@@ -161,13 +161,13 @@ jobs:
           mv ./target/${{ matrix.target }}/release/unitctl unitctl-${{ env.SHORT_VERSION }}-${{ matrix.target }}
 
       - name: Upload sha256 sum
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unitctl-${{ env.SHORT_VERSION }}-${{ matrix.target }}.sha256
           path: tools/unitctl/unitctl-${{ env.SHORT_VERSION }}-${{ matrix.target }}.sha256
 
       - name: Upload unitctl
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unitctl-${{ env.SHORT_VERSION }}-${{ matrix.target }}
           path: tools/unitctl/unitctl-${{ env.SHORT_VERSION }}-${{ matrix.target }}
