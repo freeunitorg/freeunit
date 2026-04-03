@@ -150,8 +150,14 @@ jobs:
       - name: make unit
         run: make -j 4
 
-      - name: configure unit-php
-        run: ln -s /usr/lib/libphp83.so /usr/lib/libphp.so && ./configure php
+      - name: Install PHP (Alpine Edge)
+        run: apk add php83 php83-dev php83-embed
+
+      - name: Configure unit-php
+        run: ./configure php --php-config=/usr/bin/php-config83
+      
+      # - name: configure unit-php
+        # run: ln -s /usr/lib/libphp83.so /usr/lib/libphp.so && ./configure php
 
       - name: make unit-php
         run: make -j 4
