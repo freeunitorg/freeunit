@@ -1,10 +1,11 @@
 name: CIFuzz
 on:
-  pull_request:
-    paths:
-      - 'src/**'
-      - 'fuzzing/**'
-      - '.github/workflows/cifuzz.yml'
+  workflow_dispatch: # manual only
+  # pull_request:
+  #   paths:
+  #     - 'src/**'
+  #     - 'fuzzing/**'
+  #     - '.github/workflows/cifuzz.yml'
 
 permissions: {}
 jobs:

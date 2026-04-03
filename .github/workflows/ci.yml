@@ -58,9 +58,9 @@ jobs:
             os: ubuntu-latest
           - build: python-3.12
             os: ubuntu-latest
-          - build: ruby-3.2
-            os: ubuntu-latest
           - build: ruby-3.3
+            os: ubuntu-latest
+          - build: ruby-3.4
             os: ubuntu-latest
           - build: wasm
             os: ubuntu-latest
@@ -298,7 +298,7 @@ jobs:
 
       - name: Configure ruby
         run: |
-          ./configure ruby
+          ./configure ruby --module=ruby
         if: steps.metadata.outputs.module == 'ruby'
 
       - name: Make ruby
