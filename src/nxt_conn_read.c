@@ -90,6 +90,16 @@ nxt_conn_io_read(nxt_task_t *task, void *obj, void *data)
             return;
         }
 
+        if (n == 0) {
+            /*
+             * Normalize EOF semantics at the generic layer: some protocol-
+             * specific io_read_handler implementations may return 0 without
+             * touching socket flags.
+             */
+            c->socket.closed = 1;
+            c->socket.read_ready = 0;
+        }
+
         if (n != NXT_AGAIN) {
             /* n == 0 or n == NXT_ERROR. */
             handler = (n == 0) ? state->close_handler : state->error_handler;
