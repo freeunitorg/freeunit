@@ -6,7 +6,7 @@ LABEL org.opencontainers.image.url="https://freeunit.org"
 LABEL org.opencontainers.image.source="https://github.com/freeunitorg/freeunit"
 LABEL org.opencontainers.image.documentation="https://github.com/freeunitorg/freeunit/blob/master/README.md"
 LABEL org.opencontainers.image.vendor="FreeUnit Community <team@freeunit.org>"
-LABEL org.opencontainers.image.version="1.35.3"
+LABEL org.opencontainers.image.version="1.35.4"
 
 RUN set -ex \
     && savedAptMark="$(apt-mark showmanual)" \
@@ -35,7 +35,7 @@ RUN set -ex \
     && mkdir -p /usr/lib/unit/modules /usr/lib/unit/debug-modules \
     && mkdir -p /usr/src/unit \
     && cd /usr/src/unit \
-    && git clone --depth 1 -b 1.35.3 https://github.com/freeunitorg/freeunit unit \
+    && git clone --depth 1 -b 1.35.4 https://github.com/freeunitorg/freeunit unit \
     && cd unit \
     && NCPU="$(getconf _NPROCESSORS_ONLN)" \
     && DEB_HOST_MULTIARCH="$(dpkg-architecture -q DEB_HOST_MULTIARCH)" \
