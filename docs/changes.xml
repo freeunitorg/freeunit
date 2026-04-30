@@ -10,6 +10,16 @@
          date="2026-04-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="security">
+<para>
+all official Docker images now ship /usr/share/unit/seccomp-no-af-alg.json,
+a seccomp profile blocking socket(AF_ALG, ...) (domain 38), mitigating
+CVE-2026-31431 — local privilege escalation (CVSS 7.8) via the Linux kernel
+algif_aead component. Apply from repo root:
+docker run --security-opt seccomp=pkg/docker/seccomp-no-af-alg.json.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 fix router process CPU spin and connection hang under port scanning load;
