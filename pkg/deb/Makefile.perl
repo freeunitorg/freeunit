@@ -1,7 +1,7 @@
 MODULES+=		perl
 MODULE_SUFFIX_perl=	perl
 
-MODULE_SUMMARY_perl=	Perl module for NGINX Unit
+MODULE_SUMMARY_perl=	Perl module for FreeUnit
 
 MODULE_VERSION_perl=	$(VERSION)
 MODULE_RELEASE_perl=	1
@@ -38,7 +38,7 @@ To check out the sample app, run these commands:
  sudo curl -X PUT --data-binary @unit.config --unix-socket /var/run/control.unit.sock http://localhost/config
  curl http://localhost:8600/
 
-Online documentation is available at https://unit.nginx.org
+Online documentation is available at https://docs.freeunit.org
 
 ----------------------------------------------------------------------
 BANNER

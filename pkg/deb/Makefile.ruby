@@ -1,7 +1,7 @@
 MODULES+=		ruby
 MODULE_SUFFIX_ruby=	ruby
 
-MODULE_SUMMARY_ruby=	Ruby module for NGINX Unit
+MODULE_SUMMARY_ruby=	Ruby module for FreeUnit
 
 MODULE_VERSION_ruby=	$(VERSION)
 MODULE_RELEASE_ruby=	1
@@ -40,7 +40,7 @@ To check out the sample app, run these commands:
  sudo curl -X PUT --data-binary @unit.config --unix-socket /var/run/control.unit.sock http://localhost/config
  curl http://localhost:8700/
 
-Online documentation is available at https://unit.nginx.org
+Online documentation is available at https://docs.freeunit.org
 
 ----------------------------------------------------------------------
 BANNER
