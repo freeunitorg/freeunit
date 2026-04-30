@@ -1,7 +1,7 @@
 MODULES+=		go
 MODULE_SUFFIX_go=	go
 
-MODULE_SUMMARY_go=	Go module for NGINX Unit
+MODULE_SUMMARY_go=	Go module for FreeUnit
 
 MODULE_VERSION_go=	$(VERSION)
 MODULE_RELEASE_go=	1
@@ -42,7 +42,7 @@ To check out the sample app, run these commands:
  sudo curl -X PUT --data-binary @unit.config --unix-socket /var/run/control.unit.sock http://localhost/config
  curl http://localhost:8500/
 
-Online documentation is available at https://unit.nginx.org
+Online documentation is available at https://docs.freeunit.org
 
 ----------------------------------------------------------------------
 BANNER

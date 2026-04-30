@@ -214,6 +214,16 @@ def run(request):
     _fds_info['router']['skip'] = False
     _fds_info['controller']['skip'] = False
 
+    # Re-capture baseline immediately before the test body runs so that any
+    # lazy initialization (e.g. OTel tokio runtime) that occurred after
+    # unit_run() captured the initial baseline is not counted as a leak.
+    if not option.restart:
+        _fds_info['main']['fds'] = _count_fds(unit_instance['pid'])
+        router = _fds_info['router']
+        router['fds'] = _count_fds(router['pid'])
+        controller = _fds_info['controller']
+        controller['fds'] = _count_fds(controller['pid'])
+
     yield
 
     # stop unit

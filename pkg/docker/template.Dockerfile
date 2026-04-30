@@ -105,6 +105,7 @@ RUN set -ex \
 
 COPY docker-entrypoint.sh /usr/local/bin/
 COPY welcome.* /usr/share/unit/welcome/
+COPY seccomp-no-af-alg.json /usr/share/unit/
 
 STOPSIGNAL SIGTERM
 

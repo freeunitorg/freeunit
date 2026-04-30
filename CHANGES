@@ -9,6 +9,10 @@ Changes with FreeUnit 1.35.4                                     xx xxx 2026
     *) Change: default HTTP keep-alive idle_timeout reduced from 180 to 30
        seconds.
 
+    *) Change: upgrade wasmtime to 43.0.1.
+
+    *) Bugfix: replace removed cgi module with email.parser in Python upload
+       test fixture; fixes test suite compatibility with Python 3.13.
 
 Changes with FreeUnit 1.35.3                                     07 Apr 2026
 

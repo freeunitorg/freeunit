@@ -8,7 +8,7 @@ DEFAULT_RELEASE := 1
 VERSION ?= $(DEFAULT_VERSION)
 RELEASE ?= $(DEFAULT_RELEASE)
 
-PACKAGE_VENDOR = NGINX Packaging <nginx-packaging@f5.com>
+PACKAGE_VENDOR = FreeUnit Packaging <team@freeunit.org>
 
 SRCDIR=	unit-$(VERSION)
 
@@ -75,6 +75,20 @@ include Makefile.perl
 include Makefile.ruby
 include Makefile.jsc-common
 include Makefile.jsc11
+include Makefile.wasm
+endif
+
+# Debian 13
+ifeq ($(CODENAME),trixie)
+include Makefile.php
+include Makefile.python312
+include Makefile.python313
+include Makefile.go
+include Makefile.perl
+include Makefile.ruby
+include Makefile.jsc-common
+include Makefile.jsc17
+include Makefile.jsc21
 include Makefile.wasm
 endif
 
