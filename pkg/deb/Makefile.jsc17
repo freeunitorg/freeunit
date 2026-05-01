@@ -1,7 +1,7 @@
 MODULES+=		jsc17
 MODULE_SUFFIX_jsc17=	jsc17
 
-MODULE_SUMMARY_jsc17=	Java 17 module for NGINX Unit
+MODULE_SUMMARY_jsc17=	Java 17 module for FreeUnit
 
 MODULE_VERSION_jsc17=	$(VERSION)
 MODULE_RELEASE_jsc17=	1
@@ -46,7 +46,7 @@ To check out the sample app, run these commands:
  sudo curl -X PUT --data-binary @unit.config --unix-socket /var/run/control.unit.sock http://localhost/config
  curl http://localhost:8800/
 
-Online documentation is available at https://unit.nginx.org
+Online documentation is available at https://docs.freeunit.org
 
 NOTICE:
 

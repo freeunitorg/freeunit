@@ -45,7 +45,7 @@ To check out the sample app, run these commands:
  sudo curl -X PUT --data-binary @unit.config --unix-socket /var/run/unit/control.sock http://localhost/config
  curl http://localhost:8300/
 
-Online documentation is available at https://unit.nginx.org
+Online documentation is available at https://docs.freeunit.org
 
 ----------------------------------------------------------------------
 BANNER

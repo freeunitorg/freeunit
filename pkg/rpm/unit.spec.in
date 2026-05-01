@@ -22,15 +22,16 @@ BuildRequires: openssl-devel
 
 %define CONFIGURE_ARGS $(echo "%%CONFIGURE_ARGS%%")
 
-Provides: nginx-unit
+Provides: unit = %{version}
+Provides: nginx-unit = %{version}
 
-Name: unit
-Summary: NGINX Unit
+Name: freeunit
+Summary: FreeUnit — community LTS fork of NGINX Unit
 Version: %%VERSION%%
-Release: %%RELEASE%%%{?dist}.ngx
+Release: %%RELEASE%%%{?dist}
 License: ASL 2.0
 Vendor: %%PACKAGE_VENDOR%%
-URL: https://unit.nginx.org/
+URL: https://docs.freeunit.org/
 
 Source0: unit-%{version}.tar.gz
 Source1: unit.service
@@ -51,24 +52,23 @@ BuildRequires: llvm
 Provides: unit-r%{version}
 
 %description
-NGINX Unit is a runtime and delivery environment for modern distributed
-applications. It runs the application code in multiple languages
-(PHP, Python, Go, etc.), and tightly couples it with traffic delivery
-in and out of the application. Take this application server and proxy
-directly in the cloud / container environments and fully control your app
-dynamically via an API.
+FreeUnit is a community-maintained LTS fork of NGINX Unit — a runtime and
+delivery environment for modern distributed applications. It runs application
+code in multiple languages (PHP, Python, Go, etc.), and tightly couples it
+with traffic delivery in and out of the application. Fully controllable
+via a REST API with zero-downtime reconfiguration.
 
 %if (0%{?fedora}) || (0%{?rhel} >= 8)
 %define _debugsource_template %{nil}
 %endif
 
 %package devel
-Summary: NGINX Unit (development files)
+Summary: FreeUnit (development files)
 Version: %%VERSION%%
-Release: %%RELEASE%%%{?dist}.ngx
-Requires: unit == %%VERSION%%-%%RELEASE%%%{?dist}.ngx
+Release: %%RELEASE%%%{?dist}
+Requires: freeunit == %%VERSION%%-%%RELEASE%%%{?dist}
 %description devel
-Library and include files required for NGINX Unit modules development.
+Library and include files required for FreeUnit modules development.
 
 %prep
 %setup -q
@@ -185,12 +185,12 @@ if [ $1 -eq 1 ]; then
     cat <<BANNER
 ----------------------------------------------------------------------
 
-Thank you for installing NGINX Unit!
+Thank you for installing FreeUnit!
 
 Additional modules are available in standalone packages.
-To see the available modules, run "yum list available unit-\*".
+To see the available modules, run "dnf list available freeunit-\*".
 
-Online documentation is available at https://unit.nginx.org/
+Online documentation is available at https://docs.freeunit.org/
 
 ----------------------------------------------------------------------
 BANNER
@@ -218,7 +218,7 @@ Since version 1.22.0, Unit's non-privileged processes run as unit:unit by
 default.  Review your system permissions and Unit configuration so apps and
 routes that relied on these processes running as nobody:nogroup stay working.
 
-More info: https://unit.nginx.org/installation/#official-packages
+More info: https://docs.freeunit.org/installation/
 
 ----------------------------------------------------------------------
 BANNER

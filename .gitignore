@@ -17,3 +17,4 @@ __pycache__/
 /pkg/contrib/local/
 /FIX.md
 /CLAUDE.original.md
+/.qwen/skills/clang-ast/SKILL.md

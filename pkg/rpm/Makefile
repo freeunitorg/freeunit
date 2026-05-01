@@ -8,7 +8,7 @@ DEFAULT_RELEASE := 1
 VERSION ?= $(DEFAULT_VERSION)
 RELEASE ?= $(DEFAULT_RELEASE)
 
-PACKAGE_VENDOR = NGINX Packaging <nginx-packaging@f5.com>
+PACKAGE_VENDOR = FreeUnit Community <team@freeunit.org>
 
 ifeq ($(shell rpm --eval "%{?rhel}"), 8)
 OSVER = centos8
@@ -22,6 +22,10 @@ else ifeq ($(shell test `rpm --eval '0%{?fedora} -eq 40'`; echo $$?),0)
 OSVER = fedora40
 else ifeq ($(shell test `rpm --eval '0%{?fedora} -eq 41'`; echo $$?),0)
 OSVER = fedora41
+else ifeq ($(shell test `rpm --eval '0%{?fedora} -eq 42'`; echo $$?),0)
+OSVER = fedora42
+else ifeq ($(shell test `rpm --eval '0%{?fedora} -eq 43'`; echo $$?),0)
+OSVER = fedora43
 endif
 
 BUILD_DEPENDS_unit = gcc rpm-build rpmlint clang llvm
@@ -38,48 +42,45 @@ MODULES=
 
 ifeq ($(OSVER), centos8)
 include Makefile.php
-include Makefile.python27
-include Makefile.python36
-include Makefile.python38
-include Makefile.python39
+include Makefile.python312
 include Makefile.go
 include Makefile.perl
 include Makefile.jsc-common
-include Makefile.jsc8
-include Makefile.jsc11
+include Makefile.jsc17
+include Makefile.jsc21
 include Makefile.wasm
 endif
 
 ifeq ($(OSVER), centos9)
 include Makefile.php
-include Makefile.python39
+include Makefile.python312
 include Makefile.go
 include Makefile.perl
 include Makefile.jsc-common
-include Makefile.jsc8
-include Makefile.jsc11
+include Makefile.jsc17
+include Makefile.jsc21
 include Makefile.wasm
 endif
 
 ifeq ($(OSVER), amazonlinux2)
 include Makefile.php
-include Makefile.python27
-include Makefile.python37
+include Makefile.python312
 include Makefile.go
 include Makefile.perl
 include Makefile.jsc-common
-include Makefile.jsc8
+include Makefile.jsc17
 include Makefile.wasm
 endif
 
 ifeq ($(OSVER), amazonlinux2023)
 include Makefile.php
-include Makefile.python39
-include Makefile.python311
+include Makefile.python312
+include Makefile.python313
 include Makefile.go
 include Makefile.perl
 include Makefile.jsc-common
 include Makefile.jsc17
+include Makefile.jsc21
 include Makefile.wasm
 endif
 
@@ -97,6 +98,30 @@ endif
 ifeq ($(OSVER), fedora41)
 include Makefile.php
 include Makefile.python313
+include Makefile.go
+include Makefile.perl
+include Makefile.ruby
+include Makefile.jsc-common
+include Makefile.jsc17
+include Makefile.jsc21
+include Makefile.wasm
+endif
+
+ifeq ($(OSVER), fedora42)
+include Makefile.php
+include Makefile.python313
+include Makefile.go
+include Makefile.perl
+include Makefile.ruby
+include Makefile.jsc-common
+include Makefile.jsc17
+include Makefile.jsc21
+include Makefile.wasm
+endif
+
+ifeq ($(OSVER), fedora43)
+include Makefile.php
+include Makefile.python314
 include Makefile.go
 include Makefile.perl
 include Makefile.ruby

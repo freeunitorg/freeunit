@@ -57,6 +57,8 @@ def test_access_log_keepalive(wait_for_record):
         wait_for_record(r'"POST / HTTP/1.1" 200 10', 'access.log') is not None
     ), 'keepalive 2'
 
+    sock.close()
+
 
 def test_access_log_pipeline(wait_for_record):
     load('empty')

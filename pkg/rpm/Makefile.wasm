@@ -1,7 +1,7 @@
 MODULES+=		wasm
 MODULE_SUFFIX_wasm=	wasm
 
-MODULE_SUMMARY_wasm=	WASM module for NGINX Unit
+MODULE_SUMMARY_wasm=	WASM module for FreeUnit
 
 MODULE_VERSION_wasm=	$(VERSION)
 MODULE_RELEASE_wasm=	1
@@ -55,7 +55,7 @@ cat <<BANNER
 
 The $(MODULE_SUMMARY_wasm) has been installed.
 
-Online documentation is available at https://unit.nginx.org
+Online documentation is available at https://docs.freeunit.org
 
 ----------------------------------------------------------------------
 BANNER

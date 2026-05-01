@@ -1,7 +1,7 @@
 MODULES+=			jsc_common
 MODULE_SUFFIX_jsc_common=	jsc-common
 
-MODULE_SUMMARY_jsc_common=	Java shared packages for NGINX Unit
+MODULE_SUMMARY_jsc_common=	Java shared packages for FreeUnit
 
 MODULE_VERSION_jsc_common=	$(VERSION)
 MODULE_RELEASE_jsc_common=	1

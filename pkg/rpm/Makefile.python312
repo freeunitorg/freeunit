@@ -1,7 +1,7 @@
 MODULES+=		python312
 MODULE_SUFFIX_python312=	python3.12
 
-MODULE_SUMMARY_python312=	Python 3.12 module for NGINX Unit
+MODULE_SUMMARY_python312=	Python 3.12 module for FreeUnit
 
 MODULE_VERSION_python312=	$(VERSION)
 MODULE_RELEASE_python312=	1
@@ -45,7 +45,7 @@ To check the sample app, run these commands:
  sudo curl -X PUT --data-binary @unit.config --unix-socket /var/run/unit/control.sock http://localhost/config
  curl http://localhost:8400/
 
-Online documentation is available at https://unit.nginx.org
+Online documentation is available at https://docs.freeunit.org
 
 ----------------------------------------------------------------------
 BANNER

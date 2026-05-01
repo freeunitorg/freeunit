@@ -5,6 +5,244 @@
 <change_log title="unit">
 
 
+<changes apply="unit"
+         ver="1.35.4" rev="1"
+         date="2026-04-30" time="00:00:00 +0000"
+         packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change type="security">
+<para>
+all official Docker images now ship /usr/share/unit/seccomp-no-af-alg.json,
+a seccomp profile blocking socket(AF_ALG, ...) (domain 38), mitigating
+CVE-2026-31431 — local privilege escalation (CVSS 7.8) via the Linux kernel
+algif_aead component. Apply from repo root:
+docker run --security-opt seccomp=pkg/docker/seccomp-no-af-alg.json.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+fix router process CPU spin and connection hang under port scanning load;
+CLOSE-WAIT sockets are now cleaned up properly on client FIN, idle
+connection queue iteration fixed, systemd file descriptor limit increased
+to 65535.
+</para>
+</change>
+
+<change type="change">
+<para>
+default HTTP keep-alive idle_timeout reduced from 180 to 30 seconds.
+</para>
+</change>
+
+<change type="change">
+<para>
+upgrade wasmtime to 43.0.1.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+replace removed cgi module with email.parser in Python upload test fixture;
+fixes test suite compatibility with Python 3.13.
+</para>
+</change>
+
+</changes>
+
+<changes apply="unit-php unit-python unit-python3.13
+                unit-go
+                unit-perl
+                unit-ruby
+                unit-jsc-common unit-jsc17 unit-jsc21
+                unit-wasm"
+         ver="1.35.4" rev="1"
+         date="2026-04-30" time="00:00:00 +0000"
+         packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change>
+<para>
+FreeUnit updated to 1.35.4.
+</para>
+</change>
+
+</changes>
+
+
+<changes apply="unit"
+         ver="1.35.3" rev="1"
+         date="2026-04-07" time="00:00:00 +0000"
+         packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change type="feature">
+<para>
+migrate contrib package mirror from packages.nginx.org to packages.freeunit.org;
+all dependency tarballs are now served from FreeUnit infrastructure.
+</para>
+</change>
+
+<change type="feature">
+<para>
+upgrade contrib dependencies: njs 0.9.6, libunit-wasm 0.5.0, wasmtime 43.0.0,
+wasi-sysroot 27.0.
+</para>
+</change>
+
+<change type="feature">
+<para>
+replace EOL jsc11 Docker image with jsc17 and jsc21 based on Eclipse Temurin
+(Ubuntu Noble).
+</para>
+</change>
+
+<change type="feature">
+<para>
+split Docker CI into native AMD64 and ARM64 build jobs with a separate
+manifest-merge step; eliminates QEMU emulation overhead.
+</para>
+</change>
+
+<change type="change">
+<para>
+bump Rust toolchain to 1.94.1 in all Docker images.
+</para>
+</change>
+
+<change type="change">
+<para>
+unitctl Dockerfile GPG key URL migrated to freeunit.org.
+</para>
+</change>
+
+</changes>
+
+<changes apply="unit-php unit-python
+                unit-go
+                unit-perl
+                unit-ruby
+                unit-jsc-common unit-jsc17 unit-jsc21
+                unit-wasm"
+         ver="1.35.3" rev="1"
+         date="2026-04-07" time="00:00:00 +0000"
+         packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change>
+<para>
+FreeUnit updated to 1.35.3.
+</para>
+</change>
+
+</changes>
+
+
+<changes apply="unit"
+         ver="1.35.2" rev="1"
+         date="2026-04-04" time="00:00:00 +0000"
+         packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change type="bugfix">
+<para>
+fix graceful shutdown for PHP workers running in TrueAsync mode; workers now
+exit cleanly when Unit delivers a quit signal instead of blocking indefinitely
+in the event loop.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+guard pre_request_init SAPI callback registration with NXT_PHP_PRE_REQUEST_INIT
+to fix builds against PHP versions that do not expose this callback.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+fix Ruby language module build in clang-ast workflow on debian:testing: resolve
+Debian multiarch library path mismatch and suppress
+-Wdefault-const-init-field-unsafe from clang 21 on Ruby 3.3 headers.
+</para>
+</change>
+
+</changes>
+
+<changes apply="unit-php"
+         ver="1.35.2" rev="1"
+         date="2026-04-04" time="00:00:00 +0000"
+         packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change>
+<para>
+FreeUnit updated to 1.35.2.
+</para>
+</change>
+
+</changes>
+
+
+<changes apply="unit"
+         ver="1.35.1" rev="1"
+         date="2026-04-03" time="00:00:00 +0000"
+         packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change type="feature">
+<para>
+Docker images for PHP 8.5, PHP 8.4, and Python 3.14 published to GitHub
+Container Registry (GHCR) for linux/amd64 and linux/arm64.
+</para>
+</change>
+
+<change type="feature">
+<para>
+switch all Docker base images from debian:bookworm to debian:trixie.
+</para>
+</change>
+
+<change type="feature">
+<para>
+add PHP 8.5 pre_request_init SAPI callback support.
+</para>
+</change>
+
+<change type="feature">
+<para>
+add PHP 8.4 and PHP 8.5 to CI test matrix.
+</para>
+</change>
+
+<change type="feature">
+<para>
+build CI against OpenSSL 3.6.
+</para>
+</change>
+
+<change type="change">
+<para>
+fork from nginx/unit as FreeUnit: community LTS continuation of the Unit
+application server.
+</para>
+</change>
+
+</changes>
+
+<changes apply="unit-php unit-python
+                unit-go
+                unit-perl
+                unit-ruby
+                unit-jsc-common unit-jsc17 unit-jsc21
+                unit-wasm"
+         ver="1.35.1" rev="1"
+         date="2026-04-03" time="00:00:00 +0000"
+         packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change>
+<para>
+FreeUnit updated to 1.35.1.
+</para>
+</change>
+
+</changes>
+
+
 <changes apply="unit-php
                 unit-python unit-python2.7
                 unit-python3.4 unit-python3.5 unit-python3.6 unit-python3.7

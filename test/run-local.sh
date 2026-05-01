@@ -198,27 +198,27 @@ ENTRYPOINT ["bash", "-c", "\
     set -ex && \
     NCPU=$(getconf _NPROCESSORS_ONLN) && \
     DEB_HOST_MULTIARCH=$(dpkg-architecture -q DEB_HOST_MULTIARCH) && \
-    CONFIGURE_ARGS='--prefix=/usr \
-                --statedir=/var/lib/unit \
-                --control=unix:/var/run/control.unit.sock \
-                --runstatedir=/var/run \
-                --pid=/var/run/unit.pid \
-                --logdir=/var/log \
-                --log=/var/log/unit.log \
-                --tmpdir=/var/tmp \
-                --user=unit \
-                --group=unit \
-                --openssl \
-                --njs \
-                --otel \
-                --zlib \
-                --zstd \
-                --brotli \
-                --libdir=/usr/lib/$DEB_HOST_MULTIARCH' && \
     make -j $NCPU -C pkg/contrib .njs && \
     export PKG_CONFIG_PATH=$(pwd)/pkg/contrib/njs/build && \
-    ./configure $CONFIGURE_ARGS \
-        --cc-opt=\"-fPIC\" \
+    ./configure \
+        --prefix=/usr \
+        --statedir=/var/lib/unit \
+        --control=unix:/var/run/control.unit.sock \
+        --runstatedir=/var/run \
+        --pid=/var/run/unit.pid \
+        --logdir=/var/log \
+        --log=/var/log/unit.log \
+        --tmpdir=/var/tmp \
+        --user=nobody \
+        --group=nogroup \
+        --openssl \
+        --njs \
+        --otel \
+        --zlib \
+        --zstd \
+        --brotli \
+        --libdir=/usr/lib/$DEB_HOST_MULTIARCH \
+        --cc-opt=-fPIC \
         --tests \
         --modulesdir=/usr/lib/unit/debug-modules \
         --debug && \
@@ -257,6 +257,7 @@ run_tests() {
     fi
 
     docker run --rm --privileged \
+        --name "freeunit-test" \
         -v "${TMP_DIR}:/unit" \
         -w /unit \
         "${IMAGE_NAME}" \

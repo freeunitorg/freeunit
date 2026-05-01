@@ -1,5 +1,6 @@
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -136,7 +137,19 @@ def test_python_isolation_cgroup(require):
 
     set_cgroup_path('/scope2/python')
 
-    cgroup_abs = Path(get_cgroup('empty'))
+    # Worker restarts asynchronously; poll until new cgroup is applied
+    cgroup_abs = None
+    for _ in range(50):
+        try:
+            cg = Path(get_cgroup('empty'))
+            if cg.parts[-2:] == ('scope2', 'python'):
+                cgroup_abs = cg
+                break
+        except Exception:
+            pass
+        time.sleep(0.1)
+
+    assert cgroup_abs is not None, 'cgroup abs: worker did not restart with new path'
     assert cgroup_abs.parts[-2:] == ('scope2', 'python'), 'cgroup abs'
 
     assert len(cgroup_rel.parts) >= len(cgroup_abs.parts)

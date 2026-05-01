@@ -1,7 +1,7 @@
 MODULES+=		php
 MODULE_SUFFIX_php=	php
 
-MODULE_SUMMARY_php=	PHP module for NGINX Unit
+MODULE_SUMMARY_php=	PHP module for FreeUnit
 
 MODULE_VERSION_php=	$(VERSION)
 MODULE_RELEASE_php=	1
@@ -45,7 +45,7 @@ To check out the sample app, run these commands:
  sudo curl -X PUT --data-binary @unit.config --unix-socket /var/run/control.unit.sock http://localhost/config
  curl http://localhost:8300/
 
-Online documentation is available at https://unit.nginx.org
+Online documentation is available at https://docs.freeunit.org
 
 ----------------------------------------------------------------------
 BANNER
