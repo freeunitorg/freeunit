@@ -193,7 +193,7 @@ FreeUnit is not a passive fork. It is:
 
 ## 📬 Community & Support
 
-- 💬 **Chat:** [t.me/freeunitorg](https://t.me/freeunitorg)
+- 💬 **Chat:** [t.me/freeunit_support](https://t.me/freeunit_support)
 - 🐛 **Tracker:** [github.com/freeunitorg/freeunit/issues](https://github.com/freeunitorg/freeunit/issues)
 - 📖 **Docs:** [freeunit.org](https://freeunit.org)
 

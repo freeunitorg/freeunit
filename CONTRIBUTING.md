@@ -49,6 +49,7 @@ docs: update installation instructions
 ## Community
 
 - **Discussions:** github.com/freeunitorg/freeunit/discussions
+- **Chat:** [t.me/freeunit_support](https://t.me/freeunit_support)
 - **Contact:** team@freeunit.org
 
 ## License

@@ -169,6 +169,7 @@ source of knowledge about the control API.
 - **Discussions:** [github.com/freeunitorg/freeunit/discussions](https://github.com/freeunitorg/freeunit/discussions)
 - **Issues:** [github.com/freeunitorg/freeunit/issues](https://github.com/freeunitorg/freeunit/issues)
 - **Website:** [freeunit.org](https://freeunit.org)
+- **Chat:** [t.me/freeunit_support](https://t.me/freeunit_support)
 - **Contact:** [team@freeunit.org](mailto:team@freeunit.org)
 - **Contributing:** see [CONTRIBUTING.md](CONTRIBUTING.md)
 - **Security:** see [SECURITY.md](SECURITY.md)

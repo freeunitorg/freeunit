@@ -14,7 +14,9 @@ FreeUnit provides security maintenance for the following versions:
 
 Please **do not** report security vulnerabilities through public GitHub issues.
 
-Send a report to: **[team@freeunit.org](mailto:team@freeunit.org)**
+Send a report to:
+**[team@freeunit.org](mailto:team@freeunit.org)**
+- 💬 **Chat:** [t.me/freeunit_support](https://t.me/freeunit_support)
 
 Include in your report:
 - Description of the vulnerability
