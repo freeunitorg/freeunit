@@ -574,11 +574,18 @@ def test_tls_write_abrupt_close():
 
     # SSL_write fails with errno=0 → nxt_socket_error_level(0) → NXT_LOG_ALERT.
     # These alerts are expected; suppress them so teardown does not fail.
-    option.skip_alerts += [r'SSL_write.+failed']
+    # Match only the syscall/zero-return signatures this test provokes,
+    # so unrelated SSL_write regressions are not silently masked.
+    option.skip_alerts += [
+        r'SSL_write\([^)]+\) failed \(0: Success\)',
+        r'SSL_write\([^)]+\) failed \(\d+: Connection reset by peer\)',
+        r'SSL_write\([^)]+\) failed \(\d+: Broken pipe\)',
+    ]
 
-    # 1 MB exceeds kernel socket send buffers so server keeps writing
-    # while we close.
-    body_size = 1024 * 1024
+    # Body must exceed the kernel send buffer so the server is still
+    # writing when the client tears the connection down.  16 MB beats
+    # autotuned SO_SNDBUF on common Linux configurations.
+    body_size = 16 * 1024 * 1024
 
     headers = {
         'Host': 'localhost',

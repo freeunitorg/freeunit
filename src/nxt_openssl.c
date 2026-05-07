@@ -1594,7 +1594,7 @@ nxt_openssl_conn_test_error(nxt_task_t *task, nxt_conn_t *c, int ret,
 
         if (io == NXT_OPENSSL_WRITE) {
             /* Cannot write to a closed connection. */
-            c->socket.error = (sys_err != 0) ? sys_err : NXT_ECONNRESET;
+            c->socket.error = sys_err ? sys_err : NXT_ECONNRESET;
             return NXT_ERROR;
         }
 

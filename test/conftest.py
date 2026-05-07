@@ -471,6 +471,7 @@ def _check_processes():
     router_pid = _fds_info['router']['pid']
     controller_pid = _fds_info['controller']['pid']
     main_pid = unit_instance['pid']
+    main_pid_re = re.compile(r'\b' + re.escape(main_pid) + r'\b')
 
     for _ in range(600):
         out = (
@@ -480,7 +481,7 @@ def _check_processes():
             .decode()
             .splitlines()
         )
-        out = [l for l in out if re.search(r'\b' + main_pid + r'\b', l)]
+        out = [l for l in out if main_pid_re.search(l)]
 
         if len(out) <= 3:
             break
