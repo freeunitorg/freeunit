@@ -1592,11 +1592,28 @@ nxt_openssl_conn_test_error(nxt_task_t *task, nxt_conn_t *c, int ret,
             return NXT_ERROR;
         }
 
+        if (io == NXT_OPENSSL_WRITE) {
+            /* Cannot write to a closed connection. */
+            c->socket.error = (sys_err != 0) ? sys_err : NXT_ECONNRESET;
+            return NXT_ERROR;
+        }
+
         /* A connection was just closed. */
         c->socket.closed = 1;
         return 0;
 
     case SSL_ERROR_ZERO_RETURN:
+        /*
+         * SSL_write() may return SSL_ERROR_ZERO_RETURN when the peer has
+         * sent a TLS close_notify.  Writing to a half-closed session is
+         * not possible; treat it as a fatal write error so the connection
+         * is closed rather than spinning the write loop.
+         */
+        if (io == NXT_OPENSSL_WRITE) {
+            c->socket.error = NXT_ECONNRESET;
+            return NXT_ERROR;
+        }
+
         /* A "close notify" alert. */
         return 0;
 

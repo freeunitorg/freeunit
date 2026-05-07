@@ -126,16 +126,16 @@ jobs:
         uses: actions/cache@v5
         with:
           path: /opt/openssl-3.6
-          key: openssl-3.6.0-${{ runner.os }}-${{ runner.arch }}
+          key: openssl-3.6.2-${{ runner.os }}-${{ runner.arch }}
 
       - name: Build OpenSSL 3.6
         if: steps.cache-openssl36.outputs.cache-hit != 'true'
         run: |
           sudo apt-get -y install build-essential
           cd /tmp
-          wget -q https://www.openssl.org/source/openssl-3.6.0.tar.gz
-          tar -xzf openssl-3.6.0.tar.gz
-          cd openssl-3.6.0
+          wget -q https://www.openssl.org/source/openssl-3.6.2.tar.gz
+          tar -xzf openssl-3.6.2.tar.gz
+          cd openssl-3.6.2
           ./Configure --prefix=/opt/openssl-3.6 shared no-docs
           make -j$(nproc)
           sudo mkdir -p /opt/openssl-3.6

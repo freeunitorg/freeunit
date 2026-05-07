@@ -480,7 +480,7 @@ def _check_processes():
             .decode()
             .splitlines()
         )
-        out = [l for l in out if main_pid in l]
+        out = [l for l in out if re.search(r'\b' + main_pid + r'\b', l)]
 
         if len(out) <= 3:
             break
