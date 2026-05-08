@@ -112,6 +112,13 @@ typedef struct {
     nxt_timer_t                   timer;
 
     nxt_queue_link_t              link;
+
+    /*
+     * Two-phase close state.  When non-zero, accept(2) has been disarmed
+     * and the FD will be released once all in-flight accepted connections
+     * release their refs via nxt_router_listen_event_release().
+     */
+    uint8_t                       draining;  /* 1 bit */
 } nxt_listen_event_t;
 
 

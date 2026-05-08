@@ -5,6 +5,10 @@ Changes with FreeUnit 1.35.6                                     07 Jul 2026
        to 36.0.12, clearing the wasmtime sandbox-escape advisories, with the
        accompanying WasiView/WasiHttpView source migration.
 
+    *) Feature: two-phase listener close — reconfiguration disarms a removed
+       listener first and releases its descriptor only after pending accept
+       references drain, instead of resetting them.
+
     *) Bugfix: authorize privileged IPC message types by the kernel-validated
        sender PID (SCM_CREDENTIALS), close any received descriptors on every
        rejected privileged message, and cap port queue item size at the slot
