@@ -484,7 +484,17 @@ nxt_runtime_close_idle_connections(nxt_event_engine_t *engine)
         c = nxt_queue_link_data(link, nxt_conn_t, link);
 
         if (!c->socket.read_ready) {
-            nxt_queue_remove(link);
+            /*
+             * Unlink and clear the tracking state immediately, before
+             * scheduling the async close.  nxt_runtime_quit() calls this on
+             * every shutdown continuation, so a conn left on idle_connections
+             * would be re-selected and re-closed on the next pass before its
+             * async close handler runs -- a double nxt_conn_close(), i.e. a
+             * use-after-free.  Clearing c->idle to TRACK_NONE also stops the
+             * close handler from unlinking the same conn a second time
+             * (P4.5).  Iteration stays safe: `next` was captured above.
+             */
+            nxt_conn_untrack(engine, c);
             nxt_conn_close(engine, c);
         }
     }

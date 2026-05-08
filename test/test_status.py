@@ -146,6 +146,45 @@ def test_status_connections():
     check_connections(3, 0, 0, 3)
 
 
+def test_status_connections_keepalive_cycle():
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "routes"}},
+            "routes": [{"action": {"return": 200}}],
+        },
+    )
+
+    Status.init()
+
+    # each keep-alive request cycles the connection idle -> active -> idle;
+    # the engine tracking queues and counters must stay balanced throughout
+
+    (resp, sock) = client.get(
+        headers={'Host': 'localhost', 'Connection': 'keep-alive'},
+        start=True,
+        read_timeout=1,
+    )
+
+    assert resp['status'] == 200
+    check_connections(1, 0, 1, 0)
+
+    for _ in range(3):
+        (resp, sock) = client.get(
+            headers={'Host': 'localhost', 'Connection': 'keep-alive'},
+            start=True,
+            read_timeout=1,
+            sock=sock,
+        )
+
+        assert resp['status'] == 200
+        check_connections(1, 0, 1, 0)
+
+    # closing the connection unlinks it from the idle queue exactly once
+
+    client.get(sock=sock)
+    check_connections(1, 0, 0, 1)
+
+
 def test_status_applications():
     def check_applications(expert):
         apps = list(client.conf_get('/status/applications').keys()).sort()
