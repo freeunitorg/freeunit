@@ -275,10 +275,10 @@ nxt_http_idle_io_read_handler(nxt_task_t *task, nxt_conn_t *c)
 
     joint = c->listen->socket.data;
 
-    if (nxt_slow_path(joint == NULL)) {
+    if (nxt_slow_path(joint == NULL || c->listen->draining)) {
         /*
-         * Listening socket had been closed while
-         * connection was in keep-alive state.
+         * Listening socket had been closed or is draining while
+         * connection is still idle.
          */
         c->read_state = &nxt_h1p_idle_close_state;
         return 0;
@@ -368,10 +368,10 @@ nxt_http_conn_test(nxt_task_t *task, void *obj, void *data)
 
     joint = c->listen->socket.data;
 
-    if (nxt_slow_path(joint == NULL)) {
+    if (nxt_slow_path(joint == NULL || c->listen->draining)) {
         /*
-         * Listening socket had been closed while
-         * connection was in keep-alive state.
+         * Listening socket had been closed or is draining while
+         * connection is still idle.
          */
         nxt_h1p_closing(task, c);
         return;
@@ -411,10 +411,10 @@ nxt_h1p_idle_io_read_handler(nxt_task_t *task, nxt_conn_t *c)
 
     joint = c->listen->socket.data;
 
-    if (nxt_slow_path(joint == NULL)) {
+    if (nxt_slow_path(joint == NULL || c->listen->draining)) {
         /*
-         * Listening socket had been closed while
-         * connection was in keep-alive state.
+         * Listening socket had been closed or is draining while
+         * connection is still idle.
          */
         c->read_state = &nxt_h1p_idle_close_state;
         return 0;
