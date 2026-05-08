@@ -519,7 +519,9 @@ nxt_openssl_chain_file(nxt_task_t *task, SSL_CTX *ctx, nxt_tls_conf_t *conf,
         goto end;
     }
 
-    if (SSL_CTX_use_PrivateKey(ctx, key) == 1) {
+    if (SSL_CTX_use_PrivateKey(ctx, key) == 1
+        && SSL_CTX_check_private_key(ctx) == 1)
+    {
         ret = NXT_OK;
     }
 
@@ -983,7 +985,7 @@ nxt_openssl_bundle_hash_insert(nxt_task_t *task, nxt_lvlhsh_t *lvlhsh,
 
     str = item->name;
 
-    if (item->name.start[0] == '*') {
+    if (item->name.length > 0 && item->name.start[0] == '*') {
         item->name.start++;
         item->name.length--;
 

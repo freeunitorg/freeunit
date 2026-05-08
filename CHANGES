@@ -1,6 +1,13 @@
 
 Changes with FreeUnit 1.35.4                                     xx xxx 2026
 
+    *) Bugfix: validate that the loaded TLS private key matches the
+       certificate; previously a mismatched key/cert pair was accepted
+       at config time and only surfaced as a handshake failure.  Also
+       guard the wildcard-name SAN matcher against an empty name (1-byte
+       OOB read of item->name.start[0] when the cert had a zero-length
+       SAN entry).
+
     *) Bugfix: fix router process CPU spin and connection hang under port
        scanning load; CLOSE-WAIT sockets are now cleaned up properly on
        client FIN, idle connection queue iteration fixed, systemd file
