@@ -139,6 +139,7 @@ nxt_event_engine_create(nxt_task_t *task,
     nxt_queue_init(&engine->joints);
     nxt_queue_init(&engine->listen_connections);
     nxt_queue_init(&engine->idle_connections);
+    nxt_queue_init(&engine->active_connections);
 
     return engine;
 

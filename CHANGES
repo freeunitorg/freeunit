@@ -35,6 +35,11 @@ Changes with FreeUnit 1.35.6                                     07 Jul 2026
        listener first and releases its descriptor only after pending accept
        references drain, instead of resetting them.
 
+    *) Change: the event engine now tracks in-flight connections on a
+       dedicated active connections queue, symmetric with idle tracking —
+       groundwork for graceful connection draining; connection accounting
+       in the "/status" API is exact on all close paths.
+
     *) Bugfix: authorize privileged IPC message types by the kernel-validated
        sender PID (SCM_CREDENTIALS), close any received descriptors on every
        rejected privileged message, and cap port queue item size at the slot

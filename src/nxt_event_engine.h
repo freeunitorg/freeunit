@@ -481,10 +481,12 @@ struct nxt_event_engine_s {
     nxt_queue_t                joints;
     nxt_queue_t                listen_connections;
     nxt_queue_t                idle_connections;
+    nxt_queue_t                active_connections;
     nxt_array_t                *mem_cache;
 
     nxt_atomic_uint_t          accepted_conns_cnt;
     nxt_atomic_uint_t          idle_conns_cnt;
+    nxt_atomic_uint_t          active_conns_cnt;
     nxt_atomic_uint_t          closed_conns_cnt;
     nxt_atomic_uint_t          requests_cnt;
 
