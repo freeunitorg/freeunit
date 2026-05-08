@@ -14,6 +14,14 @@ Changes with FreeUnit 1.35.4                                     xx xxx 2026
     *) Bugfix: replace removed cgi module with email.parser in Python upload
        test fixture; fixes test suite compatibility with Python 3.13.
 
+    *) Bugfix: tighten file-descriptor and CLOEXEC lifetime across the
+       accept(), pipe(), and static-file compression paths; accepted
+       client sockets and pipe ends are now CLOEXEC-protected so they
+       cannot leak into spawned application processes, pipe creation
+       no longer leaks one end on nxt_fd_nonblocking() failure, the
+       compression mmap failure paths close the source file fd, and the
+       accept4() availability probe falls back only on ENOSYS.
+
 Changes with FreeUnit 1.35.3                                     07 Apr 2026
 
     *) Feature: migrate contrib package mirror from packages.nginx.org to
