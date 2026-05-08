@@ -14,6 +14,19 @@ Changes with FreeUnit 1.35.4                                     xx xxx 2026
     *) Bugfix: replace removed cgi module with email.parser in Python upload
        test fixture; fixes test suite compatibility with Python 3.13.
 
+    *) Security: tighten privilege boundaries on the control socket,
+       mount preparation, and cgroup placement (audit PR-C): require
+       peer UID match (SO_PEERCRED / getpeereid) before accepting
+       connections on the unix control socket; resolve mount
+       destinations with openat2(RESOLVE_BENEATH) to defeat symlink
+       races that escape the rootfs under attacker-controlled trees;
+       resolve relative cgroup paths against /proc/<child>/cgroup
+       instead of /proc/self/cgroup so the new process's cgroup view
+       (not the parent's) drives placement.  Audit V5 sender-type
+       ACL is deferred to a follow-up (needs SO_PASSCRED + process-
+       registration ordering rework; reverted draft caused isolation
+       test regressions, see PR #14 review thread).
+
 Changes with FreeUnit 1.35.3                                     07 Apr 2026
 
     *) Feature: migrate contrib package mirror from packages.nginx.org to

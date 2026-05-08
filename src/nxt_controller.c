@@ -709,6 +709,77 @@ nxt_runtime_controller_socket(nxt_task_t *task, nxt_runtime_t *rt)
 }
 
 
+static nxt_int_t
+nxt_controller_check_peer_cred(nxt_task_t *task, nxt_conn_t *c)
+{
+#if (NXT_HAVE_UNIX_DOMAIN)
+    /*
+     * The control socket is the privilege boundary for the REST API:
+     * filesystem perms on `control.unit.sock` are defense-in-depth, not the
+     * boundary itself.  Require the peer's effective UID to match unitd's
+     * (or be root) so a local user with directory-write permission cannot
+     * mutate config by hand-crafting connections.
+     */
+    if (c->remote == NULL
+        || c->remote->u.sockaddr.sa_family != AF_UNIX)
+    {
+        return NXT_OK;
+    }
+
+#if (NXT_HAVE_UCRED)
+    {
+        struct ucred  cred;
+        socklen_t     len = sizeof(cred);
+
+        if (getsockopt(c->socket.fd, SOL_SOCKET, SO_PEERCRED, &cred, &len)
+            != 0)
+        {
+            nxt_alert(task, "controller: SO_PEERCRED failed %E", nxt_errno);
+            return NXT_ERROR;
+        }
+
+        if (cred.uid != 0 && cred.uid != nxt_euid) {
+            nxt_alert(task, "controller: rejecting connection from uid %d "
+                      "(unitd uid %d); set socket permissions accordingly",
+                      (int) cred.uid, (int) nxt_euid);
+            return NXT_ERROR;
+        }
+
+        return NXT_OK;
+    }
+#elif (defined(__FreeBSD__) || defined(__APPLE__) || defined(__OpenBSD__) \
+       || defined(__NetBSD__) || defined(__DragonFly__))
+    {
+        uid_t  euid;
+        gid_t  egid;
+
+        if (getpeereid(c->socket.fd, &euid, &egid) != 0) {
+            nxt_alert(task, "controller: getpeereid failed %E", nxt_errno);
+            return NXT_ERROR;
+        }
+
+        if (euid != 0 && euid != nxt_euid) {
+            nxt_alert(task, "controller: rejecting connection from uid %d "
+                      "(unitd uid %d)", (int) euid, (int) nxt_euid);
+            return NXT_ERROR;
+        }
+
+        return NXT_OK;
+    }
+#else
+    /*
+     * No peer-credential primitive on this platform; rely on filesystem
+     * permissions of control.unit.sock.  Operators must restrict the path.
+     */
+    return NXT_OK;
+#endif
+
+#else  /* !NXT_HAVE_UNIX_DOMAIN */
+    return NXT_OK;
+#endif
+}
+
+
 static void
 nxt_controller_conn_init(nxt_task_t *task, void *obj, void *data)
 {
@@ -720,6 +791,11 @@ nxt_controller_conn_init(nxt_task_t *task, void *obj, void *data)
     c = obj;
 
     nxt_debug(task, "controller conn init fd:%d", c->socket.fd);
+
+    if (nxt_slow_path(nxt_controller_check_peer_cred(task, c) != NXT_OK)) {
+        nxt_controller_conn_free(task, c, NULL);
+        return;
+    }
 
     r = nxt_mp_zget(c->mem_pool, sizeof(nxt_controller_request_t));
     if (nxt_slow_path(r == NULL)) {
