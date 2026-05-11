@@ -1,6 +1,15 @@
 
 Changes with FreeUnit 1.35.4                                     xx xxx 2026
 
+    *) Bugfix: pass a non-zero ovector size to PCRE2 match-data create
+       (a 0 size is undefined per the PCRE2 docs) and reject malformed
+       port ranges of fewer than three bytes in HTTP routing.  Also
+       documents the symmetric pattern/request URI decoding, the
+       intentionally case-insensitive host matcher, and that the
+       Linux capability module does not call capset(2) — privilege
+       barriers in Unit are setuid + PR_SET_NO_NEW_PRIVS, not cap
+       drops.
+
     *) Bugfix: fix router process CPU spin and connection hang under port
        scanning load; CLOSE-WAIT sockets are now cleaned up properly on
        client FIN, idle connection queue iteration fixed, systemd file
