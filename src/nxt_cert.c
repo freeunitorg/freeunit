@@ -1244,6 +1244,7 @@ error:
          * dereference it through "%FN" on a close-failure log path.
          */
         nxt_fd_close(file.fd);
+        file.fd = -1;
     }
 }
 
