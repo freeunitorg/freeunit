@@ -11,6 +11,9 @@
 #               Default: unit (runs full test suite)
 #   -t TEST     Test path to run (repeatable)
 #               Examples: test_tls.py  test_tls.py::test_tls_certificate_change
+#   --clang-ast Run clang-ast AST analysis (C-code quality check)
+#               Auto-enabled if src/**/*.{c,h} changed; use --no-clang-ast to skip
+#   --no-clang-ast Skip clang-ast even if C-code changed
 #   -n          Dry-run — print commands, do not execute
 #   -h          Show this help
 #
@@ -22,6 +25,8 @@
 #   ./run-local.sh -t test_tls.py::test_tls_certificate_change  # single test
 #   ./run-local.sh -t test_a.py -t test_b.py  # multiple test files
 #   ./run-local.sh unit python php          # multiple modules
+#   ./run-local.sh --clang-ast              # clang-ast C-code analysis only
+#   ./run-local.sh -t test_tls.py --clang-ast  # run tests, then clang-ast
 #
 # To force rebuild: docker rmi freeunit-test:local
 
@@ -35,6 +40,8 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 IMAGE_NAME="freeunit-test:local"
 DRY_RUN=false
 TMP_DIR=""
+RUN_CLANG_AST=auto  # auto=enabled if C-code changed, explicit flags override
+NO_CLANG_AST=false
 
 # ---------------------------------------------------------------------------
 # Known modules and their test paths (glob patterns for pytest)
@@ -70,20 +77,18 @@ usage() {
 MODULES=()
 TEST_ARGS=()
 
-while getopts ":m:t:nh" opt; do
-    case $opt in
-        m) MODULES+=("$OPTARG") ;;
-        t) TEST_ARGS+=("$OPTARG") ;;
-        n) DRY_RUN=true ;;
-        h) usage ;;
-        :) err "Option -$OPTARG requires an argument."; exit 1 ;;
-       \?) err "Unknown option: -$OPTARG"; exit 1 ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -m) MODULES+=("$2"); shift 2 ;;
+        -t) TEST_ARGS+=("$2"); shift 2 ;;
+        --clang-ast) RUN_CLANG_AST=true; NO_CLANG_AST=false; shift ;;
+        --no-clang-ast) RUN_CLANG_AST=false; NO_CLANG_AST=true; shift ;;
+        -n) DRY_RUN=true; shift ;;
+        -h) usage ;;
+        -*) err "Unknown option: $1"; exit 1 ;;
+        *) MODULES+=("$1"); shift ;;
     esac
 done
-shift $((OPTIND - 1))
-
-# Positional args are module names
-MODULES+=("$@")
 
 # Defaults: no -t and no modules → run full unit test suite
 if [[ ${#TEST_ARGS[@]} -eq 0 ]] && [[ ${#MODULES[@]} -eq 0 ]]; then
@@ -130,10 +135,26 @@ if ! command -v docker &>/dev/null; then
     err "docker not found in PATH"; exit 1
 fi
 
+# Auto-enable clang-ast if C-code changed (staged or unstaged) and not explicitly disabled
+if [[ "$RUN_CLANG_AST" == "auto" ]] && ! $NO_CLANG_AST; then
+    if { git -C "${PROJECT_DIR}" diff --name-only HEAD 2>/dev/null;
+         git -C "${PROJECT_DIR}" diff --name-only --cached HEAD 2>/dev/null;
+         git -C "${PROJECT_DIR}" ls-files --others --exclude-standard 2>/dev/null; } \
+       | grep -qE '\.(c|h)$|^auto/'; then
+        RUN_CLANG_AST=true
+        info "clang-ast: auto-enabled (C-code changes detected)"
+    else
+        RUN_CLANG_AST=false
+    fi
+elif [[ "$RUN_CLANG_AST" == "auto" ]]; then
+    RUN_CLANG_AST=false
+fi
+
 info "============================================================"
 info "FreeUnit local test run"
 info "  Modules  : ${MODULES[*]:--}"
 info "  Test args: ${TEST_ARGS[*]}"
+info "  clang-ast: ${RUN_CLANG_AST}"
 info "  Dry-run  : ${DRY_RUN}"
 info "============================================================"
 
@@ -227,6 +248,20 @@ ENTRYPOINT ["bash", "-c", "\
     printf 'NXT_INCS += -I%s/pkg/contrib/njs/src -I%s/pkg/contrib/njs/build\\n' \
         $(pwd) $(pwd) >> build/Makefile && \
     make python3 && \
+    cargo build --release --manifest-path test/fake_upstream/Cargo.toml && \
+    cp test/fake_upstream/target/release/fake_upstream /usr/local/bin/fake_upstream && \
+    if [ \"$1\" = '--clang-ast' ]; then \
+        apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+            clang llvm-dev libclang-dev ca-certificates git && \
+        git clone https://github.com/freeunitorg/clang-ast.git -b unit /clang-ast && \
+        make -C /clang-ast && \
+        rm -rf build && \
+        CC=clang ./configure --cc-opt='-Xclang -load -Xclang /clang-ast/ngx-ast.so \
+            -Xclang -add-plugin -Xclang ngx-ast -Wno-default-const-init-field-unsafe' \
+            --openssl --debug && \
+        make -j $NCPU && \
+        echo '=== clang-ast check PASSED ===' && exit 0; \
+    fi && \
     exec pytest-3 --print-log $@ \
 ", "bash"]
 
@@ -245,14 +280,22 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Run tests
+# Run tests (or clang-ast)
 # ---------------------------------------------------------------------------
 run_tests() {
-    info "Running: pytest-3 --print-log ${TEST_ARGS[*]}"
+    local RUN_ARGS=()
+
+    if $RUN_CLANG_AST; then
+        RUN_ARGS=("--clang-ast")
+        info "Running: clang-ast AST analysis"
+    else
+        RUN_ARGS=("${TEST_ARGS[@]}")
+        info "Running: pytest-3 --print-log ${TEST_ARGS[*]}"
+    fi
 
     if $DRY_RUN; then
         info "Dry-run: would execute:"
-        echo "  docker run --rm --privileged -v ${TMP_DIR}:/unit -w /unit ${IMAGE_NAME} ${TEST_ARGS[*]}"
+        echo "  docker run --rm --privileged -v ${TMP_DIR}:/unit -w /unit ${IMAGE_NAME} ${RUN_ARGS[*]}"
         return 0
     fi
 
@@ -261,7 +304,7 @@ run_tests() {
         -v "${TMP_DIR}:/unit" \
         -w /unit \
         "${IMAGE_NAME}" \
-        "${TEST_ARGS[@]}"
+        "${RUN_ARGS[@]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -269,4 +312,18 @@ run_tests() {
 # ---------------------------------------------------------------------------
 prepare_tmp
 build_image
-run_tests
+
+# Run tests first (if specified)
+if [[ ${#TEST_ARGS[@]} -gt 0 ]]; then
+    run_tests
+fi
+
+# Run clang-ast (if specified)
+if $RUN_CLANG_AST; then
+    run_tests
+fi
+
+# If neither tests nor clang-ast specified, run default tests
+if [[ ${#TEST_ARGS[@]} -eq 0 ]] && ! $RUN_CLANG_AST; then
+    run_tests
+fi

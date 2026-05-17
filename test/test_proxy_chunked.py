@@ -1,6 +1,7 @@
 import re
 import select
 import socket
+import subprocess
 import time
 
 import pytest
@@ -22,6 +23,11 @@ def setup_method_fixture():
 
     assert 'success' in client.conf(
         {
+            "settings": {
+                "http": {
+                    "chunked_transform": True
+                }
+            },
             "listeners": {
                 "*:8080": {"pass": "routes"},
             },
@@ -227,3 +233,167 @@ def test_proxy_chunked_invalid():
         )
         >= 1048576
     )
+
+
+def _recvall(sock):
+    buff_size = 4096 * 4096
+    data = b''
+    while True:
+        rlist = select.select([sock], [], [], 0.1)
+        if not rlist[0]:
+            break
+        part = sock.recv(buff_size)
+        data += part
+        if not part:
+            break
+    return data
+
+
+def _serve_loop(server_port, handler):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.bind(('127.0.0.1', server_port))
+    sock.listen(10)
+
+    while True:
+        connection, _ = sock.accept()
+        data = _recvall(connection).decode()
+        connection.sendall(handler(data).encode())
+        connection.close()
+
+
+def _echo_body(data):
+    m = re.search('\x0d\x0a\x0d\x0a(.*)', data, re.M | re.S)
+    return m.group(1) if m is not None else ''
+
+
+def _get_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+def _run_proxy_server(handler, port):
+    run_process(_serve_loop, port, handler)
+    waitforsocket(port)
+
+
+def _handler_sends_chunked(_data):
+    body_content = 'Hello, World!'
+    return (
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        f"{len(body_content):x}\r\n{body_content}\r\n0\r\n\r\n"
+    )
+
+
+def _configure_proxy(port, label):
+    assert 'success' in client.conf(
+        {
+            "settings": {"http": {"chunked_transform": True}},
+            "listeners": {"*:8080": {"pass": "routes"}},
+            "routes": [{"action": {"proxy": f'http://127.0.0.1:{port}'}}],
+        }
+    ), label
+
+
+# ---------------------------------------------------------------------------
+# fake_upstream — live Rust HTTP mock (test/fake_upstream/)
+# ---------------------------------------------------------------------------
+
+FAKE_UPSTREAM_BIN = '/usr/local/bin/fake_upstream'
+
+
+def _chunked_encode(data: bytes) -> bytes:
+    """Encode bytes as a single-chunk chunked body."""
+    return f'{len(data):x}\r\n'.encode() + data + b'\r\n0\r\n\r\n'
+
+
+def _run_fake_upstream(mode: str, port: int):
+    proc = subprocess.Popen(
+        [FAKE_UPSTREAM_BIN, '--port', str(port), '--mode', mode],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    waitforsocket(port)
+    return proc
+
+
+def _fake_get(body: bytes, **kwargs):
+    """Send HTTP/1.1 GET with Transfer-Encoding: chunked to FreeUnit proxy."""
+    return client.get(
+        headers={'Transfer-Encoding': 'chunked', 'Connection': 'close'},
+        body=_chunked_encode(body).decode('latin-1'),
+        **kwargs,
+    )
+
+
+def test_proxy_chunked_to_content_length():
+    """Chunked request → Content-Length for backends that require it. (Issue #1278)"""
+    port = _get_free_port()
+    proc = _run_fake_upstream('requires-cl', port)
+    try:
+        _configure_proxy(port, 'requires-cl backend')
+        body = b'test'
+        resp = _fake_get(body)
+        assert resp['status'] == 200, 'backend must accept after chunked→CL conversion'
+        assert resp['body'].encode('latin-1') == body, 'dechunked body must match exactly'
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_proxy_chunked_no_duplicate_transfer_encoding():
+    """Proxied request must not carry Transfer-Encoding after conversion. (Issue #1088)"""
+    port = _get_free_port()
+    proc = _run_fake_upstream('no-te', port)
+    try:
+        _configure_proxy(port, 'no-te backend')
+        body = b'data'
+        resp = _fake_get(body)
+        assert resp['status'] == 200, 'backend must not see Transfer-Encoding header'
+        assert resp['body'].encode('latin-1') == body, 'dechunked body must match exactly'
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_proxy_chunked_cl_matches_body():
+    """Content-Length value must equal actual dechunked body size. (Issue #445, #58)"""
+    port = _get_free_port()
+    proc = _run_fake_upstream('strict', port)
+    try:
+        _configure_proxy(port, 'strict backend')
+        body = b'hello world'
+        resp = _fake_get(body)
+        assert resp['status'] == 200, 'strict backend: CL must equal dechunked body length'
+        assert resp['body'].encode('latin-1') == body, 'dechunked body must match exactly'
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_app_response_chunked_not_duplicated():
+    """App's Transfer-Encoding: chunked response is not duplicated. (Issue #1088)"""
+    port = _get_free_port()
+    _run_proxy_server(_handler_sends_chunked, port)
+    _configure_proxy(port, 'chunked-response backend')
+
+    resp = get_http10()
+    assert resp['status'] == 200, 'response should be OK'
+    assert resp['body'] == 'Hello, World!', 'body must match exactly'
+
+
+def test_chunked_large_body():
+    """Large chunked request (64 KB > body_buffer_size) → correct Content-Length. (Issue #445)"""
+    port = _get_free_port()
+    proc = _run_fake_upstream('strict', port)
+    try:
+        _configure_proxy(port, 'strict backend for large body')
+        body = b'0123456789abcdef' * 4096  # 64 KB — forces file buffer path
+        resp = _fake_get(body, read_buffer_size=65536 * 4)
+        assert resp['status'] == 200, 'large chunked request must return 200'
+        assert resp['body'].encode('latin-1') == body, 'dechunked 64 KB body must match exactly'
+    finally:
+        proc.terminate()
+        proc.wait()
