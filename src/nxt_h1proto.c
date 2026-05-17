@@ -2466,7 +2466,7 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
 
     if (content_length >= 0) {
         p = nxt_cpymem(p, "Content-Length: ", nxt_length("Content-Length: "));
-        p = nxt_sprintf(p, p + NXT_OFF_T_LEN, "%O", content_length);
+        p = nxt_sprintf(p, header->mem.end, "%O", content_length);
         *p++ = '\r'; *p++ = '\n';
     }
 

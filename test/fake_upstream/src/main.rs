@@ -116,9 +116,14 @@ fn read_chunked_body(reader: &mut BufReader<&TcpStream>) -> std::io::Result<Vec<
     loop {
         let mut size_line = String::new();
         reader.read_line(&mut size_line)?;
-        let chunk_size =
-            usize::from_str_radix(size_line.trim_end_matches(['\r', '\n']).trim(), 16)
-                .unwrap_or(0);
+        // Strip chunk extensions (RFC 9112: chunk-size [";" chunk-ext]).
+        let size_field = size_line
+            .trim_end_matches(['\r', '\n'])
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let chunk_size = usize::from_str_radix(size_field, 16).unwrap_or(0);
         if chunk_size == 0 {
             // consume trailing CRLF after terminal chunk
             let mut crlf = String::new();
