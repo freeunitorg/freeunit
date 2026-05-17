@@ -21,3 +21,5 @@ __pycache__/
 /.qwen/.qwen/settings.json
 /.qwen/.qwen/settings.json.orig
 /.qwen/.qwen/skills/clang-ast/SKILL.md
+test/fake_upstream/target/
+test/fake_upstream/Cargo.lock
