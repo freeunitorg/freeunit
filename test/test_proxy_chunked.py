@@ -1,3 +1,4 @@
+import os
 import re
 import select
 import socket
@@ -303,6 +304,14 @@ def _configure_proxy(port, label):
 
 FAKE_UPSTREAM_BIN = '/usr/local/bin/fake_upstream'
 
+# Graceful skip when the Rust mock binary is not built (e.g. local runs
+# without a Rust toolchain).  CI installs it via the "Build fake_upstream"
+# step in ci.yml.
+_skipif_no_fake_upstream = pytest.mark.skipif(
+    not os.path.exists(FAKE_UPSTREAM_BIN),
+    reason=f'{FAKE_UPSTREAM_BIN} not installed (build via test/fake_upstream)',
+)
+
 
 def _chunked_encode(data: bytes) -> bytes:
     """Encode bytes as a single-chunk chunked body."""
@@ -328,6 +337,7 @@ def _fake_get(body: bytes, **kwargs):
     )
 
 
+@_skipif_no_fake_upstream
 def test_proxy_chunked_to_content_length():
     """Chunked request → Content-Length for backends that require it. (Issue #1278)"""
     port = _get_free_port()
@@ -343,6 +353,7 @@ def test_proxy_chunked_to_content_length():
         proc.wait()
 
 
+@_skipif_no_fake_upstream
 def test_proxy_chunked_no_duplicate_transfer_encoding():
     """Proxied request must not carry Transfer-Encoding after conversion. (Issue #1088)"""
     port = _get_free_port()
@@ -358,6 +369,7 @@ def test_proxy_chunked_no_duplicate_transfer_encoding():
         proc.wait()
 
 
+@_skipif_no_fake_upstream
 def test_proxy_chunked_cl_matches_body():
     """Content-Length value must equal actual dechunked body size. (Issue #445, #58)"""
     port = _get_free_port()
@@ -384,6 +396,7 @@ def test_app_response_chunked_not_duplicated():
     assert resp['body'] == 'Hello, World!', 'body must match exactly'
 
 
+@_skipif_no_fake_upstream
 def test_chunked_large_body():
     """Large chunked request (64 KB > body_buffer_size) → correct Content-Length. (Issue #445)"""
     port = _get_free_port()

@@ -394,6 +394,14 @@ jobs:
       ## Tests
       ##
 
+      - name: Build fake_upstream
+        if: matrix.build == 'unit' || matrix.build == 'python-3.11' || matrix.build == 'python-3.12'
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+          cargo build --release --manifest-path test/fake_upstream/Cargo.toml
+          sudo cp test/fake_upstream/target/release/fake_upstream /usr/local/bin/
+
       # /home/runner will be root only after calling sudo above
       # Ensure all users and processes can execute
       - name: Fix permissions
