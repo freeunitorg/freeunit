@@ -2422,10 +2422,18 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
     if (r->chunked) {
         if (r->body == NULL) {
             content_length = 0;
-        } else if (nxt_buf_is_file(r->body)) {
-            content_length = r->body->file_end;
         } else {
-            content_length = nxt_buf_mem_used_size(&r->body->mem);
+            nxt_buf_t  *b;
+
+            content_length = 0;
+
+            for (b = r->body; b != NULL; b = b->next) {
+                if (nxt_buf_is_file(b)) {
+                    content_length += b->file_end - b->file_pos;
+                } else {
+                    content_length += nxt_buf_mem_used_size(&b->mem);
+                }
+            }
         }
         /* Account for Content-Length header size (max off_t length + "Content-Length: \r\n"). */
         size += nxt_length("Content-Length: ") + NXT_OFF_T_LEN + nxt_length("\r\n");
