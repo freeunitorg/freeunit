@@ -333,6 +333,18 @@ void nxt_port_write_enable(nxt_task_t *task, nxt_port_t *port);
 void nxt_port_write_close(nxt_port_t *port);
 void nxt_port_read_enable(nxt_task_t *task, nxt_port_t *port);
 void nxt_port_read_close(nxt_port_t *port);
+
+/*
+ * Ownership contract:
+ *   On NXT_OK, ownership of fd, fd2, and b transfers to the port layer:
+ *   the port layer will close the descriptor(s) and run b's completion
+ *   handler.
+ *   On any other return, ownership remains with the caller, which is
+ *   responsible for closing fd/fd2 if owned and dispatching b's
+ *   completion handler.
+ *   The inline nxt_port_socket_write() wrapper below inherits this
+ *   contract.
+ */
 nxt_int_t nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port,
     nxt_uint_t type, nxt_fd_t fd, nxt_fd_t fd2, uint32_t stream,
     nxt_port_id_t reply_port, nxt_buf_t *b);

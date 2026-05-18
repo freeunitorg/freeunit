@@ -1170,8 +1170,30 @@ nxt_main_port_socket_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         type = NXT_PORT_MSG_RPC_ERROR;
     }
 
-    nxt_port_socket_write(task, port, type, ls.socket, msg->port_msg.stream,
-                          0, out);
+    if (nxt_port_socket_write(task, port, type, ls.socket, msg->port_msg.stream,
+                              0, out)
+        != NXT_OK)
+    {
+        /*
+         * ls.socket is -1 unless nxt_main_listening_socket() succeeded.
+         * In that case the port layer did not take ownership, so close it
+         * explicitly.
+         */
+        if (ls.socket != -1) {
+            nxt_socket_close(task, ls.socket);
+        }
+
+        /*
+         * The buffer never reached the port queue, so the port layer will
+         * not run its completion.  Queue the completion to match normal
+         * port-layer cleanup semantics.
+         */
+        if (out != NULL) {
+            nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                               out->completion_handler, task, out,
+                               out->parent);
+        }
+    }
 }
 
 
@@ -1728,8 +1750,18 @@ nxt_main_port_access_log_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
                                  msg->port_msg.reply_port);
 
     if (nxt_fast_path(port != NULL)) {
-        (void) nxt_port_socket_write(task, port, type, file.fd,
-                                     msg->port_msg.stream, 0, NULL);
+        if (nxt_port_socket_write(task, port, type, file.fd,
+                                  msg->port_msg.stream, 0, NULL)
+            != NXT_OK
+            && file.fd != -1)
+        {
+            /*
+             * Port layer never took ownership of the fd (e.g. malloc
+             * failure inside nxt_port_msg_alloc); close it explicitly to
+             * avoid leaking the open file in the main process.
+             */
+            nxt_file_close(task, &file);
+        }
 
     } else {
         nxt_file_close(task, &file);

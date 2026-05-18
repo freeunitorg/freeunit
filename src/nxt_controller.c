@@ -2446,6 +2446,7 @@ nxt_controller_conf_store(nxt_task_t *task, nxt_conf_value_t *conf)
     u_char         *end;
     size_t         size;
     nxt_fd_t       fd;
+    nxt_int_t      rc;
     nxt_buf_t      *b;
     nxt_port_t     *main_port;
     nxt_runtime_t  *rt;
@@ -2479,9 +2480,22 @@ nxt_controller_conf_store(nxt_task_t *task, nxt_conf_value_t *conf)
 
     b->mem.free = nxt_cpymem(b->mem.pos, &size, sizeof(size_t));
 
-    (void) nxt_port_socket_write(task, main_port,
-                                NXT_PORT_MSG_CONF_STORE | NXT_PORT_MSG_CLOSE_FD,
-                                 fd, 0, -1, b);
+    rc = nxt_port_socket_write(task, main_port,
+                               NXT_PORT_MSG_CONF_STORE | NXT_PORT_MSG_CLOSE_FD,
+                               fd, 0, -1, b);
+
+    if (nxt_slow_path(rc != NXT_OK)) {
+        /*
+         * Port layer did not take ownership of fd or b (e.g. malloc
+         * failure inside nxt_port_msg_alloc); close the shm fd and
+         * queue the buffer completion so the engine memory pool is
+         * not left with an unreclaimed buffer.
+         */
+        nxt_fd_close(fd);
+
+        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                           b->completion_handler, task, b, b->parent);
+    }
 
     return;
 

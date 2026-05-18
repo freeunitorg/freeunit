@@ -23,6 +23,12 @@ Changes with FreeUnit 1.35.5                                     29 May 2026
 
     *) Change: upgrade contrib njs to 0.9.8.
 
+    *) Bugfix: fix mem-pool retain leak in cert/script-store IPC paths
+       (router side) and fd/buffer leaks in cert/script/socket/access-log
+       reply paths and the controller config-store path (main process
+       side); all reachable when nxt_port_msg_alloc fails inside the
+       port machinery.
+
 
 Changes with FreeUnit 1.35.4                                     30 Apr 2026
 
