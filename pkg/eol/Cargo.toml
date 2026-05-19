@@ -1,0 +1,11 @@
+[package]
+name = "unit-eol-check"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+serde_json = "1"
+
+[[bin]]
+name = "unit-eol-check"
+path = "src/main.rs"

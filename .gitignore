@@ -23,3 +23,4 @@ __pycache__/
 /.qwen/.qwen/skills/clang-ast/SKILL.md
 test/fake_upstream/target/
 test/fake_upstream/Cargo.lock
+/pkg/eol/build.log
