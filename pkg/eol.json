@@ -15,7 +15,7 @@
     ],
     "centos_stream": [
       {"version": "9",  "eol": "2027-05", "supported_until": "2030-05", "default_python": "3.11"},
-      {"version": "10", "eol": "2035-05", "supported_until": "2038-05", "default_python": "3.13"}
+      {"version": "10", "eol": "2030-01", "supported_until": "2033-01", "default_python": "3.13"}
     ],
     "amazonlinux": [
       {"version": "2",    "eol": "2026-06", "supported_until": "2029-06", "default_python": "3.7",  "default_python_note": "OS-shipped; Python 3.7 upstream EOL Jun 2023"},
@@ -58,7 +58,7 @@
       {"version": "20", "eol": "2026-04", "supported_until": "2027-04", "note": "EOL"},
       {"version": "22", "eol": "2027-04", "supported_until": "2028-04"},
       {"version": "24", "eol": "2028-04", "supported_until": "2029-04"},
-      {"version": "26", "eol": "2028-04", "supported_until": "2029-04"}
+      {"version": "26", "eol": "2029-04", "supported_until": "2030-04", "lts": true}
     ],
     "perl": [
       {"version": "5.38", "eol": "2026-07", "supported_until": "2027-07"},

@@ -8,7 +8,7 @@
 //!   --os             Check OS versions only
 //!   --runtimes       Check runtime versions only
 //!   --days N         Warn if EOL is within N days (default: 365)
-//!   --fix            Output corrected eol.json to stdout (runtime dates only)
+//!   --fix            Print corrected runtime EOL lines (review and apply manually)
 //!   --ci             CI mode: exit 1 if any errors, JSON to stdout
 //!   --quiet          Suppress [ OK ] lines
 //!
@@ -181,6 +181,9 @@ fn fetch_api(category: &str) -> Result<String, String> {
 fn api_eol_date(category: &str, version: &str) -> Option<String> {
     let api_category = match category {
         "jsc" => "jdk",
+        "node" => "nodejs",
+        "amazonlinux" => "amazon-linux",
+        "centos_stream" => "centos-stream",
         "minimal" | "wasm" => return None,
         _ => category,
     };
@@ -348,17 +351,16 @@ fn detect_new_versions(
 // ---------------------------------------------------------------------------
 
 fn now_yyyy_mm() -> String {
-    // Call `date +%Y-%m` at runtime — no chrono dependency needed.
-    let output = std::process::Command::new("date")
+    std::process::Command::new("date")
         .arg("+%Y-%m")
         .output()
-        .ok();
-    output
+        .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| {
-            // Fallback: hardcode today. Update before each release.
-            "2026-05".to_string()
+            eprintln!("[ ERROR ] failed to determine current date via `date +%Y-%m`");
+            std::process::exit(2);
         })
 }
 
@@ -672,7 +674,7 @@ Options:
   --runtimes       Check runtime versions only
   --new            Detect new versions missing from matrix (API latest cycle)
   --ci             CI mode: exit 1 if any errors, JSON to stdout
-  --fix            Output corrected eol.json to stdout (runtime dates only)
+  --fix            Print corrected runtime EOL lines (review and apply manually)
   --quiet          Suppress [ OK ] lines
   --help           Show this help"
     );
@@ -735,10 +737,8 @@ fn main() {
     };
 
     if fix_mode {
-        // --fix only operates on runtime entries
+        // --fix prints corrected runtime EOL lines (not full JSON); review and apply manually.
         let fixed = generate_fix(&runtime_entries, &config);
-        println!("# --fix: corrected runtime EOL dates");
-        println!("# Run with --json to regenerate full pkg/eol.json");
         for entry in &fixed {
             println!(
                 "{} {}: eol={:?} supported_until={:?}",

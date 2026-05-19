@@ -18,7 +18,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Node.js | 20 (LTS) (EOL) † | Apr 2026 | Apr 2027 |
 | Node.js | 22 (LTS) | Apr 2027 | Apr 2028 |
 | Node.js | 24 (LTS) | Apr 2028 | Apr 2029 |
-| Node.js | 26 | Apr 2028 | Apr 2029 |
+| Node.js | 26 (LTS) | Apr 2029 | Apr 2030 |
 | Perl | 5.38 | Jul 2026 | Jul 2027 |
 | Perl | 5.40 | Jun 2027 | Jun 2028 |
 | Perl | 5.42 | Jul 2028 | Jul 2029 |
@@ -43,7 +43,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Fedora | 43 | 2026-12 | 2029-12 | 3.14 |
 | Fedora | 44 | 2027-06 | 2030-06 | 3.14 |
 | CentOS Stream | 9 | 2027-05 | 2030-05 | 3.11 |
-| CentOS Stream | 10 | 2035-05 | 2038-05 | 3.13 |
+| CentOS Stream | 10 | 2030-01 | 2033-01 | 3.13 |
 | Amazon Linux | 2 | 2026-06 | 2029-06 | 3.7 ‡ |
 | Amazon Linux | 2023 | 2029-06 | 2032-06 | 3.11 |
 | Ubuntu (LTS) | 22.04 | 2027-04 | 2030-04 | 3.10 |
