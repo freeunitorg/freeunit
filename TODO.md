@@ -135,8 +135,11 @@ Before the OpenSSL 3.6 migration can be considered fully validated:
       `OBJ_sn2nid` / `OpenSSL_version_num` replacements.
 - [ ] Run the full CI matrix (`ci.yml`) and confirm the new "Build OpenSSL 3.6"
       step succeeds on both `amd64` and `arm64` runners.
-- [ ] Confirm `clang-ast` workflow passes end-to-end on `debian:testing`
-      (was broken by `EVP_PKEY_asn1_find_str` / `SSLeay` deprecations).
+- [x] `clang-ast` workflow passes on `debian:testing` + system OpenSSL 1.1
+      via `./test/run-local-full.sh` (verified on `pre-1.35.5` branch).
+- [ ] Confirm `clang-ast` still passes when linked against OpenSSL 3.6
+      (previously broken by `EVP_PKEY_asn1_find_str` / `SSLeay` deprecations
+      — fixes need re-verification on the 3.6 build).
 - [ ] Smoke-test TLS in a Docker image built from `Dockerfile.minimal`
       (now `debian:trixie-slim`) — load a certificate via the REST API and
       make an HTTPS request.
@@ -180,3 +183,56 @@ inside a chroot/rootfs-isolated Unit application.
 1. Run `ldd $(which php)` with PHP 8.5 and compare against the rootfs fixture contents
 2. Check `unit.log` for the full path that caused the segfault (needs core dump or `strace`)
 3. Check if `php 8.5 --define open_basedir=...` reproduces outside of Unit
+
+---
+
+## Test Infrastructure
+
+### Prebuild `fake_upstream` binary via packages.freeunit.org
+
+`test/fake_upstream/` — Rust HTTP mock used by `test_proxy_chunked.py`.
+Currently built from source in Docker (`cargo build --release`), adding ~0.5s per run.
+
+**Improvement:**
+- [ ] Build `fake_upstream` binary and publish to `packages.freeunit.org`
+- [ ] Update `run-local.sh` to download prebuilt binary instead of `cargo build`
+- [ ] Add SHA-512 checksum validation (like `pkg/contrib/Makefile` does for njs/wasmtime)
+- [ ] Fallback to cargo build if download fails
+
+**Benefits:**
+- Faster test image builds
+- Reproducible binaries across platforms (AMD64 + ARM64)
+- No Rust toolchain required in Docker image
+
+---
+
+### clang-ast Docker build: debian:testing + `clang llvm-dev libclang-dev`
+
+`test/run-local-full.sh` builds a Docker image for clang-ast analysis.
+Fixed: use `clang llvm-dev libclang-dev` (not `clang-21 llvm-21-dev libclang-21-dev`).
+
+**Current state:** Works on `debian:testing` (clang 21 + llvm 21).
+
+**Future improvements:**
+- [ ] Prebuild `freeunit-test-full:local` image and publish to GHCR
+- [ ] Or add packages.freeunit.org binary for clang-ast plugin
+- [ ] Cache Docker layers for apt install + clang-ast build
+
+---
+
+## Chunked Encoding (RFC 9112) — Implemented in pre-1.35.5-i58
+
+Branch `pre-1.35.5-i58` implements automatic chunked → Content-Length conversion
+for proxy request forwarding. Key files:
+
+- `src/nxt_h1proto.c` — buffer fix (L1149-1171) + CL injection (L2414-2475)
+- `test/test_proxy_chunked.py` — 10 tests (all passing)
+- `test/fake_upstream/` — Rust HTTP mock with strict CL validation
+
+**Tests:** 10/10 passed ✅
+**clang-ast:** PASSED ✅
+
+**Pending upstream:**
+- Consider making the conversion configurable (currently always-on when `r->chunked`)
+- Add metrics/counter for chunked → CL conversions
+- Consider adding `Transfer-Encoding` removal for HTTP/2 upstream (HTTP/2 doesn't use TE header)
