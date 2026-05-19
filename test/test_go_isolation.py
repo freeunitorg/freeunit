@@ -318,7 +318,7 @@ def test_go_isolation_rootfs_container_priv(require, temp_dir):
     assert not obj['FileExists'], 'file should not exists'
 
 
-def test_go_isolation_rootfs_automount_tmpfs(is_su, require, temp_dir):
+def _assert_rootfs_tmpfs_toggle_stable(is_su, require, temp_dir, iterations):
     try:
         open("/proc/self/mountinfo", encoding='utf-8')
     except:
@@ -347,22 +347,38 @@ def test_go_isolation_rootfs_automount_tmpfs(is_su, require, temp_dir):
             'pid': True,
         }
 
-    isolation['automount'] = {'tmpfs': False}
+    # Regression coverage for flaky startup path:
+    # repeatedly reload the same rootfs while toggling tmpfs automount.
+    # The historical failure happened on the second load after enabling tmpfs.
+    for _ in range(iterations):
+        isolation['automount'] = {'tmpfs': False}
 
-    client.load('ns_inspect', isolation=isolation)
+        client.load('ns_inspect', isolation=isolation)
 
-    obj = client.getjson(url='/?mounts=true')['body']
+        obj = client.getjson(url='/?mounts=true')['body']
 
-    assert (
-        "/ /tmp" not in obj['Mounts'] and "tmpfs" not in obj['Mounts']
-    ), 'app has no /tmp mounted'
+        assert (
+            "/ /tmp" not in obj['Mounts'] and "tmpfs" not in obj['Mounts']
+        ), 'app has no /tmp mounted'
 
-    isolation['automount'] = {'tmpfs': True}
+        isolation['automount'] = {'tmpfs': True}
 
-    client.load('ns_inspect', isolation=isolation)
+        client.load('ns_inspect', isolation=isolation)
 
-    obj = client.getjson(url='/?mounts=true')['body']
+        obj = client.getjson(url='/?mounts=true')['body']
 
-    assert (
-        "/ /tmp" in obj['Mounts'] and "tmpfs" in obj['Mounts']
-    ), 'app has /tmp mounted on /'
+        assert (
+            "/ /tmp" in obj['Mounts'] and "tmpfs" in obj['Mounts']
+        ), 'app has /tmp mounted on /'
+
+
+def test_go_isolation_rootfs_automount_tmpfs(is_su, require, temp_dir):
+    _assert_rootfs_tmpfs_toggle_stable(
+        is_su, require, temp_dir, iterations=20
+    )
+
+
+def test_go_isolation_rootfs_automount_tmpfs_regression(is_su, require, temp_dir):
+    _assert_rootfs_tmpfs_toggle_stable(
+        is_su, require, temp_dir, iterations=100
+    )

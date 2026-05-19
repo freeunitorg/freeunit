@@ -707,11 +707,23 @@ static int nxt_cdecl
 nxt_isolation_mount_compare(const void *v1, const void *v2)
 {
     const nxt_fs_mount_t  *mnt1, *mnt2;
+    ssize_t               len1, len2;
 
     mnt1 = v1;
     mnt2 = v2;
 
-    return nxt_strlen(mnt1->src) > nxt_strlen(mnt2->src);
+    len1 = nxt_strlen(mnt1->dst);
+    len2 = nxt_strlen(mnt2->dst);
+
+    if (len1 < len2) {
+        return -1;
+    }
+
+    if (len1 > len2) {
+        return 1;
+    }
+
+    return memcmp(mnt1->dst, mnt2->dst, len1);
 }
 
 
