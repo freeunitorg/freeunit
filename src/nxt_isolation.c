@@ -712,6 +712,19 @@ nxt_isolation_mount_compare(const void *v1, const void *v2)
     mnt1 = v1;
     mnt2 = v2;
 
+    /*
+     * Sort by fs type first (PROC > TMP > BIND in enum order) so that
+     * procfs mounts before tmpfs before bind/lang-deps.  Empirically
+     * this ordering avoids a flaky ENOENT on the procfs mount that
+     * shows up on CI runners (freeunitorg/freeunit#60) when a sibling
+     * tmpfs is mounted first inside the same rootfs.  The kernel-side
+     * root cause is not fully diagnosed; until it is, this fixed order
+     * keeps test_go_isolation_rootfs_automount_tmpfs deterministic.
+     */
+    if (mnt1->type != mnt2->type) {
+        return (int) mnt2->type - (int) mnt1->type;
+    }
+
     len1 = nxt_strlen(mnt1->dst);
     len2 = nxt_strlen(mnt2->dst);
 
