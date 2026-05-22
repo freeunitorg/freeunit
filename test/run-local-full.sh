@@ -55,9 +55,14 @@ prepare_tmp() {
 }
 
 cleanup_tmp() {
+    local rc=$?
     if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
-        info "Tmp dir left at $TMP_DIR (cleanup disabled)"
-        # rm -rf "$TMP_DIR"
+        if [[ $rc -eq 0 ]]; then
+            info "Removing tmp dir $TMP_DIR"
+            rm -rf "$TMP_DIR"
+        else
+            info "Build failed (rc=$rc) — tmp dir preserved at $TMP_DIR"
+        fi
     fi
 }
 trap cleanup_tmp EXIT

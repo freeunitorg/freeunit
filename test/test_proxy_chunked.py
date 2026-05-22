@@ -237,18 +237,44 @@ def test_proxy_chunked_invalid():
     )
 
 
-def _recvall(sock):
-    buff_size = 4096 * 4096
+def _read_http_request(sock):
+    """Read a complete HTTP/1.x request by parsing Content-Length.
+
+    NOTE: Content-Length only — no Transfer-Encoding: chunked support.
+    Sufficient for current callers (GET-only via _serve_loop); extend if a
+    body-bearing chunked request is ever proxied to a Python mock upstream.
+    """
+    sock.settimeout(5)
     data = b''
-    while True:
-        rlist = select.select([sock], [], [], 0.1)
-        if not rlist[0]:
+    while b'\r\n\r\n' not in data:
+        chunk = sock.recv(65536)
+        if not chunk:
             break
-        part = sock.recv(buff_size)
-        data += part
-        if not part:
+        data += chunk
+
+    if b'\r\n\r\n' not in data:
+        return data.decode('latin-1')
+
+    split = data.index(b'\r\n\r\n') + 4
+    headers_raw = data[:split]
+    body = data[split:]
+
+    cl = 0
+    for line in headers_raw.decode('latin-1').split('\r\n')[1:]:
+        if line.lower().startswith('content-length:'):
+            try:
+                cl = int(line.split(':', 1)[1].strip())
+            except ValueError:
+                pass
             break
-    return data
+
+    while len(body) < cl:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        body += chunk
+
+    return (headers_raw + body).decode('latin-1')
 
 
 def _serve_loop(server_port, handler):
@@ -260,7 +286,7 @@ def _serve_loop(server_port, handler):
 
     while True:
         connection, _ = sock.accept()
-        data = _recvall(connection).decode()
+        data = _read_http_request(connection)
         connection.sendall(handler(data).encode())
         connection.close()
 
@@ -560,8 +586,6 @@ def test_proxy_chunked_delete():
 @_skipif_no_fake_upstream
 def test_proxy_chunked_concurrent():
     """10 concurrent chunked requests → all succeed. (race on buffer chain/mp_pool)"""
-    import threading
-
     port = _get_free_port()
     proc = _run_fake_upstream('strict', port)
     try:
@@ -592,9 +616,9 @@ def test_proxy_chunked_concurrent():
 
         for t in threads:
             t.start()
-        for t in threads:
+        for i, t in enumerate(threads):
             t.join(timeout=30)
-            assert not t.is_alive(), f'thread hung: body_len={len(bodies[threads.index(t)])}'
+            assert not t.is_alive(), f'thread hung: body_len={len(bodies[i])}'
 
         assert not errors, (
             f'{len(errors)}/10 concurrent requests failed: {errors[0]}'
