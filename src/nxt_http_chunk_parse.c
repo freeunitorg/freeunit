@@ -34,6 +34,7 @@ nxt_http_chunk_parse(nxt_task_t *task, nxt_http_chunk_parse_t *hcp,
     enum {
         sw_start = 0,
         sw_chunk_size,
+        sw_chunk_ext,
         sw_chunk_size_linefeed,
         sw_chunk_end_newline,
         sw_chunk_end_linefeed,
@@ -111,6 +112,10 @@ nxt_http_chunk_parse(nxt_task_t *task, nxt_http_chunk_parse_t *hcp,
                         state = sw_chunk_size_linefeed;
                         continue;
 
+                    } else if (ch == ';') {
+                        state = sw_chunk_ext;
+                        continue;
+
                     } else {
                         goto chunk_error;
                     }
@@ -122,6 +127,13 @@ nxt_http_chunk_parse(nxt_task_t *task, nxt_http_chunk_parse_t *hcp,
                 }
 
                 goto chunk_error;
+
+            case sw_chunk_ext:
+                if (ch == '\r') {
+                    state = sw_chunk_size_linefeed;
+                }
+
+                continue;
 
             case sw_chunk_size_linefeed:
                 if (nxt_fast_path(ch == '\n')) {
