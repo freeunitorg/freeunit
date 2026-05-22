@@ -236,3 +236,25 @@ for proxy request forwarding. Key files:
 - Consider making the conversion configurable (currently always-on when `r->chunked`)
 - Add metrics/counter for chunked → CL conversions
 - Consider adding `Transfer-Encoding` removal for HTTP/2 upstream (HTTP/2 doesn't use TE header)
+
+---
+
+## proxy: request buffering for chunked POST (issue #58)
+
+Backend returns 411 when FreeUnit forwards a chunked POST with no `Content-Length`.
+Workaround today: client-side buffering (`git config http.postBuffer`).
+
+**Design questions to resolve before implementation:**
+
+- Where does `request_buffering` live — on the `proxy` action object or `settings.http`?
+  Per-action is more composable (can disable for upload routes); global is simpler but
+  can't be selectively disabled.
+- After buffering: does FreeUnit strip `Transfer-Encoding: chunked` and inject
+  `Content-Length`, or re-encode? Must define behavior before writing the code.
+
+**Implementation risks:**
+
+- 🟡 Memory: `max_body_size` can be up to 17 GB. Need a per-request memory cap and
+  a disk spill path — not just a flag that buffers everything in-process.
+
+**Related upstream nginx/unit issues:** #445, #1088, #1278
