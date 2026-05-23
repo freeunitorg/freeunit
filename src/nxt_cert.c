@@ -1137,11 +1137,8 @@ nxt_cert_store_get(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp,
         goto fail;
     }
 
-    /*
-     * Retain only after the buffer has been handed off to the port machinery,
-     * so that the failure paths above do not leave the pool with a refcount
-     * that the completion handler can never release.
-     */
+    /* Retain after hand-off: failure paths above must not leave an orphaned
+     * refcount that the completion handler can never release. */
     nxt_mp_retain(mp);
 
     return;

@@ -3,6 +3,7 @@ import re
 import select
 import socket
 import subprocess
+import threading
 import time
 
 import pytest
@@ -236,18 +237,44 @@ def test_proxy_chunked_invalid():
     )
 
 
-def _recvall(sock):
-    buff_size = 4096 * 4096
+def _read_http_request(sock):
+    """Read a complete HTTP/1.x request by parsing Content-Length.
+
+    NOTE: Content-Length only — no Transfer-Encoding: chunked support.
+    Sufficient for current callers (GET-only via _serve_loop); extend if a
+    body-bearing chunked request is ever proxied to a Python mock upstream.
+    """
+    sock.settimeout(5)
     data = b''
-    while True:
-        rlist = select.select([sock], [], [], 0.1)
-        if not rlist[0]:
+    while b'\r\n\r\n' not in data:
+        chunk = sock.recv(65536)
+        if not chunk:
             break
-        part = sock.recv(buff_size)
-        data += part
-        if not part:
+        data += chunk
+
+    if b'\r\n\r\n' not in data:
+        return data.decode('latin-1')
+
+    split = data.index(b'\r\n\r\n') + 4
+    headers_raw = data[:split]
+    body = data[split:]
+
+    cl = 0
+    for line in headers_raw.decode('latin-1').split('\r\n')[1:]:
+        if line.lower().startswith('content-length:'):
+            try:
+                cl = int(line.split(':', 1)[1].strip())
+            except ValueError:
+                pass
             break
-    return data
+
+    while len(body) < cl:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        body += chunk
+
+    return (headers_raw + body).decode('latin-1')
 
 
 def _serve_loop(server_port, handler):
@@ -259,7 +286,7 @@ def _serve_loop(server_port, handler):
 
     while True:
         connection, _ = sock.accept()
-        data = _recvall(connection).decode()
+        data = _read_http_request(connection)
         connection.sendall(handler(data).encode())
         connection.close()
 
@@ -407,6 +434,195 @@ def test_chunked_large_body():
         resp = _fake_get(body, read_buffer_size=65536 * 4)
         assert resp['status'] == 200, 'large chunked request must return 200'
         assert resp['body'].encode('latin-1') == body, 'dechunked 64 KB body must match exactly'
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+# ---------------------------------------------------------------------------
+# Multi-chunk helpers
+# ---------------------------------------------------------------------------
+
+def _chunked_encode_multi(chunks: list) -> bytes:
+    """Encode list of byte chunks as chunked body."""
+    out = b''
+    for c in chunks:
+        out += f'{len(c):x}\r\n'.encode() + c + b'\r\n'
+    out += b'0\r\n\r\n'
+    return out
+
+
+def _chunked_request(method='GET', body=b'', **kwargs):
+    """Send HTTP/1.1 request with Transfer-Encoding: chunked."""
+    return client.http(
+        method,
+        headers={'Transfer-Encoding': 'chunked', 'Connection': 'close'},
+        body=body.decode('latin-1'),
+        **kwargs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Multi-chunk + memmove path
+# ---------------------------------------------------------------------------
+
+@_skipif_no_fake_upstream
+def test_proxy_chunked_multi_chunk():
+    """5+ chunks of varying size → correct Content-Length. (memmove path, Issue #445)"""
+    port = _get_free_port()
+    proc = _run_fake_upstream('strict', port)
+    try:
+        _configure_proxy(port, 'strict backend')
+        chunks = [b'X', b'Y' * 17, b'Z' * 3, b'A' * 1024, b'B' * 5]
+        expected = b''.join(chunks)
+        encoded = _chunked_encode_multi(chunks)
+        resp = _chunked_request(body=encoded)
+        assert resp['status'] == 200, f'strict backend rejected: {resp["body"]}'
+        assert resp['body'].encode('latin-1') == expected, 'multi-chunk body mismatch'
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+# ---------------------------------------------------------------------------
+# Empty chunked body
+# ---------------------------------------------------------------------------
+
+@_skipif_no_fake_upstream
+def test_proxy_chunked_empty_body():
+    """Empty chunked body (0\\r\\n\\r\\n) → Content-Length: 0. (Issue #58)"""
+    port = _get_free_port()
+    proc = _run_fake_upstream('strict', port)
+    try:
+        _configure_proxy(port, 'strict backend')
+        resp = _chunked_request(body=b'0\r\n\r\n')
+        assert resp['status'] == 200, 'strict backend must accept empty body with CL:0'
+        assert resp['body'] == '', 'empty chunked body must produce empty response body'
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+# ---------------------------------------------------------------------------
+# Chunk extensions
+# ---------------------------------------------------------------------------
+
+@_skipif_no_fake_upstream
+def test_proxy_chunked_extensions():
+    """Chunk extensions (;ext=val) stripped during dechunk. (Issue #1278)"""
+    port = _get_free_port()
+    proc = _run_fake_upstream('strict', port)
+    try:
+        _configure_proxy(port, 'strict backend')
+        # Single chunk with extension — FreeUnit must strip ;ext=val, body = "test"
+        encoded = b'4;ext=val\r\ntest\r\n0\r\n\r\n'
+        resp = _chunked_request(body=encoded)
+        assert resp['status'] == 200, 'strict backend must accept after extension strip'
+        assert resp['body'] == 'test', 'body must be "test" (extension stripped)'
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+# ---------------------------------------------------------------------------
+# HTTP methods (POST/PUT/DELETE)
+# ---------------------------------------------------------------------------
+
+@_skipif_no_fake_upstream
+def test_proxy_chunked_post():
+    """POST with chunked body → Content-Length. (Issue #58)"""
+    port = _get_free_port()
+    proc = _run_fake_upstream('strict', port)
+    try:
+        _configure_proxy(port, 'strict backend')
+        body = b'post-data'
+        encoded = _chunked_encode(body)
+        resp = _chunked_request('POST', encoded)
+        assert resp['status'] == 200, 'POST: strict backend must accept'
+        assert resp['body'].encode('latin-1') == body, 'POST body mismatch'
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+@_skipif_no_fake_upstream
+def test_proxy_chunked_put():
+    """PUT with chunked body → Content-Length. (Issue #58)"""
+    port = _get_free_port()
+    proc = _run_fake_upstream('strict', port)
+    try:
+        _configure_proxy(port, 'strict backend')
+        body = b'put-payload'
+        encoded = _chunked_encode(body)
+        resp = _chunked_request('PUT', encoded)
+        assert resp['status'] == 200, 'PUT: strict backend must accept'
+        assert resp['body'].encode('latin-1') == body, 'PUT body mismatch'
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+@_skipif_no_fake_upstream
+def test_proxy_chunked_delete():
+    """DELETE with chunked body → Content-Length. (Issue #58)"""
+    port = _get_free_port()
+    proc = _run_fake_upstream('strict', port)
+    try:
+        _configure_proxy(port, 'strict backend')
+        body = b'delete-body'
+        encoded = _chunked_encode(body)
+        resp = _chunked_request('DELETE', encoded)
+        assert resp['status'] == 200, 'DELETE: strict backend must accept'
+        assert resp['body'].encode('latin-1') == body, 'DELETE body mismatch'
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+# ---------------------------------------------------------------------------
+# Concurrent chunked requests
+# ---------------------------------------------------------------------------
+
+@_skipif_no_fake_upstream
+def test_proxy_chunked_concurrent():
+    """10 concurrent chunked requests → all succeed. (race on buffer chain/mp_pool)"""
+    port = _get_free_port()
+    proc = _run_fake_upstream('strict', port)
+    try:
+        _configure_proxy(port, 'strict backend')
+
+        errors = []
+        errors_lock = threading.Lock()
+
+        def worker(body_bytes):
+            try:
+                encoded = _chunked_encode(body_bytes)
+                resp = _chunked_request(body=encoded)
+                if resp['status'] != 200:
+                    with errors_lock:
+                        errors.append(f'status={resp["status"]} body={resp["body"]!r}')
+                elif resp['body'].encode('latin-1') != body_bytes:
+                    with errors_lock:
+                        errors.append(
+                            f'body mismatch: expected {len(body_bytes)}, '
+                            f'got {len(resp["body"])}'
+                        )
+            except Exception as e:
+                with errors_lock:
+                    errors.append(str(e))
+
+        bodies = [f'chunk-{i}-{i * "x"}'.encode() for i in range(10)]
+        threads = [threading.Thread(target=worker, args=(b,)) for b in bodies]
+
+        for t in threads:
+            t.start()
+        for i, t in enumerate(threads):
+            t.join(timeout=30)
+            assert not t.is_alive(), f'thread hung: body_len={len(bodies[i])}'
+
+        assert not errors, (
+            f'{len(errors)}/10 concurrent requests failed: {errors[0]}'
+        )
     finally:
         proc.terminate()
         proc.wait()
