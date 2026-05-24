@@ -1,18 +1,21 @@
 {
   "_comment": "Single source of truth for supported runtime versions and EOL dates.",
-  "_policy_runtimes": "Each runtime version is supported for 1 year after upstream EOL.",
-  "_policy_os": "Each OS version is supported for 3 years after upstream EOL. EOL dates: https://endoflife.date",
+  "_policy_runtimes": "Each runtime version is supported for 1 year (12 months) after upstream EOL.",
+  "_policy_os": "Each OS version is supported for 3 years (36 months) after upstream EOL. EOL dates: https://endoflife.date",
+  "_grace_runtimes": 12,
+  "_grace_os": 36,
   "_date_format": "eol and supported_until use YYYY-MM. default_python reflects what the OS ships, not necessarily an active runtime version.",
   "os": {
     "fedora": [
       {"version": "40", "eol": "2025-05", "supported_until": "2028-05", "default_python": "3.11", "note": "EOL"},
       {"version": "41", "eol": "2025-12", "supported_until": "2028-12", "default_python": "3.12", "note": "EOL"},
-      {"version": "42", "eol": "2026-05", "supported_until": "2029-05", "default_python": "3.13"},
-      {"version": "43", "eol": "2026-12", "supported_until": "2029-12", "default_python": "3.14"}
+      {"version": "42", "eol": "2026-05", "supported_until": "2029-05", "default_python": "3.13", "note": "EOL"},
+      {"version": "43", "eol": "2026-12", "supported_until": "2029-12", "default_python": "3.14"},
+      {"version": "44", "eol": "2027-06", "supported_until": "2030-06", "default_python": "3.14"}
     ],
     "centos_stream": [
       {"version": "9",  "eol": "2027-05", "supported_until": "2030-05", "default_python": "3.11"},
-      {"version": "10", "eol": "2035-05", "supported_until": "2038-05", "default_python": "3.13"}
+      {"version": "10", "eol": "2030-01", "supported_until": "2033-01", "default_python": "3.13"}
     ],
     "amazonlinux": [
       {"version": "2",    "eol": "2026-06", "supported_until": "2029-06", "default_python": "3.7",  "default_python_note": "OS-shipped; Python 3.7 upstream EOL Jun 2023"},
@@ -21,13 +24,13 @@
     "ubuntu": [
       {"version": "22.04", "eol": "2027-04", "supported_until": "2030-04", "default_python": "3.10", "lts": true},
       {"version": "24.04", "eol": "2029-05", "supported_until": "2032-05", "default_python": "3.12", "lts": true},
-      {"version": "26.04", "eol": "2031-05", "supported_until": "2034-05", "default_python": "3.13", "lts": true}
+      {"version": "26.04", "eol": "2031-04", "supported_until": "2034-04", "default_python": "3.13", "lts": true}
     ],
     "debian": [
-      {"version": "10", "eol": "2024-06", "supported_until": "2027-06", "default_python": "3.7",  "codename": "buster",   "note": "EOL", "default_python_note": "OS-shipped; Python 3.7 upstream EOL Jun 2023"},
-      {"version": "11", "eol": "2026-08", "supported_until": "2029-08", "default_python": "3.9",  "codename": "bullseye", "note": "EOL"},
-      {"version": "12", "eol": "2028-06", "supported_until": "2031-06", "default_python": "3.11", "codename": "bookworm"},
-      {"version": "13", "eol": "2030-06", "supported_until": "2033-06", "default_python": "3.13", "codename": "trixie"}
+      {"version": "10", "eol": "2022-09", "supported_until": "2025-09", "default_python": "3.7",  "codename": "buster",   "note": "EOL", "default_python_note": "OS-shipped; Python 3.7 upstream EOL Jun 2023"},
+      {"version": "11", "eol": "2024-08", "supported_until": "2027-08", "default_python": "3.9",  "codename": "bullseye", "note": "EOL"},
+      {"version": "12", "eol": "2026-06", "supported_until": "2029-06", "default_python": "3.11", "codename": "bookworm"},
+      {"version": "13", "eol": "2028-08", "supported_until": "2031-08", "default_python": "3.13", "codename": "trixie"}
     ],
     "rhel": [
       {"version": "8",  "eol": "2029-05", "supported_until": "2032-05", "default_python": "3.8",  "default_python_note": "OS-shipped; Python 3.8 upstream EOL Oct 2024"},
@@ -35,28 +38,32 @@
       {"version": "10", "eol": "2035-05", "supported_until": "2038-05", "default_python": "3.13"}
     ],
     "alpine": [
-      {"version": "3.20", "eol": "2026-11", "supported_until": "2029-11", "default_python": "3.12"},
-      {"version": "3.21", "eol": "2027-11", "supported_until": "2030-11", "default_python": "3.13"}
+      {"version": "3.20", "eol": "2026-04", "supported_until": "2029-04", "default_python": "3.12", "note": "EOL"},
+      {"version": "3.21", "eol": "2026-11", "supported_until": "2029-11", "default_python": "3.13"},
+      {"version": "3.22", "eol": "2027-05", "supported_until": "2030-05", "default_python": "3.13"},
+      {"version": "3.23", "eol": "2027-11", "supported_until": "2030-11", "default_python": "3.14"}
     ]
   },
   "runtimes": {
     "go": [
-      {"version": "1.24", "eol": "2026-02", "supported_until": "2027-02"},
+      {"version": "1.24", "eol": "2026-02", "supported_until": "2027-02", "note": "EOL"},
       {"version": "1.25", "eol": "2026-08", "supported_until": "2027-08"},
       {"version": "1.26", "eol": "2027-02", "supported_until": "2028-02"}
     ],
     "jsc": [
-      {"version": "17", "eol": "2029-09", "supported_until": "2030-09", "base": "eclipse-temurin"},
-      {"version": "21", "eol": "2031-09", "supported_until": "2032-09", "base": "eclipse-temurin"}
+      {"version": "17", "eol": "2027-10", "supported_until": "2028-10", "base": "eclipse-temurin"},
+      {"version": "21", "eol": "2029-12", "supported_until": "2030-12", "base": "eclipse-temurin"}
     ],
     "node": [
-      {"version": "20", "eol": "2026-04", "supported_until": "2027-04"},
+      {"version": "20", "eol": "2026-04", "supported_until": "2027-04", "note": "EOL"},
       {"version": "22", "eol": "2027-04", "supported_until": "2028-04"},
-      {"version": "24", "eol": "2028-04", "supported_until": "2029-04"}
+      {"version": "24", "eol": "2028-04", "supported_until": "2029-04"},
+      {"version": "26", "eol": "2029-04", "supported_until": "2030-04", "lts": true}
     ],
     "perl": [
       {"version": "5.38", "eol": "2026-07", "supported_until": "2027-07"},
-      {"version": "5.40", "eol": "2028-07", "supported_until": "2029-07"}
+      {"version": "5.40", "eol": "2027-06", "supported_until": "2028-06"},
+      {"version": "5.42", "eol": "2028-07", "supported_until": "2029-07"}
     ],
     "php": [
       {"version": "8.3", "eol": "2027-12", "supported_until": "2028-12"},
@@ -70,7 +77,8 @@
     ],
     "ruby": [
       {"version": "3.3", "eol": "2027-03", "supported_until": "2028-03"},
-      {"version": "3.4", "eol": "2028-03", "supported_until": "2029-03"}
+      {"version": "3.4", "eol": "2028-03", "supported_until": "2029-03"},
+      {"version": "4.0", "eol": "2029-03", "supported_until": "2030-03"}
     ],
     "wasm": [
       {"version": null, "eol": null, "supported_until": null}

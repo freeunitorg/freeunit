@@ -74,8 +74,8 @@ TEST_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -m) MODULES+=("$2"); shift 2 ;;
-        -t) TEST_ARGS+=("$2"); shift 2 ;;
+        -m) [[ -z "${2:-}" || "$2" == -* ]] && { err "-m requires an argument"; exit 1; }; MODULES+=("$2"); shift 2 ;;
+        -t) [[ -z "${2:-}" || "$2" == -* ]] && { err "-t requires an argument"; exit 1; }; TEST_ARGS+=("$2"); shift 2 ;;
         -n) DRY_RUN=true; shift ;;
         -h) usage ;;
         -*) err "Unknown option: $1"; exit 1 ;;

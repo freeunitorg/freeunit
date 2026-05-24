@@ -2414,10 +2414,7 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
            + sizeof("Connection: close\r\n")
            + sizeof("\r\n");
 
-    /* If request body needs Content-Length (e.g., after chunked_transform),
-       calculate it from the buffered body. Empty chunked body (0\r\n\r\n
-       only) leaves r->body == NULL — still emit Content-Length: 0 for
-       backends that require it. */
+    /* Emit Content-Length after chunked_transform; NULL body → value 0. */
     content_length = -1;
     if (r->chunked) {
         if (r->body == NULL) {

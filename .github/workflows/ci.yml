@@ -394,11 +394,22 @@ jobs:
       ## Tests
       ##
 
+      - name: Cache Cargo artifacts
+        if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            test/fake_upstream/target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('test/fake_upstream/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+
       - name: Build fake_upstream
-        if: matrix.build == 'unit' || matrix.build == 'python-3.11' || matrix.build == 'python-3.12'
+        if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          source "$HOME/.cargo/env"
+          rustup toolchain install stable --no-self-update --profile minimal
           cargo build --release --manifest-path test/fake_upstream/Cargo.toml
           sudo cp test/fake_upstream/target/release/fake_upstream /usr/local/bin/
 
