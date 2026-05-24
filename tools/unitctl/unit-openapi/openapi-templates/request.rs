@@ -27,7 +27,7 @@ impl ApiKey {
     fn key(&self, prefix: &Option<String>, key: &str) -> String {
         match prefix {
             None => key.to_owned(),
-            Some(ref prefix) => format!("{} {}", prefix, key),
+            Some(prefix) => format!("{} {}", prefix, key),
         }
     }
 }

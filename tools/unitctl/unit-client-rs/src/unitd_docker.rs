@@ -8,10 +8,9 @@ use crate::futures::StreamExt;
 use crate::unit_client::UnitClientError;
 use crate::unitd_process::UnitdProcess;
 
-use bollard::container::{Config, ListContainersOptions, StartContainerOptions};
-use bollard::image::CreateImageOptions;
-use bollard::models::{ContainerCreateResponse, ContainerSummary, HostConfig, Mount, MountTypeEnum};
-use bollard::secret::ContainerInspectResponse;
+use bollard::models::{ContainerCreateBody, ContainerCreateResponse, ContainerSummary, HostConfig, Mount, MountType};
+use bollard::models::ContainerInspectResponse;
+use bollard::query_parameters::{CreateImageOptionsBuilder, ListContainersOptionsBuilder, StartContainerOptions};
 use bollard::Docker;
 
 use regex::Regex;
@@ -142,7 +141,7 @@ impl Serialize for UnitdContainer {
 impl UnitdContainer {
     pub async fn find_unitd_containers() -> Vec<UnitdContainer> {
         if let Ok(docker) = Docker::connect_with_local_defaults() {
-            match docker.list_containers::<String>(None).await {
+            match docker.list_containers(None).await {
                 Err(e) => {
                     eprintln!("Could not read docker instances: {}", e);
                     vec![]
@@ -259,7 +258,7 @@ pub async fn deploy_new_container(
             if socket.is_local_socket() {
                 let mount_path = PathBuf::from(socket.clone()).as_path().to_string_lossy().to_string();
                 mounts.push(Mount {
-                    typ: Some(MountTypeEnum::BIND),
+                    typ: Some(MountType::BIND),
                     source: Some(mount_path),
                     target: Some("/var/run".to_string()),
                     ..Default::default()
@@ -267,7 +266,7 @@ pub async fn deploy_new_container(
             }
             // mount application dir
             mounts.push(Mount {
-                typ: Some(MountTypeEnum::BIND),
+                typ: Some(MountType::BIND),
                 source: Some(application.clone()),
                 target: Some("/www".to_string()),
                 read_only: Some(application_read_only),
@@ -277,10 +276,7 @@ pub async fn deploy_new_container(
             let mut pb = ProgressBar::on(stderr(), 10);
             let mut totals = HashMap::new();
             let mut stream = docker.create_image(
-                Some(CreateImageOptions {
-                    from_image: image.as_str(),
-                    ..Default::default()
-                }),
+                Some(CreateImageOptionsBuilder::new().from_image(image.as_str()).build()),
                 None,
                 None,
             );
@@ -309,7 +305,7 @@ pub async fn deploy_new_container(
                 network_mode: Some("host".to_string()),
                 ..Default::default()
             };
-            let mut container_conf = Config {
+            let mut container_conf = ContainerCreateBody {
                 image: Some(image.clone()),
                 ..Default::default()
             };
@@ -324,7 +320,7 @@ pub async fn deploy_new_container(
                 ]);
             }
             container_conf.host_config = Some(host_conf);
-            match docker.create_container::<String, String>(None, container_conf).await {
+            match docker.create_container(None, container_conf).await {
                 Err(err) => {
                     return Err(UnitClientError::UnitdDockerError {
                         message: err.to_string(),
@@ -338,12 +334,12 @@ pub async fn deploy_new_container(
             let mut list_container_filters = HashMap::new();
             list_container_filters.insert("id".to_string(), vec![resp.id]);
             match docker
-                .list_containers::<String>(Some(ListContainersOptions {
-                    all: true,
-                    limit: None,
-                    size: false,
-                    filters: list_container_filters,
-                }))
+                .list_containers(Some(
+                    ListContainersOptionsBuilder::new()
+                        .all(true)
+                        .filters(&list_container_filters)
+                        .build(),
+                ))
                 .await
             {
                 // somehow our container doesnt exist
@@ -364,7 +360,7 @@ pub async fn deploy_new_container(
                     match docker
                         .start_container(
                             info[0].names.clone().unwrap()[0].strip_prefix(MAIN_SEPARATOR).unwrap(),
-                            None::<StartContainerOptions<String>>,
+                            None::<StartContainerOptions>,
                         )
                         .await
                     {

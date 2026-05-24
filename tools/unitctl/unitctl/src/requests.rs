@@ -3,7 +3,7 @@ use super::UnitClient;
 use super::UnitSerializableMap;
 use super::UnitctlError;
 use crate::known_size::KnownSize;
-use hyper::{Body, Request};
+use hyper::Request;
 use rustls_pemfile::Item;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -158,8 +158,12 @@ async fn streaming_upload_deserialize_response<RESPONSE: for<'de> serde::Deseria
 ) -> Result<RESPONSE, UnitClientError> {
     let uri = client.control_socket.create_uri_with_path(path);
 
-    let content_length = read.len();
-    let body = Body::from(read);
+    // Materialize the body first so that Content-Length reflects actual bytes produced,
+    // not a potentially stale declared estimate; I/O errors are also surfaced here.
+    let (body, content_length) = read.into_full_body().map_err(|e| UnitClientError::IoError {
+        source: e,
+        socket: client.control_socket.to_string(),
+    })?;
 
     let mut request = Request::builder()
         .method(method)

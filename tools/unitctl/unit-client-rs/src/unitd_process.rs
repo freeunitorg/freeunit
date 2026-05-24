@@ -1,10 +1,11 @@
 use crate::unitd_cmd::UnitdCmd;
-use crate::unitd_docker::{pid_is_dockerized, UnitdContainer};
+use crate::unitd_docker::UnitdContainer;
 use crate::unitd_instance::UNITD_BINARY_NAMES;
 use crate::unitd_process_user::UnitdProcessUser;
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::Path;
 use sysinfo::{Pid, Process, ProcessRefreshKind, System, UpdateKind, Users};
 
@@ -41,19 +42,23 @@ impl Serialize for UnitdProcess {
 
 impl UnitdProcess {
     pub fn find_unitd_processes() -> Vec<UnitdProcess> {
-        let process_refresh_kind = ProcessRefreshKind::new()
+        let process_refresh_kind = ProcessRefreshKind::nothing()
             .with_cmd(UpdateKind::Always)
             .with_cwd(UpdateKind::Always)
             .with_exe(UpdateKind::Always)
             .with_user(UpdateKind::Always);
-        let refresh_kind = sysinfo::RefreshKind::new().with_processes(process_refresh_kind);
+        let refresh_kind = sysinfo::RefreshKind::nothing().with_processes(process_refresh_kind);
         let sys = System::new_with_specifics(refresh_kind);
+
+        // Precompute binary names as OsString once to avoid a per-process allocation in the hot filter.
+        let binary_names: Vec<OsString> = UNITD_BINARY_NAMES.iter().map(OsString::from).collect();
+
         let unitd_processes: HashMap<&Pid, &Process> = sys
             .processes()
             .iter()
             .filter(|p| {
                 let process_name = p.1.name();
-                UNITD_BINARY_NAMES.contains(&process_name)
+                binary_names.iter().any(|n| n.as_os_str() == process_name)
             })
             .collect::<HashMap<&Pid, &Process>>();
         let users = Users::new_with_refreshed_list();
@@ -81,8 +86,8 @@ impl UnitdProcess {
                 let process = *tuple.1;
                 let process_id: u64 = pid.as_u32().into();
                 let executable_path: Option<Box<Path>> = process.exe().map(|p| p.to_path_buf().into_boxed_path());
-                let environ: Vec<String> = process.environ().into();
-                let cmd: Vec<String> = process.cmd().into();
+                let environ: Vec<String> = process.environ().iter().map(|s| s.to_string_lossy().into_owned()).collect();
+                let cmd: Vec<String> = process.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
                 let working_dir: Option<Box<Path>> = process.cwd().map(|p| p.to_path_buf().into_boxed_path());
                 let child_pids = unitd_processes
                     .iter()
@@ -101,7 +106,7 @@ impl UnitdProcess {
                     .map(UnitdProcessUser::from);
 
                 UnitdProcess {
-                    binary_name: process.name().to_string(),
+                    binary_name: process.name().to_string_lossy().into_owned(),
                     process_id,
                     executable_path,
                     environ,
