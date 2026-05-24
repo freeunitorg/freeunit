@@ -49,6 +49,7 @@ struct Mismatch {
     matrix_date: Option<String>,
     actual_date: Option<String>,
     severity: Severity,
+    fetch_error: bool, // true = network/API failure, false = date mismatch or not-found
     message: String,
 }
 
@@ -110,7 +111,7 @@ fn parse_eol_json(path: &str) -> Result<(Vec<OsEntry>, Vec<RuntimeEntry>, Config
         for (category, entries) in os {
             if let Some(arr) = entries.as_array() {
                 for entry in arr {
-                    let obj = entry.as_object().unwrap();
+                    let Some(obj) = entry.as_object() else { continue };
                     os_entries.push(OsEntry {
                         category: category.clone(),
                         version: obj.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -126,7 +127,7 @@ fn parse_eol_json(path: &str) -> Result<(Vec<OsEntry>, Vec<RuntimeEntry>, Config
         for (category, entries) in runtimes {
             if let Some(arr) = entries.as_array() {
                 for entry in arr {
-                    let obj = entry.as_object().unwrap();
+                    let Some(obj) = entry.as_object() else { continue };
                     runtime_entries.push(RuntimeEntry {
                         category: category.clone(),
                         version: obj.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -146,6 +147,24 @@ fn parse_eol_json(path: &str) -> Result<(Vec<OsEntry>, Vec<RuntimeEntry>, Config
 }
 
 // ---------------------------------------------------------------------------
+// Shared category mapping (matrix name → endoflife.date API name)
+// ---------------------------------------------------------------------------
+
+fn api_category<'a>(category: &'a str) -> Option<&'a str> {
+    match category {
+        "jsc" => Some("eclipse-temurin"),
+        "node" => Some("nodejs"),
+        "amazonlinux" => Some("amazon-linux"),
+        "centos_stream" => Some("centos-stream"),
+        "minimal" | "wasm" => None,
+        // All other categories match their API name directly
+        "go" | "perl" | "php" | "python" | "ruby"
+        | "fedora" | "debian" | "ubuntu" | "alpine" | "rhel" => Some(category),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HTTP fetch from endoflife.date (std::net::TcpStream only — zero deps)
 // ---------------------------------------------------------------------------
 
@@ -154,7 +173,7 @@ fn fetch_api(category: &str) -> Result<String, String> {
 
     // Use curl (already installed in Docker image) — handles HTTPS + redirects
     let output = std::process::Command::new("curl")
-        .args(["-sL", "--max-time", "10", "-A", "unit-eol-check/0.1", &url])
+        .args(["-fsL", "--max-time", "10", "-A", "unit-eol-check/0.1", &url])
         .output()
         .map_err(|e| format!("curl failed: {}", e))?;
 
@@ -178,49 +197,43 @@ fn fetch_api(category: &str) -> Result<String, String> {
 // API date lookup
 // ---------------------------------------------------------------------------
 
-fn api_eol_date(category: &str, version: &str) -> Option<String> {
-    let api_category = match category {
-        "jsc" => "jdk",
-        "node" => "nodejs",
-        "amazonlinux" => "amazon-linux",
-        "centos_stream" => "centos-stream",
-        "minimal" | "wasm" => return None,
-        _ => category,
+/// Result of an API EOL lookup: Ok(Some(date)), Ok(None) (version not found in API),
+/// or Err (network/parse failure).
+fn api_eol_date(category: &str, version: &str) -> Result<Option<String>, String> {
+    let api_cat = match api_category(category) {
+        Some(c) => c,
+        None => return Ok(None),
     };
 
-    let api_json = match fetch_api(api_category) {
-        Ok(s) => s,
-        Err(_) => return None,
-    };
+    let api_json = fetch_api(api_cat)?;
 
-    let entries: Vec<serde_json::Value> = match serde_json::from_str(&api_json) {
-        Ok(v) => v,
-        Err(_) => return None,
-    };
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&api_json)
+        .map_err(|e| format!("parse {} API JSON: {}", category, e))?;
 
     for entry in entries {
-        let cycle = entry.get("cycle")?.as_str()?;
+        let cycle = match entry.get("cycle").and_then(|v| v.as_str()) {
+            Some(c) => c,
+            None => continue,
+        };
         if cycle == version {
-            // eol can be false (bool) or a date string
             if let Some(eol_val) = entry.get("eol") {
                 match eol_val {
                     serde_json::Value::String(s) => {
-                        // Normalize to YYYY-MM
-                        if s.len() >= 10 {
-                            return Some(s[..7].to_string());
+                        // Normalize to YYYY-MM (API may return YYYY-MM or YYYY-MM-DD)
+                        if s.len() >= 7 {
+                            return Ok(Some(s[..7].to_string()));
                         }
                     }
-                    serde_json::Value::Bool(b) if *b == false => {
-                        // No EOL set yet — future release
-                        return Some(String::from("future"));
+                    serde_json::Value::Bool(b) if !b => {
+                        return Ok(Some(String::from("future")));
                     }
                     _ => {}
                 }
             }
-            return None;
+            return Ok(None);
         }
     }
-    None
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -274,25 +287,20 @@ fn detect_new_versions(
         known.insert((e.category.clone(), e.version.clone()));
     }
 
-    // API categories we track (map matrix category → API category)
-    let api_cats: Vec<(&str, &str)> = vec![
-        ("go", "go"),
-        ("jsc", "jdk"),
-        ("node", "nodejs"),
-        ("perl", "perl"),
-        ("php", "php"),
-        ("python", "python"),
-        ("ruby", "ruby"),
-        ("fedora", "fedora"),
-        ("debian", "debian"),
-        ("ubuntu", "ubuntu"),
-        ("alpine", "alpine"),
-        ("amazonlinux", "amazon-linux"),
-        ("rhel", "rhel"),
-        ("centos_stream", "centos-stream"),
+    // Matrix categories to scan for new versions.
+    // Must stay in sync with api_category() mapping — if a category is added
+    // there, add it here too.
+    let scan_cats: &[&str] = &[
+        "go", "jsc", "node", "perl", "php", "python", "ruby",
+        "fedora", "debian", "ubuntu", "alpine", "amazonlinux", "rhel", "centos_stream",
     ];
 
-    for (matrix_cat, api_cat) in &api_cats {
+    for matrix_cat in scan_cats {
+        let api_cat = match api_category(matrix_cat) {
+            Some(c) => c,
+            None => continue,
+        };
+
         let api_json = match fetch_api(api_cat) {
             Ok(s) => s,
             Err(_) => continue,
@@ -327,6 +335,7 @@ fn detect_new_versions(
                     } else {
                         Severity::Warning
                     },
+                    fetch_error: false,
                     message: if is_fresh {
                         format!(
                             "NEW: {} {} released {}, not in matrix — add to pkg/eol.json",
@@ -364,10 +373,10 @@ fn now_yyyy_mm() -> String {
         })
 }
 
-fn check_os_entries(entries: &[OsEntry], config: &Config) -> Vec<Mismatch> {
+fn check_os_entries(entries: &[OsEntry], _config: &Config) -> Vec<Mismatch> {
     let mut results = Vec::new();
     let now = now_yyyy_mm();
-    let grace_months = config.grace_os;
+    let approaching_months = 12i64; // warn if EOL within 12 months
 
     for entry in entries {
         if let Some(matrix_date) = &entry.eol {
@@ -375,7 +384,25 @@ fn check_os_entries(entries: &[OsEntry], config: &Config) -> Vec<Mismatch> {
                 continue;
             }
 
-            let actual = api_eol_date(&entry.category, &entry.version);
+            let actual = match api_eol_date(&entry.category, &entry.version) {
+                Ok(v) => v,
+                Err(e) => {
+                    results.push(Mismatch {
+                        category: entry.category.clone(),
+                        version: entry.version.clone(),
+                        kind: "os".to_string(),
+                        matrix_date: Some(matrix_date.clone()),
+                        actual_date: None,
+                        severity: Severity::Warning,
+                        fetch_error: true,
+                        message: format!(
+                            "could not fetch upstream EOL for {} {}: {}",
+                            entry.category, entry.version, e
+                        ),
+                    });
+                    continue;
+                }
+            };
 
             match &actual {
                 Some(actual_date) if actual_date == "future" => {
@@ -387,6 +414,7 @@ fn check_os_entries(entries: &[OsEntry], config: &Config) -> Vec<Mismatch> {
                         matrix_date: Some(matrix_date.clone()),
                         actual_date: actual.clone(),
                         severity: Severity::Info,
+                        fetch_error: false,
                         message: format!(
                             "upstream has no EOL date yet for {} {}",
                             entry.category, entry.version
@@ -394,11 +422,30 @@ fn check_os_entries(entries: &[OsEntry], config: &Config) -> Vec<Mismatch> {
                     });
                 }
                 Some(actual_date) => {
-                    let diff = months_between(matrix_date, actual_date);
-                    if diff.unwrap_or(0) == 0 {
-                        // Dates match — check if within grace period warning
+                    let diff = match months_between(matrix_date, actual_date) {
+                        Some(d) => d,
+                        None => {
+                            results.push(Mismatch {
+                                category: entry.category.clone(),
+                                version: entry.version.clone(),
+                                kind: "os".to_string(),
+                                matrix_date: Some(matrix_date.clone()),
+                                actual_date: Some(actual_date.clone()),
+                                severity: Severity::Error,
+                                fetch_error: false,
+                                message: format!(
+                                    "{} {} cannot compare dates {} vs {}",
+                                    entry.category, entry.version, matrix_date, actual_date
+                                ),
+                            });
+                            continue;
+                        }
+                    };
+
+                    if diff == 0 {
+                        // Dates match — warn if EOL approaching
                         if let Some(months) = months_between(&now, matrix_date) {
-                            if months < grace_months {
+                            if months <= approaching_months {
                                 results.push(Mismatch {
                                     category: entry.category.clone(),
                                     version: entry.version.clone(),
@@ -406,6 +453,7 @@ fn check_os_entries(entries: &[OsEntry], config: &Config) -> Vec<Mismatch> {
                                     matrix_date: Some(matrix_date.clone()),
                                     actual_date: Some(actual_date.clone()),
                                     severity: Severity::Warning,
+                        fetch_error: false,
                                     message: format!(
                                         "{} {} EOL in ~{} months — plan migration",
                                         entry.category, entry.version, months
@@ -413,8 +461,8 @@ fn check_os_entries(entries: &[OsEntry], config: &Config) -> Vec<Mismatch> {
                                 });
                             }
                         }
-                    } else if diff.unwrap_or(0) < 0 {
-                        // Matrix date is in the past vs actual — matrix date is WRONG
+                    } else if diff < 0 {
+                        // Matrix date is behind actual — update matrix
                         results.push(Mismatch {
                             category: entry.category.clone(),
                             version: entry.version.clone(),
@@ -422,16 +470,14 @@ fn check_os_entries(entries: &[OsEntry], config: &Config) -> Vec<Mismatch> {
                             matrix_date: Some(matrix_date.clone()),
                             actual_date: Some(actual_date.clone()),
                             severity: Severity::Error,
+                            fetch_error: false,
                             message: format!(
-                                "{} {} matrix EOL {} != actual {} — update matrix",
-                                entry.category,
-                                entry.version,
-                                matrix_date,
-                                actual_date
+                                "{} {} matrix EOL {} behind actual {} — update matrix",
+                                entry.category, entry.version, matrix_date, actual_date
                             ),
                         });
                     } else {
-                        // Matrix date is in the future vs actual — off by more than a month
+                        // Matrix date is ahead of actual
                         results.push(Mismatch {
                             category: entry.category.clone(),
                             version: entry.version.clone(),
@@ -439,15 +485,29 @@ fn check_os_entries(entries: &[OsEntry], config: &Config) -> Vec<Mismatch> {
                             matrix_date: Some(matrix_date.clone()),
                             actual_date: Some(actual_date.clone()),
                             severity: Severity::Error,
+                            fetch_error: false,
                             message: format!(
-                                "{} {} matrix EOL {} != actual {}",
+                                "{} {} matrix EOL {} ahead of actual {}",
                                 entry.category, entry.version, matrix_date, actual_date
                             ),
                         });
                     }
                 }
                 None => {
-                    // Could not fetch — skip but warn
+                    // Version not found in API — warn
+                    results.push(Mismatch {
+                        category: entry.category.clone(),
+                        version: entry.version.clone(),
+                        kind: "os".to_string(),
+                        matrix_date: Some(matrix_date.clone()),
+                        actual_date: None,
+                        severity: Severity::Warning,
+                        fetch_error: false,
+                        message: format!(
+                            "version {} {} not found in upstream API",
+                            entry.category, entry.version
+                        ),
+                    });
                 }
             }
         }
@@ -466,7 +526,25 @@ fn check_runtime_entries(entries: &[RuntimeEntry], _config: &Config) -> Vec<Mism
                 continue;
             }
 
-            let actual = api_eol_date(&entry.category, &entry.version);
+            let actual = match api_eol_date(&entry.category, &entry.version) {
+                Ok(v) => v,
+                Err(e) => {
+                    results.push(Mismatch {
+                        category: entry.category.clone(),
+                        version: entry.version.clone(),
+                        kind: "runtime".to_string(),
+                        matrix_date: Some(matrix_date.clone()),
+                        actual_date: None,
+                        severity: Severity::Warning,
+                        fetch_error: true,
+                        message: format!(
+                            "could not fetch upstream EOL for {} {}: {}",
+                            entry.category, entry.version, e
+                        ),
+                    });
+                    continue;
+                }
+            };
 
             match &actual {
                 Some(actual_date) if actual_date == "future" => {
@@ -477,6 +555,7 @@ fn check_runtime_entries(entries: &[RuntimeEntry], _config: &Config) -> Vec<Mism
                         matrix_date: Some(matrix_date.clone()),
                         actual_date: Some(actual_date.clone()),
                         severity: Severity::Info,
+                        fetch_error: false,
                         message: format!(
                             "{} {} upstream EOL not yet set",
                             entry.category, entry.version
@@ -484,8 +563,25 @@ fn check_runtime_entries(entries: &[RuntimeEntry], _config: &Config) -> Vec<Mism
                     });
                 }
                 Some(actual_date) => {
-                    let diff = months_between(matrix_date, actual_date);
-                    let diff_val = diff.unwrap_or(0);
+                    let diff_val = match months_between(matrix_date, actual_date) {
+                        Some(d) => d,
+                        None => {
+                            results.push(Mismatch {
+                                category: entry.category.clone(),
+                                version: entry.version.clone(),
+                                kind: "runtime".to_string(),
+                                matrix_date: Some(matrix_date.clone()),
+                                actual_date: Some(actual_date.clone()),
+                                severity: Severity::Error,
+                                fetch_error: false,
+                                message: format!(
+                                    "{} {} cannot compare dates {} vs {}",
+                                    entry.category, entry.version, matrix_date, actual_date
+                                ),
+                            });
+                            continue;
+                        }
+                    };
 
                     if diff_val == 0 {
                         // Exact match — check if past EOL
@@ -500,6 +596,7 @@ fn check_runtime_entries(entries: &[RuntimeEntry], _config: &Config) -> Vec<Mism
                                         matrix_date: Some(matrix_date.clone()),
                                         actual_date: Some(actual_date.clone()),
                                         severity: Severity::Warning,
+                                        fetch_error: false,
                                         message: format!(
                                             "{} {} upstream EOL passed ({}), add (EOL) flag",
                                             entry.category, entry.version, matrix_date
@@ -509,7 +606,7 @@ fn check_runtime_entries(entries: &[RuntimeEntry], _config: &Config) -> Vec<Mism
                             }
                         }
                     } else if diff_val < 0 {
-                        // Matrix date is in the past vs actual future date — error
+                        // Matrix behind actual
                         results.push(Mismatch {
                             category: entry.category.clone(),
                             version: entry.version.clone(),
@@ -517,13 +614,14 @@ fn check_runtime_entries(entries: &[RuntimeEntry], _config: &Config) -> Vec<Mism
                             matrix_date: Some(matrix_date.clone()),
                             actual_date: Some(actual_date.clone()),
                             severity: Severity::Error,
+                            fetch_error: false,
                             message: format!(
-                                "{} {} matrix EOL {} != actual {}",
+                                "{} {} matrix EOL {} behind actual {}",
                                 entry.category, entry.version, matrix_date, actual_date
                             ),
                         });
                     } else {
-                        // Off by 1+ months
+                        // Matrix ahead of actual
                         results.push(Mismatch {
                             category: entry.category.clone(),
                             version: entry.version.clone(),
@@ -531,15 +629,29 @@ fn check_runtime_entries(entries: &[RuntimeEntry], _config: &Config) -> Vec<Mism
                             matrix_date: Some(matrix_date.clone()),
                             actual_date: Some(actual_date.clone()),
                             severity: Severity::Error,
+                            fetch_error: false,
                             message: format!(
-                                "{} {} matrix EOL {} != actual {}",
+                                "{} {} matrix EOL {} ahead of actual {}",
                                 entry.category, entry.version, matrix_date, actual_date
                             ),
                         });
                     }
                 }
                 None => {
-                    // Could not fetch — skip silently for offline
+                    // Version not found in API — warn
+                    results.push(Mismatch {
+                        category: entry.category.clone(),
+                        version: entry.version.clone(),
+                        kind: "runtime".to_string(),
+                        matrix_date: Some(matrix_date.clone()),
+                        actual_date: None,
+                        severity: Severity::Warning,
+                        fetch_error: false,
+                        message: format!(
+                            "version {} {} not found in upstream API",
+                            entry.category, entry.version
+                        ),
+                    });
                 }
             }
         }
@@ -636,7 +748,17 @@ fn generate_fix(entries: &[RuntimeEntry], config: &Config) -> Vec<RuntimeEntry> 
                 continue;
             }
 
-            let actual = api_eol_date(&entry.category, &entry.version);
+            let actual = match api_eol_date(&entry.category, &entry.version) {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!(
+                        "[ WARN  ] could not fetch EOL for {} {}: {}",
+                        entry.category, entry.version, err
+                    );
+                    fixed.push(e);
+                    continue;
+                }
+            };
 
             if let Some(actual_date) = actual {
                 if actual_date != "future" && actual_date != *matrix_date {
@@ -652,6 +774,11 @@ fn generate_fix(entries: &[RuntimeEntry], config: &Config) -> Vec<RuntimeEntry> 
                         e.supported_until = Some(format!("{:04}-{:02}", new_y, new_m));
                     }
                 }
+            } else {
+                eprintln!(
+                    "[ WARN  ] {} {} not found in upstream API — skipping",
+                    entry.category, entry.version
+                );
             }
         }
 
@@ -793,6 +920,19 @@ fn main() {
             println!("[ OK    ] all dates match");
         }
         return;
+    }
+
+    // If all mismatches are fetch errors (network/API failure), exit 2
+    let fetch_failures = all_mismatches
+        .iter()
+        .filter(|m| m.fetch_error)
+        .count();
+    if fetch_failures > 0 && fetch_failures == all_mismatches.len() {
+        eprintln!(
+            "[ ERROR ] all {} entries failed to fetch — network or API error",
+            fetch_failures
+        );
+        process::exit(2);
     }
 
     if ci_mode {

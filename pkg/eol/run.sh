@@ -95,12 +95,13 @@ run_check() {
     fi
 
     # Mount repo root as /repo; cargo registry cache avoids full redownload each run
+    # Empty args → entrypoint runs full check (runtimes + OS) via --json /repo/pkg/eol.json
     docker run --rm \
         -v "${PROJECT_DIR}:/repo" \
         -v "${HOME}/.cargo/registry:/root/.cargo/registry" \
         -w /repo \
         "${IMAGE_NAME}" \
-        "${EOL_ARGS[@]:---help}"
+        "${EOL_ARGS[@]+"${EOL_ARGS[@]}"}"
 }
 
 # ---------------------------------------------------------------------------
