@@ -8,8 +8,8 @@ __pycache__/
 /.claude/
 /pkg/docker/build-logs/
 /QWEN.md
-/.qwen/settings.json
-/.qwen/settings.json.orig
+/.qwen/
+/qwen/
 /njs/
 /pkg/contrib/njs/
 /pkg/contrib/.sum-*
@@ -17,11 +17,5 @@ __pycache__/
 /pkg/contrib/local/
 /FIX.md
 /CLAUDE.original.md
-/.qwen/skills/clang-ast/SKILL.md
-/.qwen/.qwen/settings.json
-/.qwen/.qwen/settings.json.orig
-/.qwen/.qwen/skills/clang-ast/SKILL.md
 test/fake_upstream/target/
 /pkg/eol/build.log
-/qwen/.qwen/settings.json
-/qwen/.qwen/skills/clang-ast/SKILL.md
