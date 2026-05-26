@@ -49,11 +49,6 @@ PLATFORM=""
 APT_PROXY=""
 USE_BUILDER=false
 
-# Auto-detect apt-cacher-ng on port 3142
-if nc -z 127.0.0.1 3142 2>/dev/null; then
-    APT_PROXY="http://host-gateway:3142"
-fi
-
 # Derive default version from git branch
 VERSION="$(git -C "${SCRIPT_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "local")"
 VERSION="${VERSION//\//-}"   # replace / with - (e.g. feat/foo → feat-foo)
@@ -146,6 +141,12 @@ if [[ -z "$PLATFORM" ]]; then
     esac
 fi
 
+# Auto-detect apt-cacher-ng on port 3142 (bash-native, no nc dependency)
+# Placed after arg parsing so dry-run mode skips the network probe
+if ! $DRY_RUN && (echo > /dev/tcp/127.0.0.1/3142) >/dev/null 2>&1; then
+    APT_PROXY="http://host-gateway:3142"
+fi
+
 # ---------------------------------------------------------------------------
 # Pre-flight checks
 # ---------------------------------------------------------------------------
@@ -219,7 +220,7 @@ build_variant() {
 
     # Builder mode: use local/Dockerfile.* if available for this variant
     if $USE_BUILDER && [[ -f "${SCRIPT_DIR}/local/Dockerfile.${VARIANT}" ]]; then
-        ensure_builder "$VARIANT"
+        ensure_builder "$VARIANT" || return 1
         DOCKERFILE="${SCRIPT_DIR}/local/Dockerfile.${VARIANT}"
     fi
     local IMAGE_TAG="freeunit:${VERSION}-${VARIANT}"
@@ -292,6 +293,28 @@ build_variant() {
 
 export -f build_variant ensure_builder
 export VERSION SCRIPT_DIR LOG_DIR USE_BUILDX PLATFORM DRY_RUN APT_PROXY USE_BUILDER
+
+# ---------------------------------------------------------------------------
+# Pre-build builder images (sequential, before parallel loop)
+# Ensures minimal/wasm (share one builder) and php8.5 are pulled/built once,
+# so parallel build_variant calls hit only the fast docker-inspect path.
+# ---------------------------------------------------------------------------
+if $USE_BUILDER; then
+    declare -A _BUILDER_SEEN
+    for _V in "${VARIANTS[@]}"; do
+        [[ -f "${SCRIPT_DIR}/local/Dockerfile.${_V}" ]] || continue
+        case "$_V" in
+            minimal|wasm) _BKEY="trixie" ;;
+            php8.5)       _BKEY="php8.5" ;;
+            *)            continue ;;
+        esac
+        if [[ -z "${_BUILDER_SEEN[$_BKEY]:-}" ]]; then
+            _BUILDER_SEEN[$_BKEY]=1
+            ensure_builder "$_V" || exit 1
+        fi
+    done
+    unset _BUILDER_SEEN _BKEY _V
+fi
 
 # ---------------------------------------------------------------------------
 # Run builds

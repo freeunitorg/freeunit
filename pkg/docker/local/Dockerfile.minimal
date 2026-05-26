@@ -53,7 +53,8 @@ RUN set -ex \
     && ./configure \
     && make -j $NCPU version \
     && for f in /usr/sbin/unitd /usr/lib/unit/modules/*.unit.so; do \
-        ldd $f | awk '/=>/{print $(NF-1)}' \
+        [ -f "$f" ] || continue; \
+        ldd "$f" | awk '/=>/{print $(NF-1)}' \
           | while read n; do dpkg-query -S $(realpath $n 2>/dev/null || echo $n) 2>/dev/null; done \
           | grep -v '^diversion' \
           | sed 's/^\([^:]\+\):.*$/\1/' | sort | uniq >> /requirements.apt; \

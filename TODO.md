@@ -21,6 +21,7 @@
 | OTEL Phase 0: config audit, new fields, `fake_otlp`, `test_otel.py` | 1.35.6 |
 | OTEL Phase 2: rewrite `nxt_otel_rs_runtime()` for 0.32 API (after Phase 0) | 1.35.6 |
 | `rust1.x` Docker variant (WASM path, `Dockerfile.rust1.x`) | 1.35.6 |
+| Docker: make debug build optional (`--debug` flag in `build-local.sh`, off by default; saves ~30-40 MB per image) | 1.35.6 |
 
 **July (after 1.35.6):**
 
