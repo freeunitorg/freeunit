@@ -80,10 +80,18 @@ serves Rust developers. FreeUnit can own this space.
 
 ---
 
-## OpenTelemetry crate upgrade 0.24 → 0.32 (issue #65)
+## OpenTelemetry crate upgrade 0.24 → 0.32 (issue #65, milestone 1.35.6)
 
-**Prerequisite:** audit current OTEL JSON config schema against `docs/unit-openapi.yaml`
-before touching any Rust code (see issue #65 comment for rationale).
+| Crate | Current | Latest | Gap |
+|-------|---------|--------|-----|
+| `opentelemetry` | 0.24.0 | 0.32.0 | 8 minor |
+| `opentelemetry-otlp` | 0.17.0 | 0.32.0 | 15 minor |
+| `opentelemetry_sdk` | 0.24.1 | 0.32.0 | 8 minor |
+| `opentelemetry-semantic-conventions` | 0.16.0 | 0.32.0 | 16 minor |
+
+Original implementation by Ava Hahn — co-author of FreeUnit's OTel layer.
+New account: [@ava-affine](https://github.com/ava-affine), `ava@sunnypup.io` (left F5, personal domain `sunnypup.io`).
+The upstream `nginx/nginx-otel` is a separate C++ module, unrelated to our Rust crate.
 
 ### Known pitfalls (from code audit)
 
@@ -98,23 +106,81 @@ before touching any Rust code (see issue #65 comment for rationale).
 - `eprintln!` used for errors in `nxt_otel_rs_runtime()` instead of the `log_callback` —
   fix while rewriting the function
 
-### Tasks
+### Phase 0: Documentation audit + new config fields + test infrastructure (prerequisite)
 
-- [ ] Audit OTEL JSON config schema vs `docs/unit-openapi.yaml`; document supported fields
-- [ ] Check `BoxedSpan` definition in opentelemetry 0.24 vs 0.32 — confirm ABI compatibility
-- [ ] Bump all `opentelemetry*` crates to 0.32.x in `src/otel/Cargo.toml`
-- [ ] Rewrite `nxt_otel_rs_runtime()` for new 0.32 API (TracerProviderBuilder pattern)
-- [ ] Fix `Protocol::HttpJson` dead code; fix `eprintln!` → log_callback
-- [ ] Rename `"NGINX Unit"` → `"FreeUnit"` in `lib.rs`
-- [ ] Update `src/nxt_otel.c` / `nxt_otel.h` if Rust ABI changed
-- [ ] Build with `./configure --otel --openssl && make`; run clang-ast check
-- [ ] Build `test/fake_otlp/` (std-only Rust binary, mirrors `test/fake_upstream/` pattern)
-      and write `test/test_otel.py` — no real collector needed, tests run self-contained in CI
+**Current config (4 fields):**
+```json
+{ "endpoint": "...", "protocol": "http", "batch_size": 128, "sampling_ratio": 1.0 }
+```
 
-### test/fake_otlp design
+**0a — Audit existing config:**
+- [ ] Audit current OTEL JSON config schema against `docs/unit-openapi.yaml`
+- [ ] Document all supported OTEL config fields and their defaults
+- [ ] Check for gaps between OpenAPI spec and actual C/Rust implementation
 
-Mirrors `test/fake_upstream/` exactly — single Rust binary, no external deps, installed to
-`/usr/local/bin/fake_otlp` in CI (same step as `fake_upstream`).
+**0b — New configuration fields (backward-compatible, current crate versions):**
+
+Hardcoded values that must become configurable:
+
+| Value | Current | Where | Proposed field |
+|-------|---------|-------|----------------|
+| Service name | `"NGINX Unit"` | `lib.rs:98,274` | `service_name` |
+| Max queue size | `4096` | `lib.rs:103` | `max_queue_size` |
+| Export timeout | `10s` | `lib.rs:27` | `export_timeout` |
+
+Missing fields needed for production OTEL:
+
+| Field | Type | Default | Why |
+|-------|------|---------|-----|
+| `service_name` | string | `"FreeUnit"` | Replaces hardcoded `"NGINX Unit"`; every service needs its own name |
+| `headers` | object | `{}` | Auth to collector (`Authorization: Bearer ...`, `X-Api-Key`) |
+| `root_certificate` | string | — | Custom CA for TLS collector connection |
+| `resource_attributes` | object | `{}` | `service.version`, `deployment.environment`, custom labels |
+| `max_queue_size` | integer | `4096` | Replaces hardcoded queue depth |
+| `export_timeout` | integer (sec) | `10` | Replaces hardcoded timeout |
+
+Bug fixes in existing fields:
+- [ ] Fix `protocol`: add `enum: ["http", "grpc"]` to OpenAPI; sync required/optional between C validator and OpenAPI
+- [ ] Fix `batch_size`: add upper bound validation (e.g. `<= 65536`)
+- [ ] Fix span attributes to use OTel semconv: `"method"` → `http.request.method`, `"path"` → `url.path`, `"status"` → `http.response.status_code`
+- [ ] Wrap sampler in `ParentBased(TraceIdRatioBased(...))` — respect upstream sampling decisions
+- [ ] Pass `tracestate` through to Rust OTEL SDK (currently parsed in C, echoed, but dropped)
+
+New fields implementation:
+- [ ] Add all new fields to `docs/unit-openapi.yaml` (`configSettingsTelemetry` schema)
+- [ ] Add validators in `src/nxt_conf_validation.c`
+- [ ] Parse new fields in `src/nxt_router.c`
+- [ ] Accept and use new parameters in `src/otel/src/lib.rs`
+
+**Proposed full config after Phase 0:**
+```json
+{
+  "settings": {
+    "telemetry": {
+      "endpoint": "http://collector:4318",
+      "protocol": "http",
+      "service_name": "my-app",
+      "sampling_ratio": 1.0,
+      "batch_size": 128,
+      "max_queue_size": 4096,
+      "export_timeout": 10,
+      "headers": { "Authorization": "Bearer token" },
+      "root_certificate": "/path/to/ca.pem",
+      "resource_attributes": {
+        "service.version": "1.0.0",
+        "deployment.environment": "production"
+      }
+    }
+  }
+}
+```
+
+**0c — Test infrastructure:**
+- [ ] Build `test/fake_otlp/` — std-only Rust mock OTLP collector
+
+**fake_otlp design** — mirrors `test/fake_upstream/` exactly: single Rust binary,
+no external deps, installed to `/usr/local/bin/fake_otlp` in CI (same step as
+`fake_upstream`).
 
 ```
 fake_otlp --port 19878 --requests 1
@@ -126,13 +192,48 @@ fake_otlp --port 19878 --requests 1
 - Exits after `--requests N`
 - **HTTP only** — gRPC (HTTP/2) not supported; document as "use a real collector for gRPC"
 
-`test/test_otel.py` test cases (all gated on `FAKE_OTLP_BIN` + `--otel` build flag):
+- [ ] Write `test/test_otel.py` — gated on `FAKE_OTLP_BIN` + `--otel` build flag:
 
 | Test | What it checks |
 |------|----------------|
 | `test_otel_span_exported` | span arrives at fake_otlp after one FreeUnit request |
 | `test_otel_traceparent_propagated` | FreeUnit injects `traceparent` header into forwarded request |
-| `test_otel_sampling_zero` | `sample_fraction=0.0` → fake_otlp receives nothing (stays alive) |
+| `test_otel_sampling_zero` | `sampling_ratio=0.0` → fake_otlp receives nothing (stays alive) |
+| `test_otel_service_name` | exported span contains configured `service_name` |
+| `test_otel_auth_header` | fake_otlp receives configured `headers` (Authorization) |
+| `test_otel_resource_attributes` | span resource contains custom attributes |
+
+- [ ] Verify all Phase 0 tests pass against the **current** 0.24 crates (establishes baseline)
+
+### Phase 1: Pre-upgrade safety checks
+
+- [ ] Verify `BoxedSpan` layout compatibility between 0.24 and 0.32 — `Arc<BoxedSpan>`
+      crosses C FFI as raw pointer; layout change = UB. If trait bounds changed (e.g. added
+      `Send + Sync`), introduce an intermediate opaque wrapper type
+- [ ] Confirm `Protocol::HttpJson` is dead code — remove unreachable match arm
+
+### Phase 2: Crate upgrade — full rewrite of `nxt_otel_rs_runtime()`
+
+- [ ] Bump all `opentelemetry*` crates to 0.32.x in `src/otel/Cargo.toml`
+- [ ] Rewrite `nxt_otel_rs_runtime()` — `new_pipeline()`, `new_exporter()`, `.tracing()`,
+      `.with_trace_config()`, `.with_batch_config()`, `.install_batch()` all gone in 0.27+.
+      Use `TracerProvider::builder()` + new `OtlpTracePipeline` API
+- [ ] Replace `opentelemetry_sdk::trace::Config` → `TracerProviderBuilder`
+- [ ] Replace `BatchConfigBuilder` → new location/API
+- [ ] Replace `opentelemetry_sdk::runtime::Tokio` → new runtime model
+- [ ] Adapt `src/otel/src/lib.rs` to all remaining API changes
+- [ ] Update `src/nxt_otel.c` / `nxt_otel.h` if Rust ABI changed
+- [ ] Run `test/test_otel.py` against upgraded code — must pass same baseline tests
+
+### Phase 3: Housekeeping fixes (same PR)
+
+- [ ] Rename `"NGINX Unit"` → `"FreeUnit"` in `lib.rs` (lines 154, 274)
+- [ ] Replace `eprintln!` (lib.rs lines 188–189, 204) with `nxt_otel_log_callback`
+
+### Phase 4: Final verification
+
+- [ ] Build with `./configure --otel --openssl && make`; run clang-ast check
+- [ ] Full `test/test_otel.py` pass
 
 ---
 
@@ -376,6 +477,33 @@ Fixed: use `clang llvm-dev libclang-dev` (not `clang-21 llvm-21-dev libclang-21-
 - [ ] Prebuild `freeunit-test-full:local` image and publish to GHCR
 - [ ] Or add packages.freeunit.org binary for clang-ast plugin
 - [ ] Cache Docker layers for apt install + clang-ast build
+
+---
+
+## avahahn/ngx-testing-fmk — evaluate as cross-platform test orchestration reference
+
+https://github.com/avahahn/ngx-testing-fmk — personal shell-based framework by Ava Hahn
+(ex-F5, co-author of FreeUnit OTel layer; new account: [@ava-affine](https://github.com/ava-affine), `ava@sunnypup.io`) for running nginx/nginx-otel tests across multiple
+libvirt VMs in parallel.
+
+**What it does:** boots libvirt VMs, rsyncs source + test dirs, builds and runs tests
+on each VM in parallel, collects logs, shuts VMs down. `common.sh` provides a reusable
+`parallel_invoke_and_wait` bash helper (fan-out with aggregated exit codes).
+
+**Why it is not a direct fit for FreeUnit:**
+- Hardwired to nginx + nginx-tests + nginx-otel — no Unit/FreeUnit hooks
+- Requires a pre-configured libvirt infrastructure with shared credentials (`SECRET.sh`)
+- FreeUnit already has pytest (`test/`) + GitHub Actions CI covering the same ground
+- 0 stars, last commit Jan 2025, no active maintenance
+
+**What is worth studying:**
+- `parallel_invoke_and_wait` pattern in `common.sh` — clean bash fan-out with per-input
+  log files and aggregated failure reporting; could inform a future `test/run-matrix.sh`
+  if we ever need to test across distros locally without Docker
+- Overall VM lifecycle approach (on → sync → build → test → off) as a template if we add
+  libvirt/QEMU-based cross-distro testing outside of GitHub Actions
+
+**Decision:** no code to borrow now. Revisit if we add a local multi-distro test matrix.
 
 ---
 
