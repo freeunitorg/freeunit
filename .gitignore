@@ -23,3 +23,5 @@ __pycache__/
 /.qwen/.qwen/skills/clang-ast/SKILL.md
 test/fake_upstream/target/
 /pkg/eol/build.log
+/qwen/.qwen/settings.json
+/qwen/.qwen/skills/clang-ast/SKILL.md

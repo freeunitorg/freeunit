@@ -9,7 +9,11 @@
 #   -v VERSION   FreeUnit version string to pin (default: git branch name)
 #   -p PLATFORM  Target platform (default: current arch)
 #                Examples: linux/amd64  linux/arm64  linux/amd64,linux/arm64
-#   -j N         Parallel builds (default: 1)
+#   -j N         Parallel builds (default: nproc/2)
+#   -b           Builder mode — use pre-built builder images (local/Dockerfile.*)
+#                Skips apt install and Rust download; builder image is built
+#                automatically if not found locally or on GHCR.
+#                Supported variants: minimal, wasm, php8.5
 #   -n           Dry-run — print commands, do not execute
 #   -h           Show this help
 #
@@ -27,6 +31,7 @@
 #   ./build-local.sh -j4                    # build 4 at a time
 #   ./build-local.sh -v 1.35.2 go1.25      # pin specific version
 #   ./build-local.sh -p linux/amd64,linux/arm64 -j2   # multi-arch (needs buildx)
+#   ./build-local.sh -b minimal php8.5     # fast local build via builder images
 
 set -euo pipefail
 
@@ -35,10 +40,14 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/build-logs"
-PARALLEL=1
+# Each parallel Docker build runs make -j$(nproc) internally, so halving avoids
+# CPU saturation when multiple builds compile simultaneously.
+_NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)
+PARALLEL=$(( _NCPU / 2 < 1 ? 1 : _NCPU / 2 ))
 DRY_RUN=false
 PLATFORM=""
 APT_PROXY=""
+USE_BUILDER=false
 
 # Auto-detect apt-cacher-ng on port 3142
 if nc -z 127.0.0.1 3142 2>/dev/null; then
@@ -94,11 +103,12 @@ usage() {
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
-while getopts ":v:p:j:nh" opt; do
+while getopts ":v:p:j:bnh" opt; do
     case $opt in
         v) VERSION="$OPTARG" ;;
         p) PLATFORM="$OPTARG" ;;
         j) PARALLEL="$OPTARG" ;;
+        b) USE_BUILDER=true ;;
         n) DRY_RUN=true ;;
         h) usage ;;
         :) err "Option -$OPTARG requires an argument."; exit 1 ;;
@@ -160,7 +170,45 @@ info "  Variants : ${VARIANTS[*]}"
 info "  Log dir  : ${LOG_DIR}"
 info "  Dry-run  : ${DRY_RUN}"
 info "  APT proxy: ${APT_PROXY:-none (start apt-cacher-ng on :3142 to enable)}"
+info "  Builder  : ${USE_BUILDER} (-b uses local/Dockerfile.* with pre-built Rust)"
 info "============================================================"
+
+# ---------------------------------------------------------------------------
+# Builder image management
+# ---------------------------------------------------------------------------
+ensure_builder() {
+    local VARIANT="$1"
+    # Maps variant → builder image tag and source Dockerfile
+    local IMG BDF
+    case "$VARIANT" in
+        minimal|wasm) IMG="ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1"
+                      BDF="${SCRIPT_DIR}/Dockerfile.builder-trixie" ;;
+        php8.5)       IMG="ghcr.io/freeunitorg/freeunit-builder:php8.5-rust1.94.1"
+                      BDF="${SCRIPT_DIR}/Dockerfile.builder-php8.5" ;;
+        *)            return 0 ;;  # no builder for this variant
+    esac
+
+    if docker image inspect "$IMG" &>/dev/null; then
+        info "Builder image found locally: ${IMG}"
+        return 0
+    fi
+
+    if $DRY_RUN; then
+        info "DRY-RUN: would pull/build builder image: ${IMG}"
+        return 0
+    fi
+
+    info "Builder image not found locally: ${IMG}"
+    info "Trying to pull from GHCR..."
+    if docker pull "$IMG" 2>/dev/null; then
+        info "Pulled: ${IMG}"
+        return 0
+    fi
+
+    info "Pull failed — building from ${BDF}"
+    docker build -t "$IMG" -f "$BDF" "${SCRIPT_DIR}" \
+        || { err "Failed to build builder image: ${IMG}"; return 1; }
+}
 
 # ---------------------------------------------------------------------------
 # Build function (runs in subshell for parallelism)
@@ -168,6 +216,12 @@ info "============================================================"
 build_variant() {
     local VARIANT="$1"
     local DOCKERFILE="${SCRIPT_DIR}/Dockerfile.${VARIANT}"
+
+    # Builder mode: use local/Dockerfile.* if available for this variant
+    if $USE_BUILDER && [[ -f "${SCRIPT_DIR}/local/Dockerfile.${VARIANT}" ]]; then
+        ensure_builder "$VARIANT"
+        DOCKERFILE="${SCRIPT_DIR}/local/Dockerfile.${VARIANT}"
+    fi
     local IMAGE_TAG="freeunit:${VERSION}-${VARIANT}"
     local LOG_FILE="${LOG_DIR}/${VARIANT}.log"
     local TMP_DOCKERFILE
@@ -236,8 +290,8 @@ build_variant() {
     } 2>&1 | tee "${LOG_FILE}"
 }
 
-export -f build_variant
-export VERSION SCRIPT_DIR LOG_DIR USE_BUILDX PLATFORM DRY_RUN APT_PROXY
+export -f build_variant ensure_builder
+export VERSION SCRIPT_DIR LOG_DIR USE_BUILDX PLATFORM DRY_RUN APT_PROXY USE_BUILDER
 
 # ---------------------------------------------------------------------------
 # Run builds

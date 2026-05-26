@@ -131,9 +131,11 @@ cd pkg/docker
 
 | Command | Description |
 |---------|-------------|
-| `./build-local.sh` | Build **all** variants sequentially |
+| `./build-local.sh` | Build **all** variants, `nproc/2` in parallel |
 | `./build-local.sh minimal php8.5` | Build only the listed variants |
 | `./build-local.sh -j4` | Build 4 variants in parallel (requires `parallel`) |
+| `./build-local.sh -b minimal php8.5` | Fast build via pre-built builder images (no apt/Rust download) |
+| `./build-local.sh -b` | Fast build all builder-supported variants |
 | `./build-local.sh -v 1.35.2` | Pin a specific FreeUnit version |
 | `./build-local.sh -p linux/arm64` | Build for a specific platform |
 | `./build-local.sh -p linux/amd64,linux/arm64 -j2` | Multi-arch build (requires buildx) |
@@ -147,10 +149,30 @@ as an APT proxy — no flags needed.
 ```
 -v VERSION   FreeUnit version string to pin (default: current git branch name)
 -p PLATFORM  Target platform (default: host arch, e.g. linux/amd64)
--j N         Number of parallel builds (default: 1)
+-j N         Number of parallel builds (default: nproc/2)
+-b           Builder mode — fast local builds via pre-built builder images
+             Skips apt install and Rust download; supported: minimal, wasm, php8.5
 -n           Dry-run — print commands, do not execute
 -h           Show help
 ```
+
+### Builder mode (-b): fast local iteration
+
+For `minimal`, `wasm`, and `php8.5` variants, `-b` uses pre-built builder images
+that already contain all build tools and Rust. This eliminates ~100 MB apt download
+and ~70 MB Rust download per build — useful for iterating locally.
+
+Builder images (`Dockerfile.builder-*`) are pulled from GHCR automatically, or
+built locally on first use if unavailable:
+
+```
+Dockerfile.builder-trixie   →  ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1
+Dockerfile.builder-php8.5   →  ghcr.io/freeunitorg/freeunit-builder:php8.5-rust1.94.1
+```
+
+The `local/` subdirectory contains the corresponding multi-stage Dockerfiles used
+with `-b`. These files are **not** used by CI — the GitHub Actions workflow always
+uses single-stage `Dockerfile.*` files without builder images.
 
 ### Logs
 
@@ -165,10 +187,12 @@ A summary (OK / FAILED) is printed at the end.
 | `wasm` | debian:trixie-slim |
 | `go1.24` | golang:1.24 |
 | `go1.25` | golang:1.25 |
+| `go1.26` | golang:1.26 |
 | `jsc17` | eclipse-temurin:17-jdk-noble |
 | `jsc21` | eclipse-temurin:21-jdk-noble |
 | `node20` | node:20 |
 | `node22` | node:22 |
+| `node24` | node:24 |
 | `perl5.38` | perl:5.38 |
 | `perl5.40` | perl:5.40 |
 | `php8.3` | php:8.3-cli |
@@ -182,6 +206,24 @@ A summary (OK / FAILED) is printed at the end.
 | `python3.14-slim` | python:3.14-slim |
 | `ruby3.3` | ruby:3.3 |
 | `ruby3.4` | ruby:3.4 |
+
+## Reference build environment
+
+Measured full build (all 23 variants, `./build-local.sh`) on the maintainer's local machine:
+
+| Parameter | Value |
+|-----------|-------|
+| CPU | AMD Ryzen 7 5700X — 8 cores / 16 threads |
+| RAM | 32 GiB |
+| Storage | NVMe SSD |
+| Docker | 29.5.0, `overlay2` |
+| Parallelism | 8 builds in parallel (`-j 8`, default `nproc/2`) |
+| APT cache | apt-cacher-ng on port 3142 (auto-detected) |
+| **Total time** | **~58 min** (23 variants, cold Docker layer cache) |
+
+With apt-cacher-ng, repeated builds that share base layers are significantly faster.
+Builder mode (`-b`) for `minimal`, `wasm`, and `php8.5` cuts those three variants to
+~2–3 min each by skipping apt and Rust downloads entirely.
 
 ## CI workflow
 

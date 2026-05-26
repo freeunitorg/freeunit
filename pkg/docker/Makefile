@@ -160,7 +160,7 @@ diff-%:
 all: $(addprefix Dockerfile., $(MODVERSIONS))
 
 clean:
-	rm -f Dockerfile.*
+	rm -f $(filter-out $(wildcard Dockerfile.builder-*), $(wildcard Dockerfile.*))
 	rm -f $(addprefix build-, $(MODVERSIONS))
 	rm -rf build-logs
 
