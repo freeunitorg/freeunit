@@ -92,6 +92,7 @@ RUN set -ex \
          --comment "unit user" \
          --shell /bin/false \
          unit \
+    && ldconfig \
     && ln -sf /dev/stderr /var/log/unit.log
 
 COPY docker-entrypoint.sh /usr/local/bin/
