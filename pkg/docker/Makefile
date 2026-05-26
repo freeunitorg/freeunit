@@ -161,7 +161,7 @@ all: $(addprefix Dockerfile., $(MODVERSIONS))
 
 clean:
 	rm -f Dockerfile.*
-	rm -f build-*
+	rm -f $(addprefix build-, $(MODVERSIONS))
 	rm -rf build-logs
 
 .PHONY: default build dockerfiles clean library

@@ -7,11 +7,19 @@
 #
 # Options:
 #   -v VERSION   FreeUnit version string to pin (default: git branch name)
-#   -p PLATFORM  Target platform (default: current host arch)
+#   -p PLATFORM  Target platform (default: current arch)
 #                Examples: linux/amd64  linux/arm64  linux/amd64,linux/arm64
 #   -j N         Parallel builds (default: 1)
 #   -n           Dry-run — print commands, do not execute
 #   -h           Show this help
+#
+# apt-cacher-ng (optional):
+#   If apt-cacher-ng is running on port 3142, it is detected automatically and
+#   used as an APT proxy — subsequent builds skip re-downloading .deb packages.
+#   Start it once with:
+#     docker run -d --name apt-cacher-ng --restart=always \
+#       -p 3142:3142 -v apt-cacher-ng:/var/cache/apt-cacher-ng \
+#       sameersbn/apt-cacher-ng
 #
 # Examples:
 #   ./build-local.sh                        # build all variants sequentially
@@ -30,6 +38,12 @@ LOG_DIR="${SCRIPT_DIR}/build-logs"
 PARALLEL=1
 DRY_RUN=false
 PLATFORM=""
+APT_PROXY=""
+
+# Auto-detect apt-cacher-ng on port 3142
+if nc -z 127.0.0.1 3142 2>/dev/null; then
+    APT_PROXY="http://host-gateway:3142"
+fi
 
 # Derive default version from git branch
 VERSION="$(git -C "${SCRIPT_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "local")"
@@ -145,6 +159,7 @@ info "  Parallel : ${PARALLEL}"
 info "  Variants : ${VARIANTS[*]}"
 info "  Log dir  : ${LOG_DIR}"
 info "  Dry-run  : ${DRY_RUN}"
+info "  APT proxy: ${APT_PROXY:-none (start apt-cacher-ng on :3142 to enable)}"
 info "============================================================"
 
 # ---------------------------------------------------------------------------
@@ -191,6 +206,13 @@ build_variant() {
             )
         fi
 
+        if [[ -n "$APT_PROXY" ]]; then
+            CMD+=(--add-host=host-gateway:host-gateway
+                  --build-arg "http_proxy=${APT_PROXY}"
+                  --build-arg "HTTP_PROXY=${APT_PROXY}"
+            )
+        fi
+
         echo "[$(date '+%H:%M:%S')] CMD    ${CMD[*]}"
 
         if $DRY_RUN; then
@@ -215,7 +237,7 @@ build_variant() {
 }
 
 export -f build_variant
-export VERSION SCRIPT_DIR LOG_DIR USE_BUILDX PLATFORM DRY_RUN
+export VERSION SCRIPT_DIR LOG_DIR USE_BUILDX PLATFORM DRY_RUN APT_PROXY
 
 # ---------------------------------------------------------------------------
 # Run builds

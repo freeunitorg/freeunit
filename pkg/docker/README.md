@@ -101,6 +101,21 @@ sudo usermod -aG docker "$USER"
 sudo apt-get install -y parallel
 ```
 
+### apt-cacher-ng (optional, speeds up repeated builds)
+
+Caches downloaded `.deb` packages locally — subsequent builds skip re-downloading
+~100 MB of build tools per variant. Start once, works automatically:
+
+```bash
+docker run -d --name apt-cacher-ng --restart=always \
+  -p 3142:3142 \
+  -v apt-cacher-ng:/var/cache/apt-cacher-ng \
+  sameersbn/apt-cacher-ng
+```
+
+`build-local.sh` detects apt-cacher-ng automatically (checks port 3142) and
+passes it as an APT proxy via `--build-arg`. No configuration needed.
+
 ### Verify installation
 
 ```bash
@@ -123,6 +138,9 @@ cd pkg/docker
 | `./build-local.sh -p linux/arm64` | Build for a specific platform |
 | `./build-local.sh -p linux/amd64,linux/arm64 -j2` | Multi-arch build (requires buildx) |
 | `./build-local.sh -n` | Dry-run — print commands without executing |
+
+If apt-cacher-ng is running on port 3142, it is detected automatically and used
+as an APT proxy — no flags needed.
 
 ### Options
 
