@@ -2,6 +2,54 @@
 
 ---
 
+## Release roadmap
+
+| Milestone | Due | Focus |
+|-----------|-----|-------|
+| **1.35.5** | current branch | Docker builder mode, parallel builds, Go 1.26, Node 24 |
+| **1.35.6** | 2026-06-25 | OTEL 0.24→0.32 (#65), Rust DX (`rust1.x` variant, `libunit-rust`) |
+| **1.35.7** | 2026-07-31 | Short-cycle release |
+| **1.35.8** | 2026-08-28 | Short-cycle release + Docker Hub Official Images (`make library`) |
+
+### Action plan — work streams & start dates
+
+**Now (June):**
+
+| Task | Milestone |
+|------|-----------|
+| Finish PR #66 (builder mode, parallel builds, README) | 1.35.5 |
+| OTEL Phase 0: config audit, new fields, `fake_otlp`, `test_otel.py` | 1.35.6 |
+| OTEL Phase 2: rewrite `nxt_otel_rs_runtime()` for 0.32 API (after Phase 0) | 1.35.6 |
+| `rust1.x` Docker variant (WASM path, `Dockerfile.rust1.x`) | 1.35.6 |
+
+**July (after 1.35.6):**
+
+| Task | Milestone |
+|------|-----------|
+| `libunit-rust` SDK — bindgen + FFI + axum adapter (prototype) | 1.35.7 |
+| Evaluate `libunit-rust` prototype → decide: WASM-first or native-first | 1.35.7 |
+| `packages.freeunit.org` — GoAccess / JSON stats for download counter | 1.35.7 |
+| `fake_upstream` prebuilt binary on `packages.freeunit.org` | 1.35.7 |
+
+**August 1 — start 1.35.8 work:**
+
+| Task | Milestone |
+|------|-----------|
+| Prepare `docker-library/official-images` PR: uncomment `make library` in Makefile, update `GitFetch`, test metadata generation | 1.35.8 |
+| Docker Hub Official Images: go through review process (docker-library/official-images PR template, CI validation) | 1.35.8 |
+| clang-ast plugin prebuilt binary on `packages.freeunit.org` | 1.35.8 |
+| `libunit-rust` — crates.io publish (if 1.35.7 prototype passes review) | 1.35.8 |
+| OTEL Phase 3: housekeeping (`"NGINX Unit"` → `"FreeUnit"`, `eprintln!` → log_callback) | 1.35.8 |
+
+**Open questions (decide before August):**
+
+- [ ] PHP TrueAsync — determine source of `nxt_php_extension.c` (fork EdmondDantes or write from scratch)
+- [ ] PHP 8.5 `rootfs` SIGSEGV — needs diagnostics on real hardware
+- [ ] OpenSSL 3.6 migration — verify clang-ast compatibility
+- [ ] Proxy request buffering (#58) — define scope (per-action vs global)
+
+---
+
 ## Release 1.35.6 — Rust developer experience
 
 **Goal:** attract Rust developers — the fastest-growing language community with no
