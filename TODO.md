@@ -2,6 +2,290 @@
 
 ---
 
+## Release roadmap
+
+| Milestone | Due | Focus |
+|-----------|-----|-------|
+| **1.35.5** | current branch | Docker builder mode, parallel builds, Go 1.26, Node 24 |
+| **1.35.6** | 2026-06-25 | OTEL 0.24→0.32 (#65), Rust DX (`rust1.x` variant, `libunit-rust`) |
+| **1.35.7** | 2026-07-31 | Short-cycle release |
+| **1.35.8** | 2026-08-28 | Short-cycle release + Docker Hub Official Images (`make library`) |
+
+### Action plan — work streams & start dates
+
+**Now (June):**
+
+| Task | Milestone |
+|------|-----------|
+| Finish PR #66 (builder mode, parallel builds, README) | 1.35.5 |
+| OTEL Phase 0: config audit, new fields, `fake_otlp`, `test_otel.py` | 1.35.6 |
+| OTEL Phase 2: rewrite `nxt_otel_rs_runtime()` for 0.32 API (after Phase 0) | 1.35.6 |
+| `rust1.x` Docker variant (WASM path, `Dockerfile.rust1.x`) | 1.35.6 |
+| Docker: make debug build optional (`--debug` flag in `build-local.sh`, off by default; saves ~30-40 MB per image) | 1.35.6 |
+
+**July (after 1.35.6):**
+
+| Task | Milestone |
+|------|-----------|
+| `libunit-rust` SDK — bindgen + FFI + axum adapter (prototype) | 1.35.7 |
+| Evaluate `libunit-rust` prototype → decide: WASM-first or native-first | 1.35.7 |
+| `packages.freeunit.org` — GoAccess / JSON stats for download counter | 1.35.7 |
+| `fake_upstream` prebuilt binary on `packages.freeunit.org` | 1.35.7 |
+
+**August 1 — start 1.35.8 work:**
+
+| Task | Milestone |
+|------|-----------|
+| Prepare `docker-library/official-images` PR: uncomment `make library` in Makefile, update `GitFetch`, test metadata generation | 1.35.8 |
+| Docker Hub Official Images: go through review process (docker-library/official-images PR template, CI validation) | 1.35.8 |
+| clang-ast plugin prebuilt binary on `packages.freeunit.org` | 1.35.8 |
+| `libunit-rust` — crates.io publish (if 1.35.7 prototype passes review) | 1.35.8 |
+| OTEL Phase 3: housekeeping (`"NGINX Unit"` → `"FreeUnit"`, `eprintln!` → log_callback) | 1.35.8 |
+
+**Open questions (decide before August):**
+
+- [ ] PHP TrueAsync — determine source of `nxt_php_extension.c` (fork EdmondDantes or write from scratch)
+- [ ] PHP 8.5 `rootfs` SIGSEGV — needs diagnostics on real hardware
+- [ ] OpenSSL 3.6 migration — verify clang-ast compatibility
+- [ ] Proxy request buffering (#58) — define scope (per-action vs global)
+
+---
+
+## Release 1.35.6 — Rust developer experience
+
+**Goal:** attract Rust developers — the fastest-growing language community with no
+dedicated app server since Unit was archived. FreeUnit becomes the first app server
+with a native Rust workflow.
+
+### Background & analysis (2026-05-26)
+
+- `rust:1-slim-trixie` confirmed on Docker Hub — ships Rust 1.95.0, `RUSTUP_HOME` /
+  `CARGO_HOME` already set, same layout as our `freeunit-builder:trixie-rust1.94.1`.
+  Image pulled and verified locally.
+- All 21 trixie-based Dockerfiles already download Rust at build time (for wasmtime /
+  wasm-wasi-component) and then discard it. The rust variant just keeps it in the final
+  image — same pattern as `go1.x` variants.
+- `libunit-go` is 676 lines of Go + 127 lines of C glue over `nxt_unit.c` (6800 lines).
+  Path A for `libunit-rust` (bindgen) is estimated at ~500–1000 lines of Rust — a
+  reasonable scope for a single contributor.
+- Path B (pure Rust protocol reimplementation) rejected: too risky, too large, no benefit
+  until `libunit-rust` has proven adoption.
+- No existing Rust SDK for Unit found on GitHub (searched `unit-rs`, `libunit-rust`,
+  `nginx-unit-rust`). First-mover advantage available.
+- axum: 26k ⭐, actix-web: 24k ⭐ — Rust web ecosystem is mature and large.
+- ngx-rust (https://github.com/nginx/ngx-rust) reviewed as reference. Longevity risk:
+  F5-controlled, WIP, 60% commits from one engineer — use as pattern reference only.
+
+### Step 1 — `rust1.x` Docker variant (WASM path, no C changes needed)
+
+Base image `rust:1-slim-trixie` already ships Rust 1.95.0 with `RUSTUP_HOME` /
+`CARGO_HOME` configured (same layout as our builder images). Only additions needed:
+- `rustup target add wasm32-wasip1` inside the Dockerfile
+- Build FreeUnit with wasm + wasm-wasi-component modules (same as `Dockerfile.wasm`)
+- Keep Rust toolchain in the final image — identical pattern to `go1.x` variants
+
+Result: `ghcr.io/freeunitorg/freeunit:latest-rust1.x` — write, compile, and serve
+Rust WASM apps from a single container. No external toolchain, no separate build step.
+
+- [ ] Create `pkg/docker/Dockerfile.rust1.x` based on `rust:1-slim-trixie`
+- [ ] Add `rust1.x` to `docker.yml` CI matrix
+- [ ] Add `rust1.x` to `ALL_VARIANTS` in `build-local.sh`
+- [ ] Add `rust1.x` to variants table in `pkg/docker/README.md`
+- [ ] Test: compile a minimal axum→WASM app and serve via FreeUnit wasm runtime
+
+### Step 2 — `libunit-rust` SDK (native path, Path A: bindgen + FFI)
+
+Mirrors `go/` library. Rust apps import `libunit-rust`, link `libnxt_unit.a`, and
+speak the Unit app-worker protocol directly — no WASM compilation needed.
+
+Architecture (same as Go):
+```
+nxt_unit.c (6800 lines)  ←  C protocol core, already battle-tested
+     ↓  bindgen on nxt_unit.h
+libunit-rust/src/ffi.rs  ←  generated FFI types (~auto)
+libunit-rust/src/lib.rs  ←  safe wrappers (~500-1000 lines)
+libunit-rust/src/axum.rs ←  axum/hyper adapter (drop-in replace for std listener)
+```
+
+Reference files: `go/unit.go`, `go/port.go`, `go/request.go`, `go/response.go`,
+`go/nxt_cgo_lib.h`.
+
+- [ ] Run `bindgen` on `src/nxt_unit.h` → `libunit-rust/src/ffi.rs`
+- [ ] Implement safe wrappers: port management, request/response, handler registry
+- [ ] Add `axum` adapter: `ListenAndServe(handler)` equivalent
+- [ ] Publish to crates.io as `libunit-rust`
+- [ ] Add example app to `tools/` or a separate `examples/rust/` directory
+
+### Why this matters for growth
+
+| | Today | After 1.35.6 |
+|---|---|---|
+| Rust WASM apps | manual setup | `docker pull freeunit:latest-rust1.x` |
+| Rust native apps | not supported | `libunit-rust` on crates.io |
+| Developer story | "compile to wasm32-wasi manually" | one-liner |
+
+Rust is the #1 most admired language (Stack Overflow 2024). No app server currently
+serves Rust developers. FreeUnit can own this space.
+
+---
+
+## OpenTelemetry crate upgrade 0.24 → 0.32 (issue #65, milestone 1.35.6)
+
+| Crate | Current | Latest | Gap |
+|-------|---------|--------|-----|
+| `opentelemetry` | 0.24.0 | 0.32.0 | 8 minor |
+| `opentelemetry-otlp` | 0.17.0 | 0.32.0 | 15 minor |
+| `opentelemetry_sdk` | 0.24.1 | 0.32.0 | 8 minor |
+| `opentelemetry-semantic-conventions` | 0.16.0 | 0.32.0 | 16 minor |
+
+Original implementation by Ava Hahn — co-author of FreeUnit's OTel layer.
+New account: [@ava-affine](https://github.com/ava-affine), `ava@sunnypup.io` (left F5, personal domain `sunnypup.io`).
+The upstream `nginx/nginx-otel` is a separate C++ module, unrelated to our Rust crate.
+
+### Known pitfalls (from code audit)
+
+- `opentelemetry_otlp::new_pipeline()` removed in 0.27 — `nxt_otel_rs_runtime()` must be
+  rewritten from scratch, not patched
+- `BoxedSpan` is passed as a raw pointer across the C FFI boundary (`r->otel->trace`);
+  verify its memory layout did not change between 0.24 and 0.32 before writing new code
+- `opentelemetry_sdk::trace::Config`, `BatchConfigBuilder`, `runtime::Tokio` — all moved
+  or removed; check new API in `opentelemetry_sdk` 0.32 docs
+- `Protocol::HttpJson` arm in the runtime match is unreachable dead code — fix in same PR
+- Service name `"NGINX Unit"` hardcoded in `lib.rs` lines 154 and 274 — rename to `"FreeUnit"`
+- `eprintln!` used for errors in `nxt_otel_rs_runtime()` instead of the `log_callback` —
+  fix while rewriting the function
+
+### Phase 0: Documentation audit + new config fields + test infrastructure (prerequisite)
+
+**Current config (4 fields):**
+```json
+{ "endpoint": "...", "protocol": "http", "batch_size": 128, "sampling_ratio": 1.0 }
+```
+
+**0a — Audit existing config:**
+- [ ] Audit current OTEL JSON config schema against `docs/unit-openapi.yaml`
+- [ ] Document all supported OTEL config fields and their defaults
+- [ ] Check for gaps between OpenAPI spec and actual C/Rust implementation
+
+**0b — New configuration fields (backward-compatible, current crate versions):**
+
+Hardcoded values that must become configurable:
+
+| Value | Current | Where | Proposed field |
+|-------|---------|-------|----------------|
+| Service name | `"NGINX Unit"` | `lib.rs:98,274` | `service_name` |
+| Max queue size | `4096` | `lib.rs:103` | `max_queue_size` |
+| Export timeout | `10s` | `lib.rs:27` | `export_timeout` |
+
+Missing fields needed for production OTEL:
+
+| Field | Type | Default | Why |
+|-------|------|---------|-----|
+| `service_name` | string | `"FreeUnit"` | Replaces hardcoded `"NGINX Unit"`; every service needs its own name |
+| `headers` | object | `{}` | Auth to collector (`Authorization: Bearer ...`, `X-Api-Key`) |
+| `root_certificate` | string | — | Custom CA for TLS collector connection |
+| `resource_attributes` | object | `{}` | `service.version`, `deployment.environment`, custom labels |
+| `max_queue_size` | integer | `4096` | Replaces hardcoded queue depth |
+| `export_timeout` | integer (sec) | `10` | Replaces hardcoded timeout |
+
+Bug fixes in existing fields:
+- [ ] Fix `protocol`: add `enum: ["http", "grpc"]` to OpenAPI; sync required/optional between C validator and OpenAPI
+- [ ] Fix `batch_size`: add upper bound validation (e.g. `<= 65536`)
+- [ ] Fix span attributes to use OTel semconv: `"method"` → `http.request.method`, `"path"` → `url.path`, `"status"` → `http.response.status_code`
+- [ ] Wrap sampler in `ParentBased(TraceIdRatioBased(...))` — respect upstream sampling decisions
+- [ ] Pass `tracestate` through to Rust OTEL SDK (currently parsed in C, echoed, but dropped)
+
+New fields implementation:
+- [ ] Add all new fields to `docs/unit-openapi.yaml` (`configSettingsTelemetry` schema)
+- [ ] Add validators in `src/nxt_conf_validation.c`
+- [ ] Parse new fields in `src/nxt_router.c`
+- [ ] Accept and use new parameters in `src/otel/src/lib.rs`
+
+**Proposed full config after Phase 0:**
+```json
+{
+  "settings": {
+    "telemetry": {
+      "endpoint": "http://collector:4318",
+      "protocol": "http",
+      "service_name": "my-app",
+      "sampling_ratio": 1.0,
+      "batch_size": 128,
+      "max_queue_size": 4096,
+      "export_timeout": 10,
+      "headers": { "Authorization": "Bearer token" },
+      "root_certificate": "/path/to/ca.pem",
+      "resource_attributes": {
+        "service.version": "1.0.0",
+        "deployment.environment": "production"
+      }
+    }
+  }
+}
+```
+
+**0c — Test infrastructure:**
+- [ ] Build `test/fake_otlp/` — std-only Rust mock OTLP collector
+
+**fake_otlp design** — mirrors `test/fake_upstream/` exactly: single Rust binary,
+no external deps, installed to `/usr/local/bin/fake_otlp` in CI (same step as
+`fake_upstream`).
+
+```
+fake_otlp --port 19878 --requests 1
+```
+
+- Accepts `POST /v1/traces`, validates `Content-Type: application/x-protobuf` + non-empty body
+- Responds `200 OK` with empty body (valid `ExportTraceServiceResponse`)
+- Prints `span_received content_length=NNN` to stdout per request
+- Exits after `--requests N`
+- **HTTP only** — gRPC (HTTP/2) not supported; document as "use a real collector for gRPC"
+
+- [ ] Write `test/test_otel.py` — gated on `FAKE_OTLP_BIN` + `--otel` build flag:
+
+| Test | What it checks |
+|------|----------------|
+| `test_otel_span_exported` | span arrives at fake_otlp after one FreeUnit request |
+| `test_otel_traceparent_propagated` | FreeUnit injects `traceparent` header into forwarded request |
+| `test_otel_sampling_zero` | `sampling_ratio=0.0` → fake_otlp receives nothing (stays alive) |
+| `test_otel_service_name` | exported span contains configured `service_name` |
+| `test_otel_auth_header` | fake_otlp receives configured `headers` (Authorization) |
+| `test_otel_resource_attributes` | span resource contains custom attributes |
+
+- [ ] Verify all Phase 0 tests pass against the **current** 0.24 crates (establishes baseline)
+
+### Phase 1: Pre-upgrade safety checks
+
+- [ ] Verify `BoxedSpan` layout compatibility between 0.24 and 0.32 — `Arc<BoxedSpan>`
+      crosses C FFI as raw pointer; layout change = UB. If trait bounds changed (e.g. added
+      `Send + Sync`), introduce an intermediate opaque wrapper type
+- [ ] Confirm `Protocol::HttpJson` is dead code — remove unreachable match arm
+
+### Phase 2: Crate upgrade — full rewrite of `nxt_otel_rs_runtime()`
+
+- [ ] Bump all `opentelemetry*` crates to 0.32.x in `src/otel/Cargo.toml`
+- [ ] Rewrite `nxt_otel_rs_runtime()` — `new_pipeline()`, `new_exporter()`, `.tracing()`,
+      `.with_trace_config()`, `.with_batch_config()`, `.install_batch()` all gone in 0.27+.
+      Use `TracerProvider::builder()` + new `OtlpTracePipeline` API
+- [ ] Replace `opentelemetry_sdk::trace::Config` → `TracerProviderBuilder`
+- [ ] Replace `BatchConfigBuilder` → new location/API
+- [ ] Replace `opentelemetry_sdk::runtime::Tokio` → new runtime model
+- [ ] Adapt `src/otel/src/lib.rs` to all remaining API changes
+- [ ] Update `src/nxt_otel.c` / `nxt_otel.h` if Rust ABI changed
+- [ ] Run `test/test_otel.py` against upgraded code — must pass same baseline tests
+
+### Phase 3: Housekeeping fixes (same PR)
+
+- [ ] Rename `"NGINX Unit"` → `"FreeUnit"` in `lib.rs` (lines 154, 274)
+- [ ] Replace `eprintln!` (lib.rs lines 188–189, 204) with `nxt_otel_log_callback`
+
+### Phase 4: Final verification
+
+- [ ] Build with `./configure --otel --openssl && make`; run clang-ast check
+- [ ] Full `test/test_otel.py` pass
+
+---
+
 ## PHP TrueAsync mode (branch: php-graceful-shutdown)
 
 Items below must be resolved before the branch can be merged and before
@@ -188,6 +472,31 @@ inside a chroot/rootfs-isolated Unit application.
 
 ## Test Infrastructure
 
+### Download statistics for packages.freeunit.org
+
+`packages.freeunit.org` serves tarballs (njs, wasmtime, wasi-sysroot, libunit-wasm)
+but there is no download counter — no visibility into which packages are downloaded
+and how often.
+
+Server runs **Angie** (nginx-compatible fork, COMBINED log format).
+
+**Options (ascending complexity):**
+- [ ] **GoAccess** — install on server, parse Angie access log, publish HTML report to
+      `packages.freeunit.org/stats/`
+- [ ] **JSON counter via cron** — hourly `awk` over access.log → `stats.json`, enables
+      badge endpoints or API consumers
+- [ ] **Angie NJS counter** — shared-memory counter incremented per `.tar.gz` request,
+      exposed as `/metrics` endpoint (no log parsing needed, real-time)
+
+**Quick start (GoAccess):**
+```bash
+sudo apt-get install -y goaccess
+goaccess /var/log/angie/packages.freeunit.org.access.log \
+  --log-format=COMBINED -o /var/www/packages.freeunit.org/stats/index.html
+```
+
+---
+
 ### Prebuild `fake_upstream` binary via packages.freeunit.org
 
 `test/fake_upstream/` — Rust HTTP mock used by `test_proxy_chunked.py`.
@@ -217,6 +526,98 @@ Fixed: use `clang llvm-dev libclang-dev` (not `clang-21 llvm-21-dev libclang-21-
 - [ ] Prebuild `freeunit-test-full:local` image and publish to GHCR
 - [ ] Or add packages.freeunit.org binary for clang-ast plugin
 - [ ] Cache Docker layers for apt install + clang-ast build
+
+---
+
+## avahahn/ngx-testing-fmk — evaluate as cross-platform test orchestration reference
+
+https://github.com/avahahn/ngx-testing-fmk — personal shell-based framework by Ava Hahn
+(ex-F5, co-author of FreeUnit OTel layer; new account: [@ava-affine](https://github.com/ava-affine), `ava@sunnypup.io`) for running nginx/nginx-otel tests across multiple
+libvirt VMs in parallel.
+
+**What it does:** boots libvirt VMs, rsyncs source + test dirs, builds and runs tests
+on each VM in parallel, collects logs, shuts VMs down. `common.sh` provides a reusable
+`parallel_invoke_and_wait` bash helper (fan-out with aggregated exit codes).
+
+**Why it is not a direct fit for FreeUnit:**
+- Hardwired to nginx + nginx-tests + nginx-otel — no Unit/FreeUnit hooks
+- Requires a pre-configured libvirt infrastructure with shared credentials (`SECRET.sh`)
+- FreeUnit already has pytest (`test/`) + GitHub Actions CI covering the same ground
+- 0 stars, last commit Jan 2025, no active maintenance
+
+**What is worth studying:**
+- `parallel_invoke_and_wait` pattern in `common.sh` — clean bash fan-out with per-input
+  log files and aggregated failure reporting; could inform a future `test/run-matrix.sh`
+  if we ever need to test across distros locally without Docker
+- Overall VM lifecycle approach (on → sync → build → test → off) as a template if we add
+  libvirt/QEMU-based cross-distro testing outside of GitHub Actions
+
+**Decision:** no code to borrow now. Revisit if we add a local multi-distro test matrix.
+
+---
+
+## ngx-rust — study Rust bindings and evaluate Rust runtime for FreeUnit
+
+https://github.com/nginx/ngx-rust — Rust bindings for nginx dynamic modules by F5/NGINX.
+
+**Longevity risk:** project is F5-controlled, WIP, and 60% of commits come from a single
+engineer (`bavshin-f5`). F5 archived nginx/unit in Oct 2025 — same pattern applies here.
+Use as a reference only; do not take a hard dependency.
+
+**ngx-rust ≠ Rust runtime support.** ngx-rust is about writing nginx *modules* in Rust.
+For FreeUnit there are two separate ideas worth separating:
+
+### Idea 1 — Write FreeUnit C-layer extensions in Rust (like ngx-rust does for nginx)
+Study `nginx-sys` FFI layer and `build.rs`/bindgen approach; apply safe/unsafe separation
+patterns to `src/otel/`.
+
+- [ ] Clone ngx-rust, study `nginx-sys` (FFI) and `build.rs` (bindgen)
+- [ ] Apply safe wrapper patterns to `src/otel/`
+
+### Idea 2 — Rust as a language runtime
+
+**Current state:** no native Rust runtime exists.
+- Go has `go/` library (`libunit-go`, 676 lines) — apps import it, it links `libnxt_unit.a`
+  and speaks the Unit app-worker protocol via Unix sockets.
+- Rust apps today: only path is compile to `wasm32-wasi` → run via FreeUnit wasm runtime.
+
+**Path A — bindgen + FFI (recommended, ~2–4 weeks)**
+- Run `bindgen` on `nxt_unit.h` → generate Rust FFI types
+- Write safe wrappers (~500–1000 lines), mirroring `go/unit.go`, `go/port.go`,
+  `go/request.go`, `go/response.go`
+- Add `axum`/`hyper` adapter so users drop in `libunit-rust` like they do `libunit-go`
+- Pro: reuses existing 6800-line `nxt_unit.c`, protocol already battle-tested
+- Con: C linkage required (`libnxt_unit.a`), same as Go
+
+**Path B — pure Rust protocol reimplementation (~2–3 months, high risk)**
+- Reverse-engineer Unix socket framing from `nxt_unit.c` (6800 lines)
+- Pro: no C dependency, fully async-native (tokio)
+- Con: high risk of protocol bugs, large effort
+
+**Recommendation:** Path A first. Path B only if `libunit-rust` gains traction and
+users demand a zero-C dependency.
+
+- [ ] Prototype `libunit-rust` via Path A (reference: `go/*.go`, `src/nxt_unit.h`)
+- [ ] Decide: native `libunit-rust` vs WASM-first (WASM works today, lower barrier)
+
+### Idea 3 — `rust` Docker variant (WASM path, no libunit-rust needed)
+
+All trixie-based Dockerfiles already install Rust at build time (for wasmtime /
+wasm-wasi-component) and then discard it. Go variants keep Go in the final image
+(`FROM golang:1.24-trixie`). Same pattern applies for Rust:
+
+Proposed `Dockerfile.rust1.x`:
+- Base: `FROM rust:1-slim-trixie` (official Rust image, trixie variant)
+- Add `wasm32-wasip1` target: `rustup target add wasm32-wasip1`
+- Build FreeUnit with wasm + wasm-wasi-component modules (same as `Dockerfile.wasm`)
+- Keep Rust toolchain in final image — users compile and serve Rust WASM in one container
+
+Value: "compile and run Rust WASM apps with a single FreeUnit container" — no separate
+build step, no external toolchain. Works today via existing wasm runtime.
+
+- [ ] Check `rust:1-slim-trixie` exists on Docker Hub and is suitable as base
+- [ ] Add `Dockerfile.rust1.x` to `pkg/docker/` and `docker.yml` matrix
+- [ ] Add `rust1.x` to `build-local.sh` ALL_VARIANTS
 
 ---
 
