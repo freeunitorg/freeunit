@@ -1,5 +1,22 @@
 # FreeUnit Test Suite
 
+## CRITICAL: Docker-only
+
+**ALL build and test commands MUST run inside Docker.** Never run
+`./configure`, `make`, `pytest-3`, `python3`, or any language runtime
+directly on the host — host drift hides bugs that surface in CI.
+
+Use `./test/run-local.sh` (preferred). For one-shot commands, override
+the fixed `ENTRYPOINT` (which is `bash -c "...build...exec pytest-3 $@"`)
+and mount at `/unit` (the image `WORKDIR`):
+
+```bash
+docker run --rm --entrypoint bash -v "$(pwd):/unit" -w /unit \
+    freeunit-test:local -c '<cmd>'
+```
+
+See project-root `CLAUDE.md` for the full allowed/forbidden list.
+
 ## Running Tests
 
 Tests require **root privileges** because Unit creates Unix domain sockets,
@@ -83,6 +100,9 @@ sudo pytest-3 --print-log --restart test/
 
 # 7. Save logs after execution
 sudo pytest-3 --print-log --save-log test/
+
+# 8. Run clang-ast AST analysis (C-code quality check)
+./test/run-local.sh --clang-ast
 ```
 
 ## Test Structure

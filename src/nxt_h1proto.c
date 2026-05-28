@@ -1149,6 +1149,24 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
 
             if (h1p->chunked_parse.last) {
                 body_rest = 0;
+
+            } else if (h1p->chunked_parse.chunk_size > 0) {
+                /* Mid-chunk: chunk_parse consumed the entire buffer but did not
+                 * advance b->mem.pos (CHUNK_MIDDLE path in chunk_buffer).
+                 * Reset so nxt_conn_read has space on the next iteration. */
+                b->mem.free = b->mem.start;
+                b->mem.pos = b->mem.start;
+
+            } else {
+                /* Between chunks: chunk_parse advanced b->mem.pos past all
+                 * framing.  Compact any leftover bytes to the front so
+                 * nxt_conn_read appends after them. */
+                size = (size_t) (b->mem.free - b->mem.pos);
+                if (size > 0) {
+                    nxt_memmove(b->mem.start, b->mem.pos, size);
+                }
+                b->mem.free = b->mem.start + size;
+                b->mem.pos = b->mem.start;
             }
 
         } else {
@@ -2380,6 +2398,7 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
     nxt_conn_t          *c;
     nxt_http_field_t    *field;
     nxt_http_request_t  *r;
+    nxt_off_t           content_length;
 
     nxt_debug(task, "h1p peer header send");
 
@@ -2395,9 +2414,31 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
            + sizeof("Connection: close\r\n")
            + sizeof("\r\n");
 
+    /* Emit Content-Length after chunked_transform; NULL body → value 0. */
+    content_length = -1;
+    if (r->chunked) {
+        if (r->body == NULL) {
+            content_length = 0;
+        } else {
+            nxt_buf_t  *b;
+
+            content_length = 0;
+
+            for (b = r->body; b != NULL; b = b->next) {
+                if (nxt_buf_is_file(b)) {
+                    content_length += b->file_end - b->file_pos;
+                } else {
+                    content_length += nxt_buf_mem_used_size(&b->mem);
+                }
+            }
+        }
+        /* Account for Content-Length header size (max off_t length + "Content-Length: \r\n"). */
+        size += nxt_length("Content-Length: ") + NXT_OFF_T_LEN + nxt_length("\r\n");
+    }
+
     nxt_list_each(field, r->fields) {
 
-        if (!field->hopbyhop) {
+        if (!field->hopbyhop && !field->skip) {
             size += field->name_length + field->value_length;
             size += nxt_length(": \r\n");
         }
@@ -2419,7 +2460,7 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
 
     nxt_list_each(field, r->fields) {
 
-        if (!field->hopbyhop) {
+        if (!field->hopbyhop && !field->skip) {
             p = nxt_cpymem(p, field->name, field->name_length);
             *p++ = ':'; *p++ = ' ';
             p = nxt_cpymem(p, field->value, field->value_length);
@@ -2427,6 +2468,12 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
         }
 
     } nxt_list_loop;
+
+    if (content_length >= 0) {
+        p = nxt_cpymem(p, "Content-Length: ", nxt_length("Content-Length: "));
+        p = nxt_sprintf(p, header->mem.end, "%O", content_length);
+        *p++ = '\r'; *p++ = '\n';
+    }
 
     *p++ = '\r'; *p++ = '\n';
     header->mem.free = p;

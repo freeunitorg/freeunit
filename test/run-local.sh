@@ -23,6 +23,8 @@
 #   ./run-local.sh -t test_a.py -t test_b.py  # multiple test files
 #   ./run-local.sh unit python php          # multiple modules
 #
+# For pre-commit / PR static analysis (clang-ast): ./test/run-local-full.sh
+#
 # To force rebuild: docker rmi freeunit-test:local
 
 set -euo pipefail
@@ -70,25 +72,28 @@ usage() {
 MODULES=()
 TEST_ARGS=()
 
-while getopts ":m:t:nh" opt; do
-    case $opt in
-        m) MODULES+=("$OPTARG") ;;
-        t) TEST_ARGS+=("$OPTARG") ;;
-        n) DRY_RUN=true ;;
-        h) usage ;;
-        :) err "Option -$OPTARG requires an argument."; exit 1 ;;
-       \?) err "Unknown option: -$OPTARG"; exit 1 ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -m) [[ -z "${2:-}" || "$2" == -* ]] && { err "-m requires an argument"; exit 1; }; MODULES+=("$2"); shift 2 ;;
+        -t) [[ -z "${2:-}" || "$2" == -* ]] && { err "-t requires an argument"; exit 1; }; TEST_ARGS+=("$2"); shift 2 ;;
+        -n) DRY_RUN=true; shift ;;
+        -h) usage ;;
+        -*) err "Unknown option: $1"; exit 1 ;;
+        *) MODULES+=("$1"); shift ;;
     esac
 done
-shift $((OPTIND - 1))
-
-# Positional args are module names
-MODULES+=("$@")
 
 # Defaults: no -t and no modules → run full unit test suite
 if [[ ${#TEST_ARGS[@]} -eq 0 ]] && [[ ${#MODULES[@]} -eq 0 ]]; then
     MODULES=("unit")
 fi
+
+# Normalize: prepend test/ when -t is bare test_*.py or test_*.py::nodeid
+for i in "${!TEST_ARGS[@]}"; do
+    if [[ "${TEST_ARGS[$i]}" == test_* && "${TEST_ARGS[$i]}" != test/* ]]; then
+        TEST_ARGS[$i]="test/${TEST_ARGS[$i]}"
+    fi
+done
 
 # Expand modules → test path patterns (only when -t not given)
 if [[ ${#TEST_ARGS[@]} -eq 0 ]] && [[ ${#MODULES[@]} -gt 0 ]]; then
@@ -227,6 +232,8 @@ ENTRYPOINT ["bash", "-c", "\
     printf 'NXT_INCS += -I%s/pkg/contrib/njs/src -I%s/pkg/contrib/njs/build\\n' \
         $(pwd) $(pwd) >> build/Makefile && \
     make python3 && \
+    cargo build --release --manifest-path test/fake_upstream/Cargo.toml && \
+    cp test/fake_upstream/target/release/fake_upstream /usr/local/bin/fake_upstream && \
     exec pytest-3 --print-log $@ \
 ", "bash"]
 

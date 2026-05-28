@@ -12,8 +12,8 @@
 #   go1.24      EOL ~Feb 2026  -> supported until Feb 2027
 #   go1.25      EOL ~Aug 2026  -> supported until Aug 2027
 #   go1.26      EOL ~Feb 2027  -> supported until Feb 2028
-#   jsc17       EOL Sep 2029 (OpenJDK 17 LTS, Eclipse Temurin) -> supported until Sep 2030
-#   jsc21       EOL Sep 2031 (OpenJDK 21 LTS, Eclipse Temurin) -> supported until Sep 2032
+#   jsc17       EOL Oct 2027 (OpenJDK 17 LTS, Eclipse Temurin) -> supported until Oct 2028
+#   jsc21       EOL Dec 2029 (OpenJDK 21 LTS, Eclipse Temurin) -> supported until Dec 2030
 #   node20      EOL Apr 2026   -> supported until Apr 2027
 #   node22      EOL Apr 2027   -> supported until Apr 2028
 #   node24      EOL Apr 2028   -> supported until Apr 2029

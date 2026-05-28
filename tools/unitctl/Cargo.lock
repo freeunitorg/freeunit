@@ -243,10 +243,11 @@ checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
 
 [[package]]
 name = "cc"
-version = "1.2.30"
+version = "1.2.62"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "deec109607ca693028562ed836a5f1c4b8bd77755c4e132fc5ce11b0b6211ae7"
+checksum = "a1dce859f0832a7d088c4f1119888ab94ef4b5d6795d1ce05afb7fe159d79f98"
 dependencies = [
+ "find-msvc-tools",
  "jobserver",
  "libc",
  "shlex",
@@ -514,6 +515,12 @@ dependencies = [
  "libredox",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "find-msvc-tools"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "fnv"
@@ -2279,7 +2286,7 @@ checksum = "5a5f39404a5da50712a4c1eecf25e90dd62b613502b7e925fd4e4d19b5c96512"
 
 [[package]]
 name = "unit-client-rs"
-version = "1.35.0"
+version = "1.35.5"
 dependencies = [
  "bollard",
  "custom_error",
@@ -2302,7 +2309,7 @@ dependencies = [
 
 [[package]]
 name = "unit-openapi"
-version = "1.35.0"
+version = "1.35.5"
 dependencies = [
  "base64 0.21.7",
  "futures",
@@ -2316,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "unitctl"
-version = "1.35.0"
+version = "1.35.5"
 dependencies = [
  "clap",
  "colored_json",
