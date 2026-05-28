@@ -59,7 +59,6 @@ VERSION="${VERSION//\//-}"   # replace / with - (e.g. feat/foo → feat-foo)
 ALL_VARIANTS=(
     minimal
     wasm
-    go1.24
     go1.25
     go1.26
     jsc17

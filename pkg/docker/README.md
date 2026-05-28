@@ -185,7 +185,6 @@ A summary (OK / FAILED) is printed at the end.
 |---------|-----------|
 | `minimal` | debian:trixie-slim |
 | `wasm` | debian:trixie-slim |
-| `go1.24` | golang:1.24 |
 | `go1.25` | golang:1.25 |
 | `go1.26` | golang:1.26 |
 | `jsc17` | eclipse-temurin:17-jdk-noble |

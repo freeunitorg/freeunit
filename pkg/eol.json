@@ -46,7 +46,6 @@
   },
   "runtimes": {
     "go": [
-      {"version": "1.24", "eol": "2026-02", "supported_until": "2027-02", "note": "EOL"},
       {"version": "1.25", "eol": "2026-08", "supported_until": "2027-08"},
       {"version": "1.26", "eol": "2027-02", "supported_until": "2028-02"}
     ],
