@@ -166,7 +166,7 @@ LABEL org.opencontainers.image.vendor="FreeUnit Community <team@freeunit.org>"
 ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_HOME=/usr/src/unit/cargo \
     RUSTUP_HOME=/usr/src/unit/rustup \
-    PATH=/usr/src/unit/cargo/bin:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    PATH=/usr/local/go/bin:/usr/src/unit/cargo/bin:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 RUN set -ex \
     && apt-get update \
@@ -191,6 +191,13 @@ RUN set -ex \
     && ./rustup-init -y --no-modify-path --profile minimal --default-toolchain $RUST_VERSION --default-host ${rustArch} \
     && rm rustup-init \
     && rustup --version && cargo --version && rustc --version \
+    && goArch="$(dpkg --print-architecture)" \
+    && goVer="$(curl -fsSL 'https://go.dev/dl/?mode=json' \
+                | grep -oE '"version": *"go[0-9.]+"' | head -n1 \
+                | grep -oE 'go[0-9.]+')" \
+    && curl -fsSL "https://go.dev/dl/${goVer}.linux-${goArch}.tar.gz" \
+         | tar -C /usr/local -xz \
+    && /usr/local/go/bin/go version \
     && mkdir -p /usr/lib/unit/modules /usr/lib/unit/debug-modules \
     && adduser --system --group --no-create-home unit
 
@@ -232,6 +239,11 @@ ENTRYPOINT ["bash", "-c", "\
     printf 'NXT_INCS += -I%s/pkg/contrib/njs/src -I%s/pkg/contrib/njs/build\\n' \
         $(pwd) $(pwd) >> build/Makefile && \
     make python3 && \
+    if command -v go >/dev/null 2>&1; then \
+        ./configure go --go-path=$(pwd)/build/go && \
+        make go && \
+        make go-install; \
+    fi && \
     cargo build --release --manifest-path test/fake_upstream/Cargo.toml && \
     cp test/fake_upstream/target/release/fake_upstream /usr/local/bin/fake_upstream && \
     exec pytest-3 --print-log $@ \
