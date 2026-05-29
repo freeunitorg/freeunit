@@ -187,7 +187,7 @@ jobs:
         with:
           artifacts: "unitctl-*"
           prerelease: ${{ github.event_name == 'workflow_dispatch' }}
-          tag: ${{ inputs.version && format('unitctl/{0}', inputs.version) || github.ref_name }}
+          tag: ${{ inputs.version && format('unitctl/{0}', inputs.version) || format('unitctl/{0}', github.ref_name) }}
           body: >
             ## Unitctl
 
