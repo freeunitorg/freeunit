@@ -199,7 +199,10 @@ fn main() {
                     }
                 }
             }
-            Err(_) => break,
+            // A transient accept error (e.g. a peer reset before accept
+            // completes) must not kill the collector mid-test — log and keep
+            // serving subsequent connections.
+            Err(e) => eprintln!("fake_otlp: accept error: {e}"),
         }
     }
 }

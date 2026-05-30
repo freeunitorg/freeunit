@@ -62,6 +62,12 @@ fn provider_slot() -> &'static Mutex<Option<SdkTracerProvider>> {
 /// points at `s.length` valid bytes for the duration of the call; we copy
 /// because batch-exported spans outlive the request memory these reference.
 unsafe fn nxt_str_to_string(s: &nxt_str_t) -> String {
+    // `slice::from_raw_parts` requires a non-null, aligned pointer even when
+    // the length is zero. C may hand us a `nxt_str_t` with a NULL `start` for
+    // an empty or uninitialised value, so guard against it to avoid UB.
+    if s.start.is_null() || s.length == 0 {
+        return String::new();
+    }
     String::from_utf8_unchecked(slice::from_raw_parts(s.start, s.length).to_vec())
 }
 
