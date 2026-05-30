@@ -2945,6 +2945,7 @@ nxt_h1p_peer_body_process(nxt_task_t *task, nxt_http_peer_t *peer,
 static void
 nxt_h1p_peer_closed(nxt_task_t *task, void *obj, void *data)
 {
+    nxt_h1proto_t       *h1p;
     nxt_http_peer_t     *peer;
     nxt_http_request_t  *r;
 
@@ -2955,9 +2956,24 @@ nxt_h1p_peer_closed(nxt_task_t *task, void *obj, void *data)
     r = peer->request;
 
     if (peer->header_received) {
+        h1p = peer->proto.h1;
+
+        if (h1p->chunked && !h1p->chunked_parse.last) {
+            /*
+             * Upstream closed without the terminal chunk — premature EOF.
+             * Synthesising 0\r\n\r\n would hide the truncation from the
+             * client.  Treat as an error: if headers are already sent the
+             * error path resets the client connection; otherwise a 502 is
+             * returned.
+             */
+            peer->status = NXT_HTTP_BAD_GATEWAY;
+            r->state->error_handler(task, r, peer);
+            return;
+        }
+
         peer->body = nxt_http_buf_last(r);
         peer->closed = 1;
-        r->inconsistent = (peer->proto.h1->remainder != 0);
+        r->inconsistent = (h1p->remainder != 0);
 
         r->state->ready_handler(task, r, peer);
 
@@ -3059,6 +3075,21 @@ nxt_h1p_peer_close(nxt_task_t *task, nxt_http_peer_t *peer)
     c->socket.task = task;
     c->read_timer.task = task;
     c->write_timer.task = task;
+
+    /*
+     * Block further reads on the upstream connection and cancel its read
+     * timer.  Removal of the fd from the event facility is deferred to
+     * nxt_conn_close_handler(), but the peer object (c->socket.data) lives in
+     * the request memory pool and may be freed synchronously right after this
+     * close (e.g. nxt_http_proxy_error() releases the pool when the client
+     * aborts mid-response).  A read event already queued for this connection in
+     * the current engine cycle, or the autoreset read timer firing, would then
+     * reach nxt_h1p_peer_read_done()/nxt_h1p_peer_timer_value() and dereference
+     * the freed peer -- a use-after-free that crashes the router.  Setting
+     * block_read makes the queued nxt_conn_io_read() bail out early.
+     */
+    c->block_read = 1;
+    nxt_timer_disable(task->thread->engine, &c->read_timer);
 
     if (c->socket.fd != -1) {
         c->write_state = &nxt_h1p_peer_close_state;

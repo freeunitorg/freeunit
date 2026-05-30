@@ -65,6 +65,43 @@ docker rmi freeunit-test:local
 ./test/run-local.sh python
 ```
 
+### Fast prototyping with the pre-built builder image
+
+`run-local.sh` builds a full test image from scratch (downloads Rust, Go, njs)
+— slow for tight iteration. For prototyping a **proxy / TLS** test (no language
+runtime needed), reuse the pre-built builder image
+`ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1` (Rust + all C build
+deps already baked in) and just mount the working tree. Build + run is ~30 s:
+
+```bash
+docker run --rm --privileged -v "$(pwd):/unit" -w /unit \
+  ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1 bash -c '
+    apt-get update -qq && apt-get install -y -qq python3-pytest python3-openssl
+    ./configure --openssl --tests
+    make -j"$(nproc)" unitd
+    cargo build --release --manifest-path test/fake_upstream/Cargo.toml
+    cp test/fake_upstream/target/release/fake_upstream /usr/local/bin/
+    pytest-3 --print-log test/test_proxy_chunked.py -q
+  '
+```
+
+Iterate by editing tests on the host (tree is mounted) and re-running; the C
+core and `fake_upstream` rebuild incrementally.
+
+**Caveats:**
+
+- **No language module is built**, so a test gated on one is skipped. A test
+  file with `prerequisites = {'modules': {'python': 'any'}}` (and a
+  `ApplicationPython()` client) skips entirely here. For proxy/TLS-only cases,
+  base the test on `ApplicationProto` (plain) or `ApplicationTLS` (TLS) and
+  omit the language `prerequisites` so it runs on the minimal `--openssl
+  --tests` build.
+- The build writes `build/` into the mounted tree as **root**. Run
+  `sudo rm -rf build` on the host afterwards, or use `run-local.sh` (copies to
+  a tmp dir) when you want isolation.
+- This path is for prototyping only. Before pushing, validate with
+  `./test/run-local.sh` (full matrix) and, for C changes, the clang-ast check.
+
 ### Running Tests Directly on Host
 
 If you prefer to run tests natively (requires all dependencies installed):
