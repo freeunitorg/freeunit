@@ -68,7 +68,10 @@ unsafe fn nxt_str_to_string(s: &nxt_str_t) -> String {
     if s.start.is_null() || s.length == 0 {
         return String::new();
     }
-    String::from_utf8_unchecked(slice::from_raw_parts(s.start, s.length).to_vec())
+    // Header values are arbitrary bytes, not guaranteed UTF-8; `from_utf8_lossy`
+    // replaces any invalid sequence with U+FFFD instead of constructing an
+    // invalid `String` (which `from_utf8_unchecked` would — that is itself UB).
+    String::from_utf8_lossy(slice::from_raw_parts(s.start, s.length)).into_owned()
 }
 
 /// Log a message through the C callback. `msg` must be a valid C string body.
