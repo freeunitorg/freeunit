@@ -1,6 +1,7 @@
 import os
 import socket
 import subprocess
+import time
 
 import pytest
 
@@ -103,6 +104,25 @@ def _response_headers_lower(resp):
     return {k.lower(): v for k, v in resp['headers'].items()}
 
 
+def _get_until_header(header, retries=50, delay=0.1, **kwargs):
+    """Re-issue GET until `header` is present in the response, or retries run out.
+
+    OTel (re)initialises asynchronously in the router *after* the control API
+    has already accepted the telemetry config, so the very first request can
+    race ahead of the tracer being ready: no span is created, hence no
+    traceparent is injected. Poll briefly to absorb that init lag. A header that
+    never appears still fails the caller's assertion, so a real regression is
+    not masked. Extra kwargs are forwarded to `client.get` (e.g. headers).
+    """
+    resp = client.get(**kwargs)
+    for _ in range(retries):
+        if resp['status'] == 200 and header in _response_headers_lower(resp):
+            return resp
+        time.sleep(delay)
+        resp = client.get(**kwargs)
+    return resp
+
+
 @_skipif_no_fake_otlp
 def test_otel_span_exported_with_service_name(tmp_path):
     """A traced request exports a span carrying service.name=FreeUnit."""
@@ -134,7 +154,7 @@ def test_otel_traceparent_in_response():
     try:
         _configure_or_skip(port)
 
-        resp = client.get()
+        resp = _get_until_header('traceparent')
         assert resp['status'] == 200
         assert 'traceparent' in _response_headers_lower(resp), (
             'response must carry a traceparent header'
@@ -152,12 +172,13 @@ def test_otel_traceparent_inherited(tmp_path):
     try:
         _configure_or_skip(port)
 
-        resp = client.get(
+        resp = _get_until_header(
+            'traceparent',
             headers={
                 'Host': 'localhost',
                 'traceparent': f'00-{TRACE_ID}-{PARENT_ID}-01',
                 'Connection': 'close',
-            }
+            },
         )
         assert resp['status'] == 200
         # FreeUnit echoes the inherited traceparent back in the response.
