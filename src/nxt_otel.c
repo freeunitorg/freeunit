@@ -258,7 +258,9 @@ static void
 nxt_otel_trace_and_span_init(nxt_task_t *task, nxt_http_request_t *r)
 {
     r->otel->trace =
-        nxt_otel_rs_get_or_create_trace(r->otel->trace_id);
+        nxt_otel_rs_get_or_create_trace(r->otel->trace_id,
+                                        r->otel->parent_id,
+                                        r->otel->trace_flags);
     if (r->otel->trace == NULL) {
         nxt_log(task, NXT_LOG_ERR, "error generating otel span");
         nxt_otel_state_transition(r->otel, NXT_OTEL_ERROR_STATE);

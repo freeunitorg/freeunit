@@ -136,12 +136,13 @@ run_check() {
 
     if $DRY_RUN; then
         info "Dry-run: would execute:"
-        echo "  docker run --rm -v ${TMP_DIR}:/unit -w /unit ${IMAGE_NAME}"
+        echo "  docker run --rm --user $(id -u):$(id -g) -v ${TMP_DIR}:/unit -w /unit ${IMAGE_NAME}"
         return 0
     fi
 
     docker run --rm \
         --name "freeunit-test-full" \
+        --user "$(id -u):$(id -g)" \
         -v "${TMP_DIR}:/unit" \
         -w /unit \
         "${IMAGE_NAME}"

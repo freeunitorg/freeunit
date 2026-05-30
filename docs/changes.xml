@@ -6,6 +6,66 @@
 
 
 <changes apply="unit"
+         ver="1.35.6" rev="1"
+         date="2026-06-25" time="00:00:00 +0000"
+         packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change type="feature">
+<para>
+upgrade the OpenTelemetry Rust crates from 0.24 to 0.32 and rewrite the
+OTLP trace exporter on the stable, dedicated-thread batch span processor
+(blocking reqwest client, no tokio runtime).
+</para>
+</change>
+
+<change type="feature">
+<para>
+W3C traceparent header inheritance now correctly propagates the upstream
+sampling decision; the sampler wraps TraceIdRatioBased inside ParentBased
+so that remote parent trace flags are honoured.
+</para>
+</change>
+
+<change type="change">
+<para>
+OpenTelemetry export now supports OTLP/HTTP only. The "grpc" value of
+"settings/telemetry/protocol" is no longer accepted; configurations using
+it are rejected on reload. The endpoint must be a plain http:// collector
+(no TLS). Use protocol "http" instead.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+add validation bounds for "batch_size" (1-65536) and "sampling_ratio"
+(0-1) in the OpenTelemetry configuration; previously invalid values were
+silently rejected without an error message.
+</para>
+</change>
+
+</changes>
+
+
+<changes apply="unit-php unit-python unit-python3.14
+                unit-go
+                unit-perl
+                unit-ruby
+                unit-jsc-common unit-jsc17 unit-jsc21
+                unit-wasm"
+         ver="1.35.6" rev="1"
+         date="2026-06-25" time="00:00:00 +0000"
+         packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change>
+<para>
+FreeUnit updated to 1.35.6.
+</para>
+</change>
+
+</changes>
+
+
+<changes apply="unit"
          ver="1.35.5" rev="1"
          date="2026-05-29" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">

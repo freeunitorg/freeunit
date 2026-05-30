@@ -284,6 +284,158 @@ fake_otlp --port 19878 --requests 1
 - [ ] Build with `./configure --otel --openssl && make`; run clang-ast check
 - [ ] Full `test/test_otel.py` pass
 
+### Follow-up: span leak on aborted requests (pre-existing, found in #65 review)
+
+`nxt_otel_rs_get_or_create_trace()` returns `Box::into_raw(...)` into
+`r->otel->trace`; the span is only reclaimed/ended by `nxt_otel_rs_send_trace()`,
+which is reached **only** via `NXT_OTEL_COLLECT_STATE` (`nxt_otel_span_collect`,
+`src/nxt_otel.c`). All `ERROR_STATE` transitions occur while `trace == NULL`, so
+the `nxt_otel_error()` "nothing to leak" comment holds for them. But if a request
+is torn down between `INIT` and `COLLECT` (e.g. connection reset during body),
+`r->otel->trace` is non-null and `send_trace` is never called → the boxed span
+leaks. The state machine has no request-teardown hook.
+
+Not a regression — same lifecycle existed before the 0.24→0.32 upgrade.
+
+- [ ] Add a teardown path (request free / error finalize) that calls
+      `nxt_otel_rs_send_trace()` (or a dedicated drop) when `r->otel->trace` is
+      non-null and `COLLECT` was not reached, so the span is always reclaimed.
+
+### Future: re-introduce OTLP/gRPC export (milestone TBD, post-1.35.6)
+
+1.35.6 removed `protocol: "grpc"` and shipped HTTP-only export on a blocking
+`reqwest` client + dedicated-thread `BatchSpanProcessor` (no tokio). Re-adding
+gRPC is a deliberate future feature, gated on solving the runtime question below.
+
+**Why gRPC was removed — it was an architecture decision, not a Rust bug or a
+Phase-0 blocker.** The chain:
+
+1. Upstream `opentelemetry-otlp` removed `new_pipeline()` in 0.27, so the exporter
+   had to be *rewritten from scratch*, not patched (see "Known pitfalls" above).
+2. The gRPC path in the crate is the `grpc-tonic` feature → pulls `tonic` → which
+   mandates a **`tokio` async runtime**. The old 0.24 `Cargo.toml` carried exactly
+   that: `opentelemetry-otlp` features `["http-proto", "tokio", "grpc-tonic",
+   "tonic", "reqwest-rustls"]` + `tokio = { features = ["full"] }` + `rt-tokio`.
+3. For an LTS fork that embeds this Rust staticlib inside the C app server, we
+   wanted a predictable runtime with **no async executor we manage**. So the
+   rewrite uses the blocking `reqwest` client driven by a dedicated-thread
+   `BatchSpanProcessor` (new `Cargo.toml`: `default-features = false`, features
+   `["trace", "http-proto", "reqwest-blocking-client"]`, no tokio, no tonic).
+4. gRPC/tonic is inherently async and cannot run without tokio → dropping tokio
+   **necessarily** drops gRPC. The removal is a *consequence* of the runtime
+   simplification, not a goal in itself.
+5. Bonus simplification: no TLS stack is linked either. reqwest 0.13 dropped the
+   ring rustls provider; enabling rustls would pull `aws-lc-sys` (a cmake/C
+   build), and native-tls would link a *second* OpenSSL into the staticlib. So
+   the endpoint is plain `http://` (collector on localhost / internal network).
+
+So Phase 0 had no gRPC problem; the upstream API churn forced a rewrite, and the
+rewrite chose the tokio-free path on purpose. Bringing gRPC back means bringing a
+tokio runtime back (Option A below) or finding a blocking gRPC transport (B).
+
+**Ecosystem context (researched 2026-05-30):**
+
+| Project | OTel layer | Export transport |
+|---------|-----------|------------------|
+| nginx (mainline) | `nginx/nginx-otel` (C++) | OTLP/**gRPC only**, port 4317 |
+| Angie | `angie-module-otel` (= nginx-otel) | OTLP/**gRPC only** |
+| freenginx | none native; mainline module via `--with-compat` | OTLP/**gRPC only** |
+| Caddy / FrankenPHP | `tracing` directive (`opentelemetry-go`) | OTLP/**gRPC only**, port 4317 |
+| opentelemetry-php (PHP app SDK) | OTel PHP extension/SDK | OTLP/**HTTP** (http/protobuf), port 4318 |
+| **FreeUnit** | `src/otel/` (Rust `opentelemetry-otlp`) | OTLP/**HTTP only** (since 1.35.6) |
+
+So the entire reverse-proxy / web-server family (nginx, Angie, Caddy/FrankenPHP)
+is gRPC-first at the server layer. FreeUnit is the odd one out: a Rust crate
+embedded in Unit, where HTTP export needs no async runtime but gRPC does. The
+nginx-otel directive model (`otel_exporter { endpoint; interval; batch_size;
+batch_count; }`, `otel_service_name`, `otel_trace on|off|$var`,
+`otel_trace_context`) is a useful reference for our future config-field set (cf.
+Phase 0b `service_name`, `resource_attributes`), but not for transport.
+
+**Two findings that *validate* HTTP-only rather than argue against it:**
+
+1. **HTTP-only aligns with the PHP app world.** `opentelemetry-php` (the PHP
+   app-level SDK) exports over **OTLP/HTTP** (http/protobuf, port 4318) — exactly
+   FreeUnit's transport. In FrankenPHP the server (Caddy, gRPC :4317) and the PHP
+   app (HTTP :4318) actively *conflict* over the shared `OTEL_EXPORTER_OTLP_*`
+   env vars (frankenphp#1715, caddy#5743 wants HTTP added). FreeUnit being an
+   app server for PHP-first workloads, HTTP-only is the *consistent* choice, not
+   a gap. If/when gRPC returns it should stay opt-in, never the default.
+
+2. **Caddy config model — standard `OTEL_*` env vars, not its config file.**
+   Caddy deliberately configures the exporter through the OTel env-var spec
+   (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`,
+   `OTEL_TRACES_SAMPLER=parentbased_traceidratio`, `OTEL_TRACES_SAMPLER_ARG`),
+   *not* the Caddyfile. Worth considering as a complement to our JSON config:
+   - [ ] Evaluate honouring standard `OTEL_*` env vars as fallback/override for
+         `settings.telemetry` (interop with existing OTel deployments; lets the
+         same env that configures the PHP SDK also reach FreeUnit).
+
+**Access-log trace id — direct reference for roadmap item #2.** Caddy adds
+`traceID`/`spanID` to its access logs and exposes `{http.vars.trace_id}` /
+`{http.vars.span_id}` placeholders to forward into the app. This is exactly the
+`$otel_trace_id` in access logs feature (roadmap #2, "first community PR
+candidate"). Use Caddy's placeholder + access-log-field approach as the design
+reference when implementing it.
+
+**The core problem — gRPC needs an async runtime:**
+- `opentelemetry-otlp` gRPC = `grpc-tonic` feature → pulls `tonic` + `tokio`.
+  That is exactly the tokio dependency 1.35.6 removed to get a predictable,
+  single-dedicated-thread runtime for an LTS fork.
+- Options to evaluate before committing to gRPC:
+  - [ ] **A — opt-in tokio, HTTP stays default.** Re-add `tonic`+`tokio` behind
+        a Cargo feature; spin a minimal current-thread tokio runtime on the
+        existing dedicated BSP thread *only* when `protocol: "grpc"` is set.
+        HTTP path keeps zero-async. Biggest dep surface.
+  - [ ] **B — blocking gRPC transport.** Investigate a tokio-free gRPC client
+        (e.g. driving `tonic` over a hand-rolled `block_on`, or a lighter
+        HTTP/2 client). High risk; gRPC-without-async is not a solved problem
+        in the Rust ecosystem.
+  - [ ] **C — don't.** Stay HTTP-only; document that gRPC users put an OTel
+        Collector (or `otelcol` sidecar) in front to translate OTLP/HTTP→gRPC.
+        Lowest cost; matches "internal collector on localhost" deployment model
+        we already document.
+
+**When re-introducing (whichever option):**
+- [ ] Restore `enum: ["http", "grpc"]` in `docs/unit-openapi.yaml` and the C
+      validator (`nxt_conf_vldt_otel` in `src/nxt_conf_validation.c`); today both
+      hard-reject `grpc`.
+- [ ] Map gRPC default port 4317 vs HTTP 4318 in docs/examples (the sibling
+      `docs/` + `freeunitorg.github.io` landing pages were corrected to HTTP/4318
+      in 1.35.6 — revisit both if gRPC returns).
+- [ ] Update `test/test_otel.py`: `test_otel_protocol_grpc_rejected` must flip to
+      an acceptance/export test; `test/fake_otlp` is HTTP-only, so a gRPC path
+      needs a real collector or an HTTP/2 mock.
+
+**Recommendation:** default to Option C until there is concrete user demand;
+prototype Option A behind a feature flag if demand appears. Do **not** re-add
+tokio to the default build.
+
+**Rust toolchain note (2026-05-30).** Rust 1.96 was just released (6-week
+cadence; memory-safe, no GC, runtime limited to std-lib init — fits an embedded
+staticlib well). Our builds pin **1.94.1** (`test/fake_otlp/rust-toolchain.toml`,
+the `freeunit-builder:trixie-rust1.94.1` image, Docker variants), while the
+floating `rust:1-slim-trixie` base for the planned `rust1.x` variant now tracks
+1.95→1.96. Before any OTel/gRPC rework, and before shipping `rust1.x`:
+- [ ] Bump the pinned toolchain (1.94.1 → current stable) and re-run the
+      otel-enabled clang-ast build + `test_otel.py` to confirm the 0.32 crates
+      and the staticlib still compile clean on newer Rust.
+- [ ] Decide pin-vs-floating policy for the `rust1.x` image (floating base drifts
+      to whatever `rust:1-slim-trixie` ships; pin for reproducible CI).
+
+### Sources (researched 2026-05-30)
+
+OTel transport across the reverse-proxy / app-server ecosystem:
+- nginx-otel (C++, gRPC-only): https://github.com/nginx/nginx-otel
+- NGINX OpenTelemetry admin guide: https://docs.nginx.com/nginx/admin-guide/dynamic-modules/opentelemetry/
+- Angie OTel module (gRPC-only): https://en.angie.software/angie/docs/installation/external-modules/otel/
+- Caddy `tracing` directive (opentelemetry-go, gRPC-only, OTEL_* env config): https://caddyserver.com/docs/caddyfile/directives/tracing
+- Caddy issue #5743 — request to add OTLP/HTTP protocol: https://github.com/caddyserver/caddy/issues/5743
+- FrankenPHP issue #1715 — Caddy(gRPC) vs PHP(HTTP) protocol conflict: https://github.com/php/frankenphp/issues/1715
+
+Rust release (toolchain-pin context):
+- Rust 1.96 release (ru): https://opennet.ru/65574/  (mirror: https://opennet.me/65574/)
+
 ---
 
 ## PHP TrueAsync mode (branch: php-graceful-shutdown)
@@ -496,6 +648,23 @@ goaccess /var/log/angie/packages.freeunit.org.access.log \
 ```
 
 ---
+
+### fake_otlp — harden request validation (deferred from #65)
+
+`test/fake_otlp/` is built and used by `test/test_otel.py` in 1.35.6, but its
+`handle()` (`src/main.rs`) currently counts **any** non-empty request as a
+received span. It does not assert the request is a real OTLP export. Kept as-is
+for now (the export tests pass); harden later so the mock can't be satisfied by
+garbage:
+
+- [ ] Validate request line is `POST /v1/traces`
+- [ ] Validate `Content-Type: application/x-protobuf`
+- [ ] Reject empty/zero-length protobuf body (currently only the readiness probe
+      with a fully empty buffer is filtered)
+- [ ] Optionally decode the protobuf far enough to confirm at least one span
+
+The Phase 0 design (above) already specifies this behavior; the shipped binary
+implements only the empty-probe guard. This item tracks closing that gap.
 
 ### Prebuild `fake_upstream` binary via packages.freeunit.org
 

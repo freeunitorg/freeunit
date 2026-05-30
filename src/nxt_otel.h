@@ -18,7 +18,8 @@
 
 #if (NXT_HAVE_OTEL)
 extern void nxt_otel_rs_send_trace(void *trace);
-extern void * nxt_otel_rs_get_or_create_trace(u_char *trace_id);
+extern void * nxt_otel_rs_get_or_create_trace(const u_char *trace_id,
+    const u_char *parent_id, const u_char *trace_flags);
 extern void nxt_otel_rs_init(
     void (*log_callback)(nxt_uint_t log_level, const char *log_string),
     const nxt_str_t *endpoint, const nxt_str_t *protocol,

@@ -7,17 +7,22 @@ edition = "2021"
 crate-type = ["staticlib"]
 bench = false
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+# OpenTelemetry trace export over OTLP/HTTP.
+#
+# HTTP only, no TLS — by design, for an LTS fork:
+#   * The stable, non-experimental path uses the blocking reqwest client driven
+#     by the dedicated-thread BatchSpanProcessor — no tokio runtime we manage,
+#     no async executor. gRPC (tonic) is intentionally not supported.
+#   * No TLS stack is linked. reqwest 0.13 dropped the ring rustls provider, so
+#     enabling rustls would pull aws-lc-sys (a cmake/C build) and native-tls
+#     would link a second OpenSSL into this staticlib. We avoid both: the OTLP
+#     endpoint must be plain http:// (a collector on localhost / internal net).
 [dependencies]
-once_cell = "1.19"
-opentelemetry = "0.24.0"
-opentelemetry_sdk = { version = "0.24.1", features = ["rt-tokio", "http", "tokio", "trace"] }
-lazy_static = "1.5.0"
-opentelemetry-otlp = { version = "0.17.0", features = ["http-proto", "tokio", "grpc-tonic","tonic","trace","reqwest-rustls"]}
-tokio = { version = "1", features = ["full"] }
-opentelemetry-semantic-conventions = "0.16.0"
-tracing = { version = "0.1", default-features = false }
-tracing-core = { version = "0.1", default-features = false }
-tracing-subscriber = { version = "0.3", default-features = false }
-async-std = "1.12.0"
-reqwest = { version = "0.12.7", features = ["rustls-tls"] }
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "trace",
+    "http-proto",
+    "reqwest-blocking-client",
+] }
+opentelemetry-semantic-conventions = "0.32"
