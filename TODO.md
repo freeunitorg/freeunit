@@ -22,6 +22,7 @@
 | OTEL Phase 2: rewrite `nxt_otel_rs_runtime()` for 0.32 API (after Phase 0) | 1.35.6 |
 | `rust1.x` Docker variant (WASM path, `Dockerfile.rust1.x`) | 1.35.6 |
 | Docker: make debug build optional (`--debug` flag in `build-local.sh`, off by default; saves ~30-40 MB per image) | 1.35.6 |
+| otel local image smoke-test: close doc/tag gaps (hardcoded 1.35.5, php-base snippet without `--otel`) | 1.35.6 |
 
 **July (after 1.35.6):**
 
@@ -695,6 +696,43 @@ Fixed: use `clang llvm-dev libclang-dev` (not `clang-21 llvm-21-dev libclang-21-
 - [ ] Prebuild `freeunit-test-full:local` image and publish to GHCR
 - [ ] Or add packages.freeunit.org binary for clang-ast plugin
 - [ ] Cache Docker layers for apt install + clang-ast build
+
+### otel coverage in local image smoke-tests — already exists; close the doc/tag gaps (milestone 1.35.6)
+
+**Scheduled for the 1.35.6 release** — close the doc/tag gaps below as part of
+the same milestone as the OTel 0.24→0.32 upgrade (#65).
+
+otel runtime-build coverage is already in place in two paths; the gaps are
+documentation and a hardcoded version, not missing infrastructure:
+
+- `test/run-local.sh` test image (`FROM python:3.14-slim-trixie` + rustup-pinned
+  toolchain) configures `--otel` and builds `fake_otlp`, so the pytest path
+  exercises the otel staticlib + `test_otel.py`.
+- `pkg/docker/local/Dockerfile.{minimal,php8.5,wasm}` (run via
+  `pkg/docker/build-local.sh -b minimal`) build
+  **`FROM ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1`** — a pre-built
+  builder image with Rust already baked in — and **already configure `--otel`**
+  (`--njs --otel --zlib --zstd --brotli`). **NOTE: `pkg/docker/local/` is
+  experimental — a local build-speedup only.** It depends on the builder image
+  being built first (no apt/rustup at build time), is not wired into CI, and is
+  not the canonical/release image set (that is `pkg/docker/Dockerfile.*`). Treat
+  it as a fast dev loop, not the documented smoke-test of record.
+
+Remaining gaps:
+- [ ] `pkg/docker/local/Dockerfile.*` hardcode `git clone -b 1.35.5` and
+      `LABEL ... version="1.35.5"` — bump on each release (for local branch
+      testing, override the clone ref per the CLAUDE.md note).
+- [ ] Decide the fate of the experimental `pkg/docker/local/` set: promote it to
+      a documented/CI fast-path, or keep it as a personal dev shortcut. Until
+      then, do not point users' "rebuild Docker images locally" flow at it as the
+      official smoke-test.
+- [ ] The CLAUDE.md "rebuild Docker images locally" snippet documents a
+      `php:8.5-cli-trixie` build **without `--otel`** — at minimum mention the
+      `--otel` flag there so the documented smoke-test can cover otel (it needs a
+      Rust toolchain in that image, which the php base lacks).
+- [ ] Once the `rust1.x` variant lands its `rust:1-slim-trixie` base, fold the
+      builder-image and `rust:1-slim-trixie` approaches into one documented story
+      (both already ship Rust; no rustup step needed).
 
 ---
 
