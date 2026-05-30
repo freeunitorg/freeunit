@@ -37,6 +37,35 @@ static nxt_buf_t *nxt_port_buf_alloc(nxt_port_t *port);
 static void nxt_port_buf_free(nxt_port_t *port, nxt_buf_t *b);
 static void nxt_port_error_handler(nxt_task_t *task, void *obj, void *data);
 
+#if (NXT_TESTS)
+static nxt_uint_t  nxt_port_test_msg_alloc_failure_count;
+
+
+void
+nxt_port_test_msg_alloc_failures(nxt_uint_t failures)
+{
+    nxt_port_test_msg_alloc_failure_count = failures;
+}
+
+
+/*
+ * Public wrapper that lets src/test/nxt_port_fail_test.c invoke the
+ * static nxt_port_error_handler() directly with a synthesised port
+ * and queued message — used to verify that the "queued, then write
+ * failed" cleanup matches the ordering the cert/script/socket reply
+ * paths now mirror after the audit fix (close fd first, queue buffer
+ * completion second).  Pass NULL for `data` so use_delta does not
+ * decrement for the "obj == data" case — the test owns the port
+ * reference and releases it explicitly.
+ */
+void
+nxt_port_test_run_error_handler(nxt_task_t *task, nxt_port_t *port)
+{
+    nxt_port_error_handler(task, &port->socket, NULL);
+}
+
+#endif
+
 
 nxt_int_t
 nxt_port_socket_init(nxt_task_t *task, nxt_port_t *port, size_t max_size)
@@ -335,6 +364,13 @@ static nxt_port_send_msg_t *
 nxt_port_msg_alloc(const nxt_port_send_msg_t *m)
 {
     nxt_port_send_msg_t  *msg;
+
+#if (NXT_TESTS)
+    if (nxt_slow_path(nxt_port_test_msg_alloc_failure_count != 0)) {
+        nxt_port_test_msg_alloc_failure_count--;
+        return NULL;
+    }
+#endif
 
     msg = nxt_malloc(sizeof(nxt_port_send_msg_t));
     if (nxt_slow_path(msg == NULL)) {
