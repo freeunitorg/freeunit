@@ -313,12 +313,12 @@ impl ControlSocket {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use rand::distr::{Alphanumeric, SampleString};
     use std::env::temp_dir;
     use std::fmt::Display;
     use std::io;
     use std::os::unix::net::UnixListener;
-    use super::*;
 
     struct TempSocket {
         socket_path: PathBuf,

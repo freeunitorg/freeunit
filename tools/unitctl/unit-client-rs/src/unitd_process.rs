@@ -86,7 +86,11 @@ impl UnitdProcess {
                 let process = *tuple.1;
                 let process_id: u64 = pid.as_u32().into();
                 let executable_path: Option<Box<Path>> = process.exe().map(|p| p.to_path_buf().into_boxed_path());
-                let environ: Vec<String> = process.environ().iter().map(|s| s.to_string_lossy().into_owned()).collect();
+                let environ: Vec<String> = process
+                    .environ()
+                    .iter()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .collect();
                 let cmd: Vec<String> = process.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
                 let working_dir: Option<Box<Path>> = process.cwd().map(|p| p.to_path_buf().into_boxed_path());
                 let child_pids = unitd_processes

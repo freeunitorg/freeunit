@@ -100,7 +100,8 @@ impl From<KnownSize> for Full<Bytes> {
             KnownSize::String(s) => Full::new(Bytes::from(s)),
             KnownSize::Read(mut r, _) => {
                 let mut buf = Vec::new();
-                r.read_to_end(&mut buf).expect("KnownSize::Read: I/O error while materializing body");
+                r.read_to_end(&mut buf)
+                    .expect("KnownSize::Read: I/O error while materializing body");
                 Full::new(Bytes::from(buf))
             }
         }
@@ -144,7 +145,10 @@ mod tests {
         let reader = io::Cursor::new(data);
         let known = KnownSize::Read(Box::new(reader), 100);
         let (_, len) = known.into_full_body().expect("should succeed");
-        assert_eq!(len, 5, "content-length should match actual bytes, not declared estimate");
+        assert_eq!(
+            len, 5,
+            "content-length should match actual bytes, not declared estimate"
+        );
     }
 
     #[test]
