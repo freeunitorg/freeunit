@@ -67,6 +67,10 @@ nxt_otel_add_attr(nxt_http_request_t *r, const char *key, nxt_str_t *val)
         return;
     }
 
+    if (r->otel == NULL || r->otel->trace == NULL) {
+        return;
+    }
+
     k.start = (u_char *) key;
     k.length = nxt_strlen(key);
 
@@ -282,6 +286,10 @@ nxt_otel_span_add_status(nxt_task_t *task, nxt_http_request_t *r)
     nxt_str_t               val;
     nxt_app_t               *app;
     nxt_request_rpc_data_t  *rpc;
+
+    if (r->otel == NULL || r->otel->trace == NULL) {
+        return;
+    }
 
     /*
      * Application identity is resolved during routing, so it is only known by

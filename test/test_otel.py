@@ -146,7 +146,10 @@ def test_otel_span_exported_with_service_name(tmp_path, protocol):
     try:
         _configure_or_skip(port, protocol=protocol)
 
-        assert client.get()['status'] == 200
+        # OTel init in the router is async; poll until the tracer is ready
+        # (traceparent present) so the captured span is fully attributed and
+        # the first request doesn't race ahead of tracer setup.
+        assert _get_until_header('traceparent')['status'] == 200
 
         try:
             proc.wait(timeout=EXPORT_TIMEOUT)
