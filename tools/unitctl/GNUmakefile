@@ -13,7 +13,7 @@ $(error Please install Rustup)
 endif
 
 RPM_ARCH           := $(shell uname -m)
-VERSION            ?= $(shell $(GREP) -Po '^version\s+=\s+"\K.*?(?=")' $(CURDIR)/unitctl/Cargo.toml)
+VERSION            ?= $(shell $(SED) -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' $(CURDIR)/unitctl/Cargo.toml)
 SRC_REPO           := https://github.com/nginxinc/unit-rust-sdk
 DEFAULT_TARGET     ?= $(shell $(RUSTUP) toolchain list | $(GREP) '(default)' | cut -d' ' -f1 | cut -d- -f2-)
 SHELL              := /bin/bash
@@ -90,7 +90,7 @@ target/release/$(OUTPUT_BINARY): openapi-generate
 	$Q $(CARGO) build $(RELEASE_BUILD_FLAGS)
 
 .PHONY: test
-test: ## Run tests
+test: openapi-generate ## Run tests
 	$Q $(CARGO) test
 
 .ONESHELL: target/man/$(OUTPUT_BINARY).1.gz
@@ -114,6 +114,7 @@ manpage: target/man/$(OUTPUT_BINARY).1.gz ## Builds man page
 .PHONY: openapi-generate
 openapi-generate: .openapi_cache
 	$Q if [ ! -f "$(CURDIR)/unit-openapi/src/models/mod.rs" ]; then
+		set -e
 		echo "$(M) generating Unit API access code via a OpenAPI spec"
 		OPENAPI_GENERATOR_VERSION="$(OPENAPI_GENERATOR_VERSION)" \
 		OPENAPI_GENERATOR_DOWNLOAD_CACHE_DIR="$(CURDIR)/.openapi_cache" \
@@ -124,8 +125,17 @@ openapi-generate: .openapi_cache
 			--template-dir "$(CURDIR)/unit-openapi/openapi-templates" \
 			--output "$(CURDIR)/unit-openapi" \
 			--generator-name rust
-		echo "mod error;" >> "$(CURDIR)/unit-openapi/src/apis/mod.rs"
-		$(SED) -i '1i #![allow(clippy::all)]' "$(CURDIR)/unit-openapi/src/lib.rs"
+		{ printf '%s\n' '#![allow(clippy::all)]'; cat "$(CURDIR)/unit-openapi/src/lib.rs"; } > "$(CURDIR)/unit-openapi/src/lib.rs.new" && mv "$(CURDIR)/unit-openapi/src/lib.rs.new" "$(CURDIR)/unit-openapi/src/lib.rs"
+		# Replace any remaining hyper 0.14 client paths produced by built-in templates
+		# with the hyper 1.x equivalents from hyper-util.
+		find "$(CURDIR)/unit-openapi/src" -name "*.rs" -exec \
+			$(SED) -i.bak \
+				-e 's|hyper::client::connect::Connect|hyper_util::client::legacy::connect::Connect|g' \
+				-e 's|hyper::client::Client<C>|hyper_util::client::legacy::Client<C, http_body_util::Full<bytes::Bytes>>|g' \
+				-e "s|C: Clone + std::marker::Send + Sync {|C: Clone + std::marker::Send + Sync + 'static {|g" \
+				-e 's|hyper::Body::from|bytes::Bytes::from|g' \
+			{} +
+		find "$(CURDIR)/unit-openapi/src" -name "*.rs.bak" -delete
 		$(CARGO) fmt
 	fi
 

@@ -8,8 +8,8 @@ use crate::futures::StreamExt;
 use crate::unit_client::UnitClientError;
 use crate::unitd_process::UnitdProcess;
 
-use bollard::models::{ContainerCreateBody, ContainerCreateResponse, ContainerSummary, HostConfig, Mount, MountType};
 use bollard::models::ContainerInspectResponse;
+use bollard::models::{ContainerCreateBody, ContainerCreateResponse, ContainerSummary, HostConfig, Mount, MountType};
 use bollard::query_parameters::{CreateImageOptionsBuilder, ListContainersOptionsBuilder, StartContainerOptions};
 use bollard::Docker;
 
