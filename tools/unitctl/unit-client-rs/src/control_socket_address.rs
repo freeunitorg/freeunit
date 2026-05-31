@@ -2,7 +2,7 @@ use crate::control_socket_address::ControlSocket::{TcpSocket, UnixLocalAbstractS
 use crate::control_socket_address::ControlSocketScheme::{HTTP, HTTPS};
 use crate::unit_client::UnitClientError;
 use hyper::http::uri::{Authority, PathAndQuery};
-use hyper::Uri;
+use hyper::http::Uri;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::os::unix::fs::FileTypeExt;
@@ -313,13 +313,12 @@ impl ControlSocket {
 
 #[cfg(test)]
 mod tests {
-    use rand::distributions::{Alphanumeric, DistString};
+    use super::*;
+    use rand::distr::{Alphanumeric, SampleString};
     use std::env::temp_dir;
     use std::fmt::Display;
     use std::io;
     use std::os::unix::net::UnixListener;
-
-    use super::*;
 
     struct TempSocket {
         socket_path: PathBuf,
@@ -545,7 +544,7 @@ mod tests {
     }
 
     fn create_file_socket() -> Result<TempSocket, io::Error> {
-        let random = Alphanumeric.sample_string(&mut rand::thread_rng(), 10);
+        let random = Alphanumeric.sample_string(&mut rand::rng(), 10);
         let socket_name = format!("unit-client-socket-test-{}.sock", random);
         let socket_path = temp_dir().join(socket_name);
         let listener = UnixListener::bind(&socket_path)?;
@@ -557,7 +556,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn create_abstract_socket() -> Result<TempSocket, io::Error> {
-        let random = Alphanumeric.sample_string(&mut rand::thread_rng(), 10);
+        let random = Alphanumeric.sample_string(&mut rand::rng(), 10);
         let socket_name = format!("@unit-client-socket-test-{}.sock", random);
         let socket_path = PathBuf::from(socket_name);
         let listener = UnixListener::bind(&socket_path)?;
