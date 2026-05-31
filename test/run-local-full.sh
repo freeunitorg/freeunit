@@ -5,9 +5,12 @@
 # inside Docker.  Catches API-misuse / lifetime / allocator violations the
 # normal compile does not.  Intended to be run BEFORE every commit and PR.
 #
-# Scope: C core only — configure is `--openssl --debug`.  Module-specific
-# C code (njs, otel, brotli, zlib, zstd) is NOT analyzed by this run.
-# For those, use ./test/run-local.sh which builds the full feature set.
+# Scope: C core + otel — configure is `--otel --openssl --debug`, so the
+# OpenTelemetry C glue (nxt_otel.c, the otel validators in
+# nxt_conf_validation.c) is analyzed too.  The Rust otel library is built by
+# cargo for linking but is not seen by the clang plugin.  Other module C code
+# (njs, brotli, zlib, zstd) is still NOT analyzed; use ./test/run-local.sh for
+# the full feature set.
 #
 # Usage:
 #   ./test/run-local-full.sh           # build + clang-ast check
@@ -20,6 +23,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 IMAGE_NAME="freeunit-test-full:local"
+# Pre-built image (clang-ast plugin + rustc/cargo).  Pulled when present so the
+# slow one-time apt+rust install is skipped; private — needs `docker login
+# ghcr.io`.  Falls back to a local build when the pull fails.
+REMOTE_IMAGE="ghcr.io/freeunitorg/freeunit-clang-ast:trixie"
 DRY_RUN=false
 TMP_DIR=""
 
@@ -76,6 +83,16 @@ build_image() {
         return 0
     fi
 
+    if $DRY_RUN; then
+        info "Dry-run: would try 'docker pull $REMOTE_IMAGE', else build locally"
+    elif docker pull "$REMOTE_IMAGE" 2>/dev/null; then
+        info "Pulled pre-built image: $REMOTE_IMAGE"
+        docker tag "$REMOTE_IMAGE" "$IMAGE_NAME"
+        return 0
+    else
+        info "Pull failed ($REMOTE_IMAGE) — building locally"
+    fi
+
     info "Building clang-ast image: $IMAGE_NAME (one-time, slow)"
 
     local DOCKERFILE
@@ -87,14 +104,17 @@ FROM debian:testing
 LABEL org.opencontainers.image.title="FreeUnit (full / clang-ast)"
 LABEL org.opencontainers.image.vendor="FreeUnit Community <team@freeunit.org>"
 
-ENV DEBIAN_FRONTEND=noninteractive
+# CARGO_HOME under /tmp: the check runs as an unprivileged --user with no
+# writable $HOME, and `--otel` invokes cargo to build the otel library.
+ENV DEBIAN_FRONTEND=noninteractive \
+    CARGO_HOME=/tmp/cargo
 
 RUN set -ex \
     && apt-get update \
     && apt-get install --no-install-recommends --no-install-suggests -y \
          ca-certificates git build-essential libssl-dev libpcre2-dev \
          zlib1g-dev libzstd-dev libbrotli-dev curl pkg-config pkgconf \
-         clang llvm-dev libclang-dev \
+         clang llvm-dev libclang-dev rustc cargo \
     && git clone https://github.com/freeunitorg/clang-ast.git -b unit /clang-ast \
     && make -C /clang-ast
 
@@ -111,7 +131,7 @@ ENTRYPOINT ["bash", "-c", "\
         --cc-opt='-Xclang -load -Xclang /clang-ast/ngx-ast.so \
                   -Xclang -add-plugin -Xclang ngx-ast \
                   -Wno-default-const-init-field-unsafe' \
-        --openssl --debug && \
+        --otel --openssl --debug && \
     make -j $NCPU && \
     echo '=== clang-ast check PASSED ===' \
 "]
