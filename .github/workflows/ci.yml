@@ -60,6 +60,8 @@ jobs:
             os: ubuntu-latest
           - build: python-3.12
             os: ubuntu-latest
+          - build: python-3.14
+            os: ubuntu-latest
           - build: ruby-3.3
             os: ubuntu-latest
           - build: ruby-3.4

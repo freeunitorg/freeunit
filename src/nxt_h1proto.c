@@ -1642,6 +1642,19 @@ nxt_h1p_chunk_create(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
     for (b = out; b != NULL; b = b->next) {
 
         if (nxt_buf_is_last(b)) {
+            if (r->inconsistent) {
+                /*
+                 * The response is truncated -- the upstream closed before the
+                 * body framing completed (premature chunked EOF, or a
+                 * Content-Length body cut short).  Relay the partial body but
+                 * omit the terminal 0\r\n\r\n: keepalive is already disabled,
+                 * so the connection closes after this buffer and the client
+                 * detects the truncation via the missing terminator, rather
+                 * than seeing a falsely complete response.  #72
+                 */
+                break;
+            }
+
             tail = nxt_http_buf_mem(task, r, sizeof(tail_chunk));
             if (nxt_slow_path(tail == NULL)) {
                 return NULL;
@@ -2958,22 +2971,24 @@ nxt_h1p_peer_closed(nxt_task_t *task, void *obj, void *data)
     if (peer->header_received) {
         h1p = peer->proto.h1;
 
-        if (h1p->chunked && !h1p->chunked_parse.last) {
-            /*
-             * Upstream closed without the terminal chunk — premature EOF.
-             * Synthesising 0\r\n\r\n would hide the truncation from the
-             * client.  Treat as an error: if headers are already sent the
-             * error path resets the client connection; otherwise a 502 is
-             * returned.
-             */
-            peer->status = NXT_HTTP_BAD_GATEWAY;
-            r->state->error_handler(task, r, peer);
-            return;
-        }
-
         peer->body = nxt_http_buf_last(r);
         peer->closed = 1;
-        r->inconsistent = (h1p->remainder != 0);
+
+        /*
+         * The upstream closed the connection.  The response body is truncated
+         * if its framing never completed: a Content-Length response short of
+         * its declared length (remainder != 0), or a chunked response that
+         * never reached the terminal 0\r\n\r\n (!chunked_parse.last).  Mark it
+         * inconsistent so keepalive is disabled and the client connection is
+         * closed once the partial body has been relayed.  The missing
+         * terminator then lets the client detect the truncation instead of it
+         * being masked as a clean end of response.  Relaying the partial body
+         * and closing -- rather than calling error_handler -- avoids racing a
+         * connection reset against the already-buffered status line and body
+         * (which could otherwise leave the client with an empty response). #72
+         */
+        r->inconsistent = (h1p->remainder != 0)
+                          || (h1p->chunked && !h1p->chunked_parse.last);
 
         r->state->ready_handler(task, r, peer);
 
