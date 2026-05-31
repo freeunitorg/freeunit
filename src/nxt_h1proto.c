@@ -3092,19 +3092,24 @@ nxt_h1p_peer_close(nxt_task_t *task, nxt_http_peer_t *peer)
     c->write_timer.task = task;
 
     /*
-     * Block further reads on the upstream connection and cancel its read
-     * timer.  Removal of the fd from the event facility is deferred to
+     * Block further I/O on the upstream connection and cancel its timers.
+     * Removal of the fd from the event facility is deferred to
      * nxt_conn_close_handler(), but the peer object (c->socket.data) lives in
      * the request memory pool and may be freed synchronously right after this
      * close (e.g. nxt_http_proxy_error() releases the pool when the client
-     * aborts mid-response).  A read event already queued for this connection in
-     * the current engine cycle, or the autoreset read timer firing, would then
-     * reach nxt_h1p_peer_read_done()/nxt_h1p_peer_timer_value() and dereference
-     * the freed peer -- a use-after-free that crashes the router.  Setting
-     * block_read makes the queued nxt_conn_io_read() bail out early.
+     * aborts mid-response).  An I/O event already queued for this connection in
+     * the current engine cycle, or an autoreset timer firing, would then reach
+     * nxt_h1p_peer_read_done()/nxt_h1p_peer_send_timeout()/etc. and dereference
+     * the freed peer -- a use-after-free that crashes the router.  Both paths
+     * are at risk: the read side (response relay) and the write side (the
+     * request body upload uses an autoreset send timer).  Setting block_read /
+     * block_write makes a queued nxt_conn_io_read()/nxt_conn_io_write() bail out
+     * early; nxt_conn_close() still emits the FIN via its work-queue handler.
      */
     c->block_read = 1;
+    c->block_write = 1;
     nxt_timer_disable(task->thread->engine, &c->read_timer);
+    nxt_timer_disable(task->thread->engine, &c->write_timer);
 
     if (c->socket.fd != -1) {
         c->write_state = &nxt_h1p_peer_close_state;
