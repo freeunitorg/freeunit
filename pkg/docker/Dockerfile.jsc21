@@ -6,7 +6,7 @@ LABEL org.opencontainers.image.url="https://freeunit.org"
 LABEL org.opencontainers.image.source="https://github.com/freeunitorg/freeunit"
 LABEL org.opencontainers.image.documentation="https://github.com/freeunitorg/freeunit/blob/master/README.md"
 LABEL org.opencontainers.image.vendor="FreeUnit Community <team@freeunit.org>"
-LABEL org.opencontainers.image.version="1.35.4"
+LABEL org.opencontainers.image.version="1.35.5"
 
 RUN set -ex \
     && savedAptMark="$(apt-mark showmanual)" \
@@ -35,7 +35,7 @@ RUN set -ex \
     && mkdir -p /usr/lib/unit/modules /usr/lib/unit/debug-modules \
     && mkdir -p /usr/src/unit \
     && cd /usr/src/unit \
-    && git clone --depth 1 -b 1.35.4 https://github.com/freeunitorg/freeunit unit \
+    && git clone --depth 1 -b 1.35.5 https://github.com/freeunitorg/freeunit unit \
     && cd unit \
     && NCPU="$(getconf _NPROCESSORS_ONLN)" \
     && DEB_HOST_MULTIARCH="$(dpkg-architecture -q DEB_HOST_MULTIARCH)" \
@@ -80,7 +80,8 @@ RUN set -ex \
     && cd \
     && rm -rf /usr/src/unit \
     && for f in /usr/sbin/unitd /usr/lib/unit/modules/*.unit.so; do \
-        ldd $f | awk '/=>/{print $(NF-1)}' | while read n; do dpkg-query -S $(realpath $n 2>/dev/null || echo $n) 2>/dev/null; done | grep -v '^diversion' | sed 's/^\([^:]\+\):.*$/\1/' | sort | uniq >> /requirements.apt; \
+        [ -f "$f" ] || continue; \
+        ldd "$f" | awk '/=>/{print $(NF-1)}' | while read n; do dpkg-query -S $(realpath $n 2>/dev/null || echo $n) 2>/dev/null; done | grep -v '^diversion' | sed 's/^\([^:]\+\):.*$/\1/' | sort | uniq >> /requirements.apt; \
        done \
     && apt-mark showmanual | xargs apt-mark auto > /dev/null \
     && { [ -z "$savedAptMark" ] || apt-mark manual $savedAptMark; } \

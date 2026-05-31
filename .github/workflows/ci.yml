@@ -32,8 +32,6 @@ jobs:
           - build: unit
             os: ubuntu-latest
           # Modules
-          - build: go-1.24
-            os: ubuntu-latest
           - build: go-1.25
             os: ubuntu-latest
           - build: go-1.26
@@ -61,6 +59,8 @@ jobs:
           - build: python-3.11
             os: ubuntu-latest
           - build: python-3.12
+            os: ubuntu-latest
+          - build: python-3.14
             os: ubuntu-latest
           - build: ruby-3.3
             os: ubuntu-latest
@@ -126,16 +126,16 @@ jobs:
         uses: actions/cache@v5
         with:
           path: /opt/openssl-3.6
-          key: openssl-3.6.0-${{ runner.os }}-${{ runner.arch }}
+          key: openssl-3.6.2-${{ runner.os }}-${{ runner.arch }}
 
       - name: Build OpenSSL 3.6
         if: steps.cache-openssl36.outputs.cache-hit != 'true'
         run: |
           sudo apt-get -y install build-essential
           cd /tmp
-          wget -q https://www.openssl.org/source/openssl-3.6.0.tar.gz
-          tar -xzf openssl-3.6.0.tar.gz
-          cd openssl-3.6.0
+          wget -q https://www.openssl.org/source/openssl-3.6.2.tar.gz
+          tar -xzf openssl-3.6.2.tar.gz
+          cd openssl-3.6.2
           ./Configure --prefix=/opt/openssl-3.6 shared no-docs
           make -j$(nproc)
           sudo mkdir -p /opt/openssl-3.6
@@ -393,6 +393,25 @@ jobs:
       ##
       ## Tests
       ##
+
+      - name: Cache Cargo artifacts
+        if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            test/fake_upstream/target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('test/fake_upstream/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      - name: Build fake_upstream
+        if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
+        run: |
+          rustup toolchain install stable --no-self-update --profile minimal
+          cargo build --release --manifest-path test/fake_upstream/Cargo.toml
+          sudo cp test/fake_upstream/target/release/fake_upstream /usr/local/bin/
 
       # /home/runner will be root only after calling sudo above
       # Ensure all users and processes can execute

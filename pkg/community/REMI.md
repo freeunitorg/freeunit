@@ -33,8 +33,9 @@ As of the last verified check (April 2026):
 PHP versions with confirmed `unit-php` packages: **7.4, 8.0, 8.3, 8.4, 8.5**
 
 > Remi stopped updating `unit-php` at version 1.35.0 (the last NGINX Unit release before
-> the project was archived in October 2025). FreeUnit is API/ABI compatible starting from
-> that version.
+> the project was archived in October 2025). The packages track the last NGINX Unit
+> source release. FreeUnit is API/ABI compatible starting from that version — the module
+> loads and works correctly with FreeUnit 1.35.5.
 
 ## Migration from NGINX Unit + Remi
 
@@ -99,6 +100,5 @@ That page is archived. Current FreeUnit installation docs:
 ## Notes
 
 Last verified: April 2026. Remi's `unit-php` packages were last published at version 1.35.0
-and have not been updated since NGINX Unit was archived. If Remi does not resume updates,
-native `freeunit-php` modules via `packages.freeunit.org` are the planned fallback.
-Track progress at [github.com/freeunitorg/freeunit/issues](https://github.com/freeunitorg/freeunit/issues).
+and have not been updated since NGINX Unit was archived. Contact with Remi about
+FreeUnit integration is planned after the 1.35.5 stable release.

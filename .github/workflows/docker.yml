@@ -8,12 +8,16 @@
 #   EOL dates: https://endoflife.date
 #   To drop a variant: remove its entry from matrix.include and note it in CHANGES.
 #
-# EOL status (as of April 2026):
-#   go1.24      EOL ~Feb 2026  -> supported until Feb 2027
+# EOL status (as of May 2026):
+#   go1.24      DROPPED — Go upstream stopped patching after 1.24.13 (2026-02-04).
+#               Unfixed CVEs in 1.24: CVE-2026-27140 (cmd/cgo SWIG RCE, CVSS 8.8),
+#               CVE-2026-33814 (HTTP/2 client DoS), CVE-2026-27142 (html/template XSS),
+#               cgo DNS double-free, go tool pack path traversal.
+#               Fixed only in 1.25.9+/1.26.2+.
 #   go1.25      EOL ~Aug 2026  -> supported until Aug 2027
 #   go1.26      EOL ~Feb 2027  -> supported until Feb 2028
-#   jsc17       EOL Sep 2029 (OpenJDK 17 LTS, Eclipse Temurin) -> supported until Sep 2030
-#   jsc21       EOL Sep 2031 (OpenJDK 21 LTS, Eclipse Temurin) -> supported until Sep 2032
+#   jsc17       EOL Oct 2027 (OpenJDK 17 LTS, Eclipse Temurin) -> supported until Oct 2028
+#   jsc21       EOL Dec 2029 (OpenJDK 21 LTS, Eclipse Temurin) -> supported until Dec 2030
 #   node20      EOL Apr 2026   -> supported until Apr 2027
 #   node22      EOL Apr 2027   -> supported until Apr 2028
 #   node24      EOL Apr 2028   -> supported until Apr 2029
@@ -35,7 +39,7 @@ name: Build and Push Docker Images
 on:
   push:
     tags:
-      - '*'
+      - '[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
     inputs:
       tag:
@@ -66,8 +70,6 @@ jobs:
             dockerfile: pkg/docker/Dockerfile.wasm
 
           # -- Go ------------------------------------------------------------
-          - variant: go1.24
-            dockerfile: pkg/docker/Dockerfile.go1.24
           - variant: go1.25
             dockerfile: pkg/docker/Dockerfile.go1.25
           - variant: go1.26
@@ -189,8 +191,6 @@ jobs:
             dockerfile: pkg/docker/Dockerfile.wasm
 
           # -- Go ------------------------------------------------------------
-          - variant: go1.24
-            dockerfile: pkg/docker/Dockerfile.go1.24
           - variant: go1.25
             dockerfile: pkg/docker/Dockerfile.go1.25
           - variant: go1.26
@@ -303,7 +303,6 @@ jobs:
         include:
           - variant: minimal
           - variant: wasm
-          - variant: go1.24
           - variant: go1.25
           - variant: go1.26
           # -- JSC (Java / GraalVM) ------------------------------------------

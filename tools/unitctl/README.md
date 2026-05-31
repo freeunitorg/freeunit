@@ -174,7 +174,7 @@ of Unit at once. To do this, pass multiple values for the `-s` flag as
 shown below:
 
 ```
-$ unitctl -s '127.0.0.1:8001' -s /run/nginx-unit.control.sock app list
+$ unitctl -s '127.0.0.1:8001' -s /var/run/control.unit.sock app list
 ```
 
 ### Lists active listeners from running Unit processes
@@ -195,7 +195,7 @@ No socket path provided - attempting to detect from running instance
 To do this, pass multiple values for the `-s` flag as shown below:
 
 ```
-$ unitctl -s '127.0.0.1:8001' -s /run/nginx-unit.control.sock listeners
+$ unitctl -s '127.0.0.1:8001' -s /var/run/control.unit.sock listeners
 ```
 
 ### Get the current status of FreeUnit processes
@@ -219,7 +219,7 @@ applications: {}
 To do this, pass multiple values for the `-s` flag as shown below:
 
 ```
-$ unitctl -s '127.0.0.1:8001' -s /run/nginx-unit.control.sock status
+$ unitctl -s '127.0.0.1:8001' -s /var/run/control.unit.sock status
 ```
 
 ### Send arbitrary configuration payloads to Unit
@@ -252,7 +252,7 @@ $ echo '{
 To do this, pass multiple values for the `-s` flag as shown below:
 
 ```
-$ unitctl -s '127.0.0.1:8001' -s /run/nginx-unit.control.sock execute ...
+$ unitctl -s '127.0.0.1:8001' -s /var/run/control.unit.sock execute ...
 ```
 
 ### Edit current configuration in your favorite editor

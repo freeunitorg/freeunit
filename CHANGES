@@ -1,5 +1,36 @@
 
-Changes with FreeUnit 1.35.4                                     xx xxx 2026
+Changes with FreeUnit 1.35.5                                     29 May 2026
+
+    *) Feature: automatically convert chunked request bodies to Content-Length
+       when forwarding to upstream servers via proxy action. This enables
+       compatibility with backends that do not support Transfer-Encoding:
+       chunked (e.g., Gitea, servers requiring Content-Length). Fixes
+       freeunitorg/freeunit#58, resolves nginx/unit#445 (client chunked),
+       nginx/unit#1088 (duplicate TE), and nginx/unit#1278 (RFC 9112 epic).
+
+    *) Change: chunked_transform feature is no longer experimental. Chunked
+       request bodies can be accepted and transparently converted to
+       Content-Length via configuration: { "settings": { "http":
+       { "chunked_transform": true } } }
+
+    *) Bugfix: fix TLS library busy-loop on peer-initiated close in SSL_write
+       when connection is aborted by remote peer; prevents high CPU usage and
+       ensures proper connection cleanup.
+
+    *) Feature: add unfreeze-sync.sh script for automated migration of issues
+       from nginx/unit to freeunitorg/freeunit with label mapping, deduplication,
+       and dry-run preview support.
+
+    *) Change: upgrade contrib njs to 0.9.8.
+
+    *) Bugfix: fix mem-pool retain leak in cert/script-store IPC paths
+       (router side) and fd/buffer leaks in cert/script/socket/access-log
+       reply paths and the controller config-store path (main process
+       side); all reachable when nxt_port_msg_alloc fails inside the
+       port machinery.
+
+
+Changes with FreeUnit 1.35.4                                     30 Apr 2026
 
     *) Bugfix: fix router process CPU spin and connection hang under port
        scanning load; CLOSE-WAIT sockets are now cleaned up properly on
