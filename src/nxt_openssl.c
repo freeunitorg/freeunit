@@ -1676,7 +1676,22 @@ nxt_openssl_conn_error(nxt_task_t *task, nxt_err_t err, const char *fmt, ...)
 static nxt_uint_t
 nxt_openssl_log_error_level(nxt_err_t err)
 {
-    switch (ERR_GET_REASON(ERR_peek_error())) {
+    unsigned long  lib_err;
+
+    lib_err = ERR_peek_error();
+
+    /*
+     * System-library errors (e.g. a client that aborts mid-write: OpenSSL 3.x
+     * records EPIPE/ECONNRESET in the error queue while errno reads EAGAIN)
+     * carry a reason that is a plain errno, not an SSL_R_* code.  Classify them
+     * by errno so a peer disconnect is logged at info, not alert; otherwise the
+     * errno value falls through the SSL_R_* switch to the NXT_LOG_ALERT default.
+     */
+    if (ERR_GET_LIB(lib_err) == ERR_LIB_SYS) {
+        return nxt_socket_error_level(ERR_GET_REASON(lib_err));
+    }
+
+    switch (ERR_GET_REASON(lib_err)) {
 
     case 0:
         return nxt_socket_error_level(err);
