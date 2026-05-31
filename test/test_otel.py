@@ -10,9 +10,10 @@ from unit.utils import waitforsocket
 
 client = ApplicationProto()
 
-# fake_otlp — std-only Rust mock OTLP/HTTP collector (test/fake_otlp/).
-# CI installs it via the "Build fake_otlp" step in ci.yml, mirroring
-# fake_upstream. Skip gracefully when it is not built.
+# fake_otlp — Rust mock OTLP collector (test/fake_otlp/) speaking both OTLP/HTTP
+# and OTLP/gRPC, so the transport under test is chosen by config (--protocol),
+# never by how the mock was built. CI installs it via the "Build fake_otlp" step
+# in ci.yml, mirroring fake_upstream. Skip gracefully when it is not built.
 FAKE_OTLP_BIN = '/usr/local/bin/fake_otlp'
 
 _skipif_no_fake_otlp = pytest.mark.skipif(
@@ -39,8 +40,8 @@ def _get_free_port():
         return s.getsockname()[1]
 
 
-def _run_fake_otlp(port, requests=None, dump=None):
-    cmd = [FAKE_OTLP_BIN, '--port', str(port)]
+def _run_fake_otlp(port, requests=None, dump=None, protocol='http'):
+    cmd = [FAKE_OTLP_BIN, '--port', str(port), '--protocol', protocol]
     if requests is not None:
         cmd += ['--requests', str(requests)]
     if dump is not None:
@@ -69,16 +70,26 @@ def _config(telemetry):
     }
 
 
-def _valid_telemetry(collector_port, sampling_ratio=1.0, batch_size=1):
+def _valid_telemetry(
+    collector_port, sampling_ratio=1.0, batch_size=1, protocol='http'
+):
+    # The OTLP SDK posts to the configured endpoint as-is (it does not append
+    # the signal path), so an OTLP/HTTP endpoint must spell out /v1/traces to
+    # reach a real collector — fake_otlp's hardened HTTP path rejects anything
+    # else. OTLP/gRPC targets the host:port; the RPC method carries the path.
+    if protocol == 'grpc':
+        endpoint = f"http://127.0.0.1:{collector_port}"
+    else:
+        endpoint = f"http://127.0.0.1:{collector_port}/v1/traces"
     return {
-        "endpoint": f"http://127.0.0.1:{collector_port}",
-        "protocol": "http",
+        "endpoint": endpoint,
+        "protocol": protocol,
         "sampling_ratio": sampling_ratio,
         "batch_size": batch_size,
     }
 
 
-def _configure_or_skip(collector_port, sampling_ratio=1.0):
+def _configure_or_skip(collector_port, sampling_ratio=1.0, protocol='http'):
     """Apply a valid OTel + return-200 config.
 
     A rejection here is disambiguated: if the error names the "telemetry"
@@ -87,7 +98,9 @@ def _configure_or_skip(collector_port, sampling_ratio=1.0):
     by a skip. This is what lets the negative validation tests trust that a
     rejection came from the field validator under test.
     """
-    conf = client.conf(_config(_valid_telemetry(collector_port, sampling_ratio)))
+    conf = client.conf(
+        _config(_valid_telemetry(collector_port, sampling_ratio, protocol=protocol))
+    )
     if 'success' in conf:
         return
     if 'telemetry' in str(conf).lower():
@@ -124,13 +137,14 @@ def _get_until_header(header, retries=50, delay=0.1, **kwargs):
 
 
 @_skipif_no_fake_otlp
-def test_otel_span_exported_with_service_name(tmp_path):
+@pytest.mark.parametrize('protocol', ['http', 'grpc'])
+def test_otel_span_exported_with_service_name(tmp_path, protocol):
     """A traced request exports a span carrying service.name=FreeUnit."""
     port = _get_free_port()
     dump = str(tmp_path / 'otlp_dump.bin')
-    proc = _run_fake_otlp(port, requests=1, dump=dump)
+    proc = _run_fake_otlp(port, requests=1, dump=dump, protocol=protocol)
     try:
-        _configure_or_skip(port)
+        _configure_or_skip(port, protocol=protocol)
 
         assert client.get()['status'] == 200
 
@@ -142,17 +156,24 @@ def test_otel_span_exported_with_service_name(tmp_path):
         with open(dump, 'rb') as f:
             body = f.read()
         assert b'FreeUnit' in body, 'exported span must carry service.name=FreeUnit'
+        # Semconv span attributes (1.35.6): recorded via nxt_otel_rs_add_attr,
+        # not as the old free-form span events. The attribute *keys* travel as
+        # literal strings in the OTLP protobuf payload.
+        assert b'http.request.method' in body, 'span must carry semconv method attr'
+        assert b'url.path' in body, 'span must carry semconv url.path attr'
+        assert b'http.response.status_code' in body, 'span must carry status attr'
     finally:
         _kill(proc)
 
 
 @_skipif_no_fake_otlp
-def test_otel_traceparent_in_response():
+@pytest.mark.parametrize('protocol', ['http', 'grpc'])
+def test_otel_traceparent_in_response(protocol):
     """FreeUnit injects a traceparent header into the response."""
     port = _get_free_port()
-    proc = _run_fake_otlp(port)  # run forever, just absorb exports
+    proc = _run_fake_otlp(port, protocol=protocol)  # run forever, absorb exports
     try:
-        _configure_or_skip(port)
+        _configure_or_skip(port, protocol=protocol)
 
         resp = _get_until_header('traceparent')
         assert resp['status'] == 200
@@ -164,13 +185,14 @@ def test_otel_traceparent_in_response():
 
 
 @_skipif_no_fake_otlp
-def test_otel_traceparent_inherited(tmp_path):
+@pytest.mark.parametrize('protocol', ['http', 'grpc'])
+def test_otel_traceparent_inherited(tmp_path, protocol):
     """An incoming traceparent is continued: the exported span keeps its trace id."""
     port = _get_free_port()
     dump = str(tmp_path / 'otlp_dump.bin')
-    proc = _run_fake_otlp(port, requests=1, dump=dump)
+    proc = _run_fake_otlp(port, requests=1, dump=dump, protocol=protocol)
     try:
-        _configure_or_skip(port)
+        _configure_or_skip(port, protocol=protocol)
 
         resp = _get_until_header(
             'traceparent',
@@ -200,12 +222,13 @@ def test_otel_traceparent_inherited(tmp_path):
 
 
 @_skipif_no_fake_otlp
-def test_otel_sampling_zero_exports_nothing():
+@pytest.mark.parametrize('protocol', ['http', 'grpc'])
+def test_otel_sampling_zero_exports_nothing(protocol):
     """sampling_ratio=0 → a new root trace is not sampled and never exported."""
     port = _get_free_port()
-    proc = _run_fake_otlp(port, requests=1)
+    proc = _run_fake_otlp(port, requests=1, protocol=protocol)
     try:
-        _configure_or_skip(port, sampling_ratio=0.0)
+        _configure_or_skip(port, sampling_ratio=0.0, protocol=protocol)
 
         assert client.get()['status'] == 200
 
@@ -228,18 +251,15 @@ def test_otel_sampling_zero_exports_nothing():
 # ---------------------------------------------------------------------------
 
 
-def test_otel_protocol_grpc_rejected():
-    """OTLP/gRPC was dropped in 1.35.6 — protocol "grpc" must be rejected."""
+def test_otel_protocol_grpc_accepted():
+    """protocol "grpc" is a valid transport on any --otel build."""
     _require_otel()
-    tel = _valid_telemetry(1)
-    tel["protocol"] = "grpc"
-    conf = client.conf(_config(tel))
-    assert 'error' in conf, 'protocol "grpc" must be rejected'
-    assert 'protocol' in str(conf).lower()
+    conf = client.conf(_config(_valid_telemetry(1, protocol='grpc')))
+    assert 'success' in conf, f'protocol "grpc" must be accepted: {conf}'
 
 
 def test_otel_protocol_invalid_rejected():
-    """Only "http" is a valid protocol."""
+    """Only "http" and "grpc" are valid protocols."""
     _require_otel()
     tel = _valid_telemetry(1)
     tel["protocol"] = "https"

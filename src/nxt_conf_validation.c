@@ -1626,8 +1626,12 @@ nxt_otel_validate_protocol(nxt_conf_validation_t *vldt,
         return NXT_OK;
     }
 
-    return nxt_conf_vldt_error(vldt, "The \"protocol\" must be \"http\". "
-                               "OTLP/gRPC export is not supported.");
+    if (nxt_str_eq(&proto, "GRPC", 4) || nxt_str_eq(&proto, "grpc", 4)) {
+        return NXT_OK;
+    }
+
+    return nxt_conf_vldt_error(vldt, "The \"protocol\" must be \"http\" "
+                               "or \"grpc\".");
 }
 
 #endif

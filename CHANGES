@@ -9,14 +9,31 @@ Changes with FreeUnit 1.35.6                                     25 Jun 2026
        the upstream sampling decision; the sampler wraps TraceIdRatioBased
        inside ParentBased so that remote parent trace flags are honoured.
 
-    *) Change: OpenTelemetry export now supports OTLP/HTTP only. The "grpc"
-       value of "settings/telemetry/protocol" is no longer accepted;
-       configurations using it are rejected on reload. The endpoint must be a
-       plain http:// collector (no TLS). Use protocol "http" instead.
+    *) Feature: add fake_otlp mock OTLP collector (test/fake_otlp/) and the
+       test_otel.py test suite covering span export, traceparent
+       propagation, sampling, and configuration validation over both the
+       OTLP/HTTP and OTLP/gRPC transports.
+
+    *) Feature: reintroduce OTLP/gRPC trace export. Both transports are
+       compiled into every "--otel" build and the
+       "settings/telemetry/protocol" option selects "http" (OTLP/HTTP) or
+       "grpc" (OTLP/gRPC) at runtime, as in upstream Unit. gRPC uses tonic
+       over a small tokio runtime; v1 is plaintext h2c only (no TLS to the
+       collector, like the HTTP path).
+
+    *) Change: rename the default OTel service name from "NGINX Unit" to
+       "FreeUnit".
 
     *) Bugfix: add validation bounds for "batch_size" (1-65536) and
        "sampling_ratio" (0-1) in the OpenTelemetry configuration; previously
        invalid values were silently rejected without an error message.
+
+    *) Bugfix: replace eprintln! error output in the OTel Rust layer with
+       the C log callback (nxt_otel_log_cb), so errors flow through the
+       standard Unit logging infrastructure.
+
+    *) Bugfix: remove unreachable Protocol::HttpJson dead-code arm from the
+       OTel exporter; only HttpBinary was ever selected.
 
 
 Changes with FreeUnit 1.35.5                                     29 May 2026

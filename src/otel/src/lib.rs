@@ -2,10 +2,12 @@
 
 //! OpenTelemetry trace export for FreeUnit.
 //!
-//! HTTP/OTLP only, by design. The exporter uses the blocking reqwest client
-//! driven by the stable dedicated-thread `BatchSpanProcessor`. There is no
-//! tokio runtime and no async executor here — that keeps the FFI surface
-//! simple and the runtime behaviour predictable for an LTS fork.
+//! Two OTLP transports, selected at runtime by `settings/telemetry/protocol`:
+//! `"http"` (default) uses the blocking reqwest client and needs no async
+//! executor; `"grpc"` uses tonic over a small multi-thread tokio runtime that
+//! this crate owns (built lazily, dropped on shutdown). Both are driven by the
+//! stable dedicated-thread `BatchSpanProcessor`. v1 is plaintext only — no TLS
+//! to the collector on either transport.
 //!
 //! A finished span is handed to C as a raw `*mut BoxedSpan`. Ending the span
 //! (on drop in `nxt_otel_rs_send_trace`) enqueues it into the batch processor,
@@ -14,8 +16,8 @@
 use opentelemetry::global;
 use opentelemetry::global::BoxedSpan;
 use opentelemetry::trace::{
-    Span, SpanContext, SpanId, SpanKind, TraceContextExt, TraceFlags, TraceId,
-    TraceState, Tracer, TracerProvider,
+    Span, SpanContext, SpanId, SpanKind, Status, TraceContextExt, TraceFlags,
+    TraceId, TraceState, Tracer, TracerProvider,
 };
 use opentelemetry::{Context, KeyValue};
 use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig};
@@ -24,6 +26,7 @@ use opentelemetry_sdk::trace::{
 };
 use opentelemetry_sdk::Resource;
 use std::ffi::{c_char, CStr, CString};
+use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Duration;
 use std::{ptr, slice};
@@ -56,6 +59,52 @@ type nxt_otel_log_cb = unsafe extern "C" fn(log_level: nxt_uint_t, msg: *const c
 fn provider_slot() -> &'static Mutex<Option<SdkTracerProvider>> {
     static PROVIDER: Mutex<Option<SdkTracerProvider>> = Mutex::new(None);
     &PROVIDER
+}
+
+/// The tokio runtime owning the gRPC exporter's tonic channel. The blocking
+/// batch processor drives export RPCs onto it from its own thread, so it must
+/// outlive the provider; it is dropped in `nxt_otel_rs_shutdown_tracer`.
+fn runtime_slot() -> &'static Mutex<Option<tokio::runtime::Runtime>> {
+    static RT: Mutex<Option<tokio::runtime::Runtime>> = Mutex::new(None);
+    &RT
+}
+
+/// Build the OTLP/HTTP exporter: the blocking reqwest client, no async runtime.
+fn build_http_exporter(endpoint: String) -> Result<SpanExporter, String> {
+    SpanExporter::builder()
+        .with_http()
+        .with_endpoint(endpoint)
+        .with_protocol(Protocol::HttpBinary)
+        .with_timeout(EXPORT_TIMEOUT)
+        .build()
+        .map_err(|e| format!("couldn't build otel http exporter: {e}"))
+}
+
+/// Build the OTLP/gRPC exporter (tonic). A small multi-thread tokio runtime is
+/// created and stashed so its reactor stays alive: the tonic channel is built
+/// inside the runtime context, and the batch processor's blocking export later
+/// dispatches RPCs onto it. v1 is plaintext h2c — no TLS to the collector.
+fn build_grpc_exporter(endpoint: String) -> Result<SpanExporter, String> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|e| format!("couldn't build tokio runtime for otel grpc: {e}"))?;
+
+    let exporter = {
+        let _guard = rt.enter();
+        SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .with_timeout(EXPORT_TIMEOUT)
+            .build()
+            .map_err(|e| format!("couldn't build otel grpc exporter: {e}"))?
+    };
+
+    if let Ok(mut slot) = runtime_slot().lock() {
+        *slot = Some(rt);
+    }
+    Ok(exporter)
 }
 
 /// Copy a `nxt_str_t` into an owned `String`. The caller guarantees `s.start`
@@ -94,9 +143,10 @@ pub unsafe extern "C" fn nxt_otel_rs_uninit() {
     nxt_otel_rs_shutdown_tracer();
 }
 
-/// Initialise the global tracer provider for OTLP/HTTP export.
+/// Initialise the global tracer provider for OTLP export.
 ///
-/// `protocol` must be `"http"`; anything else is rejected via `log_callback`.
+/// `protocol` selects the transport: `"http"` or `"grpc"`; anything else is
+/// rejected via `log_callback`.
 /// Re-invoking this flushes and replaces any previously configured provider.
 #[no_mangle]
 pub unsafe extern "C" fn nxt_otel_rs_init(
@@ -113,27 +163,26 @@ pub unsafe extern "C" fn nxt_otel_rs_init(
     let endpoint = nxt_str_to_string(&*endpoint);
     let proto = nxt_str_to_string(&*protocol).to_lowercase();
 
-    if proto != "http" {
+    if proto != "http" && proto != "grpc" {
         log_err(
             log_callback,
-            format!("unsupported otel protocol {proto:?}: only \"http\" is supported"),
+            format!("unsupported otel protocol {proto:?}: expected \"http\" or \"grpc\""),
         );
         return;
     }
 
-    // Start from a clean slate: flush and drop any prior provider.
+    // Start from a clean slate: flush and drop any prior provider (and, if the
+    // prior config used grpc, its tokio runtime).
     nxt_otel_rs_shutdown_tracer();
 
-    let exporter = match SpanExporter::builder()
-        .with_http()
-        .with_endpoint(endpoint)
-        .with_protocol(Protocol::HttpBinary)
-        .with_timeout(EXPORT_TIMEOUT)
-        .build()
-    {
+    let exporter = match if proto == "grpc" {
+        build_grpc_exporter(endpoint)
+    } else {
+        build_http_exporter(endpoint)
+    } {
         Ok(e) => e,
-        Err(e) => {
-            log_err(log_callback, format!("couldn't build otel exporter: {e}"));
+        Err(msg) => {
+            log_err(log_callback, msg);
             return;
         }
     };
@@ -208,6 +257,36 @@ pub unsafe extern "C" fn nxt_otel_rs_add_event_to_trace(
     (*trace).add_event("Unit Attribute".to_string(), vec![KeyValue::new(key, val)]);
 }
 
+/// Set a semantic-convention span attribute (e.g. `http.request.method`).
+/// Unlike `add_event_to_trace`, this records structured span attributes the
+/// collector can index and query, not timestamped events.
+#[no_mangle]
+pub unsafe extern "C" fn nxt_otel_rs_add_attr(
+    trace: *mut BoxedSpan,
+    key: *const nxt_str_t,
+    val: *const nxt_str_t,
+) {
+    if trace.is_null() || key.is_null() || val.is_null() {
+        return;
+    }
+
+    let key = nxt_str_to_string(&*key);
+    let val = nxt_str_to_string(&*val);
+
+    (*trace).set_attribute(KeyValue::new(key, val));
+}
+
+/// Mark the span as errored. Called by C for 5xx responses so the trace is
+/// flagged `Status::Error` in the collector, matching nginx-otel/Caddy.
+#[no_mangle]
+pub unsafe extern "C" fn nxt_otel_rs_set_error(trace: *mut BoxedSpan) {
+    if trace.is_null() {
+        return;
+    }
+
+    (*trace).set_status(Status::error(""));
+}
+
 /// Build a parent context from an inherited traceparent, if all parts parse.
 ///
 /// In OTel 0.32 the trace id can no longer be forced onto a `SpanBuilder`; a
@@ -218,6 +297,7 @@ unsafe fn nxt_otel_parent_context(
     trace_id: *const c_char,
     parent_id: *const c_char,
     trace_flags: *const c_char,
+    trace_state: *const nxt_str_t,
 ) -> Option<Context> {
     if trace_id.is_null() || parent_id.is_null() {
         return None;
@@ -234,7 +314,15 @@ unsafe fn nxt_otel_parent_context(
             .unwrap_or(TraceFlags::SAMPLED)
     };
 
-    let sc = SpanContext::new(tid, sid, flags, true, TraceState::default());
+    // Forward the inherited W3C `tracestate` so vendor context is preserved on
+    // the continued trace; an unparseable or absent value falls back to empty.
+    let state = if trace_state.is_null() {
+        TraceState::default()
+    } else {
+        TraceState::from_str(&nxt_str_to_string(&*trace_state)).unwrap_or_default()
+    };
+
+    let sc = SpanContext::new(tid, sid, flags, true, state);
     Some(Context::new().with_remote_span_context(sc))
 }
 
@@ -243,11 +331,12 @@ pub unsafe extern "C" fn nxt_otel_rs_get_or_create_trace(
     trace_id: *const c_char,
     parent_id: *const c_char,
     trace_flags: *const c_char,
+    trace_state: *const nxt_str_t,
 ) -> *mut BoxedSpan {
     let tracer = global::tracer_provider().tracer(TRACER_NAME);
     let builder = tracer.span_builder(SPAN_NAME).with_kind(SpanKind::Server);
 
-    let parent = nxt_otel_parent_context(trace_id, parent_id, trace_flags)
+    let parent = nxt_otel_parent_context(trace_id, parent_id, trace_flags, trace_state)
         .unwrap_or_else(Context::new);
     let span = tracer.build_with_context(builder, &parent);
 
@@ -272,6 +361,15 @@ pub unsafe extern "C" fn nxt_otel_rs_send_trace(trace: *mut BoxedSpan) {
 pub unsafe extern "C" fn nxt_otel_rs_shutdown_tracer() {
     let provider = provider_slot().lock().ok().and_then(|mut g| g.take());
     if let Some(provider) = provider {
+        // Flushes pending spans; on a grpc build this still needs the runtime,
+        // so the provider is shut down before the runtime is dropped below.
         let _ = provider.shutdown();
+    }
+
+    // Drop the gRPC runtime (if the live config used grpc) after the provider
+    // shutdown above has flushed through it.
+    let rt = runtime_slot().lock().ok().and_then(|mut g| g.take());
+    if let Some(rt) = rt {
+        rt.shutdown_background();
     }
 }

@@ -7457,15 +7457,19 @@ components:
 
         endpoint:
           type: string
-          description: "A plain `http://` endpoint to which Unit sends OpenTelemetry
-            spans (OTLP/HTTP). TLS is not supported for the collector connection;
-            the collector is expected on localhost or an internal network."
+          description: "A plain endpoint to which Unit sends OpenTelemetry spans.
+            For `http` use a full `http://host:4318/v1/traces` URL; for `grpc`
+            use `http://host:4317`. TLS is not supported for the collector
+            connection; the collector is expected on localhost or an internal
+            network."
 
         protocol:
           type: string
-          enum: ["http"]
-          description: "Transport for OTLP export. Only `http` (OTLP/HTTP) is
-            supported; `grpc` was removed."
+          enum: ["http", "grpc"]
+          description: "Transport for OTLP export, chosen at runtime: `http`
+            (OTLP/HTTP, default port 4318) or `grpc` (OTLP/gRPC, plaintext h2c,
+            default port 4317). Both are available in any `--otel` build. Plain
+            transport only — no TLS to the collector."
 
         sampling_ratio:
           type: number

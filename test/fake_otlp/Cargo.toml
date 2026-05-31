@@ -6,3 +6,17 @@ edition = "2021"
 [[bin]]
 name = "fake_otlp"
 path = "src/main.rs"
+
+# Serves both OTLP transports so a single build covers every test: HTTP is
+# handled std-only; gRPC pulls tonic/prost/tokio + the OTLP protobuf types.
+# This mirrors FreeUnit itself (one --otel build, both transports), so the
+# protocol under test is chosen by config, never by how the mock was built.
+# Crate versions track src/otel/Cargo.lock (opentelemetry-proto 0.32 line).
+[dependencies]
+tonic = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+opentelemetry-proto = { version = "0.32", default-features = false, features = [
+    "gen-tonic",
+    "trace",
+] }

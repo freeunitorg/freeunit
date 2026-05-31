@@ -7,16 +7,22 @@ edition = "2021"
 crate-type = ["staticlib"]
 bench = false
 
-# OpenTelemetry trace export over OTLP/HTTP.
+# OpenTelemetry trace export over OTLP.
 #
-# HTTP only, no TLS — by design, for an LTS fork:
-#   * The stable, non-experimental path uses the blocking reqwest client driven
-#     by the dedicated-thread BatchSpanProcessor — no tokio runtime we manage,
-#     no async executor. gRPC (tonic) is intentionally not supported.
-#   * No TLS stack is linked. reqwest 0.13 dropped the ring rustls provider, so
-#     enabling rustls would pull aws-lc-sys (a cmake/C build) and native-tls
-#     would link a second OpenSSL into this staticlib. We avoid both: the OTLP
-#     endpoint must be plain http:// (a collector on localhost / internal net).
+# Both transports are always compiled in; settings/telemetry/protocol picks one
+# at runtime (matching the historical Unit behaviour — a single --otel build,
+# protocol chosen by config):
+#
+#   * "http" (default): the stable, non-experimental blocking reqwest client
+#     driven by the dedicated-thread BatchSpanProcessor — no tokio runtime on
+#     this path.
+#   * "grpc": opentelemetry-otlp's grpc-tonic transport on a small tokio runtime
+#     this crate owns, bound to the export thread.
+#
+# No TLS stack is linked (reqwest 0.13 dropped the ring rustls provider; rustls
+# would pull aws-lc-sys and native-tls would link a second OpenSSL into this
+# staticlib), so both transports are plaintext — the endpoint must be plain
+# http:// (h2c for grpc).
 [dependencies]
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["trace"] }
@@ -24,5 +30,8 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "trace",
     "http-proto",
     "reqwest-blocking-client",
+    "grpc-tonic",
 ] }
 opentelemetry-semantic-conventions = "0.32"
+tonic = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread"] }

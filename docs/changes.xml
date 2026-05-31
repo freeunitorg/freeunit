@@ -26,12 +26,27 @@ so that remote parent trace flags are honoured.
 </para>
 </change>
 
+<change type="feature">
+<para>
+add fake_otlp mock OTLP collector (test/fake_otlp/) and the test_otel.py
+test suite covering span export, traceparent propagation, sampling, and
+configuration validation over both the OTLP/HTTP and OTLP/gRPC transports.
+</para>
+</change>
+
+<change type="feature">
+<para>
+reintroduce OTLP/gRPC trace export. Both transports are compiled into
+every "--otel" build and the "settings/telemetry/protocol" option selects
+"http" (OTLP/HTTP) or "grpc" (OTLP/gRPC) at runtime, as in upstream Unit.
+gRPC uses tonic over a small tokio runtime; v1 is plaintext h2c only (no
+TLS to the collector, like the HTTP path).
+</para>
+</change>
+
 <change type="change">
 <para>
-OpenTelemetry export now supports OTLP/HTTP only. The "grpc" value of
-"settings/telemetry/protocol" is no longer accepted; configurations using
-it are rejected on reload. The endpoint must be a plain http:// collector
-(no TLS). Use protocol "http" instead.
+rename the default OTel service name from "NGINX Unit" to "FreeUnit".
 </para>
 </change>
 
@@ -40,6 +55,21 @@ it are rejected on reload. The endpoint must be a plain http:// collector
 add validation bounds for "batch_size" (1-65536) and "sampling_ratio"
 (0-1) in the OpenTelemetry configuration; previously invalid values were
 silently rejected without an error message.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+replace eprintln! error output in the OTel Rust layer with the C log
+callback (nxt_otel_log_cb), so errors flow through the standard Unit
+logging infrastructure.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+remove unreachable Protocol::HttpJson dead-code arm from the OTel
+exporter; only HttpBinary was ever selected.
 </para>
 </change>
 
