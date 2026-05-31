@@ -1114,7 +1114,6 @@ nxt_cert_store_get(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp,
         goto fail;
     }
 
-    nxt_mp_retain(mp);
     b->completion_handler = nxt_cert_buf_completion;
 
     nxt_buf_cpystr(b, name);
@@ -1137,6 +1136,10 @@ nxt_cert_store_get(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp,
         nxt_port_rpc_cancel(task, recv_port, stream);
         goto fail;
     }
+
+    /* Retain after hand-off: failure paths above must not leave an orphaned
+     * refcount that the completion handler can never release. */
+    nxt_mp_retain(mp);
 
     return;
 
@@ -1224,8 +1227,21 @@ nxt_cert_store_get_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
 error:
 
-    (void) nxt_port_socket_write(task, port, type, file.fd,
-                                 msg->port_msg.stream, 0, NULL);
+    if (nxt_port_socket_write(task, port, type, file.fd,
+                              msg->port_msg.stream, 0, NULL)
+        != NXT_OK
+        && file.fd != -1)
+    {
+        /*
+         * On send failure (e.g. malloc failure inside the port machinery)
+         * the port layer never takes ownership of the fd, so close it
+         * here to avoid leaking an open file descriptor in the privileged
+         * main process.  Use nxt_fd_close() rather than nxt_file_close():
+         * file.name has already been freed above and the latter would
+         * dereference it through "%FN" on a close-failure log path.
+         */
+        nxt_fd_close(file.fd);
+    }
 }
 
 

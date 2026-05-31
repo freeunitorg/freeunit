@@ -559,6 +559,65 @@ def test_tls_no_close_notify():
     sock.close()
 
 
+def test_tls_write_abrupt_close():
+    """Regression: SSL_write busy-loop when client closes mid-response.
+
+    If the router spins, the final get_ssl() will time out and fail.
+    Covers both SSL_ERROR_SYSCALL(errno=0) and SSL_ERROR_ZERO_RETURN on
+    the write path (issue #28).
+    """
+    client.load('body_generate')
+
+    client.certificate()
+
+    add_tls(application='body_generate')
+
+    # SSL_write fails with errno=0 → nxt_socket_error_level(0) → NXT_LOG_ALERT.
+    # These alerts are expected; suppress them so teardown does not fail.
+    # Match only the syscall/zero-return signatures this test provokes,
+    # so unrelated SSL_write regressions are not silently masked.
+    option.skip_alerts += [
+        r'SSL_write\([^)]+\) failed \(0: Success\)',
+        r'SSL_write\([^)]+\) failed \(\d+: Connection reset by peer\)',
+        r'SSL_write\([^)]+\) failed \(\d+: Broken pipe\)',
+    ]
+
+    # Body must exceed the kernel send buffer so the server is still
+    # writing when the client tears the connection down.  16 MB beats
+    # autotuned SO_SNDBUF on common Linux configurations.
+    body_size = 16 * 1024 * 1024
+
+    headers = {
+        'Host': 'localhost',
+        'Connection': 'close',
+        'X-Length': str(body_size),
+    }
+
+    # Case 1: abrupt TCP close without TLS close_notify.
+    # Triggers SSL_ERROR_SYSCALL(errno=0 or ECONNRESET) on server write.
+    sock = client.get_ssl(headers=headers, no_recv=True)
+    sock.recv(256)
+    sock.close()
+
+    time.sleep(0.2)
+
+    # Case 2: TLS close_notify while server is still writing.
+    # Triggers SSL_ERROR_ZERO_RETURN on server write.
+    sock = client.get_ssl(headers=headers, no_recv=True)
+    sock.recv(256)
+    try:
+        plain = sock.unwrap()
+        plain.close()
+    except OSError:
+        sock.close()
+
+    time.sleep(0.2)
+
+    # Router must still be responsive — not stuck in a busy-loop.
+    assert client.get_ssl(read_timeout=5).get('status') == 200, \
+        'router hung after aborted TLS write (issue #28)'
+
+
 @pytest.mark.skip('not yet')
 def test_tls_keepalive_certificate_remove():
     client.load('empty')

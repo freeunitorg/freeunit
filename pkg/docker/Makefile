@@ -20,7 +20,7 @@ INSTALL_minimal ?=	version
 RUN_minimal ?=		/bin/true
 MODULE_PREBUILD_minimal ?= /bin/true
 
-VERSIONS_go ?=		1.24 1.25 1.26
+VERSIONS_go ?=		1.25 1.26
 VARIANT_go ?=		$(VARIANT)
 $(foreach goversion, $(VERSIONS_go), $(eval CONTAINER_go$(goversion) = golang:$(goversion)-$(VARIANT_go)))
 CONFIGURE_go ?=		go --go-path=$$GOPATH
@@ -118,39 +118,39 @@ build-%: Dockerfile.%
 	docker build --no-cache -t unit:$(VERSION)-$* -f Dockerfile.$* .
 	touch $@
 
-library:
-	@echo "# this file is generated via https://github.com/nginx/unit/blob/$(shell git describe --always --abbrev=0 HEAD)/pkg/docker/Makefile"
-	@echo ""
-	@echo "Maintainers: Unit Docker Maintainers <docker-maint@nginx.com> (@nginx),"
-	@echo "             Konstantin Pavlov (@thresheek),"
-	@echo "             Igor Ippolitov (@oxpa)"
-	@echo "GitRepo: https://github.com/nginx/unit.git"
-	@previous=""; \
-	 for mod in $(MODVERSIONS); do \
-		echo ""; \
-		modname="$$( echo $$mod | tr -d '.0123456789')"; \
-		modmajor="$${mod%%.*}"; \
-		if test "$${mod#*slim}" != "$$mod"; then \
-			modmajor="$${modmajor}-slim"; \
-		fi; \
-		TAGS="$$mod $$modmajor $$modname"; \
-		TAGS="$$(echo $$TAGS | tr " " "\n" | sort -u -r | tr "\n" "," | sed "s/,/, /g")"; \
-		if test "$${previous#*"$$modname"}" != "$$previous"; then \
-			echo "Tags: $(VERSION)-$$mod, $$mod"; \
-		else \
-			if [ "$$mod" = "minimal" ]; then \
-				echo "Tags: $(VERSION)-$$mod, $${TAGS%, }, latest"; \
-			else \
-				echo "Tags: $(VERSION)-$$mod, $${TAGS%, }"; \
-			fi; \
-		fi; \
-		echo "Architectures: amd64, arm64v8"; \
-		echo "GitFetch: refs/heads/packaging"; \
-		echo "GitCommit: $(shell git describe --always --abbrev=0 HEAD)"; \
-		echo "Directory: pkg/docker"; \
-		echo "File: Dockerfile.$$mod"; \
-		previous="$$previous $$modname"; \
-	done
+# TODO(#milestone-1.35.8): uncomment and update GitFetch when publishing to
+# Docker Hub Official Images.  Target date: 2026-08-28 (1.35.8 release).
+#library:
+#	@echo "# this file is generated via https://github.com/freeunitorg/freeunit/blob/$(shell git describe --always --abbrev=0 HEAD)/pkg/docker/Makefile"
+#	@echo ""
+#	@echo "Maintainers: FreeUnit Community <team@freeunit.org> (@freeunitorg)"
+#	@echo "GitRepo: https://github.com/freeunitorg/freeunit.git"
+#	@previous=""; \
+#	 for mod in $(MODVERSIONS); do \
+#		echo ""; \
+#		modname="$$( echo $$mod | tr -d '.0123456789')"; \
+#		modmajor="$${mod%%.*}"; \
+#		if test "$${mod#*slim}" != "$$mod"; then \
+#			modmajor="$${modmajor}-slim"; \
+#		fi; \
+#		TAGS="$$mod $$modmajor $$modname"; \
+#		TAGS="$$(echo $$TAGS | tr " " "\n" | sort -u -r | tr "\n" "," | sed "s/,/, /g")"; \
+#		if test "$${previous#*"$$modname"}" != "$$previous"; then \
+#			echo "Tags: $(VERSION)-$$mod, $$mod"; \
+#		else \
+#			if [ "$$mod" = "minimal" ]; then \
+#				echo "Tags: $(VERSION)-$$mod, $${TAGS%, }, latest"; \
+#			else \
+#				echo "Tags: $(VERSION)-$$mod, $${TAGS%, }"; \
+#			fi; \
+#		fi; \
+#		echo "Architectures: amd64, arm64v8"; \
+#		echo "GitFetch: refs/heads/master"; \
+#		echo "GitCommit: $(shell git describe --always --abbrev=0 HEAD)"; \
+#		echo "Directory: pkg/docker"; \
+#		echo "File: Dockerfile.$$mod"; \
+#		previous="$$previous $$modname"; \
+#	done
 
 diff: $(addprefix diff-, $(MODVERSIONS))
 
@@ -160,8 +160,8 @@ diff-%:
 all: $(addprefix Dockerfile., $(MODVERSIONS))
 
 clean:
-	rm -f Dockerfile.*
-	rm -f build-*
+	rm -f $(filter-out $(wildcard Dockerfile.builder-*), $(wildcard Dockerfile.*))
+	rm -f $(addprefix build-, $(MODVERSIONS))
 	rm -rf build-logs
 
-.PHONY: default build dockerfiles clean library
+.PHONY: default build dockerfiles clean

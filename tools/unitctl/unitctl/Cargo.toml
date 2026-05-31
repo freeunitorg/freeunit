@@ -1,6 +1,6 @@
 [package]
 name = "unitctl"
-description = "CLI interface to the NGINX Unit Control API"
+description = "CLI interface to the FreeUnit Control API"
 version = "1.35.6"
 authors = ["Elijah Zupancic"]
 edition = "2021"
@@ -35,10 +35,10 @@ futures = "0.3"
 tar = "0.4.41"
 
 [package.metadata.deb]
-copyright = "2022, F5"
+copyright = "2022, F5; 2026, FreeUnit Community"
 license-file = ["../LICENSE.txt", "0"]
 extended-description = """\
-A utility for controlling NGINX Unit."""
+A utility for controlling FreeUnit."""
 section = "utility"
 priority = "optional"
 assets = [

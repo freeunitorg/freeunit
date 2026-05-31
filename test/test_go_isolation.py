@@ -318,13 +318,15 @@ def test_go_isolation_rootfs_container_priv(require, temp_dir):
     assert not obj['FileExists'], 'file should not exists'
 
 
-def test_go_isolation_rootfs_automount_tmpfs(is_su, require, temp_dir):
+def _assert_rootfs_tmpfs_toggle_stable(is_su, require, temp_dir, iterations):
     try:
         open("/proc/self/mountinfo", encoding='utf-8')
     except:
         pytest.skip('The system lacks /proc/self/mountinfo file')
 
-    if not is_su:
+    if is_su:
+        require({'features': {'isolation': ['mnt']}})
+    else:
         require(
             {
                 'features': {
@@ -338,31 +340,57 @@ def test_go_isolation_rootfs_automount_tmpfs(is_su, require, temp_dir):
             }
         )
 
-    isolation = {'rootfs': temp_dir}
+    # Always isolate the mounts in a private mount namespace.  As root
+    # without one, automount mounts land in the shared/global namespace
+    # on the same rootfs path, so a reload races the previous worker's
+    # teardown (umount2(MNT_DETACH) of "<rootfs>/proc") against the new
+    # worker's mount of the same path — the detach can hit the freshly
+    # mounted fs, leaving the app with an empty /proc/self/mountinfo.
+    # A per-worker mount namespace makes each generation's mounts private
+    # and torn down with the namespace, eliminating the cross-reload race
+    # (freeunitorg/freeunit#60).
+    isolation = {'rootfs': temp_dir, 'namespaces': {'mount': True}}
 
     if not is_su:
-        isolation['namespaces'] = {
-            'mount': True,
-            'credential': True,
-            'pid': True,
-        }
+        isolation['namespaces'].update(
+            {
+                'credential': True,
+                'pid': True,
+            }
+        )
 
-    isolation['automount'] = {'tmpfs': False}
+    # Regression coverage for flaky startup path:
+    # repeatedly reload the same rootfs while toggling tmpfs automount.
+    # The historical failure happened on the second load after enabling tmpfs.
+    for _ in range(iterations):
+        isolation['automount'] = {'tmpfs': False}
 
-    client.load('ns_inspect', isolation=isolation)
+        client.load('ns_inspect', isolation=isolation)
 
-    obj = client.getjson(url='/?mounts=true')['body']
+        obj = client.getjson(url='/?mounts=true')['body']
 
-    assert (
-        "/ /tmp" not in obj['Mounts'] and "tmpfs" not in obj['Mounts']
-    ), 'app has no /tmp mounted'
+        assert (
+            "/ /tmp" not in obj['Mounts'] and "tmpfs" not in obj['Mounts']
+        ), 'app has no /tmp mounted'
 
-    isolation['automount'] = {'tmpfs': True}
+        isolation['automount'] = {'tmpfs': True}
 
-    client.load('ns_inspect', isolation=isolation)
+        client.load('ns_inspect', isolation=isolation)
 
-    obj = client.getjson(url='/?mounts=true')['body']
+        obj = client.getjson(url='/?mounts=true')['body']
 
-    assert (
-        "/ /tmp" in obj['Mounts'] and "tmpfs" in obj['Mounts']
-    ), 'app has /tmp mounted on /'
+        assert (
+            "/ /tmp" in obj['Mounts'] and "tmpfs" in obj['Mounts']
+        ), 'app has /tmp mounted on /'
+
+
+def test_go_isolation_rootfs_automount_tmpfs(is_su, require, temp_dir):
+    _assert_rootfs_tmpfs_toggle_stable(
+        is_su, require, temp_dir, iterations=20
+    )
+
+
+def test_go_isolation_rootfs_automount_tmpfs_regression(is_su, require, temp_dir):
+    _assert_rootfs_tmpfs_toggle_stable(
+        is_su, require, temp_dir, iterations=100
+    )
