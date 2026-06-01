@@ -7,7 +7,7 @@
 | Milestone | Due | Focus |
 |-----------|-----|-------|
 | **1.35.5** | current branch | Docker builder mode, parallel builds, Go 1.26, Node 24 |
-| **1.35.6** | 2026-06-25 | OTEL 0.24→0.32 (#65), Rust DX (`rust1.x` variant, `libunit-rust`) |
+| **1.35.6** | 2026-06-25 | OTEL 0.24→0.32 (#65), OTLP/gRPC re-intro (config-selected `protocol`), Rust DX (`rust1.x` variant, `libunit-rust`) |
 | **1.35.7** | 2026-07-31 | Short-cycle release |
 | **1.35.8** | 2026-08-28 | Short-cycle release + Docker Hub Official Images (`make library`) |
 
@@ -22,6 +22,7 @@
 | OTEL Phase 2: rewrite `nxt_otel_rs_runtime()` for 0.32 API (after Phase 0) | 1.35.6 |
 | `rust1.x` Docker variant (WASM path, `Dockerfile.rust1.x`) | 1.35.6 |
 | Docker: make debug build optional (`--debug` flag in `build-local.sh`, off by default; saves ~30-40 MB per image) | 1.35.6 |
+| otel local image smoke-test: close doc/tag gaps (hardcoded 1.35.5, php-base snippet without `--otel`) | 1.35.6 |
 
 **July (after 1.35.6):**
 
@@ -31,6 +32,8 @@
 | Evaluate `libunit-rust` prototype → decide: WASM-first or native-first | 1.35.7 |
 | `packages.freeunit.org` — GoAccess / JSON stats for download counter | 1.35.7 |
 | `fake_upstream` prebuilt binary on `packages.freeunit.org` | 1.35.7 |
+| OTEL new config fields (`service_name`, `headers`, `root_certificate`, `resource_attributes`, `max_queue_size`, `export_timeout`) | 1.35.7 |
+| Rust toolchain bump: 1.94.1 → current stable (1.96); re-run otel clang-ast build + `test_otel.py`; decide pin-vs-floating for `rust1.x` image | 1.35.7 |
 
 **August 1 — start 1.35.8 work:**
 
@@ -129,160 +132,190 @@ serves Rust developers. FreeUnit can own this space.
 
 ---
 
-## OpenTelemetry crate upgrade 0.24 → 0.32 (issue #65, milestone 1.35.6)
+## OpenTelemetry — issue #65
 
-| Crate | Current | Latest | Gap |
-|-------|---------|--------|-----|
-| `opentelemetry` | 0.24.0 | 0.32.0 | 8 minor |
-| `opentelemetry-otlp` | 0.17.0 | 0.32.0 | 15 minor |
-| `opentelemetry_sdk` | 0.24.1 | 0.32.0 | 8 minor |
-| `opentelemetry-semantic-conventions` | 0.16.0 | 0.32.0 | 16 minor |
+Crate upgrade 0.24 → 0.32 **completed**. Current crates: all 0.32 (see
+`src/otel/Cargo.toml`). What remains: configurable fields, semconv attributes,
+application-aware spans, test expansion.
 
-Original implementation by Ava Hahn — co-author of FreeUnit's OTel layer.
-New account: [@ava-affine](https://github.com/ava-affine), `ava@sunnypup.io` (left F5, personal domain `sunnypup.io`).
+Original implementation by Ava Hahn ([@ava-affine](https://github.com/ava-affine)).
 The upstream `nginx/nginx-otel` is a separate C++ module, unrelated to our Rust crate.
 
-### Known pitfalls (from code audit)
+### Done in 1.35.6 ✅
 
-- `opentelemetry_otlp::new_pipeline()` removed in 0.27 — `nxt_otel_rs_runtime()` must be
-  rewritten from scratch, not patched
-- `BoxedSpan` is passed as a raw pointer across the C FFI boundary (`r->otel->trace`);
-  verify its memory layout did not change between 0.24 and 0.32 before writing new code
-- `opentelemetry_sdk::trace::Config`, `BatchConfigBuilder`, `runtime::Tokio` — all moved
-  or removed; check new API in `opentelemetry_sdk` 0.32 docs
-- `Protocol::HttpJson` arm in the runtime match is unreachable dead code — fix in same PR
-- Service name `"NGINX Unit"` hardcoded in `lib.rs` lines 154 and 274 — rename to `"FreeUnit"`
-- `eprintln!` used for errors in `nxt_otel_rs_runtime()` instead of the `log_callback` —
-  fix while rewriting the function
+- [x] Bump all `opentelemetry*` crates to 0.32
+- [x] Rewrite `nxt_otel_rs_init()` — old `new_pipeline()` API gone in 0.27
+- [x] Dedicated-thread `BatchSpanProcessor` + blocking reqwest (no tokio runtime)
+- [x] `ParentBased(TraceIdRatioBased(...))` sampler — respects upstream sampling
+- [x] Rename `"NGINX Unit"` → `"FreeUnit"` in service name
+- [x] Replace `eprintln!` → `nxt_otel_log_cb` FFI callback
+- [x] Remove dead `Protocol::HttpJson` arm (never reached)
+- [x] `batch_size` validation bounds (1–65536) in `nxt_conf_validation.c`
+- [x] `sampling_ratio` validation bounds (0–1)
+- [x] `protocol` enum — `"http"` + `"grpc"`, both valid on any `--otel` build;
+      transport chosen at runtime by config (upstream behaviour)
+- [x] OTLP/gRPC export re-introduced — both transports compiled into every
+      `--otel` build (no separate flag); `settings/telemetry/protocol` selects
+      `http` (blocking reqwest) or `grpc` (tonic over a small owned tokio
+      runtime); v1 plaintext h2c only
+- [x] `fake_otlp` — Rust mock OTLP collector (`test/fake_otlp/`) speaking both
+      HTTP and gRPC in one build; HTTP path hardened (`POST /v1/traces` +
+      `application/x-protobuf` + non-empty body, else 400)
+- [x] `test_otel.py` — span export, traceparent, sampling, config validation;
+      export cases parametrized over `["http","grpc"]`
 
-### Phase 0: Documentation audit + new config fields + test infrastructure (prerequisite)
+### Competitive gap analysis (2026-05-31)
 
-**Current config (4 fields):**
-```json
-{ "endpoint": "...", "protocol": "http", "batch_size": 128, "sampling_ratio": 1.0 }
-```
+**Sources:** `nginx/nginx-otel` (C++, gRPC-only, 10 tests), Caddy `tracing` module
+(Go, gRPC, 9 unit tests + metrics). Angie = nginx-otel fork (not on GitHub, no
+unique tests). FreeUnit has the only std-only mock collector + sampling-zero test.
 
-**0a — Audit existing config:**
-- [ ] Audit current OTEL JSON config schema against `docs/unit-openapi.yaml`
-- [ ] Document all supported OTEL config fields and their defaults
-- [ ] Check for gaps between OpenAPI spec and actual C/Rust implementation
+#### Span attributes comparison
 
-**0b — New configuration fields (backward-compatible, current crate versions):**
+| Attribute | nginx-otel | Caddy | FreeUnit (current) |
+|-----------|-----------|-------|-------------------|
+| HTTP method | ✅ `http.method` | ✅ auto (otelhttp) | ❌ `"method"` (not semconv) |
+| URL/path | ✅ `http.target` | ✅ auto | ❌ `"path"` (not semconv) |
+| Status code | ✅ `http.status_code` | ✅ auto | ❌ `"status"` (not semconv) |
+| HTTP scheme | ✅ `http.scheme` | ✅ auto | — |
+| HTTP flavor | ✅ `http.flavor` | ✅ auto | — |
+| User agent | ✅ `http.user_agent` | ✅ auto | — |
+| Request body size | ✅ `http.request_content_length` | — | ❌ `"body size"` |
+| Response body size | ✅ `http.response_content_length` | — | — |
+| Server name | ✅ `net.host.name` | — | — |
+| Client address | ✅ `net.sock.peer.addr` | — | — |
+| Error on 5xx | ✅ `span.setError()` | — | — |
+| **Application name** | — | — | — |
+| **Application type** | — | — | — |
 
-Hardcoded values that must become configurable:
+**FreeUnit differentiator — application-aware spans.** Unlike nginx/Caddy (reverse
+proxies), FreeUnit is an **app server**: it knows which application handled the
+request. When multiple PHP versions or Go+Python apps run side-by-side, OTel spans
+must identify the target:
 
-| Value | Current | Where | Proposed field |
-|-------|---------|-------|----------------|
-| Service name | `"NGINX Unit"` | `lib.rs:98,274` | `service_name` |
-| Max queue size | `4096` | `lib.rs:103` | `max_queue_size` |
-| Export timeout | `10s` | `lib.rs:27` | `export_timeout` |
+| Attribute | Source | Example |
+|-----------|--------|---------|
+| `unit.application.name` | `r->app_name` from router | `"wordpress"`, `"api-v2"` |
+| `unit.application.type` | language module (php/python/go/...) | `"php"`, `"python"`, `"go"` |
+| `unit.application.processes` | app conf | `"5"` |
 
-Missing fields needed for production OTEL:
+These are **FreeUnit-specific** — no competitor has them. Every `add_event` call
+in `nxt_otel.c` should include these alongside the standard semconv attributes.
 
-| Field | Type | Default | Why |
-|-------|------|---------|-----|
-| `service_name` | string | `"FreeUnit"` | Replaces hardcoded `"NGINX Unit"`; every service needs its own name |
-| `headers` | object | `{}` | Auth to collector (`Authorization: Bearer ...`, `X-Api-Key`) |
-| `root_certificate` | string | — | Custom CA for TLS collector connection |
-| `resource_attributes` | object | `{}` | `service.version`, `deployment.environment`, custom labels |
-| `max_queue_size` | integer | `4096` | Replaces hardcoded queue depth |
-| `export_timeout` | integer (sec) | `10` | Replaces hardcoded timeout |
+#### Test coverage comparison
 
-Bug fixes in existing fields:
-- [ ] Fix `protocol`: add `enum: ["http", "grpc"]` to OpenAPI; sync required/optional between C validator and OpenAPI
-- [ ] Fix `batch_size`: add upper bound validation (e.g. `<= 65536`)
-- [ ] Fix span attributes to use OTel semconv: `"method"` → `http.request.method`, `"path"` → `url.path`, `"status"` → `http.response.status_code`
-- [ ] Wrap sampler in `ParentBased(TraceIdRatioBased(...))` — respect upstream sampling decisions
-- [ ] Pass `tracestate` through to Rust OTEL SDK (currently parsed in C, echoed, but dropped)
+| Test case | nginx-otel | Caddy | FreeUnit |
+|-----------|-----------|-------|---------|
+| Span exported | ✅ | ✅ | ✅ |
+| traceparent inject | ✅ (4 modes) | ✅ | ✅ |
+| traceparent inherit | ✅ | ✅ | ✅ |
+| Sampling zero | — | — | ✅ **unique** |
+| $otel_trace_id variable | ✅ | ✅ | — |
+| Custom span attributes | ✅ | ✅ | — |
+| Custom resource attributes | ✅ | ✅ | — |
+| Exporter headers (auth) | ✅ | ✅ | — |
+| TLS export | ✅ | ✅ | — |
+| Trace off | ✅ | — | — |
+| Batching | ✅ | — | — |
+| HTTP/2.0, 3.0 | ✅ | — | — |
 
-New fields implementation:
-- [ ] Add all new fields to `docs/unit-openapi.yaml` (`configSettingsTelemetry` schema)
-- [ ] Add validators in `src/nxt_conf_validation.c`
-- [ ] Parse new fields in `src/nxt_router.c`
-- [ ] Accept and use new parameters in `src/otel/src/lib.rs`
+#### Config features comparison
 
-**Proposed full config after Phase 0:**
-```json
-{
-  "settings": {
-    "telemetry": {
-      "endpoint": "http://collector:4318",
-      "protocol": "http",
-      "service_name": "my-app",
-      "sampling_ratio": 1.0,
-      "batch_size": 128,
-      "max_queue_size": 4096,
-      "export_timeout": 10,
-      "headers": { "Authorization": "Bearer token" },
-      "root_certificate": "/path/to/ca.pem",
-      "resource_attributes": {
-        "service.version": "1.0.0",
-        "deployment.environment": "production"
-      }
-    }
-  }
-}
-```
+| Feature | nginx-otel | Caddy | FreeUnit (current) |
+|---------|-----------|-------|-------------------|
+| Transport | gRPC only | gRPC (autoexport) | HTTP only |
+| Trace context modes | ignore/extract/inject/propagate | auto (autoprop) | inject only |
+| $otel_trace_id etc. | ✅ 4 variables | ✅ 2 placeholders | — |
+| Custom span name | ✅ `otel_span_name` | ✅ `span` directive | — |
+| Custom span attrs | ✅ `otel_span_attr` | ✅ `span_attributes` | — |
+| Resource attributes | ✅ `otel_resource_attr` | ✅ (env + semconv) | `"FreeUnit"` hardcoded |
+| Exporter headers | ✅ `header` directive | ✅ `OTEL_EXPORTER_OTLP_HEADERS` | — |
+| TLS to collector | ✅ `trusted_certificate` | ✅ (env) | — |
+| OTEL_* env vars | — | ✅ | — |
+| Metrics | ❌ | ✅ (separate subsystem) | ❌ |
 
-**0c — Test infrastructure:**
-- [ ] Build `test/fake_otlp/` — std-only Rust mock OTLP collector
+### Remaining work — per milestone
 
-**fake_otlp design** — mirrors `test/fake_upstream/` exactly: single Rust binary,
-no external deps, installed to `/usr/local/bin/fake_otlp` in CI (same step as
-`fake_upstream`).
+**1.35.6 (current, close before release):**
+- [ ] Fix span attributes to use OTel semconv: `"method"` → `http.request.method`,
+      `"path"` → `url.path`, `"status"` → `http.response.status_code`
+- [ ] Add application-aware attributes: `unit.application.name`, `unit.application.type`
+      from `r->app_name` / language module in `nxt_otel.c`
+- [ ] Add missing standard attributes: `http.scheme`, `http.flavor`, `http.user_agent`,
+      `server.address`, `client.address`
+- [ ] Pass `tracestate` through to Rust OTEL SDK (parsed in C at `nxt_otel.c:376`,
+      stored in `r->otel->trace_state`, but never forwarded to Rust)
+- [ ] Add `setError()` equivalent on HTTP 5xx responses
+- [x] Harden `fake_otlp` request validation (PLAN.md WS-B): validate `POST /v1/traces`,
+      `Content-Type: application/x-protobuf`, reject empty bodies
 
-```
-fake_otlp --port 19878 --requests 1
-```
+**1.35.7 (July):**
+- [ ] New config fields: `service_name`, `headers`, `root_certificate`,
+      `resource_attributes`, `max_queue_size`, `export_timeout`
+- [ ] `$otel_trace_id`, `$otel_span_id`, `$otel_parent_id` variables (access log +
+      response headers — nginx-otel has 4 variables, Caddy has 2 placeholders)
+- [ ] Custom span attributes directive (per-route, like nginx-otel `otel_span_attr`)
+- [ ] Evaluate `OTEL_*` env vars as fallback/override for `settings.telemetry`
+      (Caddy pattern — interop with existing OTel deployments)
+- [ ] Expand `test_otel.py`: custom span attrs, resource attrs, auth headers,
+      trace context modes
 
-- Accepts `POST /v1/traces`, validates `Content-Type: application/x-protobuf` + non-empty body
-- Responds `200 OK` with empty body (valid `ExportTraceServiceResponse`)
-- Prints `span_received content_length=NNN` to stdout per request
-- Exits after `--requests N`
-- **HTTP only** — gRPC (HTTP/2) not supported; document as "use a real collector for gRPC"
+**1.35.8 (August):**
+- [x] gRPC transport re-introduction — landed early in 1.35.6, config-selected
+      `protocol` in every `--otel` build (see "Done in 1.35.6")
+- [ ] TLS to collector (`root_certificate` + reqwest rustls/native-tls; gRPC v1
+      is plaintext h2c only)
+- [ ] Metrics exploration (Caddy has full HTTP metrics via OTLP; nginx-otel has none)
 
-- [ ] Write `test/test_otel.py` — gated on `FAKE_OTLP_BIN` + `--otel` build flag:
+### Span leak on aborted requests (pre-existing)
 
-| Test | What it checks |
-|------|----------------|
-| `test_otel_span_exported` | span arrives at fake_otlp after one FreeUnit request |
-| `test_otel_traceparent_propagated` | FreeUnit injects `traceparent` header into forwarded request |
-| `test_otel_sampling_zero` | `sampling_ratio=0.0` → fake_otlp receives nothing (stays alive) |
-| `test_otel_service_name` | exported span contains configured `service_name` |
-| `test_otel_auth_header` | fake_otlp receives configured `headers` (Authorization) |
-| `test_otel_resource_attributes` | span resource contains custom attributes |
+`nxt_otel_rs_get_or_create_trace()` returns `Box::into_raw(...)` into
+`r->otel->trace`. The span is reclaimed only via `NXT_OTEL_COLLECT_STATE`
+(`nxt_otel_span_collect`). `nxt_otel_request_error_path()` correctly sends trace
+through COLLECT for error cases, but if the request is torn down between INIT and
+COLLECT without hitting the error path, `r->otel->trace` leaks.
 
-- [ ] Verify all Phase 0 tests pass against the **current** 0.24 crates (establishes baseline)
+- [ ] Add a teardown path that calls `nxt_otel_rs_send_trace()` when
+      `r->otel->trace` is non-null and COLLECT was not reached.
 
-### Phase 1: Pre-upgrade safety checks
+### gRPC re-introduction notes — DONE (config-selected, no build flag)
 
-- [ ] Verify `BoxedSpan` layout compatibility between 0.24 and 0.32 — `Arc<BoxedSpan>`
-      crosses C FFI as raw pointer; layout change = UB. If trait bounds changed (e.g. added
-      `Send + Sync`), introduce an intermediate opaque wrapper type
-- [ ] Confirm `Protocol::HttpJson` is dead code — remove unreachable match arm
+Shipped in 1.35.6. Both transports compiled into every `--otel` build;
+`settings/telemetry/protocol` picks `http`/`grpc` at runtime — same UX as
+upstream Unit (which the public site already documents). Key decisions:
+- tokio already linked transitively (reqwest → hyper → tokio 1.52.3), so the
+  delta is tonic + `grpc-tonic` + a small runtime this crate owns
+- Precedent: `wasm-wasi-component` runs managed tokio runtime on dedicated thread
+- Considered an opt-in `--otel-grpc` Cargo feature but rejected it: it changed
+  the historical config-only UX and split the build matrix. Always-on keeps one
+  binary, one config contract.
+- v1 is plaintext h2c only — no TLS to collector (tracked under 1.35.8 TLS item)
+- See `test/fake_otlp/PLAN.md` for the gRPC test infrastructure (all boxes ticked)
 
-### Phase 2: Crate upgrade — full rewrite of `nxt_otel_rs_runtime()`
+### Competitive references
 
-- [ ] Bump all `opentelemetry*` crates to 0.32.x in `src/otel/Cargo.toml`
-- [ ] Rewrite `nxt_otel_rs_runtime()` — `new_pipeline()`, `new_exporter()`, `.tracing()`,
-      `.with_trace_config()`, `.with_batch_config()`, `.install_batch()` all gone in 0.27+.
-      Use `TracerProvider::builder()` + new `OtlpTracePipeline` API
-- [ ] Replace `opentelemetry_sdk::trace::Config` → `TracerProviderBuilder`
-- [ ] Replace `BatchConfigBuilder` → new location/API
-- [ ] Replace `opentelemetry_sdk::runtime::Tokio` → new runtime model
-- [ ] Adapt `src/otel/src/lib.rs` to all remaining API changes
-- [ ] Update `src/nxt_otel.c` / `nxt_otel.h` if Rust ABI changed
-- [ ] Run `test/test_otel.py` against upgraded code — must pass same baseline tests
+- **nginx/nginx-otel** (C++, gRPC-only, port 4317, TLS since 0.1.2):
+  https://github.com/nginx/nginx-otel — docs: https://nginx.org/en/docs/ngx_otel_module.html
+- **NGINX OTel admin guide**: https://docs.nginx.com/nginx/admin-guide/dynamic-modules/opentelemetry/
+- **Angie OTel module** (gRPC-only, nginx-otel fork): https://en.angie.software/angie/docs/installation/external-modules/otel/
+- **Caddy `tracing`** (opentelemetry-go, gRPC for traces, OTEL_* env config):
+  https://caddyserver.com/docs/caddyfile/directives/tracing
+- **Caddy #5743** — request to add OTLP/HTTP for traces: https://github.com/caddyserver/caddy/issues/5743
+- **FrankenPHP #1715** — Caddy(gRPC) vs PHP(HTTP) env var conflict: https://github.com/php/frankenphp/issues/1715
+- **OTLP spec** (4317 gRPC / 4318 HTTP; default SHOULD be http/protobuf): https://opentelemetry.io/docs/specs/otlp/
+- **OTLP exporter config** (per-SDK defaults; Go=grpc, Node=http/protobuf): https://opentelemetry.io/docs/specs/otel/protocol/exporter/
+- **opentelemetry-php** (HTTP/protobuf, port 4318): https://github.com/open-telemetry/opentelemetry-php
 
-### Phase 3: Housekeeping fixes (same PR)
-
-- [ ] Rename `"NGINX Unit"` → `"FreeUnit"` in `lib.rs` (lines 154, 274)
-- [ ] Replace `eprintln!` (lib.rs lines 188–189, 204) with `nxt_otel_log_callback`
-
-### Phase 4: Final verification
-
-- [ ] Build with `./configure --otel --openssl && make`; run clang-ast check
-- [ ] Full `test/test_otel.py` pass
+In-repo audit (2026-05-31):
+- tokio in otel staticlib via reqwest-blocking → hyper/tower (`src/otel/Cargo.lock`)
+- managed tokio runtime precedent: `src/wasm-wasi-component/src/lib.rs`
+- gRPC origin: upstream commit `8b697101` "otel: add opentelemetry rust crate code" (http+grpc)
+- Rust toolchain: pinned 1.94.1, Rust 1.96 just released (6-week cadence; memory-safe,
+  no GC, runtime limited to std-lib init — fits embedded staticlib). The floating
+  `rust:1-slim-trixie` base for `rust1.x` variant now tracks 1.95→1.96. Bump
+  pinned toolchain → current stable, re-run otel clang-ast + `test_otel.py` to
+  confirm 0.32 crates compile clean on newer Rust. Decide pin-vs-floating policy
+  for `rust1.x` image (floating drifts; pin for reproducible CI).
 
 ---
 
@@ -497,6 +530,23 @@ goaccess /var/log/angie/packages.freeunit.org.access.log \
 
 ---
 
+### fake_otlp — harden request validation (deferred from #65)
+
+`test/fake_otlp/` is built and used by `test/test_otel.py` in 1.35.6, but its
+`handle()` (`src/main.rs`) currently counts **any** non-empty request as a
+received span. It does not assert the request is a real OTLP export. Kept as-is
+for now (the export tests pass); harden later so the mock can't be satisfied by
+garbage:
+
+- [ ] Validate request line is `POST /v1/traces`
+- [ ] Validate `Content-Type: application/x-protobuf`
+- [ ] Reject empty/zero-length protobuf body (currently only the readiness probe
+      with a fully empty buffer is filtered)
+- [ ] Optionally decode the protobuf far enough to confirm at least one span
+
+The Phase 0 design (above) already specifies this behavior; the shipped binary
+implements only the empty-probe guard. This item tracks closing that gap.
+
 ### Prebuild `fake_upstream` binary via packages.freeunit.org
 
 `test/fake_upstream/` — Rust HTTP mock used by `test_proxy_chunked.py`.
@@ -526,6 +576,43 @@ Fixed: use `clang llvm-dev libclang-dev` (not `clang-21 llvm-21-dev libclang-21-
 - [ ] Prebuild `freeunit-test-full:local` image and publish to GHCR
 - [ ] Or add packages.freeunit.org binary for clang-ast plugin
 - [ ] Cache Docker layers for apt install + clang-ast build
+
+### otel coverage in local image smoke-tests — already exists; close the doc/tag gaps (milestone 1.35.6)
+
+**Scheduled for the 1.35.6 release** — close the doc/tag gaps below as part of
+the same milestone as the OTel 0.24→0.32 upgrade (#65).
+
+otel runtime-build coverage is already in place in two paths; the gaps are
+documentation and a hardcoded version, not missing infrastructure:
+
+- `test/run-local.sh` test image (`FROM python:3.14-slim-trixie` + rustup-pinned
+  toolchain) configures `--otel` and builds `fake_otlp`, so the pytest path
+  exercises the otel staticlib + `test_otel.py`.
+- `pkg/docker/local/Dockerfile.{minimal,php8.5,wasm}` (run via
+  `pkg/docker/build-local.sh -b minimal`) build
+  **`FROM ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1`** — a pre-built
+  builder image with Rust already baked in — and **already configure `--otel`**
+  (`--njs --otel --zlib --zstd --brotli`). **NOTE: `pkg/docker/local/` is
+  experimental — a local build-speedup only.** It depends on the builder image
+  being built first (no apt/rustup at build time), is not wired into CI, and is
+  not the canonical/release image set (that is `pkg/docker/Dockerfile.*`). Treat
+  it as a fast dev loop, not the documented smoke-test of record.
+
+Remaining gaps:
+- [ ] `pkg/docker/local/Dockerfile.*` hardcode `git clone -b 1.35.5` and
+      `LABEL ... version="1.35.5"` — bump on each release (for local branch
+      testing, override the clone ref per the CLAUDE.md note).
+- [ ] Decide the fate of the experimental `pkg/docker/local/` set: promote it to
+      a documented/CI fast-path, or keep it as a personal dev shortcut. Until
+      then, do not point users' "rebuild Docker images locally" flow at it as the
+      official smoke-test.
+- [ ] The CLAUDE.md "rebuild Docker images locally" snippet documents a
+      `php:8.5-cli-trixie` build **without `--otel`** — at minimum mention the
+      `--otel` flag there so the documented smoke-test can cover otel (it needs a
+      Rust toolchain in that image, which the php base lacks).
+- [ ] Once the `rust1.x` variant lands its `rust:1-slim-trixie` base, fold the
+      builder-image and `rust:1-slim-trixie` approaches into one documented story
+      (both already ship Rust; no rustup step needed).
 
 ---
 

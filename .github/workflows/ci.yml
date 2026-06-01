@@ -402,7 +402,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             test/fake_upstream/target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('test/fake_upstream/Cargo.lock') }}
+            test/fake_otlp/target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('test/fake_upstream/Cargo.lock', 'test/fake_otlp/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-cargo-
 
@@ -412,6 +413,13 @@ jobs:
           rustup toolchain install stable --no-self-update --profile minimal
           cargo build --release --manifest-path test/fake_upstream/Cargo.toml
           sudo cp test/fake_upstream/target/release/fake_upstream /usr/local/bin/
+
+      - name: Build fake_otlp
+        if: steps.metadata.outputs.module == 'unit'
+        run: |
+          rustup toolchain install stable --no-self-update --profile minimal
+          cargo build --release --manifest-path test/fake_otlp/Cargo.toml
+          sudo cp test/fake_otlp/target/release/fake_otlp /usr/local/bin/
 
       # /home/runner will be root only after calling sudo above
       # Ensure all users and processes can execute

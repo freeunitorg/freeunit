@@ -1,6 +1,6 @@
 openapi: 3.0.0
 info:
-  title: "FreeUnit 1.35.5 (ex NGINX Unit)"
+  title: "FreeUnit 1.35.6 (ex NGINX Unit)"
   description: "FreeUnit (ex NGINX Unit) is a lightweight and versatile application runtime
     that provides the essential components for your web application as a
     single open-source server: running application code, serving static assets,
@@ -7446,23 +7446,35 @@ components:
     configSettingsTelemetry:
       type: object
       description: "An object whose options represent global telemetry settings in Unit."
-      required: ["endpoint"]
+      required: ["endpoint", "protocol"]
       properties:
         batch_size:
           type: integer
+          minimum: 1
+          maximum: 65536
           description: "Number of spans to cache before sending to telemetry collector."
           default: 128
 
         endpoint:
           type: string
-          description: "A valid endpoint to which Unit can send OpenTelemetry spans."
+          description: "A plain endpoint to which Unit sends OpenTelemetry spans.
+            For `http` use a full `http://host:4318/v1/traces` URL; for `grpc`
+            use `http://host:4317`. TLS is not supported for the collector
+            connection; the collector is expected on localhost or an internal
+            network."
 
         protocol:
           type: string
-          description: "Protocol to use when communicating with the aforementioned endpoint."
+          enum: ["http", "grpc"]
+          description: "Transport for OTLP export, chosen at runtime: `http`
+            (OTLP/HTTP, default port 4318) or `grpc` (OTLP/gRPC, plaintext h2c,
+            default port 4317). Both are available in any `--otel` build. Plain
+            transport only — no TLS to the collector."
 
         sampling_ratio:
           type: number
+          minimum: 0
+          maximum: 1
           default: 1
           description: "A number in between 0 and 1 that describes the percent of requests traced"
 

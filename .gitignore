@@ -18,4 +18,7 @@ __pycache__/
 /FIX.md
 /CLAUDE.original.md
 test/fake_upstream/target/
+test/fake_otlp/target/
 /pkg/eol/build.log
+/clang-ast/
+/AGENTS.md

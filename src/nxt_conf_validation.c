@@ -1574,8 +1574,22 @@ nxt_otel_validate_batch_size(nxt_conf_validation_t *vldt,
     double  batch_size;
 
     batch_size = nxt_conf_get_number(value);
-    if (batch_size <= 0) {
-        return NXT_ERROR;
+
+    /* Negated comparisons so a NaN (which makes every ordered compare false)
+     * is rejected rather than silently accepted. */
+    if (!(batch_size > 0)) {
+        return nxt_conf_vldt_error(vldt, "The \"batch_size\" must be greater "
+                                   "than 0.");
+    }
+
+    /*
+     * Upper bound guards against absurd values. Note the effective ceiling is
+     * MAX_QUEUE_SIZE in src/otel/src/lib.rs (the batch processor caps the
+     * export batch at the queue size); anything larger is silently clamped.
+     */
+    if (!(batch_size <= 65536)) {
+        return nxt_conf_vldt_error(vldt, "The \"batch_size\" must not "
+                                   "exceed 65536.");
     }
 
     return NXT_OK;
@@ -1589,8 +1603,11 @@ nxt_otel_validate_sample_ratio(nxt_conf_validation_t *vldt,
     double  sample_ratio;
 
     sample_ratio = nxt_conf_get_number(value);
-    if (sample_ratio < 0 || sample_ratio > 1) {
-        return NXT_ERROR;
+
+    /* Negated range check so a NaN is rejected, not accepted. */
+    if (!(sample_ratio >= 0 && sample_ratio <= 1)) {
+        return nxt_conf_vldt_error(vldt, "The \"sampling_ratio\" must be "
+                                   "between 0 and 1.");
     }
 
     return NXT_OK;
@@ -1613,7 +1630,8 @@ nxt_otel_validate_protocol(nxt_conf_validation_t *vldt,
         return NXT_OK;
     }
 
-    return NXT_ERROR;
+    return nxt_conf_vldt_error(vldt, "The \"protocol\" must be \"http\" "
+                               "or \"grpc\".");
 }
 
 #endif

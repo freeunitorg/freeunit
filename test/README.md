@@ -137,10 +137,40 @@ sudo pytest-3 --print-log --restart test/
 
 # 7. Save logs after execution
 sudo pytest-3 --print-log --save-log test/
-
-# 8. Run clang-ast AST analysis (C-code quality check)
-./test/run-local.sh --clang-ast
 ```
+
+(clang-ast static analysis is Docker-only — see the section below.)
+
+## Static analysis (clang-ast)
+
+`./test/run-local-full.sh` runs the C build under the
+`freeunitorg/clang-ast` LLVM plugin inside Docker — catches API-misuse /
+lifetime / allocator violations the normal compile misses. Run it before
+every commit and PR.
+
+```bash
+./test/run-local-full.sh        # build + clang-ast check
+./test/run-local-full.sh -n     # dry-run (print, don't execute)
+```
+
+Scope: **C core + otel** (configure is `--otel --openssl --debug`), so
+`nxt_otel.c` and the otel validators in `nxt_conf_validation.c` are
+analyzed. The Rust otel library is built by cargo for linking but is not
+seen by the plugin. Other module C (njs, brotli, zlib, zstd) is NOT
+analyzed.
+
+**Prebuilt image.** The script pulls
+`ghcr.io/freeunitorg/freeunit-clang-ast:trixie` (clang-ast plugin +
+rustc/cargo baked in) to skip the slow one-time apt+rust install. The
+package is **private** — `docker login ghcr.io` first:
+
+```bash
+gh auth token | docker login ghcr.io -u <user> --password-stdin
+```
+
+If the pull is denied (no auth / package private), the script falls back
+to building the image locally. To force a rebuild:
+`docker rmi freeunit-test-full:local`.
 
 ## Test Structure
 
@@ -174,4 +204,5 @@ test/
 
 All tests run on GitHub Actions for every PR and push to `master`. See
 `.github/workflows/ci.yml` for the full matrix (PHP 8.2–8.5, Python 3.11–3.12,
-Go 1.21–1.22, Node.js 20–21, Java 17/18/21, Ruby 3.3/3.4, WASM, WASI).
+Go 1.25–1.26, Node.js 22/24, Java 17/18/20, Ruby 3.3/3.4, WASM,
+WASI component).

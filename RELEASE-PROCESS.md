@@ -98,3 +98,47 @@ Immediately after release we should bump the version of Unit by editing
 the version file and docs/changes.xml to add a new changes header.
 
 See e67d74332 for an example.
+
+
+# Appendix: the `version` file and what consumes it
+
+The repository-root `version` file is the single source of truth for the
+release number:
+
+    # Copyright (C) FreeUnit Community
+
+    NXT_VERSION=1.35.6
+    NXT_VERNUM=13506
+
+- **`NXT_VERSION`** — human-readable dotted string (`MAJOR.MINOR.PATCH`).
+- **`NXT_VERNUM`** — the same number for compile-time comparisons:
+  `MAJOR * 10000 + MINOR * 100 + PATCH` (e.g. `1.35.6` → `13506`). Keep both in
+  lockstep; a mismatch is a silent bug.
+
+## Consumers
+
+- **Build:** `configure` sources `. ./version`; `auto/make` generates
+  `build/include/nxt_version.h` (`#define NXT_VERSION` / `NXT_VERNUM`). Every
+  object lists that header as a prerequisite, so a bump recompiles everything
+  that embeds the version (`Server:` header, `unitd --version`, libunit).
+- **Packaging:** `pkg/Makefile` (`VERSION ?= $(NXT_VERSION)`) names the source
+  tarball; `pkg/{deb,rpm,docker,npm}/Makefile` each `include ../../version` for
+  the package version and the docker image tag.
+- **Language modules:** `auto/modules/{java,nodejs}` embed `$NXT_VERSION` into
+  artifact names (`*.jar`, `unit-http-*.tgz`, `package.json`).
+
+## Files that must move in lockstep with a bump
+
+1. `version` — `NXT_VERSION` **and** `NXT_VERNUM`.
+2. `CHANGES` — new `Changes with FreeUnit X.Y.Z   DD Mon YYYY` block at the top.
+3. `docs/changes.xml` — the two `<changes>` blocks (the `unit` block and the
+   per-module block), with matching `ver=` and `date=`.
+4. `docs/unit-openapi.yaml` line 3 — `title: "FreeUnit X.Y.Z (ex NGINX Unit)"`.
+   This line is **not** auto-generated and is the one most often forgotten.
+
+Quick consistency check:
+
+    grep -nE 'NXT_VERSION=|NXT_VERNUM=' version
+    grep -m1 'Changes with FreeUnit' CHANGES
+    grep -m2 'ver=' docs/changes.xml
+    sed -n '3p' docs/unit-openapi.yaml

@@ -6,6 +6,8 @@
 #include <math.h>
 
 #include <nxt_router.h>
+#include <nxt_router_request.h>
+#include <nxt_application.h>
 #include <nxt_http.h>
 #include <nxt_otel.h>
 #include <nxt_mp.h>
@@ -14,14 +16,30 @@
 #include <nxt_conf.h>
 #include <nxt_types.h>
 #include <nxt_string.h>
+#include <nxt_sockaddr.h>
 #include <nxt_clang.h>
 
 
 #define NXT_OTEL_TRACEPARENT_LEN    55
-#define NXT_OTEL_BODY_SIZE_TAG      "body size"
-#define NXT_OTEL_METHOD_TAG         "method"
-#define NXT_OTEL_PATH_TAG           "path"
-#define NXT_OTEL_STATUS_CODE_TAG    "status"
+
+/*
+ * Span attribute keys. These follow the stable OpenTelemetry HTTP semantic
+ * conventions (https://opentelemetry.io/docs/specs/semconv/http/http-spans/);
+ * "http.flavor"/"http.user_agent" from older drafts are superseded by
+ * "network.protocol.version"/"user_agent.original". "unit.application.*" are
+ * FreeUnit-specific: a reverse proxy can't know the served app, but Unit can.
+ */
+#define NXT_OTEL_BODY_SIZE_TAG      "http.request.body.size"
+#define NXT_OTEL_METHOD_TAG         "http.request.method"
+#define NXT_OTEL_PATH_TAG           "url.path"
+#define NXT_OTEL_SCHEME_TAG         "url.scheme"
+#define NXT_OTEL_FLAVOR_TAG         "network.protocol.version"
+#define NXT_OTEL_USER_AGENT_TAG     "user_agent.original"
+#define NXT_OTEL_SERVER_ADDR_TAG    "server.address"
+#define NXT_OTEL_CLIENT_ADDR_TAG    "client.address"
+#define NXT_OTEL_APP_NAME_TAG       "unit.application.name"
+#define NXT_OTEL_APP_TYPE_TAG       "unit.application.type"
+#define NXT_OTEL_STATUS_CODE_TAG    "http.response.status_code"
 
 
 static void
@@ -31,6 +49,56 @@ nxt_otel_state_transition(nxt_otel_state_t *state, nxt_otel_status_t status)
         || state->status != NXT_OTEL_ERROR_STATE)
     {
         state->status = status;
+    }
+}
+
+
+/*
+ * Set a semantic-convention span attribute from a string-literal key and an
+ * nxt_str_t value. Empty or absent values are skipped so we don't emit blank
+ * attributes for headers the request didn't carry.
+ */
+static void
+nxt_otel_add_attr(nxt_http_request_t *r, const char *key, nxt_str_t *val)
+{
+    nxt_str_t  k;
+
+    if (val == NULL || val->start == NULL || val->length == 0) {
+        return;
+    }
+
+    if (r->otel == NULL || r->otel->trace == NULL) {
+        return;
+    }
+
+    k.start = (u_char *) key;
+    k.length = nxt_strlen(key);
+
+    nxt_otel_rs_add_attr(r->otel->trace, &k, val);
+}
+
+
+static const char *
+nxt_otel_app_type_name(nxt_app_type_t type)
+{
+    switch (type) {
+    case NXT_APP_PYTHON:
+        return "python";
+    case NXT_APP_PHP:
+        return "php";
+    case NXT_APP_PERL:
+        return "perl";
+    case NXT_APP_RUBY:
+        return "ruby";
+    case NXT_APP_JAVA:
+        return "java";
+    case NXT_APP_WASM:
+    case NXT_APP_WASM_WC:
+        return "wasm";
+    case NXT_APP_EXTERNAL:
+        return "external";
+    default:
+        return "unknown";
     }
 }
 
@@ -110,37 +178,54 @@ nxt_otel_propagate_header(nxt_task_t *task, nxt_http_request_t *r)
 static void
 nxt_otel_span_add_headers(nxt_task_t *task, nxt_http_request_t *r)
 {
-    nxt_str_t         method_name, path_name;
-    nxt_http_field_t  *cur;
+    nxt_str_t  val;
 
-    nxt_log(task, NXT_LOG_DEBUG, "adding headers to trace");
+    nxt_log(task, NXT_LOG_DEBUG, "adding attributes to trace");
 
     if (r->otel == NULL || r->otel->trace == NULL) {
-        nxt_log(task, NXT_LOG_ERR, "no trace to add events to!");
+        nxt_log(task, NXT_LOG_ERR, "no trace to add attributes to!");
         nxt_otel_state_transition(r->otel, NXT_OTEL_ERROR_STATE);
         return;
     }
 
-    nxt_list_each(cur, r->fields) {
-        nxt_str_t  name, val;
+    /*
+     * Record only well-defined semconv attributes. We deliberately do NOT
+     * iterate every request header: that would leak sensitive values
+     * (Authorization, Cookie, ...) into the telemetry backend.
+     */
+    nxt_otel_add_attr(r, NXT_OTEL_METHOD_TAG, r->method);
+    nxt_otel_add_attr(r, NXT_OTEL_PATH_TAG, r->path);
 
-        name = (nxt_str_t) {
-            .start  = cur->name,
-            .length = cur->name_length,
-        };
+    nxt_str_set(&val, "http");
+    if (r->tls) {
+        nxt_str_set(&val, "https");
+    }
+    nxt_otel_add_attr(r, NXT_OTEL_SCHEME_TAG, &val);
 
-        val = (nxt_str_t) {
-            .start  = cur->value,
-            .length = cur->value_length,
-        };
+    /* "HTTP/1.1" -> "1.1" for network.protocol.version */
+    val = r->version;
+    if (val.length > nxt_length("HTTP/")
+        && memcmp(val.start, "HTTP/", nxt_length("HTTP/")) == 0)
+    {
+        val.start += nxt_length("HTTP/");
+        val.length -= nxt_length("HTTP/");
+    }
+    nxt_otel_add_attr(r, NXT_OTEL_FLAVOR_TAG, &val);
 
-        nxt_otel_rs_add_event_to_trace(r->otel->trace, &name, &val);
-    } nxt_list_loop;
+    if (r->user_agent != NULL) {
+        val.start = r->user_agent->value;
+        val.length = r->user_agent->value_length;
+        nxt_otel_add_attr(r, NXT_OTEL_USER_AGENT_TAG, &val);
+    }
 
-    nxt_str_set(&method_name, NXT_OTEL_METHOD_TAG);
-    nxt_otel_rs_add_event_to_trace(r->otel->trace, &method_name, r->method);
-    nxt_str_set(&path_name, NXT_OTEL_PATH_TAG);
-    nxt_otel_rs_add_event_to_trace(r->otel->trace, &path_name, r->path);
+    nxt_otel_add_attr(r, NXT_OTEL_SERVER_ADDR_TAG, &r->host);
+
+    if (r->remote != NULL) {
+        val.start = nxt_sockaddr_address(r->remote);
+        val.length = r->remote->address_length;
+        nxt_otel_add_attr(r, NXT_OTEL_CLIENT_ADDR_TAG, &val);
+    }
+
     nxt_otel_propagate_header(task, r);
 
     nxt_otel_state_transition(r->otel, NXT_OTEL_BODY_STATE);
@@ -154,7 +239,7 @@ nxt_otel_span_add_body(nxt_http_request_t *r)
     size_t     buf_size;
     u_char     *body_buf, *body_size_buf;
     nxt_int_t  cur;
-    nxt_str_t  body_key, body_val;
+    nxt_str_t  body_val;
 
     if (r->body != NULL) {
         body_size = nxt_buf_used_size(r->body);
@@ -182,17 +267,12 @@ nxt_otel_span_add_body(nxt_http_request_t *r)
     body_size_buf = body_buf + cur;
     nxt_cpystr(body_buf + cur, (const u_char *) NXT_OTEL_BODY_SIZE_TAG);
 
-    body_key = (nxt_str_t) {
-        .start  = body_size_buf,
-        .length = nxt_strlen(body_size_buf),
-    };
-
     body_val = (nxt_str_t) {
         .start  = body_buf,
         .length = nxt_strlen(body_buf),
     };
 
-    nxt_otel_rs_add_event_to_trace(r->otel->trace, &body_key, &body_val);
+    nxt_otel_add_attr(r, (const char *) body_size_buf, &body_val);
     nxt_otel_state_transition(r->otel, NXT_OTEL_COLLECT_STATE);
 }
 
@@ -200,25 +280,49 @@ nxt_otel_span_add_body(nxt_http_request_t *r)
 static void
 nxt_otel_span_add_status(nxt_task_t *task, nxt_http_request_t *r)
 {
-    u_char     status_buf[7];
-    nxt_str_t  status_key, status_val;
+    int                     n;
+    u_char                  status_buf[8];
+    const char              *type_name;
+    nxt_str_t               val;
+    nxt_app_t               *app;
+    nxt_request_rpc_data_t  *rpc;
+
+    if (r->otel == NULL || r->otel->trace == NULL) {
+        return;
+    }
+
+    /*
+     * Application identity is resolved during routing, so it is only known by
+     * the time the span is collected (after the response). A reverse proxy
+     * can't emit this; Unit can.
+     */
+    rpc = r->req_rpc_data;
+    if (rpc != NULL && rpc->app != NULL) {
+        app = rpc->app;
+        nxt_otel_add_attr(r, NXT_OTEL_APP_NAME_TAG, &app->name);
+
+        type_name = nxt_otel_app_type_name(app->type);
+        val.start = (u_char *) type_name;
+        val.length = nxt_strlen(type_name);
+        nxt_otel_add_attr(r, NXT_OTEL_APP_TYPE_TAG, &val);
+    }
 
     // dont bother logging an unset status
     if (r->status == 0) {
         return;
     }
 
-    sprintf((char *) status_buf, "%d", r->status);
+    n = sprintf((char *) status_buf, "%d", (int) r->status);
+    if (n > 0) {
+        val.start = status_buf;
+        val.length = (size_t) n;
+        nxt_otel_add_attr(r, NXT_OTEL_STATUS_CODE_TAG, &val);
+    }
 
-    // set up event
-    nxt_str_set(&status_key, NXT_OTEL_STATUS_CODE_TAG);
-
-    status_val = (nxt_str_t) {
-        .start  = status_buf,
-        .length = 3,
-    };
-
-    nxt_otel_rs_add_event_to_trace(r->otel->trace, &status_key, &status_val);
+    /* Flag server errors so the span shows Status::Error in the collector. */
+    if (r->status >= NXT_HTTP_INTERNAL_SERVER_ERROR) {
+        nxt_otel_rs_set_error(r->otel->trace);
+    }
 }
 
 
@@ -258,7 +362,10 @@ static void
 nxt_otel_trace_and_span_init(nxt_task_t *task, nxt_http_request_t *r)
 {
     r->otel->trace =
-        nxt_otel_rs_get_or_create_trace(r->otel->trace_id);
+        nxt_otel_rs_get_or_create_trace(r->otel->trace_id,
+                                        r->otel->parent_id,
+                                        r->otel->trace_flags,
+                                        &r->otel->trace_state);
     if (r->otel->trace == NULL) {
         nxt_log(task, NXT_LOG_ERR, "error generating otel span");
         nxt_otel_state_transition(r->otel, NXT_OTEL_ERROR_STATE);
@@ -388,8 +495,10 @@ nxt_otel_parse_tracestate(void *ctx, nxt_http_field_t *field, uintptr_t data)
     r->otel->trace_state = s;
 
     /*
-     * maybe someday this should get sent down into the otel lib
-     * when we can figure out what to do with it at least
+     * trace_state is forwarded into the Rust SDK at span creation
+     * (nxt_otel_trace_and_span_init -> nxt_otel_rs_get_or_create_trace), so
+     * vendor context is preserved on the continued trace. We also echo it back
+     * to the peer in the response below.
      */
 
     f = nxt_list_add(r->resp.fields);
