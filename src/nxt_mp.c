@@ -305,6 +305,17 @@ nxt_mp_release(nxt_mp_t *mp)
 }
 
 
+#if (NXT_TESTS)
+
+uint32_t
+nxt_mp_test_retain_count(nxt_mp_t *mp)
+{
+    return mp->retain;
+}
+
+#endif
+
+
 void
 nxt_mp_destroy(nxt_mp_t *mp)
 {
