@@ -137,6 +137,9 @@ sudo pytest-3 --print-log --restart test/
 
 # 7. Save logs after execution
 sudo pytest-3 --print-log --save-log test/
+
+# 8. Run clang-ast AST analysis (C-code quality check)
+./test/run-local.sh --clang-ast
 ```
 
 (clang-ast static analysis is Docker-only — see the section below.)

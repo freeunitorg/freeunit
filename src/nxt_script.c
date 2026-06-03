@@ -606,6 +606,7 @@ error:
          * log path.
          */
         nxt_fd_close(file.fd);
+        file.fd = -1;
     }
 }
 

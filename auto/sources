@@ -172,6 +172,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_http_parse_test.c \
     src/test/nxt_strverscmp_test.c \
     src/test/nxt_base64_test.c \
+    src/test/nxt_port_fail_test.c \
 "
 
 

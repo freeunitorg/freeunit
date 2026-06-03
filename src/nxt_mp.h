@@ -52,6 +52,16 @@ NXT_EXPORT void nxt_mp_retain(nxt_mp_t *mp);
  */
 NXT_EXPORT void nxt_mp_release(nxt_mp_t *mp);
 
+#if (NXT_TESTS)
+/*
+ * Returns the current retention count.  Used by
+ * src/test/nxt_port_fail_test.c to verify the "retain after
+ * successful send" pattern leaves the pool's retain at its
+ * baseline (1) when the send fails.
+ */
+NXT_EXPORT uint32_t nxt_mp_test_retain_count(nxt_mp_t *mp);
+#endif
+
 /* nxt_mp_test_sizes() tests validity of memory pool parameters. */
 NXT_EXPORT nxt_bool_t nxt_mp_test_sizes(size_t cluster_size,
     size_t page_alignment, size_t page_size, size_t min_chunk_size);
