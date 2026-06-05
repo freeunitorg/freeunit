@@ -349,6 +349,11 @@ nxt_int_t nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port,
     nxt_uint_t type, nxt_fd_t fd, nxt_fd_t fd2, uint32_t stream,
     nxt_port_id_t reply_port, nxt_buf_t *b);
 
+#if (NXT_TESTS)
+void nxt_port_test_msg_alloc_failures(nxt_uint_t failures);
+void nxt_port_test_run_error_handler(nxt_task_t *task, nxt_port_t *port);
+#endif
+
 nxt_inline nxt_int_t
 nxt_port_socket_write(nxt_task_t *task, nxt_port_t *port,
     nxt_uint_t type, nxt_fd_t fd, uint32_t stream, nxt_port_id_t reply_port,
