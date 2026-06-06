@@ -1,11 +1,12 @@
 use crate::unitd_cmd::UnitdCmd;
-use crate::unitd_docker::{pid_is_dockerized, UnitdContainer};
+#[cfg(target_os = "linux")]
+use crate::unitd_docker::pid_is_dockerized;
+use crate::unitd_docker::UnitdContainer;
 use crate::unitd_instance::UNITD_BINARY_NAMES;
 use crate::unitd_process_user::UnitdProcessUser;
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::path::Path;
 use sysinfo::{Pid, Process, ProcessRefreshKind, System, UpdateKind, Users};
 
@@ -50,15 +51,12 @@ impl UnitdProcess {
         let refresh_kind = sysinfo::RefreshKind::nothing().with_processes(process_refresh_kind);
         let sys = System::new_with_specifics(refresh_kind);
 
-        // Precompute binary names as OsString once to avoid a per-process allocation in the hot filter.
-        let binary_names: Vec<OsString> = UNITD_BINARY_NAMES.iter().map(OsString::from).collect();
-
         let unitd_processes: HashMap<&Pid, &Process> = sys
             .processes()
             .iter()
             .filter(|p| {
                 let process_name = p.1.name();
-                binary_names.iter().any(|n| n.as_os_str() == process_name)
+                UNITD_BINARY_NAMES.iter().any(|&name| process_name == name)
             })
             .collect::<HashMap<&Pid, &Process>>();
         let users = Users::new_with_refreshed_list();
