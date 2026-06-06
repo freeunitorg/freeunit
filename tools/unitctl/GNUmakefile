@@ -125,10 +125,9 @@ openapi-generate: .openapi_cache
 			--template-dir "$(CURDIR)/unit-openapi/openapi-templates" \
 			--output "$(CURDIR)/unit-openapi" \
 			--generator-name rust
-		$(SED) -i.bak '1i\
-#![allow(clippy::all)]
-' "$(CURDIR)/unit-openapi/src/lib.rs"
-		rm -f "$(CURDIR)/unit-openapi/src/lib.rs.bak"
+		tmp="$$(mktemp)"
+		{ printf '%s\n' '#![allow(clippy::all)]'; cat "$(CURDIR)/unit-openapi/src/lib.rs"; } > "$$tmp"
+		mv "$$tmp" "$(CURDIR)/unit-openapi/src/lib.rs"
 		# Replace any remaining hyper 0.14 client paths produced by built-in templates
 		# with the hyper 1.x equivalents from hyper-util.
 		find "$(CURDIR)/unit-openapi/src" -name "*.rs" -exec \
