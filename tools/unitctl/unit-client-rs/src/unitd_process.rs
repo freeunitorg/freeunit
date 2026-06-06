@@ -1,5 +1,5 @@
 use crate::unitd_cmd::UnitdCmd;
-use crate::unitd_docker::UnitdContainer;
+use crate::unitd_docker::{pid_is_dockerized, UnitdContainer};
 use crate::unitd_instance::UNITD_BINARY_NAMES;
 use crate::unitd_process_user::UnitdProcessUser;
 use serde::ser::SerializeMap;
