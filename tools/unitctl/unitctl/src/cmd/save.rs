@@ -9,7 +9,7 @@ use tar::{Builder, Header};
 use unit_client_rs::unit_client::UnitClient;
 
 pub async fn cmd(cli: &UnitCtl, filename: &String) -> Result<(), UnitctlError> {
-    if cli.control_socket_addresses.is_some() && cli.control_socket_addresses.clone().unwrap().len() > 1 {
+    if cli.control_socket_addresses.as_ref().map_or(false, |addrs| addrs.len() > 1) {
         return Err(UnitctlError::ControlSocketError {
             kind: ControlSocketErrorKind::General,
             message: "too many control sockets. specify at most one.".to_string(),
