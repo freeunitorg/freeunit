@@ -37,13 +37,18 @@ setup_sury_if_needed() {
         *) echo "sury: invalid SURY='$mode' (auto|on|off)" >&2; return 1 ;;
     esac
 
-    apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
+    apt-get install -y --no-install-recommends ca-certificates curl
     install -d /usr/share/keyrings
     curl -fsSL https://packages.sury.org/php/apt.gpg -o /usr/share/keyrings/sury-php.gpg
+    # Codename from /etc/os-release (always present on Debian) instead of pulling
+    # in lsb-release; apt reads the binary keyring directly, so no gnupg either.
+    local codename
+    # shellcheck source=/dev/null  # /etc/os-release is a runtime container file
+    codename=$(. /etc/os-release && printf '%s' "$VERSION_CODENAME")
     cat > /etc/apt/sources.list.d/sury-php.sources <<SURYSRC
 Types: deb
 URIs: https://packages.sury.org/php/
-Suites: $(lsb_release -sc)
+Suites: ${codename}
 Components: main
 Signed-By: /usr/share/keyrings/sury-php.gpg
 SURYSRC

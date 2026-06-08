@@ -73,9 +73,13 @@ jobs:
           # Enable deb.sury.org only when a requested libphpX.Y-embed runtime is
           # missing from base apt (honors $SURY: auto|on|off). See sury-setup.sh.
           setup_sury_if_needed "8.3 8.4 8.5"
+          # lsb-release is a real build dep (pkg/deb/Makefile + debian/rules.in
+          # derive CODENAME via `lsb_release -cs`); keep it independent of sury.
+          # curl is the pkg/contrib downloader (njs/wasmtime/wasi-sysroot) and is
+          # likewise needed even when sury is disabled.
           apt-get install -y --no-install-recommends \
-            build-essential debhelper devscripts fakeroot lintian \
-            libxml2-utils xsltproc pkg-config git \
+            build-essential debhelper devscripts fakeroot lintian lsb-release \
+            libxml2-utils xsltproc pkg-config git curl \
             libssl-dev libpcre2-dev clang llvm \
             cargo rustc \
             php8.3-dev libphp8.3-embed \

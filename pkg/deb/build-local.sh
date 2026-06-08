@@ -74,18 +74,13 @@ SURY_MODE="auto"
 # Read the version the Makefile will stamp into the .deb names.
 VERSION="$(grep -m1 '^NXT_VERSION=' "${REPO_ROOT}/version" | cut -d= -f2)"
 
-# Smoke matrix — matches the build-deb.yml smoke-test matrix exactly.
-# Fields: module|kind|type|port|expect
-SMOKE_MATRIX=(
-    "unit-php8.3|php|php|8083|OK-PHP-8.3"
-    "unit-php8.4|php|php|8084|OK-PHP-8.4"
-    "unit-php8.5|php|php|8085|OK-PHP-8.5"
-    "unit-python3.13|py|python 3.13|8013|OK-PY-3.13"
-)
-
-# PHP versions packaged here — drives the sury auto-detect (each needs a
-# matching libphpX.Y-embed runtime). Matches the php targets above.
-PHP_VERSIONS="8.3 8.4 8.5"
+# PHP versions packaged here. php8.4 ships in the Debian trixie base archive;
+# php8.3 and php8.5 come from deb.sury.org, so with sury disabled (-S off) only
+# the native line is buildable and the active set narrows to it. PHP_VERSIONS is
+# finalised from this pair once -S is known (see below) and is the single source
+# the build targets, container dev packages, and smoke matrix all derive from.
+PHP_VERSIONS_ALL="8.3 8.4 8.5"
+PHP_VERSIONS_NATIVE="8.4"
 
 # PHP version the combined smoke (-c) runs: one instance hosts a single PHP embed
 # runtime. Default to the Debian trixie native line (php8.4 — present in base
@@ -130,6 +125,24 @@ case "$SURY_MODE" in
     *) err "invalid -S '$SURY_MODE' (expected auto|on|off)"; exit 1 ;;
 esac
 
+# With sury disabled only the Debian trixie-native PHP line is buildable, so the
+# active set (and everything derived from it — build targets, container dev
+# packages, smoke matrix) narrows to it; otherwise the full set is in play.
+if [ "$SURY_MODE" = "off" ]; then
+    PHP_VERSIONS="$PHP_VERSIONS_NATIVE"
+else
+    PHP_VERSIONS="$PHP_VERSIONS_ALL"
+fi
+
+# Smoke matrix — one row per active PHP version plus python, mirroring the
+# build-deb.yml smoke-test matrix. Fields: module|kind|type|port|expect.
+# Port is 80 + the version digits (php8.3 -> 8083, php8.4 -> 8084, ...).
+SMOKE_MATRIX=()
+for v in $PHP_VERSIONS; do
+    SMOKE_MATRIX+=("unit-php${v}|php|php|80${v//./}|OK-PHP-${v}")
+done
+SMOKE_MATRIX+=("unit-python3.13|py|python 3.13|8013|OK-PY-3.13")
+
 # ---------------------------------------------------------------------------
 # Pre-flight checks
 # ---------------------------------------------------------------------------
@@ -166,11 +179,16 @@ if ! $DO_BUILD && ! $DO_SMOKE; then
     err "-B and -s together do nothing"; exit 1
 fi
 
-# Build target list for the Makefile.
+# Build target list for the Makefile, derived from the active PHP set so a
+# narrowed PHP_VERSIONS (e.g. -S off) never asks make for an unavailable module.
+php_targets=""
+for v in $PHP_VERSIONS; do
+    php_targets+=" unit-php${v//./}"
+done
 if $MODULES_ONLY; then
-    BUILD_TARGETS="unit-php83 unit-php84 unit-php85 unit-python313"
+    BUILD_TARGETS="${php_targets# } unit-python313"
 else
-    BUILD_TARGETS="unit unit-php83 unit-php84 unit-php85 unit-python313"
+    BUILD_TARGETS="unit${php_targets} unit-python313"
 fi
 
 info "============================================================"
@@ -221,18 +239,29 @@ if [ "$CLEAN" = "true" ]; then
 fi
 
 apt-get update
-# ca-certificates is needed for the otel Rust crate fetch over https.
-apt-get install -y --no-install-recommends ca-certificates
+# ca-certificates + curl: curl is the pkg/contrib downloader for the njs,
+# wasmtime and wasi-sysroot tarballs (it is tried before wget, then fetch); both
+# are also needed for the otel Rust crate fetch over https. curl must not depend
+# on sury being enabled (sury-off skips its setup), so install it here.
+apt-get install -y --no-install-recommends ca-certificates curl
 # Enable sury only when the requested PHP runtimes are missing from base apt.
-setup_sury_if_needed "${NEED_PHP:-8.3 8.4 8.5}"
+# NEED_PHP is always passed by the host; the fallback matches the PHP_PKGS one.
+setup_sury_if_needed "${NEED_PHP:-8.4}"
+# PHP dev/runtime packages for exactly the requested versions, so a narrowed set
+# (sury off) never asks apt for an unavailable php line.
+PHP_PKGS=""
+for v in ${NEED_PHP:-8.4}; do
+    PHP_PKGS="$PHP_PKGS php${v}-dev libphp${v}-embed"
+done
 # Core needs the Rust toolchain (--otel); modules reuse the common core config
 # without it, but installing cargo/rustc unconditionally keeps this one path.
+# lsb-release is a real build dep (pkg/deb/Makefile + debian/rules.in derive the
+# CODENAME via `lsb_release -cs`); it must not depend on sury being enabled.
 apt-get install -y --no-install-recommends \
-    build-essential debhelper devscripts fakeroot lintian \
+    build-essential debhelper devscripts fakeroot lintian lsb-release \
     libxml2-utils xsltproc pkg-config git \
     libssl-dev libpcre2-dev clang llvm cargo rustc \
-    php8.3-dev libphp8.3-embed php8.4-dev libphp8.4-embed \
-    php8.5-dev libphp8.5-embed \
+    $PHP_PKGS \
     python3.13-dev
 
 echo 'DEBUILD_LINTIAN=no' > "$HOME/.devscripts"
@@ -426,7 +455,7 @@ if $DO_SMOKE; then
             [[ "$v" == "$COMBINED_PHP" ]] || SKIPPED_PHP+="${SKIPPED_PHP:+ }$v"
         done
         info "Combined smoke: core + php${COMBINED_PHP} + python3.13 in one container ..."
-        if [[ "$SKIPPED_PHP" != "$COMBINED_PHP" ]]; then
+        if [[ -n "$SKIPPED_PHP" ]]; then
             info "Combined smoke SKIPS php: ${SKIPPED_PHP} (isolated mode covers every version)."
         fi
         if $DRY_RUN; then
@@ -446,6 +475,12 @@ if $DO_SMOKE; then
         FAILED=()
         for row in "${SMOKE_MATRIX[@]}"; do
             IFS='|' read -r module kind type port expect <<< "$row"
+            # Second guard (the matrix already tracks the active PHP set): skip a
+            # module whose .deb is absent, e.g. a partial -m/-s run.
+            if ! $DRY_RUN && ! ls "${DEBS_DIR}/${module}_${VERSION}"*.deb >/dev/null 2>&1; then
+                warn "Skipping ${module}: no ${module}_${VERSION}*.deb in ${DEBS_DIR}"
+                continue
+            fi
             info "Smoke-testing ${module} (isolated) ..."
             if $DRY_RUN; then
                 info "DRY-RUN: docker run --rm -v ${DEBS_DIR}:/debs:ro \\"
