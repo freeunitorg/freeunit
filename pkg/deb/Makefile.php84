@@ -1,0 +1,47 @@
+MODULES+=		php84
+MODULE_SUFFIX_php84=	php8.4
+
+MODULE_SUMMARY_php84=	PHP 8.4 module for FreeUnit
+
+MODULE_VERSION_php84=	$(VERSION)
+MODULE_RELEASE_php84=	1
+
+MODULE_CONFARGS_php84=	php --module=php8.4 --config=php-config8.4
+MODULE_MAKEARGS_php84=	php8.4
+MODULE_INSTARGS_php84=	php8.4-install
+
+MODULE_SOURCES_php84=	unit.example-php-app \
+			unit.example-php8.4-config
+
+BUILD_DEPENDS_php84=	php8.4-dev libphp8.4-embed
+BUILD_DEPENDS+=		$(BUILD_DEPENDS_php84)
+
+MODULE_BUILD_DEPENDS_php84=,php8.4-dev,libphp8.4-embed
+MODULE_DEPENDS_php84=,libphp8.4-embed
+
+define MODULE_PREINSTALL_php84
+	mkdir -p debian/unit-php8.4/usr/share/doc/unit-php8.4/examples/phpinfo-app
+	install -m 644 -p debian/unit.example-php-app debian/unit-php8.4/usr/share/doc/unit-php8.4/examples/phpinfo-app/index.php
+	install -m 644 -p debian/unit.example-php8.4-config debian/unit-php8.4/usr/share/doc/unit-php8.4/examples/unit.config
+endef
+export MODULE_PREINSTALL_php84
+
+define MODULE_POST_php84
+cat <<BANNER
+----------------------------------------------------------------------
+
+The $(MODULE_SUMMARY_php84) has been installed.
+
+To check out the sample app, run these commands:
+
+ sudo service unit restart
+ cd /usr/share/doc/unit-$(MODULE_SUFFIX_php84)/examples
+ sudo curl -X PUT --data-binary @unit.config --unix-socket /var/run/control.unit.sock http://localhost/config
+ curl http://localhost:8300/
+
+Online documentation is available at https://docs.freeunit.org
+
+----------------------------------------------------------------------
+BANNER
+endef
+export MODULE_POST_php84

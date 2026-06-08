@@ -14,7 +14,7 @@ SRCDIR=	unit-$(VERSION)
 
 CODENAME = $(shell lsb_release -cs)
 
-BUILD_DEPENDS_unit = build-essential debhelper devscripts fakeroot libxml2-utils lintian lsb-release xsltproc libssl-dev clang llvm
+BUILD_DEPENDS_unit = build-essential debhelper devscripts fakeroot libxml2-utils lintian lsb-release xsltproc libssl-dev libpcre2-dev pkg-config clang llvm cargo rustc
 BUILD_DEPENDS = $(BUILD_DEPENDS_unit)
 
 MODULES=
@@ -81,6 +81,9 @@ endif
 # Debian 13
 ifeq ($(CODENAME),trixie)
 include Makefile.php
+include Makefile.php83
+include Makefile.php84
+include Makefile.php85
 include Makefile.python312
 include Makefile.python313
 include Makefile.go

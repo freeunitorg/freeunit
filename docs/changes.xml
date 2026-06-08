@@ -77,7 +77,7 @@ deduplication, and dry-run preview support.
 </changes>
 
 
-<changes apply="unit-php unit-python unit-python3.14
+<changes apply="unit-php unit-php8.3 unit-php8.4 unit-php8.5 unit-python unit-python3.13 unit-python3.14
                 unit-go
                 unit-perl
                 unit-ruby
@@ -90,6 +90,12 @@ deduplication, and dry-run preview support.
 <change>
 <para>
 FreeUnit updated to 1.35.5.
+</para>
+</change>
+
+<change type="feature">
+<para>
+Debian trixie packages are now built for php8.3, php8.4, php8.5 and python3.13.
 </para>
 </change>
 

@@ -1,0 +1,16 @@
+{
+	"applications": {
+		"example_php": {
+			"type": "php 8.3",
+			"processes": 2,
+			"root": "/usr/share/doc/unit-php8.3/examples/phpinfo-app",
+			"index": "index.php"
+		}
+	},
+
+	"listeners": {
+		"*:8300": {
+			"pass": "applications/example_php"
+		}
+	}
+}

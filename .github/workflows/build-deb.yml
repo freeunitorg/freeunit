@@ -1,0 +1,306 @@
+name: "Build deb packages (Debian trixie)"
+
+# Builds binary .deb packages for the core daemon and selected language
+# modules on Debian trixie, smoke-tests each installed package, then
+# publishes them as GitHub Release assets.
+#
+#   * unit            - core daemon (njs + otel, built from pkg/contrib + rust)
+#   * unit-php8.3      - PHP 8.3 module (from deb.sury.org)
+#   * unit-php8.4      - PHP 8.4 module (from deb.sury.org)
+#   * unit-php8.5      - PHP 8.5 module (from deb.sury.org)
+#   * unit-python3.13  - Python 3.13 module (native trixie)
+#
+# Trigger manually (workflow_dispatch) or by pushing one of the fork's
+# development branches to produce build artifacts, or push a version tag to
+# additionally attach the .deb files to the matching GitHub Release. Tag
+# patterns cover the upstream "X.Y.Z" scheme plus the fork-specific
+# packaging-build suffix (e.g. 1.35.5-build1). The release job runs only
+# after the smoke tests pass.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sury:
+        description: "deb.sury.org PHP repo: auto (detect) | on | off"
+        default: auto
+        type: choice
+        options: [auto, on, off]
+  push:
+    branches: [ current, stable, develop ]
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-build[0-9]+'
+
+# Default to least privilege; only the release job elevates to contents: write.
+permissions:
+  contents: read
+
+# sury mode for the build/smoke jobs. workflow_dispatch can override it; pushes
+# default to auto, which enables deb.sury.org only when a requested
+# libphpX.Y-embed is missing from base apt (see pkg/deb/sury-setup.sh).
+env:
+  SURY: ${{ github.event.inputs.sury || 'auto' }}
+
+jobs:
+  build-trixie:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+
+    steps:
+      # The debian:trixie image ships without git, so actions/checkout would
+      # fall back to the REST API and leave the workspace unpopulated. Install
+      # git first so checkout performs a real git checkout.
+      - name: Install git for actions/checkout
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd   # v5
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies (PHP via deb.sury.org when needed)
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eux
+          . ./pkg/deb/sury-setup.sh
+          apt-get update
+          # Enable deb.sury.org only when a requested libphpX.Y-embed runtime is
+          # missing from base apt (honors $SURY: auto|on|off). See sury-setup.sh.
+          setup_sury_if_needed "8.3 8.4 8.5"
+          apt-get install -y --no-install-recommends \
+            build-essential debhelper devscripts fakeroot lintian \
+            libxml2-utils xsltproc pkg-config git \
+            libssl-dev libpcre2-dev clang llvm \
+            cargo rustc \
+            php8.3-dev libphp8.3-embed \
+            php8.4-dev libphp8.4-embed \
+            php8.5-dev libphp8.5-embed \
+            python3.13-dev
+
+      - name: Build .deb packages
+        run: |
+          set -eux
+          # debuild would otherwise gate the build on lintian findings
+          echo 'DEBUILD_LINTIAN=no' > "$HOME/.devscripts"
+          make -C pkg/deb unit unit-php83 unit-php84 unit-php85 unit-python313
+          ls -la pkg/deb/debs/
+
+      - name: Upload .deb as workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
+        with:
+          name: freeunit-trixie-debs
+          path: pkg/deb/debs/*.deb
+          if-no-files-found: error
+
+  # Each module is smoke-tested on its own clean container, installed next to
+  # the core only. This mirrors real usage: each unit-php8.x package bundles its
+  # own PHP embed runtime (libphpX.Y-embed), and running several PHP embed
+  # runtimes in one Unit instance is unsupported, so we validate one PHP version
+  # per image.
+  smoke-test:
+    needs: build-trixie
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { module: unit-php8.3,     kind: php, type: "php",          port: "8083", expect: "OK-PHP-8.3" }
+          - { module: unit-php8.4,     kind: php, type: "php",          port: "8084", expect: "OK-PHP-8.4" }
+          - { module: unit-php8.5,     kind: php, type: "php",          port: "8085", expect: "OK-PHP-8.5" }
+          - { module: unit-python3.13, kind: py,  type: "python 3.13",  port: "8013", expect: "OK-PY-3.13" }
+
+    steps:
+      # Need the repo for pkg/deb/sury-setup.sh (sourced by the run step below).
+      # As in build-trixie, install git first or checkout falls back to the REST
+      # API and leaves the workspace unpopulated.
+      - name: Install git for actions/checkout
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd   # v5
+        with:
+          persist-credentials: false
+
+      - name: Download built .deb packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
+        with:
+          name: freeunit-trixie-debs
+          path: debs
+
+      - name: "Serve a request through ${{ matrix.module }}"
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          MODULE: ${{ matrix.module }}
+          APP_KIND: ${{ matrix.kind }}
+          APP_TYPE: ${{ matrix.type }}
+          PORT: ${{ matrix.port }}
+          EXPECT: ${{ matrix.expect }}
+        run: |
+          set -eux
+          . ./pkg/deb/sury-setup.sh
+          # No init system in the container; stop maintainer scripts starting it.
+          printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+          chmod +x /usr/sbin/policy-rc.d
+          apt-get update
+          # curl drives the control API and health probes; install it explicitly
+          # since sury setup (its only other installer) is skipped for native
+          # php8.4 and python.
+          apt-get install -y --no-install-recommends curl
+          # This module's PHP version (empty for python -> no sury).
+          case "$MODULE" in
+            unit-php*) NEED_PHP="${MODULE#unit-php}" ;;
+            *)         NEED_PHP="" ;;
+          esac
+          # Enable deb.sury.org only when libphp${NEED_PHP}-embed is missing from
+          # base apt (honors $SURY: auto|on|off). See sury-setup.sh.
+          setup_sury_if_needed "$NEED_PHP"
+          # core + exactly one module (single PHP version per instance).
+          # The artifact holds exactly one build's debs, so a version-agnostic
+          # glob installs the right pair without coupling to a literal version.
+          apt-get install -y --no-install-recommends ./debs/unit_*.deb "./debs/${MODULE}_"*.deb
+
+          /usr/sbin/unitd
+          for _ in $(seq 1 30); do [ -S /var/run/control.unit.sock ] && break; sleep 0.5; done
+          test -S /var/run/control.unit.sock
+
+          mkdir -p /tmp/app
+          if [ "$APP_KIND" = php ]; then
+          printf '<?php echo "OK-PHP-".PHP_VERSION;\n' > /tmp/app/index.php
+          app="{\"type\": \"$APP_TYPE\", \"root\": \"/tmp/app\", \"script\": \"index.php\"}"
+          else
+          cat > /tmp/app/wsgi.py <<'PY'
+          import sys
+
+
+          def application(environ, start_response):
+              start_response("200 OK", [("Content-Type", "text/plain")])
+              body = "OK-PY-%d.%d" % (sys.version_info[0], sys.version_info[1])
+              return [body.encode()]
+          PY
+          app="{\"type\": \"$APP_TYPE\", \"path\": \"/tmp/app\", \"module\": \"wsgi\"}"
+          fi
+          chmod -R a+rX /tmp/app
+
+          curl -fsS -X PUT --unix-socket /var/run/control.unit.sock \
+            --data-binary "{\"listeners\": {\"*:$PORT\": {\"pass\": \"applications/a\"}}, \"applications\": {\"a\": $app}}" \
+            http://localhost/config
+
+          out=
+          for _ in $(seq 1 20); do
+            if out=$(curl -fsS "http://localhost:$PORT/" 2>/dev/null) && printf '%s' "$out" | grep -q "$EXPECT"; then
+              echo "PASS $MODULE -> $out"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "FAIL $MODULE (expected '$EXPECT'), last response: '${out:-<none>}'"
+          cat /var/log/unit.log || true
+          exit 1
+
+  release:
+    needs: [build-trixie, smoke-test]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to upload assets to the release
+    steps:
+      - name: Download built .deb packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
+        with:
+          name: freeunit-trixie-debs
+          path: debs
+
+      - name: Generate checksums and release notes
+        run: |
+          set -eux
+          # SHA256SUMS lists every published .deb; users verify with
+          # `sha256sum -c`. Paths are stored relative to debs/ so the
+          # checksum file works next to the downloaded packages.
+          ( cd debs && sha256sum -- *.deb > SHA256SUMS )
+          # The asset version (e.g. 1.35.5-1.trixie) is the .deb file
+          # name, which GitHub derives from the package version by
+          # replacing the '~' of "1.35.5-1~trixie" with a '.'.
+          core=(debs/unit_*_amd64.deb)
+          DEB="$(basename "${core[0]}" \
+            | sed -E 's#^unit_(.+)_amd64\.deb$#\1#')"
+          sed -e "s/@TAG@/${GITHUB_REF_NAME}/g" -e "s/@DEB@/${DEB}/g" \
+            > RELEASE_NOTES.md <<'NOTES'
+          ## Debian trixie packages
+
+          Binary `.deb` packages for FreeUnit on Debian **trixie**
+          (amd64 only): install the core daemon plus exactly one language
+          module — the PHP embed SAPI allows only one PHP version per
+          instance.
+
+          ### 1. Enable deb.sury.org (PHP modules only)
+
+          PHP modules depend on `libphpX.Y-embed` from deb.sury.org. Skip
+          this step if you only install the Python module.
+
+          ```bash
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl gnupg lsb-release
+          sudo curl -fsSL https://packages.sury.org/php/apt.gpg \
+            -o /usr/share/keyrings/sury-php.gpg
+          sudo tee /etc/apt/sources.list.d/sury-php.sources >/dev/null <<'SURY'
+          Types: deb
+          URIs: https://packages.sury.org/php/
+          Suites: $(lsb_release -sc)
+          Components: main
+          Signed-By: /usr/share/keyrings/sury-php.gpg
+          SURY
+          sudo apt-get update
+          ```
+
+          ### 2. Download, verify checksums, install
+
+          ```bash
+          DEB=@DEB@                 # version inside the .deb file names
+          MOD=php8.4                # php8.3 | php8.4 | php8.5 | python3.13
+          BASE="https://github.com/${{ github.repository }}/releases/download/@TAG@"
+
+          curl -fLO "$BASE/SHA256SUMS"
+          curl -fLO "$BASE/unit_${DEB}_amd64.deb"
+          curl -fLO "$BASE/unit-${MOD}_${DEB}_amd64.deb"
+
+          sha256sum -c --ignore-missing SHA256SUMS
+          sudo apt-get install -y \
+            "./unit_${DEB}_amd64.deb" "./unit-${MOD}_${DEB}_amd64.deb"
+          ```
+
+          `sha256sum -c --ignore-missing` checks only the files you
+          downloaded and fails if any digest does not match.
+
+          ### 3. Run
+
+          ```bash
+          sudo systemctl enable --now unit
+          systemctl status unit
+          ```
+
+          Optional `-dbg` (debug symbols) and `-dev` packages are attached
+          to this release. `SHA256SUMS` provides integrity only, not
+          authenticity. The installed package version is `X.Y.Z-1~trixie`
+          (the `.` in the asset file name is GitHub's renaming of `~`).
+          NOTES
+
+      - name: Attach .deb to GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda   # v3.0.0
+        with:
+          body_path: RELEASE_NOTES.md
+          files: |
+            debs/*.deb
+            debs/SHA256SUMS
