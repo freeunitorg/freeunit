@@ -51,6 +51,24 @@ nxt_feature_test="#include <fcntl.h>
 . auto/feature
 
 
+# pipe2(), Linux 2.6.27/glibc 2.9, FreeBSD 10.0, NetBSD 6.0, OpenBSD 5.7.
+
+nxt_feature="pipe2()"
+nxt_feature_name=NXT_HAVE_PIPE2
+nxt_feature_run=
+nxt_feature_incs=
+nxt_feature_libs=
+nxt_feature_test="#define _GNU_SOURCE
+                  #include <fcntl.h>
+                  #include <unistd.h>
+
+                  int main(void) {
+                      int  pp[2];
+                      return pipe2(pp, O_CLOEXEC);
+                  }"
+. auto/feature
+
+
 nxt_feature="openat2()"
 nxt_feature_name=NXT_HAVE_OPENAT2
 nxt_feature_run=
