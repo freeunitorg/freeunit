@@ -1327,6 +1327,18 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_app_processes_members[] = {
 };
 
 
+/*
+ * The isolation validator accepts arbitrary "executable" paths and
+ * lets the operator disable every isolation feature here.  This is
+ * intentional: any peer who can write to the control socket already
+ * has the same authority as the unitd main process (see the
+ * SO_PEERCRED check landed in andypost/unit#14 — non-root local
+ * users are rejected at the socket layer, not by this validator).
+ * Allow-listing executable paths or forcing isolation = true here
+ * is a deployment policy decision, not a config-schema concern;
+ * deployments needing that should add a wrapping admission gate
+ * upstream of the control API.
+ */
 static nxt_conf_vldt_object_t  nxt_conf_vldt_app_isolation_members[] = {
     {
         .name       = nxt_string("namespaces"),
