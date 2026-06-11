@@ -418,6 +418,20 @@ nxt_http_proxy_content_length(void *ctx, nxt_http_field_t *field,
 
     if (nxt_fast_path(n >= 0)) {
         r->resp.content_length_n = n;
+
+    } else {
+        /*
+         * n == -2 means the upstream Content-Length value overflows
+         * nxt_off_t; n == -1 is a generic parse error.  Both are
+         * inconsistent with a usable response body length, so log and
+         * mark the response inconsistent rather than silently leaving
+         * content_length_n at -1.
+         */
+        nxt_log(&r->task, NXT_LOG_WARN,
+                "upstream Content-Length \"%*s\" is invalid",
+                (size_t) field->value_length, field->value);
+
+        r->inconsistent = 1;
     }
 
     return NXT_OK;

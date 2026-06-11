@@ -166,6 +166,12 @@ Changes with FreeUnit 1.35.4                                     30 Apr 2026
        registration ordering rework; reverted draft caused isolation
        test regressions, see PR #14 review thread).
 
+    *) Bugfix: harden HTTP/URI parser and string helper bounds — proxy
+       response Content-Length underflow guarded in nxt_h1proto.c, oversized
+       upstream Content-Length values are now logged and flagged inconsistent
+       in nxt_http_proxy.c, nxt_is_complex_uri_encoded() off-by-one fixed for
+       trailing "%" sequences, and nxt_rmemstrn() rejects length > buffer.
+
 Changes with FreeUnit 1.35.3                                     07 Apr 2026
 
     *) Feature: migrate contrib package mirror from packages.nginx.org to
