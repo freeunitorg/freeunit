@@ -90,11 +90,26 @@ static jint JNICALL
 nxt_java_InputStream_readLine(JNIEnv *env, jclass cls,
     jlong req_info_ptr, jarray out, jint off, jint len)
 {
+    jsize                    array_len;
     uint8_t                  *data;
     ssize_t                  res;
     nxt_unit_request_info_t  *req;
 
     req = nxt_jlong2ptr(req_info_ptr);
+
+    /*
+     * Validate (off, len) against the array bounds before handing
+     * GetPrimitiveArrayCritical's pointer + an attacker-controlled
+     * offset to nxt_unit_request_read().  Without this, a malicious
+     * caller can drive an OOB write of up to len bytes past the
+     * array's heap allocation.
+     */
+    array_len = (*env)->GetArrayLength(env, out);
+    if (off < 0 || len < 0 || off > array_len || len > array_len - off) {
+        nxt_java_throw_IllegalStateException(env,
+            "InputStream.readLine: off/len out of bounds");
+        return -1;
+    }
 
     data = (*env)->GetPrimitiveArrayCritical(env, out, NULL);
 
