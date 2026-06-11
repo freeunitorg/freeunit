@@ -169,6 +169,24 @@ nxt_port_enable(nxt_task_t *task, nxt_port_t *port,
 }
 
 
+/*
+ * TODO(audit-V5-medium): sender-type ACL for privileged port messages.
+ *
+ * The audit recommends rejecting application workers / prototypes
+ * that forge cert/script/socket/access-log/etc. messages to the
+ * main process.  A first draft was implemented but caused
+ * regressions in the isolation test suite — the kernel-validated
+ * sender PID (SCM_CREDENTIALS) is not consistently available on
+ * the existing socketpair setup, and the message-dispatch path
+ * runs before the prototype's process registration completes.
+ *
+ * Reverted to the pre-audit dispatch path here and deferred the
+ * ACL to a follow-up that introduces SO_PASSCRED on the relevant
+ * socketpairs and updates the process-registration ordering.
+ * See https://github.com/andypost/unit/pull/14 review thread.
+ */
+
+
 static void
 nxt_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
