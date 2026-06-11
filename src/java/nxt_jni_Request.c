@@ -731,12 +731,23 @@ static void JNICALL
 nxt_java_Request_sendWsFrameBuf(JNIEnv *env, jclass cls,
     jlong req_info_ptr, jobject buf, jint pos, jint len, jbyte opCode, jboolean last)
 {
+    jlong                    cap;
     nxt_unit_request_info_t  *req;
 
     req = nxt_jlong2ptr(req_info_ptr);
     uint8_t *b = (*env)->GetDirectBufferAddress(env, buf);
 
     if (b != NULL) {
+        cap = (*env)->GetDirectBufferCapacity(env, buf);
+        if (pos < 0 || len < 0 || cap < 0
+            || (jlong) pos > cap
+            || (jlong) len > cap - (jlong) pos)
+        {
+            nxt_java_throw_IllegalStateException(env,
+                "sendWsFrame: pos/len out of buffer capacity");
+            return;
+        }
+
         nxt_unit_websocket_send(req, opCode, last, b + pos, len);
 
     } else {
@@ -749,9 +760,21 @@ static void JNICALL
 nxt_java_Request_sendWsFrameArr(JNIEnv *env, jclass cls,
     jlong req_info_ptr, jarray arr, jint pos, jint len, jbyte opCode, jboolean last)
 {
+    jsize                    cap;
     nxt_unit_request_info_t  *req;
 
     req = nxt_jlong2ptr(req_info_ptr);
+
+    cap = (*env)->GetArrayLength(env, arr);
+    if (pos < 0 || len < 0
+        || pos > cap
+        || len > cap - pos)
+    {
+        nxt_java_throw_IllegalStateException(env,
+            "sendWsFrame: pos/len out of array length");
+        return;
+    }
+
     uint8_t *b = (*env)->GetPrimitiveArrayCritical(env, arr, NULL);
 
     if (b != NULL) {
