@@ -3,6 +3,18 @@
  * Copyright (C) NGINX, Inc.
  */
 
+/*
+ * NOTE: this module currently exposes capability *detection*
+ * (capget), used by nxt_isolation.c and the credential machinery to
+ * decide whether a non-root build can honor setuid/setgid in the
+ * "user"/"group" config keys.  Capabilities are NOT dropped
+ * programmatically via capset(2): the privilege barrier for app
+ * processes is the existing setuid + PR_SET_NO_NEW_PRIVS dance in
+ * nxt_credential.c / nxt_process.c.  Operators expecting an explicit
+ * capability-drop step should not assume one exists; isolation in
+ * Unit relies on uid/namespace/seccomp boundaries, not capset.
+ */
+
 #include <nxt_main.h>
 
 #if (NXT_HAVE_LINUX_CAPABILITY)

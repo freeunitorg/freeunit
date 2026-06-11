@@ -261,6 +261,13 @@ nxt_http_route_addr_pattern_parse(nxt_mp_t *mp,
 
             goto parse_port;
         }
+
+        /*
+         * /32 is the single-host case; set EXACT explicitly so the
+         * state machine reflects intent rather than relying on the
+         * implicit assignment in the fallthrough path below.
+         */
+        base->match_type = NXT_HTTP_ROUTE_ADDR_EXACT;
     }
 
     inet->start = nxt_inet_addr(addr.start, addr.length);
@@ -283,7 +290,13 @@ parse_port:
         return NXT_OK;
     }
 
-    delim = memchr(port.start, '-', port.length - 1);
+    /*
+     * Search the entire port string for '-' (the original "-1" bound
+     * silently ignored a trailing dash in inputs like "8-").  If the
+     * dash is at either end the resulting empty half makes
+     * nxt_int_parse() return < 0 below, producing PATTERN_PORT_ERROR.
+     */
+    delim = memchr(port.start, '-', port.length);
     if (delim != NULL) {
         ret = nxt_int_parse(port.start, delim - port.start);
         if (nxt_slow_path(ret < 0 || ret > 65535)) {
