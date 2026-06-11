@@ -1679,10 +1679,29 @@ nxt_unit_process_websocket(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg)
         }
 
         ws_impl->ws.header = (void *) b->buf.start;
-        ws_impl->ws.payload_len = nxt_websocket_frame_payload_len(
-            ws_impl->ws.header);
 
         hsize = nxt_websocket_frame_header_size(ws_impl->ws.header);
+
+        /*
+         * Reject truncated frames before reading the extended length /
+         * mask fields or advancing buf.free past buf.end.  A 2-byte
+         * frame whose header advertises a 14-byte extended length would
+         * otherwise OOB-read b->buf.start + hsize - 4 (mask) and the
+         * 8-byte extended length, and break the buffer invariant.
+         */
+        if (nxt_slow_path((size_t) (b->buf.end - b->buf.start) < hsize)) {
+            nxt_unit_warn(ctx, "#%"PRIu32": truncated websocket frame: "
+                          "hsize %zu > buf size %zu",
+                          req_impl->stream, hsize,
+                          (size_t) (b->buf.end - b->buf.start));
+
+            nxt_unit_websocket_frame_release(&ws_impl->ws);
+
+            return NXT_UNIT_ERROR;
+        }
+
+        ws_impl->ws.payload_len = nxt_websocket_frame_payload_len(
+            ws_impl->ws.header);
 
         if (ws_impl->ws.header->mask) {
             ws_impl->ws.mask = (uint8_t *) b->buf.start + hsize - 4;
@@ -3453,6 +3472,12 @@ nxt_unit_websocket_retain(nxt_unit_websocket_frame_t *ws)
     memcpy(b, ws_impl->buf->buf.start, size);
 
     hsize = nxt_websocket_frame_header_size(b);
+
+    /* Same OOB-read hazard as nxt_unit_process_websocket(). */
+    if (nxt_slow_path(hsize > size)) {
+        nxt_unit_free(ws->req->ctx, b);
+        return NXT_UNIT_ERROR;
+    }
 
     ws_impl->buf->buf.start = b;
     ws_impl->buf->buf.free = b + hsize;

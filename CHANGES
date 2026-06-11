@@ -106,6 +106,17 @@ Changes with FreeUnit 1.35.4                                     30 Apr 2026
        compression mmap failure paths close the source file fd, and the
        accept4() availability probe falls back only on ENOSYS.
 
+    *) Bugfix: tighten WebSocket frame-bound checks across libunit and the
+       protocol layer.  Adds guards for an OOB header read on truncated
+       extended-length frames (libunit nxt_unit.c), the matching unchecked
+       hsize in nxt_unit_websocket_retain(), the unvalidated MSB of the
+       64-bit extended payload length (RFC 6455 §5.2), a frame-size
+       decrement that was a no-op (nxt_http_websocket.c) and could leak
+       cross-frame bytes into the outgoing buffer, missing buffer-capacity
+       checks on the Java sendWsFrame JNI entry points, and a uint64
+       wraparound on pending_payload_len in the Python ASGI WebSocket
+       handler.
+
 Changes with FreeUnit 1.35.3                                     07 Apr 2026
 
     *) Feature: migrate contrib package mirror from packages.nginx.org to
