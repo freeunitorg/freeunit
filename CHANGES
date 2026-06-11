@@ -109,6 +109,18 @@ Changes with FreeUnit 1.35.4                                     30 Apr 2026
        send_headers/send_response and the per-request memcpy chain
        against NXT_WASM_MEM_SIZE.
 
+    *) Bugfix: cap JSON parser depth (100) and per-array/object element
+       count (100k) in the controller so a malformed POST /config
+       payload like "[[[[…]]]]" or a million-element flat array can no
+       longer exhaust the stack or heap.  Scrub PHP TrueAsync EG
+       exception state before the prototype-fork so workers do not
+       inherit a stale exception across the boundary, and guard the
+       Ruby rack.input / rack.errors handles against NULL-deref if an
+       app captures them outside the request lifetime, and bind each
+       handle to its originating request so a captured handle cannot
+       read/write the body of a later, unrelated request handled by
+       the same worker.
+
     *) Bugfix: fix router process CPU spin and connection hang under port
        scanning load; CLOSE-WAIT sockets are now cleaned up properly on
        client FIN, idle connection queue iteration fixed, systemd file

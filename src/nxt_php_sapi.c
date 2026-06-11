@@ -2397,7 +2397,25 @@ nxt_php_async_load_entrypoint(nxt_task_t *task, nxt_str_t *entrypoint)
                   nxt_php_request_callback ? Z_TYPE_P(nxt_php_request_callback) : -1);
     }
 
-    /* DON'T call php_request_shutdown() - we want the callback to persist after fork */
+    /*
+     * DON'T call php_request_shutdown() — we want the callback zval to
+     * persist across the prototype → worker fork.  But scrub any
+     * pending exception left in EG: if the entrypoint script raised
+     * something that wasn't caught before HttpServer->onRequest()
+     * stored the callback, every forked worker would inherit the
+     * exception on its first request.  The callback zval itself
+     * (nxt_php_request_callback) is not on the exception path; it
+     * was registered explicitly by the userland code.
+     *
+     * Other EG globals (output buffers, error_reporting, the symbol
+     * table) are also inherited, but those are reset implicitly when
+     * the worker enters a fresh request_init.  Exception state is
+     * the one that bites hardest because the next request's
+     * php_execute_script() can early-exit on a stale EG(exception).
+     */
+    if (EG(exception) != NULL) {
+        zend_clear_exception();
+    }
 
     return NXT_OK;
 }
