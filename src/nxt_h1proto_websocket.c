@@ -68,6 +68,9 @@ static const nxt_ws_error_t  nxt_ws_err_invalid_opcode = {
 static const nxt_ws_error_t  nxt_ws_err_cont_expected = {
     NXT_WEBSOCKET_CR_PROTOCOL_ERROR,
     1, nxt_string("Continuation expected, but %ud opcode received") };
+static const nxt_ws_error_t  nxt_ws_err_invalid_length = {
+    NXT_WEBSOCKET_CR_PROTOCOL_ERROR,
+    0, nxt_string("Invalid extended payload length") };
 
 void
 nxt_h1p_websocket_first_frame_start(nxt_task_t *task, nxt_http_request_t *r,
@@ -264,6 +267,18 @@ nxt_h1p_conn_ws_frame_header_read(nxt_task_t *task, void *obj, void *data)
 
     if (nxt_slow_path(wsh->mask == 0)) {
         hxt_h1p_send_ws_error(task, r, &nxt_ws_err_not_masked);
+        return;
+    }
+
+    /*
+     * RFC 6455 §5.2: when payload_len == 127, the most-significant bit
+     * of the 8-byte extended length MUST be 0.  Reject as protocol error
+     * before any further size arithmetic uses the value.
+     */
+    if (nxt_slow_path(wsh->payload_len == 127
+                      && (wsh->payload_len_[0] & 0x80) != 0))
+    {
+        hxt_h1p_send_ws_error(task, r, &nxt_ws_err_invalid_length);
         return;
     }
 

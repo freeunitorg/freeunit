@@ -82,9 +82,9 @@ nxt_http_websocket_client(nxt_task_t *task, void *obj, void *data)
             copy_size -= chunk_copy_size;
             b->mem.pos += chunk_copy_size;
             buf_free_size -= chunk_copy_size;
+            frame_size -= chunk_copy_size;
         }
 
-        frame_size -= copy_size;
         next = b->next;
         b->next = NULL;
 
