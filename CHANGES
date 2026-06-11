@@ -85,6 +85,17 @@ Changes with FreeUnit 1.35.4                                     30 Apr 2026
        barriers in Unit are setuid + PR_SET_NO_NEW_PRIVS, not cap
        drops.
 
+    *) Security: bounds-check untrusted shared-memory offsets on the port
+       IPC and libunit deserialization paths (audit PR-B): reject
+       out-of-range chunk_id and chunk_id+nchunks in mmap messages
+       (nxt_port_mmap_get_incoming_buf), close a TOCTOU window between
+       incoming-mmap lookup and first hdr dereference by retaining the
+       handler refcount across the unlock, reject integer overflow in
+       the application-supplied (max_fields_count, max_fields_size)
+       response-buffer formula in nxt_unit_response_init/realloc, and
+       validate every nxt_unit_request_t sptr at request arrival before
+       any libunit consumer dereferences it.
+
     *) Bugfix: fix router process CPU spin and connection hang under port
        scanning load; CLOSE-WAIT sockets are now cleaned up properly on
        client FIN, idle connection queue iteration fixed, systemd file

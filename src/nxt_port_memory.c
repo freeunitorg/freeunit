@@ -531,6 +531,16 @@ nxt_port_get_port_incoming_mmap(nxt_task_t *task, nxt_pid_t spid, uint32_t id)
     if (nxt_fast_path(process->incoming.size > id)) {
         mmap_handler = process->incoming.elts[id].mmap_handler;
 
+        /*
+         * Bump refcount under the mutex so the handler cannot be unmapped
+         * by a concurrent peer-side close between this lookup and the
+         * caller's first dereference of mmap_handler->hdr.  The caller
+         * adopts this reference and is responsible for releasing it.
+         */
+        if (mmap_handler != NULL) {
+            nxt_port_mmap_handler_use(mmap_handler, 1);
+        }
+
     } else {
         mmap_handler = NULL;
 
@@ -540,6 +550,26 @@ nxt_port_get_port_incoming_mmap(nxt_task_t *task, nxt_pid_t spid, uint32_t id)
     nxt_thread_mutex_unlock(&process->incoming.mutex);
 
     return mmap_handler;
+}
+
+
+/*
+ * Validate that a peer-supplied (chunk_id, nchunks) pair refers to a
+ * region wholly inside the mapped data area.  Returns non-zero on
+ * success.  Underflow-safe: subtracts on the constant side.
+ */
+nxt_inline nxt_bool_t
+nxt_port_mmap_chunk_range_valid(nxt_chunk_id_t chunk_id, size_t nchunks)
+{
+    if (chunk_id >= PORT_MMAP_CHUNK_COUNT) {
+        return 0;
+    }
+
+    if (nchunks > (size_t) PORT_MMAP_CHUNK_COUNT - chunk_id) {
+        return 0;
+    }
+
+    return 1;
 }
 
 
@@ -679,19 +709,37 @@ nxt_port_mmap_get_incoming_buf(nxt_task_t *task, nxt_port_t *port,
         return NULL;
     }
 
+    /*
+     * mmap_msg fields originate from a peer process; reject offsets
+     * that would point outside the mapped data area before they reach
+     * pointer arithmetic below.  See security-audit.md V5.
+     */
+    nchunks = mmap_msg->size / PORT_MMAP_CHUNK_SIZE;
+    if ((mmap_msg->size % PORT_MMAP_CHUNK_SIZE) != 0) {
+        nchunks++;
+    }
+
+    if (nxt_slow_path(!nxt_port_mmap_chunk_range_valid(mmap_msg->chunk_id,
+                                                      nchunks)))
+    {
+        nxt_alert(task, "invalid mmap message from pid %PI: "
+                  "chunk_id %uD, size %uD (chunks %uz, max %d)",
+                  spid, mmap_msg->chunk_id, mmap_msg->size,
+                  nchunks, PORT_MMAP_CHUNK_COUNT);
+
+        nxt_port_mmap_handler_use(mmap_handler, -1);
+        return NULL;
+    }
+
     b = nxt_buf_mem_ts_alloc(task, port->mem_pool, 0);
     if (nxt_slow_path(b == NULL)) {
+        nxt_port_mmap_handler_use(mmap_handler, -1);
         return NULL;
     }
 
     b->completion_handler = nxt_port_mmap_buf_completion;
 
     nxt_buf_set_port_mmap(b);
-
-    nchunks = mmap_msg->size / PORT_MMAP_CHUNK_SIZE;
-    if ((mmap_msg->size % PORT_MMAP_CHUNK_SIZE) != 0) {
-        nchunks++;
-    }
 
     hdr = mmap_handler->hdr;
 
@@ -701,7 +749,7 @@ nxt_port_mmap_get_incoming_buf(nxt_task_t *task, nxt_port_t *port,
     b->mem.end = b->mem.start + nchunks * PORT_MMAP_CHUNK_SIZE;
 
     b->parent = mmap_handler;
-    nxt_port_mmap_handler_use(mmap_handler, 1);
+    /* Adopts the reference taken by nxt_port_get_port_incoming_mmap(). */
 
     nxt_debug(task, "incoming mmap buf allocation: %p [%p,%uz] %PI->%PI,%d,%d",
               b, b->mem.start, b->mem.end - b->mem.start,
