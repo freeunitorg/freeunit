@@ -572,6 +572,12 @@ nxt_perl_psgi_ctx_init(const char *script, nxt_perl_psgi_ctx_t *pctx)
 
 fail:
 
+    /*
+     * Scrub ERRSV so a stale exception from eval_pv() / io_init() does
+     * not propagate to the next interpreter created on this pctx slot.
+     */
+    sv_setsv(ERRSV, &PL_sv_undef);
+
     nxt_perl_psgi_io_release(my_perl, &pctx->arg_input);
     nxt_perl_psgi_io_release(my_perl, &pctx->arg_error);
 

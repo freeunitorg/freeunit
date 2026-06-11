@@ -96,6 +96,19 @@ Changes with FreeUnit 1.35.4                                     30 Apr 2026
        validate every nxt_unit_request_t sptr at request arrival before
        any libunit consumer dereferences it.
 
+    *) Bugfix: bounds-check app-supplied arguments at the language-binding
+       trust boundary.  PHP: bound the response-header isspace() skip to
+       the header buffer; free the realpath() temp on script-resolution
+       failure; document that PATH_INFO is length-only (not NUL-terminated).
+       Python: surface failed environ-template refresh in the WSGI worker;
+       fix two ASGI lifespan NULL-checks that referenced the wrong handle.
+       Perl: scrub ERRSV on PSGI interpreter init failure so a stale
+       exception cannot propagate to the next interpreter.  Java:
+       validate (off, len) in InputStream.readLine() against the byte
+       array's length.  WASM: bound guest-supplied offsets in
+       send_headers/send_response and the per-request memcpy chain
+       against NXT_WASM_MEM_SIZE.
+
     *) Bugfix: fix router process CPU spin and connection hang under port
        scanning load; CLOSE-WAIT sockets are now cleaned up properly on
        client FIN, idle connection queue iteration fixed, systemd file
