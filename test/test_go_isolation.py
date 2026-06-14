@@ -1,4 +1,5 @@
 import grp
+import json
 import os
 import pwd
 import time
@@ -328,9 +329,13 @@ def _reload_and_poll_mounts(isolation):
 
     resp = None
     for _ in range(50):
-        resp = client.getjson(url='/?mounts=true')
+        # Use a raw GET, not getjson(): during the reload the new generation
+        # transiently answers 503 with a text/html error page, which trips
+        # getjson()'s Content-Type==application/json assertion before this retry
+        # loop can react. Decode JSON only once the app actually serves 200.
+        resp = client.get(url='/?mounts=true')
         if resp['status'] == 200:
-            return resp['body']
+            return json.loads(resp['body'])
         time.sleep(0.1)
 
     status = resp['status'] if resp is not None else None
