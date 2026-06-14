@@ -192,8 +192,10 @@ A summary (OK / FAILED) is printed at the end.
 | `node-20` | node:20 |
 | `node-22` | node:22 |
 | `node-24` | node:24 |
+| `node-26` | node:26 |
 | `perl-5.38` | perl:5.38 |
 | `perl-5.40` | perl:5.40 |
+| `perl-5.42` | perl:5.42 |
 | `php-8.3` | php:8.3-cli |
 | `php-8.4` | php:8.4-cli |
 | `php-8.5` | php:8.5-cli-trixie |
@@ -205,6 +207,7 @@ A summary (OK / FAILED) is printed at the end.
 | `python-3.14-slim` | python:3.14-slim |
 | `ruby-3.3` | ruby:3.3 |
 | `ruby-3.4` | ruby:3.4 |
+| `ruby-4.0` | ruby:4.0 |
 
 ## Reference build environment
 

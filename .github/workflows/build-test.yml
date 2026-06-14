@@ -38,9 +38,7 @@ jobs:
             os: ubuntu-latest
           - build: java-17
             os: ubuntu-latest
-          - build: java-18
-            os: ubuntu-latest
-          - build: java-20
+          - build: java-21
             os: ubuntu-latest
           - build: node-20
             os: ubuntu-latest
@@ -48,17 +46,15 @@ jobs:
             os: ubuntu-latest
           - build: node-24
             os: ubuntu-latest
-          - build: perl
+          - build: node-26
             os: ubuntu-latest
-          - build: php-8.2
+          - build: perl
             os: ubuntu-latest
           - build: php-8.3
             os: ubuntu-latest
           - build: php-8.4
             os: ubuntu-latest
           - build: php-8.5
-            os: ubuntu-latest
-          - build: python-3.11
             os: ubuntu-latest
           - build: python-3.12
             os: ubuntu-latest
@@ -69,6 +65,8 @@ jobs:
           - build: ruby-3.3
             os: ubuntu-latest
           - build: ruby-3.4
+            os: ubuntu-latest
+          - build: ruby-4.0
             os: ubuntu-latest
           - build: wasm
             os: ubuntu-latest

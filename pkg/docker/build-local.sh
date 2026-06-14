@@ -66,8 +66,10 @@ ALL_VARIANTS=(
     node-20
     node-22
     node-24
+    node-26
     perl-5.38
     perl-5.40
+    perl-5.42
     php-8.3
     php-8.4
     php-8.5
@@ -79,6 +81,7 @@ ALL_VARIANTS=(
     python-3.14-slim
     ruby-3.3
     ruby-3.4
+    ruby-4.0
 )
 
 # ---------------------------------------------------------------------------

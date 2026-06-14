@@ -203,5 +203,5 @@ test/
 ## CI
 
 All tests run on GitHub Actions for every PR and push to `master`. See
-`.github/workflows/build-test.yml` for the full matrix (PHP 8.2–8.5, Python 3.11–3.14,
-Go 1.25–1.26, Node.js 20/22/24, Java 17/18/20, Ruby 3.3/3.4, WASM, WASI).
+`.github/workflows/build-test.yml` for the full matrix (PHP 8.3–8.5, Python 3.12–3.14,
+Go 1.25–1.26, Node.js 20/22/24/26, Java 17/21, Ruby 3.3/3.4/4.0, WASM, WASI).

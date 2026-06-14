@@ -36,7 +36,7 @@ INSTALL_java ?=		java-shared-install java-install
 RUN_java ?=	 		rm -rf /root/.m2
 MODULE_PREBUILD_java ?= /bin/true
 
-VERSIONS_node ?=	20 22 24
+VERSIONS_node ?=	20 22 24 26
 VARIANT_node ?=		$(VARIANT)
 $(foreach nodeversion, $(VERSIONS_node), $(eval CONTAINER_node-$(nodeversion) = node:$(nodeversion)-$(VARIANT_node)))
 CONFIGURE_node ?=	nodejs --node-gyp=/usr/local/bin/node-gyp
@@ -44,7 +44,7 @@ INSTALL_node ?=		node node-install libunit-install
 RUN_node ?=			rm -rf /root/.cache/ \&\& rm -rf /root/.npm
 MODULE_PREBUILD_node ?=	npm -g install node-gyp
 
-VERSIONS_perl ?=	5.38 5.40
+VERSIONS_perl ?=	5.38 5.40 5.42
 VARIANT_perl ?=		$(VARIANT)
 $(foreach perlversion, $(VERSIONS_perl), $(eval CONTAINER_perl-$(perlversion) = perl:$(perlversion)-$(VARIANT_perl)))
 CONFIGURE_perl ?=	perl
@@ -69,7 +69,7 @@ INSTALL_python ?=	python3-install
 RUN_python ?=		/bin/true
 MODULE_PREBUILD_python ?= /bin/true
 
-VERSIONS_ruby ?=	3.3 3.4
+VERSIONS_ruby ?=	3.3 3.4 4.0
 VARIANT_ruby ?=		$(VARIANT)
 $(foreach rubyversion, $(VERSIONS_ruby), $(eval CONTAINER_ruby-$(rubyversion) = ruby:$(rubyversion)-$(VARIANT_ruby)))
 CONFIGURE_ruby ?=	ruby

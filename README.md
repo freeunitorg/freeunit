@@ -59,11 +59,13 @@ and are available for `linux/amd64` and `linux/arm64`.
 | Python 3.14 | `ghcr.io/freeunitorg/freeunit:latest-python-3.14` |
 | Python 3.13 | `ghcr.io/freeunitorg/freeunit:latest-python-3.13` |
 | Python 3.12 | `ghcr.io/freeunitorg/freeunit:latest-python-3.12` |
+| Node.js 26 | `ghcr.io/freeunitorg/freeunit:latest-node-26` |
 | Node.js 24 | `ghcr.io/freeunitorg/freeunit:latest-node-24` |
 | Node.js 22 | `ghcr.io/freeunitorg/freeunit:latest-node-22` |
 | Node.js 20 | `ghcr.io/freeunitorg/freeunit:latest-node-20` |
 | Go 1.26 | `ghcr.io/freeunitorg/freeunit:latest-go-1.26` |
 | Go 1.25 | `ghcr.io/freeunitorg/freeunit:latest-go-1.25` |
+| Ruby 4.0 | `ghcr.io/freeunitorg/freeunit:latest-ruby-4.0` |
 | Ruby 3.4 | `ghcr.io/freeunitorg/freeunit:latest-ruby-3.4` |
 | WebAssembly | `ghcr.io/freeunitorg/freeunit:latest-wasm` |
 
