@@ -3,7 +3,7 @@
 #   docker build -t ghcr.io/freeunitorg/freeunit-builder:php8.5-rust1.94.1 \
 #     -f ../Dockerfile.builder-php8.5 ..
 # Then build this variant:
-#   ../build-local.sh -b php8.5
+#   ../build-local.sh -b php-8.5
 
 FROM ghcr.io/freeunitorg/freeunit-builder:php8.5-rust1.94.1 AS build
 
@@ -62,7 +62,7 @@ RUN set -ex \
 
 FROM php:8.5-cli-trixie
 
-LABEL org.opencontainers.image.title="FreeUnit (php8.5)"
+LABEL org.opencontainers.image.title="FreeUnit (php-8.5)"
 LABEL org.opencontainers.image.description="Community build of FreeUnit for Docker."
 LABEL org.opencontainers.image.url="https://freeunit.org"
 LABEL org.opencontainers.image.source="https://github.com/freeunitorg/freeunit"
