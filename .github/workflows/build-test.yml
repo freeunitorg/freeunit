@@ -102,6 +102,9 @@ jobs:
           NJS_VERSION=$(sed -n "s/NJS_VERSION := \(.*\)/\1/p" pkg/contrib/src/njs/version)
           echo "njs_version=${NJS_VERSION}" >> "$GITHUB_OUTPUT"
 
+          WASMTIME_VERSION=$(sed -n "s/WASMTIME_VERSION := \(.*\)/\1/p" pkg/contrib/src/wasmtime/version)
+          echo "wasmtime_version=${WASMTIME_VERSION}" >> "$GITHUB_OUTPUT"
+
           cat "$GITHUB_OUTPUT"
 
       # https://github.com/actions/runner-images/issues/2821
@@ -121,7 +124,26 @@ jobs:
           fi
 
       - name: Install packages
-        run: sudo apt-get -y install libbrotli-dev
+        run: sudo apt-get -y install libbrotli-dev ccache
+
+      # ccache transparently caches C object files across runs. The Debian
+      # ccache package ships compiler symlinks in /usr/lib/ccache; putting it
+      # first on PATH makes `cc`/`gcc` resolve to ccache for njs, unit and the
+      # OpenSSL build with no configure changes. Falls back to real cc on any
+      # miss, so it can only speed things up, never break the build.
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.build }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.build }}-
+
+      - name: Enable ccache
+        run: |
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=500M" >> "$GITHUB_ENV"
 
       - name: Cache OpenSSL 3.6
         id: cache-openssl36
@@ -158,7 +180,15 @@ jobs:
       ## njs
       ##
 
+      - name: Cache njs
+        id: cache-njs
+        uses: actions/cache@v5
+        with:
+          path: njs
+          key: njs-${{ steps.metadata.outputs.njs_version }}-${{ runner.os }}-${{ runner.arch }}
+
       - name: Clone njs repository
+        if: steps.cache-njs.outputs.cache-hit != 'true'
         uses: actions/checkout@v5
         with:
           repository: nginx/njs
@@ -166,6 +196,7 @@ jobs:
           path: njs
 
       - name: Make njs
+        if: steps.cache-njs.outputs.cache-hit != 'true'
         run: |
           ./configure --no-libxml2 --no-zlib
           make -j4 -k
@@ -355,10 +386,18 @@ jobs:
       ## Wasm
       ##
 
+      - name: Cache wasmtime
+        id: cache-wasmtime
+        if: steps.metadata.outputs.module == 'wasm'
+        uses: actions/cache@v5
+        with:
+          path: pkg/contrib/wasmtime/artifacts
+          key: wasmtime-${{ steps.metadata.outputs.wasmtime_version }}-${{ runner.os }}-${{ runner.arch }}
+
       - name: Make wasmtime
         run: |
           make -C pkg/contrib .wasmtime
-        if: steps.metadata.outputs.module == 'wasm'
+        if: steps.metadata.outputs.module == 'wasm' && steps.cache-wasmtime.outputs.cache-hit != 'true'
 
       - name: Configure wasm
         run: |
@@ -377,7 +416,14 @@ jobs:
       - name: Setup rust
         run: |
           curl https://sh.rustup.rs | sh -s -- -y
-          cargo install cargo-component
+        if: steps.metadata.outputs.module == 'wasm-wasi-component'
+
+      # Prebuilt binary instead of `cargo install cargo-component` (which
+      # compiles it from source on every run). Same tool, much faster.
+      - name: Install cargo-component
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-component
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
 
       - name: Configure wasm-wasi-component
