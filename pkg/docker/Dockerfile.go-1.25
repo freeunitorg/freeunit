@@ -1,6 +1,6 @@
-FROM perl:5.40-trixie
+FROM golang:1.25-trixie
 
-LABEL org.opencontainers.image.title="FreeUnit (perl5.40)"
+LABEL org.opencontainers.image.title="FreeUnit (go-1.25)"
 LABEL org.opencontainers.image.description="Community build of FreeUnit for Docker."
 LABEL org.opencontainers.image.url="https://freeunit.org"
 LABEL org.opencontainers.image.source="https://github.com/freeunitorg/freeunit"
@@ -71,12 +71,12 @@ RUN set -ex \
     && make clean \
     && /bin/true \
     && ./configure $CONFIGURE_ARGS_MODULES --cc-opt="$CC_OPT" --modulesdir=/usr/lib/unit/debug-modules --debug \
-    && ./configure perl \
-    && make -j $NCPU perl-install \
+    && ./configure go --go-path=$GOPATH \
+    && make -j $NCPU go-install-src libunit-install \
     && make clean \
     && ./configure $CONFIGURE_ARGS_MODULES --cc-opt="$CC_OPT" --modulesdir=/usr/lib/unit/modules \
-    && ./configure perl \
-    && make -j $NCPU perl-install \
+    && ./configure go --go-path=$GOPATH \
+    && make -j $NCPU go-install-src libunit-install \
     && cd \
     && rm -rf /usr/src/unit \
     && for f in /usr/sbin/unitd /usr/lib/unit/modules/*.unit.so; do \

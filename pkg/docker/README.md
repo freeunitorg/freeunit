@@ -2,7 +2,7 @@
 
 This directory contains Dockerfiles for all FreeUnit language variants and
 a helper script (`build-local.sh`) for building them locally — mirroring
-the behavior of `.github/workflows/docker.yml`.
+the behavior of `.github/workflows/release-docker.yml`.
 
 ## Security: CVE-2026-31431 (AF_ALG privilege escalation)
 
@@ -31,14 +31,14 @@ Apply at runtime (path must be on the **host** filesystem, run from repo root):
 ```bash
 # Option 1: use the profile from this repo directly
 docker run --security-opt seccomp=pkg/docker/seccomp-no-af-alg.json \
-    ghcr.io/freeunitorg/freeunit:latest-php8.4
+    ghcr.io/freeunitorg/freeunit:latest-php-8.4
 
 # Option 2: extract from a pulled image
 CNAME=$(docker create ghcr.io/freeunitorg/freeunit:latest-minimal)
 docker cp "$CNAME":/usr/share/unit/seccomp-no-af-alg.json ./seccomp-no-af-alg.json
 docker rm "$CNAME"
 docker run --security-opt seccomp=./seccomp-no-af-alg.json \
-    ghcr.io/freeunitorg/freeunit:latest-php8.4
+    ghcr.io/freeunitorg/freeunit:latest-php-8.4
 ```
 
 Verify the profile is active (AF_ALG socket must be denied):
@@ -46,13 +46,13 @@ Verify the profile is active (AF_ALG socket must be denied):
 ```bash
 # Should exit with "Operation not permitted" — confirms AF_ALG is blocked
 docker run --rm --security-opt seccomp=pkg/docker/seccomp-no-af-alg.json \
-    ghcr.io/freeunitorg/freeunit:latest-python3.13-slim \
+    ghcr.io/freeunitorg/freeunit:latest-python-3.13-slim \
     python3 -c "import socket; socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET)"
 # Expected: PermissionError: [Errno 1] Operation not permitted
 
 # Normal TCP socket must still work — confirms no regression
 docker run --rm --security-opt seccomp=pkg/docker/seccomp-no-af-alg.json \
-    ghcr.io/freeunitorg/freeunit:latest-python3.13-slim \
+    ghcr.io/freeunitorg/freeunit:latest-python-3.13-slim \
     python3 -c "import socket; s = socket.socket(); s.close(); print('OK')"
 # Expected: OK
 ```
@@ -132,9 +132,9 @@ cd pkg/docker
 | Command | Description |
 |---------|-------------|
 | `./build-local.sh` | Build **all** variants, `nproc/2` in parallel |
-| `./build-local.sh minimal php8.5` | Build only the listed variants |
+| `./build-local.sh minimal php-8.5` | Build only the listed variants |
 | `./build-local.sh -j4` | Build 4 variants in parallel (requires `parallel`) |
-| `./build-local.sh -b minimal php8.5` | Fast build via pre-built builder images (no apt/Rust download) |
+| `./build-local.sh -b minimal php-8.5` | Fast build via pre-built builder images (no apt/Rust download) |
 | `./build-local.sh -b` | Fast build all builder-supported variants |
 | `./build-local.sh -v 1.35.2` | Pin a specific FreeUnit version |
 | `./build-local.sh -p linux/arm64` | Build for a specific platform |
@@ -151,14 +151,14 @@ as an APT proxy — no flags needed.
 -p PLATFORM  Target platform (default: host arch, e.g. linux/amd64)
 -j N         Number of parallel builds (default: nproc/2)
 -b           Builder mode — fast local builds via pre-built builder images
-             Skips apt install and Rust download; supported: minimal, wasm, php8.5
+             Skips apt install and Rust download; supported: minimal, wasm, php-8.5
 -n           Dry-run — print commands, do not execute
 -h           Show help
 ```
 
 ### Builder mode (-b): fast local iteration
 
-For `minimal`, `wasm`, and `php8.5` variants, `-b` uses pre-built builder images
+For `minimal`, `wasm`, and `php-8.5` variants, `-b` uses pre-built builder images
 that already contain all build tools and Rust. This eliminates ~100 MB apt download
 and ~70 MB Rust download per build — useful for iterating locally.
 
@@ -185,26 +185,26 @@ A summary (OK / FAILED) is printed at the end.
 |---------|-----------|
 | `minimal` | debian:trixie-slim |
 | `wasm` | debian:trixie-slim |
-| `go1.25` | golang:1.25 |
-| `go1.26` | golang:1.26 |
-| `jsc17` | eclipse-temurin:17-jdk-noble |
-| `jsc21` | eclipse-temurin:21-jdk-noble |
-| `node20` | node:20 |
-| `node22` | node:22 |
-| `node24` | node:24 |
-| `perl5.38` | perl:5.38 |
-| `perl5.40` | perl:5.40 |
-| `php8.3` | php:8.3-cli |
-| `php8.4` | php:8.4-cli |
-| `php8.5` | php:8.5-cli-trixie |
-| `python3.12` | python:3.12 |
-| `python3.12-slim` | python:3.12-slim |
-| `python3.13` | python:3.13 |
-| `python3.13-slim` | python:3.13-slim |
-| `python3.14` | python:3.14 |
-| `python3.14-slim` | python:3.14-slim |
-| `ruby3.3` | ruby:3.3 |
-| `ruby3.4` | ruby:3.4 |
+| `go-1.25` | golang:1.25 |
+| `go-1.26` | golang:1.26 |
+| `java-17` | eclipse-temurin:17-jdk-noble |
+| `java-21` | eclipse-temurin:21-jdk-noble |
+| `node-20` | node:20 |
+| `node-22` | node:22 |
+| `node-24` | node:24 |
+| `perl-5.38` | perl:5.38 |
+| `perl-5.40` | perl:5.40 |
+| `php-8.3` | php:8.3-cli |
+| `php-8.4` | php:8.4-cli |
+| `php-8.5` | php:8.5-cli-trixie |
+| `python-3.12` | python:3.12 |
+| `python-3.12-slim` | python:3.12-slim |
+| `python-3.13` | python:3.13 |
+| `python-3.13-slim` | python:3.13-slim |
+| `python-3.14` | python:3.14 |
+| `python-3.14-slim` | python:3.14-slim |
+| `ruby-3.3` | ruby:3.3 |
+| `ruby-3.4` | ruby:3.4 |
 
 ## Reference build environment
 
@@ -221,12 +221,12 @@ Measured full build (all 23 variants, `./build-local.sh`) on the maintainer's lo
 | **Total time** | **~58 min** (23 variants, cold Docker layer cache) |
 
 With apt-cacher-ng, repeated builds that share base layers are significantly faster.
-Builder mode (`-b`) for `minimal`, `wasm`, and `php8.5` cuts those three variants to
+Builder mode (`-b`) for `minimal`, `wasm`, and `php-8.5` cuts those three variants to
 ~2–3 min each by skipping apt and Rust downloads entirely.
 
 ## CI workflow
 
-The GitHub Actions workflow (`.github/workflows/docker.yml`) builds and pushes
+The GitHub Actions workflow (`.github/workflows/release-docker.yml`) builds and pushes
 images to GHCR (`ghcr.io/freeunitorg/freeunit`) on every `v*` release tag or
 via `workflow_dispatch`. It produces:
 

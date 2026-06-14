@@ -1,5 +1,5 @@
 
-name: unitctl
+name: "Build & Release (unitctl)"
 
 on:
   pull_request:

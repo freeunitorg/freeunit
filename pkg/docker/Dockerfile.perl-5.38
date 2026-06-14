@@ -1,6 +1,6 @@
-FROM python:3.12-slim-trixie
+FROM perl:5.38-trixie
 
-LABEL org.opencontainers.image.title="FreeUnit (python3.12-slim)"
+LABEL org.opencontainers.image.title="FreeUnit (perl-5.38)"
 LABEL org.opencontainers.image.description="Community build of FreeUnit for Docker."
 LABEL org.opencontainers.image.url="https://freeunit.org"
 LABEL org.opencontainers.image.source="https://github.com/freeunitorg/freeunit"
@@ -71,12 +71,12 @@ RUN set -ex \
     && make clean \
     && /bin/true \
     && ./configure $CONFIGURE_ARGS_MODULES --cc-opt="$CC_OPT" --modulesdir=/usr/lib/unit/debug-modules --debug \
-    && ./configure python --config=/usr/local/bin/python3-config \
-    && make -j $NCPU python3-install \
+    && ./configure perl \
+    && make -j $NCPU perl-install \
     && make clean \
     && ./configure $CONFIGURE_ARGS_MODULES --cc-opt="$CC_OPT" --modulesdir=/usr/lib/unit/modules \
-    && ./configure python --config=/usr/local/bin/python3-config \
-    && make -j $NCPU python3-install \
+    && ./configure perl \
+    && make -j $NCPU perl-install \
     && cd \
     && rm -rf /usr/src/unit \
     && for f in /usr/sbin/unitd /usr/lib/unit/modules/*.unit.so; do \

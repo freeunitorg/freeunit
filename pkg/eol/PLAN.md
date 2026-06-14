@@ -214,7 +214,7 @@ and running `make dockerfiles`.
 ## Future Extensions
 
 - Prebuild binary to `packages.freeunit.org` (like fake_upstream) — eliminates runtime compile
-- CI step in `.github/workflows/ci.yml` (scheduled weekly, non-blocking warning)
+- CI step in `.github/workflows/build-test.yml` (scheduled weekly, non-blocking warning)
 - `--days N`: configurable warning threshold (default: 365 days = 12 months)
 - `--fix --os`: correct OS EOL dates too (currently runtime-only)
 - JSON output format for `--new` mode

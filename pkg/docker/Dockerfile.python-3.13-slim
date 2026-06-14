@@ -1,6 +1,6 @@
-FROM python:3.14-trixie
+FROM python:3.13-slim-trixie
 
-LABEL org.opencontainers.image.title="FreeUnit (python3.14)"
+LABEL org.opencontainers.image.title="FreeUnit (python-3.13-slim)"
 LABEL org.opencontainers.image.description="Community build of FreeUnit for Docker."
 LABEL org.opencontainers.image.url="https://freeunit.org"
 LABEL org.opencontainers.image.source="https://github.com/freeunitorg/freeunit"
