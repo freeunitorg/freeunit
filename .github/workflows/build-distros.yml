@@ -1,4 +1,4 @@
-name: "CI - Fedora Rawhide / Alpine Edge / GCC / Clang"
+name: "Build (Fedora/Alpine · GCC/Clang)"
 
 on:
   workflow_dispatch: # manual only
@@ -9,7 +9,7 @@ on:
 #      - 'auto/**'
 #      - 'src/**'
 #      - 'test/**'
-#      - '.github/workflows/ci-dev-distro-compiler.yaml'
+#      - '.github/workflows/build-distros.yml'
 #  pull_request:
 #    branches: master
 #    paths:
@@ -17,7 +17,7 @@ on:
 #      - 'auto/**'
 #      - 'src/**'
 #      - 'test/**'
-#      - '.github/workflows/ci-dev-distro-compiler.yaml'
+#      - '.github/workflows/build-distros.yml'
 
 jobs:
 
@@ -42,7 +42,7 @@ jobs:
               python-unversioned-command python3 python3-devel \
               php-devel php-embedded perl-devel perl-ExtUtils-Embed \
               ruby-devel java-devel nodejs-devel nodejs-npm golang \
-              cargo rust
+              cargo rust cmake
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             dnf -y install --setopt=install_weak_deps=False clang
           fi
@@ -105,12 +105,14 @@ jobs:
       - name: make unit-go
         run: make go-install
 
-      - name: Install wasmtime
-        run: |
-          wget -O- https://github.com/bytecodealliance/wasmtime/releases/download/v20.0.0/wasmtime-v20.0.0-x86_64-linux-c-api.tar.xz | tar -xJf -
+      # wasmtime version is pinned in pkg/contrib/src/wasmtime/version and
+      # built from a checksum-verified source tarball — same as build-test.
+      # Keeps the wasm runtime in sync with what Unit is actually built against.
+      - name: Build wasmtime (pinned via pkg/contrib)
+        run: make -C pkg/contrib .wasmtime
 
       - name: configure unit-wasm
-        run: ./configure wasm --include-path=wasmtime-v20.0.0-x86_64-linux-c-api/include --lib-path=wasmtime-v20.0.0-x86_64-linux-c-api/lib --rpath
+        run: ./configure wasm --include-path=pkg/contrib/wasmtime/artifacts/include --lib-path=pkg/contrib/wasmtime/artifacts/lib --rpath
 
       - name: make unit-wasm
         run: make wasm

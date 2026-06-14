@@ -1,4 +1,4 @@
-name: seccomp-test
+name: "Security (Seccomp AF_ALG)"
 
 on:
   push:
@@ -33,8 +33,12 @@ jobs:
       - name: Run seccomp tests (python base image)
         run: bash test/security/seccomp/test-af-alg.sh python:3.13-slim-trixie
 
-      - name: Pull FreeUnit python3.13-slim image
-        run: docker pull ghcr.io/freeunitorg/freeunit:latest-python3.13-slim
+      # Build the image from the in-repo Dockerfile instead of pulling a
+      # published tag: this validates the Dockerfile under change (the very
+      # trigger of this workflow) and avoids coupling to the release that
+      # publishes the dash-style tags (latest-python-3.13-slim).
+      - name: Build FreeUnit python-3.13-slim image
+        run: docker build -t freeunit:seccomp-test -f pkg/docker/Dockerfile.python-3.13-slim pkg/docker
 
       - name: Run seccomp tests (FreeUnit image)
-        run: bash test/security/seccomp/test-af-alg.sh ghcr.io/freeunitorg/freeunit:latest-python3.13-slim
+        run: bash test/security/seccomp/test-af-alg.sh freeunit:seccomp-test

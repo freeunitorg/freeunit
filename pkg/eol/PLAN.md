@@ -116,13 +116,13 @@ Optionally patch `pkg/docker/Makefile` in place.
 
 | eol.json category | Dockerfile pattern | Notes |
 |-------------------|--------------------|-------|
-| `go` | `Dockerfile.go{version}` | `golang:{version}-trixie` base |
-| `node` | `Dockerfile.node{version}` | `node:{version}-trixie` base |
-| `perl` | `Dockerfile.perl{version}` | `perl:{version}-trixie` base |
-| `php` | `Dockerfile.php{version}` | `php:{version}-cli-trixie` base |
-| `python` | `Dockerfile.python{version}`, `Dockerfile.python{version}-slim` | two variants |
-| `ruby` | `Dockerfile.ruby{version}` | `ruby:{version}-trixie` base |
-| `jsc` | `Dockerfile.jsc{version}` | `eclipse-temurin:{version}-jdk-noble` base |
+| `go` | `Dockerfile.go-{version}` | `golang:{version}-trixie` base |
+| `node` | `Dockerfile.node-{version}` | `node:{version}-trixie` base |
+| `perl` | `Dockerfile.perl-{version}` | `perl:{version}-trixie` base |
+| `php` | `Dockerfile.php-{version}` | `php:{version}-cli-trixie` base |
+| `python` | `Dockerfile.python-{version}`, `Dockerfile.python-{version}-slim` | two variants |
+| `ruby` | `Dockerfile.ruby-{version}` | `ruby:{version}-trixie` base |
+| `java` | `Dockerfile.java-{version}` | `eclipse-temurin:{version}-jdk-noble` base |
 | `wasm` | `Dockerfile.wasm` | no version suffix, skip EOL check |
 | `minimal` | `Dockerfile.minimal` | no version suffix, skip EOL check |
 
@@ -146,11 +146,11 @@ Optionally patch `pkg/docker/Makefile` in place.
 **Output example:**
 
 ```
-[ ADD   ] node 26: Dockerfile.node26 missing — supported until 2029-04
-[ ADD   ] perl 5.42: Dockerfile.perl5.42 missing — supported until 2029-07
-[ ADD   ] ruby 4.0: Dockerfile.ruby4.0 missing — supported until 2030-03
-[ DROP  ] node 20: Dockerfile.node20 — FreeUnit drop date 2027-04
-[ WARN  ] go 1.24: Dockerfile.go1.24 — drop in 9 months (2027-02)
+[ ADD   ] node 26: Dockerfile.node-26 missing — supported until 2029-04
+[ ADD   ] perl 5.42: Dockerfile.perl-5.42 missing — supported until 2029-07
+[ ADD   ] ruby 4.0: Dockerfile.ruby-4.0 missing — supported until 2030-03
+[ DROP  ] node 20: Dockerfile.node-20 — FreeUnit drop date 2027-04
+[ WARN  ] go 1.24: Dockerfile.go-1.24 — drop in 9 months (2027-02)
 [ OK    ] php 8.3 8.4 8.5 — in sync
 ```
 
@@ -181,17 +181,17 @@ regenerates all Dockerfiles for the new active set.
 
 - **DROP on `supported_until`, not `eol`**: grace period is deliberate policy. A version past upstream EOL but within the 12/36-month window is still actively supported by FreeUnit — removing its Dockerfile early would break users. `DROP` fires only when `supported_until` ≤ today.
 - **`--docker-makefile` only patches `VERSIONS_*` lines** — does not regenerate Dockerfiles itself. After patching, user runs `cd pkg/docker && make clean && make dockerfiles`. Keeps Makefile as the single source for Dockerfile generation logic.
-- **python**: one eol.json entry → two Dockerfiles (`Dockerfile.python{v}` + `Dockerfile.python{v}-slim`). Both generated, both checked.
+- **python**: one eol.json entry → two Dockerfiles (`Dockerfile.python-{v}` + `Dockerfile.python-{v}-slim`). Both generated, both checked.
 - **wasm / minimal**: no `version` field in eol.json → skip EOL check entirely. Dockerfiles always present.
-- **jsc**: `eclipse-temurin:{v}-jdk-noble` base (not trixie). `VARIANT_jsc ?= noble` in Makefile — no change needed.
+- **java**: `eclipse-temurin:{v}-jdk-noble` base (not trixie). `VARIANT_java ?= noble` in Makefile — no change needed.
 
 ### Current gap (2026-05-20)
 
 | Needed | Missing Dockerfile |
 |--------|--------------------|
-| node 26 | `Dockerfile.node26` |
-| perl 5.42 | `Dockerfile.perl5.42` |
-| ruby 4.0 | `Dockerfile.ruby4.0` |
+| node 26 | `Dockerfile.node-26` |
+| perl 5.42 | `Dockerfile.perl-5.42` |
+| ruby 4.0 | `Dockerfile.ruby-4.0` |
 
 These are active in eol.json (`supported_until` 2029–2030) but absent from `pkg/docker/`.
 `--docker` will report them as `[ ADD ]`. Resolve by updating `VERSIONS_*` in Makefile
@@ -214,7 +214,7 @@ and running `make dockerfiles`.
 ## Future Extensions
 
 - Prebuild binary to `packages.freeunit.org` (like fake_upstream) — eliminates runtime compile
-- CI step in `.github/workflows/ci.yml` (scheduled weekly, non-blocking warning)
+- CI step in `.github/workflows/build-test.yml` (scheduled weekly, non-blocking warning)
 - `--days N`: configurable warning threshold (default: 365 days = 12 months)
 - `--fix --os`: correct OS EOL dates too (currently runtime-only)
 - JSON output format for `--new` mode

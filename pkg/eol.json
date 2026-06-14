@@ -49,7 +49,7 @@
       {"version": "1.25", "eol": "2026-08", "supported_until": "2027-08"},
       {"version": "1.26", "eol": "2027-02", "supported_until": "2028-02"}
     ],
-    "jsc": [
+    "java": [
       {"version": "17", "eol": "2027-10", "supported_until": "2028-10", "base": "eclipse-temurin"},
       {"version": "21", "eol": "2029-12", "supported_until": "2030-12", "base": "eclipse-temurin"}
     ],

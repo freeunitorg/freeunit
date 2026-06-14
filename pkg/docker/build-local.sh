@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # build-local.sh — locally builds all (or selected) Docker variants
-# from pkg/docker/, mirroring .github/workflows/docker.yml
+# from pkg/docker/, mirroring .github/workflows/release-docker.yml
 #
 # Usage:
 #   ./build-local.sh [OPTIONS] [VARIANT...]
@@ -13,7 +13,7 @@
 #   -b           Builder mode — use pre-built builder images (local/Dockerfile.*)
 #                Skips apt install and Rust download; builder image is built
 #                automatically if not found locally or on GHCR.
-#                Supported variants: minimal, wasm, php8.5
+#                Supported variants: minimal, wasm, php-8.5
 #   -n           Dry-run — print commands, do not execute
 #   -h           Show this help
 #
@@ -27,11 +27,11 @@
 #
 # Examples:
 #   ./build-local.sh                        # build all variants sequentially
-#   ./build-local.sh minimal php8.5         # build only these two variants
+#   ./build-local.sh minimal php-8.5        # build only these two variants
 #   ./build-local.sh -j4                    # build 4 at a time
-#   ./build-local.sh -v 1.35.2 go1.25      # pin specific version
+#   ./build-local.sh -v 1.35.2 go-1.25     # pin specific version
 #   ./build-local.sh -p linux/amd64,linux/arm64 -j2   # multi-arch (needs buildx)
-#   ./build-local.sh -b minimal php8.5     # fast local build via builder images
+#   ./build-local.sh -b minimal php-8.5    # fast local build via builder images
 
 set -euo pipefail
 
@@ -54,31 +54,31 @@ VERSION="$(git -C "${SCRIPT_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || ech
 VERSION="${VERSION//\//-}"   # replace / with - (e.g. feat/foo → feat-foo)
 
 # ---------------------------------------------------------------------------
-# All variants (matches docker.yml matrix)
+# All variants (matches release-docker.yml matrix)
 # ---------------------------------------------------------------------------
 ALL_VARIANTS=(
     minimal
     wasm
-    go1.25
-    go1.26
-    jsc17
-    jsc21
-    node20
-    node22
-    node24
-    perl5.38
-    perl5.40
-    php8.3
-    php8.4
-    php8.5
-    python3.12
-    python3.12-slim
-    python3.13
-    python3.13-slim
-    python3.14
-    python3.14-slim
-    ruby3.3
-    ruby3.4
+    go-1.25
+    go-1.26
+    java-17
+    java-21
+    node-20
+    node-22
+    node-24
+    perl-5.38
+    perl-5.40
+    php-8.3
+    php-8.4
+    php-8.5
+    python-3.12
+    python-3.12-slim
+    python-3.13
+    python-3.13-slim
+    python-3.14
+    python-3.14-slim
+    ruby-3.3
+    ruby-3.4
 )
 
 # ---------------------------------------------------------------------------
@@ -183,7 +183,7 @@ ensure_builder() {
     case "$VARIANT" in
         minimal|wasm) IMG="ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1"
                       BDF="${SCRIPT_DIR}/Dockerfile.builder-trixie" ;;
-        php8.5)       IMG="ghcr.io/freeunitorg/freeunit-builder:php8.5-rust1.94.1"
+        php-8.5)      IMG="ghcr.io/freeunitorg/freeunit-builder:php8.5-rust1.94.1"
                       BDF="${SCRIPT_DIR}/Dockerfile.builder-php8.5" ;;
         *)            return 0 ;;  # no builder for this variant
     esac
@@ -295,7 +295,7 @@ export VERSION SCRIPT_DIR LOG_DIR USE_BUILDX PLATFORM DRY_RUN APT_PROXY USE_BUIL
 
 # ---------------------------------------------------------------------------
 # Pre-build builder images (sequential, before parallel loop)
-# Ensures minimal/wasm (share one builder) and php8.5 are pulled/built once,
+# Ensures minimal/wasm (share one builder) and php-8.5 are pulled/built once,
 # so parallel build_variant calls hit only the fast docker-inspect path.
 # ---------------------------------------------------------------------------
 if $USE_BUILDER; then
@@ -304,7 +304,7 @@ if $USE_BUILDER; then
         [[ -f "${SCRIPT_DIR}/local/Dockerfile.${_V}" ]] || continue
         case "$_V" in
             minimal|wasm) _BKEY="trixie" ;;
-            php8.5)       _BKEY="php8.5" ;;
+            php-8.5)      _BKEY="php8.5" ;;
             *)            continue ;;
         esac
         if [[ -z "${_BUILDER_SEEN[$_BKEY]:-}" ]]; then

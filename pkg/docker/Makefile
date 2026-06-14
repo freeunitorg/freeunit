@@ -8,7 +8,7 @@ DEFAULT_VERSION := $(NXT_VERSION)
 VERSION ?= $(DEFAULT_VERSION)
 PATCHLEVEL ?= 1
 
-MODULES ?= go jsc node perl php python ruby wasm
+MODULES ?= go java node perl php python ruby wasm
 MODULES_SLIM ?= python
 
 VARIANT ?= trixie
@@ -22,23 +22,23 @@ MODULE_PREBUILD_minimal ?= /bin/true
 
 VERSIONS_go ?=		1.25 1.26
 VARIANT_go ?=		$(VARIANT)
-$(foreach goversion, $(VERSIONS_go), $(eval CONTAINER_go$(goversion) = golang:$(goversion)-$(VARIANT_go)))
+$(foreach goversion, $(VERSIONS_go), $(eval CONTAINER_go-$(goversion) = golang:$(goversion)-$(VARIANT_go)))
 CONFIGURE_go ?=		go --go-path=$$GOPATH
 INSTALL_go ?=		go-install-src libunit-install
 RUN_go ?=			/bin/true
 MODULE_PREBUILD_go ?= /bin/true
 
-VERSIONS_jsc ?=		17 21
-VARIANT_jsc ?=		noble
-$(foreach jscversion, $(VERSIONS_jsc), $(eval CONTAINER_jsc$(jscversion) = eclipse-temurin:$(jscversion)-jdk-$(VARIANT_jsc)))
-CONFIGURE_jsc ?=	java --jars=/usr/share/unit-jsc-common/
-INSTALL_jsc ?=		java-shared-install java-install
-RUN_jsc ?=	 		rm -rf /root/.m2
-MODULE_PREBUILD_jsc ?= /bin/true
+VERSIONS_java ?=	17 21
+VARIANT_java ?=		noble
+$(foreach javaversion, $(VERSIONS_java), $(eval CONTAINER_java-$(javaversion) = eclipse-temurin:$(javaversion)-jdk-$(VARIANT_java)))
+CONFIGURE_java ?=	java --jars=/usr/share/unit-jsc-common/
+INSTALL_java ?=		java-shared-install java-install
+RUN_java ?=	 		rm -rf /root/.m2
+MODULE_PREBUILD_java ?= /bin/true
 
 VERSIONS_node ?=	20 22 24
 VARIANT_node ?=		$(VARIANT)
-$(foreach nodeversion, $(VERSIONS_node), $(eval CONTAINER_node$(nodeversion) = node:$(nodeversion)-$(VARIANT_node)))
+$(foreach nodeversion, $(VERSIONS_node), $(eval CONTAINER_node-$(nodeversion) = node:$(nodeversion)-$(VARIANT_node)))
 CONFIGURE_node ?=	nodejs --node-gyp=/usr/local/bin/node-gyp
 INSTALL_node ?=		node node-install libunit-install
 RUN_node ?=			rm -rf /root/.cache/ \&\& rm -rf /root/.npm
@@ -46,7 +46,7 @@ MODULE_PREBUILD_node ?=	npm -g install node-gyp
 
 VERSIONS_perl ?=	5.38 5.40
 VARIANT_perl ?=		$(VARIANT)
-$(foreach perlversion, $(VERSIONS_perl), $(eval CONTAINER_perl$(perlversion) = perl:$(perlversion)-$(VARIANT_perl)))
+$(foreach perlversion, $(VERSIONS_perl), $(eval CONTAINER_perl-$(perlversion) = perl:$(perlversion)-$(VARIANT_perl)))
 CONFIGURE_perl ?=	perl
 INSTALL_perl ?=		perl-install
 RUN_perl ?=			/bin/true
@@ -54,7 +54,7 @@ MODULE_PREBUILD_perl ?=	/bin/true
 
 VERSIONS_php ?=		8.3 8.4 8.5
 VARIANT_php ?=		cli-$(VARIANT)
-$(foreach phpversion, $(VERSIONS_php), $(eval CONTAINER_php$(phpversion) = php:$(phpversion)-$(VARIANT_php)))
+$(foreach phpversion, $(VERSIONS_php), $(eval CONTAINER_php-$(phpversion) = php:$(phpversion)-$(VARIANT_php)))
 CONFIGURE_php ?=	php
 INSTALL_php ?=		php-install
 RUN_php ?=			ldconfig
@@ -62,8 +62,8 @@ MODULE_PREBUILD_php ?= /bin/true
 
 VERSIONS_python ?=  3.12 3.13 3.14
 VARIANT_python ?=	$(VARIANT)
-$(foreach pythonversion, $(VERSIONS_python), $(eval CONTAINER_python$(pythonversion) = python:$(pythonversion)-$(VARIANT_python)))
-$(foreach pythonversion, $(VERSIONS_python), $(eval CONTAINER_python$(pythonversion)-slim = python:$(pythonversion)-slim-$(VARIANT_python)))
+$(foreach pythonversion, $(VERSIONS_python), $(eval CONTAINER_python-$(pythonversion) = python:$(pythonversion)-$(VARIANT_python)))
+$(foreach pythonversion, $(VERSIONS_python), $(eval CONTAINER_python-$(pythonversion)-slim = python:$(pythonversion)-slim-$(VARIANT_python)))
 CONFIGURE_python ?=	python --config=/usr/local/bin/python3-config
 INSTALL_python ?=	python3-install
 RUN_python ?=		/bin/true
@@ -71,7 +71,7 @@ MODULE_PREBUILD_python ?= /bin/true
 
 VERSIONS_ruby ?=	3.3 3.4
 VARIANT_ruby ?=		$(VARIANT)
-$(foreach rubyversion, $(VERSIONS_ruby), $(eval CONTAINER_ruby$(rubyversion) = ruby:$(rubyversion)-$(VARIANT_ruby)))
+$(foreach rubyversion, $(VERSIONS_ruby), $(eval CONTAINER_ruby-$(rubyversion) = ruby:$(rubyversion)-$(VARIANT_ruby)))
 CONFIGURE_ruby ?=	ruby
 INSTALL_ruby ?=		ruby-install
 RUN_ruby ?=			gem install rack \&\& rm -rf /root/.local
@@ -91,8 +91,8 @@ endef
 default:
 	@echo "valid targets: all build dockerfiles library clean"
 
-MODVERSIONS = $(foreach module, $(MODULES), $(foreach modversion, $(shell for v in $(VERSIONS_$(module)); do echo $$v; done | sort -r), $(module)$(modversion)))
-MODVERSIONS += $(foreach module, $(MODULES_SLIM), $(foreach modversion, $(shell for v in $(VERSIONS_$(module)); do echo $$v; done | sort -r), $(module)$(modversion)-slim))
+MODVERSIONS = $(foreach module, $(MODULES), $(foreach modversion, $(shell for v in $(VERSIONS_$(module)); do echo $$v; done | sort -r), $(module)-$(modversion)))
+MODVERSIONS += $(foreach module, $(MODULES_SLIM), $(foreach modversion, $(shell for v in $(VERSIONS_$(module)); do echo $$v; done | sort -r), $(module)-$(modversion)-slim))
 MODVERSIONS += wasm minimal
 
 modname = $(shell echo $1 | /usr/bin/tr -d '.01234567890-' | sed 's/slim//')

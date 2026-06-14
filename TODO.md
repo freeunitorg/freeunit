@@ -91,7 +91,7 @@ Result: `ghcr.io/freeunitorg/freeunit:latest-rust1.x` — write, compile, and se
 Rust WASM apps from a single container. No external toolchain, no separate build step.
 
 - [ ] Create `pkg/docker/Dockerfile.rust1.x` based on `rust:1-slim-trixie`
-- [ ] Add `rust1.x` to `docker.yml` CI matrix
+- [ ] Add `rust1.x` to `release-docker.yml` CI matrix
 - [ ] Add `rust1.x` to `ALL_VARIANTS` in `build-local.sh`
 - [ ] Add `rust1.x` to variants table in `pkg/docker/README.md`
 - [ ] Test: compile a minimal axum→WASM app and serve via FreeUnit wasm runtime
@@ -450,7 +450,7 @@ Before the OpenSSL 3.6 migration can be considered fully validated:
 - [ ] Verify that the `openssl-3.x` branch (if it exists upstream or as a
       fork reference) still applies cleanly on top of `master` with the new
       `OBJ_sn2nid` / `OpenSSL_version_num` replacements.
-- [ ] Run the full CI matrix (`ci.yml`) and confirm the new "Build OpenSSL 3.6"
+- [ ] Run the full CI matrix (`build-test.yml`) and confirm the new "Build OpenSSL 3.6"
       step succeeds on both `amd64` and `arm64` runners.
 - [x] `clang-ast` workflow passes on `debian:testing` + system OpenSSL 1.1
       via `./test/run-local-full.sh` (verified on `pre-1.35.5` branch).
@@ -703,7 +703,7 @@ Value: "compile and run Rust WASM apps with a single FreeUnit container" — no 
 build step, no external toolchain. Works today via existing wasm runtime.
 
 - [ ] Check `rust:1-slim-trixie` exists on Docker Hub and is suitable as base
-- [ ] Add `Dockerfile.rust1.x` to `pkg/docker/` and `docker.yml` matrix
+- [ ] Add `Dockerfile.rust1.x` to `pkg/docker/` and `release-docker.yml` matrix
 - [ ] Add `rust1.x` to `build-local.sh` ALL_VARIANTS
 
 ---

@@ -1,6 +1,6 @@
-FROM perl:5.40-trixie
+FROM node:20-trixie
 
-LABEL org.opencontainers.image.title="FreeUnit (perl5.40)"
+LABEL org.opencontainers.image.title="FreeUnit (node-20)"
 LABEL org.opencontainers.image.description="Community build of FreeUnit for Docker."
 LABEL org.opencontainers.image.url="https://freeunit.org"
 LABEL org.opencontainers.image.source="https://github.com/freeunitorg/freeunit"
@@ -69,14 +69,14 @@ RUN set -ex \
     && make -j $NCPU unitd \
     && install -pm755 build/sbin/unitd /usr/sbin/unitd \
     && make clean \
-    && /bin/true \
+    && npm -g install node-gyp \
     && ./configure $CONFIGURE_ARGS_MODULES --cc-opt="$CC_OPT" --modulesdir=/usr/lib/unit/debug-modules --debug \
-    && ./configure perl \
-    && make -j $NCPU perl-install \
+    && ./configure nodejs --node-gyp=/usr/local/bin/node-gyp \
+    && make -j $NCPU node node-install libunit-install \
     && make clean \
     && ./configure $CONFIGURE_ARGS_MODULES --cc-opt="$CC_OPT" --modulesdir=/usr/lib/unit/modules \
-    && ./configure perl \
-    && make -j $NCPU perl-install \
+    && ./configure nodejs --node-gyp=/usr/local/bin/node-gyp \
+    && make -j $NCPU node node-install libunit-install \
     && cd \
     && rm -rf /usr/src/unit \
     && for f in /usr/sbin/unitd /usr/lib/unit/modules/*.unit.so; do \
@@ -85,7 +85,7 @@ RUN set -ex \
        done \
     && apt-mark showmanual | xargs apt-mark auto > /dev/null \
     && { [ -z "$savedAptMark" ] || apt-mark manual $savedAptMark; } \
-    && /bin/true \
+    && rm -rf /root/.cache/ && rm -rf /root/.npm \
     && mkdir -p /var/lib/unit/ \
     && mkdir -p /docker-entrypoint.d/ \
     && groupadd --gid 999 unit \

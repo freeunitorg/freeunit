@@ -1,4 +1,4 @@
-name: ci
+name: "Build & Test (Linux)"
 
 on:
   pull_request:
@@ -9,7 +9,7 @@ on:
       - 'src/**'
       - 'test/**'
       - 'pkg/contrib/**'
-      - '.github/workflows/ci.yml'
+      - '.github/workflows/build-test.yml'
   push:
     branches: master
     paths:
@@ -19,7 +19,7 @@ on:
       - 'src/**'
       - 'test/**'
       - 'pkg/contrib/**'
-      - '.github/workflows/ci.yml'
+      - '.github/workflows/build-test.yml'
 
 jobs:
   test:
@@ -42,6 +42,8 @@ jobs:
             os: ubuntu-latest
           - build: java-20
             os: ubuntu-latest
+          - build: node-20
+            os: ubuntu-latest
           - build: node-22
             os: ubuntu-latest
           - build: node-24
@@ -59,6 +61,8 @@ jobs:
           - build: python-3.11
             os: ubuntu-latest
           - build: python-3.12
+            os: ubuntu-latest
+          - build: python-3.13
             os: ubuntu-latest
           - build: python-3.14
             os: ubuntu-latest
@@ -415,7 +419,7 @@ jobs:
           sudo cp test/fake_upstream/target/release/fake_upstream /usr/local/bin/
 
       - name: Build fake_otlp
-        if: steps.metadata.outputs.module == 'unit'
+        if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
         run: |
           rustup toolchain install stable --no-self-update --profile minimal
           cargo build --release --manifest-path test/fake_otlp/Cargo.toml
