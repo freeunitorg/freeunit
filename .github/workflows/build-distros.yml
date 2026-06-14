@@ -108,7 +108,18 @@ jobs:
       # wasmtime version is pinned in pkg/contrib/src/wasmtime/version and
       # built from a checksum-verified source tarball — same as build-test.
       # Keeps the wasm runtime in sync with what Unit is actually built against.
+      # Cache the compiled artifacts (keyed by the pinned version + this distro,
+      # so it never mixes with the ubuntu/debian glibc builds) to skip the slow
+      # from-source compile on a hit.
+      - name: Cache wasmtime
+        id: cache-wasmtime
+        uses: actions/cache@v5
+        with:
+          path: pkg/contrib/wasmtime/artifacts
+          key: wasmtime-fedora-rawhide-${{ runner.arch }}-${{ hashFiles('pkg/contrib/src/wasmtime/version') }}
+
       - name: Build wasmtime (pinned via pkg/contrib)
+        if: steps.cache-wasmtime.outputs.cache-hit != 'true'
         run: make -C pkg/contrib .wasmtime
 
       - name: configure unit-wasm

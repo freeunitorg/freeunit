@@ -89,7 +89,20 @@ jobs:
       # wasmtime version is pinned in pkg/contrib/src/wasmtime/version and
       # built from a checksum-verified source tarball — same as build-test.
       # Keeps the wasm runtime in sync with what Unit is actually built against.
+      # Cache the compiled artifacts (keyed by pinned version + this distro,
+      # isolated from the ubuntu/fedora builds) to skip the slow from-source
+      # compile on a hit.
+      - name: Cache wasmtime
+        id: cache-wasmtime
+        uses: actions/cache@v5
+        with:
+          path: pkg/contrib/wasmtime/artifacts
+          key: wasmtime-debian-testing-${{ runner.arch }}-${{ hashFiles('pkg/contrib/src/wasmtime/version') }}
+
+      - name: Build wasmtime (pinned via pkg/contrib)
+        if: steps.cache-wasmtime.outputs.cache-hit != 'true'
+        run: make -C pkg/contrib .wasmtime
+
       - name: Build wasm language module
         run: |
-          make -C pkg/contrib .wasmtime
           ./configure wasm --include-path=pkg/contrib/wasmtime/artifacts/include --lib-path=pkg/contrib/wasmtime/artifacts/lib --rpath && make wasm
