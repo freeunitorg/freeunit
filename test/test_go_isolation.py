@@ -2,6 +2,7 @@ import grp
 import json
 import os
 import pwd
+import socket
 import time
 
 import pytest
@@ -327,19 +328,41 @@ def _reload_and_poll_mounts(isolation):
     # generation until it serves before inspecting its mounts.
     client.load('ns_inspect', isolation=isolation)
 
-    resp = None
+    # During the reload swap the new worker generation can refuse the
+    # connection, accept it but not answer, or serve a transient 503 (text/html)
+    # before its mount namespace is up. The test client is not built for polling
+    # an unstable endpoint, so do it carefully here:
+    #   * own the socket and ALWAYS close it — a leaked client socket keeps the
+    #     router-side fd open and trips the fd-leak teardown check (#60 follow-up);
+    #   * pass a short read_timeout so a stalled generation doesn't block on the
+    #     default 60s (which would also hard-fail via pytest.fail);
+    #   * treat any transient (refused/empty/non-200/parse error) as "retry".
+    # Decode JSON only once the app actually serves 200.
+    last = None
     for _ in range(50):
-        # Use a raw GET, not getjson(): during the reload the new generation
-        # transiently answers 503 with a text/html error page, which trips
-        # getjson()'s Content-Type==application/json assertion before this retry
-        # loop can react. Decode JSON only once the app actually serves 200.
-        resp = client.get(url='/?mounts=true')
-        if resp['status'] == 200:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        resp = None
+        try:
+            sock.connect(('127.0.0.1', 8080))
+            resp = client.get(url='/?mounts=true', sock=sock, read_timeout=2)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:  # pytest.fail() raises a BaseException
+            last = repr(exc)
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+        if isinstance(resp, dict) and resp.get('status') == 200:
             return json.loads(resp['body'])
+        if isinstance(resp, dict):
+            last = f"status={resp.get('status')}"
         time.sleep(0.1)
 
-    status = resp['status'] if resp is not None else None
-    pytest.fail(f'app not ready after reload (status={status})')
+    pytest.fail(f'app not ready after reload ({last})')
 
 
 def _assert_rootfs_tmpfs_toggle_stable(is_su, require, temp_dir, iterations):
