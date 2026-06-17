@@ -30,7 +30,7 @@ umask 022
 case "$1" in
     start)
        	log_daemon_msg "Starting $DESC" "$NAME"
-        if start-stop-daemon --start --quiet --pidfile %%RUNDIR%%/$NAME.pid \
+        if start-stop-daemon --start --quiet --pidfile $PIDFILE \
                 --exec $DAEMON -- $DAEMON_ARGS; then
                 log_end_msg 0
         else
@@ -42,7 +42,7 @@ case "$1" in
         ;;
     stop)
         log_daemon_msg "Stopping $DESC" "$NAME"
-        if start-stop-daemon --oknodo --stop --quiet --pidfile %%RUNDIR%%/$NAME.pid \
+        if start-stop-daemon --oknodo --stop --quiet --pidfile $PIDFILE \
                 --exec $DAEMON; then
                 log_end_msg 0
         else
@@ -64,10 +64,10 @@ case "$1" in
         log_action_begin_msg "Restarting $DESC" "$NAME"
 
         start-stop-daemon --stop --quiet --pidfile \
-                %%RUNDIR%%/$NAME.pid --exec $DAEMON || true
+                $PIDFILE --exec $DAEMON || true
         sleep 1
         if start-stop-daemon --start --quiet --pidfile \
-                %%RUNDIR%%/$NAME.pid --exec $DAEMON -- $DAEMON_ARGS; then
+                $PIDFILE --exec $DAEMON -- $DAEMON_ARGS; then
                 log_end_msg 0
         else
                 log_end_msg 1
