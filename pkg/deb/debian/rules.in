@@ -19,8 +19,8 @@ CODENAME := $(shell lsb_release -cs)
 
 BUILDDIR_unit = $(CURDIR)/debian/build-unit
 BUILDDIR_unit_debug = $(CURDIR)/debian/build-unit-debug
-INSTALLDIR = $(CURDIR)/debian/unit
-INSTALLDIR_dev = $(CURDIR)/debian/unit-dev
+INSTALLDIR = $(CURDIR)/debian/%%PACKAGE%%
+INSTALLDIR_dev = $(CURDIR)/debian/%%PACKAGE%%-dev
 BASEDIR = $(CURDIR)
 
 DOTESTS = 0
@@ -59,8 +59,9 @@ configure.unit: config.env.unit
 	PKG_CONFIG_PATH=$(CURDIR)/pkg/contrib/njs/build \
 	CFLAGS= ./configure \
 		%%CONFIGURE_ARGS%% \
-		--modulesdir=/usr/lib/unit/modules \
+		--modulesdir=/usr/lib/%%RUNTIME%%/modules \
 		--libdir=/usr/lib/$(DEB_HOST_MULTIARCH) \
+		--pkgconfigdir=/usr/lib/$(DEB_HOST_MULTIARCH)/pkgconfig \
 		--cc-opt="$(CFLAGS)" \
 		--ld-opt="$(LDFLAGS)"
 	touch $@
@@ -70,7 +71,7 @@ configure.unit_debug: config.env.unit_debug
 	PKG_CONFIG_PATH=$(CURDIR)/pkg/contrib/njs/build \
 	CFLAGS= ./configure \
 		%%CONFIGURE_ARGS%% \
-		--modulesdir=/usr/lib/unit/debug-modules \
+		--modulesdir=/usr/lib/%%RUNTIME%%/debug-modules \
 		--libdir=/usr/lib/$(DEB_HOST_MULTIARCH) \
 		--cc-opt="$(CFLAGS)" \
 		--ld-opt="$(LDFLAGS)" \
@@ -118,21 +119,39 @@ install: build do.tests
 	dh_testroot
 	dh_prep
 	dh_installdirs
-	dh_installsystemd -punit --name=unit unit.service
-	dh_installsystemd -punit --name=unit-debug --no-start --no-enable unit-debug.service
+	dh_installsystemd -p%%PACKAGE%% --name=%%RUNTIME%% %%RUNTIME%%.service
+	dh_installsystemd -p%%PACKAGE%% --name=%%RUNTIME%%-debug --no-start --no-enable %%RUNTIME%%-debug.service
+	# SysV init (debian/%%PACKAGE%%.init) and its /etc/default/%%RUNTIME%% env
+	# file, for hosts without systemd. On systemd hosts the .service above wins;
+	# --no-start avoids racing dh_installsystemd's own start of the same unit.
+	dh_installinit -p%%PACKAGE%% --name=%%RUNTIME%% --no-start
 	dh_installlogrotate
 	cd $(BUILDDIR_unit) && DESTDIR=$(INSTALLDIR) make install E=0
+	# The build always emits the daemon as "unitd" (NXT_DAEMON). For a rebrand
+	# (RUNTIME != unit) install it under the branded name; for the drop-in
+	# default this is a no-op.
+	[ "unitd" = "%%RUNTIME%%d" ] || mv $(INSTALLDIR)/usr/sbin/unitd $(INSTALLDIR)/usr/sbin/%%RUNTIME%%d
+	# The build installs the man page as unitd.8. For a rebrand (RUNTIME != unit)
+	# the daemon is %%RUNTIME%%d, so add a %%RUNTIME%%d.8 alias symlink (dh_compress
+	# repoints it at the compressed page); `man %%RUNTIME%%d` then works and the
+	# original `man unitd` still resolves. The drop-in default is a no-op.
+	[ "unitd" = "%%RUNTIME%%d" ] || ln -s unitd.8 $(INSTALLDIR)/usr/share/man/man8/%%RUNTIME%%d.8
 	cd $(BUILDDIR_unit) && DESTDIR=$(INSTALLDIR_dev) make libunit-install
+	# libunit-install always emits the pkg-config file as "unit.pc". For a
+	# rebrand (RUNTIME != unit) install it under the branded name so
+	# `pkg-config %%RUNTIME%%` resolves; the drop-in default is a no-op. The
+	# multiarch pkgconfig dir is set via --pkgconfigdir at configure time.
+	[ "unit.pc" = "%%RUNTIME%%.pc" ] || mv $(INSTALLDIR_dev)/usr/lib/$(DEB_HOST_MULTIARCH)/pkgconfig/unit.pc $(INSTALLDIR_dev)/usr/lib/$(DEB_HOST_MULTIARCH)/pkgconfig/%%RUNTIME%%.pc
 	install -m 755 $(BUILDDIR_unit)/tools/unitc $(INSTALLDIR)/usr/bin/unitc
 	install -m 755 $(BUILDDIR_unit)/tools/setup-unit $(INSTALLDIR)/usr/bin/setup-unit
-	install -m 755 $(BUILDDIR_unit_debug)/build/sbin/unitd $(INSTALLDIR)/usr/sbin/unitd-debug
+	install -m 755 $(BUILDDIR_unit_debug)/build/sbin/unitd $(INSTALLDIR)/usr/sbin/%%RUNTIME%%d-debug
 	install -m 644 $(BUILDDIR_unit_debug)/build/lib/libunit.a $(INSTALLDIR_dev)/usr/lib/$(DEB_HOST_MULTIARCH)/libunit-debug.a
-	mkdir -p $(INSTALLDIR)/usr/share/doc/unit/examples
-	install -m 644 debian/unit.example.config $(INSTALLDIR)/usr/share/doc/unit/examples/example.config
-	install -m 644 CHANGES $(INSTALLDIR)/usr/share/doc/unit/changelog
-	install -m 644 README.md $(INSTALLDIR)/usr/share/doc/unit/
-	install -m 644 CONTRIBUTING.md $(INSTALLDIR)/usr/share/doc/unit/
-	install -m 644 NOTICE $(INSTALLDIR)/usr/share/doc/unit/
+	mkdir -p $(INSTALLDIR)/usr/share/doc/%%PACKAGE%%/examples
+	install -m 644 debian/unit.example.config $(INSTALLDIR)/usr/share/doc/%%PACKAGE%%/examples/example.config
+	install -m 644 CHANGES $(INSTALLDIR)/usr/share/doc/%%PACKAGE%%/changelog
+	install -m 644 README.md $(INSTALLDIR)/usr/share/doc/%%PACKAGE%%/
+	install -m 644 CONTRIBUTING.md $(INSTALLDIR)/usr/share/doc/%%PACKAGE%%/
+	install -m 644 NOTICE $(INSTALLDIR)/usr/share/doc/%%PACKAGE%%/
 	mkdir -p $(INSTALLDIR_dev)/usr/include/unit
 	install -m644 $(CURDIR)/pkg/contrib/libunit-wasm/src/c/libunit-wasm.a $(INSTALLDIR_dev)/usr/lib/$(DEB_HOST_MULTIARCH)/libunit-wasm.a
 	install -m644 $(CURDIR)/pkg/contrib/libunit-wasm/src/c/include/unit/unit-wasm.h $(INSTALLDIR_dev)/usr/include/unit/
@@ -143,10 +162,11 @@ binary-indep: build install
 	dh_installdocs
 	dh_installchangelogs
 	dh_link
-	dh_strip --dbg-package=unit-dbg
+	dh_strip --dbg-package=%%PACKAGE%%-dbg
 	dh_shlibdeps
 	dh_compress
 	dh_fixperms
+	dh_lintian
 	dh_installdeb
 	dh_perl
 	dh_gencontrol

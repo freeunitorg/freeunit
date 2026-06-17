@@ -1,7 +1,7 @@
 MODULES+=			python27
 MODULE_SUFFIX_python27=		python2.7
 
-MODULE_SUMMARY_python27=	Python 2.7 module for FreeUnit
+MODULE_SUMMARY_python27=	Python 2.7 module for $(BRAND_TITLE)
 
 MODULE_VERSION_python27=	$(VERSION)
 MODULE_RELEASE_python27=	1
@@ -10,8 +10,8 @@ MODULE_CONFARGS_python27=	python --config=python2.7-config
 MODULE_MAKEARGS_python27=	python2.7
 MODULE_INSTARGS_python27=	python2.7-install
 
-MODULE_SOURCES_python27=	unit.example-python-app \
-				unit.example-python2.7-config
+MODULE_SOURCES_python27=	freeunit.example-python-app \
+				freeunit.example-python2.7-config
 
 BUILD_DEPENDS_python27=	python2.7-dev
 BUILD_DEPENDS+=		$(BUILD_DEPENDS_python27)
@@ -19,9 +19,9 @@ BUILD_DEPENDS+=		$(BUILD_DEPENDS_python27)
 MODULE_BUILD_DEPENDS_python27=,python2.7-dev
 
 define MODULE_PREINSTALL_python27
-	mkdir -p debian/unit-python2.7/usr/share/doc/unit-python2.7/examples/python-app
-	install -m 644 -p debian/unit.example-python-app debian/unit-python2.7/usr/share/doc/unit-python2.7/examples/python-app/wsgi.py
-	install -m 644 -p debian/unit.example-python2.7-config debian/unit-python2.7/usr/share/doc/unit-python2.7/examples/unit.config
+	mkdir -p debian/$(BRAND)-python2.7/usr/share/doc/$(BRAND)-python2.7/examples/python-app
+	install -m 644 -p debian/freeunit.example-python-app debian/$(BRAND)-python2.7/usr/share/doc/$(BRAND)-python2.7/examples/python-app/wsgi.py
+	install -m 644 -p debian/freeunit.example-python2.7-config debian/$(BRAND)-python2.7/usr/share/doc/$(BRAND)-python2.7/examples/$(BRAND).config
 endef
 export MODULE_PREINSTALL_python27
 
@@ -33,12 +33,12 @@ The $(MODULE_SUMMARY_python27) has been installed.
 
 To check out the sample app, run these commands:
 
- sudo service unit restart
- cd /usr/share/doc/unit-$(MODULE_SUFFIX_python27)/examples
- sudo curl -X PUT --data-binary @unit.config --unix-socket /var/run/control.unit.sock http://localhost/config
+ sudo service $(RUNTIME) restart
+ cd /usr/share/doc/$(BRAND)-$(MODULE_SUFFIX_python27)/examples
+ $(MODULE_CONFIG_PUT)
  curl http://localhost:8400/
 
-Online documentation is available at https://docs.freeunit.org
+Online documentation is available at $(DOCS_URL)
 
 ----------------------------------------------------------------------
 BANNER

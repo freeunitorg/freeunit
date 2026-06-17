@@ -3,7 +3,7 @@
 		"example_ruby": {
 			"type": "ruby",
 			"processes": 2,
-			"script": "/usr/share/doc/unit-ruby/examples/ruby-app.ru"
+			"script": "/usr/share/doc/%%NAME%%/examples/ruby-app.ru"
 		}
 	},
 

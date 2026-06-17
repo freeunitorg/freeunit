@@ -1,0 +1,45 @@
+#!/bin/sh
+
+set -e
+
+if [ "$1" != "configure" ]; then
+    exit 0
+fi
+
+if [ -n "$2" ]; then
+    if dpkg --compare-versions "${2%%-*}" le "1.21.0"; then
+      cat <<BANNER
+----------------------------------------------------------------------
+
+WARNING:
+
+Since version 1.22.0, %%BRAND_TITLE%%'s non-privileged processes run as
+%%RUNTIME%%:%%RUNTIME%% by default.  Review your system permissions and
+%%BRAND_TITLE%% configuration so apps and routes that relied on these processes
+running as nobody:nogroup stay working.
+
+More info: %%DOCS_URL%%/installation/#official-packages
+
+----------------------------------------------------------------------
+BANNER
+    fi
+fi
+
+if ! getent group %%RUNTIME%% >/dev/null; then
+    groupadd --system %%RUNTIME%% >/dev/null
+fi
+
+if ! getent passwd %%RUNTIME%% >/dev/null; then
+    useradd \
+      --system \
+      --gid %%RUNTIME%% \
+      --no-create-home \
+      --home /nonexistent \
+      --comment "%%RUNTIME%% user" \
+      --shell /bin/false \
+      %%RUNTIME%% >/dev/null
+fi
+
+#DEBHELPER#
+
+exit 0

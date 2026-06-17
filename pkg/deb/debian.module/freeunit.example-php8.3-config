@@ -1,9 +1,9 @@
 {
 	"applications": {
 		"example_php": {
-			"type": "php",
+			"type": "php 8.3",
 			"processes": 2,
-			"root": "/usr/share/doc/unit-php/examples/phpinfo-app",
+			"root": "/usr/share/doc/%%NAME%%/examples/phpinfo-app",
 			"index": "index.php"
 		}
 	},

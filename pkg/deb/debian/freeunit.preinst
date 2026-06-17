@@ -7,12 +7,12 @@ case "$1" in
         cat <<BANNER
 ----------------------------------------------------------------------
 
-Thank you for installing NGINX Unit!
+Thank you for installing %%BRAND_TITLE%%!
 
 Additional modules are available in standalone packages.
-To see the available modules, run: apt search --names-only '^unit-'
+To see the available modules, run: apt search --names-only '^%%PACKAGE%%-'
 
-Online documentation is available at https://unit.nginx.org/
+Online documentation is available at %%DOCS_URL%%
 
 ----------------------------------------------------------------------
 BANNER
@@ -26,7 +26,7 @@ BANNER
 
     *)
         echo "preinst called with unknown argument \`$1'" >&2
-        exit 0
+        exit 1
         ;;
 esac
 
