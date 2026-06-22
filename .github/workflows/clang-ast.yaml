@@ -46,7 +46,7 @@ jobs:
             [ -f "$f" ] && ln -sf "$f" /usr/lib/$(basename "$f") || true
           done
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Checkout and build clang-ast
         run: |
