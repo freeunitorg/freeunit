@@ -757,6 +757,22 @@ nxt_isolation_unmount_all(nxt_task_t *task, nxt_process_t *process)
 
     nxt_debug(task, "unmount all (%s)", process->name);
 
+#if (NXT_HAVE_CLONE_NEWNS)
+    /*
+     * A worker that ran in its own mount namespace had all of its mounts
+     * reaped by the kernel when that namespace died on process exit.
+     * Unmounting the same host paths here is both pointless (the mounts are
+     * not present in the host namespace — this is the EINVAL we used to log)
+     * and unsafe: it races the next worker generation's prototype, which
+     * mounts the identical <rootfs>/proc path (freeunitorg/freeunit#83).
+     * The non-namespaced (chroot) path below still needs the host-side
+     * umount2, so only skip when CLONE_NEWNS was in effect.
+     */
+    if (nxt_is_clone_flag_set(process->isolation.clone.flags, NEWNS)) {
+        return;
+    }
+#endif
+
     automount = &process->isolation.automount;
     mounts = process->isolation.mounts;
     n = mounts->nelts;
@@ -790,6 +806,30 @@ nxt_isolation_prepare_rootfs(nxt_task_t *task, nxt_process_t *process)
 
     n = mounts->nelts;
     mnt = mounts->elts;
+
+#if (NXT_HAVE_CLONE_NEWNS)
+    /*
+     * unshare(CLONE_NEWNS) copies the host mount tree *and* its propagation
+     * type.  On a systemd host "/" (and "/tmp", where a rootfs often lives) is
+     * MS_SHARED, so the new namespace starts as a peer of the host and the
+     * mounts below would propagate out to it.  pivot_root() only severs
+     * propagation later (nxt_isolation_pivot_root), so during this loop a
+     * concurrent host-side umount2(<rootfs>/proc) from the previous worker
+     * generation's teardown races our mount of the same path, yielding a
+     * transient "mount(...proc...) ENOENT" and a respawn storm
+     * (freeunitorg/freeunit#83).
+     *
+     * Detach the whole namespace from the host peer group *before* mounting.
+     * MS_PRIVATE (not MS_SLAVE) is required: a slave still receives propagation
+     * from its former master, so a host umount would propagate back in.
+     */
+    if (nxt_is_clone_flag_set(process->isolation.clone.flags, NEWNS)) {
+        if (nxt_slow_path(mount("", "/", "", MS_REC | MS_PRIVATE, "") != 0)) {
+            nxt_alert(task, "mount(\"/\", MS_REC|MS_PRIVATE) %E", nxt_errno);
+            return NXT_ERROR;
+        }
+    }
+#endif
 
     for (i = 0; i < n; i++) {
         dst = mnt[i].dst;
