@@ -54,35 +54,21 @@ VERSION="$(git -C "${SCRIPT_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || ech
 VERSION="${VERSION//\//-}"   # replace / with - (e.g. feat/foo → feat-foo)
 
 # ---------------------------------------------------------------------------
-# All variants (matches release-docker.yml matrix)
+# All variants — derived from pkg/eol.json (single source of truth, same list
+# release-docker.yml builds). <runtime>-<version>; a null version (wasm,
+# minimal) -> just <runtime>; "slim": true adds a -slim sibling.
 # ---------------------------------------------------------------------------
-ALL_VARIANTS=(
-    minimal
-    wasm
-    go-1.25
-    go-1.26
-    java-17
-    java-21
-    node-20
-    node-22
-    node-24
-    node-26
-    perl-5.38
-    perl-5.40
-    perl-5.42
-    php-8.3
-    php-8.4
-    php-8.5
-    python-3.12
-    python-3.12-slim
-    python-3.13
-    python-3.13-slim
-    python-3.14
-    python-3.14-slim
-    ruby-3.3
-    ruby-3.4
-    ruby-4.0
-)
+EOL_JSON="${SCRIPT_DIR}/../eol.json"
+if ! command -v jq &>/dev/null; then
+    echo "ERROR jq not found in PATH (required to read ${EOL_JSON})" >&2; exit 1
+fi
+mapfile -t ALL_VARIANTS < <(jq -r '
+    .runtimes | to_entries[] | .key as $rt | .value[] |
+    if .version == null then $rt
+    else ($rt + "-" + .version),
+         (if .slim then ($rt + "-" + .version + "-slim") else empty end)
+    end
+' "${EOL_JSON}")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -181,7 +167,12 @@ info "============================================================"
 # ---------------------------------------------------------------------------
 ensure_builder() {
     local VARIANT="$1"
-    # Maps variant → builder image tag and source Dockerfile
+    # Maps variant → builder image tag and source Dockerfile.
+    # The tag is a fixed reference to a pre-built image in GHCR, keyed by the
+    # builder *base* identity (trixie = Debian codename shared by minimal+wasm;
+    # php8.5 = the php builder base) — not by the dash-style app variant name.
+    # Do not "align" it to php-8.5: that would miss the existing GHCR tag and
+    # silently fall back to a local build.
     local IMG BDF
     case "$VARIANT" in
         minimal|wasm) IMG="ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1"

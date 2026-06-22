@@ -436,27 +436,22 @@ def _assert_rootfs_tmpfs_toggle_stable(is_su, require, temp_dir, iterations):
         _reload_and_poll_mounts(isolation, want_tmpfs=True)
 
 
-# Under a rapid same-rootfs reload loop, the previous worker's mount-ns
-# teardown races the new prototype's proc mount; the loser logs a benign
-# transient "[alert] mount(... /proc ...) No such file or directory" before
-# its generation is discarded. The final-state asserts still verify each
-# surviving generation is correct, so skip only this specific alert.
-_TMPFS_RELOAD_ALERT = r'mount\(.*proc.*\) \(2: No such file or directory\)'
-
-
-def test_go_isolation_rootfs_automount_tmpfs(
-    is_su, require, temp_dir, skip_alert
-):
-    skip_alert(_TMPFS_RELOAD_ALERT)
+# The "[alert] mount(... /proc ...) No such file or directory" transient from
+# the rootfs automount reload race is fixed in nxt_isolation.c
+# (freeunitorg/freeunit#83): the per-worker mount namespace is made
+# MS_REC|MS_PRIVATE before mounting and its mounts are reaped with the
+# namespace instead of a racy host-side umount2. The alert must no longer
+# appear, so it is intentionally NOT skipped here — let it fail as a hard
+# regression guard if the race ever returns.
+def test_go_isolation_rootfs_automount_tmpfs(is_su, require, temp_dir):
     _assert_rootfs_tmpfs_toggle_stable(
         is_su, require, temp_dir, iterations=20
     )
 
 
 def test_go_isolation_rootfs_automount_tmpfs_regression(
-    is_su, require, temp_dir, skip_alert
+    is_su, require, temp_dir
 ):
-    skip_alert(_TMPFS_RELOAD_ALERT)
     _assert_rootfs_tmpfs_toggle_stable(
         is_su, require, temp_dir, iterations=100
     )

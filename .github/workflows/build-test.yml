@@ -21,57 +21,44 @@ on:
       - 'pkg/contrib/**'
       - '.github/workflows/build-test.yml'
 
+env:
+  # OpenSSL patch version built from source (see "Build OpenSSL" step). Only the
+  # patch level lives here; the 3.6 "slot" (/opt/openssl-3.6, OPENSSL36_* vars)
+  # is stable across patch bumps and intentionally not templated.
+  OPENSSL_VERSION: 3.6.2
+
 jobs:
+  # Single source of truth for the test matrix. The version-tested language
+  # modules (go/java/node/php/python/ruby) are derived from pkg/eol.json; the
+  # fixed extras below are not runtime-versioned in CI. Excluded on purpose:
+  # per-version perl (tested against the runner's system perl), python "-slim"
+  # and the "minimal" image — those are Docker packaging flavors, not test axes.
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      builds: ${{ steps.list.outputs.builds }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Derive build list from pkg/eol.json
+        id: list
+        run: |
+          builds=$(jq -c '
+            ["unit", "perl", "wasm", "wasm-wasi-component"]
+            + [ .runtimes | to_entries[]
+                | select(.key | IN("go", "java", "node", "php", "ruby"))
+                | .key as $rt | .value[] | $rt + "-" + .version ]
+            + [ .runtimes.python[] | "python-" + .version ]
+          ' pkg/eol.json)
+          echo "builds=${builds}" >> "$GITHUB_OUTPUT"
+
   test:
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Core
-          - build: unit
-            os: ubuntu-latest
-          # Modules
-          - build: go-1.25
-            os: ubuntu-latest
-          - build: go-1.26
-            os: ubuntu-latest
-          - build: java-17
-            os: ubuntu-latest
-          - build: java-21
-            os: ubuntu-latest
-          - build: node-20
-            os: ubuntu-latest
-          - build: node-22
-            os: ubuntu-latest
-          - build: node-24
-            os: ubuntu-latest
-          - build: node-26
-            os: ubuntu-latest
-          - build: perl
-            os: ubuntu-latest
-          - build: php-8.3
-            os: ubuntu-latest
-          - build: php-8.4
-            os: ubuntu-latest
-          - build: php-8.5
-            os: ubuntu-latest
-          - build: python-3.12
-            os: ubuntu-latest
-          - build: python-3.13
-            os: ubuntu-latest
-          - build: python-3.14
-            os: ubuntu-latest
-          - build: ruby-3.3
-            os: ubuntu-latest
-          - build: ruby-3.4
-            os: ubuntu-latest
-          - build: ruby-4.0
-            os: ubuntu-latest
-          - build: wasm
-            os: ubuntu-latest
-          - build: wasm-wasi-component
-            os: ubuntu-latest
+        build: ${{ fromJSON(needs.prepare.outputs.builds) }}
+        os: [ubuntu-latest]
 
     steps:
       - uses: actions/checkout@v5
@@ -150,16 +137,16 @@ jobs:
         uses: actions/cache@v5
         with:
           path: /opt/openssl-3.6
-          key: openssl-3.6.2-${{ runner.os }}-${{ runner.arch }}
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Build OpenSSL 3.6
         if: steps.cache-openssl36.outputs.cache-hit != 'true'
         run: |
           sudo apt-get -y install build-essential
           cd /tmp
-          wget -q https://www.openssl.org/source/openssl-3.6.2.tar.gz
-          tar -xzf openssl-3.6.2.tar.gz
-          cd openssl-3.6.2
+          wget -q "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
+          tar -xzf "openssl-${OPENSSL_VERSION}.tar.gz"
+          cd "openssl-${OPENSSL_VERSION}"
           ./Configure --prefix=/opt/openssl-3.6 shared no-docs
           make -j$(nproc)
           sudo mkdir -p /opt/openssl-3.6
@@ -455,17 +442,19 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-cargo-
 
+      - name: Install Rust toolchain
+        if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
+        run: rustup toolchain install stable --no-self-update --profile minimal
+
       - name: Build fake_upstream
         if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
         run: |
-          rustup toolchain install stable --no-self-update --profile minimal
           cargo build --release --manifest-path test/fake_upstream/Cargo.toml
           sudo cp test/fake_upstream/target/release/fake_upstream /usr/local/bin/
 
       - name: Build fake_otlp
         if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
         run: |
-          rustup toolchain install stable --no-self-update --profile minimal
           cargo build --release --manifest-path test/fake_otlp/Cargo.toml
           sudo cp test/fake_otlp/target/release/fake_otlp /usr/local/bin/
 

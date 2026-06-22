@@ -8,6 +8,7 @@ on:
       - 'auto/**'
       - 'src/**'
       - 'test/**'
+      - 'pkg/contrib/**'
       - '.github/workflows/analysis-clang-ast.yml'
   pull_request:
     branches: master
@@ -16,6 +17,7 @@ on:
       - 'auto/**'
       - 'src/**'
       - 'test/**'
+      - 'pkg/contrib/**'
       - '.github/workflows/analysis-clang-ast.yml'
 
 jobs:

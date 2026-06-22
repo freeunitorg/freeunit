@@ -8,8 +8,16 @@ DEFAULT_VERSION := $(NXT_VERSION)
 VERSION ?= $(DEFAULT_VERSION)
 PATCHLEVEL ?= 1
 
+# Runtime versions are sourced from pkg/eol.json (single source of truth, same
+# list release-docker.yml and build-local.sh build). Each VERSIONS_<module> and
+# MODULES_SLIM below default to a jq read of it; override per module on the CLI,
+# e.g. `make VERSIONS_go="1.25" dockerfiles`. The per-module build recipes
+# (CONTAINER/CONFIGURE/INSTALL/RUN) stay here — they are logic, not versions.
+EOL_JSON := ../eol.json
+eol_versions = $(shell jq -r '.runtimes["$(1)"][].version' $(EOL_JSON) | tr '\n' ' ')
+
 MODULES ?= go java node perl php python ruby wasm
-MODULES_SLIM ?= python
+MODULES_SLIM ?= $(shell jq -r '.runtimes | to_entries[] | select(any(.value[]; .slim==true)) | .key' $(EOL_JSON) | tr '\n' ' ')
 
 VARIANT ?= trixie
 
@@ -20,7 +28,7 @@ INSTALL_minimal ?=	version
 RUN_minimal ?=		/bin/true
 MODULE_PREBUILD_minimal ?= /bin/true
 
-VERSIONS_go ?=		1.25 1.26
+VERSIONS_go ?=		$(call eol_versions,go)
 VARIANT_go ?=		$(VARIANT)
 $(foreach goversion, $(VERSIONS_go), $(eval CONTAINER_go-$(goversion) = golang:$(goversion)-$(VARIANT_go)))
 CONFIGURE_go ?=		go --go-path=$$GOPATH
@@ -28,7 +36,7 @@ INSTALL_go ?=		go-install-src libunit-install
 RUN_go ?=			/bin/true
 MODULE_PREBUILD_go ?= /bin/true
 
-VERSIONS_java ?=	17 21
+VERSIONS_java ?=	$(call eol_versions,java)
 VARIANT_java ?=		noble
 $(foreach javaversion, $(VERSIONS_java), $(eval CONTAINER_java-$(javaversion) = eclipse-temurin:$(javaversion)-jdk-$(VARIANT_java)))
 CONFIGURE_java ?=	java --jars=/usr/share/unit-jsc-common/
@@ -36,7 +44,7 @@ INSTALL_java ?=		java-shared-install java-install
 RUN_java ?=	 		rm -rf /root/.m2
 MODULE_PREBUILD_java ?= /bin/true
 
-VERSIONS_node ?=	20 22 24 26
+VERSIONS_node ?=	$(call eol_versions,node)
 VARIANT_node ?=		$(VARIANT)
 $(foreach nodeversion, $(VERSIONS_node), $(eval CONTAINER_node-$(nodeversion) = node:$(nodeversion)-$(VARIANT_node)))
 CONFIGURE_node ?=	nodejs --node-gyp=/usr/local/bin/node-gyp
@@ -44,7 +52,7 @@ INSTALL_node ?=		node node-install libunit-install
 RUN_node ?=			rm -rf /root/.cache/ \&\& rm -rf /root/.npm
 MODULE_PREBUILD_node ?=	npm -g install node-gyp
 
-VERSIONS_perl ?=	5.38 5.40 5.42
+VERSIONS_perl ?=	$(call eol_versions,perl)
 VARIANT_perl ?=		$(VARIANT)
 $(foreach perlversion, $(VERSIONS_perl), $(eval CONTAINER_perl-$(perlversion) = perl:$(perlversion)-$(VARIANT_perl)))
 CONFIGURE_perl ?=	perl
@@ -52,7 +60,7 @@ INSTALL_perl ?=		perl-install
 RUN_perl ?=			/bin/true
 MODULE_PREBUILD_perl ?=	/bin/true
 
-VERSIONS_php ?=		8.3 8.4 8.5
+VERSIONS_php ?=		$(call eol_versions,php)
 VARIANT_php ?=		cli-$(VARIANT)
 $(foreach phpversion, $(VERSIONS_php), $(eval CONTAINER_php-$(phpversion) = php:$(phpversion)-$(VARIANT_php)))
 CONFIGURE_php ?=	php
@@ -60,7 +68,7 @@ INSTALL_php ?=		php-install
 RUN_php ?=			ldconfig
 MODULE_PREBUILD_php ?= /bin/true
 
-VERSIONS_python ?=  3.12 3.13 3.14
+VERSIONS_python ?=  $(call eol_versions,python)
 VARIANT_python ?=	$(VARIANT)
 $(foreach pythonversion, $(VERSIONS_python), $(eval CONTAINER_python-$(pythonversion) = python:$(pythonversion)-$(VARIANT_python)))
 $(foreach pythonversion, $(VERSIONS_python), $(eval CONTAINER_python-$(pythonversion)-slim = python:$(pythonversion)-slim-$(VARIANT_python)))
@@ -69,7 +77,7 @@ INSTALL_python ?=	python3-install
 RUN_python ?=		/bin/true
 MODULE_PREBUILD_python ?= /bin/true
 
-VERSIONS_ruby ?=	3.3 3.4 4.0
+VERSIONS_ruby ?=	$(call eol_versions,ruby)
 VARIANT_ruby ?=		$(VARIANT)
 $(foreach rubyversion, $(VERSIONS_ruby), $(eval CONTAINER_ruby-$(rubyversion) = ruby:$(rubyversion)-$(VARIANT_ruby)))
 CONFIGURE_ruby ?=	ruby
