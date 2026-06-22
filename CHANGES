@@ -35,6 +35,52 @@ Changes with FreeUnit 1.35.6                                     25 Jun 2026
     *) Bugfix: remove unreachable Protocol::HttpJson dead-code arm from the
        OTel exporter; only HttpBinary was ever selected.
 
+    *) Bugfix: validate that a loaded TLS private key matches its certificate
+       at config time, and guard the wildcard-name SAN matcher against a
+       zero-length SAN entry.
+
+    *) Bugfix: correct IPv4 /32 CIDR fallthrough, symmetric URI/pattern
+       decoding, the PCRE2 match-data ovector size, and short port-range
+       parsing in HTTP routing; document the case-insensitive host matcher
+       and the capset stance.
+
+    *) Bugfix: tighten file-descriptor and CLOEXEC lifetime — CLOEXEC-protect
+       accepted sockets and pipe ends, close the pipe end on
+       nxt_fd_nonblocking() failure and the source fd on compression mmap
+       failure, and narrow the accept4() fallback to ENOSYS.
+
+    *) Bugfix: tighten WebSocket frame-bound checks — reject truncated
+       extended-length frames in libunit, validate the 64-bit extended-length
+       MSB (RFC 6455), fix a no-op frame-size decrement that could copy bytes
+       beyond the declared payload, bound the Java sendWsFrame JNI arguments,
+       and guard pending_payload_len overflow in the Python ASGI handler.
+
+    *) Bugfix: bounds-check peer-supplied shared-memory offsets — range-check
+       chunk_id and chunk_id+nchunks in incoming mmap messages, close a
+       lookup/dereference window on the incoming-mmap handler, reject
+       response-buffer size overflow, and validate request sptr offsets
+       before use.
+
+    *) Bugfix: bounds-check app-supplied arguments across the language
+       bindings (PHP header skip / realpath / PATH_INFO; Python WSGI and ASGI
+       checks; Perl ERRSV scrub; Java InputStream.readLine off/len; WASM
+       guest offsets).
+
+    *) Bugfix: tighten isolation boundaries — require a matching peer UID on
+       the unix control socket, resolve mount destinations with
+       openat2(RESOLVE_BENEATH), and resolve relative cgroup paths against the
+       child's /proc/<pid>/cgroup.
+
+    *) Bugfix: cap JSON parser depth and element counts in the controller,
+       scrub PHP TrueAsync exception state before the prototype fork, and bind
+       the Ruby rack.input / rack.errors handles to their originating request.
+
+    *) Bugfix: bound proxy Content-Length and URI/string helpers — truncate a
+       proxied response body that exceeds its Content-Length and close the
+       connection, flag invalid or oversized upstream Content-Length, fix an
+       nxt_is_complex_uri_encoded() off-by-one, and reject over-long lengths
+       in nxt_rmemstrn().
+
 
 Changes with FreeUnit 1.35.5                                     29 May 2026
 

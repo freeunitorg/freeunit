@@ -150,6 +150,24 @@ nxt_py_asgi_lifespan_target_startup(nxt_py_asgi_ctx_data_t *ctx_data,
         return NULL;
     }
 
+    /*
+     * Initialize every pointer field the deallocator may touch BEFORE
+     * any path can goto release_lifespan / release_receive / release_send,
+     * since PyObject_New returns uninitialized memory and the dealloc
+     * runs Py_CLEAR on these unconditionally.
+     */
+    lifespan->ctx_data = ctx_data;
+    lifespan->disabled = 0;
+    lifespan->startup_received = 0;
+    lifespan->startup_sent = 0;
+    lifespan->shutdown_received = 0;
+    lifespan->shutdown_sent = 0;
+    lifespan->shutdown_called = 0;
+    lifespan->startup_future = NULL;
+    lifespan->shutdown_future = NULL;
+    lifespan->receive_future = NULL;
+    lifespan->state = NULL;
+
     ret = NULL;
 
     receive = PyObject_GetAttrString((PyObject *) lifespan, "receive");
@@ -159,13 +177,13 @@ nxt_py_asgi_lifespan_target_startup(nxt_py_asgi_ctx_data_t *ctx_data,
     }
 
     send = PyObject_GetAttrString((PyObject *) lifespan, "send");
-    if (nxt_slow_path(receive == NULL)) {
+    if (nxt_slow_path(send == NULL)) {
         nxt_unit_alert(NULL, "Python failed to get 'send' method");
         goto release_receive;
     }
 
     done = PyObject_GetAttrString((PyObject *) lifespan, "_done");
-    if (nxt_slow_path(receive == NULL)) {
+    if (nxt_slow_path(done == NULL)) {
         nxt_unit_alert(NULL, "Python failed to get '_done' method");
         goto release_send;
     }
@@ -178,17 +196,6 @@ nxt_py_asgi_lifespan_target_startup(nxt_py_asgi_ctx_data_t *ctx_data,
 
         goto release_done;
     }
-
-    lifespan->ctx_data = ctx_data;
-    lifespan->disabled = 0;
-    lifespan->startup_received = 0;
-    lifespan->startup_sent = 0;
-    lifespan->shutdown_received = 0;
-    lifespan->shutdown_sent = 0;
-    lifespan->shutdown_called = 0;
-    lifespan->shutdown_future = NULL;
-    lifespan->receive_future = NULL;
-    lifespan->state = NULL;
 
     scope = nxt_py_asgi_new_scope(NULL, nxt_py_lifespan_str, nxt_py_2_0_str);
     if (nxt_slow_path(scope == NULL)) {

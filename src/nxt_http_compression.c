@@ -274,20 +274,28 @@ nxt_http_comp_compress_static_response(nxt_task_t *task, nxt_http_request_t *r,
         nxt_alert(task, "ftruncate(%d<%s>, %uz) failed %E",
                   tfile.fd, tmp_path, out_size, nxt_errno);
         nxt_file_close(task, &tfile);
+        nxt_file_close(task, *f);
+        *f = NULL;
         return NXT_ERROR;
     }
 
     in = nxt_mem_mmap(NULL, in_size, PROT_READ, MAP_SHARED, (*f)->fd, 0);
     if (nxt_slow_path(in == MAP_FAILED)) {
+        nxt_alert(task, "mmap(%uz) of source failed %E", in_size, nxt_errno);
         nxt_file_close(task, &tfile);
+        nxt_file_close(task, *f);
+        *f = NULL;
         return NXT_ERROR;
     }
 
     out = nxt_mem_mmap(NULL, out_size, PROT_READ|PROT_WRITE, MAP_SHARED,
                        tfile.fd, 0);
     if (nxt_slow_path(out == MAP_FAILED)) {
+        nxt_alert(task, "mmap(%uz) of temp failed %E", out_size, nxt_errno);
         nxt_mem_munmap(in, in_size);
         nxt_file_close(task, &tfile);
+        nxt_file_close(task, *f);
+        *f = NULL;
         return NXT_ERROR;
     }
 
@@ -308,6 +316,8 @@ nxt_http_comp_compress_static_response(nxt_task_t *task, nxt_http_request_t *r,
             nxt_file_close(task, &tfile);
             nxt_mem_munmap(in, in_size);
             nxt_mem_munmap(out, out_size);
+            nxt_file_close(task, *f);
+            *f = NULL;
             return NXT_ERROR;
         }
 
@@ -324,6 +334,8 @@ nxt_http_comp_compress_static_response(nxt_task_t *task, nxt_http_request_t *r,
         nxt_alert(task, "ftruncate(%d<%s>, %uz) failed %E",
                   tfile.fd, tmp_path, *out_total, nxt_errno);
         nxt_file_close(task, &tfile);
+        nxt_file_close(task, *f);
+        *f = NULL;
         return NXT_ERROR;
     }
 

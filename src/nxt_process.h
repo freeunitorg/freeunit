@@ -76,6 +76,13 @@ typedef struct {
 
 struct nxt_cgroup_s {
     char  *path;
+    /*
+     * Resolved cgroup directory cached by nxt_cgroup_proc_add() so
+     * nxt_cgroup_cleanup() does not need to re-resolve via
+     * /proc/<pid>/cgroup after the child has already exited (which
+     * would fail with ENOENT and leak cgroup directories).
+     */
+    char  *resolved_path;
 };
 
 

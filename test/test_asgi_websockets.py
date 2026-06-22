@@ -170,7 +170,11 @@ def test_asgi_websockets_length_long():
     ws.frame_write(sock, ws.OP_TEXT, 'fragment1', fin=False)
     ws.frame_write(sock, ws.OP_CONT, 'fragment2', length=2**64 - 1)
 
-    check_close(sock, 1009)  # 1009 - CLOSE_TOO_LARGE
+    # 1002 - CLOSE_PROTOCOL_ERROR.  RFC 6455 §5.2 requires the
+    # high bit of the 64-bit extended payload length to be 0; an
+    # all-ones length is a protocol violation and gets rejected
+    # before the policy-size check (1009 CLOSE_TOO_LARGE) runs.
+    check_close(sock, 1002)
 
 
 def test_asgi_websockets_frame_fragmentation_invalid():
