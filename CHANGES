@@ -35,6 +35,13 @@ Changes with FreeUnit 1.35.6                                     25 Jun 2026
     *) Bugfix: remove unreachable Protocol::HttpJson dead-code arm from the
        OTel exporter; only HttpBinary was ever selected.
 
+    *) Bugfix: fix a rootfs automount reload race: sever the worker's mount
+       namespace propagation (MS_REC|MS_PRIVATE) before mounting and let a
+       per-worker automount be reaped with the namespace instead of being
+       unmounted from the host, so a configuration reload no longer races the
+       previous worker generation's teardown against the new prototype's
+       procfs mount (freeunitorg/freeunit#83).
+
 
 Changes with FreeUnit 1.35.5                                     29 May 2026
 
