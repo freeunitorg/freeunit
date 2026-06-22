@@ -12,11 +12,24 @@ on:
 
 jobs:
   claude:
+    # Only trusted accounts (repo owner/members/collaborators) may invoke
+    # Claude. On a public repo anyone can comment "@claude" and would
+    # otherwise burn the owner's Anthropic quota and feed untrusted text into
+    # the run (prompt injection). The author_association field differs per
+    # event type, so each branch carries its own check.
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      (github.event_name == 'issue_comment' &&
+        contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review_comment' &&
+        contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review' &&
+        contains(github.event.review.body, '@claude') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association)) ||
+      (github.event_name == 'issues' &&
+        (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -47,4 +60,70 @@ jobs:
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
           # claude_args: '--allowed-tools Bash(gh pr *)'
+
+  # Posts a friendly "maintainers only" reply when an untrusted account tries
+  # to summon Claude. Mirror of the gate in the `claude` job, negated.
+  # The reply text must NOT contain the literal trigger string, otherwise the
+  # bot's own comment re-fires issue_comment and loops forever.
+  claude-denied:
+    if: |
+      (github.event_name == 'issue_comment' &&
+        contains(github.event.comment.body, '@claude') &&
+        !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review_comment' &&
+        contains(github.event.comment.body, '@claude') &&
+        !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review' &&
+        contains(github.event.review.body, '@claude') &&
+        !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association)) ||
+      (github.event_name == 'issues' &&
+        (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
+        !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association))
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Reply that Claude is maintainers-only
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          # Conversation number for the standalone-comment path
+          # (issue_comment/issues -> issue.number; pull_request_review -> PR number).
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          # Inline PR review-comment threading target.
+          PULL_NUMBER: ${{ github.event.pull_request.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          # Author to address in the standalone-comment path. Field differs per event.
+          AUTHOR: ${{ github.event.comment.user.login || github.event.review.user.login || github.event.issue.user.login }}
+          # Self-hosted GIF: commit it at .github/assets/maintainers-only.gif.
+          # HEAD keeps the URL branch-agnostic. Swap for a Giphy/Tenor direct
+          # .gif link if you prefer not to vendor the file.
+          GIF_URL: https://raw.githubusercontent.com/${{ github.repository }}/HEAD/.github/assets/maintainers-only.gif
+        run: |
+          MSG="Sorry, only maintainers can reach out to me here."
+          # printf builds the body with real newlines and no leading indentation,
+          # so the image line isn't swallowed by Markdown as an indented code block.
+          if [ "$EVENT" = "pull_request_review_comment" ]; then
+            # Inline review comment: reply inside its thread (already attached,
+            # so no @mention needed).
+            BODY=$(printf '%s\n\n![maintainers only](%s)' "$MSG" "$GIF_URL")
+            gh api "repos/${REPO}/pulls/${PULL_NUMBER}/comments/${COMMENT_ID}/replies" -f body="$BODY"
+          else
+            # No native threading here: post a standalone comment and address
+            # the author so the reply still reads as directed at them.
+            #
+            # Guard the corner case of a user literally named "claude*": the
+            # mention would otherwise put the bot's own trigger string ("@claude",
+            # matched case-insensitively) into the reply. GitHub already won't
+            # re-run workflows on GITHUB_TOKEN-authored comments, but keep the
+            # text trigger-free too — drop the "@" (and the ping) for such names.
+            MENTION="@${AUTHOR}"
+            case "${AUTHOR,,}" in
+              claude*) MENTION="${AUTHOR}" ;;
+            esac
+            BODY=$(printf '%s %s\n\n![maintainers only](%s)' "$MENTION" "$MSG" "$GIF_URL")
+            gh api "repos/${REPO}/issues/${NUMBER}/comments" -f body="$BODY"
+          fi
 
