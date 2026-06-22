@@ -260,13 +260,19 @@ nxt_unit_sptr_in_buf(nxt_unit_sptr_t *sptr, uint32_t length,
     }
 
     sptr_off = (uint8_t *) sptr - (uint8_t *) buf_start;
+
     /*
-     * Underflow-safe: subtract on the constant side throughout.  The
-     * sptr struct itself must fit inside the buffer before we
-     * dereference sptr->offset, so check sizeof(*sptr) here rather
-     * than just sptr_off > buf_size.
+     * The sptr struct itself must fit inside the buffer before we
+     * dereference sptr->offset.  Reject a buffer too small to hold an
+     * sptr first: buf_size is uint32_t and sizeof() is size_t, so
+     * "buf_size - sizeof(nxt_unit_sptr_t)" is evaluated in size_t and
+     * underflows to a huge value -- wrongly passing the bound check --
+     * when buf_size is smaller than the struct.  The short-circuit keeps
+     * the subtraction below from ever underflowing.
      */
-    if (sptr_off > buf_size - sizeof(nxt_unit_sptr_t)) {
+    if (buf_size < sizeof(nxt_unit_sptr_t)
+        || sptr_off > buf_size - sizeof(nxt_unit_sptr_t))
+    {
         return 0;
     }
 
