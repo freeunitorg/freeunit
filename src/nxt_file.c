@@ -726,12 +726,23 @@ nxt_pipe_create(nxt_task_t *task, nxt_fd_t *pp, nxt_bool_t nbread,
     nxt_bool_t nbwrite)
 {
 #if (NXT_HAVE_PIPE2)
-    if (pipe2(pp, O_CLOEXEC) != 0) {
+    if (pipe2(pp, O_CLOEXEC) == 0) {
+        goto created;
+    }
+
+    /*
+     * pipe2() is probed at compile time only, so a binary built where the
+     * headers advertise it can still run on an older kernel/libc that
+     * returns ENOSYS.  Fall back to pipe() + FD_CLOEXEC in that case
+     * instead of failing every pipe creation.
+     */
+    if (nxt_errno != NXT_ENOSYS) {
         nxt_alert(task, "pipe2() failed %E", nxt_errno);
 
         return NXT_ERROR;
     }
-#else
+#endif
+
     if (pipe(pp) != 0) {
         nxt_alert(task, "pipe() failed %E", nxt_errno);
 
@@ -749,6 +760,9 @@ nxt_pipe_create(nxt_task_t *task, nxt_fd_t *pp, nxt_bool_t nbread,
         nxt_pipe_close(task, pp);
         return NXT_ERROR;
     }
+
+#if (NXT_HAVE_PIPE2)
+created:
 #endif
 
     nxt_debug(task, "pipe(): %FD:%FD", pp[0], pp[1]);
