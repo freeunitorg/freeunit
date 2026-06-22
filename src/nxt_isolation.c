@@ -843,9 +843,19 @@ nxt_isolation_prepare_rootfs(nxt_task_t *task, nxt_process_t *process)
         }
 
 #if (NXT_HAVE_OPENAT2)
+        /*
+         * Require a path separator right after the rootfs prefix so a
+         * sibling like "<rootfs>-helper" is not treated as living under
+         * "<rootfs>" (which would resolve a bogus relative path and abort
+         * startup with a spurious ENOENT).  dst is always built as
+         * rootfs + a component starting with '/', so this byte is '/' for
+         * every real destination; the preceding length check makes the
+         * index safe to read.
+         */
         if (rootfs_fd != -1
             && nxt_strlen(dst) > rootfs_len
-            && memcmp(dst, rootfs_path, rootfs_len) == 0)
+            && memcmp(dst, rootfs_path, rootfs_len) == 0
+            && dst[rootfs_len] == '/')
         {
             struct open_how  how;
             const char      *rel;
