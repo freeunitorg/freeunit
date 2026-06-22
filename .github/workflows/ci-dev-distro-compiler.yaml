@@ -48,7 +48,7 @@ jobs:
           fi
           npm install -g node-gyp
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: configure unit CC=${{ matrix.compiler }}
         run: |
@@ -138,7 +138,7 @@ jobs:
             apk add clang
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: configure unit CC=${{ matrix.compiler }}
         run: |

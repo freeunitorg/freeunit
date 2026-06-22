@@ -70,7 +70,7 @@ jobs:
             os: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Provides module, language version and testpath from build name
       - name: Output build metadata
@@ -155,7 +155,7 @@ jobs:
       ##
 
       - name: Clone njs repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: nginx/njs
           ref: '${{ steps.metadata.outputs.njs_version }}'
