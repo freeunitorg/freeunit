@@ -152,7 +152,7 @@ fn parse_eol_json(path: &str) -> Result<(Vec<OsEntry>, Vec<RuntimeEntry>, Config
 
 fn api_category<'a>(category: &'a str) -> Option<&'a str> {
     match category {
-        "jsc" => Some("eclipse-temurin"),
+        "java" => Some("eclipse-temurin"),
         "node" => Some("nodejs"),
         "amazonlinux" => Some("amazon-linux"),
         "centos_stream" => Some("centos-stream"),
@@ -291,7 +291,7 @@ fn detect_new_versions(
     // Must stay in sync with api_category() mapping — if a category is added
     // there, add it here too.
     let scan_cats: &[&str] = &[
-        "go", "jsc", "node", "perl", "php", "python", "ruby",
+        "go", "java", "node", "perl", "php", "python", "ruby",
         "fedora", "debian", "ubuntu", "alpine", "amazonlinux", "rhel", "centos_stream",
     ];
 

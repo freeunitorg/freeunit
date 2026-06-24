@@ -1,0 +1,192 @@
+# .github/workflows/release-docker.yml
+#
+# Builds multi-arch Docker images (amd64 + arm64) and pushes to GHCR.
+# Triggered on FreeUnit release tags (semver, e.g. 1.35.0) or manually
+# via workflow_dispatch.
+#
+# Structure:
+#   setup  — single source of truth: emits the version and the variant list.
+#   build  — variant × arch matrix; builds and pushes per-arch images.
+#   merge  — variant matrix; stitches the per-arch images into a manifest.
+#
+# Adding/dropping a variant: edit the VARIANTS list in the `setup` job only.
+# The Dockerfile path is derived as pkg/docker/Dockerfile.<variant>, so the
+# variant name must match the Dockerfile suffix.
+#
+# Language version support policy:
+#   Each image is supported for 1 year after the language/runtime EOL.
+#   The variant list and EOL dates live in pkg/eol.json (single source of
+#   truth) — the `setup` job derives the build matrix from it, so this file
+#   no longer duplicates the per-version table. EOL reference:
+#   https://endoflife.date
+#
+#   go-1.24 is intentionally NOT built: Go upstream stopped patching after
+#   1.24.13 (2026-02-04), leaving unfixed CVEs — CVE-2026-27140 (cmd/cgo SWIG
+#   RCE, CVSS 8.8), CVE-2026-33814 (HTTP/2 client DoS), CVE-2026-27142
+#   (html/template XSS), cgo DNS double-free, go tool pack path traversal —
+#   fixed only in 1.25.9+/1.26.2+.
+
+name: "Release (Docker Images)"
+
+on:
+  push:
+    # Only FreeUnit release tags (semver). Must NOT match unitctl/* tags,
+    # otherwise a unitctl release would trigger a full image build.
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag (e.g. 1.35.0)'
+        required: true
+
+env:
+  GHCR_REGISTRY: ghcr.io
+  GHCR_IMAGE_NAME: freeunitorg/freeunit
+  DOCKERHUB_REGISTRY: docker.io
+  DOCKERHUB_IMAGE_NAME: freeunitorg/freeunit
+
+jobs:
+  # Single source of truth for the release version and the variant list,
+  # consumed by both `build` and `merge` via fromJSON().
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      variants: ${{ steps.meta.outputs.variants }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve version and variant list
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          # Variant list is derived from pkg/eol.json (single source of truth).
+          # Each runtime version -> "<runtime>-<version>"; a null version (wasm,
+          # minimal) -> just "<runtime>"; "slim": true adds a "-slim" sibling.
+          # Variant == Dockerfile suffix (pkg/docker/Dockerfile.<variant>).
+          variants=$(jq -c '[
+            .runtimes | to_entries[] | .key as $rt | .value[] |
+            if .version == null then $rt
+            else ([$rt + "-" + .version]
+                  + (if .slim then [$rt + "-" + .version + "-slim"] else [] end))
+            end
+          ] | flatten' pkg/eol.json)
+          echo "variants=${variants}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: setup
+    runs-on: ${{ matrix.arch.runner }}
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(needs.setup.outputs.variants) }}
+        arch:
+          - name: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - name: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Pin version in Dockerfile
+        run: |
+          VERSION="${{ needs.setup.outputs.version }}"
+          sed -i \
+            -e "s|-b [0-9][0-9.]*\( https://github.com/freeunitorg/freeunit\)|-b ${VERSION}\1|" \
+            -e "s|image.version=\"[^\"]*\"|image.version=\"${VERSION}\"|" \
+            pkg/docker/Dockerfile.${{ matrix.variant }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push (${{ matrix.arch.name }})
+        uses: docker/build-push-action@v7
+        with:
+          context: pkg/docker
+          file: pkg/docker/Dockerfile.${{ matrix.variant }}
+          platforms: ${{ matrix.arch.platform }}
+          push: true
+          tags: |
+            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}:${{ needs.setup.outputs.version }}-${{ matrix.variant }}-${{ matrix.arch.name }}
+            ${{ env.DOCKERHUB_REGISTRY }}/${{ env.DOCKERHUB_IMAGE_NAME }}:${{ needs.setup.outputs.version }}-${{ matrix.variant }}-${{ matrix.arch.name }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/freeunitorg/freeunit
+          cache-from: type=gha,scope=${{ matrix.arch.name }}-${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch.name }}-${{ matrix.variant }}
+
+  merge:
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(needs.setup.outputs.variants) }}
+
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest
+        run: |
+          VERSION="${{ needs.setup.outputs.version }}"
+          VARIANT="${{ matrix.variant }}"
+          # Per-arch images live in both registries; build a manifest in each.
+          for REPO in \
+            "${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}" \
+            "${{ env.DOCKERHUB_REGISTRY }}/${{ env.DOCKERHUB_IMAGE_NAME }}"; do
+            docker buildx imagetools create \
+              --tag ${REPO}:${VERSION}-${VARIANT} \
+              --tag ${REPO}:latest-${VARIANT} \
+              --annotation "index:org.opencontainers.image.description=FreeUnit ${VERSION} (${VARIANT}) — community LTS fork of the NGINX Unit application server" \
+              --annotation "index:org.opencontainers.image.title=FreeUnit (${VARIANT})" \
+              --annotation "index:org.opencontainers.image.url=https://freeunit.org" \
+              --annotation "index:org.opencontainers.image.source=https://github.com/freeunitorg/freeunit" \
+              --annotation "index:org.opencontainers.image.vendor=FreeUnit Community" \
+              --annotation "index:org.opencontainers.image.version=${VERSION}" \
+              ${REPO}:${VERSION}-${VARIANT}-amd64 \
+              ${REPO}:${VERSION}-${VARIANT}-arm64
+            docker buildx imagetools inspect ${REPO}:${VERSION}-${VARIANT}
+          done

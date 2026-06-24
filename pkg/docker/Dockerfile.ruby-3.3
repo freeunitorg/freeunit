@@ -1,6 +1,6 @@
-FROM eclipse-temurin:17-jdk-noble
+FROM ruby:3.3-trixie
 
-LABEL org.opencontainers.image.title="FreeUnit (jsc17)"
+LABEL org.opencontainers.image.title="FreeUnit (ruby-3.3)"
 LABEL org.opencontainers.image.description="Community build of FreeUnit for Docker."
 LABEL org.opencontainers.image.url="https://freeunit.org"
 LABEL org.opencontainers.image.source="https://github.com/freeunitorg/freeunit"
@@ -71,12 +71,12 @@ RUN set -ex \
     && make clean \
     && /bin/true \
     && ./configure $CONFIGURE_ARGS_MODULES --cc-opt="$CC_OPT" --modulesdir=/usr/lib/unit/debug-modules --debug \
-    && ./configure java --jars=/usr/share/unit-jsc-common/ \
-    && make -j $NCPU java-shared-install java-install \
+    && ./configure ruby \
+    && make -j $NCPU ruby-install \
     && make clean \
     && ./configure $CONFIGURE_ARGS_MODULES --cc-opt="$CC_OPT" --modulesdir=/usr/lib/unit/modules \
-    && ./configure java --jars=/usr/share/unit-jsc-common/ \
-    && make -j $NCPU java-shared-install java-install \
+    && ./configure ruby \
+    && make -j $NCPU ruby-install \
     && cd \
     && rm -rf /usr/src/unit \
     && for f in /usr/sbin/unitd /usr/lib/unit/modules/*.unit.so; do \
@@ -85,7 +85,7 @@ RUN set -ex \
        done \
     && apt-mark showmanual | xargs apt-mark auto > /dev/null \
     && { [ -z "$savedAptMark" ] || apt-mark manual $savedAptMark; } \
-    && rm -rf /root/.m2 \
+    && gem install rack && rm -rf /root/.local \
     && mkdir -p /var/lib/unit/ \
     && mkdir -p /docker-entrypoint.d/ \
     && groupadd --gid 999 unit \

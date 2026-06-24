@@ -1,4 +1,4 @@
-name: ci
+name: "Build & Test (Linux)"
 
 on:
   pull_request:
@@ -9,7 +9,7 @@ on:
       - 'src/**'
       - 'test/**'
       - 'pkg/contrib/**'
-      - '.github/workflows/ci.yml'
+      - '.github/workflows/build-test.yml'
   push:
     branches: master
     paths:
@@ -19,57 +19,46 @@ on:
       - 'src/**'
       - 'test/**'
       - 'pkg/contrib/**'
-      - '.github/workflows/ci.yml'
+      - '.github/workflows/build-test.yml'
+
+env:
+  # OpenSSL patch version built from source (see "Build OpenSSL" step). Only the
+  # patch level lives here; the 3.6 "slot" (/opt/openssl-3.6, OPENSSL36_* vars)
+  # is stable across patch bumps and intentionally not templated.
+  OPENSSL_VERSION: 3.6.2
 
 jobs:
+  # Single source of truth for the test matrix. The version-tested language
+  # modules (go/java/node/php/python/ruby) are derived from pkg/eol.json; the
+  # fixed extras below are not runtime-versioned in CI. Excluded on purpose:
+  # per-version perl (tested against the runner's system perl), python "-slim"
+  # and the "minimal" image — those are Docker packaging flavors, not test axes.
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      builds: ${{ steps.list.outputs.builds }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Derive build list from pkg/eol.json
+        id: list
+        run: |
+          builds=$(jq -c '
+            ["unit", "perl", "wasm", "wasm-wasi-component"]
+            + [ .runtimes | to_entries[]
+                | select(.key | IN("go", "java", "node", "php", "ruby"))
+                | .key as $rt | .value[] | $rt + "-" + .version ]
+            + [ .runtimes.python[] | "python-" + .version ]
+          ' pkg/eol.json)
+          echo "builds=${builds}" >> "$GITHUB_OUTPUT"
+
   test:
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Core
-          - build: unit
-            os: ubuntu-latest
-          # Modules
-          - build: go-1.25
-            os: ubuntu-latest
-          - build: go-1.26
-            os: ubuntu-latest
-          - build: java-17
-            os: ubuntu-latest
-          - build: java-18
-            os: ubuntu-latest
-          - build: java-20
-            os: ubuntu-latest
-          - build: node-22
-            os: ubuntu-latest
-          - build: node-24
-            os: ubuntu-latest
-          - build: perl
-            os: ubuntu-latest
-          - build: php-8.2
-            os: ubuntu-latest
-          - build: php-8.3
-            os: ubuntu-latest
-          - build: php-8.4
-            os: ubuntu-latest
-          - build: php-8.5
-            os: ubuntu-latest
-          - build: python-3.11
-            os: ubuntu-latest
-          - build: python-3.12
-            os: ubuntu-latest
-          - build: python-3.14
-            os: ubuntu-latest
-          - build: ruby-3.3
-            os: ubuntu-latest
-          - build: ruby-3.4
-            os: ubuntu-latest
-          - build: wasm
-            os: ubuntu-latest
-          - build: wasm-wasi-component
-            os: ubuntu-latest
+        build: ${{ fromJSON(needs.prepare.outputs.builds) }}
+        os: [ubuntu-latest]
 
     steps:
       - uses: actions/checkout@v5
@@ -100,6 +89,9 @@ jobs:
           NJS_VERSION=$(sed -n "s/NJS_VERSION := \(.*\)/\1/p" pkg/contrib/src/njs/version)
           echo "njs_version=${NJS_VERSION}" >> "$GITHUB_OUTPUT"
 
+          WASMTIME_VERSION=$(sed -n "s/WASMTIME_VERSION := \(.*\)/\1/p" pkg/contrib/src/wasmtime/version)
+          echo "wasmtime_version=${WASMTIME_VERSION}" >> "$GITHUB_OUTPUT"
+
           cat "$GITHUB_OUTPUT"
 
       # https://github.com/actions/runner-images/issues/2821
@@ -119,23 +111,42 @@ jobs:
           fi
 
       - name: Install packages
-        run: sudo apt-get -y install libbrotli-dev
+        run: sudo apt-get -y install libbrotli-dev ccache
+
+      # ccache transparently caches C object files across runs. The Debian
+      # ccache package ships compiler symlinks in /usr/lib/ccache; putting it
+      # first on PATH makes `cc`/`gcc` resolve to ccache for njs, unit and the
+      # OpenSSL build with no configure changes. Falls back to real cc on any
+      # miss, so it can only speed things up, never break the build.
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.build }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.build }}-
+
+      - name: Enable ccache
+        run: |
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=500M" >> "$GITHUB_ENV"
 
       - name: Cache OpenSSL 3.6
         id: cache-openssl36
         uses: actions/cache@v5
         with:
           path: /opt/openssl-3.6
-          key: openssl-3.6.2-${{ runner.os }}-${{ runner.arch }}
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Build OpenSSL 3.6
         if: steps.cache-openssl36.outputs.cache-hit != 'true'
         run: |
           sudo apt-get -y install build-essential
           cd /tmp
-          wget -q https://www.openssl.org/source/openssl-3.6.2.tar.gz
-          tar -xzf openssl-3.6.2.tar.gz
-          cd openssl-3.6.2
+          wget -q "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
+          tar -xzf "openssl-${OPENSSL_VERSION}.tar.gz"
+          cd "openssl-${OPENSSL_VERSION}"
           ./Configure --prefix=/opt/openssl-3.6 shared no-docs
           make -j$(nproc)
           sudo mkdir -p /opt/openssl-3.6
@@ -156,7 +167,15 @@ jobs:
       ## njs
       ##
 
+      - name: Cache njs
+        id: cache-njs
+        uses: actions/cache@v5
+        with:
+          path: njs
+          key: njs-${{ steps.metadata.outputs.njs_version }}-${{ runner.os }}-${{ runner.arch }}
+
       - name: Clone njs repository
+        if: steps.cache-njs.outputs.cache-hit != 'true'
         uses: actions/checkout@v5
         with:
           repository: nginx/njs
@@ -164,6 +183,7 @@ jobs:
           path: njs
 
       - name: Make njs
+        if: steps.cache-njs.outputs.cache-hit != 'true'
         run: |
           ./configure --no-libxml2 --no-zlib
           make -j4 -k
@@ -353,10 +373,18 @@ jobs:
       ## Wasm
       ##
 
+      - name: Cache wasmtime
+        id: cache-wasmtime
+        if: steps.metadata.outputs.module == 'wasm'
+        uses: actions/cache@v5
+        with:
+          path: pkg/contrib/wasmtime/artifacts
+          key: wasmtime-${{ steps.metadata.outputs.wasmtime_version }}-${{ runner.os }}-${{ runner.arch }}
+
       - name: Make wasmtime
         run: |
           make -C pkg/contrib .wasmtime
-        if: steps.metadata.outputs.module == 'wasm'
+        if: steps.metadata.outputs.module == 'wasm' && steps.cache-wasmtime.outputs.cache-hit != 'true'
 
       - name: Configure wasm
         run: |
@@ -375,7 +403,14 @@ jobs:
       - name: Setup rust
         run: |
           curl https://sh.rustup.rs | sh -s -- -y
-          cargo install cargo-component
+        if: steps.metadata.outputs.module == 'wasm-wasi-component'
+
+      # Prebuilt binary instead of `cargo install cargo-component` (which
+      # compiles it from source on every run). Same tool, much faster.
+      - name: Install cargo-component
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-component
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
 
       - name: Configure wasm-wasi-component
@@ -407,17 +442,19 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-cargo-
 
+      - name: Install Rust toolchain
+        if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
+        run: rustup toolchain install stable --no-self-update --profile minimal
+
       - name: Build fake_upstream
         if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
         run: |
-          rustup toolchain install stable --no-self-update --profile minimal
           cargo build --release --manifest-path test/fake_upstream/Cargo.toml
           sudo cp test/fake_upstream/target/release/fake_upstream /usr/local/bin/
 
       - name: Build fake_otlp
-        if: steps.metadata.outputs.module == 'unit'
+        if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
         run: |
-          rustup toolchain install stable --no-self-update --profile minimal
           cargo build --release --manifest-path test/fake_otlp/Cargo.toml
           sudo cp test/fake_otlp/target/release/fake_otlp /usr/local/bin/
 

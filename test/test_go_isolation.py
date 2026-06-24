@@ -1,6 +1,8 @@
 import grp
+import json
 import os
 import pwd
+import socket
 import time
 
 import pytest
@@ -319,22 +321,65 @@ def test_go_isolation_rootfs_container_priv(require, temp_dir):
     assert not obj['FileExists'], 'file should not exists'
 
 
-def _reload_and_poll_mounts(isolation):
+def _reload_and_poll_mounts(isolation, want_tmpfs):
     # Reload swaps the worker generation; the new prototype sets up its mount
-    # namespace asynchronously, so the first request can race it and hit a
-    # transient 503 (or the torn-down previous generation). Poll the new
-    # generation until it serves before inspecting its mounts.
+    # namespace asynchronously. Poll until the *new* generation has converged
+    # to the requested automount state before returning — this is a
+    # reload-stability test, so it asserts the steady state, not whatever is
+    # observable mid-swap.
     client.load('ns_inspect', isolation=isolation)
 
-    resp = None
+    # During the reload swap the new worker generation can refuse the
+    # connection, accept it but not answer, or serve a transient 503 (text/html)
+    # before its mount namespace is up. The test client is not built for polling
+    # an unstable endpoint, so do it carefully here:
+    #   * own the socket and ALWAYS close it — a leaked client socket keeps the
+    #     router-side fd open and trips the fd-leak teardown check (#60 follow-up);
+    #   * pass a short read_timeout so a stalled generation doesn't block on the
+    #     default 60s (which would also hard-fail via pytest.fail);
+    #   * treat any transient (refused/empty/non-200/parse error) as "retry".
+    #
+    # A 200 only means the worker accepted the connection, not that its mount
+    # namespace is established and current. Two non-steady states are retried,
+    # never accepted as the answer:
+    #   * empty Mounts — the new generation answered before /proc was mounted,
+    #     so the app's ReadFile('/proc/self/mountinfo') returned nothing;
+    #   * Mounts present but with the wrong tmpfs state — a still-serving
+    #     previous generation, not the one this reload installed.
+    # A genuinely broken steady state (never converges) still fails loudly via
+    # the pytest.fail() timeout below, with the last observation in the message.
+    last = None
     for _ in range(50):
-        resp = client.getjson(url='/?mounts=true')
-        if resp['status'] == 200:
-            return resp['body']
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        resp = None
+        try:
+            sock.connect(('127.0.0.1', 8080))
+            resp = client.get(url='/?mounts=true', sock=sock, read_timeout=2)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:  # pytest.fail() raises a BaseException
+            last = repr(exc)
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+        if isinstance(resp, dict) and resp.get('status') == 200:
+            mounts = json.loads(resp['body'])['Mounts']
+            if not mounts:
+                last = 'empty mountinfo'
+            else:
+                has_tmpfs = "/ /tmp" in mounts and "tmpfs" in mounts
+                if has_tmpfs == want_tmpfs:
+                    return
+                last = f'tmpfs={has_tmpfs}, want={want_tmpfs}'
+        elif isinstance(resp, dict):
+            last = f"status={resp.get('status')}"
         time.sleep(0.1)
 
-    status = resp['status'] if resp is not None else None
-    pytest.fail(f'app not ready after reload (status={status})')
+    pytest.fail(f'mounts did not converge after reload ({last})')
 
 
 def _assert_rootfs_tmpfs_toggle_stable(is_su, require, temp_dir, iterations):
@@ -381,45 +426,32 @@ def _assert_rootfs_tmpfs_toggle_stable(is_su, require, temp_dir, iterations):
     # Regression coverage for flaky startup path:
     # repeatedly reload the same rootfs while toggling tmpfs automount.
     # The historical failure happened on the second load after enabling tmpfs.
+    # Convergence to the requested state (and the timeout on non-convergence)
+    # is enforced inside _reload_and_poll_mounts via want_tmpfs.
     for _ in range(iterations):
         isolation['automount'] = {'tmpfs': False}
-
-        obj = _reload_and_poll_mounts(isolation)
-
-        assert (
-            "/ /tmp" not in obj['Mounts'] and "tmpfs" not in obj['Mounts']
-        ), 'app has no /tmp mounted'
+        _reload_and_poll_mounts(isolation, want_tmpfs=False)
 
         isolation['automount'] = {'tmpfs': True}
-
-        obj = _reload_and_poll_mounts(isolation)
-
-        assert (
-            "/ /tmp" in obj['Mounts'] and "tmpfs" in obj['Mounts']
-        ), 'app has /tmp mounted on /'
+        _reload_and_poll_mounts(isolation, want_tmpfs=True)
 
 
-# Under a rapid same-rootfs reload loop, the previous worker's mount-ns
-# teardown races the new prototype's proc mount; the loser logs a benign
-# transient "[alert] mount(... /proc ...) No such file or directory" before
-# its generation is discarded. The final-state asserts still verify each
-# surviving generation is correct, so skip only this specific alert.
-_TMPFS_RELOAD_ALERT = r'mount\(.*proc.*\) \(2: No such file or directory\)'
-
-
-def test_go_isolation_rootfs_automount_tmpfs(
-    is_su, require, temp_dir, skip_alert
-):
-    skip_alert(_TMPFS_RELOAD_ALERT)
+# The "[alert] mount(... /proc ...) No such file or directory" transient from
+# the rootfs automount reload race is fixed in nxt_isolation.c
+# (freeunitorg/freeunit#83): the per-worker mount namespace is made
+# MS_REC|MS_PRIVATE before mounting and its mounts are reaped with the
+# namespace instead of a racy host-side umount2. The alert must no longer
+# appear, so it is intentionally NOT skipped here — let it fail as a hard
+# regression guard if the race ever returns.
+def test_go_isolation_rootfs_automount_tmpfs(is_su, require, temp_dir):
     _assert_rootfs_tmpfs_toggle_stable(
         is_su, require, temp_dir, iterations=20
     )
 
 
 def test_go_isolation_rootfs_automount_tmpfs_regression(
-    is_su, require, temp_dir, skip_alert
+    is_su, require, temp_dir
 ):
-    skip_alert(_TMPFS_RELOAD_ALERT)
     _assert_rootfs_tmpfs_toggle_stable(
         is_su, require, temp_dir, iterations=100
     )

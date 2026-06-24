@@ -1,4 +1,4 @@
-name: "Clang AST"
+name: "Analysis (Clang AST)"
 
 on:
   push:
@@ -8,7 +8,8 @@ on:
       - 'auto/**'
       - 'src/**'
       - 'test/**'
-      - '.github/workflows/clang-ast.yaml'
+      - 'pkg/contrib/**'
+      - '.github/workflows/analysis-clang-ast.yml'
   pull_request:
     branches: master
     paths:
@@ -16,7 +17,8 @@ on:
       - 'auto/**'
       - 'src/**'
       - 'test/**'
-      - '.github/workflows/clang-ast.yaml'
+      - 'pkg/contrib/**'
+      - '.github/workflows/analysis-clang-ast.yml'
 
 jobs:
   clang-ast:
@@ -32,7 +34,8 @@ jobs:
           apt-get -y install git wget curl llvm-dev libclang-dev clang make \
                              libssl-dev libpcre2-dev libperl-dev \
                              libphp-embed php-dev python3-dev libpython3-dev \
-                             ruby-dev openjdk-21-jdk npm dpkg-dev
+                             ruby-dev openjdk-21-jdk npm dpkg-dev \
+                             cargo rustc cmake
           npm install -g node-gyp
           # Debian multiarch: RbConfig["libdir"] returns /usr/lib but the
           # actual libruby-X.Y.so is in /usr/lib/<triplet>/.  auto/modules/ruby
@@ -85,7 +88,23 @@ jobs:
       - name: Build Nodejs support
         run: ./configure nodejs && make node-local-install DESTDIR=node
 
+      # wasmtime version is pinned in pkg/contrib/src/wasmtime/version and
+      # built from a checksum-verified source tarball — same as build-test.
+      # Keeps the wasm runtime in sync with what Unit is actually built against.
+      # Cache the compiled artifacts (keyed by pinned version + this distro,
+      # isolated from the ubuntu/fedora builds) to skip the slow from-source
+      # compile on a hit.
+      - name: Cache wasmtime
+        id: cache-wasmtime
+        uses: actions/cache@v5
+        with:
+          path: pkg/contrib/wasmtime/artifacts
+          key: wasmtime-debian-testing-${{ runner.arch }}-${{ hashFiles('pkg/contrib/src/wasmtime/version') }}
+
+      - name: Build wasmtime (pinned via pkg/contrib)
+        if: steps.cache-wasmtime.outputs.cache-hit != 'true'
+        run: make -C pkg/contrib .wasmtime
+
       - name: Build wasm language module
         run: |
-          wget -q -O- https://github.com/bytecodealliance/wasmtime/releases/download/v26.0.0/wasmtime-v26.0.0-x86_64-linux-c-api.tar.xz | tar -xJf -
-          ./configure wasm --include-path=wasmtime-v26.0.0-x86_64-linux-c-api/include --lib-path=wasmtime-v26.0.0-x86_64-linux-c-api/lib --rpath && make wasm
+          ./configure wasm --include-path=pkg/contrib/wasmtime/artifacts/include --lib-path=pkg/contrib/wasmtime/artifacts/lib --rpath && make wasm
