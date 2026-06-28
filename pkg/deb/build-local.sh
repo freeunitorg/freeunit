@@ -321,12 +321,12 @@ if [ "$CLEAN" = "true" ]; then
     fi
 fi
 
-apt-get update
+apt_retry apt-get update
 # ca-certificates + curl: curl is the pkg/contrib downloader for the njs,
 # wasmtime and wasi-sysroot tarballs (it is tried before wget, then fetch); both
 # are also needed for the otel Rust crate fetch over https. curl must not depend
 # on sury being enabled (sury-off skips its setup), so install it here.
-apt-get install -y --no-install-recommends ca-certificates curl
+apt_retry apt-get install -y --no-install-recommends ca-certificates curl
 # Enable sury only when the requested PHP runtimes are missing from base apt.
 # NEED_PHP is always passed by the host; the fallback matches the PHP_PKGS one.
 setup_sury_if_needed "${NEED_PHP:-8.4}"
@@ -340,7 +340,7 @@ done
 # without it, but installing cargo/rustc unconditionally keeps this one path.
 # lsb-release is a real build dep (pkg/deb/Makefile + debian/rules.in derive the
 # CODENAME via `lsb_release -cs`); it must not depend on sury being enabled.
-apt-get install -y --no-install-recommends \
+apt_retry apt-get install -y --no-install-recommends \
     build-essential debhelper devscripts fakeroot lintian lsb-release \
     libxml2-utils xsltproc pkg-config git \
     libssl-dev libpcre2-dev clang llvm cargo rustc \
@@ -418,11 +418,11 @@ printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
 chmod +x /usr/sbin/policy-rc.d
 
 apply_deb_mirror
-apt-get update
+apt_retry apt-get update
 # curl drives the control API and health probes; the unit packages do not pull
 # it in, and sury setup (its only other installer) is skipped for native php8.4
 # and python, so install it explicitly.
-apt-get install -y --no-install-recommends curl
+apt_retry apt-get install -y --no-install-recommends curl
 # Derive the PHP version this module needs (empty for python -> no sury).
 case "$MODULE" in
     ${BRAND}-php*) NEED_PHP="${MODULE#${BRAND}-php}" ;;
@@ -430,7 +430,7 @@ case "$MODULE" in
 esac
 setup_sury_if_needed "$NEED_PHP"
 # core + exactly one module (single PHP version per instance)
-apt-get install -y --no-install-recommends /debs/${BRAND}_*.deb "/debs/${MODULE}_${VERSION}"*.deb
+apt_retry apt-get install -y --no-install-recommends /debs/${BRAND}_*.deb "/debs/${MODULE}_${VERSION}"*.deb
 
 # Packaging/rebrand assertions on the freshly installed set (shared with the
 # combined path); fatal on a broken rebrand, before any request is served.
@@ -499,12 +499,12 @@ printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
 chmod +x /usr/sbin/policy-rc.d
 
 apply_deb_mirror
-apt-get update
+apt_retry apt-get update
 # curl drives the control API and health probes; install it explicitly since the
 # native-php8.4 path skips sury setup (its only other installer).
-apt-get install -y --no-install-recommends curl
+apt_retry apt-get install -y --no-install-recommends curl
 setup_sury_if_needed "$COMBINED_PHP"
-apt-get install -y --no-install-recommends \
+apt_retry apt-get install -y --no-install-recommends \
     /debs/${BRAND}_*.deb \
     "/debs/${BRAND}-php${COMBINED_PHP}_"*.deb \
     /debs/${BRAND}-python3.13_*.deb

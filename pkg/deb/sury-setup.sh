@@ -17,6 +17,27 @@
 # the Debian archive (preferences.d) so the build resolves PHP from one source
 # deterministically — see the pin block below for why this stays invisible to
 # end users.
+
+# Retry an apt-get invocation across transient mirror/network hiccups. A single
+# momentary fetch failure (the sury mirror or deb.debian.org) otherwise aborts
+# the whole script under `set -e`, which surfaced as spurious smoke failures.
+# Retries with linear backoff; the final attempt's exit status propagates so a
+# genuinely broken apt still fails loudly. Defined here because this file is
+# sourced before any apt-get on every build/smoke path, so the smoke scripts
+# reuse it without redefining it.
+apt_retry() {
+    local i=1
+    while [ "$i" -lt 5 ]; do
+        if "$@"; then
+            return 0
+        fi
+        echo "apt_retry: '$*' failed (attempt ${i}/5); retrying in $((i * 3))s" >&2
+        sleep "$((i * 3))"
+        i=$((i + 1))
+    done
+    "$@"
+}
+
 setup_sury_if_needed() {
     local need="${1:-}" mode="${SURY:-auto}" v cand missing=0
 
@@ -39,13 +60,25 @@ setup_sury_if_needed() {
         *) echo "sury: invalid SURY='$mode' (auto|on|off)" >&2; return 1 ;;
     esac
 
-    apt-get install -y --no-install-recommends ca-certificates curl
+    apt_retry apt-get install -y --no-install-recommends ca-certificates curl
     install -d /usr/share/keyrings
     # SURY_MIRROR (empty = upstream) replaces the packages.sury.org base for both
     # the signing key and the apt source, so an offline/local build can resolve
     # php8.3/8.5 from a mirror. The pin host below is derived from the same base.
     local sury_base="${SURY_MIRROR:-https://packages.sury.org}"
     local sury_host="${sury_base#*://}"; sury_host="${sury_host%%/*}"; sury_host="${sury_host%%:*}"
+    # The key fetched below becomes apt's trust anchor (Signed-By). Over a non-https
+    # base its transport is unauthenticated, so an integrity pin is mandatory there:
+    # refuse rather than trust a key an http mirror — or a MITM — could swap. The
+    # https default/base keeps web-PKI transport trust, so the pin stays optional.
+    case "$sury_base" in
+        https://*) : ;;
+        *)
+            if [ -z "${SURY_KEY_SHA256:-}" ]; then
+                echo "sury: refusing to fetch the signing key over non-https '$sury_base' without SURY_KEY_SHA256" >&2
+                return 1
+            fi ;;
+    esac
     curl -fsSL "${sury_base}/php/apt.gpg" -o /usr/share/keyrings/sury-php.gpg
     # Unlike the deb.debian.org rewrite — where only data moves over the mirror
     # and apt verifies Release signatures against the pre-installed Debian keyring
@@ -84,5 +117,5 @@ Package: *php*
 Pin: origin ${sury_host}
 Pin-Priority: 600
 SURYPIN
-    apt-get update
+    apt_retry apt-get update
 }

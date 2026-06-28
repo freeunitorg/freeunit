@@ -25,6 +25,14 @@ on:
         default: auto
         type: choice
         options: [auto, on, off]
+      sury_mirror:
+        description: "Base URL replacing packages.sury.org, no trailing /php (empty = upstream)"
+        default: ""
+        type: string
+      sury_key_sha256:
+        description: "sha256 of sury apt.gpg (required for an http mirror, optional for https)"
+        default: ""
+        type: string
   push:
     branches: [ current, stable, develop ]
     tags:
@@ -45,6 +53,12 @@ permissions:
 # is a one-line change here instead of scattered literals.
 env:
   SURY: ${{ github.event.inputs.sury || 'auto' }}
+  # Optional sury mirror + key integrity pin, both consumed by
+  # pkg/deb/sury-setup.sh (workflow-level env reaches every step's source of it).
+  # Empty — push triggers, or a dispatch left blank — means upstream
+  # packages.sury.org, so default behaviour is unchanged. See FORK.md "Mirrors".
+  SURY_MIRROR: ${{ github.event.inputs.sury_mirror || '' }}
+  SURY_KEY_SHA256: ${{ github.event.inputs.sury_key_sha256 || '' }}
   BRAND: freeunit
   RUNTIME: freeunit
   # Volatile runtime dir for the control socket + pidfile (Makefile RUNDIR ?=
@@ -80,7 +94,7 @@ jobs:
         run: |
           set -eux
           . ./pkg/deb/sury-setup.sh
-          apt-get update
+          apt_retry apt-get update
           # Enable deb.sury.org only when a requested libphpX.Y-embed runtime is
           # missing from base apt (honors $SURY: auto|on|off). See sury-setup.sh.
           setup_sury_if_needed "8.3 8.4 8.5"
@@ -88,7 +102,7 @@ jobs:
           # derive CODENAME via `lsb_release -cs`); keep it independent of sury.
           # curl is the pkg/contrib downloader (njs/wasmtime/wasi-sysroot) and is
           # likewise needed even when sury is disabled.
-          apt-get install -y --no-install-recommends \
+          apt_retry apt-get install -y --no-install-recommends \
             build-essential debhelper devscripts fakeroot lintian lsb-release \
             libxml2-utils xsltproc pkg-config git curl \
             libssl-dev libpcre2-dev clang llvm \
@@ -204,11 +218,11 @@ jobs:
           # No init system in the container; stop maintainer scripts starting it.
           printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
           chmod +x /usr/sbin/policy-rc.d
-          apt-get update
+          apt_retry apt-get update
           # curl drives the control API and health probes; install it explicitly
           # since sury setup (its only other installer) is skipped for native
           # php8.4 and python.
-          apt-get install -y --no-install-recommends curl
+          apt_retry apt-get install -y --no-install-recommends curl
           # This module's PHP version (empty for python -> no sury).
           case "$MODULE_SUFFIX" in
             php*) NEED_PHP="${MODULE_SUFFIX#php}" ;;
@@ -222,7 +236,7 @@ jobs:
           # agnostic glob (underscore separator disambiguates it from the
           # ${BRAND}-<module> packages), while the module glob is pinned to
           # ${VERSION} to match the local runner (build-local.sh).
-          apt-get install -y --no-install-recommends \
+          apt_retry apt-get install -y --no-install-recommends \
             ./debs/"${BRAND}"_*.deb "./debs/${MODULE}_${VERSION}"*.deb
 
           # Packaging/rebrand assertions on the freshly installed set, before any
@@ -395,6 +409,11 @@ jobs:
           SURY
           sudo apt-get update
           ```
+
+          If `packages.sury.org` is unavailable, replace it in both the `curl`
+          and `URIs:` lines with a mirror that also serves the `apt.gpg` key (a
+          plain package mirror without the key will not work). When that mirror
+          is plain http, verify the downloaded key against a known-good sha256.
 
           ### 2. Download, verify checksums, install
 
