@@ -3,7 +3,7 @@
 		"example_java21": {
 			"processes": 1,
 			"type": "java 21",
-			"webapp": "/usr/share/doc/unit-jsc21/examples/jsc-app"
+			"webapp": "/usr/share/doc/%%NAME%%/examples/jsc-app"
 		}
 	},
 

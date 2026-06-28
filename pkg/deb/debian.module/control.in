@@ -1,20 +1,22 @@
 Source: %%NAME%%
 Section: admin
-Priority: extra
+Priority: optional
 Maintainer: %%PACKAGE_VENDOR%%
 Build-Depends: debhelper (>= 11),
                linux-libc-dev,
                libssl-dev,
                libpcre2-dev%%MODULE_BUILD_DEPENDS%%
 Standards-Version: 4.1.4
-Homepage: https://unit.nginx.org
+Homepage: %%HOMEPAGE%%
 
 Package: %%NAME%%
 Section: admin
 Architecture: any
-Depends: lsb-base,
-         ${misc:Depends}, ${shlibs:Depends},
-         unit-r%%UNIT_VERSION%%%%MODULE_DEPENDS%%
+Depends: ${misc:Depends}, ${shlibs:Depends},
+         %%RUNTIME%%-r%%UNIT_VERSION%%%%MODULE_DEPENDS%%
+Provides: %%OLDNAME%% (= ${binary:Version})
+Conflicts: %%OLDNAME%%
+Replaces: %%OLDNAME%%
 Description: %%SUMMARY%%
  NGINX Unit is a runtime and delivery environment for modern distributed
  applications. It runs the application code in multiple languages
@@ -27,8 +29,11 @@ Description: %%SUMMARY%%
 Package: %%NAME%%-dbg
 Section: debug
 Architecture: any
-Priority: extra
+Priority: optional
 Depends: %%NAME%% (= ${binary:Version}),
          ${misc:Depends}
+Provides: %%OLDNAME%%-dbg (= ${binary:Version})
+Conflicts: %%OLDNAME%%-dbg
+Replaces: %%OLDNAME%%-dbg
 Description: %%SUMMARY%% (debug symbols)
  This package contains the debugging symbols for %%NAME%%

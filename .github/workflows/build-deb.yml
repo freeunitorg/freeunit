@@ -1,0 +1,456 @@
+name: "Build deb packages (Debian trixie)"
+
+# Builds binary .deb packages for the core daemon and selected language
+# modules on Debian trixie, smoke-tests each installed package, then
+# publishes them as GitHub Release assets.
+#
+#   * unit            - core daemon (njs + otel, built from pkg/contrib + rust)
+#   * unit-php8.3      - PHP 8.3 module (from deb.sury.org)
+#   * unit-php8.4      - PHP 8.4 module (from deb.sury.org)
+#   * unit-php8.5      - PHP 8.5 module (from deb.sury.org)
+#   * unit-python3.13  - Python 3.13 module (native trixie)
+#
+# Trigger manually (workflow_dispatch) or by pushing one of the fork's
+# development branches to produce build artifacts, or push a version tag to
+# additionally attach the .deb files to the matching GitHub Release. Tag
+# patterns cover the upstream "X.Y.Z" scheme plus the fork-specific
+# packaging-build suffix (e.g. 1.35.5-build1). The release job runs only
+# after the smoke tests pass.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sury:
+        description: "deb.sury.org PHP repo: auto (detect) | on | off"
+        default: auto
+        type: choice
+        options: [auto, on, off]
+      sury_mirror:
+        description: "Base URL replacing packages.sury.org, no trailing /php (empty = upstream)"
+        default: ""
+        type: string
+      sury_key_sha256:
+        description: "sha256 of sury apt.gpg (required for an http mirror, optional for https)"
+        default: ""
+        type: string
+  push:
+    branches: [ current, stable, develop ]
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-build[0-9]+'
+
+# Default to least privilege; only the release job elevates to contents: write.
+permissions:
+  contents: read
+
+# sury mode for the build/smoke jobs. workflow_dispatch can override it; pushes
+# default to auto, which enables deb.sury.org only when a requested
+# libphpX.Y-embed is missing from base apt (see pkg/deb/sury-setup.sh).
+#
+# BRAND / RUNTIME mirror pkg/deb/Makefile (BRAND ?= freeunit, RUNTIME ?= freeunit)
+# and parametrise package names + on-disk paths in the smoke and package-QA jobs,
+# exactly as $BRAND / $RUNTIME do in pkg/deb/build-local.sh — so a future rebrand
+# is a one-line change here instead of scattered literals.
+env:
+  SURY: ${{ github.event.inputs.sury || 'auto' }}
+  # Optional sury mirror + key integrity pin, both consumed by
+  # pkg/deb/sury-setup.sh (workflow-level env reaches every step's source of it).
+  # Empty — push triggers, or a dispatch left blank — means upstream
+  # packages.sury.org, so default behaviour is unchanged. See FORK.md "Mirrors".
+  SURY_MIRROR: ${{ github.event.inputs.sury_mirror || '' }}
+  SURY_KEY_SHA256: ${{ github.event.inputs.sury_key_sha256 || '' }}
+  BRAND: freeunit
+  RUNTIME: freeunit
+  # Volatile runtime dir for the control socket + pidfile (Makefile RUNDIR ?=
+  # /var/run; set /run for the pure FHS path). Forwarded to make and used by the
+  # smoke paths, mirroring $RUNDIR in pkg/deb/build-local.sh.
+  RUNDIR: /var/run
+
+jobs:
+  build-trixie:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+
+    steps:
+      # The debian:trixie image ships without git, so actions/checkout would
+      # fall back to the REST API and leave the workspace unpopulated. Install
+      # git first so checkout performs a real git checkout.
+      - name: Install git for actions/checkout
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd   # v5
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies (PHP via deb.sury.org when needed)
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eux
+          . ./pkg/deb/sury-setup.sh
+          apt_retry apt-get update
+          # Enable deb.sury.org only when a requested libphpX.Y-embed runtime is
+          # missing from base apt (honors $SURY: auto|on|off). See sury-setup.sh.
+          setup_sury_if_needed "8.3 8.4 8.5"
+          # lsb-release is a real build dep (pkg/deb/Makefile + debian/rules.in
+          # derive CODENAME via `lsb_release -cs`); keep it independent of sury.
+          # curl is the pkg/contrib downloader (njs/wasmtime/wasi-sysroot) and is
+          # likewise needed even when sury is disabled.
+          apt_retry apt-get install -y --no-install-recommends \
+            build-essential debhelper devscripts fakeroot lintian lsb-release \
+            libxml2-utils xsltproc pkg-config git curl \
+            libssl-dev libpcre2-dev clang llvm \
+            cargo rustc \
+            php8.3-dev libphp8.3-embed \
+            php8.4-dev libphp8.4-embed \
+            php8.5-dev libphp8.5-embed \
+            python3.13-dev
+
+      - name: Build .deb packages
+        env:
+          # The merged 1.35.6 otel stack (tonic 0.14 + icu 2.2) needs rustc >=
+          # 1.88, but Debian trixie's apt rust is 1.85. Pin the same toolchain
+          # pkg/deb/build-local.sh installs; bump deliberately when a dependency
+          # needs newer.
+          RUST_TOOLCHAIN: "1.88.0"
+        run: |
+          set -eux
+          # debuild would otherwise gate the build on lintian findings
+          echo 'DEBUILD_LINTIAN=no' > "$HOME/.devscripts"
+
+          # Install a pinned stable Rust toolchain via rustup and prepend it to
+          # PATH so it shadows the apt rustc (1.85) during the build, exactly as
+          # pkg/deb/build-local.sh does. The apt cargo/rustc stay only to satisfy
+          # the dpkg build-deps; debuild preserves PATH + RUSTUP_HOME (see
+          # pkg/deb/Makefile), so the newer toolchain reaches the otel crate.
+          export RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo
+          rustup_init="$(mktemp)"
+          curl --proto '=https' -sSf https://sh.rustup.rs -o "$rustup_init"
+          sh "$rustup_init" -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal
+          rm -f "$rustup_init"
+          export PATH="$CARGO_HOME/bin:$PATH"
+          rustc --version
+
+          # unit*/python313 are make TARGET names (upstream-derived, unaffected by
+          # brand); BRAND/RUNTIME/RUNDIR are forwarded as make vars so the built
+          # package names + on-disk paths match what the smoke and package-QA jobs
+          # probe — exactly as pkg/deb/build-local.sh forwards them.
+          make -C pkg/deb BRAND="$BRAND" RUNTIME="$RUNTIME" RUNDIR="$RUNDIR" \
+            unit unit-php83 unit-php84 unit-php85 unit-python313
+          ls -la pkg/deb/debs/
+
+      - name: Upload .deb as workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
+        with:
+          name: freeunit-trixie-debs
+          path: pkg/deb/debs/*.deb
+          if-no-files-found: error
+
+  # Each module is smoke-tested on its own clean container, installed next to
+  # the core only. This mirrors real usage: each unit-php8.x package bundles its
+  # own PHP embed runtime (libphpX.Y-embed), and running several PHP embed
+  # runtimes in one Unit instance is unsupported, so we validate one PHP version
+  # per image.
+  smoke-test:
+    needs: build-trixie
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+    strategy:
+      fail-fast: false
+      # matrix carries the package SUFFIX only (php8.3, python3.13, ...); the full
+      # name is composed as ${BRAND}-${suffix} in the step, since matrix values
+      # cannot reference the env context.
+      matrix:
+        include:
+          - { suffix: php8.3,     kind: php, type: "php",          port: "8083", expect: "OK-PHP-8.3" }
+          - { suffix: php8.4,     kind: php, type: "php",          port: "8084", expect: "OK-PHP-8.4" }
+          - { suffix: php8.5,     kind: php, type: "php",          port: "8085", expect: "OK-PHP-8.5" }
+          - { suffix: python3.13, kind: py,  type: "python 3.13",  port: "8013", expect: "OK-PY-3.13" }
+
+    steps:
+      # Need the repo for pkg/deb/sury-setup.sh (sourced by the run step below).
+      # As in build-trixie, install git first or checkout falls back to the REST
+      # API and leaves the workspace unpopulated.
+      - name: Install git for actions/checkout
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd   # v5
+        with:
+          persist-credentials: false
+
+      - name: Download built .deb packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
+        with:
+          name: freeunit-trixie-debs
+          path: debs
+
+      - name: "Serve a request through ${{ env.BRAND }}-${{ matrix.suffix }}"
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          MODULE_SUFFIX: ${{ matrix.suffix }}
+          APP_KIND: ${{ matrix.kind }}
+          APP_TYPE: ${{ matrix.type }}
+          PORT: ${{ matrix.port }}
+          EXPECT: ${{ matrix.expect }}
+        run: |
+          set -eux
+          # Full package name from the brand + this matrix suffix (see env.BRAND).
+          MODULE="${BRAND}-${MODULE_SUFFIX}"
+          # Upstream version the daemon reports, read from the source tree exactly
+          # as pkg/deb/build-local.sh does (NXT_VERSION) — feeds assert_daemon_version.
+          VERSION="$(grep -m1 '^NXT_VERSION=' version | cut -d= -f2)"; export VERSION
+          . ./pkg/deb/sury-setup.sh
+          # Shared smoke/rebrand assertions — the same file the local runner
+          # sources; consumes BRAND/RUNTIME/RUNDIR/VERSION from the job env.
+          . ./pkg/deb/smoke-asserts.sh
+          # No init system in the container; stop maintainer scripts starting it.
+          printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+          chmod +x /usr/sbin/policy-rc.d
+          apt_retry apt-get update
+          # curl drives the control API and health probes; install it explicitly
+          # since sury setup (its only other installer) is skipped for native
+          # php8.4 and python.
+          apt_retry apt-get install -y --no-install-recommends curl
+          # This module's PHP version (empty for python -> no sury).
+          case "$MODULE_SUFFIX" in
+            php*) NEED_PHP="${MODULE_SUFFIX#php}" ;;
+            *)    NEED_PHP="" ;;
+          esac
+          # Enable deb.sury.org only when libphp${NEED_PHP}-embed is missing from
+          # base apt (honors $SURY: auto|on|off). See sury-setup.sh.
+          setup_sury_if_needed "$NEED_PHP"
+          # core + exactly one module (single PHP version per instance). The
+          # artifact holds exactly one build's debs; the core uses a version-
+          # agnostic glob (underscore separator disambiguates it from the
+          # ${BRAND}-<module> packages), while the module glob is pinned to
+          # ${VERSION} to match the local runner (build-local.sh).
+          apt_retry apt-get install -y --no-install-recommends \
+            ./debs/"${BRAND}"_*.deb "./debs/${MODULE}_${VERSION}"*.deb
+
+          # Packaging/rebrand assertions on the freshly installed set, before any
+          # request is served — fatal on a broken rebrand (mirrors SMOKE_ONE).
+          run_smoke_asserts
+
+          "/usr/sbin/${RUNTIME}d"
+          for _ in $(seq 1 30); do [ -S "${RUNDIR}/control.${RUNTIME}.sock" ] && break; sleep 0.5; done
+          test -S "${RUNDIR}/control.${RUNTIME}.sock"
+
+          mkdir -p /tmp/app
+          if [ "$APP_KIND" = php ]; then
+          printf '<?php echo "OK-PHP-".PHP_VERSION;\n' > /tmp/app/index.php
+          app="{\"type\": \"$APP_TYPE\", \"root\": \"/tmp/app\", \"script\": \"index.php\"}"
+          else
+          cat > /tmp/app/wsgi.py <<'PY'
+          import sys
+
+
+          def application(environ, start_response):
+              start_response("200 OK", [("Content-Type", "text/plain")])
+              body = "OK-PY-%d.%d" % (sys.version_info[0], sys.version_info[1])
+              return [body.encode()]
+          PY
+          app="{\"type\": \"$APP_TYPE\", \"path\": \"/tmp/app\", \"module\": \"wsgi\"}"
+          fi
+          chmod -R a+rX /tmp/app
+
+          curl -fsS -X PUT --unix-socket "${RUNDIR}/control.${RUNTIME}.sock" \
+            --data-binary "{\"listeners\": {\"*:$PORT\": {\"pass\": \"applications/a\"}}, \"applications\": {\"a\": $app}}" \
+            http://localhost/config
+
+          # Round-trip: the controller must echo back the listener we applied.
+          assert_listener_echoed "\*:$PORT"
+
+          out=
+          for _ in $(seq 1 20); do
+            if out=$(curl -fsS "http://localhost:$PORT/" 2>/dev/null) && printf '%s' "$out" | grep -q "$EXPECT"; then
+              # The router itself must answer: a Server: header carrying the
+              # upstream NXT_NAME ("Unit") confirms our daemon served the response.
+              assert_server_header "http://localhost:$PORT/" "$MODULE"
+              echo "PASS $MODULE -> $out (config round-trip + Server header OK)"
+              assert_clean_shutdown
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "FAIL $MODULE (expected '$EXPECT'), last response: '${out:-<none>}'"
+          cat "/var/log/${RUNTIME}.log" || true
+          exit 1
+
+  # Package-level QA gates ported from pkg/deb/build-local.sh: the .deb control
+  # fields + lintian, the install/remove/purge/reinstall lifecycle, and the
+  # drop-in upgrade over a synthetic upstream "unit". Each gate is a function in
+  # the shared pkg/deb/pkg-qa.sh (the local runner sources the same file), and
+  # each runs in its own clean container via the matrix — mirroring how the local
+  # runner gives every gate a fresh --rm container, so installed-package state
+  # never leaks between gates.
+  package-qa:
+    needs: build-trixie
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+    strategy:
+      fail-fast: false
+      matrix:
+        gate: [pkg_qa_control_lintian, pkg_lifecycle, pkg_dropin_upgrade]
+
+    steps:
+      # As in the other jobs, install git first or actions/checkout falls back to
+      # the REST API and leaves the workspace unpopulated (we need pkg-qa.sh).
+      - name: Install git for actions/checkout
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd   # v5
+        with:
+          persist-credentials: false
+
+      - name: Download built .deb packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
+        with:
+          name: freeunit-trixie-debs
+          path: debs
+
+      - name: "Package QA gate: ${{ matrix.gate }}"
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          # BRAND / RUNTIME come from the workflow env; GATE names the pkg-qa.sh
+          # function to run. Passed via env (not interpolated into the script) so
+          # the matrix value is never spliced into the shell command line.
+          GATE: ${{ matrix.gate }}
+        run: |
+          set -eux
+          # No init system in the container; block maintainer scripts starting
+          # the service (the lifecycle/drop-in gates install the package).
+          printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+          chmod +x /usr/sbin/policy-rc.d
+          apt-get update
+          # pkg-qa.sh reads the .deb set from $DEBS_DIR (default /debs) and the
+          # package identity + expected version from $BRAND/$RUNTIME/$VERSION.
+          DEBS_DIR="$PWD/debs"; export DEBS_DIR
+          # Upstream version from the source tree (NXT_VERSION), exactly as
+          # pkg/deb/build-local.sh derives it; a valid glob prefix for the built
+          # ${BRAND}_<version>-<rev>~<suite> package names that pkg-qa.sh matches.
+          VERSION="$(grep -m1 '^NXT_VERSION=' version | cut -d= -f2)"; export VERSION
+          echo "gate=$GATE brand=$BRAND runtime=$RUNTIME version=$VERSION"
+          . ./pkg/deb/pkg-qa.sh
+          "$GATE"
+
+  release:
+    needs: [build-trixie, smoke-test, package-qa]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to upload assets to the release
+    steps:
+      - name: Download built .deb packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
+        with:
+          name: freeunit-trixie-debs
+          path: debs
+
+      - name: Generate checksums and release notes
+        run: |
+          set -eux
+          # SHA256SUMS lists every published .deb; users verify with
+          # `sha256sum -c`. Paths are stored relative to debs/ so the
+          # checksum file works next to the downloaded packages.
+          ( cd debs && sha256sum -- *.deb > SHA256SUMS )
+          # The asset version (e.g. 1.35.5-1.trixie) is the .deb file
+          # name, which GitHub derives from the package version by
+          # replacing the '~' of "1.35.5-1~trixie" with a '.'.
+          core=(debs/"${BRAND}"_*_amd64.deb)
+          DEB="$(basename "${core[0]}" \
+            | sed -E "s#^${BRAND}_(.+)_amd64\.deb\$#\1#")"
+          # @BRAND@/@RUNTIME@ keep the user-facing instructions in sync with the
+          # package identity (mirrors $BRAND/$RUNTIME used everywhere else).
+          sed -e "s/@TAG@/${GITHUB_REF_NAME}/g" -e "s/@DEB@/${DEB}/g" \
+              -e "s/@BRAND@/${BRAND}/g" -e "s/@RUNTIME@/${RUNTIME}/g" \
+            > RELEASE_NOTES.md <<'NOTES'
+          ## Debian trixie packages
+
+          Binary `.deb` packages for FreeUnit on Debian **trixie**
+          (amd64 only): install the core daemon plus exactly one language
+          module — the PHP embed SAPI allows only one PHP version per
+          instance.
+
+          ### 1. Enable deb.sury.org (PHP modules only)
+
+          PHP modules depend on `libphpX.Y-embed` from deb.sury.org. Skip
+          this step if you only install the Python module.
+
+          ```bash
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl gnupg lsb-release
+          sudo curl -fsSL https://packages.sury.org/php/apt.gpg \
+            -o /usr/share/keyrings/sury-php.gpg
+          sudo tee /etc/apt/sources.list.d/sury-php.sources >/dev/null <<'SURY'
+          Types: deb
+          URIs: https://packages.sury.org/php/
+          Suites: $(lsb_release -sc)
+          Components: main
+          Signed-By: /usr/share/keyrings/sury-php.gpg
+          SURY
+          sudo apt-get update
+          ```
+
+          If `packages.sury.org` is unavailable, replace it in both the `curl`
+          and `URIs:` lines with a mirror that also serves the `apt.gpg` key (a
+          plain package mirror without the key will not work). When that mirror
+          is plain http, verify the downloaded key against a known-good sha256.
+
+          ### 2. Download, verify checksums, install
+
+          ```bash
+          DEB=@DEB@                 # version inside the .deb file names
+          MOD=php8.4                # php8.3 | php8.4 | php8.5 | python3.13
+          BASE="https://github.com/${{ github.repository }}/releases/download/@TAG@"
+
+          curl -fLO "$BASE/SHA256SUMS"
+          curl -fLO "$BASE/@BRAND@_${DEB}_amd64.deb"
+          curl -fLO "$BASE/@BRAND@-${MOD}_${DEB}_amd64.deb"
+
+          sha256sum -c --ignore-missing SHA256SUMS
+          sudo apt-get install -y \
+            "./@BRAND@_${DEB}_amd64.deb" "./@BRAND@-${MOD}_${DEB}_amd64.deb"
+          ```
+
+          `sha256sum -c --ignore-missing` checks only the files you
+          downloaded and fails if any digest does not match.
+
+          ### 3. Run
+
+          ```bash
+          sudo systemctl enable --now @RUNTIME@
+          systemctl status @RUNTIME@
+          ```
+
+          Optional `-dbg` (debug symbols) and `-dev` packages are attached
+          to this release. `SHA256SUMS` provides integrity only, not
+          authenticity. The installed package version is `X.Y.Z-1~trixie`
+          (the `.` in the asset file name is GitHub's renaming of `~`).
+          NOTES
+
+      - name: Attach .deb to GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda   # v3.0.0
+        with:
+          body_path: RELEASE_NOTES.md
+          files: |
+            debs/*.deb
+            debs/SHA256SUMS

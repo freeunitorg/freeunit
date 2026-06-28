@@ -3,8 +3,8 @@
 		"example_perl": {
 			"type": "perl",
 			"processes": 1,
-			"working_directory": "/usr/share/doc/unit-perl/examples/perl-app",
-			"script": "/usr/share/doc/unit-perl/examples/perl-app/index.pl"
+			"working_directory": "/usr/share/doc/%%NAME%%/examples/perl-app",
+			"script": "/usr/share/doc/%%NAME%%/examples/perl-app/index.pl"
 		}
 	},
 

@@ -3,7 +3,7 @@
 		"example_java18": {
 			"processes": 1,
 			"type": "java 18",
-			"webapp": "/usr/share/doc/unit-jsc18/examples/jsc-app"
+			"webapp": "/usr/share/doc/%%NAME%%/examples/jsc-app"
 		}
 	},
 

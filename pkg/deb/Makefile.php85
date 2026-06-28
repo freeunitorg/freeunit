@@ -1,0 +1,47 @@
+MODULES+=		php85
+MODULE_SUFFIX_php85=	php8.5
+
+MODULE_SUMMARY_php85=	PHP 8.5 module for $(BRAND_TITLE)
+
+MODULE_VERSION_php85=	$(VERSION)
+MODULE_RELEASE_php85=	1
+
+MODULE_CONFARGS_php85=	php --module=php8.5 --config=php-config8.5
+MODULE_MAKEARGS_php85=	php8.5
+MODULE_INSTARGS_php85=	php8.5-install
+
+MODULE_SOURCES_php85=	freeunit.example-php-app \
+			freeunit.example-php8.5-config
+
+BUILD_DEPENDS_php85=	php8.5-dev libphp8.5-embed
+BUILD_DEPENDS+=		$(BUILD_DEPENDS_php85)
+
+MODULE_BUILD_DEPENDS_php85=,php8.5-dev,libphp8.5-embed
+MODULE_DEPENDS_php85=,libphp8.5-embed
+
+define MODULE_PREINSTALL_php85
+	mkdir -p debian/$(BRAND)-php8.5/usr/share/doc/$(BRAND)-php8.5/examples/phpinfo-app
+	install -m 644 -p debian/freeunit.example-php-app debian/$(BRAND)-php8.5/usr/share/doc/$(BRAND)-php8.5/examples/phpinfo-app/index.php
+	install -m 644 -p debian/freeunit.example-php8.5-config debian/$(BRAND)-php8.5/usr/share/doc/$(BRAND)-php8.5/examples/$(BRAND).config
+endef
+export MODULE_PREINSTALL_php85
+
+define MODULE_POST_php85
+cat <<BANNER
+----------------------------------------------------------------------
+
+The $(MODULE_SUMMARY_php85) has been installed.
+
+To check out the sample app, run these commands:
+
+ sudo service $(RUNTIME) restart
+ cd /usr/share/doc/$(BRAND)-$(MODULE_SUFFIX_php85)/examples
+ $(MODULE_CONFIG_PUT)
+ curl http://localhost:8300/
+
+Online documentation is available at $(DOCS_URL)
+
+----------------------------------------------------------------------
+BANNER
+endef
+export MODULE_POST_php85
