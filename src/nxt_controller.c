@@ -731,8 +731,8 @@ nxt_controller_check_peer_cred(nxt_task_t *task, nxt_conn_t *c)
         struct ucred  cred;
         socklen_t     len = sizeof(cred);
 
-        if (getsockopt(c->socket.fd, SOL_SOCKET, SO_PEERCRED, &cred, &len)
-            != 0)
+        if (getsockopt(c->socket.fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0
+            || len < (socklen_t) sizeof(cred))
         {
             nxt_alert(task, "controller: SO_PEERCRED failed %E", nxt_errno);
             return NXT_ERROR;

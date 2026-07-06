@@ -765,6 +765,11 @@ nxt_java_Request_sendWsFrameArr(JNIEnv *env, jclass cls,
 
     req = nxt_jlong2ptr(req_info_ptr);
 
+    if (arr == NULL) {
+        nxt_java_throw_IllegalStateException(env, "sendWsFrame: array is null");
+        return;
+    }
+
     cap = (*env)->GetArrayLength(env, arr);
     if (pos < 0 || len < 0
         || pos > cap

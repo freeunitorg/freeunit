@@ -1805,6 +1805,13 @@ nxt_unit_process_websocket(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg)
 
         ws_impl->ws.header = (void *) b->buf.start;
 
+        if (nxt_slow_path((size_t) (b->buf.end - b->buf.start) < 2)) {
+            nxt_unit_warn(ctx, "#%"PRIu32": truncated websocket frame header",
+                          req_impl->stream);
+            nxt_unit_websocket_frame_release(&ws_impl->ws);
+            return NXT_UNIT_ERROR;
+        }
+
         hsize = nxt_websocket_frame_header_size(ws_impl->ws.header);
 
         /*
@@ -3599,6 +3606,11 @@ nxt_unit_websocket_retain(nxt_unit_websocket_frame_t *ws)
     }
 
     memcpy(b, ws_impl->buf->buf.start, size);
+
+    if (nxt_slow_path(size < 2)) {
+        nxt_unit_free(ws->req->ctx, b);
+        return NXT_UNIT_ERROR;
+    }
 
     hsize = nxt_websocket_frame_header_size(b);
 

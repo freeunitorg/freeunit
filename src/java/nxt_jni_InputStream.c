@@ -104,6 +104,12 @@ nxt_java_InputStream_readLine(JNIEnv *env, jclass cls,
      * caller can drive an OOB write of up to len bytes past the
      * array's heap allocation.
      */
+    if (out == NULL) {
+        nxt_java_throw_IllegalStateException(env,
+            "InputStream.readLine: output array is null");
+        return -1;
+    }
+
     array_len = (*env)->GetArrayLength(env, out);
     if (off < 0 || len < 0 || off > array_len || len > array_len - off) {
         nxt_java_throw_IllegalStateException(env,
