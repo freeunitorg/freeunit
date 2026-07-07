@@ -3,7 +3,7 @@
 		"example_java20": {
 			"processes": 1,
 			"type": "java 20",
-			"webapp": "/usr/share/doc/unit-jsc20/examples/jsc-app"
+			"webapp": "/usr/share/doc/%%NAME%%/examples/jsc-app"
 		}
 	},
 

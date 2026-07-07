@@ -1,20 +1,21 @@
 #!/bin/sh
 #
-# unitd              NGINX Unit
+# %%RUNTIME%%d              %%BRAND_TITLE%%
 #
 ### BEGIN INIT INFO
-# Provides:          unitd
+# Provides:          %%RUNTIME%%
 # Required-Start:    $network $remote_fs
 # Required-Stop:     $network $remote_fs
 # Default-Start:     2 3 4 5
 # Default-Stop:      0 1 6
-# Short-Description: NGINX Unit
-# Description:       NGINX Unit
+# Short-Description: %%BRAND_TITLE%% application server
+# Description:       %%BRAND_TITLE%% application server
 ### END INIT INFO
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
-DAEMON=/usr/sbin/unitd
-NAME=unit
-DESC=unitd
+DAEMON=/usr/sbin/%%RUNTIME%%d
+NAME=%%RUNTIME%%
+DESC=%%RUNTIME%%d
+PIDFILE=%%RUNDIR%%/$NAME.pid
 
 #includes lsb functions
 . /lib/lsb/init-functions
@@ -29,7 +30,7 @@ umask 022
 case "$1" in
     start)
        	log_daemon_msg "Starting $DESC" "$NAME"
-        if start-stop-daemon --start --quiet --pidfile /var/run/$NAME.pid \
+        if start-stop-daemon --start --quiet --pidfile $PIDFILE \
                 --exec $DAEMON -- $DAEMON_ARGS; then
                 log_end_msg 0
         else
@@ -41,7 +42,7 @@ case "$1" in
         ;;
     stop)
         log_daemon_msg "Stopping $DESC" "$NAME"
-        if start-stop-daemon --oknodo --stop --quiet --pidfile /var/run/$NAME.pid \
+        if start-stop-daemon --oknodo --stop --quiet --pidfile $PIDFILE \
                 --exec $DAEMON; then
                 log_end_msg 0
         else
@@ -49,17 +50,24 @@ case "$1" in
         fi
         ;;
    reload|force-reload)
-        echo "Not implemented." >&2
-        exit 1
+        # The daemon has no signal-based config reload (config is applied via the
+        # control API); SIGUSR1 reopens the log files, matching logrotate's use.
+        log_daemon_msg "Reopening $DESC log files" "$NAME"
+        if start-stop-daemon --stop --signal USR1 --oknodo --quiet \
+                --pidfile $PIDFILE --exec $DAEMON; then
+                log_end_msg 0
+        else
+                log_end_msg 1
+        fi
         ;;
     restart)
         log_action_begin_msg "Restarting $DESC" "$NAME"
 
         start-stop-daemon --stop --quiet --pidfile \
-                /var/run/$NAME.pid --exec $DAEMON || true
+                $PIDFILE --exec $DAEMON || true
         sleep 1
         if start-stop-daemon --start --quiet --pidfile \
-                /var/run/$NAME.pid --exec $DAEMON -- $DAEMON_ARGS; then
+                $PIDFILE --exec $DAEMON -- $DAEMON_ARGS; then
                 log_end_msg 0
         else
                 log_end_msg 1

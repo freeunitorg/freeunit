@@ -1,9 +1,9 @@
 {
 	"applications": {
 		"example_python": {
-			"type": "python 3.14",
+			"type": "python 2.7",
 			"processes": 2,
-			"path": "/usr/share/doc/unit-python3.14/examples/python-app",
+			"path": "/usr/share/doc/%%NAME%%/examples/python-app",
 			"module": "wsgi"
 		}
 	},
