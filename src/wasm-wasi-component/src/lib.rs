@@ -11,9 +11,9 @@ use std::sync::OnceLock;
 use tokio::sync::mpsc;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
-use wasmtime_wasi::p2::{WasiCtx, WasiCtxBuilder, WasiView, IoView,
-                        add_to_linker_async};
-use wasmtime_wasi::{DirPerms, FilePerms};
+use wasmtime_wasi::p2::add_to_linker_async;
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder,
+                    WasiCtxView, WasiView};
 use wasmtime_wasi_http::bindings::http::types::{ErrorCode, Scheme};
 use wasmtime_wasi_http::bindings::ProxyPre;
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
@@ -595,16 +595,19 @@ struct StoreState {
     table: ResourceTable,
 }
 
-impl IoView for StoreState {
-    fn table(&mut self) -> &mut ResourceTable { &mut self.table }
-}
-
 impl WasiView for StoreState {
-    fn ctx(&mut self) -> &mut WasiCtx { &mut self.ctx }
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
+        }
+    }
 }
 
 impl WasiHttpView for StoreState {
     fn ctx(&mut self) -> &mut WasiHttpCtx { &mut self.http }
+
+    fn table(&mut self) -> &mut ResourceTable { &mut self.table }
 }
 
 impl StoreState {}
