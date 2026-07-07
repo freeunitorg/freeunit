@@ -43,6 +43,7 @@ fake_upstream --port <N> --mode <mode> [--requests <N>] [--size <MiB>] [--delay-
 | `abort-mid` | as `chunked-response`, but after `--size` bytes closes the socket **without** the terminal `0\r\n\r\n` — upstream dies mid-stream (#72 case 4) |
 | `slow-drip` | chunked, one 512-byte chunk every `--delay-ms` ms, proper terminal chunk — relay vs `proxy_read_timeout` (#72 case 5) |
 | `dup-te` | 200 with `Transfer-Encoding: chunked` header sent **twice** + valid chunked body — duplicate-TE relay (#72 case 6, nginx/unit#1088) |
+| `overrun-cl` | 200 with a fixed `Content-Length` (100) but 150 body bytes — upstream overruns its advertised length. FreeUnit must relay exactly the advertised bytes and drop the excess (no response splitting), then close the connection as inconsistent |
 
 Deterministic body: byte at global offset `i` is `"0123456789abcdef"[i % 16]`,
 so a test regenerates the exact sequence and verifies the relayed body
@@ -70,6 +71,7 @@ single `grep` finds every side of a case. E.g. token `chunked_response`:
 
 | Port | Token | Mode (CLI) | Rust handler | pytest |
 |------|-------|-----------|--------------|--------|
+| 7989 | `overrun_cl` | `overrun-cl` | `respond_overrun_cl` | `test_proxy_overrun_cl` (Content-Length overrun → excess truncated, no response splitting) |
 | 7990 | `echo` | `echo` | `respond` (echo arm) | — (shared sanity) |
 | 7991 | `strict` | `strict` | `handle` (Strict arm) | chunked **request** → CL (#445, #58) |
 | 7992 | `requires_cl` | `requires-cl` | `handle` (RequiresCl arm) | backend demands `Content-Length` (#1278) |

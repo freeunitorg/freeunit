@@ -464,3 +464,43 @@ def test_unprivileged_user_error(require, skip_alert):
         },
         'applications',
     ), 'setting user'
+
+
+def test_json_deep_nesting():
+    # The controller caps JSON nesting depth so a pathologically deep
+    # payload cannot exhaust its stack.  Well past the cap it must be
+    # rejected cleanly while the control socket keeps serving.
+    depth = 10000
+    payload = '[' * depth + ']' * depth
+
+    assert 'error' in client.conf(payload), 'deep nesting rejected'
+
+    # Controller survived and still applies a valid configuration.
+    assert 'success' in client.conf(
+        {"listeners": {}, "routes": [], "applications": {}}
+    ), 'controller alive after deep nesting'
+
+
+def test_json_too_many_array_elements():
+    # Per-array element count is capped to bound heap usage on a
+    # malformed payload; just over the cap must be rejected without
+    # taking the controller down.
+    payload = '[' + ','.join(['0'] * 100001) + ']'
+
+    assert 'error' in client.conf(payload), 'too many array elements rejected'
+
+    assert 'success' in client.conf(
+        {"listeners": {}, "routes": [], "applications": {}}
+    ), 'controller alive after large array'
+
+
+def test_json_too_many_object_members():
+    # Same cap applies to object members.
+    members = ','.join(f'"k{i}":0' for i in range(100001))
+    payload = '{' + members + '}'
+
+    assert 'error' in client.conf(payload), 'too many object members rejected'
+
+    assert 'success' in client.conf(
+        {"listeners": {}, "routes": [], "applications": {}}
+    ), 'controller alive after large object'

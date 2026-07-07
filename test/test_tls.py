@@ -185,13 +185,14 @@ def test_tls_certificate_update():
     ), 'update certificate'
 
 
-@pytest.mark.skip('not yet')
 def test_tls_certificate_key_incorrect():
     client.load('empty')
 
     client.certificate('first', False)
     client.certificate('second', False)
 
+    # A cert paired with a foreign private key is rejected at config time
+    # (SSL_CTX_check_private_key), not left to fail at the first handshake.
     assert 'error' in client.certificate_load(
         'first', 'second'
     ), 'key incorrect'

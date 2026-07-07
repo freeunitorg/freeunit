@@ -284,6 +284,40 @@ def test_tls_sni_empty_cn():
     assert sock.getpeercert()['subjectAltName'][0][1] == 'alt.localhost.com'
 
 
+def test_tls_sni_empty_san():
+    # A certificate carrying a zero-length SAN entry must not trigger a
+    # one-byte over-read in the wildcard-name SAN matcher during the
+    # bundle-hash insert / SNI lookup.  The empty entry is treated as a
+    # plain (non-wildcard) name; the bundle still loads and the valid
+    # names keep resolving.
+    bundles = {
+        "localhost": {
+            "subj": "empty-san",
+            "alt_names": ['', 'alt.localhost.com'],
+        }
+    }
+    ctx = config_bundles(bundles)
+    add_tls(["localhost"])
+
+    resp, sock = client.get_ssl(
+        headers={
+            'Host': 'alt.localhost.com',
+            'Content-Length': '0',
+            'Connection': 'close',
+        },
+        start=True,
+        context=ctx,
+    )
+
+    assert resp['status'] == 200
+    san = [
+        name
+        for typ, name in sock.getpeercert()['subjectAltName']
+        if typ == 'DNS'
+    ]
+    assert 'alt.localhost.com' in san, 'valid SAN still resolves'
+
+
 def test_tls_sni_invalid():
     _ = config_bundles({"localhost": {"subj": "subj1", "alt_names": ''}})
     add_tls(["localhost"])

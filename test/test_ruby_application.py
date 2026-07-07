@@ -164,6 +164,29 @@ def test_ruby_application_input_each():
     assert client.post(body=body)['body'] == body, 'input each'
 
 
+def test_ruby_application_input_read_retained():
+    client.load('input_read_retained')
+
+    # Pin a single persistent worker so both requests share one process
+    # (the retained rack.input handle lives in a Ruby global).
+    assert 'success' in client.conf(
+        '1', 'applications/input_read_retained/processes'
+    ), 'single process'
+
+    assert client.get()['body'] == 'stashed', 'first request stashes handle'
+
+    # The handle retained from the first request must not read this
+    # request's body -- that would be a cross-request body disclosure on a
+    # shared worker. A request-bound handle yields nil (empty) instead.
+    secret = 'SECRETBODY0123456789'
+    resp = client.post(body=secret)
+
+    assert resp['status'] == 200, 'second request status'
+    assert resp['body'].startswith('leaked['), 'same worker handled both'
+    assert secret not in resp['body'], 'retained rack.input leaked next body'
+    assert resp['body'] == 'leaked[]', 'stale handle reads nothing'
+
+
 @pytest.mark.skip('not yet')
 def test_ruby_application_syntax_error(skip_alert):
     skip_alert(
