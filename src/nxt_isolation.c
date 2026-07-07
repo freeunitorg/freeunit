@@ -502,15 +502,15 @@ nxt_isolation_set_rootfs(nxt_task_t *task, nxt_conf_value_t *isolation,
     if (obj != NULL) {
         nxt_conf_get_string(obj, &str);
 
+        while (str.length > 1 && str.start[str.length - 1] == '/') {
+            str.length--;
+        }
+
         if (nxt_slow_path(str.length <= 1 || str.start[0] != '/')) {
             nxt_log(task, NXT_LOG_ERR, "rootfs requires an absolute path other "
                     "than \"/\" but given \"%V\"", &str);
 
             return NXT_ERROR;
-        }
-
-        if (str.start[str.length - 1] == '/') {
-            str.length--;
         }
 
         process->isolation.rootfs = nxt_mp_alloc(process->mem_pool,

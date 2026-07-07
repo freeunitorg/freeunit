@@ -246,6 +246,11 @@ static nxt_int_t nxt_conf_vldt_cgroup_path(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 #endif
 
+#if (NXT_HAVE_ISOLATION_ROOTFS)
+static nxt_int_t nxt_conf_vldt_rootfs_path(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
+#endif
+
 #if (NXT_HAVE_NJS)
 static nxt_int_t nxt_conf_vldt_js_module(nxt_conf_validation_t *vldt,
      nxt_conf_value_t *value, void *data);
@@ -1365,6 +1370,7 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_app_isolation_members[] = {
     {
         .name       = nxt_string("rootfs"),
         .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_rootfs_path,
     }, {
         .name       = nxt_string("automount"),
         .type       = NXT_CONF_VLDT_OBJECT,
@@ -3458,12 +3464,58 @@ nxt_conf_vldt_cgroup_path(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
                                    &cgpath);
     }
 
-    sprintf(path, "/%*s/", (int) cgpath.length, cgpath.start);
-
-    if (cgpath.length == 0 || strstr(path, "/../") != NULL) {
+    if (cgpath.length == 0
+        || memchr(cgpath.start, '\0', cgpath.length) != NULL)
+    {
         return nxt_conf_vldt_error(vldt,
                                    "The cgroup path \"%V\" is invalid.",
                                    &cgpath);
+    }
+
+    snprintf(path, sizeof(path), "/%.*s/", (int) cgpath.length, cgpath.start);
+
+    if (strstr(path, "/../") != NULL) {
+        return nxt_conf_vldt_error(vldt,
+                                   "The cgroup path \"%V\" is invalid.",
+                                   &cgpath);
+    }
+
+    return NXT_OK;
+}
+
+#endif
+
+
+#if (NXT_HAVE_ISOLATION_ROOTFS)
+
+static nxt_int_t
+nxt_conf_vldt_rootfs_path(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
+    void *data)
+{
+    size_t     trimmed_len;
+    nxt_str_t  rootfs;
+
+    nxt_conf_get_string(value, &rootfs);
+
+    /*
+     * "//" resolves to "/" and is rejected like "/"; the NUL scan below
+     * covers the full, untrimmed length.
+     */
+    trimmed_len = rootfs.length;
+
+    while (trimmed_len > 1 && rootfs.start[trimmed_len - 1] == '/') {
+        trimmed_len--;
+    }
+
+    if (trimmed_len <= 1
+        || rootfs.start[0] != '/'
+        || memchr(rootfs.start, '\0', rootfs.length) != NULL)
+    {
+        return nxt_conf_vldt_error(vldt,
+                                   "The \"rootfs\" path \"%V\" is invalid; "
+                                   "an absolute path other than \"/\" "
+                                   "is required.",
+                                   &rootfs);
     }
 
     return NXT_OK;

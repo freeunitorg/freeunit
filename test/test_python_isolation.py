@@ -225,3 +225,33 @@ def test_python_isolation_cgroup_invalid(require):
     check_invalid('')
     check_invalid('../scope')
     check_invalid('scope/../python')
+    check_invalid('scope\0python')
+
+
+def test_python_isolation_rootfs_invalid():
+    def check_invalid(rootfs):
+        script_path = f'{option.test_dir}/python/empty'
+        assert 'error' in client.conf(
+            {
+                "listeners": {"*:8080": {"pass": "applications/empty"}},
+                "applications": {
+                    "empty": {
+                        "type": "python",
+                        "processes": {"spare": 0},
+                        "path": script_path,
+                        "working_directory": script_path,
+                        "module": "wsgi",
+                        "isolation": {
+                            'rootfs': rootfs,
+                        },
+                    }
+                },
+            }
+        )
+
+    check_invalid('')
+    check_invalid('/')
+    check_invalid('//')
+    check_invalid('///')
+    check_invalid('app/rootfs')
+    check_invalid('/app/rootfs\0/injected')

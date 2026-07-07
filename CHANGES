@@ -78,6 +78,10 @@ Changes with FreeUnit 1.35.6                                     25 Jun 2026
        openat2(RESOLVE_BENEATH), and resolve relative cgroup paths against the
        child's /proc/<pid>/cgroup.
 
+    *) Bugfix: reject embedded NUL bytes in the "rootfs" and cgroup "path"
+       isolation options, and validate "rootfs" as an absolute path other
+       than "/" at configuration time.
+
     *) Bugfix: cap JSON parser depth and element counts in the controller,
        scrub PHP TrueAsync exception state before the prototype fork, and bind
        the Ruby rack.input / rack.errors handles to their originating request.
