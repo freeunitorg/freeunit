@@ -165,6 +165,18 @@ nxt_conn_io_accept(nxt_task_t *task, void *obj, void *data)
         return;
     }
 
+    /*
+     * Set FD_CLOEXEC so the accepted client socket does not leak into
+     * spawned application processes (the accept4()-based path uses
+     * SOCK_CLOEXEC instead).
+     */
+    if (nxt_slow_path(fcntl(s, F_SETFD, FD_CLOEXEC) == -1)) {
+        nxt_alert(task, "fcntl(%d, F_SETFD, FD_CLOEXEC) failed %E", s,
+                  nxt_errno);
+        nxt_socket_close(task, s);
+        return;
+    }
+
     c->socket.fd = s;
 
 #if (NXT_LINUX)

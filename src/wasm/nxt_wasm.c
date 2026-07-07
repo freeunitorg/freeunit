@@ -42,15 +42,95 @@ nxt_wasm_do_response_end(nxt_wasm_ctx_t *ctx)
 void
 nxt_wasm_do_send_headers(nxt_wasm_ctx_t *ctx, uint32_t offset)
 {
-    size_t                      fields_len;
+    size_t                      fields_len, fields_table_end;
     unsigned int                i;
     nxt_wasm_response_fields_t  *rh;
 
+    /*
+     * `offset`, `nfields`, and every (name_off, name_len, value_off,
+     * value_len) tuple arrive from the guest WASM module.  Bound them
+     * against the linear-memory size before any dereference.
+     */
+    if (offset > NXT_WASM_MEM_SIZE - sizeof(nxt_wasm_response_fields_t)) {
+        nxt_unit_req_alert(ctx->req,
+                           "WASM send_headers offset %u out of range", offset);
+        return;
+    }
+
     rh = (nxt_wasm_response_fields_t *)(ctx->baddr + offset);
 
+    /*
+     * Bound the fields[] table.  Each entry is nxt_wasm_http_field_t;
+     * compute end-offset with overflow-safe arithmetic.
+     */
+    if (rh->nfields > (NXT_WASM_MEM_SIZE - offset
+                       - sizeof(nxt_wasm_response_fields_t))
+                      / sizeof(nxt_wasm_http_field_t))
+    {
+        nxt_unit_req_alert(ctx->req,
+                           "WASM send_headers nfields=%u out of range",
+                           rh->nfields);
+        return;
+    }
+    fields_table_end = offset + sizeof(nxt_wasm_response_fields_t)
+                       + (size_t) rh->nfields * sizeof(nxt_wasm_http_field_t);
+
+    /*
+     * Bound each (name, value) range in the guest's memory.  Field
+     * offsets are guest-relative to `rh`, so the absolute offset in
+     * linear memory is `offset + field_off`.
+     *
+     * Two additional caps:
+     *   - `name_len` is passed to nxt_unit_response_add_field() whose
+     *     `name_length` parameter is uint8_t — any name_len > 255 would
+     *     silently truncate, splicing the next bytes of guest memory
+     *     into the emitted header.  Reject up front.
+     *   - `fields_len` is the aggregate sum of every name+value length;
+     *     nothing stops a guest from pointing many fields at the same
+     *     in-bounds region and inflating the sum (or overflowing it).
+     *     Accumulate with overflow checks and cap to the linear-memory
+     *     size: no legitimate response header table can exceed that.
+     */
     fields_len = 0;
     for (i = 0; i < rh->nfields; i++) {
-        fields_len += rh->fields[i].name_len + rh->fields[i].value_len;
+        uint32_t  name_off = rh->fields[i].name_off;
+        uint32_t  name_len = rh->fields[i].name_len;
+        uint32_t  val_off  = rh->fields[i].value_off;
+        uint32_t  val_len  = rh->fields[i].value_len;
+        size_t    abs_name = (size_t) offset + name_off;
+        size_t    abs_val  = (size_t) offset + val_off;
+
+        if (abs_name < fields_table_end
+            || abs_name > NXT_WASM_MEM_SIZE
+            || name_len > NXT_WASM_MEM_SIZE - abs_name
+            || abs_val < fields_table_end
+            || abs_val > NXT_WASM_MEM_SIZE
+            || val_len > NXT_WASM_MEM_SIZE - abs_val)
+        {
+            nxt_unit_req_alert(ctx->req,
+                "WASM send_headers field[%u] out of range "
+                "(name_off=%u name_len=%u val_off=%u val_len=%u)",
+                i, name_off, name_len, val_off, val_len);
+            return;
+        }
+
+        if (name_len > UINT8_MAX) {
+            nxt_unit_req_alert(ctx->req,
+                "WASM send_headers field[%u] name_len=%u exceeds 255",
+                i, name_len);
+            return;
+        }
+
+        if (val_len > NXT_WASM_MEM_SIZE - fields_len
+            || name_len > NXT_WASM_MEM_SIZE - fields_len - val_len)
+        {
+            nxt_unit_req_alert(ctx->req,
+                "WASM send_headers aggregate header size exceeds %zu "
+                "at field[%u]", (size_t) NXT_WASM_MEM_SIZE, i);
+            return;
+        }
+
+        fields_len += name_len + val_len;
     }
 
     nxt_unit_response_init(ctx->req, ctx->status, rh->nfields, fields_len);
@@ -80,7 +160,25 @@ nxt_wasm_do_send_response(nxt_wasm_ctx_t *ctx, uint32_t offset)
         nxt_unit_response_init(req, ctx->status, 0, 0);
     }
 
+    /*
+     * `offset` arrives from the guest WASM module; bound it against
+     * the linear-memory size before dereferencing.
+     */
+    if (offset > NXT_WASM_MEM_SIZE - sizeof(nxt_wasm_response_t)) {
+        nxt_unit_req_alert(req,
+                           "WASM send_response offset %u out of range", offset);
+        return;
+    }
+
     resp = (nxt_wasm_response_t *)(nxt_wasm_ctx.baddr + offset);
+
+    if (resp->size > NXT_WASM_MEM_SIZE
+        - offset - offsetof(nxt_wasm_response_t, data))
+    {
+        nxt_unit_req_alert(req, "WASM send_response size %u out of range",
+                           resp->size);
+        return;
+    }
 
     nxt_unit_response_write(req, (const char *)resp->data, resp->size);
 }
@@ -97,22 +195,64 @@ nxt_wasm_request_handler(nxt_unit_request_info_t *req)
     nxt_wasm_request_t     *wr;
     nxt_wasm_http_field_t  *df;
 
+    /*
+     * Publish the in-flight request on the shared ctx *before* any
+     * hook or guarded jump so REQUEST_INIT / REQUEST_END always see
+     * the right request — including the bounds-failure paths that
+     * goto request_done before reaching the body-read block below.
+     * Without this, REQUEST_END would fire with a stale (or NULL)
+     * ctx->req on the first guarded exit of any worker.
+     */
+    nxt_wasm_ctx.req = req;
+
     NXT_WASM_DO_HOOK(NXT_WASM_FH_REQUEST_INIT);
 
     wr = (nxt_wasm_request_t *)nxt_wasm_ctx.baddr;
 
+    /*
+     * Each request field is copied into the WASM linear memory at the
+     * running `offset`.  Without bounds checks, an unusually large
+     * request (many headers, oversized header values) can drive the
+     * memcpy past the end of the 32 MB sandbox region.
+     */
+    /*
+     * Route bounds failures through the request_done label so the
+     * REQUEST_END hook still fires — modules tracking per-request
+     * state in request_init_handler need their matching cleanup.
+     */
+#define WASM_OFFSET_GUARD(need)                                                \
+    do {                                                                       \
+        if (offset > NXT_WASM_MEM_SIZE - 1                                     \
+            || (size_t)(need) > NXT_WASM_MEM_SIZE - 1 - offset)                \
+        {                                                                      \
+            nxt_unit_req_alert(req,                                            \
+                "WASM request buffer overflow at offset %zu", offset);         \
+            nxt_unit_request_done(req, NXT_UNIT_ERROR);                        \
+            goto request_done;                                                 \
+        }                                                                      \
+    } while (0)
+
 #define SET_REQ_MEMBER(dmember, smember) \
     do { \
         const char *str = nxt_unit_sptr_get(&r->smember); \
+        size_t      slen = strlen(str); \
+        WASM_OFFSET_GUARD(slen); \
         wr->dmember##_off = offset; \
-        wr->dmember##_len = strlen(str); \
-        memcpy((uint8_t *)wr + offset, str, wr->dmember##_len + 1); \
-        offset += wr->dmember##_len + 1; \
+        wr->dmember##_len = slen; \
+        memcpy((uint8_t *)wr + offset, str, slen + 1); \
+        offset += slen + 1; \
     } while (0)
 
     r = req->request;
     offset = sizeof(nxt_wasm_request_t)
              + (r->fields_count * sizeof(nxt_wasm_http_field_t));
+
+    if (offset > NXT_WASM_MEM_SIZE) {
+        nxt_unit_req_alert(req, "WASM request header table exceeds linear "
+                           "memory: fields_count=%u", r->fields_count);
+        nxt_unit_request_done(req, NXT_UNIT_ERROR);
+        goto request_done;
+    }
 
     SET_REQ_MEMBER(path, path);
     SET_REQ_MEMBER(method, method);
@@ -129,19 +269,24 @@ nxt_wasm_request_handler(nxt_unit_request_info_t *req)
     for (sf = r->fields; sf < sf_end; sf++) {
         const char  *name = nxt_unit_sptr_get(&sf->name);
         const char  *value = nxt_unit_sptr_get(&sf->value);
+        size_t      nlen = strlen(name);
+        size_t      vlen = strlen(value);
 
+        WASM_OFFSET_GUARD(nlen);
         df->name_off = offset;
-        df->name_len = strlen(name);
-        memcpy((uint8_t *)wr + offset, name, df->name_len + 1);
-        offset += df->name_len + 1;
+        df->name_len = nlen;
+        memcpy((uint8_t *)wr + offset, name, nlen + 1);
+        offset += nlen + 1;
 
+        WASM_OFFSET_GUARD(vlen);
         df->value_off = offset;
-        df->value_len = strlen(value);
-        memcpy((uint8_t *)wr + offset, value, df->value_len + 1);
-        offset += df->value_len + 1;
+        df->value_len = vlen;
+        memcpy((uint8_t *)wr + offset, value, vlen + 1);
+        offset += vlen + 1;
 
         df++;
     }
+#undef WASM_OFFSET_GUARD
 
     wr->tls = r->tls;
     wr->nfields = r->fields_count;
@@ -156,7 +301,6 @@ nxt_wasm_request_handler(nxt_unit_request_info_t *req)
     wr->request_size = offset + bytes_read;
 
     nxt_wasm_ctx.status = NXT_WASM_HTTP_OK;
-    nxt_wasm_ctx.req = req;
     err = nxt_wops->exec_request(&nxt_wasm_ctx);
     if (err) {
         goto out_err_500;

@@ -883,6 +883,7 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
         p = nxt_realpath(tmp);
         if (nxt_slow_path(p == NULL)) {
             nxt_alert(task, "script realpath(%s) failed %E", tmp, nxt_errno);
+            nxt_free(tmp);
             return NXT_ERROR;
         }
 
@@ -1471,6 +1472,11 @@ nxt_php_dynamic_request(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
         path.length = ctx->path_info.start - path.start;
 
         ctx->path_info.length = r->path_length - path.length;
+        /*
+         * ctx->path_info points into the shmem-mapped request buffer
+         * and is not NUL-terminated.  All consumers below use the
+         * length field; do not pass path_info.start to C-string APIs.
+         */
 
     } else if (path.start[path.length - 1] == '/') {
         script_name = *ctx->index;
@@ -1792,7 +1798,9 @@ nxt_php_send_headers(sapi_headers_struct *sapi_headers TSRMLS_DC)
         }
 
         value = colon + 1;
-        while(isspace(*value)) {
+        while (value < h->header + h->header_len
+               && isspace((unsigned char) *value))
+        {
             value++;
         }
 
@@ -2389,7 +2397,25 @@ nxt_php_async_load_entrypoint(nxt_task_t *task, nxt_str_t *entrypoint)
                   nxt_php_request_callback ? Z_TYPE_P(nxt_php_request_callback) : -1);
     }
 
-    /* DON'T call php_request_shutdown() - we want the callback to persist after fork */
+    /*
+     * DON'T call php_request_shutdown() — we want the callback zval to
+     * persist across the prototype → worker fork.  But scrub any
+     * pending exception left in EG: if the entrypoint script raised
+     * something that wasn't caught before HttpServer->onRequest()
+     * stored the callback, every forked worker would inherit the
+     * exception on its first request.  The callback zval itself
+     * (nxt_php_request_callback) is not on the exception path; it
+     * was registered explicitly by the userland code.
+     *
+     * Other EG globals (output buffers, error_reporting, the symbol
+     * table) are also inherited, but those are reset implicitly when
+     * the worker enters a fresh request_init.  Exception state is
+     * the one that bites hardest because the next request's
+     * php_execute_script() can early-exit on a stale EG(exception).
+     */
+    if (EG(exception) != NULL) {
+        zend_clear_exception();
+    }
 
     return NXT_OK;
 }
