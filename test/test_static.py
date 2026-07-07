@@ -209,6 +209,23 @@ def test_static_path():
     assert client.get(url='/../assets/')['status'] == 400, 'path invalid 5'
 
 
+def test_static_path_encoded():
+    # Percent-encoded and partially-encoded dot segments are decoded before
+    # path normalization, so an encoded "../" cannot bypass the traversal
+    # guard that rejects the plain form.
+    assert (
+        client.get(url='/dir/%2e%2e/dir/file')['status'] == 200
+    ), 'encoded relative stays in root'
+
+    assert client.get(url='/%2e%2e/')['status'] == 400, 'encoded ..'
+    assert client.get(url='/%2e%2e')['status'] == 400, 'encoded .. no slash'
+    assert client.get(url='/%2e./')['status'] == 400, 'partial encoded .. 1'
+    assert client.get(url='/.%2e/')['status'] == 400, 'partial encoded .. 2'
+    assert (
+        client.get(url='/%2e%2e/assets/')['status'] == 400
+    ), 'encoded traversal to sibling'
+
+
 def test_static_two_clients():
     sock = client.get(no_recv=True)
     sock2 = client.get(no_recv=True)
