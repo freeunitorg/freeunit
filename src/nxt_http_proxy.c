@@ -412,6 +412,32 @@ nxt_http_proxy_content_length(void *ctx, nxt_http_field_t *field,
 
     r = ctx;
 
+    /*
+     * A second Content-Length header from the upstream is a classic
+     * response-smuggling primitive: the two values disagree on where the
+     * body ends, and silently overwriting the first with the second lets
+     * a malicious/compromised upstream desync the proxy from the client.
+     *
+     * Mark the response inconsistent (disables keepalive and closes the
+     * connection after this response, same as the parse-error path below)
+     * and do not trust either value: skip both Content-Length fields so
+     * neither is forwarded to the client, and reset content_length_n to -1
+     * so the body is framed by read-to-EOF rather than by an ambiguous
+     * advertised length.  Forwarding both headers would let a downstream
+     * parser that honours the other value re-frame the body.
+     */
+    if (r->resp.content_length != NULL) {
+        nxt_log(&r->task, NXT_LOG_WARN,
+                "upstream sent duplicate Content-Length");
+
+        r->inconsistent = 1;
+        r->resp.content_length->skip = 1;
+        field->skip = 1;
+        r->resp.content_length_n = -1;
+
+        return NXT_OK;
+    }
+
     r->resp.content_length = field;
 
     n = nxt_off_t_parse(field->value, field->value_length);

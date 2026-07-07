@@ -1,6 +1,11 @@
 
 Changes with FreeUnit 1.35.6                                     07 Jul 2026
 
+    *) Bugfix: treat duplicate upstream "Content-Length" headers in a
+       proxied response as inconsistent — both headers are dropped and the
+       body is read to EOF instead of trusting either length, preventing a
+       response-smuggling desynchronization.
+
     *) Bugfix: bound the request-header fields region against the shared
        memory message size in libunit, validate every field name/value
        serialized pointer and the cached header-field indexes before use,
