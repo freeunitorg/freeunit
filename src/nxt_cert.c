@@ -1175,12 +1175,20 @@ nxt_cert_store_get_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_runtime_t        *rt;
     nxt_port_msg_type_t  type;
 
-    port = nxt_runtime_port_find(task->thread->runtime, msg->port_msg.pid,
+    /*
+     * Look up the sender's port via the kernel-validated PID
+     * (SCM_CREDENTIALS).  msg->port_msg.pid is self-declared, so using
+     * it would let a compromised worker spoof the controller / router
+     * and pull arbitrary certificate material out of main.
+     */
+    port = nxt_runtime_port_find(task->thread->runtime,
+                                 nxt_recv_msg_cmsg_pid(msg),
                                  msg->port_msg.reply_port);
 
     if (nxt_slow_path(port == NULL)) {
         nxt_alert(task, "process port not found (pid %PI, reply_port %d)",
-                  msg->port_msg.pid, msg->port_msg.reply_port);
+                  nxt_recv_msg_cmsg_pid(msg), msg->port_msg.reply_port);
+        nxt_port_recv_msg_close_fds(msg);
         return;
     }
 
@@ -1188,7 +1196,8 @@ nxt_cert_store_get_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
                       && port->type != NXT_PROCESS_ROUTER))
     {
         nxt_alert(task, "process %PI cannot store certificates",
-                  msg->port_msg.pid);
+                  nxt_recv_msg_cmsg_pid(msg));
+        nxt_port_recv_msg_close_fds(msg);
         return;
     }
 
@@ -1282,12 +1291,14 @@ nxt_cert_store_delete_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     if (nxt_slow_path(ctl_port == NULL)) {
         nxt_alert(task, "controller port not found");
+        nxt_port_recv_msg_close_fds(msg);
         return;
     }
 
     if (nxt_slow_path(nxt_recv_msg_cmsg_pid(msg) != ctl_port->pid)) {
         nxt_alert(task, "process %PI cannot delete certificates",
                   nxt_recv_msg_cmsg_pid(msg));
+        nxt_port_recv_msg_close_fds(msg);
         return;
     }
 
