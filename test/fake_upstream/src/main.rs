@@ -52,7 +52,24 @@ enum Mode {
     SlowDrip,
     DupTe,
     OverrunCl,
+    BadCl,
+    OverrunClKa,
+    ChunkedTrailer,
+    ChunkedExt,
 }
+
+/// Small fixed body (bytes) for the `chunked-trailer` / `chunked-ext` modes.
+/// Deterministic (PATTERN by offset) so the test regenerates it exactly; split
+/// into two chunks by CHUNKED_EDGE_SPLIT.
+const CHUNKED_EDGE_LEN: usize = 40;
+const CHUNKED_EDGE_SPLIT: usize = 16;
+
+/// Deterministic body for the `bad-cl` mode and the exact (invalid)
+/// Content-Length value it advertises. The value is non-numeric so the
+/// upstream Content-Length parse fails (n < 0), exercising the "log and
+/// flag inconsistent" branch in nxt_http_proxy_content_length.
+const BAD_CL_BODY: &[u8] = b"0123456789";
+const BAD_CL_VALUE: &str = "notanumber";
 
 /// Advertised Content-Length and the number of unadvertised excess bytes for
 /// the `overrun-cl` mode. Kept tiny and fixed so the whole response fits one
@@ -420,6 +437,100 @@ fn respond_overrun_cl(stream: &mut TcpStream) {
     let _ = stream.flush();
 }
 
+/// Send a response whose Content-Length is syntactically invalid
+/// (non-numeric), followed by a small body, then close. FreeUnit's
+/// nxt_http_proxy_content_length must log and mark the response
+/// inconsistent rather than leaving content_length_n at -1 and
+/// mis-framing the relayed body. Mirrors pytest `test_proxy_bad_cl`.
+fn respond_bad_cl(stream: &mut TcpStream) {
+    let mut resp = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/octet-stream\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        BAD_CL_VALUE
+    )
+    .into_bytes();
+
+    resp.extend_from_slice(BAD_CL_BODY);
+
+    let _ = stream.write_all(&resp);
+    let _ = stream.flush();
+}
+
+/// Like `overrun-cl` but the response is keep-alive-able (HTTP/1.1, no
+/// `Connection: close`). The point is to prove that FreeUnit closes the
+/// *downstream* connection because it flagged the response inconsistent —
+/// not merely because the upstream asked to close. Mirrors pytest
+/// `test_proxy_overrun_cl_keepalive`.
+fn respond_overrun_cl_ka(stream: &mut TcpStream) {
+    let total = OVERRUN_DECLARED + OVERRUN_EXCESS;
+
+    let mut resp = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/octet-stream\r\n\
+         Content-Length: {}\r\n\r\n",
+        OVERRUN_DECLARED
+    )
+    .into_bytes();
+
+    for i in 0..total {
+        resp.push(PATTERN[i % PATTERN.len()]);
+    }
+
+    let _ = stream.write_all(&resp);
+    let _ = stream.flush();
+}
+
+/// Write CHUNKED_EDGE_LEN deterministic bytes as two chunks. `ext` adds a
+/// chunk-extension to each chunk-size line; `trailer` appends a trailer field
+/// after the terminal chunk. Both must be relayed transparently: the client
+/// gets the exact body, extensions stripped, and (per Unit) trailers dropped.
+fn respond_chunked_edge(stream: &mut TcpStream, ext: bool, trailer: bool) {
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: application/octet-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    if stream.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+
+    let sizes = [CHUNKED_EDGE_SPLIT, CHUNKED_EDGE_LEN - CHUNKED_EDGE_SPLIT];
+    let mut offset = 0usize;
+
+    for n in sizes {
+        let mut chunk = Vec::with_capacity(n);
+        for i in 0..n {
+            chunk.push(PATTERN[(offset + i) % PATTERN.len()]);
+        }
+        offset += n;
+
+        let size_line = if ext {
+            format!("{:x};ext=val\r\n", n)
+        } else {
+            format!("{:x}\r\n", n)
+        };
+
+        if stream
+            .write_all(size_line.as_bytes())
+            .and_then(|_| stream.write_all(&chunk))
+            .and_then(|_| stream.write_all(b"\r\n"))
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    let terminal: &[u8] = if trailer {
+        b"0\r\nX-Trailer-Test: trailed\r\n\r\n"
+    } else {
+        b"0\r\n\r\n"
+    };
+
+    let _ = stream.write_all(terminal);
+    let _ = stream.flush();
+}
+
 fn handle(mut stream: TcpStream, opts: &Opts) {
     let req = match read_request(&stream) {
         Ok(r) => r,
@@ -448,6 +559,22 @@ fn handle(mut stream: TcpStream, opts: &Opts) {
 
         Mode::OverrunCl => {
             respond_overrun_cl(&mut stream);
+        }
+
+        Mode::BadCl => {
+            respond_bad_cl(&mut stream);
+        }
+
+        Mode::OverrunClKa => {
+            respond_overrun_cl_ka(&mut stream);
+        }
+
+        Mode::ChunkedTrailer => {
+            respond_chunked_edge(&mut stream, false, true);
+        }
+
+        Mode::ChunkedExt => {
+            respond_chunked_edge(&mut stream, true, false);
         }
 
         Mode::Echo => {
@@ -506,7 +633,8 @@ fn usage() -> ! {
     eprintln!(
         "Usage: fake_upstream --port <N> \
          --mode <requires-cl|no-te|strict|echo|chunked-response|\
-         abort-mid|slow-drip|dup-te|overrun-cl> \
+         abort-mid|slow-drip|dup-te|overrun-cl|bad-cl|\
+         overrun-cl-ka|chunked-trailer|chunked-ext> \
          [--requests <N>] [--size <MiB>] [--delay-ms <N>]"
     );
     process::exit(1);
@@ -540,6 +668,10 @@ fn main() {
                     "slow-drip" => Some(Mode::SlowDrip),
                     "dup-te" => Some(Mode::DupTe),
                     "overrun-cl" => Some(Mode::OverrunCl),
+                    "bad-cl" => Some(Mode::BadCl),
+                    "overrun-cl-ka" => Some(Mode::OverrunClKa),
+                    "chunked-trailer" => Some(Mode::ChunkedTrailer),
+                    "chunked-ext" => Some(Mode::ChunkedExt),
                     _ => None,
                 });
             }
