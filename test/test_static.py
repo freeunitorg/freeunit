@@ -106,6 +106,51 @@ def test_static_etag(temp_dir):
     assert etag != client.get(url='/')['headers']['ETag'], 'new ETag'
 
 
+def test_static_range_ignored():
+    # Unit does not implement byte-range requests for static files. Per
+    # RFC 7233 a server that does not support Range MUST ignore it and
+    # return the full 200 representation -- never a malformed 206.
+    resp = client.get(
+        url='/index.html',
+        headers={
+            'Host': 'localhost',
+            'Range': 'bytes=0-4',
+            'Connection': 'close',
+        },
+    )
+    assert resp['status'] == 200, 'range ignored -> full 200'
+    assert resp['body'] == '0123456789', 'full body returned'
+    assert 'Content-Range' not in resp['headers'], 'no Content-Range'
+
+
+def test_static_conditional_ignored():
+    # Conditional requests are not implemented; a matching validator must
+    # not produce a 304 (which would imply the body was withheld).
+    etag = client.get(url='/index.html')['headers']['ETag']
+
+    resp = client.get(
+        url='/index.html',
+        headers={
+            'Host': 'localhost',
+            'If-None-Match': etag,
+            'Connection': 'close',
+        },
+    )
+    assert resp['status'] == 200, 'if-none-match ignored'
+    assert resp['body'] == '0123456789', 'full body on matching etag'
+
+    resp = client.get(
+        url='/index.html',
+        headers={
+            'Host': 'localhost',
+            'If-Modified-Since': 'Thu, 01 Jan 2100 00:00:00 GMT',
+            'Connection': 'close',
+        },
+    )
+    assert resp['status'] == 200, 'if-modified-since ignored'
+    assert resp['body'] == '0123456789', 'full body on future date'
+
+
 def test_static_redirect():
     resp = client.get(url='/dir')
     assert resp['status'] == 301, 'redirect status'
