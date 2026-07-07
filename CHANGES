@@ -1,6 +1,12 @@
 
 Changes with FreeUnit 1.35.6                                     07 Jul 2026
 
+    *) Bugfix: bound the request-header fields region against the shared
+       memory message size in libunit, validate every field name/value
+       serialized pointer and the cached header-field indexes before use,
+       and range-check off/len in the Java InputStream read() binding,
+       preventing out-of-bounds access on a malformed request.
+
     *) Feature: SIGQUIT now performs a graceful stop — application workers
        drain in-flight requests before exiting; SIGTERM remains the fast
        exit that drops them.
