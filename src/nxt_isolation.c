@@ -919,6 +919,8 @@ nxt_isolation_prepare_rootfs(nxt_task_t *task, nxt_process_t *process)
 #endif
 
     for (i = 0; i < n; i++) {
+        int  mnt_dst_fd = -1;
+
         dst = mnt[i].dst;
 
         if (mnt[i].deps && !automount->language_deps) {
@@ -997,12 +999,26 @@ nxt_isolation_prepare_rootfs(nxt_task_t *task, nxt_process_t *process)
                 }
 
             } else {
-                close(fd);
+                /*
+                 * Keep the validated fd open and mount onto it directly
+                 * (via /proc/self/fd/<fd> in nxt_fs_mount) so the mount
+                 * targets the exact inode openat2 resolved, rather than
+                 * re-resolving dst as a path and reopening the check-then-
+                 * use window.  Closed after the mount below.
+                 */
+                mnt_dst_fd = fd;
             }
         }
 #endif
 
-        ret = nxt_fs_mount(task, &mnt[i]);
+        ret = nxt_fs_mount(task, &mnt[i], mnt_dst_fd);
+
+#if (NXT_HAVE_OPENAT2)
+        if (mnt_dst_fd != -1) {
+            close(mnt_dst_fd);
+        }
+#endif
+
         if (nxt_slow_path(ret != NXT_OK)) {
             goto undo;
         }

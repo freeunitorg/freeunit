@@ -1,6 +1,11 @@
 
 Changes with FreeUnit 1.35.6                                     07 Jul 2026
 
+    *) Bugfix: mount rootfs automount destinations onto the openat2
+       validated descriptor via "/proc/self/fd" instead of re-resolving the
+       path, closing a check-to-use window in which a destination component
+       could be swapped for a symlink escaping the rootfs.
+
     *) Bugfix: treat duplicate upstream "Content-Length" headers in a
        proxied response as inconsistent — both headers are dropped and the
        body is read to EOF instead of trusting either length, preventing a
