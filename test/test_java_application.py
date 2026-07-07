@@ -1032,3 +1032,26 @@ def test_java_application_threads():
         sock.close()
 
     assert len(socks) == len(threads), 'threads differs'
+
+
+def test_java_input_readline_bounds():
+    client.load('input_readline_bounds')
+
+    # The app calls ServletInputStream.readLine(buf, 0, 1000) into an 8-byte
+    # buffer. The native readLine must reject the out-of-bounds (off, len)
+    # (IllegalStateException) instead of writing past the array; the worker
+    # must stay alive to serve the follow-up request.
+    resp = client.post(
+        headers={'Host': 'localhost', 'Connection': 'close'},
+        body='0123456789',
+    )
+    assert resp['status'] == 200, f'status: {resp}'
+    assert resp['body'] == 'rejected', f'bad readLine bounds not rejected: {resp}'
+
+    # Worker survived the guarded call.
+    assert (
+        client.post(
+            headers={'Host': 'localhost', 'Connection': 'close'}, body='x'
+        )['status']
+        == 200
+    ), 'worker survived'
