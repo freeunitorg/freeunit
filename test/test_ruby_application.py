@@ -183,7 +183,13 @@ def test_ruby_application_input_read_retained():
 
     assert resp['status'] == 200, 'second request status'
     assert resp['body'].startswith('leaked['), 'same worker handled both'
+    # The security invariant is "no disclosure": the retained handle must
+    # not expose this request's body.
     assert secret not in resp['body'], 'retained rack.input leaked next body'
+    # Exact match asserts the current fix behavior: a stale read returns
+    # nil -> '' (empty). If the fix ever switches to raising on a stale
+    # handle instead, config.ru would yield 'leaked[err:...]' and only this
+    # line needs updating -- the disclosure invariant above still holds.
     assert resp['body'] == 'leaked[]', 'stale handle reads nothing'
 
 

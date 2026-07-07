@@ -2,11 +2,16 @@
 
 An upstream that sends more body bytes than its Content-Length advertises must
 not have the excess relayed downstream: FreeUnit already sent that same
-Content-Length to the client, so forwarding the surplus would smuggle bytes
-into the next response on the connection (response splitting). The hardening in
+Content-Length to the client, so forwarding the surplus is what would enable
+response splitting on a kept-alive connection. The hardening in
 nxt_h1p_peer_body_process truncates the buf chain to the advertised length,
 flags the response inconsistent (disabling keep-alive) and closes the
 connection.
+
+This test asserts the mechanism that prevents splitting -- the client receives
+exactly the advertised bytes and no more -- rather than driving a second
+pipelined request; a single request with `Connection: close` is enough to
+observe the truncation.
 
 Driven by the `overrun-cl` mode of the Rust mock upstream
 (test/fake_upstream/): it declares `Content-Length: 100` but writes 150 bytes.
@@ -49,7 +54,14 @@ def _run_overrun_cl(port=UPSTREAM_OVERRUN_PORT):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
-    waitforsocket(port)
+    # Tear the process down if it never binds — otherwise a waitforsocket
+    # timeout would raise before the caller's try/finally and leak it.
+    try:
+        waitforsocket(port)
+    except Exception:
+        proc.terminate()
+        proc.wait()
+        raise
     return proc
 
 

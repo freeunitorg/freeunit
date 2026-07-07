@@ -185,17 +185,29 @@ def test_tls_certificate_update():
     ), 'update certificate'
 
 
-def test_tls_certificate_key_incorrect():
+def test_tls_certificate_key_incorrect(skip_alert):
+    skip_alert(r'nxt_openssl_chain_file\(\) failed', r'failed to apply new conf')
+
     client.load('empty')
 
     client.certificate('first', False)
     client.certificate('second', False)
 
-    # A cert paired with a foreign private key is rejected at config time
-    # (SSL_CTX_check_private_key), not left to fail at the first handshake.
-    assert 'error' in client.certificate_load(
+    # A structurally valid bundle (a private key + a certificate) is stored
+    # fine -- the cert store only checks PEM structure. The key/cert
+    # *mismatch* is caught later, when the router builds the listener's
+    # SSL_CTX (SSL_CTX_check_private_key), rather than being left to fail at
+    # the first handshake.
+    assert 'success' in client.certificate_load(
         'first', 'second'
-    ), 'key incorrect'
+    ), 'mismatched bundle stored'
+
+    # pass at the existing app so the mismatched cert is the only reason
+    # the listener config can be rejected.
+    assert 'error' in client.conf(
+        {"pass": "applications/empty", "tls": {"certificate": 'first'}},
+        'listeners/*:8080',
+    ), 'mismatched key/cert rejected at listener config'
 
 
 def test_tls_certificate_change():

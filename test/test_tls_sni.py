@@ -297,6 +297,26 @@ def test_tls_sni_empty_san():
         }
     }
     ctx = config_bundles(bundles)
+
+    # Guard against an openssl/libressl version silently dropping the empty
+    # SAN: the generated cert must actually carry the zero-length entry,
+    # otherwise this test would pass without exercising the over-read guard
+    # at all.  The SAN line reads "DNS:, DNS:alt.localhost.com" -> two
+    # "DNS:" tokens; a dropped empty entry leaves only one.
+    cert_text = subprocess.check_output(
+        [
+            'openssl',
+            'x509',
+            '-in',
+            f'{option.temp_dir}/localhost.crt',
+            '-noout',
+            '-text',
+        ],
+        stderr=subprocess.STDOUT,
+        encoding='utf-8',
+    )
+    assert cert_text.count('DNS:') == 2, 'empty SAN entry preserved in cert'
+
     add_tls(["localhost"])
 
     resp, sock = client.get_ssl(
