@@ -24,7 +24,7 @@ app = Proc.new do |env|
         out = "leaked[#{leaked}]"
     end
 
-    ['200', { 'Content-Length' => out.bytesize.to_s }, [out]]
+    [200, { 'Content-Length' => out.bytesize.to_s }, [out]]
 end
 
 run app

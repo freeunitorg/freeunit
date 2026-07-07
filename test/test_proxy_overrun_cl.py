@@ -52,7 +52,9 @@ def _run_overrun_cl(port=UPSTREAM_OVERRUN_PORT):
     proc = subprocess.Popen(
         [FAKE_UPSTREAM_BIN, '--port', str(port), '--mode', 'overrun-cl'],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        # DEVNULL, not PIPE: nothing reads this stream, and an unread PIPE can
+        # deadlock the child if it ever fills the OS pipe buffer.
+        stderr=subprocess.DEVNULL,
     )
     # Tear the process down if it never binds — otherwise a waitforsocket
     # timeout would raise before the caller's try/finally and leak it.
