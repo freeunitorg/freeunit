@@ -5895,9 +5895,9 @@ nxt_router_get_mmap_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         nxt_alert(task, "get_mmap_handler: app == NULL for reply port %PI:%d",
                   port->pid, port->id);
 
-        // FIXME
-        nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
-                              -1, msg->port_msg.stream, 0, NULL);
+        /* Best-effort RPC_ERROR; peer-side RPC timeout is the backstop. */
+        (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
+                                     -1, msg->port_msg.stream, 0, NULL);
 
         return;
     }
@@ -5911,9 +5911,9 @@ nxt_router_get_mmap_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         nxt_alert(task, "get_mmap_handler: mmap id is too big (%d)",
                   (int) get_mmap_msg->id);
 
-        // FIXME
-        nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
-                              -1, msg->port_msg.stream, 0, NULL);
+        /* Best-effort RPC_ERROR; peer-side RPC timeout is the backstop. */
+        (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
+                                     -1, msg->port_msg.stream, 0, NULL);
         return;
     }
 
