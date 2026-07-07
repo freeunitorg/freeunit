@@ -1,3 +1,4 @@
+import json
 import os
 import socket
 import subprocess
@@ -117,15 +118,18 @@ def _response_headers_lower(resp):
     return {k.lower(): v for k, v in resp['headers'].items()}
 
 
-def _get_until_header(header, retries=50, delay=0.1, **kwargs):
+def _get_until_header(header, retries=150, delay=0.1, **kwargs):
     """Re-issue GET until `header` is present in the response, or retries run out.
 
     OTel (re)initialises asynchronously in the router *after* the control API
     has already accepted the telemetry config, so the very first request can
     race ahead of the tracer being ready: no span is created, hence no
-    traceparent is injected. Poll briefly to absorb that init lag. A header that
-    never appears still fails the caller's assertion, so a real regression is
-    not masked. Extra kwargs are forwarded to `client.get` (e.g. headers).
+    traceparent is injected. Poll to absorb that init lag -- the gRPC exporter
+    in particular can take several seconds to establish on a loaded CI runner,
+    which the previous 5s budget occasionally missed. The loop returns the
+    moment the header appears, so a larger cap costs nothing on the happy path;
+    a header that never appears still fails the caller's assertion, so a real
+    regression is not masked. Extra kwargs are forwarded to `client.get`.
     """
     resp = client.get(**kwargs)
     for _ in range(retries):
@@ -165,6 +169,102 @@ def test_otel_span_exported_with_service_name(tmp_path, protocol):
         assert b'http.request.method' in body, 'span must carry semconv method attr'
         assert b'url.path' in body, 'span must carry semconv url.path attr'
         assert b'http.response.status_code' in body, 'span must carry status attr'
+    finally:
+        _kill(proc)
+
+
+@_skipif_no_fake_otlp
+@pytest.mark.parametrize('protocol', ['http', 'grpc'])
+def test_otel_span_5xx_status(tmp_path, protocol):
+    """A 5xx response is still traced and the span records the error status.
+
+    The status_code attribute is emitted as a string (sprintf "%d"), so the
+    literal `503` travels in the OTLP payload. Per the 1.35.6 fix, 503 >= 500
+    also marks the span Status::Error (nxt_otel_rs_set_error); that enum is not
+    asserted here (it is not a literal in the protobuf), but the status_code
+    value is the concrete, reliable signal.
+    """
+    port = _get_free_port()
+    dump = str(tmp_path / 'otlp_dump.bin')
+    # Run forever and accumulate every export into the dump, so the readiness
+    # phase (200 spans) does not consume a one-shot budget before the 503 span.
+    proc = _run_fake_otlp(port, dump=dump, protocol=protocol)
+    try:
+        _configure_or_skip(port, protocol=protocol)
+
+        # OTel inits asynchronously; wait until the tracer is ready on the
+        # default 200 route (traceparent injected) before the error path.
+        ready = _get_until_header('traceparent')
+        assert (
+            ready['status'] == 200
+            and 'traceparent' in _response_headers_lower(ready)
+        ), 'tracer did not become ready'
+
+        assert 'success' in client.conf(
+            '503', 'routes/0/action/return'
+        ), 'switch route to return 503'
+
+        # Fire 503s until the error span reaches the collector. status_code is
+        # emitted as the string "503" (sprintf "%d"); per the 1.35.6 fix,
+        # 503 >= 500 also marks the span Status::Error (not asserted here -- it
+        # is a protobuf enum, not a literal). Only the 503 requests can add the
+        # "503" bytes, so the readiness 200 spans don't false-positive.
+        body = b''
+        found = False
+        for _ in range(int(EXPORT_TIMEOUT * 10)):
+            resp = client.get()
+            assert resp['status'] == 503, f'expected 503: {resp}'
+
+            # The exporter may not have created the dump on the first pass.
+            if os.path.exists(dump):
+                with open(dump, 'rb') as f:
+                    body = f.read()
+
+                if b'503' in body:
+                    found = True
+                    break
+
+            time.sleep(0.1)
+
+        assert found, 'span with status_code=503 was not exported'
+        assert b'http.response.status_code' in body, 'status_code attr missing'
+    finally:
+        _kill(proc)
+
+
+@_skipif_no_fake_otlp
+@pytest.mark.xfail(
+    reason=(
+        'Suspected bug: a malformed inbound traceparent returns HTTP 500 '
+        'instead of being ignored. nxt_otel_parse_traceparent() returns '
+        'NXT_ERROR on a length/format mismatch (src/nxt_otel.c ~445-476), and a '
+        'header-parse callback returning NXT_ERROR fails the request. W3C '
+        'Trace Context 3.2.2.3 requires an unparseable traceparent to be '
+        'ignored and the trace restarted, not to reject the request -- so on '
+        'an OTel-enabled listener any client can force a 500 with '
+        '"traceparent: x". Deterministic, so strict=True: once #109 is fixed '
+        'the test xpasses -> fails, forcing removal of this marker. '
+        'See freeunitorg/freeunit#109.'
+    ),
+    strict=True,
+)
+@pytest.mark.parametrize('protocol', ['http', 'grpc'])
+def test_otel_traceparent_malformed(protocol):
+    """A malformed inbound traceparent should be ignored (the trace is
+    restarted), not turned into an error response."""
+    port = _get_free_port()
+    proc = _run_fake_otlp(port, protocol=protocol)  # run forever, absorb exports
+    try:
+        _configure_or_skip(port, protocol=protocol)
+
+        resp = client.get(
+            headers={
+                'Host': 'localhost',
+                'traceparent': 'this-is-not-a-valid-traceparent',
+                'Connection': 'close',
+            }
+        )
+        assert resp['status'] == 200, f'malformed traceparent must not error: {resp}'
     finally:
         _kill(proc)
 
@@ -316,3 +416,22 @@ def test_otel_sampling_ratio_bounds_accepted(ratio):
     _require_otel()
     conf = client.conf(_config(_valid_telemetry(1, sampling_ratio=ratio)))
     assert 'success' in conf, f'sampling_ratio={ratio} must be accepted: {conf}'
+
+
+def test_otel_sampling_ratio_nonfinite_rejected():
+    """A sampling_ratio that overflows to a non-finite double is rejected.
+
+    Closest reachable proxy for the NaN-validator fix (33c7f0e0): strict JSON
+    cannot express NaN, but a huge exponent (`1e400`) parses to +Inf, which
+    must still land in the error path (> 1). Injected as a raw JSON number
+    literal -- json.dumps() of a Python float would emit `Infinity`, testing
+    the parser instead of the validator.
+    """
+    _require_otel()
+
+    body = json.dumps(_config(_valid_telemetry(1)))
+    body = body.replace('"sampling_ratio": 1.0', '"sampling_ratio": 1e400')
+    assert '1e400' in body, 'sampling_ratio literal not injected'
+
+    conf = client.conf(body)
+    assert 'error' in conf, f'non-finite sampling_ratio must be rejected: {conf}'
