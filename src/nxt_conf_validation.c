@@ -2849,10 +2849,48 @@ nxt_conf_vldt_object_conf_commands(nxt_conf_validation_t *vldt,
 #endif
 
 
+/*
+ * RFC 9110 token characters, the only bytes allowed in a header field
+ * name: "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+ * "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA.
+ */
+static nxt_bool_t
+nxt_conf_vldt_header_name_is_token(const nxt_str_t *name)
+{
+    u_char  c;
+    size_t  i;
+
+    for (i = 0; i < name->length; i++) {
+        c = name->start[i];
+
+        if ((c >= 'a' && c <= 'z')
+            || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9'))
+        {
+            continue;
+        }
+
+        switch (c) {
+        case '!': case '#': case '$': case '%': case '&': case '\'':
+        case '*': case '+': case '-': case '.': case '^': case '_':
+        case '`': case '|': case '~':
+            continue;
+        }
+
+        return 0;
+    }
+
+    return 1;
+}
+
+
 static nxt_int_t
 nxt_conf_vldt_response_header(nxt_conf_validation_t *vldt, nxt_str_t *name,
     nxt_conf_value_t *value)
 {
+    u_char      c;
+    size_t      i;
+    nxt_int_t   ret;
     nxt_str_t   str;
     nxt_uint_t  type;
 
@@ -2861,6 +2899,13 @@ nxt_conf_vldt_response_header(nxt_conf_validation_t *vldt, nxt_str_t *name,
     if (name->length == 0) {
         return nxt_conf_vldt_error(vldt, "The response header name "
                                          "must not be empty.");
+    }
+
+    if (!nxt_conf_vldt_header_name_is_token(name)) {
+        return nxt_conf_vldt_error(vldt, "The response header name \"%V\" "
+                                         "contains characters that are not "
+                                         "allowed in a header field name.",
+                                         name);
     }
 
     if (nxt_strstr_eq(name, &content_length)) {
@@ -2878,7 +2923,26 @@ nxt_conf_vldt_response_header(nxt_conf_validation_t *vldt, nxt_str_t *name,
         nxt_conf_get_string(value, &str);
 
         if (nxt_is_tstr(&str)) {
-            return nxt_conf_vldt_var(vldt, name, &str);
+            ret = nxt_conf_vldt_var(vldt, name, &str);
+            if (ret != NXT_OK) {
+                return ret;
+            }
+        }
+
+        /*
+         * Scan the raw configured value (template markup included, which is
+         * plain printable ASCII) so a literal control character in a static
+         * segment of a templated value is rejected at load time just like a
+         * non-templated one, closing the response-splitting bypass.
+         */
+        for (i = 0; i < str.length; i++) {
+            c = str.start[i];
+
+            if ((c < 0x20 && c != '\t') || c == 0x7F) {
+                return nxt_conf_vldt_error(vldt, "The \"%V\" response header "
+                                           "value must not contain control "
+                                           "characters.", name);
+            }
         }
 
         return NXT_OK;
