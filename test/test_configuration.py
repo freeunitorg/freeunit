@@ -233,6 +233,45 @@ def test_applications_relative_path():
     ), 'relative path'
 
 
+def test_applications_cstring_nul():
+    # "spare": 0 keeps the app from spawning, so validation is exercised
+    # without any process startup.
+    def conf_app(app):
+        return client.conf({"a": app}, 'applications')
+
+    base = {"type": "python", "processes": {"spare": 0}, "module": "wsgi"}
+
+    # Length-tracked config strings later used as NUL-terminated C strings
+    # must reject an embedded NUL (\0 survives JSON parsing) and an
+    # empty value.
+    for field in ["user", "group", "working_directory", "stdout", "stderr", "home"]:
+        assert 'error' in conf_app({**base, field: "/x\0y"}), f'{field} nul'
+        assert 'error' in conf_app({**base, field: ""}), f'{field} empty'
+
+    # "executable" of an external app (mapped as a C string, passed to execve).
+    assert 'error' in conf_app(
+        {"type": "external", "processes": {"spare": 0}, "executable": "/bin/tr\0ue"}
+    ), 'executable nul'
+    assert 'error' in conf_app(
+        {"type": "external", "processes": {"spare": 0}, "executable": ""}
+    ), 'executable empty'
+
+    # Valid values are still accepted.
+    assert 'success' in conf_app(
+        {**base, "working_directory": "/tmp", "home": "/tmp"}
+    ), 'valid values'
+
+
+def test_listeners_unix_path_nul(system):
+    if system != 'Linux':
+        pytest.skip('unix sockets')
+
+    # A pathname unix socket address is used as a C string for bind()/unlink();
+    # an embedded NUL must be rejected (abstract "unix:@..." sockets, tested
+    # elsewhere, legitimately carry NULs and are exempt).
+    assert 'error' in try_addr("unix:/tmp/x\0y"), 'pathname \0'
+
+
 @pytest.mark.skip('not yet, unsafe')
 def test_listeners_empty():
     assert 'error' in client.conf({"*:8080": {}}, 'listeners'), 'listener empty'

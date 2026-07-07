@@ -199,6 +199,8 @@ static nxt_int_t nxt_conf_vldt_array_iterator(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_environment(nxt_conf_validation_t *vldt,
     nxt_str_t *name, nxt_conf_value_t *value);
+static nxt_int_t nxt_conf_vldt_c_string(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_targets_exclusive(
     nxt_conf_validation_t *vldt, nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_targets(nxt_conf_validation_t *vldt,
@@ -914,6 +916,8 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_external_members[] = {
         .name       = nxt_string("executable"),
         .type       = NXT_CONF_VLDT_STRING,
         .flags      = NXT_CONF_VLDT_REQUIRED,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "executable",
     }, {
         .name       = nxt_string("arguments"),
         .type       = NXT_CONF_VLDT_ARRAY,
@@ -929,6 +933,8 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_python_common_members[] = {
     {
         .name       = nxt_string("home"),
         .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "home",
     }, {
         .name       = nxt_string("path"),
         .type       = NXT_CONF_VLDT_STRING | NXT_CONF_VLDT_ARRAY,
@@ -1122,6 +1128,8 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_perl_members[] = {
         .name       = nxt_string("script"),
         .type       = NXT_CONF_VLDT_STRING,
         .flags      = NXT_CONF_VLDT_REQUIRED,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "script",
     }, {
         .name       = nxt_string("threads"),
         .type       = NXT_CONF_VLDT_INTEGER,
@@ -1164,6 +1172,8 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_java_members[] = {
         .name       = nxt_string("webapp"),
         .type       = NXT_CONF_VLDT_STRING,
         .flags      = NXT_CONF_VLDT_REQUIRED,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "webapp",
     }, {
         .name       = nxt_string("options"),
         .type       = NXT_CONF_VLDT_ARRAY,
@@ -1172,6 +1182,8 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_java_members[] = {
     }, {
         .name       = nxt_string("unit_jars"),
         .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "unit_jars",
     }, {
         .name       = nxt_string("threads"),
         .type       = NXT_CONF_VLDT_INTEGER,
@@ -1191,33 +1203,51 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_wasm_members[] = {
         .name       = nxt_string("module"),
         .type       = NXT_CONF_VLDT_STRING,
         .flags      = NXT_CONF_VLDT_REQUIRED,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "module",
     }, {
         .name       = nxt_string("request_handler"),
         .type       = NXT_CONF_VLDT_STRING,
         .flags      = NXT_CONF_VLDT_REQUIRED,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "request_handler",
     },{
         .name       = nxt_string("malloc_handler"),
         .type       = NXT_CONF_VLDT_STRING,
         .flags      = NXT_CONF_VLDT_REQUIRED,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "malloc_handler",
     }, {
         .name       = nxt_string("free_handler"),
         .type       = NXT_CONF_VLDT_STRING,
         .flags      = NXT_CONF_VLDT_REQUIRED,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "free_handler",
     }, {
         .name       = nxt_string("module_init_handler"),
         .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "module_init_handler",
     }, {
         .name       = nxt_string("module_end_handler"),
         .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "module_end_handler",
     }, {
         .name       = nxt_string("request_init_handler"),
         .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "request_init_handler",
     }, {
         .name       = nxt_string("request_end_handler"),
         .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "request_end_handler",
     }, {
         .name       = nxt_string("response_end_handler"),
         .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "response_end_handler",
     }, {
         .name       = nxt_string("access"),
         .type       = NXT_CONF_VLDT_OBJECT,
@@ -1234,6 +1264,8 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_wasm_wc_members[] = {
         .name       = nxt_string("component"),
         .type       = NXT_CONF_VLDT_STRING,
         .flags      = NXT_CONF_VLDT_REQUIRED,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "component",
     }, {
         .name       = nxt_string("access"),
         .type       = NXT_CONF_VLDT_OBJECT,
@@ -1272,12 +1304,18 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_common_members[] = {
     }, {
         .name       = nxt_string("user"),
         .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "user",
     }, {
         .name       = nxt_string("group"),
         .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "group",
     }, {
         .name       = nxt_string("working_directory"),
         .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "working_directory",
     }, {
         .name       = nxt_string("environment"),
         .type       = NXT_CONF_VLDT_OBJECT,
@@ -1291,9 +1329,13 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_common_members[] = {
     }, {
         .name       = nxt_string("stdout"),
         .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "stdout",
     }, {
         .name       = nxt_string("stderr"),
         .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "stderr",
     },
 
     NXT_CONF_VLDT_END
@@ -3392,6 +3434,40 @@ nxt_conf_vldt_environment(nxt_conf_validation_t *vldt, nxt_str_t *name,
     if (memchr(str.start, '\0', str.length) != NULL) {
         return nxt_conf_vldt_error(vldt, "The \"%V\" environment value must "
                                    "not contain null character.", name);
+    }
+
+    return NXT_OK;
+}
+
+
+/*
+ * Reject empty and embedded-NUL values for options that are later consumed
+ * as NUL-terminated C strings (NXT_CONF_MAP_CSTRZ or a direct sink):
+ * user/group -> getpwnam/getgrnam, working_directory -> chdir,
+ * stdout/stderr -> open, executable -> execve, and the per-language app
+ * targets home/script/webapp/unit_jars/module/component and the wasm
+ * *_handler symbol names.  A length-tracked nxt_str_t with an embedded NUL
+ * passes JSON validation but silently truncates at the sink, causing
+ * privilege/target confusion or loading the wrong file/symbol.  The option
+ * name is passed via the member's .u.string for the diagnostic.
+ */
+static nxt_int_t
+nxt_conf_vldt_c_string(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
+    void *data)
+{
+    nxt_str_t   str;
+    const char  *option = data;
+
+    nxt_conf_get_string(value, &str);
+
+    if (str.length == 0) {
+        return nxt_conf_vldt_error(vldt, "The \"%s\" value must not be empty.",
+                                   option);
+    }
+
+    if (memchr(str.start, '\0', str.length) != NULL) {
+        return nxt_conf_vldt_error(vldt, "The \"%s\" value must not contain "
+                                   "null character.", option);
     }
 
     return NXT_OK;
