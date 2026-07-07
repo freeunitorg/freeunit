@@ -49,6 +49,12 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
+          # Run on the latest Opus with the 1M-token context window. The `opus`
+          # alias always resolves to the current Opus model, so there's no
+          # version to bump. The [1m] suffix enables the long-context beta; drop
+          # it to fall back to the standard 200K window.
+          claude_args: '--model opus[1m]'
+
           # This is an optional setting that allows Claude to read CI results on PRs
           additional_permissions: |
             actions: read
