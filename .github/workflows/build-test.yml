@@ -485,3 +485,28 @@ jobs:
             sudo -E pytest-3 --print-log ${{ steps.metadata.outputs.testpath }}
           fi
         if: steps.metadata.outputs.module != 'wasm'
+
+  # C unit-test suite (src/test/ -> build/tests): HTTP parser, port/IPC
+  # fault-injection, lvlhsh, mp, rbtree, base64, utf8, clone creds, etc.
+  # Previously compiled but never executed in CI; runs here on every PR as its
+  # own check, like the language tests. sudo mirrors the pytest suite so
+  # privilege-sensitive cases (clone creds) work.
+  c-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev
+
+      - name: Configure unit (--tests)
+        run: ./configure --openssl --tests
+
+      - name: Build C tests
+        run: make -j4 tests
+
+      - name: Run C tests
+        run: sudo ./build/tests

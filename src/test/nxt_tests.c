@@ -166,6 +166,22 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_string_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_http_chunk_parse_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_conf_json_depth_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_http_route_addr_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_port_fail_test(thr) != NXT_OK) {
         return 1;
     }
