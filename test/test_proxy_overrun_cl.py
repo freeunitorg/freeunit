@@ -20,6 +20,7 @@ it runs on the minimal test build.
 """
 
 import os
+import socket
 import subprocess
 
 import pytest
@@ -37,8 +38,9 @@ PATTERN = '0123456789abcdef'
 DECLARED = 100
 EXCESS = 50
 
-# Reserved fake_upstream port for this case (see test/fake_upstream/README.md).
+# Reserved fake_upstream ports for these cases (see test/fake_upstream/README.md).
 UPSTREAM_OVERRUN_PORT = 7989
+UPSTREAM_OVERRUN_KA_PORT = 7987
 
 FAKE_UPSTREAM_BIN = '/usr/local/bin/fake_upstream'
 
@@ -48,9 +50,9 @@ _skipif_no_fake_upstream = pytest.mark.skipif(
 )
 
 
-def _run_overrun_cl(port=UPSTREAM_OVERRUN_PORT):
+def _run(port, mode):
     proc = subprocess.Popen(
-        [FAKE_UPSTREAM_BIN, '--port', str(port), '--mode', 'overrun-cl'],
+        [FAKE_UPSTREAM_BIN, '--port', str(port), '--mode', mode],
         stdout=subprocess.DEVNULL,
         # DEVNULL, not PIPE: nothing reads this stream, and an unread PIPE can
         # deadlock the child if it ever fills the OS pipe buffer.
@@ -65,6 +67,10 @@ def _run_overrun_cl(port=UPSTREAM_OVERRUN_PORT):
         proc.wait()
         raise
     return proc
+
+
+def _run_overrun_cl(port=UPSTREAM_OVERRUN_PORT):
+    return _run(port, 'overrun-cl')
 
 
 @_skipif_no_fake_upstream
@@ -103,6 +109,61 @@ def test_proxy_overrun_cl(skip_alert):
             f'got {len(resp["body"])} bytes'
         )
         assert resp['body'] == expected, 'relayed body mismatch'
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+@_skipif_no_fake_upstream
+def test_proxy_overrun_cl_keepalive(skip_alert):
+    # Same overrun, but the upstream response is keep-alive-able (no
+    # `Connection: close`). This isolates the *inconsistent* flag: the only
+    # thing that can close the downstream connection here is FreeUnit deciding
+    # the response is inconsistent -- not a relayed upstream close. A regression
+    # that dropped the inconsistent flag would leave the connection open (the
+    # recv below would then time out rather than see EOF).
+    skip_alert(r'upstream sent .* body bytes past Content-Length')
+
+    proc = _run(UPSTREAM_OVERRUN_KA_PORT, 'overrun-cl-ka')
+    try:
+        assert 'success' in client.conf(
+            {
+                "listeners": {"*:8080": {"pass": "routes"}},
+                "routes": [
+                    {
+                        "action": {
+                            "proxy": f'http://127.0.0.1:{UPSTREAM_OVERRUN_KA_PORT}'
+                        }
+                    }
+                ],
+            }
+        ), 'overrun-cl-ka proxy configuration'
+
+        # Keep-alive request (no Connection: close), read the raw response
+        # ourselves so we can observe whether the server closes the socket.
+        sock = client.get(port=8080, no_recv=True)
+        sock.settimeout(10)
+
+        data = b''
+        closed = False
+        try:
+            while True:
+                part = sock.recv(4096)
+                if not part:
+                    closed = True
+                    break
+                data += part
+        except socket.timeout:
+            closed = False
+        finally:
+            sock.close()
+
+        body = data.split(b'\r\n\r\n', 1)[1] if b'\r\n\r\n' in data else b''
+        expected = ((PATTERN * (DECLARED // len(PATTERN) + 1))[:DECLARED]).encode()
+
+        assert data[:12] == b'HTTP/1.1 200', f'status line: {data[:40]!r}'
+        assert body == expected, f'relayed body mismatch: {body!r}'
+        assert closed, 'inconsistent response must close the downstream connection'
     finally:
         proc.terminate()
         proc.wait()

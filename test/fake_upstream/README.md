@@ -44,6 +44,10 @@ fake_upstream --port <N> --mode <mode> [--requests <N>] [--size <MiB>] [--delay-
 | `slow-drip` | chunked, one 512-byte chunk every `--delay-ms` ms, proper terminal chunk — relay vs `proxy_read_timeout` (#72 case 5) |
 | `dup-te` | 200 with `Transfer-Encoding: chunked` header sent **twice** + valid chunked body — duplicate-TE relay (#72 case 6, nginx/unit#1088) |
 | `overrun-cl` | 200 with a fixed `Content-Length` (100) but 150 body bytes — upstream overruns its advertised length. FreeUnit must relay exactly the advertised bytes and drop the excess (no response splitting), then close the connection as inconsistent |
+| `bad-cl` | 200 with a syntactically invalid `Content-Length: notanumber` + a short body — FreeUnit must log and mark the response inconsistent instead of mis-framing the relayed body |
+| `overrun-cl-ka` | as `overrun-cl` but keep-alive-able (no `Connection: close`) — isolates the *inconsistent* flag: only FreeUnit's own decision can close the downstream connection |
+| `chunked-trailer` | chunked 40-byte body + a trailer field after the terminal `0` chunk — relay must keep the body intact |
+| `chunked-ext` | chunked 40-byte body with a `;ext=val` chunk-extension on each size line — relay must strip extensions and keep the body intact |
 
 Deterministic body: byte at global offset `i` is `"0123456789abcdef"[i % 16]`,
 so a test regenerates the exact sequence and verifies the relayed body
@@ -71,6 +75,10 @@ single `grep` finds every side of a case. E.g. token `chunked_response`:
 
 | Port | Token | Mode (CLI) | Rust handler | pytest |
 |------|-------|-----------|--------------|--------|
+| 7985 | `chunked_ext` | `chunked-ext` | `respond_chunked_edge` | `test_proxy_chunked_ext` (chunk-extensions stripped, body intact) |
+| 7986 | `chunked_trailer` | `chunked-trailer` | `respond_chunked_edge` | `test_proxy_chunked_trailer` (trailer after terminal chunk, body intact) |
+| 7987 | `overrun_cl_ka` | `overrun-cl-ka` | `respond_overrun_cl_ka` | `test_proxy_overrun_cl_keepalive` (inconsistent flag closes downstream conn) |
+| 7988 | `bad_cl` | `bad-cl` | `respond_bad_cl` | `test_proxy_bad_cl` (invalid upstream Content-Length → logged + inconsistent, no mis-framing) |
 | 7989 | `overrun_cl` | `overrun-cl` | `respond_overrun_cl` | `test_proxy_overrun_cl` (Content-Length overrun → excess truncated, no response splitting) |
 | 7990 | `echo` | `echo` | `respond` (echo arm) | — (shared sanity) |
 | 7991 | `strict` | `strict` | `handle` (Strict arm) | chunked **request** → CL (#445, #58) |
