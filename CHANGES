@@ -40,6 +40,12 @@ Changes with FreeUnit 1.35.6                                     07 Jul 2026
        groundwork for graceful connection draining; connection accounting
        in the "/status" API is exact on all close paths.
 
+    *) Change: broaden the regression test suite — proxy Content-Length and
+       chunked-response relay framing, OpenTelemetry 5xx tracing and inbound
+       traceparent handling, and Java ServletInputStream bounds — and run
+       the C unit-test suite in CI, which was previously compiled but never
+       executed.
+
     *) Bugfix: authorize privileged IPC message types by the kernel-validated
        sender PID (SCM_CREDENTIALS), close any received descriptors on every
        rejected privileged message, and cap port queue item size at the slot
