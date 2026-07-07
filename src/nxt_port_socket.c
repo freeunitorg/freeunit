@@ -797,6 +797,14 @@ nxt_port_read_handler(nxt_task_t *task, void *obj, void *data)
             msg.fd[0] = -1;
             msg.fd[1] = -1;
 
+#if (NXT_USE_CMSG_PID)
+            /*
+             * Fail safe: a message without SCM_CREDENTIALS must never
+             * be attributed to a valid sender PID.
+             */
+            msg.cmsg_pid = -1;
+#endif
+
             ret = nxt_socket_msg_oob_get(&oob, msg.fd,
                                          nxt_recv_msg_cmsg_pid_ref(&msg));
             if (nxt_slow_path(ret != NXT_OK)) {
@@ -867,6 +875,22 @@ nxt_port_queue_read_handler(nxt_task_t *task, void *obj, void *data)
 
     for ( ;; ) {
 
+        /*
+         * Fail safe: messages dequeued from the shared memory queue carry
+         * neither file descriptors nor socket credentials.  Reset both up
+         * front so a queue message can never be seen carrying an fd or a
+         * sender PID left over from a socket message processed on a previous
+         * loop iteration.  The fd reset matters for the reject paths in the
+         * privileged handlers: they call nxt_port_recv_msg_close_fds(), which
+         * would otherwise close a stale descriptor in this process.  The
+         * socket and suspended-message paths overwrite these fields below.
+         */
+        msg.fd[0] = -1;
+        msg.fd[1] = -1;
+#if (NXT_USE_CMSG_PID)
+        msg.cmsg_pid = -1;
+#endif
+
         if (port->from_socket == 0) {
             n = nxt_port_queue_recv(queue, qmsg);
 
@@ -902,6 +926,10 @@ nxt_port_queue_read_handler(nxt_task_t *task, void *obj, void *data)
                 n = smsg->size;
                 msg.fd[0] = smsg->fd[0];
                 msg.fd[1] = smsg->fd[1];
+
+#if (NXT_USE_CMSG_PID)
+                msg.cmsg_pid = smsg->cmsg_pid;
+#endif
 
                 smsg->size = 0;
 
@@ -948,6 +976,11 @@ nxt_port_queue_read_handler(nxt_task_t *task, void *obj, void *data)
             if (n > 0) {
                 msg.fd[0] = -1;
                 msg.fd[1] = -1;
+
+#if (NXT_USE_CMSG_PID)
+                /* Fail safe, see nxt_port_read_handler(). */
+                msg.cmsg_pid = -1;
+#endif
 
                 ret = nxt_socket_msg_oob_get(&oob, msg.fd,
                                              nxt_recv_msg_cmsg_pid_ref(&msg));
@@ -1016,6 +1049,10 @@ nxt_port_queue_read_handler(nxt_task_t *task, void *obj, void *data)
                     smsg->size = n;
                     smsg->fd[0] = msg.fd[0];
                     smsg->fd[1] = msg.fd[1];
+
+#if (NXT_USE_CMSG_PID)
+                    smsg->cmsg_pid = msg.cmsg_pid;
+#endif
 
                     continue;
                 }

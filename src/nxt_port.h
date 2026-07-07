@@ -231,6 +231,31 @@ struct nxt_port_recv_msg_s {
 #define nxt_recv_msg_cmsg_pid_ref(msg)  (NULL)
 #endif
 
+
+/*
+ * Close any file descriptors the peer attached to a received message via
+ * SCM_RIGHTS.  A privileged handler that rejects a message (unauthorized
+ * or malformed sender) must call this before returning: the port
+ * dispatcher does not reclaim descriptors once the handler returns, and
+ * a compromised peer can attach fds to a forged message, so leaving them
+ * open on the reject path would let it exhaust the receiver's descriptor
+ * table.
+ */
+nxt_inline void
+nxt_port_recv_msg_close_fds(nxt_port_recv_msg_t *msg)
+{
+    if (msg->fd[0] != -1) {
+        nxt_fd_close(msg->fd[0]);
+        msg->fd[0] = -1;
+    }
+
+    if (msg->fd[1] != -1) {
+        nxt_fd_close(msg->fd[1]);
+        msg->fd[1] = -1;
+    }
+}
+
+
 typedef struct nxt_app_s  nxt_app_t;
 
 struct nxt_port_s {
