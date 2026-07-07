@@ -3488,6 +3488,48 @@ nxt_conf_vldt_cgroup_path(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
 
 #if (NXT_HAVE_ISOLATION_ROOTFS)
 
+/*
+ * Return TRUE if the absolute, NUL-free path normalizes to "/" once "." and
+ * ".." components are collapsed (".." is clamped at root, matching what the
+ * kernel does at chroot/pivot_root time).  Such a path silently defeats rootfs
+ * isolation -- chroot("/") is a no-op -- so the validators reject it.  Caller
+ * ensures the path begins with '/' and contains no embedded NUL.
+ */
+static nxt_bool_t
+nxt_rootfs_resolves_to_root(const u_char *path, size_t length)
+{
+    size_t  i, comp_len, depth;
+
+    depth = 0;
+
+    for (i = 1; i < length; ) {           /* skip the leading '/' */
+
+        comp_len = 0;
+        while (i < length && path[i] != '/') {
+            comp_len++;
+            i++;
+        }
+
+        if (comp_len == 2 && path[i - 2] == '.' && path[i - 1] == '.') {
+            if (depth > 0) {
+                depth--;
+            }
+
+        } else if (comp_len != 0
+                   && !(comp_len == 1 && path[i - 1] == '.'))
+        {
+            depth++;
+        }
+
+        if (i < length) {
+            i++;                         /* skip the separator */
+        }
+    }
+
+    return depth == 0;
+}
+
+
 static nxt_int_t
 nxt_conf_vldt_rootfs_path(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
     void *data)
@@ -3515,6 +3557,13 @@ nxt_conf_vldt_rootfs_path(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
                                    "The \"rootfs\" path \"%V\" is invalid; "
                                    "an absolute path other than \"/\" "
                                    "is required.",
+                                   &rootfs);
+    }
+
+    if (nxt_rootfs_resolves_to_root(rootfs.start, trimmed_len)) {
+        return nxt_conf_vldt_error(vldt,
+                                   "The \"rootfs\" path \"%V\" is invalid; "
+                                   "it resolves to \"/\".",
                                    &rootfs);
     }
 

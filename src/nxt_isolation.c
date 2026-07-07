@@ -489,6 +489,48 @@ nxt_isolation_clone_flags(nxt_task_t *task, nxt_conf_value_t *namespaces,
 
 #if (NXT_HAVE_ISOLATION_ROOTFS)
 
+/*
+ * Return TRUE if the absolute, NUL-free path normalizes to "/" once "." and
+ * ".." components are collapsed (".." clamped at root, like the kernel at
+ * chroot/pivot_root).  Mirrors nxt_conf_validation.c; duplicated rather than
+ * shared so the validator stays the only cross-TU entry point for rootfs
+ * syntax.  Defense in depth: config validation already rejects these.
+ */
+static nxt_bool_t
+nxt_rootfs_resolves_to_root(const u_char *path, size_t length)
+{
+    size_t  i, comp_len, depth;
+
+    depth = 0;
+
+    for (i = 1; i < length; ) {
+
+        comp_len = 0;
+        while (i < length && path[i] != '/') {
+            comp_len++;
+            i++;
+        }
+
+        if (comp_len == 2 && path[i - 2] == '.' && path[i - 1] == '.') {
+            if (depth > 0) {
+                depth--;
+            }
+
+        } else if (comp_len != 0
+                   && !(comp_len == 1 && path[i - 1] == '.'))
+        {
+            depth++;
+        }
+
+        if (i < length) {
+            i++;
+        }
+    }
+
+    return depth == 0;
+}
+
+
 static nxt_int_t
 nxt_isolation_set_rootfs(nxt_task_t *task, nxt_conf_value_t *isolation,
     nxt_process_t *process)
@@ -509,6 +551,20 @@ nxt_isolation_set_rootfs(nxt_task_t *task, nxt_conf_value_t *isolation,
         if (nxt_slow_path(str.length <= 1 || str.start[0] != '/')) {
             nxt_log(task, NXT_LOG_ERR, "rootfs requires an absolute path other "
                     "than \"/\" but given \"%V\"", &str);
+
+            return NXT_ERROR;
+        }
+
+        if (nxt_slow_path(memchr(str.start, '\0', str.length) != NULL)) {
+            nxt_log(task, NXT_LOG_ERR, "rootfs contains an embedded NUL but "
+                    "given \"%V\"", &str);
+
+            return NXT_ERROR;
+        }
+
+        if (nxt_slow_path(nxt_rootfs_resolves_to_root(str.start, str.length))) {
+            nxt_log(task, NXT_LOG_ERR, "rootfs resolves to \"/\" but given "
+                    "\"%V\"", &str);
 
             return NXT_ERROR;
         }
