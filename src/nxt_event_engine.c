@@ -456,7 +456,19 @@ nxt_event_engine_free(nxt_event_engine_t *engine)
 
     engine->event.free(engine);
 
-    /* TODO: free timers */
+    /*
+     * Release the timer subsystem's heap-owned state.
+     *
+     * The timer rbtree itself is *not* walked here: every nxt_timer_t is
+     * embedded inside a containing struct (nxt_runtime_t::timer,
+     * nxt_listen_event_t::idle_timer, request/connection timers in
+     * nxt_h1proto.c and nxt_router.c, etc.) and is owned by that subsystem.
+     * Calling nxt_free() on an embedded node would corrupt the heap.
+     * The only allocation owned by nxt_timers_t itself is the `changes`
+     * batching array allocated by nxt_timers_init() via nxt_malloc().
+     */
+    nxt_free(engine->timers.changes);
+    engine->timers.changes = NULL;
 
     nxt_free(engine);
 }
