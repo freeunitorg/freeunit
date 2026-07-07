@@ -1,6 +1,10 @@
 
 Changes with FreeUnit 1.35.6                                     07 Jul 2026
 
+    *) Feature: SIGQUIT now performs a graceful stop — application workers
+       drain in-flight requests before exiting; SIGTERM remains the fast
+       exit that drops them.
+
     *) Change: upgrade the wasm-wasi-component wasmtime crates from 35.0.0
        to 36.0.12, clearing the wasmtime sandbox-escape advisories, with the
        accompanying WasiView/WasiHttpView source migration.

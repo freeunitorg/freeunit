@@ -167,6 +167,18 @@ typedef enum {
 } nxt_port_msg_type_t;
 
 
+/*
+ * Wire-format payload for NXT_PORT_MSG_QUIT.  A single byte selects
+ * between fast and graceful exit on the receiving side.  When the
+ * message arrives without a payload, the receiver defaults to
+ * NXT_PORT_QUIT_NORMAL (see src/nxt_unit.c nxt_unit_process_msg).
+ */
+typedef enum {
+    NXT_PORT_QUIT_NORMAL   = 0,
+    NXT_PORT_QUIT_GRACEFUL = 1,
+} nxt_port_quit_mode_t;
+
+
 /* Passed as a first iov chunk. */
 typedef struct {
     uint32_t             stream;
