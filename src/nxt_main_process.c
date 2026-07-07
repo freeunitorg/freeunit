@@ -862,10 +862,19 @@ nxt_main_process_title(nxt_task_t *task)
 static void
 nxt_main_process_sigterm_handler(nxt_task_t *task, void *obj, void *data)
 {
+    nxt_runtime_t  *rt;
+
     nxt_debug(task, "sigterm handler signo:%d (%s)",
               (int) (uintptr_t) obj, data);
 
-    /* TODO: fast exit. */
+    rt = task->thread->runtime;
+
+    /*
+     * Fast exit: do not drain in-flight requests.  The QUIT byte sent
+     * to libunit workers (see nxt_runtime_stop_app_processes()) carries
+     * NXT_PORT_QUIT_NORMAL so nxt_unit_quit() returns immediately.
+     */
+    rt->quit_mode = NXT_PORT_QUIT_NORMAL;
 
     nxt_exiting = 1;
 
@@ -876,10 +885,18 @@ nxt_main_process_sigterm_handler(nxt_task_t *task, void *obj, void *data)
 static void
 nxt_main_process_sigquit_handler(nxt_task_t *task, void *obj, void *data)
 {
+    nxt_runtime_t  *rt;
+
     nxt_debug(task, "sigquit handler signo:%d (%s)",
               (int) (uintptr_t) obj, data);
 
-    /* TODO: graceful exit. */
+    rt = task->thread->runtime;
+
+    /*
+     * Graceful exit: ask libunit workers to drain in-flight requests
+     * before tearing the per-context state down (see nxt_unit_quit()).
+     */
+    rt->quit_mode = NXT_PORT_QUIT_GRACEFUL;
 
     nxt_exiting = 1;
 

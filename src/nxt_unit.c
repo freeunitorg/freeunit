@@ -24,10 +24,16 @@
 #define NXT_UNIT_LOCAL_BUF_SIZE  \
     (NXT_UNIT_MAX_PLAIN_SIZE + sizeof(nxt_port_msg_t))
 
-enum {
-    NXT_QUIT_NORMAL   = 0,
-    NXT_QUIT_GRACEFUL = 1,
-};
+/*
+ * Wire-protocol QUIT mode selector.  The canonical enum lives in
+ * src/nxt_port.h alongside NXT_PORT_MSG_QUIT itself; the aliases
+ * below preserve the original local names without risking divergence
+ * from the daemon-side usage (the preprocessor substitutes the same
+ * enum value into every reference, so a compile-time mismatch is
+ * impossible).
+ */
+#define NXT_QUIT_NORMAL    NXT_PORT_QUIT_NORMAL
+#define NXT_QUIT_GRACEFUL  NXT_PORT_QUIT_GRACEFUL
 
 typedef struct nxt_unit_impl_s                  nxt_unit_impl_t;
 typedef struct nxt_unit_mmap_s                  nxt_unit_mmap_t;

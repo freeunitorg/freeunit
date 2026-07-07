@@ -491,6 +491,54 @@ nxt_runtime_close_idle_connections(nxt_event_engine_t *engine)
 }
 
 
+/*
+ * Allocate a one-byte port-message body carrying rt->quit_mode (a
+ * nxt_port_quit_mode_t value, see nxt_port.h).  libunit parses this
+ * as the quit_param in nxt_unit_process_msg() and falls back to
+ * NXT_PORT_QUIT_NORMAL when the message arrives without a payload --
+ * which is also the path taken when this allocator returns NULL, so
+ * the historical payload-less wire format remains compatible.
+ */
+static nxt_buf_t *
+nxt_runtime_quit_buf(nxt_task_t *task, nxt_runtime_t *rt)
+{
+    nxt_buf_t  *b;
+
+    b = nxt_buf_mem_alloc(task->thread->engine->mem_pool, 1, 0);
+    if (nxt_slow_path(b == NULL)) {
+        return NULL;
+    }
+
+    *b->mem.free++ = rt->quit_mode;
+
+    return b;
+}
+
+
+void
+nxt_runtime_port_send_quit(nxt_task_t *task, nxt_runtime_t *rt,
+    nxt_port_t *port)
+{
+    nxt_buf_t  *b;
+    nxt_int_t  rc;
+
+    b = nxt_runtime_quit_buf(task, rt);
+
+    rc = nxt_port_socket_write(task, port, NXT_PORT_MSG_QUIT, -1, 0, 0, b);
+
+    if (nxt_slow_path(rc != NXT_OK && b != NULL)) {
+        /*
+         * Port layer did not take ownership of b; queue its completion
+         * handler so the engine mem-pool buffer is reclaimed.  The
+         * process still goes down: a failed QUIT send surfaces in
+         * port->socket.error and the port teardown path handles it.
+         */
+        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                           b->completion_handler, task, b, b->parent);
+    }
+}
+
+
 void
 nxt_runtime_stop_app_processes(nxt_task_t *task, nxt_runtime_t *rt)
 {
@@ -508,8 +556,7 @@ nxt_runtime_stop_app_processes(nxt_task_t *task, nxt_runtime_t *rt)
 
             nxt_process_port_each(process, port) {
 
-                (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_QUIT, -1,
-                                             0, 0, NULL);
+                nxt_runtime_port_send_quit(task, rt, port);
 
             } nxt_process_port_loop;
         }
@@ -530,8 +577,7 @@ nxt_runtime_stop_all_processes(nxt_task_t *task, nxt_runtime_t *rt)
 
             nxt_debug(task, "%d sending quit to %PI", rt->type, port->pid);
 
-            (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_QUIT, -1, 0,
-                                         0, NULL);
+            nxt_runtime_port_send_quit(task, rt, port);
 
         } nxt_process_port_loop;
 
