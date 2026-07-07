@@ -147,6 +147,14 @@ def test_chunked_invalid():
     check_body('1\r\n\r\n1\r\n0\r\n\r\n')
     check_body('1\r\n1\r\n\r\n0\r\n\r\n')
 
+    # Non-hex chunk size.
+    check_body('z\r\nX\r\n0\r\n\r\n')
+
+    # Chunk size that overflows the size accumulator must be rejected,
+    # not silently wrapped (guards nxt_size_is_sufficient in the chunk
+    # parser).  17 hex digits overshoot a 64-bit accumulator.
+    check_body('1' + 'f' * 16 + '\r\nX\r\n0\r\n\r\n')
+
     # invalid transfer encoding header
 
     assert (

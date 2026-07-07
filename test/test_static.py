@@ -106,6 +106,51 @@ def test_static_etag(temp_dir):
     assert etag != client.get(url='/')['headers']['ETag'], 'new ETag'
 
 
+def test_static_range_ignored():
+    # Unit does not implement byte-range requests for static files. Per
+    # RFC 7233 a server that does not support Range MUST ignore it and
+    # return the full 200 representation -- never a malformed 206.
+    resp = client.get(
+        url='/index.html',
+        headers={
+            'Host': 'localhost',
+            'Range': 'bytes=0-4',
+            'Connection': 'close',
+        },
+    )
+    assert resp['status'] == 200, 'range ignored -> full 200'
+    assert resp['body'] == '0123456789', 'full body returned'
+    assert 'Content-Range' not in resp['headers'], 'no Content-Range'
+
+
+def test_static_conditional_ignored():
+    # Conditional requests are not implemented; a matching validator must
+    # not produce a 304 (which would imply the body was withheld).
+    etag = client.get(url='/index.html')['headers']['ETag']
+
+    resp = client.get(
+        url='/index.html',
+        headers={
+            'Host': 'localhost',
+            'If-None-Match': etag,
+            'Connection': 'close',
+        },
+    )
+    assert resp['status'] == 200, 'if-none-match ignored'
+    assert resp['body'] == '0123456789', 'full body on matching etag'
+
+    resp = client.get(
+        url='/index.html',
+        headers={
+            'Host': 'localhost',
+            'If-Modified-Since': 'Thu, 01 Jan 2100 00:00:00 GMT',
+            'Connection': 'close',
+        },
+    )
+    assert resp['status'] == 200, 'if-modified-since ignored'
+    assert resp['body'] == '0123456789', 'full body on future date'
+
+
 def test_static_redirect():
     resp = client.get(url='/dir')
     assert resp['status'] == 301, 'redirect status'
@@ -207,6 +252,23 @@ def test_static_path():
     assert client.get(url='/..')['status'] == 400, 'path invalid 3'
     assert client.get(url='../assets/')['status'] == 400, 'path invalid 4'
     assert client.get(url='/../assets/')['status'] == 400, 'path invalid 5'
+
+
+def test_static_path_encoded():
+    # Percent-encoded and partially-encoded dot segments are decoded before
+    # path normalization, so an encoded "../" cannot bypass the traversal
+    # guard that rejects the plain form.
+    assert (
+        client.get(url='/dir/%2e%2e/dir/file')['status'] == 200
+    ), 'encoded relative stays in root'
+
+    assert client.get(url='/%2e%2e/')['status'] == 400, 'encoded ..'
+    assert client.get(url='/%2e%2e')['status'] == 400, 'encoded .. no slash'
+    assert client.get(url='/%2e./')['status'] == 400, 'partial encoded .. 1'
+    assert client.get(url='/.%2e/')['status'] == 400, 'partial encoded .. 2'
+    assert (
+        client.get(url='/%2e%2e/assets/')['status'] == 400
+    ), 'encoded traversal to sibling'
 
 
 def test_static_two_clients():

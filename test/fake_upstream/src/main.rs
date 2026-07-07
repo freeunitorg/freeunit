@@ -22,6 +22,12 @@
 ///                    terminal chunk (relay vs proxy_read_timeout, #72 case 5)
 ///   dup-te           Transfer-Encoding: chunked header sent twice + valid
 ///                    chunked body (nginx/unit#1088, #72 case 6)
+///   overrun-cl       200 + fixed Content-Length but MORE body bytes than it
+///                    advertises. FreeUnit must truncate the relayed body to
+///                    the advertised length (never forward the excess, which
+///                    would enable response splitting) and close the
+///                    connection as inconsistent. Mirrors pytest
+///                    test_proxy_overrun_cl.
 ///
 /// --requests N   exit after handling N connections (default: run forever)
 /// --size N       chunked-response: response body size in MiB (default: 1)
@@ -45,7 +51,16 @@ enum Mode {
     AbortMid,
     SlowDrip,
     DupTe,
+    OverrunCl,
 }
+
+/// Advertised Content-Length and the number of unadvertised excess bytes for
+/// the `overrun-cl` mode. Kept tiny and fixed so the whole response fits one
+/// TCP segment (the excess lands in the same relay read as the declared tail,
+/// which is what exercises the truncation branch) and the test can regenerate
+/// the exact expected bytes.
+const OVERRUN_DECLARED: usize = 100;
+const OVERRUN_EXCESS: usize = 50;
 
 // ---------------------------------------------------------------------------
 
@@ -374,6 +389,37 @@ fn respond_dup_te(stream: &mut TcpStream, size: usize) {
     let _ = stream.flush();
 }
 
+/// Send a `Content-Length: OVERRUN_DECLARED` header but write
+/// `OVERRUN_DECLARED + OVERRUN_EXCESS` deterministic body bytes — an upstream
+/// that overruns its own advertised length. FreeUnit must relay exactly the
+/// advertised bytes to the client and drop the excess (forwarding it past the
+/// Content-Length already sent downstream would enable response splitting),
+/// then close the connection as inconsistent. Mirrors pytest
+/// `test_proxy_overrun_cl`.
+///
+/// The whole response (head + body) is written in a single syscall so the
+/// excess arrives in the same relay read as the declared tail — that is the
+/// path the truncation guard in nxt_h1p_peer_body_process protects.
+fn respond_overrun_cl(stream: &mut TcpStream) {
+    let total = OVERRUN_DECLARED + OVERRUN_EXCESS;
+
+    let mut resp = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/octet-stream\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        OVERRUN_DECLARED
+    )
+    .into_bytes();
+
+    for i in 0..total {
+        resp.push(PATTERN[i % PATTERN.len()]);
+    }
+
+    let _ = stream.write_all(&resp);
+    let _ = stream.flush();
+}
+
 fn handle(mut stream: TcpStream, opts: &Opts) {
     let req = match read_request(&stream) {
         Ok(r) => r,
@@ -398,6 +444,10 @@ fn handle(mut stream: TcpStream, opts: &Opts) {
 
         Mode::DupTe => {
             respond_dup_te(&mut stream, opts.size);
+        }
+
+        Mode::OverrunCl => {
+            respond_overrun_cl(&mut stream);
         }
 
         Mode::Echo => {
@@ -456,7 +506,7 @@ fn usage() -> ! {
     eprintln!(
         "Usage: fake_upstream --port <N> \
          --mode <requires-cl|no-te|strict|echo|chunked-response|\
-         abort-mid|slow-drip|dup-te> \
+         abort-mid|slow-drip|dup-te|overrun-cl> \
          [--requests <N>] [--size <MiB>] [--delay-ms <N>]"
     );
     process::exit(1);
@@ -489,6 +539,7 @@ fn main() {
                     "abort-mid" => Some(Mode::AbortMid),
                     "slow-drip" => Some(Mode::SlowDrip),
                     "dup-te" => Some(Mode::DupTe),
+                    "overrun-cl" => Some(Mode::OverrunCl),
                     _ => None,
                 });
             }
