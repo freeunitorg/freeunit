@@ -1,5 +1,23 @@
 
-Changes with FreeUnit 1.35.6                                     25 Jun 2026
+Changes with FreeUnit 1.35.6                                     07 Jul 2026
+
+    *) Change: upgrade the wasm-wasi-component wasmtime crates from 35.0.0
+       to 36.0.12, clearing the wasmtime sandbox-escape advisories, with the
+       accompanying WasiView/WasiHttpView source migration.
+
+    *) Bugfix: authorize privileged IPC message types by the kernel-validated
+       sender PID (SCM_CREDENTIALS), close any received descriptors on every
+       rejected privileged message, and cap port queue item size at the slot
+       data bound.
+
+    *) Bugfix: reject control characters (CR, LF, NUL, DEL) in "set_headers"
+       names and values at configuration load, including the literal
+       segments of templated values.
+
+    *) Bugfix: handle buffer-allocation failure in the port read handlers
+       with an orderly teardown instead of a NULL-pointer dereference, route
+       a connection write error after a partial send to the error handler
+       immediately, and free the timer batching array on engine teardown.
 
     *) Feature: upgrade the OpenTelemetry Rust crates from 0.24 to 0.32 and
        rewrite the OTLP trace exporter on the stable, dedicated-thread batch
