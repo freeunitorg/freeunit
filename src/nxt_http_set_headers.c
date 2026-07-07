@@ -68,6 +68,37 @@ nxt_http_set_headers_init(nxt_router_conf_t *rtcf, nxt_http_action_t *action,
 }
 
 
+/*
+ * Reject values that would inject a header boundary into the response.
+ * Templated values (e.g. $uri, $arg_*) can carry CR/LF/NUL bytes if the
+ * client encodes them in the request, and writing those bytes verbatim
+ * into the wire serialiser yields HTTP response splitting.  Static
+ * config values are operator-controlled and trusted, but the check is
+ * cheap enough to apply to both paths.
+ *
+ * Per the RFC 9110 field-value grammar, all control bytes other than
+ * HTAB are rejected, including DEL (0x7F); lenient downstream proxies
+ * may otherwise reinterpret them.  HTAB and high (0x80+) bytes are
+ * left alone.
+ */
+static nxt_bool_t
+nxt_http_header_value_is_safe(const nxt_str_t *v)
+{
+    u_char  c;
+    size_t  i;
+
+    for (i = 0; i < v->length; i++) {
+        c = v->start[i];
+
+        if ((c < 0x20 && c != '\t') || c == 0x7F) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
 static nxt_http_field_t *
 nxt_http_resp_header_find(nxt_http_request_t *r, u_char *name, size_t length)
 {
@@ -94,6 +125,7 @@ nxt_http_resp_header_find(nxt_http_request_t *r, u_char *name, size_t length)
 nxt_int_t
 nxt_http_set_headers(nxt_http_request_t *r)
 {
+    u_char                 *rejected;
     nxt_int_t              ret;
     nxt_uint_t             i, n;
     nxt_str_t              *value;
@@ -122,6 +154,11 @@ nxt_http_set_headers(nxt_http_request_t *r)
         return NXT_ERROR;
     }
 
+    rejected = nxt_mp_zalloc(r->mem_pool, n);
+    if (nxt_slow_path(rejected == NULL)) {
+        return NXT_ERROR;
+    }
+
     for (i = 0; i < n; i++) {
         hv = &header[i];
 
@@ -144,9 +181,32 @@ nxt_http_set_headers(nxt_http_request_t *r)
                 return NXT_ERROR;
             }
         }
+
+        if (value[i].start != NULL
+            && nxt_slow_path(!nxt_http_header_value_is_safe(&value[i])))
+        {
+            nxt_log(&r->task, NXT_LOG_INFO,
+                    "set_headers \"%V\": dropping value containing control "
+                    "bytes (HTTP response-splitting protection)",
+                    &hv->name);
+
+            /*
+             * Mark the entry as rejected instead of clearing the value:
+             * a NULL value means "delete this header", and letting an
+             * attacker-triggered rejection remove an existing response
+             * header (e.g. an app-emitted X-Frame-Options) would fail
+             * open.  Rejected entries are skipped entirely below, so a
+             * pre-existing same-named header survives untouched.
+             */
+            rejected[i] = 1;
+        }
     }
 
     for (i = 0; i < n; i++) {
+        if (rejected[i]) {
+            continue;
+        }
+
         hv = &header[i];
 
         f = nxt_http_resp_header_find(r, hv->name.start, hv->name.length);
