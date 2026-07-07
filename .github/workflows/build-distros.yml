@@ -113,7 +113,7 @@ jobs:
       # from-source compile on a hit.
       - name: Cache wasmtime
         id: cache-wasmtime
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: pkg/contrib/wasmtime/artifacts
           key: wasmtime-fedora-rawhide-${{ runner.arch }}-${{ hashFiles('pkg/contrib/src/wasmtime/version') }}

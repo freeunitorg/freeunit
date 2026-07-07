@@ -119,7 +119,7 @@ jobs:
       # OpenSSL build with no configure changes. Falls back to real cc on any
       # miss, so it can only speed things up, never break the build.
       - name: Cache ccache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.ccache
           key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.build }}-${{ github.run_id }}
@@ -134,7 +134,7 @@ jobs:
 
       - name: Cache OpenSSL 3.6
         id: cache-openssl36
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: /opt/openssl-3.6
           key: openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}-${{ runner.arch }}
@@ -169,7 +169,7 @@ jobs:
 
       - name: Cache njs
         id: cache-njs
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: njs
           key: njs-${{ steps.metadata.outputs.njs_version }}-${{ runner.os }}-${{ runner.arch }}
@@ -376,7 +376,7 @@ jobs:
       - name: Cache wasmtime
         id: cache-wasmtime
         if: steps.metadata.outputs.module == 'wasm'
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: pkg/contrib/wasmtime/artifacts
           key: wasmtime-${{ steps.metadata.outputs.wasmtime_version }}-${{ runner.os }}-${{ runner.arch }}
@@ -431,7 +431,7 @@ jobs:
 
       - name: Cache Cargo artifacts
         if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
