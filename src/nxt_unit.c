@@ -1403,8 +1403,28 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
      * co-located with arrival makes the trust boundary explicit.
      */
     {
+        uint32_t            i;
         nxt_unit_request_t  *vr = recv_msg->start;
         uint32_t            vsize = recv_msg->size;
+
+        /*
+         * The fields[] array trails the fixed request struct; its region
+         * (fields_count * sizeof(nxt_unit_field_t)) must lie within the
+         * received buffer before the per-field sptr loop below -- and
+         * before nxt_unit_request_group_dup_fields() and the language
+         * modules -- dereference fields[i].  64-bit math keeps the
+         * multiplication from overflowing a 32-bit fields_count.
+         */
+        if (nxt_slow_path(sizeof(nxt_unit_request_t)
+                          + (uint64_t) vr->fields_count
+                            * sizeof(nxt_unit_field_t)
+                          > vsize))
+        {
+            nxt_unit_warn(ctx, "#%"PRIu32": malformed request: fields_count "
+                          "%"PRIu32" exceeds buffer", recv_msg->stream,
+                          vr->fields_count);
+            return NXT_UNIT_ERROR;
+        }
 
         if (nxt_slow_path(
                !nxt_unit_sptr_in_buf(&vr->method, vr->method_length,
@@ -1430,6 +1450,44 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
         {
             nxt_unit_warn(ctx, "#%"PRIu32": malformed request: "
                           "sptr out of buffer", recv_msg->stream);
+            return NXT_UNIT_ERROR;
+        }
+
+        for (i = 0; i < vr->fields_count; i++) {
+            if (nxt_slow_path(
+                   !nxt_unit_sptr_in_buf(&vr->fields[i].name,
+                                         vr->fields[i].name_length,
+                                         recv_msg->start, vsize)
+                || !nxt_unit_sptr_in_buf(&vr->fields[i].value,
+                                         vr->fields[i].value_length,
+                                         recv_msg->start, vsize)))
+            {
+                nxt_unit_warn(ctx, "#%"PRIu32": malformed request: field "
+                              "%"PRIu32" sptr out of buffer",
+                              recv_msg->stream, i);
+                return NXT_UNIT_ERROR;
+            }
+        }
+
+        /*
+         * The cached header indexes also arrive from the peer.  Consumers
+         * (language modules) dereference fields[<index>] after only
+         * checking against NXT_UNIT_NONE_FIELD, so an in-range fields_count
+         * paired with an out-of-range cached index still drives an OOB
+         * read.  Reject any that is neither "unset" nor a valid index.
+         */
+        if (nxt_slow_path(
+               (vr->content_length_field != NXT_UNIT_NONE_FIELD
+                && vr->content_length_field >= vr->fields_count)
+            || (vr->content_type_field != NXT_UNIT_NONE_FIELD
+                && vr->content_type_field >= vr->fields_count)
+            || (vr->cookie_field != NXT_UNIT_NONE_FIELD
+                && vr->cookie_field >= vr->fields_count)
+            || (vr->authorization_field != NXT_UNIT_NONE_FIELD
+                && vr->authorization_field >= vr->fields_count)))
+        {
+            nxt_unit_warn(ctx, "#%"PRIu32": malformed request: cached field "
+                          "index out of range", recv_msg->stream);
             return NXT_UNIT_ERROR;
         }
     }
