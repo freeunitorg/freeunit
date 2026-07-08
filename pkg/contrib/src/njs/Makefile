@@ -14,8 +14,11 @@ njs: njs-$(NJS_VERSION).tar.gz .sum-njs
 	$(UNPACK)
 	$(MOVE)
 
+# njs 1.0.0 recommends QuickJS, but that requires an external QuickJS /
+# QuickJS-NG library, so build --no-quickjs to keep the baseline deterministic.
 .njs: njs
 	cd $< && ./configure \
+		--no-quickjs \
 		--no-libxml2 \
 		--no-zlib \
 		&& $(MAKE) libnjs
