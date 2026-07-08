@@ -139,7 +139,11 @@ nxt_otel_propagate_header(nxt_task_t *task, nxt_http_request_t *r)
 
         nxt_otel_rs_copy_traceparent(traceval, r->otel->trace);
 
-        f = nxt_list_add(r->fields);
+        /*
+         * nxt_list_add() hands out non-zeroed memory: garbage skip/hopbyhop
+         * bits make the peer/app serializers randomly drop the field.
+         */
+        f = nxt_list_zero_add(r->fields);
         if (nxt_slow_path(f == NULL)) {
             return;
         }
@@ -162,7 +166,7 @@ nxt_otel_propagate_header(nxt_task_t *task, nxt_http_request_t *r)
                                        &traceparent_name, &traceparent);
     }
 
-    f = nxt_list_add(r->resp.fields);
+    f = nxt_list_zero_add(r->resp.fields);
     if (nxt_slow_path(f == NULL)) {
         nxt_log(task, NXT_LOG_ERR,
                 "couldn't allocate traceparent header in response");
@@ -359,8 +363,51 @@ nxt_otel_error(nxt_task_t *task, nxt_http_request_t *r)
 
 
 static void
+nxt_otel_drop_tracestate(nxt_http_request_t *r)
+{
+    nxt_http_field_t  *f;
+
+    nxt_str_null(&r->otel->trace_state);
+
+    nxt_list_each(f, r->fields) {
+
+        if (f->name_length == nxt_length("tracestate")
+            && nxt_memcasecmp(f->name, "tracestate",
+                              nxt_length("tracestate")) == 0)
+        {
+            f->skip = 1;
+        }
+
+    } nxt_list_loop;
+
+    /* the echo copies nxt_otel_parse_tracestate() already appended */
+
+    nxt_list_each(f, r->resp.fields) {
+
+        if (f->name_length == nxt_length("tracestate")
+            && nxt_memcasecmp(f->name, "tracestate",
+                              nxt_length("tracestate")) == 0)
+        {
+            f->skip = 1;
+        }
+
+    } nxt_list_loop;
+}
+
+
+static void
 nxt_otel_trace_and_span_init(nxt_task_t *task, nxt_http_request_t *r)
 {
+    /*
+     * Restarting the trace (no valid inbound traceparent was accepted):
+     * drop any inbound tracestate per W3C Trace Context — vendor state
+     * from a rejected or absent context must not seed the new root span,
+     * be forwarded to the peer or application, or be echoed back.
+     */
+    if (r->otel->trace_id == NULL && r->otel->trace_state.length != 0) {
+        nxt_otel_drop_tracestate(r);
+    }
+
     r->otel->trace =
         nxt_otel_rs_get_or_create_trace(r->otel->trace_id,
                                         r->otel->parent_id,
@@ -420,10 +467,42 @@ nxt_otel_request_error_path(nxt_task_t *task, nxt_http_request_t *r)
 }
 
 
+static nxt_bool_t
+nxt_otel_segment_valid(const char *s, size_t len)
+{
+    /* W3C Trace Context segments are fixed-length lowercase hex (HEXDIGLC). */
+
+    if (strlen(s) != len) {
+        return 0;
+    }
+
+    for ( ; *s != '\0'; s++) {
+        if ((*s < '0' || *s > '9') && (*s < 'a' || *s > 'f')) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
+static nxt_bool_t
+nxt_otel_segment_all_zero(const char *s)
+{
+    for ( ; *s != '\0'; s++) {
+        if (*s != '0') {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
 nxt_int_t
 nxt_otel_parse_traceparent(void *ctx, nxt_http_field_t *field, uintptr_t data)
 {
-    char                *copy;
+    char                *copy, *version, *trace_id, *parent_id, *trace_flags;
     nxt_http_request_t  *r;
 
     /*
@@ -455,25 +534,75 @@ nxt_otel_parse_traceparent(void *ctx, nxt_http_field_t *field, uintptr_t data)
     }
     memcpy(copy, field->value, field->value_length);
 
-    r->otel->version = (u_char *) strsep(&copy, "-");
-    r->otel->trace_id = (u_char *) strsep(&copy, "-");
-    r->otel->parent_id = (u_char *) strsep(&copy, "-");
-    r->otel->trace_flags = (u_char *) strsep(&copy, "-");
+    /*
+     * Parse into locals first and only commit to r->otel on success, so a
+     * malformed field never clobbers context already accepted from an earlier
+     * valid traceparent in the same request (fields are processed in wire
+     * order).
+     */
+    version = strsep(&copy, "-");
+    trace_id = strsep(&copy, "-");
+    parent_id = strsep(&copy, "-");
+    trace_flags = strsep(&copy, "-");
 
-    if (r->otel->version        == NULL
-        || r->otel->trace_id    == NULL
-        || r->otel->parent_id   == NULL
-        || r->otel->trace_flags == NULL)
+    if (version == NULL || trace_id == NULL
+        || parent_id == NULL || trace_flags == NULL)
     {
         goto error_state;
     }
 
+    /*
+     * Validate content, not just shape: fixed segment lengths (a misplaced
+     * hyphen shifts them, so this also rejects extra segments within the
+     * checked total length), lowercase hex per the W3C ABNF (HEXDIGLC), the
+     * forbidden "ff" version, and all-zero trace/parent ids, which the spec
+     * defines as invalid.  Anything else would be inherited and re-emitted
+     * verbatim downstream and in the response.
+     */
+    if (!nxt_otel_segment_valid(version, 2)
+        || !nxt_otel_segment_valid(trace_id, 32)
+        || !nxt_otel_segment_valid(parent_id, 16)
+        || !nxt_otel_segment_valid(trace_flags, 2))
+    {
+        goto error_state;
+    }
+
+    if (memcmp(version, "ff", 2) == 0
+        || nxt_otel_segment_all_zero(trace_id)
+        || nxt_otel_segment_all_zero(parent_id))
+    {
+        goto error_state;
+    }
+
+    r->otel->version = (u_char *) version;
+    r->otel->trace_id = (u_char *) trace_id;
+    r->otel->parent_id = (u_char *) parent_id;
+    r->otel->trace_flags = (u_char *) trace_flags;
+
     return NXT_OK;
 
 error_state:
-    nxt_otel_state_transition(r->otel, NXT_OTEL_ERROR_STATE);
+    /*
+     * A malformed inbound traceparent is ignored per W3C Trace Context
+     * (§3.2.2.3): the trace is restarted, not rejected. We do NOT fail the
+     * request (return NXT_OK, not NXT_ERROR): failing this header-parse
+     * callback aborts the request as a 500, letting any client force an outage
+     * with a bad client-supplied header. We also do NOT transition to
+     * ERROR_STATE: that would disable telemetry for the request (the next
+     * dispatch would drop to UNINIT_STATE via nxt_otel_error), losing the span
+     * and the response traceparent. Staying in INIT_STATE with a NULL trace_id
+     * makes the state machine start a fresh root span
+     * (nxt_otel_trace_and_span_init -> get_or_create_trace).
+     *
+     * We leave r->otel untouched: if an earlier valid traceparent was accepted,
+     * its context is preserved (inherit it); otherwise the fields are still
+     * NULL and the trace restarts. Either way skip this bad header on the
+     * request so it is not forwarded to a proxied peer or the application
+     * alongside the inherited/restarted one.
+     */
+    field->skip = 1;
 
-    return NXT_ERROR;
+    return NXT_OK;
 }
 
 
