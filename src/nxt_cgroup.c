@@ -15,9 +15,30 @@ static nxt_int_t nxt_mk_cgpath(nxt_task_t *task, const char *dir,
 
 
 nxt_int_t
+nxt_cgroup_make_procs_path(char *cgprocs, size_t len)
+{
+    int  n;
+
+    if (nxt_slow_path(len >= NXT_MAX_PATH_LEN)) {
+        nxt_errno = ENAMETOOLONG;
+        return NXT_ERROR;
+    }
+
+    n = snprintf(cgprocs + len, NXT_MAX_PATH_LEN - len, "/cgroup.procs");
+    if (nxt_slow_path(n < 0 || (size_t) n >= NXT_MAX_PATH_LEN - len)) {
+        nxt_errno = ENAMETOOLONG;
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+
+nxt_int_t
 nxt_cgroup_proc_add(nxt_task_t *task, nxt_process_t *process)
 {
     int        len;
+    size_t     old_len;
     char       cgprocs[NXT_MAX_PATH_LEN];
     FILE       *fp;
     nxt_int_t  ret;
@@ -48,7 +69,7 @@ nxt_cgroup_proc_add(nxt_task_t *task, nxt_process_t *process)
         return NXT_ERROR;
     }
 
-    len = strlen(cgprocs);
+    old_len = strlen(cgprocs);
 
     /*
      * Stash the resolved directory before appending "/cgroup.procs" so
@@ -56,15 +77,14 @@ nxt_cgroup_proc_add(nxt_task_t *task, nxt_process_t *process)
      * which is gone once the child has exited.
      */
     process->isolation.cgroup.resolved_path = nxt_mp_alloc(process->mem_pool,
-                                                           len + 1);
+                                                           old_len + 1);
     if (nxt_fast_path(process->isolation.cgroup.resolved_path != NULL)) {
-        nxt_memcpy(process->isolation.cgroup.resolved_path, cgprocs, len);
-        process->isolation.cgroup.resolved_path[len] = '\0';
+        nxt_memcpy(process->isolation.cgroup.resolved_path, cgprocs, old_len);
+        process->isolation.cgroup.resolved_path[old_len] = '\0';
     }
 
-    len = snprintf(cgprocs + len, NXT_MAX_PATH_LEN - len, "/cgroup.procs");
-    if (nxt_slow_path(len >= NXT_MAX_PATH_LEN - len)) {
-        nxt_errno = ENAMETOOLONG;
+    ret = nxt_cgroup_make_procs_path(cgprocs, old_len);
+    if (nxt_slow_path(ret == NXT_ERROR)) {
         return NXT_ERROR;
     }
 
