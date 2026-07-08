@@ -28,6 +28,12 @@
 ///                    would enable response splitting) and close the
 ///                    connection as inconsistent. Mirrors pytest
 ///                    test_proxy_overrun_cl.
+///   dup-cl           200 with TWO conflicting Content-Length headers (20,
+///                    then 6) + a 20-byte body, then close. Duplicate
+///                    Content-Length is a response-smuggling primitive;
+///                    FreeUnit must forward neither header, re-framing the
+///                    body itself as unambiguous chunked (#113). Mirrors
+///                    pytest test_proxy_dup_cl.
 ///
 /// --requests N   exit after handling N connections (default: run forever)
 /// --size N       chunked-response: response body size in MiB (default: 1)
@@ -51,6 +57,7 @@ enum Mode {
     AbortMid,
     SlowDrip,
     DupTe,
+    DupCl,
     OverrunCl,
     BadCl,
     OverrunClKa,
@@ -78,6 +85,14 @@ const BAD_CL_VALUE: &str = "notanumber";
 /// the exact expected bytes.
 const OVERRUN_DECLARED: usize = 100;
 const OVERRUN_EXCESS: usize = 50;
+
+/// Conflicting Content-Length values for the `dup-cl` mode. The first header
+/// advertises the real body length, the second a shorter one — a downstream
+/// parser that honoured the second value would treat the body tail as the
+/// start of the next response (the classic smuggling desync). Kept tiny and
+/// fixed so the test regenerates the exact expected bytes.
+const DUP_CL_FIRST: usize = 20;
+const DUP_CL_SECOND: usize = 6;
 
 // ---------------------------------------------------------------------------
 
@@ -406,6 +421,33 @@ fn respond_dup_te(stream: &mut TcpStream, size: usize) {
     let _ = stream.flush();
 }
 
+/// Send TWO conflicting `Content-Length` headers (DUP_CL_FIRST, then
+/// DUP_CL_SECOND), followed by DUP_CL_FIRST deterministic body bytes, then
+/// close. Duplicate Content-Length is a classic response-smuggling
+/// primitive: the two values disagree on where the body ends, so a proxy
+/// that forwards them lets a downstream parser honouring the other value
+/// re-frame the body. FreeUnit must forward *neither* header, re-framing
+/// the body itself as unambiguous chunked (#113). Mirrors pytest
+/// `test_proxy_dup_cl`.
+fn respond_dup_cl(stream: &mut TcpStream) {
+    let mut resp = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/octet-stream\r\n\
+         Content-Length: {}\r\n\
+         Content-Length: {}\r\n\
+         Connection: keep-alive\r\n\r\n",
+        DUP_CL_FIRST, DUP_CL_SECOND
+    )
+    .into_bytes();
+
+    for i in 0..DUP_CL_FIRST {
+        resp.push(PATTERN[i % PATTERN.len()]);
+    }
+
+    let _ = stream.write_all(&resp);
+    let _ = stream.flush();
+}
+
 /// Send a `Content-Length: OVERRUN_DECLARED` header but write
 /// `OVERRUN_DECLARED + OVERRUN_EXCESS` deterministic body bytes — an upstream
 /// that overruns its own advertised length. FreeUnit must relay exactly the
@@ -557,6 +599,10 @@ fn handle(mut stream: TcpStream, opts: &Opts) {
             respond_dup_te(&mut stream, opts.size);
         }
 
+        Mode::DupCl => {
+            respond_dup_cl(&mut stream);
+        }
+
         Mode::OverrunCl => {
             respond_overrun_cl(&mut stream);
         }
@@ -633,7 +679,7 @@ fn usage() -> ! {
     eprintln!(
         "Usage: fake_upstream --port <N> \
          --mode <requires-cl|no-te|strict|echo|chunked-response|\
-         abort-mid|slow-drip|dup-te|overrun-cl|bad-cl|\
+         abort-mid|slow-drip|dup-te|dup-cl|overrun-cl|bad-cl|\
          overrun-cl-ka|chunked-trailer|chunked-ext> \
          [--requests <N>] [--size <MiB>] [--delay-ms <N>]"
     );
@@ -667,6 +713,7 @@ fn main() {
                     "abort-mid" => Some(Mode::AbortMid),
                     "slow-drip" => Some(Mode::SlowDrip),
                     "dup-te" => Some(Mode::DupTe),
+                    "dup-cl" => Some(Mode::DupCl),
                     "overrun-cl" => Some(Mode::OverrunCl),
                     "bad-cl" => Some(Mode::BadCl),
                     "overrun-cl-ka" => Some(Mode::OverrunClKa),
