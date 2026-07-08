@@ -272,6 +272,28 @@ def test_listeners_unix_path_nul(system):
     assert 'error' in try_addr("unix:/tmp/x\0y"), 'pathname \0'
 
 
+def test_access_log_cstring_nul(temp_dir):
+    # The access log path is passed to the router and opened as a
+    # NUL-terminated C string; both the string form and the object form
+    # "path" must reject an embedded NUL (\0 survives JSON parsing) and
+    # an empty value.
+    def conf_log(value):
+        return client.conf(
+            {"listeners": {}, "applications": {}, "access_log": value}
+        )
+
+    assert 'error' in conf_log("/tmp/x\0y"), 'string nul'
+    assert 'error' in conf_log(""), 'string empty'
+    assert 'error' in conf_log({"path": "/tmp/x\0y"}), 'path nul'
+    assert 'error' in conf_log({"path": ""}), 'path empty'
+
+    # Valid values are still accepted.
+    assert 'success' in conf_log(f'{temp_dir}/access.log'), 'string valid'
+    assert 'success' in conf_log(
+        {"path": f'{temp_dir}/access.log'}
+    ), 'path valid'
+
+
 @pytest.mark.skip('not yet, unsafe')
 def test_listeners_empty():
     assert 'error' in client.conf({"*:8080": {}}, 'listeners'), 'listener empty'
