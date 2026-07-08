@@ -1073,6 +1073,8 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_php_options_members[] = {
     {
         .name       = nxt_string("file"),
         .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_c_string,
+        .u.string   = "file",
     }, {
         .name       = nxt_string("admin"),
         .type       = NXT_CONF_VLDT_OBJECT,
@@ -2842,12 +2844,24 @@ static nxt_int_t
 nxt_conf_vldt_certificate_element(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value)
 {
+    nxt_int_t         ret;
     nxt_str_t         name;
     nxt_conf_value_t  *cert;
 
     if (nxt_conf_type(value) != NXT_CONF_STRING) {
         return nxt_conf_vldt_error(vldt, "The \"certificate\" array must "
                                    "contain only string values.");
+    }
+
+    /*
+     * The certificate name is sent to the main process NUL-terminated and
+     * used there as a C-string file name in the certificates storage
+     * directory; an embedded NUL would silently truncate it to a different
+     * certificate.
+     */
+    ret = nxt_conf_vldt_c_string(vldt, value, (void *) "certificate");
+    if (ret != NXT_OK) {
+        return ret;
     }
 
     nxt_conf_get_string(value, &name);
@@ -3450,6 +3464,10 @@ nxt_conf_vldt_environment(nxt_conf_validation_t *vldt, nxt_str_t *name,
  * passes JSON validation but silently truncates at the sink, causing
  * privilege/target confusion or loading the wrong file/symbol.  The option
  * name is passed via the member's .u.string for the diagnostic.
+ *
+ * Besides application options, the helper also guards the access_log path,
+ * the php.ini "file" path, and the TLS "certificate" and njs "js_module"
+ * store names (custom validators call it directly).
  */
 static nxt_int_t
 nxt_conf_vldt_c_string(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
@@ -3912,12 +3930,23 @@ static nxt_int_t
 nxt_conf_vldt_js_module_element(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value)
 {
+    nxt_int_t         ret;
     nxt_str_t         name;
     nxt_conf_value_t  *module;
 
     if (nxt_conf_type(value) != NXT_CONF_STRING) {
         return nxt_conf_vldt_error(vldt, "The \"js_module\" array must "
                                    "contain only string values.");
+    }
+
+    /*
+     * The module name is sent to the main process NUL-terminated and used
+     * there as a C-string file name in the scripts storage directory; an
+     * embedded NUL would silently truncate it to a different module.
+     */
+    ret = nxt_conf_vldt_c_string(vldt, value, (void *) "js_module");
+    if (ret != NXT_OK) {
+        return ret;
     }
 
     nxt_conf_get_string(value, &name);
@@ -3965,7 +3994,7 @@ nxt_conf_vldt_access_log(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
     static const nxt_str_t  format_str = nxt_string("format");
 
     if (nxt_conf_type(value) == NXT_CONF_STRING) {
-        return NXT_OK;
+        return nxt_conf_vldt_c_string(vldt, value, (void *) "access_log");
     }
 
     ret = nxt_conf_vldt_object(vldt, value, nxt_conf_vldt_access_log_members);
@@ -3986,6 +4015,13 @@ nxt_conf_vldt_access_log(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
     if (conf.path.length == 0) {
         return nxt_conf_vldt_error(vldt,
                                    "The \"path\" string must not be empty.");
+    }
+
+    /* The log path is opened as a NUL-terminated C string. */
+
+    if (memchr(conf.path.start, '\0', conf.path.length) != NULL) {
+        return nxt_conf_vldt_error(vldt, "The \"path\" value must not "
+                                   "contain null character.");
     }
 
     if (nxt_is_tstr(&conf.format)) {

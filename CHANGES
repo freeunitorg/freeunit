@@ -7,6 +7,12 @@ Changes with FreeUnit 1.35.6                                     07 Jul 2026
        the per-language application targets) and in pathname unix socket
        addresses, closing a silent-truncation target confusion.
 
+    *) Bugfix: reject empty values and embedded NUL bytes in the remaining
+       configuration strings used as NUL-terminated C strings outside
+       application options: the "access_log" path (string and object
+       forms), the TLS "certificate" and njs "js_module" store names, and
+       the PHP "options.file" php.ini path.
+
     *) Bugfix: mount rootfs automount destinations onto the openat2
        validated descriptor via "/proc/self/fd" instead of re-resolving the
        path, closing a check-to-use window in which a destination component
