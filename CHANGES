@@ -1,6 +1,19 @@
 
 Changes with FreeUnit 1.35.6                                     07 Jul 2026
 
+    *) Bugfix: ignore a malformed incoming "traceparent" header and restart
+       the trace per W3C Trace Context instead of rejecting the request
+       with HTTP 500; the malformed header is dropped instead of being
+       forwarded alongside the restarted one, and context accepted from a
+       valid duplicate is preserved. Values are now validated in full
+       (segment lengths, lowercase hex, no all-zero ids, no "ff" version),
+       so content-invalid values restart the trace instead of being
+       re-emitted verbatim. An inbound "tracestate" is dropped together
+       with the rejected context (kept when the traceparent is inherited).
+       The injected "traceparent" fields are now zero-initialized; garbage
+       flag bits could get the header randomly dropped from proxied
+       requests and responses.
+
     *) Bugfix: reject empty values and embedded NUL bytes in configuration
        strings that are later used as NUL-terminated C strings ("user",
        "group", "working_directory", "stdout", "stderr", "executable", and

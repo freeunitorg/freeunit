@@ -1,11 +1,13 @@
 import json
 import os
+import re
 import socket
 import subprocess
 import time
 
 import pytest
 
+from conftest import run_process
 from unit.applications.proto import ApplicationProto
 from unit.utils import waitforsocket
 
@@ -233,43 +235,6 @@ def test_otel_span_5xx_status(tmp_path, protocol):
 
 
 @_skipif_no_fake_otlp
-@pytest.mark.xfail(
-    reason=(
-        'Suspected bug: a malformed inbound traceparent returns HTTP 500 '
-        'instead of being ignored. nxt_otel_parse_traceparent() returns '
-        'NXT_ERROR on a length/format mismatch (src/nxt_otel.c ~445-476), and a '
-        'header-parse callback returning NXT_ERROR fails the request. W3C '
-        'Trace Context 3.2.2.3 requires an unparseable traceparent to be '
-        'ignored and the trace restarted, not to reject the request -- so on '
-        'an OTel-enabled listener any client can force a 500 with '
-        '"traceparent: x". Deterministic, so strict=True: once #109 is fixed '
-        'the test xpasses -> fails, forcing removal of this marker. '
-        'See freeunitorg/freeunit#109.'
-    ),
-    strict=True,
-)
-@pytest.mark.parametrize('protocol', ['http', 'grpc'])
-def test_otel_traceparent_malformed(protocol):
-    """A malformed inbound traceparent should be ignored (the trace is
-    restarted), not turned into an error response."""
-    port = _get_free_port()
-    proc = _run_fake_otlp(port, protocol=protocol)  # run forever, absorb exports
-    try:
-        _configure_or_skip(port, protocol=protocol)
-
-        resp = client.get(
-            headers={
-                'Host': 'localhost',
-                'traceparent': 'this-is-not-a-valid-traceparent',
-                'Connection': 'close',
-            }
-        )
-        assert resp['status'] == 200, f'malformed traceparent must not error: {resp}'
-    finally:
-        _kill(proc)
-
-
-@_skipif_no_fake_otlp
 @pytest.mark.parametrize('protocol', ['http', 'grpc'])
 def test_otel_traceparent_in_response(protocol):
     """FreeUnit injects a traceparent header into the response."""
@@ -341,6 +306,369 @@ def test_otel_sampling_zero_exports_nothing(protocol):
             pytest.fail('fake_otlp received a span despite sampling_ratio=0')
         except subprocess.TimeoutExpired:
             pass  # expected — no export
+    finally:
+        _kill(proc)
+
+
+@_skipif_no_fake_otlp
+@pytest.mark.parametrize('protocol', ['http', 'grpc'])
+def test_otel_traceparent_malformed(protocol):
+    """A malformed inbound traceparent is ignored and the trace restarted.
+
+    W3C Trace Context §3.2.2.3 requires an unparseable traceparent to be
+    ignored and the trace restarted, never to reject the request. The header is
+    client-supplied, so failing the request turns a bad header into a trivial
+    availability attack (every request 500s). Regression guard for the fix in
+    nxt_otel_parse_traceparent (src/nxt_otel.c): the request must be served
+    (200) AND still traced with a fresh root span (a new traceparent is injected
+    into the response), not served with telemetry silently disabled.
+    """
+    port = _get_free_port()
+    proc = _run_fake_otlp(port, protocol=protocol)  # run forever, absorb exports
+    try:
+        _configure_or_skip(port, protocol=protocol)
+
+        # Ensure the tracer is actually live before probing, so the malformed
+        # header exercises the parse callback rather than being skipped while
+        # OTel is still initialising.
+        assert _get_until_header('traceparent')['status'] == 200
+
+        # Wrong length, wrong shape, and content-invalid values (correct
+        # 55-char shape but non-hex/uppercase segments, all-zero ids, the
+        # forbidden "ff" version, or a misplaced hyphen) all take the
+        # error_state path in the parser; each must be served 200 and get a
+        # fresh, non-inherited traceparent in the response. The probe retries
+        # via _get_until_header: OTel re-inits asynchronously on config change,
+        # so a single-shot probe can race the tracer swap and go through
+        # untraced. A regression is not masked — telemetry silently disabled
+        # never yields a traceparent, so the poll drains and `injected` stays
+        # empty.
+        for bad in [
+            'x',
+            'this-is-not-a-valid-traceparent',
+            '00-tooshort-01',
+            f'zz-{TRACE_ID}-{PARENT_ID}-01',  # non-hex version
+            f'00-{TRACE_ID.upper()}-{PARENT_ID}-01',  # uppercase: not HEXDIGLC
+            f'00-{"0" * 32}-{PARENT_ID}-01',  # all-zero trace id
+            f'00-{TRACE_ID}-{"0" * 16}-01',  # all-zero parent id
+            f'ff-{TRACE_ID}-{PARENT_ID}-01',  # forbidden version
+            f'00-{TRACE_ID[:-1]}-{PARENT_ID}-0-1',  # shifted hyphen, len 55
+        ]:
+            resp = _get_until_header(
+                'traceparent',
+                headers={
+                    'Host': 'localhost',
+                    'traceparent': bad,
+                    'Connection': 'close',
+                },
+            )
+            assert resp['status'] == 200, (
+                f'malformed traceparent {bad!r} must be served, not 500'
+            )
+            injected = _response_headers_lower(resp).get('traceparent', '')
+            assert injected, (
+                f'malformed traceparent {bad!r} must restart the trace '
+                f'(fresh traceparent injected), not disable telemetry'
+            )
+            assert not injected.startswith('00-00000000000000000000000000000000'), (
+                f'restarted traceparent must carry a real trace id: {injected!r}'
+            )
+            assert TRACE_ID not in injected, (
+                f'content-invalid traceparent {bad!r} must not be inherited'
+            )
+
+        # A well-formed traceparent is still inherited (control case): the
+        # response echoes the incoming trace id. Retried like the probes above
+        # (the async tracer swap can land at any point inside the test); an
+        # inheritance regression still fails — a restarted trace echoes a
+        # different id than TRACE_ID.
+        resp = _get_until_header(
+            'traceparent',
+            headers={
+                'Host': 'localhost',
+                'traceparent': f'00-{TRACE_ID}-{PARENT_ID}-01',
+                'Connection': 'close',
+            },
+        )
+        assert resp['status'] == 200, 'valid traceparent must be served'
+        assert TRACE_ID in _response_headers_lower(resp).get('traceparent', ''), (
+            'valid traceparent must be inherited, not restarted'
+        )
+    finally:
+        _kill(proc)
+
+
+def _run_capture_server(server_port, capture_file):
+    """A raw upstream that appends each request it receives to capture_file."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(('', server_port))
+    sock.listen(5)
+
+    resp = b'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'
+
+    while True:
+        conn, _ = sock.accept()
+
+        # Read until end-of-headers: a short recv() is NOT end-of-message, and
+        # the traceparent unit injects is appended last in the field list, so
+        # a capture truncated at a segment boundary loses exactly that header.
+        # All requests here are body-less GETs, so end-of-headers ends the
+        # message.
+        data = b''
+        while b'\r\n\r\n' not in data:
+            part = conn.recv(4096)
+            if not part:
+                break
+            data += part
+
+        with open(capture_file, 'ab') as f:
+            f.write(data + b'\n===END===\n')
+
+        conn.sendall(resp)
+        conn.close()
+
+
+def _configure_proxy_or_skip(collector_port, upstream_port, protocol='http'):
+    """Apply a telemetry + proxy config, skipping cleanly on a non-otel build."""
+    conf = client.conf(
+        {
+            "settings": {
+                "telemetry": _valid_telemetry(collector_port, protocol=protocol)
+            },
+            "listeners": {"*:8080": {"pass": "routes"}},
+            "routes": [
+                {"action": {"proxy": f"http://127.0.0.1:{upstream_port}"}}
+            ],
+            "applications": {},
+        }
+    )
+    if 'success' in conf:
+        return
+    if 'telemetry' in str(conf).lower():
+        pytest.skip('unit built without --otel')
+    pytest.fail(f'proxy + telemetry config rejected: {conf}')
+
+
+def _forwarded_headers(capture_file, marker, name):
+    """The values of header `name` in the captured proxied request with marker.
+
+    The client.get that sends the probe only returns after the upstream has
+    answered, so the forwarded request is already on disk; a short sleep guards
+    the file append that races the socket write.
+    """
+    time.sleep(0.5)
+    blocks = capture_file.read_bytes().decode(errors='replace').split('===END===')
+    probe = [b for b in blocks if marker in b.lower()]
+    assert probe, 'proxied request carrying the probe marker was not captured'
+    return re.findall(rf'(?im)^{name}:[ \t]*(.+?)[ \t\r]*$', probe[-1])
+
+
+def _forwarded_traceparents(capture_file, marker):
+    return _forwarded_headers(capture_file, marker, 'traceparent')
+
+
+@_skipif_no_fake_otlp
+@pytest.mark.parametrize('protocol', ['http', 'grpc'])
+def test_otel_traceparent_malformed_not_forwarded(tmp_path, protocol):
+    """The bad traceparent is not forwarded alongside the restarted one.
+
+    Restarting the trace makes nxt_otel_propagate_header() append a fresh
+    traceparent to the proxied/app request. The original malformed header must
+    be dropped (field->skip), otherwise a proxied peer or the application
+    receives two traceparent headers — the bad one and the new one — and a
+    downstream reader keying on the first is misled. Regression guard for the
+    field->skip part of the fix in nxt_otel_parse_traceparent.
+    """
+    upstream_port = _get_free_port()
+    capture = tmp_path / 'forwarded.txt'
+    run_process(_run_capture_server, upstream_port, str(capture))
+    waitforsocket(upstream_port)
+
+    collector_port = _get_free_port()
+    proc = _run_fake_otlp(collector_port, protocol=protocol)
+    try:
+        _configure_proxy_or_skip(collector_port, upstream_port, protocol)
+
+        # Warm the tracer so the probe request actually restarts a trace.
+        assert _get_until_header('traceparent')['status'] == 200
+
+        # The probe goes through _get_until_header too: OTel re-inits
+        # asynchronously on every config change, so a single-shot probe can
+        # race the tracer swap and go through untraced (no injection at all).
+        # A traced probe always carries a response traceparent, so polling for
+        # it retries only raced attempts and cannot mask a regression.
+        marker = 'otel-malformed-probe'
+        resp = _get_until_header(
+            'traceparent',
+            headers={
+                'Host': 'localhost',
+                'traceparent': 'x',
+                'X-Probe': marker,
+                'Connection': 'close',
+            },
+        )
+        assert resp['status'] == 200
+
+        forwarded = _forwarded_traceparents(capture, marker)
+        assert len(forwarded) == 1, (
+            f'exactly one traceparent must be forwarded, got {forwarded}'
+        )
+        assert forwarded[0] != 'x', (
+            f'the malformed traceparent must not be forwarded: {forwarded}'
+        )
+    finally:
+        _kill(proc)
+
+
+@_skipif_no_fake_otlp
+@pytest.mark.parametrize('protocol', ['http', 'grpc'])
+@pytest.mark.parametrize('order', ['valid_first', 'malformed_first'])
+def test_otel_traceparent_duplicate_valid_preserved(tmp_path, protocol, order):
+    """A valid traceparent is kept when a duplicate malformed one is present.
+
+    Header fields are parsed in wire order, so a malformed duplicate must not
+    discard context already accepted from a valid traceparent (in either
+    order). The valid trace id is inherited (echoed in the response) and exactly
+    that one traceparent is forwarded downstream — never the malformed
+    duplicate, never a second restarted header.
+    """
+    valid = f'00-{TRACE_ID}-{PARENT_ID}-01'
+    traceparent = [valid, 'x'] if order == 'valid_first' else ['x', valid]
+
+    upstream_port = _get_free_port()
+    capture = tmp_path / 'forwarded.txt'
+    run_process(_run_capture_server, upstream_port, str(capture))
+    waitforsocket(upstream_port)
+
+    collector_port = _get_free_port()
+    proc = _run_fake_otlp(collector_port, protocol=protocol)
+    try:
+        _configure_proxy_or_skip(collector_port, upstream_port, protocol)
+
+        assert _get_until_header('traceparent')['status'] == 200
+
+        # Retry the probe across the async tracer re-init (see the malformed
+        # test above); an inheritance regression still fails: the traced
+        # response would carry a restarted (wrong) trace id, not TRACE_ID.
+        marker = 'otel-dup-probe'
+        resp = _get_until_header(
+            'traceparent',
+            headers={
+                'Host': 'localhost',
+                'traceparent': traceparent,
+                'X-Probe': marker,
+                'Connection': 'close',
+            },
+        )
+        assert resp['status'] == 200
+        assert TRACE_ID in _response_headers_lower(resp).get('traceparent', ''), (
+            'the valid duplicate must be inherited, not restarted'
+        )
+
+        forwarded = _forwarded_traceparents(capture, marker)
+        assert len(forwarded) == 1, (
+            f'exactly one traceparent must be forwarded, got {forwarded}'
+        )
+        assert TRACE_ID in forwarded[0], (
+            f'the valid trace id must be the one forwarded: {forwarded}'
+        )
+    finally:
+        _kill(proc)
+
+
+TRACESTATE = 'congo=t61rcWkgMzE'
+
+
+@_skipif_no_fake_otlp
+@pytest.mark.parametrize('protocol', ['http', 'grpc'])
+def test_otel_tracestate_dropped_on_restart(tmp_path, protocol):
+    """Inbound tracestate is dropped when the trace is restarted.
+
+    W3C Trace Context ties tracestate to the context in traceparent. With no
+    valid traceparent accepted (malformed or absent), the trace restarts and
+    the stale vendor state must not seed the new root span, be forwarded
+    downstream, or be echoed back — only the fresh traceparent survives.
+    """
+    upstream_port = _get_free_port()
+    capture = tmp_path / 'forwarded.txt'
+    run_process(_run_capture_server, upstream_port, str(capture))
+    waitforsocket(upstream_port)
+
+    collector_port = _get_free_port()
+    proc = _run_fake_otlp(collector_port, protocol=protocol)
+    try:
+        _configure_proxy_or_skip(collector_port, upstream_port, protocol)
+
+        assert _get_until_header('traceparent')['status'] == 200
+
+        scenarios = {
+            'malformed': {'traceparent': 'x', 'tracestate': TRACESTATE},
+            'absent': {'tracestate': TRACESTATE},
+        }
+        for scenario, headers in scenarios.items():
+            marker = f'otel-ts-drop-{scenario}'
+            resp = _get_until_header(
+                'traceparent',
+                headers={
+                    'Host': 'localhost',
+                    'X-Probe': marker,
+                    'Connection': 'close',
+                    **headers,
+                },
+            )
+            assert resp['status'] == 200
+            assert 'tracestate' not in _response_headers_lower(resp), (
+                f'[{scenario}] rejected tracestate must not be echoed'
+            )
+
+            assert _forwarded_headers(capture, marker, 'tracestate') == [], (
+                f'[{scenario}] rejected tracestate must not be forwarded'
+            )
+            forwarded = _forwarded_traceparents(capture, marker)
+            assert len(forwarded) == 1 and forwarded[0] != 'x', (
+                f'[{scenario}] one fresh traceparent expected: {forwarded}'
+            )
+    finally:
+        _kill(proc)
+
+
+@_skipif_no_fake_otlp
+@pytest.mark.parametrize('protocol', ['http', 'grpc'])
+def test_otel_tracestate_preserved_on_inherit(tmp_path, protocol):
+    """Inbound tracestate rides along when the traceparent is inherited."""
+    upstream_port = _get_free_port()
+    capture = tmp_path / 'forwarded.txt'
+    run_process(_run_capture_server, upstream_port, str(capture))
+    waitforsocket(upstream_port)
+
+    collector_port = _get_free_port()
+    proc = _run_fake_otlp(collector_port, protocol=protocol)
+    try:
+        _configure_proxy_or_skip(collector_port, upstream_port, protocol)
+
+        assert _get_until_header('traceparent')['status'] == 200
+
+        marker = 'otel-ts-keep'
+        resp = _get_until_header(
+            'traceparent',
+            headers={
+                'Host': 'localhost',
+                'traceparent': f'00-{TRACE_ID}-{PARENT_ID}-01',
+                'tracestate': TRACESTATE,
+                'X-Probe': marker,
+                'Connection': 'close',
+            },
+        )
+        assert resp['status'] == 200
+        assert TRACE_ID in _response_headers_lower(resp).get('traceparent', '')
+        assert TRACESTATE in _response_headers_lower(resp).get(
+            'tracestate', ''
+        ), 'tracestate must be echoed with an inherited traceparent'
+
+        assert _forwarded_headers(capture, marker, 'tracestate') == [
+            TRACESTATE
+        ], 'tracestate must be forwarded with an inherited traceparent'
     finally:
         _kill(proc)
 
