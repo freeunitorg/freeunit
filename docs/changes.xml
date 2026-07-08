@@ -75,6 +75,12 @@ exporter; only HttpBinary was ever selected.
 
 <change type="change">
 <para>
+upgrade contrib njs to 1.0.0.
+</para>
+</change>
+
+<change type="change">
+<para>
 the Debian packages are rebranded to "freeunit": the package set
 (freeunit, freeunit-dev, freeunit-php8.x, freeunit-python3.x,
 freeunit-perl, freeunit-ruby, freeunit-go, freeunit-wasm and the
