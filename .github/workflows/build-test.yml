@@ -172,13 +172,13 @@ jobs:
         uses: actions/cache@v6
         with:
           path: njs
-          key: njs-${{ steps.metadata.outputs.njs_version }}-${{ runner.os }}-${{ runner.arch }}
+          key: njs-freeunitorg-${{ steps.metadata.outputs.njs_version }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Clone njs repository
         if: steps.cache-njs.outputs.cache-hit != 'true'
         uses: actions/checkout@v5
         with:
-          repository: nginx/njs
+          repository: freeunitorg/njs
           ref: '${{ steps.metadata.outputs.njs_version }}'
           path: njs
 
