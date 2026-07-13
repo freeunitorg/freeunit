@@ -15,6 +15,8 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Go | 1.26 | Feb 2027 | Feb 2028 |
 | Java (JSC) | 17 (LTS) | Oct 2027 | Oct 2028 |
 | Java (JSC) | 21 (LTS) | Dec 2029 | Dec 2030 |
+| Java (JSC) | 25 (LTS) | Sep 2031 | Sep 2032 |
+| Java (JSC) | 26 | Sep 2026 | Sep 2027 |
 | Node.js | 20 (LTS) (EOL) † | Apr 2026 | Apr 2027 |
 | Node.js | 22 (LTS) | Apr 2027 | Apr 2028 |
 | Node.js | 24 (LTS) | Apr 2028 | Apr 2029 |
@@ -74,7 +76,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
   `CHANGES`.
 - **Security-only mode:** versions within 6 months of the FreeUnit drop date receive
   security fixes only — no new features backported.
-- **LTS runtimes (Java 17/21):** follow the upstream LTS schedule strictly.
+- **LTS runtimes (Java 17/21/25):** follow the upstream LTS schedule strictly.
 - **LTS OS (Ubuntu, RHEL, Debian):** 3-year extension applies to standard EOL, not
   extended security maintenance dates.
 
