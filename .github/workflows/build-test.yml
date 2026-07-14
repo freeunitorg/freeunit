@@ -9,6 +9,7 @@ on:
       - 'src/**'
       - 'test/**'
       - 'pkg/contrib/**'
+      - 'pkg/eol.json'
       - '.github/workflows/build-test.yml'
   push:
     branches: master
@@ -19,6 +20,7 @@ on:
       - 'src/**'
       - 'test/**'
       - 'pkg/contrib/**'
+      - 'pkg/eol.json'
       - '.github/workflows/build-test.yml'
 
 env:
