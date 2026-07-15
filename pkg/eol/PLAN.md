@@ -103,6 +103,27 @@ Image tag: `freeunit-eol-check:latest` (run.sh caches by tag — rebuild: `docke
 
 - Runtime compile on every run: cargo registry cached via `~/.cargo/registry` volume (fast re-download skip), but no `target/` persistence → full recompile each invocation (~5s). Prebuild binary in image layer eliminates this — see Future Extensions.
 
+## Expiry enforcement gate — DONE (2026-07)
+
+Implemented in `src/main.rs` as `check_expired()` + `push_if_expired()`, wired into
+the default and `--ci` runs. For every runtime **and** OS entry with a non-null
+`version`, it emits `Severity::Error` (→ `--ci` exit 1) when `supported_until <
+today` — i.e. the variant has outlived EOL + grace and must be dropped from the
+matrix. `supported_until` already bakes in the grace period (`_grace_runtimes` =
+12mo, `_grace_os` = 36mo), so the check is an offline, category-agnostic date
+comparison. "Past upstream EOL but still within grace" remains a WARN. This is the
+standalone realisation of the `[DROP]`-on-`supported_until ≤ today` rule below,
+decoupled from Dockerfile-on-disk cross-referencing (the full `--docker` mode is
+still future work).
+
+## CI wiring — DONE (2026-07)
+
+`.github/workflows/eol-check.yml` runs `cargo run --release --manifest-path
+pkg/eol/Cargo.toml -- --ci` on `ubuntu-latest`. Weekly `schedule:` cron (report-only,
+opens/updates a tracking issue on error) **plus** `pull_request:` on the eol
+data/tooling paths (hard-fails on validator errors). Distinguished by
+`github.event_name`; exit 2 (all fetches failed) is treated as a neutral outcome.
+
 ## `--docker` mode: sync Docker builds with EOL policy
 
 ### Goal
@@ -214,7 +235,7 @@ and running `make dockerfiles`.
 ## Future Extensions
 
 - Prebuild binary to `packages.freeunit.org` (like fake_upstream) — eliminates runtime compile
-- CI step in `.github/workflows/build-test.yml` (scheduled weekly, non-blocking warning)
+- ~~CI step (scheduled weekly, non-blocking warning)~~ — DONE, see `.github/workflows/eol-check.yml`
 - `--days N`: configurable warning threshold (default: 365 days = 12 months)
 - `--fix --os`: correct OS EOL dates too (currently runtime-only)
 - JSON output format for `--new` mode
