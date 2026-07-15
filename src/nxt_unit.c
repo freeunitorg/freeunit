@@ -189,7 +189,17 @@ static int nxt_unit_port_queue_recv(nxt_unit_port_t *port,
     nxt_unit_read_buf_t *rbuf);
 static int nxt_unit_app_queue_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     nxt_unit_read_buf_t *rbuf);
-nxt_inline int nxt_unit_close(int fd);
+/* Non-static so src/test/nxt_unit_close_test.c can drive it directly. */
+int nxt_unit_close_impl(int fd, const char *from, int line);
+
+/*
+ * A failed close() is almost always a double-close, but the bare
+ * "close(N) failed: EBADF" alert names neither which of the many
+ * nxt_unit_close() sites issued it nor who closed N first.  Capture the
+ * caller so the alert is self-locating, and consult a small ring of recent
+ * successful closes (see nxt_unit_close_impl) to name the prior closer.
+ */
+#define nxt_unit_close(fd)  nxt_unit_close_impl((fd), __func__, __LINE__)
 static int nxt_unit_fd_blocking(int fd);
 
 static int nxt_unit_port_hash_add(nxt_lvlhsh_t *port_hash,
@@ -6596,19 +6606,242 @@ retry:
 }
 
 
-nxt_inline int
-nxt_unit_close(int fd)
+/*
+ * Diagnostic table of recent close() sites.  A close is stamped with a
+ * monotonic ticket and stored at "ticket % size"; the failure path finds
+ * the prior closer of an fd by scanning the whole table for the
+ * highest-ticket record that matches.
+ *
+ * Records are two-phase.  A record is published as in-flight BEFORE
+ * calling close(): in a concurrent double close the loser can hit EBADF
+ * and scan the table before the winner has returned from the kernel, so a
+ * post-close stamp would leave exactly the racing case unattributed.  A
+ * close that succeeds then commits its record; one that fails with EBADF
+ * retracts it before scanning, while other errors (EINTR, EIO) commit it,
+ * since Linux releases the descriptor on those too (slot locks are only
+ * ever held for a few instructions, so all sites spin).  The scan trusts only committed records to name the
+ * "prior closer": an in-flight record may belong to a concurrent close
+ * that is itself about to fail, and competing on ticket would let one
+ * loser name another loser instead of the real earlier close.  In-flight
+ * records are instead reported as a concurrent close attempt, which also
+ * covers the not-yet-committed winner.  The scan skips the caller's own
+ * ticket as a second line of defense behind the retraction.
+ *
+ * Readers deliberately do NOT trust the shared ticket as a "published head":
+ * the writer advances the ticket to choose its slot before it has populated
+ * that slot, so a slot can momentarily still hold its previous occupant's
+ * (valid-looking) record.  Selecting by max ticket sidesteps that window --
+ * a not-yet-repopulated slot carries an old ticket and loses to the real
+ * prior close.  Each slot's lock (nxt_atomic_try_lock = acquire barrier,
+ * nxt_atomic_release = release barrier) then guarantees a reader samples a
+ * whole record rather than a torn one.  A slot found locked is spun on,
+ * not skipped: the holder may be the actual closer of the fd committing
+ * its record, and no thread ever holds a slot lock for more than a few
+ * instructions or takes another lock while holding one, so the spin is
+ * short and cannot deadlock.
+ */
+#define NXT_UNIT_CLOSE_LOG_SIZE  256
+
+typedef struct {
+    nxt_atomic_t  lock;
+    uintptr_t     ticket;
+    int           fd;
+    int           line;
+    int           committed;
+    const char    *from;
+} nxt_unit_close_rec_t;
+
+static nxt_unit_close_rec_t  nxt_unit_close_log[NXT_UNIT_CLOSE_LOG_SIZE];
+static nxt_atomic_t          nxt_unit_close_ticket;
+
+
+int
+nxt_unit_close_impl(int fd, const char *from, int line)
 {
-    int  res;
+    int                   res, err, published;
+    int                   prior_found, prior_line, infl_found, infl_line;
+    long                  i;
+    uintptr_t             pos, prior_best, infl_best;
+    const char            *prior_from, *infl_from;
+    nxt_unit_close_rec_t  *own, *rec;
+
+    /*
+     * The macro always passes __func__, but a NULL here would both hit
+     * "%s" in the alert and collide with from == NULL marking an empty
+     * ring slot, silently publishing an invisible record.
+     */
+    if (nxt_slow_path(from == NULL)) {
+        from = "unknown";
+    }
+
+    pos = nxt_atomic_fetch_add(&nxt_unit_close_ticket, 1);
+    own = &nxt_unit_close_log[pos & (NXT_UNIT_CLOSE_LOG_SIZE - 1)];
+
+    /*
+     * Spin rather than try once: a slot briefly held by a scanner must
+     * not cause a successful close to go unrecorded.
+     */
+    while (!nxt_atomic_try_lock(&own->lock)) {
+        nxt_cpu_pause();
+    }
+
+    /*
+     * A thread preempted between taking its ticket and locking the
+     * slot can find the slot already recycled by newer closes; do
+     * not overwrite a newer record with a stale one (serial-number
+     * ticket comparison, see the scan below).
+     */
+    if (nxt_fast_path(own->from == NULL
+                      || (intptr_t) (pos - own->ticket) > 0))
+    {
+        own->ticket = pos;
+        own->fd = fd;
+        own->line = line;
+        own->committed = 0;
+        own->from = from;
+
+        published = 1;
+
+    } else {
+        published = 0;
+    }
+
+    nxt_atomic_release(&own->lock);
 
     res = close(fd);
 
     if (nxt_slow_path(res == -1)) {
-        nxt_unit_alert(NULL, "close(%d) failed: %s (%d)",
-                       fd, strerror(errno), errno);
+        err = errno;
+
+        /*
+         * An EBADF close did not release any descriptor, so it is not a
+         * prior closer: retract the record, or a later failure on a
+         * reused fd number would misattribute it.  On any other error
+         * (EINTR, EIO) Linux has still released the descriptor (POSIX
+         * leaves it unspecified), so commit the record instead --
+         * retracting would erase the only trace of a close that did
+         * happen.  The slot may already have been recycled by a later
+         * close; the ticket says whether it is still ours.
+         */
+        if (published) {
+            while (!nxt_atomic_try_lock(&own->lock)) {
+                nxt_cpu_pause();
+            }
+
+            if (own->ticket == pos) {
+                if (err == EBADF) {
+                    own->from = NULL;
+
+                } else {
+                    own->committed = 1;
+                }
+            }
+
+            nxt_atomic_release(&own->lock);
+        }
+
+        /*
+         * Name the most recent committed prior closer of this fd, and any
+         * concurrent in-flight close attempt, if still on record.
+         */
+        prior_found = 0;
+        prior_best = 0;
+        prior_from = NULL;
+        prior_line = 0;
+
+        infl_found = 0;
+        infl_best = 0;
+        infl_from = NULL;
+        infl_line = 0;
+
+        for (i = 0; i < NXT_UNIT_CLOSE_LOG_SIZE; i++) {
+            rec = &nxt_unit_close_log[i];
+
+            /*
+             * Spin rather than skip: a locked slot may be the actual
+             * closer of this fd committing its record.
+             */
+            while (!nxt_atomic_try_lock(&rec->lock)) {
+                nxt_cpu_pause();
+            }
+
+            /*
+             * Serial-number comparisons: tickets wrap on 32-bit platforms,
+             * and slots recycle every NXT_UNIT_CLOSE_LOG_SIZE closes, so
+             * live tickets are always far closer than the wrap distance.
+             */
+            if (rec->from != NULL && rec->fd == fd && rec->ticket != pos) {
+
+                if (rec->committed) {
+                    if (!prior_found
+                        || (intptr_t) (rec->ticket - prior_best) > 0)
+                    {
+                        prior_found = 1;
+                        prior_best = rec->ticket;
+                        prior_from = rec->from;
+                        prior_line = rec->line;
+                    }
+
+                } else if (!infl_found
+                           || (intptr_t) (rec->ticket - infl_best) > 0)
+                {
+                    infl_found = 1;
+                    infl_best = rec->ticket;
+                    infl_from = rec->from;
+                    infl_line = rec->line;
+                }
+            }
+
+            nxt_atomic_release(&rec->lock);
+        }
+
+        if (prior_found && infl_found) {
+            nxt_unit_alert(NULL, "close(%d) failed at %s:%d: %s (%d); "
+                           "fd previously closed at %s:%d; "
+                           "concurrent close attempt at %s:%d",
+                           fd, from, line, strerror(err), err,
+                           prior_from, prior_line, infl_from, infl_line);
+
+        } else if (prior_found) {
+            nxt_unit_alert(NULL, "close(%d) failed at %s:%d: %s (%d); "
+                           "fd previously closed at %s:%d",
+                           fd, from, line, strerror(err), err,
+                           prior_from, prior_line);
+
+        } else if (infl_found) {
+            nxt_unit_alert(NULL, "close(%d) failed at %s:%d: %s (%d); "
+                           "concurrent close attempt at %s:%d",
+                           fd, from, line, strerror(err), err,
+                           infl_from, infl_line);
+
+        } else {
+            nxt_unit_alert(NULL, "close(%d) failed at %s:%d: %s (%d); "
+                           "no recent close of this fd on record",
+                           fd, from, line, strerror(err), err);
+        }
+
+        errno = err;
 
     } else {
-        nxt_unit_debug(NULL, "close(%d): %d", fd, res);
+        /*
+         * Commit own record: only a completed successful close may be
+         * named as a "prior closer" by the failure path.  The slot may
+         * already have been recycled by a later close; the ticket says
+         * whether it is still ours.
+         */
+        if (nxt_fast_path(published)) {
+            while (!nxt_atomic_try_lock(&own->lock)) {
+                nxt_cpu_pause();
+            }
+
+            if (own->ticket == pos) {
+                own->committed = 1;
+            }
+
+            nxt_atomic_release(&own->lock);
+        }
+
+        nxt_unit_debug(NULL, "close(%d) at %s:%d: %d", fd, from, line, res);
     }
 
     return res;

@@ -512,3 +512,6 @@ jobs:
 
       - name: Run C tests
         run: sudo ./build/tests
+
+      - name: Run libunit close-provenance test
+        run: ./build/unit_close_test
