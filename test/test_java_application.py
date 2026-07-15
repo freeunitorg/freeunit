@@ -1055,3 +1055,29 @@ def test_java_input_readline_bounds():
         )['status']
         == 200
     ), 'worker survived'
+
+
+def test_java_cstring_nul():
+    # "webapp" (required) and "unit_jars" are consumed as NUL-terminated C
+    # strings; an embedded NUL (survives JSON parsing) or an empty value must
+    # be rejected at validation.  "spare": 0 exercises validation without
+    # spawning (so a non-existent webapp path is not realpath-checked here).
+    def conf_app(extra):
+        base = {
+            "type": client.get_application_type(),
+            "processes": {"spare": 0},
+            "webapp": f'{option.temp_dir}/java',
+        }
+        return client.conf({"app": {**base, **extra}}, 'applications')
+
+    resp = conf_app({"webapp": "/x\0y"})
+    assert 'null character' in resp.get('detail', ''), 'webapp nul'
+
+    resp = conf_app({"webapp": ""})
+    assert 'must not be empty' in resp.get('detail', ''), 'webapp empty'
+
+    resp = conf_app({"unit_jars": "/x\0y"})
+    assert 'null character' in resp.get('detail', ''), 'unit_jars nul'
+
+    resp = conf_app({"unit_jars": ""})
+    assert 'must not be empty' in resp.get('detail', ''), 'unit_jars empty'
