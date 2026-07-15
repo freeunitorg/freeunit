@@ -293,8 +293,63 @@ nxt_http_static_iterate(nxt_task_t *task, nxt_http_request_t *r,
             if (nxt_slow_path(ret != NXT_OK)) {
                 goto fail;
             }
+
+            /*
+             * "chroot" is resolved once (share_idx == 0) and reused for every
+             * share candidate.  This must run before the "share" NUL check
+             * below so ctx->chroot stays populated for the whole share chain
+             * even when a templated share is rejected and we advance to the
+             * next candidate; otherwise the fallback share would be opened
+             * without the configured chroot confinement.  An embedded NUL
+             * would truncate the root at openat2(), and since the same chroot
+             * applies to every share, a bad "chroot" dooms the whole action --
+             * fail the request rather than advancing to the next share (which
+             * would reuse the unchecked value).  Skip straight to the last
+             * share so nxt_http_static_next() bypasses the remaining shares
+             * (never re-resolving the bad chroot) yet still dispatches the
+             * action "fallback" when one is configured, matching how the share
+             * NUL rejection below behaves.
+             */
+            if (ctx->chroot.length > 0
+                && nxt_slow_path(memchr(ctx->chroot.start, '\0',
+                                        ctx->chroot.length) != NULL))
+            {
+                nxt_log(task, NXT_LOG_ERR, "rejected \"chroot\" path with an "
+                        "embedded zero byte");
+                ctx->share_idx = conf->nshares - 1;
+                nxt_http_static_next(task, r, ctx, NXT_HTTP_NOT_FOUND);
+                return;
+            }
         }
 #endif
+
+        /*
+         * A templated "share" may resolve to an empty string (e.g. "$arg_name"
+         * with the argument absent).  An empty path can never name a file, and
+         * nxt_http_static_send() reads shr->start[shr->length - 1] unguarded --
+         * a zero length would underflow that to shr->start[-1].  Reject the
+         * empty candidate and try the next share.
+         */
+        if (nxt_slow_path(ctx->share.length == 0)) {
+            nxt_log(task, NXT_LOG_ERR, "rejected empty \"share\" path");
+            nxt_http_static_next(task, r, ctx, NXT_HTTP_NOT_FOUND);
+            return;
+        }
+
+        /*
+         * A templated "share" is resolved from request-controlled variables
+         * (e.g. "$uri", "$arg_name") and later handed to open()/openat2() as a
+         * NUL-terminated C string.  An embedded NUL would silently truncate the
+         * path at the sink, so reject this candidate and try the next share.
+         */
+        if (nxt_slow_path(memchr(ctx->share.start, '\0', ctx->share.length)
+                          != NULL))
+        {
+            nxt_log(task, NXT_LOG_ERR, "rejected \"share\" path with an "
+                    "embedded zero byte");
+            nxt_http_static_next(task, r, ctx, NXT_HTTP_NOT_FOUND);
+            return;
+        }
     }
 
     nxt_http_static_send(task, r, ctx);

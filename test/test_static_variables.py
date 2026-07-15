@@ -78,6 +78,29 @@ def test_static_variables_buildin_end():
     assert client.get(url='/index.html')['status'] == 200
 
 
+def test_static_variables_embedded_zero(temp_dir):
+    # A templated "share" is resolved from request-controlled variables and
+    # then handed to open() as a NUL-terminated C string.  A percent-encoded
+    # NUL in a query argument ("%00") decodes to an embedded zero byte that
+    # would otherwise truncate the path at the sink, serving a different file
+    # than requested.  The server must reject such a path instead.
+    assert 'success' in update_share(f'{temp_dir}/assets/$arg_x')
+
+    # Sanity: without a NUL the resolved path serves the file.
+    assert client.get(url='/?x=index.html')['status'] == 200, 'no zero byte'
+
+    # With an embedded NUL the path must not be truncated to "index.html".
+    assert (
+        client.get(url='/?x=index.html%00.txt')['status'] == 404
+    ), 'embedded zero byte'
+
+    # A "share" that is entirely a request variable resolves to an empty path
+    # when the argument is absent.  An empty path can never name a file and must
+    # be rejected safely (not underflow shr->start[-1]).
+    assert 'success' in update_share('$arg_x')
+    assert client.get(url='/')['status'] == 404, 'empty share path'
+
+
 def test_static_variables_invalid(temp_dir):
     assert 'error' in update_share(f'{temp_dir}/assets/d$r$uri')
     assert 'error' in update_share(f'{temp_dir}/assets/$$uri')
