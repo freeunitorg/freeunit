@@ -896,3 +896,29 @@ def test_php_application_opcache_preload_ffr():
 
     assert client.get()['headers']['X-Cached'] == '0', 'not cached'
     assert client.get()['headers']['X-Cached'] == '1', 'cached'
+
+
+def test_php_options_file_cstring_nul():
+    # php "options.file" (the php.ini path) is later opened as a
+    # NUL-terminated C string; an embedded NUL (survives JSON parsing) or an
+    # empty value must be rejected at validation.  "spare": 0 exercises
+    # validation without spawning a process.
+    def conf_file(value):
+        return client.conf(
+            {
+                "app": {
+                    "type": client.get_application_type(),
+                    "processes": {"spare": 0},
+                    "root": "/app",
+                    "options": {"file": value},
+                }
+            },
+            'applications',
+        )
+
+    resp = conf_file("/x\0y")
+    assert 'null character' in resp.get('detail', ''), 'file nul'
+
+    resp = conf_file("")
+    assert 'must not be empty' in resp.get('detail', ''), 'file empty'
+    assert 'success' in conf_file("/tmp/php.ini"), 'file valid'

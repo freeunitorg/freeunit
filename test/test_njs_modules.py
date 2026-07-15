@@ -102,3 +102,26 @@ def test_njs_modules_invalid(skip_alert):
     skip_alert(r'.*JS compile module.*failed.*')
 
     njs_script_load('invalid', expect='error')
+
+
+def test_njs_settings_js_module_nul():
+    # A "settings.js_module" reference is used as a NUL-terminated C-string
+    # store name; an embedded NUL (which survives JSON parsing in a
+    # length-tracked nxt_str_t) or an empty value must be rejected by the
+    # c-string validator, before the module-store lookup.
+    #
+    # The module-store lookup is length-aware and would also reject these
+    # values (as "not found"), so assert the validator's own diagnostic to
+    # prove the c-string guard ran rather than the lookup merely failing.
+    njs_script_load('next')
+
+    assert 'success' in client.conf({"js_module": "next"}, 'settings'), 'valid'
+
+    resp = client.conf({"js_module": "next\0x"}, 'settings')
+    assert 'null character' in resp.get('detail', ''), 'nul'
+
+    resp = client.conf({"js_module": ""}, 'settings')
+    assert 'must not be empty' in resp.get('detail', ''), 'empty'
+
+    resp = client.conf({"js_module": ["next\0x"]}, 'settings')
+    assert 'null character' in resp.get('detail', ''), 'array nul'
