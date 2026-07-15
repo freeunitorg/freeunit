@@ -26,6 +26,12 @@ Changes with FreeUnit 1.35.6                                     07 Jul 2026
        forms), the TLS "certificate" and njs "js_module" store names, and
        the PHP "options.file" php.ini path.
 
+    *) Bugfix: reject an embedded NUL byte in a templated static-serving
+       path ("share" and "chroot") after it is resolved from
+       request-controlled variables and before it reaches open()/openat2(),
+       preventing a silent truncation that could serve a different file
+       than the resolved path.
+
     *) Bugfix: mount rootfs automount destinations onto the openat2
        validated descriptor via "/proc/self/fd" instead of re-resolving the
        path, closing a check-to-use window in which a destination component

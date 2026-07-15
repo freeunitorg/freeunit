@@ -70,6 +70,53 @@ def test_share_chroot_array(temp_dir):
     assert client.get()['status'] != 200, 'share array bad'
 
 
+def test_share_chroot_array_embedded_zero(temp_dir):
+    # Regression: a NUL byte in the first (templated) share must skip that
+    # candidate WITHOUT dropping chroot confinement for the fallback share.
+    # "chroot" is resolved once (share_idx == 0); rejecting the first share
+    # before it is resolved would leave the fallback unconfined.
+    assert 'success' in update_action(
+        f'{temp_dir}/assets/dir',
+        [f'{temp_dir}/assets/$arg_x', f'{temp_dir}/assets$uri'],
+    )
+
+    # First share resolves to a NUL-truncated path and is skipped; the fallback
+    # share must stay confined to the chroot, so a file outside it is denied.
+    assert (
+        client.get(url='/index.html?x=%00')['status'] == 403
+    ), 'chroot kept on fallback'
+
+    # A file inside the chroot is still served through the fallback share.
+    assert (
+        client.get(url='/dir/file?x=%00')['status'] == 200
+    ), 'chroot allows in-root file'
+
+
+def test_static_chroot_embedded_zero(temp_dir):
+    # A templated "chroot" with an embedded NUL would truncate the root at
+    # openat2(); since one chroot applies to every share, the request fails.
+    assert 'success' in update_action(
+        f'{temp_dir}/assets/$arg_c', f'{temp_dir}/assets$uri'
+    )
+    assert (
+        client.get(url='/dir/file?c=%00')['status'] == 404
+    ), 'chroot embedded zero byte'
+
+    # With an action "fallback" configured, a rejected chroot must still
+    # dispatch the fallback (like the share NUL rejection) rather than 404.
+    assert 'success' in client.conf(
+        {
+            'share': f'{temp_dir}/assets$uri',
+            'chroot': f'{temp_dir}/assets/$arg_c',
+            'fallback': {"return": 204},
+        },
+        'routes/0/action',
+    )
+    assert (
+        client.get(url='/dir/file?c=%00')['status'] == 204
+    ), 'chroot rejection falls through to fallback'
+
+
 def test_static_chroot_permission(require, temp_dir):
     require({'privileged_user': False})
 
