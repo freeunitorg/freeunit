@@ -49,9 +49,8 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Ubuntu (LTS) | 22.04 | 2027-04 | 2030-04 | 3.10 |
 | Ubuntu (LTS) | 24.04 | 2029-05 | 2032-05 | 3.12 |
 | Ubuntu (LTS) | 26.04 | 2031-04 | 2034-04 | 3.13 |
-| Debian | 10 (buster) (EOL) † | 2022-09 | 2025-09 | 3.7 ‡ |
 | Debian | 11 (bullseye) (EOL) † | 2024-08 | 2027-08 | 3.9 |
-| Debian | 12 (bookworm) | 2026-06 | 2029-06 | 3.11 |
+| Debian | 12 (bookworm) | 2026-07 | 2029-07 | 3.11 |
 | Debian | 13 (trixie) | 2028-08 | 2031-08 | 3.13 |
 | RHEL | 8 | 2029-05 | 2032-05 | 3.8 ‡ |
 | RHEL | 9 | 2032-05 | 2035-05 | 3.11 |
@@ -60,6 +59,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Alpine | 3.21 | 2026-11 | 2029-11 | 3.13 |
 | Alpine | 3.22 | 2027-05 | 2030-05 | 3.13 |
 | Alpine | 3.23 | 2027-11 | 2030-11 | 3.14 |
+| Alpine | 3.24 | 2028-06 | 2031-06 | 3.14 |
 
 † Past upstream EOL; in FreeUnit grace period.
 ‡ Default Python shipped by this OS is itself past upstream EOL. FreeUnit does not backport fixes to that Python version.

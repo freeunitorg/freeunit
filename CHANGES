@@ -176,6 +176,12 @@ Changes with FreeUnit 1.35.6                                     07 Jul 2026
        nxt_is_complex_uri_encoded() off-by-one, and reject over-long lengths
        in nxt_rmemstrn().
 
+    *) Feature: enforce the runtime/OS end-of-life policy automatically — the
+       unit-eol-check tool now fails when a shipped variant has outlived its
+       support window (supported_until past EOL + grace), and a new
+       eol-check GitHub workflow validates pkg/eol.json against endoflife.date
+       on every relevant pull request and weekly on a schedule.
+
 
 Changes with FreeUnit 1.35.5                                     29 May 2026
 
