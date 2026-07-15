@@ -150,6 +150,64 @@ def test_go_application_command_line_arguments():
     assert client.get()['body'] == f'{arg1},{arg2},{arg3}', 'arguments'
 
 
+def test_go_application_port_fd_churn():
+    # Regression for the libunit port-fd double-close race in the Go module.
+    #
+    # getUnixConn() used to os.NewFile(fd)+FileConn(fd) and then Close() the
+    # ORIGINAL descriptor while nxt_go_add_port() left libunit's copy of that
+    # fd number live in the port struct until just after add_port() returned.
+    # A concurrent port destruction then called nxt_unit_close() on a number Go
+    # had already closed, emitting "close(N) failed: Bad file descriptor" (or,
+    # worse, closing a reused live fd).  Now Go dups the fd for its own use and
+    # libunit stays the sole owner/closer of port->in_fd/out_fd.
+    #
+    # Churn port creation (add_port callback) and destruction by scaling the
+    # app process count up and down under load.  The teardown check_alerts()
+    # fails on any "close(...) failed" alert, and _check_fds() (run with
+    # --fds-threshold=0 in CI) guards against descriptor leaks.
+    client.load('empty')
+
+    processes = 'applications/empty/processes'
+
+    for _ in range(20):
+        assert 'success' in client.conf('4', processes), 'scale up'
+        assert client.get()['status'] == 200, 'get after scale up'
+
+        assert 'success' in client.conf('1', processes), 'scale down'
+        assert client.get()['status'] == 200, 'get after scale down'
+
+
+def test_go_application_add_port_callback_churn():
+    # Stress the libunit add_port callback window (paired with the C-side fix
+    # that holds an extra port reference across lib->callbacks.add_port so a
+    # concurrent nxt_unit_port_release()->destroy cannot close the port fds
+    # while the callback is inspecting them).
+    #
+    # Churn port creation (add_port callback) and destruction by scaling the
+    # process count while POSTing bodies -- request bodies carry spool-file
+    # descriptors on the shared port, maximizing fd-carrying traffic that
+    # overlaps the callback window.  Teardown check_alerts() fails on a
+    # double-close alert and _check_fds() (--fds-threshold=0) guards leaks.
+    #
+    # Note: nxt_unit_add_port() and its refcount helpers are static to
+    # libunit, so the C unit-test harness (src/test/nxt_tests.c) cannot call
+    # them directly; this integration test exercises the callback path via the
+    # Go module (the only add_port-registering module buildable in this env).
+    client.load('mirror')
+
+    body = '0123456789' * 500
+    processes = 'applications/mirror/processes'
+
+    for _ in range(20):
+        assert 'success' in client.conf('4', processes), 'scale up'
+        assert client.post(body=body)['body'] == body, 'mirror after scale up'
+
+        assert 'success' in client.conf('1', processes), 'scale down'
+        assert (
+            client.post(body=body)['body'] == body
+        ), 'mirror after scale down'
+
+
 def test_go_application_command_line_arguments_change():
     client.load('command_line_arguments')
 
