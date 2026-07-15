@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"syscall"
 	"unsafe"
 )
 
@@ -44,7 +45,10 @@ func find_port(key port_key) *port {
 	return res
 }
 
-func add_port(p *port) {
+// add_port registers p and reports whether it was inserted.  A duplicate key
+// (libunit re-announced an existing port) leaves p unregistered, so the caller
+// must close p to release its dup'd descriptors.
+func add_port(p *port) bool {
 
 	port_registry_.Lock()
 	if port_registry_.m == nil {
@@ -53,11 +57,15 @@ func add_port(p *port) {
 
 	old := port_registry_.m[p.key]
 
-	if old == nil {
+	inserted := old == nil
+
+	if inserted {
 		port_registry_.m[p.key] = p
 	}
 
 	port_registry_.Unlock()
+
+	return inserted
 }
 
 func (p *port) Close() {
@@ -75,7 +83,30 @@ func getUnixConn(fd int) *net.UnixConn {
 		return nil
 	}
 
-	f := os.NewFile(uintptr(fd), "sock")
+	// Duplicate the descriptor so that libunit stays the sole owner of the
+	// original fd number stored in the port struct.  net.FileConn() below
+	// dups again (close-on-exec) for its own use, and the "defer f.Close()"
+	// then closes only this dup, never the caller's fd.  Closing the original
+	// here (the old behaviour) raced with libunit's own close on port
+	// destruction, causing "close(N) failed: Bad file descriptor" alerts or,
+	// worse, closing an already reused live descriptor.
+	//
+	// The dup must be close-on-exec: plain dup(2) clears FD_CLOEXEC, so a Go
+	// app that fork/exec's while this runs could leak the Unit port socket
+	// into a child and keep the port alive.  Hold ForkLock across dup +
+	// CloseOnExec (the Go stdlib idiom for non-atomic O_CLOEXEC dups) so no
+	// concurrent forkExec observes the fd before its flag is set.
+	syscall.ForkLock.RLock()
+	newfd, err := syscall.Dup(fd)
+	if err != nil {
+		syscall.ForkLock.RUnlock()
+		nxt_go_alert("dup(%d) failed: %s", fd, err)
+		return nil
+	}
+	syscall.CloseOnExec(newfd)
+	syscall.ForkLock.RUnlock()
+
+	f := os.NewFile(uintptr(newfd), "sock")
 	defer f.Close()
 
 	c, err := net.FileConn(f)
@@ -105,10 +136,27 @@ func nxt_go_add_port(ctx *C.nxt_unit_ctx_t, p *C.nxt_unit_port_t) C.int {
 		snd: getUnixConn(int(p.out_fd)),
 	}
 
-	add_port(new_port)
+	// A present fd that failed to wrap (dup/FileConn error) would register a
+	// port with a nil rcv/snd and panic later in nxt_go_port_send/recv.  Close
+	// any partial dups and fail the callback instead; libunit still owns and
+	// closes the original descriptors.
+	if (p.in_fd >= 0 && new_port.rcv == nil) ||
+		(p.out_fd >= 0 && new_port.snd == nil) {
+		new_port.Close()
+		return C.NXT_UNIT_ERROR
+	}
 
-	p.in_fd = -1
-	p.out_fd = -1
+	if !add_port(new_port) {
+		// Duplicate key: libunit re-announced an existing port, so new_port
+		// was not registered.  Close its dups instead of leaking them to GC;
+		// libunit still owns and closes the original descriptors.
+		new_port.Close()
+	}
+
+	// Do NOT clear p.in_fd/p.out_fd here.  getUnixConn() now works on private
+	// dups, so the original descriptors remain owned by libunit, which closes
+	// them exactly once when the port is destroyed.  Go holds independent dups
+	// for its own socket I/O.
 
 	return C.NXT_UNIT_OK
 }

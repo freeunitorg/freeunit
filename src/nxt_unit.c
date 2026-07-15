@@ -5731,6 +5731,14 @@ nxt_unit_add_port(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port, void *queue)
         pthread_mutex_unlock(&lib->mutex);
 
         if (lib->callbacks.add_port != NULL && ready) {
+            /*
+             * Hold an extra reference across the callback so a concurrent
+             * nxt_unit_port_release() cannot destroy the port and close its
+             * fds while the callback inspects port->in_fd/out_fd.  Balanced
+             * by the release below (net use_count change is zero).
+             */
+            nxt_unit_port_use(old_port);
+
             lib->callbacks.add_port(ctx, old_port);
 
             pthread_mutex_lock(&lib->mutex);
@@ -5743,6 +5751,8 @@ nxt_unit_add_port(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port, void *queue)
             }
 
             pthread_mutex_unlock(&lib->mutex);
+
+            nxt_unit_port_release(old_port);
         }
 
         nxt_unit_process_awaiting_req(ctx, &awaiting_req);
@@ -5820,6 +5830,14 @@ unlock:
     }
 
     if (lib->callbacks.add_port != NULL && new_port != NULL && ready) {
+        /*
+         * Hold an extra reference across the callback so a concurrent
+         * nxt_unit_port_release() cannot destroy the port and close its fds
+         * while the callback inspects port->in_fd/out_fd.  Balanced by the
+         * release below (net use_count change is zero).
+         */
+        nxt_unit_port_use(&new_port->port);
+
         lib->callbacks.add_port(ctx, &new_port->port);
 
         nxt_queue_init(&awaiting_req);
@@ -5836,6 +5854,8 @@ unlock:
         pthread_mutex_unlock(&lib->mutex);
 
         nxt_unit_process_awaiting_req(ctx, &awaiting_req);
+
+        nxt_unit_port_release(&new_port->port);
     }
 
     return (new_port == NULL) ? NULL : &new_port->port;
