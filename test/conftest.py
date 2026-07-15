@@ -471,7 +471,6 @@ def _check_processes():
     router_pid = _fds_info['router']['pid']
     controller_pid = _fds_info['controller']['pid']
     main_pid = unit_instance['pid']
-    main_pid_re = re.compile(r'\b' + re.escape(main_pid) + r'\b')
 
     for _ in range(600):
         out = (
@@ -481,7 +480,10 @@ def _check_processes():
             .decode()
             .splitlines()
         )
-        out = [l for l in out if main_pid_re.search(l)]
+        # match only the pid/ppid columns; a substring match against the
+        # whole line can catch unrelated processes whose arguments contain
+        # the same number (e.g. agetty's baud rates vs. pid 9600)
+        out = [l for l in out if main_pid in l.split()[:2]]
 
         if len(out) <= 3:
             break
