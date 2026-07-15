@@ -2949,19 +2949,27 @@ nxt_h1p_peer_body_process(nxt_task_t *task, nxt_http_peer_t *peer,
         if (nxt_slow_path((nxt_off_t) length < 0
                           || (nxt_off_t) length > h1p->remainder))
         {
-            nxt_buf_t  *b;
-            size_t     trimmed;
+            nxt_buf_t         *b, *tail, *next;
+            size_t            trimmed;
+            nxt_work_queue_t  *wq;
 
             /*
              * Upstream sent more body bytes than its Content-Length
              * declared.  Truncate the buf chain to remainder bytes so
              * we never forward the excess past the Content-Length we
              * already advertised downstream, then flag inconsistent
-             * and close.
+             * and close.  The tail detached by the truncation is not
+             * silently dropped: each detached buffer's completion
+             * handler is posted to the work queue below, so the
+             * request-pool retains those proxy read buffers hold are
+             * released promptly instead of lingering until request
+             * teardown.
              */
             nxt_log(task, NXT_LOG_WARN,
                     "upstream sent %uz body bytes past Content-Length "
                     "(remainder %O)", length, h1p->remainder);
+
+            tail = NULL;
 
             trimmed = 0;
             for (b = out; b != NULL; b = b->next) {
@@ -2975,11 +2983,27 @@ nxt_h1p_peer_body_process(nxt_task_t *task, nxt_http_peer_t *peer,
                     trimmed += bsz;
                     continue;
                 }
-                /* Trim this buf to fit, drop everything after it. */
+                /* Trim this buf to fit, detach the tail after it. */
                 b->mem.free = b->mem.pos
                               + (size_t) h1p->remainder - trimmed;
+                tail = b->next;
                 b->next = NULL;
                 break;
+            }
+
+            /* Complete the detached tail to release its retains now. */
+            wq = &task->thread->engine->fast_work_queue;
+
+            for (b = tail; b != NULL; b = next) {
+                next = b->next;
+                b->next = NULL;
+
+                if (nxt_buf_is_sync(b)) {
+                    continue;
+                }
+
+                nxt_work_queue_add(wq, b->completion_handler, task, b,
+                                   b->parent);
             }
 
             peer->request->inconsistent = 1;
