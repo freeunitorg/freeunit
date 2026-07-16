@@ -6,11 +6,13 @@ on:
       - 'pkg/docker/seccomp-no-af-alg.json'
       - 'pkg/docker/Dockerfile.*'
       - 'test/security/seccomp/**'
+      - '.github/workflows/security-seccomp.yml'
   pull_request:
     paths:
       - 'pkg/docker/seccomp-no-af-alg.json'
       - 'pkg/docker/Dockerfile.*'
       - 'test/security/seccomp/**'
+      - '.github/workflows/security-seccomp.yml'
   workflow_dispatch:
 
 permissions:
@@ -37,6 +39,26 @@ jobs:
       # published tag: this validates the Dockerfile under change (the very
       # trigger of this workflow) and avoids coupling to the release that
       # publishes the dash-style tags (latest-python-3.13-slim).
+      #
+      # The committed Dockerfile clones the pinned release tag, which does
+      # not exist yet while a release-prep PR is in flight (release-docker.yml
+      # rewrites the pin from the real tag at publish time).  Retarget the
+      # source checkout at the code under test instead: the PR head for pull
+      # requests, the pushed branch otherwise.
+      - name: Point the source checkout at the code under test
+        env:
+          HEAD_URL: ${{ github.event.pull_request.head.repo.clone_url || format('{0}/{1}', github.server_url, github.repository) }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          # Fetch the exact SHA this check reports against, not a moving
+          # branch tip (a later push to the branch must not change what an
+          # already-queued run builds).
+          sed -i \
+            -e "s|git clone --depth 1 -b [^ ]* [^ ]* unit|git init unit \&\& git -C unit fetch --depth 1 ${HEAD_URL} ${HEAD_SHA} \&\& git -C unit checkout --detach FETCH_HEAD|" \
+            pkg/docker/Dockerfile.python-3.13-slim
+          grep -F "git -C unit fetch --depth 1 ${HEAD_URL} ${HEAD_SHA}" \
+            pkg/docker/Dockerfile.python-3.13-slim
+
       - name: Build FreeUnit python-3.13-slim image
         run: docker build -t freeunit:seccomp-test -f pkg/docker/Dockerfile.python-3.13-slim pkg/docker
 
