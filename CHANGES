@@ -1,5 +1,5 @@
 
-Changes with FreeUnit 1.35.6                                     07 Jul 2026
+Changes with FreeUnit 1.36.0                                     16 Jul 2026
 
     *) Bugfix: the controller crashed in debug builds when a control-socket
        connection closed after the active-connection tracking change, and
@@ -54,6 +54,17 @@ Changes with FreeUnit 1.35.6                                     07 Jul 2026
        serialized pointer and the cached header-field indexes before use,
        and range-check off/len in the Java InputStream read() binding,
        preventing out-of-bounds access on a malformed request.
+
+    *) Bugfix: fix a libunit port-fd double-close race in the Go language
+       module: getUnixConn() wrapped the raw shared-port descriptor (which
+       net.FileConn dups) and a deferred Close() closed the original
+       descriptor number while libunit still owned it, an intermittent
+       double-close that raised an EBADF alert or, worse, closed an
+       unrelated reused live descriptor. Go now dup(2)s the descriptor and
+       wraps only the dup, so libunit remains the sole owner and closer;
+       libunit additionally holds a port reference across the out-of-mutex
+       add_port callback window so a concurrent destroy cannot free the
+       port mid-callback.
 
     *) Feature: SIGQUIT now performs a graceful stop — application workers
        drain in-flight requests before exiting; SIGTERM remains the fast
@@ -174,6 +185,13 @@ Changes with FreeUnit 1.35.6                                     07 Jul 2026
     *) Bugfix: reject embedded NUL bytes in the "rootfs" and cgroup "path"
        isolation options, and validate "rootfs" as an absolute path other
        than "/" at configuration time.
+
+    *) Bugfix: fix an ineffective truncation guard when building the
+       cgroup.procs pathname: snprintf()'s return value overwrote the
+       original directory length before the bounds comparison, so a long
+       cgroup directory path could overflow the check. The append now
+       preserves the original length and fails with ENAMETOOLONG when
+       "/cgroup.procs" plus the trailing NUL cannot fit.
 
     *) Bugfix: reject a "rootfs" that lexically resolves to "/" (such as
        "/.", "/..", or "/foo/.."); chroot("/") is a no-op and would silently
