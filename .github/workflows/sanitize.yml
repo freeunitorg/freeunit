@@ -1,0 +1,210 @@
+name: "Sanitize (ASan+UBSan)"
+
+# Sanitizer gate for the graceful-shutdown lifecycle paths (SIGQUIT teardown,
+# two-phase listener drain, static teardown) plus per-runtime request handling.
+# Builds unitd + one language module with AddressSanitizer +
+# UndefinedBehaviorSanitizer and runs that runtime's subset, so use-after-free
+# / null-deref / UB in the connection-close, listener-close, and module
+# request/teardown paths surface in CI. Closes the P4 acceptance criterion for
+# the graceful-shutdown roadmap and de-risks the P5 connection-drain work.
+#
+# One matrix leg per runtime.  Adding a runtime is a single `include` entry:
+# its extra apt packages (or a setup step, see PHP), the `configure`/`make`
+# module arguments, and the test files to run under the sanitizer.  The
+# runtime-agnostic teardown coverage (graceful/listener/static) rides the
+# python leg because its drivers need the python module.
+
+on:
+  pull_request:
+    paths:
+      - configure
+      - version
+      - 'auto/**'
+      - 'go/**'
+      - 'src/**'
+      - 'test/**'
+      - '.github/workflows/sanitize.yml'
+  push:
+    # master is the release/default branch; pre-* are the release-prep
+    # integration branches (e.g. pre-1.35.6) where the hardening actually
+    # lands.  PRs to either are already covered by the unfiltered
+    # pull_request trigger above.
+    branches:
+      - master
+      - 'pre-*'
+    paths:
+      - configure
+      - version
+      - 'auto/**'
+      - 'go/**'
+      - 'src/**'
+      - 'test/**'
+      - '.github/workflows/sanitize.yml'
+
+jobs:
+  sanitize:
+    name: "sanitize (${{ matrix.runtime }})"
+    runs-on: ubuntu-latest
+
+    # Blocking on purpose: this job exists to red-line lifecycle teardown
+    # regressions.  Its first run caught the controller's raw c->link unlinks
+    # desyncing c->idle from the tracking queues, crashing every --debug build
+    # on every control-socket close (fixed in "fix(controller): coherent conn
+    # tracking").  fail-fast is off so one runtime's failure does not cancel
+    # the others.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime: python
+            apt: python3-dev libpython3-dev
+            configure: python --config=python3-config
+            make: python3
+            # --restart is required here: test_graceful_reload.py signals the
+            # unitd master and self-skips without it.  It also makes conftest
+            # rmtree the temp dir on teardown, which is fine for these tests.
+            pytest_opts: "--restart"
+            # test_static is module-free; the graceful/listener drivers need
+            # the python module, so the shared teardown coverage lives here.
+            tests: >-
+              test/test_graceful_reload.py
+              test/test_listener_drain.py
+              test/test_static.py
+          - runtime: php
+            apt: ""
+            configure: php
+            make: php
+            # No --restart: test_php_application.py does not signal the master,
+            # and --restart's teardown rmtree trips on test_php_application_
+            # forbidden's restricted-permission fixture (rmtree PermissionError).
+            pytest_opts: ""
+            tests: test/test_php_application.py
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Base tools + pytest (needed to run any leg) plus this runtime's extra
+      # apt packages.  Runtimes whose toolchain is not in apt add a setup step
+      # instead (see PHP below) and leave `apt` empty.
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libpcre2-dev libssl-dev \
+                                  python3-pytest ${{ matrix.apt }}
+
+      # PHP's toolchain (php-config, embed SAPI) comes from setup-php rather
+      # than apt.  A future runtime that needs a dedicated setup action adds a
+      # similarly-gated step here; apt-based runtimes need nothing extra.
+      - name: Set up PHP
+        if: matrix.runtime == 'php'
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          # Base extension set mirrored from the skilldlabs/php:85 image
+          # (a production PHP 8.5), so the sanitized module test exercises a
+          # realistic extension surface.  Plus mysqli and pdo_pgsql (DB
+          # drivers used in production, not in the base image).  xdebug is
+          # intentionally omitted: it is disabled by default in that image and
+          # its execution hooks only add overhead and noise under the sanitizer.
+          extensions: >-
+            apcu, brotli, igbinary, uploadprogress,
+            bcmath, ctype, curl, dom, fileinfo, gd, gmp, iconv, mbstring,
+            mysqli, openssl, pcntl, pdo_mysql, pdo_pgsql, pdo_sqlite, phar,
+            session, simplexml, sqlite3, tokenizer, xml, xmlreader, xmlwriter,
+            zip
+        env:
+          update: true
+
+      # Sanitizer flags ride the tree's --cc-opt / --ld-opt (NXT_CC_OPT /
+      # NXT_LD_OPT).  --cc-opt lands after the built-in -O so -O1 wins;
+      # --debug keeps readable crash context.  auto/save records the flags
+      # into build/autoconf.data, so the module configured below inherits the
+      # same instrumentation -- no ASan interceptor/ODR mismatch.
+      #
+      # detect_leaks=0 for configure: auto/feature compiles AND RUNS its
+      # probes, and some intentionally leak (e.g. auto/malloc's Linux
+      # malloc_usable_size() probe mallocs without freeing).  With LeakSanitizer
+      # on, such a probe exits nonzero, auto/feature records it "found but is
+      # not working", and the feature is silently dropped -- so the sanitized
+      # build would configure different code paths than a normal build.  Turn
+      # LSan off for the probe run to keep the feature set faithful.
+      - name: Configure unit (ASan+UBSan)
+        env:
+          ASAN_OPTIONS: "detect_leaks=0"
+        run: |
+          ./configure \
+            --debug \
+            --openssl \
+            --cc-opt="-fsanitize=address,undefined -fno-omit-frame-pointer -O1" \
+            --ld-opt="-fsanitize=address,undefined"
+
+      - name: Make unit
+        run: make -j$(nproc) unitd
+
+      # Same probe-leak rationale as the core configure step above.
+      - name: Configure ${{ matrix.runtime }} module
+        env:
+          ASAN_OPTIONS: "detect_leaks=0"
+        run: ./configure ${{ matrix.configure }}
+
+      - name: Make ${{ matrix.runtime }} module
+        run: make -j$(nproc) ${{ matrix.make }}
+
+      - name: Create ASan log directory
+        run: mkdir -p "${GITHUB_WORKSPACE}/asan-logs"
+
+      # ASAN_OPTIONS / UBSAN_OPTIONS are step-level env so pytest and every
+      # forked unitd process inherit them.
+      #   log_path=<workspace>/asan-logs/{asan,ubsan}
+      #     ASan and UBSan reports from the forked daemons land in
+      #     asan-logs/<tool>.<pid> files rather than only the per-test unit.log
+      #     the harness rotates away, so the guard step below can fail the job
+      #     even when pytest itself is green.  UBSan needs its OWN log_path:
+      #     with only ASAN_OPTIONS set, a UBSan-only violation that does not
+      #     escalate to a fatal signal writes to neither the asan-logs dir nor
+      #     a place the harness scans (it greps unit.log for "Sanitizer", not
+      #     UBSan's "runtime error"), so half the gate could pass silently.
+      #   detect_leaks=0
+      #     the fork-heavy daemon makes LeakSanitizer extremely noisy; turning
+      #     leak detection on is tracked as a follow-up, once the teardown
+      #     paths are use-after-free / null-deref clean.
+      # pytest_opts is per-runtime (e.g. --restart for the graceful tests).
+      - name: Run ${{ matrix.runtime }} sanitizer subset
+        env:
+          ASAN_OPTIONS: "detect_leaks=0:log_path=${{ github.workspace }}/asan-logs/asan"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1:log_path=${{ github.workspace }}/asan-logs/ubsan"
+        run: |
+          python3 -m pytest -v ${{ matrix.pytest_opts }} ${{ matrix.tests }}
+
+      - name: Show ASan/UBSan reports
+        if: always()
+        run: |
+          if [ -n "$(ls -A asan-logs 2>/dev/null)" ]; then
+            for f in asan-logs/*; do
+              echo "===== ${f} ====="
+              cat "${f}"
+            done
+          else
+            echo "No ASan/UBSan report files were produced."
+          fi
+
+      - name: Upload ASan/UBSan reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: asan-ubsan-logs-${{ matrix.runtime }}
+          path: asan-logs/
+          if-no-files-found: ignore
+
+      # Sanitizer reports from forked children do not reliably fail pytest: the
+      # crash aborts a child while the session continues, and with log_path set
+      # the report never reaches the unit.log the harness scans.  Fail the job
+      # explicitly on any report file, even when pytest was green.
+      - name: Fail on sanitizer reports
+        if: always()
+        run: |
+          if [ -n "$(ls -A asan-logs 2>/dev/null)" ]; then
+            echo "::error::AddressSanitizer/UBSan produced report(s) in the ${{ matrix.runtime }} leg; see the asan-ubsan-logs-${{ matrix.runtime }} artifact and the 'Show ASan/UBSan reports' step."
+            exit 1
+          fi
+          echo "No sanitizer reports; ${{ matrix.runtime }} lifecycle paths are clean."
