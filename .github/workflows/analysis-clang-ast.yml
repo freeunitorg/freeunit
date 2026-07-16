@@ -34,7 +34,7 @@ jobs:
           apt-get -y install git wget curl llvm-dev libclang-dev clang make \
                              libssl-dev libpcre2-dev libperl-dev \
                              libphp-embed php-dev python3-dev libpython3-dev \
-                             ruby-dev openjdk-21-jdk npm dpkg-dev \
+                             ruby-dev default-jdk npm dpkg-dev \
                              cargo rustc cmake
           npm install -g node-gyp
           # Debian multiarch: RbConfig["libdir"] returns /usr/lib but the
