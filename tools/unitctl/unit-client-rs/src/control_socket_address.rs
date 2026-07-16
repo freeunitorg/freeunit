@@ -242,7 +242,9 @@ impl ControlSocket {
         let normalized_uri = Uri::builder()
             .scheme(parsed_uri.scheme_str().expect("Scheme should not be None"))
             .authority(normalized_authority)
-            .path_and_query(PathAndQuery::from_static(""))
+            // http 1.4.1+ rejects PathAndQuery::from_static("") ("static str is
+            // not valid path"); "/" yields the same normalized "host:port/" URI.
+            .path_and_query(PathAndQuery::from_static("/"))
             .build()
             .map_err(|error| UnitClientError::TcpSocketAddressParseError {
                 message: error.to_string(),
