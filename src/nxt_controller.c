@@ -793,13 +793,13 @@ nxt_controller_conn_init(nxt_task_t *task, void *obj, void *data)
     nxt_debug(task, "controller conn init fd:%d", c->socket.fd);
 
     if (nxt_slow_path(nxt_controller_check_peer_cred(task, c) != NXT_OK)) {
-        nxt_controller_conn_free(task, c, NULL);
+        nxt_controller_conn_close(task, c, NULL);
         return;
     }
 
     r = nxt_mp_zget(c->mem_pool, sizeof(nxt_controller_request_t));
     if (nxt_slow_path(r == NULL)) {
-        nxt_controller_conn_free(task, c, NULL);
+        nxt_controller_conn_close(task, c, NULL);
         return;
     }
 
@@ -808,7 +808,7 @@ nxt_controller_conn_init(nxt_task_t *task, void *obj, void *data)
     if (nxt_slow_path(nxt_http_parse_request_init(&r->parser, c->mem_pool)
                       != NXT_OK))
     {
-        nxt_controller_conn_free(task, c, NULL);
+        nxt_controller_conn_close(task, c, NULL);
         return;
     }
 
@@ -816,7 +816,7 @@ nxt_controller_conn_init(nxt_task_t *task, void *obj, void *data)
 
     b = nxt_buf_mem_alloc(c->mem_pool, 1024, 0);
     if (nxt_slow_path(b == NULL)) {
-        nxt_controller_conn_free(task, c, NULL);
+        nxt_controller_conn_close(task, c, NULL);
         return;
     }
 
@@ -860,8 +860,15 @@ nxt_controller_conn_read(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "controller conn read");
 
-    nxt_queue_remove(&c->link);
-    nxt_queue_self(&c->link);
+    /*
+     * This conn is engine-tracked: nxt_conn_accept() marked it idle, so all
+     * tracking-state transitions must go through the nxt_conn_* macros.  Raw
+     * queue surgery here would desync c->idle from the queue membership and
+     * make the close handler's nxt_conn_untrack() unlink an already-unlinked
+     * (NULLed under --debug) link.  Move idle->active via the macro instead;
+     * it is idempotent for pipelined reads (conn already TRACK_ACTIVE).
+     */
+    nxt_conn_active(task->thread->engine, c);
 
     b = c->read;
 
@@ -910,7 +917,7 @@ nxt_controller_conn_read(nxt_task_t *task, void *obj, void *data)
     if (r->length - preread > (size_t) nxt_buf_mem_free_size(&b->mem)) {
         b = nxt_buf_mem_alloc(c->mem_pool, r->length, 0);
         if (nxt_slow_path(b == NULL)) {
-            nxt_controller_conn_free(task, c, NULL);
+            nxt_controller_conn_close(task, c, r);
             return;
         }
 
@@ -1086,7 +1093,16 @@ nxt_controller_conn_close(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "controller conn close");
 
-    nxt_queue_remove(&c->link);
+    /*
+     * Untrack up front, before scheduling the async close: nxt_conn_close()
+     * defers the real close to a handler, and until it runs the conn would
+     * otherwise stay on the engine's idle/active queue.  An idle-reclaim pass
+     * under fd pressure walks idle_connections and could re-select the same
+     * conn, closing it twice.  Detaching here (idempotently; the async close
+     * handler's untrack then no-ops) closes that window -- mirrors
+     * nxt_runtime_close_idle_connections()'s untrack-before-close.
+     */
+    nxt_conn_untrack(task->thread->engine, c);
 
     c->write_state = &nxt_controller_conn_close_state;
 
@@ -1102,6 +1118,16 @@ nxt_controller_conn_free(nxt_task_t *task, void *obj, void *data)
     c = obj;
 
     nxt_debug(task, "controller conn free");
+
+    /*
+     * By the time this runs the conn has already been untracked: every path
+     * here arrives through nxt_controller_conn_close(), which untracks before
+     * scheduling the async close.  Keep an idempotent nxt_conn_untrack() as a
+     * defensive backstop so a stray future direct caller of this free handler
+     * can never leave a stale link into released pool memory -- TRACK_NONE
+     * makes the repeat a no-op.
+     */
+    nxt_conn_untrack(task->thread->engine, c);
 
     nxt_sockaddr_cache_free(task->thread->engine, c);
 
