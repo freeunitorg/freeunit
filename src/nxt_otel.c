@@ -316,8 +316,15 @@ nxt_otel_span_add_status(nxt_task_t *task, nxt_http_request_t *r)
         return;
     }
 
-    n = sprintf((char *) status_buf, "%d", (int) r->status);
-    if (n > 0) {
+    n = snprintf((char *) status_buf, sizeof(status_buf), "%d",
+                 (int) r->status);
+    /*
+     * snprintf() returns the length it *would* have written; on truncation
+     * that exceeds the buffer, so only record the attribute when the value
+     * fully fit -- a truncated status code is meaningless anyway, and using
+     * the would-have-been length as val.length would read past status_buf.
+     */
+    if (n > 0 && n < (int) sizeof(status_buf)) {
         val.start = status_buf;
         val.length = (size_t) n;
         nxt_otel_add_attr(r, NXT_OTEL_STATUS_CODE_TAG, &val);

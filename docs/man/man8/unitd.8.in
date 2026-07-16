@@ -69,6 +69,22 @@ Sets the permission of the UNIX-domain control socket.
 Sets the owner of the UNIX-domain control socket.
 .It Fl Fl control-group Ar group
 Sets the group of the UNIX-domain control socket.
+.Pp
+On a UNIX-domain control socket, and where the platform provides peer
+credentials (Linux and the BSDs), the control API additionally requires
+the connecting peer's effective user ID to be either 0 (root) or the
+user ID
+.Nm
+runs as; other local users are rejected before the request is read.
+On those builds the
+.Fl Fl control-user ,
+.Fl Fl control-group ,
+and
+.Fl Fl control-mode
+permissions act as defense-in-depth rather than the sole access control.
+Where peer credentials are unavailable, or for an IP-based control
+socket, those socket permissions (or network reachability) remain the
+boundary.
 .It Fl Fl group Ar name , Fl Fl user Ar name
 Override group name and user name used to run Unit's non-privileged processes.
 .It Fl Fl log Ar file
