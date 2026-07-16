@@ -107,12 +107,12 @@ release number:
 
     # Copyright (C) FreeUnit Community
 
-    NXT_VERSION=1.35.6
-    NXT_VERNUM=13506
+    NXT_VERSION=1.36.0
+    NXT_VERNUM=13600
 
 - **`NXT_VERSION`** — human-readable dotted string (`MAJOR.MINOR.PATCH`).
 - **`NXT_VERNUM`** — the same number for compile-time comparisons:
-  `MAJOR * 10000 + MINOR * 100 + PATCH` (e.g. `1.35.6` → `13506`). Keep both in
+  `MAJOR * 10000 + MINOR * 100 + PATCH` (e.g. `1.36.0` → `13600`). Keep both in
   lockstep; a mismatch is a silent bug.
 
 ## Consumers
