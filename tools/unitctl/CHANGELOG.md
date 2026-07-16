@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.35.6] - 2026-05-24
+## [1.36.0] - 2026-07-16
 
 ### Added
 - `KnownSize::into_full_body()` fallible API for materializing request bodies with proper error handling and actual Content-Length derivation.
@@ -55,6 +55,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Previous releases
 See earlier versions for additional change history.
 
-[Unreleased]: https://github.com/nginx/unit/compare/1.35.6...HEAD
-[1.35.6]: https://github.com/nginx/unit/releases/tag/1.35.6
-[1.35.5]: https://github.com/nginx/unit/releases/tag/1.35.5
+[Unreleased]: https://github.com/freeunitorg/freeunit/compare/unitctl/1.36.0...HEAD
+[1.36.0]: https://github.com/freeunitorg/freeunit/releases/tag/unitctl/1.36.0
+[1.35.5]: https://github.com/freeunitorg/freeunit/releases/tag/unitctl/1.35.5
