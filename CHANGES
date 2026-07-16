@@ -1,6 +1,13 @@
 
 Changes with FreeUnit 1.35.6                                     07 Jul 2026
 
+    *) Bugfix: the controller crashed in debug builds when a control-socket
+       connection closed after the active-connection tracking change, and
+       leaked the accepted file descriptor when a control connection failed
+       during initialization or body allocation; connection tracking and
+       teardown now route through the engine's tracking macros and the
+       close path.
+
     *) Bugfix: ignore a malformed incoming "traceparent" header and restart
        the trace per W3C Trace Context instead of rejecting the request
        with HTTP 500; the malformed header is dropped instead of being
