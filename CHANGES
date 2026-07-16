@@ -177,10 +177,12 @@ Changes with FreeUnit 1.36.0                                     16 Jul 2026
        checks; Perl ERRSV scrub; Java InputStream.readLine off/len; WASM
        guest offsets).
 
-    *) Bugfix: tighten isolation boundaries — require a matching peer UID on
-       the unix control socket, resolve mount destinations with
-       openat2(RESOLVE_BENEATH), and resolve relative cgroup paths against the
-       child's /proc/<pid>/cgroup.
+    *) Bugfix: tighten isolation boundaries — require a matching peer UID
+       (root or Unit's own effective UID) on the unix control socket, so the
+       "control-user", "control-group", and "control-mode" permissions are
+       defense-in-depth rather than a means to delegate control-API access;
+       resolve mount destinations with openat2(RESOLVE_BENEATH); and resolve
+       relative cgroup paths against the child's /proc/<pid>/cgroup.
 
     *) Bugfix: reject embedded NUL bytes in the "rootfs" and cgroup "path"
        isolation options, and validate "rootfs" as an absolute path other
