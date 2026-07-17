@@ -1,4 +1,25 @@
 
+Changes with Unit 1.34.3                                        (unreleased)
+
+    *) Security: tighten WebSocket frame-bound checks. Reject truncated
+       extended-length frames in libunit before reading the mask/length
+       fields, validate the 64-bit extended-length most-significant bit
+       (RFC 6455), and fix a no-op frame-size decrement that could copy
+       bytes beyond the declared payload from a following buffer, causing an
+       out-of-bounds read and cross-frame data disclosure. Also bound the
+       Java sendWsFrame JNI arguments and guard pending_payload_len overflow
+       in the Python ASGI WebSocket handler. (GHSA-g6v8-r577-76jm).
+
+    *) Security: tighten process-isolation boundaries. Require a matching
+       peer UID (SO_PEERCRED / getpeereid) before accepting a connection on
+       the unix control socket, resolve mount destinations with
+       openat2(RESOLVE_BENEATH) and mount onto the validated descriptor
+       rather than the re-resolved path, and resolve relative cgroup paths
+       against the child's /proc/<pid>/cgroup. Closes a control-socket
+       peer-authentication bypass and cgroup/mount time-of-check/
+       time-of-use races. (GHSA-768w-qrh2-jjvh).
+
+
 Changes with Unit 1.34.2                                         26 Feb 2025
 
     *) Security: fix missing websocket payload length validation in the Java
