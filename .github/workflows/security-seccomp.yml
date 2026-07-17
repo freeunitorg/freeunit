@@ -43,12 +43,18 @@ jobs:
       # The committed Dockerfile clones the pinned release tag, which does
       # not exist yet while a release-prep PR is in flight (release-docker.yml
       # rewrites the pin from the real tag at publish time).  Retarget the
-      # source checkout at the code under test instead: the PR head for pull
-      # requests, the pushed branch otherwise.
+      # source checkout at the code under test instead: the merge commit this
+      # check reports against (github.sha) -- the same tree actions/checkout
+      # built above -- rather than the unmerged PR-branch head.
       - name: Point the source checkout at the code under test
         env:
-          HEAD_URL: ${{ github.event.pull_request.head.repo.clone_url || format('{0}/{1}', github.server_url, github.repository) }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          # Always the base repo + github.sha: on pull_request this is the PR
+          # *merge* commit (reachable from refs/pull/<n>/merge, so an anonymous
+          # fetch-by-SHA resolves it), matching actions/checkout above; on push
+          # it is the pushed commit.  Both are pinned per run, so a later push
+          # cannot change what an already-queued run builds.
+          HEAD_URL: ${{ format('{0}/{1}', github.server_url, github.repository) }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
           # Fetch the exact SHA this check reports against, not a moving
           # branch tip (a later push to the branch must not change what an
