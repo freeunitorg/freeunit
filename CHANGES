@@ -49,6 +49,12 @@ Changes with FreeUnit 1.36.0                                     16 Jul 2026
        body is read to EOF instead of trusting either length, preventing a
        response-smuggling desynchronization.
 
+    *) Bugfix: keep downstream keepalive disabled after a duplicate or invalid
+       upstream "Content-Length"; a clean upstream close no longer re-enables
+       it, so an HTTP/1.1 client cannot reuse the connection past the re-framed
+       response. The complete body still ends with its terminal chunk — body
+       truncation is now tracked separately from the inconsistent flag.
+
     *) Bugfix: bound the request-header fields region against the shared
        memory message size in libunit, validate every field name/value
        serialized pointer and the cached header-field indexes before use,
@@ -194,6 +200,12 @@ Changes with FreeUnit 1.36.0                                     16 Jul 2026
        cgroup directory path could overflow the check. The append now
        preserves the original length and fails with ENAMETOOLONG when
        "/cgroup.procs" plus the trailing NUL cannot fit.
+
+    *) Bugfix: fail cgroup setup when the per-process pool allocation that
+       caches the created directory for cleanup fails; the directory is now
+       removed and setup errors out, rather than moving the process into a
+       cgroup that could never be cleaned up — a cgroup directory leak under
+       memory pressure.
 
     *) Bugfix: reject a "rootfs" that lexically resolves to "/" (such as
        "/.", "/..", or "/foo/.."); chroot("/") is a no-op and would silently
