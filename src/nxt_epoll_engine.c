@@ -294,14 +294,20 @@ nxt_epoll_test_accept4(nxt_event_engine_t *engine, nxt_conn_io_t *io)
 
 #if (NXT_HAVE_ACCEPT4)
 
+        /*
+         * Probe accept4() availability.  The call is expected to fail
+         * (fd is -1) -- only ENOSYS indicates the syscall is missing
+         * and warrants a fallback to plain accept().  Any other errno
+         * (EBADF on most kernels) means accept4() is supported.
+         */
         (void) accept4(-1, NULL, NULL, SOCK_NONBLOCK);
 
-        if (nxt_errno != NXT_ENOSYS) {
-            handler = nxt_epoll_conn_io_accept4;
-
-        } else {
+        if (nxt_errno == NXT_ENOSYS) {
             nxt_log(&engine->task, NXT_LOG_INFO, "accept4() failed %E",
                     NXT_ENOSYS);
+
+        } else {
+            handler = nxt_epoll_conn_io_accept4;
         }
 
 #endif
@@ -1025,7 +1031,7 @@ nxt_epoll_conn_io_accept4(nxt_task_t *task, void *obj, void *data)
      * The returned socklen is ignored here,
      * see comment in nxt_conn_io_accept().
      */
-    s = accept4(lev->socket.fd, sa, &socklen, SOCK_NONBLOCK);
+    s = accept4(lev->socket.fd, sa, &socklen, SOCK_NONBLOCK | SOCK_CLOEXEC);
 
     if (s != -1) {
         c->socket.fd = s;

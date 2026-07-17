@@ -112,6 +112,13 @@ typedef struct {
     nxt_timer_t                   timer;
 
     nxt_queue_link_t              link;
+
+    /*
+     * Two-phase close state.  When non-zero, accept(2) has been disarmed
+     * and the FD will be released once all in-flight accepted connections
+     * release their refs via nxt_router_listen_event_release().
+     */
+    uint8_t                       draining;  /* 1 bit */
 } nxt_listen_event_t;
 
 
@@ -160,7 +167,23 @@ struct nxt_conn_s {
     uint8_t                       block_read;   /* 1 bit */
     uint8_t                       block_write;  /* 1 bit */
     uint8_t                       delayed;      /* 1 bit */
-    uint8_t                       idle;         /* 1 bit */
+
+#define NXT_CONN_TRACK_NONE       0
+#define NXT_CONN_TRACK_IDLE       1
+#define NXT_CONN_TRACK_ACTIVE     2
+
+    /*
+     * Tri-state membership in the engine's idle/active connection queues.
+     * NONE (0): conn was never placed onto an engine tracking queue
+     *           (e.g. controller clients, proxy peers).  c->link is owned
+     *           by some other subsystem.
+     * IDLE (1): conn is on engine->idle_connections.
+     * ACTIVE (2): conn is on engine->active_connections.
+     *
+     * Set/cleared exclusively by nxt_conn_idle() / nxt_conn_active() and
+     * cleared by nxt_conn_close() when the conn is unlinked from its queue.
+     */
+    uint8_t                       idle;         /* NXT_CONN_TRACK_* */
 
 #define NXT_CONN_SENDFILE_OFF     0
 #define NXT_CONN_SENDFILE_ON      1
@@ -295,24 +318,101 @@ NXT_EXPORT void nxt_event_conn_job_sendfile(nxt_task_t *task,
     } while (0)
 
 
+/*
+ * Place conn onto engine->idle_connections.
+ *
+ * Prior states:
+ *   NXT_CONN_TRACK_NONE   - freshly created conn (e.g. just-accepted in
+ *                           nxt_conn_accept()).  Link is not on any queue.
+ *   NXT_CONN_TRACK_ACTIVE - keep-alive transition: conn is currently on
+ *                           engine->active_connections and is being moved
+ *                           back to idle awaiting the next request.
+ *   NXT_CONN_TRACK_IDLE   - already idle: no-op (idempotent).
+ *
+ * After this macro: conn is on idle_connections, c->idle == TRACK_IDLE.
+ * The idle guard keeps the transition idempotent so a stray second call
+ * cannot double-insert the link or double-count idle_conns_cnt.
+ */
 #define nxt_conn_idle(engine, c)                                              \
     do {                                                                      \
         nxt_event_engine_t  *e = engine;                                      \
                                                                               \
-        nxt_queue_insert_head(&e->idle_connections, &c->link);                \
+        if (c->idle != NXT_CONN_TRACK_IDLE) {                                 \
+            if (c->idle == NXT_CONN_TRACK_ACTIVE) {                           \
+                nxt_queue_remove(&c->link);                                   \
+                e->active_conns_cnt--;                                        \
+            }                                                                 \
                                                                               \
-        c->idle = 1;                                                          \
-        e->idle_conns_cnt++;                                                  \
+            nxt_queue_insert_head(&e->idle_connections, &c->link);           \
+                                                                              \
+            c->idle = NXT_CONN_TRACK_IDLE;                                    \
+            e->idle_conns_cnt++;                                              \
+        }                                                                     \
     } while (0)
 
 
+/*
+ * Move conn from engine->idle_connections onto engine->active_connections.
+ *
+ * Prior states:
+ *   NXT_CONN_TRACK_IDLE   - conn is currently on engine->idle_connections;
+ *                           a request has begun arriving, or a teardown/idle
+ *                           handler is detaching it before shutdown.
+ *   NXT_CONN_TRACK_ACTIVE / _NONE - no-op (idempotent).
+ *
+ * After this macro: conn is on active_connections, c->idle == TRACK_ACTIVE.
+ * All current callers (nxt_conn_accept marks every conn idle first) only
+ * reach this in TRACK_IDLE; the guard makes it safe should a future caller
+ * (e.g. P5 drain) invoke it on an already-active or untracked conn -- an
+ * unconditional nxt_queue_remove() on an untracked link would corrupt.
+ */
 #define nxt_conn_active(engine, c)                                            \
     do {                                                                      \
         nxt_event_engine_t  *e = engine;                                      \
                                                                               \
-        nxt_queue_remove(&c->link);                                           \
+        if (c->idle == NXT_CONN_TRACK_IDLE) {                                 \
+            nxt_queue_remove(&c->link);                                       \
+            e->idle_conns_cnt--;                                              \
                                                                               \
-        e->idle_conns_cnt -= c->idle;                               \
+            nxt_queue_insert_head(&e->active_connections, &c->link);         \
+                                                                              \
+            c->idle = NXT_CONN_TRACK_ACTIVE;                                  \
+            e->active_conns_cnt++;                                            \
+        }                                                                     \
+    } while (0)
+
+
+/*
+ * Detach conn from the engine's idle/active tracking queue on close.
+ *
+ * Prior states:
+ *   NXT_CONN_TRACK_IDLE   - conn is on engine->idle_connections.
+ *   NXT_CONN_TRACK_ACTIVE - conn is on engine->active_connections.
+ *   NXT_CONN_TRACK_NONE   - untracked (controller clients, proxy peers, or a
+ *                           conn already untracked here): no-op (idempotent).
+ *
+ * Unlinks the conn, decrements the queue's counter, increments
+ * closed_conns_cnt, and sets c->idle = TRACK_NONE.  Being idempotent, a conn
+ * untracked by nxt_runtime_close_idle_connections() before it scheduled the
+ * async close is not unlinked or counted a second time in the close handler.
+ */
+#define nxt_conn_untrack(engine, c)                                           \
+    do {                                                                      \
+        nxt_event_engine_t  *e = engine;                                      \
+                                                                              \
+        if (c->idle != NXT_CONN_TRACK_NONE) {                                 \
+            nxt_queue_remove(&c->link);                                       \
+                                                                              \
+            if (c->idle == NXT_CONN_TRACK_IDLE) {                             \
+                e->idle_conns_cnt--;                                          \
+                                                                              \
+            } else {                                                          \
+                e->active_conns_cnt--;                                        \
+            }                                                                 \
+                                                                              \
+            c->idle = NXT_CONN_TRACK_NONE;                                    \
+            e->closed_conns_cnt++;                                            \
+        }                                                                     \
     } while (0)
 
 

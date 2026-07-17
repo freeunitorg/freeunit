@@ -1,0 +1,111 @@
+name: EOL check
+
+# Validates pkg/eol.json (the single source of truth for supported runtime/OS
+# versions) against the live endoflife.date API, and enforces FreeUnit's
+# EOL + grace policy: any variant whose `supported_until` is already in the
+# past must be dropped from the matrix.
+#
+# Two behaviours, distinguished by github.event_name:
+#   * pull_request  -> HARD-FAIL on validator errors (drift or expiry). The PR
+#                      is editing the data, so it must leave it green.
+#   * schedule      -> REPORT-ONLY. Never fails red; on error it opens (or
+#                      comments on) a tracking issue with the JSON summary,
+#                      because upstream dates move on their own between PRs.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+  pull_request:
+    paths:
+      - 'pkg/eol.json'
+      - 'pkg/docker/**'
+      - 'pkg/eol/**'
+      - '.github/workflows/release-docker.yml'
+      - '.github/workflows/eol-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  eol-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write   # scheduled run may open/update a tracking issue
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # ubuntu-latest ships a Rust toolchain preinstalled — no setup step needed.
+      # Live-fetch endoflife.date. The CLI degrades gracefully: a single fetch
+      # failure -> WARN; only an all-fetch failure -> exit 2. exit 1 == real
+      # error (date drift or an expired variant). Report is written to a file so
+      # its JSON is never interpolated into a shell command.
+      - name: Run EOL validator
+        id: check
+        run: |
+          set +e
+          cargo run --quiet --release --manifest-path pkg/eol/Cargo.toml -- --ci \
+            | tee eol-report.json
+          code=${PIPESTATUS[0]}
+          echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Write job summary
+        run: |
+          {
+            echo "### EOL check — validator exit ${{ steps.check.outputs.exit_code }}"
+            echo
+            echo '```json'
+            cat eol-report.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # PR gate: exit 1 blocks the PR; exit 2 (endoflife.date unreachable) is a
+      # neutral/soft outcome so network flake does not red-fail a good PR.
+      - name: Enforce on pull request
+        if: github.event_name == 'pull_request'
+        run: |
+          code='${{ steps.check.outputs.exit_code }}'
+          if [ "$code" = "2" ]; then
+            echo "::warning::endoflife.date unreachable (all fetches failed) — treating as neutral, not failing the PR."
+          elif [ "$code" != "0" ]; then
+            # 1 = validator error (drift/expiry); any other non-zero code
+            # (e.g. 101 = cargo build/panic) must not pass the gate silently.
+            echo "::error::EOL validation failed (exit ${code}) — pkg/eol.json has date drift or an expired variant, or the checker itself failed. Run: cargo run --release --manifest-path pkg/eol/Cargo.toml -- --ci"
+            exit 1
+          fi
+
+      # Scheduled/manual run: report-only. On a real error, open or update a
+      # tracking issue instead of failing the workflow red.
+      - name: Open or update tracking issue
+        if: >-
+          github.event_name != 'pull_request' &&
+          steps.check.outputs.exit_code != '0' &&
+          steps.check.outputs.exit_code != '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title='EOL validation: pkg/eol.json needs attention'
+          {
+            echo 'The weekly EOL check found date drift and/or an expired variant in `pkg/eol.json`.'
+            echo 'Reproduce locally with:'
+            echo
+            echo '```'
+            echo 'cargo run --release --manifest-path pkg/eol/Cargo.toml -- --ci'
+            echo '```'
+            echo
+            echo 'Validator output:'
+            echo
+            echo '```json'
+            cat eol-report.json
+            echo '```'
+          } > issue-body.md
+          existing=$(gh issue list --state open --search "in:title ${title}" \
+            --json number,title --jq ".[] | select(.title == \"${title}\") | .number" | head -n1)
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body-file issue-body.md
+          else
+            gh issue create --title "${title}" --body-file issue-body.md
+          fi

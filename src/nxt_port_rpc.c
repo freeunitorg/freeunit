@@ -29,6 +29,39 @@ static void
 nxt_port_rpc_remove_from_peers(nxt_task_t *task, nxt_port_t *port,
     nxt_port_rpc_reg_t *reg);
 
+#if (NXT_TESTS)
+static nxt_uint_t  nxt_port_rpc_test_alloc_failure_count;
+static nxt_uint_t  nxt_port_rpc_test_insert_failure_count;
+
+
+void
+nxt_port_rpc_test_alloc_failures(nxt_uint_t failures)
+{
+    nxt_port_rpc_test_alloc_failure_count = failures;
+}
+
+
+void
+nxt_port_rpc_test_insert_failures(nxt_uint_t failures)
+{
+    nxt_port_rpc_test_insert_failure_count = failures;
+}
+
+
+static nxt_bool_t
+nxt_port_rpc_test_should_fail(nxt_uint_t *failures)
+{
+    if (*failures == 0) {
+        return 0;
+    }
+
+    (*failures)--;
+
+    return 1;
+}
+
+#endif
+
 
 nxt_int_t
 nxt_port_rpc_init(void)
@@ -130,6 +163,16 @@ nxt_port_rpc_register_handler_ex(nxt_task_t *task, nxt_port_t *port,
 
     stream = nxt_atomic_fetch_add(nxt_stream_ident, 1);
 
+#if (NXT_TESTS)
+    if (nxt_slow_path(nxt_port_rpc_test_should_fail(
+                          &nxt_port_rpc_test_alloc_failure_count)))
+    {
+        nxt_debug(task, "rpc: stream #%uD failed to allocate reg", stream);
+
+        return NULL;
+    }
+#endif
+
     reg = nxt_mp_zalloc(port->mem_pool, sizeof(nxt_port_rpc_reg_t) + ex_size);
 
     if (nxt_slow_path(reg == NULL)) {
@@ -148,6 +191,18 @@ nxt_port_rpc_register_handler_ex(nxt_task_t *task, nxt_port_t *port,
     lhq.replace = 0;
     lhq.value = reg;
     lhq.pool = port->mem_pool;
+
+#if (NXT_TESTS)
+    if (nxt_slow_path(nxt_port_rpc_test_should_fail(
+                          &nxt_port_rpc_test_insert_failure_count)))
+    {
+        nxt_debug(task, "rpc: stream #%uD failed to add reg", stream);
+
+        nxt_mp_free(port->mem_pool, reg);
+
+        return NULL;
+    }
+#endif
 
     switch (nxt_lvlhsh_insert(&port->rpc_streams, &lhq)) {
 

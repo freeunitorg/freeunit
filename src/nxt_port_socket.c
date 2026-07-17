@@ -37,6 +37,35 @@ static nxt_buf_t *nxt_port_buf_alloc(nxt_port_t *port);
 static void nxt_port_buf_free(nxt_port_t *port, nxt_buf_t *b);
 static void nxt_port_error_handler(nxt_task_t *task, void *obj, void *data);
 
+#if (NXT_TESTS)
+static nxt_uint_t  nxt_port_test_msg_alloc_failure_count;
+
+
+void
+nxt_port_test_msg_alloc_failures(nxt_uint_t failures)
+{
+    nxt_port_test_msg_alloc_failure_count = failures;
+}
+
+
+/*
+ * Public wrapper that lets src/test/nxt_port_fail_test.c invoke the
+ * static nxt_port_error_handler() directly with a synthesised port
+ * and queued message — used to verify that the "queued, then write
+ * failed" cleanup matches the ordering the cert/script/socket reply
+ * paths now mirror after the audit fix (close fd first, queue buffer
+ * completion second).  Pass NULL for `data` so use_delta does not
+ * decrement for the "obj == data" case — the test owns the port
+ * reference and releases it explicitly.
+ */
+void
+nxt_port_test_run_error_handler(nxt_task_t *task, nxt_port_t *port)
+{
+    nxt_port_error_handler(task, &port->socket, NULL);
+}
+
+#endif
+
 
 nxt_int_t
 nxt_port_socket_init(nxt_task_t *task, nxt_port_t *port, size_t max_size)
@@ -335,6 +364,13 @@ static nxt_port_send_msg_t *
 nxt_port_msg_alloc(const nxt_port_send_msg_t *m)
 {
     nxt_port_send_msg_t  *msg;
+
+#if (NXT_TESTS)
+    if (nxt_slow_path(nxt_port_test_msg_alloc_failure_count != 0)) {
+        nxt_port_test_msg_alloc_failure_count--;
+        return NULL;
+    }
+#endif
 
     msg = nxt_malloc(sizeof(nxt_port_send_msg_t));
     if (nxt_slow_path(msg == NULL)) {
@@ -746,8 +782,24 @@ nxt_port_read_handler(nxt_task_t *task, void *obj, void *data)
         b = nxt_port_buf_alloc(port);
 
         if (nxt_slow_path(b == NULL)) {
-            /* TODO: disable event for some time */
+            /*
+             * Buffer pool exhausted (transient OOM on port mem_pool).
+             * Falling through would dereference b->mem.pos and crash;
+             * disarm the read event and route through the orderly
+             * error path instead.  No timer infrastructure exists for
+             * ports, so there is no way to re-arm the read later:
+             * terminal teardown via nxt_port_error_handler is the
+             * strict improvement over the NULL dereference.
+             */
+            nxt_alert(task, "port{%d,%d} %d: buf alloc failed; "
+                            "disabling read",
+                      (int) port->pid, (int) port->id, port->socket.fd);
+            nxt_fd_event_block_read(task->thread->engine, &port->socket);
+            goto fail;
         }
+
+        /* Guards against a future regression emptying the branch above. */
+        nxt_assert(b != NULL);
 
         iov[0].iov_base = &msg.port_msg;
         iov[0].iov_len = sizeof(nxt_port_msg_t);
@@ -760,6 +812,14 @@ nxt_port_read_handler(nxt_task_t *task, void *obj, void *data)
         if (n > 0) {
             msg.fd[0] = -1;
             msg.fd[1] = -1;
+
+#if (NXT_USE_CMSG_PID)
+            /*
+             * Fail safe: a message without SCM_CREDENTIALS must never
+             * be attributed to a valid sender PID.
+             */
+            msg.cmsg_pid = -1;
+#endif
 
             ret = nxt_socket_msg_oob_get(&oob, msg.fd,
                                          nxt_recv_msg_cmsg_pid_ref(&msg));
@@ -831,6 +891,22 @@ nxt_port_queue_read_handler(nxt_task_t *task, void *obj, void *data)
 
     for ( ;; ) {
 
+        /*
+         * Fail safe: messages dequeued from the shared memory queue carry
+         * neither file descriptors nor socket credentials.  Reset both up
+         * front so a queue message can never be seen carrying an fd or a
+         * sender PID left over from a socket message processed on a previous
+         * loop iteration.  The fd reset matters for the reject paths in the
+         * privileged handlers: they call nxt_port_recv_msg_close_fds(), which
+         * would otherwise close a stale descriptor in this process.  The
+         * socket and suspended-message paths overwrite these fields below.
+         */
+        msg.fd[0] = -1;
+        msg.fd[1] = -1;
+#if (NXT_USE_CMSG_PID)
+        msg.cmsg_pid = -1;
+#endif
+
         if (port->from_socket == 0) {
             n = nxt_port_queue_recv(queue, qmsg);
 
@@ -867,6 +943,10 @@ nxt_port_queue_read_handler(nxt_task_t *task, void *obj, void *data)
                 msg.fd[0] = smsg->fd[0];
                 msg.fd[1] = smsg->fd[1];
 
+#if (NXT_USE_CMSG_PID)
+                msg.cmsg_pid = smsg->cmsg_pid;
+#endif
+
                 smsg->size = 0;
 
                 port->from_socket--;
@@ -889,8 +969,27 @@ nxt_port_queue_read_handler(nxt_task_t *task, void *obj, void *data)
         b = nxt_port_buf_alloc(port);
 
         if (nxt_slow_path(b == NULL)) {
-            /* TODO: disable event for some time */
+            /*
+             * Buffer pool exhausted (transient OOM on port mem_pool).
+             * Falling through would dereference b->mem.pos in either
+             * the dequeue memcpy or the iov[1] recv branch.  Disarm
+             * the read event, decrement the queue counter, and route
+             * through the orderly error handler; terminal teardown is
+             * the strict improvement over the NULL dereference.
+             */
+            nxt_alert(task, "port{%d,%d} %d: buf alloc failed; "
+                            "disabling read",
+                      (int) port->pid, (int) port->id, port->socket.fd);
+            nxt_fd_event_block_read(task->thread->engine, &port->socket);
+            nxt_atomic_fetch_add(&queue->nitems, -1);
+            nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                               nxt_port_error_handler, task, &port->socket,
+                               NULL);
+            return;
         }
+
+        /* Guards against a future regression emptying the branch above. */
+        nxt_assert(b != NULL);
 
         if (n >= (ssize_t) sizeof(nxt_port_msg_t)) {
             nxt_memcpy(&msg.port_msg, qmsg, sizeof(nxt_port_msg_t));
@@ -912,6 +1011,11 @@ nxt_port_queue_read_handler(nxt_task_t *task, void *obj, void *data)
             if (n > 0) {
                 msg.fd[0] = -1;
                 msg.fd[1] = -1;
+
+#if (NXT_USE_CMSG_PID)
+                /* Fail safe, see nxt_port_read_handler(). */
+                msg.cmsg_pid = -1;
+#endif
 
                 ret = nxt_socket_msg_oob_get(&oob, msg.fd,
                                              nxt_recv_msg_cmsg_pid_ref(&msg));
@@ -980,6 +1084,10 @@ nxt_port_queue_read_handler(nxt_task_t *task, void *obj, void *data)
                     smsg->size = n;
                     smsg->fd[0] = msg.fd[0];
                     smsg->fd[1] = msg.fd[1];
+
+#if (NXT_USE_CMSG_PID)
+                    smsg->cmsg_pid = msg.cmsg_pid;
+#endif
 
                     continue;
                 }
@@ -1342,7 +1450,13 @@ nxt_port_error_handler(nxt_task_t *task, void *obj, void *data)
     nxt_port_send_msg_t  *msg;
 
     nxt_debug(task, "port error handler %p", obj);
-    /* TODO */
+    /*
+     * The bare TODO here historically asked for richer error context
+     * (e.g. surfacing the actual socket.error to peers).  The handler
+     * already drains all queued send messages, releases buffers, and
+     * decrements port refcounts; richer error responses remain a
+     * possible future enhancement.
+     */
 
     port = nxt_container_of(obj, nxt_port_t, socket);
 

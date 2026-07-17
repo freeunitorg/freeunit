@@ -680,7 +680,31 @@ failed:
 static void
 nxt_proto_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
-    nxt_debug(task, "prototype quit handler");
+    uint8_t        quit_mode;
+    nxt_runtime_t  *rt;
+
+    /*
+     * The QUIT message from main carries a single nxt_port_quit_mode_t
+     * byte (see nxt_runtime_quit_buf()).  Forward it to the children
+     * unchanged so a graceful quit reaches every libunit context, not
+     * only the ports main contacts directly.  An empty body (legacy
+     * senders, or an allocation failure on the sender side) and any
+     * value other than the two defined ones normalise to
+     * NXT_PORT_QUIT_NORMAL, so a malformed sender cannot propagate a
+     * bogus byte through the whole worker pool.
+     */
+    quit_mode = NXT_PORT_QUIT_NORMAL;
+
+    if (msg->buf != NULL && nxt_buf_mem_used_size(&msg->buf->mem) >= 1
+        && msg->buf->mem.pos[0] == NXT_PORT_QUIT_GRACEFUL)
+    {
+        quit_mode = NXT_PORT_QUIT_GRACEFUL;
+    }
+
+    nxt_debug(task, "prototype quit handler (quit_mode=%d)", quit_mode);
+
+    rt = task->thread->runtime;
+    rt->quit_mode = quit_mode;
 
     nxt_proto_quit_children(task);
 
@@ -697,12 +721,14 @@ nxt_proto_quit_children(nxt_task_t *task)
 {
     nxt_port_t     *port;
     nxt_process_t  *process;
+    nxt_runtime_t  *rt;
+
+    rt = task->thread->runtime;
 
     nxt_queue_each(process, &nxt_proto_children, nxt_process_t, link) {
         port = nxt_process_port_first(process);
 
-        (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_QUIT,
-                                     -1, 0, 0, NULL);
+        nxt_runtime_port_send_quit(task, rt, port);
     }
     nxt_queue_loop;
 }
@@ -758,6 +784,14 @@ nxt_proto_sigterm_handler(nxt_task_t *task, void *obj, void *data)
 {
     nxt_trace(task, "signal signo:%d (%s) received",
               (int) (uintptr_t) obj, data);
+
+    /*
+     * A direct signal to the prototype is not the user-initiated
+     * lifecycle path (that goes main -> NXT_PORT_MSG_QUIT -> the
+     * message handler above): treat it as fast exit so children drop
+     * in-flight work rather than wait on a drain nobody requested.
+     */
+    task->thread->runtime->quit_mode = NXT_PORT_QUIT_NORMAL;
 
     nxt_proto_quit_children(task);
 

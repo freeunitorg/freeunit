@@ -54,6 +54,15 @@ nxt_app_queue_send(nxt_app_queue_t volatile *q, const void *p,
     nxt_app_queue_item_t   *qi;
     nxt_app_nncq_atomic_t  i;
 
+    /*
+     * qi->data is NXT_APP_QUEUE_MSG_SIZE bytes; refuse to enqueue an
+     * over-sized item rather than overwriting the adjacent queue slot.
+     * Callers must respect the queue's per-item budget.
+     */
+    if (nxt_slow_path(size > NXT_APP_QUEUE_MSG_SIZE)) {
+        return NXT_ERROR;
+    }
+
     i = nxt_app_nncq_dequeue(&q->free_items);
     if (i == nxt_app_nncq_empty(&q->free_items)) {
         return NXT_AGAIN;
@@ -100,7 +109,7 @@ nxt_app_queue_cancel(nxt_app_queue_t volatile *q, uint32_t cookie,
 nxt_inline ssize_t
 nxt_app_queue_recv(nxt_app_queue_t volatile *q, void *p, uint32_t *cookie)
 {
-    ssize_t                res;
+    size_t                 size;
     nxt_app_queue_item_t   *qi;
     nxt_app_nncq_atomic_t  i;
 
@@ -112,13 +121,26 @@ nxt_app_queue_recv(nxt_app_queue_t volatile *q, void *p, uint32_t *cookie)
 
     qi = (nxt_app_queue_item_t *) &q->items[i];
 
-    res = qi->size;
-    nxt_memcpy(p, qi->data, qi->size);
+    /*
+     * qi lives in shared memory that the peer can write.  Cap qi->size at
+     * the slot's data bound (NXT_APP_QUEUE_MSG_SIZE) before the memcpy so
+     * a poisoned item cannot overflow the caller's receive buffer, which
+     * is sized for NXT_APP_QUEUE_MSG_SIZE.  Read from the volatile queue
+     * structure directly so the compiler cannot fold the bound-check and
+     * the memcpy length into two separate reads of qi->size that a
+     * concurrent peer write could make disagree.
+     */
+    size = q->items[i].size;
+    if (nxt_slow_path(size > NXT_APP_QUEUE_MSG_SIZE)) {
+        size = NXT_APP_QUEUE_MSG_SIZE;
+    }
+
+    nxt_memcpy(p, qi->data, size);
     *cookie = i;
 
     nxt_app_nncq_enqueue(&q->free_items, i);
 
-    return res;
+    return size;
 }
 
 

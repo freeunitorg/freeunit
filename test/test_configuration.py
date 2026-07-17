@@ -233,6 +233,67 @@ def test_applications_relative_path():
     ), 'relative path'
 
 
+def test_applications_cstring_nul():
+    # "spare": 0 keeps the app from spawning, so validation is exercised
+    # without any process startup.
+    def conf_app(app):
+        return client.conf({"a": app}, 'applications')
+
+    base = {"type": "python", "processes": {"spare": 0}, "module": "wsgi"}
+
+    # Length-tracked config strings later used as NUL-terminated C strings
+    # must reject an embedded NUL (\0 survives JSON parsing) and an
+    # empty value.
+    for field in ["user", "group", "working_directory", "stdout", "stderr", "home"]:
+        assert 'error' in conf_app({**base, field: "/x\0y"}), f'{field} nul'
+        assert 'error' in conf_app({**base, field: ""}), f'{field} empty'
+
+    # "executable" of an external app (mapped as a C string, passed to execve).
+    assert 'error' in conf_app(
+        {"type": "external", "processes": {"spare": 0}, "executable": "/bin/tr\0ue"}
+    ), 'executable nul'
+    assert 'error' in conf_app(
+        {"type": "external", "processes": {"spare": 0}, "executable": ""}
+    ), 'executable empty'
+
+    # Valid values are still accepted.
+    assert 'success' in conf_app(
+        {**base, "working_directory": "/tmp", "home": "/tmp"}
+    ), 'valid values'
+
+
+def test_listeners_unix_path_nul(system):
+    if system != 'Linux':
+        pytest.skip('unix sockets')
+
+    # A pathname unix socket address is used as a C string for bind()/unlink();
+    # an embedded NUL must be rejected (abstract "unix:@..." sockets, tested
+    # elsewhere, legitimately carry NULs and are exempt).
+    assert 'error' in try_addr("unix:/tmp/x\0y"), 'pathname \0'
+
+
+def test_access_log_cstring_nul(temp_dir):
+    # The access log path is passed to the router and opened as a
+    # NUL-terminated C string; both the string form and the object form
+    # "path" must reject an embedded NUL (\0 survives JSON parsing) and
+    # an empty value.
+    def conf_log(value):
+        return client.conf(
+            {"listeners": {}, "applications": {}, "access_log": value}
+        )
+
+    assert 'error' in conf_log("/tmp/x\0y"), 'string nul'
+    assert 'error' in conf_log(""), 'string empty'
+    assert 'error' in conf_log({"path": "/tmp/x\0y"}), 'path nul'
+    assert 'error' in conf_log({"path": ""}), 'path empty'
+
+    # Valid values are still accepted.
+    assert 'success' in conf_log(f'{temp_dir}/access.log'), 'string valid'
+    assert 'success' in conf_log(
+        {"path": f'{temp_dir}/access.log'}
+    ), 'path valid'
+
+
 @pytest.mark.skip('not yet, unsafe')
 def test_listeners_empty():
     assert 'error' in client.conf({"*:8080": {}}, 'listeners'), 'listener empty'
@@ -464,3 +525,43 @@ def test_unprivileged_user_error(require, skip_alert):
         },
         'applications',
     ), 'setting user'
+
+
+def test_json_deep_nesting():
+    # The controller caps JSON nesting depth so a pathologically deep
+    # payload cannot exhaust its stack.  Well past the cap it must be
+    # rejected cleanly while the control socket keeps serving.
+    depth = 10000
+    payload = '[' * depth + ']' * depth
+
+    assert 'error' in client.conf(payload), 'deep nesting rejected'
+
+    # Controller survived and still applies a valid configuration.
+    assert 'success' in client.conf(
+        {"listeners": {}, "routes": [], "applications": {}}
+    ), 'controller alive after deep nesting'
+
+
+def test_json_too_many_array_elements():
+    # Per-array element count is capped to bound heap usage on a
+    # malformed payload; just over the cap must be rejected without
+    # taking the controller down.
+    payload = '[' + ','.join(['0'] * 100001) + ']'
+
+    assert 'error' in client.conf(payload), 'too many array elements rejected'
+
+    assert 'success' in client.conf(
+        {"listeners": {}, "routes": [], "applications": {}}
+    ), 'controller alive after large array'
+
+
+def test_json_too_many_object_members():
+    # Same cap applies to object members.
+    members = ','.join(f'"k{i}":0' for i in range(100001))
+    payload = '{' + members + '}'
+
+    assert 'error' in client.conf(payload), 'too many object members rejected'
+
+    assert 'success' in client.conf(
+        {"listeners": {}, "routes": [], "applications": {}}
+    ), 'controller alive after large object'

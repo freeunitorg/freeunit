@@ -1,0 +1,118 @@
+name: "Analysis (Clang AST)"
+
+on:
+  push:
+    branches: master
+    paths:
+      - configure
+      - 'auto/**'
+      - 'src/**'
+      - 'test/**'
+      - 'pkg/contrib/**'
+      - '.github/workflows/analysis-clang-ast.yml'
+  pull_request:
+    branches: master
+    paths:
+      - configure
+      - 'auto/**'
+      - 'src/**'
+      - 'test/**'
+      - 'pkg/contrib/**'
+      - '.github/workflows/analysis-clang-ast.yml'
+
+jobs:
+  clang-ast:
+    runs-on: ubuntu-latest
+
+    container:
+      image: debian:testing
+
+    steps:
+      - name: Install tools/deps
+        run: |
+          apt-get -y update
+          apt-get -y install git wget curl llvm-dev libclang-dev clang make \
+                             libssl-dev libpcre2-dev libperl-dev \
+                             libphp-embed php-dev python3-dev libpython3-dev \
+                             ruby-dev default-jdk npm dpkg-dev \
+                             cargo rustc cmake
+          npm install -g node-gyp
+          # Debian multiarch: RbConfig["libdir"] returns /usr/lib but the
+          # actual libruby-X.Y.so is in /usr/lib/<triplet>/.  auto/modules/ruby
+          # checks -L$(RbConfig["libdir"]) which misses the multiarch path.
+          # TODO: fix auto/modules/ruby to probe the multiarch libdir via
+          #   dpkg-architecture -q DEB_HOST_MULTIARCH
+          # and fall back to it when the standard libdir check fails.
+          # Workaround: create symlinks so -L/usr/lib finds the library.
+          MULTIARCH=$(dpkg-architecture -q DEB_HOST_MULTIARCH)
+          for f in /usr/lib/$MULTIARCH/libruby-*.so; do
+            [ -f "$f" ] && ln -sf "$f" /usr/lib/$(basename "$f") || true
+          done
+
+      - uses: actions/checkout@v5
+
+      - name: Checkout and build clang-ast
+        run: |
+          git clone https://github.com/freeunitorg/clang-ast.git -b unit
+          make -C clang-ast
+
+      - name: Configure Unit
+        # -Wno-default-const-init-field-unsafe: clang 21 emits this on Ruby 3.3
+        # headers (rstring.h struct RString has a const member).  Suppressed
+        # globally because (a) it is a C++ idiom that cannot fire in our pure-C
+        # source and (b) it also affects the autoconf feature-test compilation
+        # for the Ruby module.
+        run: ./configure --cc=clang --cc-opt="-Xclang -load -Xclang clang-ast/ngx-ast.so -Xclang -add-plugin -Xclang ngx-ast -Wno-default-const-init-field-unsafe" --openssl --debug --tests
+
+      - name: Build Unit
+        run: make -j4 unitd
+
+      - name: Build C tests
+        run: make -j4 tests
+
+      # Actually execute the C unit-test suite (nxt_tests.c runner): parser,
+      # port/IPC fault-injection, lvlhsh, mp, rbtree, base64, utf8, clone
+      # creds, etc. It was only ever compiled before, so regressions in these
+      # units went uncaught. This job runs as root in a container, which is the
+      # right environment for the privilege-sensitive cases (e.g. clone creds).
+      - name: Run C tests
+        run: ./build/tests
+
+      - name: Build Perl language module
+        run: ./configure perl && make -j4 perl
+
+      - name: Build PHP language module
+        run: ./configure php && make -j4 php
+
+      - name: Build Python language module
+        run: ./configure python --config=python3-config && make -j4 python3
+
+      - name: Build Ruby language module
+        run: ./configure ruby && make -j4 ruby
+
+      - name: Build Java support
+        run: ./configure java && make -j4 java
+
+      - name: Build Nodejs support
+        run: ./configure nodejs && make node-local-install DESTDIR=node
+
+      # wasmtime version is pinned in pkg/contrib/src/wasmtime/version and
+      # built from a checksum-verified source tarball — same as build-test.
+      # Keeps the wasm runtime in sync with what Unit is actually built against.
+      # Cache the compiled artifacts (keyed by pinned version + this distro,
+      # isolated from the ubuntu/fedora builds) to skip the slow from-source
+      # compile on a hit.
+      - name: Cache wasmtime
+        id: cache-wasmtime
+        uses: actions/cache@v6
+        with:
+          path: pkg/contrib/wasmtime/artifacts
+          key: wasmtime-debian-testing-${{ runner.arch }}-${{ hashFiles('pkg/contrib/src/wasmtime/version') }}
+
+      - name: Build wasmtime (pinned via pkg/contrib)
+        if: steps.cache-wasmtime.outputs.cache-hit != 'true'
+        run: make -C pkg/contrib .wasmtime
+
+      - name: Build wasm language module
+        run: |
+          ./configure wasm --include-path=pkg/contrib/wasmtime/artifacts/include --lib-path=pkg/contrib/wasmtime/artifacts/lib --rpath && make wasm

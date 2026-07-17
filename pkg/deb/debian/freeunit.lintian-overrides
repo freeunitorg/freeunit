@@ -1,0 +1,6 @@
+# Inherited from NGINX Unit: the CLI helpers (unitc, setup-unit) and the debug
+# daemon ship without man pages upstream. This is a conscious packaging decision
+# for the fork, not a defect; accept the tag rather than invent stubs. The main
+# daemon %%RUNTIME%%d does ship unitd.8, aliased to %%RUNTIME%%d.8 in rules.in.
+# Affected paths: usr/bin/unitc, usr/bin/setup-unit, usr/sbin/%%RUNTIME%%d-debug
+%%PACKAGE%%: no-manual-page

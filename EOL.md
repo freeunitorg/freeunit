@@ -15,6 +15,8 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Go | 1.26 | Feb 2027 | Feb 2028 |
 | Java (JSC) | 17 (LTS) | Oct 2027 | Oct 2028 |
 | Java (JSC) | 21 (LTS) | Dec 2029 | Dec 2030 |
+| Java (JSC) | 25 (LTS) | Sep 2031 | Sep 2032 |
+| Java (JSC) | 26 | Sep 2026 | Sep 2027 |
 | Node.js | 20 (LTS) (EOL) † | Apr 2026 | Apr 2027 |
 | Node.js | 22 (LTS) | Apr 2027 | Apr 2028 |
 | Node.js | 24 (LTS) | Apr 2028 | Apr 2029 |
@@ -49,9 +51,8 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Ubuntu (LTS) | 22.04 | 2027-04 | 2030-04 | 3.10 |
 | Ubuntu (LTS) | 24.04 | 2029-05 | 2032-05 | 3.12 |
 | Ubuntu (LTS) | 26.04 | 2031-04 | 2034-04 | 3.13 |
-| Debian | 10 (buster) (EOL) † | 2022-09 | 2025-09 | 3.7 ‡ |
 | Debian | 11 (bullseye) (EOL) † | 2024-08 | 2027-08 | 3.9 |
-| Debian | 12 (bookworm) | 2026-06 | 2029-06 | 3.11 |
+| Debian | 12 (bookworm) | 2026-07 | 2029-07 | 3.11 |
 | Debian | 13 (trixie) | 2028-08 | 2031-08 | 3.13 |
 | RHEL | 8 | 2029-05 | 2032-05 | 3.8 ‡ |
 | RHEL | 9 | 2032-05 | 2035-05 | 3.11 |
@@ -60,6 +61,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Alpine | 3.21 | 2026-11 | 2029-11 | 3.13 |
 | Alpine | 3.22 | 2027-05 | 2030-05 | 3.13 |
 | Alpine | 3.23 | 2027-11 | 2030-11 | 3.14 |
+| Alpine | 3.24 | 2028-06 | 2031-06 | 3.14 |
 
 † Past upstream EOL; in FreeUnit grace period.
 ‡ Default Python shipped by this OS is itself past upstream EOL. FreeUnit does not backport fixes to that Python version.
@@ -74,7 +76,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
   `CHANGES`.
 - **Security-only mode:** versions within 6 months of the FreeUnit drop date receive
   security fixes only — no new features backported.
-- **LTS runtimes (Java 17/21):** follow the upstream LTS schedule strictly.
+- **LTS runtimes (Java 17/21/25):** follow the upstream LTS schedule strictly.
 - **LTS OS (Ubuntu, RHEL, Debian):** 3-year extension applies to standard EOL, not
   extended security maintenance dates.
 

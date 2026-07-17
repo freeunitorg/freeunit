@@ -1,7 +1,7 @@
 MODULES+=			python313
 MODULE_SUFFIX_python313=		python3.13
 
-MODULE_SUMMARY_python313=	Python 3.13 module for FreeUnit
+MODULE_SUMMARY_python313=	Python 3.13 module for $(BRAND_TITLE)
 
 MODULE_VERSION_python313=	$(VERSION)
 MODULE_RELEASE_python313=	1
@@ -10,8 +10,8 @@ MODULE_CONFARGS_python313=	python --config=python3.13-config
 MODULE_MAKEARGS_python313=	python3.13
 MODULE_INSTARGS_python313=	python3.13-install
 
-MODULE_SOURCES_python313=	unit.example-python-app \
-				unit.example-python3.13-config
+MODULE_SOURCES_python313=	freeunit.example-python-app \
+				freeunit.example-python3.13-config
 
 BUILD_DEPENDS_python313=	python3.13-dev
 BUILD_DEPENDS+=		$(BUILD_DEPENDS_python313)
@@ -19,9 +19,9 @@ BUILD_DEPENDS+=		$(BUILD_DEPENDS_python313)
 MODULE_BUILD_DEPENDS_python313=,python3.13-dev
 
 define MODULE_PREINSTALL_python313
-	mkdir -p debian/unit-python3.13/usr/share/doc/unit-python3.13/examples/python-app
-	install -m 644 -p debian/unit.example-python-app debian/unit-python3.13/usr/share/doc/unit-python3.13/examples/python-app/wsgi.py
-	install -m 644 -p debian/unit.example-python3.13-config debian/unit-python3.13/usr/share/doc/unit-python3.13/examples/unit.config
+	mkdir -p debian/$(BRAND)-python3.13/usr/share/doc/$(BRAND)-python3.13/examples/python-app
+	install -m 644 -p debian/freeunit.example-python-app debian/$(BRAND)-python3.13/usr/share/doc/$(BRAND)-python3.13/examples/python-app/wsgi.py
+	install -m 644 -p debian/freeunit.example-python3.13-config debian/$(BRAND)-python3.13/usr/share/doc/$(BRAND)-python3.13/examples/$(BRAND).config
 endef
 export MODULE_PREINSTALL_python313
 
@@ -33,12 +33,12 @@ The $(MODULE_SUMMARY_python313) has been installed.
 
 To check out the sample app, run these commands:
 
- sudo service unit restart
- cd /usr/share/doc/unit-$(MODULE_SUFFIX_python313)/examples
- sudo curl -X PUT --data-binary @unit.config --unix-socket /var/run/control.unit.sock http://localhost/config
+ sudo service $(RUNTIME) restart
+ cd /usr/share/doc/$(BRAND)-$(MODULE_SUFFIX_python313)/examples
+ $(MODULE_CONFIG_PUT)
  curl http://localhost:8400/
 
-Online documentation is available at https://docs.freeunit.org
+Online documentation is available at $(DOCS_URL)
 
 ----------------------------------------------------------------------
 BANNER

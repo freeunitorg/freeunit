@@ -167,6 +167,18 @@ typedef enum {
 } nxt_port_msg_type_t;
 
 
+/*
+ * Wire-format payload for NXT_PORT_MSG_QUIT.  A single byte selects
+ * between fast and graceful exit on the receiving side.  When the
+ * message arrives without a payload, the receiver defaults to
+ * NXT_PORT_QUIT_NORMAL (see src/nxt_unit.c nxt_unit_process_msg).
+ */
+typedef enum {
+    NXT_PORT_QUIT_NORMAL   = 0,
+    NXT_PORT_QUIT_GRACEFUL = 1,
+} nxt_port_quit_mode_t;
+
+
 /* Passed as a first iov chunk. */
 typedef struct {
     uint32_t             stream;
@@ -230,6 +242,31 @@ struct nxt_port_recv_msg_s {
 #define nxt_recv_msg_cmsg_pid(msg)      ((msg)->port_msg.pid)
 #define nxt_recv_msg_cmsg_pid_ref(msg)  (NULL)
 #endif
+
+
+/*
+ * Close any file descriptors the peer attached to a received message via
+ * SCM_RIGHTS.  A privileged handler that rejects a message (unauthorized
+ * or malformed sender) must call this before returning: the port
+ * dispatcher does not reclaim descriptors once the handler returns, and
+ * a compromised peer can attach fds to a forged message, so leaving them
+ * open on the reject path would let it exhaust the receiver's descriptor
+ * table.
+ */
+nxt_inline void
+nxt_port_recv_msg_close_fds(nxt_port_recv_msg_t *msg)
+{
+    if (msg->fd[0] != -1) {
+        nxt_fd_close(msg->fd[0]);
+        msg->fd[0] = -1;
+    }
+
+    if (msg->fd[1] != -1) {
+        nxt_fd_close(msg->fd[1]);
+        msg->fd[1] = -1;
+    }
+}
+
 
 typedef struct nxt_app_s  nxt_app_t;
 
@@ -348,6 +385,11 @@ void nxt_port_read_close(nxt_port_t *port);
 nxt_int_t nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port,
     nxt_uint_t type, nxt_fd_t fd, nxt_fd_t fd2, uint32_t stream,
     nxt_port_id_t reply_port, nxt_buf_t *b);
+
+#if (NXT_TESTS)
+void nxt_port_test_msg_alloc_failures(nxt_uint_t failures);
+void nxt_port_test_run_error_handler(nxt_task_t *task, nxt_port_t *port);
+#endif
 
 nxt_inline nxt_int_t
 nxt_port_socket_write(nxt_task_t *task, nxt_port_t *port,

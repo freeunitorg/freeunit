@@ -1,0 +1,35 @@
+#!/bin/sh
+
+set -e
+
+case "$1" in
+    install)
+        cat <<BANNER
+----------------------------------------------------------------------
+
+Thank you for installing %%BRAND_TITLE%%!
+
+Additional modules are available in standalone packages.
+To see the available modules, run: apt search --names-only '^%%PACKAGE%%-'
+
+Online documentation is available at %%DOCS_URL%%
+
+----------------------------------------------------------------------
+BANNER
+        ;;
+
+    upgrade)
+        ;;
+
+    abort-upgrade)
+        ;;
+
+    *)
+        echo "preinst called with unknown argument \`$1'" >&2
+        exit 0
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

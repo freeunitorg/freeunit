@@ -3894,35 +3894,138 @@ nxt_router_worker_thread_quit(nxt_task_t *task, void *obj, void *data)
 }
 
 
+/*
+ * Two-phase close of a router listen event.
+ *
+ *   Accepting -> Draining: nxt_router_listen_socket_close() (phase 1)
+ *                          disarms accept(2), marks lev->draining = 1.
+ *   Draining  -> Closed:   nxt_router_listen_socket_close_finish() (phase 2)
+ *                          runs once lev->count == 1 (no in-flight accepted
+ *                          connections), releases the FD and posts the
+ *                          close_job back to the configuration thread.
+ *
+ * The intermediate state lets in-flight TLS handshakes and accepted-but-
+ * not-yet-handled connections complete cleanly instead of being RST when
+ * the listener is reconfigured under load (mirrors the engine->shutdown
+ * pattern in nxt_router_worker_thread_quit()).
+ */
+
+static void nxt_router_listen_socket_close_ready(nxt_socket_conf_joint_t *joint);
+static void nxt_router_listen_socket_close_finish(nxt_task_t *task,
+    nxt_listen_event_t *lev);
+
+
 static void
 nxt_router_listen_socket_close(nxt_task_t *task, void *obj, void *data)
 {
     nxt_timer_t              *timer;
-    nxt_joint_job_t          *job;
     nxt_listen_event_t       *lev;
+    nxt_event_engine_t       *engine;
     nxt_socket_conf_joint_t  *joint;
 
     timer = obj;
     lev = nxt_timer_data(timer, nxt_listen_event_t, timer);
 
-    nxt_debug(task, "engine %p: listen socket close: %d", task->thread->engine,
-              lev->socket.fd);
+    engine = task->thread->engine;
+    joint = lev->socket.data;
+
+    nxt_debug(task, "engine %p: listen socket close: %d draining:%d count:%D",
+              engine, lev->socket.fd, lev->draining, lev->count);
+
+    /*
+     * Phase 1: disarm accept(2).  nxt_router_listen_socket_delete() has
+     * already called nxt_fd_event_delete() on epoll/kqueue, but be
+     * defensive in case this entry point is reused or the event
+     * backend's delete is a no-op for events that were never armed
+     * (kqueue's behaviour differs from epoll's when an FD is closed
+     * with pending kevents, see nxt_kqueue_close()).
+     *
+     * Scope note: this drains *already-accepted* connections only.
+     * TCP connections completed by the kernel but still in the listen
+     * queue waiting for a userspace accept(2) are not preserved --
+     * they will be RST when the FD is released in phase 2 below.
+     * Draining the kernel accept queue is future work (full
+     * connection drain with timeout escalation).
+     */
+    if (!lev->draining) {
+        lev->draining = 1;
+
+        if (nxt_fd_event_is_active(lev->socket.read)) {
+            nxt_fd_event_disable_read(engine, &lev->socket);
+        }
+    }
+
+    /*
+     * Configuration is ready once accept(2) has been disarmed.  The
+     * listener FD and old socket configuration stay alive below until
+     * accepted connections release their listener refs, but the control
+     * request must not wait for idle client timing.
+     */
+    nxt_router_listen_socket_close_ready(joint);
+
+    /*
+     * Phase 2 gating: wait for accepted connections to release their
+     * refs.  lev->count == 1 means only the original listener ref
+     * remains (see nxt_listen_event() and nxt_conn_accept()).
+     *
+     * Known limitation: the listening FD stays bound until the drain
+     * completes (nxt_router_listen_socket_release() closes it on the
+     * last engine's phase 2), so a configuration that re-adds the same
+     * address while the old listener drains fails with EADDRINUSE at
+     * bind time in the main process -- a visible, retryable config
+     * error.  Closing the FD in phase 1 instead requires reworking the
+     * ls->count contract across engines and the nxt_process_quit()
+     * listen-queue walk; that belongs to the full-drain follow-up.
+     */
+    if (lev->count > 1) {
+        nxt_debug(task, "engine %p: listen socket %d drain pending, "
+                  "in-flight: %D", engine, lev->socket.fd, lev->count - 1);
+        return;
+    }
+
+    nxt_router_listen_socket_close_finish(task, lev);
+}
+
+
+static void
+nxt_router_listen_socket_close_ready(nxt_socket_conf_joint_t *joint)
+{
+    nxt_joint_job_t  *job;
+
+    job = joint->close_job;
+    if (job == NULL) {
+        return;
+    }
+
+    joint->close_job = NULL;
+
+    job->work.next = NULL;
+    job->work.handler = nxt_router_conf_wait;
+
+    nxt_event_engine_post(job->tmcf->engine, &job->work);
+}
+
+
+static void
+nxt_router_listen_socket_close_finish(nxt_task_t *task,
+    nxt_listen_event_t *lev)
+{
+    nxt_socket_conf_joint_t  *joint;
+
+    nxt_debug(task, "engine %p: listen socket close finish: %d",
+              task->thread->engine, lev->socket.fd);
 
     nxt_queue_remove(&lev->link);
 
     joint = lev->socket.data;
     lev->socket.data = NULL;
 
+    nxt_router_listen_socket_close_ready(joint);
+
     /* 'task' refers to lev->task and we cannot use after nxt_free() */
     task = &task->thread->engine->task;
 
     nxt_router_listen_socket_release(task, joint->socket_conf);
-
-    job = joint->close_job;
-    job->work.next = NULL;
-    job->work.handler = nxt_router_conf_wait;
-
-    nxt_event_engine_post(job->tmcf->engine, &job->work);
 
     nxt_router_listen_event_release(task, lev, joint);
 }
@@ -3996,7 +4099,8 @@ nxt_router_listen_event_release(nxt_task_t *task, nxt_listen_event_t *lev,
 {
     nxt_event_engine_t  *engine;
 
-    nxt_debug(task, "listen event count: %D", lev->count);
+    nxt_debug(task, "listen event count: %D draining:%d",
+              lev->count, lev->draining);
 
     engine = task->thread->engine;
 
@@ -4008,6 +4112,22 @@ nxt_router_listen_event_release(nxt_task_t *task, nxt_listen_event_t *lev,
         }
 
         nxt_free(lev);
+
+    } else if (lev->draining && lev->count == 1) {
+        /*
+         * Phase 1 of the two-phase close marked this listener as
+         * draining and deferred FD release because in-flight accepted
+         * connections still held refs.  The last such ref has just
+         * been dropped, so finalise the close now.  finish() drops
+         * the listener's own ref (count: 1 -> 0) and frees lev via
+         * the nxt_router_listen_event_release() call at its tail.
+         */
+        if (joint != NULL) {
+            nxt_router_conf_release(task, joint);
+            joint = NULL;
+        }
+
+        nxt_router_listen_socket_close_finish(task, lev);
     }
 
     if (joint != NULL) {
@@ -5895,9 +6015,9 @@ nxt_router_get_mmap_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         nxt_alert(task, "get_mmap_handler: app == NULL for reply port %PI:%d",
                   port->pid, port->id);
 
-        // FIXME
-        nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
-                              -1, msg->port_msg.stream, 0, NULL);
+        /* Best-effort RPC_ERROR; peer-side RPC timeout is the backstop. */
+        (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
+                                     -1, msg->port_msg.stream, 0, NULL);
 
         return;
     }
@@ -5911,9 +6031,9 @@ nxt_router_get_mmap_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         nxt_alert(task, "get_mmap_handler: mmap id is too big (%d)",
                   (int) get_mmap_msg->id);
 
-        // FIXME
-        nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
-                              -1, msg->port_msg.stream, 0, NULL);
+        /* Best-effort RPC_ERROR; peer-side RPC timeout is the backstop. */
+        (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
+                                     -1, msg->port_msg.stream, 0, NULL);
         return;
     }
 

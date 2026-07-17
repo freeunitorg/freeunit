@@ -489,6 +489,48 @@ nxt_isolation_clone_flags(nxt_task_t *task, nxt_conf_value_t *namespaces,
 
 #if (NXT_HAVE_ISOLATION_ROOTFS)
 
+/*
+ * Return TRUE if the absolute, NUL-free path normalizes to "/" once "." and
+ * ".." components are collapsed (".." clamped at root, like the kernel at
+ * chroot/pivot_root).  Mirrors nxt_conf_validation.c; duplicated rather than
+ * shared so the validator stays the only cross-TU entry point for rootfs
+ * syntax.  Defense in depth: config validation already rejects these.
+ */
+static nxt_bool_t
+nxt_rootfs_resolves_to_root(const u_char *path, size_t length)
+{
+    size_t  i, comp_len, depth;
+
+    depth = 0;
+
+    for (i = 1; i < length; ) {
+
+        comp_len = 0;
+        while (i < length && path[i] != '/') {
+            comp_len++;
+            i++;
+        }
+
+        if (comp_len == 2 && path[i - 2] == '.' && path[i - 1] == '.') {
+            if (depth > 0) {
+                depth--;
+            }
+
+        } else if (comp_len != 0
+                   && !(comp_len == 1 && path[i - 1] == '.'))
+        {
+            depth++;
+        }
+
+        if (i < length) {
+            i++;
+        }
+    }
+
+    return depth == 0;
+}
+
+
 static nxt_int_t
 nxt_isolation_set_rootfs(nxt_task_t *task, nxt_conf_value_t *isolation,
     nxt_process_t *process)
@@ -502,6 +544,10 @@ nxt_isolation_set_rootfs(nxt_task_t *task, nxt_conf_value_t *isolation,
     if (obj != NULL) {
         nxt_conf_get_string(obj, &str);
 
+        while (str.length > 1 && str.start[str.length - 1] == '/') {
+            str.length--;
+        }
+
         if (nxt_slow_path(str.length <= 1 || str.start[0] != '/')) {
             nxt_log(task, NXT_LOG_ERR, "rootfs requires an absolute path other "
                     "than \"/\" but given \"%V\"", &str);
@@ -509,8 +555,18 @@ nxt_isolation_set_rootfs(nxt_task_t *task, nxt_conf_value_t *isolation,
             return NXT_ERROR;
         }
 
-        if (str.start[str.length - 1] == '/') {
-            str.length--;
+        if (nxt_slow_path(memchr(str.start, '\0', str.length) != NULL)) {
+            nxt_log(task, NXT_LOG_ERR, "rootfs contains an embedded NUL but "
+                    "given \"%V\"", &str);
+
+            return NXT_ERROR;
+        }
+
+        if (nxt_slow_path(nxt_rootfs_resolves_to_root(str.start, str.length))) {
+            nxt_log(task, NXT_LOG_ERR, "rootfs resolves to \"/\" but given "
+                    "\"%V\"", &str);
+
+            return NXT_ERROR;
         }
 
         process->isolation.rootfs = nxt_mp_alloc(process->mem_pool,
@@ -757,6 +813,22 @@ nxt_isolation_unmount_all(nxt_task_t *task, nxt_process_t *process)
 
     nxt_debug(task, "unmount all (%s)", process->name);
 
+#if (NXT_HAVE_CLONE_NEWNS)
+    /*
+     * A worker that ran in its own mount namespace had all of its mounts
+     * reaped by the kernel when that namespace died on process exit.
+     * Unmounting the same host paths here is both pointless (the mounts are
+     * not present in the host namespace — this is the EINVAL we used to log)
+     * and unsafe: it races the next worker generation's prototype, which
+     * mounts the identical <rootfs>/proc path (freeunitorg/freeunit#83).
+     * The non-namespaced (chroot) path below still needs the host-side
+     * umount2, so only skip when CLONE_NEWNS was in effect.
+     */
+    if (nxt_is_clone_flag_set(process->isolation.clone.flags, NEWNS)) {
+        return;
+    }
+#endif
+
     automount = &process->isolation.automount;
     mounts = process->isolation.mounts;
     n = mounts->nelts;
@@ -784,6 +856,11 @@ nxt_isolation_prepare_rootfs(nxt_task_t *task, nxt_process_t *process)
     const u_char             *dst;
     nxt_fs_mount_t           *mnt;
     nxt_process_automount_t  *automount;
+#if (NXT_HAVE_OPENAT2)
+    int                      rootfs_fd;
+    const u_char             *rootfs_path;
+    size_t                   rootfs_len;
+#endif
 
     automount = &process->isolation.automount;
     mounts = process->isolation.mounts;
@@ -791,7 +868,59 @@ nxt_isolation_prepare_rootfs(nxt_task_t *task, nxt_process_t *process)
     n = mounts->nelts;
     mnt = mounts->elts;
 
+#if (NXT_HAVE_CLONE_NEWNS)
+    /*
+     * unshare(CLONE_NEWNS) copies the host mount tree *and* its propagation
+     * type.  On a systemd host "/" (and "/tmp", where a rootfs often lives) is
+     * MS_SHARED, so the new namespace starts as a peer of the host and the
+     * mounts below would propagate out to it.  pivot_root() only severs
+     * propagation later (nxt_isolation_pivot_root), so during this loop a
+     * concurrent host-side umount2(<rootfs>/proc) from the previous worker
+     * generation's teardown races our mount of the same path, yielding a
+     * transient "mount(...proc...) ENOENT" and a respawn storm
+     * (freeunitorg/freeunit#83).
+     *
+     * Detach the whole namespace from the host peer group *before* mounting.
+     * MS_PRIVATE (not MS_SLAVE) is required: a slave still receives propagation
+     * from its former master, so a host umount would propagate back in.
+     */
+    if (nxt_is_clone_flag_set(process->isolation.clone.flags, NEWNS)) {
+        if (nxt_slow_path(mount("", "/", "", MS_REC | MS_PRIVATE, "") != 0)) {
+            nxt_alert(task, "mount(\"/\", MS_REC|MS_PRIVATE) %E", nxt_errno);
+            return NXT_ERROR;
+        }
+    }
+#endif
+
+#if (NXT_HAVE_OPENAT2)
+    /*
+     * Mount destinations live under a (possibly user-owned) rootfs.  An
+     * attacker with write access to that tree can race mkdir->mount(2)
+     * by swapping a path component for a symlink pointing outside the
+     * rootfs.  Re-open the rootfs and resolve each destination with
+     * RESOLVE_BENEATH so a tampered destination that escapes the
+     * rootfs fails the open, before we hand a path to mount(2).
+     * RESOLVE_NO_SYMLINKS is intentionally NOT requested: legitimate
+     * rootfs setups commonly contain in-tree symlinks (e.g.
+     * /lib -> /usr/lib) that must still resolve.
+     */
+    rootfs_path = process->isolation.rootfs;
+    rootfs_len = (rootfs_path != NULL) ? nxt_strlen(rootfs_path) : 0;
+
+    rootfs_fd = -1;
+    if (rootfs_len > 0) {
+        rootfs_fd = open((const char *) rootfs_path,
+                         O_PATH | O_DIRECTORY | O_CLOEXEC);
+        if (rootfs_fd == -1) {
+            nxt_alert(task, "open rootfs(%s) %E", rootfs_path, nxt_errno);
+            return NXT_ERROR;
+        }
+    }
+#endif
+
     for (i = 0; i < n; i++) {
+        int  mnt_dst_fd = -1;
+
         dst = mnt[i].dst;
 
         if (mnt[i].deps && !automount->language_deps) {
@@ -811,11 +940,95 @@ nxt_isolation_prepare_rootfs(nxt_task_t *task, nxt_process_t *process)
             goto undo;
         }
 
-        ret = nxt_fs_mount(task, &mnt[i]);
+#if (NXT_HAVE_OPENAT2)
+        /*
+         * Require a path separator right after the rootfs prefix so a
+         * sibling like "<rootfs>-helper" is not treated as living under
+         * "<rootfs>" (which would resolve a bogus relative path and abort
+         * startup with a spurious ENOENT).  dst is always built as
+         * rootfs + a component starting with '/', so this byte is '/' for
+         * every real destination; the preceding length check makes the
+         * index safe to read.
+         */
+        if (rootfs_fd != -1
+            && nxt_strlen(dst) > rootfs_len
+            && memcmp(dst, rootfs_path, rootfs_len) == 0
+            && dst[rootfs_len] == '/')
+        {
+            struct open_how  how;
+            const char      *rel;
+            int              fd;
+
+            rel = (const char *) dst + rootfs_len;
+            while (*rel == '/') {
+                rel++;
+            }
+
+            nxt_memzero(&how, sizeof(how));
+            how.flags = O_PATH | O_CLOEXEC | O_DIRECTORY;
+            how.resolve = RESOLVE_BENEATH;
+
+            fd = syscall(SYS_openat2, rootfs_fd, rel, &how, sizeof(how));
+            if (fd == -1) {
+                if (nxt_errno == ENOSYS) {
+                    /*
+                     * openat2(2) is Linux 5.6+; older kernels return
+                     * ENOSYS even when the userspace headers are
+                     * present.  Skip the symlink-resolution check on
+                     * such kernels rather than failing every isolation
+                     * setup; mount(2) below still operates on the
+                     * caller-supplied path, just without the extra
+                     * RESOLVE_BENEATH guard.  Warn once so operators
+                     * see the reduced security posture.
+                     */
+                    static nxt_bool_t  openat2_warned;
+                    if (!openat2_warned) {
+                        nxt_log(task, NXT_LOG_WARN,
+                                "openat2(SYS_openat2) not supported by the "
+                                "running kernel; rootfs mount destinations "
+                                "are not validated against symlinks");
+                        openat2_warned = 1;
+                    }
+
+                } else {
+                    nxt_alert(task, "mount destination %s escapes rootfs %s "
+                              "or contains symlinks: %E", dst, rootfs_path,
+                              nxt_errno);
+                    ret = NXT_ERROR;
+                    goto undo;
+                }
+
+            } else {
+                /*
+                 * Keep the validated fd open and mount onto it directly
+                 * (via /proc/self/fd/<fd> in nxt_fs_mount) so the mount
+                 * targets the exact inode openat2 resolved, rather than
+                 * re-resolving dst as a path and reopening the check-then-
+                 * use window.  Closed after the mount below.
+                 */
+                mnt_dst_fd = fd;
+            }
+        }
+#endif
+
+        ret = nxt_fs_mount(task, &mnt[i], mnt_dst_fd);
+
+#if (NXT_HAVE_OPENAT2)
+        if (mnt_dst_fd != -1) {
+            close(mnt_dst_fd);
+        }
+#endif
+
         if (nxt_slow_path(ret != NXT_OK)) {
             goto undo;
         }
     }
+
+#if (NXT_HAVE_OPENAT2)
+    if (rootfs_fd != -1) {
+        close(rootfs_fd);
+    }
+#endif
 
     return NXT_OK;
 
@@ -826,6 +1039,12 @@ undo:
     for (i = 0; i < n; i++) {
         nxt_fs_unmount(mnt[i].dst);
     }
+
+#if (NXT_HAVE_OPENAT2)
+    if (rootfs_fd != -1) {
+        close(rootfs_fd);
+    }
+#endif
 
     return NXT_ERROR;
 }

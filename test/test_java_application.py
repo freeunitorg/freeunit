@@ -1032,3 +1032,52 @@ def test_java_application_threads():
         sock.close()
 
     assert len(socks) == len(threads), 'threads differs'
+
+
+def test_java_input_readline_bounds():
+    client.load('input_readline_bounds')
+
+    # The app calls ServletInputStream.readLine(buf, 0, 1000) into an 8-byte
+    # buffer. The native readLine must reject the out-of-bounds (off, len)
+    # (IllegalStateException) instead of writing past the array; the worker
+    # must stay alive to serve the follow-up request.
+    resp = client.post(
+        headers={'Host': 'localhost', 'Connection': 'close'},
+        body='0123456789',
+    )
+    assert resp['status'] == 200, f'status: {resp}'
+    assert resp['body'] == 'rejected', f'bad readLine bounds not rejected: {resp}'
+
+    # Worker survived the guarded call.
+    assert (
+        client.post(
+            headers={'Host': 'localhost', 'Connection': 'close'}, body='x'
+        )['status']
+        == 200
+    ), 'worker survived'
+
+
+def test_java_cstring_nul():
+    # "webapp" (required) and "unit_jars" are consumed as NUL-terminated C
+    # strings; an embedded NUL (survives JSON parsing) or an empty value must
+    # be rejected at validation.  "spare": 0 exercises validation without
+    # spawning (so a non-existent webapp path is not realpath-checked here).
+    def conf_app(extra):
+        base = {
+            "type": client.get_application_type(),
+            "processes": {"spare": 0},
+            "webapp": f'{option.temp_dir}/java',
+        }
+        return client.conf({"app": {**base, **extra}}, 'applications')
+
+    resp = conf_app({"webapp": "/x\0y"})
+    assert 'null character' in resp.get('detail', ''), 'webapp nul'
+
+    resp = conf_app({"webapp": ""})
+    assert 'must not be empty' in resp.get('detail', ''), 'webapp empty'
+
+    resp = conf_app({"unit_jars": "/x\0y"})
+    assert 'null character' in resp.get('detail', ''), 'unit_jars nul'
+
+    resp = conf_app({"unit_jars": ""})
+    assert 'must not be empty' in resp.get('detail', ''), 'unit_jars empty'

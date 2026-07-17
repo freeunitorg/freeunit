@@ -1,0 +1,197 @@
+name: "Build (Fedora/Alpine · GCC/Clang)"
+
+on:
+  workflow_dispatch: # manual only
+#  push:
+#    branches: master
+#    paths:
+#      - configure
+#      - 'auto/**'
+#      - 'src/**'
+#      - 'test/**'
+#      - '.github/workflows/build-distros.yml'
+#  pull_request:
+#    branches: master
+#    paths:
+#      - configure
+#      - 'auto/**'
+#      - 'src/**'
+#      - 'test/**'
+#      - '.github/workflows/build-distros.yml'
+
+jobs:
+
+  fedora-rawhide:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [ 'gcc', 'clang' ]
+
+    container:
+      image: fedora:rawhide
+
+    steps:
+      - name: Install tools/deps
+        run: |
+          dnf -y update
+          dnf -y install --setopt=install_weak_deps=False \
+              which wget git gcc make pcre2-devel openssl-devel \
+              zlib-ng-compat-devel libzstd-devel brotli-devel \
+              python-unversioned-command python3 python3-devel \
+              php-devel php-embedded perl-devel perl-ExtUtils-Embed \
+              ruby-devel java-devel nodejs-devel nodejs-npm golang \
+              cargo rust cmake
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            dnf -y install --setopt=install_weak_deps=False clang
+          fi
+          npm install -g node-gyp
+
+      - uses: actions/checkout@v5
+
+      - name: configure unit CC=${{ matrix.compiler }}
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            ./configure --openssl --otel --zlib --zstd --brotli --tests --cc=clang
+          else
+            ./configure --openssl --otel --zlib --zstd --brotli --tests
+          fi
+
+      - name: make unit
+        run: make -j 4
+
+      - name: configure unit-php
+        run: ./configure php
+
+      - name: make unit-php
+        run: make -j 4 php
+
+      - name: configure unit-python
+        run: ./configure python
+
+      - name: make unit-python
+        run: make -j 4 python
+
+      - name: configure unit-perl
+        run: ./configure perl
+        if: matrix.compiler == 'gcc'
+
+      - name: make unit-perl
+        run: make -j 4 perl
+        if: matrix.compiler == 'gcc'
+
+      - name: configure unit-ruby
+        run: ./configure ruby
+
+      - name: make unit-ruby
+        run: make -j 4 ruby
+
+      - name: configure unit-java
+        run: ./configure java
+
+      - name: make unit-java
+        run: make -j 4 java
+
+      - name: configure unit-nodejs
+        run: ./configure nodejs
+
+      - name: make unit-nodejs
+        run: make node-local-install DESTDIR=node
+
+      - name: configure unit-go
+        run: ./configure go --go-path=
+
+      - name: make unit-go
+        run: make go-install
+
+      # wasmtime version is pinned in pkg/contrib/src/wasmtime/version and
+      # built from a checksum-verified source tarball — same as build-test.
+      # Keeps the wasm runtime in sync with what Unit is actually built against.
+      # Cache the compiled artifacts (keyed by the pinned version + this distro,
+      # so it never mixes with the ubuntu/debian glibc builds) to skip the slow
+      # from-source compile on a hit.
+      - name: Cache wasmtime
+        id: cache-wasmtime
+        uses: actions/cache@v6
+        with:
+          path: pkg/contrib/wasmtime/artifacts
+          key: wasmtime-fedora-rawhide-${{ runner.arch }}-${{ hashFiles('pkg/contrib/src/wasmtime/version') }}
+
+      - name: Build wasmtime (pinned via pkg/contrib)
+        if: steps.cache-wasmtime.outputs.cache-hit != 'true'
+        run: make -C pkg/contrib .wasmtime
+
+      - name: configure unit-wasm
+        run: ./configure wasm --include-path=pkg/contrib/wasmtime/artifacts/include --lib-path=pkg/contrib/wasmtime/artifacts/lib --rpath
+
+      - name: make unit-wasm
+        run: make wasm
+
+  alpine-edge:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [ 'gcc', 'clang' ]
+
+    container:
+      image: alpine:edge
+
+    steps:
+      - name: Install tools/deps
+        run: |
+          apk update && apk upgrade
+          apk add gcc make musl-dev openssl-dev pcre2-dev curl \
+              zlib-dev zstd-dev brotli-dev \
+              php83-dev php83-embed python3-dev perl-dev ruby-dev \
+              openjdk21-jdk cargo rust
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            apk add clang
+          fi
+
+      - uses: actions/checkout@v5
+
+      - name: configure unit CC=${{ matrix.compiler }}
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            ./configure --openssl --otel --zlib --zstd --brotli --tests --cc=clang
+          else
+            ./configure --openssl --otel --zlib --zstd --brotli --tests
+          fi
+
+      - name: make unit
+        run: make -j 4
+
+      - name: configure unit-php
+        run: |
+          ln -s /usr/lib/libphp83.so /usr/lib/libphp.so
+          ./configure php --php-config=/usr/bin/php-config83
+
+      - name: make unit-php
+        run: make -j 4
+
+      - name: configure unit-python
+        run: ./configure python
+
+      - name: make unit-python
+        run: make -j 4
+
+      - name: configure unit-perl
+        run: ./configure perl
+
+      - name: make unit-perl
+        run: make -j 4 perl
+
+      - name: configure unit-ruby
+        run: ./configure ruby
+
+      - name: make unit-ruby
+        run: make -j 4 ruby
+
+      - name: configure unit-java
+        run: ./configure java
+
+      - name: make unit-java
+        run: make -j 4 java

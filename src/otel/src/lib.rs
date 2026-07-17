@@ -1,26 +1,44 @@
 #![allow(non_camel_case_types)]
 
+//! OpenTelemetry trace export for FreeUnit.
+//!
+//! Two OTLP transports, selected at runtime by `settings/telemetry/protocol`:
+//! `"http"` (default) uses the blocking reqwest client and needs no async
+//! executor; `"grpc"` uses tonic over a small multi-thread tokio runtime that
+//! this crate owns (built lazily, dropped on shutdown). Both are driven by the
+//! stable dedicated-thread `BatchSpanProcessor`. v1 is plaintext only — no TLS
+//! to the collector on either transport.
+//!
+//! A finished span is handed to C as a raw `*mut BoxedSpan`. Ending the span
+//! (on drop in `nxt_otel_rs_send_trace`) enqueues it into the batch processor,
+//! which exports it from its own background thread.
+
+use opentelemetry::global;
 use opentelemetry::global::BoxedSpan;
 use opentelemetry::trace::{
-    Span, SpanBuilder, SpanKind, TraceId, Tracer, TracerProvider,
+    Span, SpanContext, SpanId, SpanKind, Status, TraceContextExt, TraceFlags,
+    TraceId, TraceState, Tracer, TracerProvider,
 };
-use opentelemetry::{global, KeyValue};
-use opentelemetry_otlp::Protocol;
-use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::trace::{Config, BatchConfigBuilder, Sampler};
-use opentelemetry_sdk::{runtime, Resource};
+use opentelemetry::{Context, KeyValue};
+use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig};
+use opentelemetry_sdk::trace::{
+    BatchConfigBuilder, BatchSpanProcessor, Sampler, SdkTracerProvider,
+};
+use opentelemetry_sdk::Resource;
 use std::ffi::{c_char, CStr, CString};
-use std::{ptr, time};
-use std::ptr::addr_of;
-use std::slice;
-use std::sync::{Arc, OnceLock};
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::{Receiver, Sender};
+use std::str::FromStr;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::{ptr, slice};
 
 const TRACEPARENT_HEADER_LEN: u8 = 55;
-const TIMEOUT: time::Duration = std::time::Duration::from_secs(10);
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_QUEUE_SIZE: usize = 4096;
+const SERVICE_NAME: &str = "FreeUnit";
+const TRACER_NAME: &str = "FreeUnit";
+const SPAN_NAME: &str = "request";
 
-const NXT_LOG_ERR:    nxt_uint_t = 1;
+const NXT_LOG_ERR: nxt_uint_t = 1;
 
 #[repr(C)]
 pub struct nxt_str_t {
@@ -34,290 +52,324 @@ pub type nxt_uint_t = ::std::os::raw::c_uint;
 #[cfg(not(target_arch = "x86_64"))]
 pub type nxt_uint_t = usize;
 
-// Stored sender channel to send spans or a shutdown message to within the
-// Tokio runtime.
-#[allow(static_mut_refs)]
-unsafe fn nxt_otel_rs_span_tx(destruct: bool) -> *const OnceLock<Sender<SpanMessage>> {
-    static mut SPAN_TX: OnceLock<Sender<SpanMessage>> = OnceLock::new();
-    if destruct {
-        SPAN_TX.take();
+type nxt_otel_log_cb = unsafe extern "C" fn(log_level: nxt_uint_t, msg: *const c_char);
+
+/// The live tracer provider. Held so we can flush and shut it down cleanly on
+/// reconfigure or teardown. `None` means OTel is not currently configured.
+fn provider_slot() -> &'static Mutex<Option<SdkTracerProvider>> {
+    static PROVIDER: Mutex<Option<SdkTracerProvider>> = Mutex::new(None);
+    &PROVIDER
+}
+
+/// The tokio runtime owning the gRPC exporter's tonic channel. The blocking
+/// batch processor drives export RPCs onto it from its own thread, so it must
+/// outlive the provider; it is dropped in `nxt_otel_rs_shutdown_tracer`.
+fn runtime_slot() -> &'static Mutex<Option<tokio::runtime::Runtime>> {
+    static RT: Mutex<Option<tokio::runtime::Runtime>> = Mutex::new(None);
+    &RT
+}
+
+/// Build the OTLP/HTTP exporter: the blocking reqwest client, no async runtime.
+fn build_http_exporter(endpoint: String) -> Result<SpanExporter, String> {
+    SpanExporter::builder()
+        .with_http()
+        .with_endpoint(endpoint)
+        .with_protocol(Protocol::HttpBinary)
+        .with_timeout(EXPORT_TIMEOUT)
+        .build()
+        .map_err(|e| format!("couldn't build otel http exporter: {e}"))
+}
+
+/// Build the OTLP/gRPC exporter (tonic). A small multi-thread tokio runtime is
+/// created and stashed so its reactor stays alive: the tonic channel is built
+/// inside the runtime context, and the batch processor's blocking export later
+/// dispatches RPCs onto it. v1 is plaintext h2c — no TLS to the collector.
+fn build_grpc_exporter(endpoint: String) -> Result<SpanExporter, String> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|e| format!("couldn't build tokio runtime for otel grpc: {e}"))?;
+
+    let exporter = {
+        let _guard = rt.enter();
+        SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .with_timeout(EXPORT_TIMEOUT)
+            .build()
+            .map_err(|e| format!("couldn't build otel grpc exporter: {e}"))?
+    };
+
+    if let Ok(mut slot) = runtime_slot().lock() {
+        *slot = Some(rt);
     }
-
-    addr_of!(SPAN_TX)
+    Ok(exporter)
 }
 
-// Message type to send on the channel. Either a span or a shutdown message for
-// graceful termination of the tokio runtime.
-enum SpanMessage {
-    Span {
-        s: Arc<BoxedSpan>
-    },
-    Shutdown,
+/// Copy a `nxt_str_t` into an owned `String`. The caller guarantees `s.start`
+/// points at `s.length` valid bytes for the duration of the call; we copy
+/// because batch-exported spans outlive the request memory these reference.
+unsafe fn nxt_str_to_string(s: &nxt_str_t) -> String {
+    // `slice::from_raw_parts` requires a non-null, aligned pointer even when
+    // the length is zero. C may hand us a `nxt_str_t` with a NULL `start` for
+    // an empty or uninitialised value, so guard against it to avoid UB.
+    if s.start.is_null() || s.length == 0 {
+        return String::new();
+    }
+    // Header values are arbitrary bytes, not guaranteed UTF-8; `from_utf8_lossy`
+    // replaces any invalid sequence with U+FFFD instead of constructing an
+    // invalid `String` (which `from_utf8_unchecked` would — that is itself UB).
+    String::from_utf8_lossy(slice::from_raw_parts(s.start, s.length)).into_owned()
 }
 
-#[no_mangle]
-unsafe fn nxt_otel_rs_is_init() -> u8 {
-    (*nxt_otel_rs_span_tx(false)).get().map_or(0, |_| 1)
-}
-
-#[no_mangle]
-unsafe fn nxt_otel_rs_uninit() {
-    if nxt_otel_rs_is_init() == 1 {
-        nxt_otel_rs_shutdown_tracer();
-        nxt_otel_rs_span_tx(true);
+/// Log a message through the C callback. `msg` must be a valid C string body.
+unsafe fn log_err(cb: nxt_otel_log_cb, msg: String) {
+    if let Ok(cmsg) = CString::new(msg) {
+        cb(NXT_LOG_ERR, cmsg.as_ptr());
     }
 }
 
-// potentially returns an error message
 #[no_mangle]
-unsafe fn nxt_otel_rs_init(
-    log_callback: unsafe extern "C" fn(log_level: nxt_uint_t, msg: *const c_char),
+pub unsafe extern "C" fn nxt_otel_rs_is_init() -> u8 {
+    provider_slot()
+        .lock()
+        .map(|g| g.is_some() as u8)
+        .unwrap_or(0)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn nxt_otel_rs_uninit() {
+    nxt_otel_rs_shutdown_tracer();
+}
+
+/// Initialise the global tracer provider for OTLP export.
+///
+/// `protocol` selects the transport: `"http"` or `"grpc"`; anything else is
+/// rejected via `log_callback`.
+/// Re-invoking this flushes and replaces any previously configured provider.
+#[no_mangle]
+pub unsafe extern "C" fn nxt_otel_rs_init(
+    log_callback: nxt_otel_log_cb,
     endpoint: *const nxt_str_t,
     protocol: *const nxt_str_t,
     sample_fraction: f64,
-    batch_size: f64
+    batch_size: f64,
 ) {
     if endpoint.is_null() || protocol.is_null() {
-        return
+        return;
     }
 
-    let ep = String::from_utf8_unchecked(
-        slice::from_raw_parts((*endpoint).start, (*endpoint).length).to_vec()
-    ).clone(); // we want our own memory
+    let endpoint = nxt_str_to_string(&*endpoint);
+    let proto = nxt_str_to_string(&*protocol).to_lowercase();
 
-    let proto: Protocol;
-    match String::from_utf8_unchecked(
-        slice::from_raw_parts((*protocol).start, (*protocol).length).to_vec()
-    ).to_lowercase()
-        .as_str() {
-            "http" => proto = Protocol::HttpBinary,
-            "grpc" => proto = Protocol::Grpc,
-            e => {
-                let msg_string = format!("unknown tracer type: {:#?}", e);
-                let msg = CString::from_vec_unchecked(msg_string.as_bytes().to_vec());
-                log_callback(NXT_LOG_ERR, msg.into_raw() as _);
-                return;
-            }
-        }
-
-    // make sure we are starting with a clean state
-    nxt_otel_rs_uninit();
-
-    // Create a new mpsc channel. Tokio runtime gets receiver, the send
-    // trace function gets sender.
-    let (tx, rx): (Sender<SpanMessage>, Receiver<SpanMessage>) = mpsc::channel(32);
-
-    // Store the sender so the other function can also reach it.
-    match (*nxt_otel_rs_span_tx(false)).set(tx) {
-        /* spawn a new thread with the tokio runtime and forget about it.
-         * This function will return that allows the C code to carry on
-         * doing its thing, whereas the runtime function is a long lived
-         * process that only exits when a shutdown message is sent.
-         */
-        Ok(_) => {
-            std::thread::spawn(move || nxt_otel_rs_runtime(
-                ep,
-                proto,
-                batch_size,
-                sample_fraction,
-                rx
-            ));
-        },
-        Err(e) => {
-            let msg_string = format!("couldn't initialize tracer: {:#?}", e);
-            let msg = CString::from_vec_unchecked(msg_string.as_bytes().to_vec());
-            log_callback(NXT_LOG_ERR, msg.into_raw() as _);
-        }
-    }
-}
-
-
-/* function that we wrap around Tokio's runtime code. This is long lived,
- * which means it stops only when a shutdown signal is sent to the rx
- * channel, or we terminate the process and leave memory all over.
- */
-#[tokio::main]
-async unsafe fn nxt_otel_rs_runtime(
-    endpoint: String,
-    proto: Protocol,
-    batch_size: f64,
-    sample_fraction: f64,
-    mut rx: Receiver<SpanMessage>
-) {
-    let pipeline = opentelemetry_otlp::new_pipeline()
-        .tracing()
-        .with_trace_config(
-            Config::default()
-                .with_resource(
-                    Resource::new(vec![KeyValue::new(
-                        opentelemetry_semantic_conventions::resource::SERVICE_NAME,
-                        "NGINX Unit",
-                    )])
-                )
-                .with_sampler(Sampler::TraceIdRatioBased(sample_fraction))
-        )
-        .with_batch_config(
-            BatchConfigBuilder::default()
-                .with_max_export_batch_size(batch_size as _)
-                .with_max_queue_size(4096)
-                .build()
+    if proto != "http" && proto != "grpc" {
+        log_err(
+            log_callback,
+            format!("unsupported otel protocol {proto:?}: expected \"http\" or \"grpc\""),
         );
+        return;
+    }
 
-    let res = match proto {
-        Protocol::HttpBinary | Protocol::HttpJson => pipeline
-            .with_exporter(
-                opentelemetry_otlp::new_exporter()
-                    .http()
-                    .with_http_client(reqwest::Client::new()) // needed because rustls feature
-                    .with_endpoint(endpoint)
-                    .with_protocol(proto)
-                    .with_timeout(TIMEOUT)
-            ).install_batch(runtime::Tokio),
-        Protocol::Grpc => pipeline
-            .with_exporter(
-                opentelemetry_otlp::new_exporter()
-                    .tonic()
-                    .with_endpoint(endpoint)
-                    .with_protocol(proto)
-                    .with_timeout(TIMEOUT)
-            ).install_batch(runtime::Tokio),
-    };
+    // Start from a clean slate: flush and drop any prior provider (and, if the
+    // prior config used grpc, its tokio runtime).
+    nxt_otel_rs_shutdown_tracer();
 
-    match res {
-        Err(e) => {
-            eprintln!("otel tracing error: {}", e);
+    let exporter = match if proto == "grpc" {
+        build_grpc_exporter(endpoint)
+    } else {
+        build_http_exporter(endpoint)
+    } {
+        Ok(e) => e,
+        Err(msg) => {
+            log_err(log_callback, msg);
             return;
         }
-        Ok(t) => {
-            global::set_tracer_provider(t);
-        }
-    }
+    };
 
-    // this is the block that keeps this function running until it gets shut down.
-    // @see https://tokio.rs/tokio/tutorial/channels for the inspiration.
-    while let Some(message) = rx.recv().await {
-        match message {
-            SpanMessage::Shutdown => {
-                eprintln!("it was a shutdown");
-                break;
-            }
-            SpanMessage::Span { s: _s } => {
-                // do nothing, because the point is for this _s var to be dropped
-                // here rather than where it was sent from.
-            }
-        }
+    let processor = BatchSpanProcessor::builder(exporter)
+        .with_batch_config(
+            BatchConfigBuilder::default()
+                .with_max_export_batch_size(batch_size as usize)
+                .with_max_queue_size(MAX_QUEUE_SIZE)
+                .build(),
+        )
+        .build();
+
+    let provider = SdkTracerProvider::builder()
+        .with_span_processor(processor)
+        .with_resource(
+            Resource::builder().with_service_name(SERVICE_NAME).build(),
+        )
+        // ParentBased honours an upstream sampling decision carried in
+        // traceparent; falls back to ratio sampling for new roots.
+        .with_sampler(Sampler::ParentBased(Box::new(
+            Sampler::TraceIdRatioBased(sample_fraction),
+        )))
+        .build();
+
+    global::set_tracer_provider(provider.clone());
+
+    if let Ok(mut slot) = provider_slot().lock() {
+        *slot = Some(provider);
     }
 }
 
 // it's on the caller to pass in a buf of proper length
 #[no_mangle]
-pub unsafe fn nxt_otel_rs_copy_traceparent(buf: *mut i8, span: *const BoxedSpan) {
+pub unsafe extern "C" fn nxt_otel_rs_copy_traceparent(buf: *mut c_char, span: *const BoxedSpan) {
     if buf.is_null() || span.is_null() {
         return;
     }
 
+    let ctx = (*span).span_context();
     let traceparent = format!(
         "00-{:032x}-{:016x}-{:02x}",
-        (*span).span_context().trace_id(), // 16 chars, 32 hex
-        (*span).span_context().span_id(),  // 8 byte, 16 hex
-        (*span).span_context().trace_flags()  // 1 char, 2 hex
+        ctx.trace_id(),    // 16 bytes, 32 hex
+        ctx.span_id(),     // 8 bytes, 16 hex
+        ctx.trace_flags()  // 1 byte, 2 hex
     );
 
-    assert_eq!(traceparent.len(), TRACEPARENT_HEADER_LEN as usize);
+    debug_assert_eq!(traceparent.len(), TRACEPARENT_HEADER_LEN as usize);
 
     ptr::copy_nonoverlapping(
-        traceparent.as_bytes().as_ptr(),
-        buf as _,
-        TRACEPARENT_HEADER_LEN as _,
+        traceparent.as_bytes().as_ptr() as *const c_char,
+        buf,
+        TRACEPARENT_HEADER_LEN as usize,
     );
-    // set null terminator
-    *buf.add(TRACEPARENT_HEADER_LEN as _) = b'\0' as _;
+    // null terminator
+    *buf.add(TRACEPARENT_HEADER_LEN as usize) = 0;
 }
 
 #[no_mangle]
-pub unsafe fn nxt_otel_rs_add_event_to_trace(
+pub unsafe extern "C" fn nxt_otel_rs_add_event_to_trace(
     trace: *mut BoxedSpan,
     key: *const nxt_str_t,
     val: *const nxt_str_t,
 ) {
-    if !key.is_null() && !val.is_null() && !trace.is_null() {
-        /* We need .clone() here because when using the batch exporter, when the
-         * trace gets exported, the request object that these pointers pointed to
-         * no longer exists.
-         */
-        let key = String::from_utf8_unchecked(
-            slice::from_raw_parts((*key).start, (*key).length).to_vec()
-        ).clone();
-        let val = String::from_utf8_unchecked(
-            slice::from_raw_parts((*val).start, (*val).length).to_vec()
-        ).clone();
-
-        (*trace).add_event(
-            String::from("Unit Attribute"),
-            vec![KeyValue::new(key, val)]
-        );
-    }
-}
-
-#[no_mangle]
-pub unsafe fn nxt_otel_rs_get_or_create_trace(trace_id: *mut i8) -> *mut BoxedSpan {
-    let mut trace_key = None;
-    let trace_cstr: &CStr;
-    if !trace_id.is_null() {
-        trace_cstr = CStr::from_ptr(trace_id as _);
-        // We need .into_owned() here as well to avoid referencing a deallocated piece of memory.
-        if let Ok(id) = TraceId::from_hex(&trace_cstr.to_string_lossy().into_owned()) {
-            trace_key = Some(id);
-        }
-    }
-
-    let tracer = global::tracer_provider().tracer("NGINX Unit");
-    let span = tracer.build(SpanBuilder {
-            trace_id: trace_key,
-            span_kind: Some(SpanKind::Server),
-            ..Default::default()
-        });
-
-    Arc::<BoxedSpan>::into_raw(Arc::new(span)) as *mut BoxedSpan
-}
-
-#[no_mangle]
-pub unsafe fn nxt_otel_rs_send_trace(trace: *mut BoxedSpan) {
-    // damage nothing on an improper call
-    if trace.is_null() {
-        eprintln!("trace was null, returning");
+    if trace.is_null() || key.is_null() || val.is_null() {
         return;
     }
 
-    /* memory needs to be accounted for via arc here
-     * see the final return statement from
-     * nxt_otel_get_or_create_trace
-     */
-    let arc_span = Arc::from_raw(trace);
+    let key = nxt_str_to_string(&*key);
+    let val = nxt_str_to_string(&*val);
 
-    /* Instead of dropping the reference at the end of this function
-     * we'll send the entire Arc through the channel to the long
-     * running process that will drop it there. The reason we need to
-     * drop it there, rather than here is because that code block is
-     * within the tokio runtime context with the mpsc channels still
-     * open, whereas if we tried to do it here, it would fail for
-     * a number of different reasons:
-     * - channel closed
-     * - not a tokio runtime
-     * - different tokio runtime
-     */
-    (*nxt_otel_rs_span_tx(false))
-        .get()
-        .and_then(|x| Some(x.try_send(SpanMessage::Span{ s: arc_span })));
+    (*trace).add_event("Unit Attribute".to_string(), vec![KeyValue::new(key, val)]);
 }
 
-/* Function to send a shutdown signal to the tokio runtime.
- * The receive loop will break and exit.
- * It might be better to close the channels here instead.
- */
+/// Set a semantic-convention span attribute (e.g. `http.request.method`).
+/// Unlike `add_event_to_trace`, this records structured span attributes the
+/// collector can index and query, not timestamped events.
 #[no_mangle]
-pub unsafe fn nxt_otel_rs_shutdown_tracer() {
-    (*nxt_otel_rs_span_tx(false))
-        .get()
-        .and_then(|x| Some(x.try_send(SpanMessage::Shutdown)));
+pub unsafe extern "C" fn nxt_otel_rs_add_attr(
+    trace: *mut BoxedSpan,
+    key: *const nxt_str_t,
+    val: *const nxt_str_t,
+) {
+    if trace.is_null() || key.is_null() || val.is_null() {
+        return;
+    }
+
+    let key = nxt_str_to_string(&*key);
+    let val = nxt_str_to_string(&*val);
+
+    (*trace).set_attribute(KeyValue::new(key, val));
+}
+
+/// Mark the span as errored. Called by C for 5xx responses so the trace is
+/// flagged `Status::Error` in the collector, matching nginx-otel/Caddy.
+#[no_mangle]
+pub unsafe extern "C" fn nxt_otel_rs_set_error(trace: *mut BoxedSpan) {
+    if trace.is_null() {
+        return;
+    }
+
+    (*trace).set_status(Status::error(""));
+}
+
+/// Build a parent context from an inherited traceparent, if all parts parse.
+///
+/// In OTel 0.32 the trace id can no longer be forced onto a `SpanBuilder`; a
+/// continued trace must be expressed as a remote parent `SpanContext`. The new
+/// span then inherits the trace id and links to `parent_id`, and `ParentBased`
+/// sampling honours the inherited `trace_flags`.
+unsafe fn nxt_otel_parent_context(
+    trace_id: *const c_char,
+    parent_id: *const c_char,
+    trace_flags: *const c_char,
+    trace_state: *const nxt_str_t,
+) -> Option<Context> {
+    if trace_id.is_null() || parent_id.is_null() {
+        return None;
+    }
+
+    let tid = TraceId::from_hex(&CStr::from_ptr(trace_id).to_string_lossy()).ok()?;
+    let sid = SpanId::from_hex(&CStr::from_ptr(parent_id).to_string_lossy()).ok()?;
+
+    let flags = if trace_flags.is_null() {
+        TraceFlags::SAMPLED
+    } else {
+        u8::from_str_radix(CStr::from_ptr(trace_flags).to_string_lossy().trim(), 16)
+            .map(TraceFlags::new)
+            .unwrap_or(TraceFlags::SAMPLED)
+    };
+
+    // Forward the inherited W3C `tracestate` so vendor context is preserved on
+    // the continued trace; an unparseable or absent value falls back to empty.
+    let state = if trace_state.is_null() {
+        TraceState::default()
+    } else {
+        TraceState::from_str(&nxt_str_to_string(&*trace_state)).unwrap_or_default()
+    };
+
+    let sc = SpanContext::new(tid, sid, flags, true, state);
+    Some(Context::new().with_remote_span_context(sc))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn nxt_otel_rs_get_or_create_trace(
+    trace_id: *const c_char,
+    parent_id: *const c_char,
+    trace_flags: *const c_char,
+    trace_state: *const nxt_str_t,
+) -> *mut BoxedSpan {
+    let tracer = global::tracer_provider().tracer(TRACER_NAME);
+    let builder = tracer.span_builder(SPAN_NAME).with_kind(SpanKind::Server);
+
+    let parent = nxt_otel_parent_context(trace_id, parent_id, trace_flags, trace_state)
+        .unwrap_or_else(Context::new);
+    let span = tracer.build_with_context(builder, &parent);
+
+    Box::into_raw(Box::new(span))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn nxt_otel_rs_send_trace(trace: *mut BoxedSpan) {
+    if trace.is_null() {
+        return;
+    }
+
+    // Reclaim ownership of the span allocated in nxt_otel_rs_get_or_create_trace
+    // and end it. Ending enqueues the span into the batch processor, which
+    // exports it from its own background thread; the Box is then dropped here.
+    let mut span = Box::from_raw(trace);
+    span.end();
+}
+
+/// Flush and tear down the live tracer provider, if any.
+#[no_mangle]
+pub unsafe extern "C" fn nxt_otel_rs_shutdown_tracer() {
+    let provider = provider_slot().lock().ok().and_then(|mut g| g.take());
+    if let Some(provider) = provider {
+        // Flushes pending spans; on a grpc build this still needs the runtime,
+        // so the provider is shut down before the runtime is dropped below.
+        let _ = provider.shutdown();
+    }
+
+    // Drop the gRPC runtime (if the live config used grpc) after the provider
+    // shutdown above has flushed through it.
+    let rt = runtime_slot().lock().ok().and_then(|mut g| g.take());
+    if let Some(rt) = rt {
+        rt.shutdown_background();
+    }
 }

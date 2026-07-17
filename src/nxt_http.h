@@ -210,6 +210,7 @@ struct nxt_http_request_s {
     uint8_t                         logged;       /* 1 bit  */
     uint8_t                         header_sent;  /* 1 bit  */
     uint8_t                         inconsistent; /* 1 bit  */
+    uint8_t                         truncated;    /* 1 bit  */
     uint8_t                         error;        /* 1 bit  */
     uint8_t                         websocket_handshake;  /* 1 bit */
     uint8_t                         chunked;  /* 1 bit */

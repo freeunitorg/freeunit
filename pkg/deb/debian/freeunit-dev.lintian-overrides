@@ -1,0 +1,5 @@
+# libunit-wasm.a is a WebAssembly helper archive from pkg/contrib: its members
+# are wasm objects with no native ELF code sections, so lintian's
+# no-code-sections heuristic misfires. The archive is intentionally shipped for
+# module development. Affected path: usr/lib/<triplet>/libunit-wasm.a
+%%PACKAGE%%-dev: no-code-sections

@@ -14,8 +14,10 @@
 //!
 //! Exit codes:
 //!   0  — all dates match or only grace-period warnings
-//!   1  — one or more errors found (wrong dates, missed EOL)
-//!   2  — network/file error
+//!   1  — one or more errors found (wrong/expired dates, missed EOL, or a
+//!        local failure such as an unreadable/invalid eol.json)
+//!   2  — endoflife.date unreachable (every fetch failed) — neutral network
+//!        outage only; reserved so CI can treat it as non-fatal flake
 
 use std::env;
 use std::fs;
@@ -30,6 +32,7 @@ struct OsEntry {
     category: String, // fedora, debian, etc.
     version: String,
     eol: Option<String>,
+    supported_until: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +119,10 @@ fn parse_eol_json(path: &str) -> Result<(Vec<OsEntry>, Vec<RuntimeEntry>, Config
                         category: category.clone(),
                         version: obj.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                         eol: obj.get("eol").and_then(|v| v.as_str()).map(String::from),
+                        supported_until: obj
+                            .get("supported_until")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
                     });
                 }
             }
@@ -152,7 +159,7 @@ fn parse_eol_json(path: &str) -> Result<(Vec<OsEntry>, Vec<RuntimeEntry>, Config
 
 fn api_category<'a>(category: &'a str) -> Option<&'a str> {
     match category {
-        "jsc" => Some("eclipse-temurin"),
+        "java" => Some("eclipse-temurin"),
         "node" => Some("nodejs"),
         "amazonlinux" => Some("amazon-linux"),
         "centos_stream" => Some("centos-stream"),
@@ -291,7 +298,7 @@ fn detect_new_versions(
     // Must stay in sync with api_category() mapping — if a category is added
     // there, add it here too.
     let scan_cats: &[&str] = &[
-        "go", "jsc", "node", "perl", "php", "python", "ruby",
+        "go", "java", "node", "perl", "php", "python", "ruby",
         "fedora", "debian", "ubuntu", "alpine", "amazonlinux", "rhel", "centos_stream",
     ];
 
@@ -369,7 +376,8 @@ fn now_yyyy_mm() -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| {
             eprintln!("[ ERROR ] failed to determine current date via `date +%Y-%m`");
-            std::process::exit(2);
+            // Local failure, not a network outage: exit 1 (real error), not 2.
+            std::process::exit(1);
         })
 }
 
@@ -661,6 +669,123 @@ fn check_runtime_entries(entries: &[RuntimeEntry], _config: &Config) -> Vec<Mism
 }
 
 // ---------------------------------------------------------------------------
+// Expiry enforcement gate
+// ---------------------------------------------------------------------------
+
+/// Push a `Severity::Error` mismatch when a still-shipped variant has outlived
+/// its FreeUnit support window (`supported_until` strictly in the past).
+///
+/// The grace period is already baked into `supported_until` (`_grace_runtimes`
+/// = 12mo, `_grace_os` = 36mo), so this is a category-agnostic date comparison:
+/// once `supported_until < today` the variant is past EOL + grace and must be
+/// dropped from the matrix. "Past upstream EOL but still within grace" stays a
+/// WARN (handled in check_*_entries) — this gate fires only on a true breach.
+fn push_if_expired(
+    results: &mut Vec<Mismatch>,
+    now: &str,
+    category: &str,
+    version: &str,
+    kind: &str,
+    supported_until: &Option<String>,
+) {
+    if version.is_empty() {
+        return;
+    }
+    // A versioned, shipped entry with no `supported_until` can never be
+    // expiry-checked — that's a data defect, not a pass. Fail the gate.
+    let Some(sup_date) = supported_until else {
+        results.push(Mismatch {
+            category: category.to_string(),
+            version: version.to_string(),
+            kind: kind.to_string(),
+            matrix_date: None,
+            actual_date: Some(now.to_string()),
+            severity: Severity::Error,
+            fetch_error: false,
+            message: format!(
+                "{} {} has no supported_until — cannot enforce EOL + grace policy",
+                category, version
+            ),
+        });
+        return;
+    };
+    if sup_date == "future" {
+        return;
+    }
+    // months_between(now, sup_date) < 0  ⇔  sup_date < now (strictly in the past).
+    let Some(months) = months_between(now, sup_date) else {
+        // Unparseable date on a versioned entry: another data defect the gate
+        // must not skip silently.
+        results.push(Mismatch {
+            category: category.to_string(),
+            version: version.to_string(),
+            kind: kind.to_string(),
+            matrix_date: Some(sup_date.clone()),
+            actual_date: Some(now.to_string()),
+            severity: Severity::Error,
+            fetch_error: false,
+            message: format!(
+                "{} {} has unparseable supported_until {:?} — expected YYYY-MM",
+                category, version, sup_date
+            ),
+        });
+        return;
+    };
+    if months < 0 {
+        results.push(Mismatch {
+            category: category.to_string(),
+            version: version.to_string(),
+            kind: kind.to_string(),
+            matrix_date: Some(sup_date.clone()),
+            actual_date: Some(now.to_string()),
+            severity: Severity::Error,
+            fetch_error: false,
+            message: format!(
+                "{} {} outlived support window (supported_until {} < {}) — drop from matrix",
+                category, version, sup_date, now
+            ),
+        });
+    }
+}
+
+/// Enforcement gate: fail when any shipped runtime or OS variant is past its
+/// `supported_until` date (EOL + grace). Offline — no API fetch required.
+fn check_expired(
+    os_entries: &[OsEntry],
+    runtime_entries: &[RuntimeEntry],
+    _config: &Config,
+) -> Vec<Mismatch> {
+    let mut results = Vec::new();
+    let now = now_yyyy_mm();
+
+    // Distinct kind ("*_expired") so the dedup in main() (keyed on
+    // category+version+kind) never collapses this Error into a same-version
+    // drift WARN from check_*_entries.
+    for e in os_entries {
+        push_if_expired(
+            &mut results,
+            &now,
+            &e.category,
+            &e.version,
+            "os_expired",
+            &e.supported_until,
+        );
+    }
+    for e in runtime_entries {
+        push_if_expired(
+            &mut results,
+            &now,
+            &e.category,
+            &e.version,
+            "runtime_expired",
+            &e.supported_until,
+        );
+    }
+
+    results
+}
+
+// ---------------------------------------------------------------------------
 // Output reporters
 // ---------------------------------------------------------------------------
 
@@ -859,7 +984,10 @@ fn main() {
         Ok(v) => v,
         Err(e) => {
             eprintln!("[ ERROR ] {}", e);
-            process::exit(2);
+            // A broken/unreadable eol.json is a real error (exit 1), NOT the
+            // neutral network outage that exit 2 is reserved for — otherwise a
+            // syntactically broken file would slip the PR gate green.
+            process::exit(1);
         }
     };
 
@@ -904,6 +1032,12 @@ fn main() {
         all_mismatches.extend_from_slice(&check_runtime_entries(&runtime_entries, &config));
     }
 
+    // Enforcement gate: fail on any variant past its supported_until (EOL +
+    // grace). Offline check; honours --os / --runtimes scoping.
+    let expiry_os: &[OsEntry] = if check_os { &os_entries } else { &[] };
+    let expiry_rt: &[RuntimeEntry] = if check_runtimes { &runtime_entries } else { &[] };
+    all_mismatches.extend(check_expired(expiry_os, expiry_rt, &config));
+
     // Deduplicate (same category+version can appear in both)
     all_mismatches.sort_by(|a, b| {
         a.category
@@ -946,5 +1080,73 @@ fn main() {
         if errors > 0 {
             process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_gate(now: &str, sup: Option<&str>, version: &str) -> Vec<Mismatch> {
+        let mut results = Vec::new();
+        push_if_expired(
+            &mut results,
+            now,
+            "debian",
+            version,
+            "os_expired",
+            &sup.map(String::from),
+        );
+        results
+    }
+
+    #[test]
+    fn expired_supported_until_is_hard_error() {
+        let r = run_gate("2026-07", Some("2025-09"), "10");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].severity, Severity::Error);
+        assert_eq!(r[0].kind, "os_expired");
+        assert!(!r[0].fetch_error);
+    }
+
+    #[test]
+    fn expiry_fires_the_month_after_supported_until() {
+        // supported_until == current month -> still supported (not expired) ...
+        assert!(run_gate("2026-07", Some("2026-07"), "12").is_empty());
+        // ... and one month later it is a breach.
+        assert_eq!(run_gate("2026-08", Some("2026-07"), "12").len(), 1);
+    }
+
+    #[test]
+    fn future_supported_until_stays_silent() {
+        // In-grace / future dates are not this gate's business: the grace
+        // window WARN comes from check_*_entries, never an Error from here.
+        assert!(run_gate("2026-07", Some("2029-07"), "12").is_empty());
+        assert!(run_gate("2026-07", Some("future"), "12").is_empty());
+    }
+
+    #[test]
+    fn empty_version_is_skipped() {
+        // A reference/aggregate row with no version is not a shipped variant.
+        assert!(run_gate("2026-07", Some("2020-01"), "").is_empty());
+        assert!(run_gate("2026-07", None, "").is_empty());
+    }
+
+    #[test]
+    fn missing_supported_until_on_versioned_entry_is_error() {
+        // A versioned, shipped entry that can't be expiry-checked is a data
+        // defect the gate must catch, not silently pass.
+        let r = run_gate("2026-07", None, "12");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].severity, Severity::Error);
+        assert!(r[0].message.contains("no supported_until"));
+    }
+
+    #[test]
+    fn unparseable_supported_until_is_error() {
+        let r = run_gate("2026-07", Some("n/a"), "12");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].severity, Severity::Error);
+        assert!(r[0].message.contains("unparseable"));
     }
 }

@@ -4,13 +4,15 @@ use std::fmt::Debug;
 use std::rc::Rc;
 use std::{fmt, io};
 
+use bytes::{Buf, Bytes};
 use custom_error::custom_error;
-use hyper::body::{Buf, HttpBody};
-use hyper::client::{HttpConnector, ResponseFuture};
-use hyper::Error as HyperError;
-use hyper::{http, Body, Client, Request};
-use hyper_rustls::{HttpsConnectorBuilder, HttpsConnector};
-use hyperlocal::{UnixClientExt, UnixConnector};
+use http_body_util::{BodyExt, Full};
+use hyper::{http, Request};
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::{Client, ResponseFuture};
+use hyper_util::rt::TokioExecutor;
+use hyperlocal::UnixConnector;
 use serde::{Deserialize, Serialize};
 
 use crate::control_socket_address::ControlSocket;
@@ -27,9 +29,12 @@ custom_error! {pub UnitClientError
     OpenAPIError { source: OpenAPIError } = "OpenAPI error",
     JsonError { source: serde_json::Error,
                 path: String} = "JSON error [path={path}]",
-    HyperError { source: hyper::Error,
+    HyperError { source: hyper_util::client::legacy::Error,
                  control_socket_address: String,
                  path: String} = "Communications error [control_socket_address={control_socket_address}, path={path}]: {source}",
+    HyperBodyError { source: hyper::Error,
+                     control_socket_address: String,
+                     path: String} = "Body read error [control_socket_address={control_socket_address}, path={path}]: {source}",
     HttpRequestError { source: http::Error,
                        path: String} = "HTTP error [path={path}]",
     HttpResponseError { status: http::StatusCode,
@@ -74,7 +79,7 @@ custom_error! {pub UnitClientError
 }
 
 impl UnitClientError {
-    fn new(error: HyperError, control_socket_address: String, path: String) -> Self {
+    fn new(error: hyper_util::client::legacy::Error, control_socket_address: String, path: String) -> Self {
         if error.is_connect() {
             if let Some(source) = error.source() {
                 if let Some(io_error) = source.downcast_ref::<io::Error>() {
@@ -122,34 +127,24 @@ macro_rules! new_openapi_client {
 }
 
 #[derive(Clone)]
-pub enum RemoteClient<B>
-where
-    B: HttpBody + Send + 'static,
-    B::Data: Send,
-    B::Error: Into<Box<dyn StdError + Send + Sync>>,
-{
+pub enum RemoteClient {
     Unix {
-        client: Client<UnixConnector, B>,
+        client: Client<UnixConnector, Full<Bytes>>,
     },
     Tcp {
-        client: Client<HttpsConnector<HttpConnector>, B>,
+        client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
     },
 }
 
-impl<B> RemoteClient<B>
-where
-    B: HttpBody + Send + 'static,
-    B::Data: Send,
-    B::Error: Into<Box<dyn StdError + Send + Sync>>,
-{
+impl RemoteClient {
     fn client_name(&self) -> &str {
         match self {
-            RemoteClient::Unix { .. } => "Client<UnixConnector, Body>",
-            RemoteClient::Tcp { .. } => "Client<HttpsConnector<HttpConnector>, Body>",
+            RemoteClient::Unix { .. } => "Client<UnixConnector, Full<Bytes>>",
+            RemoteClient::Tcp { .. } => "Client<HttpsConnector<HttpConnector>, Full<Bytes>>",
         }
     }
 
-    pub fn request(&self, req: Request<B>) -> ResponseFuture {
+    pub fn request(&self, req: Request<Full<Bytes>>) -> ResponseFuture {
         match self {
             RemoteClient::Unix { client } => client.request(req),
             RemoteClient::Tcp { client } => client.request(req),
@@ -157,12 +152,7 @@ where
     }
 }
 
-impl<B> Debug for RemoteClient<B>
-where
-    B: HttpBody + Send + 'static,
-    B::Data: Send,
-    B::Error: Into<Box<dyn StdError + Send + Sync>>,
-{
+impl Debug for RemoteClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.client_name())
     }
@@ -172,7 +162,7 @@ where
 pub struct UnitClient {
     pub control_socket: ControlSocket,
     /// Client for communicating with the control API over the UNIX domain socket
-    client: Box<RemoteClient<Body>>,
+    client: Box<RemoteClient>,
 }
 
 impl UnitClient {
@@ -185,14 +175,14 @@ impl UnitClient {
     }
 
     pub fn new_http(control_socket: ControlSocket) -> Self {
-        let remote_client = Client::builder()
-            .build(HttpsConnectorBuilder::default()
-                   .with_native_roots()
-                   .unwrap_or_else(|_| HttpsConnectorBuilder::default()
-                                   .with_webpki_roots())
-                   .https_or_http()
-                   .enable_all_versions()
-                   .wrap_connector(HttpConnector::new()));
+        let connector = HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .unwrap_or_else(|_| HttpsConnectorBuilder::new().with_webpki_roots())
+            .https_or_http()
+            .enable_all_versions()
+            .build();
+        let remote_client: Client<HttpsConnector<HttpConnector>, Full<Bytes>> =
+            Client::builder(TokioExecutor::new()).build(connector);
         Self {
             control_socket,
             client: Box::from(RemoteClient::Tcp { client: remote_client }),
@@ -200,8 +190,8 @@ impl UnitClient {
     }
 
     pub fn new_unix(control_socket: ControlSocket) -> UnitClient {
-        let remote_client = Client::unix();
-
+        let remote_client: Client<UnixConnector, Full<Bytes>> =
+            Client::builder(TokioExecutor::new()).build(UnixConnector);
         Self {
             control_socket,
             client: Box::from(RemoteClient::Unix { client: remote_client }),
@@ -211,27 +201,35 @@ impl UnitClient {
     /// Sends a request to Unit and deserializes the JSON response body into the value of type `RESPONSE`.
     pub async fn send_request_and_deserialize_response<RESPONSE: for<'de> serde::Deserialize<'de>>(
         &self,
-        mut request: Request<Body>,
+        mut request: Request<Full<Bytes>>,
     ) -> Result<RESPONSE, UnitClientError> {
         let uri = request.uri().clone();
         let path: &str = uri.path();
 
         request.headers_mut().insert("User-Agent", USER_AGENT.parse().unwrap());
 
-        let response_future = self.client.request(request);
-
-        let response = response_future
+        let response = self
+            .client
+            .request(request)
             .await
             .map_err(|error| UnitClientError::new(error, self.control_socket.to_string(), path.to_string()))?;
 
         let status = response.status();
-        let body = hyper::body::aggregate(response)
+        let body_bytes = response
+            .into_body()
+            .collect()
             .await
-            .map_err(|error| UnitClientError::new(error, self.control_socket.to_string(), path.to_string()))?;
-        let reader = &mut body.reader();
+            .map_err(|error| UnitClientError::HyperBodyError {
+                source: error,
+                control_socket_address: self.control_socket.to_string(),
+                path: path.to_string(),
+            })?
+            .to_bytes();
+
+        let mut reader = body_bytes.reader();
         if !status.is_success() {
             let error: HashMap<String, String> =
-                serde_json::from_reader(reader).map_err(|error| UnitClientError::JsonError {
+                serde_json::from_reader(&mut reader).map_err(|error| UnitClientError::JsonError {
                     source: error,
                     path: path.to_string(),
                 })?;
@@ -243,7 +241,7 @@ impl UnitClient {
                 detail: error.get("detail").unwrap_or(&"".into()).to_string(),
             });
         }
-        serde_json::from_reader(reader).map_err(|error| UnitClientError::JsonError {
+        serde_json::from_reader(&mut reader).map_err(|error| UnitClientError::JsonError {
             source: error,
             path: path.to_string(),
         })
@@ -255,9 +253,9 @@ impl UnitClient {
 
     pub async fn listeners(&self) -> Result<HashMap<String, ConfigListener>, Box<UnitClientError>> {
         self.listeners_api().get_listeners().await.or_else(|err| {
-            if let OpenAPIError::Hyper(hyper_error) = err {
+            if let OpenAPIError::LegacyClient(client_error) = err {
                 Err(Box::new(UnitClientError::new(
-                    hyper_error,
+                    client_error,
                     self.control_socket.to_string(),
                     "/listeners".to_string(),
                 )))
@@ -273,9 +271,9 @@ impl UnitClient {
 
     pub async fn status(&self) -> Result<Status, Box<UnitClientError>> {
         self.status_api().get_status().await.or_else(|err| {
-            if let OpenAPIError::Hyper(hyper_error) = err {
+            if let OpenAPIError::LegacyClient(client_error) = err {
                 Err(Box::new(UnitClientError::new(
-                    hyper_error,
+                    client_error,
                     self.control_socket.to_string(),
                     "/status".to_string(),
                 )))
@@ -291,9 +289,9 @@ impl UnitClient {
 
     pub async fn applications(&self) -> Result<HashMap<String, ConfigApplication>, Box<UnitClientError>> {
         self.applications_api().get_applications().await.or_else(|err| {
-            if let OpenAPIError::Hyper(hyper_error) = err {
+            if let OpenAPIError::LegacyClient(client_error) = err {
                 Err(Box::new(UnitClientError::new(
-                    hyper_error,
+                    client_error,
                     self.control_socket.to_string(),
                     "/applications".to_string(),
                 )))
@@ -313,9 +311,9 @@ impl UnitClient {
             .get_app_restart(name.as_str())
             .await
             .or_else(|err| {
-                if let OpenAPIError::Hyper(hyper_error) = err {
+                if let OpenAPIError::LegacyClient(client_error) = err {
                     Err(Box::new(UnitClientError::new(
-                        hyper_error,
+                        client_error,
                         self.control_socket.to_string(),
                         format!("/control/applications/{}/restart", name),
                     )))

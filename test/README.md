@@ -65,6 +65,43 @@ docker rmi freeunit-test:local
 ./test/run-local.sh python
 ```
 
+### Fast prototyping with the pre-built builder image
+
+`run-local.sh` builds a full test image from scratch (downloads Rust, Go, njs)
+— slow for tight iteration. For prototyping a **proxy / TLS** test (no language
+runtime needed), reuse the pre-built builder image
+`ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1` (Rust + all C build
+deps already baked in) and just mount the working tree. Build + run is ~30 s:
+
+```bash
+docker run --rm --privileged -v "$(pwd):/unit" -w /unit \
+  ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1 bash -c '
+    apt-get update -qq && apt-get install -y -qq python3-pytest python3-openssl
+    ./configure --openssl --tests
+    make -j"$(nproc)" unitd
+    cargo build --release --manifest-path test/fake_upstream/Cargo.toml
+    cp test/fake_upstream/target/release/fake_upstream /usr/local/bin/
+    pytest-3 --print-log test/test_proxy_chunked.py -q
+  '
+```
+
+Iterate by editing tests on the host (tree is mounted) and re-running; the C
+core and `fake_upstream` rebuild incrementally.
+
+**Caveats:**
+
+- **No language module is built**, so a test gated on one is skipped. A test
+  file with `prerequisites = {'modules': {'python': 'any'}}` (and a
+  `ApplicationPython()` client) skips entirely here. For proxy/TLS-only cases,
+  base the test on `ApplicationProto` (plain) or `ApplicationTLS` (TLS) and
+  omit the language `prerequisites` so it runs on the minimal `--openssl
+  --tests` build.
+- The build writes `build/` into the mounted tree as **root**. Run
+  `sudo rm -rf build` on the host afterwards, or use `run-local.sh` (copies to
+  a tmp dir) when you want isolation.
+- This path is for prototyping only. Before pushing, validate with
+  `./test/run-local.sh` (full matrix) and, for C changes, the clang-ast check.
+
 ### Running Tests Directly on Host
 
 If you prefer to run tests natively (requires all dependencies installed):
@@ -100,10 +137,40 @@ sudo pytest-3 --print-log --restart test/
 
 # 7. Save logs after execution
 sudo pytest-3 --print-log --save-log test/
-
-# 8. Run clang-ast AST analysis (C-code quality check)
-./test/run-local.sh --clang-ast
 ```
+
+(clang-ast static analysis is Docker-only — see the section below.)
+
+## Static analysis (clang-ast)
+
+`./test/run-local-full.sh` runs the C build under the
+`freeunitorg/clang-ast` LLVM plugin inside Docker — catches API-misuse /
+lifetime / allocator violations the normal compile misses. Run it before
+every commit and PR.
+
+```bash
+./test/run-local-full.sh        # build + clang-ast check
+./test/run-local-full.sh -n     # dry-run (print, don't execute)
+```
+
+Scope: **C core + otel** (configure is `--otel --openssl --debug`), so
+`nxt_otel.c` and the otel validators in `nxt_conf_validation.c` are
+analyzed. The Rust otel library is built by cargo for linking but is not
+seen by the plugin. Other module C (njs, brotli, zlib, zstd) is NOT
+analyzed.
+
+**Prebuilt image.** The script pulls
+`ghcr.io/freeunitorg/freeunit-clang-ast:trixie` (clang-ast plugin +
+rustc/cargo baked in) to skip the slow one-time apt+rust install. The
+package is **private** — `docker login ghcr.io` first:
+
+```bash
+gh auth token | docker login ghcr.io -u <user> --password-stdin
+```
+
+If the pull is denied (no auth / package private), the script falls back
+to building the image locally. To force a rebuild:
+`docker rmi freeunit-test-full:local`.
 
 ## Test Structure
 
@@ -136,5 +203,5 @@ test/
 ## CI
 
 All tests run on GitHub Actions for every PR and push to `master`. See
-`.github/workflows/ci.yml` for the full matrix (PHP 8.2–8.5, Python 3.11–3.12,
-Go 1.21–1.22, Node.js 20–21, Java 17/18/21, Ruby 3.3/3.4, WASM, WASI).
+`.github/workflows/build-test.yml` for the full matrix (PHP 8.3–8.5, Python 3.12–3.14,
+Go 1.25–1.26, Node.js 20/22/24/26, Java 17/21, Ruby 3.3/3.4/4.0, WASM, WASI).

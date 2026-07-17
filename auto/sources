@@ -172,11 +172,19 @@ NXT_TEST_SRCS=" \
     src/test/nxt_http_parse_test.c \
     src/test/nxt_strverscmp_test.c \
     src/test/nxt_base64_test.c \
+    src/test/nxt_string_test.c \
+    src/test/nxt_http_chunk_parse_test.c \
+    src/test/nxt_conf_parse_test.c \
+    src/test/nxt_port_fail_test.c \
 "
 
 
 if [ $NXT_HAVE_CLONE_NEWUSER = YES ]; then
     NXT_TEST_SRCS="$NXT_TEST_SRCS src/test/nxt_clone_test.c"
+fi
+
+if [ "$NXT_HAVE_CGROUP" = "YES" ]; then
+    NXT_TEST_SRCS="$NXT_TEST_SRCS src/test/nxt_cgroup_test.c"
 fi
 
 

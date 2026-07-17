@@ -1,8 +1,8 @@
 # FreeUnit — Community LTS fork of Unit
 
 [![Project Status: Active – The project has reached a stable, usable state and is being actively developed.](https://www.repostatus.org/badges/latest/active.svg)](https://www.repostatus.org/#active)
-[![CI](https://github.com/freeunitorg/freeunit/actions/workflows/ci.yml/badge.svg)](https://github.com/freeunitorg/freeunit/actions/workflows/ci.yml "GitHub workflow CI")
-[![Docker](https://github.com/freeunitorg/freeunit/actions/workflows/docker.yml/badge.svg)](https://github.com/freeunitorg/freeunit/actions/workflows/docker.yml "Docker build")
+[![Build & Test](https://github.com/freeunitorg/freeunit/actions/workflows/build-test.yml/badge.svg)](https://github.com/freeunitorg/freeunit/actions/workflows/build-test.yml "Build & Test")
+[![Docker](https://github.com/freeunitorg/freeunit/actions/workflows/release-docker.yml/badge.svg)](https://github.com/freeunitorg/freeunit/actions/workflows/release-docker.yml "Release (Docker Images)")
 [![GitHub Discussions](https://img.shields.io/badge/GitHub-discussions-009639)](https://github.com/freeunitorg/freeunit/discussions "GitHub Discussions")
 
 **Free as in freedom.**
@@ -53,23 +53,25 @@ and are available for `linux/amd64` and `linux/arm64`.
 | Variant | Image |
 |---------|-------|
 | minimal | `ghcr.io/freeunitorg/freeunit:latest-minimal` |
-| PHP 8.5 | `ghcr.io/freeunitorg/freeunit:latest-php8.5` |
-| PHP 8.4 | `ghcr.io/freeunitorg/freeunit:latest-php8.4` |
-| PHP 8.3 | `ghcr.io/freeunitorg/freeunit:latest-php8.3` |
-| Python 3.14 | `ghcr.io/freeunitorg/freeunit:latest-python3.14` |
-| Python 3.13 | `ghcr.io/freeunitorg/freeunit:latest-python3.13` |
-| Python 3.12 | `ghcr.io/freeunitorg/freeunit:latest-python3.12` |
-| Node.js 24 | `ghcr.io/freeunitorg/freeunit:latest-node24` |
-| Node.js 22 | `ghcr.io/freeunitorg/freeunit:latest-node22` |
-| Node.js 20 | `ghcr.io/freeunitorg/freeunit:latest-node20` |
-| Go 1.26 | `ghcr.io/freeunitorg/freeunit:latest-go1.26` |
-| Go 1.25 | `ghcr.io/freeunitorg/freeunit:latest-go1.25` |
-| Ruby 3.4 | `ghcr.io/freeunitorg/freeunit:latest-ruby3.4` |
+| PHP 8.5 | `ghcr.io/freeunitorg/freeunit:latest-php-8.5` |
+| PHP 8.4 | `ghcr.io/freeunitorg/freeunit:latest-php-8.4` |
+| PHP 8.3 | `ghcr.io/freeunitorg/freeunit:latest-php-8.3` |
+| Python 3.14 | `ghcr.io/freeunitorg/freeunit:latest-python-3.14` |
+| Python 3.13 | `ghcr.io/freeunitorg/freeunit:latest-python-3.13` |
+| Python 3.12 | `ghcr.io/freeunitorg/freeunit:latest-python-3.12` |
+| Node.js 26 | `ghcr.io/freeunitorg/freeunit:latest-node-26` |
+| Node.js 24 | `ghcr.io/freeunitorg/freeunit:latest-node-24` |
+| Node.js 22 | `ghcr.io/freeunitorg/freeunit:latest-node-22` |
+| Node.js 20 | `ghcr.io/freeunitorg/freeunit:latest-node-20` |
+| Go 1.26 | `ghcr.io/freeunitorg/freeunit:latest-go-1.26` |
+| Go 1.25 | `ghcr.io/freeunitorg/freeunit:latest-go-1.25` |
+| Ruby 4.0 | `ghcr.io/freeunitorg/freeunit:latest-ruby-4.0` |
+| Ruby 3.4 | `ghcr.io/freeunitorg/freeunit:latest-ruby-3.4` |
 | WebAssembly | `ghcr.io/freeunitorg/freeunit:latest-wasm` |
 
-Full list of variants (including `python3.14`, `perl5.40`, `ruby3.3`, slim
+Full list of variants (including `python-3.14`, `perl-5.40`, `ruby-3.3`, slim
 Python variants, etc.) is in the
-[docker workflow](.github/workflows/docker.yml).
+[docker workflow](.github/workflows/release-docker.yml).
 
 ```console
 $ docker pull ghcr.io/freeunitorg/freeunit:latest-minimal
@@ -132,8 +134,8 @@ Hello, PHP on FreeUnit!
 FreeUnit provides first-class PHP 8.4 and PHP 8.5 support — the primary motivation for this fork.
 
 ```console
-$ docker pull ghcr.io/freeunitorg/freeunit:latest-php8.5
-$ docker pull ghcr.io/freeunitorg/freeunit:latest-php8.4
+$ docker pull ghcr.io/freeunitorg/freeunit:latest-php-8.5
+$ docker pull ghcr.io/freeunitorg/freeunit:latest-php-8.4
 ```
 
 ## OpenTelemetry

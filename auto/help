@@ -56,7 +56,8 @@ cat << END
 
   --njs                enable njs library usage
 
-  --otel               enable otel library usage
+  --otel               enable otel library usage (OTLP/HTTP + OTLP/gRPC;
+                       transport is chosen by settings/telemetry/protocol)
 
   --debug              enable debug logging
 

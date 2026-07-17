@@ -27,6 +27,35 @@ $ make
 4. Test your changes
 5. Submit a pull request against `master`
 
+## Labels
+
+Every issue and PR must carry labels so triage and release notes stay
+accurate. Maintainers (or the contributor, if able) apply at least:
+
+- **One type** — `z-bug 🐞`, `z-enhancement ⬆️`, `z-question`, or the
+  upstream `T-Defect` / `T-Enhancement` / `T-Other`.
+- **One area** — the language module (`z-php`, `z-python`, `z-rust`, …)
+  or `z-c` for core C, `z-infrastructure`, `z-packages`, `z-toolchain`.
+- **Severity, when it applies** — `z-crasher` for a segfault/abort,
+  `X-Release-Blocker` for anything that must ship in the next release.
+
+Run `gh label list` to see the full set. To apply labels to a PR:
+
+```console
+$ gh pr edit <num> --add-label "z-bug 🐞" --add-label "z-c"
+```
+
+If `gh pr edit` fails with a Projects-classic deprecation error, use
+the REST API instead:
+
+```console
+$ gh api repos/freeunitorg/freeunit/issues/<num>/labels -X POST \
+      -f "labels[]=z-bug 🐞" -f "labels[]=z-c"
+```
+
+PR titles must follow Conventional Commits (see below), not the branch
+name — rename a `feature/foo` PR to `feat(scope): …` before merge.
+
 ## Code Style
 
 Follow the existing C code style in the project.

@@ -103,6 +103,23 @@ typedef struct {
 static nxt_int_t nxt_conf_path_next_token(nxt_conf_path_parse_t *parse,
     nxt_str_t *token);
 
+/*
+ * Hard caps on JSON inputs to the controller.  Both values are
+ * intentionally well above any legitimate Unit config (configs rarely
+ * nest more than 6 levels; the largest production configs we've seen
+ * have a few thousand elements per array).  These exist to bound the
+ * controller's stack and heap usage on malformed input.
+ */
+#define NXT_CONF_JSON_MAX_DEPTH     100
+#define NXT_CONF_JSON_MAX_ELEMENTS  100000
+
+/*
+ * Recursion-depth counter.  The controller is single-threaded so a
+ * file-static suffices.  Reset on every entry to nxt_conf_json_parse()
+ * so a stale value from an aborted prior call cannot leak.
+ */
+static nxt_uint_t  nxt_conf_json_parse_depth;
+
 static u_char *nxt_conf_json_skip_space(u_char *start, const u_char *end);
 static u_char *nxt_conf_json_parse_value(nxt_mp_t *mp, nxt_conf_value_t *value,
     u_char *start, u_char *end, nxt_conf_json_error_t *error);
@@ -1277,6 +1294,8 @@ nxt_conf_json_parse(nxt_mp_t *mp, u_char *start, u_char *end,
         return NULL;
     }
 
+    nxt_conf_json_parse_depth = 0;
+
     p = nxt_conf_json_parse_value(mp, value, p, end, error);
 
     if (nxt_slow_path(p == NULL)) {
@@ -1393,10 +1412,34 @@ nxt_conf_json_parse_value(nxt_mp_t *mp, nxt_conf_value_t *value, u_char *start,
 
     switch (ch) {
     case '{':
-        return nxt_conf_json_parse_object(mp, value, start, end, error);
+        /*
+         * Bound recursion depth so a deeply-nested payload such as
+         * "[[[[...]]]]" cannot blow the controller's stack.  Only
+         * '{' and '[' deepen the recursion; leaf cases below don't
+         * need to touch the counter.
+         */
+        if (nxt_slow_path(nxt_conf_json_parse_depth
+                          >= NXT_CONF_JSON_MAX_DEPTH)) {
+            nxt_conf_json_parse_error(error, start,
+                "JSON nesting exceeds the maximum supported depth.");
+            return NULL;
+        }
+        nxt_conf_json_parse_depth++;
+        p = nxt_conf_json_parse_object(mp, value, start, end, error);
+        nxt_conf_json_parse_depth--;
+        return p;
 
     case '[':
-        return nxt_conf_json_parse_array(mp, value, start, end, error);
+        if (nxt_slow_path(nxt_conf_json_parse_depth
+                          >= NXT_CONF_JSON_MAX_DEPTH)) {
+            nxt_conf_json_parse_error(error, start,
+                "JSON nesting exceeds the maximum supported depth.");
+            return NULL;
+        }
+        nxt_conf_json_parse_depth++;
+        p = nxt_conf_json_parse_array(mp, value, start, end, error);
+        nxt_conf_json_parse_depth--;
+        return p;
 
     case '"':
         return nxt_conf_json_parse_string(mp, value, start, end, error);
@@ -1544,6 +1587,12 @@ nxt_conf_json_parse_object(nxt_mp_t *mp, nxt_conf_value_t *value, u_char *start,
         }
 
         name = p;
+
+        if (nxt_slow_path(count >= NXT_CONF_JSON_MAX_ELEMENTS)) {
+            nxt_conf_json_parse_error(error, p,
+                "JSON object has too many members.");
+            goto error;
+        }
 
         count++;
 
@@ -1759,6 +1808,12 @@ nxt_conf_json_parse_array(nxt_mp_t *mp, nxt_conf_value_t *value, u_char *start,
 
         if (*p == ']') {
             break;
+        }
+
+        if (nxt_slow_path(count >= NXT_CONF_JSON_MAX_ELEMENTS)) {
+            nxt_conf_json_parse_error(error, p,
+                "JSON array has too many elements.");
+            goto error;
         }
 
         count++;

@@ -493,6 +493,13 @@ nxt_http_route_match_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     }
 
     if (mtcf.host != NULL) {
+        /*
+         * Host matching is intentionally always case-insensitive
+         * (LOWCASE).  Per RFC 9110 §4.2.3 the host component is
+         * case-insensitive, and there is no per-rule sensitivity
+         * flag — an admin expecting case-sensitive host filtering
+         * will not get it from this rule.
+         */
         rule = nxt_http_route_rule_create(task, mp, mtcf.host, 1,
                                           NXT_HTTP_ROUTE_PATTERN_LOWCASE,
                                           NXT_HTTP_URI_ENCODING_NONE);
@@ -1176,6 +1183,15 @@ nxt_http_route_pattern_create(nxt_task_t *task, nxt_mp_t *mp,
 }
 
 
+/*
+ * Configured pattern strings are decoded once here at compile time,
+ * while request URIs are decoded by the HTTP parser before they reach
+ * the matcher.  Both paths funnel through the same nxt_decode_uri /
+ * nxt_decode_uri_plus helpers; %XX semantics are symmetric, so a
+ * "%2e%2e" in the configured pattern will compare against the same
+ * bytes a request "%2e%2e" decoded into.  If either helper's behaviour
+ * changes, route patterns and request URIs MUST be updated in lock-step.
+ */
 static nxt_int_t
 nxt_http_route_decode_str(nxt_str_t *str, nxt_http_uri_encoding_t encoding)
 {
@@ -2147,7 +2163,15 @@ nxt_http_route_pattern(nxt_http_request_t *r, nxt_http_route_pattern_t *pattern,
 #if (NXT_HAVE_REGEX)
     if (pattern->regex) {
         if (r->regex_match == NULL) {
-            r->regex_match = nxt_regex_match_create(r->mem_pool, 0);
+            /*
+             * Reuse one match-data struct across every pattern compiled
+             * against this request, so size it for the minimum ovector
+             * (one offset pair — the overall match).  Captures are not
+             * consulted by the matcher.  Passing 0 to PCRE2's
+             * pcre2_match_data_create() is undefined per the public
+             * docs; 1 is the documented minimum.
+             */
+            r->regex_match = nxt_regex_match_create(r->mem_pool, 1);
             if (nxt_slow_path(r->regex_match == NULL)) {
                 return NXT_ERROR;
             }

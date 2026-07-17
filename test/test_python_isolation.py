@@ -225,3 +225,92 @@ def test_python_isolation_cgroup_invalid(require):
     check_invalid('')
     check_invalid('../scope')
     check_invalid('scope/../python')
+    check_invalid('scope\0python')
+
+
+def test_python_isolation_rootfs_invalid():
+    def check_invalid(rootfs):
+        script_path = f'{option.test_dir}/python/empty'
+        assert 'error' in client.conf(
+            {
+                "listeners": {"*:8080": {"pass": "applications/empty"}},
+                "applications": {
+                    "empty": {
+                        "type": "python",
+                        "processes": {"spare": 0},
+                        "path": script_path,
+                        "working_directory": script_path,
+                        "module": "wsgi",
+                        "isolation": {
+                            'rootfs': rootfs,
+                        },
+                    }
+                },
+            }
+        )
+
+    # empty / not absolute / slash-only (resolves to "/")
+    check_invalid('')
+    check_invalid('app/rootfs')
+    check_invalid('/')
+    check_invalid('//')
+    check_invalid('///')
+
+    # "." components only -> still "/"
+    check_invalid('/.')
+    check_invalid('/./')
+    check_invalid('/./.')
+    check_invalid('/././.')
+
+    # ".." that collapses back to root
+    check_invalid('/..')
+    check_invalid('/../')
+    check_invalid('/../..')
+    check_invalid('/foo/..')
+    check_invalid('/foo/bar/../..')
+    check_invalid('/./foo/..')
+    check_invalid('/foo/./..')
+    check_invalid('/foo/../bar/..')
+    check_invalid('/foo/../../bar/..')
+
+    # embedded NUL would truncate the path at config time
+    check_invalid('/app/rootfs\0/injected')
+
+
+def test_python_isolation_rootfs_dotdot_valid(is_su, require, temp_dir):
+    """A rootfs that lexically contains "."/".." but resolves to a real,
+    non-root directory must be accepted (regression guard against the
+    resolves-to-root normalizer over-rejecting legitimate paths).
+    """
+    isolation = {'rootfs': f'{temp_dir}/sub/..'}
+
+    (Path(temp_dir) / 'sub').mkdir()
+
+    if not is_su:
+        require(
+            {
+                'features': {
+                    'isolation': [
+                        'unprivileged_userns_clone',
+                        'user',
+                        'mnt',
+                        'pid',
+                    ]
+                }
+            }
+        )
+
+        isolation['namespaces'] = {
+            'mount': True,
+            'credential': True,
+            'pid': True,
+        }
+
+    client.load('ns_inspect', isolation=isolation)
+
+    # The host path of temp_dir is outside the chroot (which resolves to
+    # temp_dir via ".."), so it must not be visible inside -- proves the
+    # ".." rootfs was accepted and confinement actually happened.
+    assert not (
+        client.getjson(url=f'/?path={temp_dir}')['body']['FileExists']
+    ), 'rootfs with ".." is confined'
