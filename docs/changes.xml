@@ -97,6 +97,25 @@ with ENAMETOOLONG when "/cgroup.procs" plus the trailing NUL cannot fit.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+fail cgroup setup when the per-process pool allocation that caches the
+created directory for cleanup fails; the directory is removed and setup
+errors out instead of moving the process into a cgroup that could never be
+cleaned up -- a cgroup directory leak under memory pressure.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+keep downstream keepalive disabled after a duplicate or invalid upstream
+"Content-Length"; a clean upstream close no longer re-enables it, so an
+HTTP/1.1 client cannot reuse the connection past the re-framed response. The
+complete body still ends with its terminal chunk -- body truncation is now
+tracked separately from the inconsistent flag.
+</para>
+</change>
+
 <change type="change">
 <para>
 upgrade contrib njs to 1.0.0.

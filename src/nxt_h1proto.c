@@ -1642,7 +1642,7 @@ nxt_h1p_chunk_create(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
     for (b = out; b != NULL; b = b->next) {
 
         if (nxt_buf_is_last(b)) {
-            if (r->inconsistent) {
+            if (r->truncated) {
                 /*
                  * The response is truncated -- the upstream closed before the
                  * body framing completed (premature chunked EOF, or a
@@ -1651,6 +1651,11 @@ nxt_h1p_chunk_create(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
                  * so the connection closes after this buffer and the client
                  * detects the truncation via the missing terminator, rather
                  * than seeing a falsely complete response.  #72
+                 *
+                 * Keyed on "truncated" not "inconsistent": a complete body
+                 * flagged inconsistent for another reason (e.g. a duplicate
+                 * upstream Content-Length) must keep its terminal chunk while
+                 * still disabling keepalive.
                  */
                 break;
             }
@@ -3052,16 +3057,28 @@ nxt_h1p_peer_closed(nxt_task_t *task, void *obj, void *data)
          * if its framing never completed: a Content-Length response short of
          * its declared length (remainder != 0), or a chunked response that
          * never reached the terminal 0\r\n\r\n (!chunked_parse.last).  Mark it
-         * inconsistent so keepalive is disabled and the client connection is
-         * closed once the partial body has been relayed.  The missing
-         * terminator then lets the client detect the truncation instead of it
-         * being masked as a clean end of response.  Relaying the partial body
-         * and closing -- rather than calling error_handler -- avoids racing a
-         * connection reset against the already-buffered status line and body
-         * (which could otherwise leave the client with an empty response). #72
+         * "truncated" so nxt_h1p_chunk_create() drops the terminal chunk and
+         * the client detects the cut instead of it being masked as a clean end
+         * of response, and "inconsistent" so keepalive is disabled and the
+         * client connection is closed once the partial body has been relayed.
+         * Relaying the partial body and closing -- rather than calling
+         * error_handler -- avoids racing a connection reset against the
+         * already-buffered status line and body (which could otherwise leave
+         * the client with an empty response). #72
+         *
+         * Set rather than assign: an earlier stage may already have marked the
+         * response inconsistent for an unrelated reason whose body is complete
+         * (e.g. an invalid or duplicate upstream Content-Length in
+         * nxt_http_proxy_content_length()).  A clean close there must keep
+         * keepalive disabled without falsely truncating the framing, so only a
+         * genuine short body sets "truncated", and neither flag is ever cleared.
          */
-        r->inconsistent = (h1p->remainder != 0)
-                          || (h1p->chunked && !h1p->chunked_parse.last);
+        if ((h1p->remainder != 0)
+            || (h1p->chunked && !h1p->chunked_parse.last))
+        {
+            r->truncated = 1;
+            r->inconsistent = 1;
+        }
 
         r->state->ready_handler(task, r, peer);
 

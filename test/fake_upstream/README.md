@@ -76,6 +76,7 @@ single `grep` finds every side of a case. E.g. token `chunked_response`:
 
 | Port | Token | Mode (CLI) | Rust handler | pytest |
 |------|-------|-----------|--------------|--------|
+| 7979 | `dup_cl` | `dup-cl` | `respond_dup_cl` | `test_proxy_dup_cl_keepalive_disabled` (duplicate upstream Content-Length disables downstream keepalive for a keep-alive client; complete body keeps its terminal chunk) — out of the 7983–7999 block below, which is exhausted; 7980–7982 are `fake_otlp`, so 7974–7979 is the free gap |
 | 7983 | `dup_cl` | `dup-cl` | `respond_dup_cl` | `test_proxy_dup_cl_raw` (zero raw `Content-Length` occurrences on the wire, complete re-framed chunked body) |
 | 7984 | `dup_cl` | `dup-cl` | `respond_dup_cl` | `test_proxy_dup_cl` (duplicate upstream Content-Length → neither forwarded, body re-framed, #113) |
 | 7985 | `chunked_ext` | `chunked-ext` | `respond_chunked_edge` | `test_proxy_chunked_ext` (chunk-extensions stripped, body intact) |
@@ -92,6 +93,10 @@ single `grep` finds every side of a case. E.g. token `chunked_response`:
 | 7996 | `abort_mid` | `abort-mid` | `respond_abort_mid` | `test_proxy_chunked_response_abort_mid` (#72 case 4) |
 | 7997 | `slow_drip` | `slow-drip` | `respond_slow_drip` | `test_proxy_chunked_response_slow_drip` (#72 case 5) |
 | 7998 | `dup_te` | `dup-te` | `respond_dup_te` | `test_proxy_chunked_response_dup_te` (#72 case 6, nginx/unit#1088) |
+
+> **7999 is not available here.** `test/test_proxy.py` and `test/test_proxy_chunked.py`
+> already bind `SERVER_PORT = 7999` for their own upstream, so this registry ends at
+> 7998. New `fake_upstream` slots go to the 7974–7979 gap (7980–7982 are `fake_otlp`).
 
 A test pins its port as a module constant referencing this table:
 
