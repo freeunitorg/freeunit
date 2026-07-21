@@ -29,19 +29,60 @@ typedef struct {
 } nxt_http_static_conf_t;
 
 
-typedef struct {
-    nxt_http_action_t           *action;
-    nxt_str_t                   share;
-#if (NXT_HAVE_OPENAT2)
-    nxt_str_t                   chroot;
-#endif
-    uint32_t                    share_idx;
-    uint8_t                     need_body;  /* 1 bit */
-} nxt_http_static_ctx_t;
-
-
 #define NXT_HTTP_STATIC_BUF_COUNT  2
 #define NXT_HTTP_STATIC_BUF_SIZE   (128 * 1024)
+
+#define NXT_HTTP_STATIC_BUF_FREELIST_MAX  32
+
+static nxt_thread_declare_data(nxt_buf_t *, nxt_http_static_buf_freelist);
+static nxt_thread_declare_data(nxt_uint_t, nxt_http_static_buf_freelist_count);
+
+
+nxt_inline nxt_buf_t *
+nxt_http_static_buf_alloc(nxt_task_t *task, nxt_mp_t *mp)
+{
+    nxt_buf_t   *fb, **fl;
+    nxt_uint_t  *count;
+
+    fl = nxt_thread_get_data(nxt_http_static_buf_freelist);
+    count = nxt_thread_get_data(nxt_http_static_buf_freelist_count);
+
+    if (*fl != NULL) {
+        fb = *fl;
+        *fl = fb->next;
+        (*count)--;
+        nxt_memzero(fb, sizeof(nxt_buf_t));
+        return fb;
+    }
+
+    fb = nxt_malloc(NXT_BUF_FILE_SIZE);
+    if (nxt_fast_path(fb != NULL)) {
+        nxt_memzero(fb, sizeof(nxt_buf_t));
+    }
+
+    return fb;
+}
+
+
+nxt_inline void
+nxt_http_static_buf_free(nxt_buf_t *fb)
+{
+    nxt_buf_t   **fl;
+    nxt_uint_t  *count;
+
+    fl = nxt_thread_get_data(nxt_http_static_buf_freelist);
+    count = nxt_thread_get_data(nxt_http_static_buf_freelist_count);
+
+    if (*count < NXT_HTTP_STATIC_BUF_FREELIST_MAX) {
+        fb->next = *fl;
+        *fl = fb;
+        (*count)++;
+
+    } else {
+        nxt_free(fb);
+    }
+}
+
 
 
 static nxt_http_action_t *nxt_http_static(nxt_task_t *task,
@@ -211,11 +252,8 @@ nxt_http_static(nxt_task_t *task, nxt_http_request_t *r,
         need_body = 1;
     }
 
-    ctx = nxt_mp_zget(r->mem_pool, sizeof(nxt_http_static_ctx_t));
-    if (nxt_slow_path(ctx == NULL)) {
-        nxt_http_request_error(task, r, NXT_HTTP_INTERNAL_SERVER_ERROR);
-        return NULL;
-    }
+    ctx = &r->static_ctx;
+    nxt_memzero(ctx, sizeof(nxt_http_static_ctx_t));
 
     ctx->action = action;
     ctx->need_body = need_body;
@@ -663,7 +701,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
                 r->resp.content_length_n = out_total;
             }
 
-            fb = nxt_mp_zget(r->mem_pool, NXT_BUF_FILE_SIZE);
+            fb = nxt_http_static_buf_alloc(task, r->mem_pool);
             if (nxt_slow_path(fb == NULL)) {
                 goto fail;
             }
@@ -968,6 +1006,8 @@ complete_buf:
         nxt_file_close(task, fb->file);
         r->out = NULL;
 
+        nxt_http_static_buf_free(fb);
+
         b->next = nxt_http_buf_last(r);
 
     } else {
@@ -1001,6 +1041,8 @@ clean:
     if (fb != NULL) {
         nxt_file_close(task, fb->file);
         r->out = NULL;
+
+        nxt_http_static_buf_free(fb);
     }
 }
 

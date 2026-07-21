@@ -168,6 +168,19 @@ typedef struct {
 } nxt_http_peer_t;
 
 
+typedef struct nxt_http_action_s nxt_http_action_t;
+
+typedef struct {
+    nxt_http_action_t           *action;
+    nxt_str_t                   share;
+#if (NXT_HAVE_OPENAT2)
+    nxt_str_t                   chroot;
+#endif
+    uint32_t                    share_idx;
+    uint8_t                     need_body;  /* 1 bit */
+} nxt_http_static_ctx_t;
+
+
 struct nxt_http_request_s {
     nxt_http_proto_t                proto;
     nxt_socket_conf_joint_t         *conf;
@@ -234,6 +247,8 @@ struct nxt_http_request_s {
 #if (NXT_HAVE_OTEL)
     nxt_otel_state_t                *otel;
 #endif
+
+    nxt_http_static_ctx_t           static_ctx;
 
     nxt_http_status_t               status:16;
 
