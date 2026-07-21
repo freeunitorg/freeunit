@@ -219,9 +219,15 @@ nxt_var_cache_value(nxt_task_t *task, nxt_tstr_state_t *state,
     value = cache->spare;
 
     if (value == NULL) {
-        value = nxt_mp_zget(cache->pool, sizeof(nxt_str_t));
-        if (nxt_slow_path(value == NULL)) {
-            return NULL;
+        if (cache->num_inline_values < nxt_nitems(cache->inline_values)) {
+            value = &cache->inline_values[cache->num_inline_values++];
+            nxt_memzero(value, sizeof(nxt_str_t));
+
+        } else {
+            value = nxt_mp_zget(cache->pool, sizeof(nxt_str_t));
+            if (nxt_slow_path(value == NULL)) {
+                return NULL;
+            }
         }
 
         cache->spare = value;
