@@ -43,6 +43,8 @@ typedef struct {
     nxt_mp_t                *pool;
     nxt_lvlhsh_t            hash;
     nxt_str_t               *spare;
+    nxt_str_t               inline_values[8];
+    uint8_t                 num_inline_values;
 } nxt_var_cache_t;
 
 
