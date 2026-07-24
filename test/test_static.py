@@ -410,3 +410,39 @@ Content-Length: 6\r
         sock_type='unix',
         addr=f'{temp_dir}/control.unit.sock',
     ), 'mime_types invalid'
+
+
+def test_static_buffer_reuse():
+    # Exercise the static-file buffer-descriptor freelist: many keep-alive
+    # requests over a single connection recycle the same descriptor (allocated
+    # on send, returned to the thread-local freelist on completion), so a
+    # corrupted recycle would surface as a wrong or truncated body.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.connect(('127.0.0.1', 8080))
+    sock.settimeout(5)
+
+    def one_request():
+        sock.sendall(
+            b'GET / HTTP/1.1\r\nHost: localhost\r\n'
+            b'Connection: keep-alive\r\n\r\n'
+        )
+        data = b''
+        while b'\r\n\r\n' not in data:
+            data += sock.recv(4096)
+        head, _, rest = data.partition(b'\r\n\r\n')
+        length = int(
+            dict(
+                line.split(': ', 1)
+                for line in head.decode().split('\r\n')[1:]
+            )['Content-Length']
+        )
+        while len(rest) < length:
+            rest += sock.recv(4096)
+        return rest[:length]
+
+    try:
+        for i in range(50):
+            assert one_request() == b'0123456789', f'keep-alive request {i}'
+    finally:
+        sock.close()
