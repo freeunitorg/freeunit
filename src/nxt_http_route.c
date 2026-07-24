@@ -1966,7 +1966,7 @@ nxt_http_route_header(nxt_http_request_t *r, nxt_http_route_rule_t *rule)
 
     ret = 0;
 
-    nxt_list_each(f, r->fields) {
+    nxt_http_fields_each(f, r->inline_fields, r->num_inline_fields, r->fields) {
 
         if (rule->u.name.hash != f->hash
             || rule->u.name.length != f->name_length
@@ -1985,7 +1985,7 @@ nxt_http_route_header(nxt_http_request_t *r, nxt_http_route_rule_t *rule)
             return ret;
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     return ret;
 }

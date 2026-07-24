@@ -104,7 +104,9 @@ nxt_http_resp_header_find(nxt_http_request_t *r, u_char *name, size_t length)
 {
     nxt_http_field_t  *f;
 
-    nxt_list_each(f, r->resp.fields) {
+    nxt_http_fields_each(f, r->resp.inline_fields, r->resp.num_inline_fields,
+                         r->resp.fields)
+    {
 
         if (f->skip) {
             continue;
@@ -116,7 +118,7 @@ nxt_http_resp_header_find(nxt_http_request_t *r, u_char *name, size_t length)
             return f;
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     return NULL;
 }
@@ -214,7 +216,7 @@ nxt_http_set_headers(nxt_http_request_t *r)
         if (value[i].start != NULL) {
 
             if (f == NULL) {
-                f = nxt_list_zero_add(r->resp.fields);
+                f = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
                 if (nxt_slow_path(f == NULL)) {
                     return NXT_ERROR;
                 }

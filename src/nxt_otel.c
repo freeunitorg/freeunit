@@ -143,7 +143,7 @@ nxt_otel_propagate_header(nxt_task_t *task, nxt_http_request_t *r)
          * nxt_list_add() hands out non-zeroed memory: garbage skip/hopbyhop
          * bits make the peer/app serializers randomly drop the field.
          */
-        f = nxt_list_zero_add(r->fields);
+        f = nxt_http_req_field_zero_add(r);
         if (nxt_slow_path(f == NULL)) {
             return;
         }
@@ -166,7 +166,7 @@ nxt_otel_propagate_header(nxt_task_t *task, nxt_http_request_t *r)
                                        &traceparent_name, &traceparent);
     }
 
-    f = nxt_list_zero_add(r->resp.fields);
+    f = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
     if (nxt_slow_path(f == NULL)) {
         nxt_log(task, NXT_LOG_ERR,
                 "couldn't allocate traceparent header in response");
@@ -376,7 +376,7 @@ nxt_otel_drop_tracestate(nxt_http_request_t *r)
 
     nxt_str_null(&r->otel->trace_state);
 
-    nxt_list_each(f, r->fields) {
+    nxt_http_fields_each(f, r->inline_fields, r->num_inline_fields, r->fields) {
 
         if (f->name_length == nxt_length("tracestate")
             && nxt_memcasecmp(f->name, "tracestate",
@@ -385,11 +385,13 @@ nxt_otel_drop_tracestate(nxt_http_request_t *r)
             f->skip = 1;
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     /* the echo copies nxt_otel_parse_tracestate() already appended */
 
-    nxt_list_each(f, r->resp.fields) {
+    nxt_http_fields_each(f, r->resp.inline_fields, r->resp.num_inline_fields,
+                         r->resp.fields)
+    {
 
         if (f->name_length == nxt_length("tracestate")
             && nxt_memcasecmp(f->name, "tracestate",
@@ -398,7 +400,7 @@ nxt_otel_drop_tracestate(nxt_http_request_t *r)
             f->skip = 1;
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 }
 
 
@@ -637,7 +639,7 @@ nxt_otel_parse_tracestate(void *ctx, nxt_http_field_t *field, uintptr_t data)
      * to the peer in the response below.
      */
 
-    f = nxt_list_add(r->resp.fields);
+    f = nxt_http_resp_field_add(&r->resp, r->mem_pool);
     if (nxt_fast_path(f != NULL)) {
         *f = *field;
     }

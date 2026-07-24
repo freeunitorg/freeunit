@@ -107,6 +107,8 @@ typedef union {
 
 
 typedef struct {
+    nxt_http_field_t                inline_fields[16];
+    uint8_t                         num_inline_fields;
     nxt_list_t                      *fields;
     nxt_http_field_t                *date;
     nxt_http_field_t                *content_type;
@@ -116,12 +118,46 @@ typedef struct {
 } nxt_http_response_t;
 
 
+nxt_inline nxt_http_field_t *
+nxt_http_resp_field_add(nxt_http_response_t *resp, nxt_mp_t *mp)
+{
+    if (resp->num_inline_fields < 16) {
+        return &resp->inline_fields[resp->num_inline_fields++];
+    }
+
+    if (resp->fields == NULL) {
+        resp->fields = nxt_list_create(mp, 8, sizeof(nxt_http_field_t));
+        if (nxt_slow_path(resp->fields == NULL)) {
+            return NULL;
+        }
+    }
+
+    return nxt_list_add(resp->fields);
+}
+
+
+nxt_inline nxt_http_field_t *
+nxt_http_resp_field_zero_add(nxt_http_response_t *resp, nxt_mp_t *mp)
+{
+    nxt_http_field_t  *field;
+
+    field = nxt_http_resp_field_add(resp, mp);
+    if (nxt_fast_path(field != NULL)) {
+        nxt_memzero(field, sizeof(nxt_http_field_t));
+    }
+
+    return field;
+}
+
+
 typedef struct nxt_upstream_server_s  nxt_upstream_server_t;
 
 typedef struct {
     nxt_http_proto_t                proto;
     nxt_http_request_t              *request;
     nxt_upstream_server_t           *server;
+    nxt_http_field_t                inline_fields[16];
+    uint8_t                         num_inline_fields;
     nxt_list_t                      *fields;
     nxt_buf_t                       *body;
 
@@ -157,6 +193,8 @@ struct nxt_http_request_s {
     nxt_str_t                       args_decoded;
     nxt_array_t                     *arguments;  /* of nxt_http_name_value_t */
     nxt_array_t                     *cookies;    /* of nxt_http_name_value_t */
+    nxt_http_field_t                inline_fields[16];
+    uint8_t                         num_inline_fields;
     nxt_list_t                      *fields;
     nxt_http_field_t                *content_type;
     nxt_http_field_t                *content_length;
@@ -215,6 +253,38 @@ struct nxt_http_request_s {
     uint8_t                         websocket_handshake;  /* 1 bit */
     uint8_t                         chunked;  /* 1 bit */
 };
+
+
+nxt_inline nxt_http_field_t *
+nxt_http_req_field_add(nxt_http_request_t *r)
+{
+    if (r->num_inline_fields < 16) {
+        return &r->inline_fields[r->num_inline_fields++];
+    }
+
+    if (r->fields == NULL) {
+        r->fields = nxt_list_create(r->mem_pool, 8, sizeof(nxt_http_field_t));
+        if (nxt_slow_path(r->fields == NULL)) {
+            return NULL;
+        }
+    }
+
+    return nxt_list_add(r->fields);
+}
+
+
+nxt_inline nxt_http_field_t *
+nxt_http_req_field_zero_add(nxt_http_request_t *r)
+{
+    nxt_http_field_t  *field;
+
+    field = nxt_http_req_field_add(r);
+    if (nxt_fast_path(field != NULL)) {
+        nxt_memzero(field, sizeof(nxt_http_field_t));
+    }
+
+    return field;
+}
 
 
 typedef struct {

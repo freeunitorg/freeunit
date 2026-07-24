@@ -895,8 +895,10 @@ nxt_controller_conn_read(nxt_task_t *task, void *obj, void *data)
         return;
     }
 
-    rc = nxt_http_fields_process(r->parser.fields, &nxt_controller_fields_hash,
-                                 r);
+    rc = nxt_http_fields_process(r->parser.inline_fields,
+                                 r->parser.num_inline_fields,
+                                 r->parser.fields,
+                                 &nxt_controller_fields_hash, r);
 
     if (nxt_slow_path(rc != NXT_OK)) {
         nxt_controller_conn_close(task, c, r);

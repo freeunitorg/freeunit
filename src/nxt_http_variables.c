@@ -657,7 +657,7 @@ nxt_http_var_header(nxt_task_t *task, nxt_str_t *str, void *ctx, void *data)
     r = ctx;
     vf = data;
 
-    nxt_list_each(f, r->fields) {
+    nxt_http_fields_each(f, r->inline_fields, r->num_inline_fields, r->fields) {
 
         if (vf->hash == f->hash
             && vf->name.length == f->name_length
@@ -669,7 +669,7 @@ nxt_http_var_header(nxt_task_t *task, nxt_str_t *str, void *ctx, void *data)
             return NXT_OK;
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     nxt_str_null(str);
 
@@ -758,7 +758,9 @@ nxt_http_var_response_header(nxt_task_t *task, nxt_str_t *str, void *ctx,
     r = ctx;
     name = data;
 
-    nxt_list_each(f, r->resp.fields) {
+    nxt_http_fields_each(f, r->resp.inline_fields, r->resp.num_inline_fields,
+                         r->resp.fields)
+    {
 
         if (f->skip) {
             continue;
@@ -771,7 +773,7 @@ nxt_http_var_response_header(nxt_task_t *task, nxt_str_t *str, void *ctx,
             return NXT_OK;
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     nxt_str_null(str);
 
