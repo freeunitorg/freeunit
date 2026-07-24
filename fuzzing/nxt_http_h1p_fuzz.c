@@ -96,7 +96,8 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         goto failed;
     }
 
-    nxt_http_fields_process(rp.fields, &nxt_h1p_fields_hash, req);
+    nxt_http_fields_process(rp.inline_fields, rp.num_inline_fields, rp.fields,
+                            &nxt_h1p_fields_hash, req);
 
 failed:
 

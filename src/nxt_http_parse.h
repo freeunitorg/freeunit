@@ -20,6 +20,17 @@ typedef struct nxt_http_field_s          nxt_http_field_t;
 typedef struct nxt_http_fields_hash_s    nxt_http_fields_hash_t;
 
 
+struct nxt_http_field_s {
+    uint16_t                  hash;
+    uint8_t                   skip:1;
+    uint8_t                   hopbyhop:1;
+    uint8_t                   name_length;
+    uint32_t                  value_length;
+    u_char                    *name;
+    u_char                    *value;
+};
+
+
 typedef union {
     u_char                    str[8] NXT_NONSTRING;
     uint64_t                  ui64;
@@ -47,6 +58,9 @@ struct nxt_http_request_parse_s {
     nxt_str_t                 args;
 
     nxt_http_ver_t            version;
+
+    nxt_http_field_t          inline_fields[16];
+    uint8_t                   num_inline_fields;
 
     nxt_list_t                *fields;
     nxt_mp_t                  *mem_pool;
@@ -84,17 +98,6 @@ typedef struct {
 } nxt_http_field_proc_t;
 
 
-struct nxt_http_field_s {
-    uint16_t                  hash;
-    uint8_t                   skip:1;
-    uint8_t                   hopbyhop:1;
-    uint8_t                   name_length;
-    uint32_t                  value_length;
-    u_char                    *name;
-    u_char                    *value;
-};
-
-
 typedef struct {
     nxt_mp_t                  *mem_pool;
     uint64_t                  chunk_size;
@@ -110,6 +113,84 @@ typedef struct {
 #define nxt_http_field_hash_end(h)      (((h) >> 16) ^ (h))
 
 
+typedef struct {
+    nxt_http_field_t          *inline_fields;
+    uint8_t                   num_inline_fields;
+    uint8_t                   inline_index;
+    nxt_list_t                *fields;
+    nxt_list_part_t           *part;
+    uintptr_t                 elt;
+} nxt_http_fields_iter_t;
+
+
+nxt_inline nxt_http_field_t *
+nxt_http_fields_first(nxt_http_fields_iter_t *iter,
+    nxt_http_field_t *inline_fields, uint8_t num_inline_fields,
+    nxt_list_t *fields)
+{
+    iter->inline_fields = inline_fields;
+    iter->num_inline_fields = num_inline_fields;
+    iter->inline_index = 0;
+    iter->fields = fields;
+    iter->part = (fields != NULL) ? nxt_list_part(fields) : NULL;
+    iter->elt = 0;
+
+    if (iter->inline_index < iter->num_inline_fields) {
+        return &iter->inline_fields[iter->inline_index++];
+    }
+
+    while (iter->part != NULL) {
+        if (iter->part->nelts > 0) {
+            iter->elt = 1;
+            return (nxt_http_field_t *) nxt_list_data(iter->part);
+        }
+
+        iter->part = iter->part->next;
+    }
+
+    return NULL;
+}
+
+
+nxt_inline nxt_http_field_t *
+nxt_http_fields_next(nxt_http_fields_iter_t *iter)
+{
+    nxt_http_field_t  *f;
+
+    if (iter->inline_index < iter->num_inline_fields) {
+        return &iter->inline_fields[iter->inline_index++];
+    }
+
+    while (iter->part != NULL) {
+        if (iter->elt < iter->part->nelts) {
+            f = (nxt_http_field_t *) nxt_list_data(iter->part) + iter->elt;
+            iter->elt++;
+            return f;
+        }
+
+        iter->part = iter->part->next;
+        iter->elt = 0;
+    }
+
+    return NULL;
+}
+
+
+#define nxt_http_fields_each(field, inline_fields, num_inline_fields, fields) \
+    do {                                                                      \
+        nxt_http_fields_iter_t  _iter;                                        \
+        for (field = nxt_http_fields_first(&_iter,                            \
+                                            (nxt_http_field_t *) (inline_fields),\
+                                            num_inline_fields, fields);       \
+             field != NULL;                                                   \
+             field = nxt_http_fields_next(&_iter))                            \
+        {
+
+#define nxt_http_fields_loop                                                  \
+        }                                                                     \
+    } while (0)
+
+
 nxt_int_t nxt_http_parse_request_init(nxt_http_request_parse_t *rp,
     nxt_mp_t *mp);
 nxt_int_t nxt_http_parse_request(nxt_http_request_parse_t *rp,
@@ -121,7 +202,8 @@ nxt_int_t nxt_http_fields_hash(nxt_lvlhsh_t *hash,
     nxt_http_field_proc_t items[], nxt_uint_t count);
 nxt_uint_t nxt_http_fields_hash_collisions(nxt_lvlhsh_t *hash,
     nxt_http_field_proc_t items[], nxt_uint_t count, nxt_bool_t level);
-nxt_int_t nxt_http_fields_process(nxt_list_t *fields, nxt_lvlhsh_t *hash,
+nxt_int_t nxt_http_fields_process(nxt_http_field_t *inline_fields,
+    uint8_t num_inline_fields, nxt_list_t *fields, nxt_lvlhsh_t *hash,
     void *ctx);
 
 nxt_int_t nxt_http_parse_complex_target(nxt_http_request_parse_t *rp);

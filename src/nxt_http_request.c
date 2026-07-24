@@ -258,11 +258,6 @@ nxt_http_request_create(nxt_task_t *task)
         goto fail;
     }
 
-    r->resp.fields = nxt_list_create(mp, 8, sizeof(nxt_http_field_t));
-    if (nxt_slow_path(r->resp.fields == NULL)) {
-        goto fail;
-    }
-
     last = nxt_mp_zget(mp, NXT_BUF_SYNC_SIZE);
     if (nxt_slow_path(last == NULL)) {
         goto fail;
@@ -381,7 +376,7 @@ nxt_http_request_forward(nxt_task_t *task, nxt_http_request_t *r,
 
     protocol_field = NULL;
 
-    nxt_list_each(f, r->fields) {
+    nxt_http_fields_each(f, r->inline_fields, r->num_inline_fields, r->fields) {
         if (client_ip_fields != NULL
             && f->hash == client_ip->header_hash
             && f->value_length > 0
@@ -407,7 +402,7 @@ nxt_http_request_forward(nxt_task_t *task, nxt_http_request_t *r,
         {
             protocol_field = f;
         }
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     if (client_ip_fields != NULL) {
         nxt_http_request_forward_client_ip(r, forward, client_ip_fields);
@@ -562,7 +557,7 @@ nxt_http_request_chunked_transform(nxt_http_request_t *r)
 
     size = r->body->file_end;
 
-    f = nxt_list_zero_add(r->fields);
+    f = nxt_http_req_field_zero_add(r);
     if (nxt_slow_path(f == NULL)) {
         return NXT_ERROR;
     }
@@ -702,7 +697,7 @@ nxt_http_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
      * to the last header filter.
      */
 
-    server = nxt_list_zero_add(r->resp.fields);
+    server = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
     if (nxt_slow_path(server == NULL)) {
         goto fail;
     }
@@ -715,7 +710,7 @@ nxt_http_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
     server->value_length = nxt_strlen(server_string);
 
     if (r->resp.date == NULL) {
-        date = nxt_list_zero_add(r->resp.fields);
+        date = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
         if (nxt_slow_path(date == NULL)) {
             goto fail;
         }
@@ -738,7 +733,7 @@ nxt_http_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
     if (r->resp.content_length_n != -1
         && (r->resp.content_length == NULL || r->resp.content_length->skip))
     {
-        content_length = nxt_list_zero_add(r->resp.fields);
+        content_length = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
         if (nxt_slow_path(content_length == NULL)) {
             goto fail;
         }
@@ -1092,7 +1087,7 @@ nxt_http_cookies_parse(nxt_http_request_t *r)
         return NULL;
     }
 
-    nxt_list_each(f, r->fields) {
+    nxt_http_fields_each(f, r->inline_fields, r->num_inline_fields, r->fields) {
 
         if (f->hash != NXT_HTTP_COOKIE_HASH
             || f->name_length != 6
@@ -1107,7 +1102,7 @@ nxt_http_cookies_parse(nxt_http_request_t *r)
             return NULL;
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     r->cookies = cookies;
 

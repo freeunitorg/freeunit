@@ -499,3 +499,53 @@ def test_http_discard_unsafe_fields():
 
     resp = check_status("Custom_Header")
     assert 'CUSTOM' not in resp['headers']['All-Headers']
+
+
+def test_http_header_fields_inline_spill():
+    # The parser stores the first 16 header fields inline and spills any
+    # further fields into a list; every field must still reach the
+    # application regardless of where it lands.  Exercise counts below, at,
+    # and well past the 16-field boundary.
+    client.load('header_fields')
+
+    for count in [1, 15, 16, 17, 32, 48]:
+        headers = {'Host': 'localhost', 'Connection': 'close'}
+        for i in range(count):
+            headers[f'X-Test-{i}'] = str(i)
+
+        resp = client.get(headers=headers)
+
+        assert resp['status'] == 200, f'{count} headers status'
+
+        got = resp['headers']['All-Headers']
+        for i in range(count):
+            assert f'HTTP_X_TEST_{i}' in got, f'field {i} of {count} present'
+
+
+def test_http_header_fields_keepalive_spill():
+    # The parser struct is reused across keep-alive requests (num_inline_fields
+    # is reset per request).  Vary the header count on the same connection --
+    # inline-only, spilled past 16, then back below the boundary -- and confirm
+    # each request's fields are all delivered, so a stale count from the
+    # previous request cannot corrupt the next one.
+    client.load('header_fields')
+
+    sock = None
+    for count in [3, 20, 5, 32]:
+        headers = {'Host': 'localhost', 'Connection': 'keep-alive'}
+        for i in range(count):
+            headers[f'X-Test-{i}'] = str(i)
+
+        kwargs = {'headers': headers, 'start': True, 'read_timeout': 1}
+        if sock is not None:
+            kwargs['sock'] = sock
+
+        resp, sock = client.get(**kwargs)
+
+        assert resp['status'] == 200, f'{count}-header keep-alive status'
+
+        got = resp['headers']['All-Headers']
+        for i in range(count):
+            assert f'HTTP_X_TEST_{i}' in got, f'keep-alive field {i} of {count}'
+
+    sock.close()

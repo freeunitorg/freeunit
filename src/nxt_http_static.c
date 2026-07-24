@@ -575,7 +575,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         r->status = NXT_HTTP_OK;
         r->resp.content_length_n = nxt_file_size(&fi);
 
-        field = nxt_list_zero_add(r->resp.fields);
+        field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
         if (nxt_slow_path(field == NULL)) {
             goto fail;
         }
@@ -592,7 +592,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         field->value = p;
         field->value_length = nxt_http_date(p, &tm) - p;
 
-        field = nxt_list_zero_add(r->resp.fields);
+        field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
         if (nxt_slow_path(field == NULL)) {
             goto fail;
         }
@@ -621,7 +621,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         }
 
         if (mtype->length != 0) {
-            field = nxt_list_zero_add(r->resp.fields);
+            field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
             if (nxt_slow_path(field == NULL)) {
                 goto fail;
             }
@@ -699,7 +699,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         r->status = NXT_HTTP_MOVED_PERMANENTLY;
         r->resp.content_length_n = 0;
 
-        field = nxt_list_zero_add(r->resp.fields);
+        field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
         if (nxt_slow_path(field == NULL)) {
             goto fail;
         }

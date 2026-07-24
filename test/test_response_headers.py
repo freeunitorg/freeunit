@@ -234,3 +234,24 @@ def test_response_headers_var_control():
     assert resp['status'] == 200, 'request still served'
     assert 'Evil' not in resp['headers'], 'response header injection'
     assert 'X-Foo' not in resp['headers'], 'tainted value dropped'
+
+
+def test_response_headers_inline_spill(temp_dir):
+    # More than 16 response headers exercise the resp.inline_fields[16] -> list
+    # spill in the response field store; together with the static handler's own
+    # headers this is well past the 16-slot boundary, and all must reach the
+    # client.
+    headers = {f'X-Rh-{i}': str(i) for i in range(24)}
+
+    action_update(
+        {
+            'share': f'{temp_dir}/index.html',
+            'response_headers': headers,
+        }
+    )
+
+    resp = client.get()
+
+    assert resp['status'] == 200, 'spill status'
+    for i in range(24):
+        assert resp['headers'].get(f'X-Rh-{i}') == str(i), f'response header {i}'
