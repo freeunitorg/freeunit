@@ -138,7 +138,7 @@ def test_idle_fin_no_close_wait(skip_fds_check):
     )
 
 
-def test_idle_fin_fds_stable():
+def test_idle_fin_fds_stable(unit_pid):
     """Router FD count must not grow after a wave of keepalive FINs."""
     from pathlib import Path
     import subprocess
@@ -149,8 +149,13 @@ def test_idle_fin_fds_stable():
 
     def _router_pid():
         try:
+            # Scope strictly to OUR unitd: the router is a direct child of the
+            # main pid this test's Unit was started with.  A bare
+            # `pgrep -f 'unit: router'` also matches any other unitd instance
+            # on the box (CI shares the host with long-lived daemons) and would
+            # silently sample the wrong process.
             out = subprocess.check_output(
-                ['pgrep', '-f', 'unit: router'],
+                ['pgrep', '-P', str(unit_pid), '-f', 'unit: router'],
                 stderr=subprocess.DEVNULL,
             ).decode().strip()
             return int(out.splitlines()[0]) if out else None
