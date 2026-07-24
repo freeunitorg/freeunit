@@ -32,6 +32,29 @@ typedef struct {
 #define NXT_HTTP_STATIC_BUF_COUNT  2
 #define NXT_HTTP_STATIC_BUF_SIZE   (128 * 1024)
 
+#if (NXT_HAVE_THREAD_STORAGE_CLASS)
+
+/*
+ * Recycle the fixed-size static-file buffer descriptors (NXT_BUF_FILE_SIZE)
+ * through a thread-local freelist to avoid a per-request malloc/free on the
+ * hot path.  This is only compiled when the compiler provides __thread
+ * storage: with nxt_thread_declare_data() over __thread the freelist head and
+ * count are plain thread-local variables, nxt_thread_get_data() resolves to
+ * their address, and nxt_thread_init_data() is a no-op -- so no runtime
+ * initialisation is required.
+ *
+ * On the pthread-specific-data fallback (see the #else branch) these keys
+ * would be uninitialised (-1) until nxt_thread_init_data() ran on each router
+ * thread; this module has no such per-thread init hook (only the core
+ * nxt_thread_context is initialised that way), so there we fall back to plain
+ * allocation rather than dereference an invalid TSD key.
+ *
+ * The freelist is intentionally not drained at thread exit: for long-lived
+ * router threads it is a bounded (NXT_HTTP_STATIC_BUF_FREELIST_MAX descriptors)
+ * one-time retain, released with the process.  LeakSanitizer may report these
+ * as still-reachable in short-lived-thread scenarios; that is expected.
+ */
+
 #define NXT_HTTP_STATIC_BUF_FREELIST_MAX  32
 
 static nxt_thread_declare_data(nxt_buf_t *, nxt_http_static_buf_freelist);
@@ -83,6 +106,30 @@ nxt_http_static_buf_free(nxt_buf_t *fb)
     }
 }
 
+#else  /* !NXT_HAVE_THREAD_STORAGE_CLASS */
+
+nxt_inline nxt_buf_t *
+nxt_http_static_buf_alloc(nxt_task_t *task, nxt_mp_t *mp)
+{
+    nxt_buf_t  *fb;
+
+    fb = nxt_malloc(NXT_BUF_FILE_SIZE);
+    if (nxt_fast_path(fb != NULL)) {
+        nxt_memzero(fb, sizeof(nxt_buf_t));
+    }
+
+    return fb;
+}
+
+
+nxt_inline void
+nxt_http_static_buf_free(nxt_buf_t *fb)
+{
+    nxt_free(fb);
+}
+
+#endif
+
 
 
 static nxt_http_action_t *nxt_http_static(nxt_task_t *task,
@@ -101,6 +148,8 @@ static void nxt_http_static_extract_extension(nxt_str_t *path,
 static void nxt_http_static_body_handler(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_http_static_buf_completion(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_http_static_buf_cleanup(nxt_task_t *task, void *obj,
     void *data);
 
 static nxt_int_t nxt_http_static_mtypes_hash_test(nxt_lvlhsh_query_t *lhq,
@@ -711,6 +760,26 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
 
             r->out = fb;
 
+            /*
+             * The descriptor is malloc-backed (freelist), not pool memory, so
+             * it is not reclaimed when the request pool is released.  On the
+             * normal path nxt_http_static_buf_completion() closes the file,
+             * clears r->out and returns fb to the freelist.  But if the header
+             * send below takes the error path the body handler is never
+             * scheduled and fb stays parked in r->out with the file still
+             * open; nothing else drains r->out (discard only drains connection
+             * buffers and r->last).  Register a pool cleanup that reclaims fb
+             * in exactly that case -- it is a no-op once r->out is cleared.
+             */
+            if (nxt_slow_path(nxt_mp_cleanup(r->mem_pool,
+                                             nxt_http_static_buf_cleanup,
+                                             task, fb, r) != NXT_OK))
+            {
+                r->out = NULL;
+                nxt_http_static_buf_free(fb);
+                goto fail;
+            }
+
             body_handler = &nxt_http_static_body_handler;
 
         } else {
@@ -1039,6 +1108,31 @@ clean:
     } while (b != NULL);
 
     if (fb != NULL) {
+        nxt_file_close(task, fb->file);
+        r->out = NULL;
+
+        nxt_http_static_buf_free(fb);
+    }
+}
+
+
+static void
+nxt_http_static_buf_cleanup(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_buf_t           *fb;
+    nxt_http_request_t  *r;
+
+    fb = obj;
+    r = data;
+
+    /*
+     * Runs once when the request pool is destroyed.  If fb is still parked in
+     * r->out the body handler / completion never ran (header send took the
+     * error path), so the file is still open and the descriptor still owned
+     * here: close and reclaim it.  Otherwise completion already cleared r->out
+     * and returned fb to the freelist, so this is a no-op.
+     */
+    if (r->out == fb) {
         nxt_file_close(task, fb->file);
         r->out = NULL;
 
