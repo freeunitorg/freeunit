@@ -574,10 +574,23 @@ def unit_stop():
     # check zombies (only once startup got far enough to record the main pid)
 
     if main_pid is not None:
-        out = subprocess.check_output(
-            ['ps', 'ax', '-o', 'state', '-o', 'ppid']
-        ).decode()
-        z_ppids = re.findall(r'Z\s*(\d+)', out)
+        # A child that just exited can briefly remain a zombie until main reaps
+        # it; under load (notably sanitizer builds) that window can outlast a
+        # single sample and flake this check.  Poll so a transient
+        # reap-in-progress is not mistaken for a genuinely leaked zombie -- a
+        # real leak persists, a reap race clears within a few ms.  Sample after
+        # each sleep (including the last one) so a reap that lands in the final
+        # interval is still observed before the assertion.
+        z_ppids = []
+        for i in range(41):
+            if i:
+                time.sleep(0.05)
+            out = subprocess.check_output(
+                ['ps', 'ax', '-o', 'state', '-o', 'ppid']
+            ).decode()
+            z_ppids = re.findall(r'Z\s*(\d+)', out)
+            if main_pid not in z_ppids:
+                break
         assert main_pid not in z_ppids, 'no zombies'
 
     # terminate unit
