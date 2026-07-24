@@ -119,7 +119,11 @@ def test_tls_session():
     reason='session reuse is not supported',
 )
 def test_tls_session_timeout():
-    assert 'success' in add_session(cache_size=5, timeout=1)
+    # OpenSSL evaluates session expiry in whole seconds (time_t), so a 1s
+    # timeout leaves barely over one second of real slack for the resume
+    # below and evicts the session early under CI load, making the "no
+    # timeout" assertion flaky.  Use a comfortable window and sleep past it.
+    assert 'success' in add_session(cache_size=5, timeout=4)
 
     _, sess, ctx, reused = connect()
     assert not reused, 'new connection'
@@ -127,7 +131,7 @@ def test_tls_session_timeout():
     _, _, _, reused = connect(ctx, sess)
     assert reused, 'no timeout'
 
-    time.sleep(3)
+    time.sleep(6)
 
     _, _, _, reused = connect(ctx, sess)
     assert not reused, 'timeout'
