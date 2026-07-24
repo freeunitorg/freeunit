@@ -499,6 +499,7 @@ nxt_int_t nxt_http_static_mtypes_hash_add(nxt_mp_t *mp, nxt_lvlhsh_t *hash,
     const nxt_str_t *exten, nxt_str_t *type);
 nxt_str_t *nxt_http_static_mtype_get(nxt_lvlhsh_t *hash,
     const nxt_str_t *exten);
+void nxt_http_static_buf_freelist_drain(void);
 
 nxt_http_action_t *nxt_http_application_handler(nxt_task_t *task,
     nxt_http_request_t *r, nxt_http_action_t *action);
