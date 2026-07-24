@@ -49,10 +49,12 @@ typedef struct {
  * nxt_thread_context is initialised that way), so there we fall back to plain
  * allocation rather than dereference an invalid TSD key.
  *
- * The freelist is intentionally not drained at thread exit: for long-lived
- * router threads it is a bounded (NXT_HTTP_STATIC_BUF_FREELIST_MAX descriptors)
- * one-time retain, released with the process.  LeakSanitizer may report these
- * as still-reachable in short-lived-thread scenarios; that is expected.
+ * A router worker thread drains its own freelist via
+ * nxt_http_static_buf_freelist_drain() just before it exits (see
+ * nxt_router.c): the __thread head lives in the exiting thread's storage and
+ * can only be freed while running on that thread.  Without this drain, every
+ * listen_threads churn that destroys a worker thread would leak up to
+ * NXT_HTTP_STATIC_BUF_FREELIST_MAX descriptors -- an unbounded process leak.
  */
 
 #define NXT_HTTP_STATIC_BUF_FREELIST_MAX  32
@@ -106,6 +108,25 @@ nxt_http_static_buf_free(nxt_buf_t *fb)
     }
 }
 
+
+void
+nxt_http_static_buf_freelist_drain(void)
+{
+    nxt_buf_t   *fb, *next, **fl;
+    nxt_uint_t  *count;
+
+    fl = nxt_thread_get_data(nxt_http_static_buf_freelist);
+    count = nxt_thread_get_data(nxt_http_static_buf_freelist_count);
+
+    for (fb = *fl; fb != NULL; fb = next) {
+        next = fb->next;
+        nxt_free(fb);
+    }
+
+    *fl = NULL;
+    *count = 0;
+}
+
 #else  /* !NXT_HAVE_THREAD_STORAGE_CLASS */
 
 nxt_inline nxt_buf_t *
@@ -126,6 +147,12 @@ nxt_inline void
 nxt_http_static_buf_free(nxt_buf_t *fb)
 {
     nxt_free(fb);
+}
+
+
+void
+nxt_http_static_buf_freelist_drain(void)
+{
 }
 
 #endif

@@ -217,6 +217,7 @@ static void nxt_router_listen_socket_delete(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_router_worker_thread_quit(nxt_task_t *task, void *obj,
     void *data);
+static void nxt_router_worker_thread_exit(nxt_task_t *task);
 static void nxt_router_listen_socket_close(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_router_thread_exit_handler(nxt_task_t *task, void *obj,
@@ -3889,8 +3890,22 @@ nxt_router_worker_thread_quit(nxt_task_t *task, void *obj, void *data)
     engine->shutdown = 1;
 
     if (nxt_queue_is_empty(&engine->joints)) {
-        nxt_thread_exit(task->thread);
+        nxt_router_worker_thread_exit(task);
     }
+}
+
+
+static void
+nxt_router_worker_thread_exit(nxt_task_t *task)
+{
+    /*
+     * Free per-thread caches whose storage lives in this thread and can only
+     * be released while running on it, then leave the thread.  New worker-exit
+     * paths must route through here so the cleanup is never forgotten.
+     */
+    nxt_http_static_buf_freelist_drain();
+
+    nxt_thread_exit(task->thread);
 }
 
 
@@ -4135,7 +4150,7 @@ nxt_router_listen_event_release(nxt_task_t *task, nxt_listen_event_t *lev,
     }
 
     if (engine->shutdown && nxt_queue_is_empty(&engine->joints)) {
-        nxt_thread_exit(task->thread);
+        nxt_router_worker_thread_exit(task);
     }
 }
 
