@@ -1187,7 +1187,11 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
             } else if (h1p->chunked_parse.chunk_size > 0) {
                 /* Mid-chunk: chunk_parse consumed the entire buffer but did not
                  * advance b->mem.pos (CHUNK_MIDDLE path in chunk_buffer).
-                 * Reset so nxt_conn_read has space on the next iteration. */
+                 * Reset so nxt_conn_read has space on the next iteration.
+                 * A buffer ending mid-trailer lands here too, since chunk_size
+                 * doubles as the trailer byte counter; there the parser did
+                 * advance pos, but it advanced it to b->mem.free, so this reset
+                 * is the same zero-byte compaction the branch below does. */
                 b->mem.free = b->mem.start;
                 b->mem.pos = b->mem.start;
 

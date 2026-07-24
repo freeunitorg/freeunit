@@ -203,7 +203,29 @@ def test_proxy_chunked_invalid():
     check_invalid('\r\n\r\n1\r\nXX\r\n0\r\n\r\n')
     check_invalid('\r\n\r\n2\r\nX\r\n0\r\n\r\n')
     check_invalid('\r\n\r\nH\r\nXX\r\n0\r\n\r\n')
-    check_invalid('\r\n\r\n0\r\nX')
+
+    # A trailer field after the terminal 0-chunk is valid HTTP/1.1 (RFC 9112
+    # 7.1.2), so an unterminated trailer *field line* is an incomplete trailer,
+    # not a framing error: the upstream closes mid-trailer, so the relay
+    # delivers the body truncated (terminal chunk dropped) rather than 502-ing
+    # an already-streaming response, just like the incomplete-data-chunk case
+    # below.  freeunitorg/freeunit#106.
+    #
+    # run_server terminates every line it echoes with CRLF, so 'X-T: v' arrives
+    # as a complete field line and only the trailer section's final CRLF is
+    # missing when the upstream closes.
+    resp = get_http10(body='\r\n\r\n0\r\nX-T: v')
+    assert resp['status'] == 200, 'incomplete trailer status'
+    assert resp['body'][-5:] != '0\r\n\r\n', 'incomplete trailer'
+
+    # 'X' arrives as the complete line "X\r\n", which is not a field line at
+    # all: no colon.  Consuming it would let a peer that ends the message at
+    # the terminal CRLF read those bytes as the start of the next message, so
+    # the parser rejects it and the relay fails the response instead.  Pinned
+    # to 502 rather than "not 200": accepting either outcome would let the
+    # grammar check be removed without any test noticing.
+    resp = get_http10(body='\r\n\r\n0\r\nX')
+    assert resp['status'] == 502, 'colonless trailer'
 
     resp = get_http10(body='\r\n\r\n65#\r\nA X 100')
     assert resp['status'] == 200, 'incomplete chunk status'

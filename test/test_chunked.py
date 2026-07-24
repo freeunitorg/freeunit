@@ -111,6 +111,55 @@ def test_chunked_after_last():
     assert resp['body'] == 'a'
 
 
+def test_chunked_trailer():
+    def check(trailer_part):
+        resp = client.get(
+            headers={
+                'Host': 'localhost',
+                'Connection': 'close',
+                'Transfer-Encoding': 'chunked',
+            },
+            body=f'5\r\nhello\r\n0\r\n{trailer_part}\r\n',
+        )
+
+        assert resp['status'] == 200
+        assert resp['headers']['Content-Length'] == '5'
+        assert resp['body'] == 'hello'
+
+    check('X-Trailer-Test: trailed\r\n')
+    check('A: 1\r\nB: 2\r\n')
+    check('X-T:v\r\n')
+    check('X-T:\r\n')
+
+    def check_invalid(trailer_part, reason):
+        resp = client.get(
+            headers={
+                'Host': 'localhost',
+                'Connection': 'close',
+                'Transfer-Encoding': 'chunked',
+            },
+            body=f'5\r\nhello\r\n0\r\n{trailer_part}\r\n',
+        )
+
+        assert resp['status'] == 400, reason
+
+    # A trailer line must be a field line.  The colonless case is the one that
+    # matters: a peer that ends the message at the terminal CRLF reads those
+    # bytes as the start of the next request, so accepting them here would let
+    # a request be smuggled past whichever side is more lenient.
+    check_invalid('GET /admin HTTP/1.1\r\n', 'colonless request line')
+    check_invalid('X-T\r\n', 'field-name with no colon')
+    check_invalid(': v\r\n', 'empty field-name')
+    check_invalid('X-T : v\r\n', 'space before colon')
+    check_invalid(' X-T: v\r\n', 'obs-fold continuation')
+
+    # An oversized trailer section is rejected (parser cap is 4096 bytes).
+    # Just over the cap rather than far over it: the counter is cumulative
+    # across reads, so either works, but this keeps the case from depending on
+    # how much of the body lands in the first read.
+    check_invalid(f'X: {"a" * 4200}\r\n', 'oversized trailer')
+
+
 def test_chunked_transform():
     assert 'success' in client.conf(
         {"http": {"chunked_transform": False}}, 'settings'
@@ -270,3 +319,18 @@ def test_chunked_split_reads():
     # reaches the recycle -- it is here to keep it that way if that early
     # return is ever refactored.
     check([req_head + b'0\r\n\r\n'], b'', with_head=False)
+
+    # Trailer-shaped variants of the same boundary, reachable only now that
+    # the terminal section is parsed instead of erroring at its first byte:
+    # the first read ends inside a trailer field line, so the header buffer is
+    # framing-only and the trailer section's final CRLF arrives later.
+    check(
+        [req_head + b'5\r\nhello\r\n0\r\nX-T: v', b'\r\n\r\n'],
+        b'hello',
+        with_head=False,
+    )
+    check(
+        [req_head + b'0\r\n', b'X-T: v\r\n', b'\r\n'],
+        b'',
+        with_head=False,
+    )

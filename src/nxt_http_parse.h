@@ -103,6 +103,7 @@ typedef struct {
     uint64_t                  chunk_size;
     uint8_t                   state;
     uint8_t                   last;         /* 1 bit */
+    uint8_t                   trailer;      /* 1 bit */
     uint8_t                   chunk_error;  /* 1 bit */
     uint8_t                   error;        /* 1 bit */
     /*
