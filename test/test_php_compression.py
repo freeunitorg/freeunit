@@ -3,10 +3,28 @@ import gzip
 import pytest
 
 from unit.applications.lang.php import ApplicationPHP
+from unit.option import option
 
 prerequisites = {'modules': {'php': 'any'}}
 
 client = ApplicationPHP()
+
+
+@pytest.fixture(autouse=True)
+def requires_restart_mode():
+    """
+    Configuring compression is not reversible within one unitd: the module
+    keeps its state in process globals pointing into the router configuration
+    that was current when they were parsed, and a later configuration without
+    a compression block neither reinitialises nor clears them, so the next
+    request dereferences a freed pool and the router dies (#167).
+
+    Without --restart the whole session shares one unitd, so these tests would
+    crash whichever test runs next.  With it, each test gets its own unitd and
+    the state cannot escape.  Drop this fixture once #167 is fixed.
+    """
+    if not option.restart:
+        pytest.skip('needs --restart until #167 is fixed')
 
 COMPRESSION_CONF = {
     "compression": {
