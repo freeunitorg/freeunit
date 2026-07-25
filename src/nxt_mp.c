@@ -1014,7 +1014,30 @@ nxt_mp_get(nxt_mp_t *mp, size_t size)
 #if !(NXT_DEBUG_MEMORY)
 
     if (size <= mp->page_size) {
-        size = nxt_max(size, NXT_MAX_ALIGNMENT);
+        /*
+         * nxt_mp_get_small() is a bump allocator with no per-allocation
+         * alignment step: it hands out the page cursor and then advances it
+         * by the requested size.  Flooring the size to NXT_MAX_ALIGNMENT is
+         * therefore not enough to keep the promise made in nxt_mp.h that
+         * nxt_mp_get() returns memory aligned suitably for structures: a
+         * single odd-sized get() leaves the cursor misaligned, and every
+         * later get() from that page returns a misaligned pointer.  On
+         * strict-alignment targets such as armv7 a struct copy or a 64-bit
+         * field access through such a pointer faults with SIGBUS, because
+         * the compiler emits multi-word instructions (stm, ldrd/strd) that
+         * require the pointer to be 4- or 8-aligned.  Round the size up
+         * instead, so the cursor stays a multiple of NXT_MAX_ALIGNMENT.
+         *
+         * The rounded size still fits the page.  nxt_mp_create() floors
+         * page_alignment to NXT_MAX_ALIGNMENT and nxt_mp_test_sizes()
+         * requires page_size to be a power of two not less than
+         * page_alignment, so page_size is a power of two not less than
+         * NXT_MAX_ALIGNMENT, which is itself a power of two -- hence
+         * page_size is a multiple of NXT_MAX_ALIGNMENT and rounding a size
+         * that already fits the page cannot push it past the end.
+         */
+        size = nxt_align_size(nxt_max(size, NXT_MAX_ALIGNMENT),
+                              NXT_MAX_ALIGNMENT);
         p = nxt_mp_get_small(mp, &mp->get_pages, size);
 
     } else {

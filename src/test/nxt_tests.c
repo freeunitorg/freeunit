@@ -98,6 +98,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_mp_get_align_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_mp_test(thr, 100, 40000, 128 - 1) != NXT_OK) {
         return 1;
     }
