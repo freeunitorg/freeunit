@@ -193,6 +193,7 @@ struct nxt_conn_s {
     uint8_t                       tcp_nodelay;  /* 1 bit */
 
     nxt_queue_link_t              link;
+    nxt_conn_t                    *next;
 };
 
 
