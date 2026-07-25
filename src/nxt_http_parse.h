@@ -176,6 +176,15 @@ nxt_http_fields_next(nxt_http_fields_iter_t *iter)
 }
 
 
+/*
+ * Iterate the inline array then the spill list.
+ *
+ * NOTE: unlike nxt_list_each(), which nests a per-part loop inside a per-list
+ * loop, this is a single flat loop -- so "break" leaves the iteration entirely
+ * rather than only the current part and resuming at the next one.  "continue"
+ * and "return" behave the same in both.  When converting a remaining
+ * nxt_list_each() over a field store, re-check any "break" in its body.
+ */
 #define nxt_http_fields_each(field, inline_fields, num_inline_fields, fields) \
     do {                                                                      \
         nxt_http_fields_iter_t  _iter;                                        \
