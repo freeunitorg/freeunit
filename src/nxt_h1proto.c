@@ -505,9 +505,28 @@ nxt_h1p_conn_request_init(nxt_task_t *task, void *obj, void *data)
 
         r->task = c->task;
         task = &r->task;
-        c->socket.task = task;
-        c->read_timer.task = task;
-        c->write_timer.task = task;
+
+        nxt_assert(c->socket.task == &c->task);
+        nxt_assert(c->read_timer.task == &c->task);
+        nxt_assert(c->write_timer.task == &c->task);
+
+        /*
+         * The request task is embedded in nxt_http_request_t and thus lives in
+         * the request memory pool, which is released
+         * (nxt_http_request_close_handler -> nxt_mp_release) as soon as the
+         * request completes.  The connection's socket and timer tasks, however,
+         * are captured by value into deferred work items (nxt_conn_write /
+         * nxt_conn_read) and into expiring timer work (nxt_timer_expire), any of
+         * which can still be queued on the engine when the pool is freed -- a
+         * keep-alive / mid-stream-abort straddle (e.g. send_timeout firing while
+         * a write item is pending).  Such a stale item would then dereference the
+         * freed task, notably nxt_conn_io_write()'s leading nxt_debug(task, ...):
+         * a use-after-free.  So the connection's socket and timer tasks are left
+         * pointed at the connection-scoped &c->task (as set by nxt_conn_create);
+         * only the request state machine below uses the request-scoped task.
+         * Both tasks log through &c->log with the same ident, so request log
+         * correlation is unchanged.
+         */
 
         ret = nxt_http_parse_request_init(&h1p->parser, r->mem_pool);
 
@@ -1863,10 +1882,18 @@ nxt_h1p_request_close(nxt_task_t *task, nxt_http_proto_t proto,
     nxt_router_conf_release(task, joint);
 
     c = h1p->conn;
+
+    nxt_assert(c->socket.task == &c->task);
+    nxt_assert(c->read_timer.task == &c->task);
+    nxt_assert(c->write_timer.task == &c->task);
+
     task = &c->task;
-    c->socket.task = task;
-    c->read_timer.task = task;
-    c->write_timer.task = task;
+    /*
+     * The connection's socket and timer tasks were never repointed at the
+     * request task (see nxt_h1p_conn_request_init), so they already reference
+     * &c->task; only the local task is reset for the keep-alive or shutdown
+     * that follows.
+     */
 
     if (h1p->keepalive) {
         nxt_h1p_keepalive(task, h1p, c);

@@ -66,10 +66,15 @@ jobs:
             pytest_opts: "--restart"
             # test_static is module-free; the graceful/listener drivers need
             # the python module, so the shared teardown coverage lives here.
+            # test_conn_task_race drives a send-timeout mid-stream RST abort
+            # straddling keep-alive reuse (freeunit#156): pre-fix a deferred
+            # conn write item dereferenced a freed request-pool task, which
+            # this leg's ASan build reports as a heap-use-after-free.
             tests: >-
               test/test_graceful_reload.py
               test/test_listener_drain.py
               test/test_static.py
+              test/test_conn_task_race.py
           - runtime: php
             apt: ""
             configure: php
