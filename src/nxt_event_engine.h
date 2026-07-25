@@ -484,6 +484,8 @@ struct nxt_event_engine_s {
     nxt_queue_t                active_connections;
     nxt_array_t                *mem_cache;
 
+    nxt_conn_t                 *free_connections;
+
     nxt_atomic_uint_t          accepted_conns_cnt;
     nxt_atomic_uint_t          idle_conns_cnt;
     nxt_atomic_uint_t          active_conns_cnt;

@@ -45,9 +45,35 @@ nxt_conn_create(nxt_mp_t *mp, nxt_task_t *task)
     nxt_conn_t    *c;
     nxt_thread_t  *thr;
 
-    c = nxt_mp_zget(mp, sizeof(nxt_conn_t));
-    if (nxt_slow_path(c == NULL)) {
-        return NULL;
+    thr = nxt_thread();
+
+    /*
+     * The freelist only recycles connection structs backed by the persistent
+     * engine->mem_pool, so a recycled struct outlives every per-connection
+     * pool.  When engine->mem_pool is NULL (e.g. an OOM at engine setup) the
+     * struct is allocated from the per-connection pool mp and is therefore
+     * NOT recyclable; nxt_conn_free() must not push it onto the freelist.
+     */
+
+    if (thr->engine->mem_pool != NULL) {
+
+        if (thr->engine->free_connections != NULL) {
+            c = thr->engine->free_connections;
+            thr->engine->free_connections = c->next;
+            nxt_memzero(c, sizeof(nxt_conn_t));
+
+        } else {
+            c = nxt_mp_zget(thr->engine->mem_pool, sizeof(nxt_conn_t));
+            if (nxt_slow_path(c == NULL)) {
+                return NULL;
+            }
+        }
+
+    } else {
+        c = nxt_mp_zget(mp, sizeof(nxt_conn_t));
+        if (nxt_slow_path(c == NULL)) {
+            return NULL;
+        }
     }
 
     c->mem_pool = mp;
@@ -63,7 +89,6 @@ nxt_conn_create(nxt_mp_t *mp, nxt_task_t *task)
         c->log.ident = nxt_task_next_ident();
     }
 
-    thr = nxt_thread();
     thr->engine->connections++;
 
     c->task.thread = thr;
@@ -104,12 +129,38 @@ nxt_conn_create(nxt_mp_t *mp, nxt_task_t *task)
 void
 nxt_conn_free(nxt_task_t *task, nxt_conn_t *c)
 {
-    nxt_mp_t  *mp;
+    nxt_mp_t            *mp;
+    nxt_event_engine_t  *engine;
 
-    task->thread->engine->connections--;
+    engine = task->thread->engine;
+    engine->connections--;
 
     mp = c->mem_pool;
-    nxt_mp_release(mp);
+
+    /*
+     * Only recycle structs backed by the persistent engine->mem_pool.  A
+     * freelist entry must outlive every per-connection pool, so when
+     * engine->mem_pool is NULL the struct lives in mp (== c->mem_pool) and
+     * must die with it -- pushing it would leave a dangling pointer on the
+     * freelist once mp is released below.  In the recycled case the struct
+     * does not live in mp, so releasing mp does not free the pushed struct.
+     *
+     * A conn must be freed on the engine that created it: recycling a struct
+     * backed by another engine's mem_pool would dangle once that engine is
+     * torn down.  The pre-existing connections-- accounting already relies on
+     * this; assert it so the freelist can too.
+     */
+
+    nxt_assert(c->task.thread == task->thread);
+
+    if (engine->mem_pool != NULL) {
+        c->next = engine->free_connections;
+        engine->free_connections = c;
+    }
+
+    if (mp != NULL) {
+        nxt_mp_release(mp);
+    }
 }
 
 
