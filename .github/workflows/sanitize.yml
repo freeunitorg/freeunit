@@ -70,11 +70,20 @@ jobs:
             # straddling keep-alive reuse (freeunit#156): pre-fix a deferred
             # conn write item dereferenced a freed request-pool task, which
             # this leg's ASan build reports as a heap-use-after-free.
+            #
+            # test_proxy covers the upstream (peer) connection lifecycle, which
+            # only this leg can red-line: the peer teardown paths free the peer
+            # object out of the request pool while conn events may still be
+            # queued (nxt_h1p_peer_close), and the connection-task ownership
+            # assertions are nxt_assert()s, live only in the --debug build
+            # configured below.  In the release test legs both the assertions
+            # and ASan's report are compiled out.
             tests: >-
               test/test_graceful_reload.py
               test/test_listener_drain.py
               test/test_static.py
               test/test_conn_task_race.py
+              test/test_proxy.py
           - runtime: php
             apt: ""
             configure: php

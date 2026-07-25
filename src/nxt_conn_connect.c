@@ -103,9 +103,21 @@ nxt_conn_socket(nxt_task_t *task, nxt_conn_t *c)
 
     c->socket.fd = s;
 
-    c->socket.task = task;
-    c->read_timer.task = task;
-    c->write_timer.task = task;
+    /*
+     * The socket and timer tasks are not (re)bound here: task is always
+     * &c->task already.  nxt_conn_sys_socket() is the only caller and runs as a
+     * work item enqueued by nxt_conn_connect() with c->socket.task, which
+     * nxt_conn_create() set to &c->task and no outgoing-connection path
+     * rebinds.  Keeping these tasks connection-scoped is what makes every
+     * later nxt_debug(c->socket.task, ...) and c->socket.task->thread->engine
+     * deref safe for the whole lifetime of the connection: a task bound to a
+     * shorter-lived pool (e.g. the request-embedded &r->task) would be captured
+     * by value into deferred work items and expiring timers and could outlive
+     * its pool -- the use-after-free class of freeunit#156.
+     */
+    nxt_assert(c->socket.task == &c->task);
+    nxt_assert(c->read_timer.task == &c->task);
+    nxt_assert(c->write_timer.task == &c->task);
 
     if (c->local != NULL) {
         if (nxt_slow_path(nxt_socket_bind(task, s, c->local) != NXT_OK)) {
