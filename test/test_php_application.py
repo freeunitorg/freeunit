@@ -922,3 +922,51 @@ def test_php_options_file_cstring_nul():
     resp = conf_file("")
     assert 'must not be empty' in resp.get('detail', ''), 'file empty'
     assert 'success' in conf_file("/tmp/php.ini"), 'file valid'
+
+
+def test_php_application_duplicate_content_length():
+    # Two disagreeing Content-Length headers from the application are a
+    # response-smuggling primitive: forwarding both lets a downstream proxy or
+    # cache that honours the other value desync from the connection.  Neither
+    # may reach the client; the body is framed by chunked encoding instead.
+    client.load('dup_content_length')
+
+    resp = client.get()
+
+    assert resp['status'] == 200, 'status'
+    assert 'Content-Length' not in resp['headers'], 'no Content-Length'
+    assert (
+        resp['headers']['Transfer-Encoding'] == 'chunked'
+    ), 'chunked framing'
+    assert resp['body'] == '0123456789', 'body intact'
+
+
+def test_php_application_comma_content_length():
+    # "Content-Length: 10, 200" is the list form of the same disagreement as
+    # two separate headers and reaches a downstream parser identically, so it
+    # must be rejected identically -- and the response must still be framed.
+    client.load('comma_content_length')
+
+    resp = client.get()
+
+    assert resp['status'] == 200, 'status'
+    assert 'Content-Length' not in resp['headers'], 'no Content-Length'
+    assert (
+        resp['headers']['Transfer-Encoding'] == 'chunked'
+    ), 'chunked framing'
+    assert resp['body'] == '0123456789', 'body intact'
+
+
+def test_php_application_content_length_not_reinstated():
+    # Once a Content-Length has been rejected, a later syntactically valid one
+    # must not be taken as the first and used to frame the body.
+    client.load('comma_then_valid_content_length')
+
+    resp = client.get()
+
+    assert resp['status'] == 200, 'status'
+    assert 'Content-Length' not in resp['headers'], 'no Content-Length'
+    assert (
+        resp['headers']['Transfer-Encoding'] == 'chunked'
+    ), 'chunked framing'
+    assert resp['body'] == '0123456789', 'body intact'
