@@ -69,6 +69,18 @@ nxt_conn_create(nxt_mp_t *mp, nxt_task_t *task)
     c->task.thread = thr;
     c->task.log = &c->log;
     c->task.ident = c->log.ident;
+
+    /*
+     * The socket and timer tasks are captured by value into deferred work items
+     * (nxt_conn_read / nxt_conn_write / nxt_conn_connect) and into expiring
+     * timer work, so they must not be rebound to a task living in a
+     * shorter-lived pool than the connection (e.g. the request-embedded
+     * &r->task): an item still queued when that pool is released would
+     * dereference freed memory -- freeunit#156.  The ownership is asserted at
+     * the sites that used to rebind these fields: nxt_h1p_conn_request_init()
+     * and nxt_h1p_request_close() for accepted connections, nxt_conn_socket()
+     * and nxt_h1p_peer_close() for outgoing ones.
+     */
     c->socket.task = &c->task;
     c->read_timer.task = &c->task;
     c->write_timer.task = &c->task;

@@ -3222,10 +3222,19 @@ nxt_h1p_peer_close(nxt_task_t *task, nxt_http_peer_t *peer)
     peer->closed = 1;
 
     c = peer->proto.h1->conn;
+
+    nxt_assert(c->socket.task == &c->task);
+    nxt_assert(c->read_timer.task == &c->task);
+    nxt_assert(c->write_timer.task == &c->task);
+
+    /*
+     * The upstream connection's socket and timer tasks are connection-scoped
+     * for its whole lifetime (nxt_conn_create() sets them; nxt_conn_socket()
+     * only rechecks), so there is nothing to reset here -- only the local task
+     * is switched to the connection for the close below, which runs after the
+     * request may already be gone.
+     */
     task = &c->task;
-    c->socket.task = task;
-    c->read_timer.task = task;
-    c->write_timer.task = task;
 
     /*
      * Block further I/O on the upstream connection and cancel its timers.
