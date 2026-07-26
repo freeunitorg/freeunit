@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from unit.applications.proto import ApplicationProto
+from unit.status import Status
 
 client = ApplicationProto()
 
@@ -71,3 +72,20 @@ def test_conn_recycle_across_thread_churn():
         _churn(60)
         assert 'success' in client.conf('4', 'settings/listen_threads')
         _churn(60)
+
+
+def test_conn_recycle_connection_accounting():
+    # The body-integrity churn above passes identically whether structs are
+    # recycled, parked forever, or never pushed at all, so it cannot see the
+    # recycler stop working -- notably pending_connections growing without
+    # bound because some struct never settles.  Pin the counters the recycler
+    # now sits beside instead: every churned connection must be accounted for
+    # and none may be left behind once the churn is over.
+    Status.init()
+
+    _churn(60)
+
+    assert Status.get('/connections/accepted') == 60, 'all accepted'
+    assert Status.get('/connections/active') == 0, 'none left active'
+    assert Status.get('/connections/idle') == 0, 'none left idle'
+    assert Status.get('/connections/closed') == 60, 'all closed'
