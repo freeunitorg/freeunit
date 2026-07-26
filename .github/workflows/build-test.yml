@@ -515,3 +515,6 @@ jobs:
 
       - name: Run libunit close-provenance test
         run: ./build/unit_close_test
+
+      - name: Run libunit port_recv fd-ownership test
+        run: ./build/unit_port_recv_test
