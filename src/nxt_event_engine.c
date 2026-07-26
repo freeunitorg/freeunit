@@ -547,6 +547,12 @@ nxt_event_engine_start(nxt_event_engine_t *engine)
             handler = nxt_event_engine_queue_pop(engine, &task, &obj, &data);
 
             if (handler == NULL) {
+                /*
+                 * Every work queue is empty here, so no queued item can still
+                 * reference a connection struct freed during this drain.  This
+                 * is the only point at which parked structs become reusable.
+                 */
+                nxt_conn_recycle_pending(engine);
                 break;
             }
 
