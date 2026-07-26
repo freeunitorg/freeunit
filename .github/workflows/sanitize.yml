@@ -78,12 +78,19 @@ jobs:
             # assertions are nxt_assert()s, live only in the --debug build
             # configured below.  In the release test legs both the assertions
             # and ASan's report are compiled out.
+            #
+            # test_chunked's split-read case drives a chunked request body whose
+            # framing arrives in its own segments, which is how the request read
+            # buffer reaches the parser's recycle path.  Without ASan a stale
+            # buffer is usually silently reused, so only this leg turns that
+            # back into a hard failure.
             tests: >-
               test/test_graceful_reload.py
               test/test_listener_drain.py
               test/test_static.py
               test/test_conn_task_race.py
               test/test_proxy.py
+              test/test_chunked.py
           - runtime: php
             apt: ""
             configure: php

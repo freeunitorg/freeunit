@@ -925,6 +925,15 @@ nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
 
         r->chunked = 1;
         h1p->chunked_parse.mem_pool = r->mem_pool;
+
+        /*
+         * Every buffer this parser sees on the request path belongs to someone
+         * else: the header buffer stays linked in h1p->buffers (parsed fields
+         * still point into it) and the body buffer lives in the request memory
+         * pool and remains c->read for the rest of the body.  Neither may be
+         * handed to its completion handler when a read carries only framing.
+         */
+        h1p->chunked_parse.retain_buffers = 1;
         break;
 
     case NXT_HTTP_TE_UNSUPPORTED:
