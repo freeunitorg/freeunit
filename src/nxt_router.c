@@ -4263,7 +4263,7 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     size_t                  b_size, count;
     nxt_int_t               ret;
     nxt_app_t               *app;
-    nxt_buf_t               *b, *next;
+    nxt_buf_t               *b, *next, *last_b, *owned_b;
     nxt_port_t              *app_port;
     nxt_unit_field_t        *f;
     nxt_http_field_t        *field;
@@ -4292,12 +4292,17 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         return;
     }
 
+    last_b = NULL;
+    owned_b = NULL;
+
     b = (msg->size == 0) ? NULL : msg->buf;
 
     if (msg->port_msg.last != 0) {
         nxt_debug(task, "router data create last buf");
 
-        nxt_buf_chain_add(&b, nxt_http_buf_last(r));
+        last_b = nxt_http_buf_last(r);
+
+        nxt_buf_chain_add(&b, last_b);
 
         req_rpc_data->rpc_cancel = 0;
 
@@ -4322,10 +4327,17 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     if (msg->buf == b) {
         /* Disable instant buffer completion/re-using by port. */
         msg->buf = NULL;
+
+        /*
+         * The port will not complete these buffers anymore, track them
+         * to release the shared memory they hold on the error path.
+         */
+        owned_b = b;
     }
 
     if (r->header_sent) {
         nxt_buf_chain_add(&r->out, b);
+        owned_b = NULL;
 
         ret = nxt_http_comp_compress_app_response(task, r, &r->out);
         if (ret == NXT_ERROR) {
@@ -4408,19 +4420,30 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
             next = b->next;
             b->next = NULL;
 
+            if (owned_b == b) {
+                owned_b = next;
+            }
+
             nxt_work_queue_add(&task->thread->engine->fast_work_queue,
                                b->completion_handler, task, b, b->parent);
 
             b = next;
         }
 
-        if (b != NULL) {
-            nxt_buf_chain_add(&r->out, b);
-        }
-
+        /*
+         * Check compression before handing the chain over to r->out, so that
+         * the rejection below still owns it: nothing drains r->out on the
+         * error path.  nxt_http_comp_check_compression() reads r->resp and
+         * the request configuration, never r->out, so the order is free.
+         */
         ret = nxt_http_comp_check_compression(task, r);
         if (ret != NXT_OK) {
             goto fail;
+        }
+
+        if (b != NULL) {
+            nxt_buf_chain_add(&r->out, b);
+            owned_b = NULL;
         }
 
         nxt_http_request_header_send(task, r, nxt_http_request_send_body, NULL);
@@ -4456,6 +4479,25 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 fail:
 
     nxt_http_request_error(task, r, NXT_HTTP_SERVICE_UNAVAILABLE);
+
+    /*
+     * Complete the buffers adopted from the port above, if any: nobody else
+     * holds them.  Stop at last_b: it is the request's own sync buffer and
+     * completing it here would close the request before the error response
+     * has been sent.
+     *
+     * This runs after the error response has been built on purpose.  Fields
+     * already added to r->resp point straight into the application's shared
+     * memory chunk, and completing these buffers hands that chunk back to
+     * the application; releasing it any earlier would make the response
+     * depend on nxt_http_request_error() having reset the field store first.
+     */
+    while (owned_b != NULL && owned_b != last_b) {
+        b = owned_b->next;
+        owned_b->next = NULL;
+        owned_b->completion_handler(task, owned_b, owned_b->parent);
+        owned_b = b;
+    }
 
     nxt_request_rpc_data_unlink(task, req_rpc_data);
 }
