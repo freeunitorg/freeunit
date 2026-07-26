@@ -1,9 +1,11 @@
 import socket
+import time
 from pathlib import Path
 
 import pytest
 
 from unit.applications.proto import ApplicationProto
+from unit.status import Status
 
 client = ApplicationProto()
 
@@ -59,6 +61,33 @@ def _churn(n):
             sock.close()
 
 
+def _wait_conns(expected, timeout=100):
+    # A client-observed EOF is not a server-side barrier.  nxt_conn_close()
+    # enqueues nxt_conn_shutdown_handler(), which performs the SHUT_RDWR the
+    # client sees as EOF and only then enqueues nxt_conn_close_handler() on
+    # the engine's close_work_queue; nxt_conn_untrack(), which moves a
+    # connection out of the active/idle queues and into closed_conns_cnt,
+    # runs in that later handler (src/nxt_conn_close.c).  So the last
+    # connection of a churn can still be counted active after the client has
+    # read the whole body and closed -- reading through to EOF does not fix
+    # this, it only narrows the window.
+    #
+    # Poll rather than sleep: the close queue drains immediately in the
+    # common case, while a fixed delay would be dead time on every run and
+    # still too short under the sanitizer.  Return the last reading either
+    # way, so that a real accounting bug fails as the counter mismatch it is
+    # rather than as an opaque timeout.
+    for _ in range(timeout):
+        conns = Status.get('/connections')
+
+        if conns == expected:
+            break
+
+        time.sleep(0.1)
+
+    return conns
+
+
 def test_conn_recycle_across_thread_churn():
     # Populate the per-engine connection freelists.
     _churn(120)
@@ -71,3 +100,24 @@ def test_conn_recycle_across_thread_churn():
         _churn(60)
         assert 'success' in client.conf('4', 'settings/listen_threads')
         _churn(60)
+
+
+def test_conn_recycle_connection_accounting():
+    # The body-integrity churn above passes identically whether structs are
+    # recycled, parked forever, or never pushed at all, so it cannot see the
+    # recycler stop working -- notably pending_connections growing without
+    # bound because some struct never settles.  Pin the counters the recycler
+    # now sits beside instead: every churned connection must be accounted for
+    # and none may be left behind once the churn is over.
+    Status.init()
+
+    _churn(60)
+
+    conns = _wait_conns(
+        {'accepted': 60, 'active': 0, 'idle': 0, 'closed': 60}
+    )
+
+    assert conns['accepted'] == 60, 'all accepted'
+    assert conns['active'] == 0, 'none left active'
+    assert conns['idle'] == 0, 'none left idle'
+    assert conns['closed'] == 60, 'all closed'

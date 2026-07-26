@@ -7,6 +7,13 @@
 #include <nxt_main.h>
 
 
+#if (NXT_DEBUG)
+static nxt_bool_t nxt_conn_is_parked(nxt_event_engine_t *engine,
+    nxt_conn_t *c);
+#endif
+static nxt_bool_t nxt_conn_timer_quiescent(nxt_timer_t *timer);
+
+
 nxt_conn_io_t  nxt_unix_conn_io = {
     .connect = nxt_conn_io_connect,
     .accept = nxt_conn_io_accept,
@@ -153,18 +160,31 @@ nxt_conn_free(nxt_task_t *task, nxt_conn_t *c)
 
     nxt_assert(c->task.thread == task->thread);
 
+    /*
+     * Take both timers out of the engine's timer machinery, and take the conn
+     * off whichever tracking queue it is on.  Callers only ever
+     * nxt_timer_disable() a timer, which clears the enabled bit but leaves the
+     * node in the engine's rbtree, and they rely on nxt_conn_close_handler()
+     * having untracked the conn -- both leave a live node inside a struct that
+     * nxt_conn_create() re-zeroes on reuse, silently corrupting the rbtree or
+     * the idle/active queue and drifting their counters.  nxt_conn_untrack() is
+     * idempotent and nxt_timer_delete()'s removal can be deferred as a queued
+     * change, so quiescence is rechecked in nxt_conn_recycle_pending().
+     *
+     * Both run outside the recycling branch below: on the non-recycling path
+     * the struct dies with mp, so a node left in the rbtree or on a tracking
+     * queue would dangle into released memory rather than be re-zeroed -- the
+     * same defect with a worse failure mode.
+     */
+
+    nxt_assert(c->idle == NXT_CONN_TRACK_NONE);
+    nxt_conn_untrack(engine, c);
+
+    nxt_timer_delete(engine, &c->read_timer);
+    nxt_timer_delete(engine, &c->write_timer);
+
     if (engine->mem_pool != NULL) {
-        /*
-         * Take both timers out of the engine's timer machinery.  Callers only
-         * ever nxt_timer_disable() them, which clears the enabled bit but
-         * leaves the node in the engine's rbtree -- re-zeroing the struct on
-         * reuse would then corrupt that tree.  nxt_timer_delete() removes it,
-         * but the removal can be deferred as a queued change, so quiescence is
-         * rechecked in nxt_conn_recycle_pending() before the struct is handed
-         * out again.
-         */
-        nxt_timer_delete(engine, &c->read_timer);
-        nxt_timer_delete(engine, &c->write_timer);
+        nxt_assert(!nxt_conn_is_parked(engine, c));
 
         /*
          * Park the struct rather than publishing it to the freelist directly.
@@ -187,7 +207,7 @@ nxt_conn_free(nxt_task_t *task, nxt_conn_t *c)
 }
 
 
-nxt_inline nxt_bool_t
+static nxt_bool_t
 nxt_conn_timer_quiescent(nxt_timer_t *timer)
 {
     return !nxt_timer_is_in_tree(timer)
@@ -196,12 +216,41 @@ nxt_conn_timer_quiescent(nxt_timer_t *timer)
 }
 
 
+#if (NXT_DEBUG)
+
+/*
+ * A conn freed twice would appear on pending_connections twice; the promotion
+ * walk then splices it onto free_connections twice and the two lists end up
+ * aliasing, so distinct live connections can be handed the same struct.  Catch
+ * it at the source in debug builds rather than at the far-away symptom.
+ */
+
+static nxt_bool_t
+nxt_conn_is_parked(nxt_event_engine_t *engine, nxt_conn_t *c)
+{
+    nxt_conn_t  *p;
+
+    for (p = engine->pending_connections; p != NULL; p = p->next) {
+        if (p == c) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+#endif
+
+
 /*
  * Publish parked connection structs to the reusable freelist.  Called from the
- * event engine once nxt_event_engine_queue_pop() reports every work queue
- * empty: at that point no queued work item can reference any parked struct, so
- * reuse cannot race a handler that is still to run.  A struct whose timers have
- * not settled yet stays parked and is retried on a later cycle.
+ * event engine once nxt_event_engine_queue_pop() reports every engine-local
+ * work queue empty: at that point no queued work item can reference any parked
+ * struct, so reuse cannot race a handler that is still to run.  A struct whose
+ * timers have not settled yet stays parked and is retried on a later cycle.
+ *
+ * See nxt_event_engine_start() for why the cross-thread locked_work_queue is
+ * outside this barrier and why that is currently safe.
  */
 
 void

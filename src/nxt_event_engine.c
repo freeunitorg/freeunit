@@ -548,9 +548,18 @@ nxt_event_engine_start(nxt_event_engine_t *engine)
 
             if (handler == NULL) {
                 /*
-                 * Every work queue is empty here, so no queued item can still
-                 * reference a connection struct freed during this drain.  This
-                 * is the only point at which parked structs become reusable.
+                 * Every engine-local work queue is empty here, so no queued
+                 * item can still reference a connection struct freed during
+                 * this drain.  This is the only point at which parked structs
+                 * become reusable.
+                 *
+                 * engine->locked_work_queue is deliberately not covered: it is
+                 * the cross-thread post queue, drained separately by
+                 * nxt_event_engine_post_handler() after poll, and reading its
+                 * head here would race its spinlock.  Nothing posted through
+                 * nxt_event_engine_post() carries an nxt_conn_t today, so the
+                 * barrier holds -- but a future post that does would need this
+                 * revisited rather than assumed covered.
                  */
                 nxt_conn_recycle_pending(engine);
                 break;
