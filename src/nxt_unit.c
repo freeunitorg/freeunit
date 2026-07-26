@@ -6332,7 +6332,15 @@ retry:
             port_impl->from_socket--;
 
             nxt_unit_rbuf_cpy(rbuf, port_impl->socket_rbuf);
+
+            /*
+             * The suspend buffer is not recycled through
+             * nxt_unit_read_buf_get(), so clear its control data along with
+             * its payload: descriptors named there now belong to rbuf, and
+             * a leftover oob.size would offer them again.
+             */
             port_impl->socket_rbuf->size = 0;
+            port_impl->socket_rbuf->oob.size = 0;
 
             nxt_unit_debug(ctx, "port{%d,%d} use suspended message %d",
                            (int) port->id.pid, (int) port->id.id,
@@ -6495,6 +6503,31 @@ nxt_unit_port_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
             return NXT_UNIT_ERROR;
         }
 
+        /*
+         * oob_size is in/out: it goes in as the capacity of rbuf->oob.buf
+         * and is expected to come back as the length of the control data
+         * actually received.  A callback that reports "no message" without
+         * assigning it leaves the capacity in place, and the control bytes
+         * of the previous message are still in this recycled buffer: they
+         * would then be parsed as a fresh SCM_RIGHTS and their descriptors
+         * closed a second time, hitting a live port fd or, once the number
+         * has been reused, an unrelated one.  Control data is only ever
+         * carried by a message, so accept it only alongside one, and never
+         * beyond the buffer.
+         */
+        if (nxt_slow_path(oob_size > sizeof(rbuf->oob.buf))) {
+            nxt_unit_alert(ctx, "port{%d,%d} recvcb reported %d control bytes "
+                           "for a %d byte buffer", (int) port->id.pid,
+                           (int) port->id.id, (int) oob_size,
+                           (int) sizeof(rbuf->oob.buf));
+
+            oob_size = 0;
+        }
+
+        if (nxt_slow_path(rbuf->size == 0)) {
+            oob_size = 0;
+        }
+
         rbuf->oob.size = oob_size;
         return NXT_UNIT_OK;
     }
@@ -6510,6 +6543,13 @@ retry:
 
     if (nxt_slow_path(rbuf->size == -1)) {
         err = errno;
+
+        /*
+         * nxt_recvmsg() assigns oob.size only when recvmsg() succeeded, so
+         * clear it here to keep "size 0 implies no control data" holding on
+         * every exit of this function rather than by inspection of callers.
+         */
+        rbuf->oob.size = 0;
 
         if (err == EINTR) {
             goto retry;

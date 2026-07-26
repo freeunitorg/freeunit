@@ -224,6 +224,15 @@ func nxt_go_port_recv(pid C.int, id C.int, buf unsafe.Pointer, buf_size C.int,
 		id:  int(id),
 	}
 
+	// oob_size arrives as the capacity of the control buffer and is read
+	// back by libunit as the length actually received.  Every return path
+	// must assign it: leaving the capacity behind on a path that received
+	// nothing (EOF at teardown, unknown port) makes libunit parse the
+	// control bytes of the *previous* message, still present in that
+	// recycled buffer, and close its descriptors a second time.
+	oob_capacity := C.int(*oob_size)
+	*oob_size = 0
+
 	p := find_port(key)
 
 	if p == nil {
@@ -232,7 +241,7 @@ func nxt_go_port_recv(pid C.int, id C.int, buf unsafe.Pointer, buf_size C.int,
 	}
 
 	n, oobn, _, _, err := p.rcv.ReadMsgUnix(GoBytes(buf, buf_size),
-		GoBytes(oob, C.int(*oob_size)))
+		GoBytes(oob, oob_capacity))
 
 	if err != nil {
 		if nerr, ok := err.(*net.OpError); ok {
