@@ -154,12 +154,77 @@ nxt_conn_free(nxt_task_t *task, nxt_conn_t *c)
     nxt_assert(c->task.thread == task->thread);
 
     if (engine->mem_pool != NULL) {
-        c->next = engine->free_connections;
-        engine->free_connections = c;
+        /*
+         * Take both timers out of the engine's timer machinery.  Callers only
+         * ever nxt_timer_disable() them, which clears the enabled bit but
+         * leaves the node in the engine's rbtree -- re-zeroing the struct on
+         * reuse would then corrupt that tree.  nxt_timer_delete() removes it,
+         * but the removal can be deferred as a queued change, so quiescence is
+         * rechecked in nxt_conn_recycle_pending() before the struct is handed
+         * out again.
+         */
+        nxt_timer_delete(engine, &c->read_timer);
+        nxt_timer_delete(engine, &c->write_timer);
+
+        /*
+         * Park the struct rather than publishing it to the freelist directly.
+         * A conn can be freed while work items that reference it are still
+         * queued -- nxt_h1p_peer_close() sets block_read/block_write for
+         * exactly that reason, then reaches nxt_conn_free() synchronously on
+         * its fd == -1 path.  Handing the struct out now would let
+         * nxt_conn_create()'s re-zero clear those guards from under the queued
+         * item, which would then act on an unrelated live connection.
+         * nxt_conn_recycle_pending() promotes the struct only once the engine
+         * has drained every work queue, so no queued item can still reach it.
+         */
+        c->next = engine->pending_connections;
+        engine->pending_connections = c;
     }
 
     if (mp != NULL) {
         nxt_mp_release(mp);
+    }
+}
+
+
+nxt_inline nxt_bool_t
+nxt_conn_timer_quiescent(nxt_timer_t *timer)
+{
+    return !nxt_timer_is_in_tree(timer)
+           && !timer->queued
+           && timer->change == NXT_TIMER_NO_CHANGE;
+}
+
+
+/*
+ * Publish parked connection structs to the reusable freelist.  Called from the
+ * event engine once nxt_event_engine_queue_pop() reports every work queue
+ * empty: at that point no queued work item can reference any parked struct, so
+ * reuse cannot race a handler that is still to run.  A struct whose timers have
+ * not settled yet stays parked and is retried on a later cycle.
+ */
+
+void
+nxt_conn_recycle_pending(nxt_event_engine_t *engine)
+{
+    nxt_conn_t  *c, *next, **link;
+
+    link = &engine->pending_connections;
+
+    for (c = *link; c != NULL; c = next) {
+        next = c->next;
+
+        if (nxt_conn_timer_quiescent(&c->read_timer)
+            && nxt_conn_timer_quiescent(&c->write_timer))
+        {
+            *link = next;
+
+            c->next = engine->free_connections;
+            engine->free_connections = c;
+
+        } else {
+            link = &c->next;
+        }
     }
 }
 
