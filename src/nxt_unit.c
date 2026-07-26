@@ -4456,7 +4456,7 @@ nxt_unit_mmap_read(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
 {
     int                     res;
     void                    *start;
-    uint32_t                size;
+    uint32_t                size, nchunks;
     nxt_unit_impl_t         *lib;
     nxt_unit_mmaps_t        *mmaps;
     nxt_unit_mmap_buf_t     *b, **incoming_tail;
@@ -4513,6 +4513,43 @@ nxt_unit_mmap_read(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
             }
 
             return res;
+        }
+
+        /*
+         * mmap_msg fields originate from the router; reject offsets that
+         * would point outside the mapped data area before they reach the
+         * pointer arithmetic below.
+         */
+        nchunks = mmap_msg->size / PORT_MMAP_CHUNK_SIZE;
+        if ((mmap_msg->size % PORT_MMAP_CHUNK_SIZE) != 0) {
+            nchunks++;
+        }
+
+        if (nxt_slow_path(mmap_msg->chunk_id >= PORT_MMAP_CHUNK_COUNT
+                          || nchunks > (uint32_t) PORT_MMAP_CHUNK_COUNT
+                                       - mmap_msg->chunk_id))
+        {
+            nxt_unit_alert(ctx, "#%"PRIu32": mmap_read: invalid mmap message: "
+                           "chunk_id %"PRIu32", size %"PRIu32
+                           " (chunks %"PRIu32", max %d)",
+                           recv_msg->stream, mmap_msg->chunk_id,
+                           mmap_msg->size, nchunks, PORT_MMAP_CHUNK_COUNT);
+
+            pthread_mutex_unlock(&mmaps->mutex);
+
+            /*
+             * Entries before the rejected one are already populated, and
+             * this message is dropped rather than retried, so their chunks
+             * have to be marked free as well: nxt_unit_mmap_buf_release()
+             * alone would recycle the wrappers and leave the chunks busy in
+             * the peer's segment for good.  Entries not reached yet have a
+             * NULL hdr and are skipped by nxt_unit_free_outgoing_buf().
+             */
+            while (recv_msg->incoming_buf != NULL) {
+                nxt_unit_mmap_buf_free(recv_msg->incoming_buf);
+            }
+
+            return NXT_UNIT_ERROR;
         }
 
         start = nxt_port_mmap_chunk_start(hdr, mmap_msg->chunk_id);
