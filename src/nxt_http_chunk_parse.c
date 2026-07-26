@@ -180,7 +180,7 @@ nxt_http_chunk_parse(nxt_task_t *task, nxt_http_chunk_parse_t *hcp,
             }
         }
 
-        if (b->retain == 0) {
+        if (b->retain == 0 && !hcp->retain_buffers) {
             /* No chunk data was found in a buffer. */
             nxt_work_queue_add(&task->thread->engine->fast_work_queue,
                                b->completion_handler, task, b, b->parent);
