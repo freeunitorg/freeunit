@@ -46,7 +46,20 @@ nxt_port_mmap_handler_use(nxt_port_mmap_handler_t *mmap_handler, int i)
 static nxt_port_mmap_t *
 nxt_port_mmap_at(nxt_port_mmaps_t *port_mmaps, uint32_t i)
 {
-    uint32_t  cap;
+    uint32_t         cap;
+    nxt_port_mmap_t  *elts;
+
+    if (nxt_fast_path(i < port_mmaps->size)) {
+        return port_mmaps->elts + i;
+    }
+
+    /*
+     * A capacity able to hold slot i is i + 1 elements, which is not
+     * representable in uint32_t for i == UINT32_MAX.
+     */
+    if (nxt_slow_path(i == UINT32_MAX)) {
+        return NULL;
+    }
 
     cap = port_mmaps->cap;
 
@@ -54,27 +67,41 @@ nxt_port_mmap_at(nxt_port_mmaps_t *port_mmaps, uint32_t i)
         cap = i + 1;
     }
 
-    while (i + 1 > cap) {
+    /*
+     * Comparing capacities rather than "i + 1 > cap": the latter wraps to
+     * 0 for i == UINT32_MAX and silently skips the growth.
+     */
+    while (cap <= i) {
 
         if (cap < 16) {
             cap = cap * 2;
 
         } else {
+            /*
+             * The 1.5x step overflows uint32_t for large capacities and
+             * wraps below the target, so the loop would spin forever with
+             * the caller's mutex held.
+             */
+            if (nxt_slow_path(cap > UINT32_MAX - cap / 2)) {
+                return NULL;
+            }
+
             cap = cap + cap / 2;
         }
     }
 
     if (cap != port_mmaps->cap) {
 
-        port_mmaps->elts = nxt_realloc(port_mmaps->elts,
-                                       cap * sizeof(nxt_port_mmap_t));
-        if (nxt_slow_path(port_mmaps->elts == NULL)) {
+        /* nxt_realloc() does not free the old array on failure. */
+        elts = nxt_realloc(port_mmaps->elts, cap * sizeof(nxt_port_mmap_t));
+        if (nxt_slow_path(elts == NULL)) {
             return NULL;
         }
 
-        nxt_memzero(port_mmaps->elts + port_mmaps->cap,
+        nxt_memzero(elts + port_mmaps->cap,
                     sizeof(nxt_port_mmap_t) * (cap - port_mmaps->cap));
 
+        port_mmaps->elts = elts;
         port_mmaps->cap = cap;
     }
 
@@ -98,14 +125,28 @@ nxt_port_mmaps_destroy(nxt_port_mmaps_t *port_mmaps, nxt_bool_t free_elts)
 
     port_mmap = port_mmaps->elts;
 
-    for (i = 0; i < port_mmaps->size; i++) {
-        nxt_port_mmap_handler_use(port_mmap[i].mmap_handler, -1);
+    if (port_mmap != NULL) {
+
+        for (i = 0; i < port_mmaps->size; i++) {
+            /*
+             * The array is indexed by the peer's segment id, so unused
+             * slots in the middle are genuinely NULL.
+             */
+            if (port_mmap[i].mmap_handler != NULL) {
+                nxt_port_mmap_handler_use(port_mmap[i].mmap_handler, -1);
+
+                port_mmap[i].mmap_handler = NULL;
+            }
+        }
     }
 
     port_mmaps->size = 0;
 
     if (free_elts != 0) {
         nxt_free(port_mmaps->elts);
+
+        port_mmaps->elts = NULL;
+        port_mmaps->cap = 0;
     }
 }
 
@@ -205,6 +246,8 @@ nxt_port_incoming_port_mmap(nxt_task_t *task, nxt_process_t *process,
     nxt_fd_t fd)
 {
     void                     *mem;
+    uint32_t                 id;
+    nxt_pid_t                src_pid, dst_pid;
     struct stat              mmap_stat;
     nxt_port_mmap_t          *port_mmap;
     nxt_port_mmap_header_t   *hdr;
@@ -221,7 +264,20 @@ nxt_port_incoming_port_mmap(nxt_task_t *task, nxt_process_t *process,
         return NULL;
     }
 
-    mem = nxt_mem_mmap(NULL, mmap_stat.st_size,
+    /*
+     * The peer sizes the segment; chunk addressing and every munmap() use
+     * the PORT_MMAP_SIZE constant, so anything else is out of bounds one
+     * way or the other.
+     */
+    if (nxt_slow_path(mmap_stat.st_size != PORT_MMAP_SIZE)) {
+        nxt_log(task, NXT_LOG_WARN, "unexpected shared memory segment size "
+                "%O from process %PI, expected %uz", mmap_stat.st_size,
+                process->pid, (size_t) PORT_MMAP_SIZE);
+
+        return NULL;
+    }
+
+    mem = nxt_mem_mmap(NULL, PORT_MMAP_SIZE,
                        PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 
     if (nxt_slow_path(mem == MAP_FAILED)) {
@@ -232,12 +288,29 @@ nxt_port_incoming_port_mmap(nxt_task_t *task, nxt_process_t *process,
 
     hdr = mem;
 
-    if (nxt_slow_path(hdr->src_pid != process->pid
-                      || hdr->dst_pid != nxt_pid))
-    {
+    /*
+     * The header lives in a segment the peer still maps writable, so every
+     * field has to be snapshotted before it is validated: re-reading one
+     * afterwards is a double fetch the peer can win, and for the segment id
+     * that would put an unvalidated value into nxt_port_mmap_at() below.
+     */
+    src_pid = hdr->src_pid;
+    dst_pid = hdr->dst_pid;
+    id = hdr->id;
+
+    if (nxt_slow_path(src_pid != process->pid || dst_pid != nxt_pid)) {
         nxt_log(task, NXT_LOG_WARN, "unexpected pid in mmap header detected: "
-                "%PI != %PI or %PI != %PI", hdr->src_pid, process->pid,
-                hdr->dst_pid, nxt_pid);
+                "%PI != %PI or %PI != %PI", src_pid, process->pid,
+                dst_pid, nxt_pid);
+
+        nxt_mem_munmap(mem, PORT_MMAP_SIZE);
+
+        return NULL;
+    }
+
+    if (nxt_slow_path(id >= NXT_PORT_MMAP_MAX_SEGMENTS)) {
+        nxt_log(task, NXT_LOG_WARN, "unexpected segment id in mmap header "
+                "detected: %uD from process %PI", id, process->pid);
 
         nxt_mem_munmap(mem, PORT_MMAP_SIZE);
 
@@ -258,7 +331,7 @@ nxt_port_incoming_port_mmap(nxt_task_t *task, nxt_process_t *process,
 
     nxt_thread_mutex_lock(&process->incoming.mutex);
 
-    port_mmap = nxt_port_mmap_at(&process->incoming, hdr->id);
+    port_mmap = nxt_port_mmap_at(&process->incoming, id);
     if (nxt_slow_path(port_mmap == NULL)) {
         nxt_log(task, NXT_LOG_WARN, "failed to add mmap to incoming array");
 
@@ -268,6 +341,15 @@ nxt_port_incoming_port_mmap(nxt_task_t *task, nxt_process_t *process,
         mmap_handler = NULL;
 
         goto fail;
+    }
+
+    /*
+     * Nothing stops the peer from reusing a segment id: without releasing
+     * the displaced handler its reference would never drop to zero and its
+     * mapping would leak for the lifetime of the router.
+     */
+    if (nxt_slow_path(port_mmap->mmap_handler != NULL)) {
+        nxt_port_mmap_handler_use(port_mmap->mmap_handler, -1);
     }
 
     port_mmap->mmap_handler = mmap_handler;
