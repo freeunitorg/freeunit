@@ -30,6 +30,23 @@
 #define PORT_MMAP_SIZE          (PORT_MMAP_HEADER_SIZE + PORT_MMAP_DATA_SIZE)
 #define PORT_MMAP_CHUNK_COUNT   (PORT_MMAP_DATA_SIZE / PORT_MMAP_CHUNK_SIZE)
 
+/*
+ * The segment id of an incoming mmap is authored by the peer process and
+ * used as an index into nxt_process_t.incoming, so it has to be bounded.
+ *
+ * libunit assigns ids as append-only indices into its outgoing array and
+ * refuses to create a segment once that array reaches shm_mmap_limit, which
+ * is shm_limit / PORT_MMAP_DATA_SIZE computed in uint32_t.  So no conforming
+ * peer can exceed floor(UINT32_MAX / PORT_MMAP_DATA_SIZE), whatever the
+ * configured shm limit.
+ *
+ * Derived from the geometry rather than written out, because
+ * NXT_MMAP_TINY_CHUNK changes PORT_MMAP_DATA_SIZE by four orders of
+ * magnitude: 410 segments here, but 4194304 in a tiny-chunk build, where a
+ * hard-coded production-sized bound would reject legitimate traffic.
+ */
+#define NXT_PORT_MMAP_MAX_SEGMENTS  (UINT32_MAX / PORT_MMAP_DATA_SIZE + 1)
+
 
 typedef uint32_t  nxt_chunk_id_t;
 
