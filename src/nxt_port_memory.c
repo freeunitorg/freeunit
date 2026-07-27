@@ -648,26 +648,6 @@ nxt_port_get_port_incoming_mmap(nxt_task_t *task, nxt_pid_t spid, uint32_t id)
 }
 
 
-/*
- * Validate that a peer-supplied (chunk_id, nchunks) pair refers to a
- * region wholly inside the mapped data area.  Returns non-zero on
- * success.  Underflow-safe: subtracts on the constant side.
- */
-nxt_inline nxt_bool_t
-nxt_port_mmap_chunk_range_valid(nxt_chunk_id_t chunk_id, size_t nchunks)
-{
-    if (chunk_id >= PORT_MMAP_CHUNK_COUNT) {
-        return 0;
-    }
-
-    if (nchunks > (size_t) PORT_MMAP_CHUNK_COUNT - chunk_id) {
-        return 0;
-    }
-
-    return 1;
-}
-
-
 nxt_buf_t *
 nxt_port_mmap_get_buf(nxt_task_t *task, nxt_port_mmaps_t *mmaps, size_t size)
 {
@@ -809,13 +789,9 @@ nxt_port_mmap_get_incoming_buf(nxt_task_t *task, nxt_port_t *port,
      * that would point outside the mapped data area before they reach
      * pointer arithmetic below.
      */
-    nchunks = mmap_msg->size / PORT_MMAP_CHUNK_SIZE;
-    if ((mmap_msg->size % PORT_MMAP_CHUNK_SIZE) != 0) {
-        nchunks++;
-    }
-
     if (nxt_slow_path(!nxt_port_mmap_chunk_range_valid(mmap_msg->chunk_id,
-                                                      nchunks)))
+                                                       mmap_msg->size,
+                                                       &nchunks)))
     {
         nxt_alert(task, "invalid mmap message from pid %PI: "
                   "chunk_id %uD, size %uD (chunks %uz, max %d)",

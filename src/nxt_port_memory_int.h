@@ -138,6 +138,49 @@ nxt_port_mmap_chunk_start(nxt_port_mmap_header_t *hdr, nxt_chunk_id_t c)
 }
 
 
+/*
+ * Validate that a peer-supplied (chunk_id, size) pair describes a region
+ * wholly inside the mapped data area, and report the number of chunks the
+ * region spans via *nchunks.  Returns non-zero on success.
+ *
+ * *nchunks is always written, on the reject path as well: the callers log
+ * it in their diagnostics before dropping the message.
+ *
+ * The chunk count is computed here, in size_t, with the divide-then-adjust
+ * form and never as (size + PORT_MMAP_CHUNK_SIZE - 1) / PORT_MMAP_CHUNK_SIZE:
+ * size is a peer-controlled uint32_t and the round-up addition wraps for
+ * size in [0xFFFFC001, 0xFFFFFFFF], yielding zero chunks and thus wrongly
+ * accepting the message.  Keeping the arithmetic here, out of the callers,
+ * is what makes it testable.
+ *
+ * Underflow-safe: subtracts on the constant side.
+ */
+nxt_inline nxt_bool_t
+nxt_port_mmap_chunk_range_valid(nxt_chunk_id_t chunk_id, uint32_t size,
+    size_t *nchunks)
+{
+    size_t  n;
+
+    n = size / PORT_MMAP_CHUNK_SIZE;
+
+    if ((size % PORT_MMAP_CHUNK_SIZE) != 0) {
+        n++;
+    }
+
+    *nchunks = n;
+
+    if (chunk_id >= PORT_MMAP_CHUNK_COUNT) {
+        return 0;
+    }
+
+    if (n > (size_t) PORT_MMAP_CHUNK_COUNT - chunk_id) {
+        return 0;
+    }
+
+    return 1;
+}
+
+
 nxt_inline nxt_bool_t
 nxt_port_mmap_get_free_chunk(nxt_free_map_t *m, nxt_chunk_id_t *c)
 {
