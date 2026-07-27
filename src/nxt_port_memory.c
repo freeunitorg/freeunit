@@ -230,9 +230,20 @@ complete_buf:
     if (dst_pid == nxt_pid
         && nxt_atomic_cmp_set(&hdr->oosm, 1, 0))
     {
-        process = nxt_runtime_process_find(task->thread->runtime, src_pid);
+        process = nxt_runtime_process_ref(task->thread->runtime, src_pid);
 
         nxt_process_broadcast_shm_ack(task, process);
+
+        /*
+         * Released here rather than at the end of the function: the
+         * complete_buf back-edge below re-enters this block once per buffer
+         * of the chain, so a release outside it would leak every reference
+         * but the last.
+         */
+
+        if (process != NULL) {
+            nxt_process_use(task, process, -1);
+        }
     }
 
 release_buf:
@@ -616,7 +627,14 @@ nxt_port_get_port_incoming_mmap(nxt_task_t *task, nxt_pid_t spid, uint32_t id)
     nxt_process_t            *process;
     nxt_port_mmap_handler_t  *mmap_handler;
 
-    process = nxt_runtime_process_find(task->thread->runtime, spid);
+    /*
+     * Referenced, not just found.  This runs on whichever router worker
+     * engine received the message, while the router main engine can be
+     * releasing the same process; without the reference the mutex locked on
+     * the next line can already have been destroyed and freed underneath us.
+     */
+
+    process = nxt_runtime_process_ref(task->thread->runtime, spid);
     if (nxt_slow_path(process == NULL)) {
         return NULL;
     }
@@ -643,6 +661,17 @@ nxt_port_get_port_incoming_mmap(nxt_task_t *task, nxt_pid_t spid, uint32_t id)
     }
 
     nxt_thread_mutex_unlock(&process->incoming.mutex);
+
+    /*
+     * Strictly after the unlock.  If this is the last reference, the release
+     * runs nxt_thread_mutex_destroy(&process->incoming.mutex) -- dropping it
+     * before the unlock would destroy the mutex this function still holds.
+     *
+     * The returned handler is unaffected: the reference bumped above is its
+     * own, independent of the process, and the caller releases it.
+     */
+
+    nxt_process_use(task, process, -1);
 
     return mmap_handler;
 }
@@ -1010,7 +1039,24 @@ nxt_process_broadcast_shm_ack(nxt_task_t *task, nxt_process_t *process)
     port = nxt_process_port_first(process);
 
     if (port->type == NXT_PROCESS_APP) {
-        nxt_port_post(task, port, nxt_port_broadcast_shm_ack, process);
+        /*
+         * The process is handed to another engine as a bare pointer and is
+         * dereferenced there, so the posted handler needs a reference of its
+         * own and drops it when it is done.  nxt_port_post() returns NXT_OK
+         * both when it queues the handler and when it calls it inline on the
+         * current engine, and the handler owns the reference either way; only
+         * the NXT_ERROR case leaves nothing to run, so only that case has to
+         * be undone here.  The inline call is safe: the caller still holds
+         * its own reference, so this one cannot be the last.
+         */
+
+        nxt_process_use(task, process, 1);
+
+        if (nxt_slow_path(nxt_port_post(task, port, nxt_port_broadcast_shm_ack,
+                                        process) != NXT_OK))
+        {
+            nxt_process_use(task, process, -1);
+        }
     }
 }
 
@@ -1026,4 +1072,6 @@ nxt_port_broadcast_shm_ack(nxt_task_t *task, nxt_port_t *port, void *data)
         (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_SHM_ACK,
                                      -1, 0, 0, NULL);
     } nxt_queue_loop;
+
+    nxt_process_use(task, process, -1);
 }

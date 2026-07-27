@@ -740,6 +740,14 @@ nxt_main_process_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     rt = task->thread->runtime;
 
+    /*
+     * Unreferenced: the main process runs a single engine.  That matters
+     * here specifically because the result outlives the call -- it is
+     * linked into pprocess->children below, a weak link cleaned up in
+     * nxt_runtime_process_free().  With one engine nothing can drop the
+     * last reference concurrently, so the link cannot outlive the process.
+     */
+
     pprocess = nxt_runtime_process_find(rt, ppid);
     if (nxt_slow_path(pprocess == NULL)) {
         nxt_alert(task, "whoami: parent process %PI not found", ppid);
@@ -1059,6 +1067,16 @@ nxt_main_process_sigchld_handler(nxt_task_t *task, void *obj, void *data)
             nxt_trace(task, "process %PI exited with code %d",
                       pid, WEXITSTATUS(status));
         }
+
+        /*
+         * Unreferenced: the main process runs a single engine.  That
+         * matters here specifically because nxt_process_close_ports()
+         * below takes its own +1/-1 around the port loop, which on a
+         * process already at zero would be a second drop to zero and so a
+         * second teardown -- the defect fixed in nxt_port_remove_pid().
+         * With one engine, find() returning non-NULL implies use_count >= 1
+         * for the whole handler.
+         */
 
         process = nxt_runtime_process_find(rt, pid);
 
