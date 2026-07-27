@@ -43,6 +43,10 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 
+#if (NXT_HAVE_MEMFD_CREATE)
+#include <linux/memfd.h>
+#endif
+
 
 static int   nxt_port_recv_test_failures;
 static int   nxt_port_recv_test_step;
@@ -88,7 +92,7 @@ nxt_port_recv_test_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
 {
     int             fds[2];
     size_t          size;
-    struct msghdr   msg;
+    struct msghdr   msg = { 0 };
     struct cmsghdr  *cmsg;
 
     if (oob_size == 0 || nxt_port_recv_test_ctx_queue_fd != -1) {
@@ -252,11 +256,20 @@ main(void)
     nxt_unit_ctx_t   *ctx, *ctx2;
     nxt_unit_init_t  init;
 
-    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, ready) == -1
-        || socketpair(AF_UNIX, SOCK_SEQPACKET, 0, router) == -1
-        || socketpair(AF_UNIX, SOCK_SEQPACKET, 0, read) == -1
-        || socketpair(AF_UNIX, SOCK_SEQPACKET, 0, shared) == -1
-        || socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sock) == -1)
+    /*
+     * SOCK_DGRAM, as libunit itself uses everywhere: its NXT_UNIX_SOCKET
+     * selector is guarded by "#if (0 || NXT_HAVE_AF_UNIX_SOCK_SEQPACKET)",
+     * so SOCK_SEQPACKET is disabled unconditionally.  The type is immaterial
+     * here -- port_recv intercepts every read and these pairs are only ever
+     * adopted as descriptors -- but SOCK_SEQPACKET would fail outright on
+     * platforms without AF_UNIX support for it.
+     */
+
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, ready) == -1
+        || socketpair(AF_UNIX, SOCK_DGRAM, 0, router) == -1
+        || socketpair(AF_UNIX, SOCK_DGRAM, 0, read) == -1
+        || socketpair(AF_UNIX, SOCK_DGRAM, 0, shared) == -1
+        || socketpair(AF_UNIX, SOCK_DGRAM, 0, sock) == -1)
     {
         perror("socketpair");
         return 1;
