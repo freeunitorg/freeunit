@@ -64,8 +64,12 @@ jobs:
             # unitd master and self-skips without it.  It also makes conftest
             # rmtree the temp dir on teardown, which is fine for these tests.
             pytest_opts: "--restart"
-            # test_static is module-free; the graceful/listener drivers need
-            # the python module, so the shared teardown coverage lives here.
+            # test_static and test_conn_recycle are module-free; the
+            # graceful/listener drivers need the python module, so the shared
+            # teardown coverage lives here.  test_conn_recycle exercises the
+            # connection-struct freelist recycler under ASan (recycle churn +
+            # engine teardown at listen_threads reconfig).
+            #
             # test_conn_task_race drives a send-timeout mid-stream RST abort
             # straddling keep-alive reuse (freeunit#156): pre-fix a deferred
             # conn write item dereferenced a freed request-pool task, which
@@ -91,6 +95,7 @@ jobs:
               test/test_conn_task_race.py
               test/test_proxy.py
               test/test_chunked.py
+              test/test_conn_recycle.py
           - runtime: php
             apt: ""
             configure: php

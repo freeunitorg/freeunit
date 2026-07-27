@@ -193,6 +193,7 @@ struct nxt_conn_s {
     uint8_t                       tcp_nodelay;  /* 1 bit */
 
     nxt_queue_link_t              link;
+    nxt_conn_t                    *next;
 };
 
 
@@ -244,6 +245,7 @@ struct nxt_conn_s {
 
 NXT_EXPORT nxt_conn_t *nxt_conn_create(nxt_mp_t *mp, nxt_task_t *task);
 NXT_EXPORT void nxt_conn_free(nxt_task_t *task, nxt_conn_t *c);
+NXT_EXPORT void nxt_conn_recycle_pending(nxt_event_engine_t *engine);
 NXT_EXPORT void nxt_conn_close(nxt_event_engine_t *engine, nxt_conn_t *c);
 
 NXT_EXPORT void nxt_conn_timer(nxt_event_engine_t *engine, nxt_conn_t *c,
