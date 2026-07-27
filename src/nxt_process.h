@@ -115,6 +115,14 @@ struct nxt_process_s {
     nxt_bool_t               registered;
     nxt_int_t                use_count;
 
+    /*
+     * Latched, under rt->processes_mutex, when use_count reaches zero.  A
+     * second drop to zero is not detectable from use_count or registered --
+     * a resurrect-then-release leaves both at their post-teardown values --
+     * so nxt_process_use() tests this and refuses the second teardown.
+     */
+    nxt_bool_t               released;
+
     nxt_port_mmaps_t         incoming;
 
 
@@ -129,6 +137,14 @@ struct nxt_process_s {
 
     nxt_queue_t              children;   /* of nxt_process_t.link */
     nxt_queue_link_t         link;       /* for nxt_process_t.children */
+
+    /*
+     * Used only by nxt_runtime_process_release() to hand the teardown to
+     * rt->main_engine, at which point the process is unlinked with use_count
+     * 0 and nothing else can reach it.  Embedded rather than allocated so
+     * that deferring the free cannot itself fail.
+     */
+    nxt_work_t               free_work;
 
     nxt_process_data_t       data;
 
