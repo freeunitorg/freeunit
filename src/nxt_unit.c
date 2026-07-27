@@ -4016,7 +4016,6 @@ nxt_unit_new_mmap(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port, int n)
     hdr = mem;
 
     memset(hdr->free_map, 0xFFU, sizeof(hdr->free_map));
-    memset(hdr->free_tracking_map, 0xFFU, sizeof(hdr->free_tracking_map));
 
     hdr->id = lib->outgoing.size - 1;
     hdr->src_pid = lib->pid;
@@ -4031,7 +4030,6 @@ nxt_unit_new_mmap(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port, int n)
 
     /* Mark as busy chunk followed the last available chunk. */
     nxt_port_mmap_set_chunk_busy(hdr->free_map, PORT_MMAP_CHUNK_COUNT);
-    nxt_port_mmap_set_chunk_busy(hdr->free_tracking_map, PORT_MMAP_CHUNK_COUNT);
 
     pthread_mutex_unlock(&lib->outgoing.mutex);
 
