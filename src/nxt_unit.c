@@ -4456,7 +4456,8 @@ nxt_unit_mmap_read(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
 {
     int                     res;
     void                    *start;
-    uint32_t                size, nchunks;
+    size_t                  nchunks;
+    uint32_t                size;
     nxt_unit_impl_t         *lib;
     nxt_unit_mmaps_t        *mmaps;
     nxt_unit_mmap_buf_t     *b, **incoming_tail;
@@ -4520,18 +4521,13 @@ nxt_unit_mmap_read(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
          * would point outside the mapped data area before they reach the
          * pointer arithmetic below.
          */
-        nchunks = mmap_msg->size / PORT_MMAP_CHUNK_SIZE;
-        if ((mmap_msg->size % PORT_MMAP_CHUNK_SIZE) != 0) {
-            nchunks++;
-        }
-
-        if (nxt_slow_path(mmap_msg->chunk_id >= PORT_MMAP_CHUNK_COUNT
-                          || nchunks > (uint32_t) PORT_MMAP_CHUNK_COUNT
-                                       - mmap_msg->chunk_id))
+        if (nxt_slow_path(!nxt_port_mmap_chunk_range_valid(mmap_msg->chunk_id,
+                                                           mmap_msg->size,
+                                                           &nchunks)))
         {
             nxt_unit_alert(ctx, "#%"PRIu32": mmap_read: invalid mmap message: "
                            "chunk_id %"PRIu32", size %"PRIu32
-                           " (chunks %"PRIu32", max %d)",
+                           " (chunks %zu, max %d)",
                            recv_msg->stream, mmap_msg->chunk_id,
                            mmap_msg->size, nchunks, PORT_MMAP_CHUNK_COUNT);
 
