@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <nxt_atomic.h>
+#include <nxt_clang.h>
 
 
 #ifdef NXT_MMAP_TINY_CHUNK
@@ -70,11 +71,40 @@ struct nxt_port_mmap_header_s {
     nxt_port_id_t   sent_over;
     nxt_atomic_t    oosm;
     nxt_free_map_t  free_map[MAX_FREE_IDX];
+    /*
+     * Not padding in the alignment sense: nxt_port_mmap_set_chunk_busy() is
+     * called with PORT_MMAP_CHUNK_COUNT to plant a permanently-busy sentinel
+     * one word past the last real word of free_map[], so that a multi-chunk
+     * allocation walking off the end of the segment fails to claim its
+     * continuation instead of reading past the end of the struct.
+     */
     nxt_free_map_t  free_map_padding;
-    nxt_free_map_t  free_tracking_map[MAX_FREE_IDX];
-    nxt_free_map_t  free_tracking_map_padding;
-    nxt_atomic_t    tracking[PORT_MMAP_CHUNK_COUNT];
+
+    /*
+     * Not a live field.  It reserves the window that a peer built before the
+     * tracking bitmap was dropped still writes: such a peer memsets
+     * MAX_FREE_IDX words of free_tracking_map starting here and plants its
+     * sentinel one word past them.  A libunit of that vintage can create
+     * segments this build maps, so the window has to stay unused while those
+     * peers are supported.
+     *
+     * Reserved in the struct rather than only described in a comment, so
+     * that the next field added lands after it by construction instead of
+     * by the author having read this.  Removing the reservation is what
+     * turns the removal of the tracking bitmap into the same latent
+     * corruption it was meant to fix.
+     */
+    nxt_free_map_t  legacy_tracking_window[MAX_FREE_IDX + 1];
 };
+
+
+/*
+ * The header struct is mapped over the first PORT_MMAP_HEADER_SIZE bytes of
+ * the segment and chunk 0 starts right after it, so anything the struct
+ * declares beyond that boundary silently aliases payload.
+ */
+nxt_static_assert(sizeof(nxt_port_mmap_header_t) <= PORT_MMAP_HEADER_SIZE,
+                  "nxt_port_mmap_header_t overflows the segment header area");
 
 
 struct nxt_port_mmap_handler_s {
