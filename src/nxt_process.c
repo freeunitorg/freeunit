@@ -347,7 +347,25 @@ nxt_process_child_fixup(nxt_task_t *task, nxt_process_t *process)
 
     rt = task->thread->runtime;
 
-    /* Remove not ready processes. */
+    /*
+     * Remove not ready processes.
+     *
+     * These walks hand unreferenced processes to nxt_process_close_ports(),
+     * which takes its own +1/-1 -- the shape that made nxt_port_remove_pid()
+     * a double release once the refcount became cross-thread.  It is safe
+     * here for a different reason than everywhere else, and not because of
+     * the refcount: this runs immediately after fork() in the child, which
+     * is single-threaded by definition, so no other thread exists to have
+     * dropped the last reference.  nxt_runtime_process_each() iterating
+     * rt->processes without the mutex is safe for the same reason.
+     *
+     * The other half of that, now that nxt_process_use() locks
+     * rt->processes_mutex: the mutex is inherited across fork() and would be
+     * held forever in the child if any other thread of the parent held it at
+     * the call.  None can -- only main and prototype fork, both take the
+     * mutex on their single event engine, and their thread-pool threads
+     * never touch it.
+     */
     nxt_runtime_process_each(rt, p) {
 
         if (nxt_proc_keep_matrix[ptype][nxt_process_type(p)] == 0
@@ -1290,6 +1308,13 @@ nxt_process_type(nxt_process_t *process)
         (nxt_process_port_first(process))->type;
 }
 
+
+/*
+ * The caller must hold a reference to the process.  Closing the ports drops
+ * the reference each of them holds, so this takes one of its own to survive
+ * the loop -- but on a process that has already reached zero that same pair
+ * is a fresh 0 -> 1 -> 0 transition, which runs the teardown a second time.
+ */
 
 void
 nxt_process_close_ports(nxt_task_t *task, nxt_process_t *process)

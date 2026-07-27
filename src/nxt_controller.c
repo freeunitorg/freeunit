@@ -495,6 +495,8 @@ nxt_controller_remove_pid_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     nxt_memcpy(&pid, msg->buf->mem.pos, sizeof(pid));
 
+    /* Unreferenced: the controller process runs a single engine. */
+
     process = nxt_runtime_process_find(rt, pid);
     if (process != NULL && nxt_process_type(process) == NXT_PROCESS_ROUTER) {
         nxt_controller_router_ready = 0;
