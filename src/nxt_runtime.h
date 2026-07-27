@@ -116,6 +116,7 @@ void nxt_runtime_process_unlink_locked(nxt_runtime_t *rt,
     nxt_process_t *process);
 
 nxt_process_t *nxt_runtime_process_find(nxt_runtime_t *rt, nxt_pid_t pid);
+nxt_process_t *nxt_runtime_process_ref(nxt_runtime_t *rt, nxt_pid_t pid);
 
 nxt_process_t *nxt_runtime_process_first(nxt_runtime_t *rt,
     nxt_lvlhsh_each_t *lhe);

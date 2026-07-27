@@ -1727,6 +1727,16 @@ nxt_runtime_process_lhq_pid(nxt_lvlhsh_query_t *lhq, nxt_pid_t *pid)
 }
 
 
+/*
+ * Returns the process without a reference: the pointer is only valid for as
+ * long as nothing can drop the last reference to it.  That holds when the
+ * caller runs on the single engine that owns the process -- the main, the
+ * prototype or the controller process, each of which has exactly one event
+ * engine -- and nowhere else.  Any caller that can run on a router worker
+ * engine must use nxt_runtime_process_ref() instead; the router's main
+ * engine can be freeing the process concurrently.
+ */
+
 nxt_process_t *
 nxt_runtime_process_find(nxt_runtime_t *rt, nxt_pid_t pid)
 {
@@ -1741,6 +1751,47 @@ nxt_runtime_process_find(nxt_runtime_t *rt, nxt_pid_t pid)
 
     if (nxt_lvlhsh_find(&rt->processes, &lhq) == NXT_OK) {
         process = lhq.value;
+
+    } else {
+        nxt_thread_log_debug("process %PI not found", pid);
+    }
+
+    nxt_thread_mutex_unlock(&rt->processes_mutex);
+
+    return process;
+}
+
+
+/*
+ * Same lookup, but the caller adopts a reference to the result and must drop
+ * it with nxt_process_use(task, process, -1).  The find and the increment
+ * share one rt->processes_mutex critical section, and nxt_process_use()
+ * unlinks the process from rt->processes under that same mutex when the count
+ * reaches zero -- so a lookup that still sees the process in the hash cannot
+ * be racing its teardown, and the reference it takes cannot be an increment
+ * on an object that is already being freed.
+ *
+ * Cost, since this sits on the shared-memory message path: the find already
+ * took the mutex, so the increment itself is free; the matching release in
+ * nxt_process_use() is one additional acquisition of the same uncontended
+ * global mutex per lookup.
+ */
+
+nxt_process_t *
+nxt_runtime_process_ref(nxt_runtime_t *rt, nxt_pid_t pid)
+{
+    nxt_process_t       *process;
+    nxt_lvlhsh_query_t  lhq;
+
+    process = NULL;
+
+    nxt_runtime_process_lhq_pid(&lhq, &pid);
+
+    nxt_thread_mutex_lock(&rt->processes_mutex);
+
+    if (nxt_lvlhsh_find(&rt->processes, &lhq) == NXT_OK) {
+        process = lhq.value;
+        process->use_count++;
 
     } else {
         nxt_thread_log_debug("process %PI not found", pid);
