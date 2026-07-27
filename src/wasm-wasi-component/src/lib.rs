@@ -608,6 +608,33 @@ impl WasiHttpView for StoreState {
     fn ctx(&mut self) -> &mut WasiHttpCtx { &mut self.http }
 
     fn table(&mut self) -> &mut ResourceTable { &mut self.table }
+
+    // Guest-initiated outbound HTTP is deliberately not supported.
+    //
+    // The default implementation of this method comes from the
+    // "default-send-request" feature of wasmtime-wasi-http, which pulls
+    // in the whole rustls TLS stack (rustls, tokio-rustls,
+    // webpki-roots, rustls-webpki) purely so that a guest can dial out.
+    // That subtree is a recurring source of advisories, and Unit itself
+    // never needs it.  Building with default-features = false removes
+    // it from the dependency graph and makes this method mandatory, so
+    // we implement it as an explicit denial.
+    //
+    // wasi:http/outgoing-handler is still linked, so components that
+    // merely import it (as the wasi:http/proxy world requires) continue
+    // to instantiate and run; only an actual outbound call fails, and
+    // it fails with a well-defined error rather than a trap or a hang.
+    fn send_request(
+        &mut self,
+        _request: hyper::Request<
+            wasmtime_wasi_http::body::HyperOutgoingBody,
+        >,
+        _config: wasmtime_wasi_http::types::OutgoingRequestConfig,
+    ) -> wasmtime_wasi_http::HttpResult<
+        wasmtime_wasi_http::types::HostFutureIncomingResponse,
+    > {
+        Err(ErrorCode::HttpRequestDenied.into())
+    }
 }
 
 impl StoreState {}
