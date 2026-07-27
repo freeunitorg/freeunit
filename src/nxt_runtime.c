@@ -308,6 +308,8 @@ nxt_runtime_event_engines(nxt_task_t *task, nxt_runtime_t *rt)
     nxt_queue_init(&rt->engines);
     nxt_queue_insert_tail(&rt->engines, &engine->link);
 
+    rt->main_engine = engine;
+
     return NXT_OK;
 }
 
@@ -1565,14 +1567,10 @@ nxt_runtime_pid_file_create(nxt_task_t *task, nxt_file_name_t *pid_file)
 }
 
 
-void
-nxt_runtime_process_release(nxt_runtime_t *rt, nxt_process_t *process)
+static void
+nxt_runtime_process_free(nxt_runtime_t *rt, nxt_process_t *process)
 {
     nxt_process_t  *child;
-
-    if (process->registered == 1) {
-        nxt_runtime_process_remove(rt, process);
-    }
 
     if (process->link.next != NULL) {
         nxt_queue_remove(&process->link);
@@ -1597,6 +1595,101 @@ nxt_runtime_process_release(nxt_runtime_t *rt, nxt_process_t *process)
     }
 
     nxt_mp_free(rt->mem_pool, process);
+}
+
+
+static void
+nxt_runtime_process_free_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_process_t  *process;
+
+    process = obj;
+
+    nxt_runtime_process_free(task->thread->runtime, process);
+}
+
+
+/*
+ * Runs with no lock held, from nxt_process_use(), once the reference count
+ * has reached zero and the process has already been unlinked from
+ * rt->processes under rt->processes_mutex.  Nothing can look the process up
+ * any more, so the teardown itself needs no lock -- but it does need the
+ * right thread.  rt->mem_pool carries no lock of its own, so nxt_mp_free()
+ * of the process, and the parent/children queue surgery that goes with it,
+ * must not run on whichever router worker engine happened to drop the last
+ * reference; hand them to the engine that owns the runtime instead.
+ *
+ * Only the router runs more than one event engine (nxt_router.c,
+ * nxt_router_engines_create()), and only the main process links a process
+ * into a parent's children queue (nxt_main_process_whoami_handler(), and
+ * nxt_proto_process_add() for the prototype's own list).  So a process that
+ * takes the deferred path below is never on a children queue, and the
+ * window between the unlink and the posted free is not observable.
+ */
+
+void
+nxt_runtime_process_release(nxt_task_t *task, nxt_runtime_t *rt,
+    nxt_process_t *process)
+{
+    /*
+     * rt->main_engine is the engine that owns rt->mem_pool, recorded when it
+     * is created.  It is deliberately not derived from
+     * rt->port_by_type[rt->type]: that slot is NULL before the runtime
+     * registers its own port and again once nxt_runtime_port_remove() has
+     * cleared it, which nxt_runtime_exit() does while router worker engines
+     * are still running -- so "no port" must never be read as "safe to free
+     * here".  Reading the slot at all would also be a use of a port this
+     * thread holds no reference to.  Before rt->main_engine is set nothing
+     * but the creating thread exists, and it compares equal to a NULL
+     * task->thread->engine.
+     */
+
+    if (task->thread->engine == rt->main_engine) {
+        nxt_runtime_process_free(rt, process);
+
+        return;
+    }
+
+    /*
+     * Reached once cross-thread lookups hold references -- see
+     * nxt_runtime_process_ref().  Until they do, every drop lands on
+     * rt->main_engine: a router worker engine's own port is not on any
+     * process's port queue, so nxt_port_release() never reaches
+     * nxt_process_use() there.
+     *
+     * The work item is embedded in the process rather than allocated, and is
+     * posted straight to the engine instead of through a port, so this path
+     * cannot fail: an allocation failure here would have to either leak the
+     * process -- unbounded, under exactly the memory pressure that caused it
+     * -- or free rt->mem_pool memory from this thread, which is what the
+     * deferral exists to prevent.  The process is unlinked with use_count 0,
+     * so nothing else can reach the field.
+     *
+     * Not guaranteed to be drained: nxt_runtime_exit() destroys rt->mem_pool
+     * and calls exit() without running the engine again, so a free posted
+     * just before shutdown may never happen.  That leak is bounded by the
+     * process exiting immediately afterwards.
+     *
+     * The work item is single-instance, which changes what a double release
+     * would look like here: posting it again while the first is still queued
+     * makes nxt_locked_work_queue_add() do lwq->tail->next = work with
+     * tail == work, and nxt_locked_work_queue_move() then loops on itself.
+     * So a second drop to zero landing on a worker would hang rather than
+     * crash -- the failure mode a sanitizer is least able to show.  That is
+     * why nxt_process_use() latches nxt_process_t.released and refuses the
+     * second teardown outright, rather than only asserting on it.
+     */
+
+    nxt_assert(process->link.next == NULL);
+    nxt_assert(nxt_queue_is_empty(&process->children));
+
+    process->free_work.handler = nxt_runtime_process_free_handler;
+    process->free_work.task = &rt->main_engine->task;
+    process->free_work.obj = process;
+    process->free_work.data = NULL;
+    process->free_work.next = NULL;
+
+    nxt_event_engine_post(rt->main_engine, &process->free_work);
 }
 
 
@@ -1672,10 +1765,17 @@ nxt_runtime_process_get(nxt_runtime_t *rt, nxt_pid_t pid)
     if (nxt_lvlhsh_find(&rt->processes, &lhq) == NXT_OK) {
         nxt_thread_log_debug("process %PI found", pid);
 
-        nxt_thread_mutex_unlock(&rt->processes_mutex);
+        /*
+         * The reference has to be taken before the mutex is dropped:
+         * nxt_process_use() unlinks the process under the same mutex when
+         * the count reaches zero, so a lookup that still sees the process
+         * in rt->processes cannot be racing its teardown.
+         */
 
         process = lhq.value;
         process->use_count++;
+
+        nxt_thread_mutex_unlock(&rt->processes_mutex);
 
         return process;
     }
@@ -1769,21 +1869,44 @@ nxt_runtime_process_add(nxt_task_t *task, nxt_process_t *process)
 }
 
 
+/*
+ * Must be called with rt->processes_mutex held.  Unlinking the process has
+ * to be atomic with the reference count reaching zero, otherwise
+ * nxt_runtime_process_find()/_get() can hand out a pointer to a process
+ * whose teardown has already begun.
+ *
+ * Nothing beyond the hash delete belongs here.  In particular
+ * nxt_port_mmaps_destroy() stays in nxt_runtime_process_free(): a router
+ * worker holds process->incoming.mutex while the main engine can hold
+ * rt->processes_mutex, so taking incoming.mutex under processes_mutex would
+ * add a lock-order edge in the opposite direction.
+ *
+ * The registered check is not defensive: nxt_runtime_exit() unregisters a
+ * process before closing its ports, so a drop to zero on an already
+ * unregistered process is a normal shutdown path.
+ *
+ * The lhq.pool assignment below looks like it frees rt->mem_pool memory on
+ * whichever thread dropped the last reference -- one call before the
+ * deferral that exists to prevent exactly that.  It does not:
+ * lvlhsh_processes_proto uses nxt_lvlhsh_alloc()/_free(), which ignore the
+ * pool argument and use nxt_memalign()/nxt_free().
+ */
+
 void
-nxt_runtime_process_remove(nxt_runtime_t *rt, nxt_process_t *process)
+nxt_runtime_process_unlink_locked(nxt_runtime_t *rt, nxt_process_t *process)
 {
     nxt_pid_t           pid;
     nxt_lvlhsh_query_t  lhq;
 
-    nxt_assert(process->registered != 0);
+    if (process->registered == 0) {
+        return;
+    }
 
     pid = process->pid;
 
     nxt_runtime_process_lhq_pid(&lhq, &pid);
 
     lhq.pool = rt->mem_pool;
-
-    nxt_thread_mutex_lock(&rt->processes_mutex);
 
     switch (nxt_lvlhsh_delete(&rt->processes, &lhq)) {
 
@@ -1801,6 +1924,17 @@ nxt_runtime_process_remove(nxt_runtime_t *rt, nxt_process_t *process)
         nxt_thread_log_alert("process %PI remove failed", pid);
         break;
     }
+}
+
+
+void
+nxt_runtime_process_remove(nxt_runtime_t *rt, nxt_process_t *process)
+{
+    nxt_assert(process->registered != 0);
+
+    nxt_thread_mutex_lock(&rt->processes_mutex);
+
+    nxt_runtime_process_unlink_locked(rt, process);
 
     nxt_thread_mutex_unlock(&rt->processes_mutex);
 }

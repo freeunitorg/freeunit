@@ -136,10 +136,70 @@ nxt_process_new(nxt_runtime_t *rt)
 void
 nxt_process_use(nxt_task_t *task, nxt_process_t *process, int i)
 {
-    process->use_count += i;
+    nxt_int_t      use_count;
+    nxt_bool_t     released;
+    nxt_runtime_t  *rt;
 
-    if (process->use_count == 0) {
-        nxt_runtime_process_release(task->thread->runtime, process);
+    rt = task->thread->runtime;
+
+    /*
+     * The count is mutated from every engine thread, so it is serialized on
+     * rt->processes_mutex rather than made atomic: an atomic increment would
+     * still let a lookup take a reference on a process whose teardown has
+     * already started.  Dropping to zero therefore unlinks the process from
+     * rt->processes while the mutex is still held, which makes {find, ref}
+     * and {unref to zero, unlink} mutually exclusive.  The teardown itself
+     * runs after the unlock -- it takes other locks and must not nest.
+     *
+     * This makes rt->processes_mutex reachable from any nxt_port_use()
+     * that drops a last port reference, including callers that already hold
+     * app->mutex (nxt_router.c).  rt->processes_mutex must therefore stay a
+     * leaf: nothing may take another lock while holding it.  It is one today
+     * only because the single outward call made while holding it,
+     * nxt_runtime_process_add() -> nxt_runtime_port_add() -> nxt_port_use(),
+     * passes a positive delta and so cannot reach nxt_port_release() and
+     * back into this function.  A -1 reached under this mutex would
+     * self-deadlock the calling thread.
+     */
+
+    nxt_thread_mutex_lock(&rt->processes_mutex);
+
+    process->use_count += i;
+    use_count = process->use_count;
+
+    /*
+     * A second drop to zero is not detectable from use_count or registered
+     * -- a resurrect-then-release leaves both exactly as the first teardown
+     * left them -- so it is latched here instead.  This has to act rather
+     * than assert: nxt_assert() compiles to nothing in a non-debug build,
+     * and the second release is worse than a double free.  On rt->main_engine
+     * it tears the process down while the first teardown is still queued; off
+     * it, it posts process->free_work a second time, and
+     * nxt_locked_work_queue_add() then self-links the item so that the
+     * engine draining it spins forever.
+     */
+
+    released = process->released;
+
+    if (use_count == 0 && !released) {
+        process->released = 1;
+
+        nxt_runtime_process_unlink_locked(rt, process);
+    }
+
+    nxt_thread_mutex_unlock(&rt->processes_mutex);
+
+    if (use_count == 0) {
+        if (nxt_slow_path(released)) {
+            nxt_assert(!released);
+
+            nxt_alert(task, "process %PI dropped to zero twice, leaking it "
+                      "rather than tearing it down again", process->pid);
+
+            return;
+        }
+
+        nxt_runtime_process_release(task, rt, process);
     }
 }
 
