@@ -4263,7 +4263,7 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     size_t                  b_size, count;
     nxt_int_t               ret;
     nxt_app_t               *app;
-    nxt_buf_t               *b, *next, *last_b, *owned_b;
+    nxt_buf_t               *b, *next, *out, *last_b, *owned_b;
     nxt_port_t              *app_port;
     nxt_unit_field_t        *f;
     nxt_http_field_t        *field;
@@ -4338,6 +4338,7 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     if (r->header_sent) {
         nxt_buf_chain_add(&r->out, b);
         owned_b = NULL;
+        last_b = NULL;
 
         ret = nxt_http_comp_compress_app_response(task, r, &r->out);
         if (ret == NXT_ERROR) {
@@ -4432,9 +4433,9 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
         /*
          * Check compression before handing the chain over to r->out, so that
-         * the rejection below still owns it: nothing drains r->out on the
-         * error path.  nxt_http_comp_check_compression() reads r->resp and
-         * the request configuration, never r->out, so the order is free.
+         * the rejection below still owns it and releases it inline.
+         * nxt_http_comp_check_compression() reads r->resp and the request
+         * configuration, never r->out, so the order is free.
          */
         ret = nxt_http_comp_check_compression(task, r);
         if (ret != NXT_OK) {
@@ -4444,6 +4445,7 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         if (b != NULL) {
             nxt_buf_chain_add(&r->out, b);
             owned_b = NULL;
+            last_b = NULL;
         }
 
         nxt_http_request_header_send(task, r, nxt_http_request_send_body, NULL);
@@ -4478,13 +4480,38 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
 fail:
 
+    /*
+     * nxt_http_buf_last() above cleared r->last as a side effect.  Put it
+     * back before nxt_http_request_error() runs: with headers not yet sent it
+     * builds a 503 whose body ends with nxt_http_buf_last(r), and a NULL there
+     * leaves the response without an NXT_BUF_SYNC_LAST buffer, so the request
+     * never completes and holds the connection until the send timeout.  With
+     * headers already sent it instead consumes r->last inline, via
+     * nxt_http_request_error_handler() and the protocol discard.  Either way
+     * the restore has to come first.
+     *
+     * This is only a pointer store -- it completes nothing and releases no
+     * shared memory -- so it does not disturb the ordering the two release
+     * loops below rely on.
+     *
+     * last_b is NULL at the two sites where the chain reached r->out: there
+     * the sync buffer is part of the chain drained below, and taking a second
+     * reference to it here would complete it twice.  That pairing is
+     * maintained a hundred lines above, so assert it rather than trust it.
+     */
+    nxt_assert(last_b == NULL || r->out == NULL);
+
+    if (last_b != NULL) {
+        r->last = last_b;
+    }
+
     nxt_http_request_error(task, r, NXT_HTTP_SERVICE_UNAVAILABLE);
 
     /*
      * Complete the buffers adopted from the port above, if any: nobody else
-     * holds them.  Stop at last_b: it is the request's own sync buffer and
-     * completing it here would close the request before the error response
-     * has been sent.
+     * holds them.  Stop at last_b: it is the request's own sync buffer, now
+     * owned by r->last again, and completing it here would close the request
+     * before the error response has been sent.
      *
      * This runs after the error response has been built on purpose.  Fields
      * already added to r->resp point straight into the application's shared
@@ -4498,6 +4525,30 @@ fail:
         owned_b->completion_handler(task, owned_b, owned_b->parent);
         owned_b = b;
     }
+
+    /*
+     * Once the chain has been linked into r->out it is no longer tracked by
+     * owned_b, and nothing else would release it: nxt_http_request_error()
+     * installs an error body handler of its own and the protocol discard
+     * drains only the connection buffers and r->last.  Nothing in r->out was
+     * ever queued on the connection either -- nxt_http_request_send_body()
+     * clears r->out before handing the chain to nxt_http_request_send() --
+     * so these buffers are owned by the request alone and may be completed
+     * here.  A send_body work item already posted by the header send re-reads
+     * r->out when it runs and degrades to a no-op.
+     *
+     * The completions must be deferred rather than run inline like the loop
+     * above: this chain can carry the request's own sync buffer, whose
+     * completion handler is nxt_router_http_request_done(), and that closes
+     * the request and releases r->mem_pool.  Running it here would do so on
+     * the line above the nxt_request_rpc_data_unlink() that ends this
+     * function.  The loop above may stay inline only because it stops short
+     * of that buffer.
+     */
+    out = r->out;
+    r->out = NULL;
+
+    nxt_sendbuf_drain(task, &task->thread->engine->fast_work_queue, out);
 
     nxt_request_rpc_data_unlink(task, req_rpc_data);
 }
