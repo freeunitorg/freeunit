@@ -5949,8 +5949,24 @@ nxt_router_oosm_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     nxt_debug(task, "oosm in %PI", msg->port_msg.pid);
 
-    process = nxt_runtime_process_find(task->thread->runtime,
-                                       msg->port_msg.pid);
+    /*
+     * Referenced, not just found: .oosm is in both the router main and the
+     * router worker port handler tables, and the reference has to span the
+     * incoming.mutex critical section below.  Which engine actually receives
+     * a given OOSM depends on the port libunit sends it to, so this is not
+     * assumed either way -- what makes the reference necessary is that a
+     * worker engine can drop the last reference to the same process while
+     * this runs.
+     *
+     * It has to span the broadcast too, but note what that does and does not
+     * buy: it keeps the nxt_process_t allocated, and nothing more.  The ports
+     * nxt_process_broadcast_shm_ack() reaches through process->ports are
+     * refcounted separately and that queue is walked here without a lock, so
+     * this reference does not make the walk itself safe.
+     */
+
+    process = nxt_runtime_process_ref(task->thread->runtime,
+                                      msg->port_msg.pid);
     if (nxt_slow_path(process == NULL)) {
         return;
     }
@@ -5991,6 +6007,13 @@ nxt_router_oosm_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     if (ack) {
         nxt_process_broadcast_shm_ack(task, process);
     }
+
+    /*
+     * The only release point: the process == NULL return above precedes the
+     * reference, and the loop breaks and continues but never returns.
+     */
+
+    nxt_process_use(task, process, -1);
 }
 
 

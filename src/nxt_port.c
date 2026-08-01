@@ -333,6 +333,8 @@ nxt_port_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     rt = task->thread->runtime;
 
+    /* Unreferenced: main and prototype processes run a single engine. */
+
     process = nxt_runtime_process_find(rt, msg->port_msg.pid);
     if (nxt_slow_path(process == NULL)) {
         return;
@@ -373,7 +375,15 @@ nxt_port_mmap_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         return;
     }
 
-    process = nxt_runtime_process_find(rt, msg->port_msg.pid);
+    /*
+     * Referenced, not just found: this handler is in the router worker port
+     * handler table, so it runs on engines other than the one that can free
+     * the process.  nxt_port_incoming_port_mmap() takes and releases
+     * process->incoming.mutex without touching the reference count, so the
+     * reference has to span the whole call.
+     */
+
+    process = nxt_runtime_process_ref(rt, msg->port_msg.pid);
     if (nxt_slow_path(process == NULL)) {
         nxt_log(task, NXT_LOG_WARN, "failed to get process #%PI",
                 msg->port_msg.pid);
@@ -382,6 +392,13 @@ nxt_port_mmap_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     }
 
     nxt_port_incoming_port_mmap(task, process, msg->fd[0]);
+
+    /*
+     * Before fail_close: that label is shared with the process == NULL path,
+     * where no reference was taken.
+     */
+
+    nxt_process_use(task, process, -1);
 
 fail_close:
 
@@ -547,10 +564,21 @@ nxt_port_remove_pid(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
     nxt_port_rpc_remove_peer(task, msg->port, pid);
 
-    process = nxt_runtime_process_find(rt, pid);
+    /*
+     * Referenced even though this only runs on main engines: the constraint
+     * that matters here is ownership, not which thread runs.  A router worker
+     * can drop the last reference to the process at any point, and
+     * nxt_process_close_ports() takes its own reference around the port loop
+     * -- on a process already at zero that would be a second drop to zero and
+     * so a second teardown, racing the one already posted to this engine.
+     */
+
+    process = nxt_runtime_process_ref(rt, pid);
 
     if (process) {
         nxt_process_close_ports(task, process);
+
+        nxt_process_use(task, process, -1);
     }
 }
 
