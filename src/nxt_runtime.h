@@ -84,6 +84,14 @@ struct nxt_runtime_s {
 
     nxt_queue_t            engines;            /* of nxt_event_engine_t */
 
+    /*
+     * The engine that owns this runtime, recorded when it is created.  The
+     * router adds worker engines to the queue above, so "the runtime's own
+     * engine" cannot be derived from it, and rt->port_by_type[rt->type] is
+     * cleared during shutdown while worker engines are still running.
+     */
+    nxt_event_engine_t     *main_engine;
+
     nxt_sockaddr_t         *controller_listen;
     nxt_listen_socket_t    *controller_socket;
 };
@@ -104,13 +112,16 @@ nxt_int_t nxt_runtime_thread_pool_create(nxt_thread_t *thr, nxt_runtime_t *rt,
 
 void nxt_runtime_process_add(nxt_task_t *task, nxt_process_t *process);
 void nxt_runtime_process_remove(nxt_runtime_t *rt, nxt_process_t *process);
+void nxt_runtime_process_unlink_locked(nxt_runtime_t *rt,
+    nxt_process_t *process);
 
 nxt_process_t *nxt_runtime_process_find(nxt_runtime_t *rt, nxt_pid_t pid);
 
 nxt_process_t *nxt_runtime_process_first(nxt_runtime_t *rt,
     nxt_lvlhsh_each_t *lhe);
 
-void nxt_runtime_process_release(nxt_runtime_t *rt, nxt_process_t *process);
+void nxt_runtime_process_release(nxt_task_t *task, nxt_runtime_t *rt,
+    nxt_process_t *process);
 
 #define nxt_runtime_process_next(rt, lhe)                                     \
     nxt_lvlhsh_each(&rt->processes, lhe)

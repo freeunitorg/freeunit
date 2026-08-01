@@ -161,6 +161,7 @@ nxt_port_mmap_buf_completion(nxt_task_t *task, void *obj, void *data)
     u_char                   *p;
     nxt_mp_t                 *mp;
     nxt_buf_t                *b, *next;
+    nxt_pid_t                src_pid, dst_pid;
     nxt_process_t            *process;
     nxt_chunk_id_t           c;
     nxt_port_mmap_header_t   *hdr;
@@ -180,9 +181,21 @@ complete_buf:
 
     hdr = mmap_handler->hdr;
 
-    if (nxt_slow_path(hdr->src_pid != nxt_pid && hdr->dst_pid != nxt_pid)) {
+    /*
+     * The header lives in a segment the peer still maps writable, so the two
+     * pids are snapshotted once here and only the locals are used below:
+     * re-reading one after the check is a double fetch the peer can win, and
+     * src_pid is what the process lookup below is given.  The other header
+     * fields are left as direct reads -- hdr->id only reaches a debug
+     * message, and the free map and oosm flag are peer-shared state read
+     * through their own accessors by design.
+     */
+    src_pid = hdr->src_pid;
+    dst_pid = hdr->dst_pid;
+
+    if (nxt_slow_path(src_pid != nxt_pid && dst_pid != nxt_pid)) {
         nxt_debug(task, "mmap buf completion: mmap for other process pair "
-                  "%PI->%PI", hdr->src_pid, hdr->dst_pid);
+                  "%PI->%PI", src_pid, dst_pid);
 
         goto release_buf;
     }
@@ -205,7 +218,7 @@ complete_buf:
 
     nxt_debug(task, "mmap buf completion: %p [%p,%uz] (sent=%d), "
               "%PI->%PI,%d,%d", b, b->mem.start, b->mem.end - b->mem.start,
-              b->is_port_mmap_sent, hdr->src_pid, hdr->dst_pid, hdr->id, c);
+              b->is_port_mmap_sent, src_pid, dst_pid, hdr->id, c);
 
     while (p < b->mem.end) {
         nxt_port_mmap_set_chunk_free(hdr->free_map, c);
@@ -214,10 +227,10 @@ complete_buf:
         c++;
     }
 
-    if (hdr->dst_pid == nxt_pid
+    if (dst_pid == nxt_pid
         && nxt_atomic_cmp_set(&hdr->oosm, 1, 0))
     {
-        process = nxt_runtime_process_find(task->thread->runtime, hdr->src_pid);
+        process = nxt_runtime_process_find(task->thread->runtime, src_pid);
 
         nxt_process_broadcast_shm_ack(task, process);
     }
