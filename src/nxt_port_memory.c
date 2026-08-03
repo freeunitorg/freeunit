@@ -366,13 +366,11 @@ fail:
 
 
 static nxt_port_mmap_handler_t *
-nxt_port_new_port_mmap(nxt_task_t *task, nxt_port_mmaps_t *mmaps,
-    nxt_bool_t tracking, nxt_int_t n)
+nxt_port_new_port_mmap(nxt_task_t *task, nxt_port_mmaps_t *mmaps, nxt_int_t n)
 {
     void                     *mem;
     nxt_fd_t                 fd;
     nxt_int_t                i;
-    nxt_free_map_t           *free_map;
     nxt_port_mmap_t          *port_mmap;
     nxt_port_mmap_header_t   *hdr;
     nxt_port_mmap_handler_t  *mmap_handler;
@@ -414,22 +412,18 @@ nxt_port_new_port_mmap(nxt_task_t *task, nxt_port_mmaps_t *mmaps,
     hdr = mmap_handler->hdr;
 
     nxt_memset(hdr->free_map, 0xFFU, sizeof(hdr->free_map));
-    nxt_memset(hdr->free_tracking_map, 0xFFU, sizeof(hdr->free_tracking_map));
 
     hdr->id = mmaps->size - 1;
     hdr->src_pid = nxt_pid;
     hdr->sent_over = 0xFFFFu;
 
     /* Mark first chunk as busy */
-    free_map = tracking ? hdr->free_tracking_map : hdr->free_map;
-
     for (i = 0; i < n; i++) {
-        nxt_port_mmap_set_chunk_busy(free_map, i);
+        nxt_port_mmap_set_chunk_busy(hdr->free_map, i);
     }
 
     /* Mark as busy chunk followed the last available chunk. */
     nxt_port_mmap_set_chunk_busy(hdr->free_map, PORT_MMAP_CHUNK_COUNT);
-    nxt_port_mmap_set_chunk_busy(hdr->free_tracking_map, PORT_MMAP_CHUNK_COUNT);
 
     nxt_log(task, NXT_LOG_DEBUG, "new mmap #%D created for %PI -> ...",
             hdr->id, nxt_pid);
@@ -523,7 +517,7 @@ nxt_shm_open(nxt_task_t *task, size_t size)
 
 static nxt_port_mmap_handler_t *
 nxt_port_mmap_get(nxt_task_t *task, nxt_port_mmaps_t *mmaps, nxt_chunk_id_t *c,
-    nxt_int_t n, nxt_bool_t tracking)
+    nxt_int_t n)
 {
     nxt_int_t                i, res, nchunks;
     nxt_free_map_t           *free_map;
@@ -553,7 +547,7 @@ nxt_port_mmap_get(nxt_task_t *task, nxt_port_mmaps_t *mmaps, nxt_chunk_id_t *c,
 
         *c = 0;
 
-        free_map = tracking ? hdr->free_tracking_map : hdr->free_map;
+        free_map = hdr->free_map;
 
         while (nxt_port_mmap_get_free_chunk(free_map, c)) {
             nchunks = 1;
@@ -587,7 +581,7 @@ nxt_port_mmap_get(nxt_task_t *task, nxt_port_mmaps_t *mmaps, nxt_chunk_id_t *c,
 end:
 
     *c = 0;
-    mmap_handler = nxt_port_new_port_mmap(task, mmaps, tracking, n);
+    mmap_handler = nxt_port_new_port_mmap(task, mmaps, n);
 
 unlock_return:
 
@@ -683,7 +677,7 @@ nxt_port_mmap_get_buf(nxt_task_t *task, nxt_port_mmaps_t *mmaps, size_t size)
     b->completion_handler = nxt_port_mmap_buf_completion;
     nxt_buf_set_port_mmap(b);
 
-    mmap_handler = nxt_port_mmap_get(task, mmaps, &c, nchunks, 0);
+    mmap_handler = nxt_port_mmap_get(task, mmaps, &c, nchunks);
     if (nxt_slow_path(mmap_handler == NULL)) {
         mp = task->thread->engine->mem_pool;
         nxt_mp_free(mp, b);
