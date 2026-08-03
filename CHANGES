@@ -1,4 +1,15 @@
 
+Changes with FreeUnit 1.36.1                                     -- --- ----
+
+    *) Feature: the access log "format" option accepts the string "json",
+       which writes one JSON object per request with a stable set of
+       fields: "request", "status", "bytes_sent", "remote_addr",
+       "user_agent", "referer", "request_time", and "request_id".  Values
+       are JSON-escaped, so request-controlled fields cannot break the
+       enclosing string.  Any other format string keeps its existing
+       literal meaning.
+
+
 Changes with FreeUnit 1.36.0                                     16 Jul 2026
 
     *) Bugfix: the controller crashed in debug builds when a control-socket
