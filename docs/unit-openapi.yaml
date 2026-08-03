@@ -7132,6 +7132,14 @@ components:
           description: "Host header field."
           $ref: "#/components/schemas/stringOrStringArray"
 
+        if:
+          description: "Condition that must be true for the step to match.
+            The value is a template string; it is false when it renders to
+            an empty string, `0`, `false`, `null`, or `undefined`, and true
+            otherwise. A leading `!` negates the result."
+
+          type: string
+
         method:
           description: "Method from the request line."
           $ref: "#/components/schemas/stringOrStringArray"
