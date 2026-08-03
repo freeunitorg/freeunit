@@ -6,6 +6,28 @@
 
 
 <changes apply="unit"
+         ver="1.36.1" rev="1"
+         date="2026-08-02" time="00:00:00 +0000"
+         packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change type="change">
+<para>
+the "if" option of a route "match" object, added in 1.33.0, is now
+described in the OpenAPI specification and covered by the test suite.  A
+request matches the step only when the condition is true; the condition
+uses the same syntax as the "if" option of the access log: it is false
+when it renders to an empty string, "0", "false", "null", or "undefined",
+and true otherwise, and a leading "!" negates the result.  Variables test
+for the presence of a value ("$arg_foo"), njs template strings express
+comparisons and regular expressions
+("`${uri == '/admin'}`", "`${/^\/admin/.test(uri)}`").
+</para>
+</change>
+
+</changes>
+
+
+<changes apply="unit"
          ver="1.36.0" rev="1"
          date="2026-07-16" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
