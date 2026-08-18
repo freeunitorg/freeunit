@@ -14,9 +14,14 @@ use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::p2::add_to_linker_async;
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder,
                     WasiCtxView, WasiView};
-use wasmtime_wasi_http::bindings::http::types::{ErrorCode, Scheme};
-use wasmtime_wasi_http::bindings::ProxyPre;
-use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
+use wasmtime_wasi_http::p2::bindings::http::types::{ErrorCode, Scheme};
+use wasmtime_wasi_http::p2::bindings::ProxyPre;
+use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
+use wasmtime_wasi_http::p2::types::{HostFutureIncomingResponse,
+                                    OutgoingRequestConfig};
+use wasmtime_wasi_http::p2::{HttpResult, WasiHttpCtxView, WasiHttpHooks,
+                             WasiHttpView};
+use wasmtime_wasi_http::WasiHttpCtx;
 
 #[allow(
     non_camel_case_types,
@@ -190,8 +195,9 @@ struct GlobalState {
 
 impl GlobalState {
     fn new(global_config: &'static GlobalConfig) -> Result<GlobalState> {
-        // Configure Wasmtime, e.g. the component model and async support are
-        // enabled here. Other configuration can include:
+        // Configure Wasmtime, e.g. the component model is enabled here.
+        // (Async support is unconditional as of wasmtime 47.) Other
+        // configuration can include:
         //
         // * Epochs/fuel - enables async yielding to prevent any one request
         //   starving others.
@@ -200,7 +206,6 @@ impl GlobalState {
         // * Memory limits/etc.
         let mut config = Config::new();
         config.wasm_component_model(true);
-        config.async_support(true);
         let engine = Engine::new(&config)?;
 
         // Compile the binary component on disk in Wasmtime. This is then
@@ -209,18 +214,22 @@ impl GlobalState {
         // repeatedly instantiate later on. This will frontload
         // compilation/linking/type-checking/etc to happen once rather than on
         // each request.
+        // NB: wasmtime 47 returns its own `wasmtime::Error` rather than an
+        // `anyhow::Error`, so `anyhow::Context` does not apply here. Use
+        // `wasmtime::Error`'s inherent `context()` and let `?` convert the
+        // result into the `anyhow::Error` these functions return.
         let component = Component::from_file(&engine, &global_config.component)
-            .context("failed to compile component")?;
+            .map_err(|e| e.context("failed to compile component"))?;
         let mut linker = Linker::<StoreState>::new(&engine);
         add_to_linker_async(&mut linker)
-            .context("failed to add wasi to linker")?;
-        wasmtime_wasi_http::add_only_http_to_linker_sync(&mut linker)
-            .context("failed to add wasi:http to linker")?;
-        let component = linker
-            .instantiate_pre(&component)
-            .context("failed to pre-instantiate the provided component")?;
-        let proxy =
-            ProxyPre::new(component).context("failed to conform to proxy")?;
+            .map_err(|e| e.context("failed to add wasi to linker"))?;
+        wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker)
+            .map_err(|e| e.context("failed to add wasi:http to linker"))?;
+        let component = linker.instantiate_pre(&component).map_err(|e| {
+            e.context("failed to pre-instantiate the provided component")
+        })?;
+        let proxy = ProxyPre::new(component)
+            .map_err(|e| e.context("failed to conform to proxy"))?;
 
         // Spin up the Tokio async runtime in a separate thread with a
         // communication channel into it. This thread will send requests to
@@ -276,6 +285,7 @@ impl GlobalState {
             },
             table: ResourceTable::default(),
             http: WasiHttpCtx::new(),
+            hooks: DenyOutboundHttp,
         };
         let mut store = Store::new(&self.engine, data);
 
@@ -298,15 +308,16 @@ impl GlobalState {
         let task = tokio::spawn(async move {
             let req = store
                 .data_mut()
+                .http()
                 .new_incoming_request(Scheme::Http, request)?;
-            let out = store.data_mut().new_response_outparam(sender)?;
+            let out = store.data_mut().http().new_response_outparam(sender)?;
             self.component
                 .instantiate_async(&mut store)
                 .await?
                 .wasi_http_incoming_handler()
                 .call_handle(&mut store, req, out)
                 .await
-                .context("failed to invoke wasm `handle`")?;
+                .map_err(|e| e.context("failed to invoke wasm `handle`"))?;
             Ok::<_, anyhow::Error>(())
         });
 
@@ -420,7 +431,7 @@ impl GlobalState {
     async fn send_response_body(
         &self,
         info: &mut NxtRequestInfo,
-        mut body: BoxBody<Bytes, ErrorCode>,
+        mut body: HyperOutgoingBody,
     ) -> Result<()> {
         loop {
             // Acquire the next frame, and because nothing is actually async
@@ -593,6 +604,36 @@ struct StoreState {
     ctx: WasiCtx,
     http: WasiHttpCtx,
     table: ResourceTable,
+    hooks: DenyOutboundHttp,
+}
+
+/// Guest-initiated outbound HTTP is deliberately not supported.
+///
+/// `send_request` normally comes from the "default-send-request" feature of
+/// wasmtime-wasi-http, which pulls in the whole rustls TLS stack (rustls,
+/// tokio-rustls, webpki-roots, rustls-webpki) purely so that a guest can dial
+/// out.  That subtree is a recurring source of advisories and Unit itself
+/// never needs it, so Cargo.toml builds the crate without the feature.  With
+/// it off the trait method has no default body, which is what makes this
+/// denial mandatory rather than merely conventional: restoring the feature
+/// without noticing cannot happen silently, because dropping this impl stops
+/// compiling.
+///
+/// `wasi:http/outgoing-handler` is still linked, so components that merely
+/// import it -- as the `wasi:http/proxy` world requires -- continue to
+/// instantiate and run.  Only an actual outbound call fails, and it fails with
+/// a well-defined error rather than a trap or a hang.
+#[derive(Default)]
+struct DenyOutboundHttp;
+
+impl WasiHttpHooks for DenyOutboundHttp {
+    fn send_request(
+        &mut self,
+        _request: hyper::Request<HyperOutgoingBody>,
+        _config: OutgoingRequestConfig,
+    ) -> HttpResult<HostFutureIncomingResponse> {
+        Err(ErrorCode::HttpRequestDenied.into())
+    }
 }
 
 impl WasiView for StoreState {
@@ -605,35 +646,12 @@ impl WasiView for StoreState {
 }
 
 impl WasiHttpView for StoreState {
-    fn ctx(&mut self) -> &mut WasiHttpCtx { &mut self.http }
-
-    fn table(&mut self) -> &mut ResourceTable { &mut self.table }
-
-    // Guest-initiated outbound HTTP is deliberately not supported.
-    //
-    // The default implementation of this method comes from the
-    // "default-send-request" feature of wasmtime-wasi-http, which pulls
-    // in the whole rustls TLS stack (rustls, tokio-rustls,
-    // webpki-roots, rustls-webpki) purely so that a guest can dial out.
-    // That subtree is a recurring source of advisories, and Unit itself
-    // never needs it.  Building with default-features = false removes
-    // it from the dependency graph and makes this method mandatory, so
-    // we implement it as an explicit denial.
-    //
-    // wasi:http/outgoing-handler is still linked, so components that
-    // merely import it (as the wasi:http/proxy world requires) continue
-    // to instantiate and run; only an actual outbound call fails, and
-    // it fails with a well-defined error rather than a trap or a hang.
-    fn send_request(
-        &mut self,
-        _request: hyper::Request<
-            wasmtime_wasi_http::body::HyperOutgoingBody,
-        >,
-        _config: wasmtime_wasi_http::types::OutgoingRequestConfig,
-    ) -> wasmtime_wasi_http::HttpResult<
-        wasmtime_wasi_http::types::HostFutureIncomingResponse,
-    > {
-        Err(ErrorCode::HttpRequestDenied.into())
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView {
+            ctx: &mut self.http,
+            table: &mut self.table,
+            hooks: &mut self.hooks,
+        }
     }
 }
 

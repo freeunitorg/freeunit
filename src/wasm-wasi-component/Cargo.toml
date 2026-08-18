@@ -17,10 +17,14 @@ http-body = { version = "1.0.0", default-features = false }
 http-body-util = "0.1.0"
 hyper = "1.4.1"
 tokio = { version = "1.33.0", default-features = false }
-wasi-common = "36.0.10"
-wasmtime = { version = "36.0.10", default-features = false, features = ['component-model', 'cranelift'] }
-wasmtime-wasi = "36.0.10"
-wasmtime-wasi-http = { version = "36.0.10", default-features = false }
+wasmtime = { version = "47.0.2", default-features = false, features = ['anyhow', 'component-model', 'cranelift'] }
+wasmtime-wasi = "47.0.2"
+# default-features = false drops the "default-send-request" feature and
+# with it the whole rustls TLS stack (rustls, tokio-rustls, webpki-roots,
+# rustls-webpki) that exists only so a guest can dial out.  "p2" is in the
+# crate's default set too, so it has to be named explicitly or the
+# wasmtime_wasi_http::p2 module this file uses disappears with it.
+wasmtime-wasi-http = { version = "47.0.2", default-features = false, features = ['p2'] }
 
 [build-dependencies]
 bindgen = "0.68.1"
