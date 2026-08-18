@@ -1,0 +1,32 @@
+# Known UndefinedBehaviorSanitizer violations, waived by
+# .github/scripts/check-sanitizer-reports.sh so that the sanitizer gate can be
+# made blocking without first fixing every pre-existing site.
+#
+# Rules:
+#   - One POSIX extended regular expression per line, matched against the
+#     report line as it appears in the harness's unit.log.
+#   - Every entry names the issue tracking its fix.  An entry without one is a
+#     bug in this file: the point of the list is to shrink, and an unattributed
+#     waiver never does.
+#   - ASan/LSan/TSan reports cannot be waived here.  The script refuses to
+#     match them on purpose -- a memory-safety report fails the leg, always.
+#   - Pin the source location.  A bare message would waive the same class of
+#     violation everywhere in the tree, including a new one.
+#
+# Measured on master (02263309) with the php leg's own test set: entries 1 and
+# 2 fire on every run of test/test_php_application.py, entry 3 on the
+# configuration-churn workload.
+
+# freeunitorg/freeunit#188 -- nxt_conf_value_t union read through an address
+# the allocator only aligned to 4 bytes.  Benign on x86-64, a real fault on
+# strict-alignment targets; tracked for a fix in the value representation.
+src/nxt_conf\.c:[0-9]+:[0-9]+: runtime error: member access within misaligned address 0x[0-9a-f]+ for type 'union <unknown>', which requires 8 byte alignment
+
+# freeunitorg/freeunit#200 -- nxt_strstr_eq() -> memcmp() on a zero-length
+# nxt_str_t, whose .start is NULL.  memcmp() declares both pointers nonnull
+# regardless of length, so a zero-length compare is UB even though every
+# implementation returns 0 without a dereference.
+src/nxt_http_route\.c:[0-9]+:[0-9]+: runtime error: null pointer passed as argument [12], which is declared to never be null
+
+# freeunitorg/freeunit#200 -- same class in nxt_cpymem(): memcpy(dst, NULL, 0).
+src/nxt_string\.h:[0-9]+:[0-9]+: runtime error: null pointer passed as argument 2, which is declared to never be null

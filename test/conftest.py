@@ -476,6 +476,17 @@ def unit_run(state_dir=None):
     option.temp_dir = temporary_dir
     public_dir(temporary_dir)
 
+    # Every start gets a fresh temp dir and therefore a fresh, empty
+    # unit.log, so the read offsets recorded against the previous one are
+    # meaningless here.  Teardown saves that offset unconditionally and only
+    # resets it when it removes the temp dir, which --save-log stops it from
+    # doing: without this, a --save-log --restart run seeks each test's reads
+    # to the size of the PREVIOUS test's log.  Everything log-based then sees
+    # a tail slice or nothing at all -- Log.wait_for_record misses records
+    # that are present, and, worse silently, the teardown Log.check_alerts()
+    # and _check_fds() stop examining most of what they are given.
+    Log.pos.clear()
+
     if oct(stat.S_IMODE(Path(builddir).stat().st_mode)) != '0o777':
         public_dir(builddir)
 

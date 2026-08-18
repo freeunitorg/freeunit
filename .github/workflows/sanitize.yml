@@ -23,7 +23,13 @@ on:
       - 'go/**'
       - 'src/**'
       - 'test/**'
+      # The gate is three files, not one: a change to the scan script or to
+      # the waiver list can break report detection or widen what is ignored
+      # just as effectively as a change to this workflow, and must not skip
+      # the job that would catch it.
       - '.github/workflows/sanitize.yml'
+      - '.github/scripts/check-sanitizer-reports.sh'
+      - '.github/sanitizer-allowlist.txt'
   push:
     # master is the release/default branch; pre-* are the release-prep
     # integration branches (e.g. pre-1.35.6) where the hardening actually
@@ -39,7 +45,13 @@ on:
       - 'go/**'
       - 'src/**'
       - 'test/**'
+      # The gate is three files, not one: a change to the scan script or to
+      # the waiver list can break report detection or widen what is ignored
+      # just as effectively as a change to this workflow, and must not skip
+      # the job that would catch it.
       - '.github/workflows/sanitize.yml'
+      - '.github/scripts/check-sanitizer-reports.sh'
+      - '.github/sanitizer-allowlist.txt'
 
 jobs:
   sanitize:
@@ -176,61 +188,52 @@ jobs:
       - name: Make ${{ matrix.runtime }} module
         run: make -j$(nproc) ${{ matrix.make }}
 
-      - name: Create ASan log directory
-        run: mkdir -p "${GITHUB_WORKSPACE}/asan-logs"
-
       # ASAN_OPTIONS / UBSAN_OPTIONS are step-level env so pytest and every
       # forked unitd process inherit them.
-      #   log_path=<workspace>/asan-logs/{asan,ubsan}
-      #     ASan and UBSan reports from the forked daemons land in
-      #     asan-logs/<tool>.<pid> files rather than only the per-test unit.log
-      #     the harness rotates away, so the guard step below can fail the job
-      #     even when pytest itself is green.  UBSan needs its OWN log_path:
-      #     with only ASAN_OPTIONS set, a UBSan-only violation that does not
-      #     escalate to a fatal signal writes to neither the asan-logs dir nor
-      #     a place the harness scans (it greps unit.log for "Sanitizer", not
-      #     UBSan's "runtime error"), so half the gate could pass silently.
       #   detect_leaks=0
       #     the fork-heavy daemon makes LeakSanitizer extremely noisy; turning
       #     leak detection on is tracked as a follow-up, once the teardown
       #     paths are use-after-free / null-deref clean.
-      # pytest_opts is per-runtime (e.g. --restart for the graceful tests).
+      #   print_stacktrace / halt_on_error
+      #     honoured wherever the options string survives.  They do NOT take
+      #     effect inside unitd itself -- see the header of
+      #     .github/scripts/check-sanitizer-reports.sh -- which is exactly why
+      #     the gate below reads unit.log instead of trusting a log_path
+      #     directory.  Kept because they cost nothing and do apply to any
+      #     helper binary the suite runs.
+      #
+      # --save-log keeps <temp_dir>/unit.log after each test.  Without it
+      # test/conftest.py removes the per-restart temp dir, and with it the only
+      # copy of any report a forked daemon wrote -- which is what the gate
+      # below scans.  pytest_opts is per-runtime (e.g. --restart for the
+      # graceful tests).
       - name: Run ${{ matrix.runtime }} sanitizer subset
         env:
-          ASAN_OPTIONS: "detect_leaks=0:log_path=${{ github.workspace }}/asan-logs/asan"
-          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1:log_path=${{ github.workspace }}/asan-logs/ubsan"
+          ASAN_OPTIONS: "detect_leaks=0"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
         run: |
-          python3 -m pytest -v ${{ matrix.pytest_opts }} ${{ matrix.tests }}
+          python3 -m pytest -v --save-log ${{ matrix.pytest_opts }} ${{ matrix.tests }}
 
-      - name: Show ASan/UBSan reports
-        if: always()
-        run: |
-          if [ -n "$(ls -A asan-logs 2>/dev/null)" ]; then
-            for f in asan-logs/*; do
-              echo "===== ${f} ====="
-              cat "${f}"
-            done
-          else
-            echo "No ASan/UBSan report files were produced."
-          fi
-
-      - name: Upload ASan/UBSan reports
+      - name: Upload unit logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: asan-ubsan-logs-${{ matrix.runtime }}
-          path: asan-logs/
-          if-no-files-found: ignore
+          name: unit-logs-${{ matrix.runtime }}
+          path: ${{ env.TMPDIR || '/tmp' }}/unit-test-*/unit.log
+          if-no-files-found: warn
 
-      # Sanitizer reports from forked children do not reliably fail pytest: the
-      # crash aborts a child while the session continues, and with log_path set
-      # the report never reaches the unit.log the harness scans.  Fail the job
-      # explicitly on any report file, even when pytest was green.
+      # Sanitizer reports do not reliably fail pytest.  A UBSan violation that
+      # does not escalate to a signal fails nothing at all: the harness's
+      # Log.check_alerts() greps unit.log for "[alert]" and "Sanitizer", not
+      # for UBSan's "runtime error:".  An ASan report does abort the router,
+      # but the session then fails with connection errors that read as an
+      # infrastructure flake rather than as a memory-safety bug.  Measured on
+      # master: 24 runs of the configuration-churn workload produced a UBSan
+      # violation in every run with pytest green in 23 of them, and the one
+      # ASan heap-use-after-free surfaced only as "Client can't connect to the
+      # server".  Fail the job explicitly on what the logs actually contain.
       - name: Fail on sanitizer reports
         if: always()
         run: |
-          if [ -n "$(ls -A asan-logs 2>/dev/null)" ]; then
-            echo "::error::AddressSanitizer/UBSan produced report(s) in the ${{ matrix.runtime }} leg; see the asan-ubsan-logs-${{ matrix.runtime }} artifact and the 'Show ASan/UBSan reports' step."
-            exit 1
-          fi
-          echo "No sanitizer reports; ${{ matrix.runtime }} lifecycle paths are clean."
+          .github/scripts/check-sanitizer-reports.sh \
+            "${TMPDIR:-/tmp}" .github/sanitizer-allowlist.txt
