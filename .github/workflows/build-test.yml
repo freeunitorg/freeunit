@@ -76,7 +76,12 @@ jobs:
             IFS='-' read -r module version <<< "${{ matrix.build }}"
           fi
 
-          testpath="test/test_${module}*"
+          # test_app_lifecycle.py is runtime-agnostic: it is parametrized over
+          # every runtime and self-skips the ones this leg did not build, so
+          # each language leg must be told about it explicitly -- the
+          # test_<module>* glob below would otherwise leave the app-process
+          # libunit port/fd lifecycle covered in the python leg only.
+          testpath="test/test_${module}* test/test_app_lifecycle.py"
 
           # Run all tests for "unit" and "python"
           # Python is the default module for tests
@@ -218,6 +223,16 @@ jobs:
       - name: Make unit
         run: |
           make -j4 -k || make
+
+      # The default target is `all: unitd manpage`, so --tests above only
+      # makes this target available -- it does not build it.  Without it
+      # build/unit_app_test does not exist and test_app_lifecycle.py's
+      # `libunit` parameter self-skips in every leg, silently: the runtime
+      # that needs no language toolchain and links libunit directly, i.e.
+      # the one that exercises the port/fd lifecycle with the least in the
+      # way, would contribute nothing while the legs still reported green.
+      - name: Make the libunit test application
+        run: make -j4 build/unit_app_test
 
       ##
       ## Go
