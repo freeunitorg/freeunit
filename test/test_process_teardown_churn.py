@@ -52,6 +52,10 @@ BODY = 'x' * BODY_SIZE
 # "settings" member (src/nxt_conf_validation.c: nxt_conf_vldt_setting_members).
 LISTEN_THREADS = 4
 
+# Prestarted workers.  Named because the baseline below has to wait for
+# exactly this many before it means anything.
+SPARE = 2
+
 WORKERS = 4
 REQUESTS_PER_WORKER = 16
 CHURN_INTERVAL = 0.05
@@ -75,6 +79,25 @@ def _app_pids():
     return {line.split()[0] for line in out.splitlines() if marker in line}
 
 
+def _wait_for_pids(count, timeout=100):
+    """Poll until at least `count` application workers are visible.
+
+    Returns the last sample either way, so a shortfall is reported by the
+    caller's assertion as the pid set it actually saw rather than as a bare
+    timeout.
+    """
+
+    for _ in range(timeout):
+        pids = _app_pids()
+
+        if len(pids) >= count:
+            break
+
+        time.sleep(0.1)
+
+    return pids
+
+
 def test_process_teardown_churn(skip_fds_check):
     # Setting "listen_threads" changes the number of router worker engines,
     # and destroying an engine leaks its descriptors: measured on this tree,
@@ -85,13 +108,33 @@ def test_process_teardown_churn(skip_fds_check):
     # causes, and it is unrelated to what the test is here to exercise.
     skip_fds_check(router=True)
 
-    client.load(APP, processes={"spare": 2, "max": 4, "idle_timeout": 5})
+    client.load(APP, processes={"spare": SPARE, "max": 4, "idle_timeout": 5})
 
     assert 'success' in client.conf(
         {"listen_threads": LISTEN_THREADS}, 'settings'
     ), 'listen_threads'
 
     assert client.post(body='ping', read_timeout=READ_TIMEOUT)['status'] == 200
+
+    # The set of workers that exist *before* any configuration rewrite.  The
+    # final assertion needs it to tell "the churn replaced processes" from
+    # "the churn changed nothing and these are the ones we started with".
+    #
+    # Wait for the configured spares rather than assuming the warm-up request
+    # brought them up.  Unit starts spare processes asynchronously as the
+    # first one becomes idle, so an immediate sample can hold one of the two
+    # -- and the second would then appear in a later sample and be counted as
+    # a replacement, restoring the exact false positive the `fresh` check
+    # below exists to rule out.
+    baseline = _wait_for_pids(SPARE)
+
+    # >=, not ==: "spare" is a floor, not a cap ("max" is 4), so the pool is
+    # allowed to be larger by the time the warm-up request has been served.
+    # What matters is that it is not still filling.
+    assert len(baseline) >= SPARE, (
+        f'expected at least {SPARE} spare workers before the churn, '
+        f'saw {sorted(baseline)}'
+    )
 
     lock = threading.Lock()
     stop = threading.Event()
@@ -225,9 +268,27 @@ def test_process_teardown_churn(skip_fds_check):
     assert resp['body'] == BODY, 'still serving intact body'
 
     # The workload has to have actually torn processes down, otherwise it is
-    # only a concurrency test.  More than one PID means the application was
-    # destroyed and respawned while requests were in flight.
-    assert len(pids) > 1, f'application processes were not replaced: {pids}'
+    # only a concurrency test.  A count is not enough to show that: "spare": 2
+    # above means `baseline` already holds two PIDs, so `len(pids) > 1` passes
+    # on a run where no process was ever replaced.  What proves a teardown and
+    # respawn is a PID that was not serving the application before the churn
+    # started.
+    fresh = pids - baseline
+    gone = baseline - _app_pids()
+
+    assert fresh, (
+        f'no new application process appeared: saw {sorted(pids)}, '
+        f'baseline {sorted(baseline)}'
+    )
+
+    # A new pid on its own only proves the pool grew, which "max": 4 permits
+    # without any teardown at all.  A pre-churn worker that is no longer
+    # serving is the direct evidence that the configuration rewrites actually
+    # tore an application down -- which is the whole point of the workload.
+    assert gone, (
+        f'no pre-churn application process was torn down: '
+        f'baseline {sorted(baseline)} all still serving'
+    )
 
     # Requests must not have been shut out entirely, or nothing reached shared
     # memory concurrently with a teardown.
