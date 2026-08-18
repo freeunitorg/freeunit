@@ -45,6 +45,7 @@ import pytest
 
 from unit.applications.lang.php import ApplicationPHP
 from unit.log import Log
+from unit.shm_body import describe_mismatch, make_body
 
 prerequisites = {'modules': {'php': 'all'}}
 
@@ -57,8 +58,14 @@ APP = 'mirror'
 # src/nxt_port_memory_int.h), so a request is inside the chunk allocator, and
 # the process/port lookups that reach it, for long enough that a kill on
 # another thread lands in the middle of one.
+#
+# The bytes are not uniform: every request carries a fresh body stamped, every
+# 64 bytes, with that request's tag and the byte offset of the record (see
+# unit/shm_body.py).  WORKERS requests are in shared memory at once here, so a
+# chunk recycled out from under one of them most likely holds another one's
+# payload; against 'x' * BODY_SIZE that chunk is byte-identical to what
+# belongs there and the check below cannot see it.
 BODY_SIZE = 1024 * 1024
-BODY = 'x' * BODY_SIZE
 
 # > 1 so more than one router worker engine is live; this is a top-level
 # "settings" member (src/nxt_conf_validation.c: nxt_conf_vldt_setting_members).
@@ -163,11 +170,12 @@ def test_process_abrupt_teardown(skip_alert, skip_fds_check):
 
     def request_worker():
         while not stop.is_set():
+            expected = make_body(BODY_SIZE)
             started = time.time()
 
             try:
                 resp = client.post(
-                    body=BODY,
+                    body=expected,
                     read_timeout=READ_TIMEOUT,
                     read_buffer_size=65536,
                 )
@@ -191,26 +199,20 @@ def test_process_abrupt_teardown(skip_alert, skip_fds_check):
                 # A short body is legitimate: the worker can die after its
                 # headers are on the wire.  Wrong *bytes* are not - that is
                 # what reading freed or recycled shared memory looks like.
-                if body != BODY[: len(body)]:
-                    # next() needs a default.  A body that is all 'x' but
-                    # LONGER than the request still fails the comparison
-                    # above -- BODY[:len(body)] clamps to BODY -- and then
-                    # has no mismatching byte to find.  Without the default
-                    # that raises StopIteration here, outside the try that
-                    # guards the request, killing the worker thread instead
-                    # of recording the corruption: the detector fails open
-                    # on one of the shapes it exists to catch.
-                    at = next(
-                        (i for i, c in enumerate(body) if c != 'x'), None
-                    )
+                if body != expected[: len(body)]:
+                    # describe_mismatch() reports the first wrong byte and the
+                    # record stamp found there, so a failure says whether the
+                    # bytes came from another offset of this request or from
+                    # another request entirely.  It keeps the fail-open guard
+                    # too: the overlong-but-correct-prefix shape has no
+                    # mismatching byte, and a bare next() would raise
+                    # StopIteration here, outside the try that guards the
+                    # request, killing this thread instead of recording the
+                    # corruption.
                     record(
                         failures,
                         f'corrupt body: {len(body)} bytes, '
-                        + (
-                            f'first mismatch at {at}'
-                            if at is not None
-                            else f'uniform but longer than {BODY_SIZE}'
-                        ),
+                        + describe_mismatch(body, expected),
                     )
                     continue
 
@@ -267,13 +269,15 @@ def test_process_abrupt_teardown(skip_alert, skip_fds_check):
     assert not failures, f'{len(failures)} failure(s), first: {failures[0]}'
 
     # The daemon is still alive and still serves the whole payload correctly.
+    expected = make_body(BODY_SIZE)
+
     resp = client.post(
-        body=BODY, read_timeout=READ_TIMEOUT, read_buffer_size=65536
+        body=expected, read_timeout=READ_TIMEOUT, read_buffer_size=65536
     )
 
     assert resp['status'] == 200, 'still serving'
     assert len(resp['body']) == BODY_SIZE, 'still serving whole body'
-    assert resp['body'] == BODY, 'still serving intact body'
+    assert resp['body'] == expected, 'still serving intact body'
 
     # Requests must not have been shut out entirely, or nothing was in flight
     # when a worker died.
