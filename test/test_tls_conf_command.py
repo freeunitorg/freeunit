@@ -117,3 +117,26 @@ def test_tls_conf_command_invalid(skip_alert):
     check_conf_commands({"protocol": {}})
     check_conf_commands({"protocol": "blah"})
     check_conf_commands({"protocol": "TLSv1.2", "blah": ""})
+
+
+def test_tls_conf_command_invalid_path(skip_alert):
+    skip_alert(r'SSL_CONF_cmd', r'failed to apply new conf')
+
+    # nxt_conf_vldt_object_conf_commands() iterates the object itself instead
+    # of going through the instrumented iterator, so the command name has to
+    # be pushed onto the validation path explicitly; otherwise the reported
+    # location stops at conf_commands and does not name the failing command.
+    r = client.conf(
+        {"certificate": "default", "conf_commands": {"protocol": {}}},
+        'listeners/*:8080/tls',
+    )
+
+    assert 'error' in r
+
+    # builds without SSL_CONF_cmd reject the member itself, so there is no
+    # command name to attribute the error to.  The validator's text is in
+    # "detail"; "error" is the generic "Invalid configuration." title.
+    if 'built without' in r['detail']:
+        pytest.skip('built without conf_commands support')
+
+    assert r['location']['path'].endswith('/tls/conf_commands/protocol')

@@ -38,6 +38,8 @@ typedef struct {
     ssize_t           offset;
     nxt_uint_t        line;
     nxt_uint_t        column;
+    nxt_str_t         pointer;     /* RFC 6901 path to validation error. */
+    nxt_str_t         suggestion;  /* "Did you mean" member name. */
 } nxt_controller_response_t;
 
 
@@ -1504,6 +1506,8 @@ nxt_controller_process_config(nxt_task_t *task, nxt_controller_request_t *req,
 
             if (rc == NXT_DECLINED) {
                 resp.detail = vldt.error;
+                resp.pointer = vldt.pointer;
+                resp.suggestion = vldt.suggestion;
                 goto invalid_conf;
             }
 
@@ -1587,6 +1591,8 @@ nxt_controller_process_config(nxt_task_t *task, nxt_controller_request_t *req,
 
             if (rc == NXT_DECLINED) {
                 resp.detail = vldt.error;
+                resp.pointer = vldt.pointer;
+                resp.suggestion = vldt.suggestion;
                 goto invalid_conf;
             }
 
@@ -2630,6 +2636,8 @@ nxt_controller_response(nxt_task_t *task, nxt_controller_request_t *req,
     static const nxt_str_t  offset_str = nxt_string("offset");
     static const nxt_str_t  line_str = nxt_string("line");
     static const nxt_str_t  column_str = nxt_string("column");
+    static const nxt_str_t  path_str = nxt_string("path");
+    static const nxt_str_t  suggestion_str = nxt_string("suggestion");
 
     static nxt_time_string_t  date_cache = {
         (nxt_atomic_uint_t) -1,
@@ -2667,9 +2675,15 @@ nxt_controller_response(nxt_task_t *task, nxt_controller_request_t *req,
     value = resp->conf;
 
     if (value == NULL) {
+        nxt_uint_t  loc_n, loc_i, have_offset, have_pointer;
+
+        have_offset = (resp->status >= 400 && resp->offset != -1);
+        have_pointer = (resp->status >= 400 && resp->pointer.start != NULL);
+
         n = 1
             + (resp->detail.length != 0)
-            + (resp->status >= 400 && resp->offset != -1);
+            + (have_offset || have_pointer)
+            + (resp->suggestion.length != 0);
 
         value = nxt_conf_create_object(c->mem_pool, n);
 
@@ -2696,23 +2710,46 @@ nxt_controller_response(nxt_task_t *task, nxt_controller_request_t *req,
             nxt_conf_set_member_string(value, &detail_str, &resp->detail, n);
         }
 
-        if (resp->status >= 400 && resp->offset != -1) {
+        if (have_offset || have_pointer) {
             n++;
 
-            location = nxt_conf_create_object(c->mem_pool,
-                                              resp->line != 0 ? 3 : 1);
+            loc_n = (have_offset ? (resp->line != 0 ? 3 : 1) : 0) + have_pointer;
+
+            location = nxt_conf_create_object(c->mem_pool, loc_n);
+
+            if (nxt_slow_path(location == NULL)) {
+                nxt_controller_conn_close(task, c, req);
+                return;
+            }
 
             nxt_conf_set_member(value, &location_str, location, n);
 
-            nxt_conf_set_member_integer(location, &offset_str, resp->offset, 0);
+            loc_i = 0;
 
-            if (resp->line != 0) {
-                nxt_conf_set_member_integer(location, &line_str,
-                                            resp->line, 1);
+            if (have_offset) {
+                nxt_conf_set_member_integer(location, &offset_str,
+                                            resp->offset, loc_i++);
 
-                nxt_conf_set_member_integer(location, &column_str,
-                                            resp->column, 2);
+                if (resp->line != 0) {
+                    nxt_conf_set_member_integer(location, &line_str,
+                                                resp->line, loc_i++);
+
+                    nxt_conf_set_member_integer(location, &column_str,
+                                                resp->column, loc_i++);
+                }
             }
+
+            if (have_pointer) {
+                nxt_conf_set_member_string(location, &path_str,
+                                           &resp->pointer, loc_i++);
+            }
+        }
+
+        if (resp->suggestion.length != 0) {
+            n++;
+
+            nxt_conf_set_member_string(value, &suggestion_str,
+                                       &resp->suggestion, n);
         }
     }
 
