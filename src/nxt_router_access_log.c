@@ -36,8 +36,16 @@ struct nxt_router_access_log_format_s {
 };
 
 
+typedef struct {
+    nxt_str_t                       name;
+    nxt_str_t                       value;
+} nxt_router_access_log_field_t;
+
+
 static nxt_router_access_log_format_t *nxt_router_access_log_format_create(
     nxt_task_t *task, nxt_router_conf_t *rtcf, nxt_conf_value_t *value);
+static nxt_int_t nxt_router_access_log_format_json(nxt_router_conf_t *rtcf,
+    nxt_router_access_log_format_t *format);
 static void nxt_router_access_log_writer(nxt_task_t *task,
     nxt_http_request_t *r, nxt_router_access_log_t *access_log,
     nxt_router_access_log_format_t *format);
@@ -58,6 +66,24 @@ static void nxt_router_access_log_reopen_ready(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
 static void nxt_router_access_log_reopen_error(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
+
+
+/*
+ * The field set of the "json" format shorthand.  The names are a stable
+ * part of the configuration interface: they are what a log consumer keys
+ * on, so they are decoupled from the variable names they expand to.
+ */
+
+static const nxt_router_access_log_field_t  nxt_router_access_log_fields[] = {
+    { nxt_string("request"),      nxt_string("$request_line")      },
+    { nxt_string("status"),       nxt_string("$status")            },
+    { nxt_string("bytes_sent"),   nxt_string("$body_bytes_sent")   },
+    { nxt_string("remote_addr"),  nxt_string("$remote_addr")       },
+    { nxt_string("user_agent"),   nxt_string("$header_user_agent") },
+    { nxt_string("referer"),      nxt_string("$header_referer")    },
+    { nxt_string("request_time"), nxt_string("$request_time")      },
+    { nxt_string("request_id"),   nxt_string("$request_id")        },
+};
 
 
 static nxt_conf_map_t  nxt_router_access_log_conf[] = {
@@ -160,6 +186,7 @@ nxt_router_access_log_format_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
 {
     size_t                          size;
     uint32_t                        i, n, next;
+    nxt_int_t                       ret;
     nxt_str_t                       name, str, *dst;
     nxt_bool_t                      has_js;
     nxt_conf_value_t                *cv;
@@ -169,6 +196,8 @@ nxt_router_access_log_format_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
     static const nxt_str_t  default_format = nxt_string("$remote_addr - - "
         "[$time_local] \"$request_line\" $status $body_bytes_sent "
         "\"$header_referer\" \"$header_user_agent\"");
+
+    static const nxt_str_t  json_format = nxt_string("json");
 
     format = nxt_mp_zalloc(rtcf->mem_pool,
                            sizeof(nxt_router_access_log_format_t));
@@ -232,6 +261,20 @@ nxt_router_access_log_format_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
                 return format;
             }
 
+            /*
+             * No njs template in the object: serialize it to JSON text once,
+             * here, and compile that as a single template string.
+             *
+             * Note this is the one path that does NOT escape its values.
+             * Variables are substituted into the finished JSON text at
+             * request time, after nxt_conf_json_print() has run, so a value
+             * holding a '"' closes its string and can inject members --
+             * e.g. {"ua": "$header_user_agent"} with a crafted User-Agent.
+             * The member path above and the "json" shorthand both print per
+             * request and are escaped. Kept as-is for compatibility; prefer
+             * "format": "json" when the values are request-controlled.
+             */
+
             size = nxt_conf_json_length(value, NULL);
 
             str.start = nxt_mp_nget(rtcf->mem_pool, size);
@@ -244,6 +287,15 @@ nxt_router_access_log_format_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
 
         } else {
             nxt_conf_get_string(value, &str);
+
+            if (nxt_strstr_eq(&str, &json_format)) {
+                ret = nxt_router_access_log_format_json(rtcf, format);
+                if (nxt_slow_path(ret != NXT_OK)) {
+                    return NULL;
+                }
+
+                return format;
+            }
         }
 
     } else {
@@ -257,6 +309,49 @@ nxt_router_access_log_format_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
     }
 
     return format;
+}
+
+
+/*
+ * Build the fixed member set of the "json" format.  Going through the
+ * member path rather than compiling a JSON template as a single string
+ * makes every value pass through nxt_conf_json_print(), which escapes it;
+ * fields such as "user_agent" and "referer" are request-controlled and
+ * would otherwise be able to break out of the enclosing JSON string.
+ */
+
+static nxt_int_t
+nxt_router_access_log_format_json(nxt_router_conf_t *rtcf,
+    nxt_router_access_log_format_t *format)
+{
+    nxt_uint_t                           i, n;
+    nxt_router_access_log_member_t       *member;
+    const nxt_router_access_log_field_t  *field;
+
+    n = nxt_nitems(nxt_router_access_log_fields);
+
+    member = nxt_mp_alloc(rtcf->mem_pool,
+                          n * sizeof(nxt_router_access_log_member_t));
+    if (nxt_slow_path(member == NULL)) {
+        return NXT_ERROR;
+    }
+
+    for (i = 0; i < n; i++) {
+        field = &nxt_router_access_log_fields[i];
+
+        member[i].name = field->name;
+
+        member[i].tstr = nxt_tstr_compile(rtcf->tstr_state, &field->value,
+                                          NXT_TSTR_LOGGING);
+        if (nxt_slow_path(member[i].tstr == NULL)) {
+            return NXT_ERROR;
+        }
+    }
+
+    format->nmembers = n;
+    format->member = member;
+
+    return NXT_OK;
 }
 
 
