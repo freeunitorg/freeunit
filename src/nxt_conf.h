@@ -68,6 +68,14 @@ typedef struct {
 } nxt_conf_json_pretty_t;
 
 
+typedef struct nxt_conf_vldt_path_s  nxt_conf_vldt_path_t;
+
+struct nxt_conf_vldt_path_s {
+    nxt_conf_vldt_path_t  *prev;
+    nxt_str_t             seg;
+};
+
+
 typedef struct {
     nxt_conf_value_t     *conf;
     nxt_mp_t             *pool;
@@ -76,6 +84,9 @@ typedef struct {
     nxt_tstr_state_t     *tstr_state;
     nxt_mp_t             *conf_pool;
     nxt_uint_t           ver;
+    nxt_conf_vldt_path_t *path;       /* Stack (top = deepest segment). */
+    nxt_str_t            pointer;     /* RFC 6901 pointer at error site. */
+    nxt_str_t            suggestion;  /* "Did you mean X" member name. */
 } nxt_conf_validation_t;
 
 

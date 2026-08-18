@@ -75,8 +75,12 @@ struct nxt_conf_vldt_object_s {
 
 static nxt_int_t nxt_conf_vldt_type(nxt_conf_validation_t *vldt,
     const nxt_str_t *name, nxt_conf_value_t *value, nxt_conf_vldt_type_t type);
+static nxt_int_t nxt_conf_vldt_verror(nxt_conf_validation_t *vldt,
+    const char *fmt, va_list args);
 static nxt_int_t nxt_conf_vldt_error(nxt_conf_validation_t *vldt,
     const char *fmt, ...);
+static nxt_int_t nxt_conf_vldt_member_error(nxt_conf_validation_t *vldt,
+    const nxt_str_t *member, const char *fmt, ...);
 static nxt_int_t nxt_conf_vldt_var(nxt_conf_validation_t *vldt,
     const nxt_str_t *name, nxt_str_t *value);
 static nxt_int_t nxt_conf_vldt_if(nxt_conf_validation_t *vldt,
@@ -1615,6 +1619,14 @@ nxt_conf_validate(nxt_conf_validation_t *vldt)
     ret = nxt_tstr_state_done(vldt->tstr_state, error);
     if (ret != NXT_OK) {
         ret = nxt_conf_vldt_error(vldt, "%s", error);
+
+        /*
+         * Deferred tstr compilation runs once the traversal has unwound, so
+         * vldt->path no longer names the value that failed.  An empty pointer
+         * here would claim the document root; report no location instead.
+         */
+        vldt->pointer.start = NULL;
+
         return ret;
     }
 
@@ -1774,17 +1786,91 @@ nxt_conf_vldt_type(nxt_conf_validation_t *vldt, const nxt_str_t *name,
 }
 
 
+/*
+ * Serialize vldt->path into vldt->pointer as an RFC 6901 JSON Pointer.
+ * Root is the empty string "". Segments are separated by '/'. Within each
+ * segment, '~' is encoded as "~0" and '/' as "~1" (in that order).
+ *
+ * Never fails validation: on allocation failure the pointer is left empty.
+ */
+static void
+nxt_conf_vldt_render_pointer(nxt_conf_validation_t *vldt)
+{
+    u_char                *p;
+    size_t                size, n;
+    u_char                c;
+    nxt_conf_vldt_path_t  *node;
+
+    static u_char  empty[1] = "";
+
+    /*
+     * Always produce a non-NULL pointer: the empty string "" is the
+     * RFC 6901 pointer to the document root. Callers distinguish
+     * "validation error, pointer available" from "no pointer" via
+     * start != NULL.
+     */
+    vldt->pointer.length = 0;
+    vldt->pointer.start = empty;
+
+    if (vldt->path == NULL) {
+        return;
+    }
+
+    size = 0;
+    for (node = vldt->path; node != NULL; node = node->prev) {
+        if (nxt_slow_path(size == NXT_SIZE_T_MAX)) {
+            vldt->pointer.start = NULL;
+            return;
+        }
+        size += 1;  /* leading '/' */
+        for (n = 0; n < node->seg.length; n++) {
+            c = node->seg.start[n];
+            if (nxt_slow_path(size >= NXT_SIZE_T_MAX - 1)) {
+                vldt->pointer.start = NULL;
+                return;
+            }
+            size += (c == '~' || c == '/') ? 2 : 1;
+        }
+    }
+
+    p = nxt_mp_nget(vldt->pool, size);
+    if (p == NULL) {
+        vldt->pointer.start = NULL;
+        return;
+    }
+
+    vldt->pointer.start = p;
+    vldt->pointer.length = size;
+
+    p += size;
+
+    for (node = vldt->path; node != NULL; node = node->prev) {
+        for (n = node->seg.length; n > 0; n--) {
+            c = node->seg.start[n - 1];
+            if (c == '~') {
+                *--p = '0';
+                *--p = '~';
+            } else if (c == '/') {
+                *--p = '1';
+                *--p = '~';
+            } else {
+                *--p = c;
+            }
+        }
+        *--p = '/';
+    }
+}
+
+
 static nxt_int_t
-nxt_conf_vldt_error(nxt_conf_validation_t *vldt, const char *fmt, ...)
+nxt_conf_vldt_verror(nxt_conf_validation_t *vldt, const char *fmt,
+    va_list args)
 {
     u_char   *p, *end;
     size_t   size;
-    va_list  args;
     u_char   error[NXT_MAX_ERROR_STR];
 
-    va_start(args, fmt);
     end = nxt_vsprintf(error, error + NXT_MAX_ERROR_STR, fmt, args);
-    va_end(args);
 
     size = end - error;
 
@@ -1798,7 +1884,184 @@ nxt_conf_vldt_error(nxt_conf_validation_t *vldt, const char *fmt, ...)
     vldt->error.length = size;
     vldt->error.start = p;
 
+    nxt_conf_vldt_render_pointer(vldt);
+
     return NXT_DECLINED;
+}
+
+
+static nxt_int_t
+nxt_conf_vldt_error(nxt_conf_validation_t *vldt, const char *fmt, ...)
+{
+    va_list    args;
+    nxt_int_t  ret;
+
+    va_start(args, fmt);
+    ret = nxt_conf_vldt_verror(vldt, fmt, args);
+    va_end(args);
+
+    return ret;
+}
+
+
+/*
+ * Report an error against a member of the object being validated, for the
+ * semantic checks that run once nxt_conf_vldt_object() has finished the
+ * traversal and already popped that member's path segment.  Without this the
+ * location would name the containing object instead of the value that failed.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_member_error(nxt_conf_validation_t *vldt,
+    const nxt_str_t *member, const char *fmt, ...)
+{
+    va_list               args;
+    nxt_int_t             ret;
+    nxt_conf_vldt_path_t  seg;
+
+    seg.prev = vldt->path;
+    seg.seg = *member;
+    vldt->path = &seg;
+
+    va_start(args, fmt);
+    ret = nxt_conf_vldt_verror(vldt, fmt, args);
+    va_end(args);
+
+    vldt->path = seg.prev;
+
+    return ret;
+}
+
+
+/*
+ * Damerau-Levenshtein distance between two byte strings. Rejects inputs
+ * that would overflow the stack buffer by returning SIZE_MAX.
+ *
+ * Used only inside validation error paths; input lengths are bounded by
+ * configuration member-name lengths.
+ */
+#define NXT_CONF_VLDT_EDIT_MAX  64
+
+static size_t
+nxt_conf_vldt_edit_distance(const nxt_str_t *a, const nxt_str_t *b)
+{
+    size_t  i, j, cost, ins, del, sub, tr, min;
+    size_t  prev2[NXT_CONF_VLDT_EDIT_MAX + 1];
+    size_t  prev[NXT_CONF_VLDT_EDIT_MAX + 1];
+    size_t  curr[NXT_CONF_VLDT_EDIT_MAX + 1];
+
+    if (a->length > NXT_CONF_VLDT_EDIT_MAX
+        || b->length > NXT_CONF_VLDT_EDIT_MAX)
+    {
+        return (size_t) -1;
+    }
+
+    for (j = 0; j <= b->length; j++) {
+        prev[j] = j;
+        prev2[j] = 0;
+    }
+
+    for (i = 1; i <= a->length; i++) {
+        curr[0] = i;
+
+        for (j = 1; j <= b->length; j++) {
+            cost = (a->start[i - 1] == b->start[j - 1]) ? 0 : 1;
+
+            ins = curr[j - 1] + 1;        /* left neighbour  */
+            del = prev[j] + 1;            /* upper neighbour */
+            sub = prev[j - 1] + cost;     /* diagonal        */
+
+            min = ins < del ? ins : del;
+            if (sub < min) {
+                min = sub;
+            }
+
+            if (i > 1 && j > 1
+                && a->start[i - 1] == b->start[j - 2]
+                && a->start[i - 2] == b->start[j - 1])
+            {
+                tr = prev2[j - 2] + 1;
+                if (tr < min) {
+                    min = tr;
+                }
+            }
+
+            curr[j] = min;
+        }
+
+        for (j = 0; j <= b->length; j++) {
+            prev2[j] = prev[j];
+            prev[j] = curr[j];
+        }
+    }
+
+    return prev[b->length];
+}
+
+
+/*
+ * Emit "Unknown parameter" error for a member not present in the schema
+ * table. If a sufficiently-close, uniquely-best candidate exists, store
+ * its name in vldt->suggestion so the response body can surface it.
+ *
+ * Does NOT modify the legacy error-message wording.
+ */
+static nxt_int_t
+nxt_conf_vldt_unknown_member(nxt_conf_validation_t *vldt,
+    const nxt_str_t *name, nxt_conf_vldt_object_t *vals)
+{
+    size_t                  d, best, second;
+    size_t                  threshold, shorter;
+    nxt_conf_vldt_object_t  *v, *best_v;
+
+    best = (size_t) -1;
+    second = (size_t) -1;
+    best_v = NULL;
+
+    v = vals;
+
+    for ( ;; ) {
+        if (v->name.length == 0) {
+            if (v->u.members != NULL) {
+                v = v->u.members;
+                continue;
+            }
+            break;
+        }
+
+        d = nxt_conf_vldt_edit_distance(name, &v->name);
+        if (d < best) {
+            second = best;
+            best = d;
+            best_v = v;
+        } else if (d < second) {
+            second = d;
+        }
+
+        v++;
+    }
+
+    threshold = nxt_max((size_t) 2, name->length / 3);
+
+    /*
+     * Require the edit to cover at most half of the shorter name as well as
+     * to stay under the threshold.  The threshold alone is too permissive for
+     * short names: at two bytes it admits a distance of 2, which is every
+     * two-letter member in the schema, so "zz" would "did you mean" its way to
+     * an unrelated name it shares no characters with.
+     *
+     * best < second keeps the match unambiguous.
+     */
+
+    if (best_v != NULL && best <= threshold && best < second) {
+        shorter = nxt_min(name->length, best_v->name.length);
+
+        if (best * 2 <= shorter) {
+            vldt->suggestion = best_v->name;
+        }
+    }
+
+    return nxt_conf_vldt_error(vldt, "Unknown parameter \"%V\".", name);
 }
 
 
@@ -2883,10 +3146,11 @@ static nxt_int_t
 nxt_conf_vldt_object_conf_commands(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data)
 {
-    uint32_t          index;
-    nxt_int_t         ret;
-    nxt_str_t         name;
-    nxt_conf_value_t  *member;
+    uint32_t              index;
+    nxt_int_t             ret;
+    nxt_str_t             name;
+    nxt_conf_value_t      *member;
+    nxt_conf_vldt_path_t  seg;
 
     index = 0;
 
@@ -2897,7 +3161,21 @@ nxt_conf_vldt_object_conf_commands(nxt_conf_validation_t *vldt,
             break;
         }
 
+        /*
+         * This iterates the object itself rather than going through
+         * nxt_conf_vldt_object_iterator(), so the command name has to be
+         * pushed here; without it the error below would point at
+         * conf_commands rather than at the command that failed.
+         */
+
+        seg.prev = vldt->path;
+        seg.seg = name;
+        vldt->path = &seg;
+
         ret = nxt_conf_vldt_type(vldt, &name, member, NXT_CONF_VLDT_STRING);
+
+        vldt->path = seg.prev;
+
         if (ret != NXT_OK) {
             return ret;
         }
@@ -3097,8 +3375,8 @@ nxt_conf_vldt_listen_backlog(nxt_conf_validation_t *vldt,
 
 
 static nxt_int_t
-nxt_conf_vldt_app(nxt_conf_validation_t *vldt, nxt_str_t *name,
-    nxt_conf_value_t *value)
+nxt_conf_vldt_app_type(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
+    nxt_app_lang_module_t **langp)
 {
     nxt_int_t              ret;
     nxt_str_t              type;
@@ -3107,27 +3385,6 @@ nxt_conf_vldt_app(nxt_conf_validation_t *vldt, nxt_str_t *name,
     nxt_app_lang_module_t  *lang;
 
     static const nxt_str_t  type_str = nxt_string("type");
-
-    static const struct {
-        nxt_conf_vldt_handler_t  validator;
-        nxt_conf_vldt_object_t   *members;
-
-    } types[] = {
-        { nxt_conf_vldt_object, nxt_conf_vldt_external_members },
-        { nxt_conf_vldt_python, NULL },
-        { nxt_conf_vldt_php,    NULL },
-        { nxt_conf_vldt_object, nxt_conf_vldt_perl_members },
-        { nxt_conf_vldt_object, nxt_conf_vldt_ruby_members },
-        { nxt_conf_vldt_object, nxt_conf_vldt_java_members },
-        { nxt_conf_vldt_object, nxt_conf_vldt_wasm_members },
-        { nxt_conf_vldt_object, nxt_conf_vldt_wasm_wc_members },
-    };
-
-    ret = nxt_conf_vldt_type(vldt, name, value, NXT_CONF_VLDT_OBJECT);
-
-    if (ret != NXT_OK) {
-        return ret;
-    }
 
     type_value = nxt_conf_get_object_member(value, &type_str, NULL);
 
@@ -3154,6 +3411,64 @@ nxt_conf_vldt_app(nxt_conf_validation_t *vldt, nxt_str_t *name,
                                    &type);
     }
 
+    *langp = lang;
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_conf_vldt_app(nxt_conf_validation_t *vldt, nxt_str_t *name,
+    nxt_conf_value_t *value)
+{
+    nxt_int_t              ret;
+    nxt_conf_vldt_path_t   seg;
+    nxt_app_lang_module_t  *lang;
+
+    static const nxt_str_t  type_str = nxt_string("type");
+
+    static const struct {
+        nxt_conf_vldt_handler_t  validator;
+        nxt_conf_vldt_object_t   *members;
+
+    } types[] = {
+        { nxt_conf_vldt_object, nxt_conf_vldt_external_members },
+        { nxt_conf_vldt_python, NULL },
+        { nxt_conf_vldt_php,    NULL },
+        { nxt_conf_vldt_object, nxt_conf_vldt_perl_members },
+        { nxt_conf_vldt_object, nxt_conf_vldt_ruby_members },
+        { nxt_conf_vldt_object, nxt_conf_vldt_java_members },
+        { nxt_conf_vldt_object, nxt_conf_vldt_wasm_members },
+        { nxt_conf_vldt_object, nxt_conf_vldt_wasm_wc_members },
+    };
+
+    lang = NULL;
+
+    ret = nxt_conf_vldt_type(vldt, name, value, NXT_CONF_VLDT_OBJECT);
+
+    if (ret != NXT_OK) {
+        return ret;
+    }
+
+    /*
+     * The three checks below all concern the "type" member, so they report
+     * against it rather than against the application object that contains
+     * it.  The nested validator that follows must run with the path back at
+     * the application, so the segment is popped before it.
+     */
+
+    seg.prev = vldt->path;
+    seg.seg = type_str;
+    vldt->path = &seg;
+
+    ret = nxt_conf_vldt_app_type(vldt, value, &lang);
+
+    vldt->path = seg.prev;
+
+    if (ret != NXT_OK) {
+        return ret;
+    }
+
     return types[lang->type].validator(vldt, value, types[lang->type].members);
 }
 
@@ -3167,6 +3482,7 @@ nxt_conf_vldt_object(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
     nxt_str_t               name, var;
     nxt_conf_value_t        *member;
     nxt_conf_vldt_object_t  *vals;
+    nxt_conf_vldt_path_t    seg;
 
     vals = data;
 
@@ -3185,8 +3501,16 @@ nxt_conf_vldt_object(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
             member = nxt_conf_get_object_member(value, &vals->name, NULL);
 
             if (member == NULL) {
-                return nxt_conf_vldt_error(vldt, "Required parameter \"%V\" "
-                                           "is missing.", &vals->name);
+                seg.prev = vldt->path;
+                seg.seg = vals->name;
+                vldt->path = &seg;
+
+                ret = nxt_conf_vldt_error(vldt, "Required parameter \"%V\" "
+                                          "is missing.", &vals->name);
+
+                vldt->path = seg.prev;
+
+                return ret;
             }
         }
 
@@ -3212,8 +3536,7 @@ nxt_conf_vldt_object(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
                     continue;
                 }
 
-                return nxt_conf_vldt_error(vldt, "Unknown parameter \"%V\".",
-                                           &name);
+                return nxt_conf_vldt_unknown_member(vldt, &name, data);
             }
 
             if (!nxt_strstr_eq(&vals->name, &name)) {
@@ -3227,7 +3550,14 @@ nxt_conf_vldt_object(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
                 nxt_conf_get_string(member, &var);
 
                 if (nxt_is_tstr(&var)) {
+                    seg.prev = vldt->path;
+                    seg.seg = name;
+                    vldt->path = &seg;
+
                     ret = nxt_conf_vldt_var(vldt, &name, &var);
+
+                    vldt->path = seg.prev;
+
                     if (ret != NXT_OK) {
                         return ret;
                     }
@@ -3236,8 +3566,13 @@ nxt_conf_vldt_object(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
                 }
             }
 
+            seg.prev = vldt->path;
+            seg.seg = name;
+            vldt->path = &seg;
+
             ret = nxt_conf_vldt_type(vldt, &name, member, vals->type);
             if (ret != NXT_OK) {
+                vldt->path = seg.prev;
                 return ret;
             }
 
@@ -3245,10 +3580,12 @@ nxt_conf_vldt_object(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
                 ret = vals->validator(vldt, member, vals->u.members);
 
                 if (ret != NXT_OK) {
+                    vldt->path = seg.prev;
                     return ret;
                 }
             }
 
+            vldt->path = seg.prev;
             break;
         }
     }
@@ -3291,6 +3628,10 @@ nxt_conf_vldt_processes(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
     nxt_int_t                       ret;
     nxt_conf_vldt_processes_conf_t  proc;
 
+    static const nxt_str_t  spare_str = nxt_string("spare");
+    static const nxt_str_t  max_str = nxt_string("max");
+    static const nxt_str_t  idle_timeout_str = nxt_string("idle_timeout");
+
     if (nxt_conf_type(value) == NXT_CONF_INTEGER) {
         int_value = nxt_conf_get_number(value);
 
@@ -3325,37 +3666,44 @@ nxt_conf_vldt_processes(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
     }
 
     if (proc.spare < 0) {
-        return nxt_conf_vldt_error(vldt, "The \"spare\" number must not be "
+        return nxt_conf_vldt_member_error(vldt, &spare_str,
+                                   "The \"spare\" number must not be "
                                    "negative.");
     }
 
     if (proc.spare > NXT_INT32_T_MAX) {
-        return nxt_conf_vldt_error(vldt, "The \"spare\" number must not "
+        return nxt_conf_vldt_member_error(vldt, &spare_str,
+                                   "The \"spare\" number must not "
                                    "exceed %d.", NXT_INT32_T_MAX);
     }
 
     if (proc.max < 1) {
-        return nxt_conf_vldt_error(vldt, "The \"max\" number must be equal "
+        return nxt_conf_vldt_member_error(vldt, &max_str,
+                                   "The \"max\" number must be equal "
                                    "to or greater than 1.");
     }
 
     if (proc.max > NXT_INT32_T_MAX) {
-        return nxt_conf_vldt_error(vldt, "The \"max\" number must not "
+        return nxt_conf_vldt_member_error(vldt, &max_str,
+                                   "The \"max\" number must not "
                                    "exceed %d.", NXT_INT32_T_MAX);
     }
 
     if (proc.max < proc.spare) {
-        return nxt_conf_vldt_error(vldt, "The \"spare\" number must be "
+        return nxt_conf_vldt_member_error(vldt, &spare_str,
+                                   "The \"spare\" number must be "
                                    "less than or equal to \"max\".");
     }
 
     if (proc.idle_timeout < 0) {
-        return nxt_conf_vldt_error(vldt, "The \"idle_timeout\" number must not "
+        return nxt_conf_vldt_member_error(vldt, &idle_timeout_str,
+                                   "The \"idle_timeout\" number must not "
                                    "be negative.");
     }
 
     if (proc.idle_timeout > NXT_INT32_T_MAX / 1000) {
-        return nxt_conf_vldt_error(vldt, "The \"idle_timeout\" number must not "
+        return nxt_conf_vldt_member_error(vldt, &idle_timeout_str,
+                                   "The \"idle_timeout\" number must not "
                                    "exceed %d.", NXT_INT32_T_MAX / 1000);
     }
 
@@ -3371,6 +3719,7 @@ nxt_conf_vldt_object_iterator(nxt_conf_validation_t *vldt,
     nxt_int_t               ret;
     nxt_str_t               name;
     nxt_conf_value_t        *member;
+    nxt_conf_vldt_path_t    seg;
     nxt_conf_vldt_member_t  validator;
 
     validator = (nxt_conf_vldt_member_t) data;
@@ -3382,7 +3731,14 @@ nxt_conf_vldt_object_iterator(nxt_conf_validation_t *vldt,
             return NXT_OK;
         }
 
+        seg.prev = vldt->path;
+        seg.seg = name;
+        vldt->path = &seg;
+
         ret = validator(vldt, &name, member);
+
+        vldt->path = seg.prev;
+
         if (ret != NXT_OK) {
             return ret;
         }
@@ -3394,10 +3750,13 @@ static nxt_int_t
 nxt_conf_vldt_array_iterator(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data)
 {
+    u_char                   *p;
     uint32_t                 index;
     nxt_int_t                ret;
     nxt_conf_value_t         *element;
+    nxt_conf_vldt_path_t     seg;
     nxt_conf_vldt_element_t  validator;
+    u_char                   buf[NXT_INT_T_LEN];
 
     validator = (nxt_conf_vldt_element_t) data;
 
@@ -3408,7 +3767,16 @@ nxt_conf_vldt_array_iterator(nxt_conf_validation_t *vldt,
             return NXT_OK;
         }
 
+        p = nxt_sprintf(buf, buf + sizeof(buf), "%uD", index);
+
+        seg.prev = vldt->path;
+        seg.seg.start = buf;
+        seg.seg.length = p - buf;
+        vldt->path = &seg;
+
         ret = validator(vldt, element);
+
+        vldt->path = seg.prev;
 
         if (ret != NXT_OK) {
             return ret;
@@ -3832,8 +4200,9 @@ static nxt_int_t
 nxt_conf_vldt_upstream(nxt_conf_validation_t *vldt, nxt_str_t *name,
     nxt_conf_value_t *value)
 {
-    nxt_int_t         ret;
-    nxt_conf_value_t  *conf;
+    nxt_int_t             ret;
+    nxt_conf_value_t      *conf;
+    nxt_conf_vldt_path_t  seg;
 
     static const nxt_str_t  servers = nxt_string("servers");
 
@@ -3851,8 +4220,19 @@ nxt_conf_vldt_upstream(nxt_conf_validation_t *vldt, nxt_str_t *name,
 
     conf = nxt_conf_get_object_member(value, &servers, NULL);
     if (conf == NULL) {
-        return nxt_conf_vldt_error(vldt, "The \"%V\" upstream must contain "
-                                   "\"servers\" object value.", name);
+        /* Same convention as the NXT_CONF_VLDT_REQUIRED check: a missing
+         * member is reported against the member, not its container. */
+
+        seg.prev = vldt->path;
+        seg.seg = servers;
+        vldt->path = &seg;
+
+        ret = nxt_conf_vldt_error(vldt, "The \"%V\" upstream must contain "
+                                  "\"servers\" object value.", name);
+
+        vldt->path = seg.prev;
+
+        return ret;
     }
 
     return NXT_OK;
@@ -3989,9 +4369,11 @@ nxt_conf_vldt_access_log(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
     void *data)
 {
     nxt_int_t                        ret;
+    nxt_conf_vldt_path_t             seg;
     nxt_conf_vldt_access_log_conf_t  conf;
 
     static const nxt_str_t  format_str = nxt_string("format");
+    static const nxt_str_t  path_str = nxt_string("path");
 
     if (nxt_conf_type(value) == NXT_CONF_STRING) {
         return nxt_conf_vldt_c_string(vldt, value, (void *) "access_log");
@@ -4013,19 +4395,28 @@ nxt_conf_vldt_access_log(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
     }
 
     if (conf.path.length == 0) {
-        return nxt_conf_vldt_error(vldt,
+        return nxt_conf_vldt_member_error(vldt, &path_str,
                                    "The \"path\" string must not be empty.");
     }
 
     /* The log path is opened as a NUL-terminated C string. */
 
     if (memchr(conf.path.start, '\0', conf.path.length) != NULL) {
-        return nxt_conf_vldt_error(vldt, "The \"path\" value must not "
+        return nxt_conf_vldt_member_error(vldt, &path_str,
+                                   "The \"path\" value must not "
                                    "contain null character.");
     }
 
     if (nxt_is_tstr(&conf.format)) {
-        return nxt_conf_vldt_var(vldt, &format_str, &conf.format);
+        seg.prev = vldt->path;
+        seg.seg = format_str;
+        vldt->path = &seg;
+
+        ret = nxt_conf_vldt_var(vldt, &format_str, &conf.format);
+
+        vldt->path = seg.prev;
+
+        return ret;
     }
 
     return NXT_OK;
