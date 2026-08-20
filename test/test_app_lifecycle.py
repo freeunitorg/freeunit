@@ -45,6 +45,7 @@ CI wiring note: .github/workflows/build-test.yml derives a per-module test glob
 import os
 import subprocess
 import time
+from collections import namedtuple
 from pathlib import Path
 
 import pytest
@@ -108,6 +109,12 @@ class ApplicationLibunit(ApplicationProto):
 # nxt_unit_response_buf_alloc() refuses anything above PORT_MMAP_DATA_SIZE, so
 # a request that fills a segment leaves it unable to build a response at all.
 # That is a property of the sample app, not of the port handling under test.
+#
+# The legacy `wasm` runtime is absent deliberately: the suite has no client
+# for it (only test/unit/applications/lang/wasm_component.py exists), its
+# build-test leg does not install or run pytest at all
+# (`if: module != 'wasm'`), and sanitize.yml has no wasm leg.  A row here
+# would skip in every leg that exists.
 RUNTIMES = {
     'libunit': (ApplicationLibunit, 'libunit', [], [], False, False),
     'go': (ApplicationGo, 'mirror', ['go'], [], True, True),
@@ -131,12 +138,18 @@ RUNTIMES = {
 
 BODY = '0123456789' * 200
 
-# PORT_MMAP_DATA_SIZE (src/nxt_port_memory_int.h): the payload area of one
-# shared-memory segment, and therefore the amount of request data the router
-# can hand an application before it has to create another one.
+# PORT_MMAP_DATA_SIZE on a non-NXT_MMAP_TINY_CHUNK build
+# (src/nxt_port_memory_int.h): the payload area of one shared-memory segment,
+# and therefore the amount of request data the router can hand an application
+# before it has to create another one.
 SEGMENT = 10 * 1024 * 1024
 
 KEEPALIVE = {'Host': 'localhost', 'Connection': 'keep-alive'}
+
+# Requests per measurement window in test_app_lifecycle_app_fds_stable(): the
+# size of the burst is what turns "one descriptor per request" into a number
+# no lazy allocation can reach.
+BURST = 40
 
 
 class LifecycleApp:
@@ -166,9 +179,14 @@ class LifecycleApp:
         """One request that forces real request/response traffic.
 
         POST with a body where the runtime mirrors it back -- bodies travel
-        through the shared-memory and spool-file paths that carry descriptors
-        to the app -- plain GET otherwise.  Returns (response, socket); the
-        socket is None unless the connection was kept alive.
+        through the shared-memory path that carries descriptors to the app --
+        plain GET otherwise.  Returns (response, socket); the socket is None
+        unless the connection was kept alive.
+
+        BODY is small on purpose, and so no request here spools: a body past
+        body_buffer_size reaches the application as a descriptor to a file
+        instead, and the runtime that would suffer most from one is the wasm
+        component, whose read loop does not terminate on a short read.
         """
         if keepalive or sock is not None:
             # A COPY.  HTTP1.http() writes Content-Length into the dict it
@@ -372,6 +390,9 @@ def app(request):
     return LifecycleApp(runtime, factory(), name, mirror, oversized)
 
 
+FdCounts = namedtuple('FdCounts', ('sockets', 'shm', 'spool'))
+
+
 def count_fds(pid):
     """Descriptors of the kinds libunit hands an application process.
 
@@ -383,10 +404,37 @@ def count_fds(pid):
     JVM, not in the port handling this test exists to watch.
 
     So count only what the docstring of the test actually claims: sockets
-    (ports), shared memory segments (incoming mmap), and regular files under
-    the test's own temp dir (request spool files).  Anything the language
-    runtime opens for its own purposes is deliberately out of scope, and a
-    real leak of a port, a segment or a spool file still fails.
+    (ports) and shared memory segments (incoming mmap).  Anything the
+    language runtime opens for its own purposes is deliberately out of scope,
+    and a real leak of a port or a segment still fails.
+
+    Counted per class rather than as one total, because the classes do not
+    behave alike: an application acquires port sockets lazily, one per router
+    engine, so their count legitimately rises for a while, while a segment or
+    a spool descriptor is closed by the same message that delivered it and
+    must never rise at all.  A single total would have to carry the socket
+    tolerance, and would then be blind to a per-segment leak.  Separate
+    counts let the caller hold each class to its own rule.
+
+    Segments are narrowed further, because "shared memory" is not
+    unit-specific -- php's opcache maps /memfd:opcache_lock, and a JVM heap
+    can appear as /memfd:java_heap -- so only names carrying `unit.` count.
+
+    Spool files are narrowed by name, not by "regular file under the temp
+    dir".  The temp dir is not unit's alone: it holds unit.log, which every
+    worker keeps open for its whole life, and ApplicationJava.prepare_env()
+    stages the whole webapp into {temp_dir}/java
+    (test/unit/applications/lang/java.py), so a directory rule counts the
+    JVM's classloader descriptors on WEB-INF/classes/*.class -- exactly the
+    runtime-specific noise the narrowing above exists to drop.  A spool file
+    is created as mkstemp("<tmp>/req-XXXXXXXX") and unlinked immediately
+    (nxt_h1p_request_body_read(), src/nxt_h1proto.c), so its link target is
+    `{temp_dir}/req-XXXXXXXX (deleted)`; match that basename.
+
+    The class is kept as a guard, but no test here reaches it: bodies are
+    either 2000 bytes (well under the 16 KiB default body_buffer_size) or
+    sent by test_app_lifecycle_app_fds_stable, which raises that buffer above
+    the body precisely so the body does NOT spool.
     """
 
     fds = Path(f'/proc/{pid}/fd')
@@ -394,7 +442,9 @@ def count_fds(pid):
     if not fds.is_dir():
         return None
 
-    n = 0
+    sockets = 0
+    shm = 0
+    spool = 0
 
     try:
         for fd in fds.iterdir():
@@ -405,47 +455,89 @@ def count_fds(pid):
                 # the descriptor closed underneath us; it is not a leak
                 continue
 
-            if (
-                target.startswith('socket:')
-                or target.startswith('/memfd:')
-                or target.startswith('/dev/shm/')
-                or target.startswith(f'{option.temp_dir}/')
+            if target.startswith('socket:'):
+                sockets += 1
+
+            elif target.startswith('/memfd:') or target.startswith(
+                '/dev/shm/'
             ):
-                n += 1
+                if 'unit.' in target:
+                    shm += 1
+
+            elif target.startswith(f'{option.temp_dir}/'):
+                if _is_spool(target):
+                    spool += 1
 
     except OSError:
         return None
 
-    return n
+    return FdCounts(sockets, shm, spool)
+
+
+def _is_spool(target):
+    """Is this /proc/<pid>/fd link target a request spool file?"""
+
+    deleted = ' (deleted)'
+
+    if target.endswith(deleted):
+        target = target[: -len(deleted)]
+
+    return os.path.basename(target).startswith('req-')
 
 
 def fd_targets(pid):
-    """What the counted descriptors of `pid` point at, for a failure message.
+    """What the descriptors of `pid` point at, for a failure message.
 
     A bare count says growth happened; this says what grew, which is the
     difference between a report someone can act on and one that starts an
     investigation from nothing.
+
+    A list rather than a set: two descriptors on the same target are exactly
+    what a leak looks like, and deduplicating them would print fewer entries
+    than the count that failed.
+
+    Labelled by the classes count_fds() counts, so the report and the number
+    that failed describe the same thing; everything else goes to `other`,
+    which is printed but never counted -- when growth is real it is useful to
+    see what the runtime is holding, and when it is not, its absence from the
+    counted classes is the answer.
     """
+
+    targets = {'sockets': [], 'shm': [], 'spool': [], 'other': []}
 
     fds = Path(f'/proc/{pid}/fd')
 
     if not fds.is_dir():
-        return set()
-
-    targets = set()
+        return targets
 
     try:
         for fd in fds.iterdir():
             try:
-                targets.add(os.readlink(fd))
+                target = os.readlink(fd)
 
             except OSError:
                 continue
 
-    except OSError:
-        return set()
+            if target.startswith('socket:'):
+                targets['sockets'].append(target)
 
-    return targets
+            elif (
+                target.startswith('/memfd:') or target.startswith('/dev/shm/')
+            ) and 'unit.' in target:
+                targets['shm'].append(target)
+
+            elif target.startswith(f'{option.temp_dir}/') and _is_spool(
+                target
+            ):
+                targets['spool'].append(target)
+
+            else:
+                targets['other'].append(target)
+
+    except OSError:
+        return targets
+
+    return {name: sorted(items) for name, items in targets.items()}
 
 
 def shm_segments(pid):
@@ -673,36 +765,100 @@ def test_app_lifecycle_app_fds_stable(app):
     """No per-request descriptor growth inside the application process.
 
     conftest's _check_fds() only watches main/router/controller.  The libunit
-    paths that hand descriptors to an app -- incoming mmap segments, request
-    spool files, port sockets -- are only observable here, so a leak of one
-    descriptor per request or per port announcement is invisible to the rest
-    of the suite.
+    paths that hand descriptors to an app -- incoming mmap segments and port
+    sockets -- are only observable here, so a leak of one descriptor per
+    request or per incoming segment is invisible to the rest of the suite.
 
-    Measured across TWO identical bursts rather than before-and-after one.
-    A single burst cannot tell a leak from lazy one-time allocation, and the
-    app process does allocate lazily: a further incoming mmap segment or an
-    additional router port arrives when it is first needed, not during the
-    warm-up.  Counting one window made this fail for a single descriptor on
-    java-26 and again on python, both times for growth that never repeated.
-    A leak is growth that keeps happening, so the claim is about the SECOND
-    window: whatever the first burst settles, the second must not add to it.
+    Per request and per incoming segment is the whole claim.  A leak in the
+    one-time paths -- recv_msg->fd[0] in nxt_unit_process_new_port(), say --
+    is NOT covered: this test loads the application with processes=1 and
+    never restarts or reconfigures it, so every NEW_PORT it sees is a first
+    discovery, lands in a single window, and is indistinguishable from the
+    legitimate lazy acquisition described below.  Port-announcement churn is
+    covered by the other tests in this module, and only through the alerts a
+    bad close writes into unit.log (Log.check_alerts()).
+
+    Request spool files are the third kind of descriptor an application is
+    handed, and this module deliberately does not exercise them: every body
+    it sends is either well under body_buffer_size or accompanied by a
+    buffer raised above it.  count_fds() still counts them, as a guard for
+    whoever adds the coverage.
+
+    Measured across THREE identical bursts rather than before-and-after one,
+    and per descriptor class rather than as one total.  A single burst cannot
+    tell a leak from lazy one-time allocation, and the app process does
+    allocate lazily.  Counting one window made this fail for a single
+    descriptor on java-26 and again on python, both times for growth that
+    never repeated.
+
+    Only sockets allocate lazily, so only sockets pay for it:
+
+      * shm and spool descriptors must be flat.  Both are closed by the same
+        message that delivered them -- nxt_unit_process_msg()'s `done:` --
+        so any growth at all, in either window, is a leak.  Every burst
+        forces an incoming segment (below), which keeps a per-segment leak
+        visible in a single window rather than cancelling out.
+
+      * sockets are bounded, not flat.  The router runs nxt_ncpu engine
+        threads (rtcf->threads, src/nxt_router.c), an application does not
+        learn an engine's port until the first request routed through that
+        engine, and nxt_unit_process_new_port() keeps that NEW_PORT socket
+        (src/nxt_unit.c).  Discovery is one-time PER ENGINE, not per
+        process: with several engines still undiscovered after the first
+        window, windows two and three can each add one, so "growth in both
+        windows" is a legitimate outcome and cannot be the rule.
+
+    The socket rule is therefore one bound, and the discovery ceiling is
+    what makes it safe.  There are at most nxt_ncpu engines, the test does
+    not touch `listen_threads`, and nxt_ncpu is CPU_COUNT() of the affinity
+    mask, capped by _SC_NPROCESSORS_ONLN (nxt_lib.c) -- which is what
+    os.sched_getaffinity() reports here.  So: total socket growth across the
+    two windows may not exceed that ceiling.  Discovery can never exceed it,
+    however the first touches fall across the windows -- one window, both,
+    or a whole burst's worth of fresh engines on a machine with more CPUs
+    than the burst has requests -- so this bound cannot be tripped by the
+    engine count.  A per-window bound was tried and dropped for exactly that
+    last case: on a host with BURST or more undiscovered engines, BURST fresh
+    connections can legitimately retain BURST new port sockets in one window.
+
+    What the socket rule gives up is a socket leak that stays under the
+    ceiling: one socket per request adds 2 * BURST over the two windows and
+    is caught on any machine with fewer than 2 * BURST CPUs -- every CI
+    runner by a wide margin -- but on a larger host, or for a leak slower
+    than one per request, growth that sums to no more than nxt_ncpu reads as
+    discovery.  That is unavoidable while discovery is live, and it is the
+    class where a leak is cheapest to spot elsewhere -- a port descriptor
+    mishandled in the churn tests above shows up as an alert.  The classes
+    with no tolerance at all are the ones only this test watches.
+
+    Measured on php with this workload reduced to six plain 40-request
+    windows, the app's socket count ran 8, 8, 9, 9, 9, 9: one discovery,
+    after the second window, then flat.  The bound passes that; a
+    per-request leak (8, 48, 88) trips it on any host under 80 CPUs.
+
+    Pinning the router to one engine would remove the variable at its source,
+    and is the more obvious fix -- but `listen_threads` is a live
+    reconfiguration, and restoring the default at teardown leaves conftest's
+    own _check_fds() looking at a router that has rebuilt its engines, which
+    it reports as a 21-descriptor leak in the router.
 
     Each burst ends with one oversized POST, and that is not decoration.  The
     router creates a segment only when the ones it has for this application
     cannot serve a request, and 2000-byte requests release their chunks as
     they complete, so a burst of them reuses the segment the warm-up caused
-    and never makes the router announce another.  A descriptor leaked per
-    incoming segment would then already be inside BOTH counts and cancel out
-    -- the one leak this test names in its own docstring, invisible to it.
-    The oversized request forces an announcement; the burst asserts that it
-    happened, so the probe cannot quietly stop working.
+    and never makes the router announce another.  A window that received no
+    segment cannot show a descriptor leaked per segment -- the one leak this
+    test names in its own docstring would be invisible to it, and the flat
+    rule would pass a leaking build.  The oversized request forces an
+    announcement; the burst asserts that it happened, so the probe cannot
+    quietly stop working.
 
     The POST grows by one segment per burst because the pool grows with it:
-    the segment the first burst forced is free again by the time the second
-    runs, and would swallow a repeat of the same body.  What stays equal
-    between the two windows is the thing being counted -- one segment
-    created, one descriptor received -- which is what makes the difference
-    between them a leak rather than a workload difference.
+    the segments an earlier burst forced are free again by the time the next
+    one runs, and would swallow a repeat of the same body.  What stays equal
+    across the windows is the thing being counted -- one segment created, one
+    descriptor received -- which is what makes the differences between them
+    leaks rather than workload differences.
 
     Runtimes whose application cannot answer such a request keep the bursts
     and lose only the segment part of the claim (see RUNTIMES); driving one
@@ -740,7 +896,7 @@ def test_app_lifecycle_app_fds_stable(app):
         app.request()
 
     def burst(pool):
-        for _ in range(40):
+        for _ in range(BURST):
             app.request()
 
         if app.oversized:
@@ -754,48 +910,69 @@ def test_app_lifecycle_app_fds_stable(app):
             n = count_fds(pid)
 
             if n is None or n == settled:
+                settled = n
                 break
 
             settled = n
             time.sleep(0.1)
+
+        # a disappearing worker is not a leak, but it is not a pass either:
+        # report it where it happened rather than as a count that is missing
+        assert settled is not None, (
+            f'{app.runtime}: worker vanished mid-measurement'
+        )
 
         return settled
 
     if count_fds(pid) is None:
         pytest.skip('no /proc/<pid>/fd on this platform')
 
-    warm = shm_segments(pid)
+    counts = []
+    segments = [shm_segments(pid)]
 
-    first = burst(1)
-    after_first = shm_segments(pid)
-
-    second = burst(2)
-    after_second = shm_segments(pid)
+    for pool in (1, 2, 3):
+        counts.append(burst(pool))
+        segments.append(shm_segments(pid))
 
     assert app.pids() == {pid}, f'{app.runtime}: same worker throughout'
 
     if app.oversized:
-        # Both windows, not just the second: a first burst that forced
-        # nothing would leave its own leak out of `first` and make the
-        # comparison below read a per-segment leak as one-time growth.
-        assert len(after_first) > len(warm), (
-            f'{app.runtime}: no incoming segment in the first burst, so a '
-            f'leak of one cannot be seen: {sorted(warm)} -> '
-            f'{sorted(after_first)}'
+        # Every window, not just the measured pair: a window that forced no
+        # segment would leave its own leak out of the baseline and make a
+        # per-segment leak read as growth that stopped.
+        for i in range(3):
+            assert len(segments[i + 1]) > len(segments[i]), (
+                f'{app.runtime}: no incoming segment in burst {i + 1}, so a '
+                f'leak of one cannot be seen: {sorted(segments[i])} -> '
+                f'{sorted(segments[i + 1])}'
+            )
+
+    # the classes libunit closes as it goes: flat, in every window
+    for name in ('shm', 'spool'):
+        series = [getattr(n, name) for n in counts]
+        growth = [series[i + 1] - series[i] for i in range(2)]
+
+        assert max(growth) <= option.fds_threshold, (
+            f'{app.runtime}: {name} descriptor leak in application process: '
+            f'{series} across three repeated identical bursts; open now: '
+            f'{fd_targets(pid)}'
         )
 
-        assert len(after_second) > len(after_first), (
-            f'{app.runtime}: no incoming segment in the second burst, so a '
-            f'leak of one cannot be seen: {sorted(after_first)} -> '
-            f'{sorted(after_second)}'
-        )
+    # sockets: bounded by the engine count, because port discovery is lazy
+    # and one-time per engine.  nxt_ncpu is CPU_COUNT() of the affinity mask
+    # (src/nxt_lib.c) and the test does not touch `listen_threads`.
+    ncpu = max(len(os.sched_getaffinity(0)), 1)
 
-    assert first is not None and second is not None, (
-        f'{app.runtime}: worker vanished mid-measurement'
-    )
+    sockets = [n.sockets for n in counts]
+    growth = [sockets[i + 1] - sockets[i] for i in range(2)]
 
-    assert second - first <= option.fds_threshold, (
-        f'{app.runtime}: descriptor leak in application process: '
-        f'{first} -> {second} across a repeated identical burst; '
-        f'open now: {sorted(fd_targets(pid))}'
+    # only the rises are summed: a window that lost a socket must not buy
+    # the next one room to leak in
+    total = sum(n for n in growth if n > 0)
+
+    assert total <= ncpu + option.fds_threshold, (
+        f'{app.runtime}: socket leak in application process: {sockets} '
+        f'across three repeated identical bursts, growing by {total} in '
+        f'total where lazy port discovery can account for at most {ncpu} '
+        f'(one per router engine); open now: {fd_targets(pid)}'
     )
