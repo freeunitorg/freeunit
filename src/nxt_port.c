@@ -19,6 +19,73 @@ static void nxt_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 static nxt_atomic_uint_t nxt_port_last_id = 1;
 
 
+/*
+ * Map a queue a peer sent over a port.
+ *
+ * mmap() succeeds when the descriptor refers to an object shorter than the
+ * mapping, and the first access past the object's last page raises SIGBUS
+ * in this process -- main, the prototype or the router, depending on which
+ * handler took the message.  That is cheaper for a hostile peer than
+ * exhausting the descriptor table, so the size has to be validated before
+ * the mapping is made.
+ *
+ * Only a short object is refused.  Both senders do size the queue with
+ * ftruncate() to exactly the size the receiver maps -- nxt_shm_open() in
+ * the runtime and nxt_unit_shm_open() in libunit -- but fstat() does not
+ * have to report that size back: a shm object is rounded up to a page on
+ * some systems, and the queue is not a whole number of pages, so requiring
+ * the exact size would refuse every legitimate queue there.  A larger
+ * object is harmless -- only the first size bytes are mapped, and every
+ * access uses fixed offsets derived from the same type.
+ *
+ * The check does not make a hostile peer harmless: the sender keeps the
+ * descriptor and can shrink the object after the check, and neither
+ * MAP_POPULATE nor a probe read would close that window -- both only touch
+ * the pages before the shrink.  Sealing the object is not available to the
+ * receiver, and is Linux-only.  What the check does close is the whole
+ * class of short objects a peer can simply hand over, which is what the
+ * receiver can decide on its own.
+ */
+
+void *
+nxt_port_queue_mmap(nxt_task_t *task, nxt_fd_t fd, size_t size)
+{
+    void         *mem;
+    struct stat  queue_stat;
+
+    if (nxt_slow_path(fstat(fd, &queue_stat) == -1)) {
+        nxt_log(task, NXT_LOG_WARN, "fstat(%FD) failed %E", fd, nxt_errno);
+
+        return NULL;
+    }
+
+    /*
+     * Only a short object is refused, not a differing one: the producers
+     * size the queue exactly, but fstat() does not have to report that.
+     * A shm object is rounded up to a page on some systems, and the queue
+     * is not a whole number of pages, so requiring equality would refuse
+     * every legitimate queue there.
+     */
+    if (nxt_slow_path(queue_stat.st_size < (off_t) size)) {
+        nxt_log(task, NXT_LOG_WARN, "port queue on descriptor %FD is %O "
+                "bytes, less than the %uz it must hold", fd,
+                queue_stat.st_size, size);
+
+        return NULL;
+    }
+
+    mem = nxt_mem_mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+    if (nxt_slow_path(mem == MAP_FAILED)) {
+        nxt_log(task, NXT_LOG_WARN, "mmap(%FD) failed %E", fd, nxt_errno);
+
+        return NULL;
+    }
+
+    return mem;
+}
+
+
 static void
 nxt_port_mp_cleanup(nxt_task_t *task, void *obj, void *data)
 {
@@ -392,9 +459,9 @@ nxt_port_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_debug(task, "process %PI ready", msg->port_msg.pid);
 
     if (msg->fd[0] != -1) {
-        mem = nxt_mem_mmap(NULL, sizeof(nxt_port_queue_t),
-                           PROT_READ | PROT_WRITE, MAP_SHARED, msg->fd[0], 0);
-        if (nxt_fast_path(mem != MAP_FAILED)) {
+        mem = nxt_port_queue_mmap(task, msg->fd[0], sizeof(nxt_port_queue_t));
+
+        if (nxt_fast_path(mem != NULL)) {
             /*
              * Release what a previous PROCESS_READY installed, so that
              * replacing the queue does not leak the old mapping and its
@@ -421,9 +488,15 @@ nxt_port_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
             msg->fd[0] = -1;
 
         } else {
-            nxt_log(task, NXT_LOG_WARN, "process %PI ready: queue mmap "
-                    "failed %E, falling back to the socket", msg->port_msg.pid,
-                    nxt_errno);
+            /*
+             * A refused queue leaves the port as it was, as a failed
+             * mapping always did -- on the socket if it had no queue yet,
+             * on the one it already has otherwise.  Refusing the message
+             * outright would let a forged PROCESS_READY carrying a bad
+             * descriptor keep the process from ever being marked ready.
+             */
+            nxt_log(task, NXT_LOG_WARN, "process %PI ready: cannot map the "
+                    "queue, leaving the port as it was", msg->port_msg.pid);
         }
     }
 

@@ -106,8 +106,6 @@ static void nxt_router_greet_controller(nxt_task_t *task,
 
 static nxt_int_t nxt_router_start_app_process(nxt_task_t *task, nxt_app_t *app);
 
-static void nxt_router_new_port_handler(nxt_task_t *task,
-    nxt_port_recv_msg_t *msg);
 static void nxt_router_conf_data_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static void nxt_router_app_restart_handler(nxt_task_t *task,
@@ -676,7 +674,7 @@ nxt_request_rpc_data_unlink(nxt_task_t *task,
 }
 
 
-static void
+void
 nxt_router_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
     nxt_int_t      res;
@@ -709,12 +707,34 @@ nxt_router_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     } else {
         if (msg->fd[1] != -1) {
             res = nxt_router_port_queue_map(task, port, msg->fd[1]);
-            if (nxt_slow_path(res != NXT_OK)) {
-                return;
-            }
+
+            /*
+             * Closed whether or not the mapping succeeded: the mapping does
+             * not keep the descriptor, and the dispatcher reclaims nothing a
+             * handler leaves behind.  The size check above is what makes this
+             * matter -- it lets a peer choose to be refused, so the failure
+             * return below handed that peer a descriptor of ours per message,
+             * which is the exhaustion the check exists to prevent.
+             *
+             * The return itself is left alone.  It also walks past the RPC
+             * dispatch below, so a refused queue leaves the pending start
+             * outstanding, and the port stays registered although a port
+             * whose queue was refused can never be reached.  Both are worth
+             * fixing and neither is fixable here: the port this handler is
+             * holding may be one nxt_port_new_port_handler() just created or
+             * one that was already live and serving, and nothing at this call
+             * site can tell them apart -- so failing the start or releasing
+             * the port would, for a forged duplicate NEW_PORT, do it to a
+             * working application port.  That needs the two handlers to agree
+             * on provenance first; see #223.
+             */
 
             nxt_fd_close(msg->fd[1]);
             msg->fd[1] = -1;
+
+            if (nxt_slow_path(res != NXT_OK)) {
+                return;
+            }
         }
     }
 
@@ -2751,9 +2771,8 @@ nxt_router_port_queue_map(nxt_task_t *task, nxt_port_t *port, nxt_fd_t fd)
 
     nxt_assert(fd != -1);
 
-    mem = nxt_mem_mmap(NULL, sizeof(nxt_port_queue_t),
-                       PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (nxt_slow_path(mem == MAP_FAILED)) {
+    mem = nxt_port_queue_mmap(task, fd, sizeof(nxt_port_queue_t));
+    if (nxt_slow_path(mem == NULL)) {
 
         return NXT_ERROR;
     }
