@@ -776,6 +776,7 @@ nxt_router_conf_data_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
                                  msg->port_msg.reply_port);
     if (nxt_slow_path(port == NULL)) {
         nxt_alert(task, "conf_data_handler: reply port not found");
+        nxt_port_recv_msg_close_fds(msg);
         return;
     }
 
@@ -848,10 +849,12 @@ cleanup:
         nxt_mem_munmap(p, size);
     }
 
-    if (msg->fd[0] != -1) {
-        nxt_fd_close(msg->fd[0]);
-        msg->fd[0] = -1;
-    }
+    /*
+     * Close both descriptors: the configuration arrives on fd[0], but a
+     * compromised sender can attach a second one to any message and would
+     * otherwise leak a descriptor of the router on every forged message.
+     */
+    nxt_port_recv_msg_close_fds(msg);
 }
 
 
