@@ -197,6 +197,9 @@ main(int argc, char **argv)
     if (nxt_port_ready_test(thr) != NXT_OK) {
         return 1;
     }
+    if (nxt_router_new_port_test(thr) != NXT_OK) {
+        return 1;
+    }
 
     if (nxt_port_change_file_test(thr) != NXT_OK) {
         return 1;

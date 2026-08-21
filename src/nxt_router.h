@@ -262,6 +262,9 @@ void nxt_router_access_log_use(nxt_thread_spinlock_t *lock,
     nxt_router_access_log_t *access_log);
 void nxt_router_access_log_release(nxt_task_t *task,
     nxt_thread_spinlock_t *lock, nxt_router_access_log_t *access_log);
+/* Not static so the descriptor-ownership test can drive it directly. */
+void nxt_router_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
+
 void nxt_router_access_log_reopen_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 
