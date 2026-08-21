@@ -802,9 +802,12 @@ nxt_main_process_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
 fail:
 
-    if (msg->fd[0] != -1) {
-        nxt_fd_close(msg->fd[0]);
-    }
+    /*
+     * Close both descriptors: WHOAMI carries one, but a compromised sender
+     * can attach a second to any message, and leaving it open here would
+     * leak a descriptor of the main process on every forged message.
+     */
+    nxt_port_recv_msg_close_fds(msg);
 }
 
 
