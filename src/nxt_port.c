@@ -313,6 +313,10 @@ nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     port->pair[0] = -1;
     port->pair[1] = msg->fd[0];
+
+    /* The port owns the descriptor now. */
+    msg->fd[0] = -1;
+
     port->max_size = new_port_msg->max_size;
     port->max_share = new_port_msg->max_share;
 
@@ -327,6 +331,7 @@ nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 void
 nxt_port_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
+    void           *mem;
     nxt_port_t     *port;
     nxt_process_t  *process;
     nxt_runtime_t  *rt;
@@ -335,27 +340,98 @@ nxt_port_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     /* Unreferenced: main and prototype processes run a single engine. */
 
+    /*
+     * The lookup stays on msg->port_msg.pid.  The kernel-validated sender
+     * PID cannot replace it here: the prototype installs this handler too,
+     * and there SCM_CREDENTIALS carries the namespace-local pid of a
+     * pid-isolated worker, while the runtime hash is keyed on the global
+     * one (see nxt_proto_process_created_handler(), which uses the two as
+     * distinct values, and nxt_process_created() refusing to register an
+     * isolated pid).  Authenticating this handler needs to accept either
+     * pid of the process it resolves; see the sender-ACL TODO above.
+     */
     process = nxt_runtime_process_find(rt, msg->port_msg.pid);
     if (nxt_slow_path(process == NULL)) {
+        nxt_port_recv_msg_close_fds(msg);
         return;
     }
 
-    nxt_assert(process->state != NXT_PROCESS_STATE_READY);
+    /*
+     * A repeated PROCESS_READY is not rejected: the message is not
+     * authenticated, so refusing it would let a forged one arriving first
+     * make itself permanent and lock the legitimate sender out of its own
+     * queue.  It replaces the mapping instead, as it did before this check
+     * existed, and the previous mapping is released below rather than
+     * leaked.  nxt_assert() is not used because it compiles out in release
+     * builds, leaving no diagnostic at all.
+     */
+    if (nxt_slow_path(process->state == NXT_PROCESS_STATE_READY)) {
+        nxt_log(task, NXT_LOG_WARN, "repeated PROCESS_READY claiming "
+                "process %PI", msg->port_msg.pid);
+    }
+
+    /*
+     * Both guards reject before the state is set: a message that is not
+     * acted upon must leave no trace.  Marking a process ready and only
+     * then rejecting it would make the next, legitimate PROCESS_READY trip
+     * the guard above, and would let nxt_main_process_sigchld_handler()
+     * clear the start stream of a process that never finished starting,
+     * dropping the REMOVE_PID that cancels the pending start RPC.
+     */
+    if (nxt_slow_path(nxt_queue_is_empty(&process->ports))) {
+        nxt_log(task, NXT_LOG_WARN, "PROCESS_READY claiming process %PI, "
+                "which has no ports", msg->port_msg.pid);
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
 
     process->state = NXT_PROCESS_STATE_READY;
-
-    nxt_assert(!nxt_queue_is_empty(&process->ports));
 
     port = nxt_process_port_first(process);
 
     nxt_debug(task, "process %PI ready", msg->port_msg.pid);
 
     if (msg->fd[0] != -1) {
-        port->queue_fd = msg->fd[0];
-        port->queue = nxt_mem_mmap(NULL, sizeof(nxt_port_queue_t),
-                                   PROT_READ | PROT_WRITE, MAP_SHARED,
-                                   msg->fd[0], 0);
+        mem = nxt_mem_mmap(NULL, sizeof(nxt_port_queue_t),
+                           PROT_READ | PROT_WRITE, MAP_SHARED, msg->fd[0], 0);
+        if (nxt_fast_path(mem != MAP_FAILED)) {
+            /*
+             * Release what a previous PROCESS_READY installed, so that
+             * replacing the queue does not leak the old mapping and its
+             * descriptor.  The size follows nxt_port_close() -- an app
+             * queue is mapped for the port with the reserved id.
+             */
+            if (port->queue_fd != -1) {
+                nxt_fd_close(port->queue_fd);
+                port->queue_fd = -1;
+            }
+
+            if (port->queue != NULL) {
+                nxt_mem_munmap(port->queue,
+                               (port->id == (nxt_port_id_t) -1)
+                                   ? sizeof(nxt_app_queue_t)
+                                   : sizeof(nxt_port_queue_t));
+                port->queue = NULL;
+            }
+
+            port->queue_fd = msg->fd[0];
+            port->queue = mem;
+
+            /* The port owns the descriptor now. */
+            msg->fd[0] = -1;
+
+        } else {
+            nxt_log(task, NXT_LOG_WARN, "process %PI ready: queue mmap "
+                    "failed %E, falling back to the socket", msg->port_msg.pid,
+                    nxt_errno);
+        }
     }
+
+    /*
+     * Close whatever the sender attached and the port did not take over:
+     * fd[1] is never used here, and fd[0] survives a failed mapping.
+     */
+    nxt_port_recv_msg_close_fds(msg);
 
     nxt_port_send_new_port(task, rt, port, msg->port_msg.stream);
 }
