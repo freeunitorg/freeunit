@@ -2618,9 +2618,8 @@ nxt_router_port_queue_map(nxt_task_t *task, nxt_port_t *port, nxt_fd_t fd)
 
     nxt_assert(fd != -1);
 
-    mem = nxt_mem_mmap(NULL, sizeof(nxt_port_queue_t),
-                       PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (nxt_slow_path(mem == MAP_FAILED)) {
+    mem = nxt_port_queue_mmap(task, fd, sizeof(nxt_port_queue_t));
+    if (nxt_slow_path(mem == NULL)) {
 
         return NXT_ERROR;
     }

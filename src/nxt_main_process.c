@@ -425,9 +425,9 @@ nxt_main_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         && port->type == NXT_PROCESS_APP
         && msg->fd[1] != -1)
     {
-        mem = nxt_mem_mmap(NULL, sizeof(nxt_port_queue_t),
-                           PROT_READ | PROT_WRITE, MAP_SHARED, msg->fd[1], 0);
-        if (nxt_fast_path(mem != MAP_FAILED)) {
+        mem = nxt_port_queue_mmap(task, msg->fd[1], sizeof(nxt_port_queue_t));
+
+        if (nxt_fast_path(mem != NULL)) {
             port->queue = mem;
         }
 
