@@ -621,7 +621,8 @@ nxt_file_fclose(nxt_task_t *task, FILE *fp)
 
 /*
  * nxt_file_redirect() redirects the file to the fd descriptor.
- * Then the fd descriptor is closed.
+ * Then the fd descriptor is closed -- on the failing paths as well, so that
+ * the caller can hand the descriptor over unconditionally.
  */
 
 nxt_int_t
@@ -632,6 +633,14 @@ nxt_file_redirect(nxt_file_t *file, nxt_fd_t fd)
     if (dup2(fd, file->fd) == -1) {
         nxt_thread_log_alert("dup2(%FD, %FD, \"%FN\") failed %E",
                              fd, file->fd, file->name, nxt_errno);
+
+        /*
+         * The descriptor is consumed whatever the outcome, as the comment
+         * above states: callers hand it over and never close it on success,
+         * so failing without closing it here leaked it instead.
+         */
+        (void) close(fd);
+
         return NXT_ERROR;
     }
 
