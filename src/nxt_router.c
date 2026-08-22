@@ -4245,6 +4245,18 @@ nxt_router_thread_exit_handler(nxt_task_t *task, void *obj, void *data)
 
     port->engine = task->thread->engine;
     nxt_mp_thread_adopt(port->mem_pool);
+
+    /*
+     * The worker thread is gone, so nothing reads port->pair[0] any more:
+     * close the socket pair and the queue memfd, and drop the reference
+     * nxt_router_rt_add_port() took when it published the port in
+     * rt->ports.  Without this every engine removed by a listen_threads
+     * decrease leaks 3 descriptors (2 socketpair + 1 memfd) for the
+     * router's lifetime.
+     */
+    nxt_port_close(task, port);
+    nxt_runtime_port_remove(task, port);
+
     nxt_port_use(task, port, -1);
 
     nxt_mp_thread_adopt(engine->mem_pool);

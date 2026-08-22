@@ -137,10 +137,8 @@ def _wait_for_pids_gone(pids, timeout=5):
 
 def test_process_abrupt_teardown(skip_alert, skip_fds_check):
     # Killing workers leaves descriptor accounting unsettled in all three
-    # long-lived processes for as long as the respawn takes, and changing
-    # "listen_threads" leaks the destroyed engines' port socketpairs on top of
-    # that (see test_process_teardown_churn.py).  Neither is what this test is
-    # about.
+    # long-lived processes for as long as the respawn takes, which is not what
+    # this test is about.
     skip_fds_check(main=True, router=True, controller=True)
 
     # Expected, and in fact asserted on below: this is how the main process
