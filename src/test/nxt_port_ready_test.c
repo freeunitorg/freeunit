@@ -177,6 +177,72 @@ fail:
     return NXT_ERROR;
 }
 
+
+/*
+ * Hand the handler a descriptor too short for the queue.  mmap() succeeds
+ * on it, so nothing fails until the first access past the object's last
+ * page, which raises SIGBUS in the process that mapped it -- main or the
+ * prototype.  The handler has to refuse the descriptor and keep the queue
+ * it already had.
+ */
+static nxt_int_t
+nxt_port_ready_test_short_queue(nxt_thread_t *thr, nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, nxt_port_t *port)
+{
+    void                       *prev_queue;
+    nxt_fd_t                   fd, prev_fd;
+    volatile nxt_port_queue_t  *queue;
+
+    fd = syscall(SYS_memfd_create, "nxt_port_ready_test", MFD_CLOEXEC);
+    if (fd == -1) {
+        nxt_log_alert(thr->log, "port ready test failed to create the queue");
+        return NXT_ERROR;
+    }
+
+    /*
+     * One page: mmap() of the whole queue over it succeeds, and every byte
+     * beyond it faults.
+     */
+    if (ftruncate(fd, nxt_pagesize) == -1) {
+        nxt_log_alert(thr->log, "port ready test failed to size the queue");
+        (void) close(fd);
+        return NXT_ERROR;
+    }
+
+    prev_fd = port->queue_fd;
+    prev_queue = port->queue;
+
+    msg->fd[0] = fd;
+    msg->fd[1] = -1;
+
+    nxt_port_process_ready_handler(task, msg);
+
+    if (port->queue != prev_queue || port->queue_fd != prev_fd) {
+        nxt_log_alert(thr->log, "port ready test: short queue replaced the "
+                      "installed one");
+        return NXT_ERROR;
+    }
+
+    if (msg->fd[0] != -1 || nxt_port_ready_test_fd_is_open(fd)) {
+        nxt_log_alert(thr->log, "port ready test: short queue leaked its "
+                      "descriptor");
+        return NXT_ERROR;
+    }
+
+    /*
+     * Touch the last item of the queue the port holds, the way
+     * nxt_port_queue_send() would, to prove the mapping the port kept is
+     * backed all the way to its end.  The check above already catches a
+     * handler that installs the short mapping, and catches it before this
+     * access, which on such a handler takes SIGBUS and kills the test
+     * binary -- verified by moving this access ahead of the check.
+     */
+    queue = port->queue;
+    queue->items[NXT_PORT_QUEUE_SIZE - 1].size = 0;
+
+    return NXT_OK;
+}
+
 #endif
 
 
@@ -297,6 +363,11 @@ nxt_port_ready_test(nxt_thread_t *thr)
     }
 
     ret = nxt_port_ready_test_queue(thr, task, &msg, port, "replacing ready");
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto done;
+    }
+
+    ret = nxt_port_ready_test_short_queue(thr, task, &msg, port);
 
 #endif
 
