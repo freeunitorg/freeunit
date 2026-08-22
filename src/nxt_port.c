@@ -350,6 +350,14 @@ nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     rt = task->thread->runtime;
 
+    /*
+     * The message arrives on the stack of nxt_port_read_handler() with the
+     * union uninitialized, and every caller of this handler reads
+     * msg->u.new_port on return, so a path that creates no port has to say
+     * so rather than leave the garbage the stack happened to hold.
+     */
+    msg->u.new_port = NULL;
+
     new_port_msg = (nxt_port_msg_new_port_t *) msg->buf->mem.pos;
 
     /* TODO check b size and make plain */
