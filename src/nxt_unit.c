@@ -175,8 +175,8 @@ static int nxt_unit_get_port(nxt_unit_ctx_t *ctx, nxt_unit_port_id_t *port_id);
 static ssize_t nxt_unit_port_send(nxt_unit_ctx_t *ctx,
     nxt_unit_port_t *port, const void *buf, size_t buf_size,
     const nxt_send_oob_t *oob);
-static ssize_t nxt_unit_sendmsg(nxt_unit_ctx_t *ctx, int fd,
-    const void *buf, size_t buf_size, const nxt_send_oob_t *oob);
+static ssize_t nxt_unit_sendmsg(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
+    int fd, const void *buf, size_t buf_size, const nxt_send_oob_t *oob);
 static int nxt_unit_ctx_port_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     nxt_unit_read_buf_t *rbuf);
 nxt_inline void nxt_unit_rbuf_cpy(nxt_unit_read_buf_t *dst,
@@ -1058,7 +1058,7 @@ nxt_unit_ready(nxt_unit_ctx_t *ctx, int ready_fd, uint32_t stream, int queue_fd)
 
     nxt_socket_msg_oob_init(&oob, fds);
 
-    res = nxt_unit_sendmsg(ctx, ready_fd, &msg, sizeof(msg), &oob);
+    res = nxt_unit_sendmsg(ctx, NULL, ready_fd, &msg, sizeof(msg), &oob);
     if (res != sizeof(msg)) {
         return NXT_UNIT_ERROR;
     }
@@ -6223,7 +6223,7 @@ nxt_unit_port_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
             msg.type = _NXT_PORT_MSG_READ_QUEUE;
 
             if (lib->callbacks.port_send == NULL) {
-                ret = nxt_unit_sendmsg(ctx, port->out_fd, &msg,
+                ret = nxt_unit_sendmsg(ctx, port, port->out_fd, &msg,
                                        sizeof(nxt_port_msg_t), NULL);
 
                 nxt_unit_debug(ctx, "port{%d,%d} send %d read_queue",
@@ -6269,7 +6269,7 @@ nxt_unit_port_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
                        (int) ret);
 
     } else {
-        ret = nxt_unit_sendmsg(ctx, port->out_fd, buf, buf_size, oob);
+        ret = nxt_unit_sendmsg(ctx, port, port->out_fd, buf, buf_size, oob);
 
         nxt_unit_debug(ctx, "port{%d,%d} sendmsg %d",
                        (int) port->id.pid, (int) port->id.id,
@@ -6281,12 +6281,13 @@ nxt_unit_port_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
 
 
 static ssize_t
-nxt_unit_sendmsg(nxt_unit_ctx_t *ctx, int fd,
+nxt_unit_sendmsg(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port, int fd,
     const void *buf, size_t buf_size, const nxt_send_oob_t *oob)
 {
     int                  err;
     ssize_t              n;
     struct iovec         iov[1];
+    nxt_unit_impl_t      *lib;
     nxt_unit_ctx_impl_t  *ctx_impl;
 
     iov[0].iov_base = (void *) buf;
@@ -6323,9 +6324,36 @@ retry:
          * too and cannot be used to distinguish steady state from
          * shutdown.  The unambiguous flag is ctx_impl->online.
          */
+        lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
         ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
 
-        if (ctx_impl->online) {
+        /*
+         * A router engine port whose peer has already closed is not an
+         * application fault even while online: the router closes an
+         * engine's port pair when a "listen_threads" decrease retires
+         * that engine (nxt_router_thread_exit_handler()), and it does
+         * not tell the applications that still hold a copy of the port,
+         * so a response to a request that engine had handed out fails:
+         * with ECONNREFUSED on the SOCK_DGRAM pairs used on Linux
+         * (src/nxt_socketpair.c), with EPIPE or ECONNRESET on a stream
+         * pair.  The request was abandoned on the router side already;
+         * say so at warn level.
+         *
+         * That reasoning covers only the per-engine ports learned through
+         * NEW_PORT/GET_PORT.  The main router port, the shared port and
+         * the readiness descriptor have no such lifecycle: a broken one
+         * of those is a real problem and keeps the alert, because for
+         * some of its messages this log line is the only visible signal
+         * (nxt_unit_mmap_release() ignores nxt_unit_send_shm_ack()'s
+         * return value).
+         */
+        if (ctx_impl->online
+            && !(port != NULL
+                 && port != lib->router_port
+                 && port != lib->shared_port
+                 && (err == ECONNREFUSED || err == EPIPE
+                     || err == ECONNRESET)))
+        {
             nxt_unit_alert(ctx, "sendmsg(%d, %d) failed: %s (%d)",
                            fd, (int) buf_size, strerror(err), err);
 
