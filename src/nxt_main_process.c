@@ -430,10 +430,16 @@ nxt_main_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         if (nxt_fast_path(mem != NULL)) {
             port->queue = mem;
         }
-
-        nxt_fd_close(msg->fd[1]);
-        msg->fd[1] = -1;
     }
+
+    /*
+     * nxt_port_new_port_handler() leaves the queue descriptor to its caller,
+     * and only a new application port has a use for it here.  Anything else
+     * -- a port that already existed, a port that could not be created, a
+     * type whose queue main never maps -- used to keep the descriptor open
+     * in the most privileged process of all.
+     */
+    nxt_port_recv_msg_close_fds(msg);
 }
 
 

@@ -690,13 +690,24 @@ nxt_router_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         nxt_router_greet_controller(task, msg->u.new_port);
     }
 
+    /*
+     * The router maps a queue for application ports only, so every other
+     * branch below has to release the queue descriptor that
+     * nxt_port_new_port_handler() left behind.  None of the RPC handlers
+     * reachable from here reads msg->fd, so closing before dispatching them
+     * takes nothing away.
+     */
+
     if (port != NULL && port->type == NXT_PROCESS_PROTOTYPE)  {
+        nxt_port_recv_msg_close_fds(msg);
+
         nxt_port_rpc_handler(task, msg);
 
         return;
     }
 
     if (port == NULL || port->type != NXT_PROCESS_APP) {
+        nxt_port_recv_msg_close_fds(msg);
 
         if (msg->port_msg.stream == 0) {
             return;
