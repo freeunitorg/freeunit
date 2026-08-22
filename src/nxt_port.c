@@ -518,7 +518,9 @@ nxt_port_change_log_file(nxt_task_t *task, nxt_runtime_t *rt, nxt_uint_t slot,
 void
 nxt_port_change_log_file_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
+    size_t         size;
     nxt_buf_t      *b;
+    nxt_int_t      ret;
     nxt_uint_t     slot;
     nxt_file_t     *log_file;
     nxt_runtime_t  *rt;
@@ -526,18 +528,82 @@ nxt_port_change_log_file_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     rt = task->thread->runtime;
 
     b = msg->buf;
-    slot = *(nxt_uint_t *) b->mem.pos;
 
+    /*
+     * The payload is whatever the sender chose to write: a message with a
+     * short -- or empty -- buffer would have the slot read past its end.
+     * The size the sender declared is what nxt_port_read_msg_process()
+     * advanced b->mem.free by, so the used size is the only bound here.
+     * nxt_assert() is not used because it compiles out in release builds,
+     * which is exactly where this message arrives unauthenticated.
+     */
+    size = 0;
+
+    if (nxt_fast_path(b != NULL)) {
+        size = (size_t) nxt_buf_mem_used_size(&b->mem);
+    }
+
+    if (nxt_slow_path(size < sizeof(nxt_uint_t))) {
+        nxt_log(task, NXT_LOG_WARN, "CHANGE_FILE with a %uz byte payload, "
+                "which is too short to name a log file slot", size);
+
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    /* The payload is not aligned for a nxt_uint_t load. */
+    nxt_memcpy(&slot, b->mem.pos, sizeof(nxt_uint_t));
+
+    /*
+     * nxt_list_elt() returns NULL past the end of the list, and every
+     * process that installs this handler -- the discovery and prototype
+     * processes, the router and the controller -- would then dereference
+     * it.
+     */
     log_file = nxt_list_elt(rt->log_files, slot);
 
+    if (nxt_slow_path(log_file == NULL)) {
+        nxt_log(task, NXT_LOG_WARN, "CHANGE_FILE claiming log file slot "
+                "%ui, which does not exist", slot);
+
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    if (nxt_slow_path(msg->fd[0] == -1)) {
+        nxt_log(task, NXT_LOG_WARN, "CHANGE_FILE claiming log file slot "
+                "%ui without a descriptor to redirect it to", slot);
+
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
     nxt_debug(task, "change log file %FD:%FD", msg->fd[0], log_file->fd);
+
+    /*
+     * A second descriptor is never used on this path, but a message can
+     * carry one whatever its type: close it before the redirect, so that
+     * neither outcome of the redirect leaves it behind.
+     */
+    if (msg->fd[1] != -1) {
+        nxt_fd_close(msg->fd[1]);
+        msg->fd[1] = -1;
+    }
 
     /*
      * The old log file descriptor must be closed at the moment when no
      * other threads use it.  dup2() allows to use the old file descriptor
      * for new log file.  This change is performed atomically in the kernel.
+     *
+     * nxt_file_redirect() consumes the descriptor on every outcome, so drop
+     * it from the message rather than letting close_fds() reach a number
+     * that has already been reused.
      */
-    if (nxt_file_redirect(log_file, msg->fd[0]) == NXT_OK) {
+    ret = nxt_file_redirect(log_file, msg->fd[0]);
+
+    msg->fd[0] = -1;
+
+    if (nxt_fast_path(ret == NXT_OK)) {
         if (slot == 0) {
             (void) nxt_file_stderr(log_file);
         }
