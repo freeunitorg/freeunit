@@ -105,16 +105,7 @@ def _wait_for_pids(count, timeout=100):
     return pids
 
 
-def test_process_teardown_churn(skip_fds_check):
-    # Setting "listen_threads" changes the number of router worker engines,
-    # and destroying an engine leaks its descriptors: measured on this tree,
-    # shrinking the count frees each dead engine's epoll and eventfd but keeps
-    # its port socketpair open (3 sockets per destroyed engine), so the router
-    # ends the test with more descriptors than it started with.  That is a
-    # pre-existing defect in engine teardown, not something this workload
-    # causes, and it is unrelated to what the test is here to exercise.
-    skip_fds_check(router=True)
-
+def test_process_teardown_churn():
     client.load(APP, processes={"spare": SPARE, "max": 4, "idle_timeout": 5})
 
     assert 'success' in client.conf(

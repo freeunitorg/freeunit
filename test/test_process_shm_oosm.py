@@ -90,13 +90,7 @@ def _body(resp, size):
     return resp[-size:]
 
 
-def test_process_shm_oosm(skip_fds_check):
-    # Same pre-existing engine-teardown descriptor leak that
-    # test_process_teardown_churn.py documents: changing "listen_threads"
-    # destroys event engines, and each destroyed engine keeps its port
-    # socketpair open.  Unrelated to what this test exercises.
-    skip_fds_check(router=True)
-
+def test_process_shm_oosm():
     client.load(APP, limits={"shm": SHM_LIMIT}, processes=1)
 
     assert 'success' in client.conf(

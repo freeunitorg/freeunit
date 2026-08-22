@@ -13,12 +13,7 @@ BODY = '0123456789'
 
 
 @pytest.fixture(autouse=True)
-def setup_method_fixture(temp_dir, skip_fds_check):
-    # Thread-count changes intentionally add and remove each engine's epoll,
-    # signalfd, and eventfd descriptors, so the generic router FD baseline is
-    # not meaningful for this test.  The recycler itself owns no descriptors.
-    skip_fds_check(router=True)
-
+def setup_method_fixture(temp_dir):
     Path(f'{temp_dir}/assets').mkdir(parents=True)
     Path(f'{temp_dir}/assets/index.html').write_text(BODY, encoding='utf-8')
 
