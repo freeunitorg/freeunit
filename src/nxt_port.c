@@ -206,6 +206,12 @@ nxt_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     nxt_alert(task, "port %d: unknown message type:%uD",
               msg->port->socket.fd, msg->port_msg.type);
+
+    /*
+     * The type is a byte off the wire, so any peer can name one that has
+     * no handler.  Nothing runs to take the descriptors it attached.
+     */
+    nxt_port_recv_msg_close_fds(msg);
 }
 
 
@@ -305,8 +311,15 @@ nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
         msg->u.new_port = port;
 
-        nxt_fd_close(msg->fd[0]);
-        msg->fd[0] = -1;
+        /*
+         * Nothing the message carries is adopted here.  The socket was
+         * already refused, and the queue descriptor is refused with it: a
+         * caller that mapped fd[1] would re-point a live port's queue at
+         * memory this message chose, dropping the mapping the port was
+         * built with.  Every caller maps fd[1] only while it is still set,
+         * so clearing it here suppresses that without racing them.
+         */
+        nxt_port_recv_msg_close_fds(msg);
         return;
     }
 
@@ -314,6 +327,7 @@ nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
                                            new_port_msg->id,
                                            new_port_msg->type);
     if (nxt_slow_path(port == NULL)) {
+        nxt_port_recv_msg_close_fds(msg);
         return;
     }
 
@@ -333,6 +347,14 @@ nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_port_write_enable(task, port);
 
     msg->u.new_port = port;
+
+    /*
+     * fd[1] is deliberately left in the message on this path alone: it is
+     * the queue of the port just created, and only the caller knows whether
+     * this process maps port queues at all and with which size.  Every
+     * caller therefore has to close it once it is done -- which is why the
+     * paths above clear it instead, so that "still set" means "yours".
+     */
 }
 
 /* TODO move to nxt_main_process.c */
@@ -456,6 +478,11 @@ nxt_port_mmap_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     if (nxt_slow_path(msg->fd[0] == -1)) {
         nxt_log(task, NXT_LOG_WARN, "invalid fd passed with mmap message");
 
+        /*
+         * A message can carry two descriptors whichever its type needs, so
+         * a missing fd[0] does not mean the message carried nothing.
+         */
+        nxt_port_recv_msg_close_fds(msg);
         return;
     }
 
@@ -486,7 +513,12 @@ nxt_port_mmap_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
 fail_close:
 
-    nxt_fd_close(msg->fd[0]);
+    /*
+     * nxt_port_incoming_port_mmap() maps the segment rather than keeping the
+     * descriptor, so fd[0] is released on the success path too.  fd[1] is
+     * never used by this handler and was leaked on every one of them.
+     */
+    nxt_port_recv_msg_close_fds(msg);
 }
 
 

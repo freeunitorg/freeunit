@@ -67,6 +67,8 @@ static u_char *nxt_cstr_dup(nxt_mp_t *mp, u_char *dst, u_char *src);
 static void nxt_proto_signal_handler(nxt_task_t *task, void *obj, void *data);
 static void nxt_proto_sigterm_handler(nxt_task_t *task, void *obj, void *data);
 static void nxt_proto_sigchld_handler(nxt_task_t *task, void *obj, void *data);
+static void nxt_app_new_port_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
 
 
 nxt_str_t  nxt_server = nxt_string(NXT_SERVER);
@@ -87,7 +89,7 @@ static nxt_common_app_conf_t  *nxt_app_conf;
 
 static const nxt_port_handlers_t  nxt_discovery_process_port_handlers = {
     .quit         = nxt_signal_quit_handler,
-    .new_port     = nxt_port_new_port_handler,
+    .new_port     = nxt_app_new_port_handler,
     .change_file  = nxt_port_change_log_file_handler,
     .mmap         = nxt_port_mmap_handler,
     .data         = nxt_port_data_handler,
@@ -110,7 +112,7 @@ const nxt_sig_event_t  nxt_prototype_signals[] = {
 static const nxt_port_handlers_t  nxt_proto_process_port_handlers = {
     .quit            = nxt_proto_quit_handler,
     .change_file     = nxt_port_change_log_file_handler,
-    .new_port        = nxt_port_new_port_handler,
+    .new_port        = nxt_app_new_port_handler,
     .process_created = nxt_proto_process_created_handler,
     .process_ready   = nxt_port_process_ready_handler,
     .remove_pid      = nxt_port_remove_pid_handler,
@@ -159,6 +161,23 @@ const nxt_process_init_t  nxt_app_process = {
     .port_handlers  = &nxt_app_process_port_handlers,
     .signals        = nxt_process_signals,
 };
+
+
+/*
+ * nxt_port_new_port_handler() hands the queue descriptor of a newly created
+ * port to its caller, because only the caller knows whether this process
+ * maps port queues.  Neither the discovery nor the prototype process does,
+ * so both used the base handler directly and kept every queue descriptor
+ * their peer sent open for the life of the process.
+ */
+
+static void
+nxt_app_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_port_new_port_handler(task, msg);
+
+    nxt_port_recv_msg_close_fds(msg);
+}
 
 
 static nxt_int_t
