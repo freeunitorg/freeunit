@@ -411,9 +411,14 @@ static void
 nxt_controller_process_new_port_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg)
 {
+    nxt_port_t  *port;
+
     nxt_port_new_port_handler(task, msg);
 
-    if (msg->u.new_port->type != NXT_PROCESS_ROUTER
+    port = msg->u.new_port;
+
+    if (port == NULL
+        || port->type != NXT_PROCESS_ROUTER
         || !nxt_controller_router_ready)
     {
         return;
