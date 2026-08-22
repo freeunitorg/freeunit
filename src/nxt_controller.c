@@ -417,6 +417,12 @@ nxt_controller_process_new_port_handler(nxt_task_t *task,
 
     port = msg->u.new_port;
 
+    /*
+     * The controller never maps a port queue, so the descriptor
+     * nxt_port_new_port_handler() leaves to its caller has no use here.
+     */
+    nxt_port_recv_msg_close_fds(msg);
+
     if (port == NULL
         || port->type != NXT_PROCESS_ROUTER
         || !nxt_controller_router_ready)

@@ -205,6 +205,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_port_fd_test(thr) != NXT_OK) {
+        return 1;
+    }
+
 #if (NXT_HAVE_CGROUP)
     if (nxt_cgroup_test(thr) != NXT_OK) {
         return 1;

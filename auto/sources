@@ -180,6 +180,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_port_ready_test.c \
     src/test/nxt_router_new_port_test.c \
     src/test/nxt_port_change_file_test.c \
+    src/test/nxt_port_fd_test.c \
 "
 
 

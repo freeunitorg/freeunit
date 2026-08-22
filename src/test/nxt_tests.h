@@ -75,6 +75,7 @@ nxt_int_t nxt_port_mmap_range_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_ready_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_new_port_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_change_file_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_fd_test(nxt_thread_t *thr);
 nxt_int_t nxt_cgroup_test(nxt_thread_t *thr);
 nxt_int_t nxt_clone_creds_test(nxt_thread_t *thr);
 
