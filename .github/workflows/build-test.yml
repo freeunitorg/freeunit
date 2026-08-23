@@ -28,6 +28,10 @@ env:
   # patch level lives here; the 3.6 "slot" (/opt/openssl-3.6, OPENSSL36_* vars)
   # is stable across patch bumps and intentionally not templated.
   OPENSSL_VERSION: 3.6.2
+  # OpenSSL 4.0 for the openssl4 leg below.  No distribution ships 4.0 yet, so
+  # like the 3.6 slot it is built from source; the /opt/openssl-4.0 slot is
+  # stable across patch bumps.
+  OPENSSL4_VERSION: 4.0.2
 
 jobs:
   # Single source of truth for the test matrix. The version-tested language
@@ -534,3 +538,80 @@ jobs:
 
       - name: Run libunit port_recv fd-ownership test
         run: ./build/unit_port_recv_test
+
+  # OpenSSL 4.0 compile gate.  4.0 removed nothing Unit uses, but it deprecated
+  # more of what Unit still calls, and 5.0 is where the deprecated symbols
+  # actually go away -- so the value here is having a leg that fails when a new
+  # deprecation lands, instead of noticing at removal time.  Deliberately cheap:
+  # a build plus the C test suite, no language modules and no pytest run, since
+  # nothing above the TLS layer changes with the OpenSSL version.
+  openssl4:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libpcre2-dev
+
+      - name: Cache OpenSSL 4.0
+        id: cache-openssl4
+        uses: actions/cache@v6
+        with:
+          path: /opt/openssl-4.0
+          key: openssl-${{ env.OPENSSL4_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build OpenSSL 4.0
+        if: steps.cache-openssl4.outputs.cache-hit != 'true'
+        run: |
+          cd /tmp
+          wget -q "https://www.openssl.org/source/openssl-${OPENSSL4_VERSION}.tar.gz"
+          tar -xzf "openssl-${OPENSSL4_VERSION}.tar.gz"
+          cd "openssl-${OPENSSL4_VERSION}"
+          ./Configure --prefix=/opt/openssl-4.0 shared no-docs
+          make -j$(nproc)
+          sudo mkdir -p /opt/openssl-4.0
+          sudo make install_sw
+
+      - name: Set OpenSSL 4.0 build environment
+        # Same isolation as the 3.6 slot: never overwrite the system libraries,
+        # because sudo links against them.
+        run: |
+          OSSL=/opt/openssl-4.0
+          LIBDIR=$( [ -d "$OSSL/lib64" ] && echo "$OSSL/lib64" || echo "$OSSL/lib" )
+          echo "OPENSSL4_INCDIR=${OSSL}/include" >> $GITHUB_ENV
+          echo "OPENSSL4_LIBDIR=${LIBDIR}"        >> $GITHUB_ENV
+
+      - name: Configure unit (--openssl --tests)
+        # LD_LIBRARY_PATH is scoped to this step only so that auto/feature test
+        # binaries load OpenSSL 4.0; exporting it globally would break sudo.
+        # The build itself needs no such help -- -Wl,-rpath below is baked into
+        # the binaries, and is honoured under sudo too.
+        env:
+          LD_LIBRARY_PATH: ${{ env.OPENSSL4_LIBDIR }}
+        run: |
+          ./configure \
+            --tests \
+            --openssl \
+            --cc-opt="-I${OPENSSL4_INCDIR} -DOPENSSL_NO_DEPRECATED" \
+            --ld-opt="-L${OPENSSL4_LIBDIR} -Wl,-rpath,${OPENSSL4_LIBDIR}"
+
+      # Assert rather than print: if the include/lib flags ever stop taking
+      # effect, configure falls back to the runner's system OpenSSL 3.x and the
+      # leg would pass while testing nothing it was added for.
+      - name: Assert configure found OpenSSL 4.0
+        run: |
+          grep NXT_HAVE_OPENSSL_VERSION build/include/nxt_auto_config.h
+          grep -q '#define NXT_HAVE_OPENSSL_VERSION  "OpenSSL 4\.' \
+            build/include/nxt_auto_config.h
+
+      - name: Build unit
+        run: make -j4
+
+      - name: Build C tests
+        run: make -j4 tests
+
+      - name: Run C tests
+        run: sudo ./build/tests
