@@ -4728,7 +4728,6 @@ nxt_router_response_error_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     req_rpc_data->rpc_cancel = 0;
 
     /* TODO cancel message and return if cancelled. */
-    // nxt_router_msg_cancel(task, &req_rpc_data->msg_info, req_rpc_data->stream);
 
     if (req_rpc_data->request != NULL) {
         nxt_http_request_error(task, req_rpc_data->request,
