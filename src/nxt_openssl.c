@@ -31,6 +31,38 @@ typedef struct {
 } nxt_openssl_conn_t;
 
 
+#if (NXT_HAVE_OPENSSL_TLSEXT)
+
+/*
+ * OpenSSL 3.0 deprecated the HMAC_CTX flavour of the session ticket key
+ * callback in favour of SSL_CTX_set_tlsext_ticket_key_evp_cb(), which hands
+ * the callback an EVP_MAC_CTX instead.  The deprecation covers the
+ * SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB control behind the old registration
+ * macro as well, so the feature guard has to follow the callback flavour:
+ * once OpenSSL 5.0 drops the deprecated symbols, testing for the control
+ * would silently turn Session Tickets off.
+ */
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+
+#include <openssl/core_names.h>
+#include <openssl/params.h>
+
+#define NXT_OPENSSL_TICKET_KEY_CB  1
+typedef EVP_MAC_CTX  nxt_tls_ticket_mac_t;
+
+#elif defined(SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB)
+
+#include <openssl/hmac.h>
+
+#define NXT_OPENSSL_TICKET_KEY_CB  1
+typedef HMAC_CTX     nxt_tls_ticket_mac_t;
+
+#endif
+
+#endif /* NXT_HAVE_OPENSSL_TLSEXT */
+
+
 struct nxt_tls_ticket_s {
     u_char            name[16];
     u_char            hmac_key[32];
@@ -66,8 +98,11 @@ static nxt_int_t nxt_ssl_conf_commands(nxt_task_t *task, SSL_CTX *ctx,
 #if (NXT_HAVE_OPENSSL_TLSEXT)
 static nxt_int_t nxt_tls_ticket_keys(nxt_task_t *task, SSL_CTX *ctx,
     nxt_tls_init_t *tls_init, nxt_mp_t *mp);
+#ifdef NXT_OPENSSL_TICKET_KEY_CB
 static int nxt_tls_ticket_key_callback(SSL *s, unsigned char *name,
-    unsigned char *iv, EVP_CIPHER_CTX *ectx, HMAC_CTX *hctx, int enc);
+    unsigned char *iv, EVP_CIPHER_CTX *ectx, nxt_tls_ticket_mac_t *hctx,
+    int enc);
+#endif
 #endif
 static void nxt_ssl_session_cache(SSL_CTX *ctx, size_t cache_size,
     time_t timeout);
@@ -530,7 +565,7 @@ nxt_tls_ticket_keys(nxt_task_t *task, SSL_CTX *ctx, nxt_tls_init_t *tls_init,
         goto no_ticket;
     }
 
-#ifdef SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB
+#ifdef NXT_OPENSSL_TICKET_KEY_CB
 
     tickets = nxt_mp_get(mp, sizeof(nxt_tls_tickets_t)
                              + count * sizeof(nxt_tls_ticket_t));
@@ -571,8 +606,13 @@ nxt_tls_ticket_keys(nxt_task_t *task, SSL_CTX *ctx, nxt_tls_init_t *tls_init,
 
     } while (i < count);
 
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    if (SSL_CTX_set_tlsext_ticket_key_evp_cb(ctx, nxt_tls_ticket_key_callback)
+        == 0)
+#else
     if (SSL_CTX_set_tlsext_ticket_key_cb(ctx, nxt_tls_ticket_key_callback)
         == 0)
+#endif
     {
         nxt_openssl_log_error(task, NXT_LOG_ALERT,
                       "Unit was built with Session Tickets support, however, "
@@ -601,11 +641,11 @@ no_ticket:
 }
 
 
-#ifdef SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB
+#ifdef NXT_OPENSSL_TICKET_KEY_CB
 
 static int
 nxt_tls_ticket_key_callback(SSL *s, unsigned char *name, unsigned char *iv,
-    EVP_CIPHER_CTX *ectx, HMAC_CTX *hctx, int enc)
+    EVP_CIPHER_CTX *ectx, nxt_tls_ticket_mac_t *hctx, int enc)
 {
     nxt_uint_t          i;
     nxt_conn_t          *c;
@@ -613,6 +653,9 @@ nxt_tls_ticket_key_callback(SSL *s, unsigned char *name, unsigned char *iv,
     const EVP_CIPHER    *cipher;
     nxt_tls_ticket_t    *ticket;
     nxt_openssl_conn_t  *tls;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    OSSL_PARAM          params[2];
+#endif
 
     c = SSL_get_ex_data(s, nxt_openssl_connection_index);
 
@@ -685,6 +728,28 @@ nxt_tls_ticket_key_callback(SSL *s, unsigned char *name, unsigned char *iv,
     digest = EVP_sha256();
 #endif
 
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+
+    /*
+     * The EVP_MAC_CTX handed to this callback is an already created HMAC
+     * context; it only needs the digest and the key.  EVP_MAC_init() takes
+     * both, so the key material, its length and the digest are exactly the
+     * ones HMAC_Init_ex() used to be given, and the tag length still follows
+     * from the digest.
+     */
+
+    params[0] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST,
+                                       (char *) EVP_MD_get0_name(digest), 0);
+    params[1] = OSSL_PARAM_construct_end();
+
+    if (EVP_MAC_init(hctx, ticket[i].hmac_key, ticket[i].size, params) != 1) {
+        nxt_openssl_log_error(c->socket.task, NXT_LOG_ALERT,
+                              "EVP_MAC_init() failed");
+        return -1;
+    }
+
+#else
+
     if (HMAC_Init_ex(hctx, ticket[i].hmac_key, ticket[i].size, digest, NULL)
         != 1)
     {
@@ -693,10 +758,12 @@ nxt_tls_ticket_key_callback(SSL *s, unsigned char *name, unsigned char *iv,
         return -1;
     }
 
+#endif
+
     return enc;
 }
 
-#endif /* SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB */
+#endif /* NXT_OPENSSL_TICKET_KEY_CB */
 
 #endif /* NXT_HAVE_OPENSSL_TLSEXT */
 
