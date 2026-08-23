@@ -17,6 +17,22 @@
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 
+/*
+ * The X509 name accessors were constified in stages, and not together:
+ * X509_NAME_get_entry() and X509_NAME_ENTRY_get_data() took const arguments
+ * from 1.1.0, but X509_NAME_get_index_by_NID() only from 3.0, and it is 4.0
+ * that constified the values all three return.  Qualifying from 3.0 is what
+ * satisfies every version at once -- an older header takes these pointers
+ * non-const, and 4.0 hands them back const -- so the boundary is 3.0 rather
+ * than the 1.1.0 the other guards in this file use.
+ */
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#define NXT_X509_CONST  const
+#else
+#define NXT_X509_CONST
+#endif
+
 
 typedef struct {
     SSL               *session;
@@ -108,6 +124,8 @@ static void nxt_ssl_session_cache(SSL_CTX *ctx, size_t cache_size,
     time_t timeout);
 static nxt_uint_t nxt_openssl_cert_get_names(nxt_task_t *task, X509 *cert,
     nxt_tls_conf_t *conf, nxt_mp_t *mp);
+static nxt_int_t nxt_openssl_name_text(NXT_X509_CONST X509_NAME *x509_name,
+    int nid, nxt_str_t *str);
 static nxt_int_t nxt_openssl_bundle_hash_test(nxt_lvlhsh_query_t *lhq,
     void *data);
 static nxt_int_t nxt_openssl_bundle_hash_insert(nxt_task_t *task,
@@ -788,9 +806,8 @@ static nxt_uint_t
 nxt_openssl_cert_get_names(nxt_task_t *task, X509 *cert, nxt_tls_conf_t *conf,
     nxt_mp_t *mp)
 {
-    int                         len;
     nxt_str_t                   domain, str;
-    X509_NAME                   *x509_name;
+    NXT_X509_CONST              X509_NAME     *x509_name;
     nxt_uint_t                  i, n;
     GENERAL_NAME                *name;
     nxt_tls_bundle_conf_t       *bundle;
@@ -842,23 +859,22 @@ nxt_openssl_cert_get_names(nxt_task_t *task, X509 *cert, nxt_tls_conf_t *conf,
 
     } else {
         x509_name = X509_get_subject_name(cert);
-        len = X509_NAME_get_text_by_NID(x509_name, NID_commonName,
-                                        NULL, 0);
-        if (len <= 0) {
+
+        if (nxt_openssl_name_text(x509_name, NID_commonName, &str) != NXT_OK
+            || str.length == 0)
+        {
             nxt_log(task, NXT_LOG_WARN, "certificate \"%V\" has neither "
                     "Subject Alternative Name nor Common Name", &bundle->name);
             return NXT_OK;
         }
 
-        domain.start = nxt_mp_nget(mp, len + 1);
+        domain.start = nxt_mp_nget(mp, str.length);
         if (nxt_slow_path(domain.start == NULL)) {
             return NXT_ERROR;
         }
 
-        domain.length = X509_NAME_get_text_by_NID(x509_name, NID_commonName,
-                                                  (char *) domain.start,
-                                                  len + 1);
-        nxt_memcpy_lowcase(domain.start, domain.start, domain.length);
+        domain.length = str.length;
+        nxt_memcpy_lowcase(domain.start, str.start, str.length);
 
         item = nxt_mp_get(mp, sizeof(nxt_tls_bundle_hash_item_t));
         if (nxt_slow_path(item == NULL)) {
@@ -883,6 +899,53 @@ fail:
     sk_GENERAL_NAME_pop_free(alt_names, GENERAL_NAME_free);
 
     return NXT_ERROR;
+}
+
+
+/*
+ * Return the raw contents of the first entry of x509_name that carries nid,
+ * or NXT_DECLINED if there is none.
+ *
+ * This replaces X509_NAME_get_text_by_NID(), deprecated in OpenSSL 4.0.  The
+ * only property of that function the callers ever used was "the bytes of the
+ * first matching entry, verbatim", which is what the entry accessors give
+ * directly and without the copy: the returned string points into the
+ * certificate and stays valid for as long as it does.
+ *
+ * The bytes are not NUL terminated and, exactly as before, may contain
+ * embedded NULs -- the callers must keep handling them with an explicit
+ * length and never as a C string.
+ */
+
+static nxt_int_t
+nxt_openssl_name_text(NXT_X509_CONST X509_NAME *x509_name, int nid,
+    nxt_str_t *str)
+{
+    int             i, len;
+    NXT_X509_CONST  ASN1_STRING      *data;
+    NXT_X509_CONST  X509_NAME_ENTRY  *entry;
+
+    i = X509_NAME_get_index_by_NID(x509_name, nid, -1);
+    if (i < 0) {
+        return NXT_DECLINED;
+    }
+
+    entry = X509_NAME_get_entry(x509_name, i);
+    if (nxt_slow_path(entry == NULL)) {
+        return NXT_DECLINED;
+    }
+
+    data = X509_NAME_ENTRY_get_data(entry);
+
+    len = ASN1_STRING_length(data);
+    if (nxt_slow_path(len < 0)) {
+        return NXT_DECLINED;
+    }
+
+    str->length = len;
+    str->start = (u_char *) ASN1_STRING_get0_data(data);
+
+    return NXT_OK;
 }
 
 
