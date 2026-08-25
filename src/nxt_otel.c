@@ -726,6 +726,63 @@ nxt_otel_parse_tracestate(void *ctx, nxt_http_field_t *field, uintptr_t data)
 }
 
 
+/*
+ * Flush the telemetry pipeline on the way out of the process.
+ *
+ * Called from nxt_runtime_exit(), the single funnel every router exit passes
+ * through (signal handlers, the "quit" port message and internal failures all
+ * converge on nxt_runtime_quit() -> nxt_runtime_exit() -> exit()).  Without
+ * this the batch processor's queue -- up to MAX_QUEUE_SIZE (4096) spans plus
+ * whatever is in the batch being assembled -- is simply discarded.
+ *
+ * The flush is bounded rather than unconditional.  A blocking shutdown waits
+ * for the exporter's own 10s timeout when the collector is unreachable, which
+ * would trade "loses spans on exit" for "takes ten seconds to stop", a far
+ * more visible regression for anything supervising unitd.  The budget below is
+ * comfortably more than a reachable collector needs (a local OTLP endpoint
+ * answers in milliseconds) and short enough that a dead one is not felt.
+ */
+
+#define NXT_OTEL_EXIT_FLUSH_TIMEOUT_MS  2000
+
+void
+nxt_otel_shutdown(nxt_task_t *task)
+{
+    if (!nxt_otel_rs_is_init()) {
+        return;
+    }
+
+    nxt_log(task, NXT_LOG_DEBUG, "otel: flushing spans before exit");
+
+    /*
+     * NXT_OTEL_SHUTDOWN_FLUSHED is not a promise that nothing was lost: the
+     * router's worker engines are still live here, so a span ended after the
+     * flush reaches an already shut down provider and is dropped silently.
+     * That one stays unreportable until producers can be quiesced, which is
+     * the P5 graceful-shutdown work, tracked in issue #219.
+     */
+    switch (nxt_otel_rs_shutdown_bounded(NXT_OTEL_EXIT_FLUSH_TIMEOUT_MS)) {
+
+    case NXT_OTEL_SHUTDOWN_TIMEOUT:
+        nxt_log(task, NXT_LOG_WARN,
+                "otel: the final span flush did not complete within %d ms, "
+                "exiting anyway; the spans it held are lost",
+                NXT_OTEL_EXIT_FLUSH_TIMEOUT_MS);
+        break;
+
+    case NXT_OTEL_SHUTDOWN_FAILED:
+        nxt_log(task, NXT_LOG_WARN,
+                "otel: span export to the collector failed, exiting anyway; "
+                "the spans of at least one batch are lost");
+        break;
+
+    default:
+        nxt_log(task, NXT_LOG_DEBUG, "otel: span flush complete");
+        break;
+    }
+}
+
+
 void
 nxt_otel_log_callback(nxt_uint_t log_level, const char *arg)
 {

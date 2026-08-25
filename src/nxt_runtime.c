@@ -11,6 +11,9 @@
 #include <nxt_main_process.h>
 #include <nxt_router.h>
 #include <nxt_regex.h>
+#if (NXT_HAVE_OTEL)
+#include <nxt_otel.h>
+#endif
 
 
 static nxt_int_t nxt_runtime_inherited_listen_sockets(nxt_task_t *task,
@@ -613,6 +616,16 @@ nxt_runtime_exit(nxt_task_t *task, void *obj, void *data)
     if (!nxt_array_is_empty(rt->thread_pools)) {
         return;
     }
+
+#if (NXT_HAVE_OTEL)
+    /*
+     * Only the router builds spans, and this is the last point before exit()
+     * at which the batch processor can still be flushed.
+     */
+    if (rt->type == NXT_PROCESS_ROUTER) {
+        nxt_otel_shutdown(task);
+    }
+#endif
 
     if (rt->type == NXT_PROCESS_MAIN) {
         if (rt->pid_file != NULL) {

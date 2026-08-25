@@ -32,6 +32,23 @@ extern void nxt_otel_rs_add_attr(void *trace, nxt_str_t *key, nxt_str_t *val);
 extern void nxt_otel_rs_set_error(void *trace);
 extern uint8_t nxt_otel_rs_is_init(void);
 extern void nxt_otel_rs_uninit(void);
+extern uint8_t nxt_otel_rs_shutdown_bounded(uint64_t timeout_ms);
+
+/*
+ * Return values of nxt_otel_rs_shutdown_bounded().  Defined on the Rust side
+ * as NXT_OTEL_SHUTDOWN_* in src/otel/src/lib.rs; the two lists must be kept
+ * in step.
+ *
+ * TIMEOUT  the flush did not answer within the caller's budget.
+ * FLUSHED  the flush completed and no export has failed since the provider
+ *          was installed.  Not a promise that no spans were lost: see the
+ *          producer race documented on the Rust side and in issue #219.
+ * FAILED   an export failed -- either the one this call forced, or an earlier
+ *          batch recorded by the sticky failure flag.
+ */
+#define NXT_OTEL_SHUTDOWN_TIMEOUT  0
+#define NXT_OTEL_SHUTDOWN_FLUSHED  1
+#define NXT_OTEL_SHUTDOWN_FAILED   2
 #endif
 
 
@@ -78,6 +95,7 @@ void nxt_otel_log_callback(nxt_uint_t log_level, const char *arg);
 
 void nxt_otel_test_and_call_state(nxt_task_t *task, nxt_http_request_t *r);
 void nxt_otel_request_error_path(nxt_task_t *task, nxt_http_request_t *r);
+void nxt_otel_shutdown(nxt_task_t *task);
 
 
 #endif /* _NXT_OTEL_H_INCLUDED_ */
