@@ -17,7 +17,9 @@ client = ApplicationProto()
 # and OTLP/gRPC, so the transport under test is chosen by config (--protocol),
 # never by how the mock was built. CI installs it via the "Build fake_otlp" step
 # in ci.yml, mirroring fake_upstream. Skip gracefully when it is not built.
-FAKE_OTLP_BIN = '/usr/local/bin/fake_otlp'
+# Overridable so the suite can be run against a locally built fake_otlp
+# without root (installing into /usr/local/bin needs it).
+FAKE_OTLP_BIN = os.environ.get('FAKE_OTLP_BIN', '/usr/local/bin/fake_otlp')
 
 _skipif_no_fake_otlp = pytest.mark.skipif(
     not os.path.exists(FAKE_OTLP_BIN),
@@ -763,3 +765,73 @@ def test_otel_sampling_ratio_nonfinite_rejected():
 
     conf = client.conf(body)
     assert 'error' in conf, f'non-finite sampling_ratio must be rejected: {conf}'
+
+
+def _status_telemetry():
+    """The /status "telemetry" object, or None when it is absent."""
+    return client.conf_get('/status').get('telemetry')
+
+
+def _wait_for_spans(field, timeout=EXPORT_TIMEOUT, delay=0.1):
+    """Poll /status until telemetry/spans/<field> is non-zero; return the object."""
+    deadline = time.time() + timeout
+    telemetry = _status_telemetry()
+    while time.time() < deadline:
+        if telemetry is not None and telemetry['spans'][field] > 0:
+            return telemetry
+        time.sleep(delay)
+        telemetry = _status_telemetry()
+    return telemetry
+
+
+def test_otel_status_absent_without_telemetry():
+    """/status carries no "telemetry" object when telemetry is not configured.
+
+    True of a build without --otel as well, which is why this one does not
+    probe for OTel support first: the absence is the contract in both cases.
+    """
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "routes"}},
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    )
+
+    assert _status_telemetry() is None
+
+
+@_skipif_no_fake_otlp
+@pytest.mark.parametrize('protocol', ['http', 'grpc'])
+def test_otel_status_counts_exported_spans(protocol):
+    """A span that reaches the collector is counted in /status (issue #219)."""
+    port = _get_free_port()
+    proc = _run_fake_otlp(port, protocol=protocol)
+    try:
+        _configure_or_skip(port, protocol=protocol)
+
+        assert _get_until_header('traceparent')['status'] == 200
+
+        telemetry = _wait_for_spans('exported')
+        assert telemetry is not None, '/status must report telemetry when configured'
+        assert telemetry['spans']['exported'] > 0, 'exported spans must be counted'
+        assert telemetry['spans']['failed'] == 0, 'a live collector must not fail'
+    finally:
+        _kill(proc)
+
+
+def test_otel_status_counts_failed_spans():
+    """An export the collector refuses is counted as failed, while the process
+    is still running -- the whole point of #219: before this the only signal
+    was a log line at exit.
+    """
+    # Nothing is listening here: the export is refused, not merely slow.
+    port = _get_free_port()
+    _configure_or_skip(port)
+
+    assert _get_until_header('traceparent')['status'] == 200
+
+    telemetry = _wait_for_spans('failed')
+    assert telemetry is not None, '/status must report telemetry when configured'
+    assert telemetry['spans']['failed'] > 0, 'a refused export must be counted'
+    assert telemetry['spans']['exported'] == 0, 'nothing can have been exported'
