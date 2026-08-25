@@ -1620,6 +1620,104 @@ static nxt_conf_map_t  nxt_router_websocket_conf[] = {
 };
 
 
+#if (NXT_HAVE_OTEL)
+
+/*
+ * The telemetry settings currently applied to the Rust exporter.
+ *
+ * nxt_otel_rs_init() flushes the live provider and builds a new one, which
+ * blocks the router's control thread for as long as the export of the pending
+ * batch takes -- up to the exporter's 10s timeout against an unreachable
+ * collector -- and drops whatever is in flight across the swap.  Every config
+ * apply used to pay that, including applies that do not touch
+ * /settings/telemetry at all (adding a route, changing an app).  Caching what
+ * was applied lets an unchanged telemetry section be a no-op.
+ *
+ * Only exact equality is treated as unchanged; anything the comparison cannot
+ * establish falls through to the rebuild, which is the old behaviour.
+ */
+typedef struct {
+    nxt_bool_t  configured;
+    nxt_str_t   endpoint;
+    nxt_str_t   protocol;
+    double      sample_fraction;
+    double      batch_size;
+} nxt_otel_applied_conf_t;
+
+
+static nxt_otel_applied_conf_t  nxt_otel_applied_conf;
+
+
+static nxt_bool_t
+nxt_router_otel_conf_unchanged(nxt_str_t *endpoint, nxt_str_t *protocol,
+    double sample_fraction, double batch_size)
+{
+    /*
+     * The doubles are re-parsed from the same JSON text on every apply, so an
+     * unchanged section reproduces them bit for bit; an exact comparison is
+     * therefore the right test here, and any inequality only costs a rebuild.
+     */
+    return nxt_otel_applied_conf.configured
+           && nxt_strstr_eq(&nxt_otel_applied_conf.endpoint, endpoint)
+           && nxt_strstr_eq(&nxt_otel_applied_conf.protocol, protocol)
+           && nxt_otel_applied_conf.sample_fraction == sample_fraction
+           && nxt_otel_applied_conf.batch_size == batch_size;
+}
+
+
+static nxt_int_t
+nxt_router_otel_conf_store_str(nxt_str_t *dst, const nxt_str_t *src)
+{
+    u_char  *p;
+
+    p = NULL;
+
+    if (src->length != 0) {
+        p = nxt_malloc(src->length);
+        if (nxt_slow_path(p == NULL)) {
+            return NXT_ERROR;
+        }
+
+        memcpy(p, src->start, src->length);
+    }
+
+    nxt_free(dst->start);
+
+    dst->start = p;
+    dst->length = src->length;
+
+    return NXT_OK;
+}
+
+
+/*
+ * Remember what was just handed to nxt_otel_rs_init().  The strings point into
+ * the configuration memory pool, which is released once this apply completes,
+ * so they have to be copied.  On any failure the cache is invalidated, which
+ * only means the next apply rebuilds unconditionally.
+ */
+static void
+nxt_router_otel_conf_remember(nxt_str_t *endpoint, nxt_str_t *protocol,
+    double sample_fraction, double batch_size)
+{
+    if (nxt_slow_path(nxt_router_otel_conf_store_str(
+                          &nxt_otel_applied_conf.endpoint, endpoint) != NXT_OK
+                      || nxt_router_otel_conf_store_str(
+                          &nxt_otel_applied_conf.protocol,
+                          protocol) != NXT_OK))
+    {
+        nxt_otel_applied_conf.configured = 0;
+        return;
+    }
+
+    nxt_otel_applied_conf.sample_fraction = sample_fraction;
+    nxt_otel_applied_conf.batch_size = batch_size;
+    nxt_otel_applied_conf.configured = 1;
+}
+
+#endif
+
+
 static nxt_int_t
 nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     u_char *start, u_char *end)
@@ -2225,11 +2323,33 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             ? nxt_conf_get_number(otel_sampling)
             : NXT_OTEL_SAMPLING_DEFAULT;
 
-        nxt_otel_rs_init(&nxt_otel_log_callback, &telemetry_endpoint,
-                         &telemetry_proto, telemetry_sample_fraction,
-                         telemetry_batching);
-    } else {
+        /*
+         * Rebuild the exporter only when the telemetry settings actually
+         * differ.  nxt_otel_rs_is_init() is required as well so that a
+         * previous init that failed inside the Rust side (an exporter that
+         * could not be built) is retried rather than remembered as applied.
+         */
+        if (!nxt_router_otel_conf_unchanged(&telemetry_endpoint,
+                                            &telemetry_proto,
+                                            telemetry_sample_fraction,
+                                            telemetry_batching)
+            || !nxt_otel_rs_is_init())
+        {
+            nxt_otel_rs_init(&nxt_otel_log_callback, &telemetry_endpoint,
+                             &telemetry_proto, telemetry_sample_fraction,
+                             telemetry_batching);
+
+            nxt_router_otel_conf_remember(&telemetry_endpoint, &telemetry_proto,
+                                          telemetry_sample_fraction,
+                                          telemetry_batching);
+        }
+
+    } else if (nxt_otel_applied_conf.configured || nxt_otel_rs_is_init()) {
         nxt_otel_rs_uninit();
+
+        nxt_free(nxt_otel_applied_conf.endpoint.start);
+        nxt_free(nxt_otel_applied_conf.protocol.start);
+        nxt_memzero(&nxt_otel_applied_conf, sizeof(nxt_otel_applied_conf));
     }
 #endif
 
