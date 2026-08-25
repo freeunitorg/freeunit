@@ -21,12 +21,16 @@ use opentelemetry::trace::{
 };
 use opentelemetry::{Context, KeyValue};
 use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig};
+use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{
-    BatchConfigBuilder, BatchSpanProcessor, Sampler, SdkTracerProvider,
+    BatchConfigBuilder, BatchSpanProcessor, Sampler, SdkTracerProvider, SpanData,
+    SpanExporter as SdkSpanExporter,
 };
 use opentelemetry_sdk::Resource;
 use std::ffi::{c_char, CStr, CString};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::Duration;
 use std::{ptr, slice};
@@ -39,6 +43,14 @@ const TRACER_NAME: &str = "FreeUnit";
 const SPAN_NAME: &str = "request";
 
 const NXT_LOG_ERR: nxt_uint_t = 1;
+
+/// Return values of `nxt_otel_rs_shutdown_bounded`.
+///
+/// These are mirrored as `NXT_OTEL_SHUTDOWN_*` in `src/nxt_otel.h`, which is
+/// the only consumer; the two lists must be kept in step.
+const NXT_OTEL_SHUTDOWN_TIMEOUT: u8 = 0;
+const NXT_OTEL_SHUTDOWN_FLUSHED: u8 = 1;
+const NXT_OTEL_SHUTDOWN_FAILED: u8 = 2;
 
 #[repr(C)]
 pub struct nxt_str_t {
@@ -67,6 +79,52 @@ fn provider_slot() -> &'static Mutex<Option<SdkTracerProvider>> {
 fn runtime_slot() -> &'static Mutex<Option<tokio::runtime::Runtime>> {
     static RT: Mutex<Option<tokio::runtime::Runtime>> = Mutex::new(None);
     &RT
+}
+
+/// Set whenever an export returns `Err`, and cleared when a new provider is
+/// installed. Sticky because the `BatchSpanProcessor` throws away the result
+/// of every batch it exports on its own schedule (it only propagates the one
+/// forced by `force_flush`), so without this a batch that failed minutes
+/// before exit would leave nothing at all for the shutdown path to report.
+static EXPORT_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Wraps the configured OTLP exporter so a failed export is remembered in
+/// `EXPORT_FAILED` even when the processor discards the result.
+///
+/// Everything other than `export` is delegated verbatim to the inner
+/// exporter: taking the trait's defaults here would silently turn shutdown,
+/// force-flush and resource propagation into no-ops.
+#[derive(Debug)]
+struct FailureTrackingExporter<E> {
+    inner: E,
+}
+
+impl<E: SdkSpanExporter> SdkSpanExporter for FailureTrackingExporter<E> {
+    async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+        let res = self.inner.export(batch).await;
+
+        if res.is_err() {
+            EXPORT_FAILED.store(true, Ordering::Release);
+        }
+
+        res
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn shutdown(&self) -> OTelSdkResult {
+        self.inner.shutdown()
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        self.inner.force_flush()
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.inner.set_resource(resource);
+    }
 }
 
 /// Build the OTLP/HTTP exporter: the blocking reqwest client, no async runtime.
@@ -187,7 +245,17 @@ pub unsafe extern "C" fn nxt_otel_rs_init(
         }
     };
 
-    let processor = BatchSpanProcessor::builder(exporter)
+    // A new provider starts with a clean slate, so the shutdown path does not
+    // normally report a failure that belonged to the exporter we replaced:
+    // nxt_otel_rs_shutdown_tracer() above joins the old worker thread before
+    // this runs.  It joins on a 5s budget though, and an export gets 10s, so
+    // a worker still blocked on a dead collector can outlive the join and set
+    // the flag after this store.  The cost is one spurious FAILED at the next
+    // exit, describing a failure that was real but belonged to the old
+    // exporter -- not worth a second flag to suppress.
+    EXPORT_FAILED.store(false, Ordering::Release);
+
+    let processor = BatchSpanProcessor::builder(FailureTrackingExporter { inner: exporter })
         .with_batch_config(
             BatchConfigBuilder::default()
                 .with_max_export_batch_size(batch_size as usize)
@@ -354,6 +422,98 @@ pub unsafe extern "C" fn nxt_otel_rs_send_trace(trace: *mut BoxedSpan) {
     // exports it from its own background thread; the Box is then dropped here.
     let mut span = Box::from_raw(trace);
     span.end();
+}
+
+/// Flush and tear down the live tracer provider with a caller-supplied bound,
+/// for use on the process exit path.
+///
+/// `nxt_otel_rs_shutdown_tracer` can block for as long as the exporter's own
+/// `EXPORT_TIMEOUT` (10s) when the collector is unreachable, which is far too
+/// long to sit in front of `exit()`. The provider and runtime are taken out of
+/// their slots here and *moved* into a helper thread, so the statics are left
+/// empty and unlocked whatever happens; we then wait up to `timeout_ms` for
+/// that thread to finish flushing. On timeout we give up and return: the
+/// helper thread is left running and dies with the process. Best effort by
+/// construction — spans that could not be flushed in the budget are lost,
+/// exactly as they are today, but a dead collector can no longer delay exit.
+///
+/// Returns one of three statuses, mirrored in `src/nxt_otel.h`:
+///
+/// * `NXT_OTEL_SHUTDOWN_FLUSHED` (1) — the flush completed within the budget
+///   and no export has failed since this provider was installed.
+/// * `NXT_OTEL_SHUTDOWN_FAILED` (2) — an export failed. Either the flush this
+///   call forced failed, or `EXPORT_FAILED` records an earlier batch that did:
+///   the processor exports on its own schedule and discards the result, so the
+///   only way that failure is visible at all is the sticky flag. The helper
+///   thread failing to spawn reports here too; it is a failure, not a timeout.
+/// * `NXT_OTEL_SHUTDOWN_TIMEOUT` (0) — the helper thread did not answer inside
+///   `timeout_ms`. Kept distinct from the above because a rejected export
+///   fails in milliseconds, and calling that a timeout sends an operator
+///   looking for latency that is not there.
+///
+/// One loss remains unreportable from here: the router's worker engines are
+/// still live when `nxt_runtime_exit` calls this, so a span they end after the
+/// flush reaches a provider that is already shut down and is dropped without a
+/// word. Nothing at this layer can see it — the engine threads are never
+/// joined (`nxt_thread_join` has no call sites), so producers cannot be
+/// quiesced first. That needs the P5 graceful-shutdown work and is tracked in
+/// issue #219. A `FLUSHED` return therefore means "this flush succeeded and no
+/// export has failed", not "no spans were lost".
+#[no_mangle]
+pub unsafe extern "C" fn nxt_otel_rs_shutdown_bounded(timeout_ms: u64) -> u8 {
+    let provider = provider_slot().lock().ok().and_then(|mut g| g.take());
+    let rt = runtime_slot().lock().ok().and_then(|mut g| g.take());
+
+    if provider.is_none() && rt.is_none() {
+        return if EXPORT_FAILED.load(Ordering::Acquire) {
+            NXT_OTEL_SHUTDOWN_FAILED
+        } else {
+            NXT_OTEL_SHUTDOWN_FLUSHED
+        };
+    }
+
+    let (tx, rx) = mpsc::channel::<bool>();
+
+    let spawned = std::thread::Builder::new()
+        .name("otel-shutdown".to_string())
+        .spawn(move || {
+            let mut flushed = true;
+
+            if let Some(provider) = provider {
+                // Needs the runtime alive on a grpc build, hence the ordering.
+                //
+                // force_flush() first, because it is the only one of the two
+                // that reports whether the spans actually left: the batch
+                // processor hands shutdown() the export result and shutdown()
+                // throws it away, reporting only that the worker answered.  A
+                // collector that refuses the connection fails in milliseconds,
+                // so shutdown() alone would call that a clean flush and exit
+                // without a word.  Both run whatever the first one says.
+                let exported = provider.force_flush().is_ok();
+                let stopped = provider.shutdown().is_ok();
+
+                flushed = exported && stopped;
+            }
+            if let Some(rt) = rt {
+                rt.shutdown_background();
+            }
+            // Read the sticky flag only after the flush above, so a batch the
+            // flush itself pushed out and failed on is counted here too.
+            let _ = tx.send(flushed && !EXPORT_FAILED.load(Ordering::Acquire));
+        });
+
+    // The caller logs these, so they must not be conflated: a collector that
+    // rejects the export fails in milliseconds, and reporting that as a
+    // timeout sends an operator looking for latency that is not there.
+    match spawned {
+        Ok(_) => match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+            Ok(true) => NXT_OTEL_SHUTDOWN_FLUSHED,
+            Ok(false) => NXT_OTEL_SHUTDOWN_FAILED,
+            Err(_) => NXT_OTEL_SHUTDOWN_TIMEOUT,
+        },
+        // Nothing flushed at all, and no time was spent trying.
+        Err(_) => NXT_OTEL_SHUTDOWN_FAILED,
+    }
 }
 
 /// Flush and tear down the live tracer provider, if any.
