@@ -1001,6 +1001,19 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     } nxt_queue_loop;
 
+#if (NXT_HAVE_OTEL)
+    /*
+     * Span export health.  The counters live in the Rust exporter wrapper,
+     * which runs in this process, so the router is the only place they can be
+     * read from.  A build without OTel, or a configuration with no
+     * "settings/telemetry", leaves the memzero'd zeros in place and
+     * nxt_status_get() then omits the "telemetry" object entirely.
+     */
+    report->otel_configured = nxt_otel_rs_export_stats(
+                                  &report->otel_spans_exported,
+                                  &report->otel_spans_failed);
+#endif
+
     report->apps_count = 0;
     app_stat = report->apps;
     p = b->mem.end;

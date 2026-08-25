@@ -22,6 +22,19 @@ typedef struct {
     uint64_t          closed_conns;
     uint64_t          requests;
 
+    /*
+     * OpenTelemetry span export health, filled in by the router.  The two
+     * counters are only meaningful when otel_configured is set: a build
+     * without OTel support, or one where "settings/telemetry" is absent,
+     * leaves them zero and reports no "telemetry" object in /status at all.
+     *
+     * Counted in spans since the live tracer provider was installed, i.e.
+     * reset by a telemetry reconfiguration.
+     */
+    uint64_t          otel_spans_exported;
+    uint64_t          otel_spans_failed;
+    uint8_t           otel_configured;
+
     size_t            apps_count;
     nxt_status_app_t  apps[];
 } nxt_status_report_t;
