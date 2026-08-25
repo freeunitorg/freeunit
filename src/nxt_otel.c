@@ -354,6 +354,63 @@ nxt_otel_span_collect(nxt_task_t *task, nxt_http_request_t *r)
 }
 
 
+/*
+ * Release the span of a request that is being torn down.
+ *
+ * Registered as an r->mem_pool cleanup at span creation, so it runs from
+ * nxt_mp_destroy() on *every* request exit: the normal completion path, the
+ * client-abort/error path that goes straight to
+ * nxt_http_request_close_handler() without ever reaching COLLECT, and any exit
+ * path added in the future.  Tying the span's lifetime to the pool that holds
+ * it makes the release structural rather than something each new exit path has
+ * to remember.
+ *
+ * nxt_otel_span_collect() NULLs r->otel->trace after handing the span to Rust,
+ * and it is the only other place that does so; that NULL is what keeps this
+ * idempotent, i.e. a no-op for a request that was collected normally.
+ */
+static void
+nxt_otel_span_pool_cleanup(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_thread_t      *thr;
+    nxt_otel_state_t  *state;
+
+    state = obj;
+
+    if (state->trace == NULL) {
+        return;
+    }
+
+    thr = nxt_thread();
+
+    /*
+     * The task recorded at registration belongs to the connection, which may
+     * already have been recycled by the time the pool is destroyed, so log
+     * against the current thread's task instead of the one passed in.
+     */
+    nxt_log(thr->task, NXT_LOG_DEBUG,
+            "otel: releasing the span of an unfinished request");
+
+    /*
+     * The request never produced a response.  Mark the span failed and export
+     * it rather than dropping it silently: an aborted or timed out request is
+     * usually the interesting trace, and a span that simply vanishes is
+     * indistinguishable from telemetry being broken.  Exporting also keeps the
+     * span consistent with the 5xx case, which is already flagged
+     * Status::Error in nxt_otel_span_add_status().
+     *
+     * This cannot stall the engine thread: nxt_otel_rs_send_trace() only ends
+     * the span, which enqueues it on the Rust-side batch processor; the actual
+     * OTLP export runs later on that processor's own thread.
+     */
+    nxt_otel_rs_set_error(state->trace);
+    nxt_otel_rs_send_trace(state->trace);
+
+    state->trace = NULL;
+    state->status = NXT_OTEL_UNINIT_STATE;
+}
+
+
 static void
 nxt_otel_error(nxt_task_t *task, nxt_http_request_t *r)
 {
@@ -424,6 +481,27 @@ nxt_otel_trace_and_span_init(nxt_task_t *task, nxt_http_request_t *r)
                                         &r->otel->trace_state);
     if (r->otel->trace == NULL) {
         nxt_log(task, NXT_LOG_ERR, "error generating otel span");
+        nxt_otel_state_transition(r->otel, NXT_OTEL_ERROR_STATE);
+        return;
+    }
+
+    /*
+     * Bind the span to the request memory pool right away, so that from here
+     * on no exit path can drop the request without releasing the span.
+     */
+    if (nxt_slow_path(nxt_mp_cleanup(r->mem_pool, nxt_otel_span_pool_cleanup,
+                                     task, r->otel, NULL) != NXT_OK))
+    {
+        /*
+         * Without the cleanup nothing guarantees the span is released on an
+         * abort, so end it now instead of tracing this request and risking a
+         * leak.
+         */
+        nxt_log(task, NXT_LOG_ERR, "couldn't register otel span cleanup");
+
+        nxt_otel_rs_send_trace(r->otel->trace);
+        r->otel->trace = NULL;
+
         nxt_otel_state_transition(r->otel, NXT_OTEL_ERROR_STATE);
         return;
     }
