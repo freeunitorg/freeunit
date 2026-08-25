@@ -33,6 +33,13 @@ extern void nxt_otel_rs_set_error(void *trace);
 extern uint8_t nxt_otel_rs_is_init(void);
 extern void nxt_otel_rs_uninit(void);
 extern uint8_t nxt_otel_rs_shutdown_bounded(uint64_t timeout_ms);
+/*
+ * Span export health for the /status API: writes the number of spans the
+ * exporter accepted and the number it rejected since the live provider was
+ * installed, and returns non-zero when a provider is installed at all.  When
+ * it returns 0 the two counters are meaningless and must not be reported.
+ */
+extern uint8_t nxt_otel_rs_export_stats(uint64_t *exported, uint64_t *failed);
 
 /*
  * Return values of nxt_otel_rs_shutdown_bounded().  Defined on the Rust side

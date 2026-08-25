@@ -29,7 +29,7 @@ use opentelemetry_sdk::trace::{
 use opentelemetry_sdk::Resource;
 use std::ffi::{c_char, CStr, CString};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -88,6 +88,19 @@ fn runtime_slot() -> &'static Mutex<Option<tokio::runtime::Runtime>> {
 /// before exit would leave nothing at all for the shutdown path to report.
 static EXPORT_FAILED: AtomicBool = AtomicBool::new(false);
 
+/// Spans in batches the exporter accepted, and spans in batches it rejected,
+/// since the live provider was installed.  Read out by
+/// `nxt_otel_rs_export_stats` for the `/status` API, which is the only way an
+/// operator can see export health without waiting for the process to exit.
+///
+/// Counted in spans rather than batches because the number an operator needs
+/// is "how much telemetry did I lose", and a batch is a variable-size unit
+/// that answers that only by accident.  Neither counter includes spans the
+/// processor dropped before an export was attempted (a full queue): that
+/// happens inside the SDK, which reports it nowhere we can observe.
+static SPANS_EXPORTED: AtomicU64 = AtomicU64::new(0);
+static SPANS_FAILED: AtomicU64 = AtomicU64::new(0);
+
 /// Wraps the configured OTLP exporter so a failed export is remembered in
 /// `EXPORT_FAILED` even when the processor discards the result.
 ///
@@ -101,10 +114,20 @@ struct FailureTrackingExporter<E> {
 
 impl<E: SdkSpanExporter> SdkSpanExporter for FailureTrackingExporter<E> {
     async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+        // Count before the batch is moved into the inner exporter.
+        let spans = batch.len() as u64;
+
         let res = self.inner.export(batch).await;
 
         if res.is_err() {
+            // The boolean is kept alongside the counter rather than derived
+            // from it: it is the fact the shutdown path asks for ("has any
+            // export failed"), and it stays true even for the degenerate
+            // empty batch that would add nothing to SPANS_FAILED.
             EXPORT_FAILED.store(true, Ordering::Release);
+            SPANS_FAILED.fetch_add(spans, Ordering::Relaxed);
+        } else {
+            SPANS_EXPORTED.fetch_add(spans, Ordering::Relaxed);
         }
 
         res
@@ -196,6 +219,44 @@ pub unsafe extern "C" fn nxt_otel_rs_is_init() -> u8 {
         .unwrap_or(0)
 }
 
+/// Report span export health for the `/status` API.
+///
+/// Writes the number of spans the exporter accepted and the number it
+/// rejected since the live provider was installed, and returns 1 when a
+/// provider is installed at all.
+///
+/// The counters are written whether or not a provider is installed, so on a
+/// 0 return they hold whatever the previous provider left behind -- they are
+/// only zeroed when a new one is installed.  A 0 return therefore means the
+/// values are stale, not absent: the caller must ignore them rather than
+/// report them.
+///
+/// The counters are read with two independent `Relaxed` loads, so a report
+/// taken while an export is completing can be off by one batch.  That is
+/// deliberate: this is a health gauge, not an accounting ledger, and taking a
+/// lock on the export path to make the pair atomic would cost more than the
+/// skew is worth.
+///
+/// # Safety
+///
+/// `exported` and `failed` must each be either null or a valid, aligned,
+/// writable `uint64_t`.
+#[no_mangle]
+pub unsafe extern "C" fn nxt_otel_rs_export_stats(
+    exported: *mut u64,
+    failed: *mut u64,
+) -> u8 {
+    if !exported.is_null() {
+        *exported = SPANS_EXPORTED.load(Ordering::Relaxed);
+    }
+
+    if !failed.is_null() {
+        *failed = SPANS_FAILED.load(Ordering::Relaxed);
+    }
+
+    nxt_otel_rs_is_init()
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn nxt_otel_rs_uninit() {
     nxt_otel_rs_shutdown_tracer();
@@ -254,6 +315,8 @@ pub unsafe extern "C" fn nxt_otel_rs_init(
     // exit, describing a failure that was real but belonged to the old
     // exporter -- not worth a second flag to suppress.
     EXPORT_FAILED.store(false, Ordering::Release);
+    SPANS_EXPORTED.store(0, Ordering::Relaxed);
+    SPANS_FAILED.store(0, Ordering::Relaxed);
 
     let processor = BatchSpanProcessor::builder(FailureTrackingExporter { inner: exporter })
         .with_batch_config(
