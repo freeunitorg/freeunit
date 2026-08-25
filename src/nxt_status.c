@@ -35,11 +35,21 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
     static const nxt_str_t  reqs_str = nxt_string("requests");
     static const nxt_str_t  total_str = nxt_string("total");
     static const nxt_str_t  apps_str = nxt_string("applications");
+    static const nxt_str_t  telemetry_str = nxt_string("telemetry");
+    static const nxt_str_t  spans_str = nxt_string("spans");
+    static const nxt_str_t  exported_str = nxt_string("exported");
+    static const nxt_str_t  failed_str = nxt_string("failed");
     static const nxt_str_t  procs_str = nxt_string("processes");
     static const nxt_str_t  run_str = nxt_string("running");
     static const nxt_str_t  start_str = nxt_string("starting");
 
-    status = nxt_conf_create_object(mp, 4);
+    /*
+     * modules, connections, requests, applications -- plus "telemetry" when
+     * OTel is built in and currently configured.  It is omitted rather than
+     * zeroed otherwise, so a build or a configuration without telemetry
+     * reports exactly what it did before.
+     */
+    status = nxt_conf_create_object(mp, 4 + (report->otel_configured != 0));
     if (nxt_slow_path(status == NULL)) {
         return NULL;
     }
@@ -147,6 +157,36 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
     nxt_conf_set_member(status, &reqs_str, obj, idx++);
 
     nxt_conf_set_member_integer(obj, &total_str, report->requests, 0);
+
+    if (report->otel_configured) {
+        nxt_conf_value_t  *spans;
+
+        /*
+         * "is my telemetry reaching the collector?" needs both halves: a
+         * failure count alone cannot tell a healthy pipeline from one that
+         * has never exported anything.  Both are cumulative since the live
+         * tracer provider was installed, so a telemetry reconfiguration
+         * restarts them.
+         */
+        obj = nxt_conf_create_object(mp, 1);
+        if (nxt_slow_path(obj == NULL)) {
+            return NULL;
+        }
+
+        nxt_conf_set_member(status, &telemetry_str, obj, idx++);
+
+        spans = nxt_conf_create_object(mp, 2);
+        if (nxt_slow_path(spans == NULL)) {
+            return NULL;
+        }
+
+        nxt_conf_set_member(obj, &spans_str, spans, 0);
+
+        nxt_conf_set_member_integer(spans, &exported_str,
+                                    report->otel_spans_exported, 0);
+        nxt_conf_set_member_integer(spans, &failed_str,
+                                    report->otel_spans_failed, 1);
+    }
 
     apps = nxt_conf_create_object(mp, report->apps_count);
     if (nxt_slow_path(apps == NULL)) {
