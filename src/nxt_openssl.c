@@ -55,12 +55,6 @@ typedef enum {
 
 static nxt_int_t nxt_openssl_library_init(nxt_task_t *task);
 static void nxt_openssl_library_free(nxt_task_t *task);
-#if OPENSSL_VERSION_NUMBER < 0x10100004L
-static nxt_int_t nxt_openssl_locks_init(void);
-static void nxt_openssl_lock(int mode, int type, const char *file, int line);
-static unsigned long nxt_openssl_thread_id(void);
-static void nxt_openssl_locks_free(void);
-#endif
 static nxt_int_t nxt_openssl_server_init(nxt_task_t *task, nxt_mp_t *mp,
     nxt_tls_init_t *tls_init, nxt_bool_t last);
 static nxt_int_t nxt_openssl_chain_file(nxt_task_t *task, SSL_CTX *ctx,
@@ -138,55 +132,13 @@ nxt_openssl_library_init(nxt_task_t *task)
         return NXT_OK;
     }
 
-#if OPENSSL_VERSION_NUMBER >= 0x10100003L
-
     OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, NULL);
-
-#else
-    {
-        nxt_int_t  ret;
-
-        SSL_load_error_strings();
-
-        OPENSSL_config(NULL);
-
-        /*
-         * SSL_library_init(3):
-         *
-         *   SSL_library_init() always returns "1",
-         *   so it is safe to discard the return value.
-         */
-        (void) SSL_library_init();
-
-        ret = nxt_openssl_locks_init();
-        if (nxt_slow_path(ret != NXT_OK)) {
-            return ret;
-        }
-    }
-
-#endif
 
     nxt_openssl_version = OpenSSL_version_num();
 
     nxt_log(task, NXT_LOG_INFO, "%s, %xl",
             OpenSSL_version(OPENSSL_VERSION), nxt_openssl_version);
 
-#ifndef SSL_OP_NO_COMPRESSION
-    {
-        /*
-         * Disable gzip compression in OpenSSL prior to 1.0.0
-         * version, this saves about 522K per connection.
-         */
-        int                 n;
-        STACK_OF(SSL_COMP)  *ssl_comp_methods;
-
-        ssl_comp_methods = SSL_COMP_get_compression_methods();
-
-        for (n = sk_SSL_COMP_num(ssl_comp_methods); n != 0; n--) {
-            (void) sk_SSL_COMP_pop(ssl_comp_methods);
-        }
-    }
-#endif
 
     index = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
 
@@ -202,92 +154,10 @@ nxt_openssl_library_init(nxt_task_t *task)
 }
 
 
-#if OPENSSL_VERSION_NUMBER >= 0x10100003L
-
 static void
 nxt_openssl_library_free(nxt_task_t *task)
 {
 }
-
-#else
-
-static nxt_thread_mutex_t  *nxt_openssl_locks;
-
-static nxt_int_t
-nxt_openssl_locks_init(void)
-{
-    int        i, n;
-    nxt_int_t  ret;
-
-    n = CRYPTO_num_locks();
-
-    nxt_openssl_locks = OPENSSL_malloc(n * sizeof(nxt_thread_mutex_t));
-    if (nxt_slow_path(nxt_openssl_locks == NULL)) {
-        return NXT_ERROR;
-    }
-
-    for (i = 0; i < n; i++) {
-        ret = nxt_thread_mutex_create(&nxt_openssl_locks[i]);
-        if (nxt_slow_path(ret != NXT_OK)) {
-            return ret;
-        }
-    }
-
-    CRYPTO_set_locking_callback(nxt_openssl_lock);
-
-    CRYPTO_set_id_callback(nxt_openssl_thread_id);
-
-    return NXT_OK;
-}
-
-
-static void
-nxt_openssl_lock(int mode, int type, const char *file, int line)
-{
-    nxt_thread_mutex_t  *lock;
-
-    lock = &nxt_openssl_locks[type];
-
-    if ((mode & CRYPTO_LOCK) != 0) {
-        (void) nxt_thread_mutex_lock(lock);
-
-    } else {
-        (void) nxt_thread_mutex_unlock(lock);
-    }
-}
-
-
-static u_long
-nxt_openssl_thread_id(void)
-{
-    return (u_long) nxt_thread_handle();
-}
-
-
-static void
-nxt_openssl_library_free(nxt_task_t *task)
-{
-    nxt_openssl_locks_free();
-}
-
-
-static void
-nxt_openssl_locks_free(void)
-{
-    int  i, n;
-
-    n = CRYPTO_num_locks();
-
-    CRYPTO_set_locking_callback(NULL);
-
-    for (i = 0; i < n; i++) {
-        nxt_thread_mutex_destroy(&nxt_openssl_locks[i]);
-    }
-
-    OPENSSL_free(nxt_openssl_locks);
-}
-
-#endif
 
 
 static nxt_int_t
@@ -875,11 +745,7 @@ nxt_openssl_cert_get_names(nxt_task_t *task, X509 *cert, nxt_tls_conf_t *conf,
             }
 
             str.length = ASN1_STRING_length(name->d.dNSName);
-#if OPENSSL_VERSION_NUMBER > 0x10100000L
             str.start = (u_char *) ASN1_STRING_get0_data(name->d.dNSName);
-#else
-            str.start = ASN1_STRING_data(name->d.dNSName);
-#endif
 
             domain.start = nxt_mp_nget(mp, str.length);
             if (nxt_slow_path(domain.start == NULL)) {
