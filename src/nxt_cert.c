@@ -812,11 +812,7 @@ nxt_cert_alt_names_details(nxt_mp_t *mp, STACK_OF(GENERAL_NAME) *alt_names)
         }
 
         str.length = ASN1_STRING_length(name->d.dNSName);
-#if OPENSSL_VERSION_NUMBER > 0x10100000L
         str.start = (u_char *) ASN1_STRING_get0_data(name->d.dNSName);
-#else
-        str.start = ASN1_STRING_data(name->d.dNSName);
-#endif
 
         ret = nxt_conf_set_element_string_dup(array, mp, i++, &str);
         if (nxt_slow_path(ret != NXT_OK)) {

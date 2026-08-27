@@ -22,9 +22,11 @@ if [ $NXT_OPENSSL = YES ]; then
     nxt_feature_incs=
     nxt_feature_libs="-lssl -lcrypto"
     nxt_feature_test="#include <openssl/ssl.h>
+                      #include <openssl/err.h>
 
                       int main(void) {
-                          SSL_library_init();
+                          SSL_CTX_free(NULL);
+                          (void) ERR_get_error();
                           return 0;
                       }"
     . auto/feature
@@ -33,6 +35,39 @@ if [ $NXT_OPENSSL = YES ]; then
     if [ $nxt_found = yes ]; then
         NXT_TLS=YES
         NXT_OPENSSL_LIBS="$nxt_feature_libs"
+
+        # The probe above uses only symbols that every OpenSSL provides and
+        # none of them deprecates, so it compiles against a too-old library
+        # as well; that is deliberate, so that the floor probe below is the
+        # one to report a too-old library by name instead of configure
+        # bailing out with a misleading "no OpenSSL library found".  The
+        # floor is not a build fact but a support decision: 1.1.1 is
+        # vendor-maintained on RHEL 8, Amazon Linux 2 and Debian 11, all
+        # still in the OS matrix (pkg/eol.json), and pkg/rpm builds against
+        # openssl11-devel there.
+        # Checking it here fails configure with a clear message instead of
+        # leaving a too-old library to surface as an implicit declaration
+        # deep in the build.
+        nxt_feature="OpenSSL 1.1.1 or later"
+        nxt_feature_name=
+        nxt_feature_run=no
+        nxt_feature_test="#include <openssl/ssl.h>
+
+                          #if OPENSSL_VERSION_NUMBER < 0x1010100fL
+                          #error OpenSSL 1.1.1 or later is required.
+                          #endif
+
+                          int main(void) {
+                              return 0;
+                          }"
+        . auto/feature
+
+        if [ $nxt_found = no ]; then
+            $echo
+            $echo $0: error: OpenSSL 1.1.1 or later is required.
+            $echo
+            exit 1;
+        fi
 
         nxt_feature="OpenSSL version"
         nxt_feature_name=NXT_HAVE_OPENSSL_VERSION
