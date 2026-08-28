@@ -364,6 +364,10 @@ Class | Method | HTTP request | Description
 *StatusApi* | [**get_status_modules_lang_version**](docs/StatusApi.md#get_status_modules_lang_version) | **Get** /status/modules/{langMod}/version | Retrieve the language module version object
 *StatusApi* | [**get_status_requests**](docs/StatusApi.md#get_status_requests) | **Get** /status/requests | Retrieve the requests status object
 *StatusApi* | [**get_status_requests_total**](docs/StatusApi.md#get_status_requests_total) | **Get** /status/requests/total | Retrieve the total requests number
+*StatusApi* | [**get_status_telemetry**](docs/StatusApi.md#get_status_telemetry) | **Get** /status/telemetry | Retrieve the telemetry status object
+*StatusApi* | [**get_status_telemetry_spans**](docs/StatusApi.md#get_status_telemetry_spans) | **Get** /status/telemetry/spans | Retrieve the telemetry spans object
+*StatusApi* | [**get_status_telemetry_spans_exported**](docs/StatusApi.md#get_status_telemetry_spans_exported) | **Get** /status/telemetry/spans/exported | Retrieve the exported spans number
+*StatusApi* | [**get_status_telemetry_spans_failed**](docs/StatusApi.md#get_status_telemetry_spans_failed) | **Get** /status/telemetry/spans/failed | Retrieve the failed spans number
 *TlsApi* | [**delete_listener_tls**](docs/TlsApi.md#delete_listener_tls) | **Delete** /config/listeners/{listenerName}/tls | Delete the tls object in a listener
 *TlsApi* | [**delete_listener_tls_certificate**](docs/TlsApi.md#delete_listener_tls_certificate) | **Delete** /config/listeners/{listenerName}/tls/certificate/{arrayIndex} | Delete a certificate array item in a listener
 *TlsApi* | [**delete_listener_tls_certificates**](docs/TlsApi.md#delete_listener_tls_certificates) | **Delete** /config/listeners/{listenerName}/tls/certificate | Delete the certificate option in a listener
@@ -465,6 +469,8 @@ Class | Method | HTTP request | Description
  - [ConfigSettingsHttpStatic](docs/ConfigSettingsHttpStatic.md)
  - [ConfigSettingsHttpStaticMimeType](docs/ConfigSettingsHttpStaticMimeType.md)
  - [ConfigSettingsTelemetry](docs/ConfigSettingsTelemetry.md)
+ - [ErrorLocation](docs/ErrorLocation.md)
+ - [JsonErrorMessage](docs/JsonErrorMessage.md)
  - [Status](docs/Status.md)
  - [StatusApplicationsApp](docs/StatusApplicationsApp.md)
  - [StatusApplicationsAppProcesses](docs/StatusApplicationsAppProcesses.md)
@@ -472,6 +478,8 @@ Class | Method | HTTP request | Description
  - [StatusConnections](docs/StatusConnections.md)
  - [StatusModulesLang](docs/StatusModulesLang.md)
  - [StatusRequests](docs/StatusRequests.md)
+ - [StatusTelemetry](docs/StatusTelemetry.md)
+ - [StatusTelemetrySpans](docs/StatusTelemetrySpans.md)
  - [StringOrStringArray](docs/StringOrStringArray.md)
 
 
