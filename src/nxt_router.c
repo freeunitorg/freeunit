@@ -229,6 +229,7 @@ static void nxt_router_app_port_ready(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
 static void nxt_router_app_port_error(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
+static void nxt_router_app_start_failed(nxt_task_t *task, nxt_app_t *app);
 
 static void nxt_router_app_use(nxt_task_t *task, nxt_app_t *app, int i);
 static void nxt_router_app_unlink(nxt_task_t *task, nxt_app_t *app);
@@ -395,7 +396,7 @@ nxt_router_greet_controller(nxt_task_t *task, nxt_port_t *controller_port)
 }
 
 
-static void
+void
 nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
     void *data)
 {
@@ -484,11 +485,25 @@ nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
 
     nxt_router_app_joint_use(task, app->joint, 1);
 
+    goto skip;
+
 failed:
+
+    /*
+     * The attempt is over and no handler remains armed for it -- the two
+     * earlier sites never armed one, and the third cancels its registration
+     * with nxt_port_rpc_cancel() -- so nothing will ever report it back.
+     * Release the pending_processes slot the initiator took, exactly as
+     * nxt_router_app_port_error() does for the attempts that do get that far.
+     */
+
+    nxt_alert(task, "app '%V' failed to start a process", &app->name);
 
     if (b != NULL) {
         nxt_mp_free(b->data, b);
     }
+
+    nxt_router_app_start_failed(task, app);
 
 skip:
 
@@ -5041,8 +5056,6 @@ nxt_router_app_port_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 {
     nxt_app_t            *app;
     nxt_app_joint_t      *app_joint;
-    nxt_queue_link_t     *link;
-    nxt_http_request_t   *r;
     nxt_app_joint_rpc_t  *app_joint_rpc;
 
     nxt_assert(data != NULL);
@@ -5063,6 +5076,23 @@ nxt_router_app_port_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     }
 
     nxt_debug(task, "app '%V' %p start error", &app->name, app);
+
+    nxt_router_app_start_failed(task, app);
+}
+
+
+/*
+ * A start attempt that will never yield a port: give back the
+ * pending_processes slot its initiator took and, if the application is left
+ * with no way to answer at all, fail the requests waiting for an
+ * acknowledgement instead of letting them sit until they time out.
+ */
+
+static void
+nxt_router_app_start_failed(nxt_task_t *task, nxt_app_t *app)
+{
+    nxt_queue_link_t    *link;
+    nxt_http_request_t  *r;
 
     link = NULL;
 
