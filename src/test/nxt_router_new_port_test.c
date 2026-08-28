@@ -21,6 +21,12 @@
  *
  * The port keeps fd[0]: it is the port's socket, and the port outlives the
  * message.  Only fd[1] is the message's to lose.
+ *
+ * The refusal itself is checked here too: the port must come back without a
+ * queue.  A descriptor accounted for proves nothing about the mapping, and
+ * the size check is what keeps a short object off the port -- mmap()
+ * succeeds on one, and the router faults on the first access past its last
+ * page.
  */
 
 #include <nxt_main.h>
@@ -68,7 +74,7 @@ nxt_router_new_port_test(nxt_thread_t *thr)
     nxt_buf_t                buf;
     nxt_task_t               *task;
     nxt_int_t                ret;
-    nxt_port_t               *port;
+    nxt_port_t               *port, *reply_port;
     nxt_runtime_t            *rt, *saved_rt;
     nxt_event_engine_t       engine;
     nxt_port_recv_msg_t      msg;
@@ -81,6 +87,7 @@ nxt_router_new_port_test(nxt_thread_t *thr)
     sock = -1;
     queue = -1;
     port = NULL;
+    reply_port = NULL;
 
     task = thr->task;
     task->thread = thr;
@@ -129,6 +136,33 @@ nxt_router_new_port_test(nxt_thread_t *thr)
     rt->main_engine = &engine;
 
     /*
+     * The port the message arrived on.  An application NEW_PORT that answers
+     * a pending start carries a stream, and the handler dispatches such a
+     * message through nxt_port_rpc_handler(), which reads this port; the
+     * fixture registers no stream, so the dispatch is a lookup that finds
+     * nothing and returns.
+     *
+     * The stream is what keeps the path under test short.  With stream 0 a
+     * handler that took the queue would run on into the main app port lookup
+     * -- an assertion the fixture cannot satisfy -- and then into a PORT_ACK
+     * written through the queue it just took, faulting on the short mapping.
+     * Either would kill the binary instead of failing the checks below.
+     */
+    reply_port = nxt_runtime_process_port_create(task, rt, nxt_pid, 0,
+                                                 NXT_PROCESS_ROUTER);
+    if (nxt_slow_path(reply_port == NULL)) {
+        goto done;
+    }
+
+    /*
+     * nxt_port_new() zeroes the port, and 0 is a descriptor teardown must
+     * not close.
+     */
+    reply_port->pair[0] = -1;
+    reply_port->pair[1] = -1;
+    reply_port->socket.fd = -1;
+
+    /*
      * A short queue: mmap() of the whole object over it would succeed and
      * fault later, so the size check has to refuse it here.
      */
@@ -166,8 +200,8 @@ nxt_router_new_port_test(nxt_thread_t *thr)
     msg.fd[0] = sock;
     msg.fd[1] = queue;
 
-    /* stream 0: the handler returns after the refusal, without RPC. */
-    msg.port_msg.stream = 0;
+    msg.port = reply_port;
+    msg.port_msg.stream = 1;
     msg.port_msg.pid = new_port.pid;
 
     nxt_router_new_port_handler(task, &msg);
@@ -196,6 +230,17 @@ nxt_router_new_port_test(nxt_thread_t *thr)
     sock = -1;
     port = msg.u.new_port;
 
+    /*
+     * The point of the refusal: the short object must not be on the port.
+     * The descriptor checks above say only that nothing leaked, and would
+     * hold just as well for a handler that mapped the object and kept it.
+     */
+    if (port->queue != NULL) {
+        nxt_log_alert(thr->log, "router new port test: a refused queue was "
+                      "installed on the port");
+        goto done;
+    }
+
     ret = NXT_OK;
 
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "router new port test passed");
@@ -221,6 +266,11 @@ done:
          */
         nxt_port_close(task, port);
         nxt_runtime_port_remove(task, port);
+    }
+
+    if (reply_port != NULL) {
+        nxt_port_close(task, reply_port);
+        nxt_runtime_port_remove(task, reply_port);
     }
 
     thr->runtime = saved_rt;

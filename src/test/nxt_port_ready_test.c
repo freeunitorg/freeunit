@@ -99,6 +99,89 @@ fail:
 #if (NXT_HAVE_MEMFD_CREATE)
 
 /*
+ * The size check in nxt_port_queue_mmap() (src/nxt_port.c) refuses only an
+ * object shorter than the queue, and both edges of that rule are load
+ * bearing.
+ *
+ * An object of exactly sizeof(nxt_port_queue_t) is what both producers ask
+ * for -- nxt_shm_open() in the runtime and nxt_unit_shm_open() in libunit
+ * -- so the comparison has to be "<": a "<=" would refuse every queue.
+ *
+ * A longer object is accepted on purpose.  A shm object is rounded up to a
+ * page on some systems and the queue is not a whole number of pages, so
+ * tightening the check to equality would refuse every legitimate queue
+ * there and stall application port setup.  Only the first
+ * sizeof(nxt_port_queue_t) bytes are mapped either way.
+ *
+ * Both cases touch the last item of the mapping the way
+ * nxt_port_queue_send() would.  That probe is not a SIGBUS check: every page
+ * of an accepted mapping is at least partially file-backed here, and a
+ * partial page at EOF is zero-filled, so no size the helper accepts can
+ * fault there.  What it catches is the helper handing back a short or
+ * garbage mapping -- and it fixes the shape of the access, so that a future
+ * change to what gets mapped is exercised rather than merely returned.  The
+ * teeth of these two cases are the NULL checks above it.
+ */
+static nxt_int_t
+nxt_port_ready_test_queue_size(nxt_thread_t *thr, nxt_task_t *task,
+    size_t file_size, const char *name)
+{
+    void                       *mem;
+    nxt_fd_t                   fd;
+    volatile nxt_port_queue_t  *queue;
+
+    fd = syscall(SYS_memfd_create, "nxt_port_ready_test", MFD_CLOEXEC);
+    if (fd == -1) {
+        nxt_log_alert(thr->log, "port ready test failed to create the queue");
+        return NXT_ERROR;
+    }
+
+    if (ftruncate(fd, file_size) == -1) {
+        nxt_log_alert(thr->log, "port ready test failed to size the queue");
+        (void) close(fd);
+        return NXT_ERROR;
+    }
+
+    mem = nxt_port_queue_mmap(task, fd, sizeof(nxt_port_queue_t));
+
+    /* The mapping does not keep the descriptor. */
+    (void) close(fd);
+
+    if (mem == NULL) {
+        nxt_log_alert(thr->log, "port ready test: %s queue was refused", name);
+        return NXT_ERROR;
+    }
+
+    queue = mem;
+    queue->items[NXT_PORT_QUEUE_SIZE - 1].size = 0;
+
+    nxt_mem_munmap(mem, sizeof(nxt_port_queue_t));
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_port_ready_test_queue_sizes(nxt_thread_t *thr, nxt_task_t *task)
+{
+    size_t  rounded;
+
+    if (nxt_slow_path(nxt_port_ready_test_queue_size(thr, task,
+                                                     sizeof(nxt_port_queue_t),
+                                                     "an exact-size")
+                      != NXT_OK))
+    {
+        return NXT_ERROR;
+    }
+
+    rounded = nxt_align_size(sizeof(nxt_port_queue_t), nxt_pagesize);
+
+    return nxt_port_ready_test_queue_size(thr, task, rounded,
+                                          "a page-rounded");
+}
+
+
+/*
  * Hand the handler a mappable descriptor and check that the port takes it
  * over: the queue is installed, whatever the port held before is released,
  * and the second descriptor of the message is closed.
@@ -262,6 +345,20 @@ nxt_port_ready_test(nxt_thread_t *thr)
 
     task = thr->task;
     task->thread = thr;
+
+#if (NXT_HAVE_MEMFD_CREATE)
+
+    /*
+     * The two accepted sizes, ahead of the handler fixtures and calling
+     * nxt_port_queue_mmap() directly: nothing is allocated yet, and a
+     * failure here names the rule that broke rather than the handler that
+     * relied on it.
+     */
+    if (nxt_slow_path(nxt_port_ready_test_queue_sizes(thr, task) != NXT_OK)) {
+        return NXT_ERROR;
+    }
+
+#endif
 
     /* Defined before the first goto done: the cleanup there releases it. */
     port = NULL;
