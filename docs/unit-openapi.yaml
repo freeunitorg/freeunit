@@ -5609,6 +5609,15 @@ components:
           line: 1
           column: 0
 
+    errorUnknownParameter:
+      summary: "400 error response for an unknown parameter"
+      value:
+        error: "Invalid configuration."
+        detail: 'Unknown parameter "pas".'
+        location:
+          path: "/routes/0/action"
+        suggestion: "pass"
+
     errorValueDoesntExist:
       summary: "404 error response"
       value:
@@ -6442,6 +6451,9 @@ components:
             example1:
               $ref: "#/components/examples/errorInvalidJson"
 
+            example2:
+              $ref: "#/components/examples/errorUnknownParameter"
+
     responseNotFound:
       description: "Not Found; the value does not exist in the configuration.
         This may occur if any part of the path is non-existent."
@@ -6493,9 +6505,56 @@ components:
 
     jsonErrorMessage:
       type: object
-      description: "JSON message on error."
+      description: "JSON message on error. Only `error` is always present;
+        each of the others is omitted where it does not apply."
+      properties:
+        error:
+          type: string
+          description: "What went wrong, in a human-readable sentence."
+
+        detail:
+          type: string
+          description: "A longer explanation of the error, where one adds
+            anything to the message."
+
+        location:
+          $ref: "#/components/schemas/errorLocation"
+
+        suggestion:
+          type: string
+          description: "The name the request most likely meant, reported when
+            an unknown parameter is a close and unambiguous typo of a known
+            one."
+
       additionalProperties:
         type: string
+
+    errorLocation:
+      type: object
+      description: "Where in the request the error is. Present when the error
+        can be placed; which members appear depends on how it was found."
+      properties:
+        offset:
+          type: integer
+          description: "Byte offset into the request body, reported only for
+            an error found while parsing it."
+
+        line:
+          type: integer
+          description: "Line number, reported with `column` and only for an
+            error found while parsing."
+
+        column:
+          type: integer
+          description: "Column number, reported with `line`."
+
+        path:
+          type: string
+          description: "An RFC 6901 JSON Pointer to where the error is: the
+            member whose value failed validation, the member a required
+            parameter is missing from, or the containing object when the
+            failure is an unknown parameter, whose name the message itself
+            carries. An empty string is the document root."
 
     # Configuration sections as data types; hugely reliant on each other
 
