@@ -7,7 +7,7 @@
 
 <changes apply="unit"
          ver="1.36.1" rev="1"
-         date="2026-08-02" time="00:00:00 +0000"
+         date="2026-08-28" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change type="feature">
@@ -22,6 +22,21 @@ intended name is reported in a top-level "suggestion" member.  The addition
 is strictly additive: the existing response fields and the error message
 wording are unchanged, and each new member is omitted where it does not
 apply.
+</para>
+</change>
+
+<change type="feature">
+<para>
+the /status API reports OpenTelemetry span export health as "telemetry":
+{"spans": {"exported": N, "failed": M}} -- the spans the collector accepted,
+and the spans whose export failed.  Both are reported because a failure count
+alone cannot distinguish a healthy pipeline from one that has never exported
+anything.  The object is omitted entirely unless Unit was built with
+OpenTelemetry support, "/config/settings/telemetry" is set, and the exporter
+was built successfully, so its absence is how a client tells telemetry is off
+rather than idle.  The counters are cumulative since the exporter was last
+built, so changing any telemetry setting restarts them, while re-applying an
+identical configuration does not.
 </para>
 </change>
 
@@ -155,8 +170,8 @@ and be accepted.
 recycle connection structures through a per-engine freelist, embed the static
 file context in the request, recycle static file buffer descriptors through a
 thread-local freelist, and resolve the first eight routing variables and the
-first sixteen response header fields from arrays embedded in the request.
-Each avoids or reuses an allocation on a per-connection or
+first sixteen request and response header fields from arrays embedded in the
+request.  Each avoids or reuses an allocation on a per-connection or
 per-request hot path.
 </para>
 </change>
@@ -190,6 +205,230 @@ and true otherwise, and a leading "!" negates the result.  Variables test
 for the presence of a value ("$arg_foo"), njs template strings express
 comparisons and regular expressions
 ("`${uri == '/admin'}`", "`${/^\/admin/.test(uri)}`").
+</para>
+</change>
+
+<change type="change">
+<para>
+build against OpenSSL 4.0, which constified the return types of the X509 name
+accessors and deprecated X509_NAME_get_text_by_NID(); SNI certificate matching
+and the "certificates" control API now read the certificate name through
+X509_NAME_get_index_by_NID() and the entry accessors instead, and a new CI job
+builds and runs the C test suite against OpenSSL 4.0 with deprecated APIs
+disabled, so it fails on any new use of a deprecated function rather than only
+on a removal.
+</para>
+</change>
+
+<change type="change">
+<para>
+OpenSSL 1.1.1 or later is now required to build with "--openssl"; configure
+fails with an explicit message on older releases.  Builds against OpenSSL 1.0.x
+have not worked since 1.35.2, when the TLS module started to use
+OpenSSL_version_num(); the unreachable pre-1.1.0 compatibility code is
+removed.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+close the engine port when a router worker thread exits.  Lowering
+settings/listen_threads deletes engines, and the thread exit handler only
+dropped a port reference, and the runtime held another, so nothing ever
+called nxt_port_close(): every deleted engine leaked its socket pair and its
+queue descriptor, three per engine, for the life of the router.  The count
+only ever rose, so a configuration that raises and lowers the thread count
+walked the router towards its descriptor limit.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+close the descriptors a forged or malformed port message leaves behind.  A
+message carries up to two descriptors whatever its type normally uses, and
+the dispatcher reclaims nothing once a handler has returned.  The main
+process kept the second descriptor on the whoami path, the router lost both
+when a conf data message named no reply port, and a PROCESS_READY naming an
+unknown process closed neither.  A peer that is already compromised could
+exhaust the descriptor table of the receiving process -- the main process on
+the whoami path -- by repeating any of them.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+bound the log file slot a CHANGE_FILE message claims, and stop leaking the
+descriptor it carries.  The slot index arrived from a peer and was used to
+walk the runtime's log file list without a range check, and a message whose
+payload was shorter than the index was read past its end.  The rejection
+paths now close what the message attached, and nxt_file_redirect() releases
+the descriptor when dup2() fails rather than only on success -- which also
+ends a leak of one descriptor per unrotatable log file on every SIGUSR1.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a NEW_PORT or PROCESS_READY message carrying a shared-memory queue shorter
+than the queue type faulted the receiving process (main, the prototype, or the
+router) with SIGBUS on first access; the object size is now checked before
+mapping, a short queue is refused with a warning, and the router no longer
+leaks the descriptor of a queue it refuses.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a NEW_PORT message announcing a port that already existed, or one that could
+not be created, left an uninitialized stack value behind; the controller
+dereferenced it unconditionally on every NEW_PORT, and main and the router
+relied on a NULL check that could not catch non-NULL garbage.  The result is
+now cleared explicitly whenever no port is created.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+close the file descriptors a NEW_PORT or MMAP message left behind instead of
+leaking them.  The discovery and application prototype processes kept every
+port queue descriptor open for the life of the process, the main process kept
+the queue descriptor of any port it had not just created, the router lost it
+on ports it does not map a queue for, the controller never closed it, and the
+mmap handler leaked its second descriptor on every path and returned closing
+nothing at all when the first was missing; a message type with no handler also
+went uncollected.  A NEW_PORT for
+a port that already has a queue now refuses the new descriptor instead of
+mapping it over the live queue and leaking the mapping it replaced, which had
+let a repeated announcement re-point an established port at memory of the
+sender's choosing.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+session tickets were silently disabled when Unit was built against an OpenSSL
+3.x library compiled with the deprecated 3.0 API removed
+(OPENSSL_NO_DEPRECATED_3_0), because the feature guard tested for a control
+macro that is itself declared only under that API and so was never defined;
+the session ticket key callback now registers through
+SSL_CTX_set_tlsext_ticket_key_evp_cb() and keys an EVP_MAC context on OpenSSL
+3.0 and later, independent of the deprecated HMAC_CTX API.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+stop building OpenTelemetry span attributes for spans the sampler has
+already dropped.  set_attribute() on a non-recording span discards its
+argument, but the argument was built first -- the sprintf round-trips, the
+pool allocations and two owned strings per attribute -- and nothing asked
+whether the span was recording.  Lowering sampling_ratio therefore bought
+back the exporter and nothing on the request path.  The sampler's verdict is
+now read once when the span is created and the attribute stages consult it,
+which removes most of telemetry's request-path cost at a low sampling
+ratio.  Context propagation is deliberately outside that check: the
+traceparent must reach the peer and the application whatever the sampling
+decision was.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+do not attach the traceparent to an OpenTelemetry span as a "Unit Attribute"
+event.  It duplicated the trace and span identifiers the span context
+already carries, nothing consumed it, and it was added twice on a request
+that took the error path with a trace it had started itself, because the
+error path re-runs header propagation.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+OpenTelemetry spans were lost at the edges of a request's life.  A request
+that ended before its span was collected -- an error path, a dropped
+connection -- left the span allocated and never exported it; the span is now
+tied to the memory pool that holds it and is exported with an error status
+when that pool is released, so an abandoned request appears in the trace
+instead of vanishing.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+flush the OpenTelemetry span pipeline before the router exits.  Exit and
+reload discarded the pipeline with up to 4096 spans still queued, losing every
+span produced since the last export.  The pipeline is now flushed with a 2
+second bound, so a slow or unreachable collector delays shutdown by at most
+that long rather than either hanging it or costing the queued spans.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+rebuild the OpenTelemetry exporter only when the telemetry settings have
+changed.  Every configuration change rebuilt it, so adding a route or changing
+an application stalled reconfiguration against an unreachable collector even
+though it did not touch "/config/settings/telemetry".  The exporter is now
+rebuilt only when the endpoint, protocol, sampling ratio or batch size
+actually differs from the running one.
+</para>
+</change>
+
+<change type="change">
+<para>
+the OpenTelemetry span attributes "http.response.status_code" and
+"http.request.body.size" are now emitted as OTLP integer values, as the HTTP
+semantic conventions specify, instead of strings.  A collector or query that
+matches these attributes as strings must be adapted; one that reads them as
+integers, or that relied on the convention rather than on Unit's previous
+output, needs no change.
+</para>
+</change>
+
+<change type="change">
+<para>
+the work a traced request does on the request path is reduced: attribute keys
+are no longer copied onto the heap per request, the two attributes above no
+longer round-trip through strings, and a span stage now crosses into the
+tracer once instead of once per attribute.  Together with the sampling fix
+above, the telemetry overhead of a request measured 27% lower at
+"sampling_ratio" 1.0 and 53% lower at 0.1.
+</para>
+</change>
+
+<change type="change">
+<para>
+the Java module now bundles Apache Tomcat 9.0.121 (from 9.0.110) and
+ClassGraph 4.8.186 (from 4.8.181).  The upstream Tomcat 9.0.121 release fixes
+CVE-2026-66299 (unbounded buffer for undelivered WebSocket messages, a memory
+exhaustion by a slow client), CVE-2026-73180, CVE-2026-68569, CVE-2026-66422
+and CVE-2026-65927.  FreeUnit bundles only the servlet, JSP and EL API jars,
+Jasper and the Tomcat utility jars -- not catalina, the WebSocket
+implementation or the example webapps -- so the bump keeps the jars it ships
+on a supported release.
+</para>
+</change>
+
+</changes>
+
+
+<changes apply="unit-php unit-php8.3 unit-php8.4 unit-php8.5
+                unit-python unit-python2.7
+                unit-python3.8 unit-python3.9 unit-python3.10 unit-python3.11
+                unit-python3.12 unit-python3.13 unit-python3.14
+                unit-go
+                unit-perl
+                unit-ruby
+                unit-jsc-common unit-jsc11 unit-jsc17 unit-jsc18
+                unit-jsc19 unit-jsc20 unit-jsc21
+                unit-wasm"
+         ver="1.36.1" rev="1"
+         date="2026-08-28" time="00:00:00 +0000"
+         packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change>
+<para>
+FreeUnit updated to 1.36.1.
 </para>
 </change>
 
