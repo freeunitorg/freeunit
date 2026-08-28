@@ -6507,6 +6507,8 @@ components:
       type: object
       description: "JSON message on error. Only `error` is always present;
         each of the others is omitted where it does not apply."
+      required:
+        - error
       properties:
         error:
           type: string
@@ -6531,13 +6533,17 @@ components:
 
     errorLocation:
       type: object
-      description: "Where in the request the error is. Present when the error
-        can be placed; which members appear depends on how it was found."
+      description: "Where the error is. Present when it can be placed. Which
+        members appear depends on how it was found, and they do not index the
+        same document: `offset`, `line` and `column` locate the error in the
+        request body, while `path` locates it in the resulting configuration."
       properties:
         offset:
           type: integer
           description: "Byte offset into the request body, reported only for
-            an error found while parsing it."
+            an error found while parsing it. A leading UTF-8 byte order mark
+            is skipped before parsing, so the offset is relative to the JSON
+            that follows it rather than to the bytes sent."
 
         line:
           type: integer
@@ -6550,11 +6556,15 @@ components:
 
         path:
           type: string
-          description: "An RFC 6901 JSON Pointer to where the error is: the
-            member whose value failed validation, the member a required
-            parameter is missing from, or the containing object when the
-            failure is an unknown parameter, whose name the message itself
-            carries. An empty string is the document root."
+          description: "An RFC 6901 JSON Pointer to the member whose value
+            failed validation, to the member a required parameter is missing
+            from, or to the containing object when the failure is an unknown
+            parameter, whose name the message itself carries. It points into
+            the configuration the request would produce, not into the request
+            body: a request to a path below \"/config\" is validated against a
+            copy of the whole configuration with the change applied, so the
+            pointer is rooted at the configuration and an empty string is the
+            configuration itself."
 
     # Configuration sections as data types; hugely reliant on each other
 
