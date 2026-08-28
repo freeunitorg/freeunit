@@ -10,6 +10,175 @@
          date="2026-08-02" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="feature">
+<para>
+configuration validation errors now say where they are.  A rejected
+configuration request carries an RFC 6901 JSON Pointer in the "path" member
+of "location": it points at the member whose value failed validation, or at
+the containing object when the failure is an unknown parameter, whose name
+the message itself already carries; "" is the document root.  On an unknown
+parameter whose name is a close and unambiguous typo of a known one, the
+intended name is reported in a top-level "suggestion" member.  The addition
+is strictly additive: the existing response fields and the error message
+wording are unchanged, and each new member is omitted where it does not
+apply.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+validate the shared memory segment identifier and geometry an application
+process supplies in its NXT_PORT_MSG_MMAP message.  The router checked only
+the pid fields, then used the peer-authored header id directly as an array
+index and mapped the descriptor at whatever length fstat() reported; a
+compromised or faulty application could drive an out-of-range write and an
+oversized mapping.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+bounds-check the router-supplied chunk identifier and size in libunit before
+consuming them, so an out-of-range size can no longer make every
+serialized-pointer check in the arrival-time validation block pass and be
+read out of bounds in the application process.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+do not replay a stale SCM_RIGHTS control message in libunit when the
+embedder's port_recv callback returns without receiving anything.  The out
+parameter carrying the control-data length was stored unconditionally, so a
+descriptor from an earlier message could be adopted a second time.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+check the shared memory buffer allocation when forwarding a websocket frame.
+Exhausting the outgoing shared memory crashed the router with a NULL
+dereference; every other caller already checked.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+keep the chunked request body buffer alive across framing reads.  A buffer
+drained without producing a data slice was handed to its completion handler
+while the parser still referenced it, a use-after-free reachable from an
+ordinary chunked request.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+parse the HTTP/1.1 trailer section (RFC 9112 7.1.2) instead of erroring on
+the first byte after the terminal chunk.  In the proxy response relay this
+aborted an already-streaming response and truncated the body at a racy
+point; chunked requests carrying a trailer were rejected the same way.
+Trailer field names and values are validated as they are parsed.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+reject an application response that disagrees with itself about its own body
+length.  A duplicate Content-Length was neither detected nor parsed, so every
+such header was forwarded verbatim and the body was framed by the advertised
+length instead of chunked.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+release the response buffers adopted from the port on the error paths of the
+router's response handler, and drain them from the request output chain when
+the failure happens after they were linked into it.  Both leaked the chain
+the handler had taken ownership of.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+keep the memory pool cursor aligned in nxt_mp_get() by rounding the requested
+size up to the maximum alignment rather than flooring it.  The small
+allocation path is a bump allocator with no per-allocation alignment step, so
+any request whose size was not a multiple of that alignment left the page
+cursor misaligned, and allocations from that page kept violating the
+documented alignment guarantee until a later size happened to bring the
+cursor back into step, which crashed with SIGBUS on strict alignment targets
+such as 32-bit ARM.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+serialize the process reference count on the runtime process mutex and take a
+reference during cross-thread process lookups.  The count was mutated
+non-atomically from every engine thread and a lookup returned an unreferenced
+process, so a router worker could operate on an nxt_process_t -- including its
+shared memory segments and its mutex -- that the main thread had already torn
+down.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+keep the socket and timer tasks of a connection scoped to that connection, so
+a work item cannot run against a task belonging to a different connection.
+</para>
+</change>
+
+<change type="change">
+<para>
+remove the dead chunk-tracking bitmap from the shared memory segment header.
+Its trailing fields ran past the header area and aliased the payload of the
+segment's first chunk, which was harmless only because nothing read or wrote
+them; the field offsets a peer of either vintage uses are unchanged, so old
+and new builds still interoperate.  A static assertion now pins the header
+struct inside the area reserved for it.
+</para>
+</change>
+
+<change type="change">
+<para>
+the shared memory chunk range check is now a single shared implementation
+used by both the router and libunit, with the chunk count computed so that a
+peer-supplied size in the top of the 32-bit range cannot wrap to zero chunks
+and be accepted.
+</para>
+</change>
+
+<change type="change">
+<para>
+recycle connection structures through a per-engine freelist, embed the static
+file context in the request, recycle static file buffer descriptors through a
+thread-local freelist, and resolve the first eight routing variables and the
+first sixteen response header fields from arrays embedded in the request.
+Each avoids or reuses an allocation on a per-connection or
+per-request hot path.
+</para>
+</change>
+
+<change type="change">
+<para>
+the WebAssembly component module no longer supports guest-initiated outbound
+HTTP.  Serving Unit never needed it, and the feature that provided it linked
+an entire TLS stack -- rustls, tokio-rustls, webpki-roots and rustls-webpki --
+into the module.  A guest that only imports wasi:http/outgoing-handler, as the
+wasi:http/proxy world requires, still instantiates and runs; an actual
+outbound call now fails with HttpRequestDenied.
+</para>
+</change>
+
+<change type="change">
+<para>
+update wasmtime from 36.0.12 to 47.0.2 in the WebAssembly component module,
+keeping outbound HTTP denied and the TLS stack out of the dependency graph.
+</para>
+</change>
+
 <change type="change">
 <para>
 the "if" option of a route "match" object, added in 1.33.0, is now
