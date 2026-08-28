@@ -19,7 +19,7 @@ use opentelemetry::trace::{
     Span, SpanContext, SpanId, SpanKind, Status, TraceContextExt, TraceFlags,
     TraceId, TraceState, Tracer, TracerProvider,
 };
-use opentelemetry::{Context, KeyValue};
+use opentelemetry::{Context, Key, KeyValue, Value};
 use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{
@@ -51,6 +51,55 @@ const NXT_LOG_ERR: nxt_uint_t = 1;
 const NXT_OTEL_SHUTDOWN_TIMEOUT: u8 = 0;
 const NXT_OTEL_SHUTDOWN_FLUSHED: u8 = 1;
 const NXT_OTEL_SHUTDOWN_FAILED: u8 = 2;
+
+/// Span attribute keys, indexed by the `nxt_otel_attr_id_t` id C sends.
+///
+/// `Key::from_static_str` is a `const fn` over a `&'static str`, so a key
+/// costs no allocation and no `strlen` -- where the previous string-key FFI
+/// copied all eleven of these compile-time constants onto the heap on every
+/// traced request.
+///
+/// This table and `nxt_otel_attr_id_t` in `src/nxt_otel.h` are one contract:
+/// the id indexes this array directly, so the order must match exactly.
+/// The `[Key; NXT_OTEL_ATTR_MAX]` annotation makes a mismatched element count
+/// a compile error, so a key added here without extending the count cannot
+/// ship. It cannot check the C enum itself -- the ids stay a reviewed
+/// contract -- but it catches the half of the mistake that lives on this side.
+///
+/// These follow the stable OpenTelemetry HTTP semantic conventions
+/// (<https://opentelemetry.io/docs/specs/semconv/http/http-spans/>);
+/// "http.flavor"/"http.user_agent" from older drafts are superseded by
+/// "network.protocol.version"/"user_agent.original". "unit.application.*" are
+/// FreeUnit-specific: a reverse proxy can't know the served app, but Unit can.
+static ATTR_KEYS: [Key; NXT_OTEL_ATTR_MAX] = [
+    Key::from_static_str("http.request.method"),
+    Key::from_static_str("url.path"),
+    Key::from_static_str("url.scheme"),
+    Key::from_static_str("network.protocol.version"),
+    Key::from_static_str("user_agent.original"),
+    Key::from_static_str("server.address"),
+    Key::from_static_str("client.address"),
+    Key::from_static_str("unit.application.name"),
+    Key::from_static_str("unit.application.type"),
+    Key::from_static_str("http.response.status_code"),
+    Key::from_static_str("http.request.body.size"),
+];
+
+/// Must equal `NXT_OTEL_ATTR_MAX` in `src/nxt_otel.h`.
+const NXT_OTEL_ATTR_MAX: usize = 11;
+
+const NXT_OTEL_ATTR_TYPE_STR: u32 = 0;
+const NXT_OTEL_ATTR_TYPE_I64: u32 = 1;
+
+/// One span attribute in a batch. Mirrors `nxt_otel_attr_t` in
+/// `src/nxt_otel.h`; the layouts must stay identical.
+#[repr(C)]
+pub struct nxt_otel_attr_t {
+    pub key_id: u32,
+    pub r#type: u32,
+    pub ival: i64,
+    pub sval: nxt_str_t,
+}
 
 #[repr(C)]
 pub struct nxt_str_t {
@@ -389,22 +438,58 @@ pub unsafe extern "C" fn nxt_otel_rs_copy_traceparent(buf: *mut c_char, span: *c
     *buf.add(TRACEPARENT_HEADER_LEN as usize) = 0;
 }
 
-/// Set a semantic-convention span attribute (e.g. `http.request.method`).
-/// These are structured span attributes the collector can index and query.
+/// Set a stage's semantic-convention span attributes in one call.
+///
+/// C accumulates a stage's attributes on its stack and crosses once, rather
+/// than once per attribute: a traced request used to make eight or nine FFI
+/// crossings here and allocate two `String`s at each of them. Only the values
+/// still allocate, and only those that are strings.
+///
+/// Note this deliberately does NOT use `SpanBuilder::with_attributes`, which
+/// issue #221 suggests. That would assemble the attributes while the span is
+/// being built -- before C can observe the sampling decision -- which would
+/// undo the `is_recording` gate that is the measured win. Attributes are set
+/// after the gate, on a span already known to be recording.
+///
+/// # Safety
+///
+/// `attrs` must point at `n` initialised `nxt_otel_attr_t`, and each entry's
+/// `sval` must reference bytes that stay valid for the duration of the call.
 #[no_mangle]
-pub unsafe extern "C" fn nxt_otel_rs_add_attr(
+pub unsafe extern "C" fn nxt_otel_rs_add_attrs(
     trace: *mut BoxedSpan,
-    key: *const nxt_str_t,
-    val: *const nxt_str_t,
+    attrs: *const nxt_otel_attr_t,
+    n: usize,
 ) {
-    if trace.is_null() || key.is_null() || val.is_null() {
+    if trace.is_null() || attrs.is_null() || n == 0 {
         return;
     }
 
-    let key = nxt_str_to_string(&*key);
-    let val = nxt_str_to_string(&*val);
+    let attrs = slice::from_raw_parts(attrs, n);
 
-    (*trace).set_attribute(KeyValue::new(key, val));
+    // Set each attribute directly rather than collecting into a Vec first.
+    // `Span::set_attributes` is a default trait method that just loops over
+    // `set_attribute`, and `BoxedSpan` does not override it, so a Vec here
+    // would be an allocation that buys nothing. The saving this function
+    // exists for is the single FFI crossing and the static keys, not batching
+    // inside the SDK.
+    for attr in attrs {
+        // A key_id C and Rust disagree about would index out of bounds;
+        // drop the attribute rather than panic across the FFI boundary.
+        let Some(key) = ATTR_KEYS.get(attr.key_id as usize) else {
+            continue;
+        };
+
+        let value = match attr.r#type {
+            NXT_OTEL_ATTR_TYPE_I64 => Value::I64(attr.ival),
+            NXT_OTEL_ATTR_TYPE_STR => Value::String(nxt_str_to_string(&attr.sval).into()),
+            _ => continue,
+        };
+
+        // Cloning a Key built by `from_static_str` copies a &'static str --
+        // no allocation, which is the point of the ATTR_KEYS table.
+        (*trace).set_attribute(KeyValue::new(key.clone(), value));
+    }
 }
 
 /// Whether the sampler kept this span.

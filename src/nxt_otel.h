@@ -16,6 +16,48 @@
 #endif
 
 
+/*
+ * Span attribute keys, as ids rather than strings.
+ *
+ * The key text lives on the Rust side in ATTR_KEYS, as a const table of
+ * Key::from_static_str -- so a key costs no allocation and no strlen per
+ * request.  The order of this enum and of that table is the contract between
+ * the two sides: the id indexes the table directly.  Add to the end, and add
+ * to ATTR_KEYS in src/otel/src/lib.rs in the same commit.
+ */
+typedef enum {
+    NXT_OTEL_ATTR_METHOD = 0,
+    NXT_OTEL_ATTR_PATH,
+    NXT_OTEL_ATTR_SCHEME,
+    NXT_OTEL_ATTR_FLAVOR,
+    NXT_OTEL_ATTR_USER_AGENT,
+    NXT_OTEL_ATTR_SERVER_ADDR,
+    NXT_OTEL_ATTR_CLIENT_ADDR,
+    NXT_OTEL_ATTR_APP_NAME,
+    NXT_OTEL_ATTR_APP_TYPE,
+    NXT_OTEL_ATTR_STATUS_CODE,
+    NXT_OTEL_ATTR_BODY_SIZE,
+    NXT_OTEL_ATTR_MAX
+} nxt_otel_attr_id_t;
+
+
+/* Which member of nxt_otel_attr_t carries the value. */
+#define NXT_OTEL_ATTR_TYPE_STR  0
+#define NXT_OTEL_ATTR_TYPE_I64  1
+
+
+/*
+ * One span attribute in a batch.  Mirrored by nxt_otel_attr_t in
+ * src/otel/src/lib.rs; the layouts must stay identical.
+ */
+typedef struct {
+    uint32_t   key_id;
+    uint32_t   type;
+    int64_t    ival;
+    nxt_str_t  sval;
+} nxt_otel_attr_t;
+
+
 #if (NXT_HAVE_OTEL)
 extern void nxt_otel_rs_send_trace(void *trace);
 extern void * nxt_otel_rs_get_or_create_trace(const u_char *trace_id,
@@ -26,7 +68,8 @@ extern void nxt_otel_rs_init(
     const nxt_str_t *endpoint, const nxt_str_t *protocol,
     double sample_fraction, double batch_size);
 extern void nxt_otel_rs_copy_traceparent(u_char *buffer, void *span);
-extern void nxt_otel_rs_add_attr(void *trace, nxt_str_t *key, nxt_str_t *val);
+extern void nxt_otel_rs_add_attrs(void *trace,
+    const nxt_otel_attr_t *attrs, size_t n);
 extern void nxt_otel_rs_set_error(void *trace);
 extern uint8_t nxt_otel_rs_is_recording(void *trace);
 extern uint8_t nxt_otel_rs_is_init(void);
