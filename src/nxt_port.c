@@ -489,14 +489,40 @@ nxt_port_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
         } else {
             /*
-             * A refused queue leaves the port as it was, as a failed
-             * mapping always did -- on the socket if it had no queue yet,
-             * on the one it already has otherwise.  Refusing the message
-             * outright would let a forged PROCESS_READY carrying a bad
-             * descriptor keep the process from ever being marked ready.
+             * A refused queue leaves the port as it was.  For a repeated
+             * PROCESS_READY that is the queue it already has, and the port
+             * keeps working.  For the first one it is no queue at all, and
+             * that is not a fallback to the socket: only libunit attaches
+             * a queue descriptor to PROCESS_READY, and a libunit process
+             * delivers a socket message only after dequeuing the
+             * READ_SOCKET marker that nxt_port_socket_write2() emits under
+             * port->queue != NULL.  A queueless sender cannot emit the
+             * marker, so its messages are suspended undelivered on the
+             * worker side, and the second one fails the worker's context
+             * ("too many port socket messages").  The broadcast below
+             * forwards queue_fd == -1, so every peer holds the same
+             * unreachable copy; a QUIT can never arrive, while requests
+             * still flow through the shared app queue.  See issue #231.
+             *
+             * The message is still not refused outright: it is not
+             * authenticated, and refusing it would let a forged
+             * PROCESS_READY carrying a bad descriptor keep the process
+             * from ever being marked ready.  Failing the start is the
+             * honest reaction to a genuine mmap failure, but it hands the
+             * same forgery a way to kill a legitimate start, so it has to
+             * wait for sender authentication (see the lookup comment
+             * above).
              */
-            nxt_log(task, NXT_LOG_WARN, "process %PI ready: cannot map the "
-                    "queue, leaving the port as it was", msg->port_msg.pid);
+            if (port->queue == NULL) {
+                nxt_alert(task, "process %PI ready: cannot map the queue; "
+                          "the process cannot be reached on this port",
+                          msg->port_msg.pid);
+
+            } else {
+                nxt_log(task, NXT_LOG_WARN, "process %PI ready: cannot map "
+                        "the replacement queue, keeping the current one",
+                        msg->port_msg.pid);
+            }
         }
     }
 
