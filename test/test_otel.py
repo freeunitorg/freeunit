@@ -202,9 +202,11 @@ def test_otel_span_exported_with_service_name(tmp_path, protocol):
         with open(dump, 'rb') as f:
             body = f.read()
         assert b'FreeUnit' in body, 'exported span must carry service.name=FreeUnit'
-        # Semconv span attributes (1.35.6): recorded via nxt_otel_rs_add_attr,
-        # not as the old free-form span events. The attribute *keys* travel as
-        # literal strings in the OTLP protobuf payload.
+        # Semconv span attributes: recorded via nxt_otel_rs_add_attrs, not as
+        # the old free-form span events. The attribute *keys* still travel as
+        # literal strings in the OTLP protobuf payload -- keying them by id
+        # across the FFI changed where they live in the process, not the wire
+        # format.
         assert b'http.request.method' in body, 'span must carry semconv method attr'
         assert b'url.path' in body, 'span must carry semconv url.path attr'
         assert b'http.response.status_code' in body, 'span must carry status attr'
