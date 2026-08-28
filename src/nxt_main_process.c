@@ -429,6 +429,19 @@ nxt_main_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
         if (nxt_fast_path(mem != NULL)) {
             port->queue = mem;
+
+        } else {
+            /*
+             * Not a fallback to the socket: a libunit process delivers a
+             * socket message only after dequeuing the READ_SOCKET marker
+             * that only a queue-holding sender emits, so everything main
+             * sends on this port -- CHANGE_FILE on log rotation, QUIT on
+             * shutdown -- would be suspended undelivered, and the second
+             * message fails the worker's context.  See issue #231.
+             */
+            nxt_alert(task, "cannot map the queue of port %PI:%d; the "
+                      "process cannot be reached on this port from main",
+                      port->pid, (int) port->id);
         }
     }
 
