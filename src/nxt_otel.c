@@ -3,8 +3,6 @@
  * Copyright (C) F5, Inc.
  */
 
-#include <math.h>
-
 #include <nxt_router.h>
 #include <nxt_router_request.h>
 #include <nxt_application.h>
@@ -22,24 +20,6 @@
 
 #define NXT_OTEL_TRACEPARENT_LEN    55
 
-/*
- * Span attribute keys. These follow the stable OpenTelemetry HTTP semantic
- * conventions (https://opentelemetry.io/docs/specs/semconv/http/http-spans/);
- * "http.flavor"/"http.user_agent" from older drafts are superseded by
- * "network.protocol.version"/"user_agent.original". "unit.application.*" are
- * FreeUnit-specific: a reverse proxy can't know the served app, but Unit can.
- */
-#define NXT_OTEL_BODY_SIZE_TAG      "http.request.body.size"
-#define NXT_OTEL_METHOD_TAG         "http.request.method"
-#define NXT_OTEL_PATH_TAG           "url.path"
-#define NXT_OTEL_SCHEME_TAG         "url.scheme"
-#define NXT_OTEL_FLAVOR_TAG         "network.protocol.version"
-#define NXT_OTEL_USER_AGENT_TAG     "user_agent.original"
-#define NXT_OTEL_SERVER_ADDR_TAG    "server.address"
-#define NXT_OTEL_CLIENT_ADDR_TAG    "client.address"
-#define NXT_OTEL_APP_NAME_TAG       "unit.application.name"
-#define NXT_OTEL_APP_TYPE_TAG       "unit.application.type"
-#define NXT_OTEL_STATUS_CODE_TAG    "http.response.status_code"
 
 
 static void
@@ -54,16 +34,103 @@ nxt_otel_state_transition(nxt_otel_state_t *state, nxt_otel_status_t status)
 
 
 /*
- * Set a semantic-convention span attribute from a string-literal key and an
- * nxt_str_t value. Empty or absent values are skipped so we don't emit blank
- * attributes for headers the request didn't carry.
+ * A request's span attributes, accumulated on the stack and handed to Rust in
+ * one call.
+ *
+ * Each attribute used to cost its own FFI crossing and two heap allocations --
+ * one for the key, one for the value -- and the keys were compile-time
+ * constants being strlen'd and copied per request. Now the key is an id into a
+ * static table on the Rust side, and a whole stage's attributes cross once.
+ *
+ * The batch never outlives the stage that fills it, so the nxt_str_t values it
+ * holds are borrowed, not copied: they stay valid until the flush, and Rust
+ * copies what it needs to keep.
+ */
+typedef struct {
+    nxt_otel_attr_t  attrs[NXT_OTEL_ATTR_MAX];
+    nxt_uint_t       n;
+} nxt_otel_attr_batch_t;
+
+
+static void
+nxt_otel_attr_batch_init(nxt_otel_attr_batch_t *batch)
+{
+    batch->n = 0;
+}
+
+
+static nxt_otel_attr_t *
+nxt_otel_attr_next(nxt_otel_attr_batch_t *batch, nxt_otel_attr_id_t id)
+{
+    nxt_otel_attr_t  *attr;
+
+    /*
+     * Every stage adds at most one attribute per id, so the batch cannot
+     * overflow; the check is here so that a future caller adding a second
+     * attribute for one id truncates rather than writing off the end.
+     */
+    if (nxt_slow_path(batch->n >= NXT_OTEL_ATTR_MAX)) {
+        return NULL;
+    }
+
+    attr = &batch->attrs[batch->n++];
+    attr->key_id = id;
+
+    return attr;
+}
+
+
+/*
+ * Add a string attribute. Empty or absent values are skipped so we don't emit
+ * blank attributes for headers the request didn't carry.
  */
 static void
-nxt_otel_add_attr(nxt_http_request_t *r, const char *key, nxt_str_t *val)
+nxt_otel_attr_str(nxt_otel_attr_batch_t *batch, nxt_otel_attr_id_t id,
+    nxt_str_t *val)
 {
-    nxt_str_t  k;
+    nxt_otel_attr_t  *attr;
 
     if (val == NULL || val->start == NULL || val->length == 0) {
+        return;
+    }
+
+    attr = nxt_otel_attr_next(batch, id);
+    if (attr == NULL) {
+        return;
+    }
+
+    attr->type = NXT_OTEL_ATTR_TYPE_STR;
+    attr->ival = 0;
+    attr->sval = *val;
+}
+
+
+/*
+ * Add an integer attribute. The semantic conventions type these as integers,
+ * and passing one as an integer avoids a sprintf round-trip on the request
+ * path as well as being the correct value type on the wire.
+ */
+static void
+nxt_otel_attr_i64(nxt_otel_attr_batch_t *batch, nxt_otel_attr_id_t id,
+    int64_t val)
+{
+    nxt_otel_attr_t  *attr;
+
+    attr = nxt_otel_attr_next(batch, id);
+    if (attr == NULL) {
+        return;
+    }
+
+    attr->type = NXT_OTEL_ATTR_TYPE_I64;
+    attr->ival = val;
+    nxt_memzero(&attr->sval, sizeof(nxt_str_t));
+}
+
+
+static void
+nxt_otel_attr_flush(nxt_http_request_t *r, nxt_otel_attr_batch_t *batch)
+{
+    if (batch->n == 0) {
         return;
     }
 
@@ -71,10 +138,7 @@ nxt_otel_add_attr(nxt_http_request_t *r, const char *key, nxt_str_t *val)
         return;
     }
 
-    k.start = (u_char *) key;
-    k.length = nxt_strlen(key);
-
-    nxt_otel_rs_add_attr(r->otel->trace, &k, val);
+    nxt_otel_rs_add_attrs(r->otel->trace, batch->attrs, batch->n);
 }
 
 
@@ -168,21 +232,24 @@ nxt_otel_propagate_header(nxt_task_t *task, nxt_http_request_t *r)
 static void
 nxt_otel_span_add_request_attrs(nxt_http_request_t *r)
 {
-    nxt_str_t  val;
+    nxt_str_t              val;
+    nxt_otel_attr_batch_t  batch;
 
     /*
      * Record only well-defined semconv attributes. We deliberately do NOT
      * iterate every request header: that would leak sensitive values
      * (Authorization, Cookie, ...) into the telemetry backend.
      */
-    nxt_otel_add_attr(r, NXT_OTEL_METHOD_TAG, r->method);
-    nxt_otel_add_attr(r, NXT_OTEL_PATH_TAG, r->path);
+    nxt_otel_attr_batch_init(&batch);
+
+    nxt_otel_attr_str(&batch, NXT_OTEL_ATTR_METHOD, r->method);
+    nxt_otel_attr_str(&batch, NXT_OTEL_ATTR_PATH, r->path);
 
     nxt_str_set(&val, "http");
     if (r->tls) {
         nxt_str_set(&val, "https");
     }
-    nxt_otel_add_attr(r, NXT_OTEL_SCHEME_TAG, &val);
+    nxt_otel_attr_str(&batch, NXT_OTEL_ATTR_SCHEME, &val);
 
     /* "HTTP/1.1" -> "1.1" for network.protocol.version */
     val = r->version;
@@ -192,21 +259,23 @@ nxt_otel_span_add_request_attrs(nxt_http_request_t *r)
         val.start += nxt_length("HTTP/");
         val.length -= nxt_length("HTTP/");
     }
-    nxt_otel_add_attr(r, NXT_OTEL_FLAVOR_TAG, &val);
+    nxt_otel_attr_str(&batch, NXT_OTEL_ATTR_FLAVOR, &val);
 
     if (r->user_agent != NULL) {
         val.start = r->user_agent->value;
         val.length = r->user_agent->value_length;
-        nxt_otel_add_attr(r, NXT_OTEL_USER_AGENT_TAG, &val);
+        nxt_otel_attr_str(&batch, NXT_OTEL_ATTR_USER_AGENT, &val);
     }
 
-    nxt_otel_add_attr(r, NXT_OTEL_SERVER_ADDR_TAG, &r->host);
+    nxt_otel_attr_str(&batch, NXT_OTEL_ATTR_SERVER_ADDR, &r->host);
 
     if (r->remote != NULL) {
         val.start = nxt_sockaddr_address(r->remote);
         val.length = r->remote->address_length;
-        nxt_otel_add_attr(r, NXT_OTEL_CLIENT_ADDR_TAG, &val);
+        nxt_otel_attr_str(&batch, NXT_OTEL_ATTR_CLIENT_ADDR, &val);
     }
+
+    nxt_otel_attr_flush(r, &batch);
 }
 
 
@@ -244,11 +313,8 @@ nxt_otel_span_add_headers(nxt_task_t *task, nxt_http_request_t *r)
 static void
 nxt_otel_span_add_body(nxt_http_request_t *r)
 {
-    size_t     body_size = 0;
-    size_t     buf_size;
-    u_char     *body_buf, *body_size_buf;
-    nxt_int_t  cur;
-    nxt_str_t  body_val;
+    size_t                 body_size = 0;
+    nxt_otel_attr_batch_t  batch;
 
     if (!r->otel->recording) {
         nxt_otel_state_transition(r->otel, NXT_OTEL_COLLECT_STATE);
@@ -259,34 +325,10 @@ nxt_otel_span_add_body(nxt_http_request_t *r)
         body_size = nxt_buf_used_size(r->body);
     }
 
-    buf_size = 1; // first digit
-    if (body_size != 0) {
-        buf_size += log10(body_size); // subsequent digits
-    }
-    buf_size += 1; // \0
-    buf_size += nxt_strlen(NXT_OTEL_BODY_SIZE_TAG);
-    buf_size += 1; // \0
+    nxt_otel_attr_batch_init(&batch);
+    nxt_otel_attr_i64(&batch, NXT_OTEL_ATTR_BODY_SIZE, (int64_t) body_size);
+    nxt_otel_attr_flush(r, &batch);
 
-    body_buf = nxt_mp_alloc(r->mem_pool, buf_size);
-    if (nxt_slow_path(body_buf == NULL)) {
-        return;
-    }
-
-    cur = sprintf((char *) body_buf, "%lu", body_size);
-    if (cur < 0) {
-        return;
-    }
-
-    cur += 1;
-    body_size_buf = body_buf + cur;
-    nxt_cpystr(body_buf + cur, (const u_char *) NXT_OTEL_BODY_SIZE_TAG);
-
-    body_val = (nxt_str_t) {
-        .start  = body_buf,
-        .length = nxt_strlen(body_buf),
-    };
-
-    nxt_otel_add_attr(r, (const char *) body_size_buf, &body_val);
     nxt_otel_state_transition(r->otel, NXT_OTEL_COLLECT_STATE);
 }
 
@@ -294,16 +336,17 @@ nxt_otel_span_add_body(nxt_http_request_t *r)
 static void
 nxt_otel_span_add_status(nxt_task_t *task, nxt_http_request_t *r)
 {
-    int                     n;
-    u_char                  status_buf[8];
     const char              *type_name;
     nxt_str_t               val;
     nxt_app_t               *app;
+    nxt_otel_attr_batch_t   batch;
     nxt_request_rpc_data_t  *rpc;
 
     if (r->otel == NULL || r->otel->trace == NULL || !r->otel->recording) {
         return;
     }
+
+    nxt_otel_attr_batch_init(&batch);
 
     /*
      * Application identity is resolved during routing, so it is only known by
@@ -313,32 +356,21 @@ nxt_otel_span_add_status(nxt_task_t *task, nxt_http_request_t *r)
     rpc = r->req_rpc_data;
     if (rpc != NULL && rpc->app != NULL) {
         app = rpc->app;
-        nxt_otel_add_attr(r, NXT_OTEL_APP_NAME_TAG, &app->name);
+        nxt_otel_attr_str(&batch, NXT_OTEL_ATTR_APP_NAME, &app->name);
 
         type_name = nxt_otel_app_type_name(app->type);
         val.start = (u_char *) type_name;
         val.length = nxt_strlen(type_name);
-        nxt_otel_add_attr(r, NXT_OTEL_APP_TYPE_TAG, &val);
+        nxt_otel_attr_str(&batch, NXT_OTEL_ATTR_APP_TYPE, &val);
     }
 
     // dont bother logging an unset status
-    if (r->status == 0) {
-        return;
+    if (r->status != 0) {
+        nxt_otel_attr_i64(&batch, NXT_OTEL_ATTR_STATUS_CODE,
+                          (int64_t) r->status);
     }
 
-    n = snprintf((char *) status_buf, sizeof(status_buf), "%d",
-                 (int) r->status);
-    /*
-     * snprintf() returns the length it *would* have written; on truncation
-     * that exceeds the buffer, so only record the attribute when the value
-     * fully fit -- a truncated status code is meaningless anyway, and using
-     * the would-have-been length as val.length would read past status_buf.
-     */
-    if (n > 0 && n < (int) sizeof(status_buf)) {
-        val.start = status_buf;
-        val.length = (size_t) n;
-        nxt_otel_add_attr(r, NXT_OTEL_STATUS_CODE_TAG, &val);
-    }
+    nxt_otel_attr_flush(r, &batch);
 
     /* Flag server errors so the span shows Status::Error in the collector. */
     if (r->status >= NXT_HTTP_INTERNAL_SERVER_ERROR) {

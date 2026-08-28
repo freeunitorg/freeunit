@@ -118,6 +118,41 @@ def _require_otel():
     _configure_or_skip(1)
 
 
+STATUS_CODE_KEY = b'http.response.status_code'
+
+
+def _otlp_int_value(value):
+    """Encode an OTLP AnyValue int_value as it appears on the wire.
+
+    int_value is field 3 of AnyValue with varint wire type, so the tag byte is
+    (3 << 3) | 0 == 0x18, followed by the value as a base-128 varint.
+    """
+    out = bytearray(b'\x18')
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        out.append(byte | 0x80 if value else byte)
+        if not value:
+            return bytes(out)
+
+
+def _has_keyed_int_attr(body, key, value):
+    """Whether `key` is followed by an int_value attribute equal to `value`.
+
+    The dump holds raw trace ids, span ids and timestamps, so the encoded value
+    can occur anywhere by coincidence. Anchoring the search to the bytes just
+    after each occurrence of the key is what makes this a statement about the
+    attribute rather than about the payload.
+    """
+    want = _otlp_int_value(value)
+    at = body.find(key)
+    while at != -1:
+        if want in body[at + len(key):at + len(key) + 16]:
+            return True
+        at = body.find(key, at + 1)
+    return False
+
+
 def _response_headers_lower(resp):
     return {k.lower(): v for k, v in resp['headers'].items()}
 
@@ -182,11 +217,15 @@ def test_otel_span_exported_with_service_name(tmp_path, protocol):
 def test_otel_span_5xx_status(tmp_path, protocol):
     """A 5xx response is still traced and the span records the error status.
 
-    The status_code attribute is emitted as a string (sprintf "%d"), so the
-    literal `503` travels in the OTLP payload. Per the 1.35.6 fix, 503 >= 500
-    also marks the span Status::Error (nxt_otel_rs_set_error); that enum is not
-    asserted here (it is not a literal in the protobuf), but the status_code
-    value is the concrete, reliable signal.
+    http.response.status_code is an OTLP *integer* attribute, so 503 travels as
+    a varint rather than the ASCII bytes `503`: in AnyValue, int_value is field
+    3, giving tag 0x18 followed by varint 503 (0xf7 0x03). Asserting on those
+    bytes is what distinguishes a correctly typed integer attribute from the
+    stringified one the semantic conventions do not ask for.
+
+    Per the 1.35.6 fix, 503 >= 500 also marks the span Status::Error
+    (nxt_otel_rs_set_error); that enum is not asserted here (it is a protobuf
+    enum, not a literal).
     """
     port = _get_free_port()
     dump = str(tmp_path / 'otlp_dump.bin')
@@ -208,11 +247,11 @@ def test_otel_span_5xx_status(tmp_path, protocol):
             '503', 'routes/0/action/return'
         ), 'switch route to return 503'
 
-        # Fire 503s until the error span reaches the collector. status_code is
-        # emitted as the string "503" (sprintf "%d"); per the 1.35.6 fix,
-        # 503 >= 500 also marks the span Status::Error (not asserted here -- it
-        # is a protobuf enum, not a literal). Only the 503 requests can add the
-        # "503" bytes, so the readiness 200 spans don't false-positive.
+        # Fire 503s until the error span reaches the collector. The wait
+        # condition is the same keyed check as the assertion below: a bare
+        # substring search would also match a trace id or timestamp that
+        # happens to contain these bytes, ending the poll before the 503 span
+        # was actually exported.
         body = b''
         found = False
         for _ in range(int(EXPORT_TIMEOUT * 10)):
@@ -224,14 +263,24 @@ def test_otel_span_5xx_status(tmp_path, protocol):
                 with open(dump, 'rb') as f:
                     body = f.read()
 
-                if b'503' in body:
+                if _has_keyed_int_attr(body, STATUS_CODE_KEY, 503):
                     found = True
                     break
 
             time.sleep(0.1)
 
-        assert found, 'span with status_code=503 was not exported'
-        assert b'http.response.status_code' in body, 'status_code attr missing'
+        assert STATUS_CODE_KEY in body, 'status_code attr missing'
+        assert found, (
+            'http.response.status_code must carry 503 as an int_value varint; '
+            'a span with that attribute was never exported'
+        )
+
+        # The readiness spans are still in the same dump and carry int_value
+        # 200, which confirms the keyed search discriminates by value rather
+        # than merely finding the key.
+        assert _has_keyed_int_attr(body, STATUS_CODE_KEY, 200), (
+            'readiness spans should still carry status_code=200'
+        )
     finally:
         _kill(proc)
 
