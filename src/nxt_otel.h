@@ -49,6 +49,26 @@ typedef enum {
 /*
  * One span attribute in a batch.  Mirrored by nxt_otel_attr_t in
  * src/otel/src/lib.rs; the layouts must stay identical.
+ *
+ * The Rust struct is #[repr(C)], so both sides lay their fields out under
+ * the target's C ABI: a change mirrored on both sides, reordering included,
+ * stays in agreement on every target.  What breaks the FFI is editing one
+ * side only, or pairing fields whose types are not the same size and
+ * alignment everywhere we ship -- C long is 4 bytes on ILP32 where Rust i64
+ * is always 8, and C enum sizes are implementation-defined, which is why
+ * key_id and type are uint32_t here rather than nxt_otel_attr_id_t.
+ *
+ * The offsets below are the same on x86-64, armv7 and i386 (the total size
+ * is not: 32 on 64-bit, 24 on 32-bit, where int64_t needs only 4-byte
+ * alignment).  They are asserted rather than described, so that a field
+ * added, reordered or appended here fails the build and prompts the matching
+ * edit on the Rust side, which these assertions cannot see.
+ *
+ * The size assertion is what covers a field appended after sval: the offset
+ * checks alone would all still hold, while the struct grew.  That matters
+ * more than it looks, because these are passed as an array -- a C-side-only
+ * trailing field changes the stride C writes with and not the one Rust reads
+ * with, so every attribute after the first would be misread.
  */
 typedef struct {
     uint32_t   key_id;
@@ -56,6 +76,19 @@ typedef struct {
     int64_t    ival;
     nxt_str_t  sval;
 } nxt_otel_attr_t;
+
+nxt_static_assert(offsetof(nxt_otel_attr_t, key_id) == 0,
+                  "nxt_otel_attr_t layout drifted from src/otel/src/lib.rs");
+nxt_static_assert(offsetof(nxt_otel_attr_t, type) == 4,
+                  "nxt_otel_attr_t layout drifted from src/otel/src/lib.rs");
+nxt_static_assert(offsetof(nxt_otel_attr_t, ival) == 8,
+                  "nxt_otel_attr_t layout drifted from src/otel/src/lib.rs");
+nxt_static_assert(offsetof(nxt_otel_attr_t, sval) == 2 * sizeof(uint32_t)
+                                                     + sizeof(int64_t),
+                  "nxt_otel_attr_t layout drifted from src/otel/src/lib.rs");
+nxt_static_assert(sizeof(nxt_otel_attr_t) == offsetof(nxt_otel_attr_t, sval)
+                                             + sizeof(nxt_str_t),
+                  "nxt_otel_attr_t grew a field Rust does not know about");
 
 
 #if (NXT_HAVE_OTEL)
