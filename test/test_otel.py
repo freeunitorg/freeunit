@@ -314,6 +314,31 @@ def test_otel_sampling_zero_exports_nothing(protocol):
 
 @_skipif_no_fake_otlp
 @pytest.mark.parametrize('protocol', ['http', 'grpc'])
+def test_otel_sampling_zero_still_propagates(protocol):
+    """sampling_ratio=0 → nothing is exported, but context still propagates.
+
+    The request path skips the attribute work for a span the sampler dropped
+    (nxt_otel_span_add_headers, src/nxt_otel.c). Propagation sits outside that
+    gate on purpose: W3C Trace Context requires the traceparent to reach the
+    peer and the application whatever the sampling decision was, so a
+    downstream service can join -- or knowingly decline to join -- the trace.
+    """
+    port = _get_free_port()
+    proc = _run_fake_otlp(port, protocol=protocol)  # run forever, absorb exports
+    try:
+        _configure_or_skip(port, sampling_ratio=0.0, protocol=protocol)
+
+        resp = _get_until_header('traceparent')
+        assert resp['status'] == 200
+        assert 'traceparent' in _response_headers_lower(resp), (
+            'an unsampled request must still carry a traceparent header'
+        )
+    finally:
+        _kill(proc)
+
+
+@_skipif_no_fake_otlp
+@pytest.mark.parametrize('protocol', ['http', 'grpc'])
 def test_otel_traceparent_malformed(protocol):
     """A malformed inbound traceparent is ignored and the trace restarted.
 
