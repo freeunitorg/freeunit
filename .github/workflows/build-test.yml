@@ -308,7 +308,8 @@ jobs:
 
       - name: Install libperl-dev
         run: |
-          sudo apt-get install libperl-dev
+          sudo apt-get -y update
+          sudo apt-get -y install libperl-dev
         if: steps.metadata.outputs.module == 'perl'
 
       - name: Configure perl
