@@ -1671,6 +1671,53 @@ nxt_openssl_conn_error(nxt_task_t *task, nxt_err_t err, const char *fmt, ...)
 }
 
 
+/*
+ * OpenSSL 4.0 renamed the SSLv3-era alert reason codes to SSL_R_TLS_ALERT_*
+ * and removed the old spellings, so a build against it with deprecated APIs
+ * disabled cannot see SSL_R_SSLV3_ALERT_*.  1.1.1 and 3.x have only the old
+ * names.  Define the new spelling in terms of the old one where it is
+ * missing, so the switch below needs one spelling rather than a version
+ * conditional per label.
+ *
+ * The SSL_R_TLSV1_ALERT_* codes are deliberately not bridged: 4.0 kept those
+ * names, and no SSL_R_TLS_ALERT_ spelling exists for them.
+ */
+
+#ifndef SSL_R_TLS_ALERT_UNEXPECTED_MESSAGE
+#define SSL_R_TLS_ALERT_UNEXPECTED_MESSAGE  SSL_R_SSLV3_ALERT_UNEXPECTED_MESSAGE
+#endif
+#ifndef SSL_R_TLS_ALERT_BAD_RECORD_MAC
+#define SSL_R_TLS_ALERT_BAD_RECORD_MAC  SSL_R_SSLV3_ALERT_BAD_RECORD_MAC
+#endif
+#ifndef SSL_R_TLS_ALERT_DECOMPRESSION_FAILURE
+#define SSL_R_TLS_ALERT_DECOMPRESSION_FAILURE  SSL_R_SSLV3_ALERT_DECOMPRESSION_FAILURE
+#endif
+#ifndef SSL_R_TLS_ALERT_HANDSHAKE_FAILURE
+#define SSL_R_TLS_ALERT_HANDSHAKE_FAILURE  SSL_R_SSLV3_ALERT_HANDSHAKE_FAILURE
+#endif
+#ifndef SSL_R_TLS_ALERT_ILLEGAL_PARAMETER
+#define SSL_R_TLS_ALERT_ILLEGAL_PARAMETER  SSL_R_SSLV3_ALERT_ILLEGAL_PARAMETER
+#endif
+#ifndef SSL_R_TLS_ALERT_NO_CERTIFICATE
+#define SSL_R_TLS_ALERT_NO_CERTIFICATE  SSL_R_SSLV3_ALERT_NO_CERTIFICATE
+#endif
+#ifndef SSL_R_TLS_ALERT_BAD_CERTIFICATE
+#define SSL_R_TLS_ALERT_BAD_CERTIFICATE  SSL_R_SSLV3_ALERT_BAD_CERTIFICATE
+#endif
+#ifndef SSL_R_TLS_ALERT_UNSUPPORTED_CERTIFICATE
+#define SSL_R_TLS_ALERT_UNSUPPORTED_CERTIFICATE  SSL_R_SSLV3_ALERT_UNSUPPORTED_CERTIFICATE
+#endif
+#ifndef SSL_R_TLS_ALERT_CERTIFICATE_REVOKED
+#define SSL_R_TLS_ALERT_CERTIFICATE_REVOKED  SSL_R_SSLV3_ALERT_CERTIFICATE_REVOKED
+#endif
+#ifndef SSL_R_TLS_ALERT_CERTIFICATE_EXPIRED
+#define SSL_R_TLS_ALERT_CERTIFICATE_EXPIRED  SSL_R_SSLV3_ALERT_CERTIFICATE_EXPIRED
+#endif
+#ifndef SSL_R_TLS_ALERT_CERTIFICATE_UNKNOWN
+#define SSL_R_TLS_ALERT_CERTIFICATE_UNKNOWN  SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN
+#endif
+
+
 static nxt_uint_t
 nxt_openssl_log_error_level(nxt_err_t err)
 {
@@ -1728,21 +1775,21 @@ nxt_openssl_log_error_level(nxt_err_t err)
     case SSL_R_SCSV_RECEIVED_WHEN_RENEGOTIATING:          /*  345 */
 #endif
     case 1000:/* SSL_R_SSLV3_ALERT_CLOSE_NOTIFY */
-    case SSL_R_SSLV3_ALERT_UNEXPECTED_MESSAGE:            /* 1010 */
-    case SSL_R_SSLV3_ALERT_BAD_RECORD_MAC:                /* 1020 */
+    case SSL_R_TLS_ALERT_UNEXPECTED_MESSAGE:            /* 1010 */
+    case SSL_R_TLS_ALERT_BAD_RECORD_MAC:                /* 1020 */
     case SSL_R_TLSV1_ALERT_DECRYPTION_FAILED:             /* 1021 */
     case SSL_R_TLSV1_ALERT_RECORD_OVERFLOW:               /* 1022 */
-    case SSL_R_SSLV3_ALERT_DECOMPRESSION_FAILURE:         /* 1030 */
-    case SSL_R_SSLV3_ALERT_HANDSHAKE_FAILURE:             /* 1040 */
-    case SSL_R_SSLV3_ALERT_ILLEGAL_PARAMETER:             /* 1047 */
+    case SSL_R_TLS_ALERT_DECOMPRESSION_FAILURE:         /* 1030 */
+    case SSL_R_TLS_ALERT_HANDSHAKE_FAILURE:             /* 1040 */
+    case SSL_R_TLS_ALERT_ILLEGAL_PARAMETER:             /* 1047 */
         break;
 
-    case SSL_R_SSLV3_ALERT_NO_CERTIFICATE:                /* 1041 */
-    case SSL_R_SSLV3_ALERT_BAD_CERTIFICATE:               /* 1042 */
-    case SSL_R_SSLV3_ALERT_UNSUPPORTED_CERTIFICATE:       /* 1043 */
-    case SSL_R_SSLV3_ALERT_CERTIFICATE_REVOKED:           /* 1044 */
-    case SSL_R_SSLV3_ALERT_CERTIFICATE_EXPIRED:           /* 1045 */
-    case SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN:           /* 1046 */
+    case SSL_R_TLS_ALERT_NO_CERTIFICATE:                /* 1041 */
+    case SSL_R_TLS_ALERT_BAD_CERTIFICATE:               /* 1042 */
+    case SSL_R_TLS_ALERT_UNSUPPORTED_CERTIFICATE:       /* 1043 */
+    case SSL_R_TLS_ALERT_CERTIFICATE_REVOKED:           /* 1044 */
+    case SSL_R_TLS_ALERT_CERTIFICATE_EXPIRED:           /* 1045 */
+    case SSL_R_TLS_ALERT_CERTIFICATE_UNKNOWN:           /* 1046 */
     case SSL_R_TLSV1_ALERT_UNKNOWN_CA:                    /* 1048 */
     case SSL_R_TLSV1_ALERT_ACCESS_DENIED:                 /* 1049 */
     case SSL_R_TLSV1_ALERT_DECODE_ERROR:                  /* 1050 */
