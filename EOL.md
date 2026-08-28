@@ -45,7 +45,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Fedora | 43 | 2026-12 | 2029-12 | 3.14 |
 | Fedora | 44 | 2027-06 | 2030-06 | 3.14 |
 | CentOS Stream | 9 | 2027-05 | 2030-05 | 3.11 |
-| CentOS Stream | 10 | 2030-01 | 2033-01 | 3.13 |
+| CentOS Stream | 10 | 2030-05 | 2033-05 | 3.13 |
 | Amazon Linux | 2 | 2026-06 | 2029-06 | 3.7 ‡ |
 | Amazon Linux | 2023 | 2029-06 | 2032-06 | 3.11 |
 | Ubuntu (LTS) | 22.04 | 2027-04 | 2030-04 | 3.10 |
@@ -66,6 +66,26 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 † Past upstream EOL; in FreeUnit grace period.
 ‡ Default Python shipped by this OS is itself past upstream EOL. FreeUnit does not backport fixes to that Python version.
 
+## Dependency Support
+
+Build-time and bundled libraries. These are **not** matrix variants — nothing in
+Docker or CI derives an image from this table — so the 1-year grace rule does not
+apply to them. Machine-readable copy: the `dependencies` key in `pkg/eol.json`.
+
+† Bundled software that is already past upstream EOL. It carries no FreeUnit "drops"
+date, because the grace policy applies to matrix variants, not to vendored jars; it
+needs an upgrade or replacement decision instead.
+
+| Dependency | Role | Floor / Version | Upstream EOL | Notes |
+|------------|------|-----------------|--------------|-------|
+| OpenSSL | TLS backend (`--openssl`) | 1.1.1 (floor) | Sep 2023 | Kept because RHEL 8, Amazon Linux 2 (`openssl11-devel`) and Debian 11 ship it. Floor declared by the `auto/ssltls` probe (PR #224). |
+| OpenSSL | tested ceiling | 3.6.2 (CI build) | Nov 2026 | `build-test.yml` builds it into `/opt/openssl-3.6` (`OPENSSL_VERSION`). **The pin needs a bump before 2026-11-01** (3.5 is the LTS, EOL Apr 2030). |
+| OpenSSL | tested ceiling | 4.0.2 (CI build) | May 2027 | The `openssl4` job builds it into `/opt/openssl-4.0` (`OPENSSL4_VERSION`) and compiles with `-DOPENSSL_NO_DEPRECATED`, so any use of an API 4.0 deprecates fails the build. |
+| Apache Tomcat | Servlet/JSP/EL API + Jasper jars bundled by the Java module | 9.0.x | Mar 2027 ([no earlier than](https://tomcat.apache.org/whichversion.html)) | Bundled by `auto/modules/java`; independent of the JDK variant. |
+| Eclipse Jetty | `jetty-util` / `jetty-server` / `jetty-http` jars bundled by the Java module | 9.4.58.v20250814 | **Aug 2025 (EOL)** † | Jetty 9.4 lost community support on 2025-08-14 and the bundled build is its last release. Needs an upgrade-or-replace decision — Jetty 10/11 are EOL too; 12.x is the supported line. |
+| Eclipse ECJ (JDT batch compiler) | JSP compilation jar bundled by the Java module | 3.26.0 | none published | Tracks Eclipse releases; endoflife.date has no product for it. Pinned build is from Jun 2021; current is 3.42.0 (Jun 2025). |
+| ClassGraph | classpath scanning jar bundled by the Java module | latest | — | No upstream EOL schedule; pinned and bumped as needed. |
+
 ## Rules
 
 - **Adding a runtime version:** when new upstream release reaches stable, FreeUnit adds
@@ -77,6 +97,9 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 - **Security-only mode:** versions within 6 months of the FreeUnit drop date receive
   security fixes only — no new features backported.
 - **LTS runtimes (Java 17/21/25):** follow the upstream LTS schedule strictly.
+- **Dependencies:** the floors in the Dependency Support section are not part of the
+  EOL + grace policy; they track what FreeUnit builds and bundles, not what it ships
+  as a variant.
 - **LTS OS (Ubuntu, RHEL, Debian):** 3-year extension applies to standard EOL, not
   extended security maintenance dates.
 

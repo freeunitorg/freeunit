@@ -15,7 +15,7 @@
     ],
     "centos_stream": [
       {"version": "9",  "eol": "2027-05", "supported_until": "2030-05", "default_python": "3.11"},
-      {"version": "10", "eol": "2030-01", "supported_until": "2033-01", "default_python": "3.13"}
+      {"version": "10", "eol": "2030-05", "supported_until": "2033-05", "default_python": "3.13"}
     ],
     "amazonlinux": [
       {"version": "2",    "eol": "2026-06", "supported_until": "2029-06", "default_python": "3.7",  "default_python_note": "OS-shipped; Python 3.7 upstream EOL Jun 2023"},
@@ -50,8 +50,8 @@
       {"version": "1.26", "eol": "2027-02", "supported_until": "2028-02"}
     ],
     "java": [
-      {"version": "17", "eol": "2027-10", "supported_until": "2028-10", "base": "eclipse-temurin"},
-      {"version": "21", "eol": "2029-12", "supported_until": "2030-12", "base": "eclipse-temurin"},
+      {"version": "17", "eol": "2027-10", "supported_until": "2028-10", "base": "eclipse-temurin", "lts": true},
+      {"version": "21", "eol": "2029-12", "supported_until": "2030-12", "base": "eclipse-temurin", "lts": true},
       {"version": "25", "eol": "2031-09", "supported_until": "2032-09", "base": "eclipse-temurin", "lts": true},
       {"version": "26", "eol": "2026-09", "supported_until": "2027-09", "base": "eclipse-temurin"}
     ],
@@ -87,5 +87,45 @@
     "minimal": [
       {"version": null, "eol": null, "supported_until": null}
     ]
+  },
+  "_comment_dependencies": "Build-time and bundled library floors/ceilings. NOT a matrix: only .os and .runtimes feed the Docker/CI variant lists (build-test.yml, release-docker.yml, pkg/docker/Makefile, pkg/docker/build-local.sh), and pkg/eol/src/main.rs reads only _grace_*, .os and .runtimes — unknown top-level keys are ignored. Entries here are documentation for humans; the EOL + grace policy does not apply to them, so they carry no supported_until.",
+  "dependencies": {
+    "openssl": {
+      "role": "TLS backend (./configure --openssl)",
+      "floor": "1.1.1",
+      "floor_eol": "2023-09",
+      "floor_note": "Upstream-EOL but still supported by FreeUnit because it is what RHEL 8, Amazon Linux 2 (openssl11-devel, see pkg/rpm/Makefile and pkg/rpm/unit.spec.in) and Debian 11 ship, and all three are inside the OS support window above.",
+      "floor_declared_by": "auto/ssltls probe (PR #224), which also drops the pre-1.1.0 compatibility code in src/nxt_openssl.c",
+      "tested_ceiling": "3.6.2 and 4.0.2",
+      "tested_ceiling_note": "build-test.yml tests two ceilings from source: 3.6.2 (OPENSSL_VERSION env, built into /opt/openssl-3.6) and 4.0.2 (OPENSSL4_VERSION env, /opt/openssl-4.0, built by the openssl4 job with --cc-opt=-DOPENSSL_NO_DEPRECATED so any use of an API OpenSSL 4.0 deprecates fails the build). ACTION: OpenSSL 3.6 goes upstream-EOL 2026-11-01, so the OPENSSL_VERSION pin needs a bump to a supported branch (3.5 is the LTS, EOL 2030-04); 4.0 is supported to 2027-05.",
+      "source": "https://endoflife.date/api/openssl.json"
+    },
+    "tomcat": {
+      "role": "Servlet/JSP/EL API + Jasper jars bundled by the java module (auto/modules/java, NXT_TOMCAT_VERSION)",
+      "version": "9.0.x",
+      "eol": "2027-03",
+      "eol_note": "Apache: \"End of support for Tomcat 9.0.x is expected no earlier than 31 March 2027\", with at least 12 months notice. Not a Docker variant — the jars are bundled into the java module regardless of JDK version.",
+      "source": "https://tomcat.apache.org/whichversion.html"
+    },
+    "jetty": {
+      "role": "HTTP parsing/server jars bundled by the java module (auto/modules/java, NXT_JAR_VERSION under org/eclipse/jetty/): jetty-util, jetty-server, jetty-http",
+      "version": "9.4.58.v20250814",
+      "eol": "2025-08",
+      "eol_note": "ALREADY EOL. Eclipse ended community support for the Jetty 9.4 line on 2025-08-14, and 9.4.58.v20250814 — the exact build bundled here — is its final release (jetty.org/download.html lists it as (EOL); the 9.4 row reads \"2016-2025 ... EOL / Unsupported\"). No supported_until is recorded: the EOL + grace policy covers matrix variants, not bundled jars, and this needs an upgrade-or-replace decision (Jetty 10/11 are also EOL as of 2025-01-01; 12.0/12.1 are the supported lines and require Java 11+/17+), not a grace window.",
+      "source": "https://endoflife.date/api/eclipse-jetty.json"
+    },
+    "ecj": {
+      "role": "Eclipse JDT batch compiler jar bundled by the java module (auto/modules/java, org/eclipse/jdt/), used to compile JSPs at runtime",
+      "version": "3.26.0",
+      "eol": null,
+      "eol_note": "Tracks Eclipse releases; no published EOL. endoflife.date has no product for it (checked /api/all.json — the only Eclipse products are eclipse-jetty and eclipse-temurin), so there is no upstream date to validate against. The pinned 3.26.0 is from 2021-06-14; the current release is 3.42.0 (2025-06-07), so this is stale rather than expired.",
+      "source": "https://central.sonatype.com/artifact/org.eclipse.jdt/ecj/versions"
+    },
+    "classgraph": {
+      "role": "classpath scanning jar bundled by the java module (auto/modules/java, NXT_JAR_VERSION)",
+      "version": "latest",
+      "note": "No floor and no EOL schedule upstream: pinned to the current release and bumped as needed.",
+      "source": "https://github.com/classgraph/classgraph/releases"
+    }
   }
 }
