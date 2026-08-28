@@ -43,7 +43,9 @@ custom_error! {pub UnitClientError
     HttpResponseJsonBodyError { status: http::StatusCode,
                                 path: String,
                                 error: String,
-                                detail: String} = "HTTP response error [path={path}, status={status}]:\n  Error: {error}\n  Detail: {detail}",
+                                detail: String,
+                                location: String,
+                                suggestion: String} = "HTTP response error [path={path}, status={status}]:\n  Error: {error}\n  Detail: {detail}{location}{suggestion}",
     IoError { source: io::Error, socket: String } = "IO error [socket={socket}]",
     UnixSocketAddressError {
         source: io::Error,
@@ -165,6 +167,50 @@ pub struct UnitClient {
     client: Box<RemoteClient>,
 }
 
+/// Pulls the parts of a control API error body out for display: the message, the
+/// detail, where the error is, and the name a typo probably meant.  The last two
+/// come back pre-formatted, empty when they do not apply, so a response carrying
+/// neither renders exactly as it did before they existed.
+fn describe_error_body(body: &serde_json::Value) -> (String, String, String, String) {
+    let member = |name: &str| {
+        body.get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let mut error = member("error");
+    if error.is_empty() {
+        error = "Unknown error".to_string();
+    }
+
+    // A validation error places itself with an RFC 6901 pointer, where the empty
+    // string is the document root; an error found while parsing the request has
+    // no pointer and places itself by position instead.
+    let place = body.get("location").and_then(|location| {
+        let number = |name: &str| location.get(name).and_then(serde_json::Value::as_i64);
+
+        match location.get("path").and_then(serde_json::Value::as_str) {
+            Some("") => Some("the document root".to_string()),
+            Some(pointer) => Some(pointer.to_string()),
+            None => match (number("line"), number("column"), number("offset")) {
+                (Some(line), Some(column), _) => Some(format!("line {}, column {}", line, column)),
+                (_, _, Some(offset)) => Some(format!("byte offset {}", offset)),
+                _ => None,
+            },
+        }
+    });
+
+    let location = place.map(|place| format!("\n  Location: {}", place)).unwrap_or_default();
+
+    let suggestion = match member("suggestion").as_str() {
+        "" => String::new(),
+        name => format!("\n  Did you mean: {}", name),
+    };
+
+    (error, member("detail"), location, suggestion)
+}
+
 impl UnitClient {
     pub fn new(control_socket: ControlSocket) -> Self {
         if control_socket.is_local_socket() {
@@ -228,17 +274,27 @@ impl UnitClient {
 
         let mut reader = body_bytes.reader();
         if !status.is_success() {
-            let error: HashMap<String, String> =
+            // The control API answers an error with "error" and, where they
+            // apply, "detail", a "location" object placing the error, and a
+            // "suggestion" naming the parameter an unknown one was probably a
+            // typo of.  "location" is an object, so the body is not a map of
+            // strings and must not be deserialized as one: that fails the
+            // whole body and hides the message it carries.
+            let body: serde_json::Value =
                 serde_json::from_reader(&mut reader).map_err(|error| UnitClientError::JsonError {
                     source: error,
                     path: path.to_string(),
                 })?;
 
+            let (error, detail, location, suggestion) = describe_error_body(&body);
+
             return Err(UnitClientError::HttpResponseJsonBodyError {
                 status,
                 path: path.to_string(),
-                error: error.get("error").unwrap_or(&"Unknown error".into()).to_string(),
-                detail: error.get("detail").unwrap_or(&"".into()).to_string(),
+                error,
+                detail,
+                location,
+                suggestion,
             });
         }
         serde_json::from_reader(&mut reader).map_err(|error| UnitClientError::JsonError {
@@ -370,6 +426,63 @@ mod tests {
     use crate::unitd_instance::UnitdInstance;
 
     use super::*;
+
+    /// The shapes nxt_controller_response() can send, and how each renders.
+    #[test]
+    fn describes_every_error_body_shape() {
+        let case = |body: serde_json::Value| {
+            let (error, detail, location, suggestion) = describe_error_body(&body);
+            format!("{}|{}|{}|{}", error, detail, location, suggestion)
+        };
+
+        // A plain error, as before location and suggestion existed: both parts
+        // must be empty so the rendered message is unchanged.
+        assert_eq!(
+            case(serde_json::json!({"error": "Value doesn't exist."})),
+            "Value doesn't exist.|||"
+        );
+
+        // A validation error: an RFC 6901 pointer at the member at fault.
+        assert_eq!(
+            case(serde_json::json!({
+                "error": "Invalid configuration.",
+                "detail": "Unknown parameter \"pas\".",
+                "location": {"path": "/routes/0/action"},
+                "suggestion": "pass"
+            })),
+            "Invalid configuration.|Unknown parameter \"pas\".|\n  Location: /routes/0/action|\n  Did you mean: pass"
+        );
+
+        // The empty pointer is the document root, not a missing value.
+        assert_eq!(
+            case(serde_json::json!({"error": "Invalid configuration.",
+                                    "location": {"path": ""}})),
+            "Invalid configuration.||\n  Location: the document root|"
+        );
+
+        // An error found while parsing places itself by position: no pointer.
+        assert_eq!(
+            case(serde_json::json!({"error": "Invalid JSON.",
+                                    "location": {"offset": 12, "line": 2, "column": 5}})),
+            "Invalid JSON.||\n  Location: line 2, column 5|"
+        );
+
+        // Offset without line/column, which the controller sends when the
+        // position is known but not the line.
+        assert_eq!(
+            case(serde_json::json!({"error": "Invalid JSON.", "location": {"offset": 12}})),
+            "Invalid JSON.||\n  Location: byte offset 12|"
+        );
+
+        // Nothing usable in location, and a body that is not an object at all:
+        // neither may panic or invent a location.
+        assert_eq!(
+            case(serde_json::json!({"error": "Invalid JSON.", "location": {}})),
+            "Invalid JSON.|||"
+        );
+        assert_eq!(case(serde_json::json!("not an object")), "Unknown error|||");
+    }
+
     // Integration tests
 
     #[tokio::test]
