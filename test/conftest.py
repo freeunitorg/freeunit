@@ -521,7 +521,22 @@ def unit_run(state_dir=None):
         # router, app workers) shares one group we can signal as a unit — and
         # which can never be confused with the pytest runner's own group or an
         # unrelated unitd already running on the box.
-        p = subprocess.Popen(unitd_args, stderr=log, start_new_session=True)
+        # UNIT_PYTHONHOME pins the embedded interpreter's stdlib to the
+        # prefix unit's python module was built against.  It cannot be passed
+        # as PYTHONHOME from outside: unitd inherits this process's
+        # environment, and PYTHONHOME here would also rebind pytest's own
+        # interpreter, dropping dist-packages (where pytest itself lives) from
+        # its sys.path.  Needed when unit is built against a non-system
+        # interpreter whose minor version matches the system one, because
+        # CPython then resolves its prefix by finding "python3" on PATH.
+        unitd_env = os.environ.copy()
+        pythonhome = unitd_env.pop('UNIT_PYTHONHOME', None)
+        if pythonhome:
+            unitd_env['PYTHONHOME'] = pythonhome
+
+        p = subprocess.Popen(
+            unitd_args, stderr=log, start_new_session=True, env=unitd_env
+        )
         unit_instance['process'] = p
 
     # Record the group id (== leader pid) immediately, on disk and in-memory,

@@ -271,7 +271,7 @@ jobs:
 
       - name: Configure java
         run: |
-          sudo ./configure java
+          sudo ./configure java --home="$(readlink -f "${JAVA_HOME}")"
         if: steps.metadata.outputs.module == 'java'
 
       - name: Make java
@@ -357,9 +357,19 @@ jobs:
           python-version: '${{ steps.metadata.outputs.version }}'
         if: steps.metadata.outputs.module == 'python'
 
+      # A second setup-python below installs python-version '3' for pytest and
+      # overwrites pythonLocation with whatever the newest 3.x is.  Record the
+      # matrix interpreter's prefix while it is still the current one.
+      - name: Record python prefix
+        run: |
+          echo "UNIT_PYTHON_PREFIX=${pythonLocation}" >> "$GITHUB_ENV"
+        if: steps.metadata.outputs.module == 'python'
+
       - name: Configure python3
         run: |
-          sudo ./configure python --config=python3-config
+          sudo ./configure python \
+            --config="${UNIT_PYTHON_PREFIX}/bin/python3-config" \
+            --lib-path="${UNIT_PYTHON_PREFIX}/lib"
         if: steps.metadata.outputs.module == 'python'
 
       - name: Make python3
@@ -501,6 +511,11 @@ jobs:
 
       - name: Run ${{ steps.metadata.outputs.module }} tests
         run: |
+          # Pin unitd's embedded interpreter to the toolcache prefix it was
+          # built against; conftest turns this into PYTHONHOME for unitd only.
+          if [ "${{ steps.metadata.outputs.module }}" == "python" ]; then
+            export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
+          fi
           if [ "${{ matrix.build }}" == "wasm-wasi-component" ]; then
             pytest-3 --print-log ${{ steps.metadata.outputs.testpath }}
           else
