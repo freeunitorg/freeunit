@@ -107,7 +107,6 @@ static void
 nxt_otel_propagate_header(nxt_task_t *task, nxt_http_request_t *r)
 {
     u_char            *traceval;
-    nxt_str_t         traceparent_name, traceparent;
     nxt_http_field_t  *f;
 
     traceval = nxt_mp_zalloc(r->mem_pool, NXT_OTEL_TRACEPARENT_LEN + 1);
@@ -151,19 +150,6 @@ nxt_otel_propagate_header(nxt_task_t *task, nxt_http_request_t *r)
         nxt_http_field_name_set(f, "traceparent");
         f->value = traceval;
         f->value_length = nxt_strlen(traceval);
-
-        traceparent_name = (nxt_str_t) {
-            .start  = f->name,
-            .length = f->name_length,
-        };
-
-        traceparent = (nxt_str_t) {
-            .start  = f->value,
-            .length = f->value_length,
-        };
-
-        nxt_otel_rs_add_event_to_trace(r->otel->trace,
-                                       &traceparent_name, &traceparent);
     }
 
     f = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
@@ -180,17 +166,9 @@ nxt_otel_propagate_header(nxt_task_t *task, nxt_http_request_t *r)
 
 
 static void
-nxt_otel_span_add_headers(nxt_task_t *task, nxt_http_request_t *r)
+nxt_otel_span_add_request_attrs(nxt_http_request_t *r)
 {
     nxt_str_t  val;
-
-    nxt_log(task, NXT_LOG_DEBUG, "adding attributes to trace");
-
-    if (r->otel == NULL || r->otel->trace == NULL) {
-        nxt_log(task, NXT_LOG_ERR, "no trace to add attributes to!");
-        nxt_otel_state_transition(r->otel, NXT_OTEL_ERROR_STATE);
-        return;
-    }
 
     /*
      * Record only well-defined semconv attributes. We deliberately do NOT
@@ -229,6 +207,33 @@ nxt_otel_span_add_headers(nxt_task_t *task, nxt_http_request_t *r)
         val.length = r->remote->address_length;
         nxt_otel_add_attr(r, NXT_OTEL_CLIENT_ADDR_TAG, &val);
     }
+}
+
+
+static void
+nxt_otel_span_add_headers(nxt_task_t *task, nxt_http_request_t *r)
+{
+    nxt_log(task, NXT_LOG_DEBUG, "adding attributes to trace");
+
+    if (r->otel == NULL || r->otel->trace == NULL) {
+        nxt_log(task, NXT_LOG_ERR, "no trace to add attributes to!");
+        nxt_otel_state_transition(r->otel, NXT_OTEL_ERROR_STATE);
+        return;
+    }
+
+    /*
+     * A span the sampler dropped records nothing, yet every attribute value
+     * is still assembled before the call that discards it.  Skip that work.
+     *
+     * Propagation below is not part of the bargain: the traceparent must
+     * reach the peer and the application whatever the sampling decision was,
+     * so that a downstream service can continue -- or deliberately not
+     * continue -- the same trace.
+     */
+
+    if (r->otel->recording) {
+        nxt_otel_span_add_request_attrs(r);
+    }
 
     nxt_otel_propagate_header(task, r);
 
@@ -244,6 +249,11 @@ nxt_otel_span_add_body(nxt_http_request_t *r)
     u_char     *body_buf, *body_size_buf;
     nxt_int_t  cur;
     nxt_str_t  body_val;
+
+    if (!r->otel->recording) {
+        nxt_otel_state_transition(r->otel, NXT_OTEL_COLLECT_STATE);
+        return;
+    }
 
     if (r->body != NULL) {
         body_size = nxt_buf_used_size(r->body);
@@ -291,7 +301,7 @@ nxt_otel_span_add_status(nxt_task_t *task, nxt_http_request_t *r)
     nxt_app_t               *app;
     nxt_request_rpc_data_t  *rpc;
 
-    if (r->otel == NULL || r->otel->trace == NULL) {
+    if (r->otel == NULL || r->otel->trace == NULL || !r->otel->recording) {
         return;
     }
 
@@ -505,6 +515,8 @@ nxt_otel_trace_and_span_init(nxt_task_t *task, nxt_http_request_t *r)
         nxt_otel_state_transition(r->otel, NXT_OTEL_ERROR_STATE);
         return;
     }
+
+    r->otel->recording = nxt_otel_rs_is_recording(r->otel->trace);
 
     nxt_otel_state_transition(r->otel, NXT_OTEL_HEADER_STATE);
 }

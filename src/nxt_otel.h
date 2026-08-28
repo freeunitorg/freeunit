@@ -26,10 +26,9 @@ extern void nxt_otel_rs_init(
     const nxt_str_t *endpoint, const nxt_str_t *protocol,
     double sample_fraction, double batch_size);
 extern void nxt_otel_rs_copy_traceparent(u_char *buffer, void *span);
-extern void nxt_otel_rs_add_event_to_trace(void *trace, nxt_str_t *key,
-    nxt_str_t *val);
 extern void nxt_otel_rs_add_attr(void *trace, nxt_str_t *key, nxt_str_t *val);
 extern void nxt_otel_rs_set_error(void *trace);
+extern uint8_t nxt_otel_rs_is_recording(void *trace);
 extern uint8_t nxt_otel_rs_is_init(void);
 extern void nxt_otel_rs_uninit(void);
 extern uint8_t nxt_otel_rs_shutdown_bounded(uint64_t timeout_ms);
@@ -90,6 +89,8 @@ struct nxt_otel_state_s {
     void               *trace;
     nxt_otel_status_t  status;
     nxt_str_t          trace_state;
+    /* The sampler's verdict on this span, cached at creation. */
+    uint8_t            recording;
 };
 
 

@@ -14,7 +14,7 @@
 //! which exports it from its own background thread.
 
 use opentelemetry::global;
-use opentelemetry::global::BoxedSpan;
+use opentelemetry::global::{BoxedSpan, BoxedTracer};
 use opentelemetry::trace::{
     Span, SpanContext, SpanId, SpanKind, Status, TraceContextExt, TraceFlags,
     TraceId, TraceState, Tracer, TracerProvider,
@@ -31,7 +31,7 @@ use std::ffi::{c_char, CStr, CString};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 use std::{ptr, slice};
 
@@ -71,6 +71,19 @@ type nxt_otel_log_cb = unsafe extern "C" fn(log_level: nxt_uint_t, msg: *const c
 fn provider_slot() -> &'static Mutex<Option<SdkTracerProvider>> {
     static PROVIDER: Mutex<Option<SdkTracerProvider>> = Mutex::new(None);
     &PROVIDER
+}
+
+/// The tracer built from the live provider.
+///
+/// `global::tracer_provider().tracer()` takes the global provider's lock,
+/// clones the provider and heap-allocates a fresh tracer on every call, but a
+/// tracer is meant to be built once. Caching it leaves the request path with
+/// one uncontended read lock instead. `None` means no provider is installed;
+/// the request path then falls back to the global one, so behaviour is
+/// unchanged either way.
+fn tracer_slot() -> &'static RwLock<Option<BoxedTracer>> {
+    static TRACER: RwLock<Option<BoxedTracer>> = RwLock::new(None);
+    &TRACER
 }
 
 /// The tokio runtime owning the gRPC exporter's tonic channel. The blocking
@@ -341,6 +354,10 @@ pub unsafe extern "C" fn nxt_otel_rs_init(
 
     global::set_tracer_provider(provider.clone());
 
+    if let Ok(mut slot) = tracer_slot().write() {
+        *slot = Some(global::tracer_provider().tracer(TRACER_NAME));
+    }
+
     if let Ok(mut slot) = provider_slot().lock() {
         *slot = Some(provider);
     }
@@ -372,25 +389,8 @@ pub unsafe extern "C" fn nxt_otel_rs_copy_traceparent(buf: *mut c_char, span: *c
     *buf.add(TRACEPARENT_HEADER_LEN as usize) = 0;
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn nxt_otel_rs_add_event_to_trace(
-    trace: *mut BoxedSpan,
-    key: *const nxt_str_t,
-    val: *const nxt_str_t,
-) {
-    if trace.is_null() || key.is_null() || val.is_null() {
-        return;
-    }
-
-    let key = nxt_str_to_string(&*key);
-    let val = nxt_str_to_string(&*val);
-
-    (*trace).add_event("Unit Attribute".to_string(), vec![KeyValue::new(key, val)]);
-}
-
 /// Set a semantic-convention span attribute (e.g. `http.request.method`).
-/// Unlike `add_event_to_trace`, this records structured span attributes the
-/// collector can index and query, not timestamped events.
+/// These are structured span attributes the collector can index and query.
 #[no_mangle]
 pub unsafe extern "C" fn nxt_otel_rs_add_attr(
     trace: *mut BoxedSpan,
@@ -405,6 +405,22 @@ pub unsafe extern "C" fn nxt_otel_rs_add_attr(
     let val = nxt_str_to_string(&*val);
 
     (*trace).set_attribute(KeyValue::new(key, val));
+}
+
+/// Whether the sampler kept this span.
+///
+/// C asks once, right after the span is built, and skips the attribute work
+/// for a span that is not recording. `set_attribute` on such a span is
+/// already a no-op, but its arguments are built before the call that throws
+/// them away -- so without this gate, lowering `sampling_ratio` buys back the
+/// exporter and nothing on the request path.
+#[no_mangle]
+pub unsafe extern "C" fn nxt_otel_rs_is_recording(trace: *mut BoxedSpan) -> u8 {
+    if trace.is_null() {
+        return 0;
+    }
+
+    (*trace).is_recording() as u8
 }
 
 /// Mark the span as errored. Called by C for 5xx responses so the trace is
@@ -457,6 +473,12 @@ unsafe fn nxt_otel_parent_context(
     Some(Context::new().with_remote_span_context(sc))
 }
 
+fn nxt_otel_build_span(tracer: &BoxedTracer, parent: &Context) -> BoxedSpan {
+    let builder = tracer.span_builder(SPAN_NAME).with_kind(SpanKind::Server);
+
+    tracer.build_with_context(builder, parent)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn nxt_otel_rs_get_or_create_trace(
     trace_id: *const c_char,
@@ -464,12 +486,23 @@ pub unsafe extern "C" fn nxt_otel_rs_get_or_create_trace(
     trace_flags: *const c_char,
     trace_state: *const nxt_str_t,
 ) -> *mut BoxedSpan {
-    let tracer = global::tracer_provider().tracer(TRACER_NAME);
-    let builder = tracer.span_builder(SPAN_NAME).with_kind(SpanKind::Server);
-
     let parent = nxt_otel_parent_context(trace_id, parent_id, trace_flags, trace_state)
         .unwrap_or_else(Context::new);
-    let span = tracer.build_with_context(builder, &parent);
+
+    // The read guard is held across the build so the cached tracer cannot be
+    // dropped by a concurrent reconfigure while a span is being made from it.
+    let cached = tracer_slot().read().ok();
+
+    let span = match cached.as_ref().and_then(|slot| slot.as_ref()) {
+        Some(tracer) => nxt_otel_build_span(tracer, &parent),
+        None => {
+            // No provider installed, or the lock is poisoned: fall back to the
+            // global provider, which hands out a no-op tracer in that case.
+            let tracer = global::tracer_provider().tracer(TRACER_NAME);
+
+            nxt_otel_build_span(&tracer, &parent)
+        }
+    };
 
     Box::into_raw(Box::new(span))
 }
@@ -524,6 +557,14 @@ pub unsafe extern "C" fn nxt_otel_rs_send_trace(trace: *mut BoxedSpan) {
 /// export has failed", not "no spans were lost".
 #[no_mangle]
 pub unsafe extern "C" fn nxt_otel_rs_shutdown_bounded(timeout_ms: u64) -> u8 {
+    // This path takes the provider without going through
+    // nxt_otel_rs_shutdown_tracer(), so the cached tracer has to be dropped
+    // here too: leaving it would hand out a tracer whose provider has
+    // already been shut down.
+    if let Ok(mut slot) = tracer_slot().write() {
+        *slot = None;
+    }
+
     let provider = provider_slot().lock().ok().and_then(|mut g| g.take());
     let rt = runtime_slot().lock().ok().and_then(|mut g| g.take());
 
@@ -582,6 +623,12 @@ pub unsafe extern "C" fn nxt_otel_rs_shutdown_bounded(timeout_ms: u64) -> u8 {
 /// Flush and tear down the live tracer provider, if any.
 #[no_mangle]
 pub unsafe extern "C" fn nxt_otel_rs_shutdown_tracer() {
+    // Dropped first: a tracer handed out after this point would belong to a
+    // provider that is already being torn down.
+    if let Ok(mut slot) = tracer_slot().write() {
+        *slot = None;
+    }
+
     let provider = provider_slot().lock().ok().and_then(|mut g| g.take());
     if let Some(provider) = provider {
         // Flushes pending spans; on a grpc build this still needs the runtime,
