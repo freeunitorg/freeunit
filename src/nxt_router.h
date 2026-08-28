@@ -265,6 +265,10 @@ void nxt_router_access_log_release(nxt_task_t *task,
 /* Not static so the descriptor-ownership test can drive it directly. */
 void nxt_router_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 
+/* Not static so the start-failure test can drive it directly. */
+void nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
+    void *data);
+
 void nxt_router_access_log_reopen_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 
