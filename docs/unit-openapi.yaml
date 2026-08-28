@@ -5176,6 +5176,120 @@ paths:
                 Closed:
                   value: 1307
 
+  /status/telemetry:
+    summary: "Endpoint for the `telemetry` status object"
+    get:
+      operationId: getStatusTelemetry
+      summary: "Retrieve the telemetry status object"
+      description: "Retrieves the `telemetry` status object that represents
+        Unit's [OpenTelemetry export statistics]
+        (https://unit.nginx.org/statusapi/)."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `telemetry` object exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/statusTelemetry"
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/statusTelemetry"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /status/telemetry/spans:
+    summary: "Endpoint for the `spans` telemetry object"
+    get:
+      operationId: getStatusTelemetrySpans
+      summary: "Retrieve the telemetry spans object"
+      description: "Retrieves the `spans` object that represents Unit's
+        [OpenTelemetry span export counters]
+        (https://unit.nginx.org/statusapi/)."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `spans` object exists in the configuration."
+
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/statusTelemetrySpans"
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/statusTelemetrySpans"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /status/telemetry/spans/exported:
+    summary: "Endpoint for the `exported` spans number"
+    get:
+      operationId: getStatusTelemetrySpansExported
+      summary: "Retrieve the exported spans number"
+      description: "Retrieves the `exported` spans number from Unit's
+        [telemetry statistics](https://unit.nginx.org/statusapi/), the spans
+        the collector accepted."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `exported` number exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                type: integer
+
+              examples:
+                Exported:
+                  value: 4096
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /status/telemetry/spans/failed:
+    summary: "Endpoint for the `failed` spans number"
+    get:
+      operationId: getStatusTelemetrySpansFailed
+      summary: "Retrieve the failed spans number"
+      description: "Retrieves the `failed` spans number from Unit's
+        [telemetry statistics](https://unit.nginx.org/statusapi/), the spans
+        whose export failed."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `failed` number exists in the configuration."
+
+          content:
+            application/json:
+              schema:
+                type: integer
+
+              examples:
+                Failed:
+                  value: 0
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
   /status/applications:
     summary: "Endpoint for the `applications` status object"
     get:
@@ -6170,6 +6284,10 @@ components:
           closed: 1050
         requests:
           total: 1307
+        telemetry:
+          spans:
+            exported: 4096
+            failed: 0
         applications:
           wp:
             processes:
@@ -6269,6 +6387,21 @@ components:
       summary: "Regular requests status object"
       value:
         total: 1307
+
+    # /status/telemetry
+    statusTelemetry:
+      summary: "Regular telemetry status object"
+      value:
+        spans:
+          exported: 4096
+          failed: 0
+
+    # /status/telemetry/spans
+    statusTelemetrySpans:
+      summary: "Regular telemetry spans status object"
+      value:
+        exported: 4096
+        failed: 0
 
   # -- RESPONSES --
 
@@ -7654,6 +7787,9 @@ components:
         requests:
           $ref: "#/components/schemas/statusRequests"
 
+        telemetry:
+          $ref: "#/components/schemas/statusTelemetry"
+
         applications:
           $ref: "#/components/schemas/statusApplications"
 
@@ -7732,6 +7868,34 @@ components:
         total:
           type: integer
           description: "Total non-API requests during the instance’s lifetime."
+
+    # /status/telemetry
+    statusTelemetry:
+      description: "Represents the health of Unit's OpenTelemetry span
+        export. The object is omitted entirely unless Unit was built with
+        OpenTelemetry support, `/config/settings/telemetry` is set, and the
+        exporter was built successfully, so its absence is how a client tells
+        telemetry that is off from telemetry that is idle."
+      type: object
+      properties:
+        spans:
+          $ref: "#/components/schemas/statusTelemetrySpans"
+
+    # /status/telemetry/spans
+    statusTelemetrySpans:
+      description: "Represents Unit's OpenTelemetry span export counters.
+        Both are cumulative since the exporter was last built, so changing
+        any telemetry setting restarts them, while re-applying an identical
+        configuration does not."
+      type: object
+      properties:
+        exported:
+          type: integer
+          description: "Spans the collector accepted."
+
+        failed:
+          type: integer
+          description: "Spans whose export failed."
 
     # /status/connections
     statusConnections:
