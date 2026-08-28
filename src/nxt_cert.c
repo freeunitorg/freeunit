@@ -19,6 +19,26 @@
 #include <openssl/err.h>
 
 
+/* The buffer X509_NAME_get_text_by_NID() used to be given, less the NUL. */
+#define NXT_CERT_NAME_TEXT_MAX  255
+
+/*
+ * The X509 name accessors were constified in stages, and not together:
+ * X509_NAME_get_entry() and X509_NAME_ENTRY_get_data() took const arguments
+ * from 1.1.0, but X509_NAME_get_index_by_NID() only from 3.0, and it is 4.0
+ * that constified the values all three return.  Qualifying from 3.0 is what
+ * satisfies every version at once -- an older header takes these pointers
+ * non-const, and 4.0 hands them back const -- so the boundary is 3.0 rather
+ * than the 1.1.0 the other guards in this file use.
+ */
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#define NXT_X509_CONST  const
+#else
+#define NXT_X509_CONST
+#endif
+
+
 struct nxt_cert_s {
     EVP_PKEY          *key;
     nxt_uint_t        count;
@@ -46,6 +66,8 @@ static int nxt_nxt_cert_pem_suffix(char *pem_str, const char *suffix);
 static nxt_conf_value_t *nxt_cert_details(nxt_mp_t *mp, nxt_cert_t *cert);
 static nxt_conf_value_t *nxt_cert_name_details(nxt_mp_t *mp, X509 *x509,
     nxt_bool_t issuer);
+static nxt_int_t nxt_cert_name_text(NXT_X509_CONST X509_NAME *x509_name,
+    int nid, nxt_str_t *str);
 static nxt_conf_value_t *nxt_cert_alt_names_details(nxt_mp_t *mp,
     STACK_OF(GENERAL_NAME) *alt_names);
 static void nxt_cert_buf_completion(nxt_task_t *task, void *obj, void *data);
@@ -536,7 +558,7 @@ nxt_cert_details(nxt_mp_t *mp, nxt_cert_t *cert)
     X509              *x509;
     u_char            *end;
     EVP_PKEY          *key;
-    ASN1_TIME         *asn1_time;
+    const ASN1_TIME   *asn1_time;
     nxt_str_t         str;
     nxt_int_t         ret;
     nxt_uint_t        i;
@@ -631,7 +653,7 @@ nxt_cert_details(nxt_mp_t *mp, nxt_cert_t *cert)
             return NULL;
         }
 
-        asn1_time = X509_get_notBefore(x509);
+        asn1_time = X509_get0_notBefore(x509);
 
         ret = ASN1_TIME_print(bio, asn1_time);
 
@@ -654,7 +676,7 @@ nxt_cert_details(nxt_mp_t *mp, nxt_cert_t *cert)
             return NULL;
         }
 
-        asn1_time = X509_get_notAfter(x509);
+        asn1_time = X509_get0_notAfter(x509);
 
         ret = ASN1_TIME_print(bio, asn1_time);
 
@@ -692,14 +714,12 @@ typedef struct {
 static nxt_conf_value_t *
 nxt_cert_name_details(nxt_mp_t *mp, X509 *x509, nxt_bool_t issuer)
 {
-    int                     len;
-    X509_NAME               *x509_name;
+    NXT_X509_CONST          X509_NAME  *x509_name;
     nxt_str_t               str;
-    nxt_int_t               ret;
+    nxt_int_t               ret, found;
     nxt_uint_t              i, n, count;
     nxt_conf_value_t        *object, *names;
     STACK_OF(GENERAL_NAME)  *alt_names;
-    u_char                  buf[256];
 
     static const nxt_cert_nid_t  nids[] = {
         { NID_commonName, nxt_string("common_name") },
@@ -752,19 +772,25 @@ nxt_cert_name_details(nxt_mp_t *mp, X509 *x509, nxt_bool_t issuer)
 
     for (n = 0, i = 0; n != nxt_nitems(nids) && i != count; n++) {
 
-        len = X509_NAME_get_text_by_NID(x509_name, nids[n].nid,
-                                        (char *) buf, sizeof(buf));
+        found = nxt_cert_name_text(x509_name, nids[n].nid, &str);
 
         if (n == 1 && names != NULL) {
             nxt_conf_set_member(object, &alt_names_str, names, i++);
         }
 
-        if (len < 0) {
+        if (found != NXT_OK) {
             continue;
         }
 
-        str.length = len;
-        str.start = buf;
+        /*
+         * X509_NAME_get_text_by_NID() used to copy into a 256 byte buffer and
+         * report the truncated length.  Keep that cap: it is what the control
+         * API has always reported for pathologically long names.
+         */
+
+        if (str.length > NXT_CERT_NAME_TEXT_MAX) {
+            str.length = NXT_CERT_NAME_TEXT_MAX;
+        }
 
         ret = nxt_conf_set_member_string_dup(object, mp, &nids[n].name,
                                              &str, i++);
@@ -774,6 +800,51 @@ nxt_cert_name_details(nxt_mp_t *mp, X509 *x509, nxt_bool_t issuer)
     }
 
     return object;
+}
+
+
+/*
+ * Return the raw contents of the first entry of x509_name that carries nid,
+ * or NXT_DECLINED if there is none.
+ *
+ * This replaces X509_NAME_get_text_by_NID(), deprecated in OpenSSL 4.0.  The
+ * old function copied the entry verbatim into the caller's buffer; the entry
+ * accessors hand out the same bytes without the copy, pointing into the
+ * certificate, which outlives the returned string here.
+ *
+ * As before the bytes are neither NUL terminated nor guaranteed free of
+ * embedded NULs, so the caller must keep treating them as a counted string.
+ */
+
+static nxt_int_t
+nxt_cert_name_text(NXT_X509_CONST X509_NAME *x509_name, int nid,
+    nxt_str_t *str)
+{
+    int             i, len;
+    NXT_X509_CONST  ASN1_STRING      *data;
+    NXT_X509_CONST  X509_NAME_ENTRY  *entry;
+
+    i = X509_NAME_get_index_by_NID(x509_name, nid, -1);
+    if (i < 0) {
+        return NXT_DECLINED;
+    }
+
+    entry = X509_NAME_get_entry(x509_name, i);
+    if (nxt_slow_path(entry == NULL)) {
+        return NXT_DECLINED;
+    }
+
+    data = X509_NAME_ENTRY_get_data(entry);
+
+    len = ASN1_STRING_length(data);
+    if (nxt_slow_path(len < 0)) {
+        return NXT_DECLINED;
+    }
+
+    str->length = len;
+    str->start = (u_char *) ASN1_STRING_get0_data(data);
+
+    return NXT_OK;
 }
 
 
