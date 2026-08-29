@@ -28,7 +28,7 @@
     ],
     "debian": [
       {"version": "11", "eol": "2024-08", "supported_until": "2027-08", "default_python": "3.9",  "codename": "bullseye", "note": "EOL"},
-      {"version": "12", "eol": "2026-07", "supported_until": "2029-07", "default_python": "3.11", "codename": "bookworm"},
+      {"version": "12", "eol": "2026-07", "supported_until": "2029-07", "default_python": "3.11", "codename": "bookworm", "note": "EOL"},
       {"version": "13", "eol": "2028-08", "supported_until": "2031-08", "default_python": "3.13", "codename": "trixie"}
     ],
     "rhel": [
@@ -46,7 +46,7 @@
   },
   "runtimes": {
     "go": [
-      {"version": "1.25", "eol": "2026-08", "supported_until": "2027-08"},
+      {"version": "1.25", "eol": "2026-08", "supported_until": "2027-08", "note": "EOL"},
       {"version": "1.26", "eol": "2027-02", "supported_until": "2028-02"}
     ],
     "java": [
@@ -62,7 +62,7 @@
       {"version": "26", "eol": "2029-04", "supported_until": "2030-04", "lts": true}
     ],
     "perl": [
-      {"version": "5.38", "eol": "2026-07", "supported_until": "2027-07"},
+      {"version": "5.38", "eol": "2026-07", "supported_until": "2027-07", "note": "EOL"},
       {"version": "5.40", "eol": "2027-06", "supported_until": "2028-06"},
       {"version": "5.42", "eol": "2028-07", "supported_until": "2029-07"}
     ],
