@@ -5051,6 +5051,7 @@ paths:
             application/json:
               schema:
                 type: integer
+                format: int64
 
               examples:
                 Accepted:
@@ -5075,6 +5076,7 @@ paths:
             application/json:
               schema:
                 type: integer
+                format: int64
 
               examples:
                 Active:
@@ -5098,6 +5100,7 @@ paths:
             application/json:
               schema:
                 type: integer
+                format: int64
 
               examples:
                 Idle:
@@ -5122,6 +5125,7 @@ paths:
             application/json:
               schema:
                 type: integer
+                format: int64
 
               examples:
                 Closed:
@@ -5171,6 +5175,7 @@ paths:
             application/json:
               schema:
                 type: integer
+                format: int64
 
               examples:
                 Closed:
@@ -5254,6 +5259,7 @@ paths:
             application/json:
               schema:
                 type: integer
+                format: int64
 
               examples:
                 Exported:
@@ -5282,6 +5288,7 @@ paths:
             application/json:
               schema:
                 type: integer
+                format: int64
 
               examples:
                 Failed:
@@ -7936,6 +7943,7 @@ components:
       properties:
         total:
           type: integer
+          format: int64
           description: "Total non-API requests during the instance’s lifetime."
 
     # /status/telemetry
@@ -7960,10 +7968,12 @@ components:
       properties:
         exported:
           type: integer
+          format: int64
           description: "Spans the collector accepted."
 
         failed:
           type: integer
+          format: int64
           description: "Spans whose export failed."
 
     # /status/connections
@@ -7973,19 +7983,23 @@ components:
       properties:
         accepted:
           type: integer
+          format: int64
           description: "Total accepted connections during the
             instance’s lifetime."
 
         active:
           type: integer
+          format: int64
           description: "Current active connections for the instance."
 
         idle:
           type: integer
+          format: int64
           description: "Current idle connections for the instance."
 
         closed:
           type: integer
+          format: int64
           description: "Total closed connections during
             the instance’s lifetime."
 
