@@ -11,7 +11,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Runtime | Version | Upstream EOL | FreeUnit Drops |
 |---------|---------|--------------|----------------|
 | Go | 1.24 (EOL) † | Feb 2026 | Feb 2027 |
-| Go | 1.25 | Aug 2026 | Aug 2027 |
+| Go | 1.25 (EOL) † | Aug 2026 | Aug 2027 |
 | Go | 1.26 | Feb 2027 | Feb 2028 |
 | Java (JSC) | 17 (LTS) | Oct 2027 | Oct 2028 |
 | Java (JSC) | 21 (LTS) | Dec 2029 | Dec 2030 |
@@ -21,7 +21,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Node.js | 22 (LTS) | Apr 2027 | Apr 2028 |
 | Node.js | 24 (LTS) | Apr 2028 | Apr 2029 |
 | Node.js | 26 (LTS) | Apr 2029 | Apr 2030 |
-| Perl | 5.38 | Jul 2026 | Jul 2027 |
+| Perl | 5.38 (EOL) † | Jul 2026 | Jul 2027 |
 | Perl | 5.40 | Jun 2027 | Jun 2028 |
 | Perl | 5.42 | Jul 2028 | Jul 2029 |
 | PHP | 8.3 | Dec 2027 | Dec 2028 |
@@ -52,7 +52,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Ubuntu (LTS) | 24.04 | 2029-05 | 2032-05 | 3.12 |
 | Ubuntu (LTS) | 26.04 | 2031-04 | 2034-04 | 3.13 |
 | Debian | 11 (bullseye) (EOL) † | 2024-08 | 2027-08 | 3.9 |
-| Debian | 12 (bookworm) | 2026-07 | 2029-07 | 3.11 |
+| Debian | 12 (bookworm) (EOL) † | 2026-07 | 2029-07 | 3.11 |
 | Debian | 13 (trixie) | 2028-08 | 2031-08 | 3.13 |
 | RHEL | 8 | 2029-05 | 2032-05 | 3.8 ‡ |
 | RHEL | 9 | 2032-05 | 2035-05 | 3.11 |
