@@ -41,10 +41,14 @@ if [ $NXT_OPENSSL = YES ]; then
         # as well; that is deliberate, so that the floor probe below is the
         # one to report a too-old library by name instead of configure
         # bailing out with a misleading "no OpenSSL library found".  The
-        # floor is not a build fact but a support decision: 1.1.1 is
-        # vendor-maintained on RHEL 8, Amazon Linux 2 and Debian 11, all
-        # still in the OS matrix (pkg/eol.json), and pkg/rpm builds against
-        # openssl11-devel there.
+        # floor is not a build fact but a support decision: it stays
+        # at 1.1.1 rather than 3.x because RHEL 8 still ships a
+        # vendor-patched 1.1.1 that Red Hat maintains into 2029, and from
+        # 2026-09 it is the last platform in the matrix still receiving
+        # those patches: Amazon Linux 2's ended 2026-06-30 and Debian
+        # 11's LTS ends 2026-08-31.  Both stay in FreeUnit's own grace
+        # window; the OS matrix and that window both live in
+        # pkg/eol.json (see EOL.md).
         # Checking it here fails configure with a clear message instead of
         # leaving a too-old library to surface as an implicit declaration
         # deep in the build.
