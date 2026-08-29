@@ -33,6 +33,14 @@ env:
   # stable across patch bumps.
   OPENSSL4_VERSION: 4.0.2
 
+concurrency:
+  # Cancel superseded runs for the same pull request.  Non-PR events fall back
+  # to the run id, which is unique, so a push is never grouped with another:
+  # Actions keeps only one PENDING run per group and would drop a queued commit
+  # even with cancel-in-progress false, which would break bisectability.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # Single source of truth for the test matrix. The version-tested language
   # modules (go/java/node/php/python/ruby) are derived from pkg/eol.json; the
@@ -41,6 +49,7 @@ jobs:
   # and the "minimal" image — those are Docker packaging flavors, not test axes.
   prepare:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       builds: ${{ steps.list.outputs.builds }}
     steps:
@@ -60,6 +69,7 @@ jobs:
   test:
     needs: prepare
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -530,6 +540,7 @@ jobs:
   # privilege-sensitive cases (clone creds) work.
   c-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v5
@@ -562,6 +573,7 @@ jobs:
   # nothing above the TLS layer changes with the OpenSSL version.
   openssl4:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v5
