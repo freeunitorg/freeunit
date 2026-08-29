@@ -1,23 +1,17 @@
 name: "Build (Fedora/Alpine · GCC/Clang)"
 
 on:
-  workflow_dispatch: # manual only
-#  push:
-#    branches: master
-#    paths:
-#      - configure
-#      - 'auto/**'
-#      - 'src/**'
-#      - 'test/**'
-#      - '.github/workflows/build-distros.yml'
-#  pull_request:
-#    branches: master
-#    paths:
-#      - configure
-#      - 'auto/**'
-#      - 'src/**'
-#      - 'test/**'
-#      - '.github/workflows/build-distros.yml'
+  # Rolling distributions break on their own schedule, not on ours, so this is
+  # a weekly gate rather than a PR gate: Fedora rawhide and Alpine edge move
+  # under us between pull requests, and a red check nobody caused is a check
+  # nobody reads.  A failure opens or updates a tracking issue instead.
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
 
 jobs:
 
@@ -169,7 +163,7 @@ jobs:
       - name: configure unit-php
         run: |
           ln -s /usr/lib/libphp83.so /usr/lib/libphp.so
-          ./configure php --php-config=/usr/bin/php-config83
+          ./configure php --config=/usr/bin/php-config83
 
       - name: make unit-php
         run: make -j 4
@@ -197,3 +191,43 @@ jobs:
 
       - name: make unit-java
         run: make -j 4 java
+
+  # A weekly red check that nobody caused is a check nobody reads, so a
+  # scheduled failure is reported as a tracking issue instead, the same way
+  # eol-check.yml handles its weekly run.
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [ fedora-rawhide, alpine-edge ]
+    if: failure() && github.event_name == 'schedule'
+
+    steps:
+      - name: Open or update tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This job does not check out the repository, so gh has no local git
+          # remote to infer the target from and would exit before creating the
+          # issue -- silently defeating the point of the job.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          title='Rolling distro build is failing (Fedora rawhide / Alpine edge)'
+          {
+            echo 'The weekly rolling-distribution build failed. These distributions'
+            echo 'move between our pull requests, so a failure here is usually a'
+            echo 'toolchain or package change rather than a regression in Unit.'
+            echo
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo 'Reproduce locally, e.g. for Alpine:'
+            echo
+            echo '```'
+            echo 'docker run --rm -it --platform linux/amd64 alpine:edge sh'
+            echo '```'
+          } > issue-body.md
+          existing=$(gh issue list --state open --search "in:title ${title}" \
+            --json number,title --jq ".[] | select(.title == \"${title}\") | .number" | head -n1)
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body-file issue-body.md
+          else
+            gh issue create --title "${title}" --body-file issue-body.md
+          fi
