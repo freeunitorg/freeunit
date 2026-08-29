@@ -49,7 +49,7 @@ nxt_capability_set(nxt_task_t *task, nxt_capabilities_t *cap)
 {
     nxt_assert(cap->setid == 0);
 
-    if (geteuid() == 0) {
+    if (nxt_euid == 0) {
         cap->setid = 1;
         cap->chroot = 1;
         return NXT_OK;
@@ -77,6 +77,7 @@ nxt_capability_linux_get_version(void)
 static nxt_int_t
 nxt_capability_specific_set(nxt_task_t *task, nxt_capabilities_t *cap)
 {
+    nxt_err_t                        err;
     struct __user_cap_data_struct    *val, data[2];
     struct __user_cap_header_struct  hdr;
 
@@ -100,7 +101,43 @@ nxt_capability_specific_set(nxt_task_t *task, nxt_capabilities_t *cap)
     hdr.pid = nxt_pid;
 
     if (nxt_slow_path(nxt_capget(&hdr, val) == -1)) {
-        nxt_alert(task, "failed to get process capabilities: %E", nxt_errno);
+        err = nxt_errno;
+
+        /*
+         * A syscall filter that does not allow capget() reports it
+         * through SECCOMP_RET_ERRNO, conventionally as EPERM or ENOSYS.
+         * Capabilities then cannot be observed at all, which is not a
+         * reason to refuse to start: leave both flags clear and run the
+         * way an ordinary unprivileged unitd already does.
+         *
+         * Any other errno means the call itself is wrong -- EINVAL,
+         * which a working version probe would have prevented, or EFAULT
+         * for a bad pointer -- so it is a bug in Unit rather than a
+         * policy decision made by the operator.  Keep failing closed
+         * there, rather than silently downgrading privileges.
+         */
+
+        if (err == NXT_EPERM || err == NXT_ENOSYS) {
+            nxt_log(task, NXT_LOG_WARN, "capget() failed %E; process "
+                    "capabilities are unknown and will not be used: user and "
+                    "group switching and \"rootfs\" isolation are disabled "
+                    "for applications that do not enable the \"credential\" "
+                    "namespace, and applications run as uid %d",
+                    err, (int) nxt_euid);
+
+            /*
+             * The log file is not open yet -- this runs from
+             * nxt_runtime_conf_init() -- so the warning above reaches
+             * stderr only.  Record it, and nxt_runtime_start() repeats it
+             * once unit.log exists, or a daemonised unitd would keep no
+             * trace of running without knowing its own capabilities.
+             */
+            cap->unknown = 1;
+
+            return NXT_OK;
+        }
+
+        nxt_alert(task, "failed to get process capabilities: %E", err);
         return NXT_ERROR;
     }
 

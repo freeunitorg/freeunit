@@ -6,6 +6,28 @@
 
 
 <changes apply="unit"
+         ver="1.36.2" rev="1"
+         date="2026-08-30" time="00:00:00 +0000"
+         packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change type="bugfix">
+<para>
+do not exit when the capget() syscall is denied.  A syscall filter that
+omits capget -- a systemd "SystemCallFilter=" allowlist, a hand-written
+seccomp profile -- made a non-root unitd fail to start with "failed to get
+process capabilities".  Unit now warns and runs without assuming any
+capability: user and group switching and "rootfs" isolation are disabled
+for applications that do not enable the "credential" namespace, and
+applications run as unitd's own uid.  Capabilities the process may
+still hold are not dropped, since Unit does not call capset().  Every
+other capget() failure remains fatal.
+</para>
+</change>
+
+</changes>
+
+
+<changes apply="unit"
          ver="1.36.1" rev="1"
          date="2026-08-28" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
