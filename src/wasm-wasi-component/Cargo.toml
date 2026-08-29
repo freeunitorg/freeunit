@@ -27,7 +27,7 @@ wasmtime-wasi = "47.0.2"
 wasmtime-wasi-http = { version = "47.0.2", default-features = false, features = ['p2'] }
 
 [build-dependencies]
-bindgen = "0.68.1"
+bindgen = "0.72"
 cc = "1.0.83"
 
 [profile.dev]
