@@ -7,9 +7,18 @@ on:
   pull_request:
     types: [ opened, synchronize ]
 
+concurrency:
+  # Cancel superseded runs for the same pull request.  Non-PR events fall back
+  # to the run id, which is unique, so a push is never grouped with another:
+  # Actions keeps only one PENDING run per group and would drop a queued commit
+  # even with cancel-in-progress false, which would break bisectability.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check-whitespace:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
     - uses: actions/checkout@v5
       with:

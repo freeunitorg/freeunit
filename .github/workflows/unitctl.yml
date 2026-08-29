@@ -21,9 +21,18 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  # Cancel superseded runs for the same pull request.  Non-PR events fall back
+  # to the run id, which is unique, so a push is never grouped with another:
+  # Actions keeps only one PENDING run per group and would drop a queued commit
+  # even with cancel-in-progress false, which would break bisectability.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     defaults:
       run:
         working-directory: tools/unitctl
@@ -74,6 +83,7 @@ jobs:
 
   build:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: tools/unitctl
@@ -177,6 +187,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     needs: [build]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/download-artifact@v8
         with:

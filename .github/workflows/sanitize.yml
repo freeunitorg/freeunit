@@ -53,10 +53,19 @@ on:
       - '.github/scripts/check-sanitizer-reports.sh'
       - '.github/sanitizer-allowlist.txt'
 
+concurrency:
+  # Cancel superseded runs for the same pull request.  Non-PR events fall back
+  # to the run id, which is unique, so a push is never grouped with another:
+  # Actions keeps only one PENDING run per group and would drop a queued commit
+  # even with cancel-in-progress false, which would break bisectability.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   sanitize:
     name: "sanitize (${{ matrix.runtime }})"
     runs-on: ubuntu-latest
+    timeout-minutes: 40
 
     # NOTE: `continue-on-error` is deliberately NOT set at job level here.
     # It is set on every step an experimental leg can fail in: the
