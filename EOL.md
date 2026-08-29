@@ -46,7 +46,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Fedora | 44 | 2027-06 | 2030-06 | 3.14 |
 | CentOS Stream | 9 | 2027-05 | 2030-05 | 3.11 |
 | CentOS Stream | 10 | 2030-05 | 2033-05 | 3.13 |
-| Amazon Linux | 2 | 2026-06 | 2029-06 | 3.7 ‡ |
+| Amazon Linux | 2 (EOL) † | 2026-06 | 2029-06 | 3.7 ‡ |
 | Amazon Linux | 2023 | 2029-06 | 2032-06 | 3.11 |
 | Ubuntu (LTS) | 22.04 | 2027-04 | 2030-04 | 3.10 |
 | Ubuntu (LTS) | 24.04 | 2029-05 | 2032-05 | 3.12 |
@@ -78,7 +78,7 @@ needs an upgrade or replacement decision instead.
 
 | Dependency | Role | Floor / Version | Upstream EOL | Notes |
 |------------|------|-----------------|--------------|-------|
-| OpenSSL | TLS backend (`--openssl`) | 1.1.1 (floor) | Sep 2023 | Kept because RHEL 8, Amazon Linux 2 (`openssl11-devel`) and Debian 11 ship it. Floor declared by the `auto/ssltls` probe (PR #224). |
+| OpenSSL | TLS backend (`--openssl`) | 1.1.1 (floor) | Sep 2023 | The floor stays at 1.1.1 rather than 3.x because RHEL 8 still ships a vendor-patched 1.1.1 and Red Hat maintains it into 2029 -- from 2026-09 it is the last platform in the matrix still receiving vendor patches for it. Amazon Linux 2's ended 2026-06-30 and Debian 11's LTS ends 2026-08-31; both remain inside FreeUnit's own three-year post-EOL support window (see `_grace_os` in `pkg/eol.json`). Floor declared by the `auto/ssltls` probe (PR #224). |
 | OpenSSL | tested ceiling | 3.6.2 (CI build) | Nov 2026 | `build-test.yml` builds it into `/opt/openssl-3.6` (`OPENSSL_VERSION`). **The pin needs a bump before 2026-11-01** (3.5 is the LTS, EOL Apr 2030). |
 | OpenSSL | tested ceiling | 4.0.2 (CI build) | May 2027 | The `openssl4` job builds it into `/opt/openssl-4.0` (`OPENSSL4_VERSION`) and compiles with `-DOPENSSL_NO_DEPRECATED`, so any use of an API 4.0 deprecates fails the build. |
 | Apache Tomcat | Servlet/JSP/EL API + Jasper jars bundled by the Java module | 9.0.x | Mar 2027 ([no earlier than](https://tomcat.apache.org/whichversion.html)) | Bundled by `auto/modules/java`; independent of the JDK variant. |

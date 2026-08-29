@@ -18,7 +18,7 @@
       {"version": "10", "eol": "2030-05", "supported_until": "2033-05", "default_python": "3.13"}
     ],
     "amazonlinux": [
-      {"version": "2",    "eol": "2026-06", "supported_until": "2029-06", "default_python": "3.7",  "default_python_note": "OS-shipped; Python 3.7 upstream EOL Jun 2023"},
+      {"version": "2",    "eol": "2026-06", "supported_until": "2029-06", "default_python": "3.7",  "default_python_note": "OS-shipped; Python 3.7 upstream EOL Jun 2023", "note": "EOL"},
       {"version": "2023", "eol": "2029-06", "supported_until": "2032-06", "default_python": "3.11"}
     ],
     "ubuntu": [
@@ -94,7 +94,7 @@
       "role": "TLS backend (./configure --openssl)",
       "floor": "1.1.1",
       "floor_eol": "2023-09",
-      "floor_note": "Upstream-EOL but still supported by FreeUnit because it is what RHEL 8, Amazon Linux 2 (openssl11-devel, see pkg/rpm/Makefile and pkg/rpm/unit.spec.in) and Debian 11 ship, and all three are inside the OS support window above.",
+      "floor_note": "The floor stays at 1.1.1 rather than 3.x because RHEL 8 (openssl-devel) still ships a vendor-patched 1.1.1 that Red Hat maintains into 2029, and from 2026-09 it is the last platform in the matrix still receiving those patches; Amazon Linux 2 builds against openssl11-devel (see pkg/rpm/Makefile and pkg/rpm/unit.spec.in). Amazon Linux 2 and Debian 11 remain inside FreeUnit's own three-year post-EOL support window (see _grace_os).",
       "floor_declared_by": "auto/ssltls probe (PR #224), which also drops the pre-1.1.0 compatibility code in src/nxt_openssl.c",
       "tested_ceiling": "3.6.2 and 4.0.2",
       "tested_ceiling_note": "build-test.yml tests two ceilings from source: 3.6.2 (OPENSSL_VERSION env, built into /opt/openssl-3.6) and 4.0.2 (OPENSSL4_VERSION env, /opt/openssl-4.0, built by the openssl4 job with --cc-opt=-DOPENSSL_NO_DEPRECATED so any use of an API OpenSSL 4.0 deprecates fails the build). ACTION: OpenSSL 3.6 goes upstream-EOL 2026-11-01, so the OPENSSL_VERSION pin needs a bump to a supported branch (3.5 is the LTS, EOL 2030-04); 4.0 is supported to 2027-05.",
