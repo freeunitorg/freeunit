@@ -1,7 +1,14 @@
 name: "Build (Fedora/Alpine · GCC/Clang)"
 
 on:
-  workflow_dispatch: # manual only
+  workflow_dispatch:
+  # Weekly, not per-PR: these legs rebuild a whole toolchain in-container and
+  # what they catch is distro drift -- Fedora rawhide or Alpine edge moving a
+  # compiler, an OpenSSL or a rustc under us -- which happens on a timescale of
+  # weeks, not commits.  A Monday run surfaces it within days without putting
+  # tens of minutes of container builds in front of every pull request.
+  schedule:
+    - cron: '0 6 * * 1'
 #  push:
 #    branches: master
 #    paths:
