@@ -37,7 +37,7 @@ jobs:
               python-unversioned-command python3 python3-devel \
               php-devel php-embedded perl-devel perl-ExtUtils-Embed \
               ruby-devel java-devel nodejs-devel nodejs-npm golang \
-              cargo rust cmake
+              cargo rust cmake clang-devel
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             dnf -y install --setopt=install_weak_deps=False clang
           fi
@@ -123,6 +123,22 @@ jobs:
       - name: make unit-wasm
         run: make wasm
 
+      # The Rust component module is the reason this workflow is worth running
+      # weekly: bindgen parses Unit's headers with libclang, and a new libclang
+      # breaks that silently -- it emits opaque `_address` placeholder structs
+      # rather than failing, so the crate then fails to compile with errors that
+      # point at Unit's code.  That is what #250 fixed for clang 22, which this
+      # distribution already ships.  Only the gcc leg builds it: bindgen uses
+      # libclang whatever the C compiler is, so the clang leg would test the
+      # same parse twice.
+      - name: configure unit-wasm-wasi-component
+        run: ./configure wasm-wasi-component
+        if: matrix.compiler == 'gcc'
+
+      - name: make unit-wasm-wasi-component
+        run: make wasm-wasi-component
+        if: matrix.compiler == 'gcc'
+
   alpine-edge:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -142,7 +158,7 @@ jobs:
           apk add gcc make musl-dev openssl-dev pcre2-dev curl \
               zlib-dev zstd-dev brotli-dev \
               php83-dev php83-embed python3-dev perl-dev ruby-dev \
-              openjdk21-jdk cargo rust
+              openjdk21-jdk cargo rust clang-dev linux-headers
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             apk add clang
           fi
@@ -191,6 +207,19 @@ jobs:
 
       - name: make unit-java
         run: make -j 4 java
+
+      # See the note on the same steps in fedora-rawhide: this is the gate that
+      # would have caught the bindgen/libclang breakage #250 fixed.  Alpine
+      # matters twice over here -- it defaults clang-dev to clang 22 in edge AND
+      # in stable 3.24, and it is where the module could not be packaged at all
+      # before #250.  gcc leg only: bindgen goes through libclang either way.
+      - name: configure unit-wasm-wasi-component
+        run: ./configure wasm-wasi-component
+        if: matrix.compiler == 'gcc'
+
+      - name: make unit-wasm-wasi-component
+        run: make wasm-wasi-component
+        if: matrix.compiler == 'gcc'
 
   # A weekly red check that nobody caused is a check nobody reads, so a
   # scheduled failure is reported as a tracking issue instead, the same way
