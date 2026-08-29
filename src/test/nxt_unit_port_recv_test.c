@@ -31,6 +31,7 @@
  */
 
 #include "nxt_main.h"
+#include "nxt_socket_msg.h"
 #include "nxt_port.h"
 #include "nxt_port_queue.h"
 #include "nxt_app_queue.h"
@@ -104,7 +105,7 @@ nxt_port_recv_test_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
 
     for (cmsg = CMSG_FIRSTHDR(&msg);
          cmsg != NULL;
-         cmsg = CMSG_NXTHDR(&msg, cmsg))
+         cmsg = NXT_CMSG_NXTHDR(&msg, cmsg))
     {
         size = cmsg->cmsg_len - CMSG_LEN(0);
 
