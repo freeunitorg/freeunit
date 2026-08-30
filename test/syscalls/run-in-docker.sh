@@ -63,7 +63,11 @@ fi
 command -v docker >/dev/null 2>&1 || die "docker not found"
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT INT TERM
+# A trapped signal does not end a POSIX shell, so each signal handler exits
+# explicitly; the EXIT trap is cleared first so the cleanup runs once.
+trap 'rm -rf "$work"' EXIT
+trap 'trap - EXIT; rm -rf "$work"; exit 130' INT
+trap 'trap - EXIT; rm -rf "$work"; exit 143' TERM
 
 # With no -o the list goes to stdout, as the usage above says.  Writing it to
 # a temporary the EXIT trap then deletes would make the plainest invocation

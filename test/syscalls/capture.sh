@@ -69,7 +69,11 @@ cleanup() {
     rm -rf "$WORK"
     return 0
 }
-trap cleanup EXIT INT TERM
+# A trapped signal does not end a POSIX shell, so each signal handler exits
+# explicitly; the EXIT trap is cleared first so the cleanup runs once.
+trap cleanup EXIT
+trap 'trap - EXIT; cleanup; exit 130' INT
+trap 'trap - EXIT; cleanup; exit 143' TERM
 
 mkdir -p "$WORK/state" "$WORK/tmp" "$WORK/modules" "$WORK/share"
 echo 'syscall drift canary' > "$WORK/share/index.txt"

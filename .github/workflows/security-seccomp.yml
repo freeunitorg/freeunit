@@ -5,13 +5,45 @@ on:
     paths:
       - 'pkg/docker/seccomp-no-af-alg.json'
       - 'pkg/docker/Dockerfile.*'
+      - 'pkg/docker/docker-entrypoint.sh'
       - 'test/security/seccomp/**'
+      - 'test/security/docker/**'
+      # The hardening matrix documents what the daemon does with credentials
+      # and capabilities; these are the files that decide it.
+      - 'src/nxt_capability.*'
+      - 'src/nxt_credential.*'
+      - 'src/nxt_isolation.*'
+      - 'src/nxt_process.*'
+      # nxt_runtime_conf_init() sets rt->user_cred/rt->group and calls
+      # nxt_capability_set(), which is the decision this table describes.
+      - 'src/nxt_runtime.*'
+      # nxt_main_process.c:556 fills app_conf->user from rt->user_cred, and
+      # nxt_application.c:669 sets process->user_cred -- the credentials the
+      # canary reports back.
+      - 'src/nxt_main_process.*'
+      - 'src/nxt_application.*'
       - '.github/workflows/security-seccomp.yml'
   pull_request:
     paths:
       - 'pkg/docker/seccomp-no-af-alg.json'
       - 'pkg/docker/Dockerfile.*'
+      - 'pkg/docker/docker-entrypoint.sh'
       - 'test/security/seccomp/**'
+      - 'test/security/docker/**'
+      # The hardening matrix documents what the daemon does with credentials
+      # and capabilities; these are the files that decide it.
+      - 'src/nxt_capability.*'
+      - 'src/nxt_credential.*'
+      - 'src/nxt_isolation.*'
+      - 'src/nxt_process.*'
+      # nxt_runtime_conf_init() sets rt->user_cred/rt->group and calls
+      # nxt_capability_set(), which is the decision this table describes.
+      - 'src/nxt_runtime.*'
+      # nxt_main_process.c:556 fills app_conf->user from rt->user_cred, and
+      # nxt_application.c:669 sets process->user_cred -- the credentials the
+      # canary reports back.
+      - 'src/nxt_main_process.*'
+      - 'src/nxt_application.*'
       - '.github/workflows/security-seccomp.yml'
   workflow_dispatch:
 
@@ -30,7 +62,9 @@ jobs:
   seccomp-af-alg:
     name: Verify AF_ALG seccomp mitigation
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Raised from 15 with the hardening matrix added at the end.  The image
+    # build dominates; the matrix itself measured 57 seconds locally.
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v5
@@ -79,3 +113,12 @@ jobs:
 
       - name: Run seccomp tests (FreeUnit image)
         run: bash test/security/seccomp/test-af-alg.sh freeunit:seccomp-test
+
+      # Reuses the image built above rather than building or pulling another
+      # one: this is the second security property of the same artifact, and an
+      # image build is the expensive part of this workflow.
+      #
+      # (The workflow is still named after AF_ALG.  Renaming it would rename
+      # the check, so that is left to a deliberate change of its own.)
+      - name: Run Docker hardening matrix (FreeUnit image)
+        run: bash test/security/docker/test-hardening.sh freeunit:seccomp-test
