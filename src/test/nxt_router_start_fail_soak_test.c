@@ -308,6 +308,23 @@ nxt_router_start_fail_soak_test(nxt_thread_t *thr)
 done:
 
     if (dport != NULL) {
+        /*
+         * The successful start above was queued rather than written, and
+         * nxt_port_msg_chk_insert() takes a port reference for every queued
+         * message.  Releasing only the test's own reference leaves the port
+         * above zero, so it never reaches nxt_port_mp_cleanup() and the
+         * assertions there -- the ones a --debug build exists to run --
+         * never execute for it.
+         */
+        nxt_port_test_run_error_handler(task, dport);
+
+        if (!nxt_queue_is_empty(&dport->messages)) {
+            nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                          "router start fail soak test: destination port "
+                          "still holds queued messages after teardown");
+            ret = NXT_ERROR;
+        }
+
         nxt_port_use(task, dport, -1);
     }
 
