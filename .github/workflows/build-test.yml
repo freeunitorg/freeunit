@@ -348,6 +348,16 @@ jobs:
           update: true
         if: steps.metadata.outputs.module == 'php'
 
+      # Informational.  A package built --with-system-tzdata reports
+      # "Version => 0.system" and reads /usr/share/zoneinfo at request time,
+      # i.e. inside an isolation.rootfs chroot; a bundled-timelib build
+      # reports a real release and never touches the filesystem.  Which one
+      # the runner has decides how test_php_isolation_rootfs behaves.
+      - name: Report php timezone database
+        run: |
+          php -i | grep -i 'timezone database' || true
+        if: steps.metadata.outputs.module == 'php'
+
       - name: Configure php
         run: |
           ./configure php
