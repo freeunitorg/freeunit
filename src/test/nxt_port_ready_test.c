@@ -35,6 +35,8 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
+#include <signal.h>
 
 #if (NXT_HAVE_MEMFD_CREATE)
 #include <linux/memfd.h>
@@ -411,7 +413,21 @@ nxt_port_ready_test_short_queue(nxt_thread_t *thr, nxt_task_t *task,
     msg->fd[0] = fd;
     msg->fd[1] = -1;
 
+    nxt_port_test_broadcasts = 0;
+
     nxt_port_process_ready_handler(task, msg);
+
+    /*
+     * The positive half of the broadcast assertion in the queueless case:
+     * refusing a replacement is not a failed start, so this message still
+     * reaches the announcement.  Without this, "not broadcast" there would
+     * pass on a handler that never broadcasts at all.
+     */
+    if (nxt_port_test_broadcasts == 0) {
+        nxt_log_alert(thr->log, "port ready test: a kept queue was not "
+                      "broadcast");
+        return NXT_ERROR;
+    }
 
     if (port->queue != prev_queue || port->queue_fd != prev_fd) {
         nxt_log_alert(thr->log, "port ready test: short queue replaced the "
@@ -439,6 +455,294 @@ nxt_port_ready_test_short_queue(nxt_thread_t *thr, nxt_task_t *task,
     return NXT_OK;
 }
 
+/*
+ * Issue #231: a first PROCESS_READY whose queue cannot be mapped.
+ *
+ * This is a different arm from nxt_port_ready_test_short_queue() above,
+ * and the distinction is the whole point.  That case runs after a queue
+ * has been installed, so the handler keeps the working mapping and the
+ * process stays ready -- refusing a replacement is not a failed start.
+ * Here the port has no queue at all, so there is nothing to fall back to:
+ * the worker is unreachable on this port forever, and the start has to
+ * fail rather than be marked ready.
+ *
+ * The kill target is a real forked child, never nxt_pid + N.  The suite
+ * runs as root in CI, so a made-up pid is a live process on the machine;
+ * only the pid fork() returned is known to be ours to signal.
+ */
+static nxt_int_t
+nxt_port_ready_test_queueless(nxt_thread_t *thr, nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, nxt_process_t *process, nxt_port_t *port)
+{
+    int        status;
+    pid_t      child, reaped;
+    nxt_fd_t   fd;
+    nxt_uint_t i;
+
+    if (nxt_slow_path(port->queue != NULL)) {
+        nxt_log_alert(thr->log, "port ready test: the queueless case needs a "
+                      "port with no queue");
+        return NXT_ERROR;
+    }
+
+    /*
+     * A child that only waits to be killed.  _exit() rather than return so
+     * that a child which somehow escapes pause() cannot run the rest of the
+     * test suite as a second process.
+     */
+    child = fork();
+    if (child == -1) {
+        nxt_log_alert(thr->log, "port ready test failed to fork the kill "
+                      "target");
+        return NXT_ERROR;
+    }
+
+    if (child == 0) {
+        for ( ;; ) {
+            pause();
+        }
+
+        _exit(0);
+    }
+
+    process->isolated_pid = child;
+
+#if (NXT_USE_CMSG_PID)
+    /* The sender gate compares against isolated_pid, which is now the child. */
+    msg->cmsg_pid = child;
+#endif
+
+    fd = syscall(SYS_memfd_create, "nxt_port_ready_test", MFD_CLOEXEC);
+    if (fd == -1) {
+        nxt_log_alert(thr->log, "port ready test failed to create the queue");
+        goto fail;
+    }
+
+    /* One page: every byte past it faults, so the mapping must be refused. */
+    if (ftruncate(fd, nxt_pagesize) == -1) {
+        nxt_log_alert(thr->log, "port ready test failed to size the queue");
+        (void) close(fd);
+        goto fail;
+    }
+
+    msg->fd[0] = fd;
+    msg->fd[1] = -1;
+
+    nxt_port_test_broadcasts = 0;
+
+    nxt_port_process_ready_handler(task, msg);
+
+    if (msg->fd[0] != -1 || nxt_port_ready_test_fd_is_open(fd)) {
+        nxt_log_alert(thr->log, "port ready test: the refused queue leaked "
+                      "its descriptor");
+        goto fail;
+    }
+
+    if (port->queue != NULL || port->queue_fd != -1) {
+        nxt_log_alert(thr->log, "port ready test: a refused queue was "
+                      "installed anyway");
+        goto fail;
+    }
+
+#if (NXT_USE_CMSG_PID)
+
+    /*
+     * Never announce a port nothing can be delivered on: every peer would
+     * hold the same unreachable copy, and a QUIT could never arrive.  The
+     * kept-queue case above is what stops this passing vacuously.
+     */
+    if (nxt_port_test_broadcasts != 0) {
+        nxt_log_alert(thr->log, "port ready test: a refused queue was "
+                      "broadcast anyway");
+        goto fail;
+    }
+
+    /*
+     * Not ready: nothing about this worker ever became usable, and the
+     * prototype's SIGCHLD notifies the others for any state but CREATING,
+     * so leaving it at CREATED still reaches the start's failure.
+     */
+    if (process->state == NXT_PROCESS_STATE_READY) {
+        nxt_log_alert(thr->log, "port ready test: a refused queue still "
+                      "marked the process ready");
+        goto fail;
+    }
+
+    if (!process->start_failed) {
+        nxt_log_alert(thr->log, "port ready test: a refused queue did not "
+                      "mark the start as failed");
+        goto fail;
+    }
+
+    /*
+     * The fixture enters at CREATING, as a worker whose WHOAMI has not been
+     * handled yet would.  Killing it while it is still CREATING would leave
+     * the prototype's SIGCHLD silent (nxt_application.c:907) and the start
+     * pending -- the wedge, reached by a different road.
+     */
+    if (process->state != NXT_PROCESS_STATE_CREATED) {
+        nxt_log_alert(thr->log, "port ready test: a refused queue left the "
+                      "process at CREATING, so nothing will notify its death");
+        goto fail;
+    }
+
+    /*
+     * Polled rather than blocking: a handler that never signalled would
+     * otherwise hang the suite instead of failing it.
+     */
+    for (i = 0; i < 100; i++) {
+        reaped = waitpid(child, &status, WNOHANG);
+
+        if (reaped == child) {
+            break;
+        }
+
+        if (reaped == -1) {
+            nxt_log_alert(thr->log, "port ready test: waitpid() failed %E",
+                          nxt_errno);
+            goto fail;
+        }
+
+        nxt_nanosleep(10 * 1000000);   /* 10ms, so at most a second. */
+    }
+
+    if (reaped != child) {
+        nxt_log_alert(thr->log, "port ready test: the process whose queue "
+                      "was refused was not killed");
+        goto fail;
+    }
+
+    if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) {
+        nxt_log_alert(thr->log, "port ready test: the killed process did not "
+                      "die of SIGKILL (status %d)", status);
+        return NXT_ERROR;
+    }
+
+    /*
+     * The latch, tested for what it is actually for.  A retransmitted
+     * PROCESS_READY must not signal a second time: the first pid has been
+     * reaped and may by now name an unrelated process.  Pointing
+     * isolated_pid at a second, live child makes that concrete -- without
+     * the latch the handler re-enters the failure arm and kills it, so the
+     * child's survival is the assertion.  Re-checking the first pid would
+     * prove nothing, since it is already dead.
+     */
+    child = fork();
+    if (child == -1) {
+        nxt_log_alert(thr->log, "port ready test failed to fork the second "
+                      "kill target");
+        return NXT_ERROR;
+    }
+
+    if (child == 0) {
+        for ( ;; ) {
+            pause();
+        }
+
+        _exit(0);
+    }
+
+    process->isolated_pid = child;
+    msg->cmsg_pid = child;
+
+    fd = syscall(SYS_memfd_create, "nxt_port_ready_test", MFD_CLOEXEC);
+    if (fd == -1 || ftruncate(fd, nxt_pagesize) == -1) {
+        nxt_log_alert(thr->log, "port ready test failed to re-create the "
+                      "queue");
+        if (fd != -1) {
+            (void) close(fd);
+        }
+        goto fail;
+    }
+
+    msg->fd[0] = fd;
+    msg->fd[1] = -1;
+
+    nxt_port_process_ready_handler(task, msg);
+
+    if (msg->fd[0] != -1 || nxt_port_ready_test_fd_is_open(fd)) {
+        nxt_log_alert(thr->log, "port ready test: the retransmitted READY "
+                      "leaked its descriptor");
+        goto fail;
+    }
+
+    if (process->state == NXT_PROCESS_STATE_READY) {
+        nxt_log_alert(thr->log, "port ready test: the retransmitted READY "
+                      "marked the process ready");
+        goto fail;
+    }
+
+    /*
+     * Still running: the latch refused the arm before it reached the kill.
+     *
+     * SIGKILL is delivered asynchronously, so a single WNOHANG poll here
+     * would race a handler that did signal and read as "survived" -- the
+     * assertion has to give a kill time to land before concluding none
+     * happened.  Verified by removing the latch check: without this window
+     * the mutation passes, with it the child is reaped and the test fails.
+     */
+    for (i = 0; i < 20; i++) {
+        reaped = waitpid(child, &status, WNOHANG);
+
+        if (reaped != 0) {
+            nxt_log_alert(thr->log, "port ready test: a retransmitted READY "
+                          "killed again");
+            return NXT_ERROR;
+        }
+
+        nxt_nanosleep(10 * 1000000);   /* 10ms, so 200ms in total. */
+    }
+
+    (void) kill(child, SIGKILL);
+    (void) waitpid(child, &status, 0);
+
+#else
+
+    /*
+     * With no kernel-validated sender pid the start cannot be failed
+     * safely, so the handler keeps the pre-#231 behaviour and announces the
+     * process on a port that cannot be reached.  Asserting that here is what
+     * keeps the guard honest: a change that quietly enabled the destructive
+     * arm on an unauthenticated platform fails this.
+     */
+    (void) i;
+    (void) reaped;
+
+    if (process->state != NXT_PROCESS_STATE_READY
+        || nxt_port_test_broadcasts == 0)
+    {
+        nxt_log_alert(thr->log, "port ready test: a platform with no sender "
+                      "credential did not keep the announcing behaviour");
+        goto fail;
+    }
+
+    if (process->start_failed) {
+        nxt_log_alert(thr->log, "port ready test: a platform with no sender "
+                      "credential latched a failed start");
+        goto fail;
+    }
+
+    /* Nothing signalled it, so the child is ours to clean up. */
+    (void) kill(child, SIGKILL);
+
+    if (waitpid(child, &status, 0) != child) {
+        nxt_log_alert(thr->log, "port ready test failed to reap the kill "
+                      "target");
+        return NXT_ERROR;
+    }
+
+#endif
+
+    return NXT_OK;
+
+fail:
+
+    (void) kill(child, SIGKILL);
+    (void) waitpid(child, &status, 0);
+
+    return NXT_ERROR;
+}
+
 #endif
 
 
@@ -449,9 +753,12 @@ nxt_port_ready_test(nxt_thread_t *thr)
     nxt_pid_t            isolated_pid;
     nxt_task_t           *task;
     nxt_int_t            ret;
-    nxt_port_t           *port;
+    nxt_port_t           *port, *queueless_port;
     nxt_runtime_t        *rt, *saved_rt;
     nxt_process_t        *process;
+#if (NXT_HAVE_MEMFD_CREATE)
+    nxt_process_t        *queueless;
+#endif
     nxt_port_recv_msg_t  msg;
 
     nxt_thread_time_update(thr);
@@ -474,8 +781,9 @@ nxt_port_ready_test(nxt_thread_t *thr)
 
 #endif
 
-    /* Defined before the first goto done: the cleanup there releases it. */
+    /* Defined before the first goto done: the cleanup there releases them. */
     port = NULL;
+    queueless_port = NULL;
 
     isolated_pid = nxt_pid + 3;
 
@@ -642,6 +950,51 @@ nxt_port_ready_test(nxt_thread_t *thr)
         goto done;
     }
 
+    /*
+     * Issue #231 needs its own fixture: the process above is ready and its
+     * port has a working queue, which is exactly the case that must NOT
+     * fail a start.  A fresh record, never announced, is the only way to
+     * reach the first-mapping arm.
+     */
+    queueless = nxt_mp_zalloc(mp, sizeof(nxt_process_t));
+    if (nxt_slow_path(queueless == NULL)) {
+        ret = NXT_ERROR;
+        goto done;
+    }
+
+    queueless->pid = nxt_pid + 5;
+    queueless->state = NXT_PROCESS_STATE_CREATING;
+    nxt_queue_init(&queueless->ports);
+
+    nxt_runtime_process_add(task, queueless);
+
+    queueless_port = nxt_port_new(task, 1, queueless->pid, NXT_PROCESS_APP);
+    if (nxt_slow_path(queueless_port == NULL)) {
+        ret = NXT_ERROR;
+        goto done;
+    }
+
+    queueless_port->pair[0] = -1;
+    queueless_port->pair[1] = -1;
+    queueless_port->socket.fd = -1;
+
+    nxt_queue_insert_tail(&queueless->ports, &queueless_port->link);
+
+    msg.port_msg.pid = queueless->pid;
+
+    ret = nxt_port_ready_test_queueless(thr, task, &msg, queueless,
+                                        queueless_port);
+
+    /* Restore the message for anything that runs after this case. */
+    msg.port_msg.pid = process->pid;
+#if (NXT_USE_CMSG_PID)
+    msg.cmsg_pid = process->isolated_pid;
+#endif
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto done;
+    }
+
 #if (NXT_USE_CMSG_PID)
 
     /*
@@ -669,6 +1022,10 @@ done:
      */
     if (port != NULL) {
         nxt_port_close(task, port);
+    }
+
+    if (queueless_port != NULL) {
+        nxt_port_close(task, queueless_port);
     }
 
     thr->runtime = saved_rt;
