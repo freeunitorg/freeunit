@@ -456,6 +456,125 @@ nxt_port_ready_test_short_queue(nxt_thread_t *thr, nxt_task_t *task,
 }
 
 /*
+ * The same wedge reached without any mmap failure: an authenticated
+ * PROCESS_READY for an application worker that carries no descriptor at all.
+ *
+ * At the receiver's RLIMIT_NOFILE the kernel delivers the payload and the
+ * SCM_CREDENTIALS while discarding SCM_RIGHTS and setting MSG_CTRUNC, which
+ * nothing in the receive path inspects -- so the handler sees a message that
+ * passes the sender gate with fd[0] == -1.  Only libunit attaches a queue to
+ * PROCESS_READY and it always does, so for an NXT_PROCESS_APP port this can
+ * never be legitimate; the core processes that do send fd -1 announce to main
+ * and are not APP.
+ *
+ * The fd is injected directly rather than by exhausting descriptors: the
+ * kernel path is the motivation, and reproducing it would make the test
+ * depend on the receiver's rlimit rather than on the handler's decision.
+ */
+static nxt_int_t
+nxt_port_ready_test_no_queue_fd(nxt_thread_t *thr, nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, nxt_process_t *process, nxt_port_t *port)
+{
+    int    status;
+    pid_t  child, reaped;
+
+    if (nxt_slow_path(port->queue != NULL
+                      || port->type != NXT_PROCESS_APP))
+    {
+        nxt_log_alert(thr->log, "port ready test: the no-queue-fd case needs "
+                      "an app port with no queue");
+        return NXT_ERROR;
+    }
+
+    child = fork();
+    if (child == -1) {
+        nxt_log_alert(thr->log, "port ready test failed to fork the kill "
+                      "target");
+        return NXT_ERROR;
+    }
+
+    if (child == 0) {
+        for ( ;; ) {
+            pause();
+        }
+
+        _exit(0);
+    }
+
+    process->isolated_pid = child;
+    process->start_failed = 0;
+    process->state = NXT_PROCESS_STATE_CREATING;
+
+#if (NXT_USE_CMSG_PID)
+    msg->cmsg_pid = child;
+#endif
+
+    /* What a truncated control block leaves behind. */
+    msg->fd[0] = -1;
+    msg->fd[1] = -1;
+
+    nxt_port_test_broadcasts = 0;
+
+    nxt_port_process_ready_handler(task, msg);
+
+#if (NXT_USE_CMSG_PID)
+
+    if (nxt_port_test_broadcasts != 0 || port->queue != NULL) {
+        nxt_log_alert(thr->log, "port ready test: a READY with no queue "
+                      "descriptor was broadcast anyway");
+        goto fail;
+    }
+
+    if (process->state == NXT_PROCESS_STATE_READY || !process->start_failed) {
+        nxt_log_alert(thr->log, "port ready test: a READY with no queue "
+                      "descriptor still marked the process ready");
+        goto fail;
+    }
+
+    if (waitpid(child, &status, 0) != child) {
+        nxt_log_alert(thr->log, "port ready test failed to reap the kill "
+                      "target");
+        return NXT_ERROR;
+    }
+
+    if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) {
+        nxt_log_alert(thr->log, "port ready test: the worker that announced "
+                      "no queue did not die of SIGKILL (status %d)", status);
+        return NXT_ERROR;
+    }
+
+#else
+
+    if (process->state != NXT_PROCESS_STATE_READY) {
+        nxt_log_alert(thr->log, "port ready test: a platform with no sender "
+                      "credential did not keep the announcing behaviour");
+        goto fail;
+    }
+
+    (void) kill(child, SIGKILL);
+
+    if (waitpid(child, &status, 0) != child) {
+        nxt_log_alert(thr->log, "port ready test failed to reap the kill "
+                      "target");
+        return NXT_ERROR;
+    }
+
+#endif
+
+    (void) reaped;
+
+    return NXT_OK;
+
+fail:
+
+    (void) kill(child, SIGKILL);
+    (void) waitpid(child, &status, 0);
+
+    return NXT_ERROR;
+}
+
+
+/*
  * Issue #231: a first PROCESS_READY whose queue cannot be mapped.
  *
  * This is a different arm from nxt_port_ready_test_short_queue() above,
@@ -753,11 +872,11 @@ nxt_port_ready_test(nxt_thread_t *thr)
     nxt_pid_t            isolated_pid;
     nxt_task_t           *task;
     nxt_int_t            ret;
-    nxt_port_t           *port, *queueless_port;
+    nxt_port_t           *port, *queueless_port, *nofd_port;
     nxt_runtime_t        *rt, *saved_rt;
     nxt_process_t        *process;
 #if (NXT_HAVE_MEMFD_CREATE)
-    nxt_process_t        *queueless;
+    nxt_process_t        *queueless, *nofd;
 #endif
     nxt_port_recv_msg_t  msg;
 
@@ -784,6 +903,7 @@ nxt_port_ready_test(nxt_thread_t *thr)
     /* Defined before the first goto done: the cleanup there releases them. */
     port = NULL;
     queueless_port = NULL;
+    nofd_port = NULL;
 
     isolated_pid = nxt_pid + 3;
 
@@ -985,6 +1105,48 @@ nxt_port_ready_test(nxt_thread_t *thr)
     ret = nxt_port_ready_test_queueless(thr, task, &msg, queueless,
                                         queueless_port);
 
+    /*
+     * Checked before the next case runs: its own assignment to ret would
+     * otherwise overwrite this failure and the suite would report a pass.
+     */
+    if (nxt_slow_path(ret != NXT_OK)) {
+        msg.port_msg.pid = process->pid;
+        goto done;
+    }
+
+    /*
+     * A second fresh record for the truncated-control case: the one above
+     * has its start_failed latch set, which would refuse the message before
+     * the arm under test is reached.
+     */
+    nofd = nxt_mp_zalloc(mp, sizeof(nxt_process_t));
+    if (nxt_slow_path(nofd == NULL)) {
+        ret = NXT_ERROR;
+        goto done;
+    }
+
+    nofd->pid = nxt_pid + 6;
+    nofd->state = NXT_PROCESS_STATE_CREATING;
+    nxt_queue_init(&nofd->ports);
+
+    nxt_runtime_process_add(task, nofd);
+
+    nofd_port = nxt_port_new(task, 1, nofd->pid, NXT_PROCESS_APP);
+    if (nxt_slow_path(nofd_port == NULL)) {
+        ret = NXT_ERROR;
+        goto done;
+    }
+
+    nofd_port->pair[0] = -1;
+    nofd_port->pair[1] = -1;
+    nofd_port->socket.fd = -1;
+
+    nxt_queue_insert_tail(&nofd->ports, &nofd_port->link);
+
+    msg.port_msg.pid = nofd->pid;
+
+    ret = nxt_port_ready_test_no_queue_fd(thr, task, &msg, nofd, nofd_port);
+
     /* Restore the message for anything that runs after this case. */
     msg.port_msg.pid = process->pid;
 #if (NXT_USE_CMSG_PID)
@@ -1026,6 +1188,10 @@ done:
 
     if (queueless_port != NULL) {
         nxt_port_close(task, queueless_port);
+    }
+
+    if (nofd_port != NULL) {
+        nxt_port_close(task, nofd_port);
     }
 
     thr->runtime = saved_rt;

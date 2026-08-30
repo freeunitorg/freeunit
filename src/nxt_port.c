@@ -613,156 +613,158 @@ nxt_port_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
             /* The port owns the descriptor now. */
             msg->fd[0] = -1;
 
-        } else {
-            /*
-             * A refused queue leaves the port as it was.  For a repeated
-             * PROCESS_READY that is the queue it already has, and the port
-             * keeps working.  For the first one it is no queue at all, and
-             * that is not a fallback to the socket: only libunit attaches
-             * a queue descriptor to PROCESS_READY, and a libunit process
-             * delivers a socket message only after dequeuing the
-             * READ_SOCKET marker that nxt_port_socket_write2() emits under
-             * port->queue != NULL.  A queueless sender cannot emit the
-             * marker, so its messages are suspended undelivered on the
-             * worker side, and the second one fails the worker's context
-             * ("too many port socket messages").  The broadcast below
-             * forwards queue_fd == -1, so every peer holds the same
-             * unreachable copy; a QUIT can never arrive, while requests
-             * still flow through the shared app queue.  See issue #231.
-             *
-             * The message is still not refused outright.  Failing the
-             * start is the honest reaction to a genuine mmap failure, and
-             * the sender gate above now makes that safe to do on ucred and
-             * cmsgcred platforms -- a forged PROCESS_READY can no longer
-             * use it to kill a legitimate start.  The behaviour change
-             * itself, and the kill of the worker that is left with no way
-             * of being reached, is issue #231.
-             */
-            if (port->queue == NULL) {
+        } else if (port->queue != NULL) {
+            nxt_log(task, NXT_LOG_WARN, "process %PI ready: cannot map "
+                    "the replacement queue, keeping the current one",
+                    msg->port_msg.pid);
+        }
+    }
+
+    /*
+     * One test for both ways an application worker can end up with no queue:
+     * a descriptor that could not be mapped, and no descriptor at all.
+     *
+     * The second is not hypothetical.  Only libunit attaches a queue to
+     * PROCESS_READY, and it always does (nxt_unit.c:1050) -- the processes
+     * that legitimately send fd -1 are the core ones, which announce to main
+     * and are not NXT_PROCESS_APP.  But at the receiver's RLIMIT_NOFILE the
+     * kernel delivers the payload and the credential while discarding
+     * SCM_RIGHTS and setting MSG_CTRUNC, which nothing here inspects, so an
+     * authenticated READY can arrive with its descriptor silently gone.
+     * Treating that as ready would broadcast the same unreachable port that
+     * issue #231 is about, by a different road.
+     *
+     * A queueless APP port is therefore a failed start either way, and the
+     * distinction that matters is not how the descriptor was lost but that
+     * the worker cannot be reached on it: no fallback to the socket exists,
+     * because a libunit process only delivers a socket message after
+     * dequeuing the READ_SOCKET marker that nxt_port_socket_write2() emits
+     * under port->queue != NULL.  A queueless sender never emits the marker,
+     * its messages are suspended undelivered, and the second one fails the
+     * worker with "too many port socket messages".
+     *
+     * A repeated READY whose replacement mapping failed keeps the queue it
+     * has and is not a failed start -- it is excluded here by port->queue.
+     */
+
+    if (port->queue == NULL && port->type == NXT_PROCESS_APP) {
 #if (NXT_USE_CMSG_PID)
+        /*
+         * The whole arm, not only the kill, is confined to the
+         * platforms that authenticate the sender.  Every step of it
+         * is destructive -- it refuses the announcement, strands the
+         * process at CREATED and signals it -- and none of that is
+         * safe to do on a message that cannot be attributed.
+         *
+         * Acting on an unauthenticated message would also be worse
+         * than the bug it fixes: without the kill below there is
+         * nothing to reap the worker, so the prototype never sends
+         * the REMOVE_PID that fails the start, and the latch refuses
+         * every retransmission -- a start pending forever rather
+         * than one that fails. Elsewhere the old behaviour stands
+         * until NEW_PORT and PROCESS_READY carry provenance
+         * everywhere; that is issue #223.
+         */
+
+        nxt_alert(task, "process %PI ready: cannot map the queue; "
+                  "failing the start", msg->port_msg.pid);
+
+        /*
+         * The tail below is not reached, so close what the sender
+         * attached here instead: the descriptor that could not be
+         * mapped, and fd[1], which this handler never uses.
+         */
+        nxt_port_recv_msg_close_fds(msg);
+
+        /*
+         * A retransmitted PROCESS_READY must not signal again: the
+         * pid has been killed and, once reaped, may name an
+         * unrelated process.  The state cannot carry this, because
+         * the process has to stay at CREATED.
+         */
+        process->start_failed = 1;
+
+        /*
+         * The kill only fails the start if somebody notices the
+         * death, and the prototype's SIGCHLD handler notifies the
+         * others for any state but CREATING
+         * (nxt_application.c:907).
+         *
+         * The record is normally CREATED by then: the worker sends
+         * PROCESS_CREATED first (nxt_process.c:918) and the
+         * prototype sets the state when it handles it
+         * (nxt_application.c:769).  Both messages travel the same
+         * socketpair, so READY cannot overtake CREATED.  It can
+         * however be LOST: if that write hits EAGAIN the message is
+         * buffered on the port (nxt_port_socket.c:331-359) and the
+         * worker then enters init->start and never returns to its
+         * loop to flush it, while libunit makes the descriptor
+         * blocking and sends READY regardless.  The record is then
+         * still CREATING here.
+         *
+         * Advancing it is what guarantees the REMOVE_PID that
+         * carries the start stream; leaving it at CREATING would
+         * kill the worker and still leave the start pending, which
+         * is the wedge this arm exists to end.
+         *
+         * CREATED, not READY: it never became usable, and on the
+         * paths main reports rather than the prototype, READY is
+         * what makes main clear the start stream
+         * (nxt_main_process.c:1108-1110).
+         */
+        if (process->state == NXT_PROCESS_STATE_CREATING) {
+            process->state = NXT_PROCESS_STATE_CREATED;
+        }
+
+        /*
+         * The process is left at CREATED because nothing about it
+         * ever became ready, and that costs the release nothing:
+         * an app worker announces itself to the prototype, whose
+         * SIGCHLD handler notifies the others whenever the state is
+         * anything but CREATING (nxt_application.c:907), so CREATED
+         * and READY travel the same path.  The stream that REMOVE_PID
+         * carries -- the one the router turns into the start's
+         * RPC_ERROR -- was set by the prototype when it forked the
+         * worker (nxt_application.c:672) and is untouched here.
+         *
+         * isolated_pid is the pid as this receiver sees it, which
+         * inside a pid namespace is a different number from the
+         * global one; nxt_process.c uses the same identity rule
+         * when it kills a child whose cgroup setup failed.
+         *
+         * The positive test is redundant -- the sender gate above
+         * rejects a non-positive isolated_pid before this arm is
+         * reachable, under the same #if -- and is kept only because
+         * what it guards is kill(0, SIGKILL), which would signal
+         * the caller's whole process group.  A later change that
+         * moved or relaxed that gate would otherwise turn this into
+         * exactly that.
+         */
+        if (nxt_fast_path(process->isolated_pid > 0)) {
+            if (kill(process->isolated_pid, SIGKILL) == -1) {
                 /*
-                 * The whole arm, not only the kill, is confined to the
-                 * platforms that authenticate the sender.  Every step of it
-                 * is destructive -- it refuses the announcement, strands the
-                 * process at CREATED and signals it -- and none of that is
-                 * safe to do on a message that cannot be attributed.
-                 *
-                 * Acting on an unauthenticated message would also be worse
-                 * than the bug it fixes: without the kill below there is
-                 * nothing to reap the worker, so the prototype never sends
-                 * the REMOVE_PID that fails the start, and the latch refuses
-                 * every retransmission -- a start pending forever rather
-                 * than one that fails. Elsewhere the old behaviour stands
-                 * until NEW_PORT and PROCESS_READY carry provenance
-                 * everywhere; that is issue #223.
+                 * ESRCH is ordinary here: the process may already
+                 * have exited with a SIGCHLD still pending.
                  */
-
-                nxt_alert(task, "process %PI ready: cannot map the queue; "
-                          "failing the start", msg->port_msg.pid);
-
-                /*
-                 * The tail below is not reached, so close what the sender
-                 * attached here instead: the descriptor that could not be
-                 * mapped, and fd[1], which this handler never uses.
-                 */
-                nxt_port_recv_msg_close_fds(msg);
-
-                /*
-                 * A retransmitted PROCESS_READY must not signal again: the
-                 * pid has been killed and, once reaped, may name an
-                 * unrelated process.  The state cannot carry this, because
-                 * the process has to stay at CREATED.
-                 */
-                process->start_failed = 1;
-
-                /*
-                 * The kill only fails the start if somebody notices the
-                 * death, and the prototype's SIGCHLD handler notifies the
-                 * others for any state but CREATING
-                 * (nxt_application.c:907).
-                 *
-                 * The record is normally CREATED by then: the worker sends
-                 * PROCESS_CREATED first (nxt_process.c:918) and the
-                 * prototype sets the state when it handles it
-                 * (nxt_application.c:769).  Both messages travel the same
-                 * socketpair, so READY cannot overtake CREATED.  It can
-                 * however be LOST: if that write hits EAGAIN the message is
-                 * buffered on the port (nxt_port_socket.c:331-359) and the
-                 * worker then enters init->start and never returns to its
-                 * loop to flush it, while libunit makes the descriptor
-                 * blocking and sends READY regardless.  The record is then
-                 * still CREATING here.
-                 *
-                 * Advancing it is what guarantees the REMOVE_PID that
-                 * carries the start stream; leaving it at CREATING would
-                 * kill the worker and still leave the start pending, which
-                 * is the wedge this arm exists to end.
-                 *
-                 * CREATED, not READY: it never became usable, and on the
-                 * paths main reports rather than the prototype, READY is
-                 * what makes main clear the start stream
-                 * (nxt_main_process.c:1108-1110).
-                 */
-                if (process->state == NXT_PROCESS_STATE_CREATING) {
-                    process->state = NXT_PROCESS_STATE_CREATED;
-                }
-
-                /*
-                 * The process is left at CREATED because nothing about it
-                 * ever became ready, and that costs the release nothing:
-                 * an app worker announces itself to the prototype, whose
-                 * SIGCHLD handler notifies the others whenever the state is
-                 * anything but CREATING (nxt_application.c:907), so CREATED
-                 * and READY travel the same path.  The stream that REMOVE_PID
-                 * carries -- the one the router turns into the start's
-                 * RPC_ERROR -- was set by the prototype when it forked the
-                 * worker (nxt_application.c:672) and is untouched here.
-                 *
-                 * isolated_pid is the pid as this receiver sees it, which
-                 * inside a pid namespace is a different number from the
-                 * global one; nxt_process.c uses the same identity rule
-                 * when it kills a child whose cgroup setup failed.
-                 *
-                 * The positive test is redundant -- the sender gate above
-                 * rejects a non-positive isolated_pid before this arm is
-                 * reachable, under the same #if -- and is kept only because
-                 * what it guards is kill(0, SIGKILL), which would signal
-                 * the caller's whole process group.  A later change that
-                 * moved or relaxed that gate would otherwise turn this into
-                 * exactly that.
-                 */
-                if (nxt_fast_path(process->isolated_pid > 0)) {
-                    if (kill(process->isolated_pid, SIGKILL) == -1) {
-                        /*
-                         * ESRCH is ordinary here: the process may already
-                         * have exited with a SIGCHLD still pending.
-                         */
-                        nxt_log(task, (nxt_errno == ESRCH) ? NXT_LOG_INFO
-                                                           : NXT_LOG_ALERT,
-                                "kill(%PI, SIGKILL) failed for a process "
-                                "whose queue could not be mapped %E",
-                                process->isolated_pid, nxt_errno);
-                    }
-                }
-
-                return;
-#else
-                /*
-                 * See above: with no kernel-validated sender pid the start
-                 * cannot be failed safely, so the announcement stands and
-                 * the port stays unreachable.  This is issue #231 as it was.
-                 */
-                nxt_alert(task, "process %PI ready: cannot map the queue; "
-                          "the process cannot be reached on this port",
-                          msg->port_msg.pid);
-#endif
-
-            } else {
-                nxt_log(task, NXT_LOG_WARN, "process %PI ready: cannot map "
-                        "the replacement queue, keeping the current one",
-                        msg->port_msg.pid);
+                nxt_log(task, (nxt_errno == ESRCH) ? NXT_LOG_INFO
+                                                   : NXT_LOG_ALERT,
+                        "kill(%PI, SIGKILL) failed for a process "
+                        "whose queue could not be mapped %E",
+                        process->isolated_pid, nxt_errno);
             }
         }
+
+        return;
+#else
+        /*
+         * See above: with no kernel-validated sender pid the start
+         * cannot be failed safely, so the announcement stands and
+         * the port stays unreachable.  This is issue #231 as it was.
+         */
+        nxt_alert(task, "process %PI ready: cannot map the queue; "
+                  "the process cannot be reached on this port",
+                  msg->port_msg.pid);
+#endif
     }
 
     /*
