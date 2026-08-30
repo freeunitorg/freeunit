@@ -27,6 +27,29 @@ other capget() failure remains fatal.
 </changes>
 
 
+<changes apply="unit-php unit-php8.3 unit-php8.4 unit-php8.5
+                unit-python unit-python2.7
+                unit-python3.8 unit-python3.9 unit-python3.10 unit-python3.11
+                unit-python3.12 unit-python3.13 unit-python3.14
+                unit-go
+                unit-perl
+                unit-ruby
+                unit-jsc-common unit-jsc11 unit-jsc17 unit-jsc18
+                unit-jsc19 unit-jsc20 unit-jsc21
+                unit-wasm"
+         ver="1.36.2" rev="1"
+         date="2026-08-30" time="00:00:00 +0000"
+         packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change>
+<para>
+FreeUnit updated to 1.36.2.
+</para>
+</change>
+
+</changes>
+
+
 <changes apply="unit"
          ver="1.36.1" rev="1"
          date="2026-08-28" time="00:00:00 +0000"
