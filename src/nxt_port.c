@@ -241,15 +241,27 @@ nxt_port_enable(nxt_task_t *task, nxt_port_t *port,
  *
  * The audit recommends rejecting application workers / prototypes
  * that forge cert/script/socket/access-log/etc. messages to the
- * main process.  A first draft was implemented but caused
- * regressions in the isolation test suite — the kernel-validated
- * sender PID (SCM_CREDENTIALS) is not consistently available on
- * the existing socketpair setup, and the message-dispatch path
- * runs before the prototype's process registration completes.
+ * main process.  A first draft was reverted because the
+ * kernel-validated sender PID was not available on the existing
+ * socketpair setup.  That blocker is gone: nxt_socketpair_create()
+ * sets SO_PASSCRED on both ends (and libunit does the same on its
+ * own sockets), NXT_HAVE_MSGHDR_CMSGCRED platforms get an SCM_CREDS
+ * control message attached to every send by
+ * nxt_socket_msg_oob_init(), and both receive paths in
+ * nxt_port_socket.c fill msg->cmsg_pid.  Individual handlers are
+ * being gated on nxt_recv_msg_cmsg_pid() one at a time --
+ * nxt_main_process_created_handler(), nxt_main_start_process_handler(),
+ * nxt_port_process_ready_handler(), nxt_proto_process_created_handler()
+ * and the cert/script/socket/access-log handlers already are.
  *
- * Reverted to the pre-audit dispatch path here and deferred the
- * ACL to a follow-up that introduces SO_PASSCRED on the relevant
- * socketpairs and updates the process-registration ordering.
+ * What is left is the table-driven part: a per-message-type sender
+ * ACL applied here, in the dispatcher, so that a handler which
+ * forgets its own gate is still covered.  That still needs the
+ * process-registration ordering sorted out -- dispatch can run
+ * before the prototype has finished registering a child, so the ACL
+ * cannot simply require an already registered sender.  Platforms
+ * with neither SCM_CREDENTIALS nor SCM_CREDS (macOS, NetBSD,
+ * OpenBSD, illumos) stay unauthenticated either way.
  * See https://github.com/andypost/unit/pull/14 review thread.
  */
 
@@ -469,14 +481,14 @@ nxt_port_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     /* Unreferenced: main and prototype processes run a single engine. */
 
     /*
-     * The lookup stays on msg->port_msg.pid.  The kernel-validated sender
-     * PID cannot replace it here: the prototype installs this handler too,
-     * and there SCM_CREDENTIALS carries the namespace-local pid of a
-     * pid-isolated worker, while the runtime hash is keyed on the global
-     * one (see nxt_proto_process_created_handler(), which uses the two as
-     * distinct values, and nxt_process_created() refusing to register an
-     * isolated pid).  Authenticating this handler needs to accept either
-     * pid of the process it resolves; see the sender-ACL TODO above.
+     * The lookup stays on msg->port_msg.pid: it is the key of the runtime
+     * hash.  The kernel-validated sender PID cannot replace it, because the
+     * prototype installs this handler too, and there SCM_CREDENTIALS
+     * carries the namespace-local pid of a pid-isolated worker while the
+     * hash is keyed on the global one (see nxt_proto_process_created_handler(),
+     * which uses the two as distinct values, and nxt_process_create()
+     * refusing to register an isolated pid).  It authenticates the resolved
+     * process instead, right below.
      */
     process = nxt_runtime_process_find(rt, msg->port_msg.pid);
     if (nxt_slow_path(process == NULL)) {
@@ -484,14 +496,55 @@ nxt_port_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         return;
     }
 
+#if (NXT_USE_CMSG_PID)
     /*
-     * A repeated PROCESS_READY is not rejected: the message is not
-     * authenticated, so refusing it would let a forged one arriving first
-     * make itself permanent and lock the legitimate sender out of its own
-     * queue.  It replaces the mapping instead, as it did before this check
-     * existed, and the previous mapping is released below rather than
-     * leaked.  nxt_assert() is not used because it compiles out in release
-     * builds, leaving no diagnostic at all.
+     * Authenticate the sender before anything else is read or written: the
+     * port socket of the main or the prototype process is duplicated into
+     * every child (nxt_proc_keep_matrix[]), the wire pid in the message is
+     * chosen by the sender, and the handler below re-points the named
+     * process's port at the queue this message carries.  Without this gate
+     * any worker can announce a sibling and hand the receiver a shared
+     * memory queue of its own making.
+     *
+     * The credential is compared against process->isolated_pid, and only
+     * against it.  isolated_pid is by construction the pid of the process
+     * as the receiver sees it -- the fork() return value in
+     * nxt_process_create(), left alone when nxt_proto_process_created_handler()
+     * rewrites process->pid to the global pid of a pid-isolated worker.
+     * Accepting process->pid as well would be a bypass: inside a pid
+     * namespace another task whose namespace-local pid happens to equal the
+     * victim's global pid would pass, and a compromised worker can fork
+     * towards such a collision.
+     *
+     * A non-positive isolated_pid means the record was not created by a
+     * fork() in this process -- nxt_runtime_process_get() only fills
+     * ->pid -- so there is nothing to authenticate against and no
+     * legitimate PROCESS_READY to lose: a worker announces itself to its
+     * parent prototype, and main's own children are all forked by main.
+     * Reject rather than compare, so that a cmsg_pid of 0 or the -1 that
+     * the shared-memory queue path leaves in place (see
+     * nxt_port_queue_read_handler()) cannot match by accident.
+     */
+    if (nxt_slow_path(process->isolated_pid <= 0
+                      || nxt_recv_msg_cmsg_pid(msg) != process->isolated_pid))
+    {
+        nxt_alert(task, "process %PI sent PROCESS_READY claiming process %PI",
+                  nxt_recv_msg_cmsg_pid(msg), msg->port_msg.pid);
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+#endif
+
+    /*
+     * A repeated PROCESS_READY from the authenticated owner is not
+     * rejected: on ucred and cmsgcred platforms the gate above has already
+     * turned a forged repeat into a rejection, and a genuine one has to
+     * keep working -- the process may legitimately re-announce a new queue,
+     * and refusing it would strand the process on the mapping it has.  It
+     * replaces the mapping instead, as it did before this check existed,
+     * and the previous mapping is released below rather than leaked.
+     * nxt_assert() is not used because it compiles out in release builds,
+     * leaving no diagnostic at all.
      */
     if (nxt_slow_path(process->state == NXT_PROCESS_STATE_READY)) {
         nxt_log(task, NXT_LOG_WARN, "repeated PROCESS_READY claiming "
@@ -499,8 +552,8 @@ nxt_port_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     }
 
     /*
-     * Both guards reject before the state is set: a message that is not
-     * acted upon must leave no trace.  Marking a process ready and only
+     * Every guard here rejects before the state is set: a message that is
+     * not acted upon must leave no trace.  Marking a process ready and only
      * then rejecting it would make the next, legitimate PROCESS_READY trip
      * the guard above, and would let nxt_main_process_sigchld_handler()
      * clear the start stream of a process that never finished starting,
@@ -565,14 +618,13 @@ nxt_port_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
              * unreachable copy; a QUIT can never arrive, while requests
              * still flow through the shared app queue.  See issue #231.
              *
-             * The message is still not refused outright: it is not
-             * authenticated, and refusing it would let a forged
-             * PROCESS_READY carrying a bad descriptor keep the process
-             * from ever being marked ready.  Failing the start is the
-             * honest reaction to a genuine mmap failure, but it hands the
-             * same forgery a way to kill a legitimate start, so it has to
-             * wait for sender authentication (see the lookup comment
-             * above).
+             * The message is still not refused outright.  Failing the
+             * start is the honest reaction to a genuine mmap failure, and
+             * the sender gate above now makes that safe to do on ucred and
+             * cmsgcred platforms -- a forged PROCESS_READY can no longer
+             * use it to kill a legitimate start.  The behaviour change
+             * itself, and the kill of the worker that is left with no way
+             * of being reached, is issue #231.
              */
             if (port->queue == NULL) {
                 nxt_alert(task, "process %PI ready: cannot map the queue; "

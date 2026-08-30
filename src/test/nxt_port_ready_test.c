@@ -18,6 +18,13 @@
  *
  * A message can carry two descriptors regardless of how many its type
  * normally uses, so the test attaches both and expects both back.
+ *
+ * The handler also authenticates the sender against the isolated_pid of
+ * the process the message names, wherever the platform hands the receiver
+ * a kernel-validated pid (NXT_USE_CMSG_PID).  The fixture models a
+ * pid-isolated process -- pid and isolated_pid deliberately differ -- so
+ * that the cases below can tell the two apart: a credential equal to the
+ * global pid has to be refused just like a foreign one.
  */
 
 #include <nxt_main.h>
@@ -94,6 +101,112 @@ fail:
 
     return NXT_ERROR;
 }
+
+
+#if (NXT_USE_CMSG_PID)
+
+/*
+ * A PROCESS_READY whose kernel-validated sender pid does not match the
+ * isolated_pid of the process it names has to be refused outright: the
+ * descriptors it carries are closed, the process keeps the state it had,
+ * and the port keeps the queue it had.
+ *
+ * The message carries a mappable queue descriptor wherever one can be
+ * made, so that a handler without the gate is caught installing it rather
+ * than merely caught failing to map it -- which is what a /dev/null
+ * descriptor would produce, and would pass these checks on a queue that is
+ * already installed.
+ */
+static nxt_int_t
+nxt_port_ready_test_reject(nxt_thread_t *thr, nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, nxt_process_t *process, nxt_port_t *port,
+    nxt_pid_t cmsg_pid, const char *name)
+{
+    void                 *prev_queue;
+    nxt_fd_t             fd0, fd1, prev_fd;
+    nxt_pid_t            saved_cmsg_pid;
+    nxt_process_state_t  prev_state;
+
+#if (NXT_HAVE_MEMFD_CREATE)
+    fd0 = syscall(SYS_memfd_create, "nxt_port_ready_test", MFD_CLOEXEC);
+
+    if (fd0 != -1 && ftruncate(fd0, sizeof(nxt_port_queue_t)) == -1) {
+        (void) close(fd0);
+        fd0 = -1;
+    }
+#else
+    fd0 = open("/dev/null", O_RDONLY);
+#endif
+
+    fd1 = open("/dev/null", O_RDONLY);
+
+    if (fd0 == -1 || fd1 == -1) {
+        nxt_log_alert(thr->log, "port ready test: %s failed to open the "
+                      "descriptors", name);
+        goto fail;
+    }
+
+    prev_state = process->state;
+    prev_queue = port->queue;
+    prev_fd = port->queue_fd;
+
+    saved_cmsg_pid = msg->cmsg_pid;
+    msg->cmsg_pid = cmsg_pid;
+
+    msg->fd[0] = fd0;
+    msg->fd[1] = fd1;
+
+    nxt_port_process_ready_handler(task, msg);
+
+    msg->cmsg_pid = saved_cmsg_pid;
+
+    /*
+     * The state and the queue are checked before the descriptors: a
+     * handler that accepted the message owns fd0 through the port, and
+     * the cleanup below would close it a second time.
+     */
+    if (process->state != prev_state) {
+        nxt_log_alert(thr->log, "port ready test: %s changed the process "
+                      "state", name);
+        return NXT_ERROR;
+    }
+
+    if (port->queue != prev_queue || port->queue_fd != prev_fd) {
+        nxt_log_alert(thr->log, "port ready test: %s replaced the queue",
+                      name);
+        return NXT_ERROR;
+    }
+
+    if (msg->fd[0] != -1 || msg->fd[1] != -1) {
+        nxt_log_alert(thr->log, "port ready test: %s left fds in the message",
+                      name);
+        return NXT_ERROR;
+    }
+
+    if (nxt_port_ready_test_fd_is_open(fd0)
+        || nxt_port_ready_test_fd_is_open(fd1))
+    {
+        nxt_log_alert(thr->log, "port ready test: %s leaked a descriptor",
+                      name);
+        goto fail;   /* closes only what is still open */
+    }
+
+    return NXT_OK;
+
+fail:
+
+    if (fd0 != -1 && nxt_port_ready_test_fd_is_open(fd0)) {
+        (void) close(fd0);
+    }
+
+    if (fd1 != -1 && nxt_port_ready_test_fd_is_open(fd1)) {
+        (void) close(fd1);
+    }
+
+    return NXT_ERROR;
+}
+
+#endif
 
 
 #if (NXT_HAVE_MEMFD_CREATE)
@@ -333,6 +446,7 @@ nxt_int_t
 nxt_port_ready_test(nxt_thread_t *thr)
 {
     nxt_mp_t             *mp;
+    nxt_pid_t            isolated_pid;
     nxt_task_t           *task;
     nxt_int_t            ret;
     nxt_port_t           *port;
@@ -362,6 +476,8 @@ nxt_port_ready_test(nxt_thread_t *thr)
 
     /* Defined before the first goto done: the cleanup there releases it. */
     port = NULL;
+
+    isolated_pid = nxt_pid + 3;
 
     mp = nxt_mp_create(1024, 128, 256, 32);
     if (nxt_slow_path(mp == NULL)) {
@@ -410,13 +526,25 @@ nxt_port_ready_test(nxt_thread_t *thr)
         goto done;
     }
 
+    /*
+     * A pid-isolated process: pid is the global pid the runtime hash is
+     * keyed on, isolated_pid is the namespace-local pid the receiver reads
+     * out of SCM_CREDENTIALS.  They differ on purpose -- with one value
+     * every case would pass the sender gate whichever of the two it
+     * compared, and the collision the gate exists to refuse could not be
+     * expressed at all.
+     */
     process->pid = nxt_pid + 2;
+    process->isolated_pid = isolated_pid;
     process->state = NXT_PROCESS_STATE_CREATING;
     nxt_queue_init(&process->ports);
 
     nxt_runtime_process_add(task, process);
 
     msg.port_msg.pid = process->pid;
+#if (NXT_USE_CMSG_PID)
+    msg.cmsg_pid = process->isolated_pid;
+#endif
 
     ret = nxt_port_ready_test_case(thr, task, &msg, "ready with no ports");
     if (nxt_slow_path(ret != NXT_OK)) {
@@ -434,13 +562,10 @@ nxt_port_ready_test(nxt_thread_t *thr)
         goto done;
     }
 
-#if (NXT_HAVE_MEMFD_CREATE)
-
     /*
-     * With a port on the process the handler takes the descriptor over and
-     * maps it, and a second PROCESS_READY replaces that mapping instead of
-     * leaking it -- a repeated message is not refused, so that a forged one
-     * arriving first cannot lock the legitimate sender out.
+     * From here on the process has a port, so the empty-ports guard can no
+     * longer be what refuses a message, and a refusal has to come from the
+     * sender gate itself.
      */
     port = nxt_port_new(task, 1, process->pid, NXT_PROCESS_APP);
     if (nxt_slow_path(port == NULL)) {
@@ -454,6 +579,54 @@ nxt_port_ready_test(nxt_thread_t *thr)
 
     nxt_queue_insert_tail(&process->ports, &port->link);
 
+#if (NXT_USE_CMSG_PID)
+
+    /* An unrelated sender announcing somebody else's process. */
+    ret = nxt_port_ready_test_reject(thr, task, &msg, process, port,
+                                     nxt_pid + 4, "a foreign sender");
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto done;
+    }
+
+    /*
+     * The global pid of the very process being announced.  Inside a pid
+     * namespace it is not the pid the receiver sees for that process, and
+     * another task's namespace-local pid can be made to equal it, so
+     * accepting it as well would leave the gate bypassable.
+     */
+    ret = nxt_port_ready_test_reject(thr, task, &msg, process, port,
+                                     process->pid, "the global pid");
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto done;
+    }
+
+    /*
+     * A record the receiver never forked keeps isolated_pid 0 --
+     * nxt_runtime_process_get() fills only ->pid.  There is nothing to
+     * authenticate against, so the credential of 0 that a plain equality
+     * test would accept has to be refused as well.
+     */
+    process->isolated_pid = 0;
+
+    ret = nxt_port_ready_test_reject(thr, task, &msg, process, port, 0,
+                                     "a process record nothing forked");
+
+    process->isolated_pid = isolated_pid;
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto done;
+    }
+
+#endif
+
+#if (NXT_HAVE_MEMFD_CREATE)
+
+    /*
+     * The handler takes the descriptor over and maps it, and a second
+     * PROCESS_READY from the same, authenticated sender replaces that
+     * mapping instead of leaking it: a process may re-announce a new queue,
+     * and refusing the repeat would strand it on the mapping it has.
+     */
     ret = nxt_port_ready_test_queue(thr, task, &msg, port, "first ready");
     if (nxt_slow_path(ret != NXT_OK)) {
         goto done;
@@ -465,6 +638,25 @@ nxt_port_ready_test(nxt_thread_t *thr)
     }
 
     ret = nxt_port_ready_test_short_queue(thr, task, &msg, port);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto done;
+    }
+
+#if (NXT_USE_CMSG_PID)
+
+    /*
+     * The same forgery once a queue is installed and the process is ready:
+     * this is the one that matters, because it is where an accepted message
+     * would re-point a live port at shared memory of the sender's choosing.
+     */
+    ret = nxt_port_ready_test_reject(thr, task, &msg, process, port,
+                                     nxt_pid + 4, "a foreign sender re-arming "
+                                     "an installed queue");
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto done;
+    }
+
+#endif
 
 #endif
 
