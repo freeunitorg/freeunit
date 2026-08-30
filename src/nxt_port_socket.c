@@ -40,6 +40,8 @@ static void nxt_port_error_handler(nxt_task_t *task, void *obj, void *data);
 #if (NXT_TESTS)
 static nxt_uint_t  nxt_port_test_msg_alloc_failure_count;
 
+nxt_uint_t  nxt_port_test_broadcasts;
+
 
 void
 nxt_port_test_msg_alloc_failures(nxt_uint_t failures)

@@ -123,6 +123,20 @@ struct nxt_process_s {
      */
     nxt_bool_t               released;
 
+    /*
+     * Latched when a PROCESS_READY could not be acted upon and the process
+     * was killed for it (nxt_port_process_ready_handler()).  A retransmitted
+     * PROCESS_READY must not re-enter that arm and signal a pid that has
+     * already been killed -- and, once reaped, may name an unrelated
+     * process.
+     *
+     * The state cannot carry this, because the process is left at CREATED.
+     * Set only where the sender of a PROCESS_READY can be authenticated
+     * (NXT_USE_CMSG_PID); elsewhere that arm is not reachable, so nothing
+     * ever latches it.
+     */
+    nxt_bool_t               start_failed;
+
     nxt_port_mmaps_t         incoming;
 
 

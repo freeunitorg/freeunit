@@ -389,6 +389,14 @@ nxt_int_t nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port,
 #if (NXT_TESTS)
 void nxt_port_test_msg_alloc_failures(nxt_uint_t failures);
 void nxt_port_test_run_error_handler(nxt_task_t *task, nxt_port_t *port);
+
+/*
+ * Counts entries into nxt_port_send_new_port().  It is nxt_inline and
+ * skips the announced process and the receiver itself, so a fixture with
+ * one process cannot tell "not broadcast" from "broadcast to nobody" by
+ * observing peers; counting the call itself distinguishes them.
+ */
+NXT_EXPORT extern nxt_uint_t  nxt_port_test_broadcasts;
 #endif
 
 nxt_inline nxt_int_t
