@@ -1,0 +1,77 @@
+name: "Security (Syscall Drift)"
+
+on:
+  pull_request:
+    paths:
+      - configure
+      - 'auto/**'
+      - 'src/**'
+      - 'test/syscalls/**'
+      - '.github/workflows/security-syscalls.yml'
+  push:
+    branches: master
+    paths:
+      - configure
+      - 'auto/**'
+      - 'src/**'
+      - 'test/syscalls/**'
+      - '.github/workflows/security-syscalls.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Cancel superseded runs for the same pull request.  Non-PR events fall back
+  # to the run id, which is unique, so a push is never grouped with another:
+  # Actions keeps only one PENDING run per group and would drop a queued commit
+  # even with cancel-in-progress false, which would break bisectability.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  syscalls:
+    name: Syscall drift, advisory (${{ matrix.libc }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Advisory until a baseline has been captured from a CI run and committed.
+    # The container pins the libc by digest, but which syscalls glibc picks
+    # still depends partly on the host kernel, and these baselines were taken
+    # on a developer machine -- so a runner on an older kernel could add a
+    # fallback syscall the baseline has never seen, and a red gate here would
+    # more likely be wrong than right.  test/syscalls/README.md has the
+    # four-step sequence for making it blocking; it is one commit.
+    continue-on-error: true
+
+    strategy:
+      fail-fast: false
+      matrix:
+        libc: [ glibc, musl ]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Everything happens inside a pinned container (debian:trixie-slim /
+      # alpine:3.22), so the runner image can move without moving the baseline:
+      # the captured set depends on the libc, not on the host.  The runner's own
+      # kernel is still in play -- see the artifact note below.
+      - name: Capture the syscall set
+        run: test/syscalls/run-in-docker.sh ${{ matrix.libc }}
+             -o "syscalls-${{ matrix.libc }}.txt"
+
+      # Uploaded even on failure: reconciling a baseline against what CI
+      # actually observed is the documented update path (test/syscalls/README.md)
+      # and it only works if the list survives a red run.
+      - name: Upload the captured list
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syscalls-${{ matrix.libc }}
+          path: syscalls-${{ matrix.libc }}.txt
+          if-no-files-found: warn
+
+      - name: Compare against the baseline
+        run: test/syscalls/check.sh
+             "test/syscalls/baseline-linux-${{ matrix.libc }}.txt"
+             "syscalls-${{ matrix.libc }}.txt"
