@@ -30,7 +30,11 @@ n_captured=$(grep -c '^[a-z]' "$CAPTURED" || :)
     || die "captured list has only $n_captured entries -- refusing to compare"
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT INT TERM
+# A trapped signal does not end a POSIX shell, so each signal handler exits
+# explicitly; the EXIT trap is cleared first so the cleanup runs once.
+trap 'rm -rf "$work"' EXIT
+trap 'trap - EXIT; rm -rf "$work"; exit 130' INT
+trap 'trap - EXIT; rm -rf "$work"; exit 143' TERM
 
 # Baselines carry '#' comments and blank lines; captures do not.
 # LC_ALL=C throughout: comm rejects input sorted under a locale whose collation
