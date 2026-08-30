@@ -8,6 +8,18 @@ conventionally returns, EPERM and ENOSYS; every other errno still
 aborts, because a privilege downgrade caused by a bug in Unit is worse
 than a hard failure.
 
+The same shim also watches capset(2), which is how this file covers
+nxt_capability_drop() -- the drop every forked process performs at the
+tail of nxt_process_apply_creds().  Its effect cannot be tested here:
+the suite runs as an ordinary user with no capabilities, so "the
+application has none either" is true with or without the code.  What
+can be tested, and cannot pass by accident, is *which processes drop*.
+Main must not, because it binds listening sockets on every
+reconfiguration; the prototype must, because it is the ancestor of
+every worker; and the worker itself must not, because it inherits.
+A run with real capabilities to lose needs root, and lives in the
+freeunit-harness smoke test instead.
+
 Reproducing a seccomp filter in a test would need privileges the suite
 does not have, so the errno is injected instead: src/nxt_capability.c
 calls the kernel through the nxt_capget() macro, which expands to
@@ -138,6 +150,7 @@ class Unitd:
         self.log = f'{self.dir}/unit.log'
         self.stderr = f'{self.dir}/stderr.log'
         self.record = f'{self.dir}/capget.pids'
+        self.capset_record = f'{self.dir}/capset.pids'
         self.control = f'{self.dir}/control.unit.sock'
         self.listener = f'{self.dir}/app.sock'
         self.pidfile = f'{self.dir}/unit.pid'
@@ -153,6 +166,7 @@ class Unitd:
         env['LD_PRELOAD'] = shim
         env['NXT_TEST_CAPGET_ERRNO'] = str(errno)
         env['NXT_TEST_CAPGET_RECORD'] = self.record
+        env['NXT_TEST_CAPSET_RECORD'] = self.capset_record
 
         # unitd's stderr is kept apart from unit.log on purpose.  The
         # first warning is written from nxt_runtime_conf_init(), before
@@ -201,10 +215,16 @@ class Unitd:
         return Path(path).read_text(encoding='utf-8', errors='ignore')
 
     def filtered_pids(self):
-        if not Path(self.record).exists():
+        return self.recorded_pids(self.record)
+
+    def capset_pids(self):
+        return self.recorded_pids(self.capset_record)
+
+    def recorded_pids(self, path):
+        if not Path(path).exists():
             return set()
 
-        return {int(p) for p in self.read(self.record).split()}
+        return {int(p) for p in self.read(path).split()}
 
 
 @pytest.fixture()
@@ -319,6 +339,44 @@ def test_capget_filtered_keeps_running(shim, unitd_factory, filtered_errno):
     uid = re.search(r'^Uid:\s+(\d+)\s+(\d+)', status, re.M)
     assert uid is not None, 'app Uid'
     assert int(uid.group(2)) == os.geteuid(), 'app runs as unitd uid'
+
+    # The application holds no capabilities at all.  On a suite that
+    # runs without any to begin with this cannot fail -- which is why
+    # it is not the real assertion; see the capset() bookkeeping below.
+    # It is still worth stating, because it is the property the change
+    # exists to guarantee and the harness smoke test asserts the same
+    # thing on a unitd that demonstrably did hold capabilities.
+    for name in ('CapInh', 'CapPrm', 'CapEff', 'CapAmb'):
+        found = re.search(rf'^{name}:\s+([0-9a-f]+)', status, re.M)
+
+        if found is None:
+            continue  # CapAmb needs Linux 4.3.
+
+        assert int(found.group(1), 16) == 0, f'app {name}'
+
+    # The real assertion: nxt_capability_drop() ran, and ran in exactly
+    # the processes it is supposed to.  Unlike the zeroes above, none of
+    # this can pass by accident -- on the commit before this one the
+    # file does not exist at all.
+    main_pid = int(unitd.read(unitd.pidfile).strip())
+    proto_pid = int(
+        re.search(r'^PPid:\s+(\d+)', status, re.M).group(1)
+    )
+    dropped = unitd.capset_pids()
+
+    # Main must never drop: it binds listening sockets in
+    # nxt_main_listening_socket() on every reconfiguration and so needs
+    # CAP_NET_BIND_SERVICE for as long as it lives.
+    assert main_pid not in dropped, 'main keeps its capabilities'
+
+    # The prototype must, since it is the ancestor of every worker.
+    assert proto_pid in dropped, 'the prototype drops'
+
+    # The worker must not: nxt_app_setup() calls init->start directly
+    # without going through nxt_process_apply_creds(), so it inherits
+    # sets the prototype already emptied.  If that ever changes this
+    # assertion is the thing that says so.
+    assert app_pid not in dropped, 'the worker inherits rather than drops'
 
     # The application inherited the shim -- fork() carries the mapping,
     # armed, whatever the environment says afterwards ...

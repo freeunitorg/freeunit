@@ -33,6 +33,17 @@
  * no child could have written to proves nothing about what the
  * children did.
  *
+ * NXT_TEST_CAPSET_RECORD does the same for capset(2), which the shim
+ * never fails -- it only writes down who called it and forwards the
+ * call.  That is how the test observes nxt_capability_drop(): the drop
+ * has no visible effect in a suite that runs without any capability to
+ * drop, so "the app has no capabilities" would pass just as well
+ * without the code.  Which *processes* called capset() is the part
+ * that cannot pass by accident: main must never appear (it keeps
+ * CAP_NET_BIND_SERVICE for bind()), the prototype must, and the
+ * application worker must not, because it inherits the prototype's
+ * already-emptied sets rather than dropping again.
+ *
  * Build:
  *     cc -shared -fPIC -o capget_filter.so capget_filter.c -ldl
  */
@@ -60,6 +71,7 @@ typedef long (*nxt_syscall_fn)(long, long, long, long, long, long, long);
 static nxt_syscall_fn  nxt_real_syscall;
 static int             nxt_capget_errno;   /* 0: filter disabled */
 static char           *nxt_record_path;    /* strdup()ed, see above */
+static char           *nxt_capset_record_path;
 
 
 static void
@@ -80,6 +92,12 @@ nxt_shim_init(void)
     if (nxt_record_path == NULL && value != NULL && *value != '\0') {
         nxt_record_path = strdup(value);
     }
+
+    value = getenv("NXT_TEST_CAPSET_RECORD");
+
+    if (nxt_capset_record_path == NULL && value != NULL && *value != '\0') {
+        nxt_capset_record_path = strdup(value);
+    }
 }
 
 
@@ -92,12 +110,12 @@ nxt_shim_ctor(void)
 
 
 static void
-nxt_shim_record(void)
+nxt_shim_record(const char *path)
 {
     int   fd, len;
     char  buf[32];
 
-    if (nxt_record_path == NULL) {
+    if (path == NULL) {
         return;
     }
 
@@ -106,7 +124,7 @@ nxt_shim_record(void)
      * syscall(), so this cannot recurse back into the shim.
      */
 
-    fd = open(nxt_record_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
 
     if (fd < 0) {
         return;
@@ -149,6 +167,36 @@ syscall(long number, ...)
      * Reading six arguments when the caller passed fewer yields
      * garbage in the unused ones, which the kernel ignores for every
      * syscall that does not declare them.
+     *
+     * ISO C calls that undefined (C17 7.16.1.1p2: va_arg with no
+     * actual next argument), and there is no portable fix -- a
+     * variadic forwarder cannot learn its own argument count, and
+     * re-declaring syscall() with a fixed prototype only trades this
+     * undefined behaviour for calling a function through an
+     * incompatible type.  It is left as-is deliberately, because the
+     * concrete behaviour is the one every implementation already
+     * depends on:
+     *
+     *   - glibc's syscall() is an assembly stub that unconditionally
+     *     moves six argument registers, and musl's is a fixed
+     *     seven-parameter C function.  Neither ever walks a va_list,
+     *     so both read exactly the slots this reads.
+     *   - The slots read are always mapped memory, on every ABI Unit
+     *     builds for.  On x86-64 SysV the first five come from the
+     *     register save area gcc/clang spill at entry and the sixth
+     *     from the caller's own frame via overflow_arg_area; on
+     *     aarch64 all seven fit the eight-register save area; on
+     *     32-bit ABIs the excess reads land in the caller's frame.
+     *     None of them can fault, and none of them is used: only
+     *     `number` decides what happens below.
+     *
+     * Whether the shim should install a real seccomp filter instead
+     * was weighed and rejected: a filter needs PR_SET_NO_NEW_PRIVS,
+     * after which it is inherited across both fork() and execve(), so
+     * every unitd child would see capget() fail too -- and the record
+     * file below, whose whole value is showing that only main was
+     * affected, could no longer say anything.  It would also filter
+     * capset() in the children, which is the call the drop depends on.
      */
 
     va_start(ap, number);
@@ -162,9 +210,20 @@ syscall(long number, ...)
 
 #ifdef SYS_capget
     if (number == SYS_capget && nxt_capget_errno != 0) {
-        nxt_shim_record();
+        nxt_shim_record(nxt_record_path);
         errno = nxt_capget_errno;
         return -1;
+    }
+#endif
+
+#ifdef SYS_capset
+    if (number == SYS_capset) {
+        /*
+         * Recorded, never failed: the test needs to know which
+         * processes drop their capabilities, and a failed capset()
+         * would be a different test.
+         */
+        nxt_shim_record(nxt_capset_record_path);
     }
 #endif
 
