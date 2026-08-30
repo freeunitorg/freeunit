@@ -1,7 +1,4 @@
-import pytest
-
 from unit.applications.lang.php import ApplicationPHP
-from unit.option import option
 
 prerequisites = {'modules': {'php': 'any'}, 'features': {'isolation': True}}
 
@@ -9,9 +6,6 @@ client = ApplicationPHP()
 
 
 def test_php_isolation_rootfs(is_su, require, temp_dir):
-    versions = option.available['modules'].get('php', [])
-    if versions and versions[0].split('.')[:2] >= ['8', '5']:
-        pytest.skip('PHP 8.5 rootfs isolation: SIGSEGV under investigation')
     isolation = {'rootfs': temp_dir}
 
     if not is_su:
