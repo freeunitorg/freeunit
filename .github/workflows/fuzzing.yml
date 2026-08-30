@@ -1,43 +1,103 @@
-name: "Fuzzing (OSS-Fuzz)"
-on:
-  workflow_dispatch: # manual only
-  # pull_request:
-  #   paths:
-  #     - 'src/**'
-  #     - 'fuzzing/**'
-  #     - '.github/workflows/fuzzing.yml'
+name: "Fuzzing (libFuzzer)"
 
-permissions: {}
+on:
+  # The HTTP parsers are the reason this runs on pull requests: they are the
+  # code an attacker reaches first, and the seed corpus already covers them.
+  pull_request:
+    paths:
+      - 'src/nxt_http*'
+      - 'src/nxt_h1proto*'
+      - 'src/nxt_conf*'
+      # nxt_http_controller_fuzz.c #includes nxt_controller.c, so a change
+      # there is a change to what this job fuzzes.
+      - 'src/nxt_controller*'
+      # configure --fuzz, auto/fuzzing and auto/sources are what produce the
+      # binaries; break them and the job has nothing to run.
+      - configure
+      - 'auto/**'
+      - 'fuzzing/**'
+      - '.github/workflows/fuzzing.yml'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: 'libFuzzer budget per target, in seconds'
+        required: false
+        default: '60'
+      targets:
+        description: 'Space-separated fuzzer names (empty = all five)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  # Cancel superseded runs for the same pull request.  Non-PR events fall back
+  # to the run id, which is unique, so a dispatch is never grouped with
+  # another: Actions keeps only one PENDING run per group and would drop a
+  # queued one even with cancel-in-progress false.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  Fuzzing:
+  libfuzzer:
+    name: libFuzzer (ASan + UBSan)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      security-events: write
+    # Five targets at a 60s budget is a little over five minutes -- each
+    # finishes within a second or two of its budget, and run-ci.sh caps the
+    # worst case at two minutes each.  The clang/ASan build is a few minutes
+    # on top.  A dispatch can ask for a much longer budget across all five
+    # targets, so it gets a much longer bound; a pull request must not, or a
+    # hung job holds a runner for an hour.
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 120 || 25 }}
+
     steps:
-    - name: Build Fuzzers
-      id: build
-      uses: google/oss-fuzz/infra/cifuzz/actions/build_fuzzers@master
-      with:
-        oss-fuzz-project-name: 'unit'
-        language: c
-    - name: Run Fuzzers
-      uses: google/oss-fuzz/infra/cifuzz/actions/run_fuzzers@master
-      with:
-        oss-fuzz-project-name: 'unit'
-        language: c
-        fuzz-seconds: 300
-        output-sarif: true
-    - name: Upload Crash
-      uses: actions/upload-artifact@v4
-      if: failure() && steps.build.outcome == 'success'
-      with:
-        name: artifacts
-        path: ./out/artifacts
-    - name: Upload Sarif
-      if: always() && steps.build.outcome == 'success'
-      uses: github/codeql-action/upload-sarif@v4
-      with:
-        # Path to SARIF file relative to the root of the repository
-        sarif_file: cifuzz-sarif/results.sarif
-        checkout_path: cifuzz-sarif
+      - uses: actions/checkout@v5
+
+      # libclang-rt-dev carries libclang_rt.fuzzer, which -fsanitize=fuzzer
+      # links against; clang alone is not enough.
+      - name: Install clang and the sanitizer runtimes
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y --no-install-recommends \
+              clang llvm libclang-rt-dev
+
+      - name: Build the fuzzers
+        env:
+          CC: clang
+          CXX: clang++
+          CFLAGS: >-
+            -g -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+            -fsanitize=address,undefined -fsanitize=fuzzer-no-link
+          CXXFLAGS: >-
+            -g -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+            -fsanitize=address,undefined -fsanitize=fuzzer-no-link
+          # configure compiles and runs small probe programs.  Built with ASan
+          # they report leaks and exit non-zero, and configure then records the
+          # feature as absent -- a silently different build, not a failure.
+          ASAN_OPTIONS: detect_leaks=0
+        run: |
+          ./configure --no-regex --no-pcre2 --fuzz=-fsanitize=fuzzer
+          make fuzz -j"$(nproc)"
+
+      # All five targets, on a pull request and on a dispatch alike.  Picking a
+      # subset per changed path was tried and dropped: every path filter above
+      # already maps to a target, `fuzzing/**` maps to all of them, and a
+      # target left out of the list is a harness that CI compiles but never
+      # runs.  At about 61 seconds each the whole set is close to five minutes.
+      - name: Run the fuzzers
+        env:
+          FUZZ_SECONDS: ${{ github.event.inputs.seconds || '60' }}
+          FUZZ_TARGETS: ${{ github.event.inputs.targets }}
+        run: |
+          # shellcheck disable=SC2086  # deliberate word splitting
+          ./fuzzing/run-ci.sh -t "${FUZZ_SECONDS}" ${FUZZ_TARGETS}
+
+      # A reproducer is the only thing that makes a fuzzing failure actionable.
+      - name: Upload reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: build/fuzz-artifacts/
+          if-no-files-found: ignore
