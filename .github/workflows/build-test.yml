@@ -533,6 +533,23 @@ jobs:
           fi
         if: steps.metadata.outputs.module != 'wasm'
 
+      # test_capget_fallback.py needs a unitd that actually calls capget(),
+      # which a root one never does, so every leg above skips it -- the file
+      # is inside "test" but has never once run.  Repeat it here without
+      # sudo.  The python leg is the one chosen because the test drives a
+      # real application to show it inherits the shim harmlessly, and this
+      # leg is where a language module exists.
+      #
+      # pytest-3 is named absolutely: setup-python puts a toolcache bin
+      # directory ahead of /usr/bin for this step and not for the sudo'd one
+      # above, and both must run the pytest that "apt install python3-pytest"
+      # provided.
+      - name: Run capget fallback tests unprivileged
+        run: |
+          export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
+          /usr/bin/pytest-3 --print-log test/test_capget_fallback.py
+        if: steps.metadata.outputs.module == 'python'
+
   # C unit-test suite (src/test/ -> build/tests): HTTP parser, port/IPC
   # fault-injection, lvlhsh, mp, rbtree, base64, utf8, clone creds, etc.
   # Previously compiled but never executed in CI; runs here on every PR as its

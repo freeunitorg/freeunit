@@ -9,10 +9,12 @@
 typedef struct {
     uint8_t  setid;     /* 1 bit */
     uint8_t  chroot;    /* 1 bit */
+    uint8_t  unknown;   /* 1 bit */
 } nxt_capabilities_t;
 
 
 NXT_EXPORT nxt_int_t nxt_capability_set(nxt_task_t *task,
     nxt_capabilities_t *cap);
+NXT_EXPORT nxt_int_t nxt_capability_drop(nxt_task_t *task);
 
 #endif /* _NXT_CAPABILITY_INCLUDED_ */

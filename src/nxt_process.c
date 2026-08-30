@@ -1128,7 +1128,18 @@ nxt_process_apply_creds(nxt_task_t *task, nxt_process_t *process)
     }
 #endif
 
-    return NXT_OK;
+    /*
+     * Last: nothing after this point in any child needs a capability,
+     * and everything before it might.  PR_SET_NO_NEW_PRIVS above stops
+     * this process *gaining* privilege across execve(); it does not
+     * take away what the process already carries, and fork() copies
+     * every capability set verbatim, so a unitd that was granted
+     * capabilities would otherwise pass them straight to application
+     * code.  Main never calls apply_creds() and so never drops -- it
+     * binds listeners on every reconfiguration.
+     */
+
+    return nxt_capability_drop(task);
 }
 
 
