@@ -229,7 +229,8 @@ static void nxt_router_app_port_ready(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
 static void nxt_router_app_port_error(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
-static void nxt_router_app_start_failed(nxt_task_t *task, nxt_app_t *app);
+static void nxt_router_app_start_failed(nxt_task_t *task, nxt_app_t *app,
+    uint32_t count);
 
 static void nxt_router_app_use(nxt_task_t *task, nxt_app_t *app, int i);
 static void nxt_router_app_unlink(nxt_task_t *task, nxt_app_t *app);
@@ -503,7 +504,7 @@ failed:
         nxt_mp_free(b->data, b);
     }
 
-    nxt_router_app_start_failed(task, app);
+    nxt_router_app_start_failed(task, app, 1);
 
 skip:
 
@@ -5054,6 +5055,7 @@ static void
 nxt_router_app_port_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
+    uint32_t             n;
     nxt_app_t            *app;
     nxt_app_joint_t      *app_joint;
     nxt_app_joint_rpc_t  *app_joint_rpc;
@@ -5077,19 +5079,56 @@ nxt_router_app_port_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
     nxt_debug(task, "app '%V' %p start error", &app->name, app);
 
-    nxt_router_app_start_failed(task, app);
+    if (app_joint_rpc->proto) {
+        /*
+         * The prototype this RPC was armed for will never arrive, and only
+         * nxt_router_app_port_ready() clears proto_port_requests.  Left set,
+         * it makes every later nxt_router_start_app_process_handler() call
+         * for this application take the "wait for prototype process" branch
+         * and park without sending anything -- so no further port_ready or
+         * port_error can ever fire to clear it.  Only replacing the
+         * nxt_app_t recovers, and a reload does that only when the
+         * application's own config text changes.  Clear it here, and
+         * release the slots of the whole parked cohort: the initiator's,
+         * plus one for each caller that joined the wait.  This mirrors
+         * port_ready(), which takes the same count and replays that many
+         * starts on success.
+         */
+
+        nxt_thread_mutex_lock(&app->mutex);
+
+        n = app->proto_port_requests;
+        app->proto_port_requests = 0;
+
+        nxt_thread_mutex_unlock(&app->mutex);
+
+        /*
+         * The counter is incremented in the same branch that sets ->proto,
+         * so an armed prototype RPC always owns at least its own slot.
+         */
+        nxt_assert(n != 0);
+
+    } else {
+        n = 1;
+    }
+
+    nxt_router_app_start_failed(task, app, n);
 }
 
 
 /*
- * A start attempt that will never yield a port: give back the
- * pending_processes slot its initiator took and, if the application is left
- * with no way to answer at all, fail the requests waiting for an
- * acknowledgement instead of letting them sit until they time out.
+ * A start attempt that will never yield a port: give back the "count"
+ * pending_processes slots it owns and, if the application is left with no way
+ * to answer at all, fail the requests waiting for an acknowledgement instead
+ * of letting them sit until they time out.
+ *
+ * "count" is 1 for an ordinary attempt, which owns only its initiator's slot.
+ * A failed prototype attempt owns the whole parked cohort: see
+ * nxt_router_app_port_error().
  */
 
 static void
-nxt_router_app_start_failed(nxt_task_t *task, nxt_app_t *app)
+nxt_router_app_start_failed(nxt_task_t *task, nxt_app_t *app, uint32_t count)
 {
     nxt_queue_link_t    *link;
     nxt_http_request_t  *r;
@@ -5098,9 +5137,20 @@ nxt_router_app_start_failed(nxt_task_t *task, nxt_app_t *app)
 
     nxt_thread_mutex_lock(&app->mutex);
 
-    nxt_assert(app->pending_processes != 0);
+    nxt_assert(app->pending_processes >= count);
 
-    app->pending_processes--;
+    /*
+     * The accounting above guarantees this, but nxt_assert() is nothing in a
+     * release build and the two directions are not equally bad: releasing one
+     * slot too few merely leaks it, while releasing one too many wraps the
+     * counter to UINT32_MAX and makes nxt_router_app_can_start() false
+     * forever -- a worse wedge than the one this path exists to clear.
+     */
+    if (nxt_slow_path(count > app->pending_processes)) {
+        count = app->pending_processes;
+    }
+
+    app->pending_processes -= count;
 
     if (app->processes == 0 && !nxt_queue_is_empty(&app->ack_waiting_req)) {
         link = nxt_queue_first(&app->ack_waiting_req);
