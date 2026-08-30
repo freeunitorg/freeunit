@@ -15,5 +15,6 @@ typedef struct {
 
 NXT_EXPORT nxt_int_t nxt_capability_set(nxt_task_t *task,
     nxt_capabilities_t *cap);
+NXT_EXPORT nxt_int_t nxt_capability_drop(nxt_task_t *task);
 
 #endif /* _NXT_CAPABILITY_INCLUDED_ */

@@ -18,9 +18,25 @@ seccomp profile -- made a non-root unitd fail to start with "failed to get
 process capabilities".  Unit now warns and runs without assuming any
 capability: user and group switching and "rootfs" isolation are disabled
 for applications that do not enable the "credential" namespace, and
-applications run as unitd's own uid.  Capabilities the process may
-still hold are not dropped, since Unit does not call capset().  Every
-other capget() failure remains fatal.
+applications run as unitd's own uid.  Every other capget() failure
+remains fatal.
+</para>
+</change>
+
+<change type="security">
+<para>
+application processes no longer inherit unitd's capabilities.  A unitd
+started as a non-root user that had been granted capabilities -- systemd
+"AmbientCapabilities=", file capabilities -- passed them through fork()
+to every application it ran, because switching between two nonzero uids
+does not clear them and a filtered capget() skips the switch entirely.
+Each forked process now empties its permitted, effective, inheritable and
+ambient sets once its credentials are final, before any application code
+runs.  The main process is unchanged: it needs CAP_NET_BIND_SERVICE to
+bind listening sockets on every reconfiguration.  Applications configured
+with "user": "root" are also unchanged, since a root process regains
+capabilities on the next execve() anyway.  A unitd running as root was
+never affected: switching away from uid 0 clears the sets by itself.
 </para>
 </change>
 
