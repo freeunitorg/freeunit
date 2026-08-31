@@ -5127,6 +5127,7 @@ nxt_router_app_port_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
     uint32_t             n;
+    nxt_bool_t           restarted;
     nxt_app_t            *app;
     nxt_app_joint_t      *app_joint;
     nxt_app_joint_rpc_t  *app_joint_rpc;
@@ -5148,7 +5149,81 @@ nxt_router_app_port_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         return;
     }
 
-    nxt_debug(task, "app '%V' %p start error", &app->name, app);
+    /*
+     * Two ways in are not failures at all, and both are excluded rather
+     * than tolerated.
+     *
+     * A restart: nxt_router_app_restart_handler() bumps app->generation
+     * and sends QUIT to the prototype, and a worker that prototype had
+     * already forked for an in-flight start goes with it.  The REMOVE_PID
+     * for that worker still carries the start's stream -- the prototype
+     * set it when it forked (nxt_application.c) and nothing clears it for
+     * a process that never became ready -- so the router retypes it into
+     * an RPC error and it lands here, reporting a start the operator
+     * themselves cancelled.  Nothing about the RPC peer is involved: the
+     * registration this handler belongs to never sets one.  Generation is
+     * how nxt_router_app_port_ready() tells the same two apart before it
+     * quietly QUITs a port that arrives for a superseded one.
+     *
+     * And a shutdown: nxt_port_close() runs nxt_port_rpc_close() over the
+     * router port, which turns every registration still on it into an
+     * RPC error, so a start that was merely still pending when Unit was
+     * asked to stop would report itself as a failure.  Nothing bumps the
+     * generation there, so it needs its own test -- engine->shutdown, the
+     * same flag this file already consults before deciding to start
+     * another process at all.
+     *
+     * Only the log line is conditional either way: the cleanup below has
+     * to run regardless, since the slots and the parked requests belong
+     * to an attempt that is over whatever ended it.
+     */
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    restarted = (app->generation != app_joint_rpc->generation);
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    /*
+     * Otherwise: logged, not nxt_debug()d.  This handler is armed for one
+     * start attempt and disarmed the moment the port arrives, so it
+     * cannot fire for an ordinary worker exit or an idle timeout: every
+     * remaining call means an application process that was asked for will
+     * never exist, and the requests parked on it are about to be answered
+     * 503.  At debug level that was invisible in a default configuration,
+     * which left "the application returns 503" with no corresponding line
+     * anywhere in the log.
+     *
+     * NXT_LOG_ERR rather than nxt_alert(), which the early-failure path
+     * in nxt_router_start_app_process_handler() uses.  That one can only
+     * be Unit's own fault; this one is usually the application's -- a
+     * module that fails to import, a worker that exits during startup --
+     * and Unit is working exactly as designed when it reports one.
+     * [error] is emitted at the default log level, which is the whole
+     * point of the change.
+     *
+     * A different sentence from that alert, deliberately, even though
+     * the two describe the same disappointment.  The test suite skips
+     * expected alerts by an unanchored regex over the log
+     * (Log.check_alerts()), so a test that skipped this [error] line by
+     * quoting "failed to start a process" would silently swallow the
+     * alert as well, in every test that ran alongside it.  The two are
+     * worth telling apart; the level alone is a thin thing to rely on.
+     *
+     * It cannot say *why*: this is usually a REMOVE_PID that
+     * nxt_router_remove_pid_handler() retyped, and its payload is the
+     * dead pid and nothing else.  The reason is in whatever the dead
+     * process logged before exiting; this line is what tells the operator
+     * there is something to go and look for.
+     */
+
+    if (nxt_slow_path(restarted || task->thread->engine->shutdown)) {
+        nxt_debug(task, "app '%V' start attempt cancelled", &app->name);
+
+    } else {
+        nxt_log(task, NXT_LOG_ERR,
+                "app '%V' start attempt produced no process", &app->name);
+    }
 
     if (app_joint_rpc->proto) {
         /*
