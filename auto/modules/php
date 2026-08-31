@@ -269,7 +269,125 @@ if grep ^$NXT_PHP_MODULE: $NXT_MAKEFILE 2>&1 > /dev/null; then
 fi
 
 
+NXT_PHP_MOUNTS_HEADER=nxt_${NXT_PHP_MODULE}_mounts.h
+
+# A PHP built with the --with-system-tzdata patch -- Debian, Ubuntu and Fedora
+# packages all carry it -- reads the timezone database from the filesystem
+# lazily, at request time, that is, after Unit has already chroot()ed into
+# "isolation.rootfs".  When the database is not there such a build does not
+# raise an error, it dereferences NULL: the application worker dies with
+# SIGSEGV on the first date() call.  Bind mount the database so that PHP gets
+# the same automount.language_deps treatment the other language modules get.
+#
+# PHP does not expose the path at runtime, so derive it here:
+#
+#   --with-system-tzdata=DIR   Fedora and Remi spell the path out; trust it
+#                              even if DIR is absent on the build host.
+#   --with-system-tzdata       Debian and Ubuntu pass the flag bare and rely
+#                              on the patch's built-in default, so probe.
+#   no such option             A build using timelib's bundled database (the
+#                              official php:*-cli images, Alpine's packages);
+#                              it never opens the directory, so mount nothing.
+#   options unavailable        php-config too old to report them: probe, since
+#                              a spurious mount beats a SIGSEGV.
+#
+# A php-config that does not know --configure-options prints its usage to
+# *stdout* and exits nonzero, so the query has to be judged by exit status;
+# taking the output alone would read the usage text as a real answer and skip
+# the probe.
+
+if NXT_PHP_CONFIGURE_OPTIONS=`$NXT_PHP_CONFIG --configure-options 2>/dev/null`
+then
+    NXT_PHP_CONFIGURE_OPTIONS=`printf '%s' "$NXT_PHP_CONFIGURE_OPTIONS" \
+                               | tr '\n' ' '`
+else
+    NXT_PHP_CONFIGURE_OPTIONS=
+fi
+
+NXT_PHP_TZDATA=
+nxt_php_tzprobe=no
+
+# Walk the options in order: Autoconf keeps the last occurrence of a repeated
+# option, so a bare --with-system-tzdata appended after an "=no" or "=DIR"
+# form is what PHP's ext/date/config.m4 actually saw.  It reads the value the
+# way Autoconf hands it over: "no" (or --without-system-tzdata) disables the
+# patch, "yes" enables it with the built-in default, and only an absolute
+# path overrides that default.
+
+for nxt_php_opt in $NXT_PHP_CONFIGURE_OPTIONS
+do
+    case "$nxt_php_opt" in
+        --with-system-tzdata | --with-system-tzdata=yes)
+            NXT_PHP_TZDATA=; nxt_php_tzprobe=yes
+        ;;
+        --with-system-tzdata=no | --without-system-tzdata)
+            NXT_PHP_TZDATA=; nxt_php_tzprobe=no
+        ;;
+        --with-system-tzdata=/*)
+            nxt_php_tzprobe=no
+            NXT_PHP_TZDATA=`printf '%s' "$nxt_php_opt" \
+                            | sed 's/^--with-system-tzdata=//'`
+        ;;
+        --with-system-tzdata=*)
+            NXT_PHP_TZDATA=; nxt_php_tzprobe=yes
+        ;;
+    esac
+done
+
+if [ -z "`printf '%s' "$NXT_PHP_CONFIGURE_OPTIONS" | tr -d ' '`" ]; then
+    nxt_php_tzprobe=yes
+fi
+
+if [ $nxt_php_tzprobe = yes ]; then
+    for nxt_tzdir in /usr/share/zoneinfo /usr/lib/zoneinfo \
+                     /usr/share/lib/zoneinfo /etc/zoneinfo
+    do
+        if [ -f "$nxt_tzdir/UTC" ]; then
+            NXT_PHP_TZDATA=$nxt_tzdir
+            break
+        fi
+    done
+fi
+
+if [ ".$NXT_PHP_TZDATA" != "." ]; then
+
+cat << END > $NXT_BUILD_DIR/include/$NXT_PHP_MOUNTS_HEADER
+#ifndef _NXT_PHP_MOUNTS_H_INCLUDED_
+#define _NXT_PHP_MOUNTS_H_INCLUDED_
+
+
+static const nxt_fs_mount_t  nxt_php_mounts[] = {
+    {(u_char *) "$NXT_PHP_TZDATA", (u_char *) "$NXT_PHP_TZDATA",
+     NXT_FS_BIND, (u_char *) "bind", 0, NULL, 1, 1},
+};
+
+#define NXT_PHP_MOUNTS   nxt_php_mounts
+#define NXT_PHP_NMOUNTS  nxt_nitems(nxt_php_mounts)
+
+
+#endif /* _NXT_PHP_MOUNTS_H_INCLUDED_ */
+END
+
+else
+
+cat << END > $NXT_BUILD_DIR/include/$NXT_PHP_MOUNTS_HEADER
+#ifndef _NXT_PHP_MOUNTS_H_INCLUDED_
+#define _NXT_PHP_MOUNTS_H_INCLUDED_
+
+
+#define NXT_PHP_MOUNTS   NULL
+#define NXT_PHP_NMOUNTS  0
+
+
+#endif /* _NXT_PHP_MOUNTS_H_INCLUDED_ */
+END
+
+fi
+
+
 $echo " + PHP module: ${NXT_PHP_MODULE}.unit.so"
+$echo " + PHP timezone database:" \
+      "${NXT_PHP_TZDATA:-bundled, no mount required}"
 
 . auto/cc/deps
 
@@ -299,6 +417,7 @@ $NXT_BUILD_DIR/$nxt_obj:	$nxt_src $NXT_VERSION_H
 	$NXT_PHP_INCLUDE -DNXT_ZEND_SIGNAL_STARTUP=$NXT_ZEND_SIGNAL_STARTUP \\
 	-DNXT_PHP_TRUEASYNC=$NXT_PHP_TRUEASYNC \\
 	-DNXT_PHP_PRE_REQUEST_INIT=$NXT_PHP_PRE_REQUEST_INIT \\
+	-DNXT_PHP_MOUNTS_H=\"$NXT_PHP_MOUNTS_HEADER\" \\
 	$nxt_dep_flags \\
 	-o $NXT_BUILD_DIR/$nxt_obj $nxt_src
 	$nxt_dep_post

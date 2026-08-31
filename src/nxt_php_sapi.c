@@ -16,6 +16,8 @@
 #include <nxt_unit_request.h>
 #include <nxt_http.h>
 
+#include NXT_PHP_MOUNTS_H
+
 
 #if (PHP_VERSION_ID >= 50400)
 #define NXT_HAVE_PHP_IGNORE_CWD 1
@@ -384,8 +386,8 @@ NXT_EXPORT nxt_app_module_t  nxt_app_module = {
     compat,
     nxt_string("php"),
     PHP_VERSION,
-    NULL,
-    0,
+    NXT_PHP_MOUNTS,
+    NXT_PHP_NMOUNTS,
     nxt_php_setup,
     nxt_php_start,
 };
