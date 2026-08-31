@@ -1,4 +1,5 @@
 import socket
+import time
 
 import pytest
 
@@ -332,8 +333,14 @@ def test_listeners_addr_error_2(skip_alert):
 
 
 def test_listeners_port_release():
+    # Since the two-phase listener drain (1.36.0) a successful
+    # configuration means accept has been disarmed, not that the
+    # descriptor is closed: it stays bound until the drain completes, so
+    # rebinding straight away can lose a race with it.  The documented
+    # behaviour is at src/nxt_router.c, in nxt_router_listen_socket_close().
+    # Retry rather than assume, so the test still fails if the port is
+    # never released.
     for _ in range(10):
-        fail = False
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
@@ -346,14 +353,19 @@ def test_listeners_port_release():
 
             resp = client.conf({"listeners": {}, "applications": {}})
 
-            try:
-                s.bind(('127.0.0.1', 8080))
-                s.listen()
+            bound = False
 
-            except OSError:
-                fail = True
+            for _ in range(50):
+                try:
+                    s.bind(('127.0.0.1', 8080))
+                    s.listen()
+                    bound = True
+                    break
 
-            if fail:
+                except OSError:
+                    time.sleep(0.1)
+
+            if not bound:
                 pytest.fail('cannot bind or listen to the address')
 
             assert 'success' in resp, 'port release'
