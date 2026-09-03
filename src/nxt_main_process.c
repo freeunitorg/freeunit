@@ -67,6 +67,42 @@ static nxt_int_t nxt_main_file_store(nxt_task_t *task, const char *tmp_name,
 static void nxt_main_port_access_log_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 
+#if (NXT_TESTS)
+static nxt_uint_t  nxt_main_test_process_new_failure_count;
+
+
+void
+nxt_main_test_process_new_failures(nxt_uint_t failures)
+{
+    nxt_main_test_process_new_failure_count = failures;
+}
+
+
+/*
+ * nxt_process_new() with an allocation-failure hook in front of it, in the
+ * shape of nxt_port_test_msg_alloc_failures() (src/nxt_port_socket.c): the
+ * count is decremented per call, so one armed failure fires once and the
+ * handler then behaves exactly as it does when the process record cannot
+ * be allocated.  The wrapper stands in front of the call rather than in
+ * place of the branch that follows it, so the code the test reaches stays
+ * the handler's own -- however this file happens to spell its response to
+ * a NULL process.
+ */
+nxt_inline nxt_process_t *
+nxt_main_process_new(nxt_runtime_t *rt)
+{
+    if (nxt_slow_path(nxt_main_test_process_new_failure_count != 0)) {
+        nxt_main_test_process_new_failure_count--;
+        return NULL;
+    }
+
+    return nxt_process_new(rt);
+}
+
+#else
+#define nxt_main_process_new(rt)  nxt_process_new(rt)
+#endif
+
 const nxt_sig_event_t  nxt_main_process_signals[] = {
     nxt_event_signal(SIGHUP,  nxt_main_process_signal_handler),
     nxt_event_signal(SIGINT,  nxt_main_process_sigterm_handler),
@@ -473,28 +509,41 @@ nxt_main_start_process_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     rt = task->thread->runtime;
 
+    /*
+     * Every exit below the fork() is either the successful one, which lets
+     * the new process answer for itself, or "failed:", which answers for it.
+     * Nothing may leave this handler in between: START_PROCESS carries the
+     * stream of an RPC the router has already armed
+     * (nxt_router_start_app_process_handler()), and only a reply retires it.
+     * A silent return leaves that RPC outstanding forever -- neither
+     * nxt_router_app_port_ready() nor nxt_router_app_port_error() ever runs,
+     * so app->proto_port_requests is never cleared, every later start for
+     * the application parks on the prototype that is not coming, and the
+     * requests waiting on it are never failed.  See issue #257.
+     */
+    process = NULL;
+
     port = rt->port_by_type[NXT_PROCESS_ROUTER];
     if (nxt_slow_path(port == NULL)) {
         nxt_alert(task, "router port not found");
-        goto close_fds;
+        goto failed;
     }
 
     if (nxt_slow_path(port->pid != nxt_recv_msg_cmsg_pid(msg))) {
         nxt_alert(task, "process %PI cannot start processes",
                   nxt_recv_msg_cmsg_pid(msg));
 
-        goto close_fds;
+        goto failed;
     }
 
-    process = nxt_process_new(rt);
+    process = nxt_main_process_new(rt);
     if (nxt_slow_path(process == NULL)) {
-        goto close_fds;
+        goto failed;
     }
 
     process->mem_pool = nxt_mp_create(1024, 128, 256, 32);
     if (process->mem_pool == NULL) {
-        nxt_process_use(task, process, -1);
-        goto close_fds;
+        goto failed;
     }
 
     process->parent_port = rt->port_by_type[NXT_PROCESS_MAIN];
@@ -622,17 +671,41 @@ nxt_main_start_process_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
 failed:
 
-    nxt_process_use(task, process, -1);
+    if (process != NULL) {
+        nxt_process_use(task, process, -1);
+    }
 
-    port = nxt_runtime_port_find(rt, msg->port_msg.pid,
+    /*
+     * Answer on the port of the process the kernel says sent this, not the
+     * one the message claims to come from: msg->port_msg.pid is filled in by
+     * the sender (nxt_port_socket_write2()) and is not authenticated, and
+     * the two branches above now reach this reply before the router identity
+     * check has run -- or after it has failed.  Keyed on the credential, the
+     * RPC_ERROR can only ever retire an RPC of the sender's own, so a worker
+     * that forges a START_PROCESS cannot use main to cancel a stream of the
+     * router's choosing.  For a legitimate sender the two pids are equal,
+     * because nxt_port_socket_write2() sets port_msg.pid to its own nxt_pid;
+     * where SCM_CREDENTIALS is unavailable nxt_recv_msg_cmsg_pid() is
+     * defined as port_msg.pid, so the lookup is unchanged there.
+     */
+    port = nxt_runtime_port_find(rt, nxt_recv_msg_cmsg_pid(msg),
                                  msg->port_msg.reply_port);
 
     if (nxt_fast_path(port != NULL)) {
-        nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
-                              -1, msg->port_msg.stream, 0, NULL);
-    }
+        (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
+                                     -1, msg->port_msg.stream, 0, NULL);
 
-close_fds:
+    } else {
+        /*
+         * Nothing to answer on: the sender is gone, or never had the port it
+         * named.  A dead sender's RPCs die with it, so this is only worth a
+         * diagnostic -- but a silent drop here is exactly the shape of the
+         * defect above, so it is not left silent.
+         */
+        nxt_alert(task, "cannot report a failed start back: reply port %d of "
+                  "process %PI not found", (int) msg->port_msg.reply_port,
+                  nxt_recv_msg_cmsg_pid(msg));
+    }
 
     nxt_fd_close(msg->fd[0]);
     msg->fd[0] = -1;
@@ -640,6 +713,25 @@ close_fds:
     nxt_fd_close(msg->fd[1]);
     msg->fd[1] = -1;
 }
+
+
+#if (NXT_TESTS)
+
+/*
+ * Public wrapper that lets src/test/nxt_main_start_process_reply_test.c
+ * invoke the static nxt_main_start_process_handler() directly with a
+ * synthesised runtime and message -- used to verify that every exit above
+ * the fork() answers the router's START_PROCESS RPC instead of returning
+ * silently and stranding it (issue #257).
+ */
+void
+nxt_main_test_run_start_process_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg)
+{
+    nxt_main_start_process_handler(task, msg);
+}
+
+#endif
 
 
 static void

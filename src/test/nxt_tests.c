@@ -217,6 +217,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_main_start_process_reply_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_port_change_file_test(thr) != NXT_OK) {
         return 1;
     }
