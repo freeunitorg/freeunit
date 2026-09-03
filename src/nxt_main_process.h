@@ -33,5 +33,11 @@ NXT_EXPORT extern const nxt_process_init_t  nxt_app_process;
 extern const nxt_sig_event_t  nxt_main_process_signals[];
 extern const nxt_sig_event_t  nxt_process_signals[];
 
+#if (NXT_TESTS)
+void nxt_main_test_process_new_failures(nxt_uint_t failures);
+void nxt_main_test_run_start_process_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+#endif
+
 
 #endif /* _NXT_MAIN_PROCESS_H_INCLUDED_ */
