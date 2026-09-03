@@ -144,7 +144,17 @@ struct nxt_process_s {
     const char               *name;
     nxt_port_t               *parent_port;
 
+    /*
+     * The start request this process was forked to satisfy: ->stream is the
+     * initiator's RPC stream, and ->stream_pid/->stream_port address the port
+     * that RPC is registered on.  A creator that can be left holding the only
+     * armed handler for a child records all three -- the prototype does, in
+     * nxt_proto_start_process_handler() -- so that a child which dies before
+     * anything else can report it still gets answered.
+     */
     uint32_t                 stream;
+    nxt_pid_t                stream_pid;
+    nxt_port_id_t            stream_port;
 
     nxt_mp_t                 *mem_pool;
     nxt_credential_t         *user_cred;
