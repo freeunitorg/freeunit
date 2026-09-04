@@ -759,6 +759,11 @@ nxt_isolation_prepare_rootfs(nxt_task_t *task, nxt_process_t *process)
     const u_char             *dst;
     nxt_fs_mount_t           *mnt;
     nxt_process_automount_t  *automount;
+#if (NXT_HAVE_OPENAT2)
+    int                      rootfs_fd;
+    const u_char             *rootfs_path;
+    size_t                   rootfs_len;
+#endif
 
     automount = &process->isolation.automount;
     mounts = process->isolation.mounts;
@@ -766,7 +771,35 @@ nxt_isolation_prepare_rootfs(nxt_task_t *task, nxt_process_t *process)
     n = mounts->nelts;
     mnt = mounts->elts;
 
+#if (NXT_HAVE_OPENAT2)
+    /*
+     * Mount destinations live under a (possibly user-owned) rootfs.  An
+     * attacker with write access to that tree can race mkdir->mount(2)
+     * by swapping a path component for a symlink pointing outside the
+     * rootfs.  Re-open the rootfs and resolve each destination with
+     * RESOLVE_BENEATH so a tampered destination that escapes the
+     * rootfs fails the open, before we hand a path to mount(2).
+     * RESOLVE_NO_SYMLINKS is intentionally NOT requested: legitimate
+     * rootfs setups commonly contain in-tree symlinks (e.g.
+     * /lib -> /usr/lib) that must still resolve.
+     */
+    rootfs_path = process->isolation.rootfs;
+    rootfs_len = (rootfs_path != NULL) ? nxt_strlen(rootfs_path) : 0;
+
+    rootfs_fd = -1;
+    if (rootfs_len > 0) {
+        rootfs_fd = open((const char *) rootfs_path,
+                         O_PATH | O_DIRECTORY | O_CLOEXEC);
+        if (rootfs_fd == -1) {
+            nxt_alert(task, "open rootfs(%s) %E", rootfs_path, nxt_errno);
+            return NXT_ERROR;
+        }
+    }
+#endif
+
     for (i = 0; i < n; i++) {
+        int  mnt_dst_fd = -1;
+
         dst = mnt[i].dst;
 
         if (mnt[i].deps && !automount->language_deps) {
@@ -786,11 +819,85 @@ nxt_isolation_prepare_rootfs(nxt_task_t *task, nxt_process_t *process)
             goto undo;
         }
 
-        ret = nxt_fs_mount(task, &mnt[i]);
+#if (NXT_HAVE_OPENAT2)
+        if (rootfs_fd != -1
+            && nxt_strlen(dst) > rootfs_len
+            && memcmp(dst, rootfs_path, rootfs_len) == 0)
+        {
+            struct open_how  how;
+            const char      *rel;
+            int              fd;
+
+            rel = (const char *) dst + rootfs_len;
+            while (*rel == '/') {
+                rel++;
+            }
+
+            nxt_memzero(&how, sizeof(how));
+            how.flags = O_PATH | O_CLOEXEC | O_DIRECTORY;
+            how.resolve = RESOLVE_BENEATH;
+
+            fd = syscall(SYS_openat2, rootfs_fd, rel, &how, sizeof(how));
+            if (fd == -1) {
+                if (nxt_errno == ENOSYS) {
+                    /*
+                     * openat2(2) is Linux 5.6+; older kernels return
+                     * ENOSYS even when the userspace headers are
+                     * present.  Skip the symlink-resolution check on
+                     * such kernels rather than failing every isolation
+                     * setup; mount(2) below still operates on the
+                     * caller-supplied path, just without the extra
+                     * RESOLVE_BENEATH guard.  Warn once so operators
+                     * see the reduced security posture.
+                     */
+                    static nxt_bool_t  openat2_warned;
+                    if (!openat2_warned) {
+                        nxt_log(task, NXT_LOG_WARN,
+                                "openat2(SYS_openat2) not supported by the "
+                                "running kernel; rootfs mount destinations "
+                                "are not validated against symlinks");
+                        openat2_warned = 1;
+                    }
+
+                } else {
+                    nxt_alert(task, "mount destination %s escapes rootfs %s "
+                              "or contains symlinks: %E", dst, rootfs_path,
+                              nxt_errno);
+                    ret = NXT_ERROR;
+                    goto undo;
+                }
+
+            } else {
+                /*
+                 * Keep the validated fd open and mount onto it directly
+                 * (via /proc/self/fd/<fd> in nxt_fs_mount) so the mount
+                 * targets the exact inode openat2 resolved, rather than
+                 * re-resolving dst as a path and reopening the check-then-
+                 * use window.  Closed after the mount below.
+                 */
+                mnt_dst_fd = fd;
+            }
+        }
+#endif
+
+        ret = nxt_fs_mount(task, &mnt[i], mnt_dst_fd);
+
+#if (NXT_HAVE_OPENAT2)
+        if (mnt_dst_fd != -1) {
+            close(mnt_dst_fd);
+        }
+#endif
+
         if (nxt_slow_path(ret != NXT_OK)) {
             goto undo;
         }
     }
+
+#if (NXT_HAVE_OPENAT2)
+    if (rootfs_fd != -1) {
+        close(rootfs_fd);
+    }
+#endif
 
     return NXT_OK;
 
@@ -801,6 +908,12 @@ undo:
     for (i = 0; i < n; i++) {
         nxt_fs_unmount(mnt[i].dst);
     }
+
+#if (NXT_HAVE_OPENAT2)
+    if (rootfs_fd != -1) {
+        close(rootfs_fd);
+    }
+#endif
 
     return NXT_ERROR;
 }
