@@ -84,9 +84,9 @@ def test_state_store_full_filesystem(skip_alert):
     if mounted.returncode != 0:
         pytest.skip(f'could not mount a tmpfs: {mounted.stderr.decode()}')
 
+    # The two alerts the failed store is expected to log.
     skip_alert(
         r'failed to store current configuration',
-        r'open\(.*conf\.json\.tmp',
         r'write\(.*conf\.json\.tmp',
     )
 
