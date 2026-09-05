@@ -430,6 +430,7 @@ void nxt_port_empty_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 nxt_int_t nxt_port_post(nxt_task_t *task, nxt_port_t *port,
     nxt_port_post_handler_t handler, void *data);
 void nxt_port_use(nxt_task_t *task, nxt_port_t *port, int i);
+nxt_bool_t nxt_port_use_unless_zero(nxt_port_t *port);
 
 nxt_inline void nxt_port_inc_use(nxt_port_t *port)
 {
