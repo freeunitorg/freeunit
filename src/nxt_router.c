@@ -4096,10 +4096,13 @@ nxt_router_worker_thread_exit(nxt_task_t *task)
  *
  *   Accepting -> Draining: nxt_router_listen_socket_close() (phase 1)
  *                          disarms accept(2), marks lev->draining = 1.
+ *                          If connections are in flight it also posts the
+ *                          close_job back to the configuration thread, so
+ *                          the control request does not wait for them.
  *   Draining  -> Closed:   nxt_router_listen_socket_close_finish() (phase 2)
  *                          runs once lev->count == 1 (no in-flight accepted
- *                          connections), releases the FD and posts the
- *                          close_job back to the configuration thread.
+ *                          connections), releases the FD and then posts the
+ *                          close_job if phase 1 did not already.
  *
  * The intermediate state lets in-flight TLS handshakes and accepted-but-
  * not-yet-handled connections complete cleanly instead of being RST when
@@ -4153,30 +4156,35 @@ nxt_router_listen_socket_close(nxt_task_t *task, void *obj, void *data)
     }
 
     /*
-     * Configuration is ready once accept(2) has been disarmed.  The
-     * listener FD and old socket configuration stay alive below until
-     * accepted connections release their listener refs, but the control
-     * request must not wait for idle client timing.
-     */
-    nxt_router_listen_socket_close_ready(joint);
-
-    /*
      * Phase 2 gating: wait for accepted connections to release their
      * refs.  lev->count == 1 means only the original listener ref
      * remains (see nxt_listen_event() and nxt_conn_accept()).
      *
-     * Known limitation: the listening FD stays bound until the drain
-     * completes (nxt_router_listen_socket_release() closes it on the
-     * last engine's phase 2), so a configuration that re-adds the same
-     * address while the old listener drains fails with EADDRINUSE at
-     * bind time in the main process -- a visible, retryable config
-     * error.  Closing the FD in phase 1 instead requires reworking the
-     * ls->count contract across engines and the nxt_process_quit()
-     * listen-queue walk; that belongs to the full-drain follow-up.
+     * When connections are still in flight the configuration is
+     * acknowledged here, before the FD is released: the control request
+     * must not wait for idle client timing.  The listening FD then stays
+     * bound until the drain completes
+     * (nxt_router_listen_socket_release() closes it on the last engine's
+     * phase 2), so a configuration that re-adds the same address while
+     * the old listener drains can fail with EADDRINUSE at bind time in
+     * the main process -- a visible, retryable config error.  Closing
+     * the FD in phase 1 instead requires reworking the ls->count
+     * contract across engines and the nxt_process_quit() listen-queue
+     * walk; that belongs to the full-drain follow-up.
+     *
+     * With nothing in flight there is no drain to wait for, so the reply
+     * is deferred to nxt_router_listen_socket_close_finish() below,
+     * which sends it after the descriptor is closed.  That keeps the
+     * pre-drain contract -- a successful reconfiguration means the port
+     * is free -- for every listener that has no accepted connection on
+     * it.
      */
     if (lev->count > 1) {
         nxt_debug(task, "engine %p: listen socket %d drain pending, "
                   "in-flight: %D", engine, lev->socket.fd, lev->count - 1);
+
+        nxt_router_listen_socket_close_ready(joint);
+
         return;
     }
 
@@ -4217,12 +4225,32 @@ nxt_router_listen_socket_close_finish(nxt_task_t *task,
     joint = lev->socket.data;
     lev->socket.data = NULL;
 
-    nxt_router_listen_socket_close_ready(joint);
-
     /* 'task' refers to lev->task and we cannot use after nxt_free() */
     task = &task->thread->engine->task;
 
     nxt_router_listen_socket_release(task, joint->socket_conf);
+
+    /*
+     * Acknowledge only now.  nxt_router_listen_socket_release() above
+     * drops this engine's reference to the listen socket, and on the
+     * last engine to reach phase 2 it performs the single
+     * nxt_socket_close() of the descriptor.  The configuration is not
+     * reported successful until every engine has acknowledged
+     * (nxt_router_conf_ready()), so acknowledging after the release --
+     * rather than before it, as this function used to -- puts the reply
+     * strictly after the close for a listener with nothing in flight.
+     *
+     * A listener that did have connections to drain acknowledged early
+     * in phase 1 and left joint->close_job NULL, so this is the no-op it
+     * has always been on that path, and the still-bound descriptor
+     * documented there remains its known limitation.
+     *
+     * The joint outlives the call: its listener reference is dropped by
+     * nxt_router_listen_event_release() below, and
+     * nxt_router_listen_socket_release() frees the nxt_listen_socket_t,
+     * not the socket configuration the joint points at.
+     */
+    nxt_router_listen_socket_close_ready(joint);
 
     nxt_router_listen_event_release(task, lev, joint);
 }
