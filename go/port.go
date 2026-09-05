@@ -240,8 +240,23 @@ func nxt_go_port_recv(pid C.int, id C.int, buf unsafe.Pointer, buf_size C.int,
 		return 0
 	}
 
-	n, oobn, _, _, err := p.rcv.ReadMsgUnix(GoBytes(buf, buf_size),
+	n, oobn, flags, _, err := p.rcv.ReadMsgUnix(GoBytes(buf, buf_size),
 		GoBytes(oob, oob_capacity))
+
+	// The control data was cut short, so a descriptor this message was
+	// meant to carry may not be here; libunit would take its fd-less path
+	// on a message that otherwise looks whole.  The callback reports a
+	// length rather than msg_flags, so there is no way to hand the
+	// truncation across as such: report it as a read error, which
+	// nxt_unit_port_recv() turns into NXT_UNIT_ERROR before it parses any
+	// control data.  This is the one place the Go wrapper can see
+	// MSG_CTRUNC at all -- ReadMsgUnix is what consumed it.
+	if err == nil && flags&syscall.MSG_CTRUNC != 0 {
+		nxt_go_alert("control data truncated on a %d byte message; "+
+			"message dropped", n)
+
+		return C.ssize_t(-1)
+	}
 
 	if err != nil {
 		if nerr, ok := err.(*net.OpError); ok {

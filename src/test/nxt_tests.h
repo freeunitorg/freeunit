@@ -80,6 +80,7 @@ nxt_int_t nxt_router_proto_wedge_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_remove_pid_soak_test(nxt_thread_t *thr);
 nxt_int_t nxt_main_start_process_reply_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_change_file_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_ctrunc_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_fd_test(nxt_thread_t *thr);
 nxt_int_t nxt_cgroup_test(nxt_thread_t *thr);
 nxt_int_t nxt_clone_creds_test(nxt_thread_t *thr);

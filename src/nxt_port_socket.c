@@ -765,6 +765,45 @@ nxt_port_read_close(nxt_port_t *port)
 }
 
 
+/*
+ * Report a message whose control data could not be taken, on the way to
+ * dropping it.
+ *
+ * Truncation is called out separately because it is the case a reader of the
+ * log cannot otherwise infer: the payload and, on Linux, the kernel
+ * credential arrived intact, and only the SCM_RIGHTS was cut -- so what a
+ * handler would see is a well-formed, authenticated message whose descriptor
+ * is -1.  The message is named by type and stream, which is what ties the
+ * loss to the start, mmap or port hand-off that will not complete.
+ *
+ * "n" is the payload length recvmsg() returned; below sizeof(nxt_port_msg_t)
+ * there is no header to name the message by.
+ */
+
+static void
+nxt_port_oob_error_alert(nxt_task_t *task, nxt_port_t *port,
+    nxt_recv_oob_t *oob, nxt_port_recv_msg_t *msg, ssize_t n)
+{
+    if (nxt_fast_path(!oob->truncated)) {
+        nxt_alert(task, "failed to get oob data from %d", port->socket.fd);
+
+        return;
+    }
+
+    if (n >= (ssize_t) sizeof(nxt_port_msg_t)) {
+        nxt_alert(task, "port{%d,%d} %d: control data truncated on message "
+                        "type %d stream #%uD; message dropped",
+                  (int) port->pid, (int) port->id, port->socket.fd,
+                  (int) msg->port_msg.type, msg->port_msg.stream);
+
+    } else {
+        nxt_alert(task, "port{%d,%d} %d: control data truncated on a %z byte "
+                        "message; message dropped",
+                  (int) port->pid, (int) port->id, port->socket.fd, n);
+    }
+}
+
+
 static void
 nxt_port_read_handler(nxt_task_t *task, void *obj, void *data)
 {
@@ -826,9 +865,13 @@ nxt_port_read_handler(nxt_task_t *task, void *obj, void *data)
             ret = nxt_socket_msg_oob_get(&oob, msg.fd,
                                          nxt_recv_msg_cmsg_pid_ref(&msg));
             if (nxt_slow_path(ret != NXT_OK)) {
-                nxt_alert(task, "failed to get oob data from %d",
-                          port->socket.fd);
+                nxt_port_oob_error_alert(task, port, &oob, &msg, n);
 
+                /*
+                 * Whatever part of the SCM_RIGHTS did arrive is in msg.fd;
+                 * the dispatcher does not reclaim descriptors once a message
+                 * is refused here, so close them before dropping it.
+                 */
                 nxt_port_close_fds(msg.fd);
 
                 goto fail;
@@ -1022,9 +1065,9 @@ nxt_port_queue_read_handler(nxt_task_t *task, void *obj, void *data)
                 ret = nxt_socket_msg_oob_get(&oob, msg.fd,
                                              nxt_recv_msg_cmsg_pid_ref(&msg));
                 if (nxt_slow_path(ret != NXT_OK)) {
-                    nxt_alert(task, "failed to get oob data from %d",
-                              port->socket.fd);
+                    nxt_port_oob_error_alert(task, port, &oob, &msg, n);
 
+                    /* See nxt_port_read_handler(). */
                     nxt_port_close_fds(msg.fd);
 
                     return;

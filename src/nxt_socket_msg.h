@@ -42,9 +42,26 @@ typedef struct cmsgcred     nxt_socket_cred_t;
 #endif
 
 
+/*
+ * NXT_OOB_RECV_SIZE is the largest control block Unit can legitimately be
+ * handed: the two descriptors a message may carry -- nxt_port_recv_msg_t
+ * has exactly two fd slots and nxt_socket_msg_oob_init() never attaches
+ * more -- plus, where the platform passes credentials, the one credential
+ * cmsg the kernel or the sender adds.  A receive buffer of that size can
+ * therefore never truncate a well-formed message: MSG_CTRUNC means either
+ * that the kernel dropped part of the control data it was going to deliver
+ * (an SCM_RIGHTS whose descriptors it could not install, typically under
+ * RLIMIT_NOFILE pressure), or that a peer sent more control data than any
+ * Unit message type uses.  Both are receive errors, not conditions a
+ * handler can be expected to notice: what reaches it is a well-formed,
+ * authenticated message whose descriptor is simply -1.
+ */
+
 typedef struct {
-    size_t  size;
-    u_char  buf[NXT_OOB_RECV_SIZE];
+    size_t      size;
+    /* recvmsg() reported MSG_CTRUNC: the control data is incomplete. */
+    nxt_bool_t  truncated;
+    u_char      buf[NXT_OOB_RECV_SIZE];
 } nxt_recv_oob_t;
 
 
@@ -80,6 +97,21 @@ NXT_CMSG_NXTHDR(struct msghdr *msgh, struct cmsghdr *cmsg)
 #if !defined(__GLIBC__) && defined(__clang__)
 #pragma clang diagnostic pop
 #endif
+}
+
+
+/*
+ * Put a receive buffer into the "carries nothing" state.  Callers that fill
+ * oob themselves, or that recycle a buffer, use this rather than assigning
+ * ->size alone, so that every field describing the control data is retired
+ * together.
+ */
+
+nxt_inline void
+nxt_socket_msg_oob_reset(nxt_recv_oob_t *oob)
+{
+    oob->size = 0;
+    oob->truncated = 0;
 }
 
 
@@ -162,8 +194,17 @@ nxt_socket_msg_oob_get_fds(nxt_recv_oob_t *oob, nxt_fd_t *fd)
 
             nxt_memcpy(fd, CMSG_DATA(cmsg), size);
 
-            return NXT_OK;
+            break;
         }
+    }
+
+    /*
+     * Checked after the loop, not before it: a truncated control block can
+     * still have delivered a descriptor, and the caller can only close what
+     * it has been told about.
+     */
+    if (nxt_slow_path(oob->truncated)) {
+        return NXT_ERROR;
     }
 
     return NXT_OK;
@@ -177,7 +218,7 @@ nxt_socket_msg_oob_get(nxt_recv_oob_t *oob, nxt_fd_t *fd, nxt_pid_t *pid)
     struct msghdr   msg;
     struct cmsghdr  *cmsg;
 
-    if (oob->size == 0) {
+    if (oob->size == 0 && !oob->truncated) {
         return NXT_OK;
     }
 
@@ -220,6 +261,11 @@ nxt_socket_msg_oob_get(nxt_recv_oob_t *oob, nxt_fd_t *fd, nxt_pid_t *pid)
             *pid = NXT_CRED_GETPID(creds);
         }
 #endif
+    }
+
+    /* See nxt_socket_msg_oob_get_fds() on why this follows the loop. */
+    if (nxt_slow_path(oob->truncated)) {
+        return NXT_ERROR;
     }
 
 #if (NXT_CRED_USECMSG)
