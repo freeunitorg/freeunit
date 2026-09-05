@@ -18,6 +18,9 @@
 
 #define NXT_COMP_LEVEL_UNSET               INT8_MIN
 
+/* Headroom for the flush marker a compressor emits per call. */
+#define NXT_HTTP_COMP_FLUSH_SLACK          64
+
 
 typedef enum nxt_http_comp_scheme_e        nxt_http_comp_scheme_t;
 typedef struct nxt_http_comp_type_s        nxt_http_comp_type_t;
@@ -174,7 +177,7 @@ nxt_http_comp_compress_app_response(nxt_task_t *task, nxt_http_request_t *r,
     bool                 last;
     size_t               buf_len;
     ssize_t              cbytes;
-    nxt_buf_t            *buf;
+    nxt_buf_t            *in, *next, *buf, *out, **tail;
     nxt_off_t            in_len;
     nxt_http_comp_ctx_t  *ctx = nxt_http_comp_ctx();
 
@@ -182,51 +185,103 @@ nxt_http_comp_compress_app_response(nxt_task_t *task, nxt_http_request_t *r,
         return NXT_OK;
     }
 
-    if (!nxt_buf_is_port_mmap(*b)) {
-        return NXT_OK;
+    /*
+     * What arrives here is a chain, not a single buffer:
+     * nxt_port_mmap_read() (src/nxt_port_memory.c) makes one nxt_buf_t per
+     * nxt_port_mmap_msg_t, the call site links it into r->out with
+     * nxt_buf_chain_add(), and a sync buffer may sit at the tail.  Walk it.
+     *
+     * The previous version compressed the head and then replaced the whole
+     * chain with that one output buffer, so anything behind the head was
+     * dropped from the response and never released, and ctx->clen_sent
+     * counted only the head -- which is what decides whether the compressor
+     * is told it is finishing the stream.
+     */
+
+    out = NULL;
+    tail = &out;
+
+    for (in = *b; in != NULL; in = next) {
+        next = in->next;
+        in->next = NULL;
+
+        /*
+         * Buffers that did not come through shared memory are passed
+         * through untouched: the trailing sync/last buffer carries no data,
+         * and a plain-mode response is not compressed at all (the same
+         * condition the single-buffer version tested on the head).
+         */
+        if (!nxt_buf_is_port_mmap(in)) {
+            *tail = in;
+            tail = &in->next;
+            continue;
+        }
+
+        in_len = in->mem.free - in->mem.pos;
+
+        last = ctx->clen_sent + in_len == ctx->resp_clen;
+
+        if (in_len == 0 && !last) {
+            goto release;
+        }
+
+        /*
+         * The per-call flush marker each compressor emits after the input
+         * is not part of what bound() promises for the input alone, so the
+         * output buffer gets a small fixed margin on top.
+         */
+        buf_len = nxt_http_comp_bound(in_len) + NXT_HTTP_COMP_FLUSH_SLACK;
+
+        buf = nxt_buf_mem_ts_alloc(task, in->data, buf_len);
+        if (nxt_slow_path(buf == NULL)) {
+            goto fail;
+        }
+
+        cbytes = nxt_http_comp_compress(buf->mem.start, buf_len,
+                                        in->mem.pos, in_len, last);
+        if (nxt_slow_path(cbytes == -1)) {
+            nxt_buf_free(buf->data, buf);
+            goto fail;
+        }
+
+        buf->mem.free += cbytes;
+
+        ctx->clen_sent += in_len;
+
+        *tail = buf;
+        tail = &buf->next;
+
+    release:
+
+        /*
+         * The compressed bytes have been copied out, so the shared memory
+         * chunk can go back to the application.  This has to run the
+         * buffer's own completion handler -- nxt_buf_free() is a plain pool
+         * free, and using it here (as the single-buffer version did) leaked
+         * the chunk, the mmap_handler reference and the port mem_pool
+         * reference on every compressed response.  in->next was cleared
+         * above because nxt_port_mmap_buf_completion() walks the chain.
+         */
+        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                           in->completion_handler, task, in, in->parent);
     }
 
-    in_len = (*b)->mem.free - (*b)->mem.pos;
-    buf_len = nxt_http_comp_bound(in_len);
-
-    buf = nxt_buf_mem_ts_alloc(task, (*b)->data, buf_len);
-    if (nxt_slow_path(buf == NULL)) {
-        return NXT_ERROR;
-    }
-
-    buf->data = (*b)->data;
-
-    last = ctx->clen_sent + in_len == ctx->resp_clen;
-
-    cbytes = nxt_http_comp_compress(buf->mem.start, buf_len,
-                                    (*b)->mem.pos, in_len, last);
-    if (cbytes == -1) {
-        nxt_buf_free(buf->data, buf);
-        return NXT_ERROR;
-    }
-
-    buf->mem.free += cbytes;
-
-    ctx->clen_sent += in_len;
-
-#define nxt_swap_buf(db, sb)                                                  \
-    do {                                                                      \
-        nxt_buf_t  **db_ = (db);                                              \
-        nxt_buf_t  **sb_ = (sb);                                              \
-        nxt_buf_t  *tmp_;                                                     \
-                                                                              \
-        tmp_ = *db_;                                                          \
-        *db_ = *sb_;                                                          \
-        *sb_ = tmp_;                                                          \
-    } while (0)
-
-    nxt_swap_buf(b, &buf);
-
-#undef nxt_swap_buf
-
-    nxt_buf_free(buf->data, buf);
+    *b = out;
 
     return NXT_OK;
+
+fail:
+
+    /*
+     * Keep whatever has been produced so far, and re-attach the input that
+     * has not been consumed, so that the caller's error path owns the whole
+     * chain and releases it.
+     */
+    in->next = next;
+    *tail = in;
+    *b = out;
+
+    return NXT_ERROR;
 }
 
 
