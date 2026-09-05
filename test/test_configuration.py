@@ -1,4 +1,5 @@
 import socket
+import time
 
 import pytest
 
@@ -333,7 +334,6 @@ def test_listeners_addr_error_2(skip_alert):
 
 def test_listeners_port_release():
     for _ in range(10):
-        fail = False
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
@@ -346,15 +346,28 @@ def test_listeners_port_release():
 
             resp = client.conf({"listeners": {}, "applications": {}})
 
-            try:
-                s.bind(('127.0.0.1', 8080))
-                s.listen()
+            # The router closes the listening descriptor before it
+            # acknowledges the removal, but close(2) only drops the closing
+            # thread's reference to the open file.  Every other router
+            # thread that had the descriptor armed for accept(2) may still
+            # hold a transient kernel reference to it, and the address
+            # leaves the bind hash only when the last one is dropped, which
+            # happens asynchronously.  A client therefore has to retry, so
+            # the test retries too; a listener that is genuinely never
+            # closed still fails here.
+            deadline = time.monotonic() + 5
 
-            except OSError:
-                fail = True
+            while True:
+                try:
+                    s.bind(('127.0.0.1', 8080))
+                    s.listen()
+                    break
 
-            if fail:
-                pytest.fail('cannot bind or listen to the address')
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        pytest.fail('cannot bind or listen to the address')
+
+                    time.sleep(0.01)
 
             assert 'success' in resp, 'port release'
 
