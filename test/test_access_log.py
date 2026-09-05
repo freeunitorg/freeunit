@@ -1,3 +1,4 @@
+import json
 import time
 
 import pytest
@@ -305,6 +306,73 @@ def test_access_log_format(wait_for_record):
         'uri': '$uri'
     }
     check_format(log_format, '{"status":"200","uri":"/"}')
+
+
+def _read_log_lines():
+    with open(
+        f'{option.temp_dir}/access.log', 'r', encoding='utf-8', errors='strict'
+    ) as f:
+        return [ln for ln in f.read().splitlines() if ln]
+
+
+def test_access_log_object_escape(wait_for_record):
+    load('empty')
+
+    # Every character below is significant inside a JSON string: the first
+    # chunk closes the "ua" member and opens a forged one, then come a bare
+    # quote, a backslash, a control character (HTAB is legal in a field
+    # value) and a multi-byte UTF-8 sequence.
+    evil = '", "injected": "1 " \\ \t \u00e9'
+
+    set_format({'status': '$status', 'ua': '$header_user_agent'})
+
+    assert (
+        client.get(
+            headers={
+                'Host': 'localhost',
+                'User-Agent': evil,
+                'Connection': 'close',
+            }
+        )['status']
+        == 200
+    )
+    assert wait_for_record(r'"status":"200"', 'access.log') is not None
+
+    line = _read_log_lines()[-1]
+
+    record = json.loads(line)
+
+    assert list(record.keys()) == ['status', 'ua'], 'no injected members'
+    assert record['status'] == '200'
+    assert record['ua'] == evil, 'value round-trips'
+
+
+def test_access_log_object_escape_njs(require, wait_for_record):
+    require({'modules': {'njs': 'any'}})
+
+    load('empty')
+
+    evil = '", "injected": "1 " \\ \t \u00e9'
+
+    set_format({'uri': '`${vars.uri}`', 'ua': '$header_user_agent'})
+
+    assert (
+        client.get(
+            headers={
+                'Host': 'localhost',
+                'User-Agent': evil,
+                'Connection': 'close',
+            }
+        )['status']
+        == 200
+    )
+    assert wait_for_record(r'"uri":"/"', 'access.log') is not None
+
+    record = json.loads(_read_log_lines()[-1])
+
+    assert list(record.keys()) == ['uri', 'ua'], 'no injected members'
+    assert record['uri'] == '/'
+    assert record['ua'] == evil, 'value round-trips'
 
 
 def test_access_log_variables(wait_for_record):
