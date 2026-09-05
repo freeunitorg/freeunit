@@ -1353,6 +1353,9 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_app_limits_members[] = {
         .name       = nxt_string("timeout"),
         .type       = NXT_CONF_VLDT_INTEGER,
     }, {
+        .name       = nxt_string("start_timeout"),
+        .type       = NXT_CONF_VLDT_INTEGER,
+    }, {
         .name       = nxt_string("requests"),
         .type       = NXT_CONF_VLDT_INTEGER,
     }, {

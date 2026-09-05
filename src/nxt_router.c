@@ -40,6 +40,7 @@ typedef struct {
     nxt_conf_value_t  *limits_value;
     nxt_conf_value_t  *processes_value;
     nxt_conf_value_t  *targets_value;
+    nxt_msec_t        start_timeout;
 } nxt_router_app_conf_t;
 
 
@@ -84,18 +85,57 @@ typedef struct {
 } nxt_socket_rpc_t;
 
 
+typedef struct nxt_router_start_timer_s  nxt_router_start_timer_t;
+
+
 typedef struct {
-    nxt_app_t               *app;
-    nxt_router_temp_conf_t  *temp_conf;
-    uint8_t                 proto;  /* 1 bit */
+    nxt_app_t                 *app;
+    nxt_router_temp_conf_t    *temp_conf;
+    nxt_router_start_timer_t  *start_timer;
+    uint8_t                   proto;  /* 1 bit */
 } nxt_app_rpc_t;
 
 
 typedef struct {
-    nxt_app_joint_t         *app_joint;
-    uint32_t                generation;
-    uint8_t                 proto;  /* 1 bit */
+    nxt_app_joint_t           *app_joint;
+    nxt_router_start_timer_t  *start_timer;
+    uint32_t                  generation;
+    uint8_t                   proto;  /* 1 bit */
 } nxt_app_joint_rpc_t;
+
+
+/*
+ * Deadline for one START_PROCESS RPC.
+ *
+ * The only thing that can answer a start is the new worker itself, through
+ * nxt_unit_init() -> PROCESS_READY.  A process that is forked successfully but
+ * never gets there -- a "type": "external" binary that blocks before exec'ing
+ * anything of ours, a runtime stuck in its own init -- answers nothing and
+ * dies of nothing, so the RPC stays armed for the life of the router.  With
+ * the default "processes" that RPC is the sole continuation of
+ * nxt_router_conf_apply(), so the configuration PUT never returns and the
+ * controller queues every later request behind it, GET /status included.
+ *
+ * On expiry the RPC is failed through nxt_port_rpc_error(), which runs the
+ * handler that a real failure would have run.  Nothing here duplicates that
+ * recovery: the pending_processes and proto_port_requests accounting stays in
+ * nxt_router_app_port_error() / nxt_router_app_prefork_error() and runs once,
+ * driven by the RPC layer.
+ *
+ * The struct owns nothing but a copy of the application name, deliberately:
+ * holding an nxt_app_t or an nxt_app_joint_t reference would let a deadline
+ * extend the lifetime of the very object whose start it is giving up on.  The
+ * router port is referenced, because the stream is only meaningful against it.
+ */
+
+struct nxt_router_start_timer_s {
+    nxt_timer_t             timer;
+    nxt_port_t              *port;
+    uint32_t                stream;
+    /* Set while the expiry handler owns the struct; see _cancel(). */
+    uint8_t                 firing;  /* 1 bit */
+    nxt_str_t               app_name;
+};
 
 
 static nxt_int_t nxt_router_prefork(nxt_task_t *task, nxt_process_t *process,
@@ -224,6 +264,14 @@ static void nxt_router_req_headers_ack_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, nxt_request_rpc_data_t *req_rpc_data);
 static void nxt_router_listen_socket_release(nxt_task_t *task,
     nxt_socket_conf_t *skcf);
+
+static nxt_router_start_timer_t *nxt_router_start_timer_add(nxt_task_t *task,
+    nxt_app_t *app, nxt_port_t *port, uint32_t stream);
+static void nxt_router_start_timer_cancel(nxt_task_t *task,
+    nxt_router_start_timer_t *st);
+static void nxt_router_start_timeout(nxt_task_t *task, void *obj, void *data);
+static void nxt_router_start_timer_release(nxt_task_t *task, void *obj,
+    void *data);
 
 static void nxt_router_app_port_ready(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
@@ -477,6 +525,8 @@ nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
     app_joint_rpc->app_joint = app->joint;
     app_joint_rpc->generation = app->generation;
     app_joint_rpc->proto = (b != NULL);
+    app_joint_rpc->start_timer = nxt_router_start_timer_add(task, app, port,
+                                                            stream);
 
     if (b != NULL) {
         app->proto_port_requests++;
@@ -509,6 +559,163 @@ failed:
 skip:
 
     nxt_router_app_use(task, app, -1);
+}
+
+
+/*
+ * Arm the deadline for a START_PROCESS RPC that has just been written.  The
+ * timer runs on the engine of the port the RPC is registered on -- always the
+ * router's own port, for both the config-apply prefork path
+ * (nxt_router_app_rpc_create()) and the on-demand path
+ * (nxt_router_start_app_process_handler(), reached by nxt_port_post() to that
+ * same port) -- so the expiry handler and the reply handlers it races cannot
+ * run concurrently.
+ *
+ * A NULL return means no deadline, which is the configured behaviour for
+ * "start_timeout": 0 and the fallback if the allocation fails; the start is
+ * then exactly as unbounded as it was before this existed, which is worse than
+ * the alternative but not worse than failing a start over a small malloc.
+ */
+
+static nxt_router_start_timer_t *
+nxt_router_start_timer_add(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
+    uint32_t stream)
+{
+    nxt_msec_t                timeout;
+    nxt_event_engine_t        *engine;
+    nxt_router_start_timer_t  *st;
+
+    /* Immutable once the application is configured, so read unlocked. */
+    timeout = app->start_timeout;
+
+    if (timeout == 0) {
+        return NULL;
+    }
+
+    st = nxt_malloc(sizeof(nxt_router_start_timer_t) + app->name.length);
+    if (nxt_slow_path(st == NULL)) {
+        nxt_alert(task, "app \"%V\" start deadline not armed: out of memory",
+                  &app->name);
+
+        return NULL;
+    }
+
+    nxt_memzero(st, sizeof(nxt_router_start_timer_t));
+
+    st->app_name.start = nxt_pointer_to(st, sizeof(nxt_router_start_timer_t));
+    st->app_name.length = app->name.length;
+    nxt_memcpy(st->app_name.start, app->name.start, app->name.length);
+
+    st->stream = stream;
+    st->port = port;
+    nxt_port_inc_use(port);
+
+    engine = task->thread->engine;
+
+    st->timer.bias = NXT_TIMER_DEFAULT_BIAS;
+    st->timer.work_queue = &engine->fast_work_queue;
+    st->timer.handler = nxt_router_start_timeout;
+    st->timer.task = &engine->task;
+    st->timer.log = st->timer.task->log;
+
+    nxt_timer_add(engine, &st->timer, timeout);
+
+    nxt_debug(task, "app \"%V\" stream #%uD start deadline %M ms",
+              &app->name, stream, timeout);
+
+    return st;
+}
+
+
+static void
+nxt_router_start_timer_free(nxt_task_t *task, nxt_router_start_timer_t *st)
+{
+    nxt_port_use(task, st->port, -1);
+
+    nxt_free(st);
+}
+
+
+/*
+ * The start answered: drop the deadline.
+ *
+ * nxt_timer_disable() is not enough -- it clears the enabled bit but leaves
+ * the node in the engine's rbtree, which would dangle the moment this struct
+ * is freed.  nxt_timer_delete() removes it, but its removal can itself be a
+ * queued change referencing the timer, so a non-zero return means the struct
+ * is still reachable from the engine and must not be freed here.  Re-arming it
+ * at zero onto a release handler is the same trick nxt_router_free_app() uses
+ * for app_joint->idle_timer: the next turn of the event loop reaches a timer
+ * the engine is done with, and frees it there.
+ *
+ * When the expiry handler is the caller's own caller, ->firing says so and
+ * ownership stays with it; freeing here would pull the struct out from under
+ * the frame that is about to touch it again.
+ */
+
+static void
+nxt_router_start_timer_cancel(nxt_task_t *task, nxt_router_start_timer_t *st)
+{
+    nxt_event_engine_t  *engine;
+
+    if (st->firing) {
+        return;
+    }
+
+    engine = task->thread->engine;
+
+    if (nxt_timer_delete(engine, &st->timer)) {
+        st->timer.handler = nxt_router_start_timer_release;
+        nxt_timer_add(engine, &st->timer, 0);
+
+        return;
+    }
+
+    nxt_router_start_timer_free(task, st);
+}
+
+
+static void
+nxt_router_start_timer_release(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_timer_t  *timer;
+
+    timer = obj;
+
+    nxt_router_start_timer_free(task,
+                    nxt_timer_data(timer, nxt_router_start_timer_t, timer));
+}
+
+
+static void
+nxt_router_start_timeout(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_timer_t               *timer;
+    nxt_router_start_timer_t  *st;
+
+    timer = obj;
+    st = nxt_timer_data(timer, nxt_router_start_timer_t, timer);
+
+    nxt_alert(task, "app \"%V\" process did not become ready in time; "
+                    "failing the start request (stream #%uD).  The process, "
+                    "if it is still running, never called nxt_unit_init() -- "
+                    "raise \"limits\": {\"start_timeout\"} if the application "
+                    "simply needs longer to start",
+              &st->app_name, st->stream);
+
+    /*
+     * Owned by this frame from here on, so the error handler reached below
+     * cannot free the struct through nxt_router_start_timer_cancel().  The
+     * stream may already be retired if a reply landed in the same turn of the
+     * event loop; nxt_port_rpc_error() drops an unknown stream, so the race
+     * costs a debug line and nothing else.
+     */
+
+    st->firing = 1;
+
+    nxt_port_rpc_error(task, st->port, st->stream);
+
+    nxt_router_start_timer_free(task, st);
 }
 
 
@@ -1529,6 +1736,12 @@ static nxt_conf_map_t  nxt_router_app_limits_conf[] = {
         NXT_CONF_MAP_MSEC,
         offsetof(nxt_router_app_conf_t, timeout),
     },
+
+    {
+        nxt_string("start_timeout"),
+        NXT_CONF_MAP_MSEC,
+        offsetof(nxt_router_app_conf_t, start_timeout),
+    },
 };
 
 
@@ -1952,6 +2165,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             apcf.max_processes = 1;
             apcf.spare_processes = 0;
             apcf.timeout = 0;
+            apcf.start_timeout = NXT_APP_START_TIMEOUT;
             apcf.idle_timeout = 15000;
             apcf.limits_value = NULL;
             apcf.processes_value = NULL;
@@ -2061,6 +2275,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             app->max_pending_processes = apcf.spare_processes
                                          ? apcf.spare_processes : 1;
             app->timeout = apcf.timeout;
+            app->start_timeout = apcf.start_timeout;
             app->idle_timeout = apcf.idle_timeout;
 
             app->targets = targets;
@@ -3357,6 +3572,9 @@ nxt_router_app_rpc_create(nxt_task_t *task,
         app->pending_processes++;
     }
 
+    rpc->start_timer = nxt_router_start_timer_add(task, app, router_port,
+                                                  stream);
+
     return;
 
 fail:
@@ -3376,6 +3594,12 @@ nxt_router_app_prefork_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
     rpc = data;
     app = rpc->app;
+
+    if (rpc->start_timer != NULL) {
+        nxt_router_start_timer_cancel(task, rpc->start_timer);
+
+        rpc->start_timer = NULL;
+    }
 
     port = msg->u.new_port;
 
@@ -3438,6 +3662,12 @@ nxt_router_app_prefork_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     rpc = data;
     app = rpc->app;
     tmcf = rpc->temp_conf;
+
+    if (rpc->start_timer != NULL) {
+        nxt_router_start_timer_cancel(task, rpc->start_timer);
+
+        rpc->start_timer = NULL;
+    }
 
     if (rpc->proto) {
         nxt_log(task, NXT_LOG_WARN, "failed to start prototype \"%V\"",
@@ -4949,6 +5179,12 @@ nxt_router_app_port_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     app_joint = app_joint_rpc->app_joint;
     port = msg->u.new_port;
 
+    if (app_joint_rpc->start_timer != NULL) {
+        nxt_router_start_timer_cancel(task, app_joint_rpc->start_timer);
+
+        app_joint_rpc->start_timer = NULL;
+    }
+
     nxt_assert(app_joint != NULL);
     nxt_assert(port != NULL);
     nxt_assert(port->id == 0);
@@ -5064,6 +5300,12 @@ nxt_router_app_port_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
     app_joint_rpc = data;
     app_joint = app_joint_rpc->app_joint;
+
+    if (app_joint_rpc->start_timer != NULL) {
+        nxt_router_start_timer_cancel(task, app_joint_rpc->start_timer);
+
+        app_joint_rpc->start_timer = NULL;
+    }
 
     nxt_assert(app_joint != NULL);
 
