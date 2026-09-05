@@ -213,6 +213,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_router_proto_death_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_router_remove_pid_soak_test(thr) != NXT_OK) {
         return 1;
     }
