@@ -257,6 +257,12 @@ static nxt_int_t nxt_conf_vldt_rootfs_path(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 #endif
 
+#if (NXT_HAVE_ISOLATION_ROOTFS) && (NXT_HAVE_CLONE_NEWUSER) \
+    && (NXT_HAVE_CLONE_NEWNS)
+static nxt_int_t nxt_conf_vldt_isolation_mounts(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, nxt_app_lang_module_t *lang);
+#endif
+
 #if (NXT_HAVE_NJS)
 static nxt_int_t nxt_conf_vldt_js_module(nxt_conf_validation_t *vldt,
      nxt_conf_value_t *value, void *data);
@@ -3469,7 +3475,17 @@ nxt_conf_vldt_app(nxt_conf_validation_t *vldt, nxt_str_t *name,
         return ret;
     }
 
-    return types[lang->type].validator(vldt, value, types[lang->type].members);
+    ret = types[lang->type].validator(vldt, value, types[lang->type].members);
+    if (ret != NXT_OK) {
+        return ret;
+    }
+
+#if (NXT_HAVE_ISOLATION_ROOTFS) && (NXT_HAVE_CLONE_NEWUSER) \
+    && (NXT_HAVE_CLONE_NEWNS)
+    return nxt_conf_vldt_isolation_mounts(vldt, value, lang);
+#else
+    return NXT_OK;
+#endif
 }
 
 
@@ -4049,6 +4065,129 @@ nxt_conf_vldt_isolation(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
 {
     return nxt_conf_vldt_object(vldt, value, data);
 }
+
+
+#if (NXT_HAVE_ISOLATION_ROOTFS) && (NXT_HAVE_CLONE_NEWUSER) \
+    && (NXT_HAVE_CLONE_NEWNS)
+
+static nxt_bool_t
+nxt_conf_vldt_boolean_member(nxt_conf_value_t *object, const nxt_str_t *name,
+    nxt_bool_t dflt)
+{
+    nxt_conf_value_t  *member;
+
+    if (object == NULL) {
+        return dflt;
+    }
+
+    member = nxt_conf_get_object_member(object, name, NULL);
+
+    if (member == NULL || nxt_conf_type(member) != NXT_CONF_BOOLEAN) {
+        return dflt;
+    }
+
+    return nxt_conf_get_boolean(member);
+}
+
+
+/*
+ * A prototype that enters a new user namespace (CLONE_NEWUSER, from
+ * "namespaces": {"credential": true}) without a new mount namespace
+ * (CLONE_NEWNS, from "namespaces": {"mount": true}) stays in the parent's
+ * mount namespace, which is owned by the initial user namespace.  mount(2)
+ * there requires CAP_SYS_ADMIN in *that* namespace, which the child does not
+ * have, so the automount loop in nxt_isolation_prepare_rootfs()
+ * (src/nxt_isolation.c:926) fails with EPERM at src/nxt_fs_mount.c:93 and the
+ * prototype dies before it can serve -- with only "Failed to apply new
+ * configuration." on the control API.  This is a kernel invariant, so refuse
+ * the combination here instead.
+ *
+ * The rootfs switch itself does not need CLONE_NEWNS:
+ * nxt_isolation_change_root() (src/nxt_isolation.c:1058) falls back to
+ * chroot(2), which needs only CAP_SYS_CHROOT in the new user namespace.  So
+ * refuse only the configurations that actually have a mount to perform: the
+ * "tmpfs" and "procfs" automounts (unconditional builtins, added in
+ * nxt_isolation_set_lang_mounts(), src/nxt_isolation.c:703 and :729), and the
+ * "language_deps" automount when the module declares mounts at all (every
+ * lang mount carries deps = 1, src/nxt_main_process.c:1768, and is skipped
+ * when "language_deps" is false, src/nxt_isolation.c:926).  A config that
+ * disables every applicable automount does start and serve, and stays valid.
+ */
+static nxt_int_t
+nxt_conf_vldt_isolation_mounts(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, nxt_app_lang_module_t *lang)
+{
+    const char        *mnt;
+    nxt_conf_value_t  *isolation, *namespaces, *automount;
+
+    static const nxt_str_t  isolation_str = nxt_string("isolation");
+    static const nxt_str_t  namespaces_str = nxt_string("namespaces");
+    static const nxt_str_t  automount_str = nxt_string("automount");
+    static const nxt_str_t  rootfs_str = nxt_string("rootfs");
+    static const nxt_str_t  credential_str = nxt_string("credential");
+    static const nxt_str_t  mount_str = nxt_string("mount");
+    static const nxt_str_t  tmpfs_str = nxt_string("tmpfs");
+    static const nxt_str_t  procfs_str = nxt_string("procfs");
+    static const nxt_str_t  langdeps_str = nxt_string("language_deps");
+
+    isolation = nxt_conf_get_object_member(value, &isolation_str,
+                                           NULL);
+    if (isolation == NULL
+        || nxt_conf_type(isolation) != NXT_CONF_OBJECT
+        || nxt_conf_get_object_member(isolation, &rootfs_str,
+                                      NULL) == NULL)
+    {
+        return NXT_OK;
+    }
+
+    namespaces = nxt_conf_get_object_member(isolation,
+                                            &namespaces_str,
+                                            NULL);
+    if (namespaces == NULL || nxt_conf_type(namespaces) != NXT_CONF_OBJECT) {
+        return NXT_OK;
+    }
+
+    if (!nxt_conf_vldt_boolean_member(namespaces, &credential_str, 0)
+        || nxt_conf_vldt_boolean_member(namespaces, &mount_str, 0))
+    {
+        return NXT_OK;
+    }
+
+    automount = nxt_conf_get_object_member(isolation,
+                                           &automount_str, NULL);
+    if (automount != NULL && nxt_conf_type(automount) != NXT_CONF_OBJECT) {
+        automount = NULL;
+    }
+
+    if (nxt_conf_vldt_boolean_member(automount, &procfs_str, 1)) {
+        mnt = "the \"procfs\" automount";
+
+    } else if (nxt_conf_vldt_boolean_member(automount, &tmpfs_str, 1)) {
+        mnt = "the \"tmpfs\" automount";
+
+    } else if (nxt_conf_vldt_boolean_member(automount, &langdeps_str, 1)
+               && lang->mounts != NULL && lang->mounts->nelts > 0)
+    {
+        mnt = "the \"language_deps\" automount";
+
+    } else {
+        return NXT_OK;
+    }
+
+    return nxt_conf_vldt_error(vldt,
+                               "The \"isolation\" object sets \"rootfs\" with "
+                               "\"namespaces\": {\"credential\": true} but "
+                               "without \"namespaces\": {\"mount\": true}; a "
+                               "process in a new user namespace but in the "
+                               "parent mount namespace cannot mount %s "
+                               "(EPERM), so the application could never "
+                               "start.  Set \"namespaces\": {\"mount\": true}, "
+                               "drop \"namespaces\": {\"credential\": "
+                               "true}, or "
+                               "disable the \"automount\" options.", mnt);
+}
+
+#endif
 
 
 #if (NXT_HAVE_CLONE_NEWUSER)
