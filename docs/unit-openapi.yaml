@@ -6903,6 +6903,12 @@ components:
               type: integer
               description: "Request timeout in seconds."
 
+            start_timeout:
+              type: integer
+              description: "Time in seconds an application process may take to
+                announce itself before Unit fails the start request; 0, the
+                default, means no limit."
+
         processes:
           description: "Governs the behavior of app processes."
           anyOf:

@@ -102,6 +102,28 @@ typedef struct {
 } nxt_joint_job_t;
 
 
+/*
+ * Default "limits": {"start_timeout"}, in milliseconds: how long a worker may
+ * take to reach nxt_unit_init() before its start request is failed.  Zero
+ * disables the bound, and that is the default deliberately.
+ *
+ * The window this measures is the whole of the application's own startup, not
+ * just Unit's part of it: every module runs user code before nxt_unit_init()
+ * -- nxt_python_start() imports the application module
+ * (src/python/nxt_python.c:303, via nxt_python_set_target()) before
+ * nxt_unit_init() (:365), nxt_java_start() deploys the webapp
+ * (src/nxt_java.c:417) before :441, the Node module loads the script before
+ * src/nodejs/unit-http/unit.cpp:279, and Go and "external" run main() first.
+ * A default bound would
+ * therefore fail a Django or ML import, or a JVM webapp deployment, that
+ * works today -- and a start failed while the worker is merely slow leaves
+ * that worker alive and orphaned, because the router cannot kill a process it
+ * has no pid for.  So the bound is opt-in, and choosing a value is the
+ * operator's judgement about their own application's startup.
+ */
+#define NXT_APP_START_TIMEOUT  0
+
+
 typedef struct {
     uint32_t               use_count;
     nxt_app_t              *app;
@@ -138,6 +160,14 @@ struct nxt_app_s {
 
     nxt_msec_t             timeout;
     nxt_msec_t             idle_timeout;
+
+    /*
+     * Bound on a START_PROCESS RPC: a worker that is forked but never calls
+     * nxt_unit_init() sends no PROCESS_READY, so without this nothing ever
+     * retires the RPC.  Zero disables the bound.  See
+     * nxt_router_start_timer_t in nxt_router.c.
+     */
+    nxt_msec_t             start_timeout;
 
     nxt_str_t              *targets;
 
