@@ -225,6 +225,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_port_ctrunc_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_port_fd_test(thr) != NXT_OK) {
         return 1;
     }

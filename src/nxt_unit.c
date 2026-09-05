@@ -1086,7 +1086,20 @@ nxt_unit_process_msg(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf,
 
     rc = nxt_socket_msg_oob_get_fds(&rbuf->oob, recv_msg.fd);
     if (nxt_slow_path(rc != NXT_OK)) {
-        nxt_unit_alert(ctx, "failed to receive file descriptor over cmsg");
+        if (rbuf->oob.truncated) {
+            /*
+             * The descriptor this message was meant to carry may not be
+             * here: NEW_PORT and MMAP would take their fd-less path on a
+             * message that otherwise looks whole.  Refuse it; "done" closes
+             * whatever part of the SCM_RIGHTS did arrive.
+             */
+            nxt_unit_alert(ctx, "control data truncated on a %d byte "
+                           "message; message dropped", (int) rbuf->size);
+
+        } else {
+            nxt_unit_alert(ctx, "failed to receive file descriptor over cmsg");
+        }
+
         rc = NXT_UNIT_ERROR;
         goto done;
     }
@@ -3019,7 +3032,7 @@ nxt_unit_read_buf_get(nxt_unit_ctx_t *ctx)
 
     pthread_mutex_unlock(&ctx_impl->mutex);
 
-    rbuf->oob.size = 0;
+    nxt_socket_msg_oob_reset(&rbuf->oob);
 
     return rbuf;
 }
@@ -6399,7 +6412,7 @@ retry:
              * a leftover oob.size would offer them again.
              */
             port_impl->socket_rbuf->size = 0;
-            port_impl->socket_rbuf->oob.size = 0;
+            nxt_socket_msg_oob_reset(&port_impl->socket_rbuf->oob);
 
             nxt_unit_debug(ctx, "port{%d,%d} use suspended message %d",
                            (int) port->id.pid, (int) port->id.id,
@@ -6484,7 +6497,7 @@ retry:
 
     nxt_unit_rbuf_cpy(port_impl->socket_rbuf, rbuf);
 
-    rbuf->oob.size = 0;
+    nxt_socket_msg_oob_reset(&rbuf->oob);
 
     goto retry;
 }
@@ -6496,6 +6509,7 @@ nxt_unit_rbuf_cpy(nxt_unit_read_buf_t *dst, nxt_unit_read_buf_t *src)
     memcpy(dst->buf, src->buf, src->size);
     dst->size = src->size;
     dst->oob.size = src->oob.size;
+    dst->oob.truncated = src->oob.truncated;
     memcpy(dst->oob.buf, src->oob.buf, src->oob.size);
 }
 
@@ -6588,6 +6602,17 @@ nxt_unit_port_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
         }
 
         rbuf->oob.size = oob_size;
+        /*
+         * The callback reports a length, not msg_flags, so a truncation
+         * cannot be carried across as such: a wrapper that sees MSG_CTRUNC
+         * reports a read error instead, and the rbuf->size < 0 arm above
+         * returns before any control data is parsed (go/port.go does exactly
+         * this).  Nothing can therefore be inferred about truncation here;
+         * clear the flag so that a previous message's MSG_CTRUNC, left in
+         * this recycled buffer, cannot be read as this one's.
+         */
+        rbuf->oob.truncated = 0;
+
         return NXT_UNIT_OK;
     }
 
@@ -6608,7 +6633,7 @@ retry:
          * clear it here to keep "size 0 implies no control data" holding on
          * every exit of this function rather than by inspection of callers.
          */
-        rbuf->oob.size = 0;
+        nxt_socket_msg_oob_reset(&rbuf->oob);
 
         if (err == EINTR) {
             goto retry;
