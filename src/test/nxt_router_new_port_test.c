@@ -76,7 +76,7 @@ nxt_router_new_port_test(nxt_thread_t *thr)
     nxt_buf_t                buf;
     nxt_task_t               *task;
     nxt_int_t                ret;
-    nxt_port_t               *port, *reply_port;
+    nxt_port_t               *port, *port2, *reply_port;
     nxt_runtime_t            *rt, *saved_rt;
     nxt_event_engine_t       engine;
     nxt_port_recv_msg_t      msg;
@@ -89,6 +89,7 @@ nxt_router_new_port_test(nxt_thread_t *thr)
     sock = -1;
     queue = -1;
     port = NULL;
+    port2 = NULL;
     reply_port = NULL;
 
     task = thr->task;
@@ -243,6 +244,119 @@ nxt_router_new_port_test(nxt_thread_t *thr)
         goto done;
     }
 
+    /*
+     * An application's main port (id 0) announced with no start stream.  The
+     * handler has to tell the two ways that can happen apart, so both are
+     * exercised here.
+     *
+     * First the duplicate: register (pid + 2, 0) with a stream, then send
+     * that exact port again with none, as a worker that called
+     * nxt_unit_ready() twice does once its prototype has retired the start
+     * stream.  The port must survive unchanged -- falling through would
+     * re-add it to the application hash and ack it a second time.
+     */
+
+    nxt_memzero(&new_port, sizeof(nxt_port_msg_new_port_t));
+
+    new_port.pid = nxt_pid + 2;
+    new_port.id = 0;
+    new_port.type = NXT_PROCESS_APP;
+    new_port.max_size = 1024;
+    new_port.max_share = 1024;
+
+    nxt_memzero(&buf, sizeof(nxt_buf_t));
+
+    buf.mem.pos = (u_char *) &new_port;
+    buf.mem.free = buf.mem.pos + sizeof(nxt_port_msg_new_port_t);
+
+    nxt_memzero(&msg, sizeof(nxt_port_recv_msg_t));
+
+    msg.buf = &buf;
+    msg.fd[0] = -1;
+    msg.fd[1] = -1;
+    msg.port = reply_port;
+    msg.port_msg.stream = 5;
+    msg.port_msg.pid = new_port.pid;
+
+    nxt_router_new_port_handler(task, &msg);
+
+    port2 = msg.u.new_port;
+
+    if (port2 == NULL || !msg.new_port_created) {
+        nxt_log_alert(thr->log, "router new port test: the first main port "
+                      "announcement did not create a port");
+        goto done;
+    }
+
+    buf.mem.pos = (u_char *) &new_port;
+    buf.mem.free = buf.mem.pos + sizeof(nxt_port_msg_new_port_t);
+
+    nxt_memzero(&msg, sizeof(nxt_port_recv_msg_t));
+
+    msg.buf = &buf;
+    msg.fd[0] = -1;
+    msg.fd[1] = -1;
+    msg.port = reply_port;
+    msg.port_msg.stream = 0;
+    msg.port_msg.pid = new_port.pid;
+
+    nxt_router_new_port_handler(task, &msg);
+
+    if (msg.u.new_port != port2 || msg.new_port_created) {
+        nxt_log_alert(thr->log, "router new port test: the repeated "
+                      "announcement did not resolve to the registered port");
+        goto done;
+    }
+
+    if (nxt_runtime_port_find(rt, new_port.pid, 0) != port2) {
+        nxt_log_alert(thr->log, "router new port test: the repeated "
+                      "announcement disturbed the registered port");
+        goto done;
+    }
+
+    if (port2->app != NULL) {
+        nxt_log_alert(thr->log, "router new port test: the repeated "
+                      "announcement enrolled the port in an application");
+        goto done;
+    }
+
+    /*
+     * Then the other case: a main port the router has never seen, announced
+     * with no stream.  No start is waiting on it and nothing else will
+     * complete it, so the handler must undo the registration this message
+     * caused rather than leave an orphan in the runtime.
+     *
+     * What this pins, honestly: with the check removed both cases reach
+     * nxt_assert(port->id != 0) -- an abort in a debug build, compiled out in
+     * a release one, where the orphan check below is what reports it.  So the
+     * case has teeth either way.  What it does not cover is the other half of
+     * the duplicate: ->port_hash_count being incremented past a declined
+     * nxt_port_hash_add(), which needs an nxt_app_t the fixture does not
+     * build.
+     */
+
+    new_port.pid = nxt_pid + 3;
+
+    buf.mem.pos = (u_char *) &new_port;
+    buf.mem.free = buf.mem.pos + sizeof(nxt_port_msg_new_port_t);
+
+    nxt_memzero(&msg, sizeof(nxt_port_recv_msg_t));
+
+    msg.buf = &buf;
+    msg.fd[0] = -1;
+    msg.fd[1] = -1;
+    msg.port = reply_port;
+    msg.port_msg.stream = 0;
+    msg.port_msg.pid = new_port.pid;
+
+    nxt_router_new_port_handler(task, &msg);
+
+    if (nxt_runtime_port_find(rt, new_port.pid, 0) != NULL) {
+        nxt_log_alert(thr->log, "router new port test: a streamless first "
+                      "announcement was left registered");
+        goto done;
+    }
+
     ret = NXT_OK;
 
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "router new port test passed");
@@ -268,6 +382,11 @@ done:
          */
         nxt_port_close(task, port);
         nxt_runtime_port_remove(task, port);
+    }
+
+    if (port2 != NULL) {
+        nxt_port_close(task, port2);
+        nxt_runtime_port_remove(task, port2);
     }
 
     if (reply_port != NULL) {

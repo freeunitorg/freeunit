@@ -25,12 +25,17 @@
  * pid-isolated process -- pid and isolated_pid deliberately differ -- so
  * that the cases below can tell the two apart: a credential equal to the
  * global pid has to be refused just like a foreign one.
+ *
+ * The last case covers what the handler does with process->stream, the start
+ * RPC the initiator armed: it is retired when the announcement that answers
+ * that RPC has gone out, and kept when it has not.  See issue #271.
  */
 
 #include <nxt_main.h>
 #include <nxt_port.h>
 #include <nxt_port_queue.h>
 #include <nxt_runtime.h>
+#include <nxt_event_engine.h>
 #include "nxt_tests.h"
 
 #include <fcntl.h>
@@ -867,6 +872,459 @@ fail:
 #endif
 
 
+/*
+ * Require that the announcement the handler just made is on the router's
+ * port and carries "expect" as its stream, then drain both peer ports so the
+ * next case starts from empty queues.
+ *
+ * The stream is what these cases are about: it is the number the router
+ * matches against its registered start RPCs, so announcing the wrong one
+ * answers nobody while looking, from every other angle, like a success.
+ *
+ * "expect" may be NXT_PORT_READY_TEST_NO_MSG to require that the router was
+ * not announced to at all, or NXT_PORT_READY_TEST_ANY to make no
+ * requirement and only report, through *got, whether it was -- which is what
+ * the mixed-outcome case below needs, since which of the two peers a single
+ * armed allocation failure lands on is hash order, not something this test
+ * fixes.
+ */
+
+#define NXT_PORT_READY_TEST_NO_MSG  ((uint32_t) -1)
+#define NXT_PORT_READY_TEST_ANY     ((uint32_t) -2)
+
+static nxt_int_t
+nxt_port_ready_test_announced(nxt_thread_t *thr, nxt_task_t *task,
+    nxt_port_t *router_port, nxt_port_t *other_port, uint32_t expect,
+    nxt_bool_t *got, const char *name)
+{
+    nxt_int_t            ret;
+    nxt_uint_t           n;
+    nxt_queue_link_t     *link;
+    nxt_port_send_msg_t  *sent;
+
+    ret = NXT_OK;
+    sent = NULL;
+    n = 0;
+
+    for (link = nxt_queue_first(&router_port->messages);
+         link != nxt_queue_tail(&router_port->messages);
+         link = nxt_queue_next(link))
+    {
+        n++;
+        sent = nxt_queue_link_data(link, nxt_port_send_msg_t, link);
+    }
+
+    if (got != NULL) {
+        *got = (n != 0);
+    }
+
+    if (expect == NXT_PORT_READY_TEST_ANY) {
+        /* Reported, not required. */
+
+    } else if (expect == NXT_PORT_READY_TEST_NO_MSG) {
+        if (nxt_slow_path(n != 0)) {
+            nxt_log_alert(thr->log, "port ready test: %s announced the port "
+                          "to the router anyway", name);
+            ret = NXT_ERROR;
+        }
+
+    } else if (nxt_slow_path(n != 1)) {
+        nxt_log_alert(thr->log, "port ready test: %s left %ui announcements "
+                      "on the router port (expected 1)", name, n);
+        ret = NXT_ERROR;
+
+    } else if (nxt_slow_path(sent->port_msg.stream != expect)) {
+        nxt_log_alert(thr->log, "port ready test: %s announced the port on "
+                      "stream #%uD, but the start it answers is stream #%uD "
+                      "-- the router matches its registrations on that "
+                      "number, so this answers nobody", name,
+                      sent->port_msg.stream, expect);
+        ret = NXT_ERROR;
+    }
+
+    nxt_port_test_run_error_handler(task, router_port);
+
+    if (other_port != NULL) {
+        nxt_port_test_run_error_handler(task, other_port);
+    }
+
+    return ret;
+}
+
+
+/*
+ * Issue #271: process->stream is the start RPC the initiator armed, and the
+ * handler has to retire it exactly when that RPC has been answered -- which
+ * is when the NEW_PORT announcement carrying the stream has gone out, not
+ * when the READY state has been set.
+ *
+ * The two are not the same moment.  The state is set first and the
+ * announcement is written afterwards, so a READY whose announcement fails
+ * leaves the initiator with no reply at all; the only thing that can still
+ * fail its RPC is the stream in the REMOVE_PID this process's death will
+ * send (src/nxt_router.c:1148-1153).  Clearing on the state -- which is
+ * what nxt_main_process_sigchld_handler() used to do -- throws that away.
+ * Keeping it forever is the other error the issue names: stream numbers come
+ * from one counter that every request draws on, so after a wrap an ordinary
+ * exit retires somebody else's live RPC.
+ *
+ * The fixture is a process announcing itself with no queue descriptor, on a
+ * prototype port: that is a real shape (only libunit attaches a queue, and
+ * the core processes that announce to main do not), and it keeps the
+ * announcement free of descriptors, so the peer's queued message can be
+ * drained without closing a descriptor another port owns.
+ *
+ * The peer is a router, because nxt_proc_send_matrix[] pairs ROUTER with
+ * PROTOTYPE; without a peer the announcement would have nothing to fail on
+ * and both cases would pass vacuously.  Its port has no socket and is not
+ * write-ready, so nxt_port_socket_write2() queues rather than writes, and
+ * nxt_port_test_msg_alloc_failures() can fail that queueing on demand.
+ */
+static nxt_int_t
+nxt_port_ready_test_stream(nxt_thread_t *thr, nxt_task_t *task,
+    nxt_runtime_t *rt, nxt_mp_t *mp)
+{
+    uint32_t             stream;
+    nxt_int_t            ret;
+    nxt_bool_t           router_got_it;
+    nxt_port_t           *proto_port, *router_port, *main_port;
+    nxt_process_t        *proto, *router, *mainp;
+    nxt_event_engine_t   engine, *saved_engine;
+    nxt_port_recv_msg_t  msg;
+
+    ret = NXT_ERROR;
+    proto_port = NULL;
+    router_port = NULL;
+    main_port = NULL;
+    stream = 0x21212121;
+
+    proto = nxt_mp_zalloc(mp, sizeof(nxt_process_t));
+    router = nxt_mp_zalloc(mp, sizeof(nxt_process_t));
+    mainp = nxt_mp_zalloc(mp, sizeof(nxt_process_t));
+
+    if (nxt_slow_path(proto == NULL || router == NULL || mainp == NULL)) {
+        return NXT_ERROR;
+    }
+
+    proto->pid = nxt_pid + 7;
+    proto->isolated_pid = nxt_pid + 8;
+    proto->state = NXT_PROCESS_STATE_CREATING;
+    proto->stream = stream;
+    nxt_queue_init(&proto->ports);
+
+    nxt_runtime_process_add(task, proto);
+
+    proto_port = nxt_port_new(task, 0, proto->pid, NXT_PROCESS_PROTOTYPE);
+    if (nxt_slow_path(proto_port == NULL)) {
+        return NXT_ERROR;
+    }
+
+    proto_port->pair[0] = -1;
+    proto_port->pair[1] = -1;
+    proto_port->socket.fd = -1;
+
+    nxt_queue_insert_tail(&proto->ports, &proto_port->link);
+
+    /*
+     * A second peer, of main's type.  nxt_proc_send_matrix[] pairs MAIN with
+     * everything, so the prototype announcing a child writes to main as well
+     * as to the router -- and only the router's write is evidence about the
+     * start.  Without this peer the two rules ("every peer succeeded" and
+     * "the router succeeded") cannot be told apart.
+     */
+    mainp->pid = nxt_pid + 10;
+    mainp->isolated_pid = nxt_pid + 10;
+    mainp->state = NXT_PROCESS_STATE_READY;
+    nxt_queue_init(&mainp->ports);
+
+    nxt_runtime_process_add(task, mainp);
+
+    main_port = nxt_port_new(task, 0, mainp->pid, NXT_PROCESS_MAIN);
+    if (nxt_slow_path(main_port == NULL)) {
+        goto done;
+    }
+
+    main_port->pair[0] = -1;
+    main_port->pair[1] = -1;
+    main_port->socket.fd = -1;
+
+    nxt_queue_insert_tail(&mainp->ports, &main_port->link);
+
+    router->pid = nxt_pid + 9;
+    router->isolated_pid = nxt_pid + 9;
+    router->state = NXT_PROCESS_STATE_READY;
+    nxt_queue_init(&router->ports);
+
+    nxt_runtime_process_add(task, router);
+
+    router_port = nxt_port_new(task, 0, router->pid, NXT_PROCESS_ROUTER);
+    if (nxt_slow_path(router_port == NULL)) {
+        goto done;
+    }
+
+    router_port->pair[0] = -1;
+    router_port->pair[1] = -1;
+    router_port->socket.fd = -1;
+
+    nxt_queue_insert_tail(&router->ports, &router_port->link);
+
+    /*
+     * An engine only for the announcement: nxt_port_send_port() allocates
+     * its buffer from task->thread->engine->mem_pool, and the queued message
+     * is completed on the engine's work queue.  The rest of this file needs
+     * none, so it is installed and taken away again here.
+     */
+    nxt_memzero(&engine, sizeof(engine));
+    nxt_work_queue_cache_create(&engine.work_queue_cache, 1024);
+    engine.fast_work_queue.cache = &engine.work_queue_cache;
+    nxt_work_queue_name(&engine.fast_work_queue, "fast");
+    engine.mem_pool = mp;
+
+    saved_engine = thr->engine;
+    thr->engine = &engine;
+    rt->main_engine = &engine;
+
+    nxt_memzero(&msg, sizeof(nxt_port_recv_msg_t));
+
+    msg.port_msg.pid = proto->pid;
+    msg.port_msg.stream = stream;
+    msg.fd[0] = -1;
+    msg.fd[1] = -1;
+#if (NXT_USE_CMSG_PID)
+    msg.cmsg_pid = proto->isolated_pid;
+#endif
+
+    /*
+     * The announcement cannot be queued.  The process is ready as far as the
+     * state goes, and the initiator has still not been told anything, so the
+     * stream has to survive -- it is the only thing that will fail that RPC
+     * when this process dies.
+     */
+    nxt_port_test_msg_alloc_failures(2);
+
+    nxt_port_process_ready_handler(task, &msg);
+
+    nxt_port_test_msg_alloc_failures(0);
+
+    if (nxt_slow_path(nxt_port_ready_test_announced(thr, task, router_port,
+                                                    main_port,
+                                                    NXT_PORT_READY_TEST_NO_MSG,
+                                                    NULL,
+                                                    "an announcement whose "
+                                                    "allocation was made to "
+                                                    "fail")
+                      != NXT_OK))
+    {
+        goto drain;
+    }
+
+    if (nxt_slow_path(proto->state != NXT_PROCESS_STATE_READY)) {
+        nxt_log_alert(thr->log, "port ready test: a queueless prototype was "
+                      "not marked ready");
+        goto drain;
+    }
+
+    if (nxt_slow_path(proto->stream != stream)) {
+        nxt_log_alert(thr->log, "port ready test: the start stream was "
+                      "cleared although the announcement never went out, so "
+                      "nothing is left to fail that RPC");
+        goto drain;
+    }
+
+    /*
+     * The same message again, with the announcement allowed through.  Now
+     * the initiator has its reply -- nxt_router_new_port_handler() feeds a
+     * stream-bearing NEW_PORT to nxt_port_rpc_handler() -- and the stream is
+     * spent: keeping it would put it into this process's REMOVE_PID and,
+     * once the counter has wrapped, fail an unrelated live RPC.
+     */
+    nxt_port_process_ready_handler(task, &msg);
+
+    if (nxt_slow_path(nxt_port_ready_test_announced(thr, task, router_port,
+                                                    main_port, stream, NULL,
+                                                    "a healthy READY")
+                      != NXT_OK))
+    {
+        goto drain;
+    }
+
+    if (nxt_slow_path(proto->stream != 0)) {
+        nxt_log_alert(thr->log, "port ready test: the start stream survived "
+                      "an announcement that answered it, so a later "
+                      "REMOVE_PID would fail whatever RPC now holds that "
+                      "number");
+        goto drain;
+    }
+
+    /*
+     * A child naming a stream of its own choosing.  The gate above
+     * authenticates who sent a PROCESS_READY, not what it says, and the
+     * stream field is written by the sender: a child that echoes something
+     * other than the stream it was started for -- malformed, or forged by a
+     * compromised worker -- must not be able to redirect the answer.
+     *
+     * The announcement has to carry the stream this process registered when
+     * it forked the child, so the router retires the start that is really
+     * pending; and clearing is then correct, because that start has been
+     * answered.  Taking the wire value instead would announce a number no
+     * registration waits on while clearing the one that does -- the start
+     * would never be retired by the reply, and the REMOVE_PID fallback would
+     * carry nothing.
+     */
+    proto->stream = stream;
+    proto->state = NXT_PROCESS_STATE_CREATING;
+    msg.port_msg.stream = 0xdeadbeef;
+
+    nxt_port_process_ready_handler(task, &msg);
+
+    if (nxt_slow_path(nxt_port_ready_test_announced(thr, task, router_port,
+                                                    main_port, stream, NULL,
+                                                    "a READY naming a foreign "
+                                                    "stream")
+                      != NXT_OK))
+    {
+        goto drain;
+    }
+
+    if (nxt_slow_path(proto->stream != 0)) {
+        nxt_log_alert(thr->log, "port ready test: a READY naming a foreign "
+                      "stream did not retire the start that was answered");
+        goto drain;
+    }
+
+    /*
+     * The same with a stream of 0, which is what a truncated or zeroed
+     * message carries.  0 is the "no RPC" value everywhere else
+     * (nxt_router_remove_pid_handler() returns on it), so a handler that
+     * passed the wire value straight through would announce nothing
+     * answerable and still count the start as replied to.
+     */
+    proto->stream = stream;
+    proto->state = NXT_PROCESS_STATE_CREATING;
+    msg.port_msg.stream = 0;
+
+    nxt_port_process_ready_handler(task, &msg);
+
+    if (nxt_slow_path(nxt_port_ready_test_announced(thr, task, router_port,
+                                                    main_port, stream, NULL,
+                                                    "a READY naming stream 0")
+                      != NXT_OK))
+    {
+        goto drain;
+    }
+
+    if (nxt_slow_path(proto->stream != 0)) {
+        nxt_log_alert(thr->log, "port ready test: a READY naming stream 0 did "
+                      "not retire the start that was answered");
+        goto drain;
+    }
+
+    /*
+     * One peer's announcement fails and the other's succeeds.  Only the
+     * router's is evidence about the start: it owns the registration for
+     * every start, whether main or the prototype did the forking, and
+     * nxt_router_new_port_handler() retires it on a stream-bearing NEW_PORT.
+     * A failure to any other peer is a delivery problem for that peer.
+     *
+     * One armed allocation failure lands on whichever peer the runtime walks
+     * first, and that is the order they were registered in, not the pids:
+     * main is added to the fixture before the router above so that the
+     * failure falls on main and the router's write goes through.  That is
+     * the branch which discriminates the two implementations -- aggregating
+     * every peer keeps a stream the router has already retired -- and it is
+     * reached on every run; the log line below records which branch was
+     * taken, so a future change to the walk order shows up as a note rather
+     * than as a test that silently stopped testing anything.
+     *
+     * The assertion is still written as the rule for both branches, so it
+     * cannot fail spuriously if that order does change.  The opposite branch
+     * -- the router itself missing out -- is covered deterministically by
+     * the failed-announcement case above, which arms a failure for every
+     * peer.
+     */
+    proto->stream = stream;
+    proto->state = NXT_PROCESS_STATE_CREATING;
+    msg.port_msg.stream = stream;
+
+    nxt_port_test_msg_alloc_failures(1);
+
+    nxt_port_process_ready_handler(task, &msg);
+
+    nxt_port_test_msg_alloc_failures(0);
+
+    router_got_it = 0;
+
+    if (nxt_slow_path(nxt_port_ready_test_announced(thr, task, router_port,
+                                                    main_port,
+                                                    NXT_PORT_READY_TEST_ANY,
+                                                    &router_got_it,
+                                                    "a partly failed "
+                                                    "announcement")
+                      != NXT_OK))
+    {
+        goto drain;
+    }
+
+    nxt_log_error(NXT_LOG_INFO, thr->log, "port ready test: the partly failed "
+                  "announcement %s the router",
+                  router_got_it ? "reached" : "missed");
+
+    if (nxt_slow_path(router_got_it && proto->stream != 0)) {
+        nxt_log_alert(thr->log, "port ready test: the router was announced to "
+                      "and retired the start, but the stream was kept because "
+                      "another peer's write failed -- after a counter wrap "
+                      "that stream fails an unrelated RPC");
+        goto drain;
+    }
+
+    if (nxt_slow_path(!router_got_it && proto->stream != stream)) {
+        nxt_log_alert(thr->log, "port ready test: the router was not "
+                      "announced to, so nothing retired the start, yet the "
+                      "stream was cleared -- the REMOVE_PID fallback is gone");
+        goto drain;
+    }
+
+    msg.port_msg.stream = stream;
+
+    ret = NXT_OK;
+
+drain:
+
+    /*
+     * A queued message is malloc'd and holds a port reference; the error
+     * handler is what releases both, and it has to run while the engine it
+     * was queued on is still installed.  The checker above drains after each
+     * case; this catches whatever a failed case left behind.
+     */
+    nxt_port_test_run_error_handler(task, router_port);
+
+    if (main_port != NULL) {
+        nxt_port_test_run_error_handler(task, main_port);
+    }
+
+    thr->engine = saved_engine;
+    rt->main_engine = NULL;
+
+    nxt_work_queue_cache_destroy(&engine.work_queue_cache);
+
+done:
+
+    if (main_port != NULL) {
+        nxt_port_close(task, main_port);
+    }
+
+    if (router_port != NULL) {
+        nxt_port_close(task, router_port);
+    }
+
+    if (proto_port != NULL) {
+        nxt_port_close(task, proto_port);
+    }
+
+    return ret;
+}
+
+
 nxt_int_t
 nxt_port_ready_test(nxt_thread_t *thr)
 {
@@ -1176,6 +1634,15 @@ nxt_port_ready_test(nxt_thread_t *thr)
 #endif
 
 #endif
+
+    /*
+     * Last, because it registers two more processes in the fixture runtime
+     * and every case above walks that runtime when it announces a port.
+     */
+    ret = nxt_port_ready_test_stream(thr, task, rt, mp);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto done;
+    }
 
 done:
 

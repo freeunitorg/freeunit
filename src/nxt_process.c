@@ -1010,11 +1010,12 @@ nxt_process_created_ok(nxt_task_t *task, nxt_port_recv_msg_t *msg, void *data)
          *
          * The refusal is visible: this exits nonzero, main's SIGCHLD
          * reaper notifies the router with the start's stream still
-         * attached (main zeroes ->stream only at state READY, and its
-         * copy of a prototype that died here is still CREATED), the
-         * router turns that REMOVE_PID into an RPC error for the start
-         * attempt, and the requests waiting on the application are
-         * answered 503 rather than left to time out.
+         * attached (main clears ->stream only once the NEW_PORT that
+         * answers the start has gone out, and a prototype that died
+         * here never sent the PROCESS_READY that would have caused
+         * one), the router turns that REMOVE_PID into an RPC error for
+         * the start attempt, and the requests waiting on the application
+         * are answered 503 rather than left to time out.
          */
 
         nxt_alert(task, "%s refused to start: capset() is denied, so the "

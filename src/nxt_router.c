@@ -793,10 +793,53 @@ nxt_router_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_debug(task, "new port id %d (%d)", port->id, port->type);
 
     /*
-     * Port with "id == 0" is application 'main' port and it always
-     * should come with non-zero stream.
+     * An application's "main" port has id 0 and is announced carrying the
+     * stream of the start it answers, which the dispatch above consumes.
+     * Arriving here means id 0 with no stream, and the arm below cannot
+     * serve that pair: it looks the announcement up as a *sibling* of an
+     * already-known main port, and for id 0 that lookup finds the port
+     * itself.  Which of the two cases this is decides the remedy, and only
+     * nxt_port_new_port_handler() knows -- hence msg->new_port_created.
+     *
+     * Already registered: a worker that sent PROCESS_READY a second time.
+     * Its start stream was retired by the first announcement
+     * (nxt_port_process_ready_handler(), src/nxt_port.c), so the repeat
+     * carries none.  The port is live and its queue, if it brought one, was
+     * mapped above -- leave it alone.  Falling through would re-add it to
+     * the application hash: nxt_port_hash_add() declines the duplicate key,
+     * but ->port_hash_count is incremented regardless, and
+     * nxt_router_app_need_start() reads that count, so the router would
+     * believe it has workers it does not have.  It would also send a second
+     * PORT_ACK for one port.
+     *
+     * Created by this message: an application main port announced with no
+     * stream at all, which no start is waiting on and nothing else will
+     * complete.  Keeping it would leave a port registered in the runtime
+     * that no application owns and no PORT_ACK was ever sent for.  Undo the
+     * registration this message caused instead.
+     *
+     * An assertion is not enough for either: nxt_assert() compiles out in a
+     * release build, which is exactly where the miscount and the orphan
+     * would do their damage.
      */
-    nxt_assert(port->id != 0);
+    if (nxt_slow_path(port->id == 0)) {
+
+        if (msg->new_port_created) {
+            nxt_alert(task, "new port of process %PI has id 0 and no start "
+                      "stream; refused", port->pid);
+
+            nxt_port_close(task, port);
+            nxt_runtime_port_remove(task, port);
+
+            return;
+        }
+
+        nxt_log(task, NXT_LOG_WARN, "process %PI announced its main port "
+                "again with no start stream; already registered, ignored",
+                port->pid);
+
+        return;
+    }
 
     /* Find 'main' app port and get app reference. */
     rt = task->thread->runtime;

@@ -1197,9 +1197,15 @@ nxt_main_process_sigchld_handler(nxt_task_t *task, void *obj, void *data)
         if (process != NULL) {
             nxt_main_process_cleanup(task, process);
 
-            if (process->state == NXT_PROCESS_STATE_READY) {
-                process->stream = 0;
-            }
+            /*
+             * ->stream is no longer cleared here.  It is cleared where the
+             * start RPC is actually answered -- on a successful NEW_PORT
+             * announcement in nxt_port_process_ready_handler() -- which is
+             * both earlier and narrower: the READY state is set before that
+             * announcement is written, so clearing on the state dropped the
+             * REMOVE_PID fallback for a start whose reply never went out.
+             * See issue #271.
+             */
 
             nxt_queue_init(&children);
 

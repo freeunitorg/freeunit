@@ -227,6 +227,14 @@ struct nxt_port_recv_msg_s {
     nxt_pid_t           cmsg_pid;
 #endif
     nxt_bool_t          cancelled;
+    /*
+     * Set by nxt_port_new_port_handler() when it had to create the port
+     * u.new_port names, clear when it found one already registered.  A
+     * caller that refuses the announcement needs the difference: an existing
+     * port is live and must be left alone, while one this message brought
+     * into the runtime is the caller's to undo.
+     */
+    nxt_bool_t          new_port_created;
     union {
         nxt_port_t      *new_port;
         nxt_pid_t       removed_pid;
