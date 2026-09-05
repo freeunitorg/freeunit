@@ -190,9 +190,46 @@ nxt_port_close(nxt_task_t *task, nxt_port_t *port)
 }
 
 
+/*
+ * Take a reference, unless the port has already dropped its last one.
+ *
+ * This is the counterpart of a lookup in process->ports: a reference derived
+ * from a pointer that was found rather than from one the caller already
+ * holds cannot use nxt_port_use(), because the port may be in teardown by
+ * the time the increment lands.  Callers must hold rt->processes_mutex,
+ * which nxt_port_release() also holds while it unlinks the port, so that
+ * {find, ref} and {last drop, unlink} are mutually exclusive: a port still
+ * reachable through process->ports either still has a reference, or has
+ * already had its count latched at zero and fails here.
+ *
+ * Returns 1 when a reference was taken -- the caller then owns it and must
+ * drop it with nxt_port_use(task, port, -1), outside the mutex.
+ */
+
+nxt_bool_t
+nxt_port_use_unless_zero(nxt_port_t *port)
+{
+    nxt_atomic_int_t  c;
+
+    for ( ;; ) {
+        c = port->use_count;
+
+        if (c <= 0) {
+            return 0;
+        }
+
+        if (nxt_atomic_cmp_set(&port->use_count, c, c + 1)) {
+            return 1;
+        }
+    }
+}
+
+
 static void
 nxt_port_release(nxt_task_t *task, nxt_port_t *port)
 {
+    nxt_runtime_t  *rt;
+
     nxt_debug(task, "port %p %d:%d release, type %d", port, port->pid,
               port->id, port->type);
 
@@ -201,7 +238,26 @@ nxt_port_release(nxt_task_t *task, nxt_port_t *port)
     if (port->link.next != NULL) {
         nxt_assert(port->process != NULL);
 
+        rt = task->thread->runtime;
+
+        /*
+         * The unlink happens under rt->processes_mutex so that it cannot
+         * race a lookup in process->ports on another engine -- see
+         * nxt_port_use_unless_zero().  use_count is zero here and stays
+         * zero, so every reader that reaches the port through the queue
+         * before the unlink takes the mutex and fails the try-ref, and every
+         * reader after it cannot reach the port at all.
+         *
+         * rt->processes_mutex must stay a leaf (src/nxt_process.c:150), so
+         * the process reference is dropped after the unlock:
+         * nxt_process_use() takes the same mutex itself.
+         */
+
+        nxt_thread_mutex_lock(&rt->processes_mutex);
+
         nxt_process_port_remove(port);
+
+        nxt_thread_mutex_unlock(&rt->processes_mutex);
 
         nxt_process_use(task, port->process, -1);
     }

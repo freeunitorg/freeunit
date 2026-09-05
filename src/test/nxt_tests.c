@@ -190,6 +190,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_port_use_unless_zero_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_port_mmap_range_test(thr) != NXT_OK) {
         return 1;
     }
