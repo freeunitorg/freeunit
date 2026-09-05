@@ -63,6 +63,28 @@ def connect(ctx=None, session=None):
         conn.set_session(session)
 
     conn.do_handshake()
+
+    # Complete one request before the session is used again.  OpenSSL
+    # inserts a server session into the shared SSL_CTX cache from
+    # tls_finish_handshake(), which runs after the Finished message it
+    # flushed has already reached the client.  A handshake that has
+    # returned on the client therefore proves nothing about the insert:
+    # with more than one router engine the immediate reconnect can be
+    # accepted by an engine that has not seen it yet, and a full
+    # handshake results -- the flake tracked in issue #51.
+    #
+    # SSL_do_handshake() does not return on the server until the insert
+    # has happened, and Unit does not read application data before it
+    # returns (nxt_openssl_conn_handshake(), src/nxt_openssl.c), so a
+    # response the client has read proves the session is in the cache.
+    conn.sendall(b'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
+
+    response = b''
+    while b'\r\n\r\n' not in response:
+        response += conn.recv(4096)
+
+    assert response.startswith(b'HTTP/1.1 200'), 'request completed'
+
     conn.shutdown()
 
     return (
@@ -119,11 +141,14 @@ def test_tls_session():
     reason='session reuse is not supported',
 )
 def test_tls_session_timeout():
-    # OpenSSL evaluates session expiry in whole seconds (time_t), so a 1s
-    # timeout leaves barely over one second of real slack for the resume
-    # below and evicts the session early under CI load, making the "no
-    # timeout" assertion flaky.  Use a comfortable window and sleep past it.
-    assert 'success' in add_session(cache_size=5, timeout=4)
+    # The two halves are configured separately rather than fitted into one
+    # window.  "Still cached" only needs a timeout no run can outlast, and
+    # "evicted" only needs one every run outlasts; sharing a window made
+    # each assertion depend on the other's margin, and a slow machine
+    # broke whichever half it reached first.  Configured apart, a slow
+    # machine makes the eviction half more certain rather than less.
+
+    assert 'success' in add_session(cache_size=5, timeout=300)
 
     _, sess, ctx, reused = connect()
     assert not reused, 'new connection'
@@ -131,7 +156,15 @@ def test_tls_session_timeout():
     _, _, _, reused = connect(ctx, sess)
     assert reused, 'no timeout'
 
-    time.sleep(6)
+    assert 'success' in add_session(cache_size=5, timeout=1)
+
+    # The reconfiguration above rebuilds the TLS context and with it the
+    # session cache, so the session that has to outlive the timeout is
+    # established after it, not before.
+    _, sess, ctx, reused = connect()
+    assert not reused, 'new connection timeout'
+
+    time.sleep(3)
 
     _, _, _, reused = connect(ctx, sess)
     assert not reused, 'timeout'
