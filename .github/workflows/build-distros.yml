@@ -221,13 +221,57 @@ jobs:
         run: make wasm-wasi-component
         if: matrix.compiler == 'gcc'
 
+  # Alpine without "linux-headers".  The full alpine-edge leg installs it (the
+  # Rust/bindgen and JDK steps are happier with the kernel UAPI headers around),
+  # and that is exactly what masked #273 for as long as it existed: the
+  # memfd_create() probe used to include <linux/memfd.h>, which Alpine ships in
+  # linux-headers rather than in musl-dev, so an ordinary "apk add build-base"
+  # build silently fell back to shm_open() and every isolation.rootfs app died.
+  # This leg is deliberately minimal -- core only, no modules -- so that it
+  # tests the probe and nothing else, and it asserts the probe result instead of
+  # trusting a green build, which would stay green with the fallback in place.
+  alpine-no-linux-headers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    container:
+      image: alpine:edge
+
+    steps:
+      - name: Install tools/deps
+        run: |
+          apk update && apk upgrade
+          apk add gcc make musl-dev openssl-dev pcre2-dev
+          if apk info -e linux-headers; then
+            echo "linux-headers must not be installed on this leg" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+
+      - name: configure unit
+        run: |
+          set -o pipefail
+          ./configure --openssl --tests | tee configure.log
+
+      - name: assert memfd_create() was detected
+        run: |
+          grep -q 'checking for memfd_create() \.\.\. found' configure.log || {
+            echo 'memfd_create() not detected without linux-headers (#273)' >&2
+            grep -n 'memfd' configure.log build/autoconf.err >&2 || true
+            exit 1
+          }
+
+      - name: make unit
+        run: make -j 4
+
   # A weekly red check that nobody caused is a check nobody reads, so a
   # scheduled failure is reported as a tracking issue instead, the same way
   # eol-check.yml handles its weekly run.
   report:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [ fedora-rawhide, alpine-edge ]
+    needs: [ fedora-rawhide, alpine-edge, alpine-no-linux-headers ]
     if: failure() && github.event_name == 'schedule'
 
     steps:
