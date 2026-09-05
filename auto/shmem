@@ -109,12 +109,20 @@ fi
 
 # Linux
 
+# MFD_CLOEXEC and the memfd_create() declaration live in <sys/mman.h> under
+# _GNU_SOURCE on glibc >= 2.27 and on musl >= 1.1.20.  Probing <linux/memfd.h>
+# instead tests for the kernel UAPI headers package rather than for the
+# syscall: Alpine ships that header in "linux-headers", not in musl-dev, so a
+# plain "apk add build-base" build used to fall back to shm_open(), which then
+# fails inside an isolation.rootfs because /dev/shm does not exist there.
+
 nxt_feature="memfd_create()"
 nxt_feature_name=NXT_HAVE_MEMFD_CREATE
 nxt_feature_run=yes
 nxt_feature_incs=
 nxt_feature_libs=
-nxt_feature_test="#include <linux/memfd.h>
+nxt_feature_test="#define _GNU_SOURCE
+                  #include <sys/mman.h>
                   #include <unistd.h>
                   #include <sys/syscall.h>
 
@@ -128,6 +136,33 @@ nxt_feature_test="#include <linux/memfd.h>
                       return 0;
                   }"
 . auto/feature
+
+
+if [ $nxt_found = no ]; then
+
+    # Older libc: MFD_CLOEXEC is only in the kernel UAPI header.
+
+    nxt_feature="memfd_create() in <linux/memfd.h>"
+    nxt_feature_test="#include <linux/memfd.h>
+                      #include <unistd.h>
+                      #include <sys/syscall.h>
+
+                      int main(void) {
+                          static char name[] = \"/unit.configure\";
+
+                          int fd = syscall(SYS_memfd_create, name,
+                                           MFD_CLOEXEC);
+                          if (fd == -1)
+                              return 1;
+
+                          return 0;
+                      }"
+    . auto/feature
+
+    if [ $nxt_found = yes ]; then
+        nxt_have=NXT_HAVE_LINUX_MEMFD_H . auto/have
+    fi
+fi
 
 
 if [ "$nxt_shm_open_found$nxt_found" = nono ]; then

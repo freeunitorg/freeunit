@@ -17,7 +17,11 @@
 #include "nxt_websocket.h"
 
 #if (NXT_HAVE_MEMFD_CREATE)
+#if (NXT_HAVE_LINUX_MEMFD_H)
 #include <linux/memfd.h>
+#else
+#include <sys/mman.h>
+#endif
 #endif
 
 #define NXT_UNIT_MAX_PLAIN_SIZE  1024

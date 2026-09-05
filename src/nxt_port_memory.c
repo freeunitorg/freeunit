@@ -8,7 +8,11 @@
 
 #if (NXT_HAVE_MEMFD_CREATE)
 
+#if (NXT_HAVE_LINUX_MEMFD_H)
 #include <linux/memfd.h>
+#else
+#include <sys/mman.h>
+#endif
 #include <unistd.h>
 #include <sys/syscall.h>
 
