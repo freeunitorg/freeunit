@@ -251,8 +251,9 @@ nxt_port_enable(nxt_task_t *task, nxt_port_t *port,
  * nxt_port_socket.c fill msg->cmsg_pid.  Individual handlers are
  * being gated on nxt_recv_msg_cmsg_pid() one at a time --
  * nxt_main_process_created_handler(), nxt_main_start_process_handler(),
- * nxt_port_process_ready_handler(), nxt_proto_process_created_handler()
- * and the cert/script/socket/access-log handlers already are.
+ * nxt_port_process_ready_handler(), nxt_proto_process_created_handler(),
+ * nxt_proto_start_process_handler() and the cert/script/socket/
+ * access-log handlers already are.
  *
  * What is left is the table-driven part: a per-message-type sender
  * ACL applied here, in the dispatcher, so that a handler which

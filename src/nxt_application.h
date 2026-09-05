@@ -167,6 +167,15 @@ struct nxt_app_module_s {
 nxt_app_lang_module_t *nxt_app_lang_module(nxt_runtime_t *rt, nxt_str_t *name);
 nxt_app_type_t nxt_app_parse_type(u_char *p, size_t length);
 
+#if (NXT_TESTS)
+/*
+ * Invokes the static nxt_proto_start_process_handler() with a synthesised
+ * runtime and message; see src/test/nxt_main_start_process_reply_test.c.
+ */
+void nxt_proto_test_run_start_process_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+#endif
+
 NXT_EXPORT extern nxt_str_t  nxt_server;
 extern nxt_app_module_t      nxt_external_module;
 
