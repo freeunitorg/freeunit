@@ -999,35 +999,83 @@ nxt_port_mmap_get_method(nxt_task_t *task, nxt_port_t *port, nxt_buf_t *b)
 void
 nxt_process_broadcast_shm_ack(nxt_task_t *task, nxt_process_t *process)
 {
-    nxt_port_t  *port;
+    nxt_port_t     *port;
+    nxt_runtime_t  *rt;
 
-    if (nxt_slow_path(process == NULL || nxt_queue_is_empty(&process->ports)))
-    {
+    if (nxt_slow_path(process == NULL)) {
         return;
     }
 
-    port = nxt_process_port_first(process);
+    rt = task->thread->runtime;
 
-    if (port->type == NXT_PROCESS_APP) {
-        /*
-         * The process is handed to another engine as a bare pointer and is
-         * dereferenced there, so the posted handler needs a reference of its
-         * own and drops it when it is done.  nxt_port_post() returns NXT_OK
-         * both when it queues the handler and when it calls it inline on the
-         * current engine, and the handler owns the reference either way; only
-         * the NXT_ERROR case leaves nothing to run, so only that case has to
-         * be undone here.  The inline call is safe: the caller still holds
-         * its own reference, so this one cannot be the last.
-         */
+    /*
+     * This runs on any engine -- most often a worker engine, from
+     * nxt_port_mmap_buf_completion() -- while the app port's teardown runs on
+     * the router's main thread.  The caller holds a reference to the process,
+     * not to the port, so the port has to be looked up, and a reference taken
+     * from a lookup can land on a port whose count already reached zero:
+     * nxt_port_post() below does an unconditional increment, and
+     * nxt_port_release() would by then be destroying the port's memory pool
+     * (issue #195 -- the `port->use_count == 0` assertion in a debug build,
+     * a use-after-free of the port and of the work item in a release one).
+     *
+     * rt->processes_mutex is the lock nxt_port_release() unlinks the port
+     * under, so reading process->ports and try-referencing the port under it
+     * cannot observe a port that is being released: either the try-ref wins
+     * and the port is alive for as long as this function holds it, or the
+     * port is already dying and there is nothing to acknowledge -- the
+     * process is going away and the app will not wait for shared memory
+     * again.
+     *
+     * Only the lookup is done under the mutex.  Everything after it takes
+     * other locks (nxt_process_use() takes this very mutex), and
+     * rt->processes_mutex is a leaf -- see src/nxt_process.c:150.
+     */
 
-        nxt_process_use(task, process, 1);
+    nxt_thread_mutex_lock(&rt->processes_mutex);
 
-        if (nxt_slow_path(nxt_port_post(task, port, nxt_port_broadcast_shm_ack,
-                                        process) != NXT_OK))
-        {
-            nxt_process_use(task, process, -1);
+    port = NULL;
+
+    if (!nxt_queue_is_empty(&process->ports)) {
+        port = nxt_process_port_first(process);
+
+        if (port->type != NXT_PROCESS_APP || !nxt_port_use_unless_zero(port)) {
+            port = NULL;
         }
     }
+
+    nxt_thread_mutex_unlock(&rt->processes_mutex);
+
+    if (port == NULL) {
+        return;
+    }
+
+    /*
+     * The process is handed to another engine as a bare pointer and is
+     * dereferenced there, so the posted handler needs a reference of its
+     * own and drops it when it is done.  nxt_port_post() returns NXT_OK
+     * both when it queues the handler and when it calls it inline on the
+     * current engine, and the handler owns the reference either way; only
+     * the NXT_ERROR case leaves nothing to run, so only that case has to
+     * be undone here.  The inline call is safe: the caller still holds
+     * its own reference, so this one cannot be the last.
+     */
+
+    nxt_process_use(task, process, 1);
+
+    if (nxt_slow_path(nxt_port_post(task, port, nxt_port_broadcast_shm_ack,
+                                    process) != NXT_OK))
+    {
+        nxt_process_use(task, process, -1);
+    }
+
+    /*
+     * nxt_port_post() took its own reference on success, so the lookup
+     * reference is dropped here either way.  It is dropped after the post so
+     * that the port cannot be released between the try-ref and the post.
+     */
+
+    nxt_port_use(task, port, -1);
 }
 
 

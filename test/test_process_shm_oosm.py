@@ -44,6 +44,8 @@ Cheap on purpose: one request and one deliberate client stall, about a second
 of work once the PHP worker is warm.
 """
 
+import subprocess
+import threading
 import time
 
 import pytest
@@ -145,5 +147,191 @@ def test_process_shm_oosm():
     assert _body(resp, 1024 * 1024).count(b'x') == 1024 * 1024, (
         'still serving'
     )
+
+    Log.check_alerts()
+
+
+# ---------------------------------------------------------------------------
+# The OOSM ack path against an application that is being torn down (issue #195)
+# ---------------------------------------------------------------------------
+
+# Kills, and the gap between them.  Each one has to land while the segment is
+# still full and clients are still stalled, which is what puts a SHM_ACK
+# broadcast and the port teardown of the process it is aimed at on two engines
+# at once.
+KILLS = 5
+KILL_INTERVAL = 0.4
+
+# Stalled readers, so the response buffers -- the application's shared memory
+# -- stay busy for the whole run instead of draining between kills.
+STALLERS = 3
+
+# Bounded on purpose: this is a race driver, not a soak.  Five kills at 0.4 s
+# is about three seconds of workload, cheap enough for every leg including the
+# sanitiser ones.  It is timing-dependent by nature: a green run is evidence
+# only in the same weak sense as test_process_abrupt_teardown.py, and the
+# deterministic check of the primitive this test exercises lives in the C
+# suite (src/test/nxt_port_use_unless_zero_test.c).
+
+
+def _oosm_app_pids():
+    """PIDs currently serving the application, via ps (as conftest does)."""
+    out = subprocess.check_output(
+        ['ps', '-ax', '-o', 'pid', '-o', 'command']
+    ).decode()
+
+    marker = f'unit: "{APP}" application'
+
+    return {line.split()[0] for line in out.splitlines() if marker in line}
+
+
+def _wait_for_fresh_pids(spent, timeout=5):
+    """A worker this run has not killed yet, so every kill is a distinct
+    abrupt teardown rather than a repeat shot at a corpse.  Same reasoning as
+    test_process_abrupt_teardown.py."""
+
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        pids = _oosm_app_pids() - spent
+
+        if pids:
+            return pids
+
+        time.sleep(0.05)
+
+    return set()
+
+
+def test_process_shm_oosm_kill(skip_alert):
+    """Kill the OOSM-blocked worker while the router is acknowledging it.
+
+    What this drives: the same one-segment application as above, but with
+    several clients stalled at once so the segment stays full, and the worker
+    SIGKILLed underneath them.  The router then has two things happening on
+    two engines: on a worker engine,
+    ``nxt_port_mmap_buf_completion()`` (src/nxt_port_memory.c) drains a
+    completed response buffer, wins ``cmp_set(&hdr->oosm, 1, 0)`` and calls
+    ``nxt_process_broadcast_shm_ack()``; on the router's main thread, the
+    SIGCHLD-driven ``nxt_port_remove_pid()`` -> ``nxt_process_close_ports()``
+    has dropped the app port's references and ``nxt_port_release()``
+    (src/nxt_port.c) is destroying its memory pool.
+
+    ``nxt_process_broadcast_shm_ack()`` read the app port out of
+    ``process->ports`` as a bare pointer and handed it to ``nxt_port_post()``,
+    whose unconditional ``nxt_atomic_fetch_add(&port->use_count, 1)`` lands on
+    a port whose count is already zero: the ``port->use_count == 0`` assertion
+    in ``nxt_port_mp_cleanup()`` in a --debug build, and a use-after-free of
+    the port and of the posted work item in a release one.  The fix takes the
+    port with ``nxt_port_use_unless_zero()`` under ``rt->processes_mutex``,
+    which ``nxt_port_release()`` now unlinks under.
+
+    What this proves and what it does not: on a --debug build the assertion
+    fires as an alert and this test catches it directly -- that is the
+    reproduction from the issue.  On a non-debug build it is only a UAF
+    driver, worth its runtime under ASan and little without it.  A green run
+    is weak evidence, as in test_process_abrupt_teardown.py; read it as "the
+    OOSM ack raced repeated abrupt teardowns and the router stayed correct".
+    """
+
+    # SIGKILLing a worker is the point of the test, so the main process'
+    # report of it is expected, not a finding.  Nothing else is waived --
+    # in particular the assertion alert this test exists to catch is not.
+    skip_alert(r'process \d+ exited on signal 9')
+
+    client.load(APP, limits={"shm": SHM_LIMIT}, processes=1)
+
+    assert 'success' in client.conf(
+        {"listen_threads": LISTEN_THREADS}, 'settings'
+    ), 'listen_threads'
+
+    stop = threading.Event()
+    failures = []
+
+    def staller():
+        """Ask for a response far larger than the segment and then read it
+        slowly, so the application blocks in nxt_unit_wait_shm_ack() and the
+        router keeps completing buffers for it."""
+
+        while not stop.is_set():
+            try:
+                sock = client.get(url=f'/?mb={RESPONSE_MB}', no_recv=True)
+                time.sleep(STALL)
+                client.recvall(sock, read_timeout=READ_TIMEOUT,
+                               buff_size=65536)
+                sock.close()
+
+            except Exception:
+                # A request cut short by a kill is the point of the test, not
+                # a failure.  Only a hang or a crashed daemon is, and those
+                # are caught by the join and the assertions below.
+                pass
+
+    stallers = [threading.Thread(target=staller) for _ in range(STALLERS)]
+
+    for thread in stallers:
+        thread.start()
+
+    # Let the first responses reach the OOSM state before killing anything.
+    time.sleep(STALL * 2)
+
+    killed = []
+
+    for round_ in range(KILLS):
+        pids = _wait_for_fresh_pids(set(killed))
+
+        if not pids:
+            failures.append(f'no fresh worker for kill {round_ + 1}')
+            break
+
+        subprocess.call(['kill', '-9', *pids])
+
+        killed.extend(pids)
+
+        time.sleep(KILL_INTERVAL)
+
+    stop.set()
+
+    for thread in stallers:
+        thread.join(timeout=120)
+        assert not thread.is_alive(), 'stalled request thread hung'
+
+    assert not failures, f'{len(failures)} failure(s), first: {failures[0]}'
+    assert len(killed) >= KILLS, (
+        f'only {len(killed)} worker(s) killed: {killed}'
+    )
+
+    log = Log.read()
+
+    # The direct hit.  nxt_assert() aborts the router in a --debug build, and
+    # the record it prints names the file and line -- src/nxt_port.c, the
+    # use_count assertion in nxt_port_mp_cleanup().  Checked before anything
+    # else, because a dead router makes every other assertion here fail for
+    # the wrong reason.
+    assert 'assertion failed' not in log, (
+        'a port was referenced after its last drop: '
+        + next(
+            line
+            for line in log.splitlines()
+            if 'assertion failed' in line
+        )
+    )
+
+    # Still serving, on a worker started after the last kill.
+    sock = client.get(url='/?mb=1', no_recv=True)
+    resp = client.recvall(sock, read_timeout=READ_TIMEOUT, buff_size=65536)
+    sock.close()
+
+    assert _body(resp, 1024 * 1024).count(b'x') == 1024 * 1024, (
+        'still serving'
+    )
+
+    if '[debug]' not in log:
+        pytest.skip('OOSM evidence needs a --debug build')
+
+    # Same proof as the test above that the OOSM round trip really ran; here
+    # it also establishes that the kills landed on a blocked worker rather
+    # than an idle one.
+    assert 'oosm in ' in log, 'router handled an OOSM message'
 
     Log.check_alerts()
