@@ -34,6 +34,7 @@ gettid
 ioctl
 listen
 membarrier
+memfd_create
 mkdir
 mmap
 mprotect

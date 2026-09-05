@@ -90,11 +90,14 @@ would then fail on a language patch release, which is noise, not drift.
 Covering the module path is a separate job with a separate baseline; see the
 follow-ups in the pull request that added this.
 
-The two lists are not directly comparable with each other: 11 syscalls appear
-only in the glibc baseline and 6 only in the musl one, because the libcs pick
-different syscalls for the same operation (`epoll_create` vs `epoll_create1`,
-`clone3` vs `fork`, `openat` vs `open`, and `memfd_create` only on glibc).
-That is the reason both are captured.
+The two lists are not directly comparable with each other: 10 syscalls appear
+only in the glibc baseline (`access`, `clone3`, `epoll_create`, `epoll_wait`,
+`lseek`, `newfstatat`, `openat`, `prlimit64`, `rseq`, `set_robust_list`) and 6
+only in the musl one (`epoll_create1`, `epoll_pwait`, `fork`, `futex`,
+`membarrier`, `open`), because the libcs pick different syscalls for the same
+operation (`epoll_create` vs `epoll_create1`, `clone3` vs `fork`, `openat` vs
+`open`). `memfd_create` appears on both now that the probe finds it on musl
+without the kernel UAPI header. That is the reason both are captured.
 
 ## Guards
 

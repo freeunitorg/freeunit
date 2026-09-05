@@ -38,8 +38,10 @@
 #include <sys/wait.h>
 #include <signal.h>
 
-#if (NXT_HAVE_MEMFD_CREATE)
+#if (NXT_HAVE_MEMFD_CREATE && NXT_HAVE_LINUX_MEMFD_H)
 #include <linux/memfd.h>
+#endif
+#if (NXT_HAVE_MEMFD_CREATE)
 #include <sys/syscall.h>
 #endif
 
