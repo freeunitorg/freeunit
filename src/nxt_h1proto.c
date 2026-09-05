@@ -1456,7 +1456,13 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
         if (r->resp.content_length == NULL || r->resp.content_length->skip) {
 
             if (http11) {
-                if (n != NXT_HTTP_NOT_MODIFIED
+                /*
+                 * r->no_body already covers 204 and 304, plus 1xx and every
+                 * response to HEAD; the two status tests are kept so the
+                 * framing rule stays readable at the point it is applied.
+                 */
+                if (!r->no_body
+                    && n != NXT_HTTP_NOT_MODIFIED
                     && n != NXT_HTTP_NO_CONTENT
                     && body_handler != NULL
                     && !h1p->websocket)
@@ -1467,7 +1473,12 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
                     size -= nxt_length("\r\n");
                 }
 
-            } else {
+            } else if (!r->no_body) {
+                /*
+                 * A pre-HTTP/1.1 client needs the close to delimit a body;
+                 * a response that has no body needs no such delimiter, so
+                 * keep-alive stays as negotiated.
+                 */
                 h1p->keepalive = 0;
             }
         }

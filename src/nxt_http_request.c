@@ -22,6 +22,10 @@ static void nxt_http_request_forward_protocol(nxt_http_request_t *r,
 static void nxt_http_request_ready(nxt_task_t *task, void *obj, void *data);
 static void nxt_http_request_proto_info(nxt_task_t *task,
     nxt_http_request_t *r);
+static nxt_bool_t nxt_http_request_is_bodyless(nxt_http_request_t *r);
+static void nxt_http_request_drop_framing_fields(nxt_http_request_t *r);
+static nxt_buf_t *nxt_http_request_body_drop(nxt_task_t *task,
+    nxt_http_request_t *r, nxt_buf_t *out);
 static void nxt_http_request_mem_buf_completion(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_http_request_done(nxt_task_t *task, void *obj, void *data);
@@ -693,6 +697,45 @@ nxt_http_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
     }
 
     /*
+     * RFC 9112 Sect. 6.3: a 1xx, 204 or 304 response, and any response to a
+     * HEAD request, never has a message body, no matter what the response
+     * headers say.  Record that here, in the layer every response source
+     * (application, proxy, static, "return") passes through, so that the
+     * per-protocol header_send() can drop the framing and
+     * nxt_http_request_send() can drop the body buffers.  Without this an
+     * application that writes a body on 204/304 has those bytes forwarded
+     * verbatim and unframed, which a downstream parser reads as the start of
+     * the next response.
+     */
+    r->no_body = nxt_http_request_is_bodyless(r);
+
+    /*
+     * RFC 9110 Sect. 8.6: a server must not send Content-Length in a 1xx or
+     * 204 response.  A 304 keeps it -- there it describes the body the client
+     * already has -- and so does a HEAD response, where it describes the body
+     * the equivalent GET would return.
+     */
+    if (r->no_body
+        && (r->status < NXT_HTTP_OK || r->status == NXT_HTTP_NO_CONTENT))
+    {
+        if (r->resp.content_length != NULL) {
+            r->resp.content_length->skip = 1;
+        }
+
+        r->resp.content_length_n = -1;
+
+        /*
+         * r->resp.content_length only tracks the field the application sent.
+         * A Content-Length added by "response_headers" (nxt_http_set_headers.c)
+         * is a generic field, and an application-supplied Transfer-Encoding is
+         * one too; both are forbidden here and both would otherwise be
+         * serialized verbatim, desyncing the next response on a connection
+         * whose keep-alive this change preserves.  Sweep the whole field store.
+         */
+        nxt_http_request_drop_framing_fields(r);
+    }
+
+    /*
      * TODO: "Server", "Date", and "Content-Length" processing should be moved
      * to the last header filter.
      */
@@ -774,9 +817,144 @@ nxt_http_request_ws_frame_start(nxt_task_t *task, nxt_http_request_t *r,
 }
 
 
+static nxt_bool_t
+nxt_http_request_is_bodyless(nxt_http_request_t *r)
+{
+    /*
+     * A 101 upgrade is a 1xx status, but the bytes that follow its header are
+     * not a message body -- they are the upgraded protocol (WebSocket), and
+     * nxt_h1proto_websocket.c pushes them through nxt_http_request_send().
+     *
+     * The status matters as much as the flag.  websocket_handshake is set when
+     * the request headers are parsed (src/nxt_h1proto.c), long before the
+     * application chooses a status, and the h1 sender only treats the response
+     * as an upgrade when it is also 101 (src/nxt_h1proto.c).  Testing the flag
+     * alone would leave an application that answers a WebSocket-upgrade
+     * request with 204 plus a body on the unframed path.
+     */
+    if (r->websocket_handshake && r->status == NXT_HTTP_SWITCHING_PROTOCOLS) {
+        return 0;
+    }
+
+    if (r->status >= NXT_HTTP_CONTINUE && r->status < NXT_HTTP_OK) {
+        return 1;
+    }
+
+    if (r->status == NXT_HTTP_NO_CONTENT
+        || r->status == NXT_HTTP_NOT_MODIFIED)
+    {
+        return 1;
+    }
+
+    return r->method != NULL && nxt_str_eq(r->method, "HEAD", 4);
+}
+
+
+/*
+ * Mark every Content-Length and Transfer-Encoding response field skipped.
+ * Only for 1xx and 204, where RFC 9110 Sect. 8.6 and RFC 9112 Sect. 6.1 forbid
+ * both: a 304 keeps Content-Length, and so does a response to HEAD.
+ */
+
+static void
+nxt_http_request_drop_framing_fields(nxt_http_request_t *r)
+{
+    nxt_http_field_t  *field;
+
+    nxt_http_fields_each(field, r->resp.inline_fields, r->resp.num_inline_fields,
+                         r->resp.fields)
+    {
+        if (field->skip) {
+            continue;
+        }
+
+        if ((field->name_length == nxt_length("Content-Length")
+             && nxt_strncasecmp(field->name, (u_char *) "Content-Length",
+                                nxt_length("Content-Length")) == 0)
+            || (field->name_length == nxt_length("Transfer-Encoding")
+                && nxt_strncasecmp(field->name, (u_char *) "Transfer-Encoding",
+                                   nxt_length("Transfer-Encoding")) == 0))
+        {
+            field->skip = 1;
+        }
+
+    } nxt_http_fields_loop;
+}
+
+
+/*
+ * Strip the payload from a response that must not carry one, keeping the
+ * sync/last markers that drive request completion.  Data-only buffers are
+ * unlinked and drained so their completion handlers run and the shared memory
+ * they hold is released; a buffer that also carries the "last" marker stays in
+ * the chain but is emptied in place, so the request still finishes normally.
+ */
+
+static nxt_buf_t *
+nxt_http_request_body_drop(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_buf_t *out)
+{
+    size_t            dropped;
+    nxt_buf_t         *b, *next, **prev;
+    nxt_work_queue_t  *wq;
+
+    dropped = 0;
+    prev = &out;
+    wq = &task->thread->engine->fast_work_queue;
+
+    for (b = out; b != NULL; b = next) {
+        next = b->next;
+
+        if (nxt_buf_is_sync(b)) {
+            /*
+             * A sync buffer may be allocated with NXT_BUF_SYNC_SIZE, so it
+             * carries no payload and its mem.free/file fields must not even
+             * be read.  Keep it as is.
+             */
+            prev = &b->next;
+            continue;
+        }
+
+        dropped += nxt_buf_used_size(b);
+
+        if (nxt_buf_is_last(b)) {
+            /* Empty it in place; the "last" marker still ends the request. */
+            b->mem.pos = b->mem.free;
+
+            if (nxt_buf_is_file(b)) {
+                b->file_pos = b->file_end;
+            }
+
+            prev = &b->next;
+            continue;
+        }
+
+        *prev = next;
+        b->next = NULL;
+
+        nxt_sendbuf_drain(task, wq, b);
+    }
+
+    if (dropped != 0) {
+        nxt_debug(task, "http request body dropped on status %d: %uz bytes",
+                  (int) r->status, dropped);
+    }
+
+    return out;
+}
+
+
 void
 nxt_http_request_send(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
 {
+    if (r->no_body) {
+        out = nxt_http_request_body_drop(task, r, out);
+
+        if (out == NULL) {
+            return;
+        }
+    }
+
     if (nxt_fast_path(r->proto.any != NULL)) {
         nxt_http_proto[r->protocol].send(task, r, out);
     }
