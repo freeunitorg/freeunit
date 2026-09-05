@@ -18,6 +18,17 @@ static nxt_int_t nxt_port_fail_test_socket_write(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_rpc_register(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_error_handler(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_mp_baseline(nxt_thread_t *thr);
+static nxt_int_t nxt_port_fail_test_cross_engine_release(nxt_thread_t *thr);
+static nxt_int_t nxt_port_fail_test_cross_engine_acquire(nxt_thread_t *thr);
+static nxt_int_t nxt_port_fail_test_cross_engine_race(nxt_thread_t *thr);
+static nxt_int_t nxt_port_fail_test_cross_engine_batch(nxt_thread_t *thr);
+static void nxt_port_fail_test_racer(void *data);
+static nxt_int_t nxt_port_fail_test_queued(nxt_locked_work_queue_t *lwq,
+    nxt_work_t *item);
+static void nxt_port_fail_test_engine_signal(nxt_event_engine_t *engine,
+    nxt_uint_t signo);
+static void nxt_port_fail_test_released(nxt_task_t *task, void *obj,
+    void *data);
 static nxt_int_t nxt_port_fail_test_sender_pattern(nxt_task_t *task,
     nxt_port_t *port, nxt_mp_t *mp);
 static void nxt_port_fail_test_mp_completion(nxt_task_t *task, void *obj,
@@ -30,6 +41,8 @@ static nxt_int_t nxt_port_fail_test_fd_count(void);
 
 
 static nxt_uint_t  nxt_port_fail_test_completions;
+static nxt_uint_t  nxt_port_fail_test_releases;
+static nxt_uint_t  nxt_port_fail_test_signals;
 
 
 nxt_int_t
@@ -51,6 +64,22 @@ nxt_port_fail_test(nxt_thread_t *thr)
     }
 
     if (nxt_port_fail_test_mp_baseline(thr) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_port_fail_test_cross_engine_release(thr) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_port_fail_test_cross_engine_acquire(thr) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_port_fail_test_cross_engine_race(thr) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_port_fail_test_cross_engine_batch(thr) != NXT_OK) {
         return NXT_ERROR;
     }
 
@@ -577,6 +606,643 @@ nxt_port_fail_test_sender_pattern(nxt_task_t *task, nxt_port_t *port,
     nxt_mp_retain(mp);
 
     return NXT_OK;
+}
+
+
+/*
+ * A last reference dropped from a thread other than port->engine's must be
+ * deferred to that engine, and the deferral must not be able to fail.
+ *
+ * nxt_port_use() used to route the drop through nxt_port_post(), which
+ * nxt_zalloc()s an nxt_port_work_t and returns NXT_ERROR when that fails.
+ * The return value was ignored: use_count was already zero, nothing was
+ * queued, and the port, its memory pool and the process reference it holds
+ * leaked (issue #187).
+ *
+ * There is no allocation-failure injection hook reachable from here, so the
+ * regression is pinned structurally instead: the item that lands on the
+ * foreign engine's locked work queue must be the one embedded in the port.
+ * That is false for any implementation that allocates it, whether or not the
+ * allocation succeeds.  Draining then has to reach nxt_port_release(), which
+ * is observed through a cleanup on the port's own memory pool.
+ */
+
+static nxt_int_t
+nxt_port_fail_test_cross_engine_release(nxt_thread_t *thr)
+{
+    nxt_task_t          *task;
+    nxt_port_t          *port;
+    nxt_work_t          *posted;
+    nxt_event_engine_t  current, foreign;
+
+    task = thr->task;
+    task->thread = thr;
+
+    /*
+     * Two minimal engines: the one this thread runs on, and the port's.
+     * They only have to differ and to carry a work queue; the post path
+     * touches locked_work_queue, event.signal and task.
+     */
+    nxt_memzero(&current, sizeof(current));
+    nxt_work_queue_cache_create(&current.work_queue_cache, 1024);
+    current.fast_work_queue.cache = &current.work_queue_cache;
+    nxt_work_queue_name(&current.fast_work_queue, "fast");
+
+    nxt_memzero(&foreign, sizeof(foreign));
+    foreign.task.thread = thr;
+    foreign.task.log = thr->log;
+
+    /*
+     * Without this stub nxt_event_engine_signal() would fall through to
+     * writing on foreign.pipe, which a bare engine does not have.
+     */
+    foreign.event.signal = nxt_port_fail_test_engine_signal;
+
+    thr->engine = &current;
+
+    port = nxt_port_fail_test_port(task);
+    if (nxt_slow_path(port == NULL)) {
+        goto fail_engine;
+    }
+
+    port->engine = &foreign;
+
+    if (nxt_slow_path(nxt_mp_cleanup(port->mem_pool,
+                                     nxt_port_fail_test_released,
+                                     task, port, NULL) != NXT_OK))
+    {
+        nxt_port_use(task, port, -1);
+        goto fail_engine;
+    }
+
+    nxt_port_fail_test_releases = 0;
+    nxt_port_fail_test_signals = 0;
+
+    posted = &port->release_work;
+
+    nxt_port_use(task, port, -1);
+
+    /* The release must be deferred, not run on this thread. */
+    if (nxt_slow_path(nxt_port_fail_test_releases != 0)) {
+        nxt_log_alert(thr->log, "port fail test: cross-engine release ran "
+                      "on the calling thread");
+        goto fail_engine;
+    }
+
+    if (nxt_slow_path(nxt_port_fail_test_signals != 1)) {
+        nxt_log_alert(thr->log, "port fail test: cross-engine release did "
+                      "not signal the target engine (%ui)",
+                      nxt_port_fail_test_signals);
+        goto fail_engine;
+    }
+
+    /*
+     * The heart of the regression check: an allocated work item would make
+     * this a different pointer, and a failed allocation would leave the
+     * queue empty.
+     */
+    if (nxt_slow_path(foreign.locked_work_queue.head != posted)) {
+        nxt_log_alert(thr->log, "port fail test: the posted item is not the "
+                      "port's embedded release work");
+        goto fail_engine;
+    }
+
+    /*
+     * The reference is handed to the item, not given up: the count is back
+     * at 1 and the posted handler is what drops it.
+     */
+    if (nxt_slow_path(port->use_count != 1)) {
+        nxt_log_alert(thr->log, "port fail test: the deferred release does "
+                      "not hold a reference (use_count %A)", port->use_count);
+        goto fail_engine;
+    }
+
+    /* The handler runs on the port's engine, so this thread becomes it. */
+    thr->engine = &foreign;
+
+    nxt_locked_work_queue_move(thr, &foreign.locked_work_queue,
+                               &current.fast_work_queue);
+
+    nxt_port_fail_test_drain_wq(&current.fast_work_queue);
+
+    if (nxt_slow_path(nxt_port_fail_test_releases != 1)) {
+        nxt_log_alert(thr->log, "port fail test: draining the target engine "
+                      "did not release the port (%ui)",
+                      nxt_port_fail_test_releases);
+        goto fail_engine;
+    }
+
+    nxt_work_queue_cache_destroy(&current.work_queue_cache);
+    thr->engine = NULL;
+
+    return NXT_OK;
+
+fail_engine:
+
+    nxt_work_queue_cache_destroy(&current.work_queue_cache);
+    thr->engine = NULL;
+
+    return NXT_ERROR;
+}
+
+
+/*
+ * A cross-engine last drop leaves the port reachable through
+ * process->ports until the deferred item runs, so another engine can still
+ * take a reference in that window -- nxt_process_broadcast_shm_ack() does.
+ * The deferral therefore has to hand its reference over and re-check at the
+ * far end, which is what routing through nxt_port_post() used to provide:
+ * it took a reference of its own and ended in nxt_port_use(port, -1).
+ *
+ * A deferred handler that released unconditionally would free a port
+ * somebody holds -- a use-after-free, and only an assertion in a --debug
+ * build.  Here the acquisition is made between the post and the drain: the
+ * drain must not release, and the release must happen exactly once, when
+ * the other holder drops its reference.
+ */
+
+static nxt_int_t
+nxt_port_fail_test_cross_engine_acquire(nxt_thread_t *thr)
+{
+    nxt_task_t          *task;
+    nxt_port_t          *port;
+    nxt_event_engine_t  current, foreign;
+
+    task = thr->task;
+    task->thread = thr;
+
+    nxt_memzero(&current, sizeof(current));
+    nxt_work_queue_cache_create(&current.work_queue_cache, 1024);
+    current.fast_work_queue.cache = &current.work_queue_cache;
+    nxt_work_queue_name(&current.fast_work_queue, "fast");
+
+    nxt_memzero(&foreign, sizeof(foreign));
+    foreign.task.thread = thr;
+    foreign.task.log = thr->log;
+    foreign.event.signal = nxt_port_fail_test_engine_signal;
+
+    thr->engine = &current;
+
+    port = nxt_port_fail_test_port(task);
+    if (nxt_slow_path(port == NULL)) {
+        goto fail_engine;
+    }
+
+    port->engine = &foreign;
+
+    if (nxt_slow_path(nxt_mp_cleanup(port->mem_pool,
+                                     nxt_port_fail_test_released,
+                                     task, port, NULL) != NXT_OK))
+    {
+        nxt_port_use(task, port, -1);
+        goto fail_engine;
+    }
+
+    nxt_port_fail_test_releases = 0;
+
+    nxt_port_use(task, port, -1);
+
+    /*
+     * The concurrent acquisition, made while the item is queued.  A real one
+     * comes from another engine; what matters here is that it happens after
+     * the drop that posted the item and before that item runs.
+     */
+    nxt_port_use(task, port, 1);
+
+    thr->engine = &foreign;
+
+    nxt_locked_work_queue_move(thr, &foreign.locked_work_queue,
+                               &current.fast_work_queue);
+
+    nxt_port_fail_test_drain_wq(&current.fast_work_queue);
+
+    if (nxt_slow_path(nxt_port_fail_test_releases != 0)) {
+        nxt_log_alert(thr->log, "port fail test: the deferred release freed "
+                      "a port another reference was taken on");
+        goto fail_port;
+    }
+
+    if (nxt_slow_path(port->use_count != 1)) {
+        nxt_log_alert(thr->log, "port fail test: use_count is %A after the "
+                      "deferred release, expected 1", port->use_count);
+        goto fail_port;
+    }
+
+    /* Now the other holder lets go, on the port's own engine. */
+    nxt_port_use(task, port, -1);
+
+    if (nxt_slow_path(nxt_port_fail_test_releases != 1)) {
+        nxt_log_alert(thr->log, "port fail test: dropping the last reference "
+                      "released the port %ui times, expected 1",
+                      nxt_port_fail_test_releases);
+        goto fail_engine;
+    }
+
+    nxt_work_queue_cache_destroy(&current.work_queue_cache);
+    thr->engine = NULL;
+
+    return NXT_OK;
+
+fail_port:
+
+    nxt_port_use(task, port, -1);
+
+fail_engine:
+
+    nxt_work_queue_cache_destroy(&current.work_queue_cache);
+    thr->engine = NULL;
+
+    return NXT_ERROR;
+}
+
+
+/*
+ * The hand-over must not be able to post the embedded item twice.
+ *
+ * The item is a single object, so two threads that both believe they are
+ * dropping the last reference would post it twice, and
+ * nxt_locked_work_queue_add() links a work onto the queue tail: the second
+ * post makes tail->next point at the item itself, and the engine draining
+ * that queue then walks a one-element cycle forever.  Routing through
+ * nxt_port_post() could not produce this, because it allocated a separate
+ * item for every post.
+ *
+ * The shape that would produce it is a foreign drop that publishes a zero
+ * use_count: another engine promoting a bare port pointer --
+ * nxt_process_broadcast_shm_ack() walks a process's ports that way, and
+ * nxt_port_socket_write() takes a reference on each -- can then complete a
+ * 0 -> 1 -> 0 cycle of its own and reach the deferral as well.  So the
+ * invariant this pins is the one that makes it impossible: use_count is
+ * never observable as zero off port->engine.
+ *
+ * A racer thread on a third engine watches use_count across a cross-engine
+ * last drop and reports every zero it sees; then, with the item already in
+ * flight, it takes a reference and drops it again -- the 1 -> 2 -> 1 that
+ * must not post anything.  The locked queue is walked with a step limit, so
+ * a self-linked item fails the test instead of hanging it.
+ */
+
+#define NXT_PORT_FAIL_TEST_RACE_TRIALS  128
+#define NXT_PORT_FAIL_TEST_RACE_SPINS   4000000
+#define NXT_PORT_FAIL_TEST_QUEUE_LIMIT  16
+
+
+typedef struct {
+    nxt_port_t          *port;
+    nxt_event_engine_t  *engine;
+    nxt_atomic_t        ready;
+    nxt_atomic_t        stop;
+    nxt_uint_t          zeroes;
+} nxt_port_fail_test_race_t;
+
+
+static nxt_int_t
+nxt_port_fail_test_cross_engine_race(nxt_thread_t *thr)
+{
+    nxt_int_t                  queued;
+    nxt_task_t                 *task;
+    nxt_uint_t                 trial;
+    nxt_port_t                 *port;
+    nxt_thread_link_t          *link;
+    nxt_thread_handle_t        handle;
+    nxt_event_engine_t         current, foreign, other;
+    nxt_port_fail_test_race_t  race;
+
+    task = thr->task;
+    task->thread = thr;
+
+    nxt_memzero(&other, sizeof(other));
+
+    for (trial = 0; trial < NXT_PORT_FAIL_TEST_RACE_TRIALS; trial++) {
+
+        nxt_memzero(&current, sizeof(current));
+        nxt_work_queue_cache_create(&current.work_queue_cache, 1024);
+        current.fast_work_queue.cache = &current.work_queue_cache;
+        nxt_work_queue_name(&current.fast_work_queue, "fast");
+
+        nxt_memzero(&foreign, sizeof(foreign));
+        foreign.task.thread = thr;
+        foreign.task.log = thr->log;
+        foreign.event.signal = nxt_port_fail_test_engine_signal;
+
+        thr->engine = &current;
+
+        port = nxt_port_fail_test_port(task);
+        if (nxt_slow_path(port == NULL)) {
+            goto fail_engine;
+        }
+
+        port->engine = &foreign;
+
+        if (nxt_slow_path(nxt_mp_cleanup(port->mem_pool,
+                                         nxt_port_fail_test_released,
+                                         task, port, NULL) != NXT_OK))
+        {
+            nxt_port_use(task, port, -1);
+            goto fail_engine;
+        }
+
+        nxt_port_fail_test_releases = 0;
+        nxt_port_fail_test_signals = 0;
+
+        nxt_memzero(&race, sizeof(race));
+        race.port = port;
+        race.engine = &other;
+
+        link = nxt_zalloc(sizeof(nxt_thread_link_t));
+        if (nxt_slow_path(link == NULL)) {
+            goto fail_port;
+        }
+
+        link->start = nxt_port_fail_test_racer;
+        link->work.data = &race;
+
+        if (nxt_slow_path(nxt_thread_create(&handle, link) != NXT_OK)) {
+            goto fail_port;
+        }
+
+        /*
+         * The racer has to be spinning before the drop, or the window it
+         * watches for is gone before it looks.
+         */
+
+        while (race.ready == 0) {
+            nxt_cpu_pause();
+        }
+
+        nxt_port_use(task, port, -1);
+
+        race.stop = 1;
+
+        nxt_thread_wait(handle);
+
+        if (nxt_slow_path(race.zeroes != 0)) {
+            nxt_log_alert(thr->log, "port fail test: a foreign thread saw "
+                          "use_count 0 on a live port %ui times", race.zeroes);
+            goto fail_port;
+        }
+
+        queued = nxt_port_fail_test_queued(&foreign.locked_work_queue,
+                                           &port->release_work);
+
+        if (nxt_slow_path(queued < 0)) {
+            nxt_log_alert(thr->log, "port fail test: the embedded release "
+                          "work is linked into the target engine's queue "
+                          "more than once");
+            goto fail_engine;
+        }
+
+        if (nxt_slow_path(queued != 1)) {
+            nxt_log_alert(thr->log, "port fail test: the embedded release "
+                          "work is queued %i times, expected 1", queued);
+            goto fail_port;
+        }
+
+        if (nxt_slow_path(nxt_port_fail_test_signals != 1)) {
+            nxt_log_alert(thr->log, "port fail test: the target engine was "
+                          "signalled %ui times, expected 1",
+                          nxt_port_fail_test_signals);
+            goto fail_port;
+        }
+
+        if (nxt_slow_path(port->use_count != 1)) {
+            nxt_log_alert(thr->log, "port fail test: use_count is %A with "
+                          "the deferral in flight, expected 1",
+                          port->use_count);
+            goto fail_port;
+        }
+
+        thr->engine = &foreign;
+
+        nxt_locked_work_queue_move(thr, &foreign.locked_work_queue,
+                                   &current.fast_work_queue);
+
+        nxt_port_fail_test_drain_wq(&current.fast_work_queue);
+
+        if (nxt_slow_path(nxt_port_fail_test_releases != 1)) {
+            nxt_log_alert(thr->log, "port fail test: draining the target "
+                          "engine released the port %ui times, expected 1",
+                          nxt_port_fail_test_releases);
+            goto fail_engine;
+        }
+
+        nxt_work_queue_cache_destroy(&current.work_queue_cache);
+    }
+
+    thr->engine = NULL;
+
+    return NXT_OK;
+
+fail_port:
+
+    nxt_port_use(task, port, -1);
+
+fail_engine:
+
+    nxt_work_queue_cache_destroy(&current.work_queue_cache);
+    thr->engine = NULL;
+
+    return NXT_ERROR;
+}
+
+
+static void
+nxt_port_fail_test_racer(void *data)
+{
+    nxt_task_t                 task;
+    nxt_uint_t                 i;
+    nxt_thread_t               *thr;
+    nxt_port_fail_test_race_t  *race;
+
+    race = data;
+
+    thr = nxt_thread();
+    thr->engine = race->engine;
+
+    nxt_memzero(&task, sizeof(task));
+    task.thread = thr;
+    task.log = thr->log;
+
+    race->ready = 1;
+
+    for (i = 0; i < NXT_PORT_FAIL_TEST_RACE_SPINS; i++) {
+
+        if (nxt_slow_path(race->port->use_count == 0)) {
+            race->zeroes++;
+            break;
+        }
+
+        if (race->stop != 0) {
+            break;
+        }
+
+        nxt_cpu_pause();
+    }
+
+    /*
+     * The acquisition another engine can still make while the deferral is
+     * in flight, and the drop that follows it: 1 -> 2 -> 1, which must not
+     * reach the deferral and must not post anything.
+     */
+
+    nxt_port_use(&task, race->port, 1);
+    nxt_port_use(&task, race->port, -1);
+}
+
+
+/*
+ * Count the occurrences of one work item in a locked work queue, refusing to
+ * walk further than the queue can legitimately be.  A work item posted twice
+ * becomes its own successor, so the walk would otherwise not terminate --
+ * which is exactly what the draining engine does.
+ */
+
+static nxt_int_t
+nxt_port_fail_test_queued(nxt_locked_work_queue_t *lwq, nxt_work_t *item)
+{
+    nxt_int_t   n, steps;
+    nxt_work_t  *w;
+
+    n = 0;
+
+    for (w = lwq->head, steps = 0; w != NULL; w = w->next, steps++) {
+
+        if (steps >= NXT_PORT_FAIL_TEST_QUEUE_LIMIT) {
+            return -1;
+        }
+
+        if (w == item) {
+            n++;
+        }
+    }
+
+    return n;
+}
+
+
+/*
+ * A drop can carry more than one reference at once: nxt_port_socket_write()
+ * and nxt_port_error_handler() batch theirs into use_delta
+ * (src/nxt_port_socket.c:601, src/nxt_port_socket.c:1500), so a cross-engine
+ * drop of -2 or more can be the last one.
+ *
+ * The deferral must then leave exactly one reference standing, whatever the
+ * size of the batch, because the posted handler drops exactly one.  A
+ * hand-over that left the whole batch behind would strand the port, its
+ * memory pool and the process reference it holds -- the very leak this
+ * change exists to remove, reintroduced through the other door.
+ */
+
+static nxt_int_t
+nxt_port_fail_test_cross_engine_batch(nxt_thread_t *thr)
+{
+    nxt_task_t          *task;
+    nxt_port_t          *port;
+    nxt_event_engine_t  current, foreign;
+
+    task = thr->task;
+    task->thread = thr;
+
+    nxt_memzero(&current, sizeof(current));
+    nxt_work_queue_cache_create(&current.work_queue_cache, 1024);
+    current.fast_work_queue.cache = &current.work_queue_cache;
+    nxt_work_queue_name(&current.fast_work_queue, "fast");
+
+    nxt_memzero(&foreign, sizeof(foreign));
+    foreign.task.thread = thr;
+    foreign.task.log = thr->log;
+    foreign.event.signal = nxt_port_fail_test_engine_signal;
+
+    thr->engine = &current;
+
+    port = nxt_port_fail_test_port(task);
+    if (nxt_slow_path(port == NULL)) {
+        goto fail_engine;
+    }
+
+    port->engine = &foreign;
+
+    if (nxt_slow_path(nxt_mp_cleanup(port->mem_pool,
+                                     nxt_port_fail_test_released,
+                                     task, port, NULL) != NXT_OK))
+    {
+        nxt_port_use(task, port, -1);
+        goto fail_engine;
+    }
+
+    nxt_port_fail_test_releases = 0;
+
+    /*
+     * Two references, given up by one drop, from a thread that is not the
+     * port's engine.
+     */
+
+    nxt_port_use(task, port, 1);
+
+    nxt_port_use(task, port, -2);
+
+    if (nxt_slow_path(nxt_port_fail_test_releases != 0)) {
+        nxt_log_alert(thr->log, "port fail test: a batched cross-engine "
+                      "release ran on the calling thread");
+        goto fail_engine;
+    }
+
+    if (nxt_slow_path(foreign.locked_work_queue.head != &port->release_work)) {
+        nxt_log_alert(thr->log, "port fail test: a batched cross-engine last "
+                      "drop did not post the port's embedded release work");
+        goto fail_engine;
+    }
+
+    if (nxt_slow_path(port->use_count != 1)) {
+        nxt_log_alert(thr->log, "port fail test: use_count is %A after a "
+                      "batched cross-engine last drop, expected 1",
+                      port->use_count);
+        goto fail_port;
+    }
+
+    thr->engine = &foreign;
+
+    nxt_locked_work_queue_move(thr, &foreign.locked_work_queue,
+                               &current.fast_work_queue);
+
+    nxt_port_fail_test_drain_wq(&current.fast_work_queue);
+
+    if (nxt_slow_path(nxt_port_fail_test_releases != 1)) {
+        nxt_log_alert(thr->log, "port fail test: draining the target engine "
+                      "released the batched port %ui times, expected 1",
+                      nxt_port_fail_test_releases);
+        goto fail_engine;
+    }
+
+    nxt_work_queue_cache_destroy(&current.work_queue_cache);
+    thr->engine = NULL;
+
+    return NXT_OK;
+
+fail_port:
+
+    nxt_port_use(task, port, -1);
+
+fail_engine:
+
+    nxt_work_queue_cache_destroy(&current.work_queue_cache);
+    thr->engine = NULL;
+
+    return NXT_ERROR;
+}
+
+
+static void
+nxt_port_fail_test_engine_signal(nxt_event_engine_t *engine, nxt_uint_t signo)
+{
+    nxt_port_fail_test_signals++;
+}
+
+
+static void
+nxt_port_fail_test_released(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_port_fail_test_releases++;
 }
 
 

@@ -1153,27 +1153,117 @@ nxt_port_post(nxt_task_t *task, nxt_port_t *port,
 
 
 static void
-nxt_port_release_handler(nxt_task_t *task, nxt_port_t *port, void *data)
+nxt_port_release_work_handler(nxt_task_t *task, void *obj, void *data)
 {
-    /* no op */
+    /*
+     * Drop the reference nxt_port_use() handed to this item, rather than
+     * releasing outright: this runs on port->engine, so the drop takes the
+     * on-engine branch of nxt_port_use() and releases only if nobody else
+     * took a reference while the item was in flight.  That re-check is the
+     * whole point of holding a reference across the post -- see
+     * nxt_port_use().
+     */
+
+    nxt_port_use(task, obj, -1);
 }
 
 
 void
 nxt_port_use(nxt_task_t *task, nxt_port_t *port, int i)
 {
-    int  c;
+    nxt_atomic_int_t  c;
 
-    c = nxt_atomic_fetch_add(&port->use_count, i);
+    if (i >= 0
+        || port->engine == NULL
+        || task->thread->engine == port->engine)
+    {
+        c = nxt_atomic_fetch_add(&port->use_count, i);
 
-    if (i < 0 && c == -i) {
-
-        if (port->engine == NULL || task->thread->engine == port->engine) {
+        if (i < 0 && c == -i) {
             nxt_port_release(task, port);
-
-            return;
         }
 
-        nxt_port_post(task, port, nxt_port_release_handler, NULL);
+        return;
     }
+
+    /*
+     * A drop on another thread cannot release the port here -- the release
+     * frees port->mem_pool, and may drop the port's process reference,
+     * neither of which this thread owns -- so the last one is carried to
+     * port->engine by a work item.
+     *
+     * The item is embedded in the port and posted straight to the engine
+     * rather than routed through nxt_port_post(), which allocates one with
+     * nxt_zalloc() and can return NXT_ERROR.  This call site has nowhere to
+     * put that error: the reference it is dropping is the last, so refusing
+     * to defer would leak the port, its memory pool and the process
+     * reference it holds -- unbounded, under exactly the memory pressure
+     * that caused the failure -- while releasing here would free another
+     * engine's memory from this thread, which is what the deferral exists
+     * to prevent.  A deferral that cannot allocate cannot fail.  This
+     * mirrors nxt_runtime_process_release().
+     *
+     * The reference is handed to the item instead of being given up: the
+     * count is left standing at 1 and the posted handler drops it on
+     * port->engine.  The port stays reachable through process->ports until
+     * then, so another engine can still take a reference in that window --
+     * nxt_process_broadcast_shm_ack() walks a process's ports through bare
+     * pointers and nxt_port_socket_write() takes a reference on each -- and
+     * only a drop re-checked at the far end can tell that apart from a port
+     * nobody wants.  Releasing from the handler unconditionally would free
+     * a port somebody holds.  Routing through nxt_port_post() used to
+     * provide exactly this: it took a reference of its own and ended in
+     * nxt_port_use(port, -1).
+     *
+     * The hand-over is why the loop below is a compare-and-set that stores
+     * the item's one reference in place of the last drop, rather than a
+     * fetch-and-add to zero followed by a compensating increment.  use_count
+     * reaches zero only on port->engine, immediately before
+     * nxt_port_release(), so while the item is in flight no other thread can
+     * observe a last drop: a reference taken in that window takes the count
+     * to 2, and the holder's drop finds the item's own reference still
+     * standing, so it is not the last and cannot reach this branch.  At most
+     * one post is therefore ever in flight, and the item cannot be posted
+     * twice.  That matters because nxt_locked_work_queue_add() links the
+     * item onto the queue tail: an item posted while it is already queued
+     * becomes its own successor, and the engine draining the queue then
+     * spins forever.
+     *
+     * The item becomes free again only once the handler's drop can run, and
+     * that is after nxt_locked_work_queue_move() has taken it off the
+     * locked queue and copied it into the engine's own work queue -- which
+     * is also why the release may free the pool the item lives in.
+     */
+
+    for ( ;; ) {
+        c = port->use_count;
+
+        if (c != -i) {
+            nxt_assert(c > -i);
+
+            if (nxt_atomic_cmp_set(&port->use_count, c, c + i)) {
+                return;
+            }
+
+            continue;
+        }
+
+        /*
+         * Exactly one reference is left standing, whatever the size of the
+         * batch this drop carries, because the item's handler drops exactly
+         * one.
+         */
+
+        if (nxt_atomic_cmp_set(&port->use_count, c, 1)) {
+            break;
+        }
+    }
+
+    port->release_work.handler = nxt_port_release_work_handler;
+    port->release_work.task = &port->engine->task;
+    port->release_work.obj = port;
+    port->release_work.data = NULL;
+    port->release_work.next = NULL;
+
+    nxt_event_engine_post(port->engine, &port->release_work);
 }
