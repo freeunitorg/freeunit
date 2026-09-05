@@ -32,6 +32,17 @@
  * ever cancel a stream of the forger's own; that case gives the two pids
  * different values and requires the router's port to stay untouched.
  *
+ * The prototype's own START_PROCESS handler is covered here too.  It is the
+ * other end of the same message -- the router sends one to main to get a
+ * prototype and one to the prototype to get a worker
+ * (src/nxt_router.c:469 and :3347) -- and until issue #270 it checked
+ * nothing at all, although every worker it forks inherits the write end of
+ * the prototype's port.  Its cases are refusals only, and each is run in a
+ * forked child: a handler that does not refuse goes on to fork a worker
+ * from a fixture that has no application loaded, and containing that keeps
+ * one broken gate from taking the whole test binary down.  The parent
+ * reports a child that died as the fall-through it is.
+ *
  * Not covered: the nxt_mp_create() failure a few lines below the process
  * allocation.  Arming it needs a malloc-failure hook that does not exist,
  * and the sites are not independent -- both reach "failed:" through the
@@ -45,10 +56,12 @@
 #include <nxt_port.h>
 #include <nxt_port_hash.h>
 #include <nxt_main_process.h>
+#include <nxt_application.h>
 #include <nxt_event_engine.h>
 #include "nxt_tests.h"
 
 #include <fcntl.h>
+#include <sys/wait.h>
 
 
 static nxt_bool_t
@@ -268,6 +281,130 @@ done:
     return ret;
 }
 
+#if (NXT_USE_CMSG_PID)
+
+/*
+ * One refusal case for nxt_proto_start_process_handler(), run inside a
+ * forked child.
+ *
+ * The child does the whole check and reports through its exit status: 0 when
+ * the handler refused, 1 when it was reached and left a trace it should not
+ * have.  A handler with no gate does not return at all -- it allocates a
+ * process and reads nxt_app_conf, which no fixture here sets -- so the
+ * parent treats a signalled child as the failure it is, and names it.
+ *
+ * What "refused" means, in the order the child tests it: nothing was queued
+ * on any port (a refusal must not answer, because the reply is addressed by
+ * the sender-chosen msg->port_msg.pid and answering would let a forger
+ * cancel a stream of its choosing), and both descriptors the message carried
+ * were closed (this handler owns them; the port read loop reclaims nothing).
+ */
+static nxt_int_t
+nxt_main_start_process_reply_test_proto_case(nxt_thread_t *thr,
+    nxt_task_t *task, nxt_port_recv_msg_t *msg, nxt_port_t *port_a,
+    nxt_port_t *port_b, const char *name)
+{
+    int        status;
+    pid_t      child;
+    nxt_fd_t   fd0, fd1;
+    nxt_int_t  ret;
+
+    fd0 = open("/dev/null", O_RDONLY);
+    fd1 = open("/dev/null", O_RDONLY);
+
+    if (nxt_slow_path(fd0 == -1 || fd1 == -1)) {
+        nxt_log_alert(thr->log, "main start process reply test: %s failed to "
+                      "open the descriptors", name);
+
+        if (fd0 != -1) {
+            (void) close(fd0);
+        }
+
+        if (fd1 != -1) {
+            (void) close(fd1);
+        }
+
+        return NXT_ERROR;
+    }
+
+    msg->fd[0] = fd0;
+    msg->fd[1] = fd1;
+
+    child = fork();
+
+    if (nxt_slow_path(child == -1)) {
+        nxt_log_alert(thr->log, "main start process reply test: %s failed to "
+                      "fork %E", name, nxt_errno);
+        (void) close(fd0);
+        (void) close(fd1);
+
+        return NXT_ERROR;
+    }
+
+    if (child == 0) {
+        ret = NXT_OK;
+
+        nxt_proto_test_run_start_process_handler(task, msg);
+
+        if (!nxt_queue_is_empty(&port_a->messages)
+            || (port_b != NULL && !nxt_queue_is_empty(&port_b->messages)))
+        {
+            nxt_log_alert(thr->log, "main start process reply test: %s was "
+                          "answered; a refused START_PROCESS must not reply, "
+                          "because the reply is addressed by the pid the "
+                          "sender chose", name);
+            ret = NXT_ERROR;
+        }
+
+        if (msg->fd[0] != -1 || msg->fd[1] != -1
+            || nxt_main_start_process_reply_test_fd_is_open(fd0)
+            || nxt_main_start_process_reply_test_fd_is_open(fd1))
+        {
+            nxt_log_alert(thr->log, "main start process reply test: %s leaked "
+                          "a descriptor", name);
+            ret = NXT_ERROR;
+        }
+
+        /*
+         * _exit(), not exit(): the child shares the parent's stdio and its
+         * pools, and must run no destructor or atexit handler of theirs.
+         */
+        _exit(ret == NXT_OK ? 0 : 1);
+    }
+
+    /* The child owns them now; this frame only has to stop naming them. */
+    (void) close(fd0);
+    (void) close(fd1);
+
+    msg->fd[0] = -1;
+    msg->fd[1] = -1;
+
+    while (waitpid(child, &status, 0) == -1) {
+        if (nxt_errno != NXT_EINTR) {
+            nxt_log_alert(thr->log, "main start process reply test: %s failed "
+                          "to reap the child %E", name, nxt_errno);
+            return NXT_ERROR;
+        }
+    }
+
+    if (nxt_slow_path(!WIFEXITED(status))) {
+        nxt_log_alert(thr->log, "main start process reply test: %s did not "
+                      "refuse -- the handler ran past the sender check and "
+                      "into the start path, and died there on signal %d",
+                      name, WTERMSIG(status));
+        return NXT_ERROR;
+    }
+
+    if (nxt_slow_path(WEXITSTATUS(status) != 0)) {
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+#endif
+
+
 nxt_int_t
 nxt_main_start_process_reply_test(nxt_thread_t *thr)
 {
@@ -473,6 +610,94 @@ nxt_main_start_process_reply_test(nxt_thread_t *thr)
     if (nxt_slow_path(ret != NXT_OK)) {
         goto done;
     }
+
+#if (NXT_USE_CMSG_PID)
+
+    /*
+     * The prototype's START_PROCESS handler, issue #270.  Each case is a
+     * refusal; the fixture is the one above, read as the prototype's own
+     * runtime -- rt->port_by_type[NXT_PROCESS_ROUTER] is the router port the
+     * prototype inherited from main, which nxt_proc_keep_matrix[] keeps.
+     */
+
+    /*
+     * A worker forging a START_PROCESS.  It claims to be the router in the
+     * one field it controls, and the credential names it.  This is the whole
+     * exposure: nxt_process_close_ports() keeps the parent's port
+     * unconditionally, so every worker holds the write end of the port this
+     * message arrived on.
+     */
+
+    msg.cmsg_pid = nxt_pid + 1;
+    msg.port_msg.stream = 0x55555555;
+
+    ret = nxt_main_start_process_reply_test_proto_case(thr, task, &msg,
+                                                      router_port,
+                                                      foreign_port,
+                                                      "a foreign sender to "
+                                                      "the prototype");
+
+    msg.cmsg_pid = nxt_pid;
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto done;
+    }
+
+    /*
+     * No router port to compare against.  The prototype cannot tell who sent
+     * this, and refusing is the only safe answer -- the same conclusion
+     * nxt_main_start_process_handler() reaches, minus the reply it can
+     * address and the prototype cannot.
+     */
+
+    rt->port_by_type[NXT_PROCESS_ROUTER] = NULL;
+
+    msg.port_msg.stream = 0x66666666;
+
+    ret = nxt_main_start_process_reply_test_proto_case(thr, task, &msg,
+                                                      router_port,
+                                                      foreign_port,
+                                                      "a missing router port "
+                                                      "in the prototype");
+
+    rt->port_by_type[NXT_PROCESS_ROUTER] = router_port;
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto done;
+    }
+
+    /*
+     * A pid-isolated prototype.  There the router is in an ancestor pid
+     * namespace and has no pid at all in this one, so the kernel writes a
+     * credential of 0 and the router's global pid is the wrong thing to
+     * compare against; the prototype's own workers, forked with no clone
+     * flags of their own, are inside the namespace and carry non-zero
+     * namespace-local pids.  This case is such a worker -- a credential that
+     * is neither 0 nor the router's -- and pins the arm down from the side
+     * that matters: a gate that simply skipped the check when isolated would
+     * pass every other case here and fail this one.
+     */
+
+    rt->is_pid_isolated = 1;
+
+    msg.cmsg_pid = 2;
+    msg.port_msg.stream = 0x77777777;
+
+    ret = nxt_main_start_process_reply_test_proto_case(thr, task, &msg,
+                                                      router_port,
+                                                      foreign_port,
+                                                      "a worker inside a "
+                                                      "pid-isolated "
+                                                      "prototype");
+
+    rt->is_pid_isolated = 0;
+    msg.cmsg_pid = nxt_pid;
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto done;
+    }
+
+#endif
 
     nxt_thread_time_update(thr);
     nxt_log_error(NXT_LOG_NOTICE, thr->log,

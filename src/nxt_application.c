@@ -619,6 +619,76 @@ nxt_proto_start(nxt_task_t *task, nxt_process_data_t *data)
 }
 
 
+#if (NXT_USE_CMSG_PID)
+
+/*
+ * Is the kernel-validated sender of this START_PROCESS allowed to make the
+ * prototype fork a worker?
+ *
+ * Only the router ever sends one (nxt_router_start_app_process_handler(),
+ * src/nxt_router.c:3347), but every worker the prototype forks inherits the
+ * write end of the prototype's own port socket -- nxt_proc_keep_matrix[]
+ * does not list it, and nxt_process_close_ports() keeps the parent's port
+ * unconditionally -- and nxt_port_handler() dispatches on the wire type
+ * alone.  So without this test one compromised worker can spend the
+ * prototype's process budget, and, once #268 has the prototype answer for a
+ * child that dies, drive the router's start bookkeeping from the inside.
+ *
+ * The test has two arms because the prototype has two pid views of the
+ * router, and the credential the kernel writes is always relative to the
+ * receiver's pid namespace:
+ *
+ *  - Sharing main's namespace, the router is an ordinary visible process and
+ *    the credential is its global pid, which is what the inherited
+ *    rt->port_by_type[NXT_PROCESS_ROUTER] is keyed on.  This is the same
+ *    whitelist nxt_main_start_process_handler() applies
+ *    (src/nxt_main_process.c:532).
+ *
+ *  - Under "isolation": {"namespaces": {"pid": true}} the prototype is the
+ *    init of its own namespace (nxt_process.c:765) and the router lives in
+ *    an ancestor of it, so the router has no pid there at all: the kernel
+ *    translates an untranslatable sender to 0 (pid_vnr() returns 0 outside
+ *    the receiver's namespace; measured, not assumed).  Comparing against
+ *    the router's global pid would then refuse every legitimate start.  A
+ *    credential of 0 is therefore what "from outside this namespace" looks
+ *    like, and it is exactly the set the prototype does not fork: its
+ *    workers are forked with no clone flags of their own
+ *    (nxt_proto_start_process_handler() leaves process->isolation zeroed),
+ *    so each of them is inside this namespace and presents a non-zero
+ *    namespace-local pid.  The residual sender that arm admits is main,
+ *    which is trusted and does not send START_PROCESS.
+ *
+ * The reply addressing at "failed:" is deliberately left keyed on
+ * msg->port_msg.pid: the runtime port hash is keyed on the global pid, which
+ * in the isolated arm is precisely the number the credential cannot supply.
+ * That is why a refused message is not answered at all -- answering it would
+ * let the forger name any port and stream it likes and have the prototype
+ * cancel somebody else's RPC.  Nothing is stranded by the silence: the
+ * router never armed an RPC for a message it did not send.
+ */
+static nxt_bool_t
+nxt_proto_start_process_sender_ok(nxt_task_t *task, nxt_runtime_t *rt,
+    nxt_port_recv_msg_t *msg)
+{
+    nxt_port_t  *router_port;
+
+    if (rt->is_pid_isolated) {
+        return nxt_recv_msg_cmsg_pid(msg) == 0;
+    }
+
+    router_port = rt->port_by_type[NXT_PROCESS_ROUTER];
+
+    if (nxt_slow_path(router_port == NULL)) {
+        nxt_alert(task, "router port not found");
+        return 0;
+    }
+
+    return nxt_recv_msg_cmsg_pid(msg) == router_port->pid;
+}
+
+#endif
+
+
 static void
 nxt_proto_start_process_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
@@ -630,6 +700,24 @@ nxt_proto_start_process_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_process_init_t  *init;
 
     rt = task->thread->runtime;
+
+#if (NXT_USE_CMSG_PID)
+    /*
+     * Before anything is allocated or forked, and without a reply: see
+     * nxt_proto_start_process_sender_ok().  The descriptors are closed here
+     * because this handler owns whatever the message carried -- the port
+     * read loop does not reclaim them (src/nxt_port_socket.c:1381) -- and a
+     * refused START_PROCESS carries the router's shared port and queue.
+     */
+    if (nxt_slow_path(!nxt_proto_start_process_sender_ok(task, rt, msg))) {
+        nxt_alert(task, "process %PI cannot start processes",
+                  nxt_recv_msg_cmsg_pid(msg));
+
+        nxt_port_recv_msg_close_fds(msg);
+
+        return;
+    }
+#endif
 
     process = nxt_process_new(rt);
     if (nxt_slow_path(process == NULL)) {
@@ -694,6 +782,18 @@ failed:
                               -1, msg->port_msg.stream, 0, NULL);
     }
 }
+
+
+#if (NXT_TESTS)
+
+void
+nxt_proto_test_run_start_process_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg)
+{
+    nxt_proto_start_process_handler(task, msg);
+}
+
+#endif
 
 
 static void
