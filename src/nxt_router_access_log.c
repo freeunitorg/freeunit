@@ -158,10 +158,8 @@ static nxt_router_access_log_format_t *
 nxt_router_access_log_format_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
     nxt_conf_value_t *value)
 {
-    size_t                          size;
     uint32_t                        i, n, next;
     nxt_str_t                       name, str, *dst;
-    nxt_bool_t                      has_js;
     nxt_conf_value_t                *cv;
     nxt_router_access_log_member_t  *member;
     nxt_router_access_log_format_t  *format;
@@ -179,68 +177,40 @@ nxt_router_access_log_format_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
     if (value != NULL) {
 
         if (nxt_conf_type(value) == NXT_CONF_OBJECT) {
-            next = 0;
-            has_js = 0;
-
             n = nxt_conf_object_members_count(value);
 
-            for ( ;; ) {
+            member = nxt_mp_alloc(rtcf->mem_pool,
+                                  n * sizeof(nxt_router_access_log_member_t));
+            if (nxt_slow_path(member == NULL)) {
+                return NULL;
+            }
+
+            next = 0;
+
+            for (i = 0; i < n; i++) {
                 cv = nxt_conf_next_object_member(value, &name, &next);
                 if (cv == NULL) {
                     break;
                 }
 
-                nxt_conf_get_string(cv, &str);
-
-                if (nxt_tstr_is_js(&str)) {
-                    has_js = 1;
-                }
-            }
-
-            if (has_js) {
-                member = nxt_mp_alloc(rtcf->mem_pool,
-                                    n * sizeof(nxt_router_access_log_member_t));
-                if (nxt_slow_path(member == NULL)) {
+                dst = nxt_str_dup(rtcf->mem_pool, &member[i].name, &name);
+                if (nxt_slow_path(dst == NULL)) {
                     return NULL;
                 }
 
-                next = 0;
+                nxt_conf_get_string(cv, &str);
 
-                for (i = 0; i < n; i++) {
-                    cv = nxt_conf_next_object_member(value, &name, &next);
-                    if (cv == NULL) {
-                        break;
-                    }
-
-                    dst = nxt_str_dup(rtcf->mem_pool, &member[i].name, &name);
-                    if (nxt_slow_path(dst == NULL)) {
-                        return NULL;
-                    }
-
-                    nxt_conf_get_string(cv, &str);
-
-                    member[i].tstr = nxt_tstr_compile(rtcf->tstr_state, &str,
-                                                      NXT_TSTR_LOGGING);
-                    if (nxt_slow_path(member[i].tstr == NULL)) {
-                        return NULL;
-                    }
+                member[i].tstr = nxt_tstr_compile(rtcf->tstr_state, &str,
+                                                  NXT_TSTR_LOGGING);
+                if (nxt_slow_path(member[i].tstr == NULL)) {
+                    return NULL;
                 }
-
-                format->nmembers = n;
-                format->member = member;
-
-                return format;
             }
 
-            size = nxt_conf_json_length(value, NULL);
+            format->nmembers = n;
+            format->member = member;
 
-            str.start = nxt_mp_nget(rtcf->mem_pool, size);
-            if (nxt_slow_path(str.start == NULL)) {
-                return NULL;
-            }
-
-            str.length = nxt_conf_json_print(str.start, value, NULL)
-                         - str.start;
+            return format;
 
         } else {
             nxt_conf_get_string(value, &str);
