@@ -426,6 +426,65 @@ nxt_file_rename(nxt_file_name_t *old_name, nxt_file_name_t *new_name)
 }
 
 
+nxt_int_t
+nxt_file_sync(nxt_task_t *task, nxt_file_t *file)
+{
+    nxt_debug(task, "fsync(%FD, \"%FN\")", file->fd, file->name);
+
+    if (nxt_fast_path(fsync(file->fd) == 0)) {
+        return NXT_OK;
+    }
+
+    file->error = nxt_errno;
+
+    nxt_alert(task, "fsync(%FD, \"%FN\") failed %E",
+              file->fd, file->name, file->error);
+
+    return NXT_ERROR;
+}
+
+
+nxt_int_t
+nxt_file_dir_sync(nxt_task_t *task, nxt_file_name_t *name)
+{
+    int        fd;
+    nxt_int_t  ret;
+    nxt_err_t  err;
+
+    fd = open((char *) name, O_RDONLY | NXT_FILE_DIR_SYNC_FLAGS);
+    if (nxt_slow_path(fd == -1)) {
+        nxt_alert(task, "open(\"%FN\", O_RDONLY) failed %E", name, nxt_errno);
+        return NXT_ERROR;
+    }
+
+    nxt_debug(task, "fsync(%FD, \"%FN\") directory", fd, name);
+
+    ret = NXT_OK;
+
+    if (nxt_slow_path(fsync(fd) != 0)) {
+        err = nxt_errno;
+
+        /*
+         * Some file systems refuse to flush a directory descriptor at all;
+         * the rename() has still happened, so this is not a store failure.
+         */
+        if (err == NXT_EINVAL || err == NXT_EOPNOTSUPP) {
+            nxt_debug(task, "fsync(%FD, \"%FN\") directory unsupported %E",
+                      fd, name, err);
+
+        } else {
+            nxt_alert(task, "fsync(%FD, \"%FN\") directory failed %E",
+                      fd, name, err);
+            ret = NXT_ERROR;
+        }
+    }
+
+    nxt_fd_close(fd);
+
+    return ret;
+}
+
+
 /*
  * ioctl(FIONBIO) sets a non-blocking mode using one syscall,
  * thereas fcntl(F_SETFL, O_NONBLOCK) needs to learn the current state

@@ -37,6 +37,8 @@ extern const nxt_sig_event_t  nxt_process_signals[];
 void nxt_main_test_process_new_failures(nxt_uint_t failures);
 void nxt_main_test_run_start_process_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
+nxt_int_t nxt_main_test_run_file_store(nxt_task_t *task, const char *dir,
+    const char *tmp_name, const char *name, u_char *buf, size_t size);
 #endif
 
 

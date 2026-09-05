@@ -62,8 +62,10 @@ static void nxt_main_process_whoami_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static void nxt_main_port_conf_store_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
-static nxt_int_t nxt_main_file_store(nxt_task_t *task, const char *tmp_name,
-    const char *name, u_char *buf, size_t size);
+static nxt_int_t nxt_main_file_store(nxt_task_t *task, const char *dir,
+    const char *tmp_name, const char *name, u_char *buf, size_t size);
+static nxt_int_t nxt_main_file_store_inherit(nxt_task_t *task,
+    nxt_file_t *tmp, const char *name);
 static void nxt_main_port_access_log_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 
@@ -729,6 +731,20 @@ nxt_main_test_run_start_process_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg)
 {
     nxt_main_start_process_handler(task, msg);
+}
+
+
+/*
+ * Public wrapper that lets src/test/nxt_main_file_store_test.c drive the
+ * static nxt_main_file_store() against a scratch directory -- used to
+ * verify that the store is atomic and never damages the existing file
+ * (issue #215).
+ */
+nxt_int_t
+nxt_main_test_run_file_store(nxt_task_t *task, const char *dir,
+    const char *tmp_name, const char *name, u_char *buf, size_t size)
+{
+    return nxt_main_file_store(task, dir, tmp_name, name, buf, size);
 }
 
 #endif
@@ -1889,7 +1905,7 @@ nxt_main_port_conf_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     if (nxt_conf_ver != NXT_VERNUM) {
         n = nxt_sprintf(ver, ver + NXT_INT_T_LEN, "%d", NXT_VERNUM) - ver;
 
-        ret = nxt_main_file_store(task, rt->ver_tmp, rt->ver, ver, n);
+        ret = nxt_main_file_store(task, rt->state, rt->ver_tmp, rt->ver, ver, n);
         if (nxt_slow_path(ret != NXT_OK)) {
             goto error;
         }
@@ -1897,7 +1913,7 @@ nxt_main_port_conf_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         nxt_conf_ver = NXT_VERNUM;
     }
 
-    ret = nxt_main_file_store(task, rt->conf_tmp, rt->conf, p, size);
+    ret = nxt_main_file_store(task, rt->state, rt->conf_tmp, rt->conf, p, size);
 
     if (nxt_fast_path(ret == NXT_OK)) {
         goto cleanup;
@@ -1920,9 +1936,27 @@ cleanup:
 }
 
 
+/*
+ * Replace "name" with "size" bytes of "buf" atomically: the content goes to
+ * "tmp_name", which the caller places in "dir" beside the destination, is
+ * flushed, and only then rename(2)d over "name", so a reader sees either
+ * the whole old file or the whole new one.  "dir" is flushed after the
+ * rename, without which the rename may not survive a power loss.  Every
+ * failure before the rename unlinks the temporary and leaves the existing
+ * "name" untouched.
+ *
+ * Because the replacement arrives by rename(), a "name" that was a symlink
+ * is replaced by a regular file rather than followed -- the price of
+ * atomicity.  A symlinked state *directory* is unaffected: "dir" and
+ * "tmp_name" resolve through it just as "name" does.
+ *
+ * The temporary is created 0600 as before; when the destination already
+ * exists, its mode and ownership are carried over to the replacement, so a
+ * state file an administrator has re-permissioned keeps its settings.
+ */
 static nxt_int_t
-nxt_main_file_store(nxt_task_t *task, const char *tmp_name, const char *name,
-    u_char *buf, size_t size)
+nxt_main_file_store(nxt_task_t *task, const char *dir, const char *tmp_name,
+    const char *name, u_char *buf, size_t size)
 {
     ssize_t     n;
     nxt_int_t   ret;
@@ -1930,7 +1964,18 @@ nxt_main_file_store(nxt_task_t *task, const char *tmp_name, const char *name,
 
     nxt_memzero(&file, sizeof(nxt_file_t));
 
-    file.name = (nxt_file_name_t *) name;
+    file.name = (nxt_file_name_t *) tmp_name;
+
+    /*
+     * Without a log level nxt_file_open() reports nothing, and a failed
+     * store would be diagnosable only from the caller's summary alert.
+     * NXT_LOG_ALERT is zero, which is the "say nothing" value, so the
+     * loudest usable level here is NXT_LOG_ERR.
+     *
+     * NXT_FILE_TRUNCATE applies to the temporary, never to "name": a
+     * leftover from an interrupted store is simply overwritten.
+     */
+    file.log_level = NXT_LOG_ERR;
 
     ret = nxt_file_open(task, &file, NXT_FILE_WRONLY, NXT_FILE_TRUNCATE,
                         NXT_FILE_OWNER_ACCESS);
@@ -1940,14 +1985,99 @@ nxt_main_file_store(nxt_task_t *task, const char *tmp_name, const char *name,
 
     n = nxt_file_write(&file, buf, size, 0);
 
-    nxt_file_close(task, &file);
-
     if (nxt_slow_path(n != (ssize_t) size)) {
+        /* nxt_file_write() logs the errno; a short write has none. */
+        if (n >= 0) {
+            nxt_alert(task, "write(\"%FN\") stored %z of %uz bytes",
+                      file.name, n, size);
+        }
+
+        goto fail;
+    }
+
+    if (nxt_slow_path(nxt_main_file_store_inherit(task, &file, name)
+                      != NXT_OK))
+    {
+        goto fail;
+    }
+
+    /* Flush before the rename, or the rename may become visible first. */
+    if (nxt_slow_path(nxt_file_sync(task, &file) != NXT_OK)) {
+        goto fail;
+    }
+
+    nxt_file_close(task, &file);
+    file.fd = NXT_FILE_INVALID;
+
+    if (nxt_slow_path(nxt_file_rename(file.name, (nxt_file_name_t *) name)
+                      != NXT_OK))
+    {
         (void) nxt_file_delete(file.name);
         return NXT_ERROR;
     }
 
-    return nxt_file_rename(file.name, (nxt_file_name_t *) name);
+    /* The destination is in place; a failed flush only costs durability. */
+    (void) nxt_file_dir_sync(task, (nxt_file_name_t *) dir);
+
+    return NXT_OK;
+
+fail:
+
+    if (file.fd != NXT_FILE_INVALID) {
+        nxt_file_close(task, &file);
+    }
+
+    (void) nxt_file_delete(file.name);
+
+    return NXT_ERROR;
+}
+
+
+/*
+ * Carry the destination's mode and ownership onto the temporary that is
+ * about to replace it.  A destination that does not exist yet keeps the
+ * 0600 the temporary was created with.
+ */
+static nxt_int_t
+nxt_main_file_store_inherit(nxt_task_t *task, nxt_file_t *tmp,
+    const char *name)
+{
+    nxt_file_t       dst;
+    nxt_file_info_t  fi;
+
+    nxt_memzero(&dst, sizeof(nxt_file_t));
+
+    dst.name = (nxt_file_name_t *) name;
+    dst.fd = NXT_FILE_INVALID;
+    dst.log_level = NXT_LOG_DEBUG;
+
+    if (nxt_file_info(&dst, &fi) != NXT_OK) {
+        if (dst.error == NXT_ENOENT) {
+            return NXT_OK;
+        }
+
+        nxt_alert(task, "stat(\"%FN\") failed %E", dst.name, dst.error);
+
+        return NXT_ERROR;
+    }
+
+    if (nxt_slow_path(fchmod(tmp->fd, fi.st_mode & 07777) != 0)) {
+        nxt_alert(task, "fchmod(%FD, \"%FN\") failed %E",
+                  tmp->fd, tmp->name, nxt_errno);
+        return NXT_ERROR;
+    }
+
+    /*
+     * Main runs as root, so this normally succeeds; when it cannot change
+     * the owner the store still proceeds -- refusing to persist the
+     * configuration would be the worse failure.
+     */
+    if (nxt_slow_path(fchown(tmp->fd, fi.st_uid, fi.st_gid) != 0)) {
+        nxt_log(task, NXT_LOG_INFO, "fchown(%FD, \"%FN\") failed %E",
+                tmp->fd, tmp->name, nxt_errno);
+    }
+
+    return NXT_OK;
 }
 
 

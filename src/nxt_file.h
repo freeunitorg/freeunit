@@ -141,6 +141,18 @@ NXT_EXPORT nxt_int_t nxt_file_openat2(nxt_task_t *task, nxt_file_t *file,
 
 #endif /* NXT_HAVE_OPENAT2 */
 
+/*
+ * O_DIRECTORY, where the platform has it, keeps nxt_file_dir_sync() from
+ * opening something that is not a directory.  It is not in POSIX, so the
+ * flag is optional.
+ */
+#if defined(O_DIRECTORY)
+#define NXT_FILE_DIR_SYNC_FLAGS     O_DIRECTORY
+#else
+#define NXT_FILE_DIR_SYNC_FLAGS     0
+#endif
+
+
 /* The file creation modes. */
 #define NXT_FILE_CREATE_OR_OPEN     O_CREAT
 #define NXT_FILE_OPEN               0
@@ -181,6 +193,17 @@ NXT_EXPORT nxt_int_t nxt_file_chown(nxt_file_name_t *name, const char *owner,
     const char *group);
 NXT_EXPORT nxt_int_t nxt_file_rename(nxt_file_name_t *old_name,
     nxt_file_name_t *new_name);
+
+/*
+ * Flush an open file, respectively a directory named by path, to stable
+ * storage.  A durable replace is: write the temporary file, nxt_file_sync()
+ * it, nxt_file_rename() it over the destination, then nxt_file_dir_sync()
+ * the directory that holds them -- without the last step the rename itself
+ * may not survive a power loss.
+ */
+NXT_EXPORT nxt_int_t nxt_file_sync(nxt_task_t *task, nxt_file_t *file);
+NXT_EXPORT nxt_int_t nxt_file_dir_sync(nxt_task_t *task,
+    nxt_file_name_t *name);
 
 NXT_EXPORT nxt_int_t nxt_fd_nonblocking(nxt_task_t *task, nxt_fd_t fd);
 NXT_EXPORT nxt_int_t nxt_fd_blocking(nxt_task_t *task, nxt_fd_t fd);
