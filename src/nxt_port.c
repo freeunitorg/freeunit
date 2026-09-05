@@ -251,8 +251,9 @@ nxt_port_enable(nxt_task_t *task, nxt_port_t *port,
  * nxt_port_socket.c fill msg->cmsg_pid.  Individual handlers are
  * being gated on nxt_recv_msg_cmsg_pid() one at a time --
  * nxt_main_process_created_handler(), nxt_main_start_process_handler(),
- * nxt_port_process_ready_handler(), nxt_proto_process_created_handler()
- * and the cert/script/socket/access-log handlers already are.
+ * nxt_port_process_ready_handler(), nxt_proto_process_created_handler(),
+ * nxt_proto_start_process_handler() and the cert/script/socket/
+ * access-log handlers already are.
  *
  * What is left is the table-driven part: a per-message-type sender
  * ACL applied here, in the dispatcher, so that a handler which
@@ -310,11 +311,30 @@ nxt_port_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 }
 
 
+/*
+ * Announce a port to every peer the send matrix pairs it with, carrying
+ * "stream" so that the announcement doubles as the reply to the start RPC
+ * the initiator armed.
+ *
+ * Returns NXT_OK only when every announcement it attempted was accepted for
+ * delivery.  The caller uses that as "the start RPC has been answered": the
+ * initiator of a start is the router, nxt_router_new_port_handler() feeds a
+ * stream-bearing NEW_PORT to nxt_port_rpc_handler()
+ * (src/nxt_router.c:768-771), and that is what retires the registration.
+ * A single failed write leaves it possible that the router was the peer that
+ * missed out, so the whole call reports failure rather than guess.
+ *
+ * "Attempted" matters: with no matching peer at all there is nothing to
+ * fail, and NXT_OK is the honest answer -- an initiator that is not in this
+ * runtime has no registration here to keep alive for.
+ */
+
 /* TODO join with process_ready and move to nxt_main_process.c */
-nxt_inline void
+nxt_inline nxt_int_t
 nxt_port_send_new_port(nxt_task_t *task, nxt_runtime_t *rt,
     nxt_port_t *new_port, uint32_t stream)
 {
+    nxt_int_t      ret;
     nxt_port_t     *port;
     nxt_process_t  *process;
 
@@ -325,6 +345,8 @@ nxt_port_send_new_port(nxt_task_t *task, nxt_runtime_t *rt,
     nxt_debug(task, "new port %d for process %PI",
               new_port->pair[1], new_port->pid);
 
+    ret = NXT_OK;
+
     nxt_runtime_process_each(rt, process) {
 
         if (process->pid == new_port->pid || process->pid == nxt_pid) {
@@ -334,10 +356,16 @@ nxt_port_send_new_port(nxt_task_t *task, nxt_runtime_t *rt,
         port = nxt_process_port_first(process);
 
         if (nxt_proc_send_matrix[port->type][new_port->type]) {
-            (void) nxt_port_send_port(task, port, new_port, stream);
+            if (nxt_slow_path(nxt_port_send_port(task, port, new_port, stream)
+                              != NXT_OK))
+            {
+                ret = NXT_ERROR;
+            }
         }
 
     } nxt_runtime_process_loop;
+
+    return ret;
 }
 
 
@@ -559,9 +587,11 @@ nxt_port_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
      * Every guard here rejects before the state is set: a message that is
      * not acted upon must leave no trace.  Marking a process ready and only
      * then rejecting it would make the next, legitimate PROCESS_READY trip
-     * the guard above, and would let nxt_main_process_sigchld_handler()
-     * clear the start stream of a process that never finished starting,
-     * dropping the REMOVE_PID that cancels the pending start RPC.
+     * the guard above -- and, before the start stream was tied to the
+     * announcement at the tail of this handler, would have let
+     * nxt_main_process_sigchld_handler() clear the start stream of a process
+     * that never finished starting, dropping the REMOVE_PID that cancels the
+     * pending start RPC.
      */
     if (nxt_slow_path(nxt_queue_is_empty(&process->ports))) {
         nxt_log(task, NXT_LOG_WARN, "PROCESS_READY claiming process %PI, "
@@ -707,10 +737,11 @@ nxt_port_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
          * kill the worker and still leave the start pending, which
          * is the wedge this arm exists to end.
          *
-         * CREATED, not READY: it never became usable, and on the
-         * paths main reports rather than the prototype, READY is
-         * what makes main clear the start stream
-         * (nxt_main_process.c:1108-1110).
+         * CREATED, not READY: it never became usable.  The start
+         * stream survives either way -- this arm returns above the
+         * announcement at the tail of this handler, which is the
+         * only thing that clears it -- so the REMOVE_PID this
+         * guarantees still carries it.
          */
         if (process->state == NXT_PROCESS_STATE_CREATING) {
             process->state = NXT_PROCESS_STATE_CREATED;
@@ -783,7 +814,38 @@ nxt_port_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
      */
     nxt_port_recv_msg_close_fds(msg);
 
-    nxt_port_send_new_port(task, rt, port, msg->port_msg.stream);
+    /*
+     * Retire the start stream, but only once the announcement that answers
+     * it has actually gone out.
+     *
+     * ->stream is the RPC the initiator armed for this start.  While it is
+     * set, nxt_port_remove_notify_others() puts it into the REMOVE_PID that
+     * reports this process's death, and nxt_router_remove_pid_handler()
+     * turns a stream-bearing REMOVE_PID into an RPC_ERROR
+     * (src/nxt_router.c:1128-1133).  That is the right fallback for a start
+     * that never completed, and a liability afterwards: stream identifiers
+     * come from one 32-bit counter that every request also draws on
+     * (src/nxt_router.c:4767), so once it wraps, an ordinary worker exit
+     * would fail whatever live RPC has inherited the number.
+     *
+     * Zeroing on the READY state alone is what this deliberately is not.
+     * The state is set above and the announcement is sent here, and in
+     * between the start RPC has not been retired by anything -- so a
+     * PROCESS_READY whose NEW_PORT could not be written would lose both the
+     * reply and the REMOVE_PID fallback, and leave the initiator waiting
+     * forever.  That is the wedge issue #231 is about, re-entered through a
+     * corner.  Keyed on the send instead, the stream survives exactly the
+     * cases that still need it.  See issue #271.
+     *
+     * nxt_main_process_sigchld_handler() used to do this, later and on the
+     * state; it no longer needs to, and main gets the same treatment here
+     * because it runs the same handler for its own children.
+     */
+    if (nxt_fast_path(nxt_port_send_new_port(task, rt, port,
+                                             msg->port_msg.stream) == NXT_OK))
+    {
+        process->stream = 0;
+    }
 }
 
 
