@@ -1107,6 +1107,11 @@ complete_buf:
         b->next = nxt_http_buf_last(r);
 
     } else {
+        if (nxt_slow_path(n == 0)) {
+            /* file truncated since it was stat(2)'d */
+            nxt_http_request_error_handler(task, r, r->proto.any);
+            goto clean;
+        }
         fb->file_pos += n;
         b->next = NULL;
     }
