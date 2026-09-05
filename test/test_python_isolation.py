@@ -127,6 +127,56 @@ def test_python_isolation_rootfs_no_language_deps(require, temp_dir):
     ), 'language_deps unmount'
 
 
+def test_python_isolation_rootfs_credential_language_deps(
+    is_su, require, temp_dir
+):
+    if not is_su:
+        require(
+            {'features': {'isolation': ['unprivileged_userns_clone', 'user']}}
+        )
+    else:
+        require({'features': {'isolation': ['user']}})
+
+    client.load('empty')
+
+    # A new user namespace without a new mount namespace cannot mount
+    # anything.  With "procfs" and "tmpfs" off the only mounts left are the
+    # language dependencies, which this module always declares (auto/modules/
+    # python emits at least the stdlib directory), so the config still could
+    # never start and must be refused -- naming "language_deps", and only
+    # "language_deps", as the automount to switch off.
+    resp = client.conf(
+        {
+            'rootfs': temp_dir,
+            'namespaces': {'credential': True},
+            'automount': {'procfs': False, 'tmpfs': False},
+        },
+        'applications/empty/isolation',
+    )
+
+    assert 'error' in resp, 'language_deps automount rejected'
+
+    detail = resp.get('detail', '')
+
+    assert '"language_deps": false' in detail, 'detail names the knob'
+    assert 'procfs' not in detail, 'disabled procfs not named'
+    assert 'tmpfs' not in detail, 'disabled tmpfs not named'
+
+    # Nothing left to mount, so the very same config becomes valid.
+    assert 'success' in client.conf(
+        {
+            'rootfs': temp_dir,
+            'namespaces': {'credential': True},
+            'automount': {
+                'procfs': False,
+                'tmpfs': False,
+                'language_deps': False,
+            },
+        },
+        'applications/empty/isolation',
+    ), 'every automount off accepted'
+
+
 def test_python_isolation_procfs(require, temp_dir):
     require({'privileged_user': True})
 
