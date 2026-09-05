@@ -267,6 +267,7 @@ struct nxt_http_request_s {
     uint8_t                         error;        /* 1 bit  */
     uint8_t                         websocket_handshake;  /* 1 bit */
     uint8_t                         chunked;  /* 1 bit */
+    uint8_t                         no_body;  /* 1 bit */
 };
 
 
