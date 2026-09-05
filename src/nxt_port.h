@@ -300,6 +300,14 @@ struct nxt_port_s {
     nxt_mp_t            *mem_pool;
     nxt_event_engine_t  *engine;
 
+    /*
+     * The deferral that carries the last reference drop to port->engine.
+     * Embedded rather than allocated, so that nxt_port_use() has no failure
+     * path -- see the comment there.  Single-instance: only the drop to zero
+     * uses it, and only once.
+     */
+    nxt_work_t          release_work;
+
     nxt_buf_t           *free_bufs;
     nxt_socket_t        pair[2];
 

@@ -18,6 +18,11 @@ static nxt_int_t nxt_port_fail_test_socket_write(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_rpc_register(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_error_handler(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_mp_baseline(nxt_thread_t *thr);
+static nxt_int_t nxt_port_fail_test_cross_engine_release(nxt_thread_t *thr);
+static void nxt_port_fail_test_engine_signal(nxt_event_engine_t *engine,
+    nxt_uint_t signo);
+static void nxt_port_fail_test_released(nxt_task_t *task, void *obj,
+    void *data);
 static nxt_int_t nxt_port_fail_test_sender_pattern(nxt_task_t *task,
     nxt_port_t *port, nxt_mp_t *mp);
 static void nxt_port_fail_test_mp_completion(nxt_task_t *task, void *obj,
@@ -30,6 +35,8 @@ static nxt_int_t nxt_port_fail_test_fd_count(void);
 
 
 static nxt_uint_t  nxt_port_fail_test_completions;
+static nxt_uint_t  nxt_port_fail_test_releases;
+static nxt_uint_t  nxt_port_fail_test_signals;
 
 
 nxt_int_t
@@ -51,6 +58,10 @@ nxt_port_fail_test(nxt_thread_t *thr)
     }
 
     if (nxt_port_fail_test_mp_baseline(thr) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_port_fail_test_cross_engine_release(thr) != NXT_OK) {
         return NXT_ERROR;
     }
 
@@ -577,6 +588,144 @@ nxt_port_fail_test_sender_pattern(nxt_task_t *task, nxt_port_t *port,
     nxt_mp_retain(mp);
 
     return NXT_OK;
+}
+
+
+/*
+ * A last reference dropped from a thread other than port->engine's must be
+ * deferred to that engine, and the deferral must not be able to fail.
+ *
+ * nxt_port_use() used to route the drop through nxt_port_post(), which
+ * nxt_zalloc()s an nxt_port_work_t and returns NXT_ERROR when that fails.
+ * The return value was ignored: use_count was already zero, nothing was
+ * queued, and the port, its memory pool and the process reference it holds
+ * leaked (issue #187).
+ *
+ * There is no allocation-failure injection hook reachable from here, so the
+ * regression is pinned structurally instead: the item that lands on the
+ * foreign engine's locked work queue must be the one embedded in the port.
+ * That is false for any implementation that allocates it, whether or not the
+ * allocation succeeds.  Draining then has to reach nxt_port_release(), which
+ * is observed through a cleanup on the port's own memory pool.
+ */
+
+static nxt_int_t
+nxt_port_fail_test_cross_engine_release(nxt_thread_t *thr)
+{
+    nxt_task_t          *task;
+    nxt_port_t          *port;
+    nxt_work_t          *posted;
+    nxt_event_engine_t  current, foreign;
+
+    task = thr->task;
+    task->thread = thr;
+
+    /*
+     * Two minimal engines: the one this thread runs on, and the port's.
+     * They only have to differ and to carry a work queue; the post path
+     * touches locked_work_queue, event.signal and task.
+     */
+    nxt_memzero(&current, sizeof(current));
+    nxt_work_queue_cache_create(&current.work_queue_cache, 1024);
+    current.fast_work_queue.cache = &current.work_queue_cache;
+    nxt_work_queue_name(&current.fast_work_queue, "fast");
+
+    nxt_memzero(&foreign, sizeof(foreign));
+    foreign.task.thread = thr;
+    foreign.task.log = thr->log;
+
+    /*
+     * Without this stub nxt_event_engine_signal() would fall through to
+     * writing on foreign.pipe, which a bare engine does not have.
+     */
+    foreign.event.signal = nxt_port_fail_test_engine_signal;
+
+    thr->engine = &current;
+
+    port = nxt_port_fail_test_port(task);
+    if (nxt_slow_path(port == NULL)) {
+        goto fail_engine;
+    }
+
+    port->engine = &foreign;
+
+    if (nxt_slow_path(nxt_mp_cleanup(port->mem_pool,
+                                     nxt_port_fail_test_released,
+                                     task, port, NULL) != NXT_OK))
+    {
+        nxt_port_use(task, port, -1);
+        goto fail_engine;
+    }
+
+    nxt_port_fail_test_releases = 0;
+    nxt_port_fail_test_signals = 0;
+
+    posted = &port->release_work;
+
+    nxt_port_use(task, port, -1);
+
+    /* The release must be deferred, not run on this thread. */
+    if (nxt_slow_path(nxt_port_fail_test_releases != 0)) {
+        nxt_log_alert(thr->log, "port fail test: cross-engine release ran "
+                      "on the calling thread");
+        goto fail_engine;
+    }
+
+    if (nxt_slow_path(nxt_port_fail_test_signals != 1)) {
+        nxt_log_alert(thr->log, "port fail test: cross-engine release did "
+                      "not signal the target engine (%ui)",
+                      nxt_port_fail_test_signals);
+        goto fail_engine;
+    }
+
+    /*
+     * The heart of the regression check: an allocated work item would make
+     * this a different pointer, and a failed allocation would leave the
+     * queue empty.
+     */
+    if (nxt_slow_path(foreign.locked_work_queue.head != posted)) {
+        nxt_log_alert(thr->log, "port fail test: the posted item is not the "
+                      "port's embedded release work");
+        goto fail_engine;
+    }
+
+    nxt_locked_work_queue_move(thr, &foreign.locked_work_queue,
+                               &current.fast_work_queue);
+
+    nxt_port_fail_test_drain_wq(&current.fast_work_queue);
+
+    if (nxt_slow_path(nxt_port_fail_test_releases != 1)) {
+        nxt_log_alert(thr->log, "port fail test: draining the target engine "
+                      "did not release the port (%ui)",
+                      nxt_port_fail_test_releases);
+        goto fail_engine;
+    }
+
+    nxt_work_queue_cache_destroy(&current.work_queue_cache);
+    thr->engine = NULL;
+
+    return NXT_OK;
+
+fail_engine:
+
+    nxt_work_queue_cache_destroy(&current.work_queue_cache);
+    thr->engine = NULL;
+
+    return NXT_ERROR;
+}
+
+
+static void
+nxt_port_fail_test_engine_signal(nxt_event_engine_t *engine, nxt_uint_t signo)
+{
+    nxt_port_fail_test_signals++;
+}
+
+
+static void
+nxt_port_fail_test_released(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_port_fail_test_releases++;
 }
 
 

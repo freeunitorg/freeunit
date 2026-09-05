@@ -1153,9 +1153,9 @@ nxt_port_post(nxt_task_t *task, nxt_port_t *port,
 
 
 static void
-nxt_port_release_handler(nxt_task_t *task, nxt_port_t *port, void *data)
+nxt_port_release_work_handler(nxt_task_t *task, void *obj, void *data)
 {
-    /* no op */
+    nxt_port_release(task, obj);
 }
 
 
@@ -1174,6 +1174,40 @@ nxt_port_use(nxt_task_t *task, nxt_port_t *port, int i)
             return;
         }
 
-        nxt_port_post(task, port, nxt_port_release_handler, NULL);
+        /*
+         * The last reference is gone, so the release has to happen on
+         * port->engine -- it frees port->mem_pool, and may drop the port's
+         * process reference, neither of which this thread owns.
+         *
+         * The work item is embedded in the port and posted straight to the
+         * engine rather than routed through nxt_port_post(), which allocates
+         * one with nxt_zalloc() and can return NXT_ERROR.  This call site
+         * has nowhere to put that error: use_count is already zero, so
+         * refusing to defer would leak the port, its memory pool and the
+         * process reference it holds -- unbounded, under exactly the memory
+         * pressure that caused the failure -- while releasing here would
+         * free another engine's memory from this thread, which is what the
+         * deferral exists to prevent.  A deferral that cannot allocate
+         * cannot fail.  This mirrors nxt_runtime_process_release().
+         *
+         * The item is safe to write and to post with no further
+         * synchronisation because use_count reached zero: no other thread
+         * holds a reference through which the port can be reached.  For the
+         * same reason it is used at most once -- a second drop to zero would
+         * mean the port was resurrected after its pool was freed, which is
+         * already a use-after-free on the same-engine path above.
+         *
+         * nxt_locked_work_queue_move() copies the item into the target
+         * engine's work queue before any handler runs, so releasing the pool
+         * the item lives in is safe.
+         */
+
+        port->release_work.handler = nxt_port_release_work_handler;
+        port->release_work.task = &port->engine->task;
+        port->release_work.obj = port;
+        port->release_work.data = NULL;
+        port->release_work.next = NULL;
+
+        nxt_event_engine_post(port->engine, &port->release_work);
     }
 }
