@@ -175,4 +175,7 @@ NXT_EXPORT nxt_int_t nxt_unit_default_init(nxt_task_t *task,
 
 NXT_EXPORT nxt_int_t nxt_app_set_logs(void);
 
+/* Reports a reaped child of the prototype; see nxt_proto_sigchld_handler(). */
+void nxt_proto_child_exited(nxt_task_t *task, nxt_process_t *process);
+
 #endif /* _NXT_APPLICATION_H_INCLIDED_ */

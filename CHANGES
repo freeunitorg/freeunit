@@ -1,4 +1,14 @@
 
+Changes with FreeUnit 1.36.2                                     (unreleased)
+
+    *) Bugfix: prevent application startup failures from leaving requests
+       waiting indefinitely. The main process now replies when it cannot
+       start an application prototype, and a prototype reports a worker that
+       exits before completing the PROCESS_CREATED handshake. In both cases,
+       the pending start is retired, waiting requests receive an error, and
+       later start attempts are no longer blocked.
+
+
 Changes with FreeUnit 1.36.1                                     28 Aug 2026
 
     *) Feature: configuration validation errors now say where they are. A
@@ -1836,4 +1846,3 @@ Changes with Unit 0.2                                            19 Oct 2017
 Changes with Unit 0.1                                            06 Sep 2017
 
     *) First public release.
-

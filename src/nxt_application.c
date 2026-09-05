@@ -669,7 +669,16 @@ nxt_proto_start_process_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     process->user_cred = &rt->user_cred;
 
     process->data.app = nxt_app_conf;
+
+    /*
+     * Remember who to answer, not just which stream: the RPC is registered on
+     * the initiator's port, and by the time this child is reaped the message
+     * that named it is long gone.  nxt_proto_child_exited() is then the only
+     * thing left that can report a child which died before it was announced.
+     */
     process->stream = msg->port_msg.stream;
+    process->stream_pid = msg->port_msg.pid;
+    process->stream_port = msg->port_msg.reply_port;
 
     init->siblings = &nxt_proto_children;
 
@@ -904,9 +913,7 @@ nxt_proto_sigchld_handler(nxt_task_t *task, void *obj, void *data)
             port = nxt_process_port_first(process);
         }
 
-        if (process->state != NXT_PROCESS_STATE_CREATING) {
-            nxt_port_remove_notify_others(task, process);
-        }
+        nxt_proto_child_exited(task, process);
 
         nxt_process_close_ports(task, process);
 
@@ -919,6 +926,143 @@ nxt_proto_sigchld_handler(nxt_task_t *task, void *obj, void *data)
             return;
         }
     }
+}
+
+
+/*
+ * Report a reaped child of the prototype.  Every child is forked to satisfy a
+ * START_PROCESS request, and that request has an RPC handler armed on the
+ * initiator's port; something has to retire it when the child dies or the
+ * initiator waits forever.  This closes the case where the child dies; the
+ * case where the *prototype* dies part-way through an on-demand start is
+ * still open, because the router registers that RPC with no peer
+ * (nxt_router_start_app_process_handler()), so REMOVE_PID for the prototype
+ * recovers nothing.  For the router that also means a leaked
+ * app->pending_processes slot, which makes nxt_router_app_can_start() false
+ * for good once the application's max is reached -- the process never starts
+ * again, and a reload only recovers if the application's own config text
+ * changed.
+ *
+ * A child that got as far as PROCESS_CREATED is reported by REMOVE_PID, which
+ * carries ->stream: nxt_router_remove_pid_handler() turns a stream-bearing
+ * REMOVE_PID into an RPC error.  A child still in the CREATING state cannot be
+ * announced that way.  The pid is the whole content of REMOVE_PID, and until
+ * the PROCESS_CREATED exchange completes the prototype does not necessarily
+ * know a globally valid one: under pid isolation ->pid is still the
+ * namespace-local pid nxt_process_create() got from fork(), and the global pid
+ * only arrives with PROCESS_CREATED (see nxt_proto_process_created_handler()
+ * and 900828cc, which is why such a process is deliberately kept out of the
+ * global pid hash).  Broadcasting that pid would ask every receiver to remove
+ * whatever unrelated process happens to hold it.
+ *
+ * So the gate stays exactly as it was, and the CREATING case is answered
+ * directly instead: an RPC error to the port the start request came from,
+ * addressed by ->stream_pid/->stream_port rather than by any pid of the dead
+ * child.  It is the same message nxt_proto_start_process_handler() sends when
+ * the fork itself fails.
+ *
+ * Answering the initiator is not the whole job, though, because the initiator
+ * is not the only process left holding the child.  A worker that got as far as
+ * WHOAMI made main create a process record and a port for it, with main's end
+ * of the worker's port socket in it (nxt_main_process_whoami_handler()), and
+ * linked that record into the prototype's ->children.  REMOVE_PID is what
+ * retires it -- nxt_proc_remove_notify_matrix pairs a dying APP with MAIN --
+ * so a CREATING child that is only answered on the RPC leaves main holding a
+ * record and an fd until the prototype itself exits.  Before this whole fix
+ * that leak was capped by the wedge: the application stopped starting
+ * processes, so at most one could leak.  Now that the start RPC is retired and
+ * requests retry, a worker that keeps dying in that window costs main one
+ * record and one descriptor per attempt, without bound.
+ *
+ * The pid problem is the same one the gate exists for, so the answer is the
+ * same test the rest of the code already uses for "is this pid a usable global
+ * key": rt->is_pid_isolated, which nxt_process_create() consults to decide
+ * whether a forked child may go into the runtime hash at all.  When it is
+ * clear, the prototype shares main's pid namespace, ->pid is the fork() return
+ * in that namespace, and it is by construction the same number main read from
+ * SCM_CREDENTIALS on the WHOAMI message -- so REMOVE_PID is safe.  The
+ * notification is deliberately made after ->stream has been cleared, so it
+ * carries no stream: the initiator has already been answered directly, and a
+ * stream-bearing REMOVE_PID would make nxt_router_remove_pid_handler() fail
+ * the same RPC a second time.
+ *
+ * Ordering is not a race even though the two messages come from two processes:
+ * the worker's WHOAMI and the prototype's REMOVE_PID are both written to the
+ * single write end of main's port socketpair, inherited by every descendant,
+ * so they share one kernel queue.  The worker's WHOAMI write completes before
+ * it exits, and the prototype writes only after waitpid() has reaped it.  If
+ * the WHOAMI never reached the socket it died with the worker, and main has no
+ * record to retire.
+ *
+ * When rt->is_pid_isolated is set there is no safe pid to send: ->pid is the
+ * namespace-local one, and the global pid main and the router keyed their
+ * records on cannot be derived from it here.  Sending it anyway would ask
+ * every receiver to remove whatever unrelated process holds that number -- and
+ * a prototype's namespace-local counter climbs with each worker it forks, so
+ * it walks into the range the daemon's own pids occupy.  Removing a live
+ * sibling's ports drops requests, which is worse than the leak, so that case
+ * is left alone and logged.
+ *
+ * Closing it belongs on the other side.  The prototype cannot map its
+ * namespace-local pid to a global one, but main can map the other way without
+ * trusting anybody: it holds the global pid from SCM_CREDENTIALS at WHOAMI
+ * time, and the last entry of /proc/<pid>/status NSpid is that process's pid
+ * in its own namespace (Linux 4.1+).  Recording that as a second key, plus a
+ * REMOVE_PID variant scoped to one prototype's children, would close it with
+ * no sender-supplied pid to authenticate.  msg->port_msg.pid on the WHOAMI
+ * message happens to carry the same number, but it is chosen by the sender and
+ * would need the authentication NSpid makes unnecessary.
+ */
+
+void
+nxt_proto_child_exited(nxt_task_t *task, nxt_process_t *process)
+{
+    nxt_port_t     *port;
+    nxt_runtime_t  *rt;
+
+    if (process->state != NXT_PROCESS_STATE_CREATING) {
+        nxt_port_remove_notify_others(task, process);
+
+        return;
+    }
+
+    rt = task->thread->runtime;
+
+    if (process->stream != 0) {
+        port = nxt_runtime_port_find(rt, process->stream_pid,
+                                     process->stream_port);
+        if (nxt_slow_path(port == NULL)) {
+            nxt_alert(task, "app process (isolated %PI) died before it was "
+                            "created and its start initiator %PI port %d is "
+                            "gone", process->isolated_pid, process->stream_pid,
+                      (int) process->stream_port);
+
+        } else {
+            (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
+                                         -1, process->stream, 0, NULL);
+        }
+
+        /*
+         * One answer per start request: nxt_port_rpc_handler() drops a stream
+         * it no longer knows, but the identifiers come from a shared counter
+         * and are reused, so a second error for a retired stream could land on
+         * somebody else's RPC.  Cleared even when the initiator is gone, so
+         * that the REMOVE_PID below is streamless either way.
+         */
+        process->stream = 0;
+    }
+
+    if (nxt_slow_path(rt->is_pid_isolated)) {
+        nxt_alert(task, "app process (isolated %PI) died before it was "
+                        "created; any record the main or router process made "
+                        "for it cannot be retired without a global pid and "
+                        "is held until the prototype exits",
+                  process->isolated_pid);
+
+        return;
+    }
+
+    nxt_port_remove_notify_others(task, process);
 }
 
 
