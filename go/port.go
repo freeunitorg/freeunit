@@ -215,6 +215,29 @@ func nxt_go_port_send(pid C.int, id C.int, buf unsafe.Pointer, buf_size C.int,
 	return C.ssize_t(n)
 }
 
+// closeUnixRights closes every descriptor an SCM_RIGHTS block carries.  It is
+// used on paths that refuse a message after the kernel has already installed
+// its descriptors, where nothing else will ever see them.  Parse failures are
+// ignored deliberately: the block is known to be damaged, and whatever can
+// still be read out of it is worth closing.
+func closeUnixRights(oob []byte) {
+	msgs, err := syscall.ParseSocketControlMessage(oob)
+	if err != nil {
+		return
+	}
+
+	for _, m := range msgs {
+		fds, err := syscall.ParseUnixRights(&m)
+		if err != nil {
+			continue
+		}
+
+		for _, fd := range fds {
+			syscall.Close(fd)
+		}
+	}
+}
+
 //export nxt_go_port_recv
 func nxt_go_port_recv(pid C.int, id C.int, buf unsafe.Pointer, buf_size C.int,
 	oob unsafe.Pointer, oob_size *C.size_t) C.ssize_t {
@@ -240,8 +263,35 @@ func nxt_go_port_recv(pid C.int, id C.int, buf unsafe.Pointer, buf_size C.int,
 		return 0
 	}
 
-	n, oobn, _, _, err := p.rcv.ReadMsgUnix(GoBytes(buf, buf_size),
+	n, oobn, flags, _, err := p.rcv.ReadMsgUnix(GoBytes(buf, buf_size),
 		GoBytes(oob, oob_capacity))
+
+	// The control data was cut short, so a descriptor this message was
+	// meant to carry may not be here; libunit would take its fd-less path
+	// on a message that otherwise looks whole.  The callback reports a
+	// length rather than msg_flags, so there is no way to hand the
+	// truncation across as such: report it as a read error, which
+	// nxt_unit_port_recv() turns into NXT_UNIT_ERROR before it parses any
+	// control data.  This is the one place the Go wrapper can see
+	// MSG_CTRUNC at all -- ReadMsgUnix is what consumed it.
+	if err == nil && flags&syscall.MSG_CTRUNC != 0 {
+		// Truncation does not imply that nothing was delivered:
+		// scm_detach_fds() installs the descriptors that fit and only
+		// then raises MSG_CTRUNC.  Those are open in this process
+		// already, and reporting an error leaves *oob_size at 0, so
+		// libunit never parses the block and never closes them --
+		// a descriptor leak under exactly the pressure that caused
+		// the truncation.  Close them here instead; best effort,
+		// since a block the kernel cut may not parse.
+		if oobn > 0 {
+			closeUnixRights(GoBytes(oob, C.int(oobn)))
+		}
+
+		nxt_go_alert("control data truncated on a %d byte message; "+
+			"message dropped", n)
+
+		return C.ssize_t(-1)
+	}
 
 	if err != nil {
 		if nerr, ok := err.(*net.OpError); ok {
