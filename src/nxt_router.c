@@ -1377,6 +1377,26 @@ nxt_router_conf_wait(nxt_task_t *task, void *obj, void *data)
 }
 
 
+/*
+ * Hand a joint job's temporary configuration reference back to the
+ * configuration thread.  Resetting work.next is not optional: the job was
+ * chained on recf->jobs when it was built, and posting a work item that still
+ * points at its old neighbour silently splices that neighbour into the target
+ * engine's locked queue.  The job must not be touched after the post -- the
+ * configuration thread may run nxt_router_conf_wait() and release the pool the
+ * job lives in at any point from here on.
+ */
+
+nxt_inline void
+nxt_router_conf_wait_post(nxt_joint_job_t *job)
+{
+    job->work.next = NULL;
+    job->work.handler = nxt_router_conf_wait;
+
+    nxt_event_engine_post(job->tmcf->engine, &job->work);
+}
+
+
 static void
 nxt_router_conf_ready(nxt_task_t *task, nxt_router_temp_conf_t *tmcf)
 {
@@ -3670,9 +3690,15 @@ nxt_router_engine_quit(nxt_router_temp_conf_t *tmcf,
     job->task = tmcf->engine->task;
     job->work.handler = nxt_router_worker_thread_quit;
     job->work.task = &job->task;
-    job->work.obj = NULL;
+    job->work.obj = job;
     job->work.data = NULL;
-    job->tmcf = NULL;
+    job->tmcf = tmcf;
+
+    /*
+     * The job outlives this call on the target engine's locked queue, so hold
+     * the pool it lives in, as the joints create/delete jobs do.
+     */
+    tmcf->count++;
 
     return NXT_OK;
 }
@@ -3963,10 +3989,7 @@ nxt_router_listen_socket_create(nxt_task_t *task, void *obj, void *data)
     ls->count++;
     nxt_thread_spin_unlock(lock);
 
-    job->work.next = NULL;
-    job->work.handler = nxt_router_conf_wait;
-
-    nxt_event_engine_post(job->tmcf->engine, &job->work);
+    nxt_router_conf_wait_post(job);
 }
 
 
@@ -4017,10 +4040,7 @@ nxt_router_listen_socket_update(nxt_task_t *task, void *obj, void *data)
     lev->socket.data = joint;
     lev->listen = joint->socket_conf->listen;
 
-    job->work.next = NULL;
-    job->work.handler = nxt_router_conf_wait;
-
-    nxt_event_engine_post(job->tmcf->engine, &job->work);
+    nxt_router_conf_wait_post(job);
 
     /*
      * The task is allocated from configuration temporary
@@ -4063,16 +4083,27 @@ nxt_router_listen_socket_delete(nxt_task_t *task, void *obj, void *data)
 static void
 nxt_router_worker_thread_quit(nxt_task_t *task, void *obj, void *data)
 {
+    nxt_joint_job_t     *job;
     nxt_event_engine_t  *engine;
 
     nxt_debug(task, "router worker thread quit");
+
+    job = obj;
 
     engine = task->thread->engine;
 
     engine->shutdown = 1;
 
+    /*
+     * Give the reference nxt_router_engine_quit() took back.  The task this
+     * handler was called with is allocated from the same pool as the job, so
+     * the exit below has to continue on the engine's own task.
+     */
+
+    nxt_router_conf_wait_post(job);
+
     if (nxt_queue_is_empty(&engine->joints)) {
-        nxt_router_worker_thread_exit(task);
+        nxt_router_worker_thread_exit(&engine->task);
     }
 }
 
@@ -4196,10 +4227,7 @@ nxt_router_listen_socket_close_ready(nxt_socket_conf_joint_t *joint)
 
     joint->close_job = NULL;
 
-    job->work.next = NULL;
-    job->work.handler = nxt_router_conf_wait;
-
-    nxt_event_engine_post(job->tmcf->engine, &job->work);
+    nxt_router_conf_wait_post(job);
 }
 
 

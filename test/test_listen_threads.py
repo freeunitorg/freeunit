@@ -103,3 +103,44 @@ def test_listen_threads_engine_fds():
         f'router leaked {after - before} descriptors over a listen_threads'
         f' {THREADS} -> 1 -> {THREADS} cycle ({before} before, {after} after)'
     )
+
+
+def test_listen_threads_shrink_grow_no_listeners():
+    # nxt_router_engine_quit() allocates its nxt_joint_job_t (the nxt_work_t
+    # *and* the nxt_task_t the work item points at) from tmcf->mem_pool but
+    # used to take no tmcf->count reference, so nxt_router_conf_ready() could
+    # release the pool while the job was still sitting on the dying engine's
+    # locked work queue.  The window is widest with no listeners configured:
+    # engine->joints is then empty, so nxt_router_worker_thread_quit() is the
+    # only thing standing between the post and nxt_thread_exit(), and there is
+    # no listen-socket delete job on the same queue to serialise behind.
+    #
+    # Each PUT is asserted, so a "Value doesn't exist." reply is never counted
+    # as a clean cycle, and the router pid is compared every cycle because the
+    # control API only reports the failed apply of the crashed generation, not
+    # the crash itself.
+    #
+    # 50 cycles, not fewer: the per-cycle crash probability is only ~3%, so the
+    # count is what buys the detection rate.  Measured on master, 10 runs each:
+    # 50 cycles caught it 8 times in 1.2 s per run, 20 cycles 4 times in 0.8 s.
+    # Halving the detection to save 0.4 s is not a trade worth making; the run
+    # time here is dominated by pytest and unitd start-up either way.
+    assert 'success' in client.conf(
+        {
+            "listeners": {},
+            "routes": [{"action": {"return": 200}}],
+        }
+    )
+
+    pid = pid_by_name('unit: router')
+
+    for i in range(50):
+        for threads in (8, 4, 8):
+            assert 'success' in client.conf(
+                {"listen_threads": threads}, 'settings'
+            ), f'cycle {i}: listen_threads {threads}'
+
+        assert pid_by_name('unit: router') == pid, (
+            f'router restarted during cycle {i}: the engine-quit job was'
+            ' freed with tmcf->mem_pool before the dying engine drained it'
+        )
