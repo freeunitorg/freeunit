@@ -11,6 +11,14 @@ prerequisites = {'modules': {'python': 'any'}}
 
 client = Control()
 
+# Pinned rather than inherited from the runner: test_listeners_close_before_reply
+# reads the ordering of records written by several router engines, and
+# "listen_threads" defaults to nxt_ncpu (src/nxt_router.c), so on a one-vCPU
+# runner there is a single engine and the assertions reduce to one thread's
+# program order -- still passing, but no longer testing the interleaving they
+# are written for.  Same name and value as the other suites that pin it.
+LISTEN_THREADS = 4
+
 
 def try_addr(addr):
     return client.conf(
@@ -377,6 +385,7 @@ def test_listeners_port_release():
 def test_listeners_close_before_reply(findall):
     assert 'success' in client.conf(
         {
+            "settings": {"listen_threads": LISTEN_THREADS},
             "listeners": {"127.0.0.1:8080": {"pass": "routes"}},
             "routes": [],
         }
@@ -397,7 +406,11 @@ def test_listeners_close_before_reply(findall):
     pos = len(Log.read())
 
     assert 'success' in client.conf(
-        {"listeners": {}, "applications": {}}
+        {
+            "settings": {"listen_threads": LISTEN_THREADS},
+            "listeners": {},
+            "applications": {},
+        }
     ), 'listener removed'
 
     # The reply is the barrier that makes the tail complete rather than
