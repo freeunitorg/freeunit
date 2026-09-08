@@ -22,9 +22,9 @@
       {"version": "2023", "eol": "2029-06", "supported_until": "2032-06", "default_python": "3.11"}
     ],
     "ubuntu": [
-      {"version": "22.04", "eol": "2027-04", "supported_until": "2030-04", "default_python": "3.10", "lts": true},
+      {"version": "22.04", "eol": "2027-06", "supported_until": "2030-06", "default_python": "3.10", "lts": true},
       {"version": "24.04", "eol": "2029-05", "supported_until": "2032-05", "default_python": "3.12", "lts": true},
-      {"version": "26.04", "eol": "2031-04", "supported_until": "2034-04", "default_python": "3.13", "lts": true}
+      {"version": "26.04", "eol": "2031-05", "supported_until": "2034-05", "default_python": "3.13", "lts": true}
     ],
     "debian": [
       {"version": "11", "eol": "2024-08", "supported_until": "2027-08", "default_python": "3.9",  "codename": "bullseye", "note": "EOL"},

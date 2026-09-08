@@ -48,9 +48,9 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | CentOS Stream | 10 | 2030-05 | 2033-05 | 3.13 |
 | Amazon Linux | 2 (EOL) † | 2026-06 | 2029-06 | 3.7 ‡ |
 | Amazon Linux | 2023 | 2029-06 | 2032-06 | 3.11 |
-| Ubuntu (LTS) | 22.04 | 2027-04 | 2030-04 | 3.10 |
+| Ubuntu (LTS) | 22.04 | 2027-06 | 2030-06 | 3.10 |
 | Ubuntu (LTS) | 24.04 | 2029-05 | 2032-05 | 3.12 |
-| Ubuntu (LTS) | 26.04 | 2031-04 | 2034-04 | 3.13 |
+| Ubuntu (LTS) | 26.04 | 2031-05 | 2034-05 | 3.13 |
 | Debian | 11 (bullseye) (EOL) † | 2024-08 | 2027-08 | 3.9 |
 | Debian | 12 (bookworm) (EOL) † | 2026-07 | 2029-07 | 3.11 |
 | Debian | 13 (trixie) | 2028-08 | 2031-08 | 3.13 |
