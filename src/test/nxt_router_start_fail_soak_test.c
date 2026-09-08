@@ -45,21 +45,6 @@
 static nxt_app_t  nxt_router_start_fail_soak_test_app;
 
 
-/*
- * Mirrors the nxt_inline nxt_router_app_can_start() predicate in
- * src/nxt_router.c:1218.  Being nxt_inline, the gate #214 wedges is private
- * to the router's translation unit and cannot be called from here, so this
- * copy must be kept in sync with it.
- */
-
-static nxt_bool_t
-nxt_router_start_fail_soak_can_start(nxt_app_t *app)
-{
-    return app->processes + app->pending_processes < app->max_processes
-           && app->pending_processes < app->max_pending_processes;
-}
-
-
 nxt_int_t
 nxt_router_start_fail_soak_test(nxt_thread_t *thr)
 {
@@ -255,7 +240,7 @@ nxt_router_start_fail_soak_test(nxt_thread_t *thr)
     app->conf.length = 0;
     app->proto_port = dport;
 
-    if (!nxt_router_start_fail_soak_can_start(app)) {
+    if (!nxt_router_app_can_start(app)) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start fail soak test: app cannot start after "
                       "%d failures, processes %uD pending %uD",

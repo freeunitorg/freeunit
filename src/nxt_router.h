@@ -159,6 +159,22 @@ struct nxt_app_s {
 };
 
 
+/*
+ * The gate on every application start.  It lives here rather than in
+ * src/nxt_router.c so that the regression tests which turn on it -- the ones
+ * for the pending_processes accounting, #214 and #269 -- can call the very
+ * predicate the router uses instead of keeping a copy that silently drifts
+ * from it.
+ */
+
+nxt_inline nxt_bool_t
+nxt_router_app_can_start(nxt_app_t *app)
+{
+    return app->processes + app->pending_processes < app->max_processes
+            && app->pending_processes < app->max_pending_processes;
+}
+
+
 typedef struct {
     size_t                 max_frame_size;
     nxt_msec_t             read_timeout;
