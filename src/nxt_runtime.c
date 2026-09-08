@@ -1563,8 +1563,9 @@ nxt_current_directory(nxt_mp_t *mp)
 static nxt_int_t
 nxt_runtime_pid_file_create(nxt_task_t *task, nxt_file_name_t *pid_file)
 {
-    ssize_t     length;
-    nxt_int_t   n;
+    size_t      size, written;
+    ssize_t     n;
+    nxt_int_t   ret;
     nxt_file_t  file;
     u_char      pid[NXT_INT64_T_LEN + nxt_length("\n")];
 
@@ -1574,17 +1575,35 @@ nxt_runtime_pid_file_create(nxt_task_t *task, nxt_file_name_t *pid_file)
 
     nxt_fs_mkdir_p_dirname(pid_file, 0755);
 
-    n = nxt_file_open(task, &file, O_WRONLY, O_CREAT | O_TRUNC,
-                      NXT_FILE_DEFAULT_ACCESS);
+    ret = nxt_file_open(task, &file, O_WRONLY, O_CREAT | O_TRUNC,
+                        NXT_FILE_DEFAULT_ACCESS);
 
-    if (n != NXT_OK) {
+    if (ret != NXT_OK) {
         return NXT_ERROR;
     }
 
-    length = nxt_sprintf(pid, pid + sizeof(pid), "%PI%n", nxt_pid) - pid;
+    size = nxt_sprintf(pid, pid + sizeof(pid), "%PI%n", nxt_pid) - pid;
 
-    if (nxt_file_write(&file, pid, length, 0) != length) {
-        return NXT_ERROR;
+    /*
+     * pwrite() may store less than it was asked for, so resume from where it
+     * stopped rather than report a short write as a failure.  A zero return
+     * carries no errno and cannot make progress, so it ends the loop.
+     */
+
+    for (written = 0; written < size; written += n) {
+        n = nxt_file_write(&file, pid + written, size - written, written);
+
+        if (nxt_slow_path(n <= 0)) {
+            /* nxt_file_write() logs the errno; a zero return has none. */
+            if (n == 0) {
+                nxt_alert(task, "write(\"%FN\") stored %uz of %uz bytes",
+                          file.name, written, size);
+            }
+
+            nxt_file_close(task, &file);
+
+            return NXT_ERROR;
+        }
     }
 
     nxt_file_close(task, &file);
