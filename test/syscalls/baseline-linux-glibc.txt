@@ -20,8 +20,11 @@ epoll_wait
 eventfd2
 execve
 exit_group
+fchmod
+fchown
 fcntl
 fstat
+fsync
 ftruncate
 getdents64
 getegid

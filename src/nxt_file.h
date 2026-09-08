@@ -141,10 +141,43 @@ NXT_EXPORT nxt_int_t nxt_file_openat2(nxt_task_t *task, nxt_file_t *file,
 
 #endif /* NXT_HAVE_OPENAT2 */
 
+/*
+ * O_DIRECTORY, where the platform has it, keeps nxt_file_dir_sync() from
+ * opening something that is not a directory.  It is not in POSIX, so the
+ * flag is optional.
+ */
+#if defined(O_DIRECTORY)
+#define NXT_FILE_DIR_SYNC_FLAGS     O_DIRECTORY
+#else
+#define NXT_FILE_DIR_SYNC_FLAGS     0
+#endif
+
+
+/*
+ * O_NOFOLLOW, where the platform has it, keeps a create from opening a
+ * symbolic link left in place of the file.  O_EXCL already refuses one --
+ * POSIX has open() fail when O_CREAT and O_EXCL are set and the path names
+ * a link -- so this is the belt to that pair of braces, and optional.
+ */
+#if defined(O_NOFOLLOW)
+#define NXT_FILE_NOFOLLOW           O_NOFOLLOW
+#else
+#define NXT_FILE_NOFOLLOW           0
+#endif
+
+
 /* The file creation modes. */
 #define NXT_FILE_CREATE_OR_OPEN     O_CREAT
 #define NXT_FILE_OPEN               0
 #define NXT_FILE_TRUNCATE           (O_CREAT | O_TRUNC)
+
+/*
+ * Create the file or fail: never open something that is already there, and
+ * never follow a link to it.  For a path an unprivileged user could have
+ * got to first -- see nxt_main_file_store().
+ */
+#define NXT_FILE_CREATE_EXCLUSIVE                                             \
+    (O_CREAT | O_EXCL | NXT_FILE_NOFOLLOW)
 
 /* The file access rights. */
 #define NXT_FILE_DEFAULT_ACCESS     0644
@@ -181,6 +214,17 @@ NXT_EXPORT nxt_int_t nxt_file_chown(nxt_file_name_t *name, const char *owner,
     const char *group);
 NXT_EXPORT nxt_int_t nxt_file_rename(nxt_file_name_t *old_name,
     nxt_file_name_t *new_name);
+
+/*
+ * Flush an open file, respectively a directory named by path, to stable
+ * storage.  A durable replace is: write the temporary file, nxt_file_sync()
+ * it, nxt_file_rename() it over the destination, then nxt_file_dir_sync()
+ * the directory that holds them -- without the last step the rename itself
+ * may not survive a power loss.
+ */
+NXT_EXPORT nxt_int_t nxt_file_sync(nxt_task_t *task, nxt_file_t *file);
+NXT_EXPORT nxt_int_t nxt_file_dir_sync(nxt_task_t *task,
+    nxt_file_name_t *name);
 
 NXT_EXPORT nxt_int_t nxt_fd_nonblocking(nxt_task_t *task, nxt_fd_t fd);
 NXT_EXPORT nxt_int_t nxt_fd_blocking(nxt_task_t *task, nxt_fd_t fd);

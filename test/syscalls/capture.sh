@@ -156,6 +156,23 @@ done
 grep -q 'syscall drift canary' "$WORK/body.txt" \
     || die "served body is not the canary file"
 
+# A second PUT, so the capture covers storing over state files that already
+# exist.  The first one writes conf.json and version into an empty statedir,
+# where nxt_main_file_store_inherit() finds no destination and returns before
+# it reads or copies anything -- so a single PUT never reaches the fchmod()
+# and fchown() that carry a destination's mode and ownership onto its
+# replacement, and the syscalls of the most privileged path in the store
+# would be invisible to this gate.  The settings block is here only to make
+# the configuration differ from the one above; the listener and routes are
+# untouched, so the canary served above still describes what is running.
+sed -e 's/^{$/{\n    "settings": {"http": {"header_read_timeout": 30}},/' \
+    "$WORK/config.json" > "$WORK/config2.json"
+
+curl -sS --fail --max-time 10 --unix-socket "$SOCK" \
+    -X PUT --data-binary "@$WORK/config2.json" \
+    http://localhost/config >"$WORK/put2.log" 2>&1 \
+    || { cat "$WORK/put2.log" >&2; die "the second configuration was rejected"; }
+
 # Stop the daemon and let it run its teardown path *inside* the trace, so
 # shutdown syscalls are part of the captured set.  Signal unitd, not strace
 # (see unit_pid above), then wait for strace itself to reap and flush.

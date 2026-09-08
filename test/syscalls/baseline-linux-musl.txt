@@ -18,9 +18,12 @@ epoll_pwait
 eventfd2
 execve
 exit_group
+fchmod
+fchown
 fcntl
 fork
 fstat
+fsync
 ftruncate
 futex
 getdents64
@@ -33,6 +36,7 @@ getsockopt
 gettid
 ioctl
 listen
+lstat
 membarrier
 mkdir
 mmap
