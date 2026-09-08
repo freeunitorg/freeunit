@@ -8,6 +8,7 @@ access
 arch_prctl
 bind
 brk
+capset
 chmod
 clone
 clone3

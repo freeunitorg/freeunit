@@ -7,6 +7,7 @@ accept4
 arch_prctl
 bind
 brk
+capset
 chmod
 clone
 close

@@ -991,6 +991,39 @@ nxt_process_created_ok(nxt_task_t *task, nxt_port_recv_msg_t *msg, void *data)
     init = nxt_process_init(process);
 
     ret = nxt_process_apply_creds(task, process);
+
+    if (nxt_slow_path(ret == NXT_DECLINED)) {
+        /*
+         * capset() is filtered and nxt_capability_still_held() found
+         * this process carrying capabilities because of it, or could
+         * not establish that it is not.  Only a prototype reaches
+         * nxt_process_created_ok(): the core processes set
+         * NXT_PROCESS_STATE_READY in nxt_process_core_setup() and never
+         * send PROCESS_CREATED, and an application worker never sends
+         * one either, because nxt_app_setup() returns init->start()
+         * directly and that call does not come back with NXT_OK.  The
+         * entire remaining job of a prototype is to fork workers that
+         * would inherit those sets.  Refuse the start
+         * instead, and say which syscall and which consequence, so the
+         * operator's next step is to allow capset() rather than to
+         * hunt for a broken application.
+         *
+         * The refusal is visible: this exits nonzero, main's SIGCHLD
+         * reaper notifies the router with the start's stream still
+         * attached (main zeroes ->stream only at state READY, and its
+         * copy of a prototype that died here is still CREATED), the
+         * router turns that REMOVE_PID into an RPC error for the start
+         * attempt, and the requests waiting on the application are
+         * answered 503 rather than left to time out.
+         */
+
+        nxt_alert(task, "%s refused to start: capset() is denied, so the "
+                  "capabilities this process holds cannot be dropped and "
+                  "would be inherited by application code", process->name);
+
+        goto fail;
+    }
+
     if (nxt_slow_path(ret != NXT_OK)) {
         goto fail;
     }
@@ -1039,7 +1072,24 @@ nxt_process_core_setup(nxt_task_t *task, nxt_process_t *process)
     nxt_int_t  ret;
 
     ret = nxt_process_apply_creds(task, process);
-    if (nxt_slow_path(ret != NXT_OK)) {
+
+    /*
+     * NXT_DECLINED -- capset() filtered, capabilities still held -- is
+     * warn-and-continue here, unlike on the nxt_process_created_ok()
+     * path.  This is the router, the controller and discovery: they run
+     * no application code, so there is nothing to inherit what they
+     * keep, and refusing costs far more than it buys.  Router and
+     * controller declare .restart = 1 and nxt_main_process_sigchld_
+     * handler() re-forks them immediately and without backoff, so a
+     * filter that denies every attempt would spin a respawn loop
+     * instead of reporting anything; discovery's row in
+     * nxt_proc_remove_notify_matrix is all zeroes and it is the main
+     * process's only startup action, so its death would leave unitd up
+     * with no modules, no control socket and no error.
+     * nxt_capability_drop() has already logged the warning.
+     */
+
+    if (nxt_slow_path(ret != NXT_OK && ret != NXT_DECLINED)) {
         return NXT_ERROR;
     }
 
@@ -1128,7 +1178,23 @@ nxt_process_apply_creds(nxt_task_t *task, nxt_process_t *process)
     }
 #endif
 
-    return NXT_OK;
+    /*
+     * Last: nothing after this point in any child needs a capability,
+     * and everything before it might.  PR_SET_NO_NEW_PRIVS above stops
+     * this process *gaining* privilege across execve(); it does not
+     * take away what the process already carries, and fork() copies
+     * every capability set verbatim, so a unitd that was granted
+     * capabilities would otherwise pass them straight to application
+     * code.  Main never calls apply_creds() and so never drops -- it
+     * binds listeners on every reconfiguration.
+     *
+     * Its NXT_DECLINED -- a filtered capset(), sets still full -- is
+     * passed through rather than folded into either NXT_OK or
+     * NXT_ERROR, because the two callers answer it differently: see
+     * nxt_process_created_ok() and nxt_process_core_setup().
+     */
+
+    return nxt_capability_drop(task);
 }
 
 

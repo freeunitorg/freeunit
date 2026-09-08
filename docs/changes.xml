@@ -18,9 +18,45 @@ seccomp profile -- made a non-root unitd fail to start with "failed to get
 process capabilities".  Unit now warns and runs without assuming any
 capability: user and group switching and "rootfs" isolation are disabled
 for applications that do not enable the "credential" namespace, and
-applications run as unitd's own uid.  Capabilities the process may
-still hold are not dropped, since Unit does not call capset().  Every
-other capget() failure remains fatal.
+applications run as unitd's own uid.  Every other capget() failure
+remains fatal.
+</para>
+</change>
+
+<change type="security">
+<para>
+application processes no longer inherit unitd's capabilities.  A unitd
+started as a non-root user that had been granted capabilities -- systemd
+"AmbientCapabilities=", file capabilities -- passed them through fork()
+to every application it ran, because switching between two nonzero uids
+does not clear them and a filtered capget() skips the switch entirely.
+Each forked process now empties its permitted, effective, inheritable
+and ambient sets once its credentials are final, before the worker
+serves any request.  The language module's own startup still runs before
+the drop: the mount, pivot_root and chroot work for "rootfs" isolation
+happens after it and needs the capabilities that are being given up.
+Where a syscall filter denies capset() as well, an application start is
+now refused rather than allowed to proceed with capabilities still held:
+the request is answered 503 and the log names the denied syscall.  A
+process with an empty permitted, effective and ambient set -- which is
+every process of a root unitd once it has switched away from uid 0, and
+every process of an unprivileged one that was granted no capabilities --
+keeps behaving as before, since there is nothing an application could
+have inherited from it.  Its inheritable set is emptied as well, which
+on its own is not counted and grants nothing without an execve() of a
+file carrying a matching capability.  The main process is
+unchanged, since it needs CAP_NET_BIND_SERVICE to bind listening sockets
+on every reconfiguration; the router, controller and discovery processes
+warn and carry on rather than refuse, because they run no application
+code.  Applications configured with "user": "root" are also unchanged,
+since a root process regains capabilities on the next execve() anyway.
+One configuration does lose something it previously kept: an application
+in a "credential" namespace began with a full capability set inside that
+namespace, because the default uid_map maps unitd's euid to the
+application's uid, so the setuid() is not a transition out of uid 0 and
+nothing cleared it.  Those capabilities were valid only inside the
+namespace and Unit's own use of them is finished before the drop, but an
+application that relied on them now needs "user": "root".
 </para>
 </change>
 

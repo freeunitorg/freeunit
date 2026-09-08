@@ -33,6 +33,41 @@
  * no child could have written to proves nothing about what the
  * children did.
  *
+ * NXT_TEST_CAPSET_RECORD does the same for capset(2).  That is how the
+ * test observes nxt_capability_drop(): the drop has no visible effect
+ * in a suite that runs without any capability to drop, so "the app has
+ * no capabilities" would pass just as well without the code.  Which
+ * *processes* called capset() is the part that cannot pass by
+ * accident: main must never appear (it keeps CAP_NET_BIND_SERVICE for
+ * bind()), the prototype must, and the application worker must not,
+ * because it inherits the prototype's already-emptied sets rather than
+ * dropping again.
+ *
+ * NXT_TEST_CAPGET_HOLD is the other direction: a hex mask that makes
+ * capget(2) *succeed* and report that mask in the permitted, effective
+ * and inheritable sets of the first data element.  The suite runs as an
+ * ordinary user with no capabilities, so without it there is nothing to
+ * refuse over -- nxt_capability_still_held() would correctly answer
+ * "empty" and the refusal below would never fire.  Faking the answer is
+ * what lets an unprivileged pytest reach the code the harness smoke test
+ * reaches with real ambient capabilities.
+ *
+ * The mask the test passes is CAP_NET_BIND_SERVICE, deliberately: main's
+ * own capget() sees it too, and nxt_capability_specific_set() only looks
+ * for CAP_SETUID, CAP_SETGID and CAP_SYS_CHROOT, so unitd still starts
+ * and behaves exactly like the unprivileged process it really is.  A
+ * mask containing CAP_SETUID would make it attempt a setuid() it cannot
+ * perform.
+ *
+ * NXT_TEST_CAPSET_ERRNO makes capset(2) fail the same way, which is
+ * the other half of a "SystemCallFilter=" allowlist: a profile that
+ * omits capget() almost always omits capset() too.  The call is still
+ * recorded before it is failed, so the record says who *tried*.  Unit
+ * answers that differently per process -- a prototype refuses to start
+ * rather than fork workers that would inherit what it could not drop,
+ * while the router, controller and discovery warn and carry on -- so
+ * the test needs to be able to produce it.
+ *
  * Build:
  *     cc -shared -fPIC -o capget_filter.so capget_filter.c -ldl
  */
@@ -49,6 +84,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <linux/capability.h>
+
 /*
  * glibc declares syscall() variadic, but it is an assembly stub that
  * only moves registers: it never walks a va_list, so calling it
@@ -59,7 +96,10 @@ typedef long (*nxt_syscall_fn)(long, long, long, long, long, long, long);
 
 static nxt_syscall_fn  nxt_real_syscall;
 static int             nxt_capget_errno;   /* 0: filter disabled */
+static int             nxt_capset_errno;   /* 0: filter disabled */
+static unsigned        nxt_capget_hold;    /* 0: report the real sets */
 static char           *nxt_record_path;    /* strdup()ed, see above */
+static char           *nxt_capset_record_path;
 
 
 static void
@@ -75,10 +115,28 @@ nxt_shim_init(void)
         nxt_capget_errno = (int) strtol(value, NULL, 10);
     }
 
+    value = getenv("NXT_TEST_CAPSET_ERRNO");
+
+    if (value != NULL && *value != '\0') {
+        nxt_capset_errno = (int) strtol(value, NULL, 10);
+    }
+
+    value = getenv("NXT_TEST_CAPGET_HOLD");
+
+    if (value != NULL && *value != '\0') {
+        nxt_capget_hold = (unsigned) strtoul(value, NULL, 16);
+    }
+
     value = getenv("NXT_TEST_CAPGET_RECORD");
 
     if (nxt_record_path == NULL && value != NULL && *value != '\0') {
         nxt_record_path = strdup(value);
+    }
+
+    value = getenv("NXT_TEST_CAPSET_RECORD");
+
+    if (nxt_capset_record_path == NULL && value != NULL && *value != '\0') {
+        nxt_capset_record_path = strdup(value);
     }
 }
 
@@ -92,12 +150,12 @@ nxt_shim_ctor(void)
 
 
 static void
-nxt_shim_record(void)
+nxt_shim_record(const char *path)
 {
     int   fd, len;
     char  buf[32];
 
-    if (nxt_record_path == NULL) {
+    if (path == NULL) {
         return;
     }
 
@@ -106,7 +164,7 @@ nxt_shim_record(void)
      * syscall(), so this cannot recurse back into the shim.
      */
 
-    fd = open(nxt_record_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
 
     if (fd < 0) {
         return;
@@ -149,6 +207,36 @@ syscall(long number, ...)
      * Reading six arguments when the caller passed fewer yields
      * garbage in the unused ones, which the kernel ignores for every
      * syscall that does not declare them.
+     *
+     * ISO C calls that undefined (C17 7.16.1.1p2: va_arg with no
+     * actual next argument), and there is no portable fix -- a
+     * variadic forwarder cannot learn its own argument count, and
+     * re-declaring syscall() with a fixed prototype only trades this
+     * undefined behaviour for calling a function through an
+     * incompatible type.  It is left as-is deliberately, because the
+     * concrete behaviour is the one every implementation already
+     * depends on:
+     *
+     *   - glibc's syscall() is an assembly stub that unconditionally
+     *     moves six argument registers, and musl's is a fixed
+     *     seven-parameter C function.  Neither ever walks a va_list,
+     *     so both read exactly the slots this reads.
+     *   - The slots read are always mapped memory, on every ABI Unit
+     *     builds for.  On x86-64 SysV the first five come from the
+     *     register save area gcc/clang spill at entry and the sixth
+     *     from the caller's own frame via overflow_arg_area; on
+     *     aarch64 all seven fit the eight-register save area; on
+     *     32-bit ABIs the excess reads land in the caller's frame.
+     *     None of them can fault, and none of them is used: only
+     *     `number` decides what happens below.
+     *
+     * Whether the shim should install a real seccomp filter instead
+     * was weighed and rejected: a filter needs PR_SET_NO_NEW_PRIVS,
+     * after which it is inherited across both fork() and execve(), so
+     * every unitd child would see capget() fail too -- and the record
+     * file below, whose whole value is showing that only main was
+     * affected, could no longer say anything.  It would also filter
+     * capset() in the children, which is the call the drop depends on.
      */
 
     va_start(ap, number);
@@ -162,9 +250,45 @@ syscall(long number, ...)
 
 #ifdef SYS_capget
     if (number == SYS_capget && nxt_capget_errno != 0) {
-        nxt_shim_record();
+        nxt_shim_record(nxt_record_path);
         errno = nxt_capget_errno;
         return -1;
+    }
+
+    /*
+     * Only when a data pointer was passed: nxt_capability_linux_get_
+     * version() calls capget() with NULL to have the kernel rewrite the
+     * header, and answering that one locally would leave the header
+     * untouched and change what Unit thinks the kernel supports.
+     */
+    if (number == SYS_capget && nxt_capget_hold != 0 && (void *) a1 != NULL) {
+        struct __user_cap_data_struct  *d = (void *) a1;
+
+        memset(d, 0, 2 * sizeof(*d));
+
+        d[0].effective = nxt_capget_hold;
+        d[0].permitted = nxt_capget_hold;
+        d[0].inheritable = nxt_capget_hold;
+
+        return 0;
+    }
+#endif
+
+#ifdef SYS_capset
+    if (number == SYS_capset) {
+        /*
+         * Recorded first, then failed only if asked.  The record is
+         * who *tried* to drop, which is what the unfiltered run
+         * asserts on; failing afterwards keeps that meaning intact
+         * for the filtered run, where the point is which processes
+         * survive a denial and which refuse to start.
+         */
+        nxt_shim_record(nxt_capset_record_path);
+
+        if (nxt_capset_errno != 0) {
+            errno = nxt_capset_errno;
+            return -1;
+        }
     }
 #endif
 

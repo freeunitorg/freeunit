@@ -57,7 +57,13 @@ if [ "$LIBC" = glibc ]; then
              gcc make libc6-dev libpcre2-dev strace curl ca-certificates >/dev/null'
 else
     IMAGE=alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
-    INSTALL='apk add --no-cache gcc make musl-dev pcre2-dev strace curl >/dev/null'
+    # linux-headers, which musl-dev does not carry: <linux/capability.h> is
+    # what auto/capability probes for, and without it NXT_HAVE_LINUX_CAPABILITY
+    # is off, nxt_capability_specific_set() and nxt_capability_drop() compile
+    # to stubs, and this leg reports "no new syscalls" about a binary that has
+    # no capability handling in it at all.
+    INSTALL='apk add --no-cache gcc make musl-dev linux-headers pcre2-dev \
+             strace curl >/dev/null'
 fi
 
 command -v docker >/dev/null 2>&1 || die "docker not found"
