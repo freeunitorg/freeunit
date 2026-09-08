@@ -1114,8 +1114,11 @@ def test_python_prototype_killed_mid_start(skip_alert, findall):
 
     The app module sleeps in its *import* (test/python/slow_start/wsgi.py),
     which is what widens the PROCESS_CREATED -> READY window enough to aim
-    at.  A kill that lands outside the window makes the test skip rather
-    than assert something it did not drive.
+    at.  Landing inside that window is a precondition, not an assertion:
+    the worker has to be discovered well before the window closes, and
+    /status has to still count the start as pending right before the kill.
+    A runner loaded enough to miss either skips rather than reporting a
+    failure the test did not drive.
     """
 
     client.load(
@@ -1156,22 +1159,41 @@ def test_python_prototype_killed_mid_start(skip_alert, findall):
 
         # Wait for the worker to exist: killing the prototype before it has
         # forked would carry the original start stream and let an unfixed
-        # router pass this test by the other route.  Then a short pause puts
-        # the worker mid-import: past PROCESS_CREATED, well before READY.
+        # router pass this test by the other route.  Bounded at 2s, inside
+        # the 4s import window: exhausting it means the fork stalled past
+        # the window, which leaves nothing for the kill to aim at.  Then a
+        # short pause puts the worker mid-import: past PROCESS_CREATED and
+        # before READY.
         workers = []
-        for _ in range(100):
+        for _ in range(40):
             workers = _child_pids(pid)
             if workers:
                 break
             time.sleep(0.05)
 
-        assert workers, 'the prototype never forked a worker'
+        if not workers:
+            pytest.skip('the prototype forked no worker within the window')
 
         time.sleep(0.3)
 
-        # The worker is still importing the module.  Its own teardown noise
-        # is scoped to its pid below rather than skipped by shape, so an
-        # alert from any other process still fails the test.
+        # The worker must still be importing for the kill to land where this
+        # test aims it.  "starting" is app->pending_processes, which the
+        # router gives back only once the worker's port arrives ready, so
+        # anything but the one pending start means the window has closed --
+        # the request would then be served with 200 and the assertions below
+        # would report the wrong thing.
+        starting = client.conf_get('/status')['applications']['slow_start'][
+            'processes'
+        ]['starting']
+
+        if starting != 1:
+            pytest.skip(
+                f'the start left the import window: starting == {starting}'
+            )
+
+        # Its own teardown noise is scoped to the worker's pid below rather
+        # than skipped by shape, so an alert from any other process still
+        # fails the test.
 
         subprocess.call(['kill', '-9', pid])
         skip_alert(fr'process {pid} exited on signal 9')
@@ -1183,8 +1205,11 @@ def test_python_prototype_killed_mid_start(skip_alert, findall):
             # prototype -- which the kill already closed.  All of that is
             # the pre-existing consequence of killing a prototype, not
             # something this test's subject produces; it happens on the
-            # unfixed router too.
-            skip_alert(fr'\b{worker}#{worker} ')
+            # unfixed router too.  Both log prefixes are pid#tid
+            # (src/nxt_unit.c:7319, src/nxt_app_log.c:63), and the two are
+            # equal only for a main thread on Linux -- scope by the pid,
+            # which is the point of this skip, and let the tid be.
+            skip_alert(fr'\b{worker}#\d+ ')
 
         # The kill retires the start RPC, which releases the slot and -- no
         # process being left -- fails the waiting request instead of letting

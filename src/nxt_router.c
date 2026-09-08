@@ -486,18 +486,15 @@ nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
      * REMOVE_PID the router gets for the prototype carries no stream (it
      * had already reached READY itself, see nxt_main_process.c) and
      * nxt_port_rpc_remove_peer() finds nothing to fail, so the attempt's
-     * pending_processes slot is never given back.  With spare 0 that alone
-     * exceeds max_pending_processes, nxt_router_app_can_start() stays false
-     * for good, and no later request can even ask for a new prototype --
-     * only the start handler does that, and it is what can_start gates.
+     * pending_processes slot is never given back.
      *
-     * With the peer set, nxt_port_rpc_remove_peer() runs
-     * nxt_router_app_port_error() exactly once (it clears ->peer, deletes
-     * the stream and frees the registration), which releases the slot and
-     * fails the ack-waiting requests when no process is left.  For a
-     * prototype start the peer is the main process, which is harmless: its
-     * death is fatal anyway, and a prototype dying before READY is already
-     * reported by the stream-bearing REMOVE_PID.
+     * For a prototype start the peer is the main process, which is
+     * harmless: its death is fatal anyway, and a prototype dying before
+     * READY is already reported by the stream-bearing REMOVE_PID.
+     *
+     * The setter cannot report a failed insert: it logs and leaves ->peer
+     * at -1 (src/nxt_port_rpc.c:301), so a pool allocation failure here
+     * restores the peerless registration -- as at every other call site.
      */
     nxt_port_rpc_ex_set_peer(task, port, app_joint_rpc, dport->pid);
 
