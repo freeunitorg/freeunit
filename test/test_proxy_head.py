@@ -16,12 +16,18 @@ plain GET.  The second response arriving at all is the regression assertion.
 in the peer reader continues the exchange past it (that is pre-existing, see
 nxt_h1p_peer_header_parse), so it is left on the path it already had.
 
-These cases also cover the two exits an unrelayed upstream header buffer can
-take, but they cannot assert that it is released: a stranded request pool is
-invisible from the client side, and a stock build exposes no pool counter --
-nxt_debug is never assigned, so even a --debug build emits no "mp ... release"
-lines.  That was measured instead with a throwaway build that forces nxt_debug
-on and counts pools reaching a zero retain per request; see the commit message.
+These cases also drive both shapes the header read can take -- with and
+without body bytes alongside the header -- but they cannot assert that the
+unrelayed header buffer is released: a stranded request pool is invisible from
+the client side, and a stock build exposes no pool counter -- nxt_debug is
+never assigned, so even a --debug build emits no "mp ... release" lines.  That
+was measured instead with a throwaway build that forces nxt_debug on and counts
+pools reaching a zero retain per request; see the commit message.
+
+The same hold covers a third path nothing here reaches: an ordinary proxied
+response whose body arrives in a read after the header, which stranded the pool
+on master as well.  It is unobservable from the client for the same reason, and
+is covered by that measurement rather than by an assertion.
 
 See freeunitorg/freeunit#283 for the downstream half of the same rule.
 """
@@ -52,10 +58,10 @@ UPSTREAM_RESPONSES = {
     '/304': 'HTTP/1.1 304 Not Modified\r\nContent-Length: 10\r\n\r\n',
     # Header block and 10 junk bytes in a single write, so the bytes land in
     # the same read as the header.  A response to HEAD has no body, so they
-    # must be dropped rather than relayed -- and the buffer holding them takes
-    # a different exit from nxt_h1p_peer_header_read_done() than the cases
-    # above, which is where an earlier revision of this change stranded the
-    # request pool.
+    # must be dropped rather than relayed -- and the buffer holding them
+    # reaches the bodyless branch of nxt_h1p_peer_header_read_done() with
+    # bytes still in it, unlike the cases above, which is where an earlier
+    # revision of this change stranded the request pool.
     '/cl10junk': (
         'HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nJUNKJUNKJU'
     ),

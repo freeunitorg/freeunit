@@ -384,9 +384,9 @@ nxt_http_proxy_buf_mem_cleanup(nxt_task_t *task, void *obj, void *data)
     engine = data;
 
     /*
-     * Runs from nxt_mp_destroy(), which may be reached from a different task
-     * than the one current when the buffer was held, so "task" is not touched
-     * and the engine is carried in "data" instead.
+     * The engine is carried in "data": nxt_mp_destroy() has none to hand.
+     * "task" is passed only so the pointer nxt_mp_cleanup() stores stays
+     * inside the pool being destroyed -- do not dereference it here.
      */
 
     nxt_event_engine_buf_mem_free(engine, b);
@@ -426,8 +426,16 @@ nxt_http_proxy_buf_mem_hold(nxt_task_t *task, nxt_http_request_t *r,
 {
     nxt_int_t  ret;
 
-    ret = nxt_mp_cleanup(r->mem_pool, nxt_http_proxy_buf_mem_cleanup, task, b,
-                         task->thread->engine);
+    /*
+     * &r->task, not "task": nxt_mp_cleanup() stores the task pointer in the
+     * work item and hands it back at destroy time, and the peer connection's
+     * task is freed with that connection well before the request pool.
+     * &r->task lives in the pool being destroyed, which nxt_mp_destroy() runs
+     * its cleanups before freeing.
+     */
+
+    ret = nxt_mp_cleanup(r->mem_pool, nxt_http_proxy_buf_mem_cleanup, &r->task,
+                         b, task->thread->engine);
     if (nxt_slow_path(ret != NXT_OK)) {
         return NXT_ERROR;
     }

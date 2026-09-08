@@ -22,6 +22,7 @@ static void nxt_http_request_forward_protocol(nxt_http_request_t *r,
 static void nxt_http_request_ready(nxt_task_t *task, void *obj, void *data);
 static void nxt_http_request_proto_info(nxt_task_t *task,
     nxt_http_request_t *r);
+static nxt_bool_t nxt_http_request_is_bodyless(nxt_http_request_t *r);
 static void nxt_http_request_drop_framing_fields(nxt_http_request_t *r);
 static nxt_buf_t *nxt_http_request_body_drop(nxt_task_t *task,
     nxt_http_request_t *r, nxt_buf_t *out);
@@ -706,7 +707,7 @@ nxt_http_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
      * verbatim and unframed, which a downstream parser reads as the start of
      * the next response.
      */
-    r->no_body = nxt_http_request_is_bodyless(r, r->status);
+    r->no_body = nxt_http_request_is_bodyless(r);
 
     /*
      * RFC 9110 Sect. 8.6: a server must not send Content-Length in a 1xx or
@@ -846,8 +847,8 @@ nxt_http_request_is_bodyless_final(nxt_http_request_t *r,
 }
 
 
-nxt_bool_t
-nxt_http_request_is_bodyless(nxt_http_request_t *r, nxt_http_status_t status)
+static nxt_bool_t
+nxt_http_request_is_bodyless(nxt_http_request_t *r)
 {
     /*
      * A 101 upgrade is a 1xx status, but the bytes that follow its header are
@@ -861,15 +862,15 @@ nxt_http_request_is_bodyless(nxt_http_request_t *r, nxt_http_status_t status)
      * alone would leave an application that answers a WebSocket-upgrade
      * request with 204 plus a body on the unframed path.
      */
-    if (r->websocket_handshake && status == NXT_HTTP_SWITCHING_PROTOCOLS) {
+    if (r->websocket_handshake && r->status == NXT_HTTP_SWITCHING_PROTOCOLS) {
         return 0;
     }
 
-    if (status >= NXT_HTTP_CONTINUE && status < NXT_HTTP_OK) {
+    if (r->status >= NXT_HTTP_CONTINUE && r->status < NXT_HTTP_OK) {
         return 1;
     }
 
-    return nxt_http_request_is_bodyless_final(r, status);
+    return nxt_http_request_is_bodyless_final(r, r->status);
 }
 
 
