@@ -4153,7 +4153,8 @@ nxt_router_worker_thread_exit(nxt_task_t *task)
  * pattern in nxt_router_worker_thread_quit()).
  */
 
-static void nxt_router_listen_socket_close_ready(nxt_socket_conf_joint_t *joint);
+static void nxt_router_listen_socket_close_ready(nxt_task_t *task,
+    nxt_socket_conf_joint_t *joint);
 static void nxt_router_listen_socket_close_finish(nxt_task_t *task,
     nxt_listen_event_t *lev);
 
@@ -4226,7 +4227,7 @@ nxt_router_listen_socket_close(nxt_task_t *task, void *obj, void *data)
         nxt_debug(task, "engine %p: listen socket %d drain pending, "
                   "in-flight: %D", engine, lev->socket.fd, lev->count - 1);
 
-        nxt_router_listen_socket_close_ready(joint);
+        nxt_router_listen_socket_close_ready(task, joint);
 
         return;
     }
@@ -4236,7 +4237,8 @@ nxt_router_listen_socket_close(nxt_task_t *task, void *obj, void *data)
 
 
 static void
-nxt_router_listen_socket_close_ready(nxt_socket_conf_joint_t *joint)
+nxt_router_listen_socket_close_ready(nxt_task_t *task,
+    nxt_socket_conf_joint_t *joint)
 {
     nxt_joint_job_t  *job;
 
@@ -4246,6 +4248,21 @@ nxt_router_listen_socket_close_ready(nxt_socket_conf_joint_t *joint)
     }
 
     joint->close_job = NULL;
+
+    /*
+     * The only record of the acknowledgement on the thread that issues
+     * it.  The configuration thread's "temp conf ... count" line is
+     * written after a cross-thread post, so where it lands in the log is
+     * a function of that thread's wake-up latency, not of where in the
+     * close path the acknowledgement was issued -- it stays in the same
+     * place whether this call is made before the descriptor is released
+     * or after it.  This line does not: it is written by the closing
+     * engine itself, between its own records, so the order of the close
+     * and the acknowledgement is readable from the log.
+     * test_listeners_close_before_reply asserts exactly that.
+     */
+    nxt_debug(task, "engine %p: listen socket close acknowledged",
+              task->thread->engine);
 
     nxt_router_conf_wait_post(job);
 }
@@ -4290,7 +4307,7 @@ nxt_router_listen_socket_close_finish(nxt_task_t *task,
      * nxt_router_listen_socket_release() frees the nxt_listen_socket_t,
      * not the socket configuration the joint points at.
      */
-    nxt_router_listen_socket_close_ready(joint);
+    nxt_router_listen_socket_close_ready(task, joint);
 
     nxt_router_listen_event_release(task, lev, joint);
 }

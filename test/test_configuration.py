@@ -1,9 +1,11 @@
+import re
 import socket
 import time
 
 import pytest
 
 from unit.control import Control
+from unit.log import Log
 
 prerequisites = {'modules': {'python': 'any'}}
 
@@ -370,6 +372,90 @@ def test_listeners_port_release():
                     time.sleep(0.01)
 
             assert 'success' in resp, 'port release'
+
+
+def test_listeners_close_before_reply(findall):
+    assert 'success' in client.conf(
+        {
+            "listeners": {"127.0.0.1:8080": {"pass": "routes"}},
+            "routes": [],
+        }
+    ), 'listener added'
+
+    # The markers below are all nxt_debug(), so a release build cannot
+    # observe this at all.  There is no build flag in option.available,
+    # so ask the log: skipping is the only honest outcome here, passing
+    # would be a test that cannot fail.
+    if not findall(r'\[debug\]'):
+        pytest.skip('needs a build configured with --debug')
+
+    # Remember where the log ends before the removal.  The tail already
+    # holds a "controller conn write" for the request above, and the
+    # ordering is read off positions in a single read of what follows:
+    # two independent waits could each succeed with the order between
+    # them wrong.
+    pos = len(Log.read())
+
+    assert 'success' in client.conf(
+        {"listeners": {}, "applications": {}}
+    ), 'listener removed'
+
+    # The reply is the barrier that makes the tail complete rather than
+    # something the assertions below compare against: it is written only
+    # after every engine has acknowledged, and every engine writes its
+    # own records before it acknowledges.
+    deadline = time.monotonic() + 15
+
+    while True:
+        tail = Log.read()[pos:]
+
+        if 'controller conn write complete' in tail:
+            break
+
+        if time.monotonic() >= deadline:
+            pytest.fail('the controller did not reply')
+
+        time.sleep(0.01)
+
+    # One record per engine, so with listen_threads > 1 there are
+    # several of each.  Comparing the last of one with the last of the
+    # other is what makes the assertion independent of how the engines
+    # interleave: an engine acknowledges after it has finished closing,
+    # so the latest acknowledgement is later than every close; an engine
+    # that acknowledged first would put the latest close after every
+    # acknowledgement instead.
+    finish = list(
+        re.finditer(
+            r'\[debug\] (\d+)#\d+ .*listen socket close finish: (\d+)',
+            tail,
+        )
+    )
+    ack = list(re.finditer(r'listen socket close acknowledged', tail))
+
+    assert finish, 'listener closed'
+    assert ack, 'removal acknowledged'
+
+    assert finish[-1].start() < ack[-1].start(), 'phase 2 before ack'
+
+    # The one that has to hold: "close finish" is written on entry to
+    # nxt_router_listen_socket_close_finish(), before the descriptor is
+    # released, so the check above cannot see an acknowledgement moved
+    # back above nxt_router_listen_socket_release() inside that function
+    # -- the position #276 moved it out of.  The close(2) of the
+    # descriptor is written by the same engine that then acknowledges,
+    # so anchoring on it covers both positions.
+    #
+    # Match the router's pid: the controller writes "socket close(N)"
+    # for its own connection after every reply, and fd numbers collide
+    # across processes.
+    pid, fd = finish[-1].group(1), finish[-1].group(2)
+    closed = re.search(
+        rf'\[debug\] {pid}#\d+ (\*\d+ )?socket close\({fd}\)', tail
+    )
+
+    assert closed is not None, 'descriptor closed'
+
+    assert closed.start() < ack[-1].start(), 'closed before ack'
 
 
 def test_json_application_name_large():
