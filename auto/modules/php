@@ -269,7 +269,352 @@ if grep ^$NXT_PHP_MODULE: $NXT_MAKEFILE 2>&1 > /dev/null; then
 fi
 
 
+NXT_PHP_MOUNTS_HEADER=nxt_${NXT_PHP_MODULE}_mounts.h
+
+# A PHP built with the --with-system-tzdata patch -- Debian, Ubuntu and Fedora
+# packages all carry it -- reads the timezone database from the filesystem
+# lazily, at request time, that is, after Unit has already chroot()ed into
+# "isolation.rootfs".  When the database is not there such a build does not
+# raise an error, it dereferences NULL: the application worker dies with
+# SIGSEGV on the first date() call.  Bind mount the database so that PHP gets
+# the same automount.language_deps treatment the other language modules get.
+#
+# PHP does not expose the path at runtime, so derive it here:
+#
+#   --with-system-tzdata=DIR   a build that spells the path out; trust it
+#                              even if DIR is absent on the build host.
+#   --with-system-tzdata       Debian, Ubuntu and Fedora pass the flag bare
+#                              and rely on the patch's built-in default,
+#                              /usr/share/zoneinfo: probe for it, and fall
+#                              back to that default when the build host
+#                              has no database at all.
+#   no such option             A build using timelib's bundled database (the
+#                              official php:*-cli images, Alpine's packages);
+#                              it never opens the directory, so mount nothing.
+#   options unavailable        php-config too old to report them: probe, since
+#                              a spurious mount beats a SIGSEGV.
+#
+# A php-config that does not know --configure-options prints its usage to
+# *stdout* and exits nonzero, so the query has to be judged by exit status;
+# taking the output alone would read the usage text as a real answer and skip
+# the probe.
+
+# A PHP configured with no options at all reports an empty list and exits
+# successfully: that is a bundled-timezonedb build, not an unknown one.  Only
+# a failed query (a php-config without --configure-options) leaves the
+# question open, and that is the one case worth probing the host for.
+nxt_php_configure_options_known=yes
+
+if NXT_PHP_CONFIGURE_OPTIONS=`$NXT_PHP_CONFIG --configure-options 2>/dev/null`
+then
+    NXT_PHP_CONFIGURE_OPTIONS=`printf '%s' "$NXT_PHP_CONFIGURE_OPTIONS" \
+                               | tr '\n' ' '`
+else
+    NXT_PHP_CONFIGURE_OPTIONS=
+    nxt_php_configure_options_known=no
+fi
+
+NXT_PHP_TZDATA=
+nxt_php_tzprobe=no
+nxt_php_tzdata_default=no
+nxt_php_tzdata_relative=
+nxt_php_tzdata_guessed=
+
+# Some builds hand back $ac_configure_args verbatim, with each argument
+# shell-quoted, and a quoted --with-system-tzdata=DIR may carry a space.
+# Split the list into one argument per line the way a shell would -- on
+# unquoted whitespace only, quotes removed -- so a quoted argument survives
+# whole instead of matching no arm below or being cut at its first space.
+# Autoconf quotes with single quotes alone, so a double quote is a pathname
+# character here and not quoting: reading it as quoting would swallow the
+# rest of the line into one argument and drop the quote from the path.
+
+nxt_php_configure_args=`printf '%s' "$NXT_PHP_CONFIGURE_OPTIONS" \
+    | awk '
+        {
+            n = length($0); q = ""; tok = ""; has = 0;
+            for (i = 1; i <= n; i++) {
+                c = substr($0, i, 1);
+                if (q != "") {
+                    if (c == q) { q = ""; } else { tok = tok c; }
+                } else if (c == "\047") {
+                    q = c; has = 1;
+                } else if (c == " " || c == "\t") {
+                    if (has || tok != "") { print tok; }
+                    tok = ""; has = 0;
+                } else {
+                    tok = tok c;
+                }
+            }
+            if (has || tok != "") { print tok; }
+        }'`
+
+# The stock php-config strips the quotes from $configure_options before it
+# echoes them (scripts/php-config.in: sed -e "s#'##g"), so a directory with
+# whitespace in it arrives already split into words.  Recover it: a word
+# that starts an absolute tzdata path absorbs the words after it up to the
+# next option (-x) or Autoconf variable (NAME=value).  It deliberately
+# absorbs the positional system type too: no pattern can tell a system
+# alias from a path component, since config.sub takes shortened aliases
+# ("x86_64-linux") and single words as readily as the cpu-vendor-os
+# triple, and a directory name may hold a hyphen just as happily.  So this
+# pass only has to produce a candidate the true path is a word prefix of;
+# the arm below settles which prefix against the build host's filesystem.
+# Repeated whitespace is already collapsed by php-config's unquoted echo,
+# so it cannot be recovered.
+
+nxt_php_configure_args=`printf '%s\n' "$nxt_php_configure_args" \
+    | awk '
+        function flush() { if (path != "") { print path; path = ""; } }
+        /^--?with-system-tzdata=\// {
+            flush(); path = $0; next;
+        }
+        path != "" && !/^-/ && !/^[A-Za-z_][A-Za-z0-9_]*=/ {
+            path = path " " $0; next;
+        }
+        { flush(); print; }
+        END { flush(); }'`
+
+# Walk the arguments in order: Autoconf keeps the last occurrence of a
+# repeated option, so a bare --with-system-tzdata appended after an "=no" or
+# "=DIR" form is what PHP's ext/date/config.m4 actually saw.  It reads the
+# value the way Autoconf hands it over: "no" (or --without-system-tzdata)
+# disables the patch, "yes" enables it with the built-in default, and only an
+# absolute path overrides that default.  Every arm therefore clears what the
+# others set -- the relative note included, or a later absolute path would be
+# mounted under an earlier relative value's "no mount can be derived" notice.
+
+nxt_php_ifs_saved=$IFS
+IFS='
+'
+set -f
+for nxt_php_opt in $nxt_php_configure_args
+do
+    # Autoconf accepts the single-dash spelling of every option too.
+    case "$nxt_php_opt" in
+        -with-* | -without-*)
+            nxt_php_opt="-$nxt_php_opt"
+        ;;
+    esac
+
+    case "$nxt_php_opt" in
+        --with-system-tzdata | --with-system-tzdata=yes)
+            NXT_PHP_TZDATA=; nxt_php_tzprobe=yes
+            nxt_php_tzdata_relative=; nxt_php_tzdata_guessed=
+        ;;
+        --with-system-tzdata=no | --without-system-tzdata)
+            NXT_PHP_TZDATA=; nxt_php_tzprobe=no
+            nxt_php_tzdata_relative=; nxt_php_tzdata_guessed=
+        ;;
+        --with-system-tzdata=/*)
+            nxt_php_tzprobe=no
+            nxt_php_tzdata_relative=; nxt_php_tzdata_guessed=
+            NXT_PHP_TZDATA=`printf '%s' "$nxt_php_opt" \
+                            | sed 's/^--with-system-tzdata=//'`
+
+            # A candidate carrying whitespace was reassembled from words,
+            # and only the filesystem knows where the directory ends: take
+            # the longest word prefix that is one.  If no prefix is, keep
+            # the candidate less a trailing system type and say it was
+            # reconstructed -- the cross-host case, where the probe loop
+            # already trusts the build host to look like the rootfs.
+            case "$NXT_PHP_TZDATA" in
+                *\ *)
+                    nxt_php_tzcand=$NXT_PHP_TZDATA
+
+                    while :
+                    do
+                        if [ -d "$nxt_php_tzcand" ]; then
+                            NXT_PHP_TZDATA=$nxt_php_tzcand
+                            break
+                        fi
+
+                        case "$nxt_php_tzcand" in
+                            *\ *)
+                                nxt_php_tzcand=${nxt_php_tzcand% *}
+                            ;;
+                            *)
+                                # Nothing exists.  The absorbed tail may
+                                # still be a system type, and dropping a
+                                # trailing alias-shaped word ([a-z0-9_.]
+                                # and at least one hyphen) is the best
+                                # reading left for the message and for a
+                                # rootfs that has what this host lacks.
+                                nxt_php_tzlast=${NXT_PHP_TZDATA##* }
+
+                                case "$nxt_php_tzlast" in
+                                    *-*)
+                                        case "$nxt_php_tzlast" in
+                                            *[!a-z0-9_.-]*) ;;
+                                            *)
+                                                NXT_PHP_TZDATA=${NXT_PHP_TZDATA% *}
+                                            ;;
+                                        esac
+                                    ;;
+                                esac
+
+                                nxt_php_tzdata_guessed=$NXT_PHP_TZDATA
+                                break
+                            ;;
+                        esac
+                    done
+                ;;
+            esac
+        ;;
+        --with-system-tzdata=*)
+            # A relative value is embedded verbatim and resolved against the
+            # worker's working directory at run time, so no host directory
+            # can be derived for a mount; say so instead of mounting an
+            # unrelated one, and leave the database to the rootfs author.
+            NXT_PHP_TZDATA=; nxt_php_tzprobe=no
+            nxt_php_tzdata_guessed=
+            nxt_php_tzdata_relative=`printf '%s' "$nxt_php_opt" \
+                                     | sed 's/^--with-system-tzdata=//'`
+        ;;
+    esac
+done
+set +f
+IFS=$nxt_php_ifs_saved
+
+if [ $nxt_php_configure_options_known = no ]; then
+    nxt_php_tzprobe=yes
+fi
+
+if [ $nxt_php_tzprobe = yes ]; then
+    for nxt_tzdir in /usr/share/zoneinfo /usr/lib/zoneinfo \
+                     /usr/share/lib/zoneinfo /etc/zoneinfo
+    do
+        if [ -f "$nxt_tzdir/UTC" ]; then
+            NXT_PHP_TZDATA=$nxt_tzdir
+            break
+        fi
+    done
+
+    # When the option itself asked for the probe, PHP does read a system
+    # database, and the patch compiles /usr/share/zoneinfo in as its
+    # default -- Debian's and Fedora's php binaries both carry the string.
+    # A build host without any database (a minimal build chroot, a
+    # sysroot) must not turn that into "bundled, no mount": emit the
+    # default, which the worker skips with a warning if the running host
+    # lacks it too.  A probe that only php-config's silence asked for has
+    # no such certainty, so it still mounts nothing when it finds nothing.
+    if [ ".$NXT_PHP_TZDATA" = "." ] \
+       && [ $nxt_php_configure_options_known = yes ]
+    then
+        NXT_PHP_TZDATA=/usr/share/zoneinfo
+        nxt_php_tzdata_default=yes
+    fi
+fi
+
+# The path reaches the header as data, never as shell text: escape
+# backslash, double quote and -- against -Wtrigraphs, which -Wall raises
+# and the default -Werror makes fatal -- the question mark for the C string
+# literal, and write the one line that carries it with printf, because an
+# unquoted heredoc would re-read "$", "`" and "\" in the path.  A control
+# character has no representation here -- a newline would break the
+# header's line structure as well -- so refuse those.
+#
+# A double quote and a backslash are refused too, for now: the C literal
+# could carry them escaped, but the discovery process hands the mount
+# table to the main process as JSON built with a plain %s
+# (nxt_discovery_modules(), src/nxt_application.c), where either byte
+# breaks the parse and takes every language module down with it.  Lift
+# this once that serializer escapes its strings.  A single quote in the
+# path is caught by the same test: the stock php-config's quote strip
+# turns Autoconf's '\'' into a bare backslash before it gets here.
+nxt_php_tzdata_refused=no
+
+if [ ".$nxt_php_tzdata_relative" != "." ]; then
+    printf '%s\n' " + PHP timezone database: relative path \"$nxt_php_tzdata_relative\"" \
+                  "   is resolved against the worker's working directory; no" \
+                  "   mount can be derived, provide it inside the rootfs"
+    nxt_php_tzdata_refused=yes
+fi
+
+if [ $nxt_php_tzdata_default = yes ]; then
+    printf '%s\n' " + PHP timezone database: none found on this host;" \
+                  "   mounting the patch's default \"$NXT_PHP_TZDATA\""
+fi
+
+if [ ".$nxt_php_tzdata_guessed" != "." ] \
+   && [ ".$NXT_PHP_TZDATA" = ".$nxt_php_tzdata_guessed" ]
+then
+    printf '%s\n' " + PHP timezone database path \"$NXT_PHP_TZDATA\" was" \
+                  "   reconstructed from a whitespace-split configure option" \
+                  "   and is not a directory here; check it before relying" \
+                  "   on the mount"
+fi
+
+nxt_php_tzdata_printable=$(printf '%s' "$NXT_PHP_TZDATA" \
+                           | tr -d '\001-\037\177')
+
+if [ "x$nxt_php_tzdata_printable" != "x$NXT_PHP_TZDATA" ]; then
+    printf '%s\n' " + PHP timezone database path \"$nxt_php_tzdata_printable\"" \
+                  "   contains control characters that cannot be embedded;" \
+                  "   no mount"
+    NXT_PHP_TZDATA=
+    nxt_php_tzdata_refused=yes
+fi
+
+case "$NXT_PHP_TZDATA" in
+    *\"* | *\\*)
+        printf '%s\n' " + PHP timezone database path \"$NXT_PHP_TZDATA\"" \
+                      "   contains a double quote or a backslash, which the" \
+                      "   module discovery message cannot carry; no mount"
+        NXT_PHP_TZDATA=
+        nxt_php_tzdata_refused=yes
+    ;;
+esac
+
+if [ ".$NXT_PHP_TZDATA" != "." ]; then
+
+nxt_php_tzdata_c=$(printf '%s' "$NXT_PHP_TZDATA" | sed 's/[\\"?]/\\&/g')
+
+cat << 'END' > $NXT_BUILD_DIR/include/$NXT_PHP_MOUNTS_HEADER
+#ifndef _NXT_PHP_MOUNTS_H_INCLUDED_
+#define _NXT_PHP_MOUNTS_H_INCLUDED_
+
+
+static const nxt_fs_mount_t  nxt_php_mounts[] = {
+END
+
+printf '    {(u_char *) "%s", (u_char *) "%s",\n' \
+       "$nxt_php_tzdata_c" "$nxt_php_tzdata_c" \
+       >> $NXT_BUILD_DIR/include/$NXT_PHP_MOUNTS_HEADER
+
+cat << 'END' >> $NXT_BUILD_DIR/include/$NXT_PHP_MOUNTS_HEADER
+     NXT_FS_BIND, (u_char *) "bind", 0, NULL, 1, 1},
+};
+
+#define NXT_PHP_MOUNTS   nxt_php_mounts
+#define NXT_PHP_NMOUNTS  nxt_nitems(nxt_php_mounts)
+
+
+#endif /* _NXT_PHP_MOUNTS_H_INCLUDED_ */
+END
+
+else
+
+cat << 'END' > $NXT_BUILD_DIR/include/$NXT_PHP_MOUNTS_HEADER
+#ifndef _NXT_PHP_MOUNTS_H_INCLUDED_
+#define _NXT_PHP_MOUNTS_H_INCLUDED_
+
+
+#define NXT_PHP_MOUNTS   NULL
+#define NXT_PHP_NMOUNTS  0
+
+
+#endif /* _NXT_PHP_MOUNTS_H_INCLUDED_ */
+END
+
+fi
+
+
 $echo " + PHP module: ${NXT_PHP_MODULE}.unit.so"
+if [ $nxt_php_tzdata_refused = no ]; then
+    printf '%s\n' " + PHP timezone database:" \
+                  "   ${NXT_PHP_TZDATA:-bundled, no mount required}"
+fi
 
 . auto/cc/deps
 
@@ -299,6 +644,7 @@ $NXT_BUILD_DIR/$nxt_obj:	$nxt_src $NXT_VERSION_H
 	$NXT_PHP_INCLUDE -DNXT_ZEND_SIGNAL_STARTUP=$NXT_ZEND_SIGNAL_STARTUP \\
 	-DNXT_PHP_TRUEASYNC=$NXT_PHP_TRUEASYNC \\
 	-DNXT_PHP_PRE_REQUEST_INIT=$NXT_PHP_PRE_REQUEST_INIT \\
+	-DNXT_PHP_MOUNTS_H=\"$NXT_PHP_MOUNTS_HEADER\" \\
 	$nxt_dep_flags \\
 	-o $NXT_BUILD_DIR/$nxt_obj $nxt_src
 	$nxt_dep_post
