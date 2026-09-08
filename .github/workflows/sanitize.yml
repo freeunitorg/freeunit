@@ -131,6 +131,14 @@ jobs:
             # hard ASan failure here instead of an intermittent "[alert]" line
             # in one runtime's log.  It self-skips every runtime that is not
             # built into this leg's unitd.
+            #
+            # test_configuration drives the control API only and is here for
+            # test_listeners_close_before_reply: it reads the router's
+            # nxt_debug() records to assert that a removed listener's
+            # descriptor is closed before the removal is acknowledged
+            # (#276), and skips on any build without --debug.  Every
+            # build-test leg is a release build, so this leg is the only one
+            # in which that test runs rather than skips.
             tests: >-
               test/test_graceful_reload.py
               test/test_listener_drain.py
@@ -140,6 +148,7 @@ jobs:
               test/test_chunked.py
               test/test_conn_recycle.py
               test/test_app_lifecycle.py
+              test/test_configuration.py
           - runtime: php
             apt: ""
             configure: php

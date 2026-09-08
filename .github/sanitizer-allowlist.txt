@@ -30,3 +30,10 @@ src/nxt_http_route\.c:[0-9]+:[0-9]+: runtime error: null pointer passed as argum
 
 # freeunitorg/freeunit#200 -- same class in nxt_cpymem(): memcpy(dst, NULL, 0).
 src/nxt_string\.h:[0-9]+:[0-9]+: runtime error: null pointer passed as argument 2, which is declared to never be null
+
+# freeunitorg/freeunit#200 -- same class in nxt_is_tstr(): memchr(NULL, c, 0)
+# on a zero-length nxt_str_t, twice, one per character it looks for.  Reached
+# from the configuration validator.  Measured with the python leg's test set:
+# only test_configuration.py sends a configuration that gets there, so the
+# entry arrived with that file.
+src/nxt_tstr\.h:[0-9]+:[0-9]+: runtime error: null pointer passed as argument 1, which is declared to never be null
