@@ -204,6 +204,22 @@ fn fetch_api(category: &str) -> Result<String, String> {
 // API date lookup
 // ---------------------------------------------------------------------------
 
+/// endoflife.date field holding the date FreeUnit's policy is anchored to.
+///
+/// EOL.md: the three-year OS extension runs from *standard* EOL, never from
+/// extended maintenance. For every vendor but one that is the API's `eol`.
+/// Debian is the exception: in September 2026 endoflife.date redefined Debian's
+/// `eol` to the end of LTS (`eolFrom` in the v1 API) and moved the end of
+/// regular security-team support — the date the policy means — to `support`
+/// (`eoasFrom`). Reading `eol` for Debian would silently re-anchor the grace
+/// window to LTS and keep bullseye in the matrix two years past policy.
+fn api_eol_field(category: &str) -> &'static str {
+    match category {
+        "debian" => "support",
+        _ => "eol",
+    }
+}
+
 /// Result of an API EOL lookup: Ok(Some(date)), Ok(None) (version not found in API),
 /// or Err (network/parse failure).
 fn api_eol_date(category: &str, version: &str) -> Result<Option<String>, String> {
@@ -223,7 +239,7 @@ fn api_eol_date(category: &str, version: &str) -> Result<Option<String>, String>
             None => continue,
         };
         if cycle == version {
-            if let Some(eol_val) = entry.get("eol") {
+            if let Some(eol_val) = entry.get(api_eol_field(category)) {
                 match eol_val {
                     serde_json::Value::String(s) => {
                         // Normalize to YYYY-MM (API may return YYYY-MM or YYYY-MM-DD)
@@ -1148,5 +1164,16 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].severity, Severity::Error);
         assert!(r[0].message.contains("unparseable"));
+    }
+
+    #[test]
+    fn debian_is_compared_against_the_support_field() {
+        // Debian's API `eol` became the end of LTS in September 2026; the
+        // policy anchors on the end of regular security support, which the API
+        // now calls `support`. Every other category still means `eol`.
+        assert_eq!(api_eol_field("debian"), "support");
+        assert_eq!(api_eol_field("ubuntu"), "eol");
+        assert_eq!(api_eol_field("alpine"), "eol");
+        assert_eq!(api_eol_field("python"), "eol");
     }
 }

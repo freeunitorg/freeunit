@@ -66,6 +66,13 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 † Past upstream EOL; in FreeUnit grace period.
 ‡ Default Python shipped by this OS is itself past upstream EOL. FreeUnit does not backport fixes to that Python version.
 
+The "Upstream EOL" column is always the end of *standard* support, per the LTS
+rule below — never an extended-maintenance date. Which endoflife.date field that
+is depends on the vendor, so `pkg/eol/` picks per category: Ubuntu's `eol` is the
+end of standard security maintenance (ESM excluded), while Debian's `eol` became
+the end of **LTS** in September 2026, and the Debian Security Team's window — the
+one this table tracks — moved to that API's `support` field.
+
 ## Dependency Support
 
 Build-time and bundled libraries. These are **not** matrix variants — nothing in
