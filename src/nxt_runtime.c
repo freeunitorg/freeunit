@@ -357,6 +357,19 @@ nxt_runtime_start(nxt_task_t *task, void *obj, void *data)
         goto fail;
     }
 
+    if (rt->capabilities.unknown) {
+        /*
+         * nxt_capability_set() could only reach stderr: it runs from
+         * nxt_runtime_conf_init(), before the log file exists.  Repeat it
+         * here so the record survives in unit.log too.
+         */
+        nxt_log(task, NXT_LOG_WARN, "capget() failed; process "
+                "capabilities are unknown and will not be used: user and "
+                "group switching and \"rootfs\" isolation are disabled "
+                "for applications that do not enable the \"credential\" "
+                "namespace, and applications run as uid %d", (int) nxt_euid);
+    }
+
     if (nxt_runtime_event_engine_change(task, rt) != NXT_OK) {
         goto fail;
     }
