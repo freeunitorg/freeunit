@@ -225,17 +225,28 @@ nxt_discovery_start(nxt_task_t *task, nxt_process_data_t *data)
 static nxt_buf_t *
 nxt_discovery_modules(nxt_task_t *task, const char *path)
 {
-    char            *name;
-    u_char          *p, *end;
-    size_t          size;
-    glob_t          glb;
-    nxt_mp_t        *mp;
-    nxt_buf_t       *b;
-    nxt_int_t       ret;
-    nxt_uint_t      i, n, j;
-    nxt_array_t     *modules, *mounts;
-    nxt_module_t    *module;
-    nxt_fs_mount_t  *mnt;
+    char              *name;
+    size_t            size;
+    glob_t            glb;
+    nxt_mp_t          *mp;
+    nxt_str_t         str;
+    nxt_buf_t         *b;
+    nxt_int_t         ret;
+    nxt_uint_t        i, n, j;
+    nxt_array_t       *modules, *mounts;
+    nxt_module_t      *module;
+    nxt_fs_mount_t    *mnt;
+    nxt_conf_value_t  *root, *obj, *array, *mount;
+
+    static const nxt_str_t  type_str = nxt_string("type");
+    static const nxt_str_t  name_str = nxt_string("name");
+    static const nxt_str_t  version_str = nxt_string("version");
+    static const nxt_str_t  file_str = nxt_string("file");
+    static const nxt_str_t  mounts_str = nxt_string("mounts");
+    static const nxt_str_t  src_str = nxt_string("src");
+    static const nxt_str_t  dst_str = nxt_string("dst");
+    static const nxt_str_t  flags_str = nxt_string("flags");
+    static const nxt_str_t  data_str = nxt_string("data");
 
     b = NULL;
 
@@ -268,39 +279,76 @@ nxt_discovery_modules(nxt_task_t *task, const char *path)
         }
     }
 
-    size = nxt_length("[]");
     module = modules->elts;
     n = modules->nelts;
+
+    /*
+     * The main process parses this message as JSON, so build it through
+     * nxt_conf, which escapes every string.  Formatted with "%s", a double
+     * quote or a backslash in a module path or a mount source broke the
+     * parse, and the main process then started with no language modules
+     * at all and nothing above debug level in the log to say why.
+     */
+    root = nxt_conf_create_array(mp, n);
+    if (nxt_slow_path(root == NULL)) {
+        goto fail;
+    }
 
     for (i = 0; i < n; i++) {
         nxt_debug(task, "module: %d %V %V",
                   module[i].type, &module[i].version, &module[i].file);
 
-        size += nxt_length("{\"type\": ,");
-        size += nxt_length(" \"name\": \"\",");
-        size += nxt_length(" \"version\": \"\",");
-        size += nxt_length(" \"file\": \"\",");
-        size += nxt_length(" \"mounts\": []},");
+        obj = nxt_conf_create_object(mp, 5);
+        if (nxt_slow_path(obj == NULL)) {
+            goto fail;
+        }
 
-        size += NXT_INT_T_LEN
-                + module[i].version.length
-                + module[i].name.length
-                + module[i].file.length;
+        nxt_conf_set_member_integer(obj, &type_str, module[i].type, 0);
+        nxt_conf_set_member_string(obj, &name_str, &module[i].name, 1);
+        nxt_conf_set_member_string(obj, &version_str, &module[i].version, 2);
+        nxt_conf_set_member_string(obj, &file_str, &module[i].file, 3);
 
         mounts = module[i].mounts;
-
-        size += mounts->nelts * nxt_length("{\"src\": \"\", \"dst\": \"\", "
-                                            "\"type\": , \"name\": \"\", "
-                                            "\"flags\": , \"data\": \"\"},");
-
         mnt = mounts->elts;
 
-        for (j = 0; j < mounts->nelts; j++) {
-            size += nxt_strlen(mnt[j].src) + nxt_strlen(mnt[j].dst)
-                    + nxt_strlen(mnt[j].name) + (2 * NXT_INT_T_LEN)
-                    + (mnt[j].data == NULL ? 0 : nxt_strlen(mnt[j].data));
+        array = nxt_conf_create_array(mp, mounts->nelts);
+        if (nxt_slow_path(array == NULL)) {
+            goto fail;
         }
+
+        for (j = 0; j < mounts->nelts; j++) {
+            mount = nxt_conf_create_object(mp, 6);
+            if (nxt_slow_path(mount == NULL)) {
+                goto fail;
+            }
+
+            str.start = mnt[j].src;
+            str.length = nxt_strlen(mnt[j].src);
+            nxt_conf_set_member_string(mount, &src_str, &str, 0);
+
+            str.start = mnt[j].dst;
+            str.length = nxt_strlen(mnt[j].dst);
+            nxt_conf_set_member_string(mount, &dst_str, &str, 1);
+
+            str.start = mnt[j].name;
+            str.length = nxt_strlen(mnt[j].name);
+            nxt_conf_set_member_string(mount, &name_str, &str, 2);
+
+            nxt_conf_set_member_integer(mount, &type_str, mnt[j].type, 3);
+            nxt_conf_set_member_integer(mount, &flags_str, mnt[j].flags, 4);
+
+            str.start = (mnt[j].data == NULL) ? (u_char *) "" : mnt[j].data;
+            str.length = nxt_strlen(str.start);
+            nxt_conf_set_member_string(mount, &data_str, &str, 5);
+
+            nxt_conf_set_element(array, j, mount);
+        }
+
+        nxt_conf_set_member(obj, &mounts_str, array, 4);
+        nxt_conf_set_element(root, i, obj);
     }
+
+    size = nxt_conf_json_length(root, NULL);
 
     b = nxt_buf_mem_alloc(mp, size, 0);
     if (b == NULL) {
@@ -309,44 +357,21 @@ nxt_discovery_modules(nxt_task_t *task, const char *path)
 
     b->completion_handler = nxt_discovery_completion_handler;
 
-    p = b->mem.free;
-    end = b->mem.end;
-    *p++ = '[';
-
-    for (i = 0; i < n; i++) {
-        mounts = module[i].mounts;
-
-        p = nxt_sprintf(p, end, "{\"type\": %d, \"name\": \"%V\", "
-                        "\"version\": \"%V\", \"file\": \"%V\", \"mounts\": [",
-                        module[i].type, &module[i].name, &module[i].version,
-                        &module[i].file);
-
-        mnt = mounts->elts;
-        for (j = 0; j < mounts->nelts; j++) {
-            p = nxt_sprintf(p, end,
-                            "{\"src\": \"%s\", \"dst\": \"%s\", "
-                            "\"name\": \"%s\", \"type\": %d, \"flags\": %d, "
-                            "\"data\": \"%s\"},",
-                            mnt[j].src, mnt[j].dst, mnt[j].name, mnt[j].type,
-                            mnt[j].flags,
-                            mnt[j].data == NULL ? (u_char *) "" : mnt[j].data);
-        }
-
-        *p++ = ']';
-        *p++ = '}';
-        *p++ = ',';
-    }
-
-    *p++ = ']';
-
-    if (nxt_slow_path(p > end)) {
-        nxt_alert(task, "discovery write past the buffer");
-        goto fail;
-    }
-
-    b->mem.free = p;
+    b->mem.free = nxt_conf_json_print(b->mem.free, root, NULL);
 
 fail:
+
+    /*
+     * This is the success path too -- b is NULL only if one of the allocations
+     * above failed.  Say so: the caller turns a NULL into NXT_ERROR, and the
+     * main process then starts the controller and the router with no language
+     * modules registered, so without a line here the only symptom an operator
+     * sees is every application type reported as "not found".
+     */
+    if (nxt_slow_path(b == NULL)) {
+        nxt_alert(task, "discovery failed to build the module list");
+        nxt_mp_destroy(mp);
+    }
 
     globfree(&glb);
 

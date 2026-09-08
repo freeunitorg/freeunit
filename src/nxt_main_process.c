@@ -1705,11 +1705,15 @@ nxt_main_port_modules_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     conf = nxt_conf_json_parse(mp, b->mem.pos, b->mem.free, NULL);
     if (conf == NULL) {
+        nxt_alert(task, "discovery message is not valid JSON; "
+                        "no application modules will be available");
         goto fail;
     }
 
     root = nxt_conf_get_path(conf, &root_path);
     if (root == NULL) {
+        nxt_alert(task, "discovery message has no module list; "
+                        "no application modules will be available");
         goto fail;
     }
 
@@ -1721,6 +1725,7 @@ nxt_main_port_modules_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
         lang = nxt_array_zero_add(rt->languages);
         if (lang == NULL) {
+            nxt_alert(task, "failed to record the module at index %uD", index);
             goto fail;
         }
 
@@ -1730,6 +1735,8 @@ nxt_main_port_modules_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
                                   nxt_nitems(nxt_app_lang_module_map), lang);
 
         if (ret != NXT_OK) {
+            nxt_alert(task, "unexpected members in the module at index %uD",
+                      index);
             goto fail;
         }
 
