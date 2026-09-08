@@ -2851,12 +2851,67 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
 
         h1p = peer->proto.h1;
 
-        if (h1p->chunked) {
-            if (r->resp.content_length != NULL) {
-                peer->status = NXT_HTTP_BAD_GATEWAY;
+        if (h1p->chunked && r->resp.content_length != NULL) {
+            peer->status = NXT_HTTP_BAD_GATEWAY;
+            break;
+        }
+
+        /*
+         * RFC 9112 Sect. 6.3: a response to HEAD, and any 204 or 304 response,
+         * is terminated by the first empty line after the header fields no
+         * matter what Content-Length or Transfer-Encoding say.  Such a response
+         * is complete right here, so neither arm the chunked parser nor set a
+         * remainder from a Content-Length that describes a body the upstream
+         * will never send.
+         *
+         * Without this the upstream -- which nxt_h1p_peer_header_send() always
+         * asks to "Connection: close" -- closes with h1p->remainder still at
+         * the advertised length, or with chunked_parse.last still clear;
+         * nxt_h1p_peer_closed() then reads that as a truncated body and sets
+         * r->truncated and r->inconsistent, and nxt_h1p_request_close() drops
+         * the client keep-alive over a response that was never short.  Any
+         * pipelined request already in the client's socket buffer is lost.
+         *
+         * Complete the response the way a body that reaches its declared
+         * length completes it in nxt_h1p_peer_body_process(): hand the
+         * request's last buffer to the ready handler and mark the peer closed,
+         * so nxt_http_proxy_send_body() closes the upstream connection and
+         * releases the request pool.
+         *
+         * The predicate is the "final response" one, not the full RFC list:
+         * a 1xx from an upstream is an interim response, and nothing here
+         * continues the exchange past it -- nxt_h1p_peer_header_parse() only
+         * reads a status line while peer->status is still NXT_HTTP_UNSET, so
+         * the 1xx is taken as the response and whatever follows is relayed as
+         * its body.  That is pre-existing and out of scope; ending the
+         * exchange on the 1xx header here would discard a final response that
+         * may already be sitting in this very buffer.
+         *
+         * "b" is not forwarded: bytes an upstream put after the header of a
+         * bodyless response are not a body.  It is handed to
+         * nxt_http_proxy_buf_mem_hold() rather than freed, because the
+         * response fields point their name/value into it and are read until
+         * the request is logged and closed; see the comment there.
+         */
+        if (nxt_http_request_is_bodyless_final(r, peer->status)) {
+            h1p->chunked = 0;
+            h1p->remainder = 0;
+
+            if (nxt_slow_path(nxt_http_proxy_buf_mem_hold(task, r, b)
+                              != NXT_OK))
+            {
+                peer->status = NXT_HTTP_INTERNAL_SERVER_ERROR;
                 break;
             }
 
+            peer->body = nxt_http_buf_last(r);
+            peer->closed = 1;
+
+            r->state->ready_handler(task, r, peer);
+            return;
+        }
+
+        if (h1p->chunked) {
             h1p->chunked_parse.mem_pool = c->mem_pool;
 
         } else if (r->resp.content_length_n > 0) {
@@ -2866,6 +2921,20 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
         if (nxt_buf_mem_used_size(&b->mem) != 0) {
             nxt_h1p_peer_body_process(task, peer, b);
             return;
+        }
+
+        /*
+         * No body bytes arrived with the header, so nothing will relay "b" and
+         * nothing will run its completion handler.  Dropping it here -- which
+         * is what this path did -- stranded both the buffer and the
+         * r->mem_pool retain nxt_http_proxy_buf_mem_alloc() took, so the whole
+         * request pool was never destroyed.  Measured on the parent commit:
+         * two pools reach a zero retain per request on this path against three
+         * on the path where the body shares the header's read.
+         */
+        if (nxt_slow_path(nxt_http_proxy_buf_mem_hold(task, r, b) != NXT_OK)) {
+            peer->status = NXT_HTTP_INTERNAL_SERVER_ERROR;
+            break;
         }
 
         r->state->ready_handler(task, r, peer);

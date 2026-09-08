@@ -76,6 +76,7 @@ single `grep` finds every side of a case. E.g. token `chunked_response`:
 
 | Port | Token | Mode (CLI) | Rust handler | pytest |
 |------|-------|-----------|--------------|--------|
+| 7978 | — | — (plain-Python upstream in the test file) | `test_proxy_head.py` (bodyless upstream response: header block only, then close — not a `fake_upstream` mode, reserved here so the 79xx block stays in one registry) |
 | 7979 | `dup_cl` | `dup-cl` | `respond_dup_cl` | `test_proxy_dup_cl_keepalive_disabled` (duplicate upstream Content-Length disables downstream keepalive for a keep-alive client; complete body keeps its terminal chunk) — out of the 7983–7999 block below, which is exhausted; 7980–7982 are `fake_otlp`, so 7974–7979 is the free gap |
 | 7983 | `dup_cl` | `dup-cl` | `respond_dup_cl` | `test_proxy_dup_cl_raw` (zero raw `Content-Length` occurrences on the wire, complete re-framed chunked body) |
 | 7984 | `dup_cl` | `dup-cl` | `respond_dup_cl` | `test_proxy_dup_cl` (duplicate upstream Content-Length → neither forwarded, body re-framed, #113) |
@@ -96,7 +97,7 @@ single `grep` finds every side of a case. E.g. token `chunked_response`:
 
 > **7999 is not available here.** `test/test_proxy.py` and `test/test_proxy_chunked.py`
 > already bind `SERVER_PORT = 7999` for their own upstream, so this registry ends at
-> 7998. New `fake_upstream` slots go to the 7974–7979 gap (7980–7982 are `fake_otlp`).
+> 7998. New `fake_upstream` slots go to the 7974–7977 gap (7978–7979 are taken above, 7980–7982 are `fake_otlp`).
 
 A test pins its port as a module constant referencing this table:
 

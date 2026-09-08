@@ -375,6 +375,76 @@ nxt_http_proxy_buf_mem_free(nxt_task_t *task, nxt_http_request_t *r,
 
 
 static void
+nxt_http_proxy_buf_mem_cleanup(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_buf_t           *b;
+    nxt_event_engine_t  *engine;
+
+    b = obj;
+    engine = data;
+
+    /*
+     * Runs from nxt_mp_destroy(), which may be reached from a different task
+     * than the one current when the buffer was held, so "task" is not touched
+     * and the engine is carried in "data" instead.
+     */
+
+    nxt_event_engine_buf_mem_free(engine, b);
+}
+
+
+/*
+ * Keep an upstream read buffer alive for the rest of the request without
+ * holding the request pool hostage.
+ *
+ * A buffer that is relayed downstream needs none of this: its completion
+ * handler frees it and drops the retain.  One that is *not* relayed does --
+ * an upstream header block with no body bytes behind it, and the header of a
+ * response that RFC 9112 Sect. 6.3 gives no body at all.  Two things then have
+ * to hold at once:
+ *
+ *   - It must outlive the response.  peer->fields point their name/value into
+ *     this buffer (nxt_http_parse_fields) and nxt_http_proxy_header_read()
+ *     shallow-copies those field structs into r->resp, where
+ *     $response_header_* and "match" conditions read them until the request is
+ *     logged and closed.  Returning it to the engine cache when the response
+ *     completes would leave them pointing at reusable memory.
+ *
+ *   - It must not keep the retain nxt_http_proxy_buf_mem_alloc() took.  That
+ *     retain is dropped by a buffer completion, and a buffer that is never
+ *     relayed has no completion to run -- the pool would never reach zero and
+ *     the entire request pool would be stranded.
+ *
+ * A pool cleanup satisfies both: nxt_mp_destroy() runs it before freeing the
+ * pool's own blocks, so the field bytes stay valid for exactly as long as
+ * anything can read them, and not one request longer.
+ */
+
+nxt_int_t
+nxt_http_proxy_buf_mem_hold(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_buf_t *b)
+{
+    nxt_int_t  ret;
+
+    ret = nxt_mp_cleanup(r->mem_pool, nxt_http_proxy_buf_mem_cleanup, task, b,
+                         task->thread->engine);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return NXT_ERROR;
+    }
+
+    /*
+     * The request itself holds a retain until nxt_http_request_close_handler(),
+     * so this cannot destroy the pool here -- which it must not, the cleanup
+     * just registered lives in it.
+     */
+
+    nxt_mp_release(r->mem_pool);
+
+    return NXT_OK;
+}
+
+
+static void
 nxt_http_proxy_error(nxt_task_t *task, void *obj, void *data)
 {
     nxt_http_peer_t     *peer;

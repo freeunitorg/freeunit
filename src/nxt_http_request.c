@@ -22,7 +22,6 @@ static void nxt_http_request_forward_protocol(nxt_http_request_t *r,
 static void nxt_http_request_ready(nxt_task_t *task, void *obj, void *data);
 static void nxt_http_request_proto_info(nxt_task_t *task,
     nxt_http_request_t *r);
-static nxt_bool_t nxt_http_request_is_bodyless(nxt_http_request_t *r);
 static void nxt_http_request_drop_framing_fields(nxt_http_request_t *r);
 static nxt_buf_t *nxt_http_request_body_drop(nxt_task_t *task,
     nxt_http_request_t *r, nxt_buf_t *out);
@@ -707,7 +706,7 @@ nxt_http_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
      * verbatim and unframed, which a downstream parser reads as the start of
      * the next response.
      */
-    r->no_body = nxt_http_request_is_bodyless(r);
+    r->no_body = nxt_http_request_is_bodyless(r, r->status);
 
     /*
      * RFC 9110 Sect. 8.6: a server must not send Content-Length in a 1xx or
@@ -817,8 +816,38 @@ nxt_http_request_ws_frame_start(nxt_task_t *task, nxt_http_request_t *r,
 }
 
 
-static nxt_bool_t
-nxt_http_request_is_bodyless(nxt_http_request_t *r)
+/*
+ * A *final* response that RFC 9112 Sect. 6.3 gives no message body: 204, 304,
+ * or any response to HEAD.  1xx is excluded on purpose.  A 1xx is an interim
+ * response -- the exchange continues with a final response after it -- so
+ * "carries no body" and "ends the exchange" are different questions for it,
+ * and a caller that needs the second one must not be answered with the first.
+ *
+ * The status is a parameter rather than a read of r->status because the proxy
+ * has to answer this question before r->status exists.  The h1 peer reader
+ * decides how to frame the upstream body while the upstream status still lives
+ * in peer->status; nxt_http_proxy_header_read() copies it into r->status only
+ * one step later.
+ */
+
+nxt_bool_t
+nxt_http_request_is_bodyless_final(nxt_http_request_t *r,
+    nxt_http_status_t status)
+{
+    if (status < NXT_HTTP_OK) {
+        return 0;
+    }
+
+    if (status == NXT_HTTP_NO_CONTENT || status == NXT_HTTP_NOT_MODIFIED) {
+        return 1;
+    }
+
+    return r->method != NULL && nxt_str_eq(r->method, "HEAD", 4);
+}
+
+
+nxt_bool_t
+nxt_http_request_is_bodyless(nxt_http_request_t *r, nxt_http_status_t status)
 {
     /*
      * A 101 upgrade is a 1xx status, but the bytes that follow its header are
@@ -832,21 +861,15 @@ nxt_http_request_is_bodyless(nxt_http_request_t *r)
      * alone would leave an application that answers a WebSocket-upgrade
      * request with 204 plus a body on the unframed path.
      */
-    if (r->websocket_handshake && r->status == NXT_HTTP_SWITCHING_PROTOCOLS) {
+    if (r->websocket_handshake && status == NXT_HTTP_SWITCHING_PROTOCOLS) {
         return 0;
     }
 
-    if (r->status >= NXT_HTTP_CONTINUE && r->status < NXT_HTTP_OK) {
+    if (status >= NXT_HTTP_CONTINUE && status < NXT_HTTP_OK) {
         return 1;
     }
 
-    if (r->status == NXT_HTTP_NO_CONTENT
-        || r->status == NXT_HTTP_NOT_MODIFIED)
-    {
-        return 1;
-    }
-
-    return r->method != NULL && nxt_str_eq(r->method, "HEAD", 4);
+    return nxt_http_request_is_bodyless_final(r, status);
 }
 
 
