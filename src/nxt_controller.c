@@ -379,6 +379,27 @@ nxt_controller_start(nxt_task_t *task, nxt_process_data_t *data)
     vldt.conf_pool = mp;
     vldt.ver = nxt_conf_ver;
 
+    /*
+     * A state file written before this check existed can hold bytes the
+     * control API would now refuse.  Rejecting it here would drop the whole
+     * configuration on the next restart -- the daemon would come back serving
+     * nothing -- and repairing it would silently rewrite an operator's value,
+     * which is how a working non-UTF-8 "share" path becomes a broken one.  So
+     * it is loaded exactly as written and reported, once, with the pointer
+     * that names it.  The API refuses to store any more of them.
+     */
+
+    if (nxt_conf_validate_encoding(&vldt) == NXT_DECLINED) {
+        nxt_log(task, NXT_LOG_WARN, "the restored configuration holds a value "
+                "at \"%V\" that the control API would now reject: %V  It is "
+                "kept as written, and the configuration is running; correct it "
+                "to be able to update the configuration.",
+                &vldt.pointer, &vldt.error);
+
+        nxt_memzero(&vldt.error, sizeof(nxt_str_t));
+        nxt_memzero(&vldt.pointer, sizeof(nxt_str_t));
+    }
+
     ret = nxt_conf_validate(&vldt);
 
     if (nxt_slow_path(ret != NXT_OK)) {
@@ -1510,7 +1531,22 @@ nxt_controller_process_config(nxt_task_t *task, nxt_controller_request_t *req,
         vldt.conf_pool = mp;
         vldt.ver = NXT_VERNUM;
 
-        rc = nxt_conf_validate(&vldt);
+        /*
+         * Before nxt_conf_validate(), which quotes an offending member name
+         * into its own error text: a name that is not UTF-8 would otherwise
+         * reach the response body and make the error report unreadable for
+         * the very reason it is being reported.
+         *
+         * This runs on the tree that would be installed, so a configuration
+         * that already holds such a value has to have it corrected before any
+         * other part of it can be updated.  The pointer in the error names it.
+         */
+
+        rc = nxt_conf_validate_encoding(&vldt);
+
+        if (nxt_fast_path(rc == NXT_OK)) {
+            rc = nxt_conf_validate(&vldt);
+        }
 
         if (nxt_slow_path(rc != NXT_OK)) {
             nxt_mp_destroy(mp);
@@ -1595,7 +1631,22 @@ nxt_controller_process_config(nxt_task_t *task, nxt_controller_request_t *req,
         vldt.conf_pool = mp;
         vldt.ver = NXT_VERNUM;
 
-        rc = nxt_conf_validate(&vldt);
+        /*
+         * Before nxt_conf_validate(), which quotes an offending member name
+         * into its own error text: a name that is not UTF-8 would otherwise
+         * reach the response body and make the error report unreadable for
+         * the very reason it is being reported.
+         *
+         * This runs on the tree that would be installed, so a configuration
+         * that already holds such a value has to have it corrected before any
+         * other part of it can be updated.  The pointer in the error names it.
+         */
+
+        rc = nxt_conf_validate_encoding(&vldt);
+
+        if (nxt_fast_path(rc == NXT_OK)) {
+            rc = nxt_conf_validate(&vldt);
+        }
 
         if (nxt_slow_path(rc != NXT_OK)) {
             nxt_mp_destroy(mp);

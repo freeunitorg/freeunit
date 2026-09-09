@@ -128,6 +128,14 @@ void nxt_conf_json_position(u_char *start, const u_char *pos, nxt_uint_t *line,
 
 nxt_int_t nxt_conf_validate(nxt_conf_validation_t *vldt);
 
+/*
+ * Checks every string in the tree -- values and member names alike -- for
+ * valid UTF-8.  Separate from nxt_conf_validate() because
+ * the two callers want different answers: the control API refuses such a
+ * configuration, while a state file that already holds one still has to load.
+ */
+nxt_int_t nxt_conf_validate_encoding(nxt_conf_validation_t *vldt);
+
 NXT_EXPORT void nxt_conf_get_string(const nxt_conf_value_t *value,
     nxt_str_t *str);
 NXT_EXPORT nxt_str_t *nxt_conf_get_string_dup(const nxt_conf_value_t *value,

@@ -55,6 +55,62 @@ def test_json_unicode():
     }, 'unicode get'
 
 
+def test_json_utf8_invalid_value():
+    # A configuration string is JSON text and JSON text is UTF-8 (RFC 8259
+    # Sect. 8.1).  Bytes that begin no valid sequence used to be stored and
+    # echoed back, which made GET /config undecodable.
+    resp = client.conf(
+        b'{"listeners": {"*:8080": {"pass": "routes"}},'
+        b' "routes": [{"match": {"headers": {"X-T": "caf\xff\xfe"}},'
+        b' "action": {"return": 200}}]}'
+    )
+
+    assert 'error' in resp, 'invalid utf-8 value rejected'
+    assert 'UTF-8' in resp['detail'], 'reason given'
+    assert (
+        resp['location']['path'] == '/routes/0/match/headers/X-T'
+    ), 'pointer names the value'
+
+
+def test_json_utf8_invalid_member_name():
+    resp = client.conf(
+        b'{"listeners": {"*:8080": {"pass": "routes"}},'
+        b' "routes": [{"match": {"headers": {"X-\xff": "v"}},'
+        b' "action": {"return": 200}}]}'
+    )
+
+    assert 'error' in resp, 'invalid utf-8 member name rejected'
+    assert 'member name' in resp['detail'], 'name named as the culprit'
+
+    # The pointer is echoed in this very response, so it must point at the
+    # object holding the bad name rather than embed the name itself --
+    # otherwise the error report is unreadable for the reason it reports.
+    assert (
+        resp['location']['path'] == '/routes/0/match/headers'
+    ), 'pointer stops at the parent'
+
+
+def test_json_utf8_valid():
+    # Multi-byte UTF-8 is not affected: it must round-trip byte for byte.
+    value = 'caf\u00e9-\U0001f600-\u043d'
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "routes"}},
+            "routes": [
+                {
+                    "match": {"headers": {"X-T": value}},
+                    "action": {"return": 200},
+                }
+            ],
+        }
+    ), 'valid utf-8 accepted'
+
+    assert (
+        client.conf_get('routes/0/match/headers/X-T') == value
+    ), 'valid utf-8 round-trips unchanged'
+
+
 def test_json_unicode_2():
     assert 'success' in client.conf(
         {

@@ -1804,6 +1804,134 @@ nxt_conf_vldt_type(nxt_conf_validation_t *vldt, const nxt_str_t *name,
  *
  * Never fails validation: on allocation failure the pointer is left empty.
  */
+/*
+ * A configuration string is JSON text, and RFC 8259 Sect. 8.1 defines JSON
+ * text as UTF-8.  The parser does not enforce it: nxt_conf_json_parse_string()
+ * copies every byte above 0x1F through untouched, so a PUT can store bytes that
+ * no JSON parser reads back -- including the body of GET /config, which is
+ * served as "application/json", a media type that carries no charset parameter.
+ *
+ * This walks the parsed tree rather than the schema.  A configuration option
+ * added later cannot escape the check by forgetting to ask for it, which is the
+ * property that matters here: the zero-byte guards this fork already carries
+ * were written one sink at a time, and the sink nobody reported kept its hole.
+ *
+ * A zero byte is deliberately NOT rejected.  It is valid UTF-8, and "location"
+ * accepts one today and percent-encodes it (test/test_return.py:137), so
+ * refusing it here would break a documented behaviour to fix a different
+ * problem.  The path sinks guard themselves; see nxt_http_static.c.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_encoding_str(nxt_conf_validation_t *vldt, const nxt_str_t *str,
+    const char *what)
+{
+    if (nxt_slow_path(!nxt_utf8_is_valid(str->start, str->length))) {
+        return nxt_conf_vldt_error(vldt, "The %s is not valid UTF-8.  JSON "
+                                   "text is UTF-8 (RFC 8259 Sect. 8.1), so "
+                                   "these bytes have no JSON representation "
+                                   "and could not be read back.", what);
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_conf_vldt_encoding_value(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value)
+{
+    u_char                *p;
+    uint32_t              index, next, count;
+    nxt_str_t             name, str;
+    nxt_int_t             ret;
+    nxt_conf_value_t      *member;
+    nxt_conf_vldt_path_t  seg;
+
+    u_char                buf[sizeof("4294967295") - 1];
+
+    switch (nxt_conf_type(value)) {
+
+    case NXT_CONF_STRING:
+        nxt_conf_get_string(value, &str);
+
+        return nxt_conf_vldt_encoding_str(vldt, &str, "value");
+
+    case NXT_CONF_ARRAY:
+        count = nxt_conf_array_elements_count(value);
+
+        for (index = 0; index < count; index++) {
+            p = nxt_sprintf(buf, buf + sizeof(buf), "%uD", index);
+
+            seg.prev = vldt->path;
+            seg.seg.start = buf;
+            seg.seg.length = p - buf;
+            vldt->path = &seg;
+
+            ret = nxt_conf_vldt_encoding_value(vldt,
+                                    nxt_conf_get_array_element(value, index));
+
+            vldt->path = seg.prev;
+
+            if (nxt_slow_path(ret != NXT_OK)) {
+                return ret;
+            }
+        }
+
+        return NXT_OK;
+
+    case NXT_CONF_OBJECT:
+        next = 0;
+
+        for ( ;; ) {
+            member = nxt_conf_next_object_member(value, &name, &next);
+
+            if (member == NULL) {
+                break;
+            }
+
+            /*
+             * Check the name before it becomes a path segment.  The pointer
+             * rendered for an error is echoed in the response body, so putting
+             * the offending bytes there would make the error report itself
+             * unreadable for the same reason it is being reported.  A bad name
+             * is reported against the object that holds it.
+             */
+
+            ret = nxt_conf_vldt_encoding_str(vldt, &name, "member name");
+
+            if (nxt_slow_path(ret != NXT_OK)) {
+                return ret;
+            }
+
+            seg.prev = vldt->path;
+            seg.seg = name;
+            vldt->path = &seg;
+
+            ret = nxt_conf_vldt_encoding_value(vldt, member);
+
+            vldt->path = seg.prev;
+
+            if (nxt_slow_path(ret != NXT_OK)) {
+                return ret;
+            }
+        }
+
+        return NXT_OK;
+
+    default:
+        return NXT_OK;
+    }
+}
+
+
+nxt_int_t
+nxt_conf_validate_encoding(nxt_conf_validation_t *vldt)
+{
+    return nxt_conf_vldt_encoding_value(vldt, vldt->conf);
+}
+
+
 static void
 nxt_conf_vldt_render_pointer(nxt_conf_validation_t *vldt)
 {
