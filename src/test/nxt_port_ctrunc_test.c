@@ -179,12 +179,155 @@ nxt_port_ctrunc_test_close_fds(nxt_fd_t *fd)
 
 
 /*
- * Defined only where it is called: both call sites sit in the non-macOS arm
- * below, and an unused static trips -Wunused-function under -Werror on a
- * platform no CI leg builds.
+ * Do "controllen" bytes of control buffer hold the two descriptors that were
+ * sent, and does the kernel say so?
+ *
+ * Returns NXT_OK when MSG_CTRUNC came back, NXT_DECLINED when the exchange
+ * worked and the flag did not, and NXT_ERROR when the probe itself could not
+ * run -- a caller that cannot tell those apart reports a kernel property it
+ * never observed.  "used" and "flags" carry what was seen, for the log.
+ *
+ * Only SCM_RIGHTS is used, so this is the same on every platform that has any
+ * of it at all.
  */
 
-#if !(NXT_MACOSX)
+static nxt_int_t
+nxt_port_ctrunc_test_probe(size_t controllen, size_t *used, int *flags)
+{
+    int             fd[2], received;
+    char            buf, *data, *limit;
+    size_t          i;
+    ssize_t         n;
+    nxt_int_t       ret;
+    nxt_socket_t    pair[2];
+    struct iovec    iov;
+    struct msghdr   msg;
+    struct cmsghdr  *cmsg;
+    union {
+        struct cmsghdr  align;
+        char            buf[CMSG_SPACE(2 * sizeof(int))];
+    } send_control;
+    union {
+        struct cmsghdr  align;
+        char            buf[CMSG_SPACE(2 * sizeof(int))];
+    } recv_control;
+
+    *used = 0;
+    *flags = 0;
+
+    if (nxt_slow_path(controllen > sizeof(recv_control.buf))) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_slow_path(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0)) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_slow_path(pipe(fd) != 0)) {
+        close(pair[0]);
+        close(pair[1]);
+
+        return NXT_ERROR;
+    }
+
+    buf = 'x';
+    iov.iov_base = &buf;
+    iov.iov_len = 1;
+
+    nxt_memzero(&msg, sizeof(struct msghdr));
+    nxt_memzero(&send_control, sizeof(send_control));
+
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = send_control.buf;
+    msg.msg_controllen = sizeof(send_control.buf);
+
+    cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(2 * sizeof(int));
+    nxt_memcpy(CMSG_DATA(cmsg), fd, 2 * sizeof(int));
+
+    ret = NXT_ERROR;
+
+    if (nxt_fast_path(sendmsg(pair[0], &msg, 0) == 1)) {
+
+        nxt_memzero(&msg, sizeof(struct msghdr));
+        nxt_memzero(&recv_control, sizeof(recv_control));
+
+        iov.iov_base = &buf;
+        iov.iov_len = 1;
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = recv_control.buf;
+        msg.msg_controllen = controllen;
+
+        n = recvmsg(pair[1], &msg, 0);
+
+        if (nxt_fast_path(n == 1)) {
+
+            /*
+             * Everything below walks what the kernel returned, and the reason
+             * this probe exists is that the layer underneath may not be one.
+             * Nothing here trusts a length it did not bound first: a
+             * msg_controllen larger than the buffer that was offered, or a
+             * cmsg_len reaching past it, would otherwise walk off the union
+             * and close whatever integer it found there.
+             */
+
+            if (msg.msg_controllen > controllen) {
+                msg.msg_controllen = controllen;
+            }
+
+            *used = msg.msg_controllen;
+            *flags = msg.msg_flags;
+
+            ret = (msg.msg_flags & MSG_CTRUNC) ? NXT_OK : NXT_DECLINED;
+
+            limit = recv_control.buf + msg.msg_controllen;
+
+            for (cmsg = CMSG_FIRSTHDR(&msg);
+                 cmsg != NULL;
+                 cmsg = CMSG_NXTHDR(&msg, cmsg))
+            {
+                if (cmsg->cmsg_level != SOL_SOCKET
+                    || cmsg->cmsg_type != SCM_RIGHTS)
+                {
+                    continue;
+                }
+
+                /*
+                 * Whatever did fit was installed and belongs to this process
+                 * now; leaving it open would move the descriptor count the
+                 * cases this gates are measuring.  Standard streams are never
+                 * what was sent, so a 0, 1 or 2 here is a misread rather than
+                 * a descriptor to close.
+                 */
+
+                data = (char *) CMSG_DATA(cmsg);
+
+                for (i = 0; data + i + sizeof(int) <= limit
+                            && CMSG_LEN(i + sizeof(int)) <= cmsg->cmsg_len;
+                     i += sizeof(int))
+                {
+                    nxt_memcpy(&received, data + i, sizeof(int));
+
+                    if (received > STDERR_FILENO) {
+                        close(received);
+                    }
+                }
+            }
+        }
+    }
+
+    close(fd[0]);
+    close(fd[1]);
+    close(pair[0]);
+    close(pair[1]);
+
+    return ret;
+}
+
 
 /*
  * The regression itself: a control buffer that holds the credential but not
@@ -279,8 +422,6 @@ nxt_port_ctrunc_test_truncated(nxt_thread_t *thr, nxt_socket_t *pair,
 
     return NXT_OK;
 }
-
-#endif
 
 
 /*
@@ -891,22 +1032,50 @@ nxt_port_ctrunc_test(nxt_thread_t *thr)
     }
 
     /*
-     * The cases below assert how the kernel itself divides a control buffer
-     * that is too small: Linux and the BSDs run scm_detach_fds() against the
-     * room that is left and raise MSG_CTRUNC, while xnu externalizes the
-     * rights before it measures, so the same short receive there does not
-     * report truncation at all.  Skipped rather than adapted: what they add
-     * over nxt_port_ctrunc_test_marked() is the proof that a real kernel
-     * produces the flag, and on a kernel that does not, there is nothing to
-     * prove.  The code under test is platform independent -- nothing acts on
-     * a truncation that was not reported.
+     * The two cases below assert how the kernel itself divides a control
+     * buffer that is too small.  They are two different decisions: with no
+     * room for any descriptor it drops the whole SCM_RIGHTS cmsg, and with
+     * room for one of two it installs what fits.  Both must raise MSG_CTRUNC
+     * for the cases to mean anything, and not every layer does -- xnu
+     * externalizes the rights before it measures, and qemu-user's cmsg
+     * translation reproduces neither kernel.  Nothing in the code under test
+     * acts on a truncation that was not reported, so where the flag does not
+     * come back there is nothing to prove and asserting it anyway fails for
+     * the environment rather than for the code.
+     *
+     * Probe both shapes rather than one: a layer that mistranslates the
+     * budget for the second decision need not mistranslate the first, and a
+     * predicate narrower than what it gates would let a case through to fail
+     * for the environment again.
      */
-#if (NXT_MACOSX)
+    if (ret == NXT_OK) {
+        nxt_int_t  drop, partial;
+        size_t     drop_used, partial_used;
+        int        drop_flags, partial_flags;
 
-    nxt_log_error(NXT_LOG_NOTICE, thr->log, "port ctrunc test: kernel driven "
-                  "truncation cases skipped on macOS");
+        drop = nxt_port_ctrunc_test_probe(CMSG_LEN(0), &drop_used,
+                                          &drop_flags);
+        partial = nxt_port_ctrunc_test_probe(CMSG_LEN(0) + sizeof(int),
+                                             &partial_used, &partial_flags);
 
-#else
+        if (drop == NXT_ERROR || partial == NXT_ERROR) {
+            nxt_log_alert(thr->log, "port ctrunc test: the MSG_CTRUNC probe "
+                          "could not run, so the kernel driven cases cannot "
+                          "be decided either way");
+            ret = NXT_ERROR;
+            goto done;
+        }
+
+        if (drop != NXT_OK || partial != NXT_OK) {
+            nxt_log_error(NXT_LOG_NOTICE, thr->log, "port ctrunc test: "
+                          "kernel driven truncation cases skipped -- this "
+                          "kernel does not report MSG_CTRUNC (no room: used "
+                          "%uz flags 0x%04Xd; one of two: used %uz flags "
+                          "0x%04Xd)", drop_used, (unsigned) drop_flags,
+                          partial_used, (unsigned) partial_flags);
+            goto done;
+        }
+    }
 
     if (ret == NXT_OK) {
         ret = nxt_port_ctrunc_test_truncated(thr, pair,
@@ -932,7 +1101,7 @@ nxt_port_ctrunc_test(nxt_thread_t *thr)
                                   "one of two descriptors delivered");
     }
 
-#endif
+done:
 
     nxt_socket_close(task, pair[0]);
     nxt_socket_close(task, pair[1]);
