@@ -8,10 +8,6 @@ license = "Apache-2.0"
 [lib]
 name = "unit_client_rs"
 
-[features]
-# this preserves the ordering of json
-default = ["serde_json/preserve_order"]
-
 [dependencies]
 custom_error = "1.9"
 hyper = { version = "1", features = ["http1", "http2"] }
@@ -21,7 +17,10 @@ hyperlocal = "0.9"
 http-body-util = "0.1"
 bytes = "1"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# preserve_order is required, not optional.  json_body compares two decodes of
+# the same body member by member, in order, and a sorted map would pair them
+# wrongly.  It also keeps the server's member order in what unitctl prints.
+serde_json = { version = "1.0", features = ["preserve_order"] }
 sysinfo = "0.39"
 tokio = { version = "1.34", features = ["macros"] }
 futures = "0.3"

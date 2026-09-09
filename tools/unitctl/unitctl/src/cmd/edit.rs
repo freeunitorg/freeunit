@@ -1,10 +1,11 @@
 use crate::inputfile::{InputFile, InputFormat};
-use crate::requests::{send_and_validate_config_deserialize_response, send_empty_body_deserialize_response};
+use crate::requests::{send_and_validate_config_deserialize_response, send_empty_body_read_bytes};
 use crate::unitctl::UnitCtl;
 use crate::unitctl_error::ControlSocketErrorKind;
 use crate::{wait, OutputFormat, UnitctlError};
 use std::path::{Path, PathBuf};
-use unit_client_rs::unit_client::UnitClient;
+use unit_client_rs::json_body;
+use unit_client_rs::unit_client::{UnitClient, UnitSerializableMap};
 use which::which;
 
 const EDITOR_ENV_VARS: [&str; 2] = ["EDITOR", "VISUAL"];
@@ -20,7 +21,11 @@ const EDITOR_KNOWN_LIST: [&str; 8] = [
 ];
 
 pub(crate) async fn cmd(cli: &UnitCtl, output_format: OutputFormat) -> Result<(), UnitctlError> {
-    if cli.control_socket_addresses.as_ref().map_or(false, |addrs| addrs.len() > 1) {
+    if cli
+        .control_socket_addresses
+        .as_ref()
+        .map_or(false, |addrs| addrs.len() > 1)
+    {
         return Err(UnitctlError::ControlSocketError {
             kind: ControlSocketErrorKind::General,
             message: "too many control sockets. specify at most one.".to_string(),
@@ -29,8 +34,36 @@ pub(crate) async fn cmd(cli: &UnitCtl, output_format: OutputFormat) -> Result<()
 
     let mut control_sockets = wait::wait_for_sockets(cli).await?;
     let client = UnitClient::new(control_sockets.pop().unwrap());
-    // Get latest configuration
-    let current_config = send_empty_body_deserialize_response(&client, "GET", "/config").await?;
+    // Get latest configuration.  Editing means handing it back, and the way
+    // back runs the file through serde_json, whose strings are Rust strings:
+    // bytes Unit stores but UTF-8 cannot carry would be replaced by the mere
+    // act of opening the editor.  Refuse rather than rewrite a configuration
+    // the user only meant to look at.
+    // UnitSerializableMap and not serde_json::Value: a configuration is a JSON
+    // object, and the type is what keeps a 200 carrying "null", an array or a
+    // bare string -- an intermediary talking -- from being opened in the editor
+    // and handed back as the whole configuration.
+    let raw_config = send_empty_body_read_bytes(&client, "GET", "/config").await?;
+    let current_config: UnitSerializableMap = match json_body::decode(&raw_config) {
+        Ok((config, fidelity)) if fidelity.is_exact() => config,
+        Ok((_, fidelity)) => {
+            return Err(UnitctlError::UndecodableConfiguration {
+                path: "/config".to_string(),
+                members: fidelity.members(),
+                values: fidelity.replaced_values(),
+                names: fidelity.replaced_names(),
+            })
+        }
+        // Name the path, as the JsonError this replaced did: "expected value at
+        // line 1 column 1" on its own does not say what was being read -- and
+        // show the body, because a 200 carrying an intermediary's page is the
+        // ordinary way this arm is reached.
+        Err(error) => {
+            return Err(UnitctlError::DeserializationError {
+                message: format!("/config: {}\n{}", error, json_body::body_for_display(&raw_config)),
+            })
+        }
+    };
 
     // Write JSON to temporary file - this file will automatically be deleted by the OS when
     // the last file handle to it is removed.

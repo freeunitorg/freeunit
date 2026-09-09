@@ -5,6 +5,7 @@ extern crate hyperlocal;
 extern crate serde;
 extern crate serde_json;
 pub mod control_socket_address;
+pub mod json_body;
 mod runtime_flags;
 pub mod unit_client;
 mod unitd_cmd;
