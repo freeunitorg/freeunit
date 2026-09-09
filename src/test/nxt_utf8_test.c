@@ -107,6 +107,24 @@ nxt_utf8_test(nxt_thread_t *thr)
 
         d = nxt_utf8_decode(&pp, p);
 
+        /*
+         * The surrogates are encodable as bytes but are not UTF-8, so the
+         * decoder refuses them; nxt_utf8_encode() still produces the
+         * three-byte form, which is what a WTF-8 producer would emit.
+         */
+
+        if (u >= 0xD800 && u <= 0xDFFF) {
+
+            if (d != 0xFFFFFFFF) {
+                nxt_log_alert(thr->log, "nxt_utf8_decode(%05uxD) returned "
+                              "%05uxD for a surrogate, expected a refusal",
+                              u, d);
+                return NXT_ERROR;
+            }
+
+            continue;
+        }
+
         if (u != d) {
             nxt_log_alert(thr->log, "nxt_utf8_decode(%05uxD) failed: %05uxD",
                           u, d);

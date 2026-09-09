@@ -158,7 +158,18 @@ nxt_utf8_decode2(const u_char **start, const u_char *end)
 
         } while (n != 0);
 
-        if (overlong < u && u < 0x110000) {
+        /*
+         * Shortest form, inside the Unicode range, and not a surrogate:
+         * U+D800-U+DFFF exist only to be paired inside UTF-16 and have no
+         * UTF-8 encoding at all (Unicode 15.0 Sect. 3.9, D92), so a decoder
+         * that returns them hands its caller a code point that cannot be
+         * re-encoded -- and, for anything that then writes the bytes back
+         * out, output no strict reader will take.
+         */
+
+        if (overlong < u && u < 0x110000
+            && !(u >= 0xD800 && u <= 0xDFFF))
+        {
             *start = p;
             return u;
         }
