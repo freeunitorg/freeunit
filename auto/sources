@@ -204,11 +204,6 @@ if [ "$NXT_HAVE_CGROUP" = "YES" ]; then
 fi
 
 
-NXT_LIB_UTF8_FILE_NAME_TEST_SRCS=" \
-    src/test/nxt_utf8_file_name_test.c \
-"
-
-
 if [ $NXT_HAVE_ROOTFS = YES ]; then
     NXT_LIB_SRCS="$NXT_LIB_SRCS src/nxt_fs_mount.c"
 fi

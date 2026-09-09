@@ -83,7 +83,6 @@ nxt_utf8_test(nxt_thread_t *thr)
 {
     u_char        *p, utf8[4];
     size_t        len;
-    int32_t       n;
     uint32_t      u, d;
     nxt_uint_t    i, k, l, m;
     const u_char  *pp;
@@ -192,16 +191,6 @@ nxt_utf8_test(nxt_thread_t *thr)
                 }
             }
         }
-    }
-
-    n = nxt_utf8_casecmp((u_char *) "ABC АБВ ΑΒΓ",
-                         (u_char *) "abc абв αβγ",
-                         nxt_length("ABC АБВ ΑΒΓ"),
-                         nxt_length("abc абв αβγ"));
-
-    if (n != 0) {
-        nxt_log_alert(thr->log, "nxt_utf8_casecmp() failed");
-        return NXT_ERROR;
     }
 
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "utf8 test passed");

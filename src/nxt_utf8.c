@@ -6,28 +6,8 @@
 
 #include <nxt_main.h>
 
-/*
- * The nxt_unicode_lowcase.h file is the auto-generated file from
- * the CaseFolding-6.3.0.txt file provided by Unicode, Inc.:
- *
- *   ./lib/src/nxt_unicode_lowcase.pl CaseFolding-6.3.0.txt
- *
- * This file should be copied to system specific nxt_unicode_SYSTEM_lowcase.h
- * file and utf8_file_name_test should be built with this file.
- * Then a correct system specific file should be generated:
- *
- *   ./build/utf8_file_name_test | ./lib/src/nxt_unicode_lowcase.pl
- *
- * Only common and simple case foldings are supported.  Full case foldings
- * is not supported.  Combined characters are also not supported.
- */
 
-#if (NXT_MACOSX)
-#include <nxt_unicode_macosx_lowcase.h>
-
-#else
-#include <nxt_unicode_lowcase.h>
-#endif
+static uint32_t nxt_utf8_decode2(const u_char **start, const u_char *end);
 
 
 u_char *
@@ -91,7 +71,7 @@ nxt_utf8_decode(const u_char **start, const u_char *end)
  * invalid or overlong UTF-8 sequence.
  */
 
-uint32_t
+static uint32_t
 nxt_utf8_decode2(const u_char **start, const u_char *end)
 {
     u_char        c;
@@ -176,72 +156,6 @@ nxt_utf8_decode2(const u_char **start, const u_char *end)
     }
 
     return 0xFFFFFFFF;
-}
-
-
-/*
- * nxt_utf8_casecmp() tests only up to the minimum of given lengths, but
- * requires lengths of both strings because otherwise nxt_utf8_decode2()
- * may fail due to incomplete sequence.
- */
-
-nxt_int_t
-nxt_utf8_casecmp(const u_char *start1, const u_char *start2, size_t len1,
-    size_t len2)
-{
-    int32_t       n;
-    uint32_t      u1, u2;
-    const u_char  *end1, *end2;
-
-    end1 = start1 + len1;
-    end2 = start2 + len2;
-
-    while (start1 < end1 && start2 < end2) {
-
-        u1 = nxt_utf8_lowcase(&start1, end1);
-
-        u2 = nxt_utf8_lowcase(&start2, end2);
-
-        if (nxt_slow_path((u1 | u2) == 0xFFFFFFFF)) {
-            return NXT_UTF8_SORT_INVALID;
-        }
-
-        n = u1 - u2;
-
-        if (n != 0) {
-            return (nxt_int_t) n;
-        }
-    }
-
-    return 0;
-}
-
-
-uint32_t
-nxt_utf8_lowcase(const u_char **start, const u_char *end)
-{
-    uint32_t        u;
-    const uint32_t  *block;
-
-    u = (uint32_t) **start;
-
-    if (nxt_fast_path(u < 0x80)) {
-        (*start)++;
-
-        return nxt_unicode_block_000[u];
-    }
-
-    u = nxt_utf8_decode2(start, end);
-
-    if (u <= NXT_UNICODE_MAX_LOWCASE) {
-        block = nxt_unicode_blocks[u / NXT_UNICODE_BLOCK_SIZE];
-
-        if (block != NULL) {
-            return block[u % NXT_UNICODE_BLOCK_SIZE];
-        }
-    }
-
-    return u;
 }
 
 
