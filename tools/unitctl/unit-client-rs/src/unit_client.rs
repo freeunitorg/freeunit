@@ -4,7 +4,7 @@ use std::fmt::Debug;
 use std::rc::Rc;
 use std::{fmt, io};
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use custom_error::custom_error;
 use http_body_util::{BodyExt, Full};
 use hyper::{http, Request};
@@ -16,6 +16,7 @@ use hyperlocal::UnixConnector;
 use serde::{Deserialize, Serialize};
 
 use crate::control_socket_address::ControlSocket;
+use crate::json_body::{self, Fidelity};
 use unit_openapi::apis::configuration::Configuration;
 use unit_openapi::apis::{
     ApplicationsApi, ApplicationsApiClient, AppsApi, AppsApiClient, Error as OpenAPIError, ListenersApi,
@@ -28,7 +29,10 @@ const USER_AGENT: &str = concat!("Unit CLI/", env!("CARGO_PKG_VERSION"), "/rust"
 custom_error! {pub UnitClientError
     OpenAPIError { source: OpenAPIError } = "OpenAPI error",
     JsonError { source: serde_json::Error,
-                path: String} = "JSON error [path={path}]",
+                path: String} = "JSON error [path={path}]: {source}",
+    UnparseableBodyError { source: serde_json::Error,
+                           path: String,
+                           body: String} = "JSON error [path={path}]: {source}\n{body}",
     HyperError { source: hyper_util::client::legacy::Error,
                  control_socket_address: String,
                  path: String} = "Communications error [control_socket_address={control_socket_address}, path={path}]: {source}",
@@ -167,17 +171,27 @@ pub struct UnitClient {
     client: Box<RemoteClient>,
 }
 
+/// Say out loud when a body had to be decoded with bytes replaced, so that
+/// nobody mistakes what is printed for what the server stores.
+fn warn_if_replaced(fidelity: &Fidelity, path: &str) {
+    if let Some(warning) = fidelity.warning(path) {
+        eprintln!("{}", warning);
+    }
+}
+
 /// Pulls the parts of a control API error body out for display: the message, the
 /// detail, where the error is, and the name a typo probably meant.  The last two
 /// come back pre-formatted, empty when they do not apply, so a response carrying
 /// neither renders exactly as it did before they existed.
 fn describe_error_body(body: &serde_json::Value) -> (String, String, String, String) {
-    let member = |name: &str| {
-        body.get(name)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    };
+    // Whatever answered wrote these strings, and they are printed to a
+    // terminal.  A genuine unitd echoes only the requester's own member name
+    // here (src/nxt_conf_validation.c), so the writer to guard against is the
+    // same intermediary the unparseable-body path already guards against: an
+    // escape sequence in a 400 would otherwise reach the screen, and a newline
+    // would let it forge a line of unitctl's own output.
+    let member =
+        |name: &str| json_body::one_line(body.get(name).and_then(serde_json::Value::as_str).unwrap_or_default());
 
     let mut error = member("error");
     if error.is_empty() {
@@ -192,7 +206,7 @@ fn describe_error_body(body: &serde_json::Value) -> (String, String, String, Str
 
         match location.get("path").and_then(serde_json::Value::as_str) {
             Some("") => Some("the document root".to_string()),
-            Some(pointer) => Some(pointer.to_string()),
+            Some(pointer) => Some(json_body::one_line(pointer)),
             None => match (number("line"), number("column"), number("offset")) {
                 (Some(line), Some(column), _) => Some(format!("line {}, column {}", line, column)),
                 (_, _, Some(offset)) => Some(format!("byte offset {}", offset)),
@@ -244,11 +258,17 @@ impl UnitClient {
         }
     }
 
-    /// Sends a request to Unit and deserializes the JSON response body into the value of type `RESPONSE`.
-    pub async fn send_request_and_deserialize_response<RESPONSE: for<'de> serde::Deserialize<'de>>(
+    /// Sends a request to Unit and returns the response body as it arrived.
+    ///
+    /// A caller that will write the document back needs the bytes the server
+    /// sent and not a re-encoding of them, because a configuration can hold
+    /// bytes no Rust `String` can carry.  Turning a non-success status into an
+    /// error happens here so that those callers share it with the
+    /// deserializing variant below.
+    pub async fn send_request_and_collect_body(
         &self,
         mut request: Request<Full<Bytes>>,
-    ) -> Result<RESPONSE, UnitClientError> {
+    ) -> Result<Bytes, UnitClientError> {
         let uri = request.uri().clone();
         let path: &str = uri.path();
 
@@ -272,7 +292,6 @@ impl UnitClient {
             })?
             .to_bytes();
 
-        let mut reader = body_bytes.reader();
         if !status.is_success() {
             // The control API answers an error with "error" and, where they
             // apply, "detail", a "location" object placing the error, and a
@@ -280,11 +299,22 @@ impl UnitClient {
             // typo of.  "location" is an object, so the body is not a map of
             // strings and must not be deserialized as one: that fails the
             // whole body and hides the message it carries.
-            let body: serde_json::Value =
-                serde_json::from_reader(&mut reader).map_err(|error| UnitClientError::JsonError {
-                    source: error,
-                    path: path.to_string(),
-                })?;
+            let (body, fidelity) = match json_body::decode::<serde_json::Value>(&body_bytes) {
+                Ok(decoded) => decoded,
+                // Not JSON at all -- an intermediary's page, or a truncated
+                // answer.  A body that will not parse is exactly when its text
+                // matters most, so show it instead of a parser complaint, but
+                // show it bounded and with the control characters taken out.
+                Err(_) => {
+                    return Err(UnitClientError::HttpResponseError {
+                        status,
+                        path: path.to_string(),
+                        body: json_body::body_for_display(&body_bytes),
+                    })
+                }
+            };
+
+            warn_if_replaced(&fidelity, path);
 
             let (error, detail, location, suggestion) = describe_error_body(&body);
 
@@ -297,10 +327,32 @@ impl UnitClient {
                 suggestion,
             });
         }
-        serde_json::from_reader(&mut reader).map_err(|error| UnitClientError::JsonError {
-            source: error,
-            path: path.to_string(),
-        })
+
+        Ok(body_bytes)
+    }
+
+    /// Sends a request to Unit and deserializes the JSON response body into the value of type `RESPONSE`.
+    pub async fn send_request_and_deserialize_response<RESPONSE: for<'de> serde::Deserialize<'de>>(
+        &self,
+        request: Request<Full<Bytes>>,
+    ) -> Result<RESPONSE, UnitClientError> {
+        let path = request.uri().path().to_string();
+        let body_bytes = self.send_request_and_collect_body(request).await?;
+
+        // A success status is no guarantee that Unit answered: a proxy or a
+        // captive portal can return 200 with a page of its own.  Show it, for
+        // the reason the non-success arm above shows its body -- a body that
+        // will not parse is exactly when its text matters most.
+        let (response, fidelity) =
+            json_body::decode(&body_bytes).map_err(|error| UnitClientError::UnparseableBodyError {
+                source: error,
+                path: path.clone(),
+                body: json_body::body_for_display(&body_bytes),
+            })?;
+
+        warn_if_replaced(&fidelity, &path);
+
+        Ok(response)
     }
 
     pub fn listeners_api(&self) -> Box<dyn ListenersApi + 'static> {
@@ -384,7 +436,14 @@ impl UnitClient {
     }
 }
 
-pub type UnitSerializableMap = HashMap<String, serde_json::Value>;
+/// A JSON object as it travels between unitctl and the control API.
+///
+/// `serde_json::Map` and not `HashMap`: with the crate's `preserve_order`
+/// feature this keeps the server's member order, and a `HashMap` does not.  A
+/// `HashMap` here reordered the members of `/config` on every single run, so
+/// two `unitctl export`s of one unchanged configuration disagreed, and
+/// `unitctl edit` presented a document shuffled differently each time.
+pub type UnitSerializableMap = serde_json::Map<String, serde_json::Value>;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UnitStatus {
@@ -426,6 +485,43 @@ mod tests {
     use crate::unitd_instance::UnitdInstance;
 
     use super::*;
+
+    /// The four strings a control API error body carries are the server's text,
+    /// and they print straight to stderr.  The rendering is asserted rather than
+    /// the absence of control characters: an absence is also satisfied by U+FFFD,
+    /// which would say these strings hold bytes that could not be decoded.
+    #[test]
+    fn an_error_body_cannot_carry_control_characters_to_the_terminal() {
+        let esc = String::from_utf8(vec![0x1b]).unwrap();
+        let bell = String::from_utf8(vec![0x07]).unwrap();
+
+        let (error, detail, location, suggestion) = describe_error_body(&serde_json::json!({
+            "error": format!("{}[2Jcleared", esc),
+            "detail": format!("{}pwned\nWarning: forged line", bell),
+            "location": {"path": format!("/routes/{}[31m", esc)},
+            "suggestion": format!("pass{}", esc),
+        }));
+
+        assert_eq!(error, "\\u001b[2Jcleared");
+        assert_eq!(detail, "\\u0007pwned\\u000aWarning: forged line");
+        assert_eq!(location, "\n  Location: /routes/\\u001b[31m");
+        assert_eq!(suggestion, "\n  Did you mean: pass\\u001b");
+
+        for part in [&error, &detail, &location, &suggestion] {
+            assert!(
+                !part.contains('\u{fffd}'),
+                "text that is valid UTF-8 must not be shown as a replaced byte: {:?}",
+                part
+            );
+        }
+
+        // Location and suggestion are built with a deliberate leading newline,
+        // and it is the only one either may have.
+        assert_eq!(location.matches('\n').count(), 1);
+        assert_eq!(suggestion.matches('\n').count(), 1);
+        assert!(!error.contains('\n'));
+        assert!(!detail.contains('\n'), "detail forged a line: {:?}", detail);
+    }
 
     /// The shapes nxt_controller_response() can send, and how each renders.
     #[test]
@@ -481,6 +577,64 @@ mod tests {
             "Invalid JSON.|||"
         );
         assert_eq!(case(serde_json::json!("not an object")), "Unknown error|||");
+    }
+
+    /// A 200 is no guarantee that Unit answered: a proxy or a captive portal can
+    /// return one with a page of its own.  The parser's complaint about that page
+    /// says nothing about it, so the page is shown as well -- bounded and with
+    /// its control characters written out, since it is a stranger's text.
+    #[test]
+    fn an_unparseable_success_body_is_shown_not_just_complained_about() {
+        let page = b"<html><body>captive portal: sign in at http://portal.example/\x1b[2J</body></html>";
+        let source = serde_json::from_slice::<serde_json::Value>(page).expect_err("not JSON");
+
+        let error = UnitClientError::UnparseableBodyError {
+            path: "/config".to_string(),
+            source,
+            body: json_body::body_for_display(page),
+        };
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("/config"), "{}", rendered);
+        assert!(
+            rendered.contains("captive portal: sign in"),
+            "the page must be shown: {}",
+            rendered
+        );
+        assert!(
+            rendered.contains("expected value"),
+            "the parser's reason stays: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "an escape reached the message: {:?}",
+            rendered
+        );
+        assert!(
+            rendered.contains("\\u001b[2J"),
+            "the escape is written out: {}",
+            rendered
+        );
+    }
+
+    /// The error that carries such a body must carry it as shown: the body is
+    /// embedded in the message the user reads.
+    #[test]
+    fn the_http_response_error_shows_the_body_it_was_given() {
+        let error = UnitClientError::HttpResponseError {
+            status: http::StatusCode::BAD_GATEWAY,
+            path: "/config".to_string(),
+            body: json_body::body_for_display(&[0x1b, b'[', b'2', b'J']),
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains("/config"));
+        assert!(rendered.contains("502"));
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "an escape reached the message: {}",
+            rendered
+        );
     }
 
     // Integration tests

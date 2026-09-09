@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io;
 use std::io::{BufRead, BufReader, Error as IoError, Read};
 use std::path::{Path, PathBuf};
@@ -161,7 +160,12 @@ impl InputFile {
                     .map_err(|e| UnitctlError::DeserializationError { message: e.to_string() })?
             }
             InputFormat::Hjson => {
-                let hjson_value: HashMap<String, nu_json::Value> = nu_json::from_reader(reader)
+                // nu_json::Map and not HashMap: with the crate's preserve_order
+                // feature, on by default, it is a LinkedHashMap and keeps the
+                // document's member order.  A HashMap here shuffled the members
+                // of every hjson input, which is the same defect the response
+                // side of this fixes.
+                let hjson_value: nu_json::Map<String, nu_json::Value> = nu_json::from_reader(reader)
                     .map_err(|e| UnitctlError::DeserializationError { message: e.to_string() })?;
 
                 hjson_value
@@ -285,5 +289,112 @@ mod tests {
             InputFormat::from_remote_path("certificates/something"),
             InputFormat::Pem
         );
+    }
+
+    /// Member names in an order no map sorts into by accident, so a map that
+    /// does not keep insertion order cannot pass by luck.
+    const MEMBERS: [&str; 6] = [
+        "settings",
+        "listeners",
+        "routes",
+        "applications",
+        "access_log",
+        "upstreams",
+    ];
+
+    fn write_input(body: &str, suffix: &str) -> tempfile::NamedTempFile {
+        let mut file = tempfile::Builder::new()
+            .prefix("unitctl-inputfile-")
+            .suffix(suffix)
+            .tempfile()
+            .expect("a temporary file");
+        std::io::Write::write_all(file.as_file_mut(), body.as_bytes()).expect("writing the input");
+        file
+    }
+
+    fn members_of(file: &tempfile::NamedTempFile, format: InputFormat) -> Vec<String> {
+        InputFile::FileWithFormat(file.path().into(), format)
+            .to_unit_serializable_map()
+            .expect("the input must deserialize")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// `UnitSerializableMap` is a `serde_json::Map`, which keeps member order
+    /// only because every format feeding it keeps it too.  `serde_yaml`, `json5`
+    /// and the hjson `collect()` each reach the type by a different route, so
+    /// each one is checked.
+    #[test]
+    fn every_input_format_keeps_member_order() {
+        let json = MEMBERS
+            .iter()
+            .map(|name| format!("  \"{}\": {{}}", name))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        let json = format!("{{\n{}\n}}\n", json);
+
+        assert_eq!(members_of(&write_input(&json, ".json"), InputFormat::Json), MEMBERS);
+        assert_eq!(members_of(&write_input(&json, ".json5"), InputFormat::Json5), MEMBERS);
+        assert_eq!(members_of(&write_input(&json, ".hjson"), InputFormat::Hjson), MEMBERS);
+
+        let yaml = MEMBERS
+            .iter()
+            .map(|name| format!("{}: {{}}\n", name))
+            .collect::<String>();
+        assert_eq!(members_of(&write_input(&yaml, ".yaml"), InputFormat::Yaml), MEMBERS);
+    }
+
+    /// The values have to arrive intact, not just the names: hjson reaches
+    /// `serde_json::Value` through a conversion of its own.
+    #[test]
+    fn an_hjson_input_keeps_its_values_and_nesting() {
+        let file = write_input(
+            "{\n  listeners: {\n    \"*:8080\": { pass: \"routes\", tls: { certificate: \"bundle\", session: {} } }\n  }\n  routes: [ { action: { return: 204 } } ]\n}\n",
+            ".hjson",
+        );
+        let map = InputFile::FileWithFormat(file.path().into(), InputFormat::Hjson)
+            .to_unit_serializable_map()
+            .expect("hjson must deserialize");
+
+        assert_eq!(map.keys().cloned().collect::<Vec<_>>(), vec!["listeners", "routes"]);
+        assert_eq!(map["listeners"]["*:8080"]["pass"], "routes");
+        assert_eq!(map["routes"][0]["action"]["return"], 204);
+
+        // Nested order is the other half of this, and it holds only while both
+        // crates keep preserve_order: every nu_json::Value goes through
+        // serde_json::to_value on the way in.  So pin the nested names too, in
+        // an order no map sorts into by accident.
+        let listener = map["listeners"]["*:8080"].as_object().expect("a listener");
+        assert_eq!(listener.keys().cloned().collect::<Vec<_>>(), vec!["pass", "tls"]);
+        let tls = listener["tls"].as_object().expect("a tls object");
+        assert_eq!(tls.keys().cloned().collect::<Vec<_>>(), vec!["certificate", "session"]);
+    }
+
+    /// The way back in is strict, which is why `unitctl export` warns that the
+    /// verbatim backup it writes for a configuration holding bytes that are not
+    /// valid UTF-8 is one `unitctl import` cannot replay.
+    #[test]
+    fn a_file_that_is_not_valid_utf8_is_refused_on_the_way_in() {
+        let mut file = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .expect("a temporary file");
+        let mut raw = br#"{"routes":[{"match":{"uri":"/"#.to_vec();
+        raw.push(0xff);
+        raw.extend_from_slice(br#""},"action":{"return":204}}]}"#);
+        std::io::Write::write_all(file.as_file_mut(), &raw).expect("writing the input");
+
+        assert!(InputFile::FileWithFormat(file.path().into(), InputFormat::Json)
+            .to_unit_serializable_map()
+            .is_err());
+    }
+
+    #[test]
+    fn an_unsupported_input_format_is_refused() {
+        let file = write_input("not a configuration", ".txt");
+        assert!(InputFile::FileWithFormat(file.path().into(), InputFormat::Pem)
+            .to_unit_serializable_map()
+            .is_err());
     }
 }

@@ -3,6 +3,8 @@ use super::UnitClient;
 use super::UnitSerializableMap;
 use super::UnitctlError;
 use crate::known_size::KnownSize;
+use bytes::Bytes;
+use http_body_util::Full;
 use hyper::Request;
 use rustls_pemfile::Item;
 use std::collections::HashMap;
@@ -149,6 +151,21 @@ pub async fn send_body_deserialize_response<RESPONSE: for<'de> serde::Deserializ
     .map_err(|e| UnitctlError::UnitClientError { source: e })
 }
 
+/// Read a document without decoding it.
+///
+/// A caller that will hand the document back to Unit needs the bytes Unit
+/// sent: a configuration can hold bytes that no Rust `String` carries, so
+/// anything routed through `serde_json` on the way out would return something
+/// other than what it was shown.
+pub async fn send_empty_body_read_bytes(client: &UnitClient, method: &str, path: &str) -> Result<Bytes, UnitctlError> {
+    let request = build_request(client, method, path, None, KnownSize::Empty)
+        .map_err(|e| UnitctlError::UnitClientError { source: e })?;
+    client
+        .send_request_and_collect_body(request)
+        .await
+        .map_err(|e| UnitctlError::UnitClientError { source: e })
+}
+
 async fn streaming_upload_deserialize_response<RESPONSE: for<'de> serde::Deserialize<'de>>(
     client: &UnitClient,
     method: &str,
@@ -156,6 +173,17 @@ async fn streaming_upload_deserialize_response<RESPONSE: for<'de> serde::Deseria
     mime_type: Option<String>,
     read: KnownSize,
 ) -> Result<RESPONSE, UnitClientError> {
+    let request = build_request(client, method, path, mime_type, read)?;
+    client.send_request_and_deserialize_response(request).await
+}
+
+fn build_request(
+    client: &UnitClient,
+    method: &str,
+    path: &str,
+    mime_type: Option<String>,
+    read: KnownSize,
+) -> Result<Request<Full<Bytes>>, UnitClientError> {
     let uri = client.control_socket.create_uri_with_path(path);
 
     // Materialize the body first so that Content-Length reflects actual bytes produced,
@@ -178,5 +206,5 @@ async fn streaming_upload_deserialize_response<RESPONSE: for<'de> serde::Deseria
             .insert("Content-Type", content_type.parse().unwrap());
     }
 
-    client.send_request_and_deserialize_response(request).await
+    Ok(request)
 }

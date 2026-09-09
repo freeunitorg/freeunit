@@ -36,6 +36,9 @@ custom_error! {pub UnitctlError
     PathNotFound { path: String } = "Path not found: {path}",
     UnknownInputFileType { path: String } = "Unknown input type for file: {path}",
     NoFilesImported = "All imports failed",
+    UndecodableConfiguration {
+        path: String,
+        members: String } = "The configuration at {path} holds bytes that are not valid UTF-8: {members}",
     WaitTimeoutError = "Timeout waiting for unit to start has been exceeded",
 }
 
@@ -117,6 +120,17 @@ pub fn eprint_error(error: &UnitctlError) {
         }
         UnitctlError::UiServerError { ref message } => {
             eprintln!("UI server error: {}", message);
+        }
+        UnitctlError::UndecodableConfiguration { path, .. } => {
+            // The sentence itself is the one custom_error! already defines, so
+            // that the two cannot drift apart.
+            eprintln!("{}", error);
+            eprintln!("Editing it would replace them, so unitctl will not open it.");
+            eprintln!(
+                "Read it with 'unitctl execute -m GET -p {}' -- the bytes appear there as U+FFFD --",
+                path
+            );
+            eprintln!("and repair the member named above with a PUT to its own path.");
         }
         _ => {
             eprintln!("{}", error);
