@@ -73,6 +73,11 @@ nxt_is_tstr(nxt_str_t *str)
 {
     u_char  *p;
 
+    /* memchr() declares its pointer non-null; an empty string has none. */
+    if (str->length == 0) {
+        return 0;
+    }
+
     p = memchr(str->start, '`', str->length);
     if (p != NULL) {
         return 1;

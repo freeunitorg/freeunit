@@ -58,6 +58,15 @@ NXT_EXPORT void nxt_memcpy_upcase(u_char *dst, const u_char *src,
 nxt_inline void *
 nxt_cpymem(void *dst, const void *src, size_t length)
 {
+    /*
+     * memcpy() declares "src" non-null even for a zero-length copy, and
+     * callers reach here with the NULL start of an empty nxt_str_t.  The
+     * copy has nothing to do in that case and dst + 0 is dst.
+     */
+    if (length == 0) {
+        return dst;
+    }
+
     return memcpy(dst, src, length) + length;
 }
 
@@ -122,9 +131,16 @@ NXT_EXPORT nxt_str_t *nxt_str_dup(nxt_mp_t *mp, nxt_str_t *dst,
 NXT_EXPORT char *nxt_str_cstrz(nxt_mp_t *mp, const nxt_str_t *src);
 
 
+/*
+ * memcmp() declares both pointers non-null whatever the length, and a
+ * zero-length nxt_str_t carries a NULL start, so the length test has to
+ * short-circuit the call rather than only decide its result.  Two empty
+ * strings are equal, which is what falling through to "true" gives.
+ */
 #define nxt_strstr_eq(s1, s2)                                                 \
     (((s1)->length == (s2)->length)                                           \
-      && (memcmp((s1)->start, (s2)->start, (s1)->length) == 0))
+      && ((s1)->length == 0                                                   \
+          || memcmp((s1)->start, (s2)->start, (s1)->length) == 0))
 
 
 #define nxt_strcasestr_eq(s1, s2)                                             \
