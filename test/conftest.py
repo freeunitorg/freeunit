@@ -257,15 +257,19 @@ def run(request):
         # Workers must be gone before their files are.  _clear_conf() returns
         # on the controller's ack, but the router quits workers asynchronously,
         # and a java one still in scanClasses() keeps reading temp_dir.
-        _check_processes()
+        # Only wait here: the identity asserts belong after _check_fds(),
+        # which is what refreshes the router/controller pids a respawn test
+        # has changed.
+        _wait_for_processes()
         _clear_temp_dir()
 
     # check descriptors
 
     _check_fds(log=log)
 
-    if option.restart:
-        _check_processes()
+    # check processes id's and amount
+
+    _check_processes()
 
     # Teardown logs too, after the snapshot at the top of this fixture, so
     # read again or those lines are charged to the next test.  Not under
@@ -769,9 +773,7 @@ def _clear_temp_dir():
                         time.sleep(1)
 
 
-def _check_processes():
-    router_pid = _fds_info['router']['pid']
-    controller_pid = _fds_info['controller']['pid']
+def _wait_for_processes():
     main_pid = unit_instance['pid']
 
     for _ in range(600):
@@ -791,6 +793,16 @@ def _check_processes():
             break
 
         time.sleep(0.1)
+
+    return out
+
+
+def _check_processes():
+    router_pid = _fds_info['router']['pid']
+    controller_pid = _fds_info['controller']['pid']
+    main_pid = unit_instance['pid']
+
+    out = _wait_for_processes()
 
     if option.restart:
         assert len(out) == 0, 'all termimated'
