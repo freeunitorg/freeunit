@@ -65,3 +65,21 @@ def test_wasm_component_obs_text():
     )
     assert resp['status'] == 200
     assert resp['body'] == 'Hello'
+
+
+def test_wasm_component_unrepresentable_request():
+    client.load('hello_world')
+
+    # Unit forwards bytes that the Rust "http" crate will not put in a URI:
+    # obs-text in Host, and "<" or a control byte in the target.  Building the
+    # request then fails, and that error must fail this request alone.  The
+    # worker used to abort on it (SIGABRT), which conftest's Log.check_alerts()
+    # would also catch on teardown.
+    for req in (
+        b'GET / HTTP/1.1\r\nHost: caf\xff\r\nConnection: close\r\n\r\n',
+        b'GET /a<b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n',
+    ):
+        assert client.http(req, raw=True)['status'] == 400, req
+
+    # The worker is still alive and serving after both.
+    assert client.get()['status'] == 200

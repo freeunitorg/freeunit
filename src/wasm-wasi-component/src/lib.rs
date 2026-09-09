@@ -293,9 +293,27 @@ impl GlobalState {
         // Convert the `nxt_*` representation into the representation required
         // by Wasmtime's `wasi-http` implementation using the Rust `http`
         // crate.
-        let request = self.to_request_builder(&info)?;
+        // A request that the `http` crate refuses to represent must fail on
+        // its own, not take the worker with it: `run()` turns an `Err` from
+        // here into `.expect()`, and both profiles set `panic = 'abort'`.
+        // Unit forwards bytes that `http` rejects -- a `Host` holding
+        // obs-text, a target holding `<`, `>` or a control byte -- so this is
+        // reachable from an unauthenticated request.
+        let builder = match self.to_request_builder(&info) {
+            Ok(builder) => builder,
+            Err(e) => {
+                info.reject(&e);
+                return Ok(());
+            }
+        };
         let body = self.to_request_body(&mut info);
-        let request = request.body(body)?;
+        let request = match builder.body(body) {
+            Ok(request) => request,
+            Err(e) => {
+                info.reject(&e.into());
+                return Ok(());
+            }
+        };
 
         let (sender, receiver) = tokio::sync::oneshot::channel();
 
@@ -579,6 +597,27 @@ impl NxtRequestInfo {
             let rc = bindings::nxt_unit_response_send(self.info);
             assert_eq!(rc, 0);
         }
+    }
+
+    /// Fail this one request with a 400, leaving the worker alive.
+    ///
+    /// Takes `self` so the request info is always released: returning without
+    /// `request_done()` would leak it and hang the client.
+    fn reject(mut self, err: &anyhow::Error) {
+        unsafe {
+            let msg = format!("rejected a malformed request: {err:#}");
+            if let Ok(msg) = CString::new(msg) {
+                bindings::nxt_unit_req_log(
+                    self.info,
+                    bindings::NXT_UNIT_LOG_ERR as i32,
+                    "%s\0".as_ptr().cast(),
+                    msg.as_ptr(),
+                );
+            }
+        }
+        self.init_response(400, 0, 0);
+        self.send_response();
+        self.request_done();
     }
 
     fn request_done(self) {
