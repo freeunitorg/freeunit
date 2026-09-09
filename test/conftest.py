@@ -253,15 +253,28 @@ def run(request):
 
     if not option.restart:
         _clear_conf(log=log)
+
+        # Workers must be gone before their files are.  _clear_conf() returns
+        # on the controller's ack, but the router quits workers asynchronously,
+        # and a java one still in scanClasses() keeps reading temp_dir.
+        _check_processes()
         _clear_temp_dir()
 
     # check descriptors
 
     _check_fds(log=log)
 
-    # check processes id's and amount
+    if option.restart:
+        _check_processes()
 
-    _check_processes()
+    # Teardown logs too, after the snapshot at the top of this fixture, so
+    # read again or those lines are charged to the next test.  Not under
+    # --restart: it stops unitd and may have deleted the log with temp_dir.
+
+    if not option.restart:
+        with Log.open() as f:
+            log += f.read()
+            Log.set_pos(f.tell())
 
     # print unit.log in case of error
 
