@@ -60,6 +60,7 @@ static void nxt_proto_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 static void nxt_proto_process_created_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static void nxt_proto_quit_children(nxt_task_t *task);
+static void nxt_proto_kill_silent(nxt_task_t *task, void *obj, void *data);
 static nxt_process_t *nxt_proto_process_find(nxt_task_t *task, nxt_pid_t pid);
 static void nxt_proto_process_add(nxt_task_t *task, nxt_process_t *process);
 static nxt_process_t *nxt_proto_process_remove(nxt_task_t *task, nxt_pid_t pid);
@@ -82,6 +83,13 @@ static uint32_t  compat[] = {
 static nxt_lvlhsh_t           nxt_proto_processes;
 static nxt_queue_t            nxt_proto_children;
 static nxt_bool_t             nxt_proto_exiting;
+
+/*
+ * The prototype's own deadline on a quit; see nxt_proto_quit_children().
+ * File scope, so its node can never outlive its storage and
+ * nxt_timer_disable() is never owed.
+ */
+static nxt_timer_t            nxt_proto_kill_timer;
 
 static nxt_app_module_t       *nxt_app;
 static nxt_common_app_conf_t  *nxt_app_conf;
@@ -877,19 +885,139 @@ nxt_proto_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 }
 
 
+/*
+ * Tell every worker to go, and wait for the SIGCHLD of each: only when
+ * nxt_proto_children is empty does nxt_proto_sigchld_handler() run
+ * nxt_process_quit() for the prototype itself.
+ *
+ * A port message is how a worker is told, and a worker that has never sent
+ * PROCESS_READY is not reading its port yet.  That alone does not lose the
+ * message: the QUIT sits in the socket, and a module worker still inside the
+ * module's own start function reads it the moment nxt_unit_init() starts
+ * reading -- which is why an application that merely takes its time to start
+ * shuts down cleanly, and has to keep doing so.
+ *
+ * What is lost is the QUIT to a worker that will never read that port at
+ * all: a "type": "external" one exec'd the user's binary out of
+ * nxt_app_setup() before any of ours ran, and a module worker whose start
+ * function never returns is no better.  Such a worker outlives the request
+ * that asked for it and the prototype waits on it for good, so the pair
+ * survives every drain there is, including unitd's own exit.  Measured with
+ * an external application running /bin/sleep and a "limits":
+ * {"start_timeout"} that gives up on it: five rejected configuration PUTs
+ * left five prototypes and five workers alive, and replacing the
+ * configuration did not collect them either.
+ *
+ * The two are the same worker until one of them announces itself, and
+ * nothing here can tell them apart -- that is precisely the question
+ * "start_timeout" exists to answer.  So the QUIT goes to every worker as it
+ * always did, and where the application declared a bound, the prototype arms
+ * one of its own: SIGKILL for whatever is still silent when it expires, in
+ * nxt_proto_kill_silent().
+ *
+ * That deadline is strictly later than the router's, and by a whole
+ * "start_timeout": it is armed here, and this runs on a QUIT the router only
+ * sends once it has itself given up on the application.  A worker that would
+ * have announced itself within the bound the user asked for therefore gets
+ * that whole bound over again before anything is signalled.
+ *
+ * With no "start_timeout" nothing is armed and this is exactly what it was,
+ * unbounded -- as the wait for an application start is unbounded by default.
+ */
+
 static void
 nxt_proto_quit_children(nxt_task_t *task)
 {
-    nxt_port_t     *port;
-    nxt_process_t  *process;
-    nxt_runtime_t  *rt;
+    nxt_bool_t          silent;
+    nxt_port_t          *port;
+    nxt_process_t       *process;
+    nxt_runtime_t       *rt;
+    nxt_event_engine_t  *engine;
 
     rt = task->thread->runtime;
 
+    silent = 0;
+
     nxt_queue_each(process, &nxt_proto_children, nxt_process_t, link) {
+
+        if (nxt_slow_path(process->state != NXT_PROCESS_STATE_READY)) {
+            silent = 1;
+        }
+
         port = nxt_process_port_first(process);
 
         nxt_runtime_port_send_quit(task, rt, port);
+    }
+    nxt_queue_loop;
+
+    if (!silent || nxt_app_conf == NULL || nxt_app_conf->start_timeout == 0) {
+        return;
+    }
+
+    engine = task->thread->engine;
+
+    nxt_proto_kill_timer.bias = NXT_TIMER_DEFAULT_BIAS;
+    nxt_proto_kill_timer.work_queue = &engine->fast_work_queue;
+    nxt_proto_kill_timer.handler = nxt_proto_kill_silent;
+    nxt_proto_kill_timer.task = &engine->task;
+    nxt_proto_kill_timer.log = nxt_proto_kill_timer.task->log;
+
+    nxt_timer_add(engine, &nxt_proto_kill_timer, nxt_app_conf->start_timeout);
+
+    nxt_debug(task, "app \"%V\" quit deadline %M ms for a worker that has not "
+                    "announced itself",
+              &nxt_app_conf->name, nxt_app_conf->start_timeout);
+}
+
+
+/*
+ * The prototype's deadline expired: a worker it told to quit has still not
+ * announced itself, so it never read that QUIT and never will.
+ *
+ * Signal it, which is possible precisely because it never announced itself:
+ * the prototype forked it and knows its pid, where the router only ever
+ * learns one from PROCESS_READY.  SIGKILL, not SIGTERM, because what such a
+ * worker does with a catchable signal is the user's binary's business and one
+ * that ignores SIGTERM is the case this exists for; nothing is lost, because
+ * a worker that has not announced itself holds no port anyone can reach, no
+ * mapped queue (nxt_port_process_ready_handler() maps it at PROCESS_READY)
+ * and no request.
+ *
+ * Read process->isolated_pid, not ->pid: under "isolation": {"namespaces":
+ * {"pid": true}} nxt_proto_process_created_handler() rewrites ->pid to the
+ * global pid and only ->isolated_pid stays valid in this namespace.  It is
+ * the number waitpid() reports in nxt_proto_sigchld_handler(), and the one
+ * nxt_port_process_ready_handler() signals for the same reason.
+ */
+
+static void
+nxt_proto_kill_silent(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_process_t  *process;
+
+    nxt_queue_each(process, &nxt_proto_children, nxt_process_t, link) {
+
+        if (process->state == NXT_PROCESS_STATE_READY) {
+            continue;
+        }
+
+        nxt_log(task, NXT_LOG_INFO,
+                "app process %PI neither announced itself nor acted on the "
+                "quit it was sent within \"start_timeout\"; killing it",
+                process->isolated_pid);
+
+        if (nxt_fast_path(process->isolated_pid > 0)
+            && kill(process->isolated_pid, SIGKILL) == -1)
+        {
+            /*
+             * ESRCH is ordinary: the worker may already have exited with its
+             * SIGCHLD still pending, and that SIGCHLD drains it.
+             */
+            nxt_log(task, (nxt_errno == ESRCH) ? NXT_LOG_INFO : NXT_LOG_ALERT,
+                    "kill(%PI, SIGKILL) failed for an app process that never "
+                    "announced itself %E",
+                    process->isolated_pid, nxt_errno);
+        }
     }
     nxt_queue_loop;
 }

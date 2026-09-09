@@ -8,8 +8,8 @@ because it stays alive nothing kills it either, so no REMOVE_PID converts the
 wait into an error.
 
 Without a "limits": {"start_timeout"} that leaves the router's START_PROCESS
-RPC armed for good.  With the default "processes" that RPC is the only continuation
-of nxt_router_conf_apply(), so:
+RPC armed for good.  With the default "processes" that RPC is the only
+continuation of nxt_router_conf_apply(), so:
 
   * the configuration PUT never returned, and
   * the controller parks the in-flight request at the head of its queue, so
@@ -90,6 +90,36 @@ def _stuck_pids():
     return [int(p) for p in res.stdout.split()]
 
 
+def _stuck_protos():
+    """Pids of the prototypes started for the wedging application.
+
+    A prototype cannot exit while a child of it is alive, so it is half of
+    what a leaked start leaves behind and has to be counted separately: the
+    marker in _stuck_pids() is the worker's, not the prototype's.
+    """
+
+    res = subprocess.run(
+        ['pgrep', '-f', 'unit: "stuck" prototype'],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    return [int(p) for p in res.stdout.split()]
+
+
+def _wait_gone(seconds=10):
+    """Wait for every worker and prototype of the wedging app to be gone."""
+
+    for _ in range(int(seconds * 10)):
+        if _stuck_pids() == [] and _stuck_protos() == []:
+            break
+
+        time.sleep(0.1)
+
+    return _stuck_pids(), _stuck_protos()
+
+
 def _children(pid):
     """Pids the kernel currently lists as children of pid."""
 
@@ -132,9 +162,10 @@ def _stuck_app(skip_alert):
     * the deadline's own alert;
     * "failed to apply new conf", which nxt_router_conf_error() logs for the
       PUT the deadline makes fail;
-    * "exited on signal", from reaping the silent worker below -- the router
-      cannot kill it (see test_app_start_timeout_worker_not_reaped), so the
-      test has to, and the prototype reports the death.
+    * "exited on signal", which the prototype logs for a silent worker: the
+      router has no pid for one and cannot kill it, so either the test reaps
+      it or the prototype does, one "start_timeout" after it is told to quit
+      (see nxt_proto_quit_children(), and the three tests that pin it below).
     """
 
     skip_alert(
@@ -145,10 +176,10 @@ def _stuck_app(skip_alert):
 
     yield
 
-    # The router never learns the silent worker's pid -- it arrives only with
-    # PROCESS_READY -- so the deadline cannot kill it; see the module note in
-    # test_app_start_timeout_worker_not_reaped().  Clean up regardless, so a
-    # failure here does not leave sleeps behind for the next run.
+    # A silent worker outlives the start that asked for it, and while its
+    # application is live nothing collects it -- the router never learns its
+    # pid.  Clean up regardless, so a failure here does not leave sleeps
+    # behind for the next run.
     _reap_stuck()
 
 
@@ -256,7 +287,9 @@ def test_app_start_timeout_knob_validated():
     assert 'integer' in detail, resp
 
     # And 0 -- the default, meaning unbounded -- is accepted and survives.
-    assert 'success' in client.conf('{"start_timeout": 0}', path), 'zero accepted'
+    assert 'success' in client.conf(
+        '{"start_timeout": 0}', path
+    ), 'zero accepted'
 
     assert client.conf_get(f'{path}/start_timeout') == 0, 'zero round-trips'
 
@@ -318,32 +351,45 @@ def test_app_start_timeout_range_validated():
     assert client.conf_get(f'{path}/start_timeout') == 2147483
 
 
-def test_app_start_timeout_worker_not_reaped():
-    """Documents the boundary of this fix.
+def test_app_start_timeout_retry_leaks_nothing():
+    """Rejecting the same configuration N times must cost N times nothing.
 
-    The router only ever learns a worker's pid from PROCESS_READY, which is
-    exactly the message a silent worker does not send, so the deadline has no
-    pid to kill.  Reaping the process needs the *prototype* -- which does know
-    the pid -- to escalate a child that will not exit, in
-    nxt_proto_sigchld_handler()/nxt_process_quit(); that is the code #268
-    rewrites, so it is deliberately left out of this change.
+    The deadline fails the PUT, and nxt_router_conf_error() discards the
+    temporary configuration -- with the nxt_app_t that
+    app->unaccounted_processes lives on.  So there is no counter left to bound
+    the config-apply path with, and each retry forks a fresh prototype and a
+    fresh worker: ordinary control-plane retry automation exhausts host pids.
 
-    This test asserts the state that fix will change, so that landing it turns
-    this assertion red rather than letting the gap go unnoticed.
+    What bounds it is not accounting but draining.  Discarding the application
+    sends the prototype a QUIT, and the prototype is then able to act on it,
+    because nxt_proto_quit_children() signals a child that has never announced
+    itself instead of writing a port message nothing there reads.  Before
+    that, both processes survived every retry -- and unitd's own exit.
     """
 
+    retries = 5
+
     assert 'success' in client.conf(_serving_conf()), 'baseline configured'
-    assert 'error' in client.conf(_stuck_conf()), 'stuck app rejected'
 
-    # The router recovered; the process it gave up on is still there.
-    assert client.conf_get('/status')['connections'] is not None
+    for i in range(retries):
+        assert 'error' in client.conf(_stuck_conf()), f'PUT {i} rejected'
 
-    time.sleep(1)
+    workers, protos = _wait_gone()
 
-    assert _stuck_pids() != [], (
-        'the silent worker is expected to survive the timeout; if this fails, '
-        'something now reaps it -- update this test and the note above'
+    assert workers == [], (
+        f'{len(workers)} silent workers survive {retries} rejected PUTs; '
+        'each retry is leaking the process it forked'
     )
+
+    assert protos == [], (
+        f'{len(protos)} prototypes survive {retries} rejected PUTs; a '
+        'prototype cannot exit while a child of it is alive'
+    )
+
+    # And none of it cost the control plane, which is the point of the bound.
+    assert 'connections' in client.conf_get('/status')
+
+    assert client.conf_get() == _serving_conf(), 'previous config retained'
 
 
 def test_app_start_timeout_default_is_unbounded(findall):
@@ -419,9 +465,9 @@ def test_app_start_timeout_bounds_orphans():
     """"processes": {"max"} must bound the processes the deadline gives up on.
 
     The deadline fails the start, and the worker it gave up on keeps running:
-    the router has no pid for it and cannot kill it (see
-    test_app_start_timeout_worker_not_reaped()).  Such a worker is in neither
-    app->processes, which only PROCESS_READY fills, nor
+    the router has no pid for it and cannot kill it, and its application is
+    live, so nothing quits the prototype that could.  Such a worker is in
+    neither app->processes, which only PROCESS_READY fills, nor
     app->pending_processes, which the failure gives back -- so unless the
     router counts it somewhere, every request forks another one and "max"
     bounds nothing.  Five requests against "max": 2 produced five `sleep`
@@ -568,3 +614,94 @@ def test_app_start_timeout_slow_worker_adopted():
     }
 
     assert client.get(url='/')['status'] == 200, 'the adopted worker serves'
+
+
+def test_app_start_timeout_slow_worker_survives_a_quit(findall):
+    """A worker that is merely slow must ride out a quit, not be signalled.
+
+    The prototype's deadline is for a worker that will never read the QUIT it
+    is sent (nxt_proto_quit_children()), and until one announces itself that
+    worker is indistinguishable from one that is simply still starting.  The
+    deadline is how they are told apart: a slow one reads the QUIT out of its
+    port the moment nxt_unit_init() starts reading, which is well inside the
+    second "start_timeout" it is given here.
+
+    A restart is the shape that catches it, and is what caught it: serving a
+    request replenishes the spare, so the application has a worker in the
+    middle of its start exactly when the old prototype is told to quit.
+    """
+
+    delay = 2
+
+    conf = {
+        'listeners': {'*:8080': {'pass': 'applications/slow'}},
+        'applications': {
+            'slow': {
+                'type': 'external',
+                'working_directory': option.temp_dir,
+                'processes': {'max': 2, 'spare': 1, 'idle_timeout': 60},
+                # Comfortably longer than the start below, so nothing here
+                # turns on a race between the two.
+                'limits': {'start_timeout': delay * 10},
+                'executable': '/bin/sh',
+                'arguments': [
+                    '-c',
+                    f'sleep {delay}; exec "$0"',
+                    f'{option.current_dir}/build/unit_app_test',
+                ],
+            }
+        },
+    }
+
+    assert 'success' in client.conf(conf), 'the slow app is configured'
+
+    assert client.get(url='/')['status'] == 200, 'the slow app serves'
+
+    # Serving that request is what asks for the second process, and it is
+    # still sleeping when the restart below quits the prototype that forked
+    # it.  Nothing waits for it: waiting is what this test must not do.
+    assert 'success' in client.conf_get('/control/applications/slow/restart')
+
+    # Long enough for both starts to finish and for a deadline that should
+    # not be armed at all to have fired if it were.
+    time.sleep(delay * 3)
+
+    assert findall(r'killing it') == [], 'a slow worker was signalled'
+
+    assert findall(r'exited on signal') == [], 'a slow worker was killed'
+
+    assert client.get(url='/')['status'] == 200, 'the restarted app serves'
+
+
+def test_app_start_timeout_reconfigure_collects_orphans():
+    """Replacing the application must collect what its deadlines gave up on.
+
+    This is the recovery the bound relies on: a worker wedged for good holds
+    its "processes" slot for the life of the application, and a
+    reconfiguration is what ends that life.  It only works if the processes
+    actually die.  They are children of the prototype, which is the one
+    process that knows their pids, and nxt_router_free_app() sends that
+    prototype a QUIT -- but a QUIT it cannot act on left the prototype waiting
+    on children that answer nothing, so the whole family outlived unitd.
+    """
+
+    max_processes = 2
+
+    assert 'success' in client.conf(_stuck_on_demand_conf(max_processes))
+
+    for i in range(max_processes):
+        assert client.get(url='/')['status'] == 503, f'request {i} failed'
+
+    assert len(_stuck_pids()) == max_processes, 'the workers are there'
+    assert len(_stuck_protos()) == 1, 'and the prototype that forked them'
+
+    assert _app_processes()['unaccounted'] == max_processes
+
+    assert 'success' in client.conf(_serving_conf()), 'the app is replaced'
+
+    workers, protos = _wait_gone()
+
+    assert workers == [], f'{len(workers)} workers survive the reconfigure'
+    assert protos == [], f'{len(protos)} prototypes survive the reconfigure'
+
+    assert client.get(url='/')['status'] == 200, 'the new config serves'

@@ -131,6 +131,15 @@ struct nxt_common_app_conf_s {
     size_t                     shm_limit;
     uint32_t                   request_limit;
 
+    /*
+     * "limits": {"start_timeout"} in milliseconds, 0 for unbounded.  The
+     * router arms it on the start itself (nxt_router_start_timer_arm());
+     * the prototype is given the same number because it is the one process
+     * that can act on a worker the router gave up on -- it knows its pid.
+     * See nxt_proto_quit_children().
+     */
+    nxt_msec_t                 start_timeout;
+
     nxt_fd_t                   shared_port_fd;
     nxt_fd_t                   shared_queue_fd;
 

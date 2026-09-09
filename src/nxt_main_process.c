@@ -213,6 +213,12 @@ static nxt_conf_map_t  nxt_common_app_limits_conf[] = {
         offsetof(nxt_common_app_conf_t, request_limit),
     },
 
+    {
+        nxt_string("start_timeout"),
+        NXT_CONF_MAP_MSEC,
+        offsetof(nxt_common_app_conf_t, start_timeout),
+    },
+
 };
 
 
