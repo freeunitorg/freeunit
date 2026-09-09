@@ -187,6 +187,52 @@ nxt_port_release_send_msg(nxt_port_send_msg_t *msg)
 }
 
 
+/*
+ * Give up on a message that nxt_port_write_handler() is dropping, completing
+ * what it still owns.
+ *
+ * Only for a message that is not in port->messages -- msg->link.next == NULL,
+ * which on these paths means it is still the caller's stack copy from the
+ * nxt_port_msg_chk_insert() NXT_DECLINED branch.  That is also why this cannot
+ * double-complete: the nxt_port_error_handler() the caller goes on to raise
+ * completes what the queue holds, and this was never in it.
+ *
+ * Without this the buffers of an accepted write were simply orphaned, which
+ * breaks the contract nxt_port_socket_write2() documents -- it answers NXT_OK
+ * on these paths, because nxt_port_write_handler() returns void -- and strands
+ * any caller waiting on the completion, such as the START_PROCESS deadline in
+ * src/nxt_router.c.
+ *
+ * Descriptors first, then buffers, the order nxt_port_error_handler() uses.
+ */
+
+static void
+nxt_port_msg_drop(nxt_task_t *task, nxt_port_send_msg_t *msg)
+{
+    nxt_buf_t         *b, *next;
+    nxt_work_queue_t  *wq;
+
+    nxt_port_msg_close_fd(msg);
+
+    wq = &task->thread->engine->fast_work_queue;
+
+    for (b = msg->buf; b != NULL; b = next) {
+        next = b->next;
+        b->next = NULL;
+
+        if (nxt_buf_is_sync(b)) {
+            continue;
+        }
+
+        nxt_work_queue_add(wq, b->completion_handler, task, b, b->parent);
+    }
+
+    msg->buf = NULL;
+
+    nxt_port_release_send_msg(msg);
+}
+
+
 nxt_int_t
 nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
     nxt_fd_t fd, nxt_fd_t fd2, uint32_t stream, nxt_port_id_t reply_port,
@@ -413,7 +459,7 @@ nxt_port_write_handler(nxt_task_t *task, void *obj, void *data)
     struct iovec            iov[NXT_IOBUF_MAX * 10];
     nxt_work_queue_t        *wq;
     nxt_port_method_t       m;
-    nxt_port_send_msg_t     *msg;
+    nxt_port_send_msg_t     *msg, *qmsg;
     nxt_sendbuf_coalesce_t  sb;
 
     port = nxt_container_of(obj, nxt_port_t, socket);
@@ -520,10 +566,14 @@ next_fragment:
                         nxt_thread_mutex_unlock(&port->write_mutex);
 
                     } else {
-                        msg = nxt_port_msg_insert_tail(port, msg);
-                        if (nxt_slow_path(msg == NULL)) {
+                        qmsg = nxt_port_msg_insert_tail(port, msg);
+                        if (nxt_slow_path(qmsg == NULL)) {
+                            nxt_port_msg_drop(task, msg);
+
                             goto fail;
                         }
+
+                        msg = qmsg;
 
                         use_delta++;
                     }
@@ -552,21 +602,31 @@ next_fragment:
             }
 
         } else {
+            /*
+             * Both failures below drop a message that was never queued, so
+             * both go through nxt_port_msg_drop(): the send is over and
+             * nothing else will ever complete its buffers.  Neither is a
+             * socket-death-only path -- the second is an allocation failure
+             * against a port that is otherwise perfectly alive.
+             */
+
             if (nxt_slow_path(n == NXT_ERROR)) {
                 if (msg->link.next == NULL) {
-                    nxt_port_msg_close_fd(msg);
-
-                    nxt_port_release_send_msg(msg);
+                    nxt_port_msg_drop(task, msg);
                 }
 
                 goto fail;
             }
 
             if (msg->link.next == NULL) {
-                msg = nxt_port_msg_insert_tail(port, msg);
-                if (nxt_slow_path(msg == NULL)) {
+                qmsg = nxt_port_msg_insert_tail(port, msg);
+                if (nxt_slow_path(qmsg == NULL)) {
+                    nxt_port_msg_drop(task, msg);
+
                     goto fail;
                 }
+
+                msg = qmsg;
 
                 use_delta++;
             }
@@ -600,6 +660,94 @@ cleanup:
     if (use_delta != 0) {
         nxt_port_use(task, port, use_delta);
     }
+}
+
+
+nxt_port_msg_cancel_t
+nxt_port_socket_cancel(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
+    uint32_t stream, nxt_port_id_t reply_port, nxt_buf_t *b)
+{
+    nxt_buf_t              *buf, *next;
+    nxt_work_queue_t       *wq;
+    nxt_port_send_msg_t    *msg, *found;
+    nxt_port_msg_cancel_t  ret;
+
+    found = NULL;
+    ret = NXT_PORT_MSG_NOT_FOUND;
+
+    nxt_thread_mutex_lock(&port->write_mutex);
+
+    nxt_queue_each(msg, &port->messages, nxt_port_send_msg_t, link) {
+
+        if (msg->port_msg.stream != stream
+            || msg->port_msg.type != (type & NXT_PORT_MSG_MASK)
+            || msg->port_msg.reply_port != reply_port)
+        {
+            continue;
+        }
+
+        if (b != NULL && msg->buf != b) {
+            continue;
+        }
+
+        /*
+         * nxt_port_write_handler() sets nf on the message once it has sent a
+         * fragment, and clears msg->fd[] at the same time: from then on the
+         * peer is reading a stream this message must finish.
+         */
+
+        if (msg->port_msg.nf) {
+            ret = NXT_PORT_MSG_STARTED;
+            break;
+        }
+
+        nxt_queue_remove(&msg->link);
+        msg->link.next = NULL;
+
+        found = msg;
+        ret = NXT_PORT_MSG_CANCELLED;
+
+        break;
+
+    } nxt_queue_loop;
+
+    nxt_thread_mutex_unlock(&port->write_mutex);
+
+    if (found == NULL) {
+        return ret;
+    }
+
+    /*
+     * Outside the mutex from here: a completion handler may reach arbitrary
+     * router code, and nxt_port_use() can destroy the port.
+     */
+
+    buf = found->buf;
+    found->buf = NULL;
+
+    nxt_port_msg_close_fd(found);
+
+    nxt_port_release_send_msg(found);
+
+    wq = &task->thread->engine->fast_work_queue;
+
+    while (buf != NULL) {
+        next = buf->next;
+        buf->next = NULL;
+
+        if (!nxt_buf_is_sync(buf)) {
+            nxt_work_queue_add(wq, buf->completion_handler, task, buf,
+                               buf->parent);
+        }
+
+        buf = next;
+    }
+
+    /* The reference nxt_port_msg_chk_insert() took for the queued message. */
+
+    nxt_port_use(task, port, -1);
+
+    return ret;
 }
 
 

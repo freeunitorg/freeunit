@@ -195,6 +195,7 @@ def test_status_applications():
             'processes': {
                 'running': running,
                 'starting': starting,
+                'unaccounted': 0,
                 'idle': idle,
             },
             'requests': {'active': active},

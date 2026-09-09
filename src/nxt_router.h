@@ -102,6 +102,28 @@ typedef struct {
 } nxt_joint_job_t;
 
 
+/*
+ * Default "limits": {"start_timeout"}, in milliseconds: how long a worker may
+ * take to reach nxt_unit_init() before its start request is failed.  Zero
+ * disables the bound, and that is the default deliberately.
+ *
+ * The window this measures is the whole of the application's own startup, not
+ * just Unit's part of it: every module runs user code before nxt_unit_init()
+ * -- nxt_python_start() imports the application module
+ * (src/python/nxt_python.c:303, via nxt_python_set_target()) before
+ * nxt_unit_init() (:365), nxt_java_start() deploys the webapp
+ * (src/nxt_java.c:417) before :441, the Node module loads the script before
+ * src/nodejs/unit-http/unit.cpp:279, and Go and "external" run main() first.
+ * A default bound would
+ * therefore fail a Django or ML import, or a JVM webapp deployment, that
+ * works today -- and a start failed while the worker is merely slow leaves
+ * that worker alive and orphaned, because the router cannot kill a process it
+ * has no pid for.  So the bound is opt-in, and choosing a value is the
+ * operator's judgement about their own application's startup.
+ */
+#define NXT_APP_START_TIMEOUT  0
+
+
 typedef struct {
     uint32_t               use_count;
     nxt_app_t              *app;
@@ -129,6 +151,21 @@ struct nxt_app_s {
     uint32_t               processes;
     uint32_t               idle_processes;
 
+    /*
+     * Application processes the router asked for, that were forked, and that
+     * it has neither a port nor a pid for: the ones a "limits":
+     * {"start_timeout"} deadline gave up on.  Such a worker is not in
+     * ->processes, because only PROCESS_READY puts one there, and it is no
+     * longer in ->pending_processes, because its start attempt is over --
+     * so without a third counter "processes": {"max"} would bound nothing,
+     * and every expired start would fork another OS child.
+     *
+     * A slot leaves again when the process it stands for is finally
+     * accounted for: it announces itself late, or it dies and the router is
+     * told.  See nxt_router_app_start_expired() in src/nxt_router.c.
+     */
+    uint32_t               unaccounted_processes;
+
     uint32_t               max_processes;
     uint32_t               spare_processes;
     uint32_t               max_pending_processes;
@@ -138,6 +175,14 @@ struct nxt_app_s {
 
     nxt_msec_t             timeout;
     nxt_msec_t             idle_timeout;
+
+    /*
+     * Bound on a START_PROCESS RPC: a worker that is forked but never calls
+     * nxt_unit_init() sends no PROCESS_READY, so without this nothing ever
+     * retires the RPC.  Zero disables the bound.  See
+     * nxt_router_start_timer_t in nxt_router.c.
+     */
+    nxt_msec_t             start_timeout;
 
     nxt_str_t              *targets;
 
@@ -170,7 +215,8 @@ struct nxt_app_s {
 nxt_inline nxt_bool_t
 nxt_router_app_can_start(nxt_app_t *app)
 {
-    return app->processes + app->pending_processes < app->max_processes
+    return app->processes + app->pending_processes
+               + app->unaccounted_processes < app->max_processes
             && app->pending_processes < app->max_pending_processes;
 }
 
@@ -287,6 +333,16 @@ void nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
 
 void nxt_router_access_log_reopen_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
+
+#if (NXT_TESTS)
+/*
+ * The config-apply start and the temporary configuration its failure path
+ * releases, for the start-deadline test.
+ */
+nxt_router_temp_conf_t *nxt_router_test_temp_conf(nxt_task_t *task);
+void nxt_router_test_app_rpc_create(nxt_task_t *task,
+    nxt_router_temp_conf_t *tmcf, nxt_app_t *app);
+#endif
 
 
 extern nxt_router_t  *nxt_router;

@@ -42,6 +42,7 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
     static const nxt_str_t  procs_str = nxt_string("processes");
     static const nxt_str_t  run_str = nxt_string("running");
     static const nxt_str_t  start_str = nxt_string("starting");
+    static const nxt_str_t  unacc_str = nxt_string("unaccounted");
 
     /*
      * modules, connections, requests, applications -- plus "telemetry" when
@@ -211,7 +212,7 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
             return NULL;
         }
 
-        obj = nxt_conf_create_object(mp, 3);
+        obj = nxt_conf_create_object(mp, 4);
         if (nxt_slow_path(obj == NULL)) {
             return NULL;
         }
@@ -220,7 +221,9 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
 
         nxt_conf_set_member_integer(obj, &run_str, app->processes, 0);
         nxt_conf_set_member_integer(obj, &start_str, app->pending_processes, 1);
-        nxt_conf_set_member_integer(obj, &idle_str, app->idle_processes, 2);
+        nxt_conf_set_member_integer(obj, &unacc_str,
+                                    app->unaccounted_processes, 2);
+        nxt_conf_set_member_integer(obj, &idle_str, app->idle_processes, 3);
 
         obj = nxt_conf_create_object(mp, 1);
         if (nxt_slow_path(obj == NULL)) {

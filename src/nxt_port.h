@@ -403,6 +403,49 @@ nxt_int_t nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port,
     nxt_uint_t type, nxt_fd_t fd, nxt_fd_t fd2, uint32_t stream,
     nxt_port_id_t reply_port, nxt_buf_t *b);
 
+
+typedef enum {
+    /*
+     * The message was still whole in port->messages and has been taken back
+     * out of it.  Its buffers have been completed and the queue's reference
+     * to the port released, so nothing the caller handed to write2() is
+     * reachable from the port any more.
+     */
+    NXT_PORT_MSG_CANCELLED = 0,
+    /*
+     * Found, but a fragment of it has already gone out (port_msg.nf), so the
+     * peer is mid-stream and the descriptors have been handed off.  Left
+     * queued: taking it back now would strand the peer on an unfinished
+     * stream.
+     */
+    NXT_PORT_MSG_STARTED,
+    /*
+     * Not in port->messages.  Either it was never queued or it has been sent
+     * in full.  NOT a lifetime boundary on its own: the write handler removes
+     * the message and only then queues the buffer completion, which can land
+     * behind work already queued ahead of it.
+     */
+    NXT_PORT_MSG_NOT_FOUND,
+} nxt_port_msg_cancel_t;
+
+/*
+ * Take a not-yet-started message back out of a port's send queue.
+ *
+ * Callable only on the thread that owns the port's engine, and only against a
+ * message this caller queued: it identifies the message by (type, stream,
+ * reply_port) and, when b is not NULL, by buffer identity as well, since a
+ * stream number alone is only unique per reply port.
+ *
+ * Descriptors are treated exactly as the send path treats them, through
+ * close_fd: a message that owns its descriptors has them closed here, and one
+ * that merely borrows them (START_PROCESS borrows the application's shared
+ * port) does not, so cancelling can never close a descriptor its owner is
+ * still using.
+ */
+nxt_port_msg_cancel_t nxt_port_socket_cancel(nxt_task_t *task,
+    nxt_port_t *port, nxt_uint_t type, uint32_t stream,
+    nxt_port_id_t reply_port, nxt_buf_t *b);
+
 #if (NXT_TESTS)
 void nxt_port_test_msg_alloc_failures(nxt_uint_t failures);
 void nxt_port_test_run_error_handler(nxt_task_t *task, nxt_port_t *port);

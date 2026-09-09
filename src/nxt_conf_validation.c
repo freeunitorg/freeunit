@@ -195,6 +195,8 @@ static nxt_int_t nxt_conf_vldt_app(nxt_conf_validation_t *vldt,
     nxt_str_t *name, nxt_conf_value_t *value);
 static nxt_int_t nxt_conf_vldt_object(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_app_limits(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_processes(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_object_iterator(nxt_conf_validation_t *vldt,
@@ -1306,7 +1308,7 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_common_members[] = {
     }, {
         .name       = nxt_string("limits"),
         .type       = NXT_CONF_VLDT_OBJECT,
-        .validator  = nxt_conf_vldt_object,
+        .validator  = nxt_conf_vldt_app_limits,
         .u.members  = nxt_conf_vldt_app_limits_members,
     }, {
         .name       = nxt_string("processes"),
@@ -1357,6 +1359,9 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_common_members[] = {
 static nxt_conf_vldt_object_t  nxt_conf_vldt_app_limits_members[] = {
     {
         .name       = nxt_string("timeout"),
+        .type       = NXT_CONF_VLDT_INTEGER,
+    }, {
+        .name       = nxt_string("start_timeout"),
         .type       = NXT_CONF_VLDT_INTEGER,
     }, {
         .name       = nxt_string("requests"),
@@ -3605,6 +3610,72 @@ nxt_conf_vldt_object(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
             break;
         }
     }
+}
+
+
+typedef struct {
+    int64_t  start_timeout;
+} nxt_conf_vldt_app_limits_conf_t;
+
+
+static nxt_conf_map_t  nxt_conf_vldt_app_limits_conf_map[] = {
+    {
+        nxt_string("start_timeout"),
+        NXT_CONF_MAP_INT64,
+        offsetof(nxt_conf_vldt_app_limits_conf_t, start_timeout),
+    },
+};
+
+
+/*
+ * "start_timeout" reaches the router through NXT_CONF_MAP_MSEC
+ * (nxt_router_app_limits_conf[], src/nxt_router.c:1733), which computes
+ * (nxt_msec_t) seconds * 1000 and range-checks nothing.  Seconds above
+ * NXT_INT32_T_MAX / 1000 therefore land past the sign bit of the 32-bit
+ * millisecond clock, where nxt_msec_diff() (src/nxt_time.h:103) reads the
+ * deadline as already past, so the bound fires at once instead of far in the
+ * future; a negative value is an out-of-range conversion to an unsigned type
+ * before it even gets that far.  Bound it here, exactly as "idle_timeout" is
+ * bounded in nxt_conf_vldt_processes() below.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_app_limits(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
+    void *data)
+{
+    nxt_int_t                        ret;
+    nxt_conf_vldt_app_limits_conf_t  limits;
+
+    static const nxt_str_t  start_timeout_str = nxt_string("start_timeout");
+
+    ret = nxt_conf_vldt_object(vldt, value, data);
+    if (ret != NXT_OK) {
+        return ret;
+    }
+
+    limits.start_timeout = 0;
+
+    ret = nxt_conf_map_object(vldt->pool, value,
+                              nxt_conf_vldt_app_limits_conf_map,
+                              nxt_nitems(nxt_conf_vldt_app_limits_conf_map),
+                              &limits);
+    if (ret != NXT_OK) {
+        return ret;
+    }
+
+    if (limits.start_timeout < 0) {
+        return nxt_conf_vldt_member_error(vldt, &start_timeout_str,
+                                   "The \"start_timeout\" number must not "
+                                   "be negative.");
+    }
+
+    if (limits.start_timeout > NXT_INT32_T_MAX / 1000) {
+        return nxt_conf_vldt_member_error(vldt, &start_timeout_str,
+                                   "The \"start_timeout\" number must not "
+                                   "exceed %d.", NXT_INT32_T_MAX / 1000);
+    }
+
+    return NXT_OK;
 }
 
 

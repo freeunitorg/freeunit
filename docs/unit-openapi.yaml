@@ -5445,6 +5445,39 @@ paths:
         "404":
           $ref: "#/components/responses/responseNotFound"
 
+  /status/applications/{appName}/processes/unaccounted:
+    summary: "Endpoint for the `unaccounted` processes number"
+    get:
+      operationId: getStatusApplicationsAppProcessesUnaccounted
+      summary: "Retrieve the unaccounted processes app status number"
+      description: "Retrieves the `unaccounted` processes number that
+        represents Unit's per-app
+        [process statistics](https://unit.nginx.org/statusapi/)."
+
+      tags:
+        - status
+
+      parameters:
+        - $ref: "#/components/parameters/appName"
+
+      responses:
+        "200":
+          description: "OK; the `unaccounted` number exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                type: integer
+                format: int64
+
+              examples:
+                Unaccounted:
+                  value: 0
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
   /status/applications/{appName}/processes/idle:
     summary: "Endpoint for the `idle` processes number"
     get:
@@ -6309,6 +6342,7 @@ components:
             processes:
               running: 9
               starting: 1
+              unaccounted: 0
               idle: 0
             requests:
               active: 15
@@ -6369,6 +6403,7 @@ components:
           processes:
             running: 9
             starting: 1
+            unaccounted: 0
             idle: 0
           requests:
             active: 15
@@ -6380,6 +6415,7 @@ components:
         processes:
           running: 9
           starting: 1
+          unaccounted: 0
           idle: 0
         requests:
           active: 15
@@ -6390,6 +6426,7 @@ components:
       value:
         running: 9
         starting: 1
+        unaccounted: 0
         idle: 0
 
     # /status/applications/{appName}/requests
@@ -6902,6 +6939,12 @@ components:
             timeout:
               type: integer
               description: "Request timeout in seconds."
+
+            start_timeout:
+              type: integer
+              description: "Time in seconds an application process may take to
+                announce itself before Unit fails the start request; 0, the
+                default, means no limit."
 
         processes:
           description: "Governs the behavior of app processes."
@@ -7922,6 +7965,15 @@ components:
         starting:
           type: integer
           description: "Current starting app processes."
+
+        unaccounted:
+          type: integer
+          format: int64
+          description: "App processes Unit started and can no longer see: a
+            worker that a `limits/start_timeout` deadline gave up on is still
+            running, but never announced itself, so Unit has no pid for it.
+            They count against `processes/max` until they announce themselves
+            after all, or exit."
 
         idle:
           type: integer
