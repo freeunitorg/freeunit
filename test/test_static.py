@@ -51,6 +51,25 @@ def test_static_index(temp_dir):
     assert client.get()['status'] == 404, 'index empty'
 
 
+def test_static_index_nul(temp_dir):
+    # "index" is appended to "share" and handed to open() as a NUL-terminated
+    # C string, so an embedded NUL truncated the name at the sink: an index of
+    # "README\0x" opened "README".  "share" has been guarded against this since
+    # it is templated; this is the same sink reached by the other half.
+    assert 'error' in client.conf(
+        {"share": f'{temp_dir}/assets$uri', "index": "README\u0000x"},
+        'routes/0/action',
+    ), 'index with null character'
+
+    # An empty index stays valid -- see test_static_index.
+    assert 'success' in client.conf(
+        {"share": f'{temp_dir}/assets$uri', "index": "README"},
+        'routes/0/action',
+    ), 'clean index still accepted'
+
+    assert client.get()['body'] == 'readme', 'clean index still served'
+
+
 def test_static_index_default():
     assert client.get(url='/index.html')['body'] == '0123456789', 'index'
     assert client.get(url='/')['body'] == '0123456789', 'index 2'

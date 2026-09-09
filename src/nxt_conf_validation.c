@@ -123,6 +123,8 @@ static nxt_int_t nxt_conf_vldt_pass(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_return(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_index(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_share(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_share_element(nxt_conf_validation_t *vldt,
@@ -876,6 +878,7 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_share_action_members[] = {
     }, {
         .name       = nxt_string("index"),
         .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_index,
     }, {
         .name       = nxt_string("types"),
         .type       = NXT_CONF_VLDT_STRING | NXT_CONF_VLDT_ARRAY,
@@ -1114,6 +1117,7 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_php_target_members[] = {
     }, {
         .name       = nxt_string("index"),
         .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_index,
     },
 
     NXT_CONF_VLDT_END
@@ -1131,6 +1135,7 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_php_notargets_members[] = {
     }, {
         .name       = nxt_string("index"),
         .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_index,
     },
 
     NXT_CONF_VLDT_NEXT(nxt_conf_vldt_php_common_members)
@@ -2438,6 +2443,39 @@ nxt_conf_vldt_return(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
     if (status < NXT_HTTP_INVALID || status > NXT_HTTP_STATUS_MAX) {
         return nxt_conf_vldt_error(vldt, "The \"return\" value is out of "
                                    "allowed HTTP status code range 0-999.");
+    }
+
+    return NXT_OK;
+}
+
+
+/*
+ * "index" is appended to a "share" directory and the result is handed to
+ * open() as a NUL-terminated C string (nxt_http_static.c, where the name is
+ * assembled).  An embedded NUL truncates the name there, so "a\u0000b" opens
+ * "a".  Unlike "share" this value is not a template, so it can be refused once
+ * at configuration time instead of on every request.
+ *
+ * The neighbouring "share" has the same guard applied per request, and
+ * "component" and the environment names and values are refused the same way;
+ * this is the sink that was missed.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_index(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
+    void *data)
+{
+    nxt_str_t  str;
+
+    nxt_conf_get_string(value, &str);
+
+    /* memchr() on a null pointer is undefined even for a zero length. */
+
+    if (str.length != 0
+        && nxt_slow_path(memchr(str.start, '\0', str.length) != NULL))
+    {
+        return nxt_conf_vldt_error(vldt, "The \"index\" must not contain "
+                                   "null character.");
     }
 
     return NXT_OK;
