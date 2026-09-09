@@ -168,6 +168,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_sprintf_test.c \
     src/test/nxt_malloc_test.c \
     src/test/nxt_utf8_test.c \
+    src/test/nxt_utf8_sanitize_test.c \
     src/test/nxt_rbtree1_test.c \
     src/test/nxt_http_parse_test.c \
     src/test/nxt_strverscmp_test.c \

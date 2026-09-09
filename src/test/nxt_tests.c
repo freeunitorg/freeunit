@@ -158,6 +158,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_utf8_sanitize_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_http_parse_test(thr) != NXT_OK) {
         return 1;
     }

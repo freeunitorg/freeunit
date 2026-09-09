@@ -267,6 +267,109 @@ nxt_utf8_length(const u_char *p, size_t len)
 }
 
 
+/*
+ * Copy "src" into the pool, replacing every byte that begins no valid UTF-8
+ * sequence with U+FFFD.  Returns "src" itself when there is nothing to
+ * replace, so the ordinary path neither allocates nor copies.
+ *
+ * The replacement is per byte rather than per maximal subpart (Unicode 15.0
+ * Sect. 3.9): a truncated four-byte sequence therefore yields up to four
+ * U+FFFD where a maximal-subpart resync yields one.  That changes how many
+ * replacement characters a reader sees, never whether the result is valid,
+ * and it keeps the worst-case expansion at the three bytes of U+FFFD per
+ * input byte -- which matters when the input is a request header somebody
+ * else chose.
+ */
+
+nxt_int_t
+nxt_utf8_sanitize(nxt_mp_t *mp, nxt_str_t *dst, const nxt_str_t *src)
+{
+    size_t        len;
+    u_char        *d, *out;
+    const u_char  *p, *seq, *end, *start;
+
+    /*
+     * "dst" and "src" may be the same nxt_str_t -- the access log sanitizes
+     * a value in place -- so the input is read through locals captured here
+     * and "dst" is not written until both passes are done.
+     */
+
+    start = src->start;
+    end = start + src->length;
+
+    p = start;
+    len = 0;
+
+    while (p < end) {
+
+        /*
+         * nxt_utf8_decode() is a call into another translation unit, and a
+         * logged value is mostly ASCII, so the single-byte case is decided
+         * here rather than paid for at that price once per character.
+         */
+
+        if (nxt_fast_path(*p < 0x80)) {
+            p++;
+            len++;
+
+            continue;
+        }
+
+        seq = p;
+
+        if (nxt_utf8_decode(&seq, end) == 0xFFFFFFFF) {
+            len += nxt_length("\xEF\xBF\xBD");
+            p++;
+
+            continue;
+        }
+
+        len += seq - p;
+        p = seq;
+    }
+
+    if (nxt_fast_path(len == src->length)) {
+        *dst = *src;
+
+        return NXT_OK;
+    }
+
+    out = nxt_mp_nget(mp, len);
+    if (nxt_slow_path(out == NULL)) {
+        return NXT_ERROR;
+    }
+
+    d = out;
+    p = start;
+
+    while (p < end) {
+
+        if (nxt_fast_path(*p < 0x80)) {
+            *d++ = *p++;
+
+            continue;
+        }
+
+        seq = p;
+
+        if (nxt_utf8_decode(&seq, end) == 0xFFFFFFFF) {
+            *d++ = 0xEF; *d++ = 0xBF; *d++ = 0xBD;
+            p++;
+
+            continue;
+        }
+
+        d = nxt_cpymem(d, p, seq - p);
+        p = seq;
+    }
+
+    dst->start = out;
+    dst->length = len;
+
+    return NXT_OK;
+}
+
+
 nxt_bool_t
 nxt_utf8_is_valid(const u_char *p, size_t len)
 {

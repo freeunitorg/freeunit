@@ -17,6 +17,8 @@
 
 
 NXT_EXPORT u_char *nxt_utf8_encode(u_char *p, uint32_t u);
+NXT_EXPORT nxt_int_t nxt_utf8_sanitize(nxt_mp_t *mp, nxt_str_t *dst,
+    const nxt_str_t *src);
 NXT_EXPORT uint32_t nxt_utf8_decode(const u_char **start, const u_char *end);
 NXT_EXPORT uint32_t nxt_utf8_decode2(const u_char **start, const u_char *end);
 NXT_EXPORT nxt_int_t nxt_utf8_casecmp(const u_char *start1,

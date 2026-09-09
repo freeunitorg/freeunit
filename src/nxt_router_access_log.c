@@ -325,6 +325,27 @@ nxt_router_access_log_json(nxt_task_t *task, nxt_http_request_t *r,
             }
         }
 
+        /*
+         * The value is whatever the variable resolved to, and for a request
+         * header that is bytes the client chose: RFC 9110 Sect. 5.5 admits
+         * obs-text, so 0x80-0xFF reach here unfiltered.  JSON text is UTF-8
+         * (RFC 8259 Sect. 8.1), and nxt_conf_json_escape() escapes the quote
+         * and the backslash but copies every other byte through -- so an
+         * unencodable one leaves a record that is unforgeable and still
+         * unreadable, which a strict consumer drops whole.
+         *
+         * Sanitize here rather than in the serializer.  The same serializer
+         * writes state/conf.json and answers GET /config, where the bytes are
+         * the operator's and have to round-trip exactly: a "share" path is
+         * allowed to be non-UTF-8 on Linux, and rewriting one would point the
+         * router at a different file after a restart.
+         */
+
+        ret = nxt_utf8_sanitize(r->mem_pool, &str, &str);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NXT_ERROR;
+        }
+
         nxt_conf_set_member_string(value, &member->name, &str, i);
     }
 
