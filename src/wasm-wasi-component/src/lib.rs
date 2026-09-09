@@ -3,6 +3,7 @@ use bytes::{Bytes, BytesMut};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::Error;
+use std::borrow::Cow;
 use std::ffi::{CStr, CString};
 use std::mem::MaybeUninit;
 use std::process::exit;
@@ -359,8 +360,8 @@ impl GlobalState {
     ) -> Result<http::request::Builder> {
         let mut request = http::Request::builder();
 
-        request = request.method(info.method());
-        request = match info.version() {
+        request = request.method(info.method().as_ref());
+        request = match &*info.version() {
             "HTTP/0.9" => request.version(http::Version::HTTP_09),
             "HTTP/1.0" => request.version(http::Version::HTTP_10),
             "HTTP/1.1" => request.version(http::Version::HTTP_11),
@@ -374,14 +375,14 @@ impl GlobalState {
 
         let uri = http::Uri::builder()
             .scheme(if info.tls() { "https" } else { "http" })
-            .authority(info.server_name())
-            .path_and_query(info.target())
+            .authority(info.server_name().as_ref())
+            .path_and_query(info.target().as_ref())
             .build()
             .context("failed to build URI")?;
         request = request.uri(uri);
 
         for (name, value) in info.fields() {
-            request = request.header(name, value);
+            request = request.header(name.as_ref(), value.as_ref());
         }
         Ok(request)
     }
@@ -463,7 +464,7 @@ unsafe impl Send for NxtRequestInfo {}
 unsafe impl Sync for NxtRequestInfo {}
 
 impl NxtRequestInfo {
-    fn method(&self) -> &str {
+    fn method(&self) -> Cow<'_, str> {
         unsafe {
             let raw = (*self.info).request;
             self.get_str(&(*raw).method, (*raw).method_length.into())
@@ -474,21 +475,21 @@ impl NxtRequestInfo {
         unsafe { (*(*self.info).request).tls != 0 }
     }
 
-    fn version(&self) -> &str {
+    fn version(&self) -> Cow<'_, str> {
         unsafe {
             let raw = (*self.info).request;
             self.get_str(&(*raw).version, (*raw).version_length.into())
         }
     }
 
-    fn server_name(&self) -> &str {
+    fn server_name(&self) -> Cow<'_, str> {
         unsafe {
             let raw = (*self.info).request;
             self.get_str(&(*raw).server_name, (*raw).server_name_length.into())
         }
     }
 
-    fn target(&self) -> &str {
+    fn target(&self) -> Cow<'_, str> {
         unsafe {
             let raw = (*self.info).request;
             self.get_str(&(*raw).target, (*raw).target_length.into())
@@ -502,7 +503,7 @@ impl NxtRequestInfo {
         }
     }
 
-    fn fields(&self) -> impl Iterator<Item = (&str, &str)> {
+    fn fields(&self) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {
         unsafe {
             let raw = (*self.info).request;
             (0..(*raw).fields_count).map(move |i| {
@@ -593,10 +594,10 @@ impl NxtRequestInfo {
         &self,
         ptr: &bindings::nxt_unit_sptr_t,
         len: u32,
-    ) -> &str {
+    ) -> Cow<'_, str> {
         let ptr = bindings::nxt_unit_sptr_get(ptr);
         let slice = std::slice::from_raw_parts(ptr, len.try_into().unwrap());
-        std::str::from_utf8(slice).unwrap()
+        String::from_utf8_lossy(slice)
     }
 }
 
