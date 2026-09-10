@@ -6,6 +6,7 @@ use hyper::Error;
 use std::borrow::Cow;
 use std::ffi::{CStr, CString};
 use std::mem::MaybeUninit;
+use std::os::raw::c_int;
 use std::process::exit;
 use std::ptr;
 use std::sync::OnceLock;
@@ -179,7 +180,13 @@ unsafe extern "C" fn request_handler(
     // Enqueue this request to get processed by the Tokio event loop, and
     // otherwise immediately return.
     let state = GLOBAL_STATE.get().unwrap();
-    state.sender.blocking_send(NxtRequestInfo { info }).unwrap();
+    state
+        .sender
+        .blocking_send(NxtRequestInfo {
+            info,
+            response_started: false,
+        })
+        .unwrap();
 }
 
 struct GlobalConfig {
@@ -256,14 +263,26 @@ impl GlobalState {
         rt.block_on(async {
             while let Some(msg) = receiver.recv().await {
                 let state = GLOBAL_STATE.get().unwrap();
-                tokio::task::spawn(async move {
-                    state.handle(msg).await.expect("failed to handle request")
-                });
+                tokio::task::spawn(async move { state.handle(msg).await });
             }
         });
     }
 
-    async fn handle(&'static self, mut info: NxtRequestInfo) -> Result<()> {
+    /// Handle one request, and finish it whatever happens.
+    ///
+    /// Every error below used to reach `.expect()` in `run()`, which under
+    /// `panic = 'abort'` killed the worker and every other request on it.
+    async fn handle(&'static self, mut info: NxtRequestInfo) {
+        match self.handle_inner(&mut info).await {
+            Ok(()) => info.request_done(),
+            Err(e) => info.fail(&e),
+        }
+    }
+
+    async fn handle_inner(
+        &'static self,
+        info: &mut NxtRequestInfo,
+    ) -> Result<()> {
         // Create a "Store" which is the unit of per-request isolation in
         // Wasmtime.
         let data = StoreState {
@@ -299,27 +318,16 @@ impl GlobalState {
         // Unit forwards bytes that `http` rejects -- a `Host` holding
         // obs-text, a target holding `<`, `>` or a control byte -- so this is
         // reachable from an unauthenticated request.
-        let builder = match self.to_request_builder(&info) {
-            Ok(builder) => builder,
-            Err(e) => {
-                info.reject(&e);
-                return Ok(());
-            }
-        };
-        let body = match self.to_request_body(&mut info) {
-            Ok(body) => body,
-            Err(e) => {
-                info.reject(&e);
-                return Ok(());
-            }
-        };
-        let request = match builder.body(body) {
-            Ok(request) => request,
-            Err(e) => {
-                info.reject(&e.into());
-                return Ok(());
-            }
-        };
+        let builder = self.to_request_builder(info).context(BadRequest)?;
+
+        // Not BadRequest: a negative read comes from read() on the spooled
+        // body failing (src/nxt_unit.c), which is our I/O, not the client's
+        // doing, so it answers 500.
+        let body = self.to_request_body(info)?;
+        let request = builder
+            .body(body)
+            .map_err(anyhow::Error::from)
+            .context(BadRequest)?;
 
         let (sender, receiver) = tokio::sync::oneshot::channel();
 
@@ -330,7 +338,7 @@ impl GlobalState {
         // writing the response when it's available. This enables wasm to
         // generate headers, write those below, and then compute the body
         // afterwards.
-        let task = tokio::spawn(async move {
+        let mut task = GuestTask(Some(tokio::spawn(async move {
             let req = store
                 .data_mut()
                 .http()
@@ -344,7 +352,7 @@ impl GlobalState {
                 .await
                 .map_err(|e| e.context("failed to invoke wasm `handle`"))?;
             Ok::<_, anyhow::Error>(())
-        });
+        })));
 
         // Wait for the wasm to produce the initial response. If this succeeds
         // then propagate that failure. If this fails then wait for the above
@@ -353,27 +361,24 @@ impl GlobalState {
         let response = match receiver.await {
             Ok(response) => response.context("response generation failed")?,
             Err(_) => {
-                task.await.unwrap()?;
-                panic!("sender of response disappeared");
+                task.join().await?;
+                bail!("the sender of the response disappeared");
             }
         };
 
         // Send the headers/status which will extract the body for the next
         // phase.
-        let body = self.send_response(&mut info, response);
+        let body = self.send_response(info, response)?;
 
         // Send the body, a blocking operation, over time as it becomes
         // available.
-        self.send_response_body(&mut info, body)
+        self.send_response_body(info, body)
             .await
             .context("failed to write response body")?;
 
         // Join on completion of the wasm task which should be done by this
         // point.
-        task.await.unwrap()?;
-
-        // And finally signal that we're done.
-        info.request_done();
+        task.join().await?;
 
         Ok(())
     }
@@ -433,7 +438,7 @@ impl GlobalState {
         &self,
         info: &mut NxtRequestInfo,
         response: http::Response<T>,
-    ) -> T {
+    ) -> Result<T> {
         info.init_response(
             response.status().as_u16(),
             response.headers().len().try_into().unwrap(),
@@ -444,13 +449,13 @@ impl GlobalState {
                 .sum::<usize>()
                 .try_into()
                 .unwrap(),
-        );
+        )?;
         for (k, v) in response.headers() {
-            info.add_field(k.as_str().as_bytes(), v.as_bytes());
+            info.add_field(k.as_str().as_bytes(), v.as_bytes())?;
         }
-        info.send_response();
+        info.send_response()?;
 
-        response.into_body()
+        Ok(response.into_body())
     }
 
     async fn send_response_body(
@@ -469,7 +474,7 @@ impl GlobalState {
             };
             match frame.data_ref() {
                 Some(data) => {
-                    info.response_write(&data);
+                    info.response_write(&data)?;
                 }
                 None => {
                     // TODO: what to do with trailers?
@@ -479,8 +484,67 @@ impl GlobalState {
     }
 }
 
+/// Owns the wasm task so that leaving `handle_inner()` early stops it.
+/// Dropping a `JoinHandle` only detaches the task, it does not cancel it:
+/// a client that disconnects mid-response fails the write, the request is
+/// finished without us, and the wasm invocation would keep its `Store` and
+/// burn CPU in the background.  `join()` takes the handle back out, so a
+/// task that ran to completion is never aborted.
+struct GuestTask(Option<tokio::task::JoinHandle<Result<()>>>);
+
+impl GuestTask {
+    /// Wait for the wasm task, reporting a cancelled or panicked one as an
+    /// error.  `unwrap()` here would panic a second time, and under
+    /// `panic = 'abort'` that ends the worker.  A missing handle cannot
+    /// happen -- both callers return right after -- and is reported the
+    /// same way for the same reason.
+    async fn join(&mut self) -> Result<()> {
+        match self.0.take() {
+            Some(task) => match task.await {
+                Ok(result) => result,
+                Err(e) => bail!("the wasm task did not finish: {e}"),
+            },
+            None => bail!("the wasm task was already joined"),
+        }
+    }
+}
+
+impl Drop for GuestTask {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// Marks an error caused by what the client sent, so it is answered 400
+/// rather than 500.
+#[derive(Debug)]
+struct BadRequest;
+
+impl std::fmt::Display for BadRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("malformed request")
+    }
+}
+
+impl std::error::Error for BadRequest {}
+
+/// libunit reports failure as a non-zero return.  Turn that into an error
+/// rather than a panic: under `panic = 'abort'` a panic here would take the
+/// worker down and with it every other request it is serving.
+fn check_rc(rc: c_int, what: &str) -> Result<()> {
+    if rc != 0 {
+        bail!("{what} failed with {rc}");
+    }
+    Ok(())
+}
+
 struct NxtRequestInfo {
     info: *mut bindings::nxt_unit_request_info_t,
+    // Once the status line is out, a failure can no longer be answered with
+    // a status -- all that is left is to end the request.
+    response_started: bool,
 }
 
 // TODO: is this actually safe?
@@ -581,18 +645,24 @@ impl NxtRequestInfo {
         Ok(())
     }
 
-    fn response_write(&mut self, data: &[u8]) {
+    fn response_write(&mut self, data: &[u8]) -> Result<()> {
         unsafe {
             let rc = bindings::nxt_unit_response_write(
                 self.info,
                 data.as_ptr().cast(),
                 data.len(),
             );
-            assert_eq!(rc, 0);
+            check_rc(rc, "nxt_unit_response_write")?;
         }
+        Ok(())
     }
 
-    fn init_response(&mut self, status: u16, headers: u32, headers_size: u32) {
+    fn init_response(
+        &mut self,
+        status: u16,
+        headers: u32,
+        headers_size: u32,
+    ) -> Result<()> {
         unsafe {
             let rc = bindings::nxt_unit_response_init(
                 self.info,
@@ -600,37 +670,71 @@ impl NxtRequestInfo {
                 headers,
                 headers_size,
             );
-            assert_eq!(rc, 0);
+            check_rc(rc, "nxt_unit_response_init")?;
         }
+        Ok(())
     }
 
-    fn add_field(&mut self, key: &[u8], val: &[u8]) {
+    fn add_field(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
+        // libunit takes the name length as a u8.  A guest is free to emit a
+        // longer one, and `unwrap()` here would abort the worker over a
+        // header -- the failure this whole path exists to stop.
+        let Ok(key_len) = key.len().try_into() else {
+            bail!("a response header name is longer than 255 bytes");
+        };
+        let Ok(val_len) = val.len().try_into() else {
+            bail!("a response header value is too long");
+        };
+
         unsafe {
             let rc = bindings::nxt_unit_response_add_field(
                 self.info,
                 key.as_ptr().cast(),
-                key.len().try_into().unwrap(),
+                key_len,
                 val.as_ptr().cast(),
-                val.len().try_into().unwrap(),
+                val_len,
             );
-            assert_eq!(rc, 0);
+            check_rc(rc, "nxt_unit_response_add_field")?;
         }
+        Ok(())
     }
 
-    fn send_response(&mut self) {
+    fn send_response(&mut self) -> Result<()> {
         unsafe {
             let rc = bindings::nxt_unit_response_send(self.info);
-            assert_eq!(rc, 0);
+            check_rc(rc, "nxt_unit_response_send")?;
         }
+        // Only now has a status line reached the router.  `response_init`
+        // alone fills a local buffer, and libunit permits a second one, so
+        // a failure before this point can still be answered.
+        self.response_started = true;
+        Ok(())
     }
 
-    /// Fail this one request with a 400, leaving the worker alive.
+    /// Fail this one request, leaving the worker alive.
     ///
-    /// Takes `self` so the request info is always released: returning without
-    /// `request_done()` would leak it and hang the client.
-    fn reject(mut self, err: &anyhow::Error) {
+    /// Answers 500 if nothing has gone out yet.  Once the status line is
+    /// sent there is no status left to send, so all this can do is end the
+    /// request and let the client see a truncated response.
+    fn fail(mut self, err: &anyhow::Error) {
+        let bad = err.downcast_ref::<BadRequest>().is_some();
+        let status = if bad { 400 } else { 500 };
+
+        self.log_err(&format!("failed to handle a request: {err:#}"));
+
+        if !self.response_started
+            && self.init_response(status, 0, 0).is_ok()
+            && self.send_response().is_ok()
+        {
+            self.request_done();
+            return;
+        }
+
+        self.request_failed();
+    }
+
+    fn log_err(&self, msg: &str) {
         unsafe {
-            let msg = format!("rejected a malformed request: {err:#}");
             if let Ok(msg) = CString::new(msg) {
                 bindings::nxt_unit_req_log(
                     self.info,
@@ -640,9 +744,15 @@ impl NxtRequestInfo {
                 );
             }
         }
-        self.init_response(400, 0, 0);
-        self.send_response();
-        self.request_done();
+    }
+
+    fn request_failed(self) {
+        unsafe {
+            bindings::nxt_unit_request_done(
+                self.info,
+                bindings::NXT_UNIT_ERROR as i32,
+            );
+        }
     }
 
     fn request_done(self) {
