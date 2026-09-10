@@ -306,7 +306,13 @@ impl GlobalState {
                 return Ok(());
             }
         };
-        let body = self.to_request_body(&mut info);
+        let body = match self.to_request_body(&mut info) {
+            Ok(body) => body,
+            Err(e) => {
+                info.reject(&e);
+                return Ok(());
+            }
+        };
         let request = match builder.body(body) {
             Ok(request) => request,
             Err(e) => {
@@ -408,7 +414,7 @@ impl GlobalState {
     fn to_request_body(
         &self,
         info: &mut NxtRequestInfo,
-    ) -> BoxBody<Bytes, Error> {
+    ) -> Result<BoxBody<Bytes, Error>> {
         // TODO: should convert the body into a form of `Stream` to become an
         // async stream of frames. The return value can represent that here
         // but for now this slurps up the entire body into memory and puts it
@@ -418,9 +424,9 @@ impl GlobalState {
 
         // TODO: can this perform a partial read?
         // TODO: how to make this async at the nxt level?
-        info.request_read(&mut body);
+        info.request_read(&mut body)?;
 
-        Full::new(body.freeze()).map_err(|e| match e {}).boxed()
+        Ok(Full::new(body.freeze()).map_err(|e| match e {}).boxed())
     }
 
     fn send_response<T>(
@@ -535,25 +541,44 @@ impl NxtRequestInfo {
         }
     }
 
-    fn request_read(&mut self, dst: &mut BytesMut) {
+    fn request_read(&mut self, dst: &mut BytesMut) -> Result<()> {
         unsafe {
             let rest = dst.spare_capacity_mut();
             let mut total_bytes_read = 0;
-            loop {
+            while total_bytes_read < rest.len() {
                 let amt = bindings::nxt_unit_request_read(
                     self.info,
                     rest.as_mut_ptr().wrapping_add(total_bytes_read).cast(),
-                    32 * 1024 * 1024,
+                    rest.len() - total_bytes_read,
                 );
-                total_bytes_read += amt as usize;
-                if total_bytes_read >= rest.len() {
+
+                // A read returns a signed count.  `amt as usize` on a
+                // negative one wraps to a huge number, which ends the loop
+                // and then moves `set_len()` past the allocation.
+                if amt < 0 {
+                    bail!("failed to read the request body");
+                }
+
+                // Nothing left to read.  Without this a steady 0 spins here
+                // forever, because 0 never reaches `rest.len()`.
+                if amt == 0 {
                     break;
                 }
+
+                // libunit should never return more than it was asked for,
+                // but this count decides `set_len()` below, so do not take
+                // its word for it: a wrong one here is a buffer overrun,
+                // not a wrong answer.
+                let amt = amt as usize;
+                if amt > rest.len() - total_bytes_read {
+                    bail!("the request body read returned more than it was given room for");
+                }
+
+                total_bytes_read += amt;
             }
-            // TODO: handle failure when `amt` is negative
-            let total_bytes_read: usize = total_bytes_read.try_into().unwrap();
             dst.set_len(dst.len() + total_bytes_read);
         }
+        Ok(())
     }
 
     fn response_write(&mut self, data: &[u8]) {

@@ -83,3 +83,15 @@ def test_wasm_component_unrepresentable_request():
 
     # The worker is still alive and serving after both.
     assert client.get()['status'] == 200
+
+
+def test_wasm_component_request_body():
+    client.load('hello_world')
+
+    # Exercises the request_read() loop.  A body larger than one read keeps
+    # the loop going, and the component must still answer rather than spin or
+    # read past the buffer.
+    for size in (1, 8192, 128 * 1024):
+        resp = client.post(body='x' * size)
+        assert resp['status'] == 200, size
+        assert resp['body'] == 'Hello', size
