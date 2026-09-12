@@ -27,13 +27,16 @@
  * against gmtime().  Do not "simplify" these into the differential loops
  * below: handing a nxt_time_t to gmtime(), which takes a time_t, is only
  * safe where the two types agree, and for a negative value they need not.
- * On QNX nxt_time_t is a signed int32_t while the native time_t is uint32_t,
- * so the same bits are 1969 to nxt_gmtime() and 2106 to the C library.  And
- * where nxt_time_t is 8 bytes against a 4-byte time_t -- the case the
- * NXT_TIME_T_SIZE test above already contemplates -- the library reads half
- * the object: the low half on a little-endian machine, which often looks
- * right by accident, and the high half on a big-endian one, which is
- * garbage.  Fixed fields test the arithmetic on every platform instead.
+ * Where nxt_time_t is 8 bytes against a 4-byte time_t -- QNX before SDP
+ * 8.0, whose native time_t is uint32_t, and the case the NXT_TIME_T_SIZE
+ * test above already contemplates -- the library reads half the object,
+ * the low half on a little-endian machine, which often looks right by
+ * accident, and the high half on a big-endian one, which is garbage.
+ * Fixed fields test the arithmetic on every platform instead.
+ *
+ * For the same reason the loops below never hand gmtime() the address of
+ * the nxt_time_t itself: they convert into a real time_t first, and skip
+ * the values that do not survive the conversion.
  *
  * A file's mtime can be negative ("touch -d 1969-07-20"), and the day-time
  * step used to wrap and render an hour of 1193046.  -432000 and beyond
@@ -101,7 +104,19 @@ nxt_gmtime_test(nxt_thread_t *thr)
     for (s = 0; s < NXT_GMTIME_MAX; s += 86400) {
 
         nxt_gmtime(s, &tm0);
+
         native = (time_t) s;
+
+        if ((nxt_time_t) native != s) {
+            /*
+             * The native time_t is narrower than nxt_time_t and cannot hold
+             * s, so gmtime() would be given a truncated value and there is
+             * nothing left to compare against.  Where the two types agree
+             * this never triggers.
+             */
+            break;
+        }
+
         tm1 = gmtime(&native);
 
         if (tm0.tm_mday != tm1->tm_mday
@@ -126,7 +141,13 @@ nxt_gmtime_test(nxt_thread_t *thr)
     for (s = 0; s < 90000; s++) {
 
         nxt_gmtime(s, &tm0);
+
         native = (time_t) s;
+
+        if ((nxt_time_t) native != s) {
+            break;
+        }
+
         tm1 = gmtime(&native);
 
         if (tm0.tm_hour != tm1->tm_hour
@@ -161,7 +182,8 @@ nxt_gmtime_test(nxt_thread_t *thr)
     start = nxt_thread_monotonic_time(thr);
 
     for (s = 0; s < 10000000; s++) {
-        (void) gmtime(&s);
+        native = (time_t) s;
+        (void) gmtime(&native);
     }
 
     nxt_thread_time_update(thr);
