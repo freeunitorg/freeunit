@@ -12,6 +12,17 @@
 
 <change type="change">
 <para>
+two source files that the build never used have been removed.
+src/nxt_job_cache_file.c is named nowhere in auto/, so no configuration ever
+compiled it, and nothing in the tree referenced it or its symbols.
+src/nxt_source.h was removed because nothing includes it: of the 106 headers
+in src/, it was the only one with no #include anywhere in the tree.  Nothing
+observable changes.
+</para>
+</change>
+
+<change type="change">
+<para>
 the fiber implementation has been removed.  It had not been compiled since
 2017: the only allocation of the engine's fiber stack sat under "#if 0", so
 the pointer was always NULL and the setjmp() branch that tested it could not
