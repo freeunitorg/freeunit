@@ -838,6 +838,38 @@ def test_java_application_no_method():
     assert client.post()['status'] == 405, 'no method'
 
 
+def test_java_application_server_name():
+    client.load('server_name')
+
+    def headers(host):
+        return client.get(headers={'Host': host, 'Connection': 'close'})[
+            'headers'
+        ]
+
+    def server_name(host):
+        return headers(host)['X-Server-Name']
+
+    assert server_name('localhost') == 'localhost', 'plain host'
+    assert server_name('localhost:8080') == 'localhost', 'port stripped'
+    assert server_name('LocalHost') == 'localhost', 'lowercased'
+    assert server_name('localhost.') == 'localhost', 'trailing dot stripped'
+    assert server_name('[::1]') == '[::1]', 'ipv6 literal'
+    assert server_name('[::1]:8080') == '[::1]', 'ipv6 literal with port'
+
+    # the port comes from the listener, never from the Host field
+    assert headers('[::1]:9999')['X-Server-Port'] == '8080', 'server port'
+
+    # HTTP/1.0 may omit Host.  The router substitutes "localhost" rather than
+    # leaving the name empty, so that is what the servlet sees -- previously
+    # this module fell back to the listener address instead.  Aligning with
+    # every other module is the point of the change, not a side effect.
+    resp = client.http(
+        b'GET / HTTP/1.0\r\nConnection: close\r\n\r\n', raw=True
+    )
+    assert resp['status'] == 200, 'no host'
+    assert resp['headers']['X-Server-Name'] == 'localhost', 'no host name'
+
+
 def test_java_application_get_header():
     client.load('get_header')
 
