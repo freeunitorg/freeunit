@@ -1,5 +1,7 @@
+import os
 import re
 import time
+from email.utils import formatdate
 from pathlib import Path
 
 import pytest
@@ -544,6 +546,11 @@ def test_variables_response_header(temp_dir, wait_for_record):
     Path(f'{temp_dir}/foo').mkdir()
     Path(f'{temp_dir}/foo/index.html').write_text('index', encoding='utf-8')
 
+    # A fixed mtime, so the logged $response_header_last_modified can be
+    # checked against a value computed here instead of against a shape.
+    mtime = 1600000000  # Sun, 13 Sep 2020 12:26:40 GMT
+    os.utime(f'{temp_dir}/foo/index.html', (mtime, mtime))
+
     assert 'success' in client.conf(
         {
             "listeners": {"*:8080": {"pass": "routes"}},
@@ -564,10 +571,17 @@ def test_variables_response_header(temp_dir, wait_for_record):
         '$response_header_connection'
     )
 
+    # The exact string, not r'.*GMT': matching only the trailing "GMT"
+    # accepts any instant at all, which is how a Last-Modified rendered from
+    # localtime() and labelled GMT stayed green here for years.  $date is the
+    # response clock, not a file's, so it stays a shape.
+    last_modified = re.escape(formatdate(mtime, usegmt=True))
+
     assert client.get(url='/foo/index.html')['status'] == 200
     assert (
         wait_for_record(
-            r'share@.*GMT@".*"@text/html@Unit/.*@.*GMT@5@close', 'access.log'
+            rf'share@{last_modified}@".*"@text/html@Unit/.*@.*GMT@5@close',
+            'access.log',
         )
         is not None
     )
