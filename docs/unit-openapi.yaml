@@ -7136,6 +7136,17 @@ components:
                   $ref: "#/components/schemas/stringArray"
                   description:  "Host directories this application may have access to."
 
+            execution_timeout:
+              type: integer
+              description: "Time in seconds a component may run for one request
+                before Unit stops it; 0, the default, means no limit. Unit
+                answers 500 if the component has not begun its response; once
+                its headers are sent, the client sees a truncated response
+                instead. This bounds the guest, not the request: it runs from
+                the guest's first instruction until it returns, waits inside
+                host calls included. To bound what the client waits for, use
+                limits/timeout, which answers 503."
+
     configApplicationPHP:
       description: "PHP application on Unit."
       allOf:

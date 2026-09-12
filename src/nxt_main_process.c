@@ -432,6 +432,11 @@ static nxt_conf_map_t  nxt_wasm_wc_app_conf[] = {
         NXT_CONF_MAP_PTR,
         offsetof(nxt_common_app_conf_t, u.wasm_wc.access),
     },
+    {
+        nxt_string("execution_timeout"),
+        NXT_CONF_MAP_MSEC,
+        offsetof(nxt_common_app_conf_t, u.wasm_wc.execution_timeout),
+    },
 };
 
 

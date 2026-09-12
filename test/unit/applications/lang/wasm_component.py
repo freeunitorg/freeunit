@@ -41,23 +41,29 @@ class ApplicationWasmComponent(ApplicationProto):
 
         return output
 
-    def load(self, script, **kwargs):
+    def load(self, script, execution_timeout=None, limits=None, **kwargs):
         self.prepare_env(script)
 
         component_path = f'{option.temp_dir}/wasm_component/{script}/target/wasm32-wasip1/release/test_wasi_component.wasm'
+
+        app = {
+            "type": "wasm-wasi-component",
+            "processes": {"spare": 0},
+            "component": component_path,
+        }
+
+        if execution_timeout is not None:
+            app["execution_timeout"] = execution_timeout
+
+        if limits is not None:
+            app["limits"] = limits
 
         self._load_conf(
             {
                 "listeners": {
                     "*:8080": {"pass": f"applications/{quote(script, '')}"}
                 },
-                "applications": {
-                    script: {
-                        "type": "wasm-wasi-component",
-                        "processes": {"spare": 0},
-                        "component": component_path,
-                    }
-                },
+                "applications": {script: app},
             },
             **kwargs,
         )

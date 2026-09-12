@@ -209,6 +209,8 @@ static nxt_int_t nxt_conf_vldt_environment(nxt_conf_validation_t *vldt,
     nxt_str_t *name, nxt_conf_value_t *value);
 static nxt_int_t nxt_conf_vldt_c_string(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_wasm_wc_timeout(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_targets_exclusive(
     nxt_conf_validation_t *vldt, nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_targets(nxt_conf_validation_t *vldt,
@@ -1290,6 +1292,10 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_wasm_wc_members[] = {
         .type       = NXT_CONF_VLDT_OBJECT,
         .validator  = nxt_conf_vldt_object,
         .u.members  = nxt_conf_vldt_wasm_access_members,
+    }, {
+        .name       = nxt_string("execution_timeout"),
+        .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_wasm_wc_timeout,
     },
 
     NXT_CONF_VLDT_NEXT(nxt_conf_vldt_common_members)
@@ -3941,6 +3947,40 @@ nxt_conf_vldt_environment(nxt_conf_validation_t *vldt, nxt_str_t *name,
     if (memchr(str.start, '\0', str.length) != NULL) {
         return nxt_conf_vldt_error(vldt, "The \"%V\" environment value must "
                                    "not contain null character.", name);
+    }
+
+    return NXT_OK;
+}
+
+
+/*
+ * "execution_timeout" bounds one invocation of the component's "handle".
+ * It reaches the module through NXT_CONF_MAP_MSEC (nxt_wasm_wc_app_conf[],
+ * src/nxt_main_process.c), which computes (nxt_msec_t) seconds * 1000 and
+ * range-checks nothing, so bound it here exactly as "start_timeout" is
+ * bounded in nxt_conf_vldt_app_limits() above: a negative value is an
+ * out-of-range conversion to an unsigned type, and seconds above
+ * NXT_INT32_T_MAX / 1000 land past the sign bit of the 32-bit millisecond
+ * value.  0 means unbounded.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_wasm_wc_timeout(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    int64_t  timeout;
+
+    timeout = nxt_conf_get_number(value);
+
+    if (timeout < 0) {
+        return nxt_conf_vldt_error(vldt, "The \"execution_timeout\" number "
+                                   "must not be negative.");
+    }
+
+    if (timeout > NXT_INT32_T_MAX / 1000) {
+        return nxt_conf_vldt_error(vldt, "The \"execution_timeout\" number "
+                                   "must not exceed %d.",
+                                   NXT_INT32_T_MAX / 1000);
     }
 
     return NXT_OK;

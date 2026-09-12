@@ -110,6 +110,22 @@ typedef struct {
     const char        *component;
 
     nxt_conf_value_t  *access;
+
+    /*
+     * "execution_timeout" in milliseconds, 0 for unbounded.  It bounds one
+     * invocation of the component's "handle", and only the wasm module acts
+     * on it: the guest is preempted inside the module's own process, so
+     * unlike "limits": {"start_timeout"} the router has nothing to arm.
+     *
+     * It is wall clock from the guest's first instruction until "handle"
+     * returns, not CPU time, so time the guest spends parked in a host
+     * call -- waiting for a slow client to drain the response body, say --
+     * is spent too.  And the deadline is only checked while wasm executes,
+     * so a guest parked in a host call is not preempted, only trapped when
+     * it resumes.  This is not a request timeout; that is
+     * "limits": {"timeout"}, which the router arms for every app type.
+     */
+    nxt_msec_t        execution_timeout;
 } nxt_wasm_wc_app_conf_t;
 
 
