@@ -701,7 +701,15 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
             goto fail;
         }
 
-        nxt_localtime(nxt_file_mtime(&fi), &tm);
+        /*
+         * On QNX nxt_time_t is a signed int32_t over an unsigned native
+         * time_t, so an mtime past 2038 arrives here negative and renders
+         * as a date in 1901.  That is the Y2038 limitation nxt_types.h
+         * names in its own comment, it costs the Date header and the ETag
+         * below in the same way, and it cannot be repaired at this call
+         * site, since nxt_gmtime() takes an nxt_time_t.  See #329.
+         */
+        nxt_gmtime(nxt_file_mtime(&fi), &tm);
 
         field->value = p;
         field->value_length = nxt_http_date(p, &tm) - p;

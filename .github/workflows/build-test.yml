@@ -530,6 +530,15 @@ jobs:
         if: steps.metadata.outputs.module != 'wasm'
 
       - name: Run ${{ steps.metadata.outputs.module }} tests
+        # GitHub runners are UTC, where localtime() and gmtime() agree, so a
+        # UTC-only run cannot tell a correct HTTP-date from one rendered in
+        # local time and labelled "GMT" (see test_static_last_modified_is_gmt,
+        # which skips itself, loudly, when the offset is zero).  Kolkata is
+        # +05:30 all year: never UTC, no DST to shift it, and a half-hour
+        # offset that also catches whole-hour assumptions.
+        # "sudo -E" below keeps it for unitd, which inherits pytest's env.
+        env:
+          TZ: Asia/Kolkata
         run: |
           # Pin unitd's embedded interpreter to the toolcache prefix it was
           # built against; conftest turns this into PYTHONHOME for unitd only.

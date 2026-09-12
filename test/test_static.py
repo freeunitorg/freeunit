@@ -1,5 +1,7 @@
 import os
 import socket
+import time
+from email.utils import formatdate, parsedate_to_datetime
 from pathlib import Path
 
 import pytest
@@ -168,6 +170,60 @@ def test_static_conditional_ignored():
     )
     assert resp['status'] == 200, 'if-modified-since ignored'
     assert resp['body'] == '0123456789', 'full body on future date'
+
+
+def test_static_last_modified_is_gmt(temp_dir):
+    # RFC 9110 Sect. 5.6.7: an HTTP-date is GMT.  Last-Modified used to be
+    # rendered from localtime() and then labelled "GMT", so on a host not set
+    # to UTC the value was wrong by the UTC offset while still looking valid.
+    # Only a downstream cache comparing it would ever notice.
+    mtime = 1600000000  # Sun, 13 Sep 2020 12:26:40 GMT
+
+    # Under UTC the two renderings are identical and this proves nothing, so
+    # say so out loud rather than passing.  glibc also treats an unknown zone
+    # as UTC, which is how a runner image without tzdata would go green
+    # against a broken build; the workflow pins a zone for this reason.
+    if time.localtime(mtime).tm_gmtoff == 0:
+        pytest.skip('TZ is UTC: localtime() and gmtime() cannot be told apart')
+
+    os.utime(f'{temp_dir}/assets/index.html', (mtime, mtime))
+
+    last_modified = client.get(url='/index.html')['headers']['Last-Modified']
+
+    assert last_modified == formatdate(
+        mtime, usegmt=True
+    ), 'Last-Modified is the GMT rendering of mtime'
+
+
+def test_static_last_modified_pre_epoch(temp_dir):
+    # A pre-epoch mtime is legal ("touch -d 1969-07-20").  nxt_gmtime() used
+    # to take the time of day from an unsigned "s % 86400", which wraps for a
+    # negative time: the header came out as "Thu, 01 Jan 1970 1193046:28:1",
+    # malformed, with the " GMT" truncated off the end of the buffer.
+    path = f'{temp_dir}/assets/index.html'
+    mtime = -14182940  # Sun, 20 Jul 1969 20:17:40 GMT
+
+    try:
+        os.utime(path, (mtime, mtime))
+    except (OSError, OverflowError):
+        pytest.skip('filesystem rejects a pre-epoch mtime')
+
+    if os.stat(path).st_mtime != mtime:
+        pytest.skip('filesystem does not keep a pre-epoch mtime')
+
+    last_modified = client.get(url='/index.html')['headers']['Last-Modified']
+
+    # Checked separately from the equality below: this is the truncation,
+    # and it is worth failing on its own terms.
+    assert last_modified.endswith(' GMT'), 'well-formed pre-epoch date'
+
+    # The exact string, not a parsed timestamp: parsedate_to_datetime()
+    # discards the day name, so a wrong weekday would parse to the right
+    # instant.  This mtime is 164 days pre-epoch, far enough that a weekday
+    # taken from an unsigned day number comes out wrong.
+    assert last_modified == formatdate(
+        mtime, usegmt=True
+    ), 'pre-epoch mtime is reported as itself, not clamped or wrapped'
 
 
 def test_static_redirect():
