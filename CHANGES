@@ -1,6 +1,12 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Change: the fiber implementation has been removed. It had not been
+       compiled since 2017: the only allocation of the engine's fiber
+       stack sat under "#if 0", so the pointer was always NULL and the
+       setjmp() branch that tested it could not run. The thread, log and
+       sprintf sites were already disabled. Nothing observable changes.
+
     *) Bugfix: do not exit when the capget() syscall is denied. A syscall
        filter that omits capget -- a systemd "SystemCallFilter=" allowlist,
        a hand-written seccomp profile -- made a non-root unitd fail to start

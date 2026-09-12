@@ -55,7 +55,6 @@ typedef uint16_t                     nxt_port_id_t;
 #include <nxt_thread_time.h>
 #include <nxt_rbtree.h>
 #include <nxt_timer.h>
-#include <nxt_fiber.h>
 #include <nxt_thread.h>
 #include <nxt_process_type.h>
 #include <nxt_capability.h>

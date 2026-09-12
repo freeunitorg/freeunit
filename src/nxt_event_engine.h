@@ -407,9 +407,6 @@ void nxt_fd_event_hash_destroy(nxt_lvlhsh_t *lvlhsh);
     (engine)->event.enable_accept(engine, ev)
 
 
-#define NXT_ENGINE_FIBERS      1
-
-
 typedef struct {
     nxt_fd_t                   fds[2];
     nxt_fd_event_t             event;
@@ -464,8 +461,6 @@ struct nxt_event_engine_s {
     nxt_event_engine_pipe_t    *pipe;
 
     nxt_event_signals_t        *signals;
-
-    nxt_fiber_main_t           *fibers;
 
     /* The engine ID, the main engine has ID 0. */
     uint32_t                   id;

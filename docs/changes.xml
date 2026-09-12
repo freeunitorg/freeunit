@@ -10,6 +10,16 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="change">
+<para>
+the fiber implementation has been removed.  It had not been compiled since
+2017: the only allocation of the engine's fiber stack sat under "#if 0", so
+the pointer was always NULL and the setjmp() branch that tested it could not
+run.  The thread, log and sprintf sites were already disabled.  Nothing
+observable changes.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 do not exit when the capget() syscall is denied.  A syscall filter that

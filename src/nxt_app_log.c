@@ -41,28 +41,8 @@ nxt_log_time_handler(nxt_uint_t level, nxt_log_t *log, const char *fmt, ...)
     syslogmsg = p;
 #endif
 
-#if 0
-    nxt_fid_t    fid;
-    const char   *id;
-    nxt_fiber_t  *fib;
-
-    fib = nxt_fiber_self(thr);
-
-    if (fib != NULL) {
-        id = "[%V] %PI#%PT#%PF ";
-        fid = nxt_fiber_id(fib);
-
-    } else {
-        id = "[%V] %PI#%PT ";
-        fid = 0;
-    }
-
-    p = nxt_sprintf(p, end, id, &nxt_log_levels[level], nxt_pid,
-                    nxt_thread_tid(thr), fid);
-#else
     p = nxt_sprintf(p, end, "[%V] %PI#%PT ", &nxt_log_levels[level], nxt_pid,
                     nxt_thread_tid(thr));
-#endif
 
     if (log->ident != 0) {
         p = nxt_sprintf(p, end, "*%D ", log->ident);

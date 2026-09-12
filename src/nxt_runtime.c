@@ -301,9 +301,6 @@ nxt_runtime_event_engines(nxt_task_t *task, nxt_runtime_t *rt)
 
     thread = task->thread;
     thread->engine = engine;
-#if 0
-    thread->fiber = &engine->fibers->fiber;
-#endif
 
     engine->id = rt->last_engine_id++;
     engine->mem_pool = nxt_mp_create(1024, 128, 256, 32);

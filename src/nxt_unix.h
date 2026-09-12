@@ -153,7 +153,6 @@
 #include <poll.h>
 #include <pwd.h>
 #include <semaphore.h>
-#include <setjmp.h>
 #include <sched.h>
 #include <signal.h>
 #include <spawn.h>
