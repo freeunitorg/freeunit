@@ -303,11 +303,25 @@ jobs:
       # graceful tests).
       - name: Run ${{ matrix.runtime }} sanitizer subset
         continue-on-error: ${{ matrix.experimental == true }}
+        # TZ: same pin as build-test.yml's pytest step, and for the same
+        # reason (see its comment) -- without it this leg's
+        # test_static_last_modified_is_gmt is as vacuous under UTC as that
+        # one was.
         env:
           ASAN_OPTIONS: "detect_leaks=0"
           UBSAN_OPTIONS: "print_stacktrace=1"
+          TZ: Asia/Kolkata
         run: |
           set -o pipefail
+          # An image without tzdata reads an unknown zone as UTC, where the
+          # test above skips itself and the leg stays green -- the pin would
+          # be silently absent.  Assert the offset instead of trusting it.
+          offset=$(date +%z)
+          if [ "$offset" != "+0530" ]; then
+            echo "TZ=$TZ resolved to $offset, expected +0530:" \
+                 "the zone is missing from this image and the pin does nothing"
+            exit 1
+          fi
           python3 -m pytest -v --save-log ${{ matrix.pytest_opts }} \
             ${{ matrix.tests }} | tee "${RUNNER_TEMP}/pytest.out"
 
