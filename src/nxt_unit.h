@@ -245,10 +245,6 @@ void nxt_unit_port_id_init(nxt_unit_port_id_t *port_id, pid_t pid, uint16_t id);
 /* Calculates hash for given field name. */
 uint16_t nxt_unit_field_hash(const char* name, size_t name_length);
 
-/* Split host for server name and port. */
-void nxt_unit_split_host(char *host_start, uint32_t host_length,
-    char **name, uint32_t *name_length, char **port, uint32_t *port_length);
-
 /* Group duplicate fields for easy enumeration. */
 void nxt_unit_request_group_dup_fields(nxt_unit_request_info_t *req);
 
