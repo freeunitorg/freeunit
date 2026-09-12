@@ -35,6 +35,16 @@ remains fatal.
 
 <change type="bugfix">
 <para>
+the main process did not answer a START_PROCESS request it could not carry
+out -- an unknown router port, a sender that is not the router, or an
+allocation that failed -- so the start stayed pending.  The application then
+parked every later start on a prototype that was not coming, and the
+requests waiting on it were never failed.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 an application worker that died before it finished starting was reported to
 nobody, so the start it was forked for stayed pending forever.  Once the
 application reached its "processes" maximum it started no further process,
