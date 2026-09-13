@@ -1,6 +1,22 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Bugfix: unitctl gave up on a configuration it could not decode as
+       UTF-8.  Unit stores the bytes it is given, so a configuration can
+       hold bytes no UTF-8 decoder accepts; "unitctl execute" and "unitctl
+       export" then failed with "JSON error [path=/config]" and left the
+       operator no way to read or back up the configuration.  Both work
+       now: the document is shown with the undecodable bytes replaced and
+       the members they fall in named, and "export" stores the server's
+       bytes verbatim.  "unitctl edit" refuses such a configuration rather
+       than writing the replacements back over it.
+
+    *) Bugfix: unitctl reordered the members of a configuration.  "unitctl
+       edit" and "unitctl export" passed the document through an unordered
+       map, so members came back in an arbitrary order and an edit rewrote
+       the whole configuration even where nothing had changed.  The order
+       the server sent is now kept.
+
     *) Change: two source files that the build never used have been
        removed.  src/nxt_job_cache_file.c is named nowhere in auto/, so no
        configuration ever compiled it, and nothing in the tree referenced
