@@ -1,6 +1,17 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Feature: conditional requests for static files. A "share" action now
+       answers a GET or HEAD carrying "If-None-Match" or "If-Modified-Since"
+       with "304 Not Modified" when the file's validators still match, so a
+       client that already holds the file is no longer sent it again. Unit
+       emitted "ETag" and "Last-Modified" before, but ignored both when they
+       came back. Entity-tag comparison is weak and "*" matches any
+       representation; a present "If-None-Match" takes precedence over
+       "If-Modified-Since", per RFC 9110. "If-Match" and
+       "If-Unmodified-Since" are evaluated first and answer "412 Precondition
+       Failed" when they do not hold.
+
     *) Security: a file descriptor sent to a port is no longer leaked when
        the message is dispatched and nothing takes ownership of it. An
        application holds the write end of the router's main port and the

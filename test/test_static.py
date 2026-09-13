@@ -144,32 +144,111 @@ def test_static_range_ignored():
     assert 'Content-Range' not in resp['headers'], 'no Content-Range'
 
 
-def test_static_conditional_ignored():
-    # Conditional requests are not implemented; a matching validator must
-    # not produce a 304 (which would imply the body was withheld).
+def test_static_conditional_etag():
     etag = client.get(url='/index.html')['headers']['ETag']
 
-    resp = client.get(
-        url='/index.html',
-        headers={
-            'Host': 'localhost',
-            'If-None-Match': etag,
-            'Connection': 'close',
-        },
-    )
-    assert resp['status'] == 200, 'if-none-match ignored'
-    assert resp['body'] == '0123456789', 'full body on matching etag'
+    def get(**headers):
+        return client.get(
+            url='/index.html',
+            headers={'Host': 'localhost', 'Connection': 'close', **headers},
+        )
 
-    resp = client.get(
-        url='/index.html',
-        headers={
-            'Host': 'localhost',
-            'If-Modified-Since': 'Thu, 01 Jan 2100 00:00:00 GMT',
-            'Connection': 'close',
-        },
-    )
-    assert resp['status'] == 200, 'if-modified-since ignored'
-    assert resp['body'] == '0123456789', 'full body on future date'
+    for value in [etag, f'W/{etag}', '*', f'"nope", {etag}']:
+        resp = get(**{'If-None-Match': value})
+        assert resp['status'] == 304, f'304 for {value}'
+        assert resp['body'] == '', f'no body for {value}'
+        assert resp['headers']['ETag'] == etag, f'ETag echoed for {value}'
+        assert (
+            'Content-Length' not in resp['headers']
+        ), f'no Content-Length for {value}'
+
+    resp = get(**{'If-None-Match': '"nope"'})
+    assert resp['status'] == 200, 'mismatch sends the body'
+    assert resp['body'] == '0123456789', 'full body on mismatch'
+
+
+def test_static_conditional_if_match():
+    etag = client.get(url='/index.html')['headers']['ETag']
+
+    def get(**headers):
+        return client.get(
+            url='/index.html',
+            headers={'Host': 'localhost', 'Connection': 'close', **headers},
+        )
+
+    resp = get(**{'If-Match': etag})
+    assert resp['status'] == 200, 'matching If-Match serves the file'
+    assert resp['body'] == '0123456789', 'full body'
+
+    assert get(**{'If-Match': '*'})['status'] == 200, '* matches'
+    assert get(**{'If-Match': '"nope"'})['status'] == 412, 'mismatch is 412'
+
+    # RFC 9110 Sect. 13.1.1: If-Match uses the strong comparison function,
+    # so a weak tag never matches even when the opaque tags are equal.
+    assert get(**{'If-Match': f'W/{etag}'})['status'] == 412, 'weak tag'
+
+    # Sect. 13.2.2 evaluation order: If-Match is checked before
+    # If-None-Match, so a failed If-Match is a 412, not a 304.
+    resp = get(**{'If-Match': '"nope"', 'If-None-Match': etag})
+    assert resp['status'] == 412, 'If-Match evaluated first'
+
+
+def test_static_conditional_unmodified_since():
+    def get(value, **extra):
+        return client.get(
+            url='/index.html',
+            headers={
+                'Host': 'localhost',
+                'Connection': 'close',
+                'If-Unmodified-Since': value,
+                **extra,
+            },
+        )
+
+    assert get('Thu, 01 Jan 2100 00:00:00 GMT')['status'] == 200, 'unmodified'
+    assert get('Thu, 01 Jan 2000 00:00:00 GMT')['status'] == 412, 'modified'
+    assert get('not-a-date')['status'] == 200, 'unparsable date is ignored'
+
+    etag = client.get(url='/index.html')['headers']['ETag']
+
+    # If-Match takes precedence over If-Unmodified-Since.
+    resp = get('Thu, 01 Jan 2000 00:00:00 GMT', **{'If-Match': etag})
+    assert resp['status'] == 200, 'If-Match wins'
+
+
+def test_static_conditional_modified_since(temp_dir):
+    last_modified = client.get(url='/index.html')['headers']['Last-Modified']
+
+    def get(value, **extra):
+        return client.get(
+            url='/index.html',
+            headers={
+                'Host': 'localhost',
+                'Connection': 'close',
+                'If-Modified-Since': value,
+                **extra,
+            },
+        )
+
+    resp = get('Thu, 01 Jan 2100 00:00:00 GMT')
+    assert resp['status'] == 304, 'not modified since a future date'
+    assert resp['body'] == '', 'no body'
+
+    resp = get(last_modified)
+    assert resp['status'] == 304, 'not modified since its own mtime'
+
+    resp = get('Thu, 01 Jan 2000 00:00:00 GMT')
+    assert resp['status'] == 200, 'modified since an old date'
+    assert resp['body'] == '0123456789', 'full body'
+
+    resp = get('not-a-date')
+    assert resp['status'] == 200, 'unparsable date is ignored'
+
+    # RFC 9110 Sect. 13.2.2: a present If-None-Match wins outright, even when
+    # it does not match, so this must send the body despite the future date.
+    resp = get('Thu, 01 Jan 2100 00:00:00 GMT', **{'If-None-Match': '"nope"'})
+    assert resp['status'] == 200, 'If-None-Match takes precedence'
+    assert resp['body'] == '0123456789', 'full body'
 
 
 def test_static_last_modified_is_gmt(temp_dir):
