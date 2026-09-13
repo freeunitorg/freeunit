@@ -75,8 +75,8 @@ nxt_port_test_run_error_handler(nxt_task_t *task, nxt_port_t *port)
  * -- used to verify the tail close of whatever a dispatch leaves in
  * msg->fd[], and the close in the last-fragment merge that runs before
  * msg->fd[0] is overwritten by the assembled message's own descriptors
- * (issue freeunitorg/freeunit#... "port: close the descriptors a handler
- * does not take").
+ * (freeunitorg/freeunit#342, "port: close the descriptors a handler does
+ * not take").
  */
 void
 nxt_port_test_run_read_msg_process(nxt_task_t *task, nxt_port_t *port,
