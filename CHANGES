@@ -1,20 +1,20 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
-    *) Bugfix: a compressed static response no longer carries the same strong
-       entity-tag as the uncompressed one. Unit derives the tag from the
-       file's mtime and size, which do not change with the content coding, so
-       both representations advertised an identical strong validator. RFC 9110
-       requires a strong validator to change whenever the selected
-       representation changes; the tag of a coded representation is now weak,
-       as nginx does.
-
-    *) Security: a file descriptor is no longer leaked when a static request
-       cannot be satisfied by any acceptable representation. A share with
-       compression configured answered "406 Not Acceptable" without closing
-       the file it had opened, so a single unauthenticated request carrying
-       "Accept-Encoding: identity;q=0, *;q=0" cost the router a descriptor,
-       and repeating it exhausted the table.
+    *) Feature: byte-range requests for static files. A "share" action now
+       answers a satisfiable single-range "Range: bytes=..." request with
+       "206 Partial Content" and a matching "Content-Range", and an
+       unsatisfiable one with "416 Range Not Satisfiable"; "Accept-Ranges:
+       bytes" is now sent on a plain 200 as well. The three single-range
+       forms are supported -- "A-B", "A-" and the suffix form "-N" -- with
+       the end clamped to the last byte of the file; a multi-range request
+       is ignored and answered with the full 200, as RFC 9110 permits.
+       "If-Range" is honoured against the file's entity-tag (strong
+       comparison) or its "Last-Modified" date, falling back to the full
+       200 on a mismatch. Preconditions (RFC 9110 Sect. 13.2.2) are still
+       evaluated first, so a 304 or 412 outcome wins over any Range. A
+       response served from a Range is not content-coded; compression
+       still applies to a full 200.
 
     *) Feature: conditional requests for static files. A "share" action now
        answers a GET or HEAD carrying "If-None-Match" or "If-Modified-Since"

@@ -10,25 +10,15 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
-<change type="bugfix">
+<change type="feature">
 <para>
-a compressed static response no longer carries the same strong entity-tag as
-the uncompressed one.  Unit derives the tag from the file's mtime and size,
-which do not change with the content coding, so both representations
-advertised an identical strong validator.  RFC 9110 requires a strong
-validator to change whenever the selected representation changes; the tag of
-a coded representation is now weak, as nginx does.
-</para>
-</change>
-
-<change type="security">
-<para>
-a file descriptor is no longer leaked when a static request cannot be
-satisfied by any acceptable representation.  A share with compression
-configured answered "406 Not Acceptable" without closing the file it had
-opened, so a single unauthenticated request carrying
-"Accept-Encoding: identity;q=0, *;q=0" cost the router a descriptor, and
-repeating it exhausted the table.
+byte-range requests for static files.  A "share" action answers a "Range"
+header naming a single range with "206 Partial Content" and a
+"Content-Range" header, an unsatisfiable one with "416 Range Not
+Satisfiable", and advertises support with "Accept-Ranges: bytes".
+"If-Range" is honoured, so a range is served only while the client's copy
+is still current.  A request naming several ranges is answered in full, as
+a server that does not implement multipart ranges may.
 </para>
 </change>
 

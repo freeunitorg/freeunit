@@ -171,6 +171,9 @@ static nxt_http_status_t nxt_http_static_preconditions(nxt_http_request_t *r,
     nxt_str_t *etag, nxt_time_t mtime);
 static nxt_bool_t nxt_http_static_etag_match(nxt_str_t *list, nxt_str_t *etag,
     nxt_bool_t strong);
+static nxt_http_status_t nxt_http_static_range(nxt_http_request_t *r,
+    nxt_str_t *etag, nxt_time_t mtime, nxt_off_t size, nxt_off_t *start,
+    nxt_off_t *end);
 #if (NXT_HAVE_OPENAT2)
 static u_char *nxt_http_static_chroot_match(u_char *chr, u_char *shr);
 #endif
@@ -493,6 +496,9 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_uint_t              level;
     nxt_file_t              *f, file;
     nxt_file_info_t         fi;
+    nxt_off_t               range_start, range_end;
+    nxt_bool_t              is_range;
+    nxt_http_status_t       rstatus;
     nxt_http_field_t        *field;
     nxt_http_status_t       status, pcond;
     nxt_router_conf_t       *rtcf;
@@ -773,10 +779,9 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         if (ret == NXT_HTTP_NOT_ACCEPTABLE) {
             /*
              * Every other exit that answers without a body closes the file
-             * first -- the 304, 412 and 416 branches below, and "fail:".
-             * This one returns without reaching any of them, so it has to
-             * close its own, or one unauthenticated request costs the router
-             * a descriptor.
+             * first -- the 304 and 416 branches below, and "fail:".  This one
+             * returns rather than reaching either, so it has to close its own,
+             * or one unauthenticated request costs the router a descriptor.
              */
             nxt_file_close(task, f);
             f = NULL;
@@ -813,30 +818,135 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
             goto send;
         }
 
-        if (ctx->need_body && nxt_file_size(&fi) > 0) {
-            ret = nxt_http_comp_apply_compression(task, r);
-            if (nxt_slow_path(ret != NXT_OK)) {
+        field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+        if (nxt_slow_path(field == NULL)) {
+            goto fail;
+        }
+
+        nxt_http_field_name_set(field, "Accept-Ranges");
+
+        field->value = (u_char *) "bytes";
+        field->value_length = nxt_length("bytes");
+
+        /*
+         * A HEAD is range-processed exactly like the GET it stands for, and
+         * differs only in sending no body.  RFC 9110 Sect. 14.2 says range
+         * handling is defined for GET, which reads like an argument for
+         * ignoring Range here -- but Sect. 9.3.2 asks a HEAD to send the same
+         * header fields the GET would have sent, and nginx, Apache and Go's
+         * net/http all answer 206 with Content-Range to a HEAD.  "curl -I -r"
+         * relies on it.  Matching them is worth more than the stricter
+         * reading of a sentence about methods that do not define ranges.
+         */
+
+        rstatus = nxt_http_static_range(r, &etag, nxt_file_mtime(&fi),
+                                        nxt_file_size(&fi), &range_start,
+                                        &range_end);
+
+        if (rstatus == NXT_HTTP_RANGE_NOT_SATISFIABLE) {
+            nxt_file_close(task, f);
+            f = NULL;
+
+            r->status = NXT_HTTP_RANGE_NOT_SATISFIABLE;
+            r->resp.content_length_n = 0;
+
+            field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+            if (nxt_slow_path(field == NULL)) {
                 goto fail;
             }
 
-            if (nxt_http_comp_wants_compression()) {
-                size_t     out_total;
-                nxt_int_t  ret;
+            nxt_http_field_name_set(field, "Content-Range");
 
-                ret = nxt_http_comp_compress_static_response(
-                                                    task, r, &f, &fi,
-                                                    NXT_HTTP_STATIC_BUF_SIZE,
-                                                    &out_total);
-                if (ret == NXT_ERROR) {
-                    goto fail;
-                }
+            length = nxt_length("bytes */") + NXT_OFF_T_LEN;
 
-                ret = nxt_file_info(f, &fi);
+            p = nxt_mp_nget(r->mem_pool, length);
+            if (nxt_slow_path(p == NULL)) {
+                goto fail;
+            }
+
+            field->value = p;
+            field->value_length = nxt_sprintf(p, p + length, "bytes */%O",
+                                              nxt_file_size(&fi))
+                                  - p;
+
+            body_handler = NULL;
+            goto send;
+        }
+
+        is_range = (rstatus == NXT_HTTP_PARTIAL_CONTENT);
+
+        if (is_range) {
+            r->status = NXT_HTTP_PARTIAL_CONTENT;
+            r->resp.content_length_n = range_end - range_start + 1;
+
+            field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+            if (nxt_slow_path(field == NULL)) {
+                goto fail;
+            }
+
+            nxt_http_field_name_set(field, "Content-Range");
+
+            /*
+             * Three %O conversions, so three times NXT_OFF_T_LEN.  With two,
+             * 40 digits are available across start, end and size: 13 digits
+             * each still fits, 14 does not, so a file of about 10 TB with a
+             * range near its end truncates the header.  nxt_sprintf() clamps
+             * at the boundary, so the value is cut rather than the buffer
+             * overrun -- a wrong Content-Range rather than a crash.
+             */
+            length = nxt_length("bytes -/") + 3 * NXT_OFF_T_LEN;
+
+            p = nxt_mp_nget(r->mem_pool, length);
+            if (nxt_slow_path(p == NULL)) {
+                goto fail;
+            }
+
+            field->value = p;
+            field->value_length = nxt_sprintf(p, p + length,
+                                              "bytes %O-%O/%O", range_start,
+                                              range_end, nxt_file_size(&fi))
+                                  - p;
+        }
+
+        if (ctx->need_body && nxt_file_size(&fi) > 0) {
+
+            /*
+             * A satisfiable Range request is served as identity partial
+             * content: content-coding a byte slice would either compress
+             * the wrong bytes (coding the whole file, then slicing, defeats
+             * the point of a range request) or require re-deriving which
+             * coded bytes correspond to the requested identity range, which
+             * most codings do not support at all.  Skipping compression
+             * here is a plain read of the file, so it does not touch the
+             * temp-file swap that nxt_http_comp_compress_static_response()
+             * performs, nor r->resp.mime_type (already set above).
+             */
+
+            if (!is_range) {
+                ret = nxt_http_comp_apply_compression(task, r);
                 if (nxt_slow_path(ret != NXT_OK)) {
                     goto fail;
                 }
 
-                r->resp.content_length_n = out_total;
+                if (nxt_http_comp_wants_compression()) {
+                    size_t     out_total;
+                    nxt_int_t  ret;
+
+                    ret = nxt_http_comp_compress_static_response(
+                                                        task, r, &f, &fi,
+                                                        NXT_HTTP_STATIC_BUF_SIZE,
+                                                        &out_total);
+                    if (ret == NXT_ERROR) {
+                        goto fail;
+                    }
+
+                    ret = nxt_file_info(f, &fi);
+                    if (nxt_slow_path(ret != NXT_OK)) {
+                        goto fail;
+                    }
+
+                    r->resp.content_length_n = out_total;
+                }
             }
 
             fb = nxt_http_static_buf_alloc(task, r->mem_pool);
@@ -845,7 +955,14 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
             }
 
             fb->file = f;
-            fb->file_end = nxt_file_size(&fi);
+
+            if (is_range) {
+                fb->file_pos = range_start;
+                fb->file_end = range_end + 1;
+
+            } else {
+                fb->file_end = nxt_file_size(&fi);
+            }
 
             r->out = fb;
 
@@ -1198,6 +1315,234 @@ nxt_http_static_etag_match(nxt_str_t *list, nxt_str_t *etag, nxt_bool_t strong)
     }
 
     return 0;
+}
+
+
+/*
+ * Parses a decimal run of digits starting at *p (bounded by end), advancing
+ * *p past what it consumed.  Returns the parsed value, or -1 if *p pointed
+ * at a non-digit (no digits consumed, *p left unchanged).
+ */
+
+static nxt_off_t
+nxt_http_static_range_number(u_char **p, u_char *end)
+{
+    u_char      *start;
+    nxt_off_t   value;
+
+    start = *p;
+
+    if (*p == end || **p < '0' || **p > '9') {
+        return -1;
+    }
+
+    value = 0;
+
+    while (*p < end && **p >= '0' && **p <= '9') {
+        /*
+         * Saturate rather than wrap.  A wrapped value goes NEGATIVE, and a
+         * negative first-pos passes both the "a >= size" and "b < a" tests,
+         * so the range is accepted and "rest = file_end - file_pos" in
+         * nxt_http_static_body_handler() comes out negative: nxt_min() casts
+         * it to a huge size_t, the buffer allocation fails, and the request
+         * is abandoned with the file still open in r->out.  One header per
+         * leaked descriptor is an unauthenticated denial of service.
+         *
+         * Saturating is also what the RFC asks for at both ends: a first-pos
+         * of NXT_OFF_T_MAX is >= size, so Sect. 14.1.2 gives 416, while a
+         * suffix that large means "the whole representation".
+         */
+
+        if (value > (NXT_OFF_T_MAX - (**p - '0')) / 10) {
+            value = NXT_OFF_T_MAX;
+
+            while (*p < end && **p >= '0' && **p <= '9') {
+                (*p)++;
+            }
+
+            return value;
+        }
+
+        value = value * 10 + (*(*p)++ - '0');
+    }
+
+    if (*p == start) {
+        return -1;
+    }
+
+    return value;
+}
+
+
+/*
+ * RFC 9110 Sect. 14.1-14.4: parses a "Range" request header and, when
+ * "If-Range" (Sect. 13.1.5) is present, applies it only if the precondition
+ * matches the current representation.
+ *
+ * Returns:
+ *   NXT_HTTP_OK                  -- no Range applies; serve the full 200.
+ *     (No Range header, a malformed Range, a multi-range request -- a
+ *     server may legally ignore Range entirely -- or an If-Range mismatch.)
+ *   NXT_HTTP_PARTIAL_CONTENT     -- "start"/"end" name an inclusive byte range
+ *     to serve as a 206; both are clamped to [0, size - 1].
+ *   NXT_HTTP_RANGE_NOT_SATISFIABLE -- the single range is out of bounds; the
+ *     caller answers 416 with a "Content-Range: bytes STAR/size" header.
+ */
+
+static nxt_http_status_t
+nxt_http_static_range(nxt_http_request_t *r, nxt_str_t *etag,
+    nxt_time_t mtime, nxt_off_t size, nxt_off_t *start, nxt_off_t *end)
+{
+    u_char                  *p, *last;
+    nxt_off_t               a, b, suffix;
+    nxt_time_t              date;
+    nxt_bool_t              match;
+    nxt_str_t               value;
+    nxt_http_field_t        *f, *range, *if_range;
+    nxt_http_fields_iter_t  iter;
+
+    range = NULL;
+    if_range = NULL;
+
+    for (f = nxt_http_fields_first(&iter, r->inline_fields,
+                                   r->num_inline_fields, r->fields);
+         f != NULL;
+         f = nxt_http_fields_next(&iter))
+    {
+        if (f->skip) {
+            continue;
+        }
+
+        switch (f->name_length) {
+
+        case nxt_length("Range"):
+            if (nxt_strncasecmp(f->name, (u_char *) "Range",
+                                nxt_length("Range")) == 0)
+            {
+                range = f;
+            }
+
+            break;
+
+        case nxt_length("If-Range"):
+            if (nxt_strncasecmp(f->name, (u_char *) "If-Range",
+                                nxt_length("If-Range")) == 0)
+            {
+                if_range = f;
+            }
+
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    if (range == NULL) {
+        return NXT_HTTP_OK;
+    }
+
+    if (if_range != NULL) {
+        value.start = if_range->value;
+        value.length = if_range->value_length;
+
+        if (value.length > 0 && (value.start[0] == '"'
+                                 || (value.length > 1
+                                     && value.start[0] == 'W'
+                                     && value.start[1] == '/')))
+        {
+            /* An entity-tag: Sect. 13.1.5 requires the strong comparison. */
+
+            match = nxt_http_static_etag_match(&value, etag, 1);
+
+        } else {
+            date = nxt_time_parse(value.start, value.length);
+
+            /* Sect. 13.1.5: an exact match against the last modification. */
+
+            match = (date != (nxt_time_t) -1 && date == mtime);
+        }
+
+        if (!match) {
+            return NXT_HTTP_OK;
+        }
+    }
+
+    p = range->value;
+    last = p + range->value_length;
+
+    if ((size_t) (last - p) <= nxt_length("bytes=")
+        || nxt_strncasecmp(p, (u_char *) "bytes=", nxt_length("bytes=")) != 0)
+    {
+        return NXT_HTTP_OK;
+    }
+
+    p += nxt_length("bytes=");
+
+    /*
+     * Only a single range-spec is supported; a comma anywhere in the
+     * remainder marks a multi-range request, which a server may ignore.
+     */
+
+    if (memchr(p, ',', last - p) != NULL) {
+        return NXT_HTTP_OK;
+    }
+
+    if (*p == '-') {
+        p++;
+
+        suffix = nxt_http_static_range_number(&p, last);
+
+        if (suffix == -1 || p != last) {
+            return NXT_HTTP_OK;
+        }
+
+        /*
+         * A suffix range is unsatisfiable when it asks for nothing, and also
+         * against a zero-length representation: "size - suffix" would clamp
+         * to 0 while "size - 1" is -1, yielding "Content-Range: bytes 0--1/0".
+         */
+
+        if (suffix == 0 || size == 0) {
+            return NXT_HTTP_RANGE_NOT_SATISFIABLE;
+        }
+
+        a = (suffix < size) ? size - suffix : 0;
+        b = size - 1;
+
+    } else {
+        a = nxt_http_static_range_number(&p, last);
+
+        if (a == -1 || p == last || *p != '-') {
+            return NXT_HTTP_OK;
+        }
+
+        p++;
+
+        if (a >= size) {
+            return NXT_HTTP_RANGE_NOT_SATISFIABLE;
+        }
+
+        if (p == last) {
+            b = size - 1;
+
+        } else {
+            b = nxt_http_static_range_number(&p, last);
+
+            if (b == -1 || p != last || b < a) {
+                return NXT_HTTP_OK;
+            }
+
+            if (b >= size) {
+                b = size - 1;
+            }
+        }
+    }
+
+    *start = a;
+    *end = b;
+
+    return NXT_HTTP_PARTIAL_CONTENT;
 }
 
 
