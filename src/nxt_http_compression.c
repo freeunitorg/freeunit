@@ -661,10 +661,22 @@ nxt_http_comp_set_vary(nxt_http_request_t *r)
         p = vary->value;
         end = p + vary->value_length;
 
-        /* "Vary: *" already varies on everything; adding to it says less. */
+        /*
+         * "Vary: *" already varies on everything; adding to it says less.
+         *
+         * Trim both ends before the test.  These are response fields an
+         * application handed to libunit, not request headers the parser has
+         * normalised, so "Vary: * " arrives with its trailing space intact --
+         * and appending to that would emit "* , Accept-Encoding", which is
+         * not a valid field value.
+         */
 
         while (p < end && (*p == ' ' || *p == '\t')) {
             p++;
+        }
+
+        while (end > p && (end[-1] == ' ' || end[-1] == '\t')) {
+            end--;
         }
 
         if (end - p == 1 && *p == '*') {
@@ -672,6 +684,8 @@ nxt_http_comp_set_vary(nxt_http_request_t *r)
         }
 
         /* Already listed?  Compare per token, so "X-Accept-Encoding" misses. */
+
+        end = vary->value + vary->value_length;
 
         for (p = vary->value; p < end; p++) {
             while (p < end && (*p == ' ' || *p == '\t' || *p == ',')) {
