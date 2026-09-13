@@ -26,14 +26,50 @@ if [ ! -f "$NXT_BUILD_DIR/$NXT_JAR_FILE" ]; then
 
         mkdir -p "${NXT_JAR_LOCAL_DIR}"
 
-        # --fail so an error page is not written out as if it were the jar,
-        # --location to follow a repository redirect, and --retry because a
-        # transient failure here fails the whole build for reasons that have
-        # nothing to do with the change under test.
-        if ! curl --fail --location --retry 3 --retry-delay 2 \
-                  --progress-bar "$NXT_JAR_URL" -o "$NXT_JAR_LOCAL_TMP"
+        # The observed CI failure is a COMPLETE transfer of the wrong bytes:
+        # a "100.0%" progress bar in 0.07s for a 280 KB jar, then a checksum
+        # mismatch -- an error page or a poisoned cache, not a truncated
+        # download.  curl's own --retry does not cover that, since as far as
+        # curl is concerned the transfer succeeded, so the retry has to span
+        # the verification too.  --fail keeps an error page from being written
+        # out as if it were the jar, and --location follows a redirect.
+        NXT_JAR_TRY=1
+        NXT_JAR_FAIL=download
+
+        while [ $NXT_JAR_TRY -le 3 ]; do
+
+            if curl --fail --location --retry 2 --retry-delay 2 \
+                    --progress-bar "$NXT_JAR_URL" -o "$NXT_JAR_LOCAL_TMP"
+            then
+                NXT_JAR_CHK_FILE=$NXT_JAR_LOCAL_TMP
+                . auto/modules/java_chk_sha512
+
+                # java_chk_sha512 deletes the file it rejects, so the file
+                # surviving means the checksum matched.
+                if [ -f "$NXT_JAR_LOCAL_TMP" ]; then
+                    break
+                fi
+
+                NXT_JAR_FAIL=checksum
+
+                $echo "retrying $NXT_JAR_FILE: checksum did not match"
+            else
+                rm -f "$NXT_JAR_LOCAL_TMP"
+
+                NXT_JAR_FAIL=download
+
+                $echo "retrying $NXT_JAR_FILE: download failed"
+            fi
+
+            NXT_JAR_TRY=$((NXT_JAR_TRY + 1))
+        done
+
+        # Every attempt was rejected.  Say why, rather than letting the mv
+        # below fail with a "cannot stat" that hides the cause, and keep the
+        # two causes apart: a download that never arrived is a different
+        # problem from bytes that arrived and did not verify.
+        if [ ! -f "$NXT_JAR_LOCAL_TMP" ] && [ "$NXT_JAR_FAIL" = "download" ]
         then
-            rm -f "$NXT_JAR_LOCAL_TMP"
             $echo
             $echo $0: error: failed to download "$NXT_JAR_URL".
             $echo
@@ -41,12 +77,6 @@ if [ ! -f "$NXT_BUILD_DIR/$NXT_JAR_FILE" ]; then
             exit 1
         fi
 
-        NXT_JAR_CHK_FILE=$NXT_JAR_LOCAL_TMP
-        . auto/modules/java_chk_sha512
-
-        # java_chk_sha512 deletes the file it rejects, so a missing temp file
-        # here means the checksum did not match.  Say that, rather than
-        # letting the mv below fail with a "cannot stat" that hides the cause.
         if [ ! -f "$NXT_JAR_LOCAL_TMP" ]; then
             $echo
             $echo $0: error: SHA512 mismatch for "$NXT_JAR_FILE".
