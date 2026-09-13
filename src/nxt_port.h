@@ -455,6 +455,8 @@ nxt_port_msg_cancel_t nxt_port_socket_cancel(nxt_task_t *task,
 #if (NXT_TESTS)
 void nxt_port_test_msg_alloc_failures(nxt_uint_t failures);
 void nxt_port_test_run_error_handler(nxt_task_t *task, nxt_port_t *port);
+void nxt_port_test_run_read_msg_process(nxt_task_t *task, nxt_port_t *port,
+    nxt_port_recv_msg_t *msg);
 
 /*
  * Counts entries into nxt_port_send_new_port().  It is nxt_inline and

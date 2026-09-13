@@ -26,6 +26,15 @@
  * The one path this cannot reach is nxt_runtime_process_port_create()
  * returning NULL, which needs an allocation failure the test harness has no
  * way to inject.
+ *
+ * nxt_port_fd_test_tail_close() and nxt_port_fd_test_frag_merge() go one
+ * level up, into the static nxt_port_read_msg_process() itself (via the
+ * NXT_TESTS wrapper nxt_port_test_run_read_msg_process()), for the two
+ * closes nothing above exercises: the tail close that reclaims whatever a
+ * dispatch left behind, and the close in the last-fragment merge that runs
+ * before msg->fd[0] is overwritten by the assembled message's own
+ * descriptors.  nxt_router_response_ready_handler() stays uncovered here
+ * too, for the same reason as above.
  */
 
 #include <nxt_main.h>
@@ -63,8 +72,41 @@ nxt_port_fd_test_dispatch_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 }
 
 
+/*
+ * A handler that takes fd[0] -- blanking its slot without closing it, the
+ * way a handler that keeps a descriptor is required to -- and releases
+ * fd[1] as usual.  Used to pin that nxt_port_read_msg_process() leaves a
+ * kept descriptor alone: the tail close and the fragment-merge close both
+ * have to treat "-1" as "already spoken for", not "nothing was here".
+ */
+static void
+nxt_port_fd_test_keep_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    msg->fd[0] = -1;
+
+    if (msg->fd[1] != -1) {
+        nxt_fd_close(msg->fd[1]);
+        msg->fd[1] = -1;
+    }
+}
+
+
+/*
+ * A handler that ignores the message entirely -- the shape GET_MMAP and
+ * OOSM have, and the shape every handler had before the fix.  It never
+ * touches msg->fd[], so whatever nxt_port_read_msg_process() does with a
+ * dispatch's leftovers is the only thing standing between this and a leak.
+ */
+static void
+nxt_port_fd_test_ignore_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+}
+
+
 static const nxt_port_handlers_t  nxt_port_fd_test_handlers = {
     .quit = nxt_port_fd_test_dispatch_handler,
+    .status = nxt_port_fd_test_keep_handler,
+    .oosm = nxt_port_fd_test_ignore_handler,
 };
 
 
@@ -134,6 +176,188 @@ fail:
      */
     nxt_port_fd_test_close(fd0);
     nxt_port_fd_test_close(fd1);
+
+    return NXT_ERROR;
+}
+
+
+/*
+ * Runs a single, non-fragmented message through nxt_port_read_msg_process()
+ * and checks what the dispatcher's tail close left behind: this pins the
+ * close at the tail of the function, which runs after the handler and
+ * covers whatever it did not take -- distinct from nxt_port_fd_test_closed()
+ * above, which only exercises the dispatcher's own NULL-slot guard.
+ *
+ * "keep_fd0" selects the handler dispatched to: nxt_port_fd_test_handlers
+ * .oosm ignores the message outright (keep_fd0 false), .status blanks fd[0]
+ * without closing it (keep_fd0 true).  Either way fd[1] is never taken, so
+ * it is always expected closed.
+ */
+static nxt_int_t
+nxt_port_fd_test_tail_close(nxt_thread_t *thr, nxt_task_t *task,
+    nxt_port_t *port, nxt_bool_t keep_fd0, const char *name)
+{
+    int                   pipe0[2], pipe1[2];
+    nxt_buf_t             *b;
+    nxt_port_recv_msg_t   msg;
+
+    if (nxt_slow_path(pipe(pipe0) != 0 || pipe(pipe1) != 0)) {
+        nxt_log_alert(thr->log, "port fd test failed to create a pipe");
+        return NXT_ERROR;
+    }
+
+    /* Only the read end of each pipe travels in the message. */
+    (void) close(pipe0[1]);
+    (void) close(pipe1[1]);
+
+    b = nxt_mp_zalloc(port->mem_pool, sizeof(nxt_buf_t));
+    if (nxt_slow_path(b == NULL)) {
+        (void) close(pipe0[0]);
+        (void) close(pipe1[0]);
+        return NXT_ERROR;
+    }
+
+    nxt_memzero(&msg, sizeof(nxt_port_recv_msg_t));
+
+    msg.port = port;
+    msg.buf = b;
+    msg.size = sizeof(nxt_port_msg_t);
+    msg.fd[0] = pipe0[0];
+    msg.fd[1] = pipe1[0];
+    msg.port_msg.type = keep_fd0 ? _NXT_PORT_MSG_STATUS : _NXT_PORT_MSG_OOSM;
+
+    nxt_port_test_run_read_msg_process(task, port, &msg);
+
+    if (nxt_slow_path(keep_fd0 != nxt_port_fd_test_is_open(pipe0[0]))) {
+        nxt_log_alert(thr->log, "port fd test: %s left fd[0] %s", name,
+                      keep_fd0 ? "closed" : "open");
+        goto fail;
+    }
+
+    if (nxt_slow_path(nxt_port_fd_test_is_open(pipe1[0]))) {
+        nxt_log_alert(thr->log, "port fd test: %s leaked fd[1]", name);
+        goto fail;
+    }
+
+    if (nxt_slow_path(msg.fd[0] != -1 || msg.fd[1] != -1)) {
+        nxt_log_alert(thr->log, "port fd test: %s left fds in the message",
+                      name);
+        goto fail;
+    }
+
+    if (keep_fd0) {
+        /* Ours now: the dispatcher correctly left it alone. */
+        (void) close(pipe0[0]);
+    }
+
+    return NXT_OK;
+
+fail:
+
+    nxt_port_fd_test_close(pipe0[0]);
+    nxt_port_fd_test_close(pipe1[0]);
+
+    return NXT_ERROR;
+}
+
+
+/*
+ * Runs a first fragment carrying descriptor A and a last fragment carrying
+ * a different descriptor B through the same (stream, pid), and checks the
+ * close in the merge that runs just before msg->fd[0] is overwritten by the
+ * assembled message's own descriptors (fmsg->fd[0]).  Without that close,
+ * B -- the last fragment's own descriptor, never seen by any handler -- is
+ * dropped on the floor when the overwrite happens.
+ *
+ * "keep_fd0" selects the same two handlers as nxt_port_fd_test_tail_close():
+ * ignoring the message (A ends up closed by the tail close, since nothing
+ * took it) or blanking fd[0] (A is kept open).  B is never handed to a
+ * handler at all -- it is always expected closed.
+ */
+static nxt_int_t
+nxt_port_fd_test_frag_merge(nxt_thread_t *thr, nxt_task_t *task,
+    nxt_port_t *port, nxt_bool_t keep_fd0, const char *name)
+{
+    int                   pipe_a[2], pipe_b[2];
+    nxt_buf_t             *b;
+    nxt_port_recv_msg_t   msg;
+
+    if (nxt_slow_path(pipe(pipe_a) != 0 || pipe(pipe_b) != 0)) {
+        nxt_log_alert(thr->log, "port fd test failed to create a pipe");
+        return NXT_ERROR;
+    }
+
+    (void) close(pipe_a[1]);
+    (void) close(pipe_b[1]);
+
+    /* First fragment: nf=0, mf=1, carries A. */
+
+    b = nxt_mp_zalloc(port->mem_pool, sizeof(nxt_buf_t));
+    if (nxt_slow_path(b == NULL)) {
+        (void) close(pipe_a[0]);
+        (void) close(pipe_b[0]);
+        return NXT_ERROR;
+    }
+
+    nxt_memzero(&msg, sizeof(nxt_port_recv_msg_t));
+
+    msg.port = port;
+    msg.buf = b;
+    msg.size = sizeof(nxt_port_msg_t);
+    msg.fd[0] = pipe_a[0];
+    msg.fd[1] = -1;
+    msg.port_msg.stream = 0x46524147; /* "FRAG" -- distinct from other tests */
+    msg.port_msg.pid = nxt_pid;
+    msg.port_msg.mf = 1;
+    msg.port_msg.type = keep_fd0 ? _NXT_PORT_MSG_STATUS : _NXT_PORT_MSG_OOSM;
+
+    nxt_port_test_run_read_msg_process(task, port, &msg);
+
+    /* Last fragment: nf=1, mf=0, carries a *different* descriptor, B. */
+
+    b = nxt_mp_zalloc(port->mem_pool, sizeof(nxt_buf_t));
+    if (nxt_slow_path(b == NULL)) {
+        nxt_port_fd_test_close(pipe_a[0]);
+        (void) close(pipe_b[0]);
+        return NXT_ERROR;
+    }
+
+    nxt_memzero(&msg, sizeof(nxt_port_recv_msg_t));
+
+    msg.port = port;
+    msg.buf = b;
+    msg.size = sizeof(nxt_port_msg_t);
+    msg.fd[0] = pipe_b[0];
+    msg.fd[1] = -1;
+    msg.port_msg.stream = 0x46524147;
+    msg.port_msg.pid = nxt_pid;
+    msg.port_msg.nf = 1;
+
+    nxt_port_test_run_read_msg_process(task, port, &msg);
+
+    if (nxt_slow_path(keep_fd0 != nxt_port_fd_test_is_open(pipe_a[0]))) {
+        nxt_log_alert(thr->log, "port fd test: %s left A %s", name,
+                      keep_fd0 ? "closed" : "open");
+        goto fail;
+    }
+
+    if (nxt_slow_path(nxt_port_fd_test_is_open(pipe_b[0]))) {
+        nxt_log_alert(thr->log, "port fd test: %s leaked B, the last "
+                      "fragment's own descriptor", name);
+        goto fail;
+    }
+
+    if (keep_fd0) {
+        /* Ours now: the handler kept it, the merge did not touch it. */
+        (void) close(pipe_a[0]);
+    }
+
+    return NXT_OK;
+
+fail:
+
+    nxt_port_fd_test_close(pipe_a[0]);
+    nxt_port_fd_test_close(pipe_b[0]);
 
     return NXT_ERROR;
 }
@@ -434,6 +658,40 @@ nxt_port_fd_test(nxt_thread_t *thr)
         nxt_log_alert(thr->log, "port fd test: a handled type did not reach "
                       "its handler");
         ret = NXT_ERROR;
+        goto done;
+    }
+
+    /*
+     * nxt_port_read_msg_process() itself: the tail close that reclaims
+     * whatever a dispatch left in msg->fd[], and the close in the
+     * last-fragment merge that runs before msg->fd[0] is overwritten by the
+     * assembled message's own descriptors.
+     */
+
+    ret = nxt_port_fd_test_tail_close(thr, task, port, 0,
+                                      "dispatch to a handler that ignores "
+                                      "the message");
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto done;
+    }
+
+    ret = nxt_port_fd_test_tail_close(thr, task, port, 1,
+                                      "dispatch to a handler that keeps "
+                                      "fd[0]");
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto done;
+    }
+
+    ret = nxt_port_fd_test_frag_merge(thr, task, port, 0,
+                                      "fragment merge, handler ignores the "
+                                      "message");
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto done;
+    }
+
+    ret = nxt_port_fd_test_frag_merge(thr, task, port, 1,
+                                      "fragment merge, handler keeps fd[0]");
+    if (nxt_slow_path(ret != NXT_OK)) {
         goto done;
     }
 
