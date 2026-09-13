@@ -32,17 +32,10 @@
 #include <fcntl.h>
 
 
-static nxt_bool_t
-nxt_port_rpc_fd_test_is_open(nxt_fd_t fd)
-{
-    return fcntl(fd, F_GETFD) != -1;
-}
-
-
 static void
 nxt_port_rpc_fd_test_close(nxt_fd_t fd)
 {
-    if (fd != -1 && nxt_port_rpc_fd_test_is_open(fd)) {
+    if (fd != -1 && nxt_test_fd_is_open(fd)) {
         (void) close(fd);
     }
 }
@@ -89,12 +82,12 @@ nxt_port_rpc_fd_test_unregistered(nxt_thread_t *thr, nxt_task_t *task,
 
     nxt_port_rpc_handler(task, &msg);
 
-    if (nxt_slow_path(nxt_port_rpc_fd_test_is_open(fd0))) {
+    if (nxt_slow_path(nxt_test_fd_is_open(fd0))) {
         nxt_log_alert(thr->log, "port rpc fd test: %s leaked fd[0]", name);
         goto fail;
     }
 
-    if (second_fd && nxt_slow_path(nxt_port_rpc_fd_test_is_open(fd1))) {
+    if (second_fd && nxt_slow_path(nxt_test_fd_is_open(fd1))) {
         nxt_log_alert(thr->log, "port rpc fd test: %s leaked fd[1]", name);
         goto fail;
     }

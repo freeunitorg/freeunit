@@ -40,7 +40,6 @@ static void nxt_port_fail_test_mp_completion(nxt_task_t *task, void *obj,
 static void nxt_port_fail_test_completion(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_port_fail_test_drain_wq(nxt_work_queue_t *wq);
-static nxt_bool_t nxt_port_fail_test_fd_is_open(nxt_fd_t fd);
 static nxt_int_t nxt_port_fail_test_fd_count(void);
 
 
@@ -185,7 +184,7 @@ nxt_port_fail_test_socket_write(nxt_thread_t *thr)
 
     nxt_port_test_msg_alloc_failures(0);
 
-    if (!nxt_port_fail_test_fd_is_open(fd)) {
+    if (!nxt_test_fd_is_open(fd)) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "port failure test closed fd before ownership transfer");
         goto fail_close_port;
@@ -221,7 +220,7 @@ nxt_port_fail_test_socket_write(nxt_thread_t *thr)
 
 fail_close_fd:
 
-    if (fd != -1 && nxt_port_fail_test_fd_is_open(fd)) {
+    if (fd != -1 && nxt_test_fd_is_open(fd)) {
         nxt_fd_close(fd);
     }
 
@@ -404,7 +403,7 @@ nxt_port_fail_test_inline_drop(nxt_thread_t *thr)
 
     ret = NXT_ERROR;
 
-    if (!nxt_port_fail_test_fd_is_open(fd)) {
+    if (!nxt_test_fd_is_open(fd)) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "port failure test: the inline drop closed a descriptor "
                       "it reported as not taken");
@@ -515,7 +514,7 @@ done:
 
     nxt_port_test_msg_alloc_failures(0);
 
-    if (fd != -1 && nxt_port_fail_test_fd_is_open(fd)) {
+    if (fd != -1 && nxt_test_fd_is_open(fd)) {
         nxt_fd_close(fd);
     }
 
@@ -540,7 +539,7 @@ done:
 
     nxt_port_close(task, port);
 
-    if (pair[0] != -1 && nxt_port_fail_test_fd_is_open(pair[0])) {
+    if (pair[0] != -1 && nxt_test_fd_is_open(pair[0])) {
         nxt_fd_close(pair[0]);
     }
 
@@ -750,7 +749,7 @@ nxt_port_fail_test_error_handler(nxt_thread_t *thr)
         goto fail_port;
     }
 
-    if (nxt_port_fail_test_fd_is_open(fd)) {
+    if (nxt_test_fd_is_open(fd)) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "port failure test did not close the queued fd");
         goto fail_port;
@@ -789,7 +788,7 @@ fail_port:
         nxt_queue_remove(&msg->link);
         nxt_free(msg);
     }
-    if (fd != -1 && nxt_port_fail_test_fd_is_open(fd)) {
+    if (fd != -1 && nxt_test_fd_is_open(fd)) {
         nxt_fd_close(fd);
     }
     nxt_port_use(task, port, -1);
@@ -1603,13 +1602,6 @@ nxt_port_fail_test_drain_wq(nxt_work_queue_t *wq)
         handler = nxt_work_queue_pop(wq, &t, &obj, &data);
         handler(t, obj, data);
     }
-}
-
-
-static nxt_bool_t
-nxt_port_fail_test_fd_is_open(nxt_fd_t fd)
-{
-    return fcntl(fd, F_GETFD) != -1;
 }
 
 

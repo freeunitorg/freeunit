@@ -51,13 +51,6 @@
 #endif
 
 
-static nxt_bool_t
-nxt_port_ready_test_fd_is_open(nxt_fd_t fd)
-{
-    return fcntl(fd, F_GETFD) != -1;
-}
-
-
 static nxt_int_t
 nxt_port_ready_test_case(nxt_thread_t *thr, nxt_task_t *task,
     nxt_port_recv_msg_t *msg, const char *name)
@@ -77,8 +70,8 @@ nxt_port_ready_test_case(nxt_thread_t *thr, nxt_task_t *task,
 
     nxt_port_process_ready_handler(task, msg);
 
-    if (nxt_port_ready_test_fd_is_open(fd0)
-        || nxt_port_ready_test_fd_is_open(fd1))
+    if (nxt_test_fd_is_open(fd0)
+        || nxt_test_fd_is_open(fd1))
     {
         nxt_log_alert(thr->log, "port ready test: %s leaked a descriptor",
                       name);
@@ -100,11 +93,11 @@ fail:
      * are gone already, and closing them again could reach an unrelated
      * descriptor that reused the number.
      */
-    if (fd0 != -1 && nxt_port_ready_test_fd_is_open(fd0)) {
+    if (fd0 != -1 && nxt_test_fd_is_open(fd0)) {
         (void) close(fd0);
     }
 
-    if (fd1 != -1 && nxt_port_ready_test_fd_is_open(fd1)) {
+    if (fd1 != -1 && nxt_test_fd_is_open(fd1)) {
         (void) close(fd1);
     }
 
@@ -192,8 +185,8 @@ nxt_port_ready_test_reject(nxt_thread_t *thr, nxt_task_t *task,
         return NXT_ERROR;
     }
 
-    if (nxt_port_ready_test_fd_is_open(fd0)
-        || nxt_port_ready_test_fd_is_open(fd1))
+    if (nxt_test_fd_is_open(fd0)
+        || nxt_test_fd_is_open(fd1))
     {
         nxt_log_alert(thr->log, "port ready test: %s leaked a descriptor",
                       name);
@@ -204,11 +197,11 @@ nxt_port_ready_test_reject(nxt_thread_t *thr, nxt_task_t *task,
 
 fail:
 
-    if (fd0 != -1 && nxt_port_ready_test_fd_is_open(fd0)) {
+    if (fd0 != -1 && nxt_test_fd_is_open(fd0)) {
         (void) close(fd0);
     }
 
-    if (fd1 != -1 && nxt_port_ready_test_fd_is_open(fd1)) {
+    if (fd1 != -1 && nxt_test_fd_is_open(fd1)) {
         (void) close(fd1);
     }
 
@@ -355,13 +348,13 @@ nxt_port_ready_test_queue(nxt_thread_t *thr, nxt_task_t *task,
         return NXT_ERROR;
     }
 
-    if (nxt_port_ready_test_fd_is_open(spare)) {
+    if (nxt_test_fd_is_open(spare)) {
         nxt_log_alert(thr->log, "port ready test: %s leaked the spare "
                       "descriptor", name);
         return NXT_ERROR;
     }
 
-    if (prev_queue != NULL && nxt_port_ready_test_fd_is_open(prev_fd)) {
+    if (prev_queue != NULL && nxt_test_fd_is_open(prev_fd)) {
         nxt_log_alert(thr->log, "port ready test: %s did not release the "
                       "previous queue", name);
         return NXT_ERROR;
@@ -442,7 +435,7 @@ nxt_port_ready_test_short_queue(nxt_thread_t *thr, nxt_task_t *task,
         return NXT_ERROR;
     }
 
-    if (msg->fd[0] != -1 || nxt_port_ready_test_fd_is_open(fd)) {
+    if (msg->fd[0] != -1 || nxt_test_fd_is_open(fd)) {
         nxt_log_alert(thr->log, "port ready test: short queue leaked its "
                       "descriptor");
         return NXT_ERROR;
@@ -658,7 +651,7 @@ nxt_port_ready_test_queueless(nxt_thread_t *thr, nxt_task_t *task,
 
     nxt_port_process_ready_handler(task, msg);
 
-    if (msg->fd[0] != -1 || nxt_port_ready_test_fd_is_open(fd)) {
+    if (msg->fd[0] != -1 || nxt_test_fd_is_open(fd)) {
         nxt_log_alert(thr->log, "port ready test: the refused queue leaked "
                       "its descriptor");
         goto fail;
@@ -786,7 +779,7 @@ nxt_port_ready_test_queueless(nxt_thread_t *thr, nxt_task_t *task,
 
     nxt_port_process_ready_handler(task, msg);
 
-    if (msg->fd[0] != -1 || nxt_port_ready_test_fd_is_open(fd)) {
+    if (msg->fd[0] != -1 || nxt_test_fd_is_open(fd)) {
         nxt_log_alert(thr->log, "port ready test: the retransmitted READY "
                       "leaked its descriptor");
         goto fail;

@@ -110,17 +110,10 @@ static const nxt_port_handlers_t  nxt_port_fd_test_handlers = {
 };
 
 
-static nxt_bool_t
-nxt_port_fd_test_is_open(nxt_fd_t fd)
-{
-    return fcntl(fd, F_GETFD) != -1;
-}
-
-
 static void
 nxt_port_fd_test_close(nxt_fd_t fd)
 {
-    if (fd != -1 && nxt_port_fd_test_is_open(fd)) {
+    if (fd != -1 && nxt_test_fd_is_open(fd)) {
         (void) close(fd);
     }
 }
@@ -152,8 +145,8 @@ nxt_port_fd_test_closed(nxt_thread_t *thr, nxt_task_t *task,
 
     handler(task, msg);
 
-    if ((first_fd && nxt_port_fd_test_is_open(fd0))
-        || nxt_port_fd_test_is_open(fd1))
+    if ((first_fd && nxt_test_fd_is_open(fd0))
+        || nxt_test_fd_is_open(fd1))
     {
         nxt_log_alert(thr->log, "port fd test: %s leaked a descriptor", name);
         goto fail;   /* closes only what is still open */
@@ -228,13 +221,13 @@ nxt_port_fd_test_tail_close(nxt_thread_t *thr, nxt_task_t *task,
 
     nxt_port_test_run_read_msg_process(task, port, &msg);
 
-    if (nxt_slow_path(keep_fd0 != nxt_port_fd_test_is_open(pipe0[0]))) {
+    if (nxt_slow_path(keep_fd0 != nxt_test_fd_is_open(pipe0[0]))) {
         nxt_log_alert(thr->log, "port fd test: %s left fd[0] %s", name,
                       keep_fd0 ? "closed" : "open");
         goto fail;
     }
 
-    if (nxt_slow_path(nxt_port_fd_test_is_open(pipe1[0]))) {
+    if (nxt_slow_path(nxt_test_fd_is_open(pipe1[0]))) {
         nxt_log_alert(thr->log, "port fd test: %s leaked fd[1]", name);
         goto fail;
     }
@@ -335,13 +328,13 @@ nxt_port_fd_test_frag_merge(nxt_thread_t *thr, nxt_task_t *task,
 
     nxt_port_test_run_read_msg_process(task, port, &msg);
 
-    if (nxt_slow_path(keep_fd0 != nxt_port_fd_test_is_open(pipe_a[0]))) {
+    if (nxt_slow_path(keep_fd0 != nxt_test_fd_is_open(pipe_a[0]))) {
         nxt_log_alert(thr->log, "port fd test: %s left A %s", name,
                       keep_fd0 ? "closed" : "open");
         goto fail;
     }
 
-    if (nxt_slow_path(nxt_port_fd_test_is_open(pipe_b[0]))) {
+    if (nxt_slow_path(nxt_test_fd_is_open(pipe_b[0]))) {
         nxt_log_alert(thr->log, "port fd test: %s leaked B, the last "
                       "fragment's own descriptor", name);
         goto fail;
@@ -501,7 +494,7 @@ nxt_port_fd_test(nxt_thread_t *thr)
         goto done;
     }
 
-    if (nxt_slow_path(msg.fd[0] != -1 || nxt_port_fd_test_is_open(fd0))) {
+    if (nxt_slow_path(msg.fd[0] != -1 || nxt_test_fd_is_open(fd0))) {
         nxt_log_alert(thr->log, "port fd test: an existing port did not "
                       "refuse the socket");
         nxt_port_fd_test_close(fd1);
@@ -509,7 +502,7 @@ nxt_port_fd_test(nxt_thread_t *thr)
         goto done;
     }
 
-    if (nxt_slow_path(msg.fd[1] != fd1 || !nxt_port_fd_test_is_open(fd1))) {
+    if (nxt_slow_path(msg.fd[1] != fd1 || !nxt_test_fd_is_open(fd1))) {
         nxt_log_alert(thr->log, "port fd test: the queue descriptor of a "
                       "queueless existing port was not left to the caller");
         ret = NXT_ERROR;
@@ -594,7 +587,7 @@ nxt_port_fd_test(nxt_thread_t *thr)
         goto done;
     }
 
-    if (nxt_slow_path(msg.fd[1] != fd1 || !nxt_port_fd_test_is_open(fd1))) {
+    if (nxt_slow_path(msg.fd[1] != fd1 || !nxt_test_fd_is_open(fd1))) {
         nxt_log_alert(thr->log, "port fd test: the queue descriptor was not "
                       "left to the caller");
         ret = NXT_ERROR;

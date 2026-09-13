@@ -48,17 +48,6 @@
 #endif
 
 
-#if (NXT_HAVE_MEMFD_CREATE)
-
-static nxt_bool_t
-nxt_router_new_port_test_fd_is_open(nxt_fd_t fd)
-{
-    return fcntl(fd, F_GETFD) != -1;
-}
-
-#endif
-
-
 nxt_int_t
 nxt_router_new_port_test(nxt_thread_t *thr)
 {
@@ -209,7 +198,7 @@ nxt_router_new_port_test(nxt_thread_t *thr)
 
     nxt_router_new_port_handler(task, &msg);
 
-    if (msg.fd[1] != -1 || nxt_router_new_port_test_fd_is_open(queue)) {
+    if (msg.fd[1] != -1 || nxt_test_fd_is_open(queue)) {
         nxt_log_alert(thr->log, "router new port test: a refused queue "
                       "leaked its descriptor");
         goto done;

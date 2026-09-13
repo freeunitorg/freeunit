@@ -31,13 +31,6 @@
 #include <fcntl.h>
 
 
-static nxt_bool_t
-nxt_port_change_file_test_fd_is_open(nxt_fd_t fd)
-{
-    return fcntl(fd, F_GETFD) != -1;
-}
-
-
 /*
  * Feed the handler a message it has to refuse, and check that nothing the
  * message carried outlives the call.
@@ -67,8 +60,8 @@ nxt_port_change_file_test_reject(nxt_thread_t *thr, nxt_task_t *task,
 
     nxt_port_change_log_file_handler(task, msg);
 
-    if ((fd0 != -1 && nxt_port_change_file_test_fd_is_open(fd0))
-        || nxt_port_change_file_test_fd_is_open(fd1))
+    if ((fd0 != -1 && nxt_test_fd_is_open(fd0))
+        || nxt_test_fd_is_open(fd1))
     {
         nxt_log_alert(thr->log, "port change file test: %s leaked a "
                       "descriptor", name);
@@ -90,11 +83,11 @@ fail:
      * are gone already, and closing them again could reach an unrelated
      * descriptor that reused the number.
      */
-    if (fd0 != -1 && nxt_port_change_file_test_fd_is_open(fd0)) {
+    if (fd0 != -1 && nxt_test_fd_is_open(fd0)) {
         (void) close(fd0);
     }
 
-    if (fd1 != -1 && nxt_port_change_file_test_fd_is_open(fd1)) {
+    if (fd1 != -1 && nxt_test_fd_is_open(fd1)) {
         (void) close(fd1);
     }
 
@@ -128,8 +121,8 @@ nxt_port_change_file_test_accept(nxt_thread_t *thr, nxt_task_t *task,
 
     nxt_port_change_log_file_handler(task, msg);
 
-    if (nxt_port_change_file_test_fd_is_open(fd0)
-        || nxt_port_change_file_test_fd_is_open(fd1))
+    if (nxt_test_fd_is_open(fd0)
+        || nxt_test_fd_is_open(fd1))
     {
         nxt_log_alert(thr->log, "port change file test: %s leaked a "
                       "descriptor", name);
@@ -142,7 +135,7 @@ nxt_port_change_file_test_accept(nxt_thread_t *thr, nxt_task_t *task,
         return NXT_ERROR;
     }
 
-    if (!nxt_port_change_file_test_fd_is_open(log_file->fd)) {
+    if (!nxt_test_fd_is_open(log_file->fd)) {
         nxt_log_alert(thr->log, "port change file test: %s closed the log "
                       "file", name);
         return NXT_ERROR;
@@ -152,11 +145,11 @@ nxt_port_change_file_test_accept(nxt_thread_t *thr, nxt_task_t *task,
 
 fail:
 
-    if (fd0 != -1 && nxt_port_change_file_test_fd_is_open(fd0)) {
+    if (fd0 != -1 && nxt_test_fd_is_open(fd0)) {
         (void) close(fd0);
     }
 
-    if (fd1 != -1 && nxt_port_change_file_test_fd_is_open(fd1)) {
+    if (fd1 != -1 && nxt_test_fd_is_open(fd1)) {
         (void) close(fd1);
     }
 

@@ -64,13 +64,6 @@
 #include <sys/wait.h>
 
 
-static nxt_bool_t
-nxt_main_start_process_reply_test_fd_is_open(nxt_fd_t fd)
-{
-    return fcntl(fd, F_GETFD) != -1;
-}
-
-
 /*
  * Run the handler once and require that it answered: exactly one RPC_ERROR
  * on reply_port, carrying the stream of the incoming message, and nothing
@@ -113,12 +106,12 @@ nxt_main_start_process_reply_test_case(nxt_thread_t *thr, nxt_task_t *task,
      * the fix, only a guard against the cleanup below closing a number that
      * has already been reused.
      */
-    if (msg->fd[0] == -1 && !nxt_main_start_process_reply_test_fd_is_open(fd0))
+    if (msg->fd[0] == -1 && !nxt_test_fd_is_open(fd0))
     {
         fd0 = -1;
     }
 
-    if (msg->fd[1] == -1 && !nxt_main_start_process_reply_test_fd_is_open(fd1))
+    if (msg->fd[1] == -1 && !nxt_test_fd_is_open(fd1))
     {
         fd1 = -1;
     }
@@ -180,11 +173,11 @@ done:
      * Close only what is still open: a consumed descriptor is gone already,
      * and closing its number again could reach an unrelated file.
      */
-    if (fd0 != -1 && nxt_main_start_process_reply_test_fd_is_open(fd0)) {
+    if (fd0 != -1 && nxt_test_fd_is_open(fd0)) {
         (void) close(fd0);
     }
 
-    if (fd1 != -1 && nxt_main_start_process_reply_test_fd_is_open(fd1)) {
+    if (fd1 != -1 && nxt_test_fd_is_open(fd1)) {
         (void) close(fd1);
     }
 
@@ -235,12 +228,12 @@ nxt_main_start_process_reply_test_no_reply_case(nxt_thread_t *thr,
 
     nxt_main_test_run_start_process_handler(task, msg);
 
-    if (msg->fd[0] == -1 && !nxt_main_start_process_reply_test_fd_is_open(fd0))
+    if (msg->fd[0] == -1 && !nxt_test_fd_is_open(fd0))
     {
         fd0 = -1;
     }
 
-    if (msg->fd[1] == -1 && !nxt_main_start_process_reply_test_fd_is_open(fd1))
+    if (msg->fd[1] == -1 && !nxt_test_fd_is_open(fd1))
     {
         fd1 = -1;
     }
@@ -264,11 +257,11 @@ nxt_main_start_process_reply_test_no_reply_case(nxt_thread_t *thr,
 
 done:
 
-    if (fd0 != -1 && nxt_main_start_process_reply_test_fd_is_open(fd0)) {
+    if (fd0 != -1 && nxt_test_fd_is_open(fd0)) {
         (void) close(fd0);
     }
 
-    if (fd1 != -1 && nxt_main_start_process_reply_test_fd_is_open(fd1)) {
+    if (fd1 != -1 && nxt_test_fd_is_open(fd1)) {
         (void) close(fd1);
     }
 
@@ -357,8 +350,8 @@ nxt_main_start_process_reply_test_proto_case(nxt_thread_t *thr,
         }
 
         if (msg->fd[0] != -1 || msg->fd[1] != -1
-            || nxt_main_start_process_reply_test_fd_is_open(fd0)
-            || nxt_main_start_process_reply_test_fd_is_open(fd1))
+            || nxt_test_fd_is_open(fd0)
+            || nxt_test_fd_is_open(fd1))
         {
             nxt_log_alert(thr->log, "main start process reply test: %s leaked "
                           "a descriptor", name);

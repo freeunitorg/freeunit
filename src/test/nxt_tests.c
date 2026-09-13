@@ -14,6 +14,19 @@ nxt_module_init_t  nxt_init_modules[1];
 nxt_uint_t         nxt_init_modules_n;
 
 
+/*
+ * Whether the descriptor is still open in this process.  Several port tests
+ * assert on a descriptor's real state rather than on what a handler returned,
+ * because the bug they guard against is a close that did or did not happen.
+ */
+
+nxt_bool_t
+nxt_test_fd_is_open(nxt_fd_t fd)
+{
+    return fcntl(fd, F_GETFD) != -1;
+}
+
+
 /* The function is defined here to prevent inline optimizations. */
 static nxt_bool_t
 nxt_msec_less(nxt_msec_t first, nxt_msec_t second)

@@ -60,7 +60,7 @@ nxt_port_ctrunc_test_fd_count(void)
     n = 0;
 
     for (fd = 0; fd < NXT_CTRUNC_TEST_FD_MAX; fd++) {
-        if (fcntl(fd, F_GETFD) != -1) {
+        if (nxt_test_fd_is_open(fd)) {
             n++;
         }
     }
