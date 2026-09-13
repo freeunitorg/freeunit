@@ -323,6 +323,31 @@ struct nxt_port_s {
      */
     nxt_work_t          release_work;
 
+    /*
+     * The write event has to be re-armed on port->engine, and a caller on
+     * another engine cannot do it directly.  nxt_port_post() would allocate
+     * the item it posts, which fails exactly when the re-arm is needed most:
+     * the write that could not be held for a later attempt ran out of memory
+     * too.  So the item lives here.
+     *
+     * ->release_work gets its uniqueness from the reference count -- only one
+     * thread can hand over the last reference -- and nothing like that holds
+     * for a re-arm, which any thread can want at any time.  ->rearm_pending
+     * is that guarantee instead: the poster takes it from 0 to 1 and the
+     * handler clears it, so the item is on the engine's queue at most once.
+     * Re-arming twice would cost nothing, but linking the same item twice
+     * makes it its own successor.
+     *
+     * ->announce says the shared queue holds items whose READ_QUEUE marker
+     * was never sent.  It is a fact about the port rather than work to run,
+     * so it is a flag and not a second item: any thread may set it, only
+     * port->engine clears it, and it is cleared only once a marker has gone
+     * out.
+     */
+    nxt_work_t          rearm_work;
+    nxt_atomic_t        rearm_pending;
+    nxt_atomic_t        announce;
+
     nxt_buf_t           *free_bufs;
     nxt_socket_t        pair[2];
 
@@ -483,6 +508,7 @@ nxt_int_t nxt_port_send_port(nxt_task_t *task, nxt_port_t *port,
 void nxt_port_change_log_file(nxt_task_t *task, nxt_runtime_t *rt,
     nxt_uint_t slot, nxt_fd_t fd);
 void nxt_port_remove_notify_others(nxt_task_t *task, nxt_process_t *process);
+void nxt_port_rearm(nxt_task_t *task, nxt_port_t *port);
 void *nxt_port_queue_mmap(nxt_task_t *task, nxt_fd_t fd, size_t size);
 
 void nxt_port_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);

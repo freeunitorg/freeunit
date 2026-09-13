@@ -37,6 +37,10 @@ static void nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
     nxt_port_recv_msg_t *msg);
 static nxt_buf_t *nxt_port_buf_alloc(nxt_port_t *port);
 static void nxt_port_buf_free(nxt_port_t *port, nxt_buf_t *b);
+static void nxt_port_announce(nxt_task_t *task, nxt_port_t *port);
+static void nxt_port_rearm_now(nxt_task_t *task, nxt_port_t *port);
+static void nxt_port_rearm_work_handler(nxt_task_t *task, void *obj,
+    void *data);
 static void nxt_port_error_handler(nxt_task_t *task, void *obj, void *data);
 
 #if (NXT_TESTS)
@@ -378,16 +382,16 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
          *
          * ENOBUFS promises nothing: nxt_socketpair_send() maps it to
          * NXT_AGAIN as well (src/nxt_socketpair.c), and it means the system
-         * ran out of buffers, not that the peer owes this port a read.  The
-         * item then waits until something else makes that peer read.  Keeping
-         * the notification instead needs one the port has already allocated,
-         * the way ->release_work is held for the release path; the alert
-         * marks the case until then.
+         * ran out of buffers, not that the peer owes this port a read.
+         *
+         * So record that a marker is owed and re-arm.  nxt_port_announce()
+         * sends it from the stack with no allocation, either here on this
+         * port's own engine or from the item nxt_port_rearm() posts.
          */
 
-        nxt_alert(task, "port{%d,%d} %d: the queued message could not be "
-                  "announced; the peer takes it only when it next reads this "
-                  "port", (int) port->pid, (int) port->id, port->socket.fd);
+        nxt_atomic_fetch_add(&port->announce, 1);
+
+        nxt_port_rearm(task, port);
 
         res = NXT_OK;
     }
@@ -510,10 +514,153 @@ nxt_port_fd_block_write(nxt_task_t *task, nxt_port_t *port, void *data)
 }
 
 
+/*
+ * Tell the peer the shared queue has something in it, when the marker that
+ * should have said so could not be written.
+ *
+ * The marker is a bare header with no buffer and no descriptor, so it goes out
+ * from the stack with one sendmsg() and allocates nothing -- which is the
+ * point, because this runs after an allocation failure.  The flag is cleared
+ * only once the marker has left: a peer that reads one drains the whole ring,
+ * so anything enqueued in between is covered by the same marker.
+ */
+
 static void
-nxt_port_fd_enable_write(nxt_task_t *task, nxt_port_t *port, void *data)
+nxt_port_announce(nxt_task_t *task, nxt_port_t *port)
 {
+    ssize_t         n;
+    nxt_fd_t        fd[2];
+    struct iovec    iov;
+    nxt_port_msg_t  msg;
+
+    /*
+     * pair[1], not socket.fd: nxt_port_write_close() clears the first and
+     * leaves the second at the number it had, so socket.fd tells you nothing
+     * about whether this port may still be written to.  The caller checks the
+     * same thing before it arms the event; this repeats it because the test
+     * is cheap and the consequence of getting it wrong is writing to somebody
+     * else's descriptor.
+     */
+
+    if (port->announce == 0 || port->pair[1] == -1) {
+        return;
+    }
+
+    /* nxt_socketpair_send() reads both, whether or not it sends them. */
+
+    fd[0] = -1;
+    fd[1] = -1;
+
+    nxt_memzero(&msg, sizeof(nxt_port_msg_t));
+
+    msg.type = _NXT_PORT_MSG_READ_QUEUE;
+    msg.pid = nxt_pid;
+    msg.last = 1;
+
+    iov.iov_base = &msg;
+    iov.iov_len = sizeof(nxt_port_msg_t);
+
+    n = nxt_socketpair_send(&port->socket, fd, &iov, 1);
+
+    if (n == (ssize_t) sizeof(nxt_port_msg_t)) {
+        nxt_atomic_fetch_add(&port->announce, -1);
+
+        nxt_debug(task, "port{%d,%d} %d: queue announced", (int) port->pid,
+                  (int) port->id, port->socket.fd);
+    }
+}
+
+
+/*
+ * The work itself, on port->engine and touching neither the flag nor the
+ * reference count: both belong to whoever posted, and a caller already on
+ * this engine posts nothing.
+ *
+ * The descriptor is checked because a port can be closed while an item is in
+ * flight: nxt_port_write_close() sets pair[1] to -1 but leaves socket.fd at
+ * the number it had, so enabling would register that number -- possibly
+ * somebody else's by then -- against this port's handlers.  Every close runs
+ * on port->engine, which is this thread, so the read is stable.
+ */
+
+static void
+nxt_port_rearm_now(nxt_task_t *task, nxt_port_t *port)
+{
+    if (port->pair[1] == -1) {
+        return;
+    }
+
     nxt_fd_event_enable_write(task->thread->engine, &port->socket);
+
+    nxt_port_announce(task, port);
+}
+
+
+/*
+ * Clear ->rearm_pending before the work, not after: a poster that arrives
+ * while this runs then posts again rather than dropping the re-arm, and
+ * enabling the same write event twice costs nothing.  The reverse order can
+ * lose one, because a poster that sees the flag set cannot know whether the
+ * enable it skipped has happened yet.
+ *
+ * Only this handler clears it, and only because the post that queued this
+ * item set it.  The flag counts posts, not re-arms.
+ */
+
+static void
+nxt_port_rearm_work_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_port_t  *port;
+
+    port = obj;
+
+    nxt_atomic_fetch_add(&port->rearm_pending, -1);
+
+    nxt_port_rearm_now(task, port);
+
+    /*
+     * The reference the post took.  It runs on port->engine, so this drop
+     * takes the on-engine branch of nxt_port_use() and releases the port only
+     * if nobody else holds it -- the same discipline nxt_port_post() uses.
+     */
+
+    nxt_port_use(task, port, -1);
+}
+
+
+/*
+ * Re-arm the write event, and announce the queue if a marker is owed.
+ *
+ * On port->engine both are immediate.  From another engine they have to be
+ * posted, and nxt_port_post() would allocate the item -- which fails exactly
+ * when this is needed, since the write that brought us here ran out of memory
+ * too.  So the port carries its own item, and ->rearm_pending keeps it off the
+ * engine's queue twice: linking one item as its own successor would spin
+ * nxt_locked_work_queue_add() forever.
+ */
+
+void
+nxt_port_rearm(nxt_task_t *task, nxt_port_t *port)
+{
+    if (task->thread->engine == port->engine) {
+        nxt_port_rearm_now(task, port);
+
+        return;
+    }
+
+    if (!nxt_atomic_cmp_set(&port->rearm_pending, 0, 1)) {
+        return;
+    }
+
+    nxt_atomic_fetch_add(&port->use_count, 1);
+
+    port->rearm_work.handler = nxt_port_rearm_work_handler;
+    port->rearm_work.task = &port->engine->task;
+    port->rearm_work.obj = port;
+    port->rearm_work.data = NULL;
+    port->rearm_work.next = NULL;
+
+    nxt_event_engine_post(port->engine, &port->rearm_work);
 }
 
 
@@ -779,39 +926,16 @@ cleanup:
         nxt_port_post(task, port, nxt_port_fd_block_write, NULL);
     }
 
-    if (enable_write) {
-        /*
-         * Same engine, nxt_port_post() is a direct call and cannot fail.
-         * Cross-engine, it allocates the work item it posts, and that can
-         * fail under the same memory pressure that sent this write down the
-         * refusal path above.  A re-arm that never happens leaves
-         * write_ready at 0 with no event to set it again, so anything on
-         * this port's queue -- inserted concurrently, or by the next caller
-         * -- would wait forever.
-         *
-         * Raise the error handler instead, as every other failure here
-         * does.  It drains the queue and completes what it holds, so those
-         * callers get their buffers back.
-         *
-         * It does not repair the port.  write_ready stays 0 with no write
-         * event armed, so every later message is queued and never sent until
-         * the port is closed.  An embedded work item on the port, the way
-         * ->release_work already works, would let the re-arm run without an
-         * allocation and remove this branch.
-         */
+    /*
+     * An owed marker is a reason to come back even when the event needs no
+     * arming: the first retry runs from the re-arm handler, which enables the
+     * event, so nothing would set enable_write again and a second ENOBUFS
+     * would strand the marker.  Every later pass through this function tries
+     * once more.
+     */
 
-        if (nxt_slow_path(nxt_port_post(task, port, nxt_port_fd_enable_write,
-                                        NULL) != NXT_OK))
-        {
-            nxt_alert(task, "port{%d,%d} %d: cannot re-arm the write event; "
-                      "draining what it holds, and it sends nothing further",
-                      (int) port->pid, (int) port->id, port->socket.fd);
-
-            use_delta++;
-
-            nxt_work_queue_add(wq, nxt_port_error_handler, task,
-                               &port->socket, &port->socket);
-        }
+    if (enable_write || port->announce != 0) {
+        nxt_port_rearm(task, port);
     }
 
     if (use_delta != 0) {

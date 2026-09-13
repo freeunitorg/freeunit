@@ -26,6 +26,7 @@ static nxt_int_t nxt_port_fail_test_cross_engine_release(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_cross_engine_acquire(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_cross_engine_race(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_cross_engine_batch(nxt_thread_t *thr);
+static nxt_int_t nxt_port_fail_test_cross_engine_rearm(nxt_thread_t *thr);
 static void nxt_port_fail_test_racer(void *data);
 static nxt_int_t nxt_port_fail_test_queued(nxt_locked_work_queue_t *lwq,
     nxt_work_t *item);
@@ -88,6 +89,10 @@ nxt_port_fail_test(nxt_thread_t *thr)
     }
 
     if (nxt_port_fail_test_cross_engine_batch(thr) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_port_fail_test_cross_engine_rearm(thr) != NXT_OK) {
         return NXT_ERROR;
     }
 
@@ -269,6 +274,7 @@ static nxt_int_t
 nxt_port_fail_test_inline_drop(nxt_thread_t *thr)
 {
     int                    sndbuf;
+    ssize_t                n;
     nxt_mp_t               *mp;
     nxt_fd_t               fd, pair[2];
     nxt_buf_t              *buf;
@@ -505,6 +511,66 @@ nxt_port_fail_test_inline_drop(nxt_thread_t *thr)
                       "port failure test: the enqueued payload was completed "
                       "%d times, expected once",
                       (int) nxt_port_fail_test_completions);
+        goto done;
+    }
+
+    /*
+     * The marker that should have announced it could not be written, so the
+     * port owes one.  Nothing has been lost: once the socket takes writes
+     * again, the re-arm sends the marker from the stack -- no allocation,
+     * which is the point, since an allocation is what failed.
+     */
+
+    if (port->announce != 1) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: the lost queue marker was not "
+                      "recorded (announce %d)", (int) port->announce);
+        goto done;
+    }
+
+    while (recv(pair[0], block, sizeof(block), MSG_DONTWAIT) > 0) {
+        /* Make room, as a peer that reads its backlog would. */
+    }
+
+    nxt_port_rearm(task, port);
+
+    if (port->announce != 0) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: the queue marker was still owed "
+                      "after the port became writable");
+        goto done;
+    }
+
+    /*
+     * Every re-arm in this leg ran on the port's own engine, so none of them
+     * posted anything and none may have touched the count of posts in flight.
+     * The flag is unsigned: one stray decrement wraps it to its maximum and
+     * every later cross-engine post is refused by the CAS, silently.
+     */
+
+    if (port->rearm_pending != 0) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: a same-engine re-arm changed the "
+                      "posted-item flag (rearm_pending %A)",
+                      port->rearm_pending);
+        goto done;
+    }
+
+    n = recv(pair[0], block, sizeof(block), MSG_DONTWAIT);
+
+    if (n != (ssize_t) sizeof(nxt_port_msg_t)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: the announcement was %d bytes, "
+                      "expected a %d byte header", (int) n,
+                      (int) sizeof(nxt_port_msg_t));
+        goto done;
+    }
+
+    if (((nxt_port_msg_t *) block)->type != _NXT_PORT_MSG_READ_QUEUE) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: the announcement was of type %d, "
+                      "expected READ_QUEUE",
+                      (int) ((nxt_port_msg_t *) block)->type);
         goto done;
     }
 
@@ -1422,6 +1488,214 @@ nxt_port_fail_test_racer(void *data)
  * which is exactly what the draining engine does.
  */
 
+/*
+ * Re-arming a port that belongs to another engine.
+ *
+ * nxt_port_rearm() posts the port's own item rather than allocating one, so
+ * the re-arm survives the memory pressure that made the write fail in the
+ * first place.  Three things have to hold: the item on the queue is the
+ * port's, a second attempt does not link it twice, and the reference the post
+ * takes is given back by the handler.
+ *
+ * The last phase covers a port closed while the item is in flight.  The
+ * handler must not enable the event then: nxt_port_write_close() leaves
+ * socket.fd at the number it had, which by that point may belong to somebody
+ * else.
+ */
+
+static nxt_int_t
+nxt_port_fail_test_cross_engine_rearm(nxt_thread_t *thr)
+{
+    nxt_int_t           ret;
+    nxt_task_t          *task;
+    nxt_port_t          *port;
+    nxt_work_t          *posted;
+    nxt_event_engine_t  current, foreign;
+
+    task = thr->task;
+    task->thread = thr;
+
+    ret = NXT_ERROR;
+
+    nxt_memzero(&current, sizeof(current));
+    nxt_work_queue_cache_create(&current.work_queue_cache, 1024);
+    current.fast_work_queue.cache = &current.work_queue_cache;
+    nxt_work_queue_name(&current.fast_work_queue, "fast");
+
+    nxt_memzero(&foreign, sizeof(foreign));
+    foreign.task.thread = thr;
+    foreign.task.log = thr->log;
+    foreign.event.signal = nxt_port_fail_test_engine_signal;
+    foreign.event.enable_write = nxt_port_fail_test_enable_write;
+
+    thr->engine = &current;
+
+    port = nxt_port_fail_test_port(task);
+    if (nxt_slow_path(port == NULL)) {
+        goto done;
+    }
+
+    port->engine = &foreign;
+
+    /* Any descriptor but -1: the stub engine never touches the number. */
+    port->pair[1] = 0;
+
+    nxt_port_fail_test_signals = 0;
+    nxt_port_fail_test_rearms = 0;
+
+    posted = &port->rearm_work;
+
+    nxt_port_rearm(task, port);
+
+    if (nxt_slow_path(nxt_port_fail_test_rearms != 0)) {
+        nxt_log_alert(thr->log, "port fail test: the cross-engine re-arm ran "
+                      "on the calling thread");
+        goto done;
+    }
+
+    if (nxt_slow_path(foreign.locked_work_queue.head != posted)) {
+        nxt_log_alert(thr->log, "port fail test: the posted item is not the "
+                      "port's embedded re-arm work");
+        goto done;
+    }
+
+    if (nxt_slow_path(nxt_port_fail_test_signals != 1)) {
+        nxt_log_alert(thr->log, "port fail test: the cross-engine re-arm did "
+                      "not signal the target engine (%ui)",
+                      nxt_port_fail_test_signals);
+        goto done;
+    }
+
+    if (nxt_slow_path(port->use_count != 2 || port->rearm_pending != 1)) {
+        nxt_log_alert(thr->log, "port fail test: the posted re-arm holds no "
+                      "reference (use_count %A pending %A)", port->use_count,
+                      port->rearm_pending);
+        goto done;
+    }
+
+    /* A second attempt while the first is queued must be a no-op. */
+
+    nxt_port_rearm(task, port);
+
+    if (nxt_slow_path(nxt_port_fail_test_signals != 1
+                      || port->use_count != 2))
+    {
+        nxt_log_alert(thr->log, "port fail test: a second re-arm posted the "
+                      "same item again (signals %ui use_count %A)",
+                      nxt_port_fail_test_signals, port->use_count);
+        goto done;
+    }
+
+    /* The handler runs on the port's engine, so this thread becomes it. */
+
+    thr->engine = &foreign;
+
+    nxt_locked_work_queue_move(thr, &foreign.locked_work_queue,
+                               &current.fast_work_queue);
+
+    nxt_port_fail_test_drain_wq(&current.fast_work_queue);
+
+    if (nxt_slow_path(nxt_port_fail_test_rearms != 1)) {
+        nxt_log_alert(thr->log, "port fail test: the posted item re-armed the "
+                      "write event %ui times, expected once",
+                      nxt_port_fail_test_rearms);
+        goto done;
+    }
+
+    if (nxt_slow_path(port->use_count != 1 || port->rearm_pending != 0)) {
+        nxt_log_alert(thr->log, "port fail test: the re-arm handler did not "
+                      "give its reference back (use_count %A pending %A)",
+                      port->use_count, port->rearm_pending);
+        goto done;
+    }
+
+    /*
+     * A same-engine re-arm while a cross-engine post is still queued: it does
+     * its own work and leaves the queued item exactly as it was.  Clearing the
+     * flag here would let a second poster link the same item again -- and
+     * severing its ->next would drop whatever the locked queue held behind it.
+     */
+
+    thr->engine = &current;
+
+    nxt_port_rearm(task, port);
+
+    thr->engine = &foreign;
+
+    nxt_port_rearm(task, port);
+
+    if (nxt_slow_path(port->rearm_pending != 1
+                      || foreign.locked_work_queue.head != posted
+                      || posted->next != NULL))
+    {
+        nxt_log_alert(thr->log, "port fail test: a same-engine re-arm "
+                      "disturbed a post already in flight (pending %A)",
+                      port->rearm_pending);
+        goto done;
+    }
+
+    thr->engine = &foreign;
+
+    nxt_locked_work_queue_move(thr, &foreign.locked_work_queue,
+                               &current.fast_work_queue);
+
+    nxt_port_fail_test_drain_wq(&current.fast_work_queue);
+
+    if (nxt_slow_path(port->rearm_pending != 0 || port->use_count != 1)) {
+        nxt_log_alert(thr->log, "port fail test: the queued post did not "
+                      "settle (pending %A use_count %A)", port->rearm_pending,
+                      port->use_count);
+        goto done;
+    }
+
+    nxt_port_fail_test_rearms = 1;
+
+    /* Closed while the next one is in flight: no enable, reference returned. */
+
+    thr->engine = &current;
+
+    nxt_port_rearm(task, port);
+
+    port->pair[1] = -1;
+
+    thr->engine = &foreign;
+
+    nxt_locked_work_queue_move(thr, &foreign.locked_work_queue,
+                               &current.fast_work_queue);
+
+    nxt_port_fail_test_drain_wq(&current.fast_work_queue);
+
+    if (nxt_slow_path(nxt_port_fail_test_rearms != 1)) {
+        nxt_log_alert(thr->log, "port fail test: the re-arm enabled the write "
+                      "event of a closed port");
+        goto done;
+    }
+
+    if (nxt_slow_path(port->use_count != 1 || port->rearm_pending != 0)) {
+        nxt_log_alert(thr->log, "port fail test: a re-arm that found the port "
+                      "closed kept its reference (use_count %A pending %A)",
+                      port->use_count, port->rearm_pending);
+        goto done;
+    }
+
+    ret = NXT_OK;
+
+done:
+
+    if (port != NULL) {
+        /* nxt_port_mp_cleanup() asserts on this in a debug build. */
+        port->pair[1] = -1;
+
+        thr->engine = &foreign;
+        nxt_port_use(task, port, -1);
+    }
+
+    thr->engine = &current;
+
+    nxt_work_queue_cache_destroy(&current.work_queue_cache);
+
+    return ret;
+}
 static nxt_int_t
 nxt_port_fail_test_queued(nxt_locked_work_queue_t *lwq, nxt_work_t *item)
 {

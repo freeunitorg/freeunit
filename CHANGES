@@ -101,6 +101,13 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        prototype that was not coming, and the requests waiting on it were
        never failed.
 
+    *) Bugfix: a port could stop sending after it ran out of memory. When a
+       write had to be retried later, the port asked its own thread to watch
+       the socket again, and that request needed memory of its own. If it
+       failed, nothing watched the socket and every later message waited in
+       the queue until the port closed. The port now carries the request it
+       needs, so it cannot fail for lack of memory.
+
     *) Bugfix: the port layer reported a message as sent when it had been
        neither sent nor queued. This happened when a socket answered
        EAGAIN and no memory was left to hold the message for a later
