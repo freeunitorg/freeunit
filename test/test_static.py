@@ -249,6 +249,101 @@ def test_static_conditional_unmodified_since():
     assert resp['status'] == 200, 'If-Match wins'
 
 
+def test_static_conditional_validator_override(temp_dir):
+    # A conditional request is judged against the validator the client was
+    # given.  When "response_headers" replaces ETag, the tag Unit derives
+    # from the file is not what went out, so preconditions are not evaluated
+    # at all -- previously an If-Match carrying the advertised tag was
+    # refused with 412, which is a legitimate request denied.
+    assets_dir = f'{temp_dir}/assets'
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "routes"}},
+            "routes": [
+                {
+                    "action": {
+                        "share": f'{assets_dir}$uri',
+                        "response_headers": {"ETag": '"release-42"'},
+                    }
+                }
+            ],
+        }
+    ), 'override configure'
+
+    def get(**headers):
+        return client.get(
+            url='/index.html',
+            headers={'Host': 'localhost', 'Connection': 'close', **headers},
+        )
+
+    assert get()['headers']['ETag'] == '"release-42"', 'override advertised'
+
+    assert (
+        get(**{'If-Match': '"release-42"'})['status'] == 200
+    ), 'the advertised tag is not refused'
+    assert (
+        get(**{'If-None-Match': '"release-42"'})['status'] == 200
+    ), 'no 304 against a tag Unit did not generate'
+    assert (
+        get(**{'If-Match': '"nope"'})['status'] == 200
+    ), 'and no 412 either, rather than a wrong one'
+
+
+def test_static_conditional_keepalive():
+    # The other conditional tests all send "Connection: close", so none of
+    # them establishes that a 304 leaves the connection usable.  A 304 is
+    # bodyless with no Content-Length and no Transfer-Encoding, so a client
+    # that miscounts the framing would desynchronise here rather than fail
+    # outright.
+    etag = client.get(url='/index.html')['headers']['ETag']
+
+    resp, sock = client.get(
+        url='/index.html',
+        headers={'Host': 'localhost', 'Connection': 'keep-alive',
+                 'If-None-Match': etag},
+        start=True,
+        read_timeout=1,
+    )
+
+    assert resp['status'] == 304, '304 on a kept-alive connection'
+    assert resp['body'] == '', 'no body'
+    assert 'Content-Length' not in resp['headers'], 'no Content-Length'
+    assert 'Transfer-Encoding' not in resp['headers'], 'not chunked'
+
+    resp = client.get(
+        url='/index.html',
+        headers={'Host': 'localhost', 'Connection': 'close'},
+        sock=sock,
+    )
+
+    assert resp['status'] == 200, 'the same connection still serves'
+    assert resp['body'] == '0123456789', 'and the body is intact'
+
+
+def test_static_conditional_head():
+    etag = client.get(url='/index.html')['headers']['ETag']
+
+    def head(**headers):
+        return client.head(
+            url='/index.html',
+            headers={'Host': 'localhost', 'Connection': 'close', **headers},
+        )
+
+    resp = head(**{'If-None-Match': etag})
+    assert resp['status'] == 304, 'HEAD honours a matching validator'
+    assert resp['body'] == '', 'no body'
+
+    resp = head(**{'If-None-Match': '"nope"'})
+    assert resp['status'] == 200, 'HEAD with a stale validator'
+    assert resp['body'] == '', 'still no body on a HEAD'
+    assert (
+        resp['headers']['Content-Length'] == '10'
+    ), 'HEAD reports the length it would have sent'
+
+    assert head(**{'If-Match': '"nope"'})['status'] == 412, 'HEAD 412'
+
+
 def test_static_conditional_modified_since(temp_dir):
     last_modified = client.get(url='/index.html')['headers']['Last-Modified']
 

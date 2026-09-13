@@ -739,6 +739,44 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         etag.start = field->value;
         etag.length = field->value_length;
 
+        if (exten.start == NULL) {
+            nxt_http_static_extract_extension(shr, &exten);
+        }
+
+        if (mtype == NULL) {
+            mtype = nxt_http_static_mtype_get(&rtcf->mtypes_hash, &exten);
+        }
+
+        if (mtype->length != 0) {
+            field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+            if (nxt_slow_path(field == NULL)) {
+                goto fail;
+            }
+
+            nxt_http_field_name_set(field, "Content-Type");
+
+            field->value = mtype->start;
+            field->value_length = mtype->length;
+        }
+
+        r->resp.mime_type = mtype;
+
+        /*
+         * RFC 9110 Sect. 13.2.1: an ordinary failure outranks a precondition.
+         * If no acceptable representation exists the answer is 406, and it
+         * must not be displaced by the 304 or 412 a validator would give --
+         * so ask about acceptability here, and apply the decision further
+         * down, on the path that actually sends a body.
+         */
+
+        ret = nxt_http_comp_check_acceptable(task, r);
+        if (ret == NXT_HTTP_NOT_ACCEPTABLE) {
+            nxt_http_request_error(task, r, NXT_HTTP_NOT_ACCEPTABLE);
+            return;
+        } else if (ret != NXT_OK) {
+            goto fail;
+        }
+
         pcond = nxt_http_static_preconditions(r, &etag, nxt_file_mtime(&fi));
 
         if (pcond != NXT_HTTP_OK) {
@@ -765,34 +803,9 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
             goto send;
         }
 
-        if (exten.start == NULL) {
-            nxt_http_static_extract_extension(shr, &exten);
-        }
-
-        if (mtype == NULL) {
-            mtype = nxt_http_static_mtype_get(&rtcf->mtypes_hash, &exten);
-        }
-
-        if (mtype->length != 0) {
-            field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
-            if (nxt_slow_path(field == NULL)) {
-                goto fail;
-            }
-
-            nxt_http_field_name_set(field, "Content-Type");
-
-            field->value = mtype->start;
-            field->value_length = mtype->length;
-        }
-
-        r->resp.mime_type = mtype;
-
         if (ctx->need_body && nxt_file_size(&fi) > 0) {
-            ret = nxt_http_comp_check_compression(task, r);
-            if (ret == NXT_HTTP_NOT_ACCEPTABLE) {
-                nxt_http_request_error(task, r, NXT_HTTP_NOT_ACCEPTABLE);
-                return;
-            } else if (ret != NXT_OK) {
+            ret = nxt_http_comp_apply_compression(task, r);
+            if (nxt_slow_path(ret != NXT_OK)) {
                 goto fail;
             }
 
@@ -957,6 +970,19 @@ nxt_http_static_preconditions(nxt_http_request_t *r, nxt_str_t *etag,
      * concatenation -- whereas keeping only the last line seen would refuse a
      * legitimate request with 412 when an earlier If-Match line matched.
      */
+
+    /*
+     * Judge a conditional request only against validators the client was
+     * actually given.  If "response_headers" replaces or removes ETag or
+     * Last-Modified, what this function would compare is not what went out
+     * (src/nxt_http_set_headers.c), so decline rather than answer 304 or 412
+     * on the strength of a tag the client never saw.  Serving the full
+     * response is always a correct answer to a conditional request.
+     */
+
+    if (nxt_http_set_headers_override_validators(r)) {
+        return NXT_HTTP_OK;
+    }
 
     im_seen = 0;
     im_match = 0;

@@ -489,6 +489,7 @@ nxt_int_t nxt_http_rewrite_init(nxt_router_conf_t *rtcf,
     nxt_http_action_t *action, nxt_http_action_conf_t *acf);
 nxt_int_t nxt_http_rewrite(nxt_task_t *task, nxt_http_request_t *r);
 
+nxt_bool_t nxt_http_set_headers_override_validators(nxt_http_request_t *r);
 nxt_int_t nxt_http_set_headers_init(nxt_router_conf_t *rtcf,
     nxt_http_action_t *action, nxt_http_action_conf_t *acf);
 nxt_int_t nxt_http_set_headers(nxt_http_request_t *r);

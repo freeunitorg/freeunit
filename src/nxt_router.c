@@ -5435,11 +5435,22 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
         /*
          * Check compression before handing the chain over to r->out, so that
-         * the rejection below still owns it and releases it inline.
-         * nxt_http_comp_check_compression() reads r->resp and the request
-         * configuration, never r->out, so the order is free.
+         * the rejection below still owns it and releases it inline.  Both
+         * calls read r->resp and the request configuration, never r->out, so
+         * the order is free.
+         *
+         * An application response is always sent with a body, so the two
+         * halves run together here.  They are separate calls because the
+         * static path has to put precondition evaluation between them: a 406
+         * outranks a precondition, but a 304 must not leave an initialised
+         * compressor behind (RFC 9110 Sect. 13.2.1).
          */
-        ret = nxt_http_comp_check_compression(task, r);
+        ret = nxt_http_comp_check_acceptable(task, r);
+        if (ret != NXT_OK) {
+            goto fail;
+        }
+
+        ret = nxt_http_comp_apply_compression(task, r);
         if (ret != NXT_OK) {
             goto fail;
         }

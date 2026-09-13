@@ -69,6 +69,13 @@ struct nxt_http_comp_compressor_s {
 struct nxt_http_comp_ctx_s {
     nxt_uint_t                      idx;
 
+    /*
+     * The compressor nxt_http_comp_check_acceptable() chose, or -1 when the
+     * request will not be compressed.  Kept apart from "idx", which is only
+     * set once the choice has actually been applied.
+     */
+    nxt_int_t                       sel_idx;
+
     nxt_off_t                       resp_clen;
     nxt_off_t                       clen_sent;
 
@@ -596,18 +603,29 @@ nxt_http_comp_is_resp_content_encoded(const nxt_http_request_t *r)
 }
 
 
-nxt_int_t
-nxt_http_comp_check_compression(nxt_task_t *task, nxt_http_request_t *r)
-{
-    int                         err;
-    nxt_int_t                   ret, idx;
-    nxt_off_t                   min_len;
-    nxt_str_t                   accept_encoding, mime_type = {};
-    nxt_router_conf_t           *rtcf;
-    nxt_http_comp_ctx_t         *ctx = nxt_http_comp_ctx();
-    nxt_http_comp_compressor_t  *compressor;
+/*
+ * Decides whether an acceptable representation exists, and remembers which
+ * compressor would be used, without touching the response or allocating a
+ * compressor context.
+ *
+ * Separated from applying that decision because RFC 9110 Sect. 13.2.1 puts
+ * this ahead of precondition evaluation: a request that cannot be satisfied
+ * at all must be answered 406, not 304 or 412.  The caller therefore asks
+ * this first, evaluates preconditions, and only then applies -- so a 304
+ * neither carries a Content-Encoding header nor leaves an initialised
+ * compressor behind, which would leak, since the compressor is torn down by
+ * the last deflate() call and a 304 makes none.
+ */
 
-    *ctx = (nxt_http_comp_ctx_t){ .resp_clen = -1 };
+nxt_int_t
+nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
+{
+    nxt_int_t            ret, idx;
+    nxt_str_t            accept_encoding, mime_type = {};
+    nxt_router_conf_t    *rtcf;
+    nxt_http_comp_ctx_t  *ctx = nxt_http_comp_ctx();
+
+    *ctx = (nxt_http_comp_ctx_t){ .resp_clen = -1, .sel_idx = -1 };
 
     if (nxt_http_comp_nr_enabled_compressors == 0) {
         return NXT_OK;
@@ -664,7 +682,30 @@ nxt_http_comp_check_compression(nxt_task_t *task, nxt_http_request_t *r)
         return NXT_HTTP_NOT_ACCEPTABLE;
     }
 
-    if (idx == NXT_HTTP_COMP_SCHEME_IDENTITY) {
+    ctx->sel_idx = idx;
+
+    return NXT_OK;
+}
+
+
+/*
+ * Applies the decision nxt_http_comp_check_acceptable() reached: adds the
+ * Content-Encoding header and initialises the compressor.  Call it only on a
+ * path that will actually send a body.
+ */
+
+nxt_int_t
+nxt_http_comp_apply_compression(nxt_task_t *task, nxt_http_request_t *r)
+{
+    int                         err;
+    nxt_int_t                   idx;
+    nxt_off_t                   min_len;
+    nxt_http_comp_ctx_t         *ctx = nxt_http_comp_ctx();
+    nxt_http_comp_compressor_t  *compressor;
+
+    idx = ctx->sel_idx;
+
+    if (idx == -1 || idx == NXT_HTTP_COMP_SCHEME_IDENTITY) {
         return NXT_OK;
     }
 
