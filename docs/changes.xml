@@ -123,6 +123,29 @@ nothing had changed.  The order the server sent is now kept.
 </para>
 </change>
 
+<change type="security">
+<para>
+unitctl no longer depends on rustls-pemfile or on hyper's "http2" feature.
+rustls-pemfile is unmaintained; the parser is replaced by rustls-pki-types,
+already in the dependency graph.  PEM parsing behavior is unchanged: both
+parsers were run over 1884 PEM documents and produced zero differences.  This
+closes RUSTSEC-2025-0134.  Dropping the "http2" feature from hyper, hyper-rustls
+and hyper-util removes the h2 and fnv crates as well, closing
+RUSTSEC-2026-0258, an unbounded empty DATA frame flood in h2 0.4.15.  The
+control API speaks HTTP/1.1 only -- unitd writes "HTTP/1.1" into every response
+line -- so HTTP/2 support was never usable against the server itself.
+</para>
+</change>
+
+<change type="change">
+<para>
+unitctl no longer offers HTTP/2 in the TLS handshake it makes to a remote
+control API.  This follows from the "http2" feature removal above.  A TLS-
+terminating proxy placed in front of a remote control API must now speak
+HTTP/1.1 to unitctl; one that only accepts HTTP/2 can no longer be reached.
+</para>
+</change>
+
 </changes>
 
 
