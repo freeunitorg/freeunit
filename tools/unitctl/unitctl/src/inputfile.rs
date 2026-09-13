@@ -14,6 +14,9 @@ pub enum InputFormat {
     Yaml,
     Json,
     Json5,
+    /// Recognised, but not parsed.  unitctl no longer reads hjson.  The format
+    /// stays in this list so that an ".hjson" file gets a message saying that,
+    /// instead of a JSON parse error.
     Hjson,
     Pem,
     JavaScript,
@@ -51,7 +54,7 @@ impl InputFormat {
             .split_once('/')
             .map_or(lead_slash_removed, |(first, _)| first);
         match first_path {
-            "config" => InputFormat::Hjson,
+            "config" => InputFormat::Json,
             "certificates" => InputFormat::Pem,
             "js_modules" => InputFormat::JavaScript,
             _ => InputFormat::Json,
@@ -138,11 +141,6 @@ impl InputFile {
         }
     }
 
-    /// Converts a HJSON Value type to a JSON Value type
-    fn hjson_value_to_json_value(value: nu_json::Value) -> serde_json::Value {
-        serde_json::to_value(value).expect("Failed to convert HJSON value to JSON value")
-    }
-
     pub fn to_unit_serializable_map(&self) -> Result<UnitSerializableMap, UnitctlError> {
         let reader: Box<dyn BufRead + Send> = self.try_into()?;
         let body_data: UnitSerializableMap = match self.format() {
@@ -159,23 +157,12 @@ impl InputFile {
                 json5::from_str(&json5_string)
                     .map_err(|e| UnitctlError::DeserializationError { message: e.to_string() })?
             }
-            InputFormat::Hjson => {
-                // nu_json::Map and not HashMap: with the crate's preserve_order
-                // feature, on by default, it is a LinkedHashMap and keeps the
-                // document's member order.  A HashMap here shuffled the members
-                // of every hjson input, which is the same defect the response
-                // side of this fixes.
-                let hjson_value: nu_json::Map<String, nu_json::Value> = nu_json::from_reader(reader)
-                    .map_err(|e| UnitctlError::DeserializationError { message: e.to_string() })?;
-
-                hjson_value
-                    .iter()
-                    .map(|(k, v)| {
-                        let json_value = Self::hjson_value_to_json_value(v.clone());
-                        (k.clone(), json_value)
-                    })
-                    .collect()
-            }
+            // Refuse hjson by name.  Handing the file to the JSON parser would
+            // report a syntax error on the first comment or unquoted key, and
+            // that error does not tell the user what to do.
+            InputFormat::Hjson => Err(UnitctlError::DeserializationError {
+                message: "hjson is no longer supported: convert the file to JSON first".to_string(),
+            })?,
             _ => Err(UnitctlError::DeserializationError {
                 message: format!("Unsupported input format for serialization: {:?}", self),
             })?,
@@ -254,6 +241,8 @@ mod tests {
         assert_eq!(InputFormat::from_file_extension("yml"), InputFormat::Yaml);
         assert_eq!(InputFormat::from_file_extension("json"), InputFormat::Json);
         assert_eq!(InputFormat::from_file_extension("json5"), InputFormat::Json5);
+        assert_eq!(InputFormat::from_file_extension("hjson"), InputFormat::Hjson);
+        assert_eq!(InputFormat::from_file_extension("cjson"), InputFormat::Hjson);
         assert_eq!(InputFormat::from_file_extension("pem"), InputFormat::Pem);
         assert_eq!(InputFormat::from_file_extension("js"), InputFormat::JavaScript);
         assert_eq!(InputFormat::from_file_extension("njs"), InputFormat::JavaScript);
@@ -262,14 +251,14 @@ mod tests {
 
     #[test]
     fn can_parse_remote_paths() {
-        assert_eq!(InputFormat::from_remote_path("//config"), InputFormat::Hjson);
-        assert_eq!(InputFormat::from_remote_path("/config"), InputFormat::Hjson);
-        assert_eq!(InputFormat::from_remote_path("/config/"), InputFormat::Hjson);
-        assert_eq!(InputFormat::from_remote_path("config/"), InputFormat::Hjson);
-        assert_eq!(InputFormat::from_remote_path("config"), InputFormat::Hjson);
-        assert_eq!(InputFormat::from_remote_path("/config/something/"), InputFormat::Hjson);
-        assert_eq!(InputFormat::from_remote_path("config/something/"), InputFormat::Hjson);
-        assert_eq!(InputFormat::from_remote_path("config/something"), InputFormat::Hjson);
+        assert_eq!(InputFormat::from_remote_path("//config"), InputFormat::Json);
+        assert_eq!(InputFormat::from_remote_path("/config"), InputFormat::Json);
+        assert_eq!(InputFormat::from_remote_path("/config/"), InputFormat::Json);
+        assert_eq!(InputFormat::from_remote_path("config/"), InputFormat::Json);
+        assert_eq!(InputFormat::from_remote_path("config"), InputFormat::Json);
+        assert_eq!(InputFormat::from_remote_path("/config/something/"), InputFormat::Json);
+        assert_eq!(InputFormat::from_remote_path("config/something/"), InputFormat::Json);
+        assert_eq!(InputFormat::from_remote_path("config/something"), InputFormat::Json);
         assert_eq!(InputFormat::from_remote_path("/certificates"), InputFormat::Pem);
         assert_eq!(InputFormat::from_remote_path("/certificates/"), InputFormat::Pem);
         assert_eq!(InputFormat::from_remote_path("certificates/"), InputFormat::Pem);
@@ -322,9 +311,9 @@ mod tests {
     }
 
     /// `UnitSerializableMap` is a `serde_json::Map`, which keeps member order
-    /// only because every format feeding it keeps it too.  `serde_yaml`, `json5`
-    /// and the hjson `collect()` each reach the type by a different route, so
-    /// each one is checked.
+    /// only because every format feeding it keeps it too.  `serde_yaml` and
+    /// `json5` each reach the type by a different route, so each one is
+    /// checked.
     #[test]
     fn every_input_format_keeps_member_order() {
         let json = MEMBERS
@@ -336,7 +325,6 @@ mod tests {
 
         assert_eq!(members_of(&write_input(&json, ".json"), InputFormat::Json), MEMBERS);
         assert_eq!(members_of(&write_input(&json, ".json5"), InputFormat::Json5), MEMBERS);
-        assert_eq!(members_of(&write_input(&json, ".hjson"), InputFormat::Hjson), MEMBERS);
 
         let yaml = MEMBERS
             .iter()
@@ -345,30 +333,21 @@ mod tests {
         assert_eq!(members_of(&write_input(&yaml, ".yaml"), InputFormat::Yaml), MEMBERS);
     }
 
-    /// The values have to arrive intact, not just the names: hjson reaches
-    /// `serde_json::Value` through a conversion of its own.
+    /// hjson is refused by name.  Handing the file to the JSON parser instead
+    /// would report a syntax error on the first comment, which does not tell
+    /// the user what to do.
     #[test]
-    fn an_hjson_input_keeps_its_values_and_nesting() {
-        let file = write_input(
-            "{\n  listeners: {\n    \"*:8080\": { pass: \"routes\", tls: { certificate: \"bundle\", session: {} } }\n  }\n  routes: [ { action: { return: 204 } } ]\n}\n",
-            ".hjson",
-        );
-        let map = InputFile::FileWithFormat(file.path().into(), InputFormat::Hjson)
+    fn an_hjson_input_is_refused_with_a_message_about_hjson() {
+        let file = write_input("{\n  # a comment\n  routes: []\n}\n", ".hjson");
+        let error = InputFile::from(file.path())
             .to_unit_serializable_map()
-            .expect("hjson must deserialize");
+            .expect_err("hjson must be refused");
 
-        assert_eq!(map.keys().cloned().collect::<Vec<_>>(), vec!["listeners", "routes"]);
-        assert_eq!(map["listeners"]["*:8080"]["pass"], "routes");
-        assert_eq!(map["routes"][0]["action"]["return"], 204);
-
-        // Nested order is the other half of this, and it holds only while both
-        // crates keep preserve_order: every nu_json::Value goes through
-        // serde_json::to_value on the way in.  So pin the nested names too, in
-        // an order no map sorts into by accident.
-        let listener = map["listeners"]["*:8080"].as_object().expect("a listener");
-        assert_eq!(listener.keys().cloned().collect::<Vec<_>>(), vec!["pass", "tls"]);
-        let tls = listener["tls"].as_object().expect("a tls object");
-        assert_eq!(tls.keys().cloned().collect::<Vec<_>>(), vec!["certificate", "session"]);
+        assert!(
+            error.to_string().contains("hjson is no longer supported"),
+            "unexpected message: {}",
+            error
+        );
     }
 
     /// The way back in is strict, which is why `unitctl export` warns that the
