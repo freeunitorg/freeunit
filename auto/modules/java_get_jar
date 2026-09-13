@@ -25,10 +25,43 @@ if [ ! -f "$NXT_BUILD_DIR/$NXT_JAR_FILE" ]; then
         $echo "getting remote $NXT_JAR_FILE ..." >> $NXT_AUTOCONF_ERR
 
         mkdir -p "${NXT_JAR_LOCAL_DIR}"
-        curl --progress-bar "$NXT_JAR_URL" -o "$NXT_JAR_LOCAL_TMP"
+
+        # --fail so an error page is not written out as if it were the jar,
+        # --location to follow a repository redirect, and --retry because a
+        # transient failure here fails the whole build for reasons that have
+        # nothing to do with the change under test.
+        if ! curl --fail --location --retry 3 --retry-delay 2 \
+                  --progress-bar "$NXT_JAR_URL" -o "$NXT_JAR_LOCAL_TMP"
+        then
+            rm -f "$NXT_JAR_LOCAL_TMP"
+            $echo
+            $echo $0: error: failed to download "$NXT_JAR_URL".
+            $echo
+            $echo "error: failed to download $NXT_JAR_URL" >> $NXT_AUTOCONF_ERR
+            exit 1
+        fi
 
         NXT_JAR_CHK_FILE=$NXT_JAR_LOCAL_TMP
         . auto/modules/java_chk_sha512
+
+        # java_chk_sha512 deletes the file it rejects, so a missing temp file
+        # here means the checksum did not match.  Say that, rather than
+        # letting the mv below fail with a "cannot stat" that hides the cause.
+        if [ ! -f "$NXT_JAR_LOCAL_TMP" ]; then
+            $echo
+            $echo $0: error: SHA512 mismatch for "$NXT_JAR_FILE".
+            $echo
+            $echo "  downloaded from: $NXT_JAR_URL"
+            $echo "  expected SHA512: $NXT_JAR_SHA512"
+            $echo
+            $echo "  The pinned checksum is in auto/modules/java_jar.sha512."
+            $echo "  A mismatch means the download was truncated or proxied,"
+            $echo "  or the artifact itself changed."
+            $echo
+            $echo "error: SHA512 mismatch for $NXT_JAR_FILE" \
+                  >> $NXT_AUTOCONF_ERR
+            exit 1
+        fi
 
         mv "$NXT_JAR_LOCAL_TMP" "$NXT_JAR_LOCAL"
     else

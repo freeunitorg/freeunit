@@ -37,6 +37,22 @@ fi
 
 if [ -f "$NXT_JAR_CHK_FILE" ]; then
     NXT_JAR_SHA512=`grep -F $NXT_JAR_FILE auto/modules/java_jar.sha512 | head -c 128`
+
+    # An unpinned jar produced an empty expected value, a malformed check
+    # line, and a "SHA512 not matched" that reads exactly like a corrupt
+    # download.  It is neither: it means the version was bumped without
+    # updating auto/modules/java_jar.sha512.
+    if [ -z "$NXT_JAR_SHA512" ]; then
+        $echo
+        $echo $0: error: no pinned SHA512 for "$NXT_JAR_FILE".
+        $echo
+        $echo "  Add its checksum to auto/modules/java_jar.sha512;"
+        $echo "  a version bump needs the pinned checksums updated too."
+        $echo
+        $echo "error: no pinned SHA512 for $NXT_JAR_FILE" >> $NXT_AUTOCONF_ERR
+        exit 1
+    fi
+
     NXT_JAR_CHK=${NXT_JAR_CHK_FILE}.sha512.$$
     $echo "$NXT_JAR_SHA512  $NXT_JAR_CHK_FILE" > $NXT_JAR_CHK
 
