@@ -242,6 +242,16 @@ using yq.
 </para>
 </change>
 
+<change type="change">
+<para>
+unitctl builds TLS support behind a "tls" Cargo feature, on by default.  The
+musl build turns it off, so the static binary no longer links a C TLS library
+and no longer accepts an "https://" control socket address; it refuses one with
+a message naming the feature.  A Unix socket or a plain "http://" address is
+unaffected, and a build with default features behaves as before.
+</para>
+</change>
+
 </changes>
 
 
