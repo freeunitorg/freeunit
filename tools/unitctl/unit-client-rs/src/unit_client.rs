@@ -8,6 +8,7 @@ use bytes::Bytes;
 use custom_error::custom_error;
 use http_body_util::{BodyExt, Full};
 use hyper::{http, Request};
+#[cfg(feature = "tls")]
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::{Client, ResponseFuture};
@@ -132,21 +133,29 @@ macro_rules! new_openapi_client {
     };
 }
 
+/// Connector for a TCP control socket.  Without the "tls" feature there is no
+/// HTTPS connector, and an "https://" address is refused while it is parsed.
+#[cfg(feature = "tls")]
+type TcpConnector = HttpsConnector<HttpConnector>;
+#[cfg(not(feature = "tls"))]
+type TcpConnector = HttpConnector;
+
+#[cfg(feature = "tls")]
+const TCP_CLIENT_NAME: &str = "Client<HttpsConnector<HttpConnector>, Full<Bytes>>";
+#[cfg(not(feature = "tls"))]
+const TCP_CLIENT_NAME: &str = "Client<HttpConnector, Full<Bytes>>";
+
 #[derive(Clone)]
 pub enum RemoteClient {
-    Unix {
-        client: Client<UnixConnector, Full<Bytes>>,
-    },
-    Tcp {
-        client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
-    },
+    Unix { client: Client<UnixConnector, Full<Bytes>> },
+    Tcp { client: Client<TcpConnector, Full<Bytes>> },
 }
 
 impl RemoteClient {
     fn client_name(&self) -> &str {
         match self {
             RemoteClient::Unix { .. } => "Client<UnixConnector, Full<Bytes>>",
-            RemoteClient::Tcp { .. } => "Client<HttpsConnector<HttpConnector>, Full<Bytes>>",
+            RemoteClient::Tcp { .. } => TCP_CLIENT_NAME,
         }
     }
 
@@ -236,17 +245,26 @@ impl UnitClient {
         }
     }
 
-    pub fn new_http(control_socket: ControlSocket) -> Self {
-        let connector = HttpsConnectorBuilder::new()
+    #[cfg(feature = "tls")]
+    fn tcp_connector() -> TcpConnector {
+        HttpsConnectorBuilder::new()
             .with_native_roots()
             .unwrap_or_else(|_| HttpsConnectorBuilder::new().with_webpki_roots())
             .https_or_http()
             // The control API speaks HTTP/1.1 only.  This also keeps "h2" out
             // of the ALPN list we offer.
             .enable_http1()
-            .build();
-        let remote_client: Client<HttpsConnector<HttpConnector>, Full<Bytes>> =
-            Client::builder(TokioExecutor::new()).build(connector);
+            .build()
+    }
+
+    #[cfg(not(feature = "tls"))]
+    fn tcp_connector() -> TcpConnector {
+        HttpConnector::new()
+    }
+
+    pub fn new_http(control_socket: ControlSocket) -> Self {
+        let remote_client: Client<TcpConnector, Full<Bytes>> =
+            Client::builder(TokioExecutor::new()).build(Self::tcp_connector());
         Self {
             control_socket,
             client: Box::from(RemoteClient::Tcp { client: remote_client }),

@@ -11,6 +11,9 @@ name = "unitctl"
 path = "src/main.rs"
 
 [features]
+default = ["tls"]
+# "https://" control sockets.  The musl build passes --no-default-features.
+tls = ["unit-client-rs/tls"]
 
 [dependencies]
 clap = { version = "4.4", features = ["default", "derive", "cargo"] }
@@ -20,7 +23,9 @@ json5 = "1.3.1"
 serde_json = { version = "1.0", optional = false }
 # The "std" feature is not on by default and pem::from_buf needs it.
 rustls-pki-types = { version = "1.15", features = ["std"] }
-unit-client-rs = { path = "../unit-client-rs" }
+# default-features = false, or unitctl's own --no-default-features would not
+# reach unit-client-rs and TLS would stay on.
+unit-client-rs = { path = "../unit-client-rs", default-features = false }
 colored_json = "5.0.0"
 tempfile = "3.8"
 which = "8.0.2"

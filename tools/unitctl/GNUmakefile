@@ -44,6 +44,11 @@ endif
 
 RELEASE_BUILD_FLAGS ?= --quiet --release --bin $(OUTPUT_BINARY)
 
+# The musl artifact is built without the "tls" feature.  TLS pulls in
+# aws-lc-sys, a C library built by cmake, and that is the only thing making
+# this build need a C toolchain.
+target_feature_flags = $(if $(findstring musl,$(1)),--no-default-features,)
+
 Q = $(if $(filter 1,$V),,@)
 M = $(shell printf "\033[34;1m▶\033[0m")
 
@@ -68,8 +73,8 @@ all: $(TARGETS) ## Build all available platform targets [see: list-targets]
 .ONESHELL: $(TARGETS)
 $(TARGETS): openapi-generate
 	$Q if [ ! -f "$(CURDIR)/target/$(@)/release/$(OUTPUT_BINARY)" ]; then
-		echo "$(M) building $(OUTPUT_BINARY) with flags [$(RELEASE_BUILD_FLAGS) --target $(@)]"
-		$(CARGO) build $(RELEASE_BUILD_FLAGS) --target $@
+		echo "$(M) building $(OUTPUT_BINARY) with flags [$(RELEASE_BUILD_FLAGS) $(call target_feature_flags,$@) --target $(@)]"
+		$(CARGO) build $(RELEASE_BUILD_FLAGS) $(call target_feature_flags,$@) --target $@
 	fi
 
 target target/debug:

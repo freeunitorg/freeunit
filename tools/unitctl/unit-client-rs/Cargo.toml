@@ -8,10 +8,20 @@ license = "Apache-2.0"
 [lib]
 name = "unit_client_rs"
 
+[features]
+default = ["tls"]
+# "https://" control sockets.  The control API has no TLS listener of its own,
+# so this is for a TLS-terminating proxy in front of a remote control API.
+# Turning it off drops aws-lc-sys, and with it the C toolchain the build needs;
+# that is what the musl artifact does.  hyper-rustls and rustls must be gated
+# together: the direct rustls dependency is the only thing that turns on
+# rustls's own default features, and losing one of those is silent.
+tls = ["dep:hyper-rustls", "dep:rustls"]
+
 [dependencies]
 custom_error = "1.9"
 hyper = { version = "1", features = ["http1"] }
-hyper-rustls = { version = "0.27", features = ["rustls-native-certs", "webpki-roots"] }
+hyper-rustls = { version = "0.27", features = ["rustls-native-certs", "webpki-roots"], optional = true }
 hyper-util = { version = "0.1", features = ["client-legacy", "client", "http1", "tokio"] }
 hyperlocal = "0.9"
 http-body-util = "0.1"
@@ -28,7 +38,10 @@ hex = "0.4"
 which = "8.0"
 
 unit-openapi = { path = "../unit-openapi" }
-rustls = "0.23.5"
+# Not used in code.  It is here so that rustls gets its own default features,
+# which hyper-rustls does not turn on for us: "prefer-post-quantum" comes from
+# this line alone.
+rustls = { version = "0.23.5", optional = true }
 bollard = "0.21"
 regex = "1.10.4"
 pbr = "1.1.1"
