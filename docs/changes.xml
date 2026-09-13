@@ -10,6 +10,17 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="bugfix">
+<para>
+a compressed static response no longer carries the same strong entity-tag as
+the uncompressed one.  Unit derives the tag from the file's mtime and size,
+which do not change with the content coding, so both representations
+advertised an identical strong validator.  RFC 9110 requires a strong
+validator to change whenever the selected representation changes; the tag of
+a coded representation is now weak, as nginx does.
+</para>
+</change>
+
 <change type="security">
 <para>
 a file descriptor is no longer leaked when a static request cannot be
@@ -32,6 +43,18 @@ and "If-Unmodified-Since" are evaluated first and answer "412 Precondition
 Failed" when they do not hold.  Entity-tag comparison is weak for
 "If-None-Match" and strong for "If-Match", and "*" matches any
 representation, per RFC 9110.
+</para>
+</change>
+
+<change type="change">
+<para>
+a content-coded response now carries a weak entity-tag, so "If-Range" cannot
+resume a coded representation; "If-None-Match" revalidation is unaffected.
+Unit derives the tag from the file's mtime and size, which do not change with
+the content coding, so a gzip response and the identity one previously
+advertised the same strong validator -- 1.36.1 and earlier shipped that.
+RFC 9110 requires a strong validator to change whenever the selected
+representation changes, and nginx weakens the tag for the same reason.
 </para>
 </change>
 

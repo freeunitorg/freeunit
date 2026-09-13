@@ -689,6 +689,72 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
 
 
 /*
+ * Weakens the response's ETag, so that a coded representation does not carry
+ * the same strong validator as the identity one.
+ *
+ * RFC 9110 Sect. 8.8.3: a strong validator must change whenever the selected
+ * representation changes, and a content coding selects a different
+ * representation.  Unit derives the tag from the file's mtime and size, which
+ * are the same whichever coding is served, so without this a client that took
+ * its tag from a gzip response and then sent it back in If-Range -- which
+ * Sect. 13.1.5 compares strongly -- would match, and be handed identity bytes
+ * for offsets it believes are gzip offsets.  Weakening makes that strong
+ * comparison fail, so the range is simply not applied.
+ *
+ * If-None-Match keeps working: it compares weakly, so revalidation of a coded
+ * representation still answers 304.
+ *
+ * nginx does the same thing (ngx_http_weak_etag(), called from its gzip
+ * header filter); Apache appends "-gzip" and Go's net/http appends the coding
+ * name.  All three make the tag differ per coding; weakening is the smallest
+ * of the three and needs no extra allocation beyond the prefix.
+ */
+
+static nxt_int_t
+nxt_http_comp_weaken_etag(nxt_http_request_t *r)
+{
+    u_char                  *p;
+    nxt_http_field_t        *f;
+    nxt_http_fields_iter_t  iter;
+
+    for (f = nxt_http_fields_first(&iter, r->resp.inline_fields,
+                                   r->resp.num_inline_fields, r->resp.fields);
+         f != NULL;
+         f = nxt_http_fields_next(&iter))
+    {
+        if (f->skip || f->name_length != nxt_length("ETag")
+            || nxt_strncasecmp(f->name, (u_char *) "ETag",
+                               nxt_length("ETag")) != 0)
+        {
+            continue;
+        }
+
+        if (f->value_length >= 2
+            && f->value[0] == 'W' && f->value[1] == '/')
+        {
+            return NXT_OK;
+        }
+
+        p = nxt_mp_nget(r->mem_pool, f->value_length + nxt_length("W/"));
+        if (nxt_slow_path(p == NULL)) {
+            return NXT_ERROR;
+        }
+
+        /* Copy out of the old value before the field is repointed. */
+        nxt_memcpy(p, "W/", nxt_length("W/"));
+        nxt_memcpy(p + nxt_length("W/"), f->value, f->value_length);
+
+        f->value = p;
+        f->value_length += nxt_length("W/");
+
+        return NXT_OK;
+    }
+
+    return NXT_OK;
+}
+
+
+/*
  * Applies the decision nxt_http_comp_check_acceptable() reached: adds the
  * Content-Encoding header and initialises the compressor.  Call it only on a
  * path that will actually send a body.
@@ -725,6 +791,10 @@ nxt_http_comp_apply_compression(nxt_task_t *task, nxt_http_request_t *r)
     }
 
     nxt_http_comp_set_header(r, idx);
+
+    if (nxt_slow_path(nxt_http_comp_weaken_etag(r) != NXT_OK)) {
+        return NXT_ERROR;
+    }
 
     ctx->idx = idx;
     ctx->ctx.level = nxt_http_comp_enabled_compressors[idx].opts.level;

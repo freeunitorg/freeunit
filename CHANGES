@@ -1,6 +1,14 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Bugfix: a compressed static response no longer carries the same strong
+       entity-tag as the uncompressed one. Unit derives the tag from the
+       file's mtime and size, which do not change with the content coding, so
+       both representations advertised an identical strong validator. RFC 9110
+       requires a strong validator to change whenever the selected
+       representation changes; the tag of a coded representation is now weak,
+       as nginx does.
+
     *) Security: a file descriptor is no longer leaked when a static request
        cannot be satisfied by any acceptable representation. A share with
        compression configured answered "406 Not Acceptable" without closing
@@ -18,6 +26,15 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        "If-Modified-Since", per RFC 9110. "If-Match" and
        "If-Unmodified-Since" are evaluated first and answer "412 Precondition
        Failed" when they do not hold.
+
+    *) Change: a content-coded response now carries a weak entity-tag, so
+       "If-Range" cannot resume a coded representation; "If-None-Match"
+       revalidation is unaffected. Unit derives the tag from the file's mtime
+       and size, which do not change with the content coding, so a gzip
+       response and the identity one previously advertised the same strong
+       validator -- 1.36.1 and earlier shipped that. RFC 9110 requires a
+       strong validator to change whenever the selected representation
+       changes, and nginx weakens the tag for the same reason.
 
     *) Security: a file descriptor is no longer leaked when a static request
        cannot be satisfied by any acceptable representation. A share with
