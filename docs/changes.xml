@@ -187,14 +187,21 @@ HTTP/1.1 to unitctl; one that only accepts HTTP/2 can no longer be reached.
 
 <change type="change">
 <para>
-unitctl no longer reads hjson.  Input piped to "/config" on stdin is parsed as
-JSON now, not hjson; hjson is a superset of JSON, so piping JSON still works,
-but comments and unquoted keys do not.  A ".hjson" or ".cjson" file is refused
-with "hjson is no longer supported: convert the file to JSON first", instead of
-being handed to the JSON parser, which reports a misleading error at the first
-comment.  Supported input formats are now json, json5, yaml and pem.  This
-removes the nu-json dependency and the 30 crates of Nushell utility code it
-pulled in for a tool that speaks one JSON control API.
+unitctl no longer reads hjson or YAML, and no longer writes YAML.  Input piped
+to "/config" on stdin is parsed as JSON now, not hjson; hjson is a superset of
+JSON, so piping JSON still works, but comments and unquoted keys do not.  A
+".hjson" or ".cjson" file is refused with "hjson is no longer supported:
+convert the file to JSON first", instead of being handed to the JSON parser,
+which reports a misleading error at the first comment.  A ".yaml" or ".yml"
+file is refused with "YAML is no longer supported: convert the file to JSON
+first, for example with "yq -o=json"".  Supported input formats are now json,
+json5 and pem.  "unitctl status -t yaml" is gone; --output-format now accepts
+json, json-pretty and text.  This removes the nu-json dependency and the 30
+crates of Nushell utility code it pulled in for a tool that speaks one JSON
+control API.  It also removes serde_yaml and unsafe-libyaml; the latter is a
+c2rust transpile of libyaml with 241 unsafe lines and no RustSec advisory.
+tools/unitc is unaffected: it still converts configuration to and from YAML,
+using yq.
 </para>
 </change>
 
