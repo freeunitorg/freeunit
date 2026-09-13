@@ -127,18 +127,6 @@ main(int argc, char **argv)
         return 1;
     }
 
-    if (nxt_mem_zone_test(thr, 100, 20000, 128 - 1) != NXT_OK) {
-        return 1;
-    }
-
-    if (nxt_mem_zone_test(thr, 100, 10000, 4096 - 1) != NXT_OK) {
-        return 1;
-    }
-
-    if (nxt_mem_zone_test(thr, 1000, 40, 64 * 1024 - 1) != NXT_OK) {
-        return 1;
-    }
-
     if (nxt_lvlhsh_test(thr, 2, 1) != NXT_OK) {
         return 1;
     }

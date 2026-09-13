@@ -227,6 +227,16 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        tree; src/nxt_queue.h and the nxt_queue_* macros it provides are
        unaffected and untouched.
 
+    *) Change: nxt_mem_zone, a second allocator, is removed.  It was a
+       zone allocator over a mapped region, distinct from nxt_mp, the
+       pool allocator product code actually uses; nothing in the router,
+       applications, or any language module called it.  Its only caller
+       was its own unit test, run by "./build/tests"; that test is
+       removed too, dropping the three "mem zone test passed" lines from
+       the suite's output.  Upstream nginx/unit had already reached the
+       same conclusion and deleted the file as part of an unrelated
+       cleanup.
+
 
 Changes with FreeUnit 1.36.1                                     28 Aug 2026
 

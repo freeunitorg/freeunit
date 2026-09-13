@@ -26,7 +26,6 @@ NXT_LIB_SRCS=" \
     src/nxt_random.c \
     src/nxt_rbtree.c \
     src/nxt_mp.c \
-    src/nxt_mem_zone.c \
     src/nxt_string.c \
     src/nxt_utf8.c \
     src/nxt_parse.c \
@@ -158,7 +157,6 @@ NXT_TEST_SRCS=" \
     src/test/nxt_term_parse_test.c \
     src/test/nxt_msec_diff_test.c \
     src/test/nxt_mp_test.c \
-    src/test/nxt_mem_zone_test.c \
     src/test/nxt_lvlhsh_test.c \
     src/test/nxt_gmtime_test.c \
     src/test/nxt_sprintf_test.c \

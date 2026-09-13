@@ -93,7 +93,6 @@ typedef struct {
 } nxt_mem_proto_t;
 
 
-#include <nxt_mem_zone.h>
 #include <nxt_signal.h>
 #include <nxt_semaphore.h>
 
