@@ -426,6 +426,15 @@ nxt_port_rpc_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     if (ret != NXT_OK) {
         nxt_debug(task, "rpc: stream #%uD no handler found", stream);
 
+        /*
+         * No handler ran, so nothing can have taken the descriptors this
+         * message arrived with.  The dispatcher would close them anyway;
+         * doing it here keeps the reject path self-evidently safe, since
+         * the stream number is a value off the wire and any peer can name
+         * one that was never registered.
+         */
+        nxt_port_recv_msg_close_fds(msg);
+
         return;
     }
 

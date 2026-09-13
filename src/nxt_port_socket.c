@@ -1251,6 +1251,15 @@ nxt_port_queue_read_handler(nxt_task_t *task, void *obj, void *data)
             if (n == (ssize_t) sizeof(nxt_port_msg_t)
                 && msg.port_msg.type == _NXT_PORT_MSG_READ_QUEUE)
             {
+                /*
+                 * A wake-up marker carries no payload and needs no
+                 * descriptor, but the sender chooses the type byte and
+                 * SCM_RIGHTS is already attached by the time it is read.
+                 * This exit never reaches nxt_port_read_msg_process(), so
+                 * the close at its tail cannot cover it.
+                 */
+                nxt_port_close_fds(msg.fd);
+
                 nxt_port_buf_free(port, b);
 
                 nxt_debug(task, "port{%d,%d} %d: recv %d read_queue",
@@ -1282,6 +1291,8 @@ nxt_port_queue_read_handler(nxt_task_t *task, void *obj, void *data)
                                       (int) port->pid, (int) port->id,
                                       port->socket.fd);
 
+                            nxt_port_close_fds(msg.fd);
+
                             return;
                         }
 
@@ -1293,6 +1304,8 @@ nxt_port_queue_read_handler(nxt_task_t *task, void *obj, void *data)
                                             "messages",
                                       (int) port->pid, (int) port->id,
                                       port->socket.fd);
+
+                            nxt_port_close_fds(msg.fd);
 
                             return;
                         }
@@ -1544,6 +1557,12 @@ nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
 
                 port->handler(task, fmsg);
 
+                /*
+                 * The assembled message's descriptors are about to overwrite
+                 * this fragment's own, which would drop them unnoticed.
+                 */
+                nxt_port_close_fds(msg->fd);
+
                 msg->buf = fmsg->buf;
                 msg->fd[0] = fmsg->fd[0];
                 msg->fd[1] = fmsg->fd[1];
@@ -1625,6 +1644,26 @@ fmsg_failed:
         /* restore original buf */
         msg->buf = orig_b;
     }
+
+    /*
+     * Close whatever nothing took ownership of.  A handler that keeps a
+     * descriptor sets its slot to -1, so this closes only what is genuinely
+     * unclaimed, and it is idempotent for the paths that already closed.
+     *
+     * This sits at the tail rather than beside the handler call because the
+     * paths that drop descriptors are not all handler paths: "goto
+     * fmsg_failed" above skips the dispatch entirely when a fragment cannot
+     * be found or started, and a middle fragment is chained into the
+     * assembled message without its own fd[] being carried across.  Neither
+     * runs a handler, so no per-handler close can reach them.
+     *
+     * The message header is attacker-chosen -- type, stream and the nf/mf
+     * fragment bits are bytes off the wire, and an application holds the
+     * write end of the router's main port -- so every one of those paths is
+     * reachable from a compromised application, one leaked descriptor per
+     * message until the table is exhausted.
+     */
+    nxt_port_close_fds(msg->fd);
 }
 
 

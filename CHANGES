@@ -1,6 +1,17 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Security: a file descriptor sent to a port is no longer leaked when
+       the message is dispatched and nothing takes ownership of it. An
+       application holds the write end of the router's main port and the
+       message header is unauthenticated, so a compromised application could
+       attach a descriptor to messages the router does not expect one on --
+       or to a fragment that never reaches a handler -- and consume the
+       router's descriptor table, stopping every application behind it. A
+       fragment stream that is started and never completed still retains its
+       descriptor; that needs a bound on pending fragments and is tracked
+       in freeunitorg/freeunit#343.
+
     *) Bugfix: unitctl gave up on a configuration it could not decode as
        UTF-8.  Unit stores the bytes it is given, so a configuration can
        hold bytes no UTF-8 decoder accepts; "unitctl execute" and "unitctl

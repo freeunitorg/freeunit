@@ -3173,6 +3173,7 @@ nxt_router_js_module_rpc_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     ret = nxt_script_file_read(msg->fd[0], &text);
 
     nxt_fd_close(msg->fd[0]);
+    msg->fd[0] = -1;
 
     if (nxt_slow_path(ret == NXT_ERROR)) {
         goto fail;
@@ -3804,6 +3805,9 @@ nxt_router_listen_socket_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
     s = msg->fd[0];
 
+    /* The listener owns the descriptor now. */
+    msg->fd[0] = -1;
+
     ret = nxt_socket_nonblocking(task, s);
     if (nxt_slow_path(ret != NXT_OK)) {
         goto fail;
@@ -3941,6 +3945,10 @@ nxt_router_tls_rpc_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     }
 
     bundle->chain_file = msg->fd[0];
+
+    /* The bundle owns the descriptor now. */
+    msg->fd[0] = -1;
+
     bundle->next = tlscf->bundle;
     tlscf->bundle = bundle;
 
@@ -5251,6 +5259,15 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     nxt_http_request_t      *r;
     nxt_unit_response_t     *resp;
     nxt_request_rpc_data_t  *req_rpc_data;
+
+    /*
+     * An application response never legitimately carries a descriptor and
+     * this handler does not read msg->fd.  The dispatcher closes what a
+     * handler leaves behind, so this is belt and braces; it is here because
+     * an application owns its end of the port socket, which makes this the
+     * one handler a hostile peer reaches on every single request.
+     */
+    nxt_port_recv_msg_close_fds(msg);
 
     req_rpc_data = data;
 

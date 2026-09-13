@@ -440,6 +440,9 @@ nxt_router_access_log_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
     access_log->fd = msg->fd[0];
 
+    /* The access log owns the descriptor now. */
+    msg->fd[0] = -1;
+
     nxt_work_queue_add(&task->thread->engine->fast_work_queue,
                        nxt_router_conf_apply, task, tmcf, NULL);
 }
@@ -610,6 +613,7 @@ nxt_router_access_log_reopen_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     }
 
     nxt_fd_close(msg->fd[0]);
+    msg->fd[0] = -1;
     nxt_mp_release(reopen->mem_pool);
 }
 

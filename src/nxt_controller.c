@@ -2069,6 +2069,7 @@ nxt_controller_process_cert_save(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     nxt_fd_write(msg->fd[0], mbuf->pos, nxt_buf_mem_used_size(mbuf));
 
     nxt_fd_close(msg->fd[0]);
+    msg->fd[0] = -1;
 
     nxt_memzero(&resp, sizeof(nxt_controller_response_t));
 
@@ -2352,6 +2353,7 @@ nxt_controller_process_script_save(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     nxt_fd_write(msg->fd[0], mbuf->pos, nxt_buf_mem_used_size(mbuf));
 
     nxt_fd_close(msg->fd[0]);
+    msg->fd[0] = -1;
 
     nxt_memzero(&resp, sizeof(nxt_controller_response_t));
 

@@ -254,12 +254,18 @@ struct nxt_port_recv_msg_s {
 
 /*
  * Close any file descriptors the peer attached to a received message via
- * SCM_RIGHTS.  A privileged handler that rejects a message (unauthorized
- * or malformed sender) must call this before returning: the port
- * dispatcher does not reclaim descriptors once the handler returns, and
- * a compromised peer can attach fds to a forged message, so leaving them
- * open on the reject path would let it exhaust the receiver's descriptor
- * table.
+ * SCM_RIGHTS.
+ *
+ * The ownership contract: nxt_port_read_msg_process() closes whatever is
+ * left in msg->fd[] once the message has been dispatched, so a handler that
+ * KEEPS a descriptor must set its slot to -1.  A kept descriptor whose slot
+ * was left set is closed under the handler, and the number is then handed
+ * out again by the next open() or accept() on that thread -- the retained
+ * handle silently refers to something else, which is a good deal worse than
+ * the leak this arrangement replaced.
+ *
+ * Calling this explicitly is still right on a reject path, where it makes
+ * the intent local and obvious, and it is idempotent.
  */
 nxt_inline void
 nxt_port_recv_msg_close_fds(nxt_port_recv_msg_t *msg)
