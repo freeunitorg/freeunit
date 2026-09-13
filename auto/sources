@@ -66,9 +66,7 @@ NXT_LIB_SRCS=" \
     src/nxt_conn_read.c \
     src/nxt_conn_write.c \
     src/nxt_conn_close.c \
-    src/nxt_event_conn_job_sendfile.c \
     src/nxt_conn_proxy.c \
-    src/nxt_job.c \
     src/nxt_sockaddr.c \
     src/nxt_listen_socket.c \
     src/nxt_upstream.c \

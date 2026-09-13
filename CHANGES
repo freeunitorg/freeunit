@@ -10,6 +10,12 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        response is the one a cache must not reuse for a client that accepts
        gzip.
 
+    *) Change: removed the unused job cluster (nxt_job.c, nxt_job.h, and
+       nxt_event_conn_job_sendfile.c). The offload path they implemented
+       had no caller anywhere in the tree and its thread pool handoff was
+       structurally unreachable, since the connection field it read was
+       never assigned.
+
     *) Feature: byte-range requests for static files. A "share" action now
        answers a satisfiable single-range "Range: bytes=..." request with
        "206 Partial Content" and a matching "Content-Range", and an

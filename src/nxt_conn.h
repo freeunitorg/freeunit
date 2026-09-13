@@ -146,12 +146,11 @@ struct nxt_conn_s {
 
     nxt_conn_io_t                 *io;
 
-    union {
 #if (NXT_TLS)
+    union {
         void                      *tls;
-#endif
-        nxt_thread_pool_t         *thread_pool;
     } u;
+#endif
 
     nxt_mp_t                      *mem_pool;
 
@@ -288,9 +287,6 @@ nxt_bool_t nxt_event_conn_write_delayed(nxt_event_engine_t *engine,
 ssize_t nxt_event_conn_io_writev(nxt_conn_t *c, nxt_iobuf_t *iob,
     nxt_uint_t niob);
 ssize_t nxt_event_conn_io_send(nxt_conn_t *c, void *buf, size_t size);
-
-NXT_EXPORT void nxt_event_conn_job_sendfile(nxt_task_t *task,
-    nxt_conn_t *c);
 
 
 #define nxt_conn_connect(engine, c)                                           \
