@@ -945,12 +945,24 @@ nxt_http_static_preconditions(nxt_http_request_t *r, nxt_str_t *etag,
 {
     nxt_str_t               value;
     nxt_time_t              date;
-    nxt_http_field_t        *f, *im, *ium, *inm, *ims;
+    nxt_bool_t              im_seen, im_match, inm_seen, inm_match;
+    nxt_http_field_t        *f, *ium, *ims;
     nxt_http_fields_iter_t  iter;
 
-    im = NULL;
+    /*
+     * RFC 9110 Sect. 5.3: repeated field lines are equivalent to one line
+     * holding the comma-separated concatenation.  If-Match and If-None-Match
+     * are both "#entity-tag" lists whose members are OR'd, so evaluating
+     * every line and remembering whether ANY of them matched is exactly that
+     * concatenation -- whereas keeping only the last line seen would refuse a
+     * legitimate request with 412 when an earlier If-Match line matched.
+     */
+
+    im_seen = 0;
+    im_match = 0;
+    inm_seen = 0;
+    inm_match = 0;
     ium = NULL;
-    inm = NULL;
     ims = NULL;
 
     /*
@@ -975,7 +987,16 @@ nxt_http_static_preconditions(nxt_http_request_t *r, nxt_str_t *etag,
             if (nxt_strncasecmp(f->name, (u_char *) "If-Match",
                                 nxt_length("If-Match")) == 0)
             {
-                im = f;
+                im_seen = 1;
+
+                if (!im_match) {
+                    value.start = f->value;
+                    value.length = f->value_length;
+
+                    /* Sect. 13.1.1: If-Match compares strongly. */
+
+                    im_match = nxt_http_static_etag_match(&value, etag, 1);
+                }
             }
 
             break;
@@ -984,7 +1005,14 @@ nxt_http_static_preconditions(nxt_http_request_t *r, nxt_str_t *etag,
             if (nxt_strncasecmp(f->name, (u_char *) "If-None-Match",
                                 nxt_length("If-None-Match")) == 0)
             {
-                inm = f;
+                inm_seen = 1;
+
+                if (!inm_match) {
+                    value.start = f->value;
+                    value.length = f->value_length;
+
+                    inm_match = nxt_http_static_etag_match(&value, etag, 0);
+                }
             }
 
             break;
@@ -1012,13 +1040,8 @@ nxt_http_static_preconditions(nxt_http_request_t *r, nxt_str_t *etag,
         }
     }
 
-    if (im != NULL) {
-        value.start = im->value;
-        value.length = im->value_length;
-
-        /* Sect. 13.1.1: If-Match uses the strong comparison function. */
-
-        if (!nxt_http_static_etag_match(&value, etag, 1)) {
+    if (im_seen) {
+        if (!im_match) {
             return NXT_HTTP_PRECONDITION_FAILED;
         }
 
@@ -1030,11 +1053,8 @@ nxt_http_static_preconditions(nxt_http_request_t *r, nxt_str_t *etag,
         }
     }
 
-    if (inm != NULL) {
-        value.start = inm->value;
-        value.length = inm->value_length;
-
-        if (nxt_http_static_etag_match(&value, etag, 0)) {
+    if (inm_seen) {
+        if (inm_match) {
             return NXT_HTTP_NOT_MODIFIED;
         }
 

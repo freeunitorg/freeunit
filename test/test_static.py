@@ -167,6 +167,39 @@ def test_static_conditional_etag():
     assert resp['body'] == '0123456789', 'full body on mismatch'
 
 
+def test_static_conditional_duplicate_field_lines():
+    # RFC 9110 Sect. 5.3: repeated field lines are equivalent to one line
+    # holding the comma-separated concatenation.  Keeping only the last line
+    # seen refused a legitimate request with 412 when an earlier If-Match
+    # line matched.
+    etag = client.get(url='/index.html')['headers']['ETag']
+
+    def get(header, values):
+        return client.get(
+            url='/index.html',
+            headers={
+                'Host': 'localhost',
+                'Connection': 'close',
+                header: values,
+            },
+        )
+
+    for values in [[etag, '"other"'], ['"other"', etag]]:
+        assert (
+            get('If-None-Match', values)['status'] == 304
+        ), f'If-None-Match matches in any line: {values}'
+        assert (
+            get('If-Match', values)['status'] == 200
+        ), f'If-Match matches in any line: {values}'
+
+    assert (
+        get('If-None-Match', ['"a"', '"b"'])['status'] == 200
+    ), 'no If-None-Match line matches'
+    assert (
+        get('If-Match', ['"a"', '"b"'])['status'] == 412
+    ), 'no If-Match line matches'
+
+
 def test_static_conditional_if_match():
     etag = client.get(url='/index.html')['headers']['ETag']
 
