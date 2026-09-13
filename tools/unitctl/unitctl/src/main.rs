@@ -2,7 +2,6 @@ extern crate clap;
 extern crate colored_json;
 extern crate custom_error;
 extern crate nu_json;
-extern crate rustls_pemfile;
 extern crate serde;
 extern crate unit_client_rs;
 

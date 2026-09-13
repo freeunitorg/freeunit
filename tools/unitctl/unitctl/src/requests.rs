@@ -6,9 +6,12 @@ use crate::known_size::KnownSize;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::Request;
-use rustls_pemfile::Item;
+use rustls_pki_types::pem;
+use rustls_pki_types::pem::SectionKind;
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::io::Cursor;
+use std::io::ErrorKind;
 use std::sync::atomic::AtomicUsize;
 use unit_client_rs::unit_client::UnitClientError;
 
@@ -60,10 +63,7 @@ pub async fn send_and_validate_pem_data_deserialize_response(
     let bytes: Vec<u8> = input_file.try_into()?;
     {
         let mut cursor = Cursor::new(&bytes);
-        let items = rustls_pemfile::read_all(&mut cursor)
-            .map(|item| item.map_err(|e| UnitctlError::IoError { source: e }))
-            .collect();
-        validate_pem_items(items)?;
+        validate_pem_items(read_pem_sections(&mut cursor))?;
     }
     let known_size = KnownSize::Vec((*bytes).to_owned());
 
@@ -72,21 +72,61 @@ pub async fn send_and_validate_pem_data_deserialize_response(
         .map_err(|e| UnitctlError::UnitClientError { source: e })
 }
 
-/// Validate the contents of a PEM file
-fn validate_pem_items(pem_items: Vec<Result<Item, UnitctlError>>) -> Result<(), UnitctlError> {
-    fn item_name(item: Item) -> String {
-        match item {
-            Item::X509Certificate(_) => "X509Certificate",
-            Item::Sec1Key(_) => "Sec1Key",
-            Item::Crl(_) => "Crl",
-            Item::Pkcs1Key(_) => "Pkcs1Key",
-            Item::Pkcs8Key(_) => "Pkcs8Key",
-            // Note: this is not a valid PEM item, but rustls_pemfile library defines the enum as non-exhaustive
-            _ => "Unknown",
-        }
-        .to_string()
+/// Name a PEM section for the tally below.
+///
+/// `None` means the section is not one this check knows, and the caller drops
+/// it.  Only the names ending in "Key" or "Certificate" are counted, so the
+/// other names are there to keep the section in the tally.
+fn section_name(kind: SectionKind) -> Option<&'static str> {
+    match kind {
+        SectionKind::Certificate => Some("X509Certificate"),
+        SectionKind::EcPrivateKey => Some("Sec1Key"),
+        SectionKind::Crl => Some("Crl"),
+        SectionKind::RsaPrivateKey => Some("Pkcs1Key"),
+        SectionKind::PrivateKey => Some("Pkcs8Key"),
+        SectionKind::PublicKey => Some("Unknown"),
+        SectionKind::Csr => Some("Unknown"),
+        // SectionKind is non-exhaustive.  A kind we do not name is dropped, so
+        // a file that carries one is judged on its other sections alone.
+        _ => None,
     }
+}
 
+/// Read every PEM section this check knows about.
+///
+/// Reading stops at the first error.  The caller reports that error, so
+/// anything after it would not be looked at.
+fn read_pem_sections(rd: &mut dyn BufRead) -> Vec<Result<SectionKind, UnitctlError>> {
+    let mut sections = Vec::new();
+
+    loop {
+        match pem::from_buf(rd) {
+            Ok(Some((kind, _data))) => {
+                if section_name(kind).is_some() {
+                    sections.push(Ok(kind));
+                }
+            }
+            Ok(None) => return sections,
+            Err(error) => {
+                sections.push(Err(pem_error(error)));
+                return sections;
+            }
+        }
+    }
+}
+
+/// Turn a PEM parse failure into the error unitctl reports.
+fn pem_error(error: pem::Error) -> UnitctlError {
+    match error {
+        pem::Error::Io(source) => UnitctlError::IoError { source },
+        other => UnitctlError::IoError {
+            source: std::io::Error::new(ErrorKind::InvalidData, other.to_string()),
+        },
+    }
+}
+
+/// Validate the contents of a PEM file
+fn validate_pem_items(pem_items: Vec<Result<SectionKind, UnitctlError>>) -> Result<(), UnitctlError> {
     if pem_items.is_empty() {
         let error = UnitctlError::CertificateError {
             message: "No certificates found in file".to_string(),
@@ -98,7 +138,7 @@ fn validate_pem_items(pem_items: Vec<Result<Item, UnitctlError>>) -> Result<(), 
 
     for pem_item_result in pem_items {
         let pem_item = pem_item_result?;
-        let key = item_name(pem_item);
+        let key = section_name(pem_item).unwrap_or("Unknown").to_string();
         if let Some(count) = items_tally.get_mut(key.clone().as_str()) {
             count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         } else {
@@ -207,4 +247,85 @@ fn build_request(
     }
 
     Ok(request)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CERT: &str = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
+    const PKCS8_KEY: &str = "-----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n";
+    const RSA_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----\nAQID\n-----END RSA PRIVATE KEY-----\n";
+    const EC_KEY: &str = "-----BEGIN EC PRIVATE KEY-----\nAQID\n-----END EC PRIVATE KEY-----\n";
+    const PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nAQID\n-----END PUBLIC KEY-----\n";
+    const ECH_CONFIG: &str = "-----BEGIN ECHCONFIG-----\nAQID\n-----END ECHCONFIG-----\n";
+
+    /// Run the check a PEM upload goes through before it is sent.
+    fn validate(pem: &str) -> Result<(), UnitctlError> {
+        let mut cursor = Cursor::new(pem.as_bytes());
+        validate_pem_items(read_pem_sections(&mut cursor))
+    }
+
+    fn error_message(pem: &str) -> String {
+        match validate(pem) {
+            Err(UnitctlError::CertificateError { message }) => message,
+            other => panic!("expected a certificate error, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn accepts_a_certificate_with_a_key() {
+        validate(&format!("{}{}", CERT, PKCS8_KEY)).unwrap();
+        validate(&format!("{}{}", CERT, RSA_KEY)).unwrap();
+        validate(&format!("{}{}", CERT, EC_KEY)).unwrap();
+    }
+
+    #[test]
+    fn accepts_a_chain_of_certificates_with_one_key() {
+        validate(&format!("{}{}{}", CERT, CERT, PKCS8_KEY)).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_certificate_with_no_key() {
+        assert_eq!(error_message(CERT), "No private keys found in file");
+    }
+
+    #[test]
+    fn rejects_a_key_with_no_certificate() {
+        assert_eq!(error_message(PKCS8_KEY), "No certificates found in file");
+    }
+
+    #[test]
+    fn rejects_a_file_with_no_pem_section() {
+        assert_eq!(error_message(""), "No certificates found in file");
+        assert_eq!(error_message("not a pem file\n"), "No certificates found in file");
+    }
+
+    /// A public key is not a private key, so it cannot stand in for one.
+    #[test]
+    fn rejects_a_public_key_as_the_key() {
+        assert_eq!(
+            error_message(&format!("{}{}", CERT, PUBLIC_KEY)),
+            "No private keys found in file"
+        );
+    }
+
+    /// A section this check does not name is dropped, so the file is judged on
+    /// its other sections.
+    #[test]
+    fn ignores_a_section_it_does_not_name() {
+        validate(&format!("{}{}{}", CERT, ECH_CONFIG, PKCS8_KEY)).unwrap();
+        assert_eq!(error_message(ECH_CONFIG), "No certificates found in file");
+    }
+
+    #[test]
+    fn rejects_a_section_with_no_end_marker() {
+        let truncated = "-----BEGIN CERTIFICATE-----\nAQID\n";
+        match validate(truncated) {
+            Err(UnitctlError::IoError { source }) => {
+                assert_eq!(source.kind(), ErrorKind::InvalidData);
+            }
+            other => panic!("expected an IO error, got ok={}", other.is_ok()),
+        }
+    }
 }
