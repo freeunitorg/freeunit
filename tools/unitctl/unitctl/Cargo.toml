@@ -28,7 +28,7 @@ tempfile = "3.8"
 which = "8.0.2"
 walkdir = "2.4"
 
-hyper = { version = "1.9.0", features = ["http2", "server", "client"] }
+hyper = { version = "1.9.0", features = ["server", "client"] }
 http-body-util = "0.1"
 bytes = "1"
 tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }

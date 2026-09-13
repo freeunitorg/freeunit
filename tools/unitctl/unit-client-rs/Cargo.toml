@@ -10,9 +10,9 @@ name = "unit_client_rs"
 
 [dependencies]
 custom_error = "1.9"
-hyper = { version = "1", features = ["http1", "http2"] }
-hyper-rustls = { version = "0.27", features = ["rustls-native-certs", "webpki-roots", "http2"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "client", "http1", "http2", "tokio"] }
+hyper = { version = "1", features = ["http1"] }
+hyper-rustls = { version = "0.27", features = ["rustls-native-certs", "webpki-roots"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "client", "http1", "tokio"] }
 hyperlocal = "0.9"
 http-body-util = "0.1"
 bytes = "1"

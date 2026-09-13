@@ -241,7 +241,9 @@ impl UnitClient {
             .with_native_roots()
             .unwrap_or_else(|_| HttpsConnectorBuilder::new().with_webpki_roots())
             .https_or_http()
-            .enable_all_versions()
+            // The control API speaks HTTP/1.1 only.  This also keeps "h2" out
+            // of the ALPN list we offer.
+            .enable_http1()
             .build();
         let remote_client: Client<HttpsConnector<HttpConnector>, Full<Bytes>> =
             Client::builder(TokioExecutor::new()).build(connector);
