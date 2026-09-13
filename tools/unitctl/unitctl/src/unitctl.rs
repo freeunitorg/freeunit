@@ -84,7 +84,7 @@ pub(crate) enum Commands {
             global = true,
             short = 'f',
             long = "file",
-            help = "Input file (json, json5, yaml, pem) to send to unit when applicable use - for stdin"
+            help = "Input file (json, json5, pem) to send to unit when applicable use - for stdin"
         )]
         input_file: Option<String>,
 

@@ -6,7 +6,6 @@ use std::io::{stdout, BufWriter, Write};
 
 #[derive(ValueEnum, Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OutputFormat {
-    Yaml,
     Json,
     #[value(id = "json-pretty")]
     JsonPretty,
@@ -24,8 +23,6 @@ impl OutputFormat {
             serde_json::to_value(object).map_err(|e| UnitctlError::SerializationError { message: e.to_string() })?;
 
         match (self, no_color) {
-            (OutputFormat::Yaml, _) => serde_yaml::to_writer(BufWriter::new(out), &value)
-                .map_err(|e| UnitctlError::SerializationError { message: e.to_string() }),
             (OutputFormat::Json, _) => serde_json::to_writer(BufWriter::new(out), &value)
                 .map_err(|e| UnitctlError::SerializationError { message: e.to_string() }),
             (OutputFormat::JsonPretty, true) => serde_json::to_writer_pretty(BufWriter::new(out), &value)

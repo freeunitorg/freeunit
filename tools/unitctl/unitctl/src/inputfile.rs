@@ -11,6 +11,9 @@ use super::UnitctlError;
 /// Input file data format
 #[derive(ValueEnum, Copy, Clone, Debug, PartialEq, Eq)]
 pub enum InputFormat {
+    /// Recognised, but not parsed.  unitctl no longer reads YAML.  The format
+    /// stays in this list so that a ".yaml" file gets a message saying that,
+    /// instead of a JSON parse error.
     Yaml,
     Json,
     Json5,
@@ -144,8 +147,6 @@ impl InputFile {
     pub fn to_unit_serializable_map(&self) -> Result<UnitSerializableMap, UnitctlError> {
         let reader: Box<dyn BufRead + Send> = self.try_into()?;
         let body_data: UnitSerializableMap = match self.format() {
-            InputFormat::Yaml => serde_yaml::from_reader(reader)
-                .map_err(|e| UnitctlError::DeserializationError { message: e.to_string() })?,
             InputFormat::Json => serde_json::from_reader(reader)
                 .map_err(|e| UnitctlError::DeserializationError { message: e.to_string() })?,
             InputFormat::Json5 => {
@@ -157,11 +158,16 @@ impl InputFile {
                 json5::from_str(&json5_string)
                     .map_err(|e| UnitctlError::DeserializationError { message: e.to_string() })?
             }
-            // Refuse hjson by name.  Handing the file to the JSON parser would
-            // report a syntax error on the first comment or unquoted key, and
-            // that error does not tell the user what to do.
+            // Refuse hjson and YAML by name.  Handing the file to the JSON
+            // parser would report a syntax error on the first comment or
+            // unquoted key, and that error does not tell the user what to do.
             InputFormat::Hjson => Err(UnitctlError::DeserializationError {
                 message: "hjson is no longer supported: convert the file to JSON first".to_string(),
+            })?,
+            InputFormat::Yaml => Err(UnitctlError::DeserializationError {
+                message: "YAML is no longer supported: convert the file to JSON first, for example with \
+                          \"yq -o=json\""
+                    .to_string(),
             })?,
             _ => Err(UnitctlError::DeserializationError {
                 message: format!("Unsupported input format for serialization: {:?}", self),
@@ -311,9 +317,8 @@ mod tests {
     }
 
     /// `UnitSerializableMap` is a `serde_json::Map`, which keeps member order
-    /// only because every format feeding it keeps it too.  `serde_yaml` and
-    /// `json5` each reach the type by a different route, so each one is
-    /// checked.
+    /// only because every format feeding it keeps it too.  `json5` reaches the
+    /// type by a different route than `serde_json`, so both are checked.
     #[test]
     fn every_input_format_keeps_member_order() {
         let json = MEMBERS
@@ -325,12 +330,6 @@ mod tests {
 
         assert_eq!(members_of(&write_input(&json, ".json"), InputFormat::Json), MEMBERS);
         assert_eq!(members_of(&write_input(&json, ".json5"), InputFormat::Json5), MEMBERS);
-
-        let yaml = MEMBERS
-            .iter()
-            .map(|name| format!("{}: {{}}\n", name))
-            .collect::<String>();
-        assert_eq!(members_of(&write_input(&yaml, ".yaml"), InputFormat::Yaml), MEMBERS);
     }
 
     /// hjson is refused by name.  Handing the file to the JSON parser instead
@@ -348,6 +347,27 @@ mod tests {
             "unexpected message: {}",
             error
         );
+    }
+
+    /// YAML is refused by name for the same reason, and the ".yaml" extension
+    /// still has to reach that refusal.  Were the variant dropped instead, the
+    /// file would become `InputFormat::Unknown` and `execute` would abort on
+    /// its `panic!("Unknown input file type")`.
+    #[test]
+    fn a_yaml_input_is_refused_with_a_message_about_yaml() {
+        for suffix in [".yaml", ".yml"] {
+            let file = write_input("routes: []\n", suffix);
+            let input = InputFile::from(file.path());
+
+            assert!(input.is_config(), "{} must stay a config format", suffix);
+
+            let error = input.to_unit_serializable_map().expect_err("YAML must be refused");
+            assert!(
+                error.to_string().contains("YAML is no longer supported"),
+                "unexpected message: {}",
+                error
+            );
+        }
     }
 
     /// The way back in is strict, which is why `unitctl export` warns that the
