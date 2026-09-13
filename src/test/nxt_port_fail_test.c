@@ -6,6 +6,7 @@
 #include <nxt_port.h>
 #include <nxt_port_rpc.h>
 #include <nxt_event_engine.h>
+#include <nxt_port_queue.h>
 #include "nxt_tests.h"
 
 #if (NXT_LINUX)
@@ -15,6 +16,9 @@
 
 static nxt_port_t *nxt_port_fail_test_port(nxt_task_t *task);
 static nxt_int_t nxt_port_fail_test_socket_write(nxt_thread_t *thr);
+static nxt_int_t nxt_port_fail_test_inline_drop(nxt_thread_t *thr);
+static void nxt_port_fail_test_enable_write(nxt_event_engine_t *engine,
+    nxt_fd_event_t *ev);
 static nxt_int_t nxt_port_fail_test_rpc_register(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_error_handler(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_mp_baseline(nxt_thread_t *thr);
@@ -41,6 +45,7 @@ static nxt_int_t nxt_port_fail_test_fd_count(void);
 
 
 static nxt_uint_t  nxt_port_fail_test_completions;
+static nxt_uint_t  nxt_port_fail_test_rearms;
 static nxt_uint_t  nxt_port_fail_test_releases;
 static nxt_uint_t  nxt_port_fail_test_signals;
 
@@ -52,6 +57,10 @@ nxt_port_fail_test(nxt_thread_t *thr)
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "port failure test started");
 
     if (nxt_port_fail_test_socket_write(thr) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_port_fail_test_inline_drop(thr) != NXT_OK) {
         return NXT_ERROR;
     }
 
@@ -226,6 +235,323 @@ fail:
     nxt_mp_destroy(mp);
 
     return NXT_ERROR;
+}
+
+
+static void
+nxt_port_fail_test_enable_write(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
+{
+    nxt_port_fail_test_rearms++;
+}
+
+
+/*
+ * The inline write that the port cannot take.
+ *
+ * The other leg above drives the allocation failure in
+ * nxt_port_msg_chk_insert(), before anything is sent.  This one drives the
+ * other half: the port is write-ready with an empty queue, so chk_insert()
+ * declines and nxt_port_socket_write2() sends inline, and there the socket
+ * answers EAGAIN with the message unable to queue for later either.
+ *
+ * Nothing of the message was consumed on that path, so the answer must be
+ * NXT_ERROR, with the descriptor still open and no completion queued: the
+ * ownership contract in src/nxt_port.h, which the caller relies on to free
+ * its own payload.  Answering NXT_OK there is what left an RPC reply lost,
+ * with the caller believing it had sent it (#335).
+ *
+ * The write event must also be re-armed.  nxt_socketpair_send() cleared
+ * write_ready on the EAGAIN, and nothing else sets it back, so a port that
+ * skipped the re-arm would never drain what is already queued on it.  The
+ * stub engine below exists to count that call.
+ */
+
+static nxt_int_t
+nxt_port_fail_test_inline_drop(nxt_thread_t *thr)
+{
+    int                    sndbuf;
+    nxt_mp_t               *mp;
+    nxt_fd_t               fd, pair[2];
+    nxt_buf_t              *buf;
+    nxt_int_t              ret;
+    nxt_task_t             *task;
+    nxt_port_t             *port;
+    nxt_event_engine_t     engine, *saved_engine;
+    nxt_port_queue_t       *queue;
+    nxt_event_interface_t  stub;
+    u_char                 block[4096];
+
+    task = thr->task;
+    task->thread = thr;
+
+    ret = NXT_ERROR;
+    fd = -1;
+    pair[0] = -1;
+    pair[1] = -1;
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (nxt_slow_path(mp == NULL)) {
+        return NXT_ERROR;
+    }
+
+    port = nxt_port_fail_test_port(task);
+    if (nxt_slow_path(port == NULL)) {
+        nxt_mp_destroy(mp);
+        return NXT_ERROR;
+    }
+
+    /*
+     * Only fast_work_queue and the one event method this path can reach are
+     * real.  The code under test never reaches anything else, so it stays
+     * unset.
+     */
+
+    nxt_memzero(&engine, sizeof(engine));
+    nxt_memzero(&stub, sizeof(stub));
+
+    nxt_work_queue_cache_create(&engine.work_queue_cache, 1024);
+    engine.fast_work_queue.cache = &engine.work_queue_cache;
+    nxt_work_queue_name(&engine.fast_work_queue, "fast");
+
+    stub.enable_write = nxt_port_fail_test_enable_write;
+    engine.event = stub;
+
+    saved_engine = thr->engine;
+    thr->engine = &engine;
+
+    /*
+     * port->engine matches the caller's, so nxt_port_post() is a direct
+     * call.  The re-arm then lands on the stub above instead of on an event
+     * loop this fixture does not have.
+     */
+    port->engine = &engine;
+
+    /*
+     * SOCK_DGRAM: the type the port layer itself selects, since
+     * src/nxt_socketpair.c keeps SEQPACKET switched off.  This fixture then
+     * builds a pair on any platform the product supports.  It needs only a
+     * send buffer it can fill, not seqpacket semantics.
+     */
+
+    if (nxt_slow_path(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) != 0)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: socketpair failed");
+        goto done;
+    }
+
+    sndbuf = 4096;
+    (void) setsockopt(pair[1], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+    if (nxt_slow_path(fcntl(pair[1], F_SETFL, O_NONBLOCK) == -1)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: O_NONBLOCK failed");
+        goto done;
+    }
+
+    port->pair[0] = pair[0];
+    port->pair[1] = pair[1];
+    port->socket.fd = pair[1];
+    port->socket.task = task;
+    port->socket.log = thr->log;
+    port->max_size = 1024;
+    port->max_share = 1024;
+
+    /* Nobody reads pair[0], so the send buffer fills and stays full. */
+
+    nxt_memzero(block, sizeof(block));
+
+    while (send(pair[1], block, sizeof(block), 0) > 0) {
+        /* void */
+    }
+
+    port->socket.write_ready = 1;
+    port->socket.write = NXT_EVENT_INACTIVE;
+
+    fd = open("/dev/null", O_RDONLY);
+    if (nxt_slow_path(fd == -1)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: failed to open /dev/null");
+        goto done;
+    }
+
+    buf = nxt_buf_mem_alloc(mp, 1, 0);
+    if (nxt_slow_path(buf == NULL)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: failed to allocate buf");
+        goto done;
+    }
+
+    buf->completion_handler = nxt_port_fail_test_completion;
+
+    nxt_port_fail_test_completions = 0;
+    nxt_port_fail_test_rearms = 0;
+
+    nxt_port_test_msg_alloc_failures(1);
+
+    ret = nxt_port_socket_write(task, port, NXT_PORT_MSG_DATA
+                                | NXT_PORT_MSG_CLOSE_FD, fd, 1, 0, buf);
+
+    nxt_port_test_msg_alloc_failures(0);
+
+    if (ret != NXT_ERROR) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: an inline write that was neither "
+                      "sent nor queued answered %d, expected NXT_ERROR",
+                      (int) ret);
+        ret = NXT_ERROR;
+        goto done;
+    }
+
+    ret = NXT_ERROR;
+
+    if (!nxt_port_fail_test_fd_is_open(fd)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: the inline drop closed a descriptor "
+                      "it reported as not taken");
+        fd = -1;
+        goto done;
+    }
+
+    /*
+     * Drain first: both consuming paths queue the completion rather than run
+     * it, so a counter read before this would be 0 whether or not the port
+     * took the buffer -- an assertion that holds for the wrong reason.
+     */
+
+    nxt_port_fail_test_drain_wq(&engine.fast_work_queue);
+
+    if (nxt_port_fail_test_completions != 0) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: the inline drop completed a buffer "
+                      "the caller still owns");
+        goto done;
+    }
+
+    if (!nxt_queue_is_empty(&port->messages)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: the refused message was left on the "
+                      "port");
+        goto done;
+    }
+
+    if (port->socket.write_ready != 0) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: write_ready survived an EAGAIN");
+        goto done;
+    }
+
+    if (nxt_port_fail_test_rearms != 1) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: the write event was re-armed %d "
+                      "times, expected once -- without it nothing queued on "
+                      "this port from here on would ever drain",
+                      (int) nxt_port_fail_test_rearms);
+        goto done;
+    }
+
+    /*
+     * The same failure, but on a port with a shared queue: the payload goes
+     * into the ring, and the inline write is only the wake-up that tells the
+     * reader to look.  The buffer is already handed over, its completion
+     * already queued, so this one must answer NXT_OK however the wake-up
+     * ends.  nxt_runtime_port_send_quit() is a caller that cleans up after a
+     * failed write; it would otherwise complete the same buffer twice.
+     */
+
+    queue = nxt_mp_zalloc(mp, sizeof(nxt_port_queue_t));
+    if (nxt_slow_path(queue == NULL)) {
+        ret = NXT_ERROR;
+        goto done;
+    }
+
+    nxt_port_queue_init(queue);
+    port->queue = queue;
+
+    buf = nxt_buf_mem_alloc(mp, 1, 0);
+    if (nxt_slow_path(buf == NULL)) {
+        ret = NXT_ERROR;
+        goto done;
+    }
+
+    buf->completion_handler = nxt_port_fail_test_completion;
+    buf->mem.free++;
+
+    nxt_port_fail_test_completions = 0;
+
+    /* As the poller would leave it; the socket buffer is still full. */
+    port->socket.write_ready = 1;
+
+    nxt_port_test_msg_alloc_failures(1);
+
+    ret = nxt_port_socket_write(task, port, NXT_PORT_MSG_DATA, -1, 0, 0, buf);
+
+    nxt_port_test_msg_alloc_failures(0);
+
+    if (ret != NXT_OK) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: a payload that reached the shared "
+                      "queue answered %d; the buffer is already the port's "
+                      "and the caller must not be told to reclaim it",
+                      (int) ret);
+        ret = NXT_ERROR;
+        goto done;
+    }
+
+    ret = NXT_ERROR;
+
+    nxt_port_fail_test_drain_wq(&engine.fast_work_queue);
+
+    if (nxt_port_fail_test_completions != 1) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: the enqueued payload was completed "
+                      "%d times, expected once",
+                      (int) nxt_port_fail_test_completions);
+        goto done;
+    }
+
+    ret = NXT_OK;
+
+done:
+
+    nxt_port_test_msg_alloc_failures(0);
+
+    if (fd != -1 && nxt_port_fail_test_fd_is_open(fd)) {
+        nxt_fd_close(fd);
+    }
+
+    nxt_port_fail_test_drain_wq(&engine.fast_work_queue);
+
+    /*
+     * Close through the port's own teardown, not by closing the pair here.
+     * nxt_port_mp_cleanup() asserts both descriptors are gone, and that
+     * assertion compiles out of a release build, so closing them by hand
+     * looks clean until someone runs the suite with --debug.
+     */
+
+    /*
+     * Take the queue back first.  It came from the test's own mem pool, and
+     * nxt_port_close() munmap()s whatever port->queue points at -- 655380
+     * bytes of live heap if the allocator ever returns a page-aligned
+     * pointer.  Today the call fails EINVAL and only logs, which is luck,
+     * not a design.
+     */
+
+    port->queue = NULL;
+
+    nxt_port_close(task, port);
+
+    if (pair[0] != -1 && nxt_port_fail_test_fd_is_open(pair[0])) {
+        nxt_fd_close(pair[0]);
+    }
+
+    nxt_port_use(task, port, -1);
+
+    thr->engine = saved_engine;
+
+    nxt_work_queue_cache_destroy(&engine.work_queue_cache);
+    nxt_mp_destroy(mp);
+
+    return ret;
 }
 
 

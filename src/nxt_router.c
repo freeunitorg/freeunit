@@ -1017,6 +1017,10 @@ nxt_router_start_timeout(nxt_task_t *task, void *obj, void *data)
  * nxt_port_msg_drop() because the destination died or the port layer could not
  * requeue it -- and nothing was forked for a start that never arrived.
  *
+ * One shape does not reach here.  An inline first fragment that hits EAGAIN
+ * and cannot be held for a later attempt is refused outright, with
+ * NXT_ERROR and the payload untouched, so the caller fails the start itself.
+ *
  * ->recalled cannot answer this on its own: a message the deadline finds
  * partly sent stays queued, and only its completion knows whether the rest of
  * it ever left.  See nxt_router_app_port_error().

@@ -1364,20 +1364,18 @@ nxt_proto_child_exited(nxt_task_t *task, nxt_process_t *process)
              * the same pools and can fail the same way, and then only the
              * application's "limits.start_timeout" retires the start.  The
              * alert below is what makes that case visible instead of silent.
-             * NXT_OK is not a delivery receipt either, and that shape is
-             * the one this function cannot cover.  When the port is writable
-             * the message goes out inline; if sendmsg() answers EAGAIN and
-             * it then cannot be queued for later, it is dropped and only the
-             * port's error handler is scheduled -- while the caller reads
-             * NXT_OK.  The REMOVE_PID below does not rescue that, and not
-             * because it is streamless: the EAGAIN cleared the port's
-             * write_ready, so it is queued rather than sent, and the error
-             * handler drains the whole queue when it runs.  The router is
-             * told nothing at all.  That is the port layer answering for a
-             * message it dropped, which reaches every RPC reply in the
-             * daemon rather than this function alone; it is filed as #335,
-             * and the fix there -- reporting the drop -- is what this
-             * function's failure branch above already knows how to use.
+             * One more shape reaches the same branch.  The router port is
+             * writable, so the RPC_ERROR goes out inline and hits EAGAIN
+             * with no memory left to hold it for a later attempt.
+             * nxt_port_socket_write2() used to answer NXT_OK for that and
+             * drop the message, clearing the stream for a report nobody
+             * received.  REMOVE_PID could not rescue it either: the same
+             * EAGAIN had cleared write_ready, so REMOVE_PID was queued
+             * instead of sent, and the error handler that ran next drained
+             * it too.  It now answers NXT_ERROR with the message untouched,
+             * which keeps the stream armed here.  A send to a port whose
+             * peer has died still answers NXT_OK; the RPC is moot there
+             * anyway.
              */
             if (nxt_fast_path(ret == NXT_OK)) {
                 process->stream = 0;

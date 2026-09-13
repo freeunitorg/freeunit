@@ -57,6 +57,13 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        prototype that was not coming, and the requests waiting on it were
        never failed.
 
+    *) Bugfix: the port layer reported a message as sent when it had been
+       neither sent nor queued. This happened when a socket answered
+       EAGAIN and no memory was left to hold the message for a later
+       attempt, so it takes memory pressure to reach. The sender then
+       cleared the state that would have retried or reported it, so a
+       request could wait for an answer that nothing would ever deliver.
+
     *) Bugfix: an application worker that died before it finished starting
        was reported to nobody, so the start it was forked for stayed pending
        forever. Once the application reached its "processes" maximum it

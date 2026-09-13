@@ -20,6 +20,8 @@ static uint8_t nxt_port_enqueue_buf(nxt_task_t *task, nxt_port_msg_t *pm,
 static nxt_int_t nxt_port_msg_chk_insert(nxt_task_t *task, nxt_port_t *port,
     nxt_port_send_msg_t *msg);
 static nxt_port_send_msg_t *nxt_port_msg_alloc(const nxt_port_send_msg_t *m);
+static nxt_int_t nxt_port_write_msgs(nxt_task_t *task, void *obj,
+    void *data);
 static void nxt_port_write_handler(nxt_task_t *task, void *obj, void *data);
 static nxt_port_send_msg_t *nxt_port_msg_first(nxt_port_t *port);
 nxt_inline void nxt_port_msg_close_fd(nxt_port_send_msg_t *msg);
@@ -205,22 +207,22 @@ nxt_port_release_send_msg(nxt_port_send_msg_t *msg)
 
 
 /*
- * Give up on a message that nxt_port_write_handler() is dropping, completing
+ * Give up on a message that nxt_port_write_msgs() is dropping.  Complete
  * what it still owns.
  *
- * Only for a message that is not in port->messages -- msg->link.next == NULL,
- * which on these paths means it is still the caller's stack copy from the
- * nxt_port_msg_chk_insert() NXT_DECLINED branch.  That is also why this cannot
- * double-complete: the nxt_port_error_handler() the caller goes on to raise
- * completes what the queue holds, and this was never in it.
+ * This applies only to a message not yet in port->messages, msg->link.next
+ * == NULL: the caller's stack copy from the nxt_port_msg_chk_insert()
+ * NXT_DECLINED branch.  It cannot double-complete, because the
+ * nxt_port_error_handler() the caller raises next completes only what the
+ * queue holds, and this message was never in it.
  *
- * Without this the buffers of an accepted write were simply orphaned, which
- * breaks the contract nxt_port_socket_write2() documents -- it answers NXT_OK
- * on these paths, because nxt_port_write_handler() returns void -- and strands
- * any caller waiting on the completion, such as the START_PROCESS deadline in
- * src/nxt_router.c.
+ * nxt_port_socket_write2() answers NXT_OK on these paths on purpose.
+ * Callers that ignore the return rely on the port to finish what they
+ * handed it, such as the START_PROCESS deadline in src/nxt_router.c.
+ * Skipping this call would orphan those buffers instead.
  *
- * Descriptors first, then buffers, the order nxt_port_error_handler() uses.
+ * Close descriptors first, then complete buffers -- the order
+ * nxt_port_error_handler() uses.
  */
 
 static void
@@ -258,11 +260,14 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
     int                  notify;
     uint8_t              qmsg_size;
     nxt_int_t            res;
+    nxt_bool_t           enqueued;
     nxt_port_send_msg_t  msg;
     struct {
         nxt_port_msg_t   pm;
         uint8_t          buf[NXT_PORT_MAX_ENQUEUE_BUF_SIZE];
     } qmsg;
+
+    enqueued = 0;
 
     msg.link.next = NULL;
     msg.link.prev = NULL;
@@ -315,6 +320,13 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
                 return res;
             }
 
+            /*
+             * The payload is in the shared queue and its completion is
+             * already queued: b belongs to the port from here on, whatever
+             * becomes of the wake-up below.
+             */
+            enqueued = 1;
+
             msg.port_msg.type = _NXT_PORT_MSG_READ_QUEUE;
             msg.buf = NULL;
 
@@ -335,7 +347,48 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
 
     res = nxt_port_msg_chk_insert(task, port, &msg);
     if (nxt_fast_path(res == NXT_DECLINED)) {
-        nxt_port_write_handler(task, &port->socket, &msg);
+        /*
+         * Inline, with this stack copy: the answer is whether the port took
+         * the message, not whether the call ran.  On NXT_ERROR nothing of it
+         * was consumed, so the caller still owns fd, fd2 and b -- the
+         * contract in src/nxt_port.h, and the same state this function
+         * already answers for the allocation failure above.
+         */
+        res = nxt_port_write_msgs(task, &port->socket, &msg);
+    }
+
+    if (nxt_slow_path(res != NXT_OK && enqueued)) {
+        /*
+         * Only the wake-up failed.  The buffer already went into the shared
+         * queue above, with its completion queued, so answering anything
+         * but NXT_OK would hand back a buffer this function no longer owns
+         * -- and a caller that cleans up after a failed write would
+         * complete it a second time.  nxt_runtime_port_send_quit()
+         * (src/nxt_runtime.c) is such a caller.
+         *
+         * The message sits in the queue, but nothing told the peer to look.
+         * nxt_port_queue_send() raises "notify" only on the 0-to-1
+         * transition (src/nxt_port_queue.h), so later enqueues on this port
+         * stay silent while this item keeps nitems above zero.
+         *
+         * After EAGAIN the peer still gets it.  That errno means the socket
+         * holds data the peer has not read, and nxt_port_queue_read_handler()
+         * drains the ring before it reads the socket, so the next read pass
+         * takes this item too.
+         *
+         * ENOBUFS promises nothing: nxt_socketpair_send() maps it to
+         * NXT_AGAIN as well (src/nxt_socketpair.c), and it means the system
+         * ran out of buffers, not that the peer owes this port a read.  The
+         * item then waits until something else makes that peer read.  Keeping
+         * the notification instead needs one the port has already allocated,
+         * the way ->release_work is held for the release path; the alert
+         * marks the case until then.
+         */
+
+        nxt_alert(task, "port{%d,%d} %d: the queued message could not be "
+                  "announced; the peer takes it only when it next reads this "
+                  "port", (int) port->pid, (int) port->id, port->socket.fd);
+
         res = NXT_OK;
     }
 
@@ -464,12 +517,30 @@ nxt_port_fd_enable_write(nxt_task_t *task, nxt_port_t *port, void *data)
 }
 
 
-static void
-nxt_port_write_handler(nxt_task_t *task, void *obj, void *data)
+/*
+ * Write what the port has and report whether an inline message was taken.
+ *
+ * The event loop never sets the port socket's own ->data, so data != NULL
+ * marks the inline call from nxt_port_socket_write2(), with "msg" as that
+ * caller's stack copy.  Only then does the return value matter -- a queued
+ * message belongs to the port either way, with nobody left to tell.
+ *
+ * NXT_ERROR means the message was neither sent nor queued, and nothing of
+ * it was consumed.  See the ownership contract this promises the caller in
+ * the comment above the inline call in nxt_port_socket_write2().
+ *
+ * One exit answers NXT_ERROR today: an EAGAIN with no memory to hold a
+ * first fragment for a later attempt.  A send to a dead peer still answers
+ * NXT_OK and drops the message; see the comment on that path below.
+ */
+
+static nxt_int_t
+nxt_port_write_msgs(nxt_task_t *task, void *obj, void *data)
 {
     int                     use_delta;
     size_t                  plain_size;
     ssize_t                 n;
+    nxt_int_t               ret;
     uint32_t                mmsg_buf[3 * NXT_IOBUF_MAX * 10];
     nxt_bool_t              block_write, enable_write;
     nxt_port_t              *port;
@@ -481,6 +552,7 @@ nxt_port_write_handler(nxt_task_t *task, void *obj, void *data)
 
     port = nxt_container_of(obj, nxt_port_t, socket);
 
+    ret = NXT_OK;
     block_write = 0;
     enable_write = 0;
     use_delta = 0;
@@ -620,11 +692,16 @@ next_fragment:
 
         } else {
             /*
-             * Both failures below drop a message that was never queued, so
-             * both go through nxt_port_msg_drop(): the send is over and
-             * nothing else will ever complete its buffers.  Neither is a
-             * socket-death-only path -- the second is an allocation failure
-             * against a port that is otherwise perfectly alive.
+             * A send that failed outright: the peer is gone.  This keeps the
+             * old treatment -- drop the message here and answer NXT_OK --
+             * even though the caller is then told a message went out that
+             * did not.  It is the routine path, taken by every worker that
+             * dies with a send in flight, and the callers that ignore this
+             * return were written for it: they hand over a buffer and rely
+             * on the port to complete it.  Reporting it instead would leak
+             * those buffers, one of them a chain of shared-memory chunks
+             * that no pool teardown reclaims.  It has to be done together
+             * with those call sites; #348 tracks that.
              */
 
             if (nxt_slow_path(n == NXT_ERROR)) {
@@ -638,6 +715,38 @@ next_fragment:
             if (msg->link.next == NULL) {
                 qmsg = nxt_port_msg_insert_tail(port, msg);
                 if (nxt_slow_path(qmsg == NULL)) {
+                    /*
+                     * EAGAIN, then no memory to hold the message for a later
+                     * attempt.  The socket is alive and nothing of the
+                     * message was consumed: nxt_socketpair_send() sent no
+                     * bytes and no descriptor, and nxt_port_msg_close_fd()
+                     * runs only after a successful send.  So an inline
+                     * caller can be told, and can act on it: keep its stream
+                     * armed, or complete its own payload.
+                     *
+                     * This applies only to the first fragment.  Once a
+                     * fragment has gone out, ->nf is set, the descriptor is
+                     * closed, and the sent buffers are completed, so the
+                     * port owns the cleanup, not the caller.
+                     */
+
+                    if (data != NULL && msg->port_msg.nf == 0) {
+                        ret = NXT_ERROR;
+
+                        /*
+                         * Leave the loop the ordinary way instead of raising
+                         * the error handler.  The socket is alive, and the
+                         * ordinary exit re-arms the write event that
+                         * nxt_socketpair_send() just cleared.  Without that
+                         * re-arm, everything queued on this port from here
+                         * on -- including work another thread inserted
+                         * during this send -- would wait for a writable
+                         * event that never comes.
+                         */
+
+                        break;
+                    }
+
                     nxt_port_msg_drop(task, msg);
 
                     goto fail;
@@ -671,12 +780,52 @@ cleanup:
     }
 
     if (enable_write) {
-        nxt_port_post(task, port, nxt_port_fd_enable_write, NULL);
+        /*
+         * Same engine, nxt_port_post() is a direct call and cannot fail.
+         * Cross-engine, it allocates the work item it posts, and that can
+         * fail under the same memory pressure that sent this write down the
+         * refusal path above.  A re-arm that never happens leaves
+         * write_ready at 0 with no event to set it again, so anything on
+         * this port's queue -- inserted concurrently, or by the next caller
+         * -- would wait forever.
+         *
+         * Raise the error handler instead, as every other failure here
+         * does.  It drains the queue and completes what it holds, so those
+         * callers get their buffers back.
+         *
+         * It does not repair the port.  write_ready stays 0 with no write
+         * event armed, so every later message is queued and never sent until
+         * the port is closed.  An embedded work item on the port, the way
+         * ->release_work already works, would let the re-arm run without an
+         * allocation and remove this branch.
+         */
+
+        if (nxt_slow_path(nxt_port_post(task, port, nxt_port_fd_enable_write,
+                                        NULL) != NXT_OK))
+        {
+            nxt_alert(task, "port{%d,%d} %d: cannot re-arm the write event; "
+                      "draining what it holds, and it sends nothing further",
+                      (int) port->pid, (int) port->id, port->socket.fd);
+
+            use_delta++;
+
+            nxt_work_queue_add(wq, nxt_port_error_handler, task,
+                               &port->socket, &port->socket);
+        }
     }
 
     if (use_delta != 0) {
         nxt_port_use(task, port, use_delta);
     }
+
+    return ret;
+}
+
+
+static void
+nxt_port_write_handler(nxt_task_t *task, void *obj, void *data)
+{
+    (void) nxt_port_write_msgs(task, obj, data);
 }
 
 
