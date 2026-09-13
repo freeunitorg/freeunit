@@ -771,6 +771,16 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
 
         ret = nxt_http_comp_check_acceptable(task, r);
         if (ret == NXT_HTTP_NOT_ACCEPTABLE) {
+            /*
+             * Every other exit that answers without a body closes the file
+             * first -- the 304, 412 and 416 branches below, and "fail:".
+             * This one returns without reaching any of them, so it has to
+             * close its own, or one unauthenticated request costs the router
+             * a descriptor.
+             */
+            nxt_file_close(task, f);
+            f = NULL;
+
             nxt_http_request_error(task, r, NXT_HTTP_NOT_ACCEPTABLE);
             return;
         } else if (ret != NXT_OK) {

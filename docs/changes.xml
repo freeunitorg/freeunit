@@ -10,6 +10,17 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="security">
+<para>
+a file descriptor is no longer leaked when a static request cannot be
+satisfied by any acceptable representation.  A share with compression
+configured answered "406 Not Acceptable" without closing the file it had
+opened, so a single unauthenticated request carrying
+"Accept-Encoding: identity;q=0, *;q=0" cost the router a descriptor, and
+repeating it exhausted the table.
+</para>
+</change>
+
 <change type="feature">
 <para>
 conditional requests for static files.  A "share" action now answers a GET
@@ -21,6 +32,19 @@ and "If-Unmodified-Since" are evaluated first and answer "412 Precondition
 Failed" when they do not hold.  Entity-tag comparison is weak for
 "If-None-Match" and strong for "If-Match", and "*" matches any
 representation, per RFC 9110.
+</para>
+</change>
+
+<change type="security">
+<para>
+a file descriptor is no longer leaked when a static request cannot be
+satisfied by any acceptable representation.  A share with compression
+configured answered "406 Not Acceptable" without closing the file it had
+opened, so a single unauthenticated request carrying
+"Accept-Encoding: identity;q=0, *;q=0" cost the router a descriptor, and
+repeating it exhausted the table, stopping every application behind that
+router.  Present since compression was added: 1.35.4, 1.35.5, 1.36.0 and
+1.36.1 are all affected.
 </para>
 </change>
 
