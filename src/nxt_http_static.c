@@ -167,6 +167,10 @@ static void nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_static_ctx_t *ctx);
 static void nxt_http_static_next(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_static_ctx_t *ctx, nxt_http_status_t status);
+static nxt_http_status_t nxt_http_static_preconditions(nxt_http_request_t *r,
+    nxt_str_t *etag, nxt_time_t mtime);
+static nxt_bool_t nxt_http_static_etag_match(nxt_str_t *list, nxt_str_t *etag,
+    nxt_bool_t strong);
 #if (NXT_HAVE_OPENAT2)
 static u_char *nxt_http_static_chroot_match(u_char *chr, u_char *shr);
 #endif
@@ -485,12 +489,12 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
     struct tm               tm;
     nxt_buf_t               *fb;
     nxt_int_t               ret;
-    nxt_str_t               *shr, *index, exten, *mtype;
+    nxt_str_t               *shr, *index, exten, *mtype, etag;
     nxt_uint_t              level;
     nxt_file_t              *f, file;
     nxt_file_info_t         fi;
     nxt_http_field_t        *field;
-    nxt_http_status_t       status;
+    nxt_http_status_t       status, pcond;
     nxt_router_conf_t       *rtcf;
     nxt_http_action_t       *action;
     nxt_work_handler_t      body_handler;
@@ -732,6 +736,35 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
                                           nxt_file_size(&fi))
                               - p;
 
+        etag.start = field->value;
+        etag.length = field->value_length;
+
+        pcond = nxt_http_static_preconditions(r, &etag, nxt_file_mtime(&fi));
+
+        if (pcond != NXT_HTTP_OK) {
+            nxt_file_close(task, f);
+            f = NULL;
+
+            if (pcond == NXT_HTTP_PRECONDITION_FAILED) {
+                nxt_http_request_error(task, r, pcond);
+                return;
+            }
+
+            /*
+             * A 304 carries the validators and nothing else.
+             * content_length_n is reset so no Content-Length is emitted, and
+             * no body handler is scheduled; the h1 framing already
+             * special-cases 304, so keep-alive survives and the response is
+             * never chunked (src/nxt_h1proto.c).
+             */
+            r->status = NXT_HTTP_NOT_MODIFIED;
+            r->resp.content_length_n = -1;
+
+            body_handler = NULL;
+
+            goto send;
+        }
+
         if (exten.start == NULL) {
             nxt_http_static_extract_extension(shr, &exten);
         }
@@ -878,6 +911,8 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         body_handler = NULL;
     }
 
+send:
+
     nxt_http_request_header_send(task, r, body_handler, NULL);
 
     r->state = &nxt_http_static_send_state;
@@ -890,6 +925,243 @@ fail:
     }
 
     nxt_http_request_error(task, r, NXT_HTTP_INTERNAL_SERVER_ERROR);
+}
+
+
+/*
+ * Conditional requests, RFC 9110 Sect. 13.2.2, evaluated in the order that
+ * section mandates: If-Match, then If-Unmodified-Since, then If-None-Match,
+ * then If-Modified-Since.  Returns NXT_HTTP_OK to serve the file normally,
+ * NXT_HTTP_NOT_MODIFIED for a 304, or NXT_HTTP_PRECONDITION_FAILED for a 412.
+ *
+ * The later step in each pair is consulted only when the earlier one is
+ * absent: a client that sends both an entity-tag and a date is asking to be
+ * judged by the entity-tag, even when the tag does not match.
+ */
+
+static nxt_http_status_t
+nxt_http_static_preconditions(nxt_http_request_t *r, nxt_str_t *etag,
+    nxt_time_t mtime)
+{
+    nxt_str_t               value;
+    nxt_time_t              date;
+    nxt_bool_t              im_seen, im_match, inm_seen, inm_match;
+    nxt_http_field_t        *f, *ium, *ims;
+    nxt_http_fields_iter_t  iter;
+
+    /*
+     * RFC 9110 Sect. 5.3: repeated field lines are equivalent to one line
+     * holding the comma-separated concatenation.  If-Match and If-None-Match
+     * are both "#entity-tag" lists whose members are OR'd, so evaluating
+     * every line and remembering whether ANY of them matched is exactly that
+     * concatenation -- whereas keeping only the last line seen would refuse a
+     * legitimate request with 412 when an earlier If-Match line matched.
+     */
+
+    im_seen = 0;
+    im_match = 0;
+    inm_seen = 0;
+    inm_match = 0;
+    ium = NULL;
+    ims = NULL;
+
+    /*
+     * Request headers land in r->inline_fields and only spill into the
+     * r->fields list, so a list-only walk silently sees nothing on an
+     * ordinary request.  Use the iterator that covers both
+     * (src/nxt_http_parse.h).
+     */
+
+    for (f = nxt_http_fields_first(&iter, r->inline_fields,
+                                   r->num_inline_fields, r->fields);
+         f != NULL;
+         f = nxt_http_fields_next(&iter))
+    {
+        if (f->skip) {
+            continue;
+        }
+
+        switch (f->name_length) {
+
+        case nxt_length("If-Match"):
+            if (nxt_strncasecmp(f->name, (u_char *) "If-Match",
+                                nxt_length("If-Match")) == 0)
+            {
+                im_seen = 1;
+
+                if (!im_match) {
+                    value.start = f->value;
+                    value.length = f->value_length;
+
+                    /* Sect. 13.1.1: If-Match compares strongly. */
+
+                    im_match = nxt_http_static_etag_match(&value, etag, 1);
+                }
+            }
+
+            break;
+
+        case nxt_length("If-None-Match"):
+            if (nxt_strncasecmp(f->name, (u_char *) "If-None-Match",
+                                nxt_length("If-None-Match")) == 0)
+            {
+                inm_seen = 1;
+
+                if (!inm_match) {
+                    value.start = f->value;
+                    value.length = f->value_length;
+
+                    inm_match = nxt_http_static_etag_match(&value, etag, 0);
+                }
+            }
+
+            break;
+
+        case nxt_length("If-Modified-Since"):
+            if (nxt_strncasecmp(f->name, (u_char *) "If-Modified-Since",
+                                nxt_length("If-Modified-Since")) == 0)
+            {
+                ims = f;
+            }
+
+            break;
+
+        case nxt_length("If-Unmodified-Since"):
+            if (nxt_strncasecmp(f->name, (u_char *) "If-Unmodified-Since",
+                                nxt_length("If-Unmodified-Since")) == 0)
+            {
+                ium = f;
+            }
+
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    if (im_seen) {
+        if (!im_match) {
+            return NXT_HTTP_PRECONDITION_FAILED;
+        }
+
+    } else if (ium != NULL) {
+        date = nxt_time_parse(ium->value, ium->value_length);
+
+        if (date != (nxt_time_t) -1 && mtime > date) {
+            return NXT_HTTP_PRECONDITION_FAILED;
+        }
+    }
+
+    if (inm_seen) {
+        if (inm_match) {
+            return NXT_HTTP_NOT_MODIFIED;
+        }
+
+        return NXT_HTTP_OK;
+    }
+
+    if (ims != NULL) {
+        date = nxt_time_parse(ims->value, ims->value_length);
+
+        /*
+         * An unparsable date is ignored rather than treated as an error.
+         * Sect. 13.1.3 makes "earlier than or equal to" the unmodified case;
+         * nginx offers an "exact" mode to survive a rollback to an older
+         * mtime, but the RFC comparison is what Unit implements.
+         */
+
+        if (date != (nxt_time_t) -1 && mtime <= date) {
+            return NXT_HTTP_NOT_MODIFIED;
+        }
+    }
+
+    return NXT_HTTP_OK;
+}
+
+
+/*
+ * Matches an entity-tag against an If-Match or If-None-Match list.
+ *
+ * Unit's own tags are always strong, so the comparison functions differ only
+ * in how they treat a weak tag on the client's side: under the strong
+ * function (Sect. 8.8.3.2) a W/-prefixed tag never matches, under the weak
+ * one the prefix is stripped and the opaque tags are compared.
+ *
+ * "*" matches any existing representation, but only as the entire field
+ * value -- the grammar is "*" / #entity-tag, so it is not a list member.
+ */
+
+static nxt_bool_t
+nxt_http_static_etag_match(nxt_str_t *list, nxt_str_t *etag, nxt_bool_t strong)
+{
+    u_char     *p, *end, *start;
+    nxt_bool_t  weak;
+    nxt_str_t   tag;
+
+    p = list->start;
+    end = p + list->length;
+
+    while (p < end && (*p == ' ' || *p == '\t')) {
+        p++;
+    }
+
+    if (end - p == 1 && *p == '*') {
+        return 1;
+    }
+
+    while (p < end) {
+
+        while (p < end && (*p == ' ' || *p == '\t' || *p == ',')) {
+            p++;
+        }
+
+        if (p == end) {
+            break;
+        }
+
+        weak = 0;
+
+        if (end - p >= 2 && p[0] == 'W' && p[1] == '/') {
+            weak = 1;
+            p += 2;
+        }
+
+        if (p == end || *p != '"') {
+            /* Not a valid entity-tag; skip to the next comma. */
+
+            while (p < end && *p != ',') {
+                p++;
+            }
+
+            continue;
+        }
+
+        start = p++;
+
+        while (p < end && *p != '"') {
+            p++;
+        }
+
+        if (p == end) {
+            break;
+        }
+
+        p++;
+
+        if (weak && strong) {
+            continue;
+        }
+
+        tag.start = start;
+        tag.length = p - start;
+
+        if (nxt_strstr_eq(&tag, etag)) {
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 

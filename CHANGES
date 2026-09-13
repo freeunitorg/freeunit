@@ -1,6 +1,17 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Feature: conditional requests for static files. A "share" action now
+       answers a GET or HEAD carrying "If-None-Match" or "If-Modified-Since"
+       with "304 Not Modified" when the file's validators still match, so a
+       client that already holds the file is no longer sent it again. Unit
+       emitted "ETag" and "Last-Modified" before, but ignored both when they
+       came back. Entity-tag comparison is weak and "*" matches any
+       representation; a present "If-None-Match" takes precedence over
+       "If-Modified-Since", per RFC 9110. "If-Match" and
+       "If-Unmodified-Since" are evaluated first and answer "412 Precondition
+       Failed" when they do not hold.
+
     *) Change: two source files that the build never used have been
        removed.  src/nxt_job_cache_file.c is named nowhere in auto/, so no
        configuration ever compiled it, and nothing in the tree referenced
