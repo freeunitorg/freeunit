@@ -25,7 +25,6 @@ NXT_LIB_SRCS=" \
     src/nxt_port.c \
     src/nxt_dyld.c \
     src/nxt_random.c \
-    src/nxt_queue.c \
     src/nxt_rbtree.c \
     src/nxt_mp.c \
     src/nxt_mem_zone.c \

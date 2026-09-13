@@ -209,6 +209,12 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        tools/unitc is unaffected: it still converts configuration to and
        from YAML, using yq.
 
+    *) Change: removed src/nxt_queue.c, the unused half of a queue utility
+       library carried over from nginx.  It defined nxt_queue_sort() and
+       nxt_queue_middle(), both exported but never called anywhere in the
+       tree; src/nxt_queue.h and the nxt_queue_* macros it provides are
+       unaffected and untouched.
+
 
 Changes with FreeUnit 1.36.1                                     28 Aug 2026
 
