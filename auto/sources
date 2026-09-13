@@ -193,6 +193,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_port_change_file_test.c \
     src/test/nxt_port_ctrunc_test.c \
     src/test/nxt_port_fd_test.c \
+    src/test/nxt_port_rpc_fd_test.c \
 "
 
 
