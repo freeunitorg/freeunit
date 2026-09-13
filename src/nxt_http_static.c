@@ -1286,11 +1286,29 @@ nxt_http_static_range_number(u_char **p, u_char *end)
 
     while (*p < end && **p >= '0' && **p <= '9') {
         /*
-         * Overflow is not a practical concern: a file size never approaches
-         * NXT_OFF_T_MAX, and a request cannot supply enough digits before
-         * hitting header-size limits to matter either way -- clamping below
-         * against "size" is what actually decides satisfiability.
+         * Saturate rather than wrap.  A wrapped value goes NEGATIVE, and a
+         * negative first-pos passes both the "a >= size" and "b < a" tests,
+         * so the range is accepted and "rest = file_end - file_pos" in
+         * nxt_http_static_body_handler() comes out negative: nxt_min() casts
+         * it to a huge size_t, the buffer allocation fails, and the request
+         * is abandoned with the file still open in r->out.  One header per
+         * leaked descriptor is an unauthenticated denial of service.
+         *
+         * Saturating is also what the RFC asks for at both ends: a first-pos
+         * of NXT_OFF_T_MAX is >= size, so Sect. 14.1.2 gives 416, while a
+         * suffix that large means "the whole representation".
          */
+
+        if (value > (NXT_OFF_T_MAX - (**p - '0')) / 10) {
+            value = NXT_OFF_T_MAX;
+
+            while (*p < end && **p >= '0' && **p <= '9') {
+                (*p)++;
+            }
+
+            return value;
+        }
+
         value = value * 10 + (*(*p)++ - '0');
     }
 
