@@ -96,6 +96,16 @@ observable changes.
 </para>
 </change>
 
+<change type="change">
+<para>
+the nxt_dyld wrapper around dlopen()/dlsym()/dlclose() has been removed.
+It shipped in the initial import and was never called: the language
+module loader in src/nxt_application.c calls dlopen() and dlsym() itself
+and never used this wrapper.  libnxt.a loses one object file; there are
+no other callers.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 do not exit when the capget() syscall is denied.  A syscall filter that
