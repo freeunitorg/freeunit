@@ -974,7 +974,7 @@ def test_static_conditional_duplicate_list_headers():
     # FIRST line must therefore count.
     etag = client.get(url='/index.html')['headers']['ETag']
 
-    # Currently fails: only the last If-None-Match line is consulted.
+    # Regression: only the last If-None-Match line used to be consulted.
     resp = _raw('/index.html', [f'If-None-Match: {etag}',
                                 'If-None-Match: "other"'])
     assert resp['status'] == 304, 'matching tag on the first INM line'
@@ -983,8 +983,8 @@ def test_static_conditional_duplicate_list_headers():
                                 f'If-None-Match: {etag}'])
     assert resp['status'] == 304, 'matching tag on the last INM line'
 
-    # Currently fails: only the last If-Match line is consulted, so the
-    # matching tag on the first line is lost and the request is refused.
+    # Regression: only the last If-Match line used to be consulted, so a
+    # matching tag on the first line was lost and the request was refused.
     resp = _raw('/index.html', [f'If-Match: {etag}', 'If-Match: "other"'])
     assert resp['status'] == 200, 'matching tag on the first IM line'
     assert resp['body'] == '0123456789'
@@ -1656,9 +1656,9 @@ def test_static_range_numeric_overflow():
     for first in firsts:
         for value in [f'bytes={first}-', f'bytes={first}-{first}']:
             resp = range_get(Range=value)
-            # Currently fails for the sign-flipping magnitudes: the wrapped
-            # negative first-pos passes "a >= size" and is served as a 206
-            # with a negative Content-Range start.
+            # Regression: a wrapped negative first-pos used to pass the
+            # "a >= size" test and be served as a 206 with a negative
+            # Content-Range start, leaking the open file descriptor.
             assert resp['status'] != 206, (
                 f'{value[:60]!r}: 206 {resp["headers"].get("Content-Range")}'
             )
