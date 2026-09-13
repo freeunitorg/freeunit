@@ -1,6 +1,21 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Feature: byte-range requests for static files. A "share" action now
+       answers a satisfiable single-range "Range: bytes=..." request with
+       "206 Partial Content" and a matching "Content-Range", and an
+       unsatisfiable one with "416 Range Not Satisfiable"; "Accept-Ranges:
+       bytes" is now sent on a plain 200 as well. The three single-range
+       forms are supported -- "A-B", "A-" and the suffix form "-N" -- with
+       the end clamped to the last byte of the file; a multi-range request
+       is ignored and answered with the full 200, as RFC 9110 permits.
+       "If-Range" is honoured against the file's entity-tag (strong
+       comparison) or its "Last-Modified" date, falling back to the full
+       200 on a mismatch. Preconditions (RFC 9110 Sect. 13.2.2) are still
+       evaluated first, so a 304 or 412 outcome wins over any Range. A
+       response served from a Range is not content-coded; compression
+       still applies to a full 200.
+
     *) Feature: conditional requests for static files. A "share" action now
        answers a GET or HEAD carrying "If-None-Match" or "If-Modified-Since"
        with "304 Not Modified" when the file's validators still match, so a

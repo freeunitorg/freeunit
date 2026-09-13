@@ -127,21 +127,127 @@ def test_static_etag(temp_dir):
     assert etag != client.get(url='/')['headers']['ETag'], 'new ETag'
 
 
-def test_static_range_ignored():
-    # Unit does not implement byte-range requests for static files. Per
-    # RFC 7233 a server that does not support Range MUST ignore it and
-    # return the full 200 representation -- never a malformed 206.
-    resp = client.get(
+def test_static_accept_ranges():
+    resp = client.get(url='/index.html')
+    assert resp['status'] == 200, 'plain 200'
+    assert resp['headers']['Accept-Ranges'] == 'bytes', 'Accept-Ranges on 200'
+
+
+def range_get(**headers):
+    return client.get(
         url='/index.html',
-        headers={
-            'Host': 'localhost',
-            'Range': 'bytes=0-4',
-            'Connection': 'close',
-        },
+        headers={'Host': 'localhost', 'Connection': 'close', **headers},
     )
-    assert resp['status'] == 200, 'range ignored -> full 200'
-    assert resp['body'] == '0123456789', 'full body returned'
+
+
+def test_static_range_satisfiable():
+    # index.html is the 10-byte "0123456789".
+    resp = range_get(Range='bytes=0-4')
+    assert resp['status'] == 206, '0-4 is 206'
+    assert resp['body'] == '01234', '0-4 body slice'
+    assert resp['headers']['Content-Range'] == 'bytes 0-4/10'
+    assert resp['headers']['Content-Length'] == '5'
+    assert resp['headers']['Accept-Ranges'] == 'bytes'
+
+    resp = range_get(Range='bytes=5-')
+    assert resp['status'] == 206, '5- is 206'
+    assert resp['body'] == '56789', '5- body slice'
+    assert resp['headers']['Content-Range'] == 'bytes 5-9/10'
+
+    resp = range_get(Range='bytes=-5')
+    assert resp['status'] == 206, '-5 is 206'
+    assert resp['body'] == '56789', '-5 (suffix) body slice'
+    assert resp['headers']['Content-Range'] == 'bytes 5-9/10'
+
+    # "0-" (whole file) is a valid, satisfiable single range -> 206.
+    resp = range_get(Range='bytes=0-')
+    assert resp['status'] == 206, '0- is 206'
+    assert resp['body'] == '0123456789', '0- body is the whole file'
+    assert resp['headers']['Content-Range'] == 'bytes 0-9/10'
+
+    # Past EOF but still satisfiable: the end clamps to the last byte.
+    resp = range_get(Range='bytes=5-9999')
+    assert resp['status'] == 206, '5-9999 clamps and is 206'
+    assert resp['body'] == '56789', '5-9999 body slice'
+    assert resp['headers']['Content-Range'] == 'bytes 5-9/10'
+
+
+def test_static_range_unsatisfiable():
+    resp = range_get(Range='bytes=10-')
+    assert resp['status'] == 416, 'start at EOF is 416'
+    assert resp['body'] == '', 'no body on 416'
+    assert resp['headers']['Content-Range'] == 'bytes */10'
+
+    # "-0" (a zero-length suffix) is unsatisfiable, unlike "0-".
+    resp = range_get(Range='bytes=-0')
+    assert resp['status'] == 416, '-0 is unsatisfiable'
+    assert resp['headers']['Content-Range'] == 'bytes */10'
+
+
+def test_static_range_malformed():
+    for value in ['bytes=abc', 'bytes=', 'bytes=5-1', 'notbytes=0-4']:
+        resp = range_get(Range=value)
+        assert resp['status'] == 200, f'malformed {value!r} -> full 200'
+        assert resp['body'] == '0123456789', f'full body for {value!r}'
+        assert 'Content-Range' not in resp['headers'], f'no Content-Range for {value!r}'
+
+
+def test_static_range_multi_ignored():
+    # A server may legally ignore a multi-range request; only single ranges
+    # are implemented, so this must fall back to a full 200.
+    resp = range_get(Range='bytes=0-4,5-9')
+    assert resp['status'] == 200, 'multi-range falls back to 200'
+    assert resp['body'] == '0123456789', 'full body'
     assert 'Content-Range' not in resp['headers'], 'no Content-Range'
+
+
+def test_static_range_if_range():
+    r = client.get(url='/index.html')
+    etag = r['headers']['ETag']
+    last_modified = r['headers']['Last-Modified']
+
+    # Matching tag: apply the range.
+    resp = range_get(Range='bytes=0-4', **{'If-Range': etag})
+    assert resp['status'] == 206, 'If-Range matching tag applies range'
+    assert resp['body'] == '01234'
+
+    # Non-matching tag: ignore Range, serve full 200.
+    resp = range_get(Range='bytes=0-4', **{'If-Range': '"nope"'})
+    assert resp['status'] == 200, 'If-Range mismatched tag ignores range'
+    assert resp['body'] == '0123456789'
+
+    # Matching date: apply the range.
+    resp = range_get(Range='bytes=0-4', **{'If-Range': last_modified})
+    assert resp['status'] == 206, 'If-Range matching date applies range'
+    assert resp['body'] == '01234'
+
+    # Non-matching (older) date: ignore Range, serve full 200.
+    resp = range_get(
+        Range='bytes=0-4',
+        **{'If-Range': 'Thu, 01 Jan 2000 00:00:00 GMT'},
+    )
+    assert resp['status'] == 200, 'If-Range mismatched date ignores range'
+    assert resp['body'] == '0123456789'
+
+    # If-Range without Range is meaningless and must not affect the result.
+    resp = range_get(**{'If-Range': etag})
+    assert resp['status'] == 200, 'If-Range without Range is a no-op'
+    assert resp['body'] == '0123456789'
+
+
+def test_static_range_conditional_wins():
+    etag = client.get(url='/index.html')['headers']['ETag']
+
+    # RFC 9110 Sect. 13.2.2: preconditions are evaluated before Range is
+    # considered at all -- a 304 (or 412) must win over a Range request.
+    resp = range_get(Range='bytes=0-4', **{'If-None-Match': etag})
+    assert resp['status'] == 304, '304 wins over Range'
+    assert resp['body'] == '', 'no body on 304'
+    assert 'Content-Range' not in resp['headers'], 'no Content-Range on 304'
+
+    resp = range_get(Range='bytes=0-4', **{'If-Match': '"nope"'})
+    assert resp['status'] == 412, '412 wins over Range'
+    assert 'Content-Range' not in resp['headers'], 'no Content-Range on 412'
 
 
 def test_static_conditional_etag():
