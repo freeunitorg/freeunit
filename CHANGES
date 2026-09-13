@@ -1,6 +1,15 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Bugfix: a static response that was subject to content negotiation now
+       carries "Vary: Accept-Encoding". Without it a shared cache could store
+       whichever representation it saw first and serve it to every client --
+       gzip bytes to one that cannot decode them, or the uncompressed copy to
+       one that could have had the small version. The header is sent on the
+       identity response as well as the compressed one, since the identity
+       response is the one a cache must not reuse for a client that accepts
+       gzip.
+
     *) Feature: byte-range requests for static files. A "share" action now
        answers a satisfiable single-range "Range: bytes=..." request with
        "206 Partial Content" and a matching "Content-Range", and an

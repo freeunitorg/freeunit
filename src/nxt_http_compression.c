@@ -604,6 +604,63 @@ nxt_http_comp_is_resp_content_encoded(const nxt_http_request_t *r)
 
 
 /*
+ * Adds "Vary: Accept-Encoding", so a shared cache keys on the header that
+ * chose this representation.
+ *
+ * RFC 9110 Sect. 12.5.5: a response that was subject to proactive negotiation
+ * must say which request headers it varied on, or a cache is entitled to
+ * serve it to a client that would have been given a different representation
+ * -- gzip bytes to a client that cannot decode them, or identity to one that
+ * could have had the small copy.
+ *
+ * Emitted on the identity response as well as the coded one.  The identity
+ * response is precisely the one a cache must not reuse for a gzip-capable
+ * client, so omitting it there would leave the hole open from the other side.
+ *
+ * This is the companion of weakening the entity-tag for a coded
+ * representation: that makes revalidation distinguish the two, this makes the
+ * cache key distinguish them.  Either alone leaves shared caches able to mix
+ * them.
+ */
+
+static nxt_int_t
+nxt_http_comp_set_vary(nxt_http_request_t *r)
+{
+    nxt_http_field_t        *f;
+    nxt_http_fields_iter_t  iter;
+
+    static const nxt_str_t  accept_encoding = nxt_string("Accept-Encoding");
+
+    /* A Vary set by response_headers or another producer is left alone. */
+
+    for (f = nxt_http_fields_first(&iter, r->resp.inline_fields,
+                                   r->resp.num_inline_fields, r->resp.fields);
+         f != NULL;
+         f = nxt_http_fields_next(&iter))
+    {
+        if (!f->skip && f->name_length == nxt_length("Vary")
+            && nxt_strncasecmp(f->name, (u_char *) "Vary",
+                               nxt_length("Vary")) == 0)
+        {
+            return NXT_OK;
+        }
+    }
+
+    f = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+    if (nxt_slow_path(f == NULL)) {
+        return NXT_ERROR;
+    }
+
+    nxt_http_field_name_set(f, "Vary");
+
+    f->value = accept_encoding.start;
+    f->value_length = accept_encoding.length;
+
+    return NXT_OK;
+}
+
+
+/*
  * Decides whether an acceptable representation exists, and remembers which
  * compressor would be used, without touching the response or allocating a
  * compressor context.
@@ -663,6 +720,15 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
 
     if (nxt_http_comp_is_resp_content_encoded(r)) {
         return NXT_OK;
+    }
+
+    /*
+     * Past every early return above, so this response really was subject to
+     * negotiation on Accept-Encoding, whichever coding is chosen below.
+     */
+
+    if (nxt_slow_path(nxt_http_comp_set_vary(r) != NXT_OK)) {
+        return NXT_ERROR;
     }
 
     ret = nxt_tstr_query_init(&r->tstr_query, rtcf->tstr_state, &r->tstr_cache,

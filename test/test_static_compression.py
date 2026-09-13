@@ -100,3 +100,32 @@ def test_static_compression_304_carries_no_encoding():
     assert resp['body'] == '', 'no body'
     assert 'Content-Encoding' not in resp['headers'], 'no Content-Encoding'
     assert 'Content-Length' not in resp['headers'], 'no Content-Length'
+
+
+def test_static_compression_vary():
+    # RFC 9110 Sect. 12.5.5: a response subject to proactive negotiation must
+    # say what it varied on, or a shared cache may serve gzip bytes to a
+    # client that cannot decode them.  This is the companion of the weak
+    # entity-tag: that makes revalidation distinguish the codings, this makes
+    # the cache key distinguish them.
+    def get(**headers):
+        return client.get(
+            url='/big.css',
+            headers={'Host': 'localhost', 'Connection': 'close', **headers},
+        )
+
+    resp = get(**{'Accept-Encoding': 'gzip'})
+    assert resp['status'] == 200
+    assert resp['headers']['Content-Encoding'] == 'gzip', 'compressed'
+    assert (
+        resp['headers']['Vary'] == 'Accept-Encoding'
+    ), 'Vary on the coded response'
+
+    # The identity response is the one a cache must not reuse for a
+    # gzip-capable client, so it needs the header just as much.
+    resp = get()
+    assert resp['status'] == 200
+    assert 'Content-Encoding' not in resp['headers'], 'not compressed'
+    assert (
+        resp['headers']['Vary'] == 'Accept-Encoding'
+    ), 'Vary on the identity response too'

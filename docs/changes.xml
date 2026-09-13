@@ -36,6 +36,18 @@ representation, per RFC 9110.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a static response that was subject to content negotiation now carries
+"Vary: Accept-Encoding".  Without it a shared cache could store whichever
+representation it saw first and serve it to every client -- gzip bytes to one
+that cannot decode them, or the uncompressed copy to one that could have had
+the small version.  The header is sent on the identity response as well as
+the compressed one, since the identity response is the one a cache must not
+reuse for a client that accepts gzip.
+</para>
+</change>
+
 <change type="change">
 <para>
 a content-coded response now carries a weak entity-tag, so "If-Range" cannot
