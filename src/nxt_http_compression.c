@@ -626,12 +626,22 @@ nxt_http_comp_is_resp_content_encoded(const nxt_http_request_t *r)
 static nxt_int_t
 nxt_http_comp_set_vary(nxt_http_request_t *r)
 {
-    nxt_http_field_t        *f;
+    u_char                  *p, *end, *tok;
+    nxt_int_t               len;
+    nxt_http_field_t        *f, *vary;
     nxt_http_fields_iter_t  iter;
 
     static const nxt_str_t  accept_encoding = nxt_string("Accept-Encoding");
 
-    /* A Vary set by response_headers or another producer is left alone. */
+    /*
+     * An existing Vary is merged into, not replaced and not deferred to.
+     * Something else naming a different header -- "Vary: Origin", say --
+     * still needs Accept-Encoding added, because the response varies on both;
+     * treating any existing Vary as sufficient would leave the coding out of
+     * the cache key, which is the hole this function exists to close.
+     */
+
+    vary = NULL;
 
     for (f = nxt_http_fields_first(&iter, r->resp.inline_fields,
                                    r->resp.num_inline_fields, r->resp.fields);
@@ -642,8 +652,68 @@ nxt_http_comp_set_vary(nxt_http_request_t *r)
             && nxt_strncasecmp(f->name, (u_char *) "Vary",
                                nxt_length("Vary")) == 0)
         {
+            vary = f;
+            break;
+        }
+    }
+
+    if (vary != NULL) {
+        p = vary->value;
+        end = p + vary->value_length;
+
+        /* "Vary: *" already varies on everything; adding to it says less. */
+
+        while (p < end && (*p == ' ' || *p == '\t')) {
+            p++;
+        }
+
+        if (end - p == 1 && *p == '*') {
             return NXT_OK;
         }
+
+        /* Already listed?  Compare per token, so "X-Accept-Encoding" misses. */
+
+        for (p = vary->value; p < end; p++) {
+            while (p < end && (*p == ' ' || *p == '\t' || *p == ',')) {
+                p++;
+            }
+
+            tok = p;
+
+            while (p < end && *p != ',') {
+                p++;
+            }
+
+            len = p - tok;
+
+            while (len > 0 && (tok[len - 1] == ' ' || tok[len - 1] == '\t')) {
+                len--;
+            }
+
+            if (len == (nxt_int_t) accept_encoding.length
+                && nxt_strncasecmp(tok, accept_encoding.start,
+                                   accept_encoding.length) == 0)
+            {
+                return NXT_OK;
+            }
+        }
+
+        len = vary->value_length + nxt_length(", ") + accept_encoding.length;
+
+        p = nxt_mp_nget(r->mem_pool, len);
+        if (nxt_slow_path(p == NULL)) {
+            return NXT_ERROR;
+        }
+
+        nxt_memcpy(p, vary->value, vary->value_length);
+        nxt_memcpy(p + vary->value_length, ", ", nxt_length(", "));
+        nxt_memcpy(p + vary->value_length + nxt_length(", "),
+                   accept_encoding.start, accept_encoding.length);
+
+        vary->value = p;
+        vary->value_length = len;
+
+        return NXT_OK;
     }
 
     f = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
