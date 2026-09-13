@@ -1425,7 +1425,13 @@ nxt_http_static_range(nxt_http_request_t *r, nxt_str_t *etag,
             return NXT_HTTP_OK;
         }
 
-        if (suffix == 0) {
+        /*
+         * A suffix range is unsatisfiable when it asks for nothing, and also
+         * against a zero-length representation: "size - suffix" would clamp
+         * to 0 while "size - 1" is -1, yielding "Content-Range: bytes 0--1/0".
+         */
+
+        if (suffix == 0 || size == 0) {
             return NXT_HTTP_RANGE_NOT_SATISFIABLE;
         }
 

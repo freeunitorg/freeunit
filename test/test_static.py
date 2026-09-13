@@ -184,6 +184,31 @@ def test_static_range_unsatisfiable():
     assert resp['headers']['Content-Range'] == 'bytes */10'
 
 
+def test_static_range_empty_file(temp_dir):
+    # RFC 9110 Sect. 14.4: no range is satisfiable against a zero-length
+    # representation.  The suffix form is the trap: "size - suffix" clamps to
+    # 0 while "size - 1" is -1, which produced a 206 carrying the malformed
+    # "Content-Range: bytes 0--1/0".
+    Path(f'{temp_dir}/assets/empty.txt').write_text('', encoding='utf-8')
+
+    def get(**headers):
+        return client.get(
+            url='/empty.txt',
+            headers={'Host': 'localhost', 'Connection': 'close', **headers},
+        )
+
+    for value in ['bytes=-5', 'bytes=0-', 'bytes=0-4']:
+        resp = get(**{'Range': value})
+        assert resp['status'] == 416, f'416 for {value} on an empty file'
+        assert (
+            resp['headers']['Content-Range'] == 'bytes */0'
+        ), f'unsatisfiable Content-Range for {value}'
+
+    resp = get()
+    assert resp['status'] == 200, 'no Range still serves the empty file'
+    assert resp['body'] == '', 'empty body'
+
+
 def test_static_range_malformed():
     for value in ['bytes=abc', 'bytes=', 'bytes=5-1', 'notbytes=0-4']:
         resp = range_get(Range=value)
