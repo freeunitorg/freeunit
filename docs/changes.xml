@@ -10,6 +10,20 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="feature">
+<para>
+conditional requests for static files.  A "share" action now answers a GET
+or HEAD carrying "If-None-Match" or "If-Modified-Since" with "304 Not
+Modified" when the file's validators still match, so a client that already
+holds the file is not sent it again.  Unit emitted "ETag" and
+"Last-Modified" before, but ignored both when they came back.  "If-Match"
+and "If-Unmodified-Since" are evaluated first and answer "412 Precondition
+Failed" when they do not hold.  Entity-tag comparison is weak for
+"If-None-Match" and strong for "If-Match", and "*" matches any
+representation, per RFC 9110.
+</para>
+</change>
+
 <change type="security">
 <para>
 a file descriptor sent to a port is no longer leaked when the message is
