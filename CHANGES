@@ -1,6 +1,8 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Change: upgrade contrib njs to 1.0.1.
+
     *) Bugfix: a static response that was subject to content negotiation now
        carries "Vary: Accept-Encoding". Without it a shared cache could store
        whichever representation it saw first and serve it to every client --
