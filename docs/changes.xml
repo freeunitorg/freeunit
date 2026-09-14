@@ -333,9 +333,8 @@ unitctl sends a JSON configuration file as it was written.  It parsed the file
 and re-serialized it before, which kept the last of two object members with the
 same name and re-spelled numbers, so the server never saw what the operator
 wrote.  Unit now reports the duplicate itself, with the line and column of the
-file.  JSON5 input is still parsed, because it is not JSON.  A file that is not
-valid UTF-8 is no longer refused by unitctl; Unit refuses it and names the
-member.  The "edit" command no longer accepts JSON5 comments in the temporary
+file.  A file that is not valid UTF-8 is no longer refused by unitctl; Unit
+refuses it and names the member.  The "edit" command no longer accepts JSON5 comments in the temporary
 file.
 </para>
 </change>
@@ -352,6 +351,16 @@ error instead of a clean "unsupported".  CyaSSL was renamed wolfSSL and
 PolarSSL became mbedTLS, both in 2015, so the flags also target products
 that no longer exist under these names.  The OpenSSL backend is
 unaffected; none of these files were ever part of a default build.
+</para>
+</change>
+
+<change type="change">
+<para>
+unitctl no longer reads JSON5.  A ".json5" file is refused by name, with a
+message saying to convert it first; "json5 -o config.json config.json5" does
+that, and "jq" reformats ordinary JSON.  Nothing parsed JSON5 after the
+configuration upload path stopped parsing its input, so this removes a parser
+that only the refusal path still reached, and two crates with it.
 </para>
 </change>
 

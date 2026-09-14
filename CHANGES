@@ -40,10 +40,16 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        parsed the file and re-serialized it before, which kept the last of two
        object members with the same name and re-spelled numbers, so the server
        never saw what the operator wrote.  Unit now reports the duplicate
-       itself, with the line and column of the file.  JSON5 input is still
-       parsed, because it is not JSON.  A file that is not valid UTF-8 is no
-       longer refused by unitctl; Unit refuses it and names the member.  The
+       itself, with the line and column of the file.  A file that is not
+       valid UTF-8 is no longer refused by unitctl; Unit refuses it and names
+       the member.  The
        "edit" command no longer accepts JSON5 comments in the temporary file.
+    *) Change: unitctl no longer reads JSON5.  A ".json5" file is refused by
+       name, with a message saying to convert it first; "json5 -o config.json
+       config.json5" does that, and "jq" reformats ordinary JSON.  Nothing
+       parsed JSON5 after the configuration upload path stopped parsing its
+       input, so this removes a parser that only the refusal path still
+       reached, and two crates with it.
 
     *) Feature: conditional requests for static files. A "share" action now
        answers a GET or HEAD carrying "If-None-Match" or "If-Modified-Since"
