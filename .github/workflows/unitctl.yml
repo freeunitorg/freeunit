@@ -6,6 +6,9 @@ on:
     paths:
       - tools/unitctl/**
       - docs/unit-openapi.yaml
+      # A change to this file must run this file.  Without it a pull request
+      # that only edits the workflow is never checked by it.
+      - .github/workflows/unitctl.yml
   push:
     branches:
       - master
@@ -111,6 +114,99 @@ jobs:
       # so the job would pass while an advisory is open.
       - name: Audit Cargo.lock
         run: cargo audit --deny warnings
+
+  musl:
+    # The only leg that compiles unitctl without the "tls" feature.  The
+    # feature-off code -- the #[cfg(not(feature = "tls"))] blocks and the test
+    # that an "https://" control socket is refused -- is built nowhere else, so
+    # without this job it can break and no run would say so.
+    #
+    # The musl target is also the one shipped without TLS, because TLS is what
+    # pulls in aws-lc-sys and its C toolchain.
+    #
+    # What this job does not cover: every runner has a gnu host, so a musl
+    # *host* -- "make release" on Alpine -- is not built here.  The make rule
+    # for that host is checked below instead, which is the part that can be
+    # checked without a musl runner.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: tools/unitctl
+    steps:
+      - uses: actions/checkout@v5
+
+      - run: rustup update stable
+      - run: rustup target add x86_64-unknown-linux-musl
+
+      # The build needs the generated OpenAPI client, which is produced by a
+      # Java tool.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # The GNUmakefile drops the default features for a musl target, so this
+      # is the feature-off build.
+      - name: Make unitctl (x86_64-unknown-linux-musl)
+        run: make x86_64-unknown-linux-musl
+
+      # Assert on the binary, not on the build log.  Without TLS there is no
+      # aws-lc-sys, so the binary carries no aws_lc symbol.  The symbol count is
+      # checked first, because a stripped binary would make the aws_lc test pass
+      # while proving nothing.
+      #
+      # A program that links a C library needs an interpreter to load it, so the
+      # absence of a PT_INTERP segment is what says none was linked.  readelf
+      # names the segment; "file" would say "static-pie linked", which is that
+      # tool's wording and changes with the runner image.
+      - name: Check the binary carries no TLS stack
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/unitctl
+          file "$bin"
+          test "$(nm "$bin" | wc -l)" -gt 1000
+          ! nm "$bin" | grep -q aws_lc
+          ! readelf -lW "$bin" | grep -q INTERP
+
+      # The claim behind the musl build is that TLS is the only thing needing a
+      # C toolchain.  This runner has cc and cmake, so the job cannot show that
+      # a build works without them.  What it can show is that no crate which
+      # would use them is in the feature-off graph.  The line count guards
+      # against an empty tree passing the grep.
+      - name: Check no C-building crate is in the graph
+        run: |
+          tree=$(cargo tree --no-default-features \
+            --target x86_64-unknown-linux-musl --edges normal,build)
+          test "$(echo "$tree" | wc -l)" -gt 50
+          ! echo "$tree" | grep -E '(^|[^a-z-])(cc|cmake|aws-lc-sys) v'
+
+      # Run the host tests in the same feature state, so the feature-off
+      # branches are executed and not merely compiled.
+      - name: Test without the tls feature
+        run: cargo test --no-default-features
+
+      # The step above stays green if the refusal test is deleted or marked
+      # #[ignore].  Name the test and require that one test ran: a filter that
+      # matches nothing also reports "ok", with "0 passed".
+      - name: Check the https refusal test ran
+        run: |
+          cargo test --no-default-features -p unit-client-rs \
+            control_socket_address::tests::refuses_https_without_the_tls_feature \
+            -- --exact | tee result.log
+          grep -q 'test result: ok. 1 passed' result.log
+          rm result.log
+
+      # A native build on a musl host takes the same feature flag, by a
+      # different rule (GNUmakefile HOST_TARGET).  No runner has a musl host,
+      # so ask make what it would run.  Both directions are checked: a rule
+      # that always passed the flag would break every gnu build.
+      - name: Check the native musl build drops the feature too
+        run: |
+          make -n release HOST_TARGET=x86_64-unknown-linux-musl \
+            | grep -q -- '--no-default-features'
+          ! make -n release HOST_TARGET=x86_64-unknown-linux-gnu \
+            | grep -q -- '--no-default-features'
 
   build:
     # The weekly trigger exists for the audit job alone.
