@@ -435,10 +435,39 @@ nxt_http_comp_identity_refused(void)
 }
 
 
+/*
+ * Finds the ";q=" weight parameter in one Accept-Encoding element.
+ *
+ * RFC 9110 Sect. 12.4.2 spells the parameter "weight = OWS ';' OWS ('q' /
+ * 'Q') '=' qvalue", and an ABNF literal is case-insensitive besides, so
+ * "identity;Q=0" is as valid as "identity;q=0".  A plain strstr() for ";q="
+ * misses it, and for identity that means missing a refusal.  Spaces are
+ * already gone by the time this runs.
+ */
+
+static char *
+nxt_http_comp_find_weight(char *tkn)
+{
+    for (char *p = tkn; (p = strchr(p, ';')) != NULL; p++) {
+        if ((p[1] == 'q' || p[1] == 'Q') && p[2] == '=') {
+            return p;
+        }
+    }
+
+    return NULL;
+}
+
+
 static nxt_uint_t
 nxt_http_comp_compressor_lookup_enabled(const nxt_str_t *token)
 {
-    if (token->start[0] == '*') {
+    /*
+     * The wildcard is the whole token, not merely its first character:
+     * "*" is a tchar, so "*foo" is a legal (and unknown) coding name, and
+     * matching on the first byte alone made it stand for every coding.
+     */
+
+    if (token->length == 1 && token->start[0] == '*') {
         return NXT_HTTP_COMP_SCHEME_IDENTITY;
     }
 
@@ -524,7 +553,7 @@ nxt_http_comp_select_compressor(nxt_http_request_t *r, const nxt_str_t *token,
         nxt_uint_t              ecidx;
         nxt_http_comp_scheme_t  scheme;
 
-        qptr = strstr(tkn, ";q=");
+        qptr = nxt_http_comp_find_weight(tkn);
         if (qptr != NULL) {
             nxt_errno = 0;
 
