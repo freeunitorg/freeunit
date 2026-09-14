@@ -315,6 +315,16 @@ deleted the file as part of an unrelated cleanup.
 </para>
 </change>
 
+<change type="change">
+<para>
+the entity-tag and last-modified date of a static file are now weak while
+the request falls inside the second the file was last written, because a
+rewrite to the same size during that second changes neither validator.
+If-Match and If-Range stop matching in that window; the tag keeps its
+format, so nothing already cached is invalidated.
+</para>
+</change>
+
 </changes>
 
 

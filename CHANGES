@@ -237,6 +237,17 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        same conclusion and deleted the file as part of an unrelated
        cleanup.
 
+    *) Change: the entity-tag and last-modified date of a static file are
+       now weak while the request falls inside the second the file was
+       last written.  Both are derived from the whole-second modification
+       time and the size, so a rewrite to the same size during that second
+       changes neither, and RFC 9110 Sect. 8.8.1 reserves a strong
+       validator for one that cannot miss a change.  "If-Match" and
+       "If-Range" stop matching inside that window, so a range request
+       there is answered with the full 200 rather than a slice keyed to a
+       validator Unit cannot vouch for.  The tag keeps its format, so
+       nothing already held in a cache is invalidated.
+
 
 Changes with FreeUnit 1.36.1                                     28 Aug 2026
 
