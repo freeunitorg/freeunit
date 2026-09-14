@@ -628,6 +628,7 @@ nxt_http_comp_set_vary(nxt_http_request_t *r)
 {
     u_char                  *p, *end, *tok;
     nxt_int_t               len;
+    size_t                  keep;
     nxt_http_field_t        *f, *vary;
     nxt_http_fields_iter_t  iter;
 
@@ -683,11 +684,34 @@ nxt_http_comp_set_vary(nxt_http_request_t *r)
             return NXT_OK;
         }
 
-        /* Already listed?  Compare per token, so "X-Accept-Encoding" misses. */
+        /*
+         * An empty value carries no tokens, so there is nothing to append to
+         * and nothing to search: replacing it avoids emitting ", A-E" with a
+         * leading comma.  RFC 9110 Sect. 5.6.1.2 permits the empty element,
+         * but there is no reason to produce one.
+         */
 
         end = vary->value + vary->value_length;
 
-        for (p = vary->value; p < end; p++) {
+        if (end == vary->value) {
+            vary->value = accept_encoding.start;
+            vary->value_length = accept_encoding.length;
+
+            return NXT_OK;
+        }
+
+        /*
+         * Already listed?  Compare per token, so "X-Accept-Encoding" misses.
+         *
+         * A while loop rather than a for with p++: the inner scan can leave p
+         * at end, and incrementing there would form a pointer past
+         * one-past-the-end, which C does not define even where it is
+         * harmless in practice.
+         */
+
+        p = vary->value;
+
+        while (p < end) {
             while (p < end && (*p == ' ' || *p == '\t' || *p == ',')) {
                 p++;
             }
@@ -710,18 +734,39 @@ nxt_http_comp_set_vary(nxt_http_request_t *r)
             {
                 return NXT_OK;
             }
+
+            if (p < end) {
+                p++;
+            }
         }
 
-        len = vary->value_length + nxt_length(", ") + accept_encoding.length;
+        /*
+         * Append after the last real token, not after whatever the value
+         * happens to end with: "Origin," would otherwise become
+         * "Origin,, Accept-Encoding".  Empty list elements are legal and
+         * ignored (Sect. 5.6.1.2), but there is no reason to emit one.
+         */
+
+        keep = vary->value_length;
+
+        while (keep > 0
+               && (vary->value[keep - 1] == ' '
+                   || vary->value[keep - 1] == '\t'
+                   || vary->value[keep - 1] == ','))
+        {
+            keep--;
+        }
+
+        len = keep + nxt_length(", ") + accept_encoding.length;
 
         p = nxt_mp_nget(r->mem_pool, len);
         if (nxt_slow_path(p == NULL)) {
             return NXT_ERROR;
         }
 
-        nxt_memcpy(p, vary->value, vary->value_length);
-        nxt_memcpy(p + vary->value_length, ", ", nxt_length(", "));
-        nxt_memcpy(p + vary->value_length + nxt_length(", "),
+        nxt_memcpy(p, vary->value, keep);
+        nxt_memcpy(p + keep, ", ", nxt_length(", "));
+        nxt_memcpy(p + keep + nxt_length(", "),
                    accept_encoding.start, accept_encoding.length);
 
         vary->value = p;
