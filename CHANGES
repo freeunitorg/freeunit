@@ -23,6 +23,14 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        is not valid UTF-8 with U+FFFD before it serializes.
 
     *) Change: upgrade contrib njs to 1.0.1.
+    *) Bugfix: a process could stop hearing from a peer for good. When the
+       wake-up that tells a peer to read the shared queue failed because
+       the kernel could not allocate for it, the port treated the peer as
+       dead: the wake-up was dropped and, since a later message raises one
+       only when the queue was empty, no later message on that port raised
+       one either. The wake-up is now kept and retried, and the retry no
+       longer waits for a socket event that a socket that never filled up
+       will not deliver (#392).
 
     *) Security: a port message that was queued because the peer's socket was
        not writable borrowed the descriptors it carried -- for NEW_PORT,
