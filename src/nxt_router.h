@@ -28,6 +28,14 @@ typedef struct nxt_http_comp_conf_s            nxt_http_comp_conf_t;
 
 #define NXT_HTTP_ACTION_ERROR  ((nxt_http_action_t *) -1)
 
+/*
+ * The id of an application's shared port: the one whose queue every worker of
+ * the application reads, as opposed to a single worker's own port.  A request
+ * message still sitting in that queue can be retracted; one sent to a worker
+ * port cannot.
+ */
+#define NXT_SHARED_PORT_ID  0xFFFFu
+
 
 typedef struct {
     nxt_thread_spinlock_t    lock;
@@ -367,6 +375,9 @@ void nxt_router_test_detached_handler(nxt_task_t *task,
 nxt_router_temp_conf_t *nxt_router_test_temp_conf(nxt_task_t *task);
 void nxt_router_test_app_rpc_create(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf, nxt_app_t *app);
+
+/* The request deadline handler, for the app-timeout test. */
+void nxt_router_test_app_timeout(nxt_task_t *task, void *obj, void *data);
 #endif
 
 

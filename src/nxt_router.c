@@ -23,8 +23,6 @@
 #include <nxt_port_queue.h>
 #include <nxt_http_compression.h>
 
-#define NXT_SHARED_PORT_ID  0xFFFFu
-
 #if (NXT_HAVE_OTEL)
 #define NXT_OTEL_BATCH_DEFAULT     128
 #define NXT_OTEL_SAMPLING_DEFAULT  1
@@ -1168,12 +1166,60 @@ nxt_router_start_app_process(nxt_task_t *task, nxt_app_t *app)
 }
 
 
+/*
+ * Take the queued request message back from the shared port queue.
+ * nxt_app_queue_cancel() (src/nxt_app_queue.h) is a CAS on the queue item's
+ * tracking word; nxt_unit_app_queue_recv() runs the same CAS from the worker
+ * side, so exactly one of the two wins and a false answer here means a worker
+ * claimed the slot first.
+ *
+ * The CAS runs at most once per request, and the answer is kept in
+ * ->msg_info.cancel for the callers that need it afterwards: both outcomes
+ * leave the tracking word at 0, so a second CAS would report a claim that
+ * never happened and clear ->is_port_mmap_sent on a chunk the worker owns.
+ */
+
+nxt_inline nxt_bool_t
+nxt_router_msg_retract(nxt_task_t *task, nxt_request_rpc_data_t *req_rpc_data)
+{
+    nxt_port_t      *app_port;
+    nxt_msg_info_t  *msg_info;
+
+    msg_info = &req_rpc_data->msg_info;
+
+    if (msg_info->cancel == NXT_MSG_QUEUED) {
+        app_port = req_rpc_data->app_port;
+
+        if (app_port == NULL || app_port->id != NXT_SHARED_PORT_ID) {
+            /* Acknowledged: the message is the worker's, not the queue's. */
+            return 0;
+        }
+
+        if (nxt_app_queue_cancel(app_port->queue, msg_info->tracking_cookie,
+                                 req_rpc_data->stream))
+        {
+            msg_info->cancel = NXT_MSG_RETRACTED;
+
+            nxt_debug(task, "stream #%uD: cancelled by router",
+                      req_rpc_data->stream);
+
+        } else {
+            msg_info->cancel = NXT_MSG_CLAIMED;
+
+            nxt_debug(task, "stream #%uD: claimed by a worker",
+                      req_rpc_data->stream);
+        }
+    }
+
+    return msg_info->cancel == NXT_MSG_RETRACTED;
+}
+
+
 nxt_inline nxt_bool_t
 nxt_router_msg_cancel(nxt_task_t *task, nxt_request_rpc_data_t *req_rpc_data)
 {
     nxt_buf_t       *b, *next;
     nxt_bool_t      cancelled;
-    nxt_port_t      *app_port;
     nxt_msg_info_t  *msg_info;
 
     msg_info = &req_rpc_data->msg_info;
@@ -1182,21 +1228,7 @@ nxt_router_msg_cancel(nxt_task_t *task, nxt_request_rpc_data_t *req_rpc_data)
         return 0;
     }
 
-    app_port = req_rpc_data->app_port;
-
-    if (app_port != NULL && app_port->id == NXT_SHARED_PORT_ID) {
-        cancelled = nxt_app_queue_cancel(app_port->queue,
-                                         msg_info->tracking_cookie,
-                                         req_rpc_data->stream);
-
-        if (cancelled) {
-            nxt_debug(task, "stream #%uD: cancelled by router",
-                      req_rpc_data->stream);
-        }
-
-    } else {
-        cancelled = 0;
-    }
+    cancelled = nxt_router_msg_retract(task, req_rpc_data);
 
     for (b = msg_info->buf; b != NULL; b = next) {
         next = b->next;
@@ -4128,6 +4160,19 @@ nxt_router_test_app_rpc_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     nxt_app_t *app)
 {
     nxt_router_app_rpc_create(task, tmcf, app);
+}
+
+
+/*
+ * The request deadline, for src/test/nxt_router_app_timeout_test.c.  That test
+ * drives it through the engine's timer machinery, so the wrapper is installed
+ * as the timer handler rather than called.
+ */
+
+void
+nxt_router_test_app_timeout(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_router_app_timeout(task, obj, data);
 }
 
 #endif
@@ -7080,6 +7125,32 @@ nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
     req_rpc_data->app_port = port;
     req_rpc_data->apr_action = NXT_APR_REQUEST_FAILED;
 
+    /*
+     * Bound the wait for a process.  Until a worker acknowledges the request
+     * the two dispatch paths that arm this timer have not run, so a request
+     * parked in ack_waiting_req has no deadline of its own: it waits for a
+     * worker that may never ask for it.  With detached work that wait is as
+     * long as the application chooses to run, which is what makes the
+     * deadline worth having -- "limits": {"timeout"} now bounds waiting for
+     * capacity, not only the time a worker spends on the request.
+     *
+     * The handler is the one those paths use, and it is shared with the
+     * post-acknowledgement deadline, where 503 is simply the right answer.
+     * Here it is right only if the request is still in the queue, so the
+     * handler retracts it first and tells the two deadlines apart by the
+     * answer; see nxt_router_app_timeout().
+     *
+     * An acknowledgement re-arms the same timer with the same handler, which
+     * nxt_timer_add() treats as a change, not a second timer.
+     */
+
+    if (app->timeout != 0) {
+        r->timer.handler = nxt_router_app_timeout;
+        r->timer_data = req_rpc_data;
+
+        nxt_timer_add(task->thread->engine, &r->timer, app->timeout);
+    }
+
     if (start_process) {
         nxt_router_start_app_process(task, app);
 
@@ -7581,6 +7652,7 @@ static void
 nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
 {
     nxt_timer_t              *timer;
+    nxt_msg_info_t           *msg_info;
     nxt_http_request_t       *r;
     nxt_request_rpc_data_t   *req_rpc_data;
 
@@ -7590,6 +7662,45 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
 
     r = nxt_timer_data(timer, nxt_http_request_t, timer);
     req_rpc_data = r->timer_data;
+
+    msg_info = &req_rpc_data->msg_info;
+
+    /*
+     * Two deadlines share this handler.  After an acknowledgement a worker
+     * holds the request and 503 is the answer: it is too slow.  Before one
+     * the request is still in the shared port queue, and only the CAS in
+     * nxt_router_msg_retract() says whether it is still there.
+     *
+     * So retract before answering.  A retraction that loses means a worker
+     * took the request in that same instant: it is running, and a 503 here
+     * would both fail the request and run it -- twice, if the client
+     * retries.
+     *
+     * Leave a claimed request alone until its acknowledgement, and do not
+     * re-arm: the acknowledgement arms this timer again.  Do not answer it
+     * at a later expiry either.  The chain's tail is the request body that
+     * nxt_router_req_headers_ack_handler() still has to send, and libunit
+     * keeps the request until that body arrives.  An unlink here would drop
+     * the body and cancel the RPC, so a late acknowledgement is ignored and
+     * the request stays in the worker for ever.
+     *
+     * The acknowledgement replaces ->app_port with the worker's own port, so
+     * the shared port here means that it has not arrived yet.
+     */
+
+    if (msg_info->cancel == NXT_MSG_QUEUED) {
+        (void) nxt_router_msg_retract(task, req_rpc_data);
+    }
+
+    if (msg_info->cancel == NXT_MSG_CLAIMED
+        && req_rpc_data->app_port != NULL
+        && req_rpc_data->app_port->id == NXT_SHARED_PORT_ID)
+    {
+        nxt_debug(task, "stream #%uD: claimed, waiting for the ack",
+                  req_rpc_data->stream);
+
+        return;
+    }
 
     nxt_http_request_error(task, r, NXT_HTTP_SERVICE_UNAVAILABLE);
 

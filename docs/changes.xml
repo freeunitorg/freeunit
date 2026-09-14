@@ -10,6 +10,26 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="bugfix">
+<para>
+an application that answered a request and kept running was counted idle.  PHP
+does this whenever a script calls fastcgi_finish_request(): the response goes
+out, the script runs on, and the router returned the worker's slot to
+"processes": {"max"} and let its idle timer reap a process that was still
+executing.  Such a worker now reports itself busy until the work ends, so "max"
+bounds live processes and "/status" reports them as "detached".
+</para>
+</change>
+
+<change type="change">
+<para>
+"limits": {"timeout"} now also bounds how long a request waits for an
+application process, not only how long a worker may spend on it.  A request
+that waited for capacity previously had no deadline at all.  The default
+remains no timeout.
+</para>
+</change>
+
 <change type="security">
 <para>
 the string form of "access_log" "format" wrote what a variable expanded to

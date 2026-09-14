@@ -1,6 +1,19 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Bugfix: an application that answered a request and kept running was
+       counted idle. PHP does this whenever a script calls
+       fastcgi_finish_request(): the response goes out, the script runs on,
+       and the router returned the worker's slot to "processes": {"max"} and
+       let its idle timer reap a process that was still executing. Such a
+       worker now reports itself busy until the work ends, so "max" bounds
+       live processes and "/status" reports them as "detached".
+
+    *) Change: "limits": {"timeout"} now also bounds how long a request waits
+       for an application process, not only how long a worker may spend on
+       it. A request that waited for capacity previously had no deadline at
+       all. The default remains no timeout.
+
     *) Security: the string form of "access_log" "format" wrote what a
        variable expanded to without escaping it.  "$uri" is the
        percent-decoded target, so a request for "/%0d%0a..." put a real
