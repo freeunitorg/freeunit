@@ -244,9 +244,12 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        changes neither, and RFC 9110 Sect. 8.8.1 reserves a strong
        validator for one that cannot miss a change.  "If-Match" and
        "If-Range" stop matching inside that window, so a range request
-       there is answered with the full 200 rather than a slice keyed to a
-       validator Unit cannot vouch for.  The tag keeps its format, so
-       nothing already held in a cache is invalidated.
+       conditioned on "If-Range" is answered with the full 200 rather than
+       a slice keyed to a validator Unit cannot vouch for; an unconditional
+       "Range" is unaffected.  "If-Match: *" is unaffected too, since "*"
+       asks whether a representation exists, not whether a validator
+       matches.  The tag keeps its format, so nothing already held in a
+       cache is invalidated.
 
 
 Changes with FreeUnit 1.36.1                                     28 Aug 2026

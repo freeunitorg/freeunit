@@ -320,8 +320,10 @@ deleted the file as part of an unrelated cleanup.
 the entity-tag and last-modified date of a static file are now weak while
 the request falls inside the second the file was last written, because a
 rewrite to the same size during that second changes neither validator.
-If-Match and If-Range stop matching in that window; the tag keeps its
-format, so nothing already cached is invalidated.
+If-Match and the If-Range forms stop matching in that window, so a range
+conditioned on If-Range falls back to the full response; an unconditional
+Range is unaffected.  The tag keeps its format, so nothing already cached is
+invalidated.
 </para>
 </change>
 

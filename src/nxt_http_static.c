@@ -733,9 +733,17 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
          * cannot be promised strong; once the second has passed, no later
          * write can reproduce this mtime and the tag is strong for good.
          *
-         * Apache weakens on the same condition (server/util_etag.c, in
-         * ap_make_etag()).  The tag's format does not change, so nothing
+         * Apache weakens on the same hazard (modules/http/http_etag.c, in
+         * ap_make_etag_ex()), though on a sliding second against a
+         * microsecond mtime rather than the calendar second a whole-second
+         * mtime gives us.  The tag's format does not change, so nothing
          * already in a cache is invalidated by this.
+         *
+         * This reasons about the clock that stamped the file, so it holds
+         * only where that is the clock Unit reads.  On a remote filesystem
+         * the mtime comes from the server: if that clock trails this one,
+         * Unit can call a tag strong while the server can still write into
+         * the second it names.  Apache carries the same caveat.
          *
          * nxt_thread_time() is the cached per-thread clock.  If it lags, it
          * reports the request as still inside the second and the tag is

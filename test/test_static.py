@@ -154,6 +154,36 @@ def test_static_accept_ranges():
     assert resp['headers']['Accept-Ranges'] == 'bytes', 'Accept-Ranges on 200'
 
 
+def unit_second(resp):
+    """
+    The second Unit believes it is in, taken from the response it just sent.
+
+    Unit stamps "Date" from the same cached coarse clock that decides whether
+    a validator is weak, and stamps it after the validator is chosen, so it
+    is the only clock a test can compare against without racing.
+    """
+    return int(parsedate_to_datetime(resp['headers']['Date']).timestamp())
+
+
+def wait_for_unit_second(second, timeout=5):
+    """
+    Returns a response Unit sent during exactly `second`.
+
+    Used to put a request inside the second a file is dated to, which is
+    where both validators are weak.  The file is dated far enough ahead that
+    the whole of that second is available once it arrives.
+    """
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        resp = client.get(url='/index.html')
+
+        if unit_second(resp) == second:
+            return resp
+
+    pytest.fail(f'Unit never reported second {second}')
+
+
 def range_get(**headers):
     return client.get(
         url='/index.html',
@@ -1810,15 +1840,23 @@ def test_static_conditional_etag_weak_within_mtime_second(temp_dir):
     # is marked weak; once the second has passed it is strong for good.
     path = Path(f'{temp_dir}/assets/index.html')
 
-    # Dating the file one second ahead puts the request inside the window
-    # without racing the clock: a file the clock has not reached yet can
-    # still acquire that mtime.  Waiting the second out then makes the same
-    # file strong, with the same mtime and the same size.
-    mtime = int(time.time()) + 1
+    # Unit reads a coarse cached clock, so Python's clock cannot say which
+    # second Unit thinks it is in -- it leads Unit's by up to a jiffy, which
+    # made an earlier version of this test fail intermittently right at the
+    # boundary.  Unit's own "Date" is rendered from that same cached second,
+    # so it is the oracle used throughout here.
+    #
+    # The file is dated two seconds ahead and the test then waits for Unit to
+    # report that exact second.  That lands the request in the "now == mtime"
+    # case, which is the hazard itself: a rewrite landing in the second the
+    # file was written.  Entering only the "now < mtime" case would leave the
+    # boundary untested -- a build with "<" in place of "<=" passes that.
+    mtime = int(time.time()) + 2
     os.utime(path, (mtime, mtime))
 
-    weak = client.get(url='/index.html')['headers']['ETag']
-    assert weak.startswith('W/'), 'weak inside the mtime second'
+    resp = wait_for_unit_second(mtime)
+    weak = resp['headers']['ETag']
+    assert weak.startswith('W/'), 'weak in the second the file is dated to'
 
     # Weakness costs nothing else: a client caching on it still revalidates.
     assert range_get(**{'If-None-Match': weak})['status'] == 304, 'weak 304'
@@ -1855,15 +1893,29 @@ def test_static_conditional_etag_weak_within_mtime_second(temp_dir):
     # validator matches, so the weakness does not bear on it.
     assert range_get(**{'If-Match': '*'})['status'] == 200, 'If-Match *'
 
-    # Wait for the clock to leave the second the file is dated to.  That
-    # second spans [mtime, mtime + 1), so the wait ends at mtime + 1, not at
-    # mtime.  Nothing about the file changes here, only the guarantee Unit
-    # can make about it.
-    while time.time() < mtime + 1:
-        time.sleep(0.05)
+    # An unconditional Range is untouched.  Only a range conditioned on a
+    # validator has anything to be wrong about, so weakening must not cost
+    # every range request in the window a partial response.
+    resp = range_get(Range='bytes=0-4')
+    assert resp['status'] == 206, 'plain Range still partial in the window'
+    assert resp['body'] == '01234', 'and the right slice'
 
-    strong = client.get(url='/index.html')['headers']['ETag']
-    assert not strong.startswith('W/'), 'strong once the second has passed'
+    # Wait for the tag to go strong, then check it did not go strong early.
+    # Asserting on Unit's own "Date" rather than on a sleep is what keeps
+    # this off the boundary race: the tag may only harden once Unit has left
+    # the second the file is dated to.
+    deadline = time.time() + 5
+
+    while True:
+        resp = client.get(url='/index.html')
+        strong = resp['headers']['ETag']
+
+        if not strong.startswith('W/'):
+            break
+
+        assert time.time() < deadline, 'tag never hardened'
+
+    assert unit_second(resp) > mtime, 'hardened only after the second passed'
 
     # Only a prefix separates them: the tag's format does not change, so
     # nothing already held in a cache is invalidated by the weakening.
