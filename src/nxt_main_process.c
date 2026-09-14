@@ -935,8 +935,16 @@ nxt_main_process_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     buf->mem.free = nxt_cpymem(buf->mem.free, &pid, sizeof(nxt_pid_t));
 
-    (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_READY_LAST, -1,
-                                 msg->port_msg.stream, 0, buf);
+    if (nxt_slow_path(nxt_port_socket_write(task, port,
+                                            NXT_PORT_MSG_RPC_READY_LAST, -1,
+                                            msg->port_msg.stream, 0, buf)
+                      != NXT_OK))
+    {
+        /* Still ours: the port layer takes the buffer only on NXT_OK. */
+
+        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                           buf->completion_handler, task, buf, buf->parent);
+    }
 
 fail:
 

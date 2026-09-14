@@ -462,6 +462,7 @@ nxt_int_t
 nxt_port_send_port(nxt_task_t *task, nxt_port_t *port, nxt_port_t *new_port,
     uint32_t stream)
 {
+    nxt_int_t                ret;
     nxt_buf_t                *b;
     nxt_port_msg_new_port_t  *msg;
 
@@ -483,9 +484,24 @@ nxt_port_send_port(nxt_task_t *task, nxt_port_t *port, nxt_port_t *new_port,
     msg->max_share = port->max_share;
     msg->type = new_port->type;
 
-    return nxt_port_socket_write2(task, port, NXT_PORT_MSG_NEW_PORT,
-                                  new_port->pair[1], new_port->queue_fd,
-                                  stream, 0, b);
+    ret = nxt_port_socket_write2(task, port, NXT_PORT_MSG_NEW_PORT,
+                                 new_port->pair[1], new_port->queue_fd,
+                                 stream, 0, b);
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        /*
+         * Still ours, and nobody else can reach it: b never leaves this
+         * function, so a caller that sees the failure has nothing to
+         * complete.  The descriptors are borrowed from new_port and stay
+         * with it, as they do on the success path -- NEW_PORT carries no
+         * NXT_PORT_MSG_CLOSE_FD.
+         */
+
+        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                           b->completion_handler, task, b, b->parent);
+    }
+
+    return ret;
 }
 
 
@@ -1056,8 +1072,15 @@ nxt_port_change_log_file(nxt_task_t *task, nxt_runtime_t *rt, nxt_uint_t slot,
 
         b->mem.free = nxt_cpymem(b->mem.free, &slot, sizeof(nxt_uint_t));
 
-        (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_CHANGE_FILE,
-                                     fd, 0, 0, b);
+        if (nxt_slow_path(nxt_port_socket_write(task, port,
+                                                NXT_PORT_MSG_CHANGE_FILE,
+                                                fd, 0, 0, b) != NXT_OK))
+        {
+            /* Still ours: the port layer takes the buffer only on NXT_OK. */
+
+            nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                               b->completion_handler, task, b, b->parent);
+        }
 
     } nxt_runtime_process_loop;
 }
@@ -1216,8 +1239,17 @@ nxt_port_remove_notify_others(nxt_task_t *task, nxt_process_t *process)
 
         buf->mem.free = nxt_cpymem(buf->mem.free, &pid, sizeof(pid));
 
-        nxt_port_socket_write(task, port, NXT_PORT_MSG_REMOVE_PID, -1,
-                              process->stream, 0, buf);
+        if (nxt_slow_path(nxt_port_socket_write(task, port,
+                                                NXT_PORT_MSG_REMOVE_PID, -1,
+                                                process->stream, 0, buf)
+                          != NXT_OK))
+        {
+            /* Still ours: the port layer takes the buffer only on NXT_OK. */
+
+            nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                               buf->completion_handler, task, buf,
+                               buf->parent);
+        }
 
     } nxt_runtime_process_loop;
 }

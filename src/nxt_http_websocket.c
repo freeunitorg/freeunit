@@ -115,7 +115,44 @@ nxt_http_websocket_client(nxt_task_t *task, void *obj, void *data)
                                 req_rpc_data->stream,
                                 task->thread->engine->port->id, out);
     if (nxt_slow_path(res != NXT_OK)) {
-        // TODO: handle
+        /*
+         * The port layer did not take the chain, so it is still ours to
+         * return -- and nothing else will: these are chunks of the
+         * application's outgoing shared memory, which no pool teardown
+         * reclaims.  A frame lost this way costs the segment capacity
+         * permanently, and the application starves once enough have gone.
+         *
+         * Queued rather than run here, as nxt_port_msg_drop() queues its
+         * own: nxt_port_mmap_buf_completion() can post a SHM_ACK, and
+         * re-entering the port layer from inside this call is worth
+         * avoiding even on the way out.
+         */
+
+        while (out != NULL) {
+            next = out->next;
+            out->next = NULL;
+
+            nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                               out->completion_handler, task, out,
+                               out->parent);
+
+            out = next;
+        }
+
+        /*
+         * And fail the connection, the way the allocation failure above
+         * does.  A non-OK answer here means the application port is gone or
+         * its shared queue is full, so this frame is not reaching the
+         * application at all; carrying on would leave the peer's stream
+         * short a frame it is never told about, which for a fragmented
+         * message is a protocol error the client cannot detect.  This is
+         * what the "// TODO: handle" that used to stand here was asking
+         * for.
+         */
+
+        nxt_http_websocket_error_handler(task, r, r->proto.any);
+
+        return;
     }
 
     b = r->ws_frame;

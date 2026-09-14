@@ -27,6 +27,7 @@ static nxt_int_t nxt_port_fail_test_cross_engine_acquire(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_cross_engine_race(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_cross_engine_batch(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_cross_engine_rearm(nxt_thread_t *thr);
+static nxt_int_t nxt_port_fail_test_caller_owns_buf(nxt_thread_t *thr);
 static void nxt_port_fail_test_racer(void *data);
 static nxt_int_t nxt_port_fail_test_queued(nxt_locked_work_queue_t *lwq,
     nxt_work_t *item);
@@ -93,6 +94,10 @@ nxt_port_fail_test(nxt_thread_t *thr)
     }
 
     if (nxt_port_fail_test_cross_engine_rearm(thr) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_port_fail_test_caller_owns_buf(thr) != NXT_OK) {
         return NXT_ERROR;
     }
 
@@ -1696,6 +1701,120 @@ done:
 
     return ret;
 }
+
+/*
+ * A caller gets its buffer back when the port refuses the message.
+ *
+ * src/nxt_port.h says the port layer takes fd, fd2 and b only on NXT_OK, so on
+ * any other answer the caller still owns them.  A caller that does not act on
+ * that leaks: nothing else completes the buffer, and for an engine pool that
+ * memory is never reclaimed while the process runs.
+ *
+ * nxt_port_send_port() stands in for the eight sites that hand a buffer over.
+ * It is the awkward one -- its buffer never leaves the function, so no caller
+ * of it could clean up even if it wanted to -- and it allocates from the
+ * engine pool, which makes nxt_mp_is_empty() a decisive check: the pool holds
+ * the buffer, and nothing else.
+ */
+
+static nxt_int_t
+nxt_port_fail_test_caller_owns_buf(nxt_thread_t *thr)
+{
+    nxt_mp_t            *mp;
+    nxt_int_t           ret;
+    nxt_task_t          *task;
+    nxt_port_t          *port, *new_port;
+    nxt_event_engine_t  engine, *saved_engine;
+
+    task = thr->task;
+    task->thread = thr;
+
+    ret = NXT_ERROR;
+    port = NULL;
+    new_port = NULL;
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (nxt_slow_path(mp == NULL)) {
+        return NXT_ERROR;
+    }
+
+    nxt_memzero(&engine, sizeof(engine));
+    nxt_work_queue_cache_create(&engine.work_queue_cache, 1024);
+    engine.fast_work_queue.cache = &engine.work_queue_cache;
+    nxt_work_queue_name(&engine.fast_work_queue, "fast");
+
+    /* The buffer comes from here, which is what makes the check decisive. */
+    engine.mem_pool = mp;
+
+    saved_engine = thr->engine;
+    thr->engine = &engine;
+
+    port = nxt_port_fail_test_port(task);
+    if (nxt_slow_path(port == NULL)) {
+        goto done;
+    }
+
+    new_port = nxt_port_fail_test_port(task);
+    if (nxt_slow_path(new_port == NULL)) {
+        goto done;
+    }
+
+    if (nxt_slow_path(!nxt_mp_is_empty(mp))) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: the fixture pool is not empty "
+                      "before the write");
+        goto done;
+    }
+
+    nxt_port_test_msg_alloc_failures(1);
+
+    ret = nxt_port_send_port(task, port, new_port, 0);
+
+    nxt_port_test_msg_alloc_failures(0);
+
+    if (ret == NXT_OK) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: the refused NEW_PORT answered "
+                      "NXT_OK");
+        ret = NXT_ERROR;
+        goto done;
+    }
+
+    ret = NXT_ERROR;
+
+    /* The completion is queued, as nxt_port_msg_drop() queues its own. */
+
+    nxt_port_fail_test_drain_wq(&engine.fast_work_queue);
+
+    if (nxt_slow_path(!nxt_mp_is_empty(mp))) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: the buffer of a refused message was "
+                      "left in the caller's pool");
+        goto done;
+    }
+
+    ret = NXT_OK;
+
+done:
+
+    nxt_port_test_msg_alloc_failures(0);
+
+    if (new_port != NULL) {
+        nxt_port_use(task, new_port, -1);
+    }
+
+    if (port != NULL) {
+        nxt_port_use(task, port, -1);
+    }
+
+    thr->engine = saved_engine;
+
+    nxt_work_queue_cache_destroy(&engine.work_queue_cache);
+    nxt_mp_destroy(mp);
+
+    return ret;
+}
+
 static nxt_int_t
 nxt_port_fail_test_queued(nxt_locked_work_queue_t *lwq, nxt_work_t *item)
 {

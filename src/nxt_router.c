@@ -1734,7 +1734,20 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
 fail:
 
-    nxt_port_socket_write(task, port, type, -1, msg->port_msg.stream, 0, b);
+    if (nxt_slow_path(nxt_port_socket_write(task, port, type, -1,
+                                            msg->port_msg.stream, 0, b)
+                      != NXT_OK)
+        && b != NULL)
+    {
+        /*
+         * Still ours: the port layer takes the buffer only on NXT_OK, and
+         * this one lives in the reply port's pool, so it would sit there
+         * until the controller's port is released.
+         */
+
+        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                           b->completion_handler, task, b, b->parent);
+    }
 }
 
 
@@ -5080,8 +5093,15 @@ nxt_router_listen_socket_release(nxt_task_t *task, nxt_socket_conf_t *skcf)
     rt = task->thread->runtime;
     main_port = rt->port_by_type[NXT_PROCESS_MAIN];
 
-    (void) nxt_port_socket_write(task, main_port, NXT_PORT_MSG_SOCKET_UNLINK,
-                                 -1, 0, 0, b);
+    if (nxt_slow_path(nxt_port_socket_write(task, main_port,
+                                            NXT_PORT_MSG_SOCKET_UNLINK,
+                                            -1, 0, 0, b) != NXT_OK))
+    {
+        /* Still ours: the port layer takes the buffer only on NXT_OK. */
+
+        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                           b->completion_handler, task, b, b->parent);
+    }
 
 out_free_ls:
 #endif
@@ -5573,7 +5593,7 @@ nxt_router_req_headers_ack_handler(nxt_task_t *task,
 {
     int                 res;
     nxt_app_t           *app;
-    nxt_buf_t           *b;
+    nxt_buf_t           *b, *next;
     nxt_bool_t          start_process, unlinked;
     nxt_port_t          *app_port, *main_app_port, *idle_port;
     nxt_queue_link_t    *idle_lnk;
@@ -5694,6 +5714,25 @@ nxt_router_req_headers_ack_handler(nxt_task_t *task,
                                     task->thread->engine->port->id, b);
 
         if (nxt_slow_path(res != NXT_OK)) {
+            /*
+             * This tail was cut from msg_info.buf above, so
+             * nxt_router_msg_cancel() walks a chain that no longer reaches
+             * it and nothing else completes it.  Its buffers are chunks of
+             * shared memory that no pool teardown reclaims, so return them
+             * here.  Queued rather than run inline, as the port layer does
+             * when it drops a message of its own.
+             */
+
+            while (b != NULL) {
+                next = b->next;
+                b->next = NULL;
+
+                nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                                   b->completion_handler, task, b, b->parent);
+
+                b = next;
+            }
+
             nxt_http_request_error(task, r, NXT_HTTP_INTERNAL_SERVER_ERROR);
         }
     }
