@@ -1,8 +1,1 @@
-# No digest recorded yet for njs-1.0.1.tar.gz. This file must record the
-# SHA512 of the tarball served from packages.freeunit.org/njs (the URL the
-# contrib Makefile actually downloads), not a GitHub tag archive: verified
-# against 1.0.0, where the mirror tarball is 1,007,848 bytes and the GitHub
-# tag archive for the same tag is 1,011,616 bytes -- a different file with a
-# different digest, even though the mirror's own recorded digest below
-# matches its tarball exactly. Compute this line's digest from the real
-# njs-1.0.1.tar.gz once it is published to the mirror.
+0339134b30a382820ff7678975425bf1f7040f3f52304b698f7cf08717d07cd9988508982bcd7a8e5e1d64fbe2ad634e38587d37f1afdbe9e9a8ffe8915ac667  njs-1.0.1.tar.gz
