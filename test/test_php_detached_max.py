@@ -246,7 +246,12 @@ def test_php_detached_parked_request_times_out():
 
     assert resp['status'] == 503, f'parked request timed out, got {resp}'
     assert elapsed < timeout + 5, f'answered at the deadline, took {elapsed:.1f}s'
-    assert not os.path.exists(ran), 'the timed-out request never executed'
+    # The end-to-end half of the claim.  What it cannot show is the race
+    # underneath it -- a worker claiming the slot in the same instant the
+    # timer fires -- because that window is a single CAS.  That half is
+    # driven deterministically in src/test/nxt_router_app_timeout_test.c,
+    # where the test plays the worker and chooses the CAS outcome.
+    assert not os.path.exists(ran), 'the timed-out request did not execute'
 
     # And it must still not run once the detached worker becomes free.
     time.sleep(3)
