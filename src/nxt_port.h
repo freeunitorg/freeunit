@@ -63,6 +63,14 @@ struct nxt_port_handlers_s {
     nxt_port_handler_t  shm_ack;
     nxt_port_handler_t  read_queue;
     nxt_port_handler_t  read_socket;
+
+    /*
+     * An application that answered a request and kept running, and later
+     * that it has finished.  Appended, and appended is the only safe edit
+     * here: every _NXT_PORT_MSG_* value is this struct's offset, so
+     * inserting or reordering a slot renumbers the wire protocol.
+     */
+    nxt_port_handler_t  detached;
 };
 
 
@@ -120,6 +128,8 @@ typedef enum {
     _NXT_PORT_MSG_READ_QUEUE      = nxt_port_handler_idx(read_queue),
     _NXT_PORT_MSG_READ_SOCKET     = nxt_port_handler_idx(read_socket),
 
+    _NXT_PORT_MSG_DETACHED        = nxt_port_handler_idx(detached),
+
     NXT_PORT_MSG_MAX              = sizeof(nxt_port_handlers_t)
                                     / sizeof(nxt_port_handler_t),
 
@@ -164,6 +174,7 @@ typedef enum {
     NXT_PORT_MSG_SHM_ACK          = nxt_msg_last(_NXT_PORT_MSG_SHM_ACK),
     NXT_PORT_MSG_READ_QUEUE       = _NXT_PORT_MSG_READ_QUEUE,
     NXT_PORT_MSG_READ_SOCKET      = _NXT_PORT_MSG_READ_SOCKET,
+    NXT_PORT_MSG_DETACHED         = nxt_msg_last(_NXT_PORT_MSG_DETACHED),
 } nxt_port_msg_type_t;
 
 
@@ -177,6 +188,24 @@ typedef enum {
     NXT_PORT_QUIT_NORMAL   = 0,
     NXT_PORT_QUIT_GRACEFUL = 1,
 } nxt_port_quit_mode_t;
+
+
+/*
+ * Wire-format payload for NXT_PORT_MSG_DETACHED.  A single byte says which
+ * edge this is: an application that has answered a request and is still
+ * running, or the same application reporting that work done.
+ *
+ * A byte rather than a flag on nxt_port_msg_t: that header has no spare
+ * bit that is reliably zeroed.  Its four "1 bit" fields are whole bytes,
+ * the trailing pad byte is never cleared by the senders that build the
+ * header field by field, and nxt_port_socket_write() ORs into ->last.  A
+ * new type is bounds-checked on both sides instead, so an older peer
+ * refuses the message rather than misreading a flag.
+ */
+typedef enum {
+    NXT_PORT_DETACHED_START  = 0,
+    NXT_PORT_DETACHED_FINISH = 1,
+} nxt_port_detached_t;
 
 
 /* Passed as a first iov chunk. */
@@ -306,6 +335,18 @@ struct nxt_port_s {
     uint32_t            max_share;
 
     uint32_t            active_websockets;
+
+    /*
+     * The application answered a request on this port and kept running.
+     * Treated exactly like active_websockets by the idle transition in
+     * nxt_router_app_port_release(): the port stays in app->ports and in
+     * app->processes, and stays out of the idle queues, so the reaper
+     * never sees it and it keeps counting against "processes": {"max"}.
+     *
+     * Unlike active_websockets this one is cleared again, when the
+     * application reports the work finished.
+     */
+    uint8_t             detached;
     uint32_t            active_requests;
 
     nxt_port_handler_t  handler;

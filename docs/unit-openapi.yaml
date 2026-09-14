@@ -5478,6 +5478,39 @@ paths:
         "404":
           $ref: "#/components/responses/responseNotFound"
 
+  /status/applications/{appName}/processes/detached:
+    summary: "Endpoint for the `detached` processes number"
+    get:
+      operationId: getStatusApplicationsAppProcessesDetached
+      summary: "Retrieve the detached processes app status number"
+      description: "Retrieves the `detached` processes number that
+        represents Unit's per-app
+        [process statistics](https://unit.nginx.org/statusapi/)."
+
+      tags:
+        - status
+
+      parameters:
+        - $ref: "#/components/parameters/appName"
+
+      responses:
+        "200":
+          description: "OK; the `detached` number exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                type: integer
+                format: int64
+
+              examples:
+                Detached:
+                  value: 0
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
   /status/applications/{appName}/processes/idle:
     summary: "Endpoint for the `idle` processes number"
     get:
@@ -6344,6 +6377,7 @@ components:
               starting: 1
               unaccounted: 0
               idle: 0
+              detached: 0
             requests:
               active: 15
 
@@ -6405,6 +6439,7 @@ components:
             starting: 1
             unaccounted: 0
             idle: 0
+            detached: 0
           requests:
             active: 15
 
@@ -6417,6 +6452,7 @@ components:
           starting: 1
           unaccounted: 0
           idle: 0
+          detached: 0
         requests:
           active: 15
 
@@ -6428,6 +6464,7 @@ components:
         starting: 1
         unaccounted: 0
         idle: 0
+        detached: 0
 
     # /status/applications/{appName}/requests
     statusApplicationsAppRequests:
@@ -7985,6 +8022,14 @@ components:
             running, but never announced itself, so Unit has no pid for it.
             They count against `processes/max` until they announce themselves
             after all, or exit."
+
+        detached:
+          type: integer
+          format: int64
+          description: "App processes that answered a request and kept
+            running, such as a PHP script after `fastcgi_finish_request()`.
+            They are counted in `running`, never in `idle`, and hold their
+            slot under `processes/max` until the work ends."
 
         idle:
           type: integer

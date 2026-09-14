@@ -77,6 +77,8 @@ static int nxt_unit_process_new_port(nxt_unit_ctx_t *ctx,
 static int nxt_unit_ctx_ready(nxt_unit_ctx_t *ctx);
 static int nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx,
     nxt_unit_recv_msg_t *recv_msg, nxt_unit_request_info_t **preq);
+static void nxt_unit_ctx_detached_done(nxt_unit_ctx_t *ctx);
+static int nxt_unit_send_detached(nxt_unit_ctx_t *ctx, uint8_t state);
 static int nxt_unit_process_req_body(nxt_unit_ctx_t *ctx,
     nxt_unit_recv_msg_t *recv_msg);
 static int nxt_unit_request_check_response_port(nxt_unit_request_info_t *req,
@@ -428,6 +430,14 @@ struct nxt_unit_ctx_impl_s {
     uint8_t                       online;       /* 1 bit */
     uint8_t                       ready;        /* 1 bit */
     uint8_t                       quit_param;
+
+    /*
+     * The application answered a request with
+     * nxt_unit_request_done_detached() and has not returned from its
+     * request handler yet.  Holds the router's view of this worker as
+     * busy, and holds off a graceful quit, until it does.
+     */
+    uint8_t                       detached;     /* 1 bit */
 
     nxt_unit_mmap_buf_t           ctx_buf[2];
     nxt_unit_read_buf_t           ctx_read_buf;
@@ -801,6 +811,16 @@ nxt_unit_ctx_init(nxt_unit_impl_t *lib, nxt_unit_ctx_impl_t *ctx_impl,
     ctx_impl->online = 1;
     ctx_impl->ready = 0;
     ctx_impl->quit_param = NXT_QUIT_GRACEFUL;
+
+    /*
+     * Explicitly, like every field above it: this function initialises the
+     * context field by field and never memsets it, so anything left out
+     * starts as whatever the allocator left behind -- 0xAA in a debug
+     * build, which reads as "detached" and sends the finish report to a
+     * poison pointer.
+     */
+
+    ctx_impl->detached = 0;
 
     nxt_queue_init(&ctx_impl->free_req);
     nxt_queue_init(&ctx_impl->free_ws);
@@ -1613,6 +1633,8 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
         if (preq == NULL) {
             lib->callbacks.request_handler(req);
 
+            nxt_unit_ctx_detached_done(ctx);
+
         } else {
             *preq = req;
         }
@@ -1669,6 +1691,8 @@ nxt_unit_process_req_body(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg)
 
     if (req->content_fd != -1 || l == req->content_length) {
         lib->callbacks.request_handler(req);
+
+        nxt_unit_ctx_detached_done(ctx);
     }
 
     return NXT_UNIT_OK;
@@ -3496,6 +3520,124 @@ nxt_unit_buf_read(nxt_unit_buf_t **b, uint64_t *len, void *dst, size_t size)
 }
 
 
+/*
+ * Tell the router this worker is, or is no longer, running work of its own
+ * after a response.  One byte of payload says which edge; see
+ * nxt_port_detached_t in src/nxt_port.h for why it is a byte and a new
+ * message type rather than a flag on the header.
+ *
+ * Sent to the router's own port, the way OOSM is, not to the port the
+ * response went to.  The router reads that port on its main thread, which
+ * is the thread that owns the accounting, and one socket keeps the finish
+ * edge behind the start edge that preceded it: the next request's response
+ * may belong to another router engine, and two engines' reads of two
+ * sockets race.  The router looks the worker up by pid.
+ */
+
+static int
+nxt_unit_send_detached(nxt_unit_ctx_t *ctx, uint8_t state)
+{
+    int              res;
+    nxt_unit_impl_t  *lib;
+    struct {
+        nxt_port_msg_t  msg;
+        uint8_t         state;
+    } m;
+
+    lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
+
+    if (nxt_slow_path(lib->router_port == NULL)) {
+        nxt_unit_debug(ctx, "detached %d: no router port to report on",
+                       (int) state);
+        return NXT_UNIT_ERROR;
+    }
+
+    memset(&m, 0, sizeof(m));
+
+    m.msg.pid = lib->pid;
+    m.msg.type = _NXT_PORT_MSG_DETACHED;
+    m.msg.last = 1;
+    m.state = state;
+
+    res = nxt_unit_port_send(ctx, lib->router_port, &m, sizeof(m), NULL);
+    if (nxt_slow_path(res != sizeof(m))) {
+        return NXT_UNIT_ERROR;
+    }
+
+    return NXT_UNIT_OK;
+}
+
+
+void
+nxt_unit_request_done_detached(nxt_unit_request_info_t *req, int rc)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(req->ctx, nxt_unit_ctx_impl_t, ctx);
+
+    /*
+     * Before the response, not after.  The two go to different ports, so
+     * this orders nothing on the router's side by itself -- the router
+     * takes a worker it has already parked as idle back out when the edge
+     * arrives -- but it does keep the window in which the port sits in the
+     * idle queue as short as the router's own read makes it.
+     *
+     * A failure here is not fatal to the request: the response still goes
+     * out below, and the worst case is the accounting this call was meant
+     * to correct, which is what the router does today for every such
+     * response.
+     */
+
+    if (ctx_impl->detached == 0) {
+        if (nxt_unit_send_detached(req->ctx, NXT_PORT_DETACHED_START)
+            == NXT_UNIT_OK)
+        {
+            ctx_impl->detached = 1;
+
+        } else {
+            nxt_unit_req_alert(req, "failed to report a detached response");
+        }
+    }
+
+    nxt_unit_request_done(req, rc);
+}
+
+
+/*
+ * The application's request handler has returned, so whatever it was doing
+ * after its response is over.  Runs on every return path -- a normal return,
+ * and the ones PHP reaches through exit() and a fatal error, which all come
+ * back through the handler call site.
+ */
+
+static void
+nxt_unit_ctx_detached_done(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    if (ctx_impl->detached == 0) {
+        return;
+    }
+
+    ctx_impl->detached = 0;
+
+    (void) nxt_unit_send_detached(ctx, NXT_PORT_DETACHED_FINISH);
+
+    /*
+     * A graceful QUIT that arrived during the work was deferred by
+     * nxt_unit_quit() on this flag, the way one that arrives during a
+     * request is deferred on active_req.  That one is retried when the
+     * request is released; this is the equivalent.
+     */
+
+    if (nxt_slow_path(!nxt_unit_chk_ready(ctx))) {
+        nxt_unit_quit(ctx, NXT_QUIT_GRACEFUL);
+    }
+}
+
+
 void
 nxt_unit_request_done(nxt_unit_request_info_t *req, int rc)
 {
@@ -5129,6 +5271,8 @@ nxt_unit_process_ready_req(nxt_unit_ctx_t *ctx)
 
         lib->callbacks.request_handler(&req_impl->req);
 
+        nxt_unit_ctx_detached_done(ctx);
+
     } nxt_queue_loop;
 }
 
@@ -6100,7 +6244,8 @@ nxt_unit_quit(nxt_unit_ctx_t *ctx, uint8_t quit_param)
 
         quit = nxt_queue_is_empty(&ctx_impl->active_req)
                && nxt_queue_is_empty(&ctx_impl->pending_rbuf)
-               && ctx_impl->wait_items == 0;
+               && ctx_impl->wait_items == 0
+               && ctx_impl->detached == 0;
 
         pthread_mutex_unlock(&ctx_impl->mutex);
 
