@@ -6667,7 +6667,7 @@ static void
 nxt_router_adjust_idle_timer(nxt_task_t *task, void *obj, void *data)
 {
     nxt_app_t           *app;
-    nxt_bool_t          queued;
+    nxt_bool_t          queued, start_process;
     nxt_port_t          *port;
     nxt_msec_t          timeout, threshold;
     nxt_queue_link_t    *lnk;
@@ -6728,6 +6728,34 @@ nxt_router_adjust_idle_timer(nxt_task_t *task, void *obj, void *data)
         app->processes--;
         port->app = NULL;
 
+        /*
+         * Start a replacement if this reap leaves work with nothing to run
+         * it.  nxt_router_app_port_close() re-evaluates the same condition
+         * when a process dies, but it never runs for a reaped one: the line
+         * above clears port->app, and nxt_port_close() calls the close
+         * handler only for a port that still has an application
+         * (src/nxt_port.c:173).  So the close path covers un-reaped deaths
+         * only, and a request parked in app->ack_waiting_req when the last
+         * process is reaped waits for unrelated traffic to start one.
+         *
+         * This cannot start processes for an application that is merely
+         * idle.  nxt_router_app_need_start() is the disjunction of
+         * "active_requests > port_hash_count + pending_processes", which is
+         * false for active_requests == 0, and "spare_processes >
+         * idle_processes + pending_processes", which is false here because
+         * the loop runs only while idle_processes > spare_processes and the
+         * decrement above therefore leaves idle_processes >=
+         * spare_processes.
+         */
+
+        start_process = !engine->shutdown
+                        && nxt_router_app_can_start(app)
+                        && nxt_router_app_need_start(app);
+
+        if (start_process) {
+            app->pending_processes++;
+        }
+
         nxt_thread_mutex_unlock(&app->mutex);
 
         nxt_debug(task, "app '%V' send QUIT to idle port %PI",
@@ -6736,6 +6764,10 @@ nxt_router_adjust_idle_timer(nxt_task_t *task, void *obj, void *data)
         nxt_port_socket_write(task, port, NXT_PORT_MSG_QUIT, -1, 0, 0, NULL);
 
         nxt_port_use(task, port, -1);
+
+        if (start_process) {
+            nxt_router_start_app_process(task, app);
+        }
 
         nxt_thread_mutex_lock(&app->mutex);
     }
@@ -6931,6 +6963,25 @@ nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
 
     req_rpc_data->app_port = port;
     req_rpc_data->apr_action = NXT_APR_REQUEST_FAILED;
+
+    /*
+     * Bound the wait for a process.  Until a worker acknowledges the
+     * request the two dispatch paths that arm this timer have not run, so a
+     * request parked in ack_waiting_req has no deadline of its own: it waits
+     * for a worker that may never ask for it.  The handler is the one those
+     * paths use; it answers 503 and unlinks, and the unlink retracts the
+     * queued message through nxt_router_msg_cancel(), so a request that
+     * times out here never runs in the application.
+     *
+     * An acknowledgement re-arms the same timer with the same handler, which
+     * nxt_timer_add() treats as a change, not a second timer.
+     */
+
+    if (app->timeout != 0) {
+        r->timer.handler = nxt_router_app_timeout;
+        r->timer_data = req_rpc_data;
+        nxt_timer_add(task->thread->engine, &r->timer, app->timeout);
+    }
 
     if (start_process) {
         nxt_router_start_app_process(task, app);

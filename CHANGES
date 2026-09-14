@@ -1,6 +1,17 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Bugfix: a request that arrived while the only application process was
+       finishing a detached response is now answered.  The PHP module
+       reports a request done when the application calls
+       fastcgi_finish_request(), so the router listed the worker as idle
+       while the script still ran, reaped it after "idle_timeout", and
+       started nothing in its place; the waiting request was answered only
+       when unrelated traffic started a process.  The reaper now starts a
+       replacement when it leaves queued work behind, and a request waiting
+       for a process is now bound by "limits": {"timeout"}, which until now
+       began only once a worker had taken the request.
+
     *) Bugfix: a static response that was subject to content negotiation now
        carries "Vary: Accept-Encoding". Without it a shared cache could store
        whichever representation it saw first and serve it to every client --

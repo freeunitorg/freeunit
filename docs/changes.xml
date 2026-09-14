@@ -10,6 +10,20 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="bugfix">
+<para>
+a request that arrived while the only application process was finishing a
+detached response is now answered.  The PHP module reports a request done
+when the application calls fastcgi_finish_request(), so the router listed the
+worker as idle while the script still ran, reaped it after "idle_timeout",
+and started nothing in its place; the waiting request was answered only when
+unrelated traffic started a process.  The reaper now starts a replacement
+when it leaves queued work behind, and a request waiting for a process is now
+bound by "limits": {"timeout"}, which until now began only once a worker had
+taken the request.
+</para>
+</change>
+
 <change type="change">
 <para>
 removed the unused job cluster (nxt_job.c, nxt_job.h, and
