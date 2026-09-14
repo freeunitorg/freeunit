@@ -20,6 +20,7 @@ static uint8_t nxt_port_enqueue_buf(nxt_task_t *task, nxt_port_msg_t *pm,
 static nxt_int_t nxt_port_msg_chk_insert(nxt_task_t *task, nxt_port_t *port,
     nxt_port_send_msg_t *msg);
 static nxt_port_send_msg_t *nxt_port_msg_alloc(const nxt_port_send_msg_t *m);
+static nxt_int_t nxt_port_msg_dup_fds(nxt_port_send_msg_t *msg);
 static nxt_int_t nxt_port_write_msgs(nxt_task_t *task, void *obj,
     void *data, nxt_bool_t *send_failed);
 static void nxt_port_write_handler(nxt_task_t *task, void *obj, void *data);
@@ -519,7 +520,82 @@ nxt_port_msg_alloc(const nxt_port_send_msg_t *m)
 
     msg->allocated = 1;
 
+    /*
+     * A queued message must own the descriptors it names.
+     *
+     * The caller's copy borrows them: NEW_PORT names another port's pair[1]
+     * and queue_fd, START_PROCESS the application's shared port.  The
+     * sendmsg() that puts them into SCM_RIGHTS runs later, from
+     * nxt_port_write_msgs(), and by then the owner may have closed them --
+     * nxt_port_close() (src/nxt_port.c) does when a port goes away -- and
+     * the kernel may have given the numbers to something else.  The deferred
+     * send would then fail with EBADF, or hand the peer whatever descriptor
+     * now sits at that number.
+     *
+     * So duplicate them here, and mark the copy as owning what it sends.
+     * From here on the send path closes them the way it closes any owned
+     * descriptor: after the send in nxt_port_write_msgs(), or from
+     * nxt_port_error_handler() and nxt_port_socket_cancel() when the message
+     * is dropped instead.  The originals stay with their owner.
+     *
+     * The dup holds the descriptor until the message goes out, so a peer
+     * that stops reading holds this side's descriptor table open in
+     * proportion to what it was sent; port->messages has no bound.
+     */
+
+    if (!msg->close_fd && nxt_slow_path(nxt_port_msg_dup_fds(msg) != NXT_OK)) {
+        nxt_free(msg);
+        return NULL;
+    }
+
     return msg;
+}
+
+
+/*
+ * Replace a borrowed fd[0]/fd[1] with duplicates the message owns.  On
+ * failure nothing is changed: a first duplicate is closed again, so the
+ * caller keeps exactly its originals.
+ */
+
+static nxt_int_t
+nxt_port_msg_dup_fds(nxt_port_send_msg_t *msg)
+{
+    nxt_fd_t  fd0, fd1;
+
+    if (msg->fd[0] == -1 && msg->fd[1] == -1) {
+        return NXT_OK;
+    }
+
+    fd0 = -1;
+    fd1 = -1;
+
+    if (msg->fd[0] != -1) {
+        fd0 = fcntl(msg->fd[0], F_DUPFD_CLOEXEC, 0);
+        if (nxt_slow_path(fd0 == -1)) {
+            nxt_thread_log_alert("dup(%FD) failed %E", msg->fd[0], nxt_errno);
+            return NXT_ERROR;
+        }
+    }
+
+    if (msg->fd[1] != -1) {
+        fd1 = fcntl(msg->fd[1], F_DUPFD_CLOEXEC, 0);
+        if (nxt_slow_path(fd1 == -1)) {
+            nxt_thread_log_alert("dup(%FD) failed %E", msg->fd[1], nxt_errno);
+
+            if (fd0 != -1) {
+                nxt_fd_close(fd0);
+            }
+
+            return NXT_ERROR;
+        }
+    }
+
+    msg->fd[0] = fd0;
+    msg->fd[1] = fd1;
+    msg->close_fd = 1;
+
+    return NXT_OK;
 }
 
 

@@ -24,6 +24,13 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
     *) Change: upgrade contrib njs to 1.0.1.
 
+    *) Bugfix: a port message that was queued because the peer's socket was
+       not writable borrowed the descriptors it carried -- for NEW_PORT,
+       another port's socket and queue -- so a port closed before the queue
+       drained left the deferred sendmsg() naming a closed number, or an
+       unrelated descriptor that had since reused it.  The queued copy now
+       owns duplicates and closes them after the send (#388).
+
     *) Bugfix: a static response that was subject to content negotiation now
        carries "Vary: Accept-Encoding". Without it a shared cache could store
        whichever representation it saw first and serve it to every client --

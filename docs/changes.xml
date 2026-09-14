@@ -31,6 +31,17 @@ replaces anything that is not valid UTF-8 with U+FFFD before it serializes.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a port message that was queued because the peer's socket was not writable
+borrowed the descriptors it carried -- for NEW_PORT, another port's socket
+and queue -- so a port closed before the queue drained left the deferred
+sendmsg() naming a closed number, or an unrelated descriptor that had since
+reused it.  The queued copy now owns duplicates and closes them after the
+send (#388).
+</para>
+</change>
+
 <change type="change">
 <para>
 upgrade contrib njs to 1.0.1.
