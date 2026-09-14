@@ -304,11 +304,15 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        as identity, so "Range" together with "Accept-Encoding:
        identity;q=0" returned a "206 Partial Content" carrying exactly the
        bytes the client said it would not take.  The range is now ignored
-       and the full "200 OK" is sent in a coding the client does accept, as
-       already happens for a malformed or multi-range request.  A request
-       that accepts no coding at all is still answered with "406 Not
-       Acceptable", and a range from a client that does accept identity is
-       still a 206.
+       and the full "200 OK" is sent in a coding the client does accept --
+       where a compressor applies to the response at all; a file below the
+       compressor's "min_length" is still served as identity.  Ignoring the
+       range is all or nothing, so an unsatisfiable range from such a client
+       is no longer answered with "416" either.  A request that accepts no
+       coding at all is still "406 Not Acceptable", and a range from a client
+       that does accept identity is still a 206.  Several "Accept-Encoding"
+       lines in one request are now read as the single comma-joined value RFC
+       9110 defines them to be; previously only the first was consulted.
 
 
 Changes with FreeUnit 1.36.1                                     28 Aug 2026
