@@ -17,8 +17,8 @@ use unit_client_rs::unit_client::UnitClientError;
 
 /// Send a configuration file to the unit server.
 ///
-/// The bytes go out as they were written, for every format but JSON5.  unitctl
-/// used to parse the file into a `serde_json::Map` and re-serialize it.  That
+/// The bytes go out as they were written.  unitctl used to parse the file
+/// into a `serde_json::Map` and re-serialize it.  That
 /// dropped an operator's duplicate member before the server could refuse it
 /// (src/nxt_conf.c:1616) and re-spelled every number.  The server validates:
 /// UTF-8 (src/nxt_conf_validation.c:1840), duplicates, and the schema.

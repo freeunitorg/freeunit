@@ -19,7 +19,6 @@ tls = ["unit-client-rs/tls"]
 clap = { version = "4.4", features = ["default", "derive", "cargo"] }
 custom_error = "1.9"
 serde = "1.0"
-json5 = "1.3.1"
 serde_json = { version = "1.0", optional = false }
 # The "std" feature is not on by default and pem::from_buf needs it.
 rustls-pki-types = { version = "1.15", features = ["std"] }

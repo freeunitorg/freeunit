@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use crate::known_size::KnownSize;
 use clap::ValueEnum;
 
-use super::UnitSerializableMap;
 use super::UnitctlError;
 
 /// Input file data format
@@ -146,38 +145,26 @@ impl InputFile {
 
     /// The media type and the bytes to PUT for a configuration input.
     ///
-    /// The type is the type of the body, not of the file: a JSON5 file is
-    /// parsed and sent as JSON, so it goes out as "application/json".
-    ///
     /// JSON is sent as it was written.  unitctl does not parse it, so an
     /// operator's duplicate member reaches the server, which refuses it
     /// (src/nxt_conf.c:1616), and a number keeps the spelling the file used.
     /// Parsing here collapsed both silently.
-    ///
-    /// JSON5 is not JSON, so it is still parsed and re-serialized.  That is
-    /// the one input whose bytes cannot go out unchanged.
     pub fn to_config_body(&self) -> Result<(String, KnownSize), UnitctlError> {
         let json = "application/json".to_string();
 
         match self.format() {
             InputFormat::Json => Ok((json, self.try_into()?)),
-            InputFormat::Json5 => {
-                let mut reader: Box<dyn BufRead + Send> = self.try_into()?;
-                let mut json5_string = String::new();
-                reader
-                    .read_to_string(&mut json5_string)
-                    .map_err(|e| UnitctlError::DeserializationError { message: e.to_string() })?;
-                let parsed: UnitSerializableMap = json5::from_str(&json5_string)
-                    .map_err(|e| UnitctlError::DeserializationError { message: e.to_string() })?;
-                let body = serde_json::to_string(&parsed)
-                    .map_err(|e| UnitctlError::SerializationError { message: e.to_string() })?;
-                Ok((json, KnownSize::String(body)))
-            }
-            // Refuse hjson and YAML by name.  Sending the file as it is would
-            // make the server report a syntax error on the first comment or
-            // unquoted key, and that error does not tell the user what to do.
+            // Refuse the formats Unit cannot read by name.  Sending such a
+            // file as it is would make the server report a syntax error on
+            // the first comment or unquoted key, and that error does not tell
+            // the user what to do.
             InputFormat::Hjson => Err(UnitctlError::DeserializationError {
                 message: "hjson is no longer supported: convert the file to JSON first".to_string(),
+            }),
+            InputFormat::Json5 => Err(UnitctlError::DeserializationError {
+                message: "JSON5 is no longer supported: convert the file to JSON first, for example \
+                          with \"json5 -o config.json config.json5\""
+                    .to_string(),
             }),
             InputFormat::Yaml => Err(UnitctlError::DeserializationError {
                 message: "YAML is no longer supported: convert the file to JSON first, for example with \
@@ -254,6 +241,7 @@ impl TryInto<KnownSize> for &InputFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UnitSerializableMap;
 
     #[test]
     fn can_parse_file_extensions() {
@@ -355,10 +343,11 @@ mod tests {
     }
 
     /// The body Unit receives keeps member order.  JSON is sent as it was
-    /// written, so it can only keep it.  JSON5 is parsed and re-serialized, and
-    /// both ends of that have to keep it.
+    /// written, so it can only keep it.  The check stays because the response
+    /// side still parses into `UnitSerializableMap`, which keeps order only
+    /// while `serde_json`'s "preserve_order" feature is on.
     #[test]
-    fn every_input_format_keeps_member_order() {
+    fn a_json_body_keeps_member_order() {
         let json = MEMBERS
             .iter()
             .map(|name| format!("  \"{}\": {{}}", name))
@@ -367,7 +356,6 @@ mod tests {
         let json = format!("{{\n{}\n}}\n", json);
 
         assert_eq!(members_of(&write_input(&json, ".json"), InputFormat::Json), MEMBERS);
-        assert_eq!(members_of(&write_input(&json, ".json5"), InputFormat::Json5), MEMBERS);
     }
 
     /// A JSON file is sent byte for byte.  Parsing it here kept the last of two
@@ -418,6 +406,27 @@ mod tests {
 
         assert!(
             error.to_string().contains("hjson is no longer supported"),
+            "unexpected message: {}",
+            error
+        );
+    }
+
+    /// JSON5 is refused by name too.  unitctl parsed it until the PUT path
+    /// stopped parsing anything; keeping the variant means a ".json5" file
+    /// gets told what to do instead of reaching the JSON parser.
+    #[test]
+    fn a_json5_input_is_refused_with_a_message_about_json5() {
+        let file = write_input("{\n  // a comment\n  routes: [],\n}\n", ".json5");
+        let input = InputFile::from(file.path());
+
+        assert!(input.is_config(), ".json5 must stay a config format");
+
+        let Err(error) = input.to_config_body() else {
+            panic!("JSON5 must be refused");
+        };
+
+        assert!(
+            error.to_string().contains("JSON5 is no longer supported"),
             "unexpected message: {}",
             error
         );
