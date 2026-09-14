@@ -442,9 +442,16 @@ nxt_http_comp_compressor_lookup_enabled(const nxt_str_t *token)
         return NXT_HTTP_COMP_SCHEME_IDENTITY;
     }
 
+    /*
+     * RFC 9110 Sect. 8.4.1: a content coding is a token, and tokens are
+     * compared case-insensitively.  "Identity;q=0" and "GZIP" are as valid
+     * as the lowercase spellings, and a case-sensitive compare silently
+     * ignores them -- which, for identity, means missing a refusal.
+     */
+
     for (nxt_uint_t i = 0; i < nxt_http_comp_nr_enabled_compressors; i++) {
-        if (nxt_strstr_eq(token,
-                          &nxt_http_comp_enabled_compressors[i].type->token))
+        if (nxt_strcasestr_eq(token,
+                              &nxt_http_comp_enabled_compressors[i].type->token))
         {
             return i;
         }
@@ -474,7 +481,17 @@ static nxt_int_t
 nxt_http_comp_select_compressor(nxt_http_request_t *r, const nxt_str_t *token,
     bool *identity_refused)
 {
+    /*
+     * "identity_allowed" carries what the wildcard said; "identity_named"
+     * and "identity_named_ok" carry what an explicit "identity" token said.
+     * They are kept apart because the explicit one wins: in
+     * "gzip, identity;q=0.5, *;q=0" the client refused everything it did not
+     * name and then named identity as acceptable, so identity is acceptable.
+     * Collapsing the two lets the wildcard veto a coding the client allowed.
+     */
     bool       identity_allowed = true;
+    bool       identity_named = false;
+    bool       identity_named_ok = false;
     char       *str, *tkn, *tail, *cur;
     double     weight = 0.0;
     nxt_int_t  idx = NXT_HTTP_COMP_SCHEME_IDENTITY;
@@ -528,8 +545,14 @@ nxt_http_comp_select_compressor(nxt_http_request_t *r, const nxt_str_t *token,
 
         scheme = nxt_http_comp_enabled_compressors[ecidx].type->scheme;
 
-        if (qval == 0.0 && scheme == NXT_HTTP_COMP_SCHEME_IDENTITY) {
-            identity_allowed = false;
+        if (scheme == NXT_HTTP_COMP_SCHEME_IDENTITY) {
+            if (enc.length == 1 && enc.start[0] == '*') {
+                identity_allowed = (qval != 0.0);
+
+            } else {
+                identity_named = true;
+                identity_named_ok = (qval != 0.0);
+            }
         }
 
         if (qval == 0.0 || qval < weight) {
@@ -538,6 +561,10 @@ nxt_http_comp_select_compressor(nxt_http_request_t *r, const nxt_str_t *token,
 
         idx = ecidx;
         weight = qval;
+    }
+
+    if (identity_named) {
+        identity_allowed = identity_named_ok;
     }
 
     *identity_refused = !identity_allowed;
