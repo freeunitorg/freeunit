@@ -12,9 +12,8 @@ dropped the client keep-alive, losing any pipelined follow-up request.
 Each case pipelines two requests in a single write: the bodyless one, then a
 plain GET.  The second response arriving at all is the regression assertion.
 
-1xx is out of scope here: an upstream 1xx is an interim response, and nothing
-in the peer reader continues the exchange past it (that is pre-existing, see
-nxt_h1p_peer_header_parse), so it is left on the path it already had.
+1xx is covered by test_proxy_interim.py: nxt_h1p_peer_header_parse() consumes
+an interim response and reads on for the final one.
 
 These cases also drive both shapes the header read can take -- with and
 without body bytes alongside the header -- but they cannot assert that the
