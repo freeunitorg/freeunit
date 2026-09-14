@@ -10,6 +10,17 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="bugfix">
+<para>
+an upstream 1xx interim response ("100 Continue", "103 Early Hints") was
+relayed to the client as the response, and the final response that followed
+it was relayed as its body -- or taken as the answer to a pipelined request.
+Unit forwards a client's "Expect: 100-continue" verbatim, so any upstream
+that honours it drew the 100.  The proxy now consumes interim responses (101
+excepted) and relays the final one.
+</para>
+</change>
+
 <change type="security">
 <para>
 the string form of "access_log" "format" wrote what a variable expanded to
