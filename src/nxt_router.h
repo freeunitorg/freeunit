@@ -162,6 +162,15 @@ struct nxt_app_s {
     uint32_t               idle_processes;
 
     /*
+     * Workers that answered a request and kept running.  Counted in
+     * ->processes like any live worker -- a subset of it, not a separate
+     * population -- but never in ->idle_processes, because the reaper walks
+     * idle_ports and asserts that queue is non-empty while idle_processes
+     * exceeds spare_processes.
+     */
+    uint32_t               detached_processes;
+
+    /*
      * Application processes the router asked for, that were forked, and that
      * it has neither a port nor a pid for: the ones a "limits":
      * {"start_timeout"} deadline gave up on.  Such a worker is not in
@@ -343,6 +352,12 @@ void nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
 
 void nxt_router_access_log_reopen_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
+
+#if (NXT_TESTS)
+/* The detached edge handler, for the sender check test. */
+void nxt_router_test_detached_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+#endif
 
 #if (NXT_TESTS)
 /*

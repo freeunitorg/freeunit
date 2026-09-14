@@ -14,6 +14,7 @@ typedef struct {
     uint32_t          processes;
     uint32_t          unaccounted_processes;
     uint32_t          idle_processes;
+    uint32_t          detached_processes;
 } nxt_status_app_t;
 
 

@@ -402,6 +402,14 @@ static void nxt_router_http_request_release_post(nxt_task_t *task,
 static void nxt_router_http_request_release(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_router_oosm_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
+static void nxt_router_detached_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid,
+    uint8_t state);
+static nxt_bool_t nxt_router_app_port_idle(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_t *port);
+static nxt_bool_t nxt_router_app_port_busy(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_t *port, const char *reason);
 static void nxt_router_get_port_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static void nxt_router_get_mmap_handler(nxt_task_t *task,
@@ -441,6 +449,7 @@ static const nxt_port_handlers_t  nxt_router_process_port_handlers = {
     .rpc_ready    = nxt_port_rpc_handler,
     .rpc_error    = nxt_port_rpc_handler,
     .oosm         = nxt_router_oosm_handler,
+    .detached     = nxt_router_detached_handler,
 };
 
 
@@ -1725,6 +1734,7 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         app_stat->processes = app->processes;
         app_stat->unaccounted_processes = app->unaccounted_processes;
         app_stat->idle_processes = app->idle_processes;
+        app_stat->detached_processes = app->detached_processes;
 
         report->apps_count++;
         app_stat++;
@@ -5603,8 +5613,7 @@ nxt_router_req_headers_ack_handler(nxt_task_t *task,
     nxt_app_t           *app;
     nxt_buf_t           *b, *next;
     nxt_bool_t          start_process, unlinked;
-    nxt_port_t          *app_port, *main_app_port, *idle_port;
-    nxt_queue_link_t    *idle_lnk;
+    nxt_port_t          *app_port, *main_app_port;
     nxt_http_request_t  *r;
 
     nxt_debug(task, "stream #%uD: got ack from %PI:%d",
@@ -5617,7 +5626,6 @@ nxt_router_req_headers_ack_handler(nxt_task_t *task,
     app = req_rpc_data->app;
     r = req_rpc_data->request;
 
-    start_process = 0;
     unlinked = 0;
 
     nxt_thread_mutex_lock(&app->mutex);
@@ -5645,41 +5653,7 @@ nxt_router_req_headers_ack_handler(nxt_task_t *task,
 
     main_app_port = app_port->main_app_port;
 
-    if (nxt_queue_chk_remove(&main_app_port->idle_link)) {
-        app->idle_processes--;
-
-        nxt_debug(task, "app '%V' move port %PI:%d out of %s (ack)",
-                  &app->name, main_app_port->pid, main_app_port->id,
-                  (main_app_port->idle_start ? "idle_ports" : "spare_ports"));
-
-        /* Check port was in 'spare_ports' using idle_start field. */
-        if (main_app_port->idle_start == 0
-            && app->idle_processes >= app->spare_processes)
-        {
-            /*
-             * If there is a vacant space in spare ports,
-             * move the last idle to spare_ports.
-             */
-            nxt_assert(!nxt_queue_is_empty(&app->idle_ports));
-
-            idle_lnk = nxt_queue_last(&app->idle_ports);
-            idle_port = nxt_queue_link_data(idle_lnk, nxt_port_t, idle_link);
-            nxt_queue_remove(idle_lnk);
-
-            nxt_queue_insert_tail(&app->spare_ports, idle_lnk);
-
-            idle_port->idle_start = 0;
-
-            nxt_debug(task, "app '%V' move port %PI:%d from idle_ports "
-                      "to spare_ports",
-                      &app->name, idle_port->pid, idle_port->id);
-        }
-
-        if (nxt_router_app_can_start(app) && nxt_router_app_need_start(app)) {
-            app->pending_processes++;
-            start_process = 1;
-        }
-    }
+    start_process = nxt_router_app_port_busy(task, app, main_app_port, "ack");
 
     main_app_port->active_requests++;
 
@@ -6501,6 +6475,127 @@ nxt_router_app_unlink(nxt_task_t *task, nxt_app_t *app)
 }
 
 
+/*
+ * Take a port out of the idle economy.  Called with app->mutex held; answers
+ * whether the caller must start a replacement process once it has dropped the
+ * lock.  Does nothing to a port that is not in one of the idle queues.
+ *
+ * Two events reach this transition.  An acknowledgement, where a worker has
+ * taken a request the router was still holding for it, and the start of
+ * detached work, where a worker the router has already parked as idle says it
+ * is in fact still running.  The second is why this is a function rather than
+ * a block: setting ->detached without unwinding leaves a port that
+ * nxt_router_app_port_idle() will refuse to insert again and that
+ * nxt_router_adjust_idle_timer() will still reap, so the flag and the unwind
+ * have to happen in one critical section.
+ *
+ * "reason" is for the debug log only.
+ */
+
+static nxt_bool_t
+nxt_router_app_port_busy(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
+    const char *reason)
+{
+    nxt_bool_t        start_process;
+    nxt_port_t        *idle_port;
+    nxt_queue_link_t  *idle_lnk;
+
+    start_process = 0;
+
+    if (!nxt_queue_chk_remove(&port->idle_link)) {
+        return 0;
+    }
+
+    app->idle_processes--;
+
+    nxt_debug(task, "app '%V' move port %PI:%d out of %s (%s)",
+              &app->name, port->pid, port->id,
+              (port->idle_start ? "idle_ports" : "spare_ports"), reason);
+
+    /* Check port was in 'spare_ports' using idle_start field. */
+    if (port->idle_start == 0 && app->idle_processes >= app->spare_processes) {
+        /*
+         * If there is a vacant space in spare ports,
+         * move the last idle to spare_ports.
+         */
+        nxt_assert(!nxt_queue_is_empty(&app->idle_ports));
+
+        idle_lnk = nxt_queue_last(&app->idle_ports);
+        idle_port = nxt_queue_link_data(idle_lnk, nxt_port_t, idle_link);
+        nxt_queue_remove(idle_lnk);
+
+        nxt_queue_insert_tail(&app->spare_ports, idle_lnk);
+
+        idle_port->idle_start = 0;
+
+        nxt_debug(task, "app '%V' move port %PI:%d from idle_ports "
+                  "to spare_ports",
+                  &app->name, idle_port->pid, idle_port->id);
+    }
+
+    if (nxt_router_app_can_start(app) && nxt_router_app_need_start(app)) {
+        app->pending_processes++;
+        start_process = 1;
+    }
+
+    return start_process;
+}
+
+
+/*
+ * Hand a port back to the idle economy, if it is really idle.  Called with
+ * app->mutex held; answers whether the caller must post app->adjust_idle_work
+ * once it has dropped the lock, which is how the reaper's timer gets armed.
+ *
+ * Extracted from nxt_router_app_port_release() because the end of detached
+ * work reaches the same transition from nxt_router_detached_handler(), and a
+ * second copy of a block that touches three queues and two counters is how
+ * they drift apart.
+ */
+
+static nxt_bool_t
+nxt_router_app_port_idle(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port)
+{
+    nxt_bool_t  adjust_idle_timer;
+
+    adjust_idle_timer = 0;
+
+    if (port->pair[1] != -1
+        && port->active_requests == 0
+        && port->active_websockets == 0
+        && port->detached == 0
+        && port->idle_link.next == NULL)
+    {
+        if (app->idle_processes == app->spare_processes
+            && app->adjust_idle_work.data == NULL)
+        {
+            adjust_idle_timer = 1;
+            app->adjust_idle_work.data = app;
+            app->adjust_idle_work.next = NULL;
+        }
+
+        if (app->idle_processes < app->spare_processes) {
+            nxt_queue_insert_tail(&app->spare_ports, &port->idle_link);
+
+            nxt_debug(task, "app '%V' move port %PI:%d to spare_ports",
+                      &app->name, port->pid, port->id);
+
+        } else {
+            nxt_queue_insert_tail(&app->idle_ports, &port->idle_link);
+
+            port->idle_start = task->thread->engine->timers.now;
+
+            nxt_debug(task, "app '%V' move port %PI:%d to idle_ports",
+                      &app->name, port->pid, port->id);
+        }
+
+        app->idle_processes++;
+    }
+
+    return adjust_idle_timer;
+}
+
+
 static void
 nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     nxt_apr_action_t action)
@@ -6562,37 +6657,7 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
         nxt_port_inc_use(main_app_port);
     }
 
-    adjust_idle_timer = 0;
-
-    if (main_app_port->pair[1] != -1
-        && main_app_port->active_requests == 0
-        && main_app_port->active_websockets == 0
-        && main_app_port->idle_link.next == NULL)
-    {
-        if (app->idle_processes == app->spare_processes
-            && app->adjust_idle_work.data == NULL)
-        {
-            adjust_idle_timer = 1;
-            app->adjust_idle_work.data = app;
-            app->adjust_idle_work.next = NULL;
-        }
-
-        if (app->idle_processes < app->spare_processes) {
-            nxt_queue_insert_tail(&app->spare_ports, &main_app_port->idle_link);
-
-            nxt_debug(task, "app '%V' move port %PI:%d to spare_ports",
-                      &app->name, main_app_port->pid, main_app_port->id);
-        } else {
-            nxt_queue_insert_tail(&app->idle_ports, &main_app_port->idle_link);
-
-            main_app_port->idle_start = task->thread->engine->timers.now;
-
-            nxt_debug(task, "app '%V' move port %PI:%d to idle_ports",
-                      &app->name, main_app_port->pid, main_app_port->id);
-        }
-
-        app->idle_processes++;
-    }
+    adjust_idle_timer = nxt_router_app_port_idle(task, app, main_app_port);
 
     nxt_thread_mutex_unlock(&app->mutex);
 
@@ -6622,13 +6687,15 @@ void
 nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
 {
     nxt_app_t         *app;
-    nxt_bool_t        unchain, start_process;
+    nxt_bool_t        unchain, start_process, detached;
     nxt_port_t        *idle_port;
     nxt_queue_link_t  *idle_lnk;
 
     app = port->app;
 
     nxt_assert(app != NULL);
+
+    detached = 0;
 
     nxt_thread_mutex_lock(&app->mutex);
 
@@ -6688,6 +6755,21 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
 
     app->processes--;
 
+    /*
+     * A worker can die in the middle of its detached work -- a fatal error
+     * after the response went out, or a kill.  This is the only path that
+     * runs for it then, so the count has to be settled here or the
+     * application never reaches the zero nxt_router_free_app() asserts on.
+     * The matching application reference is dropped below, outside the lock.
+     */
+
+    detached = port->detached;
+
+    if (detached) {
+        port->detached = 0;
+        app->detached_processes--;
+    }
+
     start_process = !task->thread->engine->shutdown
                     && nxt_router_app_can_start(app)
                     && nxt_router_app_need_start(app);
@@ -6702,6 +6784,12 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
 
     if (unchain) {
         nxt_port_use(task, port, -1);
+    }
+
+    /* The reference nxt_router_detached_apply() took for this worker. */
+
+    if (detached) {
+        nxt_router_app_use(task, app, -1);
     }
 
     if (start_process) {
@@ -6749,6 +6837,18 @@ nxt_router_adjust_idle_timer(nxt_task_t *task, void *obj, void *data)
 
         lnk = nxt_queue_first(&app->idle_ports);
         port = nxt_queue_link_data(lnk, nxt_port_t, idle_link);
+
+        /*
+         * A worker running detached work must never be reachable from here:
+         * this loop clears ->app, which stops nxt_port_close() from ever
+         * running nxt_router_app_port_close() for the port, and the count
+         * and the application reference would then never be settled.
+         * nxt_router_app_port_idle() refuses to insert such a port and
+         * nxt_router_app_port_busy() takes one that is already here back
+         * out, both under this same mutex.
+         */
+
+        nxt_assert(port->detached == 0);
 
         timeout = port->idle_start + app->idle_timeout;
 
@@ -6889,6 +6989,7 @@ nxt_router_free_app(nxt_task_t *task, void *obj, void *data)
 
     nxt_assert(app->proto_port == NULL);
     nxt_assert(app->processes == 0);
+    nxt_assert(app->detached_processes == 0);
     nxt_assert(app->active_requests == 0);
     nxt_assert(app->port_hash_count == 0);
     nxt_assert(app->idle_processes == 0);
@@ -7515,6 +7616,231 @@ nxt_router_http_request_release(nxt_task_t *task, void *obj, void *data)
 
     nxt_mp_release(r->mem_pool);
 }
+
+
+/*
+ * An application says it answered a request and kept running, or that such
+ * work has finished.  PHP's fastcgi_finish_request() is the case this
+ * exists for: libunit reports the request done while the script runs on, so
+ * without this the router counts the worker idle, hands its slot back to
+ * "processes": {"max"}, and reaps a process that is still executing.
+ *
+ * Runs on the router's main thread, because the message arrives on the
+ * router's own port; see nxt_router_detached_handler().  The port is
+ * identified by pid alone: the accounting hangs off the application's main
+ * port, the one with id 0, and a worker has exactly one however many
+ * contexts it runs.  Looking it up rather than following ->main_app_port
+ * from the sender's port is also what keeps this off a stale pointer -- that
+ * field is never cleared, and the main port can be released while a sibling
+ * port of the same process is still registered.
+ *
+ * Either edge may arrive with the port already in the state being asked
+ * for, and both then do nothing: a start edge is idempotent because several
+ * contexts of one worker can be detached at once, and a finish edge because
+ * the worker's death has already settled the state.
+ */
+
+static void
+nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid, uint8_t state)
+{
+    int                drop;
+    nxt_app_t          *app;
+    nxt_port_t         *port;
+    nxt_bool_t         changed, start_process, adjust_idle_timer;
+    nxt_runtime_t      *rt;
+    nxt_atomic_uint_t  c;
+
+    rt = task->thread->runtime;
+
+    nxt_assert(task->thread->engine == rt->main_engine);
+
+    port = nxt_runtime_port_find(rt, pid, 0);
+
+    if (nxt_slow_path(port == NULL)) {
+        nxt_debug(task, "detached_handler: %PI has no main port", pid);
+        return;
+    }
+
+    app = port->app;
+
+    if (nxt_slow_path(app == NULL)) {
+        nxt_debug(task, "detached_handler: port %PI:%d has no application",
+                  pid, port->id);
+        return;
+    }
+
+    /*
+     * A reference, taken only if the application still has one.  The
+     * count reaching zero is what posts nxt_router_free_app() to this
+     * thread, and the last drop can happen on a worker engine while this
+     * edge is already on its way here: the request that held the
+     * application is released there, and a reconfiguration has already
+     * taken the configuration's reference.  A plain increment would
+     * resurrect an application whose free is queued behind this handler,
+     * and the start it may post below would then lock a mutex in freed
+     * memory.  Zero is treated exactly like no application at all; the
+     * free that is coming clears ->app and QUITs the worker.
+     */
+
+    for ( ;; ) {
+        c = app->use_count;
+
+        if (c == 0) {
+            nxt_debug(task, "detached_handler: app '%V' is being freed",
+                      &app->name);
+            return;
+        }
+
+        if (nxt_atomic_cmp_set(&app->use_count, c, c + 1)) {
+            break;
+        }
+    }
+
+    nxt_debug(task, "app '%V' port %PI:%d detached state %d",
+              &app->name, port->pid, port->id, (int) state);
+
+    changed = 0;
+    start_process = 0;
+    adjust_idle_timer = 0;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    if (state == NXT_PORT_DETACHED_START) {
+
+        if (port->detached == 0) {
+            port->detached = 1;
+            app->detached_processes++;
+            changed = 1;
+
+            /*
+             * The worker may already have been parked as idle.  libunit
+             * sends the start edge before the last response message, but
+             * that only orders the two on the wire: the response is
+             * answered by the engine that owns the request, this by the
+             * main thread, and a request that was failed rather than
+             * answered -- a "limits": {"timeout"} expiry, an error -- runs
+             * nxt_router_app_port_release() with no start edge in sight at
+             * all, so the port can have been sitting in idle_ports for as
+             * long as the application chose to keep running.
+             *
+             * Unwind it here, exactly as an acknowledgement does.  Leaving
+             * it in place would be worse than not having this message: the
+             * reaper would QUIT a worker that is still executing -- the bug
+             * this exists to fix -- and would clear ->app on the way, so
+             * nxt_router_app_port_close() would never run and the count and
+             * the application reference below would never be settled.
+             */
+
+            start_process = nxt_router_app_port_busy(task, app, port,
+                                                     "detached");
+        }
+
+    } else if (port->detached != 0) {
+        port->detached = 0;
+        app->detached_processes--;
+        changed = 1;
+
+        /*
+         * Only now may this worker rejoin the idle economy.  Its last
+         * response went out long ago, so nothing else will run this
+         * transition for it.
+         */
+
+        adjust_idle_timer = nxt_router_app_port_idle(task, app, port);
+    }
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    if (adjust_idle_timer) {
+        nxt_router_app_use(task, app, 1);
+        nxt_event_engine_post(app->engine, &app->adjust_idle_work);
+    }
+
+    /*
+     * Holding the reference taken above: this is the only caller that can
+     * reach nxt_router_start_app_process() with no reference of its own.
+     */
+
+    if (start_process) {
+        nxt_router_start_app_process(task, app);
+    }
+
+    /*
+     * A start edge that changed the state keeps the reference taken above:
+     * it is what keeps this worker's application alive for as long as the
+     * work runs.  A detached worker holds no request, and a request is what
+     * otherwise holds the application -- by the time the work starts
+     * nxt_request_rpc_data_unlink() has already dropped its reference, so a
+     * configuration reload could free the application out from under a
+     * process still executing.  The finish edge that changed the state
+     * returns it, and an edge that changed nothing returns only its own, so
+     * a repeated start cannot take a second reference that the single
+     * finish never returns.
+     */
+
+    drop = 1;
+
+    if (changed) {
+        drop = (state == NXT_PORT_DETACHED_START) ? 0 : 2;
+    }
+
+    if (drop != 0) {
+        nxt_router_app_use(task, app, -drop);
+    }
+}
+
+
+/*
+ * The edge arrives on the router's own port, whichever engine answered the
+ * request: libunit sends both edges to its router port, the way it sends
+ * OOSM.  That port is read on the main thread, which is where everything
+ * the edge touches lives -- rt->ports is read without a lock, which is only
+ * safe on the thread that adds to and removes from it, and an application
+ * is freed on app->engine, the same thread.  One socket per worker also
+ * keeps a finish edge behind the start edge that preceded it, which the
+ * ports of two engines could not: their reads race, and the flag would be
+ * cleared under the next request's work.
+ */
+
+static void
+nxt_router_detached_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    /*
+     * The pid in the message is chosen by the sender, and every worker holds
+     * a copy of this port.  Accept an edge only for the process that sent it,
+     * or a worker could pin another worker as detached or release one.  The
+     * router port has no shared memory queue, so the message always comes
+     * from the socket and carries the kernel's credentials.
+     */
+    if (nxt_slow_path(nxt_recv_msg_cmsg_pid(msg) != msg->port_msg.pid)) {
+        nxt_alert(task, "process %PI sent a detached edge for process %PI",
+                  nxt_recv_msg_cmsg_pid(msg), msg->port_msg.pid);
+        return;
+    }
+
+    if (nxt_slow_path(msg->buf == NULL
+                      || nxt_buf_used_size(msg->buf) < (int) sizeof(uint8_t)))
+    {
+        nxt_alert(task, "detached_handler: %PI sent no state byte",
+                  msg->port_msg.pid);
+        return;
+    }
+
+    nxt_router_detached_apply(task, msg->port_msg.pid, *msg->buf->mem.pos);
+}
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_router_detached_test.c. */
+
+void
+nxt_router_test_detached_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_router_detached_handler(task, msg);
+}
+
+#endif
 
 
 static void
