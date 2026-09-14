@@ -600,6 +600,12 @@ connection to 10 MB of payload that the application has not received yet
 receive()); a single frame larger than that is still accepted when nothing else
 is waiting.  A fragmented message also left a count behind that lowered the
 limit applied to the next message.
+a byte-range request from a client that refused the identity coding is no
+longer answered with identity bytes.  A range is served as identity, so
+Range together with "Accept-Encoding: identity;q=0" returned a 206 carrying
+exactly the bytes the client said it would not take; the range is now
+ignored and the full 200 is sent in a coding the client accepts.  A request
+that accepts no coding at all is still 406.
 </para>
 </change>
 
