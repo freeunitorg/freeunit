@@ -24,7 +24,7 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
     *) Change: upgrade contrib njs to 1.0.1.
 
-    *) Bugfix: a port message that was queued because the peer's socket was
+    *) Security: a port message that was queued because the peer's socket was
        not writable borrowed the descriptors it carried -- for NEW_PORT,
        another port's socket and queue -- so a port closed before the queue
        drained left the deferred sendmsg() naming a closed number, or an

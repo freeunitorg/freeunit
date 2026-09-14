@@ -31,7 +31,7 @@ replaces anything that is not valid UTF-8 with U+FFFD before it serializes.
 </para>
 </change>
 
-<change type="bugfix">
+<change type="security">
 <para>
 a port message that was queued because the peer's socket was not writable
 borrowed the descriptors it carried -- for NEW_PORT, another port's socket
