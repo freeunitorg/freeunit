@@ -623,8 +623,8 @@ nxt_http_comp_is_resp_content_encoded(const nxt_http_request_t *r)
  * them.
  */
 
-static nxt_int_t
-nxt_http_comp_set_vary(nxt_http_request_t *r)
+nxt_int_t
+nxt_http_comp_merge_vary(nxt_http_request_t *r)
 {
     u_char                  *p, *end, *tok;
     nxt_int_t               len;
@@ -856,7 +856,9 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
      * negotiation on Accept-Encoding, whichever coding is chosen below.
      */
 
-    if (nxt_slow_path(nxt_http_comp_set_vary(r) != NXT_OK)) {
+    r->resp.vary_accept_encoding = 1;
+
+    if (nxt_slow_path(nxt_http_comp_merge_vary(r) != NXT_OK)) {
         return NXT_ERROR;
     }
 

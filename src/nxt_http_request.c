@@ -697,6 +697,24 @@ nxt_http_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
     }
 
     /*
+     * "response_headers" has just run, and it replaces or removes a field it
+     * names outright.  A response chosen by negotiation still varies on
+     * Accept-Encoding whatever an operator wrote there -- almost always they
+     * are adding Origin for CORS, unaware Unit generates the field at all --
+     * so dropping it here would hand a shared cache the licence to serve one
+     * coding to every client.  Re-assert it.  The merge is idempotent: it
+     * leaves "*" alone, leaves a list that already names the header alone,
+     * and re-adds the field if it was removed.
+     */
+
+    if (r->resp.vary_accept_encoding) {
+        ret = nxt_http_comp_merge_vary(r);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            goto fail;
+        }
+    }
+
+    /*
      * RFC 9112 Sect. 6.3: a 1xx, 204 or 304 response, and any response to a
      * HEAD request, never has a message body, no matter what the response
      * headers say.  Record that here, in the layer every response source

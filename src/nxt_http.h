@@ -118,6 +118,14 @@ typedef struct {
     nxt_http_field_t                *content_length;
     nxt_off_t                       content_length_n;
     const nxt_str_t                 *mime_type;
+
+    /*
+     * The response was chosen by negotiation on Accept-Encoding, so its Vary
+     * must name that header.  Kept on the response because "response_headers"
+     * is applied after the header is generated and may replace or remove it;
+     * nxt_http_request_header_send() re-asserts it once that has run.
+     */
+    uint8_t                         vary_accept_encoding;  /* 1 bit */
 } nxt_http_response_t;
 
 
@@ -492,6 +500,7 @@ nxt_int_t nxt_http_rewrite_init(nxt_router_conf_t *rtcf,
 nxt_int_t nxt_http_rewrite(nxt_task_t *task, nxt_http_request_t *r);
 
 nxt_bool_t nxt_http_set_headers_override_validators(nxt_http_request_t *r);
+nxt_int_t nxt_http_comp_merge_vary(nxt_http_request_t *r);
 nxt_int_t nxt_http_set_headers_init(nxt_router_conf_t *rtcf,
     nxt_http_action_t *action, nxt_http_action_conf_t *acf);
 nxt_int_t nxt_http_set_headers(nxt_http_request_t *r);
