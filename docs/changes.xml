@@ -327,6 +327,19 @@ invalidated.
 </para>
 </change>
 
+<change type="change">
+<para>
+unitctl sends a JSON configuration file as it was written.  It parsed the file
+and re-serialized it before, which kept the last of two object members with the
+same name and re-spelled numbers, so the server never saw what the operator
+wrote.  Unit now reports the duplicate itself, with the line and column of the
+file.  JSON5 input is still parsed, because it is not JSON.  A file that is not
+valid UTF-8 is no longer refused by unitctl; Unit refuses it and names the
+member.  The "edit" command no longer accepts JSON5 comments in the temporary
+file.
+</para>
+</change>
+
 </changes>
 
 

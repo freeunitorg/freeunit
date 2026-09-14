@@ -36,6 +36,14 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        socket address; it refuses one with a message naming the feature.  A
        Unix socket or a plain "http://" address is unaffected, and a build
        with default features behaves as before.
+    *) Change: unitctl sends a JSON configuration file as it was written.  It
+       parsed the file and re-serialized it before, which kept the last of two
+       object members with the same name and re-spelled numbers, so the server
+       never saw what the operator wrote.  Unit now reports the duplicate
+       itself, with the line and column of the file.  JSON5 input is still
+       parsed, because it is not JSON.  A file that is not valid UTF-8 is no
+       longer refused by unitctl; Unit refuses it and names the member.  The
+       "edit" command no longer accepts JSON5 comments in the temporary file.
 
     *) Feature: conditional requests for static files. A "share" action now
        answers a GET or HEAD carrying "If-None-Match" or "If-Modified-Since"
