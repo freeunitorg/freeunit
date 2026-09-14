@@ -188,7 +188,8 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        the nu-json dependency and the 30 crates of Nushell utility code it
        pulled in for a tool that speaks one JSON control API.  It also
        removes serde_yaml and unsafe-libyaml; the latter is a c2rust
-       transpile of libyaml with 241 unsafe lines and no RustSec advisory.
+       transpile of libyaml with 218 unsafe functions and no RustSec
+       advisory.
        tools/unitc is unaffected: it still converts configuration to and
        from YAML, using yq.
 

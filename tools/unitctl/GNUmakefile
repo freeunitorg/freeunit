@@ -104,7 +104,7 @@ target/release/$(OUTPUT_BINARY): openapi-generate
 
 .PHONY: test
 test: openapi-generate ## Run tests
-	$Q $(CARGO) test
+	$Q $(CARGO) test $(HOST_FEATURE_FLAGS)
 
 .ONESHELL: target/man/$(OUTPUT_BINARY).1.gz
 target/man/$(OUTPUT_BINARY).1.gz:
