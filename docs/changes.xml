@@ -77,8 +77,8 @@ configured answered "406 Not Acceptable" without closing the file it had
 opened, so a single unauthenticated request carrying
 "Accept-Encoding: identity;q=0, *;q=0" cost the router a descriptor, and
 repeating it exhausted the table, stopping every application behind that
-router.  Present since compression was added: 1.35.4, 1.35.5, 1.36.0 and
-1.36.1 are all affected.
+router.  Present since compression was added in 1.35.0: 1.35.0, 1.35.1,
+1.35.2, 1.35.3, 1.35.4, 1.35.5, 1.36.0 and 1.36.1 are all affected.
 </para>
 </change>
 
