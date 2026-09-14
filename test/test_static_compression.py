@@ -430,3 +430,25 @@ def test_static_compression_range_identity_refused_guards(temp_dir):
     )
     assert status == 200, 'a mixed-case identity token still refuses'
     assert headers.get('Content-Encoding') == 'gzip'
+
+    # The weight is "('q' / 'Q') '=' qvalue" (Sect. 12.4.2), and an ABNF
+    # literal is case-insensitive anyway.  A strstr() for ";q=" alone misses
+    # ";Q=", and for identity a missed weight is a missed refusal -- the
+    # request gets the 206 of identity bytes it asked not to receive.
+    status, headers, _ = _raw_get(
+        **{'Accept-Encoding': 'gzip, identity;Q=0', 'Range': 'bytes=0-9'}
+    )
+    assert status == 200, 'an uppercase Q still refuses'
+    assert headers.get('Content-Encoding') == 'gzip'
+
+    # "*" is a tchar, so "*foo" is a legal coding name that Unit does not
+    # have -- not the wildcard.  Matching the wildcard on the first byte
+    # alone made an unknown coding refuse identity and cost the client a
+    # range it could have taken.
+    status, headers, body = _raw_get(
+        **{'Accept-Encoding': 'gzip, *foo;q=0', 'Range': 'bytes=0-9'}
+    )
+    assert status == 206, 'an unknown coding is not the wildcard'
+    assert 'Content-Encoding' not in headers
+    assert headers['Content-Range'] == f'bytes 0-9/{size}'
+    assert body == b'body{color'
