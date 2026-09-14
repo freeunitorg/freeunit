@@ -1345,15 +1345,18 @@ nxt_proto_child_exited(nxt_task_t *task, nxt_process_t *process)
              * cleared only once the answer has actually been written or
              * queued, which is what makes the REMOVE_PID below streamless.
              *
-             * The failure that reaches this call site is an allocation
-             * failure, and it leaves no message behind.  The prototype maps
-             * no queue for a router port -- nxt_app_new_port_handler()
-             * closes the queue descriptor every NEW_PORT carries, and main
-             * maps a queue only for an application port -- so
-             * nxt_port_socket_write2() never takes the shared-ring path that
-             * answers NXT_AGAIN, and what is left is
-             * nxt_port_msg_chk_insert() failing to allocate.  Keeping
-             * ->stream then lets the REMOVE_PID carry it, and
+             * Three failures reach this call site, and none of them leaves
+             * a message behind.  The prototype maps no queue for a router
+             * port -- nxt_app_new_port_handler() closes the queue descriptor
+             * every NEW_PORT carries, and main maps a queue only for an
+             * application port -- so nxt_port_socket_write2() never takes
+             * the shared-ring path that answers NXT_AGAIN.  What is left is
+             * nxt_port_msg_chk_insert() failing to allocate; an inline
+             * write that hit EAGAIN with no memory left to hold it for a
+             * later attempt; and an inline write to a router port whose
+             * peer has died.
+             *
+             * Keeping ->stream then lets the REMOVE_PID carry it, and
              * nxt_router_remove_pid_handler() turns that into the same RPC
              * error -- the fallback the CREATED path has always used.
              * Clearing it regardless would leave the start RPC armed and
@@ -1363,19 +1366,11 @@ nxt_proto_child_exited(nxt_task_t *task, nxt_process_t *process)
              * REMOVE_PID allocates a buffer and a message of its own from
              * the same pools and can fail the same way, and then only the
              * application's "limits.start_timeout" retires the start.  The
-             * alert below is what makes that case visible instead of silent.
-             * One more shape reaches the same branch.  The router port is
-             * writable, so the RPC_ERROR goes out inline and hits EAGAIN
-             * with no memory left to hold it for a later attempt.
-             * nxt_port_socket_write2() used to answer NXT_OK for that and
-             * drop the message, clearing the stream for a report nobody
-             * received.  REMOVE_PID could not rescue it either: the same
-             * EAGAIN had cleared write_ready, so REMOVE_PID was queued
-             * instead of sent, and the error handler that ran next drained
-             * it too.  It now answers NXT_ERROR with the message untouched,
-             * which keeps the stream armed here.  A send to a port whose
-             * peer has died still answers NXT_OK; the RPC is moot there
-             * anyway.
+             * alert below is what makes that case visible instead of
+             * silent.  After an EAGAIN, REMOVE_PID cannot rescue it either:
+             * the same EAGAIN cleared write_ready, so REMOVE_PID is queued
+             * rather than sent, and the error handler that runs next drains
+             * it too.
              */
             if (nxt_fast_path(ret == NXT_OK)) {
                 process->stream = 0;

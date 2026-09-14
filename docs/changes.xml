@@ -152,12 +152,30 @@ requests waiting on it were never failed.
 
 <change type="bugfix">
 <para>
-eight places that handed a message to a port did not take it back when the port
-refused it.  The port layer accepts a buffer only when it answers success, so on
-a refusal -- which happens when memory runs out, or when the receiving process
-has stopped reading a full shared queue -- the memory was lost.  Two of them
-lost shared memory that no cleanup reclaims, so an application could lose the
-capacity to answer at all.
+a message that could not be sent because the receiving process had died was
+reported to the sender as sent.  A sender that answers a request and then sends
+a fallback lost both, so an application could wait for an answer that nothing
+would ever deliver.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+eight places whose memory nothing else reclaims handed a message to a port and
+did not take it back when the port refused it.  The port layer accepts a buffer
+only when it answers success, so on a refusal -- which happens when memory runs
+out, or when the receiving process has stopped reading a full shared queue --
+the memory was lost.  Two of them lost shared memory that no cleanup reclaims,
+so an application could lose the capacity to answer at all.
+</para>
+</change>
+
+<change type="change">
+<para>
+a websocket connection is now closed when a frame cannot be handed to the
+application.  Such a frame was previously dropped in silence, leaving the
+peer's stream short a frame it was never told about -- which for a fragmented
+message the client cannot detect.
 </para>
 </change>
 

@@ -843,23 +843,22 @@ nxt_router_start_timeout_test(nxt_thread_t *thr)
     }
 
     /*
-     * A start whose write is accepted and then dropped inside the port layer.
+     * A start whose write the port layer refuses.
      *
      * With the port write-ready and its queue empty, nxt_port_msg_chk_insert()
-     * declines to queue and nxt_port_socket_write2() sends inline through
-     * nxt_port_write_handler().  A send that fails there -- here because the
-     * descriptor is -1, in the field because the peer is gone, or because
-     * nxt_port_msg_insert_tail() cannot allocate after an NXT_AGAIN, which
-     * happens against a perfectly live port -- drops a message that was never
-     * in port->messages.  write2() still answers NXT_OK, because the handler
-     * returns void.
+     * declines to queue and nxt_port_socket_write2() sends inline.  A send that
+     * fails there -- here because the descriptor is -1, in the field because
+     * the peer is gone -- leaves a message that was never in port->messages and
+     * was never consumed, so write2() answers NXT_ERROR.
      *
-     * So the deadline finds nothing to cancel and, waiting for the payload to
-     * be released, would wait for a completion nobody was going to run: the
-     * RPC and its pending_processes slot armed for good, which is the very
-     * wedge the option exists to bound.  nxt_port_msg_drop() completes the
-     * buffers of these dropped messages, so the wait ends the way every other
-     * one does.
+     * This start therefore needs no deadline: the caller takes its own
+     * "failed:" path, frees the payload it still owns, and gives the
+     * pending_processes slot back inside the call.
+     *
+     * The assertion that matters is the negative one below.  The port layer
+     * must not have completed that payload on its way out, because the caller
+     * frees it with nxt_mp_free() -- a completion queued here would run
+     * against freed memory.
      */
 
     app->pending_processes = 1;
@@ -889,25 +888,47 @@ nxt_router_start_timeout_test(nxt_thread_t *thr)
         goto done;
     }
 
-    /* The completion the drop queued, and the error handler it raised. */
+    /*
+     * One work item: the error handler the dead socket raised.  Not two --
+     * a buffer completion queued here would run against memory the caller
+     * has already handed to nxt_mp_free(), which is the double free the
+     * ownership contract exists to prevent, and it is why this leg counts
+     * rather than merely draining.
+     */
 
-    (void) nxt_router_start_timeout_test_drain(task, &engine);
+    ran = nxt_router_start_timeout_test_drain(task, &engine);
 
-    ran = nxt_router_start_timeout_test_tick(task, &engine, 2000);
-
-    if (ran == 0) {
+    if (ran != 1) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
-                      "router start timeout test: nothing bounded a start "
-                      "whose write was dropped inside the port layer");
+                      "router start timeout test: a refused write queued %d "
+                      "work items, expected 1 -- the port layer completed a "
+                      "payload the caller still owns and has freed",
+                      (int) ran);
         goto done;
     }
 
     if (app->proto_port_requests != 0 || app->pending_processes != 0) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start timeout test: a start whose write was "
-                      "dropped stayed armed, proto_port_requests %uD pending "
+                      "refused stayed armed, proto_port_requests %uD pending "
                       "%uD (expected 0 and 0)",
                       app->proto_port_requests, app->pending_processes);
+        goto done;
+    }
+
+    /*
+     * And no deadline was needed to get there: the refusal failed the start
+     * inside the call.  A timer firing here would mean it had been left armed
+     * for one to find, which is the state this leg exists to rule out.
+     */
+
+    ran = nxt_router_start_timeout_test_tick(task, &engine, 2000);
+
+    if (ran != 0) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router start timeout test: a deadline fired for a start "
+                      "the port layer had already refused (%d handlers)",
+                      (int) ran);
         goto done;
     }
 

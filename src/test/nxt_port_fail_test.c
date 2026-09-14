@@ -19,6 +19,7 @@ static nxt_int_t nxt_port_fail_test_socket_write(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_inline_drop(nxt_thread_t *thr);
 static void nxt_port_fail_test_enable_write(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
+static nxt_int_t nxt_port_fail_test_dead_peer(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_rpc_register(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_error_handler(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_mp_baseline(nxt_thread_t *thr);
@@ -62,6 +63,10 @@ nxt_port_fail_test(nxt_thread_t *thr)
     }
 
     if (nxt_port_fail_test_inline_drop(thr) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_port_fail_test_dead_peer(thr) != NXT_OK) {
         return NXT_ERROR;
     }
 
@@ -613,6 +618,240 @@ done:
     if (pair[0] != -1 && nxt_test_fd_is_open(pair[0])) {
         nxt_fd_close(pair[0]);
     }
+
+    nxt_port_use(task, port, -1);
+
+    thr->engine = saved_engine;
+
+    nxt_work_queue_cache_destroy(&engine.work_queue_cache);
+    nxt_mp_destroy(mp);
+
+    return ret;
+}
+
+
+/*
+ * The same wake-up, to a peer that is gone.
+ *
+ * The payload reaches the shared queue exactly as above, so it is the port's
+ * whatever becomes of the wake-up and the answer is still NXT_OK.  What
+ * differs is everything the port does afterwards.  An EAGAIN leaves a socket
+ * that will take writes again, so the marker is owed and the write event is
+ * re-armed.  A send that fails outright leaves a peer that will never read
+ * the ring, and nxt_port_write_msgs() has raised the error handler on it.
+ *
+ * Owing a marker there is not merely useless.  The re-arm enables the write
+ * event, the next pass finds announce non-zero and sends the marker again,
+ * and each pass is another failed send on a port the error handler is tearing
+ * down -- until the event fires on a port that has been freed.  That is what
+ * the application churn tests saw: repeated EPIPE, then pthread_mutex_lock()
+ * failing with EINVAL on the write mutex of a destroyed port.
+ */
+
+static nxt_int_t
+nxt_port_fail_test_dead_peer(nxt_thread_t *thr)
+{
+    nxt_mp_t               *mp;
+    nxt_fd_t               pair[2];
+    nxt_buf_t              *buf;
+    nxt_int_t              ret;
+    nxt_task_t             *task;
+    nxt_port_t             *port;
+    nxt_event_engine_t     engine, *saved_engine;
+    nxt_port_queue_t       *queue;
+    nxt_event_interface_t  stub;
+    u_char                 qbuf[NXT_PORT_QUEUE_MSG_SIZE];
+
+    task = thr->task;
+    task->thread = thr;
+
+    ret = NXT_ERROR;
+    pair[0] = -1;
+    pair[1] = -1;
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (nxt_slow_path(mp == NULL)) {
+        return NXT_ERROR;
+    }
+
+    port = nxt_port_fail_test_port(task);
+    if (nxt_slow_path(port == NULL)) {
+        nxt_mp_destroy(mp);
+        return NXT_ERROR;
+    }
+
+    nxt_memzero(&engine, sizeof(engine));
+    nxt_memzero(&stub, sizeof(stub));
+
+    nxt_work_queue_cache_create(&engine.work_queue_cache, 1024);
+    engine.fast_work_queue.cache = &engine.work_queue_cache;
+    nxt_work_queue_name(&engine.fast_work_queue, "fast");
+
+    stub.enable_write = nxt_port_fail_test_enable_write;
+    engine.event = stub;
+
+    saved_engine = thr->engine;
+    thr->engine = &engine;
+
+    port->engine = &engine;
+
+    if (nxt_slow_path(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) != 0)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: socketpair failed");
+        goto done;
+    }
+
+    port->pair[0] = pair[0];
+    port->pair[1] = pair[1];
+    port->socket.fd = pair[1];
+    port->socket.task = task;
+    port->socket.log = thr->log;
+    port->max_size = 1024;
+    port->max_share = 1024;
+
+    queue = nxt_mp_zalloc(mp, sizeof(nxt_port_queue_t));
+    if (nxt_slow_path(queue == NULL)) {
+        goto done;
+    }
+
+    nxt_port_queue_init(queue);
+    port->queue = queue;
+
+    buf = nxt_buf_mem_alloc(mp, 1, 0);
+    if (nxt_slow_path(buf == NULL)) {
+        goto done;
+    }
+
+    buf->completion_handler = nxt_port_fail_test_completion;
+    buf->mem.free++;
+
+    nxt_port_fail_test_completions = 0;
+    nxt_port_fail_test_rearms = 0;
+
+    /*
+     * The reader end goes now, so the wake-up fails outright rather than
+     * with EAGAIN.  Both copies of the number are cleared with it: the
+     * teardown below closes whatever port->pair[0] still holds, and closing
+     * a number twice would hand this fixture somebody else's descriptor.
+     */
+
+    nxt_fd_close(pair[0]);
+    pair[0] = -1;
+    port->pair[0] = -1;
+
+    port->socket.write_ready = 1;
+    port->socket.write = NXT_EVENT_INACTIVE;
+
+    ret = nxt_port_socket_write(task, port, NXT_PORT_MSG_DATA, -1, 0, 0, buf);
+
+    if (ret != NXT_OK) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: a payload that reached the shared "
+                      "queue answered %d after the peer was gone; the buffer "
+                      "is already the port's and the caller must not be told "
+                      "to reclaim it", (int) ret);
+        ret = NXT_ERROR;
+        goto done;
+    }
+
+    ret = NXT_ERROR;
+
+    nxt_port_fail_test_drain_wq(&engine.fast_work_queue);
+
+    if (nxt_port_fail_test_completions != 1) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: the enqueued payload was completed "
+                      "%d times, expected once",
+                      (int) nxt_port_fail_test_completions);
+        goto done;
+    }
+
+    if (port->announce != 0) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: a queue marker was owed to a peer "
+                      "that is gone (announce %d); every later pass resends "
+                      "it on a port the error handler is tearing down",
+                      (int) port->announce);
+        goto done;
+    }
+
+    if (nxt_port_fail_test_rearms != 0) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: the write event was re-armed %d "
+                      "times on a failed port, expected none",
+                      (int) nxt_port_fail_test_rearms);
+        goto done;
+    }
+
+    /*
+     * The same port, now owing a marker from before the peer died -- the
+     * state an earlier EAGAIN leaves, and the one the re-arm exists to
+     * settle.  A failed pass must not settle it: the debt is read again on
+     * the way out of every write, so a port that keeps re-arming on it sends
+     * one more doomed marker per pass.
+     *
+     * The ring is drained first only so the next payload is again the item
+     * that raises "notify"; nxt_port_queue_send() raises it on the 0-to-1
+     * transition alone.
+     */
+
+    while (nxt_port_queue_recv(queue, qbuf) >= 0) {
+        /* void */
+    }
+
+    nxt_atomic_fetch_add(&port->announce, 1);
+
+    buf = nxt_buf_mem_alloc(mp, 1, 0);
+    if (nxt_slow_path(buf == NULL)) {
+        goto done;
+    }
+
+    buf->completion_handler = nxt_port_fail_test_completion;
+    buf->mem.free++;
+
+    nxt_port_fail_test_completions = 0;
+
+    port->socket.write_ready = 1;
+
+    ret = nxt_port_socket_write(task, port, NXT_PORT_MSG_DATA, -1, 0, 0, buf);
+
+    if (ret != NXT_OK) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: the second enqueued payload "
+                      "answered %d", (int) ret);
+        ret = NXT_ERROR;
+        goto done;
+    }
+
+    ret = NXT_ERROR;
+
+    nxt_port_fail_test_drain_wq(&engine.fast_work_queue);
+
+    if (nxt_port_fail_test_rearms != 0) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: a failed port re-armed to send a "
+                      "marker it already owed (%d times)",
+                      (int) nxt_port_fail_test_rearms);
+        goto done;
+    }
+
+    if (port->announce != 1) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: the owed marker was counted again "
+                      "on a port that is going away (announce %d)",
+                      (int) port->announce);
+        goto done;
+    }
+
+    ret = NXT_OK;
+
+done:
+
+    nxt_port_fail_test_drain_wq(&engine.fast_work_queue);
+
+    port->queue = NULL;
+
+    nxt_port_close(task, port);
 
     nxt_port_use(task, port, -1);
 
@@ -1702,6 +1941,7 @@ done:
     return ret;
 }
 
+
 /*
  * A caller gets its buffer back when the port refuses the message.
  *
@@ -1814,6 +2054,7 @@ done:
 
     return ret;
 }
+
 
 static nxt_int_t
 nxt_port_fail_test_queued(nxt_locked_work_queue_t *lwq, nxt_work_t *item)
