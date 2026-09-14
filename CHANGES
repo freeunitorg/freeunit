@@ -1,6 +1,27 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Security: the string form of "access_log" "format" wrote what a
+       variable expanded to without escaping it.  "$uri" is the
+       percent-decoded target, so a request for "/%0d%0a..." put a real
+       CRLF in the log and the rest of the line read as a record of a
+       request that never happened.  Bytes a variable expands to are now
+       escaped the way nginx escapes them: the quote, the backslash, every
+       byte below 0x20, 0x7F and every byte above it all become "\xHH".
+       nginx emits no short forms, so a reader that already unescapes an
+       nginx log reads this one. The text of the format itself is
+       unchanged, so a tab or a quote an operator wrote still reaches the
+       log as itself; an "njs" format is the exception, because it
+       produces the whole record and all of it is escaped.  A value that
+       carries a quote of its own now shows it escaped: an entity-tag
+       logged through "$response_header_etag" reads \x22abc\x22 rather
+       than "abc", and a non-ASCII path reads "\xD0\xBF..." rather than
+       its bytes. A log parser that expected the raw bytes has to be
+       updated, though "\xHH" is reversible and the bytes can be recovered
+       from it.  The object form of "format" is unaffected by this change,
+       but it is not a way to keep bytes either: it replaces anything that
+       is not valid UTF-8 with U+FFFD before it serializes.
+
     *) Change: upgrade contrib njs to 1.0.1.
 
     *) Bugfix: a static response that was subject to content negotiation now

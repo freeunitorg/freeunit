@@ -577,10 +577,14 @@ def test_variables_response_header(temp_dir, wait_for_record):
     # response clock, not a file's, so it stays a shape.
     last_modified = re.escape(formatdate(mtime, usegmt=True))
 
+    # An entity-tag is a quoted string, and a text access log escapes the
+    # quote inside a value as \x22, the way nginx escapes every byte it
+    # escapes.  That is what keeps a quoted field parseable when the value
+    # carries a quote of its own.
     assert client.get(url='/foo/index.html')['status'] == 200
     assert (
         wait_for_record(
-            rf'share@{last_modified}@".*"@text/html@Unit/.*@.*GMT@5@close',
+            rf'share@{last_modified}@\\x22.*\\x22@text/html@Unit/.*@.*GMT@5@close',
             'access.log',
         )
         is not None

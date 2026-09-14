@@ -220,8 +220,16 @@ nxt_router_access_log_format_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
         str = default_format;
     }
 
+    /*
+     * NXT_TSTR_ESCAPE is set here and not for the object format above: the
+     * object format prints through nxt_conf_json_print(), which escapes what
+     * it prints, and escaping twice would show the escape instead of the
+     * value.
+     */
+
     format->tstr = nxt_tstr_compile(rtcf->tstr_state, &str,
-                                    NXT_TSTR_LOGGING | NXT_TSTR_NEWLINE);
+                                    NXT_TSTR_LOGGING | NXT_TSTR_NEWLINE
+                                    | NXT_TSTR_ESCAPE);
     if (nxt_slow_path(format->tstr == NULL)) {
         return NULL;
     }

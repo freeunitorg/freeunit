@@ -493,10 +493,75 @@ nxt_var_next_part(u_char *start, u_char *end, nxt_str_t *part)
 }
 
 
+/*
+ * Escape one byte of a variable's value the way nginx's access log does
+ * (ngx_http_log_escape()): the quote, the backslash and everything outside
+ * printable ASCII become "\xHH".  nginx has one emit path and no short forms
+ * such as "\\\"", so a reader that already unescapes an nginx log reads this
+ * one correctly; emitting "\\\"" here would make such a reader see a literal
+ * backslash followed by a field-terminating quote.
+ *
+ * The high half is escaped too, not only the control characters.  A reader
+ * that decodes the log as UTF-8 and splits it on Unicode line breaks treats
+ * U+0085, U+2028 and U+2029 as terminators, so a raw 0xC2 0x85 in a value
+ * would end a record just as a raw newline does.
+ */
+
+nxt_inline nxt_bool_t
+nxt_var_escaped(u_char c)
+{
+    return c < 0x20 || c >= 0x7F || c == '"' || c == '\\';
+}
+
+
+size_t
+nxt_var_escape_length(const u_char *p, size_t length)
+{
+    size_t  size, i;
+
+    size = length;
+
+    for (i = 0; i < length; i++) {
+        if (nxt_var_escaped(p[i])) {
+            /* One byte becomes the four of "\xHH". */
+            size += 3;
+        }
+    }
+
+    return size;
+}
+
+
+u_char *
+nxt_var_escape(u_char *dst, const u_char *src, size_t length)
+{
+    static const u_char  hex[] = "0123456789ABCDEF";
+
+    size_t  i;
+    u_char  c;
+
+    for (i = 0; i < length; i++) {
+        c = src[i];
+
+        if (!nxt_var_escaped(c)) {
+            *dst++ = c;
+            continue;
+        }
+
+        *dst++ = '\\';
+        *dst++ = 'x';
+        *dst++ = hex[c >> 4];
+        *dst++ = hex[c & 0xf];
+    }
+
+    return dst;
+}
+
+
 nxt_int_t
 nxt_var_interpreter(nxt_task_t *task, nxt_tstr_state_t *state,
     nxt_var_cache_t *cache, nxt_var_t *var, nxt_str_t *str, void *ctx,
-    nxt_bool_t logging)
+    nxt_uint_t flags)
 {
     u_char         *p, *src;
     size_t         length, last, next;
@@ -529,9 +594,16 @@ nxt_var_interpreter(nxt_task_t *task, nxt_tstr_state_t *state,
 
         *part = value;
 
-        length += value->length - subs[i].length;
+        length -= subs[i].length;
 
-        if (logging && value->start == NULL) {
+        if (flags & NXT_VAR_ESCAPE) {
+            length += nxt_var_escape_length(value->start, value->length);
+
+        } else {
+            length += value->length;
+        }
+
+        if ((flags & NXT_VAR_LOGGING) && value->start == NULL) {
             length += 1;
         }
     }
@@ -556,9 +628,14 @@ nxt_var_interpreter(nxt_task_t *task, nxt_tstr_state_t *state,
             p = nxt_cpymem(p, &src[last], next - last);
         }
 
-        p = nxt_cpymem(p, part[i]->start, part[i]->length);
+        if (flags & NXT_VAR_ESCAPE) {
+            p = nxt_var_escape(p, part[i]->start, part[i]->length);
 
-        if (logging && part[i]->start == NULL) {
+        } else {
+            p = nxt_cpymem(p, part[i]->start, part[i]->length);
+        }
+
+        if ((flags & NXT_VAR_LOGGING) && part[i]->start == NULL) {
             *p++ = '-';
         }
 
@@ -566,8 +643,15 @@ nxt_var_interpreter(nxt_task_t *task, nxt_tstr_state_t *state,
     }
 
     if (last != var->length) {
-        nxt_cpymem(p, &src[last], var->length - last);
+        p = nxt_cpymem(p, &src[last], var->length - last);
     }
+
+    /*
+     * The pass above and the length computed for nxt_mp_nget() are written by
+     * hand and have to agree.  Say so, rather than letting them drift apart
+     * quietly: what a variable expands to is escaped in one of them.
+     */
+    nxt_assert(p == str->start + str->length);
 
     return NXT_OK;
 }
