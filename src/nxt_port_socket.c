@@ -385,19 +385,20 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
          * drains the ring before it reads the socket, so the next read pass
          * takes this item too.
          *
-         * ENOBUFS promises nothing: nxt_socketpair_send() maps it to
-         * NXT_AGAIN as well (src/nxt_socketpair.c), and it means the system
-         * ran out of buffers, not that the peer owes this port a read.
+         * ENOBUFS and ENOMEM promise nothing: nxt_socketpair_send() maps
+         * both to NXT_AGAIN as well (src/nxt_socketpair.c), and they mean
+         * the system could not allocate for the call, not that the peer
+         * owes this port a read.
          *
          * So record that a marker is owed and re-arm.  nxt_port_announce()
          * sends it from the stack with no allocation, either here on this
          * port's own engine or from the item nxt_port_rearm() posts.
          *
          * Unless the send failed outright.  Then it did not hit a transient
-         * condition: nxt_socketpair_send() answers NXT_AGAIN for EAGAIN and
-         * ENOBUFS and retries EINTR, so everything that reaches here is an
-         * error that will not get better -- a dead peer routinely, and
-         * EMSGSIZE, EBADF or a kernel ENOMEM otherwise.  Every one of them
+         * condition: nxt_socketpair_send() answers NXT_AGAIN for EAGAIN,
+         * ENOBUFS and ENOMEM and retries EINTR, so everything that reaches
+         * here is an error that will not get better -- a dead peer
+         * routinely, and EMSGSIZE or EBADF otherwise.  Every one of them
          * ends this port: the marker can never be delivered, and re-arming
          * the write event only brings this function back to fail the same
          * send, leaving another queued error handler each pass while the
@@ -599,10 +600,43 @@ nxt_port_msg_dup_fds(nxt_port_send_msg_t *msg)
 }
 
 
+/*
+ * Disable, not block.  Blocking leaves the descriptor registered and only
+ * has the poller ignore what it reports; in edge-triggered mode that report
+ * is then lost, and the enable that later re-arms a blocked event touches
+ * the registration not at all.  That is fine after EAGAIN, where the
+ * socket is full and the peer's next read raises a fresh edge.  After a
+ * send that failed for want of kernel memory it is not: the socket stayed
+ * writable, no edge is coming, and the message queued for a later attempt
+ * would wait on an event that never fires.  Disabling drops the
+ * registration, so the re-arm adds it back and the poller re-checks
+ * readiness on the spot (#392).
+ *
+ * The cost is one epoll_ctl() here and one on the next EAGAIN, both off
+ * the inline path.  Only the event-loop pass of nxt_port_write_msgs() --
+ * data == NULL, the queue drained -- asks for this, and that pass runs on
+ * port->engine, where nxt_port_post() calls the handler directly: the
+ * post that allocates, and whose failure would skip this, is not reached
+ * from here.
+ *
+ * Both tests below are repeated from the caller, for the same reason
+ * nxt_port_announce() repeats its own: the descriptor, because a port can
+ * be closed while this item is in flight and nxt_port_write_close() leaves
+ * socket.fd at the number it had, so the disable would go out on a closed
+ * or already reused descriptor (see nxt_port_rearm_now()); the event state,
+ * because nxt_fd_event_disable_write() carries no guard of its own, unlike
+ * the nxt_fd_event_block_write() this replaced, and an EV_DISABLE on a
+ * kqueue knote that was never added is ENOENT.
+ */
+
 static void
-nxt_port_fd_block_write(nxt_task_t *task, nxt_port_t *port, void *data)
+nxt_port_fd_disable_write(nxt_task_t *task, nxt_port_t *port, void *data)
 {
-    nxt_fd_event_block_write(task->thread->engine, &port->socket);
+    if (port->pair[1] == -1 || !nxt_fd_event_is_active(port->socket.write)) {
+        return;
+    }
+
+    nxt_fd_event_disable_write(task->thread->engine, &port->socket);
 }
 
 
@@ -976,6 +1010,26 @@ next_fragment:
                 goto fail;
             }
 
+            /*
+             * NXT_AGAIN.  After EAGAIN the socket is full, and the peer's
+             * next read raises the edge that brings this handler back.
+             * After ENOBUFS or ENOMEM it is not full: the kernel could not
+             * allocate for the call, and no edge is coming.  The inline
+             * pass re-arms a disabled event, which is how the first retry
+             * runs at all; but this pass finds the event active, and an
+             * active edge-triggered event is never re-added, so a retry
+             * that runs out of memory again would leave the message queued
+             * for ever, and every later message on this port behind it.
+             * Force the readiness re-check the drained pass does -- disable,
+             * then enable -- so the poller reports the socket writable on
+             * the spot.  One epoll_ctl() pair per failed retry.
+             */
+
+            if (data == NULL && port->socket.error != NXT_EAGAIN) {
+                block_write = 1;
+                enable_write = 1;
+            }
+
             if (msg->link.next == NULL) {
                 qmsg = nxt_port_msg_insert_tail(port, msg);
                 if (nxt_slow_path(qmsg == NULL)) {
@@ -1040,7 +1094,7 @@ fail:
 cleanup:
 
     if (block_write && nxt_fd_event_is_active(port->socket.write)) {
-        nxt_port_post(task, port, nxt_port_fd_block_write, NULL);
+        nxt_port_post(task, port, nxt_port_fd_disable_write, NULL);
     }
 
     /*

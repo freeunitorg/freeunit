@@ -19,6 +19,12 @@ static nxt_int_t nxt_port_fail_test_socket_write(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_inline_drop(nxt_thread_t *thr);
 static void nxt_port_fail_test_enable_write(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
+static nxt_int_t nxt_port_fail_test_wakeup_errno(nxt_thread_t *thr);
+#if (NXT_HAVE_EPOLL_EDGE)
+static nxt_int_t nxt_port_fail_test_enqueue(nxt_task_t *task,
+    nxt_port_t *port, nxt_mp_t *mp, nxt_err_t err, nxt_uint_t fails,
+    nxt_bool_t no_memory, nxt_bool_t *queued);
+#endif
 static nxt_int_t nxt_port_fail_test_dead_peer(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_rpc_register(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_error_handler(nxt_thread_t *thr);
@@ -67,6 +73,10 @@ nxt_port_fail_test(nxt_thread_t *thr)
     }
 
     if (nxt_port_fail_test_dead_peer(thr) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_port_fail_test_wakeup_errno(thr) != NXT_OK) {
         return NXT_ERROR;
     }
 
@@ -2273,5 +2283,488 @@ nxt_port_fail_test_fd_count(void)
     return count;
 #else
     return -1;
+#endif
+}
+
+
+/*
+ * One payload into the shared ring, with the wake-up that follows failing
+ * with "err" -- and with no memory to queue the marker when "no_memory" is
+ * set.  The answer must be NXT_OK and the payload completed exactly once
+ * whatever became of the wake-up: it is in the ring, and the caller must
+ * not be told to reclaim it.  The ring is drained first so that this
+ * enqueue is the 0-to-1 transition that raises the wake-up at all.
+ */
+
+#if (NXT_HAVE_EPOLL_EDGE)
+
+static nxt_int_t
+nxt_port_fail_test_enqueue(nxt_task_t *task, nxt_port_t *port, nxt_mp_t *mp,
+    nxt_err_t err, nxt_uint_t fails, nxt_bool_t no_memory, nxt_bool_t *queued)
+{
+    nxt_buf_t  *buf;
+    nxt_int_t  ret;
+    u_char     block[NXT_PORT_QUEUE_MSG_SIZE];
+
+    while (nxt_port_queue_recv(port->queue, block) > 0) {
+        /* void */
+    }
+
+    buf = nxt_buf_mem_alloc(mp, 1, 0);
+    if (nxt_slow_path(buf == NULL)) {
+        return NXT_ERROR;
+    }
+
+    buf->completion_handler = nxt_port_fail_test_completion;
+    buf->mem.free++;
+
+    port->socket.write_ready = 1;
+
+    nxt_socketpair_test_send_fail(err, fails);
+
+    if (no_memory) {
+        nxt_port_test_msg_alloc_failures(1);
+    }
+
+    ret = nxt_port_socket_write(task, port, NXT_PORT_MSG_DATA, -1, 0, 0, buf);
+
+    nxt_port_test_msg_alloc_failures(0);
+
+    /*
+     * The send hook clears itself once its count is spent, and the inline
+     * write above spends one.  A leg that arms more than one clears what
+     * is left when it is done, so that a retry can be made to fail too.
+     */
+
+    if (ret != NXT_OK) {
+        nxt_log_error(NXT_LOG_NOTICE, task->log,
+                      "port failure test: a payload that reached the shared "
+                      "queue answered %d after sendmsg() error %d, expected "
+                      "NXT_OK", (int) ret, (int) err);
+        return NXT_ERROR;
+    }
+
+    /*
+     * Read before the drain, because the drain destroys the answer: an
+     * error raised by the write queues nxt_port_error_handler(), which
+     * empties port->messages whatever is in it.  A caller that tested the
+     * queue after this returned would find it empty either way.
+     */
+
+    if (queued != NULL) {
+        *queued = !nxt_queue_is_empty(&port->messages);
+    }
+
+    nxt_port_fail_test_drain_wq(&task->thread->engine->fast_work_queue);
+
+    if (nxt_port_fail_test_completions != 1) {
+        nxt_log_error(NXT_LOG_NOTICE, task->log,
+                      "port failure test: the enqueued payload was completed "
+                      "%d times after sendmsg() error %d, expected once",
+                      (int) nxt_port_fail_test_completions, (int) err);
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+#endif
+
+
+/*
+ * The wake-up that fails with an errno the socket recovers from (#392).
+ *
+ * A payload that fits the shared ring goes in there, and the inline write
+ * is only the READ_QUEUE marker that tells the peer to look.
+ * nxt_port_queue_send() raises "notify" on the 0-to-1 transition alone, so
+ * if that one marker is lost, no later enqueue on the port raises another:
+ * the peer stays unaware of this message and of everything after it.
+ *
+ * nxt_socketpair_send() answers NXT_AGAIN for EAGAIN and ENOBUFS, and
+ * nxt_port_write_msgs() then keeps the marker -- queued on the port, or
+ * owed in port->announce when even that allocation fails.  A kernel ENOMEM
+ * is the same transient condition, and used to fall into the arm for
+ * errors the socket does not recover from: the marker was dropped, the
+ * error handler was raised against a live peer, and the write answered
+ * NXT_OK with nothing owed.
+ *
+ * NXT_AGAIN also clears write_ready, so keeping the marker is only half of
+ * it: the re-arm has to bring the write handler back on its own, with no
+ * later write from a caller to prompt it.  So this runs on a real epoll
+ * engine, edge-triggered as the product's is, and the marker is read off
+ * the peer's end after one poll.  Twice: once with the write event never
+ * armed, and once after the drain that sent the first marker has taken
+ * the event down again -- which used to leave it blocked rather than
+ * disabled, so the second re-arm touched no registration and the marker
+ * waited on an edge that never came.
+ *
+ * Then the same ENOMEM with no memory to queue the marker, which must be
+ * owed and announced from the stack; and EPIPE, where the peer is gone and
+ * nothing may be owed or armed.  The errno is injected through
+ * nxt_socketpair_test_send_fail(), since a live pair does not produce
+ * either on demand.
+ */
+
+static nxt_int_t
+nxt_port_fail_test_wakeup_errno(nxt_thread_t *thr)
+{
+#if (NXT_HAVE_EPOLL_EDGE)
+    ssize_t              n;
+    nxt_mp_t             *mp;
+    nxt_fd_t             pair[2];
+    nxt_int_t            ret;
+    nxt_uint_t           i;
+    nxt_bool_t           queued;
+    nxt_task_t           *task;
+    nxt_port_t           *port;
+    nxt_event_engine_t   *engine, *saved_engine;
+    nxt_port_queue_t     *queue;
+    nxt_port_send_msg_t  *msg;
+    u_char               block[NXT_PORT_QUEUE_MSG_SIZE];
+
+    task = thr->task;
+    task->thread = thr;
+
+    ret = NXT_ERROR;
+    pair[0] = -1;
+    pair[1] = -1;
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (nxt_slow_path(mp == NULL)) {
+        return NXT_ERROR;
+    }
+
+    saved_engine = thr->engine;
+
+    engine = nxt_event_engine_create(task, &nxt_epoll_edge_engine, NULL, 0, 0);
+    if (nxt_slow_path(engine == NULL)) {
+        nxt_mp_destroy(mp);
+        return NXT_ERROR;
+    }
+
+    thr->engine = engine;
+
+    port = nxt_port_fail_test_port(task);
+    if (nxt_slow_path(port == NULL)) {
+        goto fail;
+    }
+
+    if (nxt_slow_path(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) != 0)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: socketpair failed");
+        goto done;
+    }
+
+    if (nxt_slow_path(fcntl(pair[1], F_SETFL, O_NONBLOCK) == -1)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: O_NONBLOCK failed");
+        goto done;
+    }
+
+    port->pair[0] = pair[0];
+    port->pair[1] = pair[1];
+    port->socket.task = task;
+    port->max_size = 1024;
+    port->max_share = 1024;
+
+    /* The real thing: handlers, engine, write_ready, and no event armed. */
+
+    nxt_port_write_enable(task, port);
+
+    port->socket.log = thr->log;
+
+    queue = nxt_mp_zalloc(mp, sizeof(nxt_port_queue_t));
+    if (nxt_slow_path(queue == NULL)) {
+        goto done;
+    }
+
+    nxt_port_queue_init(queue);
+    port->queue = queue;
+
+    /*
+     * Legs 1 and 2: ENOMEM on the wake-up, with memory to queue the marker.
+     * The first arms a write event that was never registered; the second
+     * finds it blocked by the drain that sent the first marker, and the
+     * enable then touches no epoll registration.  Edge-triggered, the
+     * second is the one that would stall if the re-arm did not re-check.
+     */
+
+    for (i = 1; i <= 2; i++) {
+
+        /*
+         * Quiescent first.  The peer's read of the previous marker wakes
+         * this end's writers, and epoll keeps that as a ready entry for a
+         * registered descriptor; a poll here consumes it, so the leg
+         * measures the re-arm and not a wake-up left over from the last
+         * leg.
+         */
+
+        engine->event.poll(engine, 0);
+
+        nxt_port_fail_test_drain_wq(&engine->fast_work_queue);
+
+        nxt_port_fail_test_completions = 0;
+
+        if (nxt_port_fail_test_enqueue(task, port, mp, NXT_ENOMEM, 1, 0, NULL)
+            != NXT_OK)
+        {
+            goto done;
+        }
+
+        if (nxt_queue_is_empty(&port->messages)) {
+            nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                          "port failure test: leg %ui: ENOMEM on the wake-up "
+                          "dropped the queue marker (announce %d); the peer "
+                          "is never told to read the ring", i,
+                          (int) port->announce);
+            goto done;
+        }
+
+        msg = nxt_queue_link_data(nxt_queue_first(&port->messages),
+                                  nxt_port_send_msg_t, link);
+
+        if (msg->port_msg.type != _NXT_PORT_MSG_READ_QUEUE) {
+            nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                          "port failure test: leg %ui: the message kept "
+                          "after ENOMEM is of type %d, expected READ_QUEUE",
+                          i, (int) msg->port_msg.type);
+            goto done;
+        }
+
+        if (port->socket.write_ready != 0
+            || !nxt_fd_event_is_active(port->socket.write))
+        {
+            nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                          "port failure test: leg %ui: after ENOMEM "
+                          "write_ready is %d and the write event state is "
+                          "%d; expected 0 and an active event", i,
+                          (int) port->socket.write_ready,
+                          (int) port->socket.write);
+            goto done;
+        }
+
+        /* One poll, nothing else: the re-arm alone must bring it back. */
+
+        engine->event.poll(engine, 0);
+
+        nxt_port_fail_test_drain_wq(&engine->fast_work_queue);
+
+        n = recv(pair[0], block, sizeof(block), MSG_DONTWAIT);
+
+        if (n != (ssize_t) sizeof(nxt_port_msg_t)
+            || ((nxt_port_msg_t *) block)->type != _NXT_PORT_MSG_READ_QUEUE)
+        {
+            nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                          "port failure test: leg %ui: the peer read %d bytes "
+                          "after the re-arm and one poll, expected a %d byte "
+                          "READ_QUEUE header (write event state %d)", i,
+                          (int) n, (int) sizeof(nxt_port_msg_t),
+                          (int) port->socket.write);
+            goto done;
+        }
+
+        if (!nxt_queue_is_empty(&port->messages) || port->announce != 0) {
+            nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                          "port failure test: leg %ui: the marker went out "
+                          "but is still held (announce %d)", i,
+                          (int) port->announce);
+            goto done;
+        }
+
+        if (nxt_fd_event_is_active(port->socket.write)) {
+            nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                          "port failure test: leg %ui: the drain left the "
+                          "write event in state %d, expected it disabled", i,
+                          (int) port->socket.write);
+            goto done;
+        }
+    }
+
+    /*
+     * Leg 3: ENOMEM on the wake-up, and ENOMEM again when the write event
+     * retries the queued marker.  The first failure is what legs 1 and 2
+     * cover: the inline pass re-arms a disabled event and the retry runs
+     * on the next poll.  The second finds the event already active, so
+     * nothing re-arms it, and the socket never filled, so no edge is
+     * coming either.  The retry pass has to force the readiness re-check
+     * itself; without it the marker, and every message queued behind it,
+     * waits for ever.
+     */
+
+    engine->event.poll(engine, 0);
+
+    nxt_port_fail_test_drain_wq(&engine->fast_work_queue);
+
+    nxt_port_fail_test_completions = 0;
+
+    if (nxt_port_fail_test_enqueue(task, port, mp, NXT_ENOMEM, 2, 0, NULL)
+        != NXT_OK)
+    {
+        goto done;
+    }
+
+    if (nxt_queue_is_empty(&port->messages) || port->socket.write_ready != 0) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: leg 3: after the first ENOMEM the "
+                      "marker is not queued, or write_ready is %d",
+                      (int) port->socket.write_ready);
+        goto done;
+    }
+
+    /* The first poll runs the retry, which is made to fail again. */
+
+    engine->event.poll(engine, 0);
+
+    nxt_port_fail_test_drain_wq(&engine->fast_work_queue);
+
+    if (nxt_queue_is_empty(&port->messages)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: leg 3: the retry did not fail; "
+                      "the marker left the queue after one poll");
+        goto done;
+    }
+
+    /* The second poll has only the re-check to bring the retry back. */
+
+    engine->event.poll(engine, 0);
+
+    nxt_port_fail_test_drain_wq(&engine->fast_work_queue);
+
+    nxt_socketpair_test_send_fail(0, 0);
+
+    n = recv(pair[0], block, sizeof(block), MSG_DONTWAIT);
+
+    if (n != (ssize_t) sizeof(nxt_port_msg_t)
+        || ((nxt_port_msg_t *) block)->type != _NXT_PORT_MSG_READ_QUEUE)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: leg 3: the peer read %d bytes after "
+                      "a retry that ran out of memory and two polls, expected "
+                      "a %d byte READ_QUEUE header; the queued marker is "
+                      "stranded (write event state %d, write_ready %d)",
+                      (int) n, (int) sizeof(nxt_port_msg_t),
+                      (int) port->socket.write,
+                      (int) port->socket.write_ready);
+        goto done;
+    }
+
+    if (!nxt_queue_is_empty(&port->messages) || port->announce != 0) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: leg 3: the marker went out but is "
+                      "still held (announce %d)", (int) port->announce);
+        goto done;
+    }
+
+    if (nxt_fd_event_is_active(port->socket.write)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: leg 3: the drain left the write "
+                      "event in state %d, expected it disabled",
+                      (int) port->socket.write);
+        goto done;
+    }
+
+    /* Leg 4: ENOMEM on the wake-up, and no memory to queue the marker. */
+
+    nxt_port_fail_test_completions = 0;
+
+    if (nxt_port_fail_test_enqueue(task, port, mp, NXT_ENOMEM, 1, 1, NULL)
+        != NXT_OK)
+    {
+        goto done;
+    }
+
+    /*
+     * Owed, and sent from the stack by the re-arm inside the same write,
+     * before any poll: the socket is writable, so nxt_port_announce() runs
+     * on the spot and the count is back to 0 by the time the write answers.
+     */
+
+    if (!nxt_queue_is_empty(&port->messages)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: ENOMEM with no memory to queue the "
+                      "marker queued one anyway");
+        goto done;
+    }
+
+    n = recv(pair[0], block, sizeof(block), MSG_DONTWAIT);
+
+    if (port->announce != 0 || n != (ssize_t) sizeof(nxt_port_msg_t)
+        || ((nxt_port_msg_t *) block)->type != _NXT_PORT_MSG_READ_QUEUE)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: the owed marker was not announced "
+                      "(announce %d, %d bytes read)", (int) port->announce,
+                      (int) n);
+        goto done;
+    }
+
+    /* Leg 5: EPIPE.  The peer is gone; nothing is owed and nothing sent. */
+
+    nxt_port_fail_test_completions = 0;
+
+    if (nxt_port_fail_test_enqueue(task, port, mp, NXT_EPIPE, 1, 0, &queued)
+        != NXT_OK)
+    {
+        goto done;
+    }
+
+    if (queued || port->announce != 0) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: EPIPE on the wake-up kept a marker "
+                      "for a peer that is gone (queued %d, announce %d)",
+                      (int) queued, (int) port->announce);
+        goto done;
+    }
+
+    engine->event.poll(engine, 0);
+
+    nxt_port_fail_test_drain_wq(&engine->fast_work_queue);
+
+    n = recv(pair[0], block, sizeof(block), MSG_DONTWAIT);
+
+    if (n != -1) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: %d bytes reached the peer after "
+                      "EPIPE", (int) n);
+        goto done;
+    }
+
+    ret = NXT_OK;
+
+done:
+
+    nxt_socketpair_test_send_fail(0, 0);
+    nxt_port_test_msg_alloc_failures(0);
+
+    nxt_port_fail_test_drain_wq(&engine->fast_work_queue);
+
+    /* See nxt_port_fail_test_inline_drop() for both of these. */
+
+    port->queue = NULL;
+
+    nxt_port_close(task, port);
+
+    if (pair[0] != -1 && nxt_test_fd_is_open(pair[0])) {
+        nxt_fd_close(pair[0]);
+    }
+
+    nxt_port_use(task, port, -1);
+
+fail:
+
+    thr->engine = saved_engine;
+
+    nxt_event_engine_free(engine);
+    nxt_mp_destroy(mp);
+
+    return ret;
+
+#else
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                  "port failure test: wake-up errno leg needs epoll, skipped");
+
+    return NXT_OK;
+
 #endif
 }
