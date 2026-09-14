@@ -8,6 +8,9 @@ on:
       - 'src/nxt_http*'
       - 'src/nxt_h1proto*'
       - 'src/nxt_conf*'
+      # nxt_basic_fuzz.c drives nxt_utf8_decode() and nxt_utf8_length(), so a
+      # change to the decoder is a change to what this job fuzzes.
+      - 'src/nxt_utf8*'
       # nxt_http_controller_fuzz.c #includes nxt_controller.c, so a change
       # there is a change to what this job fuzzes.
       - 'src/nxt_controller*'
