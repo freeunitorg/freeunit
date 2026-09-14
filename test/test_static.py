@@ -13,6 +13,24 @@ from unit.utils import waitforfiles
 client = ApplicationProto()
 
 
+def age_file(path, seconds=2):
+    """
+    Backdates a file so its validators are strong.
+
+    Both validators are derived from the whole-second mtime and the size, so
+    Unit marks them weak while the clock is still inside the second the file
+    was written -- another write could land in that second and change neither.
+    A test that writes a file and fetches it immediately is inside that window,
+    where a strong comparison (If-Match, If-Range) cannot match by design.
+
+    Most tests here are about something else, so they get a file that looks
+    like a deployed one rather than one written microseconds ago.  The window
+    itself is covered by test_static_conditional_etag_weak_within_mtime_second.
+    """
+    when = os.stat(path).st_mtime - seconds
+    os.utime(path, (when, when))
+
+
 @pytest.fixture(autouse=True)
 def setup_method_fixture(temp_dir):
     assets_dir = f'{temp_dir}/assets'
@@ -22,6 +40,9 @@ def setup_method_fixture(temp_dir):
     Path(f'{assets_dir}/README').write_text('readme', encoding='utf-8')
     Path(f'{assets_dir}/log.log').write_text('[debug]', encoding='utf-8')
     Path(f'{assets_dir}/dir/file').write_text('blah', encoding='utf-8')
+
+    for f in Path(assets_dir).rglob('*'):
+        age_file(f)
 
     assert 'success' in client.conf(
         {
@@ -1637,7 +1658,11 @@ def test_static_range_file_changes_between_requests(temp_dir):
     last_modified = r['headers']['Last-Modified']
 
     path.write_text('abcdefghijklmnop', encoding='utf-8')
-    new_mtime = int(time.time()) + 5
+
+    # A distinct mtime, and in the past: a file dated in the future is inside
+    # the weak window too, since the clock has not left that second yet, and
+    # the tail of this test needs the rewritten file to validate strongly.
+    new_mtime = int(time.time()) - 5
     os.utime(path, (new_mtime, new_mtime))
 
     r = range_get(Range='bytes=10-', **{'If-Range': etag})
@@ -1774,3 +1799,76 @@ def test_static_range_numeric_overflow():
     # Negative-looking inputs are simply not the grammar.
     for value in ['bytes=-5-9', 'bytes=-1-', 'bytes=5--9', 'bytes=-0-']:
         _check_range_honest(value, range_get(Range=value))
+
+
+def test_static_conditional_etag_weak_within_mtime_second(temp_dir):
+    # RFC 9110 Sect. 8.8.1: a validator is strong only when the
+    # representation cannot change again without the validator changing too.
+    # Both of Unit's are derived from the whole-second mtime and the size, so
+    # a rewrite to the same size inside the second the file was written is
+    # invisible to both.  While the clock is still inside that second the tag
+    # is marked weak; once the second has passed it is strong for good.
+    path = Path(f'{temp_dir}/assets/index.html')
+
+    # Dating the file one second ahead puts the request inside the window
+    # without racing the clock: a file the clock has not reached yet can
+    # still acquire that mtime.  Waiting the second out then makes the same
+    # file strong, with the same mtime and the same size.
+    mtime = int(time.time()) + 1
+    os.utime(path, (mtime, mtime))
+
+    weak = client.get(url='/index.html')['headers']['ETag']
+    assert weak.startswith('W/'), 'weak inside the mtime second'
+
+    # Weakness costs nothing else: a client caching on it still revalidates.
+    assert range_get(**{'If-None-Match': weak})['status'] == 304, 'weak 304'
+
+    # A strong comparison cannot match a weak validator (Sect. 8.8.3.2), so
+    # If-Match fails and If-Range declines to serve a partial response.
+    assert range_get(**{'If-Match': weak})['status'] == 412, 'weak If-Match'
+
+    resp = range_get(Range='bytes=0-4', **{'If-Range': weak})
+    assert resp['status'] == 200, 'weak If-Range serves the whole file'
+    assert resp['body'] == '0123456789', 'and all of it'
+
+    # A client that sends the opaque tag back without the "W/" is the case
+    # that tests Unit's own weakness rather than the client's: the list entry
+    # is strong, so only our side can fail the comparison.  A cache holding
+    # the strong tag from before a same-second rewrite sends exactly this.
+    bare = weak[len('W/') :]
+    assert range_get(**{'If-Match': bare})['status'] == 412, 'bare If-Match'
+
+    resp = range_get(Range='bytes=0-4', **{'If-Range': bare})
+    assert resp['status'] == 200, 'bare weak If-Range serves the whole file'
+
+    # Sect. 13.1.3 compares If-None-Match weakly, so the bare tag still hits.
+    assert range_get(**{'If-None-Match': bare})['status'] == 304, 'bare 304'
+
+    # The date form of If-Range is the same validator and just as weak here.
+    # Getting this wrong splices two versions together in the client's file,
+    # which is worse than the stale copy a bad conditional GET leaves.
+    last_modified = client.get(url='/index.html')['headers']['Last-Modified']
+    resp = range_get(Range='bytes=0-4', **{'If-Range': last_modified})
+    assert resp['status'] == 200, 'weak If-Range date serves the whole file'
+
+    # "*" asks whether a representation exists at all, not whether a
+    # validator matches, so the weakness does not bear on it.
+    assert range_get(**{'If-Match': '*'})['status'] == 200, 'If-Match *'
+
+    # Wait for the clock to leave the second the file is dated to.  That
+    # second spans [mtime, mtime + 1), so the wait ends at mtime + 1, not at
+    # mtime.  Nothing about the file changes here, only the guarantee Unit
+    # can make about it.
+    while time.time() < mtime + 1:
+        time.sleep(0.05)
+
+    strong = client.get(url='/index.html')['headers']['ETag']
+    assert not strong.startswith('W/'), 'strong once the second has passed'
+
+    # Only a prefix separates them: the tag's format does not change, so
+    # nothing already held in a cache is invalidated by the weakening.
+    assert weak == f'W/{strong}', 'same tag, weak prefix only'
+
+    # And the strong comparisons work again on the very same bytes.
+    assert range_get(**{'If-Match': strong})['status'] == 200, 'strong match'
+    assert range_get(Range='bytes=0-4', **{'If-Range': strong})['status'] == 206

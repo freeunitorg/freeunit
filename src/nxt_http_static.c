@@ -168,12 +168,12 @@ static void nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
 static void nxt_http_static_next(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_static_ctx_t *ctx, nxt_http_status_t status);
 static nxt_http_status_t nxt_http_static_preconditions(nxt_http_request_t *r,
-    nxt_str_t *etag, nxt_time_t mtime);
+    nxt_str_t *etag, nxt_bool_t weak, nxt_time_t mtime);
 static nxt_bool_t nxt_http_static_etag_match(nxt_str_t *list, nxt_str_t *etag,
-    nxt_bool_t strong);
+    nxt_bool_t own_weak, nxt_bool_t strong);
 static nxt_http_status_t nxt_http_static_range(nxt_http_request_t *r,
-    nxt_str_t *etag, nxt_time_t mtime, nxt_off_t size, nxt_off_t *start,
-    nxt_off_t *end);
+    nxt_str_t *etag, nxt_bool_t weak, nxt_time_t mtime, nxt_off_t size,
+    nxt_off_t *start, nxt_off_t *end);
 #if (NXT_HAVE_OPENAT2)
 static u_char *nxt_http_static_chroot_match(u_char *chr, u_char *shr);
 #endif
@@ -488,7 +488,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_static_ctx_t *ctx)
 {
     size_t                  length, encode;
-    u_char                  *p, *fname;
+    u_char                  *p, *end, *fname;
     struct tm               tm;
     nxt_buf_t               *fb;
     nxt_int_t               ret;
@@ -497,7 +497,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_file_t              *f, file;
     nxt_file_info_t         fi;
     nxt_off_t               range_start, range_end;
-    nxt_bool_t              is_range;
+    nxt_bool_t              is_range, etag_weak;
     nxt_http_status_t       rstatus;
     nxt_http_field_t        *field;
     nxt_http_status_t       status, pcond;
@@ -723,7 +723,29 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
 
         nxt_http_field_name_set(field, "ETag");
 
-        length = NXT_TIME_T_HEXLEN + NXT_OFF_T_HEXLEN + 3;
+        /*
+         * RFC 9110 Sect. 8.8.1: a validator is strong only when the
+         * representation cannot change again without the validator changing
+         * with it.  Both of ours are derived from the whole-second mtime and
+         * the size, so a rewrite to the same size during the second the file
+         * was last written is invisible to both.  While the clock is still
+         * inside that second another write can still land there, so the tag
+         * cannot be promised strong; once the second has passed, no later
+         * write can reproduce this mtime and the tag is strong for good.
+         *
+         * Apache weakens on the same condition (server/util_etag.c, in
+         * ap_make_etag()).  The tag's format does not change, so nothing
+         * already in a cache is invalidated by this.
+         *
+         * nxt_thread_time() is the cached per-thread clock.  If it lags, it
+         * reports the request as still inside the second and the tag is
+         * weakened when it need not have been -- the safe direction.
+         */
+
+        etag_weak = ((nxt_time_t) nxt_thread_time(task->thread)
+                     <= (nxt_time_t) nxt_file_mtime(&fi));
+
+        length = nxt_length("W/") + NXT_TIME_T_HEXLEN + NXT_OFF_T_HEXLEN + 3;
 
         p = nxt_mp_nget(r->mem_pool, length);
         if (nxt_slow_path(p == NULL)) {
@@ -731,19 +753,33 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         }
 
         field->value = p;
+
+        if (etag_weak) {
+            *p++ = 'W';
+            *p++ = '/';
+        }
         /*
          * nxt_file_mtime() yields a native time_t, which need not be
          * nxt_time_t: on QNX it is a 32-bit unsigned type against a 64-bit
          * nxt_time_t.  "%T" reads an nxt_time_t from the argument list, so
          * the value has to be converted before it is passed, not after.
          */
-        field->value_length = nxt_sprintf(p, p + length, "\"%xT-%xO\"",
+        end = field->value + length;
+
+        field->value_length = nxt_sprintf(p, end, "\"%xT-%xO\"",
                                           (nxt_time_t) nxt_file_mtime(&fi),
                                           nxt_file_size(&fi))
-                              - p;
+                              - field->value;
 
-        etag.start = field->value;
-        etag.length = field->value_length;
+        /*
+         * The comparison functions work on the opaque tag, so "etag" skips
+         * the prefix; weakness travels beside it as a flag rather than in
+         * the string.  Leaving "W/" in here would make every If-None-Match
+         * miss, since the client sends back the opaque tag it was given.
+         */
+
+        etag.start = p;
+        etag.length = field->value_length - (p - field->value);
 
         if (exten.start == NULL) {
             nxt_http_static_extract_extension(shr, &exten);
@@ -792,7 +828,8 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
             goto fail;
         }
 
-        pcond = nxt_http_static_preconditions(r, &etag, nxt_file_mtime(&fi));
+        pcond = nxt_http_static_preconditions(r, &etag, etag_weak,
+                                              nxt_file_mtime(&fi));
 
         if (pcond != NXT_HTTP_OK) {
             nxt_file_close(task, f);
@@ -839,7 +876,8 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
          * reading of a sentence about methods that do not define ranges.
          */
 
-        rstatus = nxt_http_static_range(r, &etag, nxt_file_mtime(&fi),
+        rstatus = nxt_http_static_range(r, &etag, etag_weak,
+                                        nxt_file_mtime(&fi),
                                         nxt_file_size(&fi), &range_start,
                                         &range_end);
 
@@ -1081,7 +1119,7 @@ fail:
 
 static nxt_http_status_t
 nxt_http_static_preconditions(nxt_http_request_t *r, nxt_str_t *etag,
-    nxt_time_t mtime)
+    nxt_bool_t weak, nxt_time_t mtime)
 {
     nxt_str_t               value;
     nxt_time_t              date;
@@ -1148,7 +1186,8 @@ nxt_http_static_preconditions(nxt_http_request_t *r, nxt_str_t *etag,
 
                     /* Sect. 13.1.1: If-Match compares strongly. */
 
-                    im_match = nxt_http_static_etag_match(&value, etag, 1);
+                    im_match = nxt_http_static_etag_match(&value, etag, weak,
+                                                          1);
                 }
             }
 
@@ -1164,7 +1203,8 @@ nxt_http_static_preconditions(nxt_http_request_t *r, nxt_str_t *etag,
                     value.start = f->value;
                     value.length = f->value_length;
 
-                    inm_match = nxt_http_static_etag_match(&value, etag, 0);
+                    inm_match = nxt_http_static_etag_match(&value, etag, weak,
+                                                           0);
                 }
             }
 
@@ -1236,17 +1276,21 @@ nxt_http_static_preconditions(nxt_http_request_t *r, nxt_str_t *etag,
 /*
  * Matches an entity-tag against an If-Match or If-None-Match list.
  *
- * Unit's own tags are always strong, so the comparison functions differ only
- * in how they treat a weak tag on the client's side: under the strong
- * function (Sect. 8.8.3.2) a W/-prefixed tag never matches, under the weak
- * one the prefix is stripped and the opaque tags are compared.
+ * "etag" is the opaque tag without any "W/"; "own_weak" says whether the tag
+ * Unit generated for this representation is weak, which it is while the
+ * request falls inside the second the file was last written.
+ *
+ * Sect. 8.8.3.2: the strong function matches only when both tags are strong,
+ * so a weak tag on either side fails it -- the client's, or our own.  The
+ * weak function strips the prefix and compares the opaque tags.
  *
  * "*" matches any existing representation, but only as the entire field
  * value -- the grammar is "*" / #entity-tag, so it is not a list member.
  */
 
 static nxt_bool_t
-nxt_http_static_etag_match(nxt_str_t *list, nxt_str_t *etag, nxt_bool_t strong)
+nxt_http_static_etag_match(nxt_str_t *list, nxt_str_t *etag,
+    nxt_bool_t own_weak, nxt_bool_t strong)
 {
     u_char     *p, *end, *start;
     nxt_bool_t  weak;
@@ -1261,6 +1305,18 @@ nxt_http_static_etag_match(nxt_str_t *list, nxt_str_t *etag, nxt_bool_t strong)
 
     if (end - p == 1 && *p == '*') {
         return 1;
+    }
+
+    if (own_weak && strong) {
+        /*
+         * A strong comparison needs both tags strong (Sect. 8.8.3.2), and
+         * ours is not, so no entity-tag in the list can match.  This is
+         * below the "*" test on purpose: "*" asks whether a representation
+         * exists at all, not whether a validator matches, so weakness does
+         * not bear on it.
+         */
+
+        return 0;
     }
 
     while (p < end) {
@@ -1391,7 +1447,8 @@ nxt_http_static_range_number(u_char **p, u_char *end)
 
 static nxt_http_status_t
 nxt_http_static_range(nxt_http_request_t *r, nxt_str_t *etag,
-    nxt_time_t mtime, nxt_off_t size, nxt_off_t *start, nxt_off_t *end)
+    nxt_bool_t weak, nxt_time_t mtime, nxt_off_t size, nxt_off_t *start,
+    nxt_off_t *end)
 {
     u_char                  *p, *last;
     nxt_off_t               a, b, suffix;
@@ -1453,14 +1510,21 @@ nxt_http_static_range(nxt_http_request_t *r, nxt_str_t *etag,
         {
             /* An entity-tag: Sect. 13.1.5 requires the strong comparison. */
 
-            match = nxt_http_static_etag_match(&value, etag, 1);
+            match = nxt_http_static_etag_match(&value, etag, weak, 1);
 
         } else {
             date = nxt_time_parse(value.start, value.length);
 
-            /* Sect. 13.1.5: an exact match against the last modification. */
+            /*
+             * Sect. 13.1.5: an exact match against the last modification,
+             * and only while that date is a strong validator.  Inside the
+             * second the file was written it is not: the client would splice
+             * a range from one version onto a copy of another, and unlike a
+             * bad conditional GET that produces a corrupt file rather than a
+             * stale one.  Refusing the If-Range costs a full response.
+             */
 
-            match = (date != (nxt_time_t) -1 && date == mtime);
+            match = (!weak && date != (nxt_time_t) -1 && date == mtime);
         }
 
         if (!match) {
