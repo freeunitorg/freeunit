@@ -299,6 +299,17 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        The OpenSSL backend is unaffected; none of these files were
        ever part of a default build.
 
+    *) Bugfix: a byte-range request from a client that refused the identity
+       coding is no longer answered with identity bytes.  A range is served
+       as identity, so "Range" together with "Accept-Encoding:
+       identity;q=0" returned a "206 Partial Content" carrying exactly the
+       bytes the client said it would not take.  The range is now ignored
+       and the full "200 OK" is sent in a coding the client does accept, as
+       already happens for a malformed or multi-range request.  A request
+       that accepts no coding at all is still answered with "406 Not
+       Acceptable", and a range from a client that does accept identity is
+       still a 206.
+
 
 Changes with FreeUnit 1.36.1                                     28 Aug 2026
 
