@@ -50,7 +50,17 @@ fn prettify_or_keep(raw: &[u8], path: &str) -> Result<Vec<u8>, UnitctlError> {
                 "Warning: {} holds bytes that are not valid UTF-8; saving what the server sent, verbatim",
                 path
             );
-            eprintln!("Warning: 'unitctl import' cannot replay this file -- restore it with curl");
+            // Not a route around it: curl reaches the same control API, which
+            // refuses a configuration holding these bytes on POST and on PUT
+            // alike (nxt_conf_validate_encoding() in nxt_controller.c, before
+            // the schema is even looked at).  A value like this only survives
+            // because it was loaded from the state file, and the server names
+            // it in the warning it logged then.
+            eprintln!(
+                "Warning: the control API refuses a configuration holding these bytes, so this \
+                 file cannot be sent back by any route; correct the value the server named in \
+                 its warning, then import"
+            );
             Ok(raw.to_vec())
         }
     }
