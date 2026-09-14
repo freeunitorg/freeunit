@@ -42,6 +42,18 @@ send (#388).
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a process could stop hearing from a peer for good.  When the wake-up that
+tells a peer to read the shared queue failed because the kernel could not
+allocate for it, the port treated the peer as dead: the wake-up was dropped
+and, since a later message raises one only when the queue was empty, no
+later message on that port raised one either.  The wake-up is now kept and
+retried, and the retry no longer waits for a socket event that a socket that
+never filled up will not deliver (#392).
+</para>
+</change>
+
 <change type="change">
 <para>
 upgrade contrib njs to 1.0.1.
