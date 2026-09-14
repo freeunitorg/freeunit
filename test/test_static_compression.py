@@ -1,3 +1,4 @@
+import gzip
 from pathlib import Path
 
 import pytest
@@ -334,3 +335,73 @@ def test_static_compression_vary_merge_identity(temp_dir, configured, expected):
 # emitting "Vary: Origin" takes that path, and nothing here exercises it --
 # including the merge's own case-insensitive field-name match.  Covering it
 # needs a language-module test, not a static one.
+
+
+def _raw_get(**headers):
+    # Raw bytes: the body has to be decompressed, so it must not be decoded.
+    raw = client.get(
+        url='/big.css',
+        headers={'Host': 'localhost', 'Connection': 'close', **headers},
+        encoding='latin-1',
+        read_buffer_size=1024 * 1024,
+        raw_resp=True,
+    )
+    head, _, body = raw.partition('\r\n\r\n')
+    lines = head.split('\r\n')
+    status = int(lines[0].split(' ')[1])
+    hdrs = dict(line.split(': ', 1) for line in lines[1:])
+    body = body.encode('latin-1')
+
+    if hdrs.get('Transfer-Encoding') == 'chunked':
+        body = client._parse_chunked_body(body)
+
+    return status, hdrs, body
+
+
+def test_static_compression_range_identity_refused(temp_dir):
+    # A Range is served as identity -- coding a byte slice would compress the
+    # wrong bytes -- so a client that sent "identity;q=0" must not be given
+    # one: it asked not to receive the file's own bytes and a 206 is exactly
+    # those.  The request is still serveable, because it named a coding Unit
+    # has, so the Range is dropped and the full 200 is sent in that coding.
+    #
+    # Without the fix this is a 206 carrying identity bytes to a client that
+    # refused identity, which is what #355 reports.
+    data = Path(f'{temp_dir}/assets/big.css').read_bytes()
+
+    status, headers, body = _raw_get(
+        **{'Accept-Encoding': 'gzip, identity;q=0', 'Range': 'bytes=0-9'}
+    )
+
+    assert status == 200, 'the Range is dropped, not the request'
+    assert headers.get('Content-Encoding') == 'gzip', 'served as gzip'
+    assert 'Content-Range' not in headers, 'no Content-Range on the full 200'
+    assert gzip.decompress(body) == data, 'the whole file, correctly coded'
+
+
+def test_static_compression_range_identity_refused_guards(temp_dir):
+    # The cases either side of it, which must not move.
+    size = Path(f'{temp_dir}/assets/big.css').stat().st_size
+
+    # Identity acceptable: a Range is still a 206 of identity bytes, which is
+    # deliberate and is what every other server does.
+    status, headers, body = _raw_get(
+        **{'Accept-Encoding': 'gzip', 'Range': 'bytes=0-9'}
+    )
+    assert status == 206, 'gzip alone still gets its partial content'
+    assert 'Content-Encoding' not in headers, 'a 206 carries no coding'
+    assert headers['Content-Range'] == f'bytes 0-9/{size}'
+    assert body == b'body{color'
+
+    # Nothing acceptable at all is 406, whether or not a Range is present.
+    # That outranks the Range and is unchanged by this fix.
+    for extra in ({}, {'Range': 'bytes=0-9'}):
+        status, _, _ = _raw_get(
+            **{'Accept-Encoding': 'identity;q=0, *;q=0', **extra}
+        )
+        assert status == 406, 'unacceptable outranks any Range'
+
+    # Refusing identity without a Range was already correct: full gzip 200.
+    status, headers, _ = _raw_get(**{'Accept-Encoding': 'gzip, identity;q=0'})
+    assert status == 200
+    assert headers.get('Content-Encoding') == 'gzip'
