@@ -12,16 +12,22 @@ enum UploadFormat {
     Javascript,
 }
 
-impl From<&InputFile> for UploadFormat {
-    fn from(input_file: &InputFile) -> Self {
+impl TryFrom<&InputFile> for UploadFormat {
+    type Error = UnitctlError;
+
+    /// A file this command cannot place is refused, not fatal.  This used to
+    /// panic on a format that reached it without a branch here.
+    fn try_from(input_file: &InputFile) -> Result<Self, Self::Error> {
         if input_file.is_config() {
-            UploadFormat::Config
+            Ok(UploadFormat::Config)
         } else if input_file.is_pem_bundle() {
-            UploadFormat::PemBundle
+            Ok(UploadFormat::PemBundle)
         } else if input_file.is_javascript() {
-            UploadFormat::Javascript
+            Ok(UploadFormat::Javascript)
         } else {
-            panic!("Unknown input file type");
+            Err(UnitctlError::UnknownInputFileType {
+                path: input_file.to_path()?.to_string_lossy().into(),
+            })
         }
     }
 }
@@ -88,7 +94,7 @@ async fn process_entry(entry: DirEntry, client: &UnitClient) -> Result<(), Unitc
             path: input_file.to_path()?.to_string_lossy().into(),
         });
     }
-    let upload_format = UploadFormat::from(&input_file);
+    let upload_format = UploadFormat::try_from(&input_file)?;
     let upload_path = upload_format.upload_path(entry.path());
 
     // We can't overwrite JS or PEM files, so we delete them first
@@ -130,5 +136,47 @@ async fn process_entry(entry: DirEntry, client: &UnitClient) -> Result<(), Unitc
             eprintln!("Error    {} -> {}", input_file.to_path()?.to_string_lossy(), error);
             Err(error)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(name: &str) -> InputFile {
+        InputFile::from(Path::new(name))
+    }
+
+    /// Each format this command can place has its own destination, and the
+    /// ".js" case is the one `execute` used to abort on.
+    #[test]
+    fn every_known_format_has_an_upload_path() {
+        let cases = [
+            ("conf.json", "/config"),
+            ("bundle.pem", "/certificates/bundle.pem"),
+            ("mod.js", "/js_modules/mod.js"),
+        ];
+
+        for (name, expected) in cases {
+            let file = input(name);
+            let format = UploadFormat::try_from(&file).expect("a known format");
+
+            assert_eq!(format.upload_path(Path::new(name)), expected);
+        }
+    }
+
+    /// A file this command cannot place is refused by name.  It used to
+    /// panic, which gave the operator a backtrace instead of the file name.
+    #[test]
+    fn an_unplaceable_file_is_refused_not_fatal() {
+        let Err(error) = UploadFormat::try_from(&input("notes.txt")) else {
+            panic!("an unplaceable file must be refused");
+        };
+
+        assert!(
+            matches!(error, UnitctlError::UnknownInputFileType { .. }),
+            "unexpected error: {}",
+            error
+        );
     }
 }

@@ -75,9 +75,17 @@ async fn send_and_deserialize(
                 // TLS certificate data
             } else if input_file.is_pem_bundle() {
                 send_and_validate_pem_data_deserialize_response(&client, method.as_str(), path, &input_file).await
-                // This is unknown data
+                // A JS module: the bytes go up as they are, the way "import" sends them
+            } else if input_file.is_javascript() {
+                send_body_deserialize_response(&client, method.as_str(), path, Some(&input_file)).await
+                // A file this command cannot send anywhere
             } else {
-                panic!("Unknown input file type")
+                Err(UnitctlError::UnknownInputFileType {
+                    path: input_file.to_path().map_or_else(
+                        |_| "-".to_string(),
+                        |path| path.to_string_lossy().into_owned(),
+                    ),
+                })
             }
         }
         // A none value for an input file can be considered a request to send an empty body

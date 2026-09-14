@@ -434,8 +434,9 @@ mod tests {
 
     /// YAML is refused by name for the same reason, and the ".yaml" extension
     /// still has to reach that refusal.  Were the variant dropped instead, the
-    /// file would become `InputFormat::Unknown` and `execute` would abort on
-    /// its `panic!("Unknown input file type")`.
+    /// file would become `InputFormat::Unknown`, which `execute` and `import`
+    /// report as an unknown input type -- the file name, but not what to do
+    /// about it.
     #[test]
     fn a_yaml_input_is_refused_with_a_message_about_yaml() {
         for suffix in [".yaml", ".yml"] {
