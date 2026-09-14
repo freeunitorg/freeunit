@@ -340,6 +340,21 @@ file.
 </para>
 </change>
 
+<change type="change">
+<para>
+removed the GnuTLS, CyaSSL, and PolarSSL backends (nxt_gnutls.c,
+nxt_cyassl.c, nxt_polarssl.c) and their configure plumbing ("--gnutls",
+"--cyassl", "--polarssl").  None of the three ever built: they read a
+"c-&gt;u.ssltls" union member that does not exist, and reference types such
+as "nxt_ssltls_conf_t" and "nxt_event_conn_io_t" that predate a refactor
+still visible in the current tree, so passing the flag reaches a compiler
+error instead of a clean "unsupported".  CyaSSL was renamed wolfSSL and
+PolarSSL became mbedTLS, both in 2015, so the flags also target products
+that no longer exist under these names.  The OpenSSL backend is
+unaffected; none of these files were ever part of a default build.
+</para>
+</change>
+
 </changes>
 
 
