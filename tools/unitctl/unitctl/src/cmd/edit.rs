@@ -1,5 +1,5 @@
 use crate::inputfile::{InputFile, InputFormat};
-use crate::requests::{send_and_validate_config_deserialize_response, send_empty_body_read_bytes};
+use crate::requests::{send_config_deserialize_response, send_empty_body_read_bytes};
 use crate::unitctl::UnitCtl;
 use crate::unitctl_error::ControlSocketErrorKind;
 use crate::{wait, OutputFormat, UnitctlError};
@@ -81,7 +81,11 @@ pub(crate) async fn cmd(cli: &UnitCtl, output_format: OutputFormat) -> Result<()
     let temp_file_path = temp_file.path();
     let before_edit_mod_time = temp_file_path.metadata().ok().map(|m| m.modified().ok());
 
-    let inputfile = InputFile::FileWithFormat(temp_file_path.into(), InputFormat::Json5);
+    // The temporary file holds what Unit returned, pretty-printed above, and
+    // whatever the editor leaves in it is sent as it is.  Reading it as JSON5
+    // would let a comment be written here, but it would also parse and
+    // re-serialize the file, which is what this path no longer does.
+    let inputfile = InputFile::FileWithFormat(temp_file_path.into(), InputFormat::Json);
     open_editor(temp_file_path)?;
     let after_edit_mod_time = temp_file_path.metadata().ok().map(|m| m.modified().ok());
 
@@ -94,7 +98,7 @@ pub(crate) async fn cmd(cli: &UnitCtl, output_format: OutputFormat) -> Result<()
     };
 
     // Send edited file to Unit to overwrite current configuration
-    send_and_validate_config_deserialize_response(&client, "PUT", "/config", Some(&inputfile))
+    send_config_deserialize_response(&client, "PUT", "/config", &inputfile)
         .await
         .and_then(|status| output_format.write_to_stdout(&status))
 }

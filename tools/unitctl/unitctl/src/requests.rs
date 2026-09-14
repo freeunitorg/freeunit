@@ -15,31 +15,22 @@ use std::io::ErrorKind;
 use std::sync::atomic::AtomicUsize;
 use unit_client_rs::unit_client::UnitClientError;
 
-/// Send the contents of a file to the unit server
-/// We assume that the file is valid and can be sent to the server
-pub async fn send_and_validate_config_deserialize_response(
+/// Send a configuration file to the unit server.
+///
+/// The bytes go out as they were written, for every format but JSON5.  unitctl
+/// used to parse the file into a `serde_json::Map` and re-serialize it.  That
+/// dropped an operator's duplicate member before the server could refuse it
+/// (src/nxt_conf.c:1616) and re-spelled every number.  The server validates:
+/// UTF-8 (src/nxt_conf_validation.c:1840), duplicates, and the schema.
+pub async fn send_config_deserialize_response(
     client: &UnitClient,
     method: &str,
     path: &str,
-    input_file: Option<&InputFile>,
+    input_file: &InputFile,
 ) -> Result<UnitSerializableMap, UnitctlError> {
-    let body_data = match input_file {
-        Some(input) => Some(input.to_unit_serializable_map()?),
-        None => None,
-    };
+    let (mime_type, body) = input_file.to_config_body()?;
 
-    /* Unfortunately, we have load the json text into memory before sending it to the server.
-     * This allows for validation of the json content before sending to the server. There may be
-     * a better way of doing this and it is worth investigating. */
-    let json = serde_json::to_value(&body_data).map_err(|error| UnitClientError::JsonError {
-        source: error,
-        path: path.into(),
-    })?;
-
-    let mime_type = input_file.map(|f| f.mime_type());
-    let reader = KnownSize::String(json.to_string());
-
-    streaming_upload_deserialize_response(client, method, path, mime_type, reader)
+    streaming_upload_deserialize_response(client, method, path, Some(mime_type), body)
         .await
         .map_err(|e| UnitctlError::UnitClientError { source: e })
 }

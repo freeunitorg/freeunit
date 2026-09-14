@@ -100,13 +100,7 @@ async fn process_entry(entry: DirEntry, client: &UnitClient) -> Result<(), Unitc
 
     let result = match upload_format {
         UploadFormat::Config => {
-            requests::send_and_validate_config_deserialize_response(
-                client,
-                "PUT",
-                upload_path.as_str(),
-                Some(&input_file),
-            )
-            .await
+            requests::send_config_deserialize_response(client, "PUT", upload_path.as_str(), &input_file).await
         }
         UploadFormat::PemBundle => {
             requests::send_and_validate_pem_data_deserialize_response(client, "PUT", upload_path.as_str(), &input_file)

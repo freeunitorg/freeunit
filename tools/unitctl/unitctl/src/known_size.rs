@@ -126,8 +126,14 @@ mod tests {
         let data = b"hello, world!";
         let reader = io::Cursor::new(data.to_vec());
         let known = KnownSize::Read(Box::new(reader), data.len() as u64);
-        let (_, len) = known.into_full_body().expect("should succeed");
+        let (body, len) = known.into_full_body().expect("should succeed");
         assert_eq!(len, data.len() as u64);
+        // The length alone would pass for any thirteen bytes, and an ordinary
+        // JSON configuration file now travels this variant.
+        let collected = futures::executor::block_on(http_body_util::BodyExt::collect(body))
+            .expect("collecting the body")
+            .to_bytes();
+        assert_eq!(collected.as_ref(), data.as_slice());
     }
 
     #[test]

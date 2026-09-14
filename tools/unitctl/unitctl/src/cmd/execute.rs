@@ -1,6 +1,6 @@
 use crate::inputfile::InputFile;
 use crate::requests::{
-    send_and_validate_config_deserialize_response, send_and_validate_pem_data_deserialize_response,
+    send_and_validate_pem_data_deserialize_response, send_config_deserialize_response,
     send_body_deserialize_response, send_empty_body_deserialize_response,
 };
 use crate::unitctl::UnitCtl;
@@ -71,7 +71,7 @@ async fn send_and_deserialize(
     match input_file {
         Some(input_file) => {
             if input_file.is_config() {
-                send_and_validate_config_deserialize_response(&client, method.as_str(), path, Some(&input_file)).await
+                send_config_deserialize_response(&client, method.as_str(), path, &input_file).await
                 // TLS certificate data
             } else if input_file.is_pem_bundle() {
                 send_and_validate_pem_data_deserialize_response(&client, method.as_str(), path, &input_file).await

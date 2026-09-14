@@ -144,36 +144,50 @@ impl InputFile {
         }
     }
 
-    pub fn to_unit_serializable_map(&self) -> Result<UnitSerializableMap, UnitctlError> {
-        let reader: Box<dyn BufRead + Send> = self.try_into()?;
-        let body_data: UnitSerializableMap = match self.format() {
-            InputFormat::Json => serde_json::from_reader(reader)
-                .map_err(|e| UnitctlError::DeserializationError { message: e.to_string() })?,
+    /// The media type and the bytes to PUT for a configuration input.
+    ///
+    /// The type is the type of the body, not of the file: a JSON5 file is
+    /// parsed and sent as JSON, so it goes out as "application/json".
+    ///
+    /// JSON is sent as it was written.  unitctl does not parse it, so an
+    /// operator's duplicate member reaches the server, which refuses it
+    /// (src/nxt_conf.c:1616), and a number keeps the spelling the file used.
+    /// Parsing here collapsed both silently.
+    ///
+    /// JSON5 is not JSON, so it is still parsed and re-serialized.  That is
+    /// the one input whose bytes cannot go out unchanged.
+    pub fn to_config_body(&self) -> Result<(String, KnownSize), UnitctlError> {
+        let json = "application/json".to_string();
+
+        match self.format() {
+            InputFormat::Json => Ok((json, self.try_into()?)),
             InputFormat::Json5 => {
-                let mut reader = BufReader::new(reader);
-                let mut json5_string: String = String::new();
+                let mut reader: Box<dyn BufRead + Send> = self.try_into()?;
+                let mut json5_string = String::new();
                 reader
                     .read_to_string(&mut json5_string)
                     .map_err(|e| UnitctlError::DeserializationError { message: e.to_string() })?;
-                json5::from_str(&json5_string)
-                    .map_err(|e| UnitctlError::DeserializationError { message: e.to_string() })?
+                let parsed: UnitSerializableMap = json5::from_str(&json5_string)
+                    .map_err(|e| UnitctlError::DeserializationError { message: e.to_string() })?;
+                let body = serde_json::to_string(&parsed)
+                    .map_err(|e| UnitctlError::SerializationError { message: e.to_string() })?;
+                Ok((json, KnownSize::String(body)))
             }
-            // Refuse hjson and YAML by name.  Handing the file to the JSON
-            // parser would report a syntax error on the first comment or
+            // Refuse hjson and YAML by name.  Sending the file as it is would
+            // make the server report a syntax error on the first comment or
             // unquoted key, and that error does not tell the user what to do.
             InputFormat::Hjson => Err(UnitctlError::DeserializationError {
                 message: "hjson is no longer supported: convert the file to JSON first".to_string(),
-            })?,
+            }),
             InputFormat::Yaml => Err(UnitctlError::DeserializationError {
                 message: "YAML is no longer supported: convert the file to JSON first, for example with \
                           \"yq -o=json\""
                     .to_string(),
-            })?,
+            }),
             _ => Err(UnitctlError::DeserializationError {
-                message: format!("Unsupported input format for serialization: {:?}", self),
-            })?,
-        };
-        Ok(body_data)
+                message: format!("Unsupported input format for a configuration: {:?}", self),
+            }),
+        }
     }
 }
 
@@ -307,18 +321,42 @@ mod tests {
         file
     }
 
-    fn members_of(file: &tempfile::NamedTempFile, format: InputFormat) -> Vec<String> {
-        InputFile::FileWithFormat(file.path().into(), format)
-            .to_unit_serializable_map()
-            .expect("the input must deserialize")
-            .keys()
-            .cloned()
-            .collect()
+    /// Read a body back without going through `into_full_body`, so the check
+    /// does not depend on the same code it is checking.
+    fn body_bytes(known_size: KnownSize) -> Vec<u8> {
+        match known_size {
+            KnownSize::Vec(bytes) => bytes,
+            KnownSize::String(text) => text.into_bytes(),
+            KnownSize::Read(mut reader, _) => {
+                let mut bytes = Vec::new();
+                reader.read_to_end(&mut bytes).expect("reading the body");
+                bytes
+            }
+            KnownSize::Empty => Vec::new(),
+        }
     }
 
-    /// `UnitSerializableMap` is a `serde_json::Map`, which keeps member order
-    /// only because every format feeding it keeps it too.  `json5` reaches the
-    /// type by a different route than `serde_json`, so both are checked.
+    fn config_body(file: &tempfile::NamedTempFile, format: InputFormat) -> Vec<u8> {
+        let (mime_type, body) = InputFile::FileWithFormat(file.path().into(), format)
+            .to_config_body()
+            .expect("the input must produce a body");
+
+        // Every configuration body is JSON by the time it leaves, whatever the
+        // file it came from.
+        assert_eq!(mime_type, "application/json");
+
+        body_bytes(body)
+    }
+
+    fn members_of(file: &tempfile::NamedTempFile, format: InputFormat) -> Vec<String> {
+        let body = config_body(file, format);
+        let map: UnitSerializableMap = serde_json::from_slice(&body).expect("the body must be JSON");
+        map.keys().cloned().collect()
+    }
+
+    /// The body Unit receives keeps member order.  JSON is sent as it was
+    /// written, so it can only keep it.  JSON5 is parsed and re-serialized, and
+    /// both ends of that have to keep it.
     #[test]
     fn every_input_format_keeps_member_order() {
         let json = MEMBERS
@@ -332,15 +370,51 @@ mod tests {
         assert_eq!(members_of(&write_input(&json, ".json5"), InputFormat::Json5), MEMBERS);
     }
 
+    /// A JSON file is sent byte for byte.  Parsing it here kept the last of two
+    /// members with the same name and re-spelled every number, so the server
+    /// never saw what the operator wrote.  The server refuses the duplicate
+    /// itself (src/nxt_conf.c:1616).
+    #[test]
+    fn a_json_input_is_sent_unchanged() {
+        let written = "{\n  \"listeners\": {},\n  \"listeners\": {\"*:8080\": {}},\n  \"settings\": 1.50\n}\n";
+        let file = write_input(written, ".json");
+
+        let body = config_body(&file, InputFormat::Json);
+
+        assert_eq!(String::from_utf8(body).expect("the body is UTF-8"), written);
+    }
+
+    /// Bytes that are not valid UTF-8 now reach the server, which refuses them
+    /// and names the member (src/nxt_conf_validation.c:1840).  unitctl refused
+    /// them first, with a parse error that said nothing about the encoding.
+    #[test]
+    fn a_file_that_is_not_valid_utf8_is_sent_to_the_server() {
+        let mut file = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .expect("a temporary file");
+        let mut raw = br#"{"routes":[{"match":{"uri":"/"#.to_vec();
+        raw.push(0xff);
+        raw.extend_from_slice(br#""},"action":{"return":204}}]}"#);
+        std::io::Write::write_all(file.as_file_mut(), &raw).expect("writing the input");
+
+        let (_, body) = InputFile::FileWithFormat(file.path().into(), InputFormat::Json)
+            .to_config_body()
+            .expect("the bytes must be sent, not judged here");
+        let body = body_bytes(body);
+
+        assert_eq!(body, raw);
+    }
+
     /// hjson is refused by name.  Handing the file to the JSON parser instead
     /// would report a syntax error on the first comment, which does not tell
     /// the user what to do.
     #[test]
     fn an_hjson_input_is_refused_with_a_message_about_hjson() {
         let file = write_input("{\n  # a comment\n  routes: []\n}\n", ".hjson");
-        let error = InputFile::from(file.path())
-            .to_unit_serializable_map()
-            .expect_err("hjson must be refused");
+        let Err(error) = InputFile::from(file.path()).to_config_body() else {
+            panic!("hjson must be refused");
+        };
 
         assert!(
             error.to_string().contains("hjson is no longer supported"),
@@ -361,7 +435,9 @@ mod tests {
 
             assert!(input.is_config(), "{} must stay a config format", suffix);
 
-            let error = input.to_unit_serializable_map().expect_err("YAML must be refused");
+            let Err(error) = input.to_config_body() else {
+                panic!("{} must be refused", suffix);
+            };
             assert!(
                 error.to_string().contains("YAML is no longer supported"),
                 "unexpected message: {}",
@@ -370,30 +446,11 @@ mod tests {
         }
     }
 
-    /// The way back in is strict, which is why `unitctl export` warns that the
-    /// verbatim backup it writes for a configuration holding bytes that are not
-    /// valid UTF-8 is one `unitctl import` cannot replay.
-    #[test]
-    fn a_file_that_is_not_valid_utf8_is_refused_on_the_way_in() {
-        let mut file = tempfile::Builder::new()
-            .suffix(".json")
-            .tempfile()
-            .expect("a temporary file");
-        let mut raw = br#"{"routes":[{"match":{"uri":"/"#.to_vec();
-        raw.push(0xff);
-        raw.extend_from_slice(br#""},"action":{"return":204}}]}"#);
-        std::io::Write::write_all(file.as_file_mut(), &raw).expect("writing the input");
-
-        assert!(InputFile::FileWithFormat(file.path().into(), InputFormat::Json)
-            .to_unit_serializable_map()
-            .is_err());
-    }
-
     #[test]
     fn an_unsupported_input_format_is_refused() {
         let file = write_input("not a configuration", ".txt");
         assert!(InputFile::FileWithFormat(file.path().into(), InputFormat::Pem)
-            .to_unit_serializable_map()
+            .to_config_body()
             .is_err());
     }
 }
