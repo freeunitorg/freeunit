@@ -555,11 +555,17 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
 
     cur = tail = str;
     /*
-     * To ease parsing the Accept-Encoding header, remove all spaces,
-     * which hold no semantic meaning.
+     * To ease parsing the Accept-Encoding header, remove all optional
+     * whitespace, which holds no semantic meaning.
+     *
+     * OWS is SP or HTAB (RFC 9110 Sect. 5.6.3), and it is legal on either
+     * side of the weight's semicolon.  Removing only the space left
+     * "identity;<HTAB>q=0" unparsed, so the element read as an unknown
+     * coding and the refusal it carried was lost -- which handed a client
+     * that refused identity a 206 of exactly those bytes.
      */
     for (; *cur != '\0'; cur++) {
-        if (*cur == ' ') {
+        if (*cur == ' ' || *cur == '\t') {
             continue;
         }
 

@@ -452,3 +452,18 @@ def test_static_compression_range_identity_refused_guards(temp_dir):
     assert 'Content-Encoding' not in headers
     assert headers['Content-Range'] == f'bytes 0-9/{size}'
     assert body == b'body{color'
+
+    # OWS is SP or HTAB (Sect. 5.6.3) and is legal either side of the
+    # weight's semicolon.  Stripping only the space left the tab forms
+    # unparsed, so the element read as an unknown coding and took its
+    # refusal with it.
+    for spelling in (
+        'gzip, identity;	q=0',
+        'gzip, identity	;q=0',
+        'gzip, identity; q=0',
+    ):
+        status, headers, _ = _raw_get(
+            **{'Accept-Encoding': spelling, 'Range': 'bytes=0-9'}
+        )
+        assert status == 200, f'whitespace in the weight: {spelling!r}'
+        assert headers.get('Content-Encoding') == 'gzip'
