@@ -267,7 +267,16 @@ PHP_FUNCTION(fastcgi_finish_request)
 #endif
     }
 
-    nxt_unit_request_done(ctx->req, NXT_UNIT_OK);
+    /*
+     * Detached, not plain done: the script keeps running after this returns.
+     * Without telling the router that, the worker is counted idle from here
+     * -- its slot goes back to "processes": {"max"} and its idle timer can
+     * reap a process that is still executing.  libunit reports the work
+     * finished by itself when this request handler returns, which covers the
+     * exit() and fatal paths as well as an ordinary return.
+     */
+
+    nxt_unit_request_done_detached(ctx->req, NXT_UNIT_OK);
     ctx->req = NULL;
 
     PG(connection_status) = PHP_CONNECTION_ABORTED;
