@@ -108,7 +108,6 @@ struct nxt_http_comp_ctx_s {
  * router on the next request (#167).
  */
 struct nxt_http_comp_conf_s {
-    nxt_tstr_t                  *accept_encoding_query;
     nxt_http_route_rule_t       *mime_types_rule;
     nxt_http_comp_compressor_t  *enabled;
     nxt_uint_t                  nr_enabled;
@@ -526,6 +525,104 @@ nxt_http_comp_compressor_lookup_enabled(const nxt_http_comp_conf_t *conf,
  *
  * 'identity;q=0' seems to basically mean the same thing...
  */
+/*
+ * Collects every Accept-Encoding field into one value.
+ *
+ * RFC 9110 Sect. 5.3: a field that may carry a comma-separated list can be
+ * sent as several lines, and a recipient must treat them as one value joined
+ * by commas.  A variable query answers with the first matching field only
+ * (nxt_http_var_header()), so "Accept-Encoding: gzip" followed by
+ * "Accept-Encoding: identity;q=0" lost the refusal and the request was served
+ * the identity bytes it had declined -- and in the other order the gzip it
+ * would have accepted was never seen, so it drew a 406.
+ *
+ * The single-field case, which is every ordinary request, points straight at
+ * the field and copies nothing.
+ */
+
+static nxt_int_t
+nxt_http_comp_accept_encoding(nxt_http_request_t *r, nxt_str_t *value)
+{
+    u_char                  *p;
+    size_t                  len;
+    nxt_uint_t              n;
+    nxt_http_field_t        *f, *first;
+    nxt_http_fields_iter_t  iter;
+
+    static const nxt_str_t  accept_encoding = nxt_string("Accept-Encoding");
+
+    n = 0;
+    len = 0;
+    first = NULL;
+
+    for (f = nxt_http_fields_first(&iter, r->inline_fields,
+                                   r->num_inline_fields, r->fields);
+         f != NULL;
+         f = nxt_http_fields_next(&iter))
+    {
+        if (f->skip || f->name_length != accept_encoding.length
+            || nxt_strncasecmp(f->name, accept_encoding.start,
+                               accept_encoding.length) != 0)
+        {
+            continue;
+        }
+
+        if (n == 0) {
+            first = f;
+
+        } else {
+            len += nxt_length(", ");
+        }
+
+        len += f->value_length;
+        n++;
+    }
+
+    if (n == 0) {
+        nxt_str_null(value);
+        return NXT_OK;
+    }
+
+    if (n == 1) {
+        value->start = first->value;
+        value->length = first->value_length;
+
+        return NXT_OK;
+    }
+
+    p = nxt_mp_nget(r->mem_pool, len);
+    if (nxt_slow_path(p == NULL)) {
+        return NXT_ERROR;
+    }
+
+    value->start = p;
+    value->length = len;
+
+    n = 0;
+
+    for (f = nxt_http_fields_first(&iter, r->inline_fields,
+                                   r->num_inline_fields, r->fields);
+         f != NULL;
+         f = nxt_http_fields_next(&iter))
+    {
+        if (f->skip || f->name_length != accept_encoding.length
+            || nxt_strncasecmp(f->name, accept_encoding.start,
+                               accept_encoding.length) != 0)
+        {
+            continue;
+        }
+
+        if (n++ != 0) {
+            p = nxt_cpymem(p, ", ", nxt_length(", "));
+        }
+
+        p = nxt_cpymem(p, f->value, f->value_length);
+    }
+
+    return NXT_OK;
+}
+
+
 static nxt_int_t
 nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
                                 nxt_http_request_t *r, const nxt_str_t *token,
@@ -912,12 +1009,11 @@ nxt_http_comp_merge_vary(nxt_http_request_t *r)
 nxt_int_t
 nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
 {
-    bool                    identity_refused;
-    nxt_int_t               ret, idx;
-    nxt_str_t               accept_encoding, mime_type = {};
-    nxt_router_conf_t       *rtcf;
-    nxt_http_comp_ctx_t     *ctx = nxt_http_comp_ctx();
-    nxt_http_comp_conf_t    *conf = nxt_http_comp_request_conf(r);
+    bool                  identity_refused;
+    nxt_int_t             ret, idx;
+    nxt_str_t             accept_encoding, mime_type = {};
+    nxt_http_comp_ctx_t   *ctx = nxt_http_comp_ctx();
+    nxt_http_comp_conf_t  *conf = nxt_http_comp_request_conf(r);
 
     *ctx = (nxt_http_comp_ctx_t){ .resp_clen = -1, .sel_idx = -1 };
 
@@ -955,8 +1051,6 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
         }
     }
 
-    rtcf = r->conf->socket_conf->router_conf;
-
     if (nxt_http_comp_is_resp_content_encoded(r)) {
         return NXT_OK;
     }
@@ -972,14 +1066,7 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
         return NXT_ERROR;
     }
 
-    ret = nxt_tstr_query_init(&r->tstr_query, rtcf->tstr_state, &r->tstr_cache,
-                              r, r->mem_pool);
-    if (nxt_slow_path(ret == NXT_ERROR)) {
-        return NXT_ERROR;
-    }
-
-    ret = nxt_tstr_query(task, r->tstr_query, conf->accept_encoding_query,
-                         &accept_encoding);
+    ret = nxt_http_comp_accept_encoding(r, &accept_encoding);
     if (nxt_slow_path(ret != NXT_OK)) {
         return NXT_ERROR;
     }
@@ -1209,8 +1296,6 @@ nxt_http_comp_compression_init(nxt_task_t *task, nxt_router_conf_t *rtcf,
     nxt_conf_value_t      *comps, *mimes;
     nxt_http_comp_conf_t  *conf;
 
-    static const nxt_str_t  accept_enc_str =
-                                    nxt_string("$header_accept_encoding");
     static const nxt_str_t  comps_str = nxt_string("compressors");
     static const nxt_str_t  mimes_str = nxt_string("types");
 
@@ -1227,13 +1312,6 @@ nxt_http_comp_compression_init(nxt_task_t *task, nxt_router_conf_t *rtcf,
         if (nxt_slow_path(conf->mime_types_rule == NULL)) {
             return NXT_ERROR;
         }
-    }
-
-    conf->accept_encoding_query =
-                            nxt_tstr_compile(rtcf->tstr_state, &accept_enc_str,
-                                             NXT_TSTR_STRZ);
-    if (nxt_slow_path(conf->accept_encoding_query == NULL)) {
-        return NXT_ERROR;
     }
 
     comps = nxt_conf_get_object_member(comp_conf, &comps_str, NULL);

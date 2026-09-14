@@ -889,6 +889,20 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
                                         nxt_file_size(&fi), &range_start,
                                         &range_end);
 
+        /*
+         * A range is served as identity, so a client that sent
+         * "identity;q=0" must not be given one -- see the comment on the
+         * drop below.  Tested here rather than after the 416 branch so that
+         * ignoring the Range is all or nothing: an unsatisfiable range from
+         * such a client would otherwise still draw a 416 whose
+         * "Content-Range: bytes STAR/size" reports the size of exactly the
+         * representation it refused.
+         */
+
+        if (nxt_http_comp_identity_refused()) {
+            rstatus = NXT_HTTP_OK;
+        }
+
         if (rstatus == NXT_HTTP_RANGE_NOT_SATISFIABLE) {
             nxt_file_close(task, f);
             f = NULL;
@@ -922,27 +936,32 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         is_range = (rstatus == NXT_HTTP_PARTIAL_CONTENT);
 
         /*
-         * A range is served as identity (see the comment on skipping
-         * compression below), so a client that sent "identity;q=0" must not
-         * be given one: it asked not to receive the file's own bytes, and a
-         * 206 hands it exactly those.  Such a request is still serveable --
-         * it named a coding Unit has -- so drop the Range rather than the
-         * request, and answer the full 200 in the coding it did accept.
+         * Why the Range is dropped for a client that refused identity.
          *
-         * Ignoring a Range is already how this function answers a malformed
-         * one, a multi-range one and an If-Range mismatch (Sect. 14.2 lets a
-         * server ignore Range), so this needs no new shape of response.  A
-         * 406 would be the other reading, but it refuses a request that can
-         * be satisfied, and a client asking for bytes 0-9 of a small file is
-         * better served the file than an error.
+         * Not because a coded range is impossible: Sect. 3.2 defines
+         * representation data as the bytes after content coding and Sect.
+         * 14.1.2 defines a byte range over that, so bytes 0-9 of the gzip
+         * representation is well defined -- and Unit codes the whole file
+         * into a temp file before sending, so it could slice that instead.
+         *
+         * Because a coded range is never resumable, and costs a whole file
+         * to answer.  A coded representation carries a weak entity-tag
+         * (nxt_http_comp_weaken_etag()), and nxt_http_static_range() above
+         * compares an "If-Range" strongly, so a resumed coded range always
+         * falls back to the full response -- the one thing a range request
+         * exists to avoid.  Meanwhile Unit compresses the whole file into a
+         * temp file to hand back ten bytes of it.
+         *
+         * So ignore the Range (Sect. 14.2 permits it) and send the full 200
+         * in the coding the client did accept.  That is already how this
+         * function answers a malformed range, a multi-range request and an
+         * If-Range mismatch, so it needs no new shape of response.  A 406
+         * would be the other reading, but it refuses a request that can be
+         * satisfied.
          *
          * Not reached when nothing is acceptable: that is already 406, from
          * nxt_http_comp_check_acceptable() above.
          */
-
-        if (is_range && nxt_http_comp_identity_refused()) {
-            is_range = 0;
-        }
 
         if (is_range) {
             r->status = NXT_HTTP_PARTIAL_CONTENT;

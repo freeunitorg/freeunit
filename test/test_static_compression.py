@@ -467,3 +467,33 @@ def test_static_compression_range_identity_refused_guards(temp_dir):
         )
         assert status == 200, f'whitespace in the weight: {spelling!r}'
         assert headers.get('Content-Encoding') == 'gzip'
+
+    # Sect. 5.3: a list-valued field may arrive as several lines and must be
+    # read as one value joined by commas.  A variable query answers with the
+    # first matching field only, so the second line went unread: in this order
+    # the refusal was lost and the 206 went out anyway, and in the other order
+    # the gzip the client would have taken was never seen and it drew a 406.
+    for lines_ae in (['gzip', 'identity;q=0'], ['identity;q=0', 'gzip']):
+        status, headers, _ = _raw_get(
+            **{'Accept-Encoding': lines_ae, 'Range': 'bytes=0-9'}
+        )
+        assert status == 200, f'repeated field: {lines_ae!r}'
+        assert headers.get('Content-Encoding') == 'gzip'
+
+    # Ignoring the Range is all or nothing.  An unsatisfiable range from a
+    # client that refused identity would otherwise draw a 416 whose
+    # "Content-Range: bytes */size" reports the size of the very
+    # representation it refused.
+    status, headers, _ = _raw_get(
+        **{'Accept-Encoding': 'gzip, identity;q=0', 'Range': 'bytes=99999-'}
+    )
+    assert status == 200, 'unsatisfiable range is ignored too'
+    assert headers.get('Content-Encoding') == 'gzip'
+    assert 'Content-Range' not in headers
+
+    # A client that accepts identity still gets its 416.
+    status, headers, _ = _raw_get(
+        **{'Accept-Encoding': 'gzip', 'Range': 'bytes=99999-'}
+    )
+    assert status == 416, 'an ordinary unsatisfiable range is still 416'
+    assert headers['Content-Range'] == f'bytes */{size}'
