@@ -405,3 +405,28 @@ def test_static_compression_range_identity_refused_guards(temp_dir):
     status, headers, _ = _raw_get(**{'Accept-Encoding': 'gzip, identity;q=0'})
     assert status == 200
     assert headers.get('Content-Encoding') == 'gzip'
+
+    # An explicitly named identity outranks the wildcard.  The client refused
+    # everything it did not name and then named identity as acceptable, so a
+    # 206 of identity bytes is exactly what it asked for.  Reading the
+    # wildcard as a veto here drops a range the client could take.
+    status, headers, body = _raw_get(
+        **{
+            'Accept-Encoding': 'gzip, identity;q=0.5, *;q=0',
+            'Range': 'bytes=0-9',
+        }
+    )
+    assert status == 206, 'an explicit identity;q>0 keeps its range'
+    assert 'Content-Encoding' not in headers
+    assert headers['Content-Range'] == f'bytes 0-9/{size}'
+    assert body == b'body{color'
+
+    # A content coding is a token and tokens are case-insensitive
+    # (Sect. 8.4.1), so "Identity;q=0" refuses identity just as "identity;q=0"
+    # does.  A case-sensitive compare drops the refusal on the floor and
+    # serves the 206 this whole test exists to prevent.
+    status, headers, _ = _raw_get(
+        **{'Accept-Encoding': 'gzip, Identity;q=0', 'Range': 'bytes=0-9'}
+    )
+    assert status == 200, 'a mixed-case identity token still refuses'
+    assert headers.get('Content-Encoding') == 'gzip'
