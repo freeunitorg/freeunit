@@ -70,6 +70,15 @@ struct nxt_http_comp_ctx_s {
     nxt_uint_t                      idx;
 
     /*
+     * The compressor's type table entry, copied out of the configuration
+     * when the choice is applied.  The table is static and lives as long as
+     * the process, so a body that is still being compressed when the
+     * configuration is replaced keeps working from here instead of indexing
+     * a per-configuration array that may already be freed.
+     */
+    const nxt_http_comp_type_t      *type;
+
+    /*
      * The compressor nxt_http_comp_check_acceptable() chose, or -1 when the
      * request will not be compressed.  Kept apart from "idx", which is only
      * set once the choice has actually been applied.
@@ -83,10 +92,19 @@ struct nxt_http_comp_ctx_s {
 };
 
 
-static nxt_tstr_t                  *nxt_http_comp_accept_encoding_query;
-static nxt_http_route_rule_t       *nxt_http_comp_mime_types_rule;
-static nxt_http_comp_compressor_t  *nxt_http_comp_enabled_compressors;
-static nxt_uint_t                  nxt_http_comp_nr_enabled_compressors;
+/*
+ * Everything here is allocated from the router configuration's pools, so it
+ * is held per configuration and reached through the request.  It used to be
+ * four process-global pointers, which dangled as soon as the configuration
+ * they came from was freed -- reconfiguring compression away killed the
+ * router on the next request (#167).
+ */
+struct nxt_http_comp_conf_s {
+    nxt_tstr_t                  *accept_encoding_query;
+    nxt_http_route_rule_t       *mime_types_rule;
+    nxt_http_comp_compressor_t  *enabled;
+    nxt_uint_t                  nr_enabled;
+};
 
 static nxt_thread_declare_data(nxt_http_comp_ctx_t,
                                nxt_http_comp_compressor_ctx);
@@ -148,16 +166,21 @@ static const nxt_http_comp_type_t  nxt_http_comp_compressors[] = {
 };
 
 
+nxt_inline nxt_http_comp_conf_t *
+nxt_http_comp_request_conf(const nxt_http_request_t *r)
+{
+    return r->conf->socket_conf->router_conf->compression;
+}
+
+
 static ssize_t
 nxt_http_comp_compress(uint8_t *dst, size_t dst_size, const uint8_t *src,
                        size_t src_size, bool last)
 {
     nxt_http_comp_ctx_t               *ctx = nxt_http_comp_ctx();
-    nxt_http_comp_compressor_t        *compressor;
     const nxt_http_comp_operations_t  *cops;
 
-    compressor = &nxt_http_comp_enabled_compressors[ctx->idx];
-    cops = compressor->type->cops;
+    cops = ctx->type->cops;
 
     return cops->deflate(&ctx->ctx, src, src_size, dst, dst_size, last);
 }
@@ -167,11 +190,9 @@ static size_t
 nxt_http_comp_bound(size_t size)
 {
     nxt_http_comp_ctx_t               *ctx = nxt_http_comp_ctx();
-    nxt_http_comp_compressor_t        *compressor;
     const nxt_http_comp_operations_t  *cops;
 
-    compressor = &nxt_http_comp_enabled_compressors[ctx->idx];
-    cops = compressor->type->cops;
+    cops = ctx->type->cops;
 
     return cops->bound(&ctx->ctx, size);
 }
@@ -419,16 +440,15 @@ nxt_http_comp_wants_compression(void)
 
 
 static nxt_uint_t
-nxt_http_comp_compressor_lookup_enabled(const nxt_str_t *token)
+nxt_http_comp_compressor_lookup_enabled(const nxt_http_comp_conf_t *conf,
+                                        const nxt_str_t *token)
 {
     if (token->start[0] == '*') {
         return NXT_HTTP_COMP_SCHEME_IDENTITY;
     }
 
-    for (nxt_uint_t i = 0; i < nxt_http_comp_nr_enabled_compressors; i++) {
-        if (nxt_strstr_eq(token,
-                          &nxt_http_comp_enabled_compressors[i].type->token))
-        {
+    for (nxt_uint_t i = 0; i < conf->nr_enabled; i++) {
+        if (nxt_strstr_eq(token, &conf->enabled[i].type->token)) {
             return i;
         }
     }
@@ -454,7 +474,8 @@ nxt_http_comp_compressor_lookup_enabled(const nxt_str_t *token)
  * 'identity;q=0' seems to basically mean the same thing...
  */
 static nxt_int_t
-nxt_http_comp_select_compressor(nxt_http_request_t *r, const nxt_str_t *token)
+nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
+                                nxt_http_request_t *r, const nxt_str_t *token)
 {
     bool       identity_allowed = true;
     char       *str, *tkn, *tail, *cur;
@@ -501,12 +522,12 @@ nxt_http_comp_select_compressor(nxt_http_request_t *r, const nxt_str_t *token)
         enc.start = (u_char *)tkn;
         enc.length = qptr != NULL ? (size_t)(qptr - tkn) : strlen(tkn);
 
-        ecidx = nxt_http_comp_compressor_lookup_enabled(&enc);
+        ecidx = nxt_http_comp_compressor_lookup_enabled(conf, &enc);
         if (ecidx == NXT_HTTP_COMP_SCHEME_UNKNOWN) {
             continue;
         }
 
-        scheme = nxt_http_comp_enabled_compressors[ecidx].type->scheme;
+        scheme = conf->enabled[ecidx].type->scheme;
 
         if (qval == 0.0 && scheme == NXT_HTTP_COMP_SCHEME_IDENTITY) {
             identity_allowed = false;
@@ -529,7 +550,8 @@ nxt_http_comp_select_compressor(nxt_http_request_t *r, const nxt_str_t *token)
 
 
 static nxt_int_t
-nxt_http_comp_set_header(nxt_http_request_t *r, nxt_uint_t comp_idx)
+nxt_http_comp_set_header(const nxt_http_comp_conf_t *conf,
+                         nxt_http_request_t *r, nxt_uint_t comp_idx)
 {
     const nxt_str_t   *token;
     nxt_http_field_t  *f;
@@ -542,7 +564,7 @@ nxt_http_comp_set_header(nxt_http_request_t *r, nxt_uint_t comp_idx)
         return NXT_ERROR;
     }
 
-    token = &nxt_http_comp_enabled_compressors[comp_idx].type->token;
+    token = &conf->enabled[comp_idx].type->token;
 
     *f = (nxt_http_field_t){};
 
@@ -806,14 +828,17 @@ nxt_http_comp_merge_vary(nxt_http_request_t *r)
 nxt_int_t
 nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
 {
-    nxt_int_t            ret, idx;
-    nxt_str_t            accept_encoding, mime_type = {};
-    nxt_router_conf_t    *rtcf;
-    nxt_http_comp_ctx_t  *ctx = nxt_http_comp_ctx();
+    nxt_int_t               ret, idx;
+    nxt_str_t               accept_encoding, mime_type = {};
+    nxt_router_conf_t       *rtcf;
+    nxt_http_comp_ctx_t     *ctx = nxt_http_comp_ctx();
+    nxt_http_comp_conf_t    *conf = nxt_http_comp_request_conf(r);
 
     *ctx = (nxt_http_comp_ctx_t){ .resp_clen = -1, .sel_idx = -1 };
 
-    if (nxt_http_comp_nr_enabled_compressors == 0) {
+    /* A built configuration always holds identity, so NULL is the only
+       "no compression" state. */
+    if (conf == NULL) {
         return NXT_OK;
     }
 
@@ -836,8 +861,8 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
         return NXT_OK;
     }
 
-    if (nxt_http_comp_mime_types_rule != NULL) {
-        ret = nxt_http_route_test_rule(r, nxt_http_comp_mime_types_rule,
+    if (conf->mime_types_rule != NULL) {
+        ret = nxt_http_route_test_rule(r, conf->mime_types_rule,
                                        mime_type.start,
                                        mime_type.length);
         if (ret == 0) {
@@ -868,13 +893,13 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
         return NXT_ERROR;
     }
 
-    ret = nxt_tstr_query(task, r->tstr_query,
-                         nxt_http_comp_accept_encoding_query, &accept_encoding);
+    ret = nxt_tstr_query(task, r->tstr_query, conf->accept_encoding_query,
+                         &accept_encoding);
     if (nxt_slow_path(ret != NXT_OK)) {
         return NXT_ERROR;
     }
 
-    idx = nxt_http_comp_select_compressor(r, &accept_encoding);
+    idx = nxt_http_comp_select_compressor(conf, r, &accept_encoding);
     if (idx == -1) {
         return NXT_HTTP_NOT_ACCEPTABLE;
     }
@@ -964,6 +989,7 @@ nxt_http_comp_apply_compression(nxt_task_t *task, nxt_http_request_t *r)
     nxt_int_t                   idx;
     nxt_off_t                   min_len;
     nxt_http_comp_ctx_t         *ctx = nxt_http_comp_ctx();
+    nxt_http_comp_conf_t        *conf;
     nxt_http_comp_compressor_t  *compressor;
 
     idx = ctx->sel_idx;
@@ -972,7 +998,12 @@ nxt_http_comp_apply_compression(nxt_task_t *task, nxt_http_request_t *r)
         return NXT_OK;
     }
 
-    compressor = &nxt_http_comp_enabled_compressors[idx];
+    /*
+     * Reached only when nxt_http_comp_check_acceptable() chose a compressor,
+     * which it does only from a non-NULL configuration.
+     */
+    conf = nxt_http_comp_request_conf(r);
+    compressor = &conf->enabled[idx];
 
     if (r->resp.content_length_n > -1) {
         ctx->resp_clen = r->resp.content_length_n;
@@ -987,14 +1018,15 @@ nxt_http_comp_apply_compression(nxt_task_t *task, nxt_http_request_t *r)
         return NXT_OK;
     }
 
-    nxt_http_comp_set_header(r, idx);
+    nxt_http_comp_set_header(conf, r, idx);
 
     if (nxt_slow_path(nxt_http_comp_weaken_etag(r) != NXT_OK)) {
         return NXT_ERROR;
     }
 
     ctx->idx = idx;
-    ctx->ctx.level = nxt_http_comp_enabled_compressors[idx].opts.level;
+    ctx->type = compressor->type;
+    ctx->ctx.level = compressor->opts.level;
 
     err = compressor->type->cops->init(&ctx->ctx);
     if (nxt_slow_path(err)) {
@@ -1034,6 +1066,7 @@ nxt_http_comp_compressor_is_valid(const nxt_str_t *token)
 
 static nxt_int_t
 nxt_http_comp_set_compressor(nxt_task_t *task, nxt_router_conf_t *rtcf,
+                             nxt_http_comp_conf_t *conf,
                              const nxt_conf_value_t *comp, nxt_uint_t index)
 {
     nxt_int_t                   ret;
@@ -1052,7 +1085,7 @@ nxt_http_comp_set_compressor(nxt_task_t *task, nxt_router_conf_t *rtcf,
     nxt_conf_get_string(obj, &token);
     cidx = nxt_http_comp_compressor_token2idx(&token);
 
-    compr = &nxt_http_comp_enabled_compressors[index];
+    compr = &conf->enabled[index];
 
     compr->type = &nxt_http_comp_compressors[cidx];
     compr->opts.level = compr->type->def_compr;
@@ -1084,29 +1117,35 @@ nxt_int_t
 nxt_http_comp_compression_init(nxt_task_t *task, nxt_router_conf_t *rtcf,
                                const nxt_conf_value_t *comp_conf)
 {
-    nxt_int_t         ret;
-    nxt_uint_t        n = 1;  /* 'identity' */
-    nxt_conf_value_t  *comps, *mimes;
+    nxt_int_t             ret;
+    nxt_uint_t            n = 1;  /* 'identity' */
+    nxt_conf_value_t      *comps, *mimes;
+    nxt_http_comp_conf_t  *conf;
 
     static const nxt_str_t  accept_enc_str =
                                     nxt_string("$header_accept_encoding");
     static const nxt_str_t  comps_str = nxt_string("compressors");
     static const nxt_str_t  mimes_str = nxt_string("types");
 
+    conf = nxt_mp_zalloc(rtcf->mem_pool, sizeof(nxt_http_comp_conf_t));
+    if (nxt_slow_path(conf == NULL)) {
+        return NXT_ERROR;
+    }
+
     mimes = nxt_conf_get_object_member(comp_conf, &mimes_str, NULL);
     if (mimes != NULL) {
-        nxt_http_comp_mime_types_rule =
+        conf->mime_types_rule =
                         nxt_http_route_types_rule_create(task,
                                                          rtcf->mem_pool, mimes);
-        if (nxt_slow_path(nxt_http_comp_mime_types_rule == NULL)) {
+        if (nxt_slow_path(conf->mime_types_rule == NULL)) {
             return NXT_ERROR;
         }
     }
 
-    nxt_http_comp_accept_encoding_query =
+    conf->accept_encoding_query =
                             nxt_tstr_compile(rtcf->tstr_state, &accept_enc_str,
                                              NXT_TSTR_STRZ);
-    if (nxt_slow_path(nxt_http_comp_accept_encoding_query == NULL)) {
+    if (nxt_slow_path(conf->accept_encoding_query == NULL)) {
         return NXT_ERROR;
     }
 
@@ -1120,30 +1159,40 @@ nxt_http_comp_compression_init(nxt_task_t *task, nxt_router_conf_t *rtcf,
     } else {
         n += nxt_conf_object_members_count(comps);
     }
-    nxt_http_comp_nr_enabled_compressors = n;
+    conf->nr_enabled = n;
 
-    nxt_http_comp_enabled_compressors =
-                        nxt_mp_zalloc(rtcf->mem_pool,
-                                      sizeof(nxt_http_comp_compressor_t) * n);
+    conf->enabled = nxt_mp_zalloc(rtcf->mem_pool,
+                                  sizeof(nxt_http_comp_compressor_t) * n);
+    if (nxt_slow_path(conf->enabled == NULL)) {
+        return NXT_ERROR;
+    }
 
-    nxt_http_comp_enabled_compressors[0] =
+    conf->enabled[0] =
         (nxt_http_comp_compressor_t){ .type = &nxt_http_comp_compressors[0],
                                       .opts.level = NXT_COMP_LEVEL_UNSET,
                                       .opts.min_len = -1 };
 
     if (nxt_conf_type(comps) == NXT_CONF_OBJECT) {
-        return nxt_http_comp_set_compressor(task, rtcf, comps, 1);
-    }
-
-    for (nxt_uint_t i = 1; i < nxt_http_comp_nr_enabled_compressors; i++) {
-        nxt_conf_value_t  *obj;
-
-        obj = nxt_conf_get_array_element(comps, i - 1);
-        ret = nxt_http_comp_set_compressor(task, rtcf, obj, i);
-        if (ret == NXT_ERROR) {
+        ret = nxt_http_comp_set_compressor(task, rtcf, conf, comps, 1);
+        if (nxt_slow_path(ret == NXT_ERROR)) {
             return NXT_ERROR;
         }
+
+    } else {
+        for (nxt_uint_t i = 1; i < conf->nr_enabled; i++) {
+            nxt_conf_value_t  *obj;
+
+            obj = nxt_conf_get_array_element(comps, i - 1);
+            ret = nxt_http_comp_set_compressor(task, rtcf, conf, obj, i);
+            if (ret == NXT_ERROR) {
+                return NXT_ERROR;
+            }
+        }
     }
+
+    /* One publish point: a failure above leaves rtcf->compression NULL. */
+
+    rtcf->compression = conf;
 
     return NXT_OK;
 }

@@ -23,6 +23,7 @@ typedef struct nxt_upstream_s                  nxt_upstream_t;
 typedef struct nxt_upstreams_s                 nxt_upstreams_t;
 typedef struct nxt_router_access_log_s         nxt_router_access_log_t;
 typedef struct nxt_router_access_log_format_s  nxt_router_access_log_format_t;
+typedef struct nxt_http_comp_conf_s            nxt_http_comp_conf_t;
 
 
 #define NXT_HTTP_ACTION_ERROR  ((nxt_http_action_t *) -1)
@@ -56,6 +57,15 @@ typedef struct {
     nxt_tstr_cond_t                 log_cond;
     nxt_router_access_log_t         *access_log;
     nxt_router_access_log_format_t  *log_format;
+
+    /*
+     * Compression state, allocated from mem_pool above and reachable from a
+     * request as r->conf->socket_conf->router_conf->compression.  NULL when
+     * this configuration has no "compression" block.  Per-configuration
+     * rather than process-global so that reconfiguring compression away
+     * cannot leave a pointer into a freed pool behind (#167).
+     */
+    nxt_http_comp_conf_t            *compression;
 } nxt_router_conf_t;
 
 

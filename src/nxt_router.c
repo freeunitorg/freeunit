@@ -2506,6 +2506,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
                                 *otel_batching, *otel_proto;
 #endif
     nxt_conf_value_t            *root, *conf, *http, *value, *websocket;
+    nxt_conf_value_t            *comp;
     nxt_conf_value_t            *applications, *application, *settings;
     nxt_conf_value_t            *listeners, *listener;
     nxt_socket_conf_t           *skcf;
@@ -2848,6 +2849,18 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 
     websocket = nxt_conf_get_path(root, &websocket_path);
 
+    /*
+     * Compression is configured once for the whole router, not per listener.
+     * The return is deliberately not checked: a "compression" block the
+     * validator accepts but this cannot build -- one with no "compressors",
+     * which is not a required member -- leaves compression off rather than
+     * rejecting the configuration, which is what it has always done.
+     */
+    comp = nxt_conf_get_path(root, &compression_path);
+    if (comp != NULL) {
+        (void) nxt_http_comp_compression_init(task, rtcf, comp);
+    }
+
     listeners = nxt_conf_get_path(root, &listeners_path);
 
     if (listeners != NULL) {
@@ -2906,7 +2919,6 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             nxt_str_null(&skcf->body_temp_path);
 
             if (http != NULL) {
-                nxt_conf_value_t  *comp;
 
                 ret = nxt_conf_map_object(mp, http, nxt_router_http_conf,
                                           nxt_nitems(nxt_router_http_conf),
@@ -2916,10 +2928,6 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
                     goto fail;
                 }
 
-                comp = nxt_conf_get_path(root, &compression_path);
-                if (comp != NULL) {
-                    nxt_http_comp_compression_init(task, rtcf, comp);
-                }
             }
 
             if (websocket != NULL) {

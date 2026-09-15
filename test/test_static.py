@@ -1717,14 +1717,8 @@ def test_static_range_file_changes_between_requests(temp_dir):
 
 def test_static_range_gzip(temp_dir):
     # Compression must be skipped for a 206 (a coded slice would be
-    # meaningless) but still work for the plain 200 alongside it.  The
-    # module keeps global state, so this needs a fresh unitd (#167).
+    # meaningless) but still work for the plain 200 alongside it.
     import gzip
-
-    from unit.option import option
-
-    if not option.restart:
-        pytest.skip('needs --restart until #167 is fixed')
 
     resp = client.conf(
         {

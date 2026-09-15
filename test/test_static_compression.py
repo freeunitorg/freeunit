@@ -3,20 +3,8 @@ from pathlib import Path
 import pytest
 
 from unit.applications.proto import ApplicationProto
-from unit.option import option
 
 client = ApplicationProto()
-
-
-@pytest.fixture(autouse=True)
-def requires_restart_mode():
-    """
-    Configuring compression is not reversible within one unitd (#167), so
-    these tests need their own unitd or they crash whichever test runs next.
-    Same reasoning as test_php_compression.py; drop both once #167 is fixed.
-    """
-    if not option.restart:
-        pytest.skip('needs --restart until #167 is fixed')
 
 
 @pytest.fixture(autouse=True)
@@ -56,6 +44,37 @@ def test_static_compression_baseline():
     )
     assert resp['status'] == 200, 'compressed 200'
     assert resp['headers']['Content-Encoding'] == 'gzip', 'gzip applied'
+
+
+def test_static_compression_removed_between_requests():
+    # #167: the compression state used to be process-global and allocated
+    # from the router configuration that parsed it, so a configuration
+    # without a "compression" block left it pointing into a freed pool and
+    # the next request killed the router.  Pin the transition itself: every
+    # other test in this file only ever configures compression, so the bug
+    # reproduced through the file order of a whole suite run rather than
+    # through any one file.
+    headers = {
+        'Host': 'localhost',
+        'Accept-Encoding': 'gzip',
+        'Connection': 'close',
+    }
+
+    resp = client.get(url='/big.css', headers=headers)
+    assert resp['headers']['Content-Encoding'] == 'gzip', 'gzip before'
+
+    assert 'success' in client.conf_delete(
+        'settings/http/compression'
+    ), 'compression removed'
+
+    resp = client.get(url='/big.css', headers=headers)
+    assert resp['status'] == 200, 'identity after the block is removed'
+    assert 'Content-Encoding' not in resp['headers'], 'no coding after'
+
+    # The second request is the one that used to find a freed pool: the
+    # first may be answered before the old configuration is released.
+    resp = client.get(url='/big.css', headers=headers)
+    assert resp['status'] == 200, 'router still serving'
 
 
 def test_static_compression_precondition_does_not_mask_406():
