@@ -11,15 +11,19 @@ import pytest
 from unit.option import option
 
 
-def request_headers(headers=None, close=True):
+def request_headers(headers=None, connection_close=True):
     """Return request headers with "Connection: close" merged in.
 
     HTTP/1.1 keeps a connection open by default and recvall() reads a
     response to EOF, so a one-shot request that omits "Connection: close"
-    waits out the server's idle timeout.  A "Connection" the caller set is
-    left alone; close=False drops the merge for a request that means to
-    keep the connection -- a handshake, a pipeline, a socket that is
-    reused.
+    waits out the server's idle timeout.  A "Connection" the caller set, in
+    any case, is left alone; connection_close=False drops the merge for a
+    request that means to keep the connection -- a handshake, a pipeline, a
+    socket that is reused.
+
+    Only a caller that passes no dict at all gets "Host: localhost"; an
+    explicit dict is given "Connection: close" and nothing else, and a
+    zero-header request is not expressible through this helper.
     """
     if headers is None:
         headers = {'Host': 'localhost'}
@@ -27,8 +31,10 @@ def request_headers(headers=None, close=True):
     else:
         headers = dict(headers)
 
-    if close:
-        headers.setdefault('Connection', 'close')
+    if connection_close and not any(
+        name.lower() == 'connection' for name in headers
+    ):
+        headers['Connection'] = 'close'
 
     return headers
 
