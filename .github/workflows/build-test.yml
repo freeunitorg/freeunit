@@ -738,15 +738,39 @@ jobs:
         env:
           TZ: Asia/Kolkata
         run: |
+          set -o pipefail
+
           # Pin unitd's embedded interpreter to the toolcache prefix it was
           # built against; conftest turns this into PYTHONHOME for unitd only.
           if [ "${{ steps.metadata.outputs.module }}" == "python" ]; then
             export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
           fi
           if [ "${{ matrix.build }}" == "wasm-wasi-component" ]; then
-            pytest-3 --print-log ${{ steps.metadata.outputs.testpath }}
+            pytest-3 --print-log ${{ steps.metadata.outputs.testpath }} \
+              | tee pytest.out
           else
-            sudo -E pytest-3 --print-log ${{ steps.metadata.outputs.testpath }}
+            sudo -E pytest-3 --print-log ${{ steps.metadata.outputs.testpath }} \
+              | tee pytest.out
+          fi
+
+          # Green is not enough.  conftest skips every test whose module is
+          # missing, and pytest exits 0 on a run that skipped everything, so
+          # a leg whose `make <module>` produced nothing -- or built against
+          # a core it did not unpack -- would still pass with the same
+          # collected count and "N skipped" where "N passed" used to be.
+          # Assert a PASSED line from this leg's own test files instead, as
+          # compression-range-tests does per file below.  The unit leg has
+          # no module of its own; any PASSED line is its floor.
+          module="${{ steps.metadata.outputs.module }}"
+          if [ "$module" = "unit" ]; then
+            pattern='test/test_[a-z_.-]*\.py::.* PASSED'
+          else
+            pattern="test/test_${module}[a-z_.-]*\.py::.* PASSED"
+          fi
+          if ! grep -qE "$pattern" pytest.out; then
+            echo "::error::no test passed for ${module}: the module tests" \
+                 "all skipped, so the module was probably not built" >&2
+            exit 1
           fi
         if: steps.metadata.outputs.module != 'wasm'
 
