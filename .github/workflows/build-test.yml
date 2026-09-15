@@ -97,10 +97,81 @@ jobs:
           # libunit port/fd lifecycle covered in the python leg only.
           testpath="test/test_${module}* test/test_app_lifecycle.py"
 
-          # Run all tests for "unit" and "python"
-          # Python is the default module for tests
-          if [ "$module" = "unit" ] || [ "$module" = "python" ]; then
+          # "unit" is the only leg that runs the language-agnostic suite in
+          # one piece; the Python-application tests self-skip there without
+          # the module, and every other test runs as written.
+          if [ "$module" = "unit" ]; then
             testpath="test"
+          fi
+
+          # A Python leg runs its interpreter-specific suites whole -- that is
+          # what the three versions are here for -- and takes a round-robin
+          # share of the rest.  Three versions each running the whole
+          # language-agnostic suite again cost about 12 minutes a leg, twice
+          # any other language, for tests no interpreter distinguishes.  Each
+          # shared file now runs on one Python version instead of three; the
+          # union over the legs is unchanged.
+          #
+          # Both lists are built from the files that exist, never from a glob
+          # handed to pytest.  There is no test_wsgi_*.py -- WSGI is exercised
+          # through the python module in test_python_* -- and an unmatched
+          # pattern survives shell expansion literally, so pytest aborts the
+          # whole leg with "file or directory not found" instead of running the
+          # rest.  `test/test_*.py` is depth 1 while the unit leg runs the whole
+          # `test` tree, so a nested test file would run on unit and on no
+          # python leg; keep the two definitions of "the suite" in step.
+          if [ "$module" = "python" ]; then
+            versions=$(jq -r '.runtimes.python | length' pkg/eol.json)
+            shard=$(jq -r --arg v "${version}" \
+              '[.runtimes.python[].version] | index($v)' pkg/eol.json)
+
+            # A jq miss prints "null" rather than failing, and a non-integer
+            # in either comparison below fails open: the leg would run its
+            # interpreter files, skip every shared one, and still report
+            # green.  Fail loudly instead, like the OpenSSL 4.0 assertion.
+            case "${versions}" in
+              ''|0|*[!0-9]*)
+                echo "::error::no python runtimes in pkg/eol.json" >&2
+                exit 1
+                ;;
+            esac
+
+            case "${shard}" in
+              ''|*[!0-9]*)
+                echo "::error::no shard for python-${version} in pkg/eol.json" >&2
+                exit 1
+                ;;
+            esac
+
+            files=""
+            whole=""
+            i=0
+            for f in $(ls test/test_*.py | sort); do
+              case "$f" in
+                test/test_python*|test/test_asgi*|test/test_wsgi*)
+                  whole="${whole} ${f}"
+                  continue
+                  ;;
+                test/test_app_lifecycle.py)
+                  continue
+                  ;;
+              esac
+
+              if [ $((i % versions)) -eq "$shard" ]; then
+                files="${files} ${f}"
+              fi
+
+              i=$((i + 1))
+            done
+
+            testpath="${files}${whole}"
+
+            # app_lifecycle self-skips unbuilt runtimes, so one Python leg is
+            # enough to carry it; the other language legs still run it as
+            # before.
+            if [ "$shard" -eq 0 ]; then
+              testpath="${testpath} test/test_app_lifecycle.py"
+            fi
           fi
 
           echo "module=${module}" >> "$GITHUB_OUTPUT"
