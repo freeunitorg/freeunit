@@ -7,7 +7,8 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        and the router returned the worker's slot to "processes": {"max"} and
        let its idle timer reap a process that was still executing. Such a
        worker now reports itself busy until the work ends, so "max" bounds
-       live processes and "/status" reports them as "detached".
+       live processes and "/status" reports them as "detached";
+       the bug had appeared in 1.29.0.
 
     *) Change: "limits": {"timeout"} now also bounds how long a request waits
        for an application process, not only how long a worker may spend on

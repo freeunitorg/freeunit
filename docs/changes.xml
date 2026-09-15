@@ -17,7 +17,8 @@ does this whenever a script calls fastcgi_finish_request(): the response goes
 out, the script runs on, and the router returned the worker's slot to
 "processes": {"max"} and let its idle timer reap a process that was still
 executing.  Such a worker now reports itself busy until the work ends, so "max"
-bounds live processes and "/status" reports them as "detached".
+bounds live processes and "/status" reports them as "detached";
+the bug had appeared in 1.29.0.
 </para>
 </change>
 
