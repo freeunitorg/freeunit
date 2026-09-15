@@ -772,6 +772,108 @@ jobs:
           /usr/bin/pytest-3 --print-log test/test_capget_fallback.py
         if: ${{ !cancelled() && steps.metadata.outputs.module == 'python' }}
 
+  # Range x Content-Encoding coverage (#379). test_static_compression.py,
+  # test_static.py::test_static_range_gzip and test_php_compression.py all
+  # skip "until #167 is fixed" unless option.restart is set.  --restart is
+  # what makes running them safe while #167 stays open: each test gets a
+  # fresh unitd, so the stale pointer #167 describes
+  # (src/nxt_http_compression.c:86-89, freed at :1084) cannot reach across
+  # tests.  This job does not touch nxt_http_compression.c.
+  #
+  # Neither existing pytest job has both flags this needs: the "unit"/"python"
+  # legs above build --zlib but never pass --restart, and --restart there
+  # would restart unitd for every test in the full "test" tree, not just
+  # these three files -- those legs are already the longest in this workflow.
+  # sanitize.yml's python leg passes --restart but configures without --zlib,
+  # and adding --zlib there would pull compression into every ASan/UBSan run
+  # for a leg that exists to red-line teardown, not codec coverage; its php
+  # leg configures without --restart on purpose (the teardown rmtree trips
+  # over test_php_application_forbidden's restricted-permission fixture).
+  # A small dedicated job avoids all of that: a minimal build (--zlib plus
+  # the php module, nothing else) running only these three files with
+  # --restart, so the added cost is three fresh-unitd tests, not a slower
+  # existing leg.
+  compression-range-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev \
+                                   zlib1g-dev
+
+      # Take the version from pkg/eol.json instead of pinning "8": setup-php
+      # resolves a bare "8" to whatever is newest that day, so the job would
+      # drift without a commit and an old run would not reproduce.  Any
+      # supported version exercises Unit's compression the same way.
+      - name: Pick the PHP version
+        id: php
+        run: |
+          version="$(jq -r '.runtimes.php[0].version' pkg/eol.json)"
+
+          case "${version}" in
+            ''|null|*[!0-9.]*)
+              echo "::error::no php runtime in pkg/eol.json" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '${{ steps.php.outputs.version }}'
+          extensions: none
+        env:
+          update: true
+
+      - name: Configure unit
+        run: ./configure --openssl --zlib
+
+      - name: Make unit
+        run: make -j$(nproc)
+
+      - name: Configure php
+        run: ./configure php
+
+      - name: Make php
+        run: make -j$(nproc) php
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3'
+
+      - name: Install pytest
+        run: sudo apt install -y python3-pytest
+
+      # TZ pin: same reasoning as the "unit"/"python" leg above.
+      #
+      # The greps are the point: a run that skips all three files also exits
+      # 0, which is the #379 failure itself, not a hypothetical.  Assert a
+      # PASSED line per file, as the OpenSSL 4.0 leg asserts on
+      # nxt_auto_config.h.  pipefail keeps pytest's exit status once tee is
+      # in the pipeline.
+      # No sudo here, unlike the language legs: nothing in these three files
+      # needs privilege, and running as the job user keeps the temp tree out
+      # of root's ownership.  Deliberate, not an oversight.
+      - name: Run Range x Content-Encoding tests
+        env:
+          TZ: Asia/Kolkata
+        run: |
+          set -o pipefail
+          pytest-3 --print-log --restart \
+            test/test_static_compression.py \
+            "test/test_static.py::test_static_range_gzip" \
+            test/test_php_compression.py | tee pytest.out
+
+          grep -qE 'test_static_compression\.py::.* PASSED' pytest.out
+          grep -q 'test_static.py::test_static_range_gzip PASSED' pytest.out
+          grep -qE 'test_php_compression\.py::.* PASSED' pytest.out
+
   # C unit-test suite (src/test/ -> build/tests): HTTP parser, port/IPC
   # fault-injection, lvlhsh, mp, rbtree, base64, utf8, clone creds, etc.
   # Previously compiled but never executed in CI; runs here on every PR as its
