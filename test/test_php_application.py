@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from unit.applications.lang.php import ApplicationPHP
+from unit import port as port_map
 from unit.option import option
 
 prerequisites = {'modules': {'php': 'all'}}
@@ -756,7 +757,8 @@ def test_php_application_trailing_slash(temp_dir):
     resp = client.get(url='/path?q=a')
     assert resp['status'] == 301, 'uri without trailing /'
     assert (
-        resp['headers']['Location'] == 'http://localhost:8080/path/?q=a'
+        resp['headers']['Location']
+        == f'http://localhost:{port_map.port(8080)}/path/?q=a'
     ), 'Location with query string'
 
     resp = client.get(

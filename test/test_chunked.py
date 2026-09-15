@@ -4,6 +4,7 @@ import time
 
 import pytest
 from unit.applications.lang.python import ApplicationPython
+from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'any'}}
 
@@ -262,7 +263,7 @@ def test_chunked_split_reads():
     )
 
     def check(writes, expect_body, with_head=True):
-        sock = socket.create_connection(('127.0.0.1', 8080))
+        sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
         sock.settimeout(15)
 
         try:

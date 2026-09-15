@@ -31,6 +31,7 @@ import pytest
 
 from unit.applications.lang.python import ApplicationPython
 from unit.log import Log
+from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'all'}}
 
@@ -83,7 +84,7 @@ def _start_inflight_request(
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(RESPONSE_TIMEOUT)
-    sock.connect(('127.0.0.1', 8080))
+    sock.connect(('127.0.0.1', port_map.port(8080)))
 
     req = (
         f'POST / HTTP/1.1\r\n'
