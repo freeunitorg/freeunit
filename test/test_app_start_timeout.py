@@ -36,6 +36,7 @@ import pytest
 from unit.control import Control
 from unit.log import Log
 from unit.option import option
+from unit import port as port_map
 
 prerequisites = {}
 
@@ -222,7 +223,9 @@ def test_app_start_timeout_control_plane_survives():
     assert 'stuck' not in status['applications'], status['applications']
 
     # And the previous configuration is still the live one, still serving.
-    assert client.conf_get() == _serving_conf(), 'previous config retained'
+    assert client.conf_get() == port_map.expected(
+        _serving_conf()
+    ), 'previous config retained'
 
     resp = client.get(url='/')
 
@@ -389,7 +392,9 @@ def test_app_start_timeout_retry_leaks_nothing():
     # And none of it cost the control plane, which is the point of the bound.
     assert 'connections' in client.conf_get('/status')
 
-    assert client.conf_get() == _serving_conf(), 'previous config retained'
+    assert client.conf_get() == port_map.expected(
+        _serving_conf()
+    ), 'previous config retained'
 
 
 def test_app_start_timeout_default_is_unbounded(findall):

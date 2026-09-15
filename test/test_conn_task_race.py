@@ -5,6 +5,7 @@ import time
 import pytest
 
 from unit.applications.lang.python import ApplicationPython
+from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'any'}}
 
@@ -30,7 +31,7 @@ STALL_SECS = 1.5
 # keep one end-to-end straddle as ASan smoke coverage for the abort lifecycle.
 ITERATIONS = 1
 
-ADDR = ('127.0.0.1', 8080)
+ADDR = ('127.0.0.1', port_map.port(8080))
 
 
 @pytest.fixture(autouse=True)
