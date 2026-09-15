@@ -24,6 +24,9 @@ static nxt_int_t nxt_port_fail_test_wakeup_errno(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_enqueue(nxt_task_t *task,
     nxt_port_t *port, nxt_mp_t *mp, nxt_err_t err, nxt_uint_t fails,
     nxt_bool_t no_memory);
+static void nxt_port_fail_test_turn(nxt_event_engine_t *engine, nxt_msec_t ms);
+static nxt_uint_t nxt_port_fail_test_spin(nxt_event_engine_t *engine,
+    nxt_msec_t window);
 #endif
 static nxt_int_t nxt_port_fail_test_dead_peer(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_rpc_register(nxt_thread_t *thr);
@@ -2357,6 +2360,72 @@ nxt_port_fail_test_enqueue(nxt_task_t *task, nxt_port_t *port, nxt_mp_t *mp,
     return NXT_OK;
 }
 
+
+/*
+ * One turn of the event loop, as nxt_event_engine_start() runs it, except
+ * that the clock moves on by "ms" instead of being read from the machine.
+ *
+ * The backoff arms a timer on the engine, and a leg that measures pacing has
+ * to be able to tell a retry that came back because time passed from one
+ * that came back because nothing held it.  A real clock cannot answer that
+ * without sleeping, and sleeping would make the numbers the scheduler's
+ * rather than the port's.  engine->timers.now starts at zero on a fresh
+ * engine and nxt_timer_expire() is what advances it, so the legs below own
+ * the clock outright.
+ */
+
+static void
+nxt_port_fail_test_turn(nxt_event_engine_t *engine, nxt_msec_t ms)
+{
+    /*
+     * Commits pending timer changes and sets timers->minimum, as the loop
+     * does before it polls; without it nxt_timer_expire() returns early.
+     */
+
+    (void) nxt_timer_find(engine);
+
+    engine->event.poll(engine, 0);
+
+    nxt_timer_expire(engine, engine->timers.now + ms);
+
+    nxt_port_fail_test_drain_wq(&engine->fast_work_queue);
+}
+
+
+/*
+ * Poll hard for "window" virtual milliseconds and answer how many times the
+ * port's write handler was dispatched.
+ *
+ * The inner loop is the busy spin itself: on a socket that stayed writable,
+ * a retry that re-checks readiness on the spot has epoll_wait() return
+ * immediately every time, so the engine thread runs this loop as fast as it
+ * can rather than at any rate the clock sets.  Sixteen polls per virtual
+ * millisecond stands in for that -- the real thing manages far more -- and
+ * makes the two outcomes differ by a factor, not by a margin: unpaced, the
+ * count follows the number of polls; paced, it follows the window.
+ */
+
+static nxt_uint_t
+nxt_port_fail_test_spin(nxt_event_engine_t *engine, nxt_msec_t window)
+{
+    nxt_uint_t  i, j;
+
+    nxt_port_test_write_dispatches = 0;
+
+    for (i = 0; i < window; i++) {
+
+        for (j = 0; j < 16; j++) {
+            engine->event.poll(engine, 0);
+
+            nxt_port_fail_test_drain_wq(&engine->fast_work_queue);
+        }
+
+        nxt_port_fail_test_turn(engine, 1);
+    }
+
+    return nxt_port_test_write_dispatches;
+}
+
 #endif
 
 
@@ -2402,7 +2471,7 @@ nxt_port_fail_test_wakeup_errno(nxt_thread_t *thr)
     nxt_mp_t             *mp;
     nxt_fd_t             pair[2];
     nxt_int_t            ret;
-    nxt_uint_t           i;
+    nxt_uint_t           i, dispatches;
     nxt_task_t           *task;
     nxt_port_t           *port;
     nxt_event_engine_t   *engine, *saved_engine;
@@ -2577,6 +2646,11 @@ nxt_port_fail_test_wakeup_errno(nxt_thread_t *thr)
      * coming either.  The retry pass has to force the readiness re-check
      * itself; without it the marker, and every message queued behind it,
      * waits for ever.
+     *
+     * That re-check is paced (#407), so the marker does not go out on the
+     * next poll but on the first one after the timer the retry armed has
+     * expired.  Which is why the legs from here on drive the clock as well
+     * as the poller.
      */
 
     engine->event.poll(engine, 0);
@@ -2612,11 +2686,15 @@ nxt_port_fail_test_wakeup_errno(nxt_thread_t *thr)
         goto done;
     }
 
-    /* The second poll has only the re-check to bring the retry back. */
+    /*
+     * The re-check is all there is to bring the retry back, and it is armed
+     * on a timer: the first turn expires it and re-arms the write event, the
+     * second is the poll that then finds the socket writable.
+     */
 
-    engine->event.poll(engine, 0);
+    nxt_port_fail_test_turn(engine, 64);
 
-    nxt_port_fail_test_drain_wq(&engine->fast_work_queue);
+    nxt_port_fail_test_turn(engine, 0);
 
     nxt_socketpair_test_send_fail(0, 0);
 
@@ -2712,6 +2790,165 @@ nxt_port_fail_test_wakeup_errno(nxt_thread_t *thr)
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "port failure test: %d bytes reached the peer after "
                       "EPIPE", (int) n);
+        goto done;
+    }
+
+    /*
+     * Leg 6: an ENOMEM that does not let up, on a queued message.
+     *
+     * The retry has to keep coming back -- that is #392 and #393 -- but a
+     * shortage lasts, and the socket it cannot send on stays writable, so a
+     * retry that re-checks readiness on the spot is dispatched again the
+     * moment it returns.  The engine thread then spends a core on
+     * epoll_wait/sendmsg/epoll_ctl for as long as the machine is short of
+     * memory (#407).
+     *
+     * So: hold the failure, poll far harder than any clock would justify,
+     * and count the dispatches.  Unpaced the count is the poll count; paced
+     * it is a handful, set by the window and the delays.  Then let the
+     * injection go and require the marker to arrive anyway: pacing a retry
+     * must not turn into dropping one.
+     */
+
+    engine->event.poll(engine, 0);
+
+    nxt_port_fail_test_drain_wq(&engine->fast_work_queue);
+
+    nxt_port_fail_test_completions = 0;
+
+    if (nxt_port_fail_test_enqueue(task, port, mp, NXT_ENOMEM, 100000, 0)
+        != NXT_OK)
+    {
+        goto done;
+    }
+
+    dispatches = nxt_port_fail_test_spin(engine, 64);
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                  "port failure test: leg 6: queued marker, %d write "
+                  "dispatches in a 64ms window of held ENOMEM",
+                  (int) dispatches);
+
+    if (dispatches > 16) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: leg 6: the write handler was "
+                      "dispatched %d times in a 64ms window of sustained "
+                      "ENOMEM, expected at most 16; the retry is not paced",
+                      (int) dispatches);
+        goto done;
+    }
+
+    if (nxt_queue_is_empty(&port->messages)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: leg 6: the marker was dropped "
+                      "while the retry was being paced");
+        goto done;
+    }
+
+    nxt_socketpair_test_send_fail(0, 0);
+
+    for (i = 0; i < 8 && !nxt_queue_is_empty(&port->messages); i++) {
+        nxt_port_fail_test_turn(engine, 64);
+    }
+
+    n = recv(pair[0], block, sizeof(block), MSG_DONTWAIT);
+
+    if (n != (ssize_t) sizeof(nxt_port_msg_t)
+        || ((nxt_port_msg_t *) block)->type != _NXT_PORT_MSG_READ_QUEUE)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: leg 6: the peer read %d bytes once "
+                      "the shortage was over, expected a %d byte READ_QUEUE "
+                      "header; the paced retry never came back (write event "
+                      "state %d)", (int) n, (int) sizeof(nxt_port_msg_t),
+                      (int) port->socket.write);
+        goto done;
+    }
+
+    if (!nxt_queue_is_empty(&port->messages) || port->announce != 0
+        || nxt_port_fail_test_completions != 1)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: leg 6: after the marker went out "
+                      "announce is %d and the payload was completed %d "
+                      "times, expected 0 and once", (int) port->announce,
+                      (int) nxt_port_fail_test_completions);
+        goto done;
+    }
+
+    /*
+     * Leg 7: the same shortage on the owed marker, which is the other way
+     * this port can spin and does not come from #393 at all.
+     * nxt_port_announce() clears port->announce only on a send that fully
+     * succeeded, and the re-arm attempts the marker every pass, so a marker
+     * that keeps failing spins whether or not the queued path is paced.
+     *
+     * Here the marker is owed rather than queued, because the allocation
+     * that would have held it failed too -- leg 4's setup, with a failure
+     * that does not stop after one.
+     */
+
+    nxt_port_fail_test_completions = 0;
+
+    if (nxt_port_fail_test_enqueue(task, port, mp, NXT_ENOMEM, 100000, 1)
+        != NXT_OK)
+    {
+        goto done;
+    }
+
+    if (port->announce == 0 || !nxt_queue_is_empty(&port->messages)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: leg 7: the marker is neither owed "
+                      "nor queued (announce %d)", (int) port->announce);
+        goto done;
+    }
+
+    dispatches = nxt_port_fail_test_spin(engine, 64);
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                  "port failure test: leg 7: owed marker, %d write "
+                  "dispatches in a 64ms window of held ENOMEM",
+                  (int) dispatches);
+
+    if (dispatches > 16) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: leg 7: the write handler was "
+                      "dispatched %d times in a 64ms window with a marker "
+                      "owed and ENOMEM held, expected at most 16; the owed "
+                      "marker is not paced", (int) dispatches);
+        goto done;
+    }
+
+    if (port->announce == 0) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: leg 7: the owed marker was "
+                      "forgotten while the retry was being paced");
+        goto done;
+    }
+
+    nxt_socketpair_test_send_fail(0, 0);
+
+    for (i = 0; i < 8 && port->announce != 0; i++) {
+        nxt_port_fail_test_turn(engine, 64);
+    }
+
+    n = recv(pair[0], block, sizeof(block), MSG_DONTWAIT);
+
+    if (port->announce != 0 || n != (ssize_t) sizeof(nxt_port_msg_t)
+        || ((nxt_port_msg_t *) block)->type != _NXT_PORT_MSG_READ_QUEUE)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: leg 7: the owed marker was not "
+                      "announced once the shortage was over (announce %d, "
+                      "%d bytes read)", (int) port->announce, (int) n);
+        goto done;
+    }
+
+    if (nxt_port_fail_test_completions != 1) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: leg 7: the payload was completed "
+                      "%d times, expected once",
+                      (int) nxt_port_fail_test_completions);
         goto done;
     }
 

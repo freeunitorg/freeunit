@@ -14,6 +14,18 @@
           (int) (NXT_PORT_QUEUE_MSG_SIZE - sizeof(nxt_port_msg_t))
 
 
+/*
+ * The first and the last delay a paced retry waits, in milliseconds.  The
+ * first is short because most shortages are: the common case is one failed
+ * send and then a retry that works, and a millisecond costs that case
+ * nothing measurable.  The cap is what a shortage that lasts settles at, and
+ * is the retry latency this trades for not spinning -- see the comment on
+ * nxt_port_retry_later().
+ */
+#define NXT_PORT_RETRY_MIN_DELAY  1
+#define NXT_PORT_RETRY_MAX_DELAY  32
+
+
 static nxt_bool_t nxt_port_can_enqueue_buf(nxt_buf_t *b);
 static uint8_t nxt_port_enqueue_buf(nxt_task_t *task, nxt_port_msg_t *pm,
     void *qbuf, nxt_buf_t *b);
@@ -38,8 +50,10 @@ static void nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
     nxt_port_recv_msg_t *msg);
 static nxt_buf_t *nxt_port_buf_alloc(nxt_port_t *port);
 static void nxt_port_buf_free(nxt_port_t *port, nxt_buf_t *b);
-static void nxt_port_announce(nxt_task_t *task, nxt_port_t *port);
+static nxt_bool_t nxt_port_announce(nxt_task_t *task, nxt_port_t *port);
 static void nxt_port_rearm_now(nxt_task_t *task, nxt_port_t *port);
+static void nxt_port_retry_later(nxt_task_t *task, nxt_port_t *port);
+static void nxt_port_retry_handler(nxt_task_t *task, void *obj, void *data);
 static void nxt_port_rearm_work_handler(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_port_error_handler(nxt_task_t *task, void *obj, void *data);
@@ -48,6 +62,8 @@ static void nxt_port_error_handler(nxt_task_t *task, void *obj, void *data);
 static nxt_uint_t  nxt_port_test_msg_alloc_failure_count;
 
 nxt_uint_t  nxt_port_test_broadcasts;
+
+nxt_uint_t  nxt_port_test_write_dispatches;
 
 
 void
@@ -636,9 +652,16 @@ nxt_port_fd_disable_write(nxt_task_t *task, nxt_port_t *port, void *data)
  * point, because this runs after an allocation failure.  The flag is cleared
  * only once the marker has left: a peer that reads one drains the whole ring,
  * so anything enqueued in between is covered by the same marker.
+ *
+ * Answers whether the marker was attempted and did not go out, which is the
+ * caller's cue to pace the next attempt rather than make it at once.  A port
+ * that owes nothing, one that can no longer be written to, and an EAGAIN all
+ * answer 0: the first two have nothing to pace, and after EAGAIN the socket
+ * is full, so the peer's next read raises an edge and paces the retry by
+ * itself.
  */
 
-static void
+static nxt_bool_t
 nxt_port_announce(nxt_task_t *task, nxt_port_t *port)
 {
     ssize_t         n;
@@ -656,7 +679,7 @@ nxt_port_announce(nxt_task_t *task, nxt_port_t *port)
      */
 
     if (port->announce == 0 || port->pair[1] == -1) {
-        return;
+        return 0;
     }
 
     /* nxt_socketpair_send() reads both, whether or not it sends them. */
@@ -680,7 +703,21 @@ nxt_port_announce(nxt_task_t *task, nxt_port_t *port)
 
         nxt_debug(task, "port{%d,%d} %d: queue announced", (int) port->pid,
                   (int) port->id, port->socket.fd);
+
+        return 0;
     }
+
+    /*
+     * port->socket.error is this send's and not a stale one: the tests above
+     * guarantee the send ran, and nxt_socketpair_send() writes the field on
+     * every outcome.
+     */
+
+    if (n == NXT_AGAIN && port->socket.error == NXT_EAGAIN) {
+        return 0;
+    }
+
+    return 1;
 }
 
 
@@ -705,7 +742,108 @@ nxt_port_rearm_now(nxt_task_t *task, nxt_port_t *port)
 
     nxt_fd_event_enable_write(task->thread->engine, &port->socket);
 
-    nxt_port_announce(task, port);
+    /*
+     * A marker that could not be written is the second way this port can
+     * spin: nxt_port_announce() clears ->announce only on a send that fully
+     * succeeded, and the enable above brings the write handler straight
+     * back, which finds nothing to send, disables the event, and re-arms on
+     * the owed marker again.  Pacing it here rather than at that caller
+     * covers every one of them, since this is the only place the marker is
+     * ever attempted.
+     */
+
+    if (nxt_slow_path(nxt_port_announce(task, port))) {
+        nxt_port_retry_later(task, port);
+    }
+}
+
+
+/*
+ * Arm the retry instead of making it now.
+ *
+ * The event is disabled and a timer re-arms it after a delay.  What that
+ * buys is in the comment on ->retry_timer in src/nxt_port.h; what it costs
+ * is retry latency, up to NXT_PORT_RETRY_MAX_DELAY once a shortage has
+ * lasted long enough for the delay to reach the cap.  That is a deliberate
+ * loss of immediacy on a path #393 made immediate on purpose, and the trade
+ * is against burning a core in a tight retry loop at the one moment the
+ * machine has nothing to spare.
+ *
+ * Disabling, rather than blocking, for the reason given above
+ * nxt_port_fd_disable_write(): a registration left in place reports nothing
+ * more on a socket that never stopped being writable, so the re-arm has to
+ * add it back.  The caller may have disabled it already, hence the test.
+ *
+ * Callable on port->engine only.  Both callers are there: the drained pass
+ * of nxt_port_write_msgs() runs on the port's own engine, and
+ * nxt_port_rearm_now() is what nxt_port_rearm() posts to it.  That is what
+ * makes the timer and the flag safe without a lock.
+ */
+
+static void
+nxt_port_retry_later(nxt_task_t *task, nxt_port_t *port)
+{
+    nxt_event_engine_t  *engine;
+
+    if (port->retry_armed || port->pair[1] == -1) {
+        return;
+    }
+
+    engine = port->engine;
+
+    if (nxt_fd_event_is_active(port->socket.write)) {
+        nxt_fd_event_disable_write(engine, &port->socket);
+    }
+
+    port->retry_delay = (port->retry_delay == 0)
+                        ? NXT_PORT_RETRY_MIN_DELAY
+                        : nxt_min(port->retry_delay * 2,
+                                  NXT_PORT_RETRY_MAX_DELAY);
+
+    port->retry_timer.work_queue = &engine->fast_work_queue;
+    port->retry_timer.handler = nxt_port_retry_handler;
+    port->retry_timer.task = &engine->task;
+    port->retry_timer.log = engine->task.log;
+
+    /*
+     * The reference is what keeps the port -- and the timer, which lives in
+     * it -- alive until the handler runs.  It is also the whole of the close
+     * handling: an armed timer cannot be cancelled from another engine, and
+     * cancelling it here would leave nxt_timer_handler() with a pointer into
+     * a pool this drop had just released.  So nothing cancels it.  The timer
+     * fires within the cap whatever became of the port, finds a closed one
+     * by its pair[1] and does nothing with it, and drops this reference.
+     */
+
+    nxt_port_inc_use(port);
+
+    port->retry_armed = 1;
+
+    nxt_timer_add(engine, &port->retry_timer, port->retry_delay);
+
+    nxt_debug(task, "port{%d,%d} %d: retry in %M ms", (int) port->pid,
+              (int) port->id, port->socket.fd, port->retry_delay);
+}
+
+
+static void
+nxt_port_retry_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_port_t  *port;
+
+    port = nxt_timer_data(obj, nxt_port_t, retry_timer);
+
+    port->retry_armed = 0;
+
+    nxt_port_rearm_now(task, port);
+
+    /*
+     * Last, because nxt_port_rearm_now() may have armed the timer again --
+     * on its own reference, which is why this one can be the last without
+     * taking the timer down with it.
+     */
+
+    nxt_port_use(task, port, -1);
 }
 
 
@@ -816,7 +954,7 @@ nxt_port_write_msgs(nxt_task_t *task, void *obj, void *data,
     ssize_t                 n;
     nxt_int_t               ret;
     uint32_t                mmsg_buf[3 * NXT_IOBUF_MAX * 10];
-    nxt_bool_t              failed, block_write, enable_write;
+    nxt_bool_t              failed, block_write, enable_write, retry_later;
     nxt_port_t              *port;
     struct iovec            iov[NXT_IOBUF_MAX * 10];
     nxt_work_queue_t        *wq;
@@ -830,9 +968,16 @@ nxt_port_write_msgs(nxt_task_t *task, void *obj, void *data,
     failed = 0;
     block_write = 0;
     enable_write = 0;
+    retry_later = 0;
     use_delta = 0;
 
     wq = &task->thread->engine->fast_work_queue;
+
+#if (NXT_TESTS)
+    if (data == NULL) {
+        nxt_port_test_write_dispatches++;
+    }
+#endif
 
     do {
         if (data) {
@@ -894,6 +1039,20 @@ next_fragment:
         n = nxt_socketpair_send(&port->socket, msg->fd, iov, sb.niov + 1);
 
         if (n > 0) {
+            /*
+             * The shortage, if there was one, is over: start the next one
+             * from the short delay again rather than from wherever the last
+             * one left off.  On the drained pass alone, because that is the
+             * one that runs on port->engine, and ->retry_delay is owned by
+             * that engine.  An inline send is a poor signal anyway: it can
+             * come from any thread at any moment, including between two
+             * retries that are both about to fail.
+             */
+
+            if (data == NULL) {
+                port->retry_delay = 0;
+            }
+
             if (nxt_slow_path((size_t) n != sb.size + iov[0].iov_len)) {
                 nxt_alert(task, "port %d: short write: %z instead of %uz",
                           port->socket.fd, n, sb.size + iov[0].iov_len);
@@ -1010,11 +1169,17 @@ next_fragment:
              * Force the readiness re-check the drained pass does -- disable,
              * then enable -- so the poller reports the socket writable on
              * the spot.  One epoll_ctl() pair per failed retry.
+             *
+             * Paced, though, rather than on the spot.  The socket is
+             * writable, so the re-check comes back at once and the retry
+             * fails again while the shortage lasts: unpaced, this is a tight
+             * loop on the engine thread for as long as the machine is short
+             * of memory (#407).  nxt_port_retry_later() does the disable as
+             * well, so block_write is not set here.
              */
 
             if (data == NULL && port->socket.error != NXT_EAGAIN) {
-                block_write = 1;
-                enable_write = 1;
+                retry_later = 1;
             }
 
             if (msg->link.next == NULL) {
@@ -1099,8 +1264,19 @@ cleanup:
      * a socket that has just refused to carry a message.
      */
 
-    if (!failed && (enable_write || port->announce != 0)) {
-        nxt_port_rearm(task, port);
+    /*
+     * A paced retry answers for the owed marker as well: the timer ends in
+     * nxt_port_rearm_now(), which sends it.  Arming both would put the write
+     * event back up at once and undo the pacing.
+     */
+
+    if (!failed) {
+        if (retry_later) {
+            nxt_port_retry_later(task, port);
+
+        } else if (enable_write || port->announce != 0) {
+            nxt_port_rearm(task, port);
+        }
     }
 
     if (use_delta != 0) {
