@@ -282,6 +282,30 @@ nxt_port_recv_msg_close_fds(nxt_port_recv_msg_t *msg)
 }
 
 
+/*
+ * How many queued messages on one port may carry a file descriptor.
+ *
+ * port->messages itself stays unbounded.  A message with no descriptor costs
+ * only memory, which was true before a queued message took ownership of what
+ * it names, and bounding it would change behaviour on paths that never hold a
+ * descriptor at all -- every ordinary reply and every request body fragment.
+ *
+ * A message that does carry one is different: it holds up to two descriptors
+ * of this process open for as long as it waits, so a peer that stops reading
+ * turns into RLIMIT_NOFILE pressure on the sender rather than memory pressure
+ * alone.  That is the cost this bounds.
+ *
+ * The traffic being bounded is control-plane and one message per event: a new
+ * port, a process start, a listening socket, a certificate, a script, a shared
+ * memory segment.  A port with 128 of them outstanding is not a busy port, it
+ * is a peer that has stopped reading, so the bound is far above any legitimate
+ * burst.  At two descriptors an entry it caps one stalled port at 256 open
+ * descriptors, which leaves room for several of them under the 1024 soft
+ * RLIMIT_NOFILE that is still the common default.
+ */
+#define NXT_PORT_MAX_FD_MSGS  128
+
+
 typedef struct nxt_app_s  nxt_app_t;
 
 struct nxt_port_s {
@@ -299,6 +323,16 @@ struct nxt_port_s {
 
     nxt_queue_t         messages;   /* of nxt_port_send_msg_t */
     nxt_thread_mutex_t  write_mutex;
+
+    /*
+     * How many entries of ->messages still carry a file descriptor.
+     *
+     * A queued message owns the descriptors it names, so each such entry
+     * holds up to two of this process's descriptors open for as long as it
+     * waits.  The count exists to bound that; it is maintained under
+     * ->write_mutex and is described with the bound in src/nxt_port_socket.c.
+     */
+    uint32_t            fd_messages;
 
     /* Maximum size of message part. */
     uint32_t            max_size;
