@@ -85,6 +85,19 @@ representation, per RFC 9110.
 
 <change type="bugfix">
 <para>
+the router died on the first request after a configuration that had a
+"compression" block was replaced by one that had none.  The compression
+state was held in process globals allocated from the router configuration
+that parsed them, and a later configuration neither refilled nor cleared
+them, so the next request read a freed pool.  The state is now held per
+configuration and reached through the request, and the compressor a
+response is already using is kept with that response, so a body still
+being compressed when the configuration is replaced also finishes (#167).
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 a static response that was subject to content negotiation now carries
 "Vary: Accept-Encoding".  Without it a shared cache could store whichever
 representation it saw first and serve it to every client -- gzip bytes to one
