@@ -11,9 +11,12 @@ prototype must never exceed "max".
 """
 
 import os
+import signal
 import subprocess
 import threading
 import time
+
+import pytest
 
 from unit.applications.lang.php import ApplicationPHP
 from unit.control import Control
@@ -446,3 +449,55 @@ def test_php_detached_survives_configuration_removal():
         time.sleep(0.2)
 
     assert os.path.exists(done), 'the detached work finished after removal'
+
+
+@pytest.mark.parametrize('spare', [0, 1])
+@pytest.mark.parametrize('remove', [False, True])
+def test_php_detached_worker_dies(skip_alert, spare, remove):
+    """A detached worker's last app reference survives replacement dispatch."""
+
+    client.load('detached_worker', processes={'max': 1, 'spare': spare})
+    assert client.get(url='/?sleep=30')['status'] == 200
+
+    deadline = time.monotonic() + 10
+    while app_processes().get('detached', 0) != 1:
+        assert time.monotonic() < deadline, 'the worker reported detached'
+        time.sleep(0.05)
+
+    pids = worker_pids()
+    assert len(pids) == 1
+    pid = int(pids.pop())
+    skip_alert(fr'app process {pid} exited on signal 9')
+
+    if remove:
+        assert 'success' in client.conf(
+            {'listeners': {}, 'applications': {}}, '/config'
+        )
+
+    os.kill(pid, signal.SIGKILL)
+
+    deadline = time.monotonic() + 10
+    while True:
+        status = Control().conf_get('/status')
+        apps = status.get('applications', {})
+        procs = apps.get('detached_worker', {}).get('processes', {})
+        if remove:
+            settled = 'detached_worker' not in apps and not worker_pids()
+        else:
+            settled = (
+                procs.get('detached') == 0 and str(pid) not in worker_pids()
+            )
+        if settled:
+            break
+        assert time.monotonic() < deadline, 'the dead worker was settled'
+        time.sleep(0.05)
+
+    assert 'applications' in status
+    if remove:
+        assert 'detached_worker' not in status['applications']
+    else:
+        assert client.get()['status'] == 200, 'replacement serves requests'
+        assert drain(), 'the replacement finished'
+
+    # The standard fixture also checks that the router PID did not change:
+    # a restarted router answering /status must not hide a crash here.

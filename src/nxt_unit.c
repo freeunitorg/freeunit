@@ -78,6 +78,7 @@ static int nxt_unit_ctx_ready(nxt_unit_ctx_t *ctx);
 static int nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx,
     nxt_unit_recv_msg_t *recv_msg, nxt_unit_request_info_t **preq);
 static void nxt_unit_ctx_detached_done(nxt_unit_ctx_t *ctx);
+static int nxt_unit_ctx_detached_retry(nxt_unit_ctx_t *ctx);
 static int nxt_unit_send_detached(nxt_unit_ctx_t *ctx, uint8_t state);
 static int nxt_unit_process_req_body(nxt_unit_ctx_t *ctx,
     nxt_unit_recv_msg_t *recv_msg);
@@ -392,6 +393,12 @@ struct nxt_unit_read_buf_s {
 };
 
 
+enum {
+    NXT_UNIT_DETACHED_NONE    = 0,
+    NXT_UNIT_DETACHED_RUNNING = 1,
+};
+
+
 struct nxt_unit_ctx_impl_s {
     nxt_unit_ctx_t                ctx;
 
@@ -438,6 +445,7 @@ struct nxt_unit_ctx_impl_s {
      * busy, and holds off a graceful quit, until it does.
      */
     uint8_t                       detached;     /* 1 bit */
+    uint8_t                       detached_retries;
 
     nxt_unit_mmap_buf_t           ctx_buf[2];
     nxt_unit_read_buf_t           ctx_read_buf;
@@ -820,7 +828,8 @@ nxt_unit_ctx_init(nxt_unit_impl_t *lib, nxt_unit_ctx_impl_t *ctx_impl,
      * poison pointer.
      */
 
-    ctx_impl->detached = 0;
+    ctx_impl->detached = NXT_UNIT_DETACHED_NONE;
+    ctx_impl->detached_retries = 0;
 
     nxt_queue_init(&ctx_impl->free_req);
     nxt_queue_init(&ctx_impl->free_ws);
@@ -3534,6 +3543,18 @@ nxt_unit_buf_read(nxt_unit_buf_t **b, uint64_t *len, void *dst, size_t size)
  * sockets race.  The router looks the worker up by pid.
  */
 
+#if (NXT_TESTS)
+static unsigned int  nxt_unit_test_send_detached_failure_count;
+
+
+void
+nxt_unit_test_send_detached_failures(unsigned int failures)
+{
+    nxt_unit_test_send_detached_failure_count = failures;
+}
+#endif
+
+
 static int
 nxt_unit_send_detached(nxt_unit_ctx_t *ctx, uint8_t state)
 {
@@ -3543,6 +3564,15 @@ nxt_unit_send_detached(nxt_unit_ctx_t *ctx, uint8_t state)
         nxt_port_msg_t  msg;
         uint8_t         state;
     } m;
+
+#if (NXT_TESTS)
+    if (nxt_slow_path(state == NXT_PORT_DETACHED_FINISH
+                      && nxt_unit_test_send_detached_failure_count > 0))
+    {
+        nxt_unit_test_send_detached_failure_count--;
+        return NXT_UNIT_ERROR;
+    }
+#endif
 
     lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
 
@@ -3588,11 +3618,11 @@ nxt_unit_request_done_detached(nxt_unit_request_info_t *req, int rc)
      * response.
      */
 
-    if (ctx_impl->detached == 0) {
+    if (ctx_impl->detached == NXT_UNIT_DETACHED_NONE) {
         if (nxt_unit_send_detached(req->ctx, NXT_PORT_DETACHED_START)
             == NXT_UNIT_OK)
         {
-            ctx_impl->detached = 1;
+            ctx_impl->detached = NXT_UNIT_DETACHED_RUNNING;
 
         } else {
             nxt_unit_req_alert(req, "failed to report a detached response");
@@ -3613,29 +3643,168 @@ nxt_unit_request_done_detached(nxt_unit_request_info_t *req, int rc)
 static void
 nxt_unit_ctx_detached_done(nxt_unit_ctx_t *ctx)
 {
+    int                  rc;
     nxt_unit_ctx_impl_t  *ctx_impl;
 
     ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
 
-    if (ctx_impl->detached == 0) {
+    if (ctx_impl->detached == NXT_UNIT_DETACHED_NONE) {
         return;
     }
 
-    ctx_impl->detached = 0;
+    rc = nxt_unit_send_detached(ctx, NXT_PORT_DETACHED_FINISH);
+    if (nxt_fast_path(rc == NXT_UNIT_OK)) {
+        ctx_impl->detached = NXT_UNIT_DETACHED_NONE;
+        ctx_impl->detached_retries = 0;
 
-    (void) nxt_unit_send_detached(ctx, NXT_PORT_DETACHED_FINISH);
+        /*
+         * A graceful QUIT that arrived during the work was deferred by
+         * nxt_unit_quit() on this flag, the way one that arrives during a
+         * request is deferred on active_req.  That one is retried when the
+         * request is released; this is the equivalent.
+         */
+
+        if (nxt_slow_path(!nxt_unit_chk_ready(ctx))) {
+            nxt_unit_quit(ctx, NXT_QUIT_GRACEFUL);
+        }
+
+        return;
+    }
 
     /*
-     * A graceful QUIT that arrived during the work was deferred by
-     * nxt_unit_quit() on this flag, the way one that arrives during a
-     * request is deferred on active_req.  That one is retried when the
-     * request is released; this is the equivalent.
+     * The FINISH edge failed to deliver (e.g. transient router-port buffer
+     * backpressure).  Keep ctx_impl->detached set so the worker does not
+     * drop into an inconsistent state, and retry from the read loop rather
+     * than quitting inline inside nxt_unit_process_ready_req().
      */
-
-    if (nxt_slow_path(!nxt_unit_chk_ready(ctx))) {
-        nxt_unit_quit(ctx, NXT_QUIT_GRACEFUL);
-    }
+    ctx_impl->detached_retries = 1;
 }
+
+
+static int
+nxt_unit_ctx_detached_retry(nxt_unit_ctx_t *ctx)
+{
+    int                  res;
+    nxt_unit_impl_t      *lib;
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    if (nxt_fast_path(ctx_impl->detached_retries == 0)) {
+        return NXT_UNIT_OK;
+    }
+
+    res = nxt_unit_send_detached(ctx, NXT_PORT_DETACHED_FINISH);
+    if (nxt_fast_path(res == NXT_UNIT_OK)) {
+        ctx_impl->detached = NXT_UNIT_DETACHED_NONE;
+        ctx_impl->detached_retries = 0;
+
+        if (nxt_slow_path(!nxt_unit_chk_ready(ctx))) {
+            nxt_unit_quit(ctx, NXT_QUIT_GRACEFUL);
+        }
+
+        return NXT_UNIT_OK;
+    }
+
+    if (++ctx_impl->detached_retries > 10) {
+        lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
+
+        nxt_unit_alert(ctx, "failed to report detached finish, closing worker");
+        nxt_unit_quit(&lib->main_ctx.ctx, NXT_QUIT_NORMAL);
+        return NXT_UNIT_ERROR;
+    }
+
+    return NXT_UNIT_OK;
+}
+
+
+#if (NXT_TESTS)
+uint8_t
+nxt_unit_test_ctx_detached(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    return ctx_impl->detached;
+}
+
+
+uint8_t
+nxt_unit_test_ctx_detached_retries(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    return ctx_impl->detached_retries;
+}
+
+
+void
+nxt_unit_test_ctx_set_detached(nxt_unit_ctx_t *ctx, uint8_t val)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    ctx_impl->detached = val;
+}
+
+
+void
+nxt_unit_test_ctx_detached_done(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_ctx_detached_done(ctx);
+}
+
+
+int
+nxt_unit_test_ctx_detached_retry(nxt_unit_ctx_t *ctx)
+{
+    return nxt_unit_ctx_detached_retry(ctx);
+}
+
+
+uint8_t
+nxt_unit_test_ctx_online(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    return ctx_impl->online;
+}
+
+
+uint8_t
+nxt_unit_test_ctx_ready(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    return ctx_impl->ready;
+}
+
+
+void
+nxt_unit_test_ctx_set_ready(nxt_unit_ctx_t *ctx, uint8_t val)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    ctx_impl->ready = val;
+}
+
+
+void
+nxt_unit_test_ctx_quit_graceful(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_quit(ctx, NXT_QUIT_GRACEFUL);
+}
+#endif
 
 
 void
@@ -5046,6 +5215,13 @@ nxt_unit_read_buf(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf)
 
     ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
 
+    if (nxt_slow_path(ctx_impl->detached_retries > 0)) {
+        res = nxt_unit_ctx_detached_retry(ctx);
+        if (nxt_slow_path(res != NXT_UNIT_OK)) {
+            return res;
+        }
+    }
+
     if (ctx_impl->wait_items > 0 || !nxt_unit_chk_ready(ctx)) {
         return nxt_unit_ctx_port_recv(ctx, ctx_impl->read_port, rbuf);
     }
@@ -5237,6 +5413,10 @@ nxt_unit_process_ready_req(nxt_unit_ctx_t *ctx)
     nxt_queue_each(req_impl, &ready_req,
                    nxt_unit_request_info_impl_t, port_wait_link)
     {
+        if (nxt_slow_path(!ctx_impl->online)) {
+            break;
+        }
+
         lib = nxt_container_of(ctx_impl->ctx.unit, nxt_unit_impl_t, unit);
 
         req = &req_impl->req;
@@ -5295,6 +5475,13 @@ nxt_unit_run_ctx(nxt_unit_ctx_t *ctx)
         if (nxt_slow_path(rbuf == NULL)) {
             rc = NXT_UNIT_ERROR;
             break;
+        }
+
+        if (nxt_slow_path(ctx_impl->detached_retries > 0)) {
+            rc = nxt_unit_ctx_detached_retry(ctx);
+            if (nxt_slow_path(rc != NXT_UNIT_OK)) {
+                break;
+            }
         }
 
     retry:
@@ -6245,7 +6432,7 @@ nxt_unit_quit(nxt_unit_ctx_t *ctx, uint8_t quit_param)
         quit = nxt_queue_is_empty(&ctx_impl->active_req)
                && nxt_queue_is_empty(&ctx_impl->pending_rbuf)
                && ctx_impl->wait_items == 0
-               && ctx_impl->detached == 0;
+               && ctx_impl->detached == NXT_UNIT_DETACHED_NONE;
 
         pthread_mutex_unlock(&ctx_impl->mutex);
 

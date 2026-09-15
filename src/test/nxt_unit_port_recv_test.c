@@ -43,6 +43,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 
 #if (NXT_HAVE_MEMFD_CREATE && NXT_HAVE_LINUX_MEMFD_H)
 #include <linux/memfd.h>
@@ -249,6 +250,167 @@ nxt_port_recv_test_notify(void)
 }
 
 
+#if (NXT_TESTS)
+static void
+nxt_port_recv_test_detached_single_fail(nxt_unit_ctx_t *ctx)
+{
+    int  rc;
+
+    /*
+     * Case A: FINISH send fails once, next retry in read loop succeeds,
+     * detached flag clears to 0, and worker keeps serving.
+     */
+    nxt_unit_test_ctx_set_ready(ctx, 1);
+    nxt_unit_test_send_detached_failures(0);
+    nxt_unit_test_ctx_set_detached(ctx, 1);
+
+    nxt_port_recv_test_assert(
+        nxt_unit_test_ctx_detached(ctx) == 1
+        && nxt_unit_test_ctx_detached_retries(ctx) == 0,
+        "detached initial state is running");
+
+    /* Inject single FINISH send failure. */
+    nxt_unit_test_send_detached_failures(1);
+
+    /* Simulate request handler return calling nxt_unit_ctx_detached_done. */
+    nxt_unit_test_ctx_detached_done(ctx);
+
+    nxt_port_recv_test_assert(
+        nxt_unit_test_ctx_detached(ctx) == 1
+        && nxt_unit_test_ctx_detached_retries(ctx) == 1,
+        "failed finish send schedules retry");
+
+    nxt_port_recv_test_assert(
+        nxt_unit_test_ctx_online(ctx) == 1
+        && nxt_unit_test_ctx_ready(ctx) == 1,
+        "worker remains online and ready during retry");
+
+    /* Simulate read loop retry. Subsequent send succeeds. */
+    rc = nxt_unit_test_ctx_detached_retry(ctx);
+
+    nxt_port_recv_test_assert(
+        rc == NXT_UNIT_OK
+        && nxt_unit_test_ctx_detached(ctx) == 0
+        && nxt_unit_test_ctx_detached_retries(ctx) == 0
+        && nxt_unit_test_ctx_online(ctx) == 1,
+        "retry settles detached = 0 and keeps serving");
+
+    /*
+     * Case B: Graceful QUIT arrives while detached work is running.
+     * Quit is held off because detached == 1, and only honoured once
+     * the retry succeeds.
+     */
+    nxt_unit_test_ctx_set_ready(ctx, 1);
+    nxt_unit_test_send_detached_failures(0);
+    nxt_unit_test_ctx_set_detached(ctx, 1);
+
+    /* Graceful quit arrives while worker is detached. */
+    nxt_unit_test_ctx_quit_graceful(ctx);
+
+    nxt_port_recv_test_assert(
+        nxt_unit_test_ctx_ready(ctx) == 0
+        && nxt_unit_test_ctx_online(ctx) == 1,
+        "graceful quit deferred while detached is running");
+
+    /* Inject single FINISH send failure on request handler return. */
+    nxt_unit_test_send_detached_failures(1);
+    nxt_unit_test_ctx_detached_done(ctx);
+
+    nxt_port_recv_test_assert(
+        nxt_unit_test_ctx_detached(ctx) == 1
+        && nxt_unit_test_ctx_detached_retries(ctx) == 1
+        && nxt_unit_test_ctx_online(ctx) == 1,
+        "graceful quit remains deferred while finish retry is pending");
+
+    /*
+     * Retry succeeds: detached clears and the deferred graceful quit is
+     * honoured.
+     */
+    rc = nxt_unit_test_ctx_detached_retry(ctx);
+
+    nxt_port_recv_test_assert(
+        rc == NXT_UNIT_OK
+        && nxt_unit_test_ctx_detached(ctx) == 0
+        && nxt_unit_test_ctx_detached_retries(ctx) == 0
+        && nxt_unit_test_ctx_online(ctx) == 0,
+        "retry settles detached = 0 and honours deferred graceful quit");
+}
+
+
+static void
+nxt_port_recv_test_detached_persistent_fail(nxt_unit_ctx_t *ctx)
+{
+    int    i, rc, status;
+    pid_t  pid;
+
+    /*
+     * Persistent send failures (>10 retries):
+     * Test in a child process so that the worker teardown (via
+     * nxt_unit_quit(..., NXT_QUIT_NORMAL)) does not affect the main test.
+     */
+    pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        nxt_port_recv_test_failures++;
+        return;
+    }
+
+    if (pid == 0) {
+        nxt_unit_test_ctx_set_detached(ctx, 1);
+
+        /* Inject persistent failures for all attempts. */
+        nxt_unit_test_send_detached_failures(20);
+
+        /* Request handler return fails to send FINISH. */
+        nxt_unit_test_ctx_detached_done(ctx);
+
+        if (nxt_unit_test_ctx_detached(ctx) != 1
+            || nxt_unit_test_ctx_detached_retries(ctx) != 1)
+        {
+            _exit(1);
+        }
+
+        /* Retries 1..9 (attempts 2..10) return OK and increment retries. */
+        for (i = 1; i <= 9; i++) {
+            rc = nxt_unit_test_ctx_detached_retry(ctx);
+            if (rc != NXT_UNIT_OK
+                || nxt_unit_test_ctx_detached(ctx) != 1
+                || nxt_unit_test_ctx_detached_retries(ctx) != (i + 1)
+                || nxt_unit_test_ctx_online(ctx) != 1)
+            {
+                _exit(2);
+            }
+        }
+
+        /*
+         * Retry 10 (attempt 11): retries exceed 10.
+         * Give-up path executes outside request processing:
+         * worker is closed (online == 0) and returns NXT_UNIT_ERROR.
+         */
+        rc = nxt_unit_test_ctx_detached_retry(ctx);
+        if (rc != NXT_UNIT_ERROR
+            || nxt_unit_test_ctx_online(ctx) != 0
+            || nxt_unit_test_ctx_detached_retries(ctx) != 11)
+        {
+            _exit(3);
+        }
+
+        _exit(0);
+    }
+
+    if (waitpid(pid, &status, 0) == -1) {
+        perror("waitpid");
+        nxt_port_recv_test_failures++;
+        return;
+    }
+
+    nxt_port_recv_test_assert(
+        WIFEXITED(status) && WEXITSTATUS(status) == 0,
+        "persistent send failures trigger give-up teardown outside request");
+}
+#endif
+
+
 int
 main(void)
 {
@@ -378,6 +540,11 @@ main(void)
     nxt_port_recv_test_assert(
         fcntl(unrelated, F_GETFD) != -1,
         "unrelated fd survives an empty read");
+
+#if (NXT_TESTS)
+    nxt_port_recv_test_detached_persistent_fail(ctx);
+    nxt_port_recv_test_detached_single_fail(ctx);
+#endif
 
     if (nxt_port_recv_test_failures != 0) {
         printf("port_recv test: %d failure(s)\n",

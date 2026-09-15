@@ -1187,6 +1187,10 @@ nxt_router_msg_retract(nxt_task_t *task, nxt_request_rpc_data_t *req_rpc_data)
 
     msg_info = &req_rpc_data->msg_info;
 
+    if (msg_info->buf == NULL) {
+        return 0;
+    }
+
     if (msg_info->cancel == NXT_MSG_QUEUED) {
         app_port = req_rpc_data->app_port;
 
@@ -6521,41 +6525,15 @@ nxt_router_app_unlink(nxt_task_t *task, nxt_app_t *app)
 
 
 /*
- * Take a port out of the idle economy.  Called with app->mutex held; answers
- * whether the caller must start a replacement process once it has dropped the
- * lock.  Does nothing to a port that is not in one of the idle queues.
- *
- * Two events reach this transition.  An acknowledgement, where a worker has
- * taken a request the router was still holding for it, and the start of
- * detached work, where a worker the router has already parked as idle says it
- * is in fact still running.  The second is why this is a function rather than
- * a block: setting ->detached without unwinding leaves a port that
- * nxt_router_app_port_idle() will refuse to insert again and that
- * nxt_router_adjust_idle_timer() will still reap, so the flag and the unwind
- * have to happen in one critical section.
- *
- * "reason" is for the debug log only.
+ * Refill spare_ports from the tail of idle_ports when a port leaves
+ * spare_ports.  Called with app->mutex held.
  */
-
-static nxt_bool_t
-nxt_router_app_port_busy(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
-    const char *reason)
+static void
+nxt_router_app_spare_rebalance(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_t *port)
 {
-    nxt_bool_t        start_process;
     nxt_port_t        *idle_port;
     nxt_queue_link_t  *idle_lnk;
-
-    start_process = 0;
-
-    if (!nxt_queue_chk_remove(&port->idle_link)) {
-        return 0;
-    }
-
-    app->idle_processes--;
-
-    nxt_debug(task, "app '%V' move port %PI:%d out of %s (%s)",
-              &app->name, port->pid, port->id,
-              (port->idle_start ? "idle_ports" : "spare_ports"), reason);
 
     /* Check port was in 'spare_ports' using idle_start field. */
     if (port->idle_start == 0 && app->idle_processes >= app->spare_processes) {
@@ -6577,6 +6555,45 @@ nxt_router_app_port_busy(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
                   "to spare_ports",
                   &app->name, idle_port->pid, idle_port->id);
     }
+}
+
+
+/*
+ * Take a port out of the idle economy.  Called with app->mutex held; answers
+ * whether the caller must start a replacement process once it has dropped the
+ * lock.  Does nothing to a port that is not in one of the idle queues.
+ *
+ * Two events reach this transition.  An acknowledgement, where a worker has
+ * taken a request the router was still holding for it, and the start of
+ * detached work, where a worker the router has already parked as idle says it
+ * is in fact still running.  The second is why this is a function rather than
+ * a block: setting ->detached without unwinding leaves a port that
+ * nxt_router_app_port_idle() will refuse to insert again and that
+ * nxt_router_adjust_idle_timer() will still reap, so the flag and the unwind
+ * have to happen in one critical section.
+ *
+ * "reason" is for the debug log only.
+ */
+
+static nxt_bool_t
+nxt_router_app_port_busy(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
+    const char *reason)
+{
+    nxt_bool_t  start_process;
+
+    start_process = 0;
+
+    if (!nxt_queue_chk_remove(&port->idle_link)) {
+        return 0;
+    }
+
+    app->idle_processes--;
+
+    nxt_debug(task, "app '%V' move port %PI:%d out of %s (%s)",
+              &app->name, port->pid, port->id,
+              (port->idle_start ? "idle_ports" : "spare_ports"), reason);
+
+    nxt_router_app_spare_rebalance(task, app, port);
 
     if (nxt_router_app_can_start(app) && nxt_router_app_need_start(app)) {
         app->pending_processes++;
@@ -6731,10 +6748,8 @@ adjust_use:
 void
 nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
 {
-    nxt_app_t         *app;
-    nxt_bool_t        unchain, start_process, detached;
-    nxt_port_t        *idle_port;
-    nxt_queue_link_t  *idle_lnk;
+    nxt_app_t   *app;
+    nxt_bool_t  unchain, start_process, detached;
 
     app = port->app;
 
@@ -6779,23 +6794,7 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
                   &app->name, port->pid, port->id,
                   (port->idle_start ? "idle_ports" : "spare_ports"));
 
-        if (port->idle_start == 0
-            && app->idle_processes >= app->spare_processes)
-        {
-            nxt_assert(!nxt_queue_is_empty(&app->idle_ports));
-
-            idle_lnk = nxt_queue_last(&app->idle_ports);
-            idle_port = nxt_queue_link_data(idle_lnk, nxt_port_t, idle_link);
-            nxt_queue_remove(idle_lnk);
-
-            nxt_queue_insert_tail(&app->spare_ports, idle_lnk);
-
-            idle_port->idle_start = 0;
-
-            nxt_debug(task, "app '%V' move port %PI:%d from idle_ports "
-                      "to spare_ports",
-                      &app->name, idle_port->pid, idle_port->id);
-        }
+        nxt_router_app_spare_rebalance(task, app, port);
     }
 
     app->processes--;
@@ -6831,14 +6830,18 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
         nxt_port_use(task, port, -1);
     }
 
-    /* The reference nxt_router_detached_apply() took for this worker. */
+    if (start_process) {
+        nxt_router_start_app_process(task, app);
+    }
+
+    /*
+     * Keep the detached reference until the replacement start has taken its
+     * own.  After configuration removal this can be the last reference, so
+     * dropping it earlier frees app before nxt_router_start_app_process().
+     */
 
     if (detached) {
         nxt_router_app_use(task, app, -1);
-    }
-
-    if (start_process) {
-        nxt_router_start_app_process(task, app);
     }
 }
 
@@ -6894,6 +6897,21 @@ nxt_router_adjust_idle_timer(nxt_task_t *task, void *obj, void *data)
          */
 
         nxt_assert(port->detached == 0);
+
+        if (nxt_slow_path(port->detached != 0)) {
+            /*
+             * A release build.  A bare continue selects the same link again
+             * and spins with app->mutex held.  Take the port out of the idle
+             * queue only: the worker is alive, so it keeps ->app, stays in
+             * app->processes and gets no QUIT.  nxt_router_app_port_idle()
+             * inserts it again when the detached work ends.
+             */
+
+            nxt_queue_remove(lnk);
+            lnk->next = NULL;
+            app->idle_processes--;
+            continue;
+        }
 
         timeout = port->idle_start + app->idle_timeout;
 
@@ -7759,7 +7777,7 @@ nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid, uint8_t state)
     nxt_port_t         *port;
     nxt_bool_t         changed, start_process, adjust_idle_timer;
     nxt_runtime_t      *rt;
-    nxt_atomic_uint_t  c;
+    nxt_atomic_int_t   c;
 
     rt = task->thread->runtime;
 
