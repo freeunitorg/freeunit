@@ -420,6 +420,20 @@ that only the refusal path still reached, and two crates with it.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a byte-range request from a client that refused the identity coding is no
+longer answered with identity bytes.  A range is served as identity, so
+Range together with "Accept-Encoding: identity;q=0" returned a 206 carrying
+exactly the bytes the client said it would not take; the range is now
+ignored and the full 200 is sent in a coding the client accepts, where a
+compressor applies to the response at all.  An unsatisfiable range from such a
+client is no longer answered with 416 either.  A request that accepts no coding
+at all is still 406.  Several Accept-Encoding lines in one request are now read
+as one comma-joined value; previously only the first was consulted.
+</para>
+</change>
+
 </changes>
 
 

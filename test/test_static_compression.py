@@ -1,3 +1,4 @@
+import gzip
 from pathlib import Path
 
 import pytest
@@ -315,3 +316,165 @@ def test_static_compression_vary_merge_identity(temp_dir, configured, expected):
 # emitting "Vary: Origin" takes that path, and nothing here exercises it --
 # including the merge's own case-insensitive field-name match.  Covering it
 # needs a language-module test, not a static one.
+
+
+def _raw_get(**headers):
+    # Raw bytes: the body has to be decompressed, so it must not be decoded.
+    raw = client.get(
+        url='/big.css',
+        headers={'Host': 'localhost', 'Connection': 'close', **headers},
+        encoding='latin-1',
+        read_buffer_size=1024 * 1024,
+        raw_resp=True,
+    )
+    head, _, body = raw.partition('\r\n\r\n')
+    lines = head.split('\r\n')
+    status = int(lines[0].split(' ')[1])
+    hdrs = dict(line.split(': ', 1) for line in lines[1:])
+    body = body.encode('latin-1')
+
+    if hdrs.get('Transfer-Encoding') == 'chunked':
+        body = client._parse_chunked_body(body)
+
+    return status, hdrs, body
+
+
+def test_static_compression_range_identity_refused(temp_dir):
+    # A Range is served as identity -- coding a byte slice would compress the
+    # wrong bytes -- so a client that sent "identity;q=0" must not be given
+    # one: it asked not to receive the file's own bytes and a 206 is exactly
+    # those.  The request is still serveable, because it named a coding Unit
+    # has, so the Range is dropped and the full 200 is sent in that coding.
+    #
+    # Without the fix this is a 206 carrying identity bytes to a client that
+    # refused identity, which is what #355 reports.
+    data = Path(f'{temp_dir}/assets/big.css').read_bytes()
+
+    status, headers, body = _raw_get(
+        **{'Accept-Encoding': 'gzip, identity;q=0', 'Range': 'bytes=0-9'}
+    )
+
+    assert status == 200, 'the Range is dropped, not the request'
+    assert headers.get('Content-Encoding') == 'gzip', 'served as gzip'
+    assert 'Content-Range' not in headers, 'no Content-Range on the full 200'
+    assert gzip.decompress(body) == data, 'the whole file, correctly coded'
+
+
+def test_static_compression_range_identity_refused_guards(temp_dir):
+    # The cases either side of it, which must not move.
+    size = Path(f'{temp_dir}/assets/big.css').stat().st_size
+
+    # Identity acceptable: a Range is still a 206 of identity bytes, which is
+    # deliberate and is what every other server does.
+    status, headers, body = _raw_get(
+        **{'Accept-Encoding': 'gzip', 'Range': 'bytes=0-9'}
+    )
+    assert status == 206, 'gzip alone still gets its partial content'
+    assert 'Content-Encoding' not in headers, 'a 206 carries no coding'
+    assert headers['Content-Range'] == f'bytes 0-9/{size}'
+    assert body == b'body{color'
+
+    # Nothing acceptable at all is 406, whether or not a Range is present.
+    # That outranks the Range and is unchanged by this fix.
+    for extra in ({}, {'Range': 'bytes=0-9'}):
+        status, _, _ = _raw_get(
+            **{'Accept-Encoding': 'identity;q=0, *;q=0', **extra}
+        )
+        assert status == 406, 'unacceptable outranks any Range'
+
+    # Refusing identity without a Range was already correct: full gzip 200.
+    status, headers, _ = _raw_get(**{'Accept-Encoding': 'gzip, identity;q=0'})
+    assert status == 200
+    assert headers.get('Content-Encoding') == 'gzip'
+
+    # An explicitly named identity outranks the wildcard.  The client refused
+    # everything it did not name and then named identity as acceptable, so a
+    # 206 of identity bytes is exactly what it asked for.  Reading the
+    # wildcard as a veto here drops a range the client could take.
+    status, headers, body = _raw_get(
+        **{
+            'Accept-Encoding': 'gzip, identity;q=0.5, *;q=0',
+            'Range': 'bytes=0-9',
+        }
+    )
+    assert status == 206, 'an explicit identity;q>0 keeps its range'
+    assert 'Content-Encoding' not in headers
+    assert headers['Content-Range'] == f'bytes 0-9/{size}'
+    assert body == b'body{color'
+
+    # A content coding is a token and tokens are case-insensitive
+    # (Sect. 8.4.1), so "Identity;q=0" refuses identity just as "identity;q=0"
+    # does.  A case-sensitive compare drops the refusal on the floor and
+    # serves the 206 this whole test exists to prevent.
+    status, headers, _ = _raw_get(
+        **{'Accept-Encoding': 'gzip, Identity;q=0', 'Range': 'bytes=0-9'}
+    )
+    assert status == 200, 'a mixed-case identity token still refuses'
+    assert headers.get('Content-Encoding') == 'gzip'
+
+    # The weight is "('q' / 'Q') '=' qvalue" (Sect. 12.4.2), and an ABNF
+    # literal is case-insensitive anyway.  A strstr() for ";q=" alone misses
+    # ";Q=", and for identity a missed weight is a missed refusal -- the
+    # request gets the 206 of identity bytes it asked not to receive.
+    status, headers, _ = _raw_get(
+        **{'Accept-Encoding': 'gzip, identity;Q=0', 'Range': 'bytes=0-9'}
+    )
+    assert status == 200, 'an uppercase Q still refuses'
+    assert headers.get('Content-Encoding') == 'gzip'
+
+    # "*" is a tchar, so "*foo" is a legal coding name that Unit does not
+    # have -- not the wildcard.  Matching the wildcard on the first byte
+    # alone made an unknown coding refuse identity and cost the client a
+    # range it could have taken.
+    status, headers, body = _raw_get(
+        **{'Accept-Encoding': 'gzip, *foo;q=0', 'Range': 'bytes=0-9'}
+    )
+    assert status == 206, 'an unknown coding is not the wildcard'
+    assert 'Content-Encoding' not in headers
+    assert headers['Content-Range'] == f'bytes 0-9/{size}'
+    assert body == b'body{color'
+
+    # OWS is SP or HTAB (Sect. 5.6.3) and is legal either side of the
+    # weight's semicolon.  Stripping only the space left the tab forms
+    # unparsed, so the element read as an unknown coding and took its
+    # refusal with it.
+    for spelling in (
+        'gzip, identity;	q=0',
+        'gzip, identity	;q=0',
+        'gzip, identity; q=0',
+    ):
+        status, headers, _ = _raw_get(
+            **{'Accept-Encoding': spelling, 'Range': 'bytes=0-9'}
+        )
+        assert status == 200, f'whitespace in the weight: {spelling!r}'
+        assert headers.get('Content-Encoding') == 'gzip'
+
+    # Sect. 5.3: a list-valued field may arrive as several lines and must be
+    # read as one value joined by commas.  A variable query answers with the
+    # first matching field only, so the second line went unread: in this order
+    # the refusal was lost and the 206 went out anyway, and in the other order
+    # the gzip the client would have taken was never seen and it drew a 406.
+    for lines_ae in (['gzip', 'identity;q=0'], ['identity;q=0', 'gzip']):
+        status, headers, _ = _raw_get(
+            **{'Accept-Encoding': lines_ae, 'Range': 'bytes=0-9'}
+        )
+        assert status == 200, f'repeated field: {lines_ae!r}'
+        assert headers.get('Content-Encoding') == 'gzip'
+
+    # Ignoring the Range is all or nothing.  An unsatisfiable range from a
+    # client that refused identity would otherwise draw a 416 whose
+    # "Content-Range: bytes */size" reports the size of the very
+    # representation it refused.
+    status, headers, _ = _raw_get(
+        **{'Accept-Encoding': 'gzip, identity;q=0', 'Range': 'bytes=99999-'}
+    )
+    assert status == 200, 'unsatisfiable range is ignored too'
+    assert headers.get('Content-Encoding') == 'gzip'
+    assert 'Content-Range' not in headers
+
+    # A client that accepts identity still gets its 416.
+    status, headers, _ = _raw_get(
+        **{'Accept-Encoding': 'gzip', 'Range': 'bytes=99999-'}
+    )
+    assert status == 416, 'an ordinary unsatisfiable range is still 416'
+    assert headers['Content-Range'] == f'bytes */{size}'

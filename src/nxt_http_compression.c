@@ -76,6 +76,14 @@ struct nxt_http_comp_ctx_s {
      */
     nxt_int_t                       sel_idx;
 
+    /*
+     * The client sent "identity;q=0": it will not take the file's own bytes.
+     * Recorded separately from sel_idx because a request that refuses
+     * identity and accepts gzip selects gzip and is perfectly serveable --
+     * until a Range enters, which is served as identity.
+     */
+    bool                            identity_refused;
+
     nxt_off_t                       resp_clen;
     nxt_off_t                       clen_sent;
 
@@ -418,16 +426,61 @@ nxt_http_comp_wants_compression(void)
 }
 
 
+bool
+nxt_http_comp_identity_refused(void)
+{
+    nxt_http_comp_ctx_t  *ctx = nxt_http_comp_ctx();
+
+    return ctx->identity_refused;
+}
+
+
+/*
+ * Finds the ";q=" weight parameter in one Accept-Encoding element.
+ *
+ * RFC 9110 Sect. 12.4.2 spells the parameter "weight = OWS ';' OWS ('q' /
+ * 'Q') '=' qvalue", and an ABNF literal is case-insensitive besides, so
+ * "identity;Q=0" is as valid as "identity;q=0".  A plain strstr() for ";q="
+ * misses it, and for identity that means missing a refusal.  Spaces are
+ * already gone by the time this runs.
+ */
+
+static char *
+nxt_http_comp_find_weight(char *tkn)
+{
+    for (char *p = tkn; (p = strchr(p, ';')) != NULL; p++) {
+        if ((p[1] == 'q' || p[1] == 'Q') && p[2] == '=') {
+            return p;
+        }
+    }
+
+    return NULL;
+}
+
+
 static nxt_uint_t
 nxt_http_comp_compressor_lookup_enabled(const nxt_str_t *token)
 {
-    if (token->start[0] == '*') {
+    /*
+     * The wildcard is the whole token, not merely its first character:
+     * "*" is a tchar, so "*foo" is a legal (and unknown) coding name, and
+     * matching on the first byte alone made it stand for every coding.
+     */
+
+    if (token->length == 1 && token->start[0] == '*') {
         return NXT_HTTP_COMP_SCHEME_IDENTITY;
     }
 
+    /*
+     * RFC 9110 Sect. 8.4.1: a content coding is a token, and tokens are
+     * compared case-insensitively.  "Identity;q=0" and "GZIP" are as valid
+     * as the lowercase spellings, and a case-sensitive compare silently
+     * ignores them -- which, for identity, means missing a refusal.
+     */
+
     for (nxt_uint_t i = 0; i < nxt_http_comp_nr_enabled_compressors; i++) {
-        if (nxt_strstr_eq(token,
-                          &nxt_http_comp_enabled_compressors[i].type->token))
+        if (nxt_strcasestr_eq(token,
+                              &nxt_http_comp_enabled_compressors[i].type->token))
         {
             return i;
         }
@@ -453,13 +506,124 @@ nxt_http_comp_compressor_lookup_enabled(const nxt_str_t *token)
  *
  * 'identity;q=0' seems to basically mean the same thing...
  */
+/*
+ * Collects every Accept-Encoding field into one value.
+ *
+ * RFC 9110 Sect. 5.3: a field that may carry a comma-separated list can be
+ * sent as several lines, and a recipient must treat them as one value joined
+ * by commas.  A variable query answers with the first matching field only
+ * (nxt_http_var_header()), so "Accept-Encoding: gzip" followed by
+ * "Accept-Encoding: identity;q=0" lost the refusal and the request was served
+ * the identity bytes it had declined -- and in the other order the gzip it
+ * would have accepted was never seen, so it drew a 406.
+ *
+ * The single-field case, which is every ordinary request, points straight at
+ * the field and copies nothing.
+ */
+
 static nxt_int_t
-nxt_http_comp_select_compressor(nxt_http_request_t *r, const nxt_str_t *token)
+nxt_http_comp_accept_encoding(nxt_http_request_t *r, nxt_str_t *value)
 {
+    u_char                  *p;
+    size_t                  len;
+    nxt_uint_t              n;
+    nxt_http_field_t        *f, *first;
+    nxt_http_fields_iter_t  iter;
+
+    static const nxt_str_t  accept_encoding = nxt_string("Accept-Encoding");
+
+    n = 0;
+    len = 0;
+    first = NULL;
+
+    for (f = nxt_http_fields_first(&iter, r->inline_fields,
+                                   r->num_inline_fields, r->fields);
+         f != NULL;
+         f = nxt_http_fields_next(&iter))
+    {
+        if (f->skip || f->name_length != accept_encoding.length
+            || nxt_strncasecmp(f->name, accept_encoding.start,
+                               accept_encoding.length) != 0)
+        {
+            continue;
+        }
+
+        if (n == 0) {
+            first = f;
+
+        } else {
+            len += nxt_length(", ");
+        }
+
+        len += f->value_length;
+        n++;
+    }
+
+    if (n == 0) {
+        nxt_str_null(value);
+        return NXT_OK;
+    }
+
+    if (n == 1) {
+        value->start = first->value;
+        value->length = first->value_length;
+
+        return NXT_OK;
+    }
+
+    p = nxt_mp_nget(r->mem_pool, len);
+    if (nxt_slow_path(p == NULL)) {
+        return NXT_ERROR;
+    }
+
+    value->start = p;
+    value->length = len;
+
+    n = 0;
+
+    for (f = nxt_http_fields_first(&iter, r->inline_fields,
+                                   r->num_inline_fields, r->fields);
+         f != NULL;
+         f = nxt_http_fields_next(&iter))
+    {
+        if (f->skip || f->name_length != accept_encoding.length
+            || nxt_strncasecmp(f->name, accept_encoding.start,
+                               accept_encoding.length) != 0)
+        {
+            continue;
+        }
+
+        if (n++ != 0) {
+            p = nxt_cpymem(p, ", ", nxt_length(", "));
+        }
+
+        p = nxt_cpymem(p, f->value, f->value_length);
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_http_comp_select_compressor(nxt_http_request_t *r, const nxt_str_t *token,
+    bool *identity_refused)
+{
+    /*
+     * "identity_allowed" carries what the wildcard said; "identity_named"
+     * and "identity_named_ok" carry what an explicit "identity" token said.
+     * They are kept apart because the explicit one wins: in
+     * "gzip, identity;q=0.5, *;q=0" the client refused everything it did not
+     * name and then named identity as acceptable, so identity is acceptable.
+     * Collapsing the two lets the wildcard veto a coding the client allowed.
+     */
     bool       identity_allowed = true;
+    bool       identity_named = false;
+    bool       identity_named_ok = false;
     char       *str, *tkn, *tail, *cur;
     double     weight = 0.0;
     nxt_int_t  idx = NXT_HTTP_COMP_SCHEME_IDENTITY;
+
+    *identity_refused = false;
 
     str = nxt_str_cstrz(r->mem_pool, token);
     if (str == NULL) {
@@ -468,11 +632,17 @@ nxt_http_comp_select_compressor(nxt_http_request_t *r, const nxt_str_t *token)
 
     cur = tail = str;
     /*
-     * To ease parsing the Accept-Encoding header, remove all spaces,
-     * which hold no semantic meaning.
+     * To ease parsing the Accept-Encoding header, remove all optional
+     * whitespace, which holds no semantic meaning.
+     *
+     * OWS is SP or HTAB (RFC 9110 Sect. 5.6.3), and it is legal on either
+     * side of the weight's semicolon.  Removing only the space left
+     * "identity;<HTAB>q=0" unparsed, so the element read as an unknown
+     * coding and the refusal it carried was lost -- which handed a client
+     * that refused identity a 206 of exactly those bytes.
      */
     for (; *cur != '\0'; cur++) {
-        if (*cur == ' ') {
+        if (*cur == ' ' || *cur == '\t') {
             continue;
         }
 
@@ -487,7 +657,7 @@ nxt_http_comp_select_compressor(nxt_http_request_t *r, const nxt_str_t *token)
         nxt_uint_t              ecidx;
         nxt_http_comp_scheme_t  scheme;
 
-        qptr = strstr(tkn, ";q=");
+        qptr = nxt_http_comp_find_weight(tkn);
         if (qptr != NULL) {
             nxt_errno = 0;
 
@@ -508,8 +678,14 @@ nxt_http_comp_select_compressor(nxt_http_request_t *r, const nxt_str_t *token)
 
         scheme = nxt_http_comp_enabled_compressors[ecidx].type->scheme;
 
-        if (qval == 0.0 && scheme == NXT_HTTP_COMP_SCHEME_IDENTITY) {
-            identity_allowed = false;
+        if (scheme == NXT_HTTP_COMP_SCHEME_IDENTITY) {
+            if (enc.length == 1 && enc.start[0] == '*') {
+                identity_allowed = (qval != 0.0);
+
+            } else {
+                identity_named = true;
+                identity_named_ok = (qval != 0.0);
+            }
         }
 
         if (qval == 0.0 || qval < weight) {
@@ -519,6 +695,12 @@ nxt_http_comp_select_compressor(nxt_http_request_t *r, const nxt_str_t *token)
         idx = ecidx;
         weight = qval;
     }
+
+    if (identity_named) {
+        identity_allowed = identity_named_ok;
+    }
+
+    *identity_refused = !identity_allowed;
 
     if (idx == NXT_HTTP_COMP_SCHEME_IDENTITY && !identity_allowed) {
         return -1;
@@ -808,7 +990,6 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
 {
     nxt_int_t            ret, idx;
     nxt_str_t            accept_encoding, mime_type = {};
-    nxt_router_conf_t    *rtcf;
     nxt_http_comp_ctx_t  *ctx = nxt_http_comp_ctx();
 
     *ctx = (nxt_http_comp_ctx_t){ .resp_clen = -1, .sel_idx = -1 };
@@ -845,8 +1026,6 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
         }
     }
 
-    rtcf = r->conf->socket_conf->router_conf;
-
     if (nxt_http_comp_is_resp_content_encoded(r)) {
         return NXT_OK;
     }
@@ -862,19 +1041,13 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
         return NXT_ERROR;
     }
 
-    ret = nxt_tstr_query_init(&r->tstr_query, rtcf->tstr_state, &r->tstr_cache,
-                              r, r->mem_pool);
-    if (nxt_slow_path(ret == NXT_ERROR)) {
-        return NXT_ERROR;
-    }
-
-    ret = nxt_tstr_query(task, r->tstr_query,
-                         nxt_http_comp_accept_encoding_query, &accept_encoding);
+    ret = nxt_http_comp_accept_encoding(r, &accept_encoding);
     if (nxt_slow_path(ret != NXT_OK)) {
         return NXT_ERROR;
     }
 
-    idx = nxt_http_comp_select_compressor(r, &accept_encoding);
+    idx = nxt_http_comp_select_compressor(r, &accept_encoding,
+                                          &ctx->identity_refused);
     if (idx == -1) {
         return NXT_HTTP_NOT_ACCEPTABLE;
     }
