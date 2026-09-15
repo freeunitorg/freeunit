@@ -92,6 +92,8 @@ needs an upgrade or replacement decision instead.
 | Eclipse Jetty | `jetty-util` / `jetty-server` / `jetty-http` jars bundled by the Java module | 9.4.58.v20250814 | **Aug 2025 (EOL)** † | Jetty 9.4 lost community support on 2025-08-14 and the bundled build is its last release. Needs an upgrade-or-replace decision — Jetty 10/11 are EOL too; 12.x is the supported line. |
 | Eclipse ECJ (JDT batch compiler) | JSP compilation jar bundled by the Java module | 3.26.0 | none published | Tracks Eclipse releases; endoflife.date has no product for it. Pinned build is from Jun 2021; current is 3.42.0 (Jun 2025). |
 | ClassGraph | classpath scanning jar bundled by the Java module | latest | — | No upstream EOL schedule; pinned and bumped as needed. |
+| Wasmtime (C API) | WebAssembly runtime built by `pkg/contrib` and linked by the `wasm` module | 43.0.1 | none published | Fetched as a source tarball (`pkg/contrib/src/wasmtime/version`), so `cargo audit` never sees it. Four majors behind the Rust pin below, and affected by RUSTSEC-2026-0269 and -0222 — see #400. |
+| Wasmtime (Rust crate) | WebAssembly runtime used by the `wasm-wasi-component` module | 47.0.4 | none published | `src/wasm-wasi-component/Cargo.lock`, audited by the `Audit (cargo)` workflow on every lock. Bumped with the advisories it closes. |
 
 ## Rules
 
@@ -107,6 +109,10 @@ needs an upgrade or replacement decision instead.
 - **Dependencies:** the floors in the Dependency Support section are not part of the
   EOL + grace policy; they track what FreeUnit builds and bundles, not what it ships
   as a variant.
+- **A dependency pinned twice needs both rows.** Wasmtime is pinned once as a Rust
+  crate and once as a source tarball, and only the crate is reachable by `cargo
+  audit`. List every pin separately and say which one an automated check covers, so
+  a gap between them is visible here rather than only in a lock file.
 - **LTS OS (Ubuntu, RHEL, Debian):** 3-year extension applies to standard EOL, not
   extended security maintenance dates.
 
