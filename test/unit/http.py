@@ -11,6 +11,28 @@ import pytest
 from unit.option import option
 
 
+def request_headers(headers=None, close=True):
+    """Return request headers with "Connection: close" merged in.
+
+    HTTP/1.1 keeps a connection open by default and recvall() reads a
+    response to EOF, so a one-shot request that omits "Connection: close"
+    waits out the server's idle timeout.  A "Connection" the caller set is
+    left alone; close=False drops the merge for a request that means to
+    keep the connection -- a handshake, a pipeline, a socket that is
+    reused.
+    """
+    if headers is None:
+        headers = {'Host': 'localhost'}
+
+    else:
+        headers = dict(headers)
+
+    if close:
+        headers.setdefault('Connection', 'close')
+
+    return headers
+
+
 class HTTP1:
     def http(self, start_str, **kwargs):
         sock_type = kwargs.get('sock_type', 'ipv4')
@@ -18,8 +40,8 @@ class HTTP1:
         url = kwargs.get('url', '/')
         http = 'HTTP/1.0' if 'http_10' in kwargs else 'HTTP/1.1'
 
-        headers = kwargs.get(
-            'headers', {'Host': 'localhost', 'Connection': 'close'}
+        headers = request_headers(
+            kwargs.get('headers'), kwargs.get('connection_close', True)
         )
 
         body = kwargs.get('body', b'')

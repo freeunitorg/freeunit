@@ -217,6 +217,7 @@ def test_java_websockets_handshake_connection_absent():  # FAIL
             'Sec-WebSocket-Protocol': 'chat',
             'Sec-WebSocket-Version': 13,
         },
+        connection_close=False,
     )
 
     assert resp['status'] == 400, 'status'

@@ -56,6 +56,7 @@ def test_chunked_pipeline():
             'Host': 'localhost',
             'Transfer-Encoding': 'chunked',
         },
+        connection_close=False,
         body='1\r\n$\r\n0\r\n\r\n',
     )
 
