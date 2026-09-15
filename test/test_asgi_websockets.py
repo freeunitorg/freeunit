@@ -212,13 +212,21 @@ def test_asgi_websockets_large():
 
     ws.frame_write(sock, ws.OP_TEXT, message)
 
+    # check_frame() asserts fin and opcode as well as the payload.  This
+    # test used to read a second frame and concatenate it, which is how it
+    # sat for 30s on every run: frame_read() fills frame['data'] whatever
+    # the opcode is, the frame that eventually arrived was the zero-length
+    # keepalive PING (websocket_conf.keepalive_interval,
+    # src/nxt_router.c:2904), and appending b'' left the comparison true.
+    #
+    # The mirror echoes a message as one frame, so one read is right here.
+    # test_node_websockets_large reads twice on purpose: it loads
+    # websockets/mirror_fragmentation, whose app.js omits the
+    # fragmentOutgoingMessages and fragmentationThreshold overrides that
+    # websockets/mirror sets, so that server really does fragment.
     frame = ws.frame_read(sock)
-    data = frame['data'].decode('utf-8')
 
-    frame = ws.frame_read(sock)
-    data += frame['data'].decode('utf-8')
-
-    assert message == data, 'large'
+    check_frame(frame, True, ws.OP_TEXT, message)
 
     sock.close()
 
