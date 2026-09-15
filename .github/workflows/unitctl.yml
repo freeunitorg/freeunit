@@ -14,10 +14,6 @@ on:
       - master
     tags:
       - '[0-9]+.[0-9]+.[0-9]+'
-  schedule:
-    # The audit job needs a trigger that does not depend on a code change.  A
-    # new advisory can land against a lock file nobody has touched.
-    - cron: "0 6 * * 1"
   workflow_dispatch:
     inputs:
       version:
@@ -38,8 +34,6 @@ concurrency:
 
 jobs:
   test:
-    # The weekly trigger exists for the audit job alone.
-    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     defaults:
@@ -90,31 +84,6 @@ jobs:
       - name: Test ${{ matrix.os }}
         run: ${{ env.MAKE }} test
 
-  audit:
-    # Check Cargo.lock against the RustSec advisory database.  This reads the
-    # lock file only, so it needs no openapi generation and no build.
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    defaults:
-      run:
-        working-directory: tools/unitctl
-    steps:
-      - uses: actions/checkout@v5
-
-      - run: rustup update stable
-
-      # Prebuilt binary instead of `cargo install cargo-audit`, which would
-      # compile it from source on every run.
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
-
-      # Without --deny warnings the command exits 0 on an unmaintained crate,
-      # so the job would pass while an advisory is open.
-      - name: Audit Cargo.lock
-        run: cargo audit --deny warnings
-
   musl:
     # The only leg that compiles unitctl without the "tls" feature.  The
     # feature-off code -- the #[cfg(not(feature = "tls"))] blocks and the test
@@ -128,7 +97,6 @@ jobs:
     # *host* -- "make release" on Alpine -- is not built here.  The make rule
     # for that host is checked below instead, which is the part that can be
     # checked without a musl runner.
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -209,8 +177,6 @@ jobs:
             | grep -q -- '--no-default-features'
 
   build:
-    # The weekly trigger exists for the audit job alone.
-    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     defaults:

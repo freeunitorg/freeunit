@@ -1,0 +1,82 @@
+
+name: "Audit (cargo)"
+
+# Every tracked Cargo.lock is checked against the RustSec advisory database.
+# The weekly trigger is what makes this a gate rather than a formality: a new
+# advisory can land against a lock file nobody has touched, and without the
+# schedule the audit would only run when a lock changes.
+on:
+  pull_request:
+    paths:
+      - '**/Cargo.lock'
+      - '**/Cargo.toml'
+      # A change to this file must run this file.
+      - .github/workflows/audit.yml
+  push:
+    branches:
+      - master
+    paths:
+      - '**/Cargo.lock'
+      - '**/Cargo.toml'
+      - .github/workflows/audit.yml
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Cancel superseded runs for the same pull request.  Non-PR events fall back
+  # to the run id, which is unique, so a push is never grouped with another:
+  # Actions keeps only one PENDING run per group and would drop a queued commit
+  # even with cancel-in-progress false, which would break bisectability.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  locks:
+    # The lock list is discovered instead of hard-coded, so a lock added by a
+    # future tool is covered the moment it is committed.  Passing it to the
+    # audit job also makes that a matrix, so every failing lock is reported,
+    # not just the first.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      locks: ${{ steps.list.outputs.locks }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: List tracked lock files
+        id: list
+        run: |
+          locks=$(git ls-files '*Cargo.lock' \
+            | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          test "$(echo "$locks" | jq 'length')" -gt 0
+          echo "locks=$locks" >> "$GITHUB_OUTPUT"
+
+  audit:
+    needs: locks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        lock: ${{ fromJSON(needs.locks.outputs.locks) }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - run: rustup update stable
+
+      # Prebuilt binary instead of `cargo install cargo-audit`, which would
+      # compile it from source on every run.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Without --deny warnings the command exits 0 on an unmaintained,
+      # unsound or yanked crate, so the job would pass while an advisory is
+      # open.
+      - name: Audit ${{ matrix.lock }}
+        run: cargo audit --deny warnings --file '${{ matrix.lock }}'
