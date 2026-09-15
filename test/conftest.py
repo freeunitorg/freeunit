@@ -22,6 +22,7 @@ from unit.http import HTTP1
 from unit.log import Log
 from unit.log import print_log_on_assert
 from unit.option import option
+from unit import port as port_map
 from unit.status import Status
 from unit.utils import check_findmnt
 from unit.utils import public_dir
@@ -71,6 +72,14 @@ def pytest_addoption(parser):
         action="store_true",
         help="Force Unit to restart after every test",
     )
+    parser.addoption(
+        "--port",
+        type=int,
+        default=int(os.environ.get('UNIT_TEST_PORT', 8080)),
+        help="Base TCP port for the suite.  The historical literals are "
+        "translated onto it (see unit/port.py), so concurrent runs can each "
+        "own a private band and stop colliding on a fixed *:8080",
+    )
 
 
 unit_instance = {}
@@ -98,6 +107,16 @@ is_findmnt = check_findmnt()
 
 def pytest_configure(config):
     option.config = config.option
+
+    # Before anything resolves a port: the session base is set here and only
+    # here, and it has to be live before the fixtures below start unitd.  A
+    # bad base (out of range, or one whose bands collide) exits the session
+    # rather than letting every listener land somewhere unintended.
+    try:
+        port_map.set_base(config.option.port)
+
+    except ValueError as err:
+        raise pytest.UsageError(str(err)) from None
 
     option.detailed = config.option.detailed
     option.fds_threshold = config.option.fds_threshold

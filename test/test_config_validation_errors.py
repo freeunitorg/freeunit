@@ -11,6 +11,7 @@ All cases are expressed using listeners + routes so they run without any
 language SAPI module configured.
 """
 
+from unit import port as port_map
 from unit.control import Control
 
 client = Control()
@@ -49,7 +50,7 @@ def test_nested_unknown_key_has_container_path():
         }
     )
     assert 'error' in r
-    assert r['location']['path'] == '/listeners/*:8080'
+    assert r['location']['path'] == f'/listeners/*:{port_map.port(8080)}'
 
 
 def test_array_element_path_points_into_routes():

@@ -8,13 +8,12 @@ from conftest import run_process
 from unit.applications.lang.python import ApplicationPython
 from unit.option import option
 from unit.utils import waitforsocket
+from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'any'}}
 
 client = ApplicationPython()
-SERVER_PORT = 7999
-
-
+SERVER_PORT = port_map.port(7999)
 @pytest.fixture(autouse=True)
 def setup_method_fixture():
     run_process(run_server, SERVER_PORT)
