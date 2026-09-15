@@ -66,8 +66,145 @@ jobs:
           ' pkg/eol.json)
           echo "builds=${builds}" >> "$GITHUB_OUTPUT"
 
+  # The core build, once for the whole run.  Every matrix leg below used to
+  # run the same "Configure unit" and "Make unit" steps with the same flags,
+  # so the same objects were compiled 26 times.  This job does it once and
+  # ships the result as an artifact; the legs unpack it and build only their
+  # own module.  Flags here are a copy of what the legs ran before -- keep
+  # the two in step if they ever change.
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read njs version
+        id: metadata
+        run: |
+          NJS_VERSION=$(sed -n "s/NJS_VERSION := \(.*\)/\1/p" pkg/contrib/src/njs/version)
+          echo "njs_version=${NJS_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install packages
+        run: sudo apt-get -y install libbrotli-dev ccache
+
+      - name: Cache ccache
+        uses: actions/cache@v6
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-${{ runner.arch }}-core-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ runner.arch }}-core-
+
+      - name: Enable ccache
+        run: |
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=500M" >> "$GITHUB_ENV"
+
+      - name: Cache OpenSSL 3.6
+        id: cache-openssl36
+        uses: actions/cache@v6
+        with:
+          path: /opt/openssl-3.6
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build OpenSSL 3.6
+        if: steps.cache-openssl36.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get -y install build-essential
+          cd /tmp
+          wget -q "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
+          tar -xzf "openssl-${OPENSSL_VERSION}.tar.gz"
+          cd "openssl-${OPENSSL_VERSION}"
+          ./Configure --prefix=/opt/openssl-3.6 shared no-docs
+          make -j$(nproc)
+          sudo mkdir -p /opt/openssl-3.6
+          sudo make install_sw
+
+      - name: Set OpenSSL 3.6 build environment
+        run: |
+          OSSL=/opt/openssl-3.6
+          LIBDIR=$( [ -d "$OSSL/lib64" ] && echo "$OSSL/lib64" || echo "$OSSL/lib" )
+          echo "OPENSSL36_INCDIR=${OSSL}/include" >> $GITHUB_ENV
+          echo "OPENSSL36_LIBDIR=${LIBDIR}"        >> $GITHUB_ENV
+
+      - name: Cache njs
+        id: cache-njs
+        uses: actions/cache@v6
+        with:
+          path: njs
+          key: njs-freeunitorg-${{ steps.metadata.outputs.njs_version }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Clone njs repository
+        if: steps.cache-njs.outputs.cache-hit != 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: freeunitorg/njs
+          ref: '${{ steps.metadata.outputs.njs_version }}'
+          path: njs
+
+      - name: Make njs
+        if: steps.cache-njs.outputs.cache-hit != 'true'
+        run: |
+          ./configure --no-libxml2 --no-zlib
+          make -j4 -k
+        working-directory: njs
+
+      - name: Configure unit
+        # LD_LIBRARY_PATH is set only for this step so that auto/feature
+        # test binaries load OpenSSL 3.6 at runtime.  It is NOT exported
+        # globally — doing so would break sudo (sudoers.so links against
+        # system libssl 3.3 which requires OPENSSL_3.3.0 from libcrypto,
+        # a symbol version that 3.6 does not export in the same slot).
+        env:
+          LD_LIBRARY_PATH: ${{ env.OPENSSL36_LIBDIR }}
+        run: |
+          ./configure \
+            --tests \
+            --openssl \
+            --njs \
+            --zlib \
+            --zstd \
+            --brotli \
+            --otel \
+            --cc-opt="-I${OPENSSL36_INCDIR} -I njs/src/ -I njs/build" \
+            --ld-opt="-L${OPENSSL36_LIBDIR} -Wl,-rpath,${OPENSSL36_LIBDIR} -L njs/build"
+
+      - name: Make unit
+        run: |
+          make -j$(nproc) -k || make
+
+      # The default target is `all: unitd manpage`, so --tests above only
+      # makes this target available -- it does not build it.  Without it
+      # build/unit_app_test does not exist and test_app_lifecycle.py's
+      # `libunit` parameter self-skips in every leg, silently: the runtime
+      # that needs no language toolchain and links libunit directly, i.e.
+      # the one that exercises the port/fd lifecycle with the least in the
+      # way, would contribute nothing while the legs still reported green.
+      - name: Make the libunit test application
+        run: make -j$(nproc) build/unit_app_test
+
+      # tar, not a bare upload: actions/upload-artifact stores a zip and
+      # restores neither the executable bit nor mtimes.  Both matter here --
+      # the legs run build/unit_app_test directly, and `make <module>` decides
+      # what to rebuild from mtimes.  The root Makefile is generated by
+      # configure (it just includes build/Makefile), so it travels too, and
+      # build/autoconf.data is what a module configure sources for the core's
+      # flags.
+      - name: Pack the core build
+        run: tar -czf /tmp/unit-core-build.tar.gz Makefile build
+
+      - name: Upload the core build
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-core-build
+          path: /tmp/unit-core-build.tar.gz
+          retention-days: 1
+          compression-level: 0
+
   test:
-    needs: prepare
+    needs: [prepare, core]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -285,39 +422,29 @@ jobs:
       ## Unit
       ##
 
-      - name: Configure unit
-        # LD_LIBRARY_PATH is set only for this step so that auto/feature
-        # test binaries load OpenSSL 3.6 at runtime.  It is NOT exported
-        # globally — doing so would break sudo (sudoers.so links against
-        # system libssl 3.3 which requires OPENSSL_3.3.0 from libcrypto,
-        # a symbol version that 3.6 does not export in the same slot).
-        env:
-          LD_LIBRARY_PATH: ${{ env.OPENSSL36_LIBDIR }}
-        run: |
-          ./configure \
-            --tests \
-            --openssl \
-            --njs \
-            --zlib \
-            --zstd \
-            --brotli \
-            --otel \
-            --cc-opt="-I${OPENSSL36_INCDIR} -I njs/src/ -I njs/build" \
-            --ld-opt="-L${OPENSSL36_LIBDIR} -Wl,-rpath,${OPENSSL36_LIBDIR} -L njs/build"
+      # The core build comes from the `core` job above: the same configure
+      # flags and the same objects, compiled once for the whole run instead
+      # of once per leg.  Only this leg's own module is built below.
+      - name: Download the core build
+        uses: actions/download-artifact@v4
+        with:
+          name: unit-core-build
+          path: /tmp
 
-      - name: Make unit
+      - name: Unpack the core build
+        # actions/checkout stamps the sources with the time it ran, which is
+        # after the core job built them, so make would judge every core object
+        # out of date and rebuild the very work this job exists to reuse.
+        # Touching the whole build tree to one timestamp fixes that: make
+        # rebuilds on a *newer* prerequisite, and equal mtimes count as up to
+        # date.  Everything under build/ came from this same commit, so there
+        # is no real staleness to mask.
         run: |
-          make -j4 -k || make
-
-      # The default target is `all: unitd manpage`, so --tests above only
-      # makes this target available -- it does not build it.  Without it
-      # build/unit_app_test does not exist and test_app_lifecycle.py's
-      # `libunit` parameter self-skips in every leg, silently: the runtime
-      # that needs no language toolchain and links libunit directly, i.e.
-      # the one that exercises the port/fd lifecycle with the least in the
-      # way, would contribute nothing while the legs still reported green.
-      - name: Make the libunit test application
-        run: make -j4 build/unit_app_test
+          tar -xzf /tmp/unit-core-build.tar.gz
+          find Makefile build -exec touch {} +
+          test -f build/autoconf.data
+          test -x build/sbin/unitd
+          test -x build/unit_app_test
 
       ##
       ## Go
