@@ -98,7 +98,8 @@ single `grep` finds every side of a case. E.g. token `chunked_response`:
 
 > **7999 is not available here.** `test/test_proxy.py` and `test/test_proxy_chunked.py`
 > already bind `SERVER_PORT = 7999` for their own upstream, so this registry ends at
-> 7998. New `fake_upstream` slots go to the 7974–7977 gap (7978–7979 are taken above, 7980–7982 are `fake_otlp`).
+> 7998. New `fake_upstream` slots go to the 7974–7976 gap (7977 is taken by
+> `test_proxy_interim.py` above, 7978–7979 are taken above, 7980–7982 are `fake_otlp`).
 
 A test pins its port as a module constant referencing this table:
 

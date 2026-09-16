@@ -15,11 +15,15 @@ response.  A 103 needs no prompting.
 The fix drops every 1xx other than 101 and reads on for the final response.
 Nothing is relayed to the client: the request body was sent to the upstream in
 full, so there is nothing for the client to continue, and the client side of
-Unit writes one header per request.
+Unit writes one header per request.  An upstream that sends more than ten
+interim responses in one exchange is looping, and the request fails with 502
+rather than letting it make Unit parse and store interim headers without bound.
 
 Each case pipelines a GET /ok behind the request under test, as
 test_proxy_head.py does: the second response arriving intact is what shows the
-final response was not lost or misattributed.
+final response was not lost or misattributed.  Cases whose exchange ends in an
+error, or in a protocol switch, close the client connection instead of
+answering the pipelined request; those send the request under test alone.
 """
 
 import select
@@ -38,6 +42,28 @@ client = ApplicationProto()
 UPSTREAM_PORT = 7977
 
 FINAL = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK'
+
+# The same final response with a marker field, to show the final response's own
+# fields survive what the interim response left behind.
+MARKED_FINAL = (
+    'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Final: yes\r\n\r\nOK'
+)
+
+# A 103 with one Link field, the shape a real origin sends.
+INTERIM = 'HTTP/1.1 103 Early Hints\r\nLink: </x.css>; rel=preload\r\n\r\n'
+
+# More fields than nxt_http_request_parse_t holds inline (16), so the parser
+# puts the rest in an nxt_list allocated from the request pool; dropping the
+# interim response has to drop both.
+BIG_FIELD_COUNT = 20
+
+# Field names a relayed 200 may carry here: the upstream's own, plus what Unit
+# adds.  Any other name in the first response's header block is a field of the
+# interim response that was not dropped.
+FINAL_FIELDS = {
+    'Content-Length', 'X-Final', 'Server', 'Date', 'Connection',
+    'Transfer-Encoding',
+}
 
 # A 103 whose header block alone is over half of the 64 KiB
 # proxy_header_buffer_size.  Two of them before the final response only fit
@@ -72,6 +98,30 @@ UPSTREAM_RESPONSES = {
         + FINAL,
     ],
     '/big': BIG_HINTS + BIG_HINTS + FINAL,
+    # More fields than the inline array holds: the ones the parser moved to its
+    # list must be dropped with the interim response, not relayed as the final
+    # response's own fields.
+    '/fields': (
+        'HTTP/1.1 103 Early Hints\r\n'
+        + ''.join(f'X-Early-{i:02d}: v{i}\r\n' for i in range(BIG_FIELD_COUNT))
+        + 'Link: </leak.css>; rel=preload\r\n'
+        + '\r\n'
+        + MARKED_FINAL
+    ),
+    # Framing fields on an interim response (RFC 9112 Sect. 6.1 forbids them
+    # there) must not reach the final response either.
+    '/framing': (
+        'HTTP/1.1 103 Early Hints\r\nContent-Length: 3\r\n'
+        'Connection: close\r\nLink: </x.css>; rel=preload\r\n\r\n' + FINAL
+    ),
+    # Exactly the cap, and one past it.
+    '/ten': INTERIM * 10 + FINAL,
+    '/eleven': INTERIM * 11 + FINAL,
+    # 101 is not interim in this sense -- the connection changes protocol -- so
+    # it stays the response.
+    '/switch': 'HTTP/1.1 101 Switching Protocols\r\n\r\n',
+    # An interim response with no final response behind it.
+    '/truncated': 'HTTP/1.1 100 Continue\r\n\r\n',
     # 100 only after the body has been read, like a real upstream honouring
     # Expect; the final response reports how many body bytes it got.
     '/expect': None,
@@ -158,15 +208,19 @@ def setup_method_fixture():
     ), 'interim proxy configuration'
 
 
-def pipeline(first_request):
-    """Send first_request and a GET /ok back to back, read to EOF."""
+def pipeline(first_request, sentinel=True):
+    """Send first_request, with a GET /ok behind it unless sentinel is false,
+    and read to EOF."""
 
-    request = first_request + (
-        'GET /ok HTTP/1.1\r\n'
-        'Host: localhost\r\n'
-        'Connection: close\r\n'
-        '\r\n'
-    )
+    request = first_request
+
+    if sentinel:
+        request += (
+            'GET /ok HTTP/1.1\r\n'
+            'Host: localhost\r\n'
+            'Connection: close\r\n'
+            '\r\n'
+        )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -264,3 +318,89 @@ def test_proxy_interim_control():
     """Control: a plain final response is unchanged."""
 
     check(get('/ok'))
+
+
+def test_proxy_interim_fields_not_leaked():
+    """A 1xx with more fields than the parser keeps inline: the fields it
+    collected -- including the ones it moved to its list -- are dropped with
+    the interim response, not relayed as the final response's own."""
+
+    raw = get('/fields')
+
+    check(raw)
+
+    lines = raw.split('\r\n\r\n')[0].split('\r\n')
+    names = [line.split(':', 1)[0] for line in lines[1:]]
+
+    assert 'X-Final: yes' in raw, f'final field lost: {raw!r}'
+    assert not [
+        name for name in names if name not in FINAL_FIELDS
+    ], f'interim fields leaked into the final response: {lines!r}'
+    assert 'X-Early' not in raw, f'interim field leaked: {raw!r}'
+
+
+def test_proxy_interim_framing_fields_dropped():
+    """Content-Length and Connection on a 1xx are dropped with it, so the final
+    response keeps its own framing and its own body."""
+
+    raw = get('/framing')
+
+    check(raw)
+
+    assert 'Content-Length: 3' not in raw, f'1xx framing relayed: {raw!r}'
+
+
+def test_proxy_interim_101_is_the_response():
+    """101 is not interim in this sense -- the connection changes protocol --
+    so it is relayed as the response, as it was before."""
+
+    raw = pipeline(
+        'GET /switch HTTP/1.1\r\n'
+        'Host: localhost\r\n'
+        'Connection: close\r\n'
+        '\r\n',
+        sentinel=False,
+    )
+
+    assert raw.startswith(
+        'HTTP/1.1 101 Switching Protocols'
+    ), f'101 not relayed: {raw!r}'
+
+
+def test_proxy_interim_then_close_is_bad_gateway():
+    """An interim response and then the upstream closing is a truncated
+    exchange: consuming the 1xx clears peer->status, and the close still has to
+    be an error rather than an empty success."""
+
+    raw = pipeline(
+        'GET /truncated HTTP/1.1\r\n'
+        'Host: localhost\r\n'
+        'Connection: close\r\n'
+        '\r\n',
+        sentinel=False,
+    )
+
+    assert 'HTTP/1.1 502' in raw, f'expected 502, got: {raw!r}'
+
+
+def test_proxy_interim_at_the_limit():
+    """Ten interim responses are consumed and the final response relayed; the
+    cap counts the eleventh."""
+
+    check(get('/ten'))
+
+
+def test_proxy_interim_over_the_limit():
+    """Eleven interim responses are an upstream protocol violation: the request
+    fails with 502 instead of parsing interim headers without bound."""
+
+    raw = pipeline(
+        'GET /eleven HTTP/1.1\r\n'
+        'Host: localhost\r\n'
+        'Connection: close\r\n'
+        '\r\n',
+        sentinel=False,
+    )
+
+    assert 'HTTP/1.1 502' in raw, f'expected 502 past the cap: {raw!r}'
+    assert 'HTTP/1.1 200' not in raw, f'final relayed past the cap: {raw!r}'
