@@ -6896,6 +6896,28 @@ nxt_router_adjust_idle_timer(nxt_task_t *task, void *obj, void *data)
         nxt_assert(port->detached == 0);
 
         if (nxt_slow_path(port->detached != 0)) {
+            /*
+             * The invariant above is expected to hold, so this is what a
+             * release build does when it does not.  A bare continue would
+             * re-select the same link -- neither the loop condition nor
+             * nxt_queue_first(&app->idle_ports) has changed -- and spin here
+             * holding app->mutex, which is worse than the miscount the guard
+             * exists to catch.  Take the port out of the idle economy
+             * instead, which is all "the reaper does not reach it" means: it
+             * stops being idle, but it is a live worker, so it stays in
+             * app->processes, keeps its ->app and is not QUIT.
+             * nxt_router_app_port_idle() re-inserts it when its detached
+             * work ends.
+             */
+
+            nxt_queue_remove(lnk);
+            lnk->next = NULL;
+
+            app->idle_processes--;
+
+            nxt_debug(task, "app '%V' move port %PI:%d out of idle_ports "
+                      "(detached)", &app->name, port->pid, port->id);
+
             continue;
         }
 
