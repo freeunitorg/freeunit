@@ -50,6 +50,17 @@ typedef struct {
     nxt_http_request_t      *request;
     nxt_msg_info_t          msg_info;
 
+    /*
+     * The worker's main port and its application, when the router gave up on
+     * a request that worker was running.  Each is held by a reference of its
+     * own until the worker answers, because neither the request nor its
+     * accounting outlives the decision to stop waiting: the port stays out of
+     * the idle economy until then and the application has to stay alive for
+     * that state to be settled at all.
+     */
+    nxt_port_t              *abandoned_port;
+    nxt_app_t               *abandoned_app;
+
     nxt_bool_t              rpc_cancel;
 } nxt_request_rpc_data_t;
 

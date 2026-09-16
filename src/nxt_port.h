@@ -347,6 +347,28 @@ struct nxt_port_s {
      * application reports the work finished.
      */
     uint8_t             detached;
+
+    /*
+     * The application reported detached work of its own.  Its FINISH edge is
+     * what ends that; until then the port stays out of the idle economy even
+     * with no request left.
+     */
+    uint8_t             detached_app;
+
+    /*
+     * The router put the port in the detached state itself: one for each
+     * request it has given up on that the worker is still running.  A
+     * "limits": {"timeout"} expiry answers the client while the worker keeps
+     * executing, and the port may not rejoin the idle economy until every
+     * such request has been answered or the port closes.  A count rather
+     * than a flag because one worker can run several of them at once, and
+     * kept apart from detached_app so that neither clear drops the other's
+     * reason.  As wide as active_requests below it, which counts the same
+     * population: "threads" is validated up to NXT_INT32_T_MAX, and a wrap
+     * would leave a settle unable to clear the state at all.
+     */
+    uint32_t            detached_router;
+
     uint32_t            active_requests;
 
     nxt_port_handler_t  handler;

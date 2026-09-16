@@ -5,6 +5,7 @@ import pytest
 
 from unit.applications.lang.node import ApplicationNode
 from unit.applications.websockets import ApplicationWebsocket
+from unit.control import Control
 
 prerequisites = {'modules': {'node': 'any'}}
 
@@ -1430,5 +1431,46 @@ def test_node_websockets_keepalive_interval():
 
     frame = ws.frame_read(sock)
     check_frame(frame, True, ws.OP_PING, '')  # PING frame
+
+    sock.close()
+
+
+def test_node_websockets_timeout_does_not_detach():
+    """An upgraded stream is not a request the deadline gave up on.
+
+    "limits": {"timeout"} re-arms nxt_router_app_timeout() for every non-last
+    message from the application, and the 101 is one, so an idle websocket
+    reaches that handler with the deadline passed.  The request's accounting
+    was already returned by the upgrade, so there is no worker still running
+    it: the router must not report the process "detached", which is its view
+    of a worker holding a request whose deadline passed.
+
+    Only the accounting is asserted.  The handler also answers 503 and drops
+    the stream, which is wrong for a websocket and is issue #422.
+    """
+
+    client.load('websockets/mirror')
+
+    assert 'success' in client.conf(
+        {'timeout': 1}, 'applications/websockets%2Fmirror/limits'
+    ), 'configure timeout'
+
+    _, sock, _ = ws.upgrade()
+
+    # No traffic either way -- keepalive_interval is 0 from the fixture -- so
+    # nothing re-arms the timer and it expires.
+    time.sleep(3)
+
+    processes = (
+        Control()
+        .conf_get('/status')
+        .get('applications', {})
+        .get('websockets/mirror', {})
+        .get('processes', {})
+    )
+
+    assert processes.get('detached', 0) == 0, (
+        f'an upgraded stream marked the worker detached: {processes}'
+    )
 
     sock.close()
