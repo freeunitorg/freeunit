@@ -152,6 +152,43 @@ nxt_http_parse_fields(nxt_http_request_parse_t *rp, nxt_buf_mem_t *b)
 }
 
 
+/*
+ * Return the field parser to the state it has before the first field of a
+ * message, so that one parser can read the next message of a connection.
+ *
+ * Only the field state is cleared: "mem_pool" and "discard_unsafe_fields" are
+ * configuration set by nxt_http_parse_request_init() and by the caller, and the
+ * request-line members (method, target, version, path, args) describe a
+ * request, not a list of fields.
+ *
+ * The caller must have consumed a complete header block -- the field parser
+ * returned NXT_DONE.  Until it does, bm->pos and the name/value pointers kept
+ * here refer to bytes of the buffer being parsed, and moving those bytes
+ * invalidates them.
+ */
+void
+nxt_http_parse_fields_reset(nxt_http_request_parse_t *rp)
+{
+    rp->handler = NULL;
+
+    rp->num_inline_fields = 0;
+    rp->fields = NULL;
+
+    /*
+     * The empty line that ends a header already clears these in
+     * nxt_http_parse_field_end(); they are repeated here so that this is the
+     * one place that says what state a field list leaves behind.
+     */
+    rp->field_name.start = NULL;
+    rp->field_name.length = 0;
+    rp->field_value.start = NULL;
+    rp->field_value.length = 0;
+    rp->field_hash = NXT_HTTP_FIELD_HASH_INIT;
+
+    rp->skip_field = 0;
+}
+
+
 static nxt_int_t
 nxt_http_parse_request_line(nxt_http_request_parse_t *rp, u_char **pos,
     const u_char *end)

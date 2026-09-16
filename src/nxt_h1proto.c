@@ -3030,19 +3030,28 @@ nxt_h1p_peer_header_parse(nxt_http_peer_t *peer, nxt_buf_mem_t *bm)
          * the client side writes one header per request.  101 is not
          * interim in this sense -- the connection changes protocol -- so it
          * stays the response, as before.
-         *
+         */
+        /*
          * The parser keeps no state across the empty line but the fields it
-         * collected; discard those.  The interim bytes are reclaimed so that
-         * the final header has the whole header buffer, which the read
-         * handler never grows.  Nothing points into them: the fields were
+         * collected; discard those.  Nothing points into them: the fields were
          * never processed.
          */
-        rp->handler = NULL;
-        rp->num_inline_fields = 0;
-        rp->fields = NULL;
+        nxt_http_parse_fields_reset(rp);
 
         peer->status = NXT_HTTP_UNSET;
 
+        /*
+         * The interim bytes are reclaimed so that the final header has the
+         * whole header buffer, which the read handler never grows.
+         *
+         * This is the only point where that is legal: the field parser has
+         * returned NXT_DONE, so it holds no cursor into the buffer.  It cannot
+         * be deferred to the next read either -- the reclaim is what gives the
+         * final header its room, and a read that filled the buffer mid-header
+         * could not be compacted at all.  Moving these bytes invalidates every
+         * pointer into the consumed region, so a future relay of the interim
+         * response has to serialise its fields before this point.
+         */
         length = bm->free - bm->pos;
 
         if (length != 0) {
