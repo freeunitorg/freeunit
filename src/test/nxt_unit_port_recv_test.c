@@ -52,6 +52,8 @@
 
 static int   nxt_port_recv_test_failures;
 static int   nxt_port_recv_test_step;
+static int   nxt_port_recv_test_block;
+static int   nxt_port_recv_test_shared_queue_fd = -1;
 static int   nxt_port_recv_test_sock_fd = -1;
 static int   nxt_port_recv_test_queue_fd = -1;
 static int   nxt_port_recv_test_ctx_queue_fd = -1;
@@ -136,6 +138,13 @@ nxt_port_recv_test_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port, void *buf,
 {
     int             fds[2];
     struct cmsghdr  *cmsg;
+
+    if (nxt_port_recv_test_block) {
+        /* A real blocking read, as libunit does without this callback. */
+        *oob_size = 0;
+
+        return read(port->in_fd, buf, buf_size);
+    }
 
     if (nxt_port_recv_test_step++ > 0) {
         return 0;
@@ -338,6 +347,263 @@ nxt_port_recv_test_detached_single_fail(nxt_unit_ctx_t *ctx)
 
 
 static void
+nxt_port_recv_test_detached_retry_budget(nxt_unit_ctx_t *ctx)
+{
+    int  rc;
+
+    /*
+     * A request handler that returns while the FINISH edge is pending sends
+     * it again, but must not reset the retry budget.  Otherwise a worker
+     * that serves traffic never reaches the give-up.
+     *
+     * Three injected failures: the handler return, one read-loop retry, and
+     * a second handler return that must leave the count at 2, not 1.  The
+     * fourth attempt succeeds and clears both.
+     */
+    nxt_unit_test_ctx_set_ready(ctx, 1);
+    nxt_unit_test_ctx_set_detached(ctx, 1);
+    nxt_unit_test_ctx_set_detached_retries(ctx, 0);
+    nxt_unit_test_send_detached_failures(3);
+
+    nxt_unit_test_ctx_detached_done(ctx);
+
+    nxt_port_recv_test_assert(
+        nxt_unit_test_ctx_detached(ctx) == 1
+        && nxt_unit_test_ctx_detached_retries(ctx) == 1,
+        "failed finish send arms the retry budget");
+
+    rc = nxt_unit_test_ctx_detached_retry(ctx);
+
+    nxt_port_recv_test_assert(
+        rc == NXT_UNIT_OK
+        && nxt_unit_test_ctx_detached_retries(ctx) == 2,
+        "read loop spends one retry");
+
+    /* A request handler returns while the FINISH is still pending. */
+    nxt_unit_test_ctx_detached_done(ctx);
+
+    nxt_port_recv_test_assert(
+        nxt_unit_test_ctx_detached(ctx) == 1
+        && nxt_unit_test_ctx_detached_retries(ctx) == 2,
+        "handler return does not reset the retry budget");
+
+    rc = nxt_unit_test_ctx_detached_retry(ctx);
+
+    nxt_port_recv_test_assert(
+        rc == NXT_UNIT_OK
+        && nxt_unit_test_ctx_detached(ctx) == 0
+        && nxt_unit_test_ctx_detached_retries(ctx) == 0
+        && nxt_unit_test_ctx_online(ctx) == 1,
+        "the next successful retry clears the state");
+}
+
+
+static void
+nxt_port_recv_test_child_wait(pid_t pid, const char *name)
+{
+    int  status;
+
+    if (pid == -1) {
+        perror("fork");
+        nxt_port_recv_test_failures++;
+        return;
+    }
+
+    if (waitpid(pid, &status, 0) == -1) {
+        perror("waitpid");
+        nxt_port_recv_test_failures++;
+        return;
+    }
+
+    if (!WIFEXITED(status)) {
+        printf("port_recv test: child killed by signal %d\n",
+               WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+
+    } else if (WEXITSTATUS(status) != 0) {
+        printf("port_recv test: child exit %d\n", WEXITSTATUS(status));
+    }
+
+    nxt_port_recv_test_assert(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                              name);
+}
+
+
+static void
+nxt_port_recv_test_detached_start_give_up(nxt_unit_ctx_t *ctx)
+{
+    pid_t  pid;
+
+    /*
+     * The START edge is retried inside the request handler, because the read
+     * loop does not run until the handler returns.  In a child process: the
+     * give-up quits the worker.
+     */
+    pid = fork();
+
+    if (pid == 0) {
+        nxt_unit_test_ctx_set_ready(ctx, 1);
+        nxt_unit_test_ctx_set_detached(ctx, 0);
+
+        /* Seven failures: the eighth and last attempt succeeds. */
+        nxt_unit_test_send_detached_failures(7);
+        nxt_unit_test_ctx_detached_start(ctx);
+
+        if (nxt_unit_test_ctx_detached(ctx) != 1
+            || nxt_unit_test_ctx_detached_unreported(ctx) != 0)
+        {
+            _exit(1);
+        }
+
+        nxt_unit_test_ctx_set_detached(ctx, 0);
+
+        /* Eight failures: the worker is not marked detached. */
+        nxt_unit_test_send_detached_failures(8);
+        nxt_unit_test_ctx_detached_start(ctx);
+
+        if (nxt_unit_test_ctx_detached(ctx) != 0
+            || nxt_unit_test_ctx_detached_unreported(ctx) != 1
+            || nxt_unit_test_ctx_online(ctx) != 1)
+        {
+            _exit(2);
+        }
+
+        /* The handler returns: the worker retires, without a FINISH. */
+        nxt_unit_test_send_detached_failures(1);
+        nxt_unit_test_ctx_detached_done(ctx);
+
+        if (nxt_unit_test_ctx_online(ctx) != 0
+            || nxt_unit_test_ctx_detached_unreported(ctx) != 0)
+        {
+            _exit(3);
+        }
+
+        _exit(0);
+    }
+
+    nxt_port_recv_test_child_wait(pid,
+        "failed start send is retried in place, then retires the worker");
+}
+
+
+static void
+nxt_port_recv_test_detached_idle_retry(nxt_unit_ctx_t *ctx, uint8_t ready,
+    const char *name)
+{
+    pid_t            pid;
+    nxt_app_queue_t  *q;
+
+    /*
+     * A FINISH retry must not wait for traffic.  The read loop runs on an
+     * idle worker: its waits must expire, so the retries reach the give-up.
+     * Reads block, so an unbounded wait lasts until SIGALRM kills the child.
+     * A ready context waits in poll() on both ports; a context that is not
+     * ready waits on its read port only.
+     */
+    pid = fork();
+
+    if (pid == 0) {
+        nxt_port_recv_test_block = 1;
+
+        /* An empty shared queue, as the router leaves it. */
+        q = mmap(NULL, sizeof(nxt_app_queue_t), PROT_READ | PROT_WRITE,
+                 MAP_SHARED, nxt_port_recv_test_shared_queue_fd, 0);
+        if (q == MAP_FAILED) {
+            _exit(4);
+        }
+
+        nxt_app_queue_init(q);
+
+        nxt_unit_test_ctx_set_ready(ctx, ready);
+        nxt_unit_test_ctx_set_detached(ctx, 1);
+        nxt_unit_test_ctx_set_detached_retries(ctx, 0);
+        nxt_unit_test_send_detached_failures(20);
+
+        nxt_unit_test_ctx_detached_done(ctx);
+
+        if (nxt_unit_test_ctx_detached_retries(ctx) != 1) {
+            _exit(1);
+        }
+
+        alarm(5);
+
+        (void) nxt_unit_run(ctx);
+
+        if (nxt_unit_test_ctx_online(ctx) != 0
+            || nxt_unit_test_ctx_detached_retries(ctx) != 11)
+        {
+            _exit(2);
+        }
+
+        _exit(0);
+    }
+
+    nxt_port_recv_test_child_wait(pid, name);
+}
+
+
+static void
+nxt_port_recv_test_deferred_quit_read(nxt_unit_ctx_t *ctx, int run_ctx,
+    const char *name)
+{
+    int    rc;
+    pid_t  pid;
+
+    /*
+     * A graceful QUIT that arrives while the worker is detached is deferred.
+     * The retry that delivers the FINISH edge then completes it, which takes
+     * the context offline and removes its read port.  The read loop must
+     * return at once: a receive on the removed port waits for a message the
+     * router will never send, so an unbounded wait lasts until SIGALRM kills
+     * the child.  Both read loops run the retry, so check both.
+     */
+
+    pid = fork();
+
+    if (pid == 0) {
+        nxt_port_recv_test_block = 1;
+
+        nxt_unit_test_ctx_set_ready(ctx, 1);
+        nxt_unit_test_ctx_set_detached(ctx, 1);
+        nxt_unit_test_ctx_set_detached_retries(ctx, 0);
+
+        nxt_unit_test_ctx_quit_graceful(ctx);
+
+        if (nxt_unit_test_ctx_ready(ctx) != 0
+            || nxt_unit_test_ctx_online(ctx) != 1)
+        {
+            _exit(1);
+        }
+
+        /* One failure: the handler return arms the retry, the retry sends. */
+        nxt_unit_test_send_detached_failures(1);
+        nxt_unit_test_ctx_detached_done(ctx);
+
+        if (nxt_unit_test_ctx_detached(ctx) != 1
+            || nxt_unit_test_ctx_detached_retries(ctx) != 1)
+        {
+            _exit(2);
+        }
+
+        alarm(5);
+
+        rc = run_ctx ? nxt_unit_run_ctx(ctx) : nxt_unit_run(ctx);
+
+        if (rc != NXT_UNIT_OK
+            || nxt_unit_test_ctx_online(ctx) != 0
+            || nxt_unit_test_ctx_detached(ctx) != 0
+            || nxt_unit_test_ctx_detached_retries(ctx) != 0)
+        {
+            _exit(3);
+        }
+
+        _exit(0);
+    }
+
+    nxt_port_recv_test_child_wait(pid, name);
+}
+
+
+static void
 nxt_port_recv_test_detached_persistent_fail(nxt_unit_ctx_t *ctx)
 {
     int    i, rc, status;
@@ -478,6 +744,8 @@ main(void)
         return 1;
     }
 
+    nxt_port_recv_test_shared_queue_fd = dup(init.shared_queue_fd);
+
     ctx = nxt_unit_init(&init);
     if (ctx == NULL) {
         printf("port_recv test: nxt_unit_init() failed\n");
@@ -542,7 +810,21 @@ main(void)
         "unrelated fd survives an empty read");
 
 #if (NXT_TESTS)
+    /*
+     * single_fail runs last: its Case B leaves the context offline, and
+     * every other case expects it online.
+     */
+    nxt_port_recv_test_detached_retry_budget(ctx);
+    nxt_port_recv_test_detached_start_give_up(ctx);
+    nxt_port_recv_test_detached_idle_retry(ctx, 1,
+        "finish retry reaches the give-up, ready and idle");
+    nxt_port_recv_test_detached_idle_retry(ctx, 0,
+        "finish retry reaches the give-up, not ready and idle");
     nxt_port_recv_test_detached_persistent_fail(ctx);
+    nxt_port_recv_test_deferred_quit_read(ctx, 0,
+        "nxt_unit_run() returns on a retry that completes a quit");
+    nxt_port_recv_test_deferred_quit_read(ctx, 1,
+        "nxt_unit_run_ctx() returns on a retry that completes a quit");
     nxt_port_recv_test_detached_single_fail(ctx);
 #endif
 

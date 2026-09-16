@@ -7955,6 +7955,14 @@ nxt_router_detached_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         return;
     }
 
+    if (*msg->buf->mem.pos != NXT_PORT_DETACHED_START
+        && *msg->buf->mem.pos != NXT_PORT_DETACHED_FINISH)
+    {
+        nxt_alert(task, "detached_handler: invalid state byte %d",
+                  (int) *msg->buf->mem.pos);
+        return;
+    }
+
     nxt_router_detached_apply(task, msg->port_msg.pid, *msg->buf->mem.pos);
 }
 

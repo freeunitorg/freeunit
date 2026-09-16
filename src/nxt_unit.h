@@ -417,6 +417,10 @@ void     nxt_unit_test_send_detached_failures(unsigned int failures);
 uint8_t  nxt_unit_test_ctx_detached(nxt_unit_ctx_t *ctx);
 uint8_t  nxt_unit_test_ctx_detached_retries(nxt_unit_ctx_t *ctx);
 void     nxt_unit_test_ctx_set_detached(nxt_unit_ctx_t *ctx, uint8_t val);
+void     nxt_unit_test_ctx_set_detached_retries(nxt_unit_ctx_t *ctx,
+    uint8_t val);
+uint8_t  nxt_unit_test_ctx_detached_unreported(nxt_unit_ctx_t *ctx);
+void     nxt_unit_test_ctx_detached_start(nxt_unit_ctx_t *ctx);
 void     nxt_unit_test_ctx_detached_done(nxt_unit_ctx_t *ctx);
 int      nxt_unit_test_ctx_detached_retry(nxt_unit_ctx_t *ctx);
 uint8_t  nxt_unit_test_ctx_online(nxt_unit_ctx_t *ctx);

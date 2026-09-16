@@ -77,8 +77,11 @@ static int nxt_unit_process_new_port(nxt_unit_ctx_t *ctx,
 static int nxt_unit_ctx_ready(nxt_unit_ctx_t *ctx);
 static int nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx,
     nxt_unit_recv_msg_t *recv_msg, nxt_unit_request_info_t **preq);
+static void nxt_unit_ctx_detached_start(nxt_unit_ctx_t *ctx);
 static void nxt_unit_ctx_detached_done(nxt_unit_ctx_t *ctx);
 static int nxt_unit_ctx_detached_retry(nxt_unit_ctx_t *ctx);
+static int nxt_unit_detached_timeout(nxt_unit_ctx_impl_t *ctx_impl);
+static int nxt_unit_detached_poll(nxt_unit_ctx_t *ctx, int fd);
 static int nxt_unit_send_detached(nxt_unit_ctx_t *ctx, uint8_t state);
 static int nxt_unit_process_req_body(nxt_unit_ctx_t *ctx,
     nxt_unit_recv_msg_t *recv_msg);
@@ -445,7 +448,15 @@ struct nxt_unit_ctx_impl_s {
      * busy, and holds off a graceful quit, until it does.
      */
     uint8_t                       detached;     /* 1 bit */
+
+    /* Failed FINISH sends so far; 0 when none is pending. */
     uint8_t                       detached_retries;
+
+    /*
+     * The START edge was never delivered.  The worker retires when the
+     * request handler returns.
+     */
+    uint8_t                       detached_unreported;  /* 1 bit */
 
     nxt_unit_mmap_buf_t           ctx_buf[2];
     nxt_unit_read_buf_t           ctx_read_buf;
@@ -830,6 +841,7 @@ nxt_unit_ctx_init(nxt_unit_impl_t *lib, nxt_unit_ctx_impl_t *ctx_impl,
 
     ctx_impl->detached = NXT_UNIT_DETACHED_NONE;
     ctx_impl->detached_retries = 0;
+    ctx_impl->detached_unreported = 0;
 
     nxt_queue_init(&ctx_impl->free_req);
     nxt_queue_init(&ctx_impl->free_ws);
@@ -3566,9 +3578,7 @@ nxt_unit_send_detached(nxt_unit_ctx_t *ctx, uint8_t state)
     } m;
 
 #if (NXT_TESTS)
-    if (nxt_slow_path(state == NXT_PORT_DETACHED_FINISH
-                      && nxt_unit_test_send_detached_failure_count > 0))
-    {
+    if (nxt_slow_path(nxt_unit_test_send_detached_failure_count > 0)) {
         nxt_unit_test_send_detached_failure_count--;
         return NXT_UNIT_ERROR;
     }
@@ -3601,10 +3611,6 @@ nxt_unit_send_detached(nxt_unit_ctx_t *ctx, uint8_t state)
 void
 nxt_unit_request_done_detached(nxt_unit_request_info_t *req, int rc)
 {
-    nxt_unit_ctx_impl_t  *ctx_impl;
-
-    ctx_impl = nxt_container_of(req->ctx, nxt_unit_ctx_impl_t, ctx);
-
     /*
      * Before the response, not after.  The two go to different ports, so
      * this orders nothing on the router's side by itself -- the router
@@ -3613,23 +3619,64 @@ nxt_unit_request_done_detached(nxt_unit_request_info_t *req, int rc)
      * idle queue as short as the router's own read makes it.
      *
      * A failure here is not fatal to the request: the response still goes
-     * out below, and the worst case is the accounting this call was meant
-     * to correct, which is what the router does today for every such
-     * response.
+     * out below.
      */
 
-    if (ctx_impl->detached == NXT_UNIT_DETACHED_NONE) {
-        if (nxt_unit_send_detached(req->ctx, NXT_PORT_DETACHED_START)
+    nxt_unit_ctx_detached_start(req->ctx);
+
+    nxt_unit_request_done(req, rc);
+}
+
+
+/*
+ * Report the START edge.  The application continues inside its request
+ * handler, and the read loop does not run again until the handler returns,
+ * so a retry from the read loop is too late.  Retry here: 8 attempts, with
+ * sleeps of 1, 2, ... 64 ms between them, 127 ms in total.
+ *
+ * If all attempts fail, the router counts this worker idle while the
+ * application runs.  Do not set ->detached, because the router does not
+ * know about the work.  Retire the worker when the handler returns.
+ */
+
+#define NXT_UNIT_DETACHED_START_ATTEMPTS  8
+
+static void
+nxt_unit_ctx_detached_start(nxt_unit_ctx_t *ctx)
+{
+    int                  i;
+    struct timespec      ts;
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    if (ctx_impl->detached != NXT_UNIT_DETACHED_NONE
+        || ctx_impl->detached_unreported)
+    {
+        return;
+    }
+
+    for (i = 0; i < NXT_UNIT_DETACHED_START_ATTEMPTS; i++) {
+
+        if (i > 0) {
+            ts.tv_sec = 0;
+            ts.tv_nsec = (1L << (i - 1)) * 1000000L;
+
+            (void) nanosleep(&ts, NULL);
+        }
+
+        if (nxt_unit_send_detached(ctx, NXT_PORT_DETACHED_START)
             == NXT_UNIT_OK)
         {
             ctx_impl->detached = NXT_UNIT_DETACHED_RUNNING;
-
-        } else {
-            nxt_unit_req_alert(req, "failed to report a detached response");
+            return;
         }
     }
 
-    nxt_unit_request_done(req, rc);
+    ctx_impl->detached_unreported = 1;
+
+    nxt_unit_alert(ctx, "failed to report a detached response, "
+                   "retiring the worker when the request handler returns");
 }
 
 
@@ -3647,6 +3694,20 @@ nxt_unit_ctx_detached_done(nxt_unit_ctx_t *ctx)
     nxt_unit_ctx_impl_t  *ctx_impl;
 
     ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    if (nxt_slow_path(ctx_impl->detached_unreported)) {
+        ctx_impl->detached_unreported = 0;
+
+        /*
+         * The START edge was never delivered.  Quit gracefully, the same
+         * way as the deferred quit below: the router then settles the
+         * process and starts a replacement if one is needed.
+         */
+
+        nxt_unit_quit(ctx, NXT_QUIT_GRACEFUL);
+
+        return;
+    }
 
     if (ctx_impl->detached == NXT_UNIT_DETACHED_NONE) {
         return;
@@ -3672,14 +3733,26 @@ nxt_unit_ctx_detached_done(nxt_unit_ctx_t *ctx)
     }
 
     /*
-     * The FINISH edge failed to deliver (e.g. transient router-port buffer
-     * backpressure).  Keep ctx_impl->detached set so the worker does not
-     * drop into an inconsistent state, and retry from the read loop rather
-     * than quitting inline inside nxt_unit_process_ready_req().
+     * The FINISH edge was not delivered.  Keep ->detached set and let the
+     * read loop retry; its blocking waits are bounded while a retry is
+     * pending (see nxt_unit_detached_timeout()).  The give-up is not run
+     * here, inside nxt_unit_process_ready_req().
+     *
+     * Only arm the retry if it is not armed.  Otherwise each request handler
+     * that returns while the FINISH is pending resets the budget, and a
+     * worker that serves traffic never reaches the give-up.
      */
-    ctx_impl->detached_retries = 1;
+
+    if (ctx_impl->detached_retries == 0) {
+        ctx_impl->detached_retries = 1;
+    }
 }
 
+
+/*
+ * Retry the FINISH edge.  Called from the read loop, outside request
+ * processing.  After 10 failed retries, close the worker.
+ */
 
 static int
 nxt_unit_ctx_detached_retry(nxt_unit_ctx_t *ctx)
@@ -3709,9 +3782,63 @@ nxt_unit_ctx_detached_retry(nxt_unit_ctx_t *ctx)
     if (++ctx_impl->detached_retries > 10) {
         lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
 
+        /*
+         * Close the main context: the router keeps the detached flag on the
+         * main port (id 0), and only closing that port settles the count
+         * and the application reference.  This assumes one context, as in
+         * PHP, the only caller of nxt_unit_request_done_detached().  A
+         * non-main context closing alone would leave the worker flagged
+         * detached for the life of the process, and the main context is
+         * changed here without cross-thread synchronization.  This is a
+         * comment and not nxt_assert(): libunit does not link the thread
+         * context that nxt_assert() needs.
+         */
+
         nxt_unit_alert(ctx, "failed to report detached finish, closing worker");
         nxt_unit_quit(&lib->main_ctx.ctx, NXT_QUIT_NORMAL);
         return NXT_UNIT_ERROR;
+    }
+
+    return NXT_UNIT_OK;
+}
+
+
+/*
+ * How long a read may block while a FINISH retry is pending: 2 ms after the
+ * first failed retry, doubling up to 256 ms.  The ten retries then span
+ * about 0.8 s without traffic.
+ */
+
+static int
+nxt_unit_detached_timeout(nxt_unit_ctx_impl_t *ctx_impl)
+{
+    return 1 << nxt_min(ctx_impl->detached_retries - 1, 8);
+}
+
+
+/*
+ * Wait for "fd" to become readable while a FINISH retry is pending.
+ * Returns NXT_UNIT_AGAIN when the wait expires, so that the caller returns
+ * to the read loop, which retries.
+ */
+
+static int
+nxt_unit_detached_poll(nxt_unit_ctx_t *ctx, int fd)
+{
+    int                  nevents;
+    struct pollfd        pfd;
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    nevents = poll(&pfd, 1, nxt_unit_detached_timeout(ctx_impl));
+
+    if (nevents == 0 || (nevents == -1 && errno == EINTR)) {
+        return NXT_UNIT_AGAIN;
     }
 
     return NXT_UNIT_OK;
@@ -3749,6 +3876,35 @@ nxt_unit_test_ctx_set_detached(nxt_unit_ctx_t *ctx, uint8_t val)
     ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
 
     ctx_impl->detached = val;
+}
+
+
+void
+nxt_unit_test_ctx_set_detached_retries(nxt_unit_ctx_t *ctx, uint8_t val)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    ctx_impl->detached_retries = val;
+}
+
+
+uint8_t
+nxt_unit_test_ctx_detached_unreported(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    return ctx_impl->detached_unreported;
+}
+
+
+void
+nxt_unit_test_ctx_detached_start(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_ctx_detached_start(ctx);
 }
 
 
@@ -5146,6 +5302,17 @@ nxt_unit_run(nxt_unit_ctx_t *ctx)
             nxt_unit_quit(ctx, NXT_QUIT_NORMAL);
             break;
         }
+
+        /*
+         * A read that returned no message because the context went offline
+         * ends the loop the same way a QUIT message does, so report it the
+         * same way: callers exit the process with this code.
+         */
+
+        if (nxt_slow_path(rc == NXT_UNIT_AGAIN && !ctx_impl->online)) {
+            rc = NXT_UNIT_OK;
+            break;
+        }
     }
 
     nxt_unit_ctx_release(ctx);
@@ -5206,7 +5373,7 @@ nxt_unit_run_once_impl(nxt_unit_ctx_t *ctx)
 static int
 nxt_unit_read_buf(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf)
 {
-    int                   nevents, res, err;
+    int                   nevents, res, err, timeout;
     nxt_uint_t            nfds;
     nxt_unit_impl_t       *lib;
     nxt_unit_ctx_impl_t   *ctx_impl;
@@ -5215,10 +5382,30 @@ nxt_unit_read_buf(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf)
 
     ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
 
+    timeout = -1;
+
     if (nxt_slow_path(ctx_impl->detached_retries > 0)) {
         res = nxt_unit_ctx_detached_retry(ctx);
         if (nxt_slow_path(res != NXT_UNIT_OK)) {
             return res;
+        }
+
+        if (nxt_slow_path(!ctx_impl->online)) {
+            /*
+             * The retry completed a graceful quit that was deferred on the
+             * detached flag, so the read port is removed.  Report "no
+             * message": the caller releases the buffer and its loop stops
+             * on ->online.  A receive here would wait for a message the
+             * router will never send.
+             */
+
+            rbuf->size = -1;
+
+            return NXT_UNIT_AGAIN;
+        }
+
+        if (ctx_impl->detached_retries > 0) {
+            timeout = nxt_unit_detached_timeout(ctx_impl);
         }
     }
 
@@ -5276,7 +5463,15 @@ retry:
 
     fds[1].revents = 0;
 
-    nevents = poll(fds, nfds, -1);
+    nevents = poll(fds, nfds, timeout);
+
+    if (nxt_slow_path(nevents == 0)) {
+        /* A pending FINISH retry bounded the wait; the caller retries. */
+        rbuf->size = -1;
+
+        return NXT_UNIT_AGAIN;
+    }
+
     if (nxt_slow_path(nevents == -1)) {
         err = errno;
 
@@ -5471,23 +5666,38 @@ nxt_unit_run_ctx(nxt_unit_ctx_t *ctx)
     rc = NXT_UNIT_OK;
 
     while (nxt_fast_path(ctx_impl->online)) {
+        if (nxt_slow_path(ctx_impl->detached_retries > 0)) {
+            rc = nxt_unit_ctx_detached_retry(ctx);
+            if (nxt_slow_path(rc != NXT_UNIT_OK)) {
+                break;
+            }
+
+            /*
+             * The retry may have completed a deferred graceful quit, which
+             * removes the read port.  Leave with the retry's NXT_UNIT_OK,
+             * before a buffer is taken; "rc" is that value.
+             */
+
+            if (nxt_slow_path(!ctx_impl->online)) {
+                break;
+            }
+        }
+
         rbuf = nxt_unit_read_buf_get(ctx);
         if (nxt_slow_path(rbuf == NULL)) {
             rc = NXT_UNIT_ERROR;
             break;
         }
 
-        if (nxt_slow_path(ctx_impl->detached_retries > 0)) {
-            rc = nxt_unit_ctx_detached_retry(ctx);
-            if (nxt_slow_path(rc != NXT_UNIT_OK)) {
-                break;
-            }
-        }
-
     retry:
 
         rc = nxt_unit_ctx_port_recv(ctx, ctx_impl->read_port, rbuf);
         if (rc == NXT_UNIT_AGAIN) {
+            if (nxt_slow_path(ctx_impl->detached_retries > 0)) {
+                nxt_unit_read_buf_release(ctx, rbuf);
+                continue;
+            }
+
             goto retry;
         }
 
@@ -6725,8 +6935,10 @@ nxt_unit_ctx_port_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     nxt_unit_read_buf_t *rbuf)
 {
     int                   res, read;
+    nxt_unit_ctx_impl_t   *ctx_impl;
     nxt_unit_port_impl_t  *port_impl;
 
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
     port_impl = nxt_container_of(port, nxt_unit_port_impl_t, port);
 
     read = 0;
@@ -6781,6 +6993,13 @@ retry:
 
     if (read) {
         return NXT_UNIT_AGAIN;
+    }
+
+    if (nxt_slow_path(ctx_impl->detached_retries > 0 && port->in_fd != -1)) {
+        res = nxt_unit_detached_poll(ctx, port->in_fd);
+        if (res != NXT_UNIT_OK) {
+            return res;
+        }
     }
 
     res = nxt_unit_port_recv(ctx, port, rbuf);
