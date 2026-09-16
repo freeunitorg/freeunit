@@ -3,6 +3,7 @@ import sys
 
 from unit.check.cargo_component import check_cargo_component
 from unit.check.chroot import check_chroot
+from unit.check.clang_wasm import check_clang_wasm
 from unit.check.go import check_go
 from unit.check.isolation import check_isolation
 from unit.check.njs import check_njs
@@ -47,5 +48,6 @@ def discover_available(unit):
 
     option.available['features']['cargo_component'] = check_cargo_component()
     option.available['features']['chroot'] = check_chroot()
+    option.available['features']['clang_wasm'] = check_clang_wasm()
     option.available['features']['isolation'] = check_isolation()
     option.available['features']['unix_abstract'] = check_unix_abstract()

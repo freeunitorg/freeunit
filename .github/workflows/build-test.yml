@@ -206,7 +206,9 @@ jobs:
   test:
     needs: [prepare, core]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # 45, not 30: the wasm leg now runs the suite on a cold contrib wasmtime
+    # build (the cache key moves with the pin) and builds the guest toolchain.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -629,7 +631,13 @@ jobs:
         uses: actions/cache@v6
         with:
           path: pkg/contrib/wasmtime/artifacts
-          key: wasmtime-${{ steps.metadata.outputs.wasmtime_version }}-${{ runner.os }}-${{ runner.arch }}
+          # Every file that decides what gets downloaded, verified and
+          # built, not just the version.  The Makefile matters most: its cmake
+          # flags decide which features the library carries, so without it a
+          # feature change with no version bump would restore the old library
+          # and skip the rebuild, leaving the tests and the audit gate
+          # disagreeing about what was linked.
+          key: wasmtime-${{ steps.metadata.outputs.wasmtime_version }}-${{ hashFiles('pkg/contrib/src/wasmtime/*') }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Make wasmtime
         run: |
@@ -638,12 +646,38 @@ jobs:
 
       - name: Configure wasm
         run: |
-          ./configure wasm --include-path=pkg/contrib/wasmtime/artifacts/include --lib-path=pkg/contrib/wasmtime/artifacts/lib
+          ./configure wasm --rpath --include-path=pkg/contrib/wasmtime/artifacts/include --lib-path=pkg/contrib/wasmtime/artifacts/lib
         if: steps.metadata.outputs.module == 'wasm'
 
       - name: Make wasm
         run: |
           make wasm
+        if: steps.metadata.outputs.module == 'wasm'
+
+      # The guest fixture is compiled at test time from pkg/contrib sources:
+      # wasi-sysroot for wasi-libc and libunit-wasm for the request ABI.
+      - name: Cache wasi-sysroot
+        id: cache-wasi-sysroot
+        if: steps.metadata.outputs.module == 'wasm'
+        uses: actions/cache@v6
+        with:
+          path: |
+            pkg/contrib/wasi-sysroot
+            pkg/contrib/libunit-wasm
+          # Every file that decides what gets downloaded, verified and built,
+          # not just the version: otherwise a checksum or build-rule change
+          # restores the old tree and skips the make below.
+          key: wasi-sysroot-${{ hashFiles('pkg/contrib/src/wasi-sysroot/*', 'pkg/contrib/src/libunit-wasm/*') }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Make wasi-sysroot
+        run: |
+          make -C pkg/contrib .wasi-sysroot libunit-wasm
+        if: steps.metadata.outputs.module == 'wasm' && steps.cache-wasi-sysroot.outputs.cache-hit != 'true'
+
+      - name: Install wasm guest toolchain
+        run: |
+          sudo apt install -y clang lld
+          sudo apt install -y "libclang-rt-$(clang -dumpversion | cut -d. -f1)-dev-wasm32"
         if: steps.metadata.outputs.module == 'wasm'
 
       ##
@@ -725,8 +759,6 @@ jobs:
         run: |
           sudo apt install -y python3-pytest
 
-        if: steps.metadata.outputs.module != 'wasm'
-
       - name: Run ${{ steps.metadata.outputs.module }} tests
         # GitHub runners are UTC, where localtime() and gmtime() agree, so a
         # UTC-only run cannot tell a correct HTTP-date from one rendered in
@@ -743,12 +775,28 @@ jobs:
           if [ "${{ steps.metadata.outputs.module }}" == "python" ]; then
             export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
           fi
-          if [ "${{ matrix.build }}" == "wasm-wasi-component" ]; then
-            pytest-3 --print-log ${{ steps.metadata.outputs.testpath }}
+          # The wasm legs build their guest fixture as the runner user, so
+          # they run unprivileged to keep the result reachable by pytest; the
+          # others install applications as root.
+          if [ "${{ matrix.build }}" == "wasm-wasi-component" ] || [ "${{ matrix.build }}" == "wasm" ]; then
+            set -o pipefail
+            pytest-3 --print-log ${{ steps.metadata.outputs.testpath }} 2>&1 | tee "$RUNNER_TEMP/pytest.out"
           else
             sudo -E pytest-3 --print-log ${{ steps.metadata.outputs.testpath }}
           fi
-        if: steps.metadata.outputs.module != 'wasm'
+
+      # check_prerequisites() skips the whole file when the clang/wasi-sysroot
+      # fixture cannot be built, so an incomplete toolchain would leave this
+      # leg green while it covers nothing.  At least one smoke test must have
+      # actually passed.
+      - name: Fail if the wasm smoke test skipped
+        if: ${{ !cancelled() && steps.metadata.outputs.module == 'wasm' }}
+        run: |
+          grep -qE 'test_wasm\.py::.*PASSED' "$RUNNER_TEMP/pytest.out" || {
+            echo "no test_wasm.py test passed; the guest toolchain skipped it:" >&2
+            grep -E 'SKIPPED|feature' "$RUNNER_TEMP/pytest.out" >&2 || true
+            exit 1
+          }
 
       # test_capget_fallback.py needs a unitd that actually calls capget(),
       # which a root one never does, so every leg above skips it -- the file
