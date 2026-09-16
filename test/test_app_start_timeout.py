@@ -611,6 +611,7 @@ def test_app_start_timeout_slow_worker_adopted():
         'starting': 0,
         'unaccounted': 0,
         'idle': 1,
+        'detached': 0,
     }
 
     assert client.get(url='/')['status'] == 200, 'the adopted worker serves'
