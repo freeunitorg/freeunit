@@ -198,6 +198,25 @@ if [ "$NXT_HAVE_CGROUP" = "YES" ]; then
 fi
 
 
+# Core sources that carry NXT_TESTS fault-injection hooks.  Each is compiled a
+# second time, with -DNXT_TESTS=1, into the test archive; the objects unitd
+# links are never compiled with the macro defined.  A hook added to a source
+# missing from this list leaves `make tests` with an undefined reference.
+#
+NXT_TESTS_LIB_SRCS=" \
+    src/nxt_application.c \
+    src/nxt_main_process.c \
+    src/nxt_mp.c \
+    src/nxt_port.c \
+    src/nxt_port_rpc.c \
+    src/nxt_port_socket.c \
+    src/nxt_random.c \
+    src/nxt_router.c \
+"
+
+NXT_LIB_TEST_STATIC="libnxt-tests.a"
+
+
 if [ $NXT_HAVE_ROOTFS = YES ]; then
     NXT_LIB_SRCS="$NXT_LIB_SRCS src/nxt_fs_mount.c"
 fi
@@ -317,11 +336,6 @@ fi
 
 if [ "$NXT_TEST_BUILD" = "YES" ]; then
     NXT_LIB_SRCS="$NXT_LIB_SRCS $NXT_TEST_BUILD_SRCS"
-fi
-
-
-if [ $NXT_TESTS = YES ]; then
-    nxt_have=NXT_TESTS . auto/have
 fi
 
 

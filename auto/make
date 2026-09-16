@@ -185,11 +185,24 @@ do
     nxt_dep=${nxt_src%.c}.dep
     nxt_dep_flags=`nxt_gen_dep_flags`
     nxt_dep_post=`nxt_gen_dep_post`
+    nxt_test_cflags=
+
+    # NXT_TESTS is a per-object macro.  Only the test sources -- the ones
+    # that call the hooks -- are compiled with it defined; the whole core,
+    # including the sources that carry the hooks, is compiled without it.
+    for nxt_test_src in $NXT_TEST_SRCS
+    do
+        if [ "$nxt_src" = "$nxt_test_src" ]; then
+            nxt_test_cflags=-DNXT_TESTS=1
+            break
+        fi
+    done
+
     cat << END >> $NXT_MAKEFILE
 
 $NXT_BUILD_DIR/$nxt_obj: $nxt_src $NXT_VERSION_H
 	\$(PP_CC) \$@
-	\$(v)\$(CC) -c \$(CFLAGS) \$(NXT_LIB_INCS) $NXT_LIB_AUX_CFLAGS \\
+	\$(v)\$(CC) -c \$(CFLAGS) $nxt_test_cflags \$(NXT_LIB_INCS) $NXT_LIB_AUX_CFLAGS \\
 	-o $NXT_BUILD_DIR/$nxt_obj \\
 	$nxt_dep_flags \\
 	$nxt_src
@@ -244,6 +257,53 @@ $echo >> $NXT_MAKEFILE
 
 if [ $NXT_TESTS = YES ]; then
 
+    # Instrumented core objects.
+    #
+    # The shipped libnxt.a is built from the plain objects above and never
+    # sees NXT_TESTS.  The hooks live in a second copy of the sources that
+    # carry them, compiled here with -DNXT_TESTS=1 and archived separately,
+    # so one `make` serves both the daemon and the test suite.
+
+    $echo "NXT_TEST_VARIANT_OBJS = \\" >> $NXT_MAKEFILE
+
+    for nxt_src in $NXT_TESTS_LIB_SRCS
+    do
+        nxt_obj=${nxt_src%.c}.test.o
+        $echo "	$NXT_BUILD_DIR/$nxt_obj \\" >> $NXT_MAKEFILE
+    done
+
+    $echo >> $NXT_MAKEFILE
+
+    for nxt_src in $NXT_TESTS_LIB_SRCS
+    do
+        nxt_obj=${nxt_src%.c}.test.o
+        nxt_dep=${nxt_src%.c}.test.dep
+        nxt_dep_flags=`nxt_gen_dep_flags`
+        nxt_dep_post=`nxt_gen_dep_post`
+        cat << END >> $NXT_MAKEFILE
+
+$NXT_BUILD_DIR/$nxt_obj: $nxt_src $NXT_VERSION_H
+	\$(PP_CC) \$@
+	\$(v)\$(CC) -c \$(CFLAGS) -DNXT_TESTS=1 \$(NXT_LIB_INCS) $NXT_LIB_AUX_CFLAGS \\
+	-o $NXT_BUILD_DIR/$nxt_obj \\
+	$nxt_dep_flags \\
+	$nxt_src
+	$nxt_dep_post
+
+-include $NXT_BUILD_DIR/$nxt_dep
+
+END
+    done
+
+    cat << END >> $NXT_MAKEFILE
+
+$NXT_BUILD_DIR/lib/$NXT_LIB_TEST_STATIC: \$(NXT_TEST_VARIANT_OBJS)
+	\$(PP_AR) \$@
+	rm -f \$@
+	\$(v)$NXT_STATIC_LINK \$@ \$(NXT_TEST_VARIANT_OBJS)
+
+END
+
     # Test object files list.
 
     $echo "NXT_TEST_OBJS = \\" >> $NXT_MAKEFILE
@@ -268,11 +328,13 @@ tests:		$NXT_BUILD_DIR/tests \\
 			$NXT_BUILD_DIR/unit_port_recv_test
 
 $NXT_BUILD_DIR/tests: \$(NXT_TEST_OBJS) \\
+			$NXT_BUILD_DIR/lib/$NXT_LIB_TEST_STATIC \\
 			$NXT_BUILD_DIR/lib/$NXT_LIB_STATIC \\
 			\$(NXT_OTEL_LIB_STATIC)
 	\$(PP_LD) \$@
 	\$(v)\$(NXT_EXEC_LINK) -o $NXT_BUILD_DIR/tests \\
 		\$(CFLAGS) \$(NXT_TEST_OBJS) \\
+		$NXT_BUILD_DIR/lib/$NXT_LIB_TEST_STATIC \\
 		$NXT_BUILD_DIR/lib/$NXT_LIB_STATIC \$(NXT_OTEL_LIB_STATIC) \\
 		$NXT_LD_OPT $NXT_LIBM $NXT_LIBS $NXT_LIB_AUX_LIBS
 
