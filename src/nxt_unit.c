@@ -3676,8 +3676,16 @@ nxt_unit_ctx_detached_done(nxt_unit_ctx_t *ctx)
      * backpressure).  Keep ctx_impl->detached set so the worker does not
      * drop into an inconsistent state, and retry from the read loop rather
      * than quitting inline inside nxt_unit_process_ready_req().
+     *
+     * Only arm the retry; never lower a count the read loop has already
+     * raised.  A plain assignment would hand every request handler that
+     * returns while the FINISH is still pending a fresh budget, so a worker
+     * serving traffic could postpone the give-up in
+     * nxt_unit_ctx_detached_retry() for as long as the traffic lasts.
      */
-    ctx_impl->detached_retries = 1;
+    if (ctx_impl->detached_retries == 0) {
+        ctx_impl->detached_retries = 1;
+    }
 }
 
 
@@ -3749,6 +3757,17 @@ nxt_unit_test_ctx_set_detached(nxt_unit_ctx_t *ctx, uint8_t val)
     ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
 
     ctx_impl->detached = val;
+}
+
+
+void
+nxt_unit_test_ctx_set_detached_retries(nxt_unit_ctx_t *ctx, uint8_t val)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    ctx_impl->detached_retries = val;
 }
 
 

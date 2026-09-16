@@ -334,6 +334,60 @@ nxt_port_recv_test_detached_single_fail(nxt_unit_ctx_t *ctx)
 
 
 static void
+nxt_port_recv_test_detached_retry_budget(nxt_unit_ctx_t *ctx)
+{
+    int  rc;
+
+    /*
+     * A request handler returning while the FINISH edge is still pending
+     * attempts the send again, but it must not hand the read loop a fresh
+     * retry budget: otherwise a worker that keeps serving requests could
+     * postpone the give-up in nxt_unit_ctx_detached_retry() for as long as
+     * the traffic lasts.
+     *
+     * Three injected failures: the handler return, one read-loop retry, and
+     * a second handler return that must leave the count where the retry put
+     * it (2, not 1).  The fourth attempt then succeeds and clears both.
+     */
+    nxt_unit_test_ctx_set_ready(ctx, 1);
+    nxt_unit_test_ctx_set_detached(ctx, 1);
+    nxt_unit_test_ctx_set_detached_retries(ctx, 0);
+    nxt_unit_test_send_detached_failures(3);
+
+    nxt_unit_test_ctx_detached_done(ctx);
+
+    nxt_port_recv_test_assert(
+        nxt_unit_test_ctx_detached(ctx) == 1
+        && nxt_unit_test_ctx_detached_retries(ctx) == 1,
+        "failed finish send arms the retry budget");
+
+    rc = nxt_unit_test_ctx_detached_retry(ctx);
+
+    nxt_port_recv_test_assert(
+        rc == NXT_UNIT_OK
+        && nxt_unit_test_ctx_detached_retries(ctx) == 2,
+        "read loop spends one retry");
+
+    /* A request handler returns while the FINISH is still pending. */
+    nxt_unit_test_ctx_detached_done(ctx);
+
+    nxt_port_recv_test_assert(
+        nxt_unit_test_ctx_detached(ctx) == 1
+        && nxt_unit_test_ctx_detached_retries(ctx) == 2,
+        "handler return does not reset the retry budget");
+
+    rc = nxt_unit_test_ctx_detached_retry(ctx);
+
+    nxt_port_recv_test_assert(
+        rc == NXT_UNIT_OK
+        && nxt_unit_test_ctx_detached(ctx) == 0
+        && nxt_unit_test_ctx_detached_retries(ctx) == 0
+        && nxt_unit_test_ctx_online(ctx) == 1,
+        "the next successful retry clears the state");
+}
+
+
+static void
 nxt_port_recv_test_detached_persistent_fail(nxt_unit_ctx_t *ctx)
 {
     int    i, rc, status;
@@ -538,6 +592,11 @@ main(void)
         "unrelated fd survives an empty read");
 
 #if (NXT_TESTS)
+    /*
+     * First: it asserts the context stays online, and single_fail leaves
+     * it offline.
+     */
+    nxt_port_recv_test_detached_retry_budget(ctx);
     nxt_port_recv_test_detached_persistent_fail(ctx);
     nxt_port_recv_test_detached_single_fail(ctx);
 #endif
