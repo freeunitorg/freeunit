@@ -1,15 +1,20 @@
 
 name: "Audit (cargo)"
 
-# Every tracked Cargo.lock is checked against the RustSec advisory database.
-# The weekly trigger is what makes this a gate rather than a formality: a new
-# advisory can land against a lock file nobody has touched, and without the
-# schedule the audit would only run when a lock changes.
+# Every tracked Cargo.lock is checked against the RustSec advisory database,
+# and every pkg/contrib source-tarball pin is checked against OSV.  The weekly
+# trigger is what makes this a gate rather than a formality: a new advisory can
+# land against a file nobody has touched, and without the schedule the audit
+# would only run when a lock or a pin changes.
 on:
   pull_request:
     paths:
       - '**/Cargo.lock'
       - '**/Cargo.toml'
+      - 'pkg/contrib/src/*/version'
+      - 'pkg/contrib/src/*/SHA512SUMS'
+      - 'pkg/contrib/check-advisories.py'
+      - 'pkg/eol.json'
       # A change to this file must run this file.
       - .github/workflows/audit.yml
   push:
@@ -18,6 +23,10 @@ on:
     paths:
       - '**/Cargo.lock'
       - '**/Cargo.toml'
+      - 'pkg/contrib/src/*/version'
+      - 'pkg/contrib/src/*/SHA512SUMS'
+      - 'pkg/contrib/check-advisories.py'
+      - 'pkg/eol.json'
       - .github/workflows/audit.yml
   schedule:
     - cron: "0 6 * * 1"
@@ -80,3 +89,15 @@ jobs:
       # open.
       - name: Audit ${{ matrix.lock }}
         run: cargo audit --deny warnings --file '${{ matrix.lock }}'
+
+  pins:
+    # A dependency pinned as a source tarball has no Cargo.lock, so cargo
+    # audit cannot see it; this checks those pins against OSV, which mirrors
+    # the RustSec database and carries the GHSA/CVE aliases.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check source-tarball pins
+        run: python3 pkg/contrib/check-advisories.py
