@@ -176,6 +176,10 @@ typedef struct {
     nxt_http_protocol_t             protocol:8;       /* 2 bits */
     uint8_t                         header_received;  /* 1 bit  */
     uint8_t                         closed;           /* 1 bit  */
+    uint8_t                         num_interim;      /* 1xx responses consumed,
+                                                       * see
+                                                       * NXT_HTTP_MAX_INTERIM_RESPONSES
+                                                       */
 } nxt_http_peer_t;
 
 

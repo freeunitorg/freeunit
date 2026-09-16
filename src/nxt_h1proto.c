@@ -2960,6 +2960,20 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
 }
 
 
+/*
+ * RFC 9110 Sect. 15.2: a 1xx response is interim, and RFC 8297 Sect. 2 lets a
+ * server send more than one "103 Early Hints".  Nothing an upstream sends
+ * bounds how many it may send, so bound them here.  A legitimate origin sends
+ * a "100 Continue" for an "Expect" and at most a few "103"s; past this many the
+ * upstream is looping.  The cap also bounds what one request can make Unit
+ * parse and store for interim responses that it is going to discard: the
+ * fields nxt_http_parse_field_end() collects come from the request pool and are
+ * kept until the request is closed.  Apache's mod_proxy_http allows 10 interim
+ * responses and then answers 502; Go's transport stops at 5.
+ */
+#define NXT_HTTP_MAX_INTERIM_RESPONSES  10
+
+
 static nxt_int_t
 nxt_h1p_peer_header_parse(nxt_http_peer_t *peer, nxt_buf_mem_t *bm)
 {
@@ -3030,7 +3044,21 @@ nxt_h1p_peer_header_parse(nxt_http_peer_t *peer, nxt_buf_mem_t *bm)
          * the client side writes one header per request.  101 is not
          * interim in this sense -- the connection changes protocol -- so it
          * stays the response, as before.
+         *
+         * An upstream that sends them without end is looping: stop it rather
+         * than parse and store interim headers for as long as proxy_timeout
+         * lasts.  The caller turns NXT_ERROR into 502.
          */
+        if (nxt_slow_path(++peer->num_interim
+                          > NXT_HTTP_MAX_INTERIM_RESPONSES))
+        {
+            nxt_log(&peer->request->task, NXT_LOG_WARN,
+                    "upstream sent more than %d interim responses",
+                    NXT_HTTP_MAX_INTERIM_RESPONSES);
+
+            return NXT_ERROR;
+        }
+
         /*
          * The parser keeps no state across the empty line but the fields it
          * collected; discard those.  Nothing points into them: the fields were

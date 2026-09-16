@@ -7,7 +7,10 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        answer to a pipelined request. Unit forwards a client's "Expect:
        100-continue" verbatim, so any upstream that honours it drew the
        100. The proxy now consumes interim responses (101 excepted) and
-       relays the final one.
+       relays the final one; more than ten interim responses in one exchange
+       is an upstream protocol violation and fails the request with 502, so
+       an upstream that loops cannot make Unit parse and discard interim
+       headers without bound.
 
     *) Security: the string form of "access_log" "format" wrote what a
        variable expanded to without escaping it.  "$uri" is the
