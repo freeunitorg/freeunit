@@ -23,6 +23,7 @@ wasmtime: wasmtime-v$(WASMTIME_VERSION)-src.tar.gz .sum-wasmtime
 .wasmtime: wasmtime
 	cd $< && cmake \
 				-DCMAKE_INSTALL_LIBDIR=lib \
+				-DWASMTIME_FEATURE_WASI_HTTP=OFF \
 				-S crates/c-api \
 				-B target/c-api \
 				--install-prefix "$(TOPSRC)/wasmtime/artifacts"
