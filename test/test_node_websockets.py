@@ -369,9 +369,8 @@ def test_node_websockets_protocol_absent():
 
 # autobahn-testsuite
 #
-# Some following tests fail because of Unit does not support UTF-8
-# validation for websocket frames.  It should be implemented
-# by application, if necessary.
+# The router validates the payload of a text message and the reason of a
+# close frame as UTF-8 and fails the connection with 1007 when it is not.
 
 
 def test_node_websockets_1_1_1__1_1_8():
@@ -1042,28 +1041,26 @@ def test_node_websockets_6_1_1__6_4_4():
 
     close_connection(sock)
 
+    # 6_3_1
 
-#        Unit does not support UTF-8 validation
-#
-#        # 6_3_1 FAIL
-#
-#        payload_1 = '\xce\xba\xe1\xbd\xb9\xcf\x83\xce\xbc\xce\xb5'
-#        payload_2 = '\xed\xa0\x80'
-#        payload_3 = '\x65\x64\x69\x74\x65\x64'
-#
-#        payload = payload_1 + payload_2 + payload_3
-#
-#        ws.message(sock, ws.OP_TEXT, payload)
-#        check_close(sock, 1007)
-#
-#        # 6_3_2 FAIL
-#
-#        _, sock, _ = ws.upgrade()
-#
-#        ws.message(sock, ws.OP_TEXT, payload, fragmention_size=1)
-#        check_close(sock, 1007)
-#
-#        # 6_4_1 ... 6_4_4 FAIL
+    _, sock, _ = ws.upgrade()
+
+    # Raw bytes: written as str these would be encoded to valid UTF-8.
+    payload_1 = b'\xce\xba\xe1\xbd\xb9\xcf\x83\xce\xbc\xce\xb5'
+    payload_2 = b'\xed\xa0\x80'
+    payload_3 = b'\x65\x64\x69\x74\x65\x64'
+
+    payload = payload_1 + payload_2 + payload_3
+
+    ws.message(sock, ws.OP_TEXT, payload)
+    check_close(sock, 1007)
+
+    # 6_3_2
+
+    _, sock, _ = ws.upgrade()
+
+    ws.message(sock, ws.OP_TEXT, payload, fragmention_size=1)
+    check_close(sock, 1007)
 
 
 def test_node_websockets_7_1_1__7_5_1():
@@ -1191,16 +1188,17 @@ def test_node_websockets_7_1_1__7_5_1():
     ws.frame_write(sock, ws.OP_CLOSE, payload)
     check_close(sock, 1002)
 
+    # 7_5_1
 
-#        # 7_5_1 FAIL Unit does not support UTF-8 validation
-#
-#        _, sock, _ = ws.upgrade()
-#
-#        payload = ws.serialize_close(reason = '\xce\xba\xe1\xbd\xb9\xcf' \
-#            '\x83\xce\xbc\xce\xb5\xed\xa0\x80\x65\x64\x69\x74\x65\x64')
-#
-#        ws.frame_write(sock, ws.OP_CLOSE, payload)
-#        check_close(sock, 1007)
+    _, sock, _ = ws.upgrade()
+
+    # A raw reason: 0xed 0xa0 0x80 is a surrogate, which has no valid UTF-8
+    # encoding.
+    payload = ws.serialize_close() + b'\xce\xba\xe1\xbd\xb9\xcf' \
+        b'\x83\xce\xbc\xce\xb5\xed\xa0\x80\x65\x64\x69\x74\x65\x64'
+
+    ws.frame_write(sock, ws.OP_CLOSE, payload)
+    check_close(sock, 1007)
 
 
 def test_node_websockets_7_7_X__7_9_X():

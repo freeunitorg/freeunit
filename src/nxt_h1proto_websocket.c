@@ -34,6 +34,11 @@ static void hxt_h1p_send_ws_error(nxt_task_t *task, nxt_http_request_t *r,
     const nxt_ws_error_t *err, ...);
 static void nxt_h1p_conn_ws_error_sent(nxt_task_t *task, void *obj, void *data);
 static void nxt_h1p_conn_ws_pong(nxt_task_t *task, void *obj, void *data);
+static size_t nxt_h1p_ws_utf8_seqlen(u_char c);
+static nxt_int_t nxt_h1p_ws_utf8_begin(const u_char *seq, size_t n);
+static nxt_int_t nxt_h1p_ws_utf8_validate(nxt_h1p_ws_utf8_t *state,
+    nxt_buf_t *b, u_char *start, size_t skip, size_t length,
+    const u_char *mask, nxt_uint_t final);
 
 static const nxt_conn_state_t  nxt_h1p_read_ws_frame_header_state;
 static const nxt_conn_state_t  nxt_h1p_read_ws_frame_payload_state;
@@ -71,6 +76,12 @@ static const nxt_ws_error_t  nxt_ws_err_cont_expected = {
 static const nxt_ws_error_t  nxt_ws_err_invalid_length = {
     NXT_WEBSOCKET_CR_PROTOCOL_ERROR,
     0, nxt_string("Invalid extended payload length") };
+static const nxt_ws_error_t  nxt_ws_err_invalid_utf8 = {
+    NXT_WEBSOCKET_CR_INVALID_DATA,
+    0, nxt_string("Invalid UTF-8") };
+static const nxt_ws_error_t  nxt_ws_err_truncated = {
+    NXT_WEBSOCKET_CR_PROTOCOL_ERROR,
+    0, nxt_string("Frame shorter than its header") };
 
 void
 nxt_h1p_websocket_first_frame_start(nxt_task_t *task, nxt_http_request_t *r,
@@ -326,6 +337,21 @@ nxt_h1p_conn_ws_frame_header_read(nxt_task_t *task, void *obj, void *data)
                                       wsh->opcode);
                 return;
             }
+
+            /*
+             * A message starts here: remember whether its payload is text,
+             * and drop a sequence the previous message left incomplete.  A
+             * frame with an RSV bit set belongs to an extension this router
+             * does not implement (RFC 6455 Section 5.2; RFC 7692 Section 6
+             * puts the "Per-Message Compressed" bit, RSV1, on the first
+             * fragment of a compressed data message), so its bytes are not
+             * text until the application has decoded them.
+             */
+            h1p->websocket_text = (wsh->opcode == NXT_WEBSOCKET_OP_TEXT
+                                   && wsh->rsv1 == 0
+                                   && wsh->rsv2 == 0
+                                   && wsh->rsv3 == 0);
+            nxt_memzero(&h1p->websocket_utf8, sizeof(nxt_h1p_ws_utf8_t));
         }
 
         h1p->websocket_cont_expected = !wsh->fin;
@@ -410,13 +436,190 @@ nxt_h1p_conn_ws_keepalive_enable(nxt_task_t *task, nxt_h1proto_t *h1p)
 }
 
 
+/*
+ * Returns the length of the UTF-8 sequence a lead byte announces, or 0 when
+ * the byte cannot begin one.  C0 and C1 have only overlong two-byte
+ * encodings and F5..FF are beyond U+10FFFF, so neither can lead a sequence
+ * (RFC 3629 Section 3).  Shortest form, surrogates, and the byte ranges that
+ * apply only after E0, ED, F0 and F4 are left to nxt_utf8_decode().
+ */
+static size_t
+nxt_h1p_ws_utf8_seqlen(u_char c)
+{
+    if (c >= 0xF0) {
+        return (c <= 0xF4) ? 4 : 0;
+    }
+
+    if (c >= 0xE0) {
+        return 3;
+    }
+
+    return (c >= 0xC2) ? 2 : 0;
+}
+
+
+/*
+ * Decides whether the "n" bytes at "seq", the whole or the beginning of one
+ * UTF-8 sequence, can be a valid character: NXT_OK when they already are,
+ * NXT_AGAIN when a continuation is still needed, NXT_ERROR when no byte
+ * following them can repair the sequence.
+ *
+ * A partial sequence is completed with the smallest continuation bytes a
+ * valid encoding could have and handed to nxt_utf8_decode(), so that this
+ * test cannot drift from the decoder that finally accepts the bytes: E0 must
+ * be followed by A0..BF, F0 by 90..BF and F4 by 80..8F, or the character is
+ * overlong or beyond U+10FFFF however the sequence ends.
+ */
+static nxt_int_t
+nxt_h1p_ws_utf8_begin(const u_char *seq, size_t n)
+{
+    u_char         buf[4];
+    size_t         len;
+    const u_char  *p;
+
+    len = nxt_h1p_ws_utf8_seqlen(seq[0]);
+
+    if (nxt_slow_path(len == 0)) {
+        return NXT_ERROR;
+    }
+
+    if (n < len) {
+        nxt_memcpy(buf, seq, n);
+
+        if (n == 1) {
+            switch (seq[0]) {
+            case 0xE0:
+                buf[n++] = 0xA0;
+                break;
+            case 0xF0:
+                buf[n++] = 0x90;
+                break;
+            default:
+                buf[n++] = 0x80;
+            }
+        }
+
+        while (n < 4) {
+            buf[n++] = 0x80;
+        }
+
+        p = buf;
+
+        if (nxt_utf8_decode(&p, buf + 4) == 0xFFFFFFFF) {
+            return NXT_ERROR;
+        }
+
+        return NXT_AGAIN;
+    }
+
+    p = seq;
+
+    if (nxt_utf8_decode(&p, seq + n) == 0xFFFFFFFF) {
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+
+/*
+ * Validates the payload of a data or close frame as UTF-8.  "length" bytes
+ * are read from "start", the first payload byte in "b"; the rest of the
+ * frame, if it did not fit in one buffer, follows in the "next" chain.  The
+ * payload is raw, so every byte is unmasked with mask[i % 4] as it is read,
+ * "i" being its offset from the first byte of the payload.  "skip" bytes
+ * before "start" are stepped over: they are the close code, which is not
+ * text.
+ *
+ * A sequence the end of the frame cut short is kept in "state" and completed
+ * by the frame that continues the message.  With "final" set the payload
+ * must end on a character boundary, as a message and a close reason do.
+ */
+static nxt_int_t
+nxt_h1p_ws_utf8_validate(nxt_h1p_ws_utf8_t *state, nxt_buf_t *b, u_char *start,
+    size_t skip, size_t length, const u_char *mask, nxt_uint_t final)
+{
+    u_char         c, seq[4];
+    size_t         i, n;
+    const u_char  *p, *end;
+    nxt_buf_t     *in;
+
+    in = b;
+    p = start;
+    end = in->mem.free;
+
+    for (i = 0; i < skip + length; /* void */) {
+
+        while (nxt_slow_path(p >= end)) {
+            in = in->next;
+
+            if (nxt_slow_path(in == NULL)) {
+                /*
+                 * The frame is shorter than its header says, which cannot
+                 * happen: a frame is buffered whole before it is handled
+                 * here.  Answered apart from invalid UTF-8 so that a reader
+                 * fault is not reported as an encoding one.
+                 */
+                return NXT_DECLINED;
+            }
+
+            p = in->mem.start;
+            end = in->mem.free;
+        }
+
+        c = *p++ ^ mask[i % 4];
+        i++;
+
+        if (nxt_slow_path(i <= skip)) {
+            continue;
+        }
+
+        if (nxt_fast_path(state->len == 0 && c < 0x80)) {
+            continue;
+        }
+
+        nxt_memcpy(seq, state->tail, state->len);
+        seq[state->len] = c;
+        n = state->len + 1;
+
+        switch (nxt_h1p_ws_utf8_begin(seq, n)) {
+
+        case NXT_OK:
+            state->len = 0;
+            break;
+
+        case NXT_AGAIN:
+            if (nxt_slow_path(n > sizeof(state->tail))) {
+                /* Cannot be taken: NXT_AGAIN means n < len <= 4. */
+                return NXT_ERROR;
+            }
+
+            nxt_memcpy(state->tail, seq, n);
+            state->len = n;
+            break;
+
+        default:
+            return NXT_ERROR;
+        }
+    }
+
+    if (nxt_slow_path(final && state->len != 0)) {
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+
 static void
 nxt_h1p_conn_ws_frame_process(nxt_task_t *task, nxt_conn_t *c,
     nxt_h1proto_t *h1p, nxt_websocket_header_t *wsh)
 {
-    size_t              hsize;
+    size_t              hsize, payload_len;
     uint8_t             *p, *mask;
     uint16_t            code;
+    nxt_int_t           res;
+    nxt_h1p_ws_utf8_t   utf8;
     nxt_http_request_t  *r;
 
     r = h1p->request;
@@ -444,9 +647,74 @@ nxt_h1p_conn_ws_frame_process(nxt_task_t *task, nxt_conn_t *c,
                                       code);
                 return;
             }
+
+            /*
+             * RFC 6455 Section 5.5.1: the reason is UTF-8-encoded.  It does
+             * not continue the message in progress, so it is validated
+             * against its own state and must be complete.  Unlike a data
+             * frame it is read with an RSV bit set: permessage-deflate and
+             * its relatives apply to data messages only (RFC 7692
+             * Section 6), and the 2-byte code above is read the same way.
+             */
+            if (wsh->payload_len > 2) {
+                payload_len = (size_t) nxt_websocket_frame_payload_len(wsh);
+
+                nxt_memzero(&utf8, sizeof(nxt_h1p_ws_utf8_t));
+
+                res = nxt_h1p_ws_utf8_validate(&utf8, r->ws_frame, p, 2,
+                                               payload_len - 2, mask, 1);
+
+                if (nxt_slow_path(res != NXT_OK)) {
+                    hxt_h1p_send_ws_error(task, r,
+                                          (res == NXT_DECLINED)
+                                          ? &nxt_ws_err_truncated
+                                          : &nxt_ws_err_invalid_utf8);
+                    return;
+                }
+            }
         }
 
         h1p->websocket_closed = 1;
+        nxt_memzero(&h1p->websocket_utf8, sizeof(nxt_h1p_ws_utf8_t));
+
+    } else if (h1p->websocket_text
+               && (wsh->opcode == NXT_WEBSOCKET_OP_TEXT
+                   || wsh->opcode == NXT_WEBSOCKET_OP_CONT))
+    {
+        if (nxt_slow_path(wsh->rsv1 != 0 || wsh->rsv2 != 0
+                          || wsh->rsv3 != 0))
+        {
+            /*
+             * Some extension defines this frame (RFC 6455 Section 5.2), so
+             * neither it nor what follows in the message can be read as
+             * text here.
+             */
+            h1p->websocket_text = 0;
+
+        } else {
+            /*
+             * RFC 6455 Section 5.6: a text message is UTF-8 text however
+             * many frames it is split into, and Section 8.1 fails the
+             * connection on data it cannot interpret; Section 7.4.1 gives
+             * the close code for that, 1007.  Binary messages are not text
+             * and are passed on unread.
+             */
+            hsize = nxt_websocket_frame_header_size(wsh);
+            mask = nxt_pointer_to(wsh, hsize - 4);
+            payload_len = (size_t) nxt_websocket_frame_payload_len(wsh);
+
+            res = nxt_h1p_ws_utf8_validate(&h1p->websocket_utf8, r->ws_frame,
+                                           nxt_pointer_to(wsh, hsize), 0,
+                                           payload_len, mask, wsh->fin);
+
+            if (nxt_slow_path(res != NXT_OK)) {
+                hxt_h1p_send_ws_error(task, r,
+                                      (res == NXT_DECLINED)
+                                      ? &nxt_ws_err_truncated
+                                      : &nxt_ws_err_invalid_utf8);
+                return;
+            }
+        }
     }
 
     r->state->ready_handler(task, r, NULL);
