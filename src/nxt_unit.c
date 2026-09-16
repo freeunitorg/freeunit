@@ -3717,6 +3717,20 @@ nxt_unit_ctx_detached_retry(nxt_unit_ctx_t *ctx)
     if (++ctx_impl->detached_retries > 10) {
         lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
 
+        /*
+         * Closing the main context is what makes the router settle this
+         * process's detached state: the flag hangs off the main port, the
+         * one with id 0, and only closing that runs
+         * nxt_router_app_port_close().  libunit allows a worker several
+         * contexts, but this recovery does not -- a non-main context
+         * closing alone would leave the worker flagged detached, and its
+         * application reference, for the life of the process.  PHP, the
+         * only caller of nxt_unit_request_done_detached(), runs one
+         * context.  A second would need this recovery reworked, not a
+         * different argument to nxt_unit_quit().  It stays a comment
+         * because nxt_assert() needs a thread context that libunit does
+         * not link.
+         */
         nxt_unit_alert(ctx, "failed to report detached finish, closing worker");
         nxt_unit_quit(&lib->main_ctx.ctx, NXT_QUIT_NORMAL);
         return NXT_UNIT_ERROR;
