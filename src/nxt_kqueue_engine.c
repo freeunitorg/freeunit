@@ -59,6 +59,8 @@ static void nxt_kqueue_disable(nxt_event_engine_t *engine, nxt_fd_event_t *ev);
 static void nxt_kqueue_delete(nxt_event_engine_t *engine, nxt_fd_event_t *ev);
 static nxt_bool_t nxt_kqueue_close(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
+static void nxt_kqueue_cancel_changes(nxt_event_engine_t *engine,
+    nxt_fd_event_t *ev);
 static void nxt_kqueue_enable_read(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
 static void nxt_kqueue_enable_write(nxt_event_engine_t *engine,
@@ -142,6 +144,7 @@ const nxt_event_interface_t  nxt_kqueue_engine = {
     nxt_kqueue_disable,
     nxt_kqueue_delete,
     nxt_kqueue_close,
+    nxt_kqueue_cancel_changes,
     nxt_kqueue_enable_read,
     nxt_kqueue_enable_write,
     nxt_kqueue_disable_read,
@@ -314,6 +317,54 @@ nxt_kqueue_close(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 
 
 /*
+ * Take this event's pending changes out of the batch, so that a struct that
+ * is about to be freed is not dereferenced when the batch is flushed -- by
+ * nxt_kqueue_get_kevent() when it fills, or by nxt_kqueue_poll().
+ *
+ * The change is dropped rather than flushed: the descriptor is closed, or is
+ * about to be, and kqueue(2) removes every kevent that references a
+ * descriptor when the descriptor is closed.  Flushing instead would name a
+ * descriptor number that may already belong to somebody else.
+ *
+ * Matching is on ->udata, which nxt_kqueue_fd_set() sets to the event; that
+ * names the struct being freed exactly, where ->ident names only a
+ * descriptor number.  nxt_kqueue_file_set() puts a file event in the same
+ * field, and a pointer comparison tells the two apart on its own.
+ *
+ * Unlike the other engines this does not return early when ->changing is
+ * clear.  Here the flag is only ever a "maybe" -- a flush leaves it set,
+ * for the reason nxt_kqueue_fd_set() gives -- so the scan is what decides,
+ * and it costs a walk of at most ->mchanges entries.
+ */
+
+static void
+nxt_kqueue_cancel_changes(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
+{
+    struct kevent  *kev, *dst, *end;
+
+    dst = engine->u.kqueue.changes;
+    end = dst + engine->u.kqueue.nchanges;
+
+    for (kev = dst; kev < end; kev++) {
+
+        if (nxt_kevent_get_udata(kev->udata) == (void *) ev) {
+            continue;
+        }
+
+        if (dst != kev) {
+            *dst = *kev;
+        }
+
+        dst++;
+    }
+
+    engine->u.kqueue.nchanges = (int) (dst - engine->u.kqueue.changes);
+
+    ev->changing = 0;
+}
+
+
+/*
  * The kqueue event engine uses only three states: inactive, blocked, and
  * active.  An active oneshot event is marked as it is in the default
  * state.  The event will be converted eventually to the default EV_CLEAR
@@ -450,6 +501,25 @@ nxt_kqueue_fd_set(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
               engine->u.kqueue.fd, ev->fd, filter, flags);
 
     kev = nxt_kqueue_get_kevent(engine);
+
+    /*
+     * ->changing says a change for this event may be buffered.  It is what
+     * the generic callers test before they ask for a cancel, so kqueue has
+     * to set it even though no kqueue path reads it -- nxt_kqueue_close()
+     * scans by descriptor, and nxt_kqueue_cancel_changes() scans by ->udata
+     * without testing the flag.
+     *
+     * A flush does not clear it, because the batch mixes fd events with the
+     * file events nxt_kqueue_file_set() puts in the same ->udata field, and
+     * nothing in a kevent says which of the two it holds: clearing the flag
+     * over a flushed batch would write through an nxt_file_event_t as if it
+     * were an nxt_fd_event_t.  So the flag only ever says "maybe", and the
+     * cost of that is a scan that finds nothing.  It is never stale in the
+     * unsafe direction: it is set whenever a change is queued, and cleared
+     * only once the batch has been scanned.
+     */
+
+    ev->changing = 1;
 
     kev->ident = ev->fd;
     kev->filter = filter;

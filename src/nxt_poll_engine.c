@@ -34,6 +34,8 @@ static void nxt_poll_disable(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
 static nxt_bool_t nxt_poll_close(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
+static void nxt_poll_cancel_changes(nxt_event_engine_t *engine,
+    nxt_fd_event_t *ev);
 static void nxt_poll_enable_read(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
 static void nxt_poll_enable_write(nxt_event_engine_t *engine,
@@ -73,6 +75,7 @@ const nxt_event_interface_t  nxt_poll_engine = {
     nxt_poll_disable,
     nxt_poll_disable,
     nxt_poll_close,
+    nxt_poll_cancel_changes,
     nxt_poll_enable_read,
     nxt_poll_enable_write,
     nxt_poll_disable_read,
@@ -315,6 +318,46 @@ nxt_poll_change(nxt_event_engine_t *engine, nxt_fd_event_t *ev, nxt_uint_t op,
     change->op = op;
     change->events = events;
     change->event = ev;
+}
+
+
+/*
+ * Take this event's pending changes out of the batch, so that a struct that
+ * is about to be freed is not dereferenced by nxt_poll_commit_changes().
+ *
+ * The change is dropped rather than committed: the descriptor is closed, or
+ * is about to be, so the change would name a descriptor number that may
+ * already belong to somebody else.
+ */
+
+static void
+nxt_poll_cancel_changes(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
+{
+    nxt_poll_change_t  *change, *dst, *end;
+
+    if (!ev->changing) {
+        return;
+    }
+
+    dst = engine->u.poll.changes;
+    end = dst + engine->u.poll.nchanges;
+
+    for (change = dst; change < end; change++) {
+
+        if (change->event == ev) {
+            continue;
+        }
+
+        if (dst != change) {
+            *dst = *change;
+        }
+
+        dst++;
+    }
+
+    engine->u.poll.nchanges = (nxt_uint_t) (dst - engine->u.poll.changes);
+
+    ev->changing = 0;
 }
 
 
