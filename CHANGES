@@ -23,6 +23,15 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        is not valid UTF-8 with U+FFFD before it serializes.
 
     *) Change: upgrade contrib njs to 1.0.1.
+
+    *) Bugfix: a port that was closed and freed could leave a pending epoll
+       or kqueue change behind it. The change is held by a pointer into the
+       port, and is applied when the batch is committed -- at the top of the
+       next poll at the latest, which is after the port's memory pool is
+       released. The commit then read freed memory, and could also name a
+       descriptor number the kernel had already handed to somebody else. A
+       port now drops its pending changes before it is freed (#414).
+
     *) Bugfix: a process could stop hearing from a peer for good. When the
        wake-up that tells a peer to read the shared queue failed because
        the kernel could not allocate for it, the port treated the peer as
