@@ -211,31 +211,6 @@ else
 fi
 
 
-nxt_feature="PHP TrueAsync API (zend_async_event_t)"
-nxt_feature_name=""
-nxt_feature_run=no
-nxt_feature_incs="${NXT_PHP_INCLUDE}"
-nxt_feature_libs="${NXT_PHP_LIB} ${NXT_PHP_LDFLAGS}"
-nxt_feature_test="
-    #include <php.h>
-
-    int main(void) {
-        zend_async_event_t *e = NULL;
-        (void) e;
-        return 0;
-    }"
-
-. auto/feature
-
-if [ $nxt_found = yes ]; then
-    NXT_PHP_TRUEASYNC=1
-    $echo " + PHP TrueAsync: enabled"
-else
-    NXT_PHP_TRUEASYNC=0
-    $echo " + PHP TrueAsync: not available (standard mode only)"
-fi
-
-
 nxt_feature="PHP sapi_module_struct pre_request_init field"
 nxt_feature_name=""
 nxt_feature_run=no
@@ -642,7 +617,6 @@ $NXT_BUILD_DIR/$nxt_obj:	$nxt_src $NXT_VERSION_H
 	\$(PP_CC) \$@
 	\$(v)\$(CC) -c \$(CFLAGS) $NXT_PHP_ADDITIONAL_FLAGS \$(NXT_INCS) \\
 	$NXT_PHP_INCLUDE -DNXT_ZEND_SIGNAL_STARTUP=$NXT_ZEND_SIGNAL_STARTUP \\
-	-DNXT_PHP_TRUEASYNC=$NXT_PHP_TRUEASYNC \\
 	-DNXT_PHP_PRE_REQUEST_INIT=$NXT_PHP_PRE_REQUEST_INIT \\
 	-DNXT_PHP_MOUNTS_H=\"$NXT_PHP_MOUNTS_HEADER\" \\
 	$nxt_dep_flags \\
