@@ -345,6 +345,16 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        The OpenSSL backend is unaffected; none of these files were
        ever part of a default build.
 
+    *) Change: removed the PHP TrueAsync code path. It was written for a
+       "zend_async_event_t" API expected in PHP 8.5 core, which did not ship
+       it, so the configure probe never succeeded and the code sat behind
+       "#if NXT_PHP_TRUEASYNC" in every build. It could not have compiled had
+       the probe succeeded: it reads "async" and "entrypoint" members that
+       "nxt_php_app_conf_t" does not have and calls "nxt_php_extension_init()",
+       which no file in the tree defines. The probe, the "entrypoint" target
+       key and the TrueAsync test suite are removed with it; a PHP application
+       builds and behaves as before.
+
 
 Changes with FreeUnit 1.36.1                                     28 Aug 2026
 
