@@ -12,6 +12,18 @@
 
 <change type="bugfix">
 <para>
+an application worker that served a WebSocket upgrade never became idle again.
+The router counts a session on the worker and keeps a worker with a session out
+of the idle queues, but nothing uncounted the session when it ended, so the
+process stayed out of them for good: its idle timer never ran and its slot
+counted against "processes": {"max"} until it died, which an application that
+serves WebSockets reaches one upgrade at a time.  A session is now uncounted
+when it ends, whichever side ends it; the bug had appeared in 1.19.0.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 an application that answered a request and kept running was counted idle.  PHP
 does this whenever a script calls fastcgi_finish_request(): the response goes
 out, the script runs on, and the router returned the worker's slot to
