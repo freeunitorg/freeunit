@@ -792,8 +792,62 @@ jobs:
       - name: Configure unit (--tests)
         run: ./configure --openssl --tests
 
+      # The shipped daemon must not carry the fault-injection hooks that
+      # `--tests` builds for build/tests.  Since `make` now produces unitd from
+      # the plain archive and build/tests from libnxt-tests.a, this is a
+      # property of the build, not a hope: assert it here, where it can fail
+      # loudly, rather than discovering it with nm on a release artifact.
+      #
+      # Layer 1: no hook symbol may appear in unitd.  nxt_mp_test_sizes() is
+      # deliberately ungated (it validates pool parameters and is part of the
+      # normal API), so it is excluded by name.
+      - name: Build unitd and assert it carries no test hooks
+        run: |
+          make -j4 unitd
+
+          if nm build/sbin/unitd \
+              | grep -E 'nxt_(mp|random|router|port|port_rpc|main|proto)_test' \
+              | grep -v 'nxt_mp_test_sizes'; then
+            echo "::error::build/sbin/unitd exports NXT_TESTS hooks; the" \
+                 "shipped daemon must be built without them"
+            exit 1
+          fi
+
+          echo "unitd is free of test hooks"
+
       - name: Build C tests
         run: make -j4 tests
+
+      # Layer 2: the hooks still have to exist where the C tests can call them,
+      # or the suite silently loses its fault-injection coverage.
+      - name: Assert build/tests carries every test hook
+        run: |
+          missing=0
+
+          for sym in \
+              nxt_port_test_msg_alloc_failures \
+              nxt_port_test_run_error_handler \
+              nxt_port_test_run_read_msg_process \
+              nxt_port_test_broadcasts \
+              nxt_port_rpc_test_alloc_failures \
+              nxt_port_rpc_test_insert_failures \
+              nxt_mp_test_retain_count \
+              nxt_random_test \
+              nxt_router_test_temp_conf \
+              nxt_router_test_app_rpc_create \
+              nxt_main_test_process_new_failures \
+              nxt_main_test_run_start_process_handler \
+              nxt_main_test_run_file_store \
+              nxt_proto_test_run_start_process_handler
+          do
+            if ! nm build/tests | grep -q " $sym\$"; then
+              echo "::error::build/tests is missing $sym -- a source was" \
+                   "probably dropped from NXT_TESTS_LIB_SRCS in auto/sources"
+              missing=1
+            fi
+          done
+
+          exit $missing
 
       - name: Run C tests
         run: sudo ./build/tests
