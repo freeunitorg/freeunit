@@ -131,7 +131,7 @@
       "role": "WebAssembly runtime built by pkg/contrib and linked by the wasm module (pkg/contrib/src/wasmtime/version, WASMTIME_VERSION)",
       "version": "47.0.4",
       "eol": null,
-      "eol_note": "Fetched as a source tarball from packages.freeunit.org, so cargo audit never sees it: it reads Cargo.lock files only. Covered by the Audit (cargo) pins job, which queries OSV for the version in pkg/contrib/src/wasmtime/version, so an advisory here arrives as a red job rather than silence. Same 47.0.4 as the wasmtime_crate pin; the 43.0.1 bump closed RUSTSEC-2026-0269 (filesystem sandbox escape), -0222, -0114, and wasmtime-wasi -0149, -0182 and -0188 (WASI path and file-permission bypasses). Tracked in freeunitorg/freeunit#400.",
+      "eol_note": "Fetched as a source tarball from packages.freeunit.org, so its Cargo.lock is not among the repository locks. The Audit (cargo) pins job verifies the tarball digest, queries OSV for the direct source-package pin, and audits the archived Cargo.lock, so an advisory here arrives as a red job rather than silence. That lock is the whole Wasmtime workspace, so pkg/contrib/check-lock-audit.py fails it only for a crate the C API library links, with pkg/contrib/wasmtime-lock-audit.allow.json recording the accepted ones; the archive is vendored, so a finding moves only when the pin does. Same 47.0.4 as the wasmtime_crate pin; the 43.0.1 bump closed RUSTSEC-2026-0269 (filesystem sandbox escape), -0222, -0114, and wasmtime-wasi -0149, -0182 and -0188 (WASI path and file-permission bypasses). Tracked in freeunitorg/freeunit#400.",
       "source": "https://github.com/bytecodealliance/wasmtime/releases"
     },
     "wasmtime_crate": {

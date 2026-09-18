@@ -1,0 +1,26 @@
+{
+  "comment": [
+    "Findings against crates that the Wasmtime C API library links, and that",
+    "pkg/contrib cannot resolve by bumping the pin.  check-lock-audit.py fails",
+    "the audit on any other linked finding.  A finding outside the linked graph",
+    "needs no entry here; it is reported and ignored.",
+    "The version is part of the key, so a pin bump forces this file to be",
+    "reviewed again rather than carrying an acceptance forward silently."
+  ],
+  "allow": [
+    {
+      "kind": "vulnerability",
+      "id": "RUSTSEC-2026-0204",
+      "package": "crossbeam-epoch",
+      "version": "0.9.18",
+      "reason": "Linked through rayon, which wasmtime pulls in for the parallel-compilation feature. The bug is an invalid pointer dereference in the fmt::Pointer impl of Atomic and Shared; neither wasmtime nor Unit formats an epoch pointer, so no call site reaches it. The archive is vendored and cannot be relocked, and wasmtime 48.x already resolves crossbeam-epoch 0.9.20, so the next pin bump clears this."
+    },
+    {
+      "kind": "yanked",
+      "id": null,
+      "package": "chacha20",
+      "version": "0.10.0",
+      "reason": "Linked through rand, which wasmtime-wasi uses to seed guest randomness. A yank is not an advisory: no RustSec record applies to this version. 0.10.1 is yanked as well and 0.10.2 is clean, but the archive is vendored, so the version moves only when the pin does."
+    }
+  ]
+}

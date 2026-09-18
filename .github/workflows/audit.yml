@@ -11,9 +11,17 @@ on:
     paths:
       - '**/Cargo.lock'
       - '**/Cargo.toml'
-      - 'pkg/contrib/src/*/version'
-      - 'pkg/contrib/src/*/SHA512SUMS'
+      # Only wasmtime: both scripts hardcode that pin, so firing this job
+      # for an njs or wasi-sysroot change would report a green that covers
+      # nothing.  The Makefile is here because its build flags decide which
+      # crates the audit gate treats as linked.
+      - 'pkg/contrib/src/wasmtime/version'
+      - 'pkg/contrib/src/wasmtime/SHA512SUMS'
+      - 'pkg/contrib/src/wasmtime/Makefile'
       - 'pkg/contrib/check-advisories.py'
+      - 'pkg/contrib/check-lock-audit.py'
+      - 'pkg/contrib/test_check_lock_audit.py'
+      - 'pkg/contrib/wasmtime-lock-audit.allow.json'
       - 'pkg/eol.json'
       # A change to this file must run this file.
       - .github/workflows/audit.yml
@@ -23,9 +31,17 @@ on:
     paths:
       - '**/Cargo.lock'
       - '**/Cargo.toml'
-      - 'pkg/contrib/src/*/version'
-      - 'pkg/contrib/src/*/SHA512SUMS'
+      # Only wasmtime: both scripts hardcode that pin, so firing this job
+      # for an njs or wasi-sysroot change would report a green that covers
+      # nothing.  The Makefile is here because its build flags decide which
+      # crates the audit gate treats as linked.
+      - 'pkg/contrib/src/wasmtime/version'
+      - 'pkg/contrib/src/wasmtime/SHA512SUMS'
+      - 'pkg/contrib/src/wasmtime/Makefile'
       - 'pkg/contrib/check-advisories.py'
+      - 'pkg/contrib/check-lock-audit.py'
+      - 'pkg/contrib/test_check_lock_audit.py'
+      - 'pkg/contrib/wasmtime-lock-audit.allow.json'
       - 'pkg/eol.json'
       - .github/workflows/audit.yml
   schedule:
@@ -91,13 +107,78 @@ jobs:
         run: cargo audit --deny warnings --file '${{ matrix.lock }}'
 
   pins:
-    # A dependency pinned as a source tarball has no Cargo.lock, so cargo
-    # audit cannot see it; this checks those pins against OSV, which mirrors
-    # the RustSec database and carries the GHSA/CVE aliases.
+    # A dependency pinned as a source tarball has a lock file inside the
+    # archive, but it is not tracked in this repository.  Check the direct
+    # source-package pins against OSV, then audit the archived lock.  That
+    # lock covers the whole Wasmtime workspace while Unit links one C API
+    # library, so check-lock-audit.py fails only on a finding against a crate
+    # that library actually links, and only when the allowlist does not carry
+    # a reason for that exact version.
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
 
+      - run: rustup update stable
+
       - name: Check source-tarball pins
         run: python3 pkg/contrib/check-advisories.py
+
+      - name: Test the lock audit gate
+        run: |
+          pip install --disable-pip-version-check --quiet pytest
+          python3 -m pytest pkg/contrib/test_check_lock_audit.py
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Resolve the Wasmtime pin
+        id: pin
+        run: |
+          version="$(sed -n -E 's/^WASMTIME_VERSION := ([0-9.]+)$/\1/p' \
+            pkg/contrib/src/wasmtime/version)"
+          test -n "$version"
+          echo "archive=wasmtime-v${version}-src.tar.gz" >> "$GITHUB_OUTPUT"
+
+      # The archive is immutable and its digest is committed, so this is one
+      # download per pin instead of 190 MB on every run and every Monday.  The
+      # digest is checked below either way, so a poisoned entry still fails.
+      - name: Cache the Wasmtime source archive
+        uses: actions/cache@v4
+        with:
+          path: ~/wasmtime-archive
+          key: >-
+            wasmtime-src-${{ hashFiles('pkg/contrib/src/wasmtime/SHA512SUMS') }}
+
+      - name: Unpack the Wasmtime source archive
+        run: |
+          archive="${{ steps.pin.outputs.archive }}"
+          mkdir -p ~/wasmtime-archive
+          # --retry because on a scheduled gate a mirror blip and an advisory
+          # must not both show up as a red job.
+          test -f ~/"wasmtime-archive/$archive" || \
+            curl --fail --location --show-error --retry 3 --retry-delay 5 \
+              --output ~/"wasmtime-archive/$archive" \
+              "https://packages.freeunit.org/wasmtime/$archive"
+          digest="$(awk -v archive="$archive" '$2 == archive { print $1 }' \
+            pkg/contrib/src/wasmtime/SHA512SUMS)"
+          test -n "$digest"
+          printf '%s  %s\n' "$digest" ~/"wasmtime-archive/$archive" \
+            | sha512sum --check
+          mkdir "$RUNNER_TEMP/wasmtime"
+          tar -xzf ~/"wasmtime-archive/$archive" --strip-components=1 \
+            --directory "$RUNNER_TEMP/wasmtime"
+
+      - name: Audit the Wasmtime source lock
+        run: |
+          # cargo audit exits non-zero on any finding, and the archived lock
+          # covers the whole Wasmtime workspace, so the report is the input to
+          # the gate rather than the verdict.  An empty report is a failure:
+          # check-lock-audit.py rejects anything that is not a cargo audit run.
+          cargo audit --json --file "$RUNNER_TEMP/wasmtime/Cargo.lock" \
+            > "$RUNNER_TEMP/audit.json" || true
+          python3 pkg/contrib/check-lock-audit.py \
+            --report "$RUNNER_TEMP/audit.json" \
+            --tree "$RUNNER_TEMP/wasmtime"
