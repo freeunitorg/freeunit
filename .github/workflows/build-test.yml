@@ -426,7 +426,7 @@ jobs:
       # flags and the same objects, compiled once for the whole run instead
       # of once per leg.  Only this leg's own module is built below.
       - name: Download the core build
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: unit-core-build
           path: /tmp
