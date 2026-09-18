@@ -604,6 +604,64 @@ nxt_port_recv_test_deferred_quit_read(nxt_unit_ctx_t *ctx, int run_ctx,
 
 
 static void
+nxt_port_recv_test_deferred_quit_port_msg(nxt_unit_ctx_t *ctx,
+    const char *name)
+{
+    int    rc;
+    pid_t  pid;
+
+    /*
+     * An embedder that drives its own event loop never enters a libunit
+     * read loop, so nxt_unit_process_port_msg() is the only wake-up the
+     * retry can run from.  Without it the FINISH edge is never re-sent and
+     * the router holds the worker detached.  The retry here completes a
+     * deferred graceful quit, which removes the read port, so the call must
+     * also report "no message" instead of receiving: the alarm catches a
+     * wait for a message the router will never send.
+     */
+
+    pid = fork();
+
+    if (pid == 0) {
+        nxt_port_recv_test_block = 1;
+
+        nxt_unit_test_ctx_set_ready(ctx, 1);
+        nxt_unit_test_ctx_set_detached(ctx, 1);
+        nxt_unit_test_ctx_set_detached_retries(ctx, 0);
+
+        nxt_unit_test_ctx_quit_graceful(ctx);
+
+        /* One failure: the handler return arms the retry, the retry sends. */
+        nxt_unit_test_send_detached_failures(1);
+        nxt_unit_test_ctx_detached_done(ctx);
+
+        if (nxt_unit_test_ctx_detached(ctx) != 1
+            || nxt_unit_test_ctx_detached_retries(ctx) != 1)
+        {
+            _exit(1);
+        }
+
+        alarm(5);
+
+        rc = nxt_unit_process_port_msg(ctx,
+                                       nxt_unit_test_ctx_read_port(ctx));
+
+        if (rc != NXT_UNIT_AGAIN
+            || nxt_unit_test_ctx_online(ctx) != 0
+            || nxt_unit_test_ctx_detached(ctx) != 0
+            || nxt_unit_test_ctx_detached_retries(ctx) != 0)
+        {
+            _exit(2);
+        }
+
+        _exit(0);
+    }
+
+    nxt_port_recv_test_child_wait(pid, name);
+}
+
+
+static void
 nxt_port_recv_test_detached_persistent_fail(nxt_unit_ctx_t *ctx)
 {
     int    i, rc, status;
@@ -825,6 +883,8 @@ main(void)
         "nxt_unit_run() returns on a retry that completes a quit");
     nxt_port_recv_test_deferred_quit_read(ctx, 1,
         "nxt_unit_run_ctx() returns on a retry that completes a quit");
+    nxt_port_recv_test_deferred_quit_port_msg(ctx,
+        "nxt_unit_process_port_msg() runs a pending finish retry");
     nxt_port_recv_test_detached_single_fail(ctx);
 #endif
 
