@@ -215,6 +215,7 @@ nxt_int_t nxt_http_parse_request(nxt_http_request_parse_t *rp,
     nxt_buf_mem_t *b);
 nxt_int_t nxt_http_parse_fields(nxt_http_request_parse_t *rp,
     nxt_buf_mem_t *b);
+void nxt_http_parse_fields_reset(nxt_http_request_parse_t *rp);
 
 nxt_int_t nxt_http_fields_hash(nxt_lvlhsh_t *hash,
     nxt_http_field_proc_t items[], nxt_uint_t count);

@@ -2879,13 +2879,10 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
          * releases the request pool.
          *
          * The predicate is the "final response" one, not the full RFC list:
-         * a 1xx from an upstream is an interim response, and nothing here
-         * continues the exchange past it -- nxt_h1p_peer_header_parse() only
-         * reads a status line while peer->status is still NXT_HTTP_UNSET, so
-         * the 1xx is taken as the response and whatever follows is relayed as
-         * its body.  That is pre-existing and out of scope; ending the
-         * exchange on the 1xx header here would discard a final response that
-         * may already be sitting in this very buffer.
+         * a 1xx from an upstream is an interim response, and
+         * nxt_h1p_peer_header_parse() consumes it and reads on, so it never
+         * reaches here.  Ending the exchange on a 1xx header would discard a
+         * final response that may already be sitting in this very buffer.
          *
          * "b" is not forwarded: bytes an upstream put after the header of a
          * bodyless response are not a body.  It is handed to
@@ -2963,48 +2960,135 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
 }
 
 
+/*
+ * RFC 9110 Sect. 15.2: a 1xx response is interim, and RFC 8297 Sect. 2 lets a
+ * server send more than one "103 Early Hints".  Nothing an upstream sends
+ * bounds how many it may send, so bound them here.  A legitimate origin sends
+ * a "100 Continue" for an "Expect" and at most a few "103"s; past this many the
+ * upstream is looping.  The cap also bounds what one request can make Unit
+ * parse and store for interim responses that it is going to discard: the
+ * fields nxt_http_parse_field_end() collects come from the request pool and are
+ * kept until the request is closed.  Apache's mod_proxy_http allows 10 interim
+ * responses and then answers 502; Go's transport stops at 5.
+ */
+#define NXT_HTTP_MAX_INTERIM_RESPONSES  10
+
+
 static nxt_int_t
 nxt_h1p_peer_header_parse(nxt_http_peer_t *peer, nxt_buf_mem_t *bm)
 {
-    u_char     *p;
-    size_t     length;
-    nxt_int_t  status;
+    u_char                    *p;
+    size_t                    length;
+    nxt_int_t                 ret, status;
+    nxt_http_request_parse_t  *rp;
 
-    if (peer->status < 0) {
-        length = nxt_buf_mem_used_size(bm);
+    rp = &peer->proto.h1->parser;
 
-        if (nxt_slow_path(length < 12)) {
-            return NXT_AGAIN;
+    for ( ;; ) {
+        if (peer->status < 0) {
+            length = nxt_buf_mem_used_size(bm);
+
+            if (nxt_slow_path(length < 12)) {
+                return NXT_AGAIN;
+            }
+
+            p = bm->pos;
+
+            if (nxt_slow_path(memcmp(p, "HTTP/1.", 7) != 0
+                              || (p[7] != '0' && p[7] != '1')))
+            {
+                return NXT_ERROR;
+            }
+
+            status = nxt_int_parse(&p[9], 3);
+
+            if (nxt_slow_path(status < 0)) {
+                return NXT_ERROR;
+            }
+
+            p += 12;
+            length -= 12;
+
+            p = memchr(p, '\n', length);
+
+            if (nxt_slow_path(p == NULL)) {
+                return NXT_AGAIN;
+            }
+
+            bm->pos = p + 1;
+            peer->status = status;
         }
 
-        p = bm->pos;
+        ret = nxt_http_parse_fields(rp, bm);
 
-        if (nxt_slow_path(memcmp(p, "HTTP/1.", 7) != 0
-                          || (p[7] != '0' && p[7] != '1')))
+        if (ret != NXT_DONE
+            || peer->status < NXT_HTTP_CONTINUE
+            || peer->status >= NXT_HTTP_OK
+            || peer->status == NXT_HTTP_SWITCHING_PROTOCOLS)
         {
+            return ret;
+        }
+
+        /*
+         * RFC 9110 Sect. 15.2: a 1xx response is interim; the final response
+         * follows it on the same connection.  An upstream sends "100
+         * Continue" for the "Expect: 100-continue" that
+         * nxt_h1p_peer_header_send() forwards from the client verbatim, and
+         * "103 Early Hints" on its own.  Taking the first status line as the
+         * response relayed the 1xx header to the client and whatever came
+         * after it as the body.
+         *
+         * Drop the interim response and read on for the next status line.
+         * Nothing relays it: the request body was sent to the upstream in
+         * full with the header, so the client has nothing to continue, and
+         * the client side writes one header per request.  101 is not
+         * interim in this sense -- the connection changes protocol -- so it
+         * stays the response, as before.
+         *
+         * An upstream that sends them without end is looping: stop it rather
+         * than parse and store interim headers for as long as proxy_timeout
+         * lasts.  The caller turns NXT_ERROR into 502.
+         */
+        if (nxt_slow_path(++peer->num_interim
+                          > NXT_HTTP_MAX_INTERIM_RESPONSES))
+        {
+            nxt_log(&peer->request->task, NXT_LOG_WARN,
+                    "upstream sent more than %d interim responses",
+                    NXT_HTTP_MAX_INTERIM_RESPONSES);
+
             return NXT_ERROR;
         }
 
-        status = nxt_int_parse(&p[9], 3);
+        /*
+         * The parser keeps no state across the empty line but the fields it
+         * collected; discard those.  Nothing points into them: the fields were
+         * never processed.
+         */
+        nxt_http_parse_fields_reset(rp);
 
-        if (nxt_slow_path(status < 0)) {
-            return NXT_ERROR;
+        peer->status = NXT_HTTP_UNSET;
+
+        /*
+         * The interim bytes are reclaimed so that the final header has the
+         * whole header buffer, which the read handler never grows.
+         *
+         * This is the only point where that is legal: the field parser has
+         * returned NXT_DONE, so it holds no cursor into the buffer.  It cannot
+         * be deferred to the next read either -- the reclaim is what gives the
+         * final header its room, and a read that filled the buffer mid-header
+         * could not be compacted at all.  Moving these bytes invalidates every
+         * pointer into the consumed region, so a future relay of the interim
+         * response has to serialise its fields before this point.
+         */
+        length = bm->free - bm->pos;
+
+        if (length != 0) {
+            nxt_memmove(bm->start, bm->pos, length);
         }
 
-        p += 12;
-        length -= 12;
-
-        p = memchr(p, '\n', length);
-
-        if (nxt_slow_path(p == NULL)) {
-            return NXT_AGAIN;
-        }
-
-        bm->pos = p + 1;
-        peer->status = status;
+        bm->pos = bm->start;
+        bm->free = bm->start + length;
     }
-
-    return nxt_http_parse_fields(&peer->proto.h1->parser, bm);
 }
 
 
