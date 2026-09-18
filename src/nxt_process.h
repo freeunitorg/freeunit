@@ -141,6 +141,21 @@ struct nxt_process_s {
 
 
     nxt_pid_t                isolated_pid;
+
+    /*
+     * The pid of this process in the pid namespace of the process that
+     * forked it, where that is not the namespace this one runs in.  Main
+     * records it from the WHOAMI message; everywhere else it is zero, and
+     * zero means "no such name", because a pid namespace never hands out 0.
+     *
+     * ->pid stays the global key.  This is the only name the parent has for
+     * a child that has not completed the PROCESS_CREATED handshake, so it is
+     * the only name it can report such a child's death with; see
+     * nxt_proto_child_exited() in src/nxt_application.c and the
+     * NXT_PORT_MSG_REMOVE_CHILD_PID handler in src/nxt_main_process.c.
+     */
+    nxt_pid_t                parent_ns_pid;
+
     const char               *name;
     nxt_port_t               *parent_port;
 

@@ -60,6 +60,8 @@ static void nxt_proto_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 static void nxt_proto_process_created_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static void nxt_proto_quit_children(nxt_task_t *task);
+static void nxt_proto_report_child_pid(nxt_task_t *task,
+    nxt_process_t *process, nxt_uint_t level);
 static void nxt_proto_kill_silent(nxt_task_t *task, void *obj, void *data);
 static nxt_process_t *nxt_proto_process_find(nxt_task_t *task, nxt_pid_t pid);
 static void nxt_proto_process_add(nxt_task_t *task, nxt_process_t *process);
@@ -1277,15 +1279,21 @@ nxt_proto_sigchld_handler(nxt_task_t *task, void *obj, void *data)
  * sibling's ports drops requests, which is worse than the leak, so that case
  * is left alone and logged.
  *
- * Closing it belongs on the other side.  The prototype cannot map its
- * namespace-local pid to a global one, but main can map the other way without
- * trusting anybody: it holds the global pid from SCM_CREDENTIALS at WHOAMI
- * time, and the last entry of /proc/<pid>/status NSpid is that process's pid
- * in its own namespace (Linux 4.1+).  Recording that as a second key, plus a
- * REMOVE_PID variant scoped to one prototype's children, would close it with
- * no sender-supplied pid to authenticate.  msg->port_msg.pid on the WHOAMI
- * message happens to carry the same number, but it is chosen by the sender and
- * would need the authentication NSpid makes unnecessary.
+ * So the report goes to main alone, and it is main that resolves it: the
+ * prototype cannot map its namespace-local pid to a global one, but main
+ * holds both names.  It read the global pid from SCM_CREDENTIALS at WHOAMI
+ * time, and the same message carried the worker's namespace-local pid in its
+ * header, which is the number this function has.
+ * NXT_PORT_MSG_REMOVE_CHILD_PID carries that number and is resolved only
+ * among the children of the sender the kernel names, so no pid crosses a
+ * namespace it does not belong to.  See nxt_main_process_name_child() and
+ * nxt_main_remove_child_pid_handler() in src/nxt_main_process.c.
+ *
+ * Main is also the only process that needs telling.  The router hears of a
+ * worker through the PROCESS_READY that follows PROCESS_CREATED, which this
+ * one never sent, and its start RPC has already been answered above; main
+ * notifies it by the global pid anyway once it has one, which costs nothing
+ * and keeps the two paths identical from the router's side.
  */
 
 void
@@ -1407,10 +1415,10 @@ nxt_proto_child_exited(nxt_task_t *task, nxt_process_t *process)
      */
 
     if (nxt_slow_path(rt->is_pid_isolated)) {
-        nxt_log(task, level, "app process (isolated %PI) died before it was "
-                "created; it has no globally valid pid to broadcast, so a "
-                "record the main or router process may hold for it stays "
-                "until the prototype exits", process->isolated_pid);
+        nxt_debug(task, "app process (isolated %PI) died before it was "
+                  "created", process->isolated_pid);
+
+        nxt_proto_report_child_pid(task, process, level);
 
         /* No REMOVE_PID will carry it; do not leave it armed. */
         process->stream = 0;
@@ -1419,6 +1427,71 @@ nxt_proto_child_exited(nxt_task_t *task, nxt_process_t *process)
     }
 
     nxt_port_remove_notify_others(task, process);
+}
+
+
+/*
+ * Tell main that a child of this prototype died, naming it by the pid this
+ * namespace knows it by.  Streamless, like the REMOVE_PID of the branch
+ * above and for the same reason: the start initiator has already been
+ * answered directly, and a second answer could land on a stream the shared
+ * counter has since handed to somebody else.
+ *
+ * Ordering is not a race even though the worker's WHOAMI and this message
+ * come from two processes.  Both are written to the single write end of
+ * main's port socketpair, inherited by every descendant, so they share one
+ * kernel queue: the worker's WHOAMI write completes before it exits, and
+ * this runs only after waitpid() has reaped it.  A WHOAMI that never reached
+ * the socket died with the worker, and main has no record to retire.
+ */
+
+static void
+nxt_proto_report_child_pid(nxt_task_t *task, nxt_process_t *process,
+    nxt_uint_t level)
+{
+    nxt_buf_t      *buf;
+    nxt_port_t     *main_port;
+    nxt_runtime_t  *rt;
+
+    rt = task->thread->runtime;
+
+    main_port = rt->port_by_type[NXT_PROCESS_MAIN];
+
+    if (nxt_fast_path(main_port != NULL)) {
+        buf = nxt_buf_mem_ts_alloc(task, task->thread->engine->mem_pool,
+                                   sizeof(nxt_pid_t));
+
+        if (nxt_fast_path(buf != NULL)) {
+            buf->mem.free = nxt_cpymem(buf->mem.free, &process->isolated_pid,
+                                       sizeof(nxt_pid_t));
+
+            if (nxt_fast_path(nxt_port_socket_write(task, main_port,
+                                              NXT_PORT_MSG_REMOVE_CHILD_PID,
+                                              -1, 0, 0, buf)
+                              == NXT_OK))
+            {
+                return;
+            }
+
+            /* Still ours: the port layer takes the buffer only on NXT_OK. */
+
+            nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                               buf->completion_handler, task, buf,
+                               buf->parent);
+        }
+    }
+
+    /*
+     * The message is the only vehicle, so a failure here is the leak this
+     * function exists to close: main keeps the record and the descriptor it
+     * made at WHOAMI time until the prototype itself exits, which is what
+     * it did for every such worker before the message existed.
+     */
+
+    nxt_log(task, level, "app process (isolated %PI) died before it was "
+            "created and could not be reported to the main process, which "
+            "keeps the record it holds for it until this prototype exits",
+            process->isolated_pid);
 }
 
 
