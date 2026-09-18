@@ -6944,6 +6944,20 @@ adjust_use:
 }
 
 
+#if (NXT_TESTS)
+
+/* For src/test/nxt_router_websocket_test.c. */
+
+void
+nxt_router_test_app_port_release(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_t *port, nxt_apr_action_t action)
+{
+    nxt_router_app_port_release(task, app, port, action);
+}
+
+#endif
+
+
 void
 nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
 {
