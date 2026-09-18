@@ -13,7 +13,6 @@
 #define NXT_PORT_MAX_ENQUEUE_BUF_SIZE \
           (int) (NXT_PORT_QUEUE_MSG_SIZE - sizeof(nxt_port_msg_t))
 
-
 static nxt_bool_t nxt_port_can_enqueue_buf(nxt_buf_t *b);
 static uint8_t nxt_port_enqueue_buf(nxt_task_t *task, nxt_port_msg_t *pm,
     void *qbuf, nxt_buf_t *b);
@@ -25,6 +24,11 @@ static nxt_int_t nxt_port_write_msgs(nxt_task_t *task, void *obj,
     void *data, nxt_bool_t *send_failed);
 static void nxt_port_write_handler(nxt_task_t *task, void *obj, void *data);
 static nxt_port_send_msg_t *nxt_port_msg_first(nxt_port_t *port);
+nxt_inline nxt_bool_t nxt_port_msg_has_fd(const nxt_port_send_msg_t *msg);
+nxt_inline void nxt_port_msg_fd_uncount_locked(nxt_port_t *port,
+    nxt_port_send_msg_t *msg);
+static void nxt_port_msg_fd_uncount(nxt_port_t *port,
+    nxt_port_send_msg_t *msg);
 nxt_inline void nxt_port_msg_close_fd(nxt_port_send_msg_t *msg);
 nxt_inline void nxt_port_close_fds(nxt_fd_t *fd);
 static nxt_buf_t *nxt_port_buf_completion(nxt_task_t *task,
@@ -472,7 +476,11 @@ static nxt_int_t
 nxt_port_msg_chk_insert(nxt_task_t *task, nxt_port_t *port,
     nxt_port_send_msg_t *msg)
 {
-    nxt_int_t  res;
+    nxt_int_t   res;
+    nxt_bool_t  has_fd, over_bound;
+
+    has_fd = nxt_port_msg_has_fd(msg);
+    over_bound = 0;
 
     nxt_thread_mutex_lock(&port->write_mutex);
 
@@ -481,11 +489,30 @@ nxt_port_msg_chk_insert(nxt_task_t *task, nxt_port_t *port,
     {
         res = NXT_DECLINED;
 
+    } else if (nxt_slow_path(has_fd
+                             && port->fd_messages >= NXT_PORT_MAX_FD_MSGS))
+    {
+        /*
+         * Refuse rather than drop.  NXT_ERROR from here says nothing of the
+         * message was consumed and it is still the caller's -- the same
+         * answer this function already gives when nxt_port_msg_alloc()
+         * fails, and the contract in src/nxt_port.h -- so every caller that
+         * sends a descriptor already has cleanup for it.
+         */
+
+        over_bound = 1;
+        res = NXT_ERROR;
+
     } else {
         msg = nxt_port_msg_alloc(msg);
 
         if (nxt_fast_path(msg != NULL)) {
             nxt_queue_insert_tail(&port->messages, &msg->link);
+
+            if (has_fd) {
+                port->fd_messages++;
+            }
+
             nxt_port_use(task, port, 1);
             res = NXT_OK;
 
@@ -495,6 +522,13 @@ nxt_port_msg_chk_insert(nxt_task_t *task, nxt_port_t *port,
     }
 
     nxt_thread_mutex_unlock(&port->write_mutex);
+
+    if (nxt_slow_path(over_bound)) {
+        nxt_alert(task, "port{%d,%d} %d: %d queued messages already hold a "
+                  "descriptor, refusing to queue another",
+                  (int) port->pid, (int) port->id, port->socket.fd,
+                  NXT_PORT_MAX_FD_MSGS);
+    }
 
     return res;
 }
@@ -541,7 +575,8 @@ nxt_port_msg_alloc(const nxt_port_send_msg_t *m)
      *
      * The dup holds the descriptor until the message goes out, so a peer
      * that stops reading holds this side's descriptor table open in
-     * proportion to what it was sent; port->messages has no bound.
+     * proportion to what it was sent.  That is what NXT_PORT_MAX_FD_MSGS
+     * bounds; the callers of this function check it before they get here.
      */
 
     if (!msg->close_fd && nxt_slow_path(nxt_port_msg_dup_fds(msg) != NXT_OK)) {
@@ -913,6 +948,8 @@ next_fragment:
                 goto fail;
             }
 
+            nxt_port_msg_fd_uncount(port, msg);
+
             nxt_port_msg_close_fd(msg);
 
             msg->buf = nxt_port_buf_completion(task, wq, msg->buf, plain_size,
@@ -1173,6 +1210,8 @@ nxt_port_socket_cancel(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
             break;
         }
 
+        nxt_port_msg_fd_uncount_locked(port, msg);
+
         nxt_queue_remove(&msg->link);
         msg->link.next = NULL;
 
@@ -1243,6 +1282,51 @@ nxt_port_msg_first(nxt_port_t *port)
     nxt_thread_mutex_unlock(&port->write_mutex);
 
     return msg;
+}
+
+
+nxt_inline nxt_bool_t
+nxt_port_msg_has_fd(const nxt_port_send_msg_t *msg)
+{
+    return msg->fd[0] != -1 || msg->fd[1] != -1;
+}
+
+
+/*
+ * Stop counting a queued message against NXT_PORT_MAX_FD_MSGS.
+ *
+ * The count follows one invariant: an entry of port->messages is counted
+ * exactly while it carries a descriptor.  So this runs at the two moments
+ * that end it -- the message leaves the queue, or it is still queued but has
+ * just had its descriptors sent -- and must run before whatever clears
+ * msg->fd[], since that is what it reads.  msg->link.next is the queue's own
+ * "is it in the list" marker, which keeps the inline stack copy in
+ * nxt_port_socket_write2() out of the count.
+ *
+ * The _locked form is for the callers that already hold port->write_mutex.
+ */
+
+nxt_inline void
+nxt_port_msg_fd_uncount_locked(nxt_port_t *port, nxt_port_send_msg_t *msg)
+{
+    if (msg->link.next != NULL && nxt_port_msg_has_fd(msg)) {
+        port->fd_messages--;
+    }
+}
+
+
+static void
+nxt_port_msg_fd_uncount(nxt_port_t *port, nxt_port_send_msg_t *msg)
+{
+    if (msg->link.next == NULL || !nxt_port_msg_has_fd(msg)) {
+        return;
+    }
+
+    nxt_thread_mutex_lock(&port->write_mutex);
+
+    port->fd_messages--;
+
+    nxt_thread_mutex_unlock(&port->write_mutex);
 }
 
 
@@ -1336,20 +1420,49 @@ nxt_port_buf_completion(nxt_task_t *task, nxt_work_queue_t *wq, nxt_buf_t *b,
 }
 
 
+/*
+ * The bound applies here as well: this is the other way a descriptor-carrying
+ * message enters port->messages, when an inline first fragment hits EAGAIN and
+ * has to be held for a later attempt.  Answering NULL is what an allocation
+ * failure already answers, and nxt_port_write_msgs() turns both into the same
+ * "nothing was consumed" NXT_ERROR for a first fragment.
+ */
+
 static nxt_port_send_msg_t *
 nxt_port_msg_insert_tail(nxt_port_t *port, nxt_port_send_msg_t *msg)
 {
+    nxt_bool_t  has_fd;
+
+    has_fd = nxt_port_msg_has_fd(msg);
+
+    nxt_thread_mutex_lock(&port->write_mutex);
+
+    if (nxt_slow_path(has_fd && port->fd_messages >= NXT_PORT_MAX_FD_MSGS)) {
+        nxt_thread_mutex_unlock(&port->write_mutex);
+
+        nxt_thread_log_alert("port{%d,%d}: %d queued messages already hold a "
+                             "descriptor, refusing to queue another",
+                             (int) port->pid, (int) port->id,
+                             NXT_PORT_MAX_FD_MSGS);
+
+        return NULL;
+    }
+
     if (msg->allocated == 0) {
         msg = nxt_port_msg_alloc(msg);
 
         if (nxt_slow_path(msg == NULL)) {
+            nxt_thread_mutex_unlock(&port->write_mutex);
+
             return NULL;
         }
     }
 
-    nxt_thread_mutex_lock(&port->write_mutex);
-
     nxt_queue_insert_tail(&port->messages, &msg->link);
+
+    if (has_fd) {
+        port->fd_messages++;
+    }
 
     nxt_thread_mutex_unlock(&port->write_mutex);
 
@@ -2201,6 +2314,8 @@ nxt_port_error_handler(nxt_task_t *task, void *obj, void *data)
     nxt_thread_mutex_lock(&port->write_mutex);
 
     nxt_queue_each(msg, &port->messages, nxt_port_send_msg_t, link) {
+
+        nxt_port_msg_fd_uncount_locked(port, msg);
 
         nxt_port_msg_close_fd(msg);
 
