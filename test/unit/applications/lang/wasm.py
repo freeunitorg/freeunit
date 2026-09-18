@@ -31,6 +31,21 @@ class ApplicationWasm(ApplicationProto):
 
         output = temp_dir / f'{script}.wasm'
 
+        # One -Wl, argument: clang splits it on commas and hands each piece to
+        # the linker, so "-z stack-size=..." stays a linker option.
+        link_flags = '-Wl,' + ','.join(
+            [
+                '--no-entry',
+                '--export=__heap_base',
+                '--export=__data_end',
+                '--export=malloc',
+                '--export=free',
+                '--stack-first',
+                '-z',
+                'stack-size=8388608',
+            ]
+        )
+
         command = [
             clang,
             f'-I{include}',
@@ -40,9 +55,7 @@ class ApplicationWasm(ApplicationProto):
             '-g',
             '-std=gnu11',
             '-fno-common',
-            '-Wl,--no-entry,--export=__heap_base,--export=__data_end,'
-            '--export=malloc,--export=free,--stack-first,'
-            '-z,stack-size=8388608',
+            link_flags,
             '-mexec-model=reactor',
             '--rtlib=compiler-rt',
             str(source),

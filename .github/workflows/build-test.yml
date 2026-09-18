@@ -668,7 +668,7 @@ jobs:
       - name: Install wasm guest toolchain
         run: |
           sudo apt install -y clang lld
-          sudo apt install -y "libclang-rt-$(clang -dumpversion)-dev-wasm32"
+          sudo apt install -y "libclang-rt-$(clang -dumpversion | cut -d. -f1)-dev-wasm32"
         if: steps.metadata.outputs.module == 'wasm'
 
       ##
