@@ -37,6 +37,13 @@ typedef enum {
     NXT_APR_GOT_RESPONSE,
     NXT_APR_UPGRADE,
     NXT_APR_CLOSE,
+    /*
+     * The close of a request that NXT_APR_UPGRADE turned into a websocket.
+     * It is the counterpart of that action: it drops the reference the way
+     * NXT_APR_CLOSE does and also takes the session off the worker's
+     * active_websockets count.
+     */
+    NXT_APR_WEBSOCKET_CLOSE,
 } nxt_apr_action_t;
 
 

@@ -5578,7 +5578,14 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
             nxt_thread_mutex_unlock(&app->mutex);
 
             nxt_router_app_port_release(task, app, app_port, NXT_APR_UPGRADE);
-            req_rpc_data->apr_action = NXT_APR_CLOSE;
+
+            /*
+             * The count above is undone by this action, and only by it:
+             * nxt_request_rpc_data_unlink() is the one path that runs for a
+             * websocket that ends, whichever side ends it, and ->app_port is
+             * still this port when it does.
+             */
+            req_rpc_data->apr_action = NXT_APR_WEBSOCKET_CLOSE;
 
             nxt_debug(task, "stream #%uD upgrade", req_rpc_data->stream);
 
@@ -6843,7 +6850,7 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     nxt_apr_action_t action)
 {
     int         inc_use;
-    uint32_t    got_response, dec_requests;
+    uint32_t    got_response, dec_requests, dec_websockets;
     nxt_bool_t  adjust_idle_timer;
     nxt_port_t  *main_app_port;
 
@@ -6852,6 +6859,7 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     inc_use = 0;
     got_response = 0;
     dec_requests = 0;
+    dec_websockets = 0;
 
     switch (action) {
     case NXT_APR_NEW_PORT:
@@ -6870,11 +6878,21 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     case NXT_APR_CLOSE:
         inc_use = -1;
         break;
+    case NXT_APR_WEBSOCKET_CLOSE:
+        dec_websockets = 1;
+        inc_use = -1;
+        break;
     }
 
-    nxt_debug(task, "app '%V' release port %PI:%d: %d %d", &app->name,
+    nxt_debug(task, "app '%V' release port %PI:%d: %d %d %d", &app->name,
               port->pid, port->id,
-              (int) inc_use, (int) got_response);
+              (int) inc_use, (int) got_response, (int) dec_websockets);
+
+    /*
+     * A websocket is upgraded from a request a worker has answered, so the
+     * port it is released on is that worker's own port, never the shared one.
+     */
+    nxt_assert(dec_websockets == 0 || port->id != NXT_SHARED_PORT_ID);
 
     if (port->id == NXT_SHARED_PORT_ID) {
         nxt_thread_mutex_lock(&app->mutex);
@@ -6891,6 +6909,7 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     nxt_thread_mutex_lock(&app->mutex);
 
     main_app_port->active_requests -= got_response + dec_requests;
+    main_app_port->active_websockets -= dec_websockets;
     app->active_requests -= got_response + dec_requests;
 
     if (main_app_port->pair[1] != -1 && main_app_port->app_link.next == NULL) {
@@ -7910,12 +7929,15 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
      * or closes.  See nxt_router_app_abandon().
      *
      * An upgraded stream is not such a request.  Its accounting was already
-     * given back by NXT_APR_UPGRADE, so there is no slot being held and
-     * nothing to keep out of the idle economy; the mark would only report the
-     * worker "detached" for as long as the connection lives.  The websocket
-     * state is the upgrade itself -- it is assigned beside that release, and
-     * nowhere else -- so a handshake still in flight or one that failed, both
-     * of which do hold their accounting, still reach the abandon.
+     * given back by NXT_APR_UPGRADE, so no worker is running it and there is
+     * no slot to hold; what does keep the port out of the idle economy is the
+     * session count, and that one is settled by the unlink below, because the
+     * upgrade left NXT_APR_WEBSOCKET_CLOSE as the action.  The mark would
+     * instead report the worker "detached" for as long as the connection
+     * lives.  The websocket state is the upgrade itself -- it is assigned
+     * beside that release, and nowhere else -- so a handshake still in flight
+     * or one that failed, both of which do hold their accounting, still reach
+     * the abandon.
      */
     if (req_rpc_data->app_port != NULL
         && req_rpc_data->app_port->id != NXT_SHARED_PORT_ID

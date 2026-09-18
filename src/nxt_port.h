@@ -334,17 +334,19 @@ struct nxt_port_s {
     /* Maximum interleave of message parts. */
     uint32_t            max_share;
 
+    /*
+     * Websocket sessions upgraded from a request this worker answered.  A
+     * session is counted by NXT_APR_UPGRADE and uncounted by
+     * NXT_APR_WEBSOCKET_CLOSE, both in nxt_router_app_port_release().
+     */
     uint32_t            active_websockets;
 
     /*
      * The application answered a request on this port and kept running.
      * Treated exactly like active_websockets by the idle transition in
-     * nxt_router_app_port_release(): the port stays in app->ports and in
+     * nxt_router_app_port_idle(): the port stays in app->ports and in
      * app->processes, and stays out of the idle queues, so the reaper
      * never sees it and it keeps counting against "processes": {"max"}.
-     *
-     * Unlike active_websockets this one is cleared again, when the
-     * application reports the work finished.
      */
     uint8_t             detached;
 
