@@ -604,6 +604,227 @@ nxt_port_recv_test_deferred_quit_read(nxt_unit_ctx_t *ctx, int run_ctx,
 
 
 static void
+nxt_port_recv_test_deferred_quit_port_msg(nxt_unit_ctx_t *ctx,
+    const char *name)
+{
+    int    rc;
+    pid_t  pid;
+
+    /*
+     * An embedder that drives its own event loop never enters a libunit
+     * read loop, so nxt_unit_process_port_msg() is the only wake-up the
+     * retry can run from.  Without it the FINISH edge is never re-sent and
+     * the router holds the worker detached.  The retry here completes a
+     * deferred graceful quit, which removes the read port, so the call must
+     * also report "no message" instead of receiving: the alarm catches a
+     * wait for a message the router will never send.
+     */
+
+    pid = fork();
+
+    if (pid == 0) {
+        nxt_port_recv_test_block = 1;
+
+        nxt_unit_test_ctx_set_ready(ctx, 1);
+        nxt_unit_test_ctx_set_detached(ctx, 1);
+        nxt_unit_test_ctx_set_detached_retries(ctx, 0);
+
+        nxt_unit_test_ctx_quit_graceful(ctx);
+
+        /* One failure: the handler return arms the retry, the retry sends. */
+        nxt_unit_test_send_detached_failures(1);
+        nxt_unit_test_ctx_detached_done(ctx);
+
+        if (nxt_unit_test_ctx_detached(ctx) != 1
+            || nxt_unit_test_ctx_detached_retries(ctx) != 1)
+        {
+            _exit(1);
+        }
+
+        alarm(5);
+
+        rc = nxt_unit_process_port_msg(ctx,
+                                       nxt_unit_test_ctx_read_port(ctx));
+
+        if (rc != NXT_UNIT_AGAIN
+            || nxt_unit_test_ctx_online(ctx) != 0
+            || nxt_unit_test_ctx_detached(ctx) != 0
+            || nxt_unit_test_ctx_detached_retries(ctx) != 0)
+        {
+            _exit(2);
+        }
+
+        _exit(0);
+    }
+
+    nxt_port_recv_test_child_wait(pid, name);
+}
+
+
+static void
+nxt_port_recv_test_port_msg_retry_pending(nxt_unit_ctx_t *ctx,
+    const char *name)
+{
+    int              rc, calls;
+    pid_t            pid;
+    struct timespec  end, start;
+
+    /*
+     * A retry that fails again leaves the context online with the FINISH
+     * still pending, and nothing else will wake the embedder: its read port
+     * stays quiet until unrelated traffic arrives.  The call must report
+     * NXT_UNIT_OK, which an embedder reschedules on, and not NXT_UNIT_AGAIN,
+     * which stops it and strands the worker detached.  Reads block, so the
+     * alarm catches an unbounded wait, and the elapsed time catches a
+     * reschedule that spins through the budget instead of pacing it.
+     */
+
+    pid = fork();
+
+    if (pid == 0) {
+        nxt_port_recv_test_block = 1;
+
+        nxt_unit_test_ctx_set_ready(ctx, 1);
+        nxt_unit_test_ctx_set_detached(ctx, 1);
+        nxt_unit_test_ctx_set_detached_retries(ctx, 0);
+        nxt_unit_test_send_detached_failures(20);
+
+        nxt_unit_test_ctx_detached_done(ctx);
+
+        if (nxt_unit_test_ctx_detached_retries(ctx) != 1) {
+            _exit(1);
+        }
+
+        alarm(10);
+
+        (void) clock_gettime(CLOCK_MONOTONIC, &start);
+
+        for (calls = 1; calls <= 20; calls++) {
+            rc = nxt_unit_process_port_msg(ctx,
+                                           nxt_unit_test_ctx_read_port(ctx));
+            if (rc != NXT_UNIT_OK) {
+                break;
+            }
+        }
+
+        (void) clock_gettime(CLOCK_MONOTONIC, &end);
+
+        /*
+         * Nine calls report "call me again", the tenth reaches the give-up
+         * that closes the worker rather than leaving it detached for good.
+         */
+
+        if (rc != NXT_UNIT_ERROR || calls != 10) {
+            _exit(2);
+        }
+
+        if (nxt_unit_test_ctx_online(ctx) != 0
+            || nxt_unit_test_ctx_detached_retries(ctx) != 11)
+        {
+            _exit(3);
+        }
+
+        if ((end.tv_sec - start.tv_sec) * 1000000000L
+            + (end.tv_nsec - start.tv_nsec) < 100000000L)
+        {
+            _exit(4);
+        }
+
+        _exit(0);
+    }
+
+    nxt_port_recv_test_child_wait(pid, name);
+}
+
+
+static void
+nxt_port_recv_test_shared_quit_retry(nxt_unit_ctx_t *ctx, unsigned int fails,
+    int expect, const char *name)
+{
+    int              rc;
+    pid_t            pid;
+    struct timespec  end, start;
+
+    /*
+     * The shared loop ends when nxt_unit_chk_ready() turns false, and that
+     * happens with a finish retry pending: a graceful quit deferred on the
+     * detached state clears ->ready, and the request that ended the
+     * detached work can be the one that reached "request_limit".  The loop
+     * must run the retry before it leaves, or the router holds the worker
+     * detached and the deferred quit never completes.  Nothing is ready, so
+     * no read reaches the shared port; the alarm catches a wait anyway.
+     */
+
+    pid = fork();
+
+    if (pid == 0) {
+        nxt_unit_test_ctx_set_ready(ctx, 1);
+        nxt_unit_test_ctx_set_detached(ctx, 1);
+        nxt_unit_test_ctx_set_detached_retries(ctx, 0);
+
+        nxt_unit_test_ctx_quit_graceful(ctx);
+
+        if (nxt_unit_test_ctx_ready(ctx) != 0
+            || nxt_unit_test_ctx_online(ctx) != 1)
+        {
+            _exit(1);
+        }
+
+        nxt_unit_test_send_detached_failures(fails);
+        nxt_unit_test_ctx_detached_done(ctx);
+
+        if (nxt_unit_test_ctx_detached_retries(ctx) != 1) {
+            _exit(2);
+        }
+
+        alarm(5);
+
+        (void) clock_gettime(CLOCK_MONOTONIC, &start);
+
+        rc = nxt_unit_run_shared(ctx);
+
+        (void) clock_gettime(CLOCK_MONOTONIC, &end);
+
+        if (rc != expect || nxt_unit_test_ctx_online(ctx) != 0) {
+            _exit(3);
+        }
+
+        /*
+         * A retry that succeeds clears the state and completes the quit; a
+         * retry that never succeeds reaches the give-up, which closes the
+         * worker instead of leaving it detached.
+         */
+
+        if (expect == NXT_UNIT_OK) {
+            if (nxt_unit_test_ctx_detached(ctx) != 0
+                || nxt_unit_test_ctx_detached_retries(ctx) != 0)
+            {
+                _exit(4);
+            }
+
+        } else if (nxt_unit_test_ctx_detached_retries(ctx) != 11) {
+            _exit(5);
+
+        } else if ((end.tv_sec - start.tv_sec) * 1000000000L
+                   + (end.tv_nsec - start.tv_nsec) < 100000000L)
+        {
+            /*
+             * The retries are spaced by the same backoff as the read loops,
+             * about 0.77 s in all.  Well under that and the loop is
+             * spinning: it would burn the whole budget at once.
+             */
+
+            _exit(6);
+        }
+
+        _exit(0);
+    }
+
+    nxt_port_recv_test_child_wait(pid, name);
+}
+
+
+static void
 nxt_port_recv_test_detached_persistent_fail(nxt_unit_ctx_t *ctx)
 {
     int    i, rc, status;
@@ -825,6 +1046,14 @@ main(void)
         "nxt_unit_run() returns on a retry that completes a quit");
     nxt_port_recv_test_deferred_quit_read(ctx, 1,
         "nxt_unit_run_ctx() returns on a retry that completes a quit");
+    nxt_port_recv_test_deferred_quit_port_msg(ctx,
+        "nxt_unit_process_port_msg() runs a pending finish retry");
+    nxt_port_recv_test_port_msg_retry_pending(ctx,
+        "nxt_unit_process_port_msg() asks for a call back");
+    nxt_port_recv_test_shared_quit_retry(ctx, 1, NXT_UNIT_OK,
+        "nxt_unit_run_shared() runs a pending finish retry");
+    nxt_port_recv_test_shared_quit_retry(ctx, 20, NXT_UNIT_ERROR,
+        "nxt_unit_run_shared() reaches the give-up, not ready");
     nxt_port_recv_test_detached_single_fail(ctx);
 #endif
 
