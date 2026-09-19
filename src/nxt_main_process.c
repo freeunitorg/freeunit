@@ -60,6 +60,11 @@ static void nxt_main_port_modules_handler(nxt_task_t *task,
 static int nxt_cdecl nxt_app_lang_compare(const void *v1, const void *v2);
 static void nxt_main_process_whoami_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
+static void nxt_main_remove_child_pid_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_main_process_name_child(nxt_task_t *task,
+    nxt_process_t *pprocess, nxt_process_t *process, nxt_pid_t wire_pid,
+    nxt_pid_t pid);
 static void nxt_main_port_conf_store_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static nxt_int_t nxt_main_file_store(nxt_task_t *task, const char *dir,
@@ -758,6 +763,28 @@ nxt_main_test_run_file_store(nxt_task_t *task, const char *dir,
     return nxt_main_file_store(task, dir, tmp_name, name, buf, size);
 }
 
+
+/*
+ * Public wrappers that let src/test/nxt_main_remove_child_pid_test.c drive
+ * the two halves of the pid-isolated child record separately: the WHOAMI
+ * side that gives a worker its second name, and the handler that resolves a
+ * prototype's report against it (issue #310).
+ */
+void
+nxt_main_test_run_name_child(nxt_task_t *task, nxt_process_t *pprocess,
+    nxt_process_t *process, nxt_pid_t wire_pid, nxt_pid_t pid)
+{
+    nxt_main_process_name_child(task, pprocess, process, wire_pid, pid);
+}
+
+
+void
+nxt_main_test_run_remove_child_pid_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg)
+{
+    nxt_main_remove_child_pid_handler(task, msg);
+}
+
 #endif
 
 
@@ -837,6 +864,7 @@ static nxt_port_handlers_t  nxt_main_process_port_handlers = {
     .process_ready    = nxt_port_process_ready_handler,
     .whoami           = nxt_main_process_whoami_handler,
     .remove_pid       = nxt_port_remove_pid_handler,
+    .remove_child_pid = nxt_main_remove_child_pid_handler,
     .start_process    = nxt_main_start_process_handler,
     .socket           = nxt_main_port_socket_handler,
     .socket_unlink    = nxt_main_port_socket_unlink_handler,
@@ -854,6 +882,78 @@ static nxt_port_handlers_t  nxt_main_process_port_handlers = {
     .rpc_ready        = nxt_port_rpc_handler,
     .rpc_error        = nxt_port_rpc_handler,
 };
+
+
+/*
+ * Record a child's pid in the pid namespace of the process that forked it.
+ *
+ * Under "isolation": {"namespaces": {"pid": true}} a prototype is the init of
+ * a namespace of its own, and it forks its workers inside that namespace with
+ * no clone flags of their own (nxt_proto_start_process_handler()).  So a
+ * worker has two names: the global pid the kernel wrote into SCM_CREDENTIALS,
+ * which is what main keys its record on, and the namespace-local pid the
+ * prototype got from fork(), which is the only name the prototype has for it
+ * until the PROCESS_CREATED handshake carries the global one back.  Neither
+ * can be derived from the other, so main keeps the pair: it is what lets
+ * nxt_main_remove_child_pid_handler() resolve a death the prototype can only
+ * report by the local name.
+ *
+ * The local name is the pid the sender wrote into the message header.  In a
+ * worker sending WHOAMI that is still its namespace-local pid --
+ * nxt_port_socket_write() writes nxt_pid, and nxt_process_whoami_ok() replaces
+ * nxt_pid with the global one only when this reply comes back.  A process that
+ * shares main's pid namespace writes the same number the credential carries,
+ * and the pair is then two spellings of one name; it is recorded anyway.
+ * Numeric equality is not evidence of a shared namespace -- the two counters
+ * are independent and a global pid that has wrapped can land on the small
+ * number a namespace-local one holds -- and refusing the pair on it would
+ * leave exactly the record this whole path exists to retire.
+ *
+ * What the pair does need is two independently sourced pids, which is what
+ * NXT_USE_CMSG_PID says.  Without it nxt_recv_msg_cmsg_pid() is the header pid
+ * itself (src/nxt_port.h:279), so the "credential" and the name are one value
+ * read twice and nothing about it can be checked.  Nothing is recorded there,
+ * which leaves nxt_main_remove_child_pid_handler() with nothing it can ever
+ * resolve.
+ *
+ * The name is chosen by the sender, so a worker can claim a live sibling's
+ * instead of its own.  That is refused rather than believed, which leaves a
+ * forger only able to give up its own record.  A reaped worker's number is
+ * free to be used again, because its record went with it.
+ */
+
+static void
+nxt_main_process_name_child(nxt_task_t *task, nxt_process_t *pprocess,
+    nxt_process_t *process, nxt_pid_t wire_pid, nxt_pid_t pid)
+{
+#if (NXT_USE_CMSG_PID)
+    nxt_process_t  *child;
+
+    /* Zero is what "no name" is stored as, and a pid namespace never hands
+       out 0 or a negative number; the header is off the wire, so say so. */
+
+    if (nxt_slow_path(wire_pid <= 0)) {
+        return;
+    }
+
+    nxt_queue_each(child, &pprocess->children, nxt_process_t, link) {
+
+        if (child != process && child->parent_ns_pid == wire_pid) {
+            nxt_alert(task, "process %PI claims pid %PI of its parent %PI, "
+                      "which process %PI already holds", pid, wire_pid,
+                      pprocess->pid, child->pid);
+
+            return;
+        }
+
+    } nxt_queue_loop;
+
+    nxt_debug(task, "process %PI is pid %PI inside %PI", pid, wire_pid,
+              pprocess->pid);
+
+    process->parent_ns_pid = wire_pid;
+#endif
+}
 
 
 static void
@@ -925,6 +1025,9 @@ nxt_main_process_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     if (ppid != nxt_pid) {
         nxt_queue_insert_tail(&pprocess->children, &port->process->link);
+
+        nxt_main_process_name_child(task, pprocess, port->process,
+                                    msg->port_msg.pid, pid);
     }
 
     buf = nxt_buf_mem_alloc(task->thread->engine->mem_pool,
@@ -953,6 +1056,114 @@ fail:
      * can attach a second to any message, and leaving it open here would
      * leak a descriptor of the main process on every forged message.
      */
+    nxt_port_recv_msg_close_fds(msg);
+}
+
+
+/*
+ * A prototype reporting a worker of its own that died before it was created.
+ *
+ * REMOVE_PID cannot carry that: a pid is its whole payload, and the only pid
+ * a prototype has for such a worker is the namespace-local one, which names
+ * an unrelated process everywhere else (nxt_proto_child_exited(),
+ * src/nxt_application.c).  Main is also the only receiver with anything to
+ * retire.  A worker that got as far as WHOAMI made main allocate a record and
+ * a port holding main's end of the worker's port socket, and
+ * nxt_proc_remove_notify_matrix pairs a dying APP with MAIN and the router --
+ * but the router only ever hears of a worker through the PROCESS_READY this
+ * one never sent.  So the message is addressed to main alone, and main
+ * forwards the death outward by the global pid once it has resolved it, which
+ * is the number every other process would have been given anyway.
+ *
+ * No identity is taken from the sender.  The sender is the pid the kernel
+ * translated into main's namespace, the payload is looked for only among that
+ * sender's own children, and a child carries a namespace-local name only
+ * where nxt_main_process_name_child() recorded one.  A prototype can therefore
+ * report its own workers and nothing else, and on a platform with no sender
+ * credential nothing is ever recorded, so nothing can ever be resolved either.
+ *
+ * What is not checked is that the worker is dead.  Nothing here can check it:
+ * the pid names a process in a namespace main does not share, and the
+ * prototype is the only reaper of it.  A compromised prototype can therefore
+ * have main drop the record, close main's end of the port and notify the
+ * router for a worker that is still running, which leaves that worker orphaned
+ * from main's bookkeeping.  It is not a new trust boundary -- the prototype is
+ * the real parent, it already kills its own children on a failed start
+ * (nxt_proto_kill_silent()), and outside a pid namespace it can say the same
+ * thing with REMOVE_PID -- but it is a new way to desync that bookkeeping from
+ * reality, and it is the reason the resolution is scoped to the sender's own
+ * children and to nothing else.
+ */
+
+static void
+nxt_main_remove_child_pid_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    size_t         size;
+    nxt_buf_t      *buf;
+    nxt_pid_t      pid, sender;
+    nxt_runtime_t  *rt;
+    nxt_process_t  *pprocess, *child;
+
+    buf = msg->buf;
+    size = (buf != NULL) ? (size_t) nxt_buf_used_size(buf) : 0;
+
+    if (nxt_slow_path(size != sizeof(nxt_pid_t))) {
+        nxt_log(task, NXT_LOG_WARN, "REMOVE_CHILD_PID with a %uz byte "
+                "payload, which cannot name a child", size);
+
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    /* The payload is not aligned for a nxt_pid_t load. */
+    nxt_memcpy(&pid, buf->mem.pos, sizeof(nxt_pid_t));
+
+    sender = nxt_recv_msg_cmsg_pid(msg);
+
+    rt = task->thread->runtime;
+
+    pprocess = nxt_runtime_process_find(rt, sender);
+
+    if (nxt_slow_path(pprocess == NULL
+                      || nxt_queue_is_empty(&pprocess->ports)
+                      || nxt_process_type(pprocess) != NXT_PROCESS_PROTOTYPE))
+    {
+        nxt_alert(task, "process %PI cannot report a child that died before "
+                  "it was created", sender);
+
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    nxt_queue_each(child, &pprocess->children, nxt_process_t, link) {
+
+        if (child->parent_ns_pid != pid) {
+            continue;
+        }
+
+        nxt_debug(task, "remove child pid %PI (aka %PI) of %PI", pid,
+                  child->pid, sender);
+
+        nxt_port_remove_notify_others(task, child);
+
+        nxt_queue_remove(&child->link);
+        child->link.next = NULL;
+
+        nxt_process_close_ports(task, child);
+
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+
+    } nxt_queue_loop;
+
+    /*
+     * Not an anomaly: a worker that died before its WHOAMI reached main left
+     * no record to retire, and the prototype cannot tell the two apart.
+     */
+
+    nxt_debug(task, "process %PI reported child pid %PI, which it has no "
+              "record for", sender, pid);
+
     nxt_port_recv_msg_close_fds(msg);
 }
 
