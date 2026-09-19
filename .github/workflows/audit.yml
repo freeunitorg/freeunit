@@ -1,15 +1,20 @@
 
 name: "Audit (cargo)"
 
-# Every tracked Cargo.lock is checked against the RustSec advisory database.
-# The weekly trigger is what makes this a gate rather than a formality: a new
-# advisory can land against a lock file nobody has touched, and without the
-# schedule the audit would only run when a lock changes.
+# Every tracked Cargo.lock is checked against the RustSec advisory database,
+# and every pkg/contrib source-tarball pin is checked against OSV.  The weekly
+# trigger is what makes this a gate rather than a formality: a new advisory can
+# land against a file nobody has touched, and without the schedule the audit
+# would only run when a lock or a pin changes.
 on:
   pull_request:
     paths:
       - '**/Cargo.lock'
       - '**/Cargo.toml'
+      - 'pkg/contrib/src/*/version'
+      - 'pkg/contrib/src/*/SHA512SUMS'
+      - 'pkg/contrib/check-advisories.py'
+      - 'pkg/eol.json'
       # A change to this file must run this file.
       - .github/workflows/audit.yml
   push:
@@ -18,6 +23,10 @@ on:
     paths:
       - '**/Cargo.lock'
       - '**/Cargo.toml'
+      - 'pkg/contrib/src/*/version'
+      - 'pkg/contrib/src/*/SHA512SUMS'
+      - 'pkg/contrib/check-advisories.py'
+      - 'pkg/eol.json'
       - .github/workflows/audit.yml
   schedule:
     - cron: "0 6 * * 1"
@@ -80,3 +89,37 @@ jobs:
       # open.
       - name: Audit ${{ matrix.lock }}
         run: cargo audit --deny warnings --file '${{ matrix.lock }}'
+
+  pins:
+    # A dependency pinned as a source tarball has a lock file inside the
+    # archive, but it is not tracked in this repository.  Check the direct
+    # source-package pins against OSV and audit the complete archived lock.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check source-tarball pins
+        run: python3 pkg/contrib/check-advisories.py
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Audit the Wasmtime source lock
+        run: |
+          version="$(sed -n -E 's/^WASMTIME_VERSION := ([0-9.]+)$/\1/p' \
+            pkg/contrib/src/wasmtime/version)"
+          test -n "$version"
+          archive="wasmtime-v${version}-src.tar.gz"
+          curl --fail --location --show-error --output "$RUNNER_TEMP/$archive" \
+            "https://packages.freeunit.org/wasmtime/$archive"
+          digest="$(awk -v archive="$archive" '$2 == archive { print $1 }' \
+            pkg/contrib/src/wasmtime/SHA512SUMS)"
+          test -n "$digest"
+          printf '%s  %s\n' "$digest" "$RUNNER_TEMP/$archive" | sha512sum --check
+          mkdir "$RUNNER_TEMP/wasmtime"
+          tar -xzf "$RUNNER_TEMP/$archive" --strip-components=1 \
+            --directory "$RUNNER_TEMP/wasmtime"
+          cargo audit --deny warnings --file "$RUNNER_TEMP/wasmtime/Cargo.lock"
