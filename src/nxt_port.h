@@ -201,6 +201,13 @@ typedef enum {
  * header field by field, and nxt_port_socket_write() ORs into ->last.  A
  * new type is bounds-checked on both sides instead, so an older peer
  * refuses the message rather than misreading a flag.
+ *
+ * The two edges are a balanced pair: one start and one finish per unit of
+ * detached work.  The payload names neither a request nor a context, so the
+ * router can only count the edges per process; it takes the worker out of
+ * the idle economy on the first start and gives it back on the last finish.
+ * The payload may grow later, and the handler requires at least one byte and
+ * reads the first, so an older sender stays readable.
  */
 typedef enum {
     NXT_PORT_DETACHED_START  = 0,
@@ -349,11 +356,15 @@ struct nxt_port_s {
     uint8_t             detached;
 
     /*
-     * The application reported detached work of its own.  Its FINISH edge is
-     * what ends that; until then the port stays out of the idle economy even
-     * with no request left.
+     * How many units of detached work the application reported of its own:
+     * one for each START edge whose FINISH edge has not arrived.  Until the
+     * last of them does, the port stays out of the idle economy even with no
+     * request left.  A count rather than a flag because the edges carry no
+     * context id and a worker may run several contexts -- see
+     * nxt_port_detached_t above -- so the first context's FINISH must not
+     * speak for the rest.
      */
-    uint8_t             detached_app;
+    uint32_t            detached_app;
 
     /*
      * The router put the port in the detached state itself: one for each

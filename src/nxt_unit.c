@@ -3783,12 +3783,12 @@ nxt_unit_ctx_detached_retry(nxt_unit_ctx_t *ctx)
         lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
 
         /*
-         * Close the main context: the router keeps the detached flag on the
-         * main port (id 0), and only closing that port settles the count
-         * and the application reference.  This assumes one context, as in
-         * PHP, the only caller of nxt_unit_request_done_detached().  A
-         * non-main context closing alone would leave the worker flagged
-         * detached for the life of the process, and the main context is
+         * Close the main context: the router keeps the detached count on
+         * the main port (id 0), and only closing that port settles the
+         * count and the application reference.  This assumes one context,
+         * as in PHP, the only caller of nxt_unit_request_done_detached().
+         * A non-main context closing alone would leave this context's start
+         * counted for the life of the process, and the main context is
          * changed here without cross-thread synchronization.  This is a
          * comment and not nxt_assert(): libunit does not link the thread
          * context that nxt_assert() needs.
