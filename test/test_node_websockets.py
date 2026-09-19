@@ -10,6 +10,7 @@ from unit.control import Control
 prerequisites = {'modules': {'node': 'any'}}
 
 client = ApplicationNode()
+control = Control()
 ws = ApplicationWebsocket()
 
 
@@ -1462,8 +1463,7 @@ def test_node_websockets_timeout_does_not_detach():
     time.sleep(3)
 
     processes = (
-        Control()
-        .conf_get('/status')
+        control.conf_get('/status')
         .get('applications', {})
         .get('websockets/mirror', {})
         .get('processes', {})
@@ -1474,3 +1474,50 @@ def test_node_websockets_timeout_does_not_detach():
     )
 
     sock.close()
+
+
+def wait_idle(name, idle, timeout=10):
+    """The idle count of an application, once it settles.
+
+    Read by name rather than compared whole: /status grows keys, and this
+    is about one of them.
+    """
+
+    for _ in range(timeout * 10):
+        processes = control.conf_get('/status')['applications'][name][
+            'processes'
+        ]
+
+        if processes['idle'] == idle:
+            break
+
+        time.sleep(0.1)
+
+    return processes
+
+
+def test_node_websockets_worker_idle_after_close():
+    client.load('websockets/mirror')
+
+    name = 'websockets/mirror'
+
+    _, sock, _ = ws.upgrade()
+
+    ws.frame_write(sock, ws.OP_TEXT, 'blah')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'blah')
+
+    # The worker is out of the idle economy while the session is open.
+
+    processes = wait_idle(name, 0)
+
+    assert processes['running'] == 1, 'running while open'
+    assert processes['idle'] == 0, 'busy while open'
+
+    close_connection(sock)
+
+    # And rejoins it when the session ends.
+
+    processes = wait_idle(name, 1)
+
+    assert processes['running'] == 1, 'running after close'
+    assert processes['idle'] == 1, 'idle after close'
