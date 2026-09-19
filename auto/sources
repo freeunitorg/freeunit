@@ -168,6 +168,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_http_chunk_parse_test.c \
     src/test/nxt_conf_parse_test.c \
     src/test/nxt_port_fail_test.c \
+    src/test/nxt_fd_event_change_test.c \
     src/test/nxt_port_use_unless_zero_test.c \
     src/test/nxt_port_mmap_range_test.c \
     src/test/nxt_port_ready_test.c \
