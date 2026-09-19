@@ -22,6 +22,7 @@ import time
 import pytest
 
 from unit.applications.tls import ApplicationTLS
+from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'any', 'openssl': 'any'}}
 
@@ -44,7 +45,7 @@ def _add_tls(application='empty', cert='default', port=8080):
             "pass": f"applications/{application}",
             "tls": {"certificate": cert},
         },
-        f'listeners/*:{port}',
+        f'listeners/*:{port_map.port(port)}',
     )
 
 
@@ -88,7 +89,7 @@ def test_listener_reconfigure_drains_inflight_tls_handshake():
     # Open a raw TCP socket; do NOT begin handshake yet.
     raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     raw.settimeout(5.0)
-    raw.connect(('127.0.0.1', 8080))
+    raw.connect(('127.0.0.1', port_map.port(8080)))
 
     # Wait longer than TCP_DEFER_ACCEPT so the no-data connection is
     # accepted by Unit before the reconfigure fires.  Otherwise it can
@@ -163,7 +164,7 @@ def test_listener_drain_no_dropped_accepted_connection():
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(5.0)
-    s.connect(('127.0.0.1', 8080))
+    s.connect(('127.0.0.1', port_map.port(8080)))
 
     # Give the kernel + router a beat to actually accept(2).
     time.sleep(0.05)
@@ -214,7 +215,7 @@ def test_listener_close_releases_fd_eventually():
         }
     ), 'initial listener on 8080'
 
-    assert _port_listening(8080), 'pre-condition: 8080 is up'
+    assert _port_listening(port_map.port(8080)), 'pre-condition: 8080 is up'
 
     assert 'success' in client.conf(
         {
@@ -228,11 +229,13 @@ def test_listener_close_releases_fd_eventually():
     # short window for the work queue to drain.
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
-        if not _port_listening(8080):
+        if not _port_listening(port_map.port(8080)):
             break
         time.sleep(0.05)
 
     assert not _port_listening(
-        8080
+        port_map.port(8080)
     ), 'old listener FD was not released after drain'
-    assert _port_listening(8081), 'new listener FD did not come up'
+    assert _port_listening(
+        port_map.port(8081)
+    ), 'new listener FD did not come up'

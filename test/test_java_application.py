@@ -6,6 +6,7 @@ from pathlib import Path
 from unit.applications.lang.java import ApplicationJava
 from unit.option import option
 from unit.utils import public_dir
+from unit import port as port_map
 
 prerequisites = {'modules': {'java': 'all'}}
 
@@ -857,7 +858,9 @@ def test_java_application_server_name():
     assert server_name('[::1]:8080') == '[::1]', 'ipv6 literal with port'
 
     # the port comes from the listener, never from the Host field
-    assert headers('[::1]:9999')['X-Server-Port'] == '8080', 'server port'
+    assert headers('[::1]:9999')['X-Server-Port'] == str(
+        port_map.port(8080)
+    ), 'server port'
 
     # HTTP/1.0 may omit Host.  The router substitutes "localhost" rather than
     # leaving the name empty, so that is what the servlet sees -- previously

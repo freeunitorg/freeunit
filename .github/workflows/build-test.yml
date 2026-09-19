@@ -750,6 +750,24 @@ jobs:
           fi
         if: steps.metadata.outputs.module != 'wasm'
 
+      # The port map (test/unit/port.py) is the identity at the default base
+      # of 8080, so every leg above proves only its no-op path: a literal that
+      # bypasses the map is invisible until the base moves.  Two such literals
+      # shipped in the change that added the map.  Re-run the language-agnostic
+      # suite off-base here, on the one leg that runs the whole `test` tree, so
+      # the map itself is a machine check rather than a manual one.
+      #
+      # !cancelled() rather than the implicit success(): a failure in the run
+      # above is reported on its own, and gating this on it would quietly take
+      # the off-base coverage away exactly when the suite is already unhappy.
+      - name: Run tests off the default base port
+        env:
+          TZ: Asia/Kolkata
+          UNIT_TEST_PORT: 18080
+        run: |
+          sudo -E pytest-3 --print-log test
+        if: ${{ !cancelled() && steps.metadata.outputs.module == 'unit' }}
+
       # test_capget_fallback.py needs a unitd that actually calls capget(),
       # which a root one never does, so every leg above skips it -- the file
       # is inside "test" but has never once run.  Repeat it here without

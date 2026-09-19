@@ -5,6 +5,7 @@ import socket
 import pytest
 
 from unit.applications.lang.php import ApplicationPHP
+from unit import port as port_map
 
 prerequisites = {'modules': {'php': 'any'}}
 
@@ -148,7 +149,9 @@ def raw_get(path, encoding, timeout=30):
     A plain socket request.  The shared client cannot express "fail rather
     than block forever", which is exactly the failure these tests look for.
     """
-    sock = socket.create_connection(('127.0.0.1', 8080), timeout)
+    sock = socket.create_connection(
+        ('127.0.0.1', port_map.port(8080)), timeout
+    )
     sock.settimeout(timeout)
 
     try:
