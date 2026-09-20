@@ -567,20 +567,13 @@ done:
     }
 
     if (app_port != NULL) {
-        nxt_queue_remove(&app_port->link);
-
         /*
-         * nxt_queue_remove() nulls the link only in a debug build
-         * (src/nxt_queue.h:130-148).  nxt_port_release() reads a non-NULL
-         * link.next as "this port belongs to a process" and dereferences
-         * port->process, which nxt_port_new() never set -- guarded by an
-         * nxt_assert() that compiles out of a release build, so the test
-         * would segfault in teardown there and nowhere else.
+         * app_port is linked into the fixture process's queue by hand
+         * rather than through nxt_process_port_add(), so port->process is
+         * NULL and nxt_port_release() cannot be used here -- see
+         * nxt_test_port_done() (src/test/nxt_tests.c) for why.
          */
-        app_port->link.next = NULL;
-        app_port->link.prev = NULL;
-
-        nxt_port_use(task, app_port, -1);
+        nxt_test_port_done(task, app_port);
     }
 
     thr->engine = saved_engine;

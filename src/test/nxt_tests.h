@@ -98,6 +98,7 @@ nxt_int_t nxt_cgroup_test(nxt_thread_t *thr);
 nxt_int_t nxt_clone_creds_test(nxt_thread_t *thr);
 
 nxt_bool_t nxt_test_fd_is_open(nxt_fd_t fd);
+void nxt_test_port_done(nxt_task_t *task, nxt_port_t *port);
 
 
 #endif /* _NXT_TESTS_H_INCLUDED_ */

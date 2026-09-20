@@ -27,6 +27,40 @@ nxt_test_fd_is_open(nxt_fd_t fd)
 }
 
 
+/*
+ * Drop a fixture port that was linked into a process's queue by hand
+ * rather than through nxt_process_port_add(), so port->process is NULL.
+ * nxt_port_release()'s own unlink is fine, but the
+ * nxt_process_use(task, port->process, -1) it makes afterwards is a NULL
+ * dereference for a port like this, so the unlink and the final reference
+ * drop have to be done here instead of through nxt_port_release().
+ * Unlike nxt_port_release(), this does not take rt->processes_mutex, so it
+ * is only for single-threaded fixtures with no other engine reading
+ * process->ports.
+ *
+ * The guard on port->link.next mirrors the port->link.next check in
+ * nxt_port_release(): nxt_port_new() zeroes port->link, and
+ * nxt_queue_remove() on a zeroed link dereferences NULL at
+ * (link)->next->prev, so only a port actually linked may be unlinked.  The
+ * link is cleared explicitly afterwards because nxt_queue_remove() only
+ * zeroes it under NXT_DEBUG, and the check that guards this branch reads it
+ * in every build.
+ */
+
+void
+nxt_test_port_done(nxt_task_t *task, nxt_port_t *port)
+{
+    if (port->link.next != NULL) {
+        nxt_process_port_remove(port);
+
+        port->link.next = NULL;
+        port->link.prev = NULL;
+    }
+
+    nxt_port_use(task, port, -1);
+}
+
+
 /* The function is defined here to prevent inline optimizations. */
 static nxt_bool_t
 nxt_msec_less(nxt_msec_t first, nxt_msec_t second)

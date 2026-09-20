@@ -62,36 +62,17 @@
  * process already carries, so the hash never learned about these ports and
  * the remove returns early without touching the count.
  *
- * The drop has to go through nxt_process_port_remove() first.  The port is
- * linked into the fixture process's queue by hand rather than through
- * nxt_process_port_add(), so port->process is NULL; nxt_port_release()'s own
- * unlink is fine, but the nxt_process_use(task, port->process, -1) it makes
- * afterwards is a NULL dereference for this port.  The link is cleared
- * explicitly because nxt_queue_remove() only zeroes it under NXT_DEBUG, and
- * the check that guards that branch reads it in every build.
- *
- * The guard below on port->link.next mirrors the one nxt_port_release()
- * itself uses (src/nxt_port.c:238): nxt_port_new() zeroes port->link, and
- * nxt_queue_remove() on a zeroed link dereferences NULL at
- * (link)->next->prev, so only a port actually linked may be unlinked.  Every
- * current call site links its port right after creating it with no branch
- * in between, so the guard never trips today; it stays so a future call
- * site that fails the link does not resurrect the crash this helper exists
- * to avoid.
+ * The drop itself -- unlinking from the fixture process's queue and taking
+ * the reference nxt_port_new() held -- is nxt_test_port_done() (src/test/
+ * nxt_tests.c), shared with nxt_proto_creating_wedge_test.c, which tears
+ * down a fixture port linked the same by-hand way.
  */
 static void
 nxt_port_ready_test_port_done(nxt_task_t *task, nxt_port_t *port)
 {
     nxt_port_close(task, port);
 
-    if (port->link.next != NULL) {
-        nxt_process_port_remove(port);
-
-        port->link.next = NULL;
-        port->link.prev = NULL;
-    }
-
-    nxt_port_use(task, port, -1);
+    nxt_test_port_done(task, port);
 }
 
 
