@@ -473,6 +473,17 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        single comma-joined value RFC 9110 defines them to be; previously
        only the first was consulted.
 
+    *) Bugfix: a malformed weight in "Accept-Encoding" is no longer read as a
+       refusal.  The qvalue was converted with strtod(), which takes no digits
+       at all from "identity;q=" and from "identity;q=abc" and reports zero,
+       so either one answered "406 Not Acceptable" to a client that had
+       refused nothing; "q=0x0" and "q=0e0" did the same.  An element whose
+       weight does not match the grammar of RFC 9110 Sect. 12.4.2 is now
+       ignored, as an element naming an unknown coding already was.  This
+       also removes "q=nan", which passed the 0-to-1 range check -- a NaN
+       compares false against both bounds -- and then outranked every real
+       weight.
+
 
 Changes with FreeUnit 1.36.1                                     28 Aug 2026
 
