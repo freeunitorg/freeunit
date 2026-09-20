@@ -478,6 +478,59 @@ nxt_http_comp_find_weight(char *tkn)
 }
 
 
+/*
+ * Reads the qvalue that follows a weight's "=".
+ *
+ * RFC 9110 Sect. 12.4.2 spells it "( '0' [ '.' 0*3DIGIT ] ) / ( '1' [ '.'
+ * 0*3( '0' ) ] )": one leading digit, then at most a fraction.  strtod() on
+ * its own is far looser and every way it is looser is a bug here.  It takes
+ * no digits at all from "q=" and from "q=abc" and reports 0, which this
+ * function's caller reads as a refusal; it reads "q=0x10" as hexadecimal;
+ * and it turns "q=nan" into a NaN that compares false against both range
+ * bounds, so the element is kept and then outranks every real weight.
+ *
+ * So check the shape first and only then convert.  The digit count in the
+ * fraction is not enforced: rejecting "q=0.0000" would read a client's
+ * refusal as an acceptance, which is the wrong way to be strict.
+ *
+ * An element whose weight does not parse is ignored, exactly like an element
+ * naming a coding this build does not have.  Reading it as q=0 is the other
+ * defensible answer -- nginx reads a bad quantity as zero -- but a zero is a
+ * refusal here, so "identity;q=" would answer 406 to a client that refused
+ * nothing.
+ */
+
+static bool
+nxt_http_comp_parse_weight(const char *qvalue, double *qval)
+{
+    const char  *p = qvalue;
+
+    if (*p != '0' && *p != '1') {
+        return false;
+    }
+
+    p++;
+
+    if (*p == '.') {
+        p++;
+
+        while (*p >= '0' && *p <= '9') {
+            p++;
+        }
+    }
+
+    /* Anything may follow the weight, but only as a further parameter. */
+
+    if (*p != '\0' && *p != ';') {
+        return false;
+    }
+
+    *qval = strtod(qvalue, NULL);
+
+    return *qval <= 1.0;
+}
+
+
 static nxt_uint_t
 nxt_http_comp_compressor_lookup_enabled(const nxt_http_comp_conf_t *conf,
                                         const nxt_str_t *token)
@@ -678,14 +731,8 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
         nxt_http_comp_scheme_t  scheme;
 
         qptr = nxt_http_comp_find_weight(tkn);
-        if (qptr != NULL) {
-            nxt_errno = 0;
-
-            qval = strtod(qptr + 3, NULL);
-
-            if (nxt_errno == ERANGE || qval < 0.0 || qval > 1.0) {
-                continue;
-            }
+        if (qptr != NULL && !nxt_http_comp_parse_weight(qptr + 3, &qval)) {
+            continue;
         }
 
         enc.start = (u_char *)tkn;

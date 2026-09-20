@@ -497,3 +497,40 @@ def test_static_compression_range_identity_refused_guards(temp_dir):
     )
     assert status == 416, 'an ordinary unsatisfiable range is still 416'
     assert headers['Content-Range'] == f'bytes */{size}'
+
+
+def test_static_compression_malformed_weight(temp_dir):
+    # A qvalue is "('0' ['.' 0*3DIGIT]) / ('1' ['.' 0*3('0')])" (Sect.
+    # 12.4.2).  strtod() takes no digits at all from "q=" and "q=abc" and
+    # reports 0, reads "q=0x0" as hexadecimal and "q=0e0" as an exponent, so
+    # every one of these was read as an explicit refusal and answered 406 to
+    # a client that refused nothing.
+    size = Path(f'{temp_dir}/assets/big.css').stat().st_size
+
+    for weight in ('', 'abc', '0x0', '0e0', 'nan', '.5', '2', '1.5'):
+        status, headers, body = _raw_get(
+            **{'Accept-Encoding': f'identity;q={weight}'}
+        )
+        assert status == 200, f'a malformed weight is not a refusal: {weight!r}'
+        assert 'Content-Encoding' not in headers
+        assert len(body) == size
+
+    # "q=nan" was worse than a refusal on any other coding: a NaN compares
+    # false against both range bounds, so the element survived the check, and
+    # false against the running best weight, so it was then selected.
+    status, headers, body = _raw_get(**{'Accept-Encoding': 'gzip;q=nan'})
+    assert status == 200
+    assert 'Content-Encoding' not in headers, 'a NaN weight selects nothing'
+    assert len(body) == size
+
+    # A well-formed zero still refuses, including a fraction longer than the
+    # grammar's three digits: being strict about the digit count would read a
+    # refusal as an acceptance, which is the wrong way to be strict.
+    for weight in ('0', '0.0', '0.000', '0.0000'):
+        status, _, _ = _raw_get(**{'Accept-Encoding': f'identity;q={weight}'})
+        assert status == 406, f'a well-formed zero still refuses: {weight!r}'
+
+    # A parameter after the weight does not make the weight malformed.
+    status, headers, _ = _raw_get(**{'Accept-Encoding': 'gzip;q=0.5;ext=1'})
+    assert status == 200
+    assert headers.get('Content-Encoding') == 'gzip', 'q=0.5 then an extension'
