@@ -576,6 +576,23 @@ asynchronous remote were affected (#486).
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+the Python ASGI module refused a WebSocket message larger than 1 MB whatever
+"max_frame_size" was set to.  The module carried a private 1 MB limit that no
+configuration ever wrote and charged the fragments of a message against it,
+while the configured value is checked by the router per frame: a 4 MB message
+was closed with 1009 where "max_frame_size" was 32 MB, and at the default size
+a client that split a larger message into small frames was refused as well.
+Each frame is now limited by "max_frame_size" alone.  The module only limits a
+connection to 10 MB of payload that the application has not received yet
+(fragments of a message in progress and complete messages waiting for
+receive()); a single frame larger than that is still accepted when nothing else
+is waiting.  A fragmented message also left a count behind that lowered the
+limit applied to the next message.
+</para>
+</change>
+
 </changes>
 
 
