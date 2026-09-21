@@ -12,7 +12,8 @@ public class app {
 
     @OnOpen
     public void onOpen(Session session) {
-        session.setMaxTextMessageBufferSize(8388608);
+        session.setMaxTextMessageBufferSize(16 * 1024 * 1024);
+        session.setMaxBinaryMessageBufferSize(16 * 1024 * 1024);
     }
 
     @OnMessage
