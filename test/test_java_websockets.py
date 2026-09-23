@@ -1377,6 +1377,26 @@ def test_java_websockets_max_frame_size():
     check_close(sock, 1009)  # 1009 - CLOSE_TOO_LARGE
 
 
+def test_java_websockets_send_text_one_frame():
+    client.load('websockets_mirror')
+
+    _, sock, _ = ws.upgrade()
+
+    # 64 KiB is well under DEFAULT_BUFFER_SIZE == 8 MiB (see
+    # test/java/websockets_mirror/app.java) but far above the java module's
+    # 8 KiB encode buffer, which used to fragment any message this large into
+    # eight TEXT/CONT frames regardless of "max_frame_size".  A complete
+    # message already in memory must leave as a single frame with fin=True.
+    payload = '*' * 64 * 1024
+
+    ws.frame_write(sock, ws.OP_TEXT, payload)
+
+    frame = ws.frame_read(sock)
+    check_frame(frame, True, ws.OP_TEXT, payload)
+
+    close_connection(sock)
+
+
 def test_java_websockets_read_timeout():
     client.load('websockets_mirror')
 
