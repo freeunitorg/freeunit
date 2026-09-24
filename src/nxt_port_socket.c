@@ -343,6 +343,10 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
                       (int) port->pid, (int) port->id, port->socket.fd,
                       (int) qmsg_size, notify, res);
 
+            if (nxt_slow_path(res == NXT_ERROR)) {
+                goto queue_broken;
+            }
+
             if (b != NULL && nxt_fast_path(res == NXT_OK)) {
                 if (qmsg.pm.mmap) {
                     b->is_port_mmap_sent = 1;
@@ -376,6 +380,10 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
             nxt_debug(task, "port{%d,%d} %d: enqueue 1 notify %d, %d",
                       (int) port->pid, (int) port->id, port->socket.fd,
                       notify, res);
+
+            if (nxt_slow_path(res == NXT_ERROR)) {
+                goto queue_broken;
+            }
 
             if (nxt_slow_path(res == NXT_AGAIN)) {
                 return NXT_AGAIN;
@@ -444,6 +452,23 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
     }
 
     return res;
+
+queue_broken:
+
+    /*
+     * The peer broke the shared queue and nxt_nncq.h gave up on it.
+     * Nothing of the message was consumed, so the caller still owns fd,
+     * fd2 and b, as after a send to a dead peer.  Later messages meet the
+     * same bounded retries: the queue cannot be dropped from a port that
+     * other engines send on.
+     */
+
+    nxt_alert(task, "port{%d,%d} %d: shared queue is broken; "
+              "message type %d stream #%uD refused",
+              (int) port->pid, (int) port->id, port->socket.fd,
+              (int) msg.port_msg.type, stream);
+
+    return NXT_ERROR;
 }
 
 

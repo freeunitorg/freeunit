@@ -11,6 +11,14 @@
 
 #define NXT_NNCQ_SIZE  16384
 
+/*
+ * The peer maps the queue writable and can put a foreign cycle under head
+ * or tail.  Each loop below retries at most this many times, so the peer
+ * cannot make this side spin for ever.  Legitimate contention needs far
+ * fewer: each retry means another party made progress.
+ */
+#define NXT_NNCQ_RETRIES  NXT_NNCQ_SIZE
+
 typedef uint32_t nxt_nncq_atomic_t;
 typedef uint16_t nxt_nncq_cycle_t;
 
@@ -94,13 +102,13 @@ nxt_nncq_init(nxt_nncq_t volatile *q)
 }
 
 
-static inline void
+static inline nxt_int_t
 nxt_nncq_enqueue(nxt_nncq_t volatile *q, nxt_nncq_atomic_t val)
 {
     nxt_nncq_cycle_t   e_cycle, t_cycle;
-    nxt_nncq_atomic_t  n, t, e, j;
+    nxt_nncq_atomic_t  n, t, e, j, r;
 
-    for ( ;; ) {
+    for (r = 0; r < NXT_NNCQ_RETRIES; r++) {
         t = nxt_nncq_tail(q);
         j = nxt_nncq_map(q, t);
         e = q->entries[j];
@@ -120,11 +128,13 @@ nxt_nncq_enqueue(nxt_nncq_t volatile *q, nxt_nncq_atomic_t val)
         n = nxt_nncq_new_entry(q, t_cycle, val);
 
         if (nxt_atomic_cmp_set(&q->entries[j], e, n)) {
-            break;
+            nxt_nncq_tail_cmp_inc(q, t);
+
+            return NXT_OK;
         }
     }
 
-    nxt_nncq_tail_cmp_inc(q, t);
+    return NXT_ERROR;
 }
 
 
@@ -132,9 +142,9 @@ static inline nxt_nncq_atomic_t
 nxt_nncq_dequeue(nxt_nncq_t volatile *q)
 {
     nxt_nncq_cycle_t   e_cycle, h_cycle;
-    nxt_nncq_atomic_t  h, j, e;
+    nxt_nncq_atomic_t  h, j, e, r;
 
-    for ( ;; ) {
+    for (r = 0; r < NXT_NNCQ_RETRIES; r++) {
         h = nxt_nncq_head(q);
         j = nxt_nncq_map(q, h);
         e = q->entries[j];
@@ -151,11 +161,11 @@ nxt_nncq_dequeue(nxt_nncq_t volatile *q)
         }
 
         if (nxt_atomic_cmp_set(&q->head, h, h + 1)) {
-            break;
+            return nxt_nncq_index(q, e);
         }
     }
 
-    return nxt_nncq_index(q, e);
+    return nxt_nncq_empty(q);
 }
 
 

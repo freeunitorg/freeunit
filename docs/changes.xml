@@ -12,6 +12,15 @@
 
 <change type="security">
 <para>
+an application could write an unexpected value into an entry of a shared
+memory queue.  The router then retried that entry for ever.  Each enqueue and
+dequeue now stops after one queue size of retries.  The router refuses the
+message and writes an alert.
+</para>
+</change>
+
+<change type="security">
+<para>
 a port kept every fragment of a message until the last one arrived, so a
 peer process could make it hold memory without limit.  A fragment that named
 a shared memory segment but carried no record also left a receive buffer in
