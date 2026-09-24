@@ -4,10 +4,13 @@
  */
 
 /*
- * nxt_port_release() of a port linked into a process's list by hand, with
- * no port->process and no reference (#425): a debug build aborted and a
- * release build dereferenced NULL.  It must unlink the port and drop no
- * reference it does not hold.  Runs in a child, so a crash is a failure.
+ * The port/process pairing (#425).  Through nxt_process_port_add(), the only
+ * public path, a linked port always has ->process and one reference on it,
+ * a second add changes nothing, and nxt_port_release() takes all of it
+ * back.  A port linked into a process's list by hand, with no ->process and
+ * no reference, used to abort a debug build and dereference NULL in a
+ * release build: it must be unlinked, and no reference it does not hold
+ * may be dropped.  Runs in a child, so a crash is a failure.
  */
 
 #include <nxt_main.h>
@@ -55,8 +58,22 @@ nxt_port_release_test_child(void *data)
 
     nxt_process_port_add(task, process, paired);
 
-    if (process->use_count != 2) {
+    if (paired->process != process
+        || nxt_queue_first(&process->ports) != &paired->link
+        || process->use_count != 2)
+    {
         return 3;
+    }
+
+    /* Already paired: refused, in a release build too. */
+
+    nxt_process_port_add(task, process, paired);
+
+    if (paired->process != process
+        || nxt_queue_next(&paired->link) != nxt_queue_tail(&process->ports)
+        || process->use_count != 2)
+    {
+        return 7;
     }
 
     nxt_port_use(task, paired, -1);

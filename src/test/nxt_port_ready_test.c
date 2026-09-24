@@ -1016,7 +1016,7 @@ nxt_port_ready_test_stream(nxt_thread_t *thr, nxt_task_t *task,
     proto_port->pair[1] = -1;
     proto_port->socket.fd = -1;
 
-    nxt_queue_insert_tail(&proto->ports, &proto_port->link);
+    nxt_process_port_add(task, proto, proto_port);
 
     /*
      * A second peer, of main's type.  nxt_proc_send_matrix[] pairs MAIN with
@@ -1041,7 +1041,7 @@ nxt_port_ready_test_stream(nxt_thread_t *thr, nxt_task_t *task,
     main_port->pair[1] = -1;
     main_port->socket.fd = -1;
 
-    nxt_queue_insert_tail(&mainp->ports, &main_port->link);
+    nxt_process_port_add(task, mainp, main_port);
 
     router->pid = nxt_pid + 9;
     router->isolated_pid = nxt_pid + 9;
@@ -1059,7 +1059,7 @@ nxt_port_ready_test_stream(nxt_thread_t *thr, nxt_task_t *task,
     router_port->pair[1] = -1;
     router_port->socket.fd = -1;
 
-    nxt_queue_insert_tail(&router->ports, &router_port->link);
+    nxt_process_port_add(task, router, router_port);
 
     /*
      * An engine only for the announcement: nxt_port_send_port() allocates
@@ -1458,7 +1458,7 @@ nxt_port_ready_test(nxt_thread_t *thr)
     port->pair[1] = -1;
     port->socket.fd = -1;
 
-    nxt_queue_insert_tail(&process->ports, &port->link);
+    nxt_process_port_add(task, process, port);
 
 #if (NXT_USE_CMSG_PID)
 
@@ -1551,7 +1551,7 @@ nxt_port_ready_test(nxt_thread_t *thr)
     queueless_port->pair[1] = -1;
     queueless_port->socket.fd = -1;
 
-    nxt_queue_insert_tail(&queueless->ports, &queueless_port->link);
+    nxt_process_port_add(task, queueless, queueless_port);
 
     msg.port_msg.pid = queueless->pid;
 
@@ -1594,7 +1594,7 @@ nxt_port_ready_test(nxt_thread_t *thr)
     nofd_port->pair[1] = -1;
     nofd_port->socket.fd = -1;
 
-    nxt_queue_insert_tail(&nofd->ports, &nofd_port->link);
+    nxt_process_port_add(task, nofd, nofd_port);
 
     msg.port_msg.pid = nofd->pid;
 
