@@ -105,6 +105,13 @@ nxt_socketpair_test_send_fail(nxt_err_t err, nxt_uint_t n)
 #endif
 
 
+/*
+ * Set around a send to a peer that may have exited: EPIPE, ECONNRESET and
+ * the like are then logged at nxt_socket_error_level(), not as alerts.
+ */
+nxt_bool_t  nxt_socketpair_peer_may_be_gone;
+
+
 ssize_t
 nxt_socketpair_send(nxt_fd_event_t *ev, nxt_fd_t *fd, nxt_iobuf_t *iob,
     nxt_uint_t niob)
@@ -184,8 +191,10 @@ nxt_socketpair_send(nxt_fd_event_t *ev, nxt_fd_t *fd, nxt_iobuf_t *iob,
             continue;
 
         default:
-            nxt_alert(ev->task, "sendmsg(%d, %FD, %FD, %ui) failed %E",
-                      ev->fd, fd[0], fd[1], niob, err);
+            nxt_log(ev->task, nxt_socketpair_peer_may_be_gone
+                              ? nxt_socket_error_level(err) : NXT_LOG_ALERT,
+                    "sendmsg(%d, %FD, %FD, %ui) failed %E",
+                    ev->fd, fd[0], fd[1], niob, err);
 
             /*
              * The one exit where the socket really is broken, so it is the
