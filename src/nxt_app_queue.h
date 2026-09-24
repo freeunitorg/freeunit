@@ -75,7 +75,12 @@ nxt_app_queue_send(nxt_app_queue_t volatile *q, const void *p,
     qi->tracking = tracking;
     *cookie = i;
 
-    nxt_app_nncq_enqueue(&q->queue, i);
+    if (nxt_slow_path(nxt_app_nncq_enqueue(&q->queue, i) != NXT_OK)) {
+        /* The slot is not lost with the message. */
+        (void) nxt_app_nncq_enqueue(&q->free_items, i);
+
+        return NXT_ERROR;
+    }
 
     n = nxt_atomic_cmp_set(&q->notified, 0, 1);
 
@@ -138,7 +143,7 @@ nxt_app_queue_recv(nxt_app_queue_t volatile *q, void *p, uint32_t *cookie)
     nxt_memcpy(p, qi->data, size);
     *cookie = i;
 
-    nxt_app_nncq_enqueue(&q->free_items, i);
+    (void) nxt_app_nncq_enqueue(&q->free_items, i);
 
     return size;
 }

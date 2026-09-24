@@ -74,7 +74,13 @@ nxt_port_queue_send(nxt_port_queue_t volatile *q, const void *p, uint8_t size,
     qi->size = size;
     nxt_memcpy(qi->data, p, size);
 
-    nxt_nncq_enqueue(&q->queue, i);
+    if (nxt_slow_path(nxt_nncq_enqueue(&q->queue, i) != NXT_OK)) {
+        /* The slot is not lost with the message. */
+        (void) nxt_nncq_enqueue(&q->free_items, i);
+
+        *notify = 0;
+        return NXT_ERROR;
+    }
 
     i = nxt_atomic_fetch_add(&q->nitems, 1);
 
@@ -114,7 +120,7 @@ nxt_port_queue_recv(nxt_port_queue_t volatile *q, void *p)
 
     nxt_memcpy(p, qi->data, size);
 
-    nxt_nncq_enqueue(&q->free_items, i);
+    (void) nxt_nncq_enqueue(&q->free_items, i);
 
     nxt_atomic_fetch_add(&q->nitems, -1);
 

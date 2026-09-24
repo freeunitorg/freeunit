@@ -348,6 +348,9 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
 
                 nxt_work_queue_add(&task->thread->engine->fast_work_queue,
                                    b->completion_handler, task, b, b->parent);
+
+            } else if (nxt_slow_path(res == NXT_ERROR)) {
+                goto queue_broken;
             }
 
             if (notify == 0) {
@@ -373,7 +376,11 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
                       (int) port->pid, (int) port->id, port->socket.fd,
                       notify, res);
 
-            if (nxt_slow_path(res == NXT_AGAIN)) {
+            if (nxt_slow_path(res != NXT_OK)) {
+                if (res == NXT_ERROR) {
+                    goto queue_broken;
+                }
+
                 return NXT_AGAIN;
             }
         }
@@ -440,6 +447,25 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
     }
 
     return res;
+
+queue_broken:
+
+    /*
+     * The peer maps the queue writable and left it in a state the retry
+     * budget of src/nxt_nncq.h gave up on.  Nothing of the message was
+     * consumed, so the answer is the one a send to a dead peer gets: the
+     * caller still owns fd, fd2 and b.  Refused per message, like a
+     * truncated or malformed one: the queue cannot be dropped from a port
+     * other engines are sending on, so every later message meets the same
+     * budget, and each costs one bounded pass over the queue.
+     */
+
+    nxt_alert(task, "port{%d,%d} %d: shared queue is broken; "
+              "message type %d stream #%uD refused",
+              (int) port->pid, (int) port->id, port->socket.fd,
+              (int) msg.port_msg.type, stream);
+
+    return NXT_ERROR;
 }
 
 

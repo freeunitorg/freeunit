@@ -11,6 +11,18 @@
 
 #define NXT_APP_NNCQ_SIZE  131072
 
+/*
+ * Retries a call makes before it gives up on the queue.
+ *
+ * The queue is mapped writable by the peer, and both loops below retry
+ * until the entry under head or tail carries a cycle they can act on.  A
+ * peer that writes any other cycle there would keep this side spinning on
+ * it for as long as it likes.  Legitimate contention never needs a fraction
+ * of this: the tail lags by at most one slot per producer in flight, and a
+ * retry on a lost CAS means another party made progress.
+ */
+#define NXT_APP_NNCQ_RETRIES  NXT_APP_NNCQ_SIZE
+
 typedef uint32_t nxt_app_nncq_atomic_t;
 typedef uint16_t nxt_app_nncq_cycle_t;
 
@@ -97,13 +109,13 @@ nxt_app_nncq_init(nxt_app_nncq_t volatile *q)
 }
 
 
-static void
+static nxt_int_t
 nxt_app_nncq_enqueue(nxt_app_nncq_t volatile *q, nxt_app_nncq_atomic_t val)
 {
     nxt_app_nncq_cycle_t   e_cycle, t_cycle;
-    nxt_app_nncq_atomic_t  n, t, e, j;
+    nxt_app_nncq_atomic_t  n, t, e, j, r;
 
-    for ( ;; ) {
+    for (r = 0; r < NXT_APP_NNCQ_RETRIES; r++) {
         t = nxt_app_nncq_tail(q);
         j = nxt_app_nncq_map(q, t);
         e = q->entries[j];
@@ -123,11 +135,13 @@ nxt_app_nncq_enqueue(nxt_app_nncq_t volatile *q, nxt_app_nncq_atomic_t val)
         n = nxt_app_nncq_new_entry(q, t_cycle, val);
 
         if (nxt_atomic_cmp_set(&q->entries[j], e, n)) {
-            break;
+            nxt_app_nncq_tail_cmp_inc(q, t);
+
+            return NXT_OK;
         }
     }
 
-    nxt_app_nncq_tail_cmp_inc(q, t);
+    return NXT_ERROR;
 }
 
 
@@ -135,9 +149,9 @@ static nxt_app_nncq_atomic_t
 nxt_app_nncq_dequeue(nxt_app_nncq_t volatile *q)
 {
     nxt_app_nncq_cycle_t   e_cycle, h_cycle;
-    nxt_app_nncq_atomic_t  h, j, e;
+    nxt_app_nncq_atomic_t  h, j, e, r;
 
-    for ( ;; ) {
+    for (r = 0; r < NXT_APP_NNCQ_RETRIES; r++) {
         h = nxt_app_nncq_head(q);
         j = nxt_app_nncq_map(q, h);
         e = q->entries[j];
@@ -154,11 +168,11 @@ nxt_app_nncq_dequeue(nxt_app_nncq_t volatile *q)
         }
 
         if (nxt_atomic_cmp_set(&q->head, h, h + 1)) {
-            break;
+            return nxt_app_nncq_index(q, e);
         }
     }
 
-    return nxt_app_nncq_index(q, e);
+    return nxt_app_nncq_empty(q);
 }
 
 
