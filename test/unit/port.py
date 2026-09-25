@@ -114,6 +114,7 @@ _MAPPED_OUTPUTS = frozenset()
 _LITERALS = frozenset(_BAND) | frozenset(range(_BLOCK_FIRST, _BLOCK_LAST + 1))
 
 _NUMBER = re.compile(r'[0-9]+')
+_NUMBER_BYTES = re.compile(rb'[0-9]+')
 
 
 def set_base(base):
@@ -188,14 +189,13 @@ def remap(text):
     otherwise be translated a second time.
 
     ``client.conf()`` also accepts bytes -- test_fake_upstream's TLS case passes
-    a bytes body -- so the type is preserved rather than assumed.  Port literals
-    are ASCII, and a body that is not decodable has no port in it worth mapping,
-    so an undecodable body is returned untouched.
+    a bytes body -- so the type is preserved rather than assumed.  The digit
+    runs are matched in the bytes themselves, not in a decoded copy: a body
+    with non-ASCII UTF-8 text still carries its port literals in ASCII, and
+    decoding would either fail on it or have to guess an encoding.
     """
 
-    def replace(match):
-        run = match.group()
-
+    def replace(run):
         if run in _MAPPED_OUTPUTS:
             return run
 
@@ -205,15 +205,13 @@ def remap(text):
         return str(port(run))
 
     if isinstance(text, (bytes, bytearray)):
-        try:
-            return type(text)(
-                _NUMBER.sub(replace, text.decode('ascii')).encode('ascii')
+        return type(text)(
+            _NUMBER_BYTES.sub(
+                lambda match: replace(match.group().decode()).encode(), text
             )
+        )
 
-        except UnicodeDecodeError:
-            return text
-
-    return _NUMBER.sub(replace, text)
+    return _NUMBER.sub(lambda match: replace(match.group()), text)
 
 
 def expected(value):
