@@ -175,8 +175,15 @@ def should_fail(findings: list[dict[str, Any]], fail_on_severity: str) -> bool:
 def main() -> int:
     args = parse_args()
 
-    with args.trivy_json.open(encoding="utf-8") as fh:
-        report = json.load(fh)
+    try:
+        with args.trivy_json.open(encoding="utf-8") as fh:
+            report = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(
+            f"Cannot read Trivy results from {args.trivy_json}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
 
     findings = collect_vulnerabilities(report)
     markdown = render_markdown(findings, args.max_rows)

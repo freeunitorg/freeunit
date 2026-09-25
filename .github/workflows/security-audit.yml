@@ -43,6 +43,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   trivy:
     name: Trivy filesystem audit
@@ -81,6 +85,11 @@ jobs:
           exit-code: 0
 
       - name: Upload SARIF results
+        # Fork pull requests get a read-only token without
+        # security-events: write, so the upload would fail there.
+        if: >-
+          github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: security-audit/trivy-results.sarif
