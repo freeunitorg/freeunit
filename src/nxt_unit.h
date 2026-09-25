@@ -338,9 +338,9 @@ void nxt_unit_request_done(nxt_unit_request_info_t *req, int rc);
  * returns NXT_UNIT_OK, and not NXT_UNIT_AGAIN, while a retry is pending,
  * to ask for the next call.  An integration that reschedules the call on
  * NXT_UNIT_OK, as the Node.js and ASGI ones do, needs nothing more.  The
- * call spends the retry backoff, up to 256 ms, so that the reschedule
- * paces the retries rather than spins; it gives up after about 0.8 s and
- * closes the worker.
+ * call never waits for the retry backoff, which would block the event
+ * loop: it keeps a deadline, and a call before it only receives.  The
+ * retries give up after about 0.8 s and close the worker.
  */
 void nxt_unit_request_done_detached(nxt_unit_request_info_t *req, int rc);
 

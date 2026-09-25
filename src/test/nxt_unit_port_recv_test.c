@@ -661,22 +661,35 @@ nxt_port_recv_test_deferred_quit_port_msg(nxt_unit_ctx_t *ctx,
 }
 
 
+static long
+nxt_port_recv_test_ms(const struct timespec *from, const struct timespec *to)
+{
+    return (to->tv_sec - from->tv_sec) * 1000
+           + (to->tv_nsec - from->tv_nsec) / 1000000;
+}
+
+
 static void
 nxt_port_recv_test_port_msg_retry_pending(nxt_unit_ctx_t *ctx,
     const char *name)
 {
-    int              rc, calls;
+    int              rc;
+    long             call_ms, max_ms;
     pid_t            pid;
-    struct timespec  end, start;
+    unsigned int     calls;
+    struct timespec  end, start, t0, t1;
 
     /*
      * A retry that fails again leaves the context online with the FINISH
      * still pending, and nothing else will wake the embedder: its read port
      * stays quiet until unrelated traffic arrives.  The call must report
      * NXT_UNIT_OK, which an embedder reschedules on, and not NXT_UNIT_AGAIN,
-     * which stops it and strands the worker detached.  Reads block, so the
-     * alarm catches an unbounded wait, and the elapsed time catches a
-     * reschedule that spins through the budget instead of pacing it.
+     * which stops it and strands the worker detached.  The call must not
+     * wait out the backoff either, which would freeze the embedder's event
+     * loop: each call returns at once, and the retries stay paced by a
+     * deadline.  Reads block, so the alarm catches a wait for a message; the
+     * slowest call catches a bounded wait, and the elapsed time catches
+     * retries that spin through the budget instead of pacing it.
      */
 
     pid = fork();
@@ -697,11 +710,21 @@ nxt_port_recv_test_port_msg_retry_pending(nxt_unit_ctx_t *ctx,
 
         alarm(10);
 
+        max_ms = 0;
+
         (void) clock_gettime(CLOCK_MONOTONIC, &start);
 
-        for (calls = 1; calls <= 20; calls++) {
+        for (calls = 1; calls <= 10000000; calls++) {
+            (void) clock_gettime(CLOCK_MONOTONIC, &t0);
+
             rc = nxt_unit_process_port_msg(ctx,
                                            nxt_unit_test_ctx_read_port(ctx));
+
+            (void) clock_gettime(CLOCK_MONOTONIC, &t1);
+
+            call_ms = nxt_port_recv_test_ms(&t0, &t1);
+            max_ms = nxt_max(max_ms, call_ms);
+
             if (rc != NXT_UNIT_OK) {
                 break;
             }
@@ -710,11 +733,12 @@ nxt_port_recv_test_port_msg_retry_pending(nxt_unit_ctx_t *ctx,
         (void) clock_gettime(CLOCK_MONOTONIC, &end);
 
         /*
-         * Nine calls report "call me again", the tenth reaches the give-up
-         * that closes the worker rather than leaving it detached for good.
+         * Calls report "call me again" until the tenth retry reaches the
+         * give-up that closes the worker rather than leaving it detached
+         * for good.
          */
 
-        if (rc != NXT_UNIT_ERROR || calls != 10) {
+        if (rc != NXT_UNIT_ERROR || calls <= 10) {
             _exit(2);
         }
 
@@ -724,10 +748,14 @@ nxt_port_recv_test_port_msg_retry_pending(nxt_unit_ctx_t *ctx,
             _exit(3);
         }
 
-        if ((end.tv_sec - start.tv_sec) * 1000000000L
-            + (end.tv_nsec - start.tv_nsec) < 100000000L)
-        {
+        if (nxt_port_recv_test_ms(&start, &end) < 100) {
             _exit(4);
+        }
+
+        /* The last backoff steps are 256 ms; a wait that long is a block. */
+
+        if (max_ms >= 50) {
+            _exit(5);
         }
 
         _exit(0);
@@ -1049,7 +1077,7 @@ main(void)
     nxt_port_recv_test_deferred_quit_port_msg(ctx,
         "nxt_unit_process_port_msg() runs a pending finish retry");
     nxt_port_recv_test_port_msg_retry_pending(ctx,
-        "nxt_unit_process_port_msg() asks for a call back");
+        "nxt_unit_process_port_msg() asks for a call back, no wait");
     nxt_port_recv_test_shared_quit_retry(ctx, 1, NXT_UNIT_OK,
         "nxt_unit_run_shared() runs a pending finish retry");
     nxt_port_recv_test_shared_quit_retry(ctx, 20, NXT_UNIT_ERROR,
