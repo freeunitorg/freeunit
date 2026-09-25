@@ -852,6 +852,47 @@ jobs:
       - name: Run libunit port_recv fd-ownership test
         run: ./build/unit_port_recv_test
 
+  # Same C unit-test suite as c-tests above, built with AddressSanitizer and
+  # run with LeakSanitizer's default ASAN_OPTIONS (detect_leaks is on unless
+  # something turns it off). Separate from sanitize.yml: that workflow runs
+  # unitd itself, a fork-heavy daemon where leak detection is noisy enough
+  # that it is turned off there deliberately (see its "Configure unit"
+  # comment); build/tests is a single non-forking process exercising
+  # nxt_lvlhsh, nxt_mp, the port/IPC fixtures, etc. directly, so a leak here
+  # is a real one in that fixture's own teardown, not daemon-lifecycle noise.
+  # No suppressions file: every known leak was fixed at its allocation site
+  # (test fixtures freeing what they allocated -- lvlhsh buckets, ports,
+  # runtime processes).
+  c-tests-asan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev clang
+
+      - name: Configure unit (ASan+LSan, --tests)
+        run: |
+          ./configure \
+            --cc=clang \
+            --debug \
+            --tests \
+            --cc-opt="-fsanitize=address -fno-omit-frame-pointer -g" \
+            --ld-opt="-fsanitize=address"
+
+      - name: Build C tests
+        run: make -j4 tests
+
+      # sudo for the same reason as c-tests above: the clone creds cases
+      # need real root. Running as root does not disable LeakSanitizer --
+      # this repo's own sandboxed reproduction ran as root throughout.
+      - name: Run C tests
+        run: sudo ./build/tests
+
   # OpenSSL 4.0 compile gate.  4.0 removed nothing Unit uses, but it deprecated
   # more of what Unit still calls, and 5.0 is where the deprecated symbols
   # actually go away -- so the value here is having a leg that fails when a new
