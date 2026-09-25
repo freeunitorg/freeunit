@@ -2851,7 +2851,27 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
 
         h1p = peer->proto.h1;
 
+        /*
+         * See nxt_h1p_peer_transfer_encoding().  RFC 9112 Sect. 6.3: with
+         * Transfer-Encoding present, Content-Length never frames the body,
+         * and a response with both "ought to be handled as an error".  The
+         * upstream connection is always closed after the response, so it is
+         * never reused whatever the framing.
+         */
+        if (h1p->transfer_encoding == NXT_HTTP_TE_UNSUPPORTED) {
+            nxt_log(task, NXT_LOG_WARN,
+                    "upstream sent unsupported Transfer-Encoding");
+
+            peer->status = NXT_HTTP_BAD_GATEWAY;
+            break;
+        }
+
+        h1p->chunked = (h1p->transfer_encoding == NXT_HTTP_TE_CHUNKED);
+
         if (h1p->chunked && r->resp.content_length != NULL) {
+            nxt_log(task, NXT_LOG_WARN, "upstream sent both "
+                    "Transfer-Encoding and Content-Length");
+
             peer->status = NXT_HTTP_BAD_GATEWAY;
             break;
         }
@@ -3380,20 +3400,89 @@ nxt_h1p_peer_free(nxt_task_t *task, void *obj, void *data)
 }
 
 
+/*
+ * RFC 9112 Sect. 6.1: Transfer-Encoding is a comma-separated list of transfer
+ * codings, coding names are case-insensitive, and chunked must be the final
+ * coding and must not be applied twice.  Several field lines form one list in
+ * order, so each line continues the state the previous lines left in
+ * h1p->transfer_encoding.
+ *
+ * The proxy decodes only chunked, and Transfer-Encoding is hop-by-hop and is
+ * never forwarded to the client.  So the result is NXT_HTTP_TE_CHUNKED only if
+ * the whole list is exactly one "chunked", in any letter case.  Any other list
+ * -- an unknown coding, "gzip, chunked", "chunked, gzip", chunked twice, an
+ * empty value, a coding with parameters -- is NXT_HTTP_TE_UNSUPPORTED, and
+ * nxt_h1p_peer_header_read_done() fails the response with 502.  RFC 9112
+ * Sect. 6.3 would frame such a body by connection close, but the proxy could
+ * not decode it, and the client would get a body in a coding it is never told
+ * about.  In no case is Content-Length used to frame the body.
+ */
+
 static nxt_int_t
 nxt_h1p_peer_transfer_encoding(void *ctx, nxt_http_field_t *field,
     uintptr_t data)
 {
+    u_char              *p, *end, *start, *last;
+    nxt_bool_t          empty;
+    nxt_h1proto_t       *h1p;
+    nxt_http_te_t       te;
     nxt_http_request_t  *r;
 
     r = ctx;
     field->skip = 1;
 
-    if (field->value_length == 7
-        && memcmp(field->value, "chunked", 7) == 0)
-    {
-        r->peer->proto.h1->chunked = 1;
+    h1p = r->peer->proto.h1;
+    te = h1p->transfer_encoding;
+
+    p = field->value;
+    end = p + field->value_length;
+    empty = 1;
+
+    while (p < end) {
+        start = p;
+
+        while (p < end && *p != ',') {
+            p++;
+        }
+
+        last = p;
+
+        if (p < end) {
+            p++;  /* Skip the comma. */
+        }
+
+        while (start < last && (*start == ' ' || *start == '\t')) {
+            start++;
+        }
+
+        while (last > start && (last[-1] == ' ' || last[-1] == '\t')) {
+            last--;
+        }
+
+        /* RFC 9110 Sect. 5.6.1: empty list elements are ignored. */
+        if (start == last) {
+            continue;
+        }
+
+        empty = 0;
+
+        if (te == NXT_HTTP_TE_NONE
+            && last - start == nxt_length("chunked")
+            && nxt_memcasecmp(start, "chunked", nxt_length("chunked")) == 0)
+        {
+            te = NXT_HTTP_TE_CHUNKED;
+
+        } else {
+            te = NXT_HTTP_TE_UNSUPPORTED;
+        }
     }
+
+    /* A field line must carry at least one transfer coding. */
+    if (empty) {
+        te = NXT_HTTP_TE_UNSUPPORTED;
+    }
+
+    h1p->transfer_encoding = te;
 
     return NXT_OK;
 }
