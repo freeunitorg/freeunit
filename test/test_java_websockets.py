@@ -121,6 +121,29 @@ def test_java_websockets_fragmentation():
     sock.close()
 
 
+def check_text_one_frame(app, *after):
+    # A text message larger than the module's 8 KiB encoder buffer is sent
+    # as one frame.  frame_read(), not message_read(), which would join the
+    # fragments and hide them.
+    client.load(app)
+
+    _, sock, _ = ws.upgrade()
+
+    payload = '*' * 64 * 2**10
+
+    ws.frame_write(sock, ws.OP_TEXT, payload)
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, payload)
+
+    for text in after:
+        check_frame(ws.frame_read(sock), True, ws.OP_TEXT, text)
+
+    close_connection(sock)
+
+
+def test_java_websockets_text_one_frame():
+    check_text_one_frame('websockets_mirror')
+
+
 def test_java_websockets_frame_fragmentation_invalid():
     client.load('websockets_mirror')
 
@@ -1501,8 +1524,9 @@ def test_java_websockets_async_binary():
 
 
 def test_java_websockets_async_large():
-    # A message larger than the module's 8 KiB buffers: the text one still
-    # leaves in 8 KiB frames on the asynchronous path, the binary one whole.
+    # A message larger than the module's 8 KiB buffers is sent whole through
+    # the asynchronous remote.  test_java_websockets_async_text_one_frame
+    # checks the text message on the wire, frame by frame.
     client.load('websockets_async')
 
     _, sock, _ = ws.upgrade()
@@ -1526,6 +1550,10 @@ def test_java_websockets_async_large():
     check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'handler-ok')
 
     close_connection(sock)
+
+
+def test_java_websockets_async_text_one_frame():
+    check_text_one_frame('websockets_async', 'future-done')
 
 
 def test_java_websockets_async_batch():
@@ -1615,9 +1643,10 @@ def test_java_websockets_async_16m(is_unsafe):
     if not is_unsafe:
         pytest.skip('unsafe, long run')
 
-    # The asynchronous text path sends a message 8 KiB at a time and starts
-    # each part from the completion of the previous one; a 16 MiB message is
-    # 2048 parts, which must not nest on the stack.
+    # 16 MiB is exactly the default send cap, so it is one frame.  Above the
+    # cap a message is sent 8 KiB at a time, each part started from the
+    # previous one's completion; lowering the cap to 8 KiB makes 2048 parts,
+    # which must not nest on the stack.
     client.load('websockets_async')
 
     assert 'success' in client.conf(
@@ -1637,7 +1666,7 @@ def test_java_websockets_async_16m(is_unsafe):
     payload = '*' * 16 * 2**20
 
     ws.frame_write(sock, ws.OP_TEXT, payload)
-    check_frame(ws.message_read(sock), True, ws.OP_TEXT, payload)
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, payload)
     check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'future-done')
 
     payload = b'*' * 16 * 2**20
@@ -1648,6 +1677,27 @@ def test_java_websockets_async_16m(is_unsafe):
 
     close_connection(sock)
 
+    assert 'success' in client.conf(
+        ['-Dnginx.unit.websocket.MAX_SEND_BUFFER_SIZE=8192'],
+        'applications/websockets_async/options',
+    ), 'lower the send buffer cap'
+
+    _, sock, _ = ws.upgrade()
+
+    payload = '*' * 16 * 2**20
+
+    ws.frame_write(sock, ws.OP_TEXT, payload)
+
+    sizes = []
+    frame = {'fin': False}
+    while not frame['fin']:
+        frame = ws.frame_read(sock)
+        sizes.append(len(frame['data']))
+
+    assert sizes == [8192] * 2048, 'parts above the cap'
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'future-done')
+
+    close_connection(sock)
 
 def check_buffers(remote):
     # Heap buffers whose bytes do not start at their array's first one: a

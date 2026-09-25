@@ -537,12 +537,14 @@ into 8 KiB frames, whatever "max_frame_size" was set to.  A 64 KiB message
 arrived as eight frames and a 16 MiB one as about two thousand, each carrying
 its own frame header and costing its own message to the router, while every
 other language module sends a complete message as a single frame.  A complete
-text message is now encoded into a buffer of its own and sent as one frame; a
-message above "nginx.unit.websocket.MAX_SEND_BUFFER_SIZE", 16 MiB by default,
-still fragments.  A Writer from getSendWriter() still sends each chunk it
-flushes as a frame of its own, but that chunk is now one frame instead of up to
-three.  This does not make the module honour "max_frame_size", which remains an
-inbound limit only.
+text message, from getBasicRemote() or getAsyncRemote(), is now encoded into a
+buffer of its own and sent as one frame; a message above
+"nginx.unit.websocket.MAX_SEND_BUFFER_SIZE", 16 MiB by default, still
+fragments.  A Writer from getSendWriter() still sends each chunk it flushes as
+a frame of its own, but that chunk is now one frame instead of up to four.  An
+OutputStream from getSendStream() still sends each 8 KiB it fills as a frame of
+its own.  This does not make the module honour "max_frame_size", which remains
+an inbound limit only.
 </para>
 </change>
 

@@ -231,8 +231,9 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
             throw new IllegalArgumentException(sm.getString("wsRemoteEndpoint.nullHandler"));
         }
         stateMachine.textStart();
+        CharBuffer part = CharBuffer.wrap(text);
         TextMessageSendHandler tmsh = new TextMessageSendHandler(handler,
-                CharBuffer.wrap(text), true, encoder, encoderBuffer, this);
+                part, true, encoder, encodeBuffer(part), this);
         tmsh.write();
         // TextMessageSendHandler will update stateMachine when it completes
     }
@@ -313,27 +314,28 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
     }
 
 
-    void sendMessageBlock(CharBuffer part, boolean last) throws IOException {
-        long timeoutExpiry = getTimeoutExpiry();
-        boolean isDone = false;
-
-        /*
-         * Encode the whole message into one buffer where it fits under the
-         * cap, so that it leaves as a single frame.  Above the cap, and for
-         * the messages that already fit, encoderBuffer is used as before; the
-         * loop is unchanged, so an oversized message still fragments exactly
-         * as it did.
-         *
-         * The buffer is on the heap and not direct, to keep the large message
-         * on the same JNI path as every message that fits in encoderBuffer,
-         * which is itself a heap buffer.
-         */
-        ByteBuffer buffer = encoderBuffer;
+    /*
+     * A message that fits under the cap gets a buffer of its own, so it leaves
+     * as one frame: Utf8Encoder returns UNDERFLOW when input and output run
+     * out together.  Any other message uses encoderBuffer and fragments as
+     * before.  The buffer is on the heap, like encoderBuffer, so both take the
+     * same JNI path.
+     */
+    private ByteBuffer encodeBuffer(CharBuffer part) {
         long needed = utf8Length(part, Constants.MAX_SEND_BUFFER_SIZE);
 
         if (needed != OVER_CAP && needed > encoderBuffer.capacity()) {
-            buffer = ByteBuffer.allocate((int) needed);
+            return ByteBuffer.allocate((int) needed);
         }
+
+        return encoderBuffer;
+    }
+
+
+    void sendMessageBlock(CharBuffer part, boolean last) throws IOException {
+        long timeoutExpiry = getTimeoutExpiry();
+        boolean isDone = false;
+        ByteBuffer buffer = encodeBuffer(part);
 
         while (!isDone) {
             buffer.clear();
