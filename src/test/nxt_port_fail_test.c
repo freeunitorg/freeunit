@@ -886,9 +886,10 @@ done:
 /*
  * The level a send to a peer that is gone is logged at.  A QUIT is sent to
  * a process that may have exited already, so EPIPE (ECONNREFUSED on a
- * SOCK_DGRAM pair) on it is info, whether it is sent at once, later from
- * the port's own queue, or to a port with a shared queue; any other message
- * is an alert.  The peer's end is closed, so sendmsg() fails for real.
+ * SOCK_DGRAM pair) on it is info, whether it is sent at once or later from
+ * the port's own queue; any other message is an alert.  A message to a port
+ * with a shared queue goes through that queue, and its socket wake-up is a
+ * READ_QUEUE, so a failed wake-up is an alert whatever it announced.  The peer's end is closed, so sendmsg() fails for real.
  */
 
 static nxt_uint_t  nxt_port_fail_test_sendmsg_level;
@@ -1040,8 +1041,6 @@ nxt_port_fail_test_quit_log_level(nxt_thread_t *thr)
     } legs[] = {
         { NXT_PORT_MSG_QUIT, 0, 0, NXT_LOG_INFO, "a QUIT sent at once" },
         { NXT_PORT_MSG_QUIT, 1, 0, NXT_LOG_INFO, "a QUIT sent from the queue" },
-        { NXT_PORT_MSG_QUIT, 0, 1, NXT_LOG_INFO,
-          "a QUIT to a port with a shared queue" },
         { NXT_PORT_MSG_DATA, 0, 0, NXT_LOG_ALERT, "a DATA sent at once" },
         { NXT_PORT_MSG_DATA, 0, 1, NXT_LOG_ALERT,
           "a DATA to a port with a shared queue" },

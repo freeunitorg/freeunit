@@ -300,15 +300,14 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
     if (port->queue != NULL && type != _NXT_PORT_MSG_READ_QUEUE) {
 
         /*
-         * A QUIT takes the socket, behind a READ_SOCKET marker that keeps
-         * its place in the ring.  Its peer may have exited already, and
-         * nxt_socketpair_send() logs that at info only when it can see the
-         * QUIT type on the wire; the READ_QUEUE wake-up for an enqueued
-         * one would hide it.
+         * A QUIT stays in the shared queue like any other message.  Sending
+         * it on the socket instead would give a worker that is still in
+         * nxt_unit_init() a second socket message it has no queue marker
+         * for yet, and libunit holds only one ("too many port socket
+         * messages").  So the wake-up for it is a plain READ_QUEUE, and a
+         * failed wake-up to a worker that is gone is still an alert.
          */
-        if (fd == -1 && msg.port_msg.type != _NXT_PORT_MSG_QUIT
-            && nxt_port_can_enqueue_buf(b))
-        {
+        if (fd == -1 && nxt_port_can_enqueue_buf(b)) {
             qmsg.pm = msg.port_msg;
 
             qmsg_size = sizeof(qmsg.pm);
