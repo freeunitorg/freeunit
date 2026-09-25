@@ -28,9 +28,11 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Queue;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.websocket.CloseReason;
@@ -120,9 +122,27 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
     }
 
 
+    /*
+     * The batched frames sit in outputBuffer, which only writeMessagePart()
+     * knows how to hand to doWrite(), so the flush goes through startMessage()
+     * like any other message part.  sendMessageBlock() writes straight to the
+     * request instead, and with no payload it has nothing to write.
+     */
     @Override
     public void flushBatch() throws IOException {
-        sendMessageBlock(Constants.INTERNAL_OPCODE_FLUSH, null, true);
+        FutureToSendHandler f2sh = new FutureToSendHandler(wsSession);
+        startMessage(Constants.INTERNAL_OPCODE_FLUSH, null, true, f2sh);
+
+        try {
+            long timeout = getBlockingSendTimeout();
+            if (timeout < 0) {
+                f2sh.get();
+            } else {
+                f2sh.get(timeout, TimeUnit.MILLISECONDS);
+            }
+        } catch (InterruptedException | ExecutionException | TimeoutException e) {
+            throw new IOException(e);
+        }
     }
 
 
@@ -240,18 +260,90 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
     }
 
 
+    private static final long OVER_CAP = -1;
+
+    /*
+     * The exact UTF-8 encoded length of part, without consuming it, or
+     * OVER_CAP once the length passes cap.  The scan stops at the cap, so an
+     * oversized message does not pay for a full pass.
+     *
+     * The widths below are Utf8Encoder's own: one byte up to 0x7F, two up to
+     * 0x7FF, four for a high surrogate followed by a low one, three for the
+     * rest.  An unpaired surrogate lands in the last branch, and the width
+     * charged for it there is arbitrary, because such a message never reaches
+     * the wire: Utf8Encoder returns malformedForLength(1) for an unpaired
+     * surrogate inside the buffer, and UNDERFLOW for one at its very end,
+     * which CharsetEncoder.encode(in, out, true) turns into malformed input
+     * under the default REPORT action.  Either way the encode below reports an
+     * error and throws.
+     */
+    private static long utf8Length(CharBuffer part, long cap) {
+        long len = 0;
+        int limit = part.limit();
+
+        for (int i = part.position(); i < limit; i++) {
+            char c = part.get(i);
+
+            if (c < 0x80) {
+                len += 1;
+            } else if (c < 0x800) {
+                len += 2;
+            } else if (Character.isHighSurrogate(c) && i + 1 < limit
+                       && Character.isLowSurrogate(part.get(i + 1)))
+            {
+                len += 4;
+                i++;
+            } else {
+                len += 3;
+            }
+
+            /*
+             * Inclusive, and load-bearing: a message of exactly cap bytes
+             * still gets a buffer of its own.  Autobahn case 9.1.6 sends
+             * 16777216 bytes, which is the default cap to the byte, so a
+             * ">=" here would fragment the largest case back into 2048 frames
+             * and fail with the very fin mismatch this method exists to fix.
+             */
+            if (len > cap) {
+                return OVER_CAP;
+            }
+        }
+
+        return len;
+    }
+
+
     void sendMessageBlock(CharBuffer part, boolean last) throws IOException {
         long timeoutExpiry = getTimeoutExpiry();
         boolean isDone = false;
+
+        /*
+         * Encode the whole message into one buffer where it fits under the
+         * cap, so that it leaves as a single frame.  Above the cap, and for
+         * the messages that already fit, encoderBuffer is used as before; the
+         * loop is unchanged, so an oversized message still fragments exactly
+         * as it did.
+         *
+         * The buffer is on the heap and not direct, to keep the large message
+         * on the same JNI path as every message that fits in encoderBuffer,
+         * which is itself a heap buffer.
+         */
+        ByteBuffer buffer = encoderBuffer;
+        long needed = utf8Length(part, Constants.MAX_SEND_BUFFER_SIZE);
+
+        if (needed != OVER_CAP && needed > encoderBuffer.capacity()) {
+            buffer = ByteBuffer.allocate((int) needed);
+        }
+
         while (!isDone) {
-            encoderBuffer.clear();
-            CoderResult cr = encoder.encode(part, encoderBuffer, true);
+            buffer.clear();
+            CoderResult cr = encoder.encode(part, buffer, true);
             if (cr.isError()) {
                 throw new IllegalArgumentException(cr.toString());
             }
             isDone = !cr.isOverflow();
-            encoderBuffer.flip();
-            sendMessageBlock(Constants.OPCODE_TEXT, encoderBuffer, last && isDone, timeoutExpiry);
+            buffer.flip();
+            sendMessageBlock(Constants.OPCODE_TEXT, buffer, last && isDone, timeoutExpiry);
         }
         stateMachine.complete(last);
     }
@@ -307,7 +399,16 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
                 intermediateMessageHandler,
                 new EndMessageHandler(this, handler), -1));
 
-        messageParts = transformation.sendMessagePart(messageParts);
+        /*
+         * On the server side there is no transformation: Tomcat's
+         * WsHttpUpgradeHandler.init() takes it from the WsFrameServer it
+         * creates, and Unit parses the frames itself, so no WsFrameServer is
+         * ever created and no transformation is installed.  The message
+         * parts then go out as they are.
+         */
+        if (transformation != null) {
+            messageParts = transformation.sendMessagePart(messageParts);
+        }
 
         // Some extensions/transformations may buffer messages so it is possible
         // that no message parts will be returned. If this is the case the
@@ -642,6 +743,22 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
         this.request = request;
     }
 
+
+    /*
+     * The transport doWrite() sends through.  Unit writes the frame header
+     * itself, so a frame is handed over as its payload, opcode and fin bit
+     * rather than as the serialised header writeHeader() built.
+     */
+    protected final void sendWsFrame(ByteBuffer payload, byte opCode,
+            boolean fin, long timeoutExpiry) throws IOException {
+        request.sendWsFrame(payload, opCode, fin, timeoutExpiry);
+    }
+
+
+    protected final boolean isSessionOpen() {
+        return wsSession.isOpen();
+    }
+
     protected void setEncoders(EndpointConfig endpointConfig)
             throws DeploymentException {
         encoderEntries.clear();
@@ -714,13 +831,20 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
             b = 0;
         }
 
+        /*
+         * The frame carries position()..limit(), which is what both write
+         * paths send; limit() alone overstates it for a buffer that does not
+         * start at 0, such as a slice or a partly read one.
+         */
+        int len = payload.remaining();
+
         // Next write the mask && length length
-        if (payload.limit() < 126) {
-            headerBuffer.put((byte) (payload.limit() | b));
-        } else if (payload.limit() < 65536) {
+        if (len < 126) {
+            headerBuffer.put((byte) (len | b));
+        } else if (len < 65536) {
             headerBuffer.put((byte) (126 | b));
-            headerBuffer.put((byte) (payload.limit() >>> 8));
-            headerBuffer.put((byte) (payload.limit() & 0xFF));
+            headerBuffer.put((byte) (len >>> 8));
+            headerBuffer.put((byte) (len & 0xFF));
         } else {
             // Will never be more than 2^31-1
             headerBuffer.put((byte) (127 | b));
@@ -728,10 +852,10 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
             headerBuffer.put((byte) 0);
             headerBuffer.put((byte) 0);
             headerBuffer.put((byte) 0);
-            headerBuffer.put((byte) (payload.limit() >>> 24));
-            headerBuffer.put((byte) (payload.limit() >>> 16));
-            headerBuffer.put((byte) (payload.limit() >>> 8));
-            headerBuffer.put((byte) (payload.limit() & 0xFF));
+            headerBuffer.put((byte) (len >>> 24));
+            headerBuffer.put((byte) (len >>> 16));
+            headerBuffer.put((byte) (len >>> 8));
+            headerBuffer.put((byte) (len & 0xFF));
         }
         if (masked) {
             headerBuffer.put(mask[0]);
