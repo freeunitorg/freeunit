@@ -58,10 +58,19 @@ jobs:
 
       # --tests has always been configured here, but only "all" was built,
       # so a toolchain that breaks the tests binary alone went unnoticed
-      # (musl's CMSG_NXTHDR under clang, #475).  Built, not run: the clone
-      # and credential cases need capabilities this container may not have.
+      # (musl's CMSG_NXTHDR under clang, #475).  build/tests itself is built,
+      # not run: the clone and credential cases need capabilities this
+      # container may not have, and nxt_tests.c has no per-test filter.
       - name: make tests
         run: make -j 4 tests
+
+      # The two standalone binaries need no privileges and run here as they do
+      # in build-test's c-tests.  See the same steps in alpine-edge for why.
+      - name: Run libunit close-provenance test
+        run: ./build/unit_close_test
+
+      - name: Run libunit port_recv fd-ownership test
+        run: ./build/unit_port_recv_test
 
       - name: configure unit-php
         run: ./configure php
@@ -185,10 +194,21 @@ jobs:
 
       # --tests has always been configured here, but only "all" was built,
       # so a toolchain that breaks the tests binary alone went unnoticed
-      # (musl's CMSG_NXTHDR under clang, #475).  Built, not run: the clone
-      # and credential cases need capabilities this container may not have.
+      # (musl's CMSG_NXTHDR under clang, #475).  build/tests itself is built,
+      # not run: the clone and credential cases need capabilities this
+      # container may not have, and nxt_tests.c has no per-test filter.
       - name: make tests
         run: make -j 4 tests
+
+      # The two standalone binaries need no privileges, so they run here as
+      # they do in build-test's c-tests.  unit_port_recv_test moves control
+      # messages over socketpair()s, so it executes the NXT_CMSG_NXTHDR() loop
+      # #475 changed against musl's macro; nothing else runs that on musl.
+      - name: Run libunit close-provenance test
+        run: ./build/unit_close_test
+
+      - name: Run libunit port_recv fd-ownership test
+        run: ./build/unit_port_recv_test
 
       - name: configure unit-php
         run: |
