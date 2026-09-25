@@ -321,9 +321,9 @@ JSON_FIELDS = [
 ]
 
 
-def get_json_record(wait_for_record, url):
+def get_json_record(wait_for_record, url, method='GET'):
     found = wait_for_record(
-        fr'^\{{.*"request":"GET {re.escape(url)} .*\}}$', 'access.log'
+        fr'^\{{.*"request":"{method} {re.escape(url)} .*\}}$', 'access.log'
     )
     assert found is not None, 'json record'
 
@@ -419,6 +419,76 @@ def test_access_log_json_literal(wait_for_record):
     check_literal('jsonx')
     check_literal('json ')
     check_literal('JSON')
+
+
+def test_access_log_json_status_bytes(wait_for_record):
+    load('mirror')
+    set_format('json')
+
+    # "status" and "bytes_sent" must follow the response, not be constant.
+
+    assert client.post(url='/json_body', body='01234')['status'] == 200
+
+    entry = get_json_record(wait_for_record, '/json_body', 'POST')
+
+    assert entry['status'] == '200', 'status 200'
+    assert entry['bytes_sent'] == '5', 'bytes_sent mirror'
+
+    assert 'success' in client.conf(
+        [{"action": {"return": 404}}], 'routes'
+    ), 'routes'
+    assert 'success' in client.conf(
+        {"*:8080": {"pass": "routes"}}, 'listeners'
+    ), 'listeners'
+
+    resp = client.get(url='/json_404')
+    assert resp['status'] == 404
+
+    entry = get_json_record(wait_for_record, '/json_404')
+
+    assert entry['status'] == '404', 'status 404'
+    assert entry['bytes_sent'] == str(len(resp['body'])), 'bytes_sent 404'
+    assert entry['bytes_sent'] != '0', 'bytes_sent 404 not empty'
+
+
+def test_access_log_json_empty_header(wait_for_record):
+    load('empty')
+    set_format('json')
+
+    # An absent header is "-", a present but empty one is "".
+
+    assert (
+        client.get(
+            url='/json_empty',
+            headers={
+                'Host': 'localhost',
+                'Connection': 'close',
+                'User-Agent': '',
+            },
+        )['status']
+        == 200
+    )
+
+    entry = get_json_record(wait_for_record, '/json_empty')
+
+    assert entry['user_agent'] == '', 'empty user agent'
+    assert entry['referer'] == '-', 'absent referer'
+
+
+def test_access_log_json_if(search_in_file, wait_for_record):
+    load('empty')
+    set_format('json')
+    set_if('$arg_log')
+
+    assert client.get(url='/json_if_skip')['status'] == 200
+    assert client.get(url='/json_if_log?log=1')['status'] == 200
+
+    entry = get_json_record(wait_for_record, '/json_if_log?log=1')
+
+    assert list(entry.keys()) == JSON_FIELDS, 'stable field set'
+    assert (
+        search_in_file(r'"GET /json_if_skip ', 'access.log') is None
+    ), 'if skips record'
 
 
 def _read_log_lines():
