@@ -41,6 +41,8 @@ static nxt_buf_t *nxt_port_buf_alloc(nxt_port_t *port);
 static void nxt_port_buf_free(nxt_port_t *port, nxt_buf_t *b);
 static void nxt_port_frag_unaccount(nxt_port_t *port,
     nxt_port_recv_msg_t *fmsg);
+static void nxt_port_frag_bufs_release(nxt_task_t *task, nxt_port_t *port,
+    nxt_buf_t *b);
 static void nxt_port_announce(nxt_task_t *task, nxt_port_t *port);
 static void nxt_port_rearm_now(nxt_task_t *task, nxt_port_t *port);
 static void nxt_port_rearm_work_handler(nxt_task_t *task, void *obj,
@@ -923,8 +925,12 @@ next_fragment:
 
         /*
          * Send through mmap enabled only when payload
-         * is bigger than PORT_MMAP_MIN_SIZE.
+         * is bigger than PORT_MMAP_MIN_SIZE.  The bit is per fragment: a
+         * fragment sent plain after one sent through mmap must not carry
+         * it, or the receiver reads its payload as mmap records.
          */
+        msg->port_msg.mmap = 0;
+
         if (m == NXT_PORT_METHOD_MMAP && plain_size > PORT_MMAP_MIN_SIZE) {
             nxt_port_mmap_write(task, port, msg, &sb, mmsg_buf);
 
@@ -1918,14 +1924,37 @@ static const nxt_lvlhsh_proto_t  lvlhsh_frag_proto  nxt_aligned(64) = {
 
 
 /*
+ * An upper bound on what nxt_port_mmap_read() allocates for each record:
+ * nxt_buf_mem_ts_alloc() takes the memory part of an nxt_buf_t followed by
+ * its thread-safe completion state, a work item and an engine pointer.
+ */
+#define NXT_PORT_FRAG_MMAP_BUF_COST                                           \
+    (sizeof(nxt_buf_t) + sizeof(nxt_work_t) + sizeof(void *))
+
+
+/*
  * What a fragment kept for reassembly costs the receiver: the whole buffer
  * it came in, port->max_size, however little of it carries.  Counting the
  * payload alone let a stream of empty fragments hold buffers without limit.
+ * An mmap fragment also keeps a buffer per record, and a record may name
+ * no bytes at all: a max_size fragment of empty records is some 1,300
+ * buffers, so each of them is charged too.
  */
-nxt_inline size_t
+static size_t
 nxt_port_frag_cost(nxt_port_t *port, nxt_port_recv_msg_t *msg)
 {
-    return nxt_max(msg->size, port->max_size);
+    size_t     cost;
+    nxt_buf_t  *b;
+
+    cost = nxt_max(msg->size, port->max_size);
+
+    if (msg->port_msg.mmap) {
+        for (b = msg->buf; b != NULL; b = b->next) {
+            cost += NXT_PORT_FRAG_MMAP_BUF_COST;
+        }
+    }
+
+    return cost;
 }
 
 
@@ -2064,13 +2093,13 @@ nxt_port_frag_unaccount(nxt_port_t *port, nxt_port_recv_msg_t *fmsg)
 /*
  * Would appending "msg" to the stream being reassembled in "fmsg" pass a
  * limit?  The per-port total is checked only for a fragment that keeps the
- * stream open: the last one hands the whole message over at once.  A stream
- * and the port's total are kept under their limits, so neither subtraction
- * can wrap.
+ * stream open, against its "cost": the last one hands the whole message
+ * over at once.  A stream and the port's total are kept under their
+ * limits, so neither subtraction can wrap.
  */
 static nxt_bool_t
 nxt_port_frag_fits(nxt_task_t *task, nxt_port_t *port,
-    nxt_port_recv_msg_t *fmsg, nxt_port_recv_msg_t *msg)
+    nxt_port_recv_msg_t *fmsg, nxt_port_recv_msg_t *msg, size_t cost)
 {
     if (nxt_slow_path(msg->size > NXT_PORT_FRAG_SIZE_MAX - fmsg->size)) {
         nxt_alert(task, "port %d: fragmented message #%uD from pid %PI "
@@ -2081,8 +2110,7 @@ nxt_port_frag_fits(nxt_task_t *task, nxt_port_t *port,
     }
 
     if (msg->port_msg.mf != 0
-        && nxt_slow_path(nxt_port_frag_cost(port, msg)
-                         > NXT_PORT_FRAG_TOTAL_MAX - port->frag_size))
+        && nxt_slow_path(cost > NXT_PORT_FRAG_TOTAL_MAX - port->frag_size))
     {
         nxt_alert(task, "port %d: fragmented messages in progress exceed "
                   "%d bytes, dropping stream #%uD from pid %PI",
@@ -2096,6 +2124,33 @@ nxt_port_frag_fits(nxt_task_t *task, nxt_port_t *port,
 
 
 /*
+ * Gives back the buffers of a reassembled message, each the way it came:
+ * a shared memory buffer is completed, a read buffer returns to the port.
+ * The fragments of one stream need not all have come the same way -- the
+ * sender picks plain or mmap per fragment -- so the last fragment's mmap
+ * bit does not say how to release what the earlier ones brought.
+ */
+static void
+nxt_port_frag_bufs_release(nxt_task_t *task, nxt_port_t *port, nxt_buf_t *b)
+{
+    nxt_buf_t  *next;
+
+    for ( /* void */ ; b != NULL; b = next) {
+        next = b->next;
+        b->next = NULL;
+
+        if (nxt_buf_is_port_mmap(b)) {
+            nxt_work_queue_add(port->socket.read_work_queue,
+                               b->completion_handler, task, b, b->parent);
+
+        } else {
+            nxt_port_buf_free(port, b);
+        }
+    }
+}
+
+
+/*
  * Drops a stream that passed a limit: out of ->frags if it is still there,
  * then everything it had accumulated -- buffers, the first fragment's
  * descriptors, the stream itself.  Its later fragments find no stream and
@@ -2105,7 +2160,6 @@ static void
 nxt_port_frag_drop(nxt_task_t *task, nxt_port_t *port,
     nxt_port_recv_msg_t *fmsg, nxt_bool_t in_hash)
 {
-    nxt_buf_t            *b, *next;
     nxt_lvlhsh_query_t   lhq;
     nxt_port_frag_key_t  frag_key;
 
@@ -2125,18 +2179,7 @@ nxt_port_frag_drop(nxt_task_t *task, nxt_port_t *port,
         }
     }
 
-    for (b = fmsg->buf; b != NULL; b = next) {
-        next = b->next;
-        b->next = NULL;
-
-        if (nxt_buf_is_port_mmap(b)) {
-            nxt_work_queue_add(port->socket.read_work_queue,
-                               b->completion_handler, task, b, b->parent);
-
-        } else {
-            nxt_port_buf_free(port, b);
-        }
-    }
+    nxt_port_frag_bufs_release(task, port, fmsg->buf);
 
     nxt_port_close_fds(fmsg->fd);
 
@@ -2144,10 +2187,40 @@ nxt_port_frag_drop(nxt_task_t *task, nxt_port_t *port,
 }
 
 
+/*
+ * Did nxt_port_mmap_read() turn an mmap fragment into shared memory
+ * buffers?  A fragment that is empty, carries only part of a record, or
+ * whose first record names no segment leaves msg->buf at the read buffer
+ * "orig_b", or at NULL.  Kept in a stream, the read buffer would also be
+ * given back to port->free_bufs by the caller and reused for the next
+ * message while the stream still held it; the sender never sends such a
+ * fragment, so the fragment is refused.  msg->buf is set back to "orig_b"
+ * for the caller to free.
+ */
+static nxt_bool_t
+nxt_port_frag_mmap_valid(nxt_task_t *task, nxt_port_t *port,
+    nxt_port_recv_msg_t *msg, nxt_buf_t *orig_b)
+{
+    if (nxt_fast_path(msg->buf != orig_b && msg->buf != NULL)) {
+        return 1;
+    }
+
+    nxt_alert(task, "port %d: mmap fragment of message #%uD from pid %PI "
+              "carries no shared memory buffer, dropped", port->socket.fd,
+              msg->port_msg.stream, msg->port_msg.pid);
+
+    msg->buf = orig_b;
+    msg->size = 0;
+
+    return 0;
+}
+
+
 static void
 nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
     nxt_port_recv_msg_t *msg)
 {
+    size_t               cost;
     nxt_buf_t            *b, *orig_b, *next;
     nxt_port_recv_msg_t  *fmsg;
 
@@ -2180,9 +2253,26 @@ nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
 
             if (msg->port_msg.mmap) {
                 nxt_port_mmap_read(task, msg);
+
+                if (nxt_slow_path(!nxt_port_frag_mmap_valid(task, port, msg,
+                                                            orig_b)))
+                {
+                    /* The last fragment's lookup took it out already. */
+                    nxt_port_frag_drop(task, port, fmsg,
+                                       msg->port_msg.mf != 0);
+
+                    b = orig_b;
+
+                    goto fmsg_failed;
+                }
             }
 
-            if (nxt_slow_path(!nxt_port_frag_fits(task, port, fmsg, msg))) {
+            /* The last fragment is not kept, so it is not charged. */
+            cost = (msg->port_msg.mf != 0) ? nxt_port_frag_cost(port, msg) : 0;
+
+            if (nxt_slow_path(!nxt_port_frag_fits(task, port, fmsg, msg,
+                                                  cost)))
+            {
                 /* The last fragment's lookup took the stream out already. */
                 nxt_port_frag_drop(task, port, fmsg, msg->port_msg.mf != 0);
 
@@ -2197,8 +2287,8 @@ nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
             fmsg->size += msg->size;
 
             if (msg->port_msg.mf != 0) {
-                fmsg->frag_held += nxt_port_frag_cost(port, msg);
-                port->frag_size += nxt_port_frag_cost(port, msg);
+                fmsg->frag_held += cost;
+                port->frag_size += cost;
             }
 
             msg->buf = NULL;
@@ -2222,10 +2312,16 @@ nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
 
                 /*
                  * To disable instant completion or buffer re-usage,
-                 * handler should reset 'msg.buf'.
+                 * handler should reset 'msg.buf'.  Whatever it leaves is
+                 * released here, buffer by buffer: this fragment's own read
+                 * buffer is in the chain only when it came plain, and an
+                 * mmap fragment's is freed by the caller once msg->buf is
+                 * restored below.
                  */
-                if (!msg->port_msg.mmap && msg->buf == b) {
-                    nxt_port_buf_free(port, b);
+                if (msg->buf == b) {
+                    nxt_port_frag_bufs_release(task, port, b);
+
+                    msg->buf = NULL;
                 }
             }
         }
@@ -2238,6 +2334,15 @@ nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
 
             if (msg->port_msg.mmap && msg->cancelled == 0) {
                 nxt_port_mmap_read(task, msg);
+
+                if (nxt_slow_path(!nxt_port_frag_mmap_valid(task, port, msg,
+                                                            orig_b)))
+                {
+                    b = orig_b;
+
+                    goto fmsg_failed;
+                }
+
                 b = msg->buf;
             }
 
