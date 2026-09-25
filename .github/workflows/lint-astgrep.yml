@@ -1,8 +1,9 @@
 name: "Lint (ast-grep)"
 
 # ast-grep: fail on violations not in tools/ast-grep/baseline.json.
-# require-tests: a src/ change needs a test/ or src/test/ change, unless the PR
-# has the "no-test-needed" label or a commit has a "No-Test-Reason:" trailer.
+# require-tests: a production src/ change needs a test/ or src/test/ change,
+# unless the PR has the "no-test-needed" label or a commit has a
+# "No-Test-Reason: <why>" trailer with a non-empty value.
 
 on:
   pull_request:
@@ -57,21 +58,28 @@ jobs:
             exit 0
           fi
 
-          if git log --format='%B' "$BASE_SHA..$HEAD_SHA" \
-             | grep -qiE '^No-Test-Reason:'; then
-            echo "opted out via a No-Test-Reason: trailer"
-            git log --format='%B' "$BASE_SHA..$HEAD_SHA" \
-              | grep -iE '^No-Test-Reason:'
+          # Only a real trailer counts, not text in the body, and its
+          # value must not be blank.
+          reasons="$(git log \
+              --format='%(trailers:key=No-Test-Reason,valueonly)' \
+              "$BASE_SHA..$HEAD_SHA" | grep -E '[^[:space:]]' || true)"
+
+          if [ -n "$reasons" ]; then
+            echo "opted out via a No-Test-Reason: trailer:"
+            echo "$reasons"
             exit 0
           fi
 
           changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
 
+          # Any file under src/ is production code (C, C++, JS, Java, Rust,
+          # build files), except the tests in src/test/ and docs.
           src_changed="$(echo "$changed" \
-            | grep -E '^src/.*\.(c|h)$' || true)"
+            | grep -E '^src/' \
+            | grep -vE '^src/test/|\.md$|/\.gitignore$' || true)"
 
           if [ -z "$src_changed" ]; then
-            echo "no src/**/*.c or src/**/*.h changes; nothing to require"
+            echo "no production src/ changes; nothing to require"
             exit 0
           fi
 
@@ -85,7 +93,7 @@ jobs:
             exit 0
           fi
 
-          echo "::error::This PR changes src/**/*.c or src/**/*.h:"
+          echo "::error::This PR changes production files under src/:"
           echo "$src_changed"
           echo
           echo "::error::...without touching test/ or src/test/. Add a test," \
