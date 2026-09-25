@@ -368,6 +368,11 @@ nxt_fd_event_change_test_keeps_others(nxt_thread_t *thr,
      * Commits the two that were kept.  Both are still allocated, and both
      * descriptors are still open, so this is the check that compaction left
      * usable entries rather than merely the right count.
+     *
+     * Both are writable, so the poll also queues their handlers on
+     * fast_work_queue with ev[0] and ev[2] as the object.  Nothing runs that
+     * queue before nxt_event_engine_free() drops it; a leg that does run it
+     * has to do so before the events are freed below.
      */
 
     engine->event.poll(engine, 0);
@@ -400,6 +405,7 @@ nxt_fd_event_change_test_keeps_others(nxt_thread_t *thr,
 
     {
         int                 err;
+        nxt_err_t           errn;
         nxt_uint_t          k;
         struct epoll_event  ee;
 
@@ -410,13 +416,14 @@ nxt_fd_event_change_test_keeps_others(nxt_thread_t *thr,
 
             err = epoll_ctl(engine->u.epoll.fd, EPOLL_CTL_MOD, pair[k][1],
                             &ee);
+            errn = (err == 0) ? 0 : nxt_errno;
 
             if (k == 1) {
-                if (nxt_slow_path(err == 0 || nxt_errno != NXT_ENOENT)) {
+                if (nxt_slow_path(err == 0 || errn != NXT_ENOENT)) {
                     nxt_log_error(NXT_LOG_NOTICE, thr->log,
                                   "fd event change test: the cancelled event "
-                                  "reached the epoll set (fd:%d err:%d)",
-                                  pair[k][1], err);
+                                  "reached the epoll set (fd:%d) %E",
+                                  pair[k][1], errn);
                     goto done;
                 }
 
@@ -424,7 +431,7 @@ nxt_fd_event_change_test_keeps_others(nxt_thread_t *thr,
                 nxt_log_error(NXT_LOG_NOTICE, thr->log,
                               "fd event change test: a kept event is not in "
                               "the epoll set (fd:%d) %E",
-                              pair[k][1], nxt_errno);
+                              pair[k][1], errn);
                 goto done;
             }
         }

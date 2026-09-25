@@ -328,8 +328,8 @@ nxt_kqueue_close(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
  *
  * Matching is on ->udata, which nxt_kqueue_fd_set() sets to the event; that
  * names the struct being freed exactly, where ->ident names only a
- * descriptor number.  nxt_kqueue_file_set() puts a file event in the same
- * field, and a pointer comparison tells the two apart on its own.
+ * descriptor number.  nxt_kqueue_enable_file() puts a file event in the
+ * same field, and a pointer comparison tells the two apart on its own.
  *
  * Unlike the other engines this does not return early when ->changing is
  * clear.  Here the flag is only ever a "maybe" -- a flush leaves it set,
@@ -509,14 +509,14 @@ nxt_kqueue_fd_set(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
      * scans by descriptor, and nxt_kqueue_cancel_changes() scans by ->udata
      * without testing the flag.
      *
-     * A flush does not clear it, because the batch mixes fd events with the
-     * file events nxt_kqueue_file_set() puts in the same ->udata field, and
-     * nothing in a kevent says which of the two it holds: clearing the flag
-     * over a flushed batch would write through an nxt_file_event_t as if it
-     * were an nxt_fd_event_t.  So the flag only ever says "maybe", and the
-     * cost of that is a scan that finds nothing.  It is never stale in the
-     * unsafe direction: it is set whenever a change is queued, and cleared
-     * only once the batch has been scanned.
+     * A flush does not clear it.  It could: ->filter tells an fd event from
+     * the file events nxt_kqueue_enable_file() puts in the same ->udata
+     * field, as nxt_kqueue_error() relies on.  But clearing would walk the
+     * whole batch on every flush and every poll, to spare a scan that runs
+     * only when a port is released.  So the flag only ever says "maybe", and
+     * the cost of that is a scan that finds nothing.  It is never stale in
+     * the unsafe direction: it is set whenever a change is queued, and
+     * cleared only once the batch has been scanned.
      */
 
     ev->changing = 1;
