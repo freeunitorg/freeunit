@@ -51,11 +51,24 @@ esac
 
 TOOLCHAIN="$cc_name-${cc_version:-unknown}-$libc"
 
-MAKEFILE_SAVE=
+# ./configure writes ./Makefile; the builds use their own build-<name>-<cc>
+# directories, so ./build is not touched.  Put ./Makefile back as it was, or
+# remove it when there was none.
 WORK=$(mktemp -d)
+MAKEFILE_SAVE=$WORK/Makefile.orig
+MAKEFILE_EXISTED=0
+
+if [ -f Makefile ]; then
+    cp -p Makefile "$MAKEFILE_SAVE"
+    MAKEFILE_EXISTED=1
+fi
 
 cleanup() {
-    [ -z "$MAKEFILE_SAVE" ] || mv -f "$MAKEFILE_SAVE" Makefile
+    if [ "$MAKEFILE_EXISTED" -eq 1 ]; then
+        mv -f "$MAKEFILE_SAVE" Makefile
+    else
+        rm -f Makefile
+    fi
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -63,11 +76,6 @@ trap cleanup EXIT
 # build <name>: configure and build unitd and the tests in build-<name>-<cc>.
 build() {
     BUILD_DIR=build-$1-$cc_name
-
-    if [ -f Makefile ]; then
-        MAKEFILE_SAVE=$(mktemp)
-        cp -p Makefile "$MAKEFILE_SAVE"
-    fi
 
     echo "toolchain: $TOOLCHAIN, build dir: $BUILD_DIR"
 
