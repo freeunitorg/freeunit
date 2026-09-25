@@ -28,10 +28,10 @@ nxt_conn_io_write(nxt_task_t *task, void *obj, void *data)
               c->socket.fd, c->socket.error, c->block_write);
 
     /*
-     * Test this first: after nxt_conn_close() the error path would queue
-     * the close state's NULL error_handler.
+     * A write queued before nxt_conn_close() returns here: the error path
+     * would queue the close state's NULL error_handler.
      */
-    if (c->write == NULL) {
+    if (c->closing) {
         return;
     }
 
@@ -39,7 +39,7 @@ nxt_conn_io_write(nxt_task_t *task, void *obj, void *data)
         goto error;
     }
 
-    if (!c->socket.write_ready) {
+    if (!c->socket.write_ready || c->write == NULL) {
         return;
     }
 

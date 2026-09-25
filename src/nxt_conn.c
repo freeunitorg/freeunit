@@ -192,7 +192,7 @@ nxt_conn_free(nxt_task_t *task, nxt_conn_t *c)
         /*
          * Park the struct rather than publishing it to the freelist directly.
          * A conn can be freed while work items that reference it are still
-         * queued -- nxt_h1p_peer_close() sets block_read/block_write for
+         * queued -- nxt_h1p_peer_close() sets block_read/closing for
          * exactly that reason, then reaches nxt_conn_free() synchronously on
          * its fd == -1 path.  Handing the struct out now would let
          * nxt_conn_create()'s re-zero clear those guards from under the queued
