@@ -6,8 +6,8 @@
 
 
 <changes apply="unit"
-         ver="1.36.2" rev="1"
-         date="2026-08-30" time="00:00:00 +0000"
+         ver="1.37.0" rev="1"
+         date="2026-10-04" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change type="change">
@@ -656,6 +656,24 @@ its bytes.  A log parser that expected the raw bytes has to be updated, though "
 reversible and the bytes can be recovered from it.  The object form of "format"
 is unaffected by this change, but it is not a way to keep bytes either: it
 replaces anything that is not valid UTF-8 with U+FFFD before it serializes.
+</para>
+</change>
+
+<change type="security">
+<para>
+when "access_log" "format" was a JSON object without an njs expression, the
+router wrote each variable's value into the record without escaping it.  A
+request header with a quote could close a member and add members to the
+record.  Every value is now escaped.  A variable in a member name is no longer
+expanded; the name is written as configured.
+</para>
+</change>
+
+<change type="change">
+<para>
+an object-format access log replaces each byte that begins no valid UTF-8
+sequence with U+FFFD.  Request headers may carry such bytes, and the record was
+then not valid JSON.  The string form keeps them, written as \xHH.
 </para>
 </change>
 
@@ -1326,13 +1344,13 @@ rejected; it was served as an empty 200 response.  The bug had appeared in 0.4.
                 unit-jsc-common unit-jsc11 unit-jsc17 unit-jsc18
                 unit-jsc19 unit-jsc20 unit-jsc21
                 unit-wasm"
-         ver="1.36.2" rev="1"
-         date="2026-08-30" time="00:00:00 +0000"
+         ver="1.37.0" rev="1"
+         date="2026-10-04" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change>
 <para>
-FreeUnit updated to 1.36.2.
+FreeUnit updated to 1.37.0.
 </para>
 </change>
 

@@ -1,5 +1,5 @@
 
-Changes with FreeUnit 1.36.2                                     30 Aug 2026
+Changes with FreeUnit 1.37.0                                     04 Oct 2026
 
     *) Bugfix: a chunked request body that grew over "max_body_size"
        after the read that carried the request header got no response.
@@ -470,6 +470,18 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        from it.  The object form of "format" is unaffected by this change,
        but it is not a way to keep bytes either: it replaces anything that
        is not valid UTF-8 with U+FFFD before it serializes.
+
+    *) Security: when "access_log" "format" was a JSON object without an
+       njs expression, the router wrote each variable's value into the
+       record without escaping it. A request header with a quote could
+       close a member and add members to the record. Every value is now
+       escaped. A variable in a member name is no longer expanded; the
+       name is written as configured.
+
+    *) Change: an object-format access log replaces each byte that begins
+       no valid UTF-8 sequence with U+FFFD. Request headers may carry such
+       bytes, and the record was then not valid JSON. The string form
+       keeps them, written as \xHH.
 
     *) Change: upgrade contrib njs to 1.0.1.
 
