@@ -6,8 +6,8 @@
 
 
 <changes apply="unit"
-         ver="1.36.2" rev="1"
-         date="2026-08-30" time="00:00:00 +0000"
+         ver="1.37.0" rev="1"
+         date="2026-10-01" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change type="bugfix">
@@ -518,13 +518,13 @@ application builds and behaves as before.
                 unit-jsc-common unit-jsc11 unit-jsc17 unit-jsc18
                 unit-jsc19 unit-jsc20 unit-jsc21
                 unit-wasm"
-         ver="1.36.2" rev="1"
-         date="2026-08-30" time="00:00:00 +0000"
+         ver="1.37.0" rev="1"
+         date="2026-10-01" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change>
 <para>
-FreeUnit updated to 1.36.2.
+FreeUnit updated to 1.37.0.
 </para>
 </change>
 

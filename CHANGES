@@ -1,5 +1,5 @@
 
-Changes with FreeUnit 1.36.2                                     30 Aug 2026
+Changes with FreeUnit 1.37.0                                     01 Oct 2026
 
     *) Bugfix: an application worker that served a WebSocket upgrade never
        became idle again. The router counts a session on the worker and
