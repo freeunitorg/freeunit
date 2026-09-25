@@ -26,6 +26,7 @@
 #include <nxt_main.h>
 #include <nxt_port.h>
 #include <nxt_port_queue.h>
+#include <nxt_socket_msg.h>
 #include "nxt_tests.h"
 
 #include <fcntl.h>
@@ -568,7 +569,7 @@ nxt_port_queued_fd_test_recv_fd(nxt_fd_t sock)
 
     fd = -1;
 
-    for (cm = CMSG_FIRSTHDR(&mh); cm != NULL; cm = CMSG_NXTHDR(&mh, cm)) {
+    for (cm = CMSG_FIRSTHDR(&mh); cm != NULL; cm = NXT_CMSG_NXTHDR(&mh, cm)) {
         if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
             nxt_memcpy(&fd, CMSG_DATA(cm), sizeof(int));
             break;
