@@ -15,9 +15,10 @@ and test details, see `CLAUDE.md`.
   check both normal behavior and malformed input paths.
 - For isolation, mounts, cgroups, credentials, namespaces, and chroot/rootfs
   changes, assume privilege-boundary regressions are high severity.
-- For language modules (`src/php`, `src/python`, `src/nodejs`, `src/ruby`,
-  `src/perl`, `src/java`, `src/wasm*`, `go/`), verify module-specific lifecycle
-  and version compatibility, not only the shared core behavior.
+- For language modules (`src/nxt_php_sapi.c`, `src/python`, `src/nodejs`,
+  `src/ruby`, `src/perl`, `src/java`, `src/wasm*`, `go/`), verify
+  module-specific lifecycle and version compatibility, not only the shared core
+  behavior.
 - For OpenAPI/docs/config schema changes, keep `docs/unit-openapi.yaml`, config
   validation, tests, and user-facing docs consistent.
 
@@ -61,14 +62,17 @@ Useful commands:
 ```bash
 ./test/run-local.sh -n
 ./test/run-local.sh -t test_tls.py
-./test/run-local.sh python php
+./test/run-local.sh python go
 ./test/run-local-full.sh -n
 ./test/run-local-full.sh
 ```
 
 `./test/run-local.sh` runs the pytest suite in Docker. It copies the tree to a
 temporary directory, configures with test support and common features, builds
-needed modules, and runs `pytest-3 --print-log`.
+`unitd` plus the Python and Go modules, and runs `pytest-3 --print-log`. It
+does not build PHP, Perl, Ruby, Java, Node.js, or Wasm modules: their tests are
+skipped as missing prerequisites. Do not report such a run as coverage for
+those modules.
 
 `./test/run-local-full.sh` runs the clang-ast analysis build in Docker and is
 the preferred extra check for C-core changes.

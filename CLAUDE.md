@@ -52,13 +52,14 @@ signal:
 ```console
 $ ./test/run-local.sh -n                 # list what would run
 $ ./test/run-local.sh -t test_tls.py     # single test file
-$ ./test/run-local.sh python php         # select language modules
+$ ./test/run-local.sh python go          # select language modules
 $ ./test/run-local-full.sh               # clang-ast analysis build (C-core changes)
 ```
 
 `./test/run-local.sh` copies the tree to a temporary directory, configures with
-test support and common features, builds the needed modules, and runs
-`pytest-3 --print-log`.
+test support and common features, builds `unitd` plus the Python and Go
+modules, and runs `pytest-3 --print-log`. Other language modules (PHP, Perl,
+Ruby, Java, Node.js, Wasm) are not built there, so their tests are skipped.
 
 Natively, tests are Python/pytest under `test/` and require **root** (they
 spawn `unitd`, bind sockets, test isolation/chroot). `test/pytest.ini` sets
@@ -118,11 +119,11 @@ user-facing docs consistent.
 **libunit** (`src/nxt_unit.c`, `src/nxt_unit.h`): the C ABI that language
 modules link against. It handles the app side of the port protocol, exposes
 request/response primitives, and is what `nxt_php_sapi.c`, `nxt_python_wsgi.c`,
-`nxt_python_asgi.c`, `nxt_ruby.c`, `nxt_perl.c`, `nxt_go_*`, `nxt_java_*`, and
-`src/nodejs/unit-http/` build on top of.
+`nxt_python_asgi.c`, `nxt_ruby.c`, `nxt_perl_psgi.c`, `nxt_java.c`,
+`go/nxt_cgo_lib.c`, and `src/nodejs/unit-http/` build on top of.
 
 **Language SAPIs** (`src/nxt_php_sapi.c`, `src/python/`, `src/perl/`,
-`src/ruby/`, `src/java/`, `src/nodejs/`, `src/wasm*/`, `src/go/` — Go is a
+`src/ruby/`, `src/java/`, `src/nodejs/`, `src/wasm*/`, `go/` — Go is a
 user-imported package, not a module binary): Each module embeds the runtime
 in-process and bridges its request model to libunit. PHP-specific fork logic
 lives in `nxt_php_sapi.c`; Python has separate WSGI and ASGI entrypoints with
