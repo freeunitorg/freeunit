@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from conftest import unit_stop
+from conftest import pid_by_name, unit_stop
 from unit.applications.tls import ApplicationTLS
 from unit.option import option
 
@@ -1274,18 +1274,18 @@ def test_http2_long_method():
 
     method = 'A' * 300
 
-    # What HTTP/1 answers to the same method.
-    h1 = client.get_ssl(
-        method=method,
-        context=ssl_context(alpn=('http/1.1',)),
+    # What HTTP/1 answers to the same method.  get() always sends GET.
+    h1 = client.http(
+        method,
+        wrapper=ssl_context(alpn=('http/1.1',)).wrap_socket,
     )['status']
+    assert h1 is not None
 
     c = H2Client()
     resp = c.send(method, '/')
     resp = c.wait(resp)
 
-    # HTTP/1 takes a 300-byte method, so HTTP/2 does too.
-    assert h1 == 200
+    # HTTP/2 answers a long method as HTTP/1 does, whatever that is.
     assert resp['status'] == h1
 
     assert c.get('/')['status'] == 200
@@ -2048,6 +2048,50 @@ def test_http2_matrix_tls_abort():
     time.sleep(3)
 
     assert_serves()
+
+
+@pytest.mark.parametrize('end', ['reset', 'rst_stream'])
+def test_http2_matrix_abort_queued(end, findall):
+    need_h2()
+    load_matrix(processes=1)
+
+    router = pid_by_name('unit: router')
+
+    c = RawH2()
+
+    # The first request takes the one application process; the second one
+    # waits in the router for it.
+    for sid in (1, 3):
+        c.request(sid, path='/slow', headers=[('x-delay', '2')])
+
+    assert c.wait(lambda: 1 in c.status)
+
+    if end == 'reset':
+        # The connection fails with both requests in the router.
+        c.sock.setsockopt(
+            socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0)
+        )
+
+    else:
+        # The client cancels the queued request, then leaves.
+        c.send(RstStreamFrame(3, error_code=CANCEL))
+        time.sleep(0.2)
+
+    c.sock.close()
+
+    time.sleep(0.2)
+
+    # Another listener: the configuration of the requests is released.  The
+    # applications are the same and keep running, and the queued request
+    # reaches the process: the router must have dropped it.
+    assert 'success' in client.conf(
+        {'*:8081': {'pass': 'applications/mirror'}}, 'listeners'
+    )
+
+    time.sleep(3)
+
+    assert pid_by_name('unit: router') == router
+    assert not findall(r'signal 11|\[alert\]|Sanitizer')
 
 
 def test_http2_matrix_request_cap_in_flight():
