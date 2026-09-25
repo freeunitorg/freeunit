@@ -65,7 +65,9 @@ nxt_port_release_test_child(void *data)
         return 3;
     }
 
-    /* Already paired: refused, in a release build too. */
+#if !(NXT_DEBUG)
+
+    /* Already paired: refused in a release build; a debug build asserts. */
 
     nxt_process_port_add(task, process, paired);
 
@@ -75,6 +77,8 @@ nxt_port_release_test_child(void *data)
     {
         return 7;
     }
+
+#endif
 
     nxt_port_use(task, paired, -1);
 
