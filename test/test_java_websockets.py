@@ -1412,3 +1412,24 @@ def test_java_websockets_keepalive_interval():
     check_frame(frame, True, ws.OP_PING, '')  # PING frame
 
     sock.close()
+
+
+def test_java_websockets_binary_message_too_big_reason():
+    # A fragmented binary message over the session's binary buffer used to
+    # report the text-message close reason (issue #435); an unfragmented
+    # binary message never reaches the check, so this needs two frames.
+    client.load('websockets_binary_toobig')
+
+    _, sock, _ = ws.upgrade()
+
+    ws.frame_write(sock, ws.OP_BINARY, '*' * 600, fin=False)
+    ws.frame_write(sock, ws.OP_CONT, '*' * 600, fin=True)
+
+    frame = ws.frame_read(sock)
+
+    assert frame['opcode'] == ws.OP_CLOSE, 'close opcode'
+    assert frame['code'] == 1009, 'close code'
+    assert 'text message' not in frame['reason'], 'reason names the wrong kind'
+    assert 'binary' in frame['reason'], 'reason names the binary message'
+
+    sock.close()
