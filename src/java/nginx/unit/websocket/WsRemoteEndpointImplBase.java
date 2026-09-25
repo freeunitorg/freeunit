@@ -320,6 +320,10 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
      * out together.  Any other message uses encoderBuffer and fragments as
      * before.  The buffer is on the heap, like encoderBuffer, so both take the
      * same JNI path.
+     *
+     * The price, on the blocking and the asynchronous path alike: a full
+     * utf8Length() pass before the first byte is sent, and a buffer of the
+     * message's encoded length, up to 16 MiB by default.
      */
     private ByteBuffer encodeBuffer(CharBuffer part) {
         long needed = utf8Length(part, Constants.MAX_SEND_BUFFER_SIZE);

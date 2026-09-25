@@ -1556,6 +1556,62 @@ def test_java_websockets_async_text_one_frame():
     check_text_one_frame('websockets_async', 'future-done')
 
 
+def test_java_websockets_async_text_one_frame_forms():
+    # One frame also through the SendHandler form, for characters of every
+    # UTF-8 width, and with batching on, where the frame reaches the wire
+    # through the 8 KiB output buffer in parts.
+    client.load('websockets_async')
+
+    _, sock, _ = ws.upgrade()
+
+    wide = 'a\u00e9\u20ac\U0001f600' * 4096  # 1, 2, 3 and 4 bytes, 40 KiB
+
+    for payload, report in (
+        ('handler:' + '*' * 64 * 2**10, 'handler-ok'),
+        (wide, 'future-done'),
+        ('handler:' + wide, 'handler-ok'),
+        ('batchtext:' + '*' * 64 * 2**10, 'batchtext-flushed'),
+    ):
+        ws.frame_write(sock, ws.OP_TEXT, payload)
+
+        frame = ws.frame_read(sock)
+        assert frame['fin'], f'one frame, got {len(frame["data"])} bytes'
+        check_frame(frame, True, ws.OP_TEXT, payload)
+        check_frame(ws.frame_read(sock), True, ws.OP_TEXT, report)
+
+    close_connection(sock)
+
+
+def test_java_websockets_async_text_above_cap():
+    # Above nginx.unit.websocket.MAX_SEND_BUFFER_SIZE a text message still
+    # fragments, 8 KiB a frame; with the cap lowered to 8 KiB a 32 KiB
+    # message is four frames.
+    client.load('websockets_async')
+
+    assert 'success' in client.conf(
+        ['-Dnginx.unit.websocket.MAX_SEND_BUFFER_SIZE=8192'],
+        'applications/websockets_async/options',
+    ), 'lower the send buffer cap'
+
+    _, sock, _ = ws.upgrade()
+
+    payload = '*' * 32 * 2**10
+
+    ws.frame_write(sock, ws.OP_TEXT, payload)
+
+    frames = [ws.frame_read(sock) for _ in range(4)]
+    assert [(f['opcode'], f['fin'], len(f['data'])) for f in frames] == [
+        (ws.OP_TEXT, False, 8192),
+        (ws.OP_CONT, False, 8192),
+        (ws.OP_CONT, False, 8192),
+        (ws.OP_CONT, True, 8192),
+    ], 'four parts'
+    assert b''.join(f['data'] for f in frames).decode() == payload, 'payload'
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'future-done')
+
+    close_connection(sock)
+
+
 def test_java_websockets_async_batch():
     # Batched messages are held until the batch is flushed.  flushBatch()
     # used to hand the request a null payload and throw, so disallowing
