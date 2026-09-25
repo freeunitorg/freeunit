@@ -59,10 +59,17 @@ def _get(sock_path, uid=None, gid=None, groups=None):
             except OSError as e:
                 result = f'connect: {e.strerror}'.encode()
             else:
-                s.sendall(
-                    b'GET / HTTP/1.1\r\nHost: localhost\r\n'
-                    b'Connection: close\r\n\r\n'
-                )
+                # A rejected peer is closed right after accept(), so the
+                # send can fail with EPIPE or ECONNRESET.  That is the same
+                # result as a close without a response.
+                try:
+                    s.sendall(
+                        b'GET / HTTP/1.1\r\nHost: localhost\r\n'
+                        b'Connection: close\r\n\r\n'
+                    )
+                except OSError:
+                    pass
+
                 data = b''
 
                 try:
