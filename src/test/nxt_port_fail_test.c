@@ -28,7 +28,7 @@ static nxt_int_t nxt_port_fail_test_enqueue(nxt_task_t *task,
 static nxt_int_t nxt_port_fail_test_dead_peer(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_quit_log_level(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_send_to_dead_peer(nxt_thread_t *thr,
-    nxt_uint_t type, nxt_bool_t queued, nxt_uint_t *level);
+    nxt_uint_t type, nxt_bool_t queued, nxt_bool_t shared, nxt_uint_t *level);
 static void nxt_cdecl nxt_port_fail_test_log_handler(nxt_uint_t level,
     nxt_log_t *log, const char *fmt, ...);
 static nxt_int_t nxt_port_fail_test_rpc_register(nxt_thread_t *thr);
@@ -885,9 +885,10 @@ done:
 
 /*
  * The level a send to a peer that is gone is logged at.  A QUIT is sent to
- * a process that may have exited already, so EPIPE on it is info, whether
- * it is sent at once or later from the queue; any other message is an
- * alert.  The peer's end is closed, so sendmsg() fails for real.
+ * a process that may have exited already, so EPIPE (ECONNREFUSED on a
+ * SOCK_DGRAM pair) on it is info, whether it is sent at once, later from
+ * the port's own queue, or to a port with a shared queue; any other message
+ * is an alert.  The peer's end is closed, so sendmsg() fails for real.
  */
 
 static nxt_uint_t  nxt_port_fail_test_sendmsg_level;
@@ -905,7 +906,7 @@ nxt_port_fail_test_log_handler(nxt_uint_t level, nxt_log_t *log,
 
 static nxt_int_t
 nxt_port_fail_test_send_to_dead_peer(nxt_thread_t *thr, nxt_uint_t type,
-    nxt_bool_t queued, nxt_uint_t *level)
+    nxt_bool_t queued, nxt_bool_t shared, nxt_uint_t *level)
 {
     nxt_fd_t               pair[2];
     nxt_int_t              ret;
@@ -913,6 +914,7 @@ nxt_port_fail_test_send_to_dead_peer(nxt_thread_t *thr, nxt_uint_t type,
     nxt_task_t             *task;
     nxt_port_t             *port;
     nxt_event_engine_t     engine, *saved_engine;
+    nxt_port_queue_t       *queue;
     nxt_event_interface_t  stub;
 
     task = thr->task;
@@ -950,12 +952,22 @@ nxt_port_fail_test_send_to_dead_peer(nxt_thread_t *thr, nxt_uint_t type,
 
     ret = NXT_ERROR;
 
-    /* The pair nxt_socketpair_create() makes: a closed peer gives EPIPE. */
+    /* The production pair: SOCK_SEQPACKET where there is one, else DGRAM. */
 
-    if (nxt_slow_path(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0)) {
+    if (nxt_slow_path(nxt_socketpair_create(task, pair) != NXT_OK)) {
         nxt_log_error(NXT_LOG_NOTICE, saved_log,
                       "port failure test: socketpair failed");
         goto done;
+    }
+
+    if (shared) {
+        queue = nxt_mp_zalloc(port->mem_pool, sizeof(nxt_port_queue_t));
+        if (nxt_slow_path(queue == NULL)) {
+            goto done;
+        }
+
+        nxt_port_queue_init(queue);
+        port->queue = queue;
     }
 
     port->pair[0] = pair[0];
@@ -999,6 +1011,9 @@ done:
 
     nxt_port_fail_test_drain_wq(&engine.fast_work_queue);
 
+    /* Not a mapping: nxt_port_close() must not munmap() it. */
+    port->queue = NULL;
+
     nxt_port_close(task, port);
     nxt_port_use(task, port, -1);
 
@@ -1019,17 +1034,23 @@ nxt_port_fail_test_quit_log_level(nxt_thread_t *thr)
     static const struct {
         nxt_uint_t  type;
         nxt_bool_t  queued;
+        nxt_bool_t  shared;
         nxt_uint_t  level;
         const char  *name;
     } legs[] = {
-        { NXT_PORT_MSG_QUIT, 0, NXT_LOG_INFO, "a QUIT sent at once" },
-        { NXT_PORT_MSG_QUIT, 1, NXT_LOG_INFO, "a QUIT sent from the queue" },
-        { NXT_PORT_MSG_DATA, 0, NXT_LOG_ALERT, "a DATA sent at once" },
+        { NXT_PORT_MSG_QUIT, 0, 0, NXT_LOG_INFO, "a QUIT sent at once" },
+        { NXT_PORT_MSG_QUIT, 1, 0, NXT_LOG_INFO, "a QUIT sent from the queue" },
+        { NXT_PORT_MSG_QUIT, 0, 1, NXT_LOG_INFO,
+          "a QUIT to a port with a shared queue" },
+        { NXT_PORT_MSG_DATA, 0, 0, NXT_LOG_ALERT, "a DATA sent at once" },
+        { NXT_PORT_MSG_DATA, 0, 1, NXT_LOG_ALERT,
+          "a DATA to a port with a shared queue" },
     };
 
     for (i = 0; i < nxt_nitems(legs); i++) {
         if (nxt_port_fail_test_send_to_dead_peer(thr, legs[i].type,
-                                                 legs[i].queued, &level)
+                                                 legs[i].queued,
+                                                 legs[i].shared, &level)
             != NXT_OK)
         {
             return NXT_ERROR;

@@ -299,7 +299,16 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
 
     if (port->queue != NULL && type != _NXT_PORT_MSG_READ_QUEUE) {
 
-        if (fd == -1 && nxt_port_can_enqueue_buf(b)) {
+        /*
+         * A QUIT takes the socket, behind a READ_SOCKET marker that keeps
+         * its place in the ring.  Its peer may have exited already, and
+         * nxt_socketpair_send() logs that at info only when it can see the
+         * QUIT type on the wire; the READ_QUEUE wake-up for an enqueued
+         * one would hide it.
+         */
+        if (fd == -1 && msg.port_msg.type != _NXT_PORT_MSG_QUIT
+            && nxt_port_can_enqueue_buf(b))
+        {
             qmsg.pm = msg.port_msg;
 
             qmsg_size = sizeof(qmsg.pm);

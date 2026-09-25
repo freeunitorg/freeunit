@@ -110,7 +110,9 @@ nxt_socketpair_test_send_fail(nxt_err_t err, nxt_uint_t n)
  * (nxt_port_write_msgs(), nxt_port_announce()).  A QUIT goes to a process
  * that may have exited already, whether it is sent at once or from the
  * queue later, so EPIPE and the like on it are no news: info, as
- * nxt_socket_error_level() has it.  Everything else is an alert.
+ * nxt_socket_error_level() has it.  A SOCK_DGRAM pair (the fallback in
+ * nxt_socketpair_create()) reports a gone peer as ECONNREFUSED instead,
+ * so that is info too.  Everything else is an alert.
  */
 static nxt_uint_t
 nxt_socketpair_send_error_level(nxt_iobuf_t *iob, nxt_uint_t niob,
@@ -122,7 +124,8 @@ nxt_socketpair_send_error_level(nxt_iobuf_t *iob, nxt_uint_t niob,
         msg = iob[0].iov_base;
 
         if (msg->type == _NXT_PORT_MSG_QUIT) {
-            return nxt_socket_error_level(err);
+            return (err == NXT_ECONNREFUSED) ? NXT_LOG_INFO
+                                             : nxt_socket_error_level(err);
         }
     }
 
