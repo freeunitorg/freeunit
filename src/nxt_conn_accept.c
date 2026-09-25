@@ -275,7 +275,9 @@ nxt_conn_accept_close_idle(nxt_task_t *task, nxt_listen_event_t *lev)
 
     nxt_timer_add(engine, &lev->timer, 100);
 
-    nxt_fd_event_disable_read(engine, &lev->socket);
+    if (nxt_fd_event_is_active(lev->socket.read)) {
+        nxt_fd_event_disable_read(engine, &lev->socket);
+    }
 
     nxt_alert(task, "new connections are not accepted within 100ms");
 }
