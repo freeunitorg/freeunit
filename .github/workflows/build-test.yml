@@ -702,9 +702,10 @@ jobs:
           ./configure wasm-wasi-component
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
 
+      # bindgen picks clang up from PATH.  The libclang-drift check against
+      # new distribution compilers lives in build-distros.yml.
       - name: Make wasm-wasi-component
         run: |
-          CLANG_PATH=/usr/bin/clang-15 \
           BINDGEN_EXTRA_CLANG_ARGS="-I../../njs/src -I../../njs/build" \
           make wasm-wasi-component
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
