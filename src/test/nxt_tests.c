@@ -258,6 +258,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_router_prepare_msg_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_main_start_process_reply_test(thr) != NXT_OK) {
         return 1;
     }
