@@ -3,7 +3,7 @@ language: c
 severity: warning
 message: >-
   sprintf() has no bound on the destination buffer. Use nxt_sprintf()/
-  nxt_snprintf() (src/nxt_string.h), which take an explicit end pointer,
+  nxt_vsprintf() (src/nxt_sprintf.h), which take an explicit end pointer,
   instead.
 rule:
   pattern: sprintf($DST, $$$)
