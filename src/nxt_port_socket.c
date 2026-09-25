@@ -1919,14 +1919,37 @@ static const nxt_lvlhsh_proto_t  lvlhsh_frag_proto  nxt_aligned(64) = {
 
 
 /*
+ * An upper bound on what nxt_port_mmap_read() allocates for each record:
+ * nxt_buf_mem_ts_alloc() takes the memory part of an nxt_buf_t followed by
+ * its thread-safe completion state, a work item and an engine pointer.
+ */
+#define NXT_PORT_FRAG_MMAP_BUF_COST                                           \
+    (sizeof(nxt_buf_t) + sizeof(nxt_work_t) + sizeof(void *))
+
+
+/*
  * What a fragment kept for reassembly costs the receiver: the whole buffer
  * it came in, port->max_size, however little of it carries.  Counting the
  * payload alone let a stream of empty fragments hold buffers without limit.
+ * An mmap fragment also keeps a buffer per record, and a record may name
+ * no bytes at all: a max_size fragment of empty records is some 1,300
+ * buffers, so each of them is charged too.
  */
-nxt_inline size_t
+static size_t
 nxt_port_frag_cost(nxt_port_t *port, nxt_port_recv_msg_t *msg)
 {
-    return nxt_max(msg->size, port->max_size);
+    size_t     cost;
+    nxt_buf_t  *b;
+
+    cost = nxt_max(msg->size, port->max_size);
+
+    if (msg->port_msg.mmap) {
+        for (b = msg->buf; b != NULL; b = b->next) {
+            cost += NXT_PORT_FRAG_MMAP_BUF_COST;
+        }
+    }
+
+    return cost;
 }
 
 
@@ -2065,13 +2088,13 @@ nxt_port_frag_unaccount(nxt_port_t *port, nxt_port_recv_msg_t *fmsg)
 /*
  * Would appending "msg" to the stream being reassembled in "fmsg" pass a
  * limit?  The per-port total is checked only for a fragment that keeps the
- * stream open: the last one hands the whole message over at once.  A stream
- * and the port's total are kept under their limits, so neither subtraction
- * can wrap.
+ * stream open, against its "cost": the last one hands the whole message
+ * over at once.  A stream and the port's total are kept under their
+ * limits, so neither subtraction can wrap.
  */
 static nxt_bool_t
 nxt_port_frag_fits(nxt_task_t *task, nxt_port_t *port,
-    nxt_port_recv_msg_t *fmsg, nxt_port_recv_msg_t *msg)
+    nxt_port_recv_msg_t *fmsg, nxt_port_recv_msg_t *msg, size_t cost)
 {
     if (nxt_slow_path(msg->size > NXT_PORT_FRAG_SIZE_MAX - fmsg->size)) {
         nxt_alert(task, "port %d: fragmented message #%uD from pid %PI "
@@ -2082,8 +2105,7 @@ nxt_port_frag_fits(nxt_task_t *task, nxt_port_t *port,
     }
 
     if (msg->port_msg.mf != 0
-        && nxt_slow_path(nxt_port_frag_cost(port, msg)
-                         > NXT_PORT_FRAG_TOTAL_MAX - port->frag_size))
+        && nxt_slow_path(cost > NXT_PORT_FRAG_TOTAL_MAX - port->frag_size))
     {
         nxt_alert(task, "port %d: fragmented messages in progress exceed "
                   "%d bytes, dropping stream #%uD from pid %PI",
@@ -2193,6 +2215,7 @@ static void
 nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
     nxt_port_recv_msg_t *msg)
 {
+    size_t               cost;
     nxt_buf_t            *b, *orig_b, *next;
     nxt_port_recv_msg_t  *fmsg;
 
@@ -2239,7 +2262,12 @@ nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
                 }
             }
 
-            if (nxt_slow_path(!nxt_port_frag_fits(task, port, fmsg, msg))) {
+            /* The last fragment is not kept, so it is not charged. */
+            cost = (msg->port_msg.mf != 0) ? nxt_port_frag_cost(port, msg) : 0;
+
+            if (nxt_slow_path(!nxt_port_frag_fits(task, port, fmsg, msg,
+                                                  cost)))
+            {
                 /* The last fragment's lookup took the stream out already. */
                 nxt_port_frag_drop(task, port, fmsg, msg->port_msg.mf != 0);
 
@@ -2254,8 +2282,8 @@ nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
             fmsg->size += msg->size;
 
             if (msg->port_msg.mf != 0) {
-                fmsg->frag_held += nxt_port_frag_cost(port, msg);
-                port->frag_size += nxt_port_frag_cost(port, msg);
+                fmsg->frag_held += cost;
+                port->frag_size += cost;
             }
 
             msg->buf = NULL;
