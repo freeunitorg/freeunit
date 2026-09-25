@@ -2493,9 +2493,14 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
            + sizeof("Connection: close\r\n")
            + sizeof("\r\n");
 
-    /* Emit Content-Length after chunked_transform; NULL body → value 0. */
+    /*
+     * Emit Content-Length after chunked_transform; NULL body → value 0.
+     * The transform adds a Content-Length field (r->content_length) that
+     * goes out with the other fields; a second one would make the
+     * upstream answer 400.
+     */
     content_length = -1;
-    if (r->chunked) {
+    if (r->chunked && r->content_length == NULL) {
         if (r->body == NULL) {
             content_length = 0;
         } else {
