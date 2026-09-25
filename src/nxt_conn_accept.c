@@ -186,6 +186,7 @@ nxt_conn_io_accept(nxt_task_t *task, void *obj, void *data)
      */
     if (nxt_slow_path(nxt_socket_nonblocking(task, s) != NXT_OK)) {
         nxt_socket_close(task, s);
+        return;
     }
 
 #endif
