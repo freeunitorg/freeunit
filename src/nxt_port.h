@@ -240,6 +240,15 @@ typedef struct {
     nxt_port_msg_t      port_msg;
     uint8_t             close_fd;   /* 1 bit */
     uint8_t             allocated;  /* 1 bit */
+
+    /*
+     * The message is a QUIT, and its peer may have exited already: a send
+     * that fails because the peer is gone is logged at info, not as an
+     * alert.  Local to this process: it is not on the wire and not in
+     * shared memory.  It stays set when the socket carries only the
+     * READ_QUEUE wake-up for a QUIT put into the shared queue.
+     */
+    uint8_t             peer_may_be_gone;  /* 1 bit */
 } nxt_port_send_msg_t;
 
 #if (NXT_HAVE_UCRED) || (NXT_HAVE_MSGHDR_CMSGCRED)

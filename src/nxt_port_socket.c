@@ -288,6 +288,16 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
     msg.close_fd = (type & NXT_PORT_MSG_CLOSE_FD) != 0;
     msg.allocated = 0;
 
+    /*
+     * Set here, from the type the caller asked for, before the shared
+     * queue branch below may turn the socket message into a READ_QUEUE
+     * wake-up, and before nxt_port_msg_chk_insert() copies the message.
+     * It is written once, before the message is published under
+     * port->write_mutex, and only read after that, by whoever sends it,
+     * so it needs no lock of its own.
+     */
+    msg.peer_may_be_gone = ((type & NXT_PORT_MSG_MASK) == _NXT_PORT_MSG_QUIT);
+
     msg.port_msg.stream = stream;
     msg.port_msg.pid = nxt_pid;
     msg.port_msg.reply_port = reply_port;
@@ -304,8 +314,9 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
          * it on the socket instead would give a worker that is still in
          * nxt_unit_init() a second socket message it has no queue marker
          * for yet, and libunit holds only one ("too many port socket
-         * messages").  So the wake-up for it is a plain READ_QUEUE, and a
-         * failed wake-up to a worker that is gone is still an alert.
+         * messages").  So the wake-up for it is a plain READ_QUEUE.
+         * msg.peer_may_be_gone, set above, still marks it as a QUIT, so a
+         * failed wake-up to a worker that is gone is logged at info.
          */
         if (fd == -1 && nxt_port_can_enqueue_buf(b)) {
             qmsg.pm = msg.port_msg;
@@ -912,7 +923,8 @@ next_fragment:
         msg->port_msg.last |= sb.last;
         msg->port_msg.mf = sb.limit_reached || sb.nmax_reached;
 
-        n = nxt_socketpair_send(&port->socket, msg->fd, iov, sb.niov + 1);
+        n = nxt_socketpair_send_ex(&port->socket, msg->fd, iov, sb.niov + 1,
+                                   msg->peer_may_be_gone);
 
         if (n > 0) {
             if (nxt_slow_path((size_t) n != sb.size + iov[0].iov_len)) {
