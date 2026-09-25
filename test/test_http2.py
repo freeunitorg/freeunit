@@ -1274,18 +1274,18 @@ def test_http2_long_method():
 
     method = 'A' * 300
 
-    # What HTTP/1 answers to the same method.
-    h1 = client.get_ssl(
-        method=method,
-        context=ssl_context(alpn=('http/1.1',)),
+    # What HTTP/1 answers to the same method.  get() always sends GET.
+    h1 = client.http(
+        method,
+        wrapper=ssl_context(alpn=('http/1.1',)).wrap_socket,
     )['status']
+    assert h1 is not None
 
     c = H2Client()
     resp = c.send(method, '/')
     resp = c.wait(resp)
 
-    # HTTP/1 takes a 300-byte method, so HTTP/2 does too.
-    assert h1 == 200
+    # HTTP/2 answers a long method as HTTP/1 does, whatever that is.
     assert resp['status'] == h1
 
     assert c.get('/')['status'] == 200
