@@ -331,8 +331,15 @@ struct nxt_port_s {
      * holds up to two of this process's descriptors open for as long as it
      * waits.  The count exists to bound that; it is maintained under
      * ->write_mutex and is described with the bound in src/nxt_port_socket.c.
+     *
+     * ->fd_refusing is set by the first send the bound refuses and cleared
+     * by the next descriptor it takes, also under ->write_mutex.  A peer
+     * that stops reading keeps the port at the bound for as long as it
+     * stalls, so the refusal is logged once when the port gets there rather
+     * than once for every send.
      */
     uint32_t            fd_messages;
+    uint8_t             fd_refusing;
 
     /* Maximum size of message part. */
     uint32_t            max_size;

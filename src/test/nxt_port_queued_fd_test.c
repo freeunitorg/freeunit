@@ -57,9 +57,13 @@ static nxt_bool_t nxt_port_queued_fd_test_same_file(nxt_fd_t a,
 static nxt_fd_t nxt_port_queued_fd_test_recv_fd(nxt_fd_t sock);
 static nxt_uint_t nxt_port_queued_fd_test_open_fds(void);
 static nxt_uint_t nxt_port_queued_fd_test_queued(nxt_port_t *port);
+static void nxt_cdecl nxt_port_queued_fd_test_log(nxt_uint_t level,
+    nxt_log_t *log, const char *fmt, ...);
 
 
 static nxt_uint_t  nxt_port_queued_fd_test_completions;
+static nxt_uint_t  nxt_port_queued_fd_test_alerts;
+static nxt_log_t   *nxt_port_queued_fd_test_saved_log;
 
 
 nxt_int_t
@@ -535,7 +539,9 @@ nxt_port_queued_fd_test_bounded(nxt_thread_t *thr)
     nxt_fd_t               fd, got, pair[2];
     nxt_buf_t              *buf;
     nxt_int_t              ret;
+    nxt_log_t              log, *saved_log;
     struct stat            st;
+    struct rlimit          rlmt;
     nxt_task_t             *task;
     nxt_port_t             *port;
     nxt_event_engine_t     engine, *saved_engine;
@@ -543,6 +549,28 @@ nxt_port_queued_fd_test_bounded(nxt_thread_t *thr)
 
     task = thr->task;
     task->thread = thr;
+
+    /*
+     * The fill holds NXT_PORT_MAX_FD_MSGS duplicates open at once, and the
+     * leg needs a few more of its own.  Under a lower RLIMIT_NOFILE a dup
+     * fails before the bound is reached, which says nothing about the
+     * bound, so the leg is skipped rather than failed.
+     */
+
+    if (getrlimit(RLIMIT_NOFILE, &rlmt) == 0
+        && rlmt.rlim_cur != RLIM_INFINITY
+        && rlmt.rlim_cur < nxt_port_queued_fd_test_open_fds()
+                           + NXT_PORT_MAX_FD_MSGS + 16)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port queued fd test: bound leg skipped, "
+                      "RLIMIT_NOFILE %d is too low for %d queued "
+                      "descriptors", (int) rlmt.rlim_cur,
+                      NXT_PORT_MAX_FD_MSGS);
+        return NXT_OK;
+    }
+
+    saved_log = task->log;
 
     ret = NXT_ERROR;
     fd = -1;
@@ -651,6 +679,19 @@ nxt_port_queued_fd_test_bounded(nxt_thread_t *thr)
 
     buf->completion_handler = nxt_port_queued_fd_test_completion;
 
+    /*
+     * The refusals below are counted by the alerts they log: a stalled peer
+     * keeps the port at the bound, so only the first one may log.
+     */
+
+    log = *saved_log;
+    log.handler = nxt_port_queued_fd_test_log;
+
+    nxt_port_queued_fd_test_saved_log = saved_log;
+    nxt_port_queued_fd_test_alerts = 0;
+
+    task->log = &log;
+
     if (nxt_port_socket_write2(task, port, NXT_PORT_MSG_NEW_PORT, fd, -1,
                                NXT_PORT_MAX_FD_MSGS, 0, buf)
         != NXT_ERROR)
@@ -658,6 +699,23 @@ nxt_port_queued_fd_test_bounded(nxt_thread_t *thr)
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "port queued fd test: a message past the bound of %d "
                       "was accepted", NXT_PORT_MAX_FD_MSGS);
+        goto done;
+    }
+
+    if (nxt_port_socket_write2(task, port, NXT_PORT_MSG_NEW_PORT, fd, -1,
+                               NXT_PORT_MAX_FD_MSGS, 0, NULL)
+        != NXT_ERROR)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port queued fd test: a second message past the bound "
+                      "was accepted");
+        goto done;
+    }
+
+    if (nxt_port_queued_fd_test_alerts != 1) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port queued fd test: two refusals in a row logged %ui "
+                      "alerts, expected 1", nxt_port_queued_fd_test_alerts);
         goto done;
     }
 
@@ -709,6 +767,57 @@ nxt_port_queued_fd_test_bounded(nxt_thread_t *thr)
                       "was not queued");
         goto done;
     }
+
+    /*
+     * Cancelling a queued message releases its place under the bound as
+     * well: the port takes one more descriptor, and refusing the one after
+     * that is a new stall, so it logs again.
+     */
+
+    if (nxt_port_socket_cancel(task, port, NXT_PORT_MSG_NEW_PORT, 0, 0, NULL)
+        != NXT_PORT_MSG_CANCELLED)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port queued fd test: the first queued message could "
+                      "not be cancelled");
+        goto done;
+    }
+
+    nxt_port_queued_fd_test_drain_wq(&engine.fast_work_queue);
+
+    if (nxt_port_queued_fd_test_open_fds() != base + NXT_PORT_MAX_FD_MSGS - 1)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port queued fd test: %ui descriptors open after the "
+                      "cancel, expected %ui",
+                      nxt_port_queued_fd_test_open_fds(),
+                      base + NXT_PORT_MAX_FD_MSGS - 1);
+        goto done;
+    }
+
+    if (nxt_port_socket_write2(task, port, NXT_PORT_MSG_NEW_PORT, fd, -1,
+                               NXT_PORT_MAX_FD_MSGS + 2, 0, NULL)
+        != NXT_OK)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port queued fd test: a cancelled message did not "
+                      "release its place under the bound");
+        goto done;
+    }
+
+    if (nxt_port_socket_write2(task, port, NXT_PORT_MSG_NEW_PORT, fd, -1,
+                               NXT_PORT_MAX_FD_MSGS + 3, 0, NULL)
+        != NXT_ERROR
+        || nxt_port_queued_fd_test_alerts != 2)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port queued fd test: the port at the bound again did "
+                      "not refuse and log once more (%ui alerts)",
+                      nxt_port_queued_fd_test_alerts);
+        goto done;
+    }
+
+    task->log = saved_log;
 
     /*
      * Draining is what releases the bound.  The peer gets what was queued
@@ -768,6 +877,8 @@ nxt_port_queued_fd_test_bounded(nxt_thread_t *thr)
     ret = NXT_OK;
 
 done:
+
+    task->log = saved_log;
 
     if (fd != -1 && nxt_test_fd_is_open(fd)) {
         nxt_fd_close(fd);
@@ -835,6 +946,36 @@ nxt_port_queued_fd_test_open_fds(void)
     }
 
     return n;
+}
+
+
+/*
+ * Counts the alerts and passes every line on to the log the leg replaced,
+ * so the refusal still shows in the output.
+ */
+
+static void nxt_cdecl
+nxt_port_queued_fd_test_log(nxt_uint_t level, nxt_log_t *log,
+    const char *fmt, ...)
+{
+    u_char     *p;
+    va_list    args;
+    nxt_log_t  *saved;
+    u_char     msg[NXT_MAX_ERROR_STR];
+
+    if (level == NXT_LOG_ALERT) {
+        nxt_port_queued_fd_test_alerts++;
+    }
+
+    va_start(args, fmt);
+    p = nxt_vsprintf(msg, msg + NXT_MAX_ERROR_STR - 1, fmt, args);
+    va_end(args);
+
+    *p = '\0';
+
+    saved = nxt_port_queued_fd_test_saved_log;
+
+    saved->handler(level, saved, "%s", msg);
 }
 
 
