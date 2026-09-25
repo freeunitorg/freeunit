@@ -78,6 +78,8 @@ def test_schedules_validation_valid():
         schedule(uri='/' + 'a' * 4095),
         schedule(headers={"X-Test": "a\tb c"}),
         schedule(headers={f'X-{i:02d}': 'v' * 1990 for i in range(4)}),
+        # Python adds no prefix to field names: the whole 255 bytes fit.
+        schedule(headers={'X-' + 'a' * 253: "x"}),
         {"drupal cron.1": s, "a" * 128: s, "b": dict(s, **one)},
     ]:
         assert 'success' in put(schedules), schedules
@@ -123,8 +125,9 @@ INVALID = (
     + [({"headers": {"X-Test": v}}, None, f'{C}/headers/X-Test')
        for v in ['a\rb', 'a\nb', 'a\x00b', 'a\x7fb', 1, None, ["x"]]]
     + [({"headers": h}, 'do not make a request', f'{C}/headers')
-       for h in [{"Host": "a..b"}, {"Host": "x", "host": "y"},
-                 {'X-' + 'a' * 254: "x"}]]
+       for h in [{"Host": "a..b"}, {"Host": "x", "host": "y"}]]
+    + [({"headers": {'X-' + 'a' * 254: "x"}}, 'is 256 bytes long',
+        f'{C}/headers/X-' + 'a' * 254)]
     + [({"headers": {f'X-{i:02d}': 'v' * 2100 for i in range(4)}},
         'must not exceed 8192 bytes', f'{C}/headers'),
        ({"headers": ["Host: x"]}, None, f'{C}/headers'),

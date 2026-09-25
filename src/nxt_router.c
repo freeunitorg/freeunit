@@ -1209,6 +1209,10 @@ nxt_router_msg_retract(nxt_task_t *task, nxt_request_rpc_data_t *req_rpc_data)
         {
             msg_info->cancel = NXT_MSG_RETRACTED;
 
+            /* The slot now reads tracking 0, so queue__dequeue cannot. */
+            NXT_USDT(queue__cancel, msg_info->tracking_cookie,
+                     req_rpc_data->stream);
+
             nxt_debug(task, "stream #%uD: cancelled by router",
                       req_rpc_data->stream);
 
@@ -7707,6 +7711,18 @@ nxt_router_app_prepare_request(nxt_task_t *task,
 
 
 
+
+
+/*
+ * The configuration validator checks schedule header names against this:
+ * nxt_router_prepare_msg() refuses a name that is too long with the prefix.
+ */
+
+size_t
+nxt_router_app_field_prefix_length(nxt_app_type_t type)
+{
+    return nxt_app_msg_prefix[type]->length;
+}
 
 
 /*
