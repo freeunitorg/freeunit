@@ -954,7 +954,8 @@ nxt_h2p_conn_expire(nxt_task_t *task, nxt_h2proto_t *h2c, nxt_bool_t all)
 /*
  * Fail the requests attached to streams: all of them, or those that still
  * wait for the client.  A request after EOF ends through its last buffer
- * anyway.  A failed request may close at once and release its stream, and
+ * anyway: its completion is queued already, and it is what the router
+ * waits for.  A failed request may close at once and release its stream, and
  * even the last one; h2c->walking keeps nxt_h2p_closing() from releasing
  * the other streams under this walk, and the caller closes afterwards.
  */
@@ -1594,6 +1595,20 @@ nxt_h2p_stream_fail(nxt_task_t *task, nxt_h2p_stream_t *stream)
          */
         nxt_work_queue_add(&task->thread->engine->fast_work_queue,
                            r->state->error_handler, &r->task, r, stream);
+        return;
+    }
+
+    if (r->state->error_handler == nxt_http_request_close_handler) {
+        /*
+         * The request has no response yet and may wait for an
+         * application: the router then holds it until r->last completes
+         * (nxt_router_http_request_done()).  A direct close would leave it
+         * linked to the application, and the answer would come to a closed
+         * request with a released configuration.  h1 never fails a request
+         * in this state, as it does not read the connection then; end it
+         * as a failed h1 write does, through r->last.
+         */
+        nxt_http_request_error_handler(&r->task, r, stream);
         return;
     }
 
