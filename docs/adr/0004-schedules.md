@@ -46,6 +46,8 @@ docs/schedules.md. Runs are `GET` over `HTTP/1.1`.
   and `interval + jitter` at most 2147483: timers are `nxt_msec_t` compared as
   a signed 32-bit difference, about 24.8 days.
 - Header names are tokens and values have no control bytes other than tab.
+  A name fits the application protocol's `uint8_t` with the target type's
+  prefix: 255 bytes, or 250 for PHP, Perl and Ruby (`HTTP_`).
   `Content-Length`, `Transfer-Encoding`, `Connection`, `Upgrade`,
   `Keep-Alive`, `TE`, `Expect` and `Sec-WebSocket-*` are reserved: their h1
   handlers assume a connection or a body. All headers fit in 8 KiB.

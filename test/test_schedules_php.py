@@ -33,6 +33,23 @@ def put_run(**kwargs):
     })
 
 
+def test_schedules_php_validation_header_name_length():
+    # PHP gets each name as "HTTP_<name>" in a uint8_t: 250 bytes fit, and
+    # a 251-byte name would fail every run with 431.
+    name = 'X-' + 'a' * 248
+    put_run(headers={name: "x"})
+
+    name += 'a'
+    resp = client.conf({"pass": "applications/schedule", "uri": "/cron",
+                        "interval": 1, "headers": {name: "x"}},
+                       'schedules/cron')
+
+    assert 'error' in resp, resp
+    assert 'is 251 bytes long' in resp['detail'], resp
+    assert 'accepts up to 250' in resp['detail'], resp
+    assert resp['location']['path'] == f'/schedules/cron/headers/{name}'
+
+
 def test_schedules_php_fires():
     uri = '/cron/SECRET_KEY?x=1'
     put_run(uri=uri, headers={"Host": "example.org", "X-Cron": "yes"})

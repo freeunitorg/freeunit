@@ -51,7 +51,9 @@ bytes). Each schedule has these fields:
 `Upgrade`, `Keep-Alive`, `TE`, `Expect`, or any `Sec-WebSocket-*` name: the
 run has no body and no connection, so these have nothing to act on. Header
 values may not contain control characters, and all headers together are
-limited to 8192 bytes.
+limited to 8192 bytes. A header name is at most 255 bytes, or 250 bytes when
+`pass` names a PHP, Perl or Ruby application: those receive each name with
+the `HTTP_` prefix added, and a longer name would fail every run with 431.
 
 ### Drupal
 
