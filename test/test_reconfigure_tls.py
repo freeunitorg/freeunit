@@ -120,3 +120,47 @@ def test_reconfigure_tls_3():
     clear_conf()
 
     assert client.get(sock=ssl_sock)['status'] == 408, 'request timeout'
+
+
+@pytest.mark.parametrize('close', ['client', 'idle_timeout'])
+def test_reconfigure_tls_keepalive_close(close):
+    # A keep-alive TLS connection that is closed after a reconfiguration.
+    #
+    # The listener stays, so the reconfiguration replaces its joint at once
+    # and releases the old one.  Only the request held the old router
+    # configuration, and that reference went with the request.  The idle
+    # connection's TLS state still points at the listener's nxt_tls_conf_t
+    # in that configuration, and the TLS shutdown at close read it: a
+    # heap-use-after-free under ASan, which the fixture's log check reports.
+    if close == 'idle_timeout':
+        assert 'success' in client.conf(
+            {'http': {'idle_timeout': 1}}, 'settings'
+        )
+
+    (resp, sock) = client.get_ssl(
+        headers={'Host': 'localhost', 'Connection': 'keep-alive'},
+        start=True,
+        read_timeout=1,
+    )
+
+    assert resp['status'] == 200, 'keep-alive request'
+
+    assert 'success' in client.conf({'return': 201}, 'routes/0/action')
+
+    if close == 'client':
+        sock.close()
+
+    else:
+        # The router closes the idle connection itself.
+        sock.settimeout(5)
+
+        try:
+            assert sock.recv(1) == b'', 'closed by the router'
+        except OSError:
+            pass
+
+    # Let the router run the TLS shutdown of the closed connection; it must
+    # still be alive and serve the new configuration.
+    time.sleep(0.5)
+
+    assert client.get_ssl()['status'] == 201, 'router alive'

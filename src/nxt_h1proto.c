@@ -21,6 +21,8 @@
 #if (NXT_TLS)
 static ssize_t nxt_http_idle_io_read_handler(nxt_task_t *task, nxt_conn_t *c);
 static void nxt_http_conn_test(nxt_task_t *task, void *obj, void *data);
+static void nxt_http_conn_tls_conf_release(nxt_task_t *task, void *obj,
+    void *data);
 #endif
 static ssize_t nxt_h1p_idle_io_read_handler(nxt_task_t *task, nxt_conn_t *c);
 static void nxt_h1p_conn_proto_init(nxt_task_t *task, void *obj, void *data);
@@ -379,7 +381,41 @@ nxt_http_conn_test(nxt_task_t *task, void *obj, void *data)
 
     tls = joint->socket_conf->tls;
 
+    /*
+     * The connection holds the listener configuration until it is freed.
+     * The TLS connection reads its nxt_tls_conf_t, which lives in the memory
+     * pool of the router configuration, in the handshake callbacks and in
+     * the TLS shutdown.  Only a request references the configuration, so
+     * without this reference a reconfiguration would destroy it under a
+     * connection in the handshake, and under a keep-alive connection that
+     * is closed after its last request has released its own reference.
+     * The cleanup runs in nxt_conn_free(), after the TLS shutdown.
+     */
+    if (nxt_slow_path(nxt_mp_cleanup(c->mem_pool,
+                                     nxt_http_conn_tls_conf_release,
+                                     &engine->task, joint, NULL)
+                      != NXT_OK))
+    {
+        nxt_h1p_closing(task, c);
+        return;
+    }
+
+    joint->count++;
+
     tls->conn_init(task, tls, c);
+}
+
+
+static void
+nxt_http_conn_tls_conf_release(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_socket_conf_joint_t  *joint;
+
+    joint = obj;
+
+    nxt_debug(task, "http conn tls conf release");
+
+    nxt_router_conf_release(task, joint);
 }
 
 #endif
