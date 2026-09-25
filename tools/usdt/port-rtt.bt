@@ -3,7 +3,7 @@
  * Copyright (C) FreeUnit contributors.
  *
  * Port send -> recv latency per pid; coarse, not per message.
- *   bpftrace tools/usdt/port-rtt.bt -p $(pgrep -f 'unit: router')
+ *   bpftrace tools/usdt/port-rtt.bt <path to unitd> [-p <pid>]
  * Needs a --usdt build: docs/observability/usdt.md.
  */
 
@@ -12,12 +12,12 @@ BEGIN
     printf("Tracing freeunit port send -> recv round trips. Ctrl-C to stop.\n");
 }
 
-usdt:/usr/sbin/unitd:freeunit:port__send
+usdt:$1:freeunit:port__send
 {
     @start[pid] = nsecs;
 }
 
-usdt:/usr/sbin/unitd:freeunit:port__recv
+usdt:$1:freeunit:port__recv
 /@start[pid]/
 {
     @port_rtt_ns = hist(nsecs - @start[pid]);

@@ -1508,8 +1508,6 @@ nxt_port_read_handler(nxt_task_t *task, void *obj, void *data)
         n = nxt_socketpair_recv(&port->socket, iov, 2, &oob);
 
         if (n > 0) {
-            NXT_USDT(port__recv, port->pid);
-
             msg.fd[0] = -1;
             msg.fd[1] = -1;
 
@@ -1538,6 +1536,8 @@ nxt_port_read_handler(nxt_task_t *task, void *obj, void *data)
 
             msg.buf = b;
             msg.size = n;
+
+            NXT_USDT(port__recv, port->pid);
 
             nxt_port_read_msg_process(task, port, &msg);
 
@@ -1844,6 +1844,12 @@ nxt_port_queue_read_handler(nxt_task_t *task, void *obj, void *data)
         if (n > 0) {
             msg.buf = b;
             msg.size = n;
+
+            /*
+             * Queue and socket messages alike, once each: a suspended
+             * socket message fires only when it is resumed here.
+             */
+            NXT_USDT(port__recv, port->pid);
 
             nxt_port_read_msg_process(task, port, &msg);
 

@@ -1209,6 +1209,10 @@ nxt_router_msg_retract(nxt_task_t *task, nxt_request_rpc_data_t *req_rpc_data)
         {
             msg_info->cancel = NXT_MSG_RETRACTED;
 
+            /* The slot now reads tracking 0, so queue__dequeue cannot. */
+            NXT_USDT(queue__cancel, msg_info->tracking_cookie,
+                     req_rpc_data->stream);
+
             nxt_debug(task, "stream #%uD: cancelled by router",
                       req_rpc_data->stream);
 

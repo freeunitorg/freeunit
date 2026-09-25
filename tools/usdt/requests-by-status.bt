@@ -3,7 +3,7 @@
  * Copyright (C) FreeUnit contributors.
  *
  * Request count, latency by status, and in-flight requests.
- *   bpftrace tools/usdt/requests-by-status.bt -p $(pgrep -f 'unit: router')
+ *   bpftrace tools/usdt/requests-by-status.bt <path to unitd> [-p <router pid>]
  * Needs a --usdt build: docs/observability/usdt.md.
  */
 
@@ -12,13 +12,13 @@ BEGIN
     printf("Tracing freeunit requests by status. Ctrl-C to stop.\n");
 }
 
-usdt:/usr/sbin/unitd:freeunit:request__start
+usdt:$1:freeunit:request__start
 {
     @req_start[arg0] = nsecs;
     @inflight++;
 }
 
-usdt:/usr/sbin/unitd:freeunit:request__done
+usdt:$1:freeunit:request__done
 {
     @by_status[arg1] = count();
 

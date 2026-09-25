@@ -129,8 +129,6 @@ nxt_app_queue_recv(nxt_app_queue_t volatile *q, void *p, uint32_t *cookie)
 
     qi = (nxt_app_queue_item_t *) &q->items[i];
 
-    NXT_USDT(queue__dequeue, i, qi->tracking);
-
     /*
      * qi lives in shared memory that the peer can write.  Cap qi->size at
      * the slot's data bound (NXT_APP_QUEUE_MSG_SIZE) before the memcpy so
@@ -147,6 +145,12 @@ nxt_app_queue_recv(nxt_app_queue_t volatile *q, void *p, uint32_t *cookie)
 
     nxt_memcpy(p, qi->data, size);
     *cookie = i;
+
+    /*
+     * Not before the slot is touched: a tracer reads qi->tracking without
+     * faulting the page in, and a first read of the page would report 0.
+     */
+    NXT_USDT(queue__dequeue, i, qi->tracking);
 
     (void) nxt_app_nncq_enqueue(&q->free_items, i);
 
