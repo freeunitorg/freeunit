@@ -26,6 +26,7 @@ typedef struct {
     nxt_controller_conf_t     conf;
     nxt_conn_t                *conn;
     nxt_queue_link_t          link;
+    nxt_bool_t                status_only;
 } nxt_controller_request_t;
 
 
@@ -63,6 +64,9 @@ static void nxt_controller_flush_requests(nxt_task_t *task);
 static nxt_int_t nxt_controller_conf_send(nxt_task_t *task, nxt_mp_t *mp,
     nxt_conf_value_t *conf, nxt_port_rpc_handler_t handler, void *data);
 
+static nxt_listen_socket_t *nxt_controller_socket(nxt_task_t *task,
+    nxt_runtime_t *rt, nxt_sockaddr_t *sa);
+static void nxt_controller_listen(nxt_task_t *task);
 static void nxt_controller_conn_init(nxt_task_t *task, void *obj, void *data);
 static void nxt_controller_conn_read(nxt_task_t *task, void *obj, void *data);
 static nxt_msec_t nxt_controller_conn_timeout_value(nxt_conn_t *c,
@@ -85,6 +89,8 @@ static nxt_int_t nxt_controller_request_content_length(void *ctx,
     nxt_http_field_t *field, uintptr_t data);
 
 static void nxt_controller_process_request(nxt_task_t *task,
+    nxt_controller_request_t *req);
+static nxt_bool_t nxt_controller_status_only_allowed(nxt_task_t *task,
     nxt_controller_request_t *req);
 static void nxt_controller_process_config(nxt_task_t *task,
     nxt_controller_request_t *req, nxt_str_t *path);
@@ -459,7 +465,6 @@ static void
 nxt_controller_send_current_conf(nxt_task_t *task)
 {
     nxt_int_t         rc;
-    nxt_runtime_t     *rt;
     nxt_conf_value_t  *conf;
 
     conf = nxt_controller_conf.root;
@@ -485,13 +490,7 @@ nxt_controller_send_current_conf(nxt_task_t *task)
         nxt_abort();
     }
 
-    rt = task->thread->runtime;
-
-    if (nxt_slow_path(nxt_listen_event(task, rt->controller_socket) == NULL)) {
-        nxt_abort();
-    }
-
-    nxt_controller_listening = 1;
+    nxt_controller_listen(task);
 
     nxt_controller_flush_requests(task);
 }
@@ -573,8 +572,6 @@ static void
 nxt_controller_conf_init_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
-    nxt_runtime_t  *rt;
-
     nxt_controller_waiting_init_conf = 0;
 
     if (msg->port_msg.type != NXT_PORT_MSG_RPC_READY) {
@@ -587,17 +584,7 @@ nxt_controller_conf_init_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         }
     }
 
-    if (nxt_controller_listening == 0) {
-        rt = task->thread->runtime;
-
-        if (nxt_slow_path(nxt_listen_event(task, rt->controller_socket)
-                          == NULL))
-        {
-            nxt_abort();
-        }
-
-        nxt_controller_listening = 1;
-    }
+    nxt_controller_listen(task);
 
     nxt_controller_flush_requests(task);
 }
@@ -695,17 +682,80 @@ fail:
 }
 
 
+static void
+nxt_controller_listen(nxt_task_t *task)
+{
+    nxt_runtime_t  *rt;
+
+    if (nxt_controller_listening) {
+        return;
+    }
+
+    rt = task->thread->runtime;
+
+    if (nxt_slow_path(nxt_listen_event(task, rt->controller_socket) == NULL)) {
+        nxt_abort();
+    }
+
+    if (rt->status_socket != NULL
+        && nxt_slow_path(nxt_listen_event(task, rt->status_socket) == NULL))
+    {
+        nxt_abort();
+    }
+
+    nxt_controller_listening = 1;
+}
+
+
 nxt_int_t
 nxt_runtime_controller_socket(nxt_task_t *task, nxt_runtime_t *rt)
 {
     nxt_listen_socket_t  *ls;
 
-    ls = nxt_mp_alloc(rt->mem_pool, sizeof(nxt_listen_socket_t));
+    ls = nxt_controller_socket(task, rt, rt->controller_listen);
     if (ls == NULL) {
         return NXT_ERROR;
     }
 
-    ls->sockaddr = rt->controller_listen;
+    rt->controller_socket = ls;
+
+    return NXT_OK;
+}
+
+
+/*
+ * The status socket serves only "GET /status" and its subpaths.  It
+ * skips the peer credential check, so its file permissions (or, for an
+ * IP address, network reachability) are the only access control.
+ */
+
+nxt_int_t
+nxt_runtime_status_socket(nxt_task_t *task, nxt_runtime_t *rt)
+{
+    nxt_listen_socket_t  *ls;
+
+    ls = nxt_controller_socket(task, rt, rt->status_listen);
+    if (ls == NULL) {
+        return NXT_ERROR;
+    }
+
+    rt->status_socket = ls;
+
+    return NXT_OK;
+}
+
+
+static nxt_listen_socket_t *
+nxt_controller_socket(nxt_task_t *task, nxt_runtime_t *rt, nxt_sockaddr_t *sa)
+{
+    nxt_listen_socket_t  *ls;
+
+    ls = nxt_mp_alloc(rt->mem_pool, sizeof(nxt_listen_socket_t));
+    if (ls == NULL) {
+        return NULL;
+    }
+
+    ls->sockaddr = sa;
 
     nxt_listen_socket_remote_size(ls);
 
@@ -736,12 +786,10 @@ nxt_runtime_controller_socket(nxt_task_t *task, nxt_runtime_t *rt)
 #endif
 
     if (nxt_listen_socket_create(task, rt->mem_pool, ls) != NXT_OK) {
-        return NXT_ERROR;
+        return NULL;
     }
 
-    rt->controller_socket = ls;
-
-    return NXT_OK;
+    return ls;
 }
 
 
@@ -820,15 +868,23 @@ static void
 nxt_controller_conn_init(nxt_task_t *task, void *obj, void *data)
 {
     nxt_buf_t                 *b;
+    nxt_bool_t                status_only;
     nxt_conn_t                *c;
+    nxt_runtime_t             *rt;
     nxt_event_engine_t        *engine;
     nxt_controller_request_t  *r;
 
     c = obj;
+    rt = task->thread->runtime;
 
     nxt_debug(task, "controller conn init fd:%d", c->socket.fd);
 
-    if (nxt_slow_path(nxt_controller_check_peer_cred(task, c) != NXT_OK)) {
+    status_only = (rt->status_socket != NULL
+                   && c->listen->listen == rt->status_socket);
+
+    if (!status_only
+        && nxt_slow_path(nxt_controller_check_peer_cred(task, c) != NXT_OK))
+    {
         nxt_controller_conn_close(task, c, NULL);
         return;
     }
@@ -840,6 +896,7 @@ nxt_controller_conn_init(nxt_task_t *task, void *obj, void *data)
     }
 
     r->conn = c;
+    r->status_only = status_only;
 
     if (nxt_slow_path(nxt_http_parse_request_init(&r->parser, c->mem_pool)
                       != NXT_OK))
@@ -947,7 +1004,12 @@ nxt_controller_conn_read(nxt_task_t *task, void *obj, void *data)
                     "body length: %uz, preread: %uz",
                     r->length, preread);
 
-    if (preread >= r->length) {
+    /*
+     * GET /status needs no body, so the status socket never reads one.
+     * A peer that is not trusted to change the configuration cannot make
+     * the controller allocate a buffer of its chosen size.
+     */
+    if (preread >= r->length || r->status_only) {
         nxt_controller_process_request(task, r);
         return;
     }
@@ -1228,6 +1290,12 @@ nxt_controller_process_request(nxt_task_t *task, nxt_controller_request_t *req)
     static const nxt_str_t config = nxt_string("config");
     static const nxt_str_t status = nxt_string("status");
 
+    if (req->status_only
+        && !nxt_controller_status_only_allowed(task, req))
+    {
+        return;
+    }
+
     c = req->conn;
     path = req->parser.path;
 
@@ -1400,6 +1468,39 @@ alloc_fail:
 
     nxt_controller_response(task, req, &resp);
     return;
+}
+
+
+static nxt_bool_t
+nxt_controller_status_only_allowed(nxt_task_t *task,
+    nxt_controller_request_t *req)
+{
+    nxt_str_t                  path;
+    nxt_controller_response_t  resp;
+
+    path = req->parser.path;
+
+    nxt_memzero(&resp, sizeof(nxt_controller_response_t));
+
+    if (!nxt_str_eq(&req->parser.method, "GET", 3)) {
+        resp.status = 405;
+        resp.title = (u_char *) "Invalid method.";
+
+    } else if (nxt_str_start(&path, "/status", 7)
+               && (path.length == 7 || path.start[7] == '/'))
+    {
+        return 1;
+
+    } else {
+        resp.status = 404;
+        resp.title = (u_char *) "Value doesn't exist.";
+    }
+
+    resp.offset = -1;
+
+    nxt_controller_response(task, req, &resp);
+
+    return 0;
 }
 
 
