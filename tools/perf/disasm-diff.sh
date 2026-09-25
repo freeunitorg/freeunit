@@ -116,6 +116,22 @@ while IFS= read -r func || [ -n "$func" ]; do
     fi
 done < tools/perf/hot-functions.txt
 
+# A baseline for a function no longer in the list: in CI the baseline comes
+# from the base commit's list, so dropping an entry drops its check.
+for base in "$BASELINE_DIR"/*.s; do
+    [ -f "$base" ] || continue
+    func=$(basename "$base" .s)
+
+    grep -qxF "$func" tools/perf/hot-functions.txt && continue
+
+    if [ "$UPDATE" -eq 1 ]; then
+        rm -f "$base"
+    else
+        echo "REMOVED (in the baseline, not in hot-functions.txt): $func"
+        status=1
+    fi
+done
+
 [ "$UPDATE" -eq 0 ] || echo "Baseline written to $BASELINE_DIR"
 [ -z "$missing" ] || echo "warning: no disassembly found for:$missing" >&2
 [ -z "$diffs" ] || echo "functions with disassembly changes:$diffs"
