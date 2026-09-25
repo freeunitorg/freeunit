@@ -215,6 +215,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_runtime_idle_close_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_router_new_port_test(thr) != NXT_OK) {
         return 1;
     }

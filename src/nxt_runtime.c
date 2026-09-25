@@ -25,6 +25,8 @@ static nxt_int_t nxt_runtime_thread_pools(nxt_thread_t *thr, nxt_runtime_t *rt);
 static void nxt_runtime_start(nxt_task_t *task, void *obj, void *data);
 static void nxt_runtime_initial_start(nxt_task_t *task, nxt_uint_t status);
 static void nxt_runtime_close_idle_connections(nxt_event_engine_t *engine);
+static void nxt_runtime_idle_conn_free(nxt_task_t *task, void *obj,
+    void *data);
 static void nxt_runtime_stop_all_processes(nxt_task_t *task, nxt_runtime_t *rt);
 static void nxt_runtime_exit(nxt_task_t *task, void *obj, void *data);
 static nxt_int_t nxt_runtime_event_engine_change(nxt_task_t *task,
@@ -480,6 +482,22 @@ nxt_runtime_quit(nxt_task_t *task, nxt_uint_t status)
 }
 
 
+/*
+ * write_state installed on an idle conn just before nxt_conn_close() so
+ * that the close handler has something to invoke once the socket is
+ * actually closed (see CONN-INV-2: nxt_conn_close() always dereferences
+ * c->write_state->ready_handler).  Without this, a keep-alive h1p conn
+ * would keep its request-send state, whose ready_handler is a no-op with
+ * c->write == NULL, leaking the conn; a conn that never received a
+ * request has write_state == NULL and the close handler would crash.
+ */
+static const nxt_conn_state_t  nxt_runtime_idle_close_state
+    nxt_aligned(64) =
+{
+    .ready_handler = nxt_runtime_idle_conn_free,
+};
+
+
 static void
 nxt_runtime_close_idle_connections(nxt_event_engine_t *engine)
 {
@@ -510,10 +528,43 @@ nxt_runtime_close_idle_connections(nxt_event_engine_t *engine)
              * (P4.5).  Iteration stays safe: `next` was captured above.
              */
             nxt_conn_untrack(engine, c);
+
+            c->write_state = &nxt_runtime_idle_close_state;
             nxt_conn_close(engine, c);
         }
     }
 }
+
+
+static void
+nxt_runtime_idle_conn_free(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_conn_t  *c;
+
+    c = obj;
+
+    nxt_debug(task, "runtime idle conn free fd:%d", c->socket.fd);
+
+    nxt_conn_free(task, c);
+}
+
+
+#if (NXT_TESTS)
+
+/*
+ * src/test/nxt_runtime_idle_close_test.c drives the idle-connection close
+ * path (M-11) without going through a full nxt_runtime_quit(): it is the
+ * only entry point that installs a write_state before nxt_conn_close(),
+ * which is exactly the invariant the test checks.
+ */
+
+void
+nxt_runtime_test_close_idle_connections(nxt_event_engine_t *engine)
+{
+    nxt_runtime_close_idle_connections(engine);
+}
+
+#endif
 
 
 /*
