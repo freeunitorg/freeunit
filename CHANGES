@@ -1,5 +1,5 @@
 
-Changes with FreeUnit 1.36.2                                     30 Aug 2026
+Changes with FreeUnit 1.37.0                                     01 Oct 2026
 
     *) Security: the router and libunit read records from shared memory
        that the other process can still write, without enough checks. A
