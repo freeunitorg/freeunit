@@ -25,8 +25,6 @@ static nxt_int_t nxt_runtime_thread_pools(nxt_thread_t *thr, nxt_runtime_t *rt);
 static void nxt_runtime_start(nxt_task_t *task, void *obj, void *data);
 static void nxt_runtime_initial_start(nxt_task_t *task, nxt_uint_t status);
 static void nxt_runtime_close_idle_connections(nxt_event_engine_t *engine);
-static void nxt_runtime_idle_conn_free(nxt_task_t *task, void *obj,
-    void *data);
 static void nxt_runtime_stop_all_processes(nxt_task_t *task, nxt_runtime_t *rt);
 static void nxt_runtime_exit(nxt_task_t *task, void *obj, void *data);
 static nxt_int_t nxt_runtime_event_engine_change(nxt_task_t *task,
@@ -483,20 +481,30 @@ nxt_runtime_quit(nxt_task_t *task, nxt_uint_t status)
 
 
 /*
- * write_state installed on an idle conn just before nxt_conn_close() so
- * that the close handler has something to invoke once the socket is
- * actually closed (see CONN-INV-2: nxt_conn_close() always dereferences
- * c->write_state->ready_handler).  Without this, a keep-alive h1p conn
- * would keep its request-send state, whose ready_handler is a no-op with
- * c->write == NULL, leaking the conn; a conn that never received a
- * request has write_state == NULL and the close handler would crash.
+ * Close every idle conn of the engine on shutdown.
+ *
+ * Each conn is handed to its own protocol through c->read_state's
+ * close_handler, the same contract nxt_conn_accept_close_idle_handler()
+ * (nxt_conn_accept.c) uses to reclaim idle conns under fd pressure.  That
+ * handler ends in the protocol's free path -- nxt_h1p_conn_free() for a
+ * router conn, nxt_controller_conn_free() for a controller conn -- which
+ * releases everything the runtime cannot know about: the sockaddr from the
+ * engine cache (nxt_conn_accept_alloc()), and for the router the listener
+ * reference taken in nxt_conn_accept(), without which a draining listener
+ * never reaches its final release.  It also satisfies CONN-INV-2 (a
+ * write_state whose ready_handler releases the conn is installed before
+ * nxt_conn_close()), which a bare nxt_conn_close() here would violate: a
+ * keep-alive h1p conn still carries its request-send state, whose
+ * ready_handler is a no-op with c->write == NULL, so the conn would leak.
+ *
+ * A conn with no read_state has been accepted but its listen handler
+ * (nxt_conn_accept(): lev->listen->handler, queued on the read work queue)
+ * has not run yet, so no protocol owns it.  It is left alone: that queued
+ * work item still references it, so closing or freeing it here would be a
+ * use-after-free once the item runs, and nxt_conn_close() on a conn with
+ * write_state == NULL crashes in nxt_conn_close_handler().  It gets its
+ * protocol state when that item runs and is closed by the next pass.
  */
-static const nxt_conn_state_t  nxt_runtime_idle_close_state
-    nxt_aligned(64) =
-{
-    .ready_handler = nxt_runtime_idle_conn_free,
-};
-
 
 static void
 nxt_runtime_close_idle_connections(nxt_event_engine_t *engine)
@@ -516,36 +524,32 @@ nxt_runtime_close_idle_connections(nxt_event_engine_t *engine)
         next = nxt_queue_next(link);
         c = nxt_queue_link_data(link, nxt_conn_t, link);
 
-        if (!c->socket.read_ready) {
-            /*
-             * Unlink and clear the tracking state immediately, before
-             * scheduling the async close.  nxt_runtime_quit() calls this on
-             * every shutdown continuation, so a conn left on idle_connections
-             * would be re-selected and re-closed on the next pass before its
-             * async close handler runs -- a double nxt_conn_close(), i.e. a
-             * use-after-free.  Clearing c->idle to TRACK_NONE also stops the
-             * close handler from unlinking the same conn a second time
-             * (P4.5).  Iteration stays safe: `next` was captured above.
-             */
-            nxt_conn_untrack(engine, c);
-
-            c->write_state = &nxt_runtime_idle_close_state;
-            nxt_conn_close(engine, c);
+        if (c->socket.read_ready) {
+            continue;
         }
+
+        if (c->read_state == NULL || c->read_state->close_handler == NULL) {
+            nxt_debug(c->socket.task, "idle connection: %d not yet "
+                      "initialized, skipped", c->socket.fd);
+            continue;
+        }
+
+        /*
+         * Unlink and clear the tracking state immediately, before the
+         * protocol schedules its async close.  nxt_runtime_quit() calls
+         * this on every shutdown continuation, so a conn left on
+         * idle_connections would be re-selected and re-closed on the next
+         * pass before its async close handler runs -- a double
+         * nxt_conn_close(), i.e. a use-after-free.  Clearing c->idle to
+         * TRACK_NONE also stops the close handler from unlinking the same
+         * conn a second time (P4.5), and makes the nxt_conn_active() at
+         * the top of the h1p close handlers a no-op.  Iteration stays
+         * safe: `next` was captured above.
+         */
+        nxt_conn_untrack(engine, c);
+
+        c->read_state->close_handler(c->socket.task, c, c->socket.data);
     }
-}
-
-
-static void
-nxt_runtime_idle_conn_free(nxt_task_t *task, void *obj, void *data)
-{
-    nxt_conn_t  *c;
-
-    c = obj;
-
-    nxt_debug(task, "runtime idle conn free fd:%d", c->socket.fd);
-
-    nxt_conn_free(task, c);
 }
 
 
@@ -553,9 +557,9 @@ nxt_runtime_idle_conn_free(nxt_task_t *task, void *obj, void *data)
 
 /*
  * src/test/nxt_runtime_idle_close_test.c drives the idle-connection close
- * path (M-11) without going through a full nxt_runtime_quit(): it is the
- * only entry point that installs a write_state before nxt_conn_close(),
- * which is exactly the invariant the test checks.
+ * path (M-11) without going through a full nxt_runtime_quit(): it checks
+ * that every idle conn is closed through its own protocol close handler,
+ * and that a conn without one is left alone.
  */
 
 void
