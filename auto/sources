@@ -195,6 +195,8 @@ NXT_TEST_SRCS=" \
     src/test/nxt_checked_test.c \
     src/test/nxt_router_prepare_msg_test.c \
     src/test/nxt_router_response_parse_test.c \
+    src/test/nxt_port_frag_test.c \
+    src/test/nxt_port_release_test.c \
 "
 
 

@@ -60,6 +60,7 @@ nxt_test_in_child(nxt_thread_t *thr, const char *name, int (*fn)(void *),
 static nxt_int_t (*const nxt_security_tests[])(nxt_thread_t *) = {
     nxt_checked_test, nxt_port_mmap_read_test,
     nxt_router_prepare_msg_test, nxt_router_response_parse_test,
+    nxt_port_frag_test, nxt_port_release_test,
 };
 
 
