@@ -23,6 +23,8 @@ static void nxt_eventport_disable(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
 static nxt_bool_t nxt_eventport_close(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
+static void nxt_eventport_cancel_changes(nxt_event_engine_t *engine,
+    nxt_fd_event_t *ev);
 static void nxt_eventport_enable_read(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
 static void nxt_eventport_enable_write(nxt_event_engine_t *engine,
@@ -63,6 +65,7 @@ const nxt_event_interface_t  nxt_eventport_engine = {
     nxt_eventport_disable,
     nxt_eventport_disable,
     nxt_eventport_close,
+    nxt_eventport_cancel_changes,
     nxt_eventport_enable_read,
     nxt_eventport_enable_write,
     nxt_eventport_disable_read,
@@ -290,6 +293,47 @@ nxt_eventport_disable_event(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
     change = &engine->u.eventport.changes[engine->u.eventport.nchanges++];
     change->events = 0;
     change->event = ev;
+}
+
+
+/*
+ * Take this event's pending changes out of the batch, so that a struct that
+ * is about to be freed is not dereferenced by nxt_eventport_commit_changes().
+ *
+ * The change is dropped rather than committed: the descriptor is closed, or
+ * is about to be, so the change would name a descriptor number that may
+ * already belong to somebody else.
+ */
+
+static void
+nxt_eventport_cancel_changes(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
+{
+    nxt_eventport_change_t  *change, *dst, *end;
+
+    if (!ev->changing) {
+        return;
+    }
+
+    dst = engine->u.eventport.changes;
+    end = dst + engine->u.eventport.nchanges;
+
+    for (change = dst; change < end; change++) {
+
+        if (change->event == ev) {
+            continue;
+        }
+
+        if (dst != change) {
+            *dst = *change;
+        }
+
+        dst++;
+    }
+
+    engine->u.eventport.nchanges = (nxt_uint_t)
+                                       (dst - engine->u.eventport.changes);
+
+    ev->changing = 0;
 }
 
 
