@@ -10,6 +10,19 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="change">
+<para>
+a certificate bundle whose private key does not belong to its first
+certificate is now refused at upload with 400 "Invalid certificate.".  Before,
+the bundle was stored, and the mismatch broke the next reconfiguration of every
+listener that named it.  Certificate names that start with "." are reserved
+for the store's own files, and files with such names are ignored at startup.
+After an upgrade, a bundle already stored with a mismatched key is not loaded
+(an alert at startup) and leaves /certificates; its file stays in the state
+directory and cannot be deleted through the API, so remove it by hand.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 an application worker that served a WebSocket upgrade never became idle again.
@@ -87,6 +100,18 @@ and, since a later message raises one only when the queue was empty, no
 later message on that port raised one either.  The wake-up is now kept and
 retried, and the retry no longer waits for a socket event that a socket that
 never filled up will not deliver (#392).
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a port that was closed and freed could leave a pending epoll or kqueue change
+behind it.  The change is held by a pointer into the port, and is applied when
+the batch is committed -- at the top of the next poll at the latest, which is
+after the port's memory pool is released.  The commit then read freed memory,
+and could also name a descriptor number the kernel had already handed to
+somebody else.  A port now drops its pending changes before it is freed
+(#414).
 </para>
 </change>
 
@@ -515,6 +540,38 @@ It could not have compiled had the probe succeeded: it reads "async" and
 "nxt_php_extension_init()", which no file in the tree defines.  The probe, the
 "entrypoint" target key and the TrueAsync test suite are removed with it; a PHP
 application builds and behaves as before.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the java module split every outgoing WebSocket text message larger than 8 KiB
+into 8 KiB frames, whatever "max_frame_size" was set to.  A 64 KiB message
+arrived as eight frames and a 16 MiB one as about two thousand, each carrying
+its own frame header and costing its own message to the router, while every
+other language module sends a complete message as a single frame.  A complete
+text message is now encoded into a buffer of its own and sent as one frame; a
+message above "nginx.unit.websocket.MAX_SEND_BUFFER_SIZE", 16 MiB by default,
+still fragments.  A Writer from getSendWriter() still sends each chunk it
+flushes as a frame of its own, but that chunk is now one frame instead of up to
+three.  This does not make the module honour "max_frame_size", which remains an
+inbound limit only.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the java module sent nothing through the asynchronous WebSocket remote.  Every
+send from getAsyncRemote() -- sendText(), sendBinary() and sendObject(), with a
+SendHandler or through the Future they return -- ended in a doWrite() that had
+no body, so no frame left, the handler was never called and Future.get()
+blocked for good; getBasicRemote() sends through another path and was not
+affected.  Such a send now goes out as one from the blocking remote does, and
+its handler or future completes on the sending thread with the outcome, which
+is a failure once the session is closed (#434).  Batching works as well:
+flushBatch() and setBatchingAllowed(false) threw instead of sending what was
+batched, and a batched frame from a buffer whose position was not 0 had a
+header that overstated its length and corrupted the frames after it.
 </para>
 </change>
 

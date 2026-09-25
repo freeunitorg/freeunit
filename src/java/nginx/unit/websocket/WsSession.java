@@ -989,7 +989,7 @@ public class WsSession implements Session {
             if (binaryBuffer.remaining() < buf.remaining()) {
                 throw new WsIOException(new CloseReason(
                         CloseCodes.TOO_BIG,
-                        sm.getString("wsFrame.textMessageTooBig")));
+                        sm.getString("wsFrame.binaryMessageTooBig")));
             }
 
             binaryBuffer.put(buf);
