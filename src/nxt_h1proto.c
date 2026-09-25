@@ -3381,9 +3381,11 @@ nxt_h1p_peer_close(nxt_task_t *task, nxt_http_peer_t *peer)
      * nxt_h1p_peer_read_done()/nxt_h1p_peer_send_timeout()/etc. and dereference
      * the freed peer -- a use-after-free that crashes the router.  Both paths
      * are at risk: the read side (response relay) and the write side (the
-     * request body upload uses an autoreset send timer).  Setting block_read /
-     * block_write makes a queued nxt_conn_io_read()/nxt_conn_io_write() bail out
-     * early; nxt_conn_close() still emits the FIN via its work-queue handler.
+     * request body upload uses an autoreset send timer).  block_read stops
+     * a queued nxt_conn_io_read(), and a queued nxt_conn_io_write() returns
+     * because nxt_conn_close() clears c->write.  The flags are set here for
+     * the fd == -1 branch, which skips nxt_conn_close().  nxt_conn_close()
+     * still emits the FIN via its work-queue handler.
      */
     c->block_read = 1;
     c->block_write = 1;

@@ -160,6 +160,9 @@ nxt_conn_free(nxt_task_t *task, nxt_conn_t *c)
 
     nxt_assert(c->task.thread == task->thread);
 
+    /* An open fd would leak and leave a stale fd-event registered. */
+    nxt_assert(c->socket.fd == -1);
+
     /*
      * Take both timers out of the engine's timer machinery, and take the conn
      * off whichever tracking queue it is on.  Callers only ever

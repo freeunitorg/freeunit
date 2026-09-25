@@ -190,6 +190,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_port_fd_test.c \
     src/test/nxt_port_rpc_fd_test.c \
     src/test/nxt_port_queued_fd_test.c \
+    src/test/nxt_conn_close_test.c \
 "
 
 
