@@ -2,7 +2,8 @@ name: "Lint (ast-grep)"
 
 # ast-grep: fail on violations not in tools/ast-grep/baseline.json.
 # require-tests: a src/ change needs a test/ or src/test/ change, unless the PR
-# has the "no-test-needed" label or a commit has a "No-Test-Reason:" trailer.
+# has the "no-test-needed" label or a commit has a "No-Test-Reason: <why>"
+# trailer with a non-empty value.
 
 on:
   pull_request:
@@ -57,11 +58,15 @@ jobs:
             exit 0
           fi
 
-          if git log --format='%B' "$BASE_SHA..$HEAD_SHA" \
-             | grep -qiE '^No-Test-Reason:'; then
-            echo "opted out via a No-Test-Reason: trailer"
-            git log --format='%B' "$BASE_SHA..$HEAD_SHA" \
-              | grep -iE '^No-Test-Reason:'
+          # Only a real trailer counts, not text in the body, and its
+          # value must not be blank.
+          reasons="$(git log \
+              --format='%(trailers:key=No-Test-Reason,valueonly)' \
+              "$BASE_SHA..$HEAD_SHA" | grep -E '[^[:space:]]' || true)"
+
+          if [ -n "$reasons" ]; then
+            echo "opted out via a No-Test-Reason: trailer:"
+            echo "$reasons"
             exit 0
           fi
 
