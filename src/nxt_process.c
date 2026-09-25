@@ -1368,6 +1368,9 @@ nxt_nanosleep(nxt_nsec_t ns)
 void
 nxt_process_port_add(nxt_task_t *task, nxt_process_t *process, nxt_port_t *port)
 {
+    /* A double add is a bug: trap it in a debug build, refuse it in any. */
+    nxt_assert(port->process == NULL && port->link.next == NULL);
+
     if (nxt_slow_path(port->process != NULL || port->link.next != NULL)) {
         nxt_alert(task, "port %p %d:%d is already paired with a process",
                   port, port->pid, port->id);
