@@ -14,6 +14,17 @@ if [ -n "$NXT_FUZZ" ]; then
 	done
 
 
+	# fuzz_http_h2p links the real nghttp2 session and the real h2p
+	# callbacks (nxt_h2p_session_create() et al, via #include), so it only
+	# exists when nghttp2 was actually configured in: without --h2 there is
+	# no session to create, and NXT_FUZZ_SRCS below leaves its .c out, so
+	# the object this target would link does not exist either.
+	if [ "$NXT_HAVE_NGHTTP2" = "YES" ]; then
+		NXT_FUZZ_H2P_TARGET="$NXT_BUILD_DIR/fuzz_http_h2p"
+	else
+		NXT_FUZZ_H2P_TARGET=
+	fi
+
 	# Fuzz-Test executables.
 
 	cat << END >> $NXT_MAKEFILE
@@ -23,6 +34,7 @@ fuzz:		$NXT_BUILD_DIR/fuzz_basic \\
 			$NXT_BUILD_DIR/fuzz_http_controller \\
 			$NXT_BUILD_DIR/fuzz_http_h1p \\
 			$NXT_BUILD_DIR/fuzz_http_h1p_peer \\
+			$NXT_FUZZ_H2P_TARGET \\
 			$NXT_BUILD_DIR/fuzz_json
 
 $NXT_BUILD_DIR/fuzz_basic: \$(NXT_FUZZ_OBJS) \\
@@ -71,5 +83,22 @@ $NXT_BUILD_DIR/fuzz_json: \$(NXT_FUZZ_OBJS) \\
 		$NXT_FUZZ
 
 END
+
+	if [ "$NXT_HAVE_NGHTTP2" = "YES" ]; then
+
+		cat << END >> $NXT_MAKEFILE
+
+$NXT_BUILD_DIR/fuzz_http_h2p: \$(NXT_FUZZ_OBJS) \\
+			$NXT_BUILD_DIR/lib/$NXT_LIB_STATIC
+	\$(PP_LD) \$@
+	\$(v)\$(NXT_EXEC_LINK) -o $NXT_BUILD_DIR/fuzz_http_h2p \\
+		\$(CFLAGS) $NXT_BUILD_DIR/fuzzing/nxt_http_h2p_fuzz.o \\
+		$NXT_BUILD_DIR/lib/$NXT_LIB_STATIC \\
+		$NXT_LD_OPT $NXT_LIBM $NXT_LIBS $NXT_LIB_AUX_LIBS \\
+		$NXT_FUZZ
+
+END
+
+	fi
 
 fi

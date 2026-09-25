@@ -344,6 +344,12 @@ NXT_FUZZ_SRCS=" \
     fuzzing/nxt_json_fuzz.c \
 "
 
+# fuzz_http_h2p #includes nxt_h2proto.c to reach its real nghttp2 callbacks
+# (ADR 0005), so it only builds where nxt_h2proto.c itself does.
+if [ "$NXT_HAVE_NGHTTP2" = "YES" ]; then
+    NXT_FUZZ_SRCS="$NXT_FUZZ_SRCS fuzzing/nxt_http_h2p_fuzz.c "
+fi
+
 
 NXT_SRCS=" \
     src/nxt_main.c \
