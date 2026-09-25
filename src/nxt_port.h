@@ -422,6 +422,16 @@ struct nxt_port_s {
     nxt_atomic_t        rearm_pending;
     nxt_atomic_t        announce;
 
+    /*
+     * A QUIT was sent to this port, so its peer may be gone by now.  Any
+     * thread may set it (nxt_port_socket_write2()), it is never cleared,
+     * and the sender reads it when a send fails: a READ_QUEUE wake-up that
+     * was already pending when the QUIT was put in the shared queue
+     * (notify == 0) wakes the peer for that QUIT too, and its failure is
+     * logged at info like the QUIT's own.
+     */
+    nxt_atomic_t        quit_sent;
+
     nxt_buf_t           *free_bufs;
     nxt_socket_t        pair[2];
 

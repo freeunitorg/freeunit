@@ -28,7 +28,8 @@ static nxt_int_t nxt_port_fail_test_enqueue(nxt_task_t *task,
 static nxt_int_t nxt_port_fail_test_dead_peer(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_quit_log_level(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_send_to_dead_peer(nxt_thread_t *thr,
-    nxt_uint_t type, nxt_bool_t queued, nxt_bool_t shared, nxt_uint_t *level);
+    nxt_uint_t type, nxt_bool_t queued, nxt_bool_t shared, nxt_uint_t then,
+    nxt_uint_t *level);
 static void nxt_cdecl nxt_port_fail_test_log_handler(nxt_uint_t level,
     nxt_log_t *log, const char *fmt, ...);
 static nxt_int_t nxt_port_fail_test_rpc_register(nxt_thread_t *thr);
@@ -910,7 +911,7 @@ nxt_port_fail_test_log_handler(nxt_uint_t level, nxt_log_t *log,
 
 static nxt_int_t
 nxt_port_fail_test_send_to_dead_peer(nxt_thread_t *thr, nxt_uint_t type,
-    nxt_bool_t queued, nxt_bool_t shared, nxt_uint_t *level)
+    nxt_bool_t queued, nxt_bool_t shared, nxt_uint_t then, nxt_uint_t *level)
 {
     nxt_fd_t               pair[2];
     nxt_int_t              ret;
@@ -1003,6 +1004,23 @@ nxt_port_fail_test_send_to_dead_peer(nxt_thread_t *thr, nxt_uint_t type,
         goto done;
     }
 
+    /*
+     * A second message behind the first one: the shared queue is not empty
+     * any more, so it goes into the queue with no wake-up of its own
+     * (notify == 0), and the pending wake-up covers it.
+     */
+    if (then != 0) {
+        ret = nxt_port_socket_write(task, port, then, -1, 0, 0, NULL);
+
+        if (ret != NXT_OK || queue == NULL || queue->nitems != 2) {
+            nxt_log_error(NXT_LOG_NOTICE, saved_log,
+                          "port failure test: the second message did not "
+                          "join the shared queue (%d)", (int) ret);
+            ret = NXT_ERROR;
+            goto done;
+        }
+    }
+
     if (queued) {
         if (ret != NXT_OK || nxt_queue_is_empty(&port->messages)) {
             nxt_log_error(NXT_LOG_NOTICE, saved_log,
@@ -1063,26 +1081,31 @@ nxt_port_fail_test_quit_log_level(nxt_thread_t *thr)
         nxt_uint_t  type;
         nxt_bool_t  queued;
         nxt_bool_t  shared;
+        nxt_uint_t  then;
         nxt_uint_t  level;
         const char  *name;
     } legs[] = {
-        { NXT_PORT_MSG_QUIT, 0, 0, NXT_LOG_INFO, "a QUIT sent at once" },
-        { NXT_PORT_MSG_QUIT, 1, 0, NXT_LOG_INFO, "a QUIT sent from the queue" },
-        { NXT_PORT_MSG_QUIT, 0, 1, NXT_LOG_INFO,
+        { NXT_PORT_MSG_QUIT, 0, 0, 0, NXT_LOG_INFO, "a QUIT sent at once" },
+        { NXT_PORT_MSG_QUIT, 1, 0, 0, NXT_LOG_INFO,
+          "a QUIT sent from the queue" },
+        { NXT_PORT_MSG_QUIT, 0, 1, 0, NXT_LOG_INFO,
           "a QUIT to a port with a shared queue" },
-        { NXT_PORT_MSG_QUIT, 1, 1, NXT_LOG_INFO,
+        { NXT_PORT_MSG_QUIT, 1, 1, 0, NXT_LOG_INFO,
           "a deferred QUIT wake-up to a port with a shared queue" },
-        { NXT_PORT_MSG_DATA, 0, 0, NXT_LOG_ALERT, "a DATA sent at once" },
-        { NXT_PORT_MSG_DATA, 0, 1, NXT_LOG_ALERT,
+        { NXT_PORT_MSG_DATA, 0, 0, 0, NXT_LOG_ALERT, "a DATA sent at once" },
+        { NXT_PORT_MSG_DATA, 0, 1, 0, NXT_LOG_ALERT,
           "a DATA to a port with a shared queue" },
-        { NXT_PORT_MSG_DATA, 1, 1, NXT_LOG_ALERT,
+        { NXT_PORT_MSG_DATA, 1, 1, 0, NXT_LOG_ALERT,
           "a deferred DATA wake-up to a port with a shared queue" },
+        { NXT_PORT_MSG_DATA, 1, 1, NXT_PORT_MSG_QUIT, NXT_LOG_INFO,
+          "a deferred wake-up that also covers a later QUIT" },
     };
 
     for (i = 0; i < nxt_nitems(legs); i++) {
         if (nxt_port_fail_test_send_to_dead_peer(thr, legs[i].type,
                                                  legs[i].queued,
-                                                 legs[i].shared, &level)
+                                                 legs[i].shared,
+                                                 legs[i].then, &level)
             != NXT_OK)
         {
             return NXT_ERROR;

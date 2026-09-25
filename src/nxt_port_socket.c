@@ -298,6 +298,14 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
      */
     msg.peer_may_be_gone = ((type & NXT_PORT_MSG_MASK) == _NXT_PORT_MSG_QUIT);
 
+    /*
+     * Before the QUIT can reach the shared queue: a wake-up that is already
+     * pending covers it as well (see port->quit_sent).
+     */
+    if (msg.peer_may_be_gone) {
+        (void) nxt_atomic_cmp_set(&port->quit_sent, 0, 1);
+    }
+
     msg.port_msg.stream = stream;
     msg.port_msg.pid = nxt_pid;
     msg.port_msg.reply_port = reply_port;
@@ -924,7 +932,8 @@ next_fragment:
         msg->port_msg.mf = sb.limit_reached || sb.nmax_reached;
 
         n = nxt_socketpair_send_ex(&port->socket, msg->fd, iov, sb.niov + 1,
-                                   msg->peer_may_be_gone);
+                                   msg->peer_may_be_gone
+                                   || port->quit_sent != 0);
 
         if (n > 0) {
             if (nxt_slow_path((size_t) n != sb.size + iov[0].iov_len)) {
