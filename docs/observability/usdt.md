@@ -38,10 +38,18 @@ ends at `queue__dequeue` or, when the router cancels it first, at
 
 ## Example
 
+The scripts take the path of the traced binary as their first argument,
+so they work with `build/sbin/unitd`, `/usr/local/sbin/unitd` or any other
+install.  For a running daemon, `/proc/<pid>/exe` gives the path.
+
 ```
-bpftrace -l 'usdt:/usr/sbin/unitd:*'
-bpftrace tools/usdt/requests-by-status.bt -p $(pgrep -f 'unit: router')
+UNITD=$(readlink /proc/$(pgrep -f 'unit: main' | head -1)/exe)
+bpftrace -l "usdt:$UNITD:*"
+bpftrace tools/usdt/requests-by-status.bt $UNITD
+bpftrace tools/usdt/port-rtt.bt $UNITD
+bpftrace tools/usdt/queue-residency.bt $UNITD <application binary or module>
 ```
 
-`tools/usdt/` also has `port-rtt.bt` and `queue-residency.bt`. The scripts
-have not been run against a live process yet.
+Add `-p <pid>` to trace one process only.  `queue__dequeue` is in libunit,
+so `queue-residency.bt` also takes the binary linked with it: the language
+module (`.so`) or the external application.
