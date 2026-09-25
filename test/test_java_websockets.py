@@ -1647,3 +1647,27 @@ def test_java_websockets_async_16m(is_unsafe):
     check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'future-done')
 
     close_connection(sock)
+
+
+def check_buffers(remote):
+    # Heap buffers whose bytes do not start at their array's first one: a
+    # slice with a non-zero arrayOffset() used to be sent from the start of
+    # the array, and a read-only buffer failed with ReadOnlyBufferException.
+    client.load('websockets_buffers')
+
+    _, sock, _ = ws.upgrade()
+
+    for kind in ('slice', 'readonly'):
+        ws.frame_write(sock, ws.OP_TEXT, f'{remote}:{kind}')
+        check_frame(ws.frame_read(sock), True, ws.OP_BINARY, b'456789ab')
+        check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'done')
+
+    close_connection(sock)
+
+
+def test_java_websockets_buffers():
+    check_buffers('basic')
+
+
+def test_java_websockets_async_buffers():
+    check_buffers('async')

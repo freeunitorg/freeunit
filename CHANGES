@@ -428,6 +428,15 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        buffer whose position was not 0 had a header that overstated its
        length and corrupted the frames after it.
 
+    *) Bugfix: the java module sent the wrong bytes, or nothing, for a
+       WebSocket message from a heap ByteBuffer that does not start at its
+       array's first byte. The payload was read from the backing array at
+       position(), ignoring arrayOffset(), so a buffer from
+       ByteBuffer.wrap(a, off, n).slice() sent bytes from the start of the
+       array instead of its own; and a read-only heap buffer threw
+       ReadOnlyBufferException instead of being sent. Both the blocking and
+       the asynchronous remote were affected (#486).
+
 
 Changes with FreeUnit 1.36.1                                     28 Aug 2026
 
