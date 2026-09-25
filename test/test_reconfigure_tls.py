@@ -151,11 +151,13 @@ def test_reconfigure_tls_keepalive_close(close):
         sock.close()
 
     else:
-        # The router closes the idle connection itself.
+        # The router closes the idle connection itself.  It may write a
+        # 408 response first (nxt_h1p_idle_response()), so read up to EOF.
         sock.settimeout(5)
 
         try:
-            assert sock.recv(1) == b'', 'closed by the router'
+            while sock.recv(4096) != b'':
+                pass
         except OSError:
             pass
 
