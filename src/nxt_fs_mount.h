@@ -41,7 +41,7 @@ struct nxt_fs_mount_s {
 };
 
 
-nxt_int_t nxt_fs_mount(nxt_task_t *task, nxt_fs_mount_t *mnt);
+nxt_int_t nxt_fs_mount(nxt_task_t *task, nxt_fs_mount_t *mnt, int dst_fd);
 void nxt_fs_unmount(const u_char *path);
 
 

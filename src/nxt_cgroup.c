@@ -9,15 +9,36 @@
 
 
 static int nxt_mk_cgpath_relative(nxt_task_t *task, const char *dir,
-    char *cgpath);
+    char *cgpath, nxt_pid_t pid);
 static nxt_int_t nxt_mk_cgpath(nxt_task_t *task, const char *dir,
-    char *cgpath);
+    char *cgpath, nxt_pid_t pid);
+
+
+nxt_int_t
+nxt_cgroup_make_procs_path(char *cgprocs, size_t len)
+{
+    int  n;
+
+    if (nxt_slow_path(len >= NXT_MAX_PATH_LEN)) {
+        nxt_errno = ENAMETOOLONG;
+        return NXT_ERROR;
+    }
+
+    n = snprintf(cgprocs + len, NXT_MAX_PATH_LEN - len, "/cgroup.procs");
+    if (nxt_slow_path(n < 0 || (size_t) n >= NXT_MAX_PATH_LEN - len)) {
+        nxt_errno = ENAMETOOLONG;
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
 
 
 nxt_int_t
 nxt_cgroup_proc_add(nxt_task_t *task, nxt_process_t *process)
 {
     int        len;
+    size_t     old_len;
     char       cgprocs[NXT_MAX_PATH_LEN];
     FILE       *fp;
     nxt_int_t  ret;
@@ -29,7 +50,16 @@ nxt_cgroup_proc_add(nxt_task_t *task, nxt_process_t *process)
         return NXT_OK;
     }
 
-    ret = nxt_mk_cgpath(task, process->isolation.cgroup.path, cgprocs);
+    /*
+     * Resolve the cgroup path against /proc/<child>/cgroup rather than
+     * /proc/self/cgroup: the parent's cgroup view may differ from the
+     * just-forked child's, particularly when CLONE_NEWCGROUP is in play
+     * and the configured path is relative.  Reading the child's own
+     * /proc entry avoids a TOCTOU where the parent moves between cgroups
+     * after fork() but before this write.
+     */
+    ret = nxt_mk_cgpath(task, process->isolation.cgroup.path, cgprocs,
+                        process->pid);
     if (nxt_slow_path(ret == NXT_ERROR)) {
         return NXT_ERROR;
     }
@@ -39,11 +69,22 @@ nxt_cgroup_proc_add(nxt_task_t *task, nxt_process_t *process)
         return NXT_ERROR;
     }
 
-    len = strlen(cgprocs);
+    old_len = strlen(cgprocs);
 
-    len = snprintf(cgprocs + len, NXT_MAX_PATH_LEN - len, "/cgroup.procs");
-    if (nxt_slow_path(len >= NXT_MAX_PATH_LEN - len)) {
-        nxt_errno = ENAMETOOLONG;
+    /*
+     * Stash the resolved directory before appending "/cgroup.procs" so
+     * nxt_cgroup_cleanup() can rmdir without re-reading /proc/<pid>/cgroup,
+     * which is gone once the child has exited.
+     */
+    process->isolation.cgroup.resolved_path = nxt_mp_alloc(process->mem_pool,
+                                                           old_len + 1);
+    if (nxt_fast_path(process->isolation.cgroup.resolved_path != NULL)) {
+        nxt_memcpy(process->isolation.cgroup.resolved_path, cgprocs, old_len);
+        process->isolation.cgroup.resolved_path[old_len] = '\0';
+    }
+
+    ret = nxt_cgroup_make_procs_path(cgprocs, old_len);
+    if (nxt_slow_path(ret == NXT_ERROR)) {
         return NXT_ERROR;
     }
 
@@ -71,26 +112,50 @@ nxt_cgroup_cleanup(nxt_task_t *task, const nxt_process_t *process)
     char       cgroot[NXT_MAX_PATH_LEN], cgpath[NXT_MAX_PATH_LEN];
     nxt_int_t  ret;
 
-    ret = nxt_mk_cgpath(task, "", cgroot);
+    /*
+     * cgroot is the parent process's own cgroup directory; we must not
+     * rmdir it.  Resolved against /proc/self/cgroup (pid=0): the child
+     * is gone by the time cleanup runs, so /proc/<child_pid>/cgroup no
+     * longer exists.  The TOCTOU concern that motivated using the
+     * child's view in nxt_cgroup_proc_add() does not apply at cleanup
+     * — we just need a stop boundary, and rmdir on the parent's own
+     * cgroup will fail anyway because it is non-empty.
+     */
+    ret = nxt_mk_cgpath(task, "", cgroot, 0);
     if (nxt_slow_path(ret == NXT_ERROR)) {
         return;
     }
 
-    ret = nxt_mk_cgpath(task, process->isolation.cgroup.path, cgpath);
-    if (nxt_slow_path(ret == NXT_ERROR)) {
+    /*
+     * Use the resolved path cached by nxt_cgroup_proc_add(); falling
+     * back to /proc/<pid>/cgroup here would fail with ENOENT.  If the
+     * cache was missed (e.g. mp_alloc failure during add), there is
+     * nothing to clean up that we can address safely — bail out.
+     */
+    if (process->isolation.cgroup.resolved_path == NULL) {
+        return;
+    }
+
+    ret = snprintf(cgpath, sizeof(cgpath), "%s",
+                   process->isolation.cgroup.resolved_path);
+    if (nxt_slow_path(ret < 0 || (size_t) ret >= sizeof(cgpath))) {
         return;
     }
 
     while (*cgpath != '\0' && strcmp(cgroot, cgpath) != 0) {
         rmdir(cgpath);
         ptr = strrchr(cgpath, '/');
+        if (ptr == NULL) {
+            break;
+        }
         *ptr = '\0';
     }
 }
 
 
 static int
-nxt_mk_cgpath_relative(nxt_task_t *task, const char *dir, char *cgpath)
+nxt_mk_cgpath_relative(nxt_task_t *task, const char *dir, char *cgpath,
+    nxt_pid_t pid)
 {
     int         i, len;
     char        *buf, *ptr;
@@ -98,8 +163,21 @@ nxt_mk_cgpath_relative(nxt_task_t *task, const char *dir, char *cgpath)
     size_t      size;
     ssize_t     nread;
     nxt_bool_t  found;
+    char        procpath[NXT_MAX_PATH_LEN];
 
-    fp = nxt_file_fopen(task, "/proc/self/cgroup", "re");
+    if (pid > 0) {
+        len = snprintf(procpath, sizeof(procpath), "/proc/%d/cgroup",
+                       (int) pid);
+        if (len < 0 || (size_t) len >= sizeof(procpath)) {
+            nxt_errno = ENAMETOOLONG;
+            return -1;
+        }
+    } else {
+        nxt_memcpy(procpath, "/proc/self/cgroup",
+                   sizeof("/proc/self/cgroup"));
+    }
+
+    fp = nxt_file_fopen(task, procpath, "re");
     if (nxt_slow_path(fp == NULL)) {
         return -1;
     }
@@ -145,7 +223,7 @@ out_free_buf:
 
 
 static nxt_int_t
-nxt_mk_cgpath(nxt_task_t *task, const char *dir, char *cgpath)
+nxt_mk_cgpath(nxt_task_t *task, const char *dir, char *cgpath, nxt_pid_t pid)
 {
     int  len;
 
@@ -154,9 +232,12 @@ nxt_mk_cgpath(nxt_task_t *task, const char *dir, char *cgpath)
      * the cgroup path include the main unit processes cgroup. I.e
      *
      *   NXT_CGROUP_ROOT/<main process cgroup>/<cgroup path>
+     *
+     * pid: read /proc/<pid>/cgroup so the path reflects the just-forked
+     *      child's cgroup view (or 0 to fall back to /proc/self/cgroup).
      */
     if (dir[0] != '/') {
-        len = nxt_mk_cgpath_relative(task, dir, cgpath);
+        len = nxt_mk_cgpath_relative(task, dir, cgpath, pid);
     } else {
         len = snprintf(cgpath, NXT_MAX_PATH_LEN, NXT_CGROUP_ROOT "%s", dir);
     }
