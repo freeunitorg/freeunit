@@ -73,9 +73,18 @@ nxt_listen_event(nxt_task_t *task, nxt_listen_socket_t *ls)
             nxt_fd_event_enable_accept(engine, &lev->socket);
 
             nxt_queue_insert_tail(&engine->listen_connections, &lev->link);
+
+            return lev;
         }
 
-        return lev;
+        /*
+         * The spare conn could not be allocated: lev was neither armed
+         * (enable_accept) nor linked into engine->listen_connections, so
+         * this listener would silently never accept on this engine.  Free
+         * it and report failure so the caller can react (see nxt_router.c,
+         * nxt_controller.c, nxt_runtime.c callers of nxt_listen_event()).
+         */
+        nxt_free(lev);
     }
 
     return NULL;
