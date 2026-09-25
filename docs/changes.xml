@@ -156,6 +156,18 @@ representation, per RFC 9110.
 </para>
 </change>
 
+<change type="feature">
+<para>
+the access log "format" option accepts the string "json", which writes one
+JSON object per request with a fixed set of fields: "request", "status",
+"bytes_sent", "remote_addr", "user_agent", "referer", "request_time", and
+"request_id".  Every value is a JSON string and is escaped the same way as in
+the object form of "format".  A header that is absent is logged as "-", and a
+header that is present but empty is logged as "".  Any other format string
+keeps its existing literal meaning.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 the router died on the first request after a configuration that had a
