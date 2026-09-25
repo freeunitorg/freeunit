@@ -356,13 +356,25 @@ struct nxt_port_s {
     uint8_t             detached;
 
     /*
+     * An edge the accounting refused -- an unmatched FINISH, or a START at
+     * the maximum count -- was already logged as an alert for this port.
+     * Such an edge is a valid message the application can send in a loop,
+     * so only the first one is an alert and the rest go to the debug log.
+     * Touched only by nxt_router_detached_apply(), on the main thread.
+     */
+    uint8_t             detached_alerted;
+
+    /*
      * How many units of detached work the application reported of its own:
      * one for each START edge whose FINISH edge has not arrived.  Until the
      * last of them does, the port stays out of the idle economy even with no
      * request left.  A count rather than a flag because the edges carry no
      * context id and a worker may run several contexts -- see
      * nxt_port_detached_t above -- so the first context's FINISH must not
-     * speak for the rest.
+     * speak for the rest.  It saturates at UINT32_MAX and detached_router
+     * below does not: this one moves on edges the application sends, which
+     * the router cannot bound, while detached_router moves only on requests
+     * the router itself gave up on, one per request it has in flight.
      */
     uint32_t            detached_app;
 

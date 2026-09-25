@@ -7987,10 +7987,10 @@ static void
 nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid, uint8_t state)
 {
     int                drop;
-    const char         *alert;
     nxt_app_t          *app;
     nxt_port_t         *port;
     nxt_bool_t         changed, start_process, adjust_idle_timer;
+    const char         *alert;
     nxt_runtime_t      *rt;
     nxt_atomic_int_t   c;
 
@@ -8135,8 +8135,19 @@ nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid, uint8_t state)
 
     nxt_thread_mutex_unlock(&app->mutex);
 
+    /*
+     * The application can send a refused edge in a loop, so it is an alert
+     * once per port and debug output after that.
+     */
+
     if (nxt_slow_path(alert != NULL)) {
-        nxt_alert(task, "detached_handler: %PI %s", pid, alert);
+        if (port->detached_alerted == 0) {
+            port->detached_alerted = 1;
+            nxt_alert(task, "detached_handler: %PI %s", pid, alert);
+
+        } else {
+            nxt_debug(task, "detached_handler: %PI %s", pid, alert);
+        }
     }
 
     if (adjust_idle_timer) {
