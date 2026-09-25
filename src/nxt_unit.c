@@ -159,6 +159,7 @@ nxt_inline int nxt_unit_is_read_queue(nxt_unit_read_buf_t *rbuf);
 nxt_inline int nxt_unit_is_read_socket(nxt_unit_read_buf_t *rbuf);
 nxt_inline int nxt_unit_is_shm_ack(nxt_unit_read_buf_t *rbuf);
 nxt_inline int nxt_unit_is_quit(nxt_unit_read_buf_t *rbuf);
+nxt_inline int nxt_unit_is_socket_quit(nxt_unit_read_buf_t *rbuf);
 static int nxt_unit_process_port_msg_impl(nxt_unit_ctx_t *ctx,
     nxt_unit_port_t *port);
 static void nxt_unit_ctx_free(nxt_unit_ctx_impl_t *ctx_impl);
@@ -5776,6 +5777,28 @@ nxt_unit_is_quit(nxt_unit_read_buf_t *rbuf)
 }
 
 
+/*
+ * A QUIT as nxt_runtime_port_send_quit() writes it: the header, and the
+ * one byte quit mode unless the runtime had no memory for it.
+ */
+
+nxt_inline int
+nxt_unit_is_socket_quit(nxt_unit_read_buf_t *rbuf)
+{
+    nxt_port_msg_t  *port_msg;
+
+    if (rbuf->size == (ssize_t) sizeof(nxt_port_msg_t)
+        || rbuf->size == (ssize_t) sizeof(nxt_port_msg_t) + 1)
+    {
+        port_msg = (nxt_port_msg_t *) rbuf->buf;
+
+        return port_msg->type == _NXT_PORT_MSG_QUIT && !port_msg->mmap;
+    }
+
+    return 0;
+}
+
+
 int
 nxt_unit_run_shared(nxt_unit_ctx_t *ctx)
 {
@@ -7026,6 +7049,22 @@ retry:
 
     if (port_impl->from_socket > 0) {
         port_impl->from_socket--;
+
+        return NXT_UNIT_OK;
+    }
+
+    /*
+     * A QUIT with no READ_SOCKET mark ahead of it was not sent through the
+     * queue, and no mark will ever come for it: the prototype writes QUIT
+     * to the bare socket of a worker whose queue it has not mapped yet,
+     * that is, one that has not sent PROCESS_READY.  Suspending it would
+     * keep the worker alive until SIGTERM.  QUIT needs no ordering with
+     * queued messages, so act on it now.
+     */
+    if (nxt_unit_is_socket_quit(rbuf)) {
+        nxt_unit_debug(ctx, "port{%d,%d} recv %d quit",
+                       (int) port->id.pid, (int) port->id.id,
+                       (int) rbuf->size);
 
         return NXT_UNIT_OK;
     }

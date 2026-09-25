@@ -57,6 +57,7 @@ static int   nxt_port_recv_test_shared_queue_fd = -1;
 static int   nxt_port_recv_test_sock_fd = -1;
 static int   nxt_port_recv_test_queue_fd = -1;
 static int   nxt_port_recv_test_ctx_queue_fd = -1;
+static int   nxt_port_recv_test_read_out_fd = -1;
 static void  *nxt_port_recv_test_ctx_queue;
 
 static struct {
@@ -604,6 +605,73 @@ nxt_port_recv_test_deferred_quit_read(nxt_unit_ctx_t *ctx, int run_ctx,
 
 
 static void
+nxt_port_recv_test_socket_quit(nxt_unit_ctx_t *ctx, uint8_t ready,
+    const char *name)
+{
+    pid_t            pid;
+    ssize_t          n;
+    nxt_app_queue_t  *q;
+
+    struct {
+        nxt_port_msg_t  msg;
+        uint8_t         quit_param;
+    } nxt_packed m;
+
+    /*
+     * The prototype writes QUIT to the bare socket of a worker it has not
+     * seen PROCESS_READY from, so no READ_SOCKET mark is queued for it.
+     * The worker must act on it: a suspended QUIT waits for a mark that
+     * never comes, so an unbounded wait lasts until SIGALRM kills the
+     * child.
+     */
+    pid = fork();
+
+    if (pid == 0) {
+        nxt_port_recv_test_block = 1;
+
+        /* An empty shared queue, as the router leaves it. */
+        q = mmap(NULL, sizeof(nxt_app_queue_t), PROT_READ | PROT_WRITE,
+                 MAP_SHARED, nxt_port_recv_test_shared_queue_fd, 0);
+        if (q == MAP_FAILED) {
+            _exit(4);
+        }
+
+        nxt_app_queue_init(q);
+
+        nxt_unit_test_ctx_set_ready(ctx, ready);
+        nxt_unit_test_ctx_set_detached(ctx, 0);
+        nxt_unit_test_ctx_set_detached_retries(ctx, 0);
+
+        /* The message nxt_runtime_port_send_quit() writes. */
+        memset(&m, 0, sizeof(m));
+
+        m.msg.pid = getppid();
+        m.msg.type = _NXT_PORT_MSG_QUIT;
+        m.quit_param = NXT_PORT_QUIT_GRACEFUL;
+
+        n = write(nxt_port_recv_test_read_out_fd, &m, sizeof(m));
+        if (n != (ssize_t) sizeof(m)) {
+            _exit(1);
+        }
+
+        alarm(5);
+
+        if (nxt_unit_run(ctx) != NXT_UNIT_OK) {
+            _exit(2);
+        }
+
+        if (nxt_unit_test_ctx_online(ctx) != 0) {
+            _exit(3);
+        }
+
+        _exit(0);
+    }
+
+    nxt_port_recv_test_child_wait(pid, name);
+}
+
+
+static void
 nxt_port_recv_test_detached_persistent_fail(nxt_unit_ctx_t *ctx)
 {
     int    i, rc, status;
@@ -705,6 +773,7 @@ main(void)
     }
 
     nxt_port_recv_test_sock_fd = sock[0];
+    nxt_port_recv_test_read_out_fd = read[1];
 
     nxt_port_recv_test_queue_fd
         = nxt_port_recv_test_shm(sizeof(nxt_port_queue_t));
@@ -821,6 +890,10 @@ main(void)
     nxt_port_recv_test_detached_idle_retry(ctx, 0,
         "finish retry reaches the give-up, not ready and idle");
     nxt_port_recv_test_detached_persistent_fail(ctx);
+    nxt_port_recv_test_socket_quit(ctx, 0,
+        "bare socket quit stops a context not ready");
+    nxt_port_recv_test_socket_quit(ctx, 1,
+        "bare socket quit stops a ready context");
     nxt_port_recv_test_deferred_quit_read(ctx, 0,
         "nxt_unit_run() returns on a retry that completes a quit");
     nxt_port_recv_test_deferred_quit_read(ctx, 1,
