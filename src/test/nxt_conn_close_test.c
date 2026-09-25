@@ -34,6 +34,7 @@ typedef struct {
 static nxt_int_t nxt_conn_close_test_write(nxt_thread_t *thr);
 static nxt_int_t nxt_conn_close_test_read(nxt_thread_t *thr);
 static nxt_int_t nxt_conn_close_test_twice(nxt_thread_t *thr);
+static nxt_int_t nxt_conn_close_test_race(nxt_thread_t *thr);
 static nxt_int_t nxt_conn_close_test_setup(nxt_thread_t *thr,
     nxt_conn_close_test_t *t);
 static nxt_int_t nxt_conn_close_test_finish(nxt_thread_t *thr,
@@ -87,6 +88,10 @@ nxt_conn_close_test(nxt_thread_t *thr)
     }
 
     if (nxt_conn_close_test_twice(thr) != NXT_OK) {
+        ret = NXT_ERROR;
+    }
+
+    if (nxt_conn_close_test_race(thr) != NXT_OK) {
         ret = NXT_ERROR;
     }
 
@@ -247,6 +252,10 @@ nxt_conn_close_test_drain(nxt_conn_close_test_t *t)
             return;
         }
 
+        /*
+         * nxt_conn_close_handler() adds the close timer with 0 ms, so a
+         * 100 ms step fires it without advancing the clock.
+         */
         nxt_timer_expire(engine, engine->timers.now + 100);
 
         if (engine->fast_work_queue.head == NULL) {
@@ -462,6 +471,79 @@ nxt_conn_close_test_twice(nxt_thread_t *thr)
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "conn close test: twice: fd %d still open after the "
                       "close", (int) c->socket.fd);
+        return nxt_conn_close_test_finish(thr, t, NXT_ERROR);
+    }
+
+    return nxt_conn_close_test_finish(thr, t, NXT_OK);
+}
+
+
+/*
+ * The full race: a read ran and queued its ready handler, a new read event
+ * is queued, then the conn is closed.  The ready handler closes again (the
+ * second close must be a no-op) and the new read must not reach the FIN
+ * and run the close handler, which would close once more.
+ */
+
+static nxt_int_t
+nxt_conn_close_test_race(nxt_thread_t *thr)
+{
+    nxt_conn_t             *c;
+    nxt_conn_close_test_t  *t;
+
+    t = &nxt_conn_close_test_fixture;
+
+    if (nxt_conn_close_test_setup(thr, t) != NXT_OK) {
+        return nxt_conn_close_test_finish(thr, t, NXT_ERROR);
+    }
+
+    c = t->c;
+
+    if (send(t->peer, "ping", 4, 0) != 4 || shutdown(t->peer, SHUT_WR) != 0) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "conn close test: race: send() or shutdown() failed");
+        return nxt_conn_close_test_finish(thr, t, NXT_ERROR);
+    }
+
+    /* The first read runs and queues the ready handler. */
+
+    nxt_work_queue_add(c->socket.read_work_queue, nxt_conn_io_read,
+                       c->socket.task, c, c->socket.data);
+
+    (void) nxt_conn_close_test_drain_wq(t, c->socket.read_work_queue);
+
+    if (c->nbytes != 4 || c->read_work_queue->head == NULL) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "conn close test: race: the first read got %uD bytes "
+                      "(expected 4) or queued no handler", c->nbytes);
+        return nxt_conn_close_test_finish(thr, t, NXT_ERROR);
+    }
+
+    /* A new edge event: the FIN is readable. */
+
+    c->socket.read_ready = 1;
+
+    nxt_work_queue_add(c->socket.read_work_queue, nxt_conn_io_read,
+                       c->socket.task, c, c->socket.data);
+
+    nxt_conn_close(t->engine, c);
+
+    nxt_conn_close_test_drain(t);
+
+    if (t->read_handlers != 1) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "conn close test: race: %ui read state handlers ran "
+                      "(expected 1); the queued read after the close reached "
+                      "the socket", t->read_handlers);
+        return nxt_conn_close_test_finish(thr, t, NXT_ERROR);
+    }
+
+    if (t->null_handlers != 0 || t->released != 1 || t->fd_at_release != -1) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "conn close test: race: %ui NULL handlers, release "
+                      "handler ran %ui times (expected 1), fd at release %d "
+                      "(expected -1)", t->null_handlers, t->released,
+                      (int) t->fd_at_release);
         return nxt_conn_close_test_finish(thr, t, NXT_ERROR);
     }
 
