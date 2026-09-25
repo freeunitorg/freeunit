@@ -727,11 +727,43 @@ nxt_runtime_controller_socket(nxt_task_t *task, nxt_runtime_t *rt)
 #endif
     ls->handler = nxt_controller_conn_init;
 
+    rt->control_uid = (nxt_uid_t) -1;
+    rt->control_gid = (nxt_gid_t) -1;
+
 #if (NXT_HAVE_UNIX_DOMAIN)
     if (ls->sockaddr->u.sockaddr.sa_family == AF_UNIX) {
         const char *path = ls->sockaddr->u.sockaddr_un.sun_path;
 
         nxt_fs_mkdir_p_dirname((const u_char *) path, 0755);
+
+        /*
+         * Remember the owner and group that the control socket is chowned
+         * to (--control-user / --control-group), so that the peer
+         * credential check accepts the same principals.
+         */
+        if (rt->control_user != NULL) {
+            struct passwd  *pwd;
+
+            pwd = getpwnam(rt->control_user);
+            if (nxt_slow_path(pwd == NULL)) {
+                nxt_alert(task, "getpwnam(\"%s\") failed", rt->control_user);
+                return NXT_ERROR;
+            }
+
+            rt->control_uid = pwd->pw_uid;
+        }
+
+        if (rt->control_group != NULL) {
+            struct group  *grp;
+
+            grp = getgrnam(rt->control_group);
+            if (nxt_slow_path(grp == NULL)) {
+                nxt_alert(task, "getgrnam(\"%s\") failed", rt->control_group);
+                return NXT_ERROR;
+            }
+
+            rt->control_gid = grp->gr_gid;
+        }
     }
 #endif
 
@@ -745,6 +777,81 @@ nxt_runtime_controller_socket(nxt_task_t *task, nxt_runtime_t *rt)
 }
 
 
+/*
+ * A peer may use the control API if it is root, runs as unitd's effective
+ * UID, or is one of the principals the control socket was delegated to with
+ * --control-user / --control-group.  The socket's file permissions are
+ * still enforced by the kernel on connect(), so this never grants more
+ * than those permissions already do.
+ */
+
+nxt_bool_t
+nxt_controller_peer_allowed(nxt_uid_t uid, nxt_gid_t gid,
+    const nxt_gid_t *groups, nxt_uint_t ngroups, nxt_uid_t euid,
+    nxt_uid_t ctl_uid, nxt_gid_t ctl_gid)
+{
+    nxt_uint_t  i;
+
+    if (uid == 0 || uid == euid) {
+        return 1;
+    }
+
+    if (ctl_uid != (nxt_uid_t) -1 && uid == ctl_uid) {
+        return 1;
+    }
+
+    if (ctl_gid != (nxt_gid_t) -1) {
+        if (gid == ctl_gid) {
+            return 1;
+        }
+
+        for (i = 0; i < ngroups; i++) {
+            if (groups[i] == ctl_gid) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+
+#if (NXT_HAVE_UNIX_DOMAIN && NXT_HAVE_UCRED && defined SO_PEERGROUPS)
+
+static nxt_gid_t *
+nxt_controller_peer_groups(nxt_socket_t fd, nxt_uint_t *ngroups)
+{
+    nxt_uint_t  try;
+    nxt_gid_t   *groups;
+    socklen_t   len;
+
+    len = 64 * sizeof(nxt_gid_t);
+
+    for (try = 0; try < 2; try++) {
+        groups = nxt_malloc(len);
+        if (nxt_slow_path(groups == NULL)) {
+            return NULL;
+        }
+
+        if (getsockopt(fd, SOL_SOCKET, SO_PEERGROUPS, groups, &len) == 0) {
+            *ngroups = len / sizeof(nxt_gid_t);
+            return groups;
+        }
+
+        nxt_free(groups);
+
+        /* On ERANGE the kernel stores the required size in len. */
+        if (nxt_errno != ERANGE) {
+            break;
+        }
+    }
+
+    return NULL;
+}
+
+#endif
+
+
 static nxt_int_t
 nxt_controller_check_peer_cred(nxt_task_t *task, nxt_conn_t *c)
 {
@@ -753,8 +860,9 @@ nxt_controller_check_peer_cred(nxt_task_t *task, nxt_conn_t *c)
      * The control socket is the privilege boundary for the REST API:
      * filesystem perms on `control.unit.sock` are defense-in-depth, not the
      * boundary itself.  Require the peer's effective UID to match unitd's
-     * (or be root) so a local user with directory-write permission cannot
-     * mutate config by hand-crafting connections.
+     * (or be root, or the configured --control-user / --control-group) so
+     * a local user with directory-write permission cannot mutate config by
+     * hand-crafting connections.
      */
     if (c->remote == NULL
         || c->remote->u.sockaddr.sa_family != AF_UNIX)
@@ -764,8 +872,10 @@ nxt_controller_check_peer_cred(nxt_task_t *task, nxt_conn_t *c)
 
 #if (NXT_HAVE_UCRED)
     {
-        struct ucred  cred;
-        socklen_t     len = sizeof(cred);
+        nxt_bool_t     allowed;
+        struct ucred   cred;
+        socklen_t      len = sizeof(cred);
+        nxt_runtime_t  *rt = task->thread->runtime;
 
         if (getsockopt(c->socket.fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0
             || len < (socklen_t) sizeof(cred))
@@ -774,7 +884,29 @@ nxt_controller_check_peer_cred(nxt_task_t *task, nxt_conn_t *c)
             return NXT_ERROR;
         }
 
-        if (cred.uid != 0 && cred.uid != nxt_euid) {
+        allowed = nxt_controller_peer_allowed(cred.uid, cred.gid, NULL, 0,
+                                              nxt_euid, rt->control_uid,
+                                              rt->control_gid);
+
+#if (defined SO_PEERGROUPS)
+        if (!allowed && rt->control_gid != (nxt_gid_t) -1) {
+            nxt_gid_t   *groups;
+            nxt_uint_t  ngroups;
+
+            groups = nxt_controller_peer_groups(c->socket.fd, &ngroups);
+
+            if (groups != NULL) {
+                allowed = nxt_controller_peer_allowed(cred.uid, cred.gid,
+                                                      groups, ngroups,
+                                                      nxt_euid,
+                                                      rt->control_uid,
+                                                      rt->control_gid);
+                nxt_free(groups);
+            }
+        }
+#endif
+
+        if (!allowed) {
             nxt_alert(task, "controller: rejecting connection from uid %d "
                       "(unitd uid %d); set socket permissions accordingly",
                       (int) cred.uid, (int) nxt_euid);
@@ -786,15 +918,18 @@ nxt_controller_check_peer_cred(nxt_task_t *task, nxt_conn_t *c)
 #elif (defined(__FreeBSD__) || defined(__APPLE__) || defined(__OpenBSD__) \
        || defined(__NetBSD__) || defined(__DragonFly__))
     {
-        uid_t  euid;
-        gid_t  egid;
+        uid_t          euid;
+        gid_t          egid;
+        nxt_runtime_t  *rt = task->thread->runtime;
 
         if (getpeereid(c->socket.fd, &euid, &egid) != 0) {
             nxt_alert(task, "controller: getpeereid failed %E", nxt_errno);
             return NXT_ERROR;
         }
 
-        if (euid != 0 && euid != nxt_euid) {
+        if (!nxt_controller_peer_allowed(euid, egid, NULL, 0, nxt_euid,
+                                         rt->control_uid, rt->control_gid))
+        {
             nxt_alert(task, "controller: rejecting connection from uid %d "
                       "(unitd uid %d)", (int) euid, (int) nxt_euid);
             return NXT_ERROR;
