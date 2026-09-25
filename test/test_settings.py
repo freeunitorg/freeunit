@@ -309,6 +309,72 @@ Connection: close
     assert len(data) > data_len, 'send timeout data 2'
 
 
+def test_settings_send_timeout_recovery(temp_dir):
+    # test_settings_send_timeout checks the framing of a single aborted
+    # response.  Nothing asserted that the router is still usable afterwards,
+    # so a request that fails to complete on the abort path -- e.g. its last
+    # buffer completed twice, or never -- would surface only indirectly.  Abort
+    # several streamed responses in a row over a unix listener, then serve a
+    # normal request on the same listener.
+    client.load('body_generate')
+
+    def req(addr, data_len):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+        # A router that stops serving after an abort is exactly what this test
+        # looks for; without a timeout that failure would hang the run instead
+        # of failing it.
+        sock.settimeout(30)
+        sock.connect(addr)
+
+        req = f"""GET / HTTP/1.1
+Host: localhost
+X-Length: {data_len}
+Connection: close
+
+"""
+
+        sock.sendall(req.encode())
+
+        data = sock.recv(16).decode()
+
+        time.sleep(3)
+
+        data += client.recvall(sock).decode()
+
+        sock.close()
+
+        return data
+
+    sysctl_out = sysctl()
+    values = re.findall(r'net.core.[rw]mem_(?:max|default).*?(\d+)', sysctl_out)
+    values = [int(v) for v in values]
+
+    data_len = 1048576 if len(values) == 0 else 10 * max(values)
+
+    addr = f'{temp_dir}/sock'
+
+    assert 'success' in client.conf(
+        {f'unix:{addr}': {'application': 'body_generate'}}, 'listeners'
+    )
+
+    assert 'success' in client.conf({'http': {'send_timeout': 1}}, 'settings')
+
+    try:
+        for i in range(3):
+            data = req(addr, data_len)
+            assert re.search(r'200 OK', data), f'aborted status {i}'
+            assert len(data) < data_len, f'aborted data {i}'
+
+        data = req(addr, 10)
+        assert re.search(r'200 OK', data), 'recovery status'
+        assert re.search(r'XXXXXXXXXX$', data), 'recovery data'
+
+    finally:
+        # The default no-restart suite preserves /settings between tests.
+        client.conf_delete('settings/http/send_timeout')
+
+
 def test_settings_idle_timeout():
     client.load('empty')
 

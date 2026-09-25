@@ -68,6 +68,37 @@ typedef struct {
                                       nxt_fd_event_t *ev);
 
     /*
+     * Drop every change still pending for this event from the engine's
+     * change batch.
+     *
+     * The batching engines hold the change by pointer and dereference it
+     * when the batch is committed, at the top of the next poll at the
+     * latest.  Nothing else keeps the struct the pointer names alive until
+     * then, so anything that frees a struct holding an nxt_fd_event_t has to
+     * take its pending changes out of the batch first.
+     *
+     * The change is dropped, not committed: the descriptor is being closed
+     * or is closed already, so committing would act on a descriptor number
+     * that may already name somebody else's file.  A caller that wants the
+     * kernel told must delete the event before it closes, which is what
+     * nxt_fd_event_close() is for.
+     *
+     * For epoll and kqueue that leaves nothing behind: the kernel drops a
+     * descriptor from its set when the descriptor is closed.  The poll,
+     * devpoll and pollset engines instead keep the set in user space, in
+     * ->fd_hash and the engine's own array, and only an applied delete
+     * removes an entry from it.  Dropping a pending delete there leaves a
+     * stale entry pointing at the freed event -- the same entry those
+     * engines are already left with whenever an event is freed without a
+     * delete, which is the common case for a port.  Not committing is still
+     * the safer half: committing dereferences the freed event first.
+     *
+     * Runs on the engine's own thread, like every other operation here.
+     */
+    void                          (*cancel_changes)(nxt_event_engine_t *engine,
+                                      nxt_fd_event_t *ev);
+
+    /*
      * Add a file descriptor to an event set and enable the most effective
      * read event notification method provided by underlying event facility.
      */
@@ -363,6 +394,10 @@ void nxt_fd_event_hash_destroy(nxt_lvlhsh_t *lvlhsh);
     (engine)->event.close(engine, ev)
 
 
+#define nxt_fd_event_cancel_changes(engine, ev)                               \
+    (engine)->event.cancel_changes(engine, ev)
+
+
 #define nxt_fd_event_enable_read(engine, ev)                                  \
     (engine)->event.enable_read(engine, ev)
 
@@ -405,9 +440,6 @@ void nxt_fd_event_hash_destroy(nxt_lvlhsh_t *lvlhsh);
 
 #define nxt_fd_event_enable_accept(engine, ev)                                \
     (engine)->event.enable_accept(engine, ev)
-
-
-#define NXT_ENGINE_FIBERS      1
 
 
 typedef struct {
@@ -465,8 +497,6 @@ struct nxt_event_engine_s {
 
     nxt_event_signals_t        *signals;
 
-    nxt_fiber_main_t           *fibers;
-
     /* The engine ID, the main engine has ID 0. */
     uint32_t                   id;
 
@@ -481,10 +511,15 @@ struct nxt_event_engine_s {
     nxt_queue_t                joints;
     nxt_queue_t                listen_connections;
     nxt_queue_t                idle_connections;
+    nxt_queue_t                active_connections;
     nxt_array_t                *mem_cache;
+
+    nxt_conn_t                 *free_connections;
+    nxt_conn_t                 *pending_connections;
 
     nxt_atomic_uint_t          accepted_conns_cnt;
     nxt_atomic_uint_t          idle_conns_cnt;
+    nxt_atomic_uint_t          active_conns_cnt;
     nxt_atomic_uint_t          closed_conns_cnt;
     nxt_atomic_uint_t          requests_cnt;
 

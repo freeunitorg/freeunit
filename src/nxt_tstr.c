@@ -261,11 +261,66 @@ nxt_tstr_query_init(nxt_tstr_query_t **query_p, nxt_tstr_state_t *state,
 }
 
 
+#if (NXT_HAVE_NJS)
+
+/*
+ * A JS template produces the whole record, so there is no template text to
+ * keep apart from the values -- escape all of it.  The trailing newline is
+ * part of that value: nxt_js_add_tpl() appends it inside the generated
+ * function, so escaping it too would turn every record into one line.
+ */
+
+static nxt_int_t
+nxt_tstr_escape(nxt_mp_t *mp, nxt_str_t *val, nxt_bool_t newline)
+{
+    size_t     length, size;
+    u_char     *p;
+    nxt_str_t  escaped;
+
+    length = val->length;
+
+    if (newline && length > 0 && val->start[length - 1] == '\n') {
+        length--;
+
+    } else {
+        newline = 0;
+    }
+
+    size = nxt_var_escape_length(val->start, length);
+
+    if (size == length) {
+        return NXT_OK;
+    }
+
+    escaped.length = size + newline;
+
+    escaped.start = nxt_mp_nget(mp, escaped.length);
+    if (nxt_slow_path(escaped.start == NULL)) {
+        return NXT_ERROR;
+    }
+
+    p = nxt_var_escape(escaped.start, val->start, length);
+
+    if (newline) {
+        *p++ = '\n';
+    }
+
+    nxt_assert(p == escaped.start + escaped.length);
+
+    *val = escaped;
+
+    return NXT_OK;
+}
+
+#endif
+
+
 nxt_int_t
 nxt_tstr_query(nxt_task_t *task, nxt_tstr_query_t *query, nxt_tstr_t *tstr,
     nxt_str_t *val)
 {
-    nxt_int_t  ret;
+    nxt_int_t   ret;
+    nxt_uint_t  flags;
 
     if (nxt_tstr_is_const(tstr)) {
         nxt_tstr_str(tstr, val);
@@ -273,9 +328,18 @@ nxt_tstr_query(nxt_task_t *task, nxt_tstr_query_t *query, nxt_tstr_t *tstr,
     }
 
     if (tstr->type == NXT_TSTR_VAR) {
+        flags = 0;
+
+        if (tstr->flags & NXT_TSTR_LOGGING) {
+            flags |= NXT_VAR_LOGGING;
+        }
+
+        if (tstr->flags & NXT_TSTR_ESCAPE) {
+            flags |= NXT_VAR_ESCAPE;
+        }
+
         ret = nxt_var_interpreter(task, query->state, &query->cache->var,
-                                  tstr->u.var, val, query->ctx,
-                                  tstr->flags & NXT_TSTR_LOGGING);
+                                  tstr->u.var, val, query->ctx, flags);
 
         if (nxt_slow_path(ret != NXT_OK)) {
             return NXT_ERROR;
@@ -288,6 +352,19 @@ nxt_tstr_query(nxt_task_t *task, nxt_tstr_query_t *query, nxt_tstr_t *tstr,
 
         if (nxt_slow_path(ret != NXT_OK)) {
             return NXT_ERROR;
+        }
+
+        if (tstr->flags & NXT_TSTR_ESCAPE) {
+            /*
+             * (flags & BIT) != 0, not the masked bit: nxt_bool_t is
+             * nxt_uint_t, and nxt_tstr_escape() adds this value to a length.
+             * nxt_tstr_compile() normalises the same flag the same way.
+             */
+            ret = nxt_tstr_escape(query->cache->var.pool, val,
+                                  (tstr->flags & NXT_TSTR_NEWLINE) != 0);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                return NXT_ERROR;
+            }
         }
 #endif
     }

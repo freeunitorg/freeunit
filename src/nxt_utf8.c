@@ -6,28 +6,8 @@
 
 #include <nxt_main.h>
 
-/*
- * The nxt_unicode_lowcase.h file is the auto-generated file from
- * the CaseFolding-6.3.0.txt file provided by Unicode, Inc.:
- *
- *   ./lib/src/nxt_unicode_lowcase.pl CaseFolding-6.3.0.txt
- *
- * This file should be copied to system specific nxt_unicode_SYSTEM_lowcase.h
- * file and utf8_file_name_test should be built with this file.
- * Then a correct system specific file should be generated:
- *
- *   ./build/utf8_file_name_test | ./lib/src/nxt_unicode_lowcase.pl
- *
- * Only common and simple case foldings are supported.  Full case foldings
- * is not supported.  Combined characters are also not supported.
- */
 
-#if (NXT_MACOSX)
-#include <nxt_unicode_macosx_lowcase.h>
-
-#else
-#include <nxt_unicode_lowcase.h>
-#endif
+static uint32_t nxt_utf8_decode2(const u_char **start, const u_char *end);
 
 
 u_char *
@@ -91,7 +71,7 @@ nxt_utf8_decode(const u_char **start, const u_char *end)
  * invalid or overlong UTF-8 sequence.
  */
 
-uint32_t
+static uint32_t
 nxt_utf8_decode2(const u_char **start, const u_char *end)
 {
     u_char        c;
@@ -158,79 +138,24 @@ nxt_utf8_decode2(const u_char **start, const u_char *end)
 
         } while (n != 0);
 
-        if (overlong < u && u < 0x110000) {
+        /*
+         * Shortest form, inside the Unicode range, and not a surrogate:
+         * U+D800-U+DFFF exist only to be paired inside UTF-16 and have no
+         * UTF-8 encoding at all (Unicode 15.0 Sect. 3.9, D92), so a decoder
+         * that returns them hands its caller a code point that cannot be
+         * re-encoded -- and, for anything that then writes the bytes back
+         * out, output no strict reader will take.
+         */
+
+        if (overlong < u && u < 0x110000
+            && !(u >= 0xD800 && u <= 0xDFFF))
+        {
             *start = p;
             return u;
         }
     }
 
     return 0xFFFFFFFF;
-}
-
-
-/*
- * nxt_utf8_casecmp() tests only up to the minimum of given lengths, but
- * requires lengths of both strings because otherwise nxt_utf8_decode2()
- * may fail due to incomplete sequence.
- */
-
-nxt_int_t
-nxt_utf8_casecmp(const u_char *start1, const u_char *start2, size_t len1,
-    size_t len2)
-{
-    int32_t       n;
-    uint32_t      u1, u2;
-    const u_char  *end1, *end2;
-
-    end1 = start1 + len1;
-    end2 = start2 + len2;
-
-    while (start1 < end1 && start2 < end2) {
-
-        u1 = nxt_utf8_lowcase(&start1, end1);
-
-        u2 = nxt_utf8_lowcase(&start2, end2);
-
-        if (nxt_slow_path((u1 | u2) == 0xFFFFFFFF)) {
-            return NXT_UTF8_SORT_INVALID;
-        }
-
-        n = u1 - u2;
-
-        if (n != 0) {
-            return (nxt_int_t) n;
-        }
-    }
-
-    return 0;
-}
-
-
-uint32_t
-nxt_utf8_lowcase(const u_char **start, const u_char *end)
-{
-    uint32_t        u;
-    const uint32_t  *block;
-
-    u = (uint32_t) **start;
-
-    if (nxt_fast_path(u < 0x80)) {
-        (*start)++;
-
-        return nxt_unicode_block_000[u];
-    }
-
-    u = nxt_utf8_decode2(start, end);
-
-    if (u <= NXT_UNICODE_MAX_LOWCASE) {
-        block = nxt_unicode_blocks[u / NXT_UNICODE_BLOCK_SIZE];
-
-        if (block != NULL) {
-            return block[u % NXT_UNICODE_BLOCK_SIZE];
-        }
-    }
-
-    return u;
 }
 
 
@@ -253,6 +178,109 @@ nxt_utf8_length(const u_char *p, size_t len)
     }
 
     return length;
+}
+
+
+/*
+ * Copy "src" into the pool, replacing every byte that begins no valid UTF-8
+ * sequence with U+FFFD.  Returns "src" itself when there is nothing to
+ * replace, so the ordinary path neither allocates nor copies.
+ *
+ * The replacement is per byte rather than per maximal subpart (Unicode 15.0
+ * Sect. 3.9): a truncated four-byte sequence therefore yields up to four
+ * U+FFFD where a maximal-subpart resync yields one.  That changes how many
+ * replacement characters a reader sees, never whether the result is valid,
+ * and it keeps the worst-case expansion at the three bytes of U+FFFD per
+ * input byte -- which matters when the input is a request header somebody
+ * else chose.
+ */
+
+nxt_int_t
+nxt_utf8_sanitize(nxt_mp_t *mp, nxt_str_t *dst, const nxt_str_t *src)
+{
+    size_t        len;
+    u_char        *d, *out;
+    const u_char  *p, *seq, *end, *start;
+
+    /*
+     * "dst" and "src" may be the same nxt_str_t -- the access log sanitizes
+     * a value in place -- so the input is read through locals captured here
+     * and "dst" is not written until both passes are done.
+     */
+
+    start = src->start;
+    end = start + src->length;
+
+    p = start;
+    len = 0;
+
+    while (p < end) {
+
+        /*
+         * nxt_utf8_decode() is a call into another translation unit, and a
+         * logged value is mostly ASCII, so the single-byte case is decided
+         * here rather than paid for at that price once per character.
+         */
+
+        if (nxt_fast_path(*p < 0x80)) {
+            p++;
+            len++;
+
+            continue;
+        }
+
+        seq = p;
+
+        if (nxt_utf8_decode(&seq, end) == 0xFFFFFFFF) {
+            len += nxt_length("\xEF\xBF\xBD");
+            p++;
+
+            continue;
+        }
+
+        len += seq - p;
+        p = seq;
+    }
+
+    if (nxt_fast_path(len == src->length)) {
+        *dst = *src;
+
+        return NXT_OK;
+    }
+
+    out = nxt_mp_nget(mp, len);
+    if (nxt_slow_path(out == NULL)) {
+        return NXT_ERROR;
+    }
+
+    d = out;
+    p = start;
+
+    while (p < end) {
+
+        if (nxt_fast_path(*p < 0x80)) {
+            *d++ = *p++;
+
+            continue;
+        }
+
+        seq = p;
+
+        if (nxt_utf8_decode(&seq, end) == 0xFFFFFFFF) {
+            *d++ = 0xEF; *d++ = 0xBF; *d++ = 0xBD;
+            p++;
+
+            continue;
+        }
+
+        d = nxt_cpymem(d, p, seq - p);
+        p = seq;
+    }
+
+    dst->start = out;
+    dst->length = len;
+
+    return NXT_OK;
 }
 
 

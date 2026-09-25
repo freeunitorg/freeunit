@@ -1,21 +1,15 @@
 extern crate clap;
 extern crate colored_json;
 extern crate custom_error;
-extern crate nu_json;
-extern crate rustls_pemfile;
 extern crate serde;
 extern crate unit_client_rs;
 
 use clap::Parser;
 
-use crate::cmd::{
-    applications, edit, execute as execute_cmd,
-    import, instances, listeners, status,
-    save
-};
+use crate::cmd::{applications, edit, execute as execute_cmd, import, instances, listeners, save, status};
 use crate::output_format::OutputFormat;
 use crate::unitctl::{Commands, UnitCtl};
-use crate::unitctl_error::{UnitctlError, eprint_error};
+use crate::unitctl_error::{eprint_error, UnitctlError};
 use unit_client_rs::unit_client::{UnitClient, UnitSerializableMap};
 
 mod cmd;

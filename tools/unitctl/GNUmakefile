@@ -13,7 +13,7 @@ $(error Please install Rustup)
 endif
 
 RPM_ARCH           := $(shell uname -m)
-VERSION            ?= $(shell $(GREP) -Po '^version\s+=\s+"\K.*?(?=")' $(CURDIR)/unitctl/Cargo.toml)
+VERSION            ?= $(shell $(SED) -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' $(CURDIR)/unitctl/Cargo.toml)
 SRC_REPO           := https://github.com/nginxinc/unit-rust-sdk
 DEFAULT_TARGET     ?= $(shell $(RUSTUP) toolchain list | $(GREP) '(default)' | cut -d' ' -f1 | cut -d- -f2-)
 SHELL              := /bin/bash
@@ -44,6 +44,19 @@ endif
 
 RELEASE_BUILD_FLAGS ?= --quiet --release --bin $(OUTPUT_BINARY)
 
+# The musl artifact is built without the "tls" feature.  TLS pulls in
+# aws-lc-sys, a C library built by cmake, and that is the only thing making
+# this build need a C toolchain.
+target_feature_flags = $(if $(findstring musl,$(1)),--no-default-features,)
+
+# The rule above keys on a target name, so it only reaches the cross builds that
+# name one.  A native build on a musl host -- "make release" on Alpine, which is
+# how a distro packages this -- passes no --target and would otherwise keep TLS
+# and compile aws-lc-sys.  Ask rustc for the host triple and apply the same
+# rule.  Empty if rustc is absent, which leaves the flags unchanged.
+HOST_TARGET := $(shell rustc -vV 2>/dev/null | sed -n 's/^host: //p')
+HOST_FEATURE_FLAGS := $(call target_feature_flags,$(HOST_TARGET))
+
 Q = $(if $(filter 1,$V),,@)
 M = $(shell printf "\033[34;1m▶\033[0m")
 
@@ -68,8 +81,8 @@ all: $(TARGETS) ## Build all available platform targets [see: list-targets]
 .ONESHELL: $(TARGETS)
 $(TARGETS): openapi-generate
 	$Q if [ ! -f "$(CURDIR)/target/$(@)/release/$(OUTPUT_BINARY)" ]; then
-		echo "$(M) building $(OUTPUT_BINARY) with flags [$(RELEASE_BUILD_FLAGS) --target $(@)]"
-		$(CARGO) build $(RELEASE_BUILD_FLAGS) --target $@
+		echo "$(M) building $(OUTPUT_BINARY) with flags [$(RELEASE_BUILD_FLAGS) $(call target_feature_flags,$@) --target $(@)]"
+		$(CARGO) build $(RELEASE_BUILD_FLAGS) $(call target_feature_flags,$@) --target $@
 	fi
 
 target target/debug:
@@ -80,18 +93,18 @@ debug: target/debug/$(OUTPUT_BINARY)
 
 target/debug/$(OUTPUT_BINARY): openapi-generate
 	$Q echo "$(M) building $(OUTPUT_BINARY) in debug mode for the current platform"
-	$Q $(CARGO) build --bin $(OUTPUT_BINARY)
+	$Q $(CARGO) build --bin $(OUTPUT_BINARY) $(HOST_FEATURE_FLAGS)
 
 .PHONY: release
 release: target/release/$(OUTPUT_BINARY)
 
 target/release/$(OUTPUT_BINARY): openapi-generate
 	$Q echo "$(M) building $(OUTPUT_BINARY) in release mode for the current platform"
-	$Q $(CARGO) build $(RELEASE_BUILD_FLAGS)
+	$Q $(CARGO) build $(RELEASE_BUILD_FLAGS) $(HOST_FEATURE_FLAGS)
 
 .PHONY: test
-test: ## Run tests
-	$Q $(CARGO) test
+test: openapi-generate ## Run tests
+	$Q $(CARGO) test $(HOST_FEATURE_FLAGS)
 
 .ONESHELL: target/man/$(OUTPUT_BINARY).1.gz
 target/man/$(OUTPUT_BINARY).1.gz:
@@ -114,6 +127,7 @@ manpage: target/man/$(OUTPUT_BINARY).1.gz ## Builds man page
 .PHONY: openapi-generate
 openapi-generate: .openapi_cache
 	$Q if [ ! -f "$(CURDIR)/unit-openapi/src/models/mod.rs" ]; then
+		set -e
 		echo "$(M) generating Unit API access code via a OpenAPI spec"
 		OPENAPI_GENERATOR_VERSION="$(OPENAPI_GENERATOR_VERSION)" \
 		OPENAPI_GENERATOR_DOWNLOAD_CACHE_DIR="$(CURDIR)/.openapi_cache" \
@@ -124,8 +138,19 @@ openapi-generate: .openapi_cache
 			--template-dir "$(CURDIR)/unit-openapi/openapi-templates" \
 			--output "$(CURDIR)/unit-openapi" \
 			--generator-name rust
-		echo "mod error;" >> "$(CURDIR)/unit-openapi/src/apis/mod.rs"
-		$(SED) -i '1i #![allow(clippy::all)]' "$(CURDIR)/unit-openapi/src/lib.rs"
+		tmp="$$(mktemp)"
+		{ printf '%s\n' '#![allow(clippy::all)]'; cat "$(CURDIR)/unit-openapi/src/lib.rs"; } > "$$tmp"
+		mv "$$tmp" "$(CURDIR)/unit-openapi/src/lib.rs"
+		# Replace any remaining hyper 0.14 client paths produced by built-in templates
+		# with the hyper 1.x equivalents from hyper-util.
+		find "$(CURDIR)/unit-openapi/src" -name "*.rs" -exec \
+			$(SED) -i.bak \
+				-e 's|hyper::client::connect::Connect|hyper_util::client::legacy::connect::Connect|g' \
+				-e 's|hyper::client::Client<C>|hyper_util::client::legacy::Client<C, http_body_util::Full<bytes::Bytes>>|g' \
+				-e "s|C: Clone + std::marker::Send + Sync {|C: Clone + std::marker::Send + Sync + 'static {|g" \
+				-e 's|hyper::Body::from|bytes::Bytes::from|g' \
+			{} +
+		find "$(CURDIR)/unit-openapi/src" -name "*.rs.bak" -delete
 		$(CARGO) fmt
 	fi
 

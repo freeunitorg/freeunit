@@ -1,11 +1,11 @@
 use crate::inputfile::InputFile;
 use crate::requests::{
-    send_and_validate_config_deserialize_response, send_and_validate_pem_data_deserialize_response,
+    send_and_validate_pem_data_deserialize_response, send_config_deserialize_response,
     send_body_deserialize_response, send_empty_body_deserialize_response,
 };
 use crate::unitctl::UnitCtl;
 use crate::wait;
-use crate::{OutputFormat, UnitctlError, eprint_error};
+use crate::{eprint_error, OutputFormat, UnitctlError};
 use unit_client_rs::unit_client::UnitClient;
 
 pub(crate) async fn cmd(
@@ -37,12 +37,13 @@ pub(crate) async fn cmd(
             method_upper.clone(),
             input_file_arg.clone(),
             path_trimmed,
-            output_format
-        ).await
-            .map_err(|e| {
-                eprint_error(&e);
-                std::process::exit(e.exit_code());
-            });
+            output_format,
+        )
+        .await
+        .map_err(|e| {
+            eprint_error(&e);
+            std::process::exit(e.exit_code());
+        });
     }
 
     Ok(())
@@ -70,13 +71,21 @@ async fn send_and_deserialize(
     match input_file {
         Some(input_file) => {
             if input_file.is_config() {
-                send_and_validate_config_deserialize_response(&client, method.as_str(), path, Some(&input_file)).await
+                send_config_deserialize_response(&client, method.as_str(), path, &input_file).await
                 // TLS certificate data
             } else if input_file.is_pem_bundle() {
                 send_and_validate_pem_data_deserialize_response(&client, method.as_str(), path, &input_file).await
-                // This is unknown data
+                // A JS module: the bytes go up as they are, the way "import" sends them
+            } else if input_file.is_javascript() {
+                send_body_deserialize_response(&client, method.as_str(), path, Some(&input_file)).await
+                // A file this command cannot send anywhere
             } else {
-                panic!("Unknown input file type")
+                Err(UnitctlError::UnknownInputFileType {
+                    path: input_file.to_path().map_or_else(
+                        |_| "-".to_string(),
+                        |path| path.to_string_lossy().into_owned(),
+                    ),
+                })
             }
         }
         // A none value for an input file can be considered a request to send an empty body

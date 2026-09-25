@@ -3,6 +3,7 @@ import re
 import pytest
 
 from unit.applications.lang.perl import ApplicationPerl
+from unit.option import option
 
 prerequisites = {'modules': {'perl': 'all'}}
 
@@ -317,3 +318,30 @@ def test_perl_application_threads():
         sock.close()
 
     assert len(socks) == len(threads), 'threads differs'
+
+
+def test_perl_script_cstring_nul():
+    # perl "script" is consumed as a NUL-terminated C-string path; an
+    # embedded NUL (survives JSON parsing) or an empty value must be
+    # rejected at validation.  "spare": 0 exercises validation without
+    # spawning a process.
+    def conf_script(value):
+        return client.conf(
+            {
+                "app": {
+                    "type": client.get_application_type(),
+                    "processes": {"spare": 0},
+                    "script": value,
+                }
+            },
+            'applications',
+        )
+
+    resp = conf_script("/x\0y.pl")
+    assert 'null character' in resp.get('detail', ''), 'script nul'
+
+    resp = conf_script("")
+    assert 'must not be empty' in resp.get('detail', ''), 'script empty'
+    assert 'success' in conf_script(
+        f'{option.test_dir}/perl/variables/psgi.pl'
+    ), 'script valid'

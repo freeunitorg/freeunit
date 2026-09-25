@@ -119,9 +119,7 @@ nxt_conn_close_handler(nxt_task_t *task, void *obj, void *data)
         nxt_socket_close(task, c->socket.fd);
         c->socket.fd = -1;
 
-        if (c->idle) {
-            engine->closed_conns_cnt++;
-        }
+        nxt_conn_untrack(engine, c);
 
         if (timers_pending == 0) {
             nxt_work_queue_add(&engine->fast_work_queue,
@@ -157,9 +155,7 @@ nxt_conn_close_timer_handler(nxt_task_t *task, void *obj, void *data)
         nxt_socket_close(task, c->socket.fd);
         c->socket.fd = -1;
 
-        if (c->idle) {
-            engine->closed_conns_cnt++;
-        }
+        nxt_conn_untrack(engine, c);
     }
 
     nxt_work_queue_add(&engine->fast_work_queue, c->write_state->ready_handler,

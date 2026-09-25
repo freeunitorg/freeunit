@@ -146,31 +146,15 @@ nxt_lib_start(const char *app, char **argv, char ***envp)
 void
 nxt_lib_stop(void)
 {
-    /* TODO: stop engines */
-
-#if 0
-
-    for ( ;; ) {
-        nxt_thread_pool_t  *tp;
-
-        nxt_thread_spin_lock(&rt->lock);
-
-        tp = rt->thread_pools;
-        rt->thread_pools = (tp != NULL) ? tp->next : NULL;
-
-        nxt_thread_spin_unlock(&rt->lock);
-
-        if (tp == NULL) {
-            break;
-        }
-
-        nxt_thread_pool_destroy(tp);
-    }
-
-#else
+    /*
+     * There is no in-tree caller for this exported symbol, and it has no
+     * access to the runtime.  Event engines are per-thread and are torn down
+     * on the nxt_runtime_quit path by their owning threads; stopping them
+     * from here would require runtime access -- either an ABI-breaking change
+     * to this signature or a new global.  The symbol keeps its historical
+     * immediate-exit behavior for ABI compatibility.
+     */
 
     exit(0);
     nxt_unreachable();
-
-#endif
 }

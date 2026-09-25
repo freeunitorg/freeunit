@@ -219,7 +219,7 @@ nxt_http_js_ext_get_header(njs_vm_t *vm, njs_object_prop_t *prop,
         return NJS_DECLINED;
     }
 
-    nxt_list_each(f, r->fields) {
+    nxt_http_fields_each(f, r->inline_fields, r->num_inline_fields, r->fields) {
 
         if (key.length == f->name_length
             && memcmp(key.start, f->name, f->name_length) == 0)
@@ -228,7 +228,7 @@ nxt_http_js_ext_get_header(njs_vm_t *vm, njs_object_prop_t *prop,
                                               f->value_length);
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     njs_value_undefined_set(retval);
 
@@ -253,7 +253,7 @@ nxt_http_js_ext_keys_header(njs_vm_t *vm, njs_value_t *value, njs_value_t *keys)
         return NJS_OK;
     }
 
-    nxt_list_each(f, r->fields) {
+    nxt_http_fields_each(f, r->inline_fields, r->num_inline_fields, r->fields) {
 
         value = njs_vm_array_push(vm, keys);
         if (value == NULL) {
@@ -265,7 +265,7 @@ nxt_http_js_ext_keys_header(njs_vm_t *vm, njs_value_t *value, njs_value_t *keys)
             return NJS_ERROR;
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     return NJS_OK;
 }

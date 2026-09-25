@@ -19,6 +19,14 @@ uint32_t nxt_port_rpc_register_handler(nxt_task_t *task, nxt_port_t *port,
 void *nxt_port_rpc_register_handler_ex(nxt_task_t *task, nxt_port_t *port,
     nxt_port_rpc_handler_t ready_handler, nxt_port_rpc_handler_t error_handler,
     size_t ex_size);
+void *nxt_port_rpc_register_handler_at(nxt_task_t *task, nxt_port_t *port,
+    nxt_port_rpc_handler_t ready_handler, nxt_port_rpc_handler_t error_handler,
+    uint32_t stream, size_t ex_size);
+
+#if (NXT_TESTS)
+void nxt_port_rpc_test_alloc_failures(nxt_uint_t failures);
+void nxt_port_rpc_test_insert_failures(nxt_uint_t failures);
+#endif
 
 uint32_t nxt_port_rpc_ex_stream(void *ex);
 void nxt_port_rpc_ex_set_peer(nxt_task_t *task, nxt_port_t *port,
@@ -28,8 +36,8 @@ void nxt_port_rpc_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 void nxt_port_rpc_remove_peer(nxt_task_t *task, nxt_port_t *port,
     nxt_pid_t peer);
 void nxt_port_rpc_cancel(nxt_task_t *task, nxt_port_t *port, uint32_t stream);
+void nxt_port_rpc_error(nxt_task_t *task, nxt_port_t *port, uint32_t stream);
 void nxt_port_rpc_close(nxt_task_t *task, nxt_port_t *port);
 
 
 #endif /* _NXT_PORT_RPC_H_INCLUDED_ */
-

@@ -55,7 +55,6 @@ typedef uint16_t                     nxt_port_id_t;
 #include <nxt_thread_time.h>
 #include <nxt_rbtree.h>
 #include <nxt_timer.h>
-#include <nxt_fiber.h>
 #include <nxt_thread.h>
 #include <nxt_process_type.h>
 #include <nxt_capability.h>
@@ -83,7 +82,6 @@ typedef struct nxt_sockaddr_s           nxt_sockaddr_t;
 #include <nxt_malloc.h>
 #include <nxt_mem_map.h>
 #include <nxt_socket.h>
-#include <nxt_dyld.h>
 
 
 typedef void *(*nxt_mem_proto_alloc_t)(void *pool, size_t size);
@@ -95,7 +93,6 @@ typedef struct {
 } nxt_mem_proto_t;
 
 
-#include <nxt_mem_zone.h>
 #include <nxt_signal.h>
 #include <nxt_semaphore.h>
 
@@ -146,7 +143,6 @@ typedef void (*nxt_event_conn_handler_t)(nxt_thread_t *thr, nxt_conn_t *c);
 #include <nxt_conn.h>
 #include <nxt_event_engine.h>
 
-#include <nxt_job.h>
 
 #include <nxt_sockaddr.h>
 

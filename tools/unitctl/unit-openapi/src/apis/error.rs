@@ -9,6 +9,7 @@ impl Display for Error {
             Error::Header(e) => write!(f, "HeaderError: {}", e),
             Error::Http(e) => write!(f, "HttpError: {:#?}", e),
             Error::Hyper(e) => write!(f, "HyperError: {:#?}", e),
+            Error::LegacyClient(e) => write!(f, "LegacyClientError: {:#?}", e),
             Error::Serde(e) => write!(f, "SerdeError: {:#?}", e),
             Error::UriError(e) => write!(f, "UriError: {:#?}", e),
         }

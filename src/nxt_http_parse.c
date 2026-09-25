@@ -109,10 +109,8 @@ nxt_http_parse_request_init(nxt_http_request_parse_t *rp, nxt_mp_t *mp)
 {
     rp->mem_pool = mp;
 
-    rp->fields = nxt_list_create(mp, 8, sizeof(nxt_http_field_t));
-    if (nxt_slow_path(rp->fields == NULL)) {
-        return NXT_ERROR;
-    }
+    rp->num_inline_fields = 0;
+    rp->fields = NULL;
 
     rp->field_hash = NXT_HTTP_FIELD_HASH_INIT;
 
@@ -788,10 +786,22 @@ nxt_http_parse_field_end(nxt_http_request_parse_t *rp, u_char **pos,
                 rp->skip_field = 0;
 
             } else {
-                field = nxt_list_add(rp->fields);
+                if (rp->num_inline_fields < 16) {
+                    field = &rp->inline_fields[rp->num_inline_fields++];
 
-                if (nxt_slow_path(field == NULL)) {
-                    return NXT_ERROR;
+                } else {
+                    if (rp->fields == NULL) {
+                        rp->fields = nxt_list_create(rp->mem_pool, 16,
+                                                    sizeof(nxt_http_field_t));
+                        if (nxt_slow_path(rp->fields == NULL)) {
+                            return NXT_ERROR;
+                        }
+                    }
+
+                    field = nxt_list_add(rp->fields);
+                    if (nxt_slow_path(field == NULL)) {
+                        return NXT_ERROR;
+                    }
                 }
 
                 field->hash = nxt_http_field_hash_end(rp->field_hash);
@@ -1251,19 +1261,21 @@ nxt_http_fields_hash_collisions(nxt_lvlhsh_t *hash,
 
 
 nxt_int_t
-nxt_http_fields_process(nxt_list_t *fields, nxt_lvlhsh_t *hash, void *ctx)
+nxt_http_fields_process(nxt_http_field_t *inline_fields,
+    uint8_t num_inline_fields, nxt_list_t *fields, nxt_lvlhsh_t *hash,
+    void *ctx)
 {
     nxt_int_t         ret;
     nxt_http_field_t  *field;
 
-    nxt_list_each(field, fields) {
+    nxt_http_fields_each(field, inline_fields, num_inline_fields, fields) {
 
         ret = nxt_http_field_process(field, hash, ctx);
         if (nxt_slow_path(ret != NXT_OK)) {
             return ret;
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     return NXT_OK;
 }

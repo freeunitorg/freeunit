@@ -1,0 +1,340 @@
+name: "Build (Fedora/Alpine · GCC/Clang)"
+
+on:
+  # Rolling distributions break on their own schedule, not on ours, so this is
+  # a weekly gate rather than a PR gate: Fedora rawhide and Alpine edge move
+  # under us between pull requests, and a red check nobody caused is a check
+  # nobody reads.  A failure opens or updates a tracking issue instead.
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+
+  fedora-rawhide:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [ 'gcc', 'clang' ]
+
+    container:
+      image: fedora:rawhide
+
+    steps:
+      - name: Install tools/deps
+        run: |
+          dnf -y update
+          dnf -y install --setopt=install_weak_deps=False \
+              which wget git gcc make pcre2-devel openssl-devel \
+              zlib-ng-compat-devel libzstd-devel brotli-devel \
+              python-unversioned-command python3 python3-devel \
+              php-devel php-embedded perl-devel perl-ExtUtils-Embed \
+              ruby-devel java-devel nodejs-devel nodejs-npm golang \
+              cargo rust cmake clang-devel
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            dnf -y install --setopt=install_weak_deps=False clang
+          fi
+          npm install -g node-gyp
+
+      - uses: actions/checkout@v5
+
+      - name: configure unit CC=${{ matrix.compiler }}
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            ./configure --openssl --otel --zlib --zstd --brotli --tests --cc=clang
+          else
+            ./configure --openssl --otel --zlib --zstd --brotli --tests
+          fi
+
+      - name: make unit
+        run: make -j 4
+
+      # --tests has always been configured here, but only "all" was built,
+      # so a toolchain that breaks the tests binary alone went unnoticed
+      # (musl's CMSG_NXTHDR under clang, #475).  build/tests itself is built,
+      # not run: the clone and credential cases need capabilities this
+      # container may not have, and nxt_tests.c has no per-test filter.
+      - name: make tests
+        run: make -j 4 tests
+
+      # The two standalone binaries need no privileges and run here as they do
+      # in build-test's c-tests.  See the same steps in alpine-edge for why.
+      - name: Run libunit close-provenance test
+        run: ./build/unit_close_test
+
+      - name: Run libunit port_recv fd-ownership test
+        run: ./build/unit_port_recv_test
+
+      - name: configure unit-php
+        run: ./configure php
+
+      - name: make unit-php
+        run: make -j 4 php
+
+      - name: configure unit-python
+        run: ./configure python
+
+      - name: make unit-python
+        run: make -j 4 python
+
+      - name: configure unit-perl
+        run: ./configure perl
+        if: matrix.compiler == 'gcc'
+
+      - name: make unit-perl
+        run: make -j 4 perl
+        if: matrix.compiler == 'gcc'
+
+      - name: configure unit-ruby
+        run: ./configure ruby
+
+      - name: make unit-ruby
+        run: make -j 4 ruby
+
+      - name: configure unit-java
+        run: ./configure java
+
+      - name: make unit-java
+        run: make -j 4 java
+
+      - name: configure unit-nodejs
+        run: ./configure nodejs
+
+      - name: make unit-nodejs
+        run: make node-local-install DESTDIR=node
+
+      - name: configure unit-go
+        run: ./configure go --go-path=
+
+      - name: make unit-go
+        run: make go-install
+
+      # wasmtime version is pinned in pkg/contrib/src/wasmtime/version and
+      # built from a checksum-verified source tarball — same as build-test.
+      # Keeps the wasm runtime in sync with what Unit is actually built against.
+      # Cache the compiled artifacts (keyed by the pinned version + this distro,
+      # so it never mixes with the ubuntu/debian glibc builds) to skip the slow
+      # from-source compile on a hit.
+      - name: Cache wasmtime
+        id: cache-wasmtime
+        uses: actions/cache@v6
+        with:
+          path: pkg/contrib/wasmtime/artifacts
+          key: wasmtime-fedora-rawhide-${{ runner.arch }}-${{ hashFiles('pkg/contrib/src/wasmtime/version') }}
+
+      - name: Build wasmtime (pinned via pkg/contrib)
+        if: steps.cache-wasmtime.outputs.cache-hit != 'true'
+        run: make -C pkg/contrib .wasmtime
+
+      - name: configure unit-wasm
+        run: ./configure wasm --include-path=pkg/contrib/wasmtime/artifacts/include --lib-path=pkg/contrib/wasmtime/artifacts/lib --rpath
+
+      - name: make unit-wasm
+        run: make wasm
+
+      # The Rust component module is the reason this workflow is worth running
+      # weekly: bindgen parses Unit's headers with libclang, and a new libclang
+      # breaks that silently -- it emits opaque `_address` placeholder structs
+      # rather than failing, so the crate then fails to compile with errors that
+      # point at Unit's code.  That is what #250 fixed for clang 22, which this
+      # distribution already ships.  Only the gcc leg builds it: bindgen uses
+      # libclang whatever the C compiler is, so the clang leg would test the
+      # same parse twice.
+      - name: configure unit-wasm-wasi-component
+        run: ./configure wasm-wasi-component
+        if: matrix.compiler == 'gcc'
+
+      - name: make unit-wasm-wasi-component
+        run: make wasm-wasi-component
+        if: matrix.compiler == 'gcc'
+
+  alpine-edge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [ 'gcc', 'clang' ]
+
+    container:
+      image: alpine:edge
+
+    steps:
+      - name: Install tools/deps
+        run: |
+          apk update && apk upgrade
+          apk add gcc make musl-dev openssl-dev pcre2-dev curl \
+              zlib-dev zstd-dev brotli-dev \
+              php83-dev php83-embed python3-dev perl-dev ruby-dev \
+              openjdk21-jdk cargo rust clang-dev linux-headers
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            apk add clang
+          fi
+
+      - uses: actions/checkout@v5
+
+      - name: configure unit CC=${{ matrix.compiler }}
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            ./configure --openssl --otel --zlib --zstd --brotli --tests --cc=clang
+          else
+            ./configure --openssl --otel --zlib --zstd --brotli --tests
+          fi
+
+      - name: make unit
+        run: make -j 4
+
+      # --tests has always been configured here, but only "all" was built,
+      # so a toolchain that breaks the tests binary alone went unnoticed
+      # (musl's CMSG_NXTHDR under clang, #475).  build/tests itself is built,
+      # not run: the clone and credential cases need capabilities this
+      # container may not have, and nxt_tests.c has no per-test filter.
+      - name: make tests
+        run: make -j 4 tests
+
+      # The two standalone binaries need no privileges, so they run here as
+      # they do in build-test's c-tests.  unit_port_recv_test moves control
+      # messages over socketpair()s, so it executes the NXT_CMSG_NXTHDR() loop
+      # #475 changed against musl's macro; nothing else runs that on musl.
+      - name: Run libunit close-provenance test
+        run: ./build/unit_close_test
+
+      - name: Run libunit port_recv fd-ownership test
+        run: ./build/unit_port_recv_test
+
+      - name: configure unit-php
+        run: |
+          ln -s /usr/lib/libphp83.so /usr/lib/libphp.so
+          ./configure php --config=/usr/bin/php-config83
+
+      - name: make unit-php
+        run: make -j 4
+
+      - name: configure unit-python
+        run: ./configure python
+
+      - name: make unit-python
+        run: make -j 4
+
+      - name: configure unit-perl
+        run: ./configure perl
+
+      - name: make unit-perl
+        run: make -j 4 perl
+
+      - name: configure unit-ruby
+        run: ./configure ruby
+
+      - name: make unit-ruby
+        run: make -j 4 ruby
+
+      - name: configure unit-java
+        run: ./configure java
+
+      - name: make unit-java
+        run: make -j 4 java
+
+      # See the note on the same steps in fedora-rawhide: this is the gate that
+      # would have caught the bindgen/libclang breakage #250 fixed.  Alpine
+      # matters twice over here -- it defaults clang-dev to clang 22 in edge AND
+      # in stable 3.24, and it is where the module could not be packaged at all
+      # before #250.  gcc leg only: bindgen goes through libclang either way.
+      - name: configure unit-wasm-wasi-component
+        run: ./configure wasm-wasi-component
+        if: matrix.compiler == 'gcc'
+
+      - name: make unit-wasm-wasi-component
+        run: make wasm-wasi-component
+        if: matrix.compiler == 'gcc'
+
+  # Alpine without "linux-headers".  The full alpine-edge leg installs it (the
+  # Rust/bindgen and JDK steps are happier with the kernel UAPI headers around),
+  # and that is exactly what masked #273 for as long as it existed: the
+  # memfd_create() probe used to include <linux/memfd.h>, which Alpine ships in
+  # linux-headers rather than in musl-dev, so an ordinary "apk add build-base"
+  # build silently fell back to shm_open() and every isolation.rootfs app died.
+  # This leg is deliberately minimal -- core only, no modules -- so that it
+  # tests the probe and nothing else, and it asserts the probe result instead of
+  # trusting a green build, which would stay green with the fallback in place.
+  alpine-no-linux-headers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    container:
+      image: alpine:edge
+
+    steps:
+      - name: Install tools/deps
+        run: |
+          apk update && apk upgrade
+          apk add gcc make musl-dev openssl-dev pcre2-dev
+          if apk info -e linux-headers; then
+            echo "linux-headers must not be installed on this leg" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+
+      - name: configure unit
+        run: |
+          set -o pipefail
+          ./configure --openssl --tests | tee configure.log
+
+      - name: assert memfd_create() was detected
+        run: |
+          grep -q 'checking for memfd_create() \.\.\. found' configure.log || {
+            echo 'memfd_create() not detected without linux-headers (#273)' >&2
+            grep -n 'memfd' configure.log build/autoconf.err >&2 || true
+            exit 1
+          }
+
+      - name: make unit
+        run: make -j 4
+
+  # A weekly red check that nobody caused is a check nobody reads, so a
+  # scheduled failure is reported as a tracking issue instead, the same way
+  # eol-check.yml handles its weekly run.
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [ fedora-rawhide, alpine-edge, alpine-no-linux-headers ]
+    if: failure() && github.event_name == 'schedule'
+
+    steps:
+      - name: Open or update tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This job does not check out the repository, so gh has no local git
+          # remote to infer the target from and would exit before creating the
+          # issue -- silently defeating the point of the job.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          title='Rolling distro build is failing (Fedora rawhide / Alpine edge)'
+          {
+            echo 'The weekly rolling-distribution build failed. These distributions'
+            echo 'move between our pull requests, so a failure here is usually a'
+            echo 'toolchain or package change rather than a regression in Unit.'
+            echo
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo 'Reproduce locally, e.g. for Alpine:'
+            echo
+            echo '```'
+            echo 'docker run --rm -it --platform linux/amd64 alpine:edge sh'
+            echo '```'
+          } > issue-body.md
+          existing=$(gh issue list --state open --search "in:title ${title}" \
+            --json number,title --jq ".[] | select(.title == \"${title}\") | .number" | head -n1)
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body-file issue-body.md
+          else
+            gh issue create --title "${title}" --body-file issue-body.md
+          fi

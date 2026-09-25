@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"syscall"
 	"unsafe"
 )
 
@@ -44,7 +45,10 @@ func find_port(key port_key) *port {
 	return res
 }
 
-func add_port(p *port) {
+// add_port registers p and reports whether it was inserted.  A duplicate key
+// (libunit re-announced an existing port) leaves p unregistered, so the caller
+// must close p to release its dup'd descriptors.
+func add_port(p *port) bool {
 
 	port_registry_.Lock()
 	if port_registry_.m == nil {
@@ -53,11 +57,15 @@ func add_port(p *port) {
 
 	old := port_registry_.m[p.key]
 
-	if old == nil {
+	inserted := old == nil
+
+	if inserted {
 		port_registry_.m[p.key] = p
 	}
 
 	port_registry_.Unlock()
+
+	return inserted
 }
 
 func (p *port) Close() {
@@ -75,7 +83,30 @@ func getUnixConn(fd int) *net.UnixConn {
 		return nil
 	}
 
-	f := os.NewFile(uintptr(fd), "sock")
+	// Duplicate the descriptor so that libunit stays the sole owner of the
+	// original fd number stored in the port struct.  net.FileConn() below
+	// dups again (close-on-exec) for its own use, and the "defer f.Close()"
+	// then closes only this dup, never the caller's fd.  Closing the original
+	// here (the old behaviour) raced with libunit's own close on port
+	// destruction, causing "close(N) failed: Bad file descriptor" alerts or,
+	// worse, closing an already reused live descriptor.
+	//
+	// The dup must be close-on-exec: plain dup(2) clears FD_CLOEXEC, so a Go
+	// app that fork/exec's while this runs could leak the Unit port socket
+	// into a child and keep the port alive.  Hold ForkLock across dup +
+	// CloseOnExec (the Go stdlib idiom for non-atomic O_CLOEXEC dups) so no
+	// concurrent forkExec observes the fd before its flag is set.
+	syscall.ForkLock.RLock()
+	newfd, err := syscall.Dup(fd)
+	if err != nil {
+		syscall.ForkLock.RUnlock()
+		nxt_go_alert("dup(%d) failed: %s", fd, err)
+		return nil
+	}
+	syscall.CloseOnExec(newfd)
+	syscall.ForkLock.RUnlock()
+
+	f := os.NewFile(uintptr(newfd), "sock")
 	defer f.Close()
 
 	c, err := net.FileConn(f)
@@ -105,10 +136,27 @@ func nxt_go_add_port(ctx *C.nxt_unit_ctx_t, p *C.nxt_unit_port_t) C.int {
 		snd: getUnixConn(int(p.out_fd)),
 	}
 
-	add_port(new_port)
+	// A present fd that failed to wrap (dup/FileConn error) would register a
+	// port with a nil rcv/snd and panic later in nxt_go_port_send/recv.  Close
+	// any partial dups and fail the callback instead; libunit still owns and
+	// closes the original descriptors.
+	if (p.in_fd >= 0 && new_port.rcv == nil) ||
+		(p.out_fd >= 0 && new_port.snd == nil) {
+		new_port.Close()
+		return C.NXT_UNIT_ERROR
+	}
 
-	p.in_fd = -1
-	p.out_fd = -1
+	if !add_port(new_port) {
+		// Duplicate key: libunit re-announced an existing port, so new_port
+		// was not registered.  Close its dups instead of leaking them to GC;
+		// libunit still owns and closes the original descriptors.
+		new_port.Close()
+	}
+
+	// Do NOT clear p.in_fd/p.out_fd here.  getUnixConn() now works on private
+	// dups, so the original descriptors remain owned by libunit, which closes
+	// them exactly once when the port is destroyed.  Go holds independent dups
+	// for its own socket I/O.
 
 	return C.NXT_UNIT_OK
 }
@@ -167,6 +215,29 @@ func nxt_go_port_send(pid C.int, id C.int, buf unsafe.Pointer, buf_size C.int,
 	return C.ssize_t(n)
 }
 
+// closeUnixRights closes every descriptor an SCM_RIGHTS block carries.  It is
+// used on paths that refuse a message after the kernel has already installed
+// its descriptors, where nothing else will ever see them.  Parse failures are
+// ignored deliberately: the block is known to be damaged, and whatever can
+// still be read out of it is worth closing.
+func closeUnixRights(oob []byte) {
+	msgs, err := syscall.ParseSocketControlMessage(oob)
+	if err != nil {
+		return
+	}
+
+	for _, m := range msgs {
+		fds, err := syscall.ParseUnixRights(&m)
+		if err != nil {
+			continue
+		}
+
+		for _, fd := range fds {
+			syscall.Close(fd)
+		}
+	}
+}
+
 //export nxt_go_port_recv
 func nxt_go_port_recv(pid C.int, id C.int, buf unsafe.Pointer, buf_size C.int,
 	oob unsafe.Pointer, oob_size *C.size_t) C.ssize_t {
@@ -176,6 +247,15 @@ func nxt_go_port_recv(pid C.int, id C.int, buf unsafe.Pointer, buf_size C.int,
 		id:  int(id),
 	}
 
+	// oob_size arrives as the capacity of the control buffer and is read
+	// back by libunit as the length actually received.  Every return path
+	// must assign it: leaving the capacity behind on a path that received
+	// nothing (EOF at teardown, unknown port) makes libunit parse the
+	// control bytes of the *previous* message, still present in that
+	// recycled buffer, and close its descriptors a second time.
+	oob_capacity := C.int(*oob_size)
+	*oob_size = 0
+
 	p := find_port(key)
 
 	if p == nil {
@@ -183,8 +263,35 @@ func nxt_go_port_recv(pid C.int, id C.int, buf unsafe.Pointer, buf_size C.int,
 		return 0
 	}
 
-	n, oobn, _, _, err := p.rcv.ReadMsgUnix(GoBytes(buf, buf_size),
-		GoBytes(oob, C.int(*oob_size)))
+	n, oobn, flags, _, err := p.rcv.ReadMsgUnix(GoBytes(buf, buf_size),
+		GoBytes(oob, oob_capacity))
+
+	// The control data was cut short, so a descriptor this message was
+	// meant to carry may not be here; libunit would take its fd-less path
+	// on a message that otherwise looks whole.  The callback reports a
+	// length rather than msg_flags, so there is no way to hand the
+	// truncation across as such: report it as a read error, which
+	// nxt_unit_port_recv() turns into NXT_UNIT_ERROR before it parses any
+	// control data.  This is the one place the Go wrapper can see
+	// MSG_CTRUNC at all -- ReadMsgUnix is what consumed it.
+	if err == nil && flags&syscall.MSG_CTRUNC != 0 {
+		// Truncation does not imply that nothing was delivered:
+		// scm_detach_fds() installs the descriptors that fit and only
+		// then raises MSG_CTRUNC.  Those are open in this process
+		// already, and reporting an error leaves *oob_size at 0, so
+		// libunit never parses the block and never closes them --
+		// a descriptor leak under exactly the pressure that caused
+		// the truncation.  Close them here instead; best effort,
+		// since a block the kernel cut may not parse.
+		if oobn > 0 {
+			closeUnixRights(GoBytes(oob, C.int(oobn)))
+		}
+
+		nxt_go_alert("control data truncated on a %d byte message; "+
+			"message dropped", n)
+
+		return C.ssize_t(-1)
+	}
 
 	if err != nil {
 		if nerr, ok := err.(*net.OpError); ok {

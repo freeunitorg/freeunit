@@ -1,4 +1,929 @@
 
+Changes with FreeUnit 1.36.2                                     30 Aug 2026
+
+    *) Change: a certificate bundle whose private key does not belong to
+       its first certificate is now refused at upload with 400 "Invalid
+       certificate.". Before, the bundle was stored, and the mismatch
+       broke the next reconfiguration of every listener that named it.
+       Certificate names that start with "." are reserved for the store's
+       own files, and files with such names are ignored at startup.
+       After an upgrade, a bundle already stored with a mismatched key is
+       not loaded (an alert at startup) and leaves /certificates; its
+       file stays in the state directory and cannot be deleted through
+       the API, so remove it by hand.
+
+    *) Bugfix: an application worker that served a WebSocket upgrade never
+       became idle again. The router counts a session on the worker and
+       keeps a worker with a session out of the idle queues, but nothing
+       uncounted the session when it ended, so the process stayed out of
+       them for good: its idle timer never ran and its slot counted against
+       "processes": {"max"} until it died, which an application that serves
+       WebSockets reaches one upgrade at a time. A session is now uncounted
+       when it ends, whichever side ends it; the bug had appeared in 1.19.0.
+
+    *) Bugfix: an application that answered a request and kept running was
+       counted idle. PHP does this whenever a script calls
+       fastcgi_finish_request(): the response goes out, the script runs on,
+       and the router returned the worker's slot to "processes": {"max"} and
+       let its idle timer reap a process that was still executing. Such a
+       worker now reports itself busy until the work ends, so "max" bounds
+       live processes and "/status" reports them as "detached". The same
+       holds for a request whose "limits": {"timeout"} deadline has passed:
+       the worker still running it is no longer returned to the idle pool
+       either, and keeps counting against "max" until it answers or exits;
+       the bug had appeared in 1.29.0.
+
+    *) Change: "limits": {"timeout"} now also bounds how long a request waits
+       for an application process, not only how long a worker may spend on
+       it. A request that waited for capacity previously had no deadline at
+       all. The default remains no timeout.
+
+    *) Security: the string form of "access_log" "format" wrote what a
+       variable expanded to without escaping it.  "$uri" is the
+       percent-decoded target, so a request for "/%0d%0a..." put a real
+       CRLF in the log and the rest of the line read as a record of a
+       request that never happened.  Bytes a variable expands to are now
+       escaped the way nginx escapes them: the quote, the backslash, every
+       byte below 0x20, 0x7F and every byte above it all become "\xHH".
+       nginx emits no short forms, so a reader that already unescapes an
+       nginx log reads this one. The text of the format itself is
+       unchanged, so a tab or a quote an operator wrote still reaches the
+       log as itself; an "njs" format is the exception, because it
+       produces the whole record and all of it is escaped.  A value that
+       carries a quote of its own now shows it escaped: an entity-tag
+       logged through "$response_header_etag" reads \x22abc\x22 rather
+       than "abc", and a non-ASCII path reads "\xD0\xBF..." rather than
+       its bytes. A log parser that expected the raw bytes has to be
+       updated, though "\xHH" is reversible and the bytes can be recovered
+       from it.  The object form of "format" is unaffected by this change,
+       but it is not a way to keep bytes either: it replaces anything that
+       is not valid UTF-8 with U+FFFD before it serializes.
+
+    *) Change: upgrade contrib njs to 1.0.1.
+
+    *) Bugfix: a port that was closed and freed could leave a pending epoll
+       or kqueue change behind it. The change is held by a pointer into the
+       port, and is applied when the batch is committed -- at the top of the
+       next poll at the latest, which is after the port's memory pool is
+       released. The commit then read freed memory, and could also name a
+       descriptor number the kernel had already handed to somebody else. A
+       port now drops its pending changes before it is freed (#414).
+
+    *) Bugfix: a process could stop hearing from a peer for good. When the
+       wake-up that tells a peer to read the shared queue failed because
+       the kernel could not allocate for it, the port treated the peer as
+       dead: the wake-up was dropped and, since a later message raises one
+       only when the queue was empty, no later message on that port raised
+       one either. The wake-up is now kept and retried, and the retry no
+       longer waits for a socket event that a socket that never filled up
+       will not deliver (#392).
+
+    *) Security: a port message that was queued because the peer's socket was
+       not writable borrowed the descriptors it carried -- for NEW_PORT,
+       another port's socket and queue -- so a port closed before the queue
+       drained left the deferred sendmsg() naming a closed number, or an
+       unrelated descriptor that had since reused it.  The queued copy now
+       owns duplicates and closes them after the send (#388).
+
+    *) Bugfix: the router died on the first request after a configuration
+       that had a "compression" block was replaced by one that had none.
+       The compression state was held in process globals allocated from the
+       router configuration that parsed them, and a later configuration
+       neither refilled nor cleared them, so the next request read a freed
+       pool.  The state is now held per configuration and reached through
+       the request, and the compressor a response is already using is kept
+       with that response, so a body still being compressed when the
+       configuration is replaced also finishes (#167).
+
+    *) Bugfix: a static response that was subject to content negotiation now
+       carries "Vary: Accept-Encoding". Without it a shared cache could store
+       whichever representation it saw first and serve it to every client --
+       gzip bytes to one that cannot decode them, or the uncompressed copy to
+       one that could have had the small version. The header is sent on the
+       identity response as well as the compressed one, since the identity
+       response is the one a cache must not reuse for a client that accepts
+       gzip.
+
+    *) Change: removed the unused job cluster (nxt_job.c, nxt_job.h, and
+       nxt_event_conn_job_sendfile.c). The offload path they implemented
+       had no caller anywhere in the tree and its thread pool handoff was
+       structurally unreachable, since the connection field it read was
+       never assigned.
+
+    *) Feature: byte-range requests for static files. A "share" action now
+       answers a satisfiable single-range "Range: bytes=..." request with
+       "206 Partial Content" and a matching "Content-Range", and an
+       unsatisfiable one with "416 Range Not Satisfiable"; "Accept-Ranges:
+       bytes" is now sent on a plain 200 as well. The three single-range
+       forms are supported -- "A-B", "A-" and the suffix form "-N" -- with
+       the end clamped to the last byte of the file; a multi-range request
+       is ignored and answered with the full 200, as RFC 9110 permits.
+       "If-Range" is honoured against the file's entity-tag (strong
+       comparison) or its "Last-Modified" date, falling back to the full
+       200 on a mismatch. Preconditions (RFC 9110 Sect. 13.2.2) are still
+       evaluated first, so a 304 or 412 outcome wins over any Range. A
+       response served from a Range is not content-coded; compression
+       still applies to a full 200.
+    *) Change: unitctl builds TLS support behind a "tls" Cargo feature, on by
+       default.  The musl build turns it off, so the static binary no longer
+       links a C TLS library and no longer accepts an "https://" control
+       socket address; it refuses one with a message naming the feature.  A
+       Unix socket or a plain "http://" address is unaffected, and a build
+       with default features behaves as before.
+    *) Change: unitctl sends a JSON configuration file as it was written.  It
+       parsed the file and re-serialized it before, which kept the last of two
+       object members with the same name and re-spelled numbers, so the server
+       never saw what the operator wrote.  Unit now reports the duplicate
+       itself, with the line and column of the file.  A file that is not
+       valid UTF-8 is no longer refused by unitctl; Unit refuses it and names
+       the member.  The
+       "edit" command no longer accepts JSON5 comments in the temporary file.
+    *) Change: unitctl no longer reads JSON5.  A ".json5" file is refused by
+       name, with a message saying to convert it first; "json5 -o config.json
+       config.json5" does that, and "jq" reformats ordinary JSON.  Nothing
+       parsed JSON5 after the configuration upload path stopped parsing its
+       input, so this removes a parser that only the refusal path still
+       reached, and two crates with it.
+
+    *) Feature: conditional requests for static files. A "share" action now
+       answers a GET or HEAD carrying "If-None-Match" or "If-Modified-Since"
+       with "304 Not Modified" when the file's validators still match, so a
+       client that already holds the file is no longer sent it again. Unit
+       emitted "ETag" and "Last-Modified" before, but ignored both when they
+       came back. Entity-tag comparison is weak and "*" matches any
+       representation; a present "If-None-Match" takes precedence over
+       "If-Modified-Since", per RFC 9110. "If-Match" and
+       "If-Unmodified-Since" are evaluated first and answer "412 Precondition
+       Failed" when they do not hold.
+
+    *) Change: a content-coded response now carries a weak entity-tag, so
+       "If-Range" cannot resume a coded representation; "If-None-Match"
+       revalidation is unaffected. Unit derives the tag from the file's mtime
+       and size, which do not change with the content coding, so a gzip
+       response and the identity one previously advertised the same strong
+       validator -- 1.36.1 and earlier shipped that. RFC 9110 requires a
+       strong validator to change whenever the selected representation
+       changes, and nginx weakens the tag for the same reason.
+
+    *) Security: a file descriptor is no longer leaked when a static request
+       cannot be satisfied by any acceptable representation. A share with
+       compression configured answered "406 Not Acceptable" without closing
+       the file it had opened, so a single unauthenticated request carrying
+       "Accept-Encoding: identity;q=0, *;q=0" cost the router a descriptor,
+       and repeating it exhausted the table, stopping every application
+       behind that router. Present since compression was added in 1.35.0:
+       1.35.0, 1.35.1, 1.35.2, 1.35.3, 1.35.4, 1.35.5, 1.36.0 and 1.36.1
+       are all affected.
+
+    *) Security: a file descriptor sent to a port is no longer leaked when
+       the message is dispatched and nothing takes ownership of it. An
+       application holds the write end of the router's main port and the
+       message header is unauthenticated, so a compromised application could
+       attach a descriptor to messages the router does not expect one on --
+       or to a fragment that never reaches a handler -- and consume the
+       router's descriptor table, stopping every application behind it. A
+       fragment stream that is started and never completed still retains its
+       descriptor; that needs a bound on pending fragments and is tracked
+       in freeunitorg/freeunit#343.
+
+    *) Bugfix: unitctl gave up on a configuration it could not decode as
+       UTF-8.  Unit stores the bytes it is given, so a configuration can
+       hold bytes no UTF-8 decoder accepts; "unitctl execute" and "unitctl
+       export" then failed with "JSON error [path=/config]" and left the
+       operator no way to read or back up the configuration.  Both work
+       now: the document is shown with the undecodable bytes replaced and
+       the members they fall in named, and "export" stores the server's
+       bytes verbatim.  "unitctl edit" refuses such a configuration rather
+       than writing the replacements back over it.
+
+    *) Bugfix: unitctl reordered the members of a configuration.  "unitctl
+       edit" and "unitctl export" passed the document through an unordered
+       map, so members came back in an arbitrary order and an edit rewrote
+       the whole configuration even where nothing had changed.  The order
+       the server sent is now kept.
+
+    *) Change: two source files that the build never used have been
+       removed.  src/nxt_job_cache_file.c is named nowhere in auto/, so no
+       configuration ever compiled it, and nothing in the tree referenced
+       it or its symbols.  src/nxt_source.h was removed because nothing
+       includes it: of the 106 headers in src/, it was the only one with
+       no #include anywhere in the tree.  Nothing observable changes.
+
+    *) Change: the fiber implementation has been removed. It had not been
+       compiled since 2017: the only allocation of the engine's fiber
+       stack sat under "#if 0", so the pointer was always NULL and the
+       setjmp() branch that tested it could not run. The thread, log and
+       sprintf sites were already disabled. Nothing observable changes.
+
+    *) Change: the nxt_dyld wrapper around dlopen()/dlsym()/dlclose() has
+       been removed. It shipped in the initial import and was never called:
+       the language module loader in src/nxt_application.c calls dlopen()
+       and dlsym() itself and never used this wrapper. libnxt.a loses one
+       object file; there are no other callers.
+
+    *) Bugfix: do not exit when the capget() syscall is denied. A syscall
+       filter that omits capget -- a systemd "SystemCallFilter=" allowlist,
+       a hand-written seccomp profile -- made a non-root unitd fail to start
+       with "failed to get process capabilities". Unit now warns and runs
+       without assuming any capability: user and group switching and
+       "rootfs" isolation are disabled for applications that do not enable
+       the "credential" namespace, and applications run as unitd's own uid.
+       Every other capget() failure remains fatal.
+
+    *) Bugfix: the main process did not answer a START_PROCESS request it
+       could not carry out -- an unknown router port, a sender that is not
+       the router, or an allocation that failed -- so the start stayed
+       pending. The application then parked every later start on a
+       prototype that was not coming, and the requests waiting on it were
+       never failed.
+
+    *) Bugfix: a message that could not be sent because the receiving process
+       had died was reported to the sender as sent. A sender that answers a
+       request and then sends a fallback lost both, so an application could
+       wait for an answer that nothing would ever deliver.
+
+    *) Bugfix: eight places whose memory nothing else reclaims handed a
+       message to a port and did not take it back when the port refused it.
+       The port layer accepts a buffer only when it answers success, so on a
+       refusal -- which happens when memory runs out, or when the receiving
+       process has stopped reading a full shared queue -- the memory was
+       lost. Two of them lost shared memory that no cleanup reclaims, so an
+       application could lose the capacity to answer at all.
+
+    *) Change: a websocket connection is now closed when a frame cannot be
+       handed to the application. Such a frame was previously dropped in
+       silence, leaving the peer's stream short a frame it was never told
+       about -- which for a fragmented message the client cannot detect.
+
+    *) Bugfix: a port could stop sending after it ran out of memory. When a
+       write had to be retried later, the port asked its own thread to watch
+       the socket again, and that request needed memory of its own. If it
+       failed, nothing watched the socket and every later message waited in
+       the queue until the port closed. The port now carries the request it
+       needs, so it cannot fail for lack of memory.
+
+    *) Bugfix: the port layer reported a message as sent when it had been
+       neither sent nor queued. This happened when a socket answered
+       EAGAIN and no memory was left to hold the message for a later
+       attempt, so it takes memory pressure to reach. The sender then
+       cleared the state that would have retried or reported it, so a
+       request could wait for an answer that nothing would ever deliver.
+
+    *) Bugfix: an application worker that died before it finished starting
+       was reported to nobody, so the start it was forked for stayed pending
+       forever. Once the application reached its "processes" maximum it
+       started no further process, and because an application's "timeout"
+       defaults to 0 the requests waiting on it hung instead of failing.
+
+    *) Security: application processes no longer inherit unitd's
+       capabilities. A unitd started as a non-root user that had been
+       granted capabilities -- systemd "AmbientCapabilities=", file
+       capabilities -- passed them through fork() to every application it
+       ran, because switching between two nonzero uids does not clear them
+       and a filtered capget() skips the switch entirely. Each forked
+       process now empties its permitted, effective, inheritable and
+       ambient sets once its credentials are final, before the worker
+       serves any request. The language module's own startup still runs
+       before the drop: the mount, pivot_root and chroot work for "rootfs"
+       isolation happens after it and needs the capabilities that are being
+       given up. Where a syscall filter denies capset() as well, an
+       application start is now refused rather than allowed to proceed with
+       capabilities still held: the request is answered 503 and the log
+       names the denied syscall. A process with an empty permitted,
+       effective and ambient set -- which is every process of a root unitd
+       once it has switched away from uid 0, and every process of an
+       unprivileged one that was granted no capabilities -- keeps behaving
+       as before, since there is nothing an application could have
+       inherited from it. Its inheritable set is emptied as well, which on
+       its own is not counted and grants nothing without an execve() of a
+       file carrying a matching capability. The
+       main process is unchanged, since it needs CAP_NET_BIND_SERVICE to
+       bind listening sockets on every reconfiguration; the router,
+       controller and discovery processes warn and carry on rather than
+       refuse, because they run no application code. Applications
+       configured with "user": "root" are also unchanged, since a root
+       process regains capabilities on the next execve() anyway. One
+       configuration does lose something it previously kept: an
+       application in a "credential" namespace began with a full
+       capability set inside that namespace, because the default uid_map
+       maps unitd's euid to the application's uid, so the setuid() is not
+       a transition out of uid 0 and nothing cleared it. Those
+       capabilities were valid only inside the namespace and Unit's own
+       use of them is finished before the drop, but an application that
+       relied on them now needs "user": "root".
+
+    *) Security: unitctl no longer depends on rustls-pemfile or on hyper's
+       "http2" feature. rustls-pemfile is unmaintained; the parser is replaced
+       by rustls-pki-types, already in the dependency graph. PEM parsing
+       behavior is unchanged: both parsers were run over 1884 PEM documents and
+       produced zero differences. This closes RUSTSEC-2025-0134. Dropping the
+       "http2" feature from hyper, hyper-rustls and hyper-util removes the h2
+       and fnv crates as well, closing RUSTSEC-2026-0258, an unbounded empty
+       DATA frame flood in h2 0.4.15. The control API speaks HTTP/1.1 only --
+       unitd writes "HTTP/1.1" into every response line -- so HTTP/2 support
+       was never usable against the server itself.
+
+    *) Change: unitctl no longer offers HTTP/2 in the TLS handshake it makes to
+       a remote control API. This follows from the "http2" feature removal
+       above. A TLS-terminating proxy placed in front of a remote control API
+       must now speak HTTP/1.1 to unitctl; one that only accepts HTTP/2 can no
+       longer be reached.
+
+    *) Change: unitctl no longer reads hjson or YAML, and no longer writes
+       YAML.  Input piped to "/config" on stdin is parsed as JSON now, not
+       hjson; hjson is a superset of JSON, so piping JSON still works, but
+       comments and unquoted keys do not.  A ".hjson" or ".cjson" file is
+       refused with "hjson is no longer supported: convert the file to JSON
+       first", instead of being handed to the JSON parser, which reports a
+       misleading error at the first comment.  A ".yaml" or ".yml" file is
+       refused with "YAML is no longer supported: convert the file to JSON
+       first, for example with "yq -o=json"".  Supported input formats are
+       now json, json5 and pem.  "unitctl status -t yaml" is gone;
+       --output-format now accepts json, json-pretty and text.  This removes
+       the nu-json dependency and the 30 crates of Nushell utility code it
+       pulled in for a tool that speaks one JSON control API.  It also
+       removes serde_yaml and unsafe-libyaml; the latter is a c2rust
+       transpile of libyaml with 218 unsafe functions and no RustSec
+       advisory.
+       tools/unitc is unaffected: it still converts configuration to and
+       from YAML, using yq.
+
+    *) Change: removed src/nxt_queue.c, the unused half of a queue utility
+       library carried over from nginx.  It defined nxt_queue_sort() and
+       nxt_queue_middle(), both exported but never called anywhere in the
+       tree; src/nxt_queue.h and the nxt_queue_* macros it provides are
+       unaffected and untouched.
+
+    *) Change: nxt_mem_zone, a second allocator, is removed.  It was a
+       zone allocator over a mapped region, distinct from nxt_mp, the
+       pool allocator product code actually uses; nothing in the router,
+       applications, or any language module called it.  Its only caller
+       was its own unit test, run by "./build/tests"; that test is
+       removed too, dropping the three "mem zone test passed" lines from
+       the suite's output.  Upstream nginx/unit had already reached the
+       same conclusion and deleted the file as part of an unrelated
+       cleanup.
+
+    *) Change: the entity-tag and last-modified date of a static file are
+       now weak while the request falls inside the second the file was
+       last written.  Both are derived from the whole-second modification
+       time and the size, so a rewrite to the same size during that second
+       changes neither, and RFC 9110 Sect. 8.8.1 reserves a strong
+       validator for one that cannot miss a change.  "If-Match" and
+       "If-Range" stop matching inside that window, so a range request
+       conditioned on "If-Range" is answered with the full 200 rather than
+       a slice keyed to a validator Unit cannot vouch for; an unconditional
+       "Range" is unaffected.  "If-Match: *" is unaffected too, since "*"
+       asks whether a representation exists, not whether a validator
+       matches.  The tag keeps its format, so nothing already held in a
+       cache is invalidated.
+
+    *) Change: removed the GnuTLS, CyaSSL, and PolarSSL backends
+       (nxt_gnutls.c, nxt_cyassl.c, nxt_polarssl.c) and their configure
+       plumbing ("--gnutls", "--cyassl", "--polarssl").  None of the
+       three ever built: they read a "c->u.ssltls" union member that
+       does not exist, and reference types such as "nxt_ssltls_conf_t"
+       and "nxt_event_conn_io_t" that predate a refactor still visible
+       in the current tree, so passing the flag reaches a compiler
+       error instead of a clean "unsupported".  CyaSSL was renamed
+       wolfSSL and PolarSSL became mbedTLS, both in 2015, so the flags
+       also target products that no longer exist under these names.
+       The OpenSSL backend is unaffected; none of these files were
+       ever part of a default build.
+
+    *) Change: removed the PHP TrueAsync code path. It was written for a
+       "zend_async_event_t" API expected in PHP 8.5 core, which did not ship
+       it, so the configure probe never succeeded and the code sat behind
+       "#if NXT_PHP_TRUEASYNC" in every build. It could not have compiled had
+       the probe succeeded: it reads "async" and "entrypoint" members that
+       "nxt_php_app_conf_t" does not have and calls "nxt_php_extension_init()",
+       which no file in the tree defines. The probe, the "entrypoint" target
+       key and the TrueAsync test suite are removed with it; a PHP application
+       builds and behaves as before.
+
+    *) Bugfix: the java module split every outgoing WebSocket text message
+       larger than 8 KiB into 8 KiB frames, whatever "max_frame_size" was set
+       to. A 64 KiB message arrived as eight frames and a 16 MiB one as about
+       two thousand, each carrying its own frame header and costing its own
+       message to the router, while every other language module sends a
+       complete message as a single frame. A complete text message is now
+       encoded into a buffer of its own and sent as one frame; a message
+       above "nginx.unit.websocket.MAX_SEND_BUFFER_SIZE", 16 MiB by default,
+       still fragments. A Writer from getSendWriter() still sends each chunk
+       it flushes as a frame of its own, but that chunk is now one frame
+       instead of up to three. This does not make the module honour
+       "max_frame_size", which remains an inbound limit only.
+
+
+Changes with FreeUnit 1.36.1                                     28 Aug 2026
+
+    *) Feature: configuration validation errors now say where they are. A
+       rejected configuration request carries an RFC 6901 JSON Pointer in
+       the "path" member of "location": it points at the member whose value
+       failed validation, or at the containing object when the failure is an
+       unknown parameter, whose name the message itself already carries; ""
+       is the document root. On an unknown parameter whose name is a close
+       and unambiguous typo of a known one, the intended name is reported in
+       a top-level "suggestion" member. The addition is strictly additive:
+       the existing response fields and the error message wording are
+       unchanged, and each new member is omitted where it does not apply.
+
+    *) Feature: the /status API reports OpenTelemetry span export health as
+       "telemetry": {"spans": {"exported": N, "failed": M}} -- the spans the
+       collector accepted, and the spans whose export failed. Both are
+       reported because a failure count alone cannot distinguish a healthy
+       pipeline from one that has never exported anything. The object is
+       omitted entirely unless Unit was built with OpenTelemetry support,
+       "/config/settings/telemetry" is set, and the exporter was built
+       successfully, so its absence is how a client tells telemetry is off
+       rather than idle. The counters are cumulative since the exporter was
+       last built, so changing any telemetry setting restarts them, while
+       re-applying an identical configuration does not.
+
+    *) Bugfix: validate the shared memory segment identifier and geometry an
+       application process supplies in its NXT_PORT_MSG_MMAP message. The
+       router checked only the pid fields, then used the peer-authored
+       header id directly as an array index and mapped the descriptor at
+       whatever length fstat() reported; a compromised or faulty application
+       could drive an out-of-range write and an oversized mapping.
+
+    *) Bugfix: bounds-check the router-supplied chunk identifier and size in
+       libunit before consuming them, so an out-of-range size can no longer
+       make every serialized-pointer check in the arrival-time validation
+       block pass and be read out of bounds in the application process.
+
+    *) Bugfix: do not replay a stale SCM_RIGHTS control message in libunit
+       when the embedder's port_recv callback returns without receiving
+       anything. The out parameter carrying the control-data length was
+       stored unconditionally, so a descriptor from an earlier message could
+       be adopted a second time.
+
+    *) Bugfix: check the shared memory buffer allocation when forwarding a
+       websocket frame. Exhausting the outgoing shared memory crashed the
+       router with a NULL dereference; every other caller already checked.
+
+    *) Bugfix: keep the chunked request body buffer alive across framing
+       reads. A buffer drained without producing a data slice was handed to
+       its completion handler while the parser still referenced it, a
+       use-after-free reachable from an ordinary chunked request.
+
+    *) Bugfix: parse the HTTP/1.1 trailer section (RFC 9112 7.1.2) instead
+       of erroring on the first byte after the terminal chunk. In the proxy
+       response relay this aborted an already-streaming response and
+       truncated the body at a racy point; chunked requests carrying a
+       trailer were rejected the same way. Trailer field names and values
+       are validated as they are parsed.
+
+    *) Bugfix: reject an application response that disagrees with itself
+       about its own body length. A duplicate Content-Length was neither
+       detected nor parsed, so every such header was forwarded verbatim and
+       the body was framed by the advertised length instead of chunked.
+
+    *) Bugfix: release the response buffers adopted from the port on the
+       error paths of the router's response handler, and drain them from the
+       request output chain when the failure happens after they were linked
+       into it. Both leaked the chain the handler had taken ownership of.
+
+    *) Bugfix: keep the memory pool cursor aligned in nxt_mp_get() by
+       rounding the requested size up to the maximum alignment rather than
+       flooring it. The small allocation path is a bump allocator with no
+       per-allocation alignment step, so any request whose size was not a
+       multiple of that alignment left the page cursor misaligned, and
+       allocations from that page kept violating the documented alignment
+       guarantee until a later size happened to bring the cursor back into
+       step, which crashed with SIGBUS on strict alignment targets such as
+       32-bit ARM.
+
+    *) Bugfix: serialize the process reference count on the runtime process
+       mutex and take a reference during cross-thread process lookups. The
+       count was mutated non-atomically from every engine thread and a
+       lookup returned an unreferenced process, so a router worker could
+       operate on an nxt_process_t -- including its shared memory segments
+       and its mutex -- that the main thread had already torn down.
+
+    *) Bugfix: keep the socket and timer tasks of a connection scoped to
+       that connection, so a work item cannot run against a task belonging
+       to a different connection.
+
+    *) Change: remove the dead chunk-tracking bitmap from the shared memory
+       segment header. Its trailing fields ran past the header area and
+       aliased the payload of the segment's first chunk, which was harmless
+       only because nothing read or wrote them; the field offsets a peer of
+       either vintage uses are unchanged, so old and new builds still
+       interoperate. A static assertion now pins the header struct inside
+       the area reserved for it.
+
+    *) Change: the shared memory chunk range check is now a single shared
+       implementation used by both the router and libunit, with the chunk
+       count computed so that a peer-supplied size in the top of the 32-bit
+       range cannot wrap to zero chunks and be accepted.
+
+    *) Change: recycle connection structures through a per-engine freelist,
+       embed the static file context in the request, recycle static file
+       buffer descriptors through a thread-local freelist, and resolve the
+       first eight routing variables and the first sixteen request and
+       response header fields from arrays embedded in the request. Each
+       avoids or reuses an allocation on a per-connection or per-request hot
+       path.
+
+    *) Change: the WebAssembly component module no longer supports
+       guest-initiated outbound HTTP. Serving Unit never needed it, and the
+       feature that provided it linked an entire TLS stack -- rustls,
+       tokio-rustls, webpki-roots and rustls-webpki -- into the module. A
+       guest that only imports wasi:http/outgoing-handler, as the
+       wasi:http/proxy world requires, still instantiates and runs; an
+       actual outbound call now fails with HttpRequestDenied.
+
+    *) Change: update wasmtime from 36.0.12 to 47.0.2 in the WebAssembly
+       component module, keeping outbound HTTP denied and the TLS stack out
+       of the dependency graph.
+
+    *) Change: the "if" option of a route "match" object, added in 1.33.0,
+       is now described in the OpenAPI specification and covered by the test
+       suite. A request matches the step only when the condition is true;
+       the condition uses the same syntax as the "if" option of the access
+       log: it is false when it renders to an empty string, "0", "false",
+       "null", or "undefined", and true otherwise, and a leading "!" negates
+       the result. Variables test for the presence of a value ("$arg_foo"),
+       njs template strings express comparisons and regular expressions
+       ("`${uri == '/admin'}`", "`${/^\/admin/.test(uri)}`").
+
+    *) Change: build against OpenSSL 4.0, which constified the return types
+       of the X509 name accessors and deprecated
+       X509_NAME_get_text_by_NID(); SNI certificate matching and the
+       "certificates" control API now read the certificate name through
+       X509_NAME_get_index_by_NID() and the entry accessors instead, and a
+       new CI job builds and runs the C test suite against OpenSSL 4.0 with
+       deprecated APIs disabled, so it fails on any new use of a deprecated
+       function rather than only on a removal.
+
+    *) Change: OpenSSL 1.1.1 or later is now required to build with
+       "--openssl"; configure fails with an explicit message on older
+       releases. Builds against OpenSSL 1.0.x have not worked since 1.35.2,
+       when the TLS module started to use OpenSSL_version_num(); the
+       unreachable pre-1.1.0 compatibility code is removed.
+
+    *) Bugfix: close the engine port when a router worker thread exits.
+       Lowering settings/listen_threads deletes engines, and the thread exit
+       handler only dropped a port reference, and the runtime held another,
+       so nothing ever called nxt_port_close(): every deleted engine leaked
+       its socket pair and its queue descriptor, three per engine, for the
+       life of the router. The count only ever rose, so a configuration that
+       raises and lowers the thread count walked the router towards its
+       descriptor limit.
+
+    *) Bugfix: close the descriptors a forged or malformed port message
+       leaves behind. A message carries up to two descriptors whatever its
+       type normally uses, and the dispatcher reclaims nothing once a
+       handler has returned. The main process kept the second descriptor on
+       the whoami path, the router lost both when a conf data message named
+       no reply port, and a PROCESS_READY naming an unknown process closed
+       neither. A peer that is already compromised could exhaust the
+       descriptor table of the receiving process -- the main process on the
+       whoami path -- by repeating any of them.
+
+    *) Bugfix: bound the log file slot a CHANGE_FILE message claims, and
+       stop leaking the descriptor it carries. The slot index arrived from a
+       peer and was used to walk the runtime's log file list without a range
+       check, and a message whose payload was shorter than the index was
+       read past its end. The rejection paths now close what the message
+       attached, and nxt_file_redirect() releases the descriptor when dup2()
+       fails rather than only on success -- which also ends a leak of one
+       descriptor per unrotatable log file on every SIGUSR1.
+
+    *) Bugfix: a NEW_PORT or PROCESS_READY message carrying a shared-memory
+       queue shorter than the queue type faulted the receiving process
+       (main, the prototype, or the router) with SIGBUS on first access; the
+       object size is now checked before mapping, a short queue is refused
+       with a warning, and the router no longer leaks the descriptor of a
+       queue it refuses.
+
+    *) Bugfix: a NEW_PORT message announcing a port that already existed, or
+       one that could not be created, left an uninitialized stack value
+       behind; the controller dereferenced it unconditionally on every
+       NEW_PORT, and main and the router relied on a NULL check that could
+       not catch non-NULL garbage. The result is now cleared explicitly
+       whenever no port is created.
+
+    *) Bugfix: close the file descriptors a NEW_PORT or MMAP message left
+       behind instead of leaking them. The discovery and application
+       prototype processes kept every port queue descriptor open for the
+       life of the process, the main process kept the queue descriptor of
+       any port it had not just created, the router lost it on ports it does
+       not map a queue for, the controller never closed it, and the mmap
+       handler leaked its second descriptor on every path and returned
+       closing nothing at all when the first was missing; a message type
+       with no handler also went uncollected. A NEW_PORT for a port that
+       already has a queue now refuses the new descriptor instead of mapping
+       it over the live queue and leaking the mapping it replaced, which had
+       let a repeated announcement re-point an established port at memory of
+       the sender's choosing.
+
+    *) Bugfix: session tickets were silently disabled when Unit was built
+       against an OpenSSL 3.x library compiled with the deprecated 3.0 API
+       removed (OPENSSL_NO_DEPRECATED_3_0), because the feature guard tested
+       for a control macro that is itself declared only under that API and
+       so was never defined; the session ticket key callback now registers
+       through SSL_CTX_set_tlsext_ticket_key_evp_cb() and keys an EVP_MAC
+       context on OpenSSL 3.0 and later, independent of the deprecated
+       HMAC_CTX API.
+
+    *) Bugfix: stop building OpenTelemetry span attributes for spans the
+       sampler has already dropped. set_attribute() on a non-recording span
+       discards its argument, but the argument was built first -- the
+       sprintf round-trips, the pool allocations and two owned strings per
+       attribute -- and nothing asked whether the span was recording.
+       Lowering sampling_ratio therefore bought back the exporter and
+       nothing on the request path. The sampler's verdict is now read once
+       when the span is created and the attribute stages consult it, which
+       removes most of telemetry's request-path cost at a low sampling
+       ratio. Context propagation is deliberately outside that check: the
+       traceparent must reach the peer and the application whatever the
+       sampling decision was.
+
+    *) Bugfix: do not attach the traceparent to an OpenTelemetry span as a
+       "Unit Attribute" event. It duplicated the trace and span identifiers
+       the span context already carries, nothing consumed it, and it was
+       added twice on a request that took the error path with a trace it had
+       started itself, because the error path re-runs header propagation.
+
+    *) Bugfix: OpenTelemetry spans were lost at the edges of a request's
+       life. A request that ended before its span was collected -- an error
+       path, a dropped connection -- left the span allocated and never
+       exported it; the span is now tied to the memory pool that holds it
+       and is exported with an error status when that pool is released, so
+       an abandoned request appears in the trace instead of vanishing.
+
+    *) Bugfix: flush the OpenTelemetry span pipeline before the router
+       exits. Exit and reload discarded the pipeline with up to 4096 spans
+       still queued, losing every span produced since the last export. The
+       pipeline is now flushed with a 2 second bound, so a slow or
+       unreachable collector delays shutdown by at most that long rather
+       than either hanging it or costing the queued spans.
+
+    *) Bugfix: rebuild the OpenTelemetry exporter only when the telemetry
+       settings have changed. Every configuration change rebuilt it, so
+       adding a route or changing an application stalled reconfiguration
+       against an unreachable collector even though it did not touch
+       "/config/settings/telemetry". The exporter is now rebuilt only when
+       the endpoint, protocol, sampling ratio or batch size actually differs
+       from the running one.
+
+    *) Change: the OpenTelemetry span attributes "http.response.status_code"
+       and "http.request.body.size" are now emitted as OTLP integer values,
+       as the HTTP semantic conventions specify, instead of strings. A
+       collector or query that matches these attributes as strings must be
+       adapted; one that reads them as integers, or that relied on the
+       convention rather than on Unit's previous output, needs no change.
+
+    *) Change: the work a traced request does on the request path is
+       reduced: attribute keys are no longer copied onto the heap per
+       request, the two attributes above no longer round-trip through
+       strings, and a span stage now crosses into the tracer once instead of
+       once per attribute. Together with the sampling fix above, the
+       telemetry overhead of a request measured 27% lower at
+       "sampling_ratio" 1.0 and 53% lower at 0.1.
+
+    *) Change: the Java module now bundles Apache Tomcat 9.0.121 (from
+       9.0.110) and ClassGraph 4.8.186 (from 4.8.181). The upstream Tomcat
+       9.0.121 release fixes CVE-2026-66299 (unbounded buffer for
+       undelivered WebSocket messages, a memory exhaustion by a slow
+       client), CVE-2026-73180, CVE-2026-68569, CVE-2026-66422 and
+       CVE-2026-65927. FreeUnit bundles only the servlet, JSP and EL API
+       jars, Jasper and the Tomcat utility jars -- not catalina, the
+       WebSocket implementation or the example webapps -- so the bump keeps
+       the jars it ships on a supported release.
+
+
+Changes with FreeUnit 1.36.0                                     16 Jul 2026
+
+    *) Bugfix: the controller crashed in debug builds when a control-socket
+       connection closed after the active-connection tracking change, and
+       leaked the accepted file descriptor when a control connection failed
+       during initialization or body allocation; connection tracking and
+       teardown now route through the engine's tracking macros and the
+       close path.
+
+    *) Bugfix: ignore a malformed incoming "traceparent" header and restart
+       the trace per W3C Trace Context instead of rejecting the request
+       with HTTP 500; the malformed header is dropped instead of being
+       forwarded alongside the restarted one, and context accepted from a
+       valid duplicate is preserved. Values are now validated in full
+       (segment lengths, lowercase hex, no all-zero ids, no "ff" version),
+       so content-invalid values restart the trace instead of being
+       re-emitted verbatim. An inbound "tracestate" is dropped together
+       with the rejected context (kept when the traceparent is inherited).
+       The injected "traceparent" fields are now zero-initialized; garbage
+       flag bits could get the header randomly dropped from proxied
+       requests and responses.
+
+    *) Bugfix: reject empty values and embedded NUL bytes in configuration
+       strings that are later used as NUL-terminated C strings ("user",
+       "group", "working_directory", "stdout", "stderr", "executable", and
+       the per-language application targets) and in pathname unix socket
+       addresses, closing a silent-truncation target confusion.
+
+    *) Bugfix: reject empty values and embedded NUL bytes in the remaining
+       configuration strings used as NUL-terminated C strings outside
+       application options: the "access_log" path (string and object
+       forms), the TLS "certificate" and njs "js_module" store names, and
+       the PHP "options.file" php.ini path.
+
+    *) Bugfix: reject an embedded NUL byte in a templated static-serving
+       path ("share" and "chroot") after it is resolved from
+       request-controlled variables and before it reaches open()/openat2(),
+       preventing a silent truncation that could serve a different file
+       than the resolved path.
+
+    *) Bugfix: mount rootfs automount destinations onto the openat2
+       validated descriptor via "/proc/self/fd" instead of re-resolving the
+       path, closing a check-to-use window in which a destination component
+       could be swapped for a symlink escaping the rootfs.
+
+    *) Bugfix: treat duplicate upstream "Content-Length" headers in a
+       proxied response as inconsistent — both headers are dropped and the
+       body is read to EOF instead of trusting either length, preventing a
+       response-smuggling desynchronization.
+
+    *) Bugfix: keep downstream keepalive disabled after a duplicate or invalid
+       upstream "Content-Length"; a clean upstream close no longer re-enables
+       it, so an HTTP/1.1 client cannot reuse the connection past the re-framed
+       response. The complete body still ends with its terminal chunk — body
+       truncation is now tracked separately from the inconsistent flag.
+
+    *) Bugfix: bound the request-header fields region against the shared
+       memory message size in libunit, validate every field name/value
+       serialized pointer and the cached header-field indexes before use,
+       and range-check off/len in the Java InputStream read() binding,
+       preventing out-of-bounds access on a malformed request.
+
+    *) Bugfix: fix a libunit port-fd double-close race in the Go language
+       module: getUnixConn() wrapped the raw shared-port descriptor (which
+       net.FileConn dups) and a deferred Close() closed the original
+       descriptor number while libunit still owned it, an intermittent
+       double-close that raised an EBADF alert or, worse, closed an
+       unrelated reused live descriptor. Go now dup(2)s the descriptor and
+       wraps only the dup, so libunit remains the sole owner and closer;
+       libunit additionally holds a port reference across the out-of-mutex
+       add_port callback window so a concurrent destroy cannot free the
+       port mid-callback.
+
+    *) Feature: SIGQUIT now performs a graceful stop — application workers
+       drain in-flight requests before exiting; SIGTERM remains the fast
+       exit that drops them.
+
+    *) Change: upgrade the wasm-wasi-component wasmtime crates from 35.0.0
+       to 36.0.12, clearing the wasmtime sandbox-escape advisories, with the
+       accompanying WasiView/WasiHttpView source migration.
+
+    *) Change: upgrade contrib njs to 1.0.0.
+
+    *) Feature: two-phase listener close — reconfiguration disarms a removed
+       listener first and releases its descriptor only after pending accept
+       references drain, instead of resetting them.
+
+    *) Change: the event engine now tracks in-flight connections on a
+       dedicated active connections queue, symmetric with idle tracking —
+       groundwork for graceful connection draining; connection accounting
+       in the "/status" API is exact on all close paths.
+
+    *) Change: broaden the regression test suite — proxy Content-Length and
+       chunked-response relay framing, OpenTelemetry 5xx tracing and inbound
+       traceparent handling, and Java ServletInputStream bounds — and run
+       the C unit-test suite in CI, which was previously compiled but never
+       executed.
+
+    *) Bugfix: authorize privileged IPC message types by the kernel-validated
+       sender PID (SCM_CREDENTIALS), close any received descriptors on every
+       rejected privileged message, and cap port queue item size at the slot
+       data bound.
+
+    *) Bugfix: reject control characters (CR, LF, NUL, DEL) in "set_headers"
+       names and values at configuration load, including the literal
+       segments of templated values.
+
+    *) Bugfix: handle buffer-allocation failure in the port read handlers
+       with an orderly teardown instead of a NULL-pointer dereference, route
+       a connection write error after a partial send to the error handler
+       immediately, and free the timer batching array on engine teardown.
+
+    *) Feature: upgrade the OpenTelemetry Rust crates from 0.24 to 0.32 and
+       rewrite the OTLP trace exporter on the stable, dedicated-thread batch
+       span processor (blocking reqwest client, no tokio runtime).
+
+    *) Feature: W3C traceparent header inheritance now correctly propagates
+       the upstream sampling decision; the sampler wraps TraceIdRatioBased
+       inside ParentBased so that remote parent trace flags are honoured.
+
+    *) Feature: add fake_otlp mock OTLP collector (test/fake_otlp/) and the
+       test_otel.py test suite covering span export, traceparent
+       propagation, sampling, and configuration validation over both the
+       OTLP/HTTP and OTLP/gRPC transports.
+
+    *) Feature: reintroduce OTLP/gRPC trace export. Both transports are
+       compiled into every "--otel" build and the
+       "settings/telemetry/protocol" option selects "http" (OTLP/HTTP) or
+       "grpc" (OTLP/gRPC) at runtime, as in upstream Unit. gRPC uses tonic
+       over a small tokio runtime; v1 is plaintext h2c only (no TLS to the
+       collector, like the HTTP path).
+
+    *) Change: rename the default OTel service name from "NGINX Unit" to
+       "FreeUnit".
+
+    *) Bugfix: add validation bounds for "batch_size" (1-65536) and
+       "sampling_ratio" (0-1) in the OpenTelemetry configuration; previously
+       invalid values were silently rejected without an error message.
+
+    *) Bugfix: replace eprintln! error output in the OTel Rust layer with
+       the C log callback (nxt_otel_log_cb), so errors flow through the
+       standard Unit logging infrastructure.
+
+    *) Bugfix: remove unreachable Protocol::HttpJson dead-code arm from the
+       OTel exporter; only HttpBinary was ever selected.
+
+    *) Bugfix: fix a rootfs automount reload race: sever the worker's mount
+       namespace propagation (MS_REC|MS_PRIVATE) before mounting and let a
+       per-worker automount be reaped with the namespace instead of being
+       unmounted from the host, so a configuration reload no longer races the
+       previous worker generation's teardown against the new prototype's
+       procfs mount (freeunitorg/freeunit#83).
+
+    *) Bugfix: validate that a loaded TLS private key matches its certificate
+       at config time, and guard the wildcard-name SAN matcher against a
+       zero-length SAN entry.
+
+    *) Bugfix: correct IPv4 /32 CIDR fallthrough, symmetric URI/pattern
+       decoding, the PCRE2 match-data ovector size, and short port-range
+       parsing in HTTP routing; document the case-insensitive host matcher
+       and the capset stance.
+
+    *) Bugfix: tighten file-descriptor and CLOEXEC lifetime — CLOEXEC-protect
+       accepted sockets and pipe ends, close the pipe end on
+       nxt_fd_nonblocking() failure and the source fd on compression mmap
+       failure, and narrow the accept4() fallback to ENOSYS.
+
+    *) Bugfix: tighten WebSocket frame-bound checks — reject truncated
+       extended-length frames in libunit, validate the 64-bit extended-length
+       MSB (RFC 6455), fix a no-op frame-size decrement that could copy bytes
+       beyond the declared payload, bound the Java sendWsFrame JNI arguments,
+       and guard pending_payload_len overflow in the Python ASGI handler.
+
+    *) Bugfix: bounds-check peer-supplied shared-memory offsets — range-check
+       chunk_id and chunk_id+nchunks in incoming mmap messages, close a
+       lookup/dereference window on the incoming-mmap handler, reject
+       response-buffer size overflow, and validate request sptr offsets
+       before use.
+
+    *) Bugfix: bounds-check app-supplied arguments across the language
+       bindings (PHP header skip / realpath / PATH_INFO; Python WSGI and ASGI
+       checks; Perl ERRSV scrub; Java InputStream.readLine off/len; WASM
+       guest offsets).
+
+    *) Bugfix: tighten isolation boundaries — require a matching peer UID
+       (root or Unit's own effective UID) on the unix control socket, so the
+       "control-user", "control-group", and "control-mode" permissions are
+       defense-in-depth rather than a means to delegate control-API access;
+       resolve mount destinations with openat2(RESOLVE_BENEATH); and resolve
+       relative cgroup paths against the child's /proc/<pid>/cgroup.
+
+    *) Bugfix: reject embedded NUL bytes in the "rootfs" and cgroup "path"
+       isolation options, and validate "rootfs" as an absolute path other
+       than "/" at configuration time.
+
+    *) Bugfix: fix an ineffective truncation guard when building the
+       cgroup.procs pathname: snprintf()'s return value overwrote the
+       original directory length before the bounds comparison, so a long
+       cgroup directory path could overflow the check. The append now
+       preserves the original length and fails with ENAMETOOLONG when
+       "/cgroup.procs" plus the trailing NUL cannot fit.
+
+    *) Bugfix: fail cgroup setup when the per-process pool allocation that
+       caches the created directory for cleanup fails; the directory is now
+       removed and setup errors out, rather than moving the process into a
+       cgroup that could never be cleaned up — a cgroup directory leak under
+       memory pressure.
+
+    *) Bugfix: reject a "rootfs" that lexically resolves to "/" (such as
+       "/.", "/..", or "/foo/.."); chroot("/") is a no-op and would silently
+       defeat rootfs isolation.
+
+    *) Bugfix: cap JSON parser depth and element counts in the controller,
+       scrub PHP TrueAsync exception state before the prototype fork, and bind
+       the Ruby rack.input / rack.errors handles to their originating request.
+
+    *) Bugfix: bound proxy Content-Length and URI/string helpers — truncate a
+       proxied response body that exceeds its Content-Length and close the
+       connection, flag invalid or oversized upstream Content-Length, fix an
+       nxt_is_complex_uri_encoded() off-by-one, and reject over-long lengths
+       in nxt_rmemstrn().
+
+    *) Feature: enforce the runtime/OS end-of-life policy automatically — the
+       unit-eol-check tool now fails when a shipped variant has outlived its
+       support window (supported_until past EOL + grace), and a new
+       eol-check GitHub workflow validates pkg/eol.json against endoflife.date
+       on every relevant pull request and weekly on a schedule.
+
+
 Changes with FreeUnit 1.35.5                                     29 May 2026
 
     *) Feature: automatically convert chunked request bodies to Content-Length

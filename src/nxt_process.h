@@ -76,6 +76,13 @@ typedef struct {
 
 struct nxt_cgroup_s {
     char  *path;
+    /*
+     * Resolved cgroup directory cached by nxt_cgroup_proc_add() so
+     * nxt_cgroup_cleanup() does not need to re-resolve via
+     * /proc/<pid>/cgroup after the child has already exited (which
+     * would fail with ENOENT and leak cgroup directories).
+     */
+    char  *resolved_path;
 };
 
 
@@ -108,6 +115,28 @@ struct nxt_process_s {
     nxt_bool_t               registered;
     nxt_int_t                use_count;
 
+    /*
+     * Latched, under rt->processes_mutex, when use_count reaches zero.  A
+     * second drop to zero is not detectable from use_count or registered --
+     * a resurrect-then-release leaves both at their post-teardown values --
+     * so nxt_process_use() tests this and refuses the second teardown.
+     */
+    nxt_bool_t               released;
+
+    /*
+     * Latched when a PROCESS_READY could not be acted upon and the process
+     * was killed for it (nxt_port_process_ready_handler()).  A retransmitted
+     * PROCESS_READY must not re-enter that arm and signal a pid that has
+     * already been killed -- and, once reaped, may name an unrelated
+     * process.
+     *
+     * The state cannot carry this, because the process is left at CREATED.
+     * Set only where the sender of a PROCESS_READY can be authenticated
+     * (NXT_USE_CMSG_PID); elsewhere that arm is not reachable, so nothing
+     * ever latches it.
+     */
+    nxt_bool_t               start_failed;
+
     nxt_port_mmaps_t         incoming;
 
 
@@ -115,13 +144,31 @@ struct nxt_process_s {
     const char               *name;
     nxt_port_t               *parent_port;
 
+    /*
+     * The start request this process was forked to satisfy: ->stream is the
+     * initiator's RPC stream, and ->stream_pid/->stream_port address the port
+     * that RPC is registered on.  A creator that can be left holding the only
+     * armed handler for a child records all three -- the prototype does, in
+     * nxt_proto_start_process_handler() -- so that a child which dies before
+     * anything else can report it still gets answered.
+     */
     uint32_t                 stream;
+    nxt_pid_t                stream_pid;
+    nxt_port_id_t            stream_port;
 
     nxt_mp_t                 *mem_pool;
     nxt_credential_t         *user_cred;
 
     nxt_queue_t              children;   /* of nxt_process_t.link */
     nxt_queue_link_t         link;       /* for nxt_process_t.children */
+
+    /*
+     * Used only by nxt_runtime_process_release() to hand the teardown to
+     * rt->main_engine, at which point the process is unlinked with use_count
+     * 0 and nothing else can reach it.  Embedded rather than allocated so
+     * that deferring the free cannot itself fail.
+     */
+    nxt_work_t               free_work;
 
     nxt_process_data_t       data;
 

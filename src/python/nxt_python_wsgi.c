@@ -453,6 +453,17 @@ done:
         PyEval_RestoreThread(pctx->thread_state);
 
         pctx->environ = nxt_python_copy_environ(NULL);
+        if (nxt_slow_path(pctx->environ == NULL)) {
+            /*
+             * Refresh failed; surface the error.  The next request's
+             * NULL-check (above) will retry via copy_environ(req) and
+             * fail it cleanly with NXT_UNIT_ERROR if the retry also
+             * fails — no NULL dereference downstream.
+             */
+            nxt_unit_alert(NULL,
+                           "Python failed to refresh the \"environ\" "
+                           "template");
+        }
 
         pctx->thread_state = PyEval_SaveThread();
     }

@@ -53,7 +53,7 @@ class ApplicationJava(ApplicationProto):
                 os.makedirs(classes_path)
 
             classpath = (
-                f'{option.current_dir}/build/tomcat-servlet-api-9.0.110.jar'
+                f'{option.current_dir}/build/tomcat-servlet-api-9.0.121.jar'
             )
 
             ws_jars = glob.glob(
@@ -63,8 +63,19 @@ class ApplicationJava(ApplicationProto):
             if not ws_jars:
                 pytest.fail('websocket api jar not found.')
 
+            # The suite runs under sudo, whose secure_path drops the
+            # toolcache directory that actions/setup-java prepends, so a bare
+            # "javac" resolves to the system JDK rather than the one this
+            # matrix leg installed and built the jars with.
+            javac_bin = 'javac'
+            java_home = os.environ.get('JAVA_HOME')
+            if java_home:
+                javac_home = os.path.join(java_home, 'bin', 'javac')
+                if os.path.isfile(javac_home):
+                    javac_bin = javac_home
+
             javac = [
-                'javac',
+                javac_bin,
                 '-target',
                 '8',
                 '-source',

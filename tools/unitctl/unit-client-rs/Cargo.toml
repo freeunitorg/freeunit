@@ -1,6 +1,6 @@
 [package]
 name = "unit-client-rs"
-version = "1.35.5"
+version = "1.36.1"
 authors = ["Elijah Zupancic"]
 edition = "2021"
 license = "Apache-2.0"
@@ -9,27 +9,42 @@ license = "Apache-2.0"
 name = "unit_client_rs"
 
 [features]
-# this preserves the ordering of json
-default = ["serde_json/preserve_order"]
+default = ["tls"]
+# "https://" control sockets.  The control API has no TLS listener of its own,
+# so this is for a TLS-terminating proxy in front of a remote control API.
+# Turning it off drops aws-lc-sys, and with it the C toolchain the build needs;
+# that is what the musl artifact does.  hyper-rustls and rustls must be gated
+# together: the direct rustls dependency is the only thing that turns on
+# rustls's own default features, and losing one of those is silent.
+tls = ["dep:hyper-rustls", "dep:rustls"]
 
 [dependencies]
 custom_error = "1.9"
-hyper = { version = "0.14", features = ["stream"] }
-hyper-rustls = { version = "0.25.0", features = ["rustls-native-certs", "webpki-roots", "http2"] }
-hyperlocal = "0.8"
+hyper = { version = "1", features = ["http1"] }
+hyper-rustls = { version = "0.27", features = ["rustls-native-certs", "webpki-roots"], optional = true }
+hyper-util = { version = "0.1", features = ["client-legacy", "client", "http1", "tokio"] }
+hyperlocal = "0.9"
+http-body-util = "0.1"
+bytes = "1"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-sysinfo = "0.30.5"
+# preserve_order is required, not optional.  json_body compares two decodes of
+# the same body member by member, in order, and a sorted map would pair them
+# wrongly.  It also keeps the server's member order in what unitctl prints.
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sysinfo = "0.39"
 tokio = { version = "1.34", features = ["macros"] }
 futures = "0.3"
 hex = "0.4"
-which = "5.0"
+which = "8.0"
 
 unit-openapi = { path = "../unit-openapi" }
-rustls = "0.23.5"
-bollard = "0.17.1"
+# Not used in code.  It is here so that rustls gets its own default features,
+# which hyper-rustls does not turn on for us: "prefer-post-quantum" comes from
+# this line alone.
+rustls = { version = "0.23.5", optional = true }
+bollard = "0.21"
 regex = "1.10.4"
 pbr = "1.1.1"
 
 [dev-dependencies]
-rand = "0.8.5"
+rand = "0.9"

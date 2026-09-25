@@ -38,6 +38,8 @@ typedef struct {
     ssize_t           offset;
     nxt_uint_t        line;
     nxt_uint_t        column;
+    nxt_str_t         pointer;     /* RFC 6901 path to validation error. */
+    nxt_str_t         suggestion;  /* "Did you mean" member name. */
 } nxt_controller_response_t;
 
 
@@ -377,6 +379,27 @@ nxt_controller_start(nxt_task_t *task, nxt_process_data_t *data)
     vldt.conf_pool = mp;
     vldt.ver = nxt_conf_ver;
 
+    /*
+     * A state file written before this check existed can hold bytes the
+     * control API would now refuse.  Rejecting it here would drop the whole
+     * configuration on the next restart -- the daemon would come back serving
+     * nothing -- and repairing it would silently rewrite an operator's value,
+     * which is how a working non-UTF-8 "share" path becomes a broken one.  So
+     * it is loaded exactly as written and reported, once, with the pointer
+     * that names it.  The API refuses to store any more of them.
+     */
+
+    if (nxt_conf_validate_encoding(&vldt) == NXT_DECLINED) {
+        nxt_log(task, NXT_LOG_WARN, "the restored configuration holds a value "
+                "at \"%V\" that the control API would now reject: %V  It is "
+                "kept as written, and the configuration is running; correct it "
+                "to be able to update the configuration.",
+                &vldt.pointer, &vldt.error);
+
+        nxt_memzero(&vldt.error, sizeof(nxt_str_t));
+        nxt_memzero(&vldt.pointer, sizeof(nxt_str_t));
+    }
+
     ret = nxt_conf_validate(&vldt);
 
     if (nxt_slow_path(ret != NXT_OK)) {
@@ -409,9 +432,20 @@ static void
 nxt_controller_process_new_port_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg)
 {
+    nxt_port_t  *port;
+
     nxt_port_new_port_handler(task, msg);
 
-    if (msg->u.new_port->type != NXT_PROCESS_ROUTER
+    port = msg->u.new_port;
+
+    /*
+     * The controller never maps a port queue, so the descriptor
+     * nxt_port_new_port_handler() leaves to its caller has no use here.
+     */
+    nxt_port_recv_msg_close_fds(msg);
+
+    if (port == NULL
+        || port->type != NXT_PROCESS_ROUTER
         || !nxt_controller_router_ready)
     {
         return;
@@ -494,6 +528,8 @@ nxt_controller_remove_pid_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_assert(nxt_buf_used_size(msg->buf) == sizeof(pid));
 
     nxt_memcpy(&pid, msg->buf->mem.pos, sizeof(pid));
+
+    /* Unreferenced: the controller process runs a single engine. */
 
     process = nxt_runtime_process_find(rt, pid);
     if (process != NULL && nxt_process_type(process) == NXT_PROCESS_ROUTER) {
@@ -709,6 +745,77 @@ nxt_runtime_controller_socket(nxt_task_t *task, nxt_runtime_t *rt)
 }
 
 
+static nxt_int_t
+nxt_controller_check_peer_cred(nxt_task_t *task, nxt_conn_t *c)
+{
+#if (NXT_HAVE_UNIX_DOMAIN)
+    /*
+     * The control socket is the privilege boundary for the REST API:
+     * filesystem perms on `control.unit.sock` are defense-in-depth, not the
+     * boundary itself.  Require the peer's effective UID to match unitd's
+     * (or be root) so a local user with directory-write permission cannot
+     * mutate config by hand-crafting connections.
+     */
+    if (c->remote == NULL
+        || c->remote->u.sockaddr.sa_family != AF_UNIX)
+    {
+        return NXT_OK;
+    }
+
+#if (NXT_HAVE_UCRED)
+    {
+        struct ucred  cred;
+        socklen_t     len = sizeof(cred);
+
+        if (getsockopt(c->socket.fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0
+            || len < (socklen_t) sizeof(cred))
+        {
+            nxt_alert(task, "controller: SO_PEERCRED failed %E", nxt_errno);
+            return NXT_ERROR;
+        }
+
+        if (cred.uid != 0 && cred.uid != nxt_euid) {
+            nxt_alert(task, "controller: rejecting connection from uid %d "
+                      "(unitd uid %d); set socket permissions accordingly",
+                      (int) cred.uid, (int) nxt_euid);
+            return NXT_ERROR;
+        }
+
+        return NXT_OK;
+    }
+#elif (defined(__FreeBSD__) || defined(__APPLE__) || defined(__OpenBSD__) \
+       || defined(__NetBSD__) || defined(__DragonFly__))
+    {
+        uid_t  euid;
+        gid_t  egid;
+
+        if (getpeereid(c->socket.fd, &euid, &egid) != 0) {
+            nxt_alert(task, "controller: getpeereid failed %E", nxt_errno);
+            return NXT_ERROR;
+        }
+
+        if (euid != 0 && euid != nxt_euid) {
+            nxt_alert(task, "controller: rejecting connection from uid %d "
+                      "(unitd uid %d)", (int) euid, (int) nxt_euid);
+            return NXT_ERROR;
+        }
+
+        return NXT_OK;
+    }
+#else
+    /*
+     * No peer-credential primitive on this platform; rely on filesystem
+     * permissions of control.unit.sock.  Operators must restrict the path.
+     */
+    return NXT_OK;
+#endif
+
+#else  /* !NXT_HAVE_UNIX_DOMAIN */
+    return NXT_OK;
+#endif
+}
+
+
 static void
 nxt_controller_conn_init(nxt_task_t *task, void *obj, void *data)
 {
@@ -721,9 +828,14 @@ nxt_controller_conn_init(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "controller conn init fd:%d", c->socket.fd);
 
+    if (nxt_slow_path(nxt_controller_check_peer_cred(task, c) != NXT_OK)) {
+        nxt_controller_conn_close(task, c, NULL);
+        return;
+    }
+
     r = nxt_mp_zget(c->mem_pool, sizeof(nxt_controller_request_t));
     if (nxt_slow_path(r == NULL)) {
-        nxt_controller_conn_free(task, c, NULL);
+        nxt_controller_conn_close(task, c, NULL);
         return;
     }
 
@@ -732,7 +844,7 @@ nxt_controller_conn_init(nxt_task_t *task, void *obj, void *data)
     if (nxt_slow_path(nxt_http_parse_request_init(&r->parser, c->mem_pool)
                       != NXT_OK))
     {
-        nxt_controller_conn_free(task, c, NULL);
+        nxt_controller_conn_close(task, c, NULL);
         return;
     }
 
@@ -740,7 +852,7 @@ nxt_controller_conn_init(nxt_task_t *task, void *obj, void *data)
 
     b = nxt_buf_mem_alloc(c->mem_pool, 1024, 0);
     if (nxt_slow_path(b == NULL)) {
-        nxt_controller_conn_free(task, c, NULL);
+        nxt_controller_conn_close(task, c, NULL);
         return;
     }
 
@@ -784,8 +896,15 @@ nxt_controller_conn_read(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "controller conn read");
 
-    nxt_queue_remove(&c->link);
-    nxt_queue_self(&c->link);
+    /*
+     * This conn is engine-tracked: nxt_conn_accept() marked it idle, so all
+     * tracking-state transitions must go through the nxt_conn_* macros.  Raw
+     * queue surgery here would desync c->idle from the queue membership and
+     * make the close handler's nxt_conn_untrack() unlink an already-unlinked
+     * (NULLed under --debug) link.  Move idle->active via the macro instead;
+     * it is idempotent for pipelined reads (conn already TRACK_ACTIVE).
+     */
+    nxt_conn_active(task->thread->engine, c);
 
     b = c->read;
 
@@ -812,8 +931,10 @@ nxt_controller_conn_read(nxt_task_t *task, void *obj, void *data)
         return;
     }
 
-    rc = nxt_http_fields_process(r->parser.fields, &nxt_controller_fields_hash,
-                                 r);
+    rc = nxt_http_fields_process(r->parser.inline_fields,
+                                 r->parser.num_inline_fields,
+                                 r->parser.fields,
+                                 &nxt_controller_fields_hash, r);
 
     if (nxt_slow_path(rc != NXT_OK)) {
         nxt_controller_conn_close(task, c, r);
@@ -834,7 +955,7 @@ nxt_controller_conn_read(nxt_task_t *task, void *obj, void *data)
     if (r->length - preread > (size_t) nxt_buf_mem_free_size(&b->mem)) {
         b = nxt_buf_mem_alloc(c->mem_pool, r->length, 0);
         if (nxt_slow_path(b == NULL)) {
-            nxt_controller_conn_free(task, c, NULL);
+            nxt_controller_conn_close(task, c, r);
             return;
         }
 
@@ -1010,7 +1131,16 @@ nxt_controller_conn_close(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "controller conn close");
 
-    nxt_queue_remove(&c->link);
+    /*
+     * Untrack up front, before scheduling the async close: nxt_conn_close()
+     * defers the real close to a handler, and until it runs the conn would
+     * otherwise stay on the engine's idle/active queue.  An idle-reclaim pass
+     * under fd pressure walks idle_connections and could re-select the same
+     * conn, closing it twice.  Detaching here (idempotently; the async close
+     * handler's untrack then no-ops) closes that window -- mirrors
+     * nxt_runtime_close_idle_connections()'s untrack-before-close.
+     */
+    nxt_conn_untrack(task->thread->engine, c);
 
     c->write_state = &nxt_controller_conn_close_state;
 
@@ -1026,6 +1156,16 @@ nxt_controller_conn_free(nxt_task_t *task, void *obj, void *data)
     c = obj;
 
     nxt_debug(task, "controller conn free");
+
+    /*
+     * By the time this runs the conn has already been untracked: every path
+     * here arrives through nxt_controller_conn_close(), which untracks before
+     * scheduling the async close.  Keep an idempotent nxt_conn_untrack() as a
+     * defensive backstop so a stray future direct caller of this free handler
+     * can never leave a stale link into released pool memory -- TRACK_NONE
+     * makes the repeat a no-op.
+     */
+    nxt_conn_untrack(task->thread->engine, c);
 
     nxt_sockaddr_cache_free(task->thread->engine, c);
 
@@ -1391,13 +1531,30 @@ nxt_controller_process_config(nxt_task_t *task, nxt_controller_request_t *req,
         vldt.conf_pool = mp;
         vldt.ver = NXT_VERNUM;
 
-        rc = nxt_conf_validate(&vldt);
+        /*
+         * Before nxt_conf_validate(), which quotes an offending member name
+         * into its own error text: a name that is not UTF-8 would otherwise
+         * reach the response body and make the error report unreadable for
+         * the very reason it is being reported.
+         *
+         * This runs on the tree that would be installed, so a configuration
+         * that already holds such a value has to have it corrected before any
+         * other part of it can be updated.  The pointer in the error names it.
+         */
+
+        rc = nxt_conf_validate_encoding(&vldt);
+
+        if (nxt_fast_path(rc == NXT_OK)) {
+            rc = nxt_conf_validate(&vldt);
+        }
 
         if (nxt_slow_path(rc != NXT_OK)) {
             nxt_mp_destroy(mp);
 
             if (rc == NXT_DECLINED) {
                 resp.detail = vldt.error;
+                resp.pointer = vldt.pointer;
+                resp.suggestion = vldt.suggestion;
                 goto invalid_conf;
             }
 
@@ -1474,13 +1631,30 @@ nxt_controller_process_config(nxt_task_t *task, nxt_controller_request_t *req,
         vldt.conf_pool = mp;
         vldt.ver = NXT_VERNUM;
 
-        rc = nxt_conf_validate(&vldt);
+        /*
+         * Before nxt_conf_validate(), which quotes an offending member name
+         * into its own error text: a name that is not UTF-8 would otherwise
+         * reach the response body and make the error report unreadable for
+         * the very reason it is being reported.
+         *
+         * This runs on the tree that would be installed, so a configuration
+         * that already holds such a value has to have it corrected before any
+         * other part of it can be updated.  The pointer in the error names it.
+         */
+
+        rc = nxt_conf_validate_encoding(&vldt);
+
+        if (nxt_fast_path(rc == NXT_OK)) {
+            rc = nxt_conf_validate(&vldt);
+        }
 
         if (nxt_slow_path(rc != NXT_OK)) {
             nxt_mp_destroy(mp);
 
             if (rc == NXT_DECLINED) {
                 resp.detail = vldt.error;
+                resp.pointer = vldt.pointer;
+                resp.suggestion = vldt.suggestion;
                 goto invalid_conf;
             }
 
@@ -1748,7 +1922,8 @@ nxt_controller_process_cert(nxt_task_t *task,
         return;
     }
 
-    if (name.length == 0 || path != NULL) {
+    /* Names starting with "." are reserved for the store's own files. */
+    if (name.length == 0 || path != NULL || name.start[0] == '.') {
         goto invalid_name;
     }
 
@@ -1895,6 +2070,7 @@ nxt_controller_process_cert_save(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     nxt_fd_write(msg->fd[0], mbuf->pos, nxt_buf_mem_used_size(mbuf));
 
     nxt_fd_close(msg->fd[0]);
+    msg->fd[0] = -1;
 
     nxt_memzero(&resp, sizeof(nxt_controller_response_t));
 
@@ -2178,6 +2354,7 @@ nxt_controller_process_script_save(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     nxt_fd_write(msg->fd[0], mbuf->pos, nxt_buf_mem_used_size(mbuf));
 
     nxt_fd_close(msg->fd[0]);
+    msg->fd[0] = -1;
 
     nxt_memzero(&resp, sizeof(nxt_controller_response_t));
 
@@ -2524,6 +2701,8 @@ nxt_controller_response(nxt_task_t *task, nxt_controller_request_t *req,
     static const nxt_str_t  offset_str = nxt_string("offset");
     static const nxt_str_t  line_str = nxt_string("line");
     static const nxt_str_t  column_str = nxt_string("column");
+    static const nxt_str_t  path_str = nxt_string("path");
+    static const nxt_str_t  suggestion_str = nxt_string("suggestion");
 
     static nxt_time_string_t  date_cache = {
         (nxt_atomic_uint_t) -1,
@@ -2561,9 +2740,15 @@ nxt_controller_response(nxt_task_t *task, nxt_controller_request_t *req,
     value = resp->conf;
 
     if (value == NULL) {
+        nxt_uint_t  loc_n, loc_i, have_offset, have_pointer;
+
+        have_offset = (resp->status >= 400 && resp->offset != -1);
+        have_pointer = (resp->status >= 400 && resp->pointer.start != NULL);
+
         n = 1
             + (resp->detail.length != 0)
-            + (resp->status >= 400 && resp->offset != -1);
+            + (have_offset || have_pointer)
+            + (resp->suggestion.length != 0);
 
         value = nxt_conf_create_object(c->mem_pool, n);
 
@@ -2590,23 +2775,46 @@ nxt_controller_response(nxt_task_t *task, nxt_controller_request_t *req,
             nxt_conf_set_member_string(value, &detail_str, &resp->detail, n);
         }
 
-        if (resp->status >= 400 && resp->offset != -1) {
+        if (have_offset || have_pointer) {
             n++;
 
-            location = nxt_conf_create_object(c->mem_pool,
-                                              resp->line != 0 ? 3 : 1);
+            loc_n = (have_offset ? (resp->line != 0 ? 3 : 1) : 0) + have_pointer;
+
+            location = nxt_conf_create_object(c->mem_pool, loc_n);
+
+            if (nxt_slow_path(location == NULL)) {
+                nxt_controller_conn_close(task, c, req);
+                return;
+            }
 
             nxt_conf_set_member(value, &location_str, location, n);
 
-            nxt_conf_set_member_integer(location, &offset_str, resp->offset, 0);
+            loc_i = 0;
 
-            if (resp->line != 0) {
-                nxt_conf_set_member_integer(location, &line_str,
-                                            resp->line, 1);
+            if (have_offset) {
+                nxt_conf_set_member_integer(location, &offset_str,
+                                            resp->offset, loc_i++);
 
-                nxt_conf_set_member_integer(location, &column_str,
-                                            resp->column, 2);
+                if (resp->line != 0) {
+                    nxt_conf_set_member_integer(location, &line_str,
+                                                resp->line, loc_i++);
+
+                    nxt_conf_set_member_integer(location, &column_str,
+                                                resp->column, loc_i++);
+                }
             }
+
+            if (have_pointer) {
+                nxt_conf_set_member_string(location, &path_str,
+                                           &resp->pointer, loc_i++);
+            }
+        }
+
+        if (resp->suggestion.length != 0) {
+            n++;
+
+            nxt_conf_set_member_string(value, &suggestion_str,
+                                       &resp->suggestion, n);
         }
     }
 

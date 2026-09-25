@@ -21,6 +21,8 @@
 #if (NXT_TLS)
 static ssize_t nxt_http_idle_io_read_handler(nxt_task_t *task, nxt_conn_t *c);
 static void nxt_http_conn_test(nxt_task_t *task, void *obj, void *data);
+static void nxt_http_conn_tls_conf_release(nxt_task_t *task, void *obj,
+    void *data);
 #endif
 static ssize_t nxt_h1p_idle_io_read_handler(nxt_task_t *task, nxt_conn_t *c);
 static void nxt_h1p_conn_proto_init(nxt_task_t *task, void *obj, void *data);
@@ -275,10 +277,10 @@ nxt_http_idle_io_read_handler(nxt_task_t *task, nxt_conn_t *c)
 
     joint = c->listen->socket.data;
 
-    if (nxt_slow_path(joint == NULL)) {
+    if (nxt_slow_path(joint == NULL || c->listen->draining)) {
         /*
-         * Listening socket had been closed while
-         * connection was in keep-alive state.
+         * Listening socket had been closed or is draining while
+         * connection is still idle.
          */
         c->read_state = &nxt_h1p_idle_close_state;
         return 0;
@@ -368,10 +370,10 @@ nxt_http_conn_test(nxt_task_t *task, void *obj, void *data)
 
     joint = c->listen->socket.data;
 
-    if (nxt_slow_path(joint == NULL)) {
+    if (nxt_slow_path(joint == NULL || c->listen->draining)) {
         /*
-         * Listening socket had been closed while
-         * connection was in keep-alive state.
+         * Listening socket had been closed or is draining while
+         * connection is still idle.
          */
         nxt_h1p_closing(task, c);
         return;
@@ -379,7 +381,41 @@ nxt_http_conn_test(nxt_task_t *task, void *obj, void *data)
 
     tls = joint->socket_conf->tls;
 
+    /*
+     * The connection holds the listener configuration until it is freed.
+     * The TLS connection reads its nxt_tls_conf_t, which lives in the memory
+     * pool of the router configuration, in the handshake callbacks and in
+     * the TLS shutdown.  Only a request references the configuration, so
+     * without this reference a reconfiguration would destroy it under a
+     * connection in the handshake, and under a keep-alive connection that
+     * is closed after its last request has released its own reference.
+     * The cleanup runs in nxt_conn_free(), after the TLS shutdown.
+     */
+    if (nxt_slow_path(nxt_mp_cleanup(c->mem_pool,
+                                     nxt_http_conn_tls_conf_release,
+                                     &engine->task, joint, NULL)
+                      != NXT_OK))
+    {
+        nxt_h1p_closing(task, c);
+        return;
+    }
+
+    joint->count++;
+
     tls->conn_init(task, tls, c);
+}
+
+
+static void
+nxt_http_conn_tls_conf_release(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_socket_conf_joint_t  *joint;
+
+    joint = obj;
+
+    nxt_debug(task, "http conn tls conf release");
+
+    nxt_router_conf_release(task, joint);
 }
 
 #endif
@@ -411,10 +447,10 @@ nxt_h1p_idle_io_read_handler(nxt_task_t *task, nxt_conn_t *c)
 
     joint = c->listen->socket.data;
 
-    if (nxt_slow_path(joint == NULL)) {
+    if (nxt_slow_path(joint == NULL || c->listen->draining)) {
         /*
-         * Listening socket had been closed while
-         * connection was in keep-alive state.
+         * Listening socket had been closed or is draining while
+         * connection is still idle.
          */
         c->read_state = &nxt_h1p_idle_close_state;
         return 0;
@@ -505,9 +541,28 @@ nxt_h1p_conn_request_init(nxt_task_t *task, void *obj, void *data)
 
         r->task = c->task;
         task = &r->task;
-        c->socket.task = task;
-        c->read_timer.task = task;
-        c->write_timer.task = task;
+
+        nxt_assert(c->socket.task == &c->task);
+        nxt_assert(c->read_timer.task == &c->task);
+        nxt_assert(c->write_timer.task == &c->task);
+
+        /*
+         * The request task is embedded in nxt_http_request_t and thus lives in
+         * the request memory pool, which is released
+         * (nxt_http_request_close_handler -> nxt_mp_release) as soon as the
+         * request completes.  The connection's socket and timer tasks, however,
+         * are captured by value into deferred work items (nxt_conn_write /
+         * nxt_conn_read) and into expiring timer work (nxt_timer_expire), any of
+         * which can still be queued on the engine when the pool is freed -- a
+         * keep-alive / mid-stream-abort straddle (e.g. send_timeout firing while
+         * a write item is pending).  Such a stale item would then dereference the
+         * freed task, notably nxt_conn_io_write()'s leading nxt_debug(task, ...):
+         * a use-after-free.  So the connection's socket and timer tasks are left
+         * pointed at the connection-scoped &c->task (as set by nxt_conn_create);
+         * only the request state machine below uses the request-scoped task.
+         * Both tasks log through &c->log with the same ident, so request log
+         * correlation is unchanged.
+         */
 
         ret = nxt_http_parse_request_init(&h1p->parser, r->mem_pool);
 
@@ -678,9 +733,15 @@ nxt_h1p_header_process(nxt_task_t *task, nxt_h1proto_t *h1p,
     r->path = &h1p->parser.path;
     r->args = &h1p->parser.args;
 
+    r->num_inline_fields = h1p->parser.num_inline_fields;
+    if (r->num_inline_fields > 0) {
+        nxt_memcpy(r->inline_fields, h1p->parser.inline_fields,
+                   sizeof(nxt_http_field_t) * r->num_inline_fields);
+    }
     r->fields = h1p->parser.fields;
 
-    ret = nxt_http_fields_process(r->fields, &nxt_h1p_fields_hash, r);
+    ret = nxt_http_fields_process(r->inline_fields, r->num_inline_fields,
+                                  r->fields, &nxt_h1p_fields_hash, r);
     if (nxt_slow_path(ret != NXT_OK)) {
         return ret;
     }
@@ -900,6 +961,15 @@ nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
 
         r->chunked = 1;
         h1p->chunked_parse.mem_pool = r->mem_pool;
+
+        /*
+         * Every buffer this parser sees on the request path belongs to someone
+         * else: the header buffer stays linked in h1p->buffers (parsed fields
+         * still point into it) and the body buffer lives in the request memory
+         * pool and remains c->read for the rest of the body.  Neither may be
+         * handed to its completion handler when a read carries only framing.
+         */
+        h1p->chunked_parse.retain_buffers = 1;
         break;
 
     case NXT_HTTP_TE_UNSUPPORTED:
@@ -1153,7 +1223,11 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
             } else if (h1p->chunked_parse.chunk_size > 0) {
                 /* Mid-chunk: chunk_parse consumed the entire buffer but did not
                  * advance b->mem.pos (CHUNK_MIDDLE path in chunk_buffer).
-                 * Reset so nxt_conn_read has space on the next iteration. */
+                 * Reset so nxt_conn_read has space on the next iteration.
+                 * A buffer ending mid-trailer lands here too, since chunk_size
+                 * doubles as the trailer byte counter; there the parser did
+                 * advance pos, but it advanced it to b->mem.free, so this reset
+                 * is the same zero-byte compaction the branch below does. */
                 b->mem.free = b->mem.start;
                 b->mem.pos = b->mem.start;
 
@@ -1418,7 +1492,13 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
         if (r->resp.content_length == NULL || r->resp.content_length->skip) {
 
             if (http11) {
-                if (n != NXT_HTTP_NOT_MODIFIED
+                /*
+                 * r->no_body already covers 204 and 304, plus 1xx and every
+                 * response to HEAD; the two status tests are kept so the
+                 * framing rule stays readable at the point it is applied.
+                 */
+                if (!r->no_body
+                    && n != NXT_HTTP_NOT_MODIFIED
                     && n != NXT_HTTP_NO_CONTENT
                     && body_handler != NULL
                     && !h1p->websocket)
@@ -1429,7 +1509,12 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
                     size -= nxt_length("\r\n");
                 }
 
-            } else {
+            } else if (!r->no_body) {
+                /*
+                 * A pre-HTTP/1.1 client needs the close to delimit a body;
+                 * a response that has no body needs no such delimiter, so
+                 * keep-alive stays as negotiated.
+                 */
                 h1p->keepalive = 0;
             }
         }
@@ -1443,14 +1528,16 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
         size += connection[conn].length;
     }
 
-    nxt_list_each(field, r->resp.fields) {
+    nxt_http_fields_each(field, r->resp.inline_fields, r->resp.num_inline_fields,
+                         r->resp.fields)
+    {
 
         if (!field->skip) {
             size += field->name_length + field->value_length;
             size += nxt_length(": \r\n");
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     if (nxt_slow_path(n == NXT_HTTP_UPGRADE_REQUIRED)) {
         size += nxt_length(websocket_version);
@@ -1464,7 +1551,9 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
 
     p = nxt_cpymem(header->mem.free, status->start, status->length);
 
-    nxt_list_each(field, r->resp.fields) {
+    nxt_http_fields_each(field, r->resp.inline_fields, r->resp.num_inline_fields,
+                         r->resp.fields)
+    {
 
         if (!field->skip) {
             p = nxt_cpymem(p, field->name, field->name_length);
@@ -1473,7 +1562,7 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
             *p++ = '\r'; *p++ = '\n';
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     if (conn >= 0) {
         p = nxt_cpymem(p, connection[conn].start, connection[conn].length);
@@ -1642,6 +1731,24 @@ nxt_h1p_chunk_create(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
     for (b = out; b != NULL; b = b->next) {
 
         if (nxt_buf_is_last(b)) {
+            if (r->truncated) {
+                /*
+                 * The response is truncated -- the upstream closed before the
+                 * body framing completed (premature chunked EOF, or a
+                 * Content-Length body cut short).  Relay the partial body but
+                 * omit the terminal 0\r\n\r\n: keepalive is already disabled,
+                 * so the connection closes after this buffer and the client
+                 * detects the truncation via the missing terminator, rather
+                 * than seeing a falsely complete response.  #72
+                 *
+                 * Keyed on "truncated" not "inconsistent": a complete body
+                 * flagged inconsistent for another reason (e.g. a duplicate
+                 * upstream Content-Length) must keep its terminal chunk while
+                 * still disabling keepalive.
+                 */
+                break;
+            }
+
             tail = nxt_http_buf_mem(task, r, sizeof(tail_chunk));
             if (nxt_slow_path(tail == NULL)) {
                 return NULL;
@@ -1735,7 +1842,7 @@ nxt_h1p_conn_request_error(nxt_task_t *task, void *obj, void *data)
         return;
     }
 
-    if (r->fields == NULL) {
+    if (r->method == NULL) {
         (void) nxt_h1p_header_process(task, h1p, r);
     }
 
@@ -1771,7 +1878,7 @@ nxt_h1p_conn_request_timeout(nxt_task_t *task, void *obj, void *data)
     h1p->keepalive = 0;
     r = h1p->request;
 
-    if (r->fields == NULL) {
+    if (r->method == NULL) {
         (void) nxt_h1p_header_process(task, h1p, r);
     }
 
@@ -1835,10 +1942,18 @@ nxt_h1p_request_close(nxt_task_t *task, nxt_http_proto_t proto,
     nxt_router_conf_release(task, joint);
 
     c = h1p->conn;
+
+    nxt_assert(c->socket.task == &c->task);
+    nxt_assert(c->read_timer.task == &c->task);
+    nxt_assert(c->write_timer.task == &c->task);
+
     task = &c->task;
-    c->socket.task = task;
-    c->read_timer.task = task;
-    c->write_timer.task = task;
+    /*
+     * The connection's socket and timer tasks were never repointed at the
+     * request task (see nxt_h1p_conn_request_init), so they already reference
+     * &c->task; only the local task is reset for the keep-alive or shutdown
+     * that follows.
+     */
 
     if (h1p->keepalive) {
         nxt_h1p_keepalive(task, h1p, c);
@@ -2414,9 +2529,14 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
            + sizeof("Connection: close\r\n")
            + sizeof("\r\n");
 
-    /* Emit Content-Length after chunked_transform; NULL body → value 0. */
+    /*
+     * Emit Content-Length after chunked_transform; NULL body → value 0.
+     * The transform adds a Content-Length field (r->content_length) that
+     * goes out with the other fields; a second one would make the
+     * upstream answer 400.
+     */
     content_length = -1;
-    if (r->chunked) {
+    if (r->chunked && r->content_length == NULL) {
         if (r->body == NULL) {
             content_length = 0;
         } else {
@@ -2436,14 +2556,16 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
         size += nxt_length("Content-Length: ") + NXT_OFF_T_LEN + nxt_length("\r\n");
     }
 
-    nxt_list_each(field, r->fields) {
+    nxt_http_fields_each(field, r->inline_fields, r->num_inline_fields,
+                         r->fields)
+    {
 
         if (!field->hopbyhop && !field->skip) {
             size += field->name_length + field->value_length;
             size += nxt_length(": \r\n");
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     header = nxt_http_buf_mem(task, r, size);
     if (nxt_slow_path(header == NULL)) {
@@ -2458,7 +2580,9 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
     p = nxt_cpymem(p, " HTTP/1.1\r\n", 11);
     p = nxt_cpymem(p, "Connection: close\r\n", 19);
 
-    nxt_list_each(field, r->fields) {
+    nxt_http_fields_each(field, r->inline_fields, r->num_inline_fields,
+                         r->fields)
+    {
 
         if (!field->hopbyhop && !field->skip) {
             p = nxt_cpymem(p, field->name, field->name_length);
@@ -2467,7 +2591,7 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
             *p++ = '\r'; *p++ = '\n';
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     if (content_length >= 0) {
         p = nxt_cpymem(p, "Content-Length: ", nxt_length("Content-Length: "));
@@ -2506,8 +2630,6 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
         }
 
         size += nxt_buf_used_size(body);
-
-//        nxt_mp_retain(r->mem_pool);
     }
 
     if (size > 16384) {
@@ -2748,9 +2870,16 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
     switch (ret) {
 
     case NXT_DONE:
+        peer->num_inline_fields = peer->proto.h1->parser.num_inline_fields;
+        if (peer->num_inline_fields > 0) {
+            nxt_memcpy(peer->inline_fields,
+                       peer->proto.h1->parser.inline_fields,
+                       sizeof(nxt_http_field_t) * peer->num_inline_fields);
+        }
         peer->fields = peer->proto.h1->parser.fields;
 
-        ret = nxt_http_fields_process(peer->fields,
+        ret = nxt_http_fields_process(peer->inline_fields,
+                                      peer->num_inline_fields, peer->fields,
                                       &nxt_h1p_peer_fields_hash, r);
         if (nxt_slow_path(ret != NXT_OK)) {
             peer->status = NXT_HTTP_INTERNAL_SERVER_ERROR;
@@ -2763,12 +2892,67 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
 
         h1p = peer->proto.h1;
 
-        if (h1p->chunked) {
-            if (r->resp.content_length != NULL) {
-                peer->status = NXT_HTTP_BAD_GATEWAY;
+        if (h1p->chunked && r->resp.content_length != NULL) {
+            peer->status = NXT_HTTP_BAD_GATEWAY;
+            break;
+        }
+
+        /*
+         * RFC 9112 Sect. 6.3: a response to HEAD, and any 204 or 304 response,
+         * is terminated by the first empty line after the header fields no
+         * matter what Content-Length or Transfer-Encoding say.  Such a response
+         * is complete right here, so neither arm the chunked parser nor set a
+         * remainder from a Content-Length that describes a body the upstream
+         * will never send.
+         *
+         * Without this the upstream -- which nxt_h1p_peer_header_send() always
+         * asks to "Connection: close" -- closes with h1p->remainder still at
+         * the advertised length, or with chunked_parse.last still clear;
+         * nxt_h1p_peer_closed() then reads that as a truncated body and sets
+         * r->truncated and r->inconsistent, and nxt_h1p_request_close() drops
+         * the client keep-alive over a response that was never short.  Any
+         * pipelined request already in the client's socket buffer is lost.
+         *
+         * Complete the response the way a body that reaches its declared
+         * length completes it in nxt_h1p_peer_body_process(): hand the
+         * request's last buffer to the ready handler and mark the peer closed,
+         * so nxt_http_proxy_send_body() closes the upstream connection and
+         * releases the request pool.
+         *
+         * The predicate is the "final response" one, not the full RFC list:
+         * a 1xx from an upstream is an interim response, and nothing here
+         * continues the exchange past it -- nxt_h1p_peer_header_parse() only
+         * reads a status line while peer->status is still NXT_HTTP_UNSET, so
+         * the 1xx is taken as the response and whatever follows is relayed as
+         * its body.  That is pre-existing and out of scope; ending the
+         * exchange on the 1xx header here would discard a final response that
+         * may already be sitting in this very buffer.
+         *
+         * "b" is not forwarded: bytes an upstream put after the header of a
+         * bodyless response are not a body.  It is handed to
+         * nxt_http_proxy_buf_mem_hold() rather than freed, because the
+         * response fields point their name/value into it and are read until
+         * the request is logged and closed; see the comment there.
+         */
+        if (nxt_http_request_is_bodyless_final(r, peer->status)) {
+            h1p->chunked = 0;
+            h1p->remainder = 0;
+
+            if (nxt_slow_path(nxt_http_proxy_buf_mem_hold(task, r, b)
+                              != NXT_OK))
+            {
+                peer->status = NXT_HTTP_INTERNAL_SERVER_ERROR;
                 break;
             }
 
+            peer->body = nxt_http_buf_last(r);
+            peer->closed = 1;
+
+            r->state->ready_handler(task, r, peer);
+            return;
+        }
+
+        if (h1p->chunked) {
             h1p->chunked_parse.mem_pool = c->mem_pool;
 
         } else if (r->resp.content_length_n > 0) {
@@ -2778,6 +2962,20 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
         if (nxt_buf_mem_used_size(&b->mem) != 0) {
             nxt_h1p_peer_body_process(task, peer, b);
             return;
+        }
+
+        /*
+         * No body bytes arrived with the header, so nothing will relay "b" and
+         * nothing will run its completion handler.  Dropping it here -- which
+         * is what this path did -- stranded both the buffer and the
+         * r->mem_pool retain nxt_http_proxy_buf_mem_alloc() took, so the whole
+         * request pool was never destroyed.  Measured on the parent commit:
+         * two pools reach a zero retain per request on this path against three
+         * on the path where the body shares the header's read.
+         */
+        if (nxt_slow_path(nxt_http_proxy_buf_mem_hold(task, r, b) != NXT_OK)) {
+            peer->status = NXT_HTTP_INTERNAL_SERVER_ERROR;
+            break;
         }
 
         r->state->ready_handler(task, r, peer);
@@ -2927,11 +3125,84 @@ nxt_h1p_peer_body_process(nxt_task_t *task, nxt_http_peer_t *peer,
 
     } else if (h1p->remainder > 0) {
         length = nxt_buf_chain_length(out);
-        h1p->remainder -= length;
 
-        if (h1p->remainder == 0) {
+        /*
+         * Cast to nxt_off_t can wrap to negative on 64-bit if length
+         * exceeds NXT_OFF_T_MAX; check that explicitly as well as the
+         * overrun condition.
+         */
+        if (nxt_slow_path((nxt_off_t) length < 0
+                          || (nxt_off_t) length > h1p->remainder))
+        {
+            nxt_buf_t         *b, *tail, *next;
+            size_t            trimmed;
+            nxt_work_queue_t  *wq;
+
+            /*
+             * Upstream sent more body bytes than its Content-Length
+             * declared.  Truncate the buf chain to remainder bytes so
+             * we never forward the excess past the Content-Length we
+             * already advertised downstream, then flag inconsistent
+             * and close.  The tail detached by the truncation is not
+             * silently dropped: each detached buffer's completion
+             * handler is posted to the work queue below, so the
+             * request-pool retains those proxy read buffers hold are
+             * released promptly instead of lingering until request
+             * teardown.
+             */
+            nxt_log(task, NXT_LOG_WARN,
+                    "upstream sent %uz body bytes past Content-Length "
+                    "(remainder %O)", length, h1p->remainder);
+
+            tail = NULL;
+
+            trimmed = 0;
+            for (b = out; b != NULL; b = b->next) {
+                size_t  bsz;
+
+                if (nxt_buf_is_sync(b)) {
+                    continue;
+                }
+                bsz = b->mem.free - b->mem.pos;
+                if (trimmed + bsz <= (size_t) h1p->remainder) {
+                    trimmed += bsz;
+                    continue;
+                }
+                /* Trim this buf to fit, detach the tail after it. */
+                b->mem.free = b->mem.pos
+                              + (size_t) h1p->remainder - trimmed;
+                tail = b->next;
+                b->next = NULL;
+                break;
+            }
+
+            /* Complete the detached tail to release its retains now. */
+            wq = &task->thread->engine->fast_work_queue;
+
+            for (b = tail; b != NULL; b = next) {
+                next = b->next;
+                b->next = NULL;
+
+                if (nxt_buf_is_sync(b)) {
+                    continue;
+                }
+
+                nxt_work_queue_add(wq, b->completion_handler, task, b,
+                                   b->parent);
+            }
+
+            peer->request->inconsistent = 1;
+            h1p->remainder = 0;
             nxt_buf_chain_add(&out, nxt_http_buf_last(peer->request));
             peer->closed = 1;
+
+        } else {
+            h1p->remainder -= length;
+
+            if (h1p->remainder == 0) {
+                nxt_buf_chain_add(&out, nxt_http_buf_last(peer->request));
+                peer->closed = 1;
+            }
         }
     }
 
@@ -2945,6 +3216,7 @@ nxt_h1p_peer_body_process(nxt_task_t *task, nxt_http_peer_t *peer,
 static void
 nxt_h1p_peer_closed(nxt_task_t *task, void *obj, void *data)
 {
+    nxt_h1proto_t       *h1p;
     nxt_http_peer_t     *peer;
     nxt_http_request_t  *r;
 
@@ -2955,9 +3227,38 @@ nxt_h1p_peer_closed(nxt_task_t *task, void *obj, void *data)
     r = peer->request;
 
     if (peer->header_received) {
+        h1p = peer->proto.h1;
+
         peer->body = nxt_http_buf_last(r);
         peer->closed = 1;
-        r->inconsistent = (peer->proto.h1->remainder != 0);
+
+        /*
+         * The upstream closed the connection.  The response body is truncated
+         * if its framing never completed: a Content-Length response short of
+         * its declared length (remainder != 0), or a chunked response that
+         * never reached the terminal 0\r\n\r\n (!chunked_parse.last).  Mark it
+         * "truncated" so nxt_h1p_chunk_create() drops the terminal chunk and
+         * the client detects the cut instead of it being masked as a clean end
+         * of response, and "inconsistent" so keepalive is disabled and the
+         * client connection is closed once the partial body has been relayed.
+         * Relaying the partial body and closing -- rather than calling
+         * error_handler -- avoids racing a connection reset against the
+         * already-buffered status line and body (which could otherwise leave
+         * the client with an empty response). #72
+         *
+         * Set rather than assign: an earlier stage may already have marked the
+         * response inconsistent for an unrelated reason whose body is complete
+         * (e.g. an invalid or duplicate upstream Content-Length in
+         * nxt_http_proxy_content_length()).  A clean close there must keep
+         * keepalive disabled without falsely truncating the framing, so only a
+         * genuine short body sets "truncated", and neither flag is ever cleared.
+         */
+        if ((h1p->remainder != 0)
+            || (h1p->chunked && !h1p->chunked_parse.last))
+        {
+            r->truncated = 1;
+            r->inconsistent = 1;
+        }
 
         r->state->ready_handler(task, r, peer);
 
@@ -3055,10 +3356,39 @@ nxt_h1p_peer_close(nxt_task_t *task, nxt_http_peer_t *peer)
     peer->closed = 1;
 
     c = peer->proto.h1->conn;
+
+    nxt_assert(c->socket.task == &c->task);
+    nxt_assert(c->read_timer.task == &c->task);
+    nxt_assert(c->write_timer.task == &c->task);
+
+    /*
+     * The upstream connection's socket and timer tasks are connection-scoped
+     * for its whole lifetime (nxt_conn_create() sets them; nxt_conn_socket()
+     * only rechecks), so there is nothing to reset here -- only the local task
+     * is switched to the connection for the close below, which runs after the
+     * request may already be gone.
+     */
     task = &c->task;
-    c->socket.task = task;
-    c->read_timer.task = task;
-    c->write_timer.task = task;
+
+    /*
+     * Block further I/O on the upstream connection and cancel its timers.
+     * Removal of the fd from the event facility is deferred to
+     * nxt_conn_close_handler(), but the peer object (c->socket.data) lives in
+     * the request memory pool and may be freed synchronously right after this
+     * close (e.g. nxt_http_proxy_error() releases the pool when the client
+     * aborts mid-response).  An I/O event already queued for this connection in
+     * the current engine cycle, or an autoreset timer firing, would then reach
+     * nxt_h1p_peer_read_done()/nxt_h1p_peer_send_timeout()/etc. and dereference
+     * the freed peer -- a use-after-free that crashes the router.  Both paths
+     * are at risk: the read side (response relay) and the write side (the
+     * request body upload uses an autoreset send timer).  Setting block_read /
+     * block_write makes a queued nxt_conn_io_read()/nxt_conn_io_write() bail out
+     * early; nxt_conn_close() still emits the FIN via its work-queue handler.
+     */
+    c->block_read = 1;
+    c->block_write = 1;
+    nxt_timer_disable(task->thread->engine, &c->read_timer);
+    nxt_timer_disable(task->thread->engine, &c->write_timer);
 
     if (c->socket.fd != -1) {
         c->write_state = &nxt_h1p_peer_close_state;

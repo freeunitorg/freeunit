@@ -245,10 +245,6 @@ void nxt_unit_port_id_init(nxt_unit_port_id_t *port_id, pid_t pid, uint16_t id);
 /* Calculates hash for given field name. */
 uint16_t nxt_unit_field_hash(const char* name, size_t name_length);
 
-/* Split host for server name and port. */
-void nxt_unit_split_host(char *host_start, uint32_t host_length,
-    char **name, uint32_t *name_length, char **port, uint32_t *port_length);
-
 /* Group duplicate fields for easy enumeration. */
 void nxt_unit_request_group_dup_fields(nxt_unit_request_info_t *req);
 
@@ -317,6 +313,25 @@ ssize_t nxt_unit_request_readline_size(nxt_unit_request_info_t *req,
     size_t max_size);
 
 void nxt_unit_request_done(nxt_unit_request_info_t *req, int rc);
+
+/*
+ * Finish a request the way nxt_unit_request_done() does, and tell the router
+ * that this worker is still running: the application has answered the client
+ * but has not returned, so the process is busy even though it has no request.
+ *
+ * Without this the router counts such a worker idle the moment the response
+ * goes out.  It then hands the worker's slot back to "processes": {"max"},
+ * and its idle timer can reap a process that is still executing.
+ *
+ * libunit reports the work finished by itself, once the request handler
+ * returns; the application does not have to pair this call with anything.
+ * That covers the requests libunit hands to the handler, not one taken with
+ * nxt_unit_dequeue_request().  The router keeps one flag per worker, not a
+ * count per context, so a worker running several contexts at once has the
+ * first context's finish clear it.  PHP's fastcgi_finish_request() is the
+ * caller this exists for, and PHP runs one context.
+ */
+void nxt_unit_request_done_detached(nxt_unit_request_info_t *req, int rc);
 
 
 int nxt_unit_websocket_send(nxt_unit_request_info_t *req, uint8_t opcode,
@@ -395,6 +410,24 @@ void nxt_unit_req_log(nxt_unit_request_info_t *req, int level,
 
 #define nxt_unit_req_alert(req, fmt, ARGS...) \
     nxt_unit_req_log(req, NXT_UNIT_LOG_ALERT, fmt, ##ARGS)
+
+
+#if (NXT_TESTS)
+void     nxt_unit_test_send_detached_failures(unsigned int failures);
+uint8_t  nxt_unit_test_ctx_detached(nxt_unit_ctx_t *ctx);
+uint8_t  nxt_unit_test_ctx_detached_retries(nxt_unit_ctx_t *ctx);
+void     nxt_unit_test_ctx_set_detached(nxt_unit_ctx_t *ctx, uint8_t val);
+void     nxt_unit_test_ctx_set_detached_retries(nxt_unit_ctx_t *ctx,
+    uint8_t val);
+uint8_t  nxt_unit_test_ctx_detached_unreported(nxt_unit_ctx_t *ctx);
+void     nxt_unit_test_ctx_detached_start(nxt_unit_ctx_t *ctx);
+void     nxt_unit_test_ctx_detached_done(nxt_unit_ctx_t *ctx);
+int      nxt_unit_test_ctx_detached_retry(nxt_unit_ctx_t *ctx);
+uint8_t  nxt_unit_test_ctx_online(nxt_unit_ctx_t *ctx);
+uint8_t  nxt_unit_test_ctx_ready(nxt_unit_ctx_t *ctx);
+void     nxt_unit_test_ctx_set_ready(nxt_unit_ctx_t *ctx, uint8_t val);
+void     nxt_unit_test_ctx_quit_graceful(nxt_unit_ctx_t *ctx);
+#endif
 
 
 #endif /* _NXT_UNIT_H_INCLUDED_ */

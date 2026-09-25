@@ -158,10 +158,8 @@ static nxt_router_access_log_format_t *
 nxt_router_access_log_format_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
     nxt_conf_value_t *value)
 {
-    size_t                          size;
     uint32_t                        i, n, next;
     nxt_str_t                       name, str, *dst;
-    nxt_bool_t                      has_js;
     nxt_conf_value_t                *cv;
     nxt_router_access_log_member_t  *member;
     nxt_router_access_log_format_t  *format;
@@ -179,68 +177,40 @@ nxt_router_access_log_format_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
     if (value != NULL) {
 
         if (nxt_conf_type(value) == NXT_CONF_OBJECT) {
-            next = 0;
-            has_js = 0;
-
             n = nxt_conf_object_members_count(value);
 
-            for ( ;; ) {
+            member = nxt_mp_alloc(rtcf->mem_pool,
+                                  n * sizeof(nxt_router_access_log_member_t));
+            if (nxt_slow_path(member == NULL)) {
+                return NULL;
+            }
+
+            next = 0;
+
+            for (i = 0; i < n; i++) {
                 cv = nxt_conf_next_object_member(value, &name, &next);
                 if (cv == NULL) {
                     break;
                 }
 
-                nxt_conf_get_string(cv, &str);
-
-                if (nxt_tstr_is_js(&str)) {
-                    has_js = 1;
-                }
-            }
-
-            if (has_js) {
-                member = nxt_mp_alloc(rtcf->mem_pool,
-                                    n * sizeof(nxt_router_access_log_member_t));
-                if (nxt_slow_path(member == NULL)) {
+                dst = nxt_str_dup(rtcf->mem_pool, &member[i].name, &name);
+                if (nxt_slow_path(dst == NULL)) {
                     return NULL;
                 }
 
-                next = 0;
+                nxt_conf_get_string(cv, &str);
 
-                for (i = 0; i < n; i++) {
-                    cv = nxt_conf_next_object_member(value, &name, &next);
-                    if (cv == NULL) {
-                        break;
-                    }
-
-                    dst = nxt_str_dup(rtcf->mem_pool, &member[i].name, &name);
-                    if (nxt_slow_path(dst == NULL)) {
-                        return NULL;
-                    }
-
-                    nxt_conf_get_string(cv, &str);
-
-                    member[i].tstr = nxt_tstr_compile(rtcf->tstr_state, &str,
-                                                      NXT_TSTR_LOGGING);
-                    if (nxt_slow_path(member[i].tstr == NULL)) {
-                        return NULL;
-                    }
+                member[i].tstr = nxt_tstr_compile(rtcf->tstr_state, &str,
+                                                  NXT_TSTR_LOGGING);
+                if (nxt_slow_path(member[i].tstr == NULL)) {
+                    return NULL;
                 }
-
-                format->nmembers = n;
-                format->member = member;
-
-                return format;
             }
 
-            size = nxt_conf_json_length(value, NULL);
+            format->nmembers = n;
+            format->member = member;
 
-            str.start = nxt_mp_nget(rtcf->mem_pool, size);
-            if (nxt_slow_path(str.start == NULL)) {
-                return NULL;
-            }
-
-            str.length = nxt_conf_json_print(str.start, value, NULL)
-                         - str.start;
+            return format;
 
         } else {
             nxt_conf_get_string(value, &str);
@@ -250,8 +220,16 @@ nxt_router_access_log_format_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
         str = default_format;
     }
 
+    /*
+     * NXT_TSTR_ESCAPE is set here and not for the object format above: the
+     * object format prints through nxt_conf_json_print(), which escapes what
+     * it prints, and escaping twice would show the escape instead of the
+     * value.
+     */
+
     format->tstr = nxt_tstr_compile(rtcf->tstr_state, &str,
-                                    NXT_TSTR_LOGGING | NXT_TSTR_NEWLINE);
+                                    NXT_TSTR_LOGGING | NXT_TSTR_NEWLINE
+                                    | NXT_TSTR_ESCAPE);
     if (nxt_slow_path(format->tstr == NULL)) {
         return NULL;
     }
@@ -355,6 +333,27 @@ nxt_router_access_log_json(nxt_task_t *task, nxt_http_request_t *r,
             }
         }
 
+        /*
+         * The value is whatever the variable resolved to, and for a request
+         * header that is bytes the client chose: RFC 9110 Sect. 5.5 admits
+         * obs-text, so 0x80-0xFF reach here unfiltered.  JSON text is UTF-8
+         * (RFC 8259 Sect. 8.1), and nxt_conf_json_escape() escapes the quote
+         * and the backslash but copies every other byte through -- so an
+         * unencodable one leaves a record that is unforgeable and still
+         * unreadable, which a strict consumer drops whole.
+         *
+         * Sanitize here rather than in the serializer.  The same serializer
+         * writes state/conf.json and answers GET /config, where the bytes are
+         * the operator's and have to round-trip exactly: a "share" path is
+         * allowed to be non-UTF-8 on Linux, and rewriting one would point the
+         * router at a different file after a restart.
+         */
+
+        ret = nxt_utf8_sanitize(r->mem_pool, &str, &str);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NXT_ERROR;
+        }
+
         nxt_conf_set_member_string(value, &member->name, &str, i);
     }
 
@@ -448,6 +447,9 @@ nxt_router_access_log_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     access_log = tmcf->router_conf->access_log;
 
     access_log->fd = msg->fd[0];
+
+    /* The access log owns the descriptor now. */
+    msg->fd[0] = -1;
 
     nxt_work_queue_add(&task->thread->engine->fast_work_queue,
                        nxt_router_conf_apply, task, tmcf, NULL);
@@ -619,6 +621,7 @@ nxt_router_access_log_reopen_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     }
 
     nxt_fd_close(msg->fd[0]);
+    msg->fd[0] = -1;
     nxt_mp_release(reopen->mem_pool);
 }
 

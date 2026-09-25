@@ -185,16 +185,36 @@ def test_tls_certificate_update():
     ), 'update certificate'
 
 
-@pytest.mark.skip('not yet')
-def test_tls_certificate_key_incorrect():
+def test_tls_certificate_key_incorrect(skip_alert):
+    skip_alert(r'certificate and private key do not match')
+
     client.load('empty')
 
     client.certificate('first', False)
     client.certificate('second', False)
 
+    # The bundle is structurally valid (a private key + a certificate), but
+    # the key belongs to another certificate.  The store refuses it at
+    # upload, so a listener can never name it.
     assert 'error' in client.certificate_load(
         'first', 'second'
-    ), 'key incorrect'
+    ), 'mismatched bundle refused'
+
+    assert 'error' in client.conf_get('/certificates/first'), 'not stored'
+
+
+def test_tls_certificate_dot_name():
+    client.load('empty')
+
+    client.certificate('default', False)
+
+    # Names starting with "." are reserved for the store's own files.
+    for name in ['.', '..', '.default', '.default.tmp']:
+        assert 'error' in client.conf(
+            b'', f'/certificates/{name}'
+        ), f'dot name {name}'
+
+    assert 'success' in client.certificate_load('default'), 'plain name'
 
 
 def test_tls_certificate_change():
@@ -761,3 +781,32 @@ def test_tls_multi_listener():
     assert client.get_ssl()['status'] == 200, 'listener #1'
 
     assert client.get_ssl(port=8081)['status'] == 200, 'listener #2'
+
+
+def test_tls_certificate_cstring_nul():
+    client.load('empty')
+    client.certificate()
+
+    # The "certificate" name is used as a NUL-terminated C-string store name;
+    # an embedded NUL (which survives JSON parsing in a length-tracked
+    # nxt_str_t) or an empty value must be rejected by the c-string validator,
+    # before the certificate-store lookup.
+    def conf_cert(cert):
+        return client.conf(
+            {"pass": "applications/empty", "tls": {"certificate": cert}},
+            'listeners/*:8080',
+        )
+
+    # The certificate-store lookup is length-aware and would also reject
+    # these values (as "not found"), so assert the validator's own diagnostic
+    # to prove the c-string guard ran rather than the lookup merely failing.
+    assert 'success' in conf_cert("default"), 'valid'
+
+    resp = conf_cert("default\0junk")
+    assert 'null character' in resp.get('detail', ''), 'nul'
+
+    resp = conf_cert("")
+    assert 'must not be empty' in resp.get('detail', ''), 'empty'
+
+    resp = conf_cert(["default\0junk"])
+    assert 'null character' in resp.get('detail', ''), 'array nul'

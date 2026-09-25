@@ -283,11 +283,12 @@ nxt_ruby_start(nxt_task_t *task, nxt_process_data_t *data)
     ruby_script("NGINX_Unit");
 
     ruby_ctx.env = Qnil;
-    ruby_ctx.io_input = Qnil;
-    ruby_ctx.io_error = Qnil;
+    ruby_ctx.io_input_class = Qnil;
+    ruby_ctx.io_error_class = Qnil;
     ruby_ctx.thread = Qnil;
     ruby_ctx.ctx = NULL;
     ruby_ctx.req = NULL;
+    ruby_ctx.req_seq = 0;
 
     rack_init.task = task;
     rack_init.script = &c->script;
@@ -570,8 +571,12 @@ nxt_ruby_rack_env_create(VALUE arg)
 
     rb_hash_aset(hash_env, rb_str_new2("SCRIPT_NAME"), rb_str_new("", 0));
     rb_hash_aset(hash_env, rb_str_new2("rack.version"), version);
-    rb_hash_aset(hash_env, rb_str_new2("rack.input"), rctx->io_input);
-    rb_hash_aset(hash_env, rb_str_new2("rack.errors"), rctx->io_error);
+    /*
+     * rack.input and rack.errors are minted per-request in
+     * nxt_ruby_rack_app_run; the template env intentionally omits
+     * them so a fresh, request-bound instance is the only thing
+     * each app callback ever sees.
+     */
     rb_hash_aset(hash_env, rb_str_new2("rack.multithread"),
                  nxt_ruby_threads > 1 ? Qtrue : Qfalse);
     rb_hash_aset(hash_env, rb_str_new2("rack.multiprocess"), Qtrue);
@@ -591,33 +596,28 @@ nxt_ruby_rack_env_create(VALUE arg)
 static int
 nxt_ruby_init_io(nxt_ruby_ctx_t *rctx)
 {
-    VALUE  io_input, io_error;
-
-    io_input = nxt_ruby_stream_io_input_init();
-
-    rctx->io_input = rb_funcall(io_input, rb_intern("new"), 1,
-                                   (VALUE) (uintptr_t) rctx);
-    if (nxt_slow_path(rctx->io_input == Qnil)) {
+    /*
+     * Store only the class references on the ctx; instances are
+     * minted per request in nxt_ruby_rack_app_run so each instance
+     * can snapshot rctx->req_seq for its originating request.
+     */
+    rctx->io_input_class = nxt_ruby_stream_io_input_init();
+    if (nxt_slow_path(rctx->io_input_class == Qnil)) {
         nxt_unit_alert(NULL,
-                       "Ruby: Failed to create environment 'rack.input' var");
-
+                       "Ruby: Failed to register 'rack.input' class");
         return NXT_UNIT_ERROR;
     }
 
-    rb_gc_register_address(&rctx->io_input);
+    rb_gc_register_address(&rctx->io_input_class);
 
-    io_error = nxt_ruby_stream_io_error_init();
-
-    rctx->io_error = rb_funcall(io_error, rb_intern("new"), 1,
-                                   (VALUE) (uintptr_t) rctx);
-    if (nxt_slow_path(rctx->io_error == Qnil)) {
+    rctx->io_error_class = nxt_ruby_stream_io_error_init();
+    if (nxt_slow_path(rctx->io_error_class == Qnil)) {
         nxt_unit_alert(NULL,
-                       "Ruby: Failed to create environment 'rack.error' var");
-
+                       "Ruby: Failed to register 'rack.errors' class");
         return NXT_UNIT_ERROR;
     }
 
-    rb_gc_register_address(&rctx->io_error);
+    rb_gc_register_address(&rctx->io_error_class);
 
     return NXT_UNIT_OK;
 }
@@ -641,6 +641,14 @@ nxt_ruby_request_handler_gvl(void *data)
     req = data;
 
     rctx = req->ctx->data;
+    /*
+     * Bump req_seq before publishing rctx->req: rack.input /
+     * rack.errors instances minted during this request snapshot
+     * req_seq at construction time, so any handle issued for an
+     * earlier request reads a mismatched seq and is rejected as
+     * stale (see nxt_ruby_bind_req).
+     */
+    rctx->req_seq++;
     rctx->req = req;
 
     res = rb_protect(nxt_ruby_rack_app_run, (VALUE) (uintptr_t) req, &state);
@@ -669,11 +677,37 @@ nxt_ruby_rack_app_run(VALUE arg)
     nxt_ruby_ctx_t           *rctx;
     nxt_unit_request_info_t  *req;
 
+    VALUE                    io_input, io_error;
+
     req = (nxt_unit_request_info_t *) arg;
 
     rctx = req->ctx->data;
 
     env = rb_hash_dup(rctx->env);
+
+    /*
+     * Mint per-request rack.input / rack.errors instances bound to
+     * the current rctx + req_seq.  This is what prevents a handle
+     * captured during request A from operating on request B handled
+     * by the same worker: each instance snapshots req_seq, and
+     * stream-IO ops reject mismatches.
+     */
+    io_input = nxt_ruby_stream_io_input_new(rctx->io_input_class, rctx);
+    if (nxt_slow_path(io_input == Qnil)) {
+        nxt_unit_req_alert(req,
+                           "Ruby: Failed to create per-request 'rack.input'");
+        goto fail;
+    }
+
+    io_error = nxt_ruby_stream_io_error_new(rctx->io_error_class, rctx);
+    if (nxt_slow_path(io_error == Qnil)) {
+        nxt_unit_req_alert(req,
+                           "Ruby: Failed to create per-request 'rack.errors'");
+        goto fail;
+    }
+
+    rb_hash_aset(env, rb_str_new2("rack.input"), io_input);
+    rb_hash_aset(env, rb_str_new2("rack.errors"), io_error);
 
     rc = nxt_ruby_read_request(req, env);
     if (nxt_slow_path(rc != NXT_UNIT_OK)) {
@@ -1291,12 +1325,12 @@ nxt_ruby_exception_log(nxt_unit_request_info_t *req, uint32_t level,
 static void
 nxt_ruby_ctx_done(nxt_ruby_ctx_t *rctx)
 {
-    if (rctx->io_input != Qnil) {
-        rb_gc_unregister_address(&rctx->io_input);
+    if (rctx->io_input_class != Qnil) {
+        rb_gc_unregister_address(&rctx->io_input_class);
     }
 
-    if (rctx->io_error != Qnil) {
-        rb_gc_unregister_address(&rctx->io_error);
+    if (rctx->io_error_class != Qnil) {
+        rb_gc_unregister_address(&rctx->io_error_class);
     }
 
     if (rctx->env != Qnil) {
@@ -1456,9 +1490,10 @@ nxt_ruby_init_threads(nxt_ruby_app_conf_t *c)
         rctx = &nxt_ruby_ctxs[i];
 
         rctx->env = Qnil;
-        rctx->io_input = Qnil;
-        rctx->io_error = Qnil;
+        rctx->io_input_class = Qnil;
+        rctx->io_error_class = Qnil;
         rctx->thread = Qnil;
+        rctx->req_seq = 0;
     }
 
     for (i = 0; i < c->threads - 1; i++) {

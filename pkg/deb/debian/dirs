@@ -1,5 +1,5 @@
 usr/bin
 usr/sbin
-usr/lib/unit
+usr/lib/%%RUNTIME%%
 usr/include/unit
-var/lib/unit
+var/lib/%%RUNTIME%%

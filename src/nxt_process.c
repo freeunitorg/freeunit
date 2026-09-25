@@ -136,10 +136,70 @@ nxt_process_new(nxt_runtime_t *rt)
 void
 nxt_process_use(nxt_task_t *task, nxt_process_t *process, int i)
 {
-    process->use_count += i;
+    nxt_int_t      use_count;
+    nxt_bool_t     released;
+    nxt_runtime_t  *rt;
 
-    if (process->use_count == 0) {
-        nxt_runtime_process_release(task->thread->runtime, process);
+    rt = task->thread->runtime;
+
+    /*
+     * The count is mutated from every engine thread, so it is serialized on
+     * rt->processes_mutex rather than made atomic: an atomic increment would
+     * still let a lookup take a reference on a process whose teardown has
+     * already started.  Dropping to zero therefore unlinks the process from
+     * rt->processes while the mutex is still held, which makes {find, ref}
+     * and {unref to zero, unlink} mutually exclusive.  The teardown itself
+     * runs after the unlock -- it takes other locks and must not nest.
+     *
+     * This makes rt->processes_mutex reachable from any nxt_port_use()
+     * that drops a last port reference, including callers that already hold
+     * app->mutex (nxt_router.c).  rt->processes_mutex must therefore stay a
+     * leaf: nothing may take another lock while holding it.  It is one today
+     * only because the single outward call made while holding it,
+     * nxt_runtime_process_add() -> nxt_runtime_port_add() -> nxt_port_use(),
+     * passes a positive delta and so cannot reach nxt_port_release() and
+     * back into this function.  A -1 reached under this mutex would
+     * self-deadlock the calling thread.
+     */
+
+    nxt_thread_mutex_lock(&rt->processes_mutex);
+
+    process->use_count += i;
+    use_count = process->use_count;
+
+    /*
+     * A second drop to zero is not detectable from use_count or registered
+     * -- a resurrect-then-release leaves both exactly as the first teardown
+     * left them -- so it is latched here instead.  This has to act rather
+     * than assert: nxt_assert() compiles to nothing in a non-debug build,
+     * and the second release is worse than a double free.  On rt->main_engine
+     * it tears the process down while the first teardown is still queued; off
+     * it, it posts process->free_work a second time, and
+     * nxt_locked_work_queue_add() then self-links the item so that the
+     * engine draining it spins forever.
+     */
+
+    released = process->released;
+
+    if (use_count == 0 && !released) {
+        process->released = 1;
+
+        nxt_runtime_process_unlink_locked(rt, process);
+    }
+
+    nxt_thread_mutex_unlock(&rt->processes_mutex);
+
+    if (use_count == 0) {
+        if (nxt_slow_path(released)) {
+            nxt_assert(!released);
+
+            nxt_alert(task, "process %PI dropped to zero twice, leaking it "
+                      "rather than tearing it down again", process->pid);
+
+            return;
+        }
+
+        nxt_runtime_process_release(task, rt, process);
     }
 }
 
@@ -287,7 +347,25 @@ nxt_process_child_fixup(nxt_task_t *task, nxt_process_t *process)
 
     rt = task->thread->runtime;
 
-    /* Remove not ready processes. */
+    /*
+     * Remove not ready processes.
+     *
+     * These walks hand unreferenced processes to nxt_process_close_ports(),
+     * which takes its own +1/-1 -- the shape that made nxt_port_remove_pid()
+     * a double release once the refcount became cross-thread.  It is safe
+     * here for a different reason than everywhere else, and not because of
+     * the refcount: this runs immediately after fork() in the child, which
+     * is single-threaded by definition, so no other thread exists to have
+     * dropped the last reference.  nxt_runtime_process_each() iterating
+     * rt->processes without the mutex is safe for the same reason.
+     *
+     * The other half of that, now that nxt_process_use() locks
+     * rt->processes_mutex: the mutex is inherited across fork() and would be
+     * held forever in the child if any other thread of the parent held it at
+     * the call.  None can -- only main and prototype fork, both take the
+     * mutex on their single event engine, and their thread-pool threads
+     * never touch it.
+     */
     nxt_runtime_process_each(rt, p) {
 
         if (nxt_proc_keep_matrix[ptype][nxt_process_type(p)] == 0
@@ -913,6 +991,40 @@ nxt_process_created_ok(nxt_task_t *task, nxt_port_recv_msg_t *msg, void *data)
     init = nxt_process_init(process);
 
     ret = nxt_process_apply_creds(task, process);
+
+    if (nxt_slow_path(ret == NXT_DECLINED)) {
+        /*
+         * capset() is filtered and nxt_capability_still_held() found
+         * this process carrying capabilities because of it, or could
+         * not establish that it is not.  Only a prototype reaches
+         * nxt_process_created_ok(): the core processes set
+         * NXT_PROCESS_STATE_READY in nxt_process_core_setup() and never
+         * send PROCESS_CREATED, and an application worker never sends
+         * one either, because nxt_app_setup() returns init->start()
+         * directly and that call does not come back with NXT_OK.  The
+         * entire remaining job of a prototype is to fork workers that
+         * would inherit those sets.  Refuse the start
+         * instead, and say which syscall and which consequence, so the
+         * operator's next step is to allow capset() rather than to
+         * hunt for a broken application.
+         *
+         * The refusal is visible: this exits nonzero, main's SIGCHLD
+         * reaper notifies the router with the start's stream still
+         * attached (main clears ->stream only once the NEW_PORT that
+         * answers the start has gone out, and a prototype that died
+         * here never sent the PROCESS_READY that would have caused
+         * one), the router turns that REMOVE_PID into an RPC error for
+         * the start attempt, and the requests waiting on the application
+         * are answered 503 rather than left to time out.
+         */
+
+        nxt_alert(task, "%s refused to start: capset() is denied, so the "
+                  "capabilities this process holds cannot be dropped and "
+                  "would be inherited by application code", process->name);
+
+        goto fail;
+    }
+
     if (nxt_slow_path(ret != NXT_OK)) {
         goto fail;
     }
@@ -961,7 +1073,24 @@ nxt_process_core_setup(nxt_task_t *task, nxt_process_t *process)
     nxt_int_t  ret;
 
     ret = nxt_process_apply_creds(task, process);
-    if (nxt_slow_path(ret != NXT_OK)) {
+
+    /*
+     * NXT_DECLINED -- capset() filtered, capabilities still held -- is
+     * warn-and-continue here, unlike on the nxt_process_created_ok()
+     * path.  This is the router, the controller and discovery: they run
+     * no application code, so there is nothing to inherit what they
+     * keep, and refusing costs far more than it buys.  Router and
+     * controller declare .restart = 1 and nxt_main_process_sigchld_
+     * handler() re-forks them immediately and without backoff, so a
+     * filter that denies every attempt would spin a respawn loop
+     * instead of reporting anything; discovery's row in
+     * nxt_proc_remove_notify_matrix is all zeroes and it is the main
+     * process's only startup action, so its death would leave unitd up
+     * with no modules, no control socket and no error.
+     * nxt_capability_drop() has already logged the warning.
+     */
+
+    if (nxt_slow_path(ret != NXT_OK && ret != NXT_DECLINED)) {
         return NXT_ERROR;
     }
 
@@ -1050,7 +1179,23 @@ nxt_process_apply_creds(nxt_task_t *task, nxt_process_t *process)
     }
 #endif
 
-    return NXT_OK;
+    /*
+     * Last: nothing after this point in any child needs a capability,
+     * and everything before it might.  PR_SET_NO_NEW_PRIVS above stops
+     * this process *gaining* privilege across execve(); it does not
+     * take away what the process already carries, and fork() copies
+     * every capability set verbatim, so a unitd that was granted
+     * capabilities would otherwise pass them straight to application
+     * code.  Main never calls apply_creds() and so never drops -- it
+     * binds listeners on every reconfiguration.
+     *
+     * Its NXT_DECLINED -- a filtered capset(), sets still full -- is
+     * passed through rather than folded into either NXT_OK or
+     * NXT_ERROR, because the two callers answer it differently: see
+     * nxt_process_created_ok() and nxt_process_core_setup().
+     */
+
+    return nxt_capability_drop(task);
 }
 
 
@@ -1230,6 +1375,13 @@ nxt_process_type(nxt_process_t *process)
         (nxt_process_port_first(process))->type;
 }
 
+
+/*
+ * The caller must hold a reference to the process.  Closing the ports drops
+ * the reference each of them holds, so this takes one of its own to survive
+ * the loop -- but on a process that has already reached zero that same pair
+ * is a fresh 0 -> 1 -> 0 transition, which runs the teardown a second time.
+ */
 
 void
 nxt_process_close_ports(nxt_task_t *task, nxt_process_t *process)

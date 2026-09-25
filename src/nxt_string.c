@@ -316,6 +316,10 @@ nxt_rmemstrn(const u_char *s, const u_char *end, const char *ss, size_t length)
     u_char        c1, c2;
     const u_char  *s1, *s2;
 
+    if (nxt_slow_path(length == 0 || length > (size_t) (end - s))) {
+        return NULL;
+    }
+
     s1 = end - length;
     s2 = (u_char *) ss;
     c2 = *s2++;
@@ -715,7 +719,12 @@ nxt_is_complex_uri_encoded(u_char *src, size_t length)
 
         if (nxt_uri_escape[ch >> 5] & (1U << (ch & 0x1f))) {
             if (ch == '%') {
-                if (end - src < 2) {
+                /*
+                 * The two pre-increments below read src+1 and src+2,
+                 * so at least three bytes ('%' plus two hex digits)
+                 * must remain in the buffer.
+                 */
+                if (end - src < 3) {
                     return 0;
                 }
 

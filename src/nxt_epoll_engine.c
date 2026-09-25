@@ -47,6 +47,8 @@ static void nxt_epoll_disable(nxt_event_engine_t *engine, nxt_fd_event_t *ev);
 static void nxt_epoll_delete(nxt_event_engine_t *engine, nxt_fd_event_t *ev);
 static nxt_bool_t nxt_epoll_close(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
+static void nxt_epoll_cancel_changes(nxt_event_engine_t *engine,
+    nxt_fd_event_t *ev);
 static void nxt_epoll_enable_read(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
 static void nxt_epoll_enable_write(nxt_event_engine_t *engine,
@@ -126,6 +128,7 @@ const nxt_event_interface_t  nxt_epoll_edge_engine = {
     nxt_epoll_disable,
     nxt_epoll_delete,
     nxt_epoll_close,
+    nxt_epoll_cancel_changes,
     nxt_epoll_enable_read,
     nxt_epoll_enable_write,
     nxt_epoll_disable_read,
@@ -172,6 +175,7 @@ const nxt_event_interface_t  nxt_epoll_level_engine = {
     nxt_epoll_disable,
     nxt_epoll_delete,
     nxt_epoll_close,
+    nxt_epoll_cancel_changes,
     nxt_epoll_enable_read,
     nxt_epoll_enable_write,
     nxt_epoll_disable_read,
@@ -294,14 +298,20 @@ nxt_epoll_test_accept4(nxt_event_engine_t *engine, nxt_conn_io_t *io)
 
 #if (NXT_HAVE_ACCEPT4)
 
+        /*
+         * Probe accept4() availability.  The call is expected to fail
+         * (fd is -1) -- only ENOSYS indicates the syscall is missing
+         * and warrants a fallback to plain accept().  Any other errno
+         * (EBADF on most kernels) means accept4() is supported.
+         */
         (void) accept4(-1, NULL, NULL, SOCK_NONBLOCK);
 
-        if (nxt_errno != NXT_ENOSYS) {
-            handler = nxt_epoll_conn_io_accept4;
-
-        } else {
+        if (nxt_errno == NXT_ENOSYS) {
             nxt_log(&engine->task, NXT_LOG_INFO, "accept4() failed %E",
                     NXT_ENOSYS);
+
+        } else {
+            handler = nxt_epoll_conn_io_accept4;
         }
 
 #endif
@@ -403,6 +413,47 @@ nxt_epoll_close(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
     nxt_epoll_delete(engine, ev);
 
     return ev->changing;
+}
+
+
+/*
+ * Take this event's pending changes out of the batch, so that a struct that
+ * is about to be freed is not dereferenced by nxt_epoll_commit_changes().
+ *
+ * The change is dropped rather than committed: the descriptor is closed, or
+ * is about to be, and close() removes it from the epoll set on its own.
+ * Committing instead would epoll_ctl() a descriptor number that may already
+ * name somebody else's file.
+ */
+
+static void
+nxt_epoll_cancel_changes(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
+{
+    nxt_epoll_change_t  *change, *dst, *end;
+
+    if (!ev->changing) {
+        return;
+    }
+
+    dst = engine->u.epoll.changes;
+    end = dst + engine->u.epoll.nchanges;
+
+    for (change = dst; change < end; change++) {
+
+        if (change->event.data.ptr == ev) {
+            continue;
+        }
+
+        if (dst != change) {
+            *dst = *change;
+        }
+
+        dst++;
+    }
+
+    engine->u.epoll.nchanges = (nxt_uint_t) (dst - engine->u.epoll.changes);
+
+    ev->changing = 0;
 }
 
 
@@ -1025,7 +1076,7 @@ nxt_epoll_conn_io_accept4(nxt_task_t *task, void *obj, void *data)
      * The returned socklen is ignored here,
      * see comment in nxt_conn_io_accept().
      */
-    s = accept4(lev->socket.fd, sa, &socklen, SOCK_NONBLOCK);
+    s = accept4(lev->socket.fd, sa, &socklen, SOCK_NONBLOCK | SOCK_CLOEXEC);
 
     if (s != -1) {
         c->socket.fd = s;

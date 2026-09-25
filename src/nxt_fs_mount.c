@@ -13,10 +13,13 @@
 #if (NXT_HAVE_LINUX_MOUNT)
 
 nxt_int_t
-nxt_fs_mount(nxt_task_t *task, nxt_fs_mount_t *mnt)
+nxt_fs_mount(nxt_task_t *task, nxt_fs_mount_t *mnt, int dst_fd)
 {
     int            rc;
+    u_char         *p;
     const char     *fsname;
+    const char     *target;
+    u_char         fdpath[sizeof("/proc/self/fd/") + NXT_INT_T_LEN];
     unsigned long  flags;
 
     flags = 0;
@@ -62,12 +65,36 @@ nxt_fs_mount(nxt_task_t *task, nxt_fs_mount_t *mnt)
         }
     }
 
-    rc = mount((const char *) mnt->src, (const char *) mnt->dst, fsname, flags,
-               mnt->data);
+    if (dst_fd >= 0) {
+        /*
+         * Mount onto the exact inode the caller validated with
+         * openat2(RESOLVE_BENEATH) by targeting its fd via
+         * /proc/self/fd/<dst_fd>, instead of re-resolving mnt->dst as a
+         * path.  This closes the check-then-use window in which a
+         * component of the destination could be swapped for a symlink
+         * escaping the rootfs between the check and the mount.
+         *
+         * This requires /proc to be mounted and visible in the current
+         * mount namespace, which holds here (the rootfs mounts run before
+         * pivot_root, with the host /proc still in view); if it were not,
+         * mount(2) fails closed with ENOENT on the target.  Pass
+         * "end - 1" to nxt_sprintf so the trailing '\0' is always written
+         * within fdpath even if the formatted value filled the buffer.
+         */
+        p = nxt_sprintf(fdpath, fdpath + sizeof(fdpath) - 1,
+                        "/proc/self/fd/%d", dst_fd);
+        *p = '\0';
+        target = (const char *) fdpath;
+
+    } else {
+        target = (const char *) mnt->dst;
+    }
+
+    rc = mount((const char *) mnt->src, target, fsname, flags, mnt->data);
 
     if (nxt_slow_path(rc < 0)) {
         nxt_alert(task, "mount(\"%s\", \"%s\", \"%s\", %ul, \"%s\") %E",
-                  mnt->src, mnt->dst, fsname, flags, mnt->data, nxt_errno);
+                  mnt->src, target, fsname, flags, mnt->data, nxt_errno);
 
         return NXT_ERROR;
     }
@@ -78,7 +105,7 @@ nxt_fs_mount(nxt_task_t *task, nxt_fs_mount_t *mnt)
 #elif (NXT_HAVE_FREEBSD_NMOUNT)
 
 nxt_int_t
-nxt_fs_mount(nxt_task_t *task, nxt_fs_mount_t *mnt)
+nxt_fs_mount(nxt_task_t *task, nxt_fs_mount_t *mnt, int dst_fd)
 {
     int           flags;
     u_char        *data, *p, *end;

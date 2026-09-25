@@ -1,0 +1,16 @@
+{
+	"applications": {
+		"example_perl": {
+			"type": "perl",
+			"processes": 1,
+			"working_directory": "/usr/share/doc/%%NAME%%/examples/perl-app",
+			"script": "/usr/share/doc/%%NAME%%/examples/perl-app/index.pl"
+		}
+	},
+
+	"listeners": {
+		"*:8600": {
+			"pass": "applications/example_perl"
+		}
+	}
+}

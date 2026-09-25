@@ -1,0 +1,39 @@
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper_util::client::legacy::connect::Connect;
+use hyper_util::client::legacy::Client;
+
+pub struct Configuration<C: Connect>
+where
+    C: Clone + std::marker::Send + Sync + 'static,
+{
+    pub base_path: String,
+    pub user_agent: Option<String>,
+    pub client: Client<C, Full<Bytes>>,
+    pub basic_auth: Option<BasicAuth>,
+    pub oauth_access_token: Option<String>,
+    pub api_key: Option<ApiKey>,
+}
+
+pub type BasicAuth = (String, Option<String>);
+
+pub struct ApiKey {
+    pub prefix: Option<String>,
+    pub key: String,
+}
+
+impl<C: Connect> Configuration<C>
+where
+    C: Clone + std::marker::Send + Sync + 'static,
+{
+    pub fn new(client: Client<C, Full<Bytes>>) -> Configuration<C> {
+        Configuration {
+            base_path: "{{{basePath}}}".to_owned(),
+            user_agent: Some("OpenAPI-Generator/{{{version}}}/rust".to_owned()),
+            client,
+            basic_auth: None,
+            oauth_access_token: None,
+            api_key: None,
+        }
+    }
+}

@@ -80,8 +80,7 @@ Options:
           Print version
 ```
 
-- Consumes alternative configuration formats Like YAML and converts them
-- Can convert output to multiple different formats (YAML, plain JSON, highlighted JSON)
+- Can convert output to multiple different formats (plain JSON, highlighted JSON)
 - Syntactic highlighting of JSON output
 - Interpretation of Unit errors with (arguably more) useful error messages
 
@@ -203,16 +202,9 @@ Unitctl can query the control API to provide the status of the running
 Unit daemon.
 
 ```
-$ unitctl status -t yaml
+$ unitctl status -t json
 No socket path provided - attempting to detect from running instance
-connections:
-  accepted: 0
-  active: 0
-  idle: 0
-  closed: 0
-requests:
-  total: 0
-applications: {}
+{"connections":{"accepted":0,"active":0,"idle":0,"closed":0},"requests":{"total":0},"applications":{}}
 ```
 
 *Note:* This command supports operating on multiple instances of Unit at once.

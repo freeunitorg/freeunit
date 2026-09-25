@@ -100,17 +100,4 @@ void nxt_cdecl nxt_openssl_log_error(nxt_task_t *task, nxt_uint_t level,
 u_char *nxt_openssl_copy_error(u_char *p, u_char *end);
 #endif
 
-#if (NXT_HAVE_GNUTLS)
-extern const nxt_tls_lib_t        nxt_gnutls_lib;
-#endif
-
-#if (NXT_HAVE_CYASSL)
-extern const nxt_tls_lib_t        nxt_cyassl_lib;
-#endif
-
-#if (NXT_HAVE_POLARSSL)
-extern const nxt_tls_lib_t        nxt_polar_lib;
-#endif
-
-
 #endif /* _NXT_TLS_H_INCLUDED_ */

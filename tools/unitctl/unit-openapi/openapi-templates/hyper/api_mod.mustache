@@ -1,0 +1,73 @@
+use bytes::Bytes;
+use hyper;
+use hyper_util;
+use serde_json;
+
+#[derive(Debug)]
+pub enum Error {
+    Api(ApiError),
+    Header(hyper::http::header::InvalidHeaderValue),
+    Http(hyper::http::Error),
+    Hyper(hyper::Error),
+    LegacyClient(hyper_util::client::legacy::Error),
+    Serde(serde_json::Error),
+    UriError(hyper::http::uri::InvalidUri),
+}
+
+#[derive(Debug)]
+pub struct ApiError {
+    pub code: hyper::StatusCode,
+    pub body: Bytes,
+}
+
+impl From<(hyper::StatusCode, Bytes)> for Error {
+    fn from(e: (hyper::StatusCode, Bytes)) -> Self {
+        Error::Api(ApiError {
+            code: e.0,
+            body: e.1,
+        })
+    }
+}
+
+impl From<hyper::http::Error> for Error {
+    fn from(e: hyper::http::Error) -> Self {
+        Error::Http(e)
+    }
+}
+
+impl From<hyper::Error> for Error {
+    fn from(e: hyper::Error) -> Self {
+        Error::Hyper(e)
+    }
+}
+
+impl From<hyper_util::client::legacy::Error> for Error {
+    fn from(e: hyper_util::client::legacy::Error) -> Self {
+        Error::LegacyClient(e)
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(e: serde_json::Error) -> Self {
+        Error::Serde(e)
+    }
+}
+
+mod error;
+mod request;
+
+{{#apiInfo}}
+{{#apis}}
+mod {{{classFilename}}};
+{{#operations}}
+{{#operation}}
+{{#-last}}
+pub use self::{{{classFilename}}}::{ {{{classname}}}, {{{classname}}}Client };
+{{/-last}}
+{{/operation}}
+{{/operations}}
+{{/apis}}
+{{/apiInfo}}
+
+pub mod configuration;
+pub mod client;

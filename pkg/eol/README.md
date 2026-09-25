@@ -28,30 +28,33 @@ Force rebuild: `docker rmi freeunit-eol-check:latest`
 [ OK    ] all dates match
 ```
 
-Exit codes: `0` = clean or warnings only · `1` = errors found · `2` = file/network error
+Exit codes: `0` = clean or warnings only · `1` = errors found (drift, expiry, or a local/data error such as an invalid `eol.json`) · `2` = endoflife.date unreachable (all fetches failed) — a neutral network outage CI can treat as non-fatal
 
-## Current EOL Status (2026-05-20)
+Errors include the **expiry gate**: any runtime or OS entry whose `supported_until` is already in the past (EOL + grace elapsed) is a hard error and must be dropped from `pkg/eol.json`.
 
-All dates verified against endoflife.date API. No errors. Warnings below are proximity alerts only.
+## Current EOL Status (2026-09-08)
+
+All dates verified against endoflife.date API. No errors. Warnings below are proximity/past-EOL alerts only — every entry is still inside its grace window.
+
+Dates are compared per category against the field that carries *standard* support: `support` for Debian (its `eol` became the end of LTS in September 2026), `eol` for everything else.
 
 ### Runtimes — warnings
 
-| Entry | Note |
-|-------|------|
-| go 1.24 | Past EOL (2026-02), in 12-month grace until 2027-02 |
-| node 20 | Past EOL (2026-04), in 12-month grace until 2027-04 |
-| go 1.25, 1.26, node 26 | Upstream EOL not yet set (future) |
+None. All shipped runtimes are within (or ahead of) upstream EOL; `go 1.25`, `node 20` and `perl 5.38` are already flagged `(EOL)` in the matrix.
 
 ### OS — warnings
 
 | Entry | Note |
 |-------|------|
+| debian 11 | Past EOL (2024-08), grace until 2027-08 |
+| fedora 40, 41, 42 | Past EOL (2025-05 / 2025-12 / 2026-05), grace until 2028-05 / 2028-12 / 2029-05 |
+| amazonlinux 2 | Past EOL (2026-06), grace until 2029-06 |
 | alpine 3.20 | Past EOL (2026-04), grace until 2029-04 |
-| debian 10, 11 | Past EOL, grace periods active |
-| fedora 40, 41, 42 | Past EOL, grace periods active |
-| debian 12 | EOL in ~1 month (2026-06) |
-| alpine 3.21 | EOL in ~6 months (2026-11) |
-| ubuntu 22.04 | EOL in ~11 months (2027-04) |
+| debian 12 | Past EOL (2026-07), grace until 2029-07 |
+| fedora 43, 44 | EOL in ~3 / ~9 months |
+| alpine 3.21, 3.22 | EOL in ~2 / ~8 months |
+| centos_stream 9 | EOL in ~8 months (2027-05) |
+| ubuntu 22.04 | EOL in ~9 months (2027-06) |
 
 ## Architecture
 

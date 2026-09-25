@@ -8,7 +8,28 @@
 #include <nxt_unit.h>
 
 
-static VALUE nxt_ruby_stream_io_new(VALUE class, VALUE arg);
+/*
+ * Per-instance binding for rack.input / rack.errors objects.
+ *
+ * The handle stores both the ctx pointer (for the current req lookup)
+ * and a snapshot of rctx->req_seq taken at construction time.  The
+ * stream-IO operations only proceed when:
+ *   - rctx->req != NULL  (a request is currently in flight), AND
+ *   - rctx->req_seq == bind->req_seq  (this handle was issued for the
+ *     same request that is currently in flight).
+ *
+ * Either guard failing means the caller is holding a stale handle —
+ * either captured after the request finished (background thread,
+ * cached IO) or carried across to a later request handled by the
+ * same worker.  In both cases, returning Qnil (reads) or routing the
+ * write through the NULL-context logger is the safest behaviour.
+ */
+typedef struct {
+    nxt_ruby_ctx_t  *rctx;
+    uint64_t        req_seq;
+} nxt_ruby_io_bind_t;
+
+
 static VALUE nxt_ruby_stream_io_initialize(int argc, VALUE *argv, VALUE self);
 static VALUE nxt_ruby_stream_io_gets(VALUE obj);
 static VALUE nxt_ruby_stream_io_each(VALUE obj);
@@ -16,26 +37,57 @@ static VALUE nxt_ruby_stream_io_read(VALUE obj, VALUE args);
 static VALUE nxt_ruby_stream_io_rewind(VALUE obj);
 static VALUE nxt_ruby_stream_io_puts(VALUE obj, VALUE args);
 static VALUE nxt_ruby_stream_io_write(VALUE obj, VALUE args);
-nxt_inline long nxt_ruby_stream_io_s_write(nxt_ruby_ctx_t *rctx, VALUE val);
+nxt_inline long nxt_ruby_stream_io_s_write(nxt_ruby_io_bind_t *bind, VALUE val);
 static VALUE nxt_ruby_stream_io_flush(VALUE obj);
 static VALUE nxt_ruby_stream_io_close(VALUE obj);
-nxt_inline size_t nxt_ruby_dt_dsize_rctx(const void *arg);
+nxt_inline size_t nxt_ruby_dt_dsize_bind(const void *arg);
+nxt_inline void nxt_ruby_dt_dfree_bind(void *arg);
+nxt_inline nxt_unit_request_info_t *nxt_ruby_bind_req(nxt_ruby_io_bind_t *bind);
 
 
 static const rb_data_type_t  nxt_rctx_dt = {
-    .wrap_struct_name  = "rctx",
+    .wrap_struct_name  = "nxt_ruby_io_bind",
     .function  = {
-        .dsize         = nxt_ruby_dt_dsize_rctx,
+        .dsize         = nxt_ruby_dt_dsize_bind,
+        .dfree         = nxt_ruby_dt_dfree_bind,
     },
 };
 
 
 nxt_inline size_t
-nxt_ruby_dt_dsize_rctx(const void *arg)
+nxt_ruby_dt_dsize_bind(const void *arg)
 {
-    const nxt_ruby_ctx_t  *rctx = arg;
+    (void) arg;
+    return sizeof(nxt_ruby_io_bind_t);
+}
 
-    return sizeof(*rctx);
+
+nxt_inline void
+nxt_ruby_dt_dfree_bind(void *arg)
+{
+    nxt_free(arg);
+}
+
+
+/*
+ * Returns the in-flight request if this handle is still valid, or
+ * NULL if it was captured outside its originating request (stale
+ * across-request reuse or after-request access).
+ */
+nxt_inline nxt_unit_request_info_t *
+nxt_ruby_bind_req(nxt_ruby_io_bind_t *bind)
+{
+    if (bind == NULL || bind->rctx == NULL) {
+        return NULL;
+    }
+
+    if (bind->rctx->req == NULL
+        || bind->rctx->req_seq != bind->req_seq)
+    {
+        return NULL;
+    }
+
+    return bind->rctx->req;
 }
 
 
@@ -48,9 +100,6 @@ nxt_ruby_stream_io_input_init(void)
 
     rb_undef_alloc_func(stream_io);
 
-    rb_gc_register_address(&stream_io);
-
-    rb_define_singleton_method(stream_io, "new", nxt_ruby_stream_io_new, 1);
     rb_define_method(stream_io, "initialize",
                      nxt_ruby_stream_io_initialize, -1);
     rb_define_method(stream_io, "gets", nxt_ruby_stream_io_gets, 0);
@@ -72,9 +121,6 @@ nxt_ruby_stream_io_error_init(void)
 
     rb_undef_alloc_func(stream_io);
 
-    rb_gc_register_address(&stream_io);
-
-    rb_define_singleton_method(stream_io, "new", nxt_ruby_stream_io_new, 1);
     rb_define_method(stream_io, "initialize",
                      nxt_ruby_stream_io_initialize, -1);
     rb_define_method(stream_io, "puts", nxt_ruby_stream_io_puts, -2);
@@ -86,16 +132,39 @@ nxt_ruby_stream_io_error_init(void)
 }
 
 
-static VALUE
-nxt_ruby_stream_io_new(VALUE class, VALUE arg)
+nxt_inline VALUE
+nxt_ruby_stream_io_alloc(VALUE class, nxt_ruby_ctx_t *rctx)
 {
-    VALUE  self;
+    VALUE               self;
+    nxt_ruby_io_bind_t  *bind;
 
-    self = TypedData_Wrap_Struct(class, &nxt_rctx_dt, (void *)(uintptr_t)arg);
+    bind = nxt_zalloc(sizeof(nxt_ruby_io_bind_t));
+    if (nxt_slow_path(bind == NULL)) {
+        return Qnil;
+    }
+
+    bind->rctx = rctx;
+    bind->req_seq = rctx->req_seq;
+
+    self = TypedData_Wrap_Struct(class, &nxt_rctx_dt, bind);
 
     rb_obj_call_init(self, 0, NULL);
 
     return self;
+}
+
+
+VALUE
+nxt_ruby_stream_io_input_new(VALUE class, nxt_ruby_ctx_t *rctx)
+{
+    return nxt_ruby_stream_io_alloc(class, rctx);
+}
+
+
+VALUE
+nxt_ruby_stream_io_error_new(VALUE class, nxt_ruby_ctx_t *rctx)
+{
+    return nxt_ruby_stream_io_alloc(class, rctx);
 }
 
 
@@ -111,11 +180,20 @@ nxt_ruby_stream_io_gets(VALUE obj)
 {
     VALUE                    buf;
     ssize_t                  res;
-    nxt_ruby_ctx_t           *rctx;
+    nxt_ruby_io_bind_t       *bind;
     nxt_unit_request_info_t  *req;
 
-    TypedData_Get_Struct(obj, nxt_ruby_ctx_t, &nxt_rctx_dt, rctx);
-    req = rctx->req;
+    TypedData_Get_Struct(obj, nxt_ruby_io_bind_t, &nxt_rctx_dt, bind);
+
+    /*
+     * Reject calls on a stale handle (captured during a finished
+     * request, or carried across into a later request handled by
+     * the same worker context).  See nxt_ruby_bind_req().
+     */
+    req = nxt_ruby_bind_req(bind);
+    if (req == NULL) {
+        return Qnil;
+    }
 
     if (req->content_length == 0) {
         return Qnil;
@@ -166,13 +244,21 @@ nxt_ruby_stream_io_each(VALUE obj)
 static VALUE
 nxt_ruby_stream_io_read(VALUE obj, VALUE args)
 {
-    VALUE           buf;
-    long            copy_size, u_size;
-    nxt_ruby_ctx_t  *rctx;
+    VALUE                    buf;
+    long                     copy_size, u_size;
+    nxt_ruby_io_bind_t       *bind;
+    nxt_unit_request_info_t  *req;
 
-    TypedData_Get_Struct(obj, nxt_ruby_ctx_t, &nxt_rctx_dt, rctx);
+    TypedData_Get_Struct(obj, nxt_ruby_io_bind_t, &nxt_rctx_dt, bind);
 
-    copy_size = rctx->req->content_length;
+    /* See nxt_ruby_bind_req() — rejects stale handles captured
+     * across the request boundary or reused under a later request. */
+    req = nxt_ruby_bind_req(bind);
+    if (req == NULL) {
+        return Qnil;
+    }
+
+    copy_size = req->content_length;
 
     if (RARRAY_LEN(args) > 0 && TYPE(RARRAY_PTR(args)[0]) == T_FIXNUM) {
         u_size = NUM2LONG(RARRAY_PTR(args)[0]);
@@ -196,7 +282,7 @@ nxt_ruby_stream_io_read(VALUE obj, VALUE args)
         return Qnil;
     }
 
-    copy_size = nxt_unit_request_read(rctx->req, RSTRING_PTR(buf), copy_size);
+    copy_size = nxt_unit_request_read(req, RSTRING_PTR(buf), copy_size);
 
     if (RARRAY_LEN(args) > 1 && TYPE(RARRAY_PTR(args)[1]) == T_STRING) {
 
@@ -220,15 +306,15 @@ nxt_ruby_stream_io_rewind(VALUE obj)
 static VALUE
 nxt_ruby_stream_io_puts(VALUE obj, VALUE args)
 {
-    nxt_ruby_ctx_t  *rctx;
+    nxt_ruby_io_bind_t  *bind;
 
     if (RARRAY_LEN(args) != 1) {
         return Qnil;
     }
 
-    TypedData_Get_Struct(obj, nxt_ruby_ctx_t, &nxt_rctx_dt, rctx);
+    TypedData_Get_Struct(obj, nxt_ruby_io_bind_t, &nxt_rctx_dt, bind);
 
-    nxt_ruby_stream_io_s_write(rctx, RARRAY_PTR(args)[0]);
+    nxt_ruby_stream_io_s_write(bind, RARRAY_PTR(args)[0]);
 
     return Qnil;
 }
@@ -237,24 +323,26 @@ nxt_ruby_stream_io_puts(VALUE obj, VALUE args)
 static VALUE
 nxt_ruby_stream_io_write(VALUE obj, VALUE args)
 {
-    long            len;
-    nxt_ruby_ctx_t  *rctx;
+    long                len;
+    nxt_ruby_io_bind_t  *bind;
 
     if (RARRAY_LEN(args) != 1) {
         return Qnil;
     }
 
-    TypedData_Get_Struct(obj, nxt_ruby_ctx_t, &nxt_rctx_dt, rctx);
+    TypedData_Get_Struct(obj, nxt_ruby_io_bind_t, &nxt_rctx_dt, bind);
 
-    len = nxt_ruby_stream_io_s_write(rctx, RARRAY_PTR(args)[0]);
+    len = nxt_ruby_stream_io_s_write(bind, RARRAY_PTR(args)[0]);
 
     return LONG2FIX(len);
 }
 
 
 nxt_inline long
-nxt_ruby_stream_io_s_write(nxt_ruby_ctx_t *rctx, VALUE val)
+nxt_ruby_stream_io_s_write(nxt_ruby_io_bind_t *bind, VALUE val)
 {
+    nxt_unit_request_info_t  *req;
+
     if (nxt_slow_path(val == Qnil)) {
         return 0;
     }
@@ -267,7 +355,23 @@ nxt_ruby_stream_io_s_write(nxt_ruby_ctx_t *rctx, VALUE val)
         }
     }
 
-    nxt_unit_req_error(rctx->req, "Ruby: %s", RSTRING_PTR(val));
+    /*
+     * Apps legitimately write to rack.errors during at_exit hooks
+     * (running after the request handler returned and rctx->req was
+     * cleared at nxt_ruby.c:657) and may also retain rack.errors past
+     * the originating request.  In both cases nxt_ruby_bind_req()
+     * returns NULL — route those messages through the NULL-context
+     * logger at ERR level so they still land in the unit log but do
+     * NOT get attributed to a later, unrelated request.  ERR (not
+     * ALERT) avoids tripping the test suite's alert detector.
+     */
+    req = nxt_ruby_bind_req(bind);
+    if (req == NULL) {
+        nxt_unit_log(NULL, NXT_UNIT_LOG_ERR, "Ruby: %s", RSTRING_PTR(val));
+        return RSTRING_LEN(val);
+    }
+
+    nxt_unit_req_error(req, "Ruby: %s", RSTRING_PTR(val));
 
     return RSTRING_LEN(val);
 }

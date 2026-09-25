@@ -14,6 +14,60 @@ typedef struct {
 } nxt_http_header_val_t;
 
 
+/*
+ * Whether the matched action replaces or removes one of the validators the
+ * static handler generates.
+ *
+ * A conditional request has to be judged against the validator the client was
+ * actually given.  When "response_headers" sets ETag or Last-Modified, the
+ * value Unit derives from the file is not what went out, so comparing against
+ * it answers the wrong question -- it refuses an If-Match carrying the tag the
+ * server itself advertised.  The static handler asks this and declines to
+ * evaluate preconditions at all in that case, which loses the 304 but is never
+ * wrong.
+ *
+ * Only the name matters here.  The value may be a template resolved per
+ * request, and resolving it this early would move tstr queries ahead of where
+ * nxt_http_set_headers() runs them.
+ */
+
+nxt_bool_t
+nxt_http_set_headers_override_validators(nxt_http_request_t *r)
+{
+    nxt_uint_t             i, n;
+    nxt_http_action_t      *action;
+    nxt_http_header_val_t  *header;
+
+    action = r->action;
+
+    if (action == NULL || action->set_headers == NULL) {
+        return 0;
+    }
+
+    header = action->set_headers->elts;
+    n = action->set_headers->nelts;
+
+    for (i = 0; i < n; i++) {
+        if (header[i].name.length == nxt_length("ETag")
+            && nxt_strncasecmp(header[i].name.start, (u_char *) "ETag",
+                               nxt_length("ETag")) == 0)
+        {
+            return 1;
+        }
+
+        if (header[i].name.length == nxt_length("Last-Modified")
+            && nxt_strncasecmp(header[i].name.start,
+                               (u_char *) "Last-Modified",
+                               nxt_length("Last-Modified")) == 0)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
 nxt_int_t
 nxt_http_set_headers_init(nxt_router_conf_t *rtcf, nxt_http_action_t *action,
      nxt_http_action_conf_t *acf)
@@ -68,12 +122,45 @@ nxt_http_set_headers_init(nxt_router_conf_t *rtcf, nxt_http_action_t *action,
 }
 
 
+/*
+ * Reject values that would inject a header boundary into the response.
+ * Templated values (e.g. $uri, $arg_*) can carry CR/LF/NUL bytes if the
+ * client encodes them in the request, and writing those bytes verbatim
+ * into the wire serialiser yields HTTP response splitting.  Static
+ * config values are operator-controlled and trusted, but the check is
+ * cheap enough to apply to both paths.
+ *
+ * Per the RFC 9110 field-value grammar, all control bytes other than
+ * HTAB are rejected, including DEL (0x7F); lenient downstream proxies
+ * may otherwise reinterpret them.  HTAB and high (0x80+) bytes are
+ * left alone.
+ */
+static nxt_bool_t
+nxt_http_header_value_is_safe(const nxt_str_t *v)
+{
+    u_char  c;
+    size_t  i;
+
+    for (i = 0; i < v->length; i++) {
+        c = v->start[i];
+
+        if ((c < 0x20 && c != '\t') || c == 0x7F) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
 static nxt_http_field_t *
 nxt_http_resp_header_find(nxt_http_request_t *r, u_char *name, size_t length)
 {
     nxt_http_field_t  *f;
 
-    nxt_list_each(f, r->resp.fields) {
+    nxt_http_fields_each(f, r->resp.inline_fields, r->resp.num_inline_fields,
+                         r->resp.fields)
+    {
 
         if (f->skip) {
             continue;
@@ -85,7 +172,7 @@ nxt_http_resp_header_find(nxt_http_request_t *r, u_char *name, size_t length)
             return f;
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     return NULL;
 }
@@ -94,6 +181,7 @@ nxt_http_resp_header_find(nxt_http_request_t *r, u_char *name, size_t length)
 nxt_int_t
 nxt_http_set_headers(nxt_http_request_t *r)
 {
+    u_char                 *rejected;
     nxt_int_t              ret;
     nxt_uint_t             i, n;
     nxt_str_t              *value;
@@ -122,6 +210,11 @@ nxt_http_set_headers(nxt_http_request_t *r)
         return NXT_ERROR;
     }
 
+    rejected = nxt_mp_zalloc(r->mem_pool, n);
+    if (nxt_slow_path(rejected == NULL)) {
+        return NXT_ERROR;
+    }
+
     for (i = 0; i < n; i++) {
         hv = &header[i];
 
@@ -144,9 +237,32 @@ nxt_http_set_headers(nxt_http_request_t *r)
                 return NXT_ERROR;
             }
         }
+
+        if (value[i].start != NULL
+            && nxt_slow_path(!nxt_http_header_value_is_safe(&value[i])))
+        {
+            nxt_log(&r->task, NXT_LOG_INFO,
+                    "set_headers \"%V\": dropping value containing control "
+                    "bytes (HTTP response-splitting protection)",
+                    &hv->name);
+
+            /*
+             * Mark the entry as rejected instead of clearing the value:
+             * a NULL value means "delete this header", and letting an
+             * attacker-triggered rejection remove an existing response
+             * header (e.g. an app-emitted X-Frame-Options) would fail
+             * open.  Rejected entries are skipped entirely below, so a
+             * pre-existing same-named header survives untouched.
+             */
+            rejected[i] = 1;
+        }
     }
 
     for (i = 0; i < n; i++) {
+        if (rejected[i]) {
+            continue;
+        }
+
         hv = &header[i];
 
         f = nxt_http_resp_header_find(r, hv->name.start, hv->name.length);
@@ -154,7 +270,7 @@ nxt_http_set_headers(nxt_http_request_t *r)
         if (value[i].start != NULL) {
 
             if (f == NULL) {
-                f = nxt_list_zero_add(r->resp.fields);
+                f = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
                 if (nxt_slow_path(f == NULL)) {
                     return NXT_ERROR;
                 }

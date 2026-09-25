@@ -28,6 +28,9 @@ LLVMFuzzerInitialize(int *argc, char ***argv)
         return NXT_ERROR;
     }
 
+    /* Keep a fuzzing run quiet: nothing below alert is worth printing. */
+    nxt_main_log.level = NXT_LOG_ALERT;
+
     ret = nxt_http_fields_hash(&nxt_h1p_fields_hash,
                                nxt_h1p_fields, nxt_nitems(nxt_h1p_fields));
     if (ret != NXT_OK) {
@@ -76,6 +79,13 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         goto failed;
     }
 
+    /*
+     * A field handler may log, and nxt_log() dereferences task->log.  The
+     * request is zeroed memory here, so without this any handler that logs
+     * is a null dereference in the harness rather than a finding.
+     */
+    req->task.log = &nxt_main_log;
+
     buf.start = (u_char *)data;
     buf.end = (u_char *)data + size;
     buf.pos = buf.start;
@@ -96,7 +106,8 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         goto failed;
     }
 
-    nxt_http_fields_process(rp.fields, &nxt_h1p_fields_hash, req);
+    nxt_http_fields_process(rp.inline_fields, rp.num_inline_fields, rp.fields,
+                            &nxt_h1p_fields_hash, req);
 
 failed:
 

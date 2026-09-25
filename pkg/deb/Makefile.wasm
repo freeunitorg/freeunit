@@ -1,7 +1,7 @@
 MODULES+=		wasm
 MODULE_SUFFIX_wasm=	wasm
 
-MODULE_SUMMARY_wasm=	WASM module for FreeUnit
+MODULE_SUMMARY_wasm=	WASM module for $(BRAND_TITLE)
 
 MODULE_VERSION_wasm=	$(VERSION)
 MODULE_RELEASE_wasm=	1
@@ -33,8 +33,8 @@ endef
 export MODULE_PREINSTALL_wasm
 
 define MODULE_POSTINSTALL_wasm
-	mkdir -p debian/unit-wasm/usr/lib/\$$(dpkg-architecture -q DEB_HOST_MULTIARCH)/
-	install -m 755 -p pkg/contrib/wasmtime/artifacts/lib/libwasmtime.so debian/unit-wasm/usr/lib/\$$(dpkg-architecture -q DEB_HOST_MULTIARCH)/
+	mkdir -p debian/$(BRAND)-wasm/usr/lib/\$$(dpkg-architecture -q DEB_HOST_MULTIARCH)/
+	install -m 755 -p pkg/contrib/wasmtime/artifacts/lib/libwasmtime.so debian/$(BRAND)-wasm/usr/lib/\$$(dpkg-architecture -q DEB_HOST_MULTIARCH)/
 endef
 export MODULE_POSTINSTALL_wasm
 endif
@@ -45,7 +45,7 @@ cat <<BANNER
 
 The $(MODULE_SUMMARY_wasm) has been installed.
 
-Online documentation is available at https://docs.freeunit.org
+Online documentation is available at $(DOCS_URL)
 
 ----------------------------------------------------------------------
 BANNER

@@ -35,6 +35,13 @@ typedef enum {
     NXT_TSTR_STRZ       = 1 << 0,
     NXT_TSTR_LOGGING    = 1 << 1,
     NXT_TSTR_NEWLINE    = 1 << 2,
+    /*
+     * Escape what a variable expands to, leaving the template around it as
+     * the operator wrote it.  The access log's string format sets this: its
+     * values come from the client, and a raw newline in one of them ends the
+     * record and starts a line the client chose.
+     */
+    NXT_TSTR_ESCAPE     = 1 << 3,
 } nxt_tstr_flags_t;
 
 
@@ -72,6 +79,11 @@ nxt_inline nxt_bool_t
 nxt_is_tstr(nxt_str_t *str)
 {
     u_char  *p;
+
+    /* memchr() declares its pointer non-null; an empty string has none. */
+    if (str->length == 0) {
+        return 0;
+    }
 
     p = memchr(str->start, '`', str->length);
     if (p != NULL) {

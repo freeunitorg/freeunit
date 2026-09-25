@@ -200,6 +200,40 @@ def test_return_location_edit():
     ), 'location with empty variable'
 
 
+def test_return_location_crlf_injection():
+    # A Location value carrying CR/LF must be percent-encoded on output, not
+    # emitted verbatim -- otherwise it splits the response header block.
+    # Existing coverage encodes control bytes generically but never asserts
+    # the anti-injection invariant, and the templated path is unchecked.
+
+    # Static value with a raw CR/LF.
+    assert 'success' in client.conf(
+        {"return": 301, "location": "/r\r\nEvil: injected"},
+        'routes/0/action',
+    ), 'configure static location'
+
+    resp = client.get()
+    assert resp['status'] == 301
+    assert 'Evil' not in resp['headers'], 'static location header injection'
+    loc = resp['headers']['Location']
+    assert '\r' not in loc and '\n' not in loc, 'static CRLF not emitted raw'
+    assert '%0d%0a' in loc.lower(), 'static CRLF percent-encoded'
+
+    # Templated value expanded from an untrusted request argument.
+    assert 'success' in client.conf(
+        '"$arg_to"', 'routes/0/action/location'
+    ), 'configure templated location'
+
+    assert client.get(url='/?to=/next')['headers']['Location'] == '/next'
+
+    resp = client.get(url='/?to=/r%0d%0aEvil:%20injected')
+    assert resp['status'] == 301
+    assert 'Evil' not in resp['headers'], 'templated location header injection'
+    loc = resp['headers']['Location']
+    assert '\r' not in loc and '\n' not in loc, 'templated CRLF not emitted raw'
+    assert '%0d%0a' in loc.lower(), 'templated CRLF percent-encoded'
+
+
 def test_return_invalid():
     def check_error(conf):
         assert 'error' in client.conf(conf, 'routes/0/action')

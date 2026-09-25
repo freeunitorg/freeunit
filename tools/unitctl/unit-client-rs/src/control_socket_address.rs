@@ -2,7 +2,7 @@ use crate::control_socket_address::ControlSocket::{TcpSocket, UnixLocalAbstractS
 use crate::control_socket_address::ControlSocketScheme::{HTTP, HTTPS};
 use crate::unit_client::UnitClientError;
 use hyper::http::uri::{Authority, PathAndQuery};
-use hyper::Uri;
+use hyper::http::Uri;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::os::unix::fs::FileTypeExt;
@@ -106,7 +106,7 @@ impl TryFrom<Uri> for ControlSocket {
                 let path = String::from_utf8_lossy(&bytes);
                 ControlSocket::parse_address(path)
             }
-            Some("http") | Some("https") => Ok(TcpSocket(socket_uri)),
+            Some("http") | Some("https") => ControlSocket::tcp_socket(socket_uri),
             Some(unknown) => Err(UnitClientError::TcpSocketAddressParseError {
                 message: format!("Unsupported scheme found in socket address: {}", unknown).to_string(),
                 control_socket_address: socket_uri.to_string(),
@@ -120,6 +120,26 @@ impl TryFrom<Uri> for ControlSocket {
 }
 
 impl ControlSocket {
+    /// Builds a TCP control socket from an already parsed URI.
+    #[cfg(feature = "tls")]
+    fn tcp_socket(uri: Uri) -> Result<Self, UnitClientError> {
+        Ok(TcpSocket(uri))
+    }
+
+    /// Without the "tls" feature there is no HTTPS connector, so refuse the
+    /// address here.  A plain HTTP connector would otherwise be handed an
+    /// "https://" URI and fail later with an unrelated message.
+    #[cfg(not(feature = "tls"))]
+    fn tcp_socket(uri: Uri) -> Result<Self, UnitClientError> {
+        if uri.scheme_str() == Some("https") {
+            return Err(UnitClientError::TcpSocketAddressParseError {
+                message: "https needs the \"tls\" feature, which this build does not have".to_string(),
+                control_socket_address: uri.to_string(),
+            });
+        }
+        Ok(TcpSocket(uri))
+    }
+
     pub fn socket_scheme(&self) -> ControlSocketScheme {
         match self {
             UnixLocalAbstractSocket(_) => ControlSocketScheme::HTTP,
@@ -242,7 +262,9 @@ impl ControlSocket {
         let normalized_uri = Uri::builder()
             .scheme(parsed_uri.scheme_str().expect("Scheme should not be None"))
             .authority(normalized_authority)
-            .path_and_query(PathAndQuery::from_static(""))
+            // http 1.4.1+ rejects PathAndQuery::from_static("") ("static str is
+            // not valid path"); "/" yields the same normalized "host:port/" URI.
+            .path_and_query(PathAndQuery::from_static("/"))
             .build()
             .map_err(|error| UnitClientError::TcpSocketAddressParseError {
                 message: error.to_string(),
@@ -300,7 +322,7 @@ impl ControlSocket {
         }
 
         let uri = Self::normalize_and_parse_http_address(buf)?;
-        Ok(TcpSocket(uri))
+        Self::tcp_socket(uri)
     }
 
     pub fn is_local_socket(&self) -> bool {
@@ -313,13 +335,12 @@ impl ControlSocket {
 
 #[cfg(test)]
 mod tests {
-    use rand::distributions::{Alphanumeric, DistString};
+    use super::*;
+    use rand::distr::{Alphanumeric, SampleString};
     use std::env::temp_dir;
     use std::fmt::Display;
     use std::io;
     use std::os::unix::net::UnixListener;
-
-    use super::*;
 
     struct TempSocket {
         socket_path: PathBuf,
@@ -457,6 +478,12 @@ mod tests {
             "[0000:0000:0000:0000:0000:0000:0000:0000]:8080",
         ];
         for socket_address in valid_socket_addresses {
+            // A build without the "tls" feature refuses https; see
+            // refuses_https_without_the_tls_feature below.
+            if cfg!(not(feature = "tls")) && socket_address.starts_with("https://") {
+                continue;
+            }
+
             let mut expected = if socket_address.starts_with("http") {
                 socket_address.to_string().trim_end_matches('/').to_string()
             } else {
@@ -505,6 +532,24 @@ mod tests {
         assert_eq!(normalized, expected);
     }
 
+    #[cfg(feature = "tls")]
+    #[test]
+    fn accepts_https_with_the_tls_feature() {
+        let control_socket = ControlSocket::try_from("https://localhost:8443").expect("https should be accepted");
+        assert_eq!(control_socket.to_string(), "https://localhost:8443/");
+    }
+
+    #[cfg(not(feature = "tls"))]
+    #[test]
+    fn refuses_https_without_the_tls_feature() {
+        let error = ControlSocket::try_from("https://localhost:8443").expect_err("https should be refused");
+        assert_eq!(
+            error.to_string(),
+            "Invalid TCP socket address [control_socket_address=https://localhost:8443/]: \
+             https needs the \"tls\" feature, which this build does not have"
+        );
+    }
+
     #[test]
     fn can_parse_http_addresses() {
         let valid_socket_addresses = vec![
@@ -545,7 +590,7 @@ mod tests {
     }
 
     fn create_file_socket() -> Result<TempSocket, io::Error> {
-        let random = Alphanumeric.sample_string(&mut rand::thread_rng(), 10);
+        let random = Alphanumeric.sample_string(&mut rand::rng(), 10);
         let socket_name = format!("unit-client-socket-test-{}.sock", random);
         let socket_path = temp_dir().join(socket_name);
         let listener = UnixListener::bind(&socket_path)?;
@@ -557,7 +602,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn create_abstract_socket() -> Result<TempSocket, io::Error> {
-        let random = Alphanumeric.sample_string(&mut rand::thread_rng(), 10);
+        let random = Alphanumeric.sample_string(&mut rand::rng(), 10);
         let socket_name = format!("@unit-client-socket-test-{}.sock", random);
         let socket_path = PathBuf::from(socket_name);
         let listener = UnixListener::bind(&socket_path)?;

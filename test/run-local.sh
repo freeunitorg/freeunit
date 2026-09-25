@@ -122,8 +122,14 @@ prepare_tmp() {
 
 cleanup_tmp() {
     if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
-        info "Tmp dir left at $TMP_DIR (cleanup disabled)"
-        # rm -rf "$TMP_DIR"
+        info "Removing tmp dir $TMP_DIR"
+        # The test container runs as root (--privileged, isolation tests need
+        # namespaces/cgroups), so build artifacts under $TMP_DIR are root-owned
+        # and a host non-root `rm` would fail. Delete via a throwaway root
+        # container instead; --user cannot be used on the test run itself.
+        docker run --rm -v "$(dirname "$TMP_DIR"):/t" alpine \
+            rm -rf "/t/$(basename "$TMP_DIR")" 2>/dev/null \
+            || info "Tmp dir left at $TMP_DIR (manual rm needed)"
     fi
 }
 trap cleanup_tmp EXIT
@@ -246,6 +252,8 @@ ENTRYPOINT ["bash", "-c", "\
     fi && \
     cargo build --release --manifest-path test/fake_upstream/Cargo.toml && \
     cp test/fake_upstream/target/release/fake_upstream /usr/local/bin/fake_upstream && \
+    cargo build --release --manifest-path test/fake_otlp/Cargo.toml && \
+    cp test/fake_otlp/target/release/fake_otlp /usr/local/bin/fake_otlp && \
     exec pytest-3 --print-log $@ \
 ", "bash"]
 

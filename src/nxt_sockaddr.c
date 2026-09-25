@@ -618,6 +618,19 @@ nxt_sockaddr_unix_parse(nxt_mp_t *mp, nxt_str_t *addr)
                              "abstract unix domain sockets are not supported");
         return NULL;
 #endif
+
+    } else if (memchr(path, '\0', length) != NULL) {
+        /*
+         * A pathname socket's sun_path is used as a NUL-terminated C string
+         * (bind(2), unlink(2), file-name ops).  An embedded NUL in the
+         * length-tracked config value would truncate it and bind/unlink a
+         * different path than was validated.  Abstract sockets (handled
+         * above) legitimately carry NULs, so this check is pathname-only.
+         */
+        nxt_thread_log_error(NXT_LOG_ERR,
+                             "unix domain socket \"%V\" name contains "
+                             "null character", addr);
+        return NULL;
     }
 
     sa = nxt_sockaddr_alloc(mp, socklen, addr->length);

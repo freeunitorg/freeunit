@@ -257,14 +257,16 @@ nxt_http_proxy_header_read(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "http proxy status: %d", peer->status);
 
-    nxt_list_each(field, peer->fields) {
+    nxt_http_fields_each(field, peer->inline_fields, peer->num_inline_fields,
+                         peer->fields)
+    {
 
         nxt_debug(task, "http proxy header: \"%*s: %*s\"",
                   (size_t) field->name_length, field->name,
                   (size_t) field->value_length, field->value);
 
         if (!field->skip) {
-            f = nxt_list_add(r->resp.fields);
+            f = nxt_http_resp_field_add(&r->resp, r->mem_pool);
             if (nxt_slow_path(f == NULL)) {
                 nxt_http_proxy_error(task, r, peer);
                 return;
@@ -273,7 +275,7 @@ nxt_http_proxy_header_read(nxt_task_t *task, void *obj, void *data)
             *f = *field;
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     r->state = &nxt_http_proxy_read_state;
 
@@ -373,6 +375,84 @@ nxt_http_proxy_buf_mem_free(nxt_task_t *task, nxt_http_request_t *r,
 
 
 static void
+nxt_http_proxy_buf_mem_cleanup(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_buf_t           *b;
+    nxt_event_engine_t  *engine;
+
+    b = obj;
+    engine = data;
+
+    /*
+     * The engine is carried in "data": nxt_mp_destroy() has none to hand.
+     * "task" is passed only so the pointer nxt_mp_cleanup() stores stays
+     * inside the pool being destroyed -- do not dereference it here.
+     */
+
+    nxt_event_engine_buf_mem_free(engine, b);
+}
+
+
+/*
+ * Keep an upstream read buffer alive for the rest of the request without
+ * holding the request pool hostage.
+ *
+ * A buffer that is relayed downstream needs none of this: its completion
+ * handler frees it and drops the retain.  One that is *not* relayed does --
+ * an upstream header block with no body bytes behind it, and the header of a
+ * response that RFC 9112 Sect. 6.3 gives no body at all.  Two things then have
+ * to hold at once:
+ *
+ *   - It must outlive the response.  peer->fields point their name/value into
+ *     this buffer (nxt_http_parse_fields) and nxt_http_proxy_header_read()
+ *     shallow-copies those field structs into r->resp, where
+ *     $response_header_* and "match" conditions read them until the request is
+ *     logged and closed.  Returning it to the engine cache when the response
+ *     completes would leave them pointing at reusable memory.
+ *
+ *   - It must not keep the retain nxt_http_proxy_buf_mem_alloc() took.  That
+ *     retain is dropped by a buffer completion, and a buffer that is never
+ *     relayed has no completion to run -- the pool would never reach zero and
+ *     the entire request pool would be stranded.
+ *
+ * A pool cleanup satisfies both: nxt_mp_destroy() runs it before freeing the
+ * pool's own blocks, so the field bytes stay valid for exactly as long as
+ * anything can read them, and not one request longer.
+ */
+
+nxt_int_t
+nxt_http_proxy_buf_mem_hold(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_buf_t *b)
+{
+    nxt_int_t  ret;
+
+    /*
+     * &r->task, not "task": nxt_mp_cleanup() stores the task pointer in the
+     * work item and hands it back at destroy time, and the peer connection's
+     * task is freed with that connection well before the request pool.
+     * &r->task lives in the pool being destroyed, which nxt_mp_destroy() runs
+     * its cleanups before freeing.
+     */
+
+    ret = nxt_mp_cleanup(r->mem_pool, nxt_http_proxy_buf_mem_cleanup, &r->task,
+                         b, task->thread->engine);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return NXT_ERROR;
+    }
+
+    /*
+     * The request itself holds a retain until nxt_http_request_close_handler(),
+     * so this cannot destroy the pool here -- which it must not, the cleanup
+     * just registered lives in it.
+     */
+
+    nxt_mp_release(r->mem_pool);
+
+    return NXT_OK;
+}
+
+
+static void
 nxt_http_proxy_error(nxt_task_t *task, void *obj, void *data)
 {
     nxt_http_peer_t     *peer;
@@ -412,12 +492,52 @@ nxt_http_proxy_content_length(void *ctx, nxt_http_field_t *field,
 
     r = ctx;
 
+    /*
+     * A second Content-Length header from the upstream is a classic
+     * response-smuggling primitive: the two values disagree on where the
+     * body ends, and silently overwriting the first with the second lets
+     * a malicious/compromised upstream desync the proxy from the client.
+     *
+     * Mark the response inconsistent (disables keepalive and closes the
+     * connection after this response, same as the parse-error path below)
+     * and do not trust either value: skip both Content-Length fields so
+     * neither is forwarded to the client, and reset content_length_n to -1
+     * so the body is framed by read-to-EOF rather than by an ambiguous
+     * advertised length.  Forwarding both headers would let a downstream
+     * parser that honours the other value re-frame the body.
+     */
+    if (r->resp.content_length != NULL) {
+        nxt_log(&r->task, NXT_LOG_WARN,
+                "upstream sent duplicate Content-Length");
+
+        r->inconsistent = 1;
+        r->resp.content_length->skip = 1;
+        field->skip = 1;
+        r->resp.content_length_n = -1;
+
+        return NXT_OK;
+    }
+
     r->resp.content_length = field;
 
     n = nxt_off_t_parse(field->value, field->value_length);
 
     if (nxt_fast_path(n >= 0)) {
         r->resp.content_length_n = n;
+
+    } else {
+        /*
+         * n == -2 means the upstream Content-Length value overflows
+         * nxt_off_t; n == -1 is a generic parse error.  Both are
+         * inconsistent with a usable response body length, so log and
+         * mark the response inconsistent rather than silently leaving
+         * content_length_n at -1.
+         */
+        nxt_log(&r->task, NXT_LOG_WARN,
+                "upstream Content-Length \"%*s\" is invalid",
+                (size_t) field->value_length, field->value);
+
+        r->inconsistent = 1;
     }
 
     return NXT_OK;

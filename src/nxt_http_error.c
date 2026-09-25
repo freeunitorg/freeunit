@@ -41,12 +41,21 @@ nxt_http_request_error(nxt_task_t *task, nxt_http_request_t *r,
 
     r->status = status;
 
-    r->resp.fields = nxt_list_create(r->mem_pool, 8, sizeof(nxt_http_field_t));
-    if (nxt_slow_path(r->resp.fields == NULL)) {
-        goto fail;
-    }
+    /*
+     * Discard any response fields already collected (e.g. app-supplied
+     * headers) before building the error response.  With inline_fields the
+     * field store is not a re-created list, so reset it explicitly; otherwise
+     * nxt_http_resp_field_zero_add() below would append the error's
+     * Content-Type after stale fields, emitting a conflicting Content-Length.
+     */
+    r->resp.num_inline_fields = 0;
+    r->resp.fields = NULL;
+    r->resp.date = NULL;
+    r->resp.content_type = NULL;
+    r->resp.content_length = NULL;
+    r->resp.mime_type = NULL;
 
-    content_type = nxt_list_zero_add(r->resp.fields);
+    content_type = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
     if (nxt_slow_path(content_type == NULL)) {
         goto fail;
     }

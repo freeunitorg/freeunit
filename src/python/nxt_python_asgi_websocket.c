@@ -706,6 +706,26 @@ nxt_py_asgi_websocket_suspend_frame(nxt_unit_websocket_frame_t *frame)
         return;
     }
 
+    /*
+     * Guard against uint64 wraparound across many fragmented frames;
+     * otherwise the eventual max_buffer_size check is bypassed.  Run
+     * the check BEFORE inserting p into the pending_frames queue so a
+     * failure exit doesn't leak the suspended-frame slot.
+     */
+    if (nxt_slow_path(frame->payload_len
+                      > UINT64_MAX - ws->pending_payload_len))
+    {
+        nxt_unit_req_alert(ws->req,
+                           "pending_payload_len overflow on suspend.");
+
+        nxt_unit_free(ws->req->ctx, p);
+        nxt_unit_websocket_done(frame);
+
+        PyErr_SetString(PyExc_RuntimeError,
+                        "pending_payload_len overflow on suspend.");
+        return;
+    }
+
     p->frame = frame;
     nxt_queue_insert_tail(&ws->pending_frames, &p->link);
 
@@ -750,6 +770,18 @@ nxt_py_asgi_websocket_pop_msg(nxt_py_asgi_websocket_t *ws,
 
     } else {
         if (frame != NULL) {
+            if (nxt_slow_path(frame->payload_len
+                              > UINT64_MAX - ws->pending_payload_len))
+            {
+                nxt_unit_req_alert(ws->req,
+                                   "pending_payload_len overflow on pop.");
+
+                nxt_unit_websocket_done(frame);
+
+                return PyErr_Format(PyExc_RuntimeError,
+                                    "pending_payload_len overflow on pop.");
+            }
+
             payload_len = ws->pending_payload_len + frame->payload_len;
             fin_frame = frame;
 

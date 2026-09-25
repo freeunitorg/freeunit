@@ -1,29 +1,29 @@
 MODULES+=		jsc17
 MODULE_SUFFIX_jsc17=	jsc17
 
-MODULE_SUMMARY_jsc17=	Java 17 module for FreeUnit
+MODULE_SUMMARY_jsc17=	Java 17 module for $(BRAND_TITLE)
 
 MODULE_VERSION_jsc17=	$(VERSION)
 MODULE_RELEASE_jsc17=	1
 
-MODULE_CONFARGS_jsc17=	java --module=java17 --home=/usr/lib/jvm/java-17-openjdk-$$\(DEB_HOST_ARCH\) --jars=/usr/share/unit-jsc-common/
+MODULE_CONFARGS_jsc17=	java --module=java17 --home=/usr/lib/jvm/java-17-openjdk-$$\(DEB_HOST_ARCH\) --jars=/usr/share/$(BRAND)-jsc-common/
 MODULE_MAKEARGS_jsc17=	java17
 MODULE_INSTARGS_jsc17=	java17-install
 
-MODULE_SOURCES_jsc17=	unit.example-jsc-app \
-			unit.example-jsc17-config
+MODULE_SOURCES_jsc17=	freeunit.example-jsc-app \
+			freeunit.example-jsc17-config
 
 BUILD_DEPENDS_jsc17=	openjdk-17-jdk-headless openjdk-17-jre-headless
 BUILD_DEPENDS+=		$(BUILD_DEPENDS_jsc17)
 
 MODULE_BUILD_DEPENDS_jsc17=,openjdk-17-jdk-headless
-MODULE_DEPENDS_jsc17=,openjdk-17-jre-headless,unit-jsc-common (= $(MODULE_VERSION_jsc_common)-$(MODULE_RELEASE_jsc_common)~$(CODENAME))
+MODULE_DEPENDS_jsc17=,openjdk-17-jre-headless,$(BRAND)-jsc-common (= $(MODULE_VERSION_jsc_common)-$(MODULE_RELEASE_jsc_common)~$(CODENAME))
 
 define MODULE_PREINSTALL_jsc17
-	mkdir -p debian/unit-jsc17/usr/share/doc/unit-jsc17/examples/jsc-app
-	install -m 644 -p debian/unit.example-jsc-app debian/unit-jsc17/usr/share/doc/unit-jsc17/examples/jsc-app/index.jsp
-	install -m 644 -p debian/unit.example-jsc17-config debian/unit-jsc17/usr/share/doc/unit-jsc17/examples/unit.config
-	install -m 644 -p src/java/README.JSR-340 debian/unit-jsc17/usr/share/doc/unit-jsc17/
+	mkdir -p debian/$(BRAND)-jsc17/usr/share/doc/$(BRAND)-jsc17/examples/jsc-app
+	install -m 644 -p debian/freeunit.example-jsc-app debian/$(BRAND)-jsc17/usr/share/doc/$(BRAND)-jsc17/examples/jsc-app/index.jsp
+	install -m 644 -p debian/freeunit.example-jsc17-config debian/$(BRAND)-jsc17/usr/share/doc/$(BRAND)-jsc17/examples/$(BRAND).config
+	install -m 644 -p src/java/README.JSR-340 debian/$(BRAND)-jsc17/usr/share/doc/$(BRAND)-jsc17/
 endef
 export MODULE_PREINSTALL_jsc17
 
@@ -41,12 +41,12 @@ The $(MODULE_SUMMARY_jsc17) has been installed.
 
 To check out the sample app, run these commands:
 
- sudo service unit restart
- cd /usr/share/doc/unit-$(MODULE_SUFFIX_jsc17)/examples
- sudo curl -X PUT --data-binary @unit.config --unix-socket /var/run/control.unit.sock http://localhost/config
+ sudo service $(RUNTIME) restart
+ cd /usr/share/doc/$(BRAND)-$(MODULE_SUFFIX_jsc17)/examples
+ $(MODULE_CONFIG_PUT)
  curl http://localhost:8800/
 
-Online documentation is available at https://docs.freeunit.org
+Online documentation is available at $(DOCS_URL)
 
 NOTICE:
 
