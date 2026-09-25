@@ -86,6 +86,24 @@ nxt_fd_event_change_test(nxt_thread_t *thr)
     saved_engine = thr->engine;
     thr->engine = engine;
 
+    /*
+     * Without eventfd (epoll) or EVFILT_USER (kqueue) the engine posts
+     * through a signal pipe, and nxt_event_engine_create() enables its read
+     * event in this same batch.  Commit it, so that every leg counts only
+     * the changes it queued itself.
+     */
+
+    engine->event.poll(engine, 0);
+
+    if (nxt_slow_path(nxt_fd_event_change_test_nchanges(engine) != 0)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "fd event change test: the engine's own changes were "
+                      "not committed, %ui left",
+                      nxt_fd_event_change_test_nchanges(engine));
+        ret = NXT_ERROR;
+        goto done;
+    }
+
     ret = nxt_fd_event_change_test_drop(thr, engine);
 
     if (ret == NXT_OK) {
@@ -95,6 +113,8 @@ nxt_fd_event_change_test(nxt_thread_t *thr)
     if (ret == NXT_OK) {
         ret = nxt_fd_event_change_test_port(thr, engine);
     }
+
+done:
 
     thr->engine = saved_engine;
 
