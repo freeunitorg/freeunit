@@ -33,7 +33,7 @@ jobs:
           dnf -y update
           dnf -y install --setopt=install_weak_deps=False \
               which wget git gcc make pcre2-devel openssl-devel \
-              zlib-ng-compat-devel libzstd-devel brotli-devel \
+              zlib-ng-compat-devel libzstd-devel brotli-devel libnghttp2-devel \
               python-unversioned-command python3 python3-devel \
               php-devel php-embedded perl-devel perl-ExtUtils-Embed \
               ruby-devel java-devel nodejs-devel nodejs-npm golang \
@@ -48,9 +48,9 @@ jobs:
       - name: configure unit CC=${{ matrix.compiler }}
         run: |
           if [ "${{ matrix.compiler }}" = "clang" ]; then
-            ./configure --openssl --otel --zlib --zstd --brotli --tests --cc=clang
+            ./configure --openssl --otel --zlib --zstd --brotli --h2 --tests --cc=clang
           else
-            ./configure --openssl --otel --zlib --zstd --brotli --tests
+            ./configure --openssl --otel --zlib --zstd --brotli --h2 --tests
           fi
 
       - name: make unit
@@ -156,7 +156,7 @@ jobs:
         run: |
           apk update && apk upgrade
           apk add gcc make musl-dev openssl-dev pcre2-dev curl \
-              zlib-dev zstd-dev brotli-dev \
+              zlib-dev zstd-dev brotli-dev nghttp2-dev \
               php83-dev php83-embed python3-dev perl-dev ruby-dev \
               openjdk21-jdk cargo rust clang-dev linux-headers
           if [ "${{ matrix.compiler }}" = "clang" ]; then
@@ -168,9 +168,9 @@ jobs:
       - name: configure unit CC=${{ matrix.compiler }}
         run: |
           if [ "${{ matrix.compiler }}" = "clang" ]; then
-            ./configure --openssl --otel --zlib --zstd --brotli --tests --cc=clang
+            ./configure --openssl --otel --zlib --zstd --brotli --h2 --tests --cc=clang
           else
-            ./configure --openssl --otel --zlib --zstd --brotli --tests
+            ./configure --openssl --otel --zlib --zstd --brotli --h2 --tests
           fi
 
       - name: make unit
