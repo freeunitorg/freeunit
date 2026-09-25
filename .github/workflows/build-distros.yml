@@ -56,6 +56,13 @@ jobs:
       - name: make unit
         run: make -j 4
 
+      # --tests has always been configured here, but only "all" was built,
+      # so a toolchain that breaks the tests binary alone went unnoticed
+      # (musl's CMSG_NXTHDR under clang, #475).  Built, not run: the clone
+      # and credential cases need capabilities this container may not have.
+      - name: make tests
+        run: make -j 4 tests
+
       - name: configure unit-php
         run: ./configure php
 
@@ -175,6 +182,13 @@ jobs:
 
       - name: make unit
         run: make -j 4
+
+      # --tests has always been configured here, but only "all" was built,
+      # so a toolchain that breaks the tests binary alone went unnoticed
+      # (musl's CMSG_NXTHDR under clang, #475).  Built, not run: the clone
+      # and credential cases need capabilities this container may not have.
+      - name: make tests
+        run: make -j 4 tests
 
       - name: configure unit-php
         run: |
