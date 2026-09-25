@@ -888,8 +888,11 @@ done:
  * a process that may have exited already, so EPIPE (ECONNREFUSED on a
  * SOCK_DGRAM pair) on it is info, whether it is sent at once or later from
  * the port's own queue; any other message is an alert.  A message to a port
- * with a shared queue goes through that queue, and its socket wake-up is a
- * READ_QUEUE, so a failed wake-up is an alert whatever it announced.  The peer's end is closed, so sendmsg() fails for real.
+ * with a shared queue goes through that queue, and the socket carries only
+ * a READ_QUEUE wake-up.  The wake-up for a QUIT keeps peer_may_be_gone, so
+ * it is info too, also when it waits in port->messages first and fails
+ * from the write handler; the wake-up for a DATA is an alert.  The peer's
+ * end is closed, so sendmsg() fails for real.
  */
 
 static nxt_uint_t  nxt_port_fail_test_sendmsg_level;
@@ -916,6 +919,7 @@ nxt_port_fail_test_send_to_dead_peer(nxt_thread_t *thr, nxt_uint_t type,
     nxt_port_t             *port;
     nxt_event_engine_t     engine, *saved_engine;
     nxt_port_queue_t       *queue;
+    nxt_port_send_msg_t    *msg;
     nxt_event_interface_t  stub;
 
     task = thr->task;
@@ -952,6 +956,7 @@ nxt_port_fail_test_send_to_dead_peer(nxt_thread_t *thr, nxt_uint_t type,
     nxt_port_fail_test_sendmsg_level = NXT_LOG_DEBUG;
 
     ret = NXT_ERROR;
+    queue = NULL;
 
     /* The production pair: SOCK_SEQPACKET where there is one, else DGRAM. */
 
@@ -990,11 +995,33 @@ nxt_port_fail_test_send_to_dead_peer(nxt_thread_t *thr, nxt_uint_t type,
 
     ret = nxt_port_socket_write(task, port, type, -1, 0, 0, NULL);
 
+    if (queue != NULL && queue->nitems != 1) {
+        nxt_log_error(NXT_LOG_NOTICE, saved_log,
+                      "port failure test: the message did not go into the "
+                      "shared queue");
+        ret = NXT_ERROR;
+        goto done;
+    }
+
     if (queued) {
         if (ret != NXT_OK || nxt_queue_is_empty(&port->messages)) {
             nxt_log_error(NXT_LOG_NOTICE, saved_log,
                           "port failure test: the message was not queued "
                           "(%d)", (int) ret);
+            ret = NXT_ERROR;
+            goto done;
+        }
+
+        msg = nxt_queue_link_data(nxt_queue_first(&port->messages),
+                                  nxt_port_send_msg_t, link);
+
+        /* What waits is the socket wake-up, not the message itself. */
+
+        if (shared && msg->port_msg.type != _NXT_PORT_MSG_READ_QUEUE) {
+            nxt_log_error(NXT_LOG_NOTICE, saved_log,
+                          "port failure test: the queued message is not a "
+                          "READ_QUEUE wake-up (%d)",
+                          (int) msg->port_msg.type);
             ret = NXT_ERROR;
             goto done;
         }
@@ -1041,9 +1068,15 @@ nxt_port_fail_test_quit_log_level(nxt_thread_t *thr)
     } legs[] = {
         { NXT_PORT_MSG_QUIT, 0, 0, NXT_LOG_INFO, "a QUIT sent at once" },
         { NXT_PORT_MSG_QUIT, 1, 0, NXT_LOG_INFO, "a QUIT sent from the queue" },
+        { NXT_PORT_MSG_QUIT, 0, 1, NXT_LOG_INFO,
+          "a QUIT to a port with a shared queue" },
+        { NXT_PORT_MSG_QUIT, 1, 1, NXT_LOG_INFO,
+          "a deferred QUIT wake-up to a port with a shared queue" },
         { NXT_PORT_MSG_DATA, 0, 0, NXT_LOG_ALERT, "a DATA sent at once" },
         { NXT_PORT_MSG_DATA, 0, 1, NXT_LOG_ALERT,
           "a DATA to a port with a shared queue" },
+        { NXT_PORT_MSG_DATA, 1, 1, NXT_LOG_ALERT,
+          "a deferred DATA wake-up to a port with a shared queue" },
     };
 
     for (i = 0; i < nxt_nitems(legs); i++) {
