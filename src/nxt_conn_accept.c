@@ -69,25 +69,29 @@ nxt_listen_event(nxt_task_t *task, nxt_listen_socket_t *ls)
         lev->socket.task = &lev->task;
         lev->timer.task = &lev->task;
 
-        if (nxt_conn_accept_alloc(task, lev) != NULL) {
+        nxt_queue_insert_tail(&engine->listen_connections, &lev->link);
+
+        if (nxt_fast_path(nxt_conn_accept_alloc(task, lev) != NULL)) {
             nxt_fd_event_enable_accept(engine, &lev->socket);
 
-            nxt_queue_insert_tail(&engine->listen_connections, &lev->link);
-
-            return lev;
+        } else {
+            /*
+             * The spare conn could not be allocated (the engine is at
+             * max_connections, or memory is short).  The listener is
+             * still valid: it is linked above, so the router can find it
+             * for later updates and closes, and it is simply not armed
+             * yet.  Treat this exactly like the same failure on the accept
+             * path (nxt_conn_accept_next()): close idle conns to make room
+             * and let the 100ms listen timer retry the spare, which arms
+             * accept once it succeeds (nxt_conn_listen_timer_handler()).
+             * The M-5 guard keeps the disable_read() in there from acting
+             * on this never-armed listener.
+             */
+            nxt_conn_accept_close_idle(task, lev);
         }
-
-        /*
-         * The spare conn could not be allocated: lev was neither armed
-         * (enable_accept) nor linked into engine->listen_connections, so
-         * this listener would silently never accept on this engine.  Free
-         * it and report failure so the caller can react (see nxt_router.c,
-         * nxt_controller.c, nxt_runtime.c callers of nxt_listen_event()).
-         */
-        nxt_free(lev);
     }
 
-    return NULL;
+    return lev;
 }
 
 
