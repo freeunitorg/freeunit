@@ -1,0 +1,16 @@
+# LeakSanitizer suppressions for the one sanitize.yml step that runs with
+# detect_leaks=1: test_http2_fail_before_body_leak in the python leg.
+#
+# That test counts only leaks in the h2 code (it searches unit.log for
+# "in nxt_h2p_on_begin_headers") and ignores the other reports at its own
+# unit_stop().  But test/conftest.py also starts and stops unitd in
+# pytest_sessionstart() and fails the session on any "Sanitizer" line, so a
+# leak that every unitd process has at exit aborts the run before the test.
+# Every entry below must be such a leak, outside the code the test covers.
+#
+# nxt_var_index_init() (src/nxt_var.c) builds the table of variable
+# declarations once per process in nxt_runtime_create() and stores it only
+# in the static nxt_vars, which nothing reads.  In the -O1 sanitizer build
+# LSan finds no pointer to it and reports 136 bytes at every process exit.
+# Not an h2 leak and not a leak per request.
+leak:nxt_var_index_init

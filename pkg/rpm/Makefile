@@ -28,7 +28,7 @@ else ifeq ($(shell test `rpm --eval '0%{?fedora} -eq 43'`; echo $$?),0)
 OSVER = fedora43
 endif
 
-BUILD_DEPENDS_unit = gcc rpm-build rpmlint clang llvm
+BUILD_DEPENDS_unit = gcc rpm-build rpmlint clang llvm libnghttp2-devel
 
 ifneq (,$(findstring $(OSVER),amazonlinux2))
 BUILD_DEPENDS_unit += libxml2 libxslt openssl11-devel

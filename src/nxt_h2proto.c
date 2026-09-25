@@ -27,12 +27,22 @@ static nxt_int_t nxt_h2p_session_create(nxt_task_t *task, nxt_h2proto_t *h2c,
     nxt_socket_conf_t *skcf);
 static void nxt_h2p_conn_read(nxt_task_t *task, void *obj, void *data);
 static void nxt_h2p_conn_flush(nxt_task_t *task, nxt_h2proto_t *h2c);
+static void nxt_h2p_conn_window_check(nxt_h2proto_t *h2c);
+static nxt_bool_t nxt_h2p_conn_window_expire(nxt_task_t *task,
+    nxt_h2proto_t *h2c, nxt_socket_conf_t *skcf);
 static void nxt_h2p_conn_sent(nxt_task_t *task, void *obj, void *data);
+static void nxt_h2p_conn_free(nxt_task_t *task, nxt_h2proto_t *h2c);
+static void nxt_h2p_conn_cleanup(nxt_task_t *task, void *obj, void *data);
 static void nxt_h2p_conn_close(nxt_task_t *task, void *obj, void *data);
 static void nxt_h2p_conn_error(nxt_task_t *task, void *obj, void *data);
 static void nxt_h2p_conn_read_timeout(nxt_task_t *task, void *obj, void *data);
 static void nxt_h2p_conn_send_timeout(nxt_task_t *task, void *obj, void *data);
 static nxt_msec_t nxt_h2p_conn_timer_value(nxt_conn_t *c, uintptr_t data);
+static nxt_msec_t nxt_h2p_conn_deadline(nxt_h2proto_t *h2c,
+    nxt_socket_conf_t *skcf, nxt_uint_t *expired);
+static void nxt_h2p_deadline(nxt_msec_t *next, nxt_uint_t *expired,
+    nxt_uint_t what, nxt_msec_t now, nxt_msec_t start, nxt_msec_t timeout);
+static void nxt_h2p_conn_timer_update(nxt_h2proto_t *h2c);
 static nxt_msec_t nxt_h2p_conn_progress_timeout(nxt_h2proto_t *h2c,
     nxt_socket_conf_t *skcf);
 static nxt_bool_t nxt_h2p_stream_incomplete(nxt_h2proto_t *h2c,
@@ -50,13 +60,18 @@ static nxt_buf_t *nxt_h2p_goaway_frame(nxt_task_t *task, nxt_h2proto_t *h2c,
 static void nxt_h2p_streams_fail(nxt_task_t *task, nxt_h2proto_t *h2c,
     nxt_bool_t all);
 static void nxt_h2p_conn_goaway(nxt_h2proto_t *h2c, int32_t last_id);
+static nxt_bool_t nxt_h2p_conn_leaving(nxt_h2proto_t *h2c);
+static nxt_bool_t nxt_h2p_conn_drain(nxt_task_t *task, nxt_h2proto_t *h2c);
+static void nxt_h2p_conns_walk(nxt_queue_t *queue);
 static void nxt_h2p_conn_shutdown(nxt_task_t *task, nxt_h2proto_t *h2c);
 static void nxt_h2p_closing(nxt_task_t *task, nxt_h2proto_t *h2c);
+static void nxt_h2p_release(nxt_h2proto_t *h2c);
 static void nxt_h2p_stream_free(nxt_h2proto_t *h2c, nxt_h2p_stream_t *stream);
 static void nxt_h2p_stream_fail(nxt_task_t *task, nxt_h2p_stream_t *stream);
 
 static int nxt_h2p_on_begin_headers(nghttp2_session *session,
     const nghttp2_frame *frame, void *user_data);
+static int nxt_h2p_stream_refuse(nxt_h2proto_t *h2c, int32_t stream_id);
 static int nxt_h2p_on_header(nghttp2_session *session,
     const nghttp2_frame *frame, const uint8_t *name, size_t namelen,
     const uint8_t *value, size_t valuelen, uint8_t flags, void *user_data);
@@ -91,6 +106,12 @@ static const nxt_conn_state_t  nxt_h2p_write_state;
 static const nxt_str_t  nxt_h2p_version = nxt_string("HTTP/2.0");
 
 
+/* What has expired, from nxt_h2p_conn_deadline(). */
+#define NXT_H2P_EXPIRED_PROGRESS  1
+#define NXT_H2P_EXPIRED_DRAIN     2
+#define NXT_H2P_EXPIRED_WINDOW    4
+
+
 void
 nxt_h2p_conn_init(nxt_task_t *task, nxt_conn_t *c)
 {
@@ -116,7 +137,28 @@ nxt_h2p_conn_init(nxt_task_t *task, nxt_conn_t *c)
     }
 
     h2c->conn = c;
+    h2c->joint = joint;
     nxt_queue_init(&h2c->streams);
+
+    /*
+     * Whatever path frees the connection, the pool cleanup deletes the
+     * nghttp2 session, which is allocated with malloc() outside c->mem_pool,
+     * if nxt_h2p_closing() has not, and releases the joint reference below.
+     */
+    if (nxt_slow_path(nxt_mp_cleanup(c->mem_pool, nxt_h2p_conn_cleanup,
+                                     &engine->task, h2c, NULL)
+                      != NXT_OK))
+    {
+        goto fail;
+    }
+
+    /*
+     * The connection holds its configuration until it is freed: the TLS
+     * connection reads its nxt_tls_conf_t, which lives in that
+     * configuration, until the TLS shutdown is over, and that is after the
+     * last request has released its own reference.
+     */
+    joint->count++;
 
     b = nxt_buf_mem_alloc(c->mem_pool, NXT_H2P_READ_BUFFER_SIZE, 0);
     if (nxt_slow_path(b == NULL)) {
@@ -153,6 +195,7 @@ fail:
 
     if (h2c != NULL && h2c->session != NULL) {
         nghttp2_session_del(h2c->session);
+        h2c->session = NULL;
     }
 
     if (c->read != NULL) {
@@ -271,12 +314,11 @@ static const nxt_conn_state_t  nxt_h2p_write_state
 static void
 nxt_h2p_conn_read(nxt_task_t *task, void *obj, void *data)
 {
-    size_t                   size;
-    ssize_t                  n;
-    nxt_buf_t                *b;
-    nxt_conn_t               *c;
-    nxt_h2proto_t            *h2c;
-    nxt_socket_conf_joint_t  *joint;
+    size_t         size;
+    ssize_t        n;
+    nxt_buf_t      *b;
+    nxt_conn_t     *c;
+    nxt_h2proto_t  *h2c;
 
     c = obj;
     h2c = data;
@@ -344,15 +386,8 @@ nxt_h2p_conn_read(nxt_task_t *task, void *obj, void *data)
         return;
     }
 
-    if (h2c->stream_count == 0) {
-        joint = c->listen->socket.data;
-
-        if (nxt_slow_path(joint == NULL || c->listen->draining)) {
-            /* The listener is closed or draining; leave with GOAWAY. */
-            nxt_h2p_conn_goaway(h2c, -1);
-            nxt_h2p_conn_shutdown(task, h2c);
-            return;
-        }
+    if (nxt_slow_path(nxt_h2p_conn_drain(task, h2c))) {
+        return;
     }
 
     if (!nghttp2_session_want_read(h2c->session)
@@ -459,7 +494,10 @@ nxt_h2p_conn_flush(nxt_task_t *task, nxt_h2proto_t *h2c)
     if (nxt_slow_path(h2c->close_pending) && c->write == NULL) {
         /* Otherwise nxt_h2p_conn_sent() closes once the frames are out. */
         nxt_h2p_closing(task, h2c);
+        return;
     }
+
+    nxt_h2p_conn_window_check(h2c);
 
     return;
 
@@ -473,6 +511,152 @@ fail:
     }
 
     nxt_h2p_conn_fail(task, h2c);
+}
+
+
+/*
+ * A response that has data to send while the client's flow-control window
+ * is exhausted waits for WINDOW_UPDATE; nghttp2 does not even ask the data
+ * provider.  A client that never sends one would hold the stream and its
+ * request for ever.  Each flush notes when a stream's own window runs out,
+ * and apart from that when the connection window runs out while some
+ * response has data to send; the read timer gives each wait send_timeout,
+ * see nxt_h2p_conn_window_expire().  The two waits have separate start
+ * times: streams run out of window at different times, and a connection
+ * window that has just run out must not inherit an older stream wait.  A
+ * write that TCP holds back is not a window wait: the write timer covers
+ * it.
+ */
+
+static void
+nxt_h2p_conn_window_check(nxt_h2proto_t *h2c)
+{
+    int32_t           conn_window;
+    nxt_msec_t        now;
+    nxt_bool_t        armed, sending;
+    nxt_queue_link_t  *lnk;
+    nxt_h2p_stream_t  *stream;
+
+    if (h2c->closing || h2c->session == NULL) {
+        return;
+    }
+
+    now = h2c->conn->socket.task->thread->engine->timers.now;
+    conn_window = nghttp2_session_get_remote_window_size(h2c->session);
+    armed = 0;
+    sending = 0;
+
+    for (lnk = nxt_queue_first(&h2c->streams);
+         lnk != nxt_queue_tail(&h2c->streams);
+         lnk = nxt_queue_next(lnk))
+    {
+        stream = nxt_queue_link_data(lnk, nxt_h2p_stream_t, link);
+
+        if (stream->out == NULL || stream->r == NULL || stream->closed
+            || stream->failed || stream->no_provider)
+        {
+            stream->window_wait = 0;
+            continue;
+        }
+
+        sending = 1;
+
+        if (nghttp2_session_get_stream_remote_window_size(h2c->session,
+                                                          stream->id)
+            <= 0)
+        {
+            if (!stream->window_wait) {
+                stream->window_wait = 1;
+                stream->window_start = now;
+                armed = 1;
+            }
+
+        } else {
+            stream->window_wait = 0;
+        }
+    }
+
+    if (sending && conn_window <= 0) {
+        if (!h2c->window_wait) {
+            h2c->window_wait = 1;
+            h2c->conn_window_start = now;
+            armed = 1;
+        }
+
+    } else {
+        h2c->window_wait = 0;
+    }
+
+    if (armed) {
+        nxt_h2p_conn_timer_update(h2c);
+    }
+}
+
+
+/*
+ * If the connection window has been exhausted for send_timeout, no stream
+ * can move: GOAWAY and close.  Otherwise the streams whose own window has
+ * been exhausted for send_timeout get RST_STREAM(CANCEL); their requests
+ * fail and the other streams go on.  Returns 1 if the connection is
+ * closing.
+ */
+
+static nxt_bool_t
+nxt_h2p_conn_window_expire(nxt_task_t *task, nxt_h2proto_t *h2c,
+    nxt_socket_conf_t *skcf)
+{
+    int32_t           elapsed;
+    nxt_msec_t        now;
+    nxt_queue_link_t  *lnk;
+    nxt_h2p_stream_t  *stream;
+
+    now = task->thread->engine->timers.now;
+
+    if (h2c->window_wait) {
+        elapsed = nxt_msec_diff(now, h2c->conn_window_start);
+
+        if (elapsed >= 0 && (nxt_msec_t) elapsed >= skcf->send_timeout
+            && nghttp2_session_get_remote_window_size(h2c->session) <= 0)
+        {
+            nxt_log(task, NXT_LOG_INFO,
+                    "h2p client timed out: connection flow-control window "
+                    "exhausted for %M ms", skcf->send_timeout);
+
+            nxt_h2p_conn_expire(task, h2c, 1);
+            return 1;
+        }
+    }
+
+    for (lnk = nxt_queue_first(&h2c->streams);
+         lnk != nxt_queue_tail(&h2c->streams);
+         lnk = nxt_queue_next(lnk))
+    {
+        stream = nxt_queue_link_data(lnk, nxt_h2p_stream_t, link);
+
+        if (!stream->window_wait) {
+            continue;
+        }
+
+        elapsed = nxt_msec_diff(now, stream->window_start);
+
+        if (elapsed < 0 || (nxt_msec_t) elapsed < skcf->send_timeout) {
+            continue;
+        }
+
+        nxt_log(task, NXT_LOG_INFO,
+                "h2p stream %D: client timed out: flow-control window "
+                "exhausted for %M ms", stream->id, skcf->send_timeout);
+
+        stream->window_wait = 0;
+
+        (void) nghttp2_submit_rst_stream(h2c->session, NGHTTP2_FLAG_NONE,
+                                         stream->id, NGHTTP2_CANCEL);
+    }
+
+    /* nghttp2 closes the streams, and on_stream_close fails the requests. */
+    nxt_h2p_conn_flush(task, h2c);
+
+    return h2c->closing;
 }
 
 
@@ -494,15 +678,7 @@ nxt_h2p_conn_sent(nxt_task_t *task, void *obj, void *data)
     }
 
     if (nxt_slow_path(c->socket.fd == -1)) {
-        /*
-         * nxt_runtime_close_idle_connections() closed the socket under an
-         * idle connection at process shutdown; only the session is left.
-         */
-        if (h2c->session != NULL) {
-            nghttp2_session_del(h2c->session);
-            h2c->session = NULL;
-        }
-
+        nxt_h2p_conn_free(task, h2c);
         return;
     }
 
@@ -529,9 +705,74 @@ nxt_h2p_conn_sent(nxt_task_t *task, void *obj, void *data)
         nxt_h2p_conn_flush(task, h2c);
     }
 
+    if (nxt_slow_path(nxt_h2p_conn_drain(task, h2c))) {
+        return;
+    }
+
     if (h2c->closing && c->write == NULL && h2c->stream_count == 0) {
         nxt_h2p_closing(task, h2c);
     }
+}
+
+
+/*
+ * nxt_runtime_close_idle_connections() has closed an idle connection at
+ * process shutdown: nxt_conn_close() ends in the ready handler of the write
+ * state, which is still this one.  Release the h2 objects and free the
+ * connection as nxt_h1p_conn_free() does after nxt_h1p_closing().
+ */
+
+static void
+nxt_h2p_conn_free(nxt_task_t *task, nxt_h2proto_t *h2c)
+{
+    nxt_conn_t          *c;
+    nxt_listen_event_t  *lev;
+    nxt_event_engine_t  *engine;
+
+    c = h2c->conn;
+
+    nxt_debug(task, "h2p conn free");
+
+    nxt_h2p_release(h2c);
+
+    h2c->closed = 1;
+    c->socket.data = NULL;
+
+    engine = task->thread->engine;
+
+    nxt_sockaddr_cache_free(engine, c);
+
+    lev = c->listen;
+
+    nxt_conn_free(task, c);
+
+    nxt_router_listen_event_release(&engine->task, lev, NULL);
+}
+
+
+/*
+ * The c->mem_pool cleanup: the last word on the session, for a connection
+ * freed on a path that did not run nxt_h2p_closing(), such as a release
+ * write state that nxt_runtime_close_idle_connections() installs.
+ */
+
+static void
+nxt_h2p_conn_cleanup(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_h2proto_t            *h2c;
+    nxt_socket_conf_joint_t  *joint;
+
+    h2c = obj;
+
+    if (h2c->session != NULL) {
+        nghttp2_session_del(h2c->session);
+        h2c->session = NULL;
+    }
+
+    joint = h2c->joint;
+    h2c->joint = NULL;
+
+    nxt_router_conf_release(task, joint);
 }
 
 
@@ -567,25 +808,36 @@ nxt_h2p_conn_error(nxt_task_t *task, void *obj, void *data)
 
 
 /*
- * The read timer has two meanings.  With no stream it is idle_timeout, as
- * for an HTTP/1 keep-alive connection.  While some stream still waits for
- * the client (its header block or its request body is not complete) it is
- * a progress timer: it runs from the last frame that advanced any stream,
- * see nxt_h2p_conn_progress(), and nxt_h2p_conn_timer_value() arms it with
- * what is left of the timeout, so bytes that do not advance a stream (PING,
- * WINDOW_UPDATE, SETTINGS, PRIORITY) do not keep a stalled client alive.
- * With streams open and none of them waiting for the client (a request is
- * with its application) there is no read timer; send_timeout covers writes.
+ * The read timer has several meanings.  With no stream it is idle_timeout,
+ * as for an HTTP/1 keep-alive connection.  With streams it runs to the
+ * nearest of these deadlines, see nxt_h2p_conn_deadline():
+ *
+ * - progress: while some stream still waits for the client (its header
+ *   block or its request body is not complete), the timer runs from the
+ *   last frame that advanced any stream, see nxt_h2p_conn_progress(), so
+ *   bytes that do not advance a stream (PING, WINDOW_UPDATE, SETTINGS,
+ *   PRIORITY) do not keep a stalled client alive;
+ *
+ * - drain: send_timeout from the shutdown notice, see nxt_h2p_conn_drain();
+ *
+ * - window: send_timeout for a response that waits for the client's
+ *   flow-control window, see nxt_h2p_conn_window_check().
+ *
+ * nxt_h2p_conn_timer_value() arms the timer with what is left.  With no
+ * deadline (every request is with its application, no response waits for
+ * window and the connection is not draining) there is no read timer; the
+ * write timer (send_timeout) covers writes that TCP holds back.
  */
 
 static void
 nxt_h2p_conn_read_timeout(nxt_task_t *task, void *obj, void *data)
 {
-    int32_t                  elapsed;
-    nxt_msec_t               timeout;
+    nxt_msec_t               next;
+    nxt_uint_t               expired;
     nxt_conn_t               *c;
     nxt_timer_t              *timer;
     nxt_h2proto_t            *h2c;
+    nxt_socket_conf_t        *skcf;
     nxt_event_engine_t       *engine;
     nxt_socket_conf_joint_t  *joint;
 
@@ -613,29 +865,49 @@ nxt_h2p_conn_read_timeout(nxt_task_t *task, void *obj, void *data)
         return;
     }
 
-    joint = c->listen->socket.data;
-
-    if (nxt_fast_path(joint != NULL)) {
-        timeout = nxt_h2p_conn_progress_timeout(h2c, joint->socket_conf);
-
-        if (timeout == 0) {
-            /* Every stream has become complete since the timer was armed. */
-            return;
-        }
-
-        elapsed = nxt_msec_diff(engine->timers.now, h2c->progress);
-
-        if (elapsed >= 0 && (nxt_msec_t) elapsed < timeout) {
-            nxt_timer_add(engine, timer, timeout - elapsed);
-            return;
-        }
-
-        nxt_log(&c->task, NXT_LOG_INFO,
-                "h2p client timed out: no stream progress for %M ms",
-                timeout);
+    if (nxt_h2p_conn_drain(&c->task, h2c)) {
+        return;
     }
 
-    nxt_h2p_conn_expire(&c->task, h2c, 0);
+    joint = c->listen->socket.data;
+
+    if (nxt_slow_path(joint == NULL)) {
+        nxt_h2p_conn_expire(&c->task, h2c, 1);
+        return;
+    }
+
+    skcf = joint->socket_conf;
+
+    next = nxt_h2p_conn_deadline(h2c, skcf, &expired);
+
+    if (expired & NXT_H2P_EXPIRED_DRAIN) {
+        nxt_log(&c->task, NXT_LOG_INFO,
+                "h2p drain timed out: %uD streams still open after %M ms",
+                h2c->stream_count, skcf->send_timeout);
+
+        nxt_h2p_conn_expire(&c->task, h2c, 1);
+        return;
+    }
+
+    if ((expired & NXT_H2P_EXPIRED_WINDOW)
+        && nxt_h2p_conn_window_expire(&c->task, h2c, skcf))
+    {
+        return;
+    }
+
+    if (expired & NXT_H2P_EXPIRED_PROGRESS) {
+        nxt_log(&c->task, NXT_LOG_INFO,
+                "h2p client timed out: no stream progress for %M ms",
+                nxt_h2p_conn_progress_timeout(h2c, skcf));
+
+        nxt_h2p_conn_expire(&c->task, h2c, 0);
+        return;
+    }
+
+    if (next != 0) {
+        /* The deadline has moved since the timer was armed. */
+        nxt_timer_add(engine, timer, next);
+    }
 }
 
 
@@ -682,7 +954,8 @@ nxt_h2p_conn_expire(nxt_task_t *task, nxt_h2proto_t *h2c, nxt_bool_t all)
 /*
  * Fail the requests attached to streams: all of them, or those that still
  * wait for the client.  A request after EOF ends through its last buffer
- * anyway.  A failed request may close at once and release its stream, and
+ * anyway: its completion is queued already, and it is what the router
+ * waits for.  A failed request may close at once and release its stream, and
  * even the last one; h2c->walking keeps nxt_h2p_closing() from releasing
  * the other streams under this walk, and the caller closes afterwards.
  */
@@ -739,8 +1012,8 @@ nxt_h2p_conn_send_timeout(nxt_task_t *task, void *obj, void *data)
 static nxt_msec_t
 nxt_h2p_conn_timer_value(nxt_conn_t *c, uintptr_t data)
 {
-    int32_t                  elapsed;
-    nxt_msec_t               timeout;
+    nxt_msec_t               next;
+    nxt_uint_t               expired;
     nxt_h2proto_t            *h2c;
     nxt_socket_conf_joint_t  *joint;
 
@@ -757,25 +1030,108 @@ nxt_h2p_conn_timer_value(nxt_conn_t *c, uintptr_t data)
         return nxt_value_at(nxt_msec_t, joint->socket_conf, data);
     }
 
-    timeout = nxt_h2p_conn_progress_timeout(h2c, joint->socket_conf);
+    next = nxt_h2p_conn_deadline(h2c, joint->socket_conf, &expired);
 
-    if (timeout == 0) {
-        /* Every request is complete and waits for its application. */
-        return 0;
+    return (expired != 0) ? 1 : next;
+}
+
+
+/*
+ * The time to the nearest deadline of a connection with streams, 0 if
+ * there is none; "expired" gets the NXT_H2P_EXPIRED_* bits of the
+ * deadlines that have passed.
+ */
+
+static nxt_msec_t
+nxt_h2p_conn_deadline(nxt_h2proto_t *h2c, nxt_socket_conf_t *skcf,
+    nxt_uint_t *expired)
+{
+    nxt_msec_t        now, next, timeout;
+    nxt_queue_link_t  *lnk;
+    nxt_h2p_stream_t  *stream;
+
+    now = h2c->conn->socket.task->thread->engine->timers.now;
+    next = 0;
+    *expired = 0;
+
+    timeout = nxt_h2p_conn_progress_timeout(h2c, skcf);
+
+    if (timeout != 0) {
+        nxt_h2p_deadline(&next, expired, NXT_H2P_EXPIRED_PROGRESS, now,
+                         h2c->progress, timeout);
     }
 
-    elapsed = nxt_msec_diff(c->socket.task->thread->engine->timers.now,
-                            h2c->progress);
+    if (h2c->draining) {
+        nxt_h2p_deadline(&next, expired, NXT_H2P_EXPIRED_DRAIN, now,
+                         h2c->drain_start, skcf->send_timeout);
+    }
+
+    if (h2c->window_wait) {
+        nxt_h2p_deadline(&next, expired, NXT_H2P_EXPIRED_WINDOW, now,
+                         h2c->conn_window_start, skcf->send_timeout);
+    }
+
+    for (lnk = nxt_queue_first(&h2c->streams);
+         lnk != nxt_queue_tail(&h2c->streams);
+         lnk = nxt_queue_next(lnk))
+    {
+        stream = nxt_queue_link_data(lnk, nxt_h2p_stream_t, link);
+
+        if (stream->window_wait) {
+            nxt_h2p_deadline(&next, expired, NXT_H2P_EXPIRED_WINDOW, now,
+                             stream->window_start, skcf->send_timeout);
+        }
+    }
+
+    return next;
+}
+
+
+static void
+nxt_h2p_deadline(nxt_msec_t *next, nxt_uint_t *expired, nxt_uint_t what,
+    nxt_msec_t now, nxt_msec_t start, nxt_msec_t timeout)
+{
+    int32_t     elapsed;
+    nxt_msec_t  left;
+
+    elapsed = nxt_msec_diff(now, start);
 
     if (elapsed < 0) {
-        return timeout;
+        left = timeout;
+
+    } else if ((nxt_msec_t) elapsed >= timeout) {
+        *expired |= what;
+        return;
+
+    } else {
+        left = timeout - elapsed;
     }
 
-    if ((nxt_msec_t) elapsed >= timeout) {
-        return 1;
+    if (*next == 0 || left < *next) {
+        *next = left;
+    }
+}
+
+
+/*
+ * Arm the read timer for a deadline that has appeared outside a read, which
+ * re-arms it anyway.  A timer armed for later fires, finds nothing expired
+ * and re-arms itself for what is left.
+ */
+
+static void
+nxt_h2p_conn_timer_update(nxt_h2proto_t *h2c)
+{
+    nxt_conn_t  *c;
+
+    c = h2c->conn;
+
+    if (h2c->closing || c->socket.fd == -1) {
+        return;
     }
 
-    return timeout - elapsed;
+    nxt_conn_timer(c->socket.task->thread->engine, c, &nxt_h2p_read_state,
+                   &c->read_timer);
 }
 
 
@@ -994,6 +1350,133 @@ nxt_h2p_conn_goaway(nxt_h2proto_t *h2c, int32_t last_id)
 }
 
 
+/*
+ * The connection has to leave: its listener is closed or draining, the
+ * configuration has changed (a new joint on the listener), or the router
+ * is shutting down.  New connections get the new configuration.
+ */
+
+static nxt_bool_t
+nxt_h2p_conn_leaving(nxt_h2proto_t *h2c)
+{
+    nxt_conn_t               *c;
+    nxt_socket_conf_joint_t  *joint;
+
+    c = h2c->conn;
+    joint = c->listen->socket.data;
+
+    return joint == NULL
+           || joint != h2c->joint
+           || c->listen->draining
+           || c->socket.task->thread->engine->shutdown;
+}
+
+
+/*
+ * Graceful drain (RFC 9113, 6.8).  When the connection has to leave:
+ *
+ * - with no stream it sends GOAWAY and closes at once;
+ *
+ * - with streams in flight it submits a shutdown notice, a GOAWAY with the
+ *   last stream ID 2^31-1, so the client stops opening streams while those
+ *   already on the way are still served.  The final GOAWAY with the real
+ *   last stream ID and the close come when the last stream has finished
+ *   (nxt_h2p_request_close()), or when send_timeout from the notice has
+ *   passed (nxt_h2p_conn_read_timeout()): then the requests left are
+ *   failed.
+ *
+ * It runs on every read, write completion and read timer of the
+ * connection, and nxt_h2p_conns_drain() runs it for every h2 connection of
+ * an engine when a listener is updated or closed, so an idle connection or
+ * one whose requests all wait for their applications does not wait for its
+ * next event.  Returns 1 if it has started to close the connection.
+ */
+
+static nxt_bool_t
+nxt_h2p_conn_drain(nxt_task_t *task, nxt_h2proto_t *h2c)
+{
+    if (h2c->closing || h2c->failed || h2c->session == NULL) {
+        return 0;
+    }
+
+    if (!h2c->draining && !nxt_h2p_conn_leaving(h2c)) {
+        return 0;
+    }
+
+    if (h2c->stream_count == 0) {
+        nxt_debug(task, "h2p drain: no stream, close");
+
+        nxt_h2p_conn_goaway(h2c, -1);
+        nxt_h2p_conn_shutdown(task, h2c);
+
+        return 1;
+    }
+
+    if (h2c->draining) {
+        return 0;
+    }
+
+    nxt_debug(task, "h2p drain: %uD streams", h2c->stream_count);
+
+    h2c->draining = 1;
+    h2c->drain_start = task->thread->engine->timers.now;
+
+    if (!h2c->goaway_sent) {
+        (void) nghttp2_submit_shutdown_notice(h2c->session);
+    }
+
+    nxt_h2p_conn_flush(task, h2c);
+    nxt_h2p_conn_timer_update(h2c);
+
+    return 0;
+}
+
+
+/*
+ * A listener has been updated or closed on this engine, or the engine is
+ * shutting down: start the drain of the h2 connections that have to leave.
+ * The drain does not free a connection synchronously, so the walk is safe;
+ * a connection that moves from the idle queue to the active one is seen
+ * twice, and nxt_h2p_conn_drain() does nothing the second time.
+ */
+
+void
+nxt_h2p_conns_drain(nxt_task_t *task, nxt_event_engine_t *engine)
+{
+    nxt_debug(task, "h2p conns drain");
+
+    nxt_h2p_conns_walk(&engine->active_connections);
+    nxt_h2p_conns_walk(&engine->idle_connections);
+}
+
+
+static void
+nxt_h2p_conns_walk(nxt_queue_t *queue)
+{
+    nxt_conn_t        *c;
+    nxt_h2proto_t     *h2c;
+    nxt_queue_link_t  *lnk, *next;
+
+    for (lnk = nxt_queue_first(queue);
+         lnk != nxt_queue_tail(queue);
+         lnk = next)
+    {
+        next = nxt_queue_next(lnk);
+        c = nxt_queue_link_data(lnk, nxt_conn_t, link);
+
+        if (c->read_state != &nxt_h2p_read_state) {
+            continue;
+        }
+
+        h2c = c->socket.data;
+
+        if (h2c != NULL && h2c->conn == c) {
+            (void) nxt_h2p_conn_drain(&c->task, h2c);
+        }
+    }
+}
+
+
 /* Write out what nghttp2 still has to say (GOAWAY), then close. */
 
 static void
@@ -1012,9 +1495,7 @@ nxt_h2p_conn_shutdown(nxt_task_t *task, nxt_h2proto_t *h2c)
 static void
 nxt_h2p_closing(nxt_task_t *task, nxt_h2proto_t *h2c)
 {
-    nxt_conn_t        *c;
-    nxt_queue_link_t  *lnk, *next;
-    nxt_h2p_stream_t  *stream;
+    nxt_conn_t  *c;
 
     if (h2c->busy || h2c->walking != 0) {
         h2c->close_pending = 1;
@@ -1038,6 +1519,20 @@ nxt_h2p_closing(nxt_task_t *task, nxt_h2proto_t *h2c)
         c->write = NULL;
     }
 
+    nxt_h2p_release(h2c);
+
+    nxt_h1p_closing(&c->task, c);
+}
+
+
+/* Free the streams left and the session.  No request is attached. */
+
+static void
+nxt_h2p_release(nxt_h2proto_t *h2c)
+{
+    nxt_queue_link_t  *lnk, *next;
+    nxt_h2p_stream_t  *stream;
+
     for (lnk = nxt_queue_first(&h2c->streams);
          lnk != nxt_queue_tail(&h2c->streams);
          lnk = next)
@@ -1052,14 +1547,25 @@ nxt_h2p_closing(nxt_task_t *task, nxt_h2proto_t *h2c)
         nghttp2_session_del(h2c->session);
         h2c->session = NULL;
     }
-
-    nxt_h1p_closing(&c->task, c);
 }
 
 
 static void
 nxt_h2p_stream_free(nxt_h2proto_t *h2c, nxt_h2p_stream_t *stream)
 {
+    nxt_event_engine_t  *engine;
+
+    if (nxt_slow_path(stream->out != NULL)) {
+        /*
+         * Response buffers must be completed, or the request pool they hold
+         * leaks.  Their completion runs from the work queue, perhaps after
+         * the connection is freed, so it gets the engine task.
+         */
+        engine = h2c->conn->socket.task->thread->engine;
+
+        nxt_h2p_stream_drain(&engine->task, stream);
+    }
+
     nxt_queue_remove(&stream->link);
 
     nxt_mp_free(h2c->conn->mem_pool, stream);
@@ -1089,6 +1595,20 @@ nxt_h2p_stream_fail(nxt_task_t *task, nxt_h2p_stream_t *stream)
          */
         nxt_work_queue_add(&task->thread->engine->fast_work_queue,
                            r->state->error_handler, &r->task, r, stream);
+        return;
+    }
+
+    if (r->state->error_handler == nxt_http_request_close_handler) {
+        /*
+         * The request has no response yet and may wait for an
+         * application: the router then holds it until r->last completes
+         * (nxt_router_http_request_done()).  A direct close would leave it
+         * linked to the application, and the answer would come to a closed
+         * request with a released configuration.  h1 never fails a request
+         * in this state, as it does not read the connection then; end it
+         * as a failed h1 write does, through r->last.
+         */
+        nxt_http_request_error_handler(&r->task, r, stream);
         return;
     }
 
@@ -1124,12 +1644,13 @@ nxt_h2p_on_begin_headers(nghttp2_session *session, const nghttp2_frame *frame,
 
     joint = c->listen->socket.data;
 
-    if (nxt_slow_path(joint == NULL || c->listen->draining
-                      || h2c->goaway_sent))
-    {
-        nxt_h2p_conn_goaway(h2c, -1);
-
-        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    if (nxt_slow_path(joint == NULL || h2c->goaway_sent)) {
+        /*
+         * The GOAWAY is submitted but not written yet, or there is no
+         * configuration to serve the stream with.  nghttp2 ignores new
+         * streams only once its GOAWAY is out.
+         */
+        return nxt_h2p_stream_refuse(h2c, frame->hd.stream_id);
     }
 
     stream = nxt_mp_zalloc(c->mem_pool, sizeof(nxt_h2p_stream_t));
@@ -1188,6 +1709,33 @@ nxt_h2p_on_begin_headers(nghttp2_session *session, const nghttp2_frame *frame,
     NXT_OTEL_TRACE();
 
     return 0;
+}
+
+
+/*
+ * A stream the connection will not serve: RST_STREAM(REFUSED_STREAM) tells
+ * the client it was not processed and may be retried (RFC 9113, 8.7).  The
+ * stream gets no user data, so the rest of its frames are ignored.
+ */
+
+static int
+nxt_h2p_stream_refuse(nxt_h2proto_t *h2c, int32_t stream_id)
+{
+    int      rc;
+    int32_t  last_id;
+
+    nxt_debug(&h2c->conn->task, "h2p stream %D refused", stream_id);
+
+    if (!h2c->goaway_sent) {
+        /* nghttp2 counts this stream as processed already. */
+        last_id = (stream_id > 2) ? stream_id - 2 : 0;
+        nxt_h2p_conn_goaway(h2c, last_id);
+    }
+
+    rc = nghttp2_submit_rst_stream(h2c->session, NGHTTP2_FLAG_NONE, stream_id,
+                                   NGHTTP2_REFUSED_STREAM);
+
+    return (rc == 0) ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
 }
 
 
@@ -1873,8 +2421,11 @@ nxt_h2p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
 
     r->header_sent = 1;
 
-    if (stream->closed || h2c->session == NULL) {
-        /* The stream is gone; let the request finish without a peer. */
+    if (stream->closed || stream->failed || h2c->session == NULL) {
+        /*
+         * The stream is gone, or the request has failed and the stream is
+         * being reset; let the request finish without a peer.
+         */
         goto discard;
     }
 
@@ -2017,8 +2568,15 @@ nxt_h2p_request_send(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
 
     stream->out_tail = &b->next;
 
-    if (stream->no_provider || stream->closed || h2c->session == NULL) {
-        /* No DATA can be sent; the buffers are only completed. */
+    if (stream->no_provider || stream->closed || stream->failed
+        || h2c->session == NULL)
+    {
+        /*
+         * No DATA can be sent; the buffers are only completed.  A failed
+         * request can still get body buffers: nxt_h2p_request_header_send()
+         * queued the body handler before the request failed, and the
+         * buffers hold the request pool until they are completed.
+         */
         nxt_h2p_stream_drain(&h2c->conn->task, stream);
         return;
     }
@@ -2051,7 +2609,11 @@ nxt_h2p_stream_drain(nxt_task_t *task, nxt_h2p_stream_t *stream)
  * The nghttp2 data provider: copies the response chain into a DATA frame.
  * A drained buffer is completed through the work queue, so a static file
  * refill or a memory buffer release runs after nghttp2 returns.  The last
- * (sync) buffer ends the stream; its completion ends the request.
+ * (sync) buffer ends the stream; its completion ends the request.  Empty
+ * and sync buffers after the data are taken in the same call even when the
+ * data fill "length": nghttp2 does not call the provider while the window
+ * is 0, so a response that fills the window exactly would otherwise wait
+ * for a WINDOW_UPDATE only to send END_STREAM.
  */
 
 static ssize_t
@@ -2073,14 +2635,20 @@ nxt_h2p_data_read(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
 
     copied = 0;
 
-    while (copied < length) {
+    for ( ;; ) {
         b = stream->out;
 
         if (b == NULL) {
             break;
         }
 
-        if (!nxt_buf_is_sync(b) && nxt_buf_is_mem(b)) {
+        if (!nxt_buf_is_sync(b) && nxt_buf_is_mem(b)
+            && nxt_buf_mem_used_size(&b->mem) != 0)
+        {
+            if (copied == length) {
+                break;
+            }
+
             size = nxt_min(length - copied,
                            (size_t) nxt_buf_mem_used_size(&b->mem));
 
@@ -2114,6 +2682,13 @@ nxt_h2p_data_read(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
     }
 
     stream->body_bytes_sent += copied;
+
+    /*
+     * nghttp2 asks for data only while both windows are open: the waits
+     * of the stream and of the connection start anew.
+     */
+    stream->window_wait = 0;
+    stream->h2c->window_wait = 0;
 
     if (copied == 0 && !stream->eof) {
         stream->deferred = 1;
@@ -2220,9 +2795,21 @@ nxt_h2p_request_close(nxt_task_t *task, nxt_http_proto_t proto,
         return;
     }
 
+    if (nxt_h2p_conn_drain(task, h2c)) {
+        return;
+    }
+
     nxt_h2p_conn_flush(task, h2c);
 
     if (h2c->closing) {
+        return;
+    }
+
+    if (!nghttp2_session_want_read(h2c->session)
+        && !nghttp2_session_want_write(h2c->session))
+    {
+        /* The client has sent GOAWAY and its last stream has finished. */
+        nxt_h2p_conn_shutdown(task, h2c);
         return;
     }
 

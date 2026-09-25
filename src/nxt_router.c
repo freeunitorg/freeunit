@@ -15,6 +15,9 @@
 #include <nxt_script.h>
 #endif
 #include <nxt_http.h>
+#if (NXT_HAVE_NGHTTP2)
+#include <nxt_h2proto.h>
+#endif
 #include <nxt_port_memory_int.h>
 #include <nxt_unit_request.h>
 #include <nxt_unit_response.h>
@@ -4854,6 +4857,11 @@ nxt_router_listen_socket_update(nxt_task_t *task, void *obj, void *data)
     lev->socket.data = joint;
     lev->listen = joint->socket_conf->listen;
 
+#if (NXT_HAVE_NGHTTP2)
+    /* HTTP/2 connections leave the old configuration with GOAWAY. */
+    nxt_h2p_conns_drain(&engine->task, engine);
+#endif
+
     nxt_router_conf_wait_post(job);
 
     /*
@@ -4907,6 +4915,10 @@ nxt_router_worker_thread_quit(nxt_task_t *task, void *obj, void *data)
     engine = task->thread->engine;
 
     engine->shutdown = 1;
+
+#if (NXT_HAVE_NGHTTP2)
+    nxt_h2p_conns_drain(&engine->task, engine);
+#endif
 
     /*
      * Give the reference nxt_router_engine_quit() took back.  The task this
@@ -4999,6 +5011,10 @@ nxt_router_listen_socket_close(nxt_task_t *task, void *obj, void *data)
         if (nxt_fd_event_is_active(lev->socket.read)) {
             nxt_fd_event_disable_read(engine, &lev->socket);
         }
+
+#if (NXT_HAVE_NGHTTP2)
+        nxt_h2p_conns_drain(&engine->task, engine);
+#endif
     }
 
     /*

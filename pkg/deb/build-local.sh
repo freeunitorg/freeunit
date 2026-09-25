@@ -343,7 +343,7 @@ done
 apt_retry apt-get install -y --no-install-recommends \
     build-essential debhelper devscripts fakeroot lintian lsb-release \
     libxml2-utils xsltproc pkg-config git \
-    libssl-dev libpcre2-dev clang llvm cargo rustc \
+    libssl-dev libpcre2-dev libnghttp2-dev clang llvm cargo rustc \
     $PHP_PKGS \
     python3.13-dev
 

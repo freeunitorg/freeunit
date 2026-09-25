@@ -1,13 +1,16 @@
 import os
 import re
 import shutil
+import signal
 import socket
 import ssl
+import struct
 import subprocess
 import time
 
 import pytest
 
+from conftest import pid_by_name, unit_stop
 from unit.applications.tls import ApplicationTLS
 from unit.option import option
 
@@ -540,7 +543,9 @@ PREFACE = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
 
 NO_ERROR = 0x0
 PROTOCOL_ERROR = 0x1
+INTERNAL_ERROR = 0x2
 REFUSED_STREAM = 0x7
+CANCEL = 0x8
 ENHANCE_YOUR_CALM = 0xB
 
 
@@ -603,18 +608,22 @@ class RawH2:
     """HTTP/2 frames written and read one by one, for what the h2 package
     refuses to send: stalls, floods, and limits the server announces."""
 
-    def __init__(self, port=8080, ack_settings=True):
+    def __init__(
+        self, port=8080, ack_settings=True, settings=None, window_update=True
+    ):
         raw = socket.create_connection(('127.0.0.1', port), timeout=10)
         self.sock = ssl_context().wrap_socket(raw, server_hostname='localhost')
         assert self.sock.selected_alpn_protocol() == 'h2'
 
         self.ack_settings = ack_settings
+        self.window_update = window_update
         self.encoder = hpack.Encoder()
         self.decoder = hpack.Decoder()
 
         self.buf = b''
         self.closed = False
         self.goaway = None
+        self.goaways = []
         self.frames = []
         self.status = {}
         self.data = {}
@@ -623,7 +632,9 @@ class RawH2:
         self.server_settings = {}
         self.server_settings_seen = False
 
-        self.sock.sendall(PREFACE + SettingsFrame(0).serialize())
+        self.sock.sendall(
+            PREFACE + SettingsFrame(0, settings=settings or {}).serialize()
+        )
 
         # Settle the SETTINGS exchange first: a SETTINGS ACK sent later
         # could land inside a header block a test leaves open.
@@ -715,7 +726,7 @@ class RawH2:
         elif isinstance(frame, DataFrame):
             self.data[sid] = self.data.get(sid, b'') + frame.data
 
-            if frame.flow_controlled_length:
+            if frame.flow_controlled_length and self.window_update:
                 self.send(
                     WindowUpdateFrame(
                         0, window_increment=frame.flow_controlled_length
@@ -727,6 +738,7 @@ class RawH2:
 
         elif isinstance(frame, GoAwayFrame):
             self.goaway = (frame.error_code, frame.last_stream_id)
+            self.goaways.append(self.goaway)
 
         elif isinstance(frame, PingFrame) and 'ACK' not in frame.flags:
             self.send(
@@ -1119,35 +1131,66 @@ def test_http2_max_concurrent_streams(ack_settings):
     c.close()
 
 
-def test_http2_rst_stream_flood():
-    need_h2()
-    load_return()
+def rst_flood(c, count):
+    """The "rapid reset" pattern: open a stream and cancel it at once."""
 
-    c = RawH2()
-
-    # The "rapid reset" pattern: open a stream and cancel it at once, 1100
-    # times.  Each stream is a request, and the connection serves 1000
-    # requests (NXT_H2P_MAX_REQUESTS), so the GOAWAY comes from that cap:
-    # NO_ERROR with the 1000th stream as the last one.  nghttp2's reset rate
-    # limit (a burst of 1000, NXT_H2P_RST_BURST) is not reached first.
     frames = []
-    for sid in range(1, 2201, 2):
+    for sid in range(1, 2 * count, 2):
         frames.append(c.headers(sid, c.block(), end_stream=False))
-        frames.append(RstStreamFrame(sid, error_code=0x8))
+        frames.append(RstStreamFrame(sid, error_code=CANCEL))
 
     try:
         c.send(*frames)
     except OSError:
         pass
 
-    assert c.wait(lambda: c.goaway is not None)
-    assert c.goaway == (NO_ERROR, 1999)
 
-    # Nothing above the last stream was served.
-    assert all(sid <= 1999 for sid in c.status)
+@pytest.mark.parametrize('count', [300, 1100])
+def test_http2_rst_stream_flood(count):
+    need_h2()
+    load_return()
+
+    c = RawH2()
+    start = time.monotonic()
+
+    # nghttp2's reset rate limit (a burst of 200, NXT_H2P_RST_BURST, then
+    # 33 a second) stops the flood long before the request cap of 1000
+    # (NXT_H2P_MAX_REQUESTS): GOAWAY, and no stream after its last one.
+    rst_flood(c, count)
+
+    assert c.wait(lambda: c.goaway is not None)
+    elapsed = time.monotonic() - start
+
+    code, last = c.goaway
+    assert code == INTERNAL_ERROR
+
+    # The 201st stream is stream 401; the rate adds some while it runs.
+    # nghttp2 refills in whole seconds of CLOCK_MONOTONIC: 33 at each
+    # second boundary the flood crosses, even if it lasts 0.1 s.
+    refill = 33 * (int(elapsed) + 1)
+    assert 401 <= last <= 401 + 2 * refill, (last, elapsed)
+
+    assert all(sid <= last for sid in c.status)
+    assert c.wait_closed()
     c.close()
 
     assert_serves()
+
+
+def test_http2_rst_stream_burst():
+    need_h2()
+    load_return()
+
+    # 150 cancelled streams, within the burst, are no attack: the
+    # connection is kept and serves the next request.
+    c = RawH2()
+    rst_flood(c, 150)
+
+    c.request(301)
+    assert c.wait_response(301) == 200
+    assert c.goaway is None
+    assert not c.closed
+    c.close()
 
 
 def test_http2_continuation_flood():
@@ -1231,18 +1274,18 @@ def test_http2_long_method():
 
     method = 'A' * 300
 
-    # What HTTP/1 answers to the same method.
-    h1 = client.get_ssl(
-        method=method,
-        context=ssl_context(alpn=('http/1.1',)),
+    # What HTTP/1 answers to the same method.  get() always sends GET.
+    h1 = client.http(
+        method,
+        wrapper=ssl_context(alpn=('http/1.1',)).wrap_socket,
     )['status']
+    assert h1 is not None
 
     c = H2Client()
     resp = c.send(method, '/')
     resp = c.wait(resp)
 
-    # HTTP/1 takes a 300-byte method, so HTTP/2 does too.
-    assert h1 == 200
+    # HTTP/2 answers a long method as HTTP/1 does, whatever that is.
     assert resp['status'] == h1
 
     assert c.get('/')['status'] == 200
@@ -1413,3 +1456,732 @@ def test_http2_proxy(proto):
     for size in [10, 50000]:
         body = os.urandom(size // 2).hex().encode()
         assert h1_or_h2(proto, body=body) == (200, body), size
+
+
+# Stage 3: drain, shutdown, flow control and the error matrix.
+
+# The last stream ID of a shutdown notice (RFC 9113, 6.8).
+NOTICE = (NO_ERROR, 2**31 - 1)
+
+
+def load_drain(settings=None):
+    """The listener passes to the "delayed" application; "routes" answers
+    201, so a request shows which configuration served it."""
+
+    conf = {
+        'listeners': {'*:8080': {'pass': 'applications/delayed'}},
+        'routes': [{'action': {'return': 201}}],
+        'applications': {'delayed': python_app('delayed')},
+    }
+
+    if settings is not None:
+        conf['settings'] = {'http': settings}
+
+    load_conf(conf)
+
+
+def test_http2_drain_reconfigure():
+    need_h2()
+    load_drain()
+
+    c = RawH2()
+    c.request(1, headers=[('x-delay', '3')])
+
+    # The request is with its application: the connection has no event of
+    # its own when the configuration changes.
+    time.sleep(1)
+    start = time.monotonic()
+    assert 'success' in client.conf('"routes"', 'listeners/*:8080/pass')
+
+    # The shutdown notice comes at once, before the response.
+    assert c.wait(lambda: NOTICE in c.goaways, 2)
+    assert time.monotonic() - start < 1.5
+    assert 1 not in c.ended
+    assert not c.closed
+
+    # The request in flight completes; then the final GOAWAY names it as
+    # the last stream, and the connection closes.
+    assert c.wait_response(1) == 200
+    assert c.wait_closed()
+    assert c.goaways == [NOTICE, (NO_ERROR, 1)]
+    c.close()
+
+    # A new connection has the new configuration.
+    new = H2Client()
+    assert new.get('/')['status'] == 201
+    new.close()
+
+
+def test_http2_drain_listener_delete():
+    need_h2()
+    load_drain()
+
+    c = RawH2()
+    c.request(1, headers=[('x-delay', '2')])
+
+    time.sleep(1)
+    assert 'success' in client.conf_delete('listeners/*:8080')
+
+    assert c.wait(lambda: NOTICE in c.goaways, 2)
+    assert c.wait_response(1) == 200
+    assert c.wait_closed()
+    assert c.goaways == [NOTICE, (NO_ERROR, 1)]
+    c.close()
+
+
+def test_http2_drain_idle():
+    need_h2()
+    load_drain()
+
+    c = RawH2()
+    c.request(1)
+    assert c.wait_response(1) == 200
+
+    # An idle connection leaves at once, with no notice: no stream is in
+    # flight.
+    start = time.monotonic()
+    assert 'success' in client.conf('"routes"', 'listeners/*:8080/pass')
+
+    assert c.wait_closed(5)
+    assert time.monotonic() - start < 2
+    assert c.goaways == [(NO_ERROR, 1)]
+    c.close()
+
+
+def test_http2_drain_timeout():
+    need_h2()
+    load_drain({'send_timeout': 2})
+
+    c = RawH2()
+    c.request(1, headers=[('x-delay', '8')])
+
+    time.sleep(1)
+    start = time.monotonic()
+    assert 'success' in client.conf('"routes"', 'listeners/*:8080/pass')
+
+    assert c.wait(lambda: NOTICE in c.goaways, 2)
+
+    # send_timeout after the notice the request still in flight is failed,
+    # and the final GOAWAY and the close follow.
+    assert c.wait_closed(10)
+    elapsed = time.monotonic() - start
+
+    assert 1.5 < elapsed < 6, elapsed
+    assert 1 not in c.ended
+    assert c.goaways[-1] == (NO_ERROR, 1)
+    c.close()
+
+    new = H2Client()
+    assert new.get('/')['status'] == 201
+    new.close()
+
+
+def test_http2_refused_after_goaway():
+    need_h2()
+    load_return()
+
+    c = RawH2()
+
+    # 999 requests, in batches under SETTINGS_MAX_CONCURRENT_STREAMS.
+    sids = list(range(1, 1999, 2))
+
+    for i in range(0, len(sids), 100):
+        batch = sids[i : i + 100]
+        c.send(*[c.headers(sid, c.block()) for sid in batch])
+        assert c.wait(lambda: set(batch) <= c.ended)
+
+    assert c.goaway is None
+
+    # The 1000th request (stream 1999) reaches NXT_H2P_MAX_REQUESTS and
+    # gets the GOAWAY submitted.  The streams after it come in the same
+    # read, before the GOAWAY is written (nghttp2 ignores new streams only
+    # after that), and are refused, so the client may retry them elsewhere.
+    late = list(range(2001, 2013, 2))
+    c.send(*[c.headers(sid, c.block()) for sid in [1999] + late])
+
+    assert c.wait(lambda: c.goaway is not None)
+    assert c.goaway == (NO_ERROR, 1999)
+
+    assert c.wait_response(1999) == 200
+    assert c.wait_closed()
+
+    # REFUSED_STREAM, not INTERNAL_ERROR.  nghttp2 drops a RST_STREAM that
+    # is still queued when the session has no active stream left after its
+    # GOAWAY, so the last ones may come without one: GOAWAY's last stream
+    # ID tells the client that they were not processed either.
+    assert c.rst
+    assert set(c.rst) <= set(late)
+    assert set(c.rst.values()) == {REFUSED_STREAM}
+    assert c.rst.get(2001) == REFUSED_STREAM
+
+    # Every stream up to the last one is served, none after it.
+    assert all(c.status[sid] == 200 for sid in range(1, 2001, 2))
+    assert not any(sid in c.status for sid in late)
+    c.close()
+
+    assert_serves()
+
+
+def test_http2_shutdown_idle():
+    need_h2()
+    load_return()
+
+    # Idle h2 connections at process shutdown: the router closes them with
+    # nxt_runtime_close_idle_connections(), and the nghttp2 sessions and
+    # streams are released with them.  Needs --restart (unit_stop()).
+    conns = []
+
+    for _ in range(3):
+        c = RawH2()
+        c.request(1)
+        assert c.wait_response(1) == 200
+        conns.append(c)
+
+    # One that has never had a stream.
+    conns.append(RawH2())
+
+    unit_stop()
+
+    for c in conns:
+        assert c.wait_closed(5)
+        c.close()
+
+
+def test_http2_shutdown_streams():
+    need_h2()
+    load_drain()
+
+    c = RawH2()
+    c.request(1, headers=[('x-delay', '3')])
+    c.request(3, headers=[('x-delay', '3')])
+    time.sleep(1)
+
+    # Streams in flight at process shutdown: the router exits in time and
+    # without an alert.
+    unit_stop()
+
+    assert c.wait_closed(5)
+    c.close()
+
+
+def load_big(settings):
+    """Static files, big.txt over the connection window of 65535."""
+
+    share = load_share()
+
+    assert 'success' in client.conf({'http': settings}, 'settings')
+
+    with open(f'{share}/big.txt', 'rb') as f:
+        return f.read()
+
+
+def test_http2_window_stall_stream():
+    need_h2()
+    big = load_big({'send_timeout': 2})
+
+    # SETTINGS_INITIAL_WINDOW_SIZE 10, and no WINDOW_UPDATE for a stream
+    # ever: a response waits for window after 10 bytes.
+    c = RawH2(settings={0x4: 10})
+
+    c.request(1, path='/big.txt')
+    assert c.wait(lambda: c.status.get(1) == 200)
+    start = time.monotonic()
+
+    # PINGs do not keep the stream.
+    for _ in range(3):
+        c.send(PingFrame(0, opaque_data=b'12345678'))
+        time.sleep(0.5)
+
+    # send_timeout after the window ran out the stream is cancelled; the
+    # connection stays.
+    assert c.wait(lambda: 1 in c.rst, 10)
+    elapsed = time.monotonic() - start
+
+    assert 1.5 < elapsed < 6, elapsed
+    assert c.rst[1] == CANCEL
+    assert c.data[1] == big[:10]
+    assert 1 not in c.ended
+    assert not c.closed
+    assert c.goaway is None
+
+    # A WINDOW_UPDATE that comes too late is ignored.
+    c.send(WindowUpdateFrame(1, window_increment=100000))
+
+    # A response that fits in the window is still served.
+    c.request(3, path='/index.html')
+    assert c.wait_response(3) == 200
+    assert c.data[3] == b'hello h2'
+    c.close()
+
+    assert_serves()
+
+
+def test_http2_window_stall_connection():
+    need_h2()
+    big = load_big({'send_timeout': 2})
+
+    # The client never sends WINDOW_UPDATE for the connection either: after
+    # 65535 bytes no stream can move, so the connection goes.
+    c = RawH2(window_update=False)
+
+    c.request(1, path='/big.txt')
+    assert c.wait(lambda: len(c.data.get(1, b'')) == 65535)
+    start = time.monotonic()
+
+    assert c.wait_closed(10)
+    elapsed = time.monotonic() - start
+
+    assert 1.5 < elapsed < 6, elapsed
+    assert c.goaway == (NO_ERROR, 1)
+    assert c.data[1] == big[:65535]
+    assert 1 not in c.ended
+    c.close()
+
+    assert_serves()
+
+
+def test_http2_window_stall_staggered():
+    need_h2()
+    big = load_big({'send_timeout': 2})
+
+    # Stream 1 waits for its own window (10 bytes, never updated) first;
+    # 1.5 s later stream 3 uses up the connection window, which the client
+    # never updates either.  The connection stall has its own start time:
+    # stream 1 is cancelled after its send_timeout, and the connection goes
+    # only send_timeout after its own window ran out.
+    c = RawH2(settings={0x4: 10}, window_update=False)
+
+    c.request(1, path='/big.txt')
+    assert c.wait(lambda: len(c.data.get(1, b'')) == 10)
+    start1 = time.monotonic()
+
+    time.sleep(1.5)
+
+    c.request(3, path='/big.txt')
+    c.send(WindowUpdateFrame(3, window_increment=100000))
+    assert c.wait(
+        lambda: len(c.data.get(1, b'')) + len(c.data.get(3, b'')) == 65535
+    )
+    start3 = time.monotonic()
+
+    assert c.wait(lambda: 1 in c.rst, 5)
+    assert 1.5 < time.monotonic() - start1 < 4, time.monotonic() - start1
+    assert c.rst[1] == CANCEL
+
+    # The old code closed here, with the stream 1 deadline.
+    assert not c.wait_closed(max(0, start3 + 1.2 - time.monotonic()))
+    assert c.goaway is None
+
+    assert c.wait_closed(10)
+    elapsed = time.monotonic() - start3
+
+    assert 1.5 < elapsed < 6, elapsed
+    assert c.goaway == (NO_ERROR, 3)
+    assert c.data[1] == big[:10]
+    assert c.data[3] == big[: 65535 - 10]
+    assert 3 not in c.ended
+    c.close()
+
+    assert_serves()
+
+
+def test_http2_window_update_resumes():
+    need_h2()
+    big = load_big({'send_timeout': 2})
+
+    # The response waits for window twice for 1.5 s, 3 s in all: each
+    # wait is shorter than send_timeout, so none is a stall.
+    step = 100000
+    c = RawH2(settings={0x4: step})
+
+    c.request(1, path='/big.txt')
+    credit = step
+
+    # big.txt is 300000 bytes: the data fill the third window exactly, and
+    # END_STREAM goes with them.
+    assert len(big) == 3 * step
+
+    for _ in range(5):
+        assert c.wait(
+            lambda: len(c.data.get(1, b'')) >= min(credit, len(big))
+            or 1 in c.ended
+            or 1 in c.rst
+        )
+        assert 1 not in c.rst
+
+        if 1 in c.ended:
+            break
+
+        time.sleep(1.5)
+        c.send(WindowUpdateFrame(1, window_increment=step))
+        credit += step
+
+    assert 1 in c.ended
+    assert credit == 3 * step
+    assert c.data[1] == big
+    assert not c.closed
+    c.close()
+
+
+# The error matrix.  Each case must end without a router alert and, under
+# ASan and UBSan, without a sanitizer report (the fixture checks both and
+# the descriptors), with the router still serving.
+
+
+def load_matrix(processes=4):
+    """"/slow" is the "delayed" application (x-delay, x-parts), "/mirror"
+    the "mirror" one; the router itself answers 200 to anything else."""
+
+    delayed = python_app('delayed')
+    delayed['processes'] = processes
+
+    load_conf(
+        {
+            'listeners': {'*:8080': {'pass': 'routes'}},
+            'routes': [
+                {
+                    'match': {'uri': '/slow'},
+                    'action': {'pass': 'applications/delayed'},
+                },
+                {
+                    'match': {'uri': '/mirror'},
+                    'action': {'pass': 'applications/mirror'},
+                },
+                {'action': {'return': 200}},
+            ],
+            'applications': {
+                'delayed': delayed,
+                'mirror': python_app('mirror'),
+            },
+        }
+    )
+
+
+def app_pids(name, unit_pid):
+    """The application processes of this Unit only: children of the
+    prototype that this Unit's main process started.  Another Unit on the
+    host (a parallel test run) can run an application of the same name."""
+
+    out = subprocess.check_output(
+        ['ps', 'ax', '-o', 'pid=,ppid=,args=']
+    ).decode()
+    procs = [
+        (int(pid), int(ppid), args)
+        for pid, ppid, args in re.findall(
+            r'^\s*(\d+)\s+(\d+)\s+(.*)$', out, re.M
+        )
+    ]
+
+    prototypes = {
+        pid
+        for pid, ppid, args in procs
+        if ppid == unit_pid and f'unit: "{name}" prototype' in args
+    }
+
+    return [
+        pid
+        for pid, ppid, args in procs
+        if ppid in prototypes and f'unit: "{name}" application' in args
+    ]
+
+
+def test_http2_matrix_rst_mid_body():
+    need_h2()
+    load_matrix()
+
+    c = RawH2()
+
+    # The request body stops half way and the client resets the stream.
+    c.request(
+        1,
+        end_stream=False,
+        method='POST',
+        path='/mirror',
+        headers=[('content-length', '100')],
+    )
+    c.send(c.data_frame(1, b'x' * 50), RstStreamFrame(1, error_code=CANCEL))
+
+    c.request(3, method='POST', path='/mirror', end_stream=False)
+    c.send(c.data_frame(3, b'abc', end_stream=True))
+    assert c.wait_response(3) == 200
+    assert c.data[3] == b'abc'
+    assert 1 not in c.status
+    assert c.goaway is None
+    c.close()
+
+    assert_serves()
+
+
+def test_http2_matrix_rst_after_headers():
+    need_h2()
+    load_matrix()
+
+    c = RawH2()
+
+    # The response header and the first of 5 parts are out; the rest comes
+    # one part a second.
+    c.request(
+        1,
+        end_stream=False,
+        method='POST',
+        path='/slow',
+        headers=[
+            ('x-parts', '5'),
+            ('x-delay', '1'),
+            ('content-length', '10'),
+        ],
+    )
+    c.send(c.data_frame(1, b'0123456789', end_stream=True))
+
+    assert c.wait(lambda: c.data.get(1))
+    assert c.status[1] == 200
+
+    c.send(RstStreamFrame(1, error_code=CANCEL))
+
+    # The application writes the other parts to a request that is gone.
+    c.request(3)
+    assert c.wait_response(3) == 200
+
+    time.sleep(5)
+    assert 1 not in c.ended
+    assert len(c.data[1]) < 10
+
+    c.request(5, path='/slow')
+    assert c.wait_response(5) == 200
+    assert c.goaway is None
+    c.close()
+
+
+def test_http2_matrix_client_goaway():
+    need_h2()
+    load_matrix()
+
+    c = RawH2()
+
+    for sid in (1, 3, 5):
+        c.request(sid, path='/slow', headers=[('x-delay', '1')])
+
+    time.sleep(0.3)
+
+    # The client leaves; the streams it has opened are still answered, and
+    # the server closes after the last one.
+    c.send(GoAwayFrame(0, last_stream_id=0, error_code=NO_ERROR))
+
+    for sid in (1, 3, 5):
+        assert c.wait_response(sid) == 200
+
+    assert c.wait_closed(5)
+    c.close()
+
+    assert_serves()
+
+
+def test_http2_matrix_app_crash(skip_alert, unit_pid, wait_for_record):
+    need_h2()
+    load_matrix()
+
+    c = RawH2()
+    sids = [1, 3, 5, 7, 9, 11]
+
+    # 6 streams: 4 with an application process, 2 queued.
+    for sid in sids:
+        c.request(sid, path='/slow', headers=[('x-delay', '5')])
+
+    time.sleep(1.5)
+    pids = app_pids('delayed', unit_pid)
+    assert pids
+
+    for pid in pids:
+        skip_alert(fr'app process {pid} exited on signal 9')
+        os.kill(pid, signal.SIGKILL)
+
+    # Every stream ends, with an error response or a reset, and the
+    # connection stays.
+    assert c.wait(lambda: all(s in c.ended or s in c.rst for s in sids), 15)
+
+    for sid in sids:
+        if sid in c.ended and c.status.get(sid) is not None:
+            assert c.status[sid] in (200, 502, 503), sid
+
+    c.request(13)
+    assert c.wait_response(13) == 200
+    assert c.goaway is None
+    c.close()
+
+    assert_serves()
+
+    # The prototype reaps the workers and logs each death on its own time.
+    # Wait for the lines, so they fall in the log of this test.
+    for pid in pids:
+        assert wait_for_record(fr'app process {pid} exited on signal 9')
+
+
+def test_http2_matrix_tls_abort():
+    need_h2()
+    load_matrix()
+
+    c = RawH2()
+
+    for sid in (1, 3, 5, 7):
+        c.request(sid, path='/slow', headers=[('x-delay', '2')])
+
+    c.request(
+        9,
+        end_stream=False,
+        method='POST',
+        path='/mirror',
+        headers=[('content-length', '100')],
+    )
+    c.send(c.data_frame(9, b'x' * 50))
+
+    time.sleep(0.5)
+
+    # No close_notify and no FIN: a TCP reset under the TLS session.
+    c.sock.setsockopt(
+        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0)
+    )
+    c.sock.close()
+
+    assert_serves()
+
+    # The applications answer requests that are gone.
+    time.sleep(3)
+
+    assert_serves()
+
+
+@pytest.mark.parametrize('end', ['reset', 'rst_stream'])
+def test_http2_matrix_abort_queued(end, findall):
+    need_h2()
+    load_matrix(processes=1)
+
+    router = pid_by_name('unit: router')
+
+    c = RawH2()
+
+    # The first request takes the one application process; the second one
+    # waits in the router for it.
+    for sid in (1, 3):
+        c.request(sid, path='/slow', headers=[('x-delay', '2')])
+
+    assert c.wait(lambda: 1 in c.status)
+
+    if end == 'reset':
+        # The connection fails with both requests in the router.
+        c.sock.setsockopt(
+            socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0)
+        )
+
+    else:
+        # The client cancels the queued request, then leaves.
+        c.send(RstStreamFrame(3, error_code=CANCEL))
+        time.sleep(0.2)
+
+    c.sock.close()
+
+    time.sleep(0.2)
+
+    # Another listener: the configuration of the requests is released.  The
+    # applications are the same and keep running, and the queued request
+    # reaches the process: the router must have dropped it.
+    assert 'success' in client.conf(
+        {'*:8081': {'pass': 'applications/mirror'}}, 'listeners'
+    )
+
+    time.sleep(3)
+
+    assert pid_by_name('unit: router') == router
+    assert not findall(r'signal 11|\[alert\]|Sanitizer')
+
+
+def test_http2_matrix_request_cap_in_flight():
+    need_h2()
+    load_matrix()
+
+    c = RawH2()
+
+    # 997 requests, in batches under SETTINGS_MAX_CONCURRENT_STREAMS.
+    sids = list(range(1, 1995, 2))
+
+    for i in range(0, len(sids), 100):
+        batch = sids[i : i + 100]
+        c.send(*[c.headers(sid, c.block()) for sid in batch])
+        assert c.wait(lambda: set(batch) <= c.ended)
+
+    # Requests 998 to 1000 (streams 1995 to 1999) go to the application;
+    # the 1000th brings the GOAWAY while all three are in flight.
+    slow = [1995, 1997, 1999]
+    c.send(
+        *[
+            c.headers(sid, c.block(path='/slow', headers=[('x-delay', '2')]))
+            for sid in slow
+        ]
+    )
+
+    assert c.wait(lambda: c.goaway is not None, 5)
+    assert c.goaway == (NO_ERROR, 1999)
+    assert not any(sid in c.ended for sid in slow)
+
+    for sid in slow:
+        assert c.wait_response(sid) == 200
+
+    assert c.wait_closed(5)
+    c.close()
+
+    assert_serves()
+
+
+@pytest.mark.parametrize('path', ['/big.txt', '/nope'], ids=['file', 'error'])
+def test_http2_fail_before_body(path):
+    need_h2()
+    load_share()
+
+    c = RawH2()
+
+    # A request whose response the router starts at once (a static file,
+    # or an error page), and in the same read a connection error: DATA on
+    # an idle stream.  The response header is submitted and the body
+    # handler queued; then the connection fails the request before the body
+    # handler runs.  For the file, the static buffer completion then gave up
+    # the last reference to the request pool before it closed the file: the
+    # pool cleanup closed it first, the second close() failed with EBADF (an
+    # alert, which the fixture checks), and r was written after it was
+    # freed.
+    c.send(c.headers(1, c.block(path=path)), DataFrame(0x1000000, data=b''))
+
+    assert c.wait_closed()
+    assert c.goaway is not None
+    assert c.goaway[0] == PROTOCOL_ERROR
+    c.close()
+
+    assert_serves()
+
+
+def test_http2_fail_before_body_leak(search_in_file):
+    need_h2()
+
+    # The request pool of test_http2_fail_before_body leaked when the body
+    # buffers came after the request had failed: nothing completed them.
+    # Only LeakSanitizer sees that, at process exit, so this needs an ASan
+    # build, ASAN_OPTIONS=detect_leaks=1 and --restart (unit_stop()).
+    if not option.configure_flag.get('asan') or 'detect_leaks=1' not in (
+        os.environ.get('ASAN_OPTIONS', '')
+    ):
+        pytest.skip('needs an ASan build and ASAN_OPTIONS=detect_leaks=1')
+
+    load_share()
+
+    for path in ['/nope', '/big.txt'] * 3:
+        c = RawH2()
+        c.send(
+            c.headers(1, c.block(path=path)), DataFrame(0x1000000, data=b'')
+        )
+        assert c.wait_closed()
+        c.close()
+
+    # Other processes have leaks of their own at exit; only this one counts.
+    option.skip_sanitizer = True
+
+    unit_stop()
+
+    assert search_in_file(r'in nxt_h2p_on_begin_headers ') is None

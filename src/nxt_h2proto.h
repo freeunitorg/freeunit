@@ -34,7 +34,17 @@
 #define NXT_H2P_CONN_WINDOW             (1024 * 1024)
 #define NXT_H2P_HEADER_TABLE_SIZE       4096
 #define NXT_H2P_MAX_REQUESTS            1000
-#define NXT_H2P_RST_BURST               1000
+
+/*
+ * nghttp2's limit of RST_STREAM frames from the client: a burst, then so
+ * many a second.  Over it nghttp2 sends GOAWAY and serves no new stream.
+ * The burst is well below NXT_H2P_MAX_REQUESTS: with a burst as large as
+ * the request cap, a "rapid reset" flood got 1000 requests into the router
+ * on every connection and the limit was never reached.  nghttp2 stops
+ * counting once any GOAWAY has been submitted, a shutdown notice too; the
+ * request cap and the drain timeout still bound such a connection.
+ */
+#define NXT_H2P_RST_BURST               200
 #define NXT_H2P_RST_RATE                33
 #define NXT_H2P_MAX_CONTINUATIONS       8
 #define NXT_H2P_MAX_SETTINGS            32
@@ -69,6 +79,13 @@ struct nxt_h2p_stream_s {
     nxt_off_t                   body_bytes_sent;
     size_t                      header_list_size;
 
+    /*
+     * engine->timers.now when the stream's own flow-control window ran
+     * out with response data to send; the connection window has its own
+     * start time in nxt_h2proto_t.
+     */
+    nxt_msec_t                  window_start;
+
     nxt_str_t                   authority;
     nxt_str_t                   method;
     nxt_str_t                   path;
@@ -92,12 +109,20 @@ struct nxt_h2p_stream_s {
     uint8_t                     body_error;    /* 1 bit */
     uint8_t                     no_provider;   /* 1 bit */
     uint8_t                     headers_done;  /* 1 bit */
+    uint8_t                     window_wait;   /* 1 bit */
 };
 
 
 struct nxt_h2proto_s {
     nghttp2_session             *session;
     nxt_conn_t                  *conn;
+
+    /*
+     * The listener configuration the connection started with, referenced
+     * until the connection is freed.  Another joint on the listener means
+     * the configuration has changed, and the connection drains.
+     */
+    nxt_socket_conf_joint_t     *joint;
 
     nxt_queue_t                 streams;   /* of nxt_h2p_stream_t */
 
@@ -113,6 +138,15 @@ struct nxt_h2proto_s {
     /* engine->timers.now when a frame last advanced a stream. */
     nxt_msec_t                  progress;
 
+    /* engine->timers.now when the shutdown notice was submitted. */
+    nxt_msec_t                  drain_start;
+
+    /*
+     * engine->timers.now when the connection flow-control window ran out
+     * while some response had data to send.
+     */
+    nxt_msec_t                  conn_window_start;
+
     uint8_t                     busy;           /* 1 bit */
     uint8_t                     flush_pending;  /* 1 bit */
     uint8_t                     goaway_sent;    /* 1 bit */
@@ -120,10 +154,13 @@ struct nxt_h2proto_s {
     uint8_t                     failed;         /* 1 bit */
     uint8_t                     close_pending;  /* 1 bit */
     uint8_t                     closed;         /* 1 bit */
+    uint8_t                     draining;       /* 1 bit */
+    uint8_t                     window_wait;    /* 1 bit */
 };
 
 
 void nxt_h2p_conn_init(nxt_task_t *task, nxt_conn_t *c);
+void nxt_h2p_conns_drain(nxt_task_t *task, nxt_event_engine_t *engine);
 
 void nxt_h2p_request_body_read(nxt_task_t *task, nxt_http_request_t *r);
 void nxt_h2p_request_local_addr(nxt_task_t *task, nxt_http_request_t *r);

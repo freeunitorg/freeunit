@@ -46,7 +46,7 @@ SRCDIR=	$(BRAND)-$(VERSION)
 
 CODENAME = $(shell lsb_release -cs)
 
-BUILD_DEPENDS_unit = build-essential debhelper devscripts fakeroot libxml2-utils lintian lsb-release xsltproc libssl-dev libpcre2-dev pkg-config clang llvm cargo rustc
+BUILD_DEPENDS_unit = build-essential debhelper devscripts fakeroot libxml2-utils lintian lsb-release xsltproc libssl-dev libpcre2-dev libnghttp2-dev pkg-config clang llvm cargo rustc
 BUILD_DEPENDS = $(BUILD_DEPENDS_unit)
 
 MODULES=

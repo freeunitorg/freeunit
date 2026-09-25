@@ -45,6 +45,7 @@ Requires(preun):   systemd
 Requires(postun):  systemd
 
 BuildRequires: pcre2-devel
+BuildRequires: libnghttp2-devel
 BuildRequires: pkgconfig
 BuildRequires: clang
 BuildRequires: llvm

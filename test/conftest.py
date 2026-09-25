@@ -172,7 +172,20 @@ Unexpected prerequisite version "{version}" for module "{module}".
                 )
 
 
+# Alerts that every test tolerates.  A QUIT can race with the exit of
+# the process it is sent to, so the send fails with EPIPE (see #440).
+_BENIGN_ALERTS = (
+    r'read signalfd\(4\) failed',
+    r'sendmsg.+failed',
+    r'recvmsg.+failed',
+)
+
+
 def pytest_sessionstart():
+    # The session start runs Unit once, too.  Hold it to the same list
+    # as each test, or it fails on the race that each test ignores.
+    option.skip_alerts = list(_BENIGN_ALERTS)
+
     unit = unit_run()
 
     discover_available(unit)
@@ -211,11 +224,7 @@ def check_prerequisites_module(request):
 def run(request):
     unit = unit_run()
 
-    option.skip_alerts = [
-        r'read signalfd\(4\) failed',
-        r'sendmsg.+failed',
-        r'recvmsg.+failed',
-    ]
+    option.skip_alerts = list(_BENIGN_ALERTS)
     option.skip_sanitizer = False
 
     _fds_info['main']['skip'] = False

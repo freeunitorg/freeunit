@@ -30,6 +30,7 @@ on:
       - '.github/workflows/sanitize.yml'
       - '.github/scripts/check-sanitizer-reports.sh'
       - '.github/sanitizer-allowlist.txt'
+      - '.github/lsan-h2-leak.supp'
   push:
     # master is the release/default branch; pre-* are the release-prep
     # integration branches (e.g. pre-1.35.6) where the hardening actually
@@ -52,6 +53,7 @@ on:
       - '.github/workflows/sanitize.yml'
       - '.github/scripts/check-sanitizer-reports.sh'
       - '.github/sanitizer-allowlist.txt'
+      - '.github/lsan-h2-leak.supp'
 
 concurrency:
   # Cancel superseded runs for the same pull request.  Non-PR events fall back
@@ -90,7 +92,11 @@ jobs:
       matrix:
         include:
           - runtime: python
-            apt: python3-dev libpython3-dev
+            # libnghttp2-dev: this leg's unitd is built with --h2 (core_opts)
+            # for test_http2.py; python3-pip installs the "h2" package from
+            # test/requirements.txt.
+            apt: python3-dev libpython3-dev libnghttp2-dev python3-pip
+            core_opts: --h2
             configure: python --config=python3-config
             make: python3
             # --restart is required here: test_graceful_reload.py signals the
@@ -139,7 +145,14 @@ jobs:
             # (#276), and skips on any build without --debug.  Every
             # build-test leg is a release build, so this leg is the only one
             # in which that test runs rather than skips.
+            #
+            # test_http2.py runs the HTTP/2 frontend (nghttp2) under the
+            # sanitizers: drain on reconfigure and shutdown, stalled flow
+            # control, the flood limits, and the error matrix (client resets,
+            # client GOAWAY, application crash, TLS abort, request cap).  Its
+            # shutdown tests need the --restart this leg runs with.
             tests: >-
+              test/test_http2.py
               test/test_graceful_reload.py
               test/test_listener_drain.py
               test/test_static.py
@@ -237,11 +250,21 @@ jobs:
             --debug \
             --tests \
             --openssl \
+            ${{ matrix.core_opts }} \
             --cc-opt="-fsanitize=address,undefined -fno-omit-frame-pointer -O1" \
             --ld-opt="-fsanitize=address,undefined"
 
       - name: Make unit
         run: make -j$(nproc) unitd
+
+      # test_http2.py needs the "h2" package in the python3 that pytest runs
+      # under; it skips itself without it.
+      - name: Install HTTP/2 test requirements
+        if: contains(matrix.core_opts, '--h2')
+        run: |
+          sudo python3 -m pip install --break-system-packages \
+            "$(grep -E '^h2([<>=~ ]|$)' test/requirements.txt)"
+          python3 -c 'import h2, hpack, hyperframe'
 
       # --tests above only makes this target available; the default target
       # does not build it.  Without it the `libunit` parameter of
@@ -324,6 +347,39 @@ jobs:
           fi
           python3 -m pytest -v --save-log ${{ matrix.pytest_opts }} \
             ${{ matrix.tests }} | tee "${RUNNER_TEMP}/pytest.out"
+
+      # test_http2_fail_before_body_leak finds a leaked request pool that
+      # only LeakSanitizer sees, at process exit, and it skips itself unless
+      # ASAN_OPTIONS has detect_leaks=1.  The run above has detect_leaks=0,
+      # so this step runs that one test again with leak detection on.
+      #   TMPDIR
+      #     its own directory: the other processes still report their own
+      #     leaks at the test's unit_stop(), which the test ignores, and the
+      #     "Fail on sanitizer reports" step below must not scan them.
+      #   LSAN_OPTIONS
+      #     .github/lsan-h2-leak.supp waives a leak that every unitd process
+      #     has at exit; see that file for why each entry is there.
+      #   PASSED
+      #     a skip exits 0, and a skipped test proves nothing.
+      - name: Run the HTTP/2 leak regression with leak detection
+        if: contains(matrix.core_opts, '--h2')
+        env:
+          ASAN_OPTIONS: "detect_leaks=1"
+          LSAN_OPTIONS: "suppressions=${{ github.workspace }}/.github/lsan-h2-leak.supp"
+          UBSAN_OPTIONS: "print_stacktrace=1"
+          TMPDIR: ${{ runner.temp }}/h2-leak
+        run: |
+          set -o pipefail
+          mkdir -p "$TMPDIR"
+          out="${RUNNER_TEMP}/pytest-h2-leak.out"
+          python3 -m pytest -v --save-log --restart \
+            -k test_http2_fail_before_body_leak test/test_http2.py \
+            | tee "$out"
+          if ! grep -qE 'test_http2_fail_before_body_leak PASSED' "$out"; then
+            echo "::error::test_http2_fail_before_body_leak did not pass;" \
+                 "it must run, not skip, with detect_leaks=1."
+            exit 1
+          fi
 
       # A leg in which every test skipped exits 0, writes clean logs, and is
       # therefore green -- indistinguishable from one that ran and passed.
