@@ -158,7 +158,10 @@ def test_reconfigure_tls_keepalive_close(close):
         try:
             while sock.recv(4096) != b'':
                 pass
+        except TimeoutError:
+            pytest.fail('the router did not close the idle connection')
         except OSError:
+            # An SSL error or a reset: the router closed it.
             pass
 
     # Let the router run the TLS shutdown of the closed connection; it must
