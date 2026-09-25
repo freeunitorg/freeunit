@@ -1,4 +1,5 @@
 import json
+import re
 import time
 
 import pytest
@@ -306,6 +307,188 @@ def test_access_log_format(wait_for_record):
         'uri': '$uri'
     }
     check_format(log_format, '{"status":"200","uri":"/"}')
+
+
+JSON_FIELDS = [
+    'request',
+    'status',
+    'bytes_sent',
+    'remote_addr',
+    'user_agent',
+    'referer',
+    'request_time',
+    'request_id',
+]
+
+
+def get_json_record(wait_for_record, url, method='GET'):
+    found = wait_for_record(
+        fr'^\{{.*"request":"{method} {re.escape(url)} .*\}}$', 'access.log'
+    )
+    assert found is not None, 'json record'
+
+    return json.loads(found.group(0))
+
+
+def test_access_log_json(wait_for_record):
+    load('empty')
+    set_format('json')
+
+    assert (
+        client.get(
+            url='/json_fmt',
+            headers={
+                'Host': 'localhost',
+                'Connection': 'close',
+                'User-Agent': 'unit/test',
+                'Referer': 'http://example.com/from',
+            },
+        )['status']
+        == 200
+    )
+
+    entry = get_json_record(wait_for_record, '/json_fmt')
+
+    assert list(entry.keys()) == JSON_FIELDS, 'stable field set'
+
+    assert entry['request'] == 'GET /json_fmt HTTP/1.1'
+    assert entry['status'] == '200'
+    assert entry['bytes_sent'] == '0'
+    assert entry['remote_addr'] == '127.0.0.1'
+    assert entry['user_agent'] == 'unit/test'
+    assert entry['referer'] == 'http://example.com/from'
+    assert re.match(r'^\d+\.\d+$', entry['request_time']), 'request_time'
+    assert re.match(r'^[0-9a-f]{32}$', entry['request_id']), 'request_id'
+
+
+def test_access_log_json_absent_headers(wait_for_record):
+    load('empty')
+    set_format('json')
+
+    assert client.get(url='/json_bare')['status'] == 200
+
+    entry = get_json_record(wait_for_record, '/json_bare')
+
+    assert list(entry.keys()) == JSON_FIELDS, 'stable field set'
+    assert entry['user_agent'] == '-', 'absent user agent'
+    assert entry['referer'] == '-', 'absent referer'
+
+
+def test_access_log_json_escape(wait_for_record):
+    load('empty')
+    set_format('json')
+
+    user_agent = 'evil", "injected": "yes'
+    referer = 'back\\slash"'
+
+    assert (
+        client.get(
+            url='/json_esc',
+            headers={
+                'Host': 'localhost',
+                'Connection': 'close',
+                'User-Agent': user_agent,
+                'Referer': referer,
+            },
+        )['status']
+        == 200
+    )
+
+    entry = get_json_record(wait_for_record, '/json_esc')
+
+    assert list(entry.keys()) == JSON_FIELDS, 'no injected member'
+    assert entry['user_agent'] == user_agent, 'escaped user agent'
+    assert entry['referer'] == referer, 'escaped referer'
+
+
+def test_access_log_json_literal(wait_for_record):
+    load('empty')
+
+    # Only the exact "json" string selects the JSON format; any other
+    # string stays a literal log format.
+
+    def check_literal(log_format):
+        set_format(log_format)
+
+        assert client.get()['status'] == 200
+        assert (
+            wait_for_record(fr'^{re.escape(log_format)}$', 'access.log')
+            is not None
+        ), 'literal format'
+
+    check_literal('jsonx')
+    check_literal('json ')
+    check_literal('JSON')
+
+
+def test_access_log_json_status_bytes(wait_for_record):
+    load('mirror')
+    set_format('json')
+
+    # "status" and "bytes_sent" must follow the response, not be constant.
+
+    assert client.post(url='/json_body', body='01234')['status'] == 200
+
+    entry = get_json_record(wait_for_record, '/json_body', 'POST')
+
+    assert entry['status'] == '200', 'status 200'
+    assert entry['bytes_sent'] == '5', 'bytes_sent mirror'
+
+    assert 'success' in client.conf(
+        [{"action": {"return": 404}}], 'routes'
+    ), 'routes'
+    assert 'success' in client.conf(
+        {"*:8080": {"pass": "routes"}}, 'listeners'
+    ), 'listeners'
+
+    resp = client.get(url='/json_404')
+    assert resp['status'] == 404
+
+    entry = get_json_record(wait_for_record, '/json_404')
+
+    assert entry['status'] == '404', 'status 404'
+    assert entry['bytes_sent'] == str(len(resp['body'])), 'bytes_sent 404'
+    assert entry['bytes_sent'] != '0', 'bytes_sent 404 not empty'
+
+
+def test_access_log_json_empty_header(wait_for_record):
+    load('empty')
+    set_format('json')
+
+    # An absent header is "-", a present but empty one is "".
+
+    assert (
+        client.get(
+            url='/json_empty',
+            headers={
+                'Host': 'localhost',
+                'Connection': 'close',
+                'User-Agent': '',
+            },
+        )['status']
+        == 200
+    )
+
+    entry = get_json_record(wait_for_record, '/json_empty')
+
+    assert entry['user_agent'] == '', 'empty user agent'
+    assert entry['referer'] == '-', 'absent referer'
+
+
+def test_access_log_json_if(search_in_file, wait_for_record):
+    load('empty')
+    set_format('json')
+    set_if('$arg_log')
+
+    assert client.get(url='/json_if_skip')['status'] == 200
+    assert client.get(url='/json_if_log?log=1')['status'] == 200
+
+    entry = get_json_record(wait_for_record, '/json_if_log?log=1')
+
+    assert list(entry.keys()) == JSON_FIELDS, 'stable field set'
+    assert (
+        search_in_file(r'"GET /json_if_skip ', 'access.log') is None
+    ), 'if skips record'
 
 
 def _read_log_lines():
