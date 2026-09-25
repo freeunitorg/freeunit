@@ -14,12 +14,17 @@
  * An mmap fragment that carries no shared memory record -- empty, a partial
  * record, or one that names no segment -- is refused: its read buffer used
  * to be kept in the stream and also given back to port->free_bufs.
+ *
+ * An mmap fragment of empty records keeps a buffer per record while its
+ * payload is next to nothing; the buffers count too, or a port's total
+ * admits millions of them.
  */
 
 #include <nxt_main.h>
 #include <nxt_port.h>
 #include <nxt_port_memory_int.h>
 #include <nxt_runtime.h>
+#include <nxt_event_engine.h>
 #include "nxt_tests.h"
 
 #include <sys/mman.h>
@@ -38,6 +43,9 @@ static nxt_bool_t  nxt_frag_test_oom;
 static nxt_task_t  *nxt_frag_test_task;
 static nxt_port_t  *nxt_frag_test_port;
 static nxt_bool_t  nxt_frag_test_aliased;
+
+static nxt_pid_t       nxt_frag_test_sender;
+static nxt_chunk_id_t  nxt_frag_test_chunk;
 
 
 typedef struct {
@@ -377,6 +385,172 @@ nxt_frag_test_mmap_run(nxt_thread_t *thr, nxt_port_t *port)
 }
 
 
+/*
+ * In a child: with the port's total all taken but "room", open a stream of
+ * mmap fragments, each a max_size read buffer full of empty records for a
+ * segment the sender did share, and send until the stream is dropped.
+ * Every record keeps a buffer of at least sizeof(nxt_buf_t), so what the
+ * stream held must fit in the room it had.
+ */
+static int
+nxt_frag_test_records_child(void *data)
+{
+    size_t                  room, nrecs;
+    uint32_t                streams;
+    nxt_buf_t               *b;
+    nxt_uint_t              i, j, n;
+    nxt_port_t              *port;
+    nxt_work_queue_t        wq;
+    nxt_port_mmap_msg_t     *rec;
+    nxt_port_recv_msg_t     msg;
+    nxt_work_queue_cache_t  cache;
+
+    port = nxt_frag_test_port;
+    port->handler = nxt_frag_test_handler;
+    port->max_size = 16 * 1024;
+
+    /* Where a dropped stream's shared memory buffers complete. */
+    nxt_memzero(&wq, sizeof(nxt_work_queue_t));
+    nxt_work_queue_cache_create(&cache, 1024);
+    wq.cache = &cache;
+    port->socket.read_work_queue = &wq;
+
+    nrecs = port->max_size / sizeof(nxt_port_mmap_msg_t);
+    room = 64 * port->max_size;
+    n = room / port->max_size + 2;
+
+    streams = port->frag_streams;
+    port->frag_size = NXT_PORT_FRAG_TOTAL_MAX - room;
+
+    for (i = 0; i < n; i++) {
+        b = nxt_buf_mem_alloc(port->mem_pool, port->max_size, 0);
+        if (b == NULL) {
+            return 8;
+        }
+
+        rec = (nxt_port_mmap_msg_t *) b->mem.start;
+
+        for (j = 0; j < nrecs; j++) {
+            rec[j].mmap_id = 0;
+            rec[j].chunk_id = nxt_frag_test_chunk;
+            rec[j].size = 0;
+        }
+
+        nxt_memzero(&msg, sizeof(nxt_port_recv_msg_t));
+
+        msg.port = port;
+        msg.buf = b;
+        msg.size = sizeof(nxt_port_msg_t) + nrecs * sizeof(*rec);
+        msg.fd[0] = -1;
+        msg.fd[1] = -1;
+        msg.port_msg.stream = NXT_FRAG_TEST_STREAM - 2;
+        msg.port_msg.pid = nxt_frag_test_sender;
+        msg.port_msg.type = _NXT_PORT_MSG_STATUS;
+        msg.port_msg.nf = (i != 0);
+        msg.port_msg.mf = 1;
+        msg.port_msg.mmap = 1;
+
+        nxt_port_test_run_read_msg_process(nxt_frag_test_task, port, &msg);
+
+        if (msg.buf == b) {
+            b->next = port->free_bufs;
+            port->free_bufs = b;
+        }
+
+        if (port->frag_streams == streams) {
+            break;
+        }
+    }
+
+    /* 1: held more than its room; 2: never dropped; 4: not given back. */
+    return (i * nrecs * sizeof(nxt_buf_t) > room)
+           | ((i == n) << 1)
+           | ((port->frag_size != NXT_PORT_FRAG_TOTAL_MAX - room) << 2);
+}
+
+
+/*
+ * The runtime knows one sender, with a segment in its incoming array, so
+ * nxt_port_mmap_read() turns each of its records into a buffer.
+ */
+static nxt_int_t
+nxt_frag_test_records_run(nxt_thread_t *thr, nxt_port_t *port)
+{
+    int                      status;
+    nxt_buf_t                *seg;
+    nxt_task_t               *task;
+    nxt_process_t            *process;
+    nxt_runtime_t            *rt, *saved_rt;
+    nxt_event_engine_t       engine, *saved_engine;
+    nxt_port_mmap_handler_t  *mmap_handler;
+
+    task = thr->task;
+
+    rt = nxt_mp_zalloc(port->mem_pool, sizeof(nxt_runtime_t));
+    process = nxt_mp_zalloc(port->mem_pool, sizeof(nxt_process_t));
+
+    if (rt == NULL || process == NULL
+        || nxt_thread_mutex_create(&rt->processes_mutex) != NXT_OK)
+    {
+        return NXT_ERROR;
+    }
+
+    rt->mem_pool = port->mem_pool;
+
+    nxt_memzero(&engine, sizeof(engine));
+    engine.mem_pool = port->mem_pool;
+    engine.task.thread = thr;
+    engine.task.log = thr->log;
+
+    saved_rt = thr->runtime;
+    saved_engine = thr->engine;
+    thr->runtime = rt;
+    thr->engine = &engine;
+
+    status = -1;
+
+    process->pid = nxt_pid + 43;
+    process->use_count = 1;
+    nxt_queue_init(&process->ports);
+
+    if (nxt_thread_mutex_create(&process->incoming.mutex) != NXT_OK) {
+        goto done;
+    }
+
+    nxt_runtime_process_add(task, process);
+
+    seg = nxt_port_mmap_get_buf(task, &process->incoming,
+                                PORT_MMAP_CHUNK_SIZE);
+    if (seg == NULL) {
+        goto done;
+    }
+
+    mmap_handler = seg->parent;
+
+    nxt_frag_test_task = task;
+    nxt_frag_test_port = port;
+    nxt_frag_test_sender = process->pid;
+    nxt_frag_test_chunk = nxt_port_mmap_chunk_id(mmap_handler->hdr,
+                                                 seg->mem.pos);
+
+    status = nxt_test_in_child(thr, "port frag test",
+                               nxt_frag_test_records_child, NULL);
+    if (status != 0) {
+        nxt_log_alert(thr->log, "port frag test: mmap fragments of empty "
+                      "records passed the port's total (%d)", status);
+    }
+
+done:
+
+    /* The segment stays mapped, like other port fixtures. */
+
+    thr->runtime = saved_rt;
+    thr->engine = saved_engine;
+
+    return (status == 0) ? NXT_OK : NXT_ERROR;
+}
+
+
 nxt_int_t
 nxt_port_frag_test(nxt_thread_t *thr)
 {
@@ -415,6 +589,10 @@ nxt_port_frag_test(nxt_thread_t *thr)
 
     if (ret == NXT_OK) {
         ret = nxt_frag_test_mmap_run(thr, port);
+    }
+
+    if (ret == NXT_OK) {
+        ret = nxt_frag_test_records_run(thr, port);
     }
 
     /*
