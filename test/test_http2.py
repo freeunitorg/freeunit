@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from conftest import unit_stop
+from conftest import pid_by_name, unit_stop
 from unit.applications.tls import ApplicationTLS
 from unit.option import option
 
@@ -1415,18 +1415,18 @@ def test_http2_long_method():
 
     method = 'A' * 300
 
-    # What HTTP/1 answers to the same method.
-    h1 = client.get_ssl(
-        method=method,
-        context=ssl_context(alpn=('http/1.1',)),
+    # What HTTP/1 answers to the same method.  get() always sends GET.
+    h1 = client.http(
+        method,
+        wrapper=ssl_context(alpn=('http/1.1',)).wrap_socket,
     )['status']
+    assert h1 is not None
 
     c = H2Client()
     resp = c.send(method, '/')
     resp = c.wait(resp)
 
-    # HTTP/1 takes a 300-byte method, so HTTP/2 does too.
-    assert h1 == 200
+    # HTTP/2 answers a long method as HTTP/1 does, whatever that is.
     assert resp['status'] == h1
 
     assert c.get('/')['status'] == 200
@@ -1998,14 +1998,31 @@ def load_matrix(processes=4):
     )
 
 
-def app_pids(name):
-    out = subprocess.check_output(['ps', 'ax']).decode()
+def app_pids(name, unit_pid):
+    """The application processes of this Unit only: children of the
+    prototype that this Unit's main process started.  Another Unit on the
+    host (a parallel test run) can run an application of the same name."""
+
+    out = subprocess.check_output(
+        ['ps', 'ax', '-o', 'pid=,ppid=,args=']
+    ).decode()
+    procs = [
+        (int(pid), int(ppid), args)
+        for pid, ppid, args in re.findall(
+            r'^\s*(\d+)\s+(\d+)\s+(.*)$', out, re.M
+        )
+    ]
+
+    prototypes = {
+        pid
+        for pid, ppid, args in procs
+        if ppid == unit_pid and f'unit: "{name}" prototype' in args
+    }
 
     return [
-        int(pid)
-        for pid in re.findall(
-            rf'^\s*(\d+).*unit: "{name}" application', out, re.M
-        )
+        pid
+        for pid, ppid, args in procs
+        if ppid in prototypes and f'unit: "{name}" application' in args
     ]
 
 
@@ -2100,11 +2117,9 @@ def test_http2_matrix_client_goaway():
     assert_serves()
 
 
-def test_http2_matrix_app_crash(skip_alert):
+def test_http2_matrix_app_crash(skip_alert, unit_pid, wait_for_record):
     need_h2()
     load_matrix()
-
-    skip_alert(r'process \d+ exited on signal 9')
 
     c = RawH2()
     sids = [1, 3, 5, 7, 9, 11]
@@ -2114,10 +2129,11 @@ def test_http2_matrix_app_crash(skip_alert):
         c.request(sid, path='/slow', headers=[('x-delay', '5')])
 
     time.sleep(1.5)
-    pids = app_pids('delayed')
+    pids = app_pids('delayed', unit_pid)
     assert pids
 
     for pid in pids:
+        skip_alert(fr'app process {pid} exited on signal 9')
         os.kill(pid, signal.SIGKILL)
 
     # Every stream ends, with an error response or a reset, and the
@@ -2134,6 +2150,11 @@ def test_http2_matrix_app_crash(skip_alert):
     c.close()
 
     assert_serves()
+
+    # The prototype reaps the workers and logs each death on its own time.
+    # Wait for the lines, so they fall in the log of this test.
+    for pid in pids:
+        assert wait_for_record(fr'app process {pid} exited on signal 9')
 
 
 def test_http2_matrix_tls_abort():
@@ -2168,6 +2189,50 @@ def test_http2_matrix_tls_abort():
     time.sleep(3)
 
     assert_serves()
+
+
+@pytest.mark.parametrize('end', ['reset', 'rst_stream'])
+def test_http2_matrix_abort_queued(end, findall):
+    need_h2()
+    load_matrix(processes=1)
+
+    router = pid_by_name('unit: router')
+
+    c = RawH2()
+
+    # The first request takes the one application process; the second one
+    # waits in the router for it.
+    for sid in (1, 3):
+        c.request(sid, path='/slow', headers=[('x-delay', '2')])
+
+    assert c.wait(lambda: 1 in c.status)
+
+    if end == 'reset':
+        # The connection fails with both requests in the router.
+        c.sock.setsockopt(
+            socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0)
+        )
+
+    else:
+        # The client cancels the queued request, then leaves.
+        c.send(RstStreamFrame(3, error_code=CANCEL))
+        time.sleep(0.2)
+
+    c.sock.close()
+
+    time.sleep(0.2)
+
+    # Another listener: the configuration of the requests is released.  The
+    # applications are the same and keep running, and the queued request
+    # reaches the process: the router must have dropped it.
+    assert 'success' in client.conf(
+        {'*:8081': {'pass': 'applications/mirror'}}, 'listeners'
+    )
+
+    time.sleep(3)
+
+    assert pid_by_name('unit: router') == router
+    assert not findall(r'signal 11|\[alert\]|Sanitizer')
 
 
 def test_http2_matrix_request_cap_in_flight():
