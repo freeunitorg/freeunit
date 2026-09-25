@@ -28,9 +28,11 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Queue;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.websocket.CloseReason;
@@ -120,9 +122,27 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
     }
 
 
+    /*
+     * The batched frames sit in outputBuffer, which only writeMessagePart()
+     * knows how to hand to doWrite(), so the flush goes through startMessage()
+     * like any other message part.  sendMessageBlock() writes straight to the
+     * request instead, and with no payload it has nothing to write.
+     */
     @Override
     public void flushBatch() throws IOException {
-        sendMessageBlock(Constants.INTERNAL_OPCODE_FLUSH, null, true);
+        FutureToSendHandler f2sh = new FutureToSendHandler(wsSession);
+        startMessage(Constants.INTERNAL_OPCODE_FLUSH, null, true, f2sh);
+
+        try {
+            long timeout = getBlockingSendTimeout();
+            if (timeout < 0) {
+                f2sh.get();
+            } else {
+                f2sh.get(timeout, TimeUnit.MILLISECONDS);
+            }
+        } catch (InterruptedException | ExecutionException | TimeoutException e) {
+            throw new IOException(e);
+        }
     }
 
 
@@ -379,7 +399,16 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
                 intermediateMessageHandler,
                 new EndMessageHandler(this, handler), -1));
 
-        messageParts = transformation.sendMessagePart(messageParts);
+        /*
+         * On the server side there is no transformation: Tomcat's
+         * WsHttpUpgradeHandler.init() takes it from the WsFrameServer it
+         * creates, and Unit parses the frames itself, so no WsFrameServer is
+         * ever created and no transformation is installed.  The message
+         * parts then go out as they are.
+         */
+        if (transformation != null) {
+            messageParts = transformation.sendMessagePart(messageParts);
+        }
 
         // Some extensions/transformations may buffer messages so it is possible
         // that no message parts will be returned. If this is the case the
@@ -714,6 +743,22 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
         this.request = request;
     }
 
+
+    /*
+     * The transport doWrite() sends through.  Unit writes the frame header
+     * itself, so a frame is handed over as its payload, opcode and fin bit
+     * rather than as the serialised header writeHeader() built.
+     */
+    protected final void sendWsFrame(ByteBuffer payload, byte opCode,
+            boolean fin, long timeoutExpiry) throws IOException {
+        request.sendWsFrame(payload, opCode, fin, timeoutExpiry);
+    }
+
+
+    protected final boolean isSessionOpen() {
+        return wsSession.isOpen();
+    }
+
     protected void setEncoders(EndpointConfig endpointConfig)
             throws DeploymentException {
         encoderEntries.clear();
@@ -786,13 +831,20 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
             b = 0;
         }
 
+        /*
+         * The frame carries position()..limit(), which is what both write
+         * paths send; limit() alone overstates it for a buffer that does not
+         * start at 0, such as a slice or a partly read one.
+         */
+        int len = payload.remaining();
+
         // Next write the mask && length length
-        if (payload.limit() < 126) {
-            headerBuffer.put((byte) (payload.limit() | b));
-        } else if (payload.limit() < 65536) {
+        if (len < 126) {
+            headerBuffer.put((byte) (len | b));
+        } else if (len < 65536) {
             headerBuffer.put((byte) (126 | b));
-            headerBuffer.put((byte) (payload.limit() >>> 8));
-            headerBuffer.put((byte) (payload.limit() & 0xFF));
+            headerBuffer.put((byte) (len >>> 8));
+            headerBuffer.put((byte) (len & 0xFF));
         } else {
             // Will never be more than 2^31-1
             headerBuffer.put((byte) (127 | b));
@@ -800,10 +852,10 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
             headerBuffer.put((byte) 0);
             headerBuffer.put((byte) 0);
             headerBuffer.put((byte) 0);
-            headerBuffer.put((byte) (payload.limit() >>> 24));
-            headerBuffer.put((byte) (payload.limit() >>> 16));
-            headerBuffer.put((byte) (payload.limit() >>> 8));
-            headerBuffer.put((byte) (payload.limit() & 0xFF));
+            headerBuffer.put((byte) (len >>> 24));
+            headerBuffer.put((byte) (len >>> 16));
+            headerBuffer.put((byte) (len >>> 8));
+            headerBuffer.put((byte) (len & 0xFF));
         }
         if (masked) {
             headerBuffer.put(mask[0]);

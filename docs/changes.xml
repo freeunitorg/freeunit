@@ -546,6 +546,22 @@ inbound limit only.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+the java module sent nothing through the asynchronous WebSocket remote.  Every
+send from getAsyncRemote() -- sendText(), sendBinary() and sendObject(), with a
+SendHandler or through the Future they return -- ended in a doWrite() that had
+no body, so no frame left, the handler was never called and Future.get()
+blocked for good; getBasicRemote() sends through another path and was not
+affected.  Such a send now goes out as one from the blocking remote does, and
+its handler or future completes on the sending thread with the outcome, which
+is a failure once the session is closed (#434).  Batching works as well:
+flushBatch() and setBatchingAllowed(false) threw instead of sending what was
+batched, and a batched frame from a buffer whose position was not 0 had a
+header that overstated its length and corrupted the frames after it.
+</para>
+</change>
+
 </changes>
 
 

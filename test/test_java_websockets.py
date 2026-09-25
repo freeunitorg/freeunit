@@ -1433,3 +1433,217 @@ def test_java_websockets_binary_message_too_big_reason():
     assert 'binary' in frame['reason'], 'reason names the binary message'
 
     sock.close()
+
+
+# async remote (issue #434)
+
+
+def test_java_websockets_async_text():
+    # The asynchronous remote used to send nothing and never call the
+    # SendHandler, so the future from sendText(String) never completed.
+    client.load('websockets_async')
+
+    _, sock, _ = ws.upgrade()
+
+    # SendHandler form
+
+    ws.frame_write(sock, ws.OP_TEXT, 'handler:blah')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'handler:blah')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'handler-ok')
+
+    # Future form
+
+    ws.frame_write(sock, ws.OP_TEXT, 'blah')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'blah')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'future-done')
+
+    # sendObject(Object) with an Integer, which is sent as text
+
+    ws.frame_write(sock, ws.OP_TEXT, 'object:123')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, '123')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'future-done')
+
+    # sendObject(Object) with a String, which has no encoder: the future
+    # completes with the failure instead of hanging
+
+    ws.frame_write(sock, ws.OP_TEXT, 'object:blah')
+    frame = ws.frame_read(sock)
+    assert frame['data'].startswith(b'future-fail: '), 'failed future'
+    assert b'EncodeException' in frame['data'], 'failed future reason'
+
+    # the session is usable for a further message after each of them
+
+    ws.frame_write(sock, ws.OP_TEXT, 'handler:again')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'handler:again')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'handler-ok')
+
+    close_connection(sock)
+
+
+def test_java_websockets_async_binary():
+    client.load('websockets_async')
+
+    _, sock, _ = ws.upgrade()
+
+    # SendHandler form
+
+    ws.frame_write(sock, ws.OP_BINARY, b'h\x00\x01\x02\xff')
+    check_frame(ws.frame_read(sock), True, ws.OP_BINARY, b'h\x00\x01\x02\xff')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'handler-ok')
+
+    # Future form
+
+    ws.frame_write(sock, ws.OP_BINARY, b'\x00\x01\x02\xff')
+    check_frame(ws.frame_read(sock), True, ws.OP_BINARY, b'\x00\x01\x02\xff')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'future-done')
+
+    close_connection(sock)
+
+
+def test_java_websockets_async_large():
+    # A message larger than the module's 8 KiB buffers: the text one still
+    # leaves in 8 KiB frames on the asynchronous path, the binary one whole.
+    client.load('websockets_async')
+
+    _, sock, _ = ws.upgrade()
+
+    payload = '*' * 65536
+
+    ws.frame_write(sock, ws.OP_TEXT, payload)
+    check_frame(ws.message_read(sock), True, ws.OP_TEXT, payload)
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'future-done')
+
+    payload = b'*' * 65536
+
+    ws.frame_write(sock, ws.OP_BINARY, payload)
+    check_frame(ws.frame_read(sock), True, ws.OP_BINARY, payload)
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'future-done')
+
+    payload = b'h' + b'*' * 65535
+
+    ws.frame_write(sock, ws.OP_BINARY, payload)
+    check_frame(ws.frame_read(sock), True, ws.OP_BINARY, payload)
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'handler-ok')
+
+    close_connection(sock)
+
+
+def test_java_websockets_async_batch():
+    # Batched messages are held until the batch is flushed.  flushBatch()
+    # used to hand the request a null payload and throw, so disallowing
+    # batching failed and the held messages were never sent.
+    client.load('websockets_async')
+
+    _, sock, _ = ws.upgrade()
+
+    ws.frame_write(sock, ws.OP_TEXT, 'batch:3')
+
+    for i in range(3):
+        check_frame(ws.frame_read(sock), True, ws.OP_TEXT, f'b{i}')
+
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'batch-flushed')
+
+    # the session is usable after the flush
+
+    ws.frame_write(sock, ws.OP_TEXT, 'handler:again')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'handler:again')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'handler-ok')
+
+    close_connection(sock)
+
+
+def test_java_websockets_async_batch_offset():
+    # A batched buffer whose position() is not 0: its frame header must give
+    # the bytes actually sent, or the frame after it is read as its payload.
+    client.load('websockets_async')
+
+    _, sock, _ = ws.upgrade()
+
+    payload = b'o\x00\x01\x02\x03\x04\x05'
+
+    ws.frame_write(sock, ws.OP_BINARY, payload)
+    check_frame(ws.frame_read(sock), True, ws.OP_BINARY, payload[3:])
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'after')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'offset-flushed')
+
+    close_connection(sock)
+
+
+def test_java_websockets_async_nested():
+    # A SendHandler that waits on a send of its own, and one that flushes a
+    # batch: the nested completion has to run before the handler returns.
+    client.load('websockets_async')
+
+    _, sock, _ = ws.upgrade()
+
+    ws.frame_write(sock, ws.OP_TEXT, 'nested:a')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'nested:a')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'nested-b')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'nested-c')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'nested-done')
+
+    close_connection(sock)
+
+
+def test_java_websockets_async_threads():
+    # Sends from several threads at once: every one of them is echoed and
+    # every future completes.  A completion is queued behind a running one
+    # only on the same thread; a queue shared by the endpoint could take a
+    # second thread's completion after the first had stopped draining it.
+    client.load('websockets_async')
+
+    _, sock, _ = ws.upgrade()
+
+    n = 8
+
+    for _ in range(10):
+        ws.frame_write(sock, ws.OP_TEXT, f'threads:{n}')
+
+        echoes = set()
+        for _ in range(n):
+            frame = ws.frame_read(sock)
+            assert frame['opcode'] == ws.OP_TEXT, 'echo opcode'
+            echoes.add(frame['data'].decode())
+
+        assert echoes == {f't{i}' for i in range(n)}, 'every send echoed'
+        check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'threads-done')
+
+    close_connection(sock)
+
+
+def test_java_websockets_async_16m(is_unsafe):
+    if not is_unsafe:
+        pytest.skip('unsafe, long run')
+
+    # The asynchronous text path sends a message 8 KiB at a time and starts
+    # each part from the completion of the previous one; a 16 MiB message is
+    # 2048 parts, which must not nest on the stack.
+    client.load('websockets_async')
+
+    assert 'success' in client.conf(
+        {
+            'http': {
+                'websocket': {
+                    'max_frame_size': 33554432,
+                    'keepalive_interval': 0,
+                }
+            }
+        },
+        'settings',
+    ), 'increase max_frame_size and keepalive_interval'
+
+    _, sock, _ = ws.upgrade()
+
+    payload = '*' * 16 * 2**20
+
+    ws.frame_write(sock, ws.OP_TEXT, payload)
+    check_frame(ws.message_read(sock), True, ws.OP_TEXT, payload)
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'future-done')
+
+    payload = b'*' * 16 * 2**20
+
+    ws.frame_write(sock, ws.OP_BINARY, payload)
+    check_frame(ws.frame_read(sock), True, ws.OP_BINARY, payload)
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'future-done')
+
+    close_connection(sock)
