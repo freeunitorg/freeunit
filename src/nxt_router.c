@@ -7714,6 +7714,18 @@ nxt_router_app_prepare_request(nxt_task_t *task,
 
 
 /*
+ * The configuration validator checks schedule header names against this:
+ * nxt_router_prepare_msg() refuses a name that is too long with the prefix.
+ */
+
+size_t
+nxt_router_app_field_prefix_length(nxt_app_type_t type)
+{
+    return nxt_app_msg_prefix[type]->length;
+}
+
+
+/*
  * Builds the nxt_unit_request_t for the application in shared memory.
  *
  * Every length that lands in a narrow field of the libunit protocol is

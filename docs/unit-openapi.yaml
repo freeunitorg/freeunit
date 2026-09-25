@@ -7226,7 +7226,9 @@ components:
             `Transfer-Encoding`, `Connection`, `Upgrade`, `Keep-Alive`, `TE`,
             `Expect`, and any `Sec-WebSocket-*` name. Header values must not
             contain control characters, and all headers together must not
-            exceed 8192 bytes."
+            exceed 8192 bytes. A header name is at most 255 bytes, or 250
+            bytes when `pass` names a PHP, Perl or Ruby application, which
+            receives each name with the `HTTP_` prefix added."
           additionalProperties:
             type: string
           example:

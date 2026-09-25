@@ -253,6 +253,8 @@ static nxt_int_t nxt_conf_vldt_schedule_overlap(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_schedule_headers(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_schedule_field_names(
+    nxt_conf_validation_t *vldt, nxt_conf_value_t *value);
 static nxt_int_t nxt_conf_vldt_schedule_header(nxt_conf_validation_t *vldt,
     nxt_str_t *name, nxt_conf_value_t *value);
 
@@ -5056,6 +5058,11 @@ nxt_conf_vldt_schedule(nxt_conf_validation_t *vldt, nxt_str_t *name,
         return ret;
     }
 
+    ret = nxt_conf_vldt_schedule_field_names(vldt, value);
+    if (ret != NXT_OK) {
+        return ret;
+    }
+
     /* The request as a run would make it, with every header handled. */
 
     nxt_conf_get_string(nxt_conf_get_object_member(value, &uri_str, NULL),
@@ -5244,6 +5251,94 @@ nxt_conf_vldt_schedule_headers(nxt_conf_validation_t *vldt,
         return nxt_conf_vldt_error(vldt, "The schedule \"headers\" must not "
                                    "exceed %d bytes in total.",
                                    NXT_SCHEDULE_HEADERS_MAX);
+    }
+
+    return NXT_OK;
+}
+
+
+/*
+ * A field name reaches the application in a uint8_t, with the prefix of the
+ * application type ("HTTP_" for PHP, Perl and Ruby) added on top, and
+ * nxt_router_prepare_msg() refuses a name that does not fit with 431.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_schedule_field_names(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value)
+{
+    size_t                 max;
+    uint32_t               next;
+    nxt_int_t              ret;
+    nxt_str_t              name, pass, type;
+    nxt_str_t              segments[3];
+    nxt_thread_t           *thread;
+    nxt_conf_value_t       *headers, *app, *member;
+    nxt_conf_vldt_path_t   seg;
+    nxt_app_lang_module_t  *lang;
+
+    static const nxt_str_t  pass_str = nxt_string("pass");
+    static const nxt_str_t  headers_str = nxt_string("headers");
+    static const nxt_str_t  type_str = nxt_string("type");
+
+    headers = nxt_conf_get_object_member(value, &headers_str, NULL);
+    if (headers == NULL) {
+        return NXT_OK;
+    }
+
+    nxt_conf_get_string(nxt_conf_get_object_member(value, &pass_str, NULL),
+                        &pass);
+
+    ret = nxt_http_pass_segments(vldt->pool, &pass, segments, 3);
+    if (ret != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    /* The application's own validation reports a missing or bad "type". */
+
+    app = nxt_conf_get_object_member(vldt->conf, &segments[0], NULL);
+    if (app == NULL) {
+        return NXT_OK;
+    }
+
+    app = nxt_conf_get_object_member(app, &segments[1], NULL);
+    if (app == NULL) {
+        return NXT_OK;
+    }
+
+    member = nxt_conf_get_object_member(app, &type_str, NULL);
+    if (member == NULL || nxt_conf_type(member) != NXT_CONF_STRING) {
+        return NXT_OK;
+    }
+
+    nxt_conf_get_string(member, &type);
+
+    thread = nxt_thread();
+
+    lang = nxt_app_lang_module(thread->runtime, &type);
+    if (lang == NULL) {
+        return NXT_OK;
+    }
+
+    max = UINT8_MAX - nxt_router_app_field_prefix_length(lang->type);
+    next = 0;
+
+    while (nxt_conf_next_object_member(headers, &name, &next) != NULL) {
+        if (name.length > max) {
+            seg.prev = vldt->path;
+            seg.seg = headers_str;
+            vldt->path = &seg;
+
+            ret = nxt_conf_vldt_member_error(vldt, &name, "The schedule "
+                                             "header name is %uz bytes long; "
+                                             "an application of type \"%V\" "
+                                             "accepts up to %uz.",
+                                             name.length, &type, max);
+
+            vldt->path = seg.prev;
+
+            return ret;
+        }
     }
 
     return NXT_OK;
