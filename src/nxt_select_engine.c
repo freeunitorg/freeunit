@@ -14,6 +14,8 @@ static void nxt_select_enable(nxt_event_engine_t *engine, nxt_fd_event_t *ev);
 static void nxt_select_disable(nxt_event_engine_t *engine, nxt_fd_event_t *ev);
 static nxt_bool_t nxt_select_close(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
+static void nxt_select_cancel_changes(nxt_event_engine_t *engine,
+    nxt_fd_event_t *ev);
 static void nxt_select_enable_read(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
 static void nxt_select_enable_write(nxt_event_engine_t *engine,
@@ -42,6 +44,7 @@ const nxt_event_interface_t  nxt_select_engine = {
     nxt_select_disable,
     nxt_select_disable,
     nxt_select_close,
+    nxt_select_cancel_changes,
     nxt_select_enable_read,
     nxt_select_enable_write,
     nxt_select_disable_read,
@@ -121,6 +124,17 @@ nxt_select_close(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
     nxt_select_disable(engine, ev);
 
     return 0;
+}
+
+
+/*
+ * select() applies every change as it is made and batches nothing, so this
+ * engine never sets ->changing and holds no pending change to drop.
+ */
+
+static void
+nxt_select_cancel_changes(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
+{
 }
 
 

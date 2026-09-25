@@ -7,13 +7,18 @@ import javax.websocket.PongMessage;
 import javax.websocket.Session;
 import javax.websocket.server.ServerEndpoint;
 
+/*
+ * A minimal mirror app with a small binary buffer, so a fragmented binary
+ * message that overflows it can be exercised with a handful of bytes
+ * instead of the 16 MiB the shared websockets_mirror app now requires
+ * (see issue #435).
+ */
 @ServerEndpoint("/")
 public class app {
 
     @OnOpen
     public void onOpen(Session session) {
-        session.setMaxTextMessageBufferSize(16 * 1024 * 1024);
-        session.setMaxBinaryMessageBufferSize(16 * 1024 * 1024);
+        session.setMaxBinaryMessageBufferSize(1024);
     }
 
     @OnMessage
@@ -46,11 +51,6 @@ public class app {
         }
     }
 
-    /**
-     * Process a received pong. This is a NO-OP.
-     *
-     * @param pm    Ignored.
-     */
     @OnMessage
     public void echoPongMessage(PongMessage pm) {
         // NO-OP
