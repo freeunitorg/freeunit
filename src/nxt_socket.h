@@ -117,6 +117,10 @@ NXT_EXPORT ssize_t nxt_socketpair_send(nxt_fd_event_t *ev, nxt_fd_t *fd,
 NXT_EXPORT ssize_t nxt_socketpair_recv(nxt_fd_event_t *ev,
     nxt_iobuf_t *iob, nxt_uint_t niob, void *oob);
 
+#if (NXT_TESTS)
+NXT_EXPORT void nxt_socketpair_test_send_fail(nxt_err_t err, nxt_uint_t n);
+#endif
+
 
 #define nxt_socket_nonblocking(task, fd)                                      \
     nxt_fd_nonblocking(task, fd)

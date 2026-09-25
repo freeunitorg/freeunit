@@ -63,6 +63,14 @@ struct nxt_port_handlers_s {
     nxt_port_handler_t  shm_ack;
     nxt_port_handler_t  read_queue;
     nxt_port_handler_t  read_socket;
+
+    /*
+     * An application that answered a request and kept running, and later
+     * that it has finished.  Appended, and appended is the only safe edit
+     * here: every _NXT_PORT_MSG_* value is this struct's offset, so
+     * inserting or reordering a slot renumbers the wire protocol.
+     */
+    nxt_port_handler_t  detached;
 };
 
 
@@ -120,6 +128,8 @@ typedef enum {
     _NXT_PORT_MSG_READ_QUEUE      = nxt_port_handler_idx(read_queue),
     _NXT_PORT_MSG_READ_SOCKET     = nxt_port_handler_idx(read_socket),
 
+    _NXT_PORT_MSG_DETACHED        = nxt_port_handler_idx(detached),
+
     NXT_PORT_MSG_MAX              = sizeof(nxt_port_handlers_t)
                                     / sizeof(nxt_port_handler_t),
 
@@ -164,6 +174,7 @@ typedef enum {
     NXT_PORT_MSG_SHM_ACK          = nxt_msg_last(_NXT_PORT_MSG_SHM_ACK),
     NXT_PORT_MSG_READ_QUEUE       = _NXT_PORT_MSG_READ_QUEUE,
     NXT_PORT_MSG_READ_SOCKET      = _NXT_PORT_MSG_READ_SOCKET,
+    NXT_PORT_MSG_DETACHED         = nxt_msg_last(_NXT_PORT_MSG_DETACHED),
 } nxt_port_msg_type_t;
 
 
@@ -177,6 +188,24 @@ typedef enum {
     NXT_PORT_QUIT_NORMAL   = 0,
     NXT_PORT_QUIT_GRACEFUL = 1,
 } nxt_port_quit_mode_t;
+
+
+/*
+ * Wire-format payload for NXT_PORT_MSG_DETACHED.  A single byte says which
+ * edge this is: an application that has answered a request and is still
+ * running, or the same application reporting that work done.
+ *
+ * A byte rather than a flag on nxt_port_msg_t: that header has no spare
+ * bit that is reliably zeroed.  Its four "1 bit" fields are whole bytes,
+ * the trailing pad byte is never cleared by the senders that build the
+ * header field by field, and nxt_port_socket_write() ORs into ->last.  A
+ * new type is bounds-checked on both sides instead, so an older peer
+ * refuses the message rather than misreading a flag.
+ */
+typedef enum {
+    NXT_PORT_DETACHED_START  = 0,
+    NXT_PORT_DETACHED_FINISH = 1,
+} nxt_port_detached_t;
 
 
 /* Passed as a first iov chunk. */
@@ -227,6 +256,14 @@ struct nxt_port_recv_msg_s {
     nxt_pid_t           cmsg_pid;
 #endif
     nxt_bool_t          cancelled;
+    /*
+     * Set by nxt_port_new_port_handler() when it had to create the port
+     * u.new_port names, clear when it found one already registered.  A
+     * caller that refuses the announcement needs the difference: an existing
+     * port is live and must be left alone, while one this message brought
+     * into the runtime is the caller's to undo.
+     */
+    nxt_bool_t          new_port_created;
     union {
         nxt_port_t      *new_port;
         nxt_pid_t       removed_pid;
@@ -246,12 +283,18 @@ struct nxt_port_recv_msg_s {
 
 /*
  * Close any file descriptors the peer attached to a received message via
- * SCM_RIGHTS.  A privileged handler that rejects a message (unauthorized
- * or malformed sender) must call this before returning: the port
- * dispatcher does not reclaim descriptors once the handler returns, and
- * a compromised peer can attach fds to a forged message, so leaving them
- * open on the reject path would let it exhaust the receiver's descriptor
- * table.
+ * SCM_RIGHTS.
+ *
+ * The ownership contract: nxt_port_read_msg_process() closes whatever is
+ * left in msg->fd[] once the message has been dispatched, so a handler that
+ * KEEPS a descriptor must set its slot to -1.  A kept descriptor whose slot
+ * was left set is closed under the handler, and the number is then handed
+ * out again by the next open() or accept() on that thread -- the retained
+ * handle silently refers to something else, which is a good deal worse than
+ * the leak this arrangement replaced.
+ *
+ * Calling this explicitly is still right on a reject path, where it makes
+ * the intent local and obvious, and it is idempotent.
  */
 nxt_inline void
 nxt_port_recv_msg_close_fds(nxt_port_recv_msg_t *msg)
@@ -291,7 +334,43 @@ struct nxt_port_s {
     /* Maximum interleave of message parts. */
     uint32_t            max_share;
 
+    /*
+     * Websocket sessions upgraded from a request this worker answered.  A
+     * session is counted by NXT_APR_UPGRADE and uncounted by
+     * NXT_APR_WEBSOCKET_CLOSE, both in nxt_router_app_port_release().
+     */
     uint32_t            active_websockets;
+
+    /*
+     * The application answered a request on this port and kept running.
+     * Treated exactly like active_websockets by the idle transition in
+     * nxt_router_app_port_idle(): the port stays in app->ports and in
+     * app->processes, and stays out of the idle queues, so the reaper
+     * never sees it and it keeps counting against "processes": {"max"}.
+     */
+    uint8_t             detached;
+
+    /*
+     * The application reported detached work of its own.  Its FINISH edge is
+     * what ends that; until then the port stays out of the idle economy even
+     * with no request left.
+     */
+    uint8_t             detached_app;
+
+    /*
+     * The router put the port in the detached state itself: one for each
+     * request it has given up on that the worker is still running.  A
+     * "limits": {"timeout"} expiry answers the client while the worker keeps
+     * executing, and the port may not rejoin the idle economy until every
+     * such request has been answered or the port closes.  A count rather
+     * than a flag because one worker can run several of them at once, and
+     * kept apart from detached_app so that neither clear drops the other's
+     * reason.  As wide as active_requests below it, which counts the same
+     * population: "threads" is validated up to NXT_INT32_T_MAX, and a wrap
+     * would leave a settle unable to clear the state at all.
+     */
+    uint32_t            detached_router;
+
     uint32_t            active_requests;
 
     nxt_port_handler_t  handler;
@@ -299,6 +378,40 @@ struct nxt_port_s {
 
     nxt_mp_t            *mem_pool;
     nxt_event_engine_t  *engine;
+
+    /*
+     * The deferral that carries the last reference drop to port->engine.
+     * Embedded rather than allocated, so that nxt_port_use() has no failure
+     * path -- see the comment there.  Single-instance: use_count reaches
+     * zero only on port->engine, so only one thread at a time can hand the
+     * last reference over, and at most one post is ever in flight.
+     */
+    nxt_work_t          release_work;
+
+    /*
+     * The write event has to be re-armed on port->engine, and a caller on
+     * another engine cannot do it directly.  nxt_port_post() would allocate
+     * the item it posts, which fails exactly when the re-arm is needed most:
+     * the write that could not be held for a later attempt ran out of memory
+     * too.  So the item lives here.
+     *
+     * ->release_work gets its uniqueness from the reference count -- only one
+     * thread can hand over the last reference -- and nothing like that holds
+     * for a re-arm, which any thread can want at any time.  ->rearm_pending
+     * is that guarantee instead: the poster takes it from 0 to 1 and the
+     * handler clears it, so the item is on the engine's queue at most once.
+     * Re-arming twice would cost nothing, but linking the same item twice
+     * makes it its own successor.
+     *
+     * ->announce says the shared queue holds items whose READ_QUEUE marker
+     * was never sent.  It is a fact about the port rather than work to run,
+     * so it is a flag and not a second item: any thread may set it, only
+     * port->engine clears it, and it is cleared only once a marker has gone
+     * out.
+     */
+    nxt_work_t          rearm_work;
+    nxt_atomic_t        rearm_pending;
+    nxt_atomic_t        announce;
 
     nxt_buf_t           *free_bufs;
     nxt_socket_t        pair[2];
@@ -386,9 +499,62 @@ nxt_int_t nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port,
     nxt_uint_t type, nxt_fd_t fd, nxt_fd_t fd2, uint32_t stream,
     nxt_port_id_t reply_port, nxt_buf_t *b);
 
+
+typedef enum {
+    /*
+     * The message was still whole in port->messages and has been taken back
+     * out of it.  Its buffers have been completed and the queue's reference
+     * to the port released, so nothing the caller handed to write2() is
+     * reachable from the port any more.
+     */
+    NXT_PORT_MSG_CANCELLED = 0,
+    /*
+     * Found, but a fragment of it has already gone out (port_msg.nf), so the
+     * peer is mid-stream and the descriptors have been handed off.  Left
+     * queued: taking it back now would strand the peer on an unfinished
+     * stream.
+     */
+    NXT_PORT_MSG_STARTED,
+    /*
+     * Not in port->messages.  Either it was never queued or it has been sent
+     * in full.  NOT a lifetime boundary on its own: the write handler removes
+     * the message and only then queues the buffer completion, which can land
+     * behind work already queued ahead of it.
+     */
+    NXT_PORT_MSG_NOT_FOUND,
+} nxt_port_msg_cancel_t;
+
+/*
+ * Take a not-yet-started message back out of a port's send queue.
+ *
+ * Callable only on the thread that owns the port's engine, and only against a
+ * message this caller queued: it identifies the message by (type, stream,
+ * reply_port) and, when b is not NULL, by buffer identity as well, since a
+ * stream number alone is only unique per reply port.
+ *
+ * Descriptors are treated exactly as the send path treats them, through
+ * close_fd: a message that owns its descriptors has them closed here, and one
+ * that merely borrows them (START_PROCESS borrows the application's shared
+ * port) does not, so cancelling can never close a descriptor its owner is
+ * still using.
+ */
+nxt_port_msg_cancel_t nxt_port_socket_cancel(nxt_task_t *task,
+    nxt_port_t *port, nxt_uint_t type, uint32_t stream,
+    nxt_port_id_t reply_port, nxt_buf_t *b);
+
 #if (NXT_TESTS)
 void nxt_port_test_msg_alloc_failures(nxt_uint_t failures);
 void nxt_port_test_run_error_handler(nxt_task_t *task, nxt_port_t *port);
+void nxt_port_test_run_read_msg_process(nxt_task_t *task, nxt_port_t *port,
+    nxt_port_recv_msg_t *msg);
+
+/*
+ * Counts entries into nxt_port_send_new_port().  It is nxt_inline and
+ * skips the announced process and the receiver itself, so a fixture with
+ * one process cannot tell "not broadcast" from "broadcast to nobody" by
+ * observing peers; counting the call itself distinguishes them.
+ */
+NXT_EXPORT extern nxt_uint_t  nxt_port_test_broadcasts;
 #endif
 
 nxt_inline nxt_int_t
@@ -407,6 +573,8 @@ nxt_int_t nxt_port_send_port(nxt_task_t *task, nxt_port_t *port,
 void nxt_port_change_log_file(nxt_task_t *task, nxt_runtime_t *rt,
     nxt_uint_t slot, nxt_fd_t fd);
 void nxt_port_remove_notify_others(nxt_task_t *task, nxt_process_t *process);
+void nxt_port_rearm(nxt_task_t *task, nxt_port_t *port);
+void *nxt_port_queue_mmap(nxt_task_t *task, nxt_fd_t fd, size_t size);
 
 void nxt_port_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 void nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
@@ -421,6 +589,7 @@ void nxt_port_empty_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 nxt_int_t nxt_port_post(nxt_task_t *task, nxt_port_t *port,
     nxt_port_post_handler_t handler, void *data);
 void nxt_port_use(nxt_task_t *task, nxt_port_t *port, int i);
+nxt_bool_t nxt_port_use_unless_zero(nxt_port_t *port);
 
 nxt_inline void nxt_port_inc_use(nxt_port_t *port)
 {

@@ -190,10 +190,9 @@ nxt_utf8_fuzz(const u_char *data, size_t size)
     in = data;
     nxt_utf8_decode(&in, data + size);
 
-    nxt_utf8_casecmp((const u_char *)"ABC АБВ ΑΒΓ",
-                    data,
-                    nxt_length("ABC АБВ ΑΒΓ"),
-                    size);
+    /* nxt_utf8_decode() stops after one sequence; walk the whole input. */
+
+    nxt_utf8_length(data, size);
 }
 
 

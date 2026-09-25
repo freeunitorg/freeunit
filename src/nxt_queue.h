@@ -194,12 +194,6 @@ typedef struct {
     nxt_container_of(lnk, type, link)
 
 
-NXT_EXPORT nxt_queue_link_t *nxt_queue_middle(nxt_queue_t *queue);
-NXT_EXPORT void nxt_queue_sort(nxt_queue_t *queue,
-    nxt_int_t (*cmp)(const void *, const nxt_queue_link_t *,
-    const nxt_queue_link_t *), const void *data);
-
-
 #define nxt_queue_each(elt, queue, type, link)                                \
     do {                                                                      \
         nxt_queue_link_t  *_lnk, *_nxt;                                       \

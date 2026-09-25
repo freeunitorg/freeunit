@@ -8,8 +8,6 @@ import pytest
 from unit.applications.lang.python import ApplicationPython
 from unit.option import option
 from unit.utils import findmnt
-from unit.utils import waitformount
-from unit.utils import waitforunmount
 
 prerequisites = {'modules': {'python': 'any'}, 'features': {'isolation': True}}
 
@@ -78,29 +76,105 @@ def test_python_isolation_rootfs(is_su, require, temp_dir):
     assert ret['body']['FileExists'], 'application exists in rootfs'
 
 
+def language_deps_mounts(temp_dir):
+    # The stdlib bind mount lands at <rootfs><stdlib dir>, and auto/modules/
+    # python picks that directory as the sys.path entry whose basename is
+    # "pythonX.Y".  It is /usr/lib/pythonX.Y only when unit was built against
+    # the system interpreter; a toolcache, venv or /usr/local build mounts a
+    # different prefix, so match the stdlib directory rather than assuming one.
+    return [
+        line
+        for line in findmnt().splitlines()
+        if line.startswith(f'{temp_dir}/')
+        and re.search(r'/python\d+\.\d+', line.split(' ')[0])
+    ]
+
+
+def waitfor(predicate, timeout=50):
+    for _ in range(timeout):
+        if predicate():
+            return True
+
+        time.sleep(0.1)
+
+    return False
+
+
 def test_python_isolation_rootfs_no_language_deps(require, temp_dir):
     require({'privileged_user': True})
 
     isolation = {'rootfs': temp_dir, 'automount': {'language_deps': False}}
     client.load('empty', isolation=isolation)
 
-    python_path = f'{temp_dir}/usr'
-
-    assert findmnt().find(python_path) == -1
+    assert not language_deps_mounts(temp_dir)
     assert client.get()['status'] != 200, 'disabled language_deps'
-    assert findmnt().find(python_path) == -1
+    assert not language_deps_mounts(temp_dir)
 
     isolation['automount']['language_deps'] = True
 
     client.load('empty', isolation=isolation)
 
-    assert findmnt().find(python_path) == -1
+    assert not language_deps_mounts(temp_dir)
     assert client.get()['status'] == 200, 'enabled language_deps'
-    assert waitformount(python_path), 'language_deps mount'
+    assert waitfor(
+        lambda: bool(language_deps_mounts(temp_dir))
+    ), 'language_deps mount'
 
     client.conf({"listeners": {}, "applications": {}})
 
-    assert waitforunmount(python_path), 'language_deps unmount'
+    assert waitfor(
+        lambda: not language_deps_mounts(temp_dir)
+    ), 'language_deps unmount'
+
+
+def test_python_isolation_rootfs_credential_language_deps(
+    is_su, require, temp_dir
+):
+    if not is_su:
+        require(
+            {'features': {'isolation': ['unprivileged_userns_clone', 'user']}}
+        )
+    else:
+        require({'features': {'isolation': ['user']}})
+
+    client.load('empty')
+
+    # A new user namespace without a new mount namespace cannot mount
+    # anything.  With "procfs" and "tmpfs" off the only mounts left are the
+    # language dependencies, which this module always declares (auto/modules/
+    # python emits at least the stdlib directory), so the config still could
+    # never start and must be refused -- naming "language_deps", and only
+    # "language_deps", as the automount to switch off.
+    resp = client.conf(
+        {
+            'rootfs': temp_dir,
+            'namespaces': {'credential': True},
+            'automount': {'procfs': False, 'tmpfs': False},
+        },
+        'applications/empty/isolation',
+    )
+
+    assert 'error' in resp, 'language_deps automount rejected'
+
+    detail = resp.get('detail', '')
+
+    assert '"language_deps": false' in detail, 'detail names the knob'
+    assert 'procfs' not in detail, 'disabled procfs not named'
+    assert 'tmpfs' not in detail, 'disabled tmpfs not named'
+
+    # Nothing left to mount, so the very same config becomes valid.
+    assert 'success' in client.conf(
+        {
+            'rootfs': temp_dir,
+            'namespaces': {'credential': True},
+            'automount': {
+                'procfs': False,
+                'tmpfs': False,
+                'language_deps': False,
+            },
+        },
+        'applications/empty/isolation',
+    ), 'every automount off accepted'
 
 
 def test_python_isolation_procfs(require, temp_dir):

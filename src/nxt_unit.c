@@ -17,7 +17,11 @@
 #include "nxt_websocket.h"
 
 #if (NXT_HAVE_MEMFD_CREATE)
+#if (NXT_HAVE_LINUX_MEMFD_H)
 #include <linux/memfd.h>
+#else
+#include <sys/mman.h>
+#endif
 #endif
 
 #define NXT_UNIT_MAX_PLAIN_SIZE  1024
@@ -73,6 +77,12 @@ static int nxt_unit_process_new_port(nxt_unit_ctx_t *ctx,
 static int nxt_unit_ctx_ready(nxt_unit_ctx_t *ctx);
 static int nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx,
     nxt_unit_recv_msg_t *recv_msg, nxt_unit_request_info_t **preq);
+static void nxt_unit_ctx_detached_start(nxt_unit_ctx_t *ctx);
+static void nxt_unit_ctx_detached_done(nxt_unit_ctx_t *ctx);
+static int nxt_unit_ctx_detached_retry(nxt_unit_ctx_t *ctx);
+static int nxt_unit_detached_timeout(nxt_unit_ctx_impl_t *ctx_impl);
+static int nxt_unit_detached_poll(nxt_unit_ctx_t *ctx, int fd);
+static int nxt_unit_send_detached(nxt_unit_ctx_t *ctx, uint8_t state);
 static int nxt_unit_process_req_body(nxt_unit_ctx_t *ctx,
     nxt_unit_recv_msg_t *recv_msg);
 static int nxt_unit_request_check_response_port(nxt_unit_request_info_t *req,
@@ -175,8 +185,8 @@ static int nxt_unit_get_port(nxt_unit_ctx_t *ctx, nxt_unit_port_id_t *port_id);
 static ssize_t nxt_unit_port_send(nxt_unit_ctx_t *ctx,
     nxt_unit_port_t *port, const void *buf, size_t buf_size,
     const nxt_send_oob_t *oob);
-static ssize_t nxt_unit_sendmsg(nxt_unit_ctx_t *ctx, int fd,
-    const void *buf, size_t buf_size, const nxt_send_oob_t *oob);
+static ssize_t nxt_unit_sendmsg(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
+    int fd, const void *buf, size_t buf_size, const nxt_send_oob_t *oob);
 static int nxt_unit_ctx_port_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     nxt_unit_read_buf_t *rbuf);
 nxt_inline void nxt_unit_rbuf_cpy(nxt_unit_read_buf_t *dst,
@@ -386,6 +396,12 @@ struct nxt_unit_read_buf_s {
 };
 
 
+enum {
+    NXT_UNIT_DETACHED_NONE    = 0,
+    NXT_UNIT_DETACHED_RUNNING = 1,
+};
+
+
 struct nxt_unit_ctx_impl_s {
     nxt_unit_ctx_t                ctx;
 
@@ -424,6 +440,23 @@ struct nxt_unit_ctx_impl_s {
     uint8_t                       online;       /* 1 bit */
     uint8_t                       ready;        /* 1 bit */
     uint8_t                       quit_param;
+
+    /*
+     * The application answered a request with
+     * nxt_unit_request_done_detached() and has not returned from its
+     * request handler yet.  Holds the router's view of this worker as
+     * busy, and holds off a graceful quit, until it does.
+     */
+    uint8_t                       detached;     /* 1 bit */
+
+    /* Failed FINISH sends so far; 0 when none is pending. */
+    uint8_t                       detached_retries;
+
+    /*
+     * The START edge was never delivered.  The worker retires when the
+     * request handler returns.
+     */
+    uint8_t                       detached_unreported;  /* 1 bit */
 
     nxt_unit_mmap_buf_t           ctx_buf[2];
     nxt_unit_read_buf_t           ctx_read_buf;
@@ -798,6 +831,18 @@ nxt_unit_ctx_init(nxt_unit_impl_t *lib, nxt_unit_ctx_impl_t *ctx_impl,
     ctx_impl->ready = 0;
     ctx_impl->quit_param = NXT_QUIT_GRACEFUL;
 
+    /*
+     * Explicitly, like every field above it: this function initialises the
+     * context field by field and never memsets it, so anything left out
+     * starts as whatever the allocator left behind -- 0xAA in a debug
+     * build, which reads as "detached" and sends the finish report to a
+     * poison pointer.
+     */
+
+    ctx_impl->detached = NXT_UNIT_DETACHED_NONE;
+    ctx_impl->detached_retries = 0;
+    ctx_impl->detached_unreported = 0;
+
     nxt_queue_init(&ctx_impl->free_req);
     nxt_queue_init(&ctx_impl->free_ws);
     nxt_queue_init(&ctx_impl->active_req);
@@ -1058,7 +1103,7 @@ nxt_unit_ready(nxt_unit_ctx_t *ctx, int ready_fd, uint32_t stream, int queue_fd)
 
     nxt_socket_msg_oob_init(&oob, fds);
 
-    res = nxt_unit_sendmsg(ctx, ready_fd, &msg, sizeof(msg), &oob);
+    res = nxt_unit_sendmsg(ctx, NULL, ready_fd, &msg, sizeof(msg), &oob);
     if (res != sizeof(msg)) {
         return NXT_UNIT_ERROR;
     }
@@ -1086,7 +1131,20 @@ nxt_unit_process_msg(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf,
 
     rc = nxt_socket_msg_oob_get_fds(&rbuf->oob, recv_msg.fd);
     if (nxt_slow_path(rc != NXT_OK)) {
-        nxt_unit_alert(ctx, "failed to receive file descriptor over cmsg");
+        if (rbuf->oob.truncated) {
+            /*
+             * The descriptor this message was meant to carry may not be
+             * here: NEW_PORT and MMAP would take their fd-less path on a
+             * message that otherwise looks whole.  Refuse it; "done" closes
+             * whatever part of the SCM_RIGHTS did arrive.
+             */
+            nxt_unit_alert(ctx, "control data truncated on a %d byte "
+                           "message; message dropped", (int) rbuf->size);
+
+        } else {
+            nxt_unit_alert(ctx, "failed to receive file descriptor over cmsg");
+        }
+
         rc = NXT_UNIT_ERROR;
         goto done;
     }
@@ -1596,6 +1654,8 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
         if (preq == NULL) {
             lib->callbacks.request_handler(req);
 
+            nxt_unit_ctx_detached_done(ctx);
+
         } else {
             *preq = req;
         }
@@ -1652,6 +1712,8 @@ nxt_unit_process_req_body(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg)
 
     if (req->content_fd != -1 || l == req->content_length) {
         lib->callbacks.request_handler(req);
+
+        nxt_unit_ctx_detached_done(ctx);
     }
 
     return NXT_UNIT_OK;
@@ -3019,7 +3081,7 @@ nxt_unit_read_buf_get(nxt_unit_ctx_t *ctx)
 
     pthread_mutex_unlock(&ctx_impl->mutex);
 
-    rbuf->oob.size = 0;
+    nxt_socket_msg_oob_reset(&rbuf->oob);
 
     return rbuf;
 }
@@ -3477,6 +3539,428 @@ nxt_unit_buf_read(nxt_unit_buf_t **b, uint64_t *len, void *dst, size_t size)
 
     return read;
 }
+
+
+/*
+ * Tell the router this worker is, or is no longer, running work of its own
+ * after a response.  One byte of payload says which edge; see
+ * nxt_port_detached_t in src/nxt_port.h for why it is a byte and a new
+ * message type rather than a flag on the header.
+ *
+ * Sent to the router's own port, the way OOSM is, not to the port the
+ * response went to.  The router reads that port on its main thread, which
+ * is the thread that owns the accounting, and one socket keeps the finish
+ * edge behind the start edge that preceded it: the next request's response
+ * may belong to another router engine, and two engines' reads of two
+ * sockets race.  The router looks the worker up by pid.
+ */
+
+#if (NXT_TESTS)
+static unsigned int  nxt_unit_test_send_detached_failure_count;
+
+
+void
+nxt_unit_test_send_detached_failures(unsigned int failures)
+{
+    nxt_unit_test_send_detached_failure_count = failures;
+}
+#endif
+
+
+static int
+nxt_unit_send_detached(nxt_unit_ctx_t *ctx, uint8_t state)
+{
+    int              res;
+    nxt_unit_impl_t  *lib;
+    struct {
+        nxt_port_msg_t  msg;
+        uint8_t         state;
+    } m;
+
+#if (NXT_TESTS)
+    if (nxt_slow_path(nxt_unit_test_send_detached_failure_count > 0)) {
+        nxt_unit_test_send_detached_failure_count--;
+        return NXT_UNIT_ERROR;
+    }
+#endif
+
+    lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
+
+    if (nxt_slow_path(lib->router_port == NULL)) {
+        nxt_unit_debug(ctx, "detached %d: no router port to report on",
+                       (int) state);
+        return NXT_UNIT_ERROR;
+    }
+
+    memset(&m, 0, sizeof(m));
+
+    m.msg.pid = lib->pid;
+    m.msg.type = _NXT_PORT_MSG_DETACHED;
+    m.msg.last = 1;
+    m.state = state;
+
+    res = nxt_unit_port_send(ctx, lib->router_port, &m, sizeof(m), NULL);
+    if (nxt_slow_path(res != sizeof(m))) {
+        return NXT_UNIT_ERROR;
+    }
+
+    return NXT_UNIT_OK;
+}
+
+
+void
+nxt_unit_request_done_detached(nxt_unit_request_info_t *req, int rc)
+{
+    /*
+     * Before the response, not after.  The two go to different ports, so
+     * this orders nothing on the router's side by itself -- the router
+     * takes a worker it has already parked as idle back out when the edge
+     * arrives -- but it does keep the window in which the port sits in the
+     * idle queue as short as the router's own read makes it.
+     *
+     * A failure here is not fatal to the request: the response still goes
+     * out below.
+     */
+
+    nxt_unit_ctx_detached_start(req->ctx);
+
+    nxt_unit_request_done(req, rc);
+}
+
+
+/*
+ * Report the START edge.  The application continues inside its request
+ * handler, and the read loop does not run again until the handler returns,
+ * so a retry from the read loop is too late.  Retry here: 8 attempts, with
+ * sleeps of 1, 2, ... 64 ms between them, 127 ms in total.
+ *
+ * If all attempts fail, the router counts this worker idle while the
+ * application runs.  Do not set ->detached, because the router does not
+ * know about the work.  Retire the worker when the handler returns.
+ */
+
+#define NXT_UNIT_DETACHED_START_ATTEMPTS  8
+
+static void
+nxt_unit_ctx_detached_start(nxt_unit_ctx_t *ctx)
+{
+    int                  i;
+    struct timespec      ts;
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    if (ctx_impl->detached != NXT_UNIT_DETACHED_NONE
+        || ctx_impl->detached_unreported)
+    {
+        return;
+    }
+
+    for (i = 0; i < NXT_UNIT_DETACHED_START_ATTEMPTS; i++) {
+
+        if (i > 0) {
+            ts.tv_sec = 0;
+            ts.tv_nsec = (1L << (i - 1)) * 1000000L;
+
+            (void) nanosleep(&ts, NULL);
+        }
+
+        if (nxt_unit_send_detached(ctx, NXT_PORT_DETACHED_START)
+            == NXT_UNIT_OK)
+        {
+            ctx_impl->detached = NXT_UNIT_DETACHED_RUNNING;
+            return;
+        }
+    }
+
+    ctx_impl->detached_unreported = 1;
+
+    nxt_unit_alert(ctx, "failed to report a detached response, "
+                   "retiring the worker when the request handler returns");
+}
+
+
+/*
+ * The application's request handler has returned, so whatever it was doing
+ * after its response is over.  Runs on every return path -- a normal return,
+ * and the ones PHP reaches through exit() and a fatal error, which all come
+ * back through the handler call site.
+ */
+
+static void
+nxt_unit_ctx_detached_done(nxt_unit_ctx_t *ctx)
+{
+    int                  rc;
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    if (nxt_slow_path(ctx_impl->detached_unreported)) {
+        ctx_impl->detached_unreported = 0;
+
+        /*
+         * The START edge was never delivered.  Quit gracefully, the same
+         * way as the deferred quit below: the router then settles the
+         * process and starts a replacement if one is needed.
+         */
+
+        nxt_unit_quit(ctx, NXT_QUIT_GRACEFUL);
+
+        return;
+    }
+
+    if (ctx_impl->detached == NXT_UNIT_DETACHED_NONE) {
+        return;
+    }
+
+    rc = nxt_unit_send_detached(ctx, NXT_PORT_DETACHED_FINISH);
+    if (nxt_fast_path(rc == NXT_UNIT_OK)) {
+        ctx_impl->detached = NXT_UNIT_DETACHED_NONE;
+        ctx_impl->detached_retries = 0;
+
+        /*
+         * A graceful QUIT that arrived during the work was deferred by
+         * nxt_unit_quit() on this flag, the way one that arrives during a
+         * request is deferred on active_req.  That one is retried when the
+         * request is released; this is the equivalent.
+         */
+
+        if (nxt_slow_path(!nxt_unit_chk_ready(ctx))) {
+            nxt_unit_quit(ctx, NXT_QUIT_GRACEFUL);
+        }
+
+        return;
+    }
+
+    /*
+     * The FINISH edge was not delivered.  Keep ->detached set and let the
+     * read loop retry; its blocking waits are bounded while a retry is
+     * pending (see nxt_unit_detached_timeout()).  The give-up is not run
+     * here, inside nxt_unit_process_ready_req().
+     *
+     * Only arm the retry if it is not armed.  Otherwise each request handler
+     * that returns while the FINISH is pending resets the budget, and a
+     * worker that serves traffic never reaches the give-up.
+     */
+
+    if (ctx_impl->detached_retries == 0) {
+        ctx_impl->detached_retries = 1;
+    }
+}
+
+
+/*
+ * Retry the FINISH edge.  Called from the read loop, outside request
+ * processing.  After 10 failed retries, close the worker.
+ */
+
+static int
+nxt_unit_ctx_detached_retry(nxt_unit_ctx_t *ctx)
+{
+    int                  res;
+    nxt_unit_impl_t      *lib;
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    if (nxt_fast_path(ctx_impl->detached_retries == 0)) {
+        return NXT_UNIT_OK;
+    }
+
+    res = nxt_unit_send_detached(ctx, NXT_PORT_DETACHED_FINISH);
+    if (nxt_fast_path(res == NXT_UNIT_OK)) {
+        ctx_impl->detached = NXT_UNIT_DETACHED_NONE;
+        ctx_impl->detached_retries = 0;
+
+        if (nxt_slow_path(!nxt_unit_chk_ready(ctx))) {
+            nxt_unit_quit(ctx, NXT_QUIT_GRACEFUL);
+        }
+
+        return NXT_UNIT_OK;
+    }
+
+    if (++ctx_impl->detached_retries > 10) {
+        lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
+
+        /*
+         * Close the main context: the router keeps the detached flag on the
+         * main port (id 0), and only closing that port settles the count
+         * and the application reference.  This assumes one context, as in
+         * PHP, the only caller of nxt_unit_request_done_detached().  A
+         * non-main context closing alone would leave the worker flagged
+         * detached for the life of the process, and the main context is
+         * changed here without cross-thread synchronization.  This is a
+         * comment and not nxt_assert(): libunit does not link the thread
+         * context that nxt_assert() needs.
+         */
+
+        nxt_unit_alert(ctx, "failed to report detached finish, closing worker");
+        nxt_unit_quit(&lib->main_ctx.ctx, NXT_QUIT_NORMAL);
+        return NXT_UNIT_ERROR;
+    }
+
+    return NXT_UNIT_OK;
+}
+
+
+/*
+ * How long a read may block while a FINISH retry is pending: 2 ms after the
+ * first failed retry, doubling up to 256 ms.  The ten retries then span
+ * about 0.8 s without traffic.
+ */
+
+static int
+nxt_unit_detached_timeout(nxt_unit_ctx_impl_t *ctx_impl)
+{
+    return 1 << nxt_min(ctx_impl->detached_retries - 1, 8);
+}
+
+
+/*
+ * Wait for "fd" to become readable while a FINISH retry is pending.
+ * Returns NXT_UNIT_AGAIN when the wait expires, so that the caller returns
+ * to the read loop, which retries.
+ */
+
+static int
+nxt_unit_detached_poll(nxt_unit_ctx_t *ctx, int fd)
+{
+    int                  nevents;
+    struct pollfd        pfd;
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    nevents = poll(&pfd, 1, nxt_unit_detached_timeout(ctx_impl));
+
+    if (nevents == 0 || (nevents == -1 && errno == EINTR)) {
+        return NXT_UNIT_AGAIN;
+    }
+
+    return NXT_UNIT_OK;
+}
+
+
+#if (NXT_TESTS)
+uint8_t
+nxt_unit_test_ctx_detached(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    return ctx_impl->detached;
+}
+
+
+uint8_t
+nxt_unit_test_ctx_detached_retries(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    return ctx_impl->detached_retries;
+}
+
+
+void
+nxt_unit_test_ctx_set_detached(nxt_unit_ctx_t *ctx, uint8_t val)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    ctx_impl->detached = val;
+}
+
+
+void
+nxt_unit_test_ctx_set_detached_retries(nxt_unit_ctx_t *ctx, uint8_t val)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    ctx_impl->detached_retries = val;
+}
+
+
+uint8_t
+nxt_unit_test_ctx_detached_unreported(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    return ctx_impl->detached_unreported;
+}
+
+
+void
+nxt_unit_test_ctx_detached_start(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_ctx_detached_start(ctx);
+}
+
+
+void
+nxt_unit_test_ctx_detached_done(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_ctx_detached_done(ctx);
+}
+
+
+int
+nxt_unit_test_ctx_detached_retry(nxt_unit_ctx_t *ctx)
+{
+    return nxt_unit_ctx_detached_retry(ctx);
+}
+
+
+uint8_t
+nxt_unit_test_ctx_online(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    return ctx_impl->online;
+}
+
+
+uint8_t
+nxt_unit_test_ctx_ready(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    return ctx_impl->ready;
+}
+
+
+void
+nxt_unit_test_ctx_set_ready(nxt_unit_ctx_t *ctx, uint8_t val)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    ctx_impl->ready = val;
+}
+
+
+void
+nxt_unit_test_ctx_quit_graceful(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_quit(ctx, NXT_QUIT_GRACEFUL);
+}
+#endif
 
 
 void
@@ -4016,7 +4500,6 @@ nxt_unit_new_mmap(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port, int n)
     hdr = mem;
 
     memset(hdr->free_map, 0xFFU, sizeof(hdr->free_map));
-    memset(hdr->free_tracking_map, 0xFFU, sizeof(hdr->free_tracking_map));
 
     hdr->id = lib->outgoing.size - 1;
     hdr->src_pid = lib->pid;
@@ -4031,7 +4514,6 @@ nxt_unit_new_mmap(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port, int n)
 
     /* Mark as busy chunk followed the last available chunk. */
     nxt_port_mmap_set_chunk_busy(hdr->free_map, PORT_MMAP_CHUNK_COUNT);
-    nxt_port_mmap_set_chunk_busy(hdr->free_tracking_map, PORT_MMAP_CHUNK_COUNT);
 
     pthread_mutex_unlock(&lib->outgoing.mutex);
 
@@ -4456,6 +4938,7 @@ nxt_unit_mmap_read(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
 {
     int                     res;
     void                    *start;
+    size_t                  nchunks;
     uint32_t                size;
     nxt_unit_impl_t         *lib;
     nxt_unit_mmaps_t        *mmaps;
@@ -4513,6 +4996,38 @@ nxt_unit_mmap_read(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
             }
 
             return res;
+        }
+
+        /*
+         * mmap_msg fields originate from the router; reject offsets that
+         * would point outside the mapped data area before they reach the
+         * pointer arithmetic below.
+         */
+        if (nxt_slow_path(!nxt_port_mmap_chunk_range_valid(mmap_msg->chunk_id,
+                                                           mmap_msg->size,
+                                                           &nchunks)))
+        {
+            nxt_unit_alert(ctx, "#%"PRIu32": mmap_read: invalid mmap message: "
+                           "chunk_id %"PRIu32", size %"PRIu32
+                           " (chunks %zu, max %d)",
+                           recv_msg->stream, mmap_msg->chunk_id,
+                           mmap_msg->size, nchunks, PORT_MMAP_CHUNK_COUNT);
+
+            pthread_mutex_unlock(&mmaps->mutex);
+
+            /*
+             * Entries before the rejected one are already populated, and
+             * this message is dropped rather than retried, so their chunks
+             * have to be marked free as well: nxt_unit_mmap_buf_release()
+             * alone would recycle the wrappers and leave the chunks busy in
+             * the peer's segment for good.  Entries not reached yet have a
+             * NULL hdr and are skipped by nxt_unit_free_outgoing_buf().
+             */
+            while (recv_msg->incoming_buf != NULL) {
+                nxt_unit_mmap_buf_free(recv_msg->incoming_buf);
+            }
+
+            return NXT_UNIT_ERROR;
         }
 
         start = nxt_port_mmap_chunk_start(hdr, mmap_msg->chunk_id);
@@ -4787,6 +5302,17 @@ nxt_unit_run(nxt_unit_ctx_t *ctx)
             nxt_unit_quit(ctx, NXT_QUIT_NORMAL);
             break;
         }
+
+        /*
+         * A read that returned no message because the context went offline
+         * ends the loop the same way a QUIT message does, so report it the
+         * same way: callers exit the process with this code.
+         */
+
+        if (nxt_slow_path(rc == NXT_UNIT_AGAIN && !ctx_impl->online)) {
+            rc = NXT_UNIT_OK;
+            break;
+        }
     }
 
     nxt_unit_ctx_release(ctx);
@@ -4847,7 +5373,7 @@ nxt_unit_run_once_impl(nxt_unit_ctx_t *ctx)
 static int
 nxt_unit_read_buf(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf)
 {
-    int                   nevents, res, err;
+    int                   nevents, res, err, timeout;
     nxt_uint_t            nfds;
     nxt_unit_impl_t       *lib;
     nxt_unit_ctx_impl_t   *ctx_impl;
@@ -4855,6 +5381,33 @@ nxt_unit_read_buf(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf)
     struct pollfd         fds[2];
 
     ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    timeout = -1;
+
+    if (nxt_slow_path(ctx_impl->detached_retries > 0)) {
+        res = nxt_unit_ctx_detached_retry(ctx);
+        if (nxt_slow_path(res != NXT_UNIT_OK)) {
+            return res;
+        }
+
+        if (nxt_slow_path(!ctx_impl->online)) {
+            /*
+             * The retry completed a graceful quit that was deferred on the
+             * detached flag, so the read port is removed.  Report "no
+             * message": the caller releases the buffer and its loop stops
+             * on ->online.  A receive here would wait for a message the
+             * router will never send.
+             */
+
+            rbuf->size = -1;
+
+            return NXT_UNIT_AGAIN;
+        }
+
+        if (ctx_impl->detached_retries > 0) {
+            timeout = nxt_unit_detached_timeout(ctx_impl);
+        }
+    }
 
     if (ctx_impl->wait_items > 0 || !nxt_unit_chk_ready(ctx)) {
         return nxt_unit_ctx_port_recv(ctx, ctx_impl->read_port, rbuf);
@@ -4910,7 +5463,15 @@ retry:
 
     fds[1].revents = 0;
 
-    nevents = poll(fds, nfds, -1);
+    nevents = poll(fds, nfds, timeout);
+
+    if (nxt_slow_path(nevents == 0)) {
+        /* A pending FINISH retry bounded the wait; the caller retries. */
+        rbuf->size = -1;
+
+        return NXT_UNIT_AGAIN;
+    }
+
     if (nxt_slow_path(nevents == -1)) {
         err = errno;
 
@@ -5047,6 +5608,10 @@ nxt_unit_process_ready_req(nxt_unit_ctx_t *ctx)
     nxt_queue_each(req_impl, &ready_req,
                    nxt_unit_request_info_impl_t, port_wait_link)
     {
+        if (nxt_slow_path(!ctx_impl->online)) {
+            break;
+        }
+
         lib = nxt_container_of(ctx_impl->ctx.unit, nxt_unit_impl_t, unit);
 
         req = &req_impl->req;
@@ -5081,6 +5646,8 @@ nxt_unit_process_ready_req(nxt_unit_ctx_t *ctx)
 
         lib->callbacks.request_handler(&req_impl->req);
 
+        nxt_unit_ctx_detached_done(ctx);
+
     } nxt_queue_loop;
 }
 
@@ -5099,6 +5666,23 @@ nxt_unit_run_ctx(nxt_unit_ctx_t *ctx)
     rc = NXT_UNIT_OK;
 
     while (nxt_fast_path(ctx_impl->online)) {
+        if (nxt_slow_path(ctx_impl->detached_retries > 0)) {
+            rc = nxt_unit_ctx_detached_retry(ctx);
+            if (nxt_slow_path(rc != NXT_UNIT_OK)) {
+                break;
+            }
+
+            /*
+             * The retry may have completed a deferred graceful quit, which
+             * removes the read port.  Leave with the retry's NXT_UNIT_OK,
+             * before a buffer is taken; "rc" is that value.
+             */
+
+            if (nxt_slow_path(!ctx_impl->online)) {
+                break;
+            }
+        }
+
         rbuf = nxt_unit_read_buf_get(ctx);
         if (nxt_slow_path(rbuf == NULL)) {
             rc = NXT_UNIT_ERROR;
@@ -5109,6 +5693,11 @@ nxt_unit_run_ctx(nxt_unit_ctx_t *ctx)
 
         rc = nxt_unit_ctx_port_recv(ctx, ctx_impl->read_port, rbuf);
         if (rc == NXT_UNIT_AGAIN) {
+            if (nxt_slow_path(ctx_impl->detached_retries > 0)) {
+                nxt_unit_read_buf_release(ctx, rbuf);
+                continue;
+            }
+
             goto retry;
         }
 
@@ -6052,7 +6641,8 @@ nxt_unit_quit(nxt_unit_ctx_t *ctx, uint8_t quit_param)
 
         quit = nxt_queue_is_empty(&ctx_impl->active_req)
                && nxt_queue_is_empty(&ctx_impl->pending_rbuf)
-               && ctx_impl->wait_items == 0;
+               && ctx_impl->wait_items == 0
+               && ctx_impl->detached == NXT_UNIT_DETACHED_NONE;
 
         pthread_mutex_unlock(&ctx_impl->mutex);
 
@@ -6192,7 +6782,7 @@ nxt_unit_port_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
             msg.type = _NXT_PORT_MSG_READ_QUEUE;
 
             if (lib->callbacks.port_send == NULL) {
-                ret = nxt_unit_sendmsg(ctx, port->out_fd, &msg,
+                ret = nxt_unit_sendmsg(ctx, port, port->out_fd, &msg,
                                        sizeof(nxt_port_msg_t), NULL);
 
                 nxt_unit_debug(ctx, "port{%d,%d} send %d read_queue",
@@ -6238,7 +6828,7 @@ nxt_unit_port_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
                        (int) ret);
 
     } else {
-        ret = nxt_unit_sendmsg(ctx, port->out_fd, buf, buf_size, oob);
+        ret = nxt_unit_sendmsg(ctx, port, port->out_fd, buf, buf_size, oob);
 
         nxt_unit_debug(ctx, "port{%d,%d} sendmsg %d",
                        (int) port->id.pid, (int) port->id.id,
@@ -6250,12 +6840,13 @@ nxt_unit_port_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
 
 
 static ssize_t
-nxt_unit_sendmsg(nxt_unit_ctx_t *ctx, int fd,
+nxt_unit_sendmsg(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port, int fd,
     const void *buf, size_t buf_size, const nxt_send_oob_t *oob)
 {
     int                  err;
     ssize_t              n;
     struct iovec         iov[1];
+    nxt_unit_impl_t      *lib;
     nxt_unit_ctx_impl_t  *ctx_impl;
 
     iov[0].iov_base = (void *) buf;
@@ -6292,9 +6883,36 @@ retry:
          * too and cannot be used to distinguish steady state from
          * shutdown.  The unambiguous flag is ctx_impl->online.
          */
+        lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
         ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
 
-        if (ctx_impl->online) {
+        /*
+         * A router engine port whose peer has already closed is not an
+         * application fault even while online: the router closes an
+         * engine's port pair when a "listen_threads" decrease retires
+         * that engine (nxt_router_thread_exit_handler()), and it does
+         * not tell the applications that still hold a copy of the port,
+         * so a response to a request that engine had handed out fails:
+         * with ECONNREFUSED on the SOCK_DGRAM pairs used on Linux
+         * (src/nxt_socketpair.c), with EPIPE or ECONNRESET on a stream
+         * pair.  The request was abandoned on the router side already;
+         * say so at warn level.
+         *
+         * That reasoning covers only the per-engine ports learned through
+         * NEW_PORT/GET_PORT.  The main router port, the shared port and
+         * the readiness descriptor have no such lifecycle: a broken one
+         * of those is a real problem and keeps the alert, because for
+         * some of its messages this log line is the only visible signal
+         * (nxt_unit_mmap_release() ignores nxt_unit_send_shm_ack()'s
+         * return value).
+         */
+        if (ctx_impl->online
+            && !(port != NULL
+                 && port != lib->router_port
+                 && port != lib->shared_port
+                 && (err == ECONNREFUSED || err == EPIPE
+                     || err == ECONNRESET)))
+        {
             nxt_unit_alert(ctx, "sendmsg(%d, %d) failed: %s (%d)",
                            fd, (int) buf_size, strerror(err), err);
 
@@ -6317,8 +6935,10 @@ nxt_unit_ctx_port_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     nxt_unit_read_buf_t *rbuf)
 {
     int                   res, read;
+    nxt_unit_ctx_impl_t   *ctx_impl;
     nxt_unit_port_impl_t  *port_impl;
 
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
     port_impl = nxt_container_of(port, nxt_unit_port_impl_t, port);
 
     read = 0;
@@ -6332,7 +6952,15 @@ retry:
             port_impl->from_socket--;
 
             nxt_unit_rbuf_cpy(rbuf, port_impl->socket_rbuf);
+
+            /*
+             * The suspend buffer is not recycled through
+             * nxt_unit_read_buf_get(), so clear its control data along with
+             * its payload: descriptors named there now belong to rbuf, and
+             * a leftover oob.size would offer them again.
+             */
             port_impl->socket_rbuf->size = 0;
+            nxt_socket_msg_oob_reset(&port_impl->socket_rbuf->oob);
 
             nxt_unit_debug(ctx, "port{%d,%d} use suspended message %d",
                            (int) port->id.pid, (int) port->id.id,
@@ -6365,6 +6993,13 @@ retry:
 
     if (read) {
         return NXT_UNIT_AGAIN;
+    }
+
+    if (nxt_slow_path(ctx_impl->detached_retries > 0 && port->in_fd != -1)) {
+        res = nxt_unit_detached_poll(ctx, port->in_fd);
+        if (res != NXT_UNIT_OK) {
+            return res;
+        }
     }
 
     res = nxt_unit_port_recv(ctx, port, rbuf);
@@ -6417,7 +7052,7 @@ retry:
 
     nxt_unit_rbuf_cpy(port_impl->socket_rbuf, rbuf);
 
-    rbuf->oob.size = 0;
+    nxt_socket_msg_oob_reset(&rbuf->oob);
 
     goto retry;
 }
@@ -6429,6 +7064,7 @@ nxt_unit_rbuf_cpy(nxt_unit_read_buf_t *dst, nxt_unit_read_buf_t *src)
     memcpy(dst->buf, src->buf, src->size);
     dst->size = src->size;
     dst->oob.size = src->oob.size;
+    dst->oob.truncated = src->oob.truncated;
     memcpy(dst->oob.buf, src->oob.buf, src->oob.size);
 }
 
@@ -6495,7 +7131,43 @@ nxt_unit_port_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
             return NXT_UNIT_ERROR;
         }
 
+        /*
+         * oob_size is in/out: it goes in as the capacity of rbuf->oob.buf
+         * and is expected to come back as the length of the control data
+         * actually received.  A callback that reports "no message" without
+         * assigning it leaves the capacity in place, and the control bytes
+         * of the previous message are still in this recycled buffer: they
+         * would then be parsed as a fresh SCM_RIGHTS and their descriptors
+         * closed a second time, hitting a live port fd or, once the number
+         * has been reused, an unrelated one.  Control data is only ever
+         * carried by a message, so accept it only alongside one, and never
+         * beyond the buffer.
+         */
+        if (nxt_slow_path(oob_size > sizeof(rbuf->oob.buf))) {
+            nxt_unit_alert(ctx, "port{%d,%d} recvcb reported %d control bytes "
+                           "for a %d byte buffer", (int) port->id.pid,
+                           (int) port->id.id, (int) oob_size,
+                           (int) sizeof(rbuf->oob.buf));
+
+            oob_size = 0;
+        }
+
+        if (nxt_slow_path(rbuf->size == 0)) {
+            oob_size = 0;
+        }
+
         rbuf->oob.size = oob_size;
+        /*
+         * The callback reports a length, not msg_flags, so a truncation
+         * cannot be carried across as such: a wrapper that sees MSG_CTRUNC
+         * reports a read error instead, and the rbuf->size < 0 arm above
+         * returns before any control data is parsed (go/port.go does exactly
+         * this).  Nothing can therefore be inferred about truncation here;
+         * clear the flag so that a previous message's MSG_CTRUNC, left in
+         * this recycled buffer, cannot be read as this one's.
+         */
+        rbuf->oob.truncated = 0;
+
         return NXT_UNIT_OK;
     }
 
@@ -6510,6 +7182,13 @@ retry:
 
     if (nxt_slow_path(rbuf->size == -1)) {
         err = errno;
+
+        /*
+         * nxt_recvmsg() assigns oob.size only when recvmsg() succeeded, so
+         * clear it here to keep "size 0 implies no control data" holding on
+         * every exit of this function rather than by inspection of callers.
+         */
+        nxt_socket_msg_oob_reset(&rbuf->oob);
 
         if (err == EINTR) {
             goto retry;

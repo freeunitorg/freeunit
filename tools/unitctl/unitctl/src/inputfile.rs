@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io;
 use std::io::{BufRead, BufReader, Error as IoError, Read};
 use std::path::{Path, PathBuf};
@@ -6,15 +5,20 @@ use std::path::{Path, PathBuf};
 use crate::known_size::KnownSize;
 use clap::ValueEnum;
 
-use super::UnitSerializableMap;
 use super::UnitctlError;
 
 /// Input file data format
 #[derive(ValueEnum, Copy, Clone, Debug, PartialEq, Eq)]
 pub enum InputFormat {
+    /// Recognised, but not parsed.  unitctl no longer reads YAML.  The format
+    /// stays in this list so that a ".yaml" file gets a message saying that,
+    /// instead of a JSON parse error.
     Yaml,
     Json,
     Json5,
+    /// Recognised, but not parsed.  unitctl no longer reads hjson.  The format
+    /// stays in this list so that an ".hjson" file gets a message saying that,
+    /// instead of a JSON parse error.
     Hjson,
     Pem,
     JavaScript,
@@ -52,7 +56,7 @@ impl InputFormat {
             .split_once('/')
             .map_or(lead_slash_removed, |(first, _)| first);
         match first_path {
-            "config" => InputFormat::Hjson,
+            "config" => InputFormat::Json,
             "certificates" => InputFormat::Pem,
             "js_modules" => InputFormat::JavaScript,
             _ => InputFormat::Json,
@@ -139,44 +143,38 @@ impl InputFile {
         }
     }
 
-    /// Converts a HJSON Value type to a JSON Value type
-    fn hjson_value_to_json_value(value: nu_json::Value) -> serde_json::Value {
-        serde_json::to_value(value).expect("Failed to convert HJSON value to JSON value")
-    }
+    /// The media type and the bytes to PUT for a configuration input.
+    ///
+    /// JSON is sent as it was written.  unitctl does not parse it, so an
+    /// operator's duplicate member reaches the server, which refuses it
+    /// (src/nxt_conf.c:1616), and a number keeps the spelling the file used.
+    /// Parsing here collapsed both silently.
+    pub fn to_config_body(&self) -> Result<(String, KnownSize), UnitctlError> {
+        let json = "application/json".to_string();
 
-    pub fn to_unit_serializable_map(&self) -> Result<UnitSerializableMap, UnitctlError> {
-        let reader: Box<dyn BufRead + Send> = self.try_into()?;
-        let body_data: UnitSerializableMap = match self.format() {
-            InputFormat::Yaml => serde_yaml::from_reader(reader)
-                .map_err(|e| UnitctlError::DeserializationError { message: e.to_string() })?,
-            InputFormat::Json => serde_json::from_reader(reader)
-                .map_err(|e| UnitctlError::DeserializationError { message: e.to_string() })?,
-            InputFormat::Json5 => {
-                let mut reader = BufReader::new(reader);
-                let mut json5_string: String = String::new();
-                reader
-                    .read_to_string(&mut json5_string)
-                    .map_err(|e| UnitctlError::DeserializationError { message: e.to_string() })?;
-                json5::from_str(&json5_string)
-                    .map_err(|e| UnitctlError::DeserializationError { message: e.to_string() })?
-            }
-            InputFormat::Hjson => {
-                let hjson_value: HashMap<String, nu_json::Value> = nu_json::from_reader(reader)
-                    .map_err(|e| UnitctlError::DeserializationError { message: e.to_string() })?;
-
-                hjson_value
-                    .iter()
-                    .map(|(k, v)| {
-                        let json_value = Self::hjson_value_to_json_value(v.clone());
-                        (k.clone(), json_value)
-                    })
-                    .collect()
-            }
+        match self.format() {
+            InputFormat::Json => Ok((json, self.try_into()?)),
+            // Refuse the formats Unit cannot read by name.  Sending such a
+            // file as it is would make the server report a syntax error on
+            // the first comment or unquoted key, and that error does not tell
+            // the user what to do.
+            InputFormat::Hjson => Err(UnitctlError::DeserializationError {
+                message: "hjson is no longer supported: convert the file to JSON first".to_string(),
+            }),
+            InputFormat::Json5 => Err(UnitctlError::DeserializationError {
+                message: "JSON5 is no longer supported: convert the file to JSON first, for example \
+                          with \"json5 -o config.json config.json5\""
+                    .to_string(),
+            }),
+            InputFormat::Yaml => Err(UnitctlError::DeserializationError {
+                message: "YAML is no longer supported: convert the file to JSON first, for example with \
+                          \"yq -o=json\""
+                    .to_string(),
+            }),
             _ => Err(UnitctlError::DeserializationError {
-                message: format!("Unsupported input format for serialization: {:?}", self),
-            })?,
-        };
-        Ok(body_data)
+                message: format!("Unsupported input format for a configuration: {:?}", self),
+            }),
+        }
     }
 }
 
@@ -243,6 +241,7 @@ impl TryInto<KnownSize> for &InputFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UnitSerializableMap;
 
     #[test]
     fn can_parse_file_extensions() {
@@ -250,6 +249,8 @@ mod tests {
         assert_eq!(InputFormat::from_file_extension("yml"), InputFormat::Yaml);
         assert_eq!(InputFormat::from_file_extension("json"), InputFormat::Json);
         assert_eq!(InputFormat::from_file_extension("json5"), InputFormat::Json5);
+        assert_eq!(InputFormat::from_file_extension("hjson"), InputFormat::Hjson);
+        assert_eq!(InputFormat::from_file_extension("cjson"), InputFormat::Hjson);
         assert_eq!(InputFormat::from_file_extension("pem"), InputFormat::Pem);
         assert_eq!(InputFormat::from_file_extension("js"), InputFormat::JavaScript);
         assert_eq!(InputFormat::from_file_extension("njs"), InputFormat::JavaScript);
@@ -258,14 +259,14 @@ mod tests {
 
     #[test]
     fn can_parse_remote_paths() {
-        assert_eq!(InputFormat::from_remote_path("//config"), InputFormat::Hjson);
-        assert_eq!(InputFormat::from_remote_path("/config"), InputFormat::Hjson);
-        assert_eq!(InputFormat::from_remote_path("/config/"), InputFormat::Hjson);
-        assert_eq!(InputFormat::from_remote_path("config/"), InputFormat::Hjson);
-        assert_eq!(InputFormat::from_remote_path("config"), InputFormat::Hjson);
-        assert_eq!(InputFormat::from_remote_path("/config/something/"), InputFormat::Hjson);
-        assert_eq!(InputFormat::from_remote_path("config/something/"), InputFormat::Hjson);
-        assert_eq!(InputFormat::from_remote_path("config/something"), InputFormat::Hjson);
+        assert_eq!(InputFormat::from_remote_path("//config"), InputFormat::Json);
+        assert_eq!(InputFormat::from_remote_path("/config"), InputFormat::Json);
+        assert_eq!(InputFormat::from_remote_path("/config/"), InputFormat::Json);
+        assert_eq!(InputFormat::from_remote_path("config/"), InputFormat::Json);
+        assert_eq!(InputFormat::from_remote_path("config"), InputFormat::Json);
+        assert_eq!(InputFormat::from_remote_path("/config/something/"), InputFormat::Json);
+        assert_eq!(InputFormat::from_remote_path("config/something/"), InputFormat::Json);
+        assert_eq!(InputFormat::from_remote_path("config/something"), InputFormat::Json);
         assert_eq!(InputFormat::from_remote_path("/certificates"), InputFormat::Pem);
         assert_eq!(InputFormat::from_remote_path("/certificates/"), InputFormat::Pem);
         assert_eq!(InputFormat::from_remote_path("certificates/"), InputFormat::Pem);
@@ -285,5 +286,181 @@ mod tests {
             InputFormat::from_remote_path("certificates/something"),
             InputFormat::Pem
         );
+    }
+
+    /// Member names in an order no map sorts into by accident, so a map that
+    /// does not keep insertion order cannot pass by luck.
+    const MEMBERS: [&str; 6] = [
+        "settings",
+        "listeners",
+        "routes",
+        "applications",
+        "access_log",
+        "upstreams",
+    ];
+
+    fn write_input(body: &str, suffix: &str) -> tempfile::NamedTempFile {
+        let mut file = tempfile::Builder::new()
+            .prefix("unitctl-inputfile-")
+            .suffix(suffix)
+            .tempfile()
+            .expect("a temporary file");
+        std::io::Write::write_all(file.as_file_mut(), body.as_bytes()).expect("writing the input");
+        file
+    }
+
+    /// Read a body back without going through `into_full_body`, so the check
+    /// does not depend on the same code it is checking.
+    fn body_bytes(known_size: KnownSize) -> Vec<u8> {
+        match known_size {
+            KnownSize::Vec(bytes) => bytes,
+            KnownSize::String(text) => text.into_bytes(),
+            KnownSize::Read(mut reader, _) => {
+                let mut bytes = Vec::new();
+                reader.read_to_end(&mut bytes).expect("reading the body");
+                bytes
+            }
+            KnownSize::Empty => Vec::new(),
+        }
+    }
+
+    fn config_body(file: &tempfile::NamedTempFile, format: InputFormat) -> Vec<u8> {
+        let (mime_type, body) = InputFile::FileWithFormat(file.path().into(), format)
+            .to_config_body()
+            .expect("the input must produce a body");
+
+        // Every configuration body is JSON by the time it leaves, whatever the
+        // file it came from.
+        assert_eq!(mime_type, "application/json");
+
+        body_bytes(body)
+    }
+
+    fn members_of(file: &tempfile::NamedTempFile, format: InputFormat) -> Vec<String> {
+        let body = config_body(file, format);
+        let map: UnitSerializableMap = serde_json::from_slice(&body).expect("the body must be JSON");
+        map.keys().cloned().collect()
+    }
+
+    /// The body Unit receives keeps member order.  JSON is sent as it was
+    /// written, so it can only keep it.  The check stays because the response
+    /// side still parses into `UnitSerializableMap`, which keeps order only
+    /// while `serde_json`'s "preserve_order" feature is on.
+    #[test]
+    fn a_json_body_keeps_member_order() {
+        let json = MEMBERS
+            .iter()
+            .map(|name| format!("  \"{}\": {{}}", name))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        let json = format!("{{\n{}\n}}\n", json);
+
+        assert_eq!(members_of(&write_input(&json, ".json"), InputFormat::Json), MEMBERS);
+    }
+
+    /// A JSON file is sent byte for byte.  Parsing it here kept the last of two
+    /// members with the same name and re-spelled every number, so the server
+    /// never saw what the operator wrote.  The server refuses the duplicate
+    /// itself (src/nxt_conf.c:1616).
+    #[test]
+    fn a_json_input_is_sent_unchanged() {
+        let written = "{\n  \"listeners\": {},\n  \"listeners\": {\"*:8080\": {}},\n  \"settings\": 1.50\n}\n";
+        let file = write_input(written, ".json");
+
+        let body = config_body(&file, InputFormat::Json);
+
+        assert_eq!(String::from_utf8(body).expect("the body is UTF-8"), written);
+    }
+
+    /// Bytes that are not valid UTF-8 now reach the server, which refuses them
+    /// and names the member (src/nxt_conf_validation.c:1840).  unitctl refused
+    /// them first, with a parse error that said nothing about the encoding.
+    #[test]
+    fn a_file_that_is_not_valid_utf8_is_sent_to_the_server() {
+        let mut file = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .expect("a temporary file");
+        let mut raw = br#"{"routes":[{"match":{"uri":"/"#.to_vec();
+        raw.push(0xff);
+        raw.extend_from_slice(br#""},"action":{"return":204}}]}"#);
+        std::io::Write::write_all(file.as_file_mut(), &raw).expect("writing the input");
+
+        let (_, body) = InputFile::FileWithFormat(file.path().into(), InputFormat::Json)
+            .to_config_body()
+            .expect("the bytes must be sent, not judged here");
+        let body = body_bytes(body);
+
+        assert_eq!(body, raw);
+    }
+
+    /// hjson is refused by name.  Handing the file to the JSON parser instead
+    /// would report a syntax error on the first comment, which does not tell
+    /// the user what to do.
+    #[test]
+    fn an_hjson_input_is_refused_with_a_message_about_hjson() {
+        let file = write_input("{\n  # a comment\n  routes: []\n}\n", ".hjson");
+        let Err(error) = InputFile::from(file.path()).to_config_body() else {
+            panic!("hjson must be refused");
+        };
+
+        assert!(
+            error.to_string().contains("hjson is no longer supported"),
+            "unexpected message: {}",
+            error
+        );
+    }
+
+    /// JSON5 is refused by name too.  unitctl parsed it until the PUT path
+    /// stopped parsing anything; keeping the variant means a ".json5" file
+    /// gets told what to do instead of reaching the JSON parser.
+    #[test]
+    fn a_json5_input_is_refused_with_a_message_about_json5() {
+        let file = write_input("{\n  // a comment\n  routes: [],\n}\n", ".json5");
+        let input = InputFile::from(file.path());
+
+        assert!(input.is_config(), ".json5 must stay a config format");
+
+        let Err(error) = input.to_config_body() else {
+            panic!("JSON5 must be refused");
+        };
+
+        assert!(
+            error.to_string().contains("JSON5 is no longer supported"),
+            "unexpected message: {}",
+            error
+        );
+    }
+
+    /// YAML is refused by name for the same reason, and the ".yaml" extension
+    /// still has to reach that refusal.  Were the variant dropped instead, the
+    /// file would become `InputFormat::Unknown`, which `execute` and `import`
+    /// report as an unknown input type -- the file name, but not what to do
+    /// about it.
+    #[test]
+    fn a_yaml_input_is_refused_with_a_message_about_yaml() {
+        for suffix in [".yaml", ".yml"] {
+            let file = write_input("routes: []\n", suffix);
+            let input = InputFile::from(file.path());
+
+            assert!(input.is_config(), "{} must stay a config format", suffix);
+
+            let Err(error) = input.to_config_body() else {
+                panic!("{} must be refused", suffix);
+            };
+            assert!(
+                error.to_string().contains("YAML is no longer supported"),
+                "unexpected message: {}",
+                error
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsupported_input_format_is_refused() {
+        let file = write_input("not a configuration", ".txt");
+        assert!(InputFile::FileWithFormat(file.path().into(), InputFormat::Pem)
+            .to_config_body()
+            .is_err());
     }
 }

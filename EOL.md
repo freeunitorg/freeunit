@@ -11,7 +11,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Runtime | Version | Upstream EOL | FreeUnit Drops |
 |---------|---------|--------------|----------------|
 | Go | 1.24 (EOL) † | Feb 2026 | Feb 2027 |
-| Go | 1.25 | Aug 2026 | Aug 2027 |
+| Go | 1.25 (EOL) † | Aug 2026 | Aug 2027 |
 | Go | 1.26 | Feb 2027 | Feb 2028 |
 | Java (JSC) | 17 (LTS) | Oct 2027 | Oct 2028 |
 | Java (JSC) | 21 (LTS) | Dec 2029 | Dec 2030 |
@@ -21,7 +21,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Node.js | 22 (LTS) | Apr 2027 | Apr 2028 |
 | Node.js | 24 (LTS) | Apr 2028 | Apr 2029 |
 | Node.js | 26 (LTS) | Apr 2029 | Apr 2030 |
-| Perl | 5.38 | Jul 2026 | Jul 2027 |
+| Perl | 5.38 (EOL) † | Jul 2026 | Jul 2027 |
 | Perl | 5.40 | Jun 2027 | Jun 2028 |
 | Perl | 5.42 | Jul 2028 | Jul 2029 |
 | PHP | 8.3 | Dec 2027 | Dec 2028 |
@@ -45,14 +45,14 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Fedora | 43 | 2026-12 | 2029-12 | 3.14 |
 | Fedora | 44 | 2027-06 | 2030-06 | 3.14 |
 | CentOS Stream | 9 | 2027-05 | 2030-05 | 3.11 |
-| CentOS Stream | 10 | 2030-01 | 2033-01 | 3.13 |
-| Amazon Linux | 2 | 2026-06 | 2029-06 | 3.7 ‡ |
+| CentOS Stream | 10 | 2030-05 | 2033-05 | 3.13 |
+| Amazon Linux | 2 (EOL) † | 2026-06 | 2029-06 | 3.7 ‡ |
 | Amazon Linux | 2023 | 2029-06 | 2032-06 | 3.11 |
-| Ubuntu (LTS) | 22.04 | 2027-04 | 2030-04 | 3.10 |
+| Ubuntu (LTS) | 22.04 | 2027-06 | 2030-06 | 3.10 |
 | Ubuntu (LTS) | 24.04 | 2029-05 | 2032-05 | 3.12 |
-| Ubuntu (LTS) | 26.04 | 2031-04 | 2034-04 | 3.13 |
+| Ubuntu (LTS) | 26.04 | 2031-05 | 2034-05 | 3.13 |
 | Debian | 11 (bullseye) (EOL) † | 2024-08 | 2027-08 | 3.9 |
-| Debian | 12 (bookworm) | 2026-07 | 2029-07 | 3.11 |
+| Debian | 12 (bookworm) (EOL) † | 2026-07 | 2029-07 | 3.11 |
 | Debian | 13 (trixie) | 2028-08 | 2031-08 | 3.13 |
 | RHEL | 8 | 2029-05 | 2032-05 | 3.8 ‡ |
 | RHEL | 9 | 2032-05 | 2035-05 | 3.11 |
@@ -66,6 +66,35 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 † Past upstream EOL; in FreeUnit grace period.
 ‡ Default Python shipped by this OS is itself past upstream EOL. FreeUnit does not backport fixes to that Python version.
 
+The "Upstream EOL" column is always the end of *standard* support, per the LTS
+rule below — never an extended-maintenance date. Which endoflife.date field that
+is depends on the vendor, so `pkg/eol/` picks per category: Ubuntu's `eol` is the
+end of standard security maintenance (ESM excluded), while Debian's `eol` became
+the end of **LTS** in September 2026, and the Debian Security Team's window — the
+one this table tracks — moved to that API's `support` field.
+
+## Dependency Support
+
+Build-time and bundled libraries. These are **not** matrix variants — nothing in
+Docker or CI derives an image from this table — so the 1-year grace rule does not
+apply to them. Machine-readable copy: the `dependencies` key in `pkg/eol.json`.
+
+† Bundled software that is already past upstream EOL. It carries no FreeUnit "drops"
+date, because the grace policy applies to matrix variants, not to vendored jars; it
+needs an upgrade or replacement decision instead.
+
+| Dependency | Role | Floor / Version | Upstream EOL | Notes |
+|------------|------|-----------------|--------------|-------|
+| OpenSSL | TLS backend (`--openssl`) | 1.1.1 (floor) | Sep 2023 | The floor stays at 1.1.1 rather than 3.x because RHEL 8 still ships a vendor-patched 1.1.1 and Red Hat maintains it into 2029 -- from 2026-09 it is the last platform in the matrix still receiving vendor patches for it. Amazon Linux 2's ended 2026-06-30 and Debian 11's LTS ends 2026-08-31; both remain inside FreeUnit's own three-year post-EOL support window (see `_grace_os` in `pkg/eol.json`). Floor declared by the `auto/ssltls` probe (PR #224). |
+| OpenSSL | tested ceiling | 3.6.2 (CI build) | Nov 2026 | `build-test.yml` builds it into `/opt/openssl-3.6` (`OPENSSL_VERSION`). **The pin needs a bump before 2026-11-01** (3.5 is the LTS, EOL Apr 2030). |
+| OpenSSL | tested ceiling | 4.0.2 (CI build) | May 2027 | The `openssl4` job builds it into `/opt/openssl-4.0` (`OPENSSL4_VERSION`) and compiles with `-DOPENSSL_NO_DEPRECATED`, so any use of an API 4.0 deprecates fails the build. |
+| Apache Tomcat | Servlet/JSP/EL API + Jasper jars bundled by the Java module | 9.0.x | Mar 2027 ([no earlier than](https://tomcat.apache.org/whichversion.html)) | Bundled by `auto/modules/java`; independent of the JDK variant. |
+| Eclipse Jetty | `jetty-util` / `jetty-server` / `jetty-http` jars bundled by the Java module | 9.4.58.v20250814 | **Aug 2025 (EOL)** † | Jetty 9.4 lost community support on 2025-08-14 and the bundled build is its last release. Needs an upgrade-or-replace decision — Jetty 10/11 are EOL too; 12.x is the supported line. |
+| Eclipse ECJ (JDT batch compiler) | JSP compilation jar bundled by the Java module | 3.26.0 | none published | Tracks Eclipse releases; endoflife.date has no product for it. Pinned build is from Jun 2021; current is 3.42.0 (Jun 2025). |
+| ClassGraph | classpath scanning jar bundled by the Java module | latest | — | No upstream EOL schedule; pinned and bumped as needed. |
+| Wasmtime (C API) | WebAssembly runtime built by `pkg/contrib` and linked by the `wasm` module | 47.0.4 | none published | Fetched as a source tarball (`pkg/contrib/src/wasmtime/version`), so `cargo audit` never sees it; the `Audit (cargo)` pins job queries OSV for the pinned version instead. Same 47.0.4 as the Rust pin below; the 43.0.1 bump closed RUSTSEC-2026-0269, -0222, -0114 and three wasmtime-wasi path/permission advisories — see #400. |
+| Wasmtime (Rust crate) | WebAssembly runtime used by the `wasm-wasi-component` module | 47.0.4 | none published | `src/wasm-wasi-component/Cargo.lock`, audited by the `Audit (cargo)` workflow on every lock. Bumped with the advisories it closes. |
+
 ## Rules
 
 - **Adding a runtime version:** when new upstream release reaches stable, FreeUnit adds
@@ -77,6 +106,13 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 - **Security-only mode:** versions within 6 months of the FreeUnit drop date receive
   security fixes only — no new features backported.
 - **LTS runtimes (Java 17/21/25):** follow the upstream LTS schedule strictly.
+- **Dependencies:** the floors in the Dependency Support section are not part of the
+  EOL + grace policy; they track what FreeUnit builds and bundles, not what it ships
+  as a variant.
+- **A dependency pinned twice needs both rows.** Wasmtime is pinned once as a Rust
+  crate and once as a source tarball, and only the crate is reachable by `cargo
+  audit`. List every pin separately and say which one an automated check covers, so
+  a gap between them is visible here rather than only in a lock file.
 - **LTS OS (Ubuntu, RHEL, Debian):** 3-year extension applies to standard EOL, not
   extended security maintenance dates.
 

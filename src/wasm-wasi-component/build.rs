@@ -15,7 +15,7 @@ fn main() {
         .blocklist_function("nxt_vsprintf")
         // Tell cargo to invalidate the built crate whenever any of the
         // included header files changed.
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks))
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         // disable some features which aren't necessary
         .layout_tests(false)
         .derive_debug(false)

@@ -38,6 +38,8 @@ typedef struct {
     ssize_t           offset;
     nxt_uint_t        line;
     nxt_uint_t        column;
+    nxt_str_t         pointer;     /* RFC 6901 path to validation error. */
+    nxt_str_t         suggestion;  /* "Did you mean" member name. */
 } nxt_controller_response_t;
 
 
@@ -377,6 +379,27 @@ nxt_controller_start(nxt_task_t *task, nxt_process_data_t *data)
     vldt.conf_pool = mp;
     vldt.ver = nxt_conf_ver;
 
+    /*
+     * A state file written before this check existed can hold bytes the
+     * control API would now refuse.  Rejecting it here would drop the whole
+     * configuration on the next restart -- the daemon would come back serving
+     * nothing -- and repairing it would silently rewrite an operator's value,
+     * which is how a working non-UTF-8 "share" path becomes a broken one.  So
+     * it is loaded exactly as written and reported, once, with the pointer
+     * that names it.  The API refuses to store any more of them.
+     */
+
+    if (nxt_conf_validate_encoding(&vldt) == NXT_DECLINED) {
+        nxt_log(task, NXT_LOG_WARN, "the restored configuration holds a value "
+                "at \"%V\" that the control API would now reject: %V  It is "
+                "kept as written, and the configuration is running; correct it "
+                "to be able to update the configuration.",
+                &vldt.pointer, &vldt.error);
+
+        nxt_memzero(&vldt.error, sizeof(nxt_str_t));
+        nxt_memzero(&vldt.pointer, sizeof(nxt_str_t));
+    }
+
     ret = nxt_conf_validate(&vldt);
 
     if (nxt_slow_path(ret != NXT_OK)) {
@@ -409,9 +432,20 @@ static void
 nxt_controller_process_new_port_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg)
 {
+    nxt_port_t  *port;
+
     nxt_port_new_port_handler(task, msg);
 
-    if (msg->u.new_port->type != NXT_PROCESS_ROUTER
+    port = msg->u.new_port;
+
+    /*
+     * The controller never maps a port queue, so the descriptor
+     * nxt_port_new_port_handler() leaves to its caller has no use here.
+     */
+    nxt_port_recv_msg_close_fds(msg);
+
+    if (port == NULL
+        || port->type != NXT_PROCESS_ROUTER
         || !nxt_controller_router_ready)
     {
         return;
@@ -494,6 +528,8 @@ nxt_controller_remove_pid_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_assert(nxt_buf_used_size(msg->buf) == sizeof(pid));
 
     nxt_memcpy(&pid, msg->buf->mem.pos, sizeof(pid));
+
+    /* Unreferenced: the controller process runs a single engine. */
 
     process = nxt_runtime_process_find(rt, pid);
     if (process != NULL && nxt_process_type(process) == NXT_PROCESS_ROUTER) {
@@ -1495,13 +1531,30 @@ nxt_controller_process_config(nxt_task_t *task, nxt_controller_request_t *req,
         vldt.conf_pool = mp;
         vldt.ver = NXT_VERNUM;
 
-        rc = nxt_conf_validate(&vldt);
+        /*
+         * Before nxt_conf_validate(), which quotes an offending member name
+         * into its own error text: a name that is not UTF-8 would otherwise
+         * reach the response body and make the error report unreadable for
+         * the very reason it is being reported.
+         *
+         * This runs on the tree that would be installed, so a configuration
+         * that already holds such a value has to have it corrected before any
+         * other part of it can be updated.  The pointer in the error names it.
+         */
+
+        rc = nxt_conf_validate_encoding(&vldt);
+
+        if (nxt_fast_path(rc == NXT_OK)) {
+            rc = nxt_conf_validate(&vldt);
+        }
 
         if (nxt_slow_path(rc != NXT_OK)) {
             nxt_mp_destroy(mp);
 
             if (rc == NXT_DECLINED) {
                 resp.detail = vldt.error;
+                resp.pointer = vldt.pointer;
+                resp.suggestion = vldt.suggestion;
                 goto invalid_conf;
             }
 
@@ -1578,13 +1631,30 @@ nxt_controller_process_config(nxt_task_t *task, nxt_controller_request_t *req,
         vldt.conf_pool = mp;
         vldt.ver = NXT_VERNUM;
 
-        rc = nxt_conf_validate(&vldt);
+        /*
+         * Before nxt_conf_validate(), which quotes an offending member name
+         * into its own error text: a name that is not UTF-8 would otherwise
+         * reach the response body and make the error report unreadable for
+         * the very reason it is being reported.
+         *
+         * This runs on the tree that would be installed, so a configuration
+         * that already holds such a value has to have it corrected before any
+         * other part of it can be updated.  The pointer in the error names it.
+         */
+
+        rc = nxt_conf_validate_encoding(&vldt);
+
+        if (nxt_fast_path(rc == NXT_OK)) {
+            rc = nxt_conf_validate(&vldt);
+        }
 
         if (nxt_slow_path(rc != NXT_OK)) {
             nxt_mp_destroy(mp);
 
             if (rc == NXT_DECLINED) {
                 resp.detail = vldt.error;
+                resp.pointer = vldt.pointer;
+                resp.suggestion = vldt.suggestion;
                 goto invalid_conf;
             }
 
@@ -1852,7 +1922,8 @@ nxt_controller_process_cert(nxt_task_t *task,
         return;
     }
 
-    if (name.length == 0 || path != NULL) {
+    /* Names starting with "." are reserved for the store's own files. */
+    if (name.length == 0 || path != NULL || name.start[0] == '.') {
         goto invalid_name;
     }
 
@@ -1999,6 +2070,7 @@ nxt_controller_process_cert_save(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     nxt_fd_write(msg->fd[0], mbuf->pos, nxt_buf_mem_used_size(mbuf));
 
     nxt_fd_close(msg->fd[0]);
+    msg->fd[0] = -1;
 
     nxt_memzero(&resp, sizeof(nxt_controller_response_t));
 
@@ -2282,6 +2354,7 @@ nxt_controller_process_script_save(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     nxt_fd_write(msg->fd[0], mbuf->pos, nxt_buf_mem_used_size(mbuf));
 
     nxt_fd_close(msg->fd[0]);
+    msg->fd[0] = -1;
 
     nxt_memzero(&resp, sizeof(nxt_controller_response_t));
 
@@ -2628,6 +2701,8 @@ nxt_controller_response(nxt_task_t *task, nxt_controller_request_t *req,
     static const nxt_str_t  offset_str = nxt_string("offset");
     static const nxt_str_t  line_str = nxt_string("line");
     static const nxt_str_t  column_str = nxt_string("column");
+    static const nxt_str_t  path_str = nxt_string("path");
+    static const nxt_str_t  suggestion_str = nxt_string("suggestion");
 
     static nxt_time_string_t  date_cache = {
         (nxt_atomic_uint_t) -1,
@@ -2665,9 +2740,15 @@ nxt_controller_response(nxt_task_t *task, nxt_controller_request_t *req,
     value = resp->conf;
 
     if (value == NULL) {
+        nxt_uint_t  loc_n, loc_i, have_offset, have_pointer;
+
+        have_offset = (resp->status >= 400 && resp->offset != -1);
+        have_pointer = (resp->status >= 400 && resp->pointer.start != NULL);
+
         n = 1
             + (resp->detail.length != 0)
-            + (resp->status >= 400 && resp->offset != -1);
+            + (have_offset || have_pointer)
+            + (resp->suggestion.length != 0);
 
         value = nxt_conf_create_object(c->mem_pool, n);
 
@@ -2694,23 +2775,46 @@ nxt_controller_response(nxt_task_t *task, nxt_controller_request_t *req,
             nxt_conf_set_member_string(value, &detail_str, &resp->detail, n);
         }
 
-        if (resp->status >= 400 && resp->offset != -1) {
+        if (have_offset || have_pointer) {
             n++;
 
-            location = nxt_conf_create_object(c->mem_pool,
-                                              resp->line != 0 ? 3 : 1);
+            loc_n = (have_offset ? (resp->line != 0 ? 3 : 1) : 0) + have_pointer;
+
+            location = nxt_conf_create_object(c->mem_pool, loc_n);
+
+            if (nxt_slow_path(location == NULL)) {
+                nxt_controller_conn_close(task, c, req);
+                return;
+            }
 
             nxt_conf_set_member(value, &location_str, location, n);
 
-            nxt_conf_set_member_integer(location, &offset_str, resp->offset, 0);
+            loc_i = 0;
 
-            if (resp->line != 0) {
-                nxt_conf_set_member_integer(location, &line_str,
-                                            resp->line, 1);
+            if (have_offset) {
+                nxt_conf_set_member_integer(location, &offset_str,
+                                            resp->offset, loc_i++);
 
-                nxt_conf_set_member_integer(location, &column_str,
-                                            resp->column, 2);
+                if (resp->line != 0) {
+                    nxt_conf_set_member_integer(location, &line_str,
+                                                resp->line, loc_i++);
+
+                    nxt_conf_set_member_integer(location, &column_str,
+                                                resp->column, loc_i++);
+                }
             }
+
+            if (have_pointer) {
+                nxt_conf_set_member_string(location, &path_str,
+                                           &resp->pointer, loc_i++);
+            }
+        }
+
+        if (resp->suggestion.length != 0) {
+            n++;
+
+            nxt_conf_set_member_string(value, &suggestion_str,
+                                       &resp->suggestion, n);
         }
     }
 

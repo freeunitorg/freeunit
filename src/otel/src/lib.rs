@@ -14,20 +14,24 @@
 //! which exports it from its own background thread.
 
 use opentelemetry::global;
-use opentelemetry::global::BoxedSpan;
+use opentelemetry::global::{BoxedSpan, BoxedTracer};
 use opentelemetry::trace::{
     Span, SpanContext, SpanId, SpanKind, Status, TraceContextExt, TraceFlags,
     TraceId, TraceState, Tracer, TracerProvider,
 };
-use opentelemetry::{Context, KeyValue};
+use opentelemetry::{Context, Key, KeyValue, Value};
 use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig};
+use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{
-    BatchConfigBuilder, BatchSpanProcessor, Sampler, SdkTracerProvider,
+    BatchConfigBuilder, BatchSpanProcessor, Sampler, SdkTracerProvider, SpanData,
+    SpanExporter as SdkSpanExporter,
 };
 use opentelemetry_sdk::Resource;
 use std::ffi::{c_char, CStr, CString};
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 use std::{ptr, slice};
 
@@ -39,6 +43,63 @@ const TRACER_NAME: &str = "FreeUnit";
 const SPAN_NAME: &str = "request";
 
 const NXT_LOG_ERR: nxt_uint_t = 1;
+
+/// Return values of `nxt_otel_rs_shutdown_bounded`.
+///
+/// These are mirrored as `NXT_OTEL_SHUTDOWN_*` in `src/nxt_otel.h`, which is
+/// the only consumer; the two lists must be kept in step.
+const NXT_OTEL_SHUTDOWN_TIMEOUT: u8 = 0;
+const NXT_OTEL_SHUTDOWN_FLUSHED: u8 = 1;
+const NXT_OTEL_SHUTDOWN_FAILED: u8 = 2;
+
+/// Span attribute keys, indexed by the `nxt_otel_attr_id_t` id C sends.
+///
+/// `Key::from_static_str` is a `const fn` over a `&'static str`, so a key
+/// costs no allocation and no `strlen` -- where the previous string-key FFI
+/// copied all eleven of these compile-time constants onto the heap on every
+/// traced request.
+///
+/// This table and `nxt_otel_attr_id_t` in `src/nxt_otel.h` are one contract:
+/// the id indexes this array directly, so the order must match exactly.
+/// The `[Key; NXT_OTEL_ATTR_MAX]` annotation makes a mismatched element count
+/// a compile error, so a key added here without extending the count cannot
+/// ship. It cannot check the C enum itself -- the ids stay a reviewed
+/// contract -- but it catches the half of the mistake that lives on this side.
+///
+/// These follow the stable OpenTelemetry HTTP semantic conventions
+/// (<https://opentelemetry.io/docs/specs/semconv/http/http-spans/>);
+/// "http.flavor"/"http.user_agent" from older drafts are superseded by
+/// "network.protocol.version"/"user_agent.original". "unit.application.*" are
+/// FreeUnit-specific: a reverse proxy can't know the served app, but Unit can.
+static ATTR_KEYS: [Key; NXT_OTEL_ATTR_MAX] = [
+    Key::from_static_str("http.request.method"),
+    Key::from_static_str("url.path"),
+    Key::from_static_str("url.scheme"),
+    Key::from_static_str("network.protocol.version"),
+    Key::from_static_str("user_agent.original"),
+    Key::from_static_str("server.address"),
+    Key::from_static_str("client.address"),
+    Key::from_static_str("unit.application.name"),
+    Key::from_static_str("unit.application.type"),
+    Key::from_static_str("http.response.status_code"),
+    Key::from_static_str("http.request.body.size"),
+];
+
+/// Must equal `NXT_OTEL_ATTR_MAX` in `src/nxt_otel.h`.
+const NXT_OTEL_ATTR_MAX: usize = 11;
+
+const NXT_OTEL_ATTR_TYPE_STR: u32 = 0;
+const NXT_OTEL_ATTR_TYPE_I64: u32 = 1;
+
+/// One span attribute in a batch. Mirrors `nxt_otel_attr_t` in
+/// `src/nxt_otel.h`; the layouts must stay identical.
+#[repr(C)]
+pub struct nxt_otel_attr_t {
+    pub key_id: u32,
+    pub r#type: u32,
+    pub ival: i64,
+    pub sval: nxt_str_t,
+}
 
 #[repr(C)]
 pub struct nxt_str_t {
@@ -61,12 +122,94 @@ fn provider_slot() -> &'static Mutex<Option<SdkTracerProvider>> {
     &PROVIDER
 }
 
+/// The tracer built from the live provider.
+///
+/// `global::tracer_provider().tracer()` takes the global provider's lock,
+/// clones the provider and heap-allocates a fresh tracer on every call, but a
+/// tracer is meant to be built once. Caching it leaves the request path with
+/// one uncontended read lock instead. `None` means no provider is installed;
+/// the request path then falls back to the global one, so behaviour is
+/// unchanged either way.
+fn tracer_slot() -> &'static RwLock<Option<BoxedTracer>> {
+    static TRACER: RwLock<Option<BoxedTracer>> = RwLock::new(None);
+    &TRACER
+}
+
 /// The tokio runtime owning the gRPC exporter's tonic channel. The blocking
 /// batch processor drives export RPCs onto it from its own thread, so it must
 /// outlive the provider; it is dropped in `nxt_otel_rs_shutdown_tracer`.
 fn runtime_slot() -> &'static Mutex<Option<tokio::runtime::Runtime>> {
     static RT: Mutex<Option<tokio::runtime::Runtime>> = Mutex::new(None);
     &RT
+}
+
+/// Set whenever an export returns `Err`, and cleared when a new provider is
+/// installed. Sticky because the `BatchSpanProcessor` throws away the result
+/// of every batch it exports on its own schedule (it only propagates the one
+/// forced by `force_flush`), so without this a batch that failed minutes
+/// before exit would leave nothing at all for the shutdown path to report.
+static EXPORT_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Spans in batches the exporter accepted, and spans in batches it rejected,
+/// since the live provider was installed.  Read out by
+/// `nxt_otel_rs_export_stats` for the `/status` API, which is the only way an
+/// operator can see export health without waiting for the process to exit.
+///
+/// Counted in spans rather than batches because the number an operator needs
+/// is "how much telemetry did I lose", and a batch is a variable-size unit
+/// that answers that only by accident.  Neither counter includes spans the
+/// processor dropped before an export was attempted (a full queue): that
+/// happens inside the SDK, which reports it nowhere we can observe.
+static SPANS_EXPORTED: AtomicU64 = AtomicU64::new(0);
+static SPANS_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// Wraps the configured OTLP exporter so a failed export is remembered in
+/// `EXPORT_FAILED` even when the processor discards the result.
+///
+/// Everything other than `export` is delegated verbatim to the inner
+/// exporter: taking the trait's defaults here would silently turn shutdown,
+/// force-flush and resource propagation into no-ops.
+#[derive(Debug)]
+struct FailureTrackingExporter<E> {
+    inner: E,
+}
+
+impl<E: SdkSpanExporter> SdkSpanExporter for FailureTrackingExporter<E> {
+    async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+        // Count before the batch is moved into the inner exporter.
+        let spans = batch.len() as u64;
+
+        let res = self.inner.export(batch).await;
+
+        if res.is_err() {
+            // The boolean is kept alongside the counter rather than derived
+            // from it: it is the fact the shutdown path asks for ("has any
+            // export failed"), and it stays true even for the degenerate
+            // empty batch that would add nothing to SPANS_FAILED.
+            EXPORT_FAILED.store(true, Ordering::Release);
+            SPANS_FAILED.fetch_add(spans, Ordering::Relaxed);
+        } else {
+            SPANS_EXPORTED.fetch_add(spans, Ordering::Relaxed);
+        }
+
+        res
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn shutdown(&self) -> OTelSdkResult {
+        self.inner.shutdown()
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        self.inner.force_flush()
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.inner.set_resource(resource);
+    }
 }
 
 /// Build the OTLP/HTTP exporter: the blocking reqwest client, no async runtime.
@@ -138,6 +281,44 @@ pub unsafe extern "C" fn nxt_otel_rs_is_init() -> u8 {
         .unwrap_or(0)
 }
 
+/// Report span export health for the `/status` API.
+///
+/// Writes the number of spans the exporter accepted and the number it
+/// rejected since the live provider was installed, and returns 1 when a
+/// provider is installed at all.
+///
+/// The counters are written whether or not a provider is installed, so on a
+/// 0 return they hold whatever the previous provider left behind -- they are
+/// only zeroed when a new one is installed.  A 0 return therefore means the
+/// values are stale, not absent: the caller must ignore them rather than
+/// report them.
+///
+/// The counters are read with two independent `Relaxed` loads, so a report
+/// taken while an export is completing can be off by one batch.  That is
+/// deliberate: this is a health gauge, not an accounting ledger, and taking a
+/// lock on the export path to make the pair atomic would cost more than the
+/// skew is worth.
+///
+/// # Safety
+///
+/// `exported` and `failed` must each be either null or a valid, aligned,
+/// writable `uint64_t`.
+#[no_mangle]
+pub unsafe extern "C" fn nxt_otel_rs_export_stats(
+    exported: *mut u64,
+    failed: *mut u64,
+) -> u8 {
+    if !exported.is_null() {
+        *exported = SPANS_EXPORTED.load(Ordering::Relaxed);
+    }
+
+    if !failed.is_null() {
+        *failed = SPANS_FAILED.load(Ordering::Relaxed);
+    }
+
+    nxt_otel_rs_is_init()
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn nxt_otel_rs_uninit() {
     nxt_otel_rs_shutdown_tracer();
@@ -187,7 +368,19 @@ pub unsafe extern "C" fn nxt_otel_rs_init(
         }
     };
 
-    let processor = BatchSpanProcessor::builder(exporter)
+    // A new provider starts with a clean slate, so the shutdown path does not
+    // normally report a failure that belonged to the exporter we replaced:
+    // nxt_otel_rs_shutdown_tracer() above joins the old worker thread before
+    // this runs.  It joins on a 5s budget though, and an export gets 10s, so
+    // a worker still blocked on a dead collector can outlive the join and set
+    // the flag after this store.  The cost is one spurious FAILED at the next
+    // exit, describing a failure that was real but belonged to the old
+    // exporter -- not worth a second flag to suppress.
+    EXPORT_FAILED.store(false, Ordering::Release);
+    SPANS_EXPORTED.store(0, Ordering::Relaxed);
+    SPANS_FAILED.store(0, Ordering::Relaxed);
+
+    let processor = BatchSpanProcessor::builder(FailureTrackingExporter { inner: exporter })
         .with_batch_config(
             BatchConfigBuilder::default()
                 .with_max_export_batch_size(batch_size as usize)
@@ -209,6 +402,10 @@ pub unsafe extern "C" fn nxt_otel_rs_init(
         .build();
 
     global::set_tracer_provider(provider.clone());
+
+    if let Ok(mut slot) = tracer_slot().write() {
+        *slot = Some(global::tracer_provider().tracer(TRACER_NAME));
+    }
 
     if let Ok(mut slot) = provider_slot().lock() {
         *slot = Some(provider);
@@ -241,39 +438,74 @@ pub unsafe extern "C" fn nxt_otel_rs_copy_traceparent(buf: *mut c_char, span: *c
     *buf.add(TRACEPARENT_HEADER_LEN as usize) = 0;
 }
 
+/// Set a stage's semantic-convention span attributes in one call.
+///
+/// C accumulates a stage's attributes on its stack and crosses once, rather
+/// than once per attribute: a traced request used to make eight or nine FFI
+/// crossings here and allocate two `String`s at each of them. Only the values
+/// still allocate, and only those that are strings.
+///
+/// Note this deliberately does NOT use `SpanBuilder::with_attributes`, which
+/// issue #221 suggests. That would assemble the attributes while the span is
+/// being built -- before C can observe the sampling decision -- which would
+/// undo the `is_recording` gate that is the measured win. Attributes are set
+/// after the gate, on a span already known to be recording.
+///
+/// # Safety
+///
+/// `attrs` must point at `n` initialised `nxt_otel_attr_t`, and each entry's
+/// `sval` must reference bytes that stay valid for the duration of the call.
 #[no_mangle]
-pub unsafe extern "C" fn nxt_otel_rs_add_event_to_trace(
+pub unsafe extern "C" fn nxt_otel_rs_add_attrs(
     trace: *mut BoxedSpan,
-    key: *const nxt_str_t,
-    val: *const nxt_str_t,
+    attrs: *const nxt_otel_attr_t,
+    n: usize,
 ) {
-    if trace.is_null() || key.is_null() || val.is_null() {
+    if trace.is_null() || attrs.is_null() || n == 0 {
         return;
     }
 
-    let key = nxt_str_to_string(&*key);
-    let val = nxt_str_to_string(&*val);
+    let attrs = slice::from_raw_parts(attrs, n);
 
-    (*trace).add_event("Unit Attribute".to_string(), vec![KeyValue::new(key, val)]);
+    // Set each attribute directly rather than collecting into a Vec first.
+    // `Span::set_attributes` is a default trait method that just loops over
+    // `set_attribute`, and `BoxedSpan` does not override it, so a Vec here
+    // would be an allocation that buys nothing. The saving this function
+    // exists for is the single FFI crossing and the static keys, not batching
+    // inside the SDK.
+    for attr in attrs {
+        // A key_id C and Rust disagree about would index out of bounds;
+        // drop the attribute rather than panic across the FFI boundary.
+        let Some(key) = ATTR_KEYS.get(attr.key_id as usize) else {
+            continue;
+        };
+
+        let value = match attr.r#type {
+            NXT_OTEL_ATTR_TYPE_I64 => Value::I64(attr.ival),
+            NXT_OTEL_ATTR_TYPE_STR => Value::String(nxt_str_to_string(&attr.sval).into()),
+            _ => continue,
+        };
+
+        // Cloning a Key built by `from_static_str` copies a &'static str --
+        // no allocation, which is the point of the ATTR_KEYS table.
+        (*trace).set_attribute(KeyValue::new(key.clone(), value));
+    }
 }
 
-/// Set a semantic-convention span attribute (e.g. `http.request.method`).
-/// Unlike `add_event_to_trace`, this records structured span attributes the
-/// collector can index and query, not timestamped events.
+/// Whether the sampler kept this span.
+///
+/// C asks once, right after the span is built, and skips the attribute work
+/// for a span that is not recording. `set_attribute` on such a span is
+/// already a no-op, but its arguments are built before the call that throws
+/// them away -- so without this gate, lowering `sampling_ratio` buys back the
+/// exporter and nothing on the request path.
 #[no_mangle]
-pub unsafe extern "C" fn nxt_otel_rs_add_attr(
-    trace: *mut BoxedSpan,
-    key: *const nxt_str_t,
-    val: *const nxt_str_t,
-) {
-    if trace.is_null() || key.is_null() || val.is_null() {
-        return;
+pub unsafe extern "C" fn nxt_otel_rs_is_recording(trace: *mut BoxedSpan) -> u8 {
+    if trace.is_null() {
+        return 0;
     }
 
-    let key = nxt_str_to_string(&*key);
-    let val = nxt_str_to_string(&*val);
-
-    (*trace).set_attribute(KeyValue::new(key, val));
+    (*trace).is_recording() as u8
 }
 
 /// Mark the span as errored. Called by C for 5xx responses so the trace is
@@ -326,6 +558,12 @@ unsafe fn nxt_otel_parent_context(
     Some(Context::new().with_remote_span_context(sc))
 }
 
+fn nxt_otel_build_span(tracer: &BoxedTracer, parent: &Context) -> BoxedSpan {
+    let builder = tracer.span_builder(SPAN_NAME).with_kind(SpanKind::Server);
+
+    tracer.build_with_context(builder, parent)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn nxt_otel_rs_get_or_create_trace(
     trace_id: *const c_char,
@@ -333,12 +571,23 @@ pub unsafe extern "C" fn nxt_otel_rs_get_or_create_trace(
     trace_flags: *const c_char,
     trace_state: *const nxt_str_t,
 ) -> *mut BoxedSpan {
-    let tracer = global::tracer_provider().tracer(TRACER_NAME);
-    let builder = tracer.span_builder(SPAN_NAME).with_kind(SpanKind::Server);
-
     let parent = nxt_otel_parent_context(trace_id, parent_id, trace_flags, trace_state)
         .unwrap_or_else(Context::new);
-    let span = tracer.build_with_context(builder, &parent);
+
+    // The read guard is held across the build so the cached tracer cannot be
+    // dropped by a concurrent reconfigure while a span is being made from it.
+    let cached = tracer_slot().read().ok();
+
+    let span = match cached.as_ref().and_then(|slot| slot.as_ref()) {
+        Some(tracer) => nxt_otel_build_span(tracer, &parent),
+        None => {
+            // No provider installed, or the lock is poisoned: fall back to the
+            // global provider, which hands out a no-op tracer in that case.
+            let tracer = global::tracer_provider().tracer(TRACER_NAME);
+
+            nxt_otel_build_span(&tracer, &parent)
+        }
+    };
 
     Box::into_raw(Box::new(span))
 }
@@ -356,9 +605,115 @@ pub unsafe extern "C" fn nxt_otel_rs_send_trace(trace: *mut BoxedSpan) {
     span.end();
 }
 
+/// Flush and tear down the live tracer provider with a caller-supplied bound,
+/// for use on the process exit path.
+///
+/// `nxt_otel_rs_shutdown_tracer` can block for as long as the exporter's own
+/// `EXPORT_TIMEOUT` (10s) when the collector is unreachable, which is far too
+/// long to sit in front of `exit()`. The provider and runtime are taken out of
+/// their slots here and *moved* into a helper thread, so the statics are left
+/// empty and unlocked whatever happens; we then wait up to `timeout_ms` for
+/// that thread to finish flushing. On timeout we give up and return: the
+/// helper thread is left running and dies with the process. Best effort by
+/// construction — spans that could not be flushed in the budget are lost,
+/// exactly as they are today, but a dead collector can no longer delay exit.
+///
+/// Returns one of three statuses, mirrored in `src/nxt_otel.h`:
+///
+/// * `NXT_OTEL_SHUTDOWN_FLUSHED` (1) — the flush completed within the budget
+///   and no export has failed since this provider was installed.
+/// * `NXT_OTEL_SHUTDOWN_FAILED` (2) — an export failed. Either the flush this
+///   call forced failed, or `EXPORT_FAILED` records an earlier batch that did:
+///   the processor exports on its own schedule and discards the result, so the
+///   only way that failure is visible at all is the sticky flag. The helper
+///   thread failing to spawn reports here too; it is a failure, not a timeout.
+/// * `NXT_OTEL_SHUTDOWN_TIMEOUT` (0) — the helper thread did not answer inside
+///   `timeout_ms`. Kept distinct from the above because a rejected export
+///   fails in milliseconds, and calling that a timeout sends an operator
+///   looking for latency that is not there.
+///
+/// One loss remains unreportable from here: the router's worker engines are
+/// still live when `nxt_runtime_exit` calls this, so a span they end after the
+/// flush reaches a provider that is already shut down and is dropped without a
+/// word. Nothing at this layer can see it — the engine threads are never
+/// joined (`nxt_thread_join` has no call sites), so producers cannot be
+/// quiesced first. That needs the P5 graceful-shutdown work and is tracked in
+/// issue #219. A `FLUSHED` return therefore means "this flush succeeded and no
+/// export has failed", not "no spans were lost".
+#[no_mangle]
+pub unsafe extern "C" fn nxt_otel_rs_shutdown_bounded(timeout_ms: u64) -> u8 {
+    // This path takes the provider without going through
+    // nxt_otel_rs_shutdown_tracer(), so the cached tracer has to be dropped
+    // here too: leaving it would hand out a tracer whose provider has
+    // already been shut down.
+    if let Ok(mut slot) = tracer_slot().write() {
+        *slot = None;
+    }
+
+    let provider = provider_slot().lock().ok().and_then(|mut g| g.take());
+    let rt = runtime_slot().lock().ok().and_then(|mut g| g.take());
+
+    if provider.is_none() && rt.is_none() {
+        return if EXPORT_FAILED.load(Ordering::Acquire) {
+            NXT_OTEL_SHUTDOWN_FAILED
+        } else {
+            NXT_OTEL_SHUTDOWN_FLUSHED
+        };
+    }
+
+    let (tx, rx) = mpsc::channel::<bool>();
+
+    let spawned = std::thread::Builder::new()
+        .name("otel-shutdown".to_string())
+        .spawn(move || {
+            let mut flushed = true;
+
+            if let Some(provider) = provider {
+                // Needs the runtime alive on a grpc build, hence the ordering.
+                //
+                // force_flush() first, because it is the only one of the two
+                // that reports whether the spans actually left: the batch
+                // processor hands shutdown() the export result and shutdown()
+                // throws it away, reporting only that the worker answered.  A
+                // collector that refuses the connection fails in milliseconds,
+                // so shutdown() alone would call that a clean flush and exit
+                // without a word.  Both run whatever the first one says.
+                let exported = provider.force_flush().is_ok();
+                let stopped = provider.shutdown().is_ok();
+
+                flushed = exported && stopped;
+            }
+            if let Some(rt) = rt {
+                rt.shutdown_background();
+            }
+            // Read the sticky flag only after the flush above, so a batch the
+            // flush itself pushed out and failed on is counted here too.
+            let _ = tx.send(flushed && !EXPORT_FAILED.load(Ordering::Acquire));
+        });
+
+    // The caller logs these, so they must not be conflated: a collector that
+    // rejects the export fails in milliseconds, and reporting that as a
+    // timeout sends an operator looking for latency that is not there.
+    match spawned {
+        Ok(_) => match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+            Ok(true) => NXT_OTEL_SHUTDOWN_FLUSHED,
+            Ok(false) => NXT_OTEL_SHUTDOWN_FAILED,
+            Err(_) => NXT_OTEL_SHUTDOWN_TIMEOUT,
+        },
+        // Nothing flushed at all, and no time was spent trying.
+        Err(_) => NXT_OTEL_SHUTDOWN_FAILED,
+    }
+}
+
 /// Flush and tear down the live tracer provider, if any.
 #[no_mangle]
 pub unsafe extern "C" fn nxt_otel_rs_shutdown_tracer() {
+    // Dropped first: a tracer handed out after this point would belong to a
+    // provider that is already being torn down.
+    if let Ok(mut slot) = tracer_slot().write() {
+        *slot = None;
+    }
+
     let provider = provider_slot().lock().ok().and_then(|mut g| g.take());
     if let Some(provider) = provider {
         // Flushes pending spans; on a grpc build this still needs the runtime,

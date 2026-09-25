@@ -11,6 +11,34 @@ import pytest
 from unit.option import option
 
 
+def request_headers(headers=None, connection_close=True):
+    """Return request headers with "Connection: close" merged in.
+
+    HTTP/1.1 keeps a connection open by default and recvall() reads a
+    response to EOF, so a one-shot request that omits "Connection: close"
+    waits out the server's idle timeout.  A "Connection" the caller set, in
+    any case, is left alone; connection_close=False drops the merge for a
+    request that means to keep the connection -- a handshake, a pipeline, a
+    socket that is reused.
+
+    Only a caller that passes no dict at all gets "Host: localhost"; an
+    explicit dict is given "Connection: close" and nothing else, and a
+    zero-header request is not expressible through this helper.
+    """
+    if headers is None:
+        headers = {'Host': 'localhost'}
+
+    else:
+        headers = dict(headers)
+
+    if connection_close and not any(
+        name.lower() == 'connection' for name in headers
+    ):
+        headers['Connection'] = 'close'
+
+    return headers
+
+
 class HTTP1:
     def http(self, start_str, **kwargs):
         sock_type = kwargs.get('sock_type', 'ipv4')
@@ -18,8 +46,8 @@ class HTTP1:
         url = kwargs.get('url', '/')
         http = 'HTTP/1.0' if 'http_10' in kwargs else 'HTTP/1.1'
 
-        headers = kwargs.get(
-            'headers', {'Host': 'localhost', 'Connection': 'close'}
+        headers = request_headers(
+            kwargs.get('headers'), kwargs.get('connection_close', True)
         )
 
         body = kwargs.get('body', b'')
@@ -131,10 +159,14 @@ class HTTP1:
         if option.detailed:
             print('>>>')
             log = self.log_truncate(log)
+
+            if isinstance(log, bytes):
+                log = log.decode(encoding, 'ignore')
+
             try:
-                print(log.decode(encoding, 'ignore'))
-            except UnicodeEncodeError:
                 print(log)
+            except UnicodeEncodeError:
+                print(log.encode())
 
     def log_in(self, log):
         if option.detailed:
@@ -148,13 +180,15 @@ class HTTP1:
     def log_truncate(self, log, limit=1024):
         len_log = len(log)
         if len_log > limit:
-            log = log[:limit]
             appendix = f'(...logged {limit} of {len_log} bytes)'
 
+            # Concatenate, do not format: an f-string turns bytes into its
+            # repr, so the result was a str holding "b'...'" and the caller
+            # that decodes it got an AttributeError instead of a log.
             if isinstance(log, bytes):
-                appendix = appendix.encode()
-
-            log = f'{log}{appendix}'
+                log = log[:limit] + appendix.encode()
+            else:
+                log = log[:limit] + appendix
 
         return log
 

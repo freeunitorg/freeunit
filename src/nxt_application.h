@@ -110,6 +110,22 @@ typedef struct {
     const char        *component;
 
     nxt_conf_value_t  *access;
+
+    /*
+     * "execution_timeout" in milliseconds, 0 for unbounded.  It bounds one
+     * invocation of the component's "handle", and only the wasm module acts
+     * on it: the guest is preempted inside the module's own process, so
+     * unlike "limits": {"start_timeout"} the router has nothing to arm.
+     *
+     * It is wall clock from the guest's first instruction until "handle"
+     * returns, not CPU time, so time the guest spends parked in a host
+     * call -- waiting for a slow client to drain the response body, say --
+     * is spent too.  And the deadline is only checked while wasm executes,
+     * so a guest parked in a host call is not preempted, only trapped when
+     * it resumes.  This is not a request timeout; that is
+     * "limits": {"timeout"}, which the router arms for every app type.
+     */
+    nxt_msec_t        execution_timeout;
 } nxt_wasm_wc_app_conf_t;
 
 
@@ -130,6 +146,15 @@ struct nxt_common_app_conf_s {
 
     size_t                     shm_limit;
     uint32_t                   request_limit;
+
+    /*
+     * "limits": {"start_timeout"} in milliseconds, 0 for unbounded.  The
+     * router arms it on the start itself (nxt_router_start_timer_arm());
+     * the prototype is given the same number because it is the one process
+     * that can act on a worker the router gave up on -- it knows its pid.
+     * See nxt_proto_quit_children().
+     */
+    nxt_msec_t                 start_timeout;
 
     nxt_fd_t                   shared_port_fd;
     nxt_fd_t                   shared_queue_fd;
@@ -167,6 +192,15 @@ struct nxt_app_module_s {
 nxt_app_lang_module_t *nxt_app_lang_module(nxt_runtime_t *rt, nxt_str_t *name);
 nxt_app_type_t nxt_app_parse_type(u_char *p, size_t length);
 
+#if (NXT_TESTS)
+/*
+ * Invokes the static nxt_proto_start_process_handler() with a synthesised
+ * runtime and message; see src/test/nxt_main_start_process_reply_test.c.
+ */
+void nxt_proto_test_run_start_process_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+#endif
+
 NXT_EXPORT extern nxt_str_t  nxt_server;
 extern nxt_app_module_t      nxt_external_module;
 
@@ -174,5 +208,8 @@ NXT_EXPORT nxt_int_t nxt_unit_default_init(nxt_task_t *task,
     nxt_unit_init_t *init, nxt_common_app_conf_t *conf);
 
 NXT_EXPORT nxt_int_t nxt_app_set_logs(void);
+
+/* Reports a reaped child of the prototype; see nxt_proto_sigchld_handler(). */
+void nxt_proto_child_exited(nxt_task_t *task, nxt_process_t *process);
 
 #endif /* _NXT_APPLICATION_H_INCLIDED_ */

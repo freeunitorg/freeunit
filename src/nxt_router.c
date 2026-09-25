@@ -23,8 +23,6 @@
 #include <nxt_port_queue.h>
 #include <nxt_http_compression.h>
 
-#define NXT_SHARED_PORT_ID  0xFFFFu
-
 #if (NXT_HAVE_OTEL)
 #define NXT_OTEL_BATCH_DEFAULT     128
 #define NXT_OTEL_SAMPLING_DEFAULT  1
@@ -40,6 +38,7 @@ typedef struct {
     nxt_conf_value_t  *limits_value;
     nxt_conf_value_t  *processes_value;
     nxt_conf_value_t  *targets_value;
+    nxt_msec_t        start_timeout;
 } nxt_router_app_conf_t;
 
 
@@ -84,18 +83,127 @@ typedef struct {
 } nxt_socket_rpc_t;
 
 
+typedef struct nxt_router_start_timer_s  nxt_router_start_timer_t;
+
+
 typedef struct {
-    nxt_app_t               *app;
-    nxt_router_temp_conf_t  *temp_conf;
-    uint8_t                 proto;  /* 1 bit */
+    nxt_app_t                 *app;
+    nxt_router_temp_conf_t    *temp_conf;
+    nxt_router_start_timer_t  *start_timer;
+    uint8_t                   proto;  /* 1 bit */
 } nxt_app_rpc_t;
 
 
 typedef struct {
-    nxt_app_joint_t         *app_joint;
-    uint32_t                generation;
-    uint8_t                 proto;  /* 1 bit */
+    nxt_app_joint_t           *app_joint;
+    nxt_router_start_timer_t  *start_timer;
+    uint32_t                  generation;
+    uint8_t                   proto;  /* 1 bit */
+    /*
+     * Not a start attempt at all any more: the registration was put back on
+     * the stream by nxt_router_app_start_expired() to reap the process the
+     * expired attempt left behind, and it owns an unaccounted_processes slot
+     * rather than a pending_processes one.
+     */
+    uint8_t                   expired;  /* 1 bit */
 } nxt_app_joint_rpc_t;
+
+
+/*
+ * Deadline for one START_PROCESS RPC.
+ *
+ * The only thing that can answer a start is the new worker itself, through
+ * nxt_unit_init() -> PROCESS_READY.  A process that is forked successfully but
+ * never gets there -- a "type": "external" binary that blocks before exec'ing
+ * anything of ours, a runtime stuck in its own init -- answers nothing and
+ * dies of nothing, so the RPC stays armed for the life of the router.  With
+ * the default "processes" that RPC is the sole continuation of
+ * nxt_router_conf_apply(), so the configuration PUT never returns and the
+ * controller queues every later request behind it, GET /status included.
+ *
+ * On expiry the RPC is failed through nxt_port_rpc_error(), which runs the
+ * handler that a real failure would have run.  Nothing here duplicates that
+ * recovery: the pending_processes and proto_port_requests accounting stays in
+ * nxt_router_app_port_error() / nxt_router_app_prefork_error() and runs once,
+ * driven by the RPC layer.
+ *
+ * The struct owns nothing but a copy of the application name, deliberately:
+ * holding an nxt_app_t or an nxt_app_joint_t reference would let a deadline
+ * extend the lifetime of the very object whose start it is giving up on.  Both
+ * ports are referenced, because the stream is only meaningful against the
+ * router port and the send queue is only reachable through the destination.
+ *
+ * Expiry cannot simply fail the RPC, because the START_PROCESS it is giving up
+ * on may not have left the router yet.  nxt_port_socket_write2() reports NXT_OK
+ * once the message is in dport->messages, and what it queued there is a shallow
+ * copy: the payload pointer, which on the config-apply path lives in
+ * tmcf->mem_pool, and the application's shared-port descriptor numbers, which
+ * it borrows.  Failing the RPC runs nxt_router_conf_error(), which unlinks the
+ * application (closing that shared port) and releases that pool -- and the
+ * queued copy would still be there, to be dereferenced and sent with
+ * SCM_RIGHTS when the destination finally drains.
+ *
+ * So the deadline is still armed at the write, and expiry resolves against the
+ * send queue first:
+ *
+ *   not yet started    nxt_port_socket_cancel() takes the message back and
+ *                      completes its buffer, and the failure is driven from
+ *                      that completion.
+ *   partially sent     left queued -- a fragment and the descriptors are
+ *                      already with the peer -- and the failure waits for the
+ *                      completion of the last fragment.  See the note on
+ *                      ->expired below.
+ *   fully sent         the message is gone from the queue but its completion
+ *                      can still be pending: nxt_port_write_handler() removes
+ *                      it and only then queues the buffer completion, which
+ *                      can land behind a timer handler already queued ahead of
+ *                      it.  Absence from the queue is not a lifetime boundary,
+ *                      so the failure again waits for the completion.
+ *   completed          ->send_done: nothing references the payload any more,
+ *                      so the RPC is failed inline.
+ *
+ * Everything but the last case therefore funnels through
+ * nxt_router_start_buf_completion(), which is the single point where the
+ * payload is known to be unreachable from the port layer.
+ *
+ * References: one for the RPC that holds it, one for the engine while the
+ * timer node is live, and one for a buffer completion that has yet to run.
+ */
+
+struct nxt_router_start_timer_s {
+    nxt_timer_t             timer;
+    /* The port the RPC is registered on, and the one it was written to. */
+    nxt_port_t              *port;
+    nxt_port_t              *dport;
+    /* The queued message's identity, for nxt_port_socket_cancel(). */
+    nxt_buf_t               *buf;
+    nxt_port_id_t           reply_port;
+    uint32_t                stream;
+    nxt_msec_t              timeout;
+    int32_t                 refs;
+    /* The timer node is live in the engine. */
+    uint8_t                 armed;      /* 1 bit */
+    /* The deadline fired; the RPC must be failed once the payload is free. */
+    uint8_t                 expired;    /* 1 bit */
+    /* The buffer completion has run: the port layer is done with the msg. */
+    uint8_t                 send_done;  /* 1 bit */
+    /* The RPC has retired, so nothing may fail it again. */
+    uint8_t                 retired;    /* 1 bit */
+    /*
+     * The START_PROCESS was taken back out of the send queue before the
+     * destination ever saw it, so no process was forked for it and there is
+     * nothing to account for.  See nxt_router_app_port_error().
+     */
+    uint8_t                 recalled;   /* 1 bit */
+    /*
+     * The payload's completion found bytes of it still unsent, so the
+     * destination never saw the whole message and forked nothing for it.
+     * The same conclusion as ->recalled, reached at the other end of a send
+     * the deadline could not take back.  See nxt_router_app_port_error().
+     */
+    uint8_t                 dropped;    /* 1 bit */
+    nxt_str_t               app_name;
+};
 
 
 static nxt_int_t nxt_router_prefork(nxt_task_t *task, nxt_process_t *process,
@@ -106,8 +214,6 @@ static void nxt_router_greet_controller(nxt_task_t *task,
 
 static nxt_int_t nxt_router_start_app_process(nxt_task_t *task, nxt_app_t *app);
 
-static void nxt_router_new_port_handler(nxt_task_t *task,
-    nxt_port_recv_msg_t *msg);
 static void nxt_router_conf_data_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static void nxt_router_app_restart_handler(nxt_task_t *task,
@@ -227,16 +333,43 @@ static void nxt_router_req_headers_ack_handler(nxt_task_t *task,
 static void nxt_router_listen_socket_release(nxt_task_t *task,
     nxt_socket_conf_t *skcf);
 
+static nxt_router_start_timer_t *nxt_router_start_timer_create(nxt_task_t *task,
+    nxt_app_t *app, nxt_port_t *port, nxt_port_t *dport, nxt_buf_t *b);
+static void nxt_router_start_timer_arm(nxt_task_t *task,
+    nxt_router_start_timer_t *st, uint32_t stream);
+static void nxt_router_start_timer_cancel(nxt_task_t *task,
+    nxt_router_start_timer_t *st);
+static void nxt_router_start_timer_use(nxt_task_t *task,
+    nxt_router_start_timer_t *st, int32_t delta);
+static void nxt_router_start_timeout(nxt_task_t *task, void *obj, void *data);
+static void nxt_router_start_timer_release(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_start_buf_completion(nxt_task_t *task,
+    nxt_router_start_timer_t *st, nxt_bool_t dropped);
+static void nxt_router_start_conf_buf_completion(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_start_app_buf_completion(nxt_task_t *task, void *obj,
+    void *data);
+
 static void nxt_router_app_port_ready(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
 static void nxt_router_app_port_error(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
+static void nxt_router_app_start_failed(nxt_task_t *task, nxt_app_t *app,
+    uint32_t count, nxt_bool_t unaccounted);
+static void nxt_router_app_start_expired(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_recv_msg_t *msg, nxt_app_joint_t *app_joint, uint32_t generation,
+    nxt_bool_t proto);
+static void nxt_router_app_unaccounted_release(nxt_task_t *task,
+    nxt_app_t *app);
 
 static void nxt_router_app_use(nxt_task_t *task, nxt_app_t *app, int i);
 static void nxt_router_app_unlink(nxt_task_t *task, nxt_app_t *app);
 
 static void nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app,
     nxt_port_t *port, nxt_apr_action_t action);
+static void nxt_router_app_abandoned_settle(nxt_task_t *task,
+    nxt_request_rpc_data_t *req_rpc_data);
 static void nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
     nxt_request_rpc_data_t *req_rpc_data);
 static void nxt_router_http_request_error(nxt_task_t *task, void *obj,
@@ -269,6 +402,14 @@ static void nxt_router_http_request_release_post(nxt_task_t *task,
 static void nxt_router_http_request_release(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_router_oosm_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
+static void nxt_router_detached_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid,
+    uint8_t state);
+static nxt_bool_t nxt_router_app_port_idle(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_t *port);
+static nxt_bool_t nxt_router_app_port_busy(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_t *port, const char *reason);
 static void nxt_router_get_port_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static void nxt_router_get_mmap_handler(nxt_task_t *task,
@@ -308,6 +449,7 @@ static const nxt_port_handlers_t  nxt_router_process_port_handlers = {
     .rpc_ready    = nxt_port_rpc_handler,
     .rpc_error    = nxt_port_rpc_handler,
     .oosm         = nxt_router_oosm_handler,
+    .detached     = nxt_router_detached_handler,
 };
 
 
@@ -397,21 +539,24 @@ nxt_router_greet_controller(nxt_task_t *task, nxt_port_t *controller_port)
 }
 
 
-static void
+void
 nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
     void *data)
 {
-    size_t               size;
-    uint32_t             stream;
-    nxt_fd_t             port_fd, queue_fd;
-    nxt_int_t            ret;
-    nxt_app_t            *app;
-    nxt_buf_t            *b;
-    nxt_port_t           *dport;
-    nxt_runtime_t        *rt;
-    nxt_app_joint_rpc_t  *app_joint_rpc;
+    size_t                    size;
+    uint32_t                  stream;
+    nxt_fd_t                  port_fd, queue_fd;
+    nxt_int_t                 ret;
+    nxt_app_t                 *app;
+    nxt_buf_t                 *b;
+    nxt_port_t                *dport;
+    nxt_runtime_t             *rt;
+    nxt_app_joint_rpc_t       *app_joint_rpc;
+    nxt_router_start_timer_t  *st;
 
     app = data;
+
+    st = NULL;
 
     nxt_thread_mutex_lock(&app->mutex);
 
@@ -466,6 +611,17 @@ nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
 
     stream = nxt_port_rpc_ex_stream(app_joint_rpc);
 
+    /*
+     * Before the write: the deadline resolves through the payload's completion
+     * handler, which nxt_port_socket_write2() may run before it returns.
+     */
+
+    st = nxt_router_start_timer_create(task, app, port, dport, b);
+
+    if (st != NULL && b != NULL) {
+        b->completion_handler = nxt_router_start_app_buf_completion;
+    }
+
     ret = nxt_port_socket_write2(task, dport, NXT_PORT_MSG_START_PROCESS,
                                  port_fd, queue_fd, stream, port->id, b);
     if (nxt_slow_path(ret != NXT_OK)) {
@@ -477,6 +633,31 @@ nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
     app_joint_rpc->app_joint = app->joint;
     app_joint_rpc->generation = app->generation;
     app_joint_rpc->proto = (b != NULL);
+    app_joint_rpc->start_timer = st;
+
+    if (st != NULL) {
+        nxt_router_start_timer_arm(task, st, stream);
+    }
+
+    /*
+     * Key the registration by the process the START_PROCESS was sent to, so
+     * that its death retires the RPC.  Without a peer the registration is
+     * only ever retired by a reply on its own stream: when the prototype
+     * dies between forking the worker and that worker's PROCESS_READY, the
+     * REMOVE_PID the router gets for the prototype carries no stream (it
+     * had already reached READY itself, see nxt_main_process.c) and
+     * nxt_port_rpc_remove_peer() finds nothing to fail, so the attempt's
+     * pending_processes slot is never given back.
+     *
+     * For a prototype start the peer is the main process, which is
+     * harmless: its death is fatal anyway, and a prototype dying before
+     * READY is already reported by the stream-bearing REMOVE_PID.
+     *
+     * The setter cannot report a failed insert: it logs and leaves ->peer
+     * at -1 (src/nxt_port_rpc.c:301), so a pool allocation failure here
+     * restores the peerless registration -- as at every other call site.
+     */
+    nxt_port_rpc_ex_set_peer(task, port, app_joint_rpc, dport->pid);
 
     if (b != NULL) {
         app->proto_port_requests++;
@@ -486,16 +667,459 @@ nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
 
     nxt_router_app_joint_use(task, app->joint, 1);
 
+    goto skip;
+
 failed:
+
+    /*
+     * The attempt is over and no handler remains armed for it -- the two
+     * earlier sites never armed one, and the third cancels its registration
+     * with nxt_port_rpc_cancel() -- so nothing will ever report it back.
+     * Release the pending_processes slot the initiator took, exactly as
+     * nxt_router_app_port_error() does for the attempts that do get that far.
+     */
+
+    nxt_alert(task, "app '%V' failed to start a process", &app->name);
+
+    if (st != NULL) {
+        /*
+         * Never armed, and the buffer below is freed without its completion
+         * handler ever running, so both references are dropped here.
+         */
+
+        if (b != NULL) {
+            nxt_router_start_timer_use(task, st, -1);
+        }
+
+        nxt_router_start_timer_use(task, st, -1);
+    }
 
     if (b != NULL) {
         nxt_mp_free(b->data, b);
     }
 
+    nxt_router_app_start_failed(task, app, 1, 0);
+
 skip:
 
     nxt_router_app_use(task, app, -1);
 }
+
+
+/*
+ * Create the deadline for a START_PROCESS RPC, before the write.
+ *
+ * Before, because the payload buffer has to carry a completion handler that
+ * knows about this struct: the deadline resolves through that completion, and
+ * nxt_port_socket_write2() can run it before it returns.
+ *
+ * The timer runs on the engine of the port the RPC is registered on -- always
+ * the router's own port, for both the config-apply prefork path
+ * (nxt_router_app_rpc_create()) and the on-demand path
+ * (nxt_router_start_app_process_handler(), reached by nxt_port_post() to that
+ * same port) -- so the expiry handler, the reply handlers it races and the
+ * buffer completion cannot run concurrently.
+ *
+ * A NULL return means no deadline, which is the configured behaviour for
+ * "start_timeout": 0 and the fallback if the allocation fails; the start is
+ * then exactly as unbounded as it was before this existed, which is worse than
+ * the alternative but not worse than failing a start over a small malloc.
+ */
+
+static nxt_router_start_timer_t *
+nxt_router_start_timer_create(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_t *port, nxt_port_t *dport, nxt_buf_t *b)
+{
+    nxt_msec_t                timeout;
+    nxt_router_start_timer_t  *st;
+
+    /* Immutable once the application is configured, so read unlocked. */
+    timeout = app->start_timeout;
+
+    if (timeout == 0) {
+        return NULL;
+    }
+
+    st = nxt_malloc(sizeof(nxt_router_start_timer_t) + app->name.length);
+    if (nxt_slow_path(st == NULL)) {
+        nxt_alert(task, "app \"%V\" start deadline not armed: out of memory",
+                  &app->name);
+
+        return NULL;
+    }
+
+    nxt_memzero(st, sizeof(nxt_router_start_timer_t));
+
+    st->app_name.start = nxt_pointer_to(st, sizeof(nxt_router_start_timer_t));
+    st->app_name.length = app->name.length;
+    nxt_memcpy(st->app_name.start, app->name.start, app->name.length);
+
+    st->timeout = timeout;
+    st->port = port;
+    st->dport = dport;
+    st->reply_port = port->id;
+    st->buf = b;
+
+    nxt_port_inc_use(port);
+    nxt_port_inc_use(dport);
+
+    /* The reference of the caller, which hands it to the RPC. */
+    st->refs = 1;
+
+    if (b == NULL) {
+        /*
+         * Nothing to wait for: a message with no payload and no descriptors
+         * (the worker-start leg, where the prototype is already up) leaves
+         * nothing of ours reachable from the send queue, so expiry can fail
+         * the RPC directly.
+         */
+        st->send_done = 1;
+
+    } else {
+        /* The reference of the pending buffer completion. */
+        st->refs++;
+
+        b->parent = st;
+    }
+
+    return st;
+}
+
+
+/*
+ * Arm it.  Separate from creation because the stream is only known once the
+ * RPC is registered, and because a write that fails must be able to drop the
+ * struct without ever having put a node in the engine's timer tree.
+ */
+
+static void
+nxt_router_start_timer_arm(nxt_task_t *task, nxt_router_start_timer_t *st,
+    uint32_t stream)
+{
+    nxt_event_engine_t  *engine;
+
+    st->stream = stream;
+
+    engine = task->thread->engine;
+
+    st->timer.bias = NXT_TIMER_DEFAULT_BIAS;
+    st->timer.work_queue = &engine->fast_work_queue;
+    st->timer.handler = nxt_router_start_timeout;
+    st->timer.task = &engine->task;
+    st->timer.log = st->timer.task->log;
+
+    /* The reference of the engine, while the timer node is live. */
+    st->refs++;
+    st->armed = 1;
+
+    nxt_timer_add(engine, &st->timer, st->timeout);
+
+    nxt_debug(task, "app \"%V\" stream #%uD start deadline %M ms",
+              &st->app_name, stream, st->timeout);
+}
+
+
+static void
+nxt_router_start_timer_use(nxt_task_t *task, nxt_router_start_timer_t *st,
+    int32_t delta)
+{
+    st->refs += delta;
+
+    nxt_assert(st->refs >= 0);
+
+    if (st->refs > 0) {
+        return;
+    }
+
+    nxt_port_use(task, st->port, -1);
+    nxt_port_use(task, st->dport, -1);
+
+    nxt_free(st);
+}
+
+
+/*
+ * The start answered, or its write failed: drop the RPC's reference and, with
+ * it, the deadline.
+ *
+ * nxt_timer_disable() is not enough -- it clears the enabled bit but leaves
+ * the node in the engine's rbtree, which would dangle the moment this struct
+ * is freed.  nxt_timer_delete() removes it, but its removal can itself be a
+ * queued change referencing the timer, so a non-zero return means the struct
+ * is still reachable from the engine: the engine's reference is then handed to
+ * a release handler instead of being dropped here.  Re-arming at zero is the
+ * same trick nxt_router_free_app() uses for app_joint->idle_timer.
+ *
+ * When the expiry handler is the caller's own caller, ->armed is already
+ * clear: the node has fired, so it owns the engine's reference and drops it
+ * itself.
+ */
+
+static void
+nxt_router_start_timer_cancel(nxt_task_t *task, nxt_router_start_timer_t *st)
+{
+    nxt_event_engine_t  *engine;
+
+    st->retired = 1;
+
+    if (st->armed) {
+        engine = task->thread->engine;
+
+        st->armed = 0;
+
+        if (nxt_timer_delete(engine, &st->timer)) {
+            st->timer.handler = nxt_router_start_timer_release;
+            nxt_timer_add(engine, &st->timer, 0);
+
+        } else {
+            nxt_router_start_timer_use(task, st, -1);
+        }
+    }
+
+    nxt_router_start_timer_use(task, st, -1);
+}
+
+
+static void
+nxt_router_start_timer_release(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_timer_t  *timer;
+
+    timer = obj;
+
+    nxt_router_start_timer_use(task,
+                    nxt_timer_data(timer, nxt_router_start_timer_t, timer), -1);
+}
+
+
+/*
+ * The deadline fired.  What it may do depends on where the START_PROCESS it is
+ * giving up on has got to; see the comment on nxt_router_start_timer_s.
+ */
+
+static void
+nxt_router_start_timeout(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_timer_t               *timer;
+    nxt_port_msg_cancel_t     cancelled;
+    nxt_router_start_timer_t  *st;
+
+    timer = obj;
+    st = nxt_timer_data(timer, nxt_router_start_timer_t, timer);
+
+    /*
+     * "unless a reply lands first" is not hedging.  The failure is driven
+     * from the payload's completion, which for a partly sent message waits
+     * for the rest of it to leave (see below), and a PROCESS_READY that
+     * arrives in that window retires the stream before the deadline can.
+     */
+
+    nxt_alert(task, "app \"%V\" process did not become ready in time; the "
+                    "deadline expired, and the start request (stream #%uD) "
+                    "will be failed unless a reply lands first.  The process, "
+                    "if it is still running, never called nxt_unit_init() -- "
+                    "raise \"limits\": {\"start_timeout\"} if the application "
+                    "simply needs longer to start",
+              &st->app_name, st->stream);
+
+    /*
+     * The node has fired, so it is out of the engine's tree: clearing ->armed
+     * both records that and keeps the error handler reached below from trying
+     * to delete it again through nxt_router_start_timer_cancel().  The
+     * engine's reference is this frame's now, and is dropped at the end.
+     */
+
+    st->armed = 0;
+    st->expired = 1;
+
+    /*
+     * Take the message back if there is still anything to take back.  Both
+     * shapes of START_PROCESS go through this, for different reasons.
+     *
+     * The one that carries a payload (a prototype start) must be recalled
+     * before its RPC can be failed at all: failing it releases the pool the
+     * payload lives in and the descriptors it borrows.
+     *
+     * The header-only one (a worker start, sent to a prototype that is already
+     * up) carries no router memory and no descriptors, so nothing about it is
+     * a lifetime hazard.  Recalling it is still worth doing: delivered after
+     * the stream is retired, it starts a worker whose PROCESS_READY answers
+     * nobody -- nxt_port_rpc_handler() drops an unknown stream -- leaving a
+     * process and a port the router is not tracking.  That is the same orphan
+     * the deadline already leaves when a worker is merely slow, since the
+     * router never learns its pid and so cannot kill it either, and reaping in
+     * the prototype is what will collect both; but there is no reason to
+     * create one while the message has not left yet.
+     *
+     * A destination whose port has a shared-memory queue is the case this
+     * cannot reach: nxt_port_socket_write2() puts the message straight into
+     * the ring, where it is already delivered, and only a READ_QUEUE
+     * notification can be left in port->messages.  Matching on the message
+     * type is what keeps this from recalling that notification and stranding a
+     * message that is genuinely on its way.
+     */
+
+    cancelled = nxt_port_socket_cancel(task, st->dport,
+                                       NXT_PORT_MSG_START_PROCESS,
+                                       st->stream, st->reply_port, st->buf);
+
+    /*
+     * Recalled before the destination saw it: no worker was forked for this
+     * start, so there is no process to account for and the slot goes back the
+     * ordinary way.  Accounting it would move a slot to unaccounted_processes
+     * that nothing can ever drain -- no PROCESS_READY and no REMOVE_PID are
+     * coming for a process that was never created -- which would turn the
+     * bound into a ratchet.  See nxt_router_app_port_error().
+     */
+
+    st->recalled = (cancelled == NXT_PORT_MSG_CANCELLED);
+
+    if (st->send_done) {
+        /*
+         * Nothing of ours is in the port layer's hands -- either the payload's
+         * completion has already run, or there was never a payload -- so the
+         * RPC is failed here.  There is nothing left to drive it otherwise: a
+         * header-only message has no buffers for the recall to complete.  The
+         * stream may meanwhile have been retired by a reply that landed in the
+         * same turn of the event loop; nxt_port_rpc_error() drops an unknown
+         * stream, so the race costs a debug line.
+         */
+
+        nxt_port_rpc_error(task, st->port, st->stream);
+
+    } else {
+        /*
+         * A payload still in flight: whichever of the three states it is in,
+         * the RPC is failed from nxt_router_start_buf_completion().
+         * NXT_PORT_MSG_CANCELLED has just queued that completion, and the
+         * other two mean the message is still being sent, so the completion is
+         * still to come.  Waiting is what keeps nxt_router_conf_error() from
+         * releasing a payload the send queue still points at.
+         *
+         * NXT_PORT_MSG_STARTED is the limitation of a protocol without
+         * cancellation: a destination that took one fragment and then stopped
+         * draining holds the failure off for as long as it stays stuck, and it
+         * is worth saying so, because from the outside that looks like a
+         * deadline that did not fire.  The wedge this deadline exists for -- a
+         * destination that is draining fine and a worker that never announces
+         * itself -- is unaffected, because there the message goes out whole.
+         */
+
+        if (cancelled == NXT_PORT_MSG_STARTED) {
+            nxt_alert(task, "app \"%V\" stream #%uD start request is partly "
+                            "sent; failing it has to wait for the rest of it "
+                            "to leave, and a reply that lands meanwhile wins",
+                      &st->app_name, st->stream);
+        }
+    }
+
+    /* The engine's reference: the timer node is gone. */
+
+    nxt_router_start_timer_use(task, st, -1);
+}
+
+
+/*
+ * Which way it left: the port layer advances the payload as it sends it, so
+ * bytes still unconsumed at its completion mean the destination never saw the
+ * whole message.  It was taken back by nxt_port_socket_cancel(), or dropped by
+ * nxt_port_msg_drop() because the destination died or the port layer could not
+ * requeue it -- and nothing was forked for a start that never arrived.
+ *
+ * One shape does not reach here.  An inline first fragment that hits EAGAIN
+ * and cannot be held for a later attempt is refused outright, with
+ * NXT_ERROR and the payload untouched, so the caller fails the start itself.
+ *
+ * ->recalled cannot answer this on its own: a message the deadline finds
+ * partly sent stays queued, and only its completion knows whether the rest of
+ * it ever left.  See nxt_router_app_port_error().
+ */
+
+nxt_inline nxt_bool_t
+nxt_router_start_buf_dropped(nxt_buf_t *b)
+{
+    return nxt_buf_mem_used_size(&b->mem) != 0;
+}
+
+
+/*
+ * The payload has left the port layer, one way or another: written in full,
+ * dropped by nxt_port_socket_cancel(), or released by nxt_port_error_handler()
+ * when the destination died.  This is the only point at which nothing in
+ * dport->messages can reach the buffer or the borrowed descriptors any more,
+ * so it is where an expired start is failed.
+ */
+
+static void
+nxt_router_start_buf_completion(nxt_task_t *task, nxt_router_start_timer_t *st,
+    nxt_bool_t dropped)
+{
+    nxt_bool_t  fail;
+
+    st->send_done = 1;
+    st->buf = NULL;
+    st->dropped = dropped;
+
+    fail = (st->expired && !st->retired);
+
+    if (fail) {
+        /*
+         * Nothing may touch b after this: failing the RPC reaches
+         * nxt_router_conf_error(), which releases the pool the buffer was
+         * allocated from.
+         */
+
+        nxt_port_rpc_error(task, st->port, st->stream);
+    }
+
+    nxt_router_start_timer_use(task, st, -1);
+}
+
+
+/*
+ * The config-apply payload is allocated from tmcf->mem_pool and freed with it,
+ * so this replaces nxt_buf_dummy_completion() and frees nothing.
+ */
+
+static void
+nxt_router_start_conf_buf_completion(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_router_start_buf_completion(task, data,
+                                    nxt_router_start_buf_dropped(obj));
+}
+
+
+/*
+ * The on-demand payload is allocated from the engine's pool and owns itself,
+ * so this replaces nxt_buf_completion(): it returns the buffer to that pool
+ * first, because failing the RPC below may not return at all cheaply.  The
+ * buffer never has a parent, so none of nxt_buf_parent_completion()'s work
+ * applies -- which is also why the context travels in b->parent and this
+ * handler is not nxt_buf_completion().
+ */
+
+static void
+nxt_router_start_app_buf_completion(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_buf_t                 *b;
+    nxt_bool_t                dropped;
+    nxt_router_start_timer_t  *st;
+
+    b = obj;
+    st = data;
+
+    nxt_assert(b->next == NULL);
+    nxt_assert(b->parent == st);
+
+    /* Read before the free: the answer is in the buffer's own pointers. */
+
+    dropped = nxt_router_start_buf_dropped(b);
+
+    nxt_mp_free(b->data, b);
+
+    nxt_router_start_buf_completion(task, st, dropped);
+}
+
 
 
 static void
@@ -544,11 +1168,22 @@ nxt_router_start_app_process(nxt_task_t *task, nxt_app_t *app)
 }
 
 
+/*
+ * Take the queued request message back from the shared port queue.
+ * nxt_app_queue_cancel() (src/nxt_app_queue.h) is a CAS on the queue item's
+ * tracking word; nxt_unit_app_queue_recv() runs the same CAS from the worker
+ * side, so exactly one of the two wins and a false answer here means a worker
+ * claimed the slot first.
+ *
+ * The CAS runs at most once per request, and the answer is kept in
+ * ->msg_info.cancel for the callers that need it afterwards: both outcomes
+ * leave the tracking word at 0, so a second CAS would report a claim that
+ * never happened and clear ->is_port_mmap_sent on a chunk the worker owns.
+ */
+
 nxt_inline nxt_bool_t
-nxt_router_msg_cancel(nxt_task_t *task, nxt_request_rpc_data_t *req_rpc_data)
+nxt_router_msg_retract(nxt_task_t *task, nxt_request_rpc_data_t *req_rpc_data)
 {
-    nxt_buf_t       *b, *next;
-    nxt_bool_t      cancelled;
     nxt_port_t      *app_port;
     nxt_msg_info_t  *msg_info;
 
@@ -558,21 +1193,48 @@ nxt_router_msg_cancel(nxt_task_t *task, nxt_request_rpc_data_t *req_rpc_data)
         return 0;
     }
 
-    app_port = req_rpc_data->app_port;
+    if (msg_info->cancel == NXT_MSG_QUEUED) {
+        app_port = req_rpc_data->app_port;
 
-    if (app_port != NULL && app_port->id == NXT_SHARED_PORT_ID) {
-        cancelled = nxt_app_queue_cancel(app_port->queue,
-                                         msg_info->tracking_cookie,
-                                         req_rpc_data->stream);
-
-        if (cancelled) {
-            nxt_debug(task, "stream #%uD: cancelled by router",
-                      req_rpc_data->stream);
+        if (app_port == NULL || app_port->id != NXT_SHARED_PORT_ID) {
+            /* Acknowledged: the message is the worker's, not the queue's. */
+            return 0;
         }
 
-    } else {
-        cancelled = 0;
+        if (nxt_app_queue_cancel(app_port->queue, msg_info->tracking_cookie,
+                                 req_rpc_data->stream))
+        {
+            msg_info->cancel = NXT_MSG_RETRACTED;
+
+            nxt_debug(task, "stream #%uD: cancelled by router",
+                      req_rpc_data->stream);
+
+        } else {
+            msg_info->cancel = NXT_MSG_CLAIMED;
+
+            nxt_debug(task, "stream #%uD: claimed by a worker",
+                      req_rpc_data->stream);
+        }
     }
+
+    return msg_info->cancel == NXT_MSG_RETRACTED;
+}
+
+
+nxt_inline nxt_bool_t
+nxt_router_msg_cancel(nxt_task_t *task, nxt_request_rpc_data_t *req_rpc_data)
+{
+    nxt_buf_t       *b, *next;
+    nxt_bool_t      cancelled;
+    nxt_msg_info_t  *msg_info;
+
+    msg_info = &req_rpc_data->msg_info;
+
+    if (msg_info->buf == NULL) {
+        return 0;
+    }
+
+    cancelled = nxt_router_msg_retract(task, req_rpc_data);
 
     for (b = msg_info->buf; b != NULL; b = next) {
         next = b->next;
@@ -676,7 +1338,7 @@ nxt_request_rpc_data_unlink(nxt_task_t *task,
 }
 
 
-static void
+void
 nxt_router_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
     nxt_int_t      res;
@@ -692,13 +1354,24 @@ nxt_router_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         nxt_router_greet_controller(task, msg->u.new_port);
     }
 
+    /*
+     * The router maps a queue for application ports only, so every other
+     * branch below has to release the queue descriptor that
+     * nxt_port_new_port_handler() left behind.  None of the RPC handlers
+     * reachable from here reads msg->fd, so closing before dispatching them
+     * takes nothing away.
+     */
+
     if (port != NULL && port->type == NXT_PROCESS_PROTOTYPE)  {
+        nxt_port_recv_msg_close_fds(msg);
+
         nxt_port_rpc_handler(task, msg);
 
         return;
     }
 
     if (port == NULL || port->type != NXT_PROCESS_APP) {
+        nxt_port_recv_msg_close_fds(msg);
 
         if (msg->port_msg.stream == 0) {
             return;
@@ -709,12 +1382,34 @@ nxt_router_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     } else {
         if (msg->fd[1] != -1) {
             res = nxt_router_port_queue_map(task, port, msg->fd[1]);
-            if (nxt_slow_path(res != NXT_OK)) {
-                return;
-            }
+
+            /*
+             * Closed whether or not the mapping succeeded: the mapping does
+             * not keep the descriptor, and the dispatcher reclaims nothing a
+             * handler leaves behind.  The size check above is what makes this
+             * matter -- it lets a peer choose to be refused, so the failure
+             * return below handed that peer a descriptor of ours per message,
+             * which is the exhaustion the check exists to prevent.
+             *
+             * The return itself is left alone.  It also walks past the RPC
+             * dispatch below, so a refused queue leaves the pending start
+             * outstanding, and the port stays registered although a port
+             * whose queue was refused can never be reached.  Both are worth
+             * fixing and neither is fixable here: the port this handler is
+             * holding may be one nxt_port_new_port_handler() just created or
+             * one that was already live and serving, and nothing at this call
+             * site can tell them apart -- so failing the start or releasing
+             * the port would, for a forged duplicate NEW_PORT, do it to a
+             * working application port.  That needs the two handlers to agree
+             * on provenance first; see #223.
+             */
 
             nxt_fd_close(msg->fd[1]);
             msg->fd[1] = -1;
+
+            if (nxt_slow_path(res != NXT_OK)) {
+                return;
+            }
         }
     }
 
@@ -726,10 +1421,53 @@ nxt_router_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_debug(task, "new port id %d (%d)", port->id, port->type);
 
     /*
-     * Port with "id == 0" is application 'main' port and it always
-     * should come with non-zero stream.
+     * An application's "main" port has id 0 and is announced carrying the
+     * stream of the start it answers, which the dispatch above consumes.
+     * Arriving here means id 0 with no stream, and the arm below cannot
+     * serve that pair: it looks the announcement up as a *sibling* of an
+     * already-known main port, and for id 0 that lookup finds the port
+     * itself.  Which of the two cases this is decides the remedy, and only
+     * nxt_port_new_port_handler() knows -- hence msg->new_port_created.
+     *
+     * Already registered: a worker that sent PROCESS_READY a second time.
+     * Its start stream was retired by the first announcement
+     * (nxt_port_process_ready_handler(), src/nxt_port.c), so the repeat
+     * carries none.  The port is live and its queue, if it brought one, was
+     * mapped above -- leave it alone.  Falling through would re-add it to
+     * the application hash: nxt_port_hash_add() declines the duplicate key,
+     * but ->port_hash_count is incremented regardless, and
+     * nxt_router_app_need_start() reads that count, so the router would
+     * believe it has workers it does not have.  It would also send a second
+     * PORT_ACK for one port.
+     *
+     * Created by this message: an application main port announced with no
+     * stream at all, which no start is waiting on and nothing else will
+     * complete.  Keeping it would leave a port registered in the runtime
+     * that no application owns and no PORT_ACK was ever sent for.  Undo the
+     * registration this message caused instead.
+     *
+     * An assertion is not enough for either: nxt_assert() compiles out in a
+     * release build, which is exactly where the miscount and the orphan
+     * would do their damage.
      */
-    nxt_assert(port->id != 0);
+    if (nxt_slow_path(port->id == 0)) {
+
+        if (msg->new_port_created) {
+            nxt_alert(task, "new port of process %PI has id 0 and no start "
+                      "stream; refused", port->pid);
+
+            nxt_port_close(task, port);
+            nxt_runtime_port_remove(task, port);
+
+            return;
+        }
+
+        nxt_log(task, NXT_LOG_WARN, "process %PI announced its main port "
+                "again with no start stream; already registered, ignored",
+                port->pid);
+
+        return;
+    }
 
     /* Find 'main' app port and get app reference. */
     rt = task->thread->runtime;
@@ -776,6 +1514,7 @@ nxt_router_conf_data_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
                                  msg->port_msg.reply_port);
     if (nxt_slow_path(port == NULL)) {
         nxt_alert(task, "conf_data_handler: reply port not found");
+        nxt_port_recv_msg_close_fds(msg);
         return;
     }
 
@@ -848,10 +1587,12 @@ cleanup:
         nxt_mem_munmap(p, size);
     }
 
-    if (msg->fd[0] != -1) {
-        nxt_fd_close(msg->fd[0]);
-        msg->fd[0] = -1;
-    }
+    /*
+     * Close both descriptors: the configuration arrives on fd[0], but a
+     * compromised sender can attach a second one to any message and would
+     * otherwise leak a descriptor of the router on every forged message.
+     */
+    nxt_port_recv_msg_close_fds(msg);
 }
 
 
@@ -1001,6 +1742,19 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     } nxt_queue_loop;
 
+#if (NXT_HAVE_OTEL)
+    /*
+     * Span export health.  The counters live in the Rust exporter wrapper,
+     * which runs in this process, so the router is the only place they can be
+     * read from.  A build without OTel, or a configuration with no
+     * "settings/telemetry", leaves the memzero'd zeros in place and
+     * nxt_status_get() then omits the "telemetry" object entirely.
+     */
+    report->otel_configured = nxt_otel_rs_export_stats(
+                                  &report->otel_spans_exported,
+                                  &report->otel_spans_failed);
+#endif
+
     report->apps_count = 0;
     app_stat = report->apps;
     p = b->mem.end;
@@ -1016,7 +1770,9 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         app_stat->active_requests = app->active_requests;
         app_stat->pending_processes = app->pending_processes;
         app_stat->processes = app->processes;
+        app_stat->unaccounted_processes = app->unaccounted_processes;
         app_stat->idle_processes = app->idle_processes;
+        app_stat->detached_processes = app->detached_processes;
 
         report->apps_count++;
         app_stat++;
@@ -1026,7 +1782,20 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
 fail:
 
-    nxt_port_socket_write(task, port, type, -1, msg->port_msg.stream, 0, b);
+    if (nxt_slow_path(nxt_port_socket_write(task, port, type, -1,
+                                            msg->port_msg.stream, 0, b)
+                      != NXT_OK)
+        && b != NULL)
+    {
+        /*
+         * Still ours: the port layer takes the buffer only on NXT_OK, and
+         * this one lives in the reply port's pool, so it would sit there
+         * until the controller's port is released.
+         */
+
+        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                           b->completion_handler, task, b, b->parent);
+    }
 }
 
 
@@ -1157,12 +1926,23 @@ out_free_mp:
 }
 
 
-nxt_inline nxt_bool_t
-nxt_router_app_can_start(nxt_app_t *app)
+#if (NXT_TESTS)
+
+/*
+ * src/test/nxt_router_start_timeout_test.c drives the config-apply start
+ * against a real temporary configuration, because that is the one whose
+ * failure path releases the pool the START_PROCESS payload lives in.  Building
+ * one by hand would not do: nxt_router_temp_conf() is also what initialises the
+ * socket queues nxt_router_conf_error() walks.
+ */
+
+nxt_router_temp_conf_t *
+nxt_router_test_temp_conf(nxt_task_t *task)
 {
-    return app->processes + app->pending_processes < app->max_processes
-            && app->pending_processes < app->max_pending_processes;
+    return nxt_router_temp_conf(task);
 }
+
+#endif
 
 
 nxt_inline nxt_bool_t
@@ -1311,6 +2091,26 @@ nxt_router_conf_wait(nxt_task_t *task, void *obj, void *data)
     job = obj;
 
     nxt_router_conf_ready(task, job->tmcf);
+}
+
+
+/*
+ * Hand a joint job's temporary configuration reference back to the
+ * configuration thread.  Resetting work.next is not optional: the job was
+ * chained on recf->jobs when it was built, and posting a work item that still
+ * points at its old neighbour silently splices that neighbour into the target
+ * engine's locked queue.  The job must not be touched after the post -- the
+ * configuration thread may run nxt_router_conf_wait() and release the pool the
+ * job lives in at any point from here on.
+ */
+
+nxt_inline void
+nxt_router_conf_wait_post(nxt_joint_job_t *job)
+{
+    job->work.next = NULL;
+    job->work.handler = nxt_router_conf_wait;
+
+    nxt_event_engine_post(job->tmcf->engine, &job->work);
 }
 
 
@@ -1466,6 +2266,12 @@ static nxt_conf_map_t  nxt_router_app_limits_conf[] = {
         NXT_CONF_MAP_MSEC,
         offsetof(nxt_router_app_conf_t, timeout),
     },
+
+    {
+        nxt_string("start_timeout"),
+        NXT_CONF_MAP_MSEC,
+        offsetof(nxt_router_app_conf_t, start_timeout),
+    },
 };
 
 
@@ -1620,6 +2426,104 @@ static nxt_conf_map_t  nxt_router_websocket_conf[] = {
 };
 
 
+#if (NXT_HAVE_OTEL)
+
+/*
+ * The telemetry settings currently applied to the Rust exporter.
+ *
+ * nxt_otel_rs_init() flushes the live provider and builds a new one, which
+ * blocks the router's control thread for as long as the export of the pending
+ * batch takes -- up to the exporter's 10s timeout against an unreachable
+ * collector -- and drops whatever is in flight across the swap.  Every config
+ * apply used to pay that, including applies that do not touch
+ * /settings/telemetry at all (adding a route, changing an app).  Caching what
+ * was applied lets an unchanged telemetry section be a no-op.
+ *
+ * Only exact equality is treated as unchanged; anything the comparison cannot
+ * establish falls through to the rebuild, which is the old behaviour.
+ */
+typedef struct {
+    nxt_bool_t  configured;
+    nxt_str_t   endpoint;
+    nxt_str_t   protocol;
+    double      sample_fraction;
+    double      batch_size;
+} nxt_otel_applied_conf_t;
+
+
+static nxt_otel_applied_conf_t  nxt_otel_applied_conf;
+
+
+static nxt_bool_t
+nxt_router_otel_conf_unchanged(nxt_str_t *endpoint, nxt_str_t *protocol,
+    double sample_fraction, double batch_size)
+{
+    /*
+     * The doubles are re-parsed from the same JSON text on every apply, so an
+     * unchanged section reproduces them bit for bit; an exact comparison is
+     * therefore the right test here, and any inequality only costs a rebuild.
+     */
+    return nxt_otel_applied_conf.configured
+           && nxt_strstr_eq(&nxt_otel_applied_conf.endpoint, endpoint)
+           && nxt_strstr_eq(&nxt_otel_applied_conf.protocol, protocol)
+           && nxt_otel_applied_conf.sample_fraction == sample_fraction
+           && nxt_otel_applied_conf.batch_size == batch_size;
+}
+
+
+static nxt_int_t
+nxt_router_otel_conf_store_str(nxt_str_t *dst, const nxt_str_t *src)
+{
+    u_char  *p;
+
+    p = NULL;
+
+    if (src->length != 0) {
+        p = nxt_malloc(src->length);
+        if (nxt_slow_path(p == NULL)) {
+            return NXT_ERROR;
+        }
+
+        memcpy(p, src->start, src->length);
+    }
+
+    nxt_free(dst->start);
+
+    dst->start = p;
+    dst->length = src->length;
+
+    return NXT_OK;
+}
+
+
+/*
+ * Remember what was just handed to nxt_otel_rs_init().  The strings point into
+ * the configuration memory pool, which is released once this apply completes,
+ * so they have to be copied.  On any failure the cache is invalidated, which
+ * only means the next apply rebuilds unconditionally.
+ */
+static void
+nxt_router_otel_conf_remember(nxt_str_t *endpoint, nxt_str_t *protocol,
+    double sample_fraction, double batch_size)
+{
+    if (nxt_slow_path(nxt_router_otel_conf_store_str(
+                          &nxt_otel_applied_conf.endpoint, endpoint) != NXT_OK
+                      || nxt_router_otel_conf_store_str(
+                          &nxt_otel_applied_conf.protocol,
+                          protocol) != NXT_OK))
+    {
+        nxt_otel_applied_conf.configured = 0;
+        return;
+    }
+
+    nxt_otel_applied_conf.sample_fraction = sample_fraction;
+    nxt_otel_applied_conf.batch_size = batch_size;
+    nxt_otel_applied_conf.configured = 1;
+}
+
+#endif
+
+
 static nxt_int_t
 nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     u_char *start, u_char *end)
@@ -1650,6 +2554,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
                                 *otel_batching, *otel_proto;
 #endif
     nxt_conf_value_t            *root, *conf, *http, *value, *websocket;
+    nxt_conf_value_t            *comp;
     nxt_conf_value_t            *applications, *application, *settings;
     nxt_conf_value_t            *listeners, *listener;
     nxt_socket_conf_t           *skcf;
@@ -1791,6 +2696,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             apcf.max_processes = 1;
             apcf.spare_processes = 0;
             apcf.timeout = 0;
+            apcf.start_timeout = NXT_APP_START_TIMEOUT;
             apcf.idle_timeout = 15000;
             apcf.limits_value = NULL;
             apcf.processes_value = NULL;
@@ -1900,6 +2806,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             app->max_pending_processes = apcf.spare_processes
                                          ? apcf.spare_processes : 1;
             app->timeout = apcf.timeout;
+            app->start_timeout = apcf.start_timeout;
             app->idle_timeout = apcf.idle_timeout;
 
             app->targets = targets;
@@ -1990,6 +2897,18 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 
     websocket = nxt_conf_get_path(root, &websocket_path);
 
+    /*
+     * Compression is configured once for the whole router, not per listener.
+     * The return is deliberately not checked: a "compression" block the
+     * validator accepts but this cannot build -- one with no "compressors",
+     * which is not a required member -- leaves compression off rather than
+     * rejecting the configuration, which is what it has always done.
+     */
+    comp = nxt_conf_get_path(root, &compression_path);
+    if (comp != NULL) {
+        (void) nxt_http_comp_compression_init(task, rtcf, comp);
+    }
+
     listeners = nxt_conf_get_path(root, &listeners_path);
 
     if (listeners != NULL) {
@@ -2048,7 +2967,6 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             nxt_str_null(&skcf->body_temp_path);
 
             if (http != NULL) {
-                nxt_conf_value_t  *comp;
 
                 ret = nxt_conf_map_object(mp, http, nxt_router_http_conf,
                                           nxt_nitems(nxt_router_http_conf),
@@ -2058,10 +2976,6 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
                     goto fail;
                 }
 
-                comp = nxt_conf_get_path(root, &compression_path);
-                if (comp != NULL) {
-                    nxt_http_comp_compression_init(task, rtcf, comp);
-                }
             }
 
             if (websocket != NULL) {
@@ -2225,11 +3139,33 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             ? nxt_conf_get_number(otel_sampling)
             : NXT_OTEL_SAMPLING_DEFAULT;
 
-        nxt_otel_rs_init(&nxt_otel_log_callback, &telemetry_endpoint,
-                         &telemetry_proto, telemetry_sample_fraction,
-                         telemetry_batching);
-    } else {
+        /*
+         * Rebuild the exporter only when the telemetry settings actually
+         * differ.  nxt_otel_rs_is_init() is required as well so that a
+         * previous init that failed inside the Rust side (an exporter that
+         * could not be built) is retried rather than remembered as applied.
+         */
+        if (!nxt_router_otel_conf_unchanged(&telemetry_endpoint,
+                                            &telemetry_proto,
+                                            telemetry_sample_fraction,
+                                            telemetry_batching)
+            || !nxt_otel_rs_is_init())
+        {
+            nxt_otel_rs_init(&nxt_otel_log_callback, &telemetry_endpoint,
+                             &telemetry_proto, telemetry_sample_fraction,
+                             telemetry_batching);
+
+            nxt_router_otel_conf_remember(&telemetry_endpoint, &telemetry_proto,
+                                          telemetry_sample_fraction,
+                                          telemetry_batching);
+        }
+
+    } else if (nxt_otel_applied_conf.configured || nxt_otel_rs_is_init()) {
         nxt_otel_rs_uninit();
+
+        nxt_free(nxt_otel_applied_conf.endpoint.start);
+        nxt_free(nxt_otel_applied_conf.protocol.start);
+        nxt_memzero(&nxt_otel_applied_conf, sizeof(nxt_otel_applied_conf));
     }
 #endif
 
@@ -2310,6 +3246,7 @@ nxt_router_js_module_rpc_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     ret = nxt_script_file_read(msg->fd[0], &text);
 
     nxt_fd_close(msg->fd[0]);
+    msg->fd[0] = -1;
 
     if (nxt_slow_path(ret == NXT_ERROR)) {
         goto fail;
@@ -2615,9 +3552,8 @@ nxt_router_port_queue_map(nxt_task_t *task, nxt_port_t *port, nxt_fd_t fd)
 
     nxt_assert(fd != -1);
 
-    mem = nxt_mem_mmap(NULL, sizeof(nxt_port_queue_t),
-                       PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (nxt_slow_path(mem == MAP_FAILED)) {
+    mem = nxt_port_queue_mmap(task, fd, sizeof(nxt_port_queue_t));
+    if (nxt_slow_path(mem == NULL)) {
 
         return NXT_ERROR;
     }
@@ -2942,6 +3878,9 @@ nxt_router_listen_socket_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
     s = msg->fd[0];
 
+    /* The listener owns the descriptor now. */
+    msg->fd[0] = -1;
+
     ret = nxt_socket_nonblocking(task, s);
     if (nxt_slow_path(ret != NXT_OK)) {
         goto fail;
@@ -3079,6 +4018,10 @@ nxt_router_tls_rpc_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     }
 
     bundle->chain_file = msg->fd[0];
+
+    /* The bundle owns the descriptor now. */
+    msg->fd[0] = -1;
+
     bundle->next = tlscf->bundle;
     tlscf->bundle = bundle;
 
@@ -3104,16 +4047,19 @@ static void
 nxt_router_app_rpc_create(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf, nxt_app_t *app)
 {
-    size_t         size;
-    uint32_t       stream;
-    nxt_fd_t       port_fd, queue_fd;
-    nxt_int_t      ret;
-    nxt_buf_t      *b;
-    nxt_port_t     *router_port, *dport;
-    nxt_runtime_t  *rt;
-    nxt_app_rpc_t  *rpc;
+    size_t                    size;
+    uint32_t                  stream;
+    nxt_fd_t                  port_fd, queue_fd;
+    nxt_int_t                 ret;
+    nxt_buf_t                 *b;
+    nxt_port_t                *router_port, *dport;
+    nxt_runtime_t             *rt;
+    nxt_app_rpc_t             *rpc;
+    nxt_router_start_timer_t  *st;
 
     rt = task->thread->runtime;
+
+    st = NULL;
 
     dport = app->proto_port;
 
@@ -3162,6 +4108,17 @@ nxt_router_app_rpc_create(nxt_task_t *task,
 
     stream = nxt_port_rpc_ex_stream(rpc);
 
+    /*
+     * Before the write: the deadline resolves through the payload's completion
+     * handler, which nxt_port_socket_write2() may run before it returns.
+     */
+
+    st = nxt_router_start_timer_create(task, app, router_port, dport, b);
+
+    if (st != NULL && b != NULL) {
+        b->completion_handler = nxt_router_start_conf_buf_completion;
+    }
+
     ret = nxt_port_socket_write2(task, dport, NXT_PORT_MSG_START_PROCESS,
                                  port_fd, queue_fd, stream, router_port->id, b);
     if (nxt_slow_path(ret != NXT_OK)) {
@@ -3175,12 +4132,56 @@ nxt_router_app_rpc_create(nxt_task_t *task,
         app->pending_processes++;
     }
 
+    rpc->start_timer = st;
+
+    if (st != NULL) {
+        nxt_router_start_timer_arm(task, st, stream);
+    }
+
     return;
 
 fail:
 
+    if (st != NULL) {
+        /*
+         * Never armed, and the payload dies with tmcf->mem_pool below without
+         * its completion handler ever running, so both references go here.
+         */
+
+        if (b != NULL) {
+            nxt_router_start_timer_use(task, st, -1);
+        }
+
+        nxt_router_start_timer_use(task, st, -1);
+    }
+
     nxt_router_conf_error(task, tmcf);
 }
+
+
+#if (NXT_TESTS)
+
+void
+nxt_router_test_app_rpc_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
+    nxt_app_t *app)
+{
+    nxt_router_app_rpc_create(task, tmcf, app);
+}
+
+
+/*
+ * The request deadline, for src/test/nxt_router_app_timeout_test.c.  That test
+ * drives it through the engine's timer machinery, so the wrapper is installed
+ * as the timer handler rather than called.
+ */
+
+void
+nxt_router_test_app_timeout(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_router_app_timeout(task, obj, data);
+}
+
+#endif
 
 
 static void
@@ -3194,6 +4195,12 @@ nxt_router_app_prefork_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
     rpc = data;
     app = rpc->app;
+
+    if (rpc->start_timer != NULL) {
+        nxt_router_start_timer_cancel(task, rpc->start_timer);
+
+        rpc->start_timer = NULL;
+    }
 
     port = msg->u.new_port;
 
@@ -3256,6 +4263,12 @@ nxt_router_app_prefork_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     rpc = data;
     app = rpc->app;
     tmcf = rpc->temp_conf;
+
+    if (rpc->start_timer != NULL) {
+        nxt_router_start_timer_cancel(task, rpc->start_timer);
+
+        rpc->start_timer = NULL;
+    }
 
     if (rpc->proto) {
         nxt_log(task, NXT_LOG_WARN, "failed to start prototype \"%V\"",
@@ -3488,9 +4501,15 @@ nxt_router_engine_quit(nxt_router_temp_conf_t *tmcf,
     job->task = tmcf->engine->task;
     job->work.handler = nxt_router_worker_thread_quit;
     job->work.task = &job->task;
-    job->work.obj = NULL;
+    job->work.obj = job;
     job->work.data = NULL;
-    job->tmcf = NULL;
+    job->tmcf = tmcf;
+
+    /*
+     * The job outlives this call on the target engine's locked queue, so hold
+     * the pool it lives in, as the joints create/delete jobs do.
+     */
+    tmcf->count++;
 
     return NXT_OK;
 }
@@ -3682,9 +4701,6 @@ nxt_router_thread_start(void *data)
     engine->task.log = thread->log;
     thread->engine = engine;
     thread->task = &engine->task;
-#if 0
-    thread->fiber = &engine->fibers->fiber;
-#endif
 
     engine->mem_pool = nxt_mp_create(4096, 128, 1024, 64);
     if (nxt_slow_path(engine->mem_pool == NULL)) {
@@ -3781,10 +4797,7 @@ nxt_router_listen_socket_create(nxt_task_t *task, void *obj, void *data)
     ls->count++;
     nxt_thread_spin_unlock(lock);
 
-    job->work.next = NULL;
-    job->work.handler = nxt_router_conf_wait;
-
-    nxt_event_engine_post(job->tmcf->engine, &job->work);
+    nxt_router_conf_wait_post(job);
 }
 
 
@@ -3835,10 +4848,7 @@ nxt_router_listen_socket_update(nxt_task_t *task, void *obj, void *data)
     lev->socket.data = joint;
     lev->listen = joint->socket_conf->listen;
 
-    job->work.next = NULL;
-    job->work.handler = nxt_router_conf_wait;
-
-    nxt_event_engine_post(job->tmcf->engine, &job->work);
+    nxt_router_conf_wait_post(job);
 
     /*
      * The task is allocated from configuration temporary
@@ -3881,16 +4891,27 @@ nxt_router_listen_socket_delete(nxt_task_t *task, void *obj, void *data)
 static void
 nxt_router_worker_thread_quit(nxt_task_t *task, void *obj, void *data)
 {
+    nxt_joint_job_t     *job;
     nxt_event_engine_t  *engine;
 
     nxt_debug(task, "router worker thread quit");
+
+    job = obj;
 
     engine = task->thread->engine;
 
     engine->shutdown = 1;
 
+    /*
+     * Give the reference nxt_router_engine_quit() took back.  The task this
+     * handler was called with is allocated from the same pool as the job, so
+     * the exit below has to continue on the engine's own task.
+     */
+
+    nxt_router_conf_wait_post(job);
+
     if (nxt_queue_is_empty(&engine->joints)) {
-        nxt_router_worker_thread_exit(task);
+        nxt_router_worker_thread_exit(&engine->task);
     }
 }
 
@@ -3914,10 +4935,13 @@ nxt_router_worker_thread_exit(nxt_task_t *task)
  *
  *   Accepting -> Draining: nxt_router_listen_socket_close() (phase 1)
  *                          disarms accept(2), marks lev->draining = 1.
+ *                          If connections are in flight it also posts the
+ *                          close_job back to the configuration thread, so
+ *                          the control request does not wait for them.
  *   Draining  -> Closed:   nxt_router_listen_socket_close_finish() (phase 2)
  *                          runs once lev->count == 1 (no in-flight accepted
- *                          connections), releases the FD and posts the
- *                          close_job back to the configuration thread.
+ *                          connections), releases the FD and then posts the
+ *                          close_job if phase 1 did not already.
  *
  * The intermediate state lets in-flight TLS handshakes and accepted-but-
  * not-yet-handled connections complete cleanly instead of being RST when
@@ -3925,7 +4949,8 @@ nxt_router_worker_thread_exit(nxt_task_t *task)
  * pattern in nxt_router_worker_thread_quit()).
  */
 
-static void nxt_router_listen_socket_close_ready(nxt_socket_conf_joint_t *joint);
+static void nxt_router_listen_socket_close_ready(nxt_task_t *task,
+    nxt_socket_conf_joint_t *joint);
 static void nxt_router_listen_socket_close_finish(nxt_task_t *task,
     nxt_listen_event_t *lev);
 
@@ -3971,30 +4996,35 @@ nxt_router_listen_socket_close(nxt_task_t *task, void *obj, void *data)
     }
 
     /*
-     * Configuration is ready once accept(2) has been disarmed.  The
-     * listener FD and old socket configuration stay alive below until
-     * accepted connections release their listener refs, but the control
-     * request must not wait for idle client timing.
-     */
-    nxt_router_listen_socket_close_ready(joint);
-
-    /*
      * Phase 2 gating: wait for accepted connections to release their
      * refs.  lev->count == 1 means only the original listener ref
      * remains (see nxt_listen_event() and nxt_conn_accept()).
      *
-     * Known limitation: the listening FD stays bound until the drain
-     * completes (nxt_router_listen_socket_release() closes it on the
-     * last engine's phase 2), so a configuration that re-adds the same
-     * address while the old listener drains fails with EADDRINUSE at
-     * bind time in the main process -- a visible, retryable config
-     * error.  Closing the FD in phase 1 instead requires reworking the
-     * ls->count contract across engines and the nxt_process_quit()
-     * listen-queue walk; that belongs to the full-drain follow-up.
+     * When connections are still in flight the configuration is
+     * acknowledged here, before the FD is released: the control request
+     * must not wait for idle client timing.  The listening FD then stays
+     * bound until the drain completes
+     * (nxt_router_listen_socket_release() closes it on the last engine's
+     * phase 2), so a configuration that re-adds the same address while
+     * the old listener drains can fail with EADDRINUSE at bind time in
+     * the main process -- a visible, retryable config error.  Closing
+     * the FD in phase 1 instead requires reworking the ls->count
+     * contract across engines and the nxt_process_quit() listen-queue
+     * walk; that belongs to the full-drain follow-up.
+     *
+     * With nothing in flight there is no drain to wait for, so the reply
+     * is deferred to nxt_router_listen_socket_close_finish() below,
+     * which sends it after the descriptor is closed.  That keeps the
+     * pre-drain contract -- a successful reconfiguration means the port
+     * is free -- for every listener that has no accepted connection on
+     * it.
      */
     if (lev->count > 1) {
         nxt_debug(task, "engine %p: listen socket %d drain pending, "
                   "in-flight: %D", engine, lev->socket.fd, lev->count - 1);
+
+        nxt_router_listen_socket_close_ready(task, joint);
+
         return;
     }
 
@@ -4003,7 +5033,8 @@ nxt_router_listen_socket_close(nxt_task_t *task, void *obj, void *data)
 
 
 static void
-nxt_router_listen_socket_close_ready(nxt_socket_conf_joint_t *joint)
+nxt_router_listen_socket_close_ready(nxt_task_t *task,
+    nxt_socket_conf_joint_t *joint)
 {
     nxt_joint_job_t  *job;
 
@@ -4014,10 +5045,22 @@ nxt_router_listen_socket_close_ready(nxt_socket_conf_joint_t *joint)
 
     joint->close_job = NULL;
 
-    job->work.next = NULL;
-    job->work.handler = nxt_router_conf_wait;
+    /*
+     * The only record of the acknowledgement on the thread that issues
+     * it.  The configuration thread's "temp conf ... count" line is
+     * written after a cross-thread post, so where it lands in the log is
+     * a function of that thread's wake-up latency, not of where in the
+     * close path the acknowledgement was issued -- it stays in the same
+     * place whether this call is made before the descriptor is released
+     * or after it.  This line does not: it is written by the closing
+     * engine itself, between its own records, so the order of the close
+     * and the acknowledgement is readable from the log.
+     * test_listeners_close_before_reply asserts exactly that.
+     */
+    nxt_debug(task, "engine %p: listen socket close acknowledged",
+              task->thread->engine);
 
-    nxt_event_engine_post(job->tmcf->engine, &job->work);
+    nxt_router_conf_wait_post(job);
 }
 
 
@@ -4035,12 +5078,32 @@ nxt_router_listen_socket_close_finish(nxt_task_t *task,
     joint = lev->socket.data;
     lev->socket.data = NULL;
 
-    nxt_router_listen_socket_close_ready(joint);
-
     /* 'task' refers to lev->task and we cannot use after nxt_free() */
     task = &task->thread->engine->task;
 
     nxt_router_listen_socket_release(task, joint->socket_conf);
+
+    /*
+     * Acknowledge only now.  nxt_router_listen_socket_release() above
+     * drops this engine's reference to the listen socket, and on the
+     * last engine to reach phase 2 it performs the single
+     * nxt_socket_close() of the descriptor.  The configuration is not
+     * reported successful until every engine has acknowledged
+     * (nxt_router_conf_ready()), so acknowledging after the release --
+     * rather than before it, as this function used to -- puts the reply
+     * strictly after the close for a listener with nothing in flight.
+     *
+     * A listener that did have connections to drain acknowledged early
+     * in phase 1 and left joint->close_job NULL, so this is the no-op it
+     * has always been on that path, and the still-bound descriptor
+     * documented there remains its known limitation.
+     *
+     * The joint outlives the call: its listener reference is dropped by
+     * nxt_router_listen_event_release() below, and
+     * nxt_router_listen_socket_release() frees the nxt_listen_socket_t,
+     * not the socket configuration the joint points at.
+     */
+    nxt_router_listen_socket_close_ready(task, joint);
 
     nxt_router_listen_event_release(task, lev, joint);
 }
@@ -4099,8 +5162,15 @@ nxt_router_listen_socket_release(nxt_task_t *task, nxt_socket_conf_t *skcf)
     rt = task->thread->runtime;
     main_port = rt->port_by_type[NXT_PROCESS_MAIN];
 
-    (void) nxt_port_socket_write(task, main_port, NXT_PORT_MSG_SOCKET_UNLINK,
-                                 -1, 0, 0, b);
+    if (nxt_slow_path(nxt_port_socket_write(task, main_port,
+                                            NXT_PORT_MSG_SOCKET_UNLINK,
+                                            -1, 0, 0, b) != NXT_OK))
+    {
+        /* Still ours: the port layer takes the buffer only on NXT_OK. */
+
+        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                           b->completion_handler, task, b, b->parent);
+    }
 
 out_free_ls:
 #endif
@@ -4245,6 +5315,18 @@ nxt_router_thread_exit_handler(nxt_task_t *task, void *obj, void *data)
 
     port->engine = task->thread->engine;
     nxt_mp_thread_adopt(port->mem_pool);
+
+    /*
+     * The worker thread is gone, so nothing reads port->pair[0] any more:
+     * close the socket pair and the queue memfd, and drop the reference
+     * nxt_router_rt_add_port() took when it published the port in
+     * rt->ports.  Without this every engine removed by a listen_threads
+     * decrease leaks 3 descriptors (2 socketpair + 1 memfd) for the
+     * router's lifetime.
+     */
+    nxt_port_close(task, port);
+    nxt_runtime_port_remove(task, port);
+
     nxt_port_use(task, port, -1);
 
     nxt_mp_thread_adopt(engine->mem_pool);
@@ -4263,7 +5345,7 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     size_t                  b_size, count;
     nxt_int_t               ret;
     nxt_app_t               *app;
-    nxt_buf_t               *b, *next;
+    nxt_buf_t               *b, *next, *out, *last_b, *owned_b;
     nxt_port_t              *app_port;
     nxt_unit_field_t        *f;
     nxt_http_field_t        *field;
@@ -4271,10 +5353,30 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     nxt_unit_response_t     *resp;
     nxt_request_rpc_data_t  *req_rpc_data;
 
+    /*
+     * An application response never legitimately carries a descriptor and
+     * this handler does not read msg->fd.  The dispatcher closes what a
+     * handler leaves behind, so this is belt and braces; it is here because
+     * an application owns its end of the port socket, which makes this the
+     * one handler a hostile peer reaches on every single request.
+     */
+    nxt_port_recv_msg_close_fds(msg);
+
     req_rpc_data = data;
 
     r = req_rpc_data->request;
     if (nxt_slow_path(r == NULL)) {
+        /*
+         * A request the router gave up on.  The answer belongs to nobody and
+         * needs no reply, but the last message is the worker saying it is
+         * done: this is where the port it was running on may rejoin the idle
+         * economy.  A message that is not the last one proves nothing yet;
+         * the response can still be streaming.
+         */
+        if (msg->port_msg.last != 0) {
+            nxt_router_app_abandoned_settle(task, req_rpc_data);
+        }
+
         return;
     }
 
@@ -4292,12 +5394,17 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         return;
     }
 
+    last_b = NULL;
+    owned_b = NULL;
+
     b = (msg->size == 0) ? NULL : msg->buf;
 
     if (msg->port_msg.last != 0) {
         nxt_debug(task, "router data create last buf");
 
-        nxt_buf_chain_add(&b, nxt_http_buf_last(r));
+        last_b = nxt_http_buf_last(r);
+
+        nxt_buf_chain_add(&b, last_b);
 
         req_rpc_data->rpc_cancel = 0;
 
@@ -4308,7 +5415,12 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         nxt_request_rpc_data_unlink(task, req_rpc_data);
 
     } else {
-        if (app->timeout != 0) {
+        /*
+         * The deadline bounds the worker's answer, and an upgraded
+         * WebSocket has had its answer: the frames that follow are a
+         * session, however quiet (#422).
+         */
+        if (app->timeout != 0 && r->state != &nxt_http_websocket) {
             r->timer.handler = nxt_router_app_timeout;
             r->timer_data = req_rpc_data;
             nxt_timer_add(task->thread->engine, &r->timer, app->timeout);
@@ -4322,10 +5434,18 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     if (msg->buf == b) {
         /* Disable instant buffer completion/re-using by port. */
         msg->buf = NULL;
+
+        /*
+         * The port will not complete these buffers anymore, track them
+         * to release the shared memory they hold on the error path.
+         */
+        owned_b = b;
     }
 
     if (r->header_sent) {
         nxt_buf_chain_add(&r->out, b);
+        owned_b = NULL;
+        last_b = NULL;
 
         ret = nxt_http_comp_compress_app_response(task, r, &r->out);
         if (ret == NXT_ERROR) {
@@ -4408,19 +5528,42 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
             next = b->next;
             b->next = NULL;
 
+            if (owned_b == b) {
+                owned_b = next;
+            }
+
             nxt_work_queue_add(&task->thread->engine->fast_work_queue,
                                b->completion_handler, task, b, b->parent);
 
             b = next;
         }
 
-        if (b != NULL) {
-            nxt_buf_chain_add(&r->out, b);
-        }
-
-        ret = nxt_http_comp_check_compression(task, r);
+        /*
+         * Check compression before handing the chain over to r->out, so that
+         * the rejection below still owns it and releases it inline.  Both
+         * calls read r->resp and the request configuration, never r->out, so
+         * the order is free.
+         *
+         * An application response is always sent with a body, so the two
+         * halves run together here.  They are separate calls because the
+         * static path has to put precondition evaluation between them: a 406
+         * outranks a precondition, but a 304 must not leave an initialised
+         * compressor behind (RFC 9110 Sect. 13.2.1).
+         */
+        ret = nxt_http_comp_check_acceptable(task, r);
         if (ret != NXT_OK) {
             goto fail;
+        }
+
+        ret = nxt_http_comp_apply_compression(task, r);
+        if (ret != NXT_OK) {
+            goto fail;
+        }
+
+        if (b != NULL) {
+            nxt_buf_chain_add(&r->out, b);
+            owned_b = NULL;
+            last_b = NULL;
         }
 
         nxt_http_request_header_send(task, r, nxt_http_request_send_body, NULL);
@@ -4440,11 +5583,25 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
             nxt_thread_mutex_unlock(&app->mutex);
 
             nxt_router_app_port_release(task, app, app_port, NXT_APR_UPGRADE);
-            req_rpc_data->apr_action = NXT_APR_CLOSE;
+
+            /*
+             * The count above is undone by this action, and only by it:
+             * nxt_request_rpc_data_unlink() is the one path that runs for a
+             * websocket that ends, whichever side ends it, and ->app_port is
+             * still this port when it does.
+             */
+            req_rpc_data->apr_action = NXT_APR_WEBSOCKET_CLOSE;
 
             nxt_debug(task, "stream #%uD upgrade", req_rpc_data->stream);
 
             r->state = &nxt_http_websocket;
+
+            /*
+             * The 101 arrived as a non-last message, which re-armed the
+             * request deadline above; the upgrade ends the request, so the
+             * deadline goes with it (#422).
+             */
+            nxt_timer_disable(task->thread->engine, &r->timer);
 
         } else {
             r->state = &nxt_http_request_send_state;
@@ -4455,7 +5612,75 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
 fail:
 
+    /*
+     * nxt_http_buf_last() above cleared r->last as a side effect.  Put it
+     * back before nxt_http_request_error() runs: with headers not yet sent it
+     * builds a 503 whose body ends with nxt_http_buf_last(r), and a NULL there
+     * leaves the response without an NXT_BUF_SYNC_LAST buffer, so the request
+     * never completes and holds the connection until the send timeout.  With
+     * headers already sent it instead consumes r->last inline, via
+     * nxt_http_request_error_handler() and the protocol discard.  Either way
+     * the restore has to come first.
+     *
+     * This is only a pointer store -- it completes nothing and releases no
+     * shared memory -- so it does not disturb the ordering the two release
+     * loops below rely on.
+     *
+     * last_b is NULL at the two sites where the chain reached r->out: there
+     * the sync buffer is part of the chain drained below, and taking a second
+     * reference to it here would complete it twice.  That pairing is
+     * maintained a hundred lines above, so assert it rather than trust it.
+     */
+    nxt_assert(last_b == NULL || r->out == NULL);
+
+    if (last_b != NULL) {
+        r->last = last_b;
+    }
+
     nxt_http_request_error(task, r, NXT_HTTP_SERVICE_UNAVAILABLE);
+
+    /*
+     * Complete the buffers adopted from the port above, if any: nobody else
+     * holds them.  Stop at last_b: it is the request's own sync buffer, now
+     * owned by r->last again, and completing it here would close the request
+     * before the error response has been sent.
+     *
+     * This runs after the error response has been built on purpose.  Fields
+     * already added to r->resp point straight into the application's shared
+     * memory chunk, and completing these buffers hands that chunk back to
+     * the application; releasing it any earlier would make the response
+     * depend on nxt_http_request_error() having reset the field store first.
+     */
+    while (owned_b != NULL && owned_b != last_b) {
+        b = owned_b->next;
+        owned_b->next = NULL;
+        owned_b->completion_handler(task, owned_b, owned_b->parent);
+        owned_b = b;
+    }
+
+    /*
+     * Once the chain has been linked into r->out it is no longer tracked by
+     * owned_b, and nothing else would release it: nxt_http_request_error()
+     * installs an error body handler of its own and the protocol discard
+     * drains only the connection buffers and r->last.  Nothing in r->out was
+     * ever queued on the connection either -- nxt_http_request_send_body()
+     * clears r->out before handing the chain to nxt_http_request_send() --
+     * so these buffers are owned by the request alone and may be completed
+     * here.  A send_body work item already posted by the header send re-reads
+     * r->out when it runs and degrades to a no-op.
+     *
+     * The completions must be deferred rather than run inline like the loop
+     * above: this chain can carry the request's own sync buffer, whose
+     * completion handler is nxt_router_http_request_done(), and that closes
+     * the request and releases r->mem_pool.  Running it here would do so on
+     * the line above the nxt_request_rpc_data_unlink() that ends this
+     * function.  The loop above may stay inline only because it stops short
+     * of that buffer.
+     */
+    out = r->out;
+    r->out = NULL;
+
+    nxt_sendbuf_drain(task, &task->thread->engine->fast_work_queue, out);
 
     nxt_request_rpc_data_unlink(task, req_rpc_data);
 }
@@ -4467,10 +5692,9 @@ nxt_router_req_headers_ack_handler(nxt_task_t *task,
 {
     int                 res;
     nxt_app_t           *app;
-    nxt_buf_t           *b;
+    nxt_buf_t           *b, *next;
     nxt_bool_t          start_process, unlinked;
-    nxt_port_t          *app_port, *main_app_port, *idle_port;
-    nxt_queue_link_t    *idle_lnk;
+    nxt_port_t          *app_port, *main_app_port;
     nxt_http_request_t  *r;
 
     nxt_debug(task, "stream #%uD: got ack from %PI:%d",
@@ -4483,7 +5707,6 @@ nxt_router_req_headers_ack_handler(nxt_task_t *task,
     app = req_rpc_data->app;
     r = req_rpc_data->request;
 
-    start_process = 0;
     unlinked = 0;
 
     nxt_thread_mutex_lock(&app->mutex);
@@ -4511,41 +5734,7 @@ nxt_router_req_headers_ack_handler(nxt_task_t *task,
 
     main_app_port = app_port->main_app_port;
 
-    if (nxt_queue_chk_remove(&main_app_port->idle_link)) {
-        app->idle_processes--;
-
-        nxt_debug(task, "app '%V' move port %PI:%d out of %s (ack)",
-                  &app->name, main_app_port->pid, main_app_port->id,
-                  (main_app_port->idle_start ? "idle_ports" : "spare_ports"));
-
-        /* Check port was in 'spare_ports' using idle_start field. */
-        if (main_app_port->idle_start == 0
-            && app->idle_processes >= app->spare_processes)
-        {
-            /*
-             * If there is a vacant space in spare ports,
-             * move the last idle to spare_ports.
-             */
-            nxt_assert(!nxt_queue_is_empty(&app->idle_ports));
-
-            idle_lnk = nxt_queue_last(&app->idle_ports);
-            idle_port = nxt_queue_link_data(idle_lnk, nxt_port_t, idle_link);
-            nxt_queue_remove(idle_lnk);
-
-            nxt_queue_insert_tail(&app->spare_ports, idle_lnk);
-
-            idle_port->idle_start = 0;
-
-            nxt_debug(task, "app '%V' move port %PI:%d from idle_ports "
-                      "to spare_ports",
-                      &app->name, idle_port->pid, idle_port->id);
-        }
-
-        if (nxt_router_app_can_start(app) && nxt_router_app_need_start(app)) {
-            app->pending_processes++;
-            start_process = 1;
-        }
-    }
+    start_process = nxt_router_app_port_busy(task, app, main_app_port, "ack");
 
     main_app_port->active_requests++;
 
@@ -4588,6 +5777,25 @@ nxt_router_req_headers_ack_handler(nxt_task_t *task,
                                     task->thread->engine->port->id, b);
 
         if (nxt_slow_path(res != NXT_OK)) {
+            /*
+             * This tail was cut from msg_info.buf above, so
+             * nxt_router_msg_cancel() walks a chain that no longer reaches
+             * it and nothing else completes it.  Its buffers are chunks of
+             * shared memory that no pool teardown reclaims, so return them
+             * here.  Queued rather than run inline, as the port layer does
+             * when it drops a message of its own.
+             */
+
+            while (b != NULL) {
+                next = b->next;
+                b->next = NULL;
+
+                nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                                   b->completion_handler, task, b, b->parent);
+
+                b = next;
+            }
+
             nxt_http_request_error(task, r, NXT_HTTP_INTERNAL_SERVER_ERROR);
         }
     }
@@ -4634,8 +5842,13 @@ nxt_router_response_error_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
     req_rpc_data->rpc_cancel = 0;
 
+    /*
+     * The worker is gone, so whatever the router gave up on it is over.  The
+     * settle does nothing unless this request is one of those.
+     */
+    nxt_router_app_abandoned_settle(task, req_rpc_data);
+
     /* TODO cancel message and return if cancelled. */
-    // nxt_router_msg_cancel(task, &req_rpc_data->msg_info, req_rpc_data->stream);
 
     if (req_rpc_data->request != NULL) {
         nxt_http_request_error(task, req_rpc_data->request,
@@ -4652,7 +5865,7 @@ nxt_router_app_port_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 {
     uint32_t             n;
     nxt_app_t            *app;
-    nxt_bool_t           start_process, restarted;
+    nxt_bool_t           start_process, restarted, superseded;
     nxt_port_t           *port;
     nxt_app_joint_t      *app_joint;
     nxt_app_joint_rpc_t  *app_joint_rpc;
@@ -4662,6 +5875,12 @@ nxt_router_app_port_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     app_joint_rpc = data;
     app_joint = app_joint_rpc->app_joint;
     port = msg->u.new_port;
+
+    if (app_joint_rpc->start_timer != NULL) {
+        nxt_router_start_timer_cancel(task, app_joint_rpc->start_timer);
+
+        app_joint_rpc->start_timer = NULL;
+    }
 
     nxt_assert(app_joint != NULL);
     nxt_assert(port != NULL);
@@ -4684,16 +5903,49 @@ nxt_router_app_port_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     restarted = (app->generation != app_joint_rpc->generation);
 
     if (app_joint_rpc->proto) {
-        nxt_assert(app->proto_port == NULL);
         nxt_assert(port->type == NXT_PROCESS_PROTOTYPE);
 
-        n = app->proto_port_requests;
-        app->proto_port_requests = 0;
+        if (app_joint_rpc->expired) {
+            /*
+             * Not a start attempt any more: the reaper armed by
+             * nxt_router_app_start_expired() for the prototype the deadline
+             * gave up on, which has announced itself after all.  The cohort
+             * it owned was released when the attempt was failed, so there is
+             * nothing to replay here, and the slot it holds is an
+             * unaccounted one.  Guarded rather than asserted for the reason
+             * given below, where a worker takes the same step.
+             */
 
-        if (nxt_slow_path(restarted)) {
+            nxt_assert(app->unaccounted_processes != 0);
+
+            if (nxt_fast_path(app->unaccounted_processes != 0)) {
+                app->unaccounted_processes--;
+            }
+
+            n = 0;
+
+        } else {
+            n = app->proto_port_requests;
+            app->proto_port_requests = 0;
+        }
+
+        /*
+         * A prototype that only just missed its deadline is adopted, exactly
+         * as a late worker is below -- unless the application has acquired a
+         * prototype meanwhile.  It can: failing the attempt clears
+         * proto_port_requests, so the next request starts a second prototype
+         * and two of them can be up at once, of which only one may ever be
+         * app->proto_port.  The other is QUIT here, which is also how the
+         * router disposes of one that belongs to a superseded generation.
+         */
+
+        superseded = restarted || app->proto_port != NULL;
+
+        if (nxt_slow_path(superseded)) {
             nxt_thread_mutex_unlock(&app->mutex);
 
-            nxt_debug(task, "proto port ready for restarted app, send QUIT");
+            nxt_debug(task, "proto port ready for an app that has no use for "
+                            "it, send QUIT");
 
             nxt_port_socket_write(task, port, NXT_PORT_MSG_QUIT, -1, 0, 0,
                                   NULL);
@@ -4721,9 +5973,41 @@ nxt_router_app_port_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     }
 
     nxt_assert(port->type == NXT_PROCESS_APP);
-    nxt_assert(app->pending_processes != 0);
 
-    app->pending_processes--;
+    if (app_joint_rpc->expired) {
+        /*
+         * The worker beat the reaper: "limits": {"start_timeout"} gave up on
+         * its start and moved the slot to unaccounted_processes, and the
+         * process the router had no pid for has now announced itself.  Move
+         * the slot back and adopt the worker exactly as an in-time start is
+         * adopted below -- the sum nxt_router_app_can_start() is taken over
+         * does not change, and this is the only drain that recovers a slot
+         * without the process having to die.  The request that waited for it
+         * was answered when the deadline fired; the worker serves the next
+         * one.
+         */
+
+        /*
+         * Guarded rather than asserted, for the reason given in
+         * nxt_router_app_start_failed(): nxt_assert() is nothing in a release
+         * build, and of the two ways to be wrong here, decrementing a counter
+         * that is already zero is much the worse.  It wraps to UINT32_MAX and
+         * pins nxt_router_app_can_start() false for the application's
+         * lifetime, where failing to decrement merely leaks the slot.
+         * nxt_router_app_unaccounted_release() takes the same care.
+         */
+
+        nxt_assert(app->unaccounted_processes != 0);
+
+        if (nxt_fast_path(app->unaccounted_processes != 0)) {
+            app->unaccounted_processes--;
+        }
+
+    } else {
+        nxt_assert(app->pending_processes != 0);
+
+        app->pending_processes--;
+    }
 
     if (nxt_slow_path(restarted)) {
         nxt_debug(task, "new port ready for restarted app, send QUIT");
@@ -4769,10 +6053,10 @@ static void
 nxt_router_app_port_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
+    uint32_t             n;
+    nxt_bool_t           reap, restarted, expired, unsent;
     nxt_app_t            *app;
     nxt_app_joint_t      *app_joint;
-    nxt_queue_link_t     *link;
-    nxt_http_request_t   *r;
     nxt_app_joint_rpc_t  *app_joint_rpc;
 
     nxt_assert(data != NULL);
@@ -4780,11 +6064,54 @@ nxt_router_app_port_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     app_joint_rpc = data;
     app_joint = app_joint_rpc->app_joint;
 
+    expired = 0;
+    unsent = 0;
+
+    if (app_joint_rpc->start_timer != NULL) {
+        /* Read before the cancel, which is what drops the deadline. */
+        expired = app_joint_rpc->start_timer->expired;
+
+        /* The two ways the destination never saw the whole message. */
+        unsent = app_joint_rpc->start_timer->recalled
+                 || app_joint_rpc->start_timer->dropped;
+
+        nxt_router_start_timer_cancel(task, app_joint_rpc->start_timer);
+
+        app_joint_rpc->start_timer = NULL;
+    }
+
     nxt_assert(app_joint != NULL);
 
     app = app_joint->app;
 
-    nxt_router_app_joint_use(task, app_joint, -1);
+    /*
+     * A start the deadline gave up on keeps its stream watched, and the
+     * reaper that watches it inherits this attempt's reference rather than
+     * taking one of its own -- so that the joint cannot be released between
+     * the two.
+     *
+     * Both shapes of start are reaped, because both leave a process behind.
+     * A worker start leaves the worker the prototype forked for it.  A
+     * prototype start leaves the prototype itself: main forks it before it
+     * can answer, and one that never reaches PROCESS_READY forks no worker,
+     * so exactly one process comes of the attempt whatever the size of the
+     * cohort parked on it.  The cohort stands for requests, not for
+     * processes; only the reaped slot stands for a process.
+     *
+     * A start the destination never saw whole is the exception -- recalled
+     * out of the send queue, or dropped by the port layer with part of it
+     * still unsent.  Nothing was forked for either, so there is nothing to
+     * reap and the slot goes back the ordinary way.  Accounting one of those
+     * would move a slot to unaccounted_processes that nothing can drain: no
+     * PROCESS_READY and no REMOVE_PID are coming for a process that was
+     * never created, which would make the bound a ratchet.
+     */
+
+    reap = (expired && !unsent && app != NULL);
+
+    if (!reap) {
+        nxt_router_app_joint_use(task, app_joint, -1);
+    }
 
     if (nxt_slow_path(app == NULL)) {
         nxt_debug(task, "start error for released app");
@@ -4792,15 +6119,216 @@ nxt_router_app_port_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         return;
     }
 
-    nxt_debug(task, "app '%V' %p start error", &app->name, app);
+    if (app_joint_rpc->expired) {
+        /*
+         * Not a start attempt: the reaper armed by
+         * nxt_router_app_start_expired() for a process the router had no
+         * pid for.  Being here is the whole point -- the process is gone,
+         * and its unaccounted_processes slot goes with it.
+         */
+
+        nxt_router_app_unaccounted_release(task, app);
+
+        return;
+    }
+
+    /*
+     * Two ways in are not failures at all, and both are excluded rather
+     * than tolerated.
+     *
+     * A restart: nxt_router_app_restart_handler() bumps app->generation
+     * and sends QUIT to the prototype, and a worker that prototype had
+     * already forked for an in-flight start goes with it.  The REMOVE_PID
+     * for that worker still carries the start's stream -- the prototype
+     * set it when it forked (nxt_application.c) and nothing clears it for
+     * a process that never became ready -- so the router retypes it into
+     * an RPC error and it lands here, reporting a start the operator
+     * themselves cancelled.  The RPC peer is not what brings it here: that
+     * is the process the START_PROCESS was sent to, and this arrives for
+     * the worker.  Generation is how nxt_router_app_port_ready() tells the
+     * same two apart before it quietly QUITs a port that arrives for a
+     * superseded one.
+     *
+     * And a shutdown: nxt_port_close() runs nxt_port_rpc_close() over the
+     * router port, which turns every registration still on it into an
+     * RPC error, so a start that was merely still pending when Unit was
+     * asked to stop would report itself as a failure.  Nothing bumps the
+     * generation there, so it needs its own test -- engine->shutdown, the
+     * same flag this file already consults before deciding to start
+     * another process at all.
+     *
+     * Only the log line is conditional either way: the cleanup below has
+     * to run regardless, since the slots and the parked requests belong
+     * to an attempt that is over whatever ended it.
+     */
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    restarted = (app->generation != app_joint_rpc->generation);
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    /*
+     * Otherwise: logged, not nxt_debug()d.  This handler is armed for one
+     * start attempt and disarmed the moment the port arrives, so it
+     * cannot fire for an ordinary worker exit or an idle timeout: every
+     * remaining call means an application process that was asked for will
+     * never exist, and the requests parked on it are about to be answered
+     * 503.  At debug level that was invisible in a default configuration,
+     * which left "the application returns 503" with no corresponding line
+     * anywhere in the log.
+     *
+     * NXT_LOG_ERR rather than nxt_alert(), which the early-failure path
+     * in nxt_router_start_app_process_handler() uses.  That one can only
+     * be Unit's own fault; this one is usually the application's -- a
+     * module that fails to import, a worker that exits during startup --
+     * and Unit is working exactly as designed when it reports one.
+     * [error] is emitted at the default log level, which is the whole
+     * point of the change.
+     *
+     * A different sentence from that alert, deliberately, even though
+     * the two describe the same disappointment.  The test suite skips
+     * expected alerts by an unanchored regex over the log
+     * (Log.check_alerts()), so a test that skipped this [error] line by
+     * quoting "failed to start a process" would silently swallow the
+     * alert as well, in every test that ran alongside it.  The two are
+     * worth telling apart; the level alone is a thin thing to rely on.
+     *
+     * It cannot say *why*: this is usually a REMOVE_PID that
+     * nxt_router_remove_pid_handler() retyped, and its payload is the
+     * dead pid and nothing else.  The reason is in whatever the dead
+     * process logged before exiting; this line is what tells the operator
+     * there is something to go and look for.
+     */
+
+    if (nxt_slow_path(restarted || task->thread->engine->shutdown)) {
+        nxt_debug(task, "app '%V' start attempt cancelled", &app->name);
+
+    } else if (expired) {
+        /*
+         * A third way in that is not what the line above describes: the
+         * "limits": {"start_timeout"} deadline failed this RPC itself.  The
+         * process it was waiting for very probably does exist -- the router
+         * never learns its pid, so it cannot say -- it simply never called
+         * nxt_unit_init().  "produced no process" would be the wrong thing
+         * to send an operator looking through the logs, and the deadline has
+         * already said the right one, naming the application and the knob.
+         */
+
+        nxt_debug(task, "app '%V' start attempt bounded by \"start_timeout\"",
+                  &app->name);
+
+    } else {
+        nxt_log(task, NXT_LOG_ERR,
+                "app '%V' start attempt produced no process", &app->name);
+    }
+
+    if (app_joint_rpc->proto) {
+        /*
+         * The prototype this RPC was armed for will never arrive, and only
+         * nxt_router_app_port_ready() clears proto_port_requests.  Left set,
+         * it makes every later nxt_router_start_app_process_handler() call
+         * for this application take the "wait for prototype process" branch
+         * and park without sending anything -- so no further port_ready or
+         * port_error can ever fire to clear it.  Only replacing the
+         * nxt_app_t recovers, and a reload does that only when the
+         * application's own config text changes.  Clear it here, and take
+         * the whole parked cohort: the initiator's slot, plus one for each
+         * caller that joined the wait.  This mirrors port_ready(), which
+         * takes the same count and replays that many starts on success.
+         *
+         * Where those slots go is decided below.  All of them go back when
+         * the attempt forked nothing; when it did, one of them stays behind
+         * with the prototype, which is the process it forked.
+         */
+
+        nxt_thread_mutex_lock(&app->mutex);
+
+        n = app->proto_port_requests;
+        app->proto_port_requests = 0;
+
+        nxt_thread_mutex_unlock(&app->mutex);
+
+        /*
+         * The counter is incremented in the same branch that sets ->proto,
+         * so an armed prototype RPC always owns at least its own slot.
+         */
+        nxt_assert(n != 0);
+
+    } else {
+        n = 1;
+    }
+
+    if (reap) {
+        /*
+         * One process was forked for this attempt, and the reaper accounts
+         * for it.  The rest of a prototype start's cohort goes back the
+         * ordinary way: those slots were taken by requests that joined the
+         * wait, and no process was forked for any of them.
+         */
+
+        if (n > 1) {
+            nxt_router_app_start_failed(task, app, n - 1, 0);
+        }
+
+        nxt_router_app_start_expired(task, app, msg, app_joint,
+                                     app_joint_rpc->generation,
+                                     app_joint_rpc->proto);
+
+        return;
+    }
+
+    nxt_router_app_start_failed(task, app, n, 0);
+}
+
+
+/*
+ * A start attempt that will never yield a port: give back the "count"
+ * pending_processes slots it owns and, if the application is left with no way
+ * to answer at all, fail the requests waiting for an acknowledgement instead
+ * of letting them sit until they time out.
+ *
+ * "count" is 1 for an ordinary attempt, which owns only its initiator's slot.
+ * A failed prototype attempt owns the whole parked cohort: see
+ * nxt_router_app_port_error().  Zero is the caller that owns no slot at all
+ * and only wants the requests answered: nxt_router_app_port_get(), for a
+ * request that arrives when the application can neither serve it nor start
+ * anything to serve it.
+ *
+ * "unaccounted" moves the slots to app->unaccounted_processes instead of
+ * giving them back, for the one caller whose attempt very probably did leave
+ * an OS process behind: nxt_router_app_start_expired().
+ */
+
+static void
+nxt_router_app_start_failed(nxt_task_t *task, nxt_app_t *app, uint32_t count,
+    nxt_bool_t unaccounted)
+{
+    nxt_queue_link_t    *link;
+    nxt_http_request_t  *r;
 
     link = NULL;
 
     nxt_thread_mutex_lock(&app->mutex);
 
-    nxt_assert(app->pending_processes != 0);
+    nxt_assert(app->pending_processes >= count);
 
-    app->pending_processes--;
+    /*
+     * The accounting above guarantees this, but nxt_assert() is nothing in a
+     * release build and the two directions are not equally bad: releasing one
+     * slot too few merely leaks it, while releasing one too many wraps the
+     * counter to UINT32_MAX and makes nxt_router_app_can_start() false
+     * forever -- a worse wedge than the one this path exists to clear.
+     */
+    if (nxt_slow_path(count > app->pending_processes)) {
+        count = app->pending_processes;
+    }
+
+    app->pending_processes -= count;
+
+    if (unaccounted) {
+        app->unaccounted_processes += count;
+    }
 
     if (app->processes == 0 && !nxt_queue_is_empty(&app->ack_waiting_req)) {
         link = nxt_queue_first(&app->ack_waiting_req);
@@ -4831,6 +6359,138 @@ nxt_router_app_port_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
         nxt_thread_mutex_unlock(&app->mutex);
     }
+}
+
+
+/*
+ * A start that "limits": {"start_timeout"} gave up on.
+ *
+ * The attempt is over -- its requests are answered here, through
+ * nxt_router_app_start_failed() -- but unlike every other way an attempt can
+ * end, this one very probably leaves a process running.  Something was forked
+ * (only a forked process can fail to announce itself), and the router has no
+ * pid for it, because a pid is exactly what PROCESS_READY carries.  Giving
+ * the pending_processes slot back would therefore mean the next request forks
+ * another one, with nothing counting either: "processes": {"max"} would bound
+ * only the processes that work.  The slot moves to unaccounted_processes
+ * instead, where nxt_router_app_can_start() still sees it.
+ *
+ * "proto" says what was forked, and only nxt_router_app_port_ready() cares:
+ * a worker start leaves the worker its prototype forked, a prototype start
+ * leaves the prototype main forked for it.  A stuck prototype forks no worker
+ * of its own, so either way the attempt leaves exactly one process, and one
+ * slot accounts for it.  That a stuck prototype spends worker slots is
+ * deliberate: while it is stuck the application has no way to run a worker
+ * anyway, and the alternative -- a counter of its own -- would let prototypes
+ * and workers each grow to "max".
+ *
+ * That is a bound, not a leak, because the stream stays watched.  The reply
+ * this start gave up on can still arrive, and both shapes of it retire the
+ * slot:
+ *
+ *   - the process announces itself late, missing only the deadline;
+ *     nxt_router_app_port_ready() retires the slot and adopts it -- a worker
+ *     into ->processes, a prototype into ->proto_port unless the application
+ *     has one by then -- so a merely slow application costs one 503 and
+ *     nothing else;
+ *
+ *   - the process dies and the router is told with the start's own stream
+ *     still attached: for a worker by the prototype that forked it and
+ *     reaps it, for a prototype by main, which clears process->stream only
+ *     for a process that reached READY (see nxt_port_remove_notify_others(),
+ *     and nxt_router_remove_pid_handler(), which retypes that REMOVE_PID
+ *     into an RPC error) -- and nxt_router_app_port_error() gives the slot
+ *     back.
+ *
+ * Neither is guaranteed: a process wedged forever is exactly the case this
+ * exists for, and it holds its slot for as long as it lives.  That is the
+ * intended trade.  A configuration reload that replaces the nxt_app_t is the
+ * other way back.
+ */
+
+static void
+nxt_router_app_start_expired(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_recv_msg_t *msg, nxt_app_joint_t *app_joint, uint32_t generation,
+    nxt_bool_t proto)
+{
+    uint32_t             stream;
+    nxt_app_joint_rpc_t  *reaper;
+
+    stream = msg->port_msg.stream;
+
+    nxt_router_app_start_failed(task, app, 1, 1);
+
+    /*
+     * Only from inside this stream's own handler is the key free to take
+     * again; see nxt_port_rpc_register_handler_at().
+     */
+
+    reaper = nxt_port_rpc_register_handler_at(task, msg->port,
+                                              nxt_router_app_port_ready,
+                                              nxt_router_app_port_error,
+                                              stream,
+                                              sizeof(nxt_app_joint_rpc_t));
+
+    if (nxt_slow_path(reaper == NULL)) {
+        /*
+         * The bound holds -- the slot is already counted -- but nothing will
+         * hand it back, so say so: from here only a reload recovers it.
+         */
+
+        nxt_alert(task, "app \"%V\" cannot watch the process its expired "
+                        "start left behind; that \"processes\" slot is held "
+                        "until the application is reconfigured", &app->name);
+
+        nxt_router_app_joint_use(task, app_joint, -1);
+
+        return;
+    }
+
+    /* The reaper inherits the failed attempt's app_joint reference. */
+
+    reaper->app_joint = app_joint;
+    reaper->generation = generation;
+    reaper->expired = 1;
+
+    /*
+     * Which kind of process the slot stands for: nxt_router_app_port_ready()
+     * branches on ->proto before anything else, and a late prototype must
+     * not be adopted as though it were a worker.
+     */
+
+    reaper->proto = proto;
+
+    nxt_debug(task, "app '%V' stream #%uD kept to account for the process an "
+                    "expired start left behind", &app->name, stream);
+}
+
+
+/*
+ * The process an expired start left behind is accounted for at last: it died
+ * and the router was told.  Only nxt_router_app_start_expired() puts a slot
+ * here, and only this and nxt_router_app_port_ready() take one back.
+ */
+
+static void
+nxt_router_app_unaccounted_release(nxt_task_t *task, nxt_app_t *app)
+{
+    nxt_thread_mutex_lock(&app->mutex);
+
+    /*
+     * One reaper owns exactly one slot, so this cannot underflow; the test
+     * is here because a wrapped counter would pin nxt_router_app_can_start()
+     * false for the application's lifetime, which is worse than leaking the
+     * slot it is meant to release.
+     */
+
+    if (nxt_fast_path(app->unaccounted_processes != 0)) {
+        app->unaccounted_processes--;
+    }
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    nxt_debug(task, "app '%V' unaccounted process is gone, %d left",
+              &app->name, app->unaccounted_processes);
 }
 
 
@@ -4902,12 +6562,307 @@ nxt_router_app_unlink(nxt_task_t *task, nxt_app_t *app)
 }
 
 
+/*
+ * Refill spare_ports from the tail of idle_ports when a port leaves
+ * spare_ports.  Called with app->mutex held.
+ */
+static void
+nxt_router_app_spare_rebalance(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_t *port)
+{
+    nxt_port_t        *idle_port;
+    nxt_queue_link_t  *idle_lnk;
+
+    /* Check port was in 'spare_ports' using idle_start field. */
+    if (port->idle_start == 0 && app->idle_processes >= app->spare_processes) {
+        /*
+         * If there is a vacant space in spare ports,
+         * move the last idle to spare_ports.
+         */
+        nxt_assert(!nxt_queue_is_empty(&app->idle_ports));
+
+        idle_lnk = nxt_queue_last(&app->idle_ports);
+        idle_port = nxt_queue_link_data(idle_lnk, nxt_port_t, idle_link);
+        nxt_queue_remove(idle_lnk);
+
+        nxt_queue_insert_tail(&app->spare_ports, idle_lnk);
+
+        idle_port->idle_start = 0;
+
+        nxt_debug(task, "app '%V' move port %PI:%d from idle_ports "
+                  "to spare_ports",
+                  &app->name, idle_port->pid, idle_port->id);
+    }
+}
+
+
+/*
+ * Take a port out of the idle economy.  Called with app->mutex held; answers
+ * whether the caller must start a replacement process once it has dropped the
+ * lock.  Does nothing to a port that is not in one of the idle queues.
+ *
+ * Two events reach this transition.  An acknowledgement, where a worker has
+ * taken a request the router was still holding for it, and the start of
+ * detached work, where a worker the router has already parked as idle says it
+ * is in fact still running.  The second is why this is a function rather than
+ * a block: setting ->detached without unwinding leaves a port that
+ * nxt_router_app_port_idle() will refuse to insert again and that
+ * nxt_router_adjust_idle_timer() will still reap, so the flag and the unwind
+ * have to happen in one critical section.
+ *
+ * "reason" is for the debug log only.
+ */
+
+static nxt_bool_t
+nxt_router_app_port_busy(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
+    const char *reason)
+{
+    nxt_bool_t  start_process;
+
+    start_process = 0;
+
+    if (!nxt_queue_chk_remove(&port->idle_link)) {
+        return 0;
+    }
+
+    app->idle_processes--;
+
+    nxt_debug(task, "app '%V' move port %PI:%d out of %s (%s)",
+              &app->name, port->pid, port->id,
+              (port->idle_start ? "idle_ports" : "spare_ports"), reason);
+
+    nxt_router_app_spare_rebalance(task, app, port);
+
+    if (nxt_router_app_can_start(app) && nxt_router_app_need_start(app)) {
+        app->pending_processes++;
+        start_process = 1;
+    }
+
+    return start_process;
+}
+
+
+/*
+ * Hand a port back to the idle economy, if it is really idle.  Called with
+ * app->mutex held; answers whether the caller must post app->adjust_idle_work
+ * once it has dropped the lock, which is how the reaper's timer gets armed.
+ *
+ * Extracted from nxt_router_app_port_release() because the end of detached
+ * work reaches the same transition from nxt_router_detached_handler(), and a
+ * second copy of a block that touches three queues and two counters is how
+ * they drift apart.
+ */
+
+static nxt_bool_t
+nxt_router_app_port_idle(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port)
+{
+    nxt_bool_t  adjust_idle_timer;
+
+    adjust_idle_timer = 0;
+
+    if (port->pair[1] != -1
+        && port->active_requests == 0
+        && port->active_websockets == 0
+        && port->detached == 0
+        && port->idle_link.next == NULL)
+    {
+        if (app->idle_processes == app->spare_processes
+            && app->adjust_idle_work.data == NULL)
+        {
+            adjust_idle_timer = 1;
+            app->adjust_idle_work.data = app;
+            app->adjust_idle_work.next = NULL;
+        }
+
+        if (app->idle_processes < app->spare_processes) {
+            nxt_queue_insert_tail(&app->spare_ports, &port->idle_link);
+
+            nxt_debug(task, "app '%V' move port %PI:%d to spare_ports",
+                      &app->name, port->pid, port->id);
+
+        } else {
+            nxt_queue_insert_tail(&app->idle_ports, &port->idle_link);
+
+            port->idle_start = task->thread->engine->timers.now;
+
+            nxt_debug(task, "app '%V' move port %PI:%d to idle_ports",
+                      &app->name, port->pid, port->id);
+        }
+
+        app->idle_processes++;
+    }
+
+    return adjust_idle_timer;
+}
+
+
+/*
+ * The router gave up on a request a worker is running.  The 503 is the
+ * client's answer, but the worker does not know that and keeps executing, so
+ * the port must not go back into the idle economy when the request's
+ * accounting is released a moment from now: the reaper would QUIT a worker
+ * in the middle of a request, and the port would count as free against
+ * "processes": {"max"} while it is not.
+ *
+ * Enter the state a detached worker already has -- see
+ * nxt_router_detached_apply() -- and settle it when the worker answers, when
+ * the port closes, or when the application's own FINISH edge says its work is
+ * over.  "app_port" is the port the acknowledgement moved the request to:
+ * the worker's, never the shared queue.  Called before the unlink that
+ * releases the request.
+ *
+ * The state lands on app_port->main_app_port.  That is the same object the
+ * acknowledgement and a release reach through the same field, while a
+ * detached edge finds it by pid (nxt_router_detached_apply()); a worker's
+ * ports share one main port, so both identities name it.
+ */
+
+static void
+nxt_router_app_abandon(nxt_task_t *task, nxt_app_t *app,
+    nxt_request_rpc_data_t *req_rpc_data, nxt_port_t *app_port)
+{
+    nxt_bool_t  changed, start_process;
+    nxt_port_t  *port;
+
+    port = app_port->main_app_port;
+
+    /*
+     * Both the detached state and the rpc_data's own pointer outlive this
+     * call, and the state is published to another thread: the port close
+     * path takes the same mutex and drops the state's reference when it
+     * settles.  So both application references and the port reference are
+     * taken before the state can be seen, the way
+     * nxt_router_detached_apply() takes its own before the mutex; a close
+     * that arrived in between would otherwise drop a reference this call has
+     * not taken yet.  The request still holds an application reference of
+     * its own here, so the increment cannot resurrect a freed one.
+     */
+    nxt_router_app_use(task, app, 2);
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    changed = 0;
+
+    if (port->detached == 0) {
+        port->detached = 1;
+        app->detached_processes++;
+        changed = 1;
+    }
+
+    port->detached_router++;
+
+    nxt_port_inc_use(port);
+
+    /*
+     * Defensive, and symmetric with the detached START edge: a port with a
+     * live request is not in an idle queue, so this normally finds nothing
+     * to unwind and starts nothing.  It is here so that the flag and the
+     * unwind share this critical section whichever way the port got here.
+     */
+    start_process = nxt_router_app_port_busy(task, app, port, "abandoned");
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    if (!changed) {
+        /*
+         * The application was detached already, so its own edge owns that
+         * reference; this call keeps only the rpc_data's.
+         */
+        nxt_router_app_use(task, app, -1);
+    }
+
+    /*
+     * Keep the registration.  nxt_router_response_ready_handler() is what
+     * drops the answer of a request nobody tracks any more, and that is also
+     * where the port is taken back; the unlink that follows would cancel the
+     * registration first and the answer would never reach it.
+     */
+    req_rpc_data->rpc_cancel = 0;
+
+    req_rpc_data->abandoned_app = app;
+    req_rpc_data->abandoned_port = port;
+
+    if (start_process) {
+        nxt_router_start_app_process(task, app);
+    }
+}
+
+
+/*
+ * A worker the router gave up on has answered, or is gone.  Its port rejoins
+ * the idle economy if the router's own mark is the only thing holding it out
+ * -- an application START edge clears that mark and its FINISH edge is what
+ * ends the state then -- and the references the abandonment took are dropped
+ * either way.
+ */
+
+static void
+nxt_router_app_abandoned_settle(nxt_task_t *task,
+    nxt_request_rpc_data_t *req_rpc_data)
+{
+    nxt_port_t  *port;
+    nxt_app_t   *app;
+    nxt_bool_t  adjust_idle_timer, ours;
+
+    port = req_rpc_data->abandoned_port;
+
+    if (port == NULL) {
+        return;
+    }
+
+    app = req_rpc_data->abandoned_app;
+
+    req_rpc_data->abandoned_port = NULL;
+    req_rpc_data->abandoned_app = NULL;
+
+    ours = 0;
+    adjust_idle_timer = 0;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    if (port->detached_router != 0) {
+        port->detached_router--;
+
+        /*
+         * The port is free only once no reason is left: this was the last
+         * request the router gave up on, and the application is not running
+         * detached work of its own either.
+         */
+        if (port->detached_router == 0 && port->detached_app == 0
+            && port->detached != 0)
+        {
+            port->detached = 0;
+
+            app->detached_processes--;
+
+            adjust_idle_timer = nxt_router_app_port_idle(task, app, port);
+
+            ours = 1;
+        }
+    }
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    if (adjust_idle_timer) {
+        nxt_router_app_use(task, app, 1);
+        nxt_event_engine_post(app->engine, &app->adjust_idle_work);
+    }
+
+    if (ours) {
+        nxt_router_app_use(task, app, -1);
+    }
+
+    nxt_router_app_use(task, app, -1);
+    nxt_port_use(task, port, -1);
+}
+
+
 static void
 nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     nxt_apr_action_t action)
 {
     int         inc_use;
-    uint32_t    got_response, dec_requests;
+    uint32_t    got_response, dec_requests, dec_websockets;
     nxt_bool_t  adjust_idle_timer;
     nxt_port_t  *main_app_port;
 
@@ -4916,6 +6871,7 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     inc_use = 0;
     got_response = 0;
     dec_requests = 0;
+    dec_websockets = 0;
 
     switch (action) {
     case NXT_APR_NEW_PORT:
@@ -4934,11 +6890,21 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     case NXT_APR_CLOSE:
         inc_use = -1;
         break;
+    case NXT_APR_WEBSOCKET_CLOSE:
+        dec_websockets = 1;
+        inc_use = -1;
+        break;
     }
 
-    nxt_debug(task, "app '%V' release port %PI:%d: %d %d", &app->name,
+    nxt_debug(task, "app '%V' release port %PI:%d: %d %d %d", &app->name,
               port->pid, port->id,
-              (int) inc_use, (int) got_response);
+              (int) inc_use, (int) got_response, (int) dec_websockets);
+
+    /*
+     * A websocket is upgraded from a request a worker has answered, so the
+     * port it is released on is that worker's own port, never the shared one.
+     */
+    nxt_assert(dec_websockets == 0 || port->id != NXT_SHARED_PORT_ID);
 
     if (port->id == NXT_SHARED_PORT_ID) {
         nxt_thread_mutex_lock(&app->mutex);
@@ -4955,6 +6921,7 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     nxt_thread_mutex_lock(&app->mutex);
 
     main_app_port->active_requests -= got_response + dec_requests;
+    main_app_port->active_websockets -= dec_websockets;
     app->active_requests -= got_response + dec_requests;
 
     if (main_app_port->pair[1] != -1 && main_app_port->app_link.next == NULL) {
@@ -4963,37 +6930,7 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
         nxt_port_inc_use(main_app_port);
     }
 
-    adjust_idle_timer = 0;
-
-    if (main_app_port->pair[1] != -1
-        && main_app_port->active_requests == 0
-        && main_app_port->active_websockets == 0
-        && main_app_port->idle_link.next == NULL)
-    {
-        if (app->idle_processes == app->spare_processes
-            && app->adjust_idle_work.data == NULL)
-        {
-            adjust_idle_timer = 1;
-            app->adjust_idle_work.data = app;
-            app->adjust_idle_work.next = NULL;
-        }
-
-        if (app->idle_processes < app->spare_processes) {
-            nxt_queue_insert_tail(&app->spare_ports, &main_app_port->idle_link);
-
-            nxt_debug(task, "app '%V' move port %PI:%d to spare_ports",
-                      &app->name, main_app_port->pid, main_app_port->id);
-        } else {
-            nxt_queue_insert_tail(&app->idle_ports, &main_app_port->idle_link);
-
-            main_app_port->idle_start = task->thread->engine->timers.now;
-
-            nxt_debug(task, "app '%V' move port %PI:%d to idle_ports",
-                      &app->name, main_app_port->pid, main_app_port->id);
-        }
-
-        app->idle_processes++;
-    }
+    adjust_idle_timer = nxt_router_app_port_idle(task, app, main_app_port);
 
     nxt_thread_mutex_unlock(&app->mutex);
 
@@ -5019,17 +6956,31 @@ adjust_use:
 }
 
 
+#if (NXT_TESTS)
+
+/* For src/test/nxt_router_websocket_test.c. */
+
+void
+nxt_router_test_app_port_release(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_t *port, nxt_apr_action_t action)
+{
+    nxt_router_app_port_release(task, app, port, action);
+}
+
+#endif
+
+
 void
 nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
 {
-    nxt_app_t         *app;
-    nxt_bool_t        unchain, start_process;
-    nxt_port_t        *idle_port;
-    nxt_queue_link_t  *idle_lnk;
+    nxt_app_t   *app;
+    nxt_bool_t  unchain, start_process, detached;
 
     app = port->app;
 
     nxt_assert(app != NULL);
+
+    detached = 0;
 
     nxt_thread_mutex_lock(&app->mutex);
 
@@ -5068,26 +7019,27 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
                   &app->name, port->pid, port->id,
                   (port->idle_start ? "idle_ports" : "spare_ports"));
 
-        if (port->idle_start == 0
-            && app->idle_processes >= app->spare_processes)
-        {
-            nxt_assert(!nxt_queue_is_empty(&app->idle_ports));
-
-            idle_lnk = nxt_queue_last(&app->idle_ports);
-            idle_port = nxt_queue_link_data(idle_lnk, nxt_port_t, idle_link);
-            nxt_queue_remove(idle_lnk);
-
-            nxt_queue_insert_tail(&app->spare_ports, idle_lnk);
-
-            idle_port->idle_start = 0;
-
-            nxt_debug(task, "app '%V' move port %PI:%d from idle_ports "
-                      "to spare_ports",
-                      &app->name, idle_port->pid, idle_port->id);
-        }
+        nxt_router_app_spare_rebalance(task, app, port);
     }
 
     app->processes--;
+
+    /*
+     * A worker can die in the middle of its detached work -- a fatal error
+     * after the response went out, or a kill.  This is the only path that
+     * runs for it then, so the count has to be settled here or the
+     * application never reaches the zero nxt_router_free_app() asserts on.
+     * The matching application reference is dropped below, outside the lock.
+     */
+
+    detached = port->detached;
+
+    if (detached) {
+        port->detached = 0;
+        port->detached_app = 0;
+        port->detached_router = 0;
+        app->detached_processes--;
+    }
 
     start_process = !task->thread->engine->shutdown
                     && nxt_router_app_can_start(app)
@@ -5107,6 +7059,16 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
 
     if (start_process) {
         nxt_router_start_app_process(task, app);
+    }
+
+    /*
+     * Keep the detached reference until the replacement start has taken its
+     * own.  After configuration removal this can be the last reference, so
+     * dropping it earlier frees app before nxt_router_start_app_process().
+     */
+
+    if (detached) {
+        nxt_router_app_use(task, app, -1);
     }
 }
 
@@ -5150,6 +7112,33 @@ nxt_router_adjust_idle_timer(nxt_task_t *task, void *obj, void *data)
 
         lnk = nxt_queue_first(&app->idle_ports);
         port = nxt_queue_link_data(lnk, nxt_port_t, idle_link);
+
+        /*
+         * A worker running detached work must never be reachable from here:
+         * this loop clears ->app, which stops nxt_port_close() from ever
+         * running nxt_router_app_port_close() for the port, and the count
+         * and the application reference would then never be settled.
+         * nxt_router_app_port_idle() refuses to insert such a port and
+         * nxt_router_app_port_busy() takes one that is already here back
+         * out, both under this same mutex.
+         */
+
+        nxt_assert(port->detached == 0);
+
+        if (nxt_slow_path(port->detached != 0)) {
+            /*
+             * A release build.  A bare continue selects the same link again
+             * and spins with app->mutex held.  Take the port out of the idle
+             * queue only: the worker is alive, so it keeps ->app, stays in
+             * app->processes and gets no QUIT.  nxt_router_app_port_idle()
+             * inserts it again when the detached work ends.
+             */
+
+            nxt_queue_remove(lnk);
+            lnk->next = NULL;
+            app->idle_processes--;
+            continue;
+        }
 
         timeout = port->idle_start + app->idle_timeout;
 
@@ -5290,6 +7279,7 @@ nxt_router_free_app(nxt_task_t *task, void *obj, void *data)
 
     nxt_assert(app->proto_port == NULL);
     nxt_assert(app->processes == 0);
+    nxt_assert(app->detached_processes == 0);
     nxt_assert(app->active_requests == 0);
     nxt_assert(app->port_hash_count == 0);
     nxt_assert(app->idle_processes == 0);
@@ -5328,7 +7318,7 @@ static void
 nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
     nxt_request_rpc_data_t *req_rpc_data)
 {
-    nxt_bool_t          start_process;
+    nxt_bool_t          start_process, unanswerable;
     nxt_port_t          *port;
     nxt_http_request_t  *r;
 
@@ -5345,6 +7335,21 @@ nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
         app->pending_processes++;
         start_process = 1;
     }
+
+    /*
+     * Nothing is running, nothing is starting, and nothing may be started:
+     * every "processes" slot is held by a process an expired start left
+     * behind (nxt_router_app_start_expired()).  Only a start can take a
+     * request back out of ack_waiting_req, so parking this one would leave
+     * it there until it timed out.  Answer it below instead, at once.
+     *
+     * Reachable only through unaccounted_processes: with no process and
+     * none pending, nxt_router_app_can_start() is otherwise false only for
+     * "processes": {"max": 0}, which the configuration rejects.
+     */
+
+    unanswerable = (start_process == 0 && app->processes == 0
+                    && app->pending_processes == 0);
 
     r = req_rpc_data->request;
 
@@ -5365,8 +7370,42 @@ nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
     req_rpc_data->app_port = port;
     req_rpc_data->apr_action = NXT_APR_REQUEST_FAILED;
 
+    /*
+     * Bound the wait for a process.  Until a worker acknowledges the request
+     * the two dispatch paths that arm this timer have not run, so a request
+     * parked in ack_waiting_req has no deadline of its own: it waits for a
+     * worker that may never ask for it.  With detached work that wait is as
+     * long as the application chooses to run, which is what makes the
+     * deadline worth having -- "limits": {"timeout"} now bounds waiting for
+     * capacity, not only the time a worker spends on the request.
+     *
+     * The handler is the one those paths use, and it is shared with the
+     * post-acknowledgement deadline, where 503 is simply the right answer.
+     * Here it is right only if the request is still in the queue, so the
+     * handler retracts it first and tells the two deadlines apart by the
+     * answer; see nxt_router_app_timeout().
+     *
+     * An acknowledgement re-arms the same timer with the same handler, which
+     * nxt_timer_add() treats as a change, not a second timer.
+     */
+
+    if (app->timeout != 0) {
+        r->timer.handler = nxt_router_app_timeout;
+        r->timer_data = req_rpc_data;
+
+        nxt_timer_add(task->thread->engine, &r->timer, app->timeout);
+    }
+
     if (start_process) {
         nxt_router_start_app_process(task, app);
+
+    } else if (nxt_slow_path(unanswerable)) {
+        nxt_debug(task, "app '%V' has no process and may not start one",
+                  &app->name);
+
+        /* No slot of its own to give back: only the requests are wanted. */
+
+        nxt_router_app_start_failed(task, app, 0, 0);
     }
 }
 
@@ -5858,6 +7897,7 @@ static void
 nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
 {
     nxt_timer_t              *timer;
+    nxt_msg_info_t           *msg_info;
     nxt_http_request_t       *r;
     nxt_request_rpc_data_t   *req_rpc_data;
 
@@ -5867,6 +7907,74 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
 
     r = nxt_timer_data(timer, nxt_http_request_t, timer);
     req_rpc_data = r->timer_data;
+
+    msg_info = &req_rpc_data->msg_info;
+
+    /*
+     * Two deadlines share this handler.  After an acknowledgement a worker
+     * holds the request and 503 is the answer: it is too slow.  Before one
+     * the request is still in the shared port queue, and only the CAS in
+     * nxt_router_msg_retract() says whether it is still there.
+     *
+     * So retract before answering.  A retraction that loses means a worker
+     * took the request in that same instant: it is running, and a 503 here
+     * would both fail the request and run it -- twice, if the client
+     * retries.
+     *
+     * Leave a claimed request alone until its acknowledgement, and do not
+     * re-arm: the acknowledgement arms this timer again.  Do not answer it
+     * at a later expiry either.  The chain's tail is the request body that
+     * nxt_router_req_headers_ack_handler() still has to send, and libunit
+     * keeps the request until that body arrives.  An unlink here would drop
+     * the body and cancel the RPC, so a late acknowledgement is ignored and
+     * the request stays in the worker for ever.
+     *
+     * The acknowledgement replaces ->app_port with the worker's own port, so
+     * the shared port here means that it has not arrived yet.
+     */
+
+    if (msg_info->cancel == NXT_MSG_QUEUED) {
+        (void) nxt_router_msg_retract(task, req_rpc_data);
+    }
+
+    if (msg_info->cancel == NXT_MSG_CLAIMED
+        && req_rpc_data->app_port != NULL
+        && req_rpc_data->app_port->id == NXT_SHARED_PORT_ID)
+    {
+        nxt_debug(task, "stream #%uD: claimed, waiting for the ack",
+                  req_rpc_data->stream);
+
+        return;
+    }
+
+    /*
+     * The acknowledgement moves the request's port off the shared queue and
+     * onto the worker that took it; nxt_router_msg_retract() reads the same
+     * fact.  A request a worker is running is not the router's to release:
+     * its port has to stay out of the idle economy until the worker answers
+     * or closes.  See nxt_router_app_abandon().
+     *
+     * An upgraded stream is not such a request.  Its accounting was already
+     * given back by NXT_APR_UPGRADE, so no worker is running it and there is
+     * no slot to hold; what does keep the port out of the idle economy is the
+     * session count, and that one is settled by the unlink below, because the
+     * upgrade left NXT_APR_WEBSOCKET_CLOSE as the action.  The mark would
+     * instead report the worker "detached" for as long as the connection
+     * lives.  The websocket state is the upgrade itself -- it is assigned
+     * beside that release, and nowhere else -- so a handshake still in flight
+     * or one that failed, both of which do hold their accounting, still reach
+     * the abandon.
+     */
+    if (req_rpc_data->app_port != NULL
+        && req_rpc_data->app_port->id != NXT_SHARED_PORT_ID
+        && r->state != &nxt_http_websocket)
+    {
+        /* The request is still linked, so it holds the application. */
+        nxt_assert(req_rpc_data->app != NULL);
+
+        nxt_router_app_abandon(task, req_rpc_data->app, req_rpc_data,
+                               req_rpc_data->app_port);
+    }
 
     nxt_http_request_error(task, r, NXT_HTTP_SERVICE_UNAVAILABLE);
 
@@ -5895,6 +8003,255 @@ nxt_router_http_request_release(nxt_task_t *task, void *obj, void *data)
 }
 
 
+/*
+ * An application says it answered a request and kept running, or that such
+ * work has finished.  PHP's fastcgi_finish_request() is the case this
+ * exists for: libunit reports the request done while the script runs on, so
+ * without this the router counts the worker idle, hands its slot back to
+ * "processes": {"max"}, and reaps a process that is still executing.
+ *
+ * Runs on the router's main thread, because the message arrives on the
+ * router's own port; see nxt_router_detached_handler().  The port is
+ * identified by pid alone: the accounting hangs off the application's main
+ * port, the one with id 0, and a worker has exactly one however many
+ * contexts it runs.  Looking it up rather than following ->main_app_port
+ * from the sender's port is also what keeps this off a stale pointer -- that
+ * field is never cleared, and the main port can be released while a sibling
+ * port of the same process is still registered.
+ *
+ * Either edge may arrive with the port already in the state being asked
+ * for, and both then do nothing: a start edge is idempotent because several
+ * contexts of one worker can be detached at once, and a finish edge because
+ * the worker's death has already settled the state.
+ */
+
+static void
+nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid, uint8_t state)
+{
+    int                drop;
+    nxt_app_t          *app;
+    nxt_port_t         *port;
+    nxt_bool_t         changed, start_process, adjust_idle_timer;
+    nxt_runtime_t      *rt;
+    nxt_atomic_int_t   c;
+
+    rt = task->thread->runtime;
+
+    nxt_assert(task->thread->engine == rt->main_engine);
+
+    port = nxt_runtime_port_find(rt, pid, 0);
+
+    if (nxt_slow_path(port == NULL)) {
+        nxt_debug(task, "detached_handler: %PI has no main port", pid);
+        return;
+    }
+
+    app = port->app;
+
+    if (nxt_slow_path(app == NULL)) {
+        nxt_debug(task, "detached_handler: port %PI:%d has no application",
+                  pid, port->id);
+        return;
+    }
+
+    /*
+     * A reference, taken only if the application still has one.  The
+     * count reaching zero is what posts nxt_router_free_app() to this
+     * thread, and the last drop can happen on a worker engine while this
+     * edge is already on its way here: the request that held the
+     * application is released there, and a reconfiguration has already
+     * taken the configuration's reference.  A plain increment would
+     * resurrect an application whose free is queued behind this handler,
+     * and the start it may post below would then lock a mutex in freed
+     * memory.  Zero is treated exactly like no application at all; the
+     * free that is coming clears ->app and QUITs the worker.
+     */
+
+    for ( ;; ) {
+        c = app->use_count;
+
+        if (c == 0) {
+            nxt_debug(task, "detached_handler: app '%V' is being freed",
+                      &app->name);
+            return;
+        }
+
+        if (nxt_atomic_cmp_set(&app->use_count, c, c + 1)) {
+            break;
+        }
+    }
+
+    nxt_debug(task, "app '%V' port %PI:%d detached state %d",
+              &app->name, port->pid, port->id, (int) state);
+
+    changed = 0;
+    start_process = 0;
+    adjust_idle_timer = 0;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    if (state == NXT_PORT_DETACHED_START) {
+
+        /*
+         * A reason of the application's own, held beside the router's count
+         * of requests it gave up on: neither clear may drop the other.
+         */
+        port->detached_app = 1;
+
+        if (port->detached == 0) {
+            port->detached = 1;
+            app->detached_processes++;
+            changed = 1;
+
+            /*
+             * The worker may already have been parked as idle.  libunit
+             * sends the start edge before the last response message, but
+             * that only orders the two on the wire: the response is
+             * answered by the engine that owns the request, this by the
+             * main thread, and a request that was failed rather than
+             * answered -- a "limits": {"timeout"} expiry, an error -- runs
+             * nxt_router_app_port_release() with no start edge in sight at
+             * all, so the port can have been sitting in idle_ports for as
+             * long as the application chose to keep running.
+             *
+             * Unwind it here, exactly as an acknowledgement does.  Leaving
+             * it in place would be worse than not having this message: the
+             * reaper would QUIT a worker that is still executing -- the bug
+             * this exists to fix -- and would clear ->app on the way, so
+             * nxt_router_app_port_close() would never run and the count and
+             * the application reference below would never be settled.
+             */
+
+            start_process = nxt_router_app_port_busy(task, app, port,
+                                                     "detached");
+        }
+
+    } else {
+        port->detached_app = 0;
+
+        /*
+         * The port leaves the detached state only when no reason is left:
+         * nothing here while a request the router gave up on is still
+         * running, and nothing for that request's answer while the
+         * application's own work is.
+         */
+        if (port->detached_router == 0 && port->detached != 0) {
+            port->detached = 0;
+            app->detached_processes--;
+            changed = 1;
+
+            /*
+             * Only now may this worker rejoin the idle economy.  Its last
+             * response went out long ago, so nothing else will run this
+             * transition for it.
+             */
+
+            adjust_idle_timer = nxt_router_app_port_idle(task, app, port);
+        }
+    }
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    if (adjust_idle_timer) {
+        nxt_router_app_use(task, app, 1);
+        nxt_event_engine_post(app->engine, &app->adjust_idle_work);
+    }
+
+    /*
+     * Holding the reference taken above: this is the only caller that can
+     * reach nxt_router_start_app_process() with no reference of its own.
+     */
+
+    if (start_process) {
+        nxt_router_start_app_process(task, app);
+    }
+
+    /*
+     * A start edge that changed the state keeps the reference taken above:
+     * it is what keeps this worker's application alive for as long as the
+     * work runs.  A detached worker holds no request, and a request is what
+     * otherwise holds the application -- by the time the work starts
+     * nxt_request_rpc_data_unlink() has already dropped its reference, so a
+     * configuration reload could free the application out from under a
+     * process still executing.  The finish edge that changed the state
+     * returns it, and an edge that changed nothing returns only its own, so
+     * a repeated start cannot take a second reference that the single
+     * finish never returns.
+     */
+
+    drop = 1;
+
+    if (changed) {
+        drop = (state == NXT_PORT_DETACHED_START) ? 0 : 2;
+    }
+
+    if (drop != 0) {
+        nxt_router_app_use(task, app, -drop);
+    }
+}
+
+
+/*
+ * The edge arrives on the router's own port, whichever engine answered the
+ * request: libunit sends both edges to its router port, the way it sends
+ * OOSM.  That port is read on the main thread, which is where everything
+ * the edge touches lives -- rt->ports is read without a lock, which is only
+ * safe on the thread that adds to and removes from it, and an application
+ * is freed on app->engine, the same thread.  One socket per worker also
+ * keeps a finish edge behind the start edge that preceded it, which the
+ * ports of two engines could not: their reads race, and the flag would be
+ * cleared under the next request's work.
+ */
+
+static void
+nxt_router_detached_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    /*
+     * The pid in the message is chosen by the sender, and every worker holds
+     * a copy of this port.  Accept an edge only for the process that sent it,
+     * or a worker could pin another worker as detached or release one.  The
+     * router port has no shared memory queue, so the message always comes
+     * from the socket and carries the kernel's credentials.
+     */
+    if (nxt_slow_path(nxt_recv_msg_cmsg_pid(msg) != msg->port_msg.pid)) {
+        nxt_alert(task, "process %PI sent a detached edge for process %PI",
+                  nxt_recv_msg_cmsg_pid(msg), msg->port_msg.pid);
+        return;
+    }
+
+    if (nxt_slow_path(msg->buf == NULL
+                      || nxt_buf_used_size(msg->buf) < (int) sizeof(uint8_t)))
+    {
+        nxt_alert(task, "detached_handler: %PI sent no state byte",
+                  msg->port_msg.pid);
+        return;
+    }
+
+    if (*msg->buf->mem.pos != NXT_PORT_DETACHED_START
+        && *msg->buf->mem.pos != NXT_PORT_DETACHED_FINISH)
+    {
+        nxt_alert(task, "detached_handler: invalid state byte %d",
+                  (int) *msg->buf->mem.pos);
+        return;
+    }
+
+    nxt_router_detached_apply(task, msg->port_msg.pid, *msg->buf->mem.pos);
+}
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_router_detached_test.c. */
+
+void
+nxt_router_test_detached_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_router_detached_handler(task, msg);
+}
+
+#endif
+
+
 static void
 nxt_router_oosm_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
@@ -5907,8 +8264,24 @@ nxt_router_oosm_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     nxt_debug(task, "oosm in %PI", msg->port_msg.pid);
 
-    process = nxt_runtime_process_find(task->thread->runtime,
-                                       msg->port_msg.pid);
+    /*
+     * Referenced, not just found: .oosm is in both the router main and the
+     * router worker port handler tables, and the reference has to span the
+     * incoming.mutex critical section below.  Which engine actually receives
+     * a given OOSM depends on the port libunit sends it to, so this is not
+     * assumed either way -- what makes the reference necessary is that a
+     * worker engine can drop the last reference to the same process while
+     * this runs.
+     *
+     * It has to span the broadcast too, but note what that does and does not
+     * buy: it keeps the nxt_process_t allocated, and nothing more.  The ports
+     * nxt_process_broadcast_shm_ack() reaches through process->ports are
+     * refcounted separately and that queue is walked here without a lock, so
+     * this reference does not make the walk itself safe.
+     */
+
+    process = nxt_runtime_process_ref(task->thread->runtime,
+                                      msg->port_msg.pid);
     if (nxt_slow_path(process == NULL)) {
         return;
     }
@@ -5949,6 +8322,13 @@ nxt_router_oosm_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     if (ack) {
         nxt_process_broadcast_shm_ack(task, process);
     }
+
+    /*
+     * The only release point: the process == NULL return above precedes the
+     * reference, and the loop breaks and continues but never returns.
+     */
+
+    nxt_process_use(task, process, -1);
 }
 
 

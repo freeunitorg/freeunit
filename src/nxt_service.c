@@ -44,16 +44,6 @@ static const nxt_service_t  nxt_services[] = {
     { "SSL/TLS", "openssl", &nxt_openssl_lib },
 #endif
 
-#if (NXT_HAVE_GNUTLS)
-    { "SSL/TLS", "GnuTLS", &nxt_gnutls_lib },
-    { "SSL/TLS", "gnutls", &nxt_gnutls_lib },
-#endif
-
-#if (NXT_HAVE_CYASSL)
-    { "SSL/TLS", "CyaSSL", &nxt_cyassl_lib },
-    { "SSL/TLS", "cyassl", &nxt_cyassl_lib },
-#endif
-
 };
 
 

@@ -28,6 +28,18 @@ env:
   # patch level lives here; the 3.6 "slot" (/opt/openssl-3.6, OPENSSL36_* vars)
   # is stable across patch bumps and intentionally not templated.
   OPENSSL_VERSION: 3.6.2
+  # OpenSSL 4.0 for the openssl4 leg below.  No distribution ships 4.0 yet, so
+  # like the 3.6 slot it is built from source; the /opt/openssl-4.0 slot is
+  # stable across patch bumps.
+  OPENSSL4_VERSION: 4.0.2
+
+concurrency:
+  # Cancel superseded runs for the same pull request.  Non-PR events fall back
+  # to the run id, which is unique, so a push is never grouped with another:
+  # Actions keeps only one PENDING run per group and would drop a queued commit
+  # even with cancel-in-progress false, which would break bisectability.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # Single source of truth for the test matrix. The version-tested language
@@ -37,6 +49,7 @@ jobs:
   # and the "minimal" image — those are Docker packaging flavors, not test axes.
   prepare:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       builds: ${{ steps.list.outputs.builds }}
     steps:
@@ -53,9 +66,149 @@ jobs:
           ' pkg/eol.json)
           echo "builds=${builds}" >> "$GITHUB_OUTPUT"
 
+  # The core build, once for the whole run.  Every matrix leg below used to
+  # run the same "Configure unit" and "Make unit" steps with the same flags,
+  # so the same objects were compiled 26 times.  This job does it once and
+  # ships the result as an artifact; the legs unpack it and build only their
+  # own module.  Flags here are a copy of what the legs ran before -- keep
+  # the two in step if they ever change.
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read njs version
+        id: metadata
+        run: |
+          NJS_VERSION=$(sed -n "s/NJS_VERSION := \(.*\)/\1/p" pkg/contrib/src/njs/version)
+          echo "njs_version=${NJS_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install packages
+        run: sudo apt-get -y install libbrotli-dev ccache
+
+      - name: Cache ccache
+        uses: actions/cache@v6
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-${{ runner.arch }}-core-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ runner.arch }}-core-
+
+      - name: Enable ccache
+        run: |
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=500M" >> "$GITHUB_ENV"
+
+      - name: Cache OpenSSL 3.6
+        id: cache-openssl36
+        uses: actions/cache@v6
+        with:
+          path: /opt/openssl-3.6
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build OpenSSL 3.6
+        if: steps.cache-openssl36.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get -y install build-essential
+          cd /tmp
+          wget -q "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
+          tar -xzf "openssl-${OPENSSL_VERSION}.tar.gz"
+          cd "openssl-${OPENSSL_VERSION}"
+          ./Configure --prefix=/opt/openssl-3.6 shared no-docs
+          make -j$(nproc)
+          sudo mkdir -p /opt/openssl-3.6
+          sudo make install_sw
+
+      - name: Set OpenSSL 3.6 build environment
+        run: |
+          OSSL=/opt/openssl-3.6
+          LIBDIR=$( [ -d "$OSSL/lib64" ] && echo "$OSSL/lib64" || echo "$OSSL/lib" )
+          echo "OPENSSL36_INCDIR=${OSSL}/include" >> $GITHUB_ENV
+          echo "OPENSSL36_LIBDIR=${LIBDIR}"        >> $GITHUB_ENV
+
+      - name: Cache njs
+        id: cache-njs
+        uses: actions/cache@v6
+        with:
+          path: njs
+          key: njs-freeunitorg-${{ steps.metadata.outputs.njs_version }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Clone njs repository
+        if: steps.cache-njs.outputs.cache-hit != 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: freeunitorg/njs
+          ref: '${{ steps.metadata.outputs.njs_version }}'
+          path: njs
+
+      - name: Make njs
+        if: steps.cache-njs.outputs.cache-hit != 'true'
+        run: |
+          ./configure --no-libxml2 --no-zlib
+          make -j4 -k
+        working-directory: njs
+
+      - name: Configure unit
+        # LD_LIBRARY_PATH is set only for this step so that auto/feature
+        # test binaries load OpenSSL 3.6 at runtime.  It is NOT exported
+        # globally — doing so would break sudo (sudoers.so links against
+        # system libssl 3.3 which requires OPENSSL_3.3.0 from libcrypto,
+        # a symbol version that 3.6 does not export in the same slot).
+        env:
+          LD_LIBRARY_PATH: ${{ env.OPENSSL36_LIBDIR }}
+        run: |
+          ./configure \
+            --tests \
+            --openssl \
+            --njs \
+            --zlib \
+            --zstd \
+            --brotli \
+            --otel \
+            --cc-opt="-I${OPENSSL36_INCDIR} -I njs/src/ -I njs/build" \
+            --ld-opt="-L${OPENSSL36_LIBDIR} -Wl,-rpath,${OPENSSL36_LIBDIR} -L njs/build"
+
+      - name: Make unit
+        run: |
+          make -j$(nproc) -k || make
+
+      # The default target is `all: unitd manpage`, so --tests above only
+      # makes this target available -- it does not build it.  Without it
+      # build/unit_app_test does not exist and test_app_lifecycle.py's
+      # `libunit` parameter self-skips in every leg, silently: the runtime
+      # that needs no language toolchain and links libunit directly, i.e.
+      # the one that exercises the port/fd lifecycle with the least in the
+      # way, would contribute nothing while the legs still reported green.
+      - name: Make the libunit test application
+        run: make -j$(nproc) build/unit_app_test
+
+      # tar, not a bare upload: actions/upload-artifact stores a zip and
+      # restores neither the executable bit nor mtimes.  Both matter here --
+      # the legs run build/unit_app_test directly, and `make <module>` decides
+      # what to rebuild from mtimes.  The root Makefile is generated by
+      # configure (it just includes build/Makefile), so it travels too, and
+      # build/autoconf.data is what a module configure sources for the core's
+      # flags.
+      - name: Pack the core build
+        run: tar -czf /tmp/unit-core-build.tar.gz Makefile build
+
+      - name: Upload the core build
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-core-build
+          path: /tmp/unit-core-build.tar.gz
+          retention-days: 1
+          compression-level: 0
+
   test:
-    needs: prepare
+    needs: [prepare, core]
     runs-on: ${{ matrix.os }}
+    # 45, not 30: the wasm leg now runs the suite on a cold contrib wasmtime
+    # build (the cache key moves with the pin) and builds the guest toolchain.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -76,12 +229,88 @@ jobs:
             IFS='-' read -r module version <<< "${{ matrix.build }}"
           fi
 
-          testpath="test/test_${module}*"
+          # test_app_lifecycle.py is runtime-agnostic: it is parametrized over
+          # every runtime and self-skips the ones this leg did not build, so
+          # each language leg must be told about it explicitly -- the
+          # test_<module>* glob below would otherwise leave the app-process
+          # libunit port/fd lifecycle covered in the python leg only.
+          testpath="test/test_${module}* test/test_app_lifecycle.py"
 
-          # Run all tests for "unit" and "python"
-          # Python is the default module for tests
-          if [ "$module" = "unit" ] || [ "$module" = "python" ]; then
+          # "unit" is the only leg that runs the language-agnostic suite in
+          # one piece; the Python-application tests self-skip there without
+          # the module, and every other test runs as written.
+          if [ "$module" = "unit" ]; then
             testpath="test"
+          fi
+
+          # A Python leg runs its interpreter-specific suites whole -- that is
+          # what the three versions are here for -- and takes a round-robin
+          # share of the rest.  Three versions each running the whole
+          # language-agnostic suite again cost about 12 minutes a leg, twice
+          # any other language, for tests no interpreter distinguishes.  Each
+          # shared file now runs on one Python version instead of three; the
+          # union over the legs is unchanged.
+          #
+          # Both lists are built from the files that exist, never from a glob
+          # handed to pytest.  There is no test_wsgi_*.py -- WSGI is exercised
+          # through the python module in test_python_* -- and an unmatched
+          # pattern survives shell expansion literally, so pytest aborts the
+          # whole leg with "file or directory not found" instead of running the
+          # rest.  `test/test_*.py` is depth 1 while the unit leg runs the whole
+          # `test` tree, so a nested test file would run on unit and on no
+          # python leg; keep the two definitions of "the suite" in step.
+          if [ "$module" = "python" ]; then
+            versions=$(jq -r '.runtimes.python | length' pkg/eol.json)
+            shard=$(jq -r --arg v "${version}" \
+              '[.runtimes.python[].version] | index($v)' pkg/eol.json)
+
+            # A jq miss prints "null" rather than failing, and a non-integer
+            # in either comparison below fails open: the leg would run its
+            # interpreter files, skip every shared one, and still report
+            # green.  Fail loudly instead, like the OpenSSL 4.0 assertion.
+            case "${versions}" in
+              ''|0|*[!0-9]*)
+                echo "::error::no python runtimes in pkg/eol.json" >&2
+                exit 1
+                ;;
+            esac
+
+            case "${shard}" in
+              ''|*[!0-9]*)
+                echo "::error::no shard for python-${version} in pkg/eol.json" >&2
+                exit 1
+                ;;
+            esac
+
+            files=""
+            whole=""
+            i=0
+            for f in $(ls test/test_*.py | sort); do
+              case "$f" in
+                test/test_python*|test/test_asgi*|test/test_wsgi*)
+                  whole="${whole} ${f}"
+                  continue
+                  ;;
+                test/test_app_lifecycle.py)
+                  continue
+                  ;;
+              esac
+
+              if [ $((i % versions)) -eq "$shard" ]; then
+                files="${files} ${f}"
+              fi
+
+              i=$((i + 1))
+            done
+
+            testpath="${files}${whole}"
+
+            # app_lifecycle self-skips unbuilt runtimes, so one Python leg is
+            # enough to carry it; the other language legs still run it as
+            # before.
+            if [ "$shard" -eq 0 ]; then
+              testpath="${testpath} test/test_app_lifecycle.py"
+            fi
           fi
 
           echo "module=${module}" >> "$GITHUB_OUTPUT"
@@ -195,29 +424,29 @@ jobs:
       ## Unit
       ##
 
-      - name: Configure unit
-        # LD_LIBRARY_PATH is set only for this step so that auto/feature
-        # test binaries load OpenSSL 3.6 at runtime.  It is NOT exported
-        # globally — doing so would break sudo (sudoers.so links against
-        # system libssl 3.3 which requires OPENSSL_3.3.0 from libcrypto,
-        # a symbol version that 3.6 does not export in the same slot).
-        env:
-          LD_LIBRARY_PATH: ${{ env.OPENSSL36_LIBDIR }}
-        run: |
-          ./configure \
-            --tests \
-            --openssl \
-            --njs \
-            --zlib \
-            --zstd \
-            --brotli \
-            --otel \
-            --cc-opt="-I${OPENSSL36_INCDIR} -I njs/src/ -I njs/build" \
-            --ld-opt="-L${OPENSSL36_LIBDIR} -Wl,-rpath,${OPENSSL36_LIBDIR} -L njs/build"
+      # The core build comes from the `core` job above: the same configure
+      # flags and the same objects, compiled once for the whole run instead
+      # of once per leg.  Only this leg's own module is built below.
+      - name: Download the core build
+        uses: actions/download-artifact@v8
+        with:
+          name: unit-core-build
+          path: /tmp
 
-      - name: Make unit
+      - name: Unpack the core build
+        # actions/checkout stamps the sources with the time it ran, which is
+        # after the core job built them, so make would judge every core object
+        # out of date and rebuild the very work this job exists to reuse.
+        # Touching the whole build tree to one timestamp fixes that: make
+        # rebuilds on a *newer* prerequisite, and equal mtimes count as up to
+        # date.  Everything under build/ came from this same commit, so there
+        # is no real staleness to mask.
         run: |
-          make -j4 -k || make
+          tar -xzf /tmp/unit-core-build.tar.gz
+          find Makefile build -exec touch {} +
+          test -f build/autoconf.data
+          test -x build/sbin/unitd
+          test -x build/unit_app_test
 
       ##
       ## Go
@@ -244,7 +473,7 @@ jobs:
       ## Java
       ##
 
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '${{ steps.metadata.outputs.version }}'
@@ -252,7 +481,7 @@ jobs:
 
       - name: Configure java
         run: |
-          sudo ./configure java
+          sudo ./configure java --home="$(readlink -f "${JAVA_HOME}")"
         if: steps.metadata.outputs.module == 'java'
 
       - name: Make java
@@ -293,7 +522,8 @@ jobs:
 
       - name: Install libperl-dev
         run: |
-          sudo apt-get install libperl-dev
+          sudo apt-get -y update
+          sudo apt-get -y install libperl-dev
         if: steps.metadata.outputs.module == 'perl'
 
       - name: Configure perl
@@ -318,6 +548,16 @@ jobs:
           update: true
         if: steps.metadata.outputs.module == 'php'
 
+      # Informational.  A package built --with-system-tzdata reports
+      # "Version => 0.system" and reads /usr/share/zoneinfo at request time,
+      # i.e. inside an isolation.rootfs chroot; a bundled-timelib build
+      # reports a real release and never touches the filesystem.  Which one
+      # the runner has decides how test_php_isolation_rootfs behaves.
+      - name: Report php timezone database
+        run: |
+          php -i | grep -i 'timezone database' || true
+        if: steps.metadata.outputs.module == 'php'
+
       - name: Configure php
         run: |
           ./configure php
@@ -337,9 +577,19 @@ jobs:
           python-version: '${{ steps.metadata.outputs.version }}'
         if: steps.metadata.outputs.module == 'python'
 
+      # A second setup-python below installs python-version '3' for pytest and
+      # overwrites pythonLocation with whatever the newest 3.x is.  Record the
+      # matrix interpreter's prefix while it is still the current one.
+      - name: Record python prefix
+        run: |
+          echo "UNIT_PYTHON_PREFIX=${pythonLocation}" >> "$GITHUB_ENV"
+        if: steps.metadata.outputs.module == 'python'
+
       - name: Configure python3
         run: |
-          sudo ./configure python --config=python3-config
+          sudo ./configure python \
+            --config="${UNIT_PYTHON_PREFIX}/bin/python3-config" \
+            --lib-path="${UNIT_PYTHON_PREFIX}/lib"
         if: steps.metadata.outputs.module == 'python'
 
       - name: Make python3
@@ -381,7 +631,13 @@ jobs:
         uses: actions/cache@v6
         with:
           path: pkg/contrib/wasmtime/artifacts
-          key: wasmtime-${{ steps.metadata.outputs.wasmtime_version }}-${{ runner.os }}-${{ runner.arch }}
+          # Every file that decides what gets downloaded, verified and
+          # built, not just the version.  The Makefile matters most: its cmake
+          # flags decide which features the library carries, so without it a
+          # feature change with no version bump would restore the old library
+          # and skip the rebuild, leaving the tests and the audit gate
+          # disagreeing about what was linked.
+          key: wasmtime-${{ steps.metadata.outputs.wasmtime_version }}-${{ hashFiles('pkg/contrib/src/wasmtime/*') }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Make wasmtime
         run: |
@@ -390,12 +646,38 @@ jobs:
 
       - name: Configure wasm
         run: |
-          ./configure wasm --include-path=pkg/contrib/wasmtime/artifacts/include --lib-path=pkg/contrib/wasmtime/artifacts/lib
+          ./configure wasm --rpath --include-path=pkg/contrib/wasmtime/artifacts/include --lib-path=pkg/contrib/wasmtime/artifacts/lib
         if: steps.metadata.outputs.module == 'wasm'
 
       - name: Make wasm
         run: |
           make wasm
+        if: steps.metadata.outputs.module == 'wasm'
+
+      # The guest fixture is compiled at test time from pkg/contrib sources:
+      # wasi-sysroot for wasi-libc and libunit-wasm for the request ABI.
+      - name: Cache wasi-sysroot
+        id: cache-wasi-sysroot
+        if: steps.metadata.outputs.module == 'wasm'
+        uses: actions/cache@v6
+        with:
+          path: |
+            pkg/contrib/wasi-sysroot
+            pkg/contrib/libunit-wasm
+          # Every file that decides what gets downloaded, verified and built,
+          # not just the version: otherwise a checksum or build-rule change
+          # restores the old tree and skips the make below.
+          key: wasi-sysroot-${{ hashFiles('pkg/contrib/src/wasi-sysroot/*', 'pkg/contrib/src/libunit-wasm/*') }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Make wasi-sysroot
+        run: |
+          make -C pkg/contrib .wasi-sysroot libunit-wasm
+        if: steps.metadata.outputs.module == 'wasm' && steps.cache-wasi-sysroot.outputs.cache-hit != 'true'
+
+      - name: Install wasm guest toolchain
+        run: |
+          sudo apt install -y clang lld
+          sudo apt install -y "libclang-rt-$(clang -dumpversion | cut -d. -f1)-dev-wasm32"
         if: steps.metadata.outputs.module == 'wasm'
 
       ##
@@ -420,9 +702,10 @@ jobs:
           ./configure wasm-wasi-component
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
 
+      # bindgen picks clang up from PATH.  The libclang-drift check against
+      # new distribution compilers lives in build-distros.yml.
       - name: Make wasm-wasi-component
         run: |
-          CLANG_PATH=/usr/bin/clang-15 \
           BINDGEN_EXTRA_CLANG_ARGS="-I../../njs/src -I../../njs/build" \
           make wasm-wasi-component
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
@@ -477,16 +760,66 @@ jobs:
         run: |
           sudo apt install -y python3-pytest
 
-        if: steps.metadata.outputs.module != 'wasm'
-
       - name: Run ${{ steps.metadata.outputs.module }} tests
+        # GitHub runners are UTC, where localtime() and gmtime() agree, so a
+        # UTC-only run cannot tell a correct HTTP-date from one rendered in
+        # local time and labelled "GMT" (see test_static_last_modified_is_gmt,
+        # which skips itself, loudly, when the offset is zero).  Kolkata is
+        # +05:30 all year: never UTC, no DST to shift it, and a half-hour
+        # offset that also catches whole-hour assumptions.
+        # "sudo -E" below keeps it for unitd, which inherits pytest's env.
+        env:
+          TZ: Asia/Kolkata
         run: |
-          if [ "${{ matrix.build }}" == "wasm-wasi-component" ]; then
-            pytest-3 --print-log ${{ steps.metadata.outputs.testpath }}
+          # Pin unitd's embedded interpreter to the toolcache prefix it was
+          # built against; conftest turns this into PYTHONHOME for unitd only.
+          if [ "${{ steps.metadata.outputs.module }}" == "python" ]; then
+            export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
+          fi
+          # The wasm legs build their guest fixture as the runner user, so
+          # they run unprivileged to keep the result reachable by pytest; the
+          # others install applications as root.
+          if [ "${{ matrix.build }}" == "wasm-wasi-component" ] || [ "${{ matrix.build }}" == "wasm" ]; then
+            set -o pipefail
+            pytest-3 --print-log ${{ steps.metadata.outputs.testpath }} 2>&1 | tee "$RUNNER_TEMP/pytest.out"
           else
             sudo -E pytest-3 --print-log ${{ steps.metadata.outputs.testpath }}
           fi
-        if: steps.metadata.outputs.module != 'wasm'
+
+      # check_prerequisites() skips the whole file when the clang/wasi-sysroot
+      # fixture cannot be built, so an incomplete toolchain would leave this
+      # leg green while it covers nothing.  At least one smoke test must have
+      # actually passed.
+      - name: Fail if the wasm smoke test skipped
+        if: ${{ !cancelled() && steps.metadata.outputs.module == 'wasm' }}
+        run: |
+          grep -qE 'test_wasm\.py::.*PASSED' "$RUNNER_TEMP/pytest.out" || {
+            echo "no test_wasm.py test passed; the guest toolchain skipped it:" >&2
+            grep -E 'SKIPPED|feature' "$RUNNER_TEMP/pytest.out" >&2 || true
+            exit 1
+          }
+
+      # test_capget_fallback.py needs a unitd that actually calls capget(),
+      # which a root one never does, so every leg above skips it -- the file
+      # is inside "test" but has never once run.  Repeat it here without
+      # sudo.  The python leg is the one chosen because the test drives a
+      # real application to show it inherits the shim harmlessly, and this
+      # leg is where a language module exists.
+      #
+      # pytest-3 is named absolutely: setup-python puts a toolcache bin
+      # directory ahead of /usr/bin for this step and not for the sudo'd one
+      # above, and both must run the pytest that "apt install python3-pytest"
+      # provided.
+      #
+      # !cancelled() rather than the implicit success(): this is the only leg
+      # that ever runs the file, and gating it on the whole sudo'd suite above
+      # would let one unrelated flake silently take that coverage away again --
+      # the very problem this step exists to fix.
+      - name: Run capget fallback tests unprivileged
+        run: |
+          export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
+          /usr/bin/pytest-3 --print-log test/test_capget_fallback.py
+        if: ${{ !cancelled() && steps.metadata.outputs.module == 'python' }}
 
   # C unit-test suite (src/test/ -> build/tests): HTTP parser, port/IPC
   # fault-injection, lvlhsh, mp, rbtree, base64, utf8, clone creds, etc.
@@ -495,6 +828,7 @@ jobs:
   # privilege-sensitive cases (clone creds) work.
   c-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v5
@@ -515,3 +849,125 @@ jobs:
 
       - name: Run libunit close-provenance test
         run: ./build/unit_close_test
+
+      - name: Run libunit port_recv fd-ownership test
+        run: ./build/unit_port_recv_test
+
+  # Same C unit-test suite as c-tests above, built with AddressSanitizer and
+  # run with LeakSanitizer's default ASAN_OPTIONS (detect_leaks is on unless
+  # something turns it off). Separate from sanitize.yml: that workflow runs
+  # unitd itself, a fork-heavy daemon where leak detection is noisy enough
+  # that it is turned off there deliberately (see its "Configure unit"
+  # comment); build/tests is a single non-forking process exercising
+  # nxt_lvlhsh, nxt_mp, the port/IPC fixtures, etc. directly, so a leak here
+  # is a real one in that fixture's own teardown, not daemon-lifecycle noise.
+  # No suppressions file: every known leak was fixed at its allocation site
+  # (test fixtures freeing what they allocated -- lvlhsh buckets, ports,
+  # runtime processes).
+  c-tests-asan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev clang
+
+      - name: Configure unit (ASan+LSan, --tests)
+        run: |
+          ./configure \
+            --cc=clang \
+            --debug \
+            --tests \
+            --cc-opt="-fsanitize=address -fno-omit-frame-pointer -g" \
+            --ld-opt="-fsanitize=address"
+
+      - name: Build C tests
+        run: make -j4 tests
+
+      # sudo for the same reason as c-tests above: the clone creds cases
+      # need real root. Running as root does not disable LeakSanitizer --
+      # this repo's own sandboxed reproduction ran as root throughout.
+      - name: Run C tests
+        run: sudo ./build/tests
+
+  # OpenSSL 4.0 compile gate.  4.0 removed nothing Unit uses, but it deprecated
+  # more of what Unit still calls, and 5.0 is where the deprecated symbols
+  # actually go away -- so the value here is having a leg that fails when a new
+  # deprecation lands, instead of noticing at removal time.  Deliberately cheap:
+  # a build plus the C test suite, no language modules and no pytest run, since
+  # nothing above the TLS layer changes with the OpenSSL version.
+  openssl4:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libpcre2-dev
+
+      - name: Cache OpenSSL 4.0
+        id: cache-openssl4
+        uses: actions/cache@v6
+        with:
+          path: /opt/openssl-4.0
+          key: openssl-${{ env.OPENSSL4_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build OpenSSL 4.0
+        if: steps.cache-openssl4.outputs.cache-hit != 'true'
+        run: |
+          cd /tmp
+          wget -q "https://www.openssl.org/source/openssl-${OPENSSL4_VERSION}.tar.gz"
+          tar -xzf "openssl-${OPENSSL4_VERSION}.tar.gz"
+          cd "openssl-${OPENSSL4_VERSION}"
+          ./Configure --prefix=/opt/openssl-4.0 shared no-docs
+          make -j$(nproc)
+          sudo mkdir -p /opt/openssl-4.0
+          sudo make install_sw
+
+      - name: Set OpenSSL 4.0 build environment
+        # Same isolation as the 3.6 slot: never overwrite the system libraries,
+        # because sudo links against them.
+        run: |
+          OSSL=/opt/openssl-4.0
+          LIBDIR=$( [ -d "$OSSL/lib64" ] && echo "$OSSL/lib64" || echo "$OSSL/lib" )
+          echo "OPENSSL4_INCDIR=${OSSL}/include" >> $GITHUB_ENV
+          echo "OPENSSL4_LIBDIR=${LIBDIR}"        >> $GITHUB_ENV
+
+      - name: Configure unit (--openssl --tests)
+        # LD_LIBRARY_PATH is scoped to this step only so that auto/feature test
+        # binaries load OpenSSL 4.0; exporting it globally would break sudo.
+        # The build itself needs no such help -- -Wl,-rpath below is baked into
+        # the binaries, and is honoured under sudo too.
+        env:
+          LD_LIBRARY_PATH: ${{ env.OPENSSL4_LIBDIR }}
+        run: |
+          ./configure \
+            --tests \
+            --openssl \
+            --cc-opt="-I${OPENSSL4_INCDIR} -DOPENSSL_NO_DEPRECATED" \
+            --ld-opt="-L${OPENSSL4_LIBDIR} -Wl,-rpath,${OPENSSL4_LIBDIR}"
+
+      # Assert rather than print: if the include/lib flags ever stop taking
+      # effect, configure falls back to the runner's system OpenSSL 3.x and the
+      # leg would pass while testing nothing it was added for.
+      - name: Assert configure found OpenSSL 4.0
+        run: |
+          grep NXT_HAVE_OPENSSL_VERSION build/include/nxt_auto_config.h
+          grep -q '#define NXT_HAVE_OPENSSL_VERSION  "OpenSSL 4\.' \
+            build/include/nxt_auto_config.h
+
+      - name: Build unit
+        run: make -j4
+
+      - name: Build C tests
+        run: make -j4 tests
+
+      - name: Run C tests
+        run: sudo ./build/tests

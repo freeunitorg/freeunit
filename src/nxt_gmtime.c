@@ -7,19 +7,44 @@
 #include <nxt_main.h>
 
 
-/* The function is valid for positive nxt_time_t only. */
+/*
+ * The function is valid for any nxt_time_t that lands on a calendar date
+ * from year 1 onward -- that is the whole range of a 32-bit time_t, and
+ * every pre-epoch timestamp a filesystem can hold.
+ */
 
 void
 nxt_gmtime(nxt_time_t s, struct tm *tm)
 {
     nxt_int_t   yday;
     nxt_uint_t  daytime, mday, mon, year, days, leap;
+    nxt_time_t  dayno, secs;
 
-    days = (nxt_uint_t) (s / 86400);
-    daytime = (nxt_uint_t) (s % 86400);
+    dayno = s / 86400;
+    secs = s % 86400;
+
+    if (secs < 0) {
+        /*
+         * C integer division truncates toward zero, but a calendar floors:
+         * for a pre-epoch time the remainder comes out negative and the day
+         * number one too high.
+         */
+        secs += 86400;
+        dayno--;
+    }
+
+    daytime = (nxt_uint_t) secs;
 
     /* January 1, 1970 was Thursday. */
-    tm->tm_wday = (4 + days) % 7;
+    tm->tm_wday = (nxt_int_t) (((dayno + 4) % 7 + 7) % 7);
+
+    /*
+     * A pre-epoch day number wraps when it is made unsigned, but every step
+     * below is modular addition and the result lands back in range, because
+     * the Gauss' formula counts from March 1, 1 BCE and so is positive for
+     * every date this function accepts.
+     */
+    days = (nxt_uint_t) dayno;
 
     /* The algorithm based on Gauss' formula. */
 

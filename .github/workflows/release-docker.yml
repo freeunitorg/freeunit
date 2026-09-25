@@ -51,6 +51,7 @@ jobs:
   # consumed by both `build` and `merge` via fromJSON().
   setup:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.meta.outputs.version }}
       variants: ${{ steps.meta.outputs.variants }}
@@ -84,6 +85,7 @@ jobs:
   build:
     needs: setup
     runs-on: ${{ matrix.arch.runner }}
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
@@ -146,6 +148,7 @@ jobs:
   merge:
     needs: [setup, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: write

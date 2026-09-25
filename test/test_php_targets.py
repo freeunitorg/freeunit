@@ -98,3 +98,63 @@ def test_php_application_targets_error():
     assert 'error' in client.conf_delete(
         'applications/targets/default/root'
     ), 'root remove'
+
+
+def test_php_application_index_nul():
+    # "index" is appended to a directory and handed to open() as a
+    # NUL-terminated C string, so an embedded NUL truncates the name at the
+    # sink.  This validator is shared with the static "share" action
+    # (test_static.py::test_static_index_nul); here it is exercised on both
+    # PHP schemas that attach it: a target's "index" and the top-level
+    # "index" used without targets.  "spare": 0 validates the configuration
+    # without spawning a PHP worker.
+    root = f"{option.test_dir}/php/targets"
+
+    def conf_targets_index(index):
+        return client.conf(
+            {
+                "listeners": {"*:8080": {"pass": "applications/targets"}},
+                "applications": {
+                    "targets": {
+                        "type": client.get_application_type(),
+                        "processes": {"spare": 0},
+                        "targets": {
+                            "default": {"index": index, "root": root},
+                        },
+                    }
+                },
+            }
+        )
+
+    def conf_notargets_index(index):
+        return client.conf(
+            {
+                "listeners": {"*:8080": {"pass": "applications/notargets"}},
+                "applications": {
+                    "notargets": {
+                        "type": client.get_application_type(),
+                        "processes": {"spare": 0},
+                        "root": root,
+                        "index": index,
+                    }
+                },
+            }
+        )
+
+    resp = conf_targets_index("index\0.php")
+    assert (
+        'must not contain null character' in resp.get('detail', '')
+    ), 'targets index with null character'
+
+    assert 'success' in conf_targets_index(
+        "index.php"
+    ), 'clean targets index still accepted'
+
+    resp = conf_notargets_index("index\0.php")
+    assert (
+        'must not contain null character' in resp.get('detail', '')
+    ), 'notargets index with null character'
+
+    assert 'success' in conf_notargets_index(
+        "index.php"
+    ), 'clean notargets index still accepted'

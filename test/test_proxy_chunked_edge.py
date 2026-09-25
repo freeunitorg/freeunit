@@ -104,17 +104,6 @@ def test_proxy_chunked_ext():
 
 
 @_skipif_no_fake_upstream
-@pytest.mark.xfail(
-    reason=(
-        'Suspected bug: FreeUnit aborts the relay of a chunked upstream '
-        'response that carries a trailer section after the terminal 0-chunk. '
-        'The client gets a truncated body (observed racy on CI: 0 or 1 of the '
-        '2 chunks delivered before the connection closes), whereas chunked-ext '
-        '(same body, no trailer) relays intact. Trailers are legal HTTP/1.1 '
-        '(RFC 7230 4.1.2). See freeunitorg/freeunit#106.'
-    ),
-    strict=False,
-)
 def test_proxy_chunked_trailer():
     proc = _run(UPSTREAM_CHUNKED_TRAILER_PORT, 'chunked-trailer')
     try:

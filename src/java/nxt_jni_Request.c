@@ -597,27 +597,12 @@ nxt_java_Request_getScheme(JNIEnv *env, jclass cls, jlong req_ptr)
 static jstring JNICALL
 nxt_java_Request_getServerName(JNIEnv *env, jclass cls, jlong req_ptr)
 {
-    char                *host, *colon;
-    nxt_unit_field_t    *f;
     nxt_unit_request_t  *r;
 
     r = nxt_jlong2ptr(req_ptr);
 
-    f = nxt_java_findHeader(r->fields, r->fields + r->fields_count,
-                            "Host", 4);
-    if (f != NULL) {
-        host = nxt_unit_sptr_get(&f->value);
-
-        colon = memchr(host, ':', f->value_length);
-
-        if (colon == NULL) {
-            colon = host + f->value_length;
-        }
-
-        return nxt_java_newString(env, host, colon - host);
-    }
-
-    return nxt_java_Request_getLocalName(env, cls, req_ptr);
+    return nxt_java_newString(env, nxt_unit_sptr_get(&r->server_name),
+                              r->server_name_length);
 }
 
 

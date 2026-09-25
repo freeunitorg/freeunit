@@ -421,6 +421,151 @@ def test_access_log_json_literal(wait_for_record):
     check_literal('JSON')
 
 
+def _read_log_lines():
+    with open(
+        f'{option.temp_dir}/access.log', 'r', encoding='utf-8', errors='strict'
+    ) as f:
+        return [ln for ln in f.read().splitlines() if ln]
+
+
+def test_access_log_text_escape(wait_for_record):
+    load('empty')
+
+    # A percent-encoded CRLF in the target reaches "$uri" decoded, so without
+    # escaping these bytes end the record and start one the client wrote.
+    set_format('$remote_addr "$uri" $status')
+
+    assert (
+        client.get(url='/%0d%0a1.2.3.4 "GET /forged" 200')['status'] == 200
+    )
+    assert wait_for_record(r'\\x0D\\x0A', 'access.log') is not None
+
+    lines = _read_log_lines()
+
+    assert len(lines) == 1, 'one request, one record'
+    assert '\\x0D\\x0A' in lines[0], 'the CRLF is escaped, not written'
+    assert '\\x22GET /forged\\x22 200' in lines[0], 'the quotes are escaped too'
+
+
+def test_access_log_text_escape_leaves_the_format_alone(wait_for_record):
+    load('empty')
+
+    # The operator's own format text is not a value and is written as it is;
+    # only what a variable expands to is escaped.
+    set_format('start\t"$uri"\tend')
+
+    assert client.get(url='/ok')['status'] == 200
+    assert wait_for_record(r'start', 'access.log') is not None
+
+    line = _read_log_lines()[-1]
+
+    assert line == 'start\t"/ok"\tend', 'tabs in the format survive'
+
+
+def test_access_log_text_escape_njs(require, wait_for_record):
+    require({'modules': {'njs': 'any'}})
+
+    load('empty')
+
+    # An njs format produces the whole record, so all of it is escaped --
+    # the quotes written here included.  The client's CRLF must not reach the
+    # file, and the record must be exactly as long as it claims: the newline
+    # it ends with is appended inside the generated function, so a length that
+    # counted the flag bit instead of a 0/1 would report pool memory past the
+    # end of the record.
+    set_format('`${vars.remote_addr} "${vars.uri}"`')
+
+    assert client.get(url='/%0d%0aFORGED')['status'] == 200
+    assert wait_for_record(r'FORGED', 'access.log') is not None
+
+    # On the raw bytes, not on split lines: three stray bytes that happened to
+    # be newlines would vanish into a line split and the record would still
+    # look right.
+    with open(f'{option.temp_dir}/access.log', 'rb') as f:
+        raw = f.read()
+
+    assert (
+        raw == b'127.0.0.1 \\x22/\\x0D\\x0AFORGED\\x22\n'
+    ), 'one record, one newline, nothing after'
+
+
+def test_access_log_object_escape(wait_for_record):
+    load('empty')
+
+    # Every character below is significant inside a JSON string: the first
+    # chunk closes the "ua" member and opens a forged one, then come a bare
+    # quote, a backslash, a control character (HTAB is legal in a field
+    # value) and a multi-byte UTF-8 sequence.
+    evil = '", "injected": "1 " \\ \t \u00e9'
+
+    set_format({'status': '$status', 'ua': '$header_user_agent'})
+
+    assert (
+        client.get(
+            headers={
+                'Host': 'localhost',
+                'User-Agent': evil,
+                'Connection': 'close',
+            }
+        )['status']
+        == 200
+    )
+    assert wait_for_record(r'"status":"200"', 'access.log') is not None
+
+    line = _read_log_lines()[-1]
+
+    record = json.loads(line)
+
+    assert list(record.keys()) == ['status', 'ua'], 'no injected members'
+    assert record['status'] == '200'
+    assert record['ua'] == evil, 'value round-trips'
+
+
+def test_access_log_object_escape_is_not_the_text_escape(wait_for_record):
+    load('empty')
+
+    # The other half of the split: the object format escapes as JSON and must
+    # not also take the text format's escaping, or a reader would get "\x0D"
+    # where JSON says "\r" and the member would no longer round-trip.
+    set_format({'uri': '$uri', 'status': '$status'})
+
+    assert client.get(url='/%0d%0aFORGED')['status'] == 200
+    assert wait_for_record(r'FORGED', 'access.log') is not None
+
+    record = json.loads(_read_log_lines()[-1])
+
+    assert record['uri'] == '/\r\nFORGED', 'the bytes round-trip through JSON'
+    assert '\\x0D' not in record['uri'], 'not escaped twice'
+
+
+def test_access_log_object_escape_njs(require, wait_for_record):
+    require({'modules': {'njs': 'any'}})
+
+    load('empty')
+
+    evil = '", "injected": "1 " \\ \t \u00e9'
+
+    set_format({'uri': '`${vars.uri}`', 'ua': '$header_user_agent'})
+
+    assert (
+        client.get(
+            headers={
+                'Host': 'localhost',
+                'User-Agent': evil,
+                'Connection': 'close',
+            }
+        )['status']
+        == 200
+    )
+    assert wait_for_record(r'"uri":"/"', 'access.log') is not None
+
+    record = json.loads(_read_log_lines()[-1])
+
+    assert list(record.keys()) == ['uri', 'ua'], 'no injected members'
+    assert record['uri'] == '/'
+    assert record['ua'] == evil, 'value round-trips'
+
+
 def test_access_log_variables(wait_for_record):
     load('mirror')
 

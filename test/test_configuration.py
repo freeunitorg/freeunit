@@ -1,8 +1,11 @@
+import re
 import socket
+import time
 
 import pytest
 
 from unit.control import Control
+from unit.log import Log
 
 prerequisites = {'modules': {'python': 'any'}}
 
@@ -50,6 +53,62 @@ def test_json_unicode():
             "module": "wsgi",
         }
     }, 'unicode get'
+
+
+def test_json_utf8_invalid_value():
+    # A configuration string is JSON text and JSON text is UTF-8 (RFC 8259
+    # Sect. 8.1).  Bytes that begin no valid sequence used to be stored and
+    # echoed back, which made GET /config undecodable.
+    resp = client.conf(
+        b'{"listeners": {"*:8080": {"pass": "routes"}},'
+        b' "routes": [{"match": {"headers": {"X-T": "caf\xff\xfe"}},'
+        b' "action": {"return": 200}}]}'
+    )
+
+    assert 'error' in resp, 'invalid utf-8 value rejected'
+    assert 'UTF-8' in resp['detail'], 'reason given'
+    assert (
+        resp['location']['path'] == '/routes/0/match/headers/X-T'
+    ), 'pointer names the value'
+
+
+def test_json_utf8_invalid_member_name():
+    resp = client.conf(
+        b'{"listeners": {"*:8080": {"pass": "routes"}},'
+        b' "routes": [{"match": {"headers": {"X-\xff": "v"}},'
+        b' "action": {"return": 200}}]}'
+    )
+
+    assert 'error' in resp, 'invalid utf-8 member name rejected'
+    assert 'member name' in resp['detail'], 'name named as the culprit'
+
+    # The pointer is echoed in this very response, so it must point at the
+    # object holding the bad name rather than embed the name itself --
+    # otherwise the error report is unreadable for the reason it reports.
+    assert (
+        resp['location']['path'] == '/routes/0/match/headers'
+    ), 'pointer stops at the parent'
+
+
+def test_json_utf8_valid():
+    # Multi-byte UTF-8 is not affected: it must round-trip byte for byte.
+    value = 'caf\u00e9-\U0001f600-\u043d'
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "routes"}},
+            "routes": [
+                {
+                    "match": {"headers": {"X-T": value}},
+                    "action": {"return": 200},
+                }
+            ],
+        }
+    ), 'valid utf-8 accepted'
+
+    assert (
+        client.conf_get('routes/0/match/headers/X-T') == value
+    ), 'valid utf-8 round-trips unchanged'
 
 
 def test_json_unicode_2():
@@ -333,7 +392,6 @@ def test_listeners_addr_error_2(skip_alert):
 
 def test_listeners_port_release():
     for _ in range(10):
-        fail = False
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
@@ -346,17 +404,114 @@ def test_listeners_port_release():
 
             resp = client.conf({"listeners": {}, "applications": {}})
 
-            try:
-                s.bind(('127.0.0.1', 8080))
-                s.listen()
+            # The router closes the listening descriptor before it
+            # acknowledges the removal, but close(2) only drops the closing
+            # thread's reference to the open file.  Every other router
+            # thread that had the descriptor armed for accept(2) may still
+            # hold a transient kernel reference to it, and the address
+            # leaves the bind hash only when the last one is dropped, which
+            # happens asynchronously.  A client therefore has to retry, so
+            # the test retries too; a listener that is genuinely never
+            # closed still fails here.
+            deadline = time.monotonic() + 5
 
-            except OSError:
-                fail = True
+            while True:
+                try:
+                    s.bind(('127.0.0.1', 8080))
+                    s.listen()
+                    break
 
-            if fail:
-                pytest.fail('cannot bind or listen to the address')
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        pytest.fail('cannot bind or listen to the address')
+
+                    time.sleep(0.01)
 
             assert 'success' in resp, 'port release'
+
+
+def test_listeners_close_before_reply(findall):
+    assert 'success' in client.conf(
+        {
+            "listeners": {"127.0.0.1:8080": {"pass": "routes"}},
+            "routes": [],
+        }
+    ), 'listener added'
+
+    # The markers below are all nxt_debug(), so a release build cannot
+    # observe this at all.  There is no build flag in option.available,
+    # so ask the log: skipping is the only honest outcome here, passing
+    # would be a test that cannot fail.
+    if not findall(r'\[debug\]'):
+        pytest.skip('needs a build configured with --debug')
+
+    # Remember where the log ends before the removal.  The tail already
+    # holds a "controller conn write" for the request above, and the
+    # ordering is read off positions in a single read of what follows:
+    # two independent waits could each succeed with the order between
+    # them wrong.
+    pos = len(Log.read())
+
+    assert 'success' in client.conf(
+        {"listeners": {}, "applications": {}}
+    ), 'listener removed'
+
+    # The reply is the barrier that makes the tail complete rather than
+    # something the assertions below compare against: it is written only
+    # after every engine has acknowledged, and every engine writes its
+    # own records before it acknowledges.
+    deadline = time.monotonic() + 15
+
+    while True:
+        tail = Log.read()[pos:]
+
+        if 'controller conn write complete' in tail:
+            break
+
+        if time.monotonic() >= deadline:
+            pytest.fail('the controller did not reply')
+
+        time.sleep(0.01)
+
+    # One record per engine, so with listen_threads > 1 there are
+    # several of each.  Comparing the last of one with the last of the
+    # other is what makes the assertion independent of how the engines
+    # interleave: an engine acknowledges after it has finished closing,
+    # so the latest acknowledgement is later than every close; an engine
+    # that acknowledged first would put the latest close after every
+    # acknowledgement instead.
+    finish = list(
+        re.finditer(
+            r'\[debug\] (\d+)#\d+ .*listen socket close finish: (\d+)',
+            tail,
+        )
+    )
+    ack = list(re.finditer(r'listen socket close acknowledged', tail))
+
+    assert finish, 'listener closed'
+    assert ack, 'removal acknowledged'
+
+    assert finish[-1].start() < ack[-1].start(), 'phase 2 before ack'
+
+    # The one that has to hold: "close finish" is written on entry to
+    # nxt_router_listen_socket_close_finish(), before the descriptor is
+    # released, so the check above cannot see an acknowledgement moved
+    # back above nxt_router_listen_socket_release() inside that function
+    # -- the position #276 moved it out of.  The close(2) of the
+    # descriptor is written by the same engine that then acknowledges,
+    # so anchoring on it covers both positions.
+    #
+    # Match the router's pid: the controller writes "socket close(N)"
+    # for its own connection after every reply, and fd numbers collide
+    # across processes.
+    pid, fd = finish[-1].group(1), finish[-1].group(2)
+    closed = re.search(
+        rf'\[debug\] {pid}#\d+ (\*\d+ )?socket close\({fd}\)', tail
+    )
+
+    assert closed is not None, 'descriptor closed'
+
+    assert closed.start() < ack[-1].start(), 'closed before ack'
 
 
 def test_json_application_name_large():

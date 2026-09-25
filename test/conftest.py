@@ -253,6 +253,14 @@ def run(request):
 
     if not option.restart:
         _clear_conf(log=log)
+
+        # Workers must be gone before their files are.  _clear_conf() returns
+        # on the controller's ack, but the router quits workers asynchronously,
+        # and a java one still in scanClasses() keeps reading temp_dir.
+        # Only wait here: the identity asserts belong after _check_fds(),
+        # which is what refreshes the router/controller pids a respawn test
+        # has changed.
+        _wait_for_processes()
         _clear_temp_dir()
 
     # check descriptors
@@ -262,6 +270,15 @@ def run(request):
     # check processes id's and amount
 
     _check_processes()
+
+    # Teardown logs too, after the snapshot at the top of this fixture, so
+    # read again or those lines are charged to the next test.  Not under
+    # --restart: it stops unitd and may have deleted the log with temp_dir.
+
+    if not option.restart:
+        with Log.open() as f:
+            log += f.read()
+            Log.set_pos(f.tell())
 
     # print unit.log in case of error
 
@@ -476,6 +493,17 @@ def unit_run(state_dir=None):
     option.temp_dir = temporary_dir
     public_dir(temporary_dir)
 
+    # Every start gets a fresh temp dir and therefore a fresh, empty
+    # unit.log, so the read offsets recorded against the previous one are
+    # meaningless here.  Teardown saves that offset unconditionally and only
+    # resets it when it removes the temp dir, which --save-log stops it from
+    # doing: without this, a --save-log --restart run seeks each test's reads
+    # to the size of the PREVIOUS test's log.  Everything log-based then sees
+    # a tail slice or nothing at all -- Log.wait_for_record misses records
+    # that are present, and, worse silently, the teardown Log.check_alerts()
+    # and _check_fds() stop examining most of what they are given.
+    Log.pos.clear()
+
     if oct(stat.S_IMODE(Path(builddir).stat().st_mode)) != '0o777':
         public_dir(builddir)
 
@@ -510,7 +538,22 @@ def unit_run(state_dir=None):
         # router, app workers) shares one group we can signal as a unit — and
         # which can never be confused with the pytest runner's own group or an
         # unrelated unitd already running on the box.
-        p = subprocess.Popen(unitd_args, stderr=log, start_new_session=True)
+        # UNIT_PYTHONHOME pins the embedded interpreter's stdlib to the
+        # prefix unit's python module was built against.  It cannot be passed
+        # as PYTHONHOME from outside: unitd inherits this process's
+        # environment, and PYTHONHOME here would also rebind pytest's own
+        # interpreter, dropping dist-packages (where pytest itself lives) from
+        # its sys.path.  Needed when unit is built against a non-system
+        # interpreter whose minor version matches the system one, because
+        # CPython then resolves its prefix by finding "python3" on PATH.
+        unitd_env = os.environ.copy()
+        pythonhome = unitd_env.pop('UNIT_PYTHONHOME', None)
+        if pythonhome:
+            unitd_env['PYTHONHOME'] = pythonhome
+
+        p = subprocess.Popen(
+            unitd_args, stderr=log, start_new_session=True, env=unitd_env
+        )
         unit_instance['process'] = p
 
     # Record the group id (== leader pid) immediately, on disk and in-memory,
@@ -730,9 +773,7 @@ def _clear_temp_dir():
                         time.sleep(1)
 
 
-def _check_processes():
-    router_pid = _fds_info['router']['pid']
-    controller_pid = _fds_info['controller']['pid']
+def _wait_for_processes():
     main_pid = unit_instance['pid']
 
     for _ in range(600):
@@ -752,6 +793,16 @@ def _check_processes():
             break
 
         time.sleep(0.1)
+
+    return out
+
+
+def _check_processes():
+    router_pid = _fds_info['router']['pid']
+    controller_pid = _fds_info['controller']['pid']
+    main_pid = unit_instance['pid']
+
+    out = _wait_for_processes()
 
     if option.restart:
         assert len(out) == 0, 'all termimated'

@@ -74,8 +74,12 @@ struct signalfd_siginfo {
     uint64_t           ssi_stime;   /* System CPU time consumed (SIGCHLD) */
     uint64_t           ssi_addr;    /* Address that generated signal
                                        (for hardware-generated signals) */
-    uint8_t            pad[8];      /* Pad size to 128 bytes (allow for
-                                       additional fields in the future) */
+    uint8_t            pad[8];      /* Padding; the real kernel struct pads
+                                       to 128 bytes, but the exact size does
+                                       not matter here since this is a
+                                       syntax-check-only stub for non-Linux
+                                       test builds, never used for a real
+                                       signalfd(2) read */
 };
 
 

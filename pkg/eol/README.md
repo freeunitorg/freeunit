@@ -32,27 +32,29 @@ Exit codes: `0` = clean or warnings only · `1` = errors found (drift, expiry, o
 
 Errors include the **expiry gate**: any runtime or OS entry whose `supported_until` is already in the past (EOL + grace elapsed) is a hard error and must be dropped from `pkg/eol.json`.
 
-## Current EOL Status (2026-07-13)
+## Current EOL Status (2026-09-08)
 
 All dates verified against endoflife.date API. No errors. Warnings below are proximity/past-EOL alerts only — every entry is still inside its grace window.
 
+Dates are compared per category against the field that carries *standard* support: `support` for Debian (its `eol` became the end of LTS in September 2026), `eol` for everything else.
+
 ### Runtimes — warnings
 
-None. All shipped runtimes are within (or ahead of) upstream EOL; `node 20` is already flagged `(EOL)` in the matrix.
+None. All shipped runtimes are within (or ahead of) upstream EOL; `go 1.25`, `node 20` and `perl 5.38` are already flagged `(EOL)` in the matrix.
 
 ### OS — warnings
 
 | Entry | Note |
 |-------|------|
 | debian 11 | Past EOL (2024-08), grace until 2027-08 |
-| fedora 40, 41, 42 | Past EOL (2025-05 / 2025-12 / 2026-05), grace active |
+| fedora 40, 41, 42 | Past EOL (2025-05 / 2025-12 / 2026-05), grace until 2028-05 / 2028-12 / 2029-05 |
 | amazonlinux 2 | Past EOL (2026-06), grace until 2029-06 |
 | alpine 3.20 | Past EOL (2026-04), grace until 2029-04 |
-| debian 12 | EOL now (2026-07), grace until 2029-07 |
-| fedora 43, 44 | EOL in ~5 / ~11 months |
-| alpine 3.21, 3.22 | EOL in ~4 / ~10 months |
-| centos_stream 9 | EOL in ~10 months (2027-05) |
-| ubuntu 22.04 | EOL in ~9 months (2027-04) |
+| debian 12 | Past EOL (2026-07), grace until 2029-07 |
+| fedora 43, 44 | EOL in ~3 / ~9 months |
+| alpine 3.21, 3.22 | EOL in ~2 / ~8 months |
+| centos_stream 9 | EOL in ~8 months (2027-05) |
+| ubuntu 22.04 | EOL in ~9 months (2027-06) |
 
 ## Architecture
 

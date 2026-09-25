@@ -62,10 +62,48 @@ static void nxt_main_process_whoami_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static void nxt_main_port_conf_store_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
-static nxt_int_t nxt_main_file_store(nxt_task_t *task, const char *tmp_name,
-    const char *name, u_char *buf, size_t size);
+static nxt_int_t nxt_main_file_store(nxt_task_t *task, const char *dir,
+    const char *tmp_name, const char *name, u_char *buf, size_t size);
+static nxt_int_t nxt_main_file_store_inherit(nxt_task_t *task,
+    nxt_file_t *tmp, const char *name);
 static void nxt_main_port_access_log_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
+
+#if (NXT_TESTS)
+static nxt_uint_t  nxt_main_test_process_new_failure_count;
+
+
+void
+nxt_main_test_process_new_failures(nxt_uint_t failures)
+{
+    nxt_main_test_process_new_failure_count = failures;
+}
+
+
+/*
+ * nxt_process_new() with an allocation-failure hook in front of it, in the
+ * shape of nxt_port_test_msg_alloc_failures() (src/nxt_port_socket.c): the
+ * count is decremented per call, so one armed failure fires once and the
+ * handler then behaves exactly as it does when the process record cannot
+ * be allocated.  The wrapper stands in front of the call rather than in
+ * place of the branch that follows it, so the code the test reaches stays
+ * the handler's own -- however this file happens to spell its response to
+ * a NULL process.
+ */
+nxt_inline nxt_process_t *
+nxt_main_process_new(nxt_runtime_t *rt)
+{
+    if (nxt_slow_path(nxt_main_test_process_new_failure_count != 0)) {
+        nxt_main_test_process_new_failure_count--;
+        return NULL;
+    }
+
+    return nxt_process_new(rt);
+}
+
+#else
+#define nxt_main_process_new(rt)  nxt_process_new(rt)
+#endif
 
 const nxt_sig_event_t  nxt_main_process_signals[] = {
     nxt_event_signal(SIGHUP,  nxt_main_process_signal_handler),
@@ -173,6 +211,12 @@ static nxt_conf_map_t  nxt_common_app_limits_conf[] = {
         nxt_string("requests"),
         NXT_CONF_MAP_INT32,
         offsetof(nxt_common_app_conf_t, request_limit),
+    },
+
+    {
+        nxt_string("start_timeout"),
+        NXT_CONF_MAP_MSEC,
+        offsetof(nxt_common_app_conf_t, start_timeout),
     },
 
 };
@@ -388,6 +432,11 @@ static nxt_conf_map_t  nxt_wasm_wc_app_conf[] = {
         NXT_CONF_MAP_PTR,
         offsetof(nxt_common_app_conf_t, u.wasm_wc.access),
     },
+    {
+        nxt_string("execution_timeout"),
+        NXT_CONF_MAP_MSEC,
+        offsetof(nxt_common_app_conf_t, u.wasm_wc.execution_timeout),
+    },
 };
 
 
@@ -425,15 +474,34 @@ nxt_main_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         && port->type == NXT_PROCESS_APP
         && msg->fd[1] != -1)
     {
-        mem = nxt_mem_mmap(NULL, sizeof(nxt_port_queue_t),
-                           PROT_READ | PROT_WRITE, MAP_SHARED, msg->fd[1], 0);
-        if (nxt_fast_path(mem != MAP_FAILED)) {
-            port->queue = mem;
-        }
+        mem = nxt_port_queue_mmap(task, msg->fd[1], sizeof(nxt_port_queue_t));
 
-        nxt_fd_close(msg->fd[1]);
-        msg->fd[1] = -1;
+        if (nxt_fast_path(mem != NULL)) {
+            port->queue = mem;
+
+        } else {
+            /*
+             * Not a fallback to the socket: a libunit process delivers a
+             * socket message only after dequeuing the READ_SOCKET marker
+             * that only a queue-holding sender emits, so everything main
+             * sends on this port -- CHANGE_FILE on log rotation, QUIT on
+             * shutdown -- would be suspended undelivered, and the second
+             * message fails the worker's context.  See issue #231.
+             */
+            nxt_alert(task, "cannot map the queue of port %PI:%d; the "
+                      "process cannot be reached on this port from main",
+                      port->pid, (int) port->id);
+        }
     }
+
+    /*
+     * nxt_port_new_port_handler() leaves the queue descriptor to its caller,
+     * and only a new application port has a use for it here.  Anything else
+     * -- a port that already existed, a port that could not be created, a
+     * type whose queue main never maps -- used to keep the descriptor open
+     * in the most privileged process of all.
+     */
+    nxt_port_recv_msg_close_fds(msg);
 }
 
 
@@ -454,28 +522,41 @@ nxt_main_start_process_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     rt = task->thread->runtime;
 
+    /*
+     * Every exit below the fork() is either the successful one, which lets
+     * the new process answer for itself, or "failed:", which answers for it.
+     * Nothing may leave this handler in between: START_PROCESS carries the
+     * stream of an RPC the router has already armed
+     * (nxt_router_start_app_process_handler()), and only a reply retires it.
+     * A silent return leaves that RPC outstanding forever -- neither
+     * nxt_router_app_port_ready() nor nxt_router_app_port_error() ever runs,
+     * so app->proto_port_requests is never cleared, every later start for
+     * the application parks on the prototype that is not coming, and the
+     * requests waiting on it are never failed.  See issue #257.
+     */
+    process = NULL;
+
     port = rt->port_by_type[NXT_PROCESS_ROUTER];
     if (nxt_slow_path(port == NULL)) {
         nxt_alert(task, "router port not found");
-        goto close_fds;
+        goto failed;
     }
 
     if (nxt_slow_path(port->pid != nxt_recv_msg_cmsg_pid(msg))) {
         nxt_alert(task, "process %PI cannot start processes",
                   nxt_recv_msg_cmsg_pid(msg));
 
-        goto close_fds;
+        goto failed;
     }
 
-    process = nxt_process_new(rt);
+    process = nxt_main_process_new(rt);
     if (nxt_slow_path(process == NULL)) {
-        goto close_fds;
+        goto failed;
     }
 
     process->mem_pool = nxt_mp_create(1024, 128, 256, 32);
     if (process->mem_pool == NULL) {
-        nxt_process_use(task, process, -1);
-        goto close_fds;
+        goto failed;
     }
 
     process->parent_port = rt->port_by_type[NXT_PROCESS_MAIN];
@@ -603,17 +684,41 @@ nxt_main_start_process_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
 failed:
 
-    nxt_process_use(task, process, -1);
+    if (process != NULL) {
+        nxt_process_use(task, process, -1);
+    }
 
-    port = nxt_runtime_port_find(rt, msg->port_msg.pid,
+    /*
+     * Answer on the port of the process the kernel says sent this, not the
+     * one the message claims to come from: msg->port_msg.pid is filled in by
+     * the sender (nxt_port_socket_write2()) and is not authenticated, and
+     * the two branches above now reach this reply before the router identity
+     * check has run -- or after it has failed.  Keyed on the credential, the
+     * RPC_ERROR can only ever retire an RPC of the sender's own, so a worker
+     * that forges a START_PROCESS cannot use main to cancel a stream of the
+     * router's choosing.  For a legitimate sender the two pids are equal,
+     * because nxt_port_socket_write2() sets port_msg.pid to its own nxt_pid;
+     * where SCM_CREDENTIALS is unavailable nxt_recv_msg_cmsg_pid() is
+     * defined as port_msg.pid, so the lookup is unchanged there.
+     */
+    port = nxt_runtime_port_find(rt, nxt_recv_msg_cmsg_pid(msg),
                                  msg->port_msg.reply_port);
 
     if (nxt_fast_path(port != NULL)) {
-        nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
-                              -1, msg->port_msg.stream, 0, NULL);
-    }
+        (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
+                                     -1, msg->port_msg.stream, 0, NULL);
 
-close_fds:
+    } else {
+        /*
+         * Nothing to answer on: the sender is gone, or never had the port it
+         * named.  A dead sender's RPCs die with it, so this is only worth a
+         * diagnostic -- but a silent drop here is exactly the shape of the
+         * defect above, so it is not left silent.
+         */
+        nxt_alert(task, "cannot report a failed start back: reply port %d of "
+                  "process %PI not found", (int) msg->port_msg.reply_port,
+                  nxt_recv_msg_cmsg_pid(msg));
+    }
 
     nxt_fd_close(msg->fd[0]);
     msg->fd[0] = -1;
@@ -621,6 +726,39 @@ close_fds:
     nxt_fd_close(msg->fd[1]);
     msg->fd[1] = -1;
 }
+
+
+#if (NXT_TESTS)
+
+/*
+ * Public wrapper that lets src/test/nxt_main_start_process_reply_test.c
+ * invoke the static nxt_main_start_process_handler() directly with a
+ * synthesised runtime and message -- used to verify that every exit above
+ * the fork() answers the router's START_PROCESS RPC instead of returning
+ * silently and stranding it (issue #257).
+ */
+void
+nxt_main_test_run_start_process_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg)
+{
+    nxt_main_start_process_handler(task, msg);
+}
+
+
+/*
+ * Public wrapper that lets src/test/nxt_main_file_store_test.c drive the
+ * static nxt_main_file_store() against a scratch directory -- used to
+ * verify that the store is atomic and never damages the existing file
+ * (issue #215).
+ */
+nxt_int_t
+nxt_main_test_run_file_store(nxt_task_t *task, const char *dir,
+    const char *tmp_name, const char *name, u_char *buf, size_t size)
+{
+    return nxt_main_file_store(task, dir, tmp_name, name, buf, size);
+}
+
+#endif
 
 
 static void
@@ -740,6 +878,14 @@ nxt_main_process_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     rt = task->thread->runtime;
 
+    /*
+     * Unreferenced: the main process runs a single engine.  That matters
+     * here specifically because the result outlives the call -- it is
+     * linked into pprocess->children below, a weak link cleaned up in
+     * nxt_runtime_process_free().  With one engine nothing can drop the
+     * last reference concurrently, so the link cannot outlive the process.
+     */
+
     pprocess = nxt_runtime_process_find(rt, ppid);
     if (nxt_slow_path(pprocess == NULL)) {
         nxt_alert(task, "whoami: parent process %PI not found", ppid);
@@ -789,14 +935,25 @@ nxt_main_process_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     buf->mem.free = nxt_cpymem(buf->mem.free, &pid, sizeof(nxt_pid_t));
 
-    (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_READY_LAST, -1,
-                                 msg->port_msg.stream, 0, buf);
+    if (nxt_slow_path(nxt_port_socket_write(task, port,
+                                            NXT_PORT_MSG_RPC_READY_LAST, -1,
+                                            msg->port_msg.stream, 0, buf)
+                      != NXT_OK))
+    {
+        /* Still ours: the port layer takes the buffer only on NXT_OK. */
+
+        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                           buf->completion_handler, task, buf, buf->parent);
+    }
 
 fail:
 
-    if (msg->fd[0] != -1) {
-        nxt_fd_close(msg->fd[0]);
-    }
+    /*
+     * Close both descriptors: WHOAMI carries one, but a compromised sender
+     * can attach a second to any message, and leaving it open here would
+     * leak a descriptor of the main process on every forged message.
+     */
+    nxt_port_recv_msg_close_fds(msg);
 }
 
 
@@ -1060,14 +1217,30 @@ nxt_main_process_sigchld_handler(nxt_task_t *task, void *obj, void *data)
                       pid, WEXITSTATUS(status));
         }
 
+        /*
+         * Unreferenced: the main process runs a single engine.  That
+         * matters here specifically because nxt_process_close_ports()
+         * below takes its own +1/-1 around the port loop, which on a
+         * process already at zero would be a second drop to zero and so a
+         * second teardown -- the defect fixed in nxt_port_remove_pid().
+         * With one engine, find() returning non-NULL implies use_count >= 1
+         * for the whole handler.
+         */
+
         process = nxt_runtime_process_find(rt, pid);
 
         if (process != NULL) {
             nxt_main_process_cleanup(task, process);
 
-            if (process->state == NXT_PROCESS_STATE_READY) {
-                process->stream = 0;
-            }
+            /*
+             * ->stream is no longer cleared here.  It is cleared where the
+             * start RPC is actually answered -- on a successful NEW_PORT
+             * announcement in nxt_port_process_ready_handler() -- which is
+             * both earlier and narrower: the READY state is set before that
+             * announcement is written, so clearing on the state dropped the
+             * REMOVE_PID fallback for a start whose reply never went out.
+             * See issue #271.
+             */
 
             nxt_queue_init(&children);
 
@@ -1573,11 +1746,15 @@ nxt_main_port_modules_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     conf = nxt_conf_json_parse(mp, b->mem.pos, b->mem.free, NULL);
     if (conf == NULL) {
+        nxt_alert(task, "discovery message is not valid JSON; "
+                        "no application modules will be available");
         goto fail;
     }
 
     root = nxt_conf_get_path(conf, &root_path);
     if (root == NULL) {
+        nxt_alert(task, "discovery message has no module list; "
+                        "no application modules will be available");
         goto fail;
     }
 
@@ -1589,6 +1766,7 @@ nxt_main_port_modules_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
         lang = nxt_array_zero_add(rt->languages);
         if (lang == NULL) {
+            nxt_alert(task, "failed to record the module at index %uD", index);
             goto fail;
         }
 
@@ -1598,6 +1776,8 @@ nxt_main_port_modules_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
                                   nxt_nitems(nxt_app_lang_module_map), lang);
 
         if (ret != NXT_OK) {
+            nxt_alert(task, "unexpected members in the module at index %uD",
+                      index);
             goto fail;
         }
 
@@ -1757,7 +1937,7 @@ nxt_main_port_conf_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     if (nxt_conf_ver != NXT_VERNUM) {
         n = nxt_sprintf(ver, ver + NXT_INT_T_LEN, "%d", NXT_VERNUM) - ver;
 
-        ret = nxt_main_file_store(task, rt->ver_tmp, rt->ver, ver, n);
+        ret = nxt_main_file_store(task, rt->state, rt->ver_tmp, rt->ver, ver, n);
         if (nxt_slow_path(ret != NXT_OK)) {
             goto error;
         }
@@ -1765,7 +1945,7 @@ nxt_main_port_conf_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         nxt_conf_ver = NXT_VERNUM;
     }
 
-    ret = nxt_main_file_store(task, rt->conf_tmp, rt->conf, p, size);
+    ret = nxt_main_file_store(task, rt->state, rt->conf_tmp, rt->conf, p, size);
 
     if (nxt_fast_path(ret == NXT_OK)) {
         goto cleanup;
@@ -1788,34 +1968,208 @@ cleanup:
 }
 
 
+/*
+ * Replace "name" with "size" bytes of "buf" atomically: the content goes to
+ * "tmp_name", which the caller places in "dir" beside the destination, is
+ * flushed, and only then rename(2)d over "name", so a reader sees either
+ * the whole old file or the whole new one.  "dir" is flushed after the
+ * rename, without which the rename may not survive a power loss.  Every
+ * failure before the rename unlinks the temporary and leaves the existing
+ * "name" untouched.
+ *
+ * Because the replacement arrives by rename(), a "name" that was a symlink
+ * is replaced by a regular file rather than followed -- the price of
+ * atomicity.  A symlinked state *directory* is unaffected: "dir" and
+ * "tmp_name" resolve through it just as "name" does.
+ *
+ * The temporary is created 0600 as before; when the destination already
+ * exists, its mode and ownership are carried over to the replacement, so a
+ * state file an administrator has re-permissioned keeps its settings.
+ */
 static nxt_int_t
-nxt_main_file_store(nxt_task_t *task, const char *tmp_name, const char *name,
-    u_char *buf, size_t size)
+nxt_main_file_store(nxt_task_t *task, const char *dir, const char *tmp_name,
+    const char *name, u_char *buf, size_t size)
 {
+    size_t      written;
     ssize_t     n;
     nxt_int_t   ret;
     nxt_file_t  file;
 
     nxt_memzero(&file, sizeof(nxt_file_t));
 
-    file.name = (nxt_file_name_t *) name;
+    file.name = (nxt_file_name_t *) tmp_name;
 
-    ret = nxt_file_open(task, &file, NXT_FILE_WRONLY, NXT_FILE_TRUNCATE,
-                        NXT_FILE_OWNER_ACCESS);
+    /*
+     * Without a log level nxt_file_open() reports nothing, and a failed
+     * store would be diagnosable only from the caller's summary alert.
+     * NXT_LOG_ALERT is zero, which is the "say nothing" value, so the
+     * loudest usable level here is NXT_LOG_ERR.
+     */
+    file.log_level = NXT_LOG_ERR;
+
+    /*
+     * Unlink first, then create exclusively, rather than opening the
+     * temporary with O_TRUNC.  The name is predictable and the store runs
+     * as root, so if --statedir is writable by anyone else that user can
+     * put a symbolic link there ahead of us: O_TRUNC would follow it and
+     * truncate whatever it addresses, and the rename below would then
+     * install the link as the state file.  O_EXCL refuses a link outright
+     * and refuses a regular file somebody hard-linked to a target we must
+     * not write, which O_NOFOLLOW alone would not.
+     *
+     * A leftover temporary from an interrupted store is still simply
+     * replaced -- that is what the unlink is for.  The window between the
+     * two is not a hole: something recreated in it makes the create fail,
+     * which loses the store and keeps the target, rather than the other
+     * way round.
+     */
+    if (nxt_slow_path(unlink(tmp_name) != 0 && nxt_errno != NXT_ENOENT)) {
+        nxt_alert(task, "unlink(\"%FN\") failed %E", file.name, nxt_errno);
+
+        return NXT_ERROR;
+    }
+
+    ret = nxt_file_open(task, &file, NXT_FILE_WRONLY,
+                        NXT_FILE_CREATE_EXCLUSIVE, NXT_FILE_OWNER_ACCESS);
     if (nxt_slow_path(ret != NXT_OK)) {
         return NXT_ERROR;
     }
 
-    n = nxt_file_write(&file, buf, size, 0);
+    /*
+     * pwrite() is allowed to store less than it was asked for, and this
+     * store exists to survive a partial one: resume from where it stopped
+     * rather than turning a short write into a failed store.  A zero return
+     * carries no errno and cannot make progress, so it ends the loop.
+     */
+    for (written = 0; written < size; written += n) {
+        n = nxt_file_write(&file, buf + written, size - written, written);
+
+        if (nxt_slow_path(n <= 0)) {
+            /* nxt_file_write() logs the errno; a zero return has none. */
+            if (n == 0) {
+                nxt_alert(task, "write(\"%FN\") stored %uz of %uz bytes",
+                          file.name, written, size);
+            }
+
+            goto fail;
+        }
+    }
+
+    if (nxt_slow_path(nxt_main_file_store_inherit(task, &file, name)
+                      != NXT_OK))
+    {
+        goto fail;
+    }
+
+    /*
+     * rename() already orders the name change for readers; what this buys
+     * is the data reaching stable storage before the name points at it, so
+     * a crash cannot leave conf.json naming a file whose blocks were never
+     * written.
+     */
+    if (nxt_slow_path(nxt_file_sync(task, &file) != NXT_OK)) {
+        goto fail;
+    }
 
     nxt_file_close(task, &file);
+    file.fd = NXT_FILE_INVALID;
 
-    if (nxt_slow_path(n != (ssize_t) size)) {
+    if (nxt_slow_path(nxt_file_rename(file.name, (nxt_file_name_t *) name)
+                      != NXT_OK))
+    {
         (void) nxt_file_delete(file.name);
         return NXT_ERROR;
     }
 
-    return nxt_file_rename(file.name, (nxt_file_name_t *) name);
+    /* The destination is in place; a failed flush only costs durability. */
+    (void) nxt_file_dir_sync(task, (nxt_file_name_t *) dir);
+
+    return NXT_OK;
+
+fail:
+
+    if (file.fd != NXT_FILE_INVALID) {
+        nxt_file_close(task, &file);
+    }
+
+    (void) nxt_file_delete(file.name);
+
+    return NXT_ERROR;
+}
+
+
+/*
+ * Carry the destination's mode and ownership onto the temporary that is
+ * about to replace it.  A destination that does not exist yet, or that is
+ * not a regular file, keeps the 0600 the temporary was created with.
+ */
+static nxt_int_t
+nxt_main_file_store_inherit(nxt_task_t *task, nxt_file_t *tmp,
+    const char *name)
+{
+    nxt_file_info_t  fi;
+
+    /*
+     * lstat(), not nxt_file_info(), which stat()s a name and therefore
+     * follows a symbolic link.  The temporary is created exclusively
+     * because --statedir may be writable by another user; that same user
+     * can point the destination at a file of their own, and a stat() here
+     * would copy its ownership and mode onto the replacement -- aim it at
+     * something 0666 and conf.json comes back world-writable, and stays
+     * that way, because every later store inherits it again.
+     *
+     * On the path this is for -- an administrator's re-permissioned state
+     * file -- lstat() and stat() agree.
+     */
+    if (lstat(name, &fi) != 0) {
+        if (nxt_errno == NXT_ENOENT) {
+            return NXT_OK;
+        }
+
+        /*
+         * The temporary is written and 0600 is a serviceable result, so
+         * an unreadable destination costs the inheritance and not the
+         * store: refusing to persist the configuration at all is the worse
+         * outcome, which is the same trade the fchown() below makes.
+         */
+        nxt_log(task, NXT_LOG_INFO, "lstat(\"%FN\") failed %E",
+                (nxt_file_name_t *) name, nxt_errno);
+
+        return NXT_OK;
+    }
+
+    /*
+     * Only a regular file donates anything.  A symbolic link, or a
+     * destination somebody replaced with a device or a directory, leaves
+     * the temporary on the 0600 it was created with; the rename replaces
+     * whatever is there either way.
+     */
+    if (!S_ISREG(fi.st_mode)) {
+        return NXT_OK;
+    }
+
+    /*
+     * Ownership first, mode second.  A successful chown() clears set-user-ID
+     * and set-group-ID on a regular file -- Linux does it to root's chown()
+     * too -- so doing it the other way round would drop exactly the bits
+     * "fi.st_mode & 07777" is here to carry over.
+     *
+     * Main runs as root, so this normally succeeds; when it cannot change
+     * the owner the store still proceeds -- refusing to persist the
+     * configuration would be the worse failure.
+     */
+    if (nxt_slow_path(fchown(tmp->fd, fi.st_uid, fi.st_gid) != 0)) {
+        nxt_log(task, NXT_LOG_INFO, "fchown(%FD, \"%FN\") failed %E",
+                tmp->fd, tmp->name, nxt_errno);
+    }
+
+    if (nxt_slow_path(fchmod(tmp->fd, fi.st_mode & 07777) != 0)) {
+        nxt_alert(task, "fchmod(%FD, \"%FN\") failed %E",
+                  tmp->fd, tmp->name, nxt_errno);
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
 }
 
 

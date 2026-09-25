@@ -8,7 +8,11 @@
 
 #if (NXT_HAVE_MEMFD_CREATE)
 
+#if (NXT_HAVE_LINUX_MEMFD_H)
 #include <linux/memfd.h>
+#else
+#include <sys/mman.h>
+#endif
 #include <unistd.h>
 #include <sys/syscall.h>
 
@@ -46,7 +50,20 @@ nxt_port_mmap_handler_use(nxt_port_mmap_handler_t *mmap_handler, int i)
 static nxt_port_mmap_t *
 nxt_port_mmap_at(nxt_port_mmaps_t *port_mmaps, uint32_t i)
 {
-    uint32_t  cap;
+    uint32_t         cap;
+    nxt_port_mmap_t  *elts;
+
+    if (nxt_fast_path(i < port_mmaps->size)) {
+        return port_mmaps->elts + i;
+    }
+
+    /*
+     * A capacity able to hold slot i is i + 1 elements, which is not
+     * representable in uint32_t for i == UINT32_MAX.
+     */
+    if (nxt_slow_path(i == UINT32_MAX)) {
+        return NULL;
+    }
 
     cap = port_mmaps->cap;
 
@@ -54,27 +71,41 @@ nxt_port_mmap_at(nxt_port_mmaps_t *port_mmaps, uint32_t i)
         cap = i + 1;
     }
 
-    while (i + 1 > cap) {
+    /*
+     * Comparing capacities rather than "i + 1 > cap": the latter wraps to
+     * 0 for i == UINT32_MAX and silently skips the growth.
+     */
+    while (cap <= i) {
 
         if (cap < 16) {
             cap = cap * 2;
 
         } else {
+            /*
+             * The 1.5x step overflows uint32_t for large capacities and
+             * wraps below the target, so the loop would spin forever with
+             * the caller's mutex held.
+             */
+            if (nxt_slow_path(cap > UINT32_MAX - cap / 2)) {
+                return NULL;
+            }
+
             cap = cap + cap / 2;
         }
     }
 
     if (cap != port_mmaps->cap) {
 
-        port_mmaps->elts = nxt_realloc(port_mmaps->elts,
-                                       cap * sizeof(nxt_port_mmap_t));
-        if (nxt_slow_path(port_mmaps->elts == NULL)) {
+        /* nxt_realloc() does not free the old array on failure. */
+        elts = nxt_realloc(port_mmaps->elts, cap * sizeof(nxt_port_mmap_t));
+        if (nxt_slow_path(elts == NULL)) {
             return NULL;
         }
 
-        nxt_memzero(port_mmaps->elts + port_mmaps->cap,
+        nxt_memzero(elts + port_mmaps->cap,
                     sizeof(nxt_port_mmap_t) * (cap - port_mmaps->cap));
 
+        port_mmaps->elts = elts;
         port_mmaps->cap = cap;
     }
 
@@ -98,14 +129,28 @@ nxt_port_mmaps_destroy(nxt_port_mmaps_t *port_mmaps, nxt_bool_t free_elts)
 
     port_mmap = port_mmaps->elts;
 
-    for (i = 0; i < port_mmaps->size; i++) {
-        nxt_port_mmap_handler_use(port_mmap[i].mmap_handler, -1);
+    if (port_mmap != NULL) {
+
+        for (i = 0; i < port_mmaps->size; i++) {
+            /*
+             * The array is indexed by the peer's segment id, so unused
+             * slots in the middle are genuinely NULL.
+             */
+            if (port_mmap[i].mmap_handler != NULL) {
+                nxt_port_mmap_handler_use(port_mmap[i].mmap_handler, -1);
+
+                port_mmap[i].mmap_handler = NULL;
+            }
+        }
     }
 
     port_mmaps->size = 0;
 
     if (free_elts != 0) {
         nxt_free(port_mmaps->elts);
+
+        port_mmaps->elts = NULL;
+        port_mmaps->cap = 0;
     }
 }
 
@@ -120,6 +165,7 @@ nxt_port_mmap_buf_completion(nxt_task_t *task, void *obj, void *data)
     u_char                   *p;
     nxt_mp_t                 *mp;
     nxt_buf_t                *b, *next;
+    nxt_pid_t                src_pid, dst_pid;
     nxt_process_t            *process;
     nxt_chunk_id_t           c;
     nxt_port_mmap_header_t   *hdr;
@@ -139,9 +185,21 @@ complete_buf:
 
     hdr = mmap_handler->hdr;
 
-    if (nxt_slow_path(hdr->src_pid != nxt_pid && hdr->dst_pid != nxt_pid)) {
+    /*
+     * The header lives in a segment the peer still maps writable, so the two
+     * pids are snapshotted once here and only the locals are used below:
+     * re-reading one after the check is a double fetch the peer can win, and
+     * src_pid is what the process lookup below is given.  The other header
+     * fields are left as direct reads -- hdr->id only reaches a debug
+     * message, and the free map and oosm flag are peer-shared state read
+     * through their own accessors by design.
+     */
+    src_pid = hdr->src_pid;
+    dst_pid = hdr->dst_pid;
+
+    if (nxt_slow_path(src_pid != nxt_pid && dst_pid != nxt_pid)) {
         nxt_debug(task, "mmap buf completion: mmap for other process pair "
-                  "%PI->%PI", hdr->src_pid, hdr->dst_pid);
+                  "%PI->%PI", src_pid, dst_pid);
 
         goto release_buf;
     }
@@ -164,7 +222,7 @@ complete_buf:
 
     nxt_debug(task, "mmap buf completion: %p [%p,%uz] (sent=%d), "
               "%PI->%PI,%d,%d", b, b->mem.start, b->mem.end - b->mem.start,
-              b->is_port_mmap_sent, hdr->src_pid, hdr->dst_pid, hdr->id, c);
+              b->is_port_mmap_sent, src_pid, dst_pid, hdr->id, c);
 
     while (p < b->mem.end) {
         nxt_port_mmap_set_chunk_free(hdr->free_map, c);
@@ -173,12 +231,23 @@ complete_buf:
         c++;
     }
 
-    if (hdr->dst_pid == nxt_pid
+    if (dst_pid == nxt_pid
         && nxt_atomic_cmp_set(&hdr->oosm, 1, 0))
     {
-        process = nxt_runtime_process_find(task->thread->runtime, hdr->src_pid);
+        process = nxt_runtime_process_ref(task->thread->runtime, src_pid);
 
         nxt_process_broadcast_shm_ack(task, process);
+
+        /*
+         * Released here rather than at the end of the function: the
+         * complete_buf back-edge below re-enters this block once per buffer
+         * of the chain, so a release outside it would leak every reference
+         * but the last.
+         */
+
+        if (process != NULL) {
+            nxt_process_use(task, process, -1);
+        }
     }
 
 release_buf:
@@ -205,6 +274,8 @@ nxt_port_incoming_port_mmap(nxt_task_t *task, nxt_process_t *process,
     nxt_fd_t fd)
 {
     void                     *mem;
+    uint32_t                 id;
+    nxt_pid_t                src_pid, dst_pid;
     struct stat              mmap_stat;
     nxt_port_mmap_t          *port_mmap;
     nxt_port_mmap_header_t   *hdr;
@@ -221,7 +292,20 @@ nxt_port_incoming_port_mmap(nxt_task_t *task, nxt_process_t *process,
         return NULL;
     }
 
-    mem = nxt_mem_mmap(NULL, mmap_stat.st_size,
+    /*
+     * The peer sizes the segment; chunk addressing and every munmap() use
+     * the PORT_MMAP_SIZE constant, so anything else is out of bounds one
+     * way or the other.
+     */
+    if (nxt_slow_path(mmap_stat.st_size != PORT_MMAP_SIZE)) {
+        nxt_log(task, NXT_LOG_WARN, "unexpected shared memory segment size "
+                "%O from process %PI, expected %uz", mmap_stat.st_size,
+                process->pid, (size_t) PORT_MMAP_SIZE);
+
+        return NULL;
+    }
+
+    mem = nxt_mem_mmap(NULL, PORT_MMAP_SIZE,
                        PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 
     if (nxt_slow_path(mem == MAP_FAILED)) {
@@ -232,12 +316,29 @@ nxt_port_incoming_port_mmap(nxt_task_t *task, nxt_process_t *process,
 
     hdr = mem;
 
-    if (nxt_slow_path(hdr->src_pid != process->pid
-                      || hdr->dst_pid != nxt_pid))
-    {
+    /*
+     * The header lives in a segment the peer still maps writable, so every
+     * field has to be snapshotted before it is validated: re-reading one
+     * afterwards is a double fetch the peer can win, and for the segment id
+     * that would put an unvalidated value into nxt_port_mmap_at() below.
+     */
+    src_pid = hdr->src_pid;
+    dst_pid = hdr->dst_pid;
+    id = hdr->id;
+
+    if (nxt_slow_path(src_pid != process->pid || dst_pid != nxt_pid)) {
         nxt_log(task, NXT_LOG_WARN, "unexpected pid in mmap header detected: "
-                "%PI != %PI or %PI != %PI", hdr->src_pid, process->pid,
-                hdr->dst_pid, nxt_pid);
+                "%PI != %PI or %PI != %PI", src_pid, process->pid,
+                dst_pid, nxt_pid);
+
+        nxt_mem_munmap(mem, PORT_MMAP_SIZE);
+
+        return NULL;
+    }
+
+    if (nxt_slow_path(id >= NXT_PORT_MMAP_MAX_SEGMENTS)) {
+        nxt_log(task, NXT_LOG_WARN, "unexpected segment id in mmap header "
+                "detected: %uD from process %PI", id, process->pid);
 
         nxt_mem_munmap(mem, PORT_MMAP_SIZE);
 
@@ -258,7 +359,7 @@ nxt_port_incoming_port_mmap(nxt_task_t *task, nxt_process_t *process,
 
     nxt_thread_mutex_lock(&process->incoming.mutex);
 
-    port_mmap = nxt_port_mmap_at(&process->incoming, hdr->id);
+    port_mmap = nxt_port_mmap_at(&process->incoming, id);
     if (nxt_slow_path(port_mmap == NULL)) {
         nxt_log(task, NXT_LOG_WARN, "failed to add mmap to incoming array");
 
@@ -268,6 +369,15 @@ nxt_port_incoming_port_mmap(nxt_task_t *task, nxt_process_t *process,
         mmap_handler = NULL;
 
         goto fail;
+    }
+
+    /*
+     * Nothing stops the peer from reusing a segment id: without releasing
+     * the displaced handler its reference would never drop to zero and its
+     * mapping would leak for the lifetime of the router.
+     */
+    if (nxt_slow_path(port_mmap->mmap_handler != NULL)) {
+        nxt_port_mmap_handler_use(port_mmap->mmap_handler, -1);
     }
 
     port_mmap->mmap_handler = mmap_handler;
@@ -284,13 +394,11 @@ fail:
 
 
 static nxt_port_mmap_handler_t *
-nxt_port_new_port_mmap(nxt_task_t *task, nxt_port_mmaps_t *mmaps,
-    nxt_bool_t tracking, nxt_int_t n)
+nxt_port_new_port_mmap(nxt_task_t *task, nxt_port_mmaps_t *mmaps, nxt_int_t n)
 {
     void                     *mem;
     nxt_fd_t                 fd;
     nxt_int_t                i;
-    nxt_free_map_t           *free_map;
     nxt_port_mmap_t          *port_mmap;
     nxt_port_mmap_header_t   *hdr;
     nxt_port_mmap_handler_t  *mmap_handler;
@@ -332,22 +440,18 @@ nxt_port_new_port_mmap(nxt_task_t *task, nxt_port_mmaps_t *mmaps,
     hdr = mmap_handler->hdr;
 
     nxt_memset(hdr->free_map, 0xFFU, sizeof(hdr->free_map));
-    nxt_memset(hdr->free_tracking_map, 0xFFU, sizeof(hdr->free_tracking_map));
 
     hdr->id = mmaps->size - 1;
     hdr->src_pid = nxt_pid;
     hdr->sent_over = 0xFFFFu;
 
     /* Mark first chunk as busy */
-    free_map = tracking ? hdr->free_tracking_map : hdr->free_map;
-
     for (i = 0; i < n; i++) {
-        nxt_port_mmap_set_chunk_busy(free_map, i);
+        nxt_port_mmap_set_chunk_busy(hdr->free_map, i);
     }
 
     /* Mark as busy chunk followed the last available chunk. */
     nxt_port_mmap_set_chunk_busy(hdr->free_map, PORT_MMAP_CHUNK_COUNT);
-    nxt_port_mmap_set_chunk_busy(hdr->free_tracking_map, PORT_MMAP_CHUNK_COUNT);
 
     nxt_log(task, NXT_LOG_DEBUG, "new mmap #%D created for %PI -> ...",
             hdr->id, nxt_pid);
@@ -441,7 +545,7 @@ nxt_shm_open(nxt_task_t *task, size_t size)
 
 static nxt_port_mmap_handler_t *
 nxt_port_mmap_get(nxt_task_t *task, nxt_port_mmaps_t *mmaps, nxt_chunk_id_t *c,
-    nxt_int_t n, nxt_bool_t tracking)
+    nxt_int_t n)
 {
     nxt_int_t                i, res, nchunks;
     nxt_free_map_t           *free_map;
@@ -471,7 +575,7 @@ nxt_port_mmap_get(nxt_task_t *task, nxt_port_mmaps_t *mmaps, nxt_chunk_id_t *c,
 
         *c = 0;
 
-        free_map = tracking ? hdr->free_tracking_map : hdr->free_map;
+        free_map = hdr->free_map;
 
         while (nxt_port_mmap_get_free_chunk(free_map, c)) {
             nchunks = 1;
@@ -505,7 +609,7 @@ nxt_port_mmap_get(nxt_task_t *task, nxt_port_mmaps_t *mmaps, nxt_chunk_id_t *c,
 end:
 
     *c = 0;
-    mmap_handler = nxt_port_new_port_mmap(task, mmaps, tracking, n);
+    mmap_handler = nxt_port_new_port_mmap(task, mmaps, n);
 
 unlock_return:
 
@@ -521,7 +625,14 @@ nxt_port_get_port_incoming_mmap(nxt_task_t *task, nxt_pid_t spid, uint32_t id)
     nxt_process_t            *process;
     nxt_port_mmap_handler_t  *mmap_handler;
 
-    process = nxt_runtime_process_find(task->thread->runtime, spid);
+    /*
+     * Referenced, not just found.  This runs on whichever router worker
+     * engine received the message, while the router main engine can be
+     * releasing the same process; without the reference the mutex locked on
+     * the next line can already have been destroyed and freed underneath us.
+     */
+
+    process = nxt_runtime_process_ref(task->thread->runtime, spid);
     if (nxt_slow_path(process == NULL)) {
         return NULL;
     }
@@ -549,27 +660,18 @@ nxt_port_get_port_incoming_mmap(nxt_task_t *task, nxt_pid_t spid, uint32_t id)
 
     nxt_thread_mutex_unlock(&process->incoming.mutex);
 
+    /*
+     * Strictly after the unlock.  If this is the last reference, the release
+     * runs nxt_thread_mutex_destroy(&process->incoming.mutex) -- dropping it
+     * before the unlock would destroy the mutex this function still holds.
+     *
+     * The returned handler is unaffected: the reference bumped above is its
+     * own, independent of the process, and the caller releases it.
+     */
+
+    nxt_process_use(task, process, -1);
+
     return mmap_handler;
-}
-
-
-/*
- * Validate that a peer-supplied (chunk_id, nchunks) pair refers to a
- * region wholly inside the mapped data area.  Returns non-zero on
- * success.  Underflow-safe: subtracts on the constant side.
- */
-nxt_inline nxt_bool_t
-nxt_port_mmap_chunk_range_valid(nxt_chunk_id_t chunk_id, size_t nchunks)
-{
-    if (chunk_id >= PORT_MMAP_CHUNK_COUNT) {
-        return 0;
-    }
-
-    if (nchunks > (size_t) PORT_MMAP_CHUNK_COUNT - chunk_id) {
-        return 0;
-    }
-
-    return 1;
 }
 
 
@@ -601,7 +703,7 @@ nxt_port_mmap_get_buf(nxt_task_t *task, nxt_port_mmaps_t *mmaps, size_t size)
     b->completion_handler = nxt_port_mmap_buf_completion;
     nxt_buf_set_port_mmap(b);
 
-    mmap_handler = nxt_port_mmap_get(task, mmaps, &c, nchunks, 0);
+    mmap_handler = nxt_port_mmap_get(task, mmaps, &c, nchunks);
     if (nxt_slow_path(mmap_handler == NULL)) {
         mp = task->thread->engine->mem_pool;
         nxt_mp_free(mp, b);
@@ -714,13 +816,9 @@ nxt_port_mmap_get_incoming_buf(nxt_task_t *task, nxt_port_t *port,
      * that would point outside the mapped data area before they reach
      * pointer arithmetic below.
      */
-    nchunks = mmap_msg->size / PORT_MMAP_CHUNK_SIZE;
-    if ((mmap_msg->size % PORT_MMAP_CHUNK_SIZE) != 0) {
-        nchunks++;
-    }
-
     if (nxt_slow_path(!nxt_port_mmap_chunk_range_valid(mmap_msg->chunk_id,
-                                                      nchunks)))
+                                                       mmap_msg->size,
+                                                       &nchunks)))
     {
         nxt_alert(task, "invalid mmap message from pid %PI: "
                   "chunk_id %uD, size %uD (chunks %uz, max %d)",
@@ -905,18 +1003,83 @@ nxt_port_mmap_get_method(nxt_task_t *task, nxt_port_t *port, nxt_buf_t *b)
 void
 nxt_process_broadcast_shm_ack(nxt_task_t *task, nxt_process_t *process)
 {
-    nxt_port_t  *port;
+    nxt_port_t     *port;
+    nxt_runtime_t  *rt;
 
-    if (nxt_slow_path(process == NULL || nxt_queue_is_empty(&process->ports)))
-    {
+    if (nxt_slow_path(process == NULL)) {
         return;
     }
 
-    port = nxt_process_port_first(process);
+    rt = task->thread->runtime;
 
-    if (port->type == NXT_PROCESS_APP) {
-        nxt_port_post(task, port, nxt_port_broadcast_shm_ack, process);
+    /*
+     * This runs on any engine -- most often a worker engine, from
+     * nxt_port_mmap_buf_completion() -- while the app port's teardown runs on
+     * the router's main thread.  The caller holds a reference to the process,
+     * not to the port, so the port has to be looked up, and a reference taken
+     * from a lookup can land on a port whose count already reached zero:
+     * nxt_port_post() below does an unconditional increment, and
+     * nxt_port_release() would by then be destroying the port's memory pool
+     * (issue #195 -- the `port->use_count == 0` assertion in a debug build,
+     * a use-after-free of the port and of the work item in a release one).
+     *
+     * rt->processes_mutex is the lock nxt_port_release() unlinks the port
+     * under, so reading process->ports and try-referencing the port under it
+     * cannot observe a port that is being released: either the try-ref wins
+     * and the port is alive for as long as this function holds it, or the
+     * port is already dying and there is nothing to acknowledge -- the
+     * process is going away and the app will not wait for shared memory
+     * again.
+     *
+     * Only the lookup is done under the mutex.  Everything after it takes
+     * other locks (nxt_process_use() takes this very mutex), and
+     * rt->processes_mutex is a leaf -- see src/nxt_process.c:150.
+     */
+
+    nxt_thread_mutex_lock(&rt->processes_mutex);
+
+    port = NULL;
+
+    if (!nxt_queue_is_empty(&process->ports)) {
+        port = nxt_process_port_first(process);
+
+        if (port->type != NXT_PROCESS_APP || !nxt_port_use_unless_zero(port)) {
+            port = NULL;
+        }
     }
+
+    nxt_thread_mutex_unlock(&rt->processes_mutex);
+
+    if (port == NULL) {
+        return;
+    }
+
+    /*
+     * The process is handed to another engine as a bare pointer and is
+     * dereferenced there, so the posted handler needs a reference of its
+     * own and drops it when it is done.  nxt_port_post() returns NXT_OK
+     * both when it queues the handler and when it calls it inline on the
+     * current engine, and the handler owns the reference either way; only
+     * the NXT_ERROR case leaves nothing to run, so only that case has to
+     * be undone here.  The inline call is safe: the caller still holds
+     * its own reference, so this one cannot be the last.
+     */
+
+    nxt_process_use(task, process, 1);
+
+    if (nxt_slow_path(nxt_port_post(task, port, nxt_port_broadcast_shm_ack,
+                                    process) != NXT_OK))
+    {
+        nxt_process_use(task, process, -1);
+    }
+
+    /*
+     * nxt_port_post() took its own reference on success, so the lookup
+     * reference is dropped here either way.  It is dropped after the post so
+     * that the port cannot be released between the try-ref and the post.
+     */
+
+    nxt_port_use(task, port, -1);
 }
 
 
@@ -931,4 +1094,6 @@ nxt_port_broadcast_shm_ack(nxt_task_t *task, nxt_port_t *port, void *data)
         (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_SHM_ACK,
                                      -1, 0, 0, NULL);
     } nxt_queue_loop;
+
+    nxt_process_use(task, process, -1);
 }

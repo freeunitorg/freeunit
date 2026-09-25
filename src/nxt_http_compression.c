@@ -18,6 +18,9 @@
 
 #define NXT_COMP_LEVEL_UNSET               INT8_MIN
 
+/* Headroom for the flush marker a compressor emits per call. */
+#define NXT_HTTP_COMP_FLUSH_SLACK          64
+
 
 typedef enum nxt_http_comp_scheme_e        nxt_http_comp_scheme_t;
 typedef struct nxt_http_comp_type_s        nxt_http_comp_type_t;
@@ -66,6 +69,22 @@ struct nxt_http_comp_compressor_s {
 struct nxt_http_comp_ctx_s {
     nxt_uint_t                      idx;
 
+    /*
+     * The compressor's type table entry, copied out of the configuration
+     * when the choice is applied.  The table is static and lives as long as
+     * the process, so a body that is still being compressed when the
+     * configuration is replaced keeps working from here instead of indexing
+     * a per-configuration array that may already be freed.
+     */
+    const nxt_http_comp_type_t      *type;
+
+    /*
+     * The compressor nxt_http_comp_check_acceptable() chose, or -1 when the
+     * request will not be compressed.  Kept apart from "idx", which is only
+     * set once the choice has actually been applied.
+     */
+    nxt_int_t                       sel_idx;
+
     nxt_off_t                       resp_clen;
     nxt_off_t                       clen_sent;
 
@@ -73,10 +92,19 @@ struct nxt_http_comp_ctx_s {
 };
 
 
-static nxt_tstr_t                  *nxt_http_comp_accept_encoding_query;
-static nxt_http_route_rule_t       *nxt_http_comp_mime_types_rule;
-static nxt_http_comp_compressor_t  *nxt_http_comp_enabled_compressors;
-static nxt_uint_t                  nxt_http_comp_nr_enabled_compressors;
+/*
+ * Everything here is allocated from the router configuration's pools, so it
+ * is held per configuration and reached through the request.  It used to be
+ * four process-global pointers, which dangled as soon as the configuration
+ * they came from was freed -- reconfiguring compression away killed the
+ * router on the next request (#167).
+ */
+struct nxt_http_comp_conf_s {
+    nxt_tstr_t                  *accept_encoding_query;
+    nxt_http_route_rule_t       *mime_types_rule;
+    nxt_http_comp_compressor_t  *enabled;
+    nxt_uint_t                  nr_enabled;
+};
 
 static nxt_thread_declare_data(nxt_http_comp_ctx_t,
                                nxt_http_comp_compressor_ctx);
@@ -138,16 +166,21 @@ static const nxt_http_comp_type_t  nxt_http_comp_compressors[] = {
 };
 
 
+nxt_inline nxt_http_comp_conf_t *
+nxt_http_comp_request_conf(const nxt_http_request_t *r)
+{
+    return r->conf->socket_conf->router_conf->compression;
+}
+
+
 static ssize_t
 nxt_http_comp_compress(uint8_t *dst, size_t dst_size, const uint8_t *src,
                        size_t src_size, bool last)
 {
     nxt_http_comp_ctx_t               *ctx = nxt_http_comp_ctx();
-    nxt_http_comp_compressor_t        *compressor;
     const nxt_http_comp_operations_t  *cops;
 
-    compressor = &nxt_http_comp_enabled_compressors[ctx->idx];
-    cops = compressor->type->cops;
+    cops = ctx->type->cops;
 
     return cops->deflate(&ctx->ctx, src, src_size, dst, dst_size, last);
 }
@@ -157,11 +190,9 @@ static size_t
 nxt_http_comp_bound(size_t size)
 {
     nxt_http_comp_ctx_t               *ctx = nxt_http_comp_ctx();
-    nxt_http_comp_compressor_t        *compressor;
     const nxt_http_comp_operations_t  *cops;
 
-    compressor = &nxt_http_comp_enabled_compressors[ctx->idx];
-    cops = compressor->type->cops;
+    cops = ctx->type->cops;
 
     return cops->bound(&ctx->ctx, size);
 }
@@ -174,7 +205,7 @@ nxt_http_comp_compress_app_response(nxt_task_t *task, nxt_http_request_t *r,
     bool                 last;
     size_t               buf_len;
     ssize_t              cbytes;
-    nxt_buf_t            *buf;
+    nxt_buf_t            *in, *next, *buf, *out, **tail;
     nxt_off_t            in_len;
     nxt_http_comp_ctx_t  *ctx = nxt_http_comp_ctx();
 
@@ -182,51 +213,103 @@ nxt_http_comp_compress_app_response(nxt_task_t *task, nxt_http_request_t *r,
         return NXT_OK;
     }
 
-    if (!nxt_buf_is_port_mmap(*b)) {
-        return NXT_OK;
+    /*
+     * What arrives here is a chain, not a single buffer:
+     * nxt_port_mmap_read() (src/nxt_port_memory.c) makes one nxt_buf_t per
+     * nxt_port_mmap_msg_t, the call site links it into r->out with
+     * nxt_buf_chain_add(), and a sync buffer may sit at the tail.  Walk it.
+     *
+     * The previous version compressed the head and then replaced the whole
+     * chain with that one output buffer, so anything behind the head was
+     * dropped from the response and never released, and ctx->clen_sent
+     * counted only the head -- which is what decides whether the compressor
+     * is told it is finishing the stream.
+     */
+
+    out = NULL;
+    tail = &out;
+
+    for (in = *b; in != NULL; in = next) {
+        next = in->next;
+        in->next = NULL;
+
+        /*
+         * Buffers that did not come through shared memory are passed
+         * through untouched: the trailing sync/last buffer carries no data,
+         * and a plain-mode response is not compressed at all (the same
+         * condition the single-buffer version tested on the head).
+         */
+        if (!nxt_buf_is_port_mmap(in)) {
+            *tail = in;
+            tail = &in->next;
+            continue;
+        }
+
+        in_len = in->mem.free - in->mem.pos;
+
+        last = ctx->clen_sent + in_len == ctx->resp_clen;
+
+        if (in_len == 0 && !last) {
+            goto release;
+        }
+
+        /*
+         * The per-call flush marker each compressor emits after the input
+         * is not part of what bound() promises for the input alone, so the
+         * output buffer gets a small fixed margin on top.
+         */
+        buf_len = nxt_http_comp_bound(in_len) + NXT_HTTP_COMP_FLUSH_SLACK;
+
+        buf = nxt_buf_mem_ts_alloc(task, in->data, buf_len);
+        if (nxt_slow_path(buf == NULL)) {
+            goto fail;
+        }
+
+        cbytes = nxt_http_comp_compress(buf->mem.start, buf_len,
+                                        in->mem.pos, in_len, last);
+        if (nxt_slow_path(cbytes == -1)) {
+            nxt_buf_free(buf->data, buf);
+            goto fail;
+        }
+
+        buf->mem.free += cbytes;
+
+        ctx->clen_sent += in_len;
+
+        *tail = buf;
+        tail = &buf->next;
+
+    release:
+
+        /*
+         * The compressed bytes have been copied out, so the shared memory
+         * chunk can go back to the application.  This has to run the
+         * buffer's own completion handler -- nxt_buf_free() is a plain pool
+         * free, and using it here (as the single-buffer version did) leaked
+         * the chunk, the mmap_handler reference and the port mem_pool
+         * reference on every compressed response.  in->next was cleared
+         * above because nxt_port_mmap_buf_completion() walks the chain.
+         */
+        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                           in->completion_handler, task, in, in->parent);
     }
 
-    in_len = (*b)->mem.free - (*b)->mem.pos;
-    buf_len = nxt_http_comp_bound(in_len);
-
-    buf = nxt_buf_mem_ts_alloc(task, (*b)->data, buf_len);
-    if (nxt_slow_path(buf == NULL)) {
-        return NXT_ERROR;
-    }
-
-    buf->data = (*b)->data;
-
-    last = ctx->clen_sent + in_len == ctx->resp_clen;
-
-    cbytes = nxt_http_comp_compress(buf->mem.start, buf_len,
-                                    (*b)->mem.pos, in_len, last);
-    if (cbytes == -1) {
-        nxt_buf_free(buf->data, buf);
-        return NXT_ERROR;
-    }
-
-    buf->mem.free += cbytes;
-
-    ctx->clen_sent += in_len;
-
-#define nxt_swap_buf(db, sb)                                                  \
-    do {                                                                      \
-        nxt_buf_t  **db_ = (db);                                              \
-        nxt_buf_t  **sb_ = (sb);                                              \
-        nxt_buf_t  *tmp_;                                                     \
-                                                                              \
-        tmp_ = *db_;                                                          \
-        *db_ = *sb_;                                                          \
-        *sb_ = tmp_;                                                          \
-    } while (0)
-
-    nxt_swap_buf(b, &buf);
-
-#undef nxt_swap_buf
-
-    nxt_buf_free(buf->data, buf);
+    *b = out;
 
     return NXT_OK;
+
+fail:
+
+    /*
+     * Keep whatever has been produced so far, and re-attach the input that
+     * has not been consumed, so that the caller's error path owns the whole
+     * chain and releases it.
+     */
+    in->next = next;
+    *tail = in;
+    *b = out;
+
+    return NXT_ERROR;
 }
 
 
@@ -357,16 +440,15 @@ nxt_http_comp_wants_compression(void)
 
 
 static nxt_uint_t
-nxt_http_comp_compressor_lookup_enabled(const nxt_str_t *token)
+nxt_http_comp_compressor_lookup_enabled(const nxt_http_comp_conf_t *conf,
+                                        const nxt_str_t *token)
 {
     if (token->start[0] == '*') {
         return NXT_HTTP_COMP_SCHEME_IDENTITY;
     }
 
-    for (nxt_uint_t i = 0; i < nxt_http_comp_nr_enabled_compressors; i++) {
-        if (nxt_strstr_eq(token,
-                          &nxt_http_comp_enabled_compressors[i].type->token))
-        {
+    for (nxt_uint_t i = 0; i < conf->nr_enabled; i++) {
+        if (nxt_strstr_eq(token, &conf->enabled[i].type->token)) {
             return i;
         }
     }
@@ -392,7 +474,8 @@ nxt_http_comp_compressor_lookup_enabled(const nxt_str_t *token)
  * 'identity;q=0' seems to basically mean the same thing...
  */
 static nxt_int_t
-nxt_http_comp_select_compressor(nxt_http_request_t *r, const nxt_str_t *token)
+nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
+                                nxt_http_request_t *r, const nxt_str_t *token)
 {
     bool       identity_allowed = true;
     char       *str, *tkn, *tail, *cur;
@@ -439,12 +522,12 @@ nxt_http_comp_select_compressor(nxt_http_request_t *r, const nxt_str_t *token)
         enc.start = (u_char *)tkn;
         enc.length = qptr != NULL ? (size_t)(qptr - tkn) : strlen(tkn);
 
-        ecidx = nxt_http_comp_compressor_lookup_enabled(&enc);
+        ecidx = nxt_http_comp_compressor_lookup_enabled(conf, &enc);
         if (ecidx == NXT_HTTP_COMP_SCHEME_UNKNOWN) {
             continue;
         }
 
-        scheme = nxt_http_comp_enabled_compressors[ecidx].type->scheme;
+        scheme = conf->enabled[ecidx].type->scheme;
 
         if (qval == 0.0 && scheme == NXT_HTTP_COMP_SCHEME_IDENTITY) {
             identity_allowed = false;
@@ -467,7 +550,8 @@ nxt_http_comp_select_compressor(nxt_http_request_t *r, const nxt_str_t *token)
 
 
 static nxt_int_t
-nxt_http_comp_set_header(nxt_http_request_t *r, nxt_uint_t comp_idx)
+nxt_http_comp_set_header(const nxt_http_comp_conf_t *conf,
+                         nxt_http_request_t *r, nxt_uint_t comp_idx)
 {
     const nxt_str_t   *token;
     nxt_http_field_t  *f;
@@ -480,7 +564,7 @@ nxt_http_comp_set_header(nxt_http_request_t *r, nxt_uint_t comp_idx)
         return NXT_ERROR;
     }
 
-    token = &nxt_http_comp_enabled_compressors[comp_idx].type->token;
+    token = &conf->enabled[comp_idx].type->token;
 
     *f = (nxt_http_field_t){};
 
@@ -541,20 +625,220 @@ nxt_http_comp_is_resp_content_encoded(const nxt_http_request_t *r)
 }
 
 
+/*
+ * Adds "Vary: Accept-Encoding", so a shared cache keys on the header that
+ * chose this representation.
+ *
+ * RFC 9110 Sect. 12.5.5: a response that was subject to proactive negotiation
+ * must say which request headers it varied on, or a cache is entitled to
+ * serve it to a client that would have been given a different representation
+ * -- gzip bytes to a client that cannot decode them, or identity to one that
+ * could have had the small copy.
+ *
+ * Emitted on the identity response as well as the coded one.  The identity
+ * response is precisely the one a cache must not reuse for a gzip-capable
+ * client, so omitting it there would leave the hole open from the other side.
+ *
+ * This is the companion of weakening the entity-tag for a coded
+ * representation: that makes revalidation distinguish the two, this makes the
+ * cache key distinguish them.  Either alone leaves shared caches able to mix
+ * them.
+ */
+
 nxt_int_t
-nxt_http_comp_check_compression(nxt_task_t *task, nxt_http_request_t *r)
+nxt_http_comp_merge_vary(nxt_http_request_t *r)
 {
-    int                         err;
-    nxt_int_t                   ret, idx;
-    nxt_off_t                   min_len;
-    nxt_str_t                   accept_encoding, mime_type = {};
-    nxt_router_conf_t           *rtcf;
-    nxt_http_comp_ctx_t         *ctx = nxt_http_comp_ctx();
-    nxt_http_comp_compressor_t  *compressor;
+    u_char                  *p, *end, *tok;
+    nxt_int_t               len;
+    size_t                  keep;
+    nxt_http_field_t        *f, *vary;
+    nxt_http_fields_iter_t  iter;
 
-    *ctx = (nxt_http_comp_ctx_t){ .resp_clen = -1 };
+    static const nxt_str_t  accept_encoding = nxt_string("Accept-Encoding");
 
-    if (nxt_http_comp_nr_enabled_compressors == 0) {
+    /*
+     * An existing Vary is merged into, not replaced and not deferred to.
+     * Something else naming a different header -- "Vary: Origin", say --
+     * still needs Accept-Encoding added, because the response varies on both;
+     * treating any existing Vary as sufficient would leave the coding out of
+     * the cache key, which is the hole this function exists to close.
+     */
+
+    vary = NULL;
+
+    for (f = nxt_http_fields_first(&iter, r->resp.inline_fields,
+                                   r->resp.num_inline_fields, r->resp.fields);
+         f != NULL;
+         f = nxt_http_fields_next(&iter))
+    {
+        if (!f->skip && f->name_length == nxt_length("Vary")
+            && nxt_strncasecmp(f->name, (u_char *) "Vary",
+                               nxt_length("Vary")) == 0)
+        {
+            vary = f;
+            break;
+        }
+    }
+
+    if (vary != NULL) {
+        p = vary->value;
+        end = p + vary->value_length;
+
+        /*
+         * "Vary: *" already varies on everything; adding to it says less.
+         *
+         * Trim both ends before the test.  These are response fields an
+         * application handed to libunit, not request headers the parser has
+         * normalised, so "Vary: * " arrives with its trailing space intact --
+         * and appending to that would emit "* , Accept-Encoding", which is
+         * not a valid field value.
+         */
+
+        while (p < end && (*p == ' ' || *p == '\t')) {
+            p++;
+        }
+
+        while (end > p && (end[-1] == ' ' || end[-1] == '\t')) {
+            end--;
+        }
+
+        if (end - p == 1 && *p == '*') {
+            return NXT_OK;
+        }
+
+        /*
+         * An empty value carries no tokens, so there is nothing to append to
+         * and nothing to search: replacing it avoids emitting ", A-E" with a
+         * leading comma.  RFC 9110 Sect. 5.6.1.2 permits the empty element,
+         * but there is no reason to produce one.
+         */
+
+        end = vary->value + vary->value_length;
+
+        if (end == vary->value) {
+            vary->value = accept_encoding.start;
+            vary->value_length = accept_encoding.length;
+
+            return NXT_OK;
+        }
+
+        /*
+         * Already listed?  Compare per token, so "X-Accept-Encoding" misses.
+         *
+         * A while loop rather than a for with p++: the inner scan can leave p
+         * at end, and incrementing there would form a pointer past
+         * one-past-the-end, which C does not define even where it is
+         * harmless in practice.
+         */
+
+        p = vary->value;
+
+        while (p < end) {
+            while (p < end && (*p == ' ' || *p == '\t' || *p == ',')) {
+                p++;
+            }
+
+            tok = p;
+
+            while (p < end && *p != ',') {
+                p++;
+            }
+
+            len = p - tok;
+
+            while (len > 0 && (tok[len - 1] == ' ' || tok[len - 1] == '\t')) {
+                len--;
+            }
+
+            if (len == (nxt_int_t) accept_encoding.length
+                && nxt_strncasecmp(tok, accept_encoding.start,
+                                   accept_encoding.length) == 0)
+            {
+                return NXT_OK;
+            }
+
+            if (p < end) {
+                p++;
+            }
+        }
+
+        /*
+         * Append after the last real token, not after whatever the value
+         * happens to end with: "Origin," would otherwise become
+         * "Origin,, Accept-Encoding".  Empty list elements are legal and
+         * ignored (Sect. 5.6.1.2), but there is no reason to emit one.
+         */
+
+        keep = vary->value_length;
+
+        while (keep > 0
+               && (vary->value[keep - 1] == ' '
+                   || vary->value[keep - 1] == '\t'
+                   || vary->value[keep - 1] == ','))
+        {
+            keep--;
+        }
+
+        len = keep + nxt_length(", ") + accept_encoding.length;
+
+        p = nxt_mp_nget(r->mem_pool, len);
+        if (nxt_slow_path(p == NULL)) {
+            return NXT_ERROR;
+        }
+
+        nxt_memcpy(p, vary->value, keep);
+        nxt_memcpy(p + keep, ", ", nxt_length(", "));
+        nxt_memcpy(p + keep + nxt_length(", "),
+                   accept_encoding.start, accept_encoding.length);
+
+        vary->value = p;
+        vary->value_length = len;
+
+        return NXT_OK;
+    }
+
+    f = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+    if (nxt_slow_path(f == NULL)) {
+        return NXT_ERROR;
+    }
+
+    nxt_http_field_name_set(f, "Vary");
+
+    f->value = accept_encoding.start;
+    f->value_length = accept_encoding.length;
+
+    return NXT_OK;
+}
+
+
+/*
+ * Decides whether an acceptable representation exists, and remembers which
+ * compressor would be used, without touching the response or allocating a
+ * compressor context.
+ *
+ * Separated from applying that decision because RFC 9110 Sect. 13.2.1 puts
+ * this ahead of precondition evaluation: a request that cannot be satisfied
+ * at all must be answered 406, not 304 or 412.  The caller therefore asks
+ * this first, evaluates preconditions, and only then applies -- so a 304
+ * neither carries a Content-Encoding header nor leaves an initialised
+ * compressor behind, which would leak, since the compressor is torn down by
+ * the last deflate() call and a 304 makes none.
+ */
+
+nxt_int_t
+nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
+{
+    nxt_int_t               ret, idx;
+    nxt_str_t               accept_encoding, mime_type = {};
+    nxt_router_conf_t       *rtcf;
+    nxt_http_comp_ctx_t     *ctx = nxt_http_comp_ctx();
+    nxt_http_comp_conf_t    *conf = nxt_http_comp_request_conf(r);
+
+    *ctx = (nxt_http_comp_ctx_t){ .resp_clen = -1, .sel_idx = -1 };
+
+    /* A built configuration always holds identity, so NULL is the only
+       "no compression" state. */
+    if (conf == NULL) {
         return NXT_OK;
     }
 
@@ -577,8 +861,8 @@ nxt_http_comp_check_compression(nxt_task_t *task, nxt_http_request_t *r)
         return NXT_OK;
     }
 
-    if (nxt_http_comp_mime_types_rule != NULL) {
-        ret = nxt_http_route_test_rule(r, nxt_http_comp_mime_types_rule,
+    if (conf->mime_types_rule != NULL) {
+        ret = nxt_http_route_test_rule(r, conf->mime_types_rule,
                                        mime_type.start,
                                        mime_type.length);
         if (ret == 0) {
@@ -592,28 +876,134 @@ nxt_http_comp_check_compression(nxt_task_t *task, nxt_http_request_t *r)
         return NXT_OK;
     }
 
+    /*
+     * Past every early return above, so this response really was subject to
+     * negotiation on Accept-Encoding, whichever coding is chosen below.
+     */
+
+    r->resp.vary_accept_encoding = 1;
+
+    if (nxt_slow_path(nxt_http_comp_merge_vary(r) != NXT_OK)) {
+        return NXT_ERROR;
+    }
+
     ret = nxt_tstr_query_init(&r->tstr_query, rtcf->tstr_state, &r->tstr_cache,
                               r, r->mem_pool);
     if (nxt_slow_path(ret == NXT_ERROR)) {
         return NXT_ERROR;
     }
 
-    ret = nxt_tstr_query(task, r->tstr_query,
-                         nxt_http_comp_accept_encoding_query, &accept_encoding);
+    ret = nxt_tstr_query(task, r->tstr_query, conf->accept_encoding_query,
+                         &accept_encoding);
     if (nxt_slow_path(ret != NXT_OK)) {
         return NXT_ERROR;
     }
 
-    idx = nxt_http_comp_select_compressor(r, &accept_encoding);
+    idx = nxt_http_comp_select_compressor(conf, r, &accept_encoding);
     if (idx == -1) {
         return NXT_HTTP_NOT_ACCEPTABLE;
     }
 
-    if (idx == NXT_HTTP_COMP_SCHEME_IDENTITY) {
+    ctx->sel_idx = idx;
+
+    return NXT_OK;
+}
+
+
+/*
+ * Weakens the response's ETag, so that a coded representation does not carry
+ * the same strong validator as the identity one.
+ *
+ * RFC 9110 Sect. 8.8.3: a strong validator must change whenever the selected
+ * representation changes, and a content coding selects a different
+ * representation.  Unit derives the tag from the file's mtime and size, which
+ * are the same whichever coding is served, so without this a client that took
+ * its tag from a gzip response and then sent it back in If-Range -- which
+ * Sect. 13.1.5 compares strongly -- would match, and be handed identity bytes
+ * for offsets it believes are gzip offsets.  Weakening makes that strong
+ * comparison fail, so the range is simply not applied.
+ *
+ * If-None-Match keeps working: it compares weakly, so revalidation of a coded
+ * representation still answers 304.
+ *
+ * nginx does the same thing (ngx_http_weak_etag(), called from its gzip
+ * header filter); Apache appends "-gzip" and Go's net/http appends the coding
+ * name.  All three make the tag differ per coding; weakening is the smallest
+ * of the three and needs no extra allocation beyond the prefix.
+ */
+
+static nxt_int_t
+nxt_http_comp_weaken_etag(nxt_http_request_t *r)
+{
+    u_char                  *p;
+    nxt_http_field_t        *f;
+    nxt_http_fields_iter_t  iter;
+
+    for (f = nxt_http_fields_first(&iter, r->resp.inline_fields,
+                                   r->resp.num_inline_fields, r->resp.fields);
+         f != NULL;
+         f = nxt_http_fields_next(&iter))
+    {
+        if (f->skip || f->name_length != nxt_length("ETag")
+            || nxt_strncasecmp(f->name, (u_char *) "ETag",
+                               nxt_length("ETag")) != 0)
+        {
+            continue;
+        }
+
+        if (f->value_length >= 2
+            && f->value[0] == 'W' && f->value[1] == '/')
+        {
+            return NXT_OK;
+        }
+
+        p = nxt_mp_nget(r->mem_pool, f->value_length + nxt_length("W/"));
+        if (nxt_slow_path(p == NULL)) {
+            return NXT_ERROR;
+        }
+
+        /* Copy out of the old value before the field is repointed. */
+        nxt_memcpy(p, "W/", nxt_length("W/"));
+        nxt_memcpy(p + nxt_length("W/"), f->value, f->value_length);
+
+        f->value = p;
+        f->value_length += nxt_length("W/");
+
         return NXT_OK;
     }
 
-    compressor = &nxt_http_comp_enabled_compressors[idx];
+    return NXT_OK;
+}
+
+
+/*
+ * Applies the decision nxt_http_comp_check_acceptable() reached: adds the
+ * Content-Encoding header and initialises the compressor.  Call it only on a
+ * path that will actually send a body.
+ */
+
+nxt_int_t
+nxt_http_comp_apply_compression(nxt_task_t *task, nxt_http_request_t *r)
+{
+    int                         err;
+    nxt_int_t                   idx;
+    nxt_off_t                   min_len;
+    nxt_http_comp_ctx_t         *ctx = nxt_http_comp_ctx();
+    nxt_http_comp_conf_t        *conf;
+    nxt_http_comp_compressor_t  *compressor;
+
+    idx = ctx->sel_idx;
+
+    if (idx == -1 || idx == NXT_HTTP_COMP_SCHEME_IDENTITY) {
+        return NXT_OK;
+    }
+
+    /*
+     * Reached only when nxt_http_comp_check_acceptable() chose a compressor,
+     * which it does only from a non-NULL configuration.
+     */
+    conf = nxt_http_comp_request_conf(r);
+    compressor = &conf->enabled[idx];
 
     if (r->resp.content_length_n > -1) {
         ctx->resp_clen = r->resp.content_length_n;
@@ -628,10 +1018,15 @@ nxt_http_comp_check_compression(nxt_task_t *task, nxt_http_request_t *r)
         return NXT_OK;
     }
 
-    nxt_http_comp_set_header(r, idx);
+    nxt_http_comp_set_header(conf, r, idx);
+
+    if (nxt_slow_path(nxt_http_comp_weaken_etag(r) != NXT_OK)) {
+        return NXT_ERROR;
+    }
 
     ctx->idx = idx;
-    ctx->ctx.level = nxt_http_comp_enabled_compressors[idx].opts.level;
+    ctx->type = compressor->type;
+    ctx->ctx.level = compressor->opts.level;
 
     err = compressor->type->cops->init(&ctx->ctx);
     if (nxt_slow_path(err)) {
@@ -671,6 +1066,7 @@ nxt_http_comp_compressor_is_valid(const nxt_str_t *token)
 
 static nxt_int_t
 nxt_http_comp_set_compressor(nxt_task_t *task, nxt_router_conf_t *rtcf,
+                             nxt_http_comp_conf_t *conf,
                              const nxt_conf_value_t *comp, nxt_uint_t index)
 {
     nxt_int_t                   ret;
@@ -689,7 +1085,7 @@ nxt_http_comp_set_compressor(nxt_task_t *task, nxt_router_conf_t *rtcf,
     nxt_conf_get_string(obj, &token);
     cidx = nxt_http_comp_compressor_token2idx(&token);
 
-    compr = &nxt_http_comp_enabled_compressors[index];
+    compr = &conf->enabled[index];
 
     compr->type = &nxt_http_comp_compressors[cidx];
     compr->opts.level = compr->type->def_compr;
@@ -721,29 +1117,35 @@ nxt_int_t
 nxt_http_comp_compression_init(nxt_task_t *task, nxt_router_conf_t *rtcf,
                                const nxt_conf_value_t *comp_conf)
 {
-    nxt_int_t         ret;
-    nxt_uint_t        n = 1;  /* 'identity' */
-    nxt_conf_value_t  *comps, *mimes;
+    nxt_int_t             ret;
+    nxt_uint_t            n = 1;  /* 'identity' */
+    nxt_conf_value_t      *comps, *mimes;
+    nxt_http_comp_conf_t  *conf;
 
     static const nxt_str_t  accept_enc_str =
                                     nxt_string("$header_accept_encoding");
     static const nxt_str_t  comps_str = nxt_string("compressors");
     static const nxt_str_t  mimes_str = nxt_string("types");
 
+    conf = nxt_mp_zalloc(rtcf->mem_pool, sizeof(nxt_http_comp_conf_t));
+    if (nxt_slow_path(conf == NULL)) {
+        return NXT_ERROR;
+    }
+
     mimes = nxt_conf_get_object_member(comp_conf, &mimes_str, NULL);
     if (mimes != NULL) {
-        nxt_http_comp_mime_types_rule =
+        conf->mime_types_rule =
                         nxt_http_route_types_rule_create(task,
                                                          rtcf->mem_pool, mimes);
-        if (nxt_slow_path(nxt_http_comp_mime_types_rule == NULL)) {
+        if (nxt_slow_path(conf->mime_types_rule == NULL)) {
             return NXT_ERROR;
         }
     }
 
-    nxt_http_comp_accept_encoding_query =
+    conf->accept_encoding_query =
                             nxt_tstr_compile(rtcf->tstr_state, &accept_enc_str,
                                              NXT_TSTR_STRZ);
-    if (nxt_slow_path(nxt_http_comp_accept_encoding_query == NULL)) {
+    if (nxt_slow_path(conf->accept_encoding_query == NULL)) {
         return NXT_ERROR;
     }
 
@@ -757,30 +1159,40 @@ nxt_http_comp_compression_init(nxt_task_t *task, nxt_router_conf_t *rtcf,
     } else {
         n += nxt_conf_object_members_count(comps);
     }
-    nxt_http_comp_nr_enabled_compressors = n;
+    conf->nr_enabled = n;
 
-    nxt_http_comp_enabled_compressors =
-                        nxt_mp_zalloc(rtcf->mem_pool,
-                                      sizeof(nxt_http_comp_compressor_t) * n);
+    conf->enabled = nxt_mp_zalloc(rtcf->mem_pool,
+                                  sizeof(nxt_http_comp_compressor_t) * n);
+    if (nxt_slow_path(conf->enabled == NULL)) {
+        return NXT_ERROR;
+    }
 
-    nxt_http_comp_enabled_compressors[0] =
+    conf->enabled[0] =
         (nxt_http_comp_compressor_t){ .type = &nxt_http_comp_compressors[0],
                                       .opts.level = NXT_COMP_LEVEL_UNSET,
                                       .opts.min_len = -1 };
 
     if (nxt_conf_type(comps) == NXT_CONF_OBJECT) {
-        return nxt_http_comp_set_compressor(task, rtcf, comps, 1);
-    }
-
-    for (nxt_uint_t i = 1; i < nxt_http_comp_nr_enabled_compressors; i++) {
-        nxt_conf_value_t  *obj;
-
-        obj = nxt_conf_get_array_element(comps, i - 1);
-        ret = nxt_http_comp_set_compressor(task, rtcf, obj, i);
-        if (ret == NXT_ERROR) {
+        ret = nxt_http_comp_set_compressor(task, rtcf, conf, comps, 1);
+        if (nxt_slow_path(ret == NXT_ERROR)) {
             return NXT_ERROR;
         }
+
+    } else {
+        for (nxt_uint_t i = 1; i < conf->nr_enabled; i++) {
+            nxt_conf_value_t  *obj;
+
+            obj = nxt_conf_get_array_element(comps, i - 1);
+            ret = nxt_http_comp_set_compressor(task, rtcf, conf, obj, i);
+            if (ret == NXT_ERROR) {
+                return NXT_ERROR;
+            }
+        }
     }
+
+    /* One publish point: a failure above leaves rtcf->compression NULL. */
+
+    rtcf->compression = conf;
 
     return NXT_OK;
 }

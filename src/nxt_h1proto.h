@@ -16,6 +16,17 @@
 typedef struct nxt_h1p_websocket_timer_s nxt_h1p_websocket_timer_t;
 
 
+/*
+ * The trailing bytes of a UTF-8 sequence the end of a frame cut in half.
+ * A sequence is at most four bytes, so three of them can be incomplete;
+ * they are completed by the frame that continues the message.
+ */
+typedef struct {
+    uint8_t   len;
+    u_char    tail[3];
+} nxt_h1p_ws_utf8_t;
+
+
 struct nxt_h1proto_s {
     nxt_http_request_parse_t  parser;
     nxt_http_chunk_parse_t    chunked_parse;
@@ -34,6 +45,9 @@ struct nxt_h1proto_s {
 
     uint8_t                   websocket_cont_expected;  /* 1 bit */
     uint8_t                   websocket_closed;         /* 1 bit */
+    uint8_t                   websocket_text;           /* 1 bit */
+
+    nxt_h1p_ws_utf8_t         websocket_utf8;
 
     uint32_t                  header_size;
 

@@ -14,6 +14,60 @@ typedef struct {
 } nxt_http_header_val_t;
 
 
+/*
+ * Whether the matched action replaces or removes one of the validators the
+ * static handler generates.
+ *
+ * A conditional request has to be judged against the validator the client was
+ * actually given.  When "response_headers" sets ETag or Last-Modified, the
+ * value Unit derives from the file is not what went out, so comparing against
+ * it answers the wrong question -- it refuses an If-Match carrying the tag the
+ * server itself advertised.  The static handler asks this and declines to
+ * evaluate preconditions at all in that case, which loses the 304 but is never
+ * wrong.
+ *
+ * Only the name matters here.  The value may be a template resolved per
+ * request, and resolving it this early would move tstr queries ahead of where
+ * nxt_http_set_headers() runs them.
+ */
+
+nxt_bool_t
+nxt_http_set_headers_override_validators(nxt_http_request_t *r)
+{
+    nxt_uint_t             i, n;
+    nxt_http_action_t      *action;
+    nxt_http_header_val_t  *header;
+
+    action = r->action;
+
+    if (action == NULL || action->set_headers == NULL) {
+        return 0;
+    }
+
+    header = action->set_headers->elts;
+    n = action->set_headers->nelts;
+
+    for (i = 0; i < n; i++) {
+        if (header[i].name.length == nxt_length("ETag")
+            && nxt_strncasecmp(header[i].name.start, (u_char *) "ETag",
+                               nxt_length("ETag")) == 0)
+        {
+            return 1;
+        }
+
+        if (header[i].name.length == nxt_length("Last-Modified")
+            && nxt_strncasecmp(header[i].name.start,
+                               (u_char *) "Last-Modified",
+                               nxt_length("Last-Modified")) == 0)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
 nxt_int_t
 nxt_http_set_headers_init(nxt_router_conf_t *rtcf, nxt_http_action_t *action,
      nxt_http_action_conf_t *acf)

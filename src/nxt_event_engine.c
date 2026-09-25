@@ -62,15 +62,6 @@ nxt_event_engine_create(nxt_task_t *task,
 
     engine->batch = batch;
 
-#if 0
-    if (flags & NXT_ENGINE_FIBERS) {
-        engine->fibers = nxt_fiber_main_create(engine);
-        if (engine->fibers == NULL) {
-            goto fibers_fail;
-        }
-    }
-#endif
-
     engine->current_work_queue = &engine->fast_work_queue;
 
     nxt_work_queue_cache_create(&engine->work_queue_cache, 0);
@@ -153,12 +144,6 @@ signals_fail:
 
     nxt_free(engine->signals);
     nxt_work_queue_cache_destroy(&engine->work_queue_cache);
-    nxt_free(engine->fibers);
-
-#if 0
-fibers_fail:
-#endif
-
     nxt_free(engine);
 
     return NULL;
@@ -529,16 +514,6 @@ nxt_event_engine_start(nxt_event_engine_t *engine)
 
     thr = nxt_thread();
 
-    if (engine->fibers) {
-        /*
-         * _setjmp() cannot be wrapped in a function since return from
-         * the function clobbers stack used by future _setjmp() returns.
-         */
-        _setjmp(engine->fibers->fiber.jmp);
-
-        /* A return point from fibers. */
-    }
-
     thr->log = engine->task.log;
 
     for ( ;; ) {
@@ -547,6 +522,21 @@ nxt_event_engine_start(nxt_event_engine_t *engine)
             handler = nxt_event_engine_queue_pop(engine, &task, &obj, &data);
 
             if (handler == NULL) {
+                /*
+                 * Every engine-local work queue is empty here, so no queued
+                 * item can still reference a connection struct freed during
+                 * this drain.  This is the only point at which parked structs
+                 * become reusable.
+                 *
+                 * engine->locked_work_queue is deliberately not covered: it is
+                 * the cross-thread post queue, drained separately by
+                 * nxt_event_engine_post_handler() after poll, and reading its
+                 * head here would race its spinlock.  Nothing posted through
+                 * nxt_event_engine_post() carries an nxt_conn_t today, so the
+                 * barrier holds -- but a future post that does would need this
+                 * revisited rather than assumed covered.
+                 */
+                nxt_conn_recycle_pending(engine);
                 break;
             }
 

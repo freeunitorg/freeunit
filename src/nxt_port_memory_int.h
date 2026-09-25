@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <nxt_atomic.h>
+#include <nxt_clang.h>
 
 
 #ifdef NXT_MMAP_TINY_CHUNK
@@ -29,6 +30,23 @@
 
 #define PORT_MMAP_SIZE          (PORT_MMAP_HEADER_SIZE + PORT_MMAP_DATA_SIZE)
 #define PORT_MMAP_CHUNK_COUNT   (PORT_MMAP_DATA_SIZE / PORT_MMAP_CHUNK_SIZE)
+
+/*
+ * The segment id of an incoming mmap is authored by the peer process and
+ * used as an index into nxt_process_t.incoming, so it has to be bounded.
+ *
+ * libunit assigns ids as append-only indices into its outgoing array and
+ * refuses to create a segment once that array reaches shm_mmap_limit, which
+ * is shm_limit / PORT_MMAP_DATA_SIZE computed in uint32_t.  So no conforming
+ * peer can exceed floor(UINT32_MAX / PORT_MMAP_DATA_SIZE), whatever the
+ * configured shm limit.
+ *
+ * Derived from the geometry rather than written out, because
+ * NXT_MMAP_TINY_CHUNK changes PORT_MMAP_DATA_SIZE by four orders of
+ * magnitude: 410 segments here, but 4194304 in a tiny-chunk build, where a
+ * hard-coded production-sized bound would reject legitimate traffic.
+ */
+#define NXT_PORT_MMAP_MAX_SEGMENTS  (UINT32_MAX / PORT_MMAP_DATA_SIZE + 1)
 
 
 typedef uint32_t  nxt_chunk_id_t;
@@ -53,11 +71,40 @@ struct nxt_port_mmap_header_s {
     nxt_port_id_t   sent_over;
     nxt_atomic_t    oosm;
     nxt_free_map_t  free_map[MAX_FREE_IDX];
+    /*
+     * Not padding in the alignment sense: nxt_port_mmap_set_chunk_busy() is
+     * called with PORT_MMAP_CHUNK_COUNT to plant a permanently-busy sentinel
+     * one word past the last real word of free_map[], so that a multi-chunk
+     * allocation walking off the end of the segment fails to claim its
+     * continuation instead of reading past the end of the struct.
+     */
     nxt_free_map_t  free_map_padding;
-    nxt_free_map_t  free_tracking_map[MAX_FREE_IDX];
-    nxt_free_map_t  free_tracking_map_padding;
-    nxt_atomic_t    tracking[PORT_MMAP_CHUNK_COUNT];
+
+    /*
+     * Not a live field.  It reserves the window that a peer built before the
+     * tracking bitmap was dropped still writes: such a peer memsets
+     * MAX_FREE_IDX words of free_tracking_map starting here and plants its
+     * sentinel one word past them.  A libunit of that vintage can create
+     * segments this build maps, so the window has to stay unused while those
+     * peers are supported.
+     *
+     * Reserved in the struct rather than only described in a comment, so
+     * that the next field added lands after it by construction instead of
+     * by the author having read this.  Removing the reservation is what
+     * turns the removal of the tracking bitmap into the same latent
+     * corruption it was meant to fix.
+     */
+    nxt_free_map_t  legacy_tracking_window[MAX_FREE_IDX + 1];
 };
+
+
+/*
+ * The header struct is mapped over the first PORT_MMAP_HEADER_SIZE bytes of
+ * the segment and chunk 0 starts right after it, so anything the struct
+ * declares beyond that boundary silently aliases payload.
+ */
+nxt_static_assert(sizeof(nxt_port_mmap_header_t) <= PORT_MMAP_HEADER_SIZE,
+                  "nxt_port_mmap_header_t overflows the segment header area");
 
 
 struct nxt_port_mmap_handler_s {
@@ -118,6 +165,55 @@ nxt_port_mmap_chunk_start(nxt_port_mmap_header_t *hdr, nxt_chunk_id_t c)
     mm_start = (u_char *) hdr;
 
     return mm_start + PORT_MMAP_HEADER_SIZE + c * PORT_MMAP_CHUNK_SIZE;
+}
+
+
+/*
+ * Validate that a peer-supplied (chunk_id, size) pair describes a region
+ * wholly inside the mapped data area, and report the number of chunks the
+ * region spans via *nchunks.  Returns non-zero on success.
+ *
+ * *nchunks is always written, on the reject path as well: the callers log
+ * it in their diagnostics before dropping the message.
+ *
+ * The chunk count is computed here, in size_t, with the divide-then-adjust
+ * form.  For a peer-supplied uint32_t size it must never be written as
+ * (size + PORT_MMAP_CHUNK_SIZE - 1) / PORT_MMAP_CHUNK_SIZE: that addition is
+ * evaluated at 32 bits and wraps for size in [0xFFFFC001, 0xFFFFFFFF],
+ * yielding zero chunks and thus wrongly accepting the message.  (Elsewhere
+ * in this tree the same idiom is reached only with a size_t size, or with
+ * one a caller has already clamped to PORT_MMAP_DATA_SIZE.)  Keeping the
+ * arithmetic here, out of the callers, is what makes it testable.
+ *
+ * The subtraction on the constant side is underflow-safe only because the
+ * chunk_id test above has already established chunk_id < PORT_MMAP_CHUNK_COUNT.
+ * It is not an independent property: drop that test and
+ * PORT_MMAP_CHUNK_COUNT - chunk_id underflows to a huge size_t, which the
+ * count comparison then passes.
+ */
+nxt_inline nxt_bool_t
+nxt_port_mmap_chunk_range_valid(nxt_chunk_id_t chunk_id, uint32_t size,
+    size_t *nchunks)
+{
+    size_t  n;
+
+    n = size / PORT_MMAP_CHUNK_SIZE;
+
+    if ((size % PORT_MMAP_CHUNK_SIZE) != 0) {
+        n++;
+    }
+
+    *nchunks = n;
+
+    if (chunk_id >= PORT_MMAP_CHUNK_COUNT) {
+        return 0;
+    }
+
+    if (n > (size_t) PORT_MMAP_CHUNK_COUNT - chunk_id) {
+        return 0;
+    }
+
+    return 1;
 }
 
 

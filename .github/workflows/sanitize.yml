@@ -23,7 +23,13 @@ on:
       - 'go/**'
       - 'src/**'
       - 'test/**'
+      # The gate is three files, not one: a change to the scan script or to
+      # the waiver list can break report detection or widen what is ignored
+      # just as effectively as a change to this workflow, and must not skip
+      # the job that would catch it.
       - '.github/workflows/sanitize.yml'
+      - '.github/scripts/check-sanitizer-reports.sh'
+      - '.github/sanitizer-allowlist.txt'
   push:
     # master is the release/default branch; pre-* are the release-prep
     # integration branches (e.g. pre-1.35.6) where the hardening actually
@@ -39,12 +45,39 @@ on:
       - 'go/**'
       - 'src/**'
       - 'test/**'
+      # The gate is three files, not one: a change to the scan script or to
+      # the waiver list can break report detection or widen what is ignored
+      # just as effectively as a change to this workflow, and must not skip
+      # the job that would catch it.
       - '.github/workflows/sanitize.yml'
+      - '.github/scripts/check-sanitizer-reports.sh'
+      - '.github/sanitizer-allowlist.txt'
+
+concurrency:
+  # Cancel superseded runs for the same pull request.  Non-PR events fall back
+  # to the run id, which is unique, so a push is never grouped with another:
+  # Actions keeps only one PENDING run per group and would drop a queued commit
+  # even with cancel-in-progress false, which would break bisectability.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   sanitize:
     name: "sanitize (${{ matrix.runtime }})"
     runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    # NOTE: `continue-on-error` is deliberately NOT set at job level here.
+    # It is set on every step an experimental leg can fail in: the
+    # runtime-specific configure/make steps, the Go package install, the test
+    # run and the gate.  Anything earlier -- apt, the core unitd build -- is
+    # shared infrastructure, and a failure there is a real problem on every
+    # leg rather than something the experimental runtime is allowed to have.
+    # Job-level continue-on-error only stops the WORKFLOW RUN from failing; the
+    # job keeps its own `failure` conclusion, GitHub creates one check run per
+    # matrix job mirroring it, and the check still shows red in the PR rollup.
+    # To make an experimental leg genuinely non-blocking the flag has to be on
+    # the steps that can fail -- see the run and gate steps below.
 
     # Blocking on purpose: this job exists to red-line lifecycle teardown
     # regressions.  Its first run caught the controller's raw c->link unlinks
@@ -64,8 +97,12 @@ jobs:
             # unitd master and self-skips without it.  It also makes conftest
             # rmtree the temp dir on teardown, which is fine for these tests.
             pytest_opts: "--restart"
-            # test_static is module-free; the graceful/listener drivers need
-            # the python module, so the shared teardown coverage lives here.
+            # test_static and test_conn_recycle are module-free; the
+            # graceful/listener drivers need the python module, so the shared
+            # teardown coverage lives here.  test_conn_recycle exercises the
+            # connection-struct freelist recycler under ASan (recycle churn +
+            # engine teardown at listen_threads reconfig).
+            #
             # test_conn_task_race drives a send-timeout mid-stream RST abort
             # straddling keep-alive reuse (freeunit#156): pre-fix a deferred
             # conn write item dereferenced a freed request-pool task, which
@@ -78,12 +115,40 @@ jobs:
             # assertions are nxt_assert()s, live only in the --debug build
             # configured below.  In the release test legs both the assertions
             # and ASan's report are compiled out.
+            #
+            # test_chunked's split-read case drives a chunked request body whose
+            # framing arrives in its own segments, which is how the request read
+            # buffer reaches the parser's recycle path.  Without ASan a stale
+            # buffer is usually silently reused, so only this leg turns that
+            # back into a hard failure.
+            #
+            # test_app_lifecycle drives the APPLICATION process's libunit
+            # port/fd lifecycle (process-count churn, control restart storms,
+            # whole-application remove/re-add, churn under keep-alive).  The
+            # language module is linked into the app process with the same
+            # instrumentation as unitd, so a double close(), a use-after-free
+            # of an nxt_unit_port_t or a stale descriptor in libunit becomes a
+            # hard ASan failure here instead of an intermittent "[alert]" line
+            # in one runtime's log.  It self-skips every runtime that is not
+            # built into this leg's unitd.
+            #
+            # test_configuration drives the control API only and is here for
+            # test_listeners_close_before_reply: it reads the router's
+            # nxt_debug() records to assert that a removed listener's
+            # descriptor is closed before the removal is acknowledged
+            # (#276), and skips on any build without --debug.  Every
+            # build-test leg is a release build, so this leg is the only one
+            # in which that test runs rather than skips.
             tests: >-
               test/test_graceful_reload.py
               test/test_listener_drain.py
               test/test_static.py
               test/test_conn_task_race.py
               test/test_proxy.py
+              test/test_chunked.py
+              test/test_conn_recycle.py
+              test/test_app_lifecycle.py
+              test/test_configuration.py
           - runtime: php
             apt: ""
             configure: php
@@ -92,7 +157,29 @@ jobs:
             # and --restart's teardown rmtree trips on test_php_application_
             # forbidden's restricted-permission fixture (rmtree PermissionError).
             pytest_opts: ""
-            tests: test/test_php_application.py
+            tests: >-
+              test/test_php_application.py
+              test/test_app_lifecycle.py
+          # Go is where the app-side port-fd double-close actually manifested
+          # (a flaky "close(N) failed: Bad file descriptor" in the go isolation
+          # leg) and it is the only module that registers libunit add_port /
+          # remove_port callbacks, i.e. the only one that exercises the
+          # ownership handoff those callbacks create.  Running its churn tests
+          # under ASan turns a silently-reused descriptor into a hard failure.
+          #
+          # experimental: cgo + ASan is a new combination for this repo (the Go
+          # binary links the sanitized libunit.a through cgo).  Kept
+          # non-blocking for its first green runs; drop `experimental` once it
+          # is stable.
+          - runtime: go
+            apt: ""
+            configure: go --go-path=
+            make: go
+            pytest_opts: ""
+            experimental: true
+            tests: >-
+              test/test_go_application.py
+              test/test_app_lifecycle.py
 
     steps:
       - uses: actions/checkout@v5
@@ -148,6 +235,7 @@ jobs:
         run: |
           ./configure \
             --debug \
+            --tests \
             --openssl \
             --cc-opt="-fsanitize=address,undefined -fno-omit-frame-pointer -O1" \
             --ld-opt="-fsanitize=address,undefined"
@@ -155,70 +243,143 @@ jobs:
       - name: Make unit
         run: make -j$(nproc) unitd
 
+      # --tests above only makes this target available; the default target
+      # does not build it.  Without it the `libunit` parameter of
+      # test_app_lifecycle.py self-skips, and the runtime that links libunit
+      # directly -- the one worth the most under a sanitizer, since nothing
+      # else sits between the test and the port/fd paths -- would be absent
+      # from precisely the legs built to instrument them.
+      - name: Make the libunit test application
+        run: make -j$(nproc) build/unit_app_test
+
       # Same probe-leak rationale as the core configure step above.
       - name: Configure ${{ matrix.runtime }} module
+        continue-on-error: ${{ matrix.experimental == true }}
         env:
           ASAN_OPTIONS: "detect_leaks=0"
         run: ./configure ${{ matrix.configure }}
 
       - name: Make ${{ matrix.runtime }} module
+        continue-on-error: ${{ matrix.experimental == true }}
         run: make -j$(nproc) ${{ matrix.make }}
 
-      - name: Create ASan log directory
-        run: mkdir -p "${GITHUB_WORKSPACE}/asan-logs"
+      # The Go package is consumed from build/go/src/unit.nginx.org/go by
+      # test/unit/applications/lang/go.py (it writes a go.mod `replace`
+      # pointing there), so the test apps only build after go-install.  The
+      # generated env.go carries the tree's --cc-opt/--ld-opt into cgo, which
+      # is how the sanitized libunit.a reaches the Go app process.
+      - name: Install Go package
+        continue-on-error: ${{ matrix.experimental == true }}
+        if: matrix.runtime == 'go'
+        run: make go-install
 
       # ASAN_OPTIONS / UBSAN_OPTIONS are step-level env so pytest and every
       # forked unitd process inherit them.
-      #   log_path=<workspace>/asan-logs/{asan,ubsan}
-      #     ASan and UBSan reports from the forked daemons land in
-      #     asan-logs/<tool>.<pid> files rather than only the per-test unit.log
-      #     the harness rotates away, so the guard step below can fail the job
-      #     even when pytest itself is green.  UBSan needs its OWN log_path:
-      #     with only ASAN_OPTIONS set, a UBSan-only violation that does not
-      #     escalate to a fatal signal writes to neither the asan-logs dir nor
-      #     a place the harness scans (it greps unit.log for "Sanitizer", not
-      #     UBSan's "runtime error"), so half the gate could pass silently.
       #   detect_leaks=0
       #     the fork-heavy daemon makes LeakSanitizer extremely noisy; turning
       #     leak detection on is tracked as a follow-up, once the teardown
       #     paths are use-after-free / null-deref clean.
-      # pytest_opts is per-runtime (e.g. --restart for the graceful tests).
+      #   print_stacktrace
+      #     honoured wherever the options string survives.  It does NOT take
+      #     effect inside unitd itself -- see the header of
+      #     .github/scripts/check-sanitizer-reports.sh -- which is exactly why
+      #     the gate below reads unit.log instead of trusting a log_path
+      #     directory.  Kept because it costs nothing and does apply to the
+      #     application processes a `"type": "external"` module execve()s,
+      #     which start a fresh sanitizer runtime with the options intact.
+      #     halt_on_error is deliberately NOT set, for that same reason: in an
+      #     exec'd app process it is live, and it aborts the worker on the
+      #     FIRST violation -- including ones the allowlist waives, since that
+      #     list is a post-hoc log scan and cannot stop a runtime abort.  With
+      #     it on, the known nxt_cpymem() zero-length copy (issue #200) killed
+      #     the Go app mid-response and failed unrelated tests with a missing
+      #     response header.  Unwaived reports are failed by the gate step
+      #     below, which is the mechanism that is actually load-bearing.
+      #
+      # --save-log keeps <temp_dir>/unit.log after each test.  Without it
+      # test/conftest.py removes the per-restart temp dir, and with it the only
+      # copy of any report a forked daemon wrote -- which is what the gate
+      # below scans.  pytest_opts is per-runtime (e.g. --restart for the
+      # graceful tests).
       - name: Run ${{ matrix.runtime }} sanitizer subset
+        continue-on-error: ${{ matrix.experimental == true }}
+        # TZ: same pin as build-test.yml's pytest step, and for the same
+        # reason (see its comment) -- without it this leg's
+        # test_static_last_modified_is_gmt is as vacuous under UTC as that
+        # one was.
         env:
-          ASAN_OPTIONS: "detect_leaks=0:log_path=${{ github.workspace }}/asan-logs/asan"
-          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1:log_path=${{ github.workspace }}/asan-logs/ubsan"
+          ASAN_OPTIONS: "detect_leaks=0"
+          UBSAN_OPTIONS: "print_stacktrace=1"
+          TZ: Asia/Kolkata
         run: |
-          python3 -m pytest -v ${{ matrix.pytest_opts }} ${{ matrix.tests }}
+          set -o pipefail
+          # An image without tzdata reads an unknown zone as UTC, where the
+          # test above skips itself and the leg stays green -- the pin would
+          # be silently absent.  Assert the offset instead of trusting it.
+          offset=$(date +%z)
+          if [ "$offset" != "+0530" ]; then
+            echo "TZ=$TZ resolved to $offset, expected +0530:" \
+                 "the zone is missing from this image and the pin does nothing"
+            exit 1
+          fi
+          python3 -m pytest -v --save-log ${{ matrix.pytest_opts }} \
+            ${{ matrix.tests }} | tee "${RUNNER_TEMP}/pytest.out"
 
-      - name: Show ASan/UBSan reports
+      # A leg in which every test skipped exits 0, writes clean logs, and is
+      # therefore green -- indistinguishable from one that ran and passed.
+      # That is how a module which failed to build hides: check_*() marks the
+      # runtime unavailable at session start, every parametrized test skips,
+      # and nothing anywhere says so.  It matters most for a leg being
+      # watched for "first green runs" before dropping `experimental`, where
+      # a skipped-everything green is precisely the wrong signal.
+      - name: Fail on an empty test run
         if: always()
+        continue-on-error: ${{ matrix.experimental == true }}
         run: |
-          if [ -n "$(ls -A asan-logs 2>/dev/null)" ]; then
-            for f in asan-logs/*; do
-              echo "===== ${f} ====="
-              cat "${f}"
-            done
-          else
-            echo "No ASan/UBSan report files were produced."
+          if [ ! -s "${RUNNER_TEMP}/pytest.out" ]; then
+            echo "::error::The ${{ matrix.runtime }} leg produced no pytest" \
+                 "output; the run step did not get that far."
+            exit 1
           fi
 
-      - name: Upload ASan/UBSan reports
+          # The pass has to belong to THIS runtime.  A bare "N passed" is
+          # satisfied by the runtime-agnostic parameters that run in every
+          # leg -- libunit above all, which needs no language toolchain and
+          # so passes even when this leg's own module failed to build and
+          # every one of its tests skipped.  That is the precise condition
+          # this guard exists to catch, so it looks for a passing test
+          # parametrized with the runtime's own name.
+          if ! grep -qE "\[${{ matrix.runtime }}\].*PASSED" \
+               "${RUNNER_TEMP}/pytest.out"; then
+            echo "::error::No ${{ matrix.runtime }} test passed in the" \
+                 "${{ matrix.runtime }} leg. Its tests skipped or errored," \
+                 "which exits 0 and would otherwise report this leg green" \
+                 "while covering nothing of the runtime it is named for."
+            tail -30 "${RUNNER_TEMP}/pytest.out"
+            exit 1
+          fi
+
+      - name: Upload unit logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: asan-ubsan-logs-${{ matrix.runtime }}
-          path: asan-logs/
-          if-no-files-found: ignore
+          name: unit-logs-${{ matrix.runtime }}
+          path: ${{ env.TMPDIR || '/tmp' }}/unit-test-*/unit.log
+          if-no-files-found: warn
 
-      # Sanitizer reports from forked children do not reliably fail pytest: the
-      # crash aborts a child while the session continues, and with log_path set
-      # the report never reaches the unit.log the harness scans.  Fail the job
-      # explicitly on any report file, even when pytest was green.
+      # Sanitizer reports do not reliably fail pytest.  A UBSan violation that
+      # does not escalate to a signal fails nothing at all: the harness's
+      # Log.check_alerts() greps unit.log for "[alert]" and "Sanitizer", not
+      # for UBSan's "runtime error:".  An ASan report does abort the router,
+      # but the session then fails with connection errors that read as an
+      # infrastructure flake rather than as a memory-safety bug.  Measured on
+      # master: 24 runs of the configuration-churn workload produced a UBSan
+      # violation in every run with pytest green in 23 of them, and the one
+      # ASan heap-use-after-free surfaced only as "Client can't connect to the
+      # server".  Fail the job explicitly on what the logs actually contain.
       - name: Fail on sanitizer reports
         if: always()
+        continue-on-error: ${{ matrix.experimental == true }}
         run: |
-          if [ -n "$(ls -A asan-logs 2>/dev/null)" ]; then
-            echo "::error::AddressSanitizer/UBSan produced report(s) in the ${{ matrix.runtime }} leg; see the asan-ubsan-logs-${{ matrix.runtime }} artifact and the 'Show ASan/UBSan reports' step."
-            exit 1
-          fi
-          echo "No sanitizer reports; ${{ matrix.runtime }} lifecycle paths are clean."
+          .github/scripts/check-sanitizer-reports.sh \
+            "${TMPDIR:-/tmp}" .github/sanitizer-allowlist.txt

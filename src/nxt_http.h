@@ -19,6 +19,7 @@ typedef enum {
     NXT_HTTP_SWITCHING_PROTOCOLS = 101,
 
     NXT_HTTP_OK = 200,
+    NXT_HTTP_PARTIAL_CONTENT = 206,
     NXT_HTTP_NO_CONTENT = 204,
 
     NXT_HTTP_MULTIPLE_CHOICES = 300,
@@ -36,8 +37,10 @@ typedef enum {
     NXT_HTTP_NOT_ACCEPTABLE = 406,
     NXT_HTTP_REQUEST_TIMEOUT = 408,
     NXT_HTTP_LENGTH_REQUIRED = 411,
+    NXT_HTTP_PRECONDITION_FAILED = 412,
     NXT_HTTP_PAYLOAD_TOO_LARGE = 413,
     NXT_HTTP_URI_TOO_LONG = 414,
+    NXT_HTTP_RANGE_NOT_SATISFIABLE = 416,
     NXT_HTTP_UPGRADE_REQUIRED = 426,
     NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE = 431,
 
@@ -115,6 +118,14 @@ typedef struct {
     nxt_http_field_t                *content_length;
     nxt_off_t                       content_length_n;
     const nxt_str_t                 *mime_type;
+
+    /*
+     * The response was chosen by negotiation on Accept-Encoding, so its Vary
+     * must name that header.  Kept on the response because "response_headers"
+     * is applied after the header is generated and may replace or remove it;
+     * nxt_http_request_header_send() re-asserts it once that has run.
+     */
+    uint8_t                         vary_accept_encoding;  /* 1 bit */
 } nxt_http_response_t;
 
 
@@ -267,6 +278,7 @@ struct nxt_http_request_s {
     uint8_t                         error;        /* 1 bit  */
     uint8_t                         websocket_handshake;  /* 1 bit */
     uint8_t                         chunked;  /* 1 bit */
+    uint8_t                         no_body;  /* 1 bit */
 };
 
 
@@ -430,6 +442,8 @@ void nxt_http_request_ws_frame_start(nxt_task_t *task, nxt_http_request_t *r,
     nxt_buf_t *ws_frame);
 void nxt_http_request_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_buf_t *out);
+nxt_bool_t nxt_http_request_is_bodyless_final(nxt_http_request_t *r,
+    nxt_http_status_t status);
 nxt_buf_t *nxt_http_buf_mem(nxt_task_t *task, nxt_http_request_t *r,
     size_t size);
 nxt_buf_t *nxt_http_buf_last(nxt_http_request_t *r);
@@ -485,6 +499,8 @@ nxt_int_t nxt_http_rewrite_init(nxt_router_conf_t *rtcf,
     nxt_http_action_t *action, nxt_http_action_conf_t *acf);
 nxt_int_t nxt_http_rewrite(nxt_task_t *task, nxt_http_request_t *r);
 
+nxt_bool_t nxt_http_set_headers_override_validators(nxt_http_request_t *r);
+nxt_int_t nxt_http_comp_merge_vary(nxt_http_request_t *r);
 nxt_int_t nxt_http_set_headers_init(nxt_router_conf_t *rtcf,
     nxt_http_action_t *action, nxt_http_action_conf_t *acf);
 nxt_int_t nxt_http_set_headers(nxt_http_request_t *r);
@@ -518,6 +534,8 @@ nxt_int_t nxt_http_proxy_skip(void *ctx, nxt_http_field_t *field,
     uintptr_t data);
 nxt_buf_t *nxt_http_proxy_buf_mem_alloc(nxt_task_t *task, nxt_http_request_t *r,
     size_t size);
+nxt_int_t nxt_http_proxy_buf_mem_hold(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_buf_t *b);
 void nxt_http_proxy_buf_mem_free(nxt_task_t *task, nxt_http_request_t *r,
     nxt_buf_t *b);
 

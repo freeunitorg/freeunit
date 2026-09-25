@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.36.1] - 2026-08-28
+
+### Fixed
+- Control API error responses that carry a `location` object (byte offset, line and column for
+  parse errors; the JSON Pointer `path` for validation errors) no longer fail to deserialise;
+  `unitctl` now prints the server's `detail`, `suggestion` and location instead of a generic JSON
+  decoding error.
+
+### Changed
+- Version bump to track the FreeUnit 1.36.1 release.
+- The `/status` counters in the OpenAPI spec are declared `format: int64`, so the generated
+  client models them as 64-bit instead of `i32`.
+
 ## [1.36.0] - 2026-07-16
 
 ### Added
@@ -55,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Previous releases
 See earlier versions for additional change history.
 
-[Unreleased]: https://github.com/freeunitorg/freeunit/compare/unitctl/1.36.0...HEAD
+[Unreleased]: https://github.com/freeunitorg/freeunit/compare/unitctl/1.36.1...HEAD
+[1.36.1]: https://github.com/freeunitorg/freeunit/releases/tag/unitctl/1.36.1
 [1.36.0]: https://github.com/freeunitorg/freeunit/releases/tag/unitctl/1.36.0
 [1.35.5]: https://github.com/freeunitorg/freeunit/releases/tag/unitctl/1.35.5

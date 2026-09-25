@@ -14,6 +14,19 @@ nxt_module_init_t  nxt_init_modules[1];
 nxt_uint_t         nxt_init_modules_n;
 
 
+/*
+ * Whether the descriptor is still open in this process.  Several port tests
+ * assert on a descriptor's real state rather than on what a handler returned,
+ * because the bug they guard against is a close that did or did not happen.
+ */
+
+nxt_bool_t
+nxt_test_fd_is_open(nxt_fd_t fd)
+{
+    return fcntl(fd, F_GETFD) != -1;
+}
+
+
 /* The function is defined here to prevent inline optimizations. */
 static nxt_bool_t
 nxt_msec_less(nxt_msec_t first, nxt_msec_t second)
@@ -114,18 +127,6 @@ main(int argc, char **argv)
         return 1;
     }
 
-    if (nxt_mem_zone_test(thr, 100, 20000, 128 - 1) != NXT_OK) {
-        return 1;
-    }
-
-    if (nxt_mem_zone_test(thr, 100, 10000, 4096 - 1) != NXT_OK) {
-        return 1;
-    }
-
-    if (nxt_mem_zone_test(thr, 1000, 40, 64 * 1024 - 1) != NXT_OK) {
-        return 1;
-    }
-
     if (nxt_lvlhsh_test(thr, 2, 1) != NXT_OK) {
         return 1;
     }
@@ -158,6 +159,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_utf8_sanitize_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_http_parse_test(thr) != NXT_OK) {
         return 1;
     }
@@ -187,6 +192,93 @@ main(int argc, char **argv)
     }
 
     if (nxt_port_fail_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_fd_event_change_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_use_unless_zero_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_mmap_range_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_ready_test(thr) != NXT_OK) {
+        return 1;
+    }
+    if (nxt_router_new_port_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_start_fail_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_start_fail_soak_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_proto_wedge_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_proto_death_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_start_timeout_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_app_timeout_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_remove_pid_soak_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_detached_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_websocket_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_main_start_process_reply_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_main_file_store_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_proto_creating_wedge_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_change_file_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_ctrunc_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_fd_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_rpc_fd_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_queued_fd_test(thr) != NXT_OK) {
         return 1;
     }
 

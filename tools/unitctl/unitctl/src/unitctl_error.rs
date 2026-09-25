@@ -36,6 +36,11 @@ custom_error! {pub UnitctlError
     PathNotFound { path: String } = "Path not found: {path}",
     UnknownInputFileType { path: String } = "Unknown input type for file: {path}",
     NoFilesImported = "All imports failed",
+    UndecodableConfiguration {
+        path: String,
+        members: String,
+        values: String,
+        names: String } = "The configuration at {path} holds bytes that are not valid UTF-8: {members}",
     WaitTimeoutError = "Timeout waiting for unit to start has been exceeded",
 }
 
@@ -117,6 +122,32 @@ pub fn eprint_error(error: &UnitctlError) {
         }
         UnitctlError::UiServerError { ref message } => {
             eprintln!("UI server error: {}", message);
+        }
+        UnitctlError::UndecodableConfiguration {
+            path, values, names, ..
+        } => {
+            // The sentence itself is the one custom_error! already defines, so
+            // that the two cannot drift apart.
+            eprintln!("{}", error);
+            eprintln!("Editing it would replace them, so unitctl will not open it.");
+            eprintln!("Read it with 'unitctl execute -m GET -p {}'.", path);
+            eprintln!("The bytes appear there as U+FFFD.");
+
+            // A replaced value and a replaced name need different advice.
+            if !values.is_empty() {
+                eprintln!();
+                eprintln!("These members hold a replaced byte in their value: {}", values);
+                eprintln!("Repair each one with a PUT to its own path.");
+            }
+
+            if !names.is_empty() {
+                eprintln!();
+                eprintln!("These are member names, not values: {}", names);
+                eprintln!("A PUT cannot repair them.  The path shown holds U+FFFD where the server");
+                eprintln!("holds a byte, so it names a member that does not exist.  Get the name as");
+                eprintln!("stored from 'unitctl export', which keeps the server's bytes.  Then");
+                eprintln!("rewrite the nearest parent that decodes: its object, or {}.", path);
+            }
         }
         _ => {
             eprintln!("{}", error);

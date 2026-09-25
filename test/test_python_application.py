@@ -4,6 +4,7 @@ import os
 import pwd
 import re
 import subprocess
+import threading
 import time
 import venv
 
@@ -1052,3 +1053,197 @@ def test_python_application_upload_multiple_files():
     )
     assert resp['status'] == 200, 'multiple files status'
     assert resp['body'] == 'first.txtfirst data', 'multiple files body'
+
+
+def _ps_rows():
+    out = subprocess.check_output(
+        ['ps', 'ax', '-o', 'pid=', '-o', 'ppid=', '-o', 'args=']
+    ).decode()
+
+    return [
+        parts
+        for parts in (line.split(None, 2) for line in out.splitlines())
+        if len(parts) == 3
+    ]
+
+
+def _proto_pid(name):
+    """The pid of the application's prototype process, or None.
+
+    `unit: "<name>" prototype` is the title nxt_main_process.c gives it, and
+    unlike a worker's title it survives for every runtime -- the prototype
+    never execve()s.  Matched on the whole ps line for the same reason
+    test_app_lifecycle.py does.
+    """
+
+    marker = f'unit: "{name}" prototype'
+
+    for pid, _, args in _ps_rows():
+        if marker in args:
+            return pid
+
+    return None
+
+
+def _child_pids(ppid):
+    return [pid for pid, parent, _ in _ps_rows() if parent == ppid]
+
+
+def test_python_prototype_killed_mid_start(skip_alert, findall):
+    """Issue #269: a prototype killed between forking a worker and that
+    worker's PROCESS_READY must not strand the router's START_PROCESS.
+
+    The router takes an app->pending_processes slot before posting
+    nxt_router_start_app_process_handler(), which arms an RPC on the router
+    port and sends START_PROCESS to the prototype.  The reply that would
+    retire it -- the worker's READY, forwarded by the prototype -- can never
+    arrive once the prototype is dead, and the REMOVE_PID that reports the
+    death carries no stream for a prototype that had itself reached READY.
+    Only a peer-keyed registration is retired by that message.  Without one
+    the slot is never given back; with "spare": 0 that is the whole of
+    max_pending_processes, so nxt_router_app_can_start() is false for good,
+    every later request parks in ack_waiting_req with no timeout, and no
+    replacement prototype is ever requested -- the start handler is the only
+    thing that asks, and it is what can_start gates.  The wedge is permanent
+    and survives a reload that leaves the app's config text unchanged.
+
+    So the assertions are: the in-flight request is answered rather than
+    hung, /status shows the slot back at zero, and the next request gets a
+    fresh prototype and a 200.  On the unfixed router the first of those
+    never returns, which is why every wait here is bounded.
+
+    The app module sleeps in its *import* (test/python/slow_start/wsgi.py),
+    which is what widens the PROCESS_CREATED -> READY window enough to aim
+    at.  Landing inside that window is a precondition, not an assertion:
+    the worker has to be discovered well before the window closes, and
+    /status has to still count the start as pending right before the kill.
+    A runner loaded enough to miss either skips rather than reporting a
+    failure the test did not drive.
+    """
+
+    client.load(
+        'slow_start',
+        processes={'max': 2, 'spare': 0, 'idle_timeout': 1},
+        environment={'UNIT_SLOW_START': '4'},
+    )
+
+    resp = []
+
+    def _request():
+        try:
+            # Bounded: on the unfixed router this request is never answered,
+            # and a thread stuck in recv() would outlive the test.
+            resp.append(client.get(read_timeout=20)['status'])
+
+        except Exception as exc:  # noqa: BLE001 - reported as a failure below
+            resp.append(repr(exc))
+
+    thread = threading.Thread(target=_request)
+    thread.start()
+
+    try:
+        # The prototype appears as soon as main forks it; the worker it then
+        # forks spends the next 4s importing the module.
+        deadline = time.time() + 10
+        pid = None
+
+        while time.time() < deadline:
+            pid = _proto_pid('slow_start')
+
+            if pid is not None:
+                break
+
+            time.sleep(0.1)
+
+        assert pid is not None, 'prototype never started'
+
+        # Wait for the worker to exist: killing the prototype before it has
+        # forked would carry the original start stream and let an unfixed
+        # router pass this test by the other route.  Bounded at 2s, inside
+        # the 4s import window: exhausting it means the fork stalled past
+        # the window, which leaves nothing for the kill to aim at.  Then a
+        # short pause puts the worker mid-import: past PROCESS_CREATED and
+        # before READY.
+        workers = []
+        for _ in range(40):
+            workers = _child_pids(pid)
+            if workers:
+                break
+            time.sleep(0.05)
+
+        if not workers:
+            pytest.skip('the prototype forked no worker within the window')
+
+        time.sleep(0.3)
+
+        # The worker must still be importing for the kill to land where this
+        # test aims it.  "starting" is app->pending_processes, which the
+        # router gives back only once the worker's port arrives ready, so
+        # anything but the one pending start means the window has closed --
+        # the request would then be served with 200 and the assertions below
+        # would report the wrong thing.
+        starting = client.conf_get('/status')['applications']['slow_start'][
+            'processes'
+        ]['starting']
+
+        if starting != 1:
+            pytest.skip(
+                f'the start left the import window: starting == {starting}'
+            )
+
+        # Its own teardown noise is scoped to the worker's pid below rather
+        # than skipped by shape, so an alert from any other process still
+        # fails the test.
+
+        subprocess.call(['kill', '-9', pid])
+        skip_alert(fr'process {pid} exited on signal 9')
+
+        for worker in workers:
+            # Orphaned by the kill, the worker finishes its import and then
+            # writes READY into the dead prototype's socket, which is EPIPE,
+            # and unwinds closing descriptors it inherited from the
+            # prototype -- which the kill already closed.  All of that is
+            # the pre-existing consequence of killing a prototype, not
+            # something this test's subject produces; it happens on the
+            # unfixed router too.  Both log prefixes are pid#tid
+            # (src/nxt_unit.c:7319, src/nxt_app_log.c:63), and the two are
+            # equal only for a main thread on Linux -- scope by the pid,
+            # which is the point of this skip, and let the tid be.
+            skip_alert(fr'\b{worker}#\d+ ')
+
+        # The kill retires the start RPC, which releases the slot and -- no
+        # process being left -- fails the waiting request instead of letting
+        # it sit forever.
+        thread.join(timeout=25)
+
+    finally:
+        if thread.is_alive():
+            # Do not leave a thread blocked in recv() behind; the assertion
+            # below reports the wedge.
+            thread.join(timeout=10)
+
+    assert not thread.is_alive(), (
+        'the in-flight request never completed: the start RPC was stranded'
+    )
+    assert resp == [503], f'in-flight request: {resp}'
+
+    # The slot is back, so the application is startable again.
+    deadline = time.time() + 10
+    starting = None
+
+    while time.time() < deadline:
+        starting = client.conf_get('/status')['applications']['slow_start'][
+            'processes'
+        ]['starting']
+
+        if starting == 0:
+            break
+
+        time.sleep(0.2)
+
+    assert starting == 0, f'processes.starting stuck at {starting}'
+
+    # And the next request gets a brand new prototype and is served.
+    assert client.get(read_timeout=30)['status'] == 200, 'recovered'
+    assert _proto_pid('slow_start') not in (None, pid), 'fresh prototype'
+    assert findall(fr'process {pid} exited on signal 9'), 'kill logged'
