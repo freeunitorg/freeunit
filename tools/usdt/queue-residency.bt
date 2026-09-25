@@ -4,8 +4,10 @@
  *
  * App-queue message residency (enqueue -> dequeue) and depth, keyed by
  * (slot, tracking id): a slot index alone repeats across app queues.
- * The dequeue probe fires in the application process.
- *   bpftrace tools/usdt/queue-residency.bt -p <pid>
+ * Enqueue and cancel fire in the router (unitd), dequeue in the application,
+ * i.e. the module or program linked with libunit.  A message the router
+ * cancels ends at queue__cancel: its slot then reads tracking id 0.
+ *   bpftrace tools/usdt/queue-residency.bt <path to unitd> <path to module>
  * Needs a --usdt build: docs/observability/usdt.md.
  */
 
@@ -15,13 +17,14 @@ BEGIN
     @depth = 0;
 }
 
-usdt:/usr/sbin/unitd:freeunit:queue__enqueue
+usdt:$1:freeunit:queue__enqueue
 {
     @qstart[arg0, arg1] = nsecs;
     @depth++;
 }
 
-usdt:*:freeunit:queue__dequeue
+usdt:$2:freeunit:queue__dequeue,
+usdt:$1:freeunit:queue__cancel
 /@qstart[arg0, arg1]/
 {
     @queue_residency_ns = hist(nsecs - @qstart[arg0, arg1]);

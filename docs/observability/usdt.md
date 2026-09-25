@@ -20,7 +20,8 @@ it, each probe is a `nop` until a tracer attaches.
 | `freeunit:mmap__chunk__alloc` | `nxt_port_incoming_port_mmap()` | `process->pid, PORT_MMAP_SIZE` |
 | `freeunit:mmap__chunk__get` | `nxt_router_prepare_msg()` | `req_size + content_length` |
 | `freeunit:queue__enqueue` | `nxt_app_queue_send()` | `slot index, tracking id` |
-| `freeunit:queue__dequeue` | `nxt_app_queue_recv()`, in the application process | `slot index, tracking id` |
+| `freeunit:queue__dequeue` | `nxt_app_queue_recv()`, in the application (libunit) | `slot index, tracking id` |
+| `freeunit:queue__cancel` | `nxt_router_msg_retract()`, when the router takes a queued message back | `slot index, tracking id` |
 | `freeunit:process__spawn` | `nxt_process_create()`, parent only | `child pid` (the global one, also with pid isolation) |
 | `freeunit:request__start` | `nxt_h1p_conn_request_init()`, once the request can be parsed | `(uintptr_t) r` |
 | `freeunit:request__done` | `nxt_http_request_close_handler()`, once per request, on every exit | `(uintptr_t) r, status` (0: no response) |
@@ -30,7 +31,10 @@ literal, it is not turned into `-`.
 
 A message is identified by its (slot index, tracking id) pair on both
 queue probes: the slot alone repeats across app queues, and a queue
-pointer differs between the router and the application process.
+pointer differs between the router and the application process.  A message
+ends at `queue__dequeue` or, when the router cancels it first, at
+`queue__cancel`: the cancel sets the slot's tracking id to 0, so the later
+`queue__dequeue` of that slot reports 0.
 
 ## Example
 
