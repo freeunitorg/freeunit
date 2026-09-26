@@ -1610,13 +1610,10 @@ nxt_runtime_process_free(nxt_runtime_t *rt, nxt_process_t *process)
 {
     nxt_process_t  *child;
 
-    if (process->link.next != NULL) {
-        nxt_queue_remove(&process->link);
-    }
+    nxt_process_unlink(process);
 
     nxt_queue_each(child, &process->children, nxt_process_t, link) {
-        nxt_queue_remove(&child->link);
-        child->link.next = NULL;
+        nxt_process_unlink(child);
     } nxt_queue_loop;
 
     nxt_assert(process->use_count == 0);

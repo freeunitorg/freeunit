@@ -826,13 +826,15 @@ jobs:
         if: ${{ !cancelled() && steps.metadata.outputs.module == 'python' }}
 
       # test_asgi_lifespan.py stops unitd from inside the test to check the
-      # shutdown event.  That needs --restart, which the run above does not
-      # pass, so both lifespan tests skip there.  Run the file again with it.
-      - name: Run ASGI lifespan tests with --restart
+      # shutdown event, and test_tls_certificate_update_restart restarts it
+      # to check that a replaced bundle survives.  Both need --restart, which
+      # the run above does not pass, so they skip there.  Run them again.
+      - name: Run the tests that restart unitd, with --restart
         run: |
           export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
           sudo -E /usr/bin/pytest-3 --print-log --restart \
-            test/test_asgi_lifespan.py
+            test/test_asgi_lifespan.py \
+            test/test_tls.py::test_tls_certificate_update_restart
         if: ${{ !cancelled() && steps.metadata.outputs.module == 'python' }}
 
   # C unit-test suite (src/test/ -> build/tests): HTTP parser, port/IPC

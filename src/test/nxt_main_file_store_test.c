@@ -123,9 +123,8 @@ static nxt_int_t
 nxt_main_file_store_test_store(nxt_task_t *task, const char *dir,
     const char *tmp_name, const char *name, const char *content)
 {
-    return nxt_main_test_run_file_store(task, dir, tmp_name, name,
-                                        (u_char *) content,
-                                        nxt_strlen(content));
+    return nxt_main_file_store(task, dir, tmp_name, name, (u_char *) content,
+                               nxt_strlen(content));
 }
 
 
@@ -404,6 +403,44 @@ nxt_main_file_store_test(nxt_thread_t *thr)
     }
 
     (void) unlink(victim);
+
+    /*
+     * Replace a certificate bundle under its own name.  The temporary file
+     * is in the same directory and has a reserved dot name.  A short bundle
+     * that replaces a long bundle must not keep the tail of the long bundle.
+     * The old in-place open without O_TRUNC kept that tail.
+     */
+
+    (void) unlink(name);
+
+    (void) nxt_sprintf((u_char *) name, (u_char *) name + sizeof(name),
+                       "%s/example.org%Z", dir);
+    (void) nxt_sprintf((u_char *) tmp_name,
+                       (u_char *) tmp_name + sizeof(tmp_name),
+                       "%s/.example.org.tmp%Z", dir);
+
+    if (nxt_main_file_store_test_store(task, dir, tmp_name, name,
+                                       "-----BEGIN LONG BUNDLE-----")
+        != NXT_OK)
+    {
+        nxt_main_file_store_test_fail(thr, "the long bundle store failed");
+    }
+
+    if (nxt_main_file_store_test_store(task, dir, tmp_name, name,
+                                       "-----SHORT-----") != NXT_OK)
+    {
+        nxt_main_file_store_test_fail(thr, "the short bundle store failed");
+    }
+
+    if (nxt_main_file_store_test_holds(name, "-----SHORT-----") != NXT_OK) {
+        nxt_main_file_store_test_fail(thr, "\"%s\" kept a tail of the longer "
+                                      "bundle it replaced", name);
+    }
+
+    if (stat(tmp_name, &st) == 0) {
+        nxt_main_file_store_test_fail(thr, "\"%s\" was left behind by a "
+                                      "bundle store", tmp_name);
+    }
 
     nxt_thread_time_update(thr);
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "main file store test passed");

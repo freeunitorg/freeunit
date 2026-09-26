@@ -9,6 +9,21 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        configurations behave as before. For "absent or not X", use an
        array of objects: [{"Name": null}, {"Name": "!X"}].
 
+    *) Feature: "PUT /certificates/<name>" replaces an existing certificate
+       bundle in place. Main writes the bundle to a temporary file and
+       renames it over the old one, so a crash never leaves a partial
+       bundle. When the current configuration names the bundle, the
+       controller applies the configuration again before it answers. New
+       handshakes get the new certificate; accepted connections finish
+       with the old one. An external ACME client can renew a certificate
+       with one request and no restart; see docs/acme.md. A bundle over
+       1 MiB is refused with 413. The router opens bundles read-only.
+
+    *) Bugfix: with "isolation": {"namespaces": {"pid": true}}, a worker
+       that died before it was fully started left its record, port and
+       descriptor in the main process until the prototype exited. The
+       prototype now reports such a worker to main, which drops them.
+
     *) Bugfix: the main process accepted a second WHOAMI from an
        application process, and a parent that is not a prototype. The
        process was then linked into its parent's list twice, which
