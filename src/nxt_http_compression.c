@@ -85,6 +85,14 @@ struct nxt_http_comp_ctx_s {
      */
     nxt_int_t                       sel_idx;
 
+    /*
+     * The client sent "identity;q=0": it will not take the file's own bytes.
+     * Recorded separately from sel_idx because a request that refuses
+     * identity and accepts gzip selects gzip and is perfectly serveable --
+     * until a Range enters, which is served as identity.
+     */
+    bool                            identity_refused;
+
     nxt_off_t                       resp_clen;
     nxt_off_t                       clen_sent;
 
@@ -100,7 +108,6 @@ struct nxt_http_comp_ctx_s {
  * router on the next request (#167).
  */
 struct nxt_http_comp_conf_s {
-    nxt_tstr_t                  *accept_encoding_query;
     nxt_http_route_rule_t       *mime_types_rule;
     nxt_http_comp_compressor_t  *enabled;
     nxt_uint_t                  nr_enabled;
@@ -439,21 +446,132 @@ nxt_http_comp_wants_compression(void)
 }
 
 
+bool
+nxt_http_comp_identity_refused(void)
+{
+    nxt_http_comp_ctx_t  *ctx = nxt_http_comp_ctx();
+
+    return ctx->identity_refused;
+}
+
+
+/*
+ * Finds the ";q=" weight parameter in one Accept-Encoding element.
+ *
+ * RFC 9110 Sect. 12.4.2 spells the parameter "weight = OWS ';' OWS ('q' /
+ * 'Q') '=' qvalue", and an ABNF literal is case-insensitive besides, so
+ * "identity;Q=0" is as valid as "identity;q=0".  A plain strstr() for ";q="
+ * misses it, and for identity that means missing a refusal.  Spaces are
+ * already gone by the time this runs.
+ */
+
+static char *
+nxt_http_comp_find_weight(char *tkn)
+{
+    for (char *p = tkn; (p = strchr(p, ';')) != NULL; p++) {
+        if ((p[1] == 'q' || p[1] == 'Q') && p[2] == '=') {
+            return p;
+        }
+    }
+
+    return NULL;
+}
+
+
+/*
+ * Reads the qvalue that follows a weight's "=".
+ *
+ * RFC 9110 Sect. 12.4.2 spells it "( '0' [ '.' 0*3DIGIT ] ) / ( '1' [ '.'
+ * 0*3( '0' ) ] )": one leading digit, then at most a fraction.  strtod() on
+ * its own is far looser and every way it is looser is a bug here.  It takes
+ * no digits at all from "q=" and from "q=abc" and reports 0, which this
+ * function's caller reads as a refusal; it reads "q=0x10" as hexadecimal;
+ * and it turns "q=nan" into a NaN that compares false against both range
+ * bounds, so the element is kept and then outranks every real weight.
+ *
+ * So check the shape first and only then convert.  The digit count in the
+ * fraction is not enforced: rejecting "q=0.0000" would read a client's
+ * refusal as an acceptance, which is the wrong way to be strict.
+ *
+ * An element whose weight does not parse is ignored, exactly like an element
+ * naming a coding this build does not have.  Reading it as q=0 is the other
+ * defensible answer -- nginx reads a bad quantity as zero -- but a zero is a
+ * refusal here, so "identity;q=" would answer 406 to a client that refused
+ * nothing.
+ */
+
+static bool
+nxt_http_comp_parse_weight(const char *qvalue, double *qval)
+{
+    const char  *p = qvalue;
+
+    if (*p != '0' && *p != '1') {
+        return false;
+    }
+
+    p++;
+
+    if (*p == '.') {
+        p++;
+
+        while (*p >= '0' && *p <= '9') {
+            p++;
+        }
+    }
+
+    /* Anything may follow the weight, but only as a further parameter. */
+
+    if (*p != '\0' && *p != ';') {
+        return false;
+    }
+
+    *qval = strtod(qvalue, NULL);
+
+    return *qval <= 1.0;
+}
+
+
 static nxt_uint_t
 nxt_http_comp_compressor_lookup_enabled(const nxt_http_comp_conf_t *conf,
                                         const nxt_str_t *token)
 {
-    if (token->start[0] == '*') {
-        return NXT_HTTP_COMP_SCHEME_IDENTITY;
+    /* With compression switched off there is no enabled array to search. */
+
+    if (conf == NULL) {
+        return NXT_HTTP_COMP_SCHEME_UNKNOWN;
     }
 
+    /*
+     * RFC 9110 Sect. 8.4.1: a content coding is a token, and tokens are
+     * compared case-insensitively.  "Identity;q=0" and "GZIP" are as valid
+     * as the lowercase spellings, and a case-sensitive compare silently
+     * ignores them -- which, for identity, means missing a refusal.
+     */
+
     for (nxt_uint_t i = 0; i < conf->nr_enabled; i++) {
-        if (nxt_strstr_eq(token, &conf->enabled[i].type->token)) {
+        if (nxt_strcasestr_eq(token, &conf->enabled[i].type->token)) {
             return i;
         }
     }
 
     return NXT_HTTP_COMP_SCHEME_UNKNOWN;
+}
+
+
+/*
+ * Whether the token names the identity coding.  Identity is a representation
+ * every response has, so it is recognised from the static table rather than
+ * from the enabled compressors: it has to be recognised with none enabled.
+ */
+
+static bool
+nxt_http_comp_token_is_identity(const nxt_str_t *token)
+{
+    const nxt_http_comp_type_t  *identity;
+
+    identity = &nxt_http_comp_compressors[NXT_HTTP_COMP_SCHEME_IDENTITY];
+
+    return nxt_strcasestr_eq(token, &identity->token);
 }
 
 
@@ -473,14 +591,166 @@ nxt_http_comp_compressor_lookup_enabled(const nxt_http_comp_conf_t *conf,
  *
  * 'identity;q=0' seems to basically mean the same thing...
  */
+/*
+ * Collects every Accept-Encoding field into one value.
+ *
+ * RFC 9110 Sect. 5.3: a field that may carry a comma-separated list can be
+ * sent as several lines, and a recipient must treat them as one value joined
+ * by commas.  A variable query answers with the first matching field only
+ * (nxt_http_var_header()), so "Accept-Encoding: gzip" followed by
+ * "Accept-Encoding: identity;q=0" lost the refusal and the request was served
+ * the identity bytes it had declined -- and in the other order the gzip it
+ * would have accepted was never seen, so it drew a 406.
+ *
+ * The single-field case, which is every ordinary request, points straight at
+ * the field and copies nothing.
+ */
+
+static nxt_int_t
+nxt_http_comp_accept_encoding(nxt_http_request_t *r, nxt_str_t *value)
+{
+    u_char                  *p;
+    size_t                  len;
+    nxt_uint_t              n;
+    nxt_http_field_t        *f, *first;
+    nxt_http_fields_iter_t  iter;
+
+    static const nxt_str_t  accept_encoding = nxt_string("Accept-Encoding");
+
+    n = 0;
+    len = 0;
+    first = NULL;
+
+    for (f = nxt_http_fields_first(&iter, r->inline_fields,
+                                   r->num_inline_fields, r->fields);
+         f != NULL;
+         f = nxt_http_fields_next(&iter))
+    {
+        if (f->skip || f->name_length != accept_encoding.length
+            || nxt_strncasecmp(f->name, accept_encoding.start,
+                               accept_encoding.length) != 0)
+        {
+            continue;
+        }
+
+        if (n == 0) {
+            first = f;
+
+        } else {
+            len += nxt_length(", ");
+        }
+
+        len += f->value_length;
+        n++;
+    }
+
+    if (n == 0) {
+        nxt_str_null(value);
+        return NXT_OK;
+    }
+
+    if (n == 1) {
+        value->start = first->value;
+        value->length = first->value_length;
+
+        return NXT_OK;
+    }
+
+    p = nxt_mp_nget(r->mem_pool, len);
+    if (nxt_slow_path(p == NULL)) {
+        return NXT_ERROR;
+    }
+
+    value->start = p;
+    value->length = len;
+
+    n = 0;
+
+    for (f = nxt_http_fields_first(&iter, r->inline_fields,
+                                   r->num_inline_fields, r->fields);
+         f != NULL;
+         f = nxt_http_fields_next(&iter))
+    {
+        if (f->skip || f->name_length != accept_encoding.length
+            || nxt_strncasecmp(f->name, accept_encoding.start,
+                               accept_encoding.length) != 0)
+        {
+            continue;
+        }
+
+        if (n++ != 0) {
+            p = nxt_cpymem(p, ", ", nxt_length(", "));
+        }
+
+        p = nxt_cpymem(p, f->value, f->value_length);
+    }
+
+    return NXT_OK;
+}
+
+
+/*
+ * The length the compressor decision is made against, or -1 when the body's
+ * length is not known yet.
+ */
+
+static nxt_off_t
+nxt_http_comp_resp_length(const nxt_http_request_t *r)
+{
+    if (r->resp.content_length_n > -1) {
+        return r->resp.content_length_n;
+    }
+
+    if (r->resp.content_length != NULL) {
+        return strtol((char *) r->resp.content_length->value, NULL, 10);
+    }
+
+    return -1;
+}
+
+
+/*
+ * Whether "min_length" declines this response.  A body of unknown length is
+ * compressed, so it is never below the minimum.
+ *
+ * Both nxt_http_comp_select_compressor() and
+ * nxt_http_comp_apply_compression() ask this, and they have to give the same
+ * answer: the first decides which coding is chosen, the second whether the
+ * chosen one is really applied.
+ */
+
+static bool
+nxt_http_comp_below_min_len(nxt_off_t clen,
+                            const nxt_http_comp_compressor_t *compressor)
+{
+    return clen > -1 && clen < compressor->opts.min_len;
+}
+
+
 static nxt_int_t
 nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
-                                nxt_http_request_t *r, const nxt_str_t *token)
+                                nxt_http_request_t *r, const nxt_str_t *token,
+                                bool *identity_refused)
 {
+    /*
+     * What the field said about identity: "identity_named" and
+     * "identity_named_ok" carry an explicit "identity" token, the wildcard
+     * pair below carries "*".  They are kept apart because the explicit one
+     * wins, and "named" records the enabled codings the field listed, which
+     * are the ones the wildcard does not stand for.
+     */
     bool       identity_allowed = true;
+    bool       identity_named = false;
+    bool       identity_named_ok = false;
+    bool       wildcard_seen = false;
     char       *str, *tkn, *tail, *cur;
     double     weight = 0.0;
+    double     wildcard_qval = 0.0;
+    uint32_t   named = 0;
+    nxt_off_t  clen = nxt_http_comp_resp_length(r);
     nxt_int_t  idx = NXT_HTTP_COMP_SCHEME_IDENTITY;
+
+    *identity_refused = false;
 
     str = nxt_str_cstrz(r->mem_pool, token);
     if (str == NULL) {
@@ -489,11 +759,17 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
 
     cur = tail = str;
     /*
-     * To ease parsing the Accept-Encoding header, remove all spaces,
-     * which hold no semantic meaning.
+     * To ease parsing the Accept-Encoding header, remove all optional
+     * whitespace, which holds no semantic meaning.
+     *
+     * OWS is SP or HTAB (RFC 9110 Sect. 5.6.3), and it is legal on either
+     * side of the weight's semicolon.  Removing only the space left
+     * "identity;<HTAB>q=0" unparsed, so the element read as an unknown
+     * coding and the refusal it carried was lost -- which handed a client
+     * that refused identity a 206 of exactly those bytes.
      */
     for (; *cur != '\0'; cur++) {
-        if (*cur == ' ') {
+        if (*cur == ' ' || *cur == '\t') {
             continue;
         }
 
@@ -502,35 +778,82 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
     *tail = '\0';
 
     while ((tkn = strsep(&str, ","))) {
-        char                    *qptr;
-        double                  qval = 1.0;
-        nxt_str_t               enc;
-        nxt_uint_t              ecidx;
-        nxt_http_comp_scheme_t  scheme;
+        bool        wildcard;
+        char        *qptr;
+        double      qval = 1.0;
+        nxt_str_t   enc;
+        nxt_uint_t  ecidx;
 
-        qptr = strstr(tkn, ";q=");
-        if (qptr != NULL) {
-            nxt_errno = 0;
-
-            qval = strtod(qptr + 3, NULL);
-
-            if (nxt_errno == ERANGE || qval < 0.0 || qval > 1.0) {
-                continue;
-            }
+        qptr = nxt_http_comp_find_weight(tkn);
+        if (qptr != NULL && !nxt_http_comp_parse_weight(qptr + 3, &qval)) {
+            continue;
         }
 
         enc.start = (u_char *)tkn;
         enc.length = qptr != NULL ? (size_t)(qptr - tkn) : strlen(tkn);
 
-        ecidx = nxt_http_comp_compressor_lookup_enabled(conf, &enc);
-        if (ecidx == NXT_HTTP_COMP_SCHEME_UNKNOWN) {
+        /*
+         * The wildcard is the whole token, not merely its first character:
+         * "*" is a tchar, so "*foo" is a legal (and unknown) coding name, and
+         * matching on the first byte alone made it stand for every coding.
+         */
+
+        wildcard = (enc.length == 1 && enc.start[0] == '*');
+
+        /*
+         * The wildcard names no coding of its own, so it is only recorded
+         * here; the pass after the loop turns it into candidates.
+         */
+
+        if (wildcard) {
+            wildcard_seen = true;
+            wildcard_qval = qval;
             continue;
         }
 
-        scheme = conf->enabled[ecidx].type->scheme;
+        /*
+         * Identity says whether the response's own bytes are acceptable,
+         * which is independent of the compressors configured.  Read it
+         * before the lookup, so that a refusal still arrives when
+         * compression is off -- that is the one case where identity is all
+         * the server has to offer.
+         */
 
-        if (qval == 0.0 && scheme == NXT_HTTP_COMP_SCHEME_IDENTITY) {
-            identity_allowed = false;
+        if (nxt_http_comp_token_is_identity(&enc)) {
+            ecidx = NXT_HTTP_COMP_SCHEME_IDENTITY;
+            identity_named = true;
+            identity_named_ok = (qval != 0.0);
+
+        } else {
+            ecidx = nxt_http_comp_compressor_lookup_enabled(conf, &enc);
+            if (ecidx == NXT_HTTP_COMP_SCHEME_UNKNOWN) {
+                continue;
+            }
+
+            /*
+             * Listed, whether or not it can be applied: the wildcard stands
+             * only for the codings the field did not name.  An index past
+             * the width of the mask is left out of the wildcard, which is
+             * the safe direction -- "compressors" may repeat an encoding, so
+             * the index is not bounded by the number of distinct codings.
+             */
+
+            if (ecidx < sizeof(named) * 8) {
+                named |= (uint32_t) 1 << ecidx;
+            }
+
+            /*
+             * A coding below its own "min_length" is never applied, so it
+             * cannot stand in for a refused identity and it must not outrank
+             * a coding that can.  "min_length" is per compressor, so with
+             * gzip at 1000 and zstd at 0 a 100-byte response is serveable as
+             * zstd; picking gzip on its weight alone and stopping there
+             * refused a request that could be satisfied.
+             */
+
+            if (nxt_http_comp_below_min_len(clen, &conf->enabled[ecidx])) {
+                continue;
+            }
         }
 
         if (qval == 0.0 || qval < weight) {
@@ -539,6 +862,78 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
 
         idx = ecidx;
         weight = qval;
+    }
+
+    /*
+     * Sect. 12.5.3: identity "is acceptable by default unless specifically
+     * excluded by the Accept-Encoding header field stating either
+     * 'identity;q=0' or '*;q=0' without a more specific entry for
+     * 'identity'".  The explicit token therefore wins outright: in
+     * "gzip, identity;q=0.5, *;q=0" the client refused everything it did not
+     * name and then named identity as acceptable, so identity is acceptable.
+     */
+
+    if (identity_named) {
+        identity_allowed = identity_named_ok;
+
+    } else if (wildcard_seen) {
+        identity_allowed = (wildcard_qval != 0.0);
+    }
+
+    *identity_refused = !identity_allowed;
+
+    /*
+     * Sect. 12.5.3: "*" matches any available content coding not explicitly
+     * listed in the field.  It therefore stands for every enabled coding the
+     * client did not name, and for identity, at its own weight.  Reading it
+     * as identity alone left the wildcard unable to select a compressor at
+     * all, so "identity;q=0, *;q=1" was answered 406 although the gzip the
+     * wildcard offered was enabled and applicable.
+     *
+     * The pass runs after the loop so that a named coding keeps its own
+     * weight whatever its place in the field, and the comparison is strict
+     * so that a named coding wins a tie with the wildcard.  Identity is
+     * taken before any compressor because all of these stand at the one
+     * wildcard weight and identity is the coding that needs nothing applied.
+     */
+
+    if (wildcard_qval > weight) {
+        if (!identity_named) {
+            idx = NXT_HTTP_COMP_SCHEME_IDENTITY;
+            weight = wildcard_qval;
+
+        } else if (conf != NULL) {
+            for (nxt_uint_t i = 1; i < conf->nr_enabled; i++) {
+                const nxt_str_t  *tok = &conf->enabled[i].type->token;
+
+                if (i >= sizeof(named) * 8
+                    || (named & ((uint32_t) 1 << i)) != 0)
+                {
+                    continue;
+                }
+
+                /*
+                 * A lookup by name only ever finds the first entry for a
+                 * coding, so a repeated "compressors" entry is unreachable
+                 * by name.  The wildcard must not reach it either, or "*"
+                 * would run a coding under options no named request can ask
+                 * for.
+                 */
+
+                if (nxt_http_comp_compressor_lookup_enabled(conf, tok) != i) {
+                    continue;
+                }
+
+                if (nxt_http_comp_below_min_len(clen, &conf->enabled[i])) {
+                    continue;
+                }
+
+                idx = i;
+                weight = wildcard_qval;
+
+                break;
+            }
+        }
     }
 
     if (idx == NXT_HTTP_COMP_SCHEME_IDENTITY && !identity_allowed) {
@@ -812,6 +1207,23 @@ nxt_http_comp_merge_vary(nxt_http_request_t *r)
 
 
 /*
+ * A 406 depends on Accept-Encoding as much as the representation it stands in
+ * for, so it carries "Vary: Accept-Encoding" too.  Without it a cache that
+ * stores error responses may hand this 406 to a later client that would have
+ * been served.  nxt_http_request_error() drops every response field, but
+ * nxt_http_request_header_send() re-adds Vary from this flag.
+ */
+
+static nxt_int_t
+nxt_http_comp_not_acceptable(nxt_http_request_t *r)
+{
+    r->resp.vary_accept_encoding = 1;
+
+    return NXT_HTTP_NOT_ACCEPTABLE;
+}
+
+
+/*
  * Decides whether an acceptable representation exists, and remembers which
  * compressor would be used, without touching the response or allocating a
  * compressor context.
@@ -828,25 +1240,72 @@ nxt_http_comp_merge_vary(nxt_http_request_t *r)
 nxt_int_t
 nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
 {
-    nxt_int_t               ret, idx;
-    nxt_str_t               accept_encoding, mime_type = {};
-    nxt_router_conf_t       *rtcf;
-    nxt_http_comp_ctx_t     *ctx = nxt_http_comp_ctx();
-    nxt_http_comp_conf_t    *conf = nxt_http_comp_request_conf(r);
+    bool                  identity_refused;
+    nxt_int_t             ret, idx;
+    nxt_str_t             accept_encoding, mime_type = {};
+    nxt_http_comp_ctx_t   *ctx = nxt_http_comp_ctx();
+    nxt_http_comp_conf_t  *conf = nxt_http_comp_request_conf(r);
 
     *ctx = (nxt_http_comp_ctx_t){ .resp_clen = -1, .sel_idx = -1 };
-
-    /* A built configuration always holds identity, so NULL is the only
-       "no compression" state. */
-    if (conf == NULL) {
-        return NXT_OK;
-    }
 
     if (r->resp.content_length == NULL && r->resp.content_length_n == -1) {
         return NXT_OK;
     }
 
     if (r->resp.content_length_n == 0) {
+        return NXT_OK;
+    }
+
+    /*
+     * A 1xx, 204 or 304 describes no representation, so there is nothing for
+     * the client to have refused and no 406 to give: negotiation is skipped
+     * whatever the request asked for.  The length tests above do not cover
+     * this.  An application may send Content-Length with such a status -- a
+     * 304 carries the length of the body the client already has -- and
+     * nxt_http_response_content_length() stores that field without setting
+     * content_length_n, which stays -1.
+     *
+     * r->status holds the response status at both callers: the application
+     * path copies it out of the response before asking, and the static path
+     * is at 200 here, ahead of precondition evaluation, so a 406 still
+     * outranks the 304 or 412 a validator would give.
+     */
+
+    if (nxt_http_status_no_representation(r->status)) {
+        return NXT_OK;
+    }
+
+    if (nxt_http_comp_is_resp_content_encoded(r)) {
+        return NXT_OK;
+    }
+
+    ret = nxt_http_comp_accept_encoding(r, &accept_encoding);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return NXT_ERROR;
+    }
+
+    /*
+     * Ask what the client accepts before anything below rules compression
+     * out.  Identity is the one representation the server always has, so
+     * "identity;q=0" is a refusal that has to be answered even where no
+     * compressor can run.  Asking afterwards, once the response had been
+     * declared serveable, is how the file's own bytes reached a client that
+     * had refused them (#390).
+     */
+
+    idx = nxt_http_comp_select_compressor(conf, r, &accept_encoding,
+                                          &identity_refused);
+    if (idx == -1) {
+        return nxt_http_comp_not_acceptable(r);
+    }
+
+    /*
+     * A built configuration always holds identity, so NULL is the only "no
+     * compression" state, and identity is then the only coding there is: a
+     * client refusing it left through the 406 above.
+     */
+
+    if (conf == NULL) {
         return NXT_OK;
     }
 
@@ -857,8 +1316,16 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
         mime_type.length = r->resp.content_type->value_length;
     }
 
+    /*
+     * A coding was selected, but the "types" rule below can still withdraw
+     * it, and the fallback is always identity.  Where the client refused
+     * identity that fallback does not exist, so the answer is 406 rather
+     * than the bytes it declined.  "min_length" cannot reach here: a coding
+     * below it is not selected in the first place.
+     */
+
     if (mime_type.start == NULL) {
-        return NXT_OK;
+        return identity_refused ? nxt_http_comp_not_acceptable(r) : NXT_OK;
     }
 
     if (conf->mime_types_rule != NULL) {
@@ -866,14 +1333,8 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
                                        mime_type.start,
                                        mime_type.length);
         if (ret == 0) {
-            return NXT_OK;
+            return identity_refused ? nxt_http_comp_not_acceptable(r) : NXT_OK;
         }
-    }
-
-    rtcf = r->conf->socket_conf->router_conf;
-
-    if (nxt_http_comp_is_resp_content_encoded(r)) {
-        return NXT_OK;
     }
 
     /*
@@ -887,24 +1348,8 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
         return NXT_ERROR;
     }
 
-    ret = nxt_tstr_query_init(&r->tstr_query, rtcf->tstr_state, &r->tstr_cache,
-                              r, r->mem_pool);
-    if (nxt_slow_path(ret == NXT_ERROR)) {
-        return NXT_ERROR;
-    }
-
-    ret = nxt_tstr_query(task, r->tstr_query, conf->accept_encoding_query,
-                         &accept_encoding);
-    if (nxt_slow_path(ret != NXT_OK)) {
-        return NXT_ERROR;
-    }
-
-    idx = nxt_http_comp_select_compressor(conf, r, &accept_encoding);
-    if (idx == -1) {
-        return NXT_HTTP_NOT_ACCEPTABLE;
-    }
-
     ctx->sel_idx = idx;
+    ctx->identity_refused = identity_refused;
 
     return NXT_OK;
 }
@@ -987,7 +1432,6 @@ nxt_http_comp_apply_compression(nxt_task_t *task, nxt_http_request_t *r)
 {
     int                         err;
     nxt_int_t                   idx;
-    nxt_off_t                   min_len;
     nxt_http_comp_ctx_t         *ctx = nxt_http_comp_ctx();
     nxt_http_comp_conf_t        *conf;
     nxt_http_comp_compressor_t  *compressor;
@@ -1005,16 +1449,9 @@ nxt_http_comp_apply_compression(nxt_task_t *task, nxt_http_request_t *r)
     conf = nxt_http_comp_request_conf(r);
     compressor = &conf->enabled[idx];
 
-    if (r->resp.content_length_n > -1) {
-        ctx->resp_clen = r->resp.content_length_n;
-    } else if (r->resp.content_length != NULL) {
-        ctx->resp_clen =
-                strtol((char *)r->resp.content_length->value, NULL, 10);
-    }
+    ctx->resp_clen = nxt_http_comp_resp_length(r);
 
-    min_len = compressor->opts.min_len;
-
-    if (ctx->resp_clen > -1 && ctx->resp_clen < min_len) {
+    if (nxt_http_comp_below_min_len(ctx->resp_clen, compressor)) {
         return NXT_OK;
     }
 
@@ -1122,8 +1559,6 @@ nxt_http_comp_compression_init(nxt_task_t *task, nxt_router_conf_t *rtcf,
     nxt_conf_value_t      *comps, *mimes;
     nxt_http_comp_conf_t  *conf;
 
-    static const nxt_str_t  accept_enc_str =
-                                    nxt_string("$header_accept_encoding");
     static const nxt_str_t  comps_str = nxt_string("compressors");
     static const nxt_str_t  mimes_str = nxt_string("types");
 
@@ -1140,13 +1575,6 @@ nxt_http_comp_compression_init(nxt_task_t *task, nxt_router_conf_t *rtcf,
         if (nxt_slow_path(conf->mime_types_rule == NULL)) {
             return NXT_ERROR;
         }
-    }
-
-    conf->accept_encoding_query =
-                            nxt_tstr_compile(rtcf->tstr_state, &accept_enc_str,
-                                             NXT_TSTR_STRZ);
-    if (nxt_slow_path(conf->accept_encoding_query == NULL)) {
-        return NXT_ERROR;
     }
 
     comps = nxt_conf_get_object_member(comp_conf, &comps_str, NULL);

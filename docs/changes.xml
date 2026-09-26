@@ -600,6 +600,87 @@ connection to 10 MB of payload that the application has not received yet
 receive()); a single frame larger than that is still accepted when nothing else
 is waiting.  A fragmented message also left a count behind that lowered the
 limit applied to the next message.
+a byte-range request from a client that refused the identity coding is no
+longer answered with identity bytes.  A range is served as identity, so
+Range together with "Accept-Encoding: identity;q=0" returned a 206 carrying
+exactly the bytes the client said it would not take; the range is now
+ignored and the full 200 is sent in a coding the client accepts.  An
+unsatisfiable range from such a client is no longer answered with 416 either.
+A request that accepts no coding at all is still 406.  Several Accept-Encoding
+lines in one request are now read as one comma-joined value; previously only the
+first was consulted.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a response no compressor applies to is no longer served as identity to a client
+that refused the identity coding.  With a compressor configured,
+"Accept-Encoding: gzip, identity;q=0" was accepted because gzip was acceptable,
+and the response was then sent uncompressed anyway when its media type was
+outside "types" or it had no media type at all: the identity bytes the request
+had declined.  Such a request is now answered with 406, with a Range header
+and without.  A 406 from this negotiation carries "Vary: Accept-Encoding".  A
+1xx, 204 or 304 response is never negotiated, so an application that answers
+one of these with a Content-Length is not affected.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the "*" in Accept-Encoding now stands for every enabled compressor the client
+did not name, not for the identity coding alone.  "identity;q=0, *;q=1" was
+answered 406 with gzip enabled and applicable, because the wildcard could only
+ever select identity, which that same field refused.  A coding the field does
+name keeps its own weight and is not matched by the wildcard, so it also wins
+a tie with it: "gzip, *" now sends gzip, where it used to send the response
+uncompressed.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a compressor below its own min_length is no longer selected over a
+lower-weight compressor that can be applied.  min_length belongs to the
+compressor, so with gzip at 1000 and deflate at 0 a 100-byte response was sent
+uncompressed because gzip carried the higher weight.  A client that refused
+the identity coding received the same uncompressed bytes.  Such a client is
+now served as deflate, and where every compressor it accepts is below its
+min_length it is answered 406 instead of the bytes it declined.
+</para>
+</change>
+
+<change type="change">
+<para>
+a server with no compression configured now answers 406 to a request whose
+Accept-Encoding refuses the identity coding: "identity;q=0", or "*;q=0" with
+no more specific entry for identity.  Identity is the only coding such a server
+has, and it used to send the response, or the requested range of it, in the
+bytes the client had declined.  To read that refusal, every response with a
+known, non-zero length is now checked for Accept-Encoding; before, the check
+ran only with a compressor configured.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a malformed weight in Accept-Encoding is no longer read as a refusal.  The
+qvalue was converted with strtod(), which takes no digits at all from
+"identity;q=" and from "identity;q=abc" and reports zero, so either one
+answered 406 to a client that had refused nothing; "q=0x0" and "q=0e0" did the
+same.  An element whose weight does not match the grammar of RFC 9110
+Sect. 12.4.2 is now ignored, as an element naming an unknown coding already
+was.  This also removes "q=nan", which passed the 0-to-1 range check and then
+outranked every real weight.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a negotiation failure on Accept-Encoding was answered with 503 instead of 406
+when the response came from an application.  The router treated every result
+of the acceptability check other than success as a server error; only the
+static path reported the 406.
 </para>
 </change>
 
