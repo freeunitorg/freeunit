@@ -10,6 +10,16 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="bugfix">
+<para>
+an upstream 1xx interim response ("100 Continue", "103 Early Hints") was
+relayed to the client as the response, with the final response relayed as its
+body.  The proxy now drops interim responses (101 excepted) and relays the
+final one; more than ten of them, or one larger than the proxy header buffer,
+fails the request with 502.
+</para>
+</change>
+
 <change type="change">
 <para>
 a certificate bundle whose private key does not belong to its first
