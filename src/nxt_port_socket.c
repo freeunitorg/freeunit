@@ -55,7 +55,7 @@ static void nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
     nxt_port_recv_msg_t *msg);
 static nxt_buf_t *nxt_port_buf_alloc(nxt_port_t *port);
 static void nxt_port_buf_free(nxt_port_t *port, nxt_buf_t *b);
-static nxt_bool_t nxt_port_announce(nxt_task_t *task, nxt_port_t *port);
+static nxt_int_t nxt_port_announce(nxt_task_t *task, nxt_port_t *port);
 static void nxt_port_rearm_now(nxt_task_t *task, nxt_port_t *port);
 static void nxt_port_retry_later(nxt_task_t *task, nxt_port_t *port);
 static void nxt_port_retry_handler(nxt_task_t *task, void *obj, void *data);
@@ -706,15 +706,20 @@ nxt_port_fd_disable_write(nxt_task_t *task, nxt_port_t *port, void *data)
  * only once the marker has left: a peer that reads one drains the whole ring,
  * so anything enqueued in between is covered by the same marker.
  *
- * Answers whether the marker was attempted and did not go out, which is the
- * caller's cue to pace the next attempt rather than make it at once.  A port
- * that owes nothing, one that can no longer be written to, and an EAGAIN all
- * answer 0: the first two have nothing to pace, and after EAGAIN the socket
- * is full, so the peer's next read raises an edge and paces the retry by
- * itself.
+ * Return values:
+ *
+ * NXT_AGAIN indicates the kernel rejected the marker due to insufficient
+ * memory; the caller must delay the next attempt.  NXT_OK indicates the
+ * port owes nothing, the marker was sent, or the write returned EAGAIN.
+ * After EAGAIN, the socket buffer is full, so the next read by the peer
+ * triggers a write event.  If the port is already closed (pair[1] is -1),
+ * the function also returns NXT_OK.  NXT_ERROR indicates an unrecoverable
+ * socket error.  In that case, the function transfers queued messages to
+ * nxt_port_error_handler(), and the caller must neither enable the write
+ * event nor schedule a retry.
  */
 
-static nxt_bool_t
+static nxt_int_t
 nxt_port_announce(nxt_task_t *task, nxt_port_t *port)
 {
     ssize_t         n;
@@ -732,7 +737,7 @@ nxt_port_announce(nxt_task_t *task, nxt_port_t *port)
      */
 
     if (port->announce == 0 || port->pair[1] == -1) {
-        return 0;
+        return NXT_OK;
     }
 
     /* nxt_socketpair_send() reads both, whether or not it sends them. */
@@ -765,7 +770,7 @@ nxt_port_announce(nxt_task_t *task, nxt_port_t *port)
         nxt_debug(task, "port{%d,%d} %d: queue announced", (int) port->pid,
                   (int) port->id, port->socket.fd);
 
-        return 0;
+        return NXT_OK;
     }
 
     /*
@@ -774,11 +779,31 @@ nxt_port_announce(nxt_task_t *task, nxt_port_t *port)
      * every outcome.
      */
 
-    if (n == NXT_AGAIN && port->socket.error == NXT_EAGAIN) {
-        return 0;
+    if (n == NXT_AGAIN) {
+        return (port->socket.error == NXT_EAGAIN) ? NXT_OK : NXT_AGAIN;
     }
 
-    return 1;
+    /*
+     * If the peer closed the socket or an unrecoverable error occurred,
+     * do not schedule a retry.  Delaying retries would leave the timer
+     * running indefinitely without re-enabling the write event.  As a
+     * result, queued messages would never reach the error handler.
+     *
+     * Transfer queued messages to nxt_port_error_handler() now, matching
+     * the fail path in nxt_port_write_msgs().  Decrement announce by 1;
+     * any leftover count on a failed port is harmless because NXT_ERROR
+     * never arms the retry timer.
+     */
+
+    nxt_atomic_fetch_add(&port->announce, -1);
+
+    nxt_port_inc_use(port);
+
+    nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                       nxt_port_error_handler, task, &port->socket,
+                       &port->socket);
+
+    return NXT_ERROR;
 }
 
 
@@ -797,6 +822,8 @@ nxt_port_announce(nxt_task_t *task, nxt_port_t *port)
 static void
 nxt_port_rearm_now(nxt_task_t *task, nxt_port_t *port)
 {
+    nxt_int_t  ret;
+
     if (port->pair[1] == -1) {
         return;
     }
@@ -823,11 +850,18 @@ nxt_port_rearm_now(nxt_task_t *task, nxt_port_t *port)
      * covers every one of them, since this is the only place the marker is
      * ever attempted.  The marker goes first so that a failed one leaves
      * the event down, instead of an enable that the retry takes back in the
-     * same pass -- two epoll_ctl() calls that cancel out.
+     * same pass -- two epoll_ctl() calls that cancel out.  If sending the
+     * marker fails permanently, nxt_port_announce() hands the port to
+     * nxt_port_error_handler(), and there is nothing left to arm.
      */
 
-    if (nxt_slow_path(nxt_port_announce(task, port))) {
-        nxt_port_retry_later(task, port);
+    ret = nxt_port_announce(task, port);
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        if (ret == NXT_AGAIN) {
+            nxt_port_retry_later(task, port);
+        }
+
         return;
     }
 
@@ -1240,22 +1274,16 @@ next_fragment:
              * NXT_AGAIN.  After EAGAIN the socket is full, and the peer's
              * next read raises the edge that brings this handler back.
              * After ENOBUFS or ENOMEM it is not full: the kernel could not
-             * allocate for the call, and no edge is coming.  The inline
-             * pass re-arms a disabled event, which is how the first retry
-             * runs at all; but this pass finds the event active, and an
-             * active edge-triggered event is never re-added, so a retry
-             * that runs out of memory again would leave the message queued
-             * for ever, and every later message on this port behind it.
-             * Force the readiness re-check the drained pass does -- disable,
-             * then enable -- so the poller reports the socket writable on
-             * the spot.  One epoll_ctl() pair per failed retry.
+             * allocate for the call, and no edge is coming.  This pass
+             * finds the event active, and an active edge-triggered event
+             * is never re-added, so a retry must force a readiness re-check.
              *
-             * Paced, though, rather than on the spot.  The socket is
-             * writable, so the re-check comes back at once and the retry
-             * fails again while the shortage lasts: unpaced, this is a tight
-             * loop on the engine thread for as long as the machine is short
-             * of memory (#407).  nxt_port_retry_later() does the disable as
-             * well, so block_write is not set here.
+             * The retry is paced rather than attempted on the spot.  The
+             * socket is writable, so an immediate re-check fails again
+             * while the memory shortage lasts (#407).  Instead,
+             * nxt_port_retry_later() disables the event and sets a timer
+             * to re-enable it.  Because it handles the event disable directly,
+             * block_write is not set here.
              */
 
             if (data == NULL && port->socket.error != NXT_EAGAIN) {

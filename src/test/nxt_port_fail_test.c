@@ -2380,9 +2380,9 @@ nxt_port_fail_test_enqueue(nxt_task_t *task, nxt_port_t *port, nxt_mp_t *mp,
  * to be able to tell a retry that came back because time passed from one
  * that came back because nothing held it.  A real clock cannot answer that
  * without sleeping, and sleeping would make the numbers the scheduler's
- * rather than the port's.  engine->timers.now starts at zero on a fresh
- * engine and nxt_timer_expire() is what advances it, so the legs below own
- * the clock outright.
+ * rather than the port's.  In these tests, only nxt_timer_expire()
+ * advances engine->timers.now.  The test functions control the timer clock
+ * directly by advancing it in discrete intervals.
  */
 
 static void
@@ -2459,11 +2459,25 @@ nxt_port_fail_test_spin(nxt_task_t *task, nxt_msec_t window,
 
 static nxt_int_t
 nxt_port_fail_test_paced(nxt_task_t *task, nxt_uint_t leg, const char *what,
-    nxt_port_t *rearm)
+    nxt_port_t *port, nxt_port_t *rearm)
 {
     nxt_uint_t  dispatches;
 
     dispatches = nxt_port_fail_test_spin(task, 64, rearm);
+
+    /*
+     * Write dispatch counters do not record attempts made without an active
+     * event.  Verify pacing directly: ensure the retry timer remains enabled
+     * at the end of the 64 ms window.
+     */
+
+    if (!port->retry_timer.enabled) {
+        nxt_log_error(NXT_LOG_NOTICE, task->log,
+                      "port failure test: leg %ui: no retry timer is armed "
+                      "after a 64ms window of held ENOMEM; the retry is not "
+                      "paced", leg);
+        return NXT_ERROR;
+    }
 
     nxt_log_error(NXT_LOG_NOTICE, task->log,
                   "port failure test: leg %ui: %s, %ui write dispatches in a "
@@ -2531,6 +2545,18 @@ nxt_port_fail_test_recovers(nxt_task_t *task, nxt_uint_t leg,
                       "announce is %d and the payload was completed %ui "
                       "times, expected 0 and once", leg,
                       (int) port->announce, nxt_port_fail_test_completions);
+        return NXT_ERROR;
+    }
+
+    /*
+     * An active timer retains a port reference.  If the timer is not disabled,
+     * the port leaks when the test frees the engine.
+     */
+
+    if (port->retry_timer.enabled) {
+        nxt_log_error(NXT_LOG_NOTICE, task->log,
+                      "port failure test: leg %ui: the retry timer is still "
+                      "armed after the marker went out", leg);
         return NXT_ERROR;
     }
 
@@ -2935,7 +2961,9 @@ nxt_port_fail_test_wakeup_errno(nxt_thread_t *thr)
         goto done;
     }
 
-    if (nxt_port_fail_test_paced(task, 6, "queued marker", NULL) != NXT_OK) {
+    if (nxt_port_fail_test_paced(task, 6, "queued marker", port, NULL)
+        != NXT_OK)
+    {
         goto done;
     }
 
@@ -2978,7 +3006,9 @@ nxt_port_fail_test_wakeup_errno(nxt_thread_t *thr)
         goto done;
     }
 
-    if (nxt_port_fail_test_paced(task, 7, "owed marker", NULL) != NXT_OK) {
+    if (nxt_port_fail_test_paced(task, 7, "owed marker", port, NULL)
+        != NXT_OK)
+    {
         goto done;
     }
 
@@ -3035,13 +3065,100 @@ nxt_port_fail_test_wakeup_errno(nxt_thread_t *thr)
     }
 
     if (nxt_port_fail_test_paced(task, 8, "owed marker re-armed every ms",
-                                 port)
+                                 port, port)
         != NXT_OK)
     {
         goto done;
     }
 
     if (nxt_port_fail_test_recovers(task, 8, port, pair[0]) != NXT_OK) {
+        goto done;
+    }
+
+    /*
+     * Leg 9: A send fails with EPIPE while a retry is delayed and a marker
+     * is pending.
+     *
+     * When the retry timer fires, nxt_port_rearm_now() attempts to send
+     * the pending marker first.
+     *
+     * If the send returns EPIPE or another unrecoverable error, the error
+     * is permanent, not a transient memory shortage.  Continuing to delay
+     * retries would leave the timer running indefinitely without re-enabling
+     * the write event.  In that case, queued messages would never reach the
+     * error handler, leaking port references.
+     *
+     * Instead, nxt_port_announce() must forward queued messages to
+     * nxt_port_error_handler(), matching the write failure path.
+     *
+     * Sequence:
+     * 1. Trigger a pending marker (simulate ENOMEM when queuing).
+     * 2. Queue a second marker.
+     * 3. Hold ENOMEM until the retry timer is set.
+     * 4. Change simulated error to EPIPE and advance the timer clock.
+     */
+
+    nxt_port_fail_test_completions = 0;
+
+    if (nxt_port_fail_test_enqueue(task, port, mp, NXT_ENOMEM, 100000, 1,
+                                   NULL)
+        != NXT_OK)
+    {
+        goto done;
+    }
+
+    /* The helper counts one completion per enqueue. */
+
+    nxt_port_fail_test_completions = 0;
+
+    if (nxt_port_fail_test_enqueue(task, port, mp, NXT_ENOMEM, 100000, 0,
+                                   NULL)
+        != NXT_OK)
+    {
+        goto done;
+    }
+
+    if (port->announce == 0 || nxt_queue_is_empty(&port->messages)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: leg 9: expected an owed and a "
+                      "queued marker (announce %d, queue empty %d)",
+                      (int) port->announce,
+                      (int) nxt_queue_is_empty(&port->messages));
+        goto done;
+    }
+
+    if (nxt_port_fail_test_paced(task, 9, "owed and queued marker", port,
+                                 NULL)
+        != NXT_OK)
+    {
+        goto done;
+    }
+
+    nxt_socketpair_test_send_fail(NXT_EPIPE, 100000);
+
+    for (i = 0; i < 4; i++) {
+        nxt_port_fail_test_turn(engine, 64);
+    }
+
+    n = recv(pair[0], block, sizeof(block), MSG_DONTWAIT);
+
+    if (n != -1 || nxt_errno != NXT_EAGAIN
+        || !nxt_queue_is_empty(&port->messages)
+        || port->announce != 0 || port->retry_timer.enabled
+        || nxt_fd_event_is_active(port->socket.write)
+        || port->use_count != 1 || nxt_port_fail_test_completions != 1)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: leg 9: after the send failed with "
+                      "EPIPE, %d bytes read (errno %d), queue empty %d, "
+                      "announce %d, timer armed %d, write active %d, "
+                      "use_count %d, completions %ui; expected -1, %d, 1, 0, "
+                      "0, 0, 1 and 1", (int) n, (int) nxt_errno,
+                      (int) nxt_queue_is_empty(&port->messages),
+                      (int) port->announce, (int) port->retry_timer.enabled,
+                      (int) nxt_fd_event_is_active(port->socket.write),
+                      (int) port->use_count, nxt_port_fail_test_completions,
+                      (int) NXT_EAGAIN);
         goto done;
     }
 
@@ -3059,6 +3176,17 @@ done:
     port->queue = NULL;
 
     nxt_port_close(task, port);
+
+    /*
+     * If a test leg fails while the retry timer is enabled, the timer retains
+     * a port reference.
+     *
+     * Advance the event loop past the maximum delay.  The expired timer detects
+     * that the port is closed and releases its reference, allowing clean
+     * engine teardown.
+     */
+
+    nxt_port_fail_test_turn(engine, 64);
 
     if (pair[0] != -1 && nxt_test_fd_is_open(pair[0])) {
         nxt_fd_close(pair[0]);
