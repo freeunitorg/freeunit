@@ -18,6 +18,10 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        again and causes no reconfiguration. The router opens bundles
        read-only.
 
+    *) Bugfix: the router leaked the TLS contexts it had built for a new
+       configuration when applying that configuration failed later, for
+       example in a bundle of a later listener or in an application.
+
     *) Bugfix: with "isolation": {"namespaces": {"pid": true}}, a worker
        that died before it was fully started left its record, port and
        descriptor in the main process until the prototype exited. The

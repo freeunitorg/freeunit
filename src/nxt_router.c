@@ -228,6 +228,9 @@ static void nxt_router_conf_ready(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf);
 static void nxt_router_conf_send(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf, nxt_port_msg_type_t type);
+#if (NXT_TLS)
+static void nxt_router_conf_error_tls(nxt_task_t *task, nxt_queue_t *sockets);
+#endif
 
 static nxt_int_t nxt_router_conf_create(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf, u_char *start, u_char *end);
@@ -2199,12 +2202,51 @@ nxt_router_conf_error(nxt_task_t *task, nxt_router_temp_conf_t *tmcf)
 
     nxt_router_access_log_release(task, &router->lock, rtcf->access_log);
 
+#if (NXT_TLS)
+    /*
+     * The new socket confs go with rtcf->mem_pool, but the TLS contexts
+     * built for them so far are OpenSSL allocations.  No connection uses
+     * them: the listen joints are posted to the engines only on success.
+     * The confs in keeping_sockets are the old ones and stay in use.
+     */
+    nxt_router_conf_error_tls(task, &creating_sockets);
+    nxt_router_conf_error_tls(task, &updating_sockets);
+#endif
+
     nxt_mp_destroy(rtcf->mem_pool);
 
     nxt_router_conf_send(task, tmcf, NXT_PORT_MSG_RPC_ERROR);
 
     nxt_mp_release(tmcf->mem_pool);
 }
+
+
+#if (NXT_TLS)
+
+static void
+nxt_router_conf_error_tls(nxt_task_t *task, nxt_queue_t *sockets)
+{
+    nxt_queue_link_t   *qlk;
+    nxt_socket_conf_t  *skcf;
+
+    for (qlk = nxt_queue_first(sockets);
+         qlk != nxt_queue_tail(sockets);
+         qlk = nxt_queue_next(qlk))
+    {
+        skcf = nxt_queue_link_data(qlk, nxt_socket_conf_t, link);
+
+        /*
+         * A conf without a bundle failed before its first context.  A
+         * bundle whose server_init() failed has a NULL context, and
+         * SSL_CTX_free(NULL) does nothing.
+         */
+        if (skcf->tls != NULL && skcf->tls->bundle != NULL) {
+            task->thread->runtime->tls->server_free(task, skcf->tls);
+        }
+    }
+}
+
+#endif
 
 
 static void

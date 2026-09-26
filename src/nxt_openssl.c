@@ -360,6 +360,9 @@ fail:
 
     SSL_CTX_free(ctx);
 
+    /* nxt_router_conf_error() frees the contexts of the other bundles. */
+    bundle->ctx = NULL;
+
 #if (OPENSSL_VERSION_NUMBER >= 0x1010100fL \
      && OPENSSL_VERSION_NUMBER < 0x1010101fL)
     RAND_keep_random_devices_open(0);

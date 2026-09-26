@@ -35,6 +35,14 @@ reconfiguration.  The router opens bundles read-only.
 
 <change type="bugfix">
 <para>
+the router leaked the TLS contexts it had built for a new configuration when
+applying that configuration failed later, for example in a bundle of a later
+listener or in an application.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 with "isolation": {"namespaces": {"pid": true}}, a worker that died before it
 was fully started left its record, port and descriptor in the main process
 until the prototype exited.  The prototype now reports such a worker to main,
