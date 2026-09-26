@@ -921,6 +921,29 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
 
         is_range = (rstatus == NXT_HTTP_PARTIAL_CONTENT);
 
+        /*
+         * A range is served as identity (see the comment on skipping
+         * compression below), so a client that sent "identity;q=0" must not
+         * be given one: it asked not to receive the file's own bytes, and a
+         * 206 hands it exactly those.  Such a request is still serveable --
+         * it named a coding Unit has -- so drop the Range rather than the
+         * request, and answer the full 200 in the coding it did accept.
+         *
+         * Ignoring a Range is already how this function answers a malformed
+         * one, a multi-range one and an If-Range mismatch (Sect. 14.2 lets a
+         * server ignore Range), so this needs no new shape of response.  A
+         * 406 would be the other reading, but it refuses a request that can
+         * be satisfied, and a client asking for bytes 0-9 of a small file is
+         * better served the file than an error.
+         *
+         * Not reached when nothing is acceptable: that is already 406, from
+         * nxt_http_comp_check_acceptable() above.
+         */
+
+        if (is_range && nxt_http_comp_identity_refused()) {
+            is_range = 0;
+        }
+
         if (is_range) {
             r->status = NXT_HTTP_PARTIAL_CONTENT;
             r->resp.content_length_n = range_end - range_start + 1;

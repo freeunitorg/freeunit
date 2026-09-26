@@ -96,6 +96,7 @@ extern nxt_int_t nxt_http_comp_compress_static_response(nxt_task_t *task,
     nxt_http_request_t *r, nxt_file_t **f, nxt_file_info_t *fi,
     size_t static_buf_len, size_t *out_total);
 extern bool nxt_http_comp_wants_compression(void);
+extern bool nxt_http_comp_identity_refused(void);
 extern bool nxt_http_comp_compressor_is_valid(const nxt_str_t *token);
 extern nxt_int_t nxt_http_comp_check_acceptable(nxt_task_t *task,
     nxt_http_request_t *r);

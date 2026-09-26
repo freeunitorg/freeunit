@@ -85,6 +85,14 @@ struct nxt_http_comp_ctx_s {
      */
     nxt_int_t                       sel_idx;
 
+    /*
+     * The client sent "identity;q=0": it will not take the file's own bytes.
+     * Recorded separately from sel_idx because a request that refuses
+     * identity and accepts gzip selects gzip and is perfectly serveable --
+     * until a Range enters, which is served as identity.
+     */
+    bool                            identity_refused;
+
     nxt_off_t                       resp_clen;
     nxt_off_t                       clen_sent;
 
@@ -439,6 +447,15 @@ nxt_http_comp_wants_compression(void)
 }
 
 
+bool
+nxt_http_comp_identity_refused(void)
+{
+    nxt_http_comp_ctx_t  *ctx = nxt_http_comp_ctx();
+
+    return ctx->identity_refused;
+}
+
+
 static nxt_uint_t
 nxt_http_comp_compressor_lookup_enabled(const nxt_http_comp_conf_t *conf,
                                         const nxt_str_t *token)
@@ -447,8 +464,15 @@ nxt_http_comp_compressor_lookup_enabled(const nxt_http_comp_conf_t *conf,
         return NXT_HTTP_COMP_SCHEME_IDENTITY;
     }
 
+    /*
+     * RFC 9110 Sect. 8.4.1: a content coding is a token, and tokens are
+     * compared case-insensitively.  "Identity;q=0" and "GZIP" are as valid
+     * as the lowercase spellings, and a case-sensitive compare silently
+     * ignores them -- which, for identity, means missing a refusal.
+     */
+
     for (nxt_uint_t i = 0; i < conf->nr_enabled; i++) {
-        if (nxt_strstr_eq(token, &conf->enabled[i].type->token)) {
+        if (nxt_strcasestr_eq(token, &conf->enabled[i].type->token)) {
             return i;
         }
     }
@@ -475,12 +499,25 @@ nxt_http_comp_compressor_lookup_enabled(const nxt_http_comp_conf_t *conf,
  */
 static nxt_int_t
 nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
-                                nxt_http_request_t *r, const nxt_str_t *token)
+                                nxt_http_request_t *r, const nxt_str_t *token,
+                                bool *identity_refused)
 {
+    /*
+     * "identity_allowed" carries what the wildcard said; "identity_named"
+     * and "identity_named_ok" carry what an explicit "identity" token said.
+     * They are kept apart because the explicit one wins: in
+     * "gzip, identity;q=0.5, *;q=0" the client refused everything it did not
+     * name and then named identity as acceptable, so identity is acceptable.
+     * Collapsing the two lets the wildcard veto a coding the client allowed.
+     */
     bool       identity_allowed = true;
+    bool       identity_named = false;
+    bool       identity_named_ok = false;
     char       *str, *tkn, *tail, *cur;
     double     weight = 0.0;
     nxt_int_t  idx = NXT_HTTP_COMP_SCHEME_IDENTITY;
+
+    *identity_refused = false;
 
     str = nxt_str_cstrz(r->mem_pool, token);
     if (str == NULL) {
@@ -529,8 +566,14 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
 
         scheme = conf->enabled[ecidx].type->scheme;
 
-        if (qval == 0.0 && scheme == NXT_HTTP_COMP_SCHEME_IDENTITY) {
-            identity_allowed = false;
+        if (scheme == NXT_HTTP_COMP_SCHEME_IDENTITY) {
+            if (enc.length == 1 && enc.start[0] == '*') {
+                identity_allowed = (qval != 0.0);
+
+            } else {
+                identity_named = true;
+                identity_named_ok = (qval != 0.0);
+            }
         }
 
         if (qval == 0.0 || qval < weight) {
@@ -540,6 +583,12 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
         idx = ecidx;
         weight = qval;
     }
+
+    if (identity_named) {
+        identity_allowed = identity_named_ok;
+    }
+
+    *identity_refused = !identity_allowed;
 
     if (idx == NXT_HTTP_COMP_SCHEME_IDENTITY && !identity_allowed) {
         return -1;
@@ -828,6 +877,7 @@ nxt_http_comp_merge_vary(nxt_http_request_t *r)
 nxt_int_t
 nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
 {
+    bool                    identity_refused;
     nxt_int_t               ret, idx;
     nxt_str_t               accept_encoding, mime_type = {};
     nxt_router_conf_t       *rtcf;
@@ -899,12 +949,14 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
         return NXT_ERROR;
     }
 
-    idx = nxt_http_comp_select_compressor(conf, r, &accept_encoding);
+    idx = nxt_http_comp_select_compressor(conf, r, &accept_encoding,
+                                          &identity_refused);
     if (idx == -1) {
         return NXT_HTTP_NOT_ACCEPTABLE;
     }
 
     ctx->sel_idx = idx;
+    ctx->identity_refused = identity_refused;
 
     return NXT_OK;
 }
