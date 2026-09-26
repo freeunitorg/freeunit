@@ -34,6 +34,10 @@
 .Op Fl Fl control-mode Ar mode
 .Op Fl Fl control-user Ar user
 .Op Fl Fl control-group Ar group
+.Op Fl Fl status Ar socket
+.Op Fl Fl status-mode Ar mode
+.Op Fl Fl status-user Ar user
+.Op Fl Fl status-group Ar group
 .Op Fl Fl group Ar name
 .Op Fl Fl user Ar name
 .Op Fl Fl log Ar file
@@ -85,6 +89,26 @@ permissions act as defense-in-depth rather than the sole access control.
 Where peer credentials are unavailable, or for an IP-based control
 socket, those socket permissions (or network reachability) remain the
 boundary.
+.It Fl Fl status Ar socket
+Opens a second, read-only control API socket in IPv4, IPv6,
+or UNIX-domain format.
+It serves only
+.Ql GET /status
+and its subpaths; other methods get 405 and other paths get 404.
+It is not opened by default.
+.It Fl Fl status-mode Ar mode
+Sets the permission of the UNIX-domain status socket; the default is 0600.
+.It Fl Fl status-user Ar user
+Sets the owner of the UNIX-domain status socket.
+.It Fl Fl status-group Ar group
+Sets the group of the UNIX-domain status socket.
+.Pp
+The status socket does not check peer credentials, so a user of another
+ID, such as an application's, can read
+.Ql /status
+through it.
+Its socket permissions (or network reachability) are the only access
+control.
 .It Fl Fl group Ar name , Fl Fl user Ar name
 Override group name and user name used to run Unit's non-privileged processes.
 .It Fl Fl log Ar file

@@ -540,6 +540,18 @@ application builds and behaves as before.
 </para>
 </change>
 
+<change type="feature">
+<para>
+a read-only status socket.  The new "--status" option opens a second control
+API socket that serves only "GET /status" and its subpaths; any other method
+gets 405 and any other path gets 404.  It does not check peer credentials, so
+an application user, such as a web worker, can read /status but cannot change
+the configuration.  "--status-mode", "--status-user" and "--status-group" set
+the permissions of a UNIX-domain status socket; the mode defaults to 0600.
+The socket is not opened by default.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 the java module split every outgoing WebSocket text message larger than 8 KiB

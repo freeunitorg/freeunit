@@ -79,6 +79,11 @@ struct nxt_runtime_s {
     const char             *control_user;
     const char             *control_group;
 
+    const char             *status_addr;
+    mode_t                 status_mode;
+    const char             *status_user;
+    const char             *status_group;
+
     nxt_str_t              certs;
     nxt_str_t              scripts;
 
@@ -94,6 +99,10 @@ struct nxt_runtime_s {
 
     nxt_sockaddr_t         *controller_listen;
     nxt_listen_socket_t    *controller_socket;
+
+    /* The read-only status socket, NULL unless "--status" is given. */
+    nxt_sockaddr_t         *status_listen;
+    nxt_listen_socket_t    *status_socket;
 };
 
 
@@ -141,6 +150,7 @@ NXT_EXPORT nxt_port_t *nxt_runtime_port_find(nxt_runtime_t *rt, nxt_pid_t pid,
 
 /* STUB */
 nxt_int_t nxt_runtime_controller_socket(nxt_task_t *task, nxt_runtime_t *rt);
+nxt_int_t nxt_runtime_status_socket(nxt_task_t *task, nxt_runtime_t *rt);
 
 nxt_str_t *nxt_current_directory(nxt_mp_t *mp);
 

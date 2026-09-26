@@ -407,6 +407,15 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        key and the TrueAsync test suite are removed with it; a PHP application
        builds and behaves as before.
 
+    *) Feature: a read-only status socket. The new "--status" option opens
+       a second control API socket that serves only "GET /status" and its
+       subpaths; any other method gets 405 and any other path gets 404. It
+       does not check peer credentials, so an application user, such as a
+       web worker, can read /status but cannot change the configuration.
+       "--status-mode", "--status-user" and "--status-group" set the
+       permissions of a UNIX-domain status socket; the mode defaults to
+       0600. The socket is not opened by default.
+
     *) Bugfix: the java module split every outgoing WebSocket text message
        larger than 8 KiB into 8 KiB frames, whatever "max_frame_size" was set
        to. A 64 KiB message arrived as eight frames and a 16 MiB one as about
