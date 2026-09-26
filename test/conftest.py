@@ -1,6 +1,5 @@
 import atexit
 import fcntl
-import inspect
 import json
 import os
 import re
@@ -216,7 +215,6 @@ def run(request):
         r'sendmsg.+failed',
         r'recvmsg.+failed',
     ]
-    option.skip_sanitizer = False
 
     _fds_info['main']['skip'] = False
     _fds_info['router']['skip'] = False
@@ -600,9 +598,6 @@ def unit_run(state_dir=None):
 
 def unit_stop():
     if not option.restart:
-        if inspect.stack()[1].function.startswith('test_'):
-            pytest.skip('no restart mode')
-
         return
 
     # Startup may have failed before the process/pid were recorded; nothing to
@@ -976,6 +971,15 @@ def is_su():
 @pytest.fixture
 def is_unsafe(request):
     return request.config.getoption("--unsafe")
+
+
+@pytest.fixture
+def requires_restart():
+    # unit_stop() does nothing without --restart, so a test that calls it in
+    # its body cannot check anything after the call.  Skip such a test at
+    # setup.
+    if not option.restart:
+        pytest.skip('no restart mode')
 
 
 @pytest.fixture

@@ -9,7 +9,6 @@ class Options:
         'configure_flag': {},
         'is_privileged': os.geteuid() == 0,
         'skip_alerts': [],
-        'skip_sanitizer': False,
         'system': platform.system(),
     }
 

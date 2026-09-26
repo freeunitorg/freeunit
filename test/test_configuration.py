@@ -365,13 +365,10 @@ def test_listeners_no_app():
 
 
 def test_listeners_unix_abstract(system):
-    if system != 'Linux':
-        assert 'error' in try_addr("unix:@sock"), 'abstract at'
+    if system == 'Linux':
+        pytest.skip('not yet')
 
-    pytest.skip('not yet')
-
-    assert 'error' in try_addr("unix:\0soc"), 'abstract \0'
-    assert 'error' in try_addr("unix:\u0000soc"), 'abstract \0 unicode'
+    assert 'error' in try_addr("unix:@sock"), 'abstract at'
 
 
 def test_listeners_addr():
