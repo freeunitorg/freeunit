@@ -199,6 +199,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_checked_test.c \
     src/test/nxt_conn_close_test.c \
     src/test/nxt_router_prepare_msg_test.c \
+    src/test/nxt_router_response_parse_test.c \
 "
 
 
@@ -350,6 +351,7 @@ NXT_FUZZ_SRCS=" \
     fuzzing/nxt_http_h1p_fuzz.c \
     fuzzing/nxt_http_h1p_peer_fuzz.c \
     fuzzing/nxt_json_fuzz.c \
+    fuzzing/nxt_router_app_response_fuzz.c \
     fuzzing/nxt_unit_msg_fuzz.c \
 "
 
