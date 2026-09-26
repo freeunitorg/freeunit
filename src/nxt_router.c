@@ -7542,11 +7542,6 @@ nxt_router_app_prepare_request(nxt_task_t *task,
     buf = nxt_router_prepare_msg(task, req_rpc_data->request, app,
                                  nxt_app_msg_prefix[app->type], &status);
     if (nxt_slow_path(buf == NULL)) {
-        if (status == NXT_HTTP_INTERNAL_SERVER_ERROR) {
-            nxt_alert(task, "stream #%uD, app '%V': failed to prepare app "
-                      "message", req_rpc_data->stream, &app->name);
-        }
-
         nxt_http_request_error(task, req_rpc_data->request, status);
 
         return;
@@ -7668,8 +7663,8 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
                       || r->local->address_length > UINT8_MAX
                       || nxt_sockaddr_port_length(r->local) > UINT8_MAX))
     {
-        nxt_alert(task, "request version or address too long for the "
-                  "application protocol");
+        nxt_alert(task, "app '%V': request version or address too long for "
+                  "the application protocol", &app->name);
 
         return NULL;
     }
@@ -7714,8 +7709,8 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     req_size += fields_count * sizeof(nxt_unit_field_t);
 
     if (nxt_slow_path(req_size > PORT_MMAP_DATA_SIZE)) {
-        nxt_alert(task, "headers too big to fit in shared memory (%uz)",
-                  req_size);
+        nxt_alert(task, "app '%V': headers too big to fit in shared memory "
+                  "(%uz)", &app->name, req_size);
 
         return NULL;
     }
