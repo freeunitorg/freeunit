@@ -731,6 +731,22 @@ first was consulted.
 
 <change type="bugfix">
 <para>
+a response that no compressor applies to is no longer sent as identity to a
+client that refused the identity coding.  With a compressor configured,
+"Accept-Encoding: gzip, identity;q=0" was accepted because gzip was
+acceptable.  When the media type of the response was outside "types", or the
+response had no media type, the response was then sent uncompressed: the
+identity bytes that the request had refused.  Such a request now gets 406,
+with a Range header and without one.  A 406 from this negotiation carries
+"Vary: Accept-Encoding".  A 1xx, 204 or 304 response is never negotiated, so
+an application that sends one of these with a Content-Length is not affected.
+A response with no body, and a response that carries its own
+Content-Encoding, are not affected either.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 "*" in Accept-Encoding now stands for each enabled compressor that the client
 did not name.  Before, it stood for the identity coding only.
 "identity;q=0, *;q=1" was answered 406 with gzip enabled and applicable,

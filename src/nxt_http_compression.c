@@ -1189,6 +1189,30 @@ nxt_http_comp_merge_vary(nxt_http_request_t *r)
 
 
 /*
+ * A 406 depends on Accept-Encoding as much as the representation that it
+ * replaces.  So it carries "Vary: Accept-Encoding" too.  Without it, a cache
+ * that stores error responses can give this 406 to a later client that could
+ * be served.  nxt_http_request_error() drops each response field, but
+ * nxt_http_request_header_send() adds Vary again from this flag.
+ *
+ * Only the 406 carries Vary.  When the types rule withdraws the coding,
+ * when the response has no media type, or when no compressor is
+ * configured, the 200 to a client that accepts identity has no Vary.
+ * A shared cache can give that 200 to a later client that refused
+ * identity.  Vary on each such 200 is a larger change, and it is not
+ * made here.
+ */
+
+static nxt_int_t
+nxt_http_comp_not_acceptable(nxt_http_request_t *r)
+{
+    r->resp.vary_accept_encoding = 1;
+
+    return NXT_HTTP_NOT_ACCEPTABLE;
+}
+
+
+/*
  * Decides whether an acceptable representation exists, and remembers which
  * compressor would be used, without touching the response or allocating a
  * compressor context.
@@ -1227,6 +1251,47 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
         return NXT_OK;
     }
 
+    /*
+     * A 1xx, 204 or 304 describes no representation.  So there is nothing
+     * that the client could refuse, and no 406 to give: negotiation is
+     * skipped, whatever the request asked for.  The length tests above do
+     * not cover this.  An application can send Content-Length with such a
+     * status.  A 304 carries the length of the body that the client already
+     * has.  nxt_http_response_content_length() stores that field without
+     * setting content_length_n, which stays -1.
+     *
+     * r->status holds the response status at both callers.  The application
+     * path copies it out of the response before it asks.  The static path
+     * is at 200 here, before precondition evaluation, so a 406 still
+     * outranks the 304 or 412 that a validator would give.
+     */
+
+    if (nxt_http_status_no_representation(r->status)) {
+        return NXT_OK;
+    }
+
+    if (nxt_http_comp_is_resp_content_encoded(r)) {
+        return NXT_OK;
+    }
+
+    ret = nxt_http_comp_accept_encoding(r, &accept_encoding);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return NXT_ERROR;
+    }
+
+    /*
+     * Ask what the client accepts before anything below rules compression
+     * out.  Before, this was asked afterwards, when the response was
+     * already declared serveable.  That is how the own bytes of the file
+     * reached a client that had refused them (#390).
+     */
+
+    idx = nxt_http_comp_select_compressor(conf, r, &accept_encoding,
+                                          &identity_refused);
+    if (idx == -1) {
+        return nxt_http_comp_not_acceptable(r);
+    }
+
     if (r->resp.mime_type != NULL) {
         mime_type = *r->resp.mime_type;
     } else if (r->resp.content_type != NULL) {
@@ -1234,8 +1299,16 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
         mime_type.length = r->resp.content_type->value_length;
     }
 
+    /*
+     * A coding was selected, but the "types" rule below can still withdraw
+     * it, and the fallback is always identity.  When the client refused
+     * identity, that fallback does not exist.  So the answer is 406, not
+     * the bytes that the client refused.  "min_length" cannot reach here: a
+     * coding below it is not selected.
+     */
+
     if (mime_type.start == NULL) {
-        return NXT_OK;
+        return identity_refused ? nxt_http_comp_not_acceptable(r) : NXT_OK;
     }
 
     if (conf->mime_types_rule != NULL) {
@@ -1243,12 +1316,8 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
                                        mime_type.start,
                                        mime_type.length);
         if (ret == 0) {
-            return NXT_OK;
+            return identity_refused ? nxt_http_comp_not_acceptable(r) : NXT_OK;
         }
-    }
-
-    if (nxt_http_comp_is_resp_content_encoded(r)) {
-        return NXT_OK;
     }
 
     /*
@@ -1260,17 +1329,6 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
 
     if (nxt_slow_path(nxt_http_comp_merge_vary(r) != NXT_OK)) {
         return NXT_ERROR;
-    }
-
-    ret = nxt_http_comp_accept_encoding(r, &accept_encoding);
-    if (nxt_slow_path(ret != NXT_OK)) {
-        return NXT_ERROR;
-    }
-
-    idx = nxt_http_comp_select_compressor(conf, r, &accept_encoding,
-                                          &identity_refused);
-    if (idx == -1) {
-        return NXT_HTTP_NOT_ACCEPTABLE;
     }
 
     ctx->sel_idx = idx;
