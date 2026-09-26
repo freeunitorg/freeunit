@@ -158,6 +158,15 @@ include Makefile.jsc11
 include Makefile.wasm
 endif
 
+# HTTP/2 (--h2) needs nghttp2 1.61 or later: auto/h2 checks for
+# nghttp2_option_set_max_continuations() and the other flood limits.
+# trixie ships 1.64.  Older Debian and Ubuntu releases have these
+# functions only through security backports, so they are left out
+# until each one is checked.
+ifeq ($(CODENAME),trixie)
+CONFIGURE_ARGS_H2 = --h2
+endif
+
 CONFIGURE_ARGS_COMMON=\
 	--prefix=/usr \
 	--statedir=/var/lib/$(RUNTIME) \
@@ -170,7 +179,8 @@ CONFIGURE_ARGS_COMMON=\
 	--user=$(RUNTIME) \
 	--group=$(RUNTIME) \
 	--tests \
-	--openssl
+	--openssl \
+	$(CONFIGURE_ARGS_H2)
 
 CONFIGURE_ARGS=\
 	$(CONFIGURE_ARGS_COMMON) \
