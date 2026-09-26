@@ -969,11 +969,6 @@ def is_su():
 
 
 @pytest.fixture
-def is_unsafe(request):
-    return request.config.getoption("--unsafe")
-
-
-@pytest.fixture
 def requires_restart():
     # unit_stop() does nothing without --restart, so a test that calls it in
     # its body cannot check anything after the call.  Skip such a test at

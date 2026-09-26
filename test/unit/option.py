@@ -10,6 +10,7 @@ class Options:
         'is_privileged': os.geteuid() == 0,
         'skip_alerts': [],
         'system': platform.system(),
+        'unsafe': False,
     }
 
     def __setattr__(self, name, value):

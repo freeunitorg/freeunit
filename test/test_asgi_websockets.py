@@ -6,6 +6,7 @@ from packaging import version
 
 from unit.applications.lang.python import ApplicationPython
 from unit.applications.websockets import ApplicationWebsocket
+from unit.option import option
 
 prerequisites = {
     'modules': {'python': lambda v: version.parse(v) >= version.parse('3.5')}
@@ -1343,10 +1344,8 @@ def test_asgi_websockets_7_13_1__7_13_2():
     check_close(sock, 1002)
 
 
-def test_asgi_websockets_9_1_1__9_6_6(is_unsafe, system):
-    if not is_unsafe:
-        pytest.skip('unsafe, long run')
-
+@pytest.mark.skipif(not option.unsafe, reason='unsafe, long run')
+def test_asgi_websockets_9_1_1__9_6_6(system):
     client.load('websockets/mirror')
 
     assert 'success' in client.conf(

@@ -779,11 +779,12 @@ jobs:
           # The wasm legs build their guest fixture as the runner user, so
           # they run unprivileged to keep the result reachable by pytest; the
           # others install applications as root.
+          # --unsafe runs the long Autobahn 9.x websocket cases.
           if [ "${{ matrix.build }}" == "wasm-wasi-component" ] || [ "${{ matrix.build }}" == "wasm" ]; then
             set -o pipefail
-            pytest-3 --print-log ${{ steps.metadata.outputs.testpath }} 2>&1 | tee "$RUNNER_TEMP/pytest.out"
+            pytest-3 --print-log --unsafe ${{ steps.metadata.outputs.testpath }} 2>&1 | tee "$RUNNER_TEMP/pytest.out"
           else
-            sudo -E pytest-3 --print-log ${{ steps.metadata.outputs.testpath }}
+            sudo -E pytest-3 --print-log --unsafe ${{ steps.metadata.outputs.testpath }}
           fi
 
       # check_prerequisites() skips the whole file when the clang/wasi-sysroot
@@ -806,19 +807,22 @@ jobs:
       # real application to show it inherits the shim harmlessly, and this
       # leg is where a language module exists.
       #
+      # test_configuration.py runs here too: test_unprivileged_user_error
+      # needs a unitd that is not root.
+      #
       # pytest-3 is named absolutely: setup-python puts a toolcache bin
       # directory ahead of /usr/bin for this step and not for the sudo'd one
       # above, and both must run the pytest that "apt install python3-pytest"
       # provided.
       #
       # !cancelled() rather than the implicit success(): this is the only leg
-      # that ever runs the file, and gating it on the whole sudo'd suite above
-      # would let one unrelated flake silently take that coverage away again --
-      # the very problem this step exists to fix.
-      - name: Run capget fallback tests unprivileged
+      # that ever runs these files, and gating it on the whole sudo'd suite
+      # above would let one unrelated flake silently take that coverage away
+      # again -- the very problem this step exists to fix.
+      - name: Run capget fallback and configuration tests unprivileged
         run: |
           export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
-          /usr/bin/pytest-3 --print-log test/test_capget_fallback.py
+          /usr/bin/pytest-3 --print-log test/test_capget_fallback.py test/test_configuration.py
         if: ${{ !cancelled() && steps.metadata.outputs.module == 'python' }}
 
       # test_asgi_lifespan.py stops unitd from inside the test to check the

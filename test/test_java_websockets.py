@@ -5,6 +5,7 @@ import pytest
 
 from unit.applications.lang.java import ApplicationJava
 from unit.applications.websockets import ApplicationWebsocket
+from unit.option import option
 
 prerequisites = {'modules': {'java': 'any'}}
 
@@ -1264,10 +1265,8 @@ def test_java_websockets_7_13_1__7_13_2():
     check_close(sock, 1002)
 
 
-def test_java_websockets_9_1_1__9_6_6(is_unsafe, system):
-    if not is_unsafe:
-        pytest.skip('unsafe, long run')
-
+@pytest.mark.skipif(not option.unsafe, reason='unsafe, long run')
+def test_java_websockets_9_1_1__9_6_6(system):
     client.load('websockets_mirror')
 
     assert 'success' in client.conf(
