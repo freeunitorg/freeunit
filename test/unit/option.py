@@ -9,8 +9,11 @@ class Options:
         'configure_flag': {},
         'is_privileged': os.geteuid() == 0,
         'skip_alerts': [],
+        # Set by a test that must ignore sanitizer reports from other
+        # processes (test_http2.py's leak test); reset for each test.
         'skip_sanitizer': False,
         'system': platform.system(),
+        'unsafe': False,
     }
 
     def __setattr__(self, name, value):

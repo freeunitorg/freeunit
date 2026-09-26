@@ -387,7 +387,7 @@ def test_python_process_switch():
     for _ in range(10):
         client.get(headers=headers_delay_1, no_recv=True)
 
-    client.get(headers=headers_delay_1)
+    assert client.get(headers=headers_delay_1)['status'] == 200
 
 
 @pytest.mark.skip('not yet')

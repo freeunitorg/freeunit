@@ -18,6 +18,14 @@
  * only ->detached, the count and the application reference, and those are
  * what the test reads.  Each forged edge is followed by the genuine one, which
  * shows that the fixture reaches the accounting at all.
+ *
+ * It also covers the counting the accounting rests on: two starts and one
+ * finish leave the worker detached, the second finish releases it, and a
+ * finish that matches no start is refused without disturbing either count.
+ * The first such edge logs an alert, which is the expected output; later ones
+ * go to the debug log.  Two presets reach the branches the application's
+ * edges alone do not: a start while the router holds its own mark, and a
+ * start at the maximum count.
  */
 
 #include <nxt_main.h>
@@ -30,13 +38,125 @@
 
 #if (NXT_USE_CMSG_PID)
 
+/* Which credential the edge arrives with. */
+
+#define NXT_ROUTER_DETACHED_TEST_SELF   0
+#define NXT_ROUTER_DETACHED_TEST_OTHER  1
+#define NXT_ROUTER_DETACHED_TEST_NONE   2
+
+
+/*
+ * The accounting an edge finds.  An edge with a preset starts from it rather
+ * than from what the previous edge left, which is how the test reaches the
+ * states only the router's own path or a long run of edges would produce.
+ */
+
+typedef struct {
+    nxt_atomic_uint_t  use_count;
+    uint32_t           detached_app;
+    uint32_t           detached_router;
+    uint32_t           processes;
+    uint8_t            detached;
+} nxt_router_detached_test_state_t;
+
+
+typedef struct {
+    const nxt_router_detached_test_state_t  *preset;
+    const char                              *name;
+    uint32_t                                detached_app;
+    uint32_t                                processes;
+    nxt_atomic_uint_t                       use_count;
+    uint8_t                                 state;
+    uint8_t                                 sender;
+    uint8_t                                 detached;
+    uint8_t                                 alerted;
+} nxt_router_detached_test_edge_t;
+
+
+/*
+ * What nxt_router_app_abandon() leaves on an idle port: the router's own
+ * mark, the detached state it set, and the application reference that state
+ * holds.
+ */
+
+static const nxt_router_detached_test_state_t
+    nxt_router_detached_test_router_mark = { 9, 0, 1, 1, 1 };
+
+
+/* A worker whose count has reached the maximum. */
+
+static const nxt_router_detached_test_state_t
+    nxt_router_detached_test_saturated = { 9, UINT32_MAX, 0, 1, 1 };
+
+
+#define NXT_RDT_START   NXT_PORT_DETACHED_START
+#define NXT_RDT_FINISH  NXT_PORT_DETACHED_FINISH
+#define NXT_RDT_SELF    NXT_ROUTER_DETACHED_TEST_SELF
+#define NXT_RDT_OTHER   NXT_ROUTER_DETACHED_TEST_OTHER
+#define NXT_RDT_NONE    NXT_ROUTER_DETACHED_TEST_NONE
+
+
+/*
+ * The edges, and the accounting each one must leave behind.  The start and
+ * the finish are a counted pair: only the first start and the last finish
+ * move ->detached, app->detached_processes and the application reference,
+ * and a finish that matches no start moves none of them.  A refused edge is
+ * an alert the first time on a port only.
+ *
+ * A start that finds the router's own mark already set changes no state, so
+ * the reference it took goes straight back: the state's reference belongs to
+ * nxt_router_app_abandoned_settle().  The finish that follows leaves the
+ * state to the router too.  A start at the maximum count is refused rather
+ * than wrapped to "no detached work".
+ */
+
+static const nxt_router_detached_test_edge_t
+    nxt_router_detached_test_edges[] =
+{
+    { NULL, "a forged start",
+      0, 0, 8, NXT_RDT_START, NXT_RDT_OTHER, 0, 0 },
+    { NULL, "a genuine start",
+      1, 1, 9, NXT_RDT_START, NXT_RDT_SELF, 1, 0 },
+    { NULL, "a forged finish",
+      1, 1, 9, NXT_RDT_FINISH, NXT_RDT_OTHER, 1, 0 },
+    { NULL, "a finish with no credential",
+      1, 1, 9, NXT_RDT_FINISH, NXT_RDT_NONE, 1, 0 },
+    { NULL, "a second start",
+      2, 1, 9, NXT_RDT_START, NXT_RDT_SELF, 1, 0 },
+    { NULL, "the first of two finishes",
+      1, 1, 9, NXT_RDT_FINISH, NXT_RDT_SELF, 1, 0 },
+    { NULL, "the last of two finishes",
+      0, 0, 8, NXT_RDT_FINISH, NXT_RDT_SELF, 0, 0 },
+    { NULL, "an unmatched finish",
+      0, 0, 8, NXT_RDT_FINISH, NXT_RDT_SELF, 0, 1 },
+    { NULL, "a second unmatched finish",
+      0, 0, 8, NXT_RDT_FINISH, NXT_RDT_SELF, 0, 1 },
+    { NULL, "a start after an unmatched finish",
+      1, 1, 9, NXT_RDT_START, NXT_RDT_SELF, 1, 1 },
+    { NULL, "the matching finish",
+      0, 0, 8, NXT_RDT_FINISH, NXT_RDT_SELF, 0, 1 },
+    { &nxt_router_detached_test_router_mark,
+      "a start while the router holds its own mark",
+      1, 1, 9, NXT_RDT_START, NXT_RDT_SELF, 1, 1 },
+    { NULL, "a finish while the router holds its own mark",
+      0, 1, 9, NXT_RDT_FINISH, NXT_RDT_SELF, 1, 1 },
+    { &nxt_router_detached_test_saturated, "a start at the maximum count",
+      UINT32_MAX, 1, 9, NXT_RDT_START, NXT_RDT_SELF, 1, 1 },
+    { NULL, "a finish below the maximum count",
+      UINT32_MAX - 1, 1, 9, NXT_RDT_FINISH, NXT_RDT_SELF, 1, 1 },
+};
+
+
 static nxt_int_t
 nxt_router_detached_test_edge(nxt_thread_t *thr, nxt_task_t *task,
-    nxt_port_t *port, nxt_app_t *app, uint8_t state, nxt_pid_t sender,
-    nxt_bool_t detached, nxt_atomic_t use_count, const char *name)
+    nxt_port_t *port, nxt_app_t *app,
+    const nxt_router_detached_test_edge_t *e, nxt_pid_t sender)
 {
+    uint8_t              state;
     nxt_buf_t            b;
     nxt_port_recv_msg_t  msg;
+
+    state = e->state;
 
     nxt_memzero(&b, sizeof(nxt_buf_t));
     b.mem.start = &state;
@@ -54,18 +174,31 @@ nxt_router_detached_test_edge(nxt_thread_t *thr, nxt_task_t *task,
     msg.port_msg.last = 1;
     msg.cmsg_pid = sender;
 
+    if (e->preset != NULL) {
+        port->detached_app = e->preset->detached_app;
+        port->detached_router = e->preset->detached_router;
+        port->detached = e->preset->detached;
+        app->detached_processes = e->preset->processes;
+        app->use_count = e->preset->use_count;
+    }
+
     nxt_router_test_detached_handler(task, &msg);
 
-    if (port->detached != detached
-        || app->detached_processes != (detached ? 1 : 0)
-        || app->use_count != use_count)
+    if (port->detached_app != e->detached_app
+        || port->detached != e->detached
+        || port->detached_alerted != e->alerted
+        || app->detached_processes != e->processes
+        || app->use_count != e->use_count)
     {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
-                      "router detached test: %s: detached %d, count %uD, "
-                      "use count %d; expected %d, %d, %d",
-                      name, (int) port->detached, app->detached_processes,
-                      (int) app->use_count, (int) detached,
-                      detached ? 1 : 0, (int) use_count);
+                      "router detached test: %s: detached_app %uD, "
+                      "detached %d, alerted %d, count %uD, use count %d; "
+                      "expected %uD, %d, %d, %uD, %d",
+                      e->name, port->detached_app, (int) port->detached,
+                      (int) port->detached_alerted, app->detached_processes,
+                      (int) app->use_count, e->detached_app,
+                      (int) e->detached, (int) e->alerted, e->processes,
+                      (int) e->use_count);
         return NXT_ERROR;
     }
 
@@ -90,12 +223,15 @@ nxt_router_detached_test(nxt_thread_t *thr)
     nxt_mp_t            *mp;
     nxt_app_t           *app;
     nxt_int_t           ret;
-    nxt_pid_t           pid, other;
+    nxt_uint_t          i;
+    nxt_pid_t           pid, other, sender;
     nxt_task_t          *task;
     nxt_port_t          *port;
     nxt_bool_t          app_mutex, hashed;
     nxt_runtime_t       *rt, *saved_rt;
     nxt_event_engine_t  engine, *saved_engine;
+
+    const nxt_router_detached_test_edge_t  *e;
 
     nxt_thread_time_update(thr);
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "router detached test started");
@@ -169,28 +305,29 @@ nxt_router_detached_test(nxt_thread_t *thr)
 
     hashed = 1;
 
-    if (nxt_router_detached_test_edge(thr, task, port, app,
-                                      NXT_PORT_DETACHED_START, other, 0, 8,
-                                      "a forged start")
-        != NXT_OK
-        || nxt_router_detached_test_edge(thr, task, port, app,
-                                         NXT_PORT_DETACHED_START, pid, 1, 9,
-                                         "a genuine start")
-           != NXT_OK
-        || nxt_router_detached_test_edge(thr, task, port, app,
-                                         NXT_PORT_DETACHED_FINISH, other, 1, 9,
-                                         "a forged finish")
-           != NXT_OK
-        || nxt_router_detached_test_edge(thr, task, port, app,
-                                         NXT_PORT_DETACHED_FINISH, -1, 1, 9,
-                                         "a finish with no credential")
-           != NXT_OK
-        || nxt_router_detached_test_edge(thr, task, port, app,
-                                         NXT_PORT_DETACHED_FINISH, pid, 0, 8,
-                                         "a genuine finish")
-           != NXT_OK)
-    {
-        goto done;
+    for (i = 0; i < nxt_nitems(nxt_router_detached_test_edges); i++) {
+        e = &nxt_router_detached_test_edges[i];
+
+        switch (e->sender) {
+        case NXT_ROUTER_DETACHED_TEST_SELF:
+            sender = pid;
+            break;
+
+        case NXT_ROUTER_DETACHED_TEST_OTHER:
+            sender = other;
+            break;
+
+        default:
+            sender = -1;
+            break;
+        }
+
+        if (nxt_slow_path(nxt_router_detached_test_edge(thr, task, port, app,
+                                                        e, sender)
+                          != NXT_OK))
+        {
+            goto done;
+        }
     }
 
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "router detached test passed");
