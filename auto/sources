@@ -109,6 +109,17 @@ NXT_LIB_SRCS=" \
 NXT_LIB_UNIT_SRCS="src/nxt_unit.c"
 
 
+# The C test suite needs the NXT_TESTS hooks: fault-injection branches and
+# counters compiled into the core and into libunit.  NXT_TESTS is never a
+# global macro.  "make tests" compiles every core and libunit source a second
+# time with -DNXT_TESTS=1 into these two archives, and only the test programs
+# link them.  unitd, libnxt.a, libunit.a and the language modules are built
+# from the plain objects and never see the macro.
+#
+NXT_LIB_TEST_STATIC="libnxt-tests.a"
+NXT_LIB_UNIT_TEST_STATIC="libunit-tests.a"
+
+
 NXT_LIB_TLS_DEPS="src/nxt_tls.h"
 NXT_LIB_TLS_SRCS="src/nxt_cert.c"
 NXT_LIB_OPENSSL_SRCS="src/nxt_openssl.c"
@@ -326,11 +337,6 @@ fi
 
 if [ "$NXT_TEST_BUILD" = "YES" ]; then
     NXT_LIB_SRCS="$NXT_LIB_SRCS $NXT_TEST_BUILD_SRCS"
-fi
-
-
-if [ $NXT_TESTS = YES ]; then
-    nxt_have=NXT_TESTS . auto/have
 fi
 
 

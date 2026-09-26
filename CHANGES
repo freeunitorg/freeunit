@@ -471,6 +471,16 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        applied to the next message.
 
 
+    *) Change: unitd, libunit.a and the language modules no longer contain
+       the test hooks compiled under "#if (NXT_TESTS)".  "./configure
+       --tests" used to define the macro for the whole build, and the deb
+       and rpm packages pass "--tests", so every released package from 0.2
+       to 1.36.1 carried them: the nxt_random_test() entry point in all of
+       them, and in 1.36.0 and 1.36.1 the fault-injection branches and
+       counters in nxt_mp.c, nxt_port_rpc.c and nxt_port_socket.c, two of
+       which were exported symbols.  The hooks now go only into the test
+       programs.  A build without "--tests" is unchanged.
+
 Changes with FreeUnit 1.36.1                                     28 Aug 2026
 
     *) Feature: configuration validation errors now say where they are. A
