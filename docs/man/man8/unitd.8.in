@@ -72,10 +72,15 @@ Sets the group of the UNIX-domain control socket.
 .Pp
 On a UNIX-domain control socket, and where the platform provides peer
 credentials (Linux and the BSDs), the control API additionally requires
-the connecting peer's effective user ID to be either 0 (root) or the
-user ID
+the connecting peer's effective user ID to be 0 (root), the user ID
 .Nm
-runs as; other local users are rejected before the request is read.
+runs as, or the user set with
+.Fl Fl control-user ,
+or its group ID to be the group set with
+.Fl Fl control-group .
+On Linux, a supplementary group of the peer also matches
+.Fl Fl control-group .
+Other local users are rejected before the request is read.
 On those builds the
 .Fl Fl control-user ,
 .Fl Fl control-group ,
