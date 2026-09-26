@@ -70,6 +70,7 @@ nxt_int_t nxt_buf_test(nxt_thread_t *thr);
 nxt_int_t nxt_http_chunk_parse_test(nxt_thread_t *thr);
 nxt_int_t nxt_conf_json_depth_test(nxt_thread_t *thr);
 nxt_int_t nxt_http_route_addr_test(nxt_thread_t *thr);
+nxt_int_t nxt_conf_map_object_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_fail_test(nxt_thread_t *thr);
 nxt_int_t nxt_fd_event_change_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_use_unless_zero_test(nxt_thread_t *thr);

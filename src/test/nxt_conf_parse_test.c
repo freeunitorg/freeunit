@@ -147,3 +147,117 @@ nxt_http_route_addr_test(nxt_thread_t *thr)
 
     return NXT_OK;
 }
+
+
+
+/* Packed: the fields after "flag" are misaligned, for UBSan to catch. */
+
+typedef struct {
+    uint8_t     flag;
+    int32_t     i32;
+    int64_t     i64;
+    int         i;
+    ssize_t     size;
+    off_t       off;
+    nxt_msec_t  msec;
+    double      dbl;
+    nxt_str_t   str;
+    char        *cstrz;
+    nxt_str_t   rstr;
+    void        *ptr;
+    uint8_t     bad8;
+    int32_t     bad32;
+} nxt_packed nxt_conf_map_test_t;
+
+
+#define nxt_conf_map_test_field(field, type)                                  \
+    { nxt_string(#field), type, offsetof(nxt_conf_map_test_t, field) }
+
+
+nxt_int_t
+nxt_conf_map_object_test(nxt_thread_t *thr)
+{
+    nxt_mp_t             *mp;
+    nxt_int_t            ret;
+    nxt_conf_value_t     *cv;
+    nxt_conf_map_test_t  dst;
+
+    static const nxt_str_t  json = nxt_string(
+        "{\"flag\": true, \"i32\": -123456, \"i64\": -9876543210, \"i\": -7,"
+        " \"size\": 424242, \"off\": 131072, \"msec\": 3, \"dbl\": 1.5,"
+        " \"str\": \"hello\", \"cstrz\": \"world\", \"rstr\": \"raw\","
+        " \"ptr\": [1], \"bad8\": 1, \"bad32\": \"x\"}");
+
+    static const nxt_conf_map_t  map[] = {
+        nxt_conf_map_test_field(flag, NXT_CONF_MAP_INT8),
+        nxt_conf_map_test_field(i32, NXT_CONF_MAP_INT32),
+        nxt_conf_map_test_field(i64, NXT_CONF_MAP_INT64),
+        nxt_conf_map_test_field(i, NXT_CONF_MAP_INT),
+        nxt_conf_map_test_field(size, NXT_CONF_MAP_SIZE),
+        nxt_conf_map_test_field(off, NXT_CONF_MAP_OFF),
+        nxt_conf_map_test_field(msec, NXT_CONF_MAP_MSEC),
+        nxt_conf_map_test_field(dbl, NXT_CONF_MAP_DOUBLE),
+        nxt_conf_map_test_field(str, NXT_CONF_MAP_STR_COPY),
+        nxt_conf_map_test_field(cstrz, NXT_CONF_MAP_CSTRZ),
+        nxt_conf_map_test_field(rstr, NXT_CONF_MAP_STR),
+        nxt_conf_map_test_field(ptr, NXT_CONF_MAP_PTR),
+        /* Wrong JSON types: the fields keep their sentinels. */
+        nxt_conf_map_test_field(bad8, NXT_CONF_MAP_INT8),
+        nxt_conf_map_test_field(bad32, NXT_CONF_MAP_INT32),
+    };
+
+    nxt_thread_time_update(thr);
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (mp == NULL) {
+        return NXT_ERROR;
+    }
+
+    ret = NXT_ERROR;
+    nxt_memzero(&dst, sizeof(dst));
+    dst.bad8 = 0xA5;
+    dst.bad32 = 0x5A5A5A5A;
+
+    cv = nxt_conf_json_parse(mp, json.start, json.start + json.length, NULL);
+
+    if (cv == NULL
+        || nxt_conf_map_object(mp, cv, map, nxt_nitems(map), &dst) != NXT_OK)
+    {
+        nxt_log_alert(thr->log, "nxt_conf_map_object() test failed");
+        goto done;
+    }
+
+    if (dst.flag != 1
+        || dst.i32 != -123456
+        || dst.i64 != -9876543210LL
+        || dst.i != -7
+        || dst.size != 424242
+        || dst.off != 131072
+        || dst.msec != 3000
+        || dst.dbl != 1.5
+        || dst.str.length != 5
+        || memcmp(dst.str.start, "hello", 5) != 0
+        || dst.cstrz == NULL
+        || strcmp(dst.cstrz, "world") != 0
+        || dst.rstr.length != 3
+        || memcmp(dst.rstr.start, "raw", 3) != 0
+        || dst.ptr == NULL
+        || nxt_conf_type(dst.ptr) != NXT_CONF_ARRAY
+        || dst.bad8 != 0xA5
+        || dst.bad32 != 0x5A5A5A5A)
+    {
+        nxt_log_alert(thr->log, "nxt_conf_map_object() mapped wrong values");
+        goto done;
+    }
+
+    ret = NXT_OK;
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                  "nxt_conf_map_object() alignment test passed");
+
+done:
+
+    nxt_mp_destroy(mp);
+
+    return ret;
+}

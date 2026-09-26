@@ -195,6 +195,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_conf_map_object_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_port_fail_test(thr) != NXT_OK) {
         return 1;
     }
