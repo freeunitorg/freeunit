@@ -92,6 +92,13 @@ typedef struct {
 struct nxt_http_route_rule_s {
     /* The object must be the first field. */
     nxt_http_route_object_t        object:8;
+
+    /*
+     * A named header, argument, or cookie rule set to null: it matches
+     * only when the field is absent.  Such a rule has no patterns.
+     */
+    uint8_t                        absent;  /* 1 bit */
+
     uint32_t                       items;
 
     union {
@@ -840,11 +847,21 @@ nxt_http_route_rule_name_create(nxt_task_t *task, nxt_mp_t *mp,
     int64_t                hash;
     nxt_http_route_rule_t  *rule;
 
-    rule = nxt_http_route_rule_create(task, mp, rule_cv, case_sensitive,
-                                      NXT_HTTP_ROUTE_PATTERN_NOCASE,
-                                      encoding);
-    if (nxt_slow_path(rule == NULL)) {
-        return NULL;
+    if (nxt_conf_type(rule_cv) == NXT_CONF_NULL) {
+        rule = nxt_mp_zget(mp, sizeof(nxt_http_route_rule_t));
+        if (nxt_slow_path(rule == NULL)) {
+            return NULL;
+        }
+
+        rule->absent = 1;
+
+    } else {
+        rule = nxt_http_route_rule_create(task, mp, rule_cv, case_sensitive,
+                                          NXT_HTTP_ROUTE_PATTERN_NOCASE,
+                                          encoding);
+        if (nxt_slow_path(rule == NULL)) {
+            return NULL;
+        }
     }
 
     hash = nxt_http_field_hash(mp, name, case_sensitive, encoding);
@@ -881,6 +898,7 @@ nxt_http_route_rule_create(nxt_task_t *task, nxt_mp_t *mp,
         return NULL;
     }
 
+    rule->absent = 0;
     rule->items = n;
 
     pattern = &rule->pattern[0];
@@ -1964,7 +1982,7 @@ nxt_http_route_header(nxt_http_request_t *r, nxt_http_route_rule_t *rule)
     nxt_int_t         ret;
     nxt_http_field_t  *f;
 
-    ret = 0;
+    ret = rule->absent;
 
     nxt_http_fields_each(f, r->inline_fields, r->num_inline_fields, r->fields) {
 
@@ -1974,6 +1992,10 @@ nxt_http_route_header(nxt_http_request_t *r, nxt_http_route_rule_t *rule)
                != 0)
         {
             continue;
+        }
+
+        if (rule->absent) {
+            return 0;
         }
 
         ret = nxt_http_route_test_rule(r, rule, f->value, f->value_length);
@@ -2012,7 +2034,7 @@ nxt_http_route_test_argument(nxt_http_request_t *r,
     nxt_int_t              ret;
     nxt_http_name_value_t  *nv, *end;
 
-    ret = 0;
+    ret = rule->absent;
 
     nv = array->elts;
     end = nv + array->nelts;
@@ -2023,6 +2045,10 @@ nxt_http_route_test_argument(nxt_http_request_t *r,
             && rule->u.name.length == nv->name_length
             && memcmp(rule->u.name.start, nv->name, nv->name_length) == 0)
         {
+            if (rule->absent) {
+                return 0;
+            }
+
             ret = nxt_http_route_test_rule(r, rule, nv->value,
                                            nv->value_length);
             if (nxt_slow_path(ret == NXT_ERROR)) {
@@ -2090,7 +2116,7 @@ nxt_http_route_test_cookie(nxt_http_request_t *r,
     nxt_int_t              ret;
     nxt_http_name_value_t  *nv, *end;
 
-    ret = 0;
+    ret = rule->absent;
 
     nv = array->elts;
     end = nv + array->nelts;
@@ -2101,6 +2127,10 @@ nxt_http_route_test_cookie(nxt_http_request_t *r,
             && rule->u.name.length == nv->name_length
             && memcmp(rule->u.name.start, nv->name, nv->name_length) == 0)
         {
+            if (rule->absent) {
+                return 0;
+            }
+
             ret = nxt_http_route_test_rule(r, rule, nv->value,
                                            nv->value_length);
             if (nxt_slow_path(ret == NXT_ERROR)) {

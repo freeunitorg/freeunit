@@ -7495,9 +7495,17 @@ components:
     #/config/routes/{routeName}/{stepIndex}/match/[arguments|cookies|headers]
     configRouteStepMatchObject:
       type: object
-      description: "An object whose options define a set of conditions."
+      description: "An object whose options define a set of conditions.
+        Each option names a field and gives a pattern or an array of
+        patterns for its value. A field that the request does not have
+        matches no pattern, not even a negated one. The value `null`
+        matches only when the request has no such field."
+
       additionalProperties:
-        $ref: "#/components/schemas/stringOrStringArray"
+        oneOf:
+          - type: string
+            nullable: true
+          - $ref: "#/components/schemas/stringArray"
 
     #/config/routes/{stepIndex}/match/[arguments|cookies|headers]
     #/config/routes/{routeName}/{stepIndex}/match/[arguments|cookies|headers]

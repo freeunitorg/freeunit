@@ -12,6 +12,17 @@
 
 <change type="feature">
 <para>
+a "match" rule can require that a header, cookie or argument is absent.  In
+"headers", "cookies" and "arguments", the value null matches only a request
+that has no field with this name; a field with an empty value is present.
+A pattern, including a negated one, still never matches an absent field, so
+existing configurations behave as before.  For "absent or not X", use an array
+of objects: [{"Name": null}, {"Name": "!X"}].
+</para>
+</change>
+
+<change type="feature">
+<para>
 "PUT /certificates/&lt;name&gt;" replaces an existing certificate bundle in
 place.  Main writes the bundle to a temporary file and renames it over the
 old one, so a crash never leaves a partial bundle.  When the current
