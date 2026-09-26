@@ -3604,7 +3604,7 @@ nxt_router_apps_hash_add(nxt_router_conf_t *rtcf, nxt_app_t *app)
     case NXT_DECLINED:
         nxt_thread_log_alert("router app hash adding failed: "
                              "\"%V\" is already in hash", &lhq.key);
-        /* Fall through. */
+        nxt_fallthrough;
     default:
         return NXT_ERROR;
     }

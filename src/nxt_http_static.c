@@ -1721,7 +1721,7 @@ nxt_http_static_extract_extension(nxt_str_t *path, nxt_str_t *exten)
         switch (ch) {
         case '/':
             p++;
-            /* Fall through. */
+            nxt_fallthrough;
         case '.':
             goto extension;
         }

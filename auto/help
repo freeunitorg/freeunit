@@ -61,6 +61,16 @@ cat << END
 
   --debug              enable debug logging
 
+  --hardening=MODE     add compiler and linker hardening flags, probed for
+                       compiler support (default: off, unchanged build):
+                         off      - no extra flags (default)
+                         default  - stack protector, _FORTIFY_SOURCE=3 (or 2),
+                                    stack-clash and control-flow protection,
+                                    RELRO/BIND_NOW/noexecstack at link time
+                         strict   - default, plus -Wformat=2, -Wvla,
+                                    -Wimplicit-fallthrough and
+                                    -ftrivial-auto-var-init=pattern
+
   --fuzz=ENGINE        enable fuzz testing
 
 

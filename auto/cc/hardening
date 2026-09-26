@@ -1,0 +1,158 @@
+
+# Copyright (C) FreeUnit Community
+
+
+# --hardening=[off|default|strict] (auto/options).  The default is "off".
+# With "off", NXT_CFLAGS and NXT_LD_OPT stay as auto/cc/test left them.
+# A build that does not pass the option does not change.
+#
+# Each flag below is probed before it is added.  The probe compiles a small
+# program with the flag under -Werror.  For a linker flag, the probe also
+# links the program.  When an older compiler, a different target or a libc
+# does not support a flag, the build does not fail.  It only does not get
+# that one flag.  This follows the "try it" approach of auto/feature.  The
+# value and run reporting of auto/feature is not used, because these flags
+# do not need it.
+
+case "$NXT_HARDENING" in
+    off | default | strict)
+    ;;
+
+    *)
+        $echo
+        $echo $0: error: invalid value \"$NXT_HARDENING\" for --hardening.
+        $echo Valid values are: off, default, strict.
+        $echo
+        exit 1
+    ;;
+esac
+
+
+if [ $NXT_HARDENING != off ]; then
+
+# The flags are in the order that auto/make uses.  The flag under test goes
+# into NXT_CFLAGS.  CFLAGS from the environment comes last.  Thus a -O0 in
+# CFLAGS wins over the built-in -O in the probe, as it does in the build.
+# The probe includes a libc header.  With it, the #warning of glibc about
+# a _FORTIFY_SOURCE level that it treats as a lower one fails the probe,
+# and not the real sources.  $2 is extra source for the probe.
+nxt_hardening_try_cflag()
+{
+    nxt_flag=$1
+
+    $echo -n "checking for $nxt_flag ..."
+
+    cat << END > $NXT_AUTOTEST.c
+#include <string.h>
+${2-}
+int main(void) { return 0; }
+END
+
+    if /bin/sh -c "($CC $NXT_CFLAGS $nxt_flag $NXT_CC_OPT $CFLAGS -Werror \
+                    -o $NXT_AUTOTEST $NXT_AUTOTEST.c)" \
+        >> $NXT_AUTOCONF_ERR 2>&1
+    then
+        $echo " found"
+        NXT_CFLAGS="$NXT_CFLAGS $nxt_flag"
+        nxt_ret=0
+    else
+        $echo " not found"
+        nxt_ret=1
+    fi
+
+    rm -rf $NXT_AUTOTEST $NXT_AUTOTEST.c
+
+    return $nxt_ret
+}
+
+
+# Links a small program with the given linker flags.  The exit status
+# tells if the link succeeded.  This function adds nothing to NXT_LD_OPT.
+nxt_hardening_link()
+{
+    cat << END > $NXT_AUTOTEST.c
+int main(void) { return 0; }
+END
+
+    /bin/sh -c "($CC $CFLAGS $NXT_CFLAGS $NXT_CC_OPT \
+                -o $NXT_AUTOTEST $NXT_AUTOTEST.c $NXT_LD_OPT $*)" \
+        >> $NXT_AUTOCONF_ERR 2>&1
+    nxt_ret=$?
+
+    rm -rf $NXT_AUTOTEST $NXT_AUTOTEST.c
+
+    return $nxt_ret
+}
+
+
+# GNU ld only warns about a -z keyword that it does not know, and it links
+# anyway.  Thus a plain probe would "find" every -z flag.  When the linker
+# accepts -Wl,--fatal-warnings, the probes below run with it.  Then a
+# linker warning fails the probe.  macOS ld does not accept the flag.
+# There the probes run without it.
+nxt_hardening_ld_fatal=
+
+nxt_hardening_try_ldflag()
+{
+    nxt_flag=$1
+
+    $echo -n "checking for $nxt_flag ..."
+
+    if nxt_hardening_link $nxt_hardening_ld_fatal $nxt_flag; then
+        $echo " found"
+        NXT_LD_OPT="$NXT_LD_OPT $nxt_flag"
+    else
+        $echo " not found"
+    fi
+}
+
+
+# Do not stop on an error exit status while the probes run, the same as in
+# auto/cc/test.  A probe that fails to compile is expected and handled.  It
+# must not abort the whole configure run.  The "set -e" after the last
+# probe restores the default.
+set +e
+
+nxt_hardening_try_cflag -fstack-protector-strong
+nxt_hardening_try_cflag -fstack-clash-protection
+
+# Each flag applies to one target only: -fcf-protection to x86, and
+# -mbranch-protection=standard to arm64.  The compiler rejects the flag on
+# the other target.  Thus the probe alone selects the correct one.
+nxt_hardening_try_cflag -fcf-protection
+nxt_hardening_try_cflag -mbranch-protection=standard
+
+# _FORTIFY_SOURCE does nothing without optimization, and not every libc
+# warns about that.  Thus the probe checks the optimization level itself.
+# When the libc treats a level as a lower one, it gives a warning.  Then
+# the probe tries the lower level.
+nxt_fortify_check='#ifndef __OPTIMIZE__
+#error _FORTIFY_SOURCE needs an optimizing build
+#endif'
+
+nxt_hardening_try_cflag -D_FORTIFY_SOURCE=3 "$nxt_fortify_check" \
+    || nxt_hardening_try_cflag -D_FORTIFY_SOURCE=2 "$nxt_fortify_check"
+
+$echo -n "checking for -Wl,--fatal-warnings ..."
+
+if nxt_hardening_link -Wl,--fatal-warnings; then
+    $echo " found"
+    nxt_hardening_ld_fatal=-Wl,--fatal-warnings
+else
+    $echo " not found"
+fi
+
+nxt_hardening_try_ldflag -Wl,-z,relro
+nxt_hardening_try_ldflag -Wl,-z,now
+nxt_hardening_try_ldflag -Wl,-z,noexecstack
+
+if [ $NXT_HARDENING = strict ]; then
+    nxt_hardening_try_cflag -Wformat=2
+    nxt_hardening_try_cflag -Wvla
+    nxt_hardening_try_cflag -Wimplicit-fallthrough
+    nxt_hardening_try_cflag -ftrivial-auto-var-init=pattern
+fi
+
+set -e
+
+fi

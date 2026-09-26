@@ -11,6 +11,8 @@ NXT_LD_OPT=
 
 NXT_DEBUG=NO
 
+NXT_HARDENING=off
+
 NXT_INET6=YES
 NXT_UNIX_DOMAIN=YES
 
@@ -101,6 +103,8 @@ do
         --group=*)                       NXT_GROUP="$value"                  ;;
 
         --debug)                         NXT_DEBUG=YES                       ;;
+
+        --hardening=*)                   NXT_HARDENING="$value"              ;;
 
         --no-ipv6)                       NXT_INET6=NO                        ;;
         --no-unix-sockets)               NXT_UNIX_DOMAIN=NO                  ;;
