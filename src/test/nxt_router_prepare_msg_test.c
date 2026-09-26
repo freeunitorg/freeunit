@@ -28,6 +28,9 @@ nxt_buf_t *nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
 static u_char  nxt_prepare_msg_test_name[300];
 static u_char  nxt_prepare_msg_test_method[300];
 
+static nxt_buf_t   *nxt_prepare_msg_test_bufs[8];
+static nxt_uint_t  nxt_prepare_msg_test_nbufs;
+
 
 typedef struct {
     const char         *name;
@@ -99,6 +102,12 @@ nxt_prepare_msg_test_case(nxt_task_t *task, nxt_mp_t *mp, nxt_app_t *app,
 
     b = nxt_router_test_prepare_msg(task, r, app, tc->prefix, &status);
 
+    if (b != NULL
+        && nxt_prepare_msg_test_nbufs < nxt_nitems(nxt_prepare_msg_test_bufs))
+    {
+        nxt_prepare_msg_test_bufs[nxt_prepare_msg_test_nbufs++] = b;
+    }
+
     if (tc->status != 0) {
         NXT_TEST_CHECK(task->log, b == NULL && status == tc->status,
                        "prepare msg test \"%s\": %s, status %d", tc->name,
@@ -132,14 +141,15 @@ nxt_prepare_msg_test_case(nxt_task_t *task, nxt_mp_t *mp, nxt_app_t *app,
 nxt_int_t
 nxt_router_prepare_msg_test(nxt_thread_t *thr)
 {
-    nxt_mp_t            *mp;
-    nxt_str_t           addr;
-    nxt_int_t           ret;
-    nxt_app_t           *app;
-    nxt_uint_t          i;
-    nxt_task_t          *task;
-    nxt_sockaddr_t      *sa;
-    nxt_event_engine_t  engine, *saved_engine;
+    nxt_mp_t                 *mp;
+    nxt_str_t                addr;
+    nxt_int_t                ret;
+    nxt_app_t                *app;
+    nxt_uint_t               i;
+    nxt_task_t               *task;
+    nxt_sockaddr_t           *sa;
+    nxt_event_engine_t       engine, *saved_engine;
+    nxt_port_mmap_handler_t  *mmap_handler;
 
     nxt_thread_time_update(thr);
 
@@ -177,6 +187,7 @@ nxt_router_prepare_msg_test(nxt_thread_t *thr)
     thr->engine = &engine;
 
     ret = NXT_OK;
+    nxt_prepare_msg_test_nbufs = 0;
 
     for (i = 0; i < nxt_nitems(nxt_prepare_msg_test_cases); i++) {
         if (nxt_prepare_msg_test_case(task, mp, app, sa,
@@ -187,9 +198,25 @@ nxt_router_prepare_msg_test(nxt_thread_t *thr)
         }
     }
 
+    /*
+     * Each accepted case's buffer holds a reference on its app->outgoing
+     * segment handler, and the array holds one more.  The buffers are never
+     * completed here, so their references are dropped by hand
+     * (nxt_port_mmap_handler_use() is private to nxt_port_memory.c); the
+     * array's reference, dropped last by nxt_port_mmaps_destroy(), then
+     * unmaps and frees each handler.  The buffers themselves come from mp.
+     */
+    for (i = 0; i < nxt_prepare_msg_test_nbufs; i++) {
+        mmap_handler = nxt_prepare_msg_test_bufs[i]->parent;
+        (void) nxt_atomic_fetch_add(&mmap_handler->use_count, -1);
+    }
+
+    nxt_port_mmaps_destroy(&app->outgoing, 1);
+
     thr->engine = saved_engine;
 
-    /* The accepted cases' buffers stay: freeing them needs the engine. */
+    nxt_thread_mutex_destroy(&app->outgoing.mutex);
+    nxt_mp_destroy(mp);
 
     if (ret == NXT_OK) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log, "router prepare msg test "
