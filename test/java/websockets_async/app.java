@@ -38,6 +38,7 @@ import javax.websocket.server.ServerEndpoint;
  * completed, or the first failure or timeout.  A binary message whose first
  * byte is 'o' is sent batched from its fourth byte on; see offset().
  * "nested:..." waits on sends from inside a SendHandler; see nested().
+ * "batchtext:..." is echoed batched and then flushed; see batchText().
  */
 @ServerEndpoint("/")
 public class app {
@@ -52,7 +53,9 @@ public class app {
     public void echoTextMessage(Session session, String msg) {
         RemoteEndpoint.Async remote = session.getAsyncRemote();
 
-        if (msg.startsWith("nested:")) {
+        if (msg.startsWith("batchtext:")) {
+            batchText(session, msg);
+        } else if (msg.startsWith("nested:")) {
             nested(session, msg);
         } else if (msg.startsWith("batch:")) {
             batch(session, Integer.parseInt(msg.substring("batch:".length())));
@@ -182,6 +185,25 @@ public class app {
             report(session, status.equals("future-done")
                             ? "nested-done" : "nested-fail: " + status);
         });
+    }
+
+    /*
+     * Echoes msg with batching allowed, then disallows it, which flushes the
+     * echo, and reports "batchtext-flushed" or "batchtext-fail: ...".
+     */
+    private static void batchText(Session session, String msg) {
+        RemoteEndpoint.Async remote = session.getAsyncRemote();
+
+        try {
+            remote.setBatchingAllowed(true);
+            String status = waitFor(remote.sendText(msg));
+            remote.setBatchingAllowed(false);
+
+            report(session, status.equals("future-done")
+                            ? "batchtext-flushed" : "batchtext-fail: " + status);
+        } catch (Exception e) {
+            report(session, "batchtext-fail: " + e);
+        }
     }
 
     private static void threads(Session session, int n) {
