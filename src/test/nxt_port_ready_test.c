@@ -1009,7 +1009,8 @@ nxt_port_ready_test_stream(nxt_thread_t *thr, nxt_task_t *task,
 
     proto_port = nxt_port_new(task, 0, proto->pid, NXT_PROCESS_PROTOTYPE);
     if (nxt_slow_path(proto_port == NULL)) {
-        return NXT_ERROR;
+        /* proto is in rt->processes already: take it out on the way. */
+        goto done;
     }
 
     proto_port->pair[0] = -1;
@@ -1302,16 +1303,56 @@ drain:
 
 done:
 
+    /*
+     * Each port was linked onto its process's queue directly, without
+     * nxt_process_port_add(), so port->process was never set and
+     * nxt_port_release() must not be handed a port still on that queue --
+     * it would assert.  Unlinking first and dropping the reference with
+     * nxt_port_use() frees the port's own pool (see nxt_port_new()), which
+     * the caller's nxt_mp_destroy(mp) cannot reach.  proto/mainp/router
+     * need no matching release: they come from mp and are freed along with
+     * it, but nxt_runtime_process_add() put them in rt->processes, a
+     * malloc'd table outside mp, and nxt_runtime_process_remove() is what
+     * takes them back out.
+     *
+     * That add happens for each of the three only partway through the
+     * function -- main_port is created before router is registered -- so
+     * an early "goto done" can reach here with a process struct that is
+     * non-NULL but was never added.  Removing it anyway would trip
+     * nxt_runtime_process_remove()'s "process->registered != 0" assert, so
+     * ->registered gates each removal alongside the NULL check.
+     */
     if (main_port != NULL) {
         nxt_port_close(task, main_port);
+        nxt_queue_remove(&main_port->link);
+        main_port->link.next = NULL;
+        nxt_port_use(task, main_port, -1);
     }
 
     if (router_port != NULL) {
         nxt_port_close(task, router_port);
+        nxt_queue_remove(&router_port->link);
+        router_port->link.next = NULL;
+        nxt_port_use(task, router_port, -1);
     }
 
     if (proto_port != NULL) {
         nxt_port_close(task, proto_port);
+        nxt_queue_remove(&proto_port->link);
+        proto_port->link.next = NULL;
+        nxt_port_use(task, proto_port, -1);
+    }
+
+    if (mainp != NULL && mainp->registered) {
+        nxt_runtime_process_remove(rt, mainp);
+    }
+
+    if (router != NULL && router->registered) {
+        nxt_runtime_process_remove(rt, router);
+    }
+
+    if (proto != NULL && proto->registered) {
+        nxt_runtime_process_remove(rt, proto);
     }
 
     return ret;
@@ -1357,6 +1398,11 @@ nxt_port_ready_test(nxt_thread_t *thr)
     port = NULL;
     queueless_port = NULL;
     nofd_port = NULL;
+    process = NULL;
+#if (NXT_HAVE_MEMFD_CREATE)
+    queueless = NULL;
+    nofd = NULL;
+#endif
 
     isolated_pid = nxt_pid + 3;
 
@@ -1643,18 +1689,58 @@ done:
      * The handler leaves the queue mapping and its descriptor on the port,
      * and nothing else owns them here: releasing the pool would leak both.
      * The fixture port never had a socket pair, so this only frees the queue.
+     *
+     * Each port was linked onto its process's queue directly, without
+     * nxt_process_port_add(), so port->process was never set and
+     * nxt_port_release() must not be handed a port still on that queue --
+     * it would assert.  Unlinking first and dropping the reference with
+     * nxt_port_use() frees the port's own pool (see nxt_port_new()), which
+     * nxt_mp_destroy(mp) below cannot reach.  The process itself needs no
+     * matching release: it came from mp and is freed along with it, but
+     * nxt_runtime_process_add() put it in rt->processes, a malloc'd table
+     * outside mp, and nxt_runtime_process_remove() is what takes it back
+     * out.
      */
     if (port != NULL) {
         nxt_port_close(task, port);
+        nxt_queue_remove(&port->link);
+        port->link.next = NULL;
+        nxt_port_use(task, port, -1);
     }
 
     if (queueless_port != NULL) {
         nxt_port_close(task, queueless_port);
+        nxt_queue_remove(&queueless_port->link);
+        queueless_port->link.next = NULL;
+        nxt_port_use(task, queueless_port, -1);
     }
 
     if (nofd_port != NULL) {
         nxt_port_close(task, nofd_port);
+        nxt_queue_remove(&nofd_port->link);
+        nofd_port->link.next = NULL;
+        nxt_port_use(task, nofd_port, -1);
     }
+
+    /*
+     * nxt_runtime_process_add() can fail to allocate its hash node and leave
+     * a process unregistered, so ->registered gates each removal here too.
+     */
+    if (process != NULL && process->registered) {
+        nxt_runtime_process_remove(rt, process);
+    }
+
+#if (NXT_HAVE_MEMFD_CREATE)
+
+    if (queueless != NULL && queueless->registered) {
+        nxt_runtime_process_remove(rt, queueless);
+    }
+
+    if (nofd != NULL && nofd->registered) {
+        nxt_runtime_process_remove(rt, nofd);
+    }
+
+#endif
 
     thr->runtime = saved_rt;
 

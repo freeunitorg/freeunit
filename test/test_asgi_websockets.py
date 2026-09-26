@@ -1453,6 +1453,191 @@ def test_asgi_websockets_10_1_1():
     close_connection(sock)
 
 
+def check_mirror(sock, opcode, payload):
+    """Read one message the mirror application echoed back.
+
+    A refusal arrives as a CLOSE frame instead, and check_frame() decodes a
+    TEXT body as UTF-8, so a 2-byte close body would surface as a
+    UnicodeDecodeError rather than the close code.  Name the code.
+    """
+    frame = ws.frame_read(sock)
+
+    assert frame['opcode'] != ws.OP_CLOSE, f"closed with {frame.get('code')}"
+
+    check_frame(frame, True, opcode, payload)
+
+
+def test_asgi_websockets_fragmented_message_over_1mb():
+    client.load('websockets/mirror')
+
+    _, sock, _ = ws.upgrade()
+
+    # 2 MiB in 32 fragments of 64 KiB.  Every frame is far below the default
+    # 1 MiB max_frame_size, so the router admits all of them; the module used
+    # to sum them against a private per-message 1 MiB of its own.
+    payload = '*' * 2 * 2**20
+
+    ws.message(sock, ws.OP_TEXT, payload, fragmention_size=64 * 2**10)
+
+    check_mirror(sock, ws.OP_TEXT, payload)
+
+    close_connection(sock)
+
+
+def test_asgi_websockets_message_after_fragmented_message():
+    client.load('websockets/mirror')
+
+    _, sock, _ = ws.upgrade()
+
+    # Three non-final 300 KiB fragments and a 100 KiB final one: under 1 MiB
+    # in total, so this message passed even the old cap.
+    payload = '*' * (3 * 300 * 2**10 + 100 * 2**10)
+
+    ws.message(sock, ws.OP_TEXT, payload, fragmention_size=300 * 2**10)
+
+    check_mirror(sock, ws.OP_TEXT, payload)
+
+    # The old per-frame counter was never reset when the final fragment was
+    # delivered straight to a waiting receive(), so 900 KiB stayed on it and
+    # this 512 KiB frame was charged against 1 MiB - 900 KiB.  That depends on
+    # the message above taking the direct-delivery branch, which the mirror
+    # application makes near-certain but does not guarantee: if this ever
+    # reports a 1009 on an unfixed build, rerun it, do not add a sleep.
+    payload = '*' * 512 * 2**10
+
+    ws.frame_write(sock, ws.OP_TEXT, payload)
+
+    check_mirror(sock, ws.OP_TEXT, payload)
+
+    close_connection(sock)
+
+
+def test_asgi_websockets_frame_over_buffer_limit():
+    client.load('websockets/mirror')
+
+    assert 'success' in client.conf(
+        {
+            'http': {
+                'websocket': {
+                    'max_frame_size': 16777216,
+                    'keepalive_interval': 0,
+                }
+            }
+        },
+        'settings',
+    ), 'increase max_frame_size'
+
+    _, sock, _ = ws.upgrade()
+
+    # A single frame the configuration allows but which is larger than the
+    # module's own 10 MiB accumulation limit.  The floor on that limit is what
+    # admits it; this is the only coverage of that branch outside --unsafe.
+    payload = '*' * 11 * 2**20
+
+    ws.frame_write(sock, ws.OP_TEXT, payload)
+
+    check_mirror(sock, ws.OP_TEXT, payload)
+
+    close_connection(sock)
+
+
+def test_asgi_websockets_message_at_buffer_limit():
+    client.load('websockets/mirror')
+
+    _, sock, _ = ws.upgrade()
+
+    # A masked frame with an 8-byte length carries 14 bytes of header, so this
+    # payload makes a frame of exactly the default 1 MiB max_frame_size.  Ten
+    # of them are 10,485,620 bytes, just under the module's 10 MiB.
+    f_size = 2**20 - 14
+    payload = '*' * (10 * f_size)
+
+    ws.message(sock, ws.OP_TEXT, payload, fragmention_size=f_size)
+
+    check_mirror(sock, ws.OP_TEXT, payload)
+
+    close_connection(sock)
+
+
+def test_asgi_websockets_message_over_buffer_limit():
+    client.load('websockets/mirror')
+
+    _, sock, _ = ws.upgrade()
+
+    # One frame more than the test above: 11,534,182 bytes, over the 10 MiB.
+    # A property test, not a regression one -- an unfixed build also answers
+    # 1009 here, on the second frame rather than the eleventh.
+    f_size = 2**20 - 14
+    payload = '*' * (11 * f_size)
+
+    ws.message(sock, ws.OP_TEXT, payload, fragmention_size=f_size)
+
+    check_close(sock, 1009)  # 1009 - CLOSE_TOO_LARGE
+
+
+def test_asgi_websockets_second_frame_over_buffer_limit():
+    client.load('websockets/mirror')
+
+    assert 'success' in client.conf(
+        {
+            'http': {
+                'websocket': {
+                    'max_frame_size': 33554432,
+                    'keepalive_interval': 0,
+                }
+            }
+        },
+        'settings',
+    ), 'increase max_frame_size'
+
+    _, sock, _ = ws.upgrade()
+
+    # The floor admits one over-limit frame into an empty queue and no more,
+    # so the connection holds at most one.  Non-final, so it is suspended
+    # whatever the application is doing.  Also a property test: an unfixed
+    # build refuses the 12 MiB frame itself.
+    ws.frame_write(sock, ws.OP_TEXT, '*' * 12 * 2**20, fin=False)
+
+    # Without this pause the CONT frame can reach the application before the
+    # 12 MiB frame has been processed; on CI that failed with "Invalid state:
+    # attempt to process CONT frame".
+    time.sleep(2)
+
+    ws.frame_write(sock, ws.OP_CONT, '*', fin=True)
+
+    check_close(sock, 1009)  # 1009 - CLOSE_TOO_LARGE
+
+
+def test_asgi_websockets_close_after_frame_over_buffer_limit():
+    client.load('websockets/mirror')
+
+    assert 'success' in client.conf(
+        {
+            'http': {
+                'websocket': {
+                    'max_frame_size': 33554432,
+                    'keepalive_interval': 0,
+                }
+            }
+        },
+        'settings',
+    ), 'increase max_frame_size'
+
+    _, sock, _ = ws.upgrade()
+
+    ws.frame_write(sock, ws.OP_TEXT, '*' * 12 * 2**20, fin=False)
+
+    # The same pause as above: let the 12 MiB frame be processed first.
+    time.sleep(2)
+
+    # CLOSE is exempt from the accumulation limit: it is at most 125 bytes and
+    # refusing it would replace the disconnect the application is owed with a
+    # 1009.  Drop the exemption and this returns 1009 instead of 1000.
+    ws.frame_write(sock, ws.OP_CLOSE, ws.serialize_close())
+
+    check_close(sock)
+
+
 # settings
 
 

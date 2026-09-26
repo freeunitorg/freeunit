@@ -5,10 +5,12 @@ import pytest
 
 from unit.applications.lang.node import ApplicationNode
 from unit.applications.websockets import ApplicationWebsocket
+from unit.control import Control
 
 prerequisites = {'modules': {'node': 'any'}}
 
 client = ApplicationNode()
+control = Control()
 ws = ApplicationWebsocket()
 
 
@@ -1432,3 +1434,90 @@ def test_node_websockets_keepalive_interval():
     check_frame(frame, True, ws.OP_PING, '')  # PING frame
 
     sock.close()
+
+
+def test_node_websockets_timeout_does_not_detach():
+    """An upgraded stream is not a request the deadline gave up on.
+
+    "limits": {"timeout"} re-arms nxt_router_app_timeout() for every non-last
+    message from the application, and the 101 is one, so an idle websocket
+    reaches that handler with the deadline passed.  The request's accounting
+    was already returned by the upgrade, so there is no worker still running
+    it: the router must not report the process "detached", which is its view
+    of a worker holding a request whose deadline passed.
+
+    Only the accounting is asserted.  The handler also answers 503 and drops
+    the stream, which is wrong for a websocket and is issue #422.
+    """
+
+    client.load('websockets/mirror')
+
+    assert 'success' in client.conf(
+        {'timeout': 1}, 'applications/websockets%2Fmirror/limits'
+    ), 'configure timeout'
+
+    _, sock, _ = ws.upgrade()
+
+    # No traffic either way -- keepalive_interval is 0 from the fixture -- so
+    # nothing re-arms the timer and it expires.
+    time.sleep(3)
+
+    processes = (
+        control.conf_get('/status')
+        .get('applications', {})
+        .get('websockets/mirror', {})
+        .get('processes', {})
+    )
+
+    assert processes.get('detached', 0) == 0, (
+        f'an upgraded stream marked the worker detached: {processes}'
+    )
+
+    sock.close()
+
+
+def wait_idle(name, idle, timeout=10):
+    """The idle count of an application, once it settles.
+
+    Read by name rather than compared whole: /status grows keys, and this
+    is about one of them.
+    """
+
+    for _ in range(timeout * 10):
+        processes = control.conf_get('/status')['applications'][name][
+            'processes'
+        ]
+
+        if processes['idle'] == idle:
+            break
+
+        time.sleep(0.1)
+
+    return processes
+
+
+def test_node_websockets_worker_idle_after_close():
+    client.load('websockets/mirror')
+
+    name = 'websockets/mirror'
+
+    _, sock, _ = ws.upgrade()
+
+    ws.frame_write(sock, ws.OP_TEXT, 'blah')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'blah')
+
+    # The worker is out of the idle economy while the session is open.
+
+    processes = wait_idle(name, 0)
+
+    assert processes['running'] == 1, 'running while open'
+    assert processes['idle'] == 0, 'busy while open'
+
+    close_connection(sock)
+
+    # And rejoins it when the session ends.
+
+    processes = wait_idle(name, 1)
+
+    assert processes['running'] == 1, 'running after close'
+    assert processes['idle'] == 1, 'idle after close'

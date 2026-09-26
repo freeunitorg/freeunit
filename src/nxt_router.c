@@ -368,6 +368,8 @@ static void nxt_router_app_unlink(nxt_task_t *task, nxt_app_t *app);
 
 static void nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app,
     nxt_port_t *port, nxt_apr_action_t action);
+static void nxt_router_app_abandoned_settle(nxt_task_t *task,
+    nxt_request_rpc_data_t *req_rpc_data);
 static void nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
     nxt_request_rpc_data_t *req_rpc_data);
 static void nxt_router_http_request_error(nxt_task_t *task, void *obj,
@@ -5364,6 +5366,17 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
     r = req_rpc_data->request;
     if (nxt_slow_path(r == NULL)) {
+        /*
+         * A request the router gave up on.  The answer belongs to nobody and
+         * needs no reply, but the last message is the worker saying it is
+         * done: this is where the port it was running on may rejoin the idle
+         * economy.  A message that is not the last one proves nothing yet;
+         * the response can still be streaming.
+         */
+        if (msg->port_msg.last != 0) {
+            nxt_router_app_abandoned_settle(task, req_rpc_data);
+        }
+
         return;
     }
 
@@ -5402,7 +5415,12 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         nxt_request_rpc_data_unlink(task, req_rpc_data);
 
     } else {
-        if (app->timeout != 0) {
+        /*
+         * The deadline bounds the worker's answer, and an upgraded
+         * WebSocket has had its answer: the frames that follow are a
+         * session, however quiet (#422).
+         */
+        if (app->timeout != 0 && r->state != &nxt_http_websocket) {
             r->timer.handler = nxt_router_app_timeout;
             r->timer_data = req_rpc_data;
             nxt_timer_add(task->thread->engine, &r->timer, app->timeout);
@@ -5565,11 +5583,25 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
             nxt_thread_mutex_unlock(&app->mutex);
 
             nxt_router_app_port_release(task, app, app_port, NXT_APR_UPGRADE);
-            req_rpc_data->apr_action = NXT_APR_CLOSE;
+
+            /*
+             * The count above is undone by this action, and only by it:
+             * nxt_request_rpc_data_unlink() is the one path that runs for a
+             * websocket that ends, whichever side ends it, and ->app_port is
+             * still this port when it does.
+             */
+            req_rpc_data->apr_action = NXT_APR_WEBSOCKET_CLOSE;
 
             nxt_debug(task, "stream #%uD upgrade", req_rpc_data->stream);
 
             r->state = &nxt_http_websocket;
+
+            /*
+             * The 101 arrived as a non-last message, which re-armed the
+             * request deadline above; the upgrade ends the request, so the
+             * deadline goes with it (#422).
+             */
+            nxt_timer_disable(task->thread->engine, &r->timer);
 
         } else {
             r->state = &nxt_http_request_send_state;
@@ -5809,6 +5841,12 @@ nxt_router_response_error_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     req_rpc_data = data;
 
     req_rpc_data->rpc_cancel = 0;
+
+    /*
+     * The worker is gone, so whatever the router gave up on it is over.  The
+     * settle does nothing unless this request is one of those.
+     */
+    nxt_router_app_abandoned_settle(task, req_rpc_data);
 
     /* TODO cancel message and return if cancelled. */
 
@@ -6658,12 +6696,173 @@ nxt_router_app_port_idle(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port)
 }
 
 
+/*
+ * The router gave up on a request a worker is running.  The 503 is the
+ * client's answer, but the worker does not know that and keeps executing, so
+ * the port must not go back into the idle economy when the request's
+ * accounting is released a moment from now: the reaper would QUIT a worker
+ * in the middle of a request, and the port would count as free against
+ * "processes": {"max"} while it is not.
+ *
+ * Enter the state a detached worker already has -- see
+ * nxt_router_detached_apply() -- and settle it when the worker answers, when
+ * the port closes, or when the application's own FINISH edge says its work is
+ * over.  "app_port" is the port the acknowledgement moved the request to:
+ * the worker's, never the shared queue.  Called before the unlink that
+ * releases the request.
+ *
+ * The state lands on app_port->main_app_port.  That is the same object the
+ * acknowledgement and a release reach through the same field, while a
+ * detached edge finds it by pid (nxt_router_detached_apply()); a worker's
+ * ports share one main port, so both identities name it.
+ */
+
+static void
+nxt_router_app_abandon(nxt_task_t *task, nxt_app_t *app,
+    nxt_request_rpc_data_t *req_rpc_data, nxt_port_t *app_port)
+{
+    nxt_bool_t  changed, start_process;
+    nxt_port_t  *port;
+
+    port = app_port->main_app_port;
+
+    /*
+     * Both the detached state and the rpc_data's own pointer outlive this
+     * call, and the state is published to another thread: the port close
+     * path takes the same mutex and drops the state's reference when it
+     * settles.  So both application references and the port reference are
+     * taken before the state can be seen, the way
+     * nxt_router_detached_apply() takes its own before the mutex; a close
+     * that arrived in between would otherwise drop a reference this call has
+     * not taken yet.  The request still holds an application reference of
+     * its own here, so the increment cannot resurrect a freed one.
+     */
+    nxt_router_app_use(task, app, 2);
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    changed = 0;
+
+    if (port->detached == 0) {
+        port->detached = 1;
+        app->detached_processes++;
+        changed = 1;
+    }
+
+    port->detached_router++;
+
+    nxt_port_inc_use(port);
+
+    /*
+     * Defensive, and symmetric with the detached START edge: a port with a
+     * live request is not in an idle queue, so this normally finds nothing
+     * to unwind and starts nothing.  It is here so that the flag and the
+     * unwind share this critical section whichever way the port got here.
+     */
+    start_process = nxt_router_app_port_busy(task, app, port, "abandoned");
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    if (!changed) {
+        /*
+         * The application was detached already, so its own edge owns that
+         * reference; this call keeps only the rpc_data's.
+         */
+        nxt_router_app_use(task, app, -1);
+    }
+
+    /*
+     * Keep the registration.  nxt_router_response_ready_handler() is what
+     * drops the answer of a request nobody tracks any more, and that is also
+     * where the port is taken back; the unlink that follows would cancel the
+     * registration first and the answer would never reach it.
+     */
+    req_rpc_data->rpc_cancel = 0;
+
+    req_rpc_data->abandoned_app = app;
+    req_rpc_data->abandoned_port = port;
+
+    if (start_process) {
+        nxt_router_start_app_process(task, app);
+    }
+}
+
+
+/*
+ * A worker the router gave up on has answered, or is gone.  Its port rejoins
+ * the idle economy if the router's own mark is the only thing holding it out
+ * -- an application START edge clears that mark and its FINISH edge is what
+ * ends the state then -- and the references the abandonment took are dropped
+ * either way.
+ */
+
+static void
+nxt_router_app_abandoned_settle(nxt_task_t *task,
+    nxt_request_rpc_data_t *req_rpc_data)
+{
+    nxt_port_t  *port;
+    nxt_app_t   *app;
+    nxt_bool_t  adjust_idle_timer, ours;
+
+    port = req_rpc_data->abandoned_port;
+
+    if (port == NULL) {
+        return;
+    }
+
+    app = req_rpc_data->abandoned_app;
+
+    req_rpc_data->abandoned_port = NULL;
+    req_rpc_data->abandoned_app = NULL;
+
+    ours = 0;
+    adjust_idle_timer = 0;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    if (port->detached_router != 0) {
+        port->detached_router--;
+
+        /*
+         * The port is free only once no reason is left: this was the last
+         * request the router gave up on, and the application is not running
+         * detached work of its own either.
+         */
+        if (port->detached_router == 0 && port->detached_app == 0
+            && port->detached != 0)
+        {
+            port->detached = 0;
+
+            app->detached_processes--;
+
+            adjust_idle_timer = nxt_router_app_port_idle(task, app, port);
+
+            ours = 1;
+        }
+    }
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    if (adjust_idle_timer) {
+        nxt_router_app_use(task, app, 1);
+        nxt_event_engine_post(app->engine, &app->adjust_idle_work);
+    }
+
+    if (ours) {
+        nxt_router_app_use(task, app, -1);
+    }
+
+    nxt_router_app_use(task, app, -1);
+    nxt_port_use(task, port, -1);
+}
+
+
 static void
 nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     nxt_apr_action_t action)
 {
     int         inc_use;
-    uint32_t    got_response, dec_requests;
+    uint32_t    got_response, dec_requests, dec_websockets;
     nxt_bool_t  adjust_idle_timer;
     nxt_port_t  *main_app_port;
 
@@ -6672,6 +6871,7 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     inc_use = 0;
     got_response = 0;
     dec_requests = 0;
+    dec_websockets = 0;
 
     switch (action) {
     case NXT_APR_NEW_PORT:
@@ -6690,11 +6890,21 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     case NXT_APR_CLOSE:
         inc_use = -1;
         break;
+    case NXT_APR_WEBSOCKET_CLOSE:
+        dec_websockets = 1;
+        inc_use = -1;
+        break;
     }
 
-    nxt_debug(task, "app '%V' release port %PI:%d: %d %d", &app->name,
+    nxt_debug(task, "app '%V' release port %PI:%d: %d %d %d", &app->name,
               port->pid, port->id,
-              (int) inc_use, (int) got_response);
+              (int) inc_use, (int) got_response, (int) dec_websockets);
+
+    /*
+     * A websocket is upgraded from a request a worker has answered, so the
+     * port it is released on is that worker's own port, never the shared one.
+     */
+    nxt_assert(dec_websockets == 0 || port->id != NXT_SHARED_PORT_ID);
 
     if (port->id == NXT_SHARED_PORT_ID) {
         nxt_thread_mutex_lock(&app->mutex);
@@ -6711,6 +6921,7 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     nxt_thread_mutex_lock(&app->mutex);
 
     main_app_port->active_requests -= got_response + dec_requests;
+    main_app_port->active_websockets -= dec_websockets;
     app->active_requests -= got_response + dec_requests;
 
     if (main_app_port->pair[1] != -1 && main_app_port->app_link.next == NULL) {
@@ -6743,6 +6954,20 @@ adjust_use:
 
     nxt_port_use(task, port, inc_use);
 }
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_router_websocket_test.c. */
+
+void
+nxt_router_test_app_port_release(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_t *port, nxt_apr_action_t action)
+{
+    nxt_router_app_port_release(task, app, port, action);
+}
+
+#endif
 
 
 void
@@ -6804,13 +7029,18 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
      * after the response went out, or a kill.  This is the only path that
      * runs for it then, so the count has to be settled here or the
      * application never reaches the zero nxt_router_free_app() asserts on.
-     * The matching application reference is dropped below, outside the lock.
+     * The process is gone, so every unit of work it was running goes with
+     * it, however many the counts hold.  The matching application
+     * reference, the one the first reason took, is dropped below, outside
+     * the lock.
      */
 
     detached = port->detached;
 
     if (detached) {
         port->detached = 0;
+        port->detached_app = 0;
+        port->detached_router = 0;
         app->detached_processes--;
     }
 
@@ -7720,6 +7950,35 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
         return;
     }
 
+    /*
+     * The acknowledgement moves the request's port off the shared queue and
+     * onto the worker that took it; nxt_router_msg_retract() reads the same
+     * fact.  A request a worker is running is not the router's to release:
+     * its port has to stay out of the idle economy until the worker answers
+     * or closes.  See nxt_router_app_abandon().
+     *
+     * An upgraded stream is not such a request.  Its accounting was already
+     * given back by NXT_APR_UPGRADE, so no worker is running it and there is
+     * no slot to hold; what does keep the port out of the idle economy is the
+     * session count, and that one is settled by the unlink below, because the
+     * upgrade left NXT_APR_WEBSOCKET_CLOSE as the action.  The mark would
+     * instead report the worker "detached" for as long as the connection
+     * lives.  The websocket state is the upgrade itself -- it is assigned
+     * beside that release, and nowhere else -- so a handshake still in flight
+     * or one that failed, both of which do hold their accounting, still reach
+     * the abandon.
+     */
+    if (req_rpc_data->app_port != NULL
+        && req_rpc_data->app_port->id != NXT_SHARED_PORT_ID
+        && r->state != &nxt_http_websocket)
+    {
+        /* The request is still linked, so it holds the application. */
+        nxt_assert(req_rpc_data->app != NULL);
+
+        nxt_router_app_abandon(task, req_rpc_data->app, req_rpc_data,
+                               req_rpc_data->app_port);
+    }
+
     nxt_http_request_error(task, r, NXT_HTTP_SERVICE_UNAVAILABLE);
 
     nxt_request_rpc_data_unlink(task, req_rpc_data);
@@ -7763,10 +8022,13 @@ nxt_router_http_request_release(nxt_task_t *task, void *obj, void *data)
  * field is never cleared, and the main port can be released while a sibling
  * port of the same process is still registered.
  *
- * Either edge may arrive with the port already in the state being asked
- * for, and both then do nothing: a start edge is idempotent because several
- * contexts of one worker can be detached at once, and a finish edge because
- * the worker's death has already settled the state.
+ * The application's edges are counted, not latched.  Several contexts of one
+ * worker can run detached work at once and the edge names none of them, so
+ * the port leaves the idle economy on the first start and rejoins it on the
+ * last finish, once the router has no abandoned request of its own left
+ * either.  app->detached_processes counts processes, so it moves on those two
+ * transitions only.  A finish with nothing to match -- a worker whose death
+ * has already settled the count, or a forged one -- changes nothing.
  */
 
 static void
@@ -7776,6 +8038,7 @@ nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid, uint8_t state)
     nxt_app_t          *app;
     nxt_port_t         *port;
     nxt_bool_t         changed, start_process, adjust_idle_timer;
+    const char         *alert;
     nxt_runtime_t      *rt;
     nxt_atomic_int_t   c;
 
@@ -7828,6 +8091,7 @@ nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid, uint8_t state)
     nxt_debug(task, "app '%V' port %PI:%d detached state %d",
               &app->name, port->pid, port->id, (int) state);
 
+    alert = NULL;
     changed = 0;
     start_process = 0;
     adjust_idle_timer = 0;
@@ -7836,49 +8100,103 @@ nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid, uint8_t state)
 
     if (state == NXT_PORT_DETACHED_START) {
 
-        if (port->detached == 0) {
-            port->detached = 1;
-            app->detached_processes++;
+        /*
+         * A reason of the application's own, counted beside the router's
+         * count of requests it gave up on: neither may settle the other.
+         *
+         * Saturate rather than wrap.  The count is bounded by the contexts
+         * of one worker, so the maximum is out of reach for a sound sender;
+         * a wrap would read as "no detached work" and hand a running worker
+         * back to the reaper.
+         */
+
+        if (nxt_slow_path(port->detached_app == UINT32_MAX)) {
+            alert = "sent a detached start at the maximum count";
+
+        } else {
+            port->detached_app++;
+
+            if (port->detached == 0) {
+                port->detached = 1;
+                app->detached_processes++;
+                changed = 1;
+
+                /*
+                 * The worker may already have been parked as idle.  libunit
+                 * sends the start edge before the last response message, but
+                 * that only orders the two on the wire: the response is
+                 * answered by the engine that owns the request, this by the
+                 * main thread, and a request that was failed rather than
+                 * answered -- a "limits": {"timeout"} expiry, an error --
+                 * runs nxt_router_app_port_release() with no start edge in
+                 * sight at all, so the port can have been sitting in
+                 * idle_ports for as long as the application chose to keep
+                 * running.
+                 *
+                 * Unwind it here, exactly as an acknowledgement does.
+                 * Leaving it in place would be worse than not having this
+                 * message: the reaper would QUIT a worker that is still
+                 * executing -- the bug this exists to fix -- and would clear
+                 * ->app on the way, so nxt_router_app_port_close() would
+                 * never run and the count and the application reference
+                 * below would never be settled.
+                 */
+
+                start_process = nxt_router_app_port_busy(task, app, port,
+                                                         "detached");
+            }
+        }
+
+    } else if (nxt_slow_path(port->detached_app == 0)) {
+
+        /*
+         * An unmatched finish: a worker whose death has already settled the
+         * count, one otherwise out of step with the router, or a forged
+         * edge.  Leave the count at zero and touch neither
+         * app->detached_processes nor the reference.
+         */
+
+        alert = "sent an unmatched detached finish";
+
+    } else if (--port->detached_app == 0) {
+
+        /*
+         * The port leaves the detached state only when no reason is left:
+         * nothing here while a request the router gave up on is still
+         * running, and nothing for that request's answer while the
+         * application's own work is.
+         */
+        if (port->detached_router == 0 && port->detached != 0) {
+            port->detached = 0;
+            app->detached_processes--;
             changed = 1;
 
             /*
-             * The worker may already have been parked as idle.  libunit
-             * sends the start edge before the last response message, but
-             * that only orders the two on the wire: the response is
-             * answered by the engine that owns the request, this by the
-             * main thread, and a request that was failed rather than
-             * answered -- a "limits": {"timeout"} expiry, an error -- runs
-             * nxt_router_app_port_release() with no start edge in sight at
-             * all, so the port can have been sitting in idle_ports for as
-             * long as the application chose to keep running.
-             *
-             * Unwind it here, exactly as an acknowledgement does.  Leaving
-             * it in place would be worse than not having this message: the
-             * reaper would QUIT a worker that is still executing -- the bug
-             * this exists to fix -- and would clear ->app on the way, so
-             * nxt_router_app_port_close() would never run and the count and
-             * the application reference below would never be settled.
+             * Only now may this worker rejoin the idle economy.  Its last
+             * response went out long ago, so nothing else will run this
+             * transition for it.
              */
 
-            start_process = nxt_router_app_port_busy(task, app, port,
-                                                     "detached");
+            adjust_idle_timer = nxt_router_app_port_idle(task, app, port);
         }
-
-    } else if (port->detached != 0) {
-        port->detached = 0;
-        app->detached_processes--;
-        changed = 1;
-
-        /*
-         * Only now may this worker rejoin the idle economy.  Its last
-         * response went out long ago, so nothing else will run this
-         * transition for it.
-         */
-
-        adjust_idle_timer = nxt_router_app_port_idle(task, app, port);
     }
 
     nxt_thread_mutex_unlock(&app->mutex);
+
+    /*
+     * The application can send a refused edge in a loop, so it is an alert
+     * once per port and debug output after that.
+     */
+
+    if (nxt_slow_path(alert != NULL)) {
+        if (port->detached_alerted == 0) {
+            port->detached_alerted = 1;
+            nxt_alert(task, "detached_handler: %PI %s", pid, alert);
+
+        } else {
+            nxt_debug(task, "detached_handler: %PI %s", pid, alert);
+        }
+    }
 
     if (adjust_idle_timer) {
         nxt_router_app_use(task, app, 1);
@@ -7902,9 +8220,11 @@ nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid, uint8_t state)
      * nxt_request_rpc_data_unlink() has already dropped its reference, so a
      * configuration reload could free the application out from under a
      * process still executing.  The finish edge that changed the state
-     * returns it, and an edge that changed nothing returns only its own, so
-     * a repeated start cannot take a second reference that the single
-     * finish never returns.
+     * returns it, and an edge that changed nothing returns only its own.
+     * One reference per process, then, not per counted edge: the inner
+     * starts and finishes take one and give it straight back, and a start
+     * that found the router's own mark already set leaves that reference to
+     * nxt_router_app_abandoned_settle().
      */
 
     drop = 1;

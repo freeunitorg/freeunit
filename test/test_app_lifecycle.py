@@ -110,11 +110,9 @@ class ApplicationLibunit(ApplicationProto):
 # a request that fills a segment leaves it unable to build a response at all.
 # That is a property of the sample app, not of the port handling under test.
 #
-# The legacy `wasm` runtime is absent deliberately: the suite has no client
-# for it (only test/unit/applications/lang/wasm_component.py exists), its
-# build-test leg does not install or run pytest at all
-# (`if: module != 'wasm'`), and sanitize.yml has no wasm leg.  A row here
-# would skip in every leg that exists.
+# The legacy `wasm` runtime is absent: its client (test/test_wasm.py) is a
+# WASI smoke guest, not a body-mirroring app, and sanitize.yml has no wasm
+# leg.  A row here would skip in every leg that exists.
 RUNTIMES = {
     'libunit': (ApplicationLibunit, 'libunit', [], [], False, False),
     'go': (ApplicationGo, 'mirror', ['go'], [], True, True),

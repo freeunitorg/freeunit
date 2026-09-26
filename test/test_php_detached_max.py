@@ -270,17 +270,27 @@ def test_php_detached_start_after_the_worker_went_idle():
 
     The start edge is sent before the last response message, but that only
     orders the two on the wire.  A request that is failed rather than
-    answered releases its worker with no start edge in sight at all:
-    "limits": {"timeout"} answers 503 while the script is still running, and
-    the release puts the port in idle_ports.  The start edge then arrives for
-    a port that is already there.
+    answered has no start edge in sight at all: "limits": {"timeout"} answers
+    503 while the script is still running, and the port is held out of the
+    idle economy until the report arrives -- by the release, and by the
+    router's own mark once the acknowledgement has moved the request to the
+    worker.
 
-    Unless it is taken back out, the reaper QUITs a process that is still
-    executing PHP -- the exact failure this feature exists to prevent -- and
-    clears the port's application on the way, after which nothing settles the
-    detached state: nxt_port_close() skips nxt_router_app_port_close() for a
-    port with no application, the finish edge is ignored for the same reason,
-    and the count sticks for the life of the application.
+    When the mark is in place, the edge finds the port already out and has
+    nothing to unwind; it records the application's own reason, and the
+    FINISH ends the state.  The unwind is still load-bearing for the other
+    order: the answer's settle runs on the request engine and this edge on the
+    main thread, nothing orders their readers, and a settle that wins clears
+    the router's mark, lets the release park the port, and leaves
+    nxt_router_app_port_busy(..., "detached") to take it back out.  Both
+    orders are reachable as this test runs; the assertions hold either way.
+
+    Without that, the reaper QUITs a process that is still executing PHP --
+    the exact failure this feature exists to prevent -- and clears the port's
+    application on the way, after which nothing settles the detached state:
+    nxt_port_close() skips nxt_router_app_port_close() for a port with no
+    application, the finish edge is ignored for the same reason, and the count
+    sticks for the life of the application.
     """
 
     timeout = 2
@@ -344,6 +354,91 @@ def test_php_detached_start_after_the_worker_went_idle():
         'the detached state cleared once the script returned'
     )
     assert os.path.exists(done), 'the detached work ran to completion'
+
+
+def test_php_timed_out_request_keeps_the_worker_busy():
+    """A request the router gave up on must not free the worker running it.
+
+    The script holds the worker past limits.timeout and then answers normally:
+    no fastcgi_finish_request(), so no detached edge ever reports that it is
+    still running.  Nothing else tells the router either -- the deadline
+    answers 503 while the worker keeps executing -- so the router's own
+    accounting has to keep the port out of the idle economy until the answer
+    arrives.  Released, the port is parked as idle, the reaper QUITs a worker
+    in the middle of a script, and the slot counts as free under "max": 1.
+
+    The counters asserted are the router's own view of that: "detached", for a
+    worker it may not hand out, and "idle", which must stay empty.  The "ran"
+    marker is appended once per execution, so it pins that the request ran
+    exactly once as well.
+    """
+
+    timeout = 2
+    hold = 12
+
+    client.load(
+        'detached_worker',
+        processes={'max': 1, 'spare': 0, 'idle_timeout': IDLE_TIMEOUT},
+        limits={'timeout': timeout},
+    )
+
+    ran = marker('timed_out_ran')
+    done = marker('timed_out_done')
+
+    start = time.time()
+    resp = client.get(
+        url=f'/?ran={ran}&hold={hold}&done={done}', read_timeout=timeout + 10
+    )
+    elapsed = time.time() - start
+
+    assert resp['status'] == 503, f'the request outlived limits.timeout: {resp}'
+    assert elapsed < timeout + 5, f'answered at the deadline, took {elapsed:.1f}s'
+    assert os.path.exists(ran), 'the request executed'
+
+    # Well past idle_start + idle_timeout with the script still running: a
+    # port the router had released would have been reaped by now.  The
+    # marker says the window really is open, so a slow machine fails here
+    # loudly instead of reading counters after the script has answered.
+    time.sleep(IDLE_TIMEOUT * 2)
+
+    assert not os.path.exists(done), (
+        f'the script finished within {IDLE_TIMEOUT * 2}s of the deadline; '
+        f'raise hold above {hold}'
+    )
+
+    procs = app_processes()
+
+    assert procs.get('detached', 0) == 1, (
+        f'the worker running the failed request is not held out of the idle '
+        f'economy: {procs}'
+    )
+    assert procs.get('idle', 0) == 0, (
+        f'a worker still running a request the router gave up on is counted '
+        f'idle and is reapable: {procs}'
+    )
+    assert procs.get('running', 0) == 1, (
+        f'the worker was reaped while the script ran: {procs}'
+    )
+    assert len(worker_pids()) == 1, '"max": 1 still bounds live workers'
+
+    # The script answers at "hold"; the worker is free from that message on.
+    deadline = time.time() + hold + 20
+    while time.time() < deadline and (
+        app_processes().get('detached', 0) != 0 or not os.path.exists(done)
+    ):
+        time.sleep(0.2)
+
+    assert os.path.exists(done), 'the script ran to completion'
+    assert app_processes().get('detached', 0) == 0, (
+        f"the port was not settled by the worker's answer: {app_processes()}"
+    )
+
+    with open(ran) as f:
+        pids = f.read().split()
+
+    assert len(pids) == 1, f'the request executed {len(pids)} times: {pids}'
+
+    assert client.get()['status'] == 200, 'the worker serves again'
 
 
 def test_php_detached_repeated_requests_hold_the_bound():

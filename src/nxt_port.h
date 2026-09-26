@@ -201,6 +201,13 @@ typedef enum {
  * header field by field, and nxt_port_socket_write() ORs into ->last.  A
  * new type is bounds-checked on both sides instead, so an older peer
  * refuses the message rather than misreading a flag.
+ *
+ * The two edges are a balanced pair: one start and one finish per unit of
+ * detached work.  The payload names neither a request nor a context, so the
+ * router can only count the edges per process; it takes the worker out of
+ * the idle economy on the first start and gives it back on the last finish.
+ * The payload may grow later, and the handler requires at least one byte and
+ * reads the first, so an older sender stays readable.
  */
 typedef enum {
     NXT_PORT_DETACHED_START  = 0,
@@ -311,6 +318,30 @@ nxt_port_recv_msg_close_fds(nxt_port_recv_msg_t *msg)
 }
 
 
+/*
+ * How many queued messages on one port may carry a file descriptor.
+ *
+ * port->messages itself stays unbounded.  A message with no descriptor costs
+ * only memory, which was true before a queued message took ownership of what
+ * it names, and bounding it would change behaviour on paths that never hold a
+ * descriptor at all -- every ordinary reply and every request body fragment.
+ *
+ * A message that does carry one is different: it holds up to two descriptors
+ * of this process open for as long as it waits, so a peer that stops reading
+ * turns into RLIMIT_NOFILE pressure on the sender rather than memory pressure
+ * alone.  That is the cost this bounds.
+ *
+ * The traffic being bounded is control-plane and one message per event: a new
+ * port, a process start, a listening socket, a certificate, a script, a shared
+ * memory segment.  A port with 128 of them outstanding is not a busy port, it
+ * is a peer that has stopped reading, so the bound is far above any legitimate
+ * burst.  At two descriptors an entry it caps one stalled port at 256 open
+ * descriptors, which leaves room for several of them under the 1024 soft
+ * RLIMIT_NOFILE that is still the common default.
+ */
+#define NXT_PORT_MAX_FD_MSGS  128
+
+
 typedef struct nxt_app_s  nxt_app_t;
 
 struct nxt_port_s {
@@ -329,24 +360,81 @@ struct nxt_port_s {
     nxt_queue_t         messages;   /* of nxt_port_send_msg_t */
     nxt_thread_mutex_t  write_mutex;
 
+    /*
+     * How many entries of ->messages still carry a file descriptor.
+     *
+     * A queued message owns the descriptors it names, so each such entry
+     * holds up to two of this process's descriptors open for as long as it
+     * waits.  The count exists to bound that; it is maintained under
+     * ->write_mutex and is described with the bound in src/nxt_port_socket.c.
+     *
+     * ->fd_refusing is set by the first send the bound refuses and cleared
+     * by the next descriptor it takes, also under ->write_mutex.  A peer
+     * that stops reading keeps the port at the bound for as long as it
+     * stalls, so the refusal is logged once when the port gets there rather
+     * than once for every send.
+     */
+    uint32_t            fd_messages;
+    uint8_t             fd_refusing;
+
     /* Maximum size of message part. */
     uint32_t            max_size;
     /* Maximum interleave of message parts. */
     uint32_t            max_share;
 
+    /*
+     * Websocket sessions upgraded from a request this worker answered.  A
+     * session is counted by NXT_APR_UPGRADE and uncounted by
+     * NXT_APR_WEBSOCKET_CLOSE, both in nxt_router_app_port_release().
+     */
     uint32_t            active_websockets;
 
     /*
      * The application answered a request on this port and kept running.
      * Treated exactly like active_websockets by the idle transition in
-     * nxt_router_app_port_release(): the port stays in app->ports and in
+     * nxt_router_app_port_idle(): the port stays in app->ports and in
      * app->processes, and stays out of the idle queues, so the reaper
      * never sees it and it keeps counting against "processes": {"max"}.
-     *
-     * Unlike active_websockets this one is cleared again, when the
-     * application reports the work finished.
      */
     uint8_t             detached;
+
+    /*
+     * An edge the accounting refused -- an unmatched FINISH, or a START at
+     * the maximum count -- was already logged as an alert for this port.
+     * Such an edge is a valid message the application can send in a loop,
+     * so only the first one is an alert and the rest go to the debug log.
+     * Touched only by nxt_router_detached_apply(), on the main thread.
+     */
+    uint8_t             detached_alerted;
+
+    /*
+     * How many units of detached work the application reported of its own:
+     * one for each START edge whose FINISH edge has not arrived.  Until the
+     * last of them does, the port stays out of the idle economy even with no
+     * request left.  A count rather than a flag because the edges carry no
+     * context id and a worker may run several contexts -- see
+     * nxt_port_detached_t above -- so the first context's FINISH must not
+     * speak for the rest.  It saturates at UINT32_MAX and detached_router
+     * below does not: this one moves on edges the application sends, which
+     * the router cannot bound, while detached_router moves only on requests
+     * the router itself gave up on, one per request it has in flight.
+     */
+    uint32_t            detached_app;
+
+    /*
+     * The router put the port in the detached state itself: one for each
+     * request it has given up on that the worker is still running.  A
+     * "limits": {"timeout"} expiry answers the client while the worker keeps
+     * executing, and the port may not rejoin the idle economy until every
+     * such request has been answered or the port closes.  A count rather
+     * than a flag because one worker can run several of them at once, and
+     * kept apart from detached_app so that neither clear drops the other's
+     * reason.  As wide as active_requests below it, which counts the same
+     * population: "threads" is validated up to NXT_INT32_T_MAX, and a wrap
+     * would leave a settle unable to clear the state at all.
+     */
+    uint32_t            detached_router;
+
     uint32_t            active_requests;
 
     nxt_port_handler_t  handler;

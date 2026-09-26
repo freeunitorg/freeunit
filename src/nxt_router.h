@@ -14,6 +14,7 @@
 
 typedef struct nxt_http_request_s  nxt_http_request_t;
 #include <nxt_application.h>
+#include <nxt_router_request.h>
 
 
 typedef struct nxt_http_action_s               nxt_http_action_t;
@@ -365,6 +366,10 @@ void nxt_router_access_log_reopen_handler(nxt_task_t *task,
 /* The detached edge handler, for the sender check test. */
 void nxt_router_test_detached_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
+
+/* The port release, for the websocket accounting test. */
+void nxt_router_test_app_port_release(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_t *port, nxt_apr_action_t action);
 #endif
 
 #if (NXT_TESTS)
