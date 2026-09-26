@@ -769,6 +769,19 @@ min_length, the client gets 406 instead of the bytes it refused.
 </para>
 </change>
 
+<change type="change">
+<para>
+a server with no compression configured now answers 406 to a request whose
+Accept-Encoding refuses the identity coding: "identity;q=0", or "*;q=0" with
+no more specific entry for identity.  Identity is the only coding that such a
+server has.  Before, it sent the response, or the requested range of it, in
+the bytes that the client had refused.  To read that refusal, each response
+with a known length above zero now looks at its own Content-Encoding and at
+the request Accept-Encoding.  Before, these checks ran only with a compressor
+configured.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 a malformed weight in Accept-Encoding is no longer read as a refusal.  The

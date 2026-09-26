@@ -535,6 +535,12 @@ static nxt_uint_t
 nxt_http_comp_compressor_lookup_enabled(const nxt_http_comp_conf_t *conf,
                                         const nxt_str_t *token)
 {
+    /* With compression off, there is no enabled array to search. */
+
+    if (conf == NULL) {
+        return NXT_HTTP_COMP_SCHEME_UNKNOWN;
+    }
+
     /*
      * RFC 9110 Sect. 8.4.1: a content coding is a token, and tokens are
      * compared case-insensitively.  "Identity;q=0" and "GZIP" are as valid
@@ -549,6 +555,24 @@ nxt_http_comp_compressor_lookup_enabled(const nxt_http_comp_conf_t *conf,
     }
 
     return NXT_HTTP_COMP_SCHEME_UNKNOWN;
+}
+
+
+/*
+ * Tells whether the token names the identity coding.  Identity is a
+ * representation that each response has.  So it is recognised from the
+ * static table, not from the enabled compressors: it must be recognised
+ * with no compressor enabled.
+ */
+
+static bool
+nxt_http_comp_token_is_identity(const nxt_str_t *token)
+{
+    const nxt_http_comp_type_t  *identity;
+
+    identity = &nxt_http_comp_compressors[NXT_HTTP_COMP_SCHEME_IDENTITY];
+
+    return nxt_strcasestr_eq(token, &identity->token);
 }
 
 
@@ -797,18 +821,25 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
             continue;
         }
 
-        ecidx = nxt_http_comp_compressor_lookup_enabled(conf, &enc);
-        if (ecidx == NXT_HTTP_COMP_SCHEME_UNKNOWN) {
-            continue;
-        }
+        /*
+         * Identity says whether the own bytes of the response are
+         * acceptable.  That does not depend on the configured compressors.
+         * Read it before the lookup, so that a refusal still arrives when
+         * compression is off.  That is the one case where identity is all
+         * the server can offer.
+         */
 
-        /* A built configuration holds identity at index 0. */
-
-        if (ecidx == NXT_HTTP_COMP_SCHEME_IDENTITY) {
+        if (nxt_http_comp_token_is_identity(&enc)) {
+            ecidx = NXT_HTTP_COMP_SCHEME_IDENTITY;
             identity_named = true;
             identity_named_ok = (qval != 0.0);
 
         } else {
+            ecidx = nxt_http_comp_compressor_lookup_enabled(conf, &enc);
+            if (ecidx == NXT_HTTP_COMP_SCHEME_UNKNOWN) {
+                continue;
+            }
+
             /*
              * Record the coding as named, whether or not it can be applied:
              * the wildcard stands only for the codings that the field did
@@ -884,7 +915,7 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
             idx = NXT_HTTP_COMP_SCHEME_IDENTITY;
             weight = wildcard_qval;
 
-        } else {
+        } else if (conf != NULL) {
             for (nxt_uint_t i = 1; i < conf->nr_enabled; i++) {
                 const nxt_str_t  *tok = &conf->enabled[i].type->token;
 
@@ -1237,12 +1268,6 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
 
     *ctx = (nxt_http_comp_ctx_t){ .resp_clen = -1, .sel_idx = -1 };
 
-    /* A built configuration always holds identity, so NULL is the only
-       "no compression" state. */
-    if (conf == NULL) {
-        return NXT_OK;
-    }
-
     if (r->resp.content_length == NULL && r->resp.content_length_n == -1) {
         return NXT_OK;
     }
@@ -1281,15 +1306,27 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
 
     /*
      * Ask what the client accepts before anything below rules compression
-     * out.  Before, this was asked afterwards, when the response was
-     * already declared serveable.  That is how the own bytes of the file
-     * reached a client that had refused them (#390).
+     * out.  Identity is the one representation that the server always has.
+     * So "identity;q=0" is a refusal that must be answered even where no
+     * compressor can run.  Before, this was asked afterwards, when the
+     * response was already declared serveable.  That is how the own bytes
+     * of the file reached a client that had refused them (#390).
      */
 
     idx = nxt_http_comp_select_compressor(conf, r, &accept_encoding,
                                           &identity_refused);
     if (idx == -1) {
         return nxt_http_comp_not_acceptable(r);
+    }
+
+    /*
+     * A built configuration always holds identity.  So NULL is the only "no
+     * compression" state, and identity is then the only coding.  A client
+     * that refused it left through the 406 above.
+     */
+
+    if (conf == NULL) {
+        return NXT_OK;
     }
 
     if (r->resp.mime_type != NULL) {
