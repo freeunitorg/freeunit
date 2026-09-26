@@ -526,6 +526,13 @@ nxt_http_var_response_connection(nxt_task_t *task, nxt_str_t *str, void *ctx,
     };
 
     r = ctx;
+
+    if (r->protocol != NXT_HTTP_PROTO_H1) {
+        /* RFC 9113, 8.2.2: HTTP/2 has no "Connection" field. */
+        nxt_str_null(str);
+        return NXT_OK;
+    }
+
     h1p = r->proto.h1;
 
     conn = -1;
@@ -596,7 +603,8 @@ nxt_http_var_response_transfer_encoding(nxt_task_t *task, nxt_str_t *str,
 
     r = ctx;
 
-    if (r->proto.h1->chunked) {
+    /* HTTP/2 frames the body itself and sends no "Transfer-Encoding". */
+    if (r->protocol == NXT_HTTP_PROTO_H1 && r->proto.h1->chunked) {
         nxt_str_set(str, "chunked");
 
     } else {

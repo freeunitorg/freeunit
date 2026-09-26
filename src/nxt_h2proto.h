@@ -79,6 +79,9 @@ struct nxt_h2p_stream_s {
     /* The error answered at END_HEADERS while the block is still consumed. */
     nxt_http_status_t           status:16;
 
+    /* The error the request body ran into; see body_error. */
+    nxt_http_status_t           body_status:16;
+
     uint8_t                     deferred;      /* 1 bit */
     uint8_t                     submitted;     /* 1 bit */
     uint8_t                     eof;           /* 1 bit */
@@ -88,6 +91,7 @@ struct nxt_h2p_stream_s {
     uint8_t                     body_wanted;   /* 1 bit */
     uint8_t                     body_error;    /* 1 bit */
     uint8_t                     no_provider;   /* 1 bit */
+    uint8_t                     headers_done;  /* 1 bit */
 };
 
 
@@ -103,11 +107,19 @@ struct nxt_h2proto_s {
     uint32_t                    stream_count;
     uint32_t                    requests_total;
 
+    /* Walks over streams that fail requests; see nxt_h2p_closing(). */
+    uint32_t                    walking;
+
+    /* engine->timers.now when a frame last advanced a stream. */
+    nxt_msec_t                  progress;
+
     uint8_t                     busy;           /* 1 bit */
     uint8_t                     flush_pending;  /* 1 bit */
     uint8_t                     goaway_sent;    /* 1 bit */
     uint8_t                     closing;        /* 1 bit */
     uint8_t                     failed;         /* 1 bit */
+    uint8_t                     close_pending;  /* 1 bit */
+    uint8_t                     closed;         /* 1 bit */
 };
 
 

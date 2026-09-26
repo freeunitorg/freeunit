@@ -2416,7 +2416,17 @@ nxt_h1p_peer_connect(nxt_task_t *task, nxt_http_peer_t *peer)
     /*
      * TODO: queues should be implemented via client proto interface.
      */
+#if (NXT_HAVE_NGHTTP2)
+    if (r->protocol == NXT_HTTP_PROTO_H2) {
+        /* r->proto.h2 is a stream; the connection is its h2 session's. */
+        client = r->proto.h2->h2c->conn;
+
+    } else {
+        client = r->proto.h1->conn;
+    }
+#else
     client = r->proto.h1->conn;
+#endif
 
     socket = &client->socket;
     wq = socket->read_work_queue;
