@@ -12,6 +12,14 @@
 
 <change type="feature">
 <para>
+"GET /certificates" shows the SHA-256 fingerprint of the server certificate of
+every bundle as "fingerprint", in the form "openssl x509 -fingerprint -sha256"
+prints it.
+</para>
+</change>
+
+<change type="feature">
+<para>
 "PUT /certificates/&lt;name&gt;" replaces an existing certificate bundle in
 place.  Main writes the bundle to a temporary file and renames it over the
 old one, so a crash never leaves a partial bundle.  When the current
@@ -19,7 +27,17 @@ configuration names the bundle, the controller applies the configuration
 again before it answers.  New handshakes get the new certificate; accepted
 connections finish with the old one.  An external ACME client can renew a
 certificate with one request and no restart; see docs/acme.md.  A bundle over
-1 MiB is refused with 413.  The router opens bundles read-only.
+1 MiB is refused with 413, and a name over 255 bytes with 400.  A bundle with
+the same certificates as the stored one is not stored again and causes no
+reconfiguration.  The router opens bundles read-only.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the router leaked the TLS contexts it had built for a new configuration when
+applying that configuration failed later, for example in a bundle of a later
+listener or in an application.
 </para>
 </change>
 

@@ -1953,8 +1953,14 @@ nxt_controller_process_cert(nxt_task_t *task,
         return;
     }
 
-    /* Names starting with "." are reserved for the store's own files. */
-    if (name.length == 0 || path != NULL || name.start[0] == '.') {
+    /*
+     * Names starting with "." are reserved for the store's own files.  A
+     * name over NAME_MAX cannot be stored, so it is refused here with 400,
+     * not by main with ENAMETOOLONG and 500.
+     */
+    if (name.length == 0 || path != NULL || name.start[0] == '.'
+        || name.length > NXT_CERT_NAME_MAX_LENGTH)
+    {
         goto invalid_name;
     }
 
@@ -1976,6 +1982,17 @@ nxt_controller_process_cert(nxt_task_t *task,
         cert = nxt_cert_mem(task, &c->read->mem);
         if (cert == NULL) {
             goto invalid_cert;
+        }
+
+        /*
+         * The same certificates as the stored bundle, and the router has
+         * them.  A store would write the same file, and a reconfiguration
+         * would build the same contexts.  A script that uploads on a timer
+         * causes no work here.
+         */
+        if (nxt_cert_info_equal(&name, cert)) {
+            nxt_cert_destroy(cert);
+            goto unchanged;
         }
 
         store = nxt_mp_get(c->mem_pool, sizeof(nxt_controller_cert_store_t));
@@ -2039,6 +2056,25 @@ nxt_controller_process_cert(nxt_task_t *task,
     resp.status = 405;
     resp.title = (u_char *) "Invalid method.";
     resp.offset = -1;
+
+    nxt_controller_response(task, req, &resp);
+    return;
+
+unchanged:
+
+    /*
+     * The answer a store gives, so that a script keyed on either text
+     * keeps working.  The postpone check above has found a ready router,
+     * so a store of a bundle in use would have applied the configuration.
+     */
+    resp.status = 200;
+
+    if (nxt_controller_cert_in_use(&name)) {
+        resp.title = (u_char *) "Certificate chain updated.";
+
+    } else {
+        resp.title = (u_char *) "Certificate chain uploaded.";
+    }
 
     nxt_controller_response(task, req, &resp);
     return;
@@ -2156,13 +2192,16 @@ nxt_controller_cert_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     {
         rc = nxt_controller_conf_send(task, req->conn->mem_pool,
                                       nxt_controller_conf.root,
-                                      nxt_controller_cert_apply_handler, req);
+                                      nxt_controller_cert_apply_handler,
+                                      store);
 
         if (nxt_fast_path(rc == NXT_OK)) {
             nxt_queue_insert_head(&nxt_controller_waiting_requests,
                                   &req->link);
             return;
         }
+
+        nxt_cert_info_applied(&store->name, 0);
 
         resp.status = 500;
         resp.title = (u_char *) "Certificate stored but not applied.";
@@ -2185,16 +2224,24 @@ static void
 nxt_controller_cert_apply_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
-    nxt_controller_request_t   *req;
-    nxt_controller_response_t  resp;
+    nxt_bool_t                   applied;
+    nxt_controller_request_t     *req;
+    nxt_controller_response_t    resp;
+    nxt_controller_cert_store_t  *store;
 
-    req = data;
+    store = data;
+    req = store->req;
 
     nxt_queue_remove(&req->link);
 
     nxt_memzero(&resp, sizeof(nxt_controller_response_t));
 
-    if (msg->port_msg.type == NXT_PORT_MSG_RPC_READY) {
+    applied = (msg->port_msg.type == NXT_PORT_MSG_RPC_READY);
+
+    /* Other changes waited, so the name still holds this bundle. */
+    nxt_cert_info_applied(&store->name, applied);
+
+    if (applied) {
         resp.status = 200;
         resp.title = (u_char *) "Certificate chain updated.";
 

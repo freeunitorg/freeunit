@@ -24,8 +24,8 @@ This page gives the procedure for operators.
 - The key must belong to the first certificate. The answer to a bundle
   with the wrong key is `400 Invalid certificate.`. The old bundle stays in
   use.
-- A name that starts with `.` is reserved. The answer to such a name is
-  `400 Invalid certificate name.`.
+- A name that starts with `.` is reserved, and a name is at most 255
+  bytes. The answer to any other name is `400 Invalid certificate name.`.
 - The answer to a bundle over 1 MiB is `413 Certificate bundle is too
   large.`.
 - When the current configuration names the bundle, the answer is
@@ -40,8 +40,16 @@ This page gives the procedure for operators.
   shows the metadata of the new bundle. The next reconfiguration or restart
   loads the new bundle. Upload a working bundle again, or correct the
   configuration.
+- A bundle with the same certificates as the stored one is not stored
+  again and causes no reconfiguration. The answer is the one a store
+  gives. After `500 Certificate stored but not applied.`, the same bundle
+  is stored and applied again.
 - The request waits while another configuration change is in progress, as
   `PUT /config` does.
+- `GET /certificates/<name>/fingerprint` gives the SHA-256 fingerprint of
+  the server certificate, in the form `openssl x509 -fingerprint -sha256`
+  prints. A script that polls for a renewed file compares the two and
+  uploads only a new certificate.
 
 ## HTTP-01 route on port 80
 
