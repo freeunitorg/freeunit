@@ -64,6 +64,16 @@
 #include <sys/wait.h>
 
 
+typedef void (*nxt_main_start_process_reply_test_handler_t)(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+
+
+static nxt_int_t nxt_main_start_process_reply_test_answer(nxt_thread_t *thr,
+    nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    nxt_main_start_process_reply_test_handler_t handler,
+    nxt_port_t *reply_port, nxt_port_t *silent_port, const char *name);
+
+
 /*
  * Run the handler once and require that it answered: exactly one RPC_ERROR
  * on reply_port, carrying the stream of the incoming message, and nothing
@@ -75,6 +85,20 @@ static nxt_int_t
 nxt_main_start_process_reply_test_case(nxt_thread_t *thr, nxt_task_t *task,
     nxt_port_recv_msg_t *msg, nxt_port_t *reply_port, nxt_port_t *silent_port,
     const char *name)
+{
+    return nxt_main_start_process_reply_test_answer(thr, task, msg,
+                                        nxt_main_test_run_start_process_handler,
+                                        reply_port, silent_port, name);
+}
+
+
+/* The same check for any START_PROCESS handler. */
+
+static nxt_int_t
+nxt_main_start_process_reply_test_answer(nxt_thread_t *thr, nxt_task_t *task,
+    nxt_port_recv_msg_t *msg,
+    nxt_main_start_process_reply_test_handler_t handler,
+    nxt_port_t *reply_port, nxt_port_t *silent_port, const char *name)
 {
     nxt_fd_t             fd0, fd1;
     nxt_int_t            ret;
@@ -98,7 +122,7 @@ nxt_main_start_process_reply_test_case(nxt_thread_t *thr, nxt_task_t *task,
     msg->fd[0] = fd0;
     msg->fd[1] = fd1;
 
-    nxt_main_test_run_start_process_handler(task, msg);
+    handler(task, msg);
 
     /*
      * Both exits own the descriptors the message carried, and both spellings
@@ -398,6 +422,73 @@ nxt_main_start_process_reply_test_proto_case(nxt_thread_t *thr,
 #endif
 
 
+/*
+ * A START_PROCESS from the router that reaches a prototype after its QUIT.
+ * On shutdown this happens when the router starts a replacement for a worker
+ * the exiting prototype has just reported.  A worker forked then gets no QUIT
+ * from anyone, and the prototype waits for it for ever.  The prototype must
+ * refuse, and answer so that the router's RPC is retired.
+ *
+ * Run in a forked child, like the refusal cases above: a handler that does
+ * not refuse goes on to fork a worker from a fixture that has no application
+ * loaded.
+ */
+static nxt_int_t
+nxt_main_start_process_reply_test_proto_exiting(nxt_thread_t *thr,
+    nxt_task_t *task, nxt_port_recv_msg_t *msg, nxt_port_t *reply_port,
+    nxt_port_t *silent_port)
+{
+    int        status;
+    pid_t      child;
+    nxt_int_t  ret;
+
+    child = fork();
+
+    if (nxt_slow_path(child == -1)) {
+        nxt_log_alert(thr->log, "main start process reply test: an exiting "
+                      "prototype failed to fork %E", nxt_errno);
+        return NXT_ERROR;
+    }
+
+    if (child == 0) {
+        nxt_proto_test_set_exiting(1);
+
+        ret = nxt_main_start_process_reply_test_answer(thr, task, msg,
+                                     nxt_proto_test_run_start_process_handler,
+                                     reply_port, silent_port,
+                                     "an exiting prototype");
+
+        _exit(ret == NXT_OK ? 0 : 1);
+    }
+
+    while (waitpid(child, &status, 0) == -1) {
+        if (nxt_errno != NXT_EINTR) {
+            nxt_log_alert(thr->log, "main start process reply test: an "
+                          "exiting prototype failed to reap the child %E",
+                          nxt_errno);
+            return NXT_ERROR;
+        }
+    }
+
+    if (nxt_slow_path(!WIFEXITED(status))) {
+        nxt_log_alert(thr->log, "main start process reply test: an exiting "
+                      "prototype did not refuse -- the handler went on to "
+                      "start a worker, and died there on signal %d",
+                      WTERMSIG(status));
+        return NXT_ERROR;
+    }
+
+    if (nxt_slow_path(WEXITSTATUS(status) != 0)) {
+        nxt_log_alert(thr->log, "main start process reply test: an exiting "
+                      "prototype failed, exit status %d",
+                      WEXITSTATUS(status));
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+
 nxt_int_t
 nxt_main_start_process_reply_test(nxt_thread_t *thr)
 {
@@ -691,6 +782,16 @@ nxt_main_start_process_reply_test(nxt_thread_t *thr)
     }
 
 #endif
+
+    msg.port_msg.stream = 0x88888888;
+
+    ret = nxt_main_start_process_reply_test_proto_exiting(thr, task, &msg,
+                                                          router_port,
+                                                          foreign_port);
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto done;
+    }
 
     nxt_thread_time_update(thr);
     nxt_log_error(NXT_LOG_NOTICE, thr->log,

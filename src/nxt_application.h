@@ -199,6 +199,7 @@ nxt_app_type_t nxt_app_parse_type(u_char *p, size_t length);
  */
 void nxt_proto_test_run_start_process_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
+void nxt_proto_test_set_exiting(nxt_bool_t exiting);
 #endif
 
 NXT_EXPORT extern nxt_str_t  nxt_server;

@@ -176,6 +176,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_router_new_port_test.c \
     src/test/nxt_router_start_fail_test.c \
     src/test/nxt_router_start_fail_soak_test.c \
+    src/test/nxt_router_start_proto_gone_test.c \
     src/test/nxt_router_proto_wedge_test.c \
     src/test/nxt_router_proto_death_test.c \
     src/test/nxt_router_start_timeout_test.c \

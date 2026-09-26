@@ -546,9 +546,11 @@ nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
     size_t                    size;
     uint32_t                  stream;
     nxt_fd_t                  port_fd, queue_fd;
+    nxt_err_t                 err;
     nxt_int_t                 ret;
     nxt_app_t                 *app;
     nxt_buf_t                 *b;
+    nxt_bool_t                proto_gone;
     nxt_port_t                *dport;
     nxt_runtime_t             *rt;
     nxt_app_joint_rpc_t       *app_joint_rpc;
@@ -557,6 +559,7 @@ nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
     app = data;
 
     st = NULL;
+    proto_gone = 0;
 
     nxt_thread_mutex_lock(&app->mutex);
 
@@ -627,6 +630,30 @@ nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
     if (nxt_slow_path(ret != NXT_OK)) {
         nxt_port_rpc_cancel(task, port, stream);
 
+        /*
+         * A worker start goes to the prototype, and the prototype can exit
+         * without the router asking for it.  On shutdown main sends QUIT to
+         * every process directly, and the prototype reports the exit of its
+         * workers to the router before it exits itself.  The router may
+         * handle such a REMOVE_PID before its own QUIT, start a replacement
+         * worker in nxt_router_app_port_close(), and find the prototype's
+         * socket already closed.  A prototype that crashes is the same case.
+         * The router cannot know it in advance: it clears ->proto_port only
+         * when the prototype's own REMOVE_PID arrives, or when it sends the
+         * QUIT itself.
+         *
+         * Nothing was sent, so nothing was forked, and the slot goes back
+         * below in the usual way.  Only the log level differs.  A
+         * prototype start goes to main, which is never expected to be gone,
+         * so it keeps the alert.
+         */
+
+        err = dport->socket.error;
+
+        proto_gone = (b == NULL
+                      && (err == NXT_EPIPE || err == NXT_ECONNRESET
+                          || err == NXT_ECONNREFUSED));
+
         goto failed;
     }
 
@@ -679,7 +706,13 @@ failed:
      * nxt_router_app_port_error() does for the attempts that do get that far.
      */
 
-    nxt_alert(task, "app '%V' failed to start a process", &app->name);
+    if (proto_gone) {
+        nxt_debug(task, "app '%V' start attempt cancelled: prototype %PI "
+                  "is gone", &app->name, dport->pid);
+
+    } else {
+        nxt_alert(task, "app '%V' failed to start a process", &app->name);
+    }
 
     if (st != NULL) {
         /*
@@ -6180,11 +6213,12 @@ nxt_router_app_port_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
      *
      * NXT_LOG_ERR rather than nxt_alert(), which the early-failure path
      * in nxt_router_start_app_process_handler() uses.  That one can only
-     * be Unit's own fault; this one is usually the application's -- a
-     * module that fails to import, a worker that exits during startup --
-     * and Unit is working exactly as designed when it reports one.
-     * [error] is emitted at the default log level, which is the whole
-     * point of the change.
+     * be Unit's own fault (a prototype that is already gone is not an
+     * alert there, see the write failure); this one is usually the
+     * application's -- a module that fails to import, a worker that exits
+     * during startup -- and Unit is working exactly as designed when it
+     * reports one.  [error] is emitted at the default log level, which is
+     * the whole point of the change.
      *
      * A different sentence from that alert, deliberately, even though
      * the two describe the same disappointment.  The test suite skips

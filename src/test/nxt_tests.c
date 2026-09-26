@@ -230,6 +230,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_router_start_proto_gone_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_router_proto_wedge_test(thr) != NXT_OK) {
         return 1;
     }
