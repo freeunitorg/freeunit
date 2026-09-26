@@ -22,6 +22,8 @@
 #if (NXT_TLS)
 static ssize_t nxt_http_idle_io_read_handler(nxt_task_t *task, nxt_conn_t *c);
 static void nxt_http_conn_test(nxt_task_t *task, void *obj, void *data);
+static void nxt_http_conn_tls_conf_release(nxt_task_t *task, void *obj,
+    void *data);
 #endif
 static ssize_t nxt_h1p_idle_io_read_handler(nxt_task_t *task, nxt_conn_t *c);
 static void nxt_h1p_conn_proto_init(nxt_task_t *task, void *obj, void *data);
@@ -380,7 +382,41 @@ nxt_http_conn_test(nxt_task_t *task, void *obj, void *data)
 
     tls = joint->socket_conf->tls;
 
+    /*
+     * The connection holds the listener configuration until it is freed.
+     * The TLS connection reads its nxt_tls_conf_t, which lives in the memory
+     * pool of the router configuration, in the handshake callbacks and in
+     * the TLS shutdown.  Only a request references the configuration, so
+     * without this reference a reconfiguration would destroy it under a
+     * connection in the handshake, and under a keep-alive connection that
+     * is closed after its last request has released its own reference.
+     * The cleanup runs in nxt_conn_free(), after the TLS shutdown.
+     */
+    if (nxt_slow_path(nxt_mp_cleanup(c->mem_pool,
+                                     nxt_http_conn_tls_conf_release,
+                                     &engine->task, joint, NULL)
+                      != NXT_OK))
+    {
+        nxt_h1p_closing(task, c);
+        return;
+    }
+
+    joint->count++;
+
     tls->conn_init(task, tls, c);
+}
+
+
+static void
+nxt_http_conn_tls_conf_release(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_socket_conf_joint_t  *joint;
+
+    joint = obj;
+
+    nxt_debug(task, "http conn tls conf release");
+
+    nxt_router_conf_release(task, joint);
 }
 
 #endif
@@ -2497,9 +2533,14 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
            + sizeof("Connection: close\r\n")
            + sizeof("\r\n");
 
-    /* Emit Content-Length after chunked_transform; NULL body → value 0. */
+    /*
+     * Emit Content-Length after chunked_transform; NULL body → value 0.
+     * The transform adds a Content-Length field (r->content_length) that
+     * goes out with the other fields; a second one would make the
+     * upstream answer 400.
+     */
     content_length = -1;
-    if (r->chunked) {
+    if (r->chunked && r->content_length == NULL) {
         if (r->body == NULL) {
             content_length = 0;
         } else {
@@ -3344,12 +3385,14 @@ nxt_h1p_peer_close(nxt_task_t *task, nxt_http_peer_t *peer)
      * nxt_h1p_peer_read_done()/nxt_h1p_peer_send_timeout()/etc. and dereference
      * the freed peer -- a use-after-free that crashes the router.  Both paths
      * are at risk: the read side (response relay) and the write side (the
-     * request body upload uses an autoreset send timer).  Setting block_read /
-     * block_write makes a queued nxt_conn_io_read()/nxt_conn_io_write() bail out
-     * early; nxt_conn_close() still emits the FIN via its work-queue handler.
+     * request body upload uses an autoreset send timer).  block_read stops
+     * a queued nxt_conn_io_read(), and the closing flag makes a queued
+     * nxt_conn_io_write() return.  nxt_conn_close() sets both; the fd == -1
+     * branch skips it and sets them here.  block_write would not do: it sends
+     * a queued write to the write state's error_handler, which uses the peer.
+     * nxt_conn_close() still emits the FIN via its work-queue handler.
      */
     c->block_read = 1;
-    c->block_write = 1;
     nxt_timer_disable(task->thread->engine, &c->read_timer);
     nxt_timer_disable(task->thread->engine, &c->write_timer);
 
@@ -3359,6 +3402,8 @@ nxt_h1p_peer_close(nxt_task_t *task, nxt_http_peer_t *peer)
         nxt_conn_close(task->thread->engine, c);
 
     } else {
+        c->closing = 1;
+
         nxt_h1p_peer_free(task, c, NULL);
     }
 }

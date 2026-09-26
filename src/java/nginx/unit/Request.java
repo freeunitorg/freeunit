@@ -1310,8 +1310,20 @@ public class Request implements HttpServletRequest, DynamicPathRequest
             sendWsFrame(req_info_ptr, payload, payload.position(),
                         payload.limit() - payload.position(), opCode, last);
         } else {
-            sendWsFrame(req_info_ptr, payload.array(), payload.position(),
-                        payload.limit() - payload.position(), opCode, last);
+            if (!payload.hasArray()) {
+                /*
+                 * A read-only heap buffer hides its array, so each frame
+                 * sent from one costs a copy of its remaining bytes.
+                 */
+                ByteBuffer copy = ByteBuffer.allocate(payload.remaining());
+                copy.put(payload.duplicate());
+                copy.flip();
+                payload = copy;
+            }
+
+            sendWsFrame(req_info_ptr, payload.array(),
+                        payload.arrayOffset() + payload.position(),
+                        payload.remaining(), opCode, last);
         }
     }
 
