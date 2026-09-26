@@ -9,8 +9,10 @@
  * or a method over 255 bytes, used to wrap and be stored truncated; now they
  * are refused with 431 and 501.  The limits themselves are pinned.
  *
- * The request is built by hand with one field; the engine is a stub that
- * only provides the memory pool the buffer is allocated from.  The cases
+ * The request is built by hand with one field, and in some cases a second
+ * one marked skip, which the router must leave out of the message and its
+ * size; the engine is a stub that only provides the memory pool the buffer
+ * is allocated from.  The cases
  * run in a child process: the accepted cases' buffers hold shared memory
  * that only a real engine can release, and the child's exit frees it.
  */
@@ -38,31 +40,36 @@ typedef struct {
     nxt_bool_t         prefix;
     size_t             method_length;
     size_t             field_length;
-    nxt_http_status_t  status;      /* 0: accepted */
+    size_t             skipped_length; /* 0: no skipped field */
+    nxt_http_status_t  status;         /* 0: accepted */
 } nxt_prepare_msg_test_case_t;
 
 
 static const nxt_prepare_msg_test_case_t  nxt_prepare_msg_test_cases[] = {
-    { "short name, prefix",              1,   3,   6, 0 },
-    { "250-byte name + prefix = 255",    1,   3, 250, 0 },
-    { "251-byte name + prefix",          1,   3, 251,
+    { "short name, prefix",              1,   3,   6,   0, 0 },
+    { "250-byte name + prefix = 255",    1,   3, 250,   0, 0 },
+    { "251-byte name + prefix",          1,   3, 251,   0,
       NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE },
-    { "253-byte name + prefix",          1,   3, 253,
+    { "253-byte name + prefix",          1,   3, 253,   0,
       NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE },
-    { "255-byte name + prefix",          1,   3, 255,
+    { "255-byte name + prefix",          1,   3, 255,   0,
       NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE },
-    { "255-byte name, no prefix",        0,   3, 255, 0 },
-    { "255-byte method",                 0, 255,   6, 0 },
-    { "256-byte method",                 0, 256,   6,
+    { "255-byte name, no prefix",        0,   3, 255,   0, 0 },
+    { "255-byte method",                 0, 255,   6,   0, 0 },
+    { "256-byte method",                 0, 256,   6,   0,
       NXT_HTTP_NOT_IMPLEMENTED },
-    { "280-byte method",                 0, 280,   6,
+    { "280-byte method",                 0, 280,   6,   0,
       NXT_HTTP_NOT_IMPLEMENTED },
+    { "251-byte skipped name + prefix",  1,   3,   6, 251, 0 },
+    { "255-byte skipped name + prefix",  1,   3,   6, 255, 0 },
 };
 
 
+/* On success *used is the size of the built message, 0 when refused. */
+
 static nxt_int_t
 nxt_prepare_msg_test_case(nxt_task_t *task, nxt_mp_t *mp, nxt_app_t *app,
-    nxt_sockaddr_t *sa, const nxt_prepare_msg_test_case_t *tc)
+    nxt_sockaddr_t *sa, const nxt_prepare_msg_test_case_t *tc, size_t *used)
 {
     size_t              expect;
     nxt_buf_t           *b;
@@ -103,6 +110,19 @@ nxt_prepare_msg_test_case(nxt_task_t *task, nxt_mp_t *mp, nxt_app_t *app,
     field->value = (u_char *) "v";
     field->value_length = 1;
 
+    if (tc->skipped_length != 0) {
+        field = &r->inline_fields[1];
+        r->num_inline_fields = 2;
+
+        field->hash = 0;
+        field->skip = 1;
+        field->name = nxt_prepare_msg_test_name;
+        field->name_length = tc->skipped_length;
+        field->value = (u_char *) "v";
+        field->value_length = 1;
+    }
+
+    *used = 0;
     status = 0;
 
     b = nxt_router_test_prepare_msg(task, r, app, tc->prefix, &status);
@@ -117,6 +137,8 @@ nxt_prepare_msg_test_case(nxt_task_t *task, nxt_mp_t *mp, nxt_app_t *app,
 
         return NXT_OK;
     }
+
+    *used = nxt_buf_mem_used_size(&b->mem);
 
     req = (nxt_unit_request_t *) b->mem.pos;
     f = &req->fields[0];
@@ -144,14 +166,17 @@ nxt_prepare_msg_test_case(nxt_task_t *task, nxt_mp_t *mp, nxt_app_t *app,
 static nxt_int_t
 nxt_prepare_msg_test_run(nxt_thread_t *thr)
 {
-    nxt_mp_t            *mp;
-    nxt_str_t           addr;
-    nxt_int_t           ret;
-    nxt_app_t           *app;
-    nxt_uint_t          i;
-    nxt_task_t          *task;
-    nxt_sockaddr_t      *sa;
-    nxt_event_engine_t  engine, *saved_engine;
+    size_t                             used, live_used;
+    nxt_mp_t                           *mp;
+    nxt_str_t                          addr;
+    nxt_int_t                          ret;
+    nxt_app_t                          *app;
+    nxt_uint_t                         i;
+    nxt_task_t                         *task;
+    nxt_sockaddr_t                     *sa;
+    nxt_event_engine_t                 engine, *saved_engine;
+    nxt_prepare_msg_test_case_t        live;
+    const nxt_prepare_msg_test_case_t  *tc;
 
     nxt_thread_time_update(thr);
 
@@ -191,10 +216,35 @@ nxt_prepare_msg_test_run(nxt_thread_t *thr)
     ret = NXT_OK;
 
     for (i = 0; i < nxt_nitems(nxt_prepare_msg_test_cases); i++) {
-        if (nxt_prepare_msg_test_case(task, mp, app, sa,
-                                      &nxt_prepare_msg_test_cases[i])
+        tc = &nxt_prepare_msg_test_cases[i];
+
+        if (nxt_prepare_msg_test_case(task, mp, app, sa, tc, &used)
             != NXT_OK)
         {
+            ret = NXT_ERROR;
+            continue;
+        }
+
+        if (tc->skipped_length == 0 || tc->status != 0) {
+            continue;
+        }
+
+        /* The skipped field must add nothing to the message. */
+
+        live = *tc;
+        live.skipped_length = 0;
+
+        if (nxt_prepare_msg_test_case(task, mp, app, sa, &live, &live_used)
+            != NXT_OK)
+        {
+            ret = NXT_ERROR;
+            continue;
+        }
+
+        if (used != live_used) {
+            nxt_log_alert(task->log, "prepare msg test \"%s\": the message "
+                          "is %uz bytes, %uz without the skipped field",
+                          tc->name, used, live_used);
             ret = NXT_ERROR;
         }
     }
