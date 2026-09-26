@@ -114,7 +114,12 @@ paths:
       operationId: putCertBundle
       summary: "Create or overwrite the actual certificate bundle"
       description: "Creates or overwrites the [stored certificate bundle]
-        (https://unit.nginx.org/certificates/) in Unit."
+        (https://unit.nginx.org/certificates/) in Unit.  The body is a PEM
+        bundle: the server certificate first, then its chain, then the
+        private key.  A bundle whose key does not belong to the first
+        certificate is refused with 400 `Invalid certificate.`; a name that
+        starts with `.` is reserved and refused with 400
+        `Invalid certificate name.`."
 
       tags:
         - certificates

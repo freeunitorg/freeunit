@@ -1922,7 +1922,8 @@ nxt_controller_process_cert(nxt_task_t *task,
         return;
     }
 
-    if (name.length == 0 || path != NULL) {
+    /* Names starting with "." are reserved for the store's own files. */
+    if (name.length == 0 || path != NULL || name.start[0] == '.') {
         goto invalid_name;
     }
 
