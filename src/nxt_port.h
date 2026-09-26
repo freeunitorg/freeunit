@@ -376,6 +376,10 @@ typedef struct nxt_app_s  nxt_app_t;
 struct nxt_port_s {
     nxt_fd_event_t      socket;
 
+    /*
+     * Set only by nxt_process_port_add().  nxt_port_release() unlinks the
+     * port and drops the process reference; it does not clear ->process.
+     */
     nxt_queue_link_t    link;       /* for nxt_process_t.ports */
     nxt_process_t       *process;
 
