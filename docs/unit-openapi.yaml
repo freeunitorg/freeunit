@@ -1228,6 +1228,167 @@ paths:
         "404":
           $ref: "#/components/responses/responseNotFound"
 
+  /config/schedules:
+    summary: "Endpoint for the `schedules` object in the configuration"
+    get:
+      operationId: getSchedules
+      summary: "Retrieve the schedules object"
+      description: "Retrieves the `schedules` object that represents Unit's
+        [schedules](https://unit.nginx.org/configuration/#schedules): periodic
+        internal requests to an application, such as a cron trigger."
+      tags:
+        - schedules
+        - config
+
+      responses:
+        "200":
+          description: "OK; the `schedules` object exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/configSchedules"
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/configSchedules"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+    put:
+      operationId: updateSchedules
+      summary: "Overwrite the schedules object"
+      description: "Overwrites the `schedules` object in the configuration."
+      tags:
+        - schedules
+        - config
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/configSchedules"
+
+            examples:
+              example1:
+                $ref: "#/components/examples/configSchedules"
+
+      responses:
+        "200":
+          $ref: "#/components/responses/responseOkUpdated"
+
+        "400":
+          $ref: "#/components/responses/responseBadRequest"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+        "500":
+          $ref: "#/components/responses/responseInternalError"
+
+    delete:
+      operationId: deleteSchedules
+      summary: "Delete the schedules object"
+      description: "Deletes the `schedules` object from the configuration."
+      tags:
+        - schedules
+        - config
+
+      responses:
+        "200":
+          $ref: "#/components/responses/responseOkDeleted"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /config/schedules/{scheduleName}:
+    summary: "Endpoint for a schedule object in the configuration"
+
+    parameters:
+      - $ref: "#/components/parameters/scheduleName"
+
+    get:
+      operationId: getSchedule
+      summary: "Retrieve a schedule object"
+      description: "Retrieves the `{scheduleName}` object that represents a
+        [schedule](https://unit.nginx.org/configuration/#schedules) in Unit's
+        control API."
+
+      tags:
+        - schedules
+        - config
+
+      responses:
+        "200":
+          description: "OK; the `{scheduleName}` object exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/configSchedule"
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/configSchedule"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+    put:
+      operationId: updateSchedule
+      summary: "Create or overwrite the schedule object"
+      description: "Creates or overwrites the `{scheduleName}` object in the
+        configuration."
+
+      tags:
+        - schedules
+        - config
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/configSchedule"
+
+            examples:
+              example1:
+                $ref: "#/components/examples/configSchedule"
+
+      responses:
+        "200":
+          $ref: "#/components/responses/responseOkUpdated"
+
+        "400":
+          $ref: "#/components/responses/responseBadRequest"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+        "500":
+          $ref: "#/components/responses/responseInternalError"
+
+    delete:
+      operationId: deleteSchedule
+      summary: "Delete the schedule object"
+      description: "Deletes the `{scheduleName}` object from the
+        configuration. Deleting a schedule stops future runs; a run already
+        in flight still completes and is logged."
+      tags:
+        - schedules
+        - config
+
+      responses:
+        "200":
+          $ref: "#/components/responses/responseOkDeleted"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
   /config/listeners:
     summary: "Endpoint for the `listeners` object"
     get:
@@ -5605,6 +5766,71 @@ paths:
         "404":
           $ref: "#/components/responses/responseNotFound"
 
+  /status/schedules:
+    summary: "Endpoint for the `schedules` status object"
+    get:
+      operationId: getStatusSchedules
+      summary: "Retrieve the schedules status object"
+      description: "Retrieves the `schedules` status object that represents
+        the run counters and last-run result of each configured
+        [schedule](https://unit.nginx.org/statusapi/). The object is
+        omitted entirely from `/status` when no `schedules` are
+        configured, so its absence there is how a client tells a build
+        or configuration with no schedules from one whose schedules have
+        simply not run yet."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `schedules` object exists in
+            the configuration."
+
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/statusSchedules"
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/statusSchedules"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /status/schedules/{scheduleName}:
+    summary: "Endpoint for the schedule status object"
+    get:
+      operationId: getStatusSchedulesSchedule
+      summary: "Retrieve one schedule's status object"
+      description: "Retrieves the status object for one configured
+        [schedule](https://unit.nginx.org/statusapi/): its run counters
+        and the result of its most recently finished run."
+
+      tags:
+        - status
+
+      parameters:
+        - $ref: "#/components/parameters/scheduleName"
+
+      responses:
+        "200":
+          description: "OK; the schedule object exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/statusSchedulesSchedule"
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/statusSchedulesSchedule"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
 components:
   # -- PARAMETERS --
 
@@ -5613,6 +5839,14 @@ components:
       in: path
       description: "An application's name in the configuration."
       name: appName
+      required: true
+      schema:
+        type: string
+
+    scheduleName:
+      in: path
+      description: "A schedule's name in the configuration (`schedules`)."
+      name: scheduleName
       required: true
       schema:
         type: string
@@ -6025,6 +6259,35 @@ components:
         wasiapp:
           type: "wasm-wasi-component"
 
+    # /config/schedules/{scheduleName}
+    configSchedule:
+      summary: "Individual Unit schedule (Drupal cron)"
+      value:
+        pass: "applications/drupal/index"
+        uri: "/cron/SECRET_KEY"
+        interval: 300
+        jitter: 15
+        timeout: 240
+        overlap: "skip"
+        headers:
+          Host: "example.org"
+        run_on_start: false
+
+    # /config/schedules
+    configSchedules:
+      summary: "Entire Unit schedules section"
+      value:
+        drupal-cron:
+          pass: "applications/drupal/index"
+          uri: "/cron/SECRET_KEY"
+          interval: 300
+          jitter: 15
+          timeout: 240
+          overlap: "skip"
+          headers:
+            Host: "example.org"
+          run_on_start: false
+
     # /config/listeners
     configListeners:
       summary: "Multiple listeners"
@@ -6385,6 +6648,16 @@ components:
               detached: 0
             requests:
               active: 15
+        schedules:
+          cron:
+            runs: 42
+            skipped: 1
+            failed: 0
+            timed_out: 0
+            running: 0
+            last_status: 200
+            last_duration_ms: 8
+            last_start: 1732300042
 
     # /status/modules
     statusModules:
@@ -6497,6 +6770,33 @@ components:
       value:
         exported: 4096
         failed: 0
+
+    # /status/schedules
+    statusSchedules:
+      summary: "Regular schedules status object"
+      value:
+        cron:
+          runs: 42
+          skipped: 1
+          failed: 0
+          timed_out: 0
+          running: 0
+          last_status: 200
+          last_duration_ms: 8
+          last_start: 1732300042
+
+    # /status/schedules/{scheduleName}
+    statusSchedulesSchedule:
+      summary: "Regular schedule status object"
+      value:
+        runs: 42
+        skipped: 1
+        failed: 0
+        timed_out: 0
+        running: 0
+        last_status: 200
+        last_duration_ms: 8
+        last_start: 1732300042
 
   # -- RESPONSES --
 
@@ -6762,6 +7062,9 @@ components:
         settings:
           $ref: "#/components/schemas/configSettings"
 
+        schedules:
+          $ref: "#/components/schemas/configSchedules"
+
     # /config/access_log
     configAccessLog:
       description: "Configures the access log."
@@ -6818,6 +7121,131 @@ components:
           ruby: "#/components/schemas/configApplicationRuby"
           wasm: "#/components/schemas/configApplicationWasm"
           wasm-wasi-component: "#/components/schemas/configApplicationWasi"
+
+    # /config/schedules
+    configSchedules:
+      type: object
+      description: "An object whose options define individual schedules:
+        periodic internal requests Unit issues to an application, such as a
+        cron trigger, with no external client involved."
+      additionalProperties:
+        $ref: "#/components/schemas/configSchedule"
+
+    # /config/schedules/{scheduleName}
+    configSchedule:
+      type: object
+      description: "An object that defines an individual schedule. Each run
+        is an ordinary application request: it is counted in `/status`
+        `requests.total`, goes through `limits` and the application queue,
+        and is recorded in the access log (with remote address `127.0.0.1`
+        and, unless overridden, `User-Agent: FreeUnit-Schedule/<name>`) using
+        whatever format the router has configured. Because the access log
+        then contains the full `uri`, including any secret in it, use a
+        restrictive access log format, or a separate route-level access log,
+        for a schedule whose URI carries a secret such as a Drupal cron key.
+
+        A schedule `timeout` does not stop the application process: the
+        worker is abandoned and keeps running, and it still counts against
+        the application's `processes` capacity until it replies. Keep
+        `timeout` at or below the application's `limits.timeout`, and size
+        `processes` so that a long-running schedule does not starve ordinary
+        requests.
+
+        Schedule state (whether a run is in flight) does not survive a router restart; after a restart, a `run_on_start`
+        schedule fires again even if a run from before the restart is still
+        an orphaned worker.
+
+        If the application calls something like PHP's
+        `fastcgi_finish_request()` and keeps running afterwards, the
+        schedule considers the run finished as soon as the response is sent,
+        not when the application actually stops working. `overlap: skip`
+        therefore does not protect against overlapping that trailing work."
+
+      required:
+        - pass
+        - uri
+        - interval
+
+      properties:
+        pass:
+          type: string
+          description: "The target Unit passes the request to. Must be
+            `applications/<name>` or `applications/<name>/<target>`; a
+            route (`proxy` or an upstream) is not accepted in v1, and the
+            value must not contain variables."
+          example: "applications/drupal/index"
+
+        uri:
+          type: string
+          description: "The request target, in origin form (`/path?query`),
+            sent as a `GET`. 1 to 4096 bytes, must start with `/`, and must
+            not contain whitespace, control characters, non-ASCII bytes or
+            `#`."
+          minLength: 1
+          maxLength: 4096
+          example: "/cron/SECRET_KEY"
+
+        interval:
+          type: integer
+          description: "Seconds between runs, measured from one scheduled
+            start to the next."
+          minimum: 1
+          maximum: 2147483
+          example: 300
+
+        jitter:
+          type: integer
+          description: "Up to this many seconds, uniformly random, added to
+            each wait. Must not exceed `interval`, and `interval` + `jitter`
+            must not exceed 2147483."
+          minimum: 0
+          maximum: 2147483
+          default: 0
+          example: 15
+
+        timeout:
+          type: integer
+          description: "Seconds before an unfinished run is abandoned. The
+            application process is not stopped; see the caveats above.
+            Defaults to `interval`."
+          minimum: 1
+          maximum: 2147483
+          example: 240
+
+        overlap:
+          type: string
+          description: "What happens when a run comes due while the
+            previous one is still running: `skip`, the only value, drops
+            the new run and logs a warning."
+          enum: [skip]
+          default: skip
+
+        headers:
+          type: object
+          description: "Extra request headers, string to string. `Host`
+            also sets `server_name`; without it, `server_name` is
+            `localhost`, which most applications' trusted-host checks (for
+            example Drupal's `trusted_host_patterns`) reject, so set
+            `headers.Host` to a host the application trusts. The following
+            names are reserved and rejected: `Content-Length`,
+            `Transfer-Encoding`, `Connection`, `Upgrade`, `Keep-Alive`, `TE`,
+            `Expect`, and any `Sec-WebSocket-*` name. Header values must not
+            contain control characters, and all headers together must not
+            exceed 8192 bytes. A header name is at most 255 bytes, or 250
+            bytes when `pass` names a PHP, Perl or Ruby application, which
+            receives each name with the `HTTP_` prefix added."
+          additionalProperties:
+            type: string
+          example:
+            Host: "example.org"
+
+        run_on_start:
+          type: boolean
+          description: "When the schedule first appears (on initial apply or
+            after being added), run it about 1 second after the
+            configuration is applied (plus jitter), instead of waiting a
+            full interval."
+          default: false
 
     # ABSTRACT BASE SCHEMA, NOT PRESENT IN THE CONFIGURATION; STORES COMMON OPTIONS
     configApplicationCommon:
@@ -7965,6 +8393,9 @@ components:
         applications:
           $ref: "#/components/schemas/statusApplications"
 
+        schedules:
+          $ref: "#/components/schemas/statusSchedules"
+
     # /status/modules
     statusModules:
       description: "Lists currently loaded language modules."
@@ -8089,6 +8520,69 @@ components:
           format: int64
           description: "Spans whose export failed."
 
+    # /status/schedules
+    statusSchedules:
+      description: "Lists the run counters and last-run result of each
+        configured schedule (`schedules`), keyed by schedule name. The
+        object is omitted entirely from `/status` when no schedules are
+        configured, so its absence is how a client tells a build or
+        configuration with no schedules from one whose schedules simply
+        have not run yet."
+      type: object
+      additionalProperties:
+        $ref: "#/components/schemas/statusSchedulesSchedule"
+
+    # /status/schedules/{scheduleName}
+    statusSchedulesSchedule:
+      description: "Represents one schedule's run counters and the result
+        of its most recently finished run."
+      type: object
+      properties:
+        runs:
+          type: integer
+          format: int64
+          description: "Runs dispatched to a worker so far."
+
+        skipped:
+          type: integer
+          format: int64
+          description: "Runs skipped because the previous one was still
+            running and `overlap` is `\"skip\"`."
+
+        failed:
+          type: integer
+          format: int64
+          description: "Runs that could not start, or that finished with
+            no valid response."
+
+        timed_out:
+          type: integer
+          format: int64
+          description: "Runs that hit the schedule's own `timeout`,
+            counted separately from `failed`."
+
+        running:
+          type: integer
+          description: "1 if a run is in flight right now, 0 otherwise."
+
+        last_status:
+          type: integer
+          description: "The HTTP status of the most recently finished
+            run; 0 before any run has finished."
+
+        last_duration_ms:
+          type: integer
+          format: int64
+          description: "The most recently finished run's duration, in
+            milliseconds."
+
+        last_start:
+          type: integer
+          format: int64
+          description: "Wall-clock start of the most recently dispatched
+            run, in whole seconds since the Epoch; 0 before any run has
+            started."
+
     # /status/connections
     statusConnections:
       description: "Represents Unit's per-instance connection statistics."
@@ -8160,6 +8654,13 @@ tags:
     description: Everything about the global settings in the /config section
     externalDocs:
       url: https://unit.nginx.org/configuration/#settings
+
+  - name: schedules
+    description:
+      Everything about schedules (periodic internal requests to an
+      application) in the /config section
+    externalDocs:
+      url: https://unit.nginx.org/configuration/#schedules
 
   - name: status
     description: Everything about the /status section in Unit's control API

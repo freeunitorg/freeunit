@@ -79,9 +79,11 @@ NXT_LIB_SRCS=" \
     src/nxt_controller.c \
     src/nxt_router.c \
     src/nxt_router_access_log.c \
+    src/nxt_router_schedule.c \
     src/nxt_h1proto.c \
     src/nxt_status.c \
     src/nxt_http_request.c \
+    src/nxt_http_devnull.c \
     src/nxt_http_response.c \
     src/nxt_http_error.c \
     src/nxt_http_route.c \
@@ -201,6 +203,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_port_release_test.c \
     src/test/nxt_nncq_bound_test.c \
     src/test/nxt_usdt_test.c \
+    src/test/nxt_router_schedule_test.c \
     src/test/nxt_conn_close_test.c \
 "
 

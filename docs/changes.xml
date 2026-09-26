@@ -10,6 +10,22 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="feature">
+<para>
+a top-level "schedules" object: periodic internal requests FreeUnit issues to
+an application on its own, with no client and no sidecar process involved,
+such as a cron trigger for Drupal or another PHP application.  Each schedule
+names a "pass" ("applications/&lt;name&gt;", not a route or an upstream in
+v1), a "uri" sent as a "GET", an "interval" in seconds, and optional
+"jitter", "timeout", "overlap" ("skip"), extra
+"headers" and "run_on_start".  A run is an ordinary application request: it
+is counted in "/status" "requests.total", goes through "limits" and the
+application queue, and is recorded in the access log.  A schedule "timeout"
+abandons the run without stopping the application process, which keeps
+counting against "processes" until it answers.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 an upstream 1xx interim response ("100 Continue", "103 Early Hints") was

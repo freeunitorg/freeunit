@@ -9,6 +9,7 @@
 #include <nxt_usdt.h>
 #include <nxt_upstream.h>
 #include <nxt_h1proto.h>
+#include <nxt_http_devnull.h>
 #include <nxt_websocket.h>
 #include <nxt_websocket_header.h>
 
@@ -154,8 +155,18 @@ const nxt_http_proto_table_t  nxt_http_proto[3] = {
 
         .ws_frame_start   = nxt_h1p_websocket_frame_start,
     },
-    /* NXT_HTTP_PROTO_H2      */
-    /* NXT_HTTP_PROTO_DEVNULL */
+    /* NXT_HTTP_PROTO_H2: empty. */
+
+    /* A request with no connection: src/nxt_http_devnull.c. */
+    [NXT_HTTP_PROTO_DEVNULL] = {
+        .body_read        = nxt_http_devnull_body_read,
+        .local_addr       = nxt_http_devnull_local_addr,
+        .header_send      = nxt_http_devnull_header_send,
+        .send             = nxt_http_devnull_send,
+        .body_bytes_sent  = nxt_http_devnull_body_bytes_sent,
+        .discard          = nxt_http_devnull_discard,
+        .close            = nxt_http_devnull_close,
+    },
 };
 
 
