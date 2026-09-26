@@ -1,0 +1,141 @@
+{
+    "listeners": {
+        "*:80": {
+            "pass": "routes/drupal"
+        }
+    },
+
+    "routes": {
+        "drupal": [
+            {
+                "match": {
+                    "uri": [
+                        "*/.ht*",
+                        "/sites/*/files/*.php",
+                        "/sites/*/private/*"
+                    ]
+                },
+                "action": {
+                    "return": 403
+                }
+            },
+            {
+                "match": {
+                    "uri": [
+                        "/vendor/*",
+                        "!*/.well-known/*",
+                        "*/.*",
+                        "*.engine",
+                        "*.inc",
+                        "*.install",
+                        "*.make",
+                        "*.module",
+                        "*.po",
+                        "*.profile",
+                        "*.sh",
+                        "*.theme",
+                        "*.twig",
+                        "*.xtmpl",
+                        "*.yml",
+                        "*.sql",
+                        "*/composer.json",
+                        "*/composer.lock",
+                        "*/web.config",
+                        "*.bak",
+                        "*.orig",
+                        "*.save",
+                        "*.swo",
+                        "*.swp",
+                        "*~"
+                    ]
+                },
+                "action": {
+                    "return": 404
+                }
+            },
+            {
+                "match": {
+                    "uri": [
+                        "/core/install.php",
+                        "/core/install.php/*",
+                        "/core/rebuild.php",
+                        "/update.php",
+                        "/update.php/*",
+                        "/core/modules/statistics/statistics.php"
+                    ]
+                },
+                "action": {
+                    "pass": "applications/drupal/direct"
+                }
+            },
+            {
+                "match": {
+                    "uri": [
+                        "/index.php",
+                        "/index.php/*"
+                    ]
+                },
+                "action": {
+                    "pass": "applications/drupal/index"
+                }
+            },
+            {
+                "match": {
+                    "uri": [
+                        "!/index.php",
+                        "!/index.php/*",
+                        "*.php",
+                        "*.php/*"
+                    ]
+                },
+                "action": {
+                    "return": 404
+                }
+            },
+            {
+                "action": {
+                    "share": "/var/www/drupal/web$uri",
+                    "fallback": {
+                        "pass": "applications/drupal/index"
+                    }
+                }
+            }
+        ]
+    },
+
+    "applications": {
+        "drupal": {
+            "type": "php",
+            "user": "www-data",
+            "group": "www-data",
+            "processes": {
+                "max": 8,
+                "spare": 2,
+                "idle_timeout": 60
+            },
+            "limits": {
+                "timeout": 300
+            },
+            "options": {
+                "admin": {
+                    "memory_limit": "1G",
+                    "opcache.validate_timestamps": "1",
+                    "opcache.revalidate_freq": "0",
+                    "realpath_cache_size": "4096K",
+                    "realpath_cache_ttl": "600",
+                    "upload_max_filesize": "64M",
+                    "post_max_size": "64M"
+                }
+            },
+            "targets": {
+                "direct": {
+                    "root": "/var/www/drupal/web/"
+                },
+                "index": {
+                    "root": "/var/www/drupal/web/",
+                    "script": "index.php"
+                }
+            }
+        }
+    }
+}
