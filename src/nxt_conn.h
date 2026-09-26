@@ -167,6 +167,9 @@ struct nxt_conn_s {
     uint8_t                       block_write;  /* 1 bit */
     uint8_t                       delayed;      /* 1 bit */
 
+    /* Makes a repeated nxt_conn_close() a no-op; never cleared. */
+    uint8_t                       closing;      /* 1 bit */
+
 #define NXT_CONN_TRACK_NONE       0
 #define NXT_CONN_TRACK_IDLE       1
 #define NXT_CONN_TRACK_ACTIVE     2
