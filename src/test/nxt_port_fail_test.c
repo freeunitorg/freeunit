@@ -29,6 +29,12 @@ static nxt_uint_t nxt_port_fail_test_spin(nxt_task_t *task,
     nxt_msec_t window, nxt_port_t *rearm);
 #endif
 static nxt_int_t nxt_port_fail_test_dead_peer(nxt_thread_t *thr);
+static nxt_int_t nxt_port_fail_test_quit_log_level(nxt_thread_t *thr);
+static nxt_int_t nxt_port_fail_test_send_to_dead_peer(nxt_thread_t *thr,
+    nxt_uint_t type, nxt_bool_t queued, nxt_bool_t shared, nxt_uint_t then,
+    nxt_uint_t *level);
+static void nxt_cdecl nxt_port_fail_test_log_handler(nxt_uint_t level,
+    nxt_log_t *log, const char *fmt, ...);
 static nxt_int_t nxt_port_fail_test_rpc_register(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_error_handler(nxt_thread_t *thr);
 static nxt_int_t nxt_port_fail_test_mp_baseline(nxt_thread_t *thr);
@@ -76,6 +82,10 @@ nxt_port_fail_test(nxt_thread_t *thr)
     }
 
     if (nxt_port_fail_test_dead_peer(thr) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_port_fail_test_quit_log_level(thr) != NXT_OK) {
         return NXT_ERROR;
     }
 
@@ -874,6 +884,246 @@ done:
     nxt_mp_destroy(mp);
 
     return ret;
+}
+
+
+/*
+ * The level a send to a peer that is gone is logged at.  A QUIT is sent to
+ * a process that may have exited already, so EPIPE (ECONNREFUSED on a
+ * SOCK_DGRAM pair) on it is info, whether it is sent at once or later from
+ * the port's own queue; any other message is an alert.  A message to a port
+ * with a shared queue goes through that queue, and the socket carries only
+ * a READ_QUEUE wake-up.  The wake-up for a QUIT keeps peer_may_be_gone, so
+ * it is info too, also when it waits in port->messages first and fails
+ * from the write handler; the wake-up for a DATA is an alert.  The peer's
+ * end is closed, so sendmsg() fails for real.
+ */
+
+static nxt_uint_t  nxt_port_fail_test_sendmsg_level;
+
+
+static void nxt_cdecl
+nxt_port_fail_test_log_handler(nxt_uint_t level, nxt_log_t *log,
+    const char *fmt, ...)
+{
+    if (nxt_strncmp(fmt, "sendmsg(", 8) == 0) {
+        nxt_port_fail_test_sendmsg_level = level;
+    }
+}
+
+
+static nxt_int_t
+nxt_port_fail_test_send_to_dead_peer(nxt_thread_t *thr, nxt_uint_t type,
+    nxt_bool_t queued, nxt_bool_t shared, nxt_uint_t then, nxt_uint_t *level)
+{
+    nxt_fd_t               pair[2];
+    nxt_int_t              ret;
+    nxt_log_t              log, *saved_log;
+    nxt_task_t             *task;
+    nxt_port_t             *port;
+    nxt_event_engine_t     engine, *saved_engine;
+    nxt_port_queue_t       *queue;
+    nxt_port_send_msg_t    *msg;
+    nxt_event_interface_t  stub;
+
+    task = thr->task;
+    task->thread = thr;
+
+    port = nxt_port_fail_test_port(task);
+    if (nxt_slow_path(port == NULL)) {
+        return NXT_ERROR;
+    }
+
+    nxt_memzero(&engine, sizeof(engine));
+    nxt_memzero(&stub, sizeof(stub));
+
+    nxt_work_queue_cache_create(&engine.work_queue_cache, 1024);
+    engine.fast_work_queue.cache = &engine.work_queue_cache;
+    nxt_work_queue_name(&engine.fast_work_queue, "fast");
+
+    stub.enable_write = nxt_port_fail_test_enable_write;
+    stub.block_write = nxt_port_fail_test_enable_write;
+    engine.event = stub;
+
+    saved_engine = thr->engine;
+    thr->engine = &engine;
+
+    /* Only the "sendmsg() failed" level is of interest. */
+
+    log = *task->log;
+    log.level = NXT_LOG_INFO;
+    log.handler = nxt_port_fail_test_log_handler;
+
+    saved_log = task->log;
+    task->log = &log;
+
+    nxt_port_fail_test_sendmsg_level = NXT_LOG_DEBUG;
+
+    ret = NXT_ERROR;
+    queue = NULL;
+
+    /* The production pair: SOCK_SEQPACKET where there is one, else DGRAM. */
+
+    if (nxt_slow_path(nxt_socketpair_create(task, pair) != NXT_OK)) {
+        nxt_log_error(NXT_LOG_NOTICE, saved_log,
+                      "port failure test: socketpair failed");
+        goto done;
+    }
+
+    if (shared) {
+        queue = nxt_mp_zalloc(port->mem_pool, sizeof(nxt_port_queue_t));
+        if (nxt_slow_path(queue == NULL)) {
+            goto done;
+        }
+
+        nxt_port_queue_init(queue);
+        port->queue = queue;
+    }
+
+    port->pair[0] = pair[0];
+    port->pair[1] = pair[1];
+    port->socket.task = task;
+    port->max_size = 1024;
+    port->max_share = 1024;
+
+    nxt_port_write_enable(task, port);
+
+    port->socket.log = &log;
+    port->socket.write = NXT_EVENT_INACTIVE;
+    port->socket.write_ready = !queued;
+
+    /* The peer is gone before the send. */
+
+    nxt_fd_close(pair[0]);
+    port->pair[0] = -1;
+
+    ret = nxt_port_socket_write(task, port, type, -1, 0, 0, NULL);
+
+    if (queue != NULL && queue->nitems != 1) {
+        nxt_log_error(NXT_LOG_NOTICE, saved_log,
+                      "port failure test: the message did not go into the "
+                      "shared queue");
+        ret = NXT_ERROR;
+        goto done;
+    }
+
+    /*
+     * A second message behind the first one: the shared queue is not empty
+     * any more, so it goes into the queue with no wake-up of its own
+     * (notify == 0), and the pending wake-up covers it.
+     */
+    if (then != 0) {
+        ret = nxt_port_socket_write(task, port, then, -1, 0, 0, NULL);
+
+        if (ret != NXT_OK || queue == NULL || queue->nitems != 2) {
+            nxt_log_error(NXT_LOG_NOTICE, saved_log,
+                          "port failure test: the second message did not "
+                          "join the shared queue (%d)", (int) ret);
+            ret = NXT_ERROR;
+            goto done;
+        }
+    }
+
+    if (queued) {
+        if (ret != NXT_OK || nxt_queue_is_empty(&port->messages)) {
+            nxt_log_error(NXT_LOG_NOTICE, saved_log,
+                          "port failure test: the message was not queued "
+                          "(%d)", (int) ret);
+            ret = NXT_ERROR;
+            goto done;
+        }
+
+        msg = nxt_queue_link_data(nxt_queue_first(&port->messages),
+                                  nxt_port_send_msg_t, link);
+
+        /* What waits is the socket wake-up, not the message itself. */
+
+        if (shared && msg->port_msg.type != _NXT_PORT_MSG_READ_QUEUE) {
+            nxt_log_error(NXT_LOG_NOTICE, saved_log,
+                          "port failure test: the queued message is not a "
+                          "READ_QUEUE wake-up (%d)",
+                          (int) msg->port_msg.type);
+            ret = NXT_ERROR;
+            goto done;
+        }
+
+        port->socket.write_ready = 1;
+
+        port->socket.write_handler(task, &port->socket, NULL);
+    }
+
+    *level = nxt_port_fail_test_sendmsg_level;
+
+    ret = NXT_OK;
+
+done:
+
+    nxt_port_fail_test_drain_wq(&engine.fast_work_queue);
+
+    /* Not a mapping: nxt_port_close() must not munmap() it. */
+    port->queue = NULL;
+
+    nxt_port_close(task, port);
+    nxt_port_use(task, port, -1);
+
+    task->log = saved_log;
+    thr->engine = saved_engine;
+
+    nxt_work_queue_cache_destroy(&engine.work_queue_cache);
+
+    return ret;
+}
+
+
+static nxt_int_t
+nxt_port_fail_test_quit_log_level(nxt_thread_t *thr)
+{
+    nxt_uint_t  i, level;
+
+    static const struct {
+        nxt_uint_t  type;
+        nxt_bool_t  queued;
+        nxt_bool_t  shared;
+        nxt_uint_t  then;
+        nxt_uint_t  level;
+        const char  *name;
+    } legs[] = {
+        { NXT_PORT_MSG_QUIT, 0, 0, 0, NXT_LOG_INFO, "a QUIT sent at once" },
+        { NXT_PORT_MSG_QUIT, 1, 0, 0, NXT_LOG_INFO,
+          "a QUIT sent from the queue" },
+        { NXT_PORT_MSG_QUIT, 0, 1, 0, NXT_LOG_INFO,
+          "a QUIT to a port with a shared queue" },
+        { NXT_PORT_MSG_QUIT, 1, 1, 0, NXT_LOG_INFO,
+          "a deferred QUIT wake-up to a port with a shared queue" },
+        { NXT_PORT_MSG_DATA, 0, 0, 0, NXT_LOG_ALERT, "a DATA sent at once" },
+        { NXT_PORT_MSG_DATA, 0, 1, 0, NXT_LOG_ALERT,
+          "a DATA to a port with a shared queue" },
+        { NXT_PORT_MSG_DATA, 1, 1, 0, NXT_LOG_ALERT,
+          "a deferred DATA wake-up to a port with a shared queue" },
+        { NXT_PORT_MSG_DATA, 1, 1, NXT_PORT_MSG_QUIT, NXT_LOG_INFO,
+          "a deferred wake-up that also covers a later QUIT" },
+    };
+
+    for (i = 0; i < nxt_nitems(legs); i++) {
+        if (nxt_port_fail_test_send_to_dead_peer(thr, legs[i].type,
+                                                 legs[i].queued,
+                                                 legs[i].shared,
+                                                 legs[i].then, &level)
+            != NXT_OK)
+        {
+            return NXT_ERROR;
+        }
+
+        if (level != legs[i].level) {
+            nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                          "port failure test: %s to a peer that is gone was "
+                          "logged at level %ui, expected %ui", legs[i].name,
+                          level, legs[i].level);
+            return NXT_ERROR;
+        }
+    }
+
+    return NXT_OK;
 }
 
 

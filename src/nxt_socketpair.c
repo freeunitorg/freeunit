@@ -105,9 +105,54 @@ nxt_socketpair_test_send_fail(nxt_err_t err, nxt_uint_t n)
 #endif
 
 
+/*
+ * The level to log a failed send at.  A QUIT goes to a process that may
+ * have exited already, whether it is sent at once or from the queue later,
+ * so EPIPE and the like on it are no news: info, as nxt_socket_error_level()
+ * has it.  A SOCK_DGRAM pair (the fallback in nxt_socketpair_create())
+ * reports a gone peer as ECONNREFUSED instead, so that is info too.
+ * Everything else is an alert.
+ *
+ * The caller says it is a QUIT with "peer_may_be_gone"
+ * (nxt_port_send_msg_t.peer_may_be_gone).  That is the only way to know
+ * for the READ_QUEUE wake-up nxt_port_socket_write2() sends for a QUIT it
+ * put into a shared queue.  A QUIT header in iob[0] (nxt_port_write_msgs()
+ * sends the port message header first) counts as well.
+ */
+static nxt_uint_t
+nxt_socketpair_send_error_level(nxt_iobuf_t *iob, nxt_uint_t niob,
+    nxt_bool_t peer_may_be_gone, nxt_err_t err)
+{
+    nxt_port_msg_t  *msg;
+
+    if (!peer_may_be_gone
+        && niob != 0 && iob[0].iov_len >= sizeof(nxt_port_msg_t))
+    {
+        msg = iob[0].iov_base;
+
+        peer_may_be_gone = (msg->type == _NXT_PORT_MSG_QUIT);
+    }
+
+    if (peer_may_be_gone) {
+        return (err == NXT_ECONNREFUSED) ? NXT_LOG_INFO
+                                         : nxt_socket_error_level(err);
+    }
+
+    return NXT_LOG_ALERT;
+}
+
+
 ssize_t
 nxt_socketpair_send(nxt_fd_event_t *ev, nxt_fd_t *fd, nxt_iobuf_t *iob,
     nxt_uint_t niob)
+{
+    return nxt_socketpair_send_ex(ev, fd, iob, niob, 0);
+}
+
+
+ssize_t
+nxt_socketpair_send_ex(nxt_fd_event_t *ev, nxt_fd_t *fd, nxt_iobuf_t *iob,
+    nxt_uint_t niob, nxt_bool_t peer_may_be_gone)
 {
     ssize_t         n;
     nxt_err_t       err;
@@ -184,8 +229,11 @@ nxt_socketpair_send(nxt_fd_event_t *ev, nxt_fd_t *fd, nxt_iobuf_t *iob,
             continue;
 
         default:
-            nxt_alert(ev->task, "sendmsg(%d, %FD, %FD, %ui) failed %E",
-                      ev->fd, fd[0], fd[1], niob, err);
+            nxt_log(ev->task,
+                    nxt_socketpair_send_error_level(iob, niob,
+                                                    peer_may_be_gone, err),
+                    "sendmsg(%d, %FD, %FD, %ui) failed %E",
+                    ev->fd, fd[0], fd[1], niob, err);
 
             /*
              * The one exit where the socket really is broken, so it is the
