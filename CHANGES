@@ -539,6 +539,7 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        than that is still accepted when nothing else is waiting. A
        fragmented message also left a count behind that lowered the limit
        applied to the next message.
+
     *) Bugfix: a byte-range request from a client that refused the identity
        coding is no longer answered with identity bytes.  A range is served
        as identity, so "Range" together with "Accept-Encoding:
@@ -552,6 +553,25 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        Several "Accept-Encoding" lines in one request are now read as the
        single comma-joined value RFC 9110 defines them to be; previously
        only the first was consulted.
+
+    *) Bugfix: "*" in "Accept-Encoding" now stands for each enabled
+       compressor that the client did not name.  Before, it stood for the
+       identity coding only.  "identity;q=0, *;q=1" was answered "406 Not
+       Acceptable" with gzip enabled and applicable, because the wildcard
+       could select only identity, and the same field refused identity.  A
+       coding that the field names keeps its own weight.  The wildcard does
+       not match it, and the named coding wins a tie: "gzip, *" now sends
+       gzip.  Before, it sent the response uncompressed.
+
+    *) Bugfix: a compressor below its own "min_length" is no longer selected
+       before a compressor with a lower weight that can be applied.
+       "min_length" belongs to each compressor.  With gzip at 1000 and
+       deflate at 0, a 100-byte response was sent uncompressed, because
+       gzip had the higher weight.  A client that refused the identity
+       coding got the same uncompressed bytes.  Such a client now gets
+       deflate.  When each compressor that the client accepts is below its
+       "min_length", the client gets "406 Not Acceptable" instead of the
+       bytes it refused.
 
     *) Bugfix: a malformed weight in "Accept-Encoding" is no longer read as a
        refusal.  The qvalue was converted with strtod(), which takes no digits
