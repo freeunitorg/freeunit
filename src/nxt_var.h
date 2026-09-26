@@ -49,7 +49,6 @@ typedef struct {
 
 
 nxt_int_t nxt_var_register(nxt_var_decl_t *decl, size_t n);
-nxt_int_t nxt_var_index_init(void);
 
 nxt_var_field_t *nxt_var_field_get(nxt_array_t *fields, uint16_t index);
 nxt_var_field_t *nxt_var_field_new(nxt_mp_t *mp, nxt_str_t *name,
