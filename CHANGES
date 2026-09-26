@@ -1,6 +1,11 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Bugfix: with "isolation": {"namespaces": {"pid": true}}, a worker
+       that died before it was fully started left its record, port and
+       descriptor in the main process until the prototype exited. The
+       prototype now reports such a worker to main, which drops them.
+
     *) Bugfix: the main process accepted a second WHOAMI from an
        application process, and a parent that is not a prototype. The
        process was then linked into its parent's list twice, which

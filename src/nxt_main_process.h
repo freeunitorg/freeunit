@@ -41,6 +41,12 @@ nxt_int_t nxt_main_test_run_file_store(nxt_task_t *task, const char *dir,
     const char *tmp_name, const char *name, u_char *buf, size_t size);
 void nxt_main_test_run_whoami_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
+#if (NXT_USE_CMSG_PID)
+void nxt_main_test_run_name_child(nxt_task_t *task, nxt_process_t *pprocess,
+    nxt_process_t *process, nxt_pid_t ns_pid);
+void nxt_main_test_run_remove_child_pid_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+#endif
 #endif
 
 

@@ -60,6 +60,12 @@ static void nxt_main_port_modules_handler(nxt_task_t *task,
 static int nxt_cdecl nxt_app_lang_compare(const void *v1, const void *v2);
 static void nxt_main_process_whoami_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
+#if (NXT_USE_CMSG_PID)
+static void nxt_main_process_name_child(nxt_task_t *task,
+    nxt_process_t *pprocess, nxt_process_t *process, nxt_pid_t ns_pid);
+static void nxt_main_remove_child_pid_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+#endif
 static void nxt_main_port_conf_store_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static nxt_int_t nxt_main_file_store(nxt_task_t *task, const char *dir,
@@ -766,6 +772,26 @@ nxt_main_test_run_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_main_process_whoami_handler(task, msg);
 }
 
+
+#if (NXT_USE_CMSG_PID)
+
+void
+nxt_main_test_run_name_child(nxt_task_t *task, nxt_process_t *pprocess,
+    nxt_process_t *process, nxt_pid_t ns_pid)
+{
+    nxt_main_process_name_child(task, pprocess, process, ns_pid);
+}
+
+
+void
+nxt_main_test_run_remove_child_pid_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg)
+{
+    nxt_main_remove_child_pid_handler(task, msg);
+}
+
+#endif
+
 #endif
 
 
@@ -845,6 +871,9 @@ static nxt_port_handlers_t  nxt_main_process_port_handlers = {
     .process_ready    = nxt_port_process_ready_handler,
     .whoami           = nxt_main_process_whoami_handler,
     .remove_pid       = nxt_port_remove_pid_handler,
+#if (NXT_USE_CMSG_PID)
+    .remove_child_pid = nxt_main_remove_child_pid_handler,
+#endif
     .start_process    = nxt_main_start_process_handler,
     .socket           = nxt_main_port_socket_handler,
     .socket_unlink    = nxt_main_port_socket_unlink_handler,
@@ -862,6 +891,59 @@ static nxt_port_handlers_t  nxt_main_process_port_handlers = {
     .rpc_ready        = nxt_port_rpc_handler,
     .rpc_error        = nxt_port_rpc_handler,
 };
+
+
+#if (NXT_USE_CMSG_PID)
+
+/*
+ * Keep a child's pid in the pid namespace of the prototype that forked it.
+ *
+ * Under "isolation": {"namespaces": {"pid": true}} a worker has two pids: the
+ * global one from SCM_CREDENTIALS, which keys main's record, and the local one
+ * the prototype got from fork().  The WHOAMI header carries the local one, and
+ * it is the only name the prototype has for a worker that dies before
+ * PROCESS_CREATED.  nxt_main_remove_child_pid_handler() resolves that name.
+ *
+ * The pair is kept even when the two numbers are equal: the counters are
+ * independent, so equality proves nothing.  A name a live sibling still holds
+ * is refused, and the new worker stays unnamed.  This happens without a
+ * forger too: the prototype forks a new worker with the local pid of one
+ * whose report main has not read yet.  Either way the cost is the #310 leak
+ * for that one worker.  Taking the name over would be worse: a late report
+ * for the old worker would then remove the live new one.
+ */
+
+static void
+nxt_main_process_name_child(nxt_task_t *task, nxt_process_t *pprocess,
+    nxt_process_t *process, nxt_pid_t ns_pid)
+{
+    nxt_process_t  *child;
+
+    /* 0 means "no name"; no namespace hands out 0 or a negative pid. */
+
+    if (nxt_slow_path(ns_pid <= 0)) {
+        return;
+    }
+
+    nxt_queue_each(child, &pprocess->children, nxt_process_t, link) {
+
+        if (child != process && child->parent_ns_pid == ns_pid) {
+            nxt_log(task, NXT_LOG_WARN, "pid %PI inside %PI is still held "
+                    "by process %PI; process %PI stays unnamed", ns_pid,
+                    pprocess->pid, child->pid, process->pid);
+
+            return;
+        }
+
+    } nxt_queue_loop;
+
+    nxt_debug(task, "process %PI is pid %PI inside %PI", process->pid,
+              ns_pid, pprocess->pid);
+
+    process->parent_ns_pid = ns_pid;
+}
+
+#endif
 
 
 static void
@@ -971,6 +1053,11 @@ nxt_main_process_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         nxt_assert(port->process->link.next == NULL);
 
         nxt_queue_insert_tail(&pprocess->children, &port->process->link);
+
+#if (NXT_USE_CMSG_PID)
+        nxt_main_process_name_child(task, pprocess, port->process,
+                                    msg->port_msg.pid);
+#endif
     }
 
     buf = nxt_buf_mem_alloc(task->thread->engine->mem_pool,
@@ -1001,6 +1088,105 @@ fail:
      */
     nxt_port_recv_msg_close_fds(msg);
 }
+
+
+#if (NXT_USE_CMSG_PID)
+
+/*
+ * A prototype reports a worker of its own that died before PROCESS_CREATED,
+ * by the worker's namespace-local pid.  REMOVE_PID cannot carry that pid: it
+ * is broadcast, and elsewhere the number names an unrelated process.
+ *
+ * The sender is the pid from SCM_CREDENTIALS, and the name is looked up among
+ * that sender's own children only, so a prototype can retire its own workers
+ * and nothing else.  Main then tells the router by the global pid, as a
+ * REMOVE_PID would.  Main cannot check that the worker is really dead, so a
+ * bad prototype can drop the record of a live worker of its own; it can do
+ * the same with REMOVE_PID outside a pid namespace.
+ *
+ * Without a sender credential the handler is not registered at all: a pid
+ * namespace needs Linux, which has SO_PASSCRED.
+ */
+
+static void
+nxt_main_remove_child_pid_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    size_t         size;
+    nxt_buf_t      *buf;
+    nxt_pid_t      pid, sender;
+    nxt_runtime_t  *rt;
+    nxt_process_t  *pprocess, *child;
+
+    buf = msg->buf;
+    size = (buf != NULL) ? (size_t) nxt_buf_used_size(buf) : 0;
+
+    if (nxt_slow_path(size != sizeof(nxt_pid_t))) {
+        nxt_log(task, NXT_LOG_WARN, "REMOVE_CHILD_PID with a %uz byte "
+                "payload", size);
+        goto done;
+    }
+
+    nxt_memcpy(&pid, buf->mem.pos, sizeof(nxt_pid_t));
+
+    /* 0 is how "no name" is stored, so it must not match anything. */
+
+    if (nxt_slow_path(pid <= 0)) {
+        nxt_log(task, NXT_LOG_WARN, "REMOVE_CHILD_PID naming pid %PI", pid);
+        goto done;
+    }
+
+    sender = nxt_recv_msg_cmsg_pid(msg);
+
+    rt = task->thread->runtime;
+
+    pprocess = nxt_runtime_process_find(rt, sender);
+
+    if (pprocess == NULL) {
+        /* The prototype may have exited before this was read. */
+        nxt_debug(task, "REMOVE_CHILD_PID from unknown process %PI", sender);
+        goto done;
+    }
+
+    if (nxt_slow_path(nxt_process_type(pprocess) != NXT_PROCESS_PROTOTYPE)) {
+        nxt_alert(task, "process %PI is not a prototype and cannot report "
+                  "a child pid", sender);
+        goto done;
+    }
+
+    nxt_queue_each(child, &pprocess->children, nxt_process_t, link) {
+
+        if (child->parent_ns_pid != pid) {
+            continue;
+        }
+
+        nxt_debug(task, "remove child pid %PI (aka %PI) of %PI", pid,
+                  child->pid, sender);
+
+        /* As in nxt_main_process_sigchld_handler(). */
+
+        if (!nxt_exiting) {
+            nxt_port_remove_notify_others(task, child);
+        }
+
+        nxt_process_unlink(child);
+
+        nxt_process_close_ports(task, child);
+
+        goto done;
+
+    } nxt_queue_loop;
+
+    /* Not an error: a worker that died before WHOAMI left no record. */
+
+    nxt_debug(task, "process %PI reported child pid %PI, which it has no "
+              "record for", sender, pid);
+
+done:
+
+    nxt_port_recv_msg_close_fds(msg);
+}
+
+#endif
 
 
 static nxt_int_t
@@ -1307,8 +1493,7 @@ nxt_main_process_sigchld_handler(nxt_task_t *task, void *obj, void *data)
                 nxt_process_close_ports(task, process);
 
                 nxt_queue_each(child, &children, nxt_process_t, link) {
-                    nxt_queue_remove(&child->link);
-                    child->link.next = NULL;
+                    nxt_process_unlink(child);
 
                     nxt_process_close_ports(task, child);
                 } nxt_queue_loop;
@@ -1327,8 +1512,7 @@ nxt_main_process_sigchld_handler(nxt_task_t *task, void *obj, void *data)
             nxt_queue_each(child, &children, nxt_process_t, link) {
                 nxt_port_remove_notify_others(task, child);
 
-                nxt_queue_remove(&child->link);
-                child->link.next = NULL;
+                nxt_process_unlink(child);
 
                 nxt_process_close_ports(task, child);
             } nxt_queue_loop;
