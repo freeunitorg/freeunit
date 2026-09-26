@@ -184,4 +184,10 @@ extern nxt_module_init_t  nxt_init_modules[];
 extern nxt_uint_t         nxt_init_modules_n;
 
 
+#if (NXT_TESTS)
+/* The idle-connection close pass, for the write_state install test. */
+void nxt_runtime_test_close_idle_connections(nxt_event_engine_t *engine);
+#endif
+
+
 #endif /* _NXT_RUNTIME_H_INCLIDED_ */

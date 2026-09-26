@@ -4785,7 +4785,25 @@ nxt_router_listen_socket_create(nxt_task_t *task, void *obj, void *data)
 
     lev = nxt_listen_event(task, ls);
     if (nxt_slow_path(lev == NULL)) {
-        nxt_router_listen_socket_release(task, skcf);
+        /*
+         * Only the lev allocation itself can fail here: a missing spare
+         * conn keeps the listener and is retried by its own timer
+         * (nxt_listen_event()).  This engine took no reference on ls yet
+         * (ls->count++ below), so releasing one would underflow the count
+         * on the first engine, or close the shared listening socket under
+         * an engine that did succeed.  Acknowledge the job so the
+         * configuration request completes instead of waiting forever.
+         * The joint stays linked (releasing it here could drop the last
+         * router conf reference under the configuration thread); a later
+         * update of this listener retries the create, and a delete only
+         * acknowledges, see nxt_router_listen_socket_update() and
+         * nxt_router_listen_socket_delete().
+         */
+        nxt_alert(task, "engine %p: listen socket %d: no memory for the "
+                  "listen event, no connections will be accepted on it",
+                  task->thread->engine, ls->socket);
+
+        nxt_router_conf_wait_post(job);
         return;
     }
 
@@ -4844,6 +4862,19 @@ nxt_router_listen_socket_update(nxt_task_t *task, void *obj, void *data)
     lev = nxt_router_listen_event(&engine->listen_connections,
                                   joint->socket_conf);
 
+    if (nxt_slow_path(lev == NULL)) {
+        /*
+         * The previous configuration could not allocate the listen event
+         * on this engine (nxt_router_listen_socket_create()), so there is
+         * nothing to update: create it now instead.  The create path
+         * links the joint itself, so unlink it again first.
+         */
+        nxt_queue_remove(&joint->link);
+
+        nxt_router_listen_socket_create(task, obj, data);
+        return;
+    }
+
     old = lev->socket.data;
     lev->socket.data = joint;
     lev->listen = joint->socket_conf->listen;
@@ -4872,6 +4903,17 @@ nxt_router_listen_socket_delete(nxt_task_t *task, void *obj, void *data)
     engine = task->thread->engine;
 
     lev = nxt_router_listen_event(&engine->listen_connections, skcf);
+
+    if (nxt_slow_path(lev == NULL)) {
+        /*
+         * The listen event was never allocated on this engine
+         * (nxt_router_listen_socket_create()), so this engine holds no
+         * reference on the listen socket and nothing to close: just
+         * acknowledge the job.
+         */
+        nxt_router_conf_wait_post(obj);
+        return;
+    }
 
     nxt_fd_event_delete(engine, &lev->socket);
 
