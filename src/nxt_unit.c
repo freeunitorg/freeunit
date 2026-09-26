@@ -3901,6 +3901,18 @@ nxt_unit_ctx_detached_retry(nxt_unit_ctx_t *ctx)
         return NXT_UNIT_OK;
     }
 
+    /*
+     * A resend is safe only because a failed send delivered nothing.  The
+     * router counts the edges and they name no context, so a FINISH that
+     * arrived twice would settle another context's START and hand a worker
+     * that is still executing back to the idle economy.
+     * nxt_unit_send_detached() fails on a missing router port, on a queue
+     * overflow, which enqueues nothing, and on a short send, which a port
+     * socket (SOCK_DGRAM or SOCK_SEQPACKET) makes all or nothing; none of
+     * these delivers the edge.  Keep it that way, or give the edge a
+     * context id first.
+     */
+
     res = nxt_unit_send_detached(ctx, NXT_PORT_DETACHED_FINISH);
     if (nxt_fast_path(res == NXT_UNIT_OK)) {
         ctx_impl->detached = NXT_UNIT_DETACHED_NONE;
@@ -3917,12 +3929,12 @@ nxt_unit_ctx_detached_retry(nxt_unit_ctx_t *ctx)
         lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
 
         /*
-         * Close the main context: the router keeps the detached flag on the
-         * main port (id 0), and only closing that port settles the count
-         * and the application reference.  This assumes one context, as in
-         * PHP, the only caller of nxt_unit_request_done_detached().  A
-         * non-main context closing alone would leave the worker flagged
-         * detached for the life of the process, and the main context is
+         * Close the main context: the router keeps the detached count on
+         * the main port (id 0), and only closing that port settles the
+         * count and the application reference.  This assumes one context,
+         * as in PHP, the only caller of nxt_unit_request_done_detached().
+         * A non-main context closing alone would leave this context's start
+         * counted for the life of the process, and the main context is
          * changed here without cross-thread synchronization.  This is a
          * comment and not nxt_assert(): libunit does not link the thread
          * context that nxt_assert() needs.
