@@ -42,6 +42,10 @@ This page gives the procedure for operators.
   configuration.
 - The request waits while another configuration change is in progress, as
   `PUT /config` does.
+- `GET /certificates/<name>/fingerprint` gives the SHA-256 fingerprint of
+  the server certificate, in the form `openssl x509 -fingerprint -sha256`
+  prints. A script that polls for a renewed file compares the two and
+  uploads only a new certificate.
 
 ## HTTP-01 route on port 80
 

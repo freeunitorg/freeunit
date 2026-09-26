@@ -648,18 +648,22 @@ nxt_cert_details(nxt_mp_t *mp, nxt_cert_t *cert)
     nxt_str_t         str;
     nxt_int_t         ret;
     nxt_uint_t        i;
+    unsigned int      md_len;
     nxt_conf_value_t  *object, *chain, *element, *value;
-    u_char            buf[256];
+    u_char            buf[256], md[EVP_MAX_MD_SIZE];
+
+    static const u_char  hex[] = "0123456789ABCDEF";
 
     static const nxt_str_t key_str = nxt_string("key");
     static const nxt_str_t chain_str = nxt_string("chain");
+    static const nxt_str_t fingerprint_str = nxt_string("fingerprint");
     static const nxt_str_t since_str = nxt_string("since");
     static const nxt_str_t until_str = nxt_string("until");
     static const nxt_str_t issuer_str = nxt_string("issuer");
     static const nxt_str_t subject_str = nxt_string("subject");
     static const nxt_str_t validity_str = nxt_string("validity");
 
-    object = nxt_conf_create_object(mp, 2);
+    object = nxt_conf_create_object(mp, 3);
     if (nxt_slow_path(object == NULL)) {
         return NULL;
     }
@@ -700,6 +704,39 @@ nxt_cert_details(nxt_mp_t *mp, nxt_cert_t *cert)
 
     } else {
         nxt_conf_set_member_null(object, &key_str, 0);
+    }
+
+    /*
+     * The SHA-256 fingerprint of the server certificate, in the form
+     * "openssl x509 -fingerprint -sha256" prints: uppercase hex, a colon
+     * between the bytes.  A renewal script compares it with the
+     * fingerprint of the file it has, and uploads only a new one.
+     */
+
+    if (nxt_slow_path(X509_digest(cert->chain[0], EVP_sha256(), md, &md_len)
+                      != 1))
+    {
+        return NULL;
+    }
+
+    end = buf;
+
+    for (i = 0; i < md_len; i++) {
+        if (i != 0) {
+            *end++ = ':';
+        }
+
+        *end++ = hex[md[i] >> 4];
+        *end++ = hex[md[i] & 0x0f];
+    }
+
+    str.length = end - buf;
+    str.start = buf;
+
+    ret = nxt_conf_set_member_string_dup(object, mp, &fingerprint_str, &str,
+                                         1);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return NULL;
     }
 
     chain = nxt_conf_create_array(mp, cert->count);
@@ -785,7 +822,7 @@ nxt_cert_details(nxt_mp_t *mp, nxt_cert_t *cert)
         nxt_conf_set_element(chain, i, element);
     }
 
-    nxt_conf_set_member(object, &chain_str, chain, 1);
+    nxt_conf_set_member(object, &chain_str, chain, 2);
 
     return object;
 }

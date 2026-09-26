@@ -194,6 +194,40 @@ paths:
         "404":
           $ref: "#/components/responses/responseNotFound"
 
+  /certificates/{bundleName}/fingerprint:
+    summary: "Endpoint for the certificate bundle fingerprint"
+    get:
+      operationId: getCertBundleFingerprint
+      summary: "Retrieve the fingerprint of the server certificate"
+      description: "Retrieves the SHA-256 fingerprint of the first
+        certificate in a [stored certificate bundle]
+        (https://unit.nginx.org/certificates/), in the form
+        `openssl x509 -fingerprint -sha256` prints it."
+
+      tags:
+        - certificates
+
+      parameters:
+        - $ref: "#/components/parameters/bundleName"
+
+      responses:
+        "200":
+          description: "OK; the certificate bundle exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                type: string
+
+              examples:
+                Fingerprint:
+                  value: "5F:0A:3E:8B:1C:27:9D:44:B6:E1:72:C8:0D:35:9A:F4:\
+                    6B:E8:21:7C:D3:90:4E:AB:15:66:F2:8D:3C:71:B9:02"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
   /certificates/{bundleName}/chain:
     summary: "Endpoint for the certificate bundle chain"
     get:
@@ -5734,6 +5768,8 @@ components:
       value:
         bundle:
           key: "RSA (4096 bits)"
+          fingerprint: "5F:0A:3E:8B:1C:27:9D:44:B6:E1:72:C8:0D:35:9A:F4:\
+            6B:E8:21:7C:D3:90:4E:AB:15:66:F2:8D:3C:71:B9:02"
           chain:
             - subject:
                 common_name: "example.com"
@@ -5775,6 +5811,8 @@ components:
       summary: "Single certificate bundle"
       value:
         key: "RSA (4096 bits)"
+        fingerprint: "5F:0A:3E:8B:1C:27:9D:44:B6:E1:72:C8:0D:35:9A:F4:\
+          6B:E8:21:7C:D3:90:4E:AB:15:66:F2:8D:3C:71:B9:02"
         chain:
           - subject:
               common_name: "example.com"
@@ -6692,6 +6730,12 @@ components:
         key:
           type: string
           description: "Certificate bundle's key type, i. e. RSA, ECDSA, etc."
+
+        fingerprint:
+          type: string
+          description: "SHA-256 fingerprint of the first certificate in the
+            bundle, in the form `openssl x509 -fingerprint -sha256` prints
+            it: uppercase hex, a colon between the bytes."
 
         chain:
           $ref: "#/components/schemas/certBundleChain"

@@ -365,6 +365,42 @@ def test_tls_certificate_update_long_name():
     assert 'error' in client.conf_get(f'/certificates/{name}a'), 'not stored'
 
 
+def test_tls_certificate_fingerprint():
+    client.certificate()
+
+    # The same value that the OpenSSL command line prints, after the "=".
+    out = subprocess.check_output(
+        [
+            'openssl',
+            'x509',
+            '-noout',
+            '-fingerprint',
+            '-sha256',
+            '-in',
+            f'{option.temp_dir}/default.crt',
+        ]
+    )
+
+    expected = out.decode().split('=', 1)[1].strip()
+
+    assert len(expected) == 95, 'openssl fingerprint'
+
+    assert (
+        client.conf_get('/certificates/default/fingerprint') == expected
+    ), 'fingerprint'
+
+    assert (
+        client.conf_get('/certificates')['default']['fingerprint'] == expected
+    ), 'fingerprint listed'
+
+    # A new certificate under the same name gets a new fingerprint.
+    assert 'success' in replace_cert(), 'replaced'
+
+    assert (
+        client.conf_get('/certificates/default/fingerprint') != expected
+    ), 'fingerprint changed'
+
+
 def test_tls_certificate_update_sni():
     client.load('empty')
 

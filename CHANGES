@@ -1,6 +1,10 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Feature: "GET /certificates" shows the SHA-256 fingerprint of the
+       server certificate of every bundle as "fingerprint", in the form
+       "openssl x509 -fingerprint -sha256" prints it.
+
     *) Feature: "PUT /certificates/<name>" replaces an existing certificate
        bundle in place. Main writes the bundle to a temporary file and
        renames it over the old one, so a crash never leaves a partial
