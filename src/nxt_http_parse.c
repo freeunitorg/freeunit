@@ -785,7 +785,7 @@ nxt_http_parse_field_end(nxt_http_request_parse_t *rp, u_char **pos,
             if (rp->skip_field) {
                 rp->skip_field = 0;
 
-            } else {
+            } else if (!rp->discard_fields) {
                 if (rp->num_inline_fields < 16) {
                     field = &rp->inline_fields[rp->num_inline_fields++];
 

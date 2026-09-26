@@ -66,7 +66,7 @@ def wait_for_stored(statedir, expected, wait=100):
     return None
 
 
-def test_state_store_full_filesystem(skip_alert):
+def test_state_store_full_filesystem(requires_restart, skip_alert):
     """A store that runs out of space must not damage the stored config."""
 
     if os.geteuid() != 0:

@@ -2253,6 +2253,11 @@ nxt_http_route_memcmp(u_char *start, u_char *test, size_t test_length,
 {
     nxt_int_t  n;
 
+    /* A "" pattern slice has a NULL start: no memcmp(NULL, p, 0). */
+    if (test_length == 0) {
+        return 1;
+    }
+
     if (case_sensitive) {
         n = memcmp(start, test, test_length);
 
