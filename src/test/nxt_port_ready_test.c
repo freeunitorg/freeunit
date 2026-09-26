@@ -1017,6 +1017,9 @@ nxt_port_ready_test_stream(nxt_thread_t *thr, nxt_task_t *task,
     proto_port->pair[1] = -1;
     proto_port->socket.fd = -1;
 
+    /* The fixture's own hold on the record, as main's would be. */
+    proto->use_count = 1;
+
     nxt_process_port_add(task, proto, proto_port);
 
     /*
@@ -1042,6 +1045,9 @@ nxt_port_ready_test_stream(nxt_thread_t *thr, nxt_task_t *task,
     main_port->pair[1] = -1;
     main_port->socket.fd = -1;
 
+    /* The fixture's own hold on the record, as main's would be. */
+    mainp->use_count = 1;
+
     nxt_process_port_add(task, mainp, main_port);
 
     router->pid = nxt_pid + 9;
@@ -1059,6 +1065,9 @@ nxt_port_ready_test_stream(nxt_thread_t *thr, nxt_task_t *task,
     router_port->pair[0] = -1;
     router_port->pair[1] = -1;
     router_port->socket.fd = -1;
+
+    /* The fixture's own hold on the record, as main's would be. */
+    router->use_count = 1;
 
     nxt_process_port_add(task, router, router_port);
 
@@ -1304,16 +1313,15 @@ drain:
 done:
 
     /*
-     * Each port was linked onto its process's queue directly, without
-     * nxt_process_port_add(), so port->process was never set and
-     * nxt_port_release() must not be handed a port still on that queue --
-     * it would assert.  Unlinking first and dropping the reference with
-     * nxt_port_use() frees the port's own pool (see nxt_port_new()), which
-     * the caller's nxt_mp_destroy(mp) cannot reach.  proto/mainp/router
-     * need no matching release: they come from mp and are freed along with
-     * it, but nxt_runtime_process_add() put them in rt->processes, a
-     * malloc'd table outside mp, and nxt_runtime_process_remove() is what
-     * takes them back out.
+     * Each port was paired with its process by nxt_process_port_add(),
+     * which took a process reference.  Dropping the port's last reference
+     * with nxt_port_use() lets nxt_port_release() unlink it, drop that
+     * process reference (2 -> 1, the fixture keeps its own hold) and free
+     * the port's own pool (see nxt_port_new()), which the caller's
+     * nxt_mp_destroy(mp) cannot reach.  proto/mainp/router come from mp and
+     * are freed along with it, but nxt_runtime_process_add() put them in
+     * rt->processes, a malloc'd table outside mp, and
+     * nxt_runtime_process_remove() is what takes them back out.
      *
      * That add happens for each of the three only partway through the
      * function -- main_port is created before router is registered -- so
@@ -1324,22 +1332,16 @@ done:
      */
     if (main_port != NULL) {
         nxt_port_close(task, main_port);
-        nxt_queue_remove(&main_port->link);
-        main_port->link.next = NULL;
         nxt_port_use(task, main_port, -1);
     }
 
     if (router_port != NULL) {
         nxt_port_close(task, router_port);
-        nxt_queue_remove(&router_port->link);
-        router_port->link.next = NULL;
         nxt_port_use(task, router_port, -1);
     }
 
     if (proto_port != NULL) {
         nxt_port_close(task, proto_port);
-        nxt_queue_remove(&proto_port->link);
-        proto_port->link.next = NULL;
         nxt_port_use(task, proto_port, -1);
     }
 
@@ -1504,6 +1506,9 @@ nxt_port_ready_test(nxt_thread_t *thr)
     port->pair[1] = -1;
     port->socket.fd = -1;
 
+    /* The fixture's own hold on the record, as main's would be. */
+    process->use_count = 1;
+
     nxt_process_port_add(task, process, port);
 
 #if (NXT_USE_CMSG_PID)
@@ -1597,6 +1602,9 @@ nxt_port_ready_test(nxt_thread_t *thr)
     queueless_port->pair[1] = -1;
     queueless_port->socket.fd = -1;
 
+    /* The fixture's own hold on the record, as main's would be. */
+    queueless->use_count = 1;
+
     nxt_process_port_add(task, queueless, queueless_port);
 
     msg.port_msg.pid = queueless->pid;
@@ -1639,6 +1647,9 @@ nxt_port_ready_test(nxt_thread_t *thr)
     nofd_port->pair[0] = -1;
     nofd_port->pair[1] = -1;
     nofd_port->socket.fd = -1;
+
+    /* The fixture's own hold on the record, as main's would be. */
+    nofd->use_count = 1;
 
     nxt_process_port_add(task, nofd, nofd_port);
 
@@ -1690,35 +1701,28 @@ done:
      * and nothing else owns them here: releasing the pool would leak both.
      * The fixture port never had a socket pair, so this only frees the queue.
      *
-     * Each port was linked onto its process's queue directly, without
-     * nxt_process_port_add(), so port->process was never set and
-     * nxt_port_release() must not be handed a port still on that queue --
-     * it would assert.  Unlinking first and dropping the reference with
-     * nxt_port_use() frees the port's own pool (see nxt_port_new()), which
-     * nxt_mp_destroy(mp) below cannot reach.  The process itself needs no
-     * matching release: it came from mp and is freed along with it, but
-     * nxt_runtime_process_add() put it in rt->processes, a malloc'd table
-     * outside mp, and nxt_runtime_process_remove() is what takes it back
-     * out.
+     * Each port was paired with its process by nxt_process_port_add(),
+     * which took a process reference.  Dropping the port's last reference
+     * with nxt_port_use() lets nxt_port_release() unlink it, drop that
+     * process reference (2 -> 1, the fixture keeps its own hold) and free
+     * the port's own pool (see nxt_port_new()), which nxt_mp_destroy(mp)
+     * below cannot reach.  The process itself came from mp and is freed
+     * along with it, but nxt_runtime_process_add() put it in rt->processes,
+     * a malloc'd table outside mp, and nxt_runtime_process_remove() is what
+     * takes it back out.
      */
     if (port != NULL) {
         nxt_port_close(task, port);
-        nxt_queue_remove(&port->link);
-        port->link.next = NULL;
         nxt_port_use(task, port, -1);
     }
 
     if (queueless_port != NULL) {
         nxt_port_close(task, queueless_port);
-        nxt_queue_remove(&queueless_port->link);
-        queueless_port->link.next = NULL;
         nxt_port_use(task, queueless_port, -1);
     }
 
     if (nofd_port != NULL) {
         nxt_port_close(task, nofd_port);
-        nxt_queue_remove(&nofd_port->link);
-        nofd_port->link.next = NULL;
         nxt_port_use(task, nofd_port, -1);
     }
 
