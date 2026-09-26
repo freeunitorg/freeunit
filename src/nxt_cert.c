@@ -1332,8 +1332,13 @@ nxt_cert_store_get_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     /*
      * Look up the sender's port via the kernel-validated PID
      * (SCM_CREDENTIALS).  msg->port_msg.pid is self-declared, so using
-     * it would let a compromised worker spoof the controller / router
-     * and pull arbitrary certificate material out of main.
+     * it would let a compromised worker spoof the router and pull
+     * arbitrary certificate material out of main.
+     *
+     * Only the router reads bundles: it opens every bundle a listener
+     * names during a reconfiguration.  The controller parses a bundle
+     * from the request body and sends it to main with CERT_STORE; it
+     * never reads one back.
      */
     port = nxt_runtime_port_find(task->thread->runtime,
                                  nxt_recv_msg_cmsg_pid(msg),
@@ -1346,9 +1351,7 @@ nxt_cert_store_get_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         return;
     }
 
-    if (nxt_slow_path(port->type != NXT_PROCESS_CONTROLLER
-                      && port->type != NXT_PROCESS_ROUTER))
-    {
+    if (nxt_slow_path(port->type != NXT_PROCESS_ROUTER)) {
         nxt_alert(task, "process %PI cannot read certificates",
                   nxt_recv_msg_cmsg_pid(msg));
         nxt_port_recv_msg_close_fds(msg);
