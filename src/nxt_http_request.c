@@ -7,6 +7,7 @@
 #include <nxt_router.h>
 #include <nxt_http.h>
 #include <nxt_otel.h>
+#include <nxt_usdt.h>
 
 
 static nxt_int_t nxt_http_validate_host(nxt_str_t *host, nxt_mp_t *mp);
@@ -1116,6 +1117,13 @@ nxt_http_request_close_handler(nxt_task_t *task, void *obj, void *data)
     }
 
     nxt_debug(task, "http request close handler");
+
+    /*
+     * Every request ends here once, whether it was answered, failed or
+     * the client went away; the router's own done handler and a protocol
+     * error skip nxt_http_request_done().  Status 0: no response was sent.
+     */
+    NXT_USDT(request__done, (uintptr_t) r, (nxt_int_t) r->status);
 
     r->proto.any = NULL;
 

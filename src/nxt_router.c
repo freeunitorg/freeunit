@@ -22,6 +22,7 @@
 #include <nxt_app_queue.h>
 #include <nxt_port_queue.h>
 #include <nxt_http_compression.h>
+#include <nxt_usdt.h>
 
 #if (NXT_HAVE_OTEL)
 #define NXT_OTEL_BATCH_DEFAULT     128
@@ -1206,6 +1207,10 @@ nxt_router_msg_retract(nxt_task_t *task, nxt_request_rpc_data_t *req_rpc_data)
                                  req_rpc_data->stream))
         {
             msg_info->cancel = NXT_MSG_RETRACTED;
+
+            /* The slot now reads tracking 0, so queue__dequeue cannot. */
+            NXT_USDT(queue__cancel, msg_info->tracking_cookie,
+                     req_rpc_data->stream);
 
             nxt_debug(task, "stream #%uD: cancelled by router",
                       req_rpc_data->stream);
@@ -7789,6 +7794,7 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     if (nxt_slow_path(out == NULL)) {
         return NULL;
     }
+    NXT_USDT(mmap__chunk__get, req_size + content_length);
 
     req = (nxt_unit_request_t *) out->mem.free;
     out->mem.free += req_size;

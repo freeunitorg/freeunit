@@ -187,6 +187,10 @@ if [ $NXT_OTEL != NO ]; then
     NXT_LIB_AUX_LIBS="$NXT_LIB_AUX_LIBS $NXT_OTEL_LIBS"
 fi
 
+if [ $NXT_USDT != NO ]; then
+    . auto/usdt
+fi
+
 . auto/make
 . auto/fuzzing
 . auto/summary

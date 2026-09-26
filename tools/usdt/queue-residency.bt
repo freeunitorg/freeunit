@@ -1,0 +1,43 @@
+#!/usr/bin/env bpftrace
+/*
+ * Copyright (C) FreeUnit contributors.
+ *
+ * App-queue message residency (enqueue -> dequeue) and depth, keyed by
+ * (slot, tracking id): a slot index alone repeats across app queues.
+ * Enqueue and cancel fire in the router (unitd), dequeue in the application,
+ * i.e. the module or program linked with libunit.  A message the router
+ * cancels ends at queue__cancel: its slot then reads tracking id 0.
+ *   bpftrace tools/usdt/queue-residency.bt <path to unitd> <path to module>
+ * Needs a --usdt build: docs/observability/usdt.md.
+ */
+
+BEGIN
+{
+    printf("Tracing freeunit app-queue enqueue -> dequeue residency. Ctrl-C to stop.\n");
+    @depth = 0;
+}
+
+usdt:$1:freeunit:queue__enqueue
+{
+    @qstart[arg0, arg1] = nsecs;
+    @depth++;
+}
+
+usdt:$2:freeunit:queue__dequeue,
+usdt:$1:freeunit:queue__cancel
+/@qstart[arg0, arg1]/
+{
+    @queue_residency_ns = hist(nsecs - @qstart[arg0, arg1]);
+    delete(@qstart[arg0, arg1]);
+    @depth--;
+}
+
+interval:s:5
+{
+    print(@depth);
+}
+
+END
+{
+    clear(@qstart);
+}

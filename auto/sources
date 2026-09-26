@@ -200,6 +200,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_port_frag_test.c \
     src/test/nxt_port_release_test.c \
     src/test/nxt_nncq_bound_test.c \
+    src/test/nxt_usdt_test.c \
     src/test/nxt_conn_close_test.c \
 "
 

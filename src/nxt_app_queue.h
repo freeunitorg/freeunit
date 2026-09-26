@@ -8,6 +8,7 @@
 
 
 #include <nxt_app_nncq.h>
+#include <nxt_usdt.h>
 
 
 /* Using Numeric Naive Circular Queue as a backend. */
@@ -82,6 +83,8 @@ nxt_app_queue_send(nxt_app_queue_t volatile *q, const void *p,
         return NXT_ERROR;
     }
 
+    NXT_USDT(queue__enqueue, i, tracking);
+
     n = nxt_atomic_cmp_set(&q->notified, 0, 1);
 
     if (notify != NULL) {
@@ -142,6 +145,12 @@ nxt_app_queue_recv(nxt_app_queue_t volatile *q, void *p, uint32_t *cookie)
 
     nxt_memcpy(p, qi->data, size);
     *cookie = i;
+
+    /*
+     * Not before the slot is touched: a tracer reads qi->tracking without
+     * faulting the page in, and a first read of the page would report 0.
+     */
+    NXT_USDT(queue__dequeue, i, qi->tracking);
 
     (void) nxt_app_nncq_enqueue(&q->free_items, i);
 
