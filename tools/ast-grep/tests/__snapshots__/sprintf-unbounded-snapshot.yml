@@ -1,0 +1,11 @@
+id: sprintf-unbounded
+snapshots:
+  ? |
+    void f(char *buf, int n) {
+        sprintf(buf, "%d", n);
+    }
+  : labels:
+    - source: sprintf(buf, "%d", n)
+      style: primary
+      start: 31
+      end: 52

@@ -1,0 +1,11 @@
+id: must-check-results
+snapshots:
+  ? |
+    void f(nxt_port_t *port, void *b, size_t n) {
+        nxt_port_socket_write2(port, NXT_PORT_MSG_DATA, -1, 0, 0, b, n, NULL, NULL);
+    }
+  : labels:
+    - source: nxt_port_socket_write2(port, NXT_PORT_MSG_DATA, -1, 0, 0, b, n, NULL, NULL);
+      style: primary
+      start: 50
+      end: 126

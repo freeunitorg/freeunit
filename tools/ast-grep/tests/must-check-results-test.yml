@@ -1,0 +1,16 @@
+id: must-check-results
+valid:
+  - |
+    void f(nxt_port_t *port, void *b, size_t n) {
+        int ret;
+
+        ret = nxt_port_socket_write2(port, NXT_PORT_MSG_DATA, -1, 0, 0, b, n, NULL, NULL);
+        if (ret != NXT_OK) {
+            return;
+        }
+    }
+invalid:
+  - |
+    void f(nxt_port_t *port, void *b, size_t n) {
+        nxt_port_socket_write2(port, NXT_PORT_MSG_DATA, -1, 0, 0, b, n, NULL, NULL);
+    }

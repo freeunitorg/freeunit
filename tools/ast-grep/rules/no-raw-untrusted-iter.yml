@@ -1,0 +1,14 @@
+id: no-raw-untrusted-iter
+language: c
+severity: warning
+message: >-
+  Hand-rolled byte-copy loop ("*dst++ = *src++"). Prefer nxt_cpymem()/memcpy()
+  with a length that has gone through a checked helper (nxt_size.h), so the
+  copy count is validated once instead of trusting the loop bound.
+note: >-
+  A loop like this next to untrusted input (a peer's frame, a language
+  module's message) is exactly where an off-by-one or an unchecked length
+  turns into an overread/overwrite. It is not wrong by itself -- only a
+  smell when the source length is not already known-good.
+rule:
+  pattern: "*$DST++ = *$SRC++;"

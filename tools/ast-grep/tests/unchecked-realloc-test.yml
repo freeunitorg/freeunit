@@ -1,0 +1,14 @@
+id: unchecked-realloc
+valid:
+  - |
+    void f(char *p, size_t n) {
+        char *tmp = realloc(p, n);
+        if (tmp != NULL) {
+            p = tmp;
+        }
+    }
+invalid:
+  - |
+    void f(char *p, size_t n) {
+        p = realloc(p, n);
+    }

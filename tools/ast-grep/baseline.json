@@ -1,0 +1,128 @@
+[
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_h1proto.c",
+    "line": 998,
+    "text": "tmp_name.length = tmp_path->length + tmp_name_pattern.length;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_h1proto_websocket.c",
+    "line": 582,
+    "text": "n = state->len + 1;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_http_return.c",
+    "line": 162,
+    "text": "encoded->length = location->length + encode * 2;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_http_static.c",
+    "line": 521,
+    "text": "length = shr->length + index->length;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_listen_socket.c",
+    "line": 347,
+    "text": "size = ls->socklen + nxt_length(\"unix:\");"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_router.c",
+    "line": 7884,
+    "text": "dst_field->name_length = field->name_length + prefix->length;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/python/nxt_python_asgi_websocket.c",
+    "line": 785,
+    "text": "payload_len = ws->pending_payload_len + frame->payload_len;"
+  },
+  {
+    "ruleId": "memcpy-computed-size",
+    "file": "src/wasm/nxt_wasm.c",
+    "line": 277,
+    "text": "memcpy((uint8_t *)wr + offset, name, nlen + 1)"
+  },
+  {
+    "ruleId": "memcpy-computed-size",
+    "file": "src/wasm/nxt_wasm.c",
+    "line": 283,
+    "text": "memcpy((uint8_t *)wr + offset, value, vlen + 1)"
+  },
+  {
+    "ruleId": "narrowing-to-proto",
+    "file": "src/nxt_router.c",
+    "line": 7844,
+    "text": "(uint32_t) r->path->length"
+  },
+  {
+    "ruleId": "narrowing-to-proto",
+    "file": "src/nxt_router.c",
+    "line": 7854,
+    "text": "(uint32_t) r->args->length"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_file_name.c",
+    "line": 181,
+    "text": "*dst++ = *fn++;"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_sprintf.c",
+    "line": 129,
+    "text": "*buf++ = *fmt++;"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_sprintf.c",
+    "line": 162,
+    "text": "*buf++ = *p++;"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_sprintf.c",
+    "line": 484,
+    "text": "*buf++ = *p++;"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_sprintf.c",
+    "line": 534,
+    "text": "*buf++ = *fmt++;"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_sprintf.c",
+    "line": 671,
+    "text": "*buf++ = *p++;"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_sprintf.c",
+    "line": 712,
+    "text": "*buf++ = *p++;"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_unit.c",
+    "line": 294,
+    "text": "*d++ = *s++;"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_utf8.c",
+    "line": 261,
+    "text": "*d++ = *p++;"
+  },
+  {
+    "ruleId": "unchecked-realloc",
+    "file": "src/test/nxt_unit_websocket_echo.c",
+    "line": 61,
+    "text": "buf = realloc(buf, ws->content_length);"
+  }
+]

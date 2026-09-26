@@ -1,0 +1,24 @@
+id: shm-double-fetch
+snapshots:
+  ? |
+    void f(nxt_port_msg_t *msg, size_t max) {
+        size_t len;
+
+        if (msg->len > max) {
+            return;
+        }
+
+        len = msg->len;
+    }
+  : labels:
+    - source: len = msg->len;
+      style: primary
+      start: 112
+      end: 127
+    - source: |-
+        if (msg->len > max) {
+                return;
+            }
+      style: secondary
+      start: 63
+      end: 106

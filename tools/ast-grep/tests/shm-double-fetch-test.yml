@@ -1,0 +1,25 @@
+id: shm-double-fetch
+valid:
+  - |
+    void f(nxt_port_msg_t *msg, size_t max) {
+        size_t len;
+
+        len = msg->len;
+
+        if (len > max) {
+            return;
+        }
+
+        use(len);
+    }
+invalid:
+  - |
+    void f(nxt_port_msg_t *msg, size_t max) {
+        size_t len;
+
+        if (msg->len > max) {
+            return;
+        }
+
+        len = msg->len;
+    }

@@ -1,0 +1,11 @@
+id: memcpy-computed-size
+snapshots:
+  ? |
+    void f(char *dst, char *src, size_t a, size_t b) {
+        memcpy(dst, src, a + b);
+    }
+  : labels:
+    - source: memcpy(dst, src, a + b)
+      style: primary
+      start: 55
+      end: 78

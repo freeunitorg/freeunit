@@ -1,0 +1,17 @@
+id: shm-double-fetch
+language: c
+severity: hint
+message: >-
+  The same struct field is re-read after a bounds check on it, rather than
+  the checked value being cached in a local. If the struct lives in memory
+  shared with another process (a port mmap buffer, a language module's
+  request), a concurrent writer can change the field between the check and
+  the second read (TOCTOU), invalidating the check.
+note: >-
+  Best effort: this pattern also fires on plain heap structs no other
+  process can touch, where re-reading the field is harmless. It exists to
+  flag call sites for a human to classify, not to prove a bug.
+rule:
+  pattern: $Z = $X->$F;
+  follows:
+    pattern: if ($X->$F > $Y) { $$$ }
