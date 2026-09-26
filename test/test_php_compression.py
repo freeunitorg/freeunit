@@ -143,7 +143,7 @@ RANDOM_BODY_SIZE = 9 * 1024 * 1024
 LEAK_REQUESTS = 15  # > 100 MB in total: more shared memory than an app may hold
 
 
-def raw_get(path, encoding, timeout=30):
+def raw_get(path, encoding, timeout=30, method='GET'):
     """
     A plain socket request.  The shared client cannot express "fail rather
     than block forever", which is exactly the failure these tests look for.
@@ -153,7 +153,7 @@ def raw_get(path, encoding, timeout=30):
 
     try:
         sock.sendall(
-            f'GET {path} HTTP/1.1\r\n'
+            f'{method} {path} HTTP/1.1\r\n'
             f'Host: localhost\r\n'
             f'Accept-Encoding: {encoding}\r\n'
             f'Connection: close\r\n\r\n'.encode()
@@ -294,6 +294,7 @@ def test_php_compression_identity_refused():
     status, headers, _ = raw_get('/', 'identity;q=0')
 
     assert status == 406, 'no representation left for the application body'
+    assert headers.get('Vary') == 'Accept-Encoding', 'the 406 varies'
     assert 'Content-Encoding' not in headers
 
 
@@ -356,3 +357,56 @@ def test_php_compression_identity_refused_below_min_length():
     assert status == 200, 'identity is acceptable here'
     assert 'Content-Encoding' not in headers
     assert body == b'A' * 64, 'the body, uncompressed'
+
+
+def test_php_compression_identity_refused_no_representation():
+    # A 1xx, 204 or 304 describes no representation, so there is nothing the
+    # client could have refused and no 406 to give.
+    #
+    # The length outs at the top of nxt_http_comp_check_acceptable() do not
+    # cover this.  nxt_http_response_content_length() stores an application's
+    # Content-Length field without setting r->resp.content_length_n, which
+    # stays -1, so a 204 or 304 that carries the field reached the compressor
+    # selection and came back 406 -- the status and the framing
+    # nxt_http_request_header_send() would have corrected never got there.
+    client.load('no_body_status')
+    configure_compression()
+
+    status, headers, body = raw_get('/?status=204&cl', 'identity;q=0')
+
+    assert status == 204, 'a 204 has no representation to refuse'
+    assert 'Content-Encoding' not in headers
+    assert body == b'', 'no body on a 204'
+
+    status, headers, body = raw_get('/?status=304&cl', 'identity;q=0')
+
+    assert status == 304, 'a 304 describes the body the client already has'
+    assert 'Content-Encoding' not in headers
+    assert body == b'', 'no body on a 304'
+
+    # The same application, the same Content-Length, a status that does
+    # describe a representation: still 406.
+    status, headers, _ = raw_get('/?status=200&cl', 'identity;q=0')
+
+    assert status == 406, 'a 200 still has a representation to refuse'
+    assert 'Content-Encoding' not in headers
+
+
+def test_php_compression_identity_refused_head():
+    # A HEAD carries no body either, but it still describes the
+    # representation the equivalent GET would return (RFC 9110 Sect. 9.3.2),
+    # so it is negotiated like that GET and a refused identity is a 406.
+    # This is why the exemption above tests the status alone and never the
+    # method, and why nxt_http_request_is_bodyless_final() is the wrong
+    # question to ask here.
+    client.load('comp_large_body')
+    configure_compression()
+
+    status, headers, _ = raw_get('/', 'identity;q=0', method='HEAD')
+
+    assert status == 406, 'a HEAD is negotiated like the GET it stands for'
+    assert 'Content-Encoding' not in headers
+
+    status, headers, _ = raw_get('/', 'gzip', method='HEAD')
+
+    assert status == 200, 'the same HEAD from a client that takes gzip'

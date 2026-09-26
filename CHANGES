@@ -473,6 +473,18 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        single comma-joined value RFC 9110 defines them to be; previously
        only the first was consulted.
 
+    *) Bugfix: a response no compressor applies to is no longer served as
+       identity to a client that refused the identity coding.  With a
+       compressor configured, "Accept-Encoding: gzip, identity;q=0" was
+       accepted because gzip was acceptable, and the response was then sent
+       uncompressed anyway when its media type was outside "types" or it had
+       no media type at all: the identity bytes the request had declined.
+       Such a request is now answered with "406 Not Acceptable", with a
+       "Range" header and without.  A 406 from this negotiation carries
+       "Vary: Accept-Encoding".  A 1xx, 204 or 304 response is never
+       negotiated, so an application that answers one of these with a
+       "Content-Length" is not affected.
+
     *) Bugfix: the "*" in "Accept-Encoding" now stands for every enabled
        compressor the client did not name, not for the identity coding
        alone.  "identity;q=0, *;q=1" was answered "406 Not Acceptable" with

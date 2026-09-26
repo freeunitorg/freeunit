@@ -960,7 +960,9 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
          * satisfied.
          *
          * Not reached when nothing is acceptable: that is already 406, from
-         * nxt_http_comp_check_acceptable() above.
+         * nxt_http_comp_check_acceptable() above -- which includes the
+         * responses no coding is applied to, where the full 200 would be
+         * identity again.
          */
 
         if (is_range) {

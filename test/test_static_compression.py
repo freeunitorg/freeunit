@@ -399,6 +399,34 @@ def test_static_compression_identity_refused_below_min_length():
         assert 'Content-Range' not in headers
 
 
+def test_static_compression_identity_refused_without_eligible_coding():
+    # The configured compressor applies only to text/css.  This extensionless
+    # file has no media type, so no coding will be applied to it and identity
+    # is again all that is left -- which this client refused.
+    for extra in ({}, {'Range': 'bytes=0-1'}):
+        status, headers, _ = _raw_get(
+            '/raw',
+            **{'Accept-Encoding': 'gzip, identity;q=0', **extra},
+        )
+        assert status == 406, 'no configured coding can serve this response'
+        assert 'Content-Encoding' not in headers
+        assert 'Content-Range' not in headers
+
+
+def test_static_compression_406_varies_on_accept_encoding():
+    # A 406 from negotiation depends on Accept-Encoding like any negotiated
+    # response.  Without "Vary: Accept-Encoding" a cache that stores error
+    # responses may give this 406 to a later client that accepts identity.
+    for url, accept in (
+        ('/big.css', 'identity;q=0, *;q=0'),  # nothing acceptable
+        ('/tiny.css', 'gzip, identity;q=0'),  # gzip below "min_length"
+        ('/raw', 'gzip, identity;q=0'),  # media type outside "types"
+    ):
+        status, headers, _ = _raw_get(url, **{'Accept-Encoding': accept})
+        assert status == 406, f'{url} {accept!r}'
+        assert headers.get('Vary') == 'Accept-Encoding', f'{url} {accept!r}'
+
+
 def test_static_compression_min_length_is_per_compressor():
     # "min_length" belongs to the compressor, so the highest-weight coding
     # being below its own threshold says nothing about the next one.  gzip is
