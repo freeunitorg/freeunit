@@ -1746,14 +1746,13 @@ nxt_h2p_on_header(nghttp2_session *session, const nghttp2_frame *frame,
 {
     nxt_str_t           host;
     nxt_int_t           ret;
+    nxt_bool_t          too_large;
     nxt_h2proto_t       *h2c;
     nxt_socket_conf_t   *skcf;
     nxt_h2p_stream_t    *stream;
     nxt_http_request_t  *r;
 
-    if (frame->hd.type != NGHTTP2_HEADERS
-        || frame->headers.cat != NGHTTP2_HCAT_REQUEST)
-    {
+    if (frame->hd.type != NGHTTP2_HEADERS) {
         return 0;
     }
 
@@ -1775,10 +1774,27 @@ nxt_h2p_on_header(nghttp2_session *session, const nghttp2_frame *frame,
      */
     stream->header_list_size += namelen + valuelen + NXT_H2P_FIELD_OVERHEAD;
 
-    if (stream->header_list_size
-        > skcf->large_header_buffer_size * skcf->large_header_buffers
-        || namelen > NXT_H2P_MAX_FIELD_NAME)
-    {
+    too_large = (stream->header_list_size
+                 > skcf->large_header_buffer_size * skcf->large_header_buffers
+                 || namelen > NXT_H2P_MAX_FIELD_NAME);
+
+    if (frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
+        /*
+         * Trailers.  nghttp2 has rejected pseudo-headers and
+         * connection-specific fields in them already.  Like chunked
+         * trailers in h1 (RFC 9112, 7.1.2), the fields are dropped, but the
+         * block has the same limits as the header block.  Trailers end the
+         * request body, so a block over the limits fails the body.
+         */
+        if (too_large && !stream->body_error) {
+            nxt_h2p_request_body_error(stream,
+                                    NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE);
+        }
+
+        return 0;
+    }
+
+    if (too_large) {
         if (stream->status == 0) {
             stream->status = NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE;
         }
@@ -1950,6 +1966,9 @@ nxt_h2p_on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
         if (frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
             stream->headers_done = 1;
 
+            /* Trailers are counted on their own. */
+            stream->header_list_size = 0;
+
             /* Known before the body decision: no DATA follows. */
             if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
                 stream->end_stream = 1;
@@ -1959,7 +1978,7 @@ nxt_h2p_on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
             break;
         }
 
-        /* Trailers (NGHTTP2_HCAT_HEADERS) are dropped; nothing reads them. */
+        /* Trailers (NGHTTP2_HCAT_HEADERS); nxt_h2p_on_header() drops them. */
 
         if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
             nxt_h2p_request_end_stream(task, stream);

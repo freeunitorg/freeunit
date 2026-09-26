@@ -1056,6 +1056,147 @@ def test_http2_content_length_mismatch():
     c.close()
 
 
+def h2_post_trailers(c, path, body, trailers, headers=()):
+    """A POST whose body ends with a trailer block (HEADERS, END_STREAM)."""
+
+    sid = c.conn.get_next_available_stream_id()
+
+    c.streams[sid] = {
+        'status': None,
+        'headers': {},
+        'body': b'',
+        'done': False,
+        'reset': None,
+        'informational': [],
+    }
+
+    hdrs = [
+        (':method', 'POST'),
+        (':path', path),
+        (':scheme', 'https'),
+        (':authority', 'localhost'),
+    ]
+
+    c.conn.send_headers(sid, hdrs + list(headers))
+
+    if body:
+        c.conn.send_data(sid, body)
+
+    c.conn.send_headers(sid, trailers, end_stream=True)
+    c.flush()
+
+    return c.wait(sid)
+
+
+@pytest.mark.parametrize('body', [b'hello', b''], ids=['data', 'no-data'])
+def test_http2_request_trailers(body):
+    need_h2()
+    load_app('variables')
+
+    c = H2Client()
+
+    # Trailers end the body; like chunked trailers in h1 they are dropped
+    # and do not reach the application as fields.
+    resp = h2_post_trailers(
+        c,
+        '/',
+        body,
+        [('custom-header', 'trailed'), ('x-checksum', 'abc')],
+        headers=[('custom-header', 'blah'), ('content-type', 'text/plain')],
+    )
+
+    assert resp['status'] == 200
+    assert resp['reset'] is None
+    assert resp['body'] == body
+    assert resp['headers']['custom-header'] == 'blah'
+
+    # The connection goes on.
+    headers = [('custom-header', 'blah'), ('content-type', 'text/plain')]
+    assert c.get('/', headers=headers)['status'] == 200
+    c.close()
+
+
+def test_http2_request_trailers_content_length():
+    need_h2()
+    load_mirror()
+
+    c = H2Client()
+
+    # nghttp2 checks the content-length at END_STREAM, on the trailers here.
+    resp = h2_post_trailers(
+        c,
+        '/',
+        b'12345',
+        [('x-checksum', 'abc')],
+        headers=[('content-length', '5')],
+    )
+
+    assert resp['status'] == 200
+    assert resp['body'] == b'12345'
+    c.close()
+
+
+@pytest.mark.parametrize(
+    'trailer',
+    [
+        (':path', '/x'),
+        (':status', '200'),
+        ('connection', 'close'),
+        ('transfer-encoding', 'chunked'),
+    ],
+    ids=['path', 'status', 'connection', 'transfer-encoding'],
+)
+def test_http2_request_trailers_invalid(trailer):
+    need_h2()
+    load_mirror()
+
+    c = RawH2()
+
+    # RFC 9113, 8.1: pseudo-headers are not allowed in trailers, and 8.2.2:
+    # neither are connection-specific fields.  The request is malformed, a
+    # stream error of type PROTOCOL_ERROR.
+    c.request(1, end_stream=False, method='POST')
+    c.send(
+        c.data_frame(1, b'hello'),
+        c.headers(1, c.encoder.encode([trailer])),
+    )
+    c.wait_response(1)
+    assert c.rst.get(1) == PROTOCOL_ERROR
+
+    # A stream error only.
+    c.request(3)
+    assert c.wait_response(3) == 200
+    assert not c.closed
+    assert c.goaway is None
+    c.close()
+
+
+def test_http2_request_trailers_too_large():
+    need_h2()
+    load_mirror()
+
+    c = H2Client()
+
+    # The header block limits apply to the trailer block on its own: a
+    # header block and a trailer block each just under the list size pass.
+    half = [(f'x-{i}', 'v' * 1000) for i in range(30)]
+    resp = h2_post_trailers(c, '/', b'hello', half, headers=half)
+    assert resp['status'] == 200
+    assert resp['body'] == b'hello'
+
+    # Over large_header_buffer_size * large_header_buffers (32 KiB).
+    trailers = [(f'x-{i}', 'v' * 1000) for i in range(40)]
+    resp = h2_post_trailers(c, '/', b'hello', trailers)
+    assert resp['status'] == 431
+
+    # A field name over the limit.
+    resp = h2_post_trailers(c, '/', b'hello', [('x' * 300, 'v')])
+    assert resp['status'] == 431
+
+    assert c.get('/')['status'] == 200
+    c.close()
+
+
 @pytest.mark.parametrize('content_length', [True, False], ids=['cl', 'no-cl'])
 def test_http2_response_before_body(content_length):
     need_h2()
