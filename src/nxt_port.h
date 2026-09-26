@@ -477,6 +477,30 @@ struct nxt_port_s {
     nxt_atomic_t        rearm_pending;
     nxt_atomic_t        announce;
 
+    /*
+     * The pacing of a re-arm that follows a send which failed for want of
+     * kernel memory.
+     *
+     * ENOBUFS and ENOMEM leave the socket writable, so no edge is coming and
+     * the retry has to force the readiness re-check itself.  Done on the
+     * spot, that re-check comes straight back: a shortage that lasts turns
+     * the engine thread into a tight epoll_wait/sendmsg/epoll_ctl loop,
+     * which is the worst moment to burn a core on.  The timer paces it
+     * instead -- the retry still happens, just not as fast as the kernel can
+     * refuse it.  See issue #407.
+     *
+     * ->retry_delay is what the next arming waits.  It doubles up to a cap
+     * and a successful send puts it back to zero.
+     *
+     * ->retry_timer.enabled says the timer is holding a port reference: set
+     * by nxt_timer_add(), left set while the expired timer waits in the work
+     * queue, and cleared by nxt_timer_handler() on the line before it calls
+     * nxt_port_retry_handler().  Both fields are touched on port->engine
+     * only.
+     */
+    nxt_timer_t         retry_timer;
+    nxt_msec_t          retry_delay;
+
     nxt_buf_t           *free_bufs;
     nxt_socket_t        pair[2];
 
@@ -619,6 +643,15 @@ void nxt_port_test_run_read_msg_process(nxt_task_t *task, nxt_port_t *port,
  * observing peers; counting the call itself distinguishes them.
  */
 NXT_EXPORT extern nxt_uint_t  nxt_port_test_broadcasts;
+
+/*
+ * Counts entries into the event-loop pass of nxt_port_write_msgs() -- the
+ * dispatches of the port's write handler.  A retry that is not paced makes
+ * this climb with the number of poll passes rather than with elapsed time,
+ * which is the whole of what the backoff is there to stop and is not
+ * observable from the port's state afterwards.
+ */
+NXT_EXPORT extern nxt_uint_t  nxt_port_test_write_dispatches;
 #endif
 
 nxt_inline nxt_int_t
