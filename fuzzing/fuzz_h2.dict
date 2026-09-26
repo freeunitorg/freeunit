@@ -1,0 +1,85 @@
+# libFuzzer dictionary for fuzz_http_h2p.
+#
+# HTTP/2 frame-type and flag bytes (RFC 9113 section 6), and a handful of
+# HPACK (RFC 7541) static-table and Huffman-coding bytes.  These are single
+# bytes or short byte strings a mutator would otherwise need many rounds to
+# discover, since a wrong frame type or flag turns almost all of a frame's
+# payload into bytes nghttp2 will not descend into.
+#
+# One entry per line, nothing else on it: libFuzzer's dictionary parser
+# takes a "#" anywhere but at the very start of a line as part of the
+# entry, not a trailing comment, so every note here is its own comment
+# line above the entries it explains.
+
+# --- frame types (RFC 9113, 6.*), as the 4th byte of a 9-byte frame header:
+# DATA, HEADERS, PRIORITY, RST_STREAM, SETTINGS, PUSH_PROMISE, PING,
+# GOAWAY, WINDOW_UPDATE, CONTINUATION
+"\x00"
+"\x01"
+"\x02"
+"\x03"
+"\x04"
+"\x05"
+"\x06"
+"\x07"
+"\x08"
+"\x09"
+
+# --- frame flags (5th byte), the ones nxt_h2proto.c itself tests for:
+# END_STREAM/ACK, END_HEADERS, PADDED, PRIORITY (on HEADERS)
+"\x01"
+"\x04"
+"\x08"
+"\x20"
+
+# --- SETTINGS identifiers (RFC 9113, 6.5.2), as a 2-byte big-endian field:
+# HEADER_TABLE_SIZE, ENABLE_PUSH, MAX_CONCURRENT_STREAMS,
+# INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE, MAX_HEADER_LIST_SIZE
+"\x00\x01"
+"\x00\x02"
+"\x00\x03"
+"\x00\x04"
+"\x00\x05"
+"\x00\x06"
+
+# --- error codes (RFC 9113, 7), as a 4-byte big-endian field:
+# PROTOCOL_ERROR, INTERNAL_ERROR, FLOW_CONTROL_ERROR, CANCEL,
+# ENHANCE_YOUR_CALM
+"\x00\x00\x00\x01"
+"\x00\x00\x00\x02"
+"\x00\x00\x00\x03"
+"\x00\x00\x00\x08"
+"\x00\x00\x00\x0b"
+
+# --- HPACK (RFC 7541): static-table indices nxt_h2p_on_header() branches on
+# by name, indexed (section 6.1, top bit set) or literal-with-incremental
+# -indexing (section 6.2.1, top two bits set): indexed :method: GET,
+# indexed :path: /, indexed :scheme: http, indexed :scheme: https, literal
+# incremental-indexing :authority (index 1), literal incremental-indexing
+# with a new name
+"\x82"
+"\x83"
+"\x84"
+"\x85"
+"\x41"
+"\x40"
+
+# --- HPACK dynamic-table-size-update instruction (section 6.3): top three
+# bits 001, easy for a mutator to land on by accident and worth naming
+"\x3f"
+
+# --- HTTP/2 pseudo-headers and a couple of common field/method names, as
+# literal ASCII (a mutator can then combine these with the HPACK bytes
+# above to build a header block by hand)
+":method"
+":path"
+":scheme"
+":authority"
+"host"
+"content-length"
+"CONNECT"
+"OPTIONS"
+
+# --- a 4-byte all-ones field: SETTINGS values, window sizes and the
+# 31-bit-max stream/window-increment fields all key off this boundary
+"\xff\xff\xff\xff"

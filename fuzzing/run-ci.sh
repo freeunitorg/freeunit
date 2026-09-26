@@ -10,7 +10,8 @@
 #   fuzzing/run-ci.sh [-t SECONDS] [TARGET ...]
 #
 #   -t SECONDS   libFuzzer budget per target (default 60)
-#   TARGET ...   fuzzer names; default is all five
+#   TARGET ...   fuzzer names; default is every target the build produced
+#                (fuzz_http_h2p only exists when configure had --h2)
 #
 # Expects the fuzzers to be built already:
 #   CC=clang CXX=clang++ \
@@ -42,11 +43,15 @@ case "$BUDGET" in
     ''|*[!0-9]*) die "budget must be a whole number of seconds, got '$BUDGET'" ;;
 esac
 
-# Seed corpus and dictionary per target.  fuzz_http_* share the HTTP corpus.
+# Seed corpus and dictionary per target.  fuzz_http_* share the HTTP corpus;
+# fuzz_http_h2p is matched first since it is a fuzz_http_* name too, but has
+# its own corpus (fuzz_h2p_seed_corpus) and dictionary (fuzz_h2.dict) --
+# nghttp2's frame/HPACK bytes are not useful to the h1 targets or vice versa.
 corpus_for() {
     case "$1" in
         fuzz_basic)     echo fuzz_basic_seed_corpus ;;
         fuzz_json)      echo fuzz_json_seed_corpus ;;
+        fuzz_http_h2p)  echo fuzz_h2p_seed_corpus ;;
         fuzz_http_*)    echo fuzz_http_seed_corpus ;;
         *)              die "unknown target: $1" ;;
     esac
@@ -54,13 +59,25 @@ corpus_for() {
 
 dict_for() {
     case "$1" in
+        fuzz_http_h2p)  echo fuzz_h2.dict ;;
         fuzz_http_*)    echo fuzz_http.dict ;;
         *)              echo "" ;;
     esac
 }
 
-[ $# -gt 0 ] || set -- fuzz_basic fuzz_json fuzz_http_controller \
-                       fuzz_http_h1p fuzz_http_h1p_peer
+if [ $# -eq 0 ]; then
+    set -- fuzz_basic fuzz_json fuzz_http_controller \
+           fuzz_http_h1p fuzz_http_h1p_peer
+
+    # fuzz_http_h2p only exists when configure had --h2 (nghttp2); the other
+    # five targets do not depend on it, so a build without it must still run
+    # them rather than fail outright.  A target named explicitly on the
+    # command line, in contrast, is expected to exist -- the "no fuzzer at"
+    # check below catches that plainly instead.
+    if [ -x "$BUILD/fuzz_http_h2p" ]; then
+        set -- "$@" fuzz_http_h2p
+    fi
+fi
 
 # Freeze the list: the loop below rebuilds "$@" to hold each target's libFuzzer
 # arguments, so it cannot also be the list being iterated.
