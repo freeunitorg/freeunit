@@ -185,11 +185,21 @@ do
     nxt_dep=${nxt_src%.c}.dep
     nxt_dep_flags=`nxt_gen_dep_flags`
     nxt_dep_post=`nxt_gen_dep_post`
+
+    # Only the test sources see NXT_TESTS here.  The core and libunit
+    # objects built by this loop are the ones unitd, libnxt.a, libunit.a
+    # and the language modules link, so they never get the macro.  The
+    # instrumented copies the test programs link are built further down.
+    case "$nxt_src" in
+        src/test/*)  nxt_test_cflags="-DNXT_TESTS=1" ;;
+        *)           nxt_test_cflags= ;;
+    esac
+
     cat << END >> $NXT_MAKEFILE
 
 $NXT_BUILD_DIR/$nxt_obj: $nxt_src $NXT_VERSION_H
 	\$(PP_CC) \$@
-	\$(v)\$(CC) -c \$(CFLAGS) \$(NXT_LIB_INCS) $NXT_LIB_AUX_CFLAGS \\
+	\$(v)\$(CC) -c \$(CFLAGS) $nxt_test_cflags \$(NXT_LIB_INCS) $NXT_LIB_AUX_CFLAGS \\
 	-o $NXT_BUILD_DIR/$nxt_obj \\
 	$nxt_dep_flags \\
 	$nxt_src
@@ -210,7 +220,7 @@ cat << END >> $NXT_MAKEFILE
 
 $NXT_BUILD_DIR/$nxt_obj: $nxt_src $NXT_VERSION_H
 	\$(PP_CC) \$@
-	\$(v)\$(CC) -c \$(CFLAGS) -DNXT_NCQ_TEST=1 \$(NXT_LIB_INCS) $NXT_LIB_AUX_CFLAGS \\
+	\$(v)\$(CC) -c \$(CFLAGS) -DNXT_TESTS=1 -DNXT_NCQ_TEST=1 \$(NXT_LIB_INCS) $NXT_LIB_AUX_CFLAGS \\
 	-o $NXT_BUILD_DIR/$nxt_obj \\
 	$nxt_dep_flags \\
 	$nxt_src
@@ -229,7 +239,7 @@ cat << END >> $NXT_MAKEFILE
 
 $NXT_BUILD_DIR/$nxt_obj: $nxt_src $NXT_VERSION_H
 	\$(PP_CC) \$@
-	\$(v)\$(CC) -c \$(CFLAGS) -DNXT_NCQ_TEST=0 \$(NXT_LIB_INCS) $NXT_LIB_AUX_CFLAGS \\
+	\$(v)\$(CC) -c \$(CFLAGS) -DNXT_TESTS=1 -DNXT_NCQ_TEST=0 \$(NXT_LIB_INCS) $NXT_LIB_AUX_CFLAGS \\
 	-o $NXT_BUILD_DIR/$nxt_obj \\
 	$nxt_dep_flags \\
 	$nxt_src
@@ -243,6 +253,73 @@ $echo >> $NXT_MAKEFILE
 
 
 if [ $NXT_TESTS = YES ]; then
+
+    # Instrumented core and libunit.
+    #
+    # Every source of libnxt.a and libunit.a is compiled a second time with
+    # -DNXT_TESTS=1 into <name>.test.o and archived as libnxt-tests.a and
+    # libunit-tests.a.  The test programs link only these archives; the plain
+    # archives above are what unitd and the language modules link.  Compiling
+    # the whole set, not a list of the sources that carry hooks, means a hook
+    # added to any core or libunit source is covered without a build change.
+
+    $echo "NXT_LIB_TEST_OBJS = \\" >> $NXT_MAKEFILE
+
+    for nxt_src in $NXT_LIB_SRCS
+    do
+        nxt_obj=${nxt_src%.c}.test.o
+        $echo "	$NXT_BUILD_DIR/$nxt_obj \\" >> $NXT_MAKEFILE
+    done
+
+    $echo >> $NXT_MAKEFILE
+
+    $echo "NXT_LIB_UNIT_TEST_OBJS = \\" >> $NXT_MAKEFILE
+    $echo "	$NXT_BUILD_DIR/src/nxt_lvlhsh.test.o \\" >> $NXT_MAKEFILE
+    $echo "	$NXT_BUILD_DIR/src/nxt_murmur_hash.test.o \\" >> $NXT_MAKEFILE
+    $echo "	$NXT_BUILD_DIR/src/nxt_socket_msg.test.o \\" >> $NXT_MAKEFILE
+    $echo "	$NXT_BUILD_DIR/src/nxt_websocket.test.o \\" >> $NXT_MAKEFILE
+
+    for nxt_src in $NXT_LIB_UNIT_SRCS
+    do
+        nxt_obj=${nxt_src%.c}.test.o
+        $echo "	$NXT_BUILD_DIR/$nxt_obj \\" >> $NXT_MAKEFILE
+    done
+
+    $echo >> $NXT_MAKEFILE
+
+    for nxt_src in $NXT_LIB_SRCS $NXT_LIB_UNIT_SRCS
+    do
+        nxt_obj=${nxt_src%.c}.test.o
+        nxt_dep=${nxt_src%.c}.test.dep
+        nxt_dep_flags=`nxt_gen_dep_flags`
+        nxt_dep_post=`nxt_gen_dep_post`
+        cat << END >> $NXT_MAKEFILE
+
+$NXT_BUILD_DIR/$nxt_obj: $nxt_src $NXT_VERSION_H
+	\$(PP_CC) \$@
+	\$(v)\$(CC) -c \$(CFLAGS) -DNXT_TESTS=1 \$(NXT_LIB_INCS) $NXT_LIB_AUX_CFLAGS \\
+	-o $NXT_BUILD_DIR/$nxt_obj \\
+	$nxt_dep_flags \\
+	$nxt_src
+	$nxt_dep_post
+
+-include $NXT_BUILD_DIR/$nxt_dep
+
+END
+
+    done
+
+    cat << END >> $NXT_MAKEFILE
+
+$NXT_BUILD_DIR/lib/$NXT_LIB_TEST_STATIC: \$(NXT_LIB_TEST_OBJS)
+	\$(PP_AR) \$@
+	\$(v)$NXT_STATIC_LINK \$@ \$(NXT_LIB_TEST_OBJS)
+
+$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_TEST_STATIC: \$(NXT_LIB_UNIT_TEST_OBJS)
+	\$(PP_AR) \$@
+	\$(v)$NXT_STATIC_LINK \$@ \$(NXT_LIB_UNIT_TEST_OBJS)
+
+END
 
     # Test object files list.
 
@@ -268,73 +345,73 @@ tests:		$NXT_BUILD_DIR/tests \\
 			$NXT_BUILD_DIR/unit_port_recv_test
 
 $NXT_BUILD_DIR/tests: \$(NXT_TEST_OBJS) \\
-			$NXT_BUILD_DIR/lib/$NXT_LIB_STATIC \\
+			$NXT_BUILD_DIR/lib/$NXT_LIB_TEST_STATIC \\
 			\$(NXT_OTEL_LIB_STATIC)
 	\$(PP_LD) \$@
 	\$(v)\$(NXT_EXEC_LINK) -o $NXT_BUILD_DIR/tests \\
 		\$(CFLAGS) \$(NXT_TEST_OBJS) \\
-		$NXT_BUILD_DIR/lib/$NXT_LIB_STATIC \$(NXT_OTEL_LIB_STATIC) \\
+		$NXT_BUILD_DIR/lib/$NXT_LIB_TEST_STATIC \$(NXT_OTEL_LIB_STATIC) \\
 		$NXT_LD_OPT $NXT_LIBM $NXT_LIBS $NXT_LIB_AUX_LIBS
 
 $NXT_BUILD_DIR/ncq_test: $NXT_BUILD_DIR/src/test/nxt_ncq_test.o \\
-			$NXT_BUILD_DIR/lib/$NXT_LIB_STATIC \\
+			$NXT_BUILD_DIR/lib/$NXT_LIB_TEST_STATIC \\
 			\$(NXT_OTEL_LIB_STATIC)
 	\$(PP_LD) \$@
 	\$(v)\$(NXT_EXEC_LINK) -o $NXT_BUILD_DIR/ncq_test \\
 		\$(CFLAGS) $NXT_BUILD_DIR/src/test/nxt_ncq_test.o \\
-		$NXT_BUILD_DIR/lib/$NXT_LIB_STATIC \$(NXT_OTEL_LIB_STATIC) \\
+		$NXT_BUILD_DIR/lib/$NXT_LIB_TEST_STATIC \$(NXT_OTEL_LIB_STATIC) \\
 		$NXT_LD_OPT $NXT_LIBM $NXT_LIBS $NXT_LIB_AUX_LIBS
 
 $NXT_BUILD_DIR/vbcq_test: $NXT_BUILD_DIR/src/test/nxt_vbcq_test.o \\
-			$NXT_BUILD_DIR/lib/$NXT_LIB_STATIC \\
+			$NXT_BUILD_DIR/lib/$NXT_LIB_TEST_STATIC \\
 			\$(NXT_OTEL_LIB_STATIC)
 	\$(PP_LD) \$@
 	\$(v)\$(NXT_EXEC_LINK) -o $NXT_BUILD_DIR/vbcq_test \\
 		\$(CFLAGS) $NXT_BUILD_DIR/src/test/nxt_vbcq_test.o \\
-		$NXT_BUILD_DIR/lib/$NXT_LIB_STATIC \$(NXT_OTEL_LIB_STATIC) \\
+		$NXT_BUILD_DIR/lib/$NXT_LIB_TEST_STATIC \$(NXT_OTEL_LIB_STATIC) \\
 		$NXT_LD_OPT $NXT_LIBM $NXT_LIBS $NXT_LIB_AUX_LIBS
 
 $NXT_BUILD_DIR/unit_app_test: $NXT_BUILD_DIR/src/test/nxt_unit_app_test.o \\
-		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_STATIC
+		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_TEST_STATIC
 	\$(PP_LD) \$@
 	\$(v)\$(NXT_EXEC_LINK) -o $NXT_BUILD_DIR/unit_app_test \\
 		\$(CFLAGS) $NXT_BUILD_DIR/src/test/nxt_unit_app_test.o \\
-		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_STATIC \\
+		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_TEST_STATIC \\
 		$NXT_LD_OPT $NXT_LIBM $NXT_LIBS $NXT_LIB_AUX_LIBS
 
 $NXT_BUILD_DIR/unit_close_test: $NXT_BUILD_DIR/src/test/nxt_unit_close_test.o \\
-		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_STATIC
+		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_TEST_STATIC
 	\$(PP_LD) \$@
 	\$(v)\$(NXT_EXEC_LINK) -o $NXT_BUILD_DIR/unit_close_test \\
 		\$(CFLAGS) $NXT_BUILD_DIR/src/test/nxt_unit_close_test.o \\
-		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_STATIC \\
+		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_TEST_STATIC \\
 		$NXT_LD_OPT $NXT_LIBM $NXT_LIBS $NXT_LIB_AUX_LIBS
 
 $NXT_BUILD_DIR/unit_port_recv_test: \\
 		$NXT_BUILD_DIR/src/test/nxt_unit_port_recv_test.o \\
-		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_STATIC
+		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_TEST_STATIC
 	\$(PP_LD) \$@
 	\$(v)\$(NXT_EXEC_LINK) -o $NXT_BUILD_DIR/unit_port_recv_test \\
 		\$(CFLAGS) $NXT_BUILD_DIR/src/test/nxt_unit_port_recv_test.o \\
-		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_STATIC \\
+		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_TEST_STATIC \\
 		$NXT_LD_OPT $NXT_LIBM $NXT_LIBS $NXT_LIB_AUX_LIBS
 
 $NXT_BUILD_DIR/unit_websocket_chat: \\
 		$NXT_BUILD_DIR/src/test/nxt_unit_websocket_chat.o \\
-		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_STATIC
+		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_TEST_STATIC
 	\$(PP_LD) \$@
 	\$(v)\$(NXT_EXEC_LINK) -o $NXT_BUILD_DIR/unit_websocket_chat \\
 		\$(CFLAGS) $NXT_BUILD_DIR/src/test/nxt_unit_websocket_chat.o \\
-		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_STATIC \\
+		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_TEST_STATIC \\
 		$NXT_LD_OPT $NXT_LIBM $NXT_LIBS $NXT_LIB_AUX_LIBS
 
 $NXT_BUILD_DIR/unit_websocket_echo: \\
 		$NXT_BUILD_DIR/src/test/nxt_unit_websocket_echo.o \\
-		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_STATIC
+		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_TEST_STATIC
 	\$(PP_LD) \$@
 	\$(v)\$(NXT_EXEC_LINK) -o $NXT_BUILD_DIR/unit_websocket_echo \\
 		\$(CFLAGS) $NXT_BUILD_DIR/src/test/nxt_unit_websocket_echo.o \\
-		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_STATIC \\
+		$NXT_BUILD_DIR/lib/$NXT_LIB_UNIT_TEST_STATIC \\
 		$NXT_LD_OPT $NXT_LIBM $NXT_LIBS $NXT_LIB_AUX_LIBS
 
 END
