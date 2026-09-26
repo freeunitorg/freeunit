@@ -47,6 +47,8 @@ static void nxt_epoll_disable(nxt_event_engine_t *engine, nxt_fd_event_t *ev);
 static void nxt_epoll_delete(nxt_event_engine_t *engine, nxt_fd_event_t *ev);
 static nxt_bool_t nxt_epoll_close(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
+static void nxt_epoll_cancel_changes(nxt_event_engine_t *engine,
+    nxt_fd_event_t *ev);
 static void nxt_epoll_enable_read(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
 static void nxt_epoll_enable_write(nxt_event_engine_t *engine,
@@ -126,6 +128,7 @@ const nxt_event_interface_t  nxt_epoll_edge_engine = {
     nxt_epoll_disable,
     nxt_epoll_delete,
     nxt_epoll_close,
+    nxt_epoll_cancel_changes,
     nxt_epoll_enable_read,
     nxt_epoll_enable_write,
     nxt_epoll_disable_read,
@@ -172,6 +175,7 @@ const nxt_event_interface_t  nxt_epoll_level_engine = {
     nxt_epoll_disable,
     nxt_epoll_delete,
     nxt_epoll_close,
+    nxt_epoll_cancel_changes,
     nxt_epoll_enable_read,
     nxt_epoll_enable_write,
     nxt_epoll_disable_read,
@@ -409,6 +413,47 @@ nxt_epoll_close(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
     nxt_epoll_delete(engine, ev);
 
     return ev->changing;
+}
+
+
+/*
+ * Take this event's pending changes out of the batch, so that a struct that
+ * is about to be freed is not dereferenced by nxt_epoll_commit_changes().
+ *
+ * The change is dropped rather than committed: the descriptor is closed, or
+ * is about to be, and close() removes it from the epoll set on its own.
+ * Committing instead would epoll_ctl() a descriptor number that may already
+ * name somebody else's file.
+ */
+
+static void
+nxt_epoll_cancel_changes(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
+{
+    nxt_epoll_change_t  *change, *dst, *end;
+
+    if (!ev->changing) {
+        return;
+    }
+
+    dst = engine->u.epoll.changes;
+    end = dst + engine->u.epoll.nchanges;
+
+    for (change = dst; change < end; change++) {
+
+        if (change->event.data.ptr == ev) {
+            continue;
+        }
+
+        if (dst != change) {
+            *dst = *change;
+        }
+
+        dst++;
+    }
+
+    engine->u.epoll.nchanges = (nxt_uint_t) (dst - engine->u.epoll.changes);
+
+    ev->changing = 0;
 }
 
 
