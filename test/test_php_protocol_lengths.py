@@ -22,7 +22,7 @@ def test_php_protocol_field_name_length():
 def test_php_protocol_method_length():
     client.load('variables')
 
-    for length, status in ((255, 200), (256, 501)):
+    for length, status in ((255, 200), (256, 501), (280, 501)):
         resp = client.http('A' * length, headers={'Host': 'localhost'})
         assert resp['status'] == status, length
 
