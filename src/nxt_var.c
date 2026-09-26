@@ -70,9 +70,6 @@ static const nxt_lvlhsh_proto_t  nxt_var_cache_proto  nxt_aligned(64) = {
 
 
 static nxt_lvlhsh_t       nxt_var_hash;
-static uint32_t           nxt_var_count;
-
-static nxt_var_decl_t     **nxt_vars;
 
 
 static nxt_int_t
@@ -285,33 +282,6 @@ nxt_var_register(nxt_var_decl_t *decl, size_t n)
             return NXT_ERROR;
         }
     }
-
-    nxt_var_count += n;
-
-    return NXT_OK;
-}
-
-
-nxt_int_t
-nxt_var_index_init(void)
-{
-    nxt_uint_t         i;
-    nxt_var_decl_t     *decl, **vars;
-    nxt_lvlhsh_each_t  lhe;
-
-    vars = nxt_memalign(64, nxt_var_count * sizeof(nxt_var_decl_t *));
-    if (vars == NULL) {
-        return NXT_ERROR;
-    }
-
-    nxt_lvlhsh_each_init(&lhe, &nxt_var_hash_proto);
-
-    for (i = 0; i < nxt_var_count; i++) {
-        decl = nxt_lvlhsh_each(&nxt_var_hash, &lhe);
-        vars[i] = decl;
-    }
-
-    nxt_vars = vars;
 
     return NXT_OK;
 }
