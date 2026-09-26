@@ -1368,7 +1368,12 @@ nxt_nanosleep(nxt_nsec_t ns)
 void
 nxt_process_port_add(nxt_task_t *task, nxt_process_t *process, nxt_port_t *port)
 {
-    /* A double add is a bug: trap it in a debug build, refuse it in any. */
+    /*
+     * A double add is a bug: trap it in a debug build, refuse it in any.
+     * link.next reads as "already linked" only because a port is never
+     * linked again after nxt_port_release() unlinks it: in a release build
+     * nxt_queue_remove() does not clear the link.
+     */
     nxt_assert(port->process == NULL && port->link.next == NULL);
 
     if (nxt_slow_path(port->process != NULL || port->link.next != NULL)) {

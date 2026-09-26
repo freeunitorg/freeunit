@@ -73,6 +73,7 @@ nxt_port_release_test_child(void *data)
 
     if (paired->process != process
         || nxt_queue_next(&paired->link) != nxt_queue_tail(&process->ports)
+        || nxt_queue_prev(&paired->link) != nxt_queue_head(&process->ports)
         || process->use_count != 2)
     {
         return 7;
