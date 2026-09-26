@@ -118,8 +118,9 @@ nxt_port_mmap_read_test(nxt_thread_t *thr)
 {
     nxt_mp_t                 *mp;
     nxt_int_t                ret;
-    nxt_buf_t                *seg;
-    nxt_uint_t               i;
+    nxt_buf_t                *seg, *segs[3];
+    nxt_uint_t               i, nsegs;
+    nxt_bool_t               incoming_mutex;
     nxt_task_t               *task;
     nxt_process_t            *process;
     nxt_runtime_t            *rt, *saved_rt;
@@ -163,6 +164,8 @@ nxt_port_mmap_read_test(nxt_thread_t *thr)
     thr->engine = &engine;
 
     ret = NXT_ERROR;
+    nsegs = 0;
+    incoming_mutex = 0;
 
     process->pid = nxt_pid + 41;
     process->use_count = 1;
@@ -174,6 +177,8 @@ nxt_port_mmap_read_test(nxt_thread_t *thr)
         goto done;
     }
 
+    incoming_mutex = 1;
+
     nxt_runtime_process_add(task, process);
 
     /* The sender's segment 0, allocated through the same array. */
@@ -182,6 +187,8 @@ nxt_port_mmap_read_test(nxt_thread_t *thr)
     if (nxt_slow_path(seg == NULL)) {
         goto done;
     }
+
+    segs[nsegs++] = seg;
 
     mmap_handler = seg->parent;
     c = nxt_port_mmap_chunk_id(mmap_handler->hdr, seg->mem.pos);
@@ -229,6 +236,10 @@ nxt_port_mmap_read_test(nxt_thread_t *thr)
     seg = nxt_port_mmap_get_buf(task, &process->incoming,
                                 (PORT_MMAP_CHUNK_COUNT - c - 2)
                                 * PORT_MMAP_CHUNK_SIZE);
+    if (seg != NULL) {
+        segs[nsegs++] = seg;
+    }
+
     if (nxt_slow_path(seg == NULL || seg->parent != mmap_handler)) {
         goto done;
     }
@@ -256,6 +267,9 @@ nxt_port_mmap_read_test(nxt_thread_t *thr)
 
     seg = nxt_port_mmap_get_buf(task, &process->incoming,
                                 2 * PORT_MMAP_CHUNK_SIZE);
+    if (seg != NULL) {
+        segs[nsegs++] = seg;
+    }
 
     if (seg != NULL && seg->parent == mmap_handler
         && seg->mem.end > nxt_port_mmap_chunk_start(mmap_handler->hdr,
@@ -272,10 +286,42 @@ nxt_port_mmap_read_test(nxt_thread_t *thr)
 
 done:
 
-    /* The segment and the port stay mapped, like other port fixtures. */
+    /*
+     * Each nxt_port_mmap_get_buf() took a reference on its segment's
+     * handler, and process->incoming holds one more.  The buffers are
+     * never completed here, so their references are dropped by hand
+     * (nxt_port_mmap_handler_use() is private to nxt_port_memory.c); the
+     * array's reference, dropped last by nxt_port_mmaps_destroy(), then
+     * unmaps and frees each handler.  The buffers themselves
+     * come from mp.  The port has its own pool, freed by the last
+     * reference; it was never linked to a process.  nxt_runtime_process_add()
+     * put the process in rt->processes, a malloc'd table outside mp.
+     */
+    for (i = 0; i < nsegs; i++) {
+        mmap_handler = segs[i]->parent;
+        (void) nxt_atomic_fetch_add(&mmap_handler->use_count, -1);
+    }
+
+    nxt_port_mmaps_destroy(&process->incoming, 1);
+
+    if (nxt_mmap_read_port != NULL) {
+        nxt_port_use(task, nxt_mmap_read_port, -1);
+        nxt_mmap_read_port = NULL;
+    }
+
+    if (process->registered) {
+        nxt_runtime_process_remove(rt, process);
+    }
+
+    if (incoming_mutex) {
+        nxt_thread_mutex_destroy(&process->incoming.mutex);
+    }
 
     thr->runtime = saved_rt;
     thr->engine = saved_engine;
+
+    nxt_thread_mutex_destroy(&rt->processes_mutex);
+    nxt_mp_destroy(mp);
 
     return ret;
 }
