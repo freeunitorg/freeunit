@@ -14,6 +14,9 @@ on:
       # nxt_http_controller_fuzz.c #includes nxt_controller.c, so a change
       # there is a change to what this job fuzzes.
       - 'src/nxt_controller*'
+      - 'src/nxt_unit*'
+      - 'src/nxt_port_memory_int.h'
+      - 'src/nxt_span.h'
       # configure --fuzz, auto/fuzzing and auto/sources are what produce the
       # binaries; break them and the job has nothing to run.
       - configure
@@ -27,7 +30,7 @@ on:
         required: false
         default: '60'
       targets:
-        description: 'Space-separated fuzzer names (empty = all five)'
+        description: 'Space-separated fuzzer names (empty = all six)'
         required: false
         default: ''
 
@@ -46,10 +49,10 @@ jobs:
   libfuzzer:
     name: libFuzzer (ASan + UBSan)
     runs-on: ubuntu-latest
-    # Five targets at a 60s budget is a little over five minutes -- each
+    # Six targets at a 60s budget is a little over six minutes -- each
     # finishes within a second or two of its budget, and run-ci.sh caps the
     # worst case at two minutes each.  The clang/ASan build is a few minutes
-    # on top.  A dispatch can ask for a much longer budget across all five
+    # on top.  A dispatch can ask for a much longer budget across all six
     # targets, so it gets a much longer bound; a pull request must not, or a
     # hung job holds a runner for an hour.
     timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 120 || 25 }}
@@ -83,11 +86,11 @@ jobs:
           ./configure --no-regex --no-pcre2 --fuzz=-fsanitize=fuzzer
           make fuzz -j"$(nproc)"
 
-      # All five targets, on a pull request and on a dispatch alike.  Picking a
+      # All six targets, on a pull request and on a dispatch alike.  Picking a
       # subset per changed path was tried and dropped: every path filter above
       # already maps to a target, `fuzzing/**` maps to all of them, and a
       # target left out of the list is a harness that CI compiles but never
-      # runs.  At about 61 seconds each the whole set is close to five minutes.
+      # runs.  At about 61 seconds each the whole set is close to six minutes.
       - name: Run the fuzzers
         env:
           FUZZ_SECONDS: ${{ github.event.inputs.seconds || '60' }}

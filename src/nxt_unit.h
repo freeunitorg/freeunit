@@ -430,5 +430,10 @@ void     nxt_unit_test_ctx_set_ready(nxt_unit_ctx_t *ctx, uint8_t val);
 void     nxt_unit_test_ctx_quit_graceful(nxt_unit_ctx_t *ctx);
 #endif
 
+#if (NXT_TESTS || NXT_FUZZ_BUILD)
+int      nxt_unit_test_process_msg(nxt_unit_ctx_t *ctx, const void *msg,
+    size_t size, int fd);
+#endif
+
 
 #endif /* _NXT_UNIT_H_INCLUDED_ */
