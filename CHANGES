@@ -473,6 +473,24 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        single comma-joined value RFC 9110 defines them to be; previously
        only the first was consulted.
 
+    *) Bugfix: the "*" in "Accept-Encoding" now stands for every enabled
+       compressor the client did not name, not for the identity coding
+       alone.  "identity;q=0, *;q=1" was answered "406 Not Acceptable" with
+       gzip enabled and applicable, because the wildcard could only ever
+       select identity, which that same field refused.  A coding the field
+       does name keeps its own weight and is not matched by the wildcard, so
+       it also wins a tie with it: "gzip, *" now sends gzip, where it used
+       to send the response uncompressed.
+
+    *) Bugfix: a compressor below its own "min_length" is no longer selected
+       over a lower-weight compressor that can be applied.  "min_length"
+       belongs to the compressor, so with gzip at 1000 and deflate at 0 a
+       100-byte response was sent uncompressed because gzip carried the
+       higher weight.  A client that refused the identity coding received
+       the same uncompressed bytes.  Such a client is now served as deflate,
+       and where every compressor it accepts is below its "min_length" it is
+       answered "406 Not Acceptable" instead of the bytes it declined.
+
     *) Bugfix: a malformed weight in "Accept-Encoding" is no longer read as a
        refusal.  The qvalue was converted with strtod(), which takes no digits
        at all from "identity;q=" and from "identity;q=abc" and reports zero,

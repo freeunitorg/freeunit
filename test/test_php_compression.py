@@ -295,3 +295,64 @@ def test_php_compression_identity_refused():
 
     assert status == 406, 'no representation left for the application body'
     assert 'Content-Encoding' not in headers
+
+
+def test_php_compression_wildcard_offers_a_coding():
+    # The wildcard reaches the application path too.  Sect. 12.5.3: "*"
+    # matches any available content coding not explicitly listed, so this
+    # client refuses the response's own bytes and accepts everything else --
+    # gzip included.  Reading "*" as identity alone left nothing acceptable
+    # and the router answered 406 to a request it could serve.
+    client.load('comp_large_body')
+    configure_compression()
+
+    status, headers, body = raw_get('/', 'identity;q=0, *;q=1')
+
+    assert status == 200, 'the wildcard offers gzip'
+    assert headers.get('Content-Encoding') == 'gzip', 'encoding advertised'
+    assert gzip.decompress(body) == b'A' * 100000, 'round-trips'
+
+    # A coding the field names keeps its own weight and is not matched by
+    # the wildcard, so gzip is worth 0.1 here and is still what is sent.
+    status, headers, body = raw_get('/', 'identity;q=0, *;q=0.5, gzip;q=0.1')
+
+    assert status == 200, 'an explicitly named gzip is still acceptable'
+    assert headers.get('Content-Encoding') == 'gzip', 'at its own weight'
+    assert gzip.decompress(body) == b'A' * 100000
+
+
+def test_php_compression_identity_refused_below_min_length():
+    # gzip is acceptable but never applied: "min_length" is above this body,
+    # so the response would fall back to the identity the client refused.
+    # 406, and still not 503.
+    client.load('comp_small_body')
+
+    # client.load() installs a configuration without a "settings" object, so
+    # a PUT to settings/http/compression is rejected.  The whole "settings"
+    # object is put, and the result is checked: with the PUT silently failing
+    # this test passed through the no-compressor path instead.
+    assert 'success' in client.conf(
+        {
+            "http": {
+                "compression": {
+                    "types": ["text/html*"],
+                    "compressors": [
+                        {"encoding": "gzip", "min_length": 1000}
+                    ],
+                }
+            }
+        },
+        'settings',
+    ), 'gzip with min_length 1000'
+
+    status, headers, _ = raw_get('/', 'gzip, identity;q=0')
+
+    assert status == 406, 'a below-minimum gzip is not available'
+    assert 'Content-Encoding' not in headers
+
+    # The same response to a client that takes identity is unchanged.
+    status, headers, body = raw_get('/', 'gzip')
+
+    assert status == 200, 'identity is acceptable here'
+    assert 'Content-Encoding' not in headers
+    assert body == b'A' * 64, 'the body, uncompressed'

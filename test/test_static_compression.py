@@ -1,4 +1,5 @@
 import gzip
+import zlib
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,10 @@ def setup_method_fixture(temp_dir):
     Path(f'{assets_dir}/big.css').write_text(
         'body{color:red}' * 500, encoding='utf-8'
     )
+    Path(f'{assets_dir}/tiny.css').write_text('ok', encoding='utf-8')
+    # Above the 10-byte "min_length" below, so a 406 on this file can only
+    # come from the media type, never from the length.
+    Path(f'{assets_dir}/raw').write_text('raw' * 10, encoding='utf-8')
 
     assert 'success' in client.conf(
         {
@@ -337,10 +342,10 @@ def test_static_compression_vary_merge_identity(temp_dir, configured, expected):
 # needs a language-module test, not a static one.
 
 
-def _raw_get(**headers):
+def _raw_get(url='/big.css', **headers):
     # Raw bytes: the body has to be decompressed, so it must not be decoded.
     raw = client.get(
-        url='/big.css',
+        url=url,
         headers={'Host': 'localhost', 'Connection': 'close', **headers},
         encoding='latin-1',
         read_buffer_size=1024 * 1024,
@@ -377,6 +382,163 @@ def test_static_compression_range_identity_refused(temp_dir):
     assert headers.get('Content-Encoding') == 'gzip', 'served as gzip'
     assert 'Content-Range' not in headers, 'no Content-Range on the full 200'
     assert gzip.decompress(body) == data, 'the whole file, correctly coded'
+
+
+def test_static_compression_identity_refused_below_min_length():
+    # "min_length" is 10 and tiny.css is two bytes, so the gzip that made this
+    # request serveable is never applied and the fallback is the identity the
+    # client refused.  406 is the honest answer, with a Range and without: the
+    # Range is not what makes the request unserveable.
+    for extra in ({}, {'Range': 'bytes=0-1'}):
+        status, headers, _ = _raw_get(
+            '/tiny.css',
+            **{'Accept-Encoding': 'gzip, identity;q=0', **extra},
+        )
+        assert status == 406, 'a below-minimum gzip is not available'
+        assert 'Content-Encoding' not in headers
+        assert 'Content-Range' not in headers
+
+
+def test_static_compression_min_length_is_per_compressor():
+    # "min_length" belongs to the compressor, so the highest-weight coding
+    # being below its own threshold says nothing about the next one.  gzip is
+    # at 1000 and deflate at 0, and tiny.css is two bytes: it is serveable as
+    # deflate.  Selecting gzip on its weight alone and stopping there made
+    # the response identity -- and, for a client that refused identity, a
+    # 406 for a request that can be satisfied.
+    assert 'success' in client.conf(
+        {
+            "types": ["text/css"],
+            "compressors": [
+                {"encoding": "gzip", "min_length": 1000},
+                {"encoding": "deflate", "min_length": 0},
+            ],
+        },
+        'settings/http/compression',
+    ), 'two compressors, different minimums'
+
+    for extra in ({}, {'Accept-Encoding': 'gzip, deflate;q=0.5, identity;q=0'}):
+        headers = {'Accept-Encoding': 'gzip, deflate;q=0.5', **extra}
+
+        status, hdrs, body = _raw_get('/tiny.css', **headers)
+
+        assert status == 200, f'deflate can serve it: {headers}'
+        assert hdrs.get('Content-Encoding') == 'deflate', 'the eligible coding'
+        assert zlib.decompress(body) == b'ok', 'round-trips'
+
+    # The weight order still decides among codings that are all eligible.
+    status, hdrs, _ = _raw_get(
+        '/big.css', **{'Accept-Encoding': 'gzip, deflate;q=0.5'}
+    )
+
+    assert status == 200, 'both are above their minimum here'
+    assert hdrs.get('Content-Encoding') == 'gzip', 'the highest weight wins'
+
+
+def test_static_compression_wildcard_stands_for_every_coding(temp_dir):
+    # Sect. 12.5.3: "The asterisk '*' symbol in an Accept-Encoding field
+    # matches any available content coding not explicitly listed in the
+    # field."  So "*" is not a synonym for identity: it offers every enabled
+    # coding the client did not name, at its own weight.
+    #
+    # Reading it as identity alone left the wildcard unable to select a
+    # compressor, so this request -- which refuses identity and accepts
+    # everything else -- was answered 406 although gzip was enabled, above
+    # its "min_length" and inside "types".
+    data = Path(f'{temp_dir}/assets/big.css').read_bytes()
+
+    status, headers, body = _raw_get(
+        **{'Accept-Encoding': 'identity;q=0, *;q=1'}
+    )
+
+    assert status == 200, 'the wildcard offers gzip'
+    assert headers.get('Content-Encoding') == 'gzip', 'served as gzip'
+    assert gzip.decompress(body) == data, 'the whole file, correctly coded'
+
+    # A coding the field does name is not matched by the wildcard and keeps
+    # its own weight, however low: gzip is listed at 0.1, so 0.1 is what gzip
+    # is worth, and with gzip the only compressor it is still the only thing
+    # left once identity is refused.
+    status, headers, body = _raw_get(
+        **{'Accept-Encoding': 'identity;q=0, *;q=0.5, gzip;q=0.1'}
+    )
+
+    assert status == 200, 'an explicitly named gzip is still acceptable'
+    assert headers.get('Content-Encoding') == 'gzip', 'at its own weight'
+    assert gzip.decompress(body) == data
+
+    # An explicitly refused coding is not resurrected by the wildcard either.
+    # gzip is out, and what "*" offers here is identity.
+    status, headers, body = _raw_get(**{'Accept-Encoding': 'gzip;q=0, *;q=1'})
+
+    assert status == 200, 'the wildcard still offers identity'
+    assert 'Content-Encoding' not in headers, 'gzip was refused by name'
+    assert body == data
+
+    # A named coding wins a tie with the wildcard -- the wildcard is the
+    # weaker statement about a coding the client did not mention.
+    for spelling in ('gzip, *', 'gzip;q=0.5, *;q=0.5'):
+        status, headers, _ = _raw_get(**{'Accept-Encoding': spelling})
+
+        assert status == 200, f'tie with the wildcard: {spelling!r}'
+        assert headers.get('Content-Encoding') == 'gzip', 'the named coding'
+
+    # With no coding named at all the wildcard covers identity too, and
+    # identity takes the tie: nothing has to be applied to send it.
+    for spelling in ('*', '*;q=1'):
+        status, headers, body = _raw_get(**{'Accept-Encoding': spelling})
+
+        assert status == 200, f'the bare wildcard: {spelling!r}'
+        assert 'Content-Encoding' not in headers, 'identity takes the tie'
+        assert body == data
+
+
+def test_static_compression_wildcard_skips_inapplicable_coding(temp_dir):
+    # The wildcard may only stand for a coding that would really be applied.
+    # gzip is the only compressor and tiny.css is below its "min_length", so
+    # there is nothing for "*" to offer but the identity this client refused:
+    # 406, not a 200 of the bytes it declined.
+    status, headers, _ = _raw_get(
+        '/tiny.css', **{'Accept-Encoding': 'identity;q=0, *;q=1'}
+    )
+
+    assert status == 406, 'a below-minimum gzip is not available to "*"'
+    assert 'Content-Encoding' not in headers
+
+    # "min_length" is per compressor, so the wildcard has to look past the
+    # first one.  gzip is at 1000 and deflate at 0, and tiny.css is two
+    # bytes: "*" offers deflate and the request is serveable.
+    assert 'success' in client.conf(
+        {
+            "types": ["text/css"],
+            "compressors": [
+                {"encoding": "gzip", "min_length": 1000},
+                {"encoding": "deflate", "min_length": 0},
+            ],
+        },
+        'settings/http/compression',
+    ), 'two compressors, different minimums'
+
+    status, headers, body = _raw_get(
+        '/tiny.css', **{'Accept-Encoding': 'identity;q=0, *;q=1'}
+    )
+
+    assert status == 200, 'the wildcard reaches the eligible coding'
+    assert headers.get('Content-Encoding') == 'deflate', 'the one that applies'
+    assert zlib.decompress(body) == b'ok', 'round-trips'
+
+    # And a coding the wildcard outbids by weight is still chosen over the
+    # one the field named lower: deflate at the wildcard's 0.5 beats the
+    # explicit gzip at 0.1.
+    status, headers, body = _raw_get(
+        **{'Accept-Encoding': 'identity;q=0, *;q=0.5, gzip;q=0.1'}
+    )
+
+    assert status == 200
+    assert headers.get('Content-Encoding') == 'deflate', 'the higher weight'
+    assert zlib.decompress(body) == Path(
+        f'{temp_dir}/assets/big.css'
+    ).read_bytes()
 
 
 def test_static_compression_range_identity_refused_guards(temp_dir):
