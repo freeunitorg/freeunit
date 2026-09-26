@@ -145,6 +145,8 @@ NXT_TEST_BUILD_SRCS="src/nxt_test_build.c"
 
 NXT_TEST_DEPS="src/test/nxt_tests.h \
     src/test/nxt_rbtree1.h \
+    src/nxt_checked.h \
+    src/nxt_span.h \
 "
 
 NXT_TEST_SRCS=" \
@@ -193,6 +195,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_port_fd_test.c \
     src/test/nxt_port_rpc_fd_test.c \
     src/test/nxt_port_queued_fd_test.c \
+    src/test/nxt_checked_test.c \
     src/test/nxt_conn_close_test.c \
     src/test/nxt_router_prepare_msg_test.c \
 "

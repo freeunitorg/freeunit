@@ -358,17 +358,17 @@ space_after_target:
                 if (p[7] < '0' || p[7] > '9') {
                     break;
                 }
-                /* Fall through. */
+                nxt_fallthrough;
             case 7:
                 if (p[6] != '.') {
                     break;
                 }
-                /* Fall through. */
+                nxt_fallthrough;
             case 6:
                 if (p[5] < '0' || p[5] > '9') {
                     break;
                 }
-                /* Fall through. */
+                nxt_fallthrough;
             default:
                 return NXT_AGAIN;
             }
@@ -743,13 +743,13 @@ nxt_http_lookup_field_end(u_char *p, const u_char *end)
     switch (end - p) {
     case 3:
         nxt_field_end_test_char(*p); p++;
-        /* Fall through. */
+        nxt_fallthrough;
     case 2:
         nxt_field_end_test_char(*p); p++;
-        /* Fall through. */
+        nxt_fallthrough;
     case 1:
         nxt_field_end_test_char(*p); p++;
-        /* Fall through. */
+        nxt_fallthrough;
     case 0:
         break;
     default:

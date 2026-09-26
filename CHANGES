@@ -1,6 +1,11 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Feature: the --hardening=[off|default|strict] configure option adds
+       compiler and linker hardening flags. Each flag is probed, and a
+       compiler that does not support a flag only loses that flag. The
+       default is "off", so a build without the option does not change.
+
     *) Feature: "PUT /certificates/<name>" replaces an existing certificate
        bundle in place. Main writes the bundle to a temporary file and
        renames it over the old one, so a crash never leaves a partial

@@ -39,6 +39,7 @@ Unit configuration summary:
   cgroupv2: .................. $NXT_HAVE_CGROUP
 
   debug logging: ............. $NXT_DEBUG
+  hardening: ................. $NXT_HARDENING
 
   fuzz engine: ............... "$NXT_FUZZ"
 

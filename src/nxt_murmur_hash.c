@@ -37,10 +37,10 @@ nxt_murmur_hash2(const void *data, size_t len)
     switch (len) {
     case 3:
         h ^= p[2] << 16;
-        /* Fall through. */
+        nxt_fallthrough;
     case 2:
         h ^= p[1] << 8;
-        /* Fall through. */
+        nxt_fallthrough;
     case 1:
         h ^= p[0];
         h *= m;
