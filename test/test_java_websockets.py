@@ -5,6 +5,7 @@ import pytest
 
 from unit.applications.lang.java import ApplicationJava
 from unit.applications.websockets import ApplicationWebsocket
+from unit.option import option
 
 prerequisites = {'modules': {'java': 'any'}}
 
@@ -1264,10 +1265,8 @@ def test_java_websockets_7_13_1__7_13_2():
     check_close(sock, 1002)
 
 
-def test_java_websockets_9_1_1__9_6_6(is_unsafe, system):
-    if not is_unsafe:
-        pytest.skip('unsafe, long run')
-
+@pytest.mark.skipif(not option.unsafe, reason='unsafe, long run')
+def test_java_websockets_9_1_1__9_6_6(system):
     client.load('websockets_mirror')
 
     assert 'success' in client.conf(
@@ -1695,10 +1694,8 @@ def test_java_websockets_async_threads():
     close_connection(sock)
 
 
-def test_java_websockets_async_16m(is_unsafe):
-    if not is_unsafe:
-        pytest.skip('unsafe, long run')
-
+@pytest.mark.skipif(not option.unsafe, reason='unsafe, long run')
+def test_java_websockets_async_16m():
     # 16 MiB is exactly the default send cap, so it is one frame.  Above the
     # cap a message is sent 8 KiB at a time, each part started from the
     # previous one's completion; lowering the cap to 8 KiB makes 2048 parts,

@@ -326,10 +326,11 @@ void nxt_unit_request_done(nxt_unit_request_info_t *req, int rc);
  * libunit reports the work finished by itself, once the request handler
  * returns; the application does not have to pair this call with anything.
  * That covers the requests libunit hands to the handler, not one taken with
- * nxt_unit_dequeue_request().  The router keeps one flag per worker, not a
- * count per context, so a worker running several contexts at once has the
- * first context's finish clear it.  PHP's fastcgi_finish_request() is the
- * caller this exists for, and PHP runs one context.
+ * nxt_unit_dequeue_request().  libunit tracks the state per context and the
+ * router counts the reports per worker, so several contexts of one worker
+ * may run detached work at once: the worker stays busy until the last of
+ * them returns.  PHP's fastcgi_finish_request() is the caller this exists
+ * for, and PHP runs one context.
  */
 void nxt_unit_request_done_detached(nxt_unit_request_info_t *req, int rc);
 

@@ -380,7 +380,8 @@ static void nxt_router_http_request_done(nxt_task_t *task, void *obj,
 static void nxt_router_app_prepare_request(nxt_task_t *task,
     nxt_request_rpc_data_t *req_rpc_data);
 static nxt_buf_t *nxt_router_prepare_msg(nxt_task_t *task,
-    nxt_http_request_t *r, nxt_app_t *app, const nxt_str_t *prefix);
+    nxt_http_request_t *r, nxt_app_t *app, const nxt_str_t *prefix,
+    nxt_http_status_t *status);
 
 static void nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data);
 static void nxt_router_adjust_idle_timer(nxt_task_t *task, void *obj,
@@ -7029,7 +7030,10 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
      * after the response went out, or a kill.  This is the only path that
      * runs for it then, so the count has to be settled here or the
      * application never reaches the zero nxt_router_free_app() asserts on.
-     * The matching application reference is dropped below, outside the lock.
+     * The process is gone, so every unit of work it was running goes with
+     * it, however many the counts hold.  The matching application
+     * reference, the one the first reason took, is dropped below, outside
+     * the lock.
      */
 
     detached = port->detached;
@@ -7515,6 +7519,7 @@ nxt_router_app_prepare_request(nxt_task_t *task,
     nxt_buf_t         *buf, *body;
     nxt_int_t         res;
     nxt_port_t        *port, *reply_port;
+    nxt_http_status_t  status;
 
     int                   notify;
     struct {
@@ -7535,13 +7540,14 @@ nxt_router_app_prepare_request(nxt_task_t *task,
     reply_port = task->thread->engine->port;
 
     buf = nxt_router_prepare_msg(task, req_rpc_data->request, app,
-                                 nxt_app_msg_prefix[app->type]);
+                                 nxt_app_msg_prefix[app->type], &status);
     if (nxt_slow_path(buf == NULL)) {
-        nxt_alert(task, "stream #%uD, app '%V': failed to prepare app message",
-                  req_rpc_data->stream, &app->name);
+        if (status == NXT_HTTP_INTERNAL_SERVER_ERROR) {
+            nxt_alert(task, "stream #%uD, app '%V': failed to prepare app "
+                      "message", req_rpc_data->stream, &app->name);
+        }
 
-        nxt_http_request_error(task, req_rpc_data->request,
-                               NXT_HTTP_INTERNAL_SERVER_ERROR);
+        nxt_http_request_error(task, req_rpc_data->request, status);
 
         return;
     }
@@ -7609,9 +7615,32 @@ nxt_router_app_prepare_request(nxt_task_t *task,
 
 
 
+/*
+ * Builds the nxt_unit_request_t for the application in shared memory.
+ *
+ * Every length that lands in a narrow field of the libunit protocol is
+ * checked before the buffer is allocated, and the request is refused rather
+ * than having the field truncated: a truncated length makes the application
+ * see a different string from the one that was copied (a 256-byte method
+ * arrived as an empty one), with the NUL terminator somewhere else.
+ *
+ *   - method_length is uint8_t, and the HTTP parser does not bound a method
+ *     (it is limited only by the header buffer): 501.
+ *   - a field's name_length is uint8_t.  nxt_http_parse_field_name() caps a
+ *     name at 255 bytes (NXT_HTTP_MAX_FIELD_NAME), which fits alone, but the
+ *     PHP/Perl/Ruby prefix "HTTP_" is added on top: names of 251..255 bytes
+ *     wrapped to 0..4.  431.
+ *   - version, the address and port texts are uint8_t as well but produced
+ *     by Unit itself; they are checked all the same, and fail with 500.
+ *   - the uint32_t lengths (server name, target, path, query, values) are
+ *     bounded by req_size <= PORT_MMAP_DATA_SIZE.
+ *
+ * On failure NULL is returned and *status says what to answer.
+ */
+
 static nxt_buf_t *
 nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
-    nxt_app_t *app, const nxt_str_t *prefix)
+    nxt_app_t *app, const nxt_str_t *prefix, nxt_http_status_t *status)
 {
     void                *target_pos, *query_pos;
     u_char              *pos, *end, *p, c;
@@ -7623,6 +7652,29 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     nxt_unit_field_t        *dst_field;
     nxt_http_fields_iter_t  iter, dup_iter;
     nxt_unit_request_t      *req;
+
+    *status = NXT_HTTP_INTERNAL_SERVER_ERROR;
+
+    if (nxt_slow_path(r->method->length > UINT8_MAX)) {
+        nxt_log(task, NXT_LOG_INFO, "request method of %uz bytes is too long "
+                "for the application protocol", r->method->length);
+
+        *status = NXT_HTTP_NOT_IMPLEMENTED;
+        return NULL;
+    }
+
+    if (nxt_slow_path(r->version.length > UINT8_MAX
+                      || r->remote->address_length > UINT8_MAX
+                      || r->local->address_length > UINT8_MAX
+                      || nxt_sockaddr_port_length(r->local) > UINT8_MAX))
+    {
+        nxt_alert(task, "request version or address too long for the "
+                  "application protocol");
+
+        return NULL;
+    }
+
+    /* Every length is of data the request holds, so the sum cannot wrap. */
 
     req_size = sizeof(nxt_unit_request_t)
                + r->method->length + 1
@@ -7642,6 +7694,15 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     {
         fields_count++;
 
+        if (nxt_slow_path(field->name_length + prefix->length > UINT8_MAX)) {
+            nxt_log(task, NXT_LOG_INFO, "header field name of %d bytes is "
+                    "too long for the application protocol with prefix "
+                    "\"%V\"", (int) field->name_length, prefix);
+
+            *status = NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE;
+            return NULL;
+        }
+
         req_size += field->name_length + prefix->length + 1
                     + field->value_length + 1;
     } nxt_http_fields_loop;
@@ -7649,8 +7710,8 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     req_size += fields_count * sizeof(nxt_unit_field_t);
 
     if (nxt_slow_path(req_size > PORT_MMAP_DATA_SIZE)) {
-        nxt_alert(task, "headers to big to fit in shared memory (%d)",
-                  (int) req_size);
+        nxt_alert(task, "headers too big to fit in shared memory (%uz)",
+                  req_size);
 
         return NULL;
     }
@@ -7752,6 +7813,7 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
 
         dst_field->hash = field->hash;
         dst_field->skip = 0;
+        /* Checked to fit uint8_t when req_size was summed. */
         dst_field->name_length = field->name_length + prefix->length;
         dst_field->value_length = field->value_length;
 
@@ -7893,6 +7955,30 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
 }
 
 
+#if (NXT_TESTS)
+
+/*
+ * For src/test/nxt_router_prepare_msg_test.c, which repeats this prototype:
+ * nxt_router.h cannot name nxt_http_status_t.
+ */
+
+nxt_buf_t *nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_app_t *app, nxt_bool_t use_http_prefix, nxt_http_status_t *status);
+
+
+nxt_buf_t *
+nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_app_t *app, nxt_bool_t use_http_prefix, nxt_http_status_t *status)
+{
+    return nxt_router_prepare_msg(task, r, app,
+                                  use_http_prefix ? &http_prefix
+                                                  : &empty_prefix,
+                                  status);
+}
+
+#endif
+
+
 static void
 nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
 {
@@ -8019,10 +8105,13 @@ nxt_router_http_request_release(nxt_task_t *task, void *obj, void *data)
  * field is never cleared, and the main port can be released while a sibling
  * port of the same process is still registered.
  *
- * Either edge may arrive with the port already in the state being asked
- * for, and both then do nothing: a start edge is idempotent because several
- * contexts of one worker can be detached at once, and a finish edge because
- * the worker's death has already settled the state.
+ * The application's edges are counted, not latched.  Several contexts of one
+ * worker can run detached work at once and the edge names none of them, so
+ * the port leaves the idle economy on the first start and rejoins it on the
+ * last finish, once the router has no abandoned request of its own left
+ * either.  app->detached_processes counts processes, so it moves on those two
+ * transitions only.  A finish with nothing to match -- a worker whose death
+ * has already settled the count, or a forged one -- changes nothing.
  */
 
 static void
@@ -8032,6 +8121,7 @@ nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid, uint8_t state)
     nxt_app_t          *app;
     nxt_port_t         *port;
     nxt_bool_t         changed, start_process, adjust_idle_timer;
+    const char         *alert;
     nxt_runtime_t      *rt;
     nxt_atomic_int_t   c;
 
@@ -8084,6 +8174,7 @@ nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid, uint8_t state)
     nxt_debug(task, "app '%V' port %PI:%d detached state %d",
               &app->name, port->pid, port->id, (int) state);
 
+    alert = NULL;
     changed = 0;
     start_process = 0;
     adjust_idle_timer = 0;
@@ -8093,41 +8184,64 @@ nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid, uint8_t state)
     if (state == NXT_PORT_DETACHED_START) {
 
         /*
-         * A reason of the application's own, held beside the router's count
-         * of requests it gave up on: neither clear may drop the other.
+         * A reason of the application's own, counted beside the router's
+         * count of requests it gave up on: neither may settle the other.
+         *
+         * Saturate rather than wrap.  The count is bounded by the contexts
+         * of one worker, so the maximum is out of reach for a sound sender;
+         * a wrap would read as "no detached work" and hand a running worker
+         * back to the reaper.
          */
-        port->detached_app = 1;
 
-        if (port->detached == 0) {
-            port->detached = 1;
-            app->detached_processes++;
-            changed = 1;
+        if (nxt_slow_path(port->detached_app == UINT32_MAX)) {
+            alert = "sent a detached start at the maximum count";
 
-            /*
-             * The worker may already have been parked as idle.  libunit
-             * sends the start edge before the last response message, but
-             * that only orders the two on the wire: the response is
-             * answered by the engine that owns the request, this by the
-             * main thread, and a request that was failed rather than
-             * answered -- a "limits": {"timeout"} expiry, an error -- runs
-             * nxt_router_app_port_release() with no start edge in sight at
-             * all, so the port can have been sitting in idle_ports for as
-             * long as the application chose to keep running.
-             *
-             * Unwind it here, exactly as an acknowledgement does.  Leaving
-             * it in place would be worse than not having this message: the
-             * reaper would QUIT a worker that is still executing -- the bug
-             * this exists to fix -- and would clear ->app on the way, so
-             * nxt_router_app_port_close() would never run and the count and
-             * the application reference below would never be settled.
-             */
+        } else {
+            port->detached_app++;
 
-            start_process = nxt_router_app_port_busy(task, app, port,
-                                                     "detached");
+            if (port->detached == 0) {
+                port->detached = 1;
+                app->detached_processes++;
+                changed = 1;
+
+                /*
+                 * The worker may already have been parked as idle.  libunit
+                 * sends the start edge before the last response message, but
+                 * that only orders the two on the wire: the response is
+                 * answered by the engine that owns the request, this by the
+                 * main thread, and a request that was failed rather than
+                 * answered -- a "limits": {"timeout"} expiry, an error --
+                 * runs nxt_router_app_port_release() with no start edge in
+                 * sight at all, so the port can have been sitting in
+                 * idle_ports for as long as the application chose to keep
+                 * running.
+                 *
+                 * Unwind it here, exactly as an acknowledgement does.
+                 * Leaving it in place would be worse than not having this
+                 * message: the reaper would QUIT a worker that is still
+                 * executing -- the bug this exists to fix -- and would clear
+                 * ->app on the way, so nxt_router_app_port_close() would
+                 * never run and the count and the application reference
+                 * below would never be settled.
+                 */
+
+                start_process = nxt_router_app_port_busy(task, app, port,
+                                                         "detached");
+            }
         }
 
-    } else {
-        port->detached_app = 0;
+    } else if (nxt_slow_path(port->detached_app == 0)) {
+
+        /*
+         * An unmatched finish: a worker whose death has already settled the
+         * count, one otherwise out of step with the router, or a forged
+         * edge.  Leave the count at zero and touch neither
+         * app->detached_processes nor the reference.
+         */
+
+        alert = "sent an unmatched detached finish";
+
+    } else if (--port->detached_app == 0) {
 
         /*
          * The port leaves the detached state only when no reason is left:
@@ -8152,6 +8266,21 @@ nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid, uint8_t state)
 
     nxt_thread_mutex_unlock(&app->mutex);
 
+    /*
+     * The application can send a refused edge in a loop, so it is an alert
+     * once per port and debug output after that.
+     */
+
+    if (nxt_slow_path(alert != NULL)) {
+        if (port->detached_alerted == 0) {
+            port->detached_alerted = 1;
+            nxt_alert(task, "detached_handler: %PI %s", pid, alert);
+
+        } else {
+            nxt_debug(task, "detached_handler: %PI %s", pid, alert);
+        }
+    }
+
     if (adjust_idle_timer) {
         nxt_router_app_use(task, app, 1);
         nxt_event_engine_post(app->engine, &app->adjust_idle_work);
@@ -8174,9 +8303,11 @@ nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid, uint8_t state)
      * nxt_request_rpc_data_unlink() has already dropped its reference, so a
      * configuration reload could free the application out from under a
      * process still executing.  The finish edge that changed the state
-     * returns it, and an edge that changed nothing returns only its own, so
-     * a repeated start cannot take a second reference that the single
-     * finish never returns.
+     * returns it, and an edge that changed nothing returns only its own.
+     * One reference per process, then, not per counted edge: the inner
+     * starts and finishes take one and give it straight back, and a start
+     * that found the router's own mark already set leaves that reference to
+     * nxt_router_app_abandoned_settle().
      */
 
     drop = 1;
