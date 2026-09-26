@@ -196,6 +196,25 @@ nxt_feature_test="static void f(void) __attribute__ ((__unused__));
 . auto/feature
 
 
+nxt_feature="GCC __attribute__ fallthrough"
+nxt_feature_name=NXT_HAVE_GCC_ATTRIBUTE_FALLTHROUGH
+nxt_feature_run=
+nxt_feature_incs=
+nxt_feature_libs=
+nxt_feature_test="int main(int argc, char **argv) {
+                      switch (argc) {
+                      case 1:
+                          argc++;
+                          __attribute__ ((__fallthrough__));
+                      default:
+                          break;
+                      }
+
+                      return !argc;
+                  }"
+. auto/feature
+
+
 nxt_feature="GCC __attribute__ nonstring"
 nxt_feature_name=NXT_HAVE_GCC_ATTRIBUTE_NONSTRING
 nxt_feature_run=

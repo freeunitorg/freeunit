@@ -23,6 +23,15 @@ of objects: [{"Name": null}, {"Name": "!X"}].
 
 <change type="feature">
 <para>
+the --hardening=[off|default|strict] configure option adds compiler and
+linker hardening flags.  Each flag is probed, and a compiler that does not
+support a flag only loses that flag.  The default is "off", so a build
+without the option does not change.
+</para>
+</change>
+
+<change type="feature">
+<para>
 "PUT /certificates/&lt;name&gt;" replaces an existing certificate bundle in
 place.  Main writes the bundle to a temporary file and renames it over the
 old one, so a crash never leaves a partial bundle.  When the current
@@ -48,6 +57,18 @@ which drops them.
 the main process accepted a second WHOAMI from an application process, and a
 parent that is not a prototype.  The process was then linked into its parent's
 list twice, which corrupted the list in main.  Such a message is now refused.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a request could reach the application with a truncated method or header name
+length.  The application protocol stores method and field name lengths in a
+single byte.  When a method exceeded 255 bytes, the router wrapped the length.
+For PHP, Perl, and Ruby, header names carry the "HTTP_" prefix, causing names
+of 251 to 255 bytes to wrap.  The router now refuses a method longer than
+255 bytes with 501, and an overflowing header name with 431.  Both are logged
+at "info".  Other languages continue to accept header names up to 255 bytes.
 </para>
 </change>
 
@@ -641,6 +662,50 @@ connection to 10 MB of payload that the application has not received yet
 receive()); a single frame larger than that is still accepted when nothing else
 is waiting.  A fragmented message also left a count behind that lowered the
 limit applied to the next message.
+a byte-range request from a client that refused the identity coding is no
+longer answered with identity bytes.  A range is served as identity, so
+Range together with "Accept-Encoding: identity;q=0" returned a 206 carrying
+exactly the bytes the client said it would not take; the range is now
+ignored and the full 200 is sent in a coding the client accepts.  An
+unsatisfiable range from such a client is no longer answered with 416 either.
+A request that accepts no coding at all is still 406.  Several Accept-Encoding
+lines in one request are now read as one comma-joined value; previously only the
+first was consulted.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a malformed weight in Accept-Encoding is no longer read as a refusal.  The
+qvalue was converted with strtod(), which takes no digits at all from
+"identity;q=" and from "identity;q=abc" and reports zero, so either one
+answered 406 to a client that had refused nothing; "q=0x0" and "q=0e0" did the
+same.  An element whose weight does not match the grammar of RFC 9110
+Sect. 12.4.2 is now ignored, as an element naming an unknown coding already
+was.  This also removes "q=nan", which passed the 0-to-1 range check and then
+outranked every real weight.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a negotiation failure on Accept-Encoding was answered with 503 instead of 406
+when the response came from an application.  The router treated every result
+of the acceptability check other than success as a server error; only the
+static path reported the 406.
+</para>
+</change>
+
+<change type="change">
+<para>
+unitd, libunit.a and the language modules no longer contain the test hooks
+compiled under "#if (NXT_TESTS)".  "./configure --tests" used to define the
+macro for the whole build, and the deb and rpm packages pass "--tests", so
+every released package from 0.2 to 1.36.1 carried them: the nxt_random_test()
+entry point in all of them, and in 1.36.0 and 1.36.1 the fault-injection
+branches and counters in nxt_mp.c, nxt_port_rpc.c and nxt_port_socket.c, two
+of which were exported symbols.  The hooks now go only into the test programs.
+A build without "--tests" is unchanged.
 </para>
 </change>
 

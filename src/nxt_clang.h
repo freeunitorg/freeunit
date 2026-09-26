@@ -12,6 +12,19 @@
 #define nxt_noinline   __attribute__((noinline))
 #define nxt_cdecl
 
+/*
+ * An intended switch fall-through.  It is a statement and not a comment.
+ * Thus -Wimplicit-fallthrough accepts it under both GCC and Clang.  That
+ * warning is part of --hardening=strict, see auto/cc/hardening.  A "Fall
+ * through." comment alone satisfies the default heuristic of GCC.  It does
+ * not satisfy Clang.
+ */
+#if (NXT_HAVE_GCC_ATTRIBUTE_FALLTHROUGH)
+#define nxt_fallthrough  __attribute__((__fallthrough__))
+#else
+#define nxt_fallthrough
+#endif
+
 
 /*
  * nxt_static_assert() fails the compilation when the condition does not

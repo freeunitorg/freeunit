@@ -2982,7 +2982,7 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
             return;
         }
 
-        /* Fall through. */
+        nxt_fallthrough;
 
     default:
     case NXT_ERROR:
