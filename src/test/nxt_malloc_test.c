@@ -119,5 +119,7 @@ nxt_malloc_test(nxt_thread_t *thr)
                       s[-1].size + 1, s->size, s->alignment, s->tight);
     }
 
+    nxt_log_error(NXT_LOG_NOTICE, thr->log, "malloc test passed");
+
     return NXT_OK;
 }
