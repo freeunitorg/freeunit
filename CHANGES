@@ -15,6 +15,12 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        application process, which keeps counting against "processes" until
        it answers.
 
+    *) Bugfix: an upstream 1xx interim response ("100 Continue", "103 Early
+       Hints") was relayed to the client as the response, with the final
+       response relayed as its body. The proxy now drops interim responses
+       (101 excepted) and relays the final one; more than ten of them, or
+       one larger than the proxy header buffer, fails the request with 502.
+
     *) Change: a certificate bundle whose private key does not belong to
        its first certificate is now refused at upload with 400 "Invalid
        certificate.". Before, the bundle was stored, and the mismatch
@@ -452,6 +458,21 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        array instead of its own; and a read-only heap buffer threw
        ReadOnlyBufferException instead of being sent. Both the blocking and
        the asynchronous remote were affected (#486).
+
+    *) Bugfix: the Python ASGI module refused a WebSocket message larger
+       than 1 MB whatever "max_frame_size" was set to. The module carried a
+       private 1 MB limit that no configuration ever wrote and charged the
+       fragments of a message against it, while the configured value is
+       checked by the router per frame: a 4 MB message was closed with 1009
+       where "max_frame_size" was 32 MB, and at the default size a client
+       that split a larger message into small frames was refused as well.
+       Each frame is now limited by "max_frame_size" alone. The module
+       only limits a connection to 10 MB of payload that the application
+       has not received yet (fragments of a message in progress and
+       complete messages waiting for receive()); a single frame larger
+       than that is still accepted when nothing else is waiting. A
+       fragmented message also left a count behind that lowered the limit
+       applied to the next message.
 
 
 Changes with FreeUnit 1.36.1                                     28 Aug 2026

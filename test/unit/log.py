@@ -44,10 +44,9 @@ class Log:
 
         assert not alerts, 'alert(s)'
 
-        if not option.skip_sanitizer:
-            sanitizer_errors = re.findall('.+Sanitizer.+', log)
+        sanitizer_errors = re.findall('.+Sanitizer.+', log)
 
-            assert not sanitizer_errors, 'sanitizer error(s)'
+        assert not sanitizer_errors, 'sanitizer error(s)'
 
         if found and option.detailed:
             print('skipped.')
