@@ -277,3 +277,21 @@ def test_php_compression_shm_not_leaked():
             hashlib.sha256(gzip.decompress(body)).hexdigest()
             == headers['X-Body-Sha256']
         ), f'body of request {i}'
+
+
+def test_php_compression_identity_refused():
+    # An application response is negotiated like a static one.  The client
+    # refuses identity and names no coding Unit can apply, so no acceptable
+    # representation is left and the answer is 406.
+    #
+    # nxt_router_response_ready_handler() used to read every non-NXT_OK
+    # result from nxt_http_comp_check_acceptable() as a server error and take
+    # the generic "fail:" path, which answers 503 -- a negotiation failure
+    # reported as the server being unable to serve anybody.
+    client.load('comp_large_body')
+    configure_compression()
+
+    status, headers, _ = raw_get('/', 'identity;q=0')
+
+    assert status == 406, 'no representation left for the application body'
+    assert 'Content-Encoding' not in headers
