@@ -1060,6 +1060,15 @@ nxt_kqueue_conn_io_read(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "kqueue conn read fd:%d", c->socket.fd);
 
+    /*
+     * As in nxt_conn_io_read(): a closed conn must not reach the EOF path.
+     * An EOF with socket.error set runs only the error path, not also the
+     * read state's close_handler.
+     */
+    if (c->socket.error != 0 || c->block_read) {
+        return;
+    }
+
     if (c->socket.kq_available == 0 && c->socket.kq_eof) {
         nxt_debug(task, "kevent fd:%d eof", c->socket.fd);
 
