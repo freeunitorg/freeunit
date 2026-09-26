@@ -202,6 +202,25 @@ END
 
 done
 
+nxt_src=src/test/nxt_queue_bench.c
+nxt_obj=src/test/nxt_queue_bench.o
+nxt_dep=src/test/nxt_queue_bench.dep
+nxt_dep_flags=`nxt_gen_dep_flags`
+nxt_dep_post=`nxt_gen_dep_post`
+cat << END >> $NXT_MAKEFILE
+
+$NXT_BUILD_DIR/$nxt_obj: $nxt_src $NXT_VERSION_H
+	\$(PP_CC) \$@
+	\$(v)\$(CC) -c \$(CFLAGS) \$(NXT_LIB_INCS) $NXT_LIB_AUX_CFLAGS \\
+	-o $NXT_BUILD_DIR/$nxt_obj \\
+	$nxt_dep_flags \\
+	$nxt_src
+	$nxt_dep_post
+
+-include $NXT_BUILD_DIR/$nxt_dep
+
+END
+
 nxt_src=src/test/nxt_cq_test.c
 nxt_obj=src/test/nxt_ncq_test.o
 nxt_dep=src/test/nxt_ncq_test.dep
@@ -263,6 +282,7 @@ if [ $NXT_TESTS = YES ]; then
 tests:		$NXT_BUILD_DIR/tests \\
 			$NXT_BUILD_DIR/ncq_test \\
 			$NXT_BUILD_DIR/vbcq_test \\
+			$NXT_BUILD_DIR/queue_bench \\
 			$NXT_BUILD_DIR/unit_app_test $NXT_BUILD_DIR/unit_websocket_chat \\
 			$NXT_BUILD_DIR/unit_websocket_echo \\
 			$NXT_BUILD_DIR/unit_close_test \\
@@ -293,6 +313,15 @@ $NXT_BUILD_DIR/vbcq_test: $NXT_BUILD_DIR/src/test/nxt_vbcq_test.o \\
 	\$(PP_LD) \$@
 	\$(v)\$(NXT_EXEC_LINK) -o $NXT_BUILD_DIR/vbcq_test \\
 		\$(CFLAGS) $NXT_BUILD_DIR/src/test/nxt_vbcq_test.o \\
+		$NXT_BUILD_DIR/lib/$NXT_LIB_STATIC \$(NXT_OTEL_LIB_STATIC) \\
+		$NXT_LD_OPT $NXT_LIBM $NXT_LIBS $NXT_LIB_AUX_LIBS
+
+$NXT_BUILD_DIR/queue_bench: $NXT_BUILD_DIR/src/test/nxt_queue_bench.o \\
+			$NXT_BUILD_DIR/lib/$NXT_LIB_STATIC \\
+			\$(NXT_OTEL_LIB_STATIC)
+	\$(PP_LD) \$@
+	\$(v)\$(NXT_EXEC_LINK) -o $NXT_BUILD_DIR/queue_bench \\
+		\$(CFLAGS) $NXT_BUILD_DIR/src/test/nxt_queue_bench.o \\
 		$NXT_BUILD_DIR/lib/$NXT_LIB_STATIC \$(NXT_OTEL_LIB_STATIC) \\
 		$NXT_LD_OPT $NXT_LIBM $NXT_LIBS $NXT_LIB_AUX_LIBS
 

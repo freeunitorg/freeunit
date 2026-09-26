@@ -1,0 +1,80 @@
+name: "Perf gates (disasm + layout)"
+
+# Codegen and struct-layout checks for the IPC hot paths (tools/perf/README.md).
+# Non-blocking until the baselines have proven stable.
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'auto/**'
+      - 'configure'
+      - 'tools/perf/**'
+      - '.github/workflows/perf-gates.yml'
+  push:
+    branches: master
+    paths:
+      - 'src/**'
+      - 'auto/**'
+      - 'configure'
+      - 'tools/perf/**'
+      - '.github/workflows/perf-gates.yml'
+
+concurrency:
+  # A push gets its own group, so no queued commit is dropped.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  disasm-diff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Build the baseline from the base commit
+        id: base
+        run: |
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          git worktree add ../base "$base"
+          if [ ! -x ../base/tools/perf/disasm-diff.sh ]; then
+              echo "::notice::base commit has no disasm-diff.sh; skipping"
+              echo "skip=1" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+          (cd ../base && tools/perf/disasm-diff.sh --cc clang --update)
+          mkdir -p tools/perf/baseline
+          cp -r ../base/tools/perf/baseline/. tools/perf/baseline/
+
+      - name: tools/perf/disasm-diff.sh --cc clang
+        if: steps.base.outputs.skip != '1'
+        continue-on-error: true
+        run: tools/perf/disasm-diff.sh --cc clang
+
+  layout-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      # pahole; without it layout-check.sh exits before checking anything.
+      - name: Install dwarves
+        run: sudo apt-get update && sudo apt-get install -y dwarves
+
+      - name: tools/perf/layout-check.sh --cc clang
+        continue-on-error: true
+        run: tools/perf/layout-check.sh --cc clang
+
+      - name: Install musl-tools
+        id: musl_install
+        continue-on-error: true
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: tools/perf/layout-check.sh --cc musl-gcc
+        if: steps.musl_install.outcome == 'success'
+        continue-on-error: true
+        run: |
+          tools/perf/layout-check.sh --cc musl-gcc \
+              --configure-opt=--no-regex

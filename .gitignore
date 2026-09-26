@@ -1,4 +1,10 @@
 build/
+build-disasm-*/
+build-disasm-*.configure.log
+build-disasm-*.build.log
+build-disasm-*.harness.log
+build-layout-*/
+build-layout-*.log
 Makefile
 *.pyc
 __pycache__/
@@ -22,3 +28,4 @@ test/fake_otlp/target/
 /pkg/eol/build.log
 /clang-ast/
 /AGENTS.md
+tools/perf/baseline/
