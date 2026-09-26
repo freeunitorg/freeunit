@@ -1,0 +1,10 @@
+# One function name on each line.  G6 (tools/gates/run_gates.sh -g 6)
+# checks each function.  The comment directly above the definition of the
+# function, somewhere under src/, must have a "@contract" line.  The
+# script ignores blank lines and lines that start with '#'.
+#
+# The list is empty by default.  Nothing is required yet.  Add a name here
+# when the pre-conditions and post-conditions of a function are important.
+# A reviewer must then be able to read them in one place.  The reviewer
+# must not have to rebuild them from the call sites.  Write the @contract
+# comment above the definition of the function first.

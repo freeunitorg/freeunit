@@ -1,0 +1,16 @@
+id: narrowing-to-proto
+language: c
+severity: warning
+message: >-
+  A length/size value is cast directly to a narrower integer type. Check
+  the range first (e.g. "if (x > UINT32_MAX) { return NXT_ERROR; }") and
+  assign without a cast, so a value that does not fit is rejected rather
+  than silently truncated onto the wire or into a protocol field.
+rule:
+  any:
+    - pattern: (uint8_t) $X->$LENFIELD
+    - pattern: (uint16_t) $X->$LENFIELD
+    - pattern: (uint32_t) $X->$LENFIELD
+constraints:
+  LENFIELD:
+    regex: "(len|length|size)$"

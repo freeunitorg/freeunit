@@ -1,0 +1,19 @@
+id: len-add-to-checked
+language: c
+severity: hint
+message: >-
+  A length/offset field is added to another and assigned directly. If either
+  operand can come from a peer, use nxt_size_add() (src/nxt_checked.h) so the
+  overflow is caught instead of wrapping silently.
+note: >-
+  Lint only: this fires on plenty of additions that are already known-safe
+  (e.g. two compile-time constants, or two values already bounds-checked
+  upstream). It exists to prompt a second look at the call site, not to gate
+  the build.
+rule:
+  any:
+    - pattern: $X = $A->$LENFIELD + $B->$LENFIELD2;
+    - pattern: $X = $A->$LENFIELD + $B;
+constraints:
+  LENFIELD:
+    regex: "(len|length|size)$"

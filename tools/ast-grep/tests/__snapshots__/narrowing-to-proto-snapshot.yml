@@ -1,0 +1,11 @@
+id: narrowing-to-proto
+snapshots:
+  ? |
+    void f(nxt_buf_t *b) {
+        uint8_t n = (uint8_t) b->len;
+    }
+  : labels:
+    - source: (uint8_t) b->len
+      style: primary
+      start: 39
+      end: 55

@@ -1,0 +1,112 @@
+name: "Lint (ast-grep)"
+
+# Two gates run on each pull request.
+#
+# ast-grep: the job fails on a violation that is not in
+# tools/ast-grep/baseline.json.
+#
+# require-tests: a change to production code under src/ must come with a
+# change under test/ or src/test/.  The PR can opt out in two ways.  It
+# can have the "no-test-needed" label.  Or one of its commits can have a
+# "No-Test-Reason: <why>" trailer with a value that is not empty.
+
+on:
+  pull_request:
+    types: [ opened, synchronize, reopened, labeled, unlabeled ]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Each push gets its own group.  Thus no queued commit is dropped.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ast-grep:
+    name: "ast-grep baseline"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install ast-grep
+        uses: taiki-e/install-action@v2
+        with:
+          tool: ast-grep
+
+      - name: Test the rules
+        run: ast-grep test -c tools/ast-grep/sgconfig.yml
+
+      - name: Check for new violations
+        run: |
+          python3 tools/ast-grep/check_baseline_test.py
+          python3 tools/ast-grep/check_baseline.py
+
+  require-tests:
+    name: "require a test for a src/ change"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check the diff has a matching test change
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: |
+          if echo "$LABELS" | grep -qi '"no-test-needed"'; then
+            echo "opted out via the 'no-test-needed' label"
+            exit 0
+          fi
+
+          # Only a real trailer counts.  Text in the commit body does not.
+          # The trailer value must not be blank.
+          reasons="$(git log \
+              --format='%(trailers:key=No-Test-Reason,valueonly)' \
+              "$BASE_SHA..$HEAD_SHA" | grep -E '[^[:space:]]' || true)"
+
+          if [ -n "$reasons" ]; then
+            echo "opted out via a No-Test-Reason: trailer:"
+            echo "$reasons"
+            exit 0
+          fi
+
+          # --no-renames: a rename out of src/ lists its old src/ path
+          # as a deletion, so it still needs a test.
+          changed="$(git diff --name-only --no-renames \
+              "$BASE_SHA...$HEAD_SHA")"
+
+          # Each file under src/ is production code (C, C++, JS, Java,
+          # Rust and build files).  The tests in src/test/ and the docs
+          # are not.
+          src_changed="$(echo "$changed" \
+            | grep -E '^src/' \
+            | grep -vE '^src/test/|\.md$|/\.gitignore$' || true)"
+
+          if [ -z "$src_changed" ]; then
+            echo "no production src/ changes; nothing to require"
+            exit 0
+          fi
+
+          # Count added, changed and renamed tests only.  A deleted test
+          # covers nothing.
+          test_changed="$(git diff --name-only --diff-filter=ACMR \
+              "$BASE_SHA...$HEAD_SHA" \
+            | grep -E '^(test/|src/test/)' || true)"
+
+          if [ -n "$test_changed" ]; then
+            echo "src/ change is covered by a test/ or src/test/ change"
+            exit 0
+          fi
+
+          echo "::error::This PR changes production files under src/:"
+          echo "$src_changed"
+          echo
+          echo "::error::...without touching test/ or src/test/. Add a test," \
+               "or opt out with the 'no-test-needed' label or a" \
+               "'No-Test-Reason: <why>' trailer on a commit in this PR."
+          exit 1

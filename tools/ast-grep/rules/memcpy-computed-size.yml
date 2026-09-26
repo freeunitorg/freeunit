@@ -1,0 +1,15 @@
+id: memcpy-computed-size
+language: c
+severity: warning
+message: >-
+  memcpy()/memmove() size is a computed expression (an addition or
+  subtraction), not a single checked variable. Compute it first and pass
+  the checked result: for a + b use nxt_size_add() (src/nxt_checked.h);
+  for a - b check the order first (e.g. "if (a < b) { return NXT_ERROR; }"),
+  so a wrapped size cannot turn into an overread/overwrite.
+rule:
+  any:
+    - pattern: memcpy($DST, $SRC, $A + $B)
+    - pattern: memcpy($DST, $SRC, $A - $B)
+    - pattern: memmove($DST, $SRC, $A + $B)
+    - pattern: memmove($DST, $SRC, $A - $B)

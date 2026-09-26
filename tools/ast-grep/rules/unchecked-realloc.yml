@@ -1,0 +1,10 @@
+id: unchecked-realloc
+language: c
+severity: warning
+message: >-
+  realloc() result is assigned straight back to the pointer being resized.
+  On failure realloc() returns NULL and leaves the original allocation
+  intact; this overwrites the only reference to it, leaking it, and then
+  dereferences NULL. Assign to a temporary and check it first.
+rule:
+  pattern: $X = realloc($X, $$$);

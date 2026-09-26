@@ -1,0 +1,17 @@
+id: len-add-to-checked
+valid:
+  - |
+    nxt_int_t f(nxt_buf_t *a, nxt_buf_t *b, size_t *out) {
+        if (nxt_size_add(a->len, b->len, out)) {
+            return NXT_ERROR;
+        }
+
+        return NXT_OK;
+    }
+invalid:
+  - |
+    void f(nxt_buf_t *a, nxt_buf_t *b) {
+        size_t total;
+
+        total = a->len + b->len;
+    }

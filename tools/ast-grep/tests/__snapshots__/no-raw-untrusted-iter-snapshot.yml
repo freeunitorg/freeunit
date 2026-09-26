@@ -1,0 +1,13 @@
+id: no-raw-untrusted-iter
+snapshots:
+  ? |
+    void copy(char *dst, char *src, size_t n) {
+        while (n--) {
+            *dst++ = *src++;
+        }
+    }
+  : labels:
+    - source: '*dst++ = *src++;'
+      style: primary
+      start: 70
+      end: 86
