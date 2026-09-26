@@ -930,15 +930,14 @@ nxt_h1p_transfer_encoding(void *ctx, nxt_http_field_t *field, uintptr_t data)
 static void
 nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
 {
-    size_t             size, body_length, body_buffer_size, body_rest;
+    size_t             size, body_length, body_rest;
     ssize_t            res;
     nxt_buf_t          *in, *b, *out, *chunk;
+    nxt_int_t          ret;
     nxt_conn_t         *c;
     nxt_h1proto_t      *h1p;
     nxt_socket_conf_t  *skcf;
     nxt_http_status_t  status;
-
-    static const nxt_str_t tmp_name_pattern = nxt_string("/req-XXXXXXXX");
 
     h1p = r->proto.h1;
     skcf = r->conf->socket_conf;
@@ -989,61 +988,13 @@ nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
 
     body_length = (size_t) r->content_length_n;
 
-    body_buffer_size = nxt_min(skcf->body_buffer_size, body_length);
-
-    if (body_length > body_buffer_size) {
-        nxt_str_t  *tmp_path, tmp_name;
-
-        tmp_path = &skcf->body_temp_path;
-
-        tmp_name.length = tmp_path->length + tmp_name_pattern.length;
-
-        b = nxt_buf_file_alloc(r->mem_pool,
-                               body_buffer_size + sizeof(nxt_file_t)
-                               + tmp_name.length + 1, 0);
-        if (nxt_slow_path(b == NULL)) {
-            status = NXT_HTTP_INTERNAL_SERVER_ERROR;
-            goto error;
-        }
-
-        tmp_name.start = nxt_pointer_to(b->mem.start, sizeof(nxt_file_t));
-
-        memcpy(tmp_name.start, tmp_path->start, tmp_path->length);
-        memcpy(tmp_name.start + tmp_path->length, tmp_name_pattern.start,
-               tmp_name_pattern.length);
-        tmp_name.start[tmp_name.length] = '\0';
-
-        b->file = (nxt_file_t *) b->mem.start;
-        nxt_memzero(b->file, sizeof(nxt_file_t));
-        b->file->fd = -1;
-        b->file->size = body_length;
-
-        b->mem.start += sizeof(nxt_file_t) + tmp_name.length + 1;
-        b->mem.pos = b->mem.start;
-        b->mem.free = b->mem.start;
-
-        b->file->fd = mkstemp((char *) tmp_name.start);
-        if (nxt_slow_path(b->file->fd == -1)) {
-            nxt_alert(task, "mkstemp(%s) failed %E", tmp_name.start, nxt_errno);
-
-            status = NXT_HTTP_INTERNAL_SERVER_ERROR;
-            goto error;
-        }
-
-        nxt_debug(task, "create body tmp file \"%V\", %d",
-                  &tmp_name, b->file->fd);
-
-        unlink((char *) tmp_name.start);
-
-    } else {
-        b = nxt_buf_mem_alloc(r->mem_pool, body_buffer_size, 0);
-        if (nxt_slow_path(b == NULL)) {
-            status = NXT_HTTP_INTERNAL_SERVER_ERROR;
-            goto error;
-        }
+    ret = nxt_http_request_body_alloc(task, r, body_length);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        status = NXT_HTTP_INTERNAL_SERVER_ERROR;
+        goto error;
     }
 
-    r->body = b;
+    b = r->body;
 
     body_rest = r->chunked ? 1 : body_length;
 
@@ -1102,7 +1053,7 @@ nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
             }
 
         } else {
-            size = nxt_min(body_buffer_size, size);
+            size = nxt_min(body_length, size);
             b->mem.free = nxt_cpymem(b->mem.free, in->mem.pos, size);
 
             in->mem.pos += size;

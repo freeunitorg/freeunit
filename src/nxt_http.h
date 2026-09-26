@@ -438,6 +438,8 @@ nxt_http_request_t *nxt_http_request_create(nxt_task_t *task);
 void nxt_http_request_error(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_status_t status);
 void nxt_http_request_read_body(nxt_task_t *task, nxt_http_request_t *r);
+nxt_int_t nxt_http_request_body_alloc(nxt_task_t *task, nxt_http_request_t *r,
+    size_t body_length);
 void nxt_http_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_work_handler_t body_handler, void *data);
 void nxt_http_request_ws_frame_start(nxt_task_t *task, nxt_http_request_t *r,
@@ -454,6 +456,7 @@ void nxt_http_request_close_handler(nxt_task_t *task, void *obj, void *data);
 
 nxt_int_t nxt_http_request_host(void *ctx, nxt_http_field_t *field,
     uintptr_t data);
+nxt_int_t nxt_http_validate_host(nxt_str_t *host, nxt_mp_t *mp);
 nxt_int_t nxt_http_request_field(void *ctx, nxt_http_field_t *field,
     uintptr_t offset);
 nxt_int_t nxt_http_request_content_length(void *ctx, nxt_http_field_t *field,
