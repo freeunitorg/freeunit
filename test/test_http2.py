@@ -1763,7 +1763,7 @@ def test_http2_refused_after_goaway():
     assert_serves()
 
 
-def test_http2_shutdown_idle():
+def test_http2_shutdown_idle(requires_restart):
     need_h2()
     load_return()
 
@@ -1788,7 +1788,7 @@ def test_http2_shutdown_idle():
         c.close()
 
 
-def test_http2_shutdown_streams():
+def test_http2_shutdown_streams(requires_restart):
     need_h2()
     load_drain()
 
@@ -2298,7 +2298,7 @@ def test_http2_fail_before_body(path):
     assert_serves()
 
 
-def test_http2_fail_before_body_leak(search_in_file):
+def test_http2_fail_before_body_leak(requires_restart, search_in_file):
     need_h2()
 
     # The request pool of test_http2_fail_before_body leaked when the body
