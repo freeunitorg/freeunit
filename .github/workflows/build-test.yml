@@ -876,14 +876,16 @@ jobs:
           sudo apt-get -y update
           sudo apt-get -y install build-essential libssl-dev libpcre2-dev clang
 
-      - name: Configure unit (ASan+LSan, --tests)
+      # -fno-sanitize-recover: the first UBSan report fails the job.
+      # nxt_conf_map_object_test fails only under UBSan.
+      - name: Configure unit (ASan+LSan+UBSan, --tests)
         run: |
           ./configure \
             --cc=clang \
             --debug \
             --tests \
-            --cc-opt="-fsanitize=address -fno-omit-frame-pointer -g" \
-            --ld-opt="-fsanitize=address"
+            --cc-opt="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g" \
+            --ld-opt="-fsanitize=address,undefined"
 
       - name: Build C tests
         run: make -j4 tests
