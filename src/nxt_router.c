@@ -7956,23 +7956,18 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
 
 #if (NXT_TESTS)
 
-/*
- * For src/test/nxt_router_prepare_msg_test.c, which repeats this prototype:
- * nxt_router.h cannot name nxt_http_status_t.
- */
-
-nxt_buf_t *nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
-    nxt_app_t *app, nxt_bool_t use_http_prefix, nxt_http_status_t *status);
-
-
 nxt_buf_t *
 nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
-    nxt_app_t *app, nxt_bool_t use_http_prefix, nxt_http_status_t *status)
+    nxt_app_t *app, nxt_uint_t *status)
 {
-    return nxt_router_prepare_msg(task, r, app,
-                                  use_http_prefix ? &http_prefix
-                                                  : &empty_prefix,
-                                  status);
+    nxt_buf_t          *b;
+    nxt_http_status_t  st;
+
+    b = nxt_router_prepare_msg(task, r, app, nxt_app_msg_prefix[app->type],
+                               &st);
+    *status = st;
+
+    return b;
 }
 
 #endif
