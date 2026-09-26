@@ -39,12 +39,13 @@ from conftest import run_process
 from unit.applications.proto import ApplicationProto
 from unit.option import option
 from unit.utils import waitforsocket
+from unit import port as port_map
 
 client = ApplicationProto()
 
 # Reserved in test/fake_upstream/README.md's port registry; 7980-7982
 # belong to test/fake_otlp.
-UPSTREAM_PORT = 7978
+UPSTREAM_PORT = port_map.port(7978)
 
 # What the upstream answers, keyed by the request target Unit forwards.
 # Every one of these closes the connection right after writing what is here:
@@ -143,7 +144,7 @@ def pipeline(method, target):
     sock.settimeout(10)
 
     try:
-        sock.connect(('127.0.0.1', 8080))
+        sock.connect(('127.0.0.1', port_map.port(8080)))
         sock.sendall(request.encode())
 
         data = b''

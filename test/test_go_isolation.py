@@ -10,6 +10,7 @@ import pytest
 from unit.applications.lang.go import ApplicationGo
 from unit.option import option
 from unit.utils import getns
+from unit import port as port_map
 
 prerequisites = {'modules': {'go': 'any'}, 'features': {'isolation': True}}
 
@@ -354,7 +355,7 @@ def _reload_and_poll_mounts(isolation, want_tmpfs):
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         resp = None
         try:
-            sock.connect(('127.0.0.1', 8080))
+            sock.connect(('127.0.0.1', port_map.port(8080)))
             resp = client.get(url='/?mounts=true', sock=sock, read_timeout=2)
         except (KeyboardInterrupt, SystemExit):
             raise

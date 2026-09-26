@@ -8,6 +8,7 @@ import pytest
 
 from unit.applications.tls import ApplicationTLS
 from unit.option import option
+from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'any', 'openssl': 'any'}}
 
@@ -176,12 +177,12 @@ def test_tls_certificate_update():
 
     add_tls()
 
-    cert_old = ssl.get_server_certificate(('127.0.0.1', 8080))
+    cert_old = ssl.get_server_certificate(('127.0.0.1', port_map.port(8080)))
 
     client.certificate()
 
     assert cert_old != ssl.get_server_certificate(
-        ('127.0.0.1', 8080)
+        ('127.0.0.1', port_map.port(8080))
     ), 'update certificate'
 
 
@@ -225,12 +226,12 @@ def test_tls_certificate_change():
 
     add_tls()
 
-    cert_old = ssl.get_server_certificate(('127.0.0.1', 8080))
+    cert_old = ssl.get_server_certificate(('127.0.0.1', port_map.port(8080)))
 
     add_tls(cert='new')
 
     assert cert_old != ssl.get_server_certificate(
-        ('127.0.0.1', 8080)
+        ('127.0.0.1', port_map.port(8080))
     ), 'change certificate'
 
 

@@ -6,6 +6,7 @@ import pytest
 
 from unit.applications.tls import ApplicationTLS
 from unit.option import option
+from unit import port as port_map
 
 prerequisites = {'modules': {'openssl': 'any'}}
 
@@ -42,7 +43,7 @@ def create_socket():
     ssl_sock = ctx.wrap_socket(
         s, server_hostname='localhost', do_handshake_on_connect=False
     )
-    ssl_sock.connect(('127.0.0.1', 8080))
+    ssl_sock.connect(('127.0.0.1', port_map.port(8080)))
 
     return ssl_sock
 

@@ -8,6 +8,7 @@ import pytest
 
 from unit.applications.proto import ApplicationProto
 from unit.utils import waitforfiles
+from unit import port as port_map
 
 
 client = ApplicationProto()
@@ -883,7 +884,7 @@ def test_static_buffer_reuse():
     # corrupted recycle would surface as a wrong or truncated body.
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    sock.connect(('127.0.0.1', 8080))
+    sock.connect(('127.0.0.1', port_map.port(8080)))
     sock.settimeout(5)
 
     def one_request():
@@ -1484,7 +1485,7 @@ def test_static_range_keepalive_mix(temp_dir):
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    sock.connect(('127.0.0.1', 8080))
+    sock.connect(('127.0.0.1', port_map.port(8080)))
     sock.settimeout(5)
 
     def request(extra=''):

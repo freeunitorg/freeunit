@@ -25,6 +25,7 @@ import pytest
 from conftest import unit_run, unit_stop
 from unit.applications.proto import ApplicationProto
 from unit.log import Log
+from unit import port as port_map
 
 client = ApplicationProto()
 
@@ -102,7 +103,9 @@ def test_state_store_full_filesystem(requires_restart, skip_alert):
 
         # The configuration that must survive.
         assert 'success' in client.conf(SMALL_CONF), 'the small store'
-        assert wait_for_stored(statedir, SMALL_CONF) is not None, 'stored'
+        assert wait_for_stored(
+            statedir, port_map.expected(SMALL_CONF)
+        ) is not None, 'stored'
 
         stored = (statedir / 'conf.json').read_bytes()
 
@@ -118,7 +121,9 @@ def test_state_store_full_filesystem(requires_restart, skip_alert):
         assert after == stored, (
             'conf.json was damaged by a store that could not complete'
         )
-        assert json.loads(after)['listeners'] == SMALL_CONF['listeners']
+        assert json.loads(after)['listeners'] == port_map.expected(
+            SMALL_CONF['listeners']
+        )
 
         # And nothing was left half-written next to it.
         assert [p.name for p in statedir.iterdir() if '.tmp' in p.name] == []
