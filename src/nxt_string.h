@@ -148,12 +148,16 @@ NXT_EXPORT char *nxt_str_cstrz(nxt_mp_t *mp, const nxt_str_t *src);
       && (nxt_memcasecmp((s1)->start, (s2)->start, (s1)->length) == 0))
 
 
+/* The same zero-length short circuit as nxt_strstr_eq(), for memcmp(). */
+
 #define nxt_str_eq(s, p, _length)                                             \
-    (((s)->length == _length) && (memcmp((s)->start, p, _length) == 0))
+    (((s)->length == _length)                                                 \
+      && ((s)->length == 0 || memcmp((s)->start, p, _length) == 0))
 
 
 #define nxt_str_start(s, p, _length)                                          \
-    (((s)->length >= _length) && (memcmp((s)->start, p, _length) == 0))
+    (((s)->length >= _length)                                                 \
+      && ((_length) == 0 || memcmp((s)->start, p, _length) == 0))
 
 
 #define nxt_strchr_eq(s, c)                                                   \

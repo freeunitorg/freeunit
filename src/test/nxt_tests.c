@@ -216,6 +216,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_buf_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_http_chunk_parse_test(thr) != NXT_OK) {
         return 1;
     }
@@ -228,7 +232,15 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_conf_map_object_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_port_fail_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_fd_event_change_test(thr) != NXT_OK) {
         return 1;
     }
 
@@ -319,6 +331,10 @@ main(int argc, char **argv)
         if (nxt_security_tests[i](thr) != NXT_OK) {
             return 1;
         }
+    }
+
+    if (nxt_conn_close_test(thr) != NXT_OK) {
+        return 1;
     }
 
 #if (NXT_HAVE_CGROUP)
