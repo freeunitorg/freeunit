@@ -324,6 +324,17 @@ nxt_cert_bio(nxt_task_t *task, BIO *bio)
         goto fail;
     }
 
+    /*
+     * The leaf comes first in the bundle.  A key that belongs to another
+     * certificate is refused here, at upload, instead of at the next
+     * reconfiguration of every listener that names the bundle.
+     */
+    if (X509_check_private_key(cert->chain[0], cert->key) != 1) {
+        nxt_openssl_log_error(task, NXT_LOG_ALERT,
+                              "certificate and private key do not match");
+        goto fail;
+    }
+
     return cert;
 
 fail:
@@ -965,7 +976,8 @@ nxt_cert_store_load(nxt_task_t *task, nxt_mp_t *mp)
         name.length = nxt_strlen(de->d_name);
         name.start = (u_char *) de->d_name;
 
-        if (nxt_str_eq(&name, ".", 1) || nxt_str_eq(&name, "..", 2)) {
+        /* ".", "..", and the names the store keeps for itself. */
+        if (name.start[0] == '.') {
             continue;
         }
 

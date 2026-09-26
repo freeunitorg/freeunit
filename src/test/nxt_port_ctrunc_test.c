@@ -288,7 +288,7 @@ nxt_port_ctrunc_test_probe(size_t controllen, size_t *used, int *flags)
 
             for (cmsg = CMSG_FIRSTHDR(&msg);
                  cmsg != NULL;
-                 cmsg = CMSG_NXTHDR(&msg, cmsg))
+                 cmsg = NXT_CMSG_NXTHDR(&msg, cmsg))
             {
                 if (cmsg->cmsg_level != SOL_SOCKET
                     || cmsg->cmsg_type != SCM_RIGHTS)
