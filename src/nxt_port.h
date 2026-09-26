@@ -286,6 +286,10 @@ struct nxt_port_recv_msg_s {
     nxt_port_t          *port;
     nxt_port_msg_t      port_msg;
     size_t              size;
+    /* Of a stream being reassembled: what it holds, nxt_port_frag_cost(). */
+    size_t              frag_held;
+    /* Of a stream being reassembled: its place in port->frag_queue. */
+    nxt_queue_link_t    frag_link;
 #if (NXT_USE_CMSG_PID)
     nxt_pid_t           cmsg_pid;
 #endif
@@ -374,6 +378,10 @@ typedef struct nxt_app_s  nxt_app_t;
 struct nxt_port_s {
     nxt_fd_event_t      socket;
 
+    /*
+     * Set only by nxt_process_port_add().  nxt_port_release() unlinks the
+     * port and drops the process reference; it does not clear ->process.
+     */
     nxt_queue_link_t    link;       /* for nxt_process_t.ports */
     nxt_process_t       *process;
 
@@ -539,6 +547,15 @@ struct nxt_port_s {
 
     nxt_lvlhsh_t        frags;
 
+    /*
+     * The fragment streams in ->frags and the bytes they hold, kept against
+     * the NXT_PORT_FRAG_* limits below.  Touched only by the port's reader.
+     */
+    uint32_t            frag_streams;
+    uint32_t            frag_size;      /* <= NXT_PORT_FRAG_TOTAL_MAX */
+    /* The same streams, the oldest first. */
+    nxt_queue_t         frag_queue;
+
     nxt_atomic_t        use_count;
 
     nxt_process_type_t  type;
@@ -549,6 +566,27 @@ struct nxt_port_s {
     void                *socket_msg;
     int                 from_socket;
 };
+
+
+/*
+ * Limits on fragment reassembly at a receiving port (#394).  A sender
+ * controls how many fragmented messages it opens and how long it keeps
+ * each one going, and the receiver holds every fragment until the last
+ * one arrives: without a bound, a peer that never sends the last fragment
+ * -- or sends a new stream id for each message -- grows the receiver
+ * without limit.  libunit never fragments, so the legitimate senders are
+ * Unit's own processes, one message at a time per destination port; the
+ * largest such message is a configuration pushed from the controller.
+ *
+ * A stream that would pass a size limit is dropped as a whole, with an
+ * alert: what it had accumulated is released and its later fragments are
+ * discarded as belonging to no stream.  A new stream when the port already
+ * has NXT_PORT_FRAG_STREAMS_MAX open drops the oldest one the same way,
+ * so streams that are never ended cannot block the port for good.
+ */
+#define NXT_PORT_FRAG_STREAMS_MAX  64                    /* per port */
+#define NXT_PORT_FRAG_SIZE_MAX     (128 * 1024 * 1024)   /* per stream */
+#define NXT_PORT_FRAG_TOTAL_MAX    (256 * 1024 * 1024)   /* per port */
 
 
 typedef struct {

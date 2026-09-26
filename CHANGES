@@ -1,6 +1,16 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Security: a port kept every fragment of a message until the last
+       one arrived, so a peer process could make it hold memory without
+       limit. A fragment that named a shared memory segment but carried no
+       record also left a receive buffer in the stream while the same
+       buffer was reused for the next read. Reassembly is now limited to
+       64 streams, 128 MiB per stream and 256 MiB per port, a new stream
+       drops the oldest one when 64 are open, and such a fragment is
+       dropped. A port linked without a process no longer crashes a
+       release build when it is freed.
+
     *) Bugfix: an application used a shared memory segment id from the
        other process to grow its array of segments without a limit. An id
        like 100000000 in one message made it allocate and fill an array of
