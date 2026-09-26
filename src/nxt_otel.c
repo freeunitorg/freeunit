@@ -186,35 +186,45 @@ nxt_otel_propagate_header(nxt_task_t *task, nxt_http_request_t *r)
         return;
     }
 
-    if (r->otel->trace_id != NULL) {
-        // copy in the pre-existing traceparent for the response
-        sprintf((char *) traceval, "%s-%s-%s-%s",
-                (char *) r->otel->version,
-                (char *) r->otel->trace_id,
-                (char *) r->otel->parent_id,
-                (char *) r->otel->trace_flags);
+    /*
+     * The traceparent forwarded to the peer/app -- and echoed in the
+     * response -- always carries this request's own span as parent-id, so
+     * that the app's spans are children of ours rather than siblings of the
+     * inbound parent. nxt_otel_rs_copy_traceparent() reads trace-id,
+     * span-id and flags off the span's own context, which already carries
+     * the inherited trace-id/flags when a valid inbound traceparent was
+     * accepted, or freshly generated ones otherwise -- so one call covers
+     * both cases.
+     */
+    nxt_otel_rs_copy_traceparent(traceval, r->otel->trace);
 
     /*
-     * if we didn't inherit a trace id then we need to add the
-     * traceparent header to the request
+     * Any inbound traceparent, valid or not, is replaced by the value
+     * below, so the peer/app never sees two of them.
      */
-    } else {
-
-        nxt_otel_rs_copy_traceparent(traceval, r->otel->trace);
-
-        /*
-         * nxt_list_add() hands out non-zeroed memory: garbage skip/hopbyhop
-         * bits make the peer/app serializers randomly drop the field.
-         */
-        f = nxt_http_req_field_zero_add(r);
-        if (nxt_slow_path(f == NULL)) {
-            return;
+    nxt_http_fields_each(f, r->inline_fields, r->num_inline_fields, r->fields)
+    {
+        if (f->name_length == nxt_length("traceparent")
+            && nxt_memcasecmp(f->name, "traceparent",
+                              nxt_length("traceparent")) == 0)
+        {
+            f->skip = 1;
         }
 
-        nxt_http_field_name_set(f, "traceparent");
-        f->value = traceval;
-        f->value_length = nxt_strlen(traceval);
+    } nxt_http_fields_loop;
+
+    /*
+     * nxt_list_add() hands out non-zeroed memory: garbage skip/hopbyhop
+     * bits make the peer/app serializers randomly drop the field.
+     */
+    f = nxt_http_req_field_zero_add(r);
+    if (nxt_slow_path(f == NULL)) {
+        return;
     }
+
+    nxt_http_field_name_set(f, "traceparent");
+    f->value = traceval;
+    f->value_length = nxt_strlen(traceval);
 
     f = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
     if (nxt_slow_path(f == NULL)) {
