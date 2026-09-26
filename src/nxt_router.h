@@ -383,6 +383,14 @@ void nxt_router_test_app_rpc_create(nxt_task_t *task,
 
 /* The request deadline handler, for the app-timeout test. */
 void nxt_router_test_app_timeout(nxt_task_t *task, void *obj, void *data);
+
+/*
+ * The app message builder with the prefix of app->type, for the protocol
+ * length test.  The status is an nxt_uint_t: nxt_http_status_t is not
+ * visible here.
+ */
+nxt_buf_t *nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_app_t *app, nxt_uint_t *status);
 #endif
 
 

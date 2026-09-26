@@ -7515,10 +7515,10 @@ static void
 nxt_router_app_prepare_request(nxt_task_t *task,
     nxt_request_rpc_data_t *req_rpc_data)
 {
-    nxt_app_t         *app;
-    nxt_buf_t         *buf, *body;
-    nxt_int_t         res;
-    nxt_port_t        *port, *reply_port;
+    nxt_app_t          *app;
+    nxt_buf_t          *buf, *body;
+    nxt_int_t          res;
+    nxt_port_t         *port, *reply_port;
     nxt_http_status_t  status;
 
     int                   notify;
@@ -7542,11 +7542,6 @@ nxt_router_app_prepare_request(nxt_task_t *task,
     buf = nxt_router_prepare_msg(task, req_rpc_data->request, app,
                                  nxt_app_msg_prefix[app->type], &status);
     if (nxt_slow_path(buf == NULL)) {
-        if (status == NXT_HTTP_INTERNAL_SERVER_ERROR) {
-            nxt_alert(task, "stream #%uD, app '%V': failed to prepare app "
-                      "message", req_rpc_data->stream, &app->name);
-        }
-
         nxt_http_request_error(task, req_rpc_data->request, status);
 
         return;
@@ -7668,8 +7663,8 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
                       || r->local->address_length > UINT8_MAX
                       || nxt_sockaddr_port_length(r->local) > UINT8_MAX))
     {
-        nxt_alert(task, "request version or address too long for the "
-                  "application protocol");
+        nxt_alert(task, "app '%V': request version or address too long for "
+                  "the application protocol", &app->name);
 
         return NULL;
     }
@@ -7692,6 +7687,10 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_fields_each(field, r->inline_fields, r->num_inline_fields,
                          r->fields)
     {
+        if (field->skip) {
+            continue;
+        }
+
         fields_count++;
 
         if (nxt_slow_path(field->name_length + prefix->length > UINT8_MAX)) {
@@ -7710,8 +7709,8 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     req_size += fields_count * sizeof(nxt_unit_field_t);
 
     if (nxt_slow_path(req_size > PORT_MMAP_DATA_SIZE)) {
-        nxt_alert(task, "headers too big to fit in shared memory (%uz)",
-                  req_size);
+        nxt_alert(task, "app '%V': headers too big to fit in shared memory "
+                  "(%uz)", &app->name, req_size);
 
         return NULL;
     }
@@ -7957,23 +7956,18 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
 
 #if (NXT_TESTS)
 
-/*
- * For src/test/nxt_router_prepare_msg_test.c, which repeats this prototype:
- * nxt_router.h cannot name nxt_http_status_t.
- */
-
-nxt_buf_t *nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
-    nxt_app_t *app, nxt_bool_t use_http_prefix, nxt_http_status_t *status);
-
-
 nxt_buf_t *
 nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
-    nxt_app_t *app, nxt_bool_t use_http_prefix, nxt_http_status_t *status)
+    nxt_app_t *app, nxt_uint_t *status)
 {
-    return nxt_router_prepare_msg(task, r, app,
-                                  use_http_prefix ? &http_prefix
-                                                  : &empty_prefix,
-                                  status);
+    nxt_buf_t          *b;
+    nxt_http_status_t  st;
+
+    b = nxt_router_prepare_msg(task, r, app, nxt_app_msg_prefix[app->type],
+                               &st);
+    *status = st;
+
+    return b;
 }
 
 #endif
