@@ -11,6 +11,7 @@ on:
       - 'pkg/contrib/**'
       - 'pkg/eol.json'
       - '.github/workflows/build-test.yml'
+      - '.github/scripts/check-test-hooks.sh'
   push:
     branches: master
     paths:
@@ -22,6 +23,7 @@ on:
       - 'pkg/contrib/**'
       - 'pkg/eol.json'
       - '.github/workflows/build-test.yml'
+      - '.github/scripts/check-test-hooks.sh'
 
 env:
   # OpenSSL patch version built from source (see "Build OpenSSL" step). Only the
@@ -857,8 +859,23 @@ jobs:
       - name: Configure unit (--tests)
         run: ./configure --openssl --tests
 
+      - name: Build unitd and libunit
+        run: |
+          make -j4
+          make -j4 build/lib/libunit.a
+
       - name: Build C tests
         run: make -j4 tests
+
+      # The hooks (fault-injection branches and counters inside
+      # "#if (NXT_TESTS)") must reach the test programs and nothing else.
+      # The script derives the hook symbols from the build itself, so a new
+      # hook needs no change here.  It fails when a hook symbol is in unitd,
+      # libnxt.a, libunit.a or nxt_unit.o, when a test program linked a plain
+      # object, or when a source outside the twice-compiled set mentions
+      # NXT_TESTS.
+      - name: Check the test hooks are in the test programs only
+        run: .github/scripts/check-test-hooks.sh
 
       - name: Run C tests
         run: sudo ./build/tests
