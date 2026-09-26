@@ -65,6 +65,35 @@ Run the test suite before submitting:
 $ sudo pytest-3 --print-log test/
 ```
 
+If you changed core C code or libunit, also run the C test suite:
+
+```console
+$ ./configure --tests --openssl
+$ make
+$ make build/lib/libunit.a
+$ make tests
+$ ./build/tests
+```
+
+`--tests` builds the test programs (`build/tests`,
+`build/unit_port_recv_test`, and the rest). It does not change `unitd`,
+`libnxt.a`, `libunit.a`, or any language module: those come from the
+same objects with or without `--tests`.
+
+If you touch a source file under `#if (NXT_TESTS)`, run the gate script
+after `make tests`. It fails if a test hook reaches a shipped artifact:
+
+```console
+$ .github/scripts/check-test-hooks.sh
+```
+
+Build once with `./configure --hardening=strict` before you submit.
+New code must compile warning-free under it: no variable-length
+arrays, and `nxt_fallthrough;` instead of a fall-through comment. For
+length arithmetic on untrusted input, use `nxt_size_add()` and
+`nxt_size_mul()` from `src/nxt_checked.h`. For record parsing, use
+`nxt_span_t` from `src/nxt_span.h`.
+
 ## Commit Messages
 
 Use conventional commits format:
