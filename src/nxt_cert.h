@@ -20,6 +20,8 @@ nxt_cert_info_t *nxt_cert_info_create(nxt_str_t *name, nxt_cert_t *cert);
 nxt_int_t nxt_cert_info_replace(nxt_cert_info_t *info, nxt_cert_info_t **old);
 void nxt_cert_info_restore(nxt_cert_info_t *info, nxt_cert_info_t *old);
 void nxt_cert_info_release(nxt_cert_info_t *info);
+nxt_bool_t nxt_cert_info_equal(nxt_str_t *name, nxt_cert_t *cert);
+void nxt_cert_info_applied(nxt_str_t *name, nxt_bool_t applied);
 nxt_conf_value_t *nxt_cert_info_get(nxt_str_t *name);
 nxt_conf_value_t *nxt_cert_info_get_all(nxt_mp_t *mp);
 nxt_int_t nxt_cert_info_delete(nxt_str_t *name);

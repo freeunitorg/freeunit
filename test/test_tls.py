@@ -1,6 +1,7 @@
 import io
 import os
 import shutil
+import socket
 import ssl
 import subprocess
 import time
@@ -211,6 +212,91 @@ def test_tls_certificate_update_unused():
     assert (
         replace_cert('unused').get('success') == 'Certificate chain uploaded.'
     ), 'stored'
+
+
+def test_tls_certificate_update_unchanged():
+    client.load('empty')
+
+    client.certificate()
+
+    # Tickets are off by default.  With "tickets": true and no key in the
+    # configuration, the key is a random one of the SSL_CTX that issued the
+    # ticket.  A reconfiguration builds a new context with a new key, so a
+    # resumed session proves that the listener kept its context.
+    assert 'success' in client.conf(
+        {
+            "pass": "applications/empty",
+            "tls": {"certificate": "default", "session": {"tickets": True}},
+        },
+        'listeners/*:8080',
+    )
+
+    path = f'{option.temp_dir}/state/certs/default'
+    stored = os.stat(path)
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    context.maximum_version = ssl.TLSVersion.TLSv1_2
+
+    def connect(session=None):
+        with socket.create_connection(('127.0.0.1', 8080)) as sock:
+            with context.wrap_socket(sock, session=session) as ssock:
+                ssock.sendall(b'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
+
+                resp = b''
+                while b'\r\n\r\n' not in resp:
+                    resp += ssock.recv(4096)
+
+                assert resp.startswith(b'HTTP/1.1 200'), 'request'
+
+                return ssock.session, ssock.session_reused
+
+    session, reused = connect()
+    assert not reused, 'new session'
+
+    _, reused = connect(session)
+    assert reused, 'session resumed'
+
+    # The same bundle again.  The answer is the one a store gives, but
+    # main writes nothing, and the router keeps its contexts.
+    assert (
+        client.certificate_load('default').get('success')
+        == 'Certificate chain updated.'
+    ), 'unchanged in use'
+
+    after = os.stat(path)
+    assert (stored.st_ino, stored.st_mtime_ns) == (
+        after.st_ino,
+        after.st_mtime_ns,
+    ), 'not stored again'
+
+    _, reused = connect(session)
+    assert reused, 'no reconfiguration'
+
+    # The same bundle under a name no listener uses.
+    client.certificate('unused')
+
+    path_unused = f'{option.temp_dir}/state/certs/unused'
+    stored = os.stat(path_unused)
+
+    assert (
+        client.certificate_load('unused').get('success')
+        == 'Certificate chain uploaded.'
+    ), 'unchanged unused'
+
+    after = os.stat(path_unused)
+    assert stored.st_ino == after.st_ino, 'unused not stored again'
+
+    # A new certificate is stored and applied, as before.
+    assert (
+        replace_cert().get('success') == 'Certificate chain updated.'
+    ), 'replaced'
+
+    assert os.stat(path).st_ino != after.st_ino, 'new bundle stored'
+
+    _, reused = connect(session)
+    assert not reused, 'reconfigured'
 
 
 def test_tls_certificate_update_keepalive():

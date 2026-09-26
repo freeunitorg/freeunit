@@ -47,10 +47,24 @@ struct nxt_cert_s {
 };
 
 
+/* The size of a SHA-256 digest. */
+#define NXT_CERT_DIGEST_LENGTH  32
+
+
 struct nxt_cert_info_s {
     nxt_str_t         name;
     nxt_conf_value_t  *value;
     nxt_mp_t          *mp;
+
+    /* See nxt_cert_digest(). */
+    u_char            digest[NXT_CERT_DIGEST_LENGTH];
+
+    /*
+     * The bundle is on disk, but the router refused the configuration with
+     * it, so the router may still serve the old one.  See
+     * nxt_cert_info_equal().
+     */
+    uint8_t           unapplied;  /* 1 bit */
 };
 
 
@@ -64,6 +78,8 @@ static nxt_cert_t *nxt_cert_fd(nxt_task_t *task, nxt_fd_t fd);
 static nxt_cert_t *nxt_cert_bio(nxt_task_t *task, BIO *bio);
 static int nxt_nxt_cert_pem_suffix(char *pem_str, const char *suffix);
 
+static nxt_int_t nxt_cert_digest(nxt_cert_t *cert, u_char *digest);
+static nxt_cert_info_t *nxt_cert_info_find(nxt_str_t *name);
 static nxt_conf_value_t *nxt_cert_details(nxt_mp_t *mp, nxt_cert_t *cert);
 static nxt_conf_value_t *nxt_cert_name_details(nxt_mp_t *mp, X509 *x509,
     nxt_bool_t issuer);
@@ -490,8 +506,13 @@ nxt_cert_info_create(nxt_str_t *name, nxt_cert_t *cert)
         goto fail;
     }
 
+    if (nxt_slow_path(nxt_cert_digest(cert, info->digest) != NXT_OK)) {
+        goto fail;
+    }
+
     info->mp = mp;
     info->value = value;
+    info->unapplied = 0;
 
     return info;
 
@@ -499,6 +520,96 @@ fail:
 
     nxt_mp_destroy(mp);
     return NULL;
+}
+
+
+/*
+ * "digest" gets the SHA-256 digest of the SHA-256 digests of the
+ * certificates, in bundle order.  Two bundles with the same digest hold the
+ * same certificates.  They also hold the same key: nxt_cert_bio() has
+ * checked the key against the first certificate, and one public key has
+ * one private key.  The PEM text may still differ, in line breaks or in
+ * the key format.  The router loads the same contexts from either.
+ */
+static nxt_int_t
+nxt_cert_digest(nxt_cert_t *cert, u_char *digest)
+{
+    u_char        *p, *buf;
+    nxt_int_t     ret;
+    nxt_uint_t    i;
+    unsigned int  len;
+
+    buf = nxt_malloc(cert->count * EVP_MAX_MD_SIZE);
+    if (nxt_slow_path(buf == NULL)) {
+        return NXT_ERROR;
+    }
+
+    ret = NXT_ERROR;
+    p = buf;
+
+    for (i = 0; i < cert->count; i++) {
+        if (nxt_slow_path(X509_digest(cert->chain[i], EVP_sha256(), p, &len)
+                          != 1))
+        {
+            goto done;
+        }
+
+        p += len;
+    }
+
+    if (nxt_fast_path(EVP_Digest(buf, p - buf, digest, &len, EVP_sha256(),
+                                 NULL) == 1
+                      && len == NXT_CERT_DIGEST_LENGTH))
+    {
+        ret = NXT_OK;
+    }
+
+done:
+
+    nxt_free(buf);
+
+    return ret;
+}
+
+
+/*
+ * Whether "cert" holds the same certificates as the stored bundle "name",
+ * and the router has that bundle.  The controller then stores nothing and
+ * applies nothing.  After a store whose configuration the router refused,
+ * this is false until the same name is stored and applied once more, so a
+ * repeated upload of that bundle is a full one.
+ */
+nxt_bool_t
+nxt_cert_info_equal(nxt_str_t *name, nxt_cert_t *cert)
+{
+    u_char           digest[NXT_CERT_DIGEST_LENGTH];
+    nxt_cert_info_t  *info;
+
+    info = nxt_cert_info_find(name);
+
+    if (info == NULL || info->unapplied) {
+        return 0;
+    }
+
+    if (nxt_slow_path(nxt_cert_digest(cert, digest) != NXT_OK)) {
+        return 0;
+    }
+
+    return (memcmp(digest, info->digest, NXT_CERT_DIGEST_LENGTH) == 0);
+}
+
+
+/* The controller records whether the router took the stored bundle. */
+void
+nxt_cert_info_applied(nxt_str_t *name, nxt_bool_t applied)
+{
+    nxt_cert_info_t  *info;
+
+    info = nxt_cert_info_find(name);
+
+    if (info != NULL) {
+        info->unapplied = !applied;
+    }
 }
 
 
@@ -568,11 +679,10 @@ nxt_cert_info_release(nxt_cert_info_t *info)
 }
 
 
-nxt_conf_value_t *
-nxt_cert_info_get(nxt_str_t *name)
+static nxt_cert_info_t *
+nxt_cert_info_find(nxt_str_t *name)
 {
     nxt_int_t           ret;
-    nxt_cert_info_t     *info;
     nxt_lvlhsh_query_t  lhq;
 
     lhq.key_hash = nxt_djb_hash(name->start, name->length);
@@ -584,9 +694,18 @@ nxt_cert_info_get(nxt_str_t *name)
         return NULL;
     }
 
-    info = lhq.value;
+    return lhq.value;
+}
 
-    return info->value;
+
+nxt_conf_value_t *
+nxt_cert_info_get(nxt_str_t *name)
+{
+    nxt_cert_info_t  *info;
+
+    info = nxt_cert_info_find(name);
+
+    return (info != NULL) ? info->value : NULL;
 }
 
 

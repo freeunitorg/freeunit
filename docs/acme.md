@@ -40,6 +40,10 @@ This page gives the procedure for operators.
   shows the metadata of the new bundle. The next reconfiguration or restart
   loads the new bundle. Upload a working bundle again, or correct the
   configuration.
+- A bundle with the same certificates as the stored one is not stored
+  again and causes no reconfiguration. The answer is the one a store
+  gives. After `500 Certificate stored but not applied.`, the same bundle
+  is stored and applied again.
 - The request waits while another configuration change is in progress, as
   `PUT /config` does.
 - `GET /certificates/<name>/fingerprint` gives the SHA-256 fingerprint of

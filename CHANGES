@@ -13,8 +13,10 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        handshakes get the new certificate; accepted connections finish
        with the old one. An external ACME client can renew a certificate
        with one request and no restart; see docs/acme.md. A bundle over
-       1 MiB is refused with 413, and a name over 255 bytes with 400. The
-       router opens bundles read-only.
+       1 MiB is refused with 413, and a name over 255 bytes with 400. A
+       bundle with the same certificates as the stored one is not stored
+       again and causes no reconfiguration. The router opens bundles
+       read-only.
 
     *) Bugfix: with "isolation": {"namespaces": {"pid": true}}, a worker
        that died before it was fully started left its record, port and

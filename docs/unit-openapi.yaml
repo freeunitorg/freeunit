@@ -130,8 +130,10 @@ paths:
         `Certificate bundle is too large.`; the old bundle stays in use.
         500 `Certificate stored but not applied.` means the bundle is on
         disk, but the router refused the configuration with it and keeps
-        the old certificate.  The request waits while a reconfiguration is
-        in progress, as a configuration change does."
+        the old certificate.  A bundle with the same certificates as the
+        stored one is not stored again and causes no reconfiguration; the
+        answer is the one a store gives.  The request waits while a
+        reconfiguration is in progress, as a configuration change does."
 
       tags:
         - certificates
