@@ -7692,6 +7692,10 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_fields_each(field, r->inline_fields, r->num_inline_fields,
                          r->fields)
     {
+        if (field->skip) {
+            continue;
+        }
+
         fields_count++;
 
         if (nxt_slow_path(field->name_length + prefix->length > UINT8_MAX)) {
