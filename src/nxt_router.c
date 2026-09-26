@@ -5350,9 +5350,13 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     nxt_port_t              *app_port;
     nxt_unit_field_t        *f;
     nxt_http_field_t        *field;
+    nxt_http_status_t       status;
     nxt_http_request_t      *r;
     nxt_unit_response_t     *resp;
     nxt_request_rpc_data_t  *req_rpc_data;
+
+    /* What "fail:" answers with, unless a branch below knows better. */
+    status = NXT_HTTP_SERVICE_UNAVAILABLE;
 
     /*
      * An application response never legitimately carries a descriptor and
@@ -5553,6 +5557,17 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
          */
         ret = nxt_http_comp_check_acceptable(task, r);
         if (ret != NXT_OK) {
+            /*
+             * No acceptable representation is a fault of the request, not of
+             * the server, and it is the one non-NXT_OK result here that is
+             * not an error: the release below is still what the chain needs,
+             * but the answer is 406 rather than the 503 "fail:" gives
+             * everything else.
+             */
+            if (ret == NXT_HTTP_NOT_ACCEPTABLE) {
+                status = NXT_HTTP_NOT_ACCEPTABLE;
+            }
+
             goto fail;
         }
 
@@ -5638,7 +5653,7 @@ fail:
         r->last = last_b;
     }
 
-    nxt_http_request_error(task, r, NXT_HTTP_SERVICE_UNAVAILABLE);
+    nxt_http_request_error(task, r, status);
 
     /*
      * Complete the buffers adopted from the port above, if any: nobody else

@@ -600,6 +600,37 @@ connection to 10 MB of payload that the application has not received yet
 receive()); a single frame larger than that is still accepted when nothing else
 is waiting.  A fragmented message also left a count behind that lowered the
 limit applied to the next message.
+a byte-range request from a client that refused the identity coding is no
+longer answered with identity bytes.  A range is served as identity, so
+Range together with "Accept-Encoding: identity;q=0" returned a 206 carrying
+exactly the bytes the client said it would not take; the range is now
+ignored and the full 200 is sent in a coding the client accepts.  An
+unsatisfiable range from such a client is no longer answered with 416 either.
+A request that accepts no coding at all is still 406.  Several Accept-Encoding
+lines in one request are now read as one comma-joined value; previously only the
+first was consulted.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a malformed weight in Accept-Encoding is no longer read as a refusal.  The
+qvalue was converted with strtod(), which takes no digits at all from
+"identity;q=" and from "identity;q=abc" and reports zero, so either one
+answered 406 to a client that had refused nothing; "q=0x0" and "q=0e0" did the
+same.  An element whose weight does not match the grammar of RFC 9110
+Sect. 12.4.2 is now ignored, as an element naming an unknown coding already
+was.  This also removes "q=nan", which passed the 0-to-1 range check and then
+outranked every real weight.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a negotiation failure on Accept-Encoding was answered with 503 instead of 406
+when the response came from an application.  The router treated every result
+of the acceptability check other than success as a server error; only the
+static path reported the 406.
 </para>
 </change>
 
