@@ -1006,3 +1006,66 @@ jobs:
 
       - name: Run C tests
         run: sudo ./build/tests
+
+  # --hardening=strict compile gate, with gcc and with clang.  auto/cc/test
+  # already passes -Werror to both, so a new warning from -Wformat=2, -Wvla or
+  # -Wimplicit-fallthrough (a fall-through without nxt_fallthrough) fails the
+  # job.  The assert step fails when a compiler stops accepting one of the
+  # probed flags: auto/cc/hardening only drops such a flag, so a plain build
+  # would pass while testing nothing.  Cheap on purpose: a build plus the C
+  # test suite, no language modules.
+  hardening-strict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev clang
+
+      - name: Configure unit (--hardening=strict --tests --openssl)
+        run: |
+          ./configure \
+            --cc=${{ matrix.cc }} \
+            --hardening=strict \
+            --tests \
+            --openssl 2>&1 | tee configure.log
+          test "${PIPESTATUS[0]}" -eq 0
+
+      # Every flag that this job exists for must be found.  The FORTIFY probe
+      # falls back from level 3 to 2, so either level passes.  The CET and
+      # branch-protection flags are not asserted: each applies to one target
+      # only.
+      - name: Assert configure found the hardening flags
+        run: |
+          grep -q 'hardening: .* strict$' configure.log
+          for flag in -fstack-protector-strong -fstack-clash-protection \
+                      -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack \
+                      -Wformat=2 -Wvla -Wimplicit-fallthrough \
+                      -ftrivial-auto-var-init=pattern
+          do
+            grep -q "checking for $flag \.\.\. found" configure.log \
+              || { echo "$flag was not found"; exit 1; }
+          done
+          grep -q 'checking for -D_FORTIFY_SOURCE=[23] \.\.\. found' \
+            configure.log \
+            || { echo "_FORTIFY_SOURCE was not found"; exit 1; }
+          grep -q 'define NXT_HAVE_BUILTIN_OVERFLOW' \
+            build/include/nxt_auto_config.h
+
+      - name: Build unit
+        run: make -j4
+
+      - name: Build C tests
+        run: make -j4 tests
+
+      - name: Run C tests
+        run: sudo ./build/tests
