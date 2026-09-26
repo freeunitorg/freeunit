@@ -1,0 +1,11 @@
+id: unchecked-realloc
+snapshots:
+  ? |
+    void f(char *p, size_t n) {
+        p = realloc(p, n);
+    }
+  : labels:
+    - source: p = realloc(p, n);
+      style: primary
+      start: 32
+      end: 50

@@ -94,6 +94,30 @@ length arithmetic on untrusted input, use `nxt_size_add()` and
 `nxt_size_mul()` from `src/nxt_checked.h`. For record parsing, use
 `nxt_span_t` from `src/nxt_span.h`.
 
+Two CI checks look at each pull request. `ast-grep baseline` runs the
+rules in `tools/ast-grep/` over `src/`, without `src/test/`. It fails on
+a match that is not in `tools/ast-grep/baseline.json`. `require a test
+for a src/ change` warns when a PR changes a file under `src/` and no
+file under `test/` or `src/test/`. If the change needs no test, add the
+`no-test-needed` label, or a trailer with the reason to one of your
+commits:
+
+```
+No-Test-Reason: the change only renames a local variable
+```
+
+To run the ast-grep check, and the `@contract` check for the functions
+in `tools/gates/contract_functions.txt`, before you push (ast-grep must
+be installed):
+
+```console
+$ tools/gates/run_gates.sh -g 5,6
+```
+
+When a new match is reviewed and safe, run
+`python3 tools/ast-grep/check_baseline.py --update` and commit
+`baseline.json` with the change.
+
 ## Commit Messages
 
 Use conventional commits format:

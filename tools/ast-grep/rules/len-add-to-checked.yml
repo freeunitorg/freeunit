@@ -1,0 +1,22 @@
+id: len-add-to-checked
+language: c
+severity: hint
+message: >-
+  A length or size field is added to a value and the sum is stored without a
+  check. If an operand can come from a peer, use nxt_size_add()
+  (src/nxt_checked.h). It reports the overflow, and the sum does not wrap.
+note: >-
+  The rule matches a sum that starts with a field whose name ends in "len",
+  "length" or "size", in an assignment, in a declaration with an initializer,
+  and as the right side of "+=". It does not match when the field is the
+  right operand of "+". Many matches are safe: two constants, or two values
+  that were checked before. The baseline check fails on each new match, as
+  for every other rule. A safe new match goes into baseline.json.
+rule:
+  any:
+    - pattern: $X = $A->$LENFIELD + $B;
+    - pattern: $T $X = $A->$LENFIELD + $B;
+    - pattern: $X += $A->$LENFIELD;
+constraints:
+  LENFIELD:
+    regex: "(len|length|size)$"

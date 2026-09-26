@@ -1,0 +1,156 @@
+name: "Lint (ast-grep)"
+
+# Two gates.
+#
+# ast-grep: runs on each pull request and on each push to master.  The job
+# fails on a match that is not in tools/ast-grep/baseline.json, and on a
+# baseline entry that no match uses any more.  The run on master shows at
+# once when a merge made the baseline stale.
+#
+# require-tests: runs on each pull request.  A change to production code
+# under src/ must come with a change under test/ or src/test/.  For now
+# the job only writes a warning and does not block the merge.  The PR can
+# opt out in two ways.  It can have the "no-test-needed" label.  Or one of
+# its own commits can have a "No-Test-Reason: <why>" trailer with a value
+# that is not empty.
+
+on:
+  pull_request:
+    types: [ opened, synchronize, reopened, labeled, unlabeled ]
+  push:
+    branches: [ master ]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Each push gets its own group.  Thus no queued commit is dropped.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ast-grep:
+    name: "ast-grep baseline"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # The snapshot tests and the matched text can change between
+      # ast-grep releases.  Change the version and the baseline together.
+      AST_GREP_VERSION: 0.45.3
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache ast-grep
+        id: cache-ast-grep
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/ast-grep
+          key: ast-grep-${{ runner.os }}-${{ runner.arch }}-${{ env.AST_GREP_VERSION }}
+
+      # install-action has no manifest for ast-grep.  It falls back to
+      # cargo-binstall, which reads a bare version as an exact one.
+      - name: Install ast-grep
+        if: steps.cache-ast-grep.outputs.cache-hit != 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: ast-grep@${{ env.AST_GREP_VERSION }}
+
+      - name: Check the ast-grep version
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          version="$("$HOME/.cargo/bin/ast-grep" --version)"
+          echo "$version"
+          test "$version" = "ast-grep $AST_GREP_VERSION"
+
+      - name: Test the rules
+        run: ast-grep test -c tools/ast-grep/sgconfig.yml
+
+      - name: Check for new violations
+        run: |
+          python3 tools/ast-grep/check_baseline_test.py
+          python3 tools/ast-grep/check_baseline.py
+
+  require-tests:
+    name: "require a test for a src/ change"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Not blocking for now: a PR without a test gets a warning, and the
+    # job passes.  An error of the job itself, such as a failed git
+    # command, makes the job fail.  Make the warning blocking when a
+    # release cycle shows how often the opt-out is needed.
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check the diff has a matching test change
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: |
+          if echo "$LABELS" | grep -qi '"no-test-needed"'; then
+            echo "opted out via the 'no-test-needed' label"
+            exit 0
+          fi
+
+          # The PR's own commits start at the merge base with the current
+          # tip of the base branch.  The base.sha of the event can be older
+          # than a master commit that a merge from master brought into the
+          # branch.  Then "base.sha..HEAD" has that master commit, and its
+          # trailer or its files count for the PR.  The merge base of
+          # base.sha and HEAD is base.sha itself, so it does not help.
+          # fetch-depth: 0 fetches the base branch as origin/<base>.
+          merge_base="$(git merge-base "refs/remotes/origin/$BASE_REF" \
+              "$HEAD_SHA")"
+
+          # Only a real trailer counts.  Text in the commit body does not.
+          # The trailer value must not be blank.  --no-merges skips the
+          # merge commits.
+          reasons="$(git log --no-merges \
+              --format='%(trailers:key=No-Test-Reason,valueonly)' \
+              "$merge_base..$HEAD_SHA" | grep -E '[^[:space:]]' || true)"
+
+          if [ -n "$reasons" ]; then
+            echo "opted out via a No-Test-Reason: trailer:"
+            echo "$reasons"
+            exit 0
+          fi
+
+          # --no-renames: a rename out of src/ lists its old src/ path
+          # as a deletion, so it still needs a test.
+          changed="$(git diff --name-only --no-renames \
+              "$merge_base" "$HEAD_SHA")"
+
+          # Each file under src/ is production code (C, C++, JS, Java,
+          # Rust and build files).  The tests in src/test/ and the docs
+          # are not.
+          src_changed="$(echo "$changed" \
+            | grep -E '^src/' \
+            | grep -vE '^src/test/|\.md$|/\.gitignore$' || true)"
+
+          if [ -z "$src_changed" ]; then
+            echo "no production src/ changes; nothing to require"
+            exit 0
+          fi
+
+          # Count added, changed and renamed tests only.  A deleted test
+          # covers nothing.  Known hole: a rename of a test file with no
+          # change of its content also counts.
+          test_changed="$(git diff --name-only --diff-filter=ACMR \
+              "$merge_base" "$HEAD_SHA" \
+            | grep -E '^(test/|src/test/)' || true)"
+
+          if [ -n "$test_changed" ]; then
+            echo "src/ change is covered by a test/ or src/test/ change"
+            exit 0
+          fi
+
+          echo "This PR changes production files under src/:"
+          echo "$src_changed"
+          echo
+          echo "::warning::This PR changes production files under src/" \
+               "and no file under test/ or src/test/. Add a test, or opt" \
+               "out with the 'no-test-needed' label or a" \
+               "'No-Test-Reason: <why>' trailer on a commit in this PR."

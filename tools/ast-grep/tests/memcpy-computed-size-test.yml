@@ -1,0 +1,11 @@
+id: memcpy-computed-size
+valid:
+  - |
+    void f(char *dst, char *src, size_t n) {
+        memcpy(dst, src, n);
+    }
+invalid:
+  - |
+    void f(char *dst, char *src, size_t a, size_t b) {
+        memcpy(dst, src, a + b);
+    }

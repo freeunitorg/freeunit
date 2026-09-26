@@ -1,0 +1,9 @@
+id: sprintf-unbounded
+language: c
+severity: warning
+message: >-
+  sprintf() does not know the size of the destination buffer. Use
+  nxt_sprintf() or nxt_vsprintf() (src/nxt_sprintf.h). They take a pointer to
+  the end of the buffer.
+rule:
+  pattern: sprintf($DST, $$$)
