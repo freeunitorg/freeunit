@@ -12,6 +12,19 @@
 
 <change type="bugfix">
 <para>
+a request could reach the application with a wrong method or header name
+length.  The application protocol stores these lengths in one byte; the router
+stored the low byte and still copied the whole string, so a method of 256 bytes
+arrived as an empty one, and for PHP, Perl and Ruby, whose header names carry
+the "HTTP_" prefix, a name of 251 to 255 bytes arrived with a length of 0 to 4.
+Such requests are now refused: a method longer than 255 bytes with 501, and a
+header name that does not fit with its prefix with 431.  Both are logged at
+"info".  Other languages take names of up to 255 bytes as before.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 an upstream 1xx interim response ("100 Continue", "103 Early Hints") was
 relayed to the client as the response, with the final response relayed as its
 body.  The proxy now drops interim responses (101 excepted) and relays the
