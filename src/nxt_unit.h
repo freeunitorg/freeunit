@@ -331,6 +331,17 @@ void nxt_unit_request_done(nxt_unit_request_info_t *req, int rc);
  * may run detached work at once: the worker stays busy until the last of
  * them returns.  PHP's fastcgi_finish_request() is the caller this exists
  * for, and PHP runs one context.
+ *
+ * The report to the router may fail and need retries.  libunit runs them
+ * from its read loops and from nxt_unit_process_port_msg(), and until one
+ * succeeds the router holds the worker busy.  Nothing wakes an integration
+ * that drives its own event loop meanwhile, so nxt_unit_process_port_msg()
+ * returns NXT_UNIT_OK, and not NXT_UNIT_AGAIN, while a retry is pending,
+ * to ask for the next call.  An integration that reschedules the call on
+ * NXT_UNIT_OK, as the Node.js and ASGI ones do, needs nothing more.  The
+ * call never waits for the retry backoff, which would block the event
+ * loop: it keeps a deadline, and a call before it only receives.  The
+ * retries give up after about 0.8 s and close the worker.
  */
 void nxt_unit_request_done_detached(nxt_unit_request_info_t *req, int rc);
 
@@ -424,6 +435,7 @@ uint8_t  nxt_unit_test_ctx_detached_unreported(nxt_unit_ctx_t *ctx);
 void     nxt_unit_test_ctx_detached_start(nxt_unit_ctx_t *ctx);
 void     nxt_unit_test_ctx_detached_done(nxt_unit_ctx_t *ctx);
 int      nxt_unit_test_ctx_detached_retry(nxt_unit_ctx_t *ctx);
+nxt_unit_port_t  *nxt_unit_test_ctx_read_port(nxt_unit_ctx_t *ctx);
 uint8_t  nxt_unit_test_ctx_online(nxt_unit_ctx_t *ctx);
 uint8_t  nxt_unit_test_ctx_ready(nxt_unit_ctx_t *ctx);
 void     nxt_unit_test_ctx_set_ready(nxt_unit_ctx_t *ctx, uint8_t val);
