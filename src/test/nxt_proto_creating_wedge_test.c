@@ -288,7 +288,10 @@ nxt_proto_creating_wedge_test(nxt_thread_t *thr)
     app_port->pair[1] = -1;
     app_port->socket.fd = -1;
 
-    nxt_queue_insert_tail(&process->ports, &app_port->link);
+    /* The fixture's own hold on the record, as main's would be. */
+    process->use_count = 1;
+
+    nxt_process_port_add(task, process, app_port);
 
     /*
      * A child that died before PROCESS_CREATED, with the prototype in main's
@@ -566,20 +569,8 @@ done:
         nxt_runtime_port_remove(task, main_port);
     }
 
+    /* Paired through nxt_process_port_add(), so its release unlinks it. */
     if (app_port != NULL) {
-        nxt_queue_remove(&app_port->link);
-
-        /*
-         * nxt_queue_remove() nulls the link only in a debug build
-         * (src/nxt_queue.h:130-148).  nxt_port_release() reads a non-NULL
-         * link.next as "this port belongs to a process" and dereferences
-         * port->process, which nxt_port_new() never set -- guarded by an
-         * nxt_assert() that compiles out of a release build, so the test
-         * would segfault in teardown there and nowhere else.
-         */
-        app_port->link.next = NULL;
-        app_port->link.prev = NULL;
-
         nxt_port_use(task, app_port, -1);
     }
 

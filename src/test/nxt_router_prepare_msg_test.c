@@ -46,11 +46,15 @@ static const nxt_prepare_msg_test_case_t  nxt_prepare_msg_test_cases[] = {
     { "250-byte name + prefix = 255",    1,   3, 250, 0 },
     { "251-byte name + prefix",          1,   3, 251,
       NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE },
+    { "253-byte name + prefix",          1,   3, 253,
+      NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE },
     { "255-byte name + prefix",          1,   3, 255,
       NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE },
     { "255-byte name, no prefix",        0,   3, 255, 0 },
     { "255-byte method",                 0, 255,   6, 0 },
     { "256-byte method",                 0, 256,   6,
+      NXT_HTTP_NOT_IMPLEMENTED },
+    { "280-byte method",                 0, 280,   6,
       NXT_HTTP_NOT_IMPLEMENTED },
 };
 

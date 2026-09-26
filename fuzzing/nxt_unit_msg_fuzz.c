@@ -8,7 +8,9 @@
  * walk (nxt_unit_mmap_read()), request arrival validation
  * (nxt_unit_process_req_headers(), nxt_unit_sptr_in_buf()), request body
  * and websocket frames -- and, for a request that comes out ready, the
- * application's request handler, which reads every field and finishes it.
+ * application's request handler, which reads every field and finishes it,
+ * or upgrades it when it is a websocket handshake so that frames on the
+ * same stream reach the frame parser (nxt_unit_process_websocket()).
  *
  * Input layout:
  *
@@ -56,6 +58,7 @@
 #include <nxt_app_queue.h>
 #include <nxt_unit.h>
 #include <nxt_unit_request.h>
+#include <nxt_unit_websocket.h>
 
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -140,6 +143,43 @@ nxt_unit_msg_fuzz_handler(nxt_unit_request_info_t *req)
 
     nxt_unit_msg_fuzz_sink = sum;
 
+    /*
+     * A handshake is answered with an upgrade, as a websocket application
+     * would: the request then waits in the hash for WEBSOCKET messages on
+     * its stream, which is the only way a frame reaches the frame parser.
+     * The close frame (or the reset) finishes it.
+     */
+    if (r->websocket_handshake
+        && nxt_unit_response_init(req, 101, 0, 0) == NXT_UNIT_OK
+        && nxt_unit_response_upgrade(req) == NXT_UNIT_OK
+        && nxt_unit_response_send(req) == NXT_UNIT_OK)
+    {
+        return;
+    }
+
+    nxt_unit_request_done(req, NXT_UNIT_ERROR);
+}
+
+
+static void
+nxt_unit_msg_fuzz_websocket(nxt_unit_websocket_frame_t *ws)
+{
+    u_char   buf[64];
+    ssize_t  n;
+
+    /* Reads the payload through the mask, as an application would. */
+    n = nxt_unit_websocket_read(ws, buf, sizeof(buf));
+
+    nxt_unit_msg_fuzz_sink = ws->payload_len + ws->header->opcode
+                             + (n > 0 ? buf[n - 1] : 0);
+
+    nxt_unit_websocket_done(ws);
+}
+
+
+static void
+nxt_unit_msg_fuzz_close(nxt_unit_request_info_t *req)
+{
     nxt_unit_request_done(req, NXT_UNIT_ERROR);
 }
 
@@ -206,6 +246,8 @@ nxt_unit_msg_fuzz_setup(void)
     memset(&init, 0, sizeof(init));
 
     init.callbacks.request_handler = nxt_unit_msg_fuzz_handler;
+    init.callbacks.websocket_handler = nxt_unit_msg_fuzz_websocket;
+    init.callbacks.close_handler = nxt_unit_msg_fuzz_close;
     init.callbacks.port_send = nxt_unit_msg_fuzz_send;
     init.callbacks.port_recv = nxt_unit_msg_fuzz_recv;
 
