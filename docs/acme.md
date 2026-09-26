@@ -24,8 +24,8 @@ This page gives the procedure for operators.
 - The key must belong to the first certificate. The answer to a bundle
   with the wrong key is `400 Invalid certificate.`. The old bundle stays in
   use.
-- A name that starts with `.` is reserved. The answer to such a name is
-  `400 Invalid certificate name.`.
+- A name that starts with `.` is reserved, and a name is at most 255
+  bytes. The answer to any other name is `400 Invalid certificate name.`.
 - The answer to a bundle over 1 MiB is `413 Certificate bundle is too
   large.`.
 - When the current configuration names the bundle, the answer is

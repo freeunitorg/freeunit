@@ -1953,8 +1953,14 @@ nxt_controller_process_cert(nxt_task_t *task,
         return;
     }
 
-    /* Names starting with "." are reserved for the store's own files. */
-    if (name.length == 0 || path != NULL || name.start[0] == '.') {
+    /*
+     * Names starting with "." are reserved for the store's own files.  A
+     * name over NAME_MAX cannot be stored, so it is refused here with 400,
+     * not by main with ENAMETOOLONG and 500.
+     */
+    if (name.length == 0 || path != NULL || name.start[0] == '.'
+        || name.length > NXT_CERT_NAME_MAX_LENGTH)
+    {
         goto invalid_name;
     }
 

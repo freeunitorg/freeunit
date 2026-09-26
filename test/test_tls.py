@@ -355,6 +355,15 @@ def test_tls_certificate_update_long_name():
 
     assert 'chain' in client.conf_get(f'/certificates/{name}'), 'listed'
 
+    # One byte more cannot be a file name.  The controller refuses it before
+    # main sees it, so the answer is 400 and not 500.
+    assert (
+        client.conf(bundle, f'/certificates/{name}a').get('error')
+        == 'Invalid certificate name.'
+    ), 'name too long'
+
+    assert 'error' in client.conf_get(f'/certificates/{name}a'), 'not stored'
+
 
 def test_tls_certificate_update_sni():
     client.load('empty')

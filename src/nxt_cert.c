@@ -1546,6 +1546,7 @@ nxt_cert_store_put_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     if (nxt_slow_path(p == NULL
                       || (size_t) (p - name.start) + 1 + sizeof(size_t) != used
                       || p == name.start
+                      || (size_t) (p - name.start) > NXT_CERT_NAME_MAX_LENGTH
                       || name.start[0] == '.'
                       || memchr(name.start, '/', p - name.start) != NULL))
     {
