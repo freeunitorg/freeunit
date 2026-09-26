@@ -39,6 +39,8 @@ void nxt_main_test_run_start_process_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 nxt_int_t nxt_main_test_run_file_store(nxt_task_t *task, const char *dir,
     const char *tmp_name, const char *name, u_char *buf, size_t size);
+void nxt_main_test_run_whoami_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
 #endif
 
 

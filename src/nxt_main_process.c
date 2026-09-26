@@ -758,6 +758,14 @@ nxt_main_test_run_file_store(nxt_task_t *task, const char *dir,
     return nxt_main_file_store(task, dir, tmp_name, name, buf, size);
 }
 
+
+/* Lets src/test/nxt_main_whoami_test.c drive the WHOAMI handler. */
+void
+nxt_main_test_run_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_main_process_whoami_handler(task, msg);
+}
+
 #endif
 
 
@@ -897,6 +905,41 @@ nxt_main_process_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_debug(task, "whoami: from %PI, parent %PI, fd %d", pid, ppid,
               msg->fd[0]);
 
+    /*
+     * The sender is not trusted, and "ppid" comes from its message.  Only
+     * two shapes are valid: a process forked by main sends no descriptor,
+     * and a worker forked by a prototype sends its port.  A process sends
+     * WHOAMI once, so a second one with a port is refused too; without
+     * that, it would get a second port and be linked into "children"
+     * twice, which corrupts the queue.
+     */
+
+    if (ppid == nxt_pid) {
+        if (nxt_slow_path(msg->fd[0] != -1)) {
+            nxt_alert(task, "whoami: process %PI sent a port", pid);
+            goto fail;
+        }
+
+    } else {
+        if (nxt_slow_path(nxt_process_type(pprocess)
+                          != NXT_PROCESS_PROTOTYPE))
+        {
+            nxt_alert(task, "whoami: process %PI named %PI as its parent, "
+                      "which is not a prototype", pid, ppid);
+            goto fail;
+        }
+
+        if (nxt_slow_path(msg->fd[0] == -1)) {
+            nxt_alert(task, "whoami: worker %PI sent no port", pid);
+            goto fail;
+        }
+
+        if (nxt_slow_path(nxt_runtime_port_find(rt, pid, 0) != NULL)) {
+            nxt_alert(task, "whoami: process %PI sent WHOAMI again", pid);
+            goto fail;
+        }
+    }
+
     if (msg->fd[0] != -1) {
         port = nxt_runtime_process_port_create(task, rt, pid, 0,
                                                NXT_PROCESS_APP);
@@ -924,6 +967,9 @@ nxt_main_process_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     }
 
     if (ppid != nxt_pid) {
+        /* A new record: the checks above make it so. */
+        nxt_assert(port->process->link.next == NULL);
+
         nxt_queue_insert_tail(&pprocess->children, &port->process->link);
     }
 

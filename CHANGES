@@ -1,6 +1,11 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Bugfix: the main process accepted a second WHOAMI from an
+       application process, and a parent that is not a prototype. The
+       process was then linked into its parent's list twice, which
+       corrupted the list in main. Such a message is now refused.
+
     *) Bugfix: an upstream 1xx interim response ("100 Continue", "103 Early
        Hints") was relayed to the client as the response, with the final
        response relayed as its body. The proxy now drops interim responses
