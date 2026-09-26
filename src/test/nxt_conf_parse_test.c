@@ -177,10 +177,16 @@ typedef struct {
 nxt_int_t
 nxt_conf_map_object_test(nxt_thread_t *thr)
 {
+    void                 *ptr;
     nxt_mp_t             *mp;
+    nxt_str_t            str, rstr, orig;
     nxt_int_t            ret;
-    nxt_conf_value_t     *cv;
+    nxt_conf_value_t     *cv, *member;
     nxt_conf_map_test_t  dst;
+
+    static const nxt_str_t  str_name = nxt_string("str");
+    static const nxt_str_t  rstr_name = nxt_string("rstr");
+    static const nxt_str_t  ptr_name = nxt_string("ptr");
 
     static const nxt_str_t  json = nxt_string(
         "{\"flag\": true, \"i32\": -123456, \"i64\": -9876543210, \"i\": -7,"
@@ -247,6 +253,44 @@ nxt_conf_map_object_test(nxt_thread_t *thr)
         || dst.bad32 != 0x5A5A5A5A)
     {
         nxt_log_alert(thr->log, "nxt_conf_map_object() mapped wrong values");
+        goto done;
+    }
+
+    /*
+     * The non-scalar copies, read back with memcpy() from their misaligned
+     * fields.  NXT_CONF_MAP_STR stores the member's own string, without a
+     * copy.  NXT_CONF_MAP_STR_COPY stores a copy from the pool.
+     * NXT_CONF_MAP_PTR stores the member's nxt_conf_value_t itself.
+     */
+
+    nxt_memcpy(&rstr, &dst.rstr, sizeof(rstr));
+    nxt_memcpy(&str, &dst.str, sizeof(str));
+    nxt_memcpy(&ptr, &dst.ptr, sizeof(ptr));
+
+    member = nxt_conf_get_object_member(cv, &rstr_name, NULL);
+    nxt_conf_get_string(member, &orig);
+
+    if (rstr.start != orig.start || rstr.length != orig.length) {
+        nxt_log_alert(thr->log, "nxt_conf_map_object() NXT_CONF_MAP_STR "
+                      "did not store the member's own string");
+        goto done;
+    }
+
+    member = nxt_conf_get_object_member(cv, &str_name, NULL);
+    nxt_conf_get_string(member, &orig);
+
+    if (str.start == orig.start
+        || str.length != orig.length
+        || memcmp(str.start, orig.start, orig.length) != 0)
+    {
+        nxt_log_alert(thr->log, "nxt_conf_map_object() NXT_CONF_MAP_STR_COPY "
+                      "did not store a copy");
+        goto done;
+    }
+
+    if (ptr != nxt_conf_get_object_member(cv, &ptr_name, NULL)) {
+        nxt_log_alert(thr->log, "nxt_conf_map_object() NXT_CONF_MAP_PTR "
+                      "did not store the member's value");
         goto done;
     }
 
