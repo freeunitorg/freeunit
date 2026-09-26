@@ -7515,10 +7515,10 @@ static void
 nxt_router_app_prepare_request(nxt_task_t *task,
     nxt_request_rpc_data_t *req_rpc_data)
 {
-    nxt_app_t         *app;
-    nxt_buf_t         *buf, *body;
-    nxt_int_t         res;
-    nxt_port_t        *port, *reply_port;
+    nxt_app_t          *app;
+    nxt_buf_t          *buf, *body;
+    nxt_int_t          res;
+    nxt_port_t         *port, *reply_port;
     nxt_http_status_t  status;
 
     int                   notify;
