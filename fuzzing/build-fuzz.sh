@@ -14,6 +14,7 @@ mkdir -p build/fuzz_http_controller_seed
 mkdir -p build/fuzz_http_h1p_seed
 mkdir -p build/fuzz_http_h1p_peer_seed
 mkdir -p build/fuzz_json_seed
+mkdir -p build/fuzz_unit_msg_seed
 
 echo ""
 echo "Run: ./build/\${fuzzer} build/\${fuzzer}_seed fuzzing/\${fuzzer}_seed_corpus"

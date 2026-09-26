@@ -227,7 +227,7 @@ done
 # 3. The test programs took every linked object from the instrumented archive.
 
 programs="$build/tests $build/ncq_test $build/vbcq_test $build/unit_app_test \
-    $build/unit_close_test $build/unit_port_recv_test \
+    $build/unit_close_test $build/unit_port_recv_test $build/unit_msg_test \
     $build/unit_websocket_chat $build/unit_websocket_echo"
 
 for prog in $programs; do

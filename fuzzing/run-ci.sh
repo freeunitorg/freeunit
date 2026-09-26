@@ -10,7 +10,7 @@
 #   fuzzing/run-ci.sh [-t SECONDS] [TARGET ...]
 #
 #   -t SECONDS   libFuzzer budget per target (default 60)
-#   TARGET ...   fuzzer names; default is all five
+#   TARGET ...   fuzzer names; default is all six
 #
 # Expects the fuzzers to be built already:
 #   CC=clang CXX=clang++ \
@@ -47,6 +47,7 @@ corpus_for() {
     case "$1" in
         fuzz_basic)     echo fuzz_basic_seed_corpus ;;
         fuzz_json)      echo fuzz_json_seed_corpus ;;
+        fuzz_unit_msg)  echo fuzz_unit_msg_seed_corpus ;;
         fuzz_http_*)    echo fuzz_http_seed_corpus ;;
         *)              die "unknown target: $1" ;;
     esac
@@ -60,7 +61,7 @@ dict_for() {
 }
 
 [ $# -gt 0 ] || set -- fuzz_basic fuzz_json fuzz_http_controller \
-                       fuzz_http_h1p fuzz_http_h1p_peer
+                       fuzz_http_h1p fuzz_http_h1p_peer fuzz_unit_msg
 
 # Freeze the list: the loop below rebuilds "$@" to hold each target's libFuzzer
 # arguments, so it cannot also be the list being iterated.
