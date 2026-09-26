@@ -394,7 +394,7 @@ def test_asgi_process_switch():
     for _ in range(10):
         client.get(headers=headers_delay_1, no_recv=True)
 
-    client.get(headers=headers_delay_1)
+    assert client.get(headers=headers_delay_1)['status'] == 200
 
 
 def test_asgi_application_loading_error(skip_alert):
