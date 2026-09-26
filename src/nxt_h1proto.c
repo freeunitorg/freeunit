@@ -21,6 +21,8 @@
 #if (NXT_TLS)
 static ssize_t nxt_http_idle_io_read_handler(nxt_task_t *task, nxt_conn_t *c);
 static void nxt_http_conn_test(nxt_task_t *task, void *obj, void *data);
+static void nxt_http_conn_tls_conf_release(nxt_task_t *task, void *obj,
+    void *data);
 #endif
 static ssize_t nxt_h1p_idle_io_read_handler(nxt_task_t *task, nxt_conn_t *c);
 static void nxt_h1p_conn_proto_init(nxt_task_t *task, void *obj, void *data);
@@ -379,7 +381,41 @@ nxt_http_conn_test(nxt_task_t *task, void *obj, void *data)
 
     tls = joint->socket_conf->tls;
 
+    /*
+     * The connection holds the listener configuration until it is freed.
+     * The TLS connection reads its nxt_tls_conf_t, which lives in the memory
+     * pool of the router configuration, in the handshake callbacks and in
+     * the TLS shutdown.  Only a request references the configuration, so
+     * without this reference a reconfiguration would destroy it under a
+     * connection in the handshake, and under a keep-alive connection that
+     * is closed after its last request has released its own reference.
+     * The cleanup runs in nxt_conn_free(), after the TLS shutdown.
+     */
+    if (nxt_slow_path(nxt_mp_cleanup(c->mem_pool,
+                                     nxt_http_conn_tls_conf_release,
+                                     &engine->task, joint, NULL)
+                      != NXT_OK))
+    {
+        nxt_h1p_closing(task, c);
+        return;
+    }
+
+    joint->count++;
+
     tls->conn_init(task, tls, c);
+}
+
+
+static void
+nxt_http_conn_tls_conf_release(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_socket_conf_joint_t  *joint;
+
+    joint = obj;
+
+    nxt_debug(task, "http conn tls conf release");
+
+    nxt_router_conf_release(task, joint);
 }
 
 #endif
@@ -2493,9 +2529,14 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
            + sizeof("Connection: close\r\n")
            + sizeof("\r\n");
 
-    /* Emit Content-Length after chunked_transform; NULL body → value 0. */
+    /*
+     * Emit Content-Length after chunked_transform; NULL body → value 0.
+     * The transform adds a Content-Length field (r->content_length) that
+     * goes out with the other fields; a second one would make the
+     * upstream answer 400.
+     */
     content_length = -1;
-    if (r->chunked) {
+    if (r->chunked && r->content_length == NULL) {
         if (r->body == NULL) {
             content_length = 0;
         } else {
@@ -2899,13 +2940,8 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
          * releases the request pool.
          *
          * The predicate is the "final response" one, not the full RFC list:
-         * a 1xx from an upstream is an interim response, and nothing here
-         * continues the exchange past it -- nxt_h1p_peer_header_parse() only
-         * reads a status line while peer->status is still NXT_HTTP_UNSET, so
-         * the 1xx is taken as the response and whatever follows is relayed as
-         * its body.  That is pre-existing and out of scope; ending the
-         * exchange on the 1xx header here would discard a final response that
-         * may already be sitting in this very buffer.
+         * nxt_h1p_peer_header_parse() drops a 1xx and reads on, so a 1xx
+         * never reaches here.
          *
          * "b" is not forwarded: bytes an upstream put after the header of a
          * bodyless response are not a body.  It is handed to
@@ -2983,12 +3019,28 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
 }
 
 
+/*
+ * A 1xx other than 101 is an interim response (RFC 9110, 15.2).
+ * Limit how many one upstream response may have.  Apache also uses 10.
+ */
+#define NXT_HTTP_MAX_INTERIM_RESPONSES  10
+
+#define nxt_h1p_peer_status_interim(status)                                   \
+    ((status) >= NXT_HTTP_CONTINUE && (status) < NXT_HTTP_OK                  \
+     && (status) != NXT_HTTP_SWITCHING_PROTOCOLS)
+
+
 static nxt_int_t
 nxt_h1p_peer_header_parse(nxt_http_peer_t *peer, nxt_buf_mem_t *bm)
 {
-    u_char     *p;
-    size_t     length;
-    nxt_int_t  status;
+    u_char                    *p;
+    size_t                    length;
+    nxt_int_t                 ret, status;
+    nxt_http_request_parse_t  *rp;
+
+    rp = &peer->proto.h1->parser;
+
+again:
 
     if (peer->status < 0) {
         length = nxt_buf_mem_used_size(bm);
@@ -3022,9 +3074,44 @@ nxt_h1p_peer_header_parse(nxt_http_peer_t *peer, nxt_buf_mem_t *bm)
 
         bm->pos = p + 1;
         peer->status = status;
+
+        /* Do not store the fields of a 1xx. */
+        rp->discard_fields = nxt_h1p_peer_status_interim(status);
     }
 
-    return nxt_http_parse_fields(&peer->proto.h1->parser, bm);
+    ret = nxt_http_parse_fields(rp, bm);
+
+    if (ret != NXT_DONE || !nxt_h1p_peer_status_interim(peer->status)) {
+        return ret;
+    }
+
+    /*
+     * Drop the 1xx and read the next response.  The client gets only
+     * the final response.  NXT_ERROR becomes 502.
+     */
+    if (nxt_slow_path(++peer->num_interim > NXT_HTTP_MAX_INTERIM_RESPONSES)) {
+        nxt_log(&peer->request->task, NXT_LOG_WARN,
+                "upstream sent more than %d interim responses",
+                NXT_HTTP_MAX_INTERIM_RESPONSES);
+
+        return NXT_ERROR;
+    }
+
+    /* The handler can point to the end of the empty line. */
+    rp->handler = NULL;
+    peer->status = NXT_HTTP_UNSET;
+
+    /*
+     * Free the 1xx bytes, so the final header can use the whole buffer.
+     * This is safe only after NXT_DONE: no pointer into the buffer is left.
+     */
+    length = bm->free - bm->pos;
+    nxt_memmove(bm->start, bm->pos, length);
+
+    bm->pos = bm->start;
+    bm->free = bm->start + length;
+
+    goto again;
 }
 
 
@@ -3360,12 +3447,14 @@ nxt_h1p_peer_close(nxt_task_t *task, nxt_http_peer_t *peer)
      * nxt_h1p_peer_read_done()/nxt_h1p_peer_send_timeout()/etc. and dereference
      * the freed peer -- a use-after-free that crashes the router.  Both paths
      * are at risk: the read side (response relay) and the write side (the
-     * request body upload uses an autoreset send timer).  Setting block_read /
-     * block_write makes a queued nxt_conn_io_read()/nxt_conn_io_write() bail out
-     * early; nxt_conn_close() still emits the FIN via its work-queue handler.
+     * request body upload uses an autoreset send timer).  block_read stops
+     * a queued nxt_conn_io_read(), and the closing flag makes a queued
+     * nxt_conn_io_write() return.  nxt_conn_close() sets both; the fd == -1
+     * branch skips it and sets them here.  block_write would not do: it sends
+     * a queued write to the write state's error_handler, which uses the peer.
+     * nxt_conn_close() still emits the FIN via its work-queue handler.
      */
     c->block_read = 1;
-    c->block_write = 1;
     nxt_timer_disable(task->thread->engine, &c->read_timer);
     nxt_timer_disable(task->thread->engine, &c->write_timer);
 
@@ -3375,6 +3464,8 @@ nxt_h1p_peer_close(nxt_task_t *task, nxt_http_peer_t *peer)
         nxt_conn_close(task->thread->engine, c);
 
     } else {
+        c->closing = 1;
+
         nxt_h1p_peer_free(task, c, NULL);
     }
 }

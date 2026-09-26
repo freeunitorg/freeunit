@@ -28,7 +28,7 @@ from unit.utils import waitforsocket
 client = ApplicationProto()
 
 # Reserved in test/fake_upstream/README.md's port registry.
-UPSTREAM_PORT = 7977
+UPSTREAM_PORT = 7976
 
 BODY = 'hello, world'
 

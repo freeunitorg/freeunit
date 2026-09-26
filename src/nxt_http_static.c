@@ -1861,6 +1861,18 @@ complete_buf:
 
 clean:
 
+    /*
+     * The file goes first: the buffers below may hold the last references
+     * to the request pool, and when the pool is destroyed r is gone and
+     * nxt_http_static_buf_cleanup() would close the file a second time.
+     */
+    if (fb != NULL) {
+        nxt_file_close(task, fb->file);
+        r->out = NULL;
+
+        nxt_http_static_buf_free(fb);
+    }
+
     do {
         next = b->next;
 
@@ -1869,13 +1881,6 @@ clean:
 
         b = next;
     } while (b != NULL);
-
-    if (fb != NULL) {
-        nxt_file_close(task, fb->file);
-        r->out = NULL;
-
-        nxt_http_static_buf_free(fb);
-    }
 }
 
 
