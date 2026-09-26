@@ -1,6 +1,20 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Bugfix: the proxy recognised an upstream Transfer-Encoding only when
+       its value was exactly "chunked". "Chunked" or "gzip, chunked" was
+       not recognised, so the body was framed by Content-Length or by
+       connection close, and the chunk framing reached the client as body
+       bytes. The value is now parsed as a list of codings, and coding
+       names are compared without case. One "chunked" is decoded. Any
+       other transfer coding, and chunked together with Content-Length,
+       fails the request with 502: the proxy cannot decode such a body,
+       and it never forwards Transfer-Encoding to the client. A response
+       to HEAD, and any 204 or 304, is exempt from both 502s: it ends at
+       the first empty line, so no Transfer-Encoding frames it. Before,
+       such a response gave 502 when it carried chunked together with
+       Content-Length.
+
     *) Feature: the --hardening=[off|default|strict] configure option adds
        compiler and linker hardening flags. Each flag is probed, and a
        compiler that does not support a flag only loses that flag. The
