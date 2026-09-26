@@ -7,7 +7,8 @@
  * nxt_router_prepare_msg() (src/nxt_router.c) stores the method and header
  * name lengths as uint8_t.  A 251..255-byte name plus the "HTTP_" prefix,
  * or a method over 255 bytes, used to wrap and be stored truncated; now they
- * are refused with 431 and 501.  The limits themselves are pinned.
+ * are refused with 431 and 501.  The limits themselves are pinned, and so
+ * is nxt_app_msg_prefix[]: which app types get the prefix and which do not.
  *
  * The request is built by hand with one field, and in some cases a second
  * one marked skip, which the router must leave out of the message and its
@@ -27,17 +28,13 @@
 #include "nxt_tests.h"
 
 
-nxt_buf_t *nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
-    nxt_app_t *app, nxt_bool_t use_http_prefix, nxt_http_status_t *status);
-
-
 static u_char  nxt_prepare_msg_test_name[300];
 static u_char  nxt_prepare_msg_test_method[300];
 
 
 typedef struct {
     const char         *name;
-    nxt_bool_t         prefix;
+    nxt_app_type_t     type;
     size_t             method_length;
     size_t             field_length;
     size_t             skipped_length; /* 0: no skipped field */
@@ -45,24 +42,46 @@ typedef struct {
 } nxt_prepare_msg_test_case_t;
 
 
+#define NXT_TEST_431  NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE
+#define NXT_TEST_501  NXT_HTTP_NOT_IMPLEMENTED
+
+
 static const nxt_prepare_msg_test_case_t  nxt_prepare_msg_test_cases[] = {
-    { "short name, prefix",              1,   3,   6,   0, 0 },
-    { "250-byte name + prefix = 255",    1,   3, 250,   0, 0 },
-    { "251-byte name + prefix",          1,   3, 251,   0,
-      NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE },
-    { "253-byte name + prefix",          1,   3, 253,   0,
-      NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE },
-    { "255-byte name + prefix",          1,   3, 255,   0,
-      NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE },
-    { "255-byte name, no prefix",        0,   3, 255,   0, 0 },
-    { "255-byte method",                 0, 255,   6,   0, 0 },
-    { "256-byte method",                 0, 256,   6,   0,
-      NXT_HTTP_NOT_IMPLEMENTED },
-    { "280-byte method",                 0, 280,   6,   0,
-      NXT_HTTP_NOT_IMPLEMENTED },
-    { "251-byte skipped name + prefix",  1,   3,   6, 251, 0 },
-    { "255-byte skipped name + prefix",  1,   3,   6, 255, 0 },
+    { "short name, php",          NXT_APP_PHP,        3,   6,   0, 0 },
+    { "250-byte name + prefix",   NXT_APP_PHP,        3, 250,   0, 0 },
+    { "251-byte name + prefix",   NXT_APP_PHP,        3, 251,   0,
+      NXT_TEST_431 },
+    { "251-byte name, perl",      NXT_APP_PERL,       3, 251,   0,
+      NXT_TEST_431 },
+    { "251-byte name, ruby",      NXT_APP_RUBY,       3, 251,   0,
+      NXT_TEST_431 },
+    { "253-byte name + prefix",   NXT_APP_PHP,        3, 253,   0,
+      NXT_TEST_431 },
+    { "255-byte name + prefix",   NXT_APP_PHP,        3, 255,   0,
+      NXT_TEST_431 },
+    { "255-byte name, external",  NXT_APP_EXTERNAL,   3, 255,   0, 0 },
+    { "255-byte name, python",    NXT_APP_PYTHON,     3, 255,   0, 0 },
+    { "255-byte name, java",      NXT_APP_JAVA,       3, 255,   0, 0 },
+    { "255-byte name, wasm",      NXT_APP_WASM,       3, 255,   0, 0 },
+    { "255-byte name, wasm-wc",   NXT_APP_WASM_WC,    3, 255,   0, 0 },
+    { "255-byte method",          NXT_APP_PYTHON,   255,   6,   0, 0 },
+    { "256-byte method",          NXT_APP_PYTHON,   256,   6,   0,
+      NXT_TEST_501 },
+    { "280-byte method",          NXT_APP_PYTHON,   280,   6,   0,
+      NXT_TEST_501 },
+    { "251-byte skipped name",    NXT_APP_PHP,        3,   6, 251, 0 },
+    { "255-byte skipped name",    NXT_APP_PHP,        3,   6, 255, 0 },
 };
+
+
+/* The app types whose header names carry "HTTP_"; the rest get none. */
+
+static nxt_bool_t
+nxt_prepare_msg_test_prefixed(nxt_app_type_t type)
+{
+    return (type == NXT_APP_PHP || type == NXT_APP_PERL
+            || type == NXT_APP_RUBY);
+}
 
 
 /* On success *used is the size of the built message, 0 when refused. */
@@ -71,12 +90,14 @@ static nxt_int_t
 nxt_prepare_msg_test_case(nxt_task_t *task, nxt_mp_t *mp, nxt_app_t *app,
     nxt_sockaddr_t *sa, const nxt_prepare_msg_test_case_t *tc, size_t *used)
 {
+    u_char              *name;
     size_t              expect;
     nxt_buf_t           *b;
     nxt_str_t           *method, *args;
+    nxt_uint_t          status;
+    nxt_bool_t          prefixed;
     nxt_http_field_t    *field;
     nxt_unit_field_t    *f;
-    nxt_http_status_t   status;
     nxt_unit_request_t  *req;
     nxt_http_request_t  *r;
 
@@ -122,13 +143,14 @@ nxt_prepare_msg_test_case(nxt_task_t *task, nxt_mp_t *mp, nxt_app_t *app,
         field->value_length = 1;
     }
 
+    app->type = tc->type;
     *used = 0;
     status = 0;
 
-    b = nxt_router_test_prepare_msg(task, r, app, tc->prefix, &status);
+    b = nxt_router_test_prepare_msg(task, r, app, &status);
 
     if (b == NULL) {
-        if (status != tc->status) {
+        if (status != (nxt_uint_t) tc->status) {
             nxt_log_alert(task->log, "prepare msg test \"%s\": refused "
                           "with %d, expected %d", tc->name, (int) status,
                           (int) tc->status);
@@ -142,14 +164,17 @@ nxt_prepare_msg_test_case(nxt_task_t *task, nxt_mp_t *mp, nxt_app_t *app,
 
     req = (nxt_unit_request_t *) b->mem.pos;
     f = &req->fields[0];
+    name = nxt_unit_sptr_get(&f->name);
 
-    expect = tc->field_length + (tc->prefix ? nxt_length("HTTP_") : 0);
+    prefixed = nxt_prepare_msg_test_prefixed(tc->type);
+    expect = tc->field_length + (prefixed ? nxt_length("HTTP_") : 0);
 
     if (tc->status != 0
         || req->method_length != tc->method_length
         || req->fields_count != 1
         || f->name_length != expect
-        || nxt_strlen(nxt_unit_sptr_get(&f->name)) != expect)
+        || nxt_strlen(name) != expect
+        || (nxt_strncmp(name, "HTTP_", nxt_length("HTTP_")) == 0) != prefixed)
     {
         nxt_log_alert(task->log, "prepare msg test \"%s\": accepted with "
                       "method_length %d, name_length %d; expected %d and "
