@@ -79,6 +79,7 @@ typedef struct {
 
 
 typedef struct nxt_h1proto_s        nxt_h1proto_t;
+typedef struct nxt_h2p_stream_s     nxt_h2p_stream_t;
 
 struct nxt_h1p_websocket_timer_s {
     nxt_timer_t                     timer;
@@ -90,6 +91,7 @@ struct nxt_h1p_websocket_timer_s {
 typedef union {
     void                            *any;
     nxt_h1proto_t                   *h1;
+    nxt_h2p_stream_t                *h2;
 } nxt_http_proto_t;
 
 
@@ -543,6 +545,7 @@ void nxt_http_proxy_buf_mem_free(nxt_task_t *task, nxt_http_request_t *r,
 
 extern nxt_time_string_t  nxt_http_date_cache;
 
+extern nxt_lvlhsh_t                        nxt_http_request_fields_hash;
 extern nxt_lvlhsh_t                        nxt_response_fields_hash;
 
 extern const nxt_http_proto_table_t  nxt_http_proto[];
