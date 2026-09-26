@@ -503,6 +503,15 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        and where every compressor it accepts is below its "min_length" it is
        answered "406 Not Acceptable" instead of the bytes it declined.
 
+    *) Change: a server with no compression configured now answers "406 Not
+       Acceptable" to a request whose "Accept-Encoding" refuses the identity
+       coding: "identity;q=0", or "*;q=0" with no more specific entry for
+       identity.  Identity is the only coding such a server has, and it used
+       to send the response, or the requested range of it, in the bytes the
+       client had declined.  To read that refusal, every response with a
+       known, non-zero length is now checked for "Accept-Encoding"; before,
+       the check ran only with a compressor configured.
+
     *) Bugfix: a malformed weight in "Accept-Encoding" is no longer read as a
        refusal.  The qvalue was converted with strtod(), which takes no digits
        at all from "identity;q=" and from "identity;q=abc" and reports zero,

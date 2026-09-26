@@ -322,6 +322,19 @@ def test_php_compression_wildcard_offers_a_coding():
     assert gzip.decompress(body) == b'A' * 100000
 
 
+def test_php_compression_identity_refused_without_compressor():
+    # The same request with compression switched off altogether: identity is
+    # then the only coding there is, and this client refused it.  This is the
+    # path that reaches the check with a NULL configuration.
+    client.load('comp_large_body')
+
+    status, headers, _ = raw_get('/', 'identity;q=0')
+
+    assert status == 406, 'identity is the only available coding'
+    assert headers.get('Vary') == 'Accept-Encoding', 'the 406 varies'
+    assert 'Content-Encoding' not in headers
+
+
 def test_php_compression_identity_refused_below_min_length():
     # gzip is acceptable but never applied: "min_length" is above this body,
     # so the response would fall back to the identity the client refused.

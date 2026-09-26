@@ -569,6 +569,30 @@ def test_static_compression_wildcard_skips_inapplicable_coding(temp_dir):
     ).read_bytes()
 
 
+def test_static_compression_wildcard_without_compressors(temp_dir):
+    # With nothing enabled, identity is the only available coding, so that is
+    # all "*" can ever stand for -- and this client named it as refused.
+    assert 'success' in client.conf_delete(
+        'settings/http/compression'
+    ), 'compression off'
+
+    for spelling in (
+        'identity;q=0, *;q=1',
+        'identity;q=0, *;q=0.5, gzip;q=0.1',
+    ):
+        status, headers, _ = _raw_get(**{'Accept-Encoding': spelling})
+
+        assert status == 406, f'"*" has only identity to offer: {spelling!r}'
+        assert 'Content-Encoding' not in headers
+
+    # The wildcard still says yes to identity where nothing named it.
+    status, headers, body = _raw_get(**{'Accept-Encoding': 'gzip;q=0, *;q=1'})
+
+    assert status == 200, 'identity is what the wildcard offers'
+    assert 'Content-Encoding' not in headers
+    assert body == Path(f'{temp_dir}/assets/big.css').read_bytes()
+
+
 def test_static_compression_range_identity_refused_guards(temp_dir):
     # The cases either side of it, which must not move.
     size = Path(f'{temp_dir}/assets/big.css').stat().st_size

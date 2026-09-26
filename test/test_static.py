@@ -154,6 +154,26 @@ def test_static_accept_ranges():
     assert resp['headers']['Accept-Ranges'] == 'bytes', 'Accept-Ranges on 200'
 
 
+def test_static_range_identity_refused_without_compressor():
+    # A range is served as identity.  With no compressors configured there is
+    # no other representation to offer a client that refused identity, so the
+    # request is not serveable -- do not hand it the 206 of exactly the bytes
+    # it declined.  Nothing here configures compression, so this is the path
+    # that used to skip the Accept-Encoding parse altogether.
+    resp = client.get(
+        url='/index.html',
+        headers={
+            'Host': 'localhost',
+            'Connection': 'close',
+            'Accept-Encoding': 'identity;q=0',
+            'Range': 'bytes=0-4',
+        },
+    )
+
+    assert resp['status'] == 406, 'identity is the only available coding'
+    assert 'Content-Range' not in resp['headers']
+
+
 def unit_second(resp):
     """
     The second Unit believes it is in, taken from the response it just sent.
