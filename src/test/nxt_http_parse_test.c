@@ -64,6 +64,7 @@ static nxt_int_t nxt_http_parse_test_run(nxt_http_request_parse_t *rp,
     nxt_str_t *request);
 static nxt_int_t nxt_http_parse_test_bench(nxt_thread_t *thr,
     nxt_str_t *request, nxt_lvlhsh_t *hash, const char *name, nxt_uint_t n);
+static void nxt_http_parse_test_hash_destroy(nxt_lvlhsh_t *hash);
 static nxt_int_t nxt_http_parse_test_request_line(nxt_http_request_parse_t *rp,
     nxt_http_parse_test_data_t *data,
     nxt_str_t *request, nxt_log_t *log);
@@ -726,6 +727,24 @@ static nxt_str_t nxt_http_test_big_request = nxt_string(
 );
 
 
+/*
+ * nxt_http_fields_hash() and nxt_http_fields_hash_collisions() build a
+ * lvlhsh with the malloc-based nxt_http_fields_hash_proto (pool is NULL).
+ * The test drives them directly, so it must drain the hash itself here,
+ * the same way nxt_lvlhsh_retrieve() is used to tear down a lvlhsh in
+ * nxt_lvlhsh_test(), otherwise every bucket and level it allocated leaks.
+ */
+static void
+nxt_http_parse_test_hash_destroy(nxt_lvlhsh_t *hash)
+{
+    while (nxt_lvlhsh_retrieve(hash, &nxt_http_fields_hash_proto, NULL)
+           != NULL)
+    {
+        continue;
+    }
+}
+
+
 nxt_int_t
 nxt_http_parse_test(nxt_thread_t *thr)
 {
@@ -792,12 +811,16 @@ nxt_http_parse_test(nxt_thread_t *thr)
                                         nxt_nitems(nxt_http_test_bench_fields),
                                         0);
 
+    nxt_http_parse_test_hash_destroy(&hash);
+
     nxt_memzero(&hash, sizeof(nxt_lvlhsh_t));
 
     lvl_colls = nxt_http_fields_hash_collisions(&hash,
                                         nxt_http_test_bench_fields,
                                         nxt_nitems(nxt_http_test_bench_fields),
                                         1);
+
+    nxt_http_parse_test_hash_destroy(&hash);
 
     nxt_log_error(NXT_LOG_NOTICE, thr->log,
                   "http parse test hash collisions %ui out of %uz, level: %ui",
@@ -815,6 +838,7 @@ nxt_http_parse_test(nxt_thread_t *thr)
                                   &hash, "simple", 1000000)
         != NXT_OK)
     {
+        nxt_http_parse_test_hash_destroy(&hash);
         return NXT_ERROR;
     }
 
@@ -822,8 +846,11 @@ nxt_http_parse_test(nxt_thread_t *thr)
                                   &hash, "big", 100000)
         != NXT_OK)
     {
+        nxt_http_parse_test_hash_destroy(&hash);
         return NXT_ERROR;
     }
+
+    nxt_http_parse_test_hash_destroy(&hash);
 
     return NXT_OK;
 }

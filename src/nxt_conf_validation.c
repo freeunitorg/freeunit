@@ -2854,8 +2854,7 @@ nxt_conf_vldt_compressors(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
 
     /* NXT_CONF_OBJECT */
 
-    return nxt_conf_vldt_object_iterator(vldt, value,
-                                         &nxt_conf_vldt_compressor_members);
+    return nxt_conf_vldt_object(vldt, value, nxt_conf_vldt_compressor_members);
 }
 
 

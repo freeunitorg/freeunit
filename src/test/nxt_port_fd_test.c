@@ -364,6 +364,7 @@ nxt_port_fd_test(nxt_thread_t *thr)
     nxt_fd_t                 fd0, fd1;
     nxt_task_t               *task;
     nxt_int_t                ret;
+    nxt_pid_t                port_pid;
     nxt_port_t               *port, *existing;
     nxt_runtime_t            *rt, *saved_rt;
     nxt_port_recv_msg_t      msg;
@@ -379,6 +380,14 @@ nxt_port_fd_test(nxt_thread_t *thr)
     /* Defined before the first goto done: the cleanup there releases them. */
     port = NULL;
     existing = NULL;
+
+    /*
+     * Only read at "done" through port, and only ever set together with
+     * it (see the comment at its real assignment below); the initializer
+     * is just to satisfy -Wmaybe-uninitialized, which cannot see that
+     * pairing.
+     */
+    port_pid = 0;
 
     mp = nxt_mp_create(1024, 128, 256, 32);
     if (nxt_slow_path(mp == NULL)) {
@@ -412,6 +421,15 @@ nxt_port_fd_test(nxt_thread_t *thr)
      * engine, so a zeroed one is enough to reach the end of the handler.
      */
     thr->engine = engine;
+
+    /*
+     * nxt_runtime_process_release() defers a process's teardown to
+     * rt->main_engine unless the calling thread is already on it, and
+     * compares it against thr->engine -- a mismatch posts to whatever
+     * rt->main_engine happens to hold, NULL here, and crashes.  The fixture
+     * runs everything on the one engine above, so that is main_engine too.
+     */
+    rt->main_engine = engine;
 
     nxt_memzero(&msg, sizeof(nxt_port_recv_msg_t));
 
@@ -579,6 +597,17 @@ nxt_port_fd_test(nxt_thread_t *thr)
         goto done;
     }
 
+    /*
+     * nxt_port_enable() below, exercised by the dispatcher cases and the
+     * fragment tests, sets port->pid to this process's own pid -- the
+     * usual thing for a port a process enables for itself, but it retargets
+     * the pid this port was registered in rt->ports under.  The teardown
+     * has to remove it by that original key, since a lookup by the mutated
+     * pid finds nothing and nxt_runtime_port_remove() would silently leak
+     * the port and its reference.
+     */
+    port_pid = port->pid;
+
     if (nxt_slow_path(msg.fd[0] != -1 || port->pair[1] != fd0)) {
         nxt_log_alert(thr->log, "port fd test: the new port did not take the "
                       "socket over");
@@ -709,6 +738,13 @@ done:
     }
 
     if (port != NULL) {
+        /*
+         * Restore the pid it was registered under (see the comment at
+         * port_pid's assignment above) so the lookup inside remove() finds
+         * it.
+         */
+        port->pid = port_pid;
+
         nxt_port_close(task, port);
         nxt_runtime_port_remove(task, port);
     }

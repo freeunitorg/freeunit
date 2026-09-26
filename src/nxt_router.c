@@ -5415,7 +5415,12 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         nxt_request_rpc_data_unlink(task, req_rpc_data);
 
     } else {
-        if (app->timeout != 0) {
+        /*
+         * The deadline bounds the worker's answer, and an upgraded
+         * WebSocket has had its answer: the frames that follow are a
+         * session, however quiet (#422).
+         */
+        if (app->timeout != 0 && r->state != &nxt_http_websocket) {
             r->timer.handler = nxt_router_app_timeout;
             r->timer_data = req_rpc_data;
             nxt_timer_add(task->thread->engine, &r->timer, app->timeout);
@@ -5590,6 +5595,13 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
             nxt_debug(task, "stream #%uD upgrade", req_rpc_data->stream);
 
             r->state = &nxt_http_websocket;
+
+            /*
+             * The 101 arrived as a non-last message, which re-armed the
+             * request deadline above; the upgrade ends the request, so the
+             * deadline goes with it (#422).
+             */
+            nxt_timer_disable(task->thread->engine, &r->timer);
 
         } else {
             r->state = &nxt_http_request_send_state;
