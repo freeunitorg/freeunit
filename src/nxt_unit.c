@@ -5,6 +5,7 @@
 
 #include "nxt_main.h"
 #include "nxt_port_memory_int.h"
+#include "nxt_span.h"
 #include "nxt_socket_msg.h"
 #include "nxt_port_queue.h"
 #include "nxt_app_queue.h"
@@ -142,6 +143,8 @@ static int nxt_unit_check_rbuf_mmap(nxt_unit_ctx_t *ctx,
 static int nxt_unit_mmap_read(nxt_unit_ctx_t *ctx,
     nxt_unit_recv_msg_t *recv_msg, nxt_unit_read_buf_t *rbuf);
 static int nxt_unit_get_mmap(nxt_unit_ctx_t *ctx, pid_t pid, uint32_t id);
+static void nxt_unit_unpark_rbufs(nxt_unit_ctx_t *ctx,
+    nxt_queue_t *awaiting_rbuf);
 static void nxt_unit_mmap_release(nxt_unit_ctx_t *ctx,
     nxt_port_mmap_header_t *hdr, void *start, uint32_t size);
 static int nxt_unit_send_shm_ack(nxt_unit_ctx_t *ctx, pid_t pid);
@@ -266,53 +269,10 @@ nxt_unit_response_buf_size(uint32_t max_fields_count,
 
 
 /*
- * Validate that an sptr field within a peer-supplied buffer dereferences
- * to a [length]-byte range that is wholly inside the buffer.  Used at
- * request-arrival time to vet every sptr in nxt_unit_request_t before
- * the application sees it.
- *
- * sptr->base aliases the address of the sptr itself (the union encodes
- * an offset relative to that location), so this also implicitly checks
- * that the sptr is inside the buffer.
+ * nxt_unit_sptr_in_buf() moved to nxt_unit_sptr.h: the router's response
+ * parser (src/nxt_router.c) needs the exact same bounds check against a
+ * peer-supplied buffer, on the other side of the trust boundary.
  */
-static int
-nxt_unit_sptr_in_buf(nxt_unit_sptr_t *sptr, uint32_t length,
-    void *buf_start, uint32_t buf_size)
-{
-    size_t  sptr_off, end_off;
-
-    if ((uint8_t *) sptr < (uint8_t *) buf_start) {
-        return 0;
-    }
-
-    sptr_off = (uint8_t *) sptr - (uint8_t *) buf_start;
-
-    /*
-     * The sptr struct itself must fit inside the buffer before we
-     * dereference sptr->offset.  Reject a buffer too small to hold an
-     * sptr first: buf_size is uint32_t and sizeof() is size_t, so
-     * "buf_size - sizeof(nxt_unit_sptr_t)" is evaluated in size_t and
-     * underflows to a huge value -- wrongly passing the bound check --
-     * when buf_size is smaller than the struct.  The short-circuit keeps
-     * the subtraction below from ever underflowing.
-     */
-    if (buf_size < sizeof(nxt_unit_sptr_t)
-        || sptr_off > buf_size - sizeof(nxt_unit_sptr_t))
-    {
-        return 0;
-    }
-
-    if (sptr->offset > buf_size - sptr_off) {
-        return 0;
-    }
-
-    end_off = sptr_off + sptr->offset;
-    if (length > buf_size - end_off) {
-        return 0;
-    }
-
-    return 1;
-}
 
 
 struct nxt_unit_mmap_buf_s {
@@ -1334,6 +1294,73 @@ done:
 }
 
 
+#if (NXT_TESTS || NXT_FUZZ_BUILD)
+
+/*
+ * Feeds one message through nxt_unit_process_msg() as if it had just been
+ * read from a port of "ctx", then reads the buffers it made pending and
+ * runs whatever request it made ready through callbacks.request_handler,
+ * the way the read loops do.  "fd", when
+ * not -1, arrives as the message's SCM_RIGHTS descriptor and is owned by
+ * libunit from here on.  Used by src/test/nxt_unit_msg_test.c and
+ * fuzzing/nxt_unit_msg_fuzz.c.
+ */
+
+int
+nxt_unit_test_process_msg(nxt_unit_ctx_t *ctx, const void *msg, size_t size,
+    int fd)
+{
+    int                  rc;
+    struct cmsghdr       *cmsg;
+    nxt_unit_read_buf_t  *rbuf;
+
+    rbuf = nxt_unit_read_buf_get(ctx);
+    if (nxt_slow_path(rbuf == NULL)) {
+        return NXT_UNIT_ERROR;
+    }
+
+    if (nxt_slow_path(size > sizeof(rbuf->buf))) {
+        nxt_unit_read_buf_release(ctx, rbuf);
+
+        return NXT_UNIT_ERROR;
+    }
+
+    /* Deterministic bytes past the message, whatever the buffer held. */
+    memset(rbuf->buf, 0, sizeof(rbuf->buf));
+    memcpy(rbuf->buf, msg, size);
+
+    rbuf->size = size;
+    rbuf->oob.size = 0;
+    rbuf->oob.truncated = 0;
+
+    if (fd != -1) {
+        cmsg = (struct cmsghdr *) rbuf->oob.buf;
+
+        memset(cmsg, 0, CMSG_SPACE(sizeof(int)));
+
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+
+        memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+
+        rbuf->oob.size = CMSG_SPACE(sizeof(int));
+    }
+
+    rc = nxt_unit_process_msg(ctx, rbuf, NULL);
+
+    if (rc != NXT_UNIT_ERROR) {
+        rc = nxt_unit_process_pending_rbuf(ctx);
+    }
+
+    nxt_unit_process_ready_req(ctx);
+
+    return rc;
+}
+
+#endif
+
+
 static int
 nxt_unit_process_new_port(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg)
 {
@@ -1471,6 +1498,7 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
      * co-located with arrival makes the trust boundary explicit.
      */
     {
+        void                *name, *value, *end;
         uint32_t            i;
         nxt_unit_request_t  *vr = recv_msg->start;
         uint32_t            vsize = recv_msg->size;
@@ -1521,14 +1549,26 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
             return NXT_UNIT_ERROR;
         }
 
+        /*
+         * Field strings must also lie past fields[]: the router puts them
+         * there, and nxt_unit_request_group_dup_fields() moves fields one
+         * slot on by subtracting sizeof(nxt_unit_field_t) from their
+         * offsets, which a target inside fields[] would underflow.  The
+         * pointers the check returns are used, not the sptr read again:
+         * the peer can change the offset between two reads.
+         */
+        end = &vr->fields[vr->fields_count];
+
         for (i = 0; i < vr->fields_count; i++) {
-            if (nxt_slow_path(
-                   !nxt_unit_sptr_in_buf(&vr->fields[i].name,
-                                         vr->fields[i].name_length,
-                                         recv_msg->start, vsize)
-                || !nxt_unit_sptr_in_buf(&vr->fields[i].value,
+            name = nxt_unit_sptr_in_buf(&vr->fields[i].name,
+                                        vr->fields[i].name_length,
+                                        recv_msg->start, vsize);
+            value = nxt_unit_sptr_in_buf(&vr->fields[i].value,
                                          vr->fields[i].value_length,
-                                         recv_msg->start, vsize)))
+                                         recv_msg->start, vsize);
+
+            if (nxt_slow_path(name == NULL || value == NULL
+                              || name < end || value < end))
             {
                 nxt_unit_warn(ctx, "#%"PRIu32": malformed request: field "
                               "%"PRIu32" sptr out of buffer",
@@ -4425,11 +4465,25 @@ nxt_unit_wait_shm_ack(nxt_unit_ctx_t *ctx)
 static nxt_unit_mmap_t *
 nxt_unit_mmap_at(nxt_unit_mmaps_t *mmaps, uint32_t i)
 {
+    size_t           bytes;
     uint32_t         cap, n;
     nxt_unit_mmap_t  *e;
 
     if (nxt_fast_path(mmaps->size > i)) {
         return mmaps->elts + i;
+    }
+
+    /*
+     * The same guards as nxt_port_mmap_at() on the router side.  "i" is a
+     * segment id taken from the peer (an mmap record or a segment header),
+     * and is deliberately not capped: the router allocates its outgoing
+     * segments without a limit.  What has to hold is the arithmetic: a
+     * capacity able to hold slot i is i + 1 elements, which does not fit
+     * uint32_t for i == UINT32_MAX -- "i + 1 > cap" then wraps to 0, skips
+     * the growth, and the element pointer lands 4G elements past the array.
+     */
+    if (nxt_slow_path(i == UINT32_MAX)) {
+        return NULL;
     }
 
     cap = mmaps->cap;
@@ -4438,19 +4492,31 @@ nxt_unit_mmap_at(nxt_unit_mmaps_t *mmaps, uint32_t i)
         cap = i + 1;
     }
 
-    while (i + 1 > cap) {
+    while (cap <= i) {
 
         if (cap < 16) {
             cap = cap * 2;
 
         } else {
+            /* The 1.5x step would wrap below the target and spin. */
+            if (nxt_slow_path(cap > UINT32_MAX - cap / 2)) {
+                return NULL;
+            }
+
             cap = cap + cap / 2;
         }
     }
 
     if (cap != mmaps->cap) {
 
-        e = realloc(mmaps->elts, cap * sizeof(nxt_unit_mmap_t));
+        if (nxt_slow_path(nxt_size_mul(cap, sizeof(nxt_unit_mmap_t),
+                                       &bytes)
+                          != 0))
+        {
+            return NULL;
+        }
+
+        e = realloc(mmaps->elts, bytes);
         if (nxt_slow_path(e == NULL)) {
             return NULL;
         }
@@ -4732,12 +4798,11 @@ nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd)
 {
     int                     rc;
     void                    *mem;
+    uint32_t                id;
     nxt_queue_t             awaiting_rbuf;
     struct stat             mmap_stat;
     nxt_unit_mmap_t         *mm;
     nxt_unit_impl_t         *lib;
-    nxt_unit_ctx_impl_t     *ctx_impl;
-    nxt_unit_read_buf_t     *rbuf;
     nxt_port_mmap_header_t  *hdr;
 
     lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
@@ -4751,7 +4816,20 @@ nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd)
         return NXT_UNIT_ERROR;
     }
 
-    mem = mmap(NULL, mmap_stat.st_size, PROT_READ | PROT_WRITE,
+    /*
+     * Every chunk offset is computed against PORT_MMAP_SIZE, and the
+     * munmap() calls use it too: a shorter object faults on access, a
+     * longer one leaks the excess mapping.  The router side requires the
+     * same (nxt_port_incoming_port_mmap()).
+     */
+    if (nxt_slow_path(mmap_stat.st_size != (off_t) PORT_MMAP_SIZE)) {
+        nxt_unit_alert(ctx, "incoming_mmap: unexpected segment size: %d != %d",
+                       (int) mmap_stat.st_size, (int) PORT_MMAP_SIZE);
+
+        return NXT_UNIT_ERROR;
+    }
+
+    mem = mmap(NULL, PORT_MMAP_SIZE, PROT_READ | PROT_WRITE,
                MAP_SHARED, fd, 0);
     if (nxt_slow_path(mem == MAP_FAILED)) {
         nxt_unit_alert(ctx, "incoming_mmap: mmap() failed: %s (%d)",
@@ -4773,17 +4851,37 @@ nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd)
         return NXT_UNIT_ERROR;
     }
 
+    /*
+     * The segment id lives in memory the sender keeps mapped writable: read
+     * it once and use only the copy.  It indexes lib->incoming, which
+     * nxt_unit_mmap_at() grows to fit and which refuses an id whose slot
+     * cannot be represented.
+     */
+    id = hdr->id;
+
     nxt_queue_init(&awaiting_rbuf);
 
     pthread_mutex_lock(&lib->incoming.mutex);
 
-    mm = nxt_unit_mmap_at(&lib->incoming, hdr->id);
+    mm = nxt_unit_mmap_at(&lib->incoming, id);
     if (nxt_slow_path(mm == NULL)) {
         nxt_unit_alert(ctx, "incoming_mmap: failed to add to incoming array");
 
         munmap(mem, PORT_MMAP_SIZE);
 
         rc = NXT_UNIT_ERROR;
+
+    } else if (nxt_slow_path(mm->hdr != NULL)) {
+        /*
+         * A duplicate id: buffers may point into the segment already
+         * there, so it stays and the new mapping goes.
+         */
+        nxt_unit_warn(ctx, "incoming_mmap: duplicate segment id %"PRIu32,
+                      id);
+
+        munmap(mem, PORT_MMAP_SIZE);
+
+        rc = NXT_UNIT_OK;
 
     } else {
         mm->hdr = hdr;
@@ -4798,7 +4896,24 @@ nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd)
 
     pthread_mutex_unlock(&lib->incoming.mutex);
 
-    nxt_queue_each(rbuf, &awaiting_rbuf, nxt_unit_read_buf_t, link) {
+    nxt_unit_unpark_rbufs(ctx, &awaiting_rbuf);
+
+    return rc;
+}
+
+
+/*
+ * Hands the read buffers parked on a segment back to their contexts as
+ * pending, so each context reads its message again.
+ */
+
+static void
+nxt_unit_unpark_rbufs(nxt_unit_ctx_t *ctx, nxt_queue_t *awaiting_rbuf)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+    nxt_unit_read_buf_t  *rbuf;
+
+    nxt_queue_each(rbuf, awaiting_rbuf, nxt_unit_read_buf_t, link) {
 
         ctx_impl = rbuf->ctx_impl;
 
@@ -4813,8 +4928,6 @@ nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd)
         nxt_unit_awake_ctx(ctx, ctx_impl);
 
     } nxt_queue_loop;
-
-    return rc;
 }
 
 
@@ -4903,6 +5016,7 @@ nxt_unit_check_rbuf_mmap(nxt_unit_ctx_t *ctx, nxt_unit_mmaps_t *mmaps,
     nxt_unit_read_buf_t *rbuf)
 {
     int                  res, need_rbuf;
+    nxt_queue_t          awaiting_rbuf;
     nxt_unit_mmap_t      *mm;
     nxt_unit_ctx_impl_t  *ctx_impl;
 
@@ -4936,13 +5050,58 @@ nxt_unit_check_rbuf_mmap(nxt_unit_ctx_t *ctx, nxt_unit_mmaps_t *mmaps,
     if (need_rbuf) {
         res = nxt_unit_get_mmap(ctx, pid, id);
         if (nxt_slow_path(res == NXT_UNIT_ERROR)) {
-            return NXT_UNIT_ERROR;
+            /*
+             * The caller releases rbuf on ERROR, so take it back off the
+             * wait queue first -- unless the segment arrived meanwhile and
+             * nxt_unit_incoming_mmap() already took it, in which case it
+             * is pending and still ours to wait on.
+             *
+             * Buffers other contexts parked behind this one did not ask
+             * for the segment themselves and nobody will ask for it now,
+             * so they go back to their contexts: the next read asks again.
+             */
+            nxt_queue_init(&awaiting_rbuf);
+
+            pthread_mutex_lock(&mmaps->mutex);
+
+            if (mmaps->elts[id].hdr == NULL) {
+                nxt_queue_remove(&rbuf->link);
+                res = NXT_UNIT_ERROR;
+
+                nxt_queue_add(&awaiting_rbuf, &mmaps->elts[id].awaiting_rbuf);
+                nxt_queue_init(&mmaps->elts[id].awaiting_rbuf);
+
+            } else {
+                res = NXT_UNIT_AGAIN;
+            }
+
+            pthread_mutex_unlock(&mmaps->mutex);
+
+            if (res == NXT_UNIT_ERROR) {
+                nxt_atomic_fetch_add(&ctx_impl->wait_items, -1);
+
+                nxt_unit_unpark_rbufs(ctx, &awaiting_rbuf);
+            }
+
+            return res;
         }
     }
 
     return NXT_UNIT_AGAIN;
 }
 
+
+/*
+ * The payload of an mmap message is an array of nxt_port_mmap_msg_t written
+ * by the router.  It is walked with nxt_span_copy(): a payload that is not a
+ * whole number of records -- a partial tail -- is refused as a whole before
+ * anything is allocated, instead of its last "record" being read past the
+ * end of the message.  Each record is copied out before use, and every
+ * field is bounds-checked before it reaches an index or pointer arithmetic:
+ * mmap_id by nxt_unit_mmap_at(), which refuses an id whose slot cannot be
+ * represented (the id is not capped otherwise -- see there), chunk_id and
+ * size by nxt_port_mmap_chunk_range_valid().
+ */
 
 static int
 nxt_unit_mmap_read(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
@@ -4952,10 +5111,12 @@ nxt_unit_mmap_read(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
     void                    *start;
     size_t                  nchunks;
     uint32_t                size;
+    nxt_bool_t              first;
+    nxt_span_t              span;
     nxt_unit_impl_t         *lib;
     nxt_unit_mmaps_t        *mmaps;
     nxt_unit_mmap_buf_t     *b, **incoming_tail;
-    nxt_port_mmap_msg_t     *mmap_msg, *end;
+    nxt_port_mmap_msg_t     mmap_msg;
     nxt_port_mmap_header_t  *hdr;
 
     if (nxt_slow_path(recv_msg->size < sizeof(nxt_port_mmap_msg_t))) {
@@ -4965,13 +5126,21 @@ nxt_unit_mmap_read(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
         return NXT_UNIT_ERROR;
     }
 
-    mmap_msg = recv_msg->start;
-    end = nxt_pointer_to(recv_msg->start, recv_msg->size);
+    if (nxt_slow_path(recv_msg->size % sizeof(nxt_port_mmap_msg_t) != 0)) {
+        nxt_unit_alert(ctx, "#%"PRIu32": mmap_read: message size %d is not "
+                       "a whole number of mmap records",
+                       recv_msg->stream, (int) recv_msg->size);
+
+        return NXT_UNIT_ERROR;
+    }
 
     incoming_tail = &recv_msg->incoming_buf;
 
-    /* Allocating buffer structures. */
-    for (; mmap_msg < end; mmap_msg++) {
+    /* Allocating buffer structures, one per whole record. */
+    for (size = 0;
+         size < recv_msg->size;
+         size += sizeof(nxt_port_mmap_msg_t))
+    {
         b = nxt_unit_mmap_buf_get(ctx);
         if (nxt_slow_path(b == NULL)) {
             nxt_unit_warn(ctx, "#%"PRIu32": mmap_read: failed to allocate buf",
@@ -4989,7 +5158,10 @@ nxt_unit_mmap_read(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
     }
 
     b = recv_msg->incoming_buf;
-    mmap_msg = recv_msg->start;
+    first = 1;
+
+    nxt_span_init(&span, recv_msg->start,
+                  nxt_pointer_to(recv_msg->start, recv_msg->size));
 
     lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
 
@@ -4997,9 +5169,10 @@ nxt_unit_mmap_read(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
 
     pthread_mutex_lock(&mmaps->mutex);
 
-    for (; mmap_msg < end; mmap_msg++) {
+    while (nxt_span_copy(&span, &mmap_msg, sizeof(nxt_port_mmap_msg_t)) == 0) {
+
         res = nxt_unit_check_rbuf_mmap(ctx, mmaps,
-                                       recv_msg->pid, mmap_msg->mmap_id,
+                                       recv_msg->pid, mmap_msg.mmap_id,
                                        &hdr, rbuf);
 
         if (nxt_slow_path(res != NXT_UNIT_OK)) {
@@ -5015,39 +5188,26 @@ nxt_unit_mmap_read(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
          * would point outside the mapped data area before they reach the
          * pointer arithmetic below.
          */
-        if (nxt_slow_path(!nxt_port_mmap_chunk_range_valid(mmap_msg->chunk_id,
-                                                           mmap_msg->size,
+        if (nxt_slow_path(!nxt_port_mmap_chunk_range_valid(mmap_msg.chunk_id,
+                                                           mmap_msg.size,
                                                            &nchunks)))
         {
             nxt_unit_alert(ctx, "#%"PRIu32": mmap_read: invalid mmap message: "
                            "chunk_id %"PRIu32", size %"PRIu32
                            " (chunks %zu, max %d)",
-                           recv_msg->stream, mmap_msg->chunk_id,
-                           mmap_msg->size, nchunks, PORT_MMAP_CHUNK_COUNT);
+                           recv_msg->stream, mmap_msg.chunk_id,
+                           mmap_msg.size, nchunks, PORT_MMAP_CHUNK_COUNT);
 
-            pthread_mutex_unlock(&mmaps->mutex);
-
-            /*
-             * Entries before the rejected one are already populated, and
-             * this message is dropped rather than retried, so their chunks
-             * have to be marked free as well: nxt_unit_mmap_buf_release()
-             * alone would recycle the wrappers and leave the chunks busy in
-             * the peer's segment for good.  Entries not reached yet have a
-             * NULL hdr and are skipped by nxt_unit_free_outgoing_buf().
-             */
-            while (recv_msg->incoming_buf != NULL) {
-                nxt_unit_mmap_buf_free(recv_msg->incoming_buf);
-            }
-
-            return NXT_UNIT_ERROR;
+            goto invalid;
         }
 
-        start = nxt_port_mmap_chunk_start(hdr, mmap_msg->chunk_id);
-        size = mmap_msg->size;
+        start = nxt_port_mmap_chunk_start(hdr, mmap_msg.chunk_id);
+        size = mmap_msg.size;
 
-        if (recv_msg->start == mmap_msg) {
+        if (first) {
             recv_msg->start = start;
             recv_msg->size = size;
+            first = 0;
         }
 
         b->buf.start = start;
@@ -5061,13 +5221,31 @@ nxt_unit_mmap_read(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
                        recv_msg->stream,
                        start, (int) size,
                        (int) hdr->src_pid, (int) hdr->dst_pid,
-                       (int) hdr->id, (int) mmap_msg->chunk_id,
-                       (int) mmap_msg->size);
+                       (int) hdr->id, (int) mmap_msg.chunk_id,
+                       (int) mmap_msg.size);
     }
 
     pthread_mutex_unlock(&mmaps->mutex);
 
     return NXT_UNIT_OK;
+
+invalid:
+
+    pthread_mutex_unlock(&mmaps->mutex);
+
+    /*
+     * Entries before the rejected one are already populated, and this
+     * message is dropped rather than retried, so their chunks have to be
+     * marked free as well: nxt_unit_mmap_buf_release() alone would recycle
+     * the wrappers and leave the chunks busy in the peer's segment for good.
+     * Entries not reached yet have a NULL hdr and are skipped by
+     * nxt_unit_free_outgoing_buf().
+     */
+    while (recv_msg->incoming_buf != NULL) {
+        nxt_unit_mmap_buf_free(recv_msg->incoming_buf);
+    }
+
+    return NXT_UNIT_ERROR;
 }
 
 
