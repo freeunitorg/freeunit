@@ -127,6 +127,7 @@ NXT_LIBRT=
 . auto/unix
 . auto/os/conf
 . auto/ssltls
+. auto/h2
 . auto/compression
 
 if [ $NXT_REGEX = YES ]; then
@@ -168,11 +169,11 @@ END
 
 # LOOK
 
-NXT_LIB_AUX_CFLAGS="$NXT_OPENSSL_CFLAGS \\
+NXT_LIB_AUX_CFLAGS="$NXT_OPENSSL_CFLAGS $NXT_NGHTTP2_CFLAGS \\
                     $NXT_PCRE_CFLAGS $NXT_ZLIB_CFLAGS $NXT_ZSTD_CFLAGS \\
                     $NXT_BROTLI_CFLAGS"
 
-NXT_LIB_AUX_LIBS="$NXT_OPENSSL_LIBS \\
+NXT_LIB_AUX_LIBS="$NXT_OPENSSL_LIBS $NXT_NGHTTP2_LIBS \\
                     $NXT_PCRE_LIB $NXT_ZLIB_LIBS $NXT_ZSTD_LIBS \\
                     $NXT_BROTLI_LIBS"
 

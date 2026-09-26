@@ -167,6 +167,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_http_request_fields_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_strverscmp_test(thr) != NXT_OK) {
         return 1;
     }
@@ -184,6 +188,14 @@ main(int argc, char **argv)
     }
 
     if (nxt_http_chunk_parse_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_http_validate_host_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_http_request_body_alloc_test(thr) != NXT_OK) {
         return 1;
     }
 

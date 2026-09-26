@@ -10,6 +10,9 @@
 #include <nxt_h1proto.h>
 #include <nxt_websocket.h>
 #include <nxt_websocket_header.h>
+#if (NXT_HAVE_NGHTTP2)
+#include <nxt_h2proto.h>
+#endif
 
 
 /*
@@ -83,7 +86,6 @@ static void nxt_h1p_idle_response_timeout(nxt_task_t *task, void *obj,
 static nxt_msec_t nxt_h1p_idle_response_timer_value(nxt_conn_t *c,
     uintptr_t data);
 static void nxt_h1p_shutdown(nxt_task_t *task, nxt_conn_t *c);
-static void nxt_h1p_closing(nxt_task_t *task, nxt_conn_t *c);
 static void nxt_h1p_conn_ws_shutdown(nxt_task_t *task, void *obj, void *data);
 static void nxt_h1p_conn_closing(nxt_task_t *task, void *obj, void *data);
 static void nxt_h1p_conn_free(nxt_task_t *task, void *obj, void *data);
@@ -153,12 +155,31 @@ const nxt_http_proto_table_t  nxt_http_proto[3] = {
 
         .ws_frame_start   = nxt_h1p_websocket_frame_start,
     },
-    /* NXT_HTTP_PROTO_H2      */
+    /* NXT_HTTP_PROTO_H2 */
+#if (NXT_HAVE_NGHTTP2)
+    {
+        .body_read        = nxt_h2p_request_body_read,
+        .local_addr       = nxt_h2p_request_local_addr,
+        .header_send      = nxt_h2p_request_header_send,
+        .send             = nxt_h2p_request_send,
+        .body_bytes_sent  = nxt_h2p_request_body_bytes_sent,
+        .discard          = nxt_h2p_request_discard,
+        .close            = nxt_h2p_request_close,
+    },
+#endif
     /* NXT_HTTP_PROTO_DEVNULL */
 };
 
 
-static nxt_lvlhsh_t                    nxt_h1p_fields_hash;
+nxt_lvlhsh_t                           nxt_h1p_fields_hash;
+nxt_lvlhsh_t                           nxt_http_request_fields_hash;
+
+/*
+ * The first NXT_H1P_ONLY_FIELDS entries are HTTP/1 framing.  The entries
+ * after them hold for every protocol and form nxt_http_request_fields_hash,
+ * which a frontend without HTTP/1 framing processes its fields with.
+ */
+#define NXT_H1P_ONLY_FIELDS  5
 
 static nxt_http_field_proc_t           nxt_h1p_fields[] = {
     { nxt_string("Connection"),        &nxt_h1p_connection, 0 },
@@ -205,6 +226,13 @@ nxt_h1p_init(nxt_task_t *task)
 
     ret = nxt_http_fields_hash(&nxt_h1p_fields_hash,
                                nxt_h1p_fields, nxt_nitems(nxt_h1p_fields));
+
+    if (nxt_fast_path(ret == NXT_OK)) {
+        ret = nxt_http_fields_hash(&nxt_http_request_fields_hash,
+                                   &nxt_h1p_fields[NXT_H1P_ONLY_FIELDS],
+                                   nxt_nitems(nxt_h1p_fields)
+                                   - NXT_H1P_ONLY_FIELDS);
+    }
 
     if (nxt_fast_path(ret == NXT_OK)) {
         ret = nxt_http_fields_hash(&nxt_h1p_peer_fields_hash,
@@ -495,6 +523,13 @@ nxt_h1p_conn_proto_init(nxt_task_t *task, void *obj, void *data)
     c = obj;
 
     nxt_debug(task, "h1p conn proto init");
+
+#if (NXT_HAVE_NGHTTP2)
+    if (c->u.tls != NULL && nxt_openssl_conn_alpn_h2(c)) {
+        nxt_h2p_conn_init(task, c);
+        return;
+    }
+#endif
 
     h1p = nxt_mp_zget(c->mem_pool, sizeof(nxt_h1proto_t));
     if (nxt_slow_path(h1p == NULL)) {
@@ -930,15 +965,14 @@ nxt_h1p_transfer_encoding(void *ctx, nxt_http_field_t *field, uintptr_t data)
 static void
 nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
 {
-    size_t             size, body_length, body_buffer_size, body_rest;
+    size_t             size, body_length, body_rest;
     ssize_t            res;
     nxt_buf_t          *in, *b, *out, *chunk;
+    nxt_int_t          ret;
     nxt_conn_t         *c;
     nxt_h1proto_t      *h1p;
     nxt_socket_conf_t  *skcf;
     nxt_http_status_t  status;
-
-    static const nxt_str_t tmp_name_pattern = nxt_string("/req-XXXXXXXX");
 
     h1p = r->proto.h1;
     skcf = r->conf->socket_conf;
@@ -989,61 +1023,13 @@ nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
 
     body_length = (size_t) r->content_length_n;
 
-    body_buffer_size = nxt_min(skcf->body_buffer_size, body_length);
-
-    if (body_length > body_buffer_size) {
-        nxt_str_t  *tmp_path, tmp_name;
-
-        tmp_path = &skcf->body_temp_path;
-
-        tmp_name.length = tmp_path->length + tmp_name_pattern.length;
-
-        b = nxt_buf_file_alloc(r->mem_pool,
-                               body_buffer_size + sizeof(nxt_file_t)
-                               + tmp_name.length + 1, 0);
-        if (nxt_slow_path(b == NULL)) {
-            status = NXT_HTTP_INTERNAL_SERVER_ERROR;
-            goto error;
-        }
-
-        tmp_name.start = nxt_pointer_to(b->mem.start, sizeof(nxt_file_t));
-
-        memcpy(tmp_name.start, tmp_path->start, tmp_path->length);
-        memcpy(tmp_name.start + tmp_path->length, tmp_name_pattern.start,
-               tmp_name_pattern.length);
-        tmp_name.start[tmp_name.length] = '\0';
-
-        b->file = (nxt_file_t *) b->mem.start;
-        nxt_memzero(b->file, sizeof(nxt_file_t));
-        b->file->fd = -1;
-        b->file->size = body_length;
-
-        b->mem.start += sizeof(nxt_file_t) + tmp_name.length + 1;
-        b->mem.pos = b->mem.start;
-        b->mem.free = b->mem.start;
-
-        b->file->fd = mkstemp((char *) tmp_name.start);
-        if (nxt_slow_path(b->file->fd == -1)) {
-            nxt_alert(task, "mkstemp(%s) failed %E", tmp_name.start, nxt_errno);
-
-            status = NXT_HTTP_INTERNAL_SERVER_ERROR;
-            goto error;
-        }
-
-        nxt_debug(task, "create body tmp file \"%V\", %d",
-                  &tmp_name, b->file->fd);
-
-        unlink((char *) tmp_name.start);
-
-    } else {
-        b = nxt_buf_mem_alloc(r->mem_pool, body_buffer_size, 0);
-        if (nxt_slow_path(b == NULL)) {
-            status = NXT_HTTP_INTERNAL_SERVER_ERROR;
-            goto error;
-        }
+    ret = nxt_http_request_body_alloc(task, r, body_length);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        status = NXT_HTTP_INTERNAL_SERVER_ERROR;
+        goto error;
     }
 
-    r->body = b;
+    b = r->body;
 
     body_rest = r->chunked ? 1 : body_length;
 
@@ -1102,7 +1088,7 @@ nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
             }
 
         } else {
-            size = nxt_min(body_buffer_size, size);
+            size = nxt_min(body_length, size);
             b->mem.free = nxt_cpymem(b->mem.free, in->mem.pos, size);
 
             in->mem.pos += size;
@@ -2298,7 +2284,7 @@ nxt_h1p_conn_ws_shutdown(nxt_task_t *task, void *obj, void *data)
 }
 
 
-static void
+void
 nxt_h1p_closing(nxt_task_t *task, nxt_conn_t *c)
 {
     nxt_debug(task, "h1p closing");

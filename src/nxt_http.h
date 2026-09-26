@@ -79,6 +79,7 @@ typedef struct {
 
 
 typedef struct nxt_h1proto_s        nxt_h1proto_t;
+typedef struct nxt_h2p_stream_s     nxt_h2p_stream_t;
 
 struct nxt_h1p_websocket_timer_s {
     nxt_timer_t                     timer;
@@ -90,6 +91,7 @@ struct nxt_h1p_websocket_timer_s {
 typedef union {
     void                            *any;
     nxt_h1proto_t                   *h1;
+    nxt_h2p_stream_t                *h2;
 } nxt_http_proto_t;
 
 
@@ -438,6 +440,8 @@ nxt_http_request_t *nxt_http_request_create(nxt_task_t *task);
 void nxt_http_request_error(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_status_t status);
 void nxt_http_request_read_body(nxt_task_t *task, nxt_http_request_t *r);
+nxt_int_t nxt_http_request_body_alloc(nxt_task_t *task, nxt_http_request_t *r,
+    size_t body_length);
 void nxt_http_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_work_handler_t body_handler, void *data);
 void nxt_http_request_ws_frame_start(nxt_task_t *task, nxt_http_request_t *r,
@@ -454,6 +458,7 @@ void nxt_http_request_close_handler(nxt_task_t *task, void *obj, void *data);
 
 nxt_int_t nxt_http_request_host(void *ctx, nxt_http_field_t *field,
     uintptr_t data);
+nxt_int_t nxt_http_validate_host(nxt_str_t *host, nxt_mp_t *mp);
 nxt_int_t nxt_http_request_field(void *ctx, nxt_http_field_t *field,
     uintptr_t offset);
 nxt_int_t nxt_http_request_content_length(void *ctx, nxt_http_field_t *field,
@@ -543,6 +548,7 @@ void nxt_http_proxy_buf_mem_free(nxt_task_t *task, nxt_http_request_t *r,
 
 extern nxt_time_string_t  nxt_http_date_cache;
 
+extern nxt_lvlhsh_t                        nxt_http_request_fields_hash;
 extern nxt_lvlhsh_t                        nxt_response_fields_hash;
 
 extern const nxt_http_proto_table_t  nxt_http_proto[];
@@ -559,5 +565,7 @@ int nxt_http_cond_value(nxt_task_t *task, nxt_http_request_t *r,
     nxt_tstr_cond_t *cond);
 
 extern const nxt_conn_state_t  nxt_h1p_idle_close_state;
+
+void nxt_h1p_closing(nxt_task_t *task, nxt_conn_t *c);
 
 #endif  /* _NXT_HTTP_H_INCLUDED_ */
