@@ -625,6 +625,15 @@ outranked every real weight.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a negotiation failure on Accept-Encoding was answered with 503 instead of 406
+when the response came from an application.  The router treated every result
+of the acceptability check other than success as a server error; only the
+static path reported the 406.
+</para>
+</change>
+
 </changes>
 
 

@@ -484,6 +484,12 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        compares false against both bounds -- and then outranked every real
        weight.
 
+    *) Bugfix: a negotiation failure on "Accept-Encoding" was answered with
+       "503 Service Unavailable" instead of "406 Not Acceptable" when the
+       response came from an application.  The router treated every result of
+       the acceptability check other than success as a server error; only the
+       static path reported the 406.
+
 
 Changes with FreeUnit 1.36.1                                     28 Aug 2026
 
