@@ -2,7 +2,7 @@
   {
     "ruleId": "len-add-to-checked",
     "file": "src/nxt_h1proto.c",
-    "line": 962,
+    "line": 998,
     "text": "tmp_name.length = tmp_path->length + tmp_name_pattern.length;"
   },
   {
@@ -32,13 +32,13 @@
   {
     "ruleId": "len-add-to-checked",
     "file": "src/nxt_router.c",
-    "line": 7869,
+    "line": 7884,
     "text": "dst_field->name_length = field->name_length + prefix->length;"
   },
   {
     "ruleId": "len-add-to-checked",
     "file": "src/python/nxt_python_asgi_websocket.c",
-    "line": 784,
+    "line": 785,
     "text": "payload_len = ws->pending_payload_len + frame->payload_len;"
   },
   {
@@ -56,13 +56,13 @@
   {
     "ruleId": "narrowing-to-proto",
     "file": "src/nxt_router.c",
-    "line": 7829,
+    "line": 7844,
     "text": "(uint32_t) r->path->length"
   },
   {
     "ruleId": "narrowing-to-proto",
     "file": "src/nxt_router.c",
-    "line": 7839,
+    "line": 7854,
     "text": "(uint32_t) r->args->length"
   },
   {
@@ -109,15 +109,15 @@
   },
   {
     "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_unit.c",
+    "line": 294,
+    "text": "*d++ = *s++;"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
     "file": "src/nxt_utf8.c",
     "line": 261,
     "text": "*d++ = *p++;"
-  },
-  {
-    "ruleId": "sprintf-unbounded",
-    "file": "src/nxt_otel.c",
-    "line": 190,
-    "text": "sprintf((char *) traceval, \"%s-%s-%s-%s\",\n                (char *) r->otel->version,\n                (char *) r->otel->trace_id,\n                (char *) r->otel->parent_id,\n                (char *) r->otel->trace_flags)"
   },
   {
     "ruleId": "unchecked-realloc",
