@@ -702,9 +702,10 @@ jobs:
           ./configure wasm-wasi-component
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
 
+      # bindgen picks clang up from PATH.  The libclang-drift check against
+      # new distribution compilers lives in build-distros.yml.
       - name: Make wasm-wasi-component
         run: |
-          CLANG_PATH=/usr/bin/clang-15 \
           BINDGEN_EXTRA_CLANG_ARGS="-I../../njs/src -I../../njs/build" \
           make wasm-wasi-component
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
@@ -778,11 +779,12 @@ jobs:
           # The wasm legs build their guest fixture as the runner user, so
           # they run unprivileged to keep the result reachable by pytest; the
           # others install applications as root.
+          # --unsafe runs the long Autobahn 9.x websocket cases.
           if [ "${{ matrix.build }}" == "wasm-wasi-component" ] || [ "${{ matrix.build }}" == "wasm" ]; then
             set -o pipefail
-            pytest-3 --print-log ${{ steps.metadata.outputs.testpath }} 2>&1 | tee "$RUNNER_TEMP/pytest.out"
+            pytest-3 --print-log --unsafe ${{ steps.metadata.outputs.testpath }} 2>&1 | tee "$RUNNER_TEMP/pytest.out"
           else
-            sudo -E pytest-3 --print-log ${{ steps.metadata.outputs.testpath }}
+            sudo -E pytest-3 --print-log --unsafe ${{ steps.metadata.outputs.testpath }}
           fi
 
       # check_prerequisites() skips the whole file when the clang/wasi-sysroot
@@ -805,19 +807,32 @@ jobs:
       # real application to show it inherits the shim harmlessly, and this
       # leg is where a language module exists.
       #
+      # test_configuration.py runs here too: test_unprivileged_user_error
+      # needs a unitd that is not root.
+      #
       # pytest-3 is named absolutely: setup-python puts a toolcache bin
       # directory ahead of /usr/bin for this step and not for the sudo'd one
       # above, and both must run the pytest that "apt install python3-pytest"
       # provided.
       #
       # !cancelled() rather than the implicit success(): this is the only leg
-      # that ever runs the file, and gating it on the whole sudo'd suite above
-      # would let one unrelated flake silently take that coverage away again --
-      # the very problem this step exists to fix.
-      - name: Run capget fallback tests unprivileged
+      # that ever runs these files, and gating it on the whole sudo'd suite
+      # above would let one unrelated flake silently take that coverage away
+      # again -- the very problem this step exists to fix.
+      - name: Run capget fallback and configuration tests unprivileged
         run: |
           export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
-          /usr/bin/pytest-3 --print-log test/test_capget_fallback.py
+          /usr/bin/pytest-3 --print-log test/test_capget_fallback.py test/test_configuration.py
+        if: ${{ !cancelled() && steps.metadata.outputs.module == 'python' }}
+
+      # test_asgi_lifespan.py stops unitd from inside the test to check the
+      # shutdown event.  That needs --restart, which the run above does not
+      # pass, so both lifespan tests skip there.  Run the file again with it.
+      - name: Run ASGI lifespan tests with --restart
+        run: |
+          export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
+          sudo -E /usr/bin/pytest-3 --print-log --restart \
+            test/test_asgi_lifespan.py
         if: ${{ !cancelled() && steps.metadata.outputs.module == 'python' }}
 
   # C unit-test suite (src/test/ -> build/tests): HTTP parser, port/IPC
@@ -851,6 +866,49 @@ jobs:
 
       - name: Run libunit port_recv fd-ownership test
         run: ./build/unit_port_recv_test
+
+  # Same C unit-test suite as c-tests above, built with AddressSanitizer and
+  # run with LeakSanitizer's default ASAN_OPTIONS (detect_leaks is on unless
+  # something turns it off). Separate from sanitize.yml: that workflow runs
+  # unitd itself, a fork-heavy daemon where leak detection is noisy enough
+  # that it is turned off there deliberately (see its "Configure unit"
+  # comment); build/tests is a single non-forking process exercising
+  # nxt_lvlhsh, nxt_mp, the port/IPC fixtures, etc. directly, so a leak here
+  # is a real one in that fixture's own teardown, not daemon-lifecycle noise.
+  # No suppressions file: every known leak was fixed at its allocation site
+  # (test fixtures freeing what they allocated -- lvlhsh buckets, ports,
+  # runtime processes).
+  c-tests-asan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev clang
+
+      # -fno-sanitize-recover: the first UBSan report fails the job.
+      # nxt_conf_map_object_test fails only under UBSan.
+      - name: Configure unit (ASan+LSan+UBSan, --tests)
+        run: |
+          ./configure \
+            --cc=clang \
+            --debug \
+            --tests \
+            --cc-opt="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g" \
+            --ld-opt="-fsanitize=address,undefined"
+
+      - name: Build C tests
+        run: make -j4 tests
+
+      # sudo for the same reason as c-tests above: the clone creds cases
+      # need real root. Running as root does not disable LeakSanitizer --
+      # this repo's own sandboxed reproduction ran as root throughout.
+      - name: Run C tests
+        run: sudo ./build/tests
 
   # OpenSSL 4.0 compile gate.  4.0 removed nothing Unit uses, but it deprecated
   # more of what Unit still calls, and 5.0 is where the deprecated symbols

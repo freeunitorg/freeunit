@@ -247,8 +247,8 @@ NXT_EXPORT size_t nxt_buf_chain_length(nxt_buf_t *b);
 nxt_inline nxt_buf_t *
 nxt_buf_cpy(nxt_buf_t *b, const void *src, size_t length)
 {
-    nxt_memcpy(b->mem.free, src, length);
-    b->mem.free += length;
+    /* nxt_cpymem() skips a zero-length copy, whose "src" may be NULL. */
+    b->mem.free = nxt_cpymem(b->mem.free, src, length);
 
     return b;
 }

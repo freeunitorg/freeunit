@@ -45,6 +45,15 @@ public class Constants {
             "nginx.unit.websocket.DEFAULT_BUFFER_SIZE", 8 * 1024)
             .intValue();
 
+    /*
+     * The largest text message that is encoded into a buffer of its own, and
+     * therefore sent as a single frame.  A larger message is encoded through
+     * DEFAULT_BUFFER_SIZE and fragments.
+     */
+    static final int MAX_SEND_BUFFER_SIZE = Integer.getInteger(
+            "nginx.unit.websocket.MAX_SEND_BUFFER_SIZE", 16 * 1024 * 1024)
+            .intValue();
+
     // Client connection
     /**
      * Property name to set to configure the value that is passed to

@@ -186,28 +186,35 @@ def test_tls_certificate_update():
 
 
 def test_tls_certificate_key_incorrect(skip_alert):
-    skip_alert(r'nxt_openssl_chain_file\(\) failed', r'failed to apply new conf')
+    skip_alert(r'certificate and private key do not match')
 
     client.load('empty')
 
     client.certificate('first', False)
     client.certificate('second', False)
 
-    # A structurally valid bundle (a private key + a certificate) is stored
-    # fine -- the cert store only checks PEM structure. The key/cert
-    # *mismatch* is caught later, when the router builds the listener's
-    # SSL_CTX (SSL_CTX_check_private_key), rather than being left to fail at
-    # the first handshake.
-    assert 'success' in client.certificate_load(
+    # The bundle is structurally valid (a private key + a certificate), but
+    # the key belongs to another certificate.  The store refuses it at
+    # upload, so a listener can never name it.
+    assert 'error' in client.certificate_load(
         'first', 'second'
-    ), 'mismatched bundle stored'
+    ), 'mismatched bundle refused'
 
-    # pass at the existing app so the mismatched cert is the only reason
-    # the listener config can be rejected.
-    assert 'error' in client.conf(
-        {"pass": "applications/empty", "tls": {"certificate": 'first'}},
-        'listeners/*:8080',
-    ), 'mismatched key/cert rejected at listener config'
+    assert 'error' in client.conf_get('/certificates/first'), 'not stored'
+
+
+def test_tls_certificate_dot_name():
+    client.load('empty')
+
+    client.certificate('default', False)
+
+    # Names starting with "." are reserved for the store's own files.
+    for name in ['.', '..', '.default', '.default.tmp']:
+        assert 'error' in client.conf(
+            b'', f'/certificates/{name}'
+        ), f'dot name {name}'
+
+    assert 'success' in client.certificate_load('default'), 'plain name'
 
 
 def test_tls_certificate_change():

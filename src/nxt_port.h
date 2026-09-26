@@ -201,6 +201,13 @@ typedef enum {
  * header field by field, and nxt_port_socket_write() ORs into ->last.  A
  * new type is bounds-checked on both sides instead, so an older peer
  * refuses the message rather than misreading a flag.
+ *
+ * The two edges are a balanced pair: one start and one finish per unit of
+ * detached work.  The payload names neither a request nor a context, so the
+ * router can only count the edges per process; it takes the worker out of
+ * the idle economy on the first start and gives it back on the last finish.
+ * The payload may grow later, and the handler requires at least one byte and
+ * reads the first, so an older sender stays readable.
  */
 typedef enum {
     NXT_PORT_DETACHED_START  = 0,
@@ -320,6 +327,30 @@ nxt_port_recv_msg_close_fds(nxt_port_recv_msg_t *msg)
 }
 
 
+/*
+ * How many queued messages on one port may carry a file descriptor.
+ *
+ * port->messages itself stays unbounded.  A message with no descriptor costs
+ * only memory, which was true before a queued message took ownership of what
+ * it names, and bounding it would change behaviour on paths that never hold a
+ * descriptor at all -- every ordinary reply and every request body fragment.
+ *
+ * A message that does carry one is different: it holds up to two descriptors
+ * of this process open for as long as it waits, so a peer that stops reading
+ * turns into RLIMIT_NOFILE pressure on the sender rather than memory pressure
+ * alone.  That is the cost this bounds.
+ *
+ * The traffic being bounded is control-plane and one message per event: a new
+ * port, a process start, a listening socket, a certificate, a script, a shared
+ * memory segment.  A port with 128 of them outstanding is not a busy port, it
+ * is a peer that has stopped reading, so the bound is far above any legitimate
+ * burst.  At two descriptors an entry it caps one stalled port at 256 open
+ * descriptors, which leaves room for several of them under the 1024 soft
+ * RLIMIT_NOFILE that is still the common default.
+ */
+#define NXT_PORT_MAX_FD_MSGS  128
+
+
 typedef struct nxt_app_s  nxt_app_t;
 
 struct nxt_port_s {
@@ -337,6 +368,23 @@ struct nxt_port_s {
 
     nxt_queue_t         messages;   /* of nxt_port_send_msg_t */
     nxt_thread_mutex_t  write_mutex;
+
+    /*
+     * How many entries of ->messages still carry a file descriptor.
+     *
+     * A queued message owns the descriptors it names, so each such entry
+     * holds up to two of this process's descriptors open for as long as it
+     * waits.  The count exists to bound that; it is maintained under
+     * ->write_mutex and is described with the bound in src/nxt_port_socket.c.
+     *
+     * ->fd_refusing is set by the first send the bound refuses and cleared
+     * by the next descriptor it takes, also under ->write_mutex.  A peer
+     * that stops reading keeps the port at the bound for as long as it
+     * stalls, so the refusal is logged once when the port gets there rather
+     * than once for every send.
+     */
+    uint32_t            fd_messages;
+    uint8_t             fd_refusing;
 
     /* Maximum size of message part. */
     uint32_t            max_size;
@@ -360,11 +408,27 @@ struct nxt_port_s {
     uint8_t             detached;
 
     /*
-     * The application reported detached work of its own.  Its FINISH edge is
-     * what ends that; until then the port stays out of the idle economy even
-     * with no request left.
+     * An edge the accounting refused -- an unmatched FINISH, or a START at
+     * the maximum count -- was already logged as an alert for this port.
+     * Such an edge is a valid message the application can send in a loop,
+     * so only the first one is an alert and the rest go to the debug log.
+     * Touched only by nxt_router_detached_apply(), on the main thread.
      */
-    uint8_t             detached_app;
+    uint8_t             detached_alerted;
+
+    /*
+     * How many units of detached work the application reported of its own:
+     * one for each START edge whose FINISH edge has not arrived.  Until the
+     * last of them does, the port stays out of the idle economy even with no
+     * request left.  A count rather than a flag because the edges carry no
+     * context id and a worker may run several contexts -- see
+     * nxt_port_detached_t above -- so the first context's FINISH must not
+     * speak for the rest.  It saturates at UINT32_MAX and detached_router
+     * below does not: this one moves on edges the application sends, which
+     * the router cannot bound, while detached_router moves only on requests
+     * the router itself gave up on, one per request it has in flight.
+     */
+    uint32_t            detached_app;
 
     /*
      * The router put the port in the detached state itself: one for each
@@ -431,6 +495,30 @@ struct nxt_port_s {
      * logged at info like the QUIT's own.
      */
     nxt_atomic_t        quit_sent;
+
+    /*
+     * The pacing of a re-arm that follows a send which failed for want of
+     * kernel memory.
+     *
+     * ENOBUFS and ENOMEM leave the socket writable, so no edge is coming and
+     * the retry has to force the readiness re-check itself.  Done on the
+     * spot, that re-check comes straight back: a shortage that lasts turns
+     * the engine thread into a tight epoll_wait/sendmsg/epoll_ctl loop,
+     * which is the worst moment to burn a core on.  The timer paces it
+     * instead -- the retry still happens, just not as fast as the kernel can
+     * refuse it.  See issue #407.
+     *
+     * ->retry_delay is what the next arming waits.  It doubles up to a cap
+     * and a successful send puts it back to zero.
+     *
+     * ->retry_timer.enabled says the timer is holding a port reference: set
+     * by nxt_timer_add(), left set while the expired timer waits in the work
+     * queue, and cleared by nxt_timer_handler() on the line before it calls
+     * nxt_port_retry_handler().  Both fields are touched on port->engine
+     * only.
+     */
+    nxt_timer_t         retry_timer;
+    nxt_msec_t          retry_delay;
 
     nxt_buf_t           *free_bufs;
     nxt_socket_t        pair[2];
@@ -574,6 +662,15 @@ void nxt_port_test_run_read_msg_process(nxt_task_t *task, nxt_port_t *port,
  * observing peers; counting the call itself distinguishes them.
  */
 NXT_EXPORT extern nxt_uint_t  nxt_port_test_broadcasts;
+
+/*
+ * Counts entries into the event-loop pass of nxt_port_write_msgs() -- the
+ * dispatches of the port's write handler.  A retry that is not paced makes
+ * this climb with the number of poll passes rather than with elapsed time,
+ * which is the whole of what the backoff is there to stop and is not
+ * observable from the port's state afterwards.
+ */
+NXT_EXPORT extern nxt_uint_t  nxt_port_test_write_dispatches;
 #endif
 
 nxt_inline nxt_int_t

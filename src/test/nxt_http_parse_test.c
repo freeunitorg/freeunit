@@ -64,11 +64,13 @@ static nxt_int_t nxt_http_parse_test_run(nxt_http_request_parse_t *rp,
     nxt_str_t *request);
 static nxt_int_t nxt_http_parse_test_bench(nxt_thread_t *thr,
     nxt_str_t *request, nxt_lvlhsh_t *hash, const char *name, nxt_uint_t n);
+static void nxt_http_parse_test_hash_destroy(nxt_lvlhsh_t *hash);
 static nxt_int_t nxt_http_parse_test_request_line(nxt_http_request_parse_t *rp,
     nxt_http_parse_test_data_t *data,
     nxt_str_t *request, nxt_log_t *log);
 static nxt_int_t nxt_http_parse_test_fields(nxt_http_request_parse_t *rp,
     nxt_http_parse_test_data_t *data, nxt_str_t *request, nxt_log_t *log);
+static nxt_int_t nxt_http_parse_test_discard_fields(nxt_thread_t *thr);
 static nxt_int_t nxt_http_parse_test_headers(nxt_http_request_parse_t *rp,
     nxt_http_parse_test_data_t *data, nxt_str_t *request, nxt_log_t *log);
 
@@ -726,6 +728,24 @@ static nxt_str_t nxt_http_test_big_request = nxt_string(
 );
 
 
+/*
+ * nxt_http_fields_hash() and nxt_http_fields_hash_collisions() build a
+ * lvlhsh with the malloc-based nxt_http_fields_hash_proto (pool is NULL).
+ * The test drives them directly, so it must drain the hash itself here,
+ * the same way nxt_lvlhsh_retrieve() is used to tear down a lvlhsh in
+ * nxt_lvlhsh_test(), otherwise every bucket and level it allocated leaks.
+ */
+static void
+nxt_http_parse_test_hash_destroy(nxt_lvlhsh_t *hash)
+{
+    while (nxt_lvlhsh_retrieve(hash, &nxt_http_fields_hash_proto, NULL)
+           != NULL)
+    {
+        continue;
+    }
+}
+
+
 nxt_int_t
 nxt_http_parse_test(nxt_thread_t *thr)
 {
@@ -783,6 +803,10 @@ nxt_http_parse_test(nxt_thread_t *thr)
         nxt_mp_destroy(mp_temp);
     }
 
+    if (nxt_http_parse_test_discard_fields(thr) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "http parse test passed");
 
     nxt_memzero(&hash, sizeof(nxt_lvlhsh_t));
@@ -792,12 +816,16 @@ nxt_http_parse_test(nxt_thread_t *thr)
                                         nxt_nitems(nxt_http_test_bench_fields),
                                         0);
 
+    nxt_http_parse_test_hash_destroy(&hash);
+
     nxt_memzero(&hash, sizeof(nxt_lvlhsh_t));
 
     lvl_colls = nxt_http_fields_hash_collisions(&hash,
                                         nxt_http_test_bench_fields,
                                         nxt_nitems(nxt_http_test_bench_fields),
                                         1);
+
+    nxt_http_parse_test_hash_destroy(&hash);
 
     nxt_log_error(NXT_LOG_NOTICE, thr->log,
                   "http parse test hash collisions %ui out of %uz, level: %ui",
@@ -815,6 +843,7 @@ nxt_http_parse_test(nxt_thread_t *thr)
                                   &hash, "simple", 1000000)
         != NXT_OK)
     {
+        nxt_http_parse_test_hash_destroy(&hash);
         return NXT_ERROR;
     }
 
@@ -822,10 +851,100 @@ nxt_http_parse_test(nxt_thread_t *thr)
                                   &hash, "big", 100000)
         != NXT_OK)
     {
+        nxt_http_parse_test_hash_destroy(&hash);
         return NXT_ERROR;
     }
 
+    nxt_http_parse_test_hash_destroy(&hash);
+
     return NXT_OK;
+}
+
+
+/*
+ * With "discard_fields", fields are checked but not stored.  Then a reset of
+ * the handler is enough to parse the next block.  24 fields is more than the
+ * 16 inline fields.
+ */
+
+static nxt_int_t
+nxt_http_parse_test_discard_fields(nxt_thread_t *thr)
+{
+    u_char                    *p;
+    nxt_mp_t                  *mp;
+    nxt_int_t                 rc, ret;
+    nxt_uint_t                i, nfields;
+    nxt_buf_mem_t             buf;
+    nxt_http_field_t          *field;
+    nxt_http_request_parse_t  rp;
+    u_char                    block[24 * nxt_length("X-Field-00: v\r\n") + 2];
+
+    p = block;
+
+    for (i = 0; i < 24; i++) {
+        p = nxt_sprintf(p, block + sizeof(block), "X-Field-%02ui: v\r\n", i);
+    }
+
+    *p++ = '\r';
+    *p++ = '\n';
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (mp == NULL) {
+        return NXT_ERROR;
+    }
+
+    ret = NXT_ERROR;
+
+    nxt_memzero(&rp, sizeof(nxt_http_request_parse_t));
+
+    if (nxt_http_parse_request_init(&rp, mp) != NXT_OK) {
+        goto done;
+    }
+
+    rp.discard_fields = 1;
+
+    buf.start = block;
+    buf.pos = block;
+    buf.free = p;
+    buf.end = p;
+
+    rc = nxt_http_parse_fields(&rp, &buf);
+
+    if (rc != NXT_DONE || rp.num_inline_fields != 0 || rp.fields != NULL) {
+        nxt_log_alert(thr->log, "http parse discard fields test failed: "
+                      "rc %i, %ui inline fields, list %p",
+                      rc, (nxt_uint_t) rp.num_inline_fields, rp.fields);
+        goto done;
+    }
+
+    rp.handler = NULL;
+    rp.discard_fields = 0;
+
+    buf.pos = block;
+
+    rc = nxt_http_parse_fields(&rp, &buf);
+
+    nfields = 0;
+
+    nxt_http_fields_each(field, rp.inline_fields, rp.num_inline_fields,
+                         rp.fields)
+    {
+        nfields++;
+    } nxt_http_fields_loop;
+
+    if (rc != NXT_DONE || nfields != 24) {
+        nxt_log_alert(thr->log, "http parse fields reset test failed: "
+                      "rc %i, %ui fields", rc, nfields);
+        goto done;
+    }
+
+    ret = NXT_OK;
+
+done:
+
+    nxt_mp_destroy(mp);
+
+    return ret;
 }
 
 
