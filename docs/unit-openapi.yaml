@@ -7677,6 +7677,16 @@ components:
         certificate:
           $ref: "#/components/schemas/configListenerTlsCertificate"
 
+        http2:
+          type: boolean
+          description: "Enables HTTP/2 on the listener.  When `true`, the
+            listener offers `h2` and `http/1.1` in TLS ALPN, in this order;
+            clients that do not ask for `h2` use HTTP/1.1.  HTTP/2 over
+            cleartext (h2c) is not supported.  Needs a Unit build with the
+            `--h2` configure option; other builds reject the option."
+
+          default: false
+
     # /config/listeners/{listenerName}/tls/session
     configListenerTlsSession:
       type: object

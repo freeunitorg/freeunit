@@ -1,0 +1,14 @@
+# h2spec cases that are known to fail, read by h2spec.sh.
+#
+# Format: "<package> <case number>", then "# reason".  The package and the
+# case number are the ones h2spec prints, for example "http2/5.1.1 2".
+# h2spec.sh fails when an excluded case passes again, so this list stays
+# current.
+
+# HEADERS on stream 3 after stream 5: RFC 9113 5.1.1 wants a connection error.
+# nghttp2 ignores a HEADERS frame with a lower stream id when it does not know
+# the stream any more (see session_on_request_headers_received() in
+# nghttp2_session.c): the client may not have seen our RST_STREAM yet, so a
+# connection error could be wrong.  Unit does not see the frame at all, so it
+# cannot be fixed in nxt_h2proto.c.  The frame is dropped, nothing is served.
+http2/5.1.1 2

@@ -116,6 +116,16 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        structurally unreachable, since the connection field it read was
        never assigned.
 
+    *) Feature: HTTP/2 over TLS. It is off by default and needs a build
+       with the new "--h2" configure option, which needs "--openssl" and a
+       libnghttp2 that has nghttp2_option_set_max_continuations(). A
+       listener with "tls": {"http2": true} offers "h2" and "http/1.1" in
+       ALPN; other clients keep using HTTP/1.1. The limits are fixed in
+       this release: 128 concurrent streams and 1000 requests per
+       connection, a 256 KiB stream window and a 1 MiB connection window.
+       HTTP/2 over cleartext (h2c) and server push are not supported, and
+       response trailers are not sent yet.
+
     *) Feature: byte-range requests for static files. A "share" action now
        answers a satisfiable single-range "Range: bytes=..." request with
        "206 Partial Content" and a matching "Content-Range", and an

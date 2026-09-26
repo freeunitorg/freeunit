@@ -951,6 +951,24 @@ jobs:
       - name: h2load smoke test
         run: sudo .github/scripts/h2load-smoke.sh 2000 8 16
 
+      # h2spec 2.6.0 is the last release.  The checksum is of the release
+      # tarball; update both together.
+      - name: Install h2spec
+        env:
+          H2SPEC_VERSION: 2.6.0
+          H2SPEC_SHA256: 157ee0de702e01ad40e752dbf074b366027e550c8e7504f9450da2809e279318
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/h2spec.tar.gz" \
+            "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz"
+          echo "${H2SPEC_SHA256}  $RUNNER_TEMP/h2spec.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/h2spec.tar.gz" -C "$RUNNER_TEMP" h2spec
+          sudo install -m 755 "$RUNNER_TEMP/h2spec" /usr/local/bin/h2spec
+          h2spec --version
+
+      # Fails on a case that is not in .github/scripts/h2spec-excludes.txt.
+      - name: h2spec conformance test
+        run: sudo .github/scripts/h2spec.sh
+
   # Same C unit-test suite as c-tests above, built with AddressSanitizer and
   # run with LeakSanitizer's default ASAN_OPTIONS (detect_leaks is on unless
   # something turns it off). Separate from sanitize.yml: that workflow runs
