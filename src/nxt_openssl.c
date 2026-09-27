@@ -161,6 +161,11 @@ const nxt_tls_lib_t  nxt_openssl_lib = {
 };
 
 
+#if (NXT_TESTS)
+nxt_uint_t  nxt_openssl_test_fail;
+#endif
+
+
 static nxt_conn_io_t  nxt_openssl_conn_io = {
     .read = nxt_conn_io_read,
     .recvbuf = nxt_openssl_conn_io_recvbuf,
@@ -223,16 +228,32 @@ nxt_openssl_server_init(nxt_task_t *task, nxt_mp_t *mp,
     STACK_OF(X509_NAME)    *list;
     nxt_tls_bundle_conf_t  *bundle;
 
-    ctx = SSL_CTX_new(SSLv23_server_method());
-    if (ctx == NULL) {
-        nxt_openssl_log_error(task, NXT_LOG_ALERT, "SSL_CTX_new() failed");
-        return NXT_ERROR;
-    }
-
     conf = tls_init->conf;
 
     bundle = conf->bundle;
     nxt_assert(bundle != NULL);
+
+    /* nxt_router_conf_error() frees the context of every bundle. */
+    bundle->ctx = NULL;
+
+    ctx = SSL_CTX_new(SSLv23_server_method());
+
+#if (NXT_TESTS)
+    if (nxt_openssl_test_fail == NXT_OPENSSL_TEST_FAIL_CTX_NEW) {
+        SSL_CTX_free(ctx);
+        ctx = NULL;
+    }
+#endif
+
+    if (ctx == NULL) {
+        nxt_openssl_log_error(task, NXT_LOG_ALERT, "SSL_CTX_new() failed");
+
+        /* nxt_openssl_chain_file() does not run, so close the file here. */
+        nxt_fd_close(bundle->chain_file);
+        bundle->chain_file = -1;
+
+        return NXT_ERROR;
+    }
 
     bundle->ctx = ctx;
 
@@ -360,6 +381,9 @@ fail:
 
     SSL_CTX_free(ctx);
 
+    /* nxt_router_conf_error() frees the contexts of the other bundles. */
+    bundle->ctx = NULL;
+
 #if (OPENSSL_VERSION_NUMBER >= 0x1010100fL \
      && OPENSSL_VERSION_NUMBER < 0x1010101fL)
     RAND_keep_random_devices_open(0);
@@ -383,14 +407,28 @@ nxt_openssl_chain_file(nxt_task_t *task, SSL_CTX *ctx, nxt_tls_conf_t *conf,
     ret = NXT_ERROR;
     cert = NULL;
 
+    bundle = conf->bundle;
+
     bio = BIO_new(BIO_s_fd());
+
+#if (NXT_TESTS)
+    if (nxt_openssl_test_fail == NXT_OPENSSL_TEST_FAIL_BIO_NEW) {
+        BIO_free(bio);
+        bio = NULL;
+    }
+#endif
+
     if (bio == NULL) {
+        /* No BIO owns the file yet, so close it here. */
+        nxt_fd_close(bundle->chain_file);
+        bundle->chain_file = -1;
+
         goto end;
     }
 
-    bundle = conf->bundle;
-
+    /* The BIO owns the file now: BIO_free() below closes it. */
     BIO_set_fd(bio, bundle->chain_file, BIO_CLOSE);
+    bundle->chain_file = -1;
 
     cert = PEM_read_bio_X509_AUX(bio, NULL, NULL, NULL);
     if (cert == NULL) {

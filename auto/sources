@@ -245,6 +245,7 @@ fi
 
 if [ $NXT_OPENSSL = YES ]; then
     NXT_LIB_SRCS="$NXT_LIB_SRCS $NXT_LIB_OPENSSL_SRCS"
+    NXT_TEST_SRCS="$NXT_TEST_SRCS src/test/nxt_openssl_server_init_test.c"
 fi
 
 
