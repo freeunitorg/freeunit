@@ -172,7 +172,19 @@ const nxt_http_proto_table_t  nxt_http_proto[3] = {
 };
 
 
-static nxt_lvlhsh_t                    nxt_h1p_fields_hash;
+nxt_lvlhsh_t                           nxt_h1p_fields_hash;
+nxt_lvlhsh_t                           nxt_http_request_fields_hash;
+
+/*
+ * The first NXT_H1P_ONLY_FIELDS entries are HTTP/1 framing: Connection,
+ * Upgrade, the two Sec-WebSocket fields, Transfer-Encoding and Expect.
+ * Their handlers write to r->proto.h1.  The entries after them hold for
+ * every protocol and form nxt_http_request_fields_hash, which a frontend
+ * without HTTP/1 framing processes its fields with.  A new HTTP/1-only
+ * field must go before the blank line and NXT_H1P_ONLY_FIELDS must grow;
+ * src/test/nxt_http_request_fields_test.c names each field and its side.
+ */
+#define NXT_H1P_ONLY_FIELDS  6
 
 static nxt_http_field_proc_t           nxt_h1p_fields[] = {
     { nxt_string("Connection"),        &nxt_h1p_connection, 0 },
@@ -220,6 +232,13 @@ nxt_h1p_init(nxt_task_t *task)
 
     ret = nxt_http_fields_hash(&nxt_h1p_fields_hash,
                                nxt_h1p_fields, nxt_nitems(nxt_h1p_fields));
+
+    if (nxt_fast_path(ret == NXT_OK)) {
+        ret = nxt_http_fields_hash(&nxt_http_request_fields_hash,
+                                   &nxt_h1p_fields[NXT_H1P_ONLY_FIELDS],
+                                   nxt_nitems(nxt_h1p_fields)
+                                   - NXT_H1P_ONLY_FIELDS);
+    }
 
     if (nxt_fast_path(ret == NXT_OK)) {
         ret = nxt_http_fields_hash(&nxt_h1p_peer_fields_hash,
