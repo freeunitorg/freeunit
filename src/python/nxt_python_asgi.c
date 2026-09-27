@@ -46,6 +46,8 @@ static void nxt_py_asgi_quit(nxt_unit_ctx_t *ctx);
 static void nxt_py_asgi_shm_ack_handler(nxt_unit_ctx_t *ctx);
 
 static PyObject *nxt_py_asgi_port_read(PyObject *self, PyObject *args);
+static void nxt_py_asgi_retry_timer_cancel(nxt_unit_ctx_t *ctx,
+    nxt_py_asgi_ctx_data_t *ctx_data);
 static void nxt_python_asgi_done(void);
 
 static PyObject           *nxt_py_port_read;
@@ -269,6 +271,7 @@ nxt_python_asgi_ctx_data_alloc(void **pdata, int main)
         { "add_reader",         &ctx_data->loop_add_reader },
         { "remove_reader",      &ctx_data->loop_remove_reader },
         { "call_soon",          &ctx_data->loop_call_soon },
+        { "call_later",         &ctx_data->loop_call_later },
         { "run_until_complete", &ctx_data->loop_run_until_complete },
         { "create_future",      &ctx_data->loop_create_future },
     };
@@ -366,10 +369,15 @@ nxt_python_asgi_ctx_data_free(void *data)
 
     ctx_data = data;
 
+    /* The delayed call keeps the pointer of the context.  It must not run. */
+
+    nxt_py_asgi_retry_timer_cancel(NULL, ctx_data);
+
     Py_XDECREF(ctx_data->loop_run_until_complete);
     Py_XDECREF(ctx_data->loop_create_future);
     Py_XDECREF(ctx_data->loop_create_task);
     Py_XDECREF(ctx_data->loop_call_soon);
+    Py_XDECREF(ctx_data->loop_call_later);
     Py_XDECREF(ctx_data->loop_add_reader);
     Py_XDECREF(ctx_data->loop_remove_reader);
     Py_XDECREF(ctx_data->quit_future);
@@ -1162,8 +1170,8 @@ nxt_py_asgi_shm_ack_handler(nxt_unit_ctx_t *ctx)
 static PyObject *
 nxt_py_asgi_port_read(PyObject *self, PyObject *args)
 {
-    int                     rc;
-    PyObject                *arg0, *arg1, *res;
+    int                     rc, delay, port_id;
+    PyObject                *arg0, *arg1, *res, *timeout;
     Py_ssize_t              n;
     nxt_unit_ctx_t          *ctx;
     nxt_unit_port_t         *port;
@@ -1195,30 +1203,117 @@ nxt_py_asgi_port_read(PyObject *self, PyObject *args)
 
     port = PyLong_AsVoidPtr(arg1);
 
+    /*
+     * When the FINISH retries give up, the call quits the context and can
+     * free the port.  Keep its id for the error message.
+     */
+
+    port_id = port->id.id;
+
     rc = nxt_unit_process_port_msg(ctx, port);
 
     nxt_unit_debug(ctx, "asgi_port_read(%p,%p): %d", ctx, port, rc);
 
+    ctx_data = ctx->data;
+
+    /*
+     * Each call can run the pending FINISH retry of the context, whatever
+     * the port.  So one delayed call for each context is enough.  Cancel
+     * the old one before a new call is scheduled.  Otherwise each burst of
+     * traffic adds one more timer, and all of them wake the loop.  Cancel
+     * it also before the error return.  After the give-up the loop still
+     * runs the lifespan shutdown, and the old call must not run then.
+     */
+
+    nxt_py_asgi_retry_timer_cancel(ctx, ctx_data);
+
     if (nxt_slow_path(rc == NXT_UNIT_ERROR)) {
         return PyErr_Format(PyExc_RuntimeError,
-                            "error processing port %d message", port->id.id);
+                            "error processing port %d message", port_id);
     }
 
     if (rc == NXT_UNIT_OK) {
-        ctx_data = ctx->data;
 
-        res = PyObject_CallFunctionObjArgs(ctx_data->loop_call_soon,
-                                           nxt_py_port_read,
-                                           arg0, arg1, NULL);
-        if (nxt_slow_path(res == NULL)) {
-            nxt_unit_alert(ctx, "Python failed to call 'loop.call_soon'");
-            nxt_python_print_exception();
+        /*
+         * NXT_UNIT_OK also comes when the call found no message and a
+         * FINISH retry is pending.  The retry is not due before a deadline.
+         * Call again at that deadline, and do not spin the loop with
+         * call_soon().
+         */
+
+        delay = nxt_unit_detached_retry_timeout(ctx);
+
+        if (delay > 0) {
+            timeout = PyFloat_FromDouble(delay / 1000.0);
+            if (nxt_slow_path(timeout == NULL)) {
+                nxt_unit_alert(ctx, "Python failed to create a float");
+                nxt_python_print_exception();
+
+                Py_RETURN_NONE;
+            }
+
+            res = PyObject_CallFunctionObjArgs(ctx_data->loop_call_later,
+                                               timeout, nxt_py_port_read,
+                                               arg0, arg1, NULL);
+
+            Py_DECREF(timeout);
+
+            if (nxt_slow_path(res == NULL)) {
+                nxt_unit_alert(ctx, "Python failed to call 'loop.call_later'");
+                nxt_python_print_exception();
+
+                Py_RETURN_NONE;
+            }
+
+            /* Keep the TimerHandle, so that a later call can cancel it. */
+
+            ctx_data->retry_timer = res;
+
+            Py_RETURN_NONE;
+
+        } else {
+            res = PyObject_CallFunctionObjArgs(ctx_data->loop_call_soon,
+                                               nxt_py_port_read,
+                                               arg0, arg1, NULL);
+            if (nxt_slow_path(res == NULL)) {
+                nxt_unit_alert(ctx, "Python failed to call 'loop.call_soon'");
+                nxt_python_print_exception();
+            }
         }
 
         Py_XDECREF(res);
     }
 
     Py_RETURN_NONE;
+}
+
+
+static void
+nxt_py_asgi_retry_timer_cancel(nxt_unit_ctx_t *ctx,
+    nxt_py_asgi_ctx_data_t *ctx_data)
+{
+    PyObject  *timer, *res;
+
+    timer = ctx_data->retry_timer;
+
+    if (timer == NULL) {
+        return;
+    }
+
+    ctx_data->retry_timer = NULL;
+
+    /* Cancel of a TimerHandle that already ran does nothing. */
+
+    res = PyObject_CallMethod(timer, "cancel", NULL);
+    if (nxt_slow_path(res == NULL)) {
+        nxt_unit_alert(ctx, "Python failed to cancel the retry timer");
+        nxt_python_print_exception();
+
+    } else {
+        Py_DECREF(res);
+    }
+
+    Py_DECREF(timer);
 }
 
 

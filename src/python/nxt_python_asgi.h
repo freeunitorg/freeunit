@@ -29,6 +29,8 @@ typedef struct {
     PyObject         *loop_create_future;
     PyObject         *loop_create_task;
     PyObject         *loop_call_soon;
+    PyObject         *loop_call_later;
+    PyObject         *retry_timer;
     PyObject         *loop_add_reader;
     PyObject         *loop_remove_reader;
     PyObject         *quit_future;
