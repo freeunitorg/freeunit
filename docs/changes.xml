@@ -122,6 +122,18 @@ remains no timeout.
 
 <change type="security">
 <para>
+the router decoded the response an application returned in shared memory
+without checking it: the field count was read twice, and the name, value and
+body offsets were followed without a bounds check.  An application could point
+the router anywhere.  libunit read the request from shared memory more than
+once after checking it.  A sibling process of the same application, which maps
+the same segment, could change a value in between.  Both sides now read every
+value once and check every offset against the buffer.
+</para>
+</change>
+
+<change type="security">
+<para>
 the string form of "access_log" "format" wrote what a variable expanded to
 without escaping it.  "$uri" is the percent-decoded target, so a request for
 "/%0d%0a..." put a real CRLF in the log and the rest of the line read as a

@@ -383,6 +383,10 @@ void nxt_router_test_app_rpc_create(nxt_task_t *task,
 
 /* The request deadline handler, for the app-timeout test. */
 void nxt_router_test_app_timeout(nxt_task_t *task, void *obj, void *data);
+
+/* The application response decoder, for the response parse test. */
+nxt_int_t nxt_router_test_response_header_parse(nxt_task_t *task,
+    nxt_http_request_t *r, nxt_buf_t *b);
 #endif
 
 
