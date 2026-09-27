@@ -1,4 +1,5 @@
 import glob
+import json
 import os
 import socket
 import subprocess
@@ -53,6 +54,32 @@ def waitforglob(pattern, count=1, timeout=50):
         time.sleep(0.1)
 
     return False
+
+
+def jsonl_records(path, event=None, uri=None):
+    try:
+        with open(path, encoding='utf-8') as f:
+            recs = [json.loads(line) for line in f if line.strip()]
+    except FileNotFoundError:
+        return []
+
+    return [
+        r
+        for r in recs
+        if event in (None, r['event']) and uri in (None, r['uri'])
+    ]
+
+
+def waitforrecords(path, n, timeout, event='start', uri=None):
+    end = time.monotonic() + timeout
+
+    while time.monotonic() < end:
+        if len(recs := jsonl_records(path, event, uri)) >= n:
+            return recs
+
+        time.sleep(0.1)
+
+    pytest.fail(f'{len(jsonl_records(path, event, uri))} {event}(s), not {n}')
 
 
 def waitforsocket(port):
