@@ -120,6 +120,7 @@ nxt_int_t nxt_nncq_bound_test(nxt_thread_t *thr);
 nxt_int_t nxt_regex_test(nxt_thread_t *thr);
 #endif
 nxt_int_t nxt_openssl_server_init_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_schedule_test(nxt_thread_t *thr);
 nxt_int_t nxt_cgroup_test(nxt_thread_t *thr);
 nxt_int_t nxt_controller_peer_test(nxt_thread_t *thr);
 nxt_int_t nxt_cpu_limit_test(nxt_thread_t *thr);
