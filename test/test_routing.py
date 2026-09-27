@@ -1590,6 +1590,127 @@ def test_routes_match_cookies_array():
     cookie('var3=foo', 200)
 
 
+def xblah(value, status):
+    headers = {'Host': 'localhost', 'Connection': 'close'}
+
+    if value is not None:
+        headers['X-Blah'] = value
+
+    assert client.get(headers=headers)['status'] == status, 'match x-blah'
+
+
+def test_routes_match_headers_absent():
+    route_match({"headers": {"X-Blah": None}})
+
+    assert client.conf_get('routes/0/match/headers') == {
+        'X-Blah': None
+    }, 'null is kept'
+
+    xblah(None, 200)
+    xblah('test', 404)
+    xblah('', 404)
+    xblah(['a', 'b'], 404)
+
+    assert (
+        client.get(
+            headers={'Host': 'localhost', 'x-bLAH': '1', 'Connection': 'close'}
+        )['status']
+        == 404
+    ), 'header name is case insensitive'
+
+
+def test_routes_match_headers_absent_cookie():
+    route_match({"headers": {"Cookie": None}})
+
+    assert client.get()['status'] == 200, 'no cookie header'
+    cookie('sess=1', 404)
+    cookie('', 404)
+
+
+def test_routes_match_headers_absent_negative():
+    # A negated pattern still does not match an absent header.
+    route_match({"headers": {"X-Blah": "!test"}})
+
+    xblah(None, 404)
+    xblah('test', 404)
+    xblah('other', 200)
+
+    # "No such header, or a value other than test".
+    route_match({"headers": [{"X-Blah": None}, {"X-Blah": "!test"}]})
+
+    xblah(None, 200)
+    xblah('test', 404)
+    xblah('other', 200)
+
+
+def test_routes_match_headers_absent_with_others():
+    route_match({"headers": {"Host": "localhost", "X-Blah": None}})
+
+    xblah(None, 200)
+    xblah('test', 404)
+
+    assert (
+        client.get(headers={'Host': 'example.com', 'Connection': 'close'})[
+            'status'
+        ]
+        == 404
+    ), 'other rule still applies'
+
+
+def test_routes_match_arguments_absent():
+    route_match({"arguments": {"foo": None}})
+
+    assert client.get()['status'] == 200, 'no query'
+    assert client.get(url='/?bar=1')['status'] == 200, 'other argument'
+    assert client.get(url='/?Foo=1')['status'] == 200, 'case sensitive'
+    assert client.get(url='/?foo')['status'] == 404, 'no value'
+    assert client.get(url='/?foo=')['status'] == 404, 'empty value'
+    assert client.get(url='/?foo=bar')['status'] == 404, 'value'
+    assert client.get(url='/?bar=1&foo=2')['status'] == 404, 'second'
+    assert client.get(url='/?%66oo=1')['status'] == 404, 'encoded name'
+
+    route_match({"arguments": {"%66oo": None}})
+
+    assert client.get(url='/?foo=1')['status'] == 404, 'encoded rule name'
+    assert client.get(url='/?bar=1')['status'] == 200, 'encoded rule name 2'
+
+
+def test_routes_match_cookies_absent():
+    route_match({"cookies": {"sess": None}})
+
+    assert client.get()['status'] == 200, 'no cookie header'
+    cookie('other=1', 200)
+    cookie('Sess=1', 200)
+    cookie('sess=1', 404)
+    cookie('sess=', 404)
+    cookie('a=1; sess=2', 404)
+    cookie(['a=1', 'sess=2'], 404)
+
+    route_match({"cookies": [{"sess": None}, {"sess": "guest"}]})
+
+    assert client.get()['status'] == 200, 'no cookie or guest'
+    cookie('sess=guest', 200)
+    cookie('sess=admin', 404)
+
+
+def test_routes_match_absent_invalid():
+    route_match_invalid({"headers": None})
+    route_match_invalid({"headers": [None]})
+    route_match_invalid({"headers": {"X-Blah": [None]}})
+    route_match_invalid({"headers": {"X-Blah": ["a", None]}})
+    route_match_invalid({"headers": {"": None}})
+    route_match_invalid({"cookies": None})
+    route_match_invalid({"cookies": {"sess": [None]}})
+    route_match_invalid({"cookies": {"": None}})
+    route_match_invalid({"arguments": None})
+    route_match_invalid({"arguments": {"foo": [None]}})
+    route_match_invalid({"arguments": {"%%": None}})
+    route_match_invalid({"arguments": {"": None}})
+    route_match_invalid({"host": None})
+    route_match_invalid({"uri": None})
+    route_match_invalid({"query": None})
+
+
 def test_routes_match_scheme():
     route_match({"scheme": "http"})
     route_match({"scheme": "https"})

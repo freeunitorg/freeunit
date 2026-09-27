@@ -3067,6 +3067,12 @@ nxt_conf_vldt_match_encoded_patterns_set_member(nxt_conf_validation_t *vldt,
                                    "\"arguments\" is encoded but is invalid.");
     }
 
+    /* null matches a request that has no such argument. */
+
+    if (nxt_conf_type(value) == NXT_CONF_NULL) {
+        return NXT_OK;
+    }
+
     return nxt_conf_vldt_match_encoded_patterns(vldt, value,
                                                 (void *) "arguments");
 }
@@ -3258,6 +3264,12 @@ nxt_conf_vldt_match_patterns_set_member(nxt_conf_validation_t *vldt,
     if (name->length == 0) {
         return nxt_conf_vldt_error(vldt, "The \"match\" pattern objects must "
                                    "not contain empty member names.");
+    }
+
+    /* null matches a request that has no such header or cookie. */
+
+    if (nxt_conf_type(value) == NXT_CONF_NULL) {
+        return NXT_OK;
     }
 
     return nxt_conf_vldt_match_patterns(vldt, value, vldt->ctx);
