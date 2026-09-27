@@ -128,6 +128,9 @@ class HTTP1:
             if 'read_buffer_size' in kwargs:
                 recvall_kwargs['buff_size'] = kwargs['read_buffer_size']
 
+            if kwargs.get('framed'):
+                recvall_kwargs['framed'] = True
+
             resp = self.recvall(sock, **recvall_kwargs).decode(
                 encoding, errors='ignore'
             )
@@ -212,6 +215,7 @@ class HTTP1:
 
         timeout = kwargs.get('read_timeout', timeout_default)
         buff_size = kwargs.get('buff_size', 4096)
+        framed = kwargs.get('framed', False)
 
         data = b''
         while True:
@@ -237,7 +241,70 @@ class HTTP1:
             if not part:
                 break
 
+            if framed and self._response_complete(data):
+                break
+
         return data
+
+    @staticmethod
+    def _response_complete(data):
+        """Return True when data holds one complete response by its framing.
+
+        recvall(framed=True) uses it on a keep-alive socket.  The server
+        does not close that socket, so without this the read ends only on
+        read_timeout.  The function knows Content-Length and chunked.  For
+        a response with neither, or one that does not parse, it returns
+        False and the read ends on the timeout, as before.  Do not use it
+        for HEAD, 1xx, 204 or 304 responses: they have no body, whatever
+        their headers say.
+        """
+        end = data.find(b'\r\n\r\n')
+        if end < 0:
+            return False
+
+        body = data[end + 4 :]
+        length = None
+        chunked = False
+
+        for line in data[:end].split(b'\r\n')[1:]:
+            name, _, value = line.partition(b':')
+            name = name.strip().lower()
+            value = value.strip()
+
+            if name == b'content-length':
+                try:
+                    length = int(value)
+                except ValueError:
+                    return False
+
+            elif name == b'transfer-encoding':
+                chunked = value.lower().endswith(b'chunked')
+
+        if chunked:
+            while True:
+                eol = body.find(b'\r\n')
+                if eol < 0:
+                    return False
+
+                try:
+                    size = int(body[:eol].split(b';')[0], 16)
+                except ValueError:
+                    return False
+
+                if size == 0:
+                    # Unit sends no trailers: the last chunk is "0" CRLF CRLF.
+                    return body[eol + 2 : eol + 4] == b'\r\n'
+
+                need = eol + 2 + size + 2
+                if len(body) < need:
+                    return False
+
+                body = body[need:]
+
+        if length is not None:
+            return len(body) >= length
+
+        return False
 
     def _resp_to_dict(self, resp):
         m = re.search(r'(.*?\x0d\x0a?)\x0d\x0a?(.*)', resp, re.M | re.S)
