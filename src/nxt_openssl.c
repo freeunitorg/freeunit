@@ -131,6 +131,11 @@ static nxt_int_t nxt_openssl_bundle_hash_test(nxt_lvlhsh_query_t *lhq,
 static nxt_int_t nxt_openssl_bundle_hash_insert(nxt_task_t *task,
     nxt_lvlhsh_t *lvlhsh, nxt_tls_bundle_hash_item_t *item, nxt_mp_t * mp);
 static nxt_int_t nxt_openssl_servername(SSL *s, int *ad, void *arg);
+#if (NXT_HAVE_NGHTTP2)
+static int nxt_openssl_alpn_select(SSL *s, const unsigned char **out,
+    unsigned char *outlen, const unsigned char *in, unsigned int inlen,
+    void *arg);
+#endif
 static nxt_tls_bundle_conf_t *nxt_openssl_find_ctx(nxt_tls_conf_t *conf,
     nxt_str_t *sn);
 static void nxt_openssl_server_free(nxt_task_t *task, nxt_tls_conf_t *conf);
@@ -345,6 +350,17 @@ nxt_openssl_server_init(nxt_task_t *task, nxt_mp_t *mp,
 
         SSL_CTX_set_client_CA_list(ctx, list);
     }
+
+#if (NXT_HAVE_NGHTTP2)
+    /*
+     * Every bundle has its own SSL_CTX and the SNI callback swaps them, so
+     * the ALPN callback is set on each of them and nothing depends on the
+     * order the two callbacks run in.
+     */
+    if (conf->http2) {
+        SSL_CTX_set_alpn_select_cb(ctx, nxt_openssl_alpn_select, NULL);
+    }
+#endif
 
     if (last) {
         conf->conn_init = nxt_openssl_conn_init;
@@ -1106,6 +1122,51 @@ done:
 
     return SSL_TLSEXT_ERR_OK;
 }
+
+
+#if (NXT_HAVE_NGHTTP2)
+
+static int
+nxt_openssl_alpn_select(SSL *s, const unsigned char **out,
+    unsigned char *outlen, const unsigned char *in, unsigned int inlen,
+    void *arg)
+{
+    int  ret;
+
+    /* Server preference first: "h2", then "http/1.1". */
+    static const unsigned char  protos[] = "\x02h2\x08http/1.1";
+
+    ret = SSL_select_next_proto((unsigned char **) out, outlen,
+                                protos, sizeof(protos) - 1, in, inlen);
+
+    if (ret == OPENSSL_NPN_NEGOTIATED) {
+        return SSL_TLSEXT_ERR_OK;
+    }
+
+    /* No common protocol: no ALPN in the ServerHello, HTTP/1 follows. */
+    return SSL_TLSEXT_ERR_NOACK;
+}
+
+
+nxt_bool_t
+nxt_openssl_conn_alpn_h2(nxt_conn_t *c)
+{
+    unsigned int         len;
+    nxt_openssl_conn_t   *tls;
+    const unsigned char  *data;
+
+    tls = c->u.tls;
+
+    if (tls == NULL || tls->session == NULL) {
+        return 0;
+    }
+
+    SSL_get0_alpn_selected(tls->session, &data, &len);
+
+    return (len == 2 && data[0] == 'h' && data[1] == '2');
+}
+
+#endif
 
 
 static nxt_tls_bundle_conf_t *

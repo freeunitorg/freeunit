@@ -79,6 +79,7 @@ struct nxt_tls_conf_s {
     size_t                        buffer_size;
 
     uint8_t                       no_wait_shutdown;  /* 1 bit */
+    uint8_t                       http2;             /* 1 bit */
 };
 
 
@@ -89,6 +90,8 @@ struct nxt_tls_init_s {
     nxt_conf_value_t              *tickets_conf;
 
     nxt_tls_conf_t                *conf;
+
+    uint8_t                       http2;  /* 1 bit */
 };
 
 
@@ -98,6 +101,7 @@ extern const nxt_tls_lib_t        nxt_openssl_lib;
 void nxt_cdecl nxt_openssl_log_error(nxt_task_t *task, nxt_uint_t level,
     const char *fmt, ...);
 u_char *nxt_openssl_copy_error(u_char *p, u_char *end);
+nxt_bool_t nxt_openssl_conn_alpn_h2(nxt_conn_t *c);
 #endif
 
 #endif /* _NXT_TLS_H_INCLUDED_ */

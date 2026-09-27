@@ -1,0 +1,67 @@
+
+# Copyright (C) FreeUnit contributors
+
+
+NXT_HAVE_NGHTTP2=NO
+NXT_NGHTTP2_CFLAGS=
+NXT_NGHTTP2_LIBS=
+
+
+if [ $NXT_H2 = YES ]; then
+
+    if [ $NXT_OPENSSL != YES ]; then
+        $echo
+        $echo $0: error: --h2 requires --openssl.
+        $echo
+        exit 1;
+    fi
+
+    NXT_NGHTTP2_CFLAGS="$(pkgconf --cflags-only-I libnghttp2 2>/dev/null \
+                          || echo "")"
+    NXT_NGHTTP2_LIBS="$(pkgconf --libs libnghttp2 2>/dev/null \
+                        || echo "-lnghttp2")"
+
+    # The classic ssize_t API is used on purpose: the nghttp2_ssize "*2"
+    # functions came with 1.62 and the distro packages in the support matrix
+    # are older.  The two mitigation setters are tested by linking and not by
+    # version, because distributions backport them without bumping
+    # NGHTTP2_VERSION.
+    nxt_feature="nghttp2 library"
+    nxt_feature_name=NXT_HAVE_NGHTTP2
+    nxt_feature_run=no
+    nxt_feature_incs=$NXT_NGHTTP2_CFLAGS
+    nxt_feature_libs=$NXT_NGHTTP2_LIBS
+    nxt_feature_test="#include <nghttp2/nghttp2.h>
+
+                      int main(void) {
+                          nghttp2_option   *opt;
+                          nghttp2_session  *s = NULL;
+                          const uint8_t    *data;
+
+                          nghttp2_option_new(&opt);
+                          nghttp2_option_set_stream_reset_rate_limit(opt,
+                                                                     1000, 33);
+                          nghttp2_option_set_max_continuations(opt, 8);
+                          nghttp2_option_set_max_settings(opt, 32);
+                          (void) nghttp2_session_server_new2(&s, NULL, NULL,
+                                                             opt);
+                          (void) nghttp2_session_mem_recv(s, NULL, 0);
+                          (void) nghttp2_session_mem_send(s, &data);
+                          nghttp2_session_del(s);
+                          nghttp2_option_del(opt);
+                          return 0;
+                      }"
+    . auto/feature
+
+    if [ $nxt_found = yes ]; then
+        NXT_HAVE_NGHTTP2=YES
+        echo " + nghttp2 version: $(pkgconf --modversion libnghttp2 \
+                                      2>/dev/null || echo unknown)"
+    else
+        $echo
+        $echo $0: error: nghttp2 library with the reset rate limit and
+        $echo "    CONTINUATION limit setters not found."
+        $echo
+        exit 1;
+    fi
+fi

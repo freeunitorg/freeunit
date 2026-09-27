@@ -10,6 +10,9 @@
 #include <nxt_h1proto.h>
 #include <nxt_websocket.h>
 #include <nxt_websocket_header.h>
+#if (NXT_HAVE_NGHTTP2)
+#include <nxt_h2proto.h>
+#endif
 
 
 /*
@@ -83,7 +86,6 @@ static void nxt_h1p_idle_response_timeout(nxt_task_t *task, void *obj,
 static nxt_msec_t nxt_h1p_idle_response_timer_value(nxt_conn_t *c,
     uintptr_t data);
 static void nxt_h1p_shutdown(nxt_task_t *task, nxt_conn_t *c);
-static void nxt_h1p_closing(nxt_task_t *task, nxt_conn_t *c);
 static void nxt_h1p_conn_ws_shutdown(nxt_task_t *task, void *obj, void *data);
 static void nxt_h1p_conn_closing(nxt_task_t *task, void *obj, void *data);
 static void nxt_h1p_conn_free(nxt_task_t *task, void *obj, void *data);
@@ -153,12 +155,31 @@ const nxt_http_proto_table_t  nxt_http_proto[3] = {
 
         .ws_frame_start   = nxt_h1p_websocket_frame_start,
     },
-    /* NXT_HTTP_PROTO_H2      */
+    /* NXT_HTTP_PROTO_H2 */
+#if (NXT_HAVE_NGHTTP2)
+    {
+        .body_read        = nxt_h2p_request_body_read,
+        .local_addr       = nxt_h2p_request_local_addr,
+        .header_send      = nxt_h2p_request_header_send,
+        .send             = nxt_h2p_request_send,
+        .body_bytes_sent  = nxt_h2p_request_body_bytes_sent,
+        .discard          = nxt_h2p_request_discard,
+        .close            = nxt_h2p_request_close,
+    },
+#endif
     /* NXT_HTTP_PROTO_DEVNULL */
 };
 
 
-static nxt_lvlhsh_t                    nxt_h1p_fields_hash;
+nxt_lvlhsh_t                           nxt_h1p_fields_hash;
+nxt_lvlhsh_t                           nxt_http_request_fields_hash;
+
+/*
+ * The first NXT_H1P_ONLY_FIELDS entries are HTTP/1 framing.  The entries
+ * after them hold for every protocol and form nxt_http_request_fields_hash,
+ * which a frontend without HTTP/1 framing processes its fields with.
+ */
+#define NXT_H1P_ONLY_FIELDS  5
 
 static nxt_http_field_proc_t           nxt_h1p_fields[] = {
     { nxt_string("Connection"),        &nxt_h1p_connection, 0 },
@@ -205,6 +226,13 @@ nxt_h1p_init(nxt_task_t *task)
 
     ret = nxt_http_fields_hash(&nxt_h1p_fields_hash,
                                nxt_h1p_fields, nxt_nitems(nxt_h1p_fields));
+
+    if (nxt_fast_path(ret == NXT_OK)) {
+        ret = nxt_http_fields_hash(&nxt_http_request_fields_hash,
+                                   &nxt_h1p_fields[NXT_H1P_ONLY_FIELDS],
+                                   nxt_nitems(nxt_h1p_fields)
+                                   - NXT_H1P_ONLY_FIELDS);
+    }
 
     if (nxt_fast_path(ret == NXT_OK)) {
         ret = nxt_http_fields_hash(&nxt_h1p_peer_fields_hash,
@@ -495,6 +523,13 @@ nxt_h1p_conn_proto_init(nxt_task_t *task, void *obj, void *data)
     c = obj;
 
     nxt_debug(task, "h1p conn proto init");
+
+#if (NXT_HAVE_NGHTTP2)
+    if (c->u.tls != NULL && nxt_openssl_conn_alpn_h2(c)) {
+        nxt_h2p_conn_init(task, c);
+        return;
+    }
+#endif
 
     h1p = nxt_mp_zget(c->mem_pool, sizeof(nxt_h1proto_t));
     if (nxt_slow_path(h1p == NULL)) {
@@ -2249,7 +2284,7 @@ nxt_h1p_conn_ws_shutdown(nxt_task_t *task, void *obj, void *data)
 }
 
 
-static void
+void
 nxt_h1p_closing(nxt_task_t *task, nxt_conn_t *c)
 {
     nxt_debug(task, "h1p closing");

@@ -49,6 +49,8 @@ cat << END
   --no-pcre2           force using PCRE library
 
   --openssl            enable OpenSSL library usage
+  --h2                 enable HTTP/2 over TLS (needs --openssl and nghttp2)
+  --no-h2              disable HTTP/2 (the default)
 
   --zlib               enable zlib compression
   --zstd               enable zstd compression

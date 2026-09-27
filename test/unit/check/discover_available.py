@@ -5,6 +5,7 @@ from unit.check.cargo_component import check_cargo_component
 from unit.check.chroot import check_chroot
 from unit.check.clang_wasm import check_clang_wasm
 from unit.check.go import check_go
+from unit.check.h2 import check_http2
 from unit.check.isolation import check_isolation
 from unit.check.njs import check_njs
 from unit.check.node import check_node
@@ -38,6 +39,7 @@ def discover_available(unit):
     # discover modules using check
 
     option.available['modules']['go'] = check_go()
+    option.available['modules']['http2'] = check_http2(output_version)
     option.available['modules']['njs'] = check_njs(output_version)
     option.available['modules']['node'] = check_node()
     option.available['modules']['openssl'] = check_openssl(output_version)

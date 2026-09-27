@@ -175,6 +175,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_utf8_sanitize_test.c \
     src/test/nxt_rbtree1_test.c \
     src/test/nxt_http_parse_test.c \
+    src/test/nxt_http_request_fields_test.c \
     src/test/nxt_strverscmp_test.c \
     src/test/nxt_base64_test.c \
     src/test/nxt_string_test.c \
@@ -245,6 +246,11 @@ fi
 
 if [ $NXT_OPENSSL = YES ]; then
     NXT_LIB_SRCS="$NXT_LIB_SRCS $NXT_LIB_OPENSSL_SRCS"
+fi
+
+
+if [ "$NXT_HAVE_NGHTTP2" = "YES" ]; then
+    NXT_LIB_SRCS="$NXT_LIB_SRCS src/nxt_h2proto.c"
 fi
 
 
