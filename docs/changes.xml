@@ -651,11 +651,21 @@ connection to 10 MB of payload that the application has not received yet
 receive()); a single frame larger than that is still accepted when nothing else
 is waiting.  A fragmented message also left a count behind that lowered the
 limit applied to the next message.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 a byte-range request from a client that refused the identity coding is no
 longer answered with identity bytes.  A range is served as identity, so
 Range together with "Accept-Encoding: identity;q=0" returned a 206 carrying
 exactly the bytes the client said it would not take; the range is now
-ignored and the full 200 is sent in a coding the client accepts.  An
+ignored and the full 200 is sent in a coding the client accepts, or 406 where
+there is no such coding: compression is not configured, the response's media
+type is outside "types", or the file is below the compressor's "min_length".
+A file below "min_length" is refused whether or not a range was asked for; the
+other two only for a range request, since a request without one is answered
+with the same full identity 200 a server with no compression sends.  An
 unsatisfiable range from such a client is no longer answered with 416 either.
 A request that accepts no coding at all is still 406.  Several Accept-Encoding
 lines in one request are now read as one comma-joined value; previously only the

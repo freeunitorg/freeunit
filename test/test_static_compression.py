@@ -15,6 +15,8 @@ def setup_method_fixture(temp_dir):
     Path(f'{assets_dir}/big.css').write_text(
         'body{color:red}' * 500, encoding='utf-8'
     )
+    Path(f'{assets_dir}/tiny.css').write_text('ok', encoding='utf-8')
+    Path(f'{assets_dir}/raw').write_text('raw', encoding='utf-8')
 
     assert 'success' in client.conf(
         {
@@ -337,10 +339,10 @@ def test_static_compression_vary_merge_identity(temp_dir, configured, expected):
 # needs a language-module test, not a static one.
 
 
-def _raw_get(**headers):
+def _raw_get(url='/big.css', **headers):
     # Raw bytes: the body has to be decompressed, so it must not be decoded.
     raw = client.get(
-        url='/big.css',
+        url=url,
         headers={'Host': 'localhost', 'Connection': 'close', **headers},
         encoding='latin-1',
         read_buffer_size=1024 * 1024,
@@ -377,6 +379,34 @@ def test_static_compression_range_identity_refused(temp_dir):
     assert headers.get('Content-Encoding') == 'gzip', 'served as gzip'
     assert 'Content-Range' not in headers, 'no Content-Range on the full 200'
     assert gzip.decompress(body) == data, 'the whole file, correctly coded'
+
+
+def test_static_compression_identity_refused_below_min_length():
+    # Compression's min_length makes gzip unavailable for this two-byte file.
+    # It must not turn a refused identity Range into a full identity 200: the
+    # only representation Unit is prepared to send is unacceptable, so 406 is
+    # the honest answer both with and without Range.
+    for extra in ({}, {'Range': 'bytes=0-1'}):
+        status, headers, _ = _raw_get(
+            '/tiny.css',
+            **{'Accept-Encoding': 'gzip, identity;q=0', **extra},
+        )
+        assert status == 406, 'a below-minimum gzip is not available'
+        assert 'Content-Encoding' not in headers
+        assert 'Content-Range' not in headers
+
+
+def test_static_compression_identity_refused_without_eligible_coding():
+    # The configured compressor applies only to text/css.  This extensionless
+    # file has no media type, so Unit cannot produce gzip and must not serve
+    # its identity bytes merely because the request also contains a Range.
+    status, headers, _ = _raw_get(
+        '/raw',
+        **{'Accept-Encoding': 'gzip, identity;q=0', 'Range': 'bytes=0-1'},
+    )
+    assert status == 406, 'no configured coding can serve this representation'
+    assert 'Content-Encoding' not in headers
+    assert 'Content-Range' not in headers
 
 
 def test_static_compression_range_identity_refused_guards(temp_dir):

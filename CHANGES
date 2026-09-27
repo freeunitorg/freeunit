@@ -493,19 +493,26 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        than that is still accepted when nothing else is waiting. A
        fragmented message also left a count behind that lowered the limit
        applied to the next message.
+
     *) Bugfix: a byte-range request from a client that refused the identity
        coding is no longer answered with identity bytes.  A range is served
        as identity, so "Range" together with "Accept-Encoding:
        identity;q=0" returned a "206 Partial Content" carrying exactly the
        bytes the client said it would not take.  The range is now ignored
-       and the full "200 OK" is sent in a coding the client does accept.
-       Ignoring the range is all or nothing, so an unsatisfiable range from
-       such a client is no longer answered with "416" either.  A request
-       that accepts no coding at all is still "406 Not Acceptable", and a
-       range from a client that does accept identity is still a 206.
-       Several "Accept-Encoding" lines in one request are now read as the
-       single comma-joined value RFC 9110 defines them to be; previously
-       only the first was consulted.
+       and the full "200 OK" is sent in a coding the client does accept, or
+       "406 Not Acceptable" where there is no such coding: compression is
+       not configured, the response's media type is outside "types", or the
+       file is below the compressor's "min_length".  A file below
+       "min_length" is refused whether or not a range was asked for; the
+       other two only for a range request, since a request without one is
+       answered with the same full identity "200 OK" a server with no
+       compression sends.  Ignoring the range is all or nothing, so an
+       unsatisfiable range from such a client is no longer answered with
+       "416" either.  A request that accepts no coding at all is still "406
+       Not Acceptable", and a range from a client that does accept identity
+       is still a 206.  Several "Accept-Encoding" lines in one request are
+       now read as the single comma-joined value RFC 9110 defines them to
+       be; previously only the first was consulted.
 
     *) Bugfix: a malformed weight in "Accept-Encoding" is no longer read as a
        refusal.  The qvalue was converted with strtod(), which takes no digits
