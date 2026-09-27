@@ -363,6 +363,15 @@ void nxt_router_access_log_reopen_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 
 #if (NXT_TESTS)
+/*
+ * The sender checks of the router main port, for the router sender test.
+ * NXT_PROCESS_PROTOTYPE selects the REMOVE_PID check: main or a prototype.
+ */
+nxt_bool_t nxt_router_test_msg_sender_is(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, nxt_process_type_t type);
+
+extern nxt_uint_t  nxt_router_test_senders_refused;
+
 /* The detached edge handler, for the sender check test. */
 void nxt_router_test_detached_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);

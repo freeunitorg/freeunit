@@ -313,6 +313,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_router_sender_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_router_websocket_test(thr) != NXT_OK) {
         return 1;
     }

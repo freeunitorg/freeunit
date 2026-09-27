@@ -44,6 +44,19 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        spans are children of FreeUnit's span. Before, the application got
        the client's traceparent unchanged.
 
+    *) Security: an application process could send control messages to
+       the router. It could make the router quit, load a configuration,
+       restart applications, forget a process, redirect the error log, or
+       reopen the access log. The router now checks the sender pid that
+       the kernel gives. QUIT, CHANGE_FILE and ACCESS_LOG must come from
+       main. REMOVE_PID must come from main or from a prototype. DATA,
+       APP_RESTART and STATUS must come from the controller. The router
+       closes the descriptors of a refused message and does not reply.
+       This makes the attack harder, but does not stop it yet: the router
+       reads the pid of main and of the controller from ports that NEW_PORT
+       registers, and an application can still send a false NEW_PORT
+       first. A later change checks NEW_PORT.
+
     *) Bugfix: when unitd ran as root and the control socket was given to
        another user or group with --control-user or --control-group, that
        user passed the socket file permissions but the controller then
