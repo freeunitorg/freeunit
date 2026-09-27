@@ -9,7 +9,6 @@
 #include <nxt_otel.h>
 
 
-static nxt_int_t nxt_http_validate_host(nxt_str_t *host, nxt_mp_t *mp);
 static void nxt_http_request_start(nxt_task_t *task, void *obj, void *data);
 static nxt_int_t nxt_http_request_forward(nxt_task_t *task,
     nxt_http_request_t *r, nxt_http_forward_t *forward);
@@ -108,7 +107,7 @@ nxt_http_request_host(void *ctx, nxt_http_field_t *field, uintptr_t data)
 }
 
 
-static nxt_int_t
+nxt_int_t
 nxt_http_validate_host(nxt_str_t *host, nxt_mp_t *mp)
 {
     u_char      *h, ch;
@@ -679,6 +678,83 @@ nxt_http_request_read_body(nxt_task_t *task, nxt_http_request_t *r)
     if (nxt_fast_path(r->proto.any != NULL)) {
         nxt_http_proto[r->protocol].body_read(task, r);
     }
+}
+
+
+/*
+ * Allocates r->body for a request body of body_length bytes, or of a
+ * length not known in advance when body_length is (size_t) -1.  A body
+ * that fits in body_buffer_size is kept in memory; a longer one goes to
+ * an unlinked temporary file under body_temp_path, with a memory part of
+ * body_buffer_size for the reads.  The protocol layer that fills the
+ * buffer enforces max_body_size on what it stores.
+ */
+
+nxt_int_t
+nxt_http_request_body_alloc(nxt_task_t *task, nxt_http_request_t *r,
+    size_t body_length)
+{
+    size_t             body_buffer_size;
+    nxt_buf_t          *b;
+    nxt_socket_conf_t  *skcf;
+
+    static const nxt_str_t tmp_name_pattern = nxt_string("/req-XXXXXXXX");
+
+    skcf = r->conf->socket_conf;
+
+    body_buffer_size = nxt_min(skcf->body_buffer_size, body_length);
+
+    if (body_length > body_buffer_size) {
+        nxt_str_t  *tmp_path, tmp_name;
+
+        tmp_path = &skcf->body_temp_path;
+
+        tmp_name.length = tmp_path->length + tmp_name_pattern.length;
+
+        b = nxt_buf_file_alloc(r->mem_pool,
+                               body_buffer_size + sizeof(nxt_file_t)
+                               + tmp_name.length + 1, 0);
+        if (nxt_slow_path(b == NULL)) {
+            return NXT_ERROR;
+        }
+
+        tmp_name.start = nxt_pointer_to(b->mem.start, sizeof(nxt_file_t));
+
+        memcpy(tmp_name.start, tmp_path->start, tmp_path->length);
+        memcpy(tmp_name.start + tmp_path->length, tmp_name_pattern.start,
+               tmp_name_pattern.length);
+        tmp_name.start[tmp_name.length] = '\0';
+
+        b->file = (nxt_file_t *) b->mem.start;
+        nxt_memzero(b->file, sizeof(nxt_file_t));
+        b->file->fd = -1;
+        b->file->size = body_length;
+
+        b->mem.start += sizeof(nxt_file_t) + tmp_name.length + 1;
+        b->mem.pos = b->mem.start;
+        b->mem.free = b->mem.start;
+
+        b->file->fd = mkstemp((char *) tmp_name.start);
+        if (nxt_slow_path(b->file->fd == -1)) {
+            nxt_alert(task, "mkstemp(%s) failed %E", tmp_name.start, nxt_errno);
+            return NXT_ERROR;
+        }
+
+        nxt_debug(task, "create body tmp file \"%V\", %d",
+                  &tmp_name, b->file->fd);
+
+        unlink((char *) tmp_name.start);
+
+    } else {
+        b = nxt_buf_mem_alloc(r->mem_pool, body_buffer_size, 0);
+        if (nxt_slow_path(b == NULL)) {
+            return NXT_ERROR;
+        }
+    }
+
+    r->body = b;
+
+    return NXT_OK;
 }
 
 
