@@ -20,6 +20,7 @@ if [ -n "$NXT_FUZZ" ]; then
 
 .PHONY: fuzz
 fuzz:		$NXT_BUILD_DIR/fuzz_basic \\
+			$NXT_BUILD_DIR/fuzz_http_chunk \\
 			$NXT_BUILD_DIR/fuzz_http_controller \\
 			$NXT_BUILD_DIR/fuzz_http_h1p \\
 			$NXT_BUILD_DIR/fuzz_http_h1p_peer \\
@@ -32,6 +33,15 @@ $NXT_BUILD_DIR/fuzz_basic: \$(NXT_FUZZ_OBJS) \\
 	\$(PP_LD) \$@
 	\$(v)\$(NXT_EXEC_LINK) -o $NXT_BUILD_DIR/fuzz_basic \\
 		\$(CFLAGS) $NXT_BUILD_DIR/fuzzing/nxt_basic_fuzz.o \\
+		$NXT_BUILD_DIR/lib/$NXT_LIB_STATIC \\
+		$NXT_LD_OPT $NXT_LIBM $NXT_LIBS $NXT_LIB_AUX_LIBS \\
+		$NXT_FUZZ
+
+$NXT_BUILD_DIR/fuzz_http_chunk: \$(NXT_FUZZ_OBJS) \\
+			$NXT_BUILD_DIR/lib/$NXT_LIB_STATIC
+	\$(PP_LD) \$@
+	\$(v)\$(NXT_EXEC_LINK) -o $NXT_BUILD_DIR/fuzz_http_chunk \\
+		\$(CFLAGS) $NXT_BUILD_DIR/fuzzing/nxt_http_chunk_fuzz.o \\
 		$NXT_BUILD_DIR/lib/$NXT_LIB_STATIC \\
 		$NXT_LD_OPT $NXT_LIBM $NXT_LIBS $NXT_LIB_AUX_LIBS \\
 		$NXT_FUZZ
