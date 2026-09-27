@@ -1127,6 +1127,13 @@ main(void)
                                nxt_unit_msg_test_websocket_case,
                                (void *) &short_frame, NXT_UNIT_OK);
 
+    /*
+     * Release the library.  Otherwise the global context pointer keeps it
+     * reachable at exit, and LeakSanitizer does not see a leak of anything
+     * the library owns.
+     */
+    nxt_unit_done(nxt_unit_msg_test_ctx);
+
     if (nxt_unit_msg_test_failures != 0) {
         printf("unit msg test: %d failure(s)\n", nxt_unit_msg_test_failures);
         return 1;

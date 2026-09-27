@@ -1018,6 +1018,13 @@ jobs:
       - name: Run libunit port_recv fd-ownership test
         run: ./build/unit_port_recv_test
 
+      # Also run in c-tests-asan, but that leg is a --debug build and this one
+      # is not.  They execute different code: NXT_DEBUG makes nxt_queue_remove()
+      # clear the removed link and enables nxt_assert(), so a debug-only run can
+      # hide a use-after-unlink that the release build would show.
+      - name: Run libunit malformed port message test
+        run: ./build/unit_msg_test
+
   # Same C unit-test suite as c-tests above, built with AddressSanitizer and
   # run with LeakSanitizer's default ASAN_OPTIONS (detect_leaks is on unless
   # something turns it off). Separate from sanitize.yml: that workflow runs
@@ -1060,6 +1067,39 @@ jobs:
       # this repo's own sandboxed reproduction ran as root throughout.
       - name: Run C tests
         run: sudo ./build/tests
+
+      # The standalone libunit test programs are not part of build/tests: each
+      # has its own main() and links libunit's instrumented archive, and
+      # "make tests" builds them.  c-tests and build-distros run the first two
+      # without a sanitizer; unit_msg_test runs nowhere else.  No sudo: they
+      # use socketpair()s, fork() and shared memory, and build-distros runs
+      # them unprivileged.  unit_msg_test's children leave with _exit(), which
+      # skips the leak check, so only its parent process is checked.
+      #
+      # LSAN_OPTIONS=use_stacks=0, for these steps only: LeakSanitizer scans
+      # thread stacks conservatively, so a stale pointer left on the stack at
+      # exit keeps a leaked object reachable, and whether one is left depends
+      # on stack layout.  With the nxt_unit_done() calls at the end of its
+      # main() removed, unit_port_recv_test reported the leak in 3 of 10 runs
+      # with the default options and in 10 of 10 with use_stacks=0.  Globals,
+      # TLS and registers are still roots, so unit_port_recv_test and
+      # unit_msg_test release the library with nxt_unit_done() before they
+      # exit; a leak inside libunit is then unreachable and reported every
+      # time.
+      - name: Run libunit close-provenance test
+        env:
+          LSAN_OPTIONS: use_stacks=0
+        run: ./build/unit_close_test
+
+      - name: Run libunit port_recv fd-ownership test
+        env:
+          LSAN_OPTIONS: use_stacks=0
+        run: ./build/unit_port_recv_test
+
+      - name: Run libunit malformed port message test
+        env:
+          LSAN_OPTIONS: use_stacks=0
+        run: ./build/unit_msg_test
 
   # OpenSSL 4.0 compile gate.  4.0 removed nothing Unit uses, but it deprecated
   # more of what Unit still calls, and 5.0 is where the deprecated symbols
