@@ -771,6 +771,24 @@ nxt_proto_start_process_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     }
 #endif
 
+    /*
+     * A prototype that got QUIT only waits for its workers to exit.  The
+     * router can still send START_PROCESS at that point.  On shutdown main
+     * sends QUIT to the prototype directly.  The prototype reports the exit
+     * of a worker to the router.  The router starts a replacement before
+     * its own QUIT arrives.  A worker forked now gets no QUIT from anyone.
+     * The prototype waits for that worker, so Unit does not exit.  Refuse
+     * the start.  The reply fails the RPC of the router and gives the slot
+     * back.
+     */
+    if (nxt_slow_path(nxt_proto_exiting)) {
+        nxt_debug(task, "prototype is exiting, start process refused");
+
+        nxt_port_recv_msg_close_fds(msg);
+
+        goto failed;
+    }
+
     process = nxt_process_new(rt);
     if (nxt_slow_path(process == NULL)) {
         goto failed;
@@ -852,6 +870,13 @@ nxt_proto_test_run_start_process_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg)
 {
     nxt_proto_start_process_handler(task, msg);
+}
+
+
+void
+nxt_proto_test_set_exiting(nxt_bool_t exiting)
+{
+    nxt_proto_exiting = exiting;
 }
 
 #endif
