@@ -1407,8 +1407,9 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_app_processes_members[] = {
  * lets the operator disable every isolation feature here.  This is
  * intentional: any peer who can write to the control socket already
  * has the same authority as the unitd main process (see the
- * SO_PEERCRED check landed in andypost/unit#14 — non-root local
- * users are rejected at the socket layer, not by this validator).
+ * SO_PEERCRED check landed in andypost/unit#14 — local users other
+ * than root, unitd's user and the --control-user / --control-group
+ * principals are rejected at the socket layer, not by this validator).
  * Allow-listing executable paths or forcing isolation = true here
  * is a deployment policy decision, not a config-schema concern;
  * deployments needing that should add a wrapping admission gate

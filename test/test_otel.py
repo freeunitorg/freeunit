@@ -308,7 +308,11 @@ def test_otel_traceparent_in_response(protocol):
 @_skipif_no_fake_otlp
 @pytest.mark.parametrize('protocol', ['http', 'grpc'])
 def test_otel_traceparent_inherited(tmp_path, protocol):
-    """An incoming traceparent is continued: the exported span keeps its trace id."""
+    """An incoming traceparent is continued: the exported span keeps its
+    trace id, and the traceparent handed onward (echoed in the response,
+    and by extension forwarded to any peer/app) carries FreeUnit's own span
+    id as parent-id -- not the client's original parent-id -- so that a
+    downstream span is a child of FreeUnit's span, not a sibling of it."""
     port = _get_free_port()
     dump = str(tmp_path / 'otlp_dump.bin')
     proc = _run_fake_otlp(port, requests=1, dump=dump, protocol=protocol)
@@ -325,7 +329,13 @@ def test_otel_traceparent_inherited(tmp_path, protocol):
         )
         assert resp['status'] == 200
         # FreeUnit echoes the inherited traceparent back in the response.
-        assert TRACE_ID in _response_headers_lower(resp).get('traceparent', '')
+        echoed = _response_headers_lower(resp).get('traceparent', '')
+        assert TRACE_ID in echoed
+        assert PARENT_ID not in echoed, (
+            'the echoed/forwarded traceparent must not carry the client\'s '
+            'original parent-id'
+        )
+        echoed_parent_id = echoed.split('-')[2]
 
         try:
             proc.wait(timeout=EXPORT_TIMEOUT)
@@ -337,6 +347,13 @@ def test_otel_traceparent_inherited(tmp_path, protocol):
         # The trace id is encoded as 16 raw bytes in the OTLP protobuf payload.
         assert bytes.fromhex(TRACE_ID) in body, (
             'exported span must keep the inherited trace id'
+        )
+        # And the span id FreeUnit exported for itself is the same span id it
+        # handed onward as parent-id -- proof that the forwarded traceparent
+        # names FreeUnit's own span, not a copy of the inbound one.
+        assert bytes.fromhex(echoed_parent_id) in body, (
+            'the parent-id handed onward must be the id of the span FreeUnit '
+            'itself exported'
         )
     finally:
         _kill(proc)

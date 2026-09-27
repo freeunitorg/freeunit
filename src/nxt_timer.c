@@ -192,7 +192,7 @@ nxt_timer_changes_commit(nxt_event_engine_t *engine)
                 break;
             }
 
-            /* Fall through. */
+            nxt_fallthrough;
 
         case NXT_TIMER_DELETE:
             nxt_debug(timer->task, "timer rbtree delete: %M±%d",

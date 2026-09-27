@@ -11,6 +11,7 @@ on:
       - 'pkg/contrib/**'
       - 'pkg/eol.json'
       - '.github/workflows/build-test.yml'
+      - '.github/scripts/check-test-hooks.sh'
   push:
     branches: master
     paths:
@@ -22,6 +23,7 @@ on:
       - 'pkg/contrib/**'
       - 'pkg/eol.json'
       - '.github/workflows/build-test.yml'
+      - '.github/scripts/check-test-hooks.sh'
 
 env:
   # OpenSSL patch version built from source (see "Build OpenSSL" step). Only the
@@ -779,11 +781,12 @@ jobs:
           # The wasm legs build their guest fixture as the runner user, so
           # they run unprivileged to keep the result reachable by pytest; the
           # others install applications as root.
+          # --unsafe runs the long Autobahn 9.x websocket cases.
           if [ "${{ matrix.build }}" == "wasm-wasi-component" ] || [ "${{ matrix.build }}" == "wasm" ]; then
             set -o pipefail
-            pytest-3 --print-log ${{ steps.metadata.outputs.testpath }} 2>&1 | tee "$RUNNER_TEMP/pytest.out"
+            pytest-3 --print-log --unsafe ${{ steps.metadata.outputs.testpath }} 2>&1 | tee "$RUNNER_TEMP/pytest.out"
           else
-            sudo -E pytest-3 --print-log ${{ steps.metadata.outputs.testpath }}
+            sudo -E pytest-3 --print-log --unsafe ${{ steps.metadata.outputs.testpath }}
           fi
 
       # check_prerequisites() skips the whole file when the clang/wasi-sysroot
@@ -806,19 +809,34 @@ jobs:
       # real application to show it inherits the shim harmlessly, and this
       # leg is where a language module exists.
       #
+      # test_configuration.py runs here too: test_unprivileged_user_error
+      # needs a unitd that is not root.
+      #
       # pytest-3 is named absolutely: setup-python puts a toolcache bin
       # directory ahead of /usr/bin for this step and not for the sudo'd one
       # above, and both must run the pytest that "apt install python3-pytest"
       # provided.
       #
       # !cancelled() rather than the implicit success(): this is the only leg
-      # that ever runs the file, and gating it on the whole sudo'd suite above
-      # would let one unrelated flake silently take that coverage away again --
-      # the very problem this step exists to fix.
-      - name: Run capget fallback tests unprivileged
+      # that ever runs these files, and gating it on the whole sudo'd suite
+      # above would let one unrelated flake silently take that coverage away
+      # again -- the very problem this step exists to fix.
+      - name: Run capget fallback and configuration tests unprivileged
         run: |
           export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
-          /usr/bin/pytest-3 --print-log test/test_capget_fallback.py
+          /usr/bin/pytest-3 --print-log test/test_capget_fallback.py test/test_configuration.py
+        if: ${{ !cancelled() && steps.metadata.outputs.module == 'python' }}
+
+      # test_asgi_lifespan.py stops unitd from inside the test to check the
+      # shutdown event, and test_tls_certificate_update_restart restarts it
+      # to check that a replaced bundle survives.  Both need --restart, which
+      # the run above does not pass, so they skip there.  Run them again.
+      - name: Run the tests that restart unitd, with --restart
+        run: |
+          export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
+          sudo -E /usr/bin/pytest-3 --print-log --restart \
+            test/test_asgi_lifespan.py \
+            test/test_tls.py::test_tls_certificate_update_restart
         if: ${{ !cancelled() && steps.metadata.outputs.module == 'python' }}
 
   # C unit-test suite (src/test/ -> build/tests): HTTP parser, port/IPC
@@ -841,8 +859,23 @@ jobs:
       - name: Configure unit (--tests)
         run: ./configure --openssl --tests
 
+      - name: Build unitd and libunit
+        run: |
+          make -j4
+          make -j4 build/lib/libunit.a
+
       - name: Build C tests
         run: make -j4 tests
+
+      # The hooks (fault-injection branches and counters inside
+      # "#if (NXT_TESTS)") must reach the test programs and nothing else.
+      # The script derives the hook symbols from the build itself, so a new
+      # hook needs no change here.  It fails when a hook symbol is in unitd,
+      # libnxt.a, libunit.a or nxt_unit.o, when a test program linked a plain
+      # object, or when a source outside the twice-compiled set mentions
+      # NXT_TESTS.
+      - name: Check the test hooks are in the test programs only
+        run: .github/scripts/check-test-hooks.sh
 
       - name: Run C tests
         run: sudo ./build/tests
@@ -876,14 +909,16 @@ jobs:
           sudo apt-get -y update
           sudo apt-get -y install build-essential libssl-dev libpcre2-dev clang
 
-      - name: Configure unit (ASan+LSan, --tests)
+      # -fno-sanitize-recover: the first UBSan report fails the job.
+      # nxt_conf_map_object_test fails only under UBSan.
+      - name: Configure unit (ASan+LSan+UBSan, --tests)
         run: |
           ./configure \
             --cc=clang \
             --debug \
             --tests \
-            --cc-opt="-fsanitize=address -fno-omit-frame-pointer -g" \
-            --ld-opt="-fsanitize=address"
+            --cc-opt="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g" \
+            --ld-opt="-fsanitize=address,undefined"
 
       - name: Build C tests
         run: make -j4 tests
@@ -961,6 +996,69 @@ jobs:
         run: |
           grep NXT_HAVE_OPENSSL_VERSION build/include/nxt_auto_config.h
           grep -q '#define NXT_HAVE_OPENSSL_VERSION  "OpenSSL 4\.' \
+            build/include/nxt_auto_config.h
+
+      - name: Build unit
+        run: make -j4
+
+      - name: Build C tests
+        run: make -j4 tests
+
+      - name: Run C tests
+        run: sudo ./build/tests
+
+  # --hardening=strict compile gate, with gcc and with clang.  auto/cc/test
+  # already passes -Werror to both, so a new warning from -Wformat=2, -Wvla or
+  # -Wimplicit-fallthrough (a fall-through without nxt_fallthrough) fails the
+  # job.  The assert step fails when a compiler stops accepting one of the
+  # probed flags: auto/cc/hardening only drops such a flag, so a plain build
+  # would pass while testing nothing.  Cheap on purpose: a build plus the C
+  # test suite, no language modules.
+  hardening-strict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev clang
+
+      - name: Configure unit (--hardening=strict --tests --openssl)
+        run: |
+          ./configure \
+            --cc=${{ matrix.cc }} \
+            --hardening=strict \
+            --tests \
+            --openssl 2>&1 | tee configure.log
+          test "${PIPESTATUS[0]}" -eq 0
+
+      # Every flag that this job exists for must be found.  The FORTIFY probe
+      # falls back from level 3 to 2, so either level passes.  The CET and
+      # branch-protection flags are not asserted: each applies to one target
+      # only.
+      - name: Assert configure found the hardening flags
+        run: |
+          grep -q 'hardening: .* strict$' configure.log
+          for flag in -fstack-protector-strong -fstack-clash-protection \
+                      -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack \
+                      -Wformat=2 -Wvla -Wimplicit-fallthrough \
+                      -ftrivial-auto-var-init=pattern
+          do
+            grep -q "checking for $flag \.\.\. found" configure.log \
+              || { echo "$flag was not found"; exit 1; }
+          done
+          grep -q 'checking for -D_FORTIFY_SOURCE=[23] \.\.\. found' \
+            configure.log \
+            || { echo "_FORTIFY_SOURCE was not found"; exit 1; }
+          grep -q 'define NXT_HAVE_BUILTIN_OVERFLOW' \
             build/include/nxt_auto_config.h
 
       - name: Build unit

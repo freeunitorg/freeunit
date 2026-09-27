@@ -1,6 +1,89 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Bugfix: when unitd ran as root and the control socket was given to
+       another user or group with --control-user or --control-group, that
+       user passed the socket file permissions but the controller then
+       closed the connection. The controller now also accepts the
+       configured user, and a peer in the configured group.
+
+    *) Security: an application could write an unexpected value into an
+       entry of a shared memory queue. The router then retried that entry
+       for ever. Each enqueue and dequeue now stops after one queue size
+       of retries. The router refuses the message and writes an alert.
+
+    *) Security: a port kept every fragment of a message until the last
+       one arrived, so a peer process could make it hold memory without
+       limit. A fragment that named a shared memory segment but carried no
+       record also left a receive buffer in the stream while the same
+       buffer was reused for the next read. Reassembly is now limited to
+       64 streams, 128 MiB per stream and 256 MiB per port, a new stream
+       drops the oldest one when 64 are open, and such a fragment is
+       dropped. A port linked without a process no longer crashes a
+       release build when it is freed.
+
+    *) Bugfix: an application used a shared memory segment id from the
+       other process to grow its array of segments without a limit. An id
+       like 100000000 in one message made it allocate and fill an array of
+       that many slots, so the process could run out of memory. It now
+       refuses an id of 65536 or more. The router already refused such ids
+       from applications; it now uses the same limit for the segments it
+       creates.
+
+    *) Bugfix: the proxy recognised an upstream Transfer-Encoding only when
+       its value was exactly "chunked". "Chunked" or "gzip, chunked" was
+       not recognised, so the body was framed by Content-Length or by
+       connection close, and the chunk framing reached the client as body
+       bytes. The value is now parsed as a list of codings, and coding
+       names are compared without case. One "chunked" is decoded. Any
+       other transfer coding, and chunked together with Content-Length,
+       fails the request with 502: the proxy cannot decode such a body,
+       and it never forwards Transfer-Encoding to the client. A response
+       to HEAD, and any 204 or 304, is exempt from both 502s: it ends at
+       the first empty line, so no Transfer-Encoding frames it. Before,
+       such a response gave 502 when it carried chunked together with
+       Content-Length.
+
+    *) Feature: the --hardening=[off|default|strict] configure option adds
+       compiler and linker hardening flags. Each flag is probed, and a
+       compiler that does not support a flag only loses that flag. The
+       default is "off", so a build without the option does not change.
+
+    *) Feature: "PUT /certificates/<name>" replaces an existing certificate
+       bundle in place. Main writes the bundle to a temporary file and
+       renames it over the old one, so a crash never leaves a partial
+       bundle. When the current configuration names the bundle, the
+       controller applies the configuration again before it answers. New
+       handshakes get the new certificate; accepted connections finish
+       with the old one. An external ACME client can renew a certificate
+       with one request and no restart; see docs/acme.md. A bundle over
+       1 MiB is refused with 413. The router opens bundles read-only.
+
+    *) Bugfix: with "isolation": {"namespaces": {"pid": true}}, a worker
+       that died before it was fully started left its record, port and
+       descriptor in the main process until the prototype exited. The
+       prototype now reports such a worker to main, which drops them.
+
+    *) Bugfix: the main process accepted a second WHOAMI from an
+       application process, and a parent that is not a prototype. The
+       process was then linked into its parent's list twice, which
+       corrupted the list in main. Such a message is now refused.
+
+    *) Bugfix: a request could reach the application with a truncated method
+       or header name length. The application protocol stores method and
+       field name lengths in a single byte. When a method exceeded 255
+       bytes, the router wrapped the length. For PHP, Perl, and Ruby, header
+       names carry the "HTTP_" prefix, causing names of 251 to 255 bytes to
+       wrap. The router now refuses a method longer than 255 bytes with 501,
+       and an overflowing header name with 431. Both are logged at "info".
+       Other languages continue to accept header names up to 255 bytes.
+
+    *) Bugfix: an upstream 1xx interim response ("100 Continue", "103 Early
+       Hints") was relayed to the client as the response, with the final
+       response relayed as its body. The proxy now drops interim responses
+       (101 excepted) and relays the final one; more than ten of them, or
+       one larger than the proxy header buffer, fails the request with 502.
+
     *) Change: a certificate bundle whose private key does not belong to
        its first certificate is now refused at upload with 400 "Invalid
        certificate.". Before, the bundle was stored, and the mismatch
@@ -37,6 +120,15 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        for an application process, not only how long a worker may spend on
        it. A request that waited for capacity previously had no deadline at
        all. The default remains no timeout.
+
+    *) Security: the router decoded the response an application returned
+       in shared memory without checking it: the field count was read
+       twice, and the name, value and body offsets were followed without a
+       bounds check. An application could point the router anywhere.
+       libunit read the request from shared memory more than once after
+       checking it. A sibling process of the same application, which maps
+       the same segment, could change a value in between. Both sides now
+       read every value once and check every offset against the buffer.
 
     *) Security: the string form of "access_log" "format" wrote what a
        variable expanded to without escaping it.  "$uri" is the
@@ -415,14 +507,94 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        to. A 64 KiB message arrived as eight frames and a 16 MiB one as about
        two thousand, each carrying its own frame header and costing its own
        message to the router, while every other language module sends a
-       complete message as a single frame. A complete text message is now
-       encoded into a buffer of its own and sent as one frame; a message
-       above "nginx.unit.websocket.MAX_SEND_BUFFER_SIZE", 16 MiB by default,
-       still fragments. A Writer from getSendWriter() still sends each chunk
-       it flushes as a frame of its own, but that chunk is now one frame
-       instead of up to three. This does not make the module honour
-       "max_frame_size", which remains an inbound limit only.
+       complete message as a single frame. A complete text message, from
+       getBasicRemote() or getAsyncRemote(), is now encoded into a buffer of
+       its own and sent as one frame; a message above
+       "nginx.unit.websocket.MAX_SEND_BUFFER_SIZE", 16 MiB by default, still
+       fragments. A Writer from getSendWriter() still sends each chunk it
+       flushes as a frame of its own, but that chunk is now one frame instead
+       of up to four. An OutputStream from getSendStream() still sends each
+       8 KiB it fills as a frame of its own. This does not make the module
+       honour "max_frame_size", which remains an inbound limit only.
 
+    *) Bugfix: the java module sent nothing through the asynchronous
+       WebSocket remote. Every send from getAsyncRemote() -- sendText(),
+       sendBinary() and sendObject(), with a SendHandler or through the
+       Future they return -- ended in a doWrite() that had no body, so no
+       frame left, the handler was never called and Future.get() blocked
+       for good; getBasicRemote() sends through another path and was not
+       affected. Such a send now goes out as one from the blocking remote
+       does, and its handler or future completes on the sending thread with
+       the outcome, which is a failure once the session is closed (#434).
+       Batching works as well: flushBatch() and setBatchingAllowed(false)
+       threw instead of sending what was batched, and a batched frame from a
+       buffer whose position was not 0 had a header that overstated its
+       length and corrupted the frames after it.
+
+    *) Bugfix: the java module sent the wrong bytes, or nothing, for a
+       WebSocket message from a heap ByteBuffer that does not start at its
+       array's first byte. The payload was read from the backing array at
+       position(), ignoring arrayOffset(), so a buffer from
+       ByteBuffer.wrap(a, off, n).slice() sent bytes from the start of the
+       array instead of its own; and a read-only heap buffer threw
+       ReadOnlyBufferException instead of being sent. Both the blocking and
+       the asynchronous remote were affected (#486).
+
+    *) Bugfix: the Python ASGI module refused a WebSocket message larger
+       than 1 MB whatever "max_frame_size" was set to. The module carried a
+       private 1 MB limit that no configuration ever wrote and charged the
+       fragments of a message against it, while the configured value is
+       checked by the router per frame: a 4 MB message was closed with 1009
+       where "max_frame_size" was 32 MB, and at the default size a client
+       that split a larger message into small frames was refused as well.
+       Each frame is now limited by "max_frame_size" alone. The module
+       only limits a connection to 10 MB of payload that the application
+       has not received yet (fragments of a message in progress and
+       complete messages waiting for receive()); a single frame larger
+       than that is still accepted when nothing else is waiting. A
+       fragmented message also left a count behind that lowered the limit
+       applied to the next message.
+    *) Bugfix: a byte-range request from a client that refused the identity
+       coding is no longer answered with identity bytes.  A range is served
+       as identity, so "Range" together with "Accept-Encoding:
+       identity;q=0" returned a "206 Partial Content" carrying exactly the
+       bytes the client said it would not take.  The range is now ignored
+       and the full "200 OK" is sent in a coding the client does accept.
+       Ignoring the range is all or nothing, so an unsatisfiable range from
+       such a client is no longer answered with "416" either.  A request
+       that accepts no coding at all is still "406 Not Acceptable", and a
+       range from a client that does accept identity is still a 206.
+       Several "Accept-Encoding" lines in one request are now read as the
+       single comma-joined value RFC 9110 defines them to be; previously
+       only the first was consulted.
+
+    *) Bugfix: a malformed weight in "Accept-Encoding" is no longer read as a
+       refusal.  The qvalue was converted with strtod(), which takes no digits
+       at all from "identity;q=" and from "identity;q=abc" and reports zero,
+       so either one answered "406 Not Acceptable" to a client that had
+       refused nothing; "q=0x0" and "q=0e0" did the same.  An element whose
+       weight does not match the grammar of RFC 9110 Sect. 12.4.2 is now
+       ignored, as an element naming an unknown coding already was.  This
+       also removes "q=nan", which passed the 0-to-1 range check -- a NaN
+       compares false against both bounds -- and then outranked every real
+       weight.
+
+    *) Bugfix: a negotiation failure on "Accept-Encoding" was answered with
+       "503 Service Unavailable" instead of "406 Not Acceptable" when the
+       response came from an application.  The router treated every result of
+       the acceptability check other than success as a server error; only the
+       static path reported the 406.
+
+
+    *) Change: unitd, libunit.a and the language modules no longer contain
+       the test hooks compiled under "#if (NXT_TESTS)".  "./configure
+       --tests" used to define the macro for the whole build, and the deb
+       and rpm packages pass "--tests", so every released package from 0.2
+       to 1.36.1 carried them: the nxt_random_test() entry point in all of
+       them, and in 1.36.0 and 1.36.1 the fault-injection branches and
+       counters in nxt_mp.c, nxt_port_rpc.c and nxt_port_socket.c, two of
+       which were exported symbols.  The hooks now go only into the test
+       programs.  A build without "--tests" is unchanged.
 
 Changes with FreeUnit 1.36.1                                     28 Aug 2026
 

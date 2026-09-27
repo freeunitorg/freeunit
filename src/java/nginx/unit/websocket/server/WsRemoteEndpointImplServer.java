@@ -22,6 +22,8 @@ import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.channels.CompletionHandler;
 import java.nio.channels.InterruptedByTimeoutException;
+import java.util.ArrayDeque;
+import java.util.Queue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 
@@ -50,6 +52,38 @@ public class WsRemoteEndpointImplServer extends WsRemoteEndpointImplBase {
     private volatile long timeoutExpiry = -1;
     private volatile boolean close;
 
+    /*
+     * A frame that the batching path split across two doWrite() calls: the
+     * base class fills its output buffer and flushes it wherever it happens
+     * to be full, so a frame's header, or its payload, may arrive in parts.
+     * A server frame is not masked, so its header is at most 10 bytes.
+     */
+    private final byte[] header = new byte[10];
+    private int headerLength = 0;
+    private byte frameOpCode;
+    private boolean frameFin;
+    private long frameLeft = 0;
+    private ByteBuffer framePayload = null;
+
+    /*
+     * A completion runs on the thread that sent.  A handler that sends from
+     * onResult(), as TextMessageSendHandler does for each 8 KiB of a text
+     * message, nests a doWrite() inside the completion, so a large message
+     * would nest thousands deep.  Completions nest inline up to MAX_DEPTH and
+     * are queued beyond it, to be run by the outermost completion on this
+     * thread.  Inline, not always queued: a handler that waits on a send it
+     * made itself (Future.get(), flushBatch(), close() with batching on) needs
+     * that send's completion to run before it returns.
+     *
+     * The state is per thread: once a completion releases the message part,
+     * another thread may send on this endpoint while the first is still
+     * inside its completion.
+     */
+    private static final int MAX_DEPTH = 32;
+
+    private static final ThreadLocal<Completions> completions =
+            new ThreadLocal<>();
+
     public WsRemoteEndpointImplServer(
             WsServerContainer serverContainer) {
     }
@@ -60,9 +94,217 @@ public class WsRemoteEndpointImplServer extends WsRemoteEndpointImplBase {
         return false;
     }
 
+    /*
+     * Sends the frames the base class serialised into buffers.  Unit writes
+     * the frame header itself, so each frame is decoded back into its opcode,
+     * fin bit and payload and handed to sendWsFrame().
+     *
+     * writeMessagePart() sends a frame directly as its header and its payload,
+     * in that order.  With batching allowed it copies frames into its output
+     * buffer instead and passes that buffer whenever it fills or is flushed,
+     * so that path is decoded as a byte stream that may split a frame across
+     * calls.
+     *
+     * The write is synchronous: sendWsFrame() has copied the payload to the
+     * router by the time it returns, so the handler is completed here, on the
+     * calling thread, with the outcome.
+     */
     @Override
     protected void doWrite(SendHandler handler, long blockingWriteTimeoutExpiry,
             ByteBuffer... buffers) {
+        SendResult result = SENDRESULT_OK;
+
+        try {
+            if (!isSessionOpen()) {
+                throw new IOException(sm.getString("wsRemoteEndpointServer.closed"));
+            }
+
+            if (buffers.length == 2 && headerLength == 0 && frameLeft == 0) {
+                // Direct path: the frame's header, then its payload.
+                ByteBuffer hdr = buffers[0];
+                ByteBuffer payload = buffers[1];
+                byte b = hdr.get(hdr.position());
+
+                sendWsFrame(payload, (byte) (b & 0x0F), (b & 0x80) != 0,
+                        blockingWriteTimeoutExpiry);
+
+                hdr.position(hdr.limit());
+                payload.position(payload.limit());
+            } else {
+                for (ByteBuffer buffer : buffers) {
+                    sendFrames(buffer, blockingWriteTimeoutExpiry);
+                }
+            }
+        } catch (IOException | RuntimeException e) {
+            /*
+             * A frame the stream decoder had started is lost with the send;
+             * start the next doWrite() at a frame boundary.
+             */
+            headerLength = 0;
+            frameLeft = 0;
+            framePayload = null;
+
+            result = new SendResult(e);
+        }
+
+        complete(handler, result);
+    }
+
+
+    private void sendFrames(ByteBuffer buffer, long timeoutExpiry)
+            throws IOException {
+        while (buffer.hasRemaining()) {
+            if (frameLeft == 0 && framePayload == null) {
+                if (!readHeader(buffer)) {
+                    // The rest of the header is in a later buffer
+                    return;
+                }
+                if (frameLeft == 0) {
+                    sendWsFrame(ByteBuffer.allocate(0), frameOpCode, frameFin,
+                            timeoutExpiry);
+                    continue;
+                }
+            }
+
+            int limit = buffer.limit();
+
+            if (framePayload == null && buffer.remaining() >= frameLeft) {
+                // The whole payload is here: send it in place
+                buffer.limit(buffer.position() + (int) frameLeft);
+                sendWsFrame(buffer, frameOpCode, frameFin, timeoutExpiry);
+                buffer.position(buffer.limit());
+                buffer.limit(limit);
+                frameLeft = 0;
+                continue;
+            }
+
+            // The payload is split across buffers: gather it
+            if (framePayload == null) {
+                framePayload = ByteBuffer.allocate((int) frameLeft);
+            }
+
+            int n = Math.min(buffer.remaining(), framePayload.remaining());
+            buffer.limit(buffer.position() + n);
+            framePayload.put(buffer);
+            buffer.limit(limit);
+            frameLeft -= n;
+
+            if (frameLeft == 0) {
+                framePayload.flip();
+                ByteBuffer payload = framePayload;
+                framePayload = null;
+                sendWsFrame(payload, frameOpCode, frameFin, timeoutExpiry);
+            }
+        }
+    }
+
+
+    /*
+     * Reads header bytes from buffer until the header is complete.  Returns
+     * false when buffer ran out first; the bytes read so far are kept for the
+     * next call.
+     */
+    private boolean readHeader(ByteBuffer buffer) throws IOException {
+        while (buffer.hasRemaining()) {
+            header[headerLength++] = buffer.get();
+
+            if (headerLength < 2) {
+                continue;
+            }
+
+            int len = header[1] & 0x7F;
+            int need = len == 126 ? 4 : len == 127 ? 10 : 2;
+
+            if (headerLength < need) {
+                continue;
+            }
+
+            frameFin = (header[0] & 0x80) != 0;
+            frameOpCode = (byte) (header[0] & 0x0F);
+
+            if (len == 126) {
+                frameLeft = ((header[2] & 0xFF) << 8) | (header[3] & 0xFF);
+            } else if (len == 127) {
+                frameLeft = 0;
+                for (int i = 2; i < 10; i++) {
+                    frameLeft = (frameLeft << 8) | (header[i] & 0xFF);
+                }
+                if (frameLeft < 0 || frameLeft > Integer.MAX_VALUE) {
+                    headerLength = 0;
+                    throw new IOException(sm.getString(
+                            "wsRemoteEndpointServer.badFrame",
+                            Long.valueOf(frameLeft)));
+                }
+            } else {
+                frameLeft = len;
+            }
+
+            headerLength = 0;
+            return true;
+        }
+
+        return false;
+    }
+
+
+    private void complete(SendHandler handler, SendResult result) {
+        Completions c = completions.get();
+
+        if (c == null) {
+            c = new Completions();
+            completions.set(c);
+
+        } else if (c.depth >= MAX_DEPTH) {
+            c.queue.add(new Completion(handler, result));
+            return;
+        }
+
+        boolean outermost = c.depth == 0;
+
+        c.depth++;
+        try {
+            handler.onResult(result);
+        } finally {
+            c.depth--;
+
+            if (outermost) {
+                drain(c);
+            }
+        }
+    }
+
+
+    private static void drain(Completions c) {
+        try {
+            Completion q;
+            while ((q = c.queue.poll()) != null) {
+                c.depth++;
+                try {
+                    q.handler.onResult(q.result);
+                } finally {
+                    c.depth--;
+                }
+            }
+        } finally {
+            completions.remove();
+        }
+    }
+
+
+    private static class Completions {
+        private int depth = 0;
+        private final Queue<Completion> queue = new ArrayDeque<>();
+    }
+
+
+    private static class Completion {
+        private final SendHandler handler;
+        private final SendResult result;
+
+        private Completion(SendHandler handler, SendResult result) {
+            this.handler = handler;
+            this.result = result;
+        }
     }
 
     @Override

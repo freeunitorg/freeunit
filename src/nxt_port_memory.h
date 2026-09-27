@@ -52,4 +52,11 @@ nxt_int_t nxt_shm_open(nxt_task_t *task, size_t size);
 
 void nxt_process_broadcast_shm_ack(nxt_task_t *task, nxt_process_t *process);
 
+#if (NXT_TESTS)
+/* The segment array growth and the segment creation, for the limit test. */
+nxt_port_mmap_t *nxt_port_test_mmap_at(nxt_port_mmaps_t *mmaps, uint32_t i);
+nxt_port_mmap_handler_t *nxt_port_test_new_port_mmap(nxt_task_t *task,
+    nxt_port_mmaps_t *mmaps, nxt_int_t n);
+#endif
+
 #endif /* _NXT_PORT_MEMORY_H_INCLUDED_ */

@@ -137,6 +137,7 @@ nxt_port_new(nxt_task_t *task, nxt_port_id_t id, nxt_pid_t pid,
         nxt_mp_cleanup(mp, nxt_port_mp_cleanup, task, port, mp);
 
         nxt_queue_init(&port->messages);
+        nxt_queue_init(&port->frag_queue);
         nxt_thread_mutex_create(&port->write_mutex);
 
         port->queue_fd = -1;
@@ -274,8 +275,6 @@ nxt_port_release(nxt_task_t *task, nxt_port_t *port)
     }
 
     if (port->link.next != NULL) {
-        nxt_assert(port->process != NULL);
-
         rt = task->thread->runtime;
 
         /*
@@ -297,7 +296,22 @@ nxt_port_release(nxt_task_t *task, nxt_port_t *port)
 
         nxt_thread_mutex_unlock(&rt->processes_mutex);
 
-        nxt_process_use(task, port->process, -1);
+        /*
+         * nxt_process_port_add() is the only production path that links a
+         * port, and it sets ->process and takes the reference with it.  A
+         * port linked any other way (#425) has no reference to drop: this
+         * used to be an nxt_assert(), which release builds compile out, and
+         * nxt_process_use() then dereferenced NULL.  The unlink above still
+         * has to happen -- the list would otherwise point into the pool
+         * freed below.
+         */
+        if (nxt_fast_path(port->process != NULL)) {
+            nxt_process_use(task, port->process, -1);
+
+        } else {
+            nxt_alert(task, "port %p %d:%d was linked to a process without "
+                      "a process reference", port, port->pid, port->id);
+        }
     }
 
     nxt_mp_release(port->mem_pool);

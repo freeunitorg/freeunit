@@ -2892,10 +2892,7 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
 
         h1p = peer->proto.h1;
 
-        if (h1p->chunked && r->resp.content_length != NULL) {
-            peer->status = NXT_HTTP_BAD_GATEWAY;
-            break;
-        }
+        h1p->chunked = (h1p->transfer_encoding == NXT_HTTP_TE_CHUNKED);
 
         /*
          * RFC 9112 Sect. 6.3: a response to HEAD, and any 204 or 304 response,
@@ -2920,13 +2917,8 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
          * releases the request pool.
          *
          * The predicate is the "final response" one, not the full RFC list:
-         * a 1xx from an upstream is an interim response, and nothing here
-         * continues the exchange past it -- nxt_h1p_peer_header_parse() only
-         * reads a status line while peer->status is still NXT_HTTP_UNSET, so
-         * the 1xx is taken as the response and whatever follows is relayed as
-         * its body.  That is pre-existing and out of scope; ending the
-         * exchange on the 1xx header here would discard a final response that
-         * may already be sitting in this very buffer.
+         * nxt_h1p_peer_header_parse() drops a 1xx and reads on, so a 1xx
+         * never reaches here.
          *
          * "b" is not forwarded: bytes an upstream put after the header of a
          * bodyless response are not a body.  It is handed to
@@ -2950,6 +2942,39 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
 
             r->state->ready_handler(task, r, peer);
             return;
+        }
+
+        /*
+         * See nxt_h1p_peer_transfer_encoding().  A Transfer-Encoding the
+         * proxy cannot decode fails the response with 502.  With any
+         * Transfer-Encoding, Content-Length does not frame the body, and both
+         * together is an error (RFC 9112 Sect. 6.3).  The upstream connection
+         * is closed after every response, so a framing error never reaches a
+         * reused connection.
+         *
+         * Both checks come after the bodyless branch above, not before it.  A
+         * response to HEAD, and any 204 or 304, ends at the first empty line
+         * no matter what Content-Length and Transfer-Encoding say -- the same
+         * Sect. 6.3 -- so there is no body for the proxy to decode, and no
+         * framing for these two fields to disagree about.  Such a response has
+         * already been completed above.  Failing it with 502 would lose a
+         * response over a field that frames nothing: the proxy never reads a
+         * body there, whatever coding the upstream named.
+         */
+        if (h1p->transfer_encoding == NXT_HTTP_TE_UNSUPPORTED) {
+            nxt_log(task, NXT_LOG_WARN,
+                    "upstream sent unsupported Transfer-Encoding");
+
+            peer->status = NXT_HTTP_BAD_GATEWAY;
+            break;
+        }
+
+        if (h1p->chunked && r->resp.content_length != NULL) {
+            nxt_log(task, NXT_LOG_WARN, "upstream sent both "
+                    "Transfer-Encoding and Content-Length");
+
+            peer->status = NXT_HTTP_BAD_GATEWAY;
+            break;
         }
 
         if (h1p->chunked) {
@@ -2987,7 +3012,7 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
             return;
         }
 
-        /* Fall through. */
+        nxt_fallthrough;
 
     default:
     case NXT_ERROR:
@@ -3004,12 +3029,28 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
 }
 
 
+/*
+ * A 1xx other than 101 is an interim response (RFC 9110, 15.2).
+ * Limit how many one upstream response may have.  Apache also uses 10.
+ */
+#define NXT_HTTP_MAX_INTERIM_RESPONSES  10
+
+#define nxt_h1p_peer_status_interim(status)                                   \
+    ((status) >= NXT_HTTP_CONTINUE && (status) < NXT_HTTP_OK                  \
+     && (status) != NXT_HTTP_SWITCHING_PROTOCOLS)
+
+
 static nxt_int_t
 nxt_h1p_peer_header_parse(nxt_http_peer_t *peer, nxt_buf_mem_t *bm)
 {
-    u_char     *p;
-    size_t     length;
-    nxt_int_t  status;
+    u_char                    *p;
+    size_t                    length;
+    nxt_int_t                 ret, status;
+    nxt_http_request_parse_t  *rp;
+
+    rp = &peer->proto.h1->parser;
+
+again:
 
     if (peer->status < 0) {
         length = nxt_buf_mem_used_size(bm);
@@ -3043,9 +3084,44 @@ nxt_h1p_peer_header_parse(nxt_http_peer_t *peer, nxt_buf_mem_t *bm)
 
         bm->pos = p + 1;
         peer->status = status;
+
+        /* Do not store the fields of a 1xx. */
+        rp->discard_fields = nxt_h1p_peer_status_interim(status);
     }
 
-    return nxt_http_parse_fields(&peer->proto.h1->parser, bm);
+    ret = nxt_http_parse_fields(rp, bm);
+
+    if (ret != NXT_DONE || !nxt_h1p_peer_status_interim(peer->status)) {
+        return ret;
+    }
+
+    /*
+     * Drop the 1xx and read the next response.  The client gets only
+     * the final response.  NXT_ERROR becomes 502.
+     */
+    if (nxt_slow_path(++peer->num_interim > NXT_HTTP_MAX_INTERIM_RESPONSES)) {
+        nxt_log(&peer->request->task, NXT_LOG_WARN,
+                "upstream sent more than %d interim responses",
+                NXT_HTTP_MAX_INTERIM_RESPONSES);
+
+        return NXT_ERROR;
+    }
+
+    /* The handler can point to the end of the empty line. */
+    rp->handler = NULL;
+    peer->status = NXT_HTTP_UNSET;
+
+    /*
+     * Free the 1xx bytes, so the final header can use the whole buffer.
+     * This is safe only after NXT_DONE: no pointer into the buffer is left.
+     */
+    length = bm->free - bm->pos;
+    nxt_memmove(bm->start, bm->pos, length);
+
+    bm->pos = bm->start;
+    bm->free = bm->start + length;
+
+    goto again;
 }
 
 
@@ -3381,12 +3457,14 @@ nxt_h1p_peer_close(nxt_task_t *task, nxt_http_peer_t *peer)
      * nxt_h1p_peer_read_done()/nxt_h1p_peer_send_timeout()/etc. and dereference
      * the freed peer -- a use-after-free that crashes the router.  Both paths
      * are at risk: the read side (response relay) and the write side (the
-     * request body upload uses an autoreset send timer).  Setting block_read /
-     * block_write makes a queued nxt_conn_io_read()/nxt_conn_io_write() bail out
-     * early; nxt_conn_close() still emits the FIN via its work-queue handler.
+     * request body upload uses an autoreset send timer).  block_read stops
+     * a queued nxt_conn_io_read(), and the closing flag makes a queued
+     * nxt_conn_io_write() return.  nxt_conn_close() sets both; the fd == -1
+     * branch skips it and sets them here.  block_write would not do: it sends
+     * a queued write to the write state's error_handler, which uses the peer.
+     * nxt_conn_close() still emits the FIN via its work-queue handler.
      */
     c->block_read = 1;
-    c->block_write = 1;
     nxt_timer_disable(task->thread->engine, &c->read_timer);
     nxt_timer_disable(task->thread->engine, &c->write_timer);
 
@@ -3396,6 +3474,8 @@ nxt_h1p_peer_close(nxt_task_t *task, nxt_http_peer_t *peer)
         nxt_conn_close(task->thread->engine, c);
 
     } else {
+        c->closing = 1;
+
         nxt_h1p_peer_free(task, c, NULL);
     }
 }
@@ -3421,20 +3501,89 @@ nxt_h1p_peer_free(nxt_task_t *task, void *obj, void *data)
 }
 
 
+/*
+ * Transfer-Encoding is a comma-separated list of transfer codings
+ * (RFC 9112 Sect. 6.1).  Coding names are case-insensitive.  "chunked" must
+ * be the last coding, and it must appear only once.  Several
+ * Transfer-Encoding lines form one list, in order.  So each line starts from
+ * the state that the previous lines left in h1p->transfer_encoding.
+ *
+ * The proxy decodes only chunked, and it never forwards Transfer-Encoding to
+ * the client.  So the result is NXT_HTTP_TE_CHUNKED only when the whole list
+ * is one "chunked", in any letter case.  Every other list is
+ * NXT_HTTP_TE_UNSUPPORTED: an unknown coding, "gzip, chunked",
+ * "chunked, gzip", chunked twice, an empty value, or a coding with
+ * parameters.  nxt_h1p_peer_header_read_done() then fails the response with
+ * 502.  RFC 9112 Sect. 6.3 would read such a body until the connection
+ * closes.  But the proxy cannot decode that body, and the client would get it
+ * in a coding that no header names.
+ */
+
 static nxt_int_t
 nxt_h1p_peer_transfer_encoding(void *ctx, nxt_http_field_t *field,
     uintptr_t data)
 {
+    u_char              *p, *end, *start, *last;
+    nxt_bool_t          empty;
+    nxt_h1proto_t       *h1p;
+    nxt_http_te_t       te;
     nxt_http_request_t  *r;
 
     r = ctx;
     field->skip = 1;
 
-    if (field->value_length == 7
-        && memcmp(field->value, "chunked", 7) == 0)
-    {
-        r->peer->proto.h1->chunked = 1;
+    h1p = r->peer->proto.h1;
+    te = h1p->transfer_encoding;
+
+    p = field->value;
+    end = p + field->value_length;
+    empty = 1;
+
+    while (p < end) {
+        start = p;
+
+        while (p < end && *p != ',') {
+            p++;
+        }
+
+        last = p;
+
+        if (p < end) {
+            p++;  /* Skip the comma. */
+        }
+
+        while (start < last && (*start == ' ' || *start == '\t')) {
+            start++;
+        }
+
+        while (last > start && (last[-1] == ' ' || last[-1] == '\t')) {
+            last--;
+        }
+
+        /* RFC 9110 Sect. 5.6.1: empty list elements are ignored. */
+        if (start == last) {
+            continue;
+        }
+
+        empty = 0;
+
+        if (te == NXT_HTTP_TE_NONE
+            && last - start == nxt_length("chunked")
+            && nxt_memcasecmp(start, "chunked", nxt_length("chunked")) == 0)
+        {
+            te = NXT_HTTP_TE_CHUNKED;
+
+        } else {
+            te = NXT_HTTP_TE_UNSUPPORTED;
+        }
     }
+
+    /* A field line must carry at least one transfer coding. */
+    if (empty) {
+        te = NXT_HTTP_TE_UNSUPPORTED;
+    }
+
+    h1p->transfer_encoding = te;
 
     return NXT_OK;
 }

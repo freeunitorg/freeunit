@@ -141,6 +141,15 @@ struct nxt_process_s {
 
 
     nxt_pid_t                isolated_pid;
+
+    /*
+     * The pid of this process inside the pid namespace of the prototype
+     * that forked it.  Only main sets it, from the WHOAMI header; 0 means
+     * "no name".  ->pid stays the global key.  See REMOVE_CHILD_PID in
+     * src/nxt_main_process.c.
+     */
+    nxt_pid_t                parent_ns_pid;
+
     const char               *name;
     nxt_port_t               *parent_port;
 
@@ -224,6 +233,20 @@ NXT_EXPORT void nxt_process_arguments(nxt_task_t *task, char **orig_argv,
 
 #define nxt_process_port_first(process)                                       \
     nxt_queue_link_data(nxt_queue_first(&process->ports), nxt_port_t, link)
+
+/*
+ * Take a process off its parent's "children" queue.  link.next == NULL means
+ * "not linked", which the release build of nxt_queue_remove() does not set,
+ * so it is set here.  Safe to call twice.
+ */
+nxt_inline void
+nxt_process_unlink(nxt_process_t *process)
+{
+    if (process->link.next != NULL) {
+        nxt_queue_remove(&process->link);
+        process->link.next = NULL;
+    }
+}
 
 NXT_EXPORT void nxt_process_port_add(nxt_task_t *task, nxt_process_t *process,
     nxt_port_t *port);

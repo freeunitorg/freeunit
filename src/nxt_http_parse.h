@@ -72,6 +72,8 @@ struct nxt_http_request_parse_s {
 
     uint8_t                   skip_field;             /* 1 bit */
     uint8_t                   discard_unsafe_fields;  /* 1 bit */
+    /* check the fields, but do not store them */
+    uint8_t                   discard_fields;         /* 1 bit */
 
     /* target with "/." */
     uint8_t                   complex_target;         /* 1 bit */

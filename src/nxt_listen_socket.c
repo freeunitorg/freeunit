@@ -128,19 +128,19 @@ nxt_listen_socket_create(nxt_task_t *task, nxt_mp_t *mp,
 
     if (family == AF_UNIX) {
         mode_t         mode;
-        const char     *user;
-        const char     *group;
+        nxt_uid_t      uid;
+        nxt_gid_t      gid;
         nxt_runtime_t  *rt = thr->runtime;
 
         if (ls->sockaddr == rt->status_listen) {
             mode = rt->status_mode;
-            user = rt->status_user;
-            group = rt->status_group;
+            uid = rt->status_uid;
+            gid = rt->status_gid;
 
         } else {
             mode = rt->control_mode;
-            user = rt->control_user;
-            group = rt->control_group;
+            uid = rt->control_uid;
+            gid = rt->control_gid;
         }
 
         name = (nxt_file_name_t *) sa->u.sockaddr_un.sun_path;
@@ -150,7 +150,8 @@ nxt_listen_socket_create(nxt_task_t *task, nxt_mp_t *mp,
             goto listen_fail;
         }
 
-        if (nxt_file_chown(name, user, group) != NXT_OK) {
+        /* The ids were resolved once, in nxt_controller_socket(). */
+        if (nxt_file_chown(name, uid, gid) != NXT_OK) {
             goto listen_fail;
         }
     }

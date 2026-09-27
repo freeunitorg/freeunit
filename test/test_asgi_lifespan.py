@@ -34,10 +34,13 @@ def setup_cookies(prefix):
 
     for name in ['startup', 'shutdown', 'version']:
         path = Path(f'{option.test_dir}/python/lifespan/empty/{prefix}{name}')
-        path.touch(0o777)
+        path.touch()
+        # touch() applies the umask; the application runs as "nobody" and
+        # must be able to write "version".
+        path.chmod(0o777)
 
 
-def test_asgi_lifespan():
+def test_asgi_lifespan(requires_restart):
     client.load('lifespan/empty')
 
     setup_cookies('')
@@ -49,7 +52,7 @@ def test_asgi_lifespan():
     assert_cookies('')
 
 
-def test_asgi_lifespan_targets():
+def test_asgi_lifespan_targets(requires_restart):
     path = f'{option.test_dir}/python/lifespan/empty'
 
     assert 'success' in client.conf(

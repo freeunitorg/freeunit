@@ -40,7 +40,6 @@ typedef struct {
     int                      state;
     nxt_queue_t              pending_frames;
     uint64_t                 pending_payload_len;
-    uint64_t                 pending_frame_len;
     int                      pending_fins;
 } nxt_py_asgi_websocket_t;
 
@@ -94,8 +93,17 @@ static PyTypeObject nxt_py_asgi_websocket_type = {
     .tp_methods   = nxt_py_asgi_websocket_methods,
 };
 
-static uint64_t  nxt_py_asgi_ws_max_frame_size = 1024 * 1024;
-static uint64_t  nxt_py_asgi_ws_max_buffer_size = 10 * 1024 * 1024;
+/*
+ * Bounds the payload bytes a connection holds that the application has not
+ * yet received: the fragments of a message in progress, and complete messages
+ * waiting for receive().  The per-frame limit is the operator's
+ * settings/http/websocket/max_frame_size, applied by the router before the
+ * frame reaches this worker (the max_frame_size check in
+ * nxt_h1p_conn_ws_frame_header_read()); the router does no accounting across
+ * frames, which is what is bounded here.  A suspended frame pins router shared
+ * memory, in 16 KiB chunks per frame, not worker heap.
+ */
+#define NXT_PY_ASGI_WS_MAX_BUFFER  (10 * 1024 * 1024)
 
 
 int
@@ -125,7 +133,6 @@ nxt_py_asgi_websocket_create(nxt_unit_request_info_t *req)
         ws->state = NXT_WS_INIT;
         nxt_queue_init(&ws->pending_frames);
         ws->pending_payload_len = 0;
-        ws->pending_frame_len = 0;
         ws->pending_fins = 0;
     }
 
@@ -490,7 +497,7 @@ nxt_py_asgi_websocket_handler(nxt_unit_websocket_frame_t *frame)
 {
     uint8_t                  opcode;
     uint16_t                 status_code;
-    uint64_t                 rest;
+    uint64_t                 limit;
     PyObject                 *msg, *exc;
     nxt_py_asgi_websocket_t  *ws;
 
@@ -519,17 +526,23 @@ nxt_py_asgi_websocket_handler(nxt_unit_websocket_frame_t *frame)
         goto bad_state;
     }
 
-    rest = nxt_py_asgi_ws_max_frame_size - ws->pending_frame_len;
+    /*
+     * The floor admits one whole router-approved frame into an empty queue, so
+     * this module never refuses a frame the configured max_frame_size allowed.
+     * It is also why the subtraction cannot wrap: limit >= payload_len by
+     * construction.  CLOSE is exempt: the router caps a control frame at 125
+     * bytes (nxt_h1p_conn_ws_frame_header_read()), and refusing a CLOSE would
+     * eat the ASGI disconnect message.
+     */
+    limit = NXT_PY_ASGI_WS_MAX_BUFFER;
 
-    if (nxt_slow_path(frame->payload_len > rest)) {
-        nxt_unit_websocket_done(frame);
-
-        goto too_big;
+    if (frame->payload_len > limit) {
+        limit = frame->payload_len;
     }
 
-    rest = nxt_py_asgi_ws_max_buffer_size - ws->pending_payload_len;
-
-    if (nxt_slow_path(frame->payload_len > rest)) {
+    if (nxt_slow_path(opcode != NXT_WEBSOCKET_OP_CLOSE
+                      && ws->pending_payload_len > limit - frame->payload_len))
+    {
         nxt_unit_websocket_done(frame);
 
         goto too_big;
@@ -708,9 +721,9 @@ nxt_py_asgi_websocket_suspend_frame(nxt_unit_websocket_frame_t *frame)
 
     /*
      * Guard against uint64 wraparound across many fragmented frames;
-     * otherwise the eventual max_buffer_size check is bypassed.  Run
-     * the check BEFORE inserting p into the pending_frames queue so a
-     * failure exit doesn't leak the suspended-frame slot.
+     * otherwise the NXT_PY_ASGI_WS_MAX_BUFFER check in the handler is
+     * bypassed.  Run the check BEFORE inserting p into the pending_frames
+     * queue so a failure exit doesn't leak the suspended-frame slot.
      */
     if (nxt_slow_path(frame->payload_len
                       > UINT64_MAX - ws->pending_payload_len))
@@ -731,18 +744,6 @@ nxt_py_asgi_websocket_suspend_frame(nxt_unit_websocket_frame_t *frame)
 
     ws->pending_payload_len += frame->payload_len;
     ws->pending_fins += frame->header->fin;
-
-    if (frame->header->fin) {
-        ws->pending_frame_len = 0;
-
-    } else {
-        if (frame->header->opcode == NXT_WEBSOCKET_OP_CONT) {
-            ws->pending_frame_len += frame->payload_len;
-
-        } else {
-            ws->pending_frame_len = frame->payload_len;
-        }
-    }
 }
 
 

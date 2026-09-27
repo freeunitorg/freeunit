@@ -48,6 +48,32 @@
  */
 #define NXT_PORT_MMAP_MAX_SEGMENTS  (UINT32_MAX / PORT_MMAP_DATA_SIZE + 1)
 
+/*
+ * The most shared memory segments one process keeps for one peer, in each
+ * direction.  A segment id is an index into that array, and the array is
+ * grown to hold the id.  On both sides, the router and libunit, an incoming
+ * id is taken from the peer: from an mmap record in a port message, or from
+ * a segment header in memory the peer can still write.  Without a limit an
+ * id like 100000000 makes the receiver allocate and initialise an array of
+ * that many slots from one message.
+ *
+ * NXT_PORT_MMAP_MAX_SEGMENTS above bounds only the libunit-authored ids the
+ * router receives.  The router's own outgoing segments are not bounded by
+ * shm_limit, so libunit needs a limit of its own, and this one is used by
+ * both sides, in nxt_port_mmap_at() and nxt_unit_mmap_at().  Each segment
+ * holds PORT_MMAP_SIZE bytes, about 10 MiB, so 65536 segments are about
+ * 640 GiB of shared memory between one pair of processes: no real peer
+ * reaches it.  The arrays a bad id can grow are bounded too: at the limit
+ * the router's array of nxt_port_mmap_t (one pointer) is 512 KiB, and
+ * libunit's array of nxt_unit_mmap_t (a pointer, a pthread_t and a queue,
+ * 32 bytes on 64-bit) is 2 MiB.  The router refuses to create a segment
+ * past the limit, and both sides refuse an incoming id past it.
+ *
+ * In an NXT_MMAP_TINY_CHUNK build a segment is 2 KiB, so the limit is only
+ * 128 MiB of shared memory per pair; that build is for debugging.
+ */
+#define NXT_PORT_MMAPS_MAX  65536U
+
 
 typedef uint32_t  nxt_chunk_id_t;
 
