@@ -758,6 +758,8 @@ void nxt_port_rearm(nxt_task_t *task, nxt_port_t *port);
 void *nxt_port_queue_mmap(nxt_task_t *task, nxt_fd_t fd, size_t size);
 
 void nxt_port_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
+nxt_int_t nxt_port_new_port_msg(nxt_port_recv_msg_t *msg,
+    nxt_port_msg_new_port_t *out);
 void nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 void nxt_port_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 void nxt_port_change_log_file_handler(nxt_task_t *task,

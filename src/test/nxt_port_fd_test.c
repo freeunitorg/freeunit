@@ -474,6 +474,27 @@ nxt_port_fd_test(nxt_thread_t *thr)
     b->mem.pos = (u_char *) &new_port_msg;
     msg.buf = b;
 
+    /*
+     * A NEW_PORT body one byte short.  The handler refuses it, closes both
+     * descriptors and creates no port.
+     */
+    b->mem.free = b->mem.pos + sizeof(nxt_port_msg_new_port_t) - 1;
+
+    ret = nxt_port_fd_test_closed(thr, task, &msg, nxt_port_new_port_handler,
+                                  1, "short new port");
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto done;
+    }
+
+    if (nxt_slow_path(msg.u.new_port != NULL)) {
+        nxt_log_alert(thr->log, "port fd test: a short new port message "
+                      "created a port");
+        ret = NXT_ERROR;
+        goto done;
+    }
+
+    b->mem.free = b->mem.pos + sizeof(nxt_port_msg_new_port_t);
+
     existing = nxt_runtime_process_port_create(task, rt, new_port_msg.pid,
                                                new_port_msg.id,
                                                new_port_msg.type);

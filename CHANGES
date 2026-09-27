@@ -52,10 +52,24 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        main. REMOVE_PID must come from main or from a prototype. DATA,
        APP_RESTART and STATUS must come from the controller. The router
        closes the descriptors of a refused message and does not reply.
-       This makes the attack harder, but does not stop it yet: the router
-       reads the pid of main and of the controller from ports that NEW_PORT
-       registers, and an application can still send a false NEW_PORT
-       first. A later change checks NEW_PORT.
+
+    *) Security: an application process could send a false NEW_PORT to
+       the router, register its own pid as main or as the controller, and
+       then pass the checks above. It could also get the port of main or
+       of the controller with GET_PORT, attach a shared memory segment to
+       another process with MMAP, make a debug router abort with GET_MMAP,
+       and answer a pending request of the router with RPC_READY or
+       RPC_ERROR, for example with a false certificate. The router now
+       accepts NEW_PORT from main, from a prototype for an application
+       port, and from an application for its own application port only.
+       GET_PORT, GET_MMAP, MMAP and OOSM must come from the application
+       that the message names, and GET_PORT gives out only ports of the
+       router. RPC_READY and RPC_ERROR must come from main, the controller
+       or a prototype. Every process now refuses a NEW_PORT message that is
+       too short. Limits: the router does not check that an RPC reply comes
+       from the process that got the request. The ports of the router
+       threads get messages through a shared memory queue, which gives no
+       sender pid, so the router does not check senders there.
 
     *) Bugfix: when unitd ran as root and the control socket was given to
        another user or group with --control-user or --control-group, that

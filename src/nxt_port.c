@@ -10,6 +10,7 @@
 #include <nxt_router.h>
 #include <nxt_app_queue.h>
 #include <nxt_port_queue.h>
+#include <nxt_span.h>
 
 
 static void nxt_port_remove_pid(nxt_task_t *task, nxt_port_recv_msg_t *msg,
@@ -557,12 +558,37 @@ nxt_port_send_port(nxt_task_t *task, nxt_port_t *port, nxt_port_t *new_port,
 }
 
 
+/*
+ * Copies the body of a NEW_PORT message.  The sender sets the size.  A body
+ * shorter than nxt_port_msg_new_port_t is an error: the missing bytes would
+ * come from an earlier message in the same buffer.
+ */
+
+nxt_int_t
+nxt_port_new_port_msg(nxt_port_recv_msg_t *msg, nxt_port_msg_new_port_t *out)
+{
+    nxt_span_t  span;
+
+    if (nxt_slow_path(msg->buf == NULL)) {
+        return NXT_ERROR;
+    }
+
+    nxt_span_init(&span, msg->buf->mem.pos, msg->buf->mem.free);
+
+    if (nxt_slow_path(nxt_span_copy(&span, out, sizeof(*out)) != 0)) {
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+
 void
 nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
     nxt_port_t               *port;
     nxt_runtime_t            *rt;
-    nxt_port_msg_new_port_t  *new_port_msg;
+    nxt_port_msg_new_port_t  new_port_msg;
 
     rt = task->thread->runtime;
 
@@ -575,17 +601,21 @@ nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     msg->u.new_port = NULL;
     msg->new_port_created = 0;
 
-    new_port_msg = (nxt_port_msg_new_port_t *) msg->buf->mem.pos;
+    if (nxt_slow_path(nxt_port_new_port_msg(msg, &new_port_msg) != NXT_OK)) {
+        nxt_alert(task, "process %PI sent a short new port message; refused",
+                  msg->port_msg.pid);
 
-    /* TODO check b size and make plain */
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
 
     nxt_debug(task, "new port %d received for process %PI:%d",
-              msg->fd[0], new_port_msg->pid, new_port_msg->id);
+              msg->fd[0], new_port_msg.pid, new_port_msg.id);
 
-    port = nxt_runtime_port_find(rt, new_port_msg->pid, new_port_msg->id);
+    port = nxt_runtime_port_find(rt, new_port_msg.pid, new_port_msg.id);
     if (port != NULL) {
-        nxt_debug(task, "port %PI:%d already exists", new_port_msg->pid,
-              new_port_msg->id);
+        nxt_debug(task, "port %PI:%d already exists", new_port_msg.pid,
+              new_port_msg.id);
 
         msg->u.new_port = port;
 
@@ -622,9 +652,9 @@ nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         return;
     }
 
-    port = nxt_runtime_process_port_create(task, rt, new_port_msg->pid,
-                                           new_port_msg->id,
-                                           new_port_msg->type);
+    port = nxt_runtime_process_port_create(task, rt, new_port_msg.pid,
+                                           new_port_msg.id,
+                                           new_port_msg.type);
     if (nxt_slow_path(port == NULL)) {
         nxt_port_recv_msg_close_fds(msg);
         return;
@@ -638,8 +668,8 @@ nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     /* The port owns the descriptor now. */
     msg->fd[0] = -1;
 
-    port->max_size = new_port_msg->max_size;
-    port->max_share = new_port_msg->max_share;
+    port->max_size = new_port_msg.max_size;
+    port->max_share = new_port_msg.max_share;
 
     port->socket.task = task;
 
