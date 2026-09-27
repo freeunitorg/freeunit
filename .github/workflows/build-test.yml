@@ -11,6 +11,7 @@ on:
       - 'pkg/contrib/**'
       - 'pkg/eol.json'
       - '.github/workflows/build-test.yml'
+      - '.github/scripts/check-test-hooks.sh'
   push:
     branches: master
     paths:
@@ -22,6 +23,7 @@ on:
       - 'pkg/contrib/**'
       - 'pkg/eol.json'
       - '.github/workflows/build-test.yml'
+      - '.github/scripts/check-test-hooks.sh'
 
 env:
   # OpenSSL patch version built from source (see "Build OpenSSL" step). Only the
@@ -56,13 +58,28 @@ jobs:
       - uses: actions/checkout@v5
       - name: Derive build list from pkg/eol.json
         id: list
+        # Slow legs come first in the list.  All 23 legs are created at
+        # once.  The hosted runner pool is smaller than the matrix, so some
+        # legs wait for a runner.  GitHub does not promise to start legs in
+        # matrix order.  Two runs (36318226905 and 36322425869) showed no
+        # such order: python-3.12 was last in the old matrix and started
+        # last; it was first in this matrix and started 12th of 23.  The
+        # order is a hypothesis and has no cost.  The set of legs does not
+        # change.  Times from run 36318226905: python-3.12 372 s (pytest
+        # 332 s; 243 s and 170 s on 3.13 and 3.14), wasm-wasi-component
+        # 322 s, java 250 to 273 s, php-8.4 255 s.  Short legs: perl 109 s,
+        # wasm 88 s, node about 150 s, ruby about 125 s.
         run: |
           builds=$(jq -c '
-            ["unit", "perl", "wasm", "wasm-wasi-component"]
-            + [ .runtimes | to_entries[]
-                | select(.key | IN("go", "java", "node", "php", "ruby"))
-                | .key as $rt | .value[] | $rt + "-" + .version ]
-            + [ .runtimes.python[] | "python-" + .version ]
+            def legs($rt): [ (.runtimes[$rt] // [])[] | $rt + "-" + .version ];
+            legs("python")
+            + ["wasm-wasi-component"]
+            + legs("java")
+            + legs("php")
+            + ["unit", "perl", "wasm"]
+            + legs("go")
+            + legs("node")
+            + legs("ruby")
           ' pkg/eol.json)
           echo "builds=${builds}" >> "$GITHUB_OUTPUT"
 
@@ -151,6 +168,30 @@ jobs:
           make -j4 -k
         working-directory: njs
 
+      # --otel makes "Make unit" run "cargo rustc" on src/otel.  ccache
+      # covers only C.  In run 36318226905 that cargo build took 44.5 s of
+      # the 55 s of "Make unit", on every run.  This step caches the crates
+      # and the target directory.  The target directory is cargo's default,
+      # src/otel/target: auto/make gives no --target-dir.  The key has the
+      # rustc version: the runner image updates rust, and a different rustc
+      # rebuilds the target anyway.  The otel crate itself is rebuilt on
+      # every run, because checkout gives its sources a new mtime.  Local
+      # test with a warm target: 52 s -> 2 s.
+      - name: Read rustc version
+        id: rustc
+        run: echo "version=$(rustc -V | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the otel Rust build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/otel/target
+          key: otel-cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('src/otel/Cargo.lock') }}
+          restore-keys: |
+            otel-cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-
+
       - name: Configure unit
         # LD_LIBRARY_PATH is set only for this step so that auto/feature
         # test binaries load OpenSSL 3.6 at runtime.  It is NOT exported
@@ -171,7 +212,13 @@ jobs:
             --cc-opt="-I${OPENSSL36_INCDIR} -I njs/src/ -I njs/build" \
             --ld-opt="-L${OPENSSL36_LIBDIR} -Wl,-rpath,${OPENSSL36_LIBDIR} -L njs/build"
 
+      # CARGO_INCREMENTAL=0, as for wasm-wasi-component: incremental data
+      # only makes the cached src/otel/target bigger.  This build uses
+      # --release, which already sets it off.  This keeps it off if the
+      # profile changes.
       - name: Make unit
+        env:
+          CARGO_INCREMENTAL: 0
         run: |
           make -j$(nproc) -k || make
 
@@ -243,13 +290,13 @@ jobs:
             testpath="test"
           fi
 
-          # A Python leg runs its interpreter-specific suites whole -- that is
-          # what the three versions are here for -- and takes a round-robin
-          # share of the rest.  Three versions each running the whole
-          # language-agnostic suite again cost about 12 minutes a leg, twice
-          # any other language, for tests no interpreter distinguishes.  Each
-          # shared file now runs on one Python version instead of three; the
-          # union over the legs is unchanged.
+          # A Python leg runs its interpreter-specific suites whole.  That is
+          # what the three versions are for.  It also takes a share of the
+          # other files, balanced by measured time (see below).  Three runs
+          # of the whole language-agnostic suite cost about 12 minutes per
+          # leg, twice any other language, for tests that no interpreter
+          # distinguishes.  Each shared file now runs on one Python version
+          # instead of three.  The union over the legs does not change.
           #
           # Both lists are built from the files that exist, never from a glob
           # handed to pytest.  There is no test_wsgi_*.py -- WSGI is exercised
@@ -282,35 +329,94 @@ jobs:
                 ;;
             esac
 
-            files=""
+            # Shared files go to the shards by measured time, not by count.
+            # Round-robin by count gave pytest 332 s / 243 s / 170 s on
+            # python-3.12 / 3.13 / 3.14 (run 36318226905, PR #448), and the
+            # 3.12 leg ended the run.  The list below has every shared file
+            # that took 10 s or more in that run, with its time in seconds.
+            # Each listed file goes to the shard with the least load (the
+            # first such shard on a tie).  All other shared files are
+            # round-robin, as before.  test_app_lifecycle.py took 73 s
+            # there; 13 s is its time after the keep-alive reads stopped
+            # waiting for read_timeout.  It skips runtimes that are not
+            # built, so one Python leg is enough for it.  The other language
+            # legs still run it.  A file that is not in this list only costs
+            # balance, not coverage.
+            heavy="
+              test/test_app_start_timeout.py:72
+              test/test_settings.py:64
+              test/test_otel.py:34
+              test/test_proxy.py:27
+              test/test_tls.py:22
+              test/test_procman.py:21
+              test/test_app_lifecycle.py:13
+              test/test_idle_close_wait.py:12
+              test/test_status.py:11
+              test/test_access_log.py:11
+            "
+
+            shared=""
             whole=""
-            i=0
             for f in $(ls test/test_*.py | sort); do
               case "$f" in
                 test/test_python*|test/test_asgi*|test/test_wsgi*)
                   whole="${whole} ${f}"
-                  continue
                   ;;
-                test/test_app_lifecycle.py)
-                  continue
+                *)
+                  shared="${shared} ${f}"
+                  ;;
+              esac
+            done
+
+            declare -A owner
+            load=()
+            for ((s = 0; s < versions; s++)); do
+              load[s]=0
+            done
+
+            # A heavy entry that names no shared test file is a stale table:
+            # the file was renamed or removed, and its time would silently
+            # stop counting.  Fail instead.
+            for entry in ${heavy}; do
+              f="${entry%:*}"
+              case " ${shared} " in
+                *" ${f} "*) ;;
+                *)
+                  echo "::error::python shards: ${f} in the heavy table" \
+                       "is not a shared test file" >&2
+                  exit 1
                   ;;
               esac
 
-              if [ $((i % versions)) -eq "$shard" ]; then
+              min=0
+              for ((s = 1; s < versions; s++)); do
+                if [ "${load[s]}" -lt "${load[min]}" ]; then
+                  min=$s
+                fi
+              done
+
+              owner[$f]=$min
+              load[min]=$((load[min] + ${entry##*:}))
+            done
+
+            i=0
+            for f in ${shared}; do
+              if [ -z "${owner[$f]+set}" ]; then
+                owner[$f]=$((i % versions))
+                i=$((i + 1))
+              fi
+            done
+
+            # Each shared file has one owner by construction: the heavy loop
+            # above, then round-robin.  Collect this shard's files.
+            files=""
+            for f in ${shared}; do
+              if [ "${owner[$f]}" -eq "$shard" ]; then
                 files="${files} ${f}"
               fi
-
-              i=$((i + 1))
             done
 
             testpath="${files}${whole}"
-
-            # app_lifecycle self-skips unbuilt runtimes, so one Python leg is
-            # enough to carry it; the other language legs still run it as
-            # before.
-            if [ "$shard" -eq 0 ]; then
-              testpath="${testpath} test/test_app_lifecycle.py"
-            fi
           fi
 
           echo "module=${module}" >> "$GITHUB_OUTPUT"
@@ -697,6 +803,29 @@ jobs:
           tool: cargo-component
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
 
+      # In run 36318226905 "Make wasm-wasi-component" took 189 s: 188
+      # crates built from nothing on every run.  This step caches the
+      # crates and the target directory, like the otel build in the core
+      # job.  "Setup rust" above installs the latest stable, so the key has
+      # the rustc version.  This crate is rebuilt on every run, because
+      # checkout gives its sources a new mtime.
+      - name: Read rustc version
+        id: rustc
+        run: echo "version=$(rustc -V | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
+        if: steps.metadata.outputs.module == 'wasm-wasi-component'
+
+      - name: Cache the wasm-wasi-component Rust build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/wasm-wasi-component/target
+          key: wasm-wasi-component-cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('src/wasm-wasi-component/Cargo.lock') }}
+          restore-keys: |
+            wasm-wasi-component-cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-
+        if: steps.metadata.outputs.module == 'wasm-wasi-component'
+
       - name: Configure wasm-wasi-component
         run: |
           ./configure wasm-wasi-component
@@ -704,7 +833,12 @@ jobs:
 
       # bindgen picks clang up from PATH.  The libclang-drift check against
       # new distribution compilers lives in build-distros.yml.
+      # CARGO_INCREMENTAL=0: incremental data only makes the cached target
+      # bigger.  The release profile already sets it off.  This keeps it
+      # off if the profile changes.
       - name: Make wasm-wasi-component
+        env:
+          CARGO_INCREMENTAL: 0
         run: |
           BINDGEN_EXTRA_CLANG_ARGS="-I../../njs/src -I../../njs/build" \
           make wasm-wasi-component
@@ -826,13 +960,15 @@ jobs:
         if: ${{ !cancelled() && steps.metadata.outputs.module == 'python' }}
 
       # test_asgi_lifespan.py stops unitd from inside the test to check the
-      # shutdown event.  That needs --restart, which the run above does not
-      # pass, so both lifespan tests skip there.  Run the file again with it.
-      - name: Run ASGI lifespan tests with --restart
+      # shutdown event, and test_tls_certificate_update_restart restarts it
+      # to check that a replaced bundle survives.  Both need --restart, which
+      # the run above does not pass, so they skip there.  Run them again.
+      - name: Run the tests that restart unitd, with --restart
         run: |
           export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
           sudo -E /usr/bin/pytest-3 --print-log --restart \
-            test/test_asgi_lifespan.py
+            test/test_asgi_lifespan.py \
+            test/test_tls.py::test_tls_certificate_update_restart
         if: ${{ !cancelled() && steps.metadata.outputs.module == 'python' }}
 
   # C unit-test suite (src/test/ -> build/tests): HTTP parser, port/IPC
@@ -855,8 +991,23 @@ jobs:
       - name: Configure unit (--tests)
         run: ./configure --openssl --tests
 
+      - name: Build unitd and libunit
+        run: |
+          make -j4
+          make -j4 build/lib/libunit.a
+
       - name: Build C tests
         run: make -j4 tests
+
+      # The hooks (fault-injection branches and counters inside
+      # "#if (NXT_TESTS)") must reach the test programs and nothing else.
+      # The script derives the hook symbols from the build itself, so a new
+      # hook needs no change here.  It fails when a hook symbol is in unitd,
+      # libnxt.a, libunit.a or nxt_unit.o, when a test program linked a plain
+      # object, or when a source outside the twice-compiled set mentions
+      # NXT_TESTS.
+      - name: Check the test hooks are in the test programs only
+        run: .github/scripts/check-test-hooks.sh
 
       - name: Run C tests
         run: sudo ./build/tests
@@ -977,6 +1128,69 @@ jobs:
         run: |
           grep NXT_HAVE_OPENSSL_VERSION build/include/nxt_auto_config.h
           grep -q '#define NXT_HAVE_OPENSSL_VERSION  "OpenSSL 4\.' \
+            build/include/nxt_auto_config.h
+
+      - name: Build unit
+        run: make -j4
+
+      - name: Build C tests
+        run: make -j4 tests
+
+      - name: Run C tests
+        run: sudo ./build/tests
+
+  # --hardening=strict compile gate, with gcc and with clang.  auto/cc/test
+  # already passes -Werror to both, so a new warning from -Wformat=2, -Wvla or
+  # -Wimplicit-fallthrough (a fall-through without nxt_fallthrough) fails the
+  # job.  The assert step fails when a compiler stops accepting one of the
+  # probed flags: auto/cc/hardening only drops such a flag, so a plain build
+  # would pass while testing nothing.  Cheap on purpose: a build plus the C
+  # test suite, no language modules.
+  hardening-strict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev clang
+
+      - name: Configure unit (--hardening=strict --tests --openssl)
+        run: |
+          ./configure \
+            --cc=${{ matrix.cc }} \
+            --hardening=strict \
+            --tests \
+            --openssl 2>&1 | tee configure.log
+          test "${PIPESTATUS[0]}" -eq 0
+
+      # Every flag that this job exists for must be found.  The FORTIFY probe
+      # falls back from level 3 to 2, so either level passes.  The CET and
+      # branch-protection flags are not asserted: each applies to one target
+      # only.
+      - name: Assert configure found the hardening flags
+        run: |
+          grep -q 'hardening: .* strict$' configure.log
+          for flag in -fstack-protector-strong -fstack-clash-protection \
+                      -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack \
+                      -Wformat=2 -Wvla -Wimplicit-fallthrough \
+                      -ftrivial-auto-var-init=pattern
+          do
+            grep -q "checking for $flag \.\.\. found" configure.log \
+              || { echo "$flag was not found"; exit 1; }
+          done
+          grep -q 'checking for -D_FORTIFY_SOURCE=[23] \.\.\. found' \
+            configure.log \
+            || { echo "_FORTIFY_SOURCE was not found"; exit 1; }
+          grep -q 'define NXT_HAVE_BUILTIN_OVERFLOW' \
             build/include/nxt_auto_config.h
 
       - name: Build unit

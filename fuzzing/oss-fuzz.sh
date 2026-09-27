@@ -12,6 +12,7 @@ pushd fuzzing/
 cp fuzz_http.dict $OUT/fuzz_http_controller.dict
 cp fuzz_http.dict $OUT/fuzz_http_h1p.dict
 cp fuzz_http.dict $OUT/fuzz_http_h1p_peer.dict
+cp fuzz_http.dict $OUT/fuzz_http_h1p_peer_response.dict
 
 # Create temporary directories.
 cp -r fuzz_http_seed_corpus/ fuzz_http_controller_seed_corpus/
@@ -23,6 +24,9 @@ zip -r $OUT/fuzz_http_controller_seed_corpus.zip  fuzz_http_controller_seed_corp
 zip -r $OUT/fuzz_http_h1p_seed_corpus.zip  fuzz_http_h1p_seed_corpus/
 zip -r $OUT/fuzz_http_h1p_peer_seed_corpus.zip  fuzz_http_h1p_peer_seed_corpus/
 zip -r $OUT/fuzz_json_seed_corpus.zip fuzz_json_seed_corpus/
+zip -r $OUT/fuzz_http_chunk_seed_corpus.zip fuzz_http_chunk_seed_corpus/
+zip -r $OUT/fuzz_http_h1p_peer_response_seed_corpus.zip fuzz_http_h1p_peer_response_seed_corpus/
+zip -r $OUT/fuzz_http_ws_utf8_seed_corpus.zip fuzz_http_ws_utf8_seed_corpus/
 
 # Delete temporary directories.
 rm -r fuzz_http_controller_seed_corpus/ fuzz_http_h1p_seed_corpus/ fuzz_http_h1p_peer_seed_corpus/

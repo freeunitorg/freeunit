@@ -412,7 +412,7 @@ nxt_strverscmp(const u_char *s1, const u_char *s2)
         c1 = *s1++;
         c2 = *s2++;
 
-        /* Fall through. */
+        nxt_fallthrough;
 
     case st_num:
 
@@ -441,7 +441,7 @@ nxt_strverscmp(const u_char *s1, const u_char *s2)
             return 1;
         }
 
-        /* Fall through. */
+        nxt_fallthrough;
 
     case st_frac:
     default:

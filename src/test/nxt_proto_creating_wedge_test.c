@@ -42,9 +42,10 @@
  * That REMOVE_PID may only be sent when the pid in it is a usable global key,
  * which is what rt->is_pid_isolated says -- the same test nxt_process_create()
  * uses to decide whether a forked child may enter the runtime hash at all.
- * The pid-isolated case is exercised here too, and it asserts the opposite:
- * nothing at all must reach main, because sending a namespace-local pid would
- * ask main to remove whatever unrelated process holds that number.
+ * The pid-isolated case is exercised here too: the namespace-local pid must
+ * not be broadcast, because it names an unrelated process everywhere else, so
+ * it goes to main alone as REMOVE_CHILD_PID.  The router must still see
+ * nothing but the RPC error.
  *
  * The answer itself can fail to be written -- a full port queue or a failed
  * allocation, neither of which leaves anything for the initiator -- and then
@@ -125,7 +126,7 @@ nxt_proto_wedge_expect(nxt_thread_t *thr, nxt_port_t *port,
                 || nxt_buf_used_size(msg->buf) != sizeof(nxt_pid_t))
             {
                 nxt_log_alert(thr->log, "proto creating wedge test: %s: the %s "
-                              "got a REMOVE_PID carrying no pid", label, whom);
+                              "got a message carrying no pid", label, whom);
                 return NXT_ERROR;
             }
 
@@ -288,7 +289,10 @@ nxt_proto_creating_wedge_test(nxt_thread_t *thr)
     app_port->pair[1] = -1;
     app_port->socket.fd = -1;
 
-    nxt_queue_insert_tail(&process->ports, &app_port->link);
+    /* The fixture's own hold on the record, as main's would be. */
+    process->use_count = 1;
+
+    nxt_process_port_add(task, process, app_port);
 
     /*
      * A child that died before PROCESS_CREATED, with the prototype in main's
@@ -349,11 +353,9 @@ nxt_proto_creating_wedge_test(nxt_thread_t *thr)
 
     /*
      * The same child under pid isolation.  ->pid is then the namespace-local
-     * pid fork() returned, and main keyed its record on the global pid it
-     * read from SCM_CREDENTIALS, so there is no pid to send: the initiator is
-     * still answered, and nothing at all may reach main.  Sending the
-     * namespace-local pid would ask main to remove whatever unrelated process
-     * happens to hold that number, which is worse than the leak this closes.
+     * pid fork() returned, which REMOVE_PID must not broadcast.  Main alone
+     * is told, with REMOVE_CHILD_PID; the router must see the RPC error and
+     * nothing else.
      */
 
     rt->is_pid_isolated = 1;
@@ -374,7 +376,11 @@ nxt_proto_creating_wedge_test(nxt_thread_t *thr)
         goto done;
     }
 
-    ret = nxt_proto_wedge_expect(thr, main_port, expect, 0,
+    expect[0].type = _NXT_PORT_MSG_REMOVE_CHILD_PID;
+    expect[0].stream = 0;
+    expect[0].pid = process->isolated_pid;
+
+    ret = nxt_proto_wedge_expect(thr, main_port, expect, 1,
                                  "a pid-isolated child that died while "
                                  "creating", "main process");
     if (nxt_slow_path(ret != NXT_OK)) {
@@ -437,11 +443,10 @@ nxt_proto_creating_wedge_test(nxt_thread_t *thr)
      * namespace-local one.
      *
      * What must not happen is a repair that looks like one: broadcasting that
-     * pid anyway would ask main and the router to remove whatever unrelated
-     * process holds the number, and a prototype's namespace-local counter
-     * climbs straight into the range the daemon's own pids occupy.  So the
-     * assertion is an absence on both ports, and it is what turns red if a
-     * later change decides to send something here.
+     * pid anyway would ask the router to remove whatever unrelated process
+     * holds the number.  So the router must stay silent here, and main gets
+     * REMOVE_CHILD_PID -- the injected failure is spent on the RPC error, so
+     * the report itself is written.
      *
      * The start RPC is left armed, which the code says out loud.  It is
      * retired when the prototype itself dies -- the router keys that RPC on
@@ -469,7 +474,11 @@ nxt_proto_creating_wedge_test(nxt_thread_t *thr)
         goto done;
     }
 
-    ret = nxt_proto_wedge_expect(thr, main_port, expect, 0,
+    expect[0].type = _NXT_PORT_MSG_REMOVE_CHILD_PID;
+    expect[0].stream = 0;
+    expect[0].pid = process->isolated_pid;
+
+    ret = nxt_proto_wedge_expect(thr, main_port, expect, 1,
                                  "a pid-isolated child whose start error "
                                  "could not be written", "main process");
     if (nxt_slow_path(ret != NXT_OK)) {
@@ -566,20 +575,8 @@ done:
         nxt_runtime_port_remove(task, main_port);
     }
 
+    /* Paired through nxt_process_port_add(), so its release unlinks it. */
     if (app_port != NULL) {
-        nxt_queue_remove(&app_port->link);
-
-        /*
-         * nxt_queue_remove() nulls the link only in a debug build
-         * (src/nxt_queue.h:130-148).  nxt_port_release() reads a non-NULL
-         * link.next as "this port belongs to a process" and dereferences
-         * port->process, which nxt_port_new() never set -- guarded by an
-         * nxt_assert() that compiles out of a release build, so the test
-         * would segfault in teardown there and nowhere else.
-         */
-        app_port->link.next = NULL;
-        app_port->link.prev = NULL;
-
         nxt_port_use(task, app_port, -1);
     }
 

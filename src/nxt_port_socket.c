@@ -55,7 +55,15 @@ static void nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
     nxt_port_recv_msg_t *msg);
 static nxt_buf_t *nxt_port_buf_alloc(nxt_port_t *port);
 static void nxt_port_buf_free(nxt_port_t *port, nxt_buf_t *b);
-static nxt_bool_t nxt_port_announce(nxt_task_t *task, nxt_port_t *port);
+static void nxt_port_frag_unaccount(nxt_port_t *port,
+    nxt_port_recv_msg_t *fmsg);
+static void nxt_port_frag_evict(nxt_task_t *task, nxt_port_t *port,
+    nxt_port_recv_msg_t *msg);
+static void nxt_port_frag_drop(nxt_task_t *task, nxt_port_t *port,
+    nxt_port_recv_msg_t *fmsg, nxt_bool_t in_hash);
+static void nxt_port_frag_bufs_release(nxt_task_t *task, nxt_port_t *port,
+    nxt_buf_t *b);
+static nxt_int_t nxt_port_announce(nxt_task_t *task, nxt_port_t *port);
 static void nxt_port_rearm_now(nxt_task_t *task, nxt_port_t *port);
 static void nxt_port_retry_later(nxt_task_t *task, nxt_port_t *port);
 static void nxt_port_retry_handler(nxt_task_t *task, void *obj, void *data);
@@ -309,6 +317,24 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
     msg.close_fd = (type & NXT_PORT_MSG_CLOSE_FD) != 0;
     msg.allocated = 0;
 
+    /*
+     * Set the flag here, from the type the caller asked for.  The shared
+     * queue branch below can change the socket message into a READ_QUEUE
+     * wake-up, and nxt_port_msg_chk_insert() copies the message.  The flag
+     * is written once, before the message is published under
+     * port->write_mutex.  Only the sender reads it, after that.  So the
+     * flag needs no lock of its own.
+     */
+    msg.peer_may_be_gone = ((type & NXT_PORT_MSG_MASK) == _NXT_PORT_MSG_QUIT);
+
+    /*
+     * Set port->quit_sent before the QUIT can reach the shared queue.
+     * A wake-up that is already pending then covers the QUIT as well.
+     */
+    if (msg.peer_may_be_gone) {
+        (void) nxt_atomic_cmp_set(&port->quit_sent, 0, 1);
+    }
+
     msg.port_msg.stream = stream;
     msg.port_msg.pid = nxt_pid;
     msg.port_msg.reply_port = reply_port;
@@ -320,6 +346,15 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
 
     if (port->queue != NULL && type != _NXT_PORT_MSG_READ_QUEUE) {
 
+        /*
+         * A QUIT goes into the shared queue like any other message.
+         * A worker that is still in nxt_unit_init() holds only one socket
+         * message with no queue marker ("too many port socket messages").
+         * A QUIT on the socket would be a second one.  So the wake-up for
+         * a QUIT is a plain READ_QUEUE.  msg.peer_may_be_gone, set above,
+         * still marks it as a QUIT.  A failed wake-up to a worker that is
+         * gone is then logged at info.
+         */
         if (fd == -1 && nxt_port_can_enqueue_buf(b)) {
             qmsg.pm = msg.port_msg;
 
@@ -334,6 +369,10 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
             nxt_debug(task, "port{%d,%d} %d: enqueue %d notify %d, %d",
                       (int) port->pid, (int) port->id, port->socket.fd,
                       (int) qmsg_size, notify, res);
+
+            if (nxt_slow_path(res == NXT_ERROR)) {
+                goto queue_broken;
+            }
 
             if (b != NULL && nxt_fast_path(res == NXT_OK)) {
                 if (qmsg.pm.mmap) {
@@ -368,6 +407,10 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
             nxt_debug(task, "port{%d,%d} %d: enqueue 1 notify %d, %d",
                       (int) port->pid, (int) port->id, port->socket.fd,
                       notify, res);
+
+            if (nxt_slow_path(res == NXT_ERROR)) {
+                goto queue_broken;
+            }
 
             if (nxt_slow_path(res == NXT_AGAIN)) {
                 return NXT_AGAIN;
@@ -436,6 +479,23 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
     }
 
     return res;
+
+queue_broken:
+
+    /*
+     * The peer broke the shared queue and nxt_nncq.h gave up on it.
+     * Nothing of the message was consumed, so the caller still owns fd,
+     * fd2 and b, as after a send to a dead peer.  Later messages meet the
+     * same bounded retries: the queue cannot be dropped from a port that
+     * other engines send on.
+     */
+
+    nxt_alert(task, "port{%d,%d} %d: shared queue is broken; "
+              "message type %d stream #%uD refused",
+              (int) port->pid, (int) port->id, port->socket.fd,
+              (int) msg.port_msg.type, stream);
+
+    return NXT_ERROR;
 }
 
 
@@ -706,15 +766,20 @@ nxt_port_fd_disable_write(nxt_task_t *task, nxt_port_t *port, void *data)
  * only once the marker has left: a peer that reads one drains the whole ring,
  * so anything enqueued in between is covered by the same marker.
  *
- * Answers whether the marker was attempted and did not go out, which is the
- * caller's cue to pace the next attempt rather than make it at once.  A port
- * that owes nothing, one that can no longer be written to, and an EAGAIN all
- * answer 0: the first two have nothing to pace, and after EAGAIN the socket
- * is full, so the peer's next read raises an edge and paces the retry by
- * itself.
+ * Return values:
+ *
+ * NXT_AGAIN indicates the kernel rejected the marker due to insufficient
+ * memory; the caller must delay the next attempt.  NXT_OK indicates the
+ * port owes nothing, the marker was sent, or the write returned EAGAIN.
+ * After EAGAIN, the socket buffer is full, so the next read by the peer
+ * triggers a write event.  If the port is already closed (pair[1] is -1),
+ * the function also returns NXT_OK.  NXT_ERROR indicates an unrecoverable
+ * socket error.  In that case, the function transfers queued messages to
+ * nxt_port_error_handler(), and the caller must neither enable the write
+ * event nor schedule a retry.
  */
 
-static nxt_bool_t
+static nxt_int_t
 nxt_port_announce(nxt_task_t *task, nxt_port_t *port)
 {
     ssize_t         n;
@@ -732,7 +797,7 @@ nxt_port_announce(nxt_task_t *task, nxt_port_t *port)
      */
 
     if (port->announce == 0 || port->pair[1] == -1) {
-        return 0;
+        return NXT_OK;
     }
 
     /* nxt_socketpair_send() reads both, whether or not it sends them. */
@@ -765,7 +830,7 @@ nxt_port_announce(nxt_task_t *task, nxt_port_t *port)
         nxt_debug(task, "port{%d,%d} %d: queue announced", (int) port->pid,
                   (int) port->id, port->socket.fd);
 
-        return 0;
+        return NXT_OK;
     }
 
     /*
@@ -774,11 +839,31 @@ nxt_port_announce(nxt_task_t *task, nxt_port_t *port)
      * every outcome.
      */
 
-    if (n == NXT_AGAIN && port->socket.error == NXT_EAGAIN) {
-        return 0;
+    if (n == NXT_AGAIN) {
+        return (port->socket.error == NXT_EAGAIN) ? NXT_OK : NXT_AGAIN;
     }
 
-    return 1;
+    /*
+     * If the peer closed the socket or an unrecoverable error occurred,
+     * do not schedule a retry.  Delaying retries would leave the timer
+     * running indefinitely without re-enabling the write event.  As a
+     * result, queued messages would never reach the error handler.
+     *
+     * Transfer queued messages to nxt_port_error_handler() now, matching
+     * the fail path in nxt_port_write_msgs().  Decrement announce by 1;
+     * any leftover count on a failed port is harmless because NXT_ERROR
+     * never arms the retry timer.
+     */
+
+    nxt_atomic_fetch_add(&port->announce, -1);
+
+    nxt_port_inc_use(port);
+
+    nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                       nxt_port_error_handler, task, &port->socket,
+                       &port->socket);
+
+    return NXT_ERROR;
 }
 
 
@@ -797,6 +882,8 @@ nxt_port_announce(nxt_task_t *task, nxt_port_t *port)
 static void
 nxt_port_rearm_now(nxt_task_t *task, nxt_port_t *port)
 {
+    nxt_int_t  ret;
+
     if (port->pair[1] == -1) {
         return;
     }
@@ -823,11 +910,18 @@ nxt_port_rearm_now(nxt_task_t *task, nxt_port_t *port)
      * covers every one of them, since this is the only place the marker is
      * ever attempted.  The marker goes first so that a failed one leaves
      * the event down, instead of an enable that the retry takes back in the
-     * same pass -- two epoll_ctl() calls that cancel out.
+     * same pass -- two epoll_ctl() calls that cancel out.  If sending the
+     * marker fails permanently, nxt_port_announce() hands the port to
+     * nxt_port_error_handler(), and there is nothing left to arm.
      */
 
-    if (nxt_slow_path(nxt_port_announce(task, port))) {
-        nxt_port_retry_later(task, port);
+    ret = nxt_port_announce(task, port);
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        if (ret == NXT_AGAIN) {
+            nxt_port_retry_later(task, port);
+        }
+
         return;
     }
 
@@ -1102,8 +1196,12 @@ next_fragment:
 
         /*
          * Send through mmap enabled only when payload
-         * is bigger than PORT_MMAP_MIN_SIZE.
+         * is bigger than PORT_MMAP_MIN_SIZE.  The bit is per fragment: a
+         * fragment sent plain after one sent through mmap must not carry
+         * it, or the receiver reads its payload as mmap records.
          */
+        msg->port_msg.mmap = 0;
+
         if (m == NXT_PORT_METHOD_MMAP && plain_size > PORT_MMAP_MIN_SIZE) {
             nxt_port_mmap_write(task, port, msg, &sb, mmsg_buf);
 
@@ -1114,7 +1212,9 @@ next_fragment:
         msg->port_msg.last |= sb.last;
         msg->port_msg.mf = sb.limit_reached || sb.nmax_reached;
 
-        n = nxt_socketpair_send(&port->socket, msg->fd, iov, sb.niov + 1);
+        n = nxt_socketpair_send_ex(&port->socket, msg->fd, iov, sb.niov + 1,
+                                   msg->peer_may_be_gone
+                                   || port->quit_sent != 0);
 
         if (n > 0) {
             /*
@@ -1240,22 +1340,16 @@ next_fragment:
              * NXT_AGAIN.  After EAGAIN the socket is full, and the peer's
              * next read raises the edge that brings this handler back.
              * After ENOBUFS or ENOMEM it is not full: the kernel could not
-             * allocate for the call, and no edge is coming.  The inline
-             * pass re-arms a disabled event, which is how the first retry
-             * runs at all; but this pass finds the event active, and an
-             * active edge-triggered event is never re-added, so a retry
-             * that runs out of memory again would leave the message queued
-             * for ever, and every later message on this port behind it.
-             * Force the readiness re-check the drained pass does -- disable,
-             * then enable -- so the poller reports the socket writable on
-             * the spot.  One epoll_ctl() pair per failed retry.
+             * allocate for the call, and no edge is coming.  This pass
+             * finds the event active, and an active edge-triggered event
+             * is never re-added, so a retry must force a readiness re-check.
              *
-             * Paced, though, rather than on the spot.  The socket is
-             * writable, so the re-check comes back at once and the retry
-             * fails again while the shortage lasts: unpaced, this is a tight
-             * loop on the engine thread for as long as the machine is short
-             * of memory (#407).  nxt_port_retry_later() does the disable as
-             * well, so block_write is not set here.
+             * The retry is paced rather than attempted on the spot.  The
+             * socket is writable, so an immediate re-check fails again
+             * while the memory shortage lasts (#407).  Instead,
+             * nxt_port_retry_later() disables the event and sets a timer
+             * to re-enable it.  Because it handles the event disable directly,
+             * block_write is not set here.
              */
 
             if (data == NULL && port->socket.error != NXT_EAGAIN) {
@@ -2216,16 +2310,67 @@ static const nxt_lvlhsh_proto_t  lvlhsh_frag_proto  nxt_aligned(64) = {
 };
 
 
+/*
+ * An upper bound on what nxt_port_mmap_read() allocates for each record:
+ * nxt_buf_mem_ts_alloc() takes the memory part of an nxt_buf_t followed by
+ * its thread-safe completion state, a work item and an engine pointer.
+ */
+#define NXT_PORT_FRAG_MMAP_BUF_COST                                           \
+    (sizeof(nxt_buf_t) + sizeof(nxt_work_t) + sizeof(void *))
+
+
+/*
+ * What a fragment kept for reassembly costs the receiver: the whole buffer
+ * it came in, port->max_size, however little of it carries.  Counting the
+ * payload alone let a stream of empty fragments hold buffers without limit.
+ * An mmap fragment also keeps a buffer per record, and a record may name
+ * no bytes at all: a max_size fragment of empty records is some 1,300
+ * buffers, so each of them is charged too.
+ */
+static size_t
+nxt_port_frag_cost(nxt_port_t *port, nxt_port_recv_msg_t *msg)
+{
+    size_t     cost;
+    nxt_buf_t  *b;
+
+    cost = nxt_max(msg->size, port->max_size);
+
+    if (msg->port_msg.mmap) {
+        for (b = msg->buf; b != NULL; b = b->next) {
+            cost += NXT_PORT_FRAG_MMAP_BUF_COST;
+        }
+    }
+
+    return cost;
+}
+
+
 static nxt_port_recv_msg_t *
 nxt_port_frag_start(nxt_task_t *task, nxt_port_t *port,
     nxt_port_recv_msg_t *msg)
 {
+    size_t               cost;
     nxt_int_t            res;
     nxt_lvlhsh_query_t   lhq;
     nxt_port_recv_msg_t  *fmsg;
     nxt_port_frag_key_t  frag_key;
 
     nxt_debug(task, "start frag stream #%uD", msg->port_msg.stream);
+
+    if (nxt_slow_path(port->frag_streams >= NXT_PORT_FRAG_STREAMS_MAX)) {
+        nxt_port_frag_evict(task, port, msg);
+    }
+
+    cost = nxt_port_frag_cost(port, msg);
+
+    if (nxt_slow_path(msg->size > NXT_PORT_FRAG_SIZE_MAX
+                      || cost > NXT_PORT_FRAG_TOTAL_MAX - port->frag_size))
+    {
+        nxt_alert(task, "port %d: fragmented message #%uD from pid %PI "
+                  "exceeds the reassembly limit, dropped", port->socket.fd,
+                  msg->port_msg.stream, msg->port_msg.pid);
+        return NULL;
+    }
 
     fmsg = nxt_mp_alloc(port->mem_pool, sizeof(nxt_port_recv_msg_t));
 
@@ -2251,6 +2396,13 @@ nxt_port_frag_start(nxt_task_t *task, nxt_port_t *port,
     switch (res) {
 
     case NXT_OK:
+        fmsg->frag_held = cost;
+
+        port->frag_streams++;
+        port->frag_size += cost;
+
+        nxt_queue_insert_tail(&port->frag_queue, &fmsg->frag_link);
+
         return fmsg;
 
     case NXT_DECLINED:
@@ -2300,6 +2452,10 @@ nxt_port_frag_find(nxt_task_t *task, nxt_port_t *port, nxt_port_recv_msg_t *msg)
     switch (res) {
 
     case NXT_OK:
+        if (last) {
+            nxt_port_frag_unaccount(port, lhq.value);
+        }
+
         return lhq.value;
 
     default:
@@ -2312,9 +2468,179 @@ nxt_port_frag_find(nxt_task_t *task, nxt_port_t *port, nxt_port_recv_msg_t *msg)
 
 
 static void
+nxt_port_frag_unaccount(nxt_port_t *port, nxt_port_recv_msg_t *fmsg)
+{
+    port->frag_streams--;
+    port->frag_size -= fmsg->frag_held;
+
+    nxt_queue_remove(&fmsg->frag_link);
+}
+
+
+/*
+ * Makes room for the new stream in "msg" when NXT_PORT_FRAG_STREAMS_MAX are
+ * open: the oldest stream is dropped as a whole.  A peer that opens streams
+ * and never ends them thus cannot block reassembly for good.  To keep out a
+ * message of another sender, it must open that many new streams between
+ * two fragments of that message, for every message.
+ */
+static void
+nxt_port_frag_evict(nxt_task_t *task, nxt_port_t *port,
+    nxt_port_recv_msg_t *msg)
+{
+    nxt_port_recv_msg_t  *old;
+
+    old = nxt_queue_link_data(nxt_queue_first(&port->frag_queue),
+                              nxt_port_recv_msg_t, frag_link);
+
+    nxt_alert(task, "port %d: %uD fragmented messages already in progress, "
+              "dropping the oldest, stream #%uD from pid %PI, for stream "
+              "#%uD from pid %PI", port->socket.fd, port->frag_streams,
+              old->port_msg.stream, old->port_msg.pid, msg->port_msg.stream,
+              msg->port_msg.pid);
+
+    nxt_port_frag_drop(task, port, old, 1);
+}
+
+
+/*
+ * Would appending "msg" to the stream being reassembled in "fmsg" pass a
+ * limit?  The per-port total is checked only for a fragment that keeps the
+ * stream open, against its "cost": the last one hands the whole message
+ * over at once.  A stream and the port's total are kept under their
+ * limits, so neither subtraction can wrap.
+ */
+static nxt_bool_t
+nxt_port_frag_fits(nxt_task_t *task, nxt_port_t *port,
+    nxt_port_recv_msg_t *fmsg, nxt_port_recv_msg_t *msg, size_t cost)
+{
+    if (nxt_slow_path(msg->size > NXT_PORT_FRAG_SIZE_MAX - fmsg->size)) {
+        nxt_alert(task, "port %d: fragmented message #%uD from pid %PI "
+                  "exceeds %d bytes, dropped", port->socket.fd,
+                  msg->port_msg.stream, msg->port_msg.pid,
+                  NXT_PORT_FRAG_SIZE_MAX);
+        return 0;
+    }
+
+    if (msg->port_msg.mf != 0
+        && nxt_slow_path(cost > NXT_PORT_FRAG_TOTAL_MAX - port->frag_size))
+    {
+        nxt_alert(task, "port %d: fragmented messages in progress exceed "
+                  "%d bytes, dropping stream #%uD from pid %PI",
+                  port->socket.fd, NXT_PORT_FRAG_TOTAL_MAX,
+                  msg->port_msg.stream, msg->port_msg.pid);
+        return 0;
+    }
+
+    return 1;
+}
+
+
+/*
+ * Gives back the buffers of a reassembled message, each the way it came:
+ * a shared memory buffer is completed, a read buffer returns to the port.
+ * The fragments of one stream need not all have come the same way -- the
+ * sender picks plain or mmap per fragment -- so the last fragment's mmap
+ * bit does not say how to release what the earlier ones brought.
+ */
+static void
+nxt_port_frag_bufs_release(nxt_task_t *task, nxt_port_t *port, nxt_buf_t *b)
+{
+    nxt_buf_t  *next;
+
+    for ( /* void */ ; b != NULL; b = next) {
+        next = b->next;
+        b->next = NULL;
+
+        if (nxt_buf_is_port_mmap(b)) {
+            nxt_work_queue_add(port->socket.read_work_queue,
+                               b->completion_handler, task, b, b->parent);
+
+        } else {
+            nxt_port_buf_free(port, b);
+        }
+    }
+}
+
+
+/*
+ * Drops a stream that passed a limit, or the oldest one when a new stream
+ * needs its place (nxt_port_frag_evict()): out of ->frags if it is still there,
+ * then everything it had accumulated -- buffers, the first fragment's
+ * descriptors, the stream itself.  Its later fragments find no stream and
+ * are discarded by the "not found" path.
+ */
+static void
+nxt_port_frag_drop(nxt_task_t *task, nxt_port_t *port,
+    nxt_port_recv_msg_t *fmsg, nxt_bool_t in_hash)
+{
+    nxt_lvlhsh_query_t   lhq;
+    nxt_port_frag_key_t  frag_key;
+
+    if (in_hash) {
+        frag_key.stream = fmsg->port_msg.stream;
+        frag_key.pid = fmsg->port_msg.pid;
+
+        lhq.key_hash = nxt_murmur_hash2(&frag_key,
+                                        sizeof(nxt_port_frag_key_t));
+        lhq.key.length = sizeof(nxt_port_frag_key_t);
+        lhq.key.start = (u_char *) &frag_key;
+        lhq.proto = &lvlhsh_frag_proto;
+        lhq.pool = port->mem_pool;
+
+        if (nxt_lvlhsh_delete(&port->frags, &lhq) == NXT_OK) {
+            nxt_port_frag_unaccount(port, fmsg);
+        }
+    }
+
+    /*
+     * A stream started while cancelled holds copies only: the caller freed
+     * its buffers and closed its descriptors.
+     */
+    if (fmsg->cancelled == 0) {
+        nxt_port_frag_bufs_release(task, port, fmsg->buf);
+
+        nxt_port_close_fds(fmsg->fd);
+    }
+
+    nxt_mp_free(port->mem_pool, fmsg);
+}
+
+
+/*
+ * Did nxt_port_mmap_read() turn an mmap fragment into shared memory
+ * buffers?  A fragment that is empty, carries only part of a record, or
+ * whose first record names no segment leaves msg->buf at the read buffer
+ * "orig_b", or at NULL.  Kept in a stream, the read buffer would also be
+ * given back to port->free_bufs by the caller and reused for the next
+ * message while the stream still held it; the sender never sends such a
+ * fragment, so the fragment is refused.  msg->buf is set back to "orig_b"
+ * for the caller to free.
+ */
+static nxt_bool_t
+nxt_port_frag_mmap_valid(nxt_task_t *task, nxt_port_t *port,
+    nxt_port_recv_msg_t *msg, nxt_buf_t *orig_b)
+{
+    if (nxt_fast_path(msg->buf != orig_b && msg->buf != NULL)) {
+        return 1;
+    }
+
+    nxt_alert(task, "port %d: mmap fragment of message #%uD from pid %PI "
+              "carries no shared memory buffer, dropped", port->socket.fd,
+              msg->port_msg.stream, msg->port_msg.pid);
+
+    msg->buf = orig_b;
+    msg->size = 0;
+
+    return 0;
+}
+
+
+static void
 nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
     nxt_port_recv_msg_t *msg)
 {
+    size_t               cost;
     nxt_buf_t            *b, *orig_b, *next;
     nxt_port_recv_msg_t  *fmsg;
 
@@ -2347,11 +2673,44 @@ nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
 
             if (msg->port_msg.mmap) {
                 nxt_port_mmap_read(task, msg);
+
+                if (nxt_slow_path(!nxt_port_frag_mmap_valid(task, port, msg,
+                                                            orig_b)))
+                {
+                    /* The last fragment's lookup took it out already. */
+                    nxt_port_frag_drop(task, port, fmsg,
+                                       msg->port_msg.mf != 0);
+
+                    b = orig_b;
+
+                    goto fmsg_failed;
+                }
+            }
+
+            /* The last fragment is not kept, so it is not charged. */
+            cost = (msg->port_msg.mf != 0) ? nxt_port_frag_cost(port, msg) : 0;
+
+            if (nxt_slow_path(!nxt_port_frag_fits(task, port, fmsg, msg,
+                                                  cost)))
+            {
+                /* The last fragment's lookup took the stream out already. */
+                nxt_port_frag_drop(task, port, fmsg, msg->port_msg.mf != 0);
+
+                /* This fragment's own buffers complete on the common path. */
+                b = msg->buf;
+
+                goto fmsg_failed;
             }
 
             nxt_buf_chain_add(&fmsg->buf, msg->buf);
 
             fmsg->size += msg->size;
+
+            if (msg->port_msg.mf != 0) {
+                fmsg->frag_held += cost;
+                port->frag_size += cost;
+            }
+
             msg->buf = NULL;
             b = NULL;
 
@@ -2373,10 +2732,16 @@ nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
 
                 /*
                  * To disable instant completion or buffer re-usage,
-                 * handler should reset 'msg.buf'.
+                 * handler should reset 'msg.buf'.  Whatever it leaves is
+                 * released here, buffer by buffer: this fragment's own read
+                 * buffer is in the chain only when it came plain, and an
+                 * mmap fragment's is freed by the caller once msg->buf is
+                 * restored below.
                  */
-                if (!msg->port_msg.mmap && msg->buf == b) {
-                    nxt_port_buf_free(port, b);
+                if (msg->buf == b) {
+                    nxt_port_frag_bufs_release(task, port, b);
+
+                    msg->buf = NULL;
                 }
             }
         }
@@ -2389,6 +2754,15 @@ nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
 
             if (msg->port_msg.mmap && msg->cancelled == 0) {
                 nxt_port_mmap_read(task, msg);
+
+                if (nxt_slow_path(!nxt_port_frag_mmap_valid(task, port, msg,
+                                                            orig_b)))
+                {
+                    b = orig_b;
+
+                    goto fmsg_failed;
+                }
+
                 b = msg->buf;
             }
 

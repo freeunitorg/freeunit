@@ -363,6 +363,15 @@ void nxt_router_access_log_reopen_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 
 #if (NXT_TESTS)
+/*
+ * The sender checks of the router main port, for the router sender test.
+ * NXT_PROCESS_PROTOTYPE selects the REMOVE_PID check: main or a prototype.
+ */
+nxt_bool_t nxt_router_test_msg_sender_is(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, nxt_process_type_t type);
+
+extern nxt_uint_t  nxt_router_test_senders_refused;
+
 /* The detached edge handler, for the sender check test. */
 void nxt_router_test_detached_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
@@ -383,6 +392,18 @@ void nxt_router_test_app_rpc_create(nxt_task_t *task,
 
 /* The request deadline handler, for the app-timeout test. */
 void nxt_router_test_app_timeout(nxt_task_t *task, void *obj, void *data);
+
+/* The application response decoder, for the response parse test. */
+nxt_int_t nxt_router_test_response_header_parse(nxt_task_t *task,
+    nxt_http_request_t *r, nxt_buf_t *b);
+
+/*
+ * The app message builder with the prefix of app->type, for the protocol
+ * length test.  The status is an nxt_uint_t: nxt_http_status_t is not
+ * visible here.
+ */
+nxt_buf_t *nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_app_t *app, nxt_uint_t *status);
 #endif
 
 

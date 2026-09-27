@@ -5,6 +5,7 @@
  */
 
 #include <nxt_main.h>
+#include <nxt_span.h>
 
 #if (NXT_HAVE_MEMFD_CREATE)
 
@@ -58,10 +59,11 @@ nxt_port_mmap_at(nxt_port_mmaps_t *port_mmaps, uint32_t i)
     }
 
     /*
-     * A capacity able to hold slot i is i + 1 elements, which is not
-     * representable in uint32_t for i == UINT32_MAX.
+     * "i" is a segment id from the peer, or the next id of an outgoing
+     * segment.  Past NXT_PORT_MMAPS_MAX it is refused before any growth,
+     * so a huge id costs nothing.  This also keeps i + 1 in uint32_t.
      */
-    if (nxt_slow_path(i == UINT32_MAX)) {
+    if (nxt_slow_path(i >= NXT_PORT_MMAPS_MAX)) {
         return NULL;
     }
 
@@ -403,6 +405,17 @@ nxt_port_new_port_mmap(nxt_task_t *task, nxt_port_mmaps_t *mmaps, nxt_int_t n)
     nxt_port_mmap_header_t   *hdr;
     nxt_port_mmap_handler_t  *mmap_handler;
 
+    /*
+     * The id of the new segment is its index, mmaps->size.  Refused here
+     * with its own message; nxt_port_mmap_at() below refuses it too.
+     */
+    if (nxt_slow_path(mmaps->size >= NXT_PORT_MMAPS_MAX)) {
+        nxt_alert(task, "too many port mmaps (%uD), limit is %uD",
+                  mmaps->size, NXT_PORT_MMAPS_MAX);
+
+        return NULL;
+    }
+
     mmap_handler = nxt_zalloc(sizeof(nxt_port_mmap_handler_t));
     if (nxt_slow_path(mmap_handler == NULL)) {
         nxt_alert(task, "failed to allocate mmap_handler");
@@ -581,7 +594,10 @@ nxt_port_mmap_get(nxt_task_t *task, nxt_port_mmaps_t *mmaps, nxt_chunk_id_t *c,
             nchunks = 1;
 
             while (nchunks < n) {
-                res = nxt_port_mmap_chk_set_chunk_busy(free_map, *c + nchunks);
+                /* Not up to the sentinel: see nxt_port_mmap_increase_buf(). */
+                res = *c + nchunks < PORT_MMAP_CHUNK_COUNT
+                      && nxt_port_mmap_chk_set_chunk_busy(free_map,
+                                                          *c + nchunks);
 
                 if (res == 0) {
                     for (i = 0; i < nchunks; i++) {
@@ -697,6 +713,9 @@ nxt_port_mmap_get_buf(nxt_task_t *task, nxt_port_mmaps_t *mmaps, size_t size)
 
     b = nxt_buf_mem_ts_alloc(task, task->thread->engine->mem_pool, 0);
     if (nxt_slow_path(b == NULL)) {
+        nxt_alert(task, "failed to allocate a buffer for %z bytes of shared "
+                  "memory", size);
+
         return NULL;
     }
 
@@ -764,8 +783,11 @@ nxt_port_mmap_increase_buf(nxt_task_t *task, nxt_buf_t *b, size_t size,
 
     c = start;
 
-    /* Try to acquire as much chunks as required. */
-    while (nchunks > 0) {
+    /*
+     * Try to acquire as much chunks as required.  Not up to the busy
+     * sentinel: the peer maps the segment writable and can clear it.
+     */
+    while (nchunks > 0 && c < PORT_MMAP_CHUNK_COUNT) {
 
         if (nxt_port_mmap_chk_set_chunk_busy(hdr->free_map, c) == 0) {
             break;
@@ -911,27 +933,51 @@ nxt_port_mmap_write(nxt_task_t *task, nxt_port_t *port,
 }
 
 
+/*
+ * The buffers of an mmap message carry an array of nxt_port_mmap_msg_t
+ * written by the peer, which may be an untrusted application process.  The
+ * array is walked with nxt_span_copy(), so a buffer whose length is not a
+ * whole number of records -- a partial tail of 1 to 11 bytes -- is refused
+ * at the tail instead of being read as a record that runs past mem.free.
+ * Each record is copied out before any field is used; the fields are then
+ * bounds-checked by nxt_port_mmap_get_incoming_buf(): mmap_id against the
+ * sender's incoming segments, chunk_id and size by
+ * nxt_port_mmap_chunk_range_valid().
+ */
+
 void
 nxt_port_mmap_read(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
     nxt_buf_t            *b, **pb;
-    nxt_port_mmap_msg_t  *end, *mmap_msg;
+    nxt_span_t           span;
+    nxt_port_mmap_msg_t  mmap_msg;
 
     pb = &msg->buf;
     msg->size = 0;
 
     for (b = msg->buf; b != NULL; b = b->next) {
 
-        mmap_msg = (nxt_port_mmap_msg_t *) b->mem.pos;
-        end = (nxt_port_mmap_msg_t *) b->mem.free;
+        nxt_span_init(&span, b->mem.pos, b->mem.free);
 
-        while (mmap_msg < end) {
+        while (nxt_span_len(&span) != 0) {
+
+            if (nxt_slow_path(nxt_span_copy(&span, &mmap_msg,
+                                            sizeof(nxt_port_mmap_msg_t))
+                              != 0))
+            {
+                nxt_alert(task, "invalid mmap message from pid %PI: "
+                          "%uz trailing bytes are not a whole record",
+                          msg->port_msg.pid, nxt_span_len(&span));
+
+                break;
+            }
+
             nxt_debug(task, "mmap_msg={%D, %D, %D} from %PI",
-                      mmap_msg->mmap_id, mmap_msg->chunk_id, mmap_msg->size,
+                      mmap_msg.mmap_id, mmap_msg.chunk_id, mmap_msg.size,
                       msg->port_msg.pid);
 
             *pb = nxt_port_mmap_get_incoming_buf(task, msg->port,
-                                                 msg->port_msg.pid, mmap_msg);
+                                                 msg->port_msg.pid, &mmap_msg);
             if (nxt_slow_path(*pb == NULL)) {
                 nxt_log_error(NXT_LOG_ERR, task->log,
                               "failed to get mmap buffer");
@@ -939,9 +985,8 @@ nxt_port_mmap_read(nxt_task_t *task, nxt_port_recv_msg_t *msg)
                 break;
             }
 
-            msg->size += mmap_msg->size;
+            msg->size += mmap_msg.size;
             pb = &(*pb)->next;
-            mmap_msg++;
 
             /* Mark original buf as complete. */
             b->mem.pos += sizeof(nxt_port_mmap_msg_t);
@@ -1097,3 +1142,27 @@ nxt_port_broadcast_shm_ack(nxt_task_t *task, nxt_port_t *port, void *data)
 
     nxt_process_use(task, process, -1);
 }
+
+
+#if (NXT_TESTS)
+
+/*
+ * The static growth and creation paths, for
+ * src/test/nxt_port_mmaps_max_test.c.
+ */
+
+nxt_port_mmap_t *
+nxt_port_test_mmap_at(nxt_port_mmaps_t *mmaps, uint32_t i)
+{
+    return nxt_port_mmap_at(mmaps, i);
+}
+
+
+nxt_port_mmap_handler_t *
+nxt_port_test_new_port_mmap(nxt_task_t *task, nxt_port_mmaps_t *mmaps,
+    nxt_int_t n)
+{
+    return nxt_port_new_port_mmap(task, mmaps, n);
+}
+
+#endif

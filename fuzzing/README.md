@@ -38,17 +38,50 @@ $ make fuzz -j$(nproc)
 
 ```shell
 $ mkdir -p build/fuzz_basic_seed
+$ mkdir -p build/fuzz_http_chunk_seed
 $ mkdir -p build/fuzz_http_controller_seed
 $ mkdir -p build/fuzz_http_h1p_seed
 $ mkdir -p build/fuzz_http_h1p_peer_seed
+$ mkdir -p build/fuzz_http_h1p_peer_response_seed
+$ mkdir -p build/fuzz_http_ws_utf8_seed
 $ mkdir -p build/fuzz_json_seed
+$ mkdir -p build/fuzz_router_app_response_seed
+$ mkdir -p build/fuzz_unit_msg_seed
 
 $ ./build/fuzz_basic            build/fuzz_basic_seed            fuzzing/fuzz_basic_seed_corpus
+$ ./build/fuzz_http_chunk       build/fuzz_http_chunk_seed       fuzzing/fuzz_http_chunk_seed_corpus
 $ ./build/fuzz_http_controller  build/fuzz_http_controller_seed  fuzzing/fuzz_http_seed_corpus
 $ ./build/fuzz_http_h1p         build/fuzz_http_h1p_seed         fuzzing/fuzz_http_seed_corpus
 $ ./build/fuzz_http_h1p_peer    build/fuzz_http_h1p_peer_seed    fuzzing/fuzz_http_seed_corpus
+$ ./build/fuzz_http_h1p_peer_response \
+                                build/fuzz_http_h1p_peer_response_seed \
+                                fuzzing/fuzz_http_h1p_peer_response_seed_corpus
+$ ./build/fuzz_http_ws_utf8     build/fuzz_http_ws_utf8_seed     fuzzing/fuzz_http_ws_utf8_seed_corpus
 $ ./build/fuzz_json             build/fuzz_json_seed             fuzzing/fuzz_json_seed_corpus
+$ ./build/fuzz_router_app_response build/fuzz_router_app_response_seed fuzzing/fuzz_router_app_response_seed_corpus
+$ ./build/fuzz_unit_msg         build/fuzz_unit_msg_seed         fuzzing/fuzz_unit_msg_seed_corpus
 ```
+
+### Differential targets.
+
+Three targets check a result, not only that the code does not crash.  Each
+one aborts on a difference, so a wrong answer is reported like a crash.
+
+- `fuzz_http_chunk` decodes a chunked body two times: one time as a single
+  buffer, and one time cut into pieces given to the decoder in chains of one
+  to three buffers.  The two runs must give the same verdict, the same end
+  of the message, and the same decoded bytes.  The first input byte seeds
+  the cuts.
+- `fuzz_http_h1p_peer_response` parses an upstream response header in the
+  same way as the proxy: it continues after each read that returned
+  `NXT_AGAIN`.  A run that gets the header a few bytes at a time must give
+  the same status, header size and fields as a run that gets it in one pass.
+  The first input byte seeds the read sizes.
+- `fuzz_http_ws_utf8` runs the UTF-8 check for WebSocket text messages and
+  close reasons on masked frames that are split into several buffers.  It
+  compares the verdict after each frame with a small validator written from
+  Unicode Table 3-7.  Byte 0 selects a close reason, byte 1 seeds the cuts,
+  bytes 2-5 are the masking key.
 
 Here is more information about [LibFuzzer](https://llvm.org/docs/LibFuzzer.html).
 
@@ -67,6 +100,18 @@ may vary).
 clang, llvm & compiler-rt
 ```
 
+`fuzz_unit_msg` (`nxt_unit_msg_fuzz.c`) is linked against libunit rather than
+the core library: it feeds one router-to-application port message through
+`nxt_unit_process_msg()` and the request handler.  Its input format and what
+the harness steers are described at the top of the file.
+
+`fuzz_router_app_response` (`nxt_router_app_response_fuzz.c`) is the other
+side of that trust boundary: the router decoding an `nxt_unit_response_t` an
+application handed back, through `nxt_router_response_header_parse()` in
+`src/nxt_router.c` (extracted from `nxt_router_response_ready_handler()` so
+it can be driven without a port message or a live application).  The fuzz
+input *is* the response buffer, byte for byte -- no framing on top.
+
 ## In CI
 
 `.github/workflows/fuzzing.yml` builds these targets with clang, ASan and
@@ -74,15 +119,16 @@ UBSan and runs `fuzzing/run-ci.sh`, which gives each target a bounded
 libFuzzer budget against its seed corpus and fails on the first crash.
 
 ```shell
-$ fuzzing/run-ci.sh                                   # all five, 60s each
+$ fuzzing/run-ci.sh                                   # all ten, 60s each
 $ fuzzing/run-ci.sh -t 120 fuzz_http_h1p              # one target, longer
 ```
 
 A pull request that touches `src/nxt_http*`, `src/nxt_h1proto*`,
-`src/nxt_controller*`, `src/nxt_conf*` or `fuzzing/` runs all five targets --
-roughly five minutes; a manual `workflow_dispatch` takes a budget and a
-target list as inputs.  Reproducers land in `build/fuzz-artifacts/` and are
-uploaded as an artifact when the job fails.
+`src/nxt_controller*`, `src/nxt_conf*`, `src/nxt_unit*`, `src/nxt_router*` or
+`fuzzing/` runs all ten targets -- roughly ten minutes; a manual
+`workflow_dispatch` takes a budget and a target list as inputs.  Reproducers
+land in `build/fuzz-artifacts/` and are uploaded as an artifact when the job
+fails.
 
 Each target finishes within a second or two of its budget.  `run-ci.sh` caps
 it at the budget plus a minute anyway -- libFuzzer only checks the budget

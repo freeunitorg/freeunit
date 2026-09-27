@@ -71,6 +71,15 @@ struct nxt_port_handlers_s {
      * inserting or reordering a slot renumbers the wire protocol.
      */
     nxt_port_handler_t  detached;
+
+    /*
+     * A prototype reports a child that died before PROCESS_CREATED, by its
+     * namespace-local pid.  Appended for the same reason as the slot above.
+     */
+    nxt_port_handler_t  remove_child_pid;
+
+    /* The controller asks main to store a certificate bundle.  Appended. */
+    nxt_port_handler_t  cert_store;
 };
 
 
@@ -130,6 +139,11 @@ typedef enum {
 
     _NXT_PORT_MSG_DETACHED        = nxt_port_handler_idx(detached),
 
+    _NXT_PORT_MSG_REMOVE_CHILD_PID
+                                  = nxt_port_handler_idx(remove_child_pid),
+
+    _NXT_PORT_MSG_CERT_STORE      = nxt_port_handler_idx(cert_store),
+
     NXT_PORT_MSG_MAX              = sizeof(nxt_port_handlers_t)
                                     / sizeof(nxt_port_handler_t),
 
@@ -175,7 +189,20 @@ typedef enum {
     NXT_PORT_MSG_READ_QUEUE       = _NXT_PORT_MSG_READ_QUEUE,
     NXT_PORT_MSG_READ_SOCKET      = _NXT_PORT_MSG_READ_SOCKET,
     NXT_PORT_MSG_DETACHED         = nxt_msg_last(_NXT_PORT_MSG_DETACHED),
+    NXT_PORT_MSG_REMOVE_CHILD_PID
+                              = nxt_msg_last(_NXT_PORT_MSG_REMOVE_CHILD_PID),
+    NXT_PORT_MSG_CERT_STORE       = nxt_msg_last(_NXT_PORT_MSG_CERT_STORE),
 } nxt_port_msg_type_t;
+
+
+/*
+ * The message numbers are on the wire, and a language module built from
+ * another release reads the same numbers.  Pin the last slot, so that a slot
+ * inserted before it fails the build.  Add new slots after it and move the
+ * pin to the new last slot.
+ */
+nxt_static_assert(_NXT_PORT_MSG_CERT_STORE == 36,
+                  "a port message slot was inserted, not appended");
 
 
 /*
@@ -247,6 +274,15 @@ typedef struct {
     nxt_port_msg_t      port_msg;
     uint8_t             close_fd;   /* 1 bit */
     uint8_t             allocated;  /* 1 bit */
+
+    /*
+     * The message is a QUIT, so its peer can have exited already.
+     * A send that fails because the peer is gone is logged at info, not
+     * as an alert.  The flag is local to this process.  It is not on the
+     * wire and not in shared memory.  The flag stays set when the socket
+     * carries only the READ_QUEUE wake-up for a QUIT in the shared queue.
+     */
+    uint8_t             peer_may_be_gone;  /* 1 bit */
 } nxt_port_send_msg_t;
 
 #if (NXT_HAVE_UCRED) || (NXT_HAVE_MSGHDR_CMSGCRED)
@@ -259,6 +295,10 @@ struct nxt_port_recv_msg_s {
     nxt_port_t          *port;
     nxt_port_msg_t      port_msg;
     size_t              size;
+    /* Of a stream being reassembled: what it holds, nxt_port_frag_cost(). */
+    size_t              frag_held;
+    /* Of a stream being reassembled: its place in port->frag_queue. */
+    nxt_queue_link_t    frag_link;
 #if (NXT_USE_CMSG_PID)
     nxt_pid_t           cmsg_pid;
 #endif
@@ -347,6 +387,10 @@ typedef struct nxt_app_s  nxt_app_t;
 struct nxt_port_s {
     nxt_fd_event_t      socket;
 
+    /*
+     * Set only by nxt_process_port_add().  nxt_port_release() unlinks the
+     * port and drops the process reference; it does not clear ->process.
+     */
     nxt_queue_link_t    link;       /* for nxt_process_t.ports */
     nxt_process_t       *process;
 
@@ -478,6 +522,16 @@ struct nxt_port_s {
     nxt_atomic_t        announce;
 
     /*
+     * A QUIT was sent to this port, so its peer can be gone by now.
+     * Any thread can set the flag in nxt_port_socket_write2().  The flag
+     * is never cleared.  The sender reads it when a send fails.
+     * A READ_QUEUE wake-up can be pending already when the QUIT goes into
+     * the shared queue (notify == 0).  That wake-up wakes the peer for
+     * the QUIT too, so its failure is logged at info like the QUIT's own.
+     */
+    nxt_atomic_t        quit_sent;
+
+    /*
      * The pacing of a re-arm that follows a send which failed for want of
      * kernel memory.
      *
@@ -512,6 +566,15 @@ struct nxt_port_s {
 
     nxt_lvlhsh_t        frags;
 
+    /*
+     * The fragment streams in ->frags and the bytes they hold, kept against
+     * the NXT_PORT_FRAG_* limits below.  Touched only by the port's reader.
+     */
+    uint32_t            frag_streams;
+    uint32_t            frag_size;      /* <= NXT_PORT_FRAG_TOTAL_MAX */
+    /* The same streams, the oldest first. */
+    nxt_queue_t         frag_queue;
+
     nxt_atomic_t        use_count;
 
     nxt_process_type_t  type;
@@ -522,6 +585,27 @@ struct nxt_port_s {
     void                *socket_msg;
     int                 from_socket;
 };
+
+
+/*
+ * Limits on fragment reassembly at a receiving port (#394).  A sender
+ * controls how many fragmented messages it opens and how long it keeps
+ * each one going, and the receiver holds every fragment until the last
+ * one arrives: without a bound, a peer that never sends the last fragment
+ * -- or sends a new stream id for each message -- grows the receiver
+ * without limit.  libunit never fragments, so the legitimate senders are
+ * Unit's own processes, one message at a time per destination port; the
+ * largest such message is a configuration pushed from the controller.
+ *
+ * A stream that would pass a size limit is dropped as a whole, with an
+ * alert: what it had accumulated is released and its later fragments are
+ * discarded as belonging to no stream.  A new stream when the port already
+ * has NXT_PORT_FRAG_STREAMS_MAX open drops the oldest one the same way,
+ * so streams that are never ended cannot block the port for good.
+ */
+#define NXT_PORT_FRAG_STREAMS_MAX  64                    /* per port */
+#define NXT_PORT_FRAG_SIZE_MAX     (128 * 1024 * 1024)   /* per stream */
+#define NXT_PORT_FRAG_TOTAL_MAX    (256 * 1024 * 1024)   /* per port */
 
 
 typedef struct {

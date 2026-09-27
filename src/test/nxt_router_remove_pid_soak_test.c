@@ -115,6 +115,11 @@ nxt_router_remove_pid_soak_msg(nxt_port_recv_msg_t *msg, nxt_buf_t *buf,
     msg->port_msg.pid = nxt_pid;
     msg->port_msg.type = _NXT_PORT_MSG_REMOVE_PID;
     msg->port_msg.last = 1;
+
+#if (NXT_USE_CMSG_PID)
+    /* From main; see main_port in the test. */
+    msg->cmsg_pid = nxt_pid;
+#endif
 }
 
 
@@ -130,7 +135,7 @@ nxt_router_remove_pid_soak_test(nxt_thread_t *thr)
     nxt_uint_t           i;
     nxt_bool_t           app_mutex;
     nxt_task_t           *task;
-    nxt_port_t           *router_port, *dport;
+    nxt_port_t           *router_port, *dport, *main_port;
     nxt_router_t         router, *saved_router;
     nxt_runtime_t        *rt, *saved_rt;
     nxt_app_joint_t      *joint;
@@ -144,6 +149,7 @@ nxt_router_remove_pid_soak_test(nxt_thread_t *thr)
     ret = NXT_ERROR;
     router_port = NULL;
     dport = NULL;
+    main_port = NULL;
     joint = NULL;
     app_mutex = 0;
     app = &nxt_router_remove_pid_soak_test_app;
@@ -243,6 +249,23 @@ nxt_router_remove_pid_soak_test(nxt_thread_t *thr)
     dport->pair[0] = -1;
     dport->pair[1] = -1;
     dport->socket.fd = -1;
+
+    /*
+     * The router accepts REMOVE_PID only from main or a prototype (issue
+     * #341).  Main sends it with a start stream when a prototype dies, so
+     * the message comes from main: a main port with the pid of this process.
+     */
+
+    main_port = nxt_port_new(task, 2, nxt_pid, NXT_PROCESS_MAIN);
+    if (nxt_slow_path(main_port == NULL)) {
+        goto done;
+    }
+
+    main_port->pair[0] = -1;
+    main_port->pair[1] = -1;
+    main_port->socket.fd = -1;
+
+    rt->port_by_type[NXT_PROCESS_MAIN] = main_port;
 
     nxt_memzero(app, sizeof(nxt_app_t));
 
@@ -405,6 +428,12 @@ done:
         router_port->pair[0] = -1;
 
         nxt_port_use(task, router_port, -1);
+    }
+
+    if (main_port != NULL) {
+        rt->port_by_type[NXT_PROCESS_MAIN] = NULL;
+
+        nxt_port_use(task, main_port, -1);
     }
 
     thr->engine = saved_engine;

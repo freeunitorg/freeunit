@@ -39,7 +39,10 @@ static const nxt_http_request_body_alloc_test_case_t
 nxt_int_t
 nxt_http_request_body_alloc_test(nxt_thread_t *thr)
 {
+    nxt_fd_t                 fd;
     const char               *tmpdir;
+    size_t                   len;
+    u_char                   *notdir;
     nxt_mp_t                 *mp;
     nxt_buf_t                *b;
     nxt_int_t                ret;
@@ -53,8 +56,10 @@ nxt_http_request_body_alloc_test(nxt_thread_t *thr)
     nxt_memzero(&skcf, sizeof(nxt_socket_conf_t));
     nxt_memzero(&joint, sizeof(nxt_socket_conf_joint_t));
 
+    /* An empty TMPDIR is the same as no TMPDIR. */
+
     tmpdir = getenv("TMPDIR");
-    if (tmpdir == NULL) {
+    if (tmpdir == NULL || tmpdir[0] == '\0') {
         tmpdir = "/tmp";
     }
 
@@ -63,6 +68,8 @@ nxt_http_request_body_alloc_test(nxt_thread_t *thr)
     skcf.body_temp_path.length = nxt_strlen(tmpdir);
 
     joint.socket_conf = &skcf;
+
+    fd = -1;
 
     for (i = 0; i < nxt_nitems(nxt_http_request_body_alloc_test_cases); i++) {
         tc = &nxt_http_request_body_alloc_test_cases[i];
@@ -104,6 +111,8 @@ nxt_http_request_body_alloc_test(nxt_thread_t *thr)
         }
 
         if (tc->file) {
+            fd = b->file->fd;
+
             if (b->file->fd == -1 || b->file_end != 0
                 || b->file->size != (nxt_off_t) tc->body_length)
             {
@@ -120,18 +129,47 @@ nxt_http_request_body_alloc_test(nxt_thread_t *thr)
                 goto fail;
             }
 
-            nxt_fd_close(b->file->fd);
+            nxt_fd_close(fd);
+            fd = -1;
         }
 
         nxt_mp_destroy(mp);
     }
 
-    /* A temporary path that cannot be opened is an error, not a buffer. */
+    /*
+     * A temporary path that cannot be opened is an error, not a buffer.
+     * A regular file is used as the directory: a file under it cannot be
+     * made on any host (ENOTDIR).
+     */
 
-    skcf.body_temp_path = (nxt_str_t) nxt_string("/nonexistent/h2p0");
+    len = nxt_strlen(tmpdir) + nxt_length("/nxt_body_alloc_XXXXXX") + 1;
+
+    notdir = nxt_malloc(len);
+    if (notdir == NULL) {
+        return NXT_ERROR;
+    }
+
+    (void) nxt_sprintf(notdir, notdir + len,
+                       "%s/nxt_body_alloc_XXXXXX%Z", tmpdir);
+
+    fd = mkstemp((char *) notdir);
+    if (fd == -1) {
+        nxt_log_alert(thr->log, "http request body alloc test failed: "
+                      "mkstemp(\"%s\") %E", notdir, nxt_errno);
+        nxt_free(notdir);
+        return NXT_ERROR;
+    }
+
+    nxt_fd_close(fd);
+    fd = -1;
+
+    skcf.body_temp_path.start = notdir;
+    skcf.body_temp_path.length = nxt_strlen(notdir);
 
     mp = nxt_mp_create(1024, 128, 256, 32);
     if (mp == NULL) {
+        (void) unlink((char *) notdir);
+        nxt_free(notdir);
         return NXT_ERROR;
     }
 
@@ -144,10 +182,14 @@ nxt_http_request_body_alloc_test(nxt_thread_t *thr)
     if (ret != NXT_ERROR || r.body != NULL) {
         nxt_log_alert(thr->log, "http request body alloc test failed: "
                       "a bad temporary path returned %i", ret);
+        (void) unlink((char *) notdir);
+        nxt_free(notdir);
         goto fail;
     }
 
     nxt_mp_destroy(mp);
+    (void) unlink((char *) notdir);
+    nxt_free(notdir);
 
     nxt_log_error(NXT_LOG_NOTICE, thr->log,
                   "http request body alloc test passed");
@@ -155,6 +197,10 @@ nxt_http_request_body_alloc_test(nxt_thread_t *thr)
     return NXT_OK;
 
 fail:
+
+    if (fd != -1) {
+        nxt_fd_close(fd);
+    }
 
     nxt_mp_destroy(mp);
 

@@ -937,11 +937,33 @@ nxt_http_request_is_bodyless_final(nxt_http_request_t *r,
         return 0;
     }
 
-    if (status == NXT_HTTP_NO_CONTENT || status == NXT_HTTP_NOT_MODIFIED) {
+    /* 204 and 304; the 1xx arm of that test is excluded above. */
+    if (nxt_http_status_no_representation(status)) {
         return 1;
     }
 
     return r->method != NULL && nxt_str_eq(r->method, "HEAD", 4);
+}
+
+
+/*
+ * Tells whether a status describes no representation of its own: a 1xx
+ * interim response, a 204, and a 304.  The Content-Length of a 304 describes
+ * the body that the client already has.  Content negotiation has nothing to
+ * select for such a response, so the response cannot be 406.
+ *
+ * The method is not read on purpose.  That separates this from
+ * nxt_http_request_is_bodyless_final() above.  A HEAD response carries no
+ * body, but it still describes the representation that the equivalent GET
+ * would return (RFC 9110 Sect. 9.3.2).  So it is negotiated like that GET.
+ */
+
+nxt_bool_t
+nxt_http_status_no_representation(nxt_http_status_t status)
+{
+    return status < NXT_HTTP_OK
+           || status == NXT_HTTP_NO_CONTENT
+           || status == NXT_HTTP_NOT_MODIFIED;
 }
 
 

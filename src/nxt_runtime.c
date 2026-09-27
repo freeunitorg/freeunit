@@ -68,6 +68,9 @@ nxt_runtime_create(nxt_task_t *task)
     task->thread->runtime = rt;
     rt->mem_pool = mp;
 
+    rt->control_uid = (nxt_uid_t) -1;
+    rt->control_gid = (nxt_gid_t) -1;
+
     nxt_thread_mutex_create(&rt->processes_mutex);
 
     rt->services = nxt_services_init(mp);
@@ -1610,13 +1613,10 @@ nxt_runtime_process_free(nxt_runtime_t *rt, nxt_process_t *process)
 {
     nxt_process_t  *child;
 
-    if (process->link.next != NULL) {
-        nxt_queue_remove(&process->link);
-    }
+    nxt_process_unlink(process);
 
     nxt_queue_each(child, &process->children, nxt_process_t, link) {
-        nxt_queue_remove(&child->link);
-        child->link.next = NULL;
+        nxt_process_unlink(child);
     } nxt_queue_loop;
 
     nxt_assert(process->use_count == 0);

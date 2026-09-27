@@ -198,14 +198,18 @@ class LifecycleApp:
             kwargs['headers'] = dict(KEEPALIVE)
             kwargs['start'] = True
             # the server will not close a keep-alive connection, so recvall()
-            # must be allowed to stop on a short timeout instead of on EOF.
+            # cannot stop on EOF.  framed=True stops the read when the
+            # response is complete by its Content-Length or its chunked
+            # framing.  Every app in RUNTIMES sends one of the two.  Before
+            # this, every keep-alive read waited for the full read_timeout:
+            # 15 reads in test_app_lifecycle_churn_under_keepalive, 30 s per
+            # runtime.
             #
-            # Every keep-alive read therefore costs this timeout in full, and
-            # the same timeout is all that separates "the response is
-            # complete" from "the app has not answered yet".  Two seconds
-            # buys margin over an ASan-instrumented worker on a loaded runner
-            # without paying much for it; the startup race that would need
-            # more than that is closed by waiting for the workers instead.
+            # read_timeout is now only the limit for an app that has not
+            # answered.  Two seconds gives margin for an ASan worker on a
+            # loaded runner.  A startup race that needs more than that is
+            # closed by waiting for the workers instead.
+            kwargs['framed'] = True
             kwargs['read_timeout'] = 2
 
             if sock is not None:

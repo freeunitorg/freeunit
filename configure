@@ -74,6 +74,7 @@ mkdir -p $NXT_BUILD_DIR/var/log/unit
 > $NXT_AUTO_CONFIG_H
 
 . auto/cc/test
+. auto/cc/hardening
 
 
 cat << END >> $NXT_AUTO_CONFIG_H

@@ -78,30 +78,54 @@ nxt_int_t nxt_port_fail_test(nxt_thread_t *thr);
 nxt_int_t nxt_fd_event_change_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_use_unless_zero_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_mmap_range_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_mmap_read_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_mmaps_max_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_ready_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_new_port_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_start_fail_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_start_fail_soak_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_start_proto_gone_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_proto_wedge_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_proto_death_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_start_timeout_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_app_timeout_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_remove_pid_soak_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_detached_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_sender_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_websocket_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_prepare_msg_test(nxt_thread_t *thr);
 nxt_int_t nxt_main_start_process_reply_test(nxt_thread_t *thr);
 nxt_int_t nxt_main_file_store_test(nxt_thread_t *thr);
 nxt_int_t nxt_proto_creating_wedge_test(nxt_thread_t *thr);
+nxt_int_t nxt_main_whoami_test(nxt_thread_t *thr);
+nxt_int_t nxt_main_remove_child_pid_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_change_file_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_ctrunc_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_fd_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_rpc_fd_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_queued_fd_test(nxt_thread_t *thr);
+nxt_int_t nxt_checked_test(nxt_thread_t *thr);
 nxt_int_t nxt_conn_close_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_response_parse_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_frag_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_release_test(nxt_thread_t *thr);
+nxt_int_t nxt_nncq_bound_test(nxt_thread_t *thr);
 nxt_int_t nxt_cgroup_test(nxt_thread_t *thr);
+nxt_int_t nxt_controller_peer_test(nxt_thread_t *thr);
 nxt_int_t nxt_clone_creds_test(nxt_thread_t *thr);
 
 nxt_bool_t nxt_test_fd_is_open(nxt_fd_t fd);
+int nxt_test_in_child(nxt_thread_t *thr, const char *name, int (*fn)(void *),
+    void *data);
+
+
+#define NXT_TEST_CHECK(log, cond, ...)                                        \
+    do {                                                                      \
+        if (!(cond)) {                                                        \
+            nxt_log_alert(log, __VA_ARGS__);                                  \
+            return NXT_ERROR;                                                 \
+        }                                                                     \
+    } while (0)
 
 
 #endif /* _NXT_TESTS_H_INCLUDED_ */
