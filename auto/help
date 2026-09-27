@@ -59,6 +59,9 @@ cat << END
   --otel               enable otel library usage (OTLP/HTTP + OTLP/gRPC;
                        transport is chosen by settings/telemetry/protocol)
 
+  --usdt               enable USDT (static) tracepoints, for bpftrace/perf/
+                       SystemTap (requires sys/sdt.h)
+
   --debug              enable debug logging
 
   --hardening=MODE     add compiler and linker hardening flags, probed for

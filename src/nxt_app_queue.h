@@ -8,6 +8,7 @@
 
 
 #include <nxt_app_nncq.h>
+#include <nxt_usdt.h>
 
 
 /* Using Numeric Naive Circular Queue as a backend. */
@@ -75,7 +76,15 @@ nxt_app_queue_send(nxt_app_queue_t volatile *q, const void *p,
     qi->tracking = tracking;
     *cookie = i;
 
+    /*
+     * Fire the probe before the enqueue makes the slot visible.  If not,
+     * a worker can dequeue the message and fire queue__dequeue first.
+     */
+    NXT_USDT(queue__enqueue, i, tracking);
+
     if (nxt_slow_path(nxt_app_nncq_enqueue(&q->queue, i) != NXT_OK)) {
+        NXT_USDT(queue__enqueue__fail, i, tracking);
+
         (void) nxt_app_nncq_enqueue(&q->free_items, i);
 
         return NXT_ERROR;
@@ -116,6 +125,9 @@ nxt_app_queue_recv(nxt_app_queue_t volatile *q, void *p, uint32_t *cookie)
     size_t                 size;
     nxt_app_queue_item_t   *qi;
     nxt_app_nncq_atomic_t  i;
+#if (NXT_HAVE_USDT)
+    volatile uint32_t      tracking;
+#endif
 
     i = nxt_app_nncq_dequeue(&q->queue);
     if (i == nxt_app_nncq_empty(&q->queue)) {
@@ -141,6 +153,19 @@ nxt_app_queue_recv(nxt_app_queue_t volatile *q, void *p, uint32_t *cookie)
 
     nxt_memcpy(p, qi->data, size);
     *cookie = i;
+
+#if (NXT_HAVE_USDT)
+    /*
+     * A tracer cannot fault a page in.  It reads 0 from a page that this
+     * process did not touch yet, and qi->tracking can be on the page after
+     * qi->data.  Thus this process copies the value to a volatile local
+     * first.  Without "volatile", the compiler gives qi->tracking to the
+     * probe as a memory operand and does not read it.
+     */
+    tracking = q->items[i].tracking;
+
+    NXT_USDT(queue__dequeue, i, tracking);
+#endif
 
     (void) nxt_app_nncq_enqueue(&q->free_items, i);
 

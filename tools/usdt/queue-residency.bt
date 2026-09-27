@@ -1,0 +1,53 @@
+#!/usr/bin/env bpftrace
+/*
+ * Copyright (C) FreeUnit contributors.
+ *
+ * App-queue message residency (enqueue -> dequeue) and depth, keyed by
+ * (slot, tracking id): a slot index alone repeats across app queues.
+ * Enqueue and cancel fire in the router (unitd), dequeue in the application,
+ * i.e. the module or program linked with libunit.  A message the router
+ * cancels ends at queue__cancel: its slot then reads tracking id 0.
+ * queue__enqueue fires before the message is in the queue, so the dequeue
+ * always comes after it.  queue__enqueue__fail removes a message that did
+ * not go into the queue.  The probes fire on many CPUs at the same time.
+ * Thus @depth is a sum(): "@depth++" on a plain map can lose an update.
+ *   bpftrace tools/usdt/queue-residency.bt <path to unitd> <path to module>
+ * Needs a --usdt build: docs/observability/usdt.md.
+ */
+
+BEGIN
+{
+    printf("Tracing freeunit app-queue enqueue -> dequeue residency. Ctrl-C to stop.\n");
+}
+
+usdt:$1:freeunit:queue__enqueue
+{
+    @qstart[arg0, arg1] = nsecs;
+    @depth = sum(1);
+}
+
+usdt:$2:freeunit:queue__dequeue,
+usdt:$1:freeunit:queue__cancel
+/@qstart[arg0, arg1]/
+{
+    @queue_residency_ns = hist(nsecs - @qstart[arg0, arg1]);
+    delete(@qstart[arg0, arg1]);
+    @depth = sum(-1);
+}
+
+usdt:$1:freeunit:queue__enqueue__fail
+/@qstart[arg0, arg1]/
+{
+    delete(@qstart[arg0, arg1]);
+    @depth = sum(-1);
+}
+
+interval:s:5
+{
+    print(@depth);
+}
+
+END
+{
+    clear(@qstart);
+}

@@ -6,6 +6,7 @@
 
 #include <nxt_router.h>
 #include <nxt_http.h>
+#include <nxt_usdt.h>
 #include <nxt_upstream.h>
 #include <nxt_h1proto.h>
 #include <nxt_websocket.h>
@@ -567,6 +568,9 @@ nxt_h1p_conn_request_init(nxt_task_t *task, void *obj, void *data)
         ret = nxt_http_parse_request_init(&h1p->parser, r->mem_pool);
 
         if (nxt_fast_path(ret == NXT_OK)) {
+            /* From here every exit is nxt_http_request_close_handler(). */
+            NXT_USDT(request__start, (uintptr_t) r);
+
             joint = c->listen->socket.data;
             joint->count++;
 
