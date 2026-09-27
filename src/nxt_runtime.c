@@ -68,6 +68,9 @@ nxt_runtime_create(nxt_task_t *task)
     task->thread->runtime = rt;
     rt->mem_pool = mp;
 
+    rt->control_uid = (nxt_uid_t) -1;
+    rt->control_gid = (nxt_gid_t) -1;
+
     nxt_thread_mutex_create(&rt->processes_mutex);
 
     rt->services = nxt_services_init(mp);

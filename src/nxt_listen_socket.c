@@ -127,8 +127,6 @@ nxt_listen_socket_create(nxt_task_t *task, nxt_mp_t *mp,
 #if (NXT_HAVE_UNIX_DOMAIN)
 
     if (family == AF_UNIX) {
-        const char     *user;
-        const char     *group;
         nxt_runtime_t  *rt = thr->runtime;
 
         name = (nxt_file_name_t *) sa->u.sockaddr_un.sun_path;
@@ -138,10 +136,8 @@ nxt_listen_socket_create(nxt_task_t *task, nxt_mp_t *mp,
             goto listen_fail;
         }
 
-        user = rt->control_user;
-        group = rt->control_group;
-
-        if (nxt_file_chown(name, user, group) != NXT_OK) {
+        /* The ids were resolved once, in nxt_runtime_controller_socket(). */
+        if (nxt_file_chown(name, rt->control_uid, rt->control_gid) != NXT_OK) {
             goto listen_fail;
         }
     }

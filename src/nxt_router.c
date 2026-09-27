@@ -547,9 +547,11 @@ nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
     size_t                    size;
     uint32_t                  stream;
     nxt_fd_t                  port_fd, queue_fd;
+    nxt_err_t                 err;
     nxt_int_t                 ret;
     nxt_app_t                 *app;
     nxt_buf_t                 *b;
+    nxt_bool_t                proto_gone;
     nxt_port_t                *dport;
     nxt_runtime_t             *rt;
     nxt_app_joint_rpc_t       *app_joint_rpc;
@@ -558,6 +560,7 @@ nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
     app = data;
 
     st = NULL;
+    proto_gone = 0;
 
     nxt_thread_mutex_lock(&app->mutex);
 
@@ -628,6 +631,30 @@ nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
     if (nxt_slow_path(ret != NXT_OK)) {
         nxt_port_rpc_cancel(task, port, stream);
 
+        /*
+         * A worker start goes to the prototype.  The prototype can exit
+         * without a request from the router.  On shutdown main sends QUIT
+         * to every process directly.  The prototype reports the exit of its
+         * workers to the router (REMOVE_PID) and then exits.  The router
+         * can handle such a REMOVE_PID before its own QUIT.  It then starts
+         * a replacement worker in nxt_router_app_port_close(), and the
+         * socket of the prototype is already closed.  A prototype that
+         * crashes gives the same result.  The router cannot know this in
+         * advance: it clears ->proto_port only when the REMOVE_PID of the
+         * prototype arrives, or when it sends the QUIT itself.
+         *
+         * Nothing was sent, so nothing was forked.  The slot goes back
+         * below in the usual way.  Only the log level is different.  A
+         * prototype start goes to main.  Main is never expected to be gone,
+         * so that start keeps the alert.
+         */
+
+        err = dport->socket.error;
+
+        proto_gone = (b == NULL
+                      && (err == NXT_EPIPE || err == NXT_ECONNRESET
+                          || err == NXT_ECONNREFUSED));
+
         goto failed;
     }
 
@@ -680,7 +707,13 @@ failed:
      * nxt_router_app_port_error() does for the attempts that do get that far.
      */
 
-    nxt_alert(task, "app '%V' failed to start a process", &app->name);
+    if (proto_gone) {
+        nxt_debug(task, "app '%V' start attempt cancelled: prototype %PI "
+                  "is gone", &app->name, dport->pid);
+
+    } else {
+        nxt_alert(task, "app '%V' failed to start a process", &app->name);
+    }
 
     if (st != NULL) {
         /*
@@ -6259,7 +6292,8 @@ nxt_router_app_port_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
      * module that fails to import, a worker that exits during startup --
      * and Unit is working exactly as designed when it reports one.
      * [error] is emitted at the default log level, which is the whole
-     * point of the change.
+     * point of the change.  One exception: a write to a prototype that is
+     * already gone is logged at debug level there, not as an alert.
      *
      * A different sentence from that alert, deliberately, even though
      * the two describe the same disappointment.  The test suite skips
@@ -7589,10 +7623,10 @@ static void
 nxt_router_app_prepare_request(nxt_task_t *task,
     nxt_request_rpc_data_t *req_rpc_data)
 {
-    nxt_app_t         *app;
-    nxt_buf_t         *buf, *body;
-    nxt_int_t         res;
-    nxt_port_t        *port, *reply_port;
+    nxt_app_t          *app;
+    nxt_buf_t          *buf, *body;
+    nxt_int_t          res;
+    nxt_port_t         *port, *reply_port;
     nxt_http_status_t  status;
 
     int                   notify;
@@ -7616,11 +7650,6 @@ nxt_router_app_prepare_request(nxt_task_t *task,
     buf = nxt_router_prepare_msg(task, req_rpc_data->request, app,
                                  nxt_app_msg_prefix[app->type], &status);
     if (nxt_slow_path(buf == NULL)) {
-        if (status == NXT_HTTP_INTERNAL_SERVER_ERROR) {
-            nxt_alert(task, "stream #%uD, app '%V': failed to prepare app "
-                      "message", req_rpc_data->stream, &app->name);
-        }
-
         nxt_http_request_error(task, req_rpc_data->request, status);
 
         return;
@@ -7730,8 +7759,9 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     *status = NXT_HTTP_INTERNAL_SERVER_ERROR;
 
     if (nxt_slow_path(r->method->length > UINT8_MAX)) {
-        nxt_log(task, NXT_LOG_INFO, "request method of %uz bytes is too long "
-                "for the application protocol", r->method->length);
+        nxt_log(task, NXT_LOG_INFO, "app '%V': request method of %uz bytes "
+                "is too long for the application protocol", &app->name,
+                r->method->length);
 
         *status = NXT_HTTP_NOT_IMPLEMENTED;
         return NULL;
@@ -7742,8 +7772,8 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
                       || r->local->address_length > UINT8_MAX
                       || nxt_sockaddr_port_length(r->local) > UINT8_MAX))
     {
-        nxt_alert(task, "request version or address too long for the "
-                  "application protocol");
+        nxt_alert(task, "app '%V': request version or address too long for "
+                  "the application protocol", &app->name);
 
         return NULL;
     }
@@ -7766,12 +7796,17 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_fields_each(field, r->inline_fields, r->num_inline_fields,
                          r->fields)
     {
+        if (field->skip) {
+            continue;
+        }
+
         fields_count++;
 
         if (nxt_slow_path(field->name_length + prefix->length > UINT8_MAX)) {
-            nxt_log(task, NXT_LOG_INFO, "header field name of %d bytes is "
-                    "too long for the application protocol with prefix "
-                    "\"%V\"", (int) field->name_length, prefix);
+            nxt_log(task, NXT_LOG_INFO, "app '%V': header field name of %d "
+                    "bytes is too long for the application protocol with "
+                    "prefix \"%V\"", &app->name, (int) field->name_length,
+                    prefix);
 
             *status = NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE;
             return NULL;
@@ -7784,8 +7819,8 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     req_size += fields_count * sizeof(nxt_unit_field_t);
 
     if (nxt_slow_path(req_size > PORT_MMAP_DATA_SIZE)) {
-        nxt_alert(task, "headers too big to fit in shared memory (%uz)",
-                  req_size);
+        nxt_alert(task, "app '%V': headers too big to fit in shared memory "
+                  "(%uz)", &app->name, req_size);
 
         return NULL;
     }
@@ -8031,23 +8066,18 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
 
 #if (NXT_TESTS)
 
-/*
- * For src/test/nxt_router_prepare_msg_test.c, which repeats this prototype:
- * nxt_router.h cannot name nxt_http_status_t.
- */
-
-nxt_buf_t *nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
-    nxt_app_t *app, nxt_bool_t use_http_prefix, nxt_http_status_t *status);
-
-
 nxt_buf_t *
 nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
-    nxt_app_t *app, nxt_bool_t use_http_prefix, nxt_http_status_t *status)
+    nxt_app_t *app, nxt_uint_t *status)
 {
-    return nxt_router_prepare_msg(task, r, app,
-                                  use_http_prefix ? &http_prefix
-                                                  : &empty_prefix,
-                                  status);
+    nxt_buf_t          *b;
+    nxt_http_status_t  st;
+
+    b = nxt_router_prepare_msg(task, r, app, nxt_app_msg_prefix[app->type],
+                               &st);
+    *status = st;
+
+    return b;
 }
 
 #endif

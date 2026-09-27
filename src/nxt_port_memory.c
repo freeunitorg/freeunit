@@ -713,6 +713,9 @@ nxt_port_mmap_get_buf(nxt_task_t *task, nxt_port_mmaps_t *mmaps, size_t size)
 
     b = nxt_buf_mem_ts_alloc(task, task->thread->engine->mem_pool, 0);
     if (nxt_slow_path(b == NULL)) {
+        nxt_alert(task, "failed to allocate a buffer for %z bytes of shared "
+                  "memory", size);
+
         return NULL;
     }
 

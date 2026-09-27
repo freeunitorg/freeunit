@@ -285,6 +285,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_router_start_proto_gone_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_router_proto_wedge_test(thr) != NXT_OK) {
         return 1;
     }
@@ -372,6 +376,10 @@ main(int argc, char **argv)
         return 1;
     }
 #endif
+
+    if (nxt_controller_peer_test(thr) != NXT_OK) {
+        return 1;
+    }
 
 #if (NXT_HAVE_CLONE_NEWUSER)
     if (nxt_clone_creds_test(thr) != NXT_OK) {

@@ -191,6 +191,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_router_new_port_test.c \
     src/test/nxt_router_start_fail_test.c \
     src/test/nxt_router_start_fail_soak_test.c \
+    src/test/nxt_router_start_proto_gone_test.c \
     src/test/nxt_router_proto_wedge_test.c \
     src/test/nxt_router_proto_death_test.c \
     src/test/nxt_router_start_timeout_test.c \
@@ -208,6 +209,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_port_fd_test.c \
     src/test/nxt_port_rpc_fd_test.c \
     src/test/nxt_port_queued_fd_test.c \
+    src/test/nxt_controller_peer_test.c \
     src/test/nxt_checked_test.c \
     src/test/nxt_conn_close_test.c \
     src/test/nxt_router_prepare_msg_test.c \
