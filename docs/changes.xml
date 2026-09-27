@@ -12,6 +12,17 @@
 
 <change type="bugfix">
 <para>
+an application used a shared memory segment id from the other process to grow
+its array of segments without a limit.  An id like 100000000 in one message
+made it allocate and fill an array of that many slots, so the process could
+run out of memory.  It now refuses an id of 65536 or more.  The router already
+refused such ids from applications; it now uses the same limit for the
+segments it creates.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 The proxy recognised an upstream Transfer-Encoding only when its value was
 exactly "chunked".  "Chunked" or "gzip, chunked" was not recognised, so the
 body was framed by Content-Length or by connection close, and the chunk

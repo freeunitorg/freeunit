@@ -7,7 +7,8 @@
  * Malformed port messages at libunit's receive side (src/nxt_unit.c), fed
  * through nxt_unit_test_process_msg().  nxt_unit_mmap_read() used to read a
  * partial last record past the message, mmap_id 0xFFFFFFFF wrapped the
- * lib->incoming index, and a segment of any size was accepted.  Cases that
+ * lib->incoming index, a segment id like 100000000 grew lib->incoming to
+ * that many slots, and a segment of any size was accepted.  Cases that
  * could crash the old code run in a child; a signal is a failure.
  *
  * The request cases put an nxt_unit_request_t into segment 0 the way the
@@ -377,6 +378,12 @@ static const nxt_unit_msg_test_segment_t  segments[] = {
     { "segment id 0xFFFFFFFF is refused", PORT_MMAP_SIZE, 0xFFFFFFFF,
       NXT_UNIT_ERROR },
     { "segment id 1000 is accepted", PORT_MMAP_SIZE, 1000, NXT_UNIT_OK },
+    { "segment id NXT_PORT_MMAPS_MAX - 1 is accepted", PORT_MMAP_SIZE,
+      NXT_PORT_MMAPS_MAX - 1, NXT_UNIT_OK },
+    { "segment id NXT_PORT_MMAPS_MAX is refused", PORT_MMAP_SIZE,
+      NXT_PORT_MMAPS_MAX, NXT_UNIT_ERROR },
+    { "segment id 100000000 is refused", PORT_MMAP_SIZE, 100000000,
+      NXT_UNIT_ERROR },
     { "segment shorter than PORT_MMAP_SIZE is refused",
       PORT_MMAP_HEADER_SIZE, 1, NXT_UNIT_ERROR },
     { "segment longer than PORT_MMAP_SIZE is refused",
@@ -389,6 +396,8 @@ static const struct {
     nxt_port_mmap_msg_t  rec;
 } bad_records[] = {
     { "mmap_id 0xFFFFFFFF is refused", { 0xFFFFFFFF, 0, 100 } },
+    { "mmap_id NXT_PORT_MMAPS_MAX is refused", { NXT_PORT_MMAPS_MAX, 0, 100 } },
+    { "mmap_id 100000000 is refused", { 100000000, 0, 100 } },
     { "chunk_id past the data area is refused",
       { 0, PORT_MMAP_CHUNK_COUNT, 100 } },
     { "size past the data area is refused",
@@ -1076,7 +1085,10 @@ main(void)
                                    NXT_UNIT_ERROR);
     }
 
-    /* Not capped: the router's outgoing segments are unbounded (#172). */
+    /*
+     * Capped at NXT_PORT_MMAPS_MAX, not by the shm limit: the router's
+     * outgoing segments are not bounded by it (#172).
+     */
 
     for (i = 0; i < nxt_nitems(segments); i++) {
         nxt_unit_msg_test_in_child(segments[i].name,

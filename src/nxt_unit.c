@@ -4556,13 +4556,14 @@ nxt_unit_mmap_at(nxt_unit_mmaps_t *mmaps, uint32_t i)
     /*
      * The same guards as nxt_port_mmap_at() on the router side.  "i" is a
      * segment id taken from the peer (an mmap record or a segment header),
-     * and is deliberately not capped: the router allocates its outgoing
-     * segments without a limit.  What has to hold is the arithmetic: a
-     * capacity able to hold slot i is i + 1 elements, which does not fit
-     * uint32_t for i == UINT32_MAX -- "i + 1 > cap" then wraps to 0, skips
-     * the growth, and the element pointer lands 4G elements past the array.
+     * or the next id of an outgoing segment.  Past NXT_PORT_MMAPS_MAX it is
+     * refused before any growth: the array is grown to hold slot i, so an
+     * id like 100000000 would otherwise cost a huge allocation and its
+     * initialisation from one message.  The limit also keeps i + 1 in
+     * uint32_t; for i == UINT32_MAX "i + 1 > cap" wraps to 0, skips the
+     * growth, and the element pointer lands 4G elements past the array.
      */
-    if (nxt_slow_path(i == UINT32_MAX)) {
+    if (nxt_slow_path(i >= NXT_PORT_MMAPS_MAX)) {
         return NULL;
     }
 
@@ -4934,8 +4935,8 @@ nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd)
     /*
      * The segment id lives in memory the sender keeps mapped writable: read
      * it once and use only the copy.  It indexes lib->incoming, which
-     * nxt_unit_mmap_at() grows to fit and which refuses an id whose slot
-     * cannot be represented.
+     * nxt_unit_mmap_at() grows to fit and which refuses an id past
+     * NXT_PORT_MMAPS_MAX.
      */
     id = hdr->id;
 
@@ -5178,9 +5179,8 @@ nxt_unit_check_rbuf_mmap(nxt_unit_ctx_t *ctx, nxt_unit_mmaps_t *mmaps,
  * anything is allocated, instead of its last "record" being read past the
  * end of the message.  Each record is copied out before use, and every
  * field is bounds-checked before it reaches an index or pointer arithmetic:
- * mmap_id by nxt_unit_mmap_at(), which refuses an id whose slot cannot be
- * represented (the id is not capped otherwise -- see there), chunk_id and
- * size by nxt_port_mmap_chunk_range_valid().
+ * mmap_id by nxt_unit_mmap_at(), which refuses an id past NXT_PORT_MMAPS_MAX
+ * (see there), chunk_id and size by nxt_port_mmap_chunk_range_valid().
  */
 
 static int

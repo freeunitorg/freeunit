@@ -59,10 +59,11 @@ nxt_port_mmap_at(nxt_port_mmaps_t *port_mmaps, uint32_t i)
     }
 
     /*
-     * A capacity able to hold slot i is i + 1 elements, which is not
-     * representable in uint32_t for i == UINT32_MAX.
+     * "i" is a segment id from the peer, or the next id of an outgoing
+     * segment.  Past NXT_PORT_MMAPS_MAX it is refused before any growth,
+     * so a huge id costs nothing.  This also keeps i + 1 in uint32_t.
      */
-    if (nxt_slow_path(i == UINT32_MAX)) {
+    if (nxt_slow_path(i >= NXT_PORT_MMAPS_MAX)) {
         return NULL;
     }
 
@@ -403,6 +404,17 @@ nxt_port_new_port_mmap(nxt_task_t *task, nxt_port_mmaps_t *mmaps, nxt_int_t n)
     nxt_port_mmap_t          *port_mmap;
     nxt_port_mmap_header_t   *hdr;
     nxt_port_mmap_handler_t  *mmap_handler;
+
+    /*
+     * The id of the new segment is its index, mmaps->size.  Refused here
+     * with its own message; nxt_port_mmap_at() below refuses it too.
+     */
+    if (nxt_slow_path(mmaps->size >= NXT_PORT_MMAPS_MAX)) {
+        nxt_alert(task, "too many port mmaps (%uD), limit is %uD",
+                  mmaps->size, NXT_PORT_MMAPS_MAX);
+
+        return NULL;
+    }
 
     mmap_handler = nxt_zalloc(sizeof(nxt_port_mmap_handler_t));
     if (nxt_slow_path(mmap_handler == NULL)) {
@@ -1127,3 +1139,27 @@ nxt_port_broadcast_shm_ack(nxt_task_t *task, nxt_port_t *port, void *data)
 
     nxt_process_use(task, process, -1);
 }
+
+
+#if (NXT_TESTS)
+
+/*
+ * The static growth and creation paths, for
+ * src/test/nxt_port_mmaps_max_test.c.
+ */
+
+nxt_port_mmap_t *
+nxt_port_test_mmap_at(nxt_port_mmaps_t *mmaps, uint32_t i)
+{
+    return nxt_port_mmap_at(mmaps, i);
+}
+
+
+nxt_port_mmap_handler_t *
+nxt_port_test_new_port_mmap(nxt_task_t *task, nxt_port_mmaps_t *mmaps,
+    nxt_int_t n)
+{
+    return nxt_port_new_port_mmap(task, mmaps, n);
+}
+
+#endif
