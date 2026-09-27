@@ -957,6 +957,12 @@ nxt_proto_quit_children(nxt_task_t *task)
 
         port = nxt_process_port_first(process);
 
+        /*
+         * The router stops its own workers before it quits the prototype.
+         * A worker can exit before the prototype handles its SIGCHLD.
+         * The QUIT to that worker then fails with EPIPE.
+         * nxt_socketpair_send_ex() logs this failure at info for a QUIT.
+         */
         nxt_runtime_port_send_quit(task, rt, port);
     }
     nxt_queue_loop;

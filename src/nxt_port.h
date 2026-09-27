@@ -274,6 +274,15 @@ typedef struct {
     nxt_port_msg_t      port_msg;
     uint8_t             close_fd;   /* 1 bit */
     uint8_t             allocated;  /* 1 bit */
+
+    /*
+     * The message is a QUIT, so its peer can have exited already.
+     * A send that fails because the peer is gone is logged at info, not
+     * as an alert.  The flag is local to this process.  It is not on the
+     * wire and not in shared memory.  The flag stays set when the socket
+     * carries only the READ_QUEUE wake-up for a QUIT in the shared queue.
+     */
+    uint8_t             peer_may_be_gone;  /* 1 bit */
 } nxt_port_send_msg_t;
 
 #if (NXT_HAVE_UCRED) || (NXT_HAVE_MSGHDR_CMSGCRED)
@@ -511,6 +520,16 @@ struct nxt_port_s {
     nxt_work_t          rearm_work;
     nxt_atomic_t        rearm_pending;
     nxt_atomic_t        announce;
+
+    /*
+     * A QUIT was sent to this port, so its peer can be gone by now.
+     * Any thread can set the flag in nxt_port_socket_write2().  The flag
+     * is never cleared.  The sender reads it when a send fails.
+     * A READ_QUEUE wake-up can be pending already when the QUIT goes into
+     * the shared queue (notify == 0).  That wake-up wakes the peer for
+     * the QUIT too, so its failure is logged at info like the QUIT's own.
+     */
+    nxt_atomic_t        quit_sent;
 
     /*
      * The pacing of a re-arm that follows a send which failed for want of

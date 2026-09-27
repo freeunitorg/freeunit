@@ -317,6 +317,24 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
     msg.close_fd = (type & NXT_PORT_MSG_CLOSE_FD) != 0;
     msg.allocated = 0;
 
+    /*
+     * Set the flag here, from the type the caller asked for.  The shared
+     * queue branch below can change the socket message into a READ_QUEUE
+     * wake-up, and nxt_port_msg_chk_insert() copies the message.  The flag
+     * is written once, before the message is published under
+     * port->write_mutex.  Only the sender reads it, after that.  So the
+     * flag needs no lock of its own.
+     */
+    msg.peer_may_be_gone = ((type & NXT_PORT_MSG_MASK) == _NXT_PORT_MSG_QUIT);
+
+    /*
+     * Set port->quit_sent before the QUIT can reach the shared queue.
+     * A wake-up that is already pending then covers the QUIT as well.
+     */
+    if (msg.peer_may_be_gone) {
+        (void) nxt_atomic_cmp_set(&port->quit_sent, 0, 1);
+    }
+
     msg.port_msg.stream = stream;
     msg.port_msg.pid = nxt_pid;
     msg.port_msg.reply_port = reply_port;
@@ -328,6 +346,15 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
 
     if (port->queue != NULL && type != _NXT_PORT_MSG_READ_QUEUE) {
 
+        /*
+         * A QUIT goes into the shared queue like any other message.
+         * A worker that is still in nxt_unit_init() holds only one socket
+         * message with no queue marker ("too many port socket messages").
+         * A QUIT on the socket would be a second one.  So the wake-up for
+         * a QUIT is a plain READ_QUEUE.  msg.peer_may_be_gone, set above,
+         * still marks it as a QUIT.  A failed wake-up to a worker that is
+         * gone is then logged at info.
+         */
         if (fd == -1 && nxt_port_can_enqueue_buf(b)) {
             qmsg.pm = msg.port_msg;
 
@@ -1185,7 +1212,9 @@ next_fragment:
         msg->port_msg.last |= sb.last;
         msg->port_msg.mf = sb.limit_reached || sb.nmax_reached;
 
-        n = nxt_socketpair_send(&port->socket, msg->fd, iov, sb.niov + 1);
+        n = nxt_socketpair_send_ex(&port->socket, msg->fd, iov, sb.niov + 1,
+                                   msg->peer_may_be_gone
+                                   || port->quit_sent != 0);
 
         if (n > 0) {
             /*
