@@ -154,6 +154,56 @@ def test_static_accept_ranges():
     assert resp['headers']['Accept-Ranges'] == 'bytes', 'Accept-Ranges on 200'
 
 
+def test_static_range_identity_refused_without_compressor(temp_dir):
+    # A range is served as identity.  With no compressor configured, there
+    # is no other representation to offer a client that refused identity.
+    # So the request is not serveable.  Do not give it the 206 of exactly the
+    # bytes that it refused.  Nothing here configures compression, so this is
+    # the path that skipped the Accept-Encoding parse before.
+    resp = client.get(
+        url='/index.html',
+        headers={
+            'Host': 'localhost',
+            'Connection': 'close',
+            'Accept-Encoding': 'identity;q=0',
+            'Range': 'bytes=0-4',
+        },
+    )
+
+    assert resp['status'] == 406, 'identity is the only available coding'
+    assert 'Content-Range' not in resp['headers']
+
+    # A zero-length file transfers no representation bytes.  So there is
+    # nothing that the client refused, and the file is not negotiated: 200,
+    # and a Range against it keeps its 416.
+    Path(f'{temp_dir}/assets/empty').write_bytes(b'')
+
+    resp = client.get(
+        url='/empty',
+        headers={
+            'Host': 'localhost',
+            'Connection': 'close',
+            'Accept-Encoding': 'identity;q=0',
+        },
+    )
+
+    assert resp['status'] == 200, 'no bytes to refuse'
+    assert resp['body'] == ''
+
+    resp = client.get(
+        url='/empty',
+        headers={
+            'Host': 'localhost',
+            'Connection': 'close',
+            'Accept-Encoding': 'identity;q=0',
+            'Range': 'bytes=0-4',
+        },
+    )
+
+    assert resp['status'] == 416, 'a range against no bytes'
+    assert resp['headers']['Content-Range'] == 'bytes */0'
+
+
 def unit_second(resp):
     """
     The second Unit believes it is in, taken from the response it just sent.

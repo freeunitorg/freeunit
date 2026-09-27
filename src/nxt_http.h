@@ -446,6 +446,7 @@ void nxt_http_request_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_buf_t *out);
 nxt_bool_t nxt_http_request_is_bodyless_final(nxt_http_request_t *r,
     nxt_http_status_t status);
+nxt_bool_t nxt_http_status_no_representation(nxt_http_status_t status);
 nxt_buf_t *nxt_http_buf_mem(nxt_task_t *task, nxt_http_request_t *r,
     size_t size);
 nxt_buf_t *nxt_http_buf_last(nxt_http_request_t *r);

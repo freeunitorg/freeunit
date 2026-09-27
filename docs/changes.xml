@@ -19,6 +19,99 @@ also accepts the configured user, and a peer in the configured group.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a worker that got a QUIT before it was ready did not act on it, and ran until
+it was killed 15 seconds later, so unitd was slow to exit.  The worker now
+exits at once.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+at shutdown, the router could ask a prototype that was already exiting to
+start a new worker.  The prototype then forked a worker that nobody stopped,
+and unitd did not exit.  If the prototype was gone, the router logged a false
+alert.  The prototype now refuses the start, and the router logs a gone
+prototype at the debug level.
+</para>
+</change>
+
+<change>
+<para>
+a QUIT that fails because the worker already exited is now logged at the info
+level, not as an alert.
+</para>
+</change>
+
+<change type="security">
+<para>
+the router and libunit read records from shared memory that the other
+process can still write, without enough checks.  A buffer that was not a whole
+number of records was read past its end.  In libunit, a segment id of
+UINT32_MAX wrapped the size of the segment array, a segment of any size was
+accepted, a duplicate segment id replaced a segment that buffers still used,
+and a field could point before the field array.  The router trusted a busy
+chunk marker that the application can clear.  All of these are now checked.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a keep-alive TLS connection that was idle across a reconfiguration could
+use the TLS settings of the old configuration after they were freed, when it
+was closed.  The connection now keeps the configuration until it is freed.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a read or write that was already queued when a connection was closed could
+run on the closed connection: a write could call a missing error handler, and
+a read could read the closing socket and close the connection again.  Such a
+queued handler now does nothing.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a static file response that failed after the request was closed could close
+the file descriptor twice.  The second close could close a descriptor that
+another connection had got in the meantime.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a proxied request with a chunked body, or an HTTP/2 request without a
+content-length, was sent to the upstream with two Content-Length fields.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+with "limits": {"timeout"} set, a WebSocket session was closed about one
+timeout after the upgrade, because the request deadline stayed armed for every
+frame.  The deadline now stops at the upgrade.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the router crashed when it validated a configuration that gave
+"compressors" in the object form.
+</para>
+</change>
+
+<change type="change">
+<para>
+with telemetry on, the application now gets a traceparent that names
+FreeUnit's own span as its parent, so the application's spans are children of
+FreeUnit's span.  Before, the application got the client's traceparent
+unchanged.
+</para>
+</change>
+
 <change type="security">
 <para>
 an application could write an unexpected value into an entry of a shared
@@ -732,6 +825,11 @@ connection to 10 MB of payload that the application has not received yet
 receive()); a single frame larger than that is still accepted when nothing else
 is waiting.  A fragmented message also left a count behind that lowered the
 limit applied to the next message.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 a byte-range request from a client that refused the identity coding is no
 longer answered with identity bytes.  A range is served as identity, so
 Range together with "Accept-Encoding: identity;q=0" returned a 206 carrying
@@ -741,6 +839,59 @@ unsatisfiable range from such a client is no longer answered with 416 either.
 A request that accepts no coding at all is still 406.  Several Accept-Encoding
 lines in one request are now read as one comma-joined value; previously only the
 first was consulted.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a response that no compressor applies to is no longer sent as identity to a
+client that refused the identity coding.  With a compressor configured,
+"Accept-Encoding: gzip, identity;q=0" was accepted because gzip was
+acceptable.  When the media type of the response was outside "types", or the
+response had no media type, the response was then sent uncompressed: the
+identity bytes that the request had refused.  Such a request now gets 406,
+with a Range header and without one.  A 406 from this negotiation carries
+"Vary: Accept-Encoding".  A 1xx, 204 or 304 response is never negotiated, so
+an application that sends one of these with a Content-Length is not affected.
+A response with no body, and a response that carries its own
+Content-Encoding, are not affected either.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+"*" in Accept-Encoding now stands for each enabled compressor that the client
+did not name.  Before, it stood for the identity coding only.
+"identity;q=0, *;q=1" was answered 406 with gzip enabled and applicable,
+because the wildcard could select only identity, and the same field refused
+identity.  A coding that the field names keeps its own weight.  The wildcard
+does not match it, and the named coding wins a tie: "gzip, *" now sends gzip.
+Before, it sent the response uncompressed.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a compressor below its own min_length is no longer selected before a
+compressor with a lower weight that can be applied.  min_length belongs to
+each compressor.  With gzip at 1000 and deflate at 0, a 100-byte response was
+sent uncompressed, because gzip had the higher weight.  A client that refused
+the identity coding got the same uncompressed bytes.  Such a client now gets
+deflate.  When each compressor that the client accepts is below its
+min_length, the client gets 406 instead of the bytes it refused.
+</para>
+</change>
+
+<change type="change">
+<para>
+a server with no compression configured now answers 406 to a request whose
+Accept-Encoding refuses the identity coding: "identity;q=0", or "*;q=0" with
+no more specific entry for identity.  Identity is the only coding that such a
+server has.  Before, it sent the response, or the requested range of it, in
+the bytes that the client had refused.  To read that refusal, each response
+with a known length above zero now looks at its own Content-Encoding and at
+the request Accept-Encoding.  Before, these checks ran only with a compressor
+configured.
 </para>
 </change>
 
