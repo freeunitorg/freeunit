@@ -1806,12 +1806,12 @@ nxt_router_new_port_check(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
     nxt_port_msg_new_port_t  new_port;
 
-    if (nxt_router_msg_from(task, msg, NXT_PROCESS_MAIN)) {
-        return NULL;
-    }
-
     if (nxt_slow_path(nxt_port_new_port_msg(msg, &new_port) != NXT_OK)) {
         return "short new port message";
+    }
+
+    if (nxt_router_msg_from(task, msg, NXT_PROCESS_MAIN)) {
+        return NULL;
     }
 
     if (nxt_slow_path(new_port.type != NXT_PROCESS_APP)) {
@@ -1858,12 +1858,14 @@ nxt_router_get_port_check(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         return "short get port message";
     }
 
+    if (get_port.pid != nxt_pid) {
+        return "not a router port";
+    }
+
     port = nxt_runtime_port_find(task->thread->runtime, get_port.pid,
                                  get_port.id);
 
-    if (port != NULL
-        && (port->pid != nxt_pid || port->type != NXT_PROCESS_ROUTER))
-    {
+    if (port != NULL && port->type != NXT_PROCESS_ROUTER) {
         return "not a router port";
     }
 

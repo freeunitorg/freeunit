@@ -95,6 +95,7 @@ enum {
     NXT_ROUTER_SENDER_TEST_STREAM,
     NXT_ROUTER_SENDER_TEST_SHORT,
     NXT_ROUTER_SENDER_TEST_FOREIGN_PORT,
+    NXT_ROUTER_SENDER_TEST_FOREIGN_PORT_UNHASHED,
     NXT_ROUTER_SENDER_TEST_REPLY_NOT_APP,
 };
 
@@ -225,6 +226,9 @@ static const nxt_router_sender_test_case_t  nxt_router_sender_test_cases[] = {
       NXT_ROUTER_SENDER_TEST_PROTO, NXT_ROUTER_SENDER_TEST_SHORT },
     { "GET_PORT for the controller port", _NXT_PORT_MSG_GET_PORT,
       NXT_ROUTER_SENDER_TEST_WORKER, NXT_ROUTER_SENDER_TEST_FOREIGN_PORT },
+    { "GET_PORT for an unhashed foreign port", _NXT_PORT_MSG_GET_PORT,
+      NXT_ROUTER_SENDER_TEST_WORKER,
+      NXT_ROUTER_SENDER_TEST_FOREIGN_PORT_UNHASHED },
     { "short GET_PORT", _NXT_PORT_MSG_GET_PORT,
       NXT_ROUTER_SENDER_TEST_WORKER, NXT_ROUTER_SENDER_TEST_SHORT },
     { "GET_MMAP to a port that is not an application port",
@@ -389,6 +393,12 @@ nxt_router_sender_test_change(nxt_router_sender_test_msg_t *m,
         m->body.get_port.pid =
             nxt_router_sender_test_pid(NXT_ROUTER_SENDER_TEST_CONTROLLER);
         m->body.get_port.id = NXT_ROUTER_SENDER_TEST_REPLY_ID;
+        break;
+
+    case NXT_ROUTER_SENDER_TEST_FOREIGN_PORT_UNHASHED:
+        m->body.get_port.pid =
+            nxt_router_sender_test_pid(NXT_ROUTER_SENDER_TEST_CONTROLLER);
+        m->body.get_port.id = 999;
         break;
 
     default:

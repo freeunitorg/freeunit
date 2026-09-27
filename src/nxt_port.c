@@ -565,7 +565,8 @@ nxt_port_send_port(nxt_task_t *task, nxt_port_t *port, nxt_port_t *new_port,
  */
 
 nxt_int_t
-nxt_port_new_port_msg(nxt_port_recv_msg_t *msg, nxt_port_msg_new_port_t *out)
+nxt_port_new_port_msg(const nxt_port_recv_msg_t *msg,
+    nxt_port_msg_new_port_t *out)
 {
     nxt_span_t  span;
 
