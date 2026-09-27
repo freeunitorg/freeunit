@@ -209,6 +209,13 @@ A summary (OK / FAILED) is printed at the end.
 | `ruby-3.4` | ruby:3.4 |
 | `ruby-4.0` | ruby:4.0 |
 
+Dev kits: these are written by hand, layered on a variant above, and not
+built by `build-local.sh` or the release workflow.
+
+| Dev kit | Base image | Docs |
+|---------|-----------|------|
+| `drupal-core-dev-php8.5` | FreeUnit `php-8.5` | [drupal/README.md](drupal/README.md) |
+
 ## Reference build environment
 
 Measured full build (all 23 variants, `./build-local.sh`) on the maintainer's local machine:

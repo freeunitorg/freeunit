@@ -13,6 +13,7 @@ __pycache__/
 /CLAUDE.md
 /.claude/
 /pkg/docker/build-logs/
+/pkg/docker/build-*.args
 /QWEN.md
 /.qwen/
 /qwen/

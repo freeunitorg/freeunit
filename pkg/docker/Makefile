@@ -121,6 +121,33 @@ Dockerfile.%: ../../version template.Dockerfile
 			-e 's,@@MODULE@@,$*,g' \
 			> $@
 
+# Hand-written dev-kit images.  They layer on a published variant instead of
+# building FreeUnit, so they are not generated from template.Dockerfile: the
+# empty rule keeps the Dockerfile.% pattern above from overwriting them, and
+# "clean" leaves them alone, as it does Dockerfile.builder-*.
+# Layer on a local base with e.g.
+#   make build-drupal-core-dev-php8.5 DEVKIT_BASE_drupal-core-dev-php8.5=unit:$(VERSION)-php-8.5
+DEVKITS = drupal-core-dev-php8.5
+DEVKIT_BASE_drupal-core-dev-php8.5 ?= ghcr.io/freeunitorg/freeunit:$(VERSION)-php-8.5
+
+$(addprefix Dockerfile., $(DEVKITS)): ;
+
+# What the image copies in, beyond its Dockerfile.
+build-drupal-core-dev-php8.5: drupal/drupal-dev.sh drupal/unit-drupal.json
+
+# The build arguments, rewritten only when they change, so a new VERSION or
+# DEVKIT_BASE_<kit> rebuilds the image.  "+" runs it under "make -n" too.
+$(addsuffix .args, $(addprefix build-, $(DEVKITS))): build-%.args: FORCE
+	+@echo 'FREEUNIT_VERSION=$(VERSION) BASE_IMAGE=$(DEVKIT_BASE_$*)' > $@.tmp
+	+@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
+
+$(addprefix build-, $(DEVKITS)): build-%: Dockerfile.% build-%.args
+	docker build -t unit:$(VERSION)-$* \
+		--build-arg FREEUNIT_VERSION=$(VERSION) \
+		--build-arg BASE_IMAGE=$(DEVKIT_BASE_$*) \
+		-f Dockerfile.$* .
+	touch $@
+
 build-%: Dockerfile.%
 	docker pull $(CONTAINER_$*)
 	docker build --no-cache -t unit:$(VERSION)-$* -f Dockerfile.$* .
@@ -168,8 +195,11 @@ diff-%:
 all: $(addprefix Dockerfile., $(MODVERSIONS))
 
 clean:
-	rm -f $(filter-out $(wildcard Dockerfile.builder-*), $(wildcard Dockerfile.*))
-	rm -f $(addprefix build-, $(MODVERSIONS))
+	rm -f $(filter-out $(wildcard Dockerfile.builder-*) $(addprefix Dockerfile., $(DEVKITS)), $(wildcard Dockerfile.*))
+	rm -f $(addprefix build-, $(MODVERSIONS) $(DEVKITS))
+	rm -f $(addsuffix .args, $(addprefix build-, $(DEVKITS)))
 	rm -rf build-logs
 
-.PHONY: default build dockerfiles clean
+FORCE:
+
+.PHONY: default build dockerfiles clean FORCE
