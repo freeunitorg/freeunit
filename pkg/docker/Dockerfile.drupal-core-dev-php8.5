@@ -1,0 +1,102 @@
+# FreeUnit Drupal core dev kit, PHP 8.5: pkg/docker/drupal/README.md.
+#
+# Hand-written (the Makefile has an empty rule for it), and layered on the
+# published php-8.5 image rather than building FreeUnit again.
+
+ARG FREEUNIT_VERSION=1.36.1
+ARG BASE_IMAGE=ghcr.io/freeunitorg/freeunit:${FREEUNIT_VERSION}-php-8.5
+
+FROM ${BASE_IMAGE}
+
+ARG FREEUNIT_VERSION=1.36.1
+
+# Xdebug 3.5 is the first series with PHP 8.5 support.
+ARG XDEBUG_VERSION=3.5.0
+ARG COMPOSER_VERSION=2.8.12
+ARG CODER_VERSION=^8.3
+
+LABEL org.opencontainers.image.title="FreeUnit Drupal core dev kit (php-8.5)"
+LABEL org.opencontainers.image.description="FreeUnit + PHP 8.5 with the extensions and tools Drupal core development needs: Composer, drupal/coder, SQLite, Xdebug (off unless XDEBUG=1)."
+LABEL org.opencontainers.image.url="https://freeunit.org"
+LABEL org.opencontainers.image.source="https://github.com/freeunitorg/freeunit"
+LABEL org.opencontainers.image.documentation="https://github.com/freeunitorg/freeunit/blob/master/pkg/docker/drupal/README.md"
+LABEL org.opencontainers.image.vendor="FreeUnit Community <team@freeunit.org>"
+LABEL org.opencontainers.image.version="${FREEUNIT_VERSION}"
+
+# PHP extensions, with the official image's docker-php-ext-* helpers; the
+# build dependencies are removed again the way that image does it.
+RUN set -eux \
+    && savedAptMark="$(apt-mark showmanual)" \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+         $PHPIZE_DEPS \
+         libfreetype-dev libjpeg62-turbo-dev libpng-dev libwebp-dev \
+         libicu-dev libzip-dev libpq-dev \
+    && docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp \
+    && docker-php-ext-install -j"$(nproc)" gd intl zip pdo_mysql pdo_pgsql \
+    && { php -m | grep -qx 'Zend OPcache' || docker-php-ext-install opcache; } \
+    && pecl install "xdebug-${XDEBUG_VERSION}" \
+    && rm -rf /tmp/pear ~/.pearrc \
+    && apt-mark auto '.*' > /dev/null \
+    && apt-mark manual $savedAptMark > /dev/null \
+    && find /usr/local/lib/php/extensions -type f -name '*.so' -exec ldd '{}' ';' \
+         | awk '/=>/ { so = $(NF-1); if (index(so, "/usr/local/") == 1) { next }; gsub("^/(usr/)?", "", so); print so }' \
+         | sort -u \
+         | xargs -r dpkg-query --search \
+         | cut -d: -f1 \
+         | sort -u \
+         | xargs -r apt-mark manual \
+    && apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false \
+    && apt-get install -y --no-install-recommends \
+         git unzip sqlite3 patch less procps openssh-client \
+    && rm -rf /var/lib/apt/lists/* \
+    && for m in gd intl zip pdo_mysql pdo_pgsql pdo_sqlite \
+         dom SimpleXML tokenizer xml xmlwriter; do \
+         php -m | grep -qx "$m" || exit 1; done \
+    && php -d zend_extension=xdebug -m | grep -qx xdebug \
+    && ! php -m | grep -qx xdebug
+
+# Composer, checked against the checksum published next to it.
+# TODO: pin the SHA-256 here; the same-origin checksum only proves the transfer.
+RUN set -eux \
+    && curl -fsSL -o /usr/local/bin/composer \
+         "https://getcomposer.org/download/${COMPOSER_VERSION}/composer.phar" \
+    && echo "$(curl -fsSL "https://getcomposer.org/download/${COMPOSER_VERSION}/composer.phar.sha256sum" | cut -d' ' -f1)  /usr/local/bin/composer" \
+         | sha256sum -c - \
+    && chmod 755 /usr/local/bin/composer \
+    && composer --version
+
+# drupal/coder outside any project, so `lint` works offline.
+RUN set -eux \
+    && mkdir -p /opt/drupal-tools \
+    && cd /opt/drupal-tools \
+    && export COMPOSER_HOME=/tmp/composer-build COMPOSER_ALLOW_SUPERUSER=1 \
+    && composer init --no-interaction --name=freeunit/drupal-tools \
+    && composer config --no-plugins \
+         allow-plugins.dealerdirect/phpcodesniffer-composer-installer true \
+    && composer require --no-interaction --no-progress \
+         "drupal/coder:${CODER_VERSION}" \
+    && vendor/bin/phpcs -i | grep -q Drupal \
+    && rm -rf /tmp/composer-build
+
+COPY drupal/unit-drupal.json /usr/share/unit/drupal/unit-drupal.json
+COPY drupal/drupal-dev.sh /usr/local/bin/drupal-dev.sh
+
+RUN set -eux \
+    && chmod 755 /usr/local/bin/drupal-dev.sh \
+    && mkdir -p /var/www/drupal/web /docker-entrypoint.d \
+    && chown -R www-data:www-data /var/www
+
+ENV DRUPAL_BASE=/var/www/drupal \
+    DRUPAL_DOCROOT=/var/www/drupal/web \
+    SIMPLETEST_BASE_URL=http://localhost \
+    SIMPLETEST_DB=sqlite://localhost//tmp/test.sqlite \
+    PATH=/var/www/drupal/vendor/bin:/var/www/drupal/web/vendor/bin:/opt/drupal-tools/vendor/bin:$PATH
+
+WORKDIR /var/www/drupal
+
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["/usr/local/bin/drupal-dev.sh"]
+EXPOSE 80
+CMD ["serve"]
