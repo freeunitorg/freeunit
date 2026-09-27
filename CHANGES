@@ -9,6 +9,29 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        configurations behave as before. For "absent or not X", use an
        array of objects: [{"Name": null}, {"Name": "!X"}].
 
+    *) Security: an application could write an unexpected value into an
+       entry of a shared memory queue. The router then retried that entry
+       for ever. Each enqueue and dequeue now stops after one queue size
+       of retries. The router refuses the message and writes an alert.
+
+    *) Security: a port kept every fragment of a message until the last
+       one arrived, so a peer process could make it hold memory without
+       limit. A fragment that named a shared memory segment but carried no
+       record also left a receive buffer in the stream while the same
+       buffer was reused for the next read. Reassembly is now limited to
+       64 streams, 128 MiB per stream and 256 MiB per port, a new stream
+       drops the oldest one when 64 are open, and such a fragment is
+       dropped. A port linked without a process no longer crashes a
+       release build when it is freed.
+
+    *) Bugfix: an application used a shared memory segment id from the
+       other process to grow its array of segments without a limit. An id
+       like 100000000 in one message made it allocate and fill an array of
+       that many slots, so the process could run out of memory. It now
+       refuses an id of 65536 or more. The router already refused such ids
+       from applications; it now uses the same limit for the segments it
+       creates.
+
     *) Bugfix: the proxy recognised an upstream Transfer-Encoding only when
        its value was exactly "chunked". "Chunked" or "gzip, chunked" was
        not recognised, so the body was framed by Content-Length or by
@@ -99,6 +122,15 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        for an application process, not only how long a worker may spend on
        it. A request that waited for capacity previously had no deadline at
        all. The default remains no timeout.
+
+    *) Security: the router decoded the response an application returned
+       in shared memory without checking it: the field count was read
+       twice, and the name, value and body offsets were followed without a
+       bounds check. An application could point the router anywhere.
+       libunit read the request from shared memory more than once after
+       checking it. A sibling process of the same application, which maps
+       the same segment, could change a value in between. Both sides now
+       read every value once and check every offset against the buffer.
 
     *) Security: the string form of "access_log" "format" wrote what a
        variable expanded to without escaping it.  "$uri" is the

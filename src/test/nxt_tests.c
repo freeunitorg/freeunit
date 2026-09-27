@@ -72,6 +72,8 @@ nxt_test_in_child(nxt_thread_t *thr, const char *name, int (*fn)(void *),
 
 static nxt_int_t (*const nxt_security_tests[])(nxt_thread_t *) = {
     nxt_checked_test, nxt_port_mmap_read_test,
+    nxt_router_response_parse_test, nxt_port_frag_test,
+    nxt_port_release_test, nxt_nncq_bound_test,
 };
 
 
@@ -261,6 +263,10 @@ main(int argc, char **argv)
     }
 
     if (nxt_port_mmap_range_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_mmaps_max_test(thr) != NXT_OK) {
         return 1;
     }
 

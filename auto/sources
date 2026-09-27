@@ -186,6 +186,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_port_use_unless_zero_test.c \
     src/test/nxt_port_mmap_range_test.c \
     src/test/nxt_port_mmap_read_test.c \
+    src/test/nxt_port_mmaps_max_test.c \
     src/test/nxt_port_ready_test.c \
     src/test/nxt_router_new_port_test.c \
     src/test/nxt_router_start_fail_test.c \
@@ -210,6 +211,10 @@ NXT_TEST_SRCS=" \
     src/test/nxt_checked_test.c \
     src/test/nxt_conn_close_test.c \
     src/test/nxt_router_prepare_msg_test.c \
+    src/test/nxt_router_response_parse_test.c \
+    src/test/nxt_port_frag_test.c \
+    src/test/nxt_port_release_test.c \
+    src/test/nxt_nncq_bound_test.c \
 "
 
 
@@ -356,6 +361,7 @@ NXT_FUZZ_SRCS=" \
     fuzzing/nxt_http_h1p_fuzz.c \
     fuzzing/nxt_http_h1p_peer_fuzz.c \
     fuzzing/nxt_json_fuzz.c \
+    fuzzing/nxt_router_app_response_fuzz.c \
     fuzzing/nxt_unit_msg_fuzz.c \
 "
 

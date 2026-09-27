@@ -231,6 +231,7 @@ static char * nxt_unit_snprint_prefix(char *p, char *end, pid_t pid,
 static void *nxt_unit_lvlhsh_alloc(void *data, size_t size);
 static void nxt_unit_lvlhsh_free(void *data, void *p);
 static int nxt_unit_memcasecmp(const void *p1, const void *p2, size_t length);
+nxt_inline void nxt_unit_shm_copy(void *dst, const void *src, size_t size);
 
 
 /*
@@ -274,6 +275,26 @@ nxt_unit_response_buf_size(uint32_t max_fields_count,
  * parser (src/nxt_router.c) needs the exact same bounds check against a
  * peer-supplied buffer, on the other side of the trust boundary.
  */
+
+
+/*
+ * Copies "size" bytes out of shared memory, each read once through volatile.
+ * For a record whose size is not known before its first bytes are read.
+ */
+
+nxt_inline void
+nxt_unit_shm_copy(void *dst, const void *src, size_t size)
+{
+    u_char                 *d;
+    const volatile u_char  *s;
+
+    d = dst;
+    s = src;
+
+    while (size-- != 0) {
+        *d++ = *s++;
+    }
+}
 
 
 struct nxt_unit_mmap_buf_s {
@@ -1469,9 +1490,10 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
     nxt_unit_request_info_t **preq)
 {
     int                           res;
+    char                          *method, *target, *preread;
     nxt_unit_impl_t               *lib;
     nxt_unit_port_id_t            port_id;
-    nxt_unit_request_t            *r;
+    nxt_unit_request_t            hdr;
     nxt_unit_mmap_buf_t           *b;
     nxt_unit_request_info_t       *req;
     nxt_unit_request_info_impl_t  *req_impl;
@@ -1492,17 +1514,22 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
     }
 
     /*
-     * Validate every sptr in the request struct before any code path
-     * dereferences it.  Offsets originate from the router (a more
-     * privileged peer) but the libunit ABI is also reachable from
-     * attacker-influenced input shapes; keeping the validation
-     * co-located with arrival makes the trust boundary explicit.
+     * The request is in a segment that every process of the application
+     * maps writable: the router wrote it, but a sibling process can change
+     * it at any time.  So every value is read once.  The fixed part and
+     * each field are copied out through volatile, the checks and the uses
+     * take the copies, and every sptr is resolved with
+     * nxt_unit_sptr_in_buf(), which reads the offset once.  The pointers it
+     * returns are the ones used.
      */
     {
         void                *name, *value, *end;
         uint32_t            i;
+        nxt_unit_field_t    uf;
         nxt_unit_request_t  *vr = recv_msg->start;
         uint32_t            vsize = recv_msg->size;
+
+        hdr = *(volatile nxt_unit_request_t *) vr;
 
         /*
          * The fields[] array trails the fixed request struct; its region
@@ -1513,36 +1540,39 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
          * multiplication from overflowing a 32-bit fields_count.
          */
         if (nxt_slow_path(sizeof(nxt_unit_request_t)
-                          + (uint64_t) vr->fields_count
+                          + (uint64_t) hdr.fields_count
                             * sizeof(nxt_unit_field_t)
                           > vsize))
         {
             nxt_unit_warn(ctx, "#%"PRIu32": malformed request: fields_count "
                           "%"PRIu32" exceeds buffer", recv_msg->stream,
-                          vr->fields_count);
+                          hdr.fields_count);
             return NXT_UNIT_ERROR;
         }
 
+        method = nxt_unit_sptr_in_buf(&vr->method, hdr.method_length,
+                                      recv_msg->start, vsize);
+        target = nxt_unit_sptr_in_buf(&vr->target, hdr.target_length,
+                                      recv_msg->start, vsize);
+        preread = nxt_unit_sptr_in_buf(&vr->preread_content, 0,
+                                       recv_msg->start, vsize);
+
         if (nxt_slow_path(
-               !nxt_unit_sptr_in_buf(&vr->method, vr->method_length,
+               method == NULL || target == NULL || preread == NULL
+            || !nxt_unit_sptr_in_buf(&vr->version, hdr.version_length,
                                      recv_msg->start, vsize)
-            || !nxt_unit_sptr_in_buf(&vr->version, vr->version_length,
+            || !nxt_unit_sptr_in_buf(&vr->remote, hdr.remote_length,
                                      recv_msg->start, vsize)
-            || !nxt_unit_sptr_in_buf(&vr->remote, vr->remote_length,
+            || !nxt_unit_sptr_in_buf(&vr->local_addr, hdr.local_addr_length,
                                      recv_msg->start, vsize)
-            || !nxt_unit_sptr_in_buf(&vr->local_addr, vr->local_addr_length,
+            || !nxt_unit_sptr_in_buf(&vr->local_port, hdr.local_port_length,
                                      recv_msg->start, vsize)
-            || !nxt_unit_sptr_in_buf(&vr->local_port, vr->local_port_length,
+            || !nxt_unit_sptr_in_buf(&vr->server_name,
+                                     hdr.server_name_length,
                                      recv_msg->start, vsize)
-            || !nxt_unit_sptr_in_buf(&vr->server_name, vr->server_name_length,
+            || !nxt_unit_sptr_in_buf(&vr->path, hdr.path_length,
                                      recv_msg->start, vsize)
-            || !nxt_unit_sptr_in_buf(&vr->target, vr->target_length,
-                                     recv_msg->start, vsize)
-            || !nxt_unit_sptr_in_buf(&vr->path, vr->path_length,
-                                     recv_msg->start, vsize)
-            || !nxt_unit_sptr_in_buf(&vr->query, vr->query_length,
-                                     recv_msg->start, vsize)
-            || !nxt_unit_sptr_in_buf(&vr->preread_content, 0,
+            || !nxt_unit_sptr_in_buf(&vr->query, hdr.query_length,
                                      recv_msg->start, vsize)))
         {
             nxt_unit_warn(ctx, "#%"PRIu32": malformed request: "
@@ -1554,18 +1584,17 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
          * Field strings must also lie past fields[]: the router puts them
          * there, and nxt_unit_request_group_dup_fields() moves fields one
          * slot on by subtracting sizeof(nxt_unit_field_t) from their
-         * offsets, which a target inside fields[] would underflow.  The
-         * pointers the check returns are used, not the sptr read again:
-         * the peer can change the offset between two reads.
+         * offsets, which a target inside fields[] would underflow.
          */
-        end = &vr->fields[vr->fields_count];
+        end = &vr->fields[hdr.fields_count];
 
-        for (i = 0; i < vr->fields_count; i++) {
-            name = nxt_unit_sptr_in_buf(&vr->fields[i].name,
-                                        vr->fields[i].name_length,
+        for (i = 0; i < hdr.fields_count; i++) {
+            uf = *(volatile nxt_unit_field_t *) &vr->fields[i];
+
+            name = nxt_unit_sptr_in_buf(&vr->fields[i].name, uf.name_length,
                                         recv_msg->start, vsize);
             value = nxt_unit_sptr_in_buf(&vr->fields[i].value,
-                                         vr->fields[i].value_length,
+                                         uf.value_length,
                                          recv_msg->start, vsize);
 
             if (nxt_slow_path(name == NULL || value == NULL
@@ -1586,14 +1615,14 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
          * read.  Reject any that is neither "unset" nor a valid index.
          */
         if (nxt_slow_path(
-               (vr->content_length_field != NXT_UNIT_NONE_FIELD
-                && vr->content_length_field >= vr->fields_count)
-            || (vr->content_type_field != NXT_UNIT_NONE_FIELD
-                && vr->content_type_field >= vr->fields_count)
-            || (vr->cookie_field != NXT_UNIT_NONE_FIELD
-                && vr->cookie_field >= vr->fields_count)
-            || (vr->authorization_field != NXT_UNIT_NONE_FIELD
-                && vr->authorization_field >= vr->fields_count)))
+               (hdr.content_length_field != NXT_UNIT_NONE_FIELD
+                && hdr.content_length_field >= hdr.fields_count)
+            || (hdr.content_type_field != NXT_UNIT_NONE_FIELD
+                && hdr.content_type_field >= hdr.fields_count)
+            || (hdr.cookie_field != NXT_UNIT_NONE_FIELD
+                && hdr.cookie_field >= hdr.fields_count)
+            || (hdr.authorization_field != NXT_UNIT_NONE_FIELD
+                && hdr.authorization_field >= hdr.fields_count)))
         {
             nxt_unit_warn(ctx, "#%"PRIu32": malformed request: cached field "
                           "index out of range", recv_msg->stream);
@@ -1619,12 +1648,11 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
     req->response = NULL;
     req->response_buf = NULL;
 
-    r = req->request;
+    req->content_length = hdr.content_length;
 
-    req->content_length = r->content_length;
-
+    /* The pointer from the check, not the sptr read again. */
     req->content_buf = req->request_buf;
-    req->content_buf->free = nxt_unit_sptr_get(&r->preread_content);
+    req->content_buf->free = preread;
 
     req_impl->stream = recv_msg->stream;
 
@@ -1648,11 +1676,9 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
     req_impl->in_hash = 0;
 
     nxt_unit_debug(ctx, "#%"PRIu32": %.*s %.*s (%d)", recv_msg->stream,
-                   (int) r->method_length,
-                   (char *) nxt_unit_sptr_get(&r->method),
-                   (int) r->target_length,
-                   (char *) nxt_unit_sptr_get(&r->target),
-                   (int) r->content_length);
+                   (int) hdr.method_length, method,
+                   (int) hdr.target_length, target,
+                   (int) hdr.content_length);
 
     nxt_unit_port_id_init(&port_id, recv_msg->pid, recv_msg->reply_port);
 
@@ -1918,8 +1944,9 @@ nxt_unit_send_req_headers_ack(nxt_unit_request_info_t *req)
 static int
 nxt_unit_process_websocket(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg)
 {
-    size_t                           hsize;
+    size_t                           size, hsize;
     nxt_unit_impl_t                  *lib;
+    nxt_websocket_header_t           wsh;
     nxt_unit_mmap_buf_t              *b;
     nxt_unit_callbacks_t             *cb;
     nxt_unit_request_info_t          *req;
@@ -1982,14 +2009,24 @@ nxt_unit_process_websocket(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg)
 
         ws_impl->ws.header = (void *) b->buf.start;
 
-        if (nxt_slow_path((size_t) (b->buf.end - b->buf.start) < 2)) {
+        size = b->buf.end - b->buf.start;
+
+        if (nxt_slow_path(size < 2)) {
             nxt_unit_warn(ctx, "#%"PRIu32": truncated websocket frame header",
                           req_impl->stream);
             nxt_unit_websocket_frame_release(&ws_impl->ws);
             return NXT_UNIT_ERROR;
         }
 
-        hsize = nxt_websocket_frame_header_size(ws_impl->ws.header);
+        /*
+         * The frame is in shared memory a sibling process can write, so the
+         * header is copied out once: the two fixed bytes first, which give
+         * the header size, then the rest.  The length and the mask flag
+         * come from the copy.
+         */
+        nxt_unit_shm_copy(&wsh, b->buf.start, 2);
+
+        hsize = nxt_websocket_frame_header_size(&wsh);
 
         /*
          * Reject truncated frames before reading the extended length /
@@ -1998,21 +2035,24 @@ nxt_unit_process_websocket(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg)
          * otherwise OOB-read b->buf.start + hsize - 4 (mask) and the
          * 8-byte extended length, and break the buffer invariant.
          */
-        if (nxt_slow_path((size_t) (b->buf.end - b->buf.start) < hsize)) {
+        if (nxt_slow_path(size < hsize)) {
             nxt_unit_warn(ctx, "#%"PRIu32": truncated websocket frame: "
                           "hsize %zu > buf size %zu",
-                          req_impl->stream, hsize,
-                          (size_t) (b->buf.end - b->buf.start));
+                          req_impl->stream, hsize, size);
 
             nxt_unit_websocket_frame_release(&ws_impl->ws);
 
             return NXT_UNIT_ERROR;
         }
 
-        ws_impl->ws.payload_len = nxt_websocket_frame_payload_len(
-            ws_impl->ws.header);
+        if (hsize > 2) {
+            nxt_unit_shm_copy(wsh.payload_len_, b->buf.start + 2,
+                              nxt_min(hsize, sizeof(wsh)) - 2);
+        }
 
-        if (ws_impl->ws.header->mask) {
+        ws_impl->ws.payload_len = nxt_websocket_frame_payload_len(&wsh);
+
+        if (wsh.mask) {
             ws_impl->ws.mask = (uint8_t *) b->buf.start + hsize - 4;
 
         } else {
@@ -2267,9 +2307,10 @@ nxt_unit_field_hash(const char *name, size_t name_length)
 void
 nxt_unit_request_group_dup_fields(nxt_unit_request_info_t *req)
 {
-    char                *name;
-    uint32_t            i, j;
-    nxt_unit_field_t    *fields, f;
+    char                *name, *jname;
+    void                *start;
+    uint32_t            i, j, n, size;
+    nxt_unit_field_t    *fields, f, fi, fj;
     nxt_unit_request_t  *r;
 
     static const nxt_str_t  content_length = nxt_string("content-length");
@@ -2281,12 +2322,41 @@ nxt_unit_request_group_dup_fields(nxt_unit_request_info_t *req)
     r = req->request;
     fields = r->fields;
 
-    for (i = 0; i < r->fields_count; i++) {
-        name = nxt_unit_sptr_get(&fields[i].name);
+    /*
+     * The request was checked on arrival, but it is in shared memory a
+     * sibling process can write, and this runs later.  So the count is read
+     * once and checked again, each field is copied out before use, and the
+     * names are resolved with nxt_unit_sptr_in_buf().  A request that does
+     * not pass is left as it is.
+     */
+    start = req->request_buf->start;
+    size = req->request_buf->end - req->request_buf->start;
 
-        switch (fields[i].hash) {
+    n = *(volatile uint32_t *) &r->fields_count;
+
+    if (nxt_slow_path(sizeof(nxt_unit_request_t)
+                      + (uint64_t) n * sizeof(nxt_unit_field_t)
+                      > size))
+    {
+        nxt_unit_req_warn(req, "group_dup_fields: fields_count %"PRIu32
+                          " exceeds buffer", n);
+        return;
+    }
+
+    for (i = 0; i < n; i++) {
+        fi = *(volatile nxt_unit_field_t *) &fields[i];
+
+        name = nxt_unit_sptr_in_buf(&fields[i].name, fi.name_length,
+                                    start, size);
+        if (nxt_slow_path(name == NULL)) {
+            nxt_unit_req_warn(req, "group_dup_fields: field %"PRIu32
+                              " name out of buffer", i);
+            return;
+        }
+
+        switch (fi.hash) {
         case NXT_UNIT_HASH_CONTENT_LENGTH:
-            if (fields[i].name_length == content_length.length
+            if (fi.name_length == content_length.length
                 && nxt_unit_memcasecmp(name, content_length.start,
                                        content_length.length) == 0)
             {
@@ -2296,7 +2366,7 @@ nxt_unit_request_group_dup_fields(nxt_unit_request_info_t *req)
             break;
 
         case NXT_UNIT_HASH_CONTENT_TYPE:
-            if (fields[i].name_length == content_type.length
+            if (fi.name_length == content_type.length
                 && nxt_unit_memcasecmp(name, content_type.start,
                                        content_type.length) == 0)
             {
@@ -2306,7 +2376,7 @@ nxt_unit_request_group_dup_fields(nxt_unit_request_info_t *req)
             break;
 
         case NXT_UNIT_HASH_COOKIE:
-            if (fields[i].name_length == cookie.length
+            if (fi.name_length == cookie.length
                 && nxt_unit_memcasecmp(name, cookie.start,
                                        cookie.length) == 0)
             {
@@ -2316,17 +2386,26 @@ nxt_unit_request_group_dup_fields(nxt_unit_request_info_t *req)
             break;
         }
 
-        for (j = i + 1; j < r->fields_count; j++) {
-            if (fields[i].hash != fields[j].hash
-                || fields[i].name_length != fields[j].name_length
-                || nxt_unit_memcasecmp(name,
-                                       nxt_unit_sptr_get(&fields[j].name),
-                                       fields[j].name_length) != 0)
-            {
+        for (j = i + 1; j < n; j++) {
+            fj = *(volatile nxt_unit_field_t *) &fields[j];
+
+            if (fi.hash != fj.hash || fi.name_length != fj.name_length) {
                 continue;
             }
 
-            f = fields[j];
+            jname = nxt_unit_sptr_in_buf(&fields[j].name, fj.name_length,
+                                         start, size);
+            if (nxt_slow_path(jname == NULL)) {
+                nxt_unit_req_warn(req, "group_dup_fields: field %"PRIu32
+                                  " name out of buffer", j);
+                return;
+            }
+
+            if (nxt_unit_memcasecmp(name, jname, fj.name_length) != 0) {
+                continue;
+            }
+
+            f = fj;
             f.value.offset += (j - (i + 1)) * sizeof(f);
 
             while (j > i + 1) {
@@ -4477,13 +4556,14 @@ nxt_unit_mmap_at(nxt_unit_mmaps_t *mmaps, uint32_t i)
     /*
      * The same guards as nxt_port_mmap_at() on the router side.  "i" is a
      * segment id taken from the peer (an mmap record or a segment header),
-     * and is deliberately not capped: the router allocates its outgoing
-     * segments without a limit.  What has to hold is the arithmetic: a
-     * capacity able to hold slot i is i + 1 elements, which does not fit
-     * uint32_t for i == UINT32_MAX -- "i + 1 > cap" then wraps to 0, skips
-     * the growth, and the element pointer lands 4G elements past the array.
+     * or the next id of an outgoing segment.  Past NXT_PORT_MMAPS_MAX it is
+     * refused before any growth: the array is grown to hold slot i, so an
+     * id like 100000000 would otherwise cost a huge allocation and its
+     * initialisation from one message.  The limit also keeps i + 1 in
+     * uint32_t; for i == UINT32_MAX "i + 1 > cap" wraps to 0, skips the
+     * growth, and the element pointer lands 4G elements past the array.
      */
-    if (nxt_slow_path(i == UINT32_MAX)) {
+    if (nxt_slow_path(i >= NXT_PORT_MMAPS_MAX)) {
         return NULL;
     }
 
@@ -4855,8 +4935,8 @@ nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd)
     /*
      * The segment id lives in memory the sender keeps mapped writable: read
      * it once and use only the copy.  It indexes lib->incoming, which
-     * nxt_unit_mmap_at() grows to fit and which refuses an id whose slot
-     * cannot be represented.
+     * nxt_unit_mmap_at() grows to fit and which refuses an id past
+     * NXT_PORT_MMAPS_MAX.
      */
     id = hdr->id;
 
@@ -5099,9 +5179,8 @@ nxt_unit_check_rbuf_mmap(nxt_unit_ctx_t *ctx, nxt_unit_mmaps_t *mmaps,
  * anything is allocated, instead of its last "record" being read past the
  * end of the message.  Each record is copied out before use, and every
  * field is bounds-checked before it reaches an index or pointer arithmetic:
- * mmap_id by nxt_unit_mmap_at(), which refuses an id whose slot cannot be
- * represented (the id is not capped otherwise -- see there), chunk_id and
- * size by nxt_port_mmap_chunk_range_valid().
+ * mmap_id by nxt_unit_mmap_at(), which refuses an id past NXT_PORT_MMAPS_MAX
+ * (see there), chunk_id and size by nxt_port_mmap_chunk_range_valid().
  */
 
 static int

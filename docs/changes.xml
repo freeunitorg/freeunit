@@ -10,6 +10,39 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="security">
+<para>
+an application could write an unexpected value into an entry of a shared
+memory queue.  The router then retried that entry for ever.  Each enqueue and
+dequeue now stops after one queue size of retries.  The router refuses the
+message and writes an alert.
+</para>
+</change>
+
+<change type="security">
+<para>
+a port kept every fragment of a message until the last one arrived, so a
+peer process could make it hold memory without limit.  A fragment that named
+a shared memory segment but carried no record also left a receive buffer in
+the stream while the same buffer was reused for the next read.  Reassembly
+is now limited to 64 streams, 128 MiB per stream and 256 MiB per port, a new
+stream drops the oldest one when 64 are open, and such a fragment is dropped.
+A port linked without a process no longer crashes a release build when it is
+freed.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+an application used a shared memory segment id from the other process to grow
+its array of segments without a limit.  An id like 100000000 in one message
+made it allocate and fill an array of that many slots, so the process could
+run out of memory.  It now refuses an id of 65536 or more.  The router already
+refused such ids from applications; it now uses the same limit for the
+segments it creates.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 The proxy recognised an upstream Transfer-Encoding only when its value was
@@ -144,6 +177,18 @@ the bug had appeared in 1.29.0.
 application process, not only how long a worker may spend on it.  A request
 that waited for capacity previously had no deadline at all.  The default
 remains no timeout.
+</para>
+</change>
+
+<change type="security">
+<para>
+the router decoded the response an application returned in shared memory
+without checking it: the field count was read twice, and the name, value and
+body offsets were followed without a bounds check.  An application could point
+the router anywhere.  libunit read the request from shared memory more than
+once after checking it.  A sibling process of the same application, which maps
+the same segment, could change a value in between.  Both sides now read every
+value once and check every offset against the buffer.
 </para>
 </change>
 

@@ -76,6 +76,7 @@ nxt_int_t nxt_fd_event_change_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_use_unless_zero_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_mmap_range_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_mmap_read_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_mmaps_max_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_ready_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_new_port_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_start_fail_test(nxt_thread_t *thr);
@@ -100,6 +101,10 @@ nxt_int_t nxt_port_rpc_fd_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_queued_fd_test(nxt_thread_t *thr);
 nxt_int_t nxt_checked_test(nxt_thread_t *thr);
 nxt_int_t nxt_conn_close_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_response_parse_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_frag_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_release_test(nxt_thread_t *thr);
+nxt_int_t nxt_nncq_bound_test(nxt_thread_t *thr);
 nxt_int_t nxt_cgroup_test(nxt_thread_t *thr);
 nxt_int_t nxt_clone_creds_test(nxt_thread_t *thr);
 
