@@ -6,8 +6,6 @@
 #ifndef _NXT_SPAN_H_INCLUDED_
 #define _NXT_SPAN_H_INCLUDED_
 
-#include <nxt_checked.h>
-
 
 /*
  * nxt_span_t is a bounded read cursor over a buffer.  "pos" is the next
@@ -72,13 +70,19 @@ nxt_span_take(nxt_span_t *span, size_t size, const u_char **out)
 /*
  * Copies "size" bytes off the front of the span into "dst".  It fails in
  * the same way as nxt_span_take().  On a short or partial tail, the span
- * and "dst" do not change.
+ * and "dst" do not change.  A copy of 0 bytes always succeeds and does
+ * not touch "dst".  It also does not call memcpy(), because "pos" of an
+ * empty span may be NULL and memcpy(dst, NULL, 0) is undefined.
  */
 
 nxt_inline int
 nxt_span_copy(nxt_span_t *span, void *dst, size_t size)
 {
     const u_char  *src;
+
+    if (size == 0) {
+        return 0;
+    }
 
     if (nxt_span_take(span, size, &src) != 0) {
         return 1;

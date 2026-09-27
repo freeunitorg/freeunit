@@ -75,6 +75,7 @@ nxt_int_t nxt_port_fail_test(nxt_thread_t *thr);
 nxt_int_t nxt_fd_event_change_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_use_unless_zero_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_mmap_range_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_mmap_read_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_ready_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_new_port_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_start_fail_test(nxt_thread_t *thr);

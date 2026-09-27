@@ -45,9 +45,19 @@ nxt_test_in_child(nxt_thread_t *thr, const char *name, int (*fn)(void *),
         _exit(fn(data));
     }
 
-    if (child == -1 || waitpid(child, &status, 0) != child) {
+    if (child == -1) {
         nxt_log_alert(thr->log, "%s: fork() failed %E", name, nxt_errno);
         return -1;
+    }
+
+    /* A signal may interrupt waitpid().  Then it is called again. */
+
+    while (waitpid(child, &status, 0) != child) {
+        if (nxt_errno != NXT_EINTR) {
+            nxt_log_alert(thr->log, "%s: waitpid() failed %E", name,
+                          nxt_errno);
+            return -1;
+        }
     }
 
     if (!WIFEXITED(status)) {
@@ -61,7 +71,7 @@ nxt_test_in_child(nxt_thread_t *thr, const char *name, int (*fn)(void *),
 
 
 static nxt_int_t (*const nxt_security_tests[])(nxt_thread_t *) = {
-    nxt_checked_test,
+    nxt_checked_test, nxt_port_mmap_read_test,
 };
 
 

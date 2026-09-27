@@ -10,6 +10,22 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="bugfix">
+<para>
+The proxy recognised an upstream Transfer-Encoding only when its value was
+exactly "chunked".  "Chunked" or "gzip, chunked" was not recognised, so the
+body was framed by Content-Length or by connection close, and the chunk
+framing reached the client as body bytes.  The value is now parsed as a list
+of codings, and coding names are compared without case.  One "chunked" is
+decoded.  Any other transfer coding, and chunked together with
+Content-Length, fails the request with 502: the proxy cannot decode such a
+body, and it never forwards Transfer-Encoding to the client.  A response to
+HEAD, and any 204 or 304, is exempt from both 502s: it ends at the first empty
+line, so no Transfer-Encoding frames it.  Before, such a response gave 502 when
+it carried chunked together with Content-Length.
+</para>
+</change>
+
 <change type="feature">
 <para>
 a "match" rule can require that a header, cookie or argument is absent.  In
