@@ -1,0 +1,67 @@
+# Hot functions tracked for disassembly diffing (O3).
+#
+# nxt_port_queue_send/recv, nxt_app_queue_send/recv/cancel and the
+# nxt_nncq/nxt_app_nncq enqueue/dequeue routines are `static inline` in
+# their headers (and several of their direct callers below are `static`
+# with a single call site, so gcc/clang fold them away too), so we track
+# the smallest surviving caller each one gets inlined into instead. Every
+# name below was checked with `nm build*/src/*.o` to make sure it still
+# has its own symbol at -O2 with this toolchain; re-verify after touching
+# these call chains.
+#
+# One symbol per line. Blank lines and '#' comments are ignored.
+# unitd (router/main process) symbols:
+
+# nxt_port_queue_send() call site (src/nxt_port_queue.h)
+nxt_port_socket_write2
+
+# nxt_port_queue_recv() call sites
+nxt_port_queue_read_handler
+nxt_port_read_handler
+
+# nxt_app_queue_send()/nxt_app_queue_cancel() call sites, inlined into
+# the router's HTTP request dispatch path (src/nxt_router.c)
+nxt_router_process_http_request
+
+# mmap chunk allocator and buffer path, hot on every IPC message that
+# carries a body (src/nxt_port_memory.c); nxt_port_mmap_get_free_chunk
+# and nxt_port_mmap_get are both inlined into this one at -O2
+nxt_port_mmap_get_buf
+nxt_port_mmap_get_method
+
+# router/main message read and dispatch hot path (src/nxt_port_socket.c)
+nxt_port_read_msg_process
+nxt_port_msg_insert_tail
+
+# libunit (application side) symbols -- present in build*/lib/libunit.a
+# and build*/unit_app_test:
+
+# nxt_port_queue_send()/recv() call sites (src/nxt_unit.c)
+nxt_unit_port_send
+nxt_unit_port_queue_recv
+
+# nxt_app_queue_recv()/nxt_app_queue_cancel() call site
+nxt_unit_app_queue_recv
+
+# app-side message dispatch hot path
+nxt_unit_process_port_msg
+
+# app-side mmap chunk allocator (mirrors nxt_port_mmap_get_buf above)
+nxt_unit_mmap_buf_get
+nxt_unit_mmap_buf_send
+
+# tools/perf/harness/mca_harness.c: noinline wrappers around the same
+# header-only inline functions above, giving each one its own stable
+# symbol instead of only the inlined-into-caller view. Compiled fresh
+# by disasm-diff.sh every run with the build's own CC/CFLAGS, so these
+# always exist (no "inlined away, renamed, or optimized out" warnings).
+mca_port_queue_send
+mca_port_queue_recv
+mca_app_queue_send
+mca_app_queue_recv
+mca_app_queue_cancel
+mca_nncq_dequeue
+mca_nncq_enqueue
+mca_app_nncq_dequeue
+mca_app_nncq_enqueue
+mca_port_mmap_get_free_chunk

@@ -1,0 +1,239 @@
+### nxt_nncq_t (shm)
+typedef struct {
+	nxt_nncq_atomic_t          head;                 /*     0     4 */
+	nxt_nncq_atomic_t          entries[16384];       /*     4 65536 */
+	/* --- cacheline 1024 boundary (65536 bytes) was 4 bytes ago --- */
+	nxt_nncq_atomic_t          tail;                 /* 65540     4 */
+
+	/* size: 65544, cachelines: 1025, members: 3 */
+	/* last cacheline: 8 bytes */
+} nxt_nncq_t;
+
+
+### nxt_app_nncq_t (shm)
+typedef struct {
+	nxt_app_nncq_atomic_t      head;                 /*     0     4 */
+	nxt_app_nncq_atomic_t      entries[131072];      /*     4 524288 */
+	/* --- cacheline 8192 boundary (524288 bytes) was 4 bytes ago --- */
+	nxt_app_nncq_atomic_t      tail;                 /* 524292     4 */
+
+	/* size: 524296, cachelines: 8193, members: 3 */
+	/* last cacheline: 8 bytes */
+} nxt_app_nncq_t;
+
+
+### nxt_port_queue_t (shm)
+typedef struct {
+	nxt_nncq_atomic_t          nitems;               /*     0     4 */
+	nxt_nncq_t                 free_items;           /*     4 65544 */
+	/* --- cacheline 1024 boundary (65536 bytes) was 12 bytes ago --- */
+	nxt_nncq_t                 queue;                /* 65548 65544 */
+	/* --- cacheline 2048 boundary (131072 bytes) was 20 bytes ago --- */
+	nxt_port_queue_item_t      items[16384];         /* 131092 524288 */
+
+	/* size: 655380, cachelines: 10241, members: 4 */
+	/* last cacheline: 20 bytes */
+} nxt_port_queue_t;
+
+
+### nxt_app_queue_t (shm)
+typedef struct {
+	nxt_app_nncq_atomic_t      notified;             /*     0     4 */
+	nxt_app_nncq_t             free_items;           /*     4 524296 */
+	/* --- cacheline 8192 boundary (524288 bytes) was 12 bytes ago --- */
+	nxt_app_nncq_t             queue;                /* 524300 524296 */
+	/* --- cacheline 16384 boundary (1048576 bytes) was 20 bytes ago --- */
+	nxt_app_queue_item_t       items[131072];        /* 1048596 4718592 */
+
+	/* size: 5767188, cachelines: 90113, members: 4 */
+	/* last cacheline: 20 bytes */
+} nxt_app_queue_t;
+
+
+### nxt_port_queue_item_t (shm)
+typedef struct {
+	uint8_t                    size;                 /*     0     1 */
+	uint8_t                    data[31];             /*     1    31 */
+
+	/* size: 32, cachelines: 1, members: 2 */
+	/* last cacheline: 32 bytes */
+} nxt_port_queue_item_t;
+
+
+### nxt_app_queue_item_t (shm)
+typedef struct {
+	uint8_t                    size;                 /*     0     1 */
+	uint8_t                    data[31];             /*     1    31 */
+	uint32_t                   tracking;             /*    32     4 */
+
+	/* size: 36, cachelines: 1, members: 3 */
+	/* last cacheline: 36 bytes */
+} nxt_app_queue_item_t;
+
+
+### nxt_port_mmap_header_s (shm)
+struct nxt_port_mmap_header_s {
+	uint32_t                   id;                   /*     0     4 */
+	nxt_pid_t                  src_pid;              /*     4     4 */
+	nxt_pid_t                  dst_pid;              /*     8     4 */
+	nxt_port_id_t              sent_over;            /*    12     2 */
+
+	/* XXX 2 bytes hole, try to pack */
+
+	nxt_atomic_t               oosm;                 /*    16     8 */
+	nxt_free_map_t             free_map[10];         /*    24    80 */
+	/* --- cacheline 1 boundary (64 bytes) was 40 bytes ago --- */
+	nxt_free_map_t             free_map_padding;     /*   104     8 */
+	nxt_free_map_t             legacy_tracking_window[11]; /*   112    88 */
+
+	/* size: 200, cachelines: 4, members: 8 */
+	/* sum members: 198, holes: 1, sum holes: 2 */
+	/* last cacheline: 8 bytes */
+};
+
+
+### nxt_unit_request_s (shm)
+struct nxt_unit_request_s {
+	uint8_t                    method_length;        /*     0     1 */
+	uint8_t                    version_length;       /*     1     1 */
+	uint8_t                    remote_length;        /*     2     1 */
+	uint8_t                    local_addr_length;    /*     3     1 */
+	uint8_t                    local_port_length;    /*     4     1 */
+	uint8_t                    tls;                  /*     5     1 */
+	uint8_t                    websocket_handshake;  /*     6     1 */
+	uint8_t                    app_target;           /*     7     1 */
+	uint32_t                   server_name_length;   /*     8     4 */
+	uint32_t                   target_length;        /*    12     4 */
+	uint32_t                   path_length;          /*    16     4 */
+	uint32_t                   query_length;         /*    20     4 */
+	uint32_t                   fields_count;         /*    24     4 */
+	uint32_t                   content_length_field; /*    28     4 */
+	uint32_t                   content_type_field;   /*    32     4 */
+	uint32_t                   cookie_field;         /*    36     4 */
+	uint32_t                   authorization_field;  /*    40     4 */
+
+	/* XXX 4 bytes hole, try to pack */
+
+	uint64_t                   content_length;       /*    48     8 */
+	nxt_unit_sptr_t            method;               /*    56     4 */
+	nxt_unit_sptr_t            version;              /*    60     4 */
+	/* --- cacheline 1 boundary (64 bytes) --- */
+	nxt_unit_sptr_t            remote;               /*    64     4 */
+	nxt_unit_sptr_t            local_addr;           /*    68     4 */
+	nxt_unit_sptr_t            local_port;           /*    72     4 */
+	nxt_unit_sptr_t            server_name;          /*    76     4 */
+	nxt_unit_sptr_t            target;               /*    80     4 */
+	nxt_unit_sptr_t            path;                 /*    84     4 */
+	nxt_unit_sptr_t            query;                /*    88     4 */
+	nxt_unit_sptr_t            preread_content;      /*    92     4 */
+	nxt_unit_field_t           fields[];             /*    96     0 */
+
+	/* size: 96, cachelines: 2, members: 29 */
+	/* sum members: 92, holes: 1, sum holes: 4 */
+	/* last cacheline: 32 bytes */
+};
+
+
+### nxt_port_s (local)
+struct nxt_port_s {
+	nxt_fd_event_t             socket;               /*     0    80 */
+	/* --- cacheline 1 boundary (64 bytes) was 16 bytes ago --- */
+	nxt_queue_link_t           link;                 /*    80    16 */
+	nxt_process_t *            process;              /*    96     8 */
+	nxt_queue_link_t           app_link;             /*   104    16 */
+	nxt_app_t *                app;                  /*   120     8 */
+	/* --- cacheline 2 boundary (128 bytes) --- */
+	nxt_port_t *               main_app_port;        /*   128     8 */
+	nxt_queue_link_t           idle_link;            /*   136    16 */
+	nxt_msec_t                 idle_start;           /*   152     4 */
+
+	/* XXX 4 bytes hole, try to pack */
+
+	nxt_queue_t                messages;             /*   160    16 */
+	nxt_thread_mutex_t         write_mutex;          /*   176    40 */
+	/* --- cacheline 3 boundary (192 bytes) was 24 bytes ago --- */
+	uint32_t                   max_size;             /*   216     4 */
+	uint32_t                   max_share;            /*   220     4 */
+	uint32_t                   active_websockets;    /*   224     4 */
+	uint8_t                    detached;             /*   228     1 */
+	uint8_t                    detached_app;         /*   229     1 */
+
+	/* XXX 2 bytes hole, try to pack */
+
+	uint32_t                   detached_router;      /*   232     4 */
+	uint32_t                   active_requests;      /*   236     4 */
+	nxt_port_handler_t         handler;              /*   240     8 */
+	nxt_port_handler_t *       data;                 /*   248     8 */
+	/* --- cacheline 4 boundary (256 bytes) --- */
+	nxt_mp_t *                 mem_pool;             /*   256     8 */
+	nxt_event_engine_t *       engine;               /*   264     8 */
+	nxt_work_t                 release_work;         /*   272    40 */
+	nxt_work_t                 rearm_work;           /*   312    40 */
+	/* --- cacheline 5 boundary (320 bytes) was 32 bytes ago --- */
+	nxt_atomic_t               rearm_pending;        /*   352     8 */
+	nxt_atomic_t               announce;             /*   360     8 */
+	nxt_buf_t *                free_bufs;            /*   368     8 */
+	nxt_socket_t               pair[2];              /*   376     8 */
+	/* --- cacheline 6 boundary (384 bytes) --- */
+	nxt_port_id_t              id;                   /*   384     2 */
+
+	/* XXX 2 bytes hole, try to pack */
+
+	nxt_pid_t                  pid;                  /*   388     4 */
+	nxt_lvlhsh_t               rpc_streams;          /*   392     8 */
+	nxt_lvlhsh_t               rpc_peers;            /*   400     8 */
+	nxt_lvlhsh_t               frags;                /*   408     8 */
+	uint32_t                   frag_streams;         /*   416     4 */
+	uint32_t                   frag_size;            /*   420     4 */
+	nxt_atomic_t               use_count;            /*   424     8 */
+	nxt_process_type_t         type;                 /*   432     4 */
+	nxt_fd_t                   queue_fd;             /*   436     4 */
+	void *                     queue;                /*   440     8 */
+	/* --- cacheline 7 boundary (448 bytes) --- */
+	void *                     socket_msg;           /*   448     8 */
+	int                        from_socket;          /*   456     4 */
+
+	/* size: 464, cachelines: 8, members: 40 */
+	/* sum members: 452, holes: 3, sum holes: 8 */
+	/* padding: 4 */
+	/* last cacheline: 16 bytes */
+};
+
+
+### nxt_unit_ctx_impl_s (local)
+struct nxt_unit_ctx_impl_s {
+	nxt_unit_ctx_t             ctx;                  /*     0    16 */
+	nxt_atomic_t               use_count;            /*    16     8 */
+	nxt_atomic_t               wait_items;           /*    24     8 */
+	pthread_mutex_t            mutex;                /*    32    40 */
+	/* --- cacheline 1 boundary (64 bytes) was 8 bytes ago --- */
+	nxt_unit_port_t *          read_port;            /*    72     8 */
+	nxt_queue_link_t           link;                 /*    80    16 */
+	nxt_unit_mmap_buf_t *      free_buf;             /*    96     8 */
+	nxt_queue_t                free_req;             /*   104    16 */
+	nxt_queue_t                free_ws;              /*   120    16 */
+	/* --- cacheline 2 boundary (128 bytes) was 8 bytes ago --- */
+	nxt_queue_t                active_req;           /*   136    16 */
+	nxt_lvlhsh_t               requests;             /*   152     8 */
+	nxt_queue_t                ready_req;            /*   160    16 */
+	nxt_queue_t                pending_rbuf;         /*   176    16 */
+	/* --- cacheline 3 boundary (192 bytes) --- */
+	nxt_queue_t                free_rbuf;            /*   192    16 */
+	uint8_t                    online;               /*   208     1 */
+	uint8_t                    ready;                /*   209     1 */
+	uint8_t                    quit_param;           /*   210     1 */
+	uint8_t                    detached;             /*   211     1 */
+	uint8_t                    detached_retries;     /*   212     1 */
+	uint8_t                    detached_unreported;  /*   213     1 */
+
+	/* XXX 2 bytes hole, try to pack */
+
+	nxt_unit_mmap_buf_t        ctx_buf[2];           /*   216   160 */
+	/* --- cacheline 5 boundary (320 bytes) was 56 bytes ago --- */
+	nxt_unit_read_buf_t        ctx_read_buf;         /*   376 16488 */
+	/* --- cacheline 263 boundary (16832 bytes) was 32 bytes ago --- */
+	nxt_unit_request_info_impl_t req;                /* 16864   160 */
+
+	/* size: 17024, cachelines: 266, members: 23 */
+	/* sum members: 17022, holes: 1, sum holes: 2 */
+};
