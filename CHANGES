@@ -1,11 +1,68 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Security: the router and libunit read records from shared memory
+       that the other process can still write, without enough checks. A
+       buffer that was not a whole number of records was read past its
+       end. In libunit, a segment id of UINT32_MAX wrapped the size of the
+       segment array, a segment of any size was accepted, a duplicate
+       segment id replaced a segment that buffers still used, and a field
+       could point before the field array. The router trusted a busy chunk
+       marker that the application can clear. All of these are now
+       checked.
+
+    *) Bugfix: a keep-alive TLS connection that was idle across a
+       reconfiguration could use the TLS settings of the old configuration
+       after they were freed, when it was closed. The connection now keeps
+       the configuration until it is freed.
+
+    *) Bugfix: a read or write that was already queued when a connection
+       was closed could run on the closed connection: a write could call a
+       missing error handler, and a read could read the closing socket and
+       close the connection again. Such a queued handler now does
+       nothing.
+
+    *) Bugfix: a static file response that failed after the request was
+       closed could close the file descriptor twice. The second close could
+       close a descriptor that another connection had got in the
+       meantime.
+
+    *) Bugfix: a proxied request with a chunked body, or an HTTP/2 request
+       without a content-length, was sent to the upstream with two
+       Content-Length fields.
+
+    *) Bugfix: with "limits": {"timeout"} set, a WebSocket session was
+       closed about one timeout after the upgrade, because the request
+       deadline stayed armed for every frame. The deadline now stops at the
+       upgrade.
+
+    *) Bugfix: the router crashed when it validated a configuration that
+       gave "compressors" in the object form.
+
+    *) Change: with telemetry on, the application now gets a traceparent
+       that names FreeUnit's own span as its parent, so the application's
+       spans are children of FreeUnit's span. Before, the application got
+       the client's traceparent unchanged.
+
     *) Bugfix: when unitd ran as root and the control socket was given to
        another user or group with --control-user or --control-group, that
        user passed the socket file permissions but the controller then
        closed the connection. The controller now also accepts the
        configured user, and a peer in the configured group.
+
+    *) Bugfix: a worker that got a QUIT before it was ready did not act on
+       it, and ran until it was killed 15 seconds later, so unitd was slow
+       to exit. The worker now exits at once.
+
+    *) Bugfix: at shutdown, the router could ask a prototype that was
+       already exiting to start a new worker. The prototype then forked a
+       worker that nobody stopped, and unitd did not exit. If the
+       prototype was gone, the router logged a false alert. The prototype
+       now refuses the start, and the router logs a gone prototype at the
+       debug level.
+
+    *) Change: a QUIT that fails because the worker already exited is now
+       logged at the info level, not as an alert.
 
     *) Security: an application could write an unexpected value into an
        entry of a shared memory queue. The router then retried that entry
