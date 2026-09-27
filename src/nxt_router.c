@@ -216,19 +216,13 @@ static nxt_int_t nxt_router_start_app_process(nxt_task_t *task, nxt_app_t *app);
 
 static nxt_bool_t nxt_router_msg_from(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, nxt_process_type_t type);
-static nxt_bool_t nxt_router_msg_sender_is(nxt_task_t *task,
-    nxt_port_recv_msg_t *msg, nxt_process_type_t type);
-static nxt_bool_t nxt_router_msg_sender_is_proto(nxt_task_t *task,
+static nxt_bool_t nxt_router_msg_from_proto(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static nxt_bool_t nxt_router_msg_sender_ok(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static void nxt_router_msg_sender_refuse(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
-static void nxt_router_main_only(nxt_task_t *task, nxt_port_recv_msg_t *msg,
-    nxt_port_handler_t handler);
-static void nxt_router_quit_handler(nxt_task_t *task,
-    nxt_port_recv_msg_t *msg);
-static void nxt_router_change_file_handler(nxt_task_t *task,
-    nxt_port_recv_msg_t *msg);
-static void nxt_router_access_log_handler(nxt_task_t *task,
+static void nxt_router_gate_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static void nxt_router_conf_data_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
@@ -451,18 +445,70 @@ static const nxt_str_t  *nxt_app_msg_prefix[] = {
 };
 
 
+/*
+ * Each application process has the write end of the main port of the
+ * router, and the sender sets the message type.  Thus the router accepts
+ * a control message only from its normal sender.  This table lists the
+ * gated types.  nxt_router_process_port_handlers points each of them to
+ * nxt_router_gate_handler(), which checks the sender of the row and then
+ * runs the handler of the row.  To gate one more type, add its row here
+ * and point its slot to nxt_router_gate_handler().
+ *
+ * The main port of the router has no shared memory queue.  Thus each
+ * message comes through the socket, and the kernel gives the pid of the
+ * sender (SCM_CREDENTIALS).  Without SCM_CREDENTIALS, the pid comes from
+ * the message header, which the sender sets.
+ *
+ * The check is only as good as rt->port_by_type[].  NEW_PORT sets that
+ * slot from the message, and the router does not check its sender yet.
+ * Thus an application can first send a NEW_PORT with type MAIN and its
+ * own pid.  The NEW_PORT step of #341 closes this.
+ */
+
+typedef enum {
+    NXT_ROUTER_SENDER_NONE = 0,
+    NXT_ROUTER_SENDER_MAIN,
+    NXT_ROUTER_SENDER_CONTROLLER,
+    NXT_ROUTER_SENDER_MAIN_OR_PROTO,
+} nxt_router_sender_t;
+
+
+typedef struct {
+    nxt_router_sender_t  sender;
+    nxt_port_handler_t   handler;
+} nxt_router_gate_t;
+
+
+static const nxt_router_gate_t  nxt_router_gates[NXT_PORT_MSG_MAX] = {
+    [_NXT_PORT_MSG_QUIT] =
+        { NXT_ROUTER_SENDER_MAIN, nxt_signal_quit_handler },
+    [_NXT_PORT_MSG_CHANGE_FILE] =
+        { NXT_ROUTER_SENDER_MAIN, nxt_port_change_log_file_handler },
+    [_NXT_PORT_MSG_ACCESS_LOG] =
+        { NXT_ROUTER_SENDER_MAIN, nxt_router_access_log_reopen_handler },
+    [_NXT_PORT_MSG_REMOVE_PID] =
+        { NXT_ROUTER_SENDER_MAIN_OR_PROTO, nxt_router_remove_pid_handler },
+    [_NXT_PORT_MSG_DATA] =
+        { NXT_ROUTER_SENDER_CONTROLLER, nxt_router_conf_data_handler },
+    [_NXT_PORT_MSG_APP_RESTART] =
+        { NXT_ROUTER_SENDER_CONTROLLER, nxt_router_app_restart_handler },
+    [_NXT_PORT_MSG_STATUS] =
+        { NXT_ROUTER_SENDER_CONTROLLER, nxt_router_status_handler },
+};
+
+
 static const nxt_port_handlers_t  nxt_router_process_port_handlers = {
-    .quit         = nxt_router_quit_handler,
+    .quit         = nxt_router_gate_handler,
     .new_port     = nxt_router_new_port_handler,
     .get_port     = nxt_router_get_port_handler,
-    .change_file  = nxt_router_change_file_handler,
+    .change_file  = nxt_router_gate_handler,
     .mmap         = nxt_port_mmap_handler,
     .get_mmap     = nxt_router_get_mmap_handler,
-    .data         = nxt_router_conf_data_handler,
-    .app_restart  = nxt_router_app_restart_handler,
-    .status       = nxt_router_status_handler,
-    .remove_pid   = nxt_router_remove_pid_handler,
-    .access_log   = nxt_router_access_log_handler,
+    .data         = nxt_router_gate_handler,
+    .app_restart  = nxt_router_gate_handler,
+    .status       = nxt_router_gate_handler,
+    .remove_pid   = nxt_router_gate_handler,
+    .access_log   = nxt_router_gate_handler,
     .rpc_ready    = nxt_port_rpc_handler,
     .rpc_error    = nxt_port_rpc_handler,
     .oosm         = nxt_router_oosm_handler,
@@ -1550,29 +1596,7 @@ nxt_router_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 }
 
 
-/*
- * Each application process has the write end of the main port of the
- * router, and the sender sets the message type.  Thus the router accepts
- * these control messages only from their normal sender:
- *
- *   - QUIT, CHANGE_FILE and ACCESS_LOG: main.
- *   - REMOVE_PID: main or a prototype.
- *   - DATA, APP_RESTART and STATUS: the controller.
- *
- * The main port of the router has no shared memory queue.  Thus each
- * message comes through the socket, and the kernel gives the pid of the
- * sender (SCM_CREDENTIALS).  Without SCM_CREDENTIALS, the pid comes from
- * the message header, which the sender sets.
- *
- * The router reads the ports from rt->port_by_type[] at message time,
- * because a restarted router gets them again through NEW_PORT.  A NULL
- * port refuses the message.
- *
- * The check is only as good as rt->port_by_type[].  NEW_PORT sets that
- * slot from the message, and the router does not check its sender yet.
- * Thus an application can first send a NEW_PORT with type MAIN and its
- * own pid.  The NEW_PORT step of #341 closes this.
- */
+/* The sender pid against the port of the process type; see the gate table. */
 
 static nxt_bool_t
 nxt_router_msg_from(nxt_task_t *task, nxt_port_recv_msg_t *msg,
@@ -1580,23 +1604,14 @@ nxt_router_msg_from(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 {
     nxt_port_t  *port;
 
+    /*
+     * Read at message time, because a restarted router gets the ports
+     * again through NEW_PORT.  A NULL port refuses the message.
+     */
+
     port = task->thread->runtime->port_by_type[type];
 
     return (port != NULL && nxt_recv_msg_cmsg_pid(msg) == port->pid);
-}
-
-
-static nxt_bool_t
-nxt_router_msg_sender_is(nxt_task_t *task, nxt_port_recv_msg_t *msg,
-    nxt_process_type_t type)
-{
-    if (nxt_fast_path(nxt_router_msg_from(task, msg, type))) {
-        return 1;
-    }
-
-    nxt_router_msg_sender_refuse(task, msg);
-
-    return 0;
 }
 
 
@@ -1608,26 +1623,55 @@ nxt_router_msg_sender_is(nxt_task_t *task, nxt_port_recv_msg_t *msg,
  */
 
 static nxt_bool_t
-nxt_router_msg_sender_is_proto(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+nxt_router_msg_from_proto(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
     nxt_bool_t     proto;
     nxt_process_t  *process;
 
-    if (nxt_router_msg_from(task, msg, NXT_PROCESS_MAIN)) {
-        return 1;
-    }
-
     process = nxt_runtime_process_ref(task->thread->runtime,
                                       nxt_recv_msg_cmsg_pid(msg));
+    if (process == NULL) {
+        return 0;
+    }
 
-    if (process != NULL) {
-        proto = (nxt_process_type(process) == NXT_PROCESS_PROTOTYPE);
+    proto = (nxt_process_type(process) == NXT_PROCESS_PROTOTYPE);
 
-        nxt_process_use(task, process, -1);
+    nxt_process_use(task, process, -1);
 
-        if (proto) {
-            return 1;
-        }
+    return proto;
+}
+
+
+static nxt_bool_t
+nxt_router_msg_sender_ok(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_bool_t  ok;
+
+    /* nxt_port_handler() dispatches only a type below NXT_PORT_MSG_MAX. */
+
+    switch (nxt_router_gates[msg->port_msg.type].sender) {
+
+    case NXT_ROUTER_SENDER_MAIN:
+        ok = nxt_router_msg_from(task, msg, NXT_PROCESS_MAIN);
+        break;
+
+    case NXT_ROUTER_SENDER_CONTROLLER:
+        ok = nxt_router_msg_from(task, msg, NXT_PROCESS_CONTROLLER);
+        break;
+
+    case NXT_ROUTER_SENDER_MAIN_OR_PROTO:
+        ok = nxt_router_msg_from(task, msg, NXT_PROCESS_MAIN)
+             || nxt_router_msg_from_proto(task, msg);
+        break;
+
+    default:
+        /* A type without a row has no sender that passes. */
+        ok = 0;
+        break;
+    }
+
+    if (nxt_fast_path(ok)) {
+        return 1;
     }
 
     nxt_router_msg_sender_refuse(task, msg);
@@ -1656,36 +1700,12 @@ nxt_router_msg_sender_refuse(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 }
 
 
-/* Other processes share these handlers, so the router table gets wrappers. */
-
 static void
-nxt_router_main_only(nxt_task_t *task, nxt_port_recv_msg_t *msg,
-    nxt_port_handler_t handler)
+nxt_router_gate_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
-    if (nxt_fast_path(nxt_router_msg_sender_is(task, msg, NXT_PROCESS_MAIN))) {
-        handler(task, msg);
+    if (nxt_fast_path(nxt_router_msg_sender_ok(task, msg))) {
+        nxt_router_gates[msg->port_msg.type].handler(task, msg);
     }
-}
-
-
-static void
-nxt_router_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
-{
-    nxt_router_main_only(task, msg, nxt_signal_quit_handler);
-}
-
-
-static void
-nxt_router_change_file_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
-{
-    nxt_router_main_only(task, msg, nxt_port_change_log_file_handler);
-}
-
-
-static void
-nxt_router_access_log_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
-{
-    nxt_router_main_only(task, msg, nxt_router_access_log_reopen_handler);
 }
 
 
@@ -1697,14 +1717,9 @@ nxt_uint_t  nxt_router_test_senders_refused;
 
 
 nxt_bool_t
-nxt_router_test_msg_sender_is(nxt_task_t *task, nxt_port_recv_msg_t *msg,
-    nxt_process_type_t type)
+nxt_router_test_msg_sender_ok(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
-    if (type == NXT_PROCESS_PROTOTYPE) {
-        return nxt_router_msg_sender_is_proto(task, msg);
-    }
-
-    return nxt_router_msg_sender_is(task, msg, type);
+    return nxt_router_msg_sender_ok(task, msg);
 }
 
 #endif
@@ -1718,12 +1733,6 @@ nxt_router_conf_data_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_int_t               ret;
     nxt_port_t              *port;
     nxt_router_temp_conf_t  *tmcf;
-
-    if (nxt_slow_path(!nxt_router_msg_sender_is(task, msg,
-                                                NXT_PROCESS_CONTROLLER)))
-    {
-        return;
-    }
 
     port = nxt_runtime_port_find(task->thread->runtime,
                                  msg->port_msg.pid,
@@ -1821,12 +1830,6 @@ nxt_router_app_restart_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_port_t           *reply_port, *shared_port, *old_shared_port;
     nxt_port_t           *proto_port;
     nxt_port_msg_type_t  reply;
-
-    if (nxt_slow_path(!nxt_router_msg_sender_is(task, msg,
-                                                NXT_PROCESS_CONTROLLER)))
-    {
-        return;
-    }
 
     reply_port = nxt_runtime_port_find(task->thread->runtime,
                                        msg->port_msg.pid,
@@ -1927,12 +1930,6 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_status_app_t     *app_stat;
     nxt_event_engine_t   *engine;
     nxt_status_report_t  *report;
-
-    if (nxt_slow_path(!nxt_router_msg_sender_is(task, msg,
-                                                NXT_PROCESS_CONTROLLER)))
-    {
-        return;
-    }
 
     port = nxt_runtime_port_find(task->thread->runtime,
                                  msg->port_msg.pid,
@@ -2046,10 +2043,6 @@ static void
 nxt_router_remove_pid_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
     nxt_event_engine_t  *engine;
-
-    if (nxt_slow_path(!nxt_router_msg_sender_is_proto(task, msg))) {
-        return;
-    }
 
     nxt_port_remove_pid_handler(task, msg);
 

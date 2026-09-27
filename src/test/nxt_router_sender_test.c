@@ -72,7 +72,7 @@ static const nxt_process_type_t  nxt_router_sender_test_port_types[] = {
 typedef struct {
     const char          *name;
     nxt_uint_t          type;
-    /* The check; NXT_PROCESS_PROTOTYPE means main or a prototype. */
+    /* The expected sender; NXT_PROCESS_PROTOTYPE means main or a prototype. */
     nxt_process_type_t  check;
     /* The body is safe to run from the correct sender. */
     nxt_bool_t          run;
@@ -228,7 +228,7 @@ nxt_router_sender_test_accepted(nxt_thread_t *thr, nxt_task_t *task,
 
     nxt_router_sender_test_msg(&msg, t->type, sender, sender);
 
-    res = nxt_router_test_msg_sender_is(task, &msg, t->check);
+    res = nxt_router_test_msg_sender_ok(task, &msg);
 
     NXT_TEST_CHECK(thr->log, res, "router sender test: %s from %s: check "
                    "returned 0", t->name, who);
