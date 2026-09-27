@@ -57,6 +57,19 @@ struct nxt_h1proto_s {
      */
     uint32_t                  sent_before_body;
 
+    /*
+     * The minimum transfer rate state of the current request.  The
+     * keep-alive code zeroes these fields before the next request.
+     */
+    uint8_t                   body_rate_on;         /* 1 bit  */
+    uint8_t                   send_rate_on;         /* 1 bit  */
+    nxt_msec_t                body_rate_start;
+    nxt_msec_t                send_rate_start;
+    uint64_t                  body_rate_bytes;
+    uint64_t                  send_rate_bytes;
+    uint64_t                  send_rate_time;
+    nxt_off_t                 send_rate_sent;
+
     nxt_http_field_t          *websocket_key;
     nxt_h1p_websocket_timer_t *websocket_timer;
 

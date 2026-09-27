@@ -2834,6 +2834,18 @@ static nxt_conf_map_t  nxt_router_http_conf[] = {
     },
 
     {
+        nxt_string("body_min_rate"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_socket_conf_t, body_min_rate),
+    },
+
+    {
+        nxt_string("send_min_rate"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_socket_conf_t, send_min_rate),
+    },
+
+    {
         nxt_string("body_temp_path"),
         NXT_CONF_MAP_STR,
         offsetof(nxt_socket_conf_t, body_temp_path),
@@ -3417,6 +3429,8 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             skcf->proxy_timeout = 60 * 1000;
             skcf->proxy_send_timeout = 30 * 1000;
             skcf->proxy_read_timeout = 30 * 1000;
+            skcf->body_min_rate = 0;
+            skcf->send_min_rate = 0;
 
             skcf->server_version = 1;
             skcf->chunked_transform = 0;
