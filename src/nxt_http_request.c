@@ -556,7 +556,11 @@ nxt_http_request_chunked_transform(nxt_http_request_t *r)
     u_char            *p, *end;
     nxt_http_field_t  *f;
 
-    r->chunked_field->skip = 1;
+    /* Only HTTP/1 has a Transfer-Encoding field to hide from the app. */
+
+    if (r->chunked_field != NULL) {
+        r->chunked_field->skip = 1;
+    }
 
     size = r->body->file_end;
 
