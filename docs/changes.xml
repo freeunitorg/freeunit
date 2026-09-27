@@ -650,8 +650,8 @@ JSON, so piping JSON still works, but comments and unquoted keys do not.  A
 convert the file to JSON first", instead of being handed to the JSON parser,
 which reports a misleading error at the first comment.  A ".yaml" or ".yml"
 file is refused with "YAML is no longer supported: convert the file to JSON
-first, for example with "yq -o=json"".  Supported input formats are now json,
-json5 and pem.  "unitctl status -t yaml" is gone; --output-format now accepts
+first, for example with "yq -o=json"".  Supported input formats are now json
+and pem.  "unitctl status -t yaml" is gone; --output-format now accepts
 json, json-pretty and text.  This removes the nu-json dependency and the 30
 crates of Nushell utility code it pulled in for a tool that speaks one JSON
 control API.  It also removes serde_yaml and unsafe-libyaml; the latter is a

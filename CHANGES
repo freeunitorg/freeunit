@@ -487,7 +487,7 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        misleading error at the first comment.  A ".yaml" or ".yml" file is
        refused with "YAML is no longer supported: convert the file to JSON
        first, for example with "yq -o=json"".  Supported input formats are
-       now json, json5 and pem.  "unitctl status -t yaml" is gone;
+       now json and pem.  "unitctl status -t yaml" is gone;
        --output-format now accepts json, json-pretty and text.  This removes
        the nu-json dependency and the 30 crates of Nushell utility code it
        pulled in for a tool that speaks one JSON control API.  It also
