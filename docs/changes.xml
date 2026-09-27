@@ -10,6 +10,15 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="bugfix">
+<para>
+when unitd ran as root and the control socket was given to another user or
+group with --control-user or --control-group, that user passed the socket file
+permissions but the controller then closed the connection.  The controller now
+also accepts the configured user, and a peer in the configured group.
+</para>
+</change>
+
 <change type="security">
 <para>
 an application could write an unexpected value into an entry of a shared

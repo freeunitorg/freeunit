@@ -1,6 +1,12 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Bugfix: when unitd ran as root and the control socket was given to
+       another user or group with --control-user or --control-group, that
+       user passed the socket file permissions but the controller then
+       closed the connection. The controller now also accepts the
+       configured user, and a peer in the configured group.
+
     *) Security: an application could write an unexpected value into an
        entry of a shared memory queue. The router then retried that entry
        for ever. Each enqueue and dequeue now stops after one queue size

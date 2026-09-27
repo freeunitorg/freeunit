@@ -325,69 +325,105 @@ nxt_file_set_access(nxt_file_name_t *name, nxt_file_access_t access)
 }
 
 
-nxt_int_t
-nxt_file_chown(nxt_file_name_t *name, const char *owner, const char *group)
-{
-    int    err;
-    char   *buf;
-    long   bufsize;
-    gid_t  gid = ~0;
-    uid_t  uid = ~0;
+/*
+ * Resolves the user and group names with the reentrant calls.  An id stays
+ * -1 when its name is NULL.  The buffer grows on ERANGE, up to 1M.
+ */
 
-    if (owner == NULL && group == NULL) {
-        return NXT_OK;
-    }
+#define NXT_FILE_OWNER_BUF_MAX  (1024 * 1024)
+
+
+nxt_int_t
+nxt_file_owner_ids(const char *owner, const char *group, uid_t *uid,
+    gid_t *gid)
+{
+    int            err;
+    long           size;
+    char           *buf;
+    struct group   grp, *gr;
+    struct passwd  pwd, *pw;
+
+    *uid = (uid_t) -1;
+    *gid = (gid_t) -1;
 
     if (owner != NULL) {
-        struct passwd  pwd, *result;
-
-        bufsize = sysconf(_SC_GETPW_R_SIZE_MAX);
-        if (bufsize == -1) {
-            bufsize = 32768;
+        /* sysconf() returns -1 when the system has no limit. */
+        size = sysconf(_SC_GETPW_R_SIZE_MAX);
+        if (size <= 0) {
+            size = 16384;
         }
 
-        buf = nxt_malloc(bufsize);
-        if (buf == NULL) {
+        for ( ;; ) {
+            buf = nxt_malloc(size);
+            if (buf == NULL) {
+                return NXT_ERROR;
+            }
+
+            err = getpwnam_r(owner, &pwd, buf, size, &pw);
+            if (err != ERANGE || size >= NXT_FILE_OWNER_BUF_MAX) {
+                break;
+            }
+
+            nxt_free(buf);
+            size *= 2;
+        }
+
+        if (pw == NULL) {
+            nxt_thread_log_alert("getpwnam_r(\"%s\", ...) failed %E %s",
+                                 owner, err,
+                                 err == 0 ? "(User not found)" : "");
+            nxt_free(buf);
             return NXT_ERROR;
         }
 
-        err = getpwnam_r(owner, &pwd, buf, bufsize, &result);
-        if (result == NULL) {
-            nxt_thread_log_alert("getpwnam_r(\"%s\", ...) failed %E %s",
-                                 owner, nxt_errno,
-                                 err == 0 ? "(User not found)" : "");
-            goto out_err_free;
-        }
-
-        uid = pwd.pw_uid;
+        *uid = pwd.pw_uid;
 
         nxt_free(buf);
     }
 
     if (group != NULL) {
-        struct group  grp, *result;
-
-        bufsize = sysconf(_SC_GETGR_R_SIZE_MAX);
-        if (bufsize == -1) {
-            bufsize = 32768;
+        size = sysconf(_SC_GETGR_R_SIZE_MAX);
+        if (size <= 0) {
+            size = 16384;
         }
 
-        buf = nxt_malloc(bufsize);
-        if (buf == NULL) {
+        for ( ;; ) {
+            buf = nxt_malloc(size);
+            if (buf == NULL) {
+                return NXT_ERROR;
+            }
+
+            err = getgrnam_r(group, &grp, buf, size, &gr);
+            if (err != ERANGE || size >= NXT_FILE_OWNER_BUF_MAX) {
+                break;
+            }
+
+            nxt_free(buf);
+            size *= 2;
+        }
+
+        if (gr == NULL) {
+            nxt_thread_log_alert("getgrnam_r(\"%s\", ...) failed %E %s",
+                                 group, err,
+                                 err == 0 ? "(Group not found)" : "");
+            nxt_free(buf);
             return NXT_ERROR;
         }
 
-        err = getgrnam_r(group, &grp, buf, bufsize, &result);
-        if (result == NULL) {
-            nxt_thread_log_alert("getgrnam_r(\"%s\", ...) failed %E %s",
-                                 group, nxt_errno,
-                                 err == 0 ? "(Group not found)" : "");
-            goto out_err_free;
-        }
-
-        gid = grp.gr_gid;
+        *gid = grp.gr_gid;
 
         nxt_free(buf);
+    }
+
+    return NXT_OK;
+}
+
+
+nxt_int_t
+nxt_file_chown(nxt_file_name_t *name, uid_t uid, gid_t gid)
+{
+    if (uid == (uid_t) -1 && gid == (gid_t) -1) {
+        return NXT_OK;
     }
 
     if (nxt_fast_path(chown((const char *) name, uid, gid) == 0)) {
@@ -395,13 +431,8 @@ nxt_file_chown(nxt_file_name_t *name, const char *owner, const char *group)
     }
 
     nxt_thread_log_alert("chown(\"%FN\", %l, %l) failed %E", name,
-                         owner != NULL ? (long) uid : -1,
-                         group != NULL ? (long) gid : -1, nxt_errno);
-
-    return NXT_ERROR;
-
-out_err_free:
-    nxt_free(buf);
+                         uid != (uid_t) -1 ? (long) uid : -1,
+                         gid != (gid_t) -1 ? (long) gid : -1, nxt_errno);
 
     return NXT_ERROR;
 }
