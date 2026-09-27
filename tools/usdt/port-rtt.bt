@@ -1,0 +1,30 @@
+#!/usr/bin/env bpftrace
+/*
+ * Copyright (C) FreeUnit contributors.
+ *
+ * Port send -> recv latency per pid; coarse, not per message.
+ *   bpftrace tools/usdt/port-rtt.bt <path to unitd> [-p <pid>]
+ * Needs a --usdt build: docs/observability/usdt.md.
+ */
+
+BEGIN
+{
+    printf("Tracing freeunit port send -> recv round trips. Ctrl-C to stop.\n");
+}
+
+usdt:$1:freeunit:port__send
+{
+    @start[pid] = nsecs;
+}
+
+usdt:$1:freeunit:port__recv
+/@start[pid]/
+{
+    @port_rtt_ns = hist(nsecs - @start[pid]);
+    delete(@start[pid]);
+}
+
+END
+{
+    clear(@start);
+}

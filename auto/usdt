@@ -1,0 +1,26 @@
+# Copyright (C) NGINX, Inc.
+
+if [ $NXT_USDT = YES ]; then
+
+    nxt_feature="USDT probes (sys/sdt.h)"
+    nxt_feature_name=NXT_HAVE_USDT
+    nxt_feature_run=no
+    nxt_feature_incs=
+    nxt_feature_libs=
+    nxt_feature_test="#include <sys/sdt.h>
+
+                      int main(void) {
+                          DTRACE_PROBE(freeunit, configure_test);
+                          return 0;
+                      }"
+    . auto/feature
+
+    if [ ! $nxt_found = yes ]; then
+        $echo
+        $echo $0: error: --usdt requires sys/sdt.h \
+                          \(systemtap-sdt-devel / systemtap-sdt-dev\).
+        $echo
+        exit 1;
+    fi
+
+fi
