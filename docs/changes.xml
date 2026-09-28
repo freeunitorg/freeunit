@@ -44,6 +44,28 @@ level, not as an alert.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+when a router thread ran out of connections or file descriptors, the log got
+an "epoll_ctl() failed (2: No such file or directory)" alert every 100
+milliseconds until a connection was freed.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+at shutdown, idle client connections were closed but not freed.  They are now
+closed through their protocol handlers.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+on systems without accept4(), an accepted socket that could not be made
+non-blocking was closed and then still used.
+</para>
+</change>
+
 <change type="security">
 <para>
 the router and libunit read records from shared memory that the other

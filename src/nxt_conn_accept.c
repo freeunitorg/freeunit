@@ -132,9 +132,20 @@ nxt_conn_listen_handler(nxt_task_t *task, void *obj, void *data)
 }
 
 
+#if (NXT_TESTS)
+
+/* For src/test/nxt_conn_io_accept_test.c: fail the next N nonblocking calls. */
+nxt_uint_t  nxt_conn_test_nonblocking_failures;
+
+#endif
+
+
 void
 nxt_conn_io_accept(nxt_task_t *task, void *obj, void *data)
 {
+#if (NXT_LINUX)
+    nxt_int_t           ret;
+#endif
     socklen_t           socklen;
     nxt_conn_t          *c;
     nxt_socket_t        s;
@@ -177,18 +188,32 @@ nxt_conn_io_accept(nxt_task_t *task, void *obj, void *data)
         return;
     }
 
-    c->socket.fd = s;
-
 #if (NXT_LINUX)
     /*
      * Linux does not inherit non-blocking mode
      * from listen socket for accept()ed socket.
      */
-    if (nxt_slow_path(nxt_socket_nonblocking(task, s) != NXT_OK)) {
+    ret = nxt_socket_nonblocking(task, s);
+
+#if (NXT_TESTS)
+    if (nxt_conn_test_nonblocking_failures > 0) {
+        nxt_conn_test_nonblocking_failures--;
+        ret = NXT_ERROR;
+    }
+#endif
+
+    if (nxt_slow_path(ret != NXT_OK)) {
         nxt_socket_close(task, s);
+        return;
     }
 
 #endif
+
+    /*
+     * Only a socket that is kept goes into the spare conn: on the error
+     * returns above the spare keeps fd -1, which nxt_conn_free() asserts.
+     */
+    c->socket.fd = s;
 
     nxt_debug(task, "accept(%d): %d", lev->socket.fd, s);
 
@@ -274,7 +299,9 @@ nxt_conn_accept_close_idle(nxt_task_t *task, nxt_listen_event_t *lev)
 
     nxt_timer_add(engine, &lev->timer, 100);
 
-    nxt_fd_event_disable_read(engine, &lev->socket);
+    if (nxt_fd_event_is_active(lev->socket.read)) {
+        nxt_fd_event_disable_read(engine, &lev->socket);
+    }
 
     nxt_alert(task, "new connections are not accepted within 100ms");
 }

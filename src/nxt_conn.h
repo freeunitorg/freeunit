@@ -265,6 +265,11 @@ void nxt_conn_connect_error(nxt_task_t *task, void *obj, void *data);
 NXT_EXPORT nxt_listen_event_t *nxt_listen_event(nxt_task_t *task,
     nxt_listen_socket_t *ls);
 void nxt_conn_io_accept(nxt_task_t *task, void *obj, void *data);
+
+#if (NXT_TESTS)
+extern nxt_uint_t  nxt_conn_test_nonblocking_failures;
+#endif
+
 NXT_EXPORT void nxt_conn_accept(nxt_task_t *task, nxt_listen_event_t *lev,
     nxt_conn_t *c);
 void nxt_conn_accept_error(nxt_task_t *task, nxt_listen_event_t *lev,
