@@ -117,7 +117,7 @@ struct nxt_wasm_ctx_s {
     nxt_unit_request_info_t  *req;
 
     uint8_t                  *baddr;
-    size_t                   baddr_off;
+    uint32_t                 baddr_off;
 
     size_t                   response_off;
 

@@ -80,6 +80,15 @@ store to finish.  When the store fails, the main process logs an alert.
 </para>
 </change>
 
+<change type="security">
+<para>
+the wasm module did not check the offset that the malloc handler of the guest
+returned.  A negative or large offset put the request buffer outside the
+linear memory of the guest.  The worker now refuses such an offset, or an
+offset that is not aligned, and exits at startup.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 a regular expression in the configuration could run for up to 10,000,000

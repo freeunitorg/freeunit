@@ -305,6 +305,9 @@ nxt_wasmtime_init_memory(nxt_wasm_ctx_t *ctx)
 {
     int                    i = 0;
     bool                   ok;
+    size_t                 need, size;
+    uint8_t                *base;
+    uint32_t               off;
     wasm_trap_t            *trap = NULL;
     wasmtime_val_t         args[1] = { };
     wasmtime_val_t         results[1] = { };
@@ -313,8 +316,10 @@ nxt_wasmtime_init_memory(nxt_wasm_ctx_t *ctx)
     nxt_wasmtime_ctx_t     *rt_ctx = &nxt_wasmtime_ctx;
     const nxt_wasm_func_t  *func = &ctx->fh[NXT_WASM_FH_MALLOC].func;
 
+    need = NXT_WASM_MEM_SIZE + NXT_WASM_PAGE_SIZE;
+
     args[i].kind = WASMTIME_I32;
-    args[i++].of.i32 = NXT_WASM_MEM_SIZE + NXT_WASM_PAGE_SIZE;
+    args[i++].of.i32 = need;
 
     error = wasmtime_func_call(rt_ctx->ctx, func, args, i, results, 1, &trap);
     if (error != NULL || trap != NULL) {
@@ -332,10 +337,36 @@ nxt_wasmtime_init_memory(nxt_wasm_ctx_t *ctx)
     }
     rt_ctx->memory = item.of.memory;
 
-    ctx->baddr_off = results[0].of.i32;
-    ctx->baddr = wasmtime_memory_data(rt_ctx->ctx, &rt_ctx->memory);
+    /*
+     * The guest returns a wasm32 pointer.  Read it as unsigned, and check
+     * that the bytes the host asked for fit in the linear memory from it.
+     */
+    off = (uint32_t) results[0].of.i32;
+    size = wasmtime_memory_data_size(rt_ctx->ctx, &rt_ctx->memory);
 
-    ctx->baddr += ctx->baddr_off;
+    if (size < need || off > size - need) {
+        nxt_wasmtime_err_msg(NULL, NULL,
+                             "malloc handler returned offset %u outside "
+                             "memory of %zu bytes", off, size);
+        return -1;
+    }
+
+    base = wasmtime_memory_data(rt_ctx->ctx, &rt_ctx->memory);
+
+    /*
+     * The host writes an nxt_wasm_request_t at this address.  The structure
+     * has uint64_t members, so the address must be aligned for it.
+     */
+    if ((uintptr_t) (base + off) % _Alignof(nxt_wasm_request_t) != 0) {
+        nxt_wasmtime_err_msg(NULL, NULL,
+                             "malloc handler returned offset %u that is not "
+                             "aligned to %zu bytes", off,
+                             _Alignof(nxt_wasm_request_t));
+        return -1;
+    }
+
+    ctx->baddr_off = off;
+    ctx->baddr = base + off;
 
     return 0;
 }
