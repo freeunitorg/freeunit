@@ -6,6 +6,7 @@ import pytest
 
 from unit.control import Control
 from unit.log import Log
+from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'any'}}
 
@@ -416,7 +417,7 @@ def test_listeners_port_release():
 
             while True:
                 try:
-                    s.bind(('127.0.0.1', 8080))
+                    s.bind(('127.0.0.1', port_map.port(8080)))
                     s.listen()
                     break
 

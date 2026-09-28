@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from unit import port as port_map
 from unit.applications.lang.go import ApplicationGo
 from unit.applications.lang.java import ApplicationJava
 from unit.applications.lang.node import ApplicationNode
@@ -133,7 +134,9 @@ def check_isolation():
         url='/config',
         sock_type='unix',
         addr=f'{option.temp_dir}/control.unit.sock',
-        body=json.dumps(conf),
+        # Direct http.put() bypasses Control, so the listener literals above
+        # are mapped here.
+        body=port_map.remap(json.dumps(conf)),
     )
 
     if 'success' not in resp['body']:

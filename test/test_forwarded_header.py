@@ -29,8 +29,6 @@ def forwarded_header(forwarded):
 
 
 def get_fwd(sock_type='ipv4', xff=None, xfp=None):
-    port = 8081 if sock_type == 'ipv4' else 8082
-
     headers = {'Connection': 'close'}
 
     if xff is not None:
@@ -39,9 +37,11 @@ def get_fwd(sock_type='ipv4', xff=None, xfp=None):
     if xfp is not None:
         headers['X-Forwarded-Proto'] = xfp
 
-    return client.get(sock_type=sock_type, port=port, headers=headers)[
-        'headers'
-    ]
+    return client.get(
+        sock_type=sock_type,
+        port=8081 if sock_type == 'ipv4' else 8082,
+        headers=headers,
+    )['headers']
 
 
 def get_addr(*args, **kwargs):

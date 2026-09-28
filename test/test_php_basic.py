@@ -1,4 +1,5 @@
 from unit.control import Control
+from unit import port as port_map
 
 prerequisites = {'modules': {'php': 'any'}}
 
@@ -59,13 +60,13 @@ def test_php_get_applications():
 def test_php_get_listeners():
     assert 'success' in client.conf(conf_basic)
 
-    assert client.conf_get()['listeners'] == {
-        "*:8080": {"pass": "applications/app"}
-    }, 'listeners'
+    assert client.conf_get()['listeners'] == port_map.expected(
+        {"*:8080": {"pass": "applications/app"}}
+    ), 'listeners'
 
-    assert client.conf_get('listeners') == {
-        "*:8080": {"pass": "applications/app"}
-    }, 'listeners prefix'
+    assert client.conf_get('listeners') == port_map.expected(
+        {"*:8080": {"pass": "applications/app"}}
+    ), 'listeners prefix'
 
     assert client.conf_get('listeners/*:8080') == {
         "pass": "applications/app"
@@ -78,9 +79,9 @@ def test_php_change_listener():
         {"*:8081": {"pass": "applications/app"}}, 'listeners'
     )
 
-    assert client.conf_get('listeners') == {
-        "*:8081": {"pass": "applications/app"}
-    }, 'change listener'
+    assert client.conf_get('listeners') == port_map.expected(
+        {"*:8081": {"pass": "applications/app"}}
+    ), 'change listener'
 
 
 def test_php_add_listener():
@@ -89,10 +90,12 @@ def test_php_add_listener():
         {"pass": "applications/app"}, 'listeners/*:8082'
     )
 
-    assert client.conf_get('listeners') == {
-        "*:8080": {"pass": "applications/app"},
-        "*:8082": {"pass": "applications/app"},
-    }, 'add listener'
+    assert client.conf_get('listeners') == port_map.expected(
+        {
+            "*:8080": {"pass": "applications/app"},
+            "*:8082": {"pass": "applications/app"},
+        }
+    ), 'add listener'
 
 
 def test_php_change_application():

@@ -1,5 +1,6 @@
 import json
 
+from unit import port as port_map
 from unit.http import HTTP1
 from unit.option import option
 
@@ -47,13 +48,28 @@ class Control(HTTP1):
         return self.post(**self._get_args(url, conf))['body']
 
     def _get_args(self, url, conf=None):
+        # The one place a listener port reaches unitd: every config body is
+        # serialized here, dict or pre-serialized string alike, and the URL
+        # carries the port for listeners/*:8080-style paths.  See unit.port.
+        #
+        # Only /config is remapped.  The /certificates and /js_modules stores
+        # take opaque payloads (PEM bundles, module source): a digit run such
+        # as 8080 in base64 text is data, not a port.
+        remap = port_map.remap if _is_config(url) else lambda text: text
+
         args = {
-            'url': url,
+            'url': remap(url),
             'sock_type': 'unix',
             'addr': f'{option.temp_dir}/control.unit.sock',
         }
 
         if conf is not None:
-            args['body'] = conf
+            args['body'] = remap(conf)
 
         return args
+
+
+def _is_config(url):
+    path = url.split('?', 1)[0]
+
+    return path == '/config' or path.startswith('/config/')

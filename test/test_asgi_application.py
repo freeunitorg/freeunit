@@ -4,6 +4,7 @@ import time
 import pytest
 from packaging import version
 
+from unit import port as port_map
 from unit.applications.lang.python import ApplicationPython
 
 prerequisites = {
@@ -172,8 +173,8 @@ def test_asgi_application_query_string_absent():
 def test_asgi_application_server_port():
     client.load('server_port')
 
-    assert (
-        client.get()['headers']['Server-Port'] == '8080'
+    assert client.get()['headers']['Server-Port'] == str(
+        port_map.port(8080)
     ), 'Server-Port header'
 
 

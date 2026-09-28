@@ -41,6 +41,7 @@ import pytest
 
 from unit.applications.proto import ApplicationProto
 from unit.utils import waitforsocket
+from unit import port as port_map
 
 client = ApplicationProto()
 
@@ -57,9 +58,9 @@ DUP_CL_SECOND = 6
 BODY = (PATTERN * (DUP_CL_FIRST // len(PATTERN) + 1))[:DUP_CL_FIRST]
 
 # Reserved fake_upstream ports for these cases (see test/fake_upstream/README.md).
-UPSTREAM_DUP_CL_PORT = 7984
-UPSTREAM_DUP_CL_RAW_PORT = 7983
-UPSTREAM_DUP_CL_KA_PORT = 7979
+UPSTREAM_DUP_CL_PORT = port_map.port(7984)
+UPSTREAM_DUP_CL_RAW_PORT = port_map.port(7983)
+UPSTREAM_DUP_CL_KA_PORT = port_map.port(7979)
 
 FAKE_UPSTREAM_BIN = '/usr/local/bin/fake_upstream'
 
