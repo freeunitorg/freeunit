@@ -113,6 +113,12 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        deadline stayed armed for every frame. The deadline now stops at the
        upgrade.
 
+    *) Bugfix: a WebSocket client that sent PINGs and did not read the
+       PONGs could make the router keep a PONG in memory for each PING.
+       Now, while a PONG is not sent, the router keeps only the PONG for
+       the most recent PING, and sends it after the queued PONG (RFC 6455
+       Section 5.5.3).
+
     *) Bugfix: the router crashed when it validated a configuration that
        gave "compressors" in the object form.
 

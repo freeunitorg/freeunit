@@ -234,6 +234,15 @@ frame.  The deadline now stops at the upgrade.
 
 <change type="bugfix">
 <para>
+a WebSocket client that sent PINGs and did not read the PONGs could make the
+router keep a PONG in memory for each PING.  Now, while a PONG is not sent, the
+router keeps only the PONG for the most recent PING, and sends it after the
+queued PONG (RFC 6455 Section 5.5.3).
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 the router crashed when it validated a configuration that gave
 "compressors" in the object form.
 </para>
