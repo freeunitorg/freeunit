@@ -54,6 +54,17 @@ milliseconds until a connection was freed.
 
 <change type="bugfix">
 <para>
+when a router thread could not allocate the listen event while a listener was
+added, a configuration request could wait forever, or a listening socket
+shared by several router threads could be closed too early.  When the thread
+had no free connection slot instead, the listener never accepted connections.
+Now the request completes, and a listener without a free slot starts to accept
+connections when a slot is free.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 at shutdown, idle client connections were closed but not freed.  They are now
 closed through their protocol handlers.
 </para>

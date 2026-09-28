@@ -268,6 +268,7 @@ void nxt_conn_io_accept(nxt_task_t *task, void *obj, void *data);
 
 #if (NXT_TESTS)
 extern nxt_uint_t  nxt_conn_test_nonblocking_failures;
+extern nxt_uint_t  nxt_listen_event_test_alloc_failures;
 #endif
 
 NXT_EXPORT void nxt_conn_accept(nxt_task_t *task, nxt_listen_event_t *lev,

@@ -96,6 +96,14 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        directory)" alert every 100 milliseconds until a connection was
        freed.
 
+    *) Bugfix: when a router thread could not allocate the listen event
+       while a listener was added, a configuration request could wait
+       forever, or a listening socket shared by several router threads
+       could be closed too early. When the thread had no free connection
+       slot instead, the listener never accepted connections. Now the
+       request completes, and a listener without a free slot starts to
+       accept connections when a slot is free.
+
     *) Bugfix: at shutdown, idle client connections were closed but not
        freed. They are now closed through their protocol handlers.
 

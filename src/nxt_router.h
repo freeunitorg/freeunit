@@ -317,6 +317,12 @@ typedef struct {
 
     nxt_joint_job_t        *close_job;
 
+    /*
+     * The create job of this joint could not allocate the listen event,
+     * see nxt_router_listen_socket_release_stale().
+     */
+    uint8_t                stale;  /* 1 bit */
+
     nxt_upstream_t         **upstreams;
 
     /* Modules configuraitons. */
@@ -386,6 +392,17 @@ void nxt_router_test_app_port_release(nxt_task_t *task, nxt_app_t *app,
 nxt_router_temp_conf_t *nxt_router_test_temp_conf(nxt_task_t *task);
 void nxt_router_test_app_rpc_create(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf, nxt_app_t *app);
+
+/* The release of stale listen joints, for the stale joint test. */
+void nxt_router_test_listen_socket_release_stale(nxt_task_t *task,
+    nxt_event_engine_t *engine, nxt_listen_socket_t *ls,
+    nxt_socket_conf_joint_t *keep);
+
+/* The listen socket create and update jobs, for the stale joint test. */
+void nxt_router_test_listen_socket_create(nxt_task_t *task,
+    nxt_joint_job_t *job, nxt_socket_conf_joint_t *joint);
+void nxt_router_test_listen_socket_update(nxt_task_t *task,
+    nxt_joint_job_t *job, nxt_socket_conf_joint_t *joint);
 
 /* The request deadline handler, for the app-timeout test. */
 void nxt_router_test_app_timeout(nxt_task_t *task, void *obj, void *data);

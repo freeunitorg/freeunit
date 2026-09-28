@@ -341,6 +341,9 @@ static void nxt_router_listen_socket_create(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_router_listen_socket_update(nxt_task_t *task, void *obj,
     void *data);
+static void nxt_router_listen_socket_release_stale(nxt_task_t *task,
+    nxt_event_engine_t *engine, nxt_listen_socket_t *ls,
+    nxt_socket_conf_joint_t *keep);
 static void nxt_router_listen_socket_delete(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_router_worker_thread_quit(nxt_task_t *task, void *obj,
@@ -4937,6 +4940,7 @@ nxt_router_engine_joints_create(nxt_router_temp_conf_t *tmcf,
         }
 
         joint->count = 1;
+        joint->stale = 0;
 
         skcf = nxt_queue_link_data(qlk, nxt_socket_conf_t, link);
         skcf->count++;
@@ -5248,19 +5252,44 @@ nxt_router_listen_socket_create(nxt_task_t *task, void *obj, void *data)
     skcf = joint->socket_conf;
     ls = skcf->listen;
 
-    lev = nxt_listen_event(task, ls);
-    if (nxt_slow_path(lev == NULL)) {
-        nxt_router_listen_socket_release(task, skcf);
-        return;
-    }
-
-    lev->socket.data = joint;
-
+    /*
+     * This engine holds one reference on the listen socket, also when the
+     * listen event cannot be allocated below.  The last engine that
+     * releases its reference closes the socket, see
+     * nxt_router_listen_socket_release().
+     */
     lock = &skcf->router_conf->router->lock;
 
     nxt_thread_spin_lock(lock);
     ls->count++;
     nxt_thread_spin_unlock(lock);
+
+    lev = nxt_listen_event(task, ls);
+    if (nxt_slow_path(lev == NULL)) {
+        /*
+         * Only the lev allocation itself can fail here: a missing spare
+         * conn keeps the listener and is retried by its own timer
+         * (nxt_listen_event()).  Acknowledge the job so the configuration
+         * request completes instead of waiting forever.  The joint and
+         * the listen socket reference stay: releasing the joint here could
+         * drop the last reference to the configuration that is being
+         * applied.  A later update or delete of this listener releases
+         * both, see nxt_router_listen_socket_release_stale().  The release
+         * is deferred, not skipped: until that job, the stale joint keeps
+         * this configuration (its memory pool and TLS contexts) and the
+         * listen socket, so the address stays bound.
+         */
+        nxt_alert(task, "engine %p: listen socket %d: no memory for the "
+                  "listen event, no connections will be accepted on it",
+                  task->thread->engine, ls->socket);
+
+        joint->stale = 1;
+
+        nxt_router_conf_wait_post(job);
+        return;
+    }
+
+    lev->socket.data = joint;
 
     nxt_router_conf_wait_post(job);
 }
@@ -5309,6 +5338,30 @@ nxt_router_listen_socket_update(nxt_task_t *task, void *obj, void *data)
     lev = nxt_router_listen_event(&engine->listen_connections,
                                   joint->socket_conf);
 
+    if (nxt_slow_path(lev == NULL)) {
+        /*
+         * The previous configuration could not allocate the listen event
+         * on this engine (nxt_router_listen_socket_create()), so there is
+         * nothing to update: create it now instead.  The create path
+         * links the joint itself, so unlink it again first.
+         */
+        nxt_queue_remove(&joint->link);
+
+        nxt_router_listen_socket_create(task, obj, data);
+
+        /*
+         * The job is posted: its task and data can be freed now, so the
+         * engine task is used below.  An update keeps the listen socket,
+         * so the stale joint of the failed create has the same one.  The
+         * create above took a new reference on it, so this release does
+         * not close it.
+         */
+        nxt_router_listen_socket_release_stale(&engine->task, engine,
+                                               joint->socket_conf->listen,
+                                               joint);
+        return;
+    }
+
     old = lev->socket.data;
     lev->socket.data = joint;
     lev->listen = joint->socket_conf->listen;
@@ -5338,6 +5391,30 @@ nxt_router_listen_socket_delete(nxt_task_t *task, void *obj, void *data)
 
     lev = nxt_router_listen_event(&engine->listen_connections, skcf);
 
+    if (nxt_slow_path(lev == NULL)) {
+        /*
+         * The listen event was never allocated on this engine
+         * (nxt_router_listen_socket_create()), so there is no listener to
+         * close.  Release the stale joint and its listen socket reference
+         * first: if this was the last reference, the socket is closed, and
+         * the acknowledgement then means that the port is free, as after
+         * nxt_router_listen_socket_close_finish().  The listen socket is
+         * matched, not skcf: when an engine is removed
+         * (nxt_router_engine_conf_delete()), skcf is the socket conf of
+         * the new configuration, and the stale joint has the old one.
+         */
+        nxt_router_listen_socket_release_stale(&engine->task, engine,
+                                               skcf->listen, NULL);
+
+        nxt_router_conf_wait_post(obj);
+
+        if (engine->shutdown && nxt_queue_is_empty(&engine->joints)) {
+            nxt_router_worker_thread_exit(&engine->task);
+        }
+
+        return;
+    }
+
     nxt_fd_event_delete(engine, &lev->socket);
 
     nxt_debug(task, "engine %p: listen socket delete: %d", engine,
@@ -5351,6 +5428,84 @@ nxt_router_listen_socket_delete(nxt_task_t *task, void *obj, void *data)
 
     nxt_timer_add(engine, &lev->timer, 0);
 }
+
+
+/*
+ * Releases the joints that a failed nxt_router_listen_socket_create() left
+ * in engine->joints for the listen socket ls, and the listen socket
+ * reference that each of them holds.  Such a joint has the stale flag.
+ * Only the flag is trusted, not ls alone: a request can hold the joint of
+ * a closed listener in engine->joints, and a new listen socket can have
+ * the address of the freed one.  "keep" is the joint of the current job.
+ * Each update or delete of ls releases its stale joints, so an engine has
+ * at most one of them for ls when this runs; the loop does not depend on
+ * that.  The order is the same as in nxt_router_listen_socket_close_finish():
+ * first the listen socket, which the last reference closes, then the
+ * joint.
+ */
+
+static void
+nxt_router_listen_socket_release_stale(nxt_task_t *task,
+    nxt_event_engine_t *engine, nxt_listen_socket_t *ls,
+    nxt_socket_conf_joint_t *keep)
+{
+    nxt_queue_link_t         *qlk, *next;
+    nxt_socket_conf_joint_t  *joint;
+
+    for (qlk = nxt_queue_first(&engine->joints);
+         qlk != nxt_queue_tail(&engine->joints);
+         qlk = next)
+    {
+        next = nxt_queue_next(qlk);
+
+        joint = nxt_queue_link_data(qlk, nxt_socket_conf_joint_t, link);
+
+        if (joint == keep) {
+            continue;
+        }
+
+        if (joint->stale && joint->socket_conf->listen == ls) {
+            nxt_debug(task, "engine %p: release stale joint %p", engine,
+                      joint);
+
+            nxt_router_listen_socket_release(task, joint->socket_conf);
+            nxt_router_conf_release(task, joint);
+        }
+    }
+}
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_router_stale_joint_test.c. */
+
+void
+nxt_router_test_listen_socket_release_stale(nxt_task_t *task,
+    nxt_event_engine_t *engine, nxt_listen_socket_t *ls,
+    nxt_socket_conf_joint_t *keep)
+{
+    nxt_router_listen_socket_release_stale(task, engine, ls, keep);
+}
+
+
+/* The listen socket jobs, for src/test/nxt_router_stale_joint_test.c. */
+
+void
+nxt_router_test_listen_socket_create(nxt_task_t *task, nxt_joint_job_t *job,
+    nxt_socket_conf_joint_t *joint)
+{
+    nxt_router_listen_socket_create(task, job, joint);
+}
+
+
+void
+nxt_router_test_listen_socket_update(nxt_task_t *task, nxt_joint_job_t *job,
+    nxt_socket_conf_joint_t *joint)
+{
+    nxt_router_listen_socket_update(task, job, joint);
+}
+
+#endif
 
 
 static void

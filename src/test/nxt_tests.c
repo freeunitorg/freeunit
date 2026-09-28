@@ -286,6 +286,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_listen_event_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_conn_io_accept_test(thr) != NXT_OK) {
         return 1;
     }
@@ -335,6 +339,10 @@ main(int argc, char **argv)
     }
 
     if (nxt_router_sender_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_stale_joint_test(thr) != NXT_OK) {
         return 1;
     }
 

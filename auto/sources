@@ -191,6 +191,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_port_mmaps_max_test.c \
     src/test/nxt_port_ready_test.c \
     src/test/nxt_conn_close_idle_test.c \
+    src/test/nxt_listen_event_test.c \
     src/test/nxt_conn_io_accept_test.c \
     src/test/nxt_runtime_idle_close_test.c \
     src/test/nxt_router_new_port_test.c \
@@ -204,6 +205,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_router_remove_pid_soak_test.c \
     src/test/nxt_router_detached_test.c \
     src/test/nxt_router_sender_test.c \
+    src/test/nxt_router_stale_joint_test.c \
     src/test/nxt_router_websocket_test.c \
     src/test/nxt_main_start_process_reply_test.c \
     src/test/nxt_main_file_store_test.c \
