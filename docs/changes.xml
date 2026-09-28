@@ -98,6 +98,19 @@ There, a repeated group on a subject of more than about 1,000 bytes can get a
 
 <change type="bugfix">
 <para>
+an application with a rootfs created the missing directories of each mount
+destination with mkdir(), which follows symlinks.  A symlink inside the rootfs
+could make unitd create empty directories outside it.  The directories are
+now created without following symlinks.  On a kernel without openat2() (older
+than 5.6) a rootfs with a symlinked component in a mount destination (for
+example usr -> real_usr) is now refused.  A missing rootfs directory is now
+refused on every system.  Builds without openat2(), such as on FreeBSD,
+created it before.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 when unitd ran as root and the control socket was given to another user or
 group with --control-user or --control-group, that user passed the socket file
 permissions but the controller then closed the connection.  The controller now

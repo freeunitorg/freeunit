@@ -429,5 +429,11 @@ main(int argc, char **argv)
     }
 #endif
 
+#if (NXT_HAVE_ISOLATION_ROOTFS)
+    if (nxt_isolation_mount_dst_test(thr) != NXT_OK) {
+        return 1;
+    }
+#endif
+
     return 0;
 }

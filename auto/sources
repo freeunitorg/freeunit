@@ -239,6 +239,7 @@ fi
 
 if [ $NXT_HAVE_ROOTFS = YES ]; then
     NXT_LIB_SRCS="$NXT_LIB_SRCS src/nxt_fs_mount.c"
+    NXT_TEST_SRCS="$NXT_TEST_SRCS src/test/nxt_isolation_mount_dst_test.c"
 fi
 
 

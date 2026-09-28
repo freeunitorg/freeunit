@@ -846,21 +846,263 @@ nxt_isolation_unmount_all(nxt_task_t *task, nxt_process_t *process)
 }
 
 
+#if (NXT_HAVE_OPENAT2)
+static nxt_bool_t  nxt_isolation_no_openat2;
+#endif
+
+
+/*
+ * Open the mount destination rel, a path relative to rootfs_fd, as a
+ * directory.  Create each missing component with mkdirat() against its
+ * parent fd.  mkdirat() does not follow a symlink in the last component,
+ * so no directory is ever created outside the rootfs.  With openat2() each
+ * prefix is resolved from rootfs_fd with RESOLVE_BENEATH: relative in-tree
+ * links such as "lib -> usr/lib" still work; absolute links and links that
+ * leave the rootfs fail with EXDEV.  Without openat2() a symlinked
+ * component is refused.
+ *
+ * The returned O_PATH fd pins the directory inode, not its name: the
+ * directory can still be renamed after resolution.  This is a known limit
+ * of fd walks.
+ */
+
+static nxt_int_t
+nxt_isolation_mount_dst_open(nxt_task_t *task, int rootfs_fd,
+    const u_char *dst, const u_char *rel, int *fdp)
+{
+    int        fd, parent, flags;
+#if (NXT_HAVE_OPENAT2)
+    int        tries;
+#endif
+    char       *path, *p, *comp, save;
+    size_t     len;
+    nxt_err_t  err;
+#if (NXT_HAVE_OPENAT2)
+    struct open_how  how;
+#endif
+
+#if defined(O_PATH)
+    flags = O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+#else
+    flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+#endif
+
+    /*
+     * A module path such as "//usr/lib" leaves a '/' at the start of rel.
+     * openat2() with RESOLVE_BENEATH refuses an absolute path.
+     */
+    while (*rel == '/') {
+        rel++;
+    }
+
+    len = nxt_strlen(rel);
+
+    path = nxt_malloc(len + 1);
+    if (nxt_slow_path(path == NULL)) {
+        return NXT_ERROR;
+    }
+
+    nxt_memcpy(path, rel, len + 1);
+
+    parent = rootfs_fd;
+    p = path;
+
+    for ( ;; ) {
+        while (*p == '/') {
+            p++;
+        }
+
+        if (*p == '\0') {
+            break;
+        }
+
+        comp = p;
+
+        while (*p != '\0' && *p != '/') {
+            p++;
+        }
+
+        save = *p;
+        *p = '\0';
+
+        /*
+         * A module path from the build (for example sys.path) can contain
+         * "." or "..".  Without openat2() ".." would climb out of the rootfs.
+         */
+        if (nxt_slow_path(nxt_strcmp(comp, ".") == 0
+                          || nxt_strcmp(comp, "..") == 0))
+        {
+            nxt_alert(task, "mount destination %s: component \"%s\" "
+                      "is not allowed", dst, comp);
+            goto fail;
+        }
+
+        if (mkdirat(parent, comp, 0777) != 0 && nxt_errno != EEXIST) {
+            nxt_alert(task, "mount destination %s: mkdirat(\"%s\") %E",
+                      dst, comp, nxt_errno);
+            goto fail;
+        }
+
+        fd = -1;
+
+#if (NXT_HAVE_OPENAT2)
+        if (!nxt_isolation_no_openat2) {
+            nxt_memzero(&how, sizeof(how));
+            how.flags = O_PATH | O_DIRECTORY | O_CLOEXEC;
+            how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
+
+            /*
+             * Resolve the full prefix from rootfs_fd, not comp from parent.
+             * From parent, an in-tree link such as "usr/lib64 -> ../lib"
+             * fails.  A rename race can only cause ENOENT, not an escape.
+             *
+             * With RESOLVE_BENEATH the kernel returns EAGAIN when a rename
+             * or a mount occurs on the system during a ".." lookup.  Try
+             * again a small number of times.
+             */
+            for (tries = 3; tries > 0; tries--) {
+                fd = syscall(SYS_openat2, rootfs_fd, path, &how, sizeof(how));
+
+                if (fd != -1 || nxt_errno != EAGAIN) {
+                    break;
+                }
+            }
+
+            if (fd == -1) {
+                err = nxt_errno;
+
+                if (err == ENOENT) {
+                    nxt_alert(task, "mount destination %s: component \"%s\" "
+                              "cannot be resolved beneath rootfs", dst, comp);
+                    goto fail;
+                }
+
+                /*
+                 * ENOSYS: openat2() is Linux 5.6+.  EPERM: a seccomp
+                 * profile or gVisor denies the syscall.  EINVAL: the
+                 * kernel does not know a resolve flag.  The fallback
+                 * below is stricter, so it is safe in all three cases.
+                 */
+                if (err != ENOSYS && err != EPERM && err != EINVAL) {
+                    nxt_alert(task, "mount destination %s: component \"%s\" "
+                              "escapes rootfs or is not a directory: %E",
+                              dst, comp, err);
+                    goto fail;
+                }
+
+                nxt_isolation_no_openat2 = 1;
+
+                /* Logged once per prototype start. */
+                nxt_log(task, NXT_LOG_WARN,
+                        "openat2() is not supported by the running kernel; "
+                        "rootfs mount destinations must not contain "
+                        "symlinks");
+            }
+        }
+#endif
+
+        if (fd == -1) {
+            fd = openat(parent, comp, flags);
+
+            if (fd == -1) {
+                err = nxt_errno;
+
+                /*
+                 * Linux returns ENOTDIR for a symlink opened with
+                 * O_NOFOLLOW | O_DIRECTORY.  POSIX allows ELOOP, and
+                 * other systems can return it.
+                 */
+                if (err == ENOTDIR || err == ELOOP) {
+                    nxt_alert(task, "mount destination %s: component \"%s\" "
+                              "is a symlink or not a directory", dst, comp);
+
+                } else {
+                    nxt_alert(task, "mount destination %s: openat(\"%s\") %E",
+                              dst, comp, err);
+                }
+
+                goto fail;
+            }
+        }
+
+        *p = save;
+
+        if (parent != rootfs_fd) {
+            close(parent);
+        }
+
+        parent = fd;
+    }
+
+    nxt_free(path);
+
+    if (nxt_slow_path(parent == rootfs_fd)) {
+        nxt_alert(task, "mount destination %s is the rootfs", dst);
+        return NXT_ERROR;
+    }
+
+    *fdp = parent;
+
+    return NXT_OK;
+
+fail:
+
+    if (parent != rootfs_fd) {
+        close(parent);
+    }
+
+    nxt_free(path);
+
+    return NXT_ERROR;
+}
+
+
+#if (NXT_TESTS)
+
+/*
+ * Lets src/test/nxt_isolation_mount_dst_test.c run the walk above.  When
+ * fallback is set, the walk does not call openat2().  It takes the
+ * O_NOFOLLOW branch, as after ENOSYS, EPERM or EINVAL.  *openat2_used is
+ * set when the walk did not switch to that branch.
+ */
+
+nxt_int_t
+nxt_isolation_test_mount_dst_open(nxt_task_t *task, int rootfs_fd,
+    const char *rel, nxt_bool_t fallback, nxt_bool_t *openat2_used, int *fdp)
+{
+    nxt_int_t  ret;
+
+#if (NXT_HAVE_OPENAT2)
+    nxt_isolation_no_openat2 = fallback;
+#endif
+
+    ret = nxt_isolation_mount_dst_open(task, rootfs_fd, (const u_char *) rel,
+                                       (const u_char *) rel, fdp);
+
+#if (NXT_HAVE_OPENAT2)
+    *openat2_used = !nxt_isolation_no_openat2;
+#else
+    *openat2_used = 0;
+#endif
+
+    return ret;
+}
+
+#endif
+
+
 nxt_int_t
 nxt_isolation_prepare_rootfs(nxt_task_t *task, nxt_process_t *process)
 {
-    size_t                   i, n;
+    int                      rootfs_fd, mnt_dst_fd;
+    u_char                   *mounted;
+    size_t                   i, n, rootfs_len;
     nxt_int_t                ret;
     struct stat              st;
     nxt_array_t              *mounts;
-    const u_char             *dst;
+    const u_char             *dst, *rootfs_path;
     nxt_fs_mount_t           *mnt;
     nxt_process_automount_t  *automount;
-#if (NXT_HAVE_OPENAT2)
-    int                      rootfs_fd;
-    const u_char             *rootfs_path;
-    size_t                   rootfs_len;
-#endif
 
     automount = &process->isolation.automount;
     mounts = process->isolation.mounts;
@@ -892,35 +1134,42 @@ nxt_isolation_prepare_rootfs(nxt_task_t *task, nxt_process_t *process)
     }
 #endif
 
-#if (NXT_HAVE_OPENAT2)
     /*
-     * Mount destinations live under a (possibly user-owned) rootfs.  An
-     * attacker with write access to that tree can race mkdir->mount(2)
-     * by swapping a path component for a symlink pointing outside the
-     * rootfs.  Re-open the rootfs and resolve each destination with
-     * RESOLVE_BENEATH so a tampered destination that escapes the
-     * rootfs fails the open, before we hand a path to mount(2).
-     * RESOLVE_NO_SYMLINKS is intentionally NOT requested: legitimate
-     * rootfs setups commonly contain in-tree symlinks (e.g.
-     * /lib -> /usr/lib) that must still resolve.
+     * Mount destinations live under a rootfs that may be writable by the
+     * application user.  nxt_isolation_mount_dst_open() creates them
+     * without following symlinks and returns an fd.  On Linux the mount
+     * targets that fd, not the path.
      */
     rootfs_path = process->isolation.rootfs;
-    rootfs_len = (rootfs_path != NULL) ? nxt_strlen(rootfs_path) : 0;
+    rootfs_len = nxt_strlen(rootfs_path);
 
-    rootfs_fd = -1;
-    if (rootfs_len > 0) {
-        rootfs_fd = open((const char *) rootfs_path,
-                         O_PATH | O_DIRECTORY | O_CLOEXEC);
-        if (rootfs_fd == -1) {
-            nxt_alert(task, "open rootfs(%s) %E", rootfs_path, nxt_errno);
-            return NXT_ERROR;
-        }
-    }
+    /*
+     * The rootfs is operator config.  It must exist: a missing rootfs is
+     * refused, not created as root.
+     */
+#if defined(O_PATH)
+    rootfs_fd = open((const char *) rootfs_path,
+                     O_PATH | O_DIRECTORY | O_CLOEXEC);
+#else
+    rootfs_fd = open((const char *) rootfs_path,
+                     O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 #endif
+    if (nxt_slow_path(rootfs_fd == -1)) {
+        nxt_alert(task, "open rootfs(%s) %E", rootfs_path, nxt_errno);
+        return NXT_ERROR;
+    }
+
+    /*
+     * mounted[i] is set when this call has mounted mnt[i].  The undo path
+     * unmounts only those.  One extra byte, because n can be 0.
+     */
+    mounted = nxt_zalloc(n + 1);
+    if (nxt_slow_path(mounted == NULL)) {
+        close(rootfs_fd);
+        return NXT_ERROR;
+    }
 
     for (i = 0; i < n; i++) {
-        int  mnt_dst_fd = -1;
-
         dst = mnt[i].dst;
 
         if (mnt[i].deps && !automount->language_deps) {
@@ -934,117 +1183,58 @@ nxt_isolation_prepare_rootfs(nxt_task_t *task, nxt_process_t *process)
             continue;
         }
 
-        ret = nxt_fs_mkdir_p(dst, 0777);
-        if (nxt_slow_path(ret != NXT_OK)) {
-            nxt_alert(task, "mkdir(%s) %E", dst, nxt_errno);
+        /*
+         * nxt_isolation_set_lang_mounts() builds every destination as
+         * rootfs + module path.  A module path from the build (for example
+         * sys.path) can be relative, so check that it starts with '/'.
+         */
+        nxt_assert(memcmp(dst, rootfs_path, rootfs_len) == 0);
+
+        if (nxt_slow_path(dst[rootfs_len] != '/')) {
+            nxt_alert(task, "mount destination %s is not an absolute path "
+                      "under rootfs %s", dst, rootfs_path);
             goto undo;
         }
 
-#if (NXT_HAVE_OPENAT2)
-        /*
-         * Require a path separator right after the rootfs prefix so a
-         * sibling like "<rootfs>-helper" is not treated as living under
-         * "<rootfs>" (which would resolve a bogus relative path and abort
-         * startup with a spurious ENOENT).  dst is always built as
-         * rootfs + a component starting with '/', so this byte is '/' for
-         * every real destination; the preceding length check makes the
-         * index safe to read.
-         */
-        if (rootfs_fd != -1
-            && nxt_strlen(dst) > rootfs_len
-            && memcmp(dst, rootfs_path, rootfs_len) == 0
-            && dst[rootfs_len] == '/')
-        {
-            struct open_how  how;
-            const char      *rel;
-            int              fd;
-
-            rel = (const char *) dst + rootfs_len;
-            while (*rel == '/') {
-                rel++;
-            }
-
-            nxt_memzero(&how, sizeof(how));
-            how.flags = O_PATH | O_CLOEXEC | O_DIRECTORY;
-            how.resolve = RESOLVE_BENEATH;
-
-            fd = syscall(SYS_openat2, rootfs_fd, rel, &how, sizeof(how));
-            if (fd == -1) {
-                if (nxt_errno == ENOSYS) {
-                    /*
-                     * openat2(2) is Linux 5.6+; older kernels return
-                     * ENOSYS even when the userspace headers are
-                     * present.  Skip the symlink-resolution check on
-                     * such kernels rather than failing every isolation
-                     * setup; mount(2) below still operates on the
-                     * caller-supplied path, just without the extra
-                     * RESOLVE_BENEATH guard.  Warn once so operators
-                     * see the reduced security posture.
-                     */
-                    static nxt_bool_t  openat2_warned;
-                    if (!openat2_warned) {
-                        nxt_log(task, NXT_LOG_WARN,
-                                "openat2(SYS_openat2) not supported by the "
-                                "running kernel; rootfs mount destinations "
-                                "are not validated against symlinks");
-                        openat2_warned = 1;
-                    }
-
-                } else {
-                    nxt_alert(task, "mount destination %s escapes rootfs %s "
-                              "or contains symlinks: %E", dst, rootfs_path,
-                              nxt_errno);
-                    ret = NXT_ERROR;
-                    goto undo;
-                }
-
-            } else {
-                /*
-                 * Keep the validated fd open and mount onto it directly
-                 * (via /proc/self/fd/<fd> in nxt_fs_mount) so the mount
-                 * targets the exact inode openat2 resolved, rather than
-                 * re-resolving dst as a path and reopening the check-then-
-                 * use window.  Closed after the mount below.
-                 */
-                mnt_dst_fd = fd;
-            }
+        ret = nxt_isolation_mount_dst_open(task, rootfs_fd, dst,
+                                           dst + rootfs_len + 1, &mnt_dst_fd);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            goto undo;
         }
-#endif
 
         ret = nxt_fs_mount(task, &mnt[i], mnt_dst_fd);
 
-#if (NXT_HAVE_OPENAT2)
-        if (mnt_dst_fd != -1) {
-            close(mnt_dst_fd);
-        }
-#endif
+        close(mnt_dst_fd);
 
         if (nxt_slow_path(ret != NXT_OK)) {
             goto undo;
         }
+
+        mounted[i] = 1;
     }
 
-#if (NXT_HAVE_OPENAT2)
-    if (rootfs_fd != -1) {
-        close(rootfs_fd);
-    }
-#endif
+    nxt_free(mounted);
+    close(rootfs_fd);
 
     return NXT_OK;
 
 undo:
 
-    n = i + 1;
+    /*
+     * Unmount only the destinations that this call mounted.  A skipped or
+     * failed destination is not mounted, and its path can go through a
+     * symlink.
+     */
+    n = i;
 
     for (i = 0; i < n; i++) {
-        nxt_fs_unmount(mnt[i].dst);
+        if (mounted[i]) {
+            nxt_fs_unmount(mnt[i].dst);
+        }
     }
 
-#if (NXT_HAVE_OPENAT2)
-    if (rootfs_fd != -1) {
-        close(rootfs_fd);
-    }
-#endif
+    nxt_free(mounted);
+    close(rootfs_fd);
 
     return NXT_ERROR;
 }

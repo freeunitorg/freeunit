@@ -121,6 +121,9 @@ nxt_int_t nxt_openssl_server_init_test(nxt_thread_t *thr);
 nxt_int_t nxt_cgroup_test(nxt_thread_t *thr);
 nxt_int_t nxt_controller_peer_test(nxt_thread_t *thr);
 nxt_int_t nxt_clone_creds_test(nxt_thread_t *thr);
+#if (NXT_HAVE_ISOLATION_ROOTFS)
+nxt_int_t nxt_isolation_mount_dst_test(nxt_thread_t *thr);
+#endif
 
 nxt_bool_t nxt_test_fd_is_open(nxt_fd_t fd);
 int nxt_test_in_child(nxt_thread_t *thr, const char *name, int (*fn)(void *),

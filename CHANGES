@@ -67,6 +67,16 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        thread stack. There, a repeated group on a subject of more than
        about 1,000 bytes can get a 500 response.
 
+    *) Bugfix: an application with a rootfs created the missing
+       directories of each mount destination with mkdir(), which follows
+       symlinks. A symlink inside the rootfs could make unitd create empty
+       directories outside it. The directories are now created without
+       following symlinks. On a kernel without openat2() (older than 5.6)
+       a rootfs with a symlinked component in a mount destination (for
+       example usr -> real_usr) is now refused. A missing rootfs
+       directory is now refused on every system. Builds without
+       openat2(), such as on FreeBSD, created it before.
+
     *) Security: the router and libunit read records from shared memory
        that the other process can still write, without enough checks. A
        buffer that was not a whole number of records was read past its

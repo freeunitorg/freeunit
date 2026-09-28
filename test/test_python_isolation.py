@@ -127,6 +127,172 @@ def test_python_isolation_rootfs_no_language_deps(require, temp_dir):
     ), 'language_deps unmount'
 
 
+# The first component of a language_deps destination: "usr" for a distro
+# Python, "opt" for a toolcache Python (as in CI).
+LANG_DEPS_TOP = ('usr', 'opt')
+
+
+def lang_deps_tops(temp_dir):
+    # Return the members of LANG_DEPS_TOP that start a language_deps
+    # destination.  The destinations come from the module build.  To find
+    # them, load the application once with a rootfs that has no symlink,
+    # and read the mount table.
+    rootfs = Path(temp_dir) / 'plain'
+    rootfs.mkdir()
+
+    client.load('empty', isolation={'rootfs': str(rootfs)})
+
+    assert client.get()['status'] == 200, 'plain rootfs'
+    assert waitfor(
+        lambda: bool(language_deps_mounts(str(rootfs)))
+    ), 'plain rootfs language_deps mount'
+
+    tops = {
+        Path(line.split(' ')[0]).relative_to(rootfs).parts[0]
+        for line in language_deps_mounts(str(rootfs))
+    }
+
+    client.conf({"listeners": {}, "applications": {}})
+
+    assert waitfor(
+        lambda: not language_deps_mounts(str(rootfs))
+    ), 'plain rootfs language_deps unmount'
+
+    return sorted(tops.intersection(LANG_DEPS_TOP))
+
+
+def symlinked_rootfs(temp_dir):
+    # Make each LANG_DEPS_TOP in the rootfs a symlink out of the rootfs.
+    # mkdir -p follows the symlink and creates decoy/lib/... or
+    # decoy/hostedtoolcache/...
+    rootfs = Path(temp_dir) / 'r'
+    decoy = Path(temp_dir) / 'decoy'
+
+    rootfs.mkdir()
+    decoy.mkdir()
+
+    for top in LANG_DEPS_TOP:
+        (rootfs / top).symlink_to('../decoy')
+
+    return rootfs, decoy
+
+
+def wait_for_refusal(rootfs, tops, findall, wait_for_record):
+    # Wait for the record of the refused destination.  Return the pid of
+    # the prototype and the destination.
+    tops_re = '|'.join(re.escape(top) for top in tops)
+    record = (
+        fr'\[alert\] (\d+)#\d+ mount destination '
+        fr'({re.escape(str(rootfs))}/(?:{tops_re})/\S+): '
+        fr'component "(?:{tops_re})" (.*)$'
+    )
+
+    found = wait_for_record(record, wait=50)
+    assert found is not None, 'refusal logged'
+
+    # The walk logs one reason with openat2() and another without it.
+    # unitd uses openat2() when the build has it, unless the kernel refuses
+    # the call.  Then unitd logs a warning and takes the fallback.
+    config = Path(option.current_dir) / 'build/include/nxt_auto_config.h'
+    have_openat2 = re.search(
+        r'^#define NXT_HAVE_OPENAT2\b', config.read_text(), re.M
+    )
+    no_openat2 = findall(r'openat2\(\) is not supported by the running kernel')
+
+    if have_openat2 and not no_openat2:
+        reason = 'escapes rootfs or is not a directory: '
+    else:
+        reason = 'is a symlink or not a directory'
+
+    assert found.group(3).startswith(reason), 'refusal reason'
+
+    return found.group(1), found.group(2)
+
+
+def test_python_isolation_rootfs_symlinked_mount_dst(
+    findall, require, skip_alert, temp_dir, wait_for_record
+):
+    require({'privileged_user': True})
+
+    # A destination whose path goes through a symlink out of the rootfs
+    # is refused, and no directory is created behind the symlink.
+    tops = lang_deps_tops(temp_dir)
+    if not tops:
+        pytest.skip('no language_deps destination under /usr or /opt')
+
+    rootfs, decoy = symlinked_rootfs(temp_dir)
+
+    skip_alert(r'mount destination .*', r'failed to apply', r'process .* exited')
+
+    client.load('empty', isolation={'rootfs': str(rootfs)})
+
+    assert client.get()['status'] != 200, 'symlinked destination refused'
+
+    wait_for_refusal(rootfs, tops, findall, wait_for_record)
+
+    assert sorted(p.name for p in decoy.iterdir()) == [], 'decoy is empty'
+
+
+def test_python_isolation_rootfs_symlinked_mount_dst_no_unmount(
+    findall, require, skip_alert, temp_dir, wait_for_record
+):
+    require({'privileged_user': True})
+
+    # When the prototype refuses a destination because of a symlink, it
+    # must not unmount that destination.  The path goes through the
+    # symlink, and without a mount namespace umount2() runs in the mount
+    # namespace of unitd.
+    tops = lang_deps_tops(temp_dir)
+    if not tops:
+        pytest.skip('no language_deps destination under /usr or /opt')
+
+    rootfs, _ = symlinked_rootfs(temp_dir)
+
+    skip_alert(r'mount destination .*', r'failed to apply', r'process .* exited')
+
+    client.load('empty', isolation={'rootfs': str(rootfs)})
+    client.get()
+
+    pid, dst = wait_for_refusal(rootfs, tops, findall, wait_for_record)
+    dst = re.escape(dst)
+
+    assert wait_for_record(fr'process {pid} exited'), 'prototype exited'
+
+    assert not findall(
+        fr'\] {pid}#\d+ umount2\({dst},'
+    ), 'refused destination is not unmounted'
+
+
+def test_python_isolation_rootfs_missing(require, skip_alert, temp_dir):
+    require({'privileged_user': True})
+
+    # A missing rootfs is refused.  It is not created as root.  The conf
+    # is sent directly: client.load() would create the rootfs.
+    missing = Path(temp_dir) / 'missing'
+    script_path = f'{option.test_dir}/python/empty'
+
+    skip_alert(r'open rootfs', r'failed to apply', r'process .* exited')
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "applications/empty"}},
+            "applications": {
+                "empty": {
+                    "type": "python",
+                    "processes": {"spare": 0},
+                    "path": script_path,
+                    "working_directory": script_path,
+                    "module": "wsgi",
+                    "isolation": {"rootfs": str(missing / 'r')},
+                }
+            },
+        }
+    )
+
+    assert client.get()['status'] != 200, 'missing rootfs refused'
+    assert not missing.exists(), 'missing rootfs not created'
+
+
 def test_python_isolation_rootfs_credential_language_deps(
     is_su, require, temp_dir
 ):
