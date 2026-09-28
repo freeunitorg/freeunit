@@ -1013,16 +1013,16 @@ nxt_port_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
      * set, nxt_port_remove_notify_others() puts it into the REMOVE_PID that
      * reports this process's death, and nxt_router_remove_pid_handler()
      * turns a stream-bearing REMOVE_PID into an RPC_ERROR
-     * (src/nxt_router.c:1147-1153).  That is the right fallback for a start
+     * (src/nxt_router.c).  That is the right fallback for a start
      * that never completed, and a liability afterwards: stream identifiers
-     * come from one 32-bit counter (nxt_stream_ident, src/nxt_port_rpc.c:11,
-     * bumped at src/nxt_port_rpc.c:164) that every request also draws on
-     * (src/nxt_router.c:5880), so once it wraps, an ordinary worker exit
-     * would fail whatever live RPC has inherited the number.  The reachable
-     * collision set is small -- the retype lands on the router's main port,
-     * which holds start, prefork, listen-socket and access-log
-     * registrations, while request RPCs live on the worker threads' engine
-     * ports -- but it is not empty.
+     * come from one 32-bit counter (nxt_stream_ident, src/nxt_port_rpc.c,
+     * bumped in nxt_port_rpc_register_handler_ex()) that every request also
+     * draws on (nxt_router_process_http_request()), so once it wraps, an
+     * ordinary worker exit would fail whatever live RPC has inherited the
+     * number.  The reachable collision set is small -- the retype lands on
+     * the router's main port, which holds start, prefork, listen-socket and
+     * access-log registrations, while request RPCs live on the worker
+     * threads' engine ports -- but it is not empty.
      *
      * Zeroing on the READY state alone is what this deliberately is not.
      * The state is set above and the announcement is sent here, and in

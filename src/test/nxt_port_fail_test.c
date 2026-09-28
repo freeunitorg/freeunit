@@ -1128,6 +1128,51 @@ nxt_port_fail_test_quit_log_level(nxt_thread_t *thr)
 }
 
 
+/*
+ * The counter wraps: the stream after UINT32_MAX must not be 0.  The port
+ * is open, and the registrations are cancelled before the return.
+ */
+
+static nxt_int_t
+nxt_port_fail_test_rpc_stream_wrap(nxt_task_t *task, nxt_port_t *port)
+{
+    void      *ex;
+    uint32_t  stream[2], saved_stream;
+
+    stream[0] = 0;
+    stream[1] = 0;
+
+    saved_stream = nxt_port_rpc_test_set_stream_ident(UINT32_MAX);
+
+    ex = nxt_port_rpc_register_handler_ex(task, port, NULL, NULL, 0);
+    if (ex != NULL) {
+        stream[0] = nxt_port_rpc_ex_stream(ex);
+
+        ex = nxt_port_rpc_register_handler_ex(task, port, NULL, NULL, 0);
+        if (ex != NULL) {
+            stream[1] = nxt_port_rpc_ex_stream(ex);
+            nxt_port_rpc_cancel(task, port, stream[1]);
+        }
+
+        nxt_port_rpc_cancel(task, port, stream[0]);
+    }
+
+    nxt_port_rpc_test_set_stream_ident(saved_stream);
+
+    if (stream[0] != UINT32_MAX || stream[1] == 0
+        || port->use_count != 1 || !nxt_lvlhsh_is_empty(&port->rpc_streams))
+    {
+        nxt_log_error(NXT_LOG_NOTICE, task->log,
+                      "port failure test rpc stream wrap: %uD then %uD, "
+                      "use_count %D", stream[0], stream[1],
+                      (int32_t) port->use_count);
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+
 static nxt_int_t
 nxt_port_fail_test_rpc_register(nxt_thread_t *thr)
 {
@@ -1148,6 +1193,10 @@ nxt_port_fail_test_rpc_register(nxt_thread_t *thr)
     }
 
     port->pair[0] = 0;
+
+    if (nxt_port_fail_test_rpc_stream_wrap(task, port) != NXT_OK) {
+        goto fail;
+    }
 
     nxt_port_rpc_test_alloc_failures(1);
 

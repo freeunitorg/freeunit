@@ -51,6 +51,24 @@ nxt_port_rpc_test_insert_failures(nxt_uint_t failures)
 }
 
 
+/*
+ * Set the next stream identifier and return the previous one.  A test uses
+ * it to reach the 32-bit wrap and to restore the counter afterwards.  It is
+ * a plain store: the tests are single-threaded.
+ */
+
+uint32_t
+nxt_port_rpc_test_set_stream_ident(uint32_t stream)
+{
+    uint32_t  old;
+
+    old = *nxt_stream_ident;
+    *nxt_stream_ident = stream;
+
+    return old;
+}
+
+
 static nxt_bool_t
 nxt_port_rpc_test_should_fail(nxt_uint_t *failures)
 {
@@ -158,9 +176,16 @@ nxt_port_rpc_register_handler_ex(nxt_task_t *task, nxt_port_t *port,
     nxt_port_rpc_handler_t ready_handler, nxt_port_rpc_handler_t error_handler,
     size_t ex_size)
 {
+    uint32_t  stream;
+
+    /* Stream 0 means "no handler" to the callers: skip it after a wrap. */
+
+    do {
+        stream = nxt_atomic_fetch_add(nxt_stream_ident, 1);
+    } while (nxt_slow_path(stream == 0));
+
     return nxt_port_rpc_reg_add(task, port, ready_handler, error_handler,
-                                nxt_atomic_fetch_add(nxt_stream_ident, 1),
-                                ex_size);
+                                stream, ex_size);
 }
 
 
@@ -178,8 +203,8 @@ nxt_port_rpc_register_handler_ex(nxt_task_t *task, nxt_port_t *port,
  * and does not delete again afterwards -- so the key is free at that point,
  * and nothing removes what this puts back.  Anywhere else the insert would
  * either collide with a live registration or be undone by the caller's own
- * cleanup, and the stream identifier itself is only unique because
- * nxt_stream_ident is never reused.
+ * cleanup, and the stream identifier itself is only unique until
+ * nxt_stream_ident wraps.
  */
 
 void *

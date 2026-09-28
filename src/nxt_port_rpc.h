@@ -26,6 +26,7 @@ void *nxt_port_rpc_register_handler_at(nxt_task_t *task, nxt_port_t *port,
 #if (NXT_TESTS)
 void nxt_port_rpc_test_alloc_failures(nxt_uint_t failures);
 void nxt_port_rpc_test_insert_failures(nxt_uint_t failures);
+uint32_t nxt_port_rpc_test_set_stream_ident(uint32_t stream);
 #endif
 
 uint32_t nxt_port_rpc_ex_stream(void *ex);

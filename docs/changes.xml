@@ -12,6 +12,14 @@
 
 <change type="bugfix">
 <para>
+after 2^32 RPC registrations the stream counter wrapped and handed out
+stream 0, which callers read as a failure.  The registration stayed.
+Stream 0 is now skipped.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 a chunked request body that grew over "max_body_size" after the read that
 carried the request header got no response.  The router closed the connection
 without a status line.  Now it answers 413 and closes.  A body that crossed the
