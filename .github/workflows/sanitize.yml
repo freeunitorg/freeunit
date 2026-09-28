@@ -139,8 +139,13 @@ jobs:
             # (#276), and skips on any build without --debug.  Every
             # build-test leg is a release build, so this leg is the only one
             # in which that test runs rather than skips.
+            #
+            # test_state_store forks a store child from main and stops main
+            # while the child runs (#516); it needs --restart, and this is
+            # the leg that runs that path under ASan.
             tests: >-
               test/test_graceful_reload.py
+              test/test_state_store.py
               test/test_listener_drain.py
               test/test_static.py
               test/test_conn_task_race.py

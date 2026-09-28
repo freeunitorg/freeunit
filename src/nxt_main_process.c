@@ -35,6 +35,15 @@ typedef struct {
 } nxt_conf_app_map_t;
 
 
+/* The state store runs in a short-lived child of main, one at a time. */
+typedef struct {
+    nxt_pid_t           pid;          /* The running store child, or 0. */
+    nxt_bool_t          version;      /* It also stores the version file. */
+    u_char              *pending;     /* The next store's mapping, or NULL. */
+    size_t              pending_size;
+} nxt_main_store_t;
+
+
 static nxt_int_t nxt_main_process_port_create(nxt_task_t *task,
     nxt_runtime_t *rt);
 static void nxt_main_process_title(nxt_task_t *task);
@@ -68,6 +77,13 @@ static void nxt_main_remove_child_pid_handler(nxt_task_t *task,
 #endif
 static void nxt_main_port_conf_store_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
+static void nxt_main_store_schedule(nxt_task_t *task, u_char *p,
+    size_t size);
+static void nxt_main_store_start(nxt_task_t *task, u_char *p, size_t size);
+static nxt_int_t nxt_main_store_files(nxt_task_t *task, u_char *p,
+    size_t size, nxt_bool_t version);
+static nxt_bool_t nxt_main_store_exited(nxt_task_t *task, nxt_pid_t pid,
+    int status);
 static nxt_int_t nxt_main_file_store_inherit(nxt_task_t *task,
     nxt_file_t *tmp, const char *name);
 static void nxt_main_port_access_log_handler(nxt_task_t *task,
@@ -123,6 +139,8 @@ const nxt_sig_event_t  nxt_main_process_signals[] = {
 nxt_uint_t  nxt_conf_ver;
 
 static nxt_bool_t  nxt_exiting;
+
+static nxt_main_store_t  nxt_main_store;
 
 
 nxt_int_t
@@ -1444,9 +1462,13 @@ nxt_main_process_sigchld_handler(nxt_task_t *task, void *obj, void *data)
          * for the whole handler.
          */
 
-        process = nxt_runtime_process_find(rt, pid);
+        if (!nxt_main_store_exited(task, pid, status)) {
+            process = nxt_runtime_process_find(rt, pid);
 
-        if (process != NULL) {
+            if (process == NULL) {
+                continue;
+            }
+
             nxt_main_process_cleanup(task, process);
 
             /*
@@ -1483,35 +1505,46 @@ nxt_main_process_sigchld_handler(nxt_task_t *task, void *obj, void *data)
                     nxt_process_close_ports(task, child);
                 } nxt_queue_loop;
 
-                if (rt->nprocesses <= 1) {
-                    nxt_runtime_quit(task, 0);
+            } else {
+                nxt_port_remove_notify_others(task, process);
 
-                    return;
+                nxt_queue_each(child, &children, nxt_process_t, link) {
+                    nxt_port_remove_notify_others(task, child);
+
+                    nxt_process_unlink(child);
+
+                    nxt_process_close_ports(task, child);
+                } nxt_queue_loop;
+
+                init = *(nxt_process_init_t *) nxt_process_init(process);
+
+                nxt_process_close_ports(task, process);
+
+                if (init.restart) {
+                    ret = nxt_process_init_start(task, init);
+                    if (nxt_slow_path(ret == NXT_ERROR)) {
+                        nxt_alert(task, "failed to restart %s", init.name);
+                    }
                 }
 
                 continue;
             }
+        }
 
-            nxt_port_remove_notify_others(task, process);
-
-            nxt_queue_each(child, &children, nxt_process_t, link) {
-                nxt_port_remove_notify_others(task, child);
-
-                nxt_process_unlink(child);
-
-                nxt_process_close_ports(task, child);
-            } nxt_queue_loop;
-
-            init = *(nxt_process_init_t *) nxt_process_init(process);
-
-            nxt_process_close_ports(task, process);
-
-            if (init.restart) {
-                ret = nxt_process_init_start(task, init);
-                if (nxt_slow_path(ret == NXT_ERROR)) {
-                    nxt_alert(task, "failed to restart %s", init.name);
-                }
+        /*
+         * At exit, main also waits for the store child.  In a container
+         * main is PID 1, and when it exits the kernel kills the child.
+         */
+        if (nxt_exiting && rt->nprocesses <= 1) {
+            if (nxt_main_store.pid != 0) {
+                nxt_debug(task, "waiting for state store child %PI",
+                          nxt_main_store.pid);
+                continue;
             }
+
+            nxt_runtime_quit(task, 0);
+
+            return;
         }
     }
 }
@@ -2090,11 +2123,9 @@ static void
 nxt_main_port_conf_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
     void           *p;
-    size_t         n, size;
-    nxt_int_t      ret;
+    size_t         size;
     nxt_port_t     *ctl_port;
     nxt_runtime_t  *rt;
-    u_char         ver[NXT_INT_T_LEN];
 
     rt = task->thread->runtime;
 
@@ -2149,28 +2180,14 @@ nxt_main_port_conf_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     nxt_debug(task, "conf_store_handler(%uz): %*s", size, size, p);
 
-    if (nxt_conf_ver != NXT_VERNUM) {
-        n = nxt_sprintf(ver, ver + NXT_INT_T_LEN, "%d", NXT_VERNUM) - ver;
+    /* The scheduler owns the mapping from here on. */
+    nxt_main_store_schedule(task, p, size);
 
-        ret = nxt_main_file_store(task, rt->state, rt->ver_tmp, rt->ver, ver, n);
-        if (nxt_slow_path(ret != NXT_OK)) {
-            goto error;
-        }
-
-        nxt_conf_ver = NXT_VERNUM;
-    }
-
-    ret = nxt_main_file_store(task, rt->state, rt->conf_tmp, rt->conf, p, size);
-
-    if (nxt_fast_path(ret == NXT_OK)) {
-        goto cleanup;
-    }
+    return;
 
 error:
 
     nxt_alert(task, "failed to store current configuration");
-
-cleanup:
 
     if (p != MAP_FAILED) {
         nxt_mem_munmap(p, size);
@@ -2180,6 +2197,170 @@ cleanup:
         nxt_fd_close(msg->fd[0]);
         msg->fd[0] = -1;
     }
+}
+
+
+/*
+ * A store runs fsync(2) twice for each file, which can take tens of
+ * milliseconds.  A short-lived child does it, so main forks workers and
+ * handles signals in the meantime (issue #516).
+ *
+ * Only one store child runs at a time: two would race on the same
+ * temporary name.  A store that arrives while a child runs becomes the
+ * pending store, and a newer store replaces it.  nxt_main_store_exited()
+ * starts the pending store when the child exits.
+ *
+ * "p" is a mapping of "size" bytes; this function takes ownership of it.
+ */
+static void
+nxt_main_store_schedule(nxt_task_t *task, u_char *p, size_t size)
+{
+    if (nxt_main_store.pid == 0) {
+        nxt_main_store_start(task, p, size);
+        return;
+    }
+
+    if (nxt_main_store.pending != NULL) {
+        nxt_debug(task, "state store: a newer store replaces the pending one");
+
+        nxt_mem_munmap(nxt_main_store.pending, nxt_main_store.pending_size);
+    }
+
+    nxt_main_store.pending = p;
+    nxt_main_store.pending_size = size;
+}
+
+
+static void
+nxt_main_store_start(nxt_task_t *task, u_char *p, size_t size)
+{
+    nxt_pid_t   pid;
+    nxt_bool_t  version;
+
+    /*
+     * The version file is stored again with each store until a child that
+     * stored it exits with 0.  Only then does main set nxt_conf_ver.
+     */
+    version = (nxt_conf_ver != NXT_VERNUM);
+
+    pid = fork();
+
+    if (nxt_slow_path(pid < 0)) {
+        nxt_alert(task, "fork() failed for the state store %E", nxt_errno);
+
+        /* Do not lose the store: do it in main, as before the child. */
+        if (nxt_main_store_files(task, p, size, version) == NXT_OK
+            && version)
+        {
+            nxt_conf_ver = NXT_VERNUM;
+        }
+
+        nxt_mem_munmap(p, size);
+        return;
+    }
+
+    if (pid == 0) {
+        /*
+         * The signals of main stay blocked, so SIGTERM or SIGINT sent to
+         * the process group does not stop the store.  _exit() runs no
+         * atexit() handler of main.
+         */
+        nxt_pid = getpid();
+        task->thread->tid = 0;
+
+        if (nxt_main_store_files(task, p, size, version) != NXT_OK) {
+            _exit(1);
+        }
+
+        _exit(0);
+    }
+
+    nxt_debug(task, "state store child %PI", pid);
+
+    /* The child has its own copy of the mapping. */
+    nxt_mem_munmap(p, size);
+
+    nxt_main_store.pid = pid;
+    nxt_main_store.version = version;
+}
+
+
+static nxt_int_t
+nxt_main_store_files(nxt_task_t *task, u_char *p, size_t size,
+    nxt_bool_t version)
+{
+    size_t         n;
+    nxt_int_t      ret;
+    nxt_runtime_t  *rt;
+    u_char         ver[NXT_INT_T_LEN];
+
+    rt = task->thread->runtime;
+
+    if (version) {
+        n = nxt_sprintf(ver, ver + NXT_INT_T_LEN, "%d", NXT_VERNUM) - ver;
+
+        ret = nxt_main_file_store(task, rt->state, rt->ver_tmp, rt->ver, ver, n);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            goto fail;
+        }
+    }
+
+    ret = nxt_main_file_store(task, rt->state, rt->conf_tmp, rt->conf, p, size);
+
+    if (nxt_fast_path(ret == NXT_OK)) {
+        return NXT_OK;
+    }
+
+fail:
+
+    nxt_alert(task, "failed to store current configuration");
+
+    return NXT_ERROR;
+}
+
+
+/*
+ * Called by the SIGCHLD handler for every reaped pid.  Returns 1 when "pid"
+ * was the store child.  The child is not in the process registry and is not
+ * counted in rt->nprocesses.
+ *
+ * Main logs a failed store again: the alerts of the child can go to a
+ * rotated log, because SIGUSR1 reopens the log in main only.
+ */
+static nxt_bool_t
+nxt_main_store_exited(nxt_task_t *task, nxt_pid_t pid, int status)
+{
+    u_char  *p;
+    size_t  size;
+
+    if (pid != nxt_main_store.pid) {
+        return 0;
+    }
+
+    nxt_main_store.pid = 0;
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        if (nxt_main_store.version) {
+            nxt_conf_ver = NXT_VERNUM;
+        }
+
+    } else {
+        nxt_alert(task, "state store child %PI failed, "
+                  "the configuration was not stored", pid);
+    }
+
+    p = nxt_main_store.pending;
+
+    if (p != NULL) {
+        size = nxt_main_store.pending_size;
+
+        nxt_main_store.pending = NULL;
+        nxt_main_store.pending_size = 0;
+
+        nxt_main_store_start(task, p, size);
+    }
+
+    return 1;
 }
 
 
