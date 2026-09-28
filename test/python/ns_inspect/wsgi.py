@@ -16,7 +16,16 @@ def application(environ, start_response):
 
     d = parse_qs(environ['QUERY_STRING'])
 
-    ret['FileExists'] = os.path.exists(d.get('path')[0])
+    if 'path' in d:
+        ret['FileExists'] = os.path.exists(d['path'][0])
+
+    if 'read' in d:
+        try:
+            with open(d['read'][0], 'r') as f:
+                ret['FileContent'] = f.read()
+
+        except IOError:
+            ret['FileContent'] = None
 
     out = json.dumps(ret)
 

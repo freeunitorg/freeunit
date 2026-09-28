@@ -23,6 +23,16 @@ store to finish.  When the store fails, the main process logs an alert.
 
 <change type="bugfix">
 <para>
+with isolation.namespaces.cgroup and isolation.cgroup.path, the cgroup
+namespace of an application was rooted at the cgroup of the main process, not
+at the configured cgroup.  The application saw its own cgroup as
+"/scope/python" instead of "/".  The namespace is now created after the process
+is moved into its cgroup.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 when unitd ran as root and the control socket was given to another user or
 group with --control-user or --control-group, that user passed the socket file
 permissions but the controller then closed the connection.  The controller now

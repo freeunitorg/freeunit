@@ -229,6 +229,35 @@ def test_python_isolation_cgroup(require):
     assert len(cgroup_rel.parts) >= len(cgroup_abs.parts)
 
 
+@pytest.mark.parametrize(
+    'cgroup', [{'path': 'scope/python'}, None], ids=['path', 'no_path']
+)
+def test_python_isolation_cgroup_namespace(require, cgroup):
+    require({'privileged_user': True, 'features': {'isolation': ['cgroup']}})
+
+    isolation = {'namespaces': {'cgroup': True}}
+
+    if cgroup is not None:
+        isolation['cgroup'] = cgroup
+
+    client.load('ns_inspect', isolation=isolation)
+
+    ret = client.getjson(url='/?read=/proc/self/cgroup')
+
+    content = ret['body']['FileContent']
+    assert content is not None, 'read /proc/self/cgroup'
+    assert [
+        l for l in content.splitlines() if l.startswith('0::')
+    ] == ['0::/'], 'cgroup namespace is rooted at the app cgroup'
+
+    if cgroup is not None:
+        # The view inside is "/" also when the process is not moved.
+        assert Path(get_cgroup('ns_inspect')).parts[-2:] == (
+            'scope',
+            'python',
+        ), 'app process is in the configured cgroup'
+
+
 def test_python_isolation_cgroup_two(require):
     require({'privileged_user': True, 'features': {'isolation': ['cgroup']}})
 
