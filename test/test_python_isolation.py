@@ -127,6 +127,110 @@ def test_python_isolation_rootfs_no_language_deps(require, temp_dir):
     ), 'language_deps unmount'
 
 
+# The first component of a language_deps destination: "usr" for a distro
+# Python, "opt" for a toolcache Python (as in CI).
+LANG_DEPS_TOP = ('usr', 'opt')
+
+
+def symlinked_rootfs(temp_dir):
+    # Make each LANG_DEPS_TOP in the rootfs a symlink out of the rootfs.
+    # mkdir -p follows the symlink and creates decoy/lib/... or
+    # decoy/hostedtoolcache/...
+    rootfs = Path(temp_dir) / 'r'
+    decoy = Path(temp_dir) / 'decoy'
+
+    rootfs.mkdir()
+    decoy.mkdir()
+
+    for top in LANG_DEPS_TOP:
+        (rootfs / top).symlink_to('../decoy')
+
+    return rootfs, decoy
+
+
+def test_python_isolation_rootfs_symlinked_mount_dst(
+    require, temp_dir, skip_alert
+):
+    require({'privileged_user': True})
+
+    # No directory may be created behind the symlink.
+    rootfs, decoy = symlinked_rootfs(temp_dir)
+
+    skip_alert(r'mount destination .*', r'failed to apply', r'process .* exited')
+
+    client.load('empty', isolation={'rootfs': str(rootfs)})
+
+    status = client.get()['status']
+
+    assert sorted(p.name for p in decoy.iterdir()) == [], 'decoy is empty'
+
+    if status == 200:
+        pytest.skip('stdlib is not under /usr or /opt')
+
+
+def test_python_isolation_rootfs_symlinked_mount_dst_no_unmount(
+    findall, require, skip_alert, temp_dir, wait_for_record
+):
+    require({'privileged_user': True})
+
+    # When the prototype refuses a destination because of a symlink, it
+    # must not unmount that destination.  The path goes through the
+    # symlink, and without a mount namespace umount2() runs in the mount
+    # namespace of unitd.
+    rootfs, _ = symlinked_rootfs(temp_dir)
+
+    skip_alert(r'mount destination .*', r'failed to apply', r'process .* exited')
+
+    client.load('empty', isolation={'rootfs': str(rootfs)})
+    client.get()
+
+    tops = '|'.join(re.escape(str(rootfs / top)) for top in LANG_DEPS_TOP)
+
+    found = wait_for_record(
+        fr'\] (\d+)#\d+ mount destination ((?:{tops})/\S+?):? ', wait=50
+    )
+    if found is None:
+        pytest.skip('stdlib is not under /usr or /opt')
+
+    pid, dst = found.group(1), re.escape(found.group(2))
+
+    assert wait_for_record(fr'process {pid} exited'), 'prototype exited'
+
+    assert not findall(
+        fr'\] {pid}#\d+ umount2\({dst},'
+    ), 'refused destination is not unmounted'
+
+
+def test_python_isolation_rootfs_missing(require, skip_alert, temp_dir):
+    require({'privileged_user': True})
+
+    # A missing rootfs is refused.  It is not created as root.  The conf
+    # is sent directly: client.load() would create the rootfs.
+    missing = Path(temp_dir) / 'missing'
+    script_path = f'{option.test_dir}/python/empty'
+
+    skip_alert(r'open rootfs', r'failed to apply', r'process .* exited')
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "applications/empty"}},
+            "applications": {
+                "empty": {
+                    "type": "python",
+                    "processes": {"spare": 0},
+                    "path": script_path,
+                    "working_directory": script_path,
+                    "module": "wsgi",
+                    "isolation": {"rootfs": str(missing / 'r')},
+                }
+            },
+        }
+    )
+
+    assert client.get()['status'] != 200, 'missing rootfs refused'
+    assert not missing.exists(), 'missing rootfs not created'
+
+
 def test_python_isolation_rootfs_credential_language_deps(
     is_su, require, temp_dir
 ):
