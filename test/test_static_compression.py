@@ -52,6 +52,66 @@ def test_static_compression_baseline():
     assert resp['headers']['Content-Encoding'] == 'gzip', 'gzip applied'
 
 
+def test_static_compression_regex_match_limit(
+    require, temp_dir, wait_for_record
+):
+    # A "types" regex that reaches its match limit is not a match.  So the
+    # response is not compressed.
+    require({'modules': {'regex': True}})
+
+    assets_dir = f'{temp_dir}/assets'
+    Path(f'{assets_dir}/a.slow').write_text('slow' * 10, encoding='utf-8')
+    Path(f'{assets_dir}/a.fast').write_text('fast' * 10, encoding='utf-8')
+
+    assert 'success' in client.conf(
+        {
+            "static": {
+                "mime_types": {',' * 2000: ".slow", "a,bx": ".fast"}
+            },
+            "compression": {
+                "types": ["~^(.*),(.*)[xy]$"],
+                "compressors": [
+                    {"encoding": "gzip", "level": 5, "min_length": 10}
+                ],
+            },
+        },
+        'settings/http',
+    ), 'regex types configure'
+
+    headers = {
+        'Host': 'localhost',
+        'Accept-Encoding': 'gzip',
+        'Connection': 'close',
+    }
+
+    resp = client.get(url='/a.fast', headers=headers)
+    assert resp['status'] == 200, 'fast status'
+    assert resp['headers'].get('Content-Encoding') == 'gzip', 'fast gzip'
+
+    # gzip is selected, but the "types" regex reaches its match limit, and
+    # that is not a match.  So a client that refuses identity gets a 406,
+    # not the bytes that it refused.
+    resp = client.get(
+        url='/a.slow',
+        headers={
+            'Host': 'localhost',
+            'Accept-Encoding': 'gzip, identity;q=0',
+            'Connection': 'close',
+        },
+    )
+    assert resp['status'] == 406, 'slow identity refused'
+
+    resp = client.get(url='/a.slow', headers=headers)
+    assert resp['status'] == 200, 'slow status'
+    assert 'Content-Encoding' not in resp['headers'], 'slow identity'
+    assert resp['body'] == 'slow' * 10, 'slow body'
+
+    assert (
+        wait_for_record(r'\[warn\].+reached the match limit on 2000 bytes')
+        is not None
+    ), 'match limit log'
+
+
 def test_static_compression_removed_between_requests():
     # #167: the compression state used to be process-global and allocated
     # from the router configuration that parsed it, so a configuration

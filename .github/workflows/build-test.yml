@@ -1028,6 +1028,33 @@ jobs:
       - name: Run libunit malformed port message test
         run: ./build/unit_msg_test
 
+  # The C unit-test suite with PCRE 1 instead of PCRE2.  nxt_pcre.c has its
+  # own match limits, recursion limit and callout.  No other job compiles
+  # it.  ubuntu-24.04 is pinned because it still ships libpcre3-dev.
+  c-tests-pcre1:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libpcre3-dev
+
+      - name: Configure unit (--no-pcre2 --tests)
+        run: ./configure --no-pcre2 --tests
+
+      - name: Build unitd
+        run: make -j4
+
+      - name: Build C tests
+        run: make -j4 tests
+
+      - name: Run C tests
+        run: sudo ./build/tests
+
   # Same C unit-test suite as c-tests above, built with AddressSanitizer and
   # run with LeakSanitizer's default ASAN_OPTIONS (detect_leaks is on unless
   # something turns it off). Separate from sanitize.yml: that workflow runs

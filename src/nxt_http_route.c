@@ -2164,12 +2164,11 @@ nxt_http_route_pattern(nxt_http_request_t *r, nxt_http_route_pattern_t *pattern,
     if (pattern->regex) {
         if (r->regex_match == NULL) {
             /*
-             * Reuse one match-data struct across every pattern compiled
-             * against this request, so size it for the minimum ovector
-             * (one offset pair — the overall match).  Captures are not
-             * consulted by the matcher.  Passing 0 to PCRE2's
-             * pcre2_match_data_create() is undefined per the public
-             * docs; 1 is the documented minimum.
+             * One match object serves every pattern tested against this
+             * request.  Its match data holds the minimum ovector: one
+             * offset pair, the overall match.  The matcher does not read
+             * captures.  pcre2_match_data_create() with 0 is undefined in
+             * the public docs; 1 is the documented minimum.
              */
             r->regex_match = nxt_regex_match_create(r->mem_pool, 1);
             if (nxt_slow_path(r->regex_match == NULL)) {

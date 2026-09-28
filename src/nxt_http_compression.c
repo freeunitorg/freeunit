@@ -1352,7 +1352,13 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
         ret = nxt_http_route_test_rule(r, conf->mime_types_rule,
                                        mime_type.start,
                                        mime_type.length);
-        if (ret == 0) {
+
+        /*
+         * NXT_ERROR is not a match.  A regex can reach its match limit on a
+         * long media type.  The response then takes the no-match path.
+         */
+
+        if (ret == 0 || nxt_slow_path(ret == NXT_ERROR)) {
             return identity_refused ? nxt_http_comp_not_acceptable(r) : NXT_OK;
         }
     }

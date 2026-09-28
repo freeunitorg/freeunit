@@ -275,6 +275,8 @@ if [ "$NXT_REGEX" = "YES" ]; then
     else
         NXT_LIB_SRCS="$NXT_LIB_SRCS $NXT_LIB_PCRE_SRCS"
     fi
+
+    NXT_TEST_SRCS="$NXT_TEST_SRCS src/test/nxt_regex_test.c"
 fi
 
 if [ "$NXT_HAVE_EPOLL" = "YES" -o "$NXT_TEST_BUILD_EPOLL" = "YES" ]; then

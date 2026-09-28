@@ -297,6 +297,60 @@ def test_routes_bad_regex(require):
         assert client.get(url='/nothing_z')['status'] == 500, '/nothing_z'
 
 
+def test_routes_regex_match_limit(require, wait_for_record, findall):
+    require({'modules': {'regex': True}})
+
+    # PCRE2 10.4x and PCRE 8.x try each split of the commas between the two
+    # groups, about 2M steps.  They do not see that no "x" or "y" is in the
+    # subject.
+    route_match({"headers": {"x-blah": "~^(.*),(.*)[xy]$"}})
+
+    assert (
+        client.get(headers={'Host': 'localhost', 'X-Blah': ',' * 2000,
+                            'Connection': 'close'})['status']
+        == 500
+    ), 'match limit'
+
+    assert (
+        wait_for_record(r'\[warn\].+reached the match limit on 2000 bytes')
+        is not None
+    ), 'match limit log'
+    assert not findall(r',{64}'), 'no subject in the log'
+
+    assert (
+        client.get(headers={'Host': 'localhost', 'X-Blah': 'a,bx',
+                            'Connection': 'close'})['status']
+        == 200
+    ), 'short subject'
+
+
+def test_routes_regex_match_limit_unanchored(require, wait_for_record):
+    require({'modules': {'regex': True}})
+
+    # The library counts the steps from zero again at each start position.
+    # This pattern takes about 8,000 steps at each of the first 976
+    # positions, below the limit at each one.  The limit must stop the
+    # whole match.
+    route_match({"headers": {"x-blah": "~(?=a)(?:a|aa){0,12}[xy]"}})
+
+    assert (
+        client.get(headers={'Host': 'localhost', 'X-Blah': 'a' * 1000 + 'x',
+                            'Connection': 'close'})['status']
+        == 500
+    ), 'match limit'
+
+    assert (
+        wait_for_record(r'\[warn\].+reached the match limit on 1001 bytes')
+        is not None
+    ), 'match limit log'
+
+    assert (
+        client.get(headers={'Host': 'localhost', 'X-Blah': 'aax',
+                            'Connection': 'close'})['status']
+        == 200
+    ), 'short subject'
+
+
 def test_routes_match_regex_captures(require):
     require({'modules': {'regex': True}})
 
