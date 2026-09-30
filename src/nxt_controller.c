@@ -39,6 +39,14 @@ typedef struct {
 #endif
 
 
+#if (NXT_HAVE_NJS)
+typedef struct {
+    nxt_str_t                 name;
+    nxt_controller_request_t  *req;
+} nxt_controller_script_store_t;
+#endif
+
+
 typedef struct {
     nxt_uint_t        status;
     nxt_conf_value_t  *conf;
@@ -158,6 +166,9 @@ static nxt_bool_t              nxt_controller_waiting_init_conf;
 static nxt_bool_t              nxt_controller_cert_storing;
 /* A stored bundle that waits for the first configuration of a router. */
 static nxt_controller_cert_store_t  *nxt_controller_cert_stored;
+#endif
+#if (NXT_HAVE_NJS)
+static nxt_bool_t              nxt_controller_script_storing;
 #endif
 static nxt_conf_value_t        *nxt_controller_status;
 
@@ -1484,14 +1495,15 @@ nxt_controller_process_request(nxt_task_t *task, nxt_controller_request_t *req)
             goto invalid_method;
         }
 
-#if (NXT_TLS)
-        /* The answer has the certificates.  Wait, as in the cert handler. */
-        if (nxt_controller_cert_storing) {
+        /*
+         * The answer has the certificates and the modules.  Wait, as in
+         * their handlers.
+         */
+        if (nxt_controller_store_in_flight()) {
             nxt_queue_insert_tail(&nxt_controller_waiting_requests,
                                   &req->link);
             return;
         }
-#endif
 
         if (nxt_controller_status == NULL) {
             nxt_controller_process_status(task, req);
@@ -1893,11 +1905,19 @@ alloc_fail:
 static nxt_bool_t
 nxt_controller_store_in_flight(void)
 {
+    nxt_bool_t  storing;
+
+    storing = 0;
+
 #if (NXT_TLS)
-    return nxt_controller_cert_storing;
-#else
-    return 0;
+    storing |= nxt_controller_cert_storing;
 #endif
+
+#if (NXT_HAVE_NJS)
+    storing |= nxt_controller_script_storing;
+#endif
+
+    return storing;
 }
 
 
@@ -2514,15 +2534,16 @@ static void
 nxt_controller_process_script(nxt_task_t *task,
     nxt_controller_request_t *req, nxt_str_t *path)
 {
-    u_char                     *p;
-    nxt_int_t                  ret;
-    nxt_str_t                  name;
-    nxt_conn_t                 *c;
-    nxt_script_t               *script;
-    nxt_buf_mem_t              *bm;
-    nxt_conf_value_t           *value;
-    nxt_controller_response_t  resp;
-    u_char                     error[NXT_MAX_ERROR_STR];
+    u_char                         *p;
+    nxt_int_t                      ret;
+    nxt_str_t                      name;
+    nxt_conn_t                     *c;
+    nxt_script_t                   *script;
+    nxt_buf_mem_t                  *bm;
+    nxt_conf_value_t               *value;
+    nxt_controller_response_t      resp;
+    nxt_controller_script_store_t  *store;
+    u_char                         error[NXT_MAX_ERROR_STR];
 
     name.length = path->length - 1;
     name.start = path->start + 1;
@@ -2544,6 +2565,13 @@ nxt_controller_process_script(nxt_task_t *task,
     c = req->conn;
 
     if (nxt_str_eq(&req->parser.method, "GET", 3)) {
+
+        /* While main stores a module, its metadata can roll back.  Wait. */
+        if (nxt_controller_script_storing) {
+            nxt_queue_insert_tail(&nxt_controller_waiting_requests,
+                                  &req->link);
+            return;
+        }
 
         if (name.length != 0) {
             value = nxt_script_info_get(&name);
@@ -2572,8 +2600,24 @@ nxt_controller_process_script(nxt_task_t *task,
         return;
     }
 
-    if (name.length == 0 || path != NULL) {
+    /*
+     * The name is a file name in the scripts directory.  Main keeps its
+     * temporary file there under a name that starts with ".", and refuses
+     * such a name.  Answer 400 here, not 500 from main.
+     */
+    if (name.length == 0 || path != NULL || name.start[0] == '.'
+        || name.length > NXT_SCRIPT_NAME_MAX_LENGTH)
+    {
         goto invalid_name;
+    }
+
+    /*
+     * A store or a delete waits for the current reconfiguration: the router
+     * reads the modules while it applies a configuration.
+     */
+    if (nxt_controller_check_postpone_request(task)) {
+        nxt_queue_insert_tail(&nxt_controller_waiting_requests, &req->link);
+        return;
     }
 
     if (nxt_str_eq(&req->parser.method, "PUT", 3)) {
@@ -2584,12 +2628,23 @@ nxt_controller_process_script(nxt_task_t *task,
 
         bm = &c->read->mem;
 
+        /* Main refuses a larger module.  Send 413 here, not 500. */
+        if (nxt_buf_mem_used_size(bm) > NXT_SCRIPT_STORE_MAX_SIZE) {
+            goto too_large;
+        }
+
+        store = nxt_mp_get(c->mem_pool, sizeof(nxt_controller_script_store_t));
+        if (nxt_slow_path(store == NULL)) {
+            goto alloc_fail;
+        }
+
         script = nxt_script_new(task, &name, bm->pos,
                                 nxt_buf_mem_used_size(bm), error);
         if (script == NULL) {
             goto invalid_script;
         }
 
+        /* A failed store deletes the metadata again. */
         ret = nxt_script_info_save(&name, script);
 
         nxt_script_destroy(script);
@@ -2598,8 +2653,19 @@ nxt_controller_process_script(nxt_task_t *task,
             goto alloc_fail;
         }
 
-        nxt_script_store_get(task, &name, c->mem_pool,
-                             nxt_controller_process_script_save, req);
+        nxt_controller_script_storing = 1;
+
+        store->name = name;
+        store->req = req;
+
+        /*
+         * Any other change waits until main answers: see
+         * nxt_controller_store_in_flight().  The request itself is not in
+         * the waiting queue, so a flush of the queue cannot run it again.
+         */
+
+        nxt_script_store_put(task, &name, bm, c->mem_pool,
+                             nxt_controller_process_script_save, store);
         return;
     }
 
@@ -2659,6 +2725,15 @@ exists_script:
     nxt_controller_response(task, req, &resp);
     return;
 
+too_large:
+
+    resp.status = 413;
+    resp.title = (u_char *) "JS module is too large.";
+    resp.offset = -1;
+
+    nxt_controller_response(task, req, &resp);
+    return;
+
 script_in_use:
 
     resp.status = 400;
@@ -2700,38 +2775,36 @@ static void
 nxt_controller_process_script_save(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
-    nxt_conn_t                 *c;
-    nxt_buf_mem_t              *mbuf;
-    nxt_controller_request_t   *req;
-    nxt_controller_response_t  resp;
+    nxt_controller_request_t       *req;
+    nxt_controller_response_t      resp;
+    nxt_controller_script_store_t  *store;
 
-    req = data;
+    store = data;
+    req = store->req;
+
+    nxt_controller_script_storing = 0;
 
     nxt_memzero(&resp, sizeof(nxt_controller_response_t));
 
-    if (msg == NULL || msg->port_msg.type == _NXT_PORT_MSG_RPC_ERROR) {
+    if (msg == NULL || msg->port_msg.type != NXT_PORT_MSG_RPC_READY) {
+        /*
+         * A store child that failed after rename(2) leaves the file, and
+         * the next start loads it.
+         */
+        (void) nxt_script_info_delete(&store->name);
+
         resp.status = 500;
         resp.title = (u_char *) "Failed to store script.";
+        resp.offset = -1;
 
-        nxt_controller_response(task, req, &resp);
-        return;
+    } else {
+        resp.status = 200;
+        resp.title = (u_char *) "JS module uploaded.";
     }
 
-    c = req->conn;
-
-    mbuf = &c->read->mem;
-
-    nxt_fd_write(msg->fd[0], mbuf->pos, nxt_buf_mem_used_size(mbuf));
-
-    nxt_fd_close(msg->fd[0]);
-    msg->fd[0] = -1;
-
-    nxt_memzero(&resp, sizeof(nxt_controller_response_t));
-
-    resp.status = 200;
-    resp.title = (u_char *) "JS module uploaded.";
-
     nxt_controller_response(task, req, &resp);
+
+    nxt_controller_flush_requests(task);
 }
 
 
