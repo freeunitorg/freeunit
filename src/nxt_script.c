@@ -159,17 +159,15 @@ nxt_script_info_init(nxt_task_t *task, nxt_array_t *scripts)
     item = scripts->elts;
 
     for (i = 0; i < scripts->nelts; i++) {
-        script = nxt_script_get(task, &item->name, item->fd);
+        script = nxt_script_get(task, &item[i].name, item[i].fd);
 
         if (nxt_slow_path(script == NULL)) {
             continue;
         }
 
-        (void) nxt_script_info_save(&item->name, script);
+        (void) nxt_script_info_save(&item[i].name, script);
 
         nxt_script_destroy(script);
-
-        item++;
     }
 }
 

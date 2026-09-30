@@ -131,6 +131,11 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        The module now refuses a 64-bit memory. It also reads the base
        address again after the guest runs.
 
+    *) Bugfix: at startup, a stored njs module that did not compile hid
+       every stored module that was read after it. Those modules were
+       missing from /js_modules and could not be used. Now only the module
+       that does not compile is left out.
+
     *) Bugfix: a keep-alive TLS connection that was idle across a
        reconfiguration could use the TLS settings of the old configuration
        after they were freed, when it was closed. The connection now keeps
