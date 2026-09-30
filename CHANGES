@@ -897,6 +897,13 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        memory, read uninitialized host memory, or corrupt the GC heap.
        Building the two modules now needs Rust 1.95.0 or newer.
 
+    *) Bugfix: the PHP module checked that "script" is under "root" by
+       comparing the first bytes of the two real paths. With "root":
+       "/srv/app", a script in "/srv/app2" passed the check and was served.
+       The script must now be in "root" or in a directory below it. A
+       "script" that resolves to "root" itself is also rejected; it was
+       served as an empty 200 response. The bug had appeared in 0.4.
+
 Changes with FreeUnit 1.36.1                                     28 Aug 2026
 
     *) Feature: configuration validation errors now say where they are. A

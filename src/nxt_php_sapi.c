@@ -104,6 +104,8 @@ static void nxt_php_disable(nxt_task_t *task, const char *type,
 static nxt_int_t nxt_php_dirname(const nxt_str_t *file, nxt_str_t *dir);
 static void nxt_php_str_trim_trail(nxt_str_t *str, u_char t);
 static void nxt_php_str_trim_lead(nxt_str_t *str, u_char t);
+static nxt_bool_t nxt_php_path_is_under(const nxt_str_t *root,
+    const nxt_str_t *path);
 nxt_inline u_char *nxt_realpath(const void *c);
 
 static nxt_int_t nxt_php_do_301(nxt_unit_request_info_t *req);
@@ -620,9 +622,7 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
         target->script_filename.length = nxt_strlen(p);
         target->script_filename.start = p;
 
-        if (!nxt_str_start(&target->script_filename,
-                           target->root.start, target->root.length))
-        {
+        if (!nxt_php_path_is_under(&target->root, &target->script_filename)) {
             nxt_alert(task, "script is not under php root");
             nxt_free(p);
             nxt_str_null(&target->script_filename);
@@ -1005,6 +1005,28 @@ nxt_php_str_trim_lead(nxt_str_t *str, u_char t)
         str->length--;
         str->start++;
     }
+}
+
+
+/*
+ * Checks that "path" names something below "root": "root", then '/', then
+ * at least one more byte.  A plain prefix test would accept "/srv/app2/x.php"
+ * for the root "/srv/app".  It would also accept the root itself.
+ *
+ * Both paths come from realpath(), so they are absolute and have no "."
+ * or ".." components, no symbolic links and no repeated or trailing '/'.
+ * nxt_php_str_trim_trail() trims the root "/" to length 0.  Every absolute
+ * path except "/" itself is below that root.
+ */
+
+static nxt_bool_t
+nxt_php_path_is_under(const nxt_str_t *root, const nxt_str_t *path)
+{
+    return path->length > root->length
+           && path->length - root->length >= 2
+           && path->start[root->length] == '/'
+           && (root->length == 0
+               || memcmp(path->start, root->start, root->length) == 0);
 }
 
 
