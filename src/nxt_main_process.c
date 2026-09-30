@@ -11,6 +11,7 @@
 #include <nxt_conf.h>
 #include <nxt_router.h>
 #include <nxt_port_queue.h>
+#include <nxt_checked.h>
 #if (NXT_TLS)
 #include <nxt_cert.h>
 #endif
@@ -38,11 +39,15 @@ typedef struct {
 
 /* The state store runs in a short-lived child of main, one at a time. */
 typedef struct {
-    nxt_pid_t           pid;          /* The running store child, or 0. */
-    nxt_bool_t          version;      /* It also stores the version file. */
-    nxt_bool_t          killed;       /* Main sent it SIGKILL. */
-    u_char              *pending;     /* The next store's mapping, or NULL. */
-    size_t              pending_size;
+    nxt_pid_t             pid;        /* The running store child, or 0. */
+    nxt_bool_t            version;    /* It also stores the version file. */
+    nxt_bool_t            killed;     /* Main sent it SIGKILL. */
+    nxt_main_store_job_t  *job;       /* Its job, or NULL for conf.json. */
+    u_char                *pending;   /* The next conf.json store, or NULL. */
+    size_t                pending_size;
+    nxt_uint_t            ahead;      /* Queued jobs older than "pending". */
+    nxt_main_store_job_t  *jobs;      /* The jobs that wait, in order. */
+    nxt_bool_t            controller; /* Start it when the store ends. */
 } nxt_main_store_t;
 
 
@@ -81,7 +86,15 @@ static void nxt_main_port_conf_store_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static void nxt_main_store_schedule(nxt_task_t *task, u_char *p,
     size_t size);
+static void nxt_main_store_next(nxt_task_t *task);
+static nxt_pid_t nxt_main_store_fork(nxt_task_t *task);
 static void nxt_main_store_start(nxt_task_t *task, u_char *p, size_t size);
+static void nxt_main_store_start_job(nxt_task_t *task,
+    nxt_main_store_job_t *job);
+static nxt_int_t nxt_main_store_job_run(nxt_task_t *task,
+    nxt_main_store_job_t *job);
+static void nxt_main_store_job_done(nxt_task_t *task,
+    nxt_main_store_job_t *job, nxt_int_t ret);
 static void nxt_main_store_close_fds(void);
 #if (NXT_LINUX)
 static nxt_int_t nxt_main_store_close_proc_fds(void);
@@ -1583,6 +1596,18 @@ nxt_main_process_sigchld_handler(nxt_task_t *task, void *obj, void *data)
                 nxt_process_close_ports(task, process);
 
                 if (init.restart) {
+                    if (init.type == NXT_PROCESS_CONTROLLER
+                        && nxt_main_store.pid != 0)
+                    {
+                        /* See nxt_main_store_exited(). */
+                        nxt_log(task, NXT_LOG_INFO, "controller starts when "
+                                "state store child %PI ends",
+                                nxt_main_store.pid);
+
+                        nxt_main_store.controller = 1;
+                        continue;
+                    }
+
                     ret = nxt_process_init_start(task, init);
                     if (nxt_slow_path(ret == NXT_ERROR)) {
                         nxt_alert(task, "failed to restart %s", init.name);
@@ -2268,28 +2293,46 @@ error:
  * handles signals in the meantime (issue #516).
  *
  * Only one store child runs at a time: two would race on the same
- * temporary name.  A store that arrives while a child runs becomes the
- * pending store, and a newer store replaces it.  nxt_main_store_exited()
- * starts the pending store when the child exits.
+ * temporary name.  A conf.json store that arrives while a child runs
+ * becomes the pending store, and a newer store replaces it.  Other stores
+ * are jobs (nxt_main_store_submit()).  They wait in a queue, and each one
+ * runs.  nxt_main_store_next() starts the next store when the child exits.
+ *
+ * The stores start in the order they came.  A newer conf.json store takes
+ * the place of the pending store that it replaces.  The order matters for
+ * a certificate DELETE: it must not run before an older conf.json store
+ * that stops naming the bundle.  Otherwise a crash between the two leaves
+ * a conf.json that names a deleted bundle, and the next start refuses
+ * that configuration.
  *
  * "p" is a mapping of "size" bytes; this function takes ownership of it.
  */
 static void
 nxt_main_store_schedule(nxt_task_t *task, u_char *p, size_t size)
 {
-    if (nxt_main_store.pid == 0) {
-        nxt_main_store_start(task, p, size);
-        return;
-    }
+    nxt_main_store_job_t  *job;
 
     if (nxt_main_store.pending != NULL) {
         nxt_debug(task, "state store: a newer store replaces the pending one");
 
         nxt_mem_munmap(nxt_main_store.pending, nxt_main_store.pending_size);
+
+    } else {
+        /* The jobs that wait now came first. */
+        nxt_main_store.ahead = 0;
+
+        for (job = nxt_main_store.jobs; job != NULL; job = job->next) {
+            nxt_main_store.ahead++;
+        }
     }
 
     nxt_main_store.pending = p;
     nxt_main_store.pending_size = size;
+
+    if (nxt_main_store.pid == 0) {
+        nxt_main_store_next(task);
+        return;
+    }
 
     if (nxt_exiting) {
         nxt_main_store_cancel(task);
@@ -2313,10 +2356,11 @@ nxt_main_start_exit(nxt_task_t *task)
 
 /*
  * At exit, main waits for the store child and then for the pending store.
- * When a store is pending, the running child stores a configuration that
- * is no longer the last one, so main stops it with SIGKILL and waits for
- * one store instead of two.  The pending store starts when the child is
- * reaped, so two stores still do not overlap.
+ * When a conf.json store is pending and a conf.json store child runs, that
+ * child stores a configuration that is no longer the last one, so main
+ * stops it with SIGKILL and waits for one store instead of two.  The next
+ * store starts when the child is reaped, so two stores still do not
+ * overlap.  Main never kills a job child: each job runs.
  *
  * Main does this only at exit.  While main runs, the child finishes, and
  * the pending store waits for it.  A kill on each new store would let
@@ -2333,6 +2377,7 @@ static void
 nxt_main_store_cancel(nxt_task_t *task)
 {
     if (nxt_main_store.pid == 0
+        || nxt_main_store.job != NULL
         || nxt_main_store.killed
         || nxt_main_store.pending == NULL)
     {
@@ -2355,6 +2400,193 @@ nxt_main_store_cancel(nxt_task_t *task)
 }
 
 
+/*
+ * Allocate a job that changes "<dir><name>".  "dir" ends with "/", its
+ * "start" is NUL-terminated, and it must live as long as main, as
+ * rt->certs and rt->scripts do.  A PUT job writes through the temporary
+ * "<dir>.store.tmp".  One temporary name per directory is enough, because
+ * only one store runs at a time.  So the caller must refuse a "name" that
+ * starts with ".".  "what" names the kind of file in the alerts, for
+ * example "certificate".
+ *
+ * The caller then sets "data" and "size" of a PUT job (nxt_malloc()ed
+ * memory, which the job owns from here on), and "reply_pid", "reply_port"
+ * and "stream" when the sender waits for an answer.  It gives the job to
+ * nxt_main_store_submit(), or frees it with nxt_main_store_job_free().
+ */
+nxt_main_store_job_t *
+nxt_main_store_job_create(nxt_main_store_op_t op, const char *what,
+    const nxt_str_t *dir, const nxt_str_t *name)
+{
+    u_char                *p;
+    size_t                size, path;
+    nxt_main_store_job_t  *job;
+
+    /* "<dir><name>" and its NUL. */
+    if (nxt_size_add(dir->length, name->length, &path) != 0
+        || nxt_size_add(path, 1, &path) != 0
+        || nxt_size_add(sizeof(nxt_main_store_job_t), path, &size) != 0)
+    {
+        return NULL;
+    }
+
+    /* "<dir>.store.tmp" and its NUL. */
+    if (op == NXT_MAIN_STORE_PUT
+        && (nxt_size_add(size, dir->length, &size) != 0
+            || nxt_size_add(size, sizeof(NXT_MAIN_STORE_TMP), &size) != 0))
+    {
+        return NULL;
+    }
+
+    job = nxt_malloc(size);
+    if (nxt_slow_path(job == NULL)) {
+        return NULL;
+    }
+
+    nxt_memzero(job, sizeof(nxt_main_store_job_t));
+
+    job->op = op;
+    job->what = what;
+    job->dir = (const char *) dir->start;
+
+    p = (u_char *) job + sizeof(nxt_main_store_job_t);
+
+    job->name = (char *) p;
+    job->base = (char *) p + dir->length;
+
+    p = nxt_cpymem(p, dir->start, dir->length);
+    p = nxt_cpymem(p, name->start, name->length);
+    *p++ = '\0';
+
+    if (op == NXT_MAIN_STORE_PUT) {
+        job->tmp = (char *) p;
+
+        p = nxt_cpymem(p, dir->start, dir->length);
+        nxt_memcpy(p, NXT_MAIN_STORE_TMP, sizeof(NXT_MAIN_STORE_TMP));
+    }
+
+    return job;
+}
+
+
+void
+nxt_main_store_job_free(nxt_main_store_job_t *job)
+{
+    nxt_free(job->data);
+    nxt_free(job);
+}
+
+
+/*
+ * Queue a job after the jobs that wait already.  Main answers the sender
+ * when the job ends: RPC_READY_LAST when the child exited with 0, and
+ * RPC_ERROR otherwise.  When fork() fails, main runs the job itself and
+ * answers at once.  The job is freed after the answer.
+ */
+void
+nxt_main_store_submit(nxt_task_t *task, nxt_main_store_job_t *job)
+{
+    nxt_main_store_job_t  **last;
+
+    job->next = NULL;
+
+    for (last = &nxt_main_store.jobs; *last != NULL; last = &(*last)->next) {
+        /* void */
+    }
+
+    *last = job;
+
+    if (nxt_main_store.pid == 0) {
+        nxt_main_store_next(task);
+    }
+}
+
+
+/*
+ * Start stores until a child runs or nothing waits, in the order they came:
+ * see nxt_main_store_schedule().  A store that cannot fork runs in main,
+ * and then the next one starts.
+ */
+static void
+nxt_main_store_next(nxt_task_t *task)
+{
+    u_char                *p;
+    size_t                size;
+    nxt_main_store_job_t  *job;
+
+    while (nxt_main_store.pid == 0) {
+        job = nxt_main_store.jobs;
+        p = nxt_main_store.pending;
+
+        if (job != NULL && (p == NULL || nxt_main_store.ahead != 0)) {
+            nxt_main_store.jobs = job->next;
+            job->next = NULL;
+
+            if (nxt_main_store.ahead != 0) {
+                nxt_main_store.ahead--;
+            }
+
+            nxt_main_store_start_job(task, job);
+            continue;
+        }
+
+        if (p == NULL) {
+            return;
+        }
+
+        size = nxt_main_store.pending_size;
+
+        nxt_main_store.pending = NULL;
+        nxt_main_store.pending_size = 0;
+
+        nxt_main_store_start(task, p, size);
+    }
+}
+
+
+/*
+ * Fork a store child.  Returns the pid in main, 0 in the child and -1 when
+ * fork() fails.
+ *
+ * The signals of main stay blocked in the child, so SIGTERM or SIGINT sent
+ * to the process group does not stop the store.  The child ends with
+ * _exit(), which runs no atexit() handler of main.
+ */
+static nxt_pid_t
+nxt_main_store_fork(nxt_task_t *task)
+{
+    nxt_pid_t  pid;
+
+    pid = fork();
+
+    if (nxt_slow_path(pid < 0)) {
+        nxt_alert(task, "fork() failed for the state store %E", nxt_errno);
+        return -1;
+    }
+
+    if (pid == 0) {
+        nxt_pid = getpid();
+        task->thread->tid = 0;
+
+        nxt_main_store_close_fds();
+
+#if (NXT_TESTS)
+        if (nxt_main_test_store_delay != 0) {
+            nxt_nanosleep(nxt_main_test_store_delay * 1000000);
+        }
+#endif
+
+        return 0;
+    }
+
+    nxt_debug(task, "state store child %PI", pid);
+
+    nxt_main_store.pid = pid;
+
+    return pid;
+}
+
+
 static void
 nxt_main_store_start(nxt_task_t *task, u_char *p, size_t size)
 {
@@ -2367,11 +2599,9 @@ nxt_main_store_start(nxt_task_t *task, u_char *p, size_t size)
      */
     version = (nxt_conf_ver != NXT_VERNUM);
 
-    pid = fork();
+    pid = nxt_main_store_fork(task);
 
     if (nxt_slow_path(pid < 0)) {
-        nxt_alert(task, "fork() failed for the state store %E", nxt_errno);
-
         /* Do not lose the store: do it in main, as before the child. */
         if (nxt_main_store_files(task, p, size, version) == NXT_OK
             && version)
@@ -2384,22 +2614,6 @@ nxt_main_store_start(nxt_task_t *task, u_char *p, size_t size)
     }
 
     if (pid == 0) {
-        /*
-         * The signals of main stay blocked, so SIGTERM or SIGINT sent to
-         * the process group does not stop the store.  _exit() runs no
-         * atexit() handler of main.
-         */
-        nxt_pid = getpid();
-        task->thread->tid = 0;
-
-        nxt_main_store_close_fds();
-
-#if (NXT_TESTS)
-        if (nxt_main_test_store_delay != 0) {
-            nxt_nanosleep(nxt_main_test_store_delay * 1000000);
-        }
-#endif
-
         if (nxt_main_store_files(task, p, size, version) != NXT_OK) {
             _exit(1);
         }
@@ -2407,13 +2621,102 @@ nxt_main_store_start(nxt_task_t *task, u_char *p, size_t size)
         _exit(0);
     }
 
-    nxt_debug(task, "state store child %PI", pid);
-
     /* The child has its own copy of the mapping. */
     nxt_mem_munmap(p, size);
 
-    nxt_main_store.pid = pid;
     nxt_main_store.version = version;
+}
+
+
+static void
+nxt_main_store_start_job(nxt_task_t *task, nxt_main_store_job_t *job)
+{
+    nxt_pid_t  pid;
+
+    pid = nxt_main_store_fork(task);
+
+    if (nxt_slow_path(pid < 0)) {
+        nxt_main_store_job_done(task, job, nxt_main_store_job_run(task, job));
+        return;
+    }
+
+    if (pid == 0) {
+        if (nxt_main_store_job_run(task, job) != NXT_OK) {
+            _exit(1);
+        }
+
+        _exit(0);
+    }
+
+    /* The child has its own copy of the data. */
+    nxt_free(job->data);
+    job->data = NULL;
+
+    nxt_main_store.job = job;
+}
+
+
+static nxt_int_t
+nxt_main_store_job_run(nxt_task_t *task, nxt_main_store_job_t *job)
+{
+    if (job->op == NXT_MAIN_STORE_PUT) {
+        return nxt_main_file_store(task, job->dir, job->tmp, job->name,
+                                   job->data, job->size);
+    }
+
+    /* A file that is not there is deleted already. */
+    if (unlink(job->name) != 0) {
+        if (nxt_errno == NXT_ENOENT) {
+            return NXT_OK;
+        }
+
+        nxt_alert(task, "unlink(\"%s\") failed %E", job->name, nxt_errno);
+
+        return NXT_ERROR;
+    }
+
+    /* The file is gone; a failed flush only costs durability. */
+    (void) nxt_file_dir_sync(task, (nxt_file_name_t *) job->dir);
+
+    return NXT_OK;
+}
+
+
+/*
+ * Log a failed job, answer the sender and free the job.  Main logs the
+ * failure: the alerts of the child can go to a rotated log, because
+ * SIGUSR1 reopens the log in main only.  A sender that has gone has no
+ * port in the runtime any more, and gets no answer.
+ */
+static void
+nxt_main_store_job_done(nxt_task_t *task, nxt_main_store_job_t *job,
+    nxt_int_t ret)
+{
+    nxt_port_t           *port;
+    nxt_port_msg_type_t  type;
+
+    if (ret == NXT_OK) {
+        type = NXT_PORT_MSG_RPC_READY_LAST;
+
+    } else {
+        type = NXT_PORT_MSG_RPC_ERROR;
+
+        nxt_alert(task, "failed to %s %s \"%s\"",
+                  (job->op == NXT_MAIN_STORE_PUT) ? "store" : "delete",
+                  job->what, job->base);
+    }
+
+    if (job->reply_pid != 0) {
+        port = nxt_runtime_port_find(task->thread->runtime, job->reply_pid,
+                                     job->reply_port);
+
+        if (port != NULL) {
+            (void) nxt_port_socket_write(task, port, type, -1, job->stream,
+                                         0, NULL);
+        }
+    }
+
+    nxt_main_store_job_free(job);
 }
 
 
@@ -2592,18 +2895,34 @@ nxt_main_store_cancelled(nxt_pid_t pid, int status)
  * rotated log, because SIGUSR1 reopens the log in main only.  A child that
  * main killed is not a failure: a newer store is pending.  A child that
  * exited before the signal arrived keeps its exit code.
+ *
+ * A controller that exits while a store child runs starts again here, when
+ * no store runs or waits.  nxt_controller_prefork() reads conf.json and the
+ * certificate bundles from disk.  Started at once, the new controller could
+ * read them before the child renames its file.  It would then keep the old
+ * state, and main would send the answer of the store to the controller that
+ * has gone.  Only the controller sends stores, so no store is added after
+ * main has reaped it.
  */
 static nxt_bool_t
 nxt_main_store_exited(nxt_task_t *task, nxt_pid_t pid, int status)
 {
-    u_char  *p;
-    size_t  size;
+    nxt_int_t             ret;
+    nxt_bool_t            ok;
+    nxt_main_store_job_t  *job;
 
     if (pid != nxt_main_store.pid) {
         return 0;
     }
 
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+    ok = (WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    job = nxt_main_store.job;
+
+    if (job != NULL) {
+        nxt_main_store_job_done(task, job, ok ? NXT_OK : NXT_ERROR);
+
+    } else if (ok) {
         if (nxt_main_store.version) {
             nxt_conf_ver = NXT_VERNUM;
         }
@@ -2619,16 +2938,19 @@ nxt_main_store_exited(nxt_task_t *task, nxt_pid_t pid, int status)
 
     nxt_main_store.pid = 0;
     nxt_main_store.killed = 0;
+    nxt_main_store.job = NULL;
 
-    p = nxt_main_store.pending;
+    nxt_main_store_next(task);
 
-    if (p != NULL) {
-        size = nxt_main_store.pending_size;
+    if (nxt_main_store.pid == 0 && nxt_main_store.controller) {
+        nxt_main_store.controller = 0;
 
-        nxt_main_store.pending = NULL;
-        nxt_main_store.pending_size = 0;
-
-        nxt_main_store_start(task, p, size);
+        if (!nxt_exiting) {
+            ret = nxt_process_init_start(task, nxt_controller_process);
+            if (nxt_slow_path(ret == NXT_ERROR)) {
+                nxt_alert(task, "failed to restart controller");
+            }
+        }
     }
 
     return 1;

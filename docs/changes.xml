@@ -89,6 +89,17 @@ store first.  When the store fails, the main process logs an alert.
 </para>
 </change>
 
+<change type="change">
+<para>
+an uploaded certificate bundle is now also stored by that child process, so
+its two fsync(2) calls no longer stop the main process.  The upload is still
+answered only when the bundle is on disk.  A certificate deletion also runs
+in the child process, after every earlier store.  A controller process that
+exits during a store is started again only when the store ends, so that it
+reads the stored files.
+</para>
+</change>
+
 <change type="security">
 <para>
 the wasm module did not check the offset that the malloc handler of the guest

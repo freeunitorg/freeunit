@@ -5,6 +5,7 @@ import socket
 import ssl
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -426,6 +427,403 @@ def test_tls_certificate_update_store_fail(skip_alert):
     assert 'new' not in client.conf_get('/')['certificates'], 'not in root'
 
     shutil.rmtree(tmp)
+
+
+def test_tls_certificate_upload_stored():
+    """The 200 of an upload comes only when main has stored the bundle.
+    Main stores it in a child process
+    (https://github.com/freeunitorg/freeunit/issues/516) and answers when
+    the child exits.  Two uploads sent at the same time both land."""
+
+    names = ('first', 'second', 'third')
+
+    bundles = {}
+
+    for name in names:
+        client.certificate(name, False)
+
+        with open(f'{option.temp_dir}/{name}.key', 'rb') as k, open(
+            f'{option.temp_dir}/{name}.crt', 'rb'
+        ) as c:
+            bundles[name] = k.read() + c.read()
+
+    certs = Path(f'{option.temp_dir}/state/certs')
+
+    # One upload.  The file is complete when the answer arrives.
+    assert 'success' in client.conf(
+        bundles['first'], '/certificates/first'
+    ), 'first uploaded'
+    assert (certs / 'first').read_bytes() == bundles['first'], 'first stored'
+
+    # Two uploads at the same time.  The controller runs one after the
+    # other, and main stores each one.
+    def upload(name):
+        return ApplicationTLS().conf(bundles[name], f'/certificates/{name}')
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        answers = list(pool.map(upload, ('second', 'third')))
+
+    for name, answer in zip(('second', 'third'), answers):
+        assert 'success' in answer, f'{name} uploaded'
+        assert (certs / name).read_bytes() == bundles[name], f'{name} stored'
+
+    assert set(names) <= set(client.conf_get('/certificates')), 'listed'
+    assert not (certs / '.store.tmp').exists(), 'no temporary file'
+
+
+def unit_children(unit_pid, name):
+    out = subprocess.check_output(
+        ['ps', 'ax', '-o', 'pid=,ppid=,args=']
+    ).decode()
+    return [
+        f[0]
+        for f in (line.split(None, 2) for line in out.splitlines())
+        if len(f) == 3 and f[1] == str(unit_pid) and name in f[2]
+    ]
+
+
+def trace_fsync(unit_pid):
+    """Delay each fsync(2) of main and its children by 2 s with strace.
+    Skip the test when strace is not installed or cannot attach."""
+
+    strace = shutil.which('strace')
+    if strace is None:
+        pytest.skip('strace is not installed')
+
+    tracer = subprocess.Popen(
+        [
+            strace,
+            '-f',
+            '-p',
+            str(unit_pid),
+            '-o',
+            '/dev/null',
+            '-e',
+            'trace=fsync',
+            '-e',
+            'inject=fsync:delay_exit=2000000',
+        ],
+        stderr=subprocess.PIPE,
+    )
+
+    # strace says "Process N attached" on stderr once it traces main.
+    line = tracer.stderr.readline().decode()
+    if 'attached' not in line:
+        tracer.kill()
+        tracer.wait()
+        pytest.skip(f'strace cannot attach: {line.strip()}')
+
+    return tracer
+
+
+def test_tls_certificate_upload_router_restart(
+    skip_alert, skip_fds_check, unit_pid
+):
+    """A router that restarts while main stores a bundle does not make the
+    controller run the upload again.  The upload gets one 200, a change
+    sent during the store runs after it, and the controller survives.
+
+    strace delays each fsync(2) of main and its children by 2 s, so the
+    store child of the upload runs for about 4 s."""
+
+    def children(name):
+        return unit_children(unit_pid, name)
+
+    client.certificate('slow', False)
+
+    with open(f'{option.temp_dir}/slow.key', 'rb') as k, open(
+        f'{option.temp_dir}/slow.crt', 'rb'
+    ) as c:
+        bundle = k.read() + c.read()
+
+    controller = children('unit: controller')
+    router = children('unit: router')
+    assert len(controller) == 1 and len(router) == 1, 'processes'
+
+    tracer = trace_fsync(unit_pid)
+
+    done = {}
+    stored = Path(f'{option.temp_dir}/state/certs/slow')
+
+    def upload():
+        body = ApplicationTLS().conf(bundle, '/certificates/slow')
+        on_disk = stored.exists() and stored.read_bytes() == bundle
+        done['upload'] = (body, on_disk)
+
+    def change():
+        start = time.monotonic()
+        body = ApplicationTLS().conf(
+            {"http": {"idle_timeout": 77}}, 'settings'
+        )
+        done['change'] = (time.monotonic() - start, body)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(upload)
+
+            # The store child is in its first fsync(2) now.
+            time.sleep(1)
+
+            skip_fds_check(router=True)
+            skip_alert(fr'process {router[0]} exited on signal 9')
+            subprocess.call(['kill', '-9', router[0]])
+
+            for _ in range(50):
+                new = children('unit: router')
+                if new and new != router:
+                    break
+                time.sleep(0.1)
+
+            # Let the new router get the configuration.
+            time.sleep(0.5)
+
+            second = pool.submit(change)
+
+            first.result(timeout=30)
+            second.result(timeout=30)
+
+    finally:
+        tracer.terminate()
+        tracer.wait(10)
+
+    assert 'success' in done['upload'][0], 'one 200 for the upload'
+    assert done['upload'][1], 'the bundle is on disk at the 200'
+    assert 'success' in done['change'][1], 'the change is applied'
+
+    # The store runs about 4 s, and it started about 1.5 s before the
+    # change was sent.  A change that did not wait takes milliseconds.
+    assert done['change'][0] > 1, 'the change waited for the store'
+
+    # Main has answered the upload; the controller must still run.
+    time.sleep(0.5)
+
+    assert children('unit: controller') == controller, 'controller survived'
+    assert client.conf_get('settings/http/idle_timeout') == 77
+
+
+def test_tls_certificate_update_router_restart(
+    skip_alert, skip_fds_check, unit_pid
+):
+    """A listener uses the bundle, and the router restarts while main
+    stores it.  The store ends while the new router still applies its
+    first configuration, because the application takes 8 s to start.  The
+    controller sends the configuration again only after that apply ends.
+    Before, it sent it at once.  The two applies ran at the same time in
+    the router: the upload got 500, the listener stopped answering, and the
+    next change crashed the router.
+
+    strace delays each fsync(2) of main and its children by 2 s, so the
+    store child of the upload runs for about 4 s."""
+
+    def children(name):
+        return unit_children(unit_pid, name)
+
+    bundles = {}
+
+    for name in ('old', 'new'):
+        client.certificate(name, False)
+
+        with open(f'{option.temp_dir}/{name}.key', 'rb') as k, open(
+            f'{option.temp_dir}/{name}.crt', 'rb'
+        ) as c:
+            bundles[name] = k.read() + c.read()
+
+    def served():
+        pem = ssl.get_server_certificate(('127.0.0.1', 8080), timeout=10)
+        return ssl.PEM_cert_to_DER_cert(pem)
+
+    def der(name):
+        pem = Path(f'{option.temp_dir}/{name}.crt').read_text(encoding='utf-8')
+        return ssl.PEM_cert_to_DER_cert(pem)
+
+    assert 'success' in client.conf(bundles['old'], '/certificates/c')
+
+    app = f'{option.test_dir}/python/slow_start'
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "applications/slow_start",
+                    "tls": {"certificate": "c"},
+                }
+            },
+            "applications": {
+                "slow_start": {
+                    "type": "python",
+                    "processes": 1,
+                    "path": app,
+                    "working_directory": app,
+                    "module": "wsgi",
+                    "environment": {"UNIT_SLOW_START": "8"},
+                }
+            },
+        }
+    )
+
+    assert served() == der('old'), 'the old certificate before'
+
+    router = children('unit: router')
+    assert len(router) == 1, 'one router'
+
+    stored = Path(f'{option.temp_dir}/state/certs/c')
+
+    tracer = trace_fsync(unit_pid)
+
+    done = {}
+
+    def upload():
+        start = time.monotonic()
+        body = ApplicationTLS().conf(bundles['new'], '/certificates/c')
+        done['upload'] = (time.monotonic() - start, body)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(upload)
+
+            # The store child is in its first fsync(2) now.
+            time.sleep(1)
+
+            assert stored.read_bytes() == bundles['old'], 'store not done'
+
+            skip_fds_check(router=True)
+            skip_alert(fr'process {router[0]} exited on signal 9')
+            subprocess.call(['kill', '-9', router[0]])
+
+            first.result(timeout=60)
+
+    finally:
+        tracer.terminate()
+        tracer.wait(10)
+
+    elapsed, body = done['upload']
+
+    assert body.get('success') == 'Certificate chain updated.', 'applied'
+
+    # The store ends after about 4 s.  The first configuration of the new
+    # router ends after the application starts, 8 s after the kill.
+    assert elapsed > 6, 'the upload waited for the first configuration'
+
+    assert served() == der('new'), 'the new certificate'
+
+    router = children('unit: router')
+    assert len(router) == 1, 'one new router'
+
+    assert 'success' in client.conf(
+        {"http": {"idle_timeout": 77}}, 'settings'
+    ), 'a later change'
+
+    assert served() == der('new'), 'the new certificate after the change'
+    assert client.get_ssl()['status'] == 200, 'the listener answers'
+    assert children('unit: router') == router, 'the router survived'
+
+
+def test_tls_certificate_update_controller_restart(
+    skip_alert, skip_fds_check, unit_pid
+):
+    """A listener uses the bundle, and the controller exits while main
+    stores a new one.  Main starts the new controller only when the store
+    ends, so the new controller reads the new bundle from disk.  It lists
+    the new certificate, and the router serves it.  When main started the
+    controller at once, the new controller read the old bundle.  The answer
+    of the store went to the controller that had gone, so the router served
+    the old certificate after the store ended.
+
+    strace delays each fsync(2) of main and its children by 2 s, so the
+    store child of the upload runs for about 4 s."""
+
+    def children(name):
+        return unit_children(unit_pid, name)
+
+    bundles = {}
+
+    for name in ('old', 'new'):
+        client.certificate(name, False)
+
+        with open(f'{option.temp_dir}/{name}.key', 'rb') as k, open(
+            f'{option.temp_dir}/{name}.crt', 'rb'
+        ) as c:
+            bundles[name] = k.read() + c.read()
+
+    def served():
+        pem = ssl.get_server_certificate(('127.0.0.1', 8080), timeout=10)
+        return ssl.PEM_cert_to_DER_cert(pem)
+
+    def der(name):
+        pem = Path(f'{option.temp_dir}/{name}.crt').read_text(encoding='utf-8')
+        return ssl.PEM_cert_to_DER_cert(pem)
+
+    client.load('empty')
+
+    assert 'success' in client.conf(bundles['old'], '/certificates/c')
+
+    add_tls(cert='c')
+
+    assert served() == der('old'), 'the old certificate before'
+
+    controller = children('unit: controller')
+    assert len(controller) == 1, 'one controller'
+
+    stored = Path(f'{option.temp_dir}/state/certs/c')
+
+    tracer = trace_fsync(unit_pid)
+
+    done = {}
+
+    def upload():
+        done['upload'] = ApplicationTLS().put(
+            url='/certificates/c',
+            sock_type='unix',
+            addr=f'{option.temp_dir}/control.unit.sock',
+            body=bundles['new'],
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(upload)
+
+            # The store child is in its first fsync(2) now.
+            time.sleep(1)
+
+            assert stored.read_bytes() == bundles['old'], 'store not done'
+
+            skip_fds_check(controller=True)
+            skip_alert(fr'process {controller[0]} exited on signal 9')
+            subprocess.call(['kill', '-9', controller[0]])
+
+            first.result(timeout=30)
+
+            # The store child is a fork of main, with the title of main.
+            for _ in range(100):
+                if not children('unit: main'):
+                    break
+                time.sleep(0.1)
+
+            assert not children('unit: main'), 'the store ended'
+
+            for _ in range(100):
+                new = children('unit: controller')
+                if new and new != controller:
+                    break
+                time.sleep(0.1)
+
+            assert new and new != controller, 'a new controller'
+
+    finally:
+        tracer.terminate()
+        tracer.wait(10)
+
+    assert done['upload'] == {}, 'the controller exited before it answered'
+    assert stored.read_bytes() == bundles['new'], 'the new bundle on disk'
+
+    # The new controller listens after the router applies its configuration.
+    assert (
+        client.conf_get('/certificates/c/chain/0/subject/common_name')
+        == 'new'
+    ), 'the controller lists the new certificate'
+
+    assert served() == der('new'), 'the router serves the new certificate'
+    assert client.get_ssl()['status'] == 200, 'the listener answers'
 
 
 def test_tls_certificate_update_long_name():
