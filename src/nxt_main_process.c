@@ -39,6 +39,7 @@ typedef struct {
 typedef struct {
     nxt_pid_t           pid;          /* The running store child, or 0. */
     nxt_bool_t          version;      /* It also stores the version file. */
+    nxt_bool_t          killed;       /* Main sent it SIGKILL. */
     u_char              *pending;     /* The next store's mapping, or NULL. */
     size_t              pending_size;
 } nxt_main_store_t;
@@ -82,6 +83,9 @@ static void nxt_main_store_schedule(nxt_task_t *task, u_char *p,
 static void nxt_main_store_start(nxt_task_t *task, u_char *p, size_t size);
 static nxt_int_t nxt_main_store_files(nxt_task_t *task, u_char *p,
     size_t size, nxt_bool_t version);
+static void nxt_main_start_exit(nxt_task_t *task);
+static void nxt_main_store_cancel(nxt_task_t *task);
+static nxt_bool_t nxt_main_store_cancelled(nxt_pid_t pid, int status);
 static nxt_bool_t nxt_main_store_exited(nxt_task_t *task, nxt_pid_t pid,
     int status);
 static nxt_int_t nxt_main_file_store_inherit(nxt_task_t *task,
@@ -91,6 +95,7 @@ static void nxt_main_port_access_log_handler(nxt_task_t *task,
 
 #if (NXT_TESTS)
 static nxt_uint_t  nxt_main_test_process_new_failure_count;
+static nxt_msec_t  nxt_main_test_store_delay;
 
 
 void
@@ -775,6 +780,53 @@ nxt_main_test_run_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 }
 
 
+/*
+ * Let src/test/nxt_main_store_test.c drive the state store.  The delay
+ * makes each store child sleep before it stores, so that the test can act
+ * while the child runs.  The test reaps the child with waitpid() and
+ * gives the status to nxt_main_test_store_exited().
+ */
+void
+nxt_main_test_store_set_delay(nxt_msec_t delay)
+{
+    nxt_main_test_store_delay = delay;
+}
+
+
+void
+nxt_main_test_store_schedule(nxt_task_t *task, u_char *p, size_t size)
+{
+    nxt_main_store_schedule(task, p, size);
+}
+
+
+nxt_pid_t
+nxt_main_test_store_pid(void)
+{
+    return nxt_main_store.pid;
+}
+
+
+nxt_bool_t
+nxt_main_test_store_exited(nxt_task_t *task, nxt_pid_t pid, int status)
+{
+    return nxt_main_store_exited(task, pid, status);
+}
+
+
+/* Start the exit as the SIGTERM and SIGQUIT handlers do, or end it. */
+void
+nxt_main_test_store_set_exiting(nxt_task_t *task, nxt_bool_t exiting)
+{
+    if (exiting) {
+        nxt_main_start_exit(task);
+
+    } else {
+        nxt_exiting = 0;
+    }
+}
+
+
 #if (NXT_USE_CMSG_PID)
 
 void
@@ -1268,7 +1320,7 @@ nxt_main_process_sigterm_handler(nxt_task_t *task, void *obj, void *data)
      */
     rt->quit_mode = NXT_PORT_QUIT_NORMAL;
 
-    nxt_exiting = 1;
+    nxt_main_start_exit(task);
 
     nxt_runtime_quit(task, 0);
 }
@@ -1290,7 +1342,7 @@ nxt_main_process_sigquit_handler(nxt_task_t *task, void *obj, void *data)
      */
     rt->quit_mode = NXT_PORT_QUIT_GRACEFUL;
 
-    nxt_exiting = 1;
+    nxt_main_start_exit(task);
 
     nxt_runtime_quit(task, 0);
 }
@@ -1437,7 +1489,12 @@ nxt_main_process_sigchld_handler(nxt_task_t *task, void *obj, void *data)
             return;
         }
 
-        if (WTERMSIG(status)) {
+        if (nxt_main_store_cancelled(pid, status)) {
+            /* Main stopped it; see nxt_main_store_cancel(). */
+            nxt_trace(task, "process %PI exited on signal %d",
+                      pid, WTERMSIG(status));
+
+        } else if (WTERMSIG(status)) {
 #ifdef WCOREDUMP
             nxt_alert(task, "process %PI exited on signal %d%s",
                       pid, WTERMSIG(status),
@@ -2089,7 +2146,7 @@ fail:
     }
 
     if (nxt_slow_path(ret == NXT_ERROR)) {
-        nxt_exiting = 1;
+        nxt_main_start_exit(task);
 
         nxt_runtime_quit(task, 1);
     }
@@ -2228,6 +2285,68 @@ nxt_main_store_schedule(nxt_task_t *task, u_char *p, size_t size)
 
     nxt_main_store.pending = p;
     nxt_main_store.pending_size = size;
+
+    if (nxt_exiting) {
+        nxt_main_store_cancel(task);
+    }
+}
+
+
+/*
+ * Main starts to exit.  The SIGTERM and SIGQUIT handlers call this, and so
+ * does the start failure.  The test hook nxt_main_test_store_set_exiting()
+ * calls it too, so src/test/nxt_main_store_test.c runs this code.
+ */
+static void
+nxt_main_start_exit(nxt_task_t *task)
+{
+    nxt_exiting = 1;
+
+    nxt_main_store_cancel(task);
+}
+
+
+/*
+ * At exit, main waits for the store child and then for the pending store.
+ * When a store is pending, the running child stores a configuration that
+ * is no longer the last one, so main stops it with SIGKILL and waits for
+ * one store instead of two.  The pending store starts when the child is
+ * reaped, so two stores still do not overlap.
+ *
+ * Main does this only at exit.  While main runs, the child finishes, and
+ * the pending store waits for it.  A kill on each new store would let
+ * stores that come faster than one store takes keep conf.json old until
+ * they stop.
+ *
+ * A killed child leaves at most the temporary file, and the next store
+ * unlinks it first.  If the child is killed after a rename(), the file it
+ * renamed is complete, because it was flushed before the rename(); the
+ * next store flushes the directory again.  A killed child does not set
+ * nxt_conf_ver, so the next store writes the version file again.
+ */
+static void
+nxt_main_store_cancel(nxt_task_t *task)
+{
+    if (nxt_main_store.pid == 0
+        || nxt_main_store.killed
+        || nxt_main_store.pending == NULL)
+    {
+        return;
+    }
+
+    /*
+     * The child is not reaped until the SIGCHLD handler runs, so its pid
+     * cannot belong to another process yet.
+     */
+    if (nxt_slow_path(kill(nxt_main_store.pid, SIGKILL) != 0)) {
+        nxt_alert(task, "kill(%PI, SIGKILL) failed %E",
+                  nxt_main_store.pid, nxt_errno);
+        return;
+    }
+
+    nxt_debug(task, "state store child %PI cancelled", nxt_main_store.pid);
+
+    nxt_main_store.killed = 1;
 }
 
 
@@ -2267,6 +2386,12 @@ nxt_main_store_start(nxt_task_t *task, u_char *p, size_t size)
          */
         nxt_pid = getpid();
         task->thread->tid = 0;
+
+#if (NXT_TESTS)
+        if (nxt_main_test_store_delay != 0) {
+            nxt_nanosleep(nxt_main_test_store_delay * 1000000);
+        }
+#endif
 
         if (nxt_main_store_files(task, p, size, version) != NXT_OK) {
             _exit(1);
@@ -2319,13 +2444,26 @@ fail:
 }
 
 
+/* Whether "pid" is the store child that main killed, and it died of that. */
+static nxt_bool_t
+nxt_main_store_cancelled(nxt_pid_t pid, int status)
+{
+    return (pid == nxt_main_store.pid
+            && nxt_main_store.killed
+            && WIFSIGNALED(status)
+            && WTERMSIG(status) == SIGKILL);
+}
+
+
 /*
  * Called by the SIGCHLD handler for every reaped pid.  Returns 1 when "pid"
  * was the store child.  The child is not in the process registry and is not
  * counted in rt->nprocesses.
  *
  * Main logs a failed store again: the alerts of the child can go to a
- * rotated log, because SIGUSR1 reopens the log in main only.
+ * rotated log, because SIGUSR1 reopens the log in main only.  A child that
+ * main killed is not a failure: a newer store is pending.  A child that
+ * exited before the signal arrived keeps its exit code.
  */
 static nxt_bool_t
 nxt_main_store_exited(nxt_task_t *task, nxt_pid_t pid, int status)
@@ -2337,17 +2475,22 @@ nxt_main_store_exited(nxt_task_t *task, nxt_pid_t pid, int status)
         return 0;
     }
 
-    nxt_main_store.pid = 0;
-
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
         if (nxt_main_store.version) {
             nxt_conf_ver = NXT_VERNUM;
         }
 
+    } else if (nxt_main_store_cancelled(pid, status)) {
+        nxt_debug(task, "state store child %PI stopped, a newer store follows",
+                  pid);
+
     } else {
         nxt_alert(task, "state store child %PI failed, "
                   "the configuration was not stored", pid);
     }
+
+    nxt_main_store.pid = 0;
+    nxt_main_store.killed = 0;
 
     p = nxt_main_store.pending;
 
