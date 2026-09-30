@@ -22,6 +22,10 @@
  *     reaped.
  *   - A child that exited before the signal arrived keeps its exit code:
  *     its store counts, and nxt_conf_ver is set.
+ *   - The store child closes the descriptors it inherits from 3 upwards
+ *     before it stores.  The test holds the read end of a pipe and gives
+ *     the write end to the child only.  The read end must see the end of
+ *     file while the child still sleeps.
  */
 
 #include <nxt_main.h>
@@ -29,6 +33,7 @@
 #include <nxt_main_process.h>
 #include "nxt_tests.h"
 
+#include <poll.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 
@@ -521,6 +526,126 @@ done:
 }
 
 
+static nxt_msec_t
+nxt_main_store_test_now(void)
+{
+    struct timespec  ts;
+
+    (void) clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    return (nxt_msec_t) (ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
+
+/*
+ * The child closes the write end of the pipe before its delay.  Before the
+ * change, it held the write end until it exited, after the delay.
+ */
+static nxt_int_t
+nxt_main_store_test_fds(nxt_thread_t *thr, nxt_task_t *task,
+    nxt_main_store_test_paths_t *paths)
+{
+    int            pp[2], n, status;
+    char           c;
+    ssize_t        r;
+    nxt_int_t      ret;
+    nxt_pid_t      pid;
+    nxt_msec_t     start, elapsed;
+    struct pollfd  pfd;
+
+    ret = NXT_ERROR;
+
+    pp[0] = -1;
+    pp[1] = -1;
+
+    if (pipe(pp) != 0) {
+        nxt_main_store_test_fail(thr, "pipe() failed %E", nxt_errno);
+    }
+
+    nxt_main_test_store_set_delay(NXT_MAIN_STORE_TEST_DELAY);
+
+    start = nxt_main_store_test_now();
+
+    if (nxt_main_store_test_schedule(task, "{\"e\":5}") != NXT_OK) {
+        nxt_main_store_test_fail(thr, "cannot map the store");
+    }
+
+    nxt_main_test_store_set_delay(0);
+
+    pid = nxt_main_test_store_pid();
+    if (pid == 0) {
+        nxt_main_store_test_fail(thr, "the store started no child");
+    }
+
+    /* Now only the child can hold the write end. */
+
+    (void) close(pp[1]);
+    pp[1] = -1;
+
+    pfd.fd = pp[0];
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    do {
+        n = poll(&pfd, 1, 4 * NXT_MAIN_STORE_TEST_DELAY);
+    } while (n == -1 && nxt_errno == NXT_EINTR);
+
+    elapsed = nxt_main_store_test_now() - start;
+
+    if (n != 1) {
+        nxt_main_store_test_fail(thr, "the pipe did not become readable: "
+                                 "poll() returned %d", n);
+    }
+
+    r = read(pp[0], &c, 1);
+
+    if (r != 0) {
+        nxt_main_store_test_fail(thr, "read() of the pipe returned %z", r);
+    }
+
+    if (waitpid(pid, &status, WNOHANG) != 0
+        || elapsed >= NXT_MAIN_STORE_TEST_DELAY / 2)
+    {
+        nxt_main_store_test_fail(thr, "the store child %PI held an inherited "
+                                 "descriptor until it exited (%M ms)", pid,
+                                 elapsed);
+    }
+
+    if (nxt_main_store_test_wait(pid, &status) != 0) {
+        nxt_main_store_test_fail(thr, "waitpid(%PI) failed %E", pid,
+                                 nxt_errno);
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        nxt_main_store_test_fail(thr, "the store failed: status 0x%Xi",
+                                 (nxt_uint_t) status);
+    }
+
+    (void) nxt_main_test_store_exited(task, pid, status);
+
+    if (!nxt_main_store_test_holds(paths->conf, "{\"e\":5}")) {
+        nxt_main_store_test_fail(thr, "\"%s\" does not hold the "
+                                 "configuration", paths->conf);
+    }
+
+    ret = NXT_OK;
+
+done:
+
+    nxt_main_store_test_reap_all(task);
+
+    if (pp[0] != -1) {
+        (void) close(pp[0]);
+    }
+
+    if (pp[1] != -1) {
+        (void) close(pp[1]);
+    }
+
+    return ret;
+}
+
+
 static void
 nxt_main_store_test_path(char *buf, const char *dir, const char *name)
 {
@@ -589,6 +714,10 @@ nxt_main_store_test(nxt_thread_t *thr)
 
     if (ret == NXT_OK) {
         ret = nxt_main_store_test_finished(thr, task, &paths);
+    }
+
+    if (ret == NXT_OK) {
+        ret = nxt_main_store_test_fds(thr, task, &paths);
     }
 
     thr->log->handler = nxt_main_store_test_next_handler;
