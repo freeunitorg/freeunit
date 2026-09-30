@@ -19,6 +19,7 @@
 #endif
 
 #include <sys/mount.h>
+#include <dirent.h>
 
 
 typedef struct {
@@ -81,6 +82,10 @@ static void nxt_main_port_conf_store_handler(nxt_task_t *task,
 static void nxt_main_store_schedule(nxt_task_t *task, u_char *p,
     size_t size);
 static void nxt_main_store_start(nxt_task_t *task, u_char *p, size_t size);
+static void nxt_main_store_close_fds(void);
+#if (NXT_LINUX)
+static nxt_int_t nxt_main_store_close_proc_fds(void);
+#endif
 static nxt_int_t nxt_main_store_files(nxt_task_t *task, u_char *p,
     size_t size, nxt_bool_t version);
 static void nxt_main_start_exit(nxt_task_t *task);
@@ -2387,6 +2392,8 @@ nxt_main_store_start(nxt_task_t *task, u_char *p, size_t size)
         nxt_pid = getpid();
         task->thread->tid = 0;
 
+        nxt_main_store_close_fds();
+
 #if (NXT_TESTS)
         if (nxt_main_test_store_delay != 0) {
             nxt_nanosleep(nxt_main_test_store_delay * 1000000);
@@ -2408,6 +2415,127 @@ nxt_main_store_start(nxt_task_t *task, u_char *p, size_t size)
     nxt_main_store.pid = pid;
     nxt_main_store.version = version;
 }
+
+
+/*
+ * The store child inherits every descriptor of main: the listen sockets,
+ * the ports and the log files.  A copy of a listen socket keeps the address
+ * bound while the child runs, so a listener that the router closes cannot
+ * be bound again until the store ends.  The child needs none of them.  It
+ * logs to stderr (nxt_log_time_handler() writes to nxt_stderr, which
+ * nxt_runtime_log_files_create() redirects to the log file), and it opens
+ * the files it writes.  So it closes every descriptor from 3 upwards.
+ *
+ * close_range() fails with ENOSYS on Linux before 5.9, and a seccomp
+ * profile can refuse it.  Then, on Linux, the child closes the descriptors
+ * that /proc/self/fd lists.  Only when that directory cannot be read does
+ * it close each number up to the limit: with a limit of 1048576 that loop
+ * took 862 to 892 ms per store.  All of this runs in the child, not in
+ * main.
+ */
+static void
+nxt_main_store_close_fds(void)
+{
+#if (NXT_HAVE_CLOSEFROM && !NXT_HAVE_CLOSE_RANGE && !NXT_HAVE_SYS_CLOSE_RANGE)
+
+    closefrom(3);
+
+#else
+
+    long  fd, max;
+
+#if (NXT_HAVE_CLOSE_RANGE)
+
+    if (close_range(3, ~0U, 0) == 0) {
+        return;
+    }
+
+#elif (NXT_HAVE_SYS_CLOSE_RANGE)
+
+    if (syscall(SYS_close_range, 3, ~0U, 0) == 0) {
+        return;
+    }
+
+#endif
+
+#if (NXT_LINUX)
+
+    if (nxt_main_store_close_proc_fds() == NXT_OK) {
+        return;
+    }
+
+#endif
+
+    max = sysconf(_SC_OPEN_MAX);
+
+    if (max <= 0) {
+        max = 1024;
+    }
+
+    for (fd = 3; fd < max; fd++) {
+        (void) close((int) fd);
+    }
+
+#endif
+}
+
+
+#if (NXT_LINUX)
+
+/*
+ * Close the descriptors from 3 upwards that /proc/self/fd lists, except
+ * the one that reads the directory.  A close changes the directory while
+ * it is read, and readdir() can then skip an entry.  So the scan runs
+ * again from the start until a scan closes nothing, as glibc does in
+ * __closefrom_fallback().
+ */
+static nxt_int_t
+nxt_main_store_close_proc_fds(void)
+{
+    int            dfd;
+    DIR            *dir;
+    nxt_int_t      fd;
+    nxt_bool_t     closed;
+    struct dirent  *de;
+
+    dir = opendir("/proc/self/fd");
+    if (dir == NULL) {
+        return NXT_ERROR;
+    }
+
+    dfd = dirfd(dir);
+
+    do {
+        closed = 0;
+
+        for ( ;; ) {
+            de = readdir(dir);
+            if (de == NULL) {
+                break;
+            }
+
+            /* "." and ".." do not parse. */
+            fd = nxt_int_parse((u_char *) de->d_name,
+                               nxt_strlen(de->d_name));
+
+            if (fd < 3 || fd == dfd) {
+                continue;
+            }
+
+            (void) close((int) fd);
+            closed = 1;
+        }
+
+        rewinddir(dir);
+
+    } while (closed);
+
+    (void) closedir(dir);
+
+    return NXT_OK;
+}
+
+#endif
 
 
 static nxt_int_t

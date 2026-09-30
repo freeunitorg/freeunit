@@ -69,6 +69,56 @@ nxt_feature_test="#define _GNU_SOURCE
 . auto/feature
 
 
+# close_range(), Linux 5.9 with glibc 2.34, FreeBSD 12.2.
+
+nxt_feature="close_range()"
+nxt_feature_name=NXT_HAVE_CLOSE_RANGE
+nxt_feature_run=
+nxt_feature_incs=
+nxt_feature_libs=
+nxt_feature_test="#define _GNU_SOURCE
+                  #include <unistd.h>
+
+                  int main(void) {
+                      return close_range(3, ~0U, 0);
+                  }"
+. auto/feature
+
+
+if [ $nxt_found = no ]; then
+
+    # A libc without the wrapper, such as musl, may still have the number.
+
+    nxt_feature="close_range() syscall"
+    nxt_feature_name=NXT_HAVE_SYS_CLOSE_RANGE
+    nxt_feature_test="#include <unistd.h>
+                      #include <sys/syscall.h>
+
+                      int main(void) {
+                          return syscall(SYS_close_range, 3, ~0U, 0);
+                      }"
+    . auto/feature
+fi
+
+
+# closefrom(), FreeBSD 8.0, NetBSD 3.0, OpenBSD 3.5, Solaris 9.
+# Solaris and illumos declare it in <stdlib.h>, the others in <unistd.h>.
+
+nxt_feature="closefrom()"
+nxt_feature_name=NXT_HAVE_CLOSEFROM
+nxt_feature_run=
+nxt_feature_incs=
+nxt_feature_libs=
+nxt_feature_test="#include <stdlib.h>
+                  #include <unistd.h>
+
+                  int main(void) {
+                      closefrom(3);
+                      return 0;
+                  }"
+. auto/feature
+
+
 nxt_feature="openat2()"
 nxt_feature_name=NXT_HAVE_OPENAT2
 nxt_feature_run=

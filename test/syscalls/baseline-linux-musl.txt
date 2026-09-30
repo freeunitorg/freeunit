@@ -11,6 +11,7 @@ capset
 chmod
 clone
 close
+close_range
 connect
 dup2
 epoll_create1

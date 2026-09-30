@@ -13,6 +13,7 @@ chmod
 clone
 clone3
 close
+close_range
 connect
 dup2
 epoll_create
