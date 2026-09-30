@@ -1,0 +1,324 @@
+[
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_file_name.c",
+    "function": "nxt_file_name_create",
+    "line": 57,
+    "text": "length += v->length;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_h1proto_websocket.c",
+    "function": "nxt_h1p_ws_utf8_validate",
+    "line": 583,
+    "text": "n = state->len + 1;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_http_chunk_parse.c",
+    "function": "nxt_http_chunk_buffer",
+    "line": 386,
+    "text": "p += hcp->chunk_size;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_http_compression.c",
+    "function": "nxt_http_comp_accept_encoding",
+    "line": 644,
+    "text": "len += f->value_length;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_http_request.c",
+    "function": "nxt_http_request_body_alloc",
+    "line": 712,
+    "text": "tmp_name.length = tmp_path->length + tmp_name_pattern.length;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_http_return.c",
+    "function": "nxt_http_return_encode",
+    "line": 163,
+    "text": "encoded->length = location->length + encode * 2;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_http_static.c",
+    "function": "nxt_http_static_send",
+    "line": 522,
+    "text": "length = shr->length + index->length;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_listen_socket.c",
+    "function": "nxt_listen_socket_pool_min_size",
+    "line": 344,
+    "text": "size = ls->socklen + nxt_length(\"unix:\");"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_php_sapi.c",
+    "function": "nxt_php_send_headers",
+    "line": 1436,
+    "text": "resp_size += h->header_len;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_port_socket.c",
+    "function": "nxt_port_read_msg_process",
+    "line": 2660,
+    "text": "b->mem.free += msg->size;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_port_socket.c",
+    "function": "nxt_port_read_msg_process",
+    "line": 2707,
+    "text": "fmsg->size += msg->size;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_router.c",
+    "function": "nxt_router_prepare_msg",
+    "line": 8124,
+    "text": "dst_field->name_length = field->name_length + prefix->length;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_sockaddr.c",
+    "function": "nxt_sockaddr_text",
+    "line": 308,
+    "text": "sa->port_start += sa->address_length;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/nxt_var.c",
+    "function": "nxt_var_interpreter",
+    "line": 573,
+    "text": "length += value->length;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/python/nxt_python_asgi_websocket.c",
+    "function": "nxt_py_asgi_websocket_suspend_frame",
+    "line": 745,
+    "text": "ws->pending_payload_len += frame->payload_len;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/python/nxt_python_asgi_websocket.c",
+    "function": "nxt_py_asgi_websocket_pop_msg",
+    "line": 786,
+    "text": "payload_len = ws->pending_payload_len + frame->payload_len;"
+  },
+  {
+    "ruleId": "len-add-to-checked",
+    "file": "src/python/nxt_python_asgi_websocket.c",
+    "function": "nxt_py_asgi_websocket_pending_len",
+    "line": 964,
+    "text": "res += p->frame->payload_len;"
+  },
+  {
+    "ruleId": "memcpy-computed-size",
+    "file": "src/wasm/nxt_wasm.c",
+    "function": "nxt_wasm_request_handler",
+    "line": 278,
+    "text": "memcpy((uint8_t *)wr + offset, name, nlen + 1)"
+  },
+  {
+    "ruleId": "memcpy-computed-size",
+    "file": "src/wasm/nxt_wasm.c",
+    "function": "nxt_wasm_request_handler",
+    "line": 284,
+    "text": "memcpy((uint8_t *)wr + offset, value, vlen + 1)"
+  },
+  {
+    "ruleId": "narrowing-to-proto",
+    "file": "src/nxt_router.c",
+    "function": "nxt_router_prepare_msg",
+    "line": 8043,
+    "text": "req->method_length = r->method->length"
+  },
+  {
+    "ruleId": "narrowing-to-proto",
+    "file": "src/nxt_router.c",
+    "function": "nxt_router_prepare_msg",
+    "line": 8048,
+    "text": "req->version_length = r->version.length"
+  },
+  {
+    "ruleId": "narrowing-to-proto",
+    "file": "src/nxt_router.c",
+    "function": "nxt_router_prepare_msg",
+    "line": 8053,
+    "text": "req->remote_length = r->remote->address_length"
+  },
+  {
+    "ruleId": "narrowing-to-proto",
+    "file": "src/nxt_router.c",
+    "function": "nxt_router_prepare_msg",
+    "line": 8059,
+    "text": "req->local_addr_length = r->local->address_length"
+  },
+  {
+    "ruleId": "narrowing-to-proto",
+    "file": "src/nxt_router.c",
+    "function": "nxt_router_prepare_msg",
+    "line": 8064,
+    "text": "req->local_port_length = nxt_sockaddr_port_length(r->local)"
+  },
+  {
+    "ruleId": "narrowing-to-proto",
+    "file": "src/nxt_router.c",
+    "function": "nxt_router_prepare_msg",
+    "line": 8084,
+    "text": "(uint32_t) r->path->length"
+  },
+  {
+    "ruleId": "narrowing-to-proto",
+    "file": "src/nxt_router.c",
+    "function": "nxt_router_prepare_msg",
+    "line": 8094,
+    "text": "(uint32_t) r->args->length"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_file_name.c",
+    "function": "nxt_file_name_create",
+    "line": 182,
+    "text": "*dst++ = *fn++;"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_sprintf.c",
+    "function": "nxt_vsprintf",
+    "line": 130,
+    "text": "*buf++ = *fmt++;"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_sprintf.c",
+    "function": "nxt_vsprintf",
+    "line": 163,
+    "text": "*buf++ = *p++;"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_sprintf.c",
+    "function": "nxt_vsprintf",
+    "line": 485,
+    "text": "*buf++ = *p++;"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_sprintf.c",
+    "function": "nxt_vsprintf",
+    "line": 535,
+    "text": "*buf++ = *fmt++;"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_sprintf.c",
+    "function": "nxt_integer",
+    "line": 672,
+    "text": "*buf++ = *p++;"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_sprintf.c",
+    "function": "nxt_number",
+    "line": 713,
+    "text": "*buf++ = *p++;"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_unit.c",
+    "function": "nxt_unit_shm_copy",
+    "line": 301,
+    "text": "*d++ = *s++;"
+  },
+  {
+    "ruleId": "no-raw-untrusted-iter",
+    "file": "src/nxt_utf8.c",
+    "function": "nxt_utf8_sanitize",
+    "line": 262,
+    "text": "*d++ = *p++;"
+  },
+  {
+    "ruleId": "shm-double-fetch",
+    "file": "src/nxt_conf_validation.c",
+    "function": "nxt_conf_vldt_edit_distance",
+    "line": 2110,
+    "text": "b->length"
+  },
+  {
+    "ruleId": "shm-double-fetch",
+    "file": "src/nxt_conf_validation.c",
+    "function": "nxt_conf_vldt_edit_distance",
+    "line": 2115,
+    "text": "a->length"
+  },
+  {
+    "ruleId": "shm-double-fetch",
+    "file": "src/nxt_http_return.c",
+    "function": "nxt_http_return",
+    "line": 115,
+    "text": "r->status = conf->status;"
+  },
+  {
+    "ruleId": "shm-double-fetch",
+    "file": "src/nxt_router.c",
+    "function": "nxt_router_prepare_msg",
+    "line": 8043,
+    "text": "req->method_length = r->method->length;"
+  },
+  {
+    "ruleId": "shm-double-fetch",
+    "file": "src/nxt_router.c",
+    "function": "nxt_router_prepare_msg",
+    "line": 8053,
+    "text": "req->remote_length = r->remote->address_length;"
+  },
+  {
+    "ruleId": "shm-double-fetch",
+    "file": "src/nxt_router.c",
+    "function": "nxt_router_prepare_msg",
+    "line": 8059,
+    "text": "req->local_addr_length = r->local->address_length;"
+  },
+  {
+    "ruleId": "shm-double-fetch",
+    "file": "src/nxt_timer.c",
+    "function": "nxt_timer_change",
+    "line": 145,
+    "text": "timer->change = timers->nchanges;"
+  },
+  {
+    "ruleId": "shm-double-fetch",
+    "file": "src/nxt_unit.c",
+    "function": "nxt_unit_response_realloc",
+    "line": 2589,
+    "text": "req->response->fields_count"
+  },
+  {
+    "ruleId": "shm-double-fetch",
+    "file": "src/nxt_unit.c",
+    "function": "nxt_unit_response_realloc",
+    "line": 2634,
+    "text": "resp->piggyback_content_length =\n                                       req->response->piggyback_content_length;"
+  },
+  {
+    "ruleId": "shm-double-fetch",
+    "file": "src/wasm/nxt_wasm.c",
+    "function": "nxt_wasm_do_send_headers",
+    "line": 95,
+    "text": "rh->nfields"
+  },
+  {
+    "ruleId": "shm-double-fetch",
+    "file": "src/wasm/nxt_wasm.c",
+    "function": "nxt_wasm_do_send_headers",
+    "line": 138,
+    "text": "rh->nfields"
+  }
+]

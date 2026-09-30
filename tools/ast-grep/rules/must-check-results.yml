@@ -1,0 +1,19 @@
+id: must-check-results
+language: c
+severity: error
+message: >-
+  The return value of this call is not checked. nxt_port_socket_write2(),
+  nxt_port_mmap_get_buf(), nxt_app_queue_send() and nxt_port_queue_send()
+  report a failure: a negative value, or NULL from nxt_port_mmap_get_buf().
+  The caller must act on it. A call as a statement, or a "(void)" cast of the
+  result, discards the failure.
+rule:
+  any:
+    - pattern: nxt_port_socket_write2($$$);
+    - pattern: nxt_port_mmap_get_buf($$$);
+    - pattern: nxt_app_queue_send($$$);
+    - pattern: nxt_port_queue_send($$$);
+    - pattern: (void) nxt_port_socket_write2($$$);
+    - pattern: (void) nxt_port_mmap_get_buf($$$);
+    - pattern: (void) nxt_app_queue_send($$$);
+    - pattern: (void) nxt_port_queue_send($$$);

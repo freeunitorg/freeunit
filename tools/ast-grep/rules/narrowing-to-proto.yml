@@ -1,0 +1,31 @@
+id: narrowing-to-proto
+language: c
+severity: warning
+message: >-
+  A length is stored in a narrower integer. Check the range first, for
+  example "if (len > UINT8_MAX) { return NXT_ERROR; }". Then a value that
+  does not fit is refused. Without the check, the value is truncated in the
+  protocol field.
+note: >-
+  ast-grep does not know the C types. The rule matches two forms. The first
+  is a cast to uint8_t, uint16_t or uint32_t of a field whose name ends in
+  "len", "length" or "size". The second is an assignment to one of the five
+  uint8_t length fields of nxt_unit_request_t (src/nxt_unit_request.h):
+  method_length, version_length, remote_length, local_addr_length and
+  local_port_length. A match with a range check before it is safe. It goes
+  into baseline.json.
+rule:
+  any:
+    - pattern: (uint8_t) $X->$LENFIELD
+    - pattern: (uint16_t) $X->$LENFIELD
+    - pattern: (uint32_t) $X->$LENFIELD
+    - kind: assignment_expression
+      has:
+        field: left
+        kind: field_expression
+        has:
+          field: field
+          regex: "^(method|version|remote|local_addr|local_port)_length$"
+constraints:
+  LENFIELD:
+    regex: "(len|length|size)$"

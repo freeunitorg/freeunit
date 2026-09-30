@@ -1,0 +1,31 @@
+id: len-add-to-checked
+valid:
+  - |
+    nxt_int_t f(nxt_buf_t *a, nxt_buf_t *b, size_t *out) {
+        if (nxt_size_add(a->len, b->len, out)) {
+            return NXT_ERROR;
+        }
+
+        return NXT_OK;
+    }
+  - |
+    void f(nxt_buf_t *a, size_t n) {
+        size_t total;
+
+        total = n + 1;
+    }
+invalid:
+  - |
+    void f(nxt_buf_t *a, nxt_buf_t *b) {
+        size_t total;
+
+        total = a->len + b->len;
+    }
+  - |
+    void f(nxt_buf_t *a, nxt_buf_t *b) {
+        size_t total = a->len + b->len;
+    }
+  - |
+    void f(nxt_port_recv_msg_t *fmsg, nxt_port_recv_msg_t *msg) {
+        fmsg->size += msg->size;
+    }

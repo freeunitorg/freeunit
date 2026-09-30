@@ -1,0 +1,10 @@
+id: unchecked-realloc
+language: c
+severity: warning
+message: >-
+  The result of realloc() is stored in the pointer that is resized. When
+  realloc() fails, it returns NULL and keeps the old block. This statement
+  then loses the only pointer to the old block, and the next use reads NULL.
+  Store the result in a temporary pointer and check it first.
+rule:
+  pattern: $X = realloc($X, $$$);

@@ -1,0 +1,44 @@
+id: shm-double-fetch
+language: c
+severity: hint
+message: >-
+  A struct field is compared with a bound and read again later, after the
+  "if". Read the field once into a local and use the local for the check and
+  after it. If the struct is in memory that another process can write (a
+  port mmap buffer, or a request or response in shared memory), that process
+  can change the field between the check and the second read.
+note: >-
+  The rule matches an "if" whose condition compares a field with ">", ">=",
+  "<" or "<=". It then matches a later statement in the same block that
+  assigns the field ("x = p->f;"), or the field in a comparison in the
+  condition of a later "for" loop. Other statements can be between the
+  two. Many matches are plain heap structs that no other process can
+  write. The baseline check fails on each new match, as for every other
+  rule. A safe new match goes into baseline.json.
+utils:
+  bound-check:
+    kind: if_statement
+    has:
+      field: condition
+      stopBy: end
+      any:
+        - pattern: $X->$F > $Y
+        - pattern: $X->$F >= $Y
+        - pattern: $Y < $X->$F
+        - pattern: $Y <= $X->$F
+rule:
+  any:
+    - pattern: $Z = $X->$F;
+      follows:
+        stopBy: end
+        matches: bound-check
+    - pattern: $X->$F
+      inside:
+        kind: binary_expression
+        stopBy: end
+        inside:
+          field: condition
+          kind: for_statement
+          follows:
+            stopBy: end
+            matches: bound-check
