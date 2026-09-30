@@ -98,6 +98,7 @@ static void nxt_controller_process_request(nxt_task_t *task,
     nxt_controller_request_t *req);
 static void nxt_controller_process_config(nxt_task_t *task,
     nxt_controller_request_t *req, nxt_str_t *path);
+static nxt_bool_t nxt_controller_store_in_flight(void);
 static nxt_bool_t nxt_controller_check_postpone_request(nxt_task_t *task);
 static void nxt_controller_process_status(nxt_task_t *task,
     nxt_controller_request_t *req);
@@ -110,6 +111,8 @@ static void nxt_controller_process_cert(nxt_task_t *task,
     nxt_controller_request_t *req, nxt_str_t *path);
 static void nxt_controller_cert_store_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
+static void nxt_controller_cert_apply(nxt_task_t *task,
+    nxt_controller_cert_store_t *store);
 static void nxt_controller_cert_apply_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
 static nxt_bool_t nxt_controller_cert_in_use(nxt_str_t *name);
@@ -153,6 +156,8 @@ static nxt_queue_t             nxt_controller_waiting_requests;
 static nxt_bool_t              nxt_controller_waiting_init_conf;
 #if (NXT_TLS)
 static nxt_bool_t              nxt_controller_cert_storing;
+/* A stored bundle that waits for the first configuration of a router. */
+static nxt_controller_cert_store_t  *nxt_controller_cert_stored;
 #endif
 static nxt_conf_value_t        *nxt_controller_status;
 
@@ -588,7 +593,10 @@ static void
 nxt_controller_conf_init_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
-    nxt_runtime_t  *rt;
+    nxt_runtime_t                *rt;
+#if (NXT_TLS)
+    nxt_controller_cert_store_t  *store;
+#endif
 
     nxt_controller_waiting_init_conf = 0;
 
@@ -613,6 +621,18 @@ nxt_controller_conf_init_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
         nxt_controller_listening = 1;
     }
+
+#if (NXT_TLS)
+    store = nxt_controller_cert_stored;
+
+    if (store != NULL) {
+        /* It runs the waiting requests when it ends. */
+        nxt_controller_cert_stored = NULL;
+
+        nxt_controller_cert_apply(task, store);
+        return;
+    }
+#endif
 
     nxt_controller_flush_requests(task);
 }
@@ -1862,6 +1882,25 @@ alloc_fail:
 }
 
 
+/*
+ * Whether main is storing a file for a request that waits for the answer.
+ * The store runs in a child of main and can take as long as a few fsync(2)
+ * calls.  The request is not in the waiting queue meanwhile: a router that
+ * restarts flushes the queue (nxt_controller_conf_init_handler()), and a
+ * request in it would run a second time, and be freed while main still
+ * answers it.  So the other requests wait while this is true.
+ */
+static nxt_bool_t
+nxt_controller_store_in_flight(void)
+{
+#if (NXT_TLS)
+    return nxt_controller_cert_storing;
+#else
+    return 0;
+#endif
+}
+
+
 static nxt_bool_t
 nxt_controller_check_postpone_request(nxt_task_t *task)
 {
@@ -1869,6 +1908,7 @@ nxt_controller_check_postpone_request(nxt_task_t *task)
     nxt_runtime_t  *rt;
 
     if (!nxt_queue_is_empty(&nxt_controller_waiting_requests)
+        || nxt_controller_store_in_flight()
         || nxt_controller_waiting_init_conf
         || !nxt_controller_router_ready)
     {
@@ -2147,8 +2187,11 @@ nxt_controller_process_cert(nxt_task_t *task,
         store->name = name;
         store->req = req;
 
-        /* Any other change waits until main answers. */
-        nxt_queue_insert_head(&nxt_controller_waiting_requests, &req->link);
+        /*
+         * Any other change waits until main answers: see
+         * nxt_controller_store_in_flight().  The request itself is not in
+         * the waiting queue, so a flush of the queue cannot run it again.
+         */
 
         nxt_cert_store_put(task, &name, &c->read->mem, c->mem_pool,
                            nxt_controller_cert_store_handler, store);
@@ -2267,41 +2310,72 @@ alloc_fail:
 
 /*
  * Main stored the bundle, or the store failed.  On failure, the old metadata
- * goes back, so a failed store leaves no metadata without a file.  When the
- * current configuration names the bundle, the controller sends the
- * configuration to the router again.  The router reads every bundle during a
- * reconfiguration, so new handshakes get the new certificate.  Accepted
- * connections keep their old TLS context.
+ * goes back, so a failed store leaves no metadata without a file.
  */
 static void
 nxt_controller_cert_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
-    nxt_int_t                    rc;
-    nxt_runtime_t                *rt;
-    nxt_controller_request_t     *req;
     nxt_controller_response_t    resp;
     nxt_controller_cert_store_t  *store;
 
     store = data;
-    req = store->req;
-
-    nxt_queue_remove(&req->link);
-
-    nxt_memzero(&resp, sizeof(nxt_controller_response_t));
 
     nxt_controller_cert_storing = 0;
 
     if (msg == NULL || msg->port_msg.type != NXT_PORT_MSG_RPC_READY) {
         nxt_cert_info_restore(store->info, store->old);
 
+        nxt_memzero(&resp, sizeof(nxt_controller_response_t));
+
         resp.status = 500;
         resp.title = (u_char *) "Failed to store certificate.";
         resp.offset = -1;
-        goto done;
+
+        nxt_controller_response(task, store->req, &resp);
+
+        nxt_controller_flush_requests(task);
+        return;
     }
 
     nxt_cert_info_release(store->old);
+
+    /*
+     * The router restarted during the store, and the new router applies
+     * its first configuration now.  A second configuration sent before
+     * that one ends would run at the same time in the router, and the
+     * router does not support that.  nxt_controller_conf_init_handler()
+     * goes on with this store.  The other changes wait meanwhile, because
+     * nxt_controller_waiting_init_conf is set.
+     */
+    if (nxt_controller_waiting_init_conf) {
+        nxt_controller_cert_stored = store;
+        return;
+    }
+
+    nxt_controller_cert_apply(task, store);
+}
+
+
+/*
+ * When the current configuration names the stored bundle, the controller
+ * sends the configuration to the router again.  The router reads every
+ * bundle during a reconfiguration, so new handshakes get the new
+ * certificate.  Accepted connections keep their old TLS context.  The
+ * first configuration of a new router may have read the old bundle, so a
+ * bundle that waited for it is applied as well.
+ */
+static void
+nxt_controller_cert_apply(nxt_task_t *task, nxt_controller_cert_store_t *store)
+{
+    nxt_int_t                  rc;
+    nxt_runtime_t              *rt;
+    nxt_controller_request_t   *req;
+    nxt_controller_response_t  resp;
+
+    req = store->req;
+
+    nxt_memzero(&resp, sizeof(nxt_controller_response_t));
 
     rt = task->thread->runtime;
 
@@ -2327,13 +2401,11 @@ nxt_controller_cert_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         resp.status = 500;
         resp.title = (u_char *) "Certificate stored but not applied.";
         resp.offset = -1;
-        goto done;
+
+    } else {
+        resp.status = 200;
+        resp.title = (u_char *) "Certificate chain uploaded.";
     }
-
-    resp.status = 200;
-    resp.title = (u_char *) "Certificate chain uploaded.";
-
-done:
 
     nxt_controller_response(task, req, &resp);
 

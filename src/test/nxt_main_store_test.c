@@ -26,11 +26,28 @@
  *     before it stores.  The test holds the read end of a pipe and gives
  *     the write end to the child only.  The read end must see the end of
  *     file while the child still sleeps.
+ *   - Stores start in the order they came.  A conf.json store that
+ *     replaces a pending one takes its place.  So a DELETE never runs
+ *     before an older conf.json store.
+ *   - Certificate bundles (with TLS).  nxt_cert_store_put_handler() gives
+ *     the bundle to a store child and answers the controller only when the
+ *     child exits: nothing is on the reply port while the child runs.  Two
+ *     uploads in quick succession both land, each gets its own answer, in
+ *     order.  A conf.json store that arrives between them runs between
+ *     them, and it does not kill the certificate child, even when main
+ *     exits.  A DELETE that follows a PUT of the same bundle runs after
+ *     it, so the bundle is gone at the end.
  */
 
 #include <nxt_main.h>
 #include <nxt_runtime.h>
+#include <nxt_port.h>
+#include <nxt_port_hash.h>
 #include <nxt_main_process.h>
+#include <nxt_event_engine.h>
+#if (NXT_TLS)
+#include <nxt_cert.h>
+#endif
 #include "nxt_tests.h"
 
 #include <poll.h>
@@ -54,6 +71,8 @@ typedef struct {
     char  conf_tmp[NXT_MAX_PATH_LEN];
     char  ver[NXT_MAX_PATH_LEN];
     char  ver_tmp[NXT_MAX_PATH_LEN];
+    char  certs[NXT_MAX_PATH_LEN];
+    char  bundle[NXT_MAX_PATH_LEN];
 } nxt_main_store_test_paths_t;
 
 
@@ -646,6 +665,641 @@ done:
 }
 
 
+static nxt_int_t
+nxt_main_store_test_write(const char *name, const char *content)
+{
+    int      fd;
+    size_t   len;
+    ssize_t  n;
+
+    fd = open(name, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd == -1) {
+        return NXT_ERROR;
+    }
+
+    len = nxt_strlen(content);
+
+    n = write(fd, content, len);
+
+    close(fd);
+
+    return (n == (ssize_t) len) ? NXT_OK : NXT_ERROR;
+}
+
+
+/* Reap the store child that runs now, and require that it exited with 0. */
+static nxt_int_t
+nxt_main_store_test_reap(nxt_thread_t *thr, nxt_task_t *task,
+    const char *what)
+{
+    int        status;
+    nxt_pid_t  pid;
+
+    pid = nxt_main_test_store_pid();
+    if (pid == 0) {
+        nxt_log_alert(thr->log, "main store test: no store child for %s",
+                      what);
+        return NXT_ERROR;
+    }
+
+    if (nxt_main_store_test_wait(pid, &status) != 0) {
+        nxt_log_alert(thr->log, "main store test: waitpid(%PI) failed %E",
+                      pid, nxt_errno);
+        return NXT_ERROR;
+    }
+
+    (void) nxt_main_test_store_exited(task, pid, status);
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        nxt_log_alert(thr->log, "main store test: the store child of %s "
+                      "ended with status 0x%Xi", what, (nxt_uint_t) status);
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+
+/* "<dir><name>" exists. */
+static nxt_bool_t
+nxt_main_store_test_exists(const char *dir, const char *name)
+{
+    char         path[NXT_MAX_PATH_LEN];
+    struct stat  st;
+
+    (void) nxt_sprintf((u_char *) path, (u_char *) path + sizeof(path),
+                       "%s%s%Z", dir, name);
+
+    return (stat(path, &st) == 0);
+}
+
+
+/* Queue a DELETE of "<dir><name>" that nobody waits for. */
+static nxt_int_t
+nxt_main_store_test_submit_delete(nxt_task_t *task, const char *dir,
+    const char *name)
+{
+    nxt_str_t             d, n;
+    nxt_main_store_job_t  *job;
+
+    d.start = (u_char *) dir;
+    d.length = nxt_strlen(dir);
+    n.start = (u_char *) name;
+    n.length = nxt_strlen(name);
+
+    job = nxt_main_store_job_create(NXT_MAIN_STORE_DELETE, "file", &d, &n);
+    if (nxt_slow_path(job == NULL)) {
+        return NXT_ERROR;
+    }
+
+    nxt_main_store_submit(task, job);
+
+    return NXT_OK;
+}
+
+
+/*
+ * Stores start in the order they came.  A conf.json store "A" runs.  Then
+ * come a DELETE of "first", a conf.json store "B", a DELETE of "old", and a
+ * conf.json store "C" that replaces "B".  The order must be A, the DELETE
+ * of "first", C, the DELETE of "old".  Before the change, both DELETEs ran
+ * before C, so "old" was gone while conf.json still held A.
+ */
+static nxt_int_t
+nxt_main_store_test_order(nxt_thread_t *thr, nxt_task_t *task,
+    nxt_main_store_test_paths_t *paths)
+{
+    nxt_int_t  ret;
+    char       dir[NXT_MAX_PATH_LEN], name[NXT_MAX_PATH_LEN];
+
+    ret = NXT_ERROR;
+
+    nxt_main_store_test_alerts = 0;
+
+    nxt_main_test_store_set_delay(0);
+
+    (void) nxt_sprintf((u_char *) dir, (u_char *) dir + sizeof(dir), "%s/%Z",
+                       paths->dir);
+
+    (void) nxt_sprintf((u_char *) name, (u_char *) name + sizeof(name),
+                       "%sfirst%Z", dir);
+
+    if (nxt_main_store_test_write(name, "first") != NXT_OK) {
+        nxt_main_store_test_fail(thr, "cannot write \"%s\"", name);
+    }
+
+    (void) nxt_sprintf((u_char *) name, (u_char *) name + sizeof(name),
+                       "%sold%Z", dir);
+
+    if (nxt_main_store_test_write(name, "old") != NXT_OK) {
+        nxt_main_store_test_fail(thr, "cannot write \"%s\"", name);
+    }
+
+    /* The child of A runs; the rest waits for it. */
+
+    if (nxt_main_store_test_schedule(task, "{\"A\":1}") != NXT_OK) {
+        nxt_main_store_test_fail(thr, "cannot map A");
+    }
+
+    if (nxt_main_test_store_pid() == 0) {
+        nxt_main_store_test_fail(thr, "A started no child");
+    }
+
+    if (nxt_main_store_test_submit_delete(task, dir, "first") != NXT_OK) {
+        nxt_main_store_test_fail(thr, "cannot queue the DELETE of first");
+    }
+
+    if (nxt_main_store_test_schedule(task, "{\"B\":2}") != NXT_OK) {
+        nxt_main_store_test_fail(thr, "cannot map B");
+    }
+
+    if (nxt_main_store_test_submit_delete(task, dir, "old") != NXT_OK) {
+        nxt_main_store_test_fail(thr, "cannot queue the DELETE of old");
+    }
+
+    if (nxt_main_store_test_schedule(task, "{\"C\":3}") != NXT_OK) {
+        nxt_main_store_test_fail(thr, "cannot map C");
+    }
+
+    if (nxt_main_store_test_reap(thr, task, "A") != NXT_OK) {
+        goto done;
+    }
+
+    if (!nxt_main_store_test_holds(paths->conf, "{\"A\":1}")) {
+        nxt_main_store_test_fail(thr, "\"%s\" does not hold A", paths->conf);
+    }
+
+    /* The DELETE of "first" came before B, so it runs before C. */
+
+    if (nxt_main_store_test_reap(thr, task, "the second store") != NXT_OK) {
+        goto done;
+    }
+
+    if (nxt_main_store_test_exists(dir, "first")
+        || !nxt_main_store_test_holds(paths->conf, "{\"A\":1}"))
+    {
+        nxt_main_store_test_fail(thr, "the second store was not the DELETE "
+                                 "of \"first\", which came before B");
+    }
+
+    /* C took the place of B, so it runs before the DELETE of "old". */
+
+    if (nxt_main_store_test_reap(thr, task, "the third store") != NXT_OK) {
+        goto done;
+    }
+
+    if (!nxt_main_store_test_exists(dir, "old")) {
+        nxt_main_store_test_fail(thr, "\"%sold\" was deleted before C, which "
+                                 "took the place of the older B", dir);
+    }
+
+    if (!nxt_main_store_test_holds(paths->conf, "{\"C\":3}")) {
+        nxt_main_store_test_fail(thr, "\"%s\" does not hold C after the "
+                                 "third store", paths->conf);
+    }
+
+    if (nxt_main_store_test_reap(thr, task, "the DELETE of old") != NXT_OK) {
+        goto done;
+    }
+
+    if (nxt_main_store_test_exists(dir, "old")) {
+        nxt_main_store_test_fail(thr, "\"%sold\" was not deleted", dir);
+    }
+
+    if (nxt_main_test_store_pid() != 0) {
+        nxt_main_store_test_fail(thr, "a store child runs with nothing "
+                                 "pending");
+    }
+
+    if (nxt_main_store_test_alerts != 0) {
+        nxt_main_store_test_fail(thr, "%ui alerts", nxt_main_store_test_alerts);
+    }
+
+    ret = NXT_OK;
+
+done:
+
+    nxt_main_store_test_reap_all(task);
+
+    (void) nxt_sprintf((u_char *) name, (u_char *) name + sizeof(name),
+                       "%sfirst%Z", dir);
+    (void) unlink(name);
+
+    (void) nxt_sprintf((u_char *) name, (u_char *) name + sizeof(name),
+                       "%sold%Z", dir);
+    (void) unlink(name);
+
+    return ret;
+}
+
+
+#if (NXT_TLS)
+
+/* A message of the controller, as the port layer gives it to main. */
+static void
+nxt_main_store_test_msg(nxt_port_recv_msg_t *msg, nxt_buf_t *b, u_char *buf,
+    size_t len, nxt_port_t *port, uint32_t stream, nxt_fd_t fd)
+{
+    nxt_memzero(msg, sizeof(nxt_port_recv_msg_t));
+    nxt_memzero(b, sizeof(nxt_buf_t));
+
+    b->mem.start = buf;
+    b->mem.pos = buf;
+    b->mem.free = buf + len;
+    b->mem.end = buf + len;
+
+    msg->buf = b;
+    msg->fd[0] = fd;
+    msg->fd[1] = -1;
+    msg->port_msg.pid = nxt_pid;
+    msg->port_msg.reply_port = port->id;
+    msg->port_msg.stream = stream;
+#if (NXT_USE_CMSG_PID)
+    msg->cmsg_pid = nxt_pid;
+#endif
+}
+
+
+/* PUT /certificates/<name>, as nxt_cert_store_put() sends it. */
+static nxt_int_t
+nxt_main_store_test_put(nxt_task_t *task, nxt_main_store_test_paths_t *paths,
+    nxt_port_t *port, const char *name, const char *content, uint32_t stream)
+{
+    u_char               *p;
+    size_t               size;
+    nxt_fd_t             fd;
+    nxt_buf_t            b;
+    nxt_port_recv_msg_t  msg;
+    u_char               buf[64];
+
+    if (nxt_main_store_test_write(paths->bundle, content) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    fd = open(paths->bundle, O_RDONLY);
+    if (fd == -1) {
+        return NXT_ERROR;
+    }
+
+    size = nxt_strlen(content);
+
+    p = nxt_cpymem(buf, name, nxt_strlen(name) + 1);
+    p = nxt_cpymem(p, &size, sizeof(size_t));
+
+    nxt_main_store_test_msg(&msg, &b, buf, p - buf, port, stream, fd);
+
+    nxt_cert_store_put_handler(task, &msg);
+
+    if (msg.fd[0] != -1 && nxt_test_fd_is_open(fd)) {
+        (void) close(fd);
+    }
+
+    return NXT_OK;
+}
+
+
+/* DELETE /certificates/<name>, as nxt_cert_store_delete() sends it. */
+static void
+nxt_main_store_test_delete(nxt_task_t *task, nxt_port_t *port,
+    const char *name)
+{
+    size_t               len;
+    nxt_buf_t            b;
+    nxt_port_recv_msg_t  msg;
+    u_char               buf[64];
+
+    len = nxt_strlen(name) + 1;
+
+    nxt_memcpy(buf, name, len);
+
+    nxt_main_store_test_msg(&msg, &b, buf, len, port, 0, -1);
+
+    nxt_cert_store_delete_handler(task, &msg);
+}
+
+
+/* The number of answers on the port, and the last one. */
+static nxt_uint_t
+nxt_main_store_test_replies(nxt_port_t *port, nxt_port_send_msg_t **last)
+{
+    nxt_uint_t        n;
+    nxt_queue_link_t  *link;
+
+    n = 0;
+    *last = NULL;
+
+    for (link = nxt_queue_first(&port->messages);
+         link != nxt_queue_tail(&port->messages);
+         link = nxt_queue_next(link))
+    {
+        n++;
+        *last = nxt_queue_link_data(link, nxt_port_send_msg_t, link);
+    }
+
+    return n;
+}
+
+
+static nxt_int_t
+nxt_main_store_test_reply(nxt_thread_t *thr, nxt_port_t *port, nxt_uint_t n,
+    uint32_t stream, const char *what)
+{
+    nxt_uint_t           count;
+    nxt_port_send_msg_t  *sent;
+
+    count = nxt_main_store_test_replies(port, &sent);
+
+    if (count != n) {
+        nxt_log_alert(thr->log, "main store test: %ui answers after %s "
+                      "(expected %ui)", count, what, n);
+        return NXT_ERROR;
+    }
+
+    if (sent->port_msg.type != _NXT_PORT_MSG_RPC_READY
+        || sent->port_msg.last != 1
+        || sent->port_msg.stream != stream)
+    {
+        nxt_log_alert(thr->log, "main store test: %s answered type %d, "
+                      "last %d, stream %uD (expected %d, 1, %uD)", what,
+                      (int) sent->port_msg.type, (int) sent->port_msg.last,
+                      sent->port_msg.stream, (int) _NXT_PORT_MSG_RPC_READY,
+                      stream);
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_main_store_test_certs(nxt_thread_t *thr, nxt_task_t *task,
+    nxt_runtime_t *rt, nxt_main_store_test_paths_t *paths)
+{
+    char                 name[NXT_MAX_PATH_LEN];
+    nxt_mp_t             *mp;
+    nxt_int_t            ret;
+    nxt_port_t           *port;
+    struct stat          st;
+    nxt_event_engine_t   engine, *saved_engine;
+    nxt_port_send_msg_t  *sent;
+
+    ret = NXT_ERROR;
+    port = NULL;
+
+    if (mkdir(paths->certs, 0700) != 0) {
+        nxt_log_alert(thr->log, "main store test: mkdir(\"%s\") failed %E",
+                      paths->certs, nxt_errno);
+        return NXT_ERROR;
+    }
+
+    rt->certs.start = (u_char *) paths->certs;
+    rt->certs.length = nxt_strlen(paths->certs);
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (nxt_slow_path(mp == NULL)) {
+        return NXT_ERROR;
+    }
+
+    /* The engine is what the teardown of queued messages needs. */
+    nxt_memzero(&engine, sizeof(engine));
+    nxt_work_queue_cache_create(&engine.work_queue_cache, 1024);
+    engine.fast_work_queue.cache = &engine.work_queue_cache;
+    nxt_work_queue_name(&engine.fast_work_queue, "fast");
+    engine.mem_pool = mp;
+
+    saved_engine = thr->engine;
+    thr->engine = &engine;
+    rt->main_engine = &engine;
+
+    /*
+     * The port of the controller.  No queue and write_ready unset, so an
+     * answer is queued on port->messages rather than written.
+     */
+    port = nxt_port_new(task, 0, nxt_pid, NXT_PROCESS_CONTROLLER);
+    if (nxt_slow_path(port == NULL)) {
+        goto done;
+    }
+
+    port->pair[0] = -1;
+    port->pair[1] = -1;
+    port->socket.fd = -1;
+
+    rt->port_by_type[NXT_PROCESS_CONTROLLER] = port;
+
+    if (nxt_slow_path(nxt_port_hash_add(&rt->ports, port) != NXT_OK)) {
+        nxt_port_use(task, port, -1);
+        port = NULL;
+        goto done;
+    }
+
+    nxt_main_store_test_alerts = 0;
+
+    /* The first upload.  Its child sleeps before it stores. */
+
+    nxt_main_test_store_set_delay(NXT_MAIN_STORE_TEST_DELAY);
+
+    if (nxt_main_store_test_put(task, paths, port, "one", "bundle one",
+                                0x11111111)
+        != NXT_OK)
+    {
+        nxt_main_store_test_fail(thr, "cannot send the first bundle");
+    }
+
+    if (!nxt_queue_is_empty(&port->messages)) {
+        nxt_main_store_test_fail(thr, "main answered the upload before the "
+                                 "bundle was stored");
+    }
+
+    if (nxt_main_test_store_pid() == 0) {
+        nxt_main_store_test_fail(thr, "the upload started no store child");
+    }
+
+    /*
+     * A conf.json store and a second upload arrive while it runs.  Main
+     * starts to exit then, so a conf.json store child would be killed.
+     */
+
+    if (nxt_main_store_test_schedule(task, "{\"f\":6}") != NXT_OK) {
+        nxt_main_store_test_fail(thr, "cannot map the conf.json store");
+    }
+
+    nxt_main_test_store_set_exiting(task, 1);
+
+    if (nxt_main_store_test_put(task, paths, port, "two", "bundle two",
+                                0x22222222)
+        != NXT_OK)
+    {
+        nxt_main_store_test_fail(thr, "cannot send the second bundle");
+    }
+
+    nxt_main_test_store_set_delay(0);
+
+    if (!nxt_queue_is_empty(&port->messages)) {
+        nxt_main_store_test_fail(thr, "main answered an upload before its "
+                                 "store child exited");
+    }
+
+    (void) nxt_sprintf((u_char *) name, (u_char *) name + sizeof(name),
+                       "%sone%Z", paths->certs);
+
+    if (nxt_main_store_test_reap(thr, task, "the first bundle") != NXT_OK) {
+        goto done;
+    }
+
+    if (nxt_main_store_test_reply(thr, port, 1, 0x11111111,
+                                  "the first bundle")
+        != NXT_OK)
+    {
+        goto done;
+    }
+
+    if (!nxt_main_store_test_holds(name, "bundle one")) {
+        nxt_main_store_test_fail(thr, "\"%s\" does not hold the first bundle "
+                                 "after the answer", name);
+    }
+
+    /* The conf.json store came before the second upload. */
+
+    if (nxt_main_store_test_reap(thr, task, "conf.json") != NXT_OK) {
+        goto done;
+    }
+
+    if (!nxt_main_store_test_holds(paths->conf, "{\"f\":6}")) {
+        nxt_main_store_test_fail(thr, "\"%s\" does not hold the "
+                                 "configuration", paths->conf);
+    }
+
+    if (nxt_main_store_test_replies(port, &sent) != 1) {
+        nxt_main_store_test_fail(thr, "the second bundle was stored before "
+                                 "the older conf.json store");
+    }
+
+    (void) nxt_sprintf((u_char *) name, (u_char *) name + sizeof(name),
+                       "%stwo%Z", paths->certs);
+
+    if (nxt_main_store_test_reap(thr, task, "the second bundle") != NXT_OK) {
+        goto done;
+    }
+
+    if (nxt_main_store_test_reply(thr, port, 2, 0x22222222,
+                                  "the second bundle")
+        != NXT_OK)
+    {
+        goto done;
+    }
+
+    if (!nxt_main_store_test_holds(name, "bundle two")) {
+        nxt_main_store_test_fail(thr, "\"%s\" does not hold the second "
+                                 "bundle after the answer", name);
+    }
+
+    if (nxt_main_test_store_pid() != 0) {
+        nxt_main_store_test_fail(thr, "a store child runs with nothing "
+                                 "pending");
+    }
+
+    nxt_main_test_store_set_exiting(task, 0);
+
+    /* A DELETE right after a PUT of the same bundle runs after it. */
+
+    nxt_main_test_store_set_delay(NXT_MAIN_STORE_TEST_DELAY);
+
+    if (nxt_main_store_test_put(task, paths, port, "three", "bundle three",
+                                0x33333333)
+        != NXT_OK)
+    {
+        nxt_main_store_test_fail(thr, "cannot send the third bundle");
+    }
+
+    nxt_main_test_store_set_delay(0);
+
+    nxt_main_store_test_delete(task, port, "three");
+
+    if (nxt_main_store_test_reap(thr, task, "the third bundle") != NXT_OK) {
+        goto done;
+    }
+
+    /* A delete that main ran at once started no child. */
+    if (nxt_main_test_store_pid() != 0
+        && nxt_main_store_test_reap(thr, task, "the delete") != NXT_OK)
+    {
+        goto done;
+    }
+
+    if (nxt_main_store_test_reply(thr, port, 3, 0x33333333,
+                                  "the third bundle")
+        != NXT_OK)
+    {
+        goto done;
+    }
+
+    (void) nxt_sprintf((u_char *) name, (u_char *) name + sizeof(name),
+                       "%sthree%Z", paths->certs);
+
+    if (stat(name, &st) == 0) {
+        nxt_main_store_test_fail(thr, "\"%s\" is back: the delete ran before "
+                                 "the store", name);
+    }
+
+    (void) nxt_sprintf((u_char *) name, (u_char *) name + sizeof(name),
+                       "%s" NXT_MAIN_STORE_TMP "%Z", paths->certs);
+
+    if (stat(name, &st) == 0) {
+        nxt_main_store_test_fail(thr, "\"%s\" was left behind", name);
+    }
+
+    if (nxt_main_store_test_alerts != 0) {
+        nxt_main_store_test_fail(thr, "%ui alerts", nxt_main_store_test_alerts);
+    }
+
+    ret = NXT_OK;
+
+done:
+
+    nxt_main_store_test_reap_all(task);
+
+    if (port != NULL) {
+        /* Frees the queued answers and their port references. */
+        nxt_port_test_run_error_handler(task, port);
+
+        (void) nxt_port_hash_remove(&rt->ports, port);
+        rt->port_by_type[NXT_PROCESS_CONTROLLER] = NULL;
+
+        nxt_port_use(task, port, -1);
+    }
+
+    thr->engine = saved_engine;
+    rt->main_engine = NULL;
+
+    nxt_work_queue_cache_destroy(&engine.work_queue_cache);
+    nxt_mp_destroy(mp);
+
+    (void) unlink(paths->bundle);
+
+    (void) nxt_sprintf((u_char *) name, (u_char *) name + sizeof(name),
+                       "%sone%Z", paths->certs);
+    (void) unlink(name);
+
+    (void) nxt_sprintf((u_char *) name, (u_char *) name + sizeof(name),
+                       "%stwo%Z", paths->certs);
+    (void) unlink(name);
+
+    (void) nxt_sprintf((u_char *) name, (u_char *) name + sizeof(name),
+                       "%sthree%Z", paths->certs);
+    (void) unlink(name);
+
+    (void) nxt_sprintf((u_char *) name, (u_char *) name + sizeof(name),
+                       "%s" NXT_MAIN_STORE_TMP "%Z", paths->certs);
+    (void) unlink(name);
+
+    (void) rmdir(paths->certs);
+
+    return ret;
+}
+
+#endif /* NXT_TLS */
+
+
 static void
 nxt_main_store_test_path(char *buf, const char *dir, const char *name)
 {
@@ -689,6 +1343,8 @@ nxt_main_store_test(nxt_thread_t *thr)
     nxt_main_store_test_path(paths.conf_tmp, paths.dir, "conf.json.tmp");
     nxt_main_store_test_path(paths.ver, paths.dir, "version");
     nxt_main_store_test_path(paths.ver_tmp, paths.dir, "version.tmp");
+    nxt_main_store_test_path(paths.certs, paths.dir, "certs/");
+    nxt_main_store_test_path(paths.bundle, paths.dir, "bundle");
 
     nxt_memzero(&rt, sizeof(nxt_runtime_t));
 
@@ -719,6 +1375,16 @@ nxt_main_store_test(nxt_thread_t *thr)
     if (ret == NXT_OK) {
         ret = nxt_main_store_test_fds(thr, task, &paths);
     }
+
+    if (ret == NXT_OK) {
+        ret = nxt_main_store_test_order(thr, task, &paths);
+    }
+
+#if (NXT_TLS)
+    if (ret == NXT_OK) {
+        ret = nxt_main_store_test_certs(thr, task, &rt, &paths);
+    }
+#endif
 
     thr->log->handler = nxt_main_store_test_next_handler;
     thr->runtime = saved_rt;

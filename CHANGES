@@ -10,6 +10,12 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        when a newer configuration waits, it stops the running store
        first. When the store fails, the main process logs an alert.
 
+    *) Change: an uploaded certificate bundle is now also stored by that
+       child process, so its two fsync(2) calls no longer stop the main
+       process. The upload is still answered only when the bundle is on
+       disk. A certificate deletion also runs in the child process, after
+       every earlier store.
+
     *) Security: the router and libunit read records from shared memory
        that the other process can still write, without enough checks. A
        buffer that was not a whole number of records was read past its
