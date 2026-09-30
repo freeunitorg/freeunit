@@ -959,6 +959,7 @@ static nxt_port_handlers_t  nxt_main_process_port_handlers = {
 #if (NXT_HAVE_NJS)
     .script_get       = nxt_script_store_get_handler,
     .script_delete    = nxt_script_store_delete_handler,
+    .script_store     = nxt_script_store_put_handler,
 #endif
     .access_log       = nxt_main_port_access_log_handler,
     .rpc_ready        = nxt_port_rpc_handler,
@@ -2896,13 +2897,13 @@ nxt_main_store_cancelled(nxt_pid_t pid, int status)
  * main killed is not a failure: a newer store is pending.  A child that
  * exited before the signal arrived keeps its exit code.
  *
- * A controller that exits while a store child runs starts again here, when
- * no store runs or waits.  nxt_controller_prefork() reads conf.json and the
- * certificate bundles from disk.  Started at once, the new controller could
- * read them before the child renames its file.  It would then keep the old
- * state, and main would send the answer of the store to the controller that
- * has gone.  Only the controller sends stores, so no store is added after
- * main has reaped it.
+ * A controller that exits while a store child runs starts again here, when no
+ * store runs or waits.  nxt_controller_prefork() reads conf.json, the
+ * certificate bundles and the njs modules from disk.  Started at once, the new
+ * controller could read them before the child renames its file.  It would then
+ * keep the old state, and main would send the answer of the store to the
+ * controller that has gone.  Only the controller sends stores, so no store is
+ * added after main has reaped it.
  */
 static nxt_bool_t
 nxt_main_store_exited(nxt_task_t *task, nxt_pid_t pid, int status)

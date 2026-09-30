@@ -131,6 +131,20 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        The module now refuses a 64-bit memory. It also reads the base
        address again after the guest runs.
 
+    *) Bugfix: an uploaded njs module was written into its file without
+       truncating it, and without fsync(2). When a longer file of that
+       name was already on disk, for example one that a failed write had
+       left, the old tail stayed after the new module. The router read
+       that file and the configuration failed. The upload was also
+       answered with 200 when the write failed. Now the main process
+       stores the module through a temporary file, flushes it and renames
+       it, in its store child, and the upload is answered only when the
+       module is on disk. A deletion also runs in the store child. A
+       module name can no longer start with ".", and a module larger than
+       16 MiB is answered with 413. Earlier versions accepted a name that
+       starts with "."; such a module is no longer loaded or listed after
+       the upgrade.
+
     *) Bugfix: at startup, a stored njs module that did not compile hid
        every stored module that was read after it. Those modules were
        missing from /js_modules and could not be used. Now only the module

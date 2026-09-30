@@ -7,6 +7,9 @@
 #include <nxt_main.h>
 #include <nxt_conf.h>
 #include <nxt_script.h>
+#include <nxt_main_process.h>
+#include <nxt_checked.h>
+#include <nxt_span.h>
 #include <dirent.h>
 
 
@@ -32,6 +35,8 @@ static nxt_script_t *nxt_script_get(nxt_task_t *task, nxt_str_t *name,
     nxt_fd_t fd);
 static nxt_conf_value_t *nxt_script_details(nxt_mp_t *mp, nxt_script_t *cert);
 static void nxt_script_buf_completion(nxt_task_t *task, void *obj, void *data);
+static nxt_int_t nxt_script_store_name(nxt_buf_t *b, size_t rest,
+    nxt_str_t *name);
 
 
 static nxt_lvlhsh_t  nxt_script_info;
@@ -376,7 +381,11 @@ nxt_script_store_load(nxt_task_t *task, nxt_mp_t *mp)
         name.length = nxt_strlen(de->d_name);
         name.start = (u_char *) de->d_name;
 
-        if (nxt_str_eq(&name, ".", 1) || nxt_str_eq(&name, "..", 2)) {
+        /*
+         * No module name starts with ".": this skips "." and "..", and
+         * the temporary file of a store that did not finish.
+         */
+        if (name.start[0] == '.') {
             continue;
         }
 
@@ -528,10 +537,59 @@ nxt_script_buf_completion(nxt_task_t *task, void *obj, void *data)
 }
 
 
+/*
+ * Check the name at the start of "b": it ends with a NUL inside the
+ * message, and "rest" bytes follow the NUL.  A name is not empty, is at most
+ * NXT_SCRIPT_NAME_MAX_LENGTH bytes, has no "/" and does not start with ".".
+ * The sender is a process of Unit, but main puts the name into a path.
+ */
+static nxt_int_t
+nxt_script_store_name(nxt_buf_t *b, size_t rest, nxt_str_t *name)
+{
+    u_char        *nul;
+    nxt_span_t    span;
+    const u_char  *start;
+
+    if (b == NULL) {
+        return NXT_ERROR;
+    }
+
+    nxt_span_init(&span, b->mem.pos, b->mem.free);
+
+    nul = memchr(b->mem.pos, '\0', nxt_span_len(&span));
+    if (nul == NULL) {
+        return NXT_ERROR;
+    }
+
+    name->length = nul - b->mem.pos;
+
+    if (nxt_span_take(&span, name->length + 1, &start) != 0
+        || nxt_span_len(&span) != rest
+        || name->length == 0
+        || name->length > NXT_SCRIPT_NAME_MAX_LENGTH
+        || start[0] == '.'
+        || memchr(start, '/', name->length) != NULL)
+    {
+        return NXT_ERROR;
+    }
+
+    name->start = b->mem.pos;
+
+    return NXT_OK;
+}
+
+
+/*
+ * Only the router reads modules: it opens every module a configuration
+ * uses.  The file is opened read-only and is never created, so a read
+ * cannot change the store.  The controller stores a module with
+ * nxt_script_store_put().
+ */
 void
 nxt_script_store_get_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
     u_char               *p;
+    size_t               size;
     nxt_int_t            ret;
     nxt_str_t            name;
     nxt_file_t           file;
@@ -542,8 +600,8 @@ nxt_script_store_get_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     /*
      * Look up the sender's port via the kernel-validated PID
      * (SCM_CREDENTIALS).  msg->port_msg.pid is self-declared, so using
-     * it would let a compromised worker spoof the controller / router
-     * and pull arbitrary script material out of main.
+     * it would let a compromised worker spoof the router and pull
+     * arbitrary script material out of main.
      */
     port = nxt_runtime_port_find(task->thread->runtime,
                                  nxt_recv_msg_cmsg_pid(msg),
@@ -556,10 +614,8 @@ nxt_script_store_get_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         return;
     }
 
-    if (nxt_slow_path(port->type != NXT_PROCESS_CONTROLLER
-                      && port->type != NXT_PROCESS_ROUTER))
-    {
-        nxt_alert(task, "process %PI cannot store scripts",
+    if (nxt_slow_path(port->type != NXT_PROCESS_ROUTER)) {
+        nxt_alert(task, "process %PI cannot read scripts",
                   nxt_recv_msg_cmsg_pid(msg));
         nxt_port_recv_msg_close_fds(msg);
         return;
@@ -572,15 +628,24 @@ nxt_script_store_get_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     rt = task->thread->runtime;
 
-    if (nxt_slow_path(rt->certs.start == NULL)) {
+    if (nxt_slow_path(rt->scripts.start == NULL)) {
         nxt_alert(task, "no scripts storage directory");
         goto error;
     }
 
-    name.start = msg->buf->mem.pos;
-    name.length = nxt_strlen(name.start);
+    if (nxt_slow_path(nxt_script_store_name(msg->buf, 0, &name) != NXT_OK)) {
+        nxt_alert(task, "script_get_handler: invalid script name");
+        goto error;
+    }
 
-    file.name = nxt_malloc(rt->scripts.length + name.length + 1);
+    /* "<scripts><name>" and its NUL. */
+    if (nxt_slow_path(nxt_size_add(rt->scripts.length, name.length, &size) != 0
+                      || nxt_size_add(size, 1, &size) != 0))
+    {
+        goto error;
+    }
+
+    file.name = nxt_malloc(size);
     if (nxt_slow_path(file.name == NULL)) {
         goto error;
     }
@@ -588,7 +653,7 @@ nxt_script_store_get_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     p = nxt_cpymem(file.name, rt->scripts.start, rt->scripts.length);
     p = nxt_cpymem(p, name.start, name.length + 1);
 
-    ret = nxt_file_open(task, &file, NXT_FILE_RDWR, NXT_FILE_CREATE_OR_OPEN,
+    ret = nxt_file_open(task, &file, NXT_FILE_RDONLY, NXT_FILE_OPEN,
                         NXT_FILE_OWNER_ACCESS);
 
     nxt_free(file.name);
@@ -618,6 +683,205 @@ error:
 }
 
 
+/*
+ * Send "mbuf" to main to store it as the module "name".  The module goes in
+ * a shared memory segment, as a certificate bundle does.  The port message
+ * holds the NUL-terminated name, followed by the size.  "handler" gets
+ * RPC_READY when the file is on disk, and RPC_ERROR or a NULL message
+ * otherwise.
+ */
+void
+nxt_script_store_put(nxt_task_t *task, nxt_str_t *name, nxt_buf_mem_t *mbuf,
+    nxt_mp_t *mp, nxt_port_rpc_handler_t handler, void *ctx)
+{
+    void           *mem;
+    size_t         size;
+    uint32_t       stream;
+    nxt_fd_t       fd;
+    nxt_int_t      ret;
+    nxt_buf_t      *b;
+    nxt_port_t     *main_port, *ctl_port;
+    nxt_runtime_t  *rt;
+
+    size = nxt_buf_mem_used_size(mbuf);
+
+    fd = nxt_shm_open(task, size);
+    if (nxt_slow_path(fd == -1)) {
+        goto fail;
+    }
+
+    mem = nxt_mem_mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (nxt_slow_path(mem == MAP_FAILED)) {
+        goto fail;
+    }
+
+    nxt_memcpy(mem, mbuf->pos, size);
+    nxt_mem_munmap(mem, size);
+
+    b = nxt_buf_mem_alloc(mp, name->length + 1 + sizeof(size_t), 0);
+    if (nxt_slow_path(b == NULL)) {
+        goto fail;
+    }
+
+    b->completion_handler = nxt_script_buf_completion;
+
+    nxt_buf_cpystr(b, name);
+    *b->mem.free++ = '\0';
+    b->mem.free = nxt_cpymem(b->mem.free, &size, sizeof(size_t));
+
+    rt = task->thread->runtime;
+    main_port = rt->port_by_type[NXT_PROCESS_MAIN];
+    ctl_port = rt->port_by_type[NXT_PROCESS_CONTROLLER];
+
+    stream = nxt_port_rpc_register_handler(task, ctl_port, handler, handler,
+                                           -1, ctx);
+    if (nxt_slow_path(stream == 0)) {
+        goto fail;
+    }
+
+    ret = nxt_port_socket_write(task, main_port,
+                                NXT_PORT_MSG_SCRIPT_STORE
+                                | NXT_PORT_MSG_CLOSE_FD,
+                                fd, stream, ctl_port->id, b);
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_rpc_cancel(task, ctl_port, stream);
+        goto fail;
+    }
+
+    /* See nxt_script_store_get(). */
+    nxt_mp_retain(mp);
+
+    return;
+
+fail:
+
+    /* The port layer owns the descriptor only after a successful write. */
+    if (fd != -1) {
+        nxt_fd_close(fd);
+    }
+
+    handler(task, NULL, ctx);
+}
+
+
+/*
+ * Main's side of nxt_script_store_put().  The store child of main writes
+ * the module to "scripts/.store.tmp", flushes it and renames it over
+ * "scripts/<name>", so a reader sees the old file or the new one, never a
+ * partial file.  Main answers the controller when the child exits.  The
+ * controller is unprivileged, so main checks the sender, the name and the
+ * size again.
+ */
+void
+nxt_script_store_put_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    size_t                size;
+    u_char                *mem;
+    nxt_str_t             name;
+    nxt_file_t            file;
+    nxt_port_t            *port;
+    nxt_span_t            span;
+    nxt_runtime_t         *rt;
+    nxt_main_store_job_t  *job;
+
+    port = nxt_runtime_port_find(task->thread->runtime,
+                                 nxt_recv_msg_cmsg_pid(msg),
+                                 msg->port_msg.reply_port);
+
+    if (nxt_slow_path(port == NULL || port->type != NXT_PROCESS_CONTROLLER)) {
+        nxt_alert(task, "process %PI cannot store scripts",
+                  nxt_recv_msg_cmsg_pid(msg));
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    rt = task->thread->runtime;
+
+    mem = NULL;
+
+    if (nxt_slow_path(rt->scripts.start == NULL)) {
+        nxt_alert(task, "no scripts storage directory");
+        goto fail;
+    }
+
+    if (nxt_slow_path(msg->fd[0] == -1)) {
+        nxt_alert(task, "script_store_handler: invalid shm fd");
+        goto fail;
+    }
+
+    /* The message holds the NUL-terminated name, followed by the size. */
+
+    if (nxt_slow_path(nxt_script_store_name(msg->buf, sizeof(size_t), &name)
+                      != NXT_OK))
+    {
+        nxt_alert(task, "script_store_handler: invalid script name");
+        goto fail;
+    }
+
+    nxt_span_init(&span, name.start + name.length + 1, msg->buf->mem.free);
+
+    if (nxt_slow_path(nxt_span_copy(&span, &size, sizeof(size_t)) != 0)) {
+        nxt_alert(task, "script_store_handler: no script size");
+        goto fail;
+    }
+
+    if (nxt_slow_path(size == 0 || size > NXT_SCRIPT_STORE_MAX_SIZE)) {
+        nxt_alert(task, "script_store_handler: invalid script size %uz",
+                  size);
+        goto fail;
+    }
+
+    /*
+     * Copy the module with pread() instead of mapping the segment: a
+     * sender can shrink a mapped segment, and a read past its end is
+     * SIGBUS in main.  A short pread() is only an error.
+     */
+
+    mem = nxt_malloc(size);
+    if (nxt_slow_path(mem == NULL)) {
+        goto fail;
+    }
+
+    nxt_memzero(&file, sizeof(nxt_file_t));
+    file.fd = msg->fd[0];
+
+    /* nxt_file_read() logs the name when pread() fails; it must not be NULL. */
+    file.name = name.start;
+
+    if (nxt_slow_path(nxt_file_read(&file, mem, size, 0) != (ssize_t) size)) {
+        nxt_alert(task, "script_store_handler: short script read");
+        goto fail;
+    }
+
+    job = nxt_main_store_job_create(NXT_MAIN_STORE_PUT, "JS module",
+                                    &rt->scripts, &name);
+    if (nxt_slow_path(job == NULL)) {
+        goto fail;
+    }
+
+    job->data = mem;
+    job->size = size;
+    job->reply_pid = port->pid;
+    job->reply_port = port->id;
+    job->stream = msg->port_msg.stream;
+
+    nxt_port_recv_msg_close_fds(msg);
+
+    nxt_main_store_submit(task, job);
+
+    return;
+
+fail:
+
+    (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR, -1,
+                                 msg->port_msg.stream, 0, NULL);
+
+    nxt_free(mem);
+    nxt_port_recv_msg_close_fds(msg);
+}
+
+
 void
 nxt_script_store_delete(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp)
 {
@@ -640,14 +904,18 @@ nxt_script_store_delete(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp)
 }
 
 
+/*
+ * The delete is a job of the store child, as a store is.  Jobs run in the
+ * order they come, so a delete cannot run before the rename(2) of an
+ * earlier store of the same module, which would bring the module back.
+ */
 void
 nxt_script_store_delete_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
-    u_char           *p;
-    nxt_str_t        name;
-    nxt_port_t       *ctl_port;
-    nxt_runtime_t    *rt;
-    nxt_file_name_t  *path;
+    nxt_str_t             name;
+    nxt_port_t            *ctl_port;
+    nxt_runtime_t         *rt;
+    nxt_main_store_job_t  *job;
 
     rt = task->thread->runtime;
     ctl_port = rt->port_by_type[NXT_PROCESS_CONTROLLER];
@@ -670,18 +938,16 @@ nxt_script_store_delete_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         return;
     }
 
-    name.start = msg->buf->mem.pos;
-    name.length = nxt_strlen(name.start);
+    if (nxt_slow_path(nxt_script_store_name(msg->buf, 0, &name) != NXT_OK)) {
+        nxt_alert(task, "script_delete_handler: invalid script name");
+        return;
+    }
 
-    path = nxt_malloc(rt->scripts.length + name.length + 1);
+    job = nxt_main_store_job_create(NXT_MAIN_STORE_DELETE, "JS module",
+                                    &rt->scripts, &name);
 
-    if (nxt_fast_path(path != NULL)) {
-        p = nxt_cpymem(path, rt->scripts.start, rt->scripts.length);
-        p = nxt_cpymem(p, name.start, name.length + 1);
-
-        (void) nxt_file_delete(path);
-
-        nxt_free(path);
+    if (nxt_fast_path(job != NULL)) {
+        nxt_main_store_submit(task, job);
     }
 }
 
