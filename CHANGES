@@ -19,6 +19,10 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        marker that the application can clear. All of these are now
        checked.
 
+    *) Bugfix: after 2^32 RPC registrations the stream counter wrapped
+       and handed out stream 0, which callers read as a failure. The
+       registration stayed. Stream 0 is now skipped.
+
     *) Bugfix: a keep-alive TLS connection that was idle across a
        reconfiguration could use the TLS settings of the old configuration
        after they were freed, when it was closed. The connection now keeps

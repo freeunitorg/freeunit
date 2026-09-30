@@ -23,6 +23,14 @@ store to finish.  When the store fails, the main process logs an alert.
 
 <change type="bugfix">
 <para>
+after 2^32 RPC registrations the stream counter wrapped and handed out
+stream 0, which callers read as a failure.  The registration stayed.
+Stream 0 is now skipped.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 when unitd ran as root and the control socket was given to another user or
 group with --control-user or --control-group, that user passed the socket file
 permissions but the controller then closed the connection.  The controller now
