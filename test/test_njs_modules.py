@@ -1,3 +1,9 @@
+import os
+import shutil
+import tempfile
+from pathlib import Path
+
+from conftest import unit_run, unit_stop
 from unit.applications.proto import ApplicationProto
 from unit.option import option
 
@@ -125,3 +131,59 @@ def test_njs_settings_js_module_nul():
 
     resp = client.conf({"js_module": ["next\0x"]}, 'settings')
     assert 'null character' in resp.get('detail', ''), 'array nul'
+
+
+SHORT_MODULE = b"""export default {
+    "route": function() {return 'next'}
+}
+"""
+
+
+def start_on(statedir):
+    # main writes here as root; the directory only has to be traversable.
+    os.chmod(statedir, 0o755)
+    unit_run(state_dir=str(statedir))
+
+
+def test_njs_modules_load_after_broken(requires_restart, skip_alert):
+    """One stored module that does not compile must not hide the modules
+    read after it at startup."""
+
+    skip_alert(r'.*JS compile module.*failed.*')
+
+    unit_stop()
+
+    statedir = Path(tempfile.mkdtemp(prefix='unit-state-'))
+    scripts = statedir / 'scripts'
+
+    try:
+        scripts.mkdir()
+
+        good = [f'good{i}' for i in range(8)]
+
+        for name in good:
+            (scripts / name).write_bytes(SHORT_MODULE)
+
+        # Pick a name that readdir() returns before at least one good module;
+        # startup reads the directory in that order.
+        for i in range(32):
+            broken = f'broken{i}'
+            (scripts / broken).write_bytes(b'export default {')
+
+            if os.listdir(scripts)[-1] != broken:
+                break
+
+            (scripts / broken).unlink()
+        else:
+            assert False, 'no name is read before a good module'
+
+        start_on(statedir)
+
+        loaded = client.conf_get('/js_modules')
+
+        assert sorted(n for n in loaded if n in good) == good, 'all loaded'
+        assert broken not in loaded
+
+    finally:
+        unit_stop()
+        shutil.rmtree(statedir, ignore_errors=True)

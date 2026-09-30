@@ -33,6 +33,14 @@ in the child process, after every earlier store.
 
 <change type="bugfix">
 <para>
+at startup, a stored njs module that did not compile hid every stored module
+that was read after it.  Those modules were missing from /js_modules and could
+not be used.  Now only the module that does not compile is left out.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 when unitd ran as root and the control socket was given to another user or
 group with --control-user or --control-group, that user passed the socket file
 permissions but the controller then closed the connection.  The controller now
