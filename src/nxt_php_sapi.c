@@ -506,28 +506,28 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
 
             ret = nxt_php_set_target(task, &nxt_php_targets[n], value);
             if (nxt_slow_path(ret != NXT_OK)) {
-                return NXT_ERROR;
+                goto fail;
             }
         }
 
     } else {
         ret = nxt_php_set_target(task, &nxt_php_targets[0], conf->self);
         if (nxt_slow_path(ret != NXT_OK)) {
-            return NXT_ERROR;
+            goto fail;
         }
     }
 
     ret = nxt_unit_default_init(task, &php_init, conf);
     if (nxt_slow_path(ret != NXT_OK)) {
         nxt_alert(task, "nxt_unit_default_init() failed");
-        return ret;
+        goto fail;
     }
 
     php_init.callbacks.request_handler = nxt_php_request_handler;
 
     unit_ctx = nxt_unit_init(&php_init);
     if (nxt_slow_path(unit_ctx == NULL)) {
-        return NXT_ERROR;
+        goto fail;
     }
 
     nxt_php_unit_ctx = unit_ctx;
@@ -541,6 +541,12 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
     exit(0);
 
     return NXT_OK;
+
+fail:
+
+    nxt_php_cleanup_targets();
+
+    return NXT_ERROR;
 }
 
 
