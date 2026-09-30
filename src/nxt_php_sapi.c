@@ -505,6 +505,7 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
 
             ret = nxt_php_set_target(task, &nxt_php_targets[n], value);
             if (nxt_slow_path(ret != NXT_OK)) {
+                nxt_php_cleanup_targets();
                 return NXT_ERROR;
             }
         }
@@ -512,6 +513,7 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
     } else {
         ret = nxt_php_set_target(task, &nxt_php_targets[0], conf->self);
         if (nxt_slow_path(ret != NXT_OK)) {
+            nxt_php_cleanup_targets();
             return NXT_ERROR;
         }
     }
@@ -519,6 +521,7 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
     ret = nxt_unit_default_init(task, &php_init, conf);
     if (nxt_slow_path(ret != NXT_OK)) {
         nxt_alert(task, "nxt_unit_default_init() failed");
+        nxt_php_cleanup_targets();
         return ret;
     }
 
@@ -526,6 +529,7 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
 
     unit_ctx = nxt_unit_init(&php_init);
     if (nxt_slow_path(unit_ctx == NULL)) {
+        nxt_php_cleanup_targets();
         return NXT_ERROR;
     }
 
@@ -624,6 +628,7 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
         {
             nxt_alert(task, "script is not under php root");
             nxt_free(p);
+            target->script_filename.start = NULL;
             goto fail;
         }
 
@@ -631,6 +636,7 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
                               &target->script_dirname);
         if (nxt_slow_path(ret != NXT_OK)) {
             nxt_free(target->script_filename.start);
+            target->script_filename.start = NULL;
             goto fail;
         }
 
@@ -667,6 +673,7 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
 fail:
 
     nxt_free(target->root.start);
+    target->root.start = NULL;
 
     return NXT_ERROR;
 }
