@@ -15,13 +15,14 @@ import time
 import pytest
 
 from conftest import run_process
+from unit import port as port_map
 from unit.applications.proto import ApplicationProto
 from unit.utils import waitforsocket
 
 client = ApplicationProto()
 
 # Reserved in test/fake_upstream/README.md's port registry.
-UPSTREAM_PORT = 7977
+UPSTREAM_PORT = port_map.port(7977)
 
 FINAL = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK'
 
@@ -210,7 +211,7 @@ def pipeline(first_request, sentinel=True):
     sock.settimeout(10)
 
     try:
-        sock.connect(('127.0.0.1', 8080))
+        sock.connect(('127.0.0.1', port_map.port(8080)))
         sock.sendall(request.encode())
 
         data = b''

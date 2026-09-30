@@ -6,6 +6,7 @@ import pytest
 
 from unit.applications.proto import ApplicationProto
 from unit.status import Status
+from unit import port as port_map
 
 client = ApplicationProto()
 
@@ -38,7 +39,7 @@ def _churn(n):
     # recycle returns a wrong/truncated body or, under the sanitizer, crashes
     # the worker.
     for i in range(n):
-        sock = socket.create_connection(('127.0.0.1', 8080))
+        sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
         sock.settimeout(5)
         try:
             sock.sendall(
