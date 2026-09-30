@@ -222,7 +222,8 @@ NXT_EXPORT nxt_int_t nxt_file_rename(nxt_file_name_t *old_name,
  * storage.  A durable replace is: write the temporary file, nxt_file_sync()
  * it, nxt_file_rename() it over the destination, then nxt_file_dir_sync()
  * the directory that holds them -- without the last step the rename itself
- * may not survive a power loss.
+ * may not survive a power loss.  On macOS, nxt_file_sync() only orders the
+ * data before the rename, and nxt_file_dir_sync() makes both durable.
  */
 NXT_EXPORT nxt_int_t nxt_file_sync(nxt_task_t *task, nxt_file_t *file);
 NXT_EXPORT nxt_int_t nxt_file_dir_sync(nxt_task_t *task,

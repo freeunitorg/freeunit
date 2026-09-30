@@ -21,6 +21,15 @@ store to finish.  When the store fails, the main process logs an alert.
 </para>
 </change>
 
+<change type="change">
+<para>
+on macOS, a stored state file is now flushed with fcntl(F_BARRIERFSYNC), and
+its directory with fcntl(F_FULLFSYNC) after the rename, so the file also leaves
+the cache of the drive.  Plain fsync(2) there does not flush that cache, and a
+power loss could lose a stored configuration.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 when unitd ran as root and the control socket was given to another user or

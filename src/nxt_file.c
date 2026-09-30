@@ -457,12 +457,99 @@ nxt_file_rename(nxt_file_name_t *old_name, nxt_file_name_t *new_name)
 }
 
 
+/*
+ * The errors of a file system that cannot flush a descriptor in the asked
+ * way.  ENOTSUP and EOPNOTSUPP are one value on Linux and FreeBSD, and two
+ * values on macOS.
+ */
+static nxt_bool_t
+nxt_file_sync_unsupported(nxt_err_t err)
+{
+    switch (err) {
+
+    case NXT_EINVAL:
+    case NXT_EOPNOTSUPP:
+#if (ENOTSUP != EOPNOTSUPP)
+    case ENOTSUP:
+#endif
+    case ENOTTY:
+        return 1;
+
+    default:
+        return 0;
+    }
+}
+
+
+#if defined(F_FULLFSYNC)
+
+/*
+ * Runs a macOS flush command.  EINTR repeats the call.  If the file system
+ * does not support the command, for example an SMB mount with ENOTSUP,
+ * fsync() does the flush and its result counts.  Any other error, such as
+ * EIO, is the result: the flush failed.
+ */
+static int
+nxt_file_fcntl_sync(nxt_fd_t fd, int cmd)
+{
+    nxt_err_t  err;
+
+    for ( ;; ) {
+        if (fcntl(fd, cmd) == 0) {
+            return 0;
+        }
+
+        err = nxt_errno;
+
+        if (err != NXT_EINTR) {
+            break;
+        }
+    }
+
+    if (nxt_file_sync_unsupported(err)) {
+        return fsync(fd);
+    }
+
+    /* errno still holds the error of fcntl(). */
+    return -1;
+}
+
+#endif
+
+
+/*
+ * On macOS, fsync(2) sends the data to the drive, but the drive can keep it
+ * in its cache, so a power loss can still lose it.  F_FULLFSYNC also
+ * flushes the cache of the drive, and it waits for the whole queue of the
+ * device.  F_BARRIERFSYNC only orders the data before any later write to
+ * the device.  So a file gets the barrier, and the directory gets the full
+ * flush after the rename.  That one full flush makes the data and the
+ * rename durable.  Without barrier support fsync() takes the place of the
+ * barrier, and only the later full flush orders the data, as before.
+ * Elsewhere both are fsync().
+ */
+static int
+nxt_file_fsync(nxt_fd_t fd, nxt_bool_t full)
+{
+#if defined(F_FULLFSYNC)
+#if defined(F_BARRIERFSYNC)
+    if (!full) {
+        return nxt_file_fcntl_sync(fd, F_BARRIERFSYNC);
+    }
+#endif
+    return nxt_file_fcntl_sync(fd, F_FULLFSYNC);
+#else
+    return fsync(fd);
+#endif
+}
+
+
 nxt_int_t
 nxt_file_sync(nxt_task_t *task, nxt_file_t *file)
 {
     nxt_debug(task, "fsync(%FD, \"%FN\")", file->fd, file->name);
 
-    if (nxt_fast_path(fsync(file->fd) == 0)) {
+    if (nxt_fast_path(nxt_file_fsync(file->fd, 0) == 0)) {
         return NXT_OK;
     }
 
@@ -492,14 +579,14 @@ nxt_file_dir_sync(nxt_task_t *task, nxt_file_name_t *name)
 
     ret = NXT_OK;
 
-    if (nxt_slow_path(fsync(fd) != 0)) {
+    if (nxt_slow_path(nxt_file_fsync(fd, 1) != 0)) {
         err = nxt_errno;
 
         /*
          * Some file systems refuse to flush a directory descriptor at all;
          * the rename() has still happened, so this is not a store failure.
          */
-        if (err == NXT_EINVAL || err == NXT_EOPNOTSUPP) {
+        if (nxt_file_sync_unsupported(err)) {
             nxt_debug(task, "fsync(%FD, \"%FN\") directory unsupported %E",
                       fd, name, err);
 
