@@ -120,7 +120,14 @@ def test_state_store_full_filesystem(requires_restart, skip_alert):
         assert 'success' in client.conf(big_conf(400)), 'the large PUT'
 
         # The store is attempted asynchronously; wait for it to give up.
-        Log.wait_for_record(r'failed to store current configuration')
+        # The store child logs the first alert, and main logs the second
+        # when it reaps the child.
+        assert Log.wait_for_record(
+            r'failed to store current configuration'
+        ), 'the store child failed'
+        assert Log.wait_for_record(
+            r'state store child \d+ failed'
+        ), 'main logged the failed store'
 
         # The store failed; the previously stored configuration is intact,
         # byte for byte, and still parses.

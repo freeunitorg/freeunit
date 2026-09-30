@@ -17,7 +17,8 @@ process, so a slow fsync(2) no longer delays the start of application
 processes after a reconfiguration, or the exit of the main process.  One
 store runs at a time; a newer configuration waits for it, and only the
 latest one waiting is stored.  At exit, the main process waits for the
-store to finish.  When the store fails, the main process logs an alert.
+store to finish; when a newer configuration waits, it stops the running
+store first.  When the store fails, the main process logs an alert.
 </para>
 </change>
 

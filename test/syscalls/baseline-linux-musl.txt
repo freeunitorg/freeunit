@@ -36,6 +36,7 @@ getrandom
 getsockopt
 gettid
 ioctl
+kill
 listen
 lstat
 membarrier

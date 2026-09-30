@@ -100,6 +100,7 @@ nxt_int_t nxt_router_websocket_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_prepare_msg_test(nxt_thread_t *thr);
 nxt_int_t nxt_main_start_process_reply_test(nxt_thread_t *thr);
 nxt_int_t nxt_main_file_store_test(nxt_thread_t *thr);
+nxt_int_t nxt_main_store_test(nxt_thread_t *thr);
 nxt_int_t nxt_proto_creating_wedge_test(nxt_thread_t *thr);
 nxt_int_t nxt_main_whoami_test(nxt_thread_t *thr);
 nxt_int_t nxt_main_remove_child_pid_test(nxt_thread_t *thr);

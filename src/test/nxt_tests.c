@@ -362,6 +362,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_main_store_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_proto_creating_wedge_test(thr) != NXT_OK) {
         return 1;
     }
