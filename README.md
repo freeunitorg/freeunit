@@ -160,6 +160,32 @@ FreeUnit includes built-in OpenTelemetry support (compiled with `--otel`):
 FreeUnit supports running WebAssembly Components (WASI 0.2).
 For configuration details see the [OpenAPI spec](docs/unit-openapi.yaml).
 
+## Schedules
+
+FreeUnit can run periodic internal requests to an application itself —
+cron, essentially — with no client and no sidecar process, through a
+top-level `"schedules"` object:
+
+```json
+{
+  "schedules": {
+    "drupal-cron": {
+      "pass": "applications/drupal/index",
+      "uri": "/cron/SECRET_KEY",
+      "interval": 300,
+      "jitter": 15,
+      "timeout": 240,
+      "overlap": "skip",
+      "headers": { "Host": "example.org" }
+    }
+  }
+}
+```
+
+See [`docs/schedules.md`](docs/schedules.md) for the field reference,
+semantics and operational caveats, and
+[`docs/adr/0004-schedules.md`](docs/adr/0004-schedules.md) for the design.
+
 ## OpenAPI Specification
 
 The [OpenAPI specification](docs/unit-openapi.yaml) aims to simplify

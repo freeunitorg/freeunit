@@ -21,7 +21,9 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
     nxt_thread_t           *thr;
     nxt_app_type_t         type, prev_type;
     nxt_status_app_t       *app;
+    nxt_status_schedule_t  *sched;
     nxt_conf_value_t       *status, *obj, *mods, *apps, *app_obj, *mod_obj;
+    nxt_conf_value_t       *scheds, *sched_obj;
     nxt_app_lang_module_t  *modules;
 
     static const nxt_str_t  modules_str = nxt_string("modules");
@@ -44,14 +46,23 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
     static const nxt_str_t  start_str = nxt_string("starting");
     static const nxt_str_t  unacc_str = nxt_string("unaccounted");
     static const nxt_str_t  detached_str = nxt_string("detached");
+    static const nxt_str_t  schedules_str = nxt_string("schedules");
+    static const nxt_str_t  runs_str = nxt_string("runs");
+    static const nxt_str_t  skipped_str = nxt_string("skipped");
+    static const nxt_str_t  timed_out_str = nxt_string("timed_out");
+    static const nxt_str_t  last_status_str = nxt_string("last_status");
+    static const nxt_str_t  last_duration_str = nxt_string("last_duration_ms");
+    static const nxt_str_t  last_start_str = nxt_string("last_start");
 
     /*
      * modules, connections, requests, applications -- plus "telemetry" when
-     * OTel is built in and currently configured.  It is omitted rather than
-     * zeroed otherwise, so a build or a configuration without telemetry
+     * OTel is built in and currently configured, and "schedules" when at
+     * least one schedule is configured.  Both are omitted rather than
+     * zeroed/emptied otherwise, so a build or a configuration without them
      * reports exactly what it did before.
      */
-    status = nxt_conf_create_object(mp, 4 + (report->otel_configured != 0));
+    status = nxt_conf_create_object(mp, 4 + (report->otel_configured != 0)
+                                        + (report->schedules_count != 0));
     if (nxt_slow_path(status == NULL)) {
         return NULL;
     }
@@ -236,6 +247,51 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
         nxt_conf_set_member(app_obj, &reqs_str, obj, 1);
 
         nxt_conf_set_member_integer(obj, &active_str, app->active_requests, 0);
+    }
+
+    if (report->schedules_count != 0) {
+        scheds = nxt_conf_create_object(mp, report->schedules_count);
+        if (nxt_slow_path(scheds == NULL)) {
+            return NULL;
+        }
+
+        nxt_conf_set_member(status, &schedules_str, scheds, idx++);
+
+        sched = nxt_status_report_schedules(report);
+
+        for (i = 0; i < report->schedules_count; i++) {
+            name.length = sched->name.length;
+            name.start = nxt_pointer_to(report, (uintptr_t) sched->name.start);
+
+            sched_obj = nxt_conf_create_object(mp, 8);
+            if (nxt_slow_path(sched_obj == NULL)) {
+                return NULL;
+            }
+
+            ret = nxt_conf_set_member_dup(scheds, mp, &name, sched_obj, i);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                return NULL;
+            }
+
+            nxt_conf_set_member_integer(sched_obj, &runs_str,
+                                        sched->runs, 0);
+            nxt_conf_set_member_integer(sched_obj, &skipped_str,
+                                        sched->skipped, 1);
+            nxt_conf_set_member_integer(sched_obj, &failed_str,
+                                        sched->failed, 2);
+            nxt_conf_set_member_integer(sched_obj, &timed_out_str,
+                                        sched->timed_out, 3);
+            nxt_conf_set_member_integer(sched_obj, &run_str,
+                                        sched->running, 4);
+            nxt_conf_set_member_integer(sched_obj, &last_status_str,
+                                        sched->last_status, 5);
+            nxt_conf_set_member_integer(sched_obj, &last_duration_str,
+                                        sched->last_duration, 6);
+            nxt_conf_set_member_integer(sched_obj, &last_start_str,
+                                        sched->last_start, 7);
+
+            sched++;
+        }
     }
 
     return status;

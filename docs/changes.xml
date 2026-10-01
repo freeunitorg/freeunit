@@ -10,6 +10,22 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="feature">
+<para>
+a top-level "schedules" object.  A schedule makes FreeUnit send a periodic
+internal request to an application, with no client and no extra process, for
+example a cron trigger for Drupal or another PHP application.  Each schedule
+has a "pass" ("applications/&lt;name&gt;"; routes and upstreams are not
+supported), a "uri" that is sent as a "GET", and an "interval" in seconds.
+The optional keys are "jitter", "timeout", "overlap" ("skip"), "headers" and
+"run_on_start".  A run is a normal application request: "/status" counts it
+in "requests.total", it goes through "limits" and the application queue, and
+the access log records it.  When a run passes its "timeout", FreeUnit stops
+waiting for it.  The application process continues, and it counts against
+"processes" until it answers.
+</para>
+</change>
+
 <change type="security">
 <para>
 an application could write an unexpected value into an entry of a shared
