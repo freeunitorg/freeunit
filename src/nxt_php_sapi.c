@@ -149,6 +149,7 @@ static size_t nxt_php_read_post(char *buffer, size_t count_bytes TSRMLS_DC);
 static int nxt_php_unbuffered_write(const char *str, uint str_length TSRMLS_DC);
 static int nxt_php_read_post(char *buffer, uint count_bytes TSRMLS_DC);
 #endif
+static void nxt_php_flush(void *server_context);
 
 
 #ifdef NXT_PHP7
@@ -306,7 +307,7 @@ static sapi_module_struct  nxt_php_sapi_module =
     NULL,                        /* deactivate */
 
     nxt_php_unbuffered_write,    /* unbuffered write */
-    NULL,                        /* flush */
+    nxt_php_flush,               /* flush */
     NULL,                        /* get uid */
     NULL,                        /* getenv */
 
@@ -1394,6 +1395,38 @@ nxt_php_unbuffered_write(const char *str, uint str_length TSRMLS_DC)
 
     php_handle_aborted_connection();
     return 0;
+}
+
+
+/*
+ * PHP calls this for flush(), and after each write when implicit_flush is
+ * on.  nxt_php_unbuffered_write() sends each write to the router at once.
+ * Thus only the response header can wait here.  This function does not
+ * empty the output buffers of PHP; ob_flush() does that, as in mod_php.
+ */
+
+static void
+nxt_php_flush(void *server_context)
+{
+    nxt_php_run_ctx_t  *ctx;
+
+    ctx = server_context;
+
+    /*
+     * Module startup has no context.  fastcgi_finish_request() leaves the
+     * context without a request.
+     */
+    if (ctx == NULL || ctx->req == NULL) {
+        return;
+    }
+
+    /*
+     * If the send fails, SG(headers_sent) stays 0.  The next output then
+     * tries again and handles the error, as it does without flush().
+     */
+    if (!SG(headers_sent)) {
+        (void) sapi_send_headers(TSRMLS_C);
+    }
 }
 
 

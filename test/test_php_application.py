@@ -238,6 +238,109 @@ def test_php_application_fastcgi_finish_request_2(findall, unit_pid):
     assert len(errs) == 0, 'no error'
 
 
+def get_flushed(method, url, **kwargs):
+    # The "flush" app sleeps after flush().  Read for less time than the
+    # sleep: what arrives in that time is what flush() sent.  Then read
+    # the rest of the response.
+    sock = client.http(method, url=url, no_recv=True, **kwargs)
+
+    early = client.recvall(sock, read_timeout=0.5).decode()
+    rest = client.recvall(sock).decode()
+    sock.close()
+
+    resp = client._resp_to_dict(early + rest)
+
+    if resp['headers'].get('Transfer-Encoding') == 'chunked':
+        resp['body'] = client._parse_chunked_body(resp['body']).decode()
+
+    return early, resp
+
+
+def test_php_application_flush_headers():
+    client.load('flush', options={'admin': {'output_buffering': '0'}})
+
+    resp = client.get()
+    assert resp['status'] == 200, 'start the application'
+    assert resp['headers']['X-OB-Level'] == '0', 'no output buffer'
+
+    early, resp = get_flushed('GET', '/?sleep=2')
+
+    assert resp['status'] == 200
+    assert resp['body'] == 'part2;headers_sent=true;part3;', 'headers_sent()'
+    assert early.startswith('HTTP/1.1 200 OK\r\n'), 'status line before sleep'
+    assert 'X-Flush: 1\r\n' in early, 'headers before sleep'
+    assert 'Transfer-Encoding: chunked\r\n' in early, 'chunked'
+    assert early.endswith('\r\n\r\n'), 'header end before sleep'
+    assert 'part2' not in early, 'no body before sleep'
+
+    # A response to HTTP/1.0 is not chunked.  The connection close ends
+    # its body.
+    early, resp = get_flushed('GET', '/?sleep=2', http_10=True)
+
+    assert resp['body'] == 'part2;headers_sent=true;part3;', 'HTTP/1.0 body'
+    assert early.startswith('HTTP/1.1 200 OK\r\n'), 'HTTP/1.0 status line'
+    assert 'X-Flush: 1\r\n' in early, 'HTTP/1.0 headers'
+    assert early.endswith('\r\n\r\n'), 'HTTP/1.0 header end'
+
+    early, resp = get_flushed('HEAD', '/?sleep=2')
+
+    assert resp['status'] == 200
+    assert resp['headers']['X-Flush'] == '1'
+    assert resp['body'] == '', 'HEAD body'
+    assert early.startswith('HTTP/1.1 200 OK\r\n'), 'HEAD status line'
+    assert early.endswith('\r\n\r\n'), 'HEAD header end'
+
+
+def test_php_application_flush_output_buffering():
+    client.load('flush', options={'admin': {'output_buffering': '4096'}})
+
+    resp = client.get()
+    assert resp['status'] == 200, 'start the application'
+    assert resp['headers']['X-OB-Level'] == '1', 'output buffer'
+
+    early, resp = get_flushed('GET', '/?sleep=2&part1')
+
+    assert resp['status'] == 200
+    assert (
+        resp['body'] == 'part1;part2;headers_sent=true;part3;'
+    ), 'headers_sent()'
+    assert early.startswith('HTTP/1.1 200 OK\r\n'), 'status line before sleep'
+    assert 'X-Flush: 1\r\n' in early, 'headers before sleep'
+
+    # flush() does not empty the output buffers of PHP, as in mod_php.
+    # ob_flush() does that.  So only the header comes before the sleep.
+    assert early.endswith('\r\n\r\n'), 'header end before sleep'
+    assert 'part1' not in early, 'part1 stays in the output buffer'
+
+
+def test_php_application_flush_after_finish(findall, wait_for_record):
+    # fastcgi_finish_request() ends the response and leaves the context
+    # without a request.  The script then calls flush() twice.
+    client.load('flush_after_finish')
+
+    resp = client.get()
+    assert resp['status'] == 200
+    # The client parses the chunked body, so a cut body fails here.
+    assert resp['headers']['Transfer-Encoding'] == 'chunked'
+    assert resp['body'] == 'before;', 'only the output before the finish'
+
+    pid = resp['headers']['X-Pid']
+
+    # The worker is busy until the script ends.  Then it serves the next
+    # request.
+    resp = client.get()
+    assert resp['status'] == 200
+    assert resp['body'] == 'before;', 'second request'
+
+    assert findall(r'.+\[alert\].+') == [], 'no alert'
+    assert resp['headers']['X-Pid'] == pid, 'the same process'
+
+    assert (
+        wait_for_record(r'php message: flush after finish: done') is not None
+    ), 'the script ran past flush()'
+    assert findall(r'Error in fastcgi_finish_request') == []
+
+
 def test_php_application_query_string_absent():
     client.load('query_string')
 
