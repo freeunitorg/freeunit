@@ -9,6 +9,12 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        stored. At exit, the main process waits for the store to finish.
        When the store fails, the main process logs an alert.
 
+    *) Security: the wasm module did not check the offset that the malloc
+       handler of the guest returned. A negative or large offset put the
+       request buffer outside the linear memory of the guest. The worker
+       now refuses such an offset, or an offset that is not aligned, and
+       exits at startup.
+
     *) Security: the router and libunit read records from shared memory
        that the other process can still write, without enough checks. A
        buffer that was not a whole number of records was read past its
