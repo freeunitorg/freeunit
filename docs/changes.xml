@@ -12,6 +12,17 @@
 
 <change type="bugfix">
 <para>
+a chunked request body that grew over "max_body_size" after the read that
+carried the request header got no response.  The router closed the connection
+without a status line.  Now it answers 413 and closes.  A body that crossed the
+limit in the same read as the header already got 413.  A later read that fails
+to allocate memory in the chunk parser, or to write the body to the temporary
+file, now answers 500 and closes in the same way.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 the router did not answer "Expect: 100-continue".  A client that sent it, as
 curl and Guzzle do for large uploads, waited for its own timeout before it
 sent the body.  For curl, that timeout is 1 second.  The router now sends
