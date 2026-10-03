@@ -9,6 +9,14 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        fastcgi_finish_request() when the released memory already held a
        request for another target. The bug had appeared in 1.18.0.
 
+    *) Bugfix: the router sent the header of a chunked HTTP/1.1 response
+       without the empty line that ends it, and sent that line with the
+       first body bytes. If an application sent the header and then
+       waited before its body, the client could not use the header until
+       the body began. Now the header ends at once. A complete response
+       has the same bytes as before. $body_bytes_sent no longer counts the
+       empty line.
+
     *) Change: the main process now writes the state files in a
        short-lived child process, so a slow fsync(2) no longer delays
        the start of application processes after a reconfiguration, or

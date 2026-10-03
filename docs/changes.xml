@@ -21,6 +21,17 @@ held a request for another target.  The bug had appeared in 1.18.0.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+the router sent the header of a chunked HTTP/1.1 response without the empty
+line that ends it, and sent that line with the first body bytes.  If an
+application sent the header and then waited before its body, the client could
+not use the header until the body began.  Now the header ends at once.  A
+complete response has the same bytes as before.  $body_bytes_sent no longer
+counts the empty line.
+</para>
+</change>
+
 <change type="change">
 <para>
 the main process now writes the state files in a short-lived child

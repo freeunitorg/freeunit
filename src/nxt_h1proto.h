@@ -37,6 +37,7 @@ struct nxt_h1proto_s {
     uint8_t                   large_buffer_slot;
     uint8_t                   keepalive;            /* 1 bit  */
     uint8_t                   chunked;              /* 1 bit  */
+    uint8_t                   chunk_sent;           /* 1 bit  */
     uint8_t                   websocket;            /* 1 bit  */
     uint8_t                   connection_upgrade;   /* 1 bit  */
     uint8_t                   upgrade_websocket;    /* 1 bit  */

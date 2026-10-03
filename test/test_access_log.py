@@ -466,6 +466,36 @@ def test_access_log_variables(wait_for_record):
     ), '$body_bytes_sent'
 
 
+def test_access_log_body_bytes_sent_chunked(wait_for_record):
+    # The application sets no Content-Length, so the response is chunked.
+    # $body_bytes_sent counts the chunk framing.  It does not count the
+    # empty line that ends the header.
+    load('chunked')
+    set_format('$uri $body_bytes_sent')
+
+    body = '0123456789'
+
+    resp = client.post(url='/data', body=body)
+    assert resp['status'] == 200
+    assert resp['headers']['Transfer-Encoding'] == 'chunked'
+    assert resp['body'] == body
+
+    # "a\r\n0123456789\r\n0\r\n\r\n" is 20 bytes.
+    record = wait_for_record(r'^/data \d+$', 'access.log')
+    assert record is not None, 'data record'
+    assert record.group(0) == '/data 20', 'chunked body'
+
+    # An empty body has only the last chunk: "0\r\n\r\n" is 5 bytes.
+    resp = client.get(url='/empty')
+    assert resp['status'] == 200
+    assert resp['headers']['Transfer-Encoding'] == 'chunked'
+    assert resp['body'] == ''
+
+    record = wait_for_record(r'^/empty \d+$', 'access.log')
+    assert record is not None, 'empty record'
+    assert record.group(0) == '/empty 5', 'empty chunked body'
+
+
 def test_access_log_if(search_in_file, wait_for_record):
     load('empty')
     set_format('$uri')

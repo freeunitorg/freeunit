@@ -1456,8 +1456,6 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
                 {
                     h1p->chunked = 1;
                     size += nxt_length(chunked);
-                    /* Trailing CRLF will be added by the first chunk header. */
-                    size -= nxt_length("\r\n");
                 }
 
             } else if (!r->no_body) {
@@ -1532,11 +1530,13 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
 
     if (h1p->chunked) {
         p = nxt_cpymem(p, chunked, nxt_length(chunked));
-        /* Trailing CRLF will be added by the first chunk header. */
-
-    } else {
-        *p++ = '\r'; *p++ = '\n';
     }
+
+    /*
+     * The header ends here, also for a chunked response.  Thus the client
+     * can use the header before the first body bytes come.
+     */
+    *p++ = '\r'; *p++ = '\n';
 
     header->mem.free = p;
 
@@ -1667,15 +1667,24 @@ nxt_h1p_request_send(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
 }
 
 
+/*
+ * The data of a chunk ends with CRLF.  This CRLF starts the next chunk
+ * header or the last chunk.  Before the first chunk there is no data to end:
+ * the response header ends with its own CRLF.
+ */
+
 static nxt_buf_t *
 nxt_h1p_chunk_create(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
 {
+    u_char             *p;
     nxt_off_t          size;
     nxt_buf_t          *b, **prev, *header, *tail;
+    nxt_h1proto_t      *h1p;
 
     const size_t       chunk_size = 2 * nxt_length("\r\n") + NXT_OFF_T_HEXLEN;
     static const char  tail_chunk[] = "\r\n0\r\n\r\n";
 
+    h1p = r->proto.h1;
     size = 0;
     prev = &out;
 
@@ -1714,6 +1723,11 @@ nxt_h1p_chunk_create(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
             nxt_memcpy(tail->mem.free, tail_chunk, sizeof(tail_chunk));
             tail->mem.free += nxt_length(tail_chunk);
 
+            if (!h1p->chunk_sent && size == 0) {
+                /* No chunk data comes before the last chunk. */
+                tail->mem.pos += nxt_length("\r\n");
+            }
+
             break;
         }
 
@@ -1731,8 +1745,16 @@ nxt_h1p_chunk_create(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
     }
 
     header->next = out;
-    header->mem.free = nxt_sprintf(header->mem.free, header->mem.end,
-                                   "\r\n%xO\r\n", size);
+    p = header->mem.free;
+
+    if (h1p->chunk_sent) {
+        *p++ = '\r'; *p++ = '\n';
+    }
+
+    header->mem.free = nxt_sprintf(p, header->mem.end, "%xO\r\n", size);
+
+    h1p->chunk_sent = 1;
+
     return header;
 }
 
