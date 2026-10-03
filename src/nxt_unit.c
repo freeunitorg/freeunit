@@ -1472,6 +1472,39 @@ nxt_unit_process_new_port(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg)
 }
 
 
+#if (NXT_TESTS)
+
+/*
+ * Adds a port with a shared memory queue, as NEW_PORT does for a router
+ * engine port.  libunit owns "out_fd" and "queue" from here on; "queue" is
+ * a mapping of sizeof(nxt_port_queue_t) bytes.
+ */
+
+int
+nxt_unit_test_add_queue_port(nxt_unit_ctx_t *ctx, pid_t pid, uint16_t id,
+    int out_fd, void *queue)
+{
+    nxt_unit_port_t  new_port, *port;
+
+    nxt_unit_port_id_init(&new_port.id, pid, id);
+
+    new_port.in_fd = -1;
+    new_port.out_fd = out_fd;
+    new_port.data = NULL;
+
+    port = nxt_unit_add_port(ctx, &new_port, queue);
+    if (nxt_slow_path(port == NULL)) {
+        return NXT_UNIT_ERROR;
+    }
+
+    nxt_unit_port_release(port);
+
+    return NXT_UNIT_OK;
+}
+
+#endif
+
+
 static int
 nxt_unit_ctx_ready(nxt_unit_ctx_t *ctx)
 {
@@ -7395,13 +7428,30 @@ nxt_unit_port_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     nxt_int_t             rc;
     nxt_port_msg_t        msg;
     nxt_unit_impl_t       *lib;
+    const nxt_port_msg_t  *pm;
     nxt_unit_port_impl_t  *port_impl;
 
     lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
 
     port_impl = nxt_container_of(port, nxt_unit_port_impl_t, port);
+
+    /*
+     * A message that goes to the socket puts only a READ_SOCKET marker into
+     * the queue.  The marker does not tell who sent it.  For each marker,
+     * the reader takes the next datagram, and that datagram can be from
+     * another process (nxt_port_queue_read_handler()).  Thus a datagram can
+     * be read before a queue message that its sender sent earlier.  A
+     * datagram is never read after a queue message that its sender sent
+     * later.  So a message of a request goes into the queue only if it is
+     * the last message of the request.  A message of no request (stream 0)
+     * can also go into the queue.
+     */
+    pm = buf;
+
     if (port_impl->queue != NULL && (oob == NULL || oob->size == 0)
-        && buf_size <= NXT_PORT_QUEUE_MSG_SIZE)
+        && buf_size <= NXT_PORT_QUEUE_MSG_SIZE
+        && buf_size >= sizeof(nxt_port_msg_t)
+        && (pm->stream == 0 || pm->last))
     {
         rc = nxt_port_queue_send(port_impl->queue, buf, buf_size, &notify);
         if (nxt_slow_path(rc != NXT_OK)) {
