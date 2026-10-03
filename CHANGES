@@ -1,6 +1,15 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Bugfix: the router did not answer "Expect: 100-continue". A client
+       that sent it, as curl and Guzzle do for large uploads, waited for its
+       own timeout before it sent the body. For curl, that timeout is 1
+       second. The router now sends "100 Continue" before it waits for the
+       body, also when a part of the body came with the header. A request
+       that the router refuses from its header gets its final status with no
+       100. A proxied request no longer carries the Expect field to the
+       upstream.
+
     *) Bugfix: the PHP module read the target index of a request after the
        request was released. libunit fills released request memory with
        0xA5, so the module called chdir(2) on every request to a "script"

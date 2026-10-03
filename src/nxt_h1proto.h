@@ -46,10 +46,15 @@ struct nxt_h1proto_s {
     uint8_t                   websocket_cont_expected;  /* 1 bit */
     uint8_t                   websocket_closed;         /* 1 bit */
     uint8_t                   websocket_text;           /* 1 bit */
+    uint8_t                   continue_pending;         /* 1 bit */
 
     nxt_h1p_ws_utf8_t         websocket_utf8;
 
-    uint32_t                  header_size;
+    /*
+     * Bytes written before the body: a 100 (Continue) and the response
+     * header.  $body_bytes_sent does not count them.
+     */
+    uint32_t                  sent_before_body;
 
     nxt_http_field_t          *websocket_key;
     nxt_h1p_websocket_timer_t *websocket_timer;

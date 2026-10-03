@@ -43,7 +43,13 @@ static nxt_int_t nxt_h1p_websocket_version(void *ctx, nxt_http_field_t *field,
     uintptr_t data);
 static nxt_int_t nxt_h1p_transfer_encoding(void *ctx, nxt_http_field_t *field,
     uintptr_t data);
+static nxt_int_t nxt_h1p_expect(void *ctx, nxt_http_field_t *field,
+    uintptr_t data);
 static void nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r);
+static nxt_int_t nxt_h1p_request_continue(nxt_task_t *task,
+    nxt_h1proto_t *h1p);
+static void nxt_h1p_conn_continue_sent(nxt_task_t *task, void *obj,
+    void *data);
 static void nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_h1p_request_local_addr(nxt_task_t *task, nxt_http_request_t *r);
@@ -120,6 +126,7 @@ static const nxt_conn_state_t  nxt_h1p_shutdown_state;
 #endif
 static const nxt_conn_state_t  nxt_h1p_idle_state;
 static const nxt_conn_state_t  nxt_h1p_header_parse_state;
+static const nxt_conn_state_t  nxt_h1p_continue_state;
 static const nxt_conn_state_t  nxt_h1p_read_body_state;
 static const nxt_conn_state_t  nxt_h1p_request_send_state;
 static const nxt_conn_state_t  nxt_h1p_timeout_response_state;
@@ -167,6 +174,7 @@ static nxt_http_field_proc_t           nxt_h1p_fields[] = {
     { nxt_string("Sec-WebSocket-Version"),
                                        &nxt_h1p_websocket_version, 0 },
     { nxt_string("Transfer-Encoding"), &nxt_h1p_transfer_encoding, 0 },
+    { nxt_string("Expect"),            &nxt_h1p_expect, 0 },
 
     { nxt_string("Host"),              &nxt_http_request_host, 0 },
     { nxt_string("Cookie"),            &nxt_http_request_field,
@@ -927,6 +935,33 @@ nxt_h1p_transfer_encoding(void *ctx, nxt_http_field_t *field, uintptr_t data)
 }
 
 
+/*
+ * RFC 9110, 10.1.1.  The router meets "100-continue" itself and ignores any
+ * other expectation, as nginx does.  An HTTP/1.0 client gets no 100.  The
+ * proxy has the whole body before it connects, so it does not forward the
+ * field.  The application still gets it.
+ */
+
+static nxt_int_t
+nxt_h1p_expect(void *ctx, nxt_http_field_t *field, uintptr_t data)
+{
+    nxt_http_request_t  *r;
+
+    r = ctx;
+    field->hopbyhop = 1;
+
+    if (field->value_length == nxt_length("100-continue")
+        && nxt_memcasecmp(field->value, "100-continue",
+                          nxt_length("100-continue")) == 0
+        && nxt_h1p_is_http11(r->proto.h1))
+    {
+        r->proto.h1->continue_pending = 1;
+    }
+
+    return NXT_OK;
+}
+
+
 static void
 nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
 {
@@ -1070,6 +1105,24 @@ nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
 
         c = h1p->conn;
         c->read = b;
+
+        /*
+         * The 100 goes out also if a part of the body came with the header,
+         * as in nginx.  That part can be only chunk framing, and the client
+         * can still wait for the 100.  Nothing is written before the body
+         * is read, so the 100 cannot follow a response.  The flag is cleared
+         * when the 100 is queued, so a request gets one 100 at most.
+         */
+        if (h1p->continue_pending) {
+            ret = nxt_h1p_request_continue(task, h1p);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                status = NXT_HTTP_INTERNAL_SERVER_ERROR;
+                goto error;
+            }
+
+            return;
+        }
+
         c->read_state = &nxt_h1p_read_body_state;
 
         nxt_conn_read(task->thread->engine, c);
@@ -1094,6 +1147,84 @@ error:
     h1p->keepalive = 0;
 
     nxt_http_request_error(task, r, status);
+}
+
+
+/*
+ * Sends "100 Continue" on the normal write path.  The body is read only
+ * after the 100 is sent.  A write error or a send timeout closes the
+ * request, as for a response.
+ */
+
+static nxt_int_t
+nxt_h1p_request_continue(nxt_task_t *task, nxt_h1proto_t *h1p)
+{
+    nxt_buf_t   *b;
+    nxt_conn_t  *c;
+
+    static const char  continue_response[] = "HTTP/1.1 100 Continue\r\n\r\n";
+
+    nxt_debug(task, "h1p request continue");
+
+    c = h1p->conn;
+
+    /* The connection pool frees the buffer also if it is never sent. */
+    b = nxt_buf_mem_alloc(c->mem_pool, nxt_length(continue_response), 0);
+    if (nxt_slow_path(b == NULL)) {
+        return NXT_ERROR;
+    }
+
+    b->mem.free = nxt_cpymem(b->mem.free, continue_response,
+                             nxt_length(continue_response));
+
+    /* $body_bytes_sent does not count the 100. */
+    h1p->sent_before_body += nxt_length(continue_response);
+    h1p->continue_pending = 0;
+
+    c->write = b;
+    c->write_state = &nxt_h1p_continue_state;
+
+    nxt_conn_write(task->thread->engine, c);
+
+    return NXT_OK;
+}
+
+
+static const nxt_conn_state_t  nxt_h1p_continue_state
+    nxt_aligned(64) =
+{
+    .ready_handler = nxt_h1p_conn_continue_sent,
+    .error_handler = nxt_h1p_conn_request_error,
+
+    .timer_handler = nxt_h1p_conn_request_send_timeout,
+    .timer_value = nxt_h1p_conn_request_timer_value,
+    .timer_data = offsetof(nxt_socket_conf_t, send_timeout),
+    .timer_autoreset = 1,
+};
+
+
+static void
+nxt_h1p_conn_continue_sent(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_conn_t          *c;
+    nxt_event_engine_t  *engine;
+
+    c = obj;
+
+    nxt_debug(task, "h1p conn continue sent");
+
+    engine = task->thread->engine;
+
+    c->write = nxt_sendbuf_completion(task, &engine->fast_work_queue, c->write);
+
+    if (c->write != NULL) {
+        nxt_conn_write(engine, c);
+        return;
+    }
+
+    c->read_state = &nxt_h1p_read_body_state;
+
+    nxt_conn_read(engine, c);
 }
 
 
@@ -1540,7 +1671,8 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
 
     header->mem.free = p;
 
-    h1p->header_size = nxt_buf_mem_used_size(&header->mem);
+    /* $body_bytes_sent does not count the header, or a 100 sent before. */
+    h1p->sent_before_body += nxt_buf_mem_used_size(&header->mem);
 
     c = h1p->conn;
 
@@ -1745,7 +1877,7 @@ nxt_h1p_request_body_bytes_sent(nxt_task_t *task, nxt_http_proto_t proto)
 
     h1p = proto.h1;
 
-    sent = h1p->conn->sent - h1p->header_size;
+    sent = h1p->conn->sent - h1p->sent_before_body;
 
     return (sent > 0) ? sent : 0;
 }
