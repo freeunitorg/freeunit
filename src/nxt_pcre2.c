@@ -21,6 +21,15 @@
  */
 #define NXT_PCRE2_HEAP_LIMIT  16384
 
+/*
+ * The most nested calls that one match may make with PCRE2 before 10.30.
+ * These versions make the calls on the stack, 448 bytes each in PCRE2 10.23
+ * of Amazon Linux 2 on x86-64.  2,000 calls use about 900 KB.  A request
+ * matches on a router thread with the default glibc stack: 8 MB, or 2 MB
+ * when the stack rlimit is unlimited.  The library default is 10,000,000.
+ */
+#define NXT_PCRE2_RECURSION_LIMIT  2000
+
 
 static void *nxt_pcre2_malloc(PCRE2_SIZE size, void *memory_data);
 static void nxt_pcre2_free(void *p, void *memory_data);
@@ -245,6 +254,8 @@ nxt_regex_match_create(nxt_mp_t *mp, size_t size)
 
 #if (PCRE2_MAJOR > 10 || PCRE2_MINOR >= 30)
     (void) pcre2_set_heap_limit(ctx, NXT_PCRE2_HEAP_LIMIT);
+#else
+    (void) pcre2_set_recursion_limit(ctx, NXT_PCRE2_RECURSION_LIMIT);
 #endif
 
     (void) pcre2_set_callout(ctx, nxt_pcre2_callout, match);
@@ -289,6 +300,12 @@ nxt_regex_match(nxt_regex_t *re, u_char *subject, size_t length,
             limit = "heap";
             break;
 #endif
+
+        /* PCRE2 10.30 and later call it the depth limit. */
+
+        case PCRE2_ERROR_RECURSIONLIMIT:
+            limit = "recursion";
+            break;
 
         default:
             limit = NULL;

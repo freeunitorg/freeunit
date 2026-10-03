@@ -7,11 +7,11 @@
  * takes about 2M match steps on 2000 separators on PCRE2 10.4x and PCRE
  * 8.39.  The match must stop at NXT_REGEX_MATCH_LIMIT and report an error.
  *
- * A repeated group takes about 2 match steps per byte.  On PCRE2 it must
- * still match on an 8 KiB subject.  PCRE 1 also nests about 2 calls per
- * byte on the stack.  On an 8 KiB subject it must stop at its recursion
- * limit and report an error, not overflow the stack.  On a 512-byte subject
- * it must match.
+ * A repeated group takes about 2 match steps per byte.  On PCRE2 10.30 and
+ * later it must still match on an 8 KiB subject.  PCRE 1 and PCRE2 before
+ * 10.30 also nest about 2 calls per byte on the stack.  On an 8 KiB subject
+ * they must stop at the recursion limit and report an error, not overflow
+ * the stack.  On a 512-byte subject they must match.
  *
  * The library counts match steps from zero again at each start position of
  * a pattern that is not anchored.  In PCRE2 10.42, "(?=a)(?:a|aa){0,12}[xy]"
@@ -26,12 +26,17 @@
 #include <nxt_regex.h>
 #include "nxt_tests.h"
 
+#if (NXT_HAVE_PCRE2)
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include <pcre2.h>
+#endif
+
 
 #define NXT_REGEX_TEST_SIZE     8192
 #define NXT_REGEX_TEST_SHORT    512
 #define NXT_REGEX_TEST_STARTS   1000
 
-#if (NXT_HAVE_PCRE2)
+#if (NXT_HAVE_PCRE2 && (PCRE2_MAJOR > 10 || PCRE2_MINOR >= 30))
 #define NXT_REGEX_TEST_LONG_RESULT  1
 #else
 #define NXT_REGEX_TEST_LONG_RESULT  NXT_ERROR
