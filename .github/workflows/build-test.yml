@@ -1149,6 +1149,52 @@ jobs:
       - name: Run C tests
         run: sudo ./build/tests
 
+  # JIT is opt-in, so the default jobs do not execute its regression cases.
+  c-tests-jit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [none, address]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev
+
+      - name: Configure unit with PCRE2 JIT
+        env:
+          SANITIZER: ${{ matrix.sanitizer }}
+        run: |
+          if [ "$SANITIZER" = address ]; then
+            ASAN_OPTIONS=detect_leaks=0 ./configure \
+              --openssl --debug --hardening=strict --tests --regex-jit \
+              --cc-opt='-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g' \
+              --ld-opt='-fsanitize=address,undefined'
+          else
+            ./configure --openssl --debug --hardening=strict --tests --regex-jit
+          fi
+
+      - name: Build unitd, libunit and C tests
+        run: |
+          make -j4
+          make -j4 build/lib/libunit.a
+          make -j4 tests
+
+      - name: Check test-hook isolation
+        run: .github/scripts/check-test-hooks.sh
+
+      - name: Run C tests
+        run: |
+          set -o pipefail
+          sudo env ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+            ./build/tests 2>&1 | tee jit-tests.log
+          grep -F 'regex JIT test passed: execution, fallback, cleanup' jit-tests.log
+
   # Same C unit-test suite as c-tests above, built with AddressSanitizer and
   # run with LeakSanitizer's default ASAN_OPTIONS (detect_leaks is on unless
   # something turns it off). Separate from sanitize.yml: that workflow runs

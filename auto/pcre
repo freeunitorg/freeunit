@@ -69,6 +69,15 @@ fi
 if [ $nxt_found = yes ]; then
     nxt_have=NXT_HAVE_REGEX . auto/have
 
+    if [ $NXT_REGEX_JIT = YES ]; then
+        if [ $NXT_HAVE_PCRE2 != YES ]; then
+            $echo "$0: error: --regex-jit requires PCRE2 and regex support."
+            exit 1
+        fi
+
+        nxt_have=NXT_REGEX_JIT . auto/have
+    fi
+
 else
     $echo
     $echo $0: error: no PCRE library found.

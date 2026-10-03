@@ -47,6 +47,22 @@ NXT_EXPORT nxt_regex_match_t *nxt_regex_match_create(nxt_mp_t *mp, size_t size);
 NXT_EXPORT nxt_int_t nxt_regex_match(nxt_regex_t *re, u_char *subject,
     size_t length, nxt_regex_match_t *match);
 
+#if (NXT_TESTS && NXT_HAVE_PCRE2)
+typedef struct {
+    nxt_uint_t  compiled;
+    nxt_uint_t  executed;
+    nxt_uint_t  freed;
+    nxt_uint_t  fallback;
+} nxt_regex_jit_test_stats_t;
+
+/* 0: normal, 1: unavailable, 2: compile failure, 3: stack limit,
+ * 4: cleanup registration failure, 5: stack limit with exhausted budget.
+ * Hooks are only in the test archive. */
+NXT_EXPORT void nxt_regex_jit_test_mode(nxt_uint_t mode);
+NXT_EXPORT nxt_regex_jit_test_stats_t nxt_regex_jit_test_stats(void);
+NXT_EXPORT nxt_bool_t nxt_regex_jit_test_available(void);
+#endif
+
 #endif /* NXT_HAVE_REGEX */
 
 #endif /* _NXT_REGEX_H_INCLUDED_ */

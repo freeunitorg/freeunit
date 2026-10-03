@@ -1,6 +1,12 @@
 
 Changes with FreeUnit 1.37.1                                     04 Oct 2026
 
+    *) Feature: --regex-jit enables optional PCRE2 JIT compilation. A
+       library or pattern without usable JIT uses interpreted matching.
+       Configuration cleanup releases JIT executable memory. A match that
+       exhausts the default JIT stack is retried once in the interpreter
+       with the same match limit. This option is off by default.
+
     *) Bugfix: the control API accepted a listener with neither "pass" nor
        "application". The router then refused the configuration, and the
        client got 500 "Failed to apply new configuration." with only

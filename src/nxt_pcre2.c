@@ -35,11 +35,62 @@ static void *nxt_pcre2_malloc(PCRE2_SIZE size, void *memory_data);
 static void nxt_pcre2_free(void *p, void *memory_data);
 static int nxt_pcre2_callout(pcre2_callout_block *block, void *data);
 static void nxt_pcre2_match_cleanup(nxt_task_t *task, void *obj, void *data);
+static void nxt_pcre2_code_cleanup(nxt_task_t *task, void *obj, void *data);
+
+#if (NXT_TESTS)
+static nxt_uint_t                   nxt_pcre2_test_mode;
+static nxt_regex_jit_test_stats_t   nxt_pcre2_test_stats;
+
+void
+nxt_regex_jit_test_mode(nxt_uint_t mode)
+{
+    nxt_pcre2_test_mode = mode;
+}
+
+nxt_regex_jit_test_stats_t
+nxt_regex_jit_test_stats(void)
+{
+    return nxt_pcre2_test_stats;
+}
+
+nxt_bool_t
+nxt_regex_jit_test_available(void)
+{
+    int         errcode;
+    uint32_t    available;
+    PCRE2_SIZE  offset;
+    pcre2_code  *code;
+    nxt_bool_t  usable;
+
+    available = 0;
+    if (pcre2_config(PCRE2_CONFIG_JIT, &available) != 0 || available == 0) {
+        return 0;
+    }
+
+    code = pcre2_compile((PCRE2_SPTR) "a", 1, 0, &errcode, &offset, NULL);
+    if (code == NULL) {
+        return 0;
+    }
+    usable = pcre2_jit_compile(code, PCRE2_JIT_COMPLETE) == 0;
+    pcre2_code_free(code);
+    return usable;
+}
+
+#if (NXT_REGEX_JIT)
+static pcre2_jit_stack *
+nxt_pcre2_test_jit_stack(void *data)
+{
+    nxt_pcre2_test_stats.executed++;
+    return NULL;
+}
+#endif
+#endif
 
 
 struct nxt_regex_s {
     pcre2_code  *code;
     nxt_str_t   pattern;
+    nxt_bool_t  jit;
 };
 
 
@@ -119,24 +170,59 @@ nxt_regex_compile(nxt_mp_t *mp, nxt_str_t *source, nxt_regex_err_t *err)
         re->code = code;
     }
 
-#if 0
-    /*
-     * The JIT honours the match limit and callouts but not the heap limit,
-     * and it has its own stack limit.  This matters if the JIT is enabled
-     * again.
-     */
+    re->jit = 0;
 
-    errcode = pcre2_jit_compile(re, PCRE2_JIT_COMPLETE);
-    if (nxt_slow_path(errcode != 0 && errcode != PCRE2_ERROR_JIT_BADOPTION)) {
-        ret = pcre2_get_error_message(errcode, (PCRE2_UCHAR *) err->msg,
-                                      ERR_BUF_SIZE);
-        if (ret < 0) {
-            (void) nxt_sprintf(err->msg, err->msg + ERR_BUF_SIZE,
-                               "JIT compilation failed with unknown "
-                               "error code: %d%Z", errcode);
+    /* JIT executable memory is not owned by the configuration pool. */
+#if (NXT_TESTS)
+    if (nxt_pcre2_test_mode == 4) {
+        ret = NXT_ERROR;
+    } else
+#endif
+    {
+        ret = nxt_mp_cleanup(mp, nxt_pcre2_code_cleanup, NULL, re, NULL);
+    }
+
+    if (ret != NXT_OK) {
+        pcre2_code_free(re->code);
+        goto alloc_fail;
+    }
+
+#if (NXT_REGEX_JIT)
+    {
+        uint32_t    available;
+        PCRE2_SIZE  jit_size;
+
+        available = 0;
+        (void) pcre2_config(PCRE2_CONFIG_JIT, &available);
+
+#if (NXT_TESTS)
+        if (nxt_pcre2_test_mode == 1) {
+            available = 0;
         }
+#endif
 
-        return NULL;
+        if (available != 0) {
+#if (NXT_TESTS)
+            if (nxt_pcre2_test_mode == 2) {
+                errcode = PCRE2_ERROR_NOMEMORY;
+            } else
+#endif
+            {
+                errcode = pcre2_jit_compile(re->code, PCRE2_JIT_COMPLETE);
+            }
+
+            jit_size = 0;
+            if (errcode == 0
+                && pcre2_pattern_info(re->code, PCRE2_INFO_JITSIZE,
+                                      &jit_size) == 0
+                && jit_size != 0)
+            {
+                re->jit = 1;
+#if (NXT_TESTS)
+                nxt_pcre2_test_stats.compiled++;
+#endif
+            }
+        }
     }
 #endif
 
@@ -204,6 +290,21 @@ nxt_pcre2_match_cleanup(nxt_task_t *task, void *obj, void *data)
 }
 
 
+static void
+nxt_pcre2_code_cleanup(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_regex_t  *re;
+
+    re = obj;
+    pcre2_code_free(re->code);
+#if (NXT_TESTS)
+    if (re->jit) {
+        nxt_pcre2_test_stats.freed++;
+    }
+#endif
+}
+
+
 nxt_regex_match_t *
 nxt_regex_match_create(nxt_mp_t *mp, size_t size)
 {
@@ -260,6 +361,10 @@ nxt_regex_match_create(nxt_mp_t *mp, size_t size)
 
     (void) pcre2_set_callout(ctx, nxt_pcre2_callout, match);
 
+#if (NXT_TESTS && NXT_REGEX_JIT)
+    pcre2_jit_stack_assign(ctx, nxt_pcre2_test_jit_stack, NULL);
+#endif
+
     match->ctx = ctx;
 
     return match;
@@ -278,6 +383,30 @@ nxt_regex_match(nxt_regex_t *re, u_char *subject, size_t length,
 
     ret = pcre2_match(re->code, (PCRE2_SPTR) subject, length, 0, 0,
                       match->data, match->ctx);
+
+#if (NXT_REGEX_JIT)
+    /*
+     * Use PCRE2's bounded default 32 KiB stack on the calling thread.
+     * Retry stack exhaustion once in the interpreter with the same limit.
+     * Preserve the remaining callout budget across the retry.
+     * Never retry MATCHLIMIT: that could double pathological backtracking.
+     */
+#if (NXT_TESTS)
+    if (re->jit && (nxt_pcre2_test_mode == 3 || nxt_pcre2_test_mode == 5)) {
+        if (nxt_pcre2_test_mode == 5) {
+            match->budget = 0;
+        }
+        ret = PCRE2_ERROR_JIT_STACKLIMIT;
+    }
+#endif
+    if (ret == PCRE2_ERROR_JIT_STACKLIMIT) {
+#if (NXT_TESTS)
+        nxt_pcre2_test_stats.fallback++;
+#endif
+        ret = pcre2_match(re->code, (PCRE2_SPTR) subject, length, 0,
+                          PCRE2_NO_JIT, match->data, match->ctx);
+    }
+#endif
 
     if (nxt_slow_path(ret < PCRE2_ERROR_NOMATCH)) {
 
