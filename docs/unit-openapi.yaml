@@ -3285,6 +3285,87 @@ paths:
         "404":
           $ref: "#/components/responses/responseNotFound"
 
+  /config/settings/http/body_min_rate:
+    summary: "Endpoint for the `body_min_rate` option in `http`"
+    get:
+      operationId: getSettingsHttpBodyMinRate
+      summary: "Retrieve the body_min_rate option from http settings"
+      description: "Retrieves the `body_min_rate` option that represents
+        the minimum rate of the client request body, in bytes per second.
+        The value 0 disables the check."
+
+      tags:
+        - settings
+        - config
+
+      responses:
+        "200":
+          description: "OK; the `body_min_rate` option exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                type: integer
+
+              examples:
+                BodyMinRate:
+                  value: 256
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+    put:
+      operationId: updateSettingsHttpBodyMinRate
+      summary: "Create or overwrite the body_min_rate option"
+      description: "Creates or overwrites the `body_min_rate` option in
+        the configuration."
+
+      tags:
+        - settings
+        - config
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: integer
+
+            examples:
+              BodyMinRate:
+                value: 256
+
+      responses:
+        "200":
+          $ref: "#/components/responses/responseOkUpdated"
+
+        "400":
+          $ref: "#/components/responses/responseBadRequest"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+        "500":
+          $ref: "#/components/responses/responseInternalError"
+
+    delete:
+      operationId: deleteSettingsHttpBodyMinRate
+      summary: "Delete the body_min_rate option"
+      description: "Deletes the `body_min_rate` option from the
+        configuration."
+
+      tags:
+        - settings
+        - config
+
+      responses:
+        "200":
+          $ref: "#/components/responses/responseOkDeleted"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
   /config/settings/http/body_read_timeout:
     summary: "Endpoint for the `body_read_timeout` option in `http`"
     get:
@@ -4514,6 +4595,87 @@ paths:
       operationId: deleteSettingsHttpMaxBodySize
       summary: "Delete the max_body_size option"
       description: "Deletes the `max_body_size` option from the configuration."
+      tags:
+        - settings
+        - config
+
+      responses:
+        "200":
+          $ref: "#/components/responses/responseOkDeleted"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /config/settings/http/send_min_rate:
+    summary: "Endpoint for the `send_min_rate` option in `http`"
+    get:
+      operationId: getSettingsHttpSendMinRate
+      summary: "Retrieve the send_min_rate option from http settings"
+      description: "Retrieves the `send_min_rate` option that represents
+        the minimum rate at which the client reads the response, in bytes
+        per second.  The value 0 disables the check."
+
+      tags:
+        - settings
+        - config
+
+      responses:
+        "200":
+          description: "OK; the `send_min_rate` option exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                type: integer
+
+              examples:
+                SendMinRate:
+                  value: 16384
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+    put:
+      operationId: updateSettingsHttpSendMinRate
+      summary: "Create or overwrite the send_min_rate option"
+      description: "Creates or overwrites the `send_min_rate` option in
+        the configuration."
+
+      tags:
+        - settings
+        - config
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: integer
+
+            examples:
+              SendMinRate:
+                value: 16384
+
+      responses:
+        "200":
+          $ref: "#/components/responses/responseOkUpdated"
+
+        "400":
+          $ref: "#/components/responses/responseBadRequest"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+        "500":
+          $ref: "#/components/responses/responseInternalError"
+
+    delete:
+      operationId: deleteSettingsHttpSendMinRate
+      summary: "Delete the send_min_rate option"
+      description: "Deletes the `send_min_rate` option from the
+        configuration."
+
       tags:
         - settings
         - config
@@ -6019,12 +6181,14 @@ components:
 
         settings:
           http:
+            body_min_rate: 256
             body_read_timeout: 30
             discard_unsafe_fields: true
             header_read_timeout: 30
             idle_timeout: 180
             log_route: true
             max_body_size: 8388608
+            send_min_rate: 16384
             send_timeout: 30
             server_version: false
 
@@ -6291,6 +6455,7 @@ components:
       summary: "Global settings"
       value:
         http:
+          body_min_rate: 256
           body_read_timeout: 30
           compression:
           types:
@@ -6305,6 +6470,7 @@ components:
           idle_timeout: 180
           log_route: true
           max_body_size: 8388608
+          send_min_rate: 16384
           send_timeout: 30
           server_version: false
           static:
@@ -6317,6 +6483,7 @@ components:
     configSettingsHttp:
       summary: "HTTP settings"
       value:
+        body_min_rate: 256
         body_read_timeout: 30
         compression:
           types:
@@ -6331,6 +6498,7 @@ components:
         idle_timeout: 180
         log_route: true
         max_body_size: 8388608
+        send_min_rate: 16384
         send_timeout: 30
         server_version: false
         static:
@@ -7873,6 +8041,26 @@ components:
         in Unit."
 
       properties:
+        body_min_rate:
+          type: integer
+          minimum: 0
+          maximum: 2147483647
+          description: "Minimum rate of the client request body, in bytes
+            per second.  The check starts after a grace time.  The grace
+            time is equal to `body_read_timeout`.  After the grace time,
+            if the client sent fewer bytes than `body_min_rate` multiplied
+            by the elapsed seconds, Unit sends 408 and closes the
+            connection.  The rate is checked for each window of at least
+            the grace time, so bytes sent early give no credit later.  Unit
+            counts the body bytes that it reads after the request header.
+            The read that completes the body is not checked, because the
+            body is then complete.  If `body_read_timeout` is 0, there is
+            no grace time and each read is checked.  The value 0 disables
+            the check.  Use the
+            value 256 to stop slow clients (\"slow POST\")."
+
+          default: 0
+
         body_read_timeout:
           type: integer
           description: "Maximum number of seconds to read data from the body of
@@ -7916,6 +8104,28 @@ components:
             client’s request."
 
           default: 8388608
+
+        send_min_rate:
+          type: integer
+          minimum: 0
+          maximum: 2147483647
+          description: "Minimum rate at which the client reads the response,
+            in bytes per second.  Unit measures only the time when response
+            data waits for the client.  The check starts after a grace time.
+            The grace time is equal to `send_timeout`.  After the grace
+            time, if the client accepted fewer bytes than `send_min_rate`
+            multiplied by the elapsed seconds, Unit closes the connection.
+            The rate is checked for each window of at least the grace time.
+            Unit counts the bytes that the kernel accepts into the socket
+            send buffer.  The kernel sizes this buffer to the link, so the
+            measured rate is near the real download rate of the client.  A
+            floor above the bandwidth of honest slow clients stops their
+            downloads.  Use a small value, for example 16384.  If
+            `send_timeout` is 0, there is no grace time and each write is
+            checked.  The value 0 disables the check.  WebSocket
+            connections do not use this check."
+
+          default: 0
 
         send_timeout:
           type: integer

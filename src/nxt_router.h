@@ -289,6 +289,10 @@ typedef struct {
     nxt_msec_t             proxy_send_timeout;
     nxt_msec_t             proxy_read_timeout;
 
+    /* Minimum client transfer rates in bytes per second, 0 is off. */
+    int32_t                body_min_rate;
+    int32_t                send_min_rate;
+
     nxt_websocket_conf_t   websocket_conf;
 
     nxt_str_t              body_temp_path;

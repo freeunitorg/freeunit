@@ -201,6 +201,22 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        such a response gave 502 when it carried chunked together with
        Content-Length.
 
+    *) Feature: the "body_min_rate" and "send_min_rate" options in
+       "settings/http" set a minimum client rate in bytes per second.
+       The body_read_timeout and send_timeout timers start again after
+       each read or write, so a client that sends or reads one byte
+       before each timeout kept a connection for ever. After a grace
+       time equal to the related timeout, a client below the rate gets
+       408 (body) or the connection closes (response). The rate is
+       checked for each window of at least the grace time, so bytes sent
+       early give no credit for a slow transfer later. The default is 0,
+       which disables the check. For body_min_rate, 256 is a good value.
+       send_min_rate counts the bytes that the kernel accepts into the
+       socket send buffer. The kernel sizes this buffer to the link, so
+       the rate is near the real download rate of the client. A floor
+       above the bandwidth of honest slow clients stops their downloads;
+       use a small value, for example 16384.
+
     *) Feature: the --hardening=[off|default|strict] configure option adds
        compiler and linker hardening flags. Each flag is probed, and a
        compiler that does not support a flag only loses that flag. The

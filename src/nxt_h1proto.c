@@ -64,6 +64,12 @@ static nxt_off_t nxt_h1p_request_body_bytes_sent(nxt_task_t *task,
 static void nxt_h1p_request_discard(nxt_task_t *task, nxt_http_request_t *r,
     nxt_buf_t *last);
 static void nxt_h1p_conn_request_error(nxt_task_t *task, void *obj, void *data);
+static nxt_bool_t nxt_h1p_rate_too_low(uint64_t bytes, uint64_t msec,
+    nxt_msec_t grace, int32_t rate);
+static void nxt_h1p_send_rate_start(nxt_task_t *task, nxt_h1proto_t *h1p,
+    nxt_http_request_t *r);
+static nxt_bool_t nxt_h1p_send_rate_check(nxt_task_t *task, nxt_conn_t *c);
+static void nxt_h1p_request_timedout(nxt_task_t *task, nxt_conn_t *c);
 static void nxt_h1p_conn_request_timeout(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_h1p_conn_request_send_timeout(nxt_task_t *task, void *obj,
@@ -1103,6 +1109,21 @@ nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
         h1p->buffers = in;
         h1p->nbuffers++;
 
+        /*
+         * The body_min_rate floor counts each byte that a read returns
+         * in the body read state, chunk framing included.  The framing
+         * costs the client the same bandwidth, and max_body_size limits
+         * the payload.  The header block, and the body bytes that came
+         * with it, are not counted, because the first body read comes
+         * after this point.  Thus the first window is a little stricter.
+         * This is intentional.  The time starts at the start of the body
+         * read state.  After a 100 (Continue),
+         * nxt_h1p_conn_continue_sent() starts it again.
+         */
+        h1p->body_rate_on = (skcf->body_min_rate > 0);
+        h1p->body_rate_start = task->thread->engine->timers.now;
+        h1p->body_rate_bytes = 0;
+
         c = h1p->conn;
         c->read = b;
 
@@ -1207,6 +1228,7 @@ static void
 nxt_h1p_conn_continue_sent(nxt_task_t *task, void *obj, void *data)
 {
     nxt_conn_t          *c;
+    nxt_h1proto_t       *h1p;
     nxt_event_engine_t  *engine;
 
     c = obj;
@@ -1221,6 +1243,14 @@ nxt_h1p_conn_continue_sent(nxt_task_t *task, void *obj, void *data)
         nxt_conn_write(engine, c);
         return;
     }
+
+    /*
+     * The body read state starts now, and so does the body_read_timeout
+     * timer.  Thus the body_min_rate time starts again here.  The time
+     * when the 100 waited for space in the send buffer is not counted.
+     */
+    h1p = c->socket.data;
+    h1p->body_rate_start = engine->timers.now;
 
     c->read_state = &nxt_h1p_read_body_state;
 
@@ -1248,6 +1278,7 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
     size_t              size, body_rest;
     ssize_t             res;
     nxt_buf_t           *b, *out, *chunk;
+    nxt_msec_t          msec;
     nxt_conn_t          *c;
     nxt_h1proto_t       *h1p;
     nxt_socket_conf_t   *skcf;
@@ -1362,6 +1393,36 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
     nxt_debug(task, "h1p body rest: %uz", body_rest);
 
     if (body_rest != 0) {
+
+        if (h1p->body_rate_on) {
+            /*
+             * The bytes are counted only here.  The flag does not change
+             * in the body read state, and only a read that continues
+             * the body is checked.
+             */
+            h1p->body_rate_bytes += c->nbytes;
+
+            msec = (nxt_msec_t) (engine->timers.now - h1p->body_rate_start);
+
+            if (nxt_h1p_rate_too_low(h1p->body_rate_bytes, msec,
+                                     skcf->body_read_timeout,
+                                     skcf->body_min_rate))
+            {
+                nxt_log(task, NXT_LOG_INFO, "client body rate is less than "
+                        "body_min_rate %d: %uL bytes in %M ms",
+                        skcf->body_min_rate, h1p->body_rate_bytes, msec);
+
+                nxt_h1p_request_timedout(task, c);
+                return;
+            }
+
+            if (msec >= skcf->body_read_timeout) {
+                /* The window passed: the next window counts from now. */
+                h1p->body_rate_start = engine->timers.now;
+                h1p->body_rate_bytes = 0;
+            }
+        }
+
         nxt_conn_read(engine, c);
 
     } else {
@@ -1680,6 +1741,8 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
     h1p->conn_write_tail = &header->next;
     c->write_state = &nxt_h1p_request_send_state;
 
+    nxt_h1p_send_rate_start(task, h1p, r);
+
     if (body_handler != NULL) {
         /*
          * The body handler will run before c->io->write() handler,
@@ -1784,6 +1847,8 @@ nxt_h1p_request_send(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
     if (c->write == NULL) {
         c->write = out;
         c->write_state = &nxt_h1p_request_send_state;
+
+        nxt_h1p_send_rate_start(task, h1p, r);
 
         nxt_conn_write(task->thread->engine, c);
 
@@ -1959,19 +2024,188 @@ nxt_h1p_conn_request_error(nxt_task_t *task, void *obj, void *data)
 }
 
 
+/*
+ * The minimum transfer rate floor: body_min_rate and send_min_rate.
+ *
+ * The body_read_timeout and send_timeout timers are gap timers.  Each
+ * read or write of one or more bytes starts the timer again.  Thus the
+ * timers stop a client that sends or reads nothing, but they do not stop
+ * a client that transfers one byte just before each timeout ("slow POST"
+ * and "slow read").  Such a client can keep a connection for ever.
+ *
+ * The rate floor stops this client.  The floor is added to the gap timers,
+ * it does not replace them.  The floor check runs only when a read or
+ * a write completes.  A client that stops fully causes no events, and the
+ * gap timer stops it.  A client that is slower than the floor still causes
+ * events, and the floor check stops it.
+ *
+ * The check starts after a grace time.  The grace time is equal to the gap
+ * timeout (body_read_timeout or send_timeout).  It lets TCP slow start and
+ * short network stops occur.  A total time limit is not used, because it
+ * also stops honest large transfers on slow links.
+ *
+ * The check is "bytes * 1000 < rate * msec" in 64-bit integers.  The
+ * validator keeps the rate at or below 2^31 - 1, and the check limits
+ * msec to 2^31 - 1.  Thus the product cannot overflow.
+ */
+
+static nxt_bool_t
+nxt_h1p_rate_too_low(uint64_t bytes, uint64_t msec, nxt_msec_t grace,
+    int32_t rate)
+{
+    if (rate <= 0 || msec < grace) {
+        return 0;
+    }
+
+    msec = nxt_min(msec, (uint64_t) NXT_INT32_T_MAX);
+
+    if (bytes >= UINT64_MAX / 1000) {
+        return 0;
+    }
+
+    return (bytes * 1000 < (uint64_t) rate * msec);
+}
+
+
+/*
+ * The send rate is measured only while response data waits for the client.
+ * A send period starts when the router gives data to an empty connection
+ * write queue.  The period stops when the client accepted all the queued
+ * data.  The time between periods is not counted: then the router waits
+ * for the application or for the upstream server, not for the client.
+ * Thus a slow response source (for example a stream of events) is not
+ * stopped by the floor.  The bytes and the time of the periods of one
+ * request are added together until a window of at least the grace time
+ * passes the check; then the next window starts from zero.  Thus bytes
+ * sent early in a response give no credit for a slow read later.
+ *
+ * The check runs after each write, also after the write that stops
+ * a period.  When the last data of the response goes out, the response
+ * is complete in the socket buffer.  Then a failed check only closes the
+ * connection instead of keeping it alive.
+ *
+ * WebSocket frames also use the request send state.  The floor is not
+ * used for a WebSocket connection.
+ */
+
+static void
+nxt_h1p_send_rate_start(nxt_task_t *task, nxt_h1proto_t *h1p,
+    nxt_http_request_t *r)
+{
+    if (h1p->send_rate_on
+        || h1p->websocket
+        || r->conf->socket_conf->send_min_rate <= 0)
+    {
+        return;
+    }
+
+    h1p->send_rate_on = 1;
+    h1p->send_rate_start = task->thread->engine->timers.now;
+    h1p->send_rate_sent = h1p->conn->sent;
+}
+
+
+static nxt_bool_t
+nxt_h1p_send_rate_check(nxt_task_t *task, nxt_conn_t *c)
+{
+    uint64_t            bytes, msec;
+    nxt_h1proto_t       *h1p;
+    nxt_socket_conf_t   *skcf;
+    nxt_http_request_t  *r;
+
+    h1p = c->socket.data;
+
+    if (!h1p->send_rate_on) {
+        return 0;
+    }
+
+    r = h1p->request;
+
+    if (nxt_slow_path(r == NULL)) {
+        return 0;
+    }
+
+    skcf = r->conf->socket_conf;
+
+    msec = h1p->send_rate_time
+           + (nxt_msec_t) (task->thread->engine->timers.now
+                           - h1p->send_rate_start);
+    bytes = h1p->send_rate_bytes;
+
+    if (c->sent > h1p->send_rate_sent) {
+        bytes += c->sent - h1p->send_rate_sent;
+    }
+
+    /*
+     * The check also runs when the write empties the queue.  An application
+     * or an upstream server that gives one buffer at a time can make each
+     * write event empty the queue.  Without the check there, the router
+     * never checks the rate of a client that keeps the socket buffer full.
+     */
+
+    if (!nxt_h1p_rate_too_low(bytes, msec, skcf->send_timeout,
+                              skcf->send_min_rate))
+    {
+        if (msec >= skcf->send_timeout) {
+            /* The window passed: the next window counts from now. */
+            msec = 0;
+            bytes = 0;
+
+            h1p->send_rate_time = 0;
+            h1p->send_rate_bytes = 0;
+            h1p->send_rate_start = task->thread->engine->timers.now;
+            h1p->send_rate_sent = c->sent;
+        }
+
+        if (c->write == NULL) {
+            /* The client accepted all the queued data: the period stops. */
+            h1p->send_rate_on = 0;
+            h1p->send_rate_time = msec;
+            h1p->send_rate_bytes = bytes;
+        }
+
+        return 0;
+    }
+
+    nxt_log(task, NXT_LOG_INFO, "client send rate is less than "
+            "send_min_rate %d: %uL bytes in %uL ms",
+            skcf->send_min_rate, bytes, msec);
+
+    /* The same steps as nxt_h1p_conn_request_send_timeout(). */
+
+    nxt_timer_disable(task->thread->engine, &c->write_timer);
+    c->block_write = 1;
+
+    nxt_h1p_request_error(task, h1p, r);
+
+    return 1;
+}
+
+
 static void
 nxt_h1p_conn_request_timeout(nxt_task_t *task, void *obj, void *data)
 {
-    nxt_conn_t          *c;
-    nxt_timer_t         *timer;
-    nxt_h1proto_t       *h1p;
-    nxt_http_request_t  *r;
+    nxt_timer_t  *timer;
 
     timer = obj;
 
     nxt_debug(task, "h1p conn request timeout");
 
-    c = nxt_read_timer_conn(timer);
+    nxt_h1p_request_timedout(task, nxt_read_timer_conn(timer));
+}
+
+
+/*
+ * The steps for a request read timeout: header_read_timeout,
+ * body_read_timeout, and the body_min_rate floor.
+ */
+
+static void
+nxt_h1p_request_timedout(nxt_task_t *task, nxt_conn_t *c)
+{
+    nxt_h1proto_t       *h1p;
+    nxt_http_request_t  *r;
+
     c->block_read = 1;
     /*
      * Disable SO_LINGER off during socket closing
@@ -2082,6 +2316,12 @@ nxt_h1p_conn_sent(nxt_task_t *task, void *obj, void *data)
     engine = task->thread->engine;
 
     c->write = nxt_sendbuf_completion(task, &engine->fast_work_queue, c->write);
+
+    if (c->write_state == &nxt_h1p_request_send_state
+        && nxt_slow_path(nxt_h1p_send_rate_check(task, c)))
+    {
+        return;
+    }
 
     if (c->write != NULL) {
         nxt_conn_write(engine, c);

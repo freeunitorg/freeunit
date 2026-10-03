@@ -143,6 +143,8 @@ static nxt_int_t nxt_conf_vldt_python_prefix(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_listen_threads(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_min_rate(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_threads(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_thread_stack_size(nxt_conf_validation_t *vldt,
@@ -395,6 +397,16 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_http_members[] = {
     }, {
         .name       = nxt_string("send_timeout"),
         .type       = NXT_CONF_VLDT_INTEGER,
+    }, {
+        .name       = nxt_string("body_min_rate"),
+        .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_min_rate,
+        .u.string   = "body_min_rate",
+    }, {
+        .name       = nxt_string("send_min_rate"),
+        .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_min_rate,
+        .u.string   = "send_min_rate",
     }, {
         .name       = nxt_string("idle_timeout"),
         .type       = NXT_CONF_VLDT_INTEGER,
@@ -2791,6 +2803,36 @@ nxt_conf_vldt_listen_threads(nxt_conf_validation_t *vldt,
     if (threads > NXT_INT32_T_MAX) {
         return nxt_conf_vldt_error(vldt, "The \"listen_threads\" number must "
                                    "not exceed %d.", NXT_INT32_T_MAX);
+    }
+
+    return NXT_OK;
+}
+
+
+/*
+ * The rate is in bytes per second.  The router compares it with the
+ * elapsed time in milliseconds as a 64-bit product.  The upper limit
+ * keeps this product in range.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_min_rate(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
+    void *data)
+{
+    int64_t     rate;
+    const char  *name;
+
+    name = data;
+    rate = nxt_conf_get_number(value);
+
+    if (rate < 0) {
+        return nxt_conf_vldt_error(vldt, "The \"%s\" number must be "
+                                   "equal to or greater than 0.", name);
+    }
+
+    if (rate > NXT_INT32_T_MAX) {
+        return nxt_conf_vldt_error(vldt, "The \"%s\" number must "
+                                   "not exceed %d.", name, NXT_INT32_T_MAX);
     }
 
     return NXT_OK;
