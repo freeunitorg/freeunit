@@ -8,7 +8,8 @@
 
 
 nxt_int_t nxt_cgroup_make_procs_path(char *cgprocs, size_t len);
-nxt_int_t nxt_cgroup_proc_add(nxt_task_t *task, nxt_process_t *process);
+nxt_int_t nxt_cgroup_proc_add(nxt_task_t *task, nxt_process_t *process,
+    nxt_pid_t pid);
 void nxt_cgroup_cleanup(nxt_task_t *task, const nxt_process_t *process);
 
 
