@@ -423,6 +423,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_cpu_limit_test(thr) != NXT_OK) {
+        return 1;
+    }
+
 #if (NXT_HAVE_CLONE_NEWUSER)
     if (nxt_clone_creds_test(thr) != NXT_OK) {
         return 1;

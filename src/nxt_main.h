@@ -157,6 +157,10 @@ typedef void (*nxt_event_conn_handler_t)(nxt_thread_t *thr, nxt_conn_t *c);
  */
 NXT_EXPORT nxt_int_t nxt_lib_start(const char *app, char **argv, char ***envp);
 NXT_EXPORT void nxt_lib_stop(void);
+NXT_EXPORT nxt_uint_t nxt_cgroup_cpu_max_parse(const u_char *p, size_t len);
+NXT_EXPORT void nxt_cgroup_mountinfo_unescape(char *s);
+NXT_EXPORT const char *nxt_cgroup_relative_path(const char *cgroup,
+    const char *root);
 
 
 NXT_EXPORT extern nxt_uint_t    nxt_ncpu;
