@@ -13,6 +13,7 @@ chmod
 clone
 clone3
 close
+close_range
 connect
 dup2
 epoll_create
@@ -36,6 +37,7 @@ getrandom
 getsockopt
 gettid
 ioctl
+kill
 listen
 lseek
 memfd_create
