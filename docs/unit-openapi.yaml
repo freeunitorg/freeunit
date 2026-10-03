@@ -8046,7 +8046,8 @@ components:
           minimum: 0
           maximum: 2147483647
           description: "Minimum rate of the client request body, in bytes
-            per second.  The check starts after a grace time.  The grace
+            per second.  Only HTTP/1 connections use this check.  The check
+            starts after a grace time.  The grace
             time is equal to `body_read_timeout`.  After the grace time,
             if the client sent fewer bytes than `body_min_rate` multiplied
             by the elapsed seconds, Unit sends 408 and closes the
@@ -8114,7 +8115,8 @@ components:
           minimum: 0
           maximum: 2147483647
           description: "Minimum rate at which the client reads the response,
-            in bytes per second.  Unit measures only the time when response
+            in bytes per second.  Only HTTP/1 connections use this check.
+            Unit measures only the time when response
             data waits for the client.  The check starts after a grace time.
             The grace time is equal to `send_timeout`.  After the grace
             time, if the client accepted fewer bytes than `send_min_rate`

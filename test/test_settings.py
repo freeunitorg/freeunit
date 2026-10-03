@@ -1,11 +1,14 @@
 import re
 import socket
+import ssl
 import subprocess
 import time
 
 import pytest
 
 from unit.applications.lang.python import ApplicationPython
+from unit.applications.tls import ApplicationTLS
+from unit.option import option
 
 prerequisites = {'modules': {'python': 'any'}}
 
@@ -386,12 +389,49 @@ def min_rate_reset():
         'body_min_rate',
         'send_timeout',
         'send_min_rate',
+        'chunked_transform',
     ):
         client.conf_delete(f'settings/http/{name}')
 
 
+BODY_RATE_RECORD = r'client body rate is less than body_min_rate'
+
+
+def min_rate_slow_body(sock, part, limit):
+    # Sends "part" about once each second for at most "limit" seconds, and
+    # reads what the router sends back.  Returns (closed, data, elapsed).
+    sock.settimeout(1)
+
+    start = time.monotonic()
+    data = b''
+    closed = False
+
+    while time.monotonic() - start < limit:
+        try:
+            sock.sendall(part)
+        except OSError:
+            closed = True
+            break
+
+        try:
+            chunk = sock.recv(4096)
+        except socket.timeout:
+            continue
+        except OSError:
+            closed = True
+            break
+
+        if not chunk:
+            closed = True
+            break
+
+        data += chunk
+
+    return closed, data, time.monotonic() - start
+
+
 @pytest.mark.parametrize('timeout', [2, 0])
-def test_settings_body_min_rate_slow_body(timeout):
+def test_settings_body_min_rate_slow_body(timeout, wait_for_record):
     # A client sends the body 1 byte each second.  Each byte starts the
     # body_read_timeout gap timer again, so only the rate floor can stop
     # this client.  The floor check starts after the grace time (equal to
@@ -413,32 +453,7 @@ def test_settings_body_min_rate_slow_body(timeout):
             b'Connection: close\r\n\r\n'
         )
 
-        start = time.monotonic()
-        data = b''
-        closed = False
-
-        while time.monotonic() - start < 12:
-            try:
-                sock.sendall(b'x')
-            except OSError:
-                closed = True
-                break
-
-            try:
-                chunk = sock.recv(4096)
-            except socket.timeout:
-                continue
-            except OSError:
-                closed = True
-                break
-
-            if not chunk:
-                closed = True
-                break
-
-            data += chunk
-
-        elapsed = time.monotonic() - start
+        closed, data, elapsed = min_rate_slow_body(sock, b'x', 12)
         sock.close()
 
         # The router closes the connection after the 408 response.  The
@@ -447,12 +462,102 @@ def test_settings_body_min_rate_slow_body(timeout):
         assert closed or data, 'slow body stopped'
         assert data == b'' or data.startswith(b'HTTP/1.1 408'), 'slow body 408'
         assert elapsed < 8, 'slow body stopped in time'
+        assert wait_for_record(BODY_RATE_RECORD) is not None, 'slow body log'
 
     finally:
         min_rate_reset()
 
 
-def test_settings_body_min_rate_burst_then_slow():
+def test_settings_body_min_rate_chunked(wait_for_record):
+    # The same slow client as in the slow body test, with a chunked body.
+    # The client sends a chunk of 1 byte each second.  The chunked body is
+    # read in the same function as a body with Content-Length, but the
+    # chunk parser runs there first.  The floor counts the chunk framing
+    # too: 6 bytes each second, which is much less than 256.
+    client.load('empty')
+
+    min_rate_conf(
+        {
+            'body_read_timeout': 2,
+            'body_min_rate': 256,
+            'chunked_transform': True,
+        }
+    )
+
+    try:
+        sock = socket.create_connection(('127.0.0.1', 8080))
+        sock.sendall(
+            b'POST / HTTP/1.1\r\n'
+            b'Host: localhost\r\n'
+            b'Transfer-Encoding: chunked\r\n'
+            b'Connection: close\r\n\r\n'
+        )
+
+        closed, data, elapsed = min_rate_slow_body(sock, b'1\r\nx\r\n', 12)
+        sock.close()
+
+        assert closed or data, 'chunked body stopped'
+        assert data == b'' or data.startswith(
+            b'HTTP/1.1 408'
+        ), 'chunked body 408'
+        assert elapsed < 8, 'chunked body stopped in time'
+        assert wait_for_record(BODY_RATE_RECORD) is not None, 'chunked log'
+
+    finally:
+        min_rate_reset()
+
+
+def test_settings_body_min_rate_tls(wait_for_record):
+    # The same slow client as in the slow body test, on a TLS listener.
+    # The floor counts the bytes that the TLS layer gives to the router,
+    # so 1 byte each second is still below 256.
+    if not option.available['modules'].get('openssl'):
+        pytest.skip('requires openssl')
+
+    client.load('empty')
+
+    ApplicationTLS().certificate()
+
+    assert 'success' in client.conf(
+        {
+            "pass": "applications/empty",
+            "tls": {"certificate": "default"},
+        },
+        'listeners/*:8080',
+    )
+
+    min_rate_conf({'body_read_timeout': 2, 'body_min_rate': 256})
+
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+
+    try:
+        sock = context.wrap_socket(
+            socket.create_connection(('127.0.0.1', 8080))
+        )
+        sock.sendall(
+            b'POST / HTTP/1.1\r\n'
+            b'Host: localhost\r\n'
+            b'Content-Length: 10000\r\n'
+            b'Connection: close\r\n\r\n'
+        )
+
+        closed, data, elapsed = min_rate_slow_body(sock, b'x', 12)
+        sock.close()
+
+        assert closed or data, 'TLS slow body stopped'
+        assert data == b'' or data.startswith(
+            b'HTTP/1.1 408'
+        ), 'TLS slow body 408'
+        assert elapsed < 8, 'TLS slow body stopped in time'
+        assert wait_for_record(BODY_RATE_RECORD) is not None, 'TLS log'
+
+    finally:
+        min_rate_reset()
+
+
+def test_settings_body_min_rate_burst_then_slow(wait_for_record):
     # A client sends half of the body at once, then 1 byte each second.
     # With one average over the whole body, the burst would give credit
     # for about 195 s at 256 bytes per second.  The rate is checked for
@@ -473,32 +578,7 @@ def test_settings_body_min_rate_burst_then_slow():
         )
         sock.sendall(b'x' * 50000)
 
-        start = time.monotonic()
-        data = b''
-        closed = False
-
-        while time.monotonic() - start < 20:
-            try:
-                sock.sendall(b'x')
-            except OSError:
-                closed = True
-                break
-
-            try:
-                chunk = sock.recv(4096)
-            except socket.timeout:
-                continue
-            except OSError:
-                closed = True
-                break
-
-            if not chunk:
-                closed = True
-                break
-
-            data += chunk
-
-        elapsed = time.monotonic() - start
+        closed, data, elapsed = min_rate_slow_body(sock, b'x', 20)
         sock.close()
 
         assert closed or data, 'burst then slow body stopped'
@@ -506,6 +586,9 @@ def test_settings_body_min_rate_burst_then_slow():
             b'HTTP/1.1 408'
         ), 'burst then slow body 408'
         assert elapsed < 12, 'burst then slow body stopped in time'
+        assert (
+            wait_for_record(BODY_RATE_RECORD) is not None
+        ), 'burst then slow body log'
 
     finally:
         min_rate_reset()
@@ -587,7 +670,7 @@ def min_rate_expect(length):
     return sock
 
 
-def test_settings_body_min_rate_expect_slow_body():
+def test_settings_body_min_rate_expect_slow_body(wait_for_record):
     # After a 100 (Continue), the body read state starts in another
     # function.  The floor must be active there too.  Otherwise a client
     # can avoid the floor with "Expect: 100-continue".  The client sends
@@ -600,32 +683,7 @@ def test_settings_body_min_rate_expect_slow_body():
         sock = min_rate_expect(10000)
         sock.settimeout(1)
 
-        start = time.monotonic()
-        data = b''
-        closed = False
-
-        while time.monotonic() - start < 12:
-            try:
-                sock.sendall(b'x')
-            except OSError:
-                closed = True
-                break
-
-            try:
-                chunk = sock.recv(4096)
-            except socket.timeout:
-                continue
-            except OSError:
-                closed = True
-                break
-
-            if not chunk:
-                closed = True
-                break
-
-            data += chunk
-
-        elapsed = time.monotonic() - start
+        closed, data, elapsed = min_rate_slow_body(sock, b'x', 12)
         sock.close()
 
         assert closed or data, 'slow body after 100 stopped'
@@ -633,6 +691,9 @@ def test_settings_body_min_rate_expect_slow_body():
             b'HTTP/1.1 408'
         ), 'slow body after 100 408'
         assert elapsed < 8, 'slow body after 100 stopped in time'
+        assert (
+            wait_for_record(BODY_RATE_RECORD) is not None
+        ), 'slow body after 100 log'
 
     finally:
         min_rate_reset()

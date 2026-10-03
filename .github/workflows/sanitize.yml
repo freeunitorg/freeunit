@@ -143,6 +143,11 @@ jobs:
             # test_state_store forks a store child from main and stops main
             # while the child runs (#516); it needs --restart, and this is
             # the leg that runs that path under ASan.
+            #
+            # test_settings runs the body_min_rate and send_min_rate floors.
+            # A floor closes the connection from a read or a write handler,
+            # in the middle of a body or a response.  It also has a TLS case,
+            # which this leg runs because it is configured with --openssl.
             tests: >-
               test/test_graceful_reload.py
               test/test_state_store.py
@@ -154,6 +159,7 @@ jobs:
               test/test_conn_recycle.py
               test/test_app_lifecycle.py
               test/test_configuration.py
+              test/test_settings.py
           - runtime: php
             apt: ""
             configure: php
