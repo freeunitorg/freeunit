@@ -26,7 +26,6 @@ typedef enum nxt_http_comp_scheme_e        nxt_http_comp_scheme_t;
 typedef struct nxt_http_comp_type_s        nxt_http_comp_type_t;
 typedef struct nxt_http_comp_opts_s        nxt_http_comp_opts_t;
 typedef struct nxt_http_comp_compressor_s  nxt_http_comp_compressor_t;
-typedef struct nxt_http_comp_ctx_s         nxt_http_comp_ctx_t;
 
 enum nxt_http_comp_scheme_e {
     NXT_HTTP_COMP_SCHEME_IDENTITY = 0,
@@ -66,6 +65,14 @@ struct nxt_http_comp_compressor_s {
     nxt_http_comp_opts_t        opts;
 };
 
+/*
+ * One per request: nxt_http_comp_check_acceptable() allocates it from the
+ * request pool and stores it in r->comp_ctx.  It was one object per router
+ * thread.  But an application response is compressed in several event loop
+ * turns, one for each message from the application.  So two responses on
+ * one thread used the same stream.  A response could get the bytes of
+ * another response, or use a stream that the other response had freed.
+ */
 struct nxt_http_comp_ctx_s {
     nxt_uint_t                      idx;
 
@@ -96,6 +103,9 @@ struct nxt_http_comp_ctx_s {
     nxt_off_t                       resp_clen;
     nxt_off_t                       clen_sent;
 
+    /* The stream in "ctx" is initialised and not yet freed. */
+    bool                            live;
+
     nxt_http_comp_compressor_ctx_t  ctx;
 };
 
@@ -112,11 +122,6 @@ struct nxt_http_comp_conf_s {
     nxt_http_comp_compressor_t  *enabled;
     nxt_uint_t                  nr_enabled;
 };
-
-static nxt_thread_declare_data(nxt_http_comp_ctx_t,
-                               nxt_http_comp_compressor_ctx);
-
-#define nxt_http_comp_ctx()  nxt_thread_get_data(nxt_http_comp_compressor_ctx)
 
 static const nxt_conf_map_t  nxt_http_comp_compressors_opts_map[] = {
     {
@@ -180,23 +185,62 @@ nxt_http_comp_request_conf(const nxt_http_request_t *r)
 }
 
 
-static ssize_t
-nxt_http_comp_compress(uint8_t *dst, size_t dst_size, const uint8_t *src,
-                       size_t src_size, bool last)
+/*
+ * Frees the stream of one response.  This occurs after the last deflate()
+ * call, after a failed call, and from the request pool cleanup when the
+ * response stops before its end: the client closed the connection, the
+ * application failed, or a timer expired.  Only the first of these calls
+ * frees the stream.
+ */
+
+static void
+nxt_http_comp_stream_free(nxt_http_comp_ctx_t *ctx)
 {
-    nxt_http_comp_ctx_t               *ctx = nxt_http_comp_ctx();
+    if (!ctx->live) {
+        return;
+    }
+
+    ctx->live = false;
+
+    ctx->type->cops->free(&ctx->ctx);
+}
+
+
+static void
+nxt_http_comp_ctx_cleanup(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_http_comp_stream_free(obj);
+}
+
+
+static ssize_t
+nxt_http_comp_compress(nxt_http_comp_ctx_t *ctx, uint8_t *dst,
+                       size_t dst_size, const uint8_t *src, size_t src_size,
+                       bool last)
+{
+    ssize_t                           ret;
     const nxt_http_comp_operations_t  *cops;
+
+    /* Input after the end of the stream, or after a failed call. */
+    if (nxt_slow_path(!ctx->live)) {
+        return -1;
+    }
 
     cops = ctx->type->cops;
 
-    return cops->deflate(&ctx->ctx, src, src_size, dst, dst_size, last);
+    ret = cops->deflate(&ctx->ctx, src, src_size, dst, dst_size, last);
+
+    if (last || ret == -1) {
+        nxt_http_comp_stream_free(ctx);
+    }
+
+    return ret;
 }
 
 
 static size_t
-nxt_http_comp_bound(size_t size)
+nxt_http_comp_bound(nxt_http_comp_ctx_t *ctx, size_t size)
 {
-    nxt_http_comp_ctx_t               *ctx = nxt_http_comp_ctx();
     const nxt_http_comp_operations_t  *cops;
 
     cops = ctx->type->cops;
@@ -214,9 +258,9 @@ nxt_http_comp_compress_app_response(nxt_task_t *task, nxt_http_request_t *r,
     ssize_t              cbytes;
     nxt_buf_t            *in, *next, *buf, *out, **tail;
     nxt_off_t            in_len;
-    nxt_http_comp_ctx_t  *ctx = nxt_http_comp_ctx();
+    nxt_http_comp_ctx_t  *ctx = r->comp_ctx;
 
-    if (ctx->idx == NXT_HTTP_COMP_SCHEME_IDENTITY) {
+    if (ctx == NULL || ctx->idx == NXT_HTTP_COMP_SCHEME_IDENTITY) {
         return NXT_OK;
     }
 
@@ -265,14 +309,15 @@ nxt_http_comp_compress_app_response(nxt_task_t *task, nxt_http_request_t *r,
          * is not part of what bound() promises for the input alone, so the
          * output buffer gets a small fixed margin on top.
          */
-        buf_len = nxt_http_comp_bound(in_len) + NXT_HTTP_COMP_FLUSH_SLACK;
+        buf_len = nxt_http_comp_bound(ctx, in_len)
+                  + NXT_HTTP_COMP_FLUSH_SLACK;
 
         buf = nxt_buf_mem_ts_alloc(task, in->data, buf_len);
         if (nxt_slow_path(buf == NULL)) {
             goto fail;
         }
 
-        cbytes = nxt_http_comp_compress(buf->mem.start, buf_len,
+        cbytes = nxt_http_comp_compress(ctx, buf->mem.start, buf_len,
                                         in->mem.pos, in_len, last);
         if (nxt_slow_path(cbytes == -1)) {
             nxt_buf_free(buf->data, buf);
@@ -325,12 +370,13 @@ nxt_http_comp_compress_static_response(nxt_task_t *task, nxt_http_request_t *r,
                                        nxt_file_t **f, nxt_file_info_t *fi,
                                        size_t static_buf_len, size_t *out_total)
 {
-    size_t         in_size, out_size, rest;
-    char           *tmp_path, *p;
-    uint8_t        *in, *out;
-    nxt_int_t      ret;
-    nxt_file_t     tfile;
-    nxt_runtime_t  *rt = task->thread->runtime;
+    size_t               in_size, out_size, rest;
+    char                 *tmp_path, *p;
+    uint8_t              *in, *out;
+    nxt_int_t            ret;
+    nxt_file_t           tfile;
+    nxt_runtime_t        *rt = task->thread->runtime;
+    nxt_http_comp_ctx_t  *ctx = r->comp_ctx;
 
     static const char  *template = "unit-compr-XXXXXX";
 
@@ -357,7 +403,7 @@ nxt_http_comp_compress_static_response(nxt_task_t *task, nxt_http_request_t *r,
     tfile.name = (nxt_file_name_t *)tmp_path;
 
     in_size = nxt_file_size(fi);
-    out_size = nxt_http_comp_bound(in_size);
+    out_size = nxt_http_comp_bound(ctx, in_size);
 
     ret = ftruncate(tfile.fd, out_size);
     if (nxt_slow_path(ret == -1)) {
@@ -400,7 +446,8 @@ nxt_http_comp_compress_static_response(nxt_task_t *task, nxt_http_request_t *r,
 
         last = n == rest;
 
-        cbytes = nxt_http_comp_compress(out + *out_total, out_size - *out_total,
+        cbytes = nxt_http_comp_compress(ctx, out + *out_total,
+                                        out_size - *out_total,
                                         in + in_size - rest, n, last);
         if (cbytes == -1) {
             nxt_file_close(task, &tfile);
@@ -437,21 +484,22 @@ nxt_http_comp_compress_static_response(nxt_task_t *task, nxt_http_request_t *r,
 }
 
 
+/*
+ * Tells whether the negotiation chose a compressor for this response.  It
+ * stays true after the stream is freed, so it does not say that a stream is
+ * live.
+ */
 bool
-nxt_http_comp_wants_compression(void)
+nxt_http_comp_wants_compression(nxt_http_request_t *r)
 {
-    nxt_http_comp_ctx_t  *ctx = nxt_http_comp_ctx();
-
-    return ctx->idx;
+    return r->comp_ctx != NULL && r->comp_ctx->idx;
 }
 
 
 bool
-nxt_http_comp_identity_refused(void)
+nxt_http_comp_identity_refused(nxt_http_request_t *r)
 {
-    nxt_http_comp_ctx_t  *ctx = nxt_http_comp_ctx();
-
-    return ctx->identity_refused;
+    return r->comp_ctx != NULL && r->comp_ctx->identity_refused;
 }
 
 
@@ -1252,9 +1300,8 @@ nxt_http_comp_not_acceptable(nxt_http_request_t *r)
  * this ahead of precondition evaluation: a request that cannot be satisfied
  * at all must be answered 406, not 304 or 412.  The caller therefore asks
  * this first, evaluates preconditions, and only then applies -- so a 304
- * neither carries a Content-Encoding header nor leaves an initialised
- * compressor behind, which would leak, since the compressor is torn down by
- * the last deflate() call and a 304 makes none.
+ * neither carries a Content-Encoding header nor initialises a compressor
+ * that no deflate() call uses.
  */
 
 nxt_int_t
@@ -1263,10 +1310,14 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
     bool                  identity_refused;
     nxt_int_t             ret, idx;
     nxt_str_t             accept_encoding, mime_type = {};
-    nxt_http_comp_ctx_t   *ctx = nxt_http_comp_ctx();
+    nxt_http_comp_ctx_t   *ctx;
     nxt_http_comp_conf_t  *conf = nxt_http_comp_request_conf(r);
 
-    *ctx = (nxt_http_comp_ctx_t){ .resp_clen = -1, .sel_idx = -1 };
+    /*
+     * No context means no compression.  A context from an earlier call is
+     * dropped, not reused: its pool cleanup still frees its stream.
+     */
+    r->comp_ctx = NULL;
 
     if (r->resp.content_length == NULL && r->resp.content_length_n == -1) {
         return NXT_OK;
@@ -1374,8 +1425,15 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
         return NXT_ERROR;
     }
 
-    ctx->sel_idx = idx;
-    ctx->identity_refused = identity_refused;
+    ctx = nxt_mp_get(r->mem_pool, sizeof(nxt_http_comp_ctx_t));
+    if (nxt_slow_path(ctx == NULL)) {
+        return NXT_ERROR;
+    }
+
+    *ctx = (nxt_http_comp_ctx_t){ .resp_clen = -1, .sel_idx = idx,
+                                  .identity_refused = identity_refused };
+
+    r->comp_ctx = ctx;
 
     return NXT_OK;
 }
@@ -1458,9 +1516,13 @@ nxt_http_comp_apply_compression(nxt_task_t *task, nxt_http_request_t *r)
 {
     int                         err;
     nxt_int_t                   idx;
-    nxt_http_comp_ctx_t         *ctx = nxt_http_comp_ctx();
+    nxt_http_comp_ctx_t         *ctx = r->comp_ctx;
     nxt_http_comp_conf_t        *conf;
     nxt_http_comp_compressor_t  *compressor;
+
+    if (ctx == NULL) {
+        return NXT_OK;
+    }
 
     idx = ctx->sel_idx;
 
@@ -1491,10 +1553,25 @@ nxt_http_comp_apply_compression(nxt_task_t *task, nxt_http_request_t *r)
     ctx->type = compressor->type;
     ctx->ctx.level = compressor->opts.level;
 
+    /*
+     * Registered before the stream exists, so that no stream is left without
+     * a cleanup.  The cleanup frees the stream when the response stops before
+     * the last deflate() call.  &r->task, not "task": the cleanup keeps the
+     * pointer, and r->task lives as long as the pool.
+     */
+    if (nxt_slow_path(nxt_mp_cleanup(r->mem_pool, nxt_http_comp_ctx_cleanup,
+                                     &r->task, ctx, NULL)
+                      != NXT_OK))
+    {
+        return NXT_ERROR;
+    }
+
     err = compressor->type->cops->init(&ctx->ctx);
     if (nxt_slow_path(err)) {
         return NXT_ERROR;
     }
+
+    ctx->live = true;
 
     return NXT_OK;
 }

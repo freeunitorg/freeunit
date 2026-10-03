@@ -46,14 +46,14 @@ nxt_brotli_compress(nxt_http_comp_compressor_ctx_t *ctx, const uint8_t *in_buf,
                                      &in_len, &in_buf, &out_bytes, &out_buf,
                                      NULL);
     if (!ok) {
-        goto out_err_free;
+        return -1;
     }
 
     ok = BrotliEncoderCompressStream(brotli, BROTLI_OPERATION_FLUSH,
                                      &in_len, &in_buf, &out_bytes, &out_buf,
                                      NULL);
     if (!ok) {
-        goto out_err_free;
+        return -1;
     }
 
     if (last) {
@@ -61,18 +61,19 @@ nxt_brotli_compress(nxt_http_comp_compressor_ctx_t *ctx, const uint8_t *in_buf,
                                          &in_len, &in_buf, &out_bytes,
                                          &out_buf, NULL);
         if (!ok) {
-            goto out_err_free;
+            return -1;
         }
-
-        BrotliEncoderDestroyInstance(brotli);
     }
 
     return out_len - out_bytes;
+}
 
-out_err_free:
-    BrotliEncoderDestroyInstance(brotli);
 
-    return -1;
+static void
+nxt_brotli_free(nxt_http_comp_compressor_ctx_t *ctx)
+{
+    BrotliEncoderDestroyInstance(ctx->brotli_ctx);
+    ctx->brotli_ctx = NULL;
 }
 
 
@@ -80,4 +81,5 @@ const nxt_http_comp_operations_t  nxt_http_comp_brotli_ops = {
     .init               = nxt_brotli_init,
     .bound              = nxt_brotli_bound,
     .deflate            = nxt_brotli_compress,
+    .free               = nxt_brotli_free,
 };

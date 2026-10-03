@@ -263,6 +263,9 @@ struct nxt_http_request_s {
 
     nxt_http_static_ctx_t           static_ctx;
 
+    /* Set by nxt_http_comp_check_acceptable(), from mem_pool. */
+    nxt_http_comp_ctx_t             *comp_ctx;
+
     nxt_http_status_t               status:16;
 
     uint8_t                         log_route;    /* 1 bit */

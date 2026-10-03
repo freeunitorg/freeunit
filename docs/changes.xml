@@ -104,6 +104,18 @@ counts the empty line.
 </para>
 </change>
 
+<change type="security">
+<para>
+with response compression on, the router kept one compressor stream for each
+router thread.  But it compresses an application response in several steps.
+So two application responses on one thread used the same stream.  A client
+could get bytes of the response to another client, a body that was not valid,
+or a body that stopped early.  The router could also crash when it used a
+stream that another response had freed.  Now each response has its own stream,
+and the router frees it when the response ends or stops early.
+</para>
+</change>
+
 <change type="change">
 <para>
 the main process now writes the state files in a short-lived child

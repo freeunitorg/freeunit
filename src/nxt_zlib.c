@@ -62,15 +62,17 @@ nxt_zlib_deflate(nxt_http_comp_compressor_ctx_t *ctx, const uint8_t *in_buf,
 
     ret = deflate(z, last ? Z_FINISH : Z_SYNC_FLUSH);
     if (ret == Z_STREAM_ERROR || ret == Z_BUF_ERROR) {
-        deflateEnd(z);
         return -1;
     }
 
-    if (last) {
-        deflateEnd(z);
-    }
-
     return z->total_out - compressed_bytes;
+}
+
+
+static void
+nxt_zlib_free(nxt_http_comp_compressor_ctx_t *ctx)
+{
+    deflateEnd(&ctx->zlib_ctx);
 }
 
 
@@ -78,6 +80,7 @@ const nxt_http_comp_operations_t  nxt_http_comp_deflate_ops = {
     .init               = nxt_zlib_deflate_init,
     .bound              = nxt_zlib_bound,
     .deflate            = nxt_zlib_deflate,
+    .free               = nxt_zlib_free,
 };
 
 
@@ -85,4 +88,5 @@ const nxt_http_comp_operations_t  nxt_http_comp_gzip_ops = {
     .init               = nxt_zlib_gzip_init,
     .bound              = nxt_zlib_bound,
     .deflate            = nxt_zlib_deflate,
+    .free               = nxt_zlib_free,
 };

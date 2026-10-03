@@ -57,6 +57,16 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        has the same bytes as before. $body_bytes_sent no longer counts the
        empty line.
 
+    *) Security: with response compression on, the router kept one
+       compressor stream for each router thread. But it compresses an
+       application response in several steps. So two application
+       responses on one thread used the same stream. A client could get
+       bytes of the response to another client, a body that was not
+       valid, or a body that stopped early. The router could also crash
+       when it used a stream that another response had freed. Now each
+       response has its own stream, and the router frees it when the
+       response ends or stops early.
+
     *) Change: the main process now writes the state files in a
        short-lived child process, so a slow fsync(2) no longer delays
        the start of application processes after a reconfiguration, or

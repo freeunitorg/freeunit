@@ -976,7 +976,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
          * representation it refused.
          */
 
-        if (nxt_http_comp_identity_refused()) {
+        if (nxt_http_comp_identity_refused(r)) {
             rstatus = NXT_HTTP_OK;
         }
 
@@ -1105,7 +1105,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
                     goto fail;
                 }
 
-                if (nxt_http_comp_wants_compression()) {
+                if (nxt_http_comp_wants_compression(r)) {
                     size_t     out_total;
                     nxt_int_t  ret;
 
