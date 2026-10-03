@@ -34,6 +34,10 @@ static void hxt_h1p_send_ws_error(nxt_task_t *task, nxt_http_request_t *r,
     const nxt_ws_error_t *err, ...);
 static void nxt_h1p_conn_ws_error_sent(nxt_task_t *task, void *obj, void *data);
 static void nxt_h1p_conn_ws_pong(nxt_task_t *task, void *obj, void *data);
+static void nxt_h1p_conn_ws_pong_send(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_buf_t *out);
+static void nxt_h1p_conn_ws_pong_sent(nxt_task_t *task, void *obj,
+    void *data);
 static size_t nxt_h1p_ws_utf8_seqlen(u_char c);
 static nxt_int_t nxt_h1p_ws_utf8_begin(const u_char *seq, size_t n);
 static nxt_int_t nxt_h1p_ws_utf8_validate(nxt_h1p_ws_utf8_t *state,
@@ -930,6 +934,8 @@ nxt_h1p_conn_ws_pong(nxt_task_t *task, void *obj, void *data)
 {
     uint8_t                 payload_len, i;
     nxt_buf_t               *b, *out, *next;
+    nxt_bool_t              deferred;
+    nxt_h1proto_t           *h1p;
     nxt_http_request_t      *r;
     nxt_websocket_header_t  *wsh;
     uint8_t                 mask[4];
@@ -937,6 +943,7 @@ nxt_h1p_conn_ws_pong(nxt_task_t *task, void *obj, void *data)
     nxt_debug(task, "h1p conn ws pong");
 
     r = obj;
+    h1p = r->proto.h1;
     b = r->ws_frame;
 
     wsh = (nxt_websocket_header_t *) b->mem.pos;
@@ -948,10 +955,42 @@ nxt_h1p_conn_ws_pong(nxt_task_t *task, void *obj, void *data)
 
     b->mem.pos += 4;
 
-    out = nxt_http_buf_mem(task, r, 2 + payload_len);
-    if (nxt_slow_path(out == NULL)) {
-        nxt_http_request_error_handler(task, r, r->proto.any);
-        return;
+    /*
+     * RFC 6455 Section 5.5.3 lets an endpoint send a PONG only for the most
+     * recent PING when it did not send the PONGs for the earlier PINGs yet.
+     * A client that sends PINGs and does not read the PONGs could otherwise
+     * make the router keep a PONG in memory for each PING.
+     *
+     * Thus, while a PONG is queued, the router does not queue a new PONG.
+     * It keeps the PONG for the most recent PING in a buffer that the next
+     * PING overwrites, and queues it when the queued PONG is sent.  The
+     * router then keeps at most two PONGs for a connection.
+     */
+
+    deferred = h1p->websocket_pong_queued;
+
+    if (deferred) {
+        out = h1p->websocket_pong_next;
+
+        if (out == NULL) {
+            /* A control frame payload is 125 bytes or less. */
+            out = nxt_buf_mem_alloc(r->mem_pool, 2 + 125, 0);
+            if (nxt_slow_path(out == NULL)) {
+                nxt_http_request_error_handler(task, r, r->proto.any);
+                return;
+            }
+
+            h1p->websocket_pong_next = out;
+        }
+
+        nxt_debug(task, "h1p conn ws pong deferred");
+
+    } else {
+        out = nxt_http_buf_mem(task, r, 2 + payload_len);
+        if (nxt_slow_path(out == NULL)) {
+            nxt_http_request_error_handler(task, r, r->proto.any);
+            return;
+        }
     }
 
     out->mem.start[0] = 0;
@@ -979,7 +1018,75 @@ nxt_h1p_conn_ws_pong(nxt_task_t *task, void *obj, void *data)
 
     r->ws_frame = b;
 
-    nxt_http_request_send(task, r, out);
+    if (!deferred) {
+        nxt_h1p_conn_ws_pong_send(task, r, out);
+    }
 
     nxt_http_request_ws_frame_start(task, r, r->ws_frame);
+}
+
+
+static void
+nxt_h1p_conn_ws_pong_send(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_buf_t *out)
+{
+    out->completion_handler = nxt_h1p_conn_ws_pong_sent;
+    out->parent = r;
+
+    r->proto.h1->websocket_pong_queued = 1;
+
+    nxt_http_request_send(task, r, out);
+}
+
+
+/*
+ * The queued PONG is sent, or it is discarded.  If a PING came in the
+ * meantime, queue the PONG for the most recent PING now.  Do not queue it
+ * when the request is closed or failed, or when its last buffer is sent:
+ * no frame can follow the last buffer.
+ */
+
+static void
+nxt_h1p_conn_ws_pong_sent(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_buf_t           *b, *next, *out;
+    nxt_h1proto_t       *h1p;
+    nxt_http_request_t  *r;
+
+    b = obj;
+    r = data;
+
+    nxt_debug(task, "h1p conn ws pong sent");
+
+    h1p = r->proto.h1;
+
+    if (h1p != NULL) {
+        h1p->websocket_pong_queued = 0;
+
+        out = h1p->websocket_pong_next;
+        h1p->websocket_pong_next = NULL;
+
+        if (out != NULL) {
+            if (r->error || r->last == NULL || h1p->conn->closing) {
+                nxt_mp_free(r->mem_pool, out);
+
+            } else {
+                /* The completion handler releases the pool. */
+                nxt_mp_retain(r->mem_pool);
+
+                nxt_h1p_conn_ws_pong_send(task, r, out);
+            }
+        }
+    }
+
+    /* The pool can be freed with the last release, and r with it. */
+
+    do {
+        next = b->next;
+
+        nxt_mp_free(r->mem_pool, b);
+        nxt_mp_release(r->mem_pool);
+
+        b = next;
+    } while (b != NULL);
 }

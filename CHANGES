@@ -65,6 +65,12 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        marker that the application can clear. All of these are now
        checked.
 
+    *) Bugfix: a WebSocket client that sent PINGs and did not read the
+       PONGs could make the router keep a PONG in memory for each PING.
+       Now, while a PONG is not sent, the router keeps only the PONG for
+       the most recent PING, and sends it after the queued PONG (RFC 6455
+       Section 5.5.3).
+
     *) Bugfix: a keep-alive TLS connection that was idle across a
        reconfiguration could use the TLS settings of the old configuration
        after they were freed, when it was closed. The connection now keeps

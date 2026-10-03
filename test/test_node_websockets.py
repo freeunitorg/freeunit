@@ -495,22 +495,19 @@ def test_node_websockets_2_10__2_11():
 
     _, sock, _ = ws.upgrade()
 
-    for i in range(0, 10):
-        ws.frame_write(sock, ws.OP_PING, f'payload-{i}')
+    pings = [f'payload-{i}' for i in range(0, 10)]
 
-    for i in range(0, 10):
-        frame = ws.frame_read(sock)
-        check_frame(frame, True, ws.OP_PONG, f'payload-{i}')
+    for payload in pings:
+        ws.frame_write(sock, ws.OP_PING, payload)
+
+    ws.pongs_read(sock, pings)
 
     # 2_11
 
-    for i in range(0, 10):
-        opcode = ws.OP_PING
-        ws.frame_write(sock, opcode, f'payload-{i}', chopsize=1)
+    for payload in pings:
+        ws.frame_write(sock, ws.OP_PING, payload, chopsize=1)
 
-    for i in range(0, 10):
-        frame = ws.frame_read(sock)
-        check_frame(frame, True, ws.OP_PONG, f'payload-{i}')
+    ws.pongs_read(sock, pings)
 
     close_connection(sock)
 

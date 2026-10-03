@@ -84,6 +84,15 @@ There, a repeated group on a subject of more than about 1,000 bytes can get a
 
 <change type="bugfix">
 <para>
+a WebSocket client that sent PINGs and did not read the PONGs could make the
+router keep a PONG in memory for each PING.  Now, while a PONG is not sent, the
+router keeps only the PONG for the most recent PING, and sends it after the
+queued PONG (RFC 6455 Section 5.5.3).
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 when unitd ran as root and the control socket was given to another user or
 group with --control-user or --control-group, that user passed the socket file
 permissions but the controller then closed the connection.  The controller now
