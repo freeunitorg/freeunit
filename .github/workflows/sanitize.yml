@@ -161,9 +161,15 @@ jobs:
             # No --restart: test_php_application.py does not signal the master,
             # and --restart's teardown rmtree trips on test_php_application_
             # forbidden's restricted-permission fixture (rmtree PermissionError).
+            #
+            # test_php_targets is here for test_php_application_targets_cwd.
+            # On the old code it fails only when libunit fills released
+            # memory, and only a --debug build does that.  Every build-test
+            # leg is a release build.
             pytest_opts: ""
             tests: >-
               test/test_php_application.py
+              test/test_php_targets.py
               test/test_app_lifecycle.py
           # Go is where the app-side port-fd double-close actually manifested
           # (a flaky "close(N) failed: Bad file descriptor" in the go isolation

@@ -5591,7 +5591,9 @@ nxt_unit_mmap_release(nxt_unit_ctx_t *ctx, nxt_port_mmap_header_t *hdr,
     nxt_chunk_id_t   c;
     nxt_unit_impl_t  *lib;
 
+#if (NXT_DEBUG)
     memset(start, 0xA5, size);
+#endif
 
     p = start;
     end = p + size;
