@@ -2053,6 +2053,16 @@ nxt_h1p_conn_request_error(nxt_task_t *task, void *obj, void *data)
  * short network stops occur.  A total time limit is not used, because it
  * also stops honest large transfers on slow links.
  *
+ * A timeout of 0 turns the gap timer off: nxt_conn_timer() arms no timer
+ * for the value 0.  Then nothing stops a client that stops fully, because
+ * the floor check needs a read or a write.  The grace time is 0 too, so
+ * a new window starts after each check.  A body read is checked against
+ * the time since the previous read, or since the start of the body read
+ * state.  A write is checked against the time since the previous write,
+ * or since the start of the send period if that is later.  Thus the time
+ * between send periods is not counted.  A check in the same millisecond
+ * passes.
+ *
  * The check is "bytes * 1000 < rate * msec" in 64-bit integers.  The
  * validator keeps the rate at or below 2^31 - 1, and the check limits
  * msec to 2^31 - 1.  Thus the product cannot overflow.

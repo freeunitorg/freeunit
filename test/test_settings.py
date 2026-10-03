@@ -390,15 +390,18 @@ def min_rate_reset():
         client.conf_delete(f'settings/http/{name}')
 
 
-def test_settings_body_min_rate_slow_body():
+@pytest.mark.parametrize('timeout', [2, 0])
+def test_settings_body_min_rate_slow_body(timeout):
     # A client sends the body 1 byte each second.  Each byte starts the
     # body_read_timeout gap timer again, so only the rate floor can stop
     # this client.  The floor check starts after the grace time (equal to
     # body_read_timeout, 2 s).  The first body read after the grace time
-    # must give 408.
+    # must give 408.  With body_read_timeout 0 there is no gap timer and
+    # no grace time, and each read is checked against the time since the
+    # previous read.  The first slow read must give 408.
     client.load('empty')
 
-    min_rate_conf({'body_read_timeout': 2, 'body_min_rate': 256})
+    min_rate_conf({'body_read_timeout': timeout, 'body_min_rate': 256})
 
     try:
         sock = socket.create_connection(('127.0.0.1', 8080))
@@ -508,14 +511,16 @@ def test_settings_body_min_rate_burst_then_slow():
         min_rate_reset()
 
 
-def test_settings_body_min_rate_normal_body():
-    # A body that is sent faster than the floor must not be stopped.
-    # The second request on the same keep-alive connection comes after
-    # an idle time that is longer than the grace time.  It must start
-    # with new rate state.
+@pytest.mark.parametrize('timeout', [2, 0])
+def test_settings_body_min_rate_normal_body(timeout):
+    # A body that is sent faster than the floor must not be stopped, also
+    # with body_read_timeout 0, when each read is checked.  The second
+    # request on the same keep-alive connection comes after an idle time
+    # that is longer than the grace time.  It must start with new rate
+    # state.
     client.load('empty')
 
-    min_rate_conf({'body_read_timeout': 2, 'body_min_rate': 256})
+    min_rate_conf({'body_read_timeout': timeout, 'body_min_rate': 256})
 
     def req(sock, close):
         sock.sendall(
@@ -672,11 +677,14 @@ def test_settings_body_min_rate_expect_wait():
         min_rate_reset()
 
 
-def test_settings_send_min_rate_slow_read(system, wait_for_record):
+@pytest.mark.parametrize('timeout', [3, 0])
+def test_settings_send_min_rate_slow_read(timeout, system, wait_for_record):
     # A client reads a large response slower than send_min_rate, but fast
     # enough that the router can write some data before each send_timeout.
     # Each write starts the send_timeout gap timer again, so only the rate
-    # floor can stop this client.
+    # floor can stop this client.  With send_timeout 0 there is no gap
+    # timer and no grace time, and each write is checked against the time
+    # since the previous write.
     #
     # The router counts the bytes that the kernel accepts.  On loopback the
     # kernel send buffer grows to some MiB, and the kernel signals a write
@@ -698,7 +706,7 @@ def test_settings_send_min_rate_slow_read(system, wait_for_record):
 
     client.load('body_generate')
 
-    min_rate_conf({'send_timeout': 3, 'send_min_rate': 8388608})
+    min_rate_conf({'send_timeout': timeout, 'send_min_rate': 8388608})
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -761,13 +769,15 @@ def test_settings_send_min_rate_slow_read(system, wait_for_record):
         min_rate_reset()
 
 
-def test_settings_send_min_rate_fast_read():
-    # A client that reads at full speed must get all the data.  Two
-    # responses on one keep-alive connection check that the second
-    # response starts with new rate state.
+@pytest.mark.parametrize('timeout', [2, 0])
+def test_settings_send_min_rate_fast_read(timeout):
+    # A client that reads at full speed must get all the data, also with
+    # send_timeout 0, when each write is checked.  Two responses on one
+    # keep-alive connection check that the second response starts with
+    # new rate state.
     client.load('body_generate')
 
-    min_rate_conf({'send_timeout': 2, 'send_min_rate': 256})
+    min_rate_conf({'send_timeout': timeout, 'send_min_rate': 256})
 
     try:
         for _ in range(2):
@@ -856,7 +866,9 @@ def test_settings_send_min_rate_gap_longer_than_grace(search_in_file):
     # write would see about 2000 bytes in 2.5 s, below the floor.  That
     # write sends the last data, so the client still gets the full body,
     # but the router closes the connection.  Thus the test sends a second
-    # request on the same connection.
+    # request on the same connection.  On a router that counts the gap,
+    # that request finds the connection closed ('gap header'), and this
+    # assertion fails before the log search.
     client.load('send_bursts')
 
     min_rate_conf({'send_timeout': 2, 'send_min_rate': 1048576})

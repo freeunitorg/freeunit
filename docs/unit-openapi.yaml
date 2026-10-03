@@ -8055,8 +8055,12 @@ components:
             counts the body bytes that it reads after the request header.
             The read that completes the body is not checked, because the
             body is then complete.  If `body_read_timeout` is 0, there is
-            no grace time and each read is checked.  The value 0 disables
-            the check.  Use the
+            no grace time.  Each read is then checked against the time
+            since the previous read, or since Unit started to read the
+            body.  A `body_read_timeout` of 0 also turns off the timer that
+            stops a client that sends nothing.  The check runs only when
+            a read completes, so a client that stops sending is then never
+            stopped.  A `body_min_rate` of 0 disables the check.  Use the
             value 256 to stop slow clients (\"slow POST\")."
 
           default: 0
@@ -8121,8 +8125,13 @@ components:
             measured rate is near the real download rate of the client.  A
             floor above the bandwidth of honest slow clients stops their
             downloads.  Use a small value, for example 16384.  If
-            `send_timeout` is 0, there is no grace time and each write is
-            checked.  The value 0 disables the check.  WebSocket
+            `send_timeout` is 0, there is no grace time.  Each write is
+            then checked against the time since the previous write, but
+            only the time when response data waits for the client is
+            counted.  A `send_timeout` of 0 also turns off the timer that
+            stops a client that reads nothing.  The check runs only when
+            a write completes, so a client that stops reading is then never
+            stopped.  A `send_min_rate` of 0 disables the check.  WebSocket
             connections do not use this check."
 
           default: 0
