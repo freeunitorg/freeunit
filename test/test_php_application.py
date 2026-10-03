@@ -705,6 +705,84 @@ def test_php_application_script():
     assert resp['body'] != '', 'body not empty'
 
 
+def php_script_conf(root, script):
+    return client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "applications/script"}},
+            "applications": {
+                "script": {
+                    "type": client.get_application_type(),
+                    "processes": {"spare": 0},
+                    "root": root,
+                    "script": script,
+                }
+            },
+        }
+    )
+
+
+def php_script_tree(temp_dir):
+    Path(f'{temp_dir}/app/sub').mkdir(parents=True)
+    Path(f'{temp_dir}/app2').mkdir()
+
+    for path in ('app/sub', 'app2'):
+        Path(f'{temp_dir}/{path}/index.php').write_text(
+            '<?php echo $_SERVER["SCRIPT_NAME"]; ?>', encoding='utf-8'
+        )
+
+
+def test_php_application_script_under_root(temp_dir):
+    php_script_tree(temp_dir)
+
+    assert 'success' in php_script_conf(f'{temp_dir}/app', 'sub/index.php')
+
+    resp = client.get()
+    assert resp['status'] == 200, 'script in a subdirectory of the root'
+    assert resp['body'] == '/sub/index.php', 'SCRIPT_NAME'
+
+    # The root "/" is trimmed to an empty string, and every absolute path is
+    # under it.  The script is appended to the root, so it can be absolute.
+    script = os.path.realpath(f'{temp_dir}/app/sub/index.php')
+
+    assert 'success' in php_script_conf('/', script)
+
+    resp = client.get()
+    assert resp['status'] == 200, 'script under the root "/"'
+    assert resp['body'] == script, 'SCRIPT_NAME under the root "/"'
+
+
+def test_php_application_script_outside_root(
+    temp_dir, skip_alert, wait_for_record
+):
+    skip_alert(r'script is not under php root')
+    php_script_tree(temp_dir)
+
+    # "<temp_dir>/app2" starts with the bytes of "<temp_dir>/app", but it is
+    # a sibling directory, not a subdirectory.
+    assert 'success' in php_script_conf(
+        f'{temp_dir}/app', '../app2/index.php'
+    )
+
+    assert client.get()['status'] == 503, 'script in a sibling directory'
+    assert (
+        wait_for_record(r'script is not under php root') is not None
+    ), 'sibling directory alert'
+
+
+def test_php_application_script_is_root(
+    temp_dir, skip_alert, wait_for_record
+):
+    skip_alert(r'script is not under php root')
+    php_script_tree(temp_dir)
+
+    assert 'success' in php_script_conf(f'{temp_dir}/app', '.')
+
+    assert client.get()['status'] == 503, 'script is the root directory'
+    assert (
+        wait_for_record(r'script is not under php root') is not None
+    ), 'root directory alert'
+
+
 def test_php_application_index_default():
     assert 'success' in client.conf(
         {

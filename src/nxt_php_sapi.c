@@ -104,6 +104,8 @@ static void nxt_php_disable(nxt_task_t *task, const char *type,
 static nxt_int_t nxt_php_dirname(const nxt_str_t *file, nxt_str_t *dir);
 static void nxt_php_str_trim_trail(nxt_str_t *str, u_char t);
 static void nxt_php_str_trim_lead(nxt_str_t *str, u_char t);
+static nxt_bool_t nxt_php_path_is_under(const nxt_str_t *root,
+    const nxt_str_t *path);
 nxt_inline u_char *nxt_realpath(const void *c);
 
 static nxt_int_t nxt_php_do_301(nxt_unit_request_info_t *req);
@@ -576,6 +578,7 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
     p = nxt_realpath(tmp);
     if (nxt_slow_path(p == NULL)) {
         nxt_alert(task, "root realpath(%s) failed %E", tmp, nxt_errno);
+        nxt_free(tmp);
         return NXT_ERROR;
     }
 
@@ -595,7 +598,7 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
 
         tmp = nxt_malloc(target->root.length + 1 + str.length + 1);
         if (nxt_slow_path(tmp == NULL)) {
-            return NXT_ERROR;
+            goto fail;
         }
 
         p = tmp;
@@ -610,7 +613,7 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
         if (nxt_slow_path(p == NULL)) {
             nxt_alert(task, "script realpath(%s) failed %E", tmp, nxt_errno);
             nxt_free(tmp);
-            return NXT_ERROR;
+            goto fail;
         }
 
         nxt_free(tmp);
@@ -618,19 +621,19 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
         target->script_filename.length = nxt_strlen(p);
         target->script_filename.start = p;
 
-        if (!nxt_str_start(&target->script_filename,
-                           target->root.start, target->root.length))
-        {
+        if (!nxt_php_path_is_under(&target->root, &target->script_filename)) {
             nxt_alert(task, "script is not under php root");
             nxt_free(p);
-            return NXT_ERROR;
+            target->script_filename.start = NULL;
+            goto fail;
         }
 
         ret = nxt_php_dirname(&target->script_filename,
                               &target->script_dirname);
         if (nxt_slow_path(ret != NXT_OK)) {
             nxt_free(target->script_filename.start);
-            return NXT_ERROR;
+            target->script_filename.start = NULL;
+            goto fail;
         }
 
         target->script_name.length = target->script_filename.length
@@ -646,7 +649,7 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
 
             tmp = nxt_malloc(str.length + 1);
             if (nxt_slow_path(tmp == NULL)) {
-                return NXT_ERROR;
+                goto fail;
             }
 
             nxt_memcpy(tmp, str.start, str.length);
@@ -662,6 +665,13 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
     }
 
     return NXT_OK;
+
+fail:
+
+    nxt_free(target->root.start);
+    target->root.start = NULL;
+
+    return NXT_ERROR;
 }
 
 
@@ -993,6 +1003,28 @@ nxt_php_str_trim_lead(nxt_str_t *str, u_char t)
         str->length--;
         str->start++;
     }
+}
+
+
+/*
+ * Checks that "path" names something below "root": "root", then '/', then
+ * at least one more byte.  A plain prefix test would accept "/srv/app2/x.php"
+ * for the root "/srv/app".  It would also accept the root itself.
+ *
+ * Both paths come from realpath(), so they are absolute and have no "."
+ * or ".." components, no symbolic links and no repeated or trailing '/'.
+ * nxt_php_str_trim_trail() trims the root "/" to length 0.  Every absolute
+ * path except "/" itself is below that root.
+ */
+
+static nxt_bool_t
+nxt_php_path_is_under(const nxt_str_t *root, const nxt_str_t *path)
+{
+    return path->length > root->length
+           && path->length - root->length >= 2
+           && path->start[root->length] == '/'
+           && (root->length == 0
+               || memcmp(path->start, root->start, root->length) == 0);
 }
 
 
