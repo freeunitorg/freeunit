@@ -312,6 +312,9 @@ nxt_wasm_request_handler(nxt_unit_request_info_t *req)
 
     offset = sizeof(nxt_wasm_request_t);
     do {
+        /* exec_request() read the base again; the memory may have moved. */
+        wr = (nxt_wasm_request_t *) nxt_wasm_ctx.baddr;
+
         read_bytes = nxt_min(content_len - content_sent,
                              NXT_WASM_MEM_SIZE - offset);
         bytes_read = nxt_unit_request_read(req, (uint8_t *)wr + offset,

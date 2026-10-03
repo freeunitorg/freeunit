@@ -58,6 +58,19 @@ nxt_wasmtime_err_msg(wasmtime_error_t *error, wasm_trap_t *trap,
 }
 
 
+/*
+ * memory.grow can move the linear memory to a new address.  Read the base
+ * again after the guest has run, and before an import function reads or
+ * writes the memory.
+ */
+static void
+nxt_wasmtime_update_baddr(nxt_wasm_ctx_t *ctx, wasmtime_context_t *wctx)
+{
+    ctx->baddr = wasmtime_memory_data(wctx, &nxt_wasmtime_ctx.memory)
+                 + ctx->baddr_off;
+}
+
+
 static wasm_trap_t *
 nxt_wasm_get_init_mem_size(void *env, wasmtime_caller_t *caller,
                            const wasmtime_val_t *args, size_t nargs,
@@ -85,6 +98,8 @@ nxt_wasm_send_response(void *env, wasmtime_caller_t *caller,
                        const wasmtime_val_t *args, size_t nargs,
                        wasmtime_val_t *results, size_t nresults)
 {
+    nxt_wasmtime_update_baddr(env, wasmtime_caller_context(caller));
+
     nxt_wasm_do_send_response(env, args[0].of.i32);
 
     return NULL;
@@ -96,6 +111,8 @@ nxt_wasm_send_headers(void *env, wasmtime_caller_t *caller,
                       const wasmtime_val_t *args, size_t nargs,
                       wasmtime_val_t *results, size_t nresults)
 {
+    nxt_wasmtime_update_baddr(env, wasmtime_caller_context(caller));
+
     nxt_wasm_do_send_headers(env, args[0].of.i32);
 
     return NULL;
@@ -116,7 +133,7 @@ nxt_wasm_set_resp_status(void *env, wasmtime_caller_t *caller,
 
 
 static void
-nxt_wasmtime_execute_hook(const nxt_wasm_ctx_t *ctx, nxt_wasm_fh_t hook)
+nxt_wasmtime_execute_hook(nxt_wasm_ctx_t *ctx, nxt_wasm_fh_t hook)
 {
     const char             *name = ctx->fh[hook].func_name;
     wasm_trap_t            *trap = NULL;
@@ -129,6 +146,9 @@ nxt_wasmtime_execute_hook(const nxt_wasm_ctx_t *ctx, nxt_wasm_fh_t hook)
     }
 
     error = wasmtime_func_call(rt_ctx->ctx, func, NULL, 0, NULL, 0, &trap);
+
+    nxt_wasmtime_update_baddr(ctx, rt_ctx->ctx);
+
     if (error != NULL || trap != NULL) {
         nxt_wasmtime_err_msg(error, trap, "failed to call hook function [%s]",
                              name);
@@ -137,7 +157,7 @@ nxt_wasmtime_execute_hook(const nxt_wasm_ctx_t *ctx, nxt_wasm_fh_t hook)
 
 
 static int
-nxt_wasmtime_execute_request(const nxt_wasm_ctx_t *ctx)
+nxt_wasmtime_execute_request(nxt_wasm_ctx_t *ctx)
 {
     int                    i = 0;
     wasm_trap_t            *trap = NULL;
@@ -151,6 +171,9 @@ nxt_wasmtime_execute_request(const nxt_wasm_ctx_t *ctx)
     args[i++].of.i32 = ctx->baddr_off;
 
     error = wasmtime_func_call(rt_ctx->ctx, func, args, i, results, 1, &trap);
+
+    nxt_wasmtime_update_baddr(ctx, rt_ctx->ctx);
+
     if (error != NULL || trap != NULL) {
         nxt_wasmtime_err_msg(error, trap,
                              "failed to call function [->wasm_request_handler]"
@@ -302,6 +325,42 @@ nxt_wasmtime_wasi_init(const nxt_wasm_ctx_t *ctx)
 }
 
 
+/*
+ * The host passes and reads wasm32 offsets.  A 64-bit memory has no 4 GiB
+ * limit, so it can grow past the address space that wasmtime reserved for
+ * it, and wasmtime then moves it.  Refuse such a memory before the host
+ * calls the malloc handler.
+ */
+static int
+nxt_wasmtime_check_memory(void)
+{
+    bool                ok, is64;
+    wasmtime_extern_t   item;
+    wasm_memorytype_t   *type;
+    nxt_wasmtime_ctx_t  *rt_ctx = &nxt_wasmtime_ctx;
+
+    ok = wasmtime_linker_get(rt_ctx->linker, rt_ctx->ctx, "", 0, "memory",
+                             strlen("memory"), &item);
+    if (!ok || item.kind != WASMTIME_EXTERN_MEMORY) {
+        nxt_wasmtime_err_msg(NULL, NULL, "couldn't get 'memory' from module");
+        return -1;
+    }
+
+    type = wasmtime_memory_type(rt_ctx->ctx, &item.of.memory);
+    is64 = wasmtime_memorytype_is64(type);
+    wasm_memorytype_delete(type);
+
+    if (is64) {
+        nxt_wasmtime_err_msg(NULL, NULL,
+                             "module memory is 64-bit; only a 32-bit memory "
+                             "is supported");
+        return -1;
+    }
+
+    return 0;
+}
+
+
 static int
 nxt_wasmtime_init_memory(nxt_wasm_ctx_t *ctx)
 {
@@ -432,6 +491,11 @@ nxt_wasmtime_init(nxt_wasm_ctx_t *ctx)
     }
 
     err = nxt_wasmtime_get_function_exports(ctx);
+    if (err) {
+        return -1;
+    }
+
+    err = nxt_wasmtime_check_memory();
     if (err) {
         return -1;
     }

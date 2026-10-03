@@ -192,6 +192,16 @@ chunk marker that the application can clear.  All of these are now checked.
 </para>
 </change>
 
+<change type="security">
+<para>
+the wasm module read the base address of the linear memory of the guest only
+once, at startup.  A guest with a 64-bit memory could grow it past 4 GiB, and
+wasmtime then moved it.  The module then read and wrote the old address, and
+the worker crashed.  The module now refuses a 64-bit memory.  It also reads
+the base address again after the guest runs.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 a keep-alive TLS connection that was idle across a reconfiguration could

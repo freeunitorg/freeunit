@@ -88,6 +88,13 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        and handed out stream 0, which callers read as a failure. The
        registration stayed. Stream 0 is now skipped.
 
+    *) Security: the wasm module read the base address of the linear
+       memory of the guest only once, at startup. A guest with a 64-bit
+       memory could grow it past 4 GiB, and wasmtime then moved it. The
+       module then read and wrote the old address, and the worker crashed.
+       The module now refuses a 64-bit memory. It also reads the base
+       address again after the guest runs.
+
     *) Bugfix: a keep-alive TLS connection that was idle across a
        reconfiguration could use the TLS settings of the old configuration
        after they were freed, when it was closed. The connection now keeps
