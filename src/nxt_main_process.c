@@ -958,6 +958,7 @@ static nxt_port_handlers_t  nxt_main_process_port_handlers = {
 #if (NXT_HAVE_NJS)
     .script_get       = nxt_script_store_get_handler,
     .script_delete    = nxt_script_store_delete_handler,
+    .script_store     = nxt_script_store_put_handler,
 #endif
     .access_log       = nxt_main_port_access_log_handler,
     .rpc_ready        = nxt_port_rpc_handler,

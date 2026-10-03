@@ -963,6 +963,8 @@ jobs:
       # shutdown event, test_tls_certificate_update_restart restarts it to
       # check that a replaced bundle survives, and test_state_store.py runs
       # unitd on its own state directory and stops it while a store runs.
+      # test_njs_modules.py stores njs modules and starts unitd again to
+      # check what it loads from the state directory.
       # All need --restart, which the run above does not pass, so they skip
       # there.  Run them again.
       - name: Run the tests that restart unitd, with --restart
@@ -970,6 +972,7 @@ jobs:
           export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
           sudo -E /usr/bin/pytest-3 --print-log --restart \
             test/test_asgi_lifespan.py \
+            test/test_njs_modules.py \
             test/test_state_store.py \
             test/test_tls.py::test_tls_certificate_update_restart
         if: ${{ !cancelled() && steps.metadata.outputs.module == 'python' }}
