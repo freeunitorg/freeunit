@@ -1292,7 +1292,7 @@ def test_node_websockets_9_1_1__9_6_6(system):
             payload = b'*' * length
 
         ws.frame_write(sock, opcode, payload, chopsize=chopsize)
-        frame = ws.frame_read(sock, read_timeout=5)
+        frame = ws.frame_read(sock, read_timeout=ws.LARGE_MESSAGE_TIMEOUT)
         check_frame(frame, True, opcode, payload)
 
     def check_message(opcode, f_size):
@@ -1302,7 +1302,7 @@ def test_node_websockets_9_1_1__9_6_6(system):
             payload = b'*' * 4 * 2**20
 
         ws.message(sock, opcode, payload, fragmention_size=f_size)
-        frame = ws.frame_read(sock, read_timeout=5)
+        frame = ws.frame_read(sock, read_timeout=ws.LARGE_MESSAGE_TIMEOUT)
         check_frame(frame, True, opcode, payload)
 
     check_payload(op_text, 64 * 2**10)  # 9_1_1

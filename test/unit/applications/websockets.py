@@ -14,6 +14,10 @@ GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 class ApplicationWebsocket(ApplicationProto):
 
+    # Seconds to wait for the echo of a large message (the 9_x tests).
+    # A debug build needs 3.6-4.4 s to echo 65536 fragments of 64 bytes.
+    LARGE_MESSAGE_TIMEOUT = 30
+
     OP_CONT = 0x00
     OP_TEXT = 0x01
     OP_BINARY = 0x02
