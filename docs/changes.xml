@@ -12,6 +12,20 @@
 
 <change type="bugfix">
 <para>
+the router could take a message of an application response before an earlier
+message of the same response.  With a header over 1024 bytes and a first body
+write of 16 to 1024 bytes, it parsed the body as the header, logged "response
+buffer too small for fields count", and answered 503.  With a body write over
+1024 bytes and a later smaller one, the client got the two parts in the wrong
+order, and nothing was logged.  This needed two or more application processes
+or threads.  The bug had appeared in 1.19.0.  The fix is in libunit: an
+application of type "external", such as Go or Node.js, gets it when it is
+built with the new libunit.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 the router did not answer "Expect: 100-continue".  A client that sent it, as
 curl and Guzzle do for large uploads, waited for its own timeout before it
 sent the body.  For curl, that timeout is 1 second.  The router now sends
