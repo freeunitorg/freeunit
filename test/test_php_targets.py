@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from unit.applications.lang.php import ApplicationPHP
 from unit.option import option
 
@@ -60,6 +62,55 @@ def test_php_application_targets():
         'applications/targets/targets/default/index'
     ), 'remove targets index'
     assert client.get(url='/')['body'] == 'index'
+
+
+def test_php_application_targets_cwd(temp_dir):
+    # libunit fills a released request with 0xA5 (nxt_unit_mmap_release()).
+    # The module read the target index after the request ended, so it kept
+    # 0xA5 (165) as the last target.  The target at index 165 then skipped
+    # chdir() and ran in the directory of the previous target.  The index
+    # follows the hash order of the names, so every target gets its own
+    # directory, and the test requests each of them.
+    routes = []
+    targets = {}
+
+    for i in range(166):
+        name = f't{i}'
+        root = f'{temp_dir}/{name}'
+
+        Path(root).mkdir()
+        Path(f'{root}/index.php').write_text(
+            '<?php echo getcwd();', encoding='utf-8'
+        )
+
+        routes.append(
+            {
+                "match": {"uri": f'/{name}'},
+                "action": {"pass": f'applications/targets/{name}'},
+            }
+        )
+        targets[name] = {"root": root, "script": "index.php"}
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "routes"}},
+            "routes": routes,
+            "applications": {
+                "targets": {
+                    "type": client.get_application_type(),
+                    "processes": 1,
+                    "targets": targets,
+                }
+            },
+        }
+    )
+
+    # Each request follows a request for another target.
+    names = list(targets)
+
+    for name in names[-1:] + names:
+        cwd = str(Path(f'{temp_dir}/{name}').resolve())
+        assert client.get(url=f'/{name}')['body'] == cwd, name
 
 
 def test_php_application_targets_error():

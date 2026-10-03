@@ -1,6 +1,14 @@
 
 Changes with FreeUnit 1.36.2                                     30 Aug 2026
 
+    *) Bugfix: the PHP module read the target index of a request after the
+       request was released. libunit fills released request memory with
+       0xA5, so the module called chdir(2) on every request to a "script"
+       target. A request could also run in the directory of another
+       target. This happened with 166 or more targets, and after
+       fastcgi_finish_request() when the released memory already held a
+       request for another target. The bug had appeared in 1.18.0.
+
     *) Change: the main process now writes the state files in a
        short-lived child process, so a slow fsync(2) no longer delays
        the start of application processes after a reconfiguration, or

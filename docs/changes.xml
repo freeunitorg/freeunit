@@ -10,6 +10,17 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="bugfix">
+<para>
+the PHP module read the target index of a request after the request was
+released.  libunit fills released request memory with 0xA5, so the module
+called chdir(2) on every request to a "script" target.  A request could also
+run in the directory of another target.  This happened with 166 or more
+targets, and after fastcgi_finish_request() when the released memory already
+held a request for another target.  The bug had appeared in 1.18.0.
+</para>
+</change>
+
 <change type="change">
 <para>
 the main process now writes the state files in a short-lived child

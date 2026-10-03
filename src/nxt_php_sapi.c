@@ -1081,12 +1081,14 @@ nxt_php_handle_fs_err(nxt_unit_request_info_t *req)
 static void
 nxt_php_request_handler(nxt_unit_request_info_t *req)
 {
+    uint8_t             app_target;
     nxt_php_target_t    *target;
     nxt_php_run_ctx_t   ctx;
     nxt_unit_request_t  *r;
 
     r = req->request;
-    target = &nxt_php_targets[r->app_target];
+    app_target = r->app_target;
+    target = &nxt_php_targets[app_target];
 
     nxt_memzero(&ctx, sizeof(ctx));
 
@@ -1103,11 +1105,12 @@ nxt_php_request_handler(nxt_unit_request_info_t *req)
     ctx.script_dirname = target->script_dirname;
     ctx.script_name = target->script_name;
 
-    ctx.chdir = (r->app_target != nxt_php_last_target);
+    ctx.chdir = (app_target != nxt_php_last_target);
 
     nxt_php_execute(&ctx, r);
 
-    nxt_php_last_target = ctx.chdir ? -1 : r->app_target;
+    /* nxt_php_execute() ended the request; r points to released memory. */
+    nxt_php_last_target = ctx.chdir ? -1 : app_target;
 }
 
 
