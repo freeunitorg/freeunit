@@ -812,10 +812,11 @@ def test_app_lifecycle_app_fds_stable(app):
 
     The socket rule is therefore one bound, and the discovery ceiling is
     what makes it safe.  There are at most nxt_ncpu engines, the test does
-    not touch `listen_threads`, and nxt_ncpu is CPU_COUNT() of the affinity
-    mask, capped by _SC_NPROCESSORS_ONLN (nxt_lib.c) -- which is what
-    os.sched_getaffinity() reports here.  So: total socket growth across the
-    two windows may not exceed that ceiling.  Discovery can never exceed it,
+    not touch `listen_threads`, and nxt_ncpu is at most CPU_COUNT() of the
+    affinity mask, capped by _SC_NPROCESSORS_ONLN (nxt_lib.c) -- which is
+    what os.sched_getaffinity() reports here.  A cgroup v2 CPU limit can
+    only lower nxt_ncpu.  So: total socket growth across the two windows may
+    not exceed that ceiling.  Discovery can never exceed it,
     however the first touches fall across the windows -- one window, both,
     or a whole burst's worth of fresh engines on a machine with more CPUs
     than the burst has requests -- so this bound cannot be tripped by the
@@ -961,8 +962,9 @@ def test_app_lifecycle_app_fds_stable(app):
         )
 
     # sockets: bounded by the engine count, because port discovery is lazy
-    # and one-time per engine.  nxt_ncpu is CPU_COUNT() of the affinity mask
-    # (src/nxt_lib.c) and the test does not touch `listen_threads`.
+    # and one-time per engine.  nxt_ncpu is at most CPU_COUNT() of the
+    # affinity mask; a cgroup v2 CPU limit can only lower it (src/nxt_lib.c).
+    # The test does not touch `listen_threads`.
     ncpu = max(len(os.sched_getaffinity(0)), 1)
 
     sockets = [n.sockets for n in counts]

@@ -37,6 +37,7 @@ getsockopt
 gettid
 ioctl
 listen
+lseek
 lstat
 membarrier
 memfd_create

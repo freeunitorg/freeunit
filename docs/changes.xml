@@ -10,6 +10,19 @@
          date="2026-08-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="change">
+<para>
+on Linux, the default number of router threads ("listen_threads") is now at
+most the CPU limit of the cgroup v2 group of unitd and of its parent groups
+("cpu.max"), rounded up to whole CPUs.  Before, it was the number of CPUs that
+unitd could run on, so a container limited to 2 CPUs on a 64-CPU host started
+64 router threads.  Now it starts 2.  A limit of 1.5 CPUs also gives 2
+threads.  An explicit "listen_threads" is not changed.  With a private cgroup
+namespace, only the limits inside the namespace are seen.  The limit is read
+once, when unitd starts.  cgroup v1 is not read.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 after 2^32 RPC registrations the stream counter wrapped and handed out

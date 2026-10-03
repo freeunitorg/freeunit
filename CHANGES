@@ -104,6 +104,16 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        close a descriptor that another connection had got in the
        meantime.
 
+    *) Change: on Linux, the default number of router threads
+       ("listen_threads") is now at most the CPU limit of the cgroup v2
+       group of unitd and of its parent groups ("cpu.max"), rounded up to
+       whole CPUs. Before, it was the number of CPUs that unitd could run
+       on, so a container limited to 2 CPUs on a 64-CPU host started 64
+       router threads. Now it starts 2. A limit of 1.5 CPUs also gives 2
+       threads. An explicit "listen_threads" is not changed. With a private
+       cgroup namespace, only the limits inside the namespace are seen. The
+       limit is read once, when unitd starts. cgroup v1 is not read.
+
     *) Bugfix: a proxied request with a chunked body, or an HTTP/2 request
        without a content-length, was sent to the upstream with two
        Content-Length fields.
