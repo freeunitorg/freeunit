@@ -1274,11 +1274,14 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
             out = nxt_http_chunk_parse(task, &h1p->chunked_parse, b);
 
             if (h1p->chunked_parse.error) {
-                nxt_h1p_request_error(task, h1p, r);
+                h1p->keepalive = 0;
+                nxt_http_request_error(task, r,
+                                       NXT_HTTP_INTERNAL_SERVER_ERROR);
                 return;
             }
 
             if (h1p->chunked_parse.chunk_error) {
+                h1p->keepalive = 0;
                 nxt_http_request_error(task, r, NXT_HTTP_BAD_REQUEST);
                 return;
             }
@@ -1287,14 +1290,18 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
                 size = nxt_buf_mem_used_size(&chunk->mem);
                 res = nxt_fd_write(b->file->fd, chunk->mem.pos, size);
                 if (nxt_slow_path(res < (ssize_t) size)) {
-                    nxt_h1p_request_error(task, h1p, r);
+                    h1p->keepalive = 0;
+                    nxt_http_request_error(task, r,
+                                           NXT_HTTP_INTERNAL_SERVER_ERROR);
                     return;
                 }
 
                 b->file_end += size;
 
                 if ((size_t) b->file_end > skcf->max_body_size) {
-                    nxt_h1p_request_error(task, h1p, r);
+                    h1p->keepalive = 0;
+                    nxt_http_request_error(task, r,
+                                           NXT_HTTP_PAYLOAD_TOO_LARGE);
                     return;
                 }
             }
@@ -1333,7 +1340,9 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
 
             res = nxt_fd_write(b->file->fd, b->mem.pos, size);
             if (nxt_slow_path(res < (ssize_t) size)) {
-                nxt_h1p_request_error(task, h1p, r);
+                h1p->keepalive = 0;
+                nxt_http_request_error(task, r,
+                                       NXT_HTTP_INTERNAL_SERVER_ERROR);
                 return;
             }
 
