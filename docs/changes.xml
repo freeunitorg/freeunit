@@ -1284,6 +1284,17 @@ rejected; it was served as an empty 200 response.  The bug had appeared in 0.4.
 </para>
 </change>
 
+<change type="change">
+<para>
+the Java module now bundles Apache Tomcat 9.0.122 (from 9.0.121).  The
+upstream release fixes CVE-2026-87022 (WebSocket message smuggling with
+per-message-deflate) and eleven other CVEs.  None of the twelve fixes is in a
+jar that FreeUnit bundles.  The FreeUnit WebSocket code is derived from Tomcat,
+but it does not decompress received frames, so CVE-2026-87022 does not affect
+it.
+</para>
+</change>
+
 </changes>
 
 
