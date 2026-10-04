@@ -25,7 +25,7 @@ bench = false
 # http:// (h2c for grpc).
 [dependencies]
 opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", features = ["trace"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "trace",
     "http-proto",
