@@ -23,15 +23,15 @@ updates:
       - "/test/wasm_component/spin_loop"
     schedule:
       interval: weekly
-    # The limit counts per directory, not for the whole block
-    # (https://github.com/dependabot/dependabot-core/issues/10395).  With the
-    # groups below, a directory needs one or two pull requests a week.
-    open-pull-requests-limit: 2
+    # Every version update below belongs to a group, and a group is one
+    # pull request for all directories.  So at most three version-update
+    # pull requests are open, whether the limit counts per directory or for
+    # the whole block.
+    open-pull-requests-limit: 3
     commit-message:
       prefix: "build(deps)"
-    # A group opens one pull request per directory, so test/fake_otlp gets
-    # its own otel pull request.  "group-by: dependency-name" would join the
-    # directories but split the otel crates, which must move together.
+    # A group is one pull request for all directories, so src/otel and
+    # test/fake_otlp move together in one otel pull request.
     groups:
       otel:
         patterns:
@@ -46,10 +46,26 @@ updates:
           - "opentelemetry*"
           - "tonic*"
           - "prost*"
+      # A group without "patterns" outranks "opentelemetry*" when Dependabot
+      # picks the most specific group, so the two groups below must exclude
+      # the otel crates.  Otherwise they claim them and split the stack.
       minor-and-patch:
+        exclude-patterns:
+          - "opentelemetry*"
+          - "tonic*"
+          - "prost*"
         update-types:
           - "minor"
           - "patch"
+      # Major updates, including a 0.x minor, which cargo rates as major.
+      # They come together in one pull request.
+      major:
+        exclude-patterns:
+          - "opentelemetry*"
+          - "tonic*"
+          - "prost*"
+        update-types:
+          - "major"
     ignore:
       # Wasmtime is updated by hand.  Its version is also pinned in
       # pkg/contrib/src/wasmtime/version, EOL.md and pkg/eol.json, which a
