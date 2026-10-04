@@ -17,7 +17,7 @@ path = "src/main.rs"
 tonic = "0.14"
 prost = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-opentelemetry-proto = { version = "0.32", default-features = false, features = [
+opentelemetry-proto = { version = "0.33", default-features = false, features = [
     "gen-tonic",
     "trace",
 ] }
