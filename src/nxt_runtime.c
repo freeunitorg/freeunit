@@ -366,6 +366,12 @@ nxt_runtime_start(nxt_task_t *task, void *obj, void *data)
                 "namespace, and applications run as uid %d", (int) nxt_euid);
     }
 
+    if (nxt_ncpu_unlimited != 0) {
+        /* nxt_lib_start() lowers the count before the log file exists. */
+        nxt_log(task, NXT_LOG_INFO, "the cgroup CPU limit lowers the CPU "
+                "count from %ui to %ui", nxt_ncpu_unlimited, nxt_ncpu);
+    }
+
     if (nxt_runtime_event_engine_change(task, rt) != NXT_OK) {
         goto fail;
     }

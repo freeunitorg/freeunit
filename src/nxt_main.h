@@ -164,6 +164,8 @@ NXT_EXPORT const char *nxt_cgroup_relative_path(const char *cgroup,
 
 
 NXT_EXPORT extern nxt_uint_t    nxt_ncpu;
+/* The CPU count before the cgroup CPU limit lowered it, or 0. */
+NXT_EXPORT extern nxt_uint_t    nxt_ncpu_unlimited;
 NXT_EXPORT extern nxt_uint_t    nxt_pagesize;
 NXT_EXPORT extern nxt_task_t    nxt_main_task;
 NXT_EXPORT extern nxt_atomic_t  nxt_task_ident;

@@ -9,6 +9,7 @@
 
 
 nxt_uint_t    nxt_ncpu = 1;
+nxt_uint_t    nxt_ncpu_unlimited;
 nxt_uint_t    nxt_pagesize;
 nxt_task_t    nxt_main_task;
 nxt_atomic_t  nxt_task_ident;
@@ -135,10 +136,8 @@ nxt_lib_start(const char *app, char **argv, char ***envp)
         limit = nxt_cgroup_cpu_limit();
 
         if (limit != 0 && limit < (nxt_uint_t) n) {
-            nxt_log(&nxt_main_task, NXT_LOG_INFO,
-                    "the cgroup CPU limit lowers the CPU count from %d to %ui",
-                    n, limit);
-
+            /* nxt_runtime_start() writes the record to unit.log. */
+            nxt_ncpu_unlimited = n;
             n = (int) limit;
         }
     }
