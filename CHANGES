@@ -1,4 +1,7 @@
 
+Changes with FreeUnit 1.37.1                                     04 Oct 2026
+
+
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 
     *) Bugfix: a chunked request body that grew over "max_body_size"
