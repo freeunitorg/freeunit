@@ -5,6 +5,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::Error;
 use std::borrow::Cow;
 use std::ffi::{CStr, CString};
+use std::future::Future;
 use std::mem::MaybeUninit;
 use std::os::raw::c_int;
 use std::process::exit;
@@ -15,16 +16,14 @@ use tokio::sync::mpsc;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::p2::add_to_linker_async;
-use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder,
-                    WasiCtxView, WasiView};
-use wasmtime_wasi_http::p2::bindings::http::types::{ErrorCode, Scheme};
+use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView,
+                    WasiView};
+use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
-use wasmtime_wasi_http::p2::types::{HostFutureIncomingResponse,
-                                    OutgoingRequestConfig};
-use wasmtime_wasi_http::p2::{HttpResult, WasiHttpCtxView, WasiHttpHooks,
-                             WasiHttpView};
-use wasmtime_wasi_http::WasiHttpCtx;
+use wasmtime_wasi_http::{Error as HttpError, RequestOptions, WasiBody,
+                         WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks,
+                         WasiHttpView};
 
 #[allow(
     non_camel_case_types,
@@ -353,12 +352,7 @@ impl GlobalState {
                 cx.inherit_stderr();
                 cx.inherit_env();
                 for dir in self.global_config.dirs.iter() {
-                    cx.preopened_dir(
-                        dir,
-                        dir,
-                        DirPerms::all(),
-                        FilePerms::all(),
-                    )?;
+                    cx.preopened_dir(dir, dir, FsPerms::ReadWrite)?;
                 }
                 cx.build()
             },
@@ -973,10 +967,21 @@ struct DenyOutboundHttp;
 impl WasiHttpHooks for DenyOutboundHttp {
     fn send_request(
         &mut self,
-        _request: hyper::Request<HyperOutgoingBody>,
-        _config: OutgoingRequestConfig,
-    ) -> HttpResult<HostFutureIncomingResponse> {
-        Err(ErrorCode::HttpRequestDenied.into())
+        _request: hyper::Request<WasiBody>,
+        _options: Option<RequestOptions>,
+        _fut: Box<dyn Future<Output = Result<(), HttpError>> + Send>,
+    ) -> Box<
+        dyn Future<
+                Output = Result<
+                    (
+                        hyper::Response<WasiBody>,
+                        Box<dyn Future<Output = Result<(), HttpError>> + Send>,
+                    ),
+                    HttpError,
+                >,
+            > + Send,
+    > {
+        Box::new(async { Err(HttpError::HttpRequestDenied) })
     }
 }
 

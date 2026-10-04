@@ -1107,6 +1107,18 @@ A build without "--tests" is unchanged.
 </para>
 </change>
 
+<change type="change">
+<para>
+update wasmtime to 48.0.5.  The WebAssembly module moves from 43.0.1, and the
+WebAssembly component module from 47.0.2.  Version 48 is a long-term support
+release of wasmtime.  It fixes twelve wasmtime security advisories published on
+24 September and 2 October 2026.  Each one needs a hostile WebAssembly guest.
+With the features that FreeUnit builds, such a guest could panic the host,
+exhaust host memory, read uninitialized host memory, or corrupt the GC heap.
+Building the two modules now needs Rust 1.95.0 or newer.
+</para>
+</change>
+
 </changes>
 
 

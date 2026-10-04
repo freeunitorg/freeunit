@@ -281,7 +281,9 @@ nxt_wasmtime_wasi_init(const nxt_wasm_ctx_t *ctx)
     wasi_config_inherit_stderr(wasi_config);
 
     for (dir = ctx->dirs; dir != NULL && *dir != NULL; dir++) {
-#if defined(WASMTIME_VERSION_MAJOR) && (WASMTIME_VERSION_MAJOR >= 27)
+#if defined(WASMTIME_VERSION_MAJOR) && (WASMTIME_VERSION_MAJOR >= 48)
+        wasi_config_preopen_dir(wasi_config, *dir, *dir, true);
+#elif defined(WASMTIME_VERSION_MAJOR) && (WASMTIME_VERSION_MAJOR >= 27)
         wasi_config_preopen_dir(wasi_config, *dir, *dir,
                 WASMTIME_WASI_DIR_PERMS_READ|WASMTIME_WASI_DIR_PERMS_WRITE,
                 WASMTIME_WASI_FILE_PERMS_READ|WASMTIME_WASI_FILE_PERMS_WRITE);
