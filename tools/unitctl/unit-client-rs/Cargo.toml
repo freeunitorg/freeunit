@@ -48,4 +48,4 @@ regex = "1.10.4"
 pbr = "1.1.1"
 
 [dev-dependencies]
-rand = "0.9"
+rand = "0.10"
