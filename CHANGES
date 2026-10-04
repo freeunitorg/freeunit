@@ -964,6 +964,14 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        FreeUnit WebSocket code is derived from Tomcat, but it does not
        decompress received frames, so CVE-2026-87022 does not affect it.
 
+    *) Feature: Docker images for Go 1.27, Perl 5.44 and Java 27. The Java
+       images are now based on Ubuntu 26.04 (resolute) instead of 24.04
+       (noble), because Eclipse Temurin publishes Java 27 only for 26.04.
+
+    *) Change: the Docker images now install the pending updates of their
+       base image when they are built. Before, an image kept the packages
+       of its base image as they were when that image was published.
+
 Changes with FreeUnit 1.36.1                                     28 Aug 2026
 
     *) Feature: configuration validation errors now say where they are. A

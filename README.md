@@ -63,6 +63,7 @@ and are available for `linux/amd64` and `linux/arm64`.
 | Node.js 24 | `ghcr.io/freeunitorg/freeunit:latest-node-24` |
 | Node.js 22 | `ghcr.io/freeunitorg/freeunit:latest-node-22` |
 | Node.js 20 | `ghcr.io/freeunitorg/freeunit:latest-node-20` |
+| Go 1.27 | `ghcr.io/freeunitorg/freeunit:latest-go-1.27` |
 | Go 1.26 | `ghcr.io/freeunitorg/freeunit:latest-go-1.26` |
 | Go 1.25 | `ghcr.io/freeunitorg/freeunit:latest-go-1.25` |
 | Ruby 4.0 | `ghcr.io/freeunitorg/freeunit:latest-ruby-4.0` |

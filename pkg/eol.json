@@ -47,13 +47,15 @@
   "runtimes": {
     "go": [
       {"version": "1.25", "eol": "2026-08", "supported_until": "2027-08", "note": "EOL"},
-      {"version": "1.26", "eol": "2027-02", "supported_until": "2028-02"}
+      {"version": "1.26", "eol": "2027-02", "supported_until": "2028-02"},
+      {"version": "1.27", "eol": "2027-08", "supported_until": "2028-08"}
     ],
     "java": [
       {"version": "17", "eol": "2027-10", "supported_until": "2028-10", "base": "eclipse-temurin", "lts": true},
       {"version": "21", "eol": "2029-12", "supported_until": "2030-12", "base": "eclipse-temurin", "lts": true},
       {"version": "25", "eol": "2031-09", "supported_until": "2032-09", "base": "eclipse-temurin", "lts": true},
-      {"version": "26", "eol": "2026-09", "supported_until": "2027-09", "base": "eclipse-temurin"}
+      {"version": "26", "eol": "2026-09", "supported_until": "2027-09", "base": "eclipse-temurin", "note": "EOL"},
+      {"version": "27", "eol": "2027-03", "supported_until": "2028-03", "base": "eclipse-temurin"}
     ],
     "node": [
       {"version": "20", "eol": "2026-04", "supported_until": "2027-04", "note": "EOL"},
@@ -64,7 +66,8 @@
     "perl": [
       {"version": "5.38", "eol": "2026-07", "supported_until": "2027-07", "note": "EOL"},
       {"version": "5.40", "eol": "2027-06", "supported_until": "2028-06"},
-      {"version": "5.42", "eol": "2028-07", "supported_until": "2029-07"}
+      {"version": "5.42", "eol": "2028-07", "supported_until": "2029-07"},
+      {"version": "5.44", "eol": "2029-07", "supported_until": "2030-07"}
     ],
     "php": [
       {"version": "8.3", "eol": "2027-12", "supported_until": "2028-12"},

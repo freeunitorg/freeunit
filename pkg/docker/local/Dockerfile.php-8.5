@@ -77,6 +77,7 @@ COPY --from=build /requirements.apt       /requirements.apt
 
 RUN set -ex \
     && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confold upgrade \
     && apt-get --no-install-recommends --no-install-suggests -y install \
          curl $(cat /requirements.apt) \
     && rm -rf /var/lib/apt/lists/* \

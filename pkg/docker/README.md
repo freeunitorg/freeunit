@@ -187,8 +187,12 @@ A summary (OK / FAILED) is printed at the end.
 | `wasm` | debian:trixie-slim |
 | `go-1.25` | golang:1.25 |
 | `go-1.26` | golang:1.26 |
-| `java-17` | eclipse-temurin:17-jdk-noble |
-| `java-21` | eclipse-temurin:21-jdk-noble |
+| `go-1.27` | golang:1.27 |
+| `java-17` | eclipse-temurin:17-jdk-resolute |
+| `java-21` | eclipse-temurin:21-jdk-resolute |
+| `java-25` | eclipse-temurin:25-jdk-resolute |
+| `java-26` | eclipse-temurin:26-jdk-resolute |
+| `java-27` | eclipse-temurin:27-jdk-resolute |
 | `node-20` | node:20 |
 | `node-22` | node:22 |
 | `node-24` | node:24 |
@@ -196,6 +200,7 @@ A summary (OK / FAILED) is printed at the end.
 | `perl-5.38` | perl:5.38 |
 | `perl-5.40` | perl:5.40 |
 | `perl-5.42` | perl:5.42 |
+| `perl-5.44` | perl:5.44 |
 | `php-8.3` | php:8.3-cli |
 | `php-8.4` | php:8.4-cli |
 | `php-8.5` | php:8.5-cli-trixie |
