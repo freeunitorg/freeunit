@@ -41,7 +41,10 @@ PACKAGE_RE = re.compile(r"^(?P<name>[\w.+-]+) v(?P<version>[^\s]+)")
 FEATURE_RE = re.compile(
     r"^\s*feature\((?P<name>[\w-]+)\s+(?P<default>ON|OFF)\)", re.MULTILINE
 )
-CMAKE_FLAG_RE = re.compile(r"-D(?P<name>WASMTIME_[A-Z0-9_]+)=(?P<value>ON|OFF)")
+# Every -DWASMTIME_* token, whatever follows the name.  A form that is not
+# plainly =ON or =OFF must stop the gate: ignoring it would leave the
+# resolved feature set different from the one cmake hands to cargo.
+CMAKE_FLAG_RE = re.compile(r"-D(?P<name>WASMTIME_\w*)(?P<rest>[^\s\\]*)")
 
 
 def fail(message: str) -> None:
@@ -62,13 +65,26 @@ def cmake_name(feature: str) -> str:
 
 
 def read_cmake_flags() -> dict:
-    """Read the -DWASMTIME_* flags that pkg/contrib passes to cmake."""
+    """Read the -DWASMTIME_* flags that pkg/contrib passes to cmake.
+
+    Only =ON and =OFF map to a Cargo feature.  Anything else, such as =0,
+    =off, :BOOL=OFF or a cargo option string, is an error and not a guess.
+    """
     if not MAKEFILE.is_file():
         fail(f"{MAKEFILE} is missing")
-    return {
-        match.group("name"): match.group("value") == "ON"
-        for match in CMAKE_FLAG_RE.finditer(MAKEFILE.read_text())
-    }
+    # A comment line may name a flag without passing it.
+    lines = MAKEFILE.read_text().splitlines()
+    text = "\n".join(line for line in lines if not line.lstrip().startswith("#"))
+    flags = {}
+    for match in CMAKE_FLAG_RE.finditer(text):
+        name, rest = match.group("name"), match.group("rest")
+        if rest not in ("=ON", "=OFF"):
+            fail(
+                f"{rel(MAKEFILE)} passes -D{name}{rest}, which cannot be "
+                f"mapped to a Cargo feature; use =ON or =OFF"
+            )
+        flags[name] = rest == "=ON"
+    return flags
 
 
 def read_features(tree: Path) -> list:
@@ -105,6 +121,16 @@ def read_features(tree: Path) -> list:
 
     if not features:
         fail(f"no features parsed from {source}")
+
+    # In the C API crate, component-model-async lists component-model.  cmake
+    # does not know that: with component-model off and the async feature on,
+    # it exits 0, cargo builds the component model anyway, and conf.h then
+    # says it is off.
+    if "component-model-async" in features and "component-model" not in features:
+        fail(
+            f"{rel(MAKEFILE)} turns component-model off and leaves "
+            f"component-model-async on; the C API crate needs the first for the second"
+        )
 
     unknown = set(flags) - declared - {"WASMTIME_DISABLE_ALL_FEATURES"}
     if unknown:

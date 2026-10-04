@@ -277,6 +277,101 @@ def test_an_undeclared_cmake_flag_fails(tmp_path, monkeypatch):
     assert error.value.code == 2
 
 
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "-DWASMTIME_FEATURE_COMPONENT_MODEL_ASYNC=0",
+        "-DWASMTIME_FEATURE_COMPONENT_MODEL_ASYNC=off",
+        "-DWASMTIME_FEATURE_COMPONENT_MODEL_ASYNC=FALSE",
+        "-DWASMTIME_FEATURE_COMPONENT_MODEL_ASYNC:BOOL=OFF",
+        "-DWASMTIME_FEATURE_COMPONENT_MODEL_ASYNC",
+        '-DWASMTIME_USER_CARGO_BUILD_OPTIONS="--features=all-arch"',
+    ],
+)
+def test_a_cmake_flag_that_does_not_map_fails(tmp_path, monkeypatch, flag):
+    """cmake reads all of these, so ignoring one changes what is linked."""
+    check = module()
+    makefile = tmp_path / "Makefile"
+    makefile.write_text(f"{flag} \\\n")
+    monkeypatch.setattr(check, "MAKEFILE", makefile)
+    tree = archive(
+        tmp_path,
+        check,
+        'set(WASMTIME_FEATURES "--no-default-features")\n'
+        "feature(component-model-async ON)\nfeature(all-arch OFF)\n",
+    )
+    with pytest.raises(SystemExit) as error:
+        check.read_features(tree)
+    assert error.value.code == 2
+
+
+def test_a_flag_in_a_comment_is_not_passed(tmp_path, monkeypatch):
+    check = module()
+    makefile = tmp_path / "Makefile"
+    makefile.write_text(
+        "# -DWASMTIME_FEATURE_WASI=OFF and -DWASMTIME_* would read as flags\n"
+        "\t# -DWASMTIME_FEATURE_NO_SUCH_THING=OFF\n"
+        "\t\t-DWASMTIME_FEATURE_WASI_HTTP=OFF \\\n"
+    )
+    monkeypatch.setattr(check, "MAKEFILE", makefile)
+    assert check.read_cmake_flags() == {"WASMTIME_FEATURE_WASI_HTTP": False}
+
+
+@pytest.mark.parametrize(
+    "flags, expected",
+    [
+        ("-DWASMTIME_FEATURE_COMPONENT_MODEL_ASYNC=OFF", ["component-model"]),
+        (
+            "-DWASMTIME_FEATURE_COMPONENT_MODEL_ASYNC=OFF "
+            "-DWASMTIME_FEATURE_COMPONENT_MODEL=OFF",
+            [],
+        ),
+    ],
+)
+def test_the_component_features_may_go_off_together(
+    tmp_path, monkeypatch, flags, expected
+):
+    check = module()
+    makefile = tmp_path / "Makefile"
+    makefile.write_text(flags + "\n")
+    monkeypatch.setattr(check, "MAKEFILE", makefile)
+    tree = archive(
+        tmp_path,
+        check,
+        'set(WASMTIME_FEATURES "--no-default-features")\n'
+        "feature(component-model ON)\nfeature(component-model-async ON)\n"
+        "feature(wasi ON)\n",
+    )
+    assert check.read_features(tree) == expected + ["wasi"]
+
+
+def test_async_without_the_component_model_fails(tmp_path, monkeypatch):
+    """cmake accepts this and cargo quietly builds the component model."""
+    check = module()
+    makefile = tmp_path / "Makefile"
+    makefile.write_text("-DWASMTIME_FEATURE_COMPONENT_MODEL=OFF\n")
+    monkeypatch.setattr(check, "MAKEFILE", makefile)
+    tree = archive(
+        tmp_path,
+        check,
+        'set(WASMTIME_FEATURES "--no-default-features")\n'
+        "feature(component-model ON)\nfeature(component-model-async ON)\n",
+    )
+    with pytest.raises(SystemExit) as error:
+        check.read_features(tree)
+    assert error.value.code == 2
+
+
+def test_the_makefile_builds_without_the_component_model():
+    """The wasm module loads core modules only, so the Makefile turns off what
+    it never uses.  Removing a flag below puts that code back in
+    libwasmtime.so without a failing test, so this one names them."""
+    flags = module().read_cmake_flags()
+    assert flags.get("WASMTIME_FEATURE_COMPONENT_MODEL") is False
+    assert flags.get("WASMTIME_FEATURE_COMPONENT_MODEL_ASYNC") is False
+    assert flags.get("WASMTIME_FEATURE_WASI_HTTP") is False
+
+
 def test_a_cargo_tree_listing_parses(tmp_path):
     """The shapes cargo tree --prefix=none actually prints."""
     check = module()
