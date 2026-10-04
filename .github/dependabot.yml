@@ -4,3 +4,62 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+
+  # Every Cargo.toml that has its own Cargo.lock.  tools/unitctl is one
+  # workspace, so its root covers the three member crates.  The tests build
+  # a copy of each test/wasm_component fixture with "cargo component build",
+  # which writes src/bindings.rs again.  The exports come from
+  # wasi::http::proxy::export!, so a bump cannot break a fixture through
+  # that file.
+  - package-ecosystem: cargo
+    directories:
+      - "/tools/unitctl"
+      - "/src/otel"
+      - "/src/wasm-wasi-component"
+      - "/pkg/eol"
+      - "/test/fake_otlp"
+      - "/test/fake_upstream"
+      - "/test/wasm_component/hello_world"
+      - "/test/wasm_component/spin_loop"
+    schedule:
+      interval: weekly
+    # The limit counts per directory, not for the whole block
+    # (https://github.com/dependabot/dependabot-core/issues/10395).  With the
+    # groups below, a directory needs one or two pull requests a week.
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "build(deps)"
+    # A group opens one pull request per directory, so test/fake_otlp gets
+    # its own otel pull request.  "group-by: dependency-name" would join the
+    # directories but split the otel crates, which must move together.
+    groups:
+      otel:
+        patterns:
+          - "opentelemetry*"
+          - "tonic*"
+          - "prost*"
+      # A group covers version updates only, so security updates need their
+      # own group to keep the otel crates together.
+      otel-security:
+        applies-to: security-updates
+        patterns:
+          - "opentelemetry*"
+          - "tonic*"
+          - "prost*"
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # Wasmtime is updated by hand.  Its version is also pinned in
+      # pkg/contrib/src/wasmtime/version, EOL.md and pkg/eol.json, which a
+      # Dependabot pull request cannot change.  It stays on the 48 LTS line.
+      # This also stops Dependabot security pull requests for Wasmtime; the
+      # weekly audit.yml run reports its advisories instead.
+      - dependency-name: "wasmtime*"
+      # bindgen 0.68 emitted opaque structs under clang 22; 0.72 is the
+      # tested version.  A 0.x minor can break, so bump it by hand.
+      - dependency-name: "bindgen"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
