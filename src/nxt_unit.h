@@ -493,6 +493,8 @@ int      nxt_unit_test_add_queue_port(nxt_unit_ctx_t *ctx, pid_t pid,
 #if (NXT_TESTS || NXT_FUZZ_BUILD)
 int      nxt_unit_test_process_msg(nxt_unit_ctx_t *ctx, const void *msg,
     size_t size, int fd);
+int      nxt_unit_test_process_shared_msg(nxt_unit_ctx_t *ctx,
+    const void *msg, size_t size, int fd);
 #endif
 
 

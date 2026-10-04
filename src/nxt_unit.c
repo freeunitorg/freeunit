@@ -72,6 +72,8 @@ static int nxt_unit_read_env(nxt_unit_port_t *ready_port,
     uint32_t *request_limit);
 static int nxt_unit_ready(nxt_unit_ctx_t *ctx, int ready_fd, uint32_t stream,
     int queue_fd);
+static int nxt_unit_process_read_msg(nxt_unit_ctx_t *ctx,
+    nxt_unit_read_buf_t *rbuf);
 static int nxt_unit_process_msg(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf,
     nxt_unit_request_info_t **preq);
 static int nxt_unit_process_new_port(nxt_unit_ctx_t *ctx,
@@ -116,6 +118,8 @@ static nxt_unit_read_buf_t *nxt_unit_read_buf_get(nxt_unit_ctx_t *ctx);
 static nxt_unit_read_buf_t *nxt_unit_read_buf_get_impl(
     nxt_unit_ctx_impl_t *ctx_impl);
 static void nxt_unit_read_buf_release(nxt_unit_ctx_t *ctx,
+    nxt_unit_read_buf_t *rbuf);
+static nxt_unit_read_buf_t *nxt_unit_read_buf_shrink(nxt_unit_ctx_t *ctx,
     nxt_unit_read_buf_t *rbuf);
 static nxt_unit_mmap_buf_t *nxt_unit_request_preread(
     nxt_unit_request_info_t *req, size_t size);
@@ -167,6 +171,8 @@ nxt_inline int nxt_unit_is_read_queue(nxt_unit_read_buf_t *rbuf);
 nxt_inline int nxt_unit_is_read_socket(nxt_unit_read_buf_t *rbuf);
 nxt_inline int nxt_unit_is_shm_ack(nxt_unit_read_buf_t *rbuf);
 nxt_inline int nxt_unit_is_quit(nxt_unit_read_buf_t *rbuf);
+nxt_inline int nxt_unit_is_mmap(nxt_unit_read_buf_t *rbuf);
+nxt_inline int nxt_unit_is_ordered(nxt_unit_read_buf_t *rbuf);
 nxt_inline int nxt_unit_is_socket_quit(nxt_unit_read_buf_t *rbuf);
 static int nxt_unit_process_port_msg_impl(nxt_unit_ctx_t *ctx,
     nxt_unit_port_t *port);
@@ -378,6 +384,8 @@ struct nxt_unit_read_buf_s {
     nxt_queue_link_t              link;
     nxt_unit_ctx_impl_t           *ctx_impl;
     ssize_t                       size;
+    /* A copy with only "size" bytes of buf; see nxt_unit_read_buf_shrink(). */
+    uint8_t                       shrunk;       /* 1 bit */
     nxt_recv_oob_t                oob;
     char                          buf[16384];
 };
@@ -394,6 +402,13 @@ struct nxt_unit_ctx_impl_s {
 
     nxt_atomic_t                  use_count;
     nxt_atomic_t                  wait_items;
+
+    /*
+     * The read buffers of this context that wait for a segment.  While
+     * there is one, the messages that keep their order wait behind it in
+     * pending_rbuf.
+     */
+    nxt_atomic_t                  parked;
 
     pthread_mutex_t               mutex;
 
@@ -846,6 +861,7 @@ nxt_unit_ctx_init(nxt_unit_impl_t *lib, nxt_unit_ctx_impl_t *ctx_impl,
 
     ctx_impl->use_count = 1;
     ctx_impl->wait_items = 0;
+    ctx_impl->parked = 0;
     ctx_impl->online = 1;
     ctx_impl->ready = 0;
     ctx_impl->quit_param = NXT_QUIT_GRACEFUL;
@@ -880,6 +896,7 @@ nxt_unit_ctx_init(nxt_unit_impl_t *lib, nxt_unit_ctx_impl_t *ctx_impl,
     nxt_queue_insert_tail(&ctx_impl->free_rbuf, &ctx_impl->ctx_read_buf.link);
 
     ctx_impl->ctx_read_buf.ctx_impl = ctx_impl;
+    ctx_impl->ctx_read_buf.shrunk = 0;
 
     ctx_impl->req.req.ctx = &ctx_impl->ctx;
     ctx_impl->req.req.unit = &lib->unit;
@@ -1134,6 +1151,57 @@ nxt_unit_ready(nxt_unit_ctx_t *ctx, int ready_fd, uint32_t stream, int queue_fd)
 }
 
 
+/*
+ * Processes a message just read from a port, unless an earlier message
+ * that keeps its order is still waiting: parked for a segment, or in
+ * pending_rbuf.  Then the message goes to the tail of pending_rbuf, and the
+ * caller's nxt_unit_process_pending_rbuf() takes it in order.  Before, it
+ * was processed at once, ahead of the earlier ones: a websocket frame in a
+ * mapped segment passed the frames that waited for a new segment, and a
+ * fragmented message lost its middle.
+ */
+
+static int
+nxt_unit_process_read_msg(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf)
+{
+    int                  wait;
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    if (!nxt_unit_is_ordered(rbuf)) {
+        return nxt_unit_process_msg(ctx, rbuf, NULL);
+    }
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    pthread_mutex_lock(&ctx_impl->mutex);
+
+    wait = ctx_impl->parked > 0
+           || !nxt_queue_is_empty(&ctx_impl->pending_rbuf);
+
+    pthread_mutex_unlock(&ctx_impl->mutex);
+
+    if (!wait) {
+        return nxt_unit_process_msg(ctx, rbuf, NULL);
+    }
+
+    /*
+     * Unlocked meanwhile.  Only the thread that reads the port of a
+     * context takes from its pending_rbuf, and nxt_unit_unpark_rbufs()
+     * puts buffers at the head.  So the tail is still the place of rbuf.
+     */
+
+    rbuf = nxt_unit_read_buf_shrink(ctx, rbuf);
+
+    pthread_mutex_lock(&ctx_impl->mutex);
+
+    nxt_queue_insert_tail(&ctx_impl->pending_rbuf, &rbuf->link);
+
+    pthread_mutex_unlock(&ctx_impl->mutex);
+
+    return NXT_UNIT_AGAIN;
+}
+
+
 static int
 nxt_unit_process_msg(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf,
     nxt_unit_request_info_t **preq)
@@ -1359,32 +1427,27 @@ done:
 #if (NXT_TESTS || NXT_FUZZ_BUILD)
 
 /*
- * Feeds one message through nxt_unit_process_msg() as if it had just been
- * read from a port of "ctx", then reads the buffers it made pending and
- * runs whatever request it made ready through callbacks.request_handler,
- * the way the read loops do.  "fd", when
- * not -1, arrives as the message's SCM_RIGHTS descriptor and is owned by
- * libunit from here on.  Used by src/test/nxt_unit_msg_test.c and
- * fuzzing/nxt_unit_msg_fuzz.c.
+ * Puts one message into a read buffer of "ctx", as if it had just been read
+ * from a port.  "fd", when not -1, arrives as the message's SCM_RIGHTS
+ * descriptor and is owned by libunit from here on.
  */
 
-int
-nxt_unit_test_process_msg(nxt_unit_ctx_t *ctx, const void *msg, size_t size,
+static nxt_unit_read_buf_t *
+nxt_unit_test_read_buf(nxt_unit_ctx_t *ctx, const void *msg, size_t size,
     int fd)
 {
-    int                  rc;
     struct cmsghdr       *cmsg;
     nxt_unit_read_buf_t  *rbuf;
 
     rbuf = nxt_unit_read_buf_get(ctx);
     if (nxt_slow_path(rbuf == NULL)) {
-        return NXT_UNIT_ERROR;
+        return NULL;
     }
 
     if (nxt_slow_path(size > sizeof(rbuf->buf))) {
         nxt_unit_read_buf_release(ctx, rbuf);
 
-        return NXT_UNIT_ERROR;
+        return NULL;
     }
 
     /* Deterministic bytes past the message, whatever the buffer held. */
@@ -1409,7 +1472,31 @@ nxt_unit_test_process_msg(nxt_unit_ctx_t *ctx, const void *msg, size_t size,
         rbuf->oob.size = CMSG_SPACE(sizeof(int));
     }
 
-    rc = nxt_unit_process_msg(ctx, rbuf, NULL);
+    return rbuf;
+}
+
+
+/*
+ * Feeds one message through nxt_unit_process_read_msg() as if it had just been
+ * read from a port of "ctx", then reads the buffers it made pending and
+ * runs whatever request it made ready through callbacks.request_handler,
+ * the way the read loops do.  Used by src/test/nxt_unit_msg_test.c and
+ * fuzzing/nxt_unit_msg_fuzz.c.
+ */
+
+int
+nxt_unit_test_process_msg(nxt_unit_ctx_t *ctx, const void *msg, size_t size,
+    int fd)
+{
+    int                  rc;
+    nxt_unit_read_buf_t  *rbuf;
+
+    rbuf = nxt_unit_test_read_buf(ctx, msg, size, fd);
+    if (nxt_slow_path(rbuf == NULL)) {
+        return NXT_UNIT_ERROR;
+    }
+
+    rc = nxt_unit_process_read_msg(ctx, rbuf);
 
     if (rc != NXT_UNIT_ERROR) {
         rc = nxt_unit_process_pending_rbuf(ctx);
@@ -1418,6 +1505,28 @@ nxt_unit_test_process_msg(nxt_unit_ctx_t *ctx, const void *msg, size_t size,
     nxt_unit_process_ready_req(ctx);
 
     return rc;
+}
+
+
+/*
+ * Feeds one message to nxt_unit_process_msg() at once, the way
+ * nxt_unit_run_shared() and nxt_unit_dequeue_request() do with a message
+ * from the shared port.  It does not wait behind a parked buffer, so a
+ * context can get more than one parked buffer this way.
+ */
+
+int
+nxt_unit_test_process_shared_msg(nxt_unit_ctx_t *ctx, const void *msg,
+    size_t size, int fd)
+{
+    nxt_unit_read_buf_t  *rbuf;
+
+    rbuf = nxt_unit_test_read_buf(ctx, msg, size, fd);
+    if (nxt_slow_path(rbuf == NULL)) {
+        return NXT_UNIT_ERROR;
+    }
+
+    return nxt_unit_process_msg(ctx, rbuf, NULL);
 }
 
 #endif
@@ -3299,6 +3408,7 @@ nxt_unit_read_buf_get_impl(nxt_unit_ctx_impl_t *ctx_impl)
 
     if (nxt_fast_path(rbuf != NULL)) {
         rbuf->ctx_impl = ctx_impl;
+        rbuf->shrunk = 0;
     }
 
     return rbuf;
@@ -3311,6 +3421,12 @@ nxt_unit_read_buf_release(nxt_unit_ctx_t *ctx,
 {
     nxt_unit_ctx_impl_t  *ctx_impl;
 
+    /* Too short to read into: it never goes to free_rbuf. */
+    if (rbuf->shrunk) {
+        nxt_unit_free(ctx, rbuf);
+        return;
+    }
+
     ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
 
     pthread_mutex_lock(&ctx_impl->mutex);
@@ -3318,6 +3434,43 @@ nxt_unit_read_buf_release(nxt_unit_ctx_t *ctx,
     nxt_queue_insert_head(&ctx_impl->free_rbuf, &rbuf->link);
 
     pthread_mutex_unlock(&ctx_impl->mutex);
+}
+
+
+/*
+ * A copy of rbuf with only the bytes of its message, for a message that
+ * waits in pending_rbuf.  A read buffer is over 16 KiB, and a websocket
+ * frame message is 28 bytes.  While a context waits for a segment, it
+ * reads on, and thousands of messages can wait: the Node.js websocket
+ * test held up to 28491 of them.  On an allocation failure, rbuf itself
+ * waits.
+ */
+
+static nxt_unit_read_buf_t *
+nxt_unit_read_buf_shrink(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf)
+{
+    size_t               size;
+    nxt_unit_read_buf_t  *copy;
+
+    if (nxt_slow_path(rbuf->shrunk || rbuf->size < 0
+                      || nxt_size_add(offsetof(nxt_unit_read_buf_t, buf),
+                                      (size_t) rbuf->size, &size)))
+    {
+        return rbuf;
+    }
+
+    copy = nxt_unit_malloc(ctx, size);
+    if (nxt_slow_path(copy == NULL)) {
+        return rbuf;
+    }
+
+    memcpy(copy, rbuf, size);
+
+    copy->shrunk = 1;
+
+    nxt_unit_read_buf_release(ctx, rbuf);
+
+    return copy;
 }
 
 
@@ -4772,6 +4925,19 @@ nxt_unit_wait_shm_ack(nxt_unit_ctx_t *ctx)
             break;
         }
 
+        /*
+         * A parked buffer may wait for this segment, and pending_rbuf is
+         * not processed while one does.
+         */
+        if (nxt_unit_is_mmap(rbuf)) {
+            res = nxt_unit_process_msg(ctx, rbuf, NULL);
+            if (nxt_slow_path(res == NXT_UNIT_ERROR)) {
+                return NXT_UNIT_ERROR;
+            }
+
+            continue;
+        }
+
         pthread_mutex_lock(&ctx_impl->mutex);
 
         nxt_queue_insert_tail(&ctx_impl->pending_rbuf, &rbuf->link);
@@ -5233,30 +5399,43 @@ nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd)
 
 /*
  * Hands the read buffers parked on a segment back to their contexts as
- * pending, so each context reads its message again.
+ * pending, so each context reads its message again.  A parked buffer was
+ * read before everything in the pending_rbuf of its context, so it goes to
+ * the head.  The list is walked from its tail, so the buffers of one
+ * context keep their order.  Walked from the head, they were replayed in
+ * reverse.  With the ordering in nxt_unit_process_read_msg(), a context has
+ * one parked buffer at most, except through nxt_unit_run_shared() and
+ * nxt_unit_dequeue_request(); the tail walk keeps the order there.
  */
 
 static void
 nxt_unit_unpark_rbufs(nxt_unit_ctx_t *ctx, nxt_queue_t *awaiting_rbuf)
 {
+    nxt_queue_link_t     *lnk, *prev;
     nxt_unit_ctx_impl_t  *ctx_impl;
     nxt_unit_read_buf_t  *rbuf;
 
-    nxt_queue_each(rbuf, awaiting_rbuf, nxt_unit_read_buf_t, link) {
+    for (lnk = nxt_queue_last(awaiting_rbuf);
+         lnk != nxt_queue_head(awaiting_rbuf);
+         lnk = prev)
+    {
+        prev = nxt_queue_prev(lnk);
 
+        rbuf = nxt_queue_link_data(lnk, nxt_unit_read_buf_t, link);
         ctx_impl = rbuf->ctx_impl;
 
         pthread_mutex_lock(&ctx_impl->mutex);
 
         nxt_queue_insert_head(&ctx_impl->pending_rbuf, &rbuf->link);
 
+        nxt_atomic_fetch_add(&ctx_impl->parked, -1);
+
         pthread_mutex_unlock(&ctx_impl->mutex);
 
         nxt_atomic_fetch_add(&ctx_impl->wait_items, -1);
 
         nxt_unit_awake_ctx(ctx, ctx_impl);
-
-    } nxt_queue_loop;
+    }
 }
 
 
@@ -5370,6 +5549,9 @@ nxt_unit_check_rbuf_mmap(nxt_unit_ctx_t *ctx, nxt_unit_mmaps_t *mmaps,
 
     nxt_queue_insert_tail(&mm->awaiting_rbuf, &rbuf->link);
 
+    /* Before the unlock: nxt_unit_unpark_rbufs() can take rbuf after it. */
+    nxt_atomic_fetch_add(&rbuf->ctx_impl->parked, 1);
+
     pthread_mutex_unlock(&mmaps->mutex);
 
     ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
@@ -5408,6 +5590,7 @@ nxt_unit_check_rbuf_mmap(nxt_unit_ctx_t *ctx, nxt_unit_mmaps_t *mmaps,
 
             if (res == NXT_UNIT_ERROR) {
                 nxt_atomic_fetch_add(&ctx_impl->wait_items, -1);
+                nxt_atomic_fetch_add(&rbuf->ctx_impl->parked, -1);
 
                 nxt_unit_unpark_rbufs(ctx, &awaiting_rbuf);
             }
@@ -5874,7 +6057,7 @@ nxt_unit_run_once_impl(nxt_unit_ctx_t *ctx)
         return rc;
     }
 
-    rc = nxt_unit_process_msg(ctx, rbuf, NULL);
+    rc = nxt_unit_process_read_msg(ctx, rbuf);
     if (nxt_slow_path(rc == NXT_UNIT_ERROR)) {
         return NXT_UNIT_ERROR;
     }
@@ -6052,34 +6235,48 @@ nxt_unit_chk_ready(nxt_unit_ctx_t *ctx)
 }
 
 
+/*
+ * Takes the buffers one at a time from the head, and stops while one of
+ * the context is parked for a segment: the rest were read after it.  The
+ * segment arrives in an MMAP message, and those are never left here
+ * behind a parked buffer: nxt_unit_process_read_msg() and
+ * nxt_unit_wait_shm_ack() process them at once.  Before, the whole queue
+ * was taken at once, and a buffer that parked again was passed by the
+ * ones after it.
+ */
+
 static int
 nxt_unit_process_pending_rbuf(nxt_unit_ctx_t *ctx)
 {
-    int                  rc;
-    nxt_queue_t          pending_rbuf;
+    int                  rc, processed;
+    nxt_queue_link_t     *lnk;
     nxt_unit_ctx_impl_t  *ctx_impl;
     nxt_unit_read_buf_t  *rbuf;
 
     ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
 
-    pthread_mutex_lock(&ctx_impl->mutex);
+    rc = NXT_UNIT_OK;
+    processed = 0;
 
-    if (nxt_queue_is_empty(&ctx_impl->pending_rbuf)) {
+    for ( ;; ) {
+        pthread_mutex_lock(&ctx_impl->mutex);
+
+        if (ctx_impl->parked > 0
+            || nxt_queue_is_empty(&ctx_impl->pending_rbuf))
+        {
+            pthread_mutex_unlock(&ctx_impl->mutex);
+
+            break;
+        }
+
+        lnk = nxt_queue_first(&ctx_impl->pending_rbuf);
+        nxt_queue_remove(lnk);
+
         pthread_mutex_unlock(&ctx_impl->mutex);
 
-        return NXT_UNIT_OK;
-    }
+        rbuf = nxt_queue_link_data(lnk, nxt_unit_read_buf_t, link);
 
-    nxt_queue_init(&pending_rbuf);
-
-    nxt_queue_add(&pending_rbuf, &ctx_impl->pending_rbuf);
-    nxt_queue_init(&ctx_impl->pending_rbuf);
-
-    pthread_mutex_unlock(&ctx_impl->mutex);
-
-    rc = NXT_UNIT_OK;
-
-    nxt_queue_each(rbuf, &pending_rbuf, nxt_unit_read_buf_t, link) {
+        processed = 1;
 
         if (nxt_fast_path(rc != NXT_UNIT_ERROR)) {
             rc = nxt_unit_process_msg(&ctx_impl->ctx, rbuf, NULL);
@@ -6087,10 +6284,9 @@ nxt_unit_process_pending_rbuf(nxt_unit_ctx_t *ctx)
         } else {
             nxt_unit_read_buf_release(ctx, rbuf);
         }
+    }
 
-    } nxt_queue_loop;
-
-    if (!ctx_impl->ready) {
+    if (processed && !ctx_impl->ready) {
         nxt_unit_quit(ctx, NXT_QUIT_GRACEFUL);
     }
 
@@ -6221,7 +6417,7 @@ nxt_unit_run_ctx(nxt_unit_ctx_t *ctx)
             goto retry;
         }
 
-        rc = nxt_unit_process_msg(ctx, rbuf, NULL);
+        rc = nxt_unit_process_read_msg(ctx, rbuf);
         if (nxt_slow_path(rc == NXT_UNIT_ERROR)) {
             break;
         }
@@ -6293,6 +6489,46 @@ nxt_unit_is_quit(nxt_unit_read_buf_t *rbuf)
     }
 
     return 0;
+}
+
+
+nxt_inline int
+nxt_unit_is_mmap(nxt_unit_read_buf_t *rbuf)
+{
+    nxt_port_msg_t  *port_msg;
+
+    if (nxt_fast_path(rbuf->size == (ssize_t) sizeof(nxt_port_msg_t))) {
+        port_msg = (nxt_port_msg_t *) rbuf->buf;
+
+        return port_msg->type == _NXT_PORT_MSG_MMAP;
+    }
+
+    return 0;
+}
+
+
+/*
+ * A request, its body, or a websocket frame: these are processed in the
+ * order the context read them.  The other messages are about the process,
+ * and are processed when read.  One of them, MMAP, brings the segment that
+ * a parked buffer waits for.
+ */
+
+nxt_inline int
+nxt_unit_is_ordered(nxt_unit_read_buf_t *rbuf)
+{
+    nxt_port_msg_t  *port_msg;
+
+    if (nxt_slow_path(rbuf->size < (ssize_t) sizeof(nxt_port_msg_t))) {
+        return 0;
+    }
+
+    port_msg = (nxt_port_msg_t *) rbuf->buf;
+
+    return port_msg->mmap
+           || port_msg->type == _NXT_PORT_MSG_REQ_HEADERS
+           || port_msg->type == _NXT_PORT_MSG_REQ_BODY
+           || port_msg->type == _NXT_PORT_MSG_WEBSOCKET;
 }
 
 
@@ -6578,7 +6814,7 @@ recv:
         return rc;
     }
 
-    rc = nxt_unit_process_msg(ctx, rbuf, NULL);
+    rc = nxt_unit_process_read_msg(ctx, rbuf);
     if (nxt_slow_path(rc == NXT_UNIT_ERROR)) {
         return NXT_UNIT_ERROR;
     }
