@@ -22,6 +22,17 @@ problem.
 
 <change type="bugfix">
 <para>
+the worker of a wasm application crashed when the guest called the import
+nxt_wasm_send_response, nxt_wasm_send_headers or nxt_wasm_response_end before
+the first request.  This could happen in the start function or "_initialize"
+of the guest, in the malloc handler, or in the module_init hook.  These
+imports now trap when the worker has no request yet.  The worker then does
+not start, except in the hook, where the trap ends only the hook.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 the wasm module took any export with a handler name as a function.  If that
 export was not a function, such as a global or a memory, the worker crashed on
 the first call of the handler.  The module now refuses such a guest when the
