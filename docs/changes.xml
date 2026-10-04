@@ -20,6 +20,15 @@ problem.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+the wasm module took any export with a handler name as a function.  If that
+export was not a function, such as a global or a memory, the worker crashed on
+the first call of the handler.  The module now refuses such a guest when the
+worker starts.
+</para>
+</change>
+
 </changes>
 
 

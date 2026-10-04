@@ -281,6 +281,14 @@ nxt_wasmtime_get_function_exports(nxt_wasm_ctx_t *ctx)
                                  ctx->fh[i].func_name);
             return -1;
         }
+
+        if (item.kind != WASMTIME_EXTERN_FUNC) {
+            nxt_wasmtime_err_msg(NULL, NULL,
+                                 "module export (%s) is not a function",
+                                 ctx->fh[i].func_name);
+            return -1;
+        }
+
         ctx->fh[i].func = item.of.func;
     }
 

@@ -104,3 +104,14 @@ def test_wasm_malloc_unaligned(wait_for_record):
 
     record = r'malloc handler returned offset \d+ that is not aligned'
     assert wait_for_record(record) is not None
+
+
+# The guest exports "__heap_base" as a global and "memory" as a memory.
+@pytest.mark.parametrize('handler', ['__heap_base', 'memory'])
+def test_wasm_handler_not_function(handler, wait_for_record):
+    client.load('hello', malloc_handler=handler)
+
+    assert client.get()['status'] == 503
+
+    record = rf'module export \({handler}\) is not a function'
+    assert wait_for_record(record) is not None
