@@ -1,8 +1,8 @@
 # Fast local build — uses pre-built builder image (no apt/Rust download).
-# Builder: ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1
+# Builder: ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.95.0
 # (same as minimal — wasmtime Rust build is included in that builder)
 
-FROM ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1 AS build
+FROM ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.95.0 AS build
 
 RUN set -ex \
     && mkdir -p /usr/lib/unit/modules /usr/lib/unit/debug-modules \

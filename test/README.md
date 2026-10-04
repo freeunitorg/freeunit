@@ -53,7 +53,7 @@ build tools.
 ```
 
 The script (`test/run-local.sh`) builds a `freeunit-test:local` image
-mirroring `pkg/docker/template.Dockerfile` (Debian trixie, Rust 1.94.1,
+mirroring `pkg/docker/template.Dockerfile` (Debian trixie, Rust 1.95.0,
 njs 0.9.6, system libssl-dev). Source code is mounted via Docker volume,
 so changes on the host are immediately reflected. The container then
 builds FreeUnit with `--tests --openssl --njs --zlib --zstd --brotli --otel`,
@@ -70,12 +70,12 @@ docker rmi freeunit-test:local
 `run-local.sh` builds a full test image from scratch (downloads Rust, Go, njs)
 — slow for tight iteration. For prototyping a **proxy / TLS** test (no language
 runtime needed), reuse the pre-built builder image
-`ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1` (Rust + all C build
+`ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.95.0` (Rust + all C build
 deps already baked in) and just mount the working tree. Build + run is ~30 s:
 
 ```bash
 docker run --rm --privileged -v "$(pwd):/unit" -w /unit \
-  ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1 bash -c '
+  ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.95.0 bash -c '
     apt-get update -qq && apt-get install -y -qq python3-pytest python3-openssl
     ./configure --openssl --tests
     make -j"$(nproc)" unitd

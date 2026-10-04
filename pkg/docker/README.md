@@ -166,8 +166,8 @@ Builder images (`Dockerfile.builder-*`) are pulled from GHCR automatically, or
 built locally on first use if unavailable:
 
 ```
-Dockerfile.builder-trixie   →  ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1
-Dockerfile.builder-php8.5   →  ghcr.io/freeunitorg/freeunit-builder:php8.5-rust1.94.1
+Dockerfile.builder-trixie   →  ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.95.0
+Dockerfile.builder-php8.5   →  ghcr.io/freeunitorg/freeunit-builder:php8.5-rust1.95.0
 ```
 
 The `local/` subdirectory contains the corresponding multi-stage Dockerfiles used

@@ -3,6 +3,7 @@ name = "unit-client-rs"
 version = "1.36.1"
 authors = ["Elijah Zupancic"]
 edition = "2021"
+rust-version = "1.95"
 license = "Apache-2.0"
 
 [lib]

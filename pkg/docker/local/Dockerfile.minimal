@@ -1,11 +1,11 @@
 # Fast local build — uses pre-built builder image (no apt/Rust download).
 # Build builder first:
-#   docker build -t ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1 \
+#   docker build -t ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.95.0 \
 #     -f ../Dockerfile.builder-trixie ..
 # Then build this variant:
 #   ../build-local.sh -b minimal
 
-FROM ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1 AS build
+FROM ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.95.0 AS build
 
 RUN set -ex \
     && mkdir -p /usr/lib/unit/modules /usr/lib/unit/debug-modules \
