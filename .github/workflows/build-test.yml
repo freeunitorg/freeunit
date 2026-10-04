@@ -58,7 +58,7 @@ jobs:
       - uses: actions/checkout@v5
       - name: Derive build list from pkg/eol.json
         id: list
-        # Slow legs come first in the list.  All 23 legs are created at
+        # Slow legs come first in the list.  All 25 legs are created at
         # once.  The hosted runner pool is smaller than the matrix, so some
         # legs wait for a runner.  GitHub does not promise to start legs in
         # matrix order.  Two runs (36318226905 and 36322425869) showed no
@@ -924,12 +924,15 @@ jobs:
       # check_prerequisites() skips the whole file when the clang/wasi-sysroot
       # fixture cannot be built, so an incomplete toolchain would leave this
       # leg green while it covers nothing.  At least one smoke test must have
-      # actually passed.
+      # actually passed.  The wasm-wasi-component leg has the same trap: a
+      # failed "cargo component build" turns into a missing cargo_component
+      # feature, and test_wasm-wasi-component.py skips as a whole.
       - name: Fail if the wasm smoke test skipped
-        if: ${{ !cancelled() && steps.metadata.outputs.module == 'wasm' }}
+        if: ${{ !cancelled() && (steps.metadata.outputs.module == 'wasm' || steps.metadata.outputs.module == 'wasm-wasi-component') }}
         run: |
-          grep -qE 'test_wasm\.py::.*PASSED' "$RUNNER_TEMP/pytest.out" || {
-            echo "no test_wasm.py test passed; the guest toolchain skipped it:" >&2
+          file="test_${{ steps.metadata.outputs.module }}.py"
+          grep -qE "${file//./\\.}::.*PASSED" "$RUNNER_TEMP/pytest.out" || {
+            echo "no $file test passed; the guest toolchain skipped it:" >&2
             grep -E 'SKIPPED|feature' "$RUNNER_TEMP/pytest.out" >&2 || true
             exit 1
           }
