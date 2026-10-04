@@ -161,6 +161,10 @@ NXT_EXPORT nxt_uint_t nxt_cgroup_cpu_max_parse(const u_char *p, size_t len);
 NXT_EXPORT void nxt_cgroup_mountinfo_unescape(char *s);
 NXT_EXPORT const char *nxt_cgroup_relative_path(const char *cgroup,
     const char *root);
+NXT_EXPORT nxt_int_t nxt_cgroup_mountinfo_parse(char *line, char **root,
+    char **mnt);
+NXT_EXPORT nxt_uint_t nxt_cgroup_cpu_limit_walk(char *dir, size_t base,
+    nxt_uint_t (*reader)(const char *dir, void *data), void *data);
 
 
 NXT_EXPORT extern nxt_uint_t    nxt_ncpu;
