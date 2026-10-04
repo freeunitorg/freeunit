@@ -10,6 +10,19 @@
          date="2026-10-04" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="change">
+<para>
+the Wasmtime library of the wasm module is now built without the component
+model.  The module loads core WebAssembly modules only and never called the
+component API.  libwasmtime.so shrinks from 32.4 MB to 23.6 MB and no longer
+exports the 156 wasmtime_component_* functions.  The packages install
+libwasmtime.so in the system library directory.  A program other than FreeUnit
+that links that file and calls the component API, or the
+wasmtime_config_wasm_component_model_* options, no longer loads.  The
+wasm-wasi-component module is not affected.
+</para>
+</change>
+
 </changes>
 
 
