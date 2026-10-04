@@ -403,9 +403,10 @@ def test_static_compression_vary_merge_identity(temp_dir, configured, expected):
 # needs a language-module test, not a static one.
 
 
-def _raw_get(url='/big.css', **headers):
+def _raw_get(url='/big.css', method='GET', **headers):
     # Raw bytes: the body has to be decompressed, so it must not be decoded.
-    raw = client.get(
+    raw = client.http(
+        method,
         url=url,
         headers={'Host': 'localhost', 'Connection': 'close', **headers},
         encoding='latin-1',
@@ -422,6 +423,14 @@ def _raw_get(url='/big.css', **headers):
         body = client._parse_chunked_body(body)
 
     return status, hdrs, body
+
+
+def _age(path):
+    # The ETag of a file written in the current second is weak by design
+    # (see test_static.py).  Move the mtime back, so that a weak ETag can
+    # come only from compression.
+    when = os.stat(path).st_mtime - 10
+    os.utime(path, (when, when))
 
 
 def test_static_compression_range_identity_refused(temp_dir):
@@ -886,3 +895,201 @@ def test_static_compression_malformed_weight(temp_dir):
     status, headers, _ = _raw_get(**{'Accept-Encoding': 'gzip;q=0.5;ext=1'})
     assert status == 200
     assert headers.get('Content-Encoding') == 'gzip', 'q=0.5 then an extension'
+
+
+def _precompressed(temp_dir, response_headers):
+    # A precompressed copy served as "$uri.gz", the usual way to serve such
+    # files with Unit.  No "types": the ".gz" extension has no media type.
+    # So every coding in "compressors" applies to it, as in issue 557.
+    stored = gzip.compress(b'body{color:red}' * 500)
+    Path(f'{temp_dir}/assets/pre.css.gz').write_bytes(stored)
+    _age(f'{temp_dir}/assets/pre.css.gz')
+
+    assert 'success' in client.conf(
+        {"compressors": [{"encoding": "gzip", "level": 5}]},
+        'settings/http/compression',
+    ), 'compression without types'
+
+    action = {"share": f'{temp_dir}/assets$uri.gz'}
+
+    if response_headers is not None:
+        action["response_headers"] = response_headers
+
+    assert 'success' in client.conf(action, 'routes/0/action'), 'action'
+
+    return stored
+
+
+@pytest.mark.parametrize('name', ['Content-Encoding', 'content-encoding'])
+def test_static_compression_response_headers_content_encoding(temp_dir, name):
+    # https://github.com/freeunitorg/freeunit/issues/557: "response_headers"
+    # are applied after the compressor ran.  Their Content-Encoding replaced
+    # the one the compressor added, so the stored gzip bytes went out coded
+    # a second time under a single "gzip", with a weakened ETag.
+    stored = _precompressed(
+        temp_dir, {"Content-Type": "text/css", name: "gzip"}
+    )
+
+    for method in ('GET', 'HEAD'):
+        status, headers, body = _raw_get(
+            url='/pre.css', method=method, **{'Accept-Encoding': 'gzip'}
+        )
+
+        assert status == 200, f'{method} status'
+        assert headers[name] == 'gzip', f'{method} the configured coding'
+        assert headers['Content-Length'] == str(len(stored)), (
+            f'{method} the stored length'
+        )
+        assert not headers['ETag'].startswith('W/'), f'{method} strong ETag'
+
+        if method == 'GET':
+            assert body == stored, 'the stored bytes, coded once'
+            assert gzip.decompress(body) == b'body{color:red}' * 500
+
+
+def test_static_compression_precompressed_control(temp_dir):
+    # The same share without a configured Content-Encoding is still
+    # compressed.  So the test above passes because of the configured
+    # field, not because this share is never compressed.
+    stored = _precompressed(temp_dir, {"Content-Type": "text/css"})
+
+    status, headers, body = _raw_get(
+        url='/pre.css', **{'Accept-Encoding': 'gzip'}
+    )
+
+    assert status == 200, 'status'
+    assert headers['Content-Encoding'] == 'gzip', 'compressed'
+    assert headers['ETag'].startswith('W/'), 'weak ETag for the coded copy'
+    assert gzip.decompress(body) == stored, 'gzip of the stored bytes'
+
+
+def test_static_compression_response_headers_content_encoding_removed(
+    temp_dir,
+):
+    # A null value removes the field.  The compressor must then not run,
+    # or the gzip bytes go out with no Content-Encoding at all.  The body is
+    # identity, so a client that refused identity still gets a 406.
+    _age(f'{temp_dir}/assets/big.css')
+
+    assert 'success' in client.conf(
+        {
+            "share": f'{temp_dir}/assets$uri',
+            "response_headers": {"Content-Encoding": None},
+        },
+        'routes/0/action',
+    ), 'configure'
+
+    status, headers, body = _raw_get(**{'Accept-Encoding': 'gzip'})
+
+    assert status == 200, 'status'
+    assert 'Content-Encoding' not in headers, 'removed'
+    assert headers['Content-Length'] == '7500', 'the identity length'
+    assert body == b'body{color:red}' * 500, 'identity bytes'
+    assert not headers['ETag'].startswith('W/'), 'strong ETag'
+
+    status, _, _ = _raw_get(**{'Accept-Encoding': 'gzip, identity;q=0'})
+
+    assert status == 406, 'identity refused'
+
+
+def test_static_compression_response_headers_content_encoding_template(
+    temp_dir,
+):
+    # A template value is resolved when compression is decided, with the
+    # same code that later sets the field.  A value that is not safe in a
+    # field is never sent.  So it must not keep the compressor out either,
+    # or the body goes out with no Content-Encoding to a client that
+    # refused identity.
+    stored = _precompressed(
+        temp_dir, {"Content-Type": "text/css", "Content-Encoding": "$arg_c"}
+    )
+
+    status, headers, body = _raw_get(
+        url='/pre.css?c=gzip', **{'Accept-Encoding': 'gzip'}
+    )
+
+    assert status == 200, 'status'
+    assert headers['Content-Encoding'] == 'gzip', 'the configured coding'
+    assert body == stored, 'the stored bytes, coded once'
+
+    status, headers, body = _raw_get(
+        url='/pre.css?c=gzip%0d%0a',
+        **{'Accept-Encoding': 'gzip, identity;q=0'},
+    )
+
+    assert status == 200, 'unsafe value: status'
+    assert headers.get('Content-Encoding') == 'gzip', 'the compressor coding'
+    assert gzip.decompress(body) == stored, 'gzip of the stored bytes'
+
+
+def test_static_compression_response_headers_content_encoding_skipped_key(
+    temp_dir,
+):
+    # Keys are applied in order, and an unsafe value skips its key.  So the
+    # result comes from the last key that is not skipped: here the null,
+    # which removes the field.  The body is identity, and a client that
+    # refused identity gets 406.
+    _precompressed(
+        temp_dir,
+        {
+            "Content-Type": "text/css",
+            "Content-Encoding": None,
+            "content-encoding": "$arg_c",
+        },
+    )
+
+    status, _, _ = _raw_get(
+        url='/pre.css?c=gzip%0d%0a',
+        **{'Accept-Encoding': 'gzip, identity;q=0'},
+    )
+
+    assert status == 406, 'identity refused'
+
+
+def test_static_compression_response_headers_content_encoding_empty(
+    temp_dir,
+):
+    # "$arg_c" with no "c" argument expands to an empty string, as "?c="
+    # does.  An empty string is a value, not a removal: the field is sent
+    # empty, nothing is compressed, and a client that refused identity gets
+    # no 406.
+    stored = _precompressed(
+        temp_dir, {"Content-Type": "text/css", "Content-Encoding": "$arg_c"}
+    )
+
+    for url, accept in (
+        ('/pre.css', 'gzip, identity;q=0'),
+        ('/pre.css?c=', 'gzip'),
+    ):
+        status, headers, body = _raw_get(
+            url=url, **{'Accept-Encoding': accept}
+        )
+
+        assert status == 200, f'{url} status'
+        assert headers['Content-Encoding'] == '', f'{url} an empty field'
+        assert body == stored, f'{url} the stored bytes'
+
+
+def test_static_compression_response_headers_content_encoding_resolved_once(
+    temp_dir,
+):
+    # The check resolves the value, and the header gets that same value.
+    # "$response_header_*" is not cached, and the static handler adds
+    # Accept-Ranges only after the check.  A second resolution at send
+    # would give "bytes" here.
+    stored = _precompressed(
+        temp_dir,
+        {
+            "Content-Type": "text/css",
+            "Content-Encoding": "$response_header_accept_ranges",
+        },
+    )
+
+    status, headers, body = _raw_get(
+        url='/pre.css', **{'Accept-Encoding': 'gzip'}
+    )
+
+    assert status == 200, 'status'
+    assert headers['Accept-Ranges'] == 'bytes', 'Accept-Ranges is sent'
+    assert headers['Content-Encoding'] == '', 'the value of the check'
+    assert body == stored, 'the stored bytes'

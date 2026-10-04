@@ -1261,6 +1261,23 @@ static path reported the 406.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a "Content-Encoding" set with "response_headers" no longer makes the body
+coded twice.  With a compressor configured, the response was compressed first,
+and "response_headers" then replaced the "Content-Encoding" of the compressor.
+So a share of "$uri.gz" with "Content-Encoding: gzip" sent gzip of the stored
+gzip file to a client that accepts gzip, with a weak ETag.  Now such a
+response is not compressed, as with a "Content-Encoding" from an application.
+This applies to static files and to application responses.  A
+"Content-Encoding" removed with null in "response_headers" also keeps the
+compressor out, so bytes that Unit compressed are no longer sent without a
+"Content-Encoding".  Such a response is identity, so a client that refused
+identity gets "406 Not Acceptable".  For a response that has its own
+"Content-Encoding", the null still removes only the field, as before.
+</para>
+</change>
+
 <change type="change">
 <para>
 unitd, libunit.a and the language modules no longer contain the test hooks

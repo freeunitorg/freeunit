@@ -65,6 +65,18 @@ typedef enum {
 } nxt_http_te_t;
 
 
+/* What "response_headers" will do to one response field. */
+typedef enum {
+    NXT_HTTP_SET_HEADER_NONE = 0,
+    NXT_HTTP_SET_HEADER_REPLACE,
+    NXT_HTTP_SET_HEADER_REMOVE,
+    NXT_HTTP_SET_HEADER_ERROR,
+} nxt_http_set_header_op_t;
+
+
+typedef struct nxt_http_set_headers_ctx_s  nxt_http_set_headers_ctx_t;
+
+
 typedef enum {
     NXT_HTTP_PROTO_H1 = 0,
     NXT_HTTP_PROTO_H2,
@@ -240,6 +252,7 @@ struct nxt_http_request_s {
 
     nxt_tstr_query_t                *tstr_query;
     nxt_tstr_cache_t                tstr_cache;
+    nxt_http_set_headers_ctx_t      *set_headers;
 
     nxt_http_action_t               *action;
     void                            *req_rpc_data;
@@ -509,6 +522,8 @@ nxt_int_t nxt_http_rewrite_init(nxt_router_conf_t *rtcf,
 nxt_int_t nxt_http_rewrite(nxt_task_t *task, nxt_http_request_t *r);
 
 nxt_bool_t nxt_http_set_headers_override_validators(nxt_http_request_t *r);
+nxt_http_set_header_op_t nxt_http_set_headers_field_op(nxt_http_request_t *r,
+    const char *name, size_t length);
 nxt_int_t nxt_http_comp_merge_vary(nxt_http_request_t *r);
 nxt_int_t nxt_http_set_headers_init(nxt_router_conf_t *rtcf,
     nxt_http_action_t *action, nxt_http_action_conf_t *acf);

@@ -337,3 +337,139 @@ def test_python_compression_app_timeout(encoding):
     time.sleep(1)
 
     assert check(2001, encoding, decode) is None, 'response after the timeout'
+
+
+# Large enough to reach the router through shared memory, so the compressor
+# takes it (see test_php_compression.py and issue 162 for small bodies).
+BODY = gzip.compress(b'A' * 100000, compresslevel=0)
+
+
+def post(body, url='/', accept='gzip', timeout=30):
+    # The "variables" application echoes the request body with the request's
+    # Content-Type.  It needs a Custom-Header to build its response.  Raw
+    # socket: the response body must not be decoded.
+    sock = socket.create_connection(('127.0.0.1', 8080), timeout)
+    sock.settimeout(timeout)
+
+    try:
+        sock.sendall(
+            f'POST {url} HTTP/1.1\r\n'
+            f'Host: localhost\r\n'
+            f'Content-Type: text/plain\r\n'
+            f'Custom-Header: 557\r\n'
+            f'Content-Length: {len(body)}\r\n'
+            f'Accept-Encoding: {accept}\r\n'
+            f'Connection: close\r\n\r\n'.encode()
+            + body
+        )
+
+        chunks = []
+        while True:
+            data = sock.recv(256 * 1024)
+            if not data:
+                break
+            chunks.append(data)
+
+    finally:
+        sock.close()
+
+    head, _, data = b''.join(chunks).partition(b'\r\n\r\n')
+    lines = head.split(b'\r\n')
+
+    headers = {}
+    for line in lines[1:]:
+        name, _, value = line.partition(b':')
+        headers[name.strip().decode()] = value.strip().decode()
+
+    if headers.get('Transfer-Encoding') == 'chunked':
+        data = dechunk(data)
+
+    return int(lines[0].split()[1]), headers, data
+
+
+def configure(response_headers, app='variables'):
+    client.load(app)
+
+    action = {"pass": f"applications/{app}"}
+
+    if response_headers is not None:
+        action["response_headers"] = response_headers
+
+    assert 'success' in client.conf(
+        {
+            "http": {
+                "compression": {
+                    "compressors": [{"encoding": "gzip", "level": 1}]
+                }
+            }
+        },
+        'settings',
+    ), 'compression'
+    assert 'success' in client.conf([{"action": action}], 'routes'), 'routes'
+    assert 'success' in client.conf(
+        {"*:8080": {"pass": "routes"}}, 'listeners'
+    ), 'listeners'
+
+
+def test_python_compression_control():
+    # Without a configured Content-Encoding, the echoed body is compressed.
+    # So the test below passes because of the configured field.
+    configure(None)
+
+    status, headers, body = post(BODY)
+
+    assert status == 200, 'status'
+    assert headers.get('Content-Encoding') == 'gzip', 'compressed'
+    assert gzip.decompress(body) == BODY, 'gzip of the echoed bytes'
+
+
+def test_python_compression_response_headers_content_encoding():
+    # https://github.com/freeunitorg/freeunit/issues/557, application path.
+    # The application sends bytes that are already gzip, and the action
+    # names their coding in "response_headers".  The compressor must not
+    # code them again: that Content-Encoding replaces the compressor's.
+    configure({"Content-Encoding": "gzip"})
+
+    status, headers, body = post(BODY)
+
+    assert status == 200, 'status'
+    assert headers.get('Content-Encoding') == 'gzip', 'the configured coding'
+    assert len(body) == len(BODY), 'the application length'
+    assert body == BODY, 'the application bytes, coded once'
+
+
+def test_python_compression_response_headers_content_encoding_template():
+    # A template value that is not safe in a field is never sent.  So it
+    # must not keep the compressor out.  Otherwise the body goes out with no
+    # Content-Encoding to a client that refused identity.
+    configure({"Content-Encoding": "$arg_c"})
+
+    status, headers, body = post(BODY, url='/?c=gzip')
+
+    assert status == 200, 'status'
+    assert headers.get('Content-Encoding') == 'gzip', 'the configured coding'
+    assert body == BODY, 'the application bytes, coded once'
+
+    status, headers, body = post(
+        BODY, url='/?c=gzip%0d%0a', accept='gzip, identity;q=0'
+    )
+
+    assert status == 200, 'unsafe value: status'
+    assert headers.get('Content-Encoding') == 'gzip', 'the compressor coding'
+    assert gzip.decompress(body) == BODY, 'gzip of the echoed bytes'
+
+
+def test_python_compression_app_coding_removed_is_not_coded_again():
+    # The application codes its own body and sends its own Content-Encoding.
+    # A null Content-Encoding in "response_headers" then removes only the
+    # field.  The removal rule is for a coding that Unit would apply, so it
+    # does not apply here: the bytes are not coded again, and a client that
+    # refused identity gets no 406.
+    configure({"Content-Encoding": None}, app='content_encoding')
+
+    for accept in ('gzip', 'gzip, identity;q=0'):
+        status, headers, body = post(BODY, accept=accept)
+
+        assert status == 200, f'{accept}: status'
+        assert 'Content-Encoding' not in headers, f'{accept}: removed'
+        assert body == BODY, f'{accept}: the application bytes'

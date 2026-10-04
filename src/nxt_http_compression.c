@@ -1307,11 +1307,12 @@ nxt_http_comp_not_acceptable(nxt_http_request_t *r)
 nxt_int_t
 nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
 {
-    bool                  identity_refused;
-    nxt_int_t             ret, idx;
-    nxt_str_t             accept_encoding, mime_type = {};
-    nxt_http_comp_ctx_t   *ctx;
-    nxt_http_comp_conf_t  *conf = nxt_http_comp_request_conf(r);
+    bool                      identity_refused;
+    nxt_int_t                 ret, idx;
+    nxt_str_t                 accept_encoding, mime_type = {};
+    nxt_http_comp_ctx_t       *ctx;
+    nxt_http_comp_conf_t      *conf = nxt_http_comp_request_conf(r);
+    nxt_http_set_header_op_t  conf_op;
 
     /*
      * No context means no compression.  A context from an earlier call is
@@ -1350,6 +1351,39 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
         return NXT_OK;
     }
 
+    /*
+     * "response_headers" are applied after this, when the header is sent.
+     * A Content-Encoding there then replaces the one that a compressor adds,
+     * or removes it.  Both make a coded body wrong: coded twice under one
+     * coding name, or coded under no name at all (#557).
+     *
+     * A value means that the operator says the body is already coded.  This
+     * is the usual way to serve a precompressed file.  It is the same case
+     * as a Content-Encoding in the response, so it returns here too.
+     *
+     * A null value removes the field.  The body then has no coding, so it is
+     * identity, and a refusal of identity is still answered below.  Only the
+     * compressor is kept out.  This applies only to a coding that Unit would
+     * apply.  A response that has its own Content-Encoding returned above,
+     * and a null value then only removes that field from the coded body.
+     *
+     * A template value is resolved now, once for the request.  A variable
+     * that is not set gives an empty string, and an empty string is a value.
+     * A value that is not safe in a field is not sent, so it counts as
+     * absent.
+     */
+
+    conf_op = nxt_http_set_headers_field_op(r, "Content-Encoding",
+                                            nxt_length("Content-Encoding"));
+
+    if (nxt_slow_path(conf_op == NXT_HTTP_SET_HEADER_ERROR)) {
+        return NXT_ERROR;
+    }
+
+    if (conf_op == NXT_HTTP_SET_HEADER_REPLACE) {
+        return NXT_OK;
+    }
+
     ret = nxt_http_comp_accept_encoding(r, &accept_encoding);
     if (nxt_slow_path(ret != NXT_OK)) {
         return NXT_ERROR;
@@ -1368,6 +1402,10 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
                                           &identity_refused);
     if (idx == -1) {
         return nxt_http_comp_not_acceptable(r);
+    }
+
+    if (conf_op == NXT_HTTP_SET_HEADER_REMOVE) {
+        return identity_refused ? nxt_http_comp_not_acceptable(r) : NXT_OK;
     }
 
     /*
