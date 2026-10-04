@@ -224,6 +224,25 @@ Changes with FreeUnit 1.36.2                                     30 Aug 2026
        such a response gave 502 when it carried chunked together with
        Content-Length.
 
+    *) Change: ".svgz" added to the default MIME type list as
+       "image/svg+xml". A share "types" rule that names image/svg+xml or
+       image/* now matches a .svgz file; before, the file had no type and
+       such a rule refused it.
+
+    *) Feature: a static ".svgz" file is served as "image/svg+xml" with
+       "Content-Encoding: gzip". Before, it had no Content-Type, and a
+       browser did not show it. The stored gzip bytes are sent
+       unchanged: compression does not code them again, the ETag stays
+       strong, and a Range applies to the stored bytes. A client without
+       gzip in Accept-Encoding also gets the gzip bytes, as with
+       "AddEncoding gzip svgz" in Apache. A "mime_types" setting that
+       maps ".svgz" to another type adds no coding. The ETag of a .svgz
+       file ends in "-gzip", so a cache that stored the old response
+       gets a full response, not a 304. A .svgz file never answers 304
+       to If-Modified-Since, and a date in If-Range never resumes it, so
+       a client that revalidates by date only downloads the file again
+       each time.
+
     *) Feature: the "body_min_rate" and "send_min_rate" options in
        "settings/http" set a minimum client rate in bytes per second.
        The body_read_timeout and send_timeout timers start again after

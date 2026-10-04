@@ -1,4 +1,5 @@
 import gzip
+import os
 import zlib
 from pathlib import Path
 
@@ -442,6 +443,60 @@ def test_static_compression_range_identity_refused(temp_dir):
     assert headers.get('Content-Encoding') == 'gzip', 'served as gzip'
     assert 'Content-Range' not in headers, 'no Content-Range on the full 200'
     assert gzip.decompress(body) == data, 'the whole file, correctly coded'
+
+
+def test_static_compression_svgz_not_compressed_twice(temp_dir):
+    # A ".svgz" file already has gzip coding.  With every type compressed,
+    # it must still go out as its stored bytes: one gzip layer, a strong
+    # ETag, and no Vary, because the coding is not negotiated.  Before, it
+    # had no type, so it was compressed again and labelled with one "gzip".
+    svg = b'<svg xmlns="http://www.w3.org/2000/svg"/>' * 10
+    data = gzip.compress(svg, mtime=0)
+    path = f'{temp_dir}/assets/a.svgz'
+    Path(path).write_bytes(data)
+    when = os.stat(path).st_mtime - 2
+    os.utime(path, (when, when))
+
+    assert 'success' in client.conf_delete(
+        'settings/http/compression/types'
+    ), 'compress every type'
+
+    status, headers, body = _raw_get(
+        url='/a.svgz', **{'Accept-Encoding': 'gzip'}
+    )
+    assert status == 200
+    assert headers.get('Content-Type') == 'image/svg+xml'
+    assert headers.get('Content-Encoding') == 'gzip'
+    assert body == data, 'the stored bytes, not compressed again'
+    assert gzip.decompress(body) == svg
+    assert not headers['ETag'].startswith('W/'), 'strong ETag'
+    assert 'Vary' not in headers
+
+    # "identity;q=0" does not drop the Range: the file is not sent as
+    # identity, and the slice is of the gzip bytes.
+    status, headers, body = _raw_get(
+        url='/a.svgz',
+        **{'Accept-Encoding': 'gzip, identity;q=0', 'Range': 'bytes=0-9'},
+    )
+    assert status == 206
+    assert headers.get('Content-Encoding') == 'gzip'
+    assert headers['Content-Range'] == f'bytes 0-9/{len(data)}'
+    assert body == data[:10]
+
+    # A client that accepts no coding still gets the gzip bytes, with 200.
+    # This is intended: no other representation of the file exists.  For a
+    # file that can be sent as identity, the second header gives 406.
+    for accept in ('identity;q=0', 'identity;q=0, *;q=0'):
+        status, headers, body = _raw_get(
+            url='/a.svgz', **{'Accept-Encoding': accept}
+        )
+        assert status == 200, accept
+        assert headers.get('Content-Encoding') == 'gzip', accept
+        assert body == data, accept
+
+    assert (
+        _raw_get(**{'Accept-Encoding': 'identity;q=0, *;q=0'})[0] == 406
+    ), 'big.css: nothing acceptable'
 
 
 def test_static_compression_identity_refused_below_min_length():

@@ -1,3 +1,4 @@
+import gzip
 import os
 import socket
 import time
@@ -908,6 +909,213 @@ def test_static_mime_types_correct():
         },
         'settings/http/static/mime_types',
     ), 'mime_types same extensions case insensitive'
+
+
+SVG = b'<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>'
+
+
+def svgz_write(path):
+    # mtime=0 keeps the gzip bytes the same on every run.
+    data = gzip.compress(SVG, mtime=0)
+    Path(path).write_bytes(data)
+    age_file(path)
+    return data
+
+
+def raw_request(method='GET', url='/a.svgz', **headers):
+    # Raw bytes: the body is gzip data, so it must not be decoded as UTF-8.
+    raw = client.http(
+        method,
+        url=url,
+        headers={'Host': 'localhost', 'Connection': 'close', **headers},
+        encoding='latin-1',
+        raw_resp=True,
+    )
+    head, _, body = raw.partition('\r\n\r\n')
+    lines = head.split('\r\n')
+    status = int(lines[0].split(' ')[1])
+    hdrs = dict(line.split(': ', 1) for line in lines[1:])
+    return status, hdrs, body.encode('latin-1')
+
+
+def test_static_svgz(temp_dir):
+    # A ".svgz" file is served as image/svg+xml with "Content-Encoding: gzip",
+    # and its stored bytes are sent unchanged.  Before, it had no Content-Type
+    # and no Content-Encoding, so a browser did not display it.
+    data = svgz_write(f'{temp_dir}/assets/a.svgz')
+
+    status, headers, body = raw_request()
+    assert status == 200
+    assert headers.get('Content-Type') == 'image/svg+xml'
+    assert headers.get('Content-Encoding') == 'gzip'
+    assert headers['Content-Length'] == str(len(data))
+    assert body == data, 'the stored bytes'
+    assert gzip.decompress(body) == SVG
+    assert 'Vary' not in headers, 'the coding is not negotiated'
+
+    # A client that does not accept gzip gets the same bytes.  No other
+    # representation exists.
+    status, headers, body = raw_request(**{'Accept-Encoding': 'identity'})
+    assert status == 200
+    assert headers.get('Content-Encoding') == 'gzip'
+    assert body == data
+
+    # HEAD sends the same header fields and no body.
+    status, headers, body = raw_request('HEAD')
+    assert status == 200
+    assert headers.get('Content-Type') == 'image/svg+xml'
+    assert headers.get('Content-Encoding') == 'gzip'
+    assert headers['Content-Length'] == str(len(data))
+    assert body == b'', 'no body on HEAD'
+
+    # A 304 carries no Content-Encoding.
+    status, headers, body = raw_request(**{'If-None-Match': headers['ETag']})
+    assert status == 304
+    assert 'Content-Encoding' not in headers
+    assert body == b''
+
+
+def test_static_svgz_case_insensitive(temp_dir):
+    # The extension matches without regard to case, as the type lookup does.
+    data = svgz_write(f'{temp_dir}/assets/B.SVGZ')
+
+    status, headers, body = raw_request(url='/B.SVGZ')
+    assert status == 200
+    assert headers.get('Content-Type') == 'image/svg+xml'
+    assert headers.get('Content-Encoding') == 'gzip'
+    assert body == data
+
+
+def test_static_svgz_range(temp_dir):
+    # A range applies to the stored gzip bytes, and the 206 keeps
+    # "Content-Encoding: gzip": the slice is part of the gzip data.
+    data = svgz_write(f'{temp_dir}/assets/a.svgz')
+
+    status, headers, body = raw_request(Range='bytes=0-9')
+    assert status == 206
+    assert headers.get('Content-Encoding') == 'gzip'
+    assert headers['Content-Range'] == f'bytes 0-9/{len(data)}'
+    assert body == data[:10]
+
+    # The ETag is strong, so a matching If-Range resumes the range.
+    etag = raw_request('HEAD')[1]['ETag']
+    assert not etag.startswith('W/'), 'strong ETag'
+
+    status, headers, body = raw_request(
+        Range='bytes=10-', **{'If-Range': etag}
+    )
+    assert status == 206
+    assert headers.get('Content-Encoding') == 'gzip'
+    assert body == data[10:]
+
+
+def test_static_svgz_etag(temp_dir):
+    # The tag of a ".svgz" file has a "-gzip" suffix.  Before, the file had
+    # the plain tag, and a cache stored it with no coding or with a second
+    # gzip under W/.  That tag must no longer match, so the cache gets a full
+    # 200 with the coding instead of a 304 that keeps the old entry.
+    data = svgz_write(f'{temp_dir}/assets/a.svgz')
+
+    # The same bytes and mtime under another name get the plain tag.
+    Path(f'{temp_dir}/assets/a.bin').write_bytes(data)
+    mtime = os.stat(f'{temp_dir}/assets/a.svgz').st_mtime
+    os.utime(f'{temp_dir}/assets/a.bin', (mtime, mtime))
+
+    etag = raw_request('HEAD')[1]['ETag']
+    old = raw_request('HEAD', url='/a.bin')[1]['ETag']
+    assert not old.startswith('W/'), 'strong ETag'
+    assert etag == f'{old[:-1]}-gzip"', 'the tag has the suffix'
+
+    for tag in (old, f'W/{old}'):
+        status, headers, body = raw_request(**{'If-None-Match': tag})
+        assert status == 200, f'old tag {tag} does not match'
+        assert headers['ETag'] == etag
+        assert headers.get('Content-Encoding') == 'gzip'
+        assert body == data
+
+    status, headers, body = raw_request(**{'If-None-Match': etag})
+    assert status == 304, 'the new tag matches'
+    assert 'Content-Encoding' not in headers
+    assert body == b''
+
+    assert raw_request(**{'If-Match': old})[0] == 412, 'If-Match old tag'
+    assert raw_request(**{'If-Match': etag})[0] == 200, 'If-Match new tag'
+
+    # A range resumed against the old tag gets the whole file.
+    status, headers, body = raw_request(Range='bytes=10-', **{'If-Range': old})
+    assert status == 200, 'If-Range old tag'
+    assert body == data
+
+
+def test_static_svgz_date_validators(temp_dir):
+    # The Last-Modified date of a ".svgz" file did not change when its
+    # response gained the coding.  So a date must not give a 304 or a range:
+    # a cache that stored the old response would keep it.
+    data = svgz_write(f'{temp_dir}/assets/a.svgz')
+
+    # Control: the same bytes and mtime under another name.
+    Path(f'{temp_dir}/assets/a.bin').write_bytes(data)
+    mtime = os.stat(f'{temp_dir}/assets/a.svgz').st_mtime
+    os.utime(f'{temp_dir}/assets/a.bin', (mtime, mtime))
+
+    date = raw_request('HEAD')[1]['Last-Modified']
+    later = formatdate(time.time() + 3600, usegmt=True)
+
+    for ims in (date, later):
+        assert (
+            raw_request(url='/a.bin', **{'If-Modified-Since': ims})[0] == 304
+        ), f'control If-Modified-Since {ims}'
+
+        status, headers, body = raw_request(**{'If-Modified-Since': ims})
+        assert status == 200, f'If-Modified-Since {ims}'
+        assert headers['ETag'].endswith('-gzip"')
+        assert headers.get('Content-Encoding') == 'gzip'
+        assert body == data
+
+    status, _, body = raw_request(
+        url='/a.bin', Range='bytes=10-', **{'If-Range': date}
+    )
+    assert status == 206, 'control If-Range date'
+    assert body == data[10:]
+
+    status, headers, body = raw_request(Range='bytes=10-', **{'If-Range': date})
+    assert status == 200, 'If-Range date'
+    assert headers.get('Content-Encoding') == 'gzip'
+    assert body == data
+
+    # If-Unmodified-Since still works: a 412 from a date stays correct.
+    earlier = formatdate(mtime - 3600, usegmt=True)
+    assert raw_request(**{'If-Unmodified-Since': earlier})[0] == 412
+    assert raw_request(**{'If-Unmodified-Since': date})[0] == 200
+
+
+def test_static_svgz_range_not_satisfiable(temp_dir):
+    # A 416 has no body, so it carries no Content-Encoding.
+    data = svgz_write(f'{temp_dir}/assets/a.svgz')
+
+    status, headers, body = raw_request(Range=f'bytes={len(data)}-')
+    assert status == 416
+    assert headers['Content-Range'] == f'bytes */{len(data)}'
+    assert 'Content-Encoding' not in headers
+    assert body == b''
+
+
+def test_static_svgz_mime_types_remap(temp_dir):
+    # The coding is added only while ".svgz" resolves to image/svg+xml.  An
+    # operator who maps it to another type gets that type and no coding.
+    svgz_write(f'{temp_dir}/assets/a.svgz')
+
+    assert raw_request()[1].get('Content-Encoding') == 'gzip'
+
+    assert 'success' in client.conf(
+        {"text/plain": [".log", "README"], "application/x-blob": ".svgz"},
+        'settings/http/static/mime_types',
+    )
+
+    status, headers, _ = raw_request()
+    assert status == 200
+    assert headers.get('Content-Type') == 'application/x-blob'
+    assert 'Content-Encoding' not in headers
 
 
 @pytest.mark.skip('not yet')
