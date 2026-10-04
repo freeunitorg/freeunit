@@ -926,7 +926,9 @@ jobs:
       # leg green while it covers nothing.  At least one smoke test must have
       # actually passed.  The wasm-wasi-component leg has the same trap: a
       # failed "cargo component build" turns into a missing cargo_component
-      # feature, and test_wasm-wasi-component.py skips as a whole.
+      # feature, and test_wasm-wasi-component.py skips as a whole.  In the
+      # wasm leg, test_wasm_memory_move.py also skips without a C compiler
+      # for its shim, so it is checked on its own.
       - name: Fail if the wasm smoke test skipped
         if: ${{ !cancelled() && (steps.metadata.outputs.module == 'wasm' || steps.metadata.outputs.module == 'wasm-wasi-component') }}
         run: |
@@ -936,6 +938,13 @@ jobs:
             grep -E 'SKIPPED|feature' "$RUNNER_TEMP/pytest.out" >&2 || true
             exit 1
           }
+          if [ "${{ steps.metadata.outputs.module }}" = wasm ]; then
+            grep -qE 'test_wasm_memory_move\.py::.*PASSED' "$RUNNER_TEMP/pytest.out" || {
+              echo "test_wasm_memory_move.py did not pass; it was skipped or failed:" >&2
+              grep -E 'test_wasm_memory_move\.py' "$RUNNER_TEMP/pytest.out" >&2 || true
+              exit 1
+            }
+          fi
 
       # test_capget_fallback.py needs a unitd that actually calls capget(),
       # which a root one never does, so every leg above skips it -- the file
