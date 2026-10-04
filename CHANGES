@@ -183,6 +183,18 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        protocol version, an unsupported key share or signature algorithm,
        and most alerts from the client.
 
+    *) Change: the Wasmtime library of the wasm module is now built
+       without the component-model C API. The module loads core
+       WebAssembly modules only and never called that API.
+       libwasmtime.so shrinks from 32.4 MB to 23.6 MB and no longer
+       exports the 156 wasmtime_component_* functions, the
+       wasmtime_config_wasm_component_model_* options and the six
+       wasmtime_module_type_* functions: clone, delete, import_count,
+       import_nth, export_count and export_nth. The packages install
+       libwasmtime.so in the system library directory. A program other
+       than FreeUnit that links that file and calls the component API no
+       longer loads. The wasm-wasi-component module is not affected.
+
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 
