@@ -192,6 +192,21 @@ jobs:
           restore-keys: |
             otel-cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-
 
+      # An --otel build without --openssl must not link OpenSSL.  The
+      # src/otel crate links no TLS stack.  This check reads the link
+      # line that configure writes.  readelf on unitd cannot show the
+      # fault here: the gcc of this runner passes --as-needed, and that
+      # drops an unused -lssl.  The next step runs configure again, so
+      # this step removes its output.
+      - name: Check that --otel without --openssl links no OpenSSL
+        run: |
+          ./configure --otel
+          if grep -n -E -- '-l(ssl|crypto)' build/Makefile; then
+            echo "::error::an --otel build without --openssl links OpenSSL"
+            exit 1
+          fi
+          rm -rf build Makefile
+
       - name: Configure unit
         # LD_LIBRARY_PATH is set only for this step so that auto/feature
         # test binaries load OpenSSL 3.6 at runtime.  It is NOT exported

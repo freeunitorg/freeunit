@@ -10,6 +10,16 @@
          date="2026-10-04" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="change">
+<para>
+"--otel" no longer needs OpenSSL.  Before, configure stopped with
+"OpenTelemetry support requires OpenSSL." when the OpenSSL headers were
+missing, and it linked unitd with OpenSSL even without "--openssl".  The OTel
+exporter has linked no TLS stack since 1.36.0.  macOS builds did not have the
+problem.
+</para>
+</change>
+
 </changes>
 
 
