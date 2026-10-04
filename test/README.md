@@ -106,6 +106,11 @@ core and `fake_upstream` rebuild incrementally.
 
 If you prefer to run tests natively (requires all dependencies installed):
 
+The test tools come from the distribution (`python3-pytest`, `python3-openssl`)
+or from `pip install -r test/requirements.txt`. That file needs Python 3.10 or
+newer, because older pytest and pyOpenSSL releases have known vulnerabilities.
+On a host with an older Python, use `./test/run-local.sh` instead.
+
 ```bash
 # 1. Build FreeUnit with test support
 ./configure --openssl --njs --zlib --zstd --brotli --otel --tests

@@ -50,7 +50,7 @@ jobs:
         libc: [ glibc, musl ]
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Everything happens inside a pinned container (debian:trixie-slim /
       # alpine:3.22), so the runner image can move without moving the baseline:
@@ -65,7 +65,7 @@ jobs:
       # and it only works if the list survives a red run.
       - name: Upload the captured list
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: syscalls-${{ matrix.libc }}
           path: syscalls-${{ matrix.libc }}.txt

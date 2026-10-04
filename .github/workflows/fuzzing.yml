@@ -59,7 +59,7 @@ jobs:
     timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 120 || 30 }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # libclang-rt-dev carries libclang_rt.fuzzer, which -fsanitize=fuzzer
       # links against; clang alone is not enough.
@@ -103,7 +103,7 @@ jobs:
       # A reproducer is the only thing that makes a fuzzing failure actionable.
       - name: Upload reproducers
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts
           path: build/fuzz-artifacts/

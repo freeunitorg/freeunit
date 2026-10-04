@@ -29,11 +29,11 @@ env:
   # OpenSSL patch version built from source (see "Build OpenSSL" step). Only the
   # patch level lives here; the 3.6 "slot" (/opt/openssl-3.6, OPENSSL36_* vars)
   # is stable across patch bumps and intentionally not templated.
-  OPENSSL_VERSION: 3.6.2
+  OPENSSL_VERSION: 3.6.5
   # OpenSSL 4.0 for the openssl4 leg below.  No distribution ships 4.0 yet, so
   # like the 3.6 slot it is built from source; the /opt/openssl-4.0 slot is
   # stable across patch bumps.
-  OPENSSL4_VERSION: 4.0.2
+  OPENSSL4_VERSION: 4.0.3
 
 concurrency:
   # Cancel superseded runs for the same pull request.  Non-PR events fall back
@@ -55,7 +55,7 @@ jobs:
     outputs:
       builds: ${{ steps.list.outputs.builds }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Derive build list from pkg/eol.json
         id: list
         # Slow legs come first in the list.  All 23 legs are created at
@@ -94,7 +94,7 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Read njs version
         id: metadata
@@ -155,7 +155,7 @@ jobs:
 
       - name: Clone njs repository
         if: steps.cache-njs.outputs.cache-hit != 'true'
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: freeunitorg/njs
           ref: '${{ steps.metadata.outputs.njs_version }}'
@@ -243,7 +243,7 @@ jobs:
         run: tar -czf /tmp/unit-core-build.tar.gz Makefile build
 
       - name: Upload the core build
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unit-core-build
           path: /tmp/unit-core-build.tar.gz
@@ -263,7 +263,7 @@ jobs:
         os: [ubuntu-latest]
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Provides module, language version and testpath from build name
       - name: Output build metadata
@@ -513,7 +513,7 @@ jobs:
 
       - name: Clone njs repository
         if: steps.cache-njs.outputs.cache-hit != 'true'
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: freeunitorg/njs
           ref: '${{ steps.metadata.outputs.njs_version }}'
@@ -798,7 +798,7 @@ jobs:
       # Prebuilt binary instead of `cargo install cargo-component` (which
       # compiles it from source on every run). Same tool, much faster.
       - name: Install cargo-component
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
         with:
           tool: cargo-component
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
@@ -987,7 +987,7 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install packages
         run: |
@@ -1039,7 +1039,7 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install packages
         run: |
@@ -1074,7 +1074,7 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install packages
         run: |
@@ -1145,7 +1145,7 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install packages
         run: |
@@ -1229,7 +1229,7 @@ jobs:
         cc: [gcc, clang]
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install packages
         run: |

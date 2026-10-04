@@ -70,7 +70,7 @@ jobs:
     outputs:
       locks: ${{ steps.list.outputs.locks }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: List tracked lock files
         id: list
@@ -89,14 +89,14 @@ jobs:
       matrix:
         lock: ${{ fromJSON(needs.locks.outputs.locks) }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - run: rustup update stable
 
       # Prebuilt binary instead of `cargo install cargo-audit`, which would
       # compile it from source on every run.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
         with:
           tool: cargo-audit
 
@@ -117,7 +117,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - run: rustup update stable
 
@@ -130,7 +130,7 @@ jobs:
           python3 -m pytest pkg/contrib/test_check_lock_audit.py
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
         with:
           tool: cargo-audit
 
