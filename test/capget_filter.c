@@ -87,12 +87,13 @@
 #include <linux/capability.h>
 
 /*
- * glibc declares syscall() variadic, but it is an assembly stub that
- * only moves registers: it never walks a va_list, so calling it
- * through a fixed six-argument prototype is what every syscall
- * interposer does and is correct on every Linux ABI Unit builds for.
+ * The real syscall() is called through its own variadic type.  musl's
+ * syscall() is C that walks a va_list.  On ppc64 ELFv2 such a callee
+ * stores r4-r10 in the parameter save area of the caller's frame, and
+ * a caller with a fixed prototype does not allocate that area.  The
+ * stores then overwrite this shim's frame, and unitd dies at startup.
  */
-typedef long (*nxt_syscall_fn)(long, long, long, long, long, long, long);
+typedef long (*nxt_syscall_fn)(long, ...);
 
 static nxt_syscall_fn  nxt_real_syscall;
 static int             nxt_capget_errno;   /* 0: filter disabled */
@@ -218,9 +219,8 @@ syscall(long number, ...)
      * depends on:
      *
      *   - glibc's syscall() is an assembly stub that unconditionally
-     *     moves six argument registers, and musl's is a fixed
-     *     seven-parameter C function.  Neither ever walks a va_list,
-     *     so both read exactly the slots this reads.
+     *     moves six argument registers.  musl's walks a va_list of six
+     *     longs.  Both read exactly the slots this reads.
      *   - The slots read are always mapped memory, on every ABI Unit
      *     builds for.  On x86-64 SysV the first five come from the
      *     register save area gcc/clang spill at entry and the sixth
