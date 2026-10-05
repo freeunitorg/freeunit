@@ -56,9 +56,20 @@ struct nxt_http_comp_type_s {
 };
 
 struct nxt_http_comp_opts_s {
-    int8_t                      level;
+    int                         level;
     nxt_off_t                   min_len;
 };
+
+/*
+ * nxt_conf_map_object() writes the size of the map type, not the size of
+ * the field.  NXT_CONF_MAP_INT writes an int.  NXT_CONF_MAP_OFF writes an
+ * off_t.
+ */
+nxt_static_assert(sizeof(((nxt_http_comp_opts_t *) 0)->level) == sizeof(int),
+                  "\"level\" is mapped with NXT_CONF_MAP_INT");
+nxt_static_assert(sizeof(((nxt_http_comp_opts_t *) 0)->min_len)
+                  == sizeof(off_t),
+                  "\"min_length\" is mapped with NXT_CONF_MAP_OFF");
 
 struct nxt_http_comp_compressor_s {
     const nxt_http_comp_type_t  *type;
@@ -130,7 +141,7 @@ static const nxt_conf_map_t  nxt_http_comp_compressors_opts_map[] = {
         offsetof(nxt_http_comp_opts_t, level),
     }, {
         nxt_string("min_length"),
-        NXT_CONF_MAP_SIZE,
+        NXT_CONF_MAP_OFF,
         offsetof(nxt_http_comp_opts_t, min_len),
     },
 };

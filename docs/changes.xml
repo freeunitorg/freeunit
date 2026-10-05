@@ -28,6 +28,17 @@ the new libunit.
 
 <change type="bugfix">
 <para>
+on 32-bit platforms, the "min_length" option of a compressor did not work.  On
+little-endian platforms, such as x86, armv7 and armhf, a response shorter than
+"min_length" was compressed, and a client that refused identity got the
+compressed response instead of a 406.  On big-endian platforms, a compressor
+with "min_length" compressed no response shorter than 4 GiB.  The bug had
+appeared in 1.35.0.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 the control API accepted a listener with neither "pass" nor "application",
 and the router then refused the configuration with 500.
 </para>
@@ -156,6 +167,16 @@ an application worker whose WHOAMI the main process refused was not told so.
 It waited for ever and stayed alive until its prototype quit.  On Linux, the
 worker now logs "WHOAMI failed, exiting" and exits, and main logs the reason.
 On other platforms a refused worker still waits, as before.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+on big-endian platforms, such as s390x, the "level" option of a compressor did
+not work.  A positive level became 0, and a negative level became -1.  For gzip
+and deflate, level 0 does not compress.  On other platforms, a level above 255
+used only its low byte: 265 became 9, with no notice.  The bug had appeared in
+1.35.0.
 </para>
 </change>
 
