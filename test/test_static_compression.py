@@ -1093,3 +1093,23 @@ def test_static_compression_response_headers_content_encoding_resolved_once(
     assert headers['Accept-Ranges'] == 'bytes', 'Accept-Ranges is sent'
     assert headers['Content-Encoding'] == '', 'the value of the check'
     assert body == stored, 'the stored bytes'
+
+
+def test_static_compression_level_above_int8(wait_for_record):
+    # "level" was stored in one byte.  265 (0x109) became 9 on little-endian
+    # and 0 on big-endian, both valid gzip levels, so there was no notice.
+    # Now 265 is out of range, and the default level is used.
+    assert 'success' in client.conf(
+        {
+            "types": ["text/css"],
+            "compressors": [{"encoding": "gzip", "level": 265}],
+        },
+        'settings/http/compression',
+    ), 'compression configure'
+
+    assert (
+        wait_for_record(
+            r'Overriding invalid compression level for \[gzip\] \[265\]'
+        )
+        is not None
+    ), 'level 265 is out of range'

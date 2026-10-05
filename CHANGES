@@ -126,6 +126,20 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        for a record that is still linked to a prototype. The bug had
        appeared in 1.37.0.
 
+    *) Bugfix: on 32-bit platforms, the "min_length" option of a compressor
+       did not work. On little-endian platforms, such as x86, armv7 and
+       armhf, a response shorter than "min_length" was compressed, and a
+       client that refused identity got the compressed response instead of
+       a 406. On big-endian platforms, a compressor with "min_length"
+       compressed no response shorter than 4 GiB. The bug had appeared in
+       1.35.0.
+
+    *) Bugfix: on big-endian platforms, such as s390x, the "level" option of
+       a compressor did not work. A positive level became 0, and a negative
+       level became -1. For gzip and deflate, level 0 does not compress. On
+       other platforms, a level above 255 used only its low byte: 265 became
+       9, with no notice. The bug had appeared in 1.35.0.
+
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 
