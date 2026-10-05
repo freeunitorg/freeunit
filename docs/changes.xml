@@ -118,6 +118,15 @@ refused above 2147483647, and "requests" below 0.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+Unit could not be built with gcc on 32-bit platforms, such as Debian i386.
+The compiler stopped on src/nxt_h1proto.c with "comparison is always
+false due to limited range of data type [-Werror=type-limits]".  Builds with
+clang were not affected.  The bug had appeared in 1.36.0.
+</para>
+</change>
+
 </changes>
 
 

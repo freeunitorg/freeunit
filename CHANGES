@@ -89,6 +89,12 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        and "requests" below 0. See
        https://github.com/freeunitorg/freeunit/issues/619.
 
+    *) Bugfix: Unit could not be built with gcc on 32-bit platforms, such
+       as Debian i386. The compiler stopped on
+       src/nxt_h1proto.c with "comparison is always false due to limited
+       range of data type [-Werror=type-limits]". Builds with clang were
+       not affected. The bug had appeared in 1.36.0.
+
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 
