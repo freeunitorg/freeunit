@@ -16,8 +16,14 @@
 # hook symbols:  the symbols defined in X.test.o and not in X.o.  Names that
 #                contain a "." are compiler-made clones (foo.isra.0, foo.cold)
 #                and are skipped; a hook is a C identifier.
-# members:       the global symbols of X.test.o.  A program that defines one
-#                of them linked object X, from one of the two archives.
+# members:       the global symbols of X.test.o that no other instrumented
+#                object also defines.  A program that defines one of them
+#                linked object X, from one of the two archives.  A name that
+#                a second object defines proves nothing about which one was
+#                linked: gcc on i386 gives every PIC object that needs one a
+#                global __x86.get_pc_thunk.*, and clang's ASan gives every
+#                object a global ___asan_globals_registered.  Compiler-made
+#                names (those with a ".") are left out as well.
 #
 # Checks, in order:
 #
@@ -29,7 +35,10 @@
 #      build/src/X.test.o, and that object differs from X.o once debug info
 #      is removed.  A hook in a source that is compiled once (for example
 #      src/nxt_main.c or a module source) would ship; a plain object that
-#      equals its instrumented twin was compiled with the macro.
+#      equals its instrumented twin was compiled with the macro.  A library
+#      source whose feature is off (src/nxt_openssl.c without --openssl) is
+#      in auto/sources but not in $build/Makefile.  It is not compiled, and
+#      is skipped.
 #   2. No shipped artifact defines a hook symbol: build/sbin/unitd,
 #      build/lib/libnxt.a, build/lib/libunit.a, build/src/nxt_unit.o (the
 #      object the language modules link), and, when present, build/lib/libnxt.so
@@ -82,11 +91,14 @@ names()
         | sort -u
 }
 
-# defined global symbol names of one object
+# defined global symbol names of one object.  Names that contain a "." are
+# compiler-made clones (foo.isra.0, foo.cold).  Which of them are evidence
+# that a program linked the object is decided in check 3.
 global_names()
 {
     nm --defined-only -p "$1" 2>/dev/null \
-        | awk 'NF >= 3 && $(NF - 1) ~ /^[A-Z]$/ { print $NF }' | sort -u
+        | awk 'NF >= 3 && $(NF - 1) ~ /^[A-Z]$/ && $NF !~ /\./ { print $NF }' \
+        | sort -u
 }
 
 
@@ -106,6 +118,7 @@ if [ -z "$test_objs" ]; then
 fi
 
 : > "$tmp/hooks"
+: > "$tmp/instrnames"
 
 for t in $test_objs; do
     p=${t%.test.o}.o
@@ -117,6 +130,10 @@ for t in $test_objs; do
 
     names "$p" > "$tmp/plain"
     names "$t" > "$tmp/instr"
+
+    # every instrumented name, for the members rule in check 3.  Each list is
+    # sorted and unique, so a duplicated line is a name two objects define.
+    cat "$tmp/instr" >> "$tmp/instrnames"
 
     # symbols only the instrumented object defines
     comm -13 "$tmp/plain" "$tmp/instr" | grep -v '\.' > "$tmp/hooks.$$" || true
@@ -156,6 +173,17 @@ for src in $(find src -name '*.c' -not -path 'src/test/*' | sort); do
 
     p=$build/${src%.c}.o
     t=$build/${src%.c}.test.o
+
+    # auto/sources lists the library sources and src/nxt_main.c.  A listed
+    # source that $build/Makefile does not name belongs to a feature that is
+    # off, and is not compiled.  A module source is not listed in
+    # auto/sources, so it is checked whether its module is configured or not.
+    if [ -f "$build/Makefile" ] && grep -Fqw "$src" auto/sources \
+        && ! grep -Fqw "$src" "$build/Makefile"
+    then
+        echo "not compiled in this configuration: $src"
+        continue
+    fi
 
     if [ ! -f "$t" ]; then
         error "$src tests NXT_TESTS but is compiled once, without the" \
@@ -226,6 +254,12 @@ done
 
 # 3. The test programs took every linked object from the instrumented archive.
 
+# A name that more than one instrumented object defines cannot tell which of
+# them a program linked: gcc on i386 gives every PIC object that needs one a
+# global __x86.get_pc_thunk.*, and clang's ASan gives every object a global
+# ___asan_globals_registered.  Such a name is never evidence of a link.
+sort "$tmp/instrnames" | uniq -d > "$tmp/sharednames"
+
 programs="$build/tests $build/ncq_test $build/vbcq_test $build/unit_app_test \
     $build/unit_close_test $build/unit_port_recv_test $build/unit_msg_test \
     $build/unit_websocket_chat $build/unit_websocket_echo"
@@ -248,9 +282,10 @@ for prog in $programs; do
         [ -s "$tmp/want" ] || continue
 
         global_names "$t" > "$tmp/members"
+        comm -23 "$tmp/members" "$tmp/sharednames" > "$tmp/members.$$"
 
         # not linked at all: nothing to prove
-        [ -n "$(comm -12 "$tmp/members" "$tmp/defined")" ] || continue
+        [ -n "$(comm -12 "$tmp/members.$$" "$tmp/defined")" ] || continue
 
         missing=$(comm -23 "$tmp/want" "$tmp/defined")
 
