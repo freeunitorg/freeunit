@@ -1,0 +1,1935 @@
+
+/*
+ * Copyright (C) Max Romanov
+ * Copyright (C) Igor Sysoev
+ * Copyright (C) Valentin V. Bartenev
+ * Copyright (C) NGINX, Inc.
+ */
+
+#include <nxt_main.h>
+#include <nxt_runtime.h>
+#include <nxt_main_process.h>
+#include <nxt_router.h>
+#include <nxt_http.h>
+#include <nxt_application.h>
+#include <nxt_unit.h>
+#include <nxt_port_memory_int.h>
+#include <nxt_isolation.h>
+
+#include <glob.h>
+
+#if (NXT_HAVE_PR_SET_NO_NEW_PRIVS)
+#include <sys/prctl.h>
+#endif
+
+
+#ifdef WCOREDUMP
+#define NXT_WCOREDUMP(s) WCOREDUMP(s)
+#else
+#define NXT_WCOREDUMP(s) 0
+#endif
+
+
+typedef struct {
+    nxt_app_type_t  type;
+    nxt_str_t       name;
+    nxt_str_t       version;
+    nxt_str_t       file;
+    nxt_array_t     *mounts;
+} nxt_module_t;
+
+
+static nxt_int_t nxt_discovery_start(nxt_task_t *task,
+    nxt_process_data_t *data);
+static nxt_buf_t *nxt_discovery_modules(nxt_task_t *task, const char *path);
+static nxt_int_t nxt_discovery_module(nxt_task_t *task, nxt_mp_t *mp,
+    nxt_array_t *modules, const char *name);
+static void nxt_discovery_completion_handler(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_discovery_quit(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data);
+static nxt_app_module_t *nxt_app_module_load(nxt_task_t *task,
+    const char *name);
+static nxt_int_t nxt_proto_setup(nxt_task_t *task, nxt_process_t *process);
+static nxt_int_t nxt_proto_start(nxt_task_t *task, nxt_process_data_t *data);
+static nxt_int_t nxt_app_setup(nxt_task_t *task, nxt_process_t *process);
+static nxt_int_t nxt_app_set_environment(nxt_conf_value_t *environment);
+static void nxt_proto_start_process_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_proto_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
+static void nxt_proto_process_created_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_proto_quit_children(nxt_task_t *task);
+static void nxt_proto_report_child_pid(nxt_task_t *task,
+    nxt_process_t *process, nxt_uint_t level);
+static void nxt_proto_kill_silent(nxt_task_t *task, void *obj, void *data);
+static nxt_process_t *nxt_proto_process_find(nxt_task_t *task, nxt_pid_t pid);
+static void nxt_proto_process_add(nxt_task_t *task, nxt_process_t *process);
+static nxt_process_t *nxt_proto_process_remove(nxt_task_t *task, nxt_pid_t pid);
+static u_char *nxt_cstr_dup(nxt_mp_t *mp, u_char *dst, u_char *src);
+static void nxt_proto_signal_handler(nxt_task_t *task, void *obj, void *data);
+static void nxt_proto_sigterm_handler(nxt_task_t *task, void *obj, void *data);
+static void nxt_proto_sigchld_handler(nxt_task_t *task, void *obj, void *data);
+static void nxt_app_new_port_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+
+
+nxt_str_t  nxt_server = nxt_string(NXT_SERVER);
+
+
+static uint32_t  compat[] = {
+    NXT_VERNUM, NXT_DEBUG,
+};
+
+
+static nxt_lvlhsh_t           nxt_proto_processes;
+static nxt_queue_t            nxt_proto_children;
+static nxt_bool_t             nxt_proto_exiting;
+
+/*
+ * The prototype's own deadline on a quit; see nxt_proto_quit_children().
+ * File scope, so its node can never outlive its storage and
+ * nxt_timer_disable() is never owed.
+ */
+static nxt_timer_t            nxt_proto_kill_timer;
+
+static nxt_app_module_t       *nxt_app;
+static nxt_common_app_conf_t  *nxt_app_conf;
+
+
+static const nxt_port_handlers_t  nxt_discovery_process_port_handlers = {
+    .quit         = nxt_signal_quit_handler,
+    .new_port     = nxt_app_new_port_handler,
+    .change_file  = nxt_port_change_log_file_handler,
+    .mmap         = nxt_port_mmap_handler,
+    .data         = nxt_port_data_handler,
+    .remove_pid   = nxt_port_remove_pid_handler,
+    .rpc_ready    = nxt_port_rpc_handler,
+    .rpc_error    = nxt_port_rpc_handler,
+};
+
+
+const nxt_sig_event_t  nxt_prototype_signals[] = {
+    nxt_event_signal(SIGHUP,  nxt_proto_signal_handler),
+    nxt_event_signal(SIGINT,  nxt_proto_sigterm_handler),
+    nxt_event_signal(SIGQUIT, nxt_proto_sigterm_handler),
+    nxt_event_signal(SIGTERM, nxt_proto_sigterm_handler),
+    nxt_event_signal(SIGCHLD, nxt_proto_sigchld_handler),
+    nxt_event_signal_end,
+};
+
+
+static const nxt_port_handlers_t  nxt_proto_process_port_handlers = {
+    .quit            = nxt_proto_quit_handler,
+    .change_file     = nxt_port_change_log_file_handler,
+    .new_port        = nxt_app_new_port_handler,
+    .process_created = nxt_proto_process_created_handler,
+    .process_ready   = nxt_port_process_ready_handler,
+    .remove_pid      = nxt_port_remove_pid_handler,
+    .start_process   = nxt_proto_start_process_handler,
+    .rpc_ready       = nxt_port_rpc_handler,
+    .rpc_error       = nxt_port_rpc_handler,
+};
+
+
+static const nxt_port_handlers_t  nxt_app_process_port_handlers = {
+    .quit         = nxt_signal_quit_handler,
+    .rpc_ready    = nxt_port_rpc_handler,
+    .rpc_error    = nxt_port_rpc_handler,
+};
+
+
+const nxt_process_init_t  nxt_discovery_process = {
+    .name           = "discovery",
+    .type           = NXT_PROCESS_DISCOVERY,
+    .prefork        = NULL,
+    .restart        = 0,
+    .setup          = nxt_process_core_setup,
+    .start          = nxt_discovery_start,
+    .port_handlers  = &nxt_discovery_process_port_handlers,
+    .signals        = nxt_process_signals,
+};
+
+
+const nxt_process_init_t  nxt_proto_process = {
+    .type           = NXT_PROCESS_PROTOTYPE,
+    .prefork        = nxt_isolation_main_prefork,
+    .restart        = 0,
+    .setup          = nxt_proto_setup,
+    .start          = nxt_proto_start,
+    .port_handlers  = &nxt_proto_process_port_handlers,
+    .signals        = nxt_prototype_signals,
+};
+
+
+const nxt_process_init_t  nxt_app_process = {
+    .type           = NXT_PROCESS_APP,
+    .setup          = nxt_app_setup,
+    .start          = NULL,
+    .prefork        = NULL,
+    .restart        = 0,
+    .port_handlers  = &nxt_app_process_port_handlers,
+    .signals        = nxt_process_signals,
+};
+
+
+/*
+ * nxt_port_new_port_handler() hands the queue descriptor of a newly created
+ * port to its caller, because only the caller knows whether this process
+ * maps port queues.  Neither the discovery nor the prototype process does,
+ * so both used the base handler directly and kept every queue descriptor
+ * their peer sent open for the life of the process.
+ */
+
+static void
+nxt_app_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_port_new_port_handler(task, msg);
+
+    nxt_port_recv_msg_close_fds(msg);
+}
+
+
+static nxt_int_t
+nxt_discovery_start(nxt_task_t *task, nxt_process_data_t *data)
+{
+    uint32_t       stream;
+    nxt_buf_t      *b;
+    nxt_int_t      ret;
+    nxt_port_t     *main_port, *discovery_port;
+    nxt_runtime_t  *rt;
+
+    nxt_log(task, NXT_LOG_INFO, "discovery started");
+
+    rt = task->thread->runtime;
+
+    b = nxt_discovery_modules(task, rt->modules);
+    if (nxt_slow_path(b == NULL)) {
+        return NXT_ERROR;
+    }
+
+    main_port = rt->port_by_type[NXT_PROCESS_MAIN];
+    discovery_port = rt->port_by_type[NXT_PROCESS_DISCOVERY];
+
+    stream = nxt_port_rpc_register_handler(task, discovery_port,
+                                           nxt_discovery_quit,
+                                           nxt_discovery_quit,
+                                           main_port->pid, NULL);
+
+    if (nxt_slow_path(stream == 0)) {
+        return NXT_ERROR;
+    }
+
+    ret = nxt_port_socket_write(task, main_port, NXT_PORT_MSG_MODULES, -1,
+                                stream, discovery_port->id, b);
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_rpc_cancel(task, discovery_port, stream);
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_buf_t *
+nxt_discovery_modules(nxt_task_t *task, const char *path)
+{
+    char              *name;
+    size_t            size;
+    glob_t            glb;
+    nxt_mp_t          *mp;
+    nxt_str_t         str;
+    nxt_buf_t         *b;
+    nxt_int_t         ret;
+    nxt_uint_t        i, n, j;
+    nxt_array_t       *modules, *mounts;
+    nxt_module_t      *module;
+    nxt_fs_mount_t    *mnt;
+    nxt_conf_value_t  *root, *obj, *array, *mount;
+
+    static const nxt_str_t  type_str = nxt_string("type");
+    static const nxt_str_t  name_str = nxt_string("name");
+    static const nxt_str_t  version_str = nxt_string("version");
+    static const nxt_str_t  file_str = nxt_string("file");
+    static const nxt_str_t  mounts_str = nxt_string("mounts");
+    static const nxt_str_t  src_str = nxt_string("src");
+    static const nxt_str_t  dst_str = nxt_string("dst");
+    static const nxt_str_t  flags_str = nxt_string("flags");
+    static const nxt_str_t  data_str = nxt_string("data");
+
+    b = NULL;
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (mp == NULL) {
+        return b;
+    }
+
+    ret = glob(path, 0, NULL, &glb);
+
+    n = glb.gl_pathc;
+
+    if (ret != 0) {
+        nxt_log(task, NXT_LOG_NOTICE,
+                "no modules matching: \"%s\" found", path);
+        n = 0;
+    }
+
+    modules = nxt_array_create(mp, n, sizeof(nxt_module_t));
+    if (modules == NULL) {
+        goto fail;
+    }
+
+    for (i = 0; i < n; i++) {
+        name = glb.gl_pathv[i];
+
+        ret = nxt_discovery_module(task, mp, modules, name);
+        if (ret != NXT_OK) {
+            goto fail;
+        }
+    }
+
+    module = modules->elts;
+    n = modules->nelts;
+
+    /*
+     * The main process parses this message as JSON, so build it through
+     * nxt_conf, which escapes every string.  Formatted with "%s", a double
+     * quote or a backslash in a module path or a mount source broke the
+     * parse, and the main process then started with no language modules
+     * at all and nothing above debug level in the log to say why.
+     */
+    root = nxt_conf_create_array(mp, n);
+    if (nxt_slow_path(root == NULL)) {
+        goto fail;
+    }
+
+    for (i = 0; i < n; i++) {
+        nxt_debug(task, "module: %d %V %V",
+                  module[i].type, &module[i].version, &module[i].file);
+
+        obj = nxt_conf_create_object(mp, 5);
+        if (nxt_slow_path(obj == NULL)) {
+            goto fail;
+        }
+
+        nxt_conf_set_member_integer(obj, &type_str, module[i].type, 0);
+        nxt_conf_set_member_string(obj, &name_str, &module[i].name, 1);
+        nxt_conf_set_member_string(obj, &version_str, &module[i].version, 2);
+        nxt_conf_set_member_string(obj, &file_str, &module[i].file, 3);
+
+        mounts = module[i].mounts;
+        mnt = mounts->elts;
+
+        array = nxt_conf_create_array(mp, mounts->nelts);
+        if (nxt_slow_path(array == NULL)) {
+            goto fail;
+        }
+
+        for (j = 0; j < mounts->nelts; j++) {
+            mount = nxt_conf_create_object(mp, 6);
+            if (nxt_slow_path(mount == NULL)) {
+                goto fail;
+            }
+
+            str.start = mnt[j].src;
+            str.length = nxt_strlen(mnt[j].src);
+            nxt_conf_set_member_string(mount, &src_str, &str, 0);
+
+            str.start = mnt[j].dst;
+            str.length = nxt_strlen(mnt[j].dst);
+            nxt_conf_set_member_string(mount, &dst_str, &str, 1);
+
+            str.start = mnt[j].name;
+            str.length = nxt_strlen(mnt[j].name);
+            nxt_conf_set_member_string(mount, &name_str, &str, 2);
+
+            nxt_conf_set_member_integer(mount, &type_str, mnt[j].type, 3);
+            nxt_conf_set_member_integer(mount, &flags_str, mnt[j].flags, 4);
+
+            str.start = (mnt[j].data == NULL) ? (u_char *) "" : mnt[j].data;
+            str.length = nxt_strlen(str.start);
+            nxt_conf_set_member_string(mount, &data_str, &str, 5);
+
+            nxt_conf_set_element(array, j, mount);
+        }
+
+        nxt_conf_set_member(obj, &mounts_str, array, 4);
+        nxt_conf_set_element(root, i, obj);
+    }
+
+    size = nxt_conf_json_length(root, NULL);
+
+    b = nxt_buf_mem_alloc(mp, size, 0);
+    if (b == NULL) {
+        goto fail;
+    }
+
+    b->completion_handler = nxt_discovery_completion_handler;
+
+    b->mem.free = nxt_conf_json_print(b->mem.free, root, NULL);
+
+fail:
+
+    /*
+     * This is the success path too -- b is NULL only if one of the allocations
+     * above failed.  Say so: the caller turns a NULL into NXT_ERROR, and the
+     * main process then starts the controller and the router with no language
+     * modules registered, so without a line here the only symptom an operator
+     * sees is every application type reported as "not found".
+     */
+    if (nxt_slow_path(b == NULL)) {
+        nxt_alert(task, "discovery failed to build the module list");
+        nxt_mp_destroy(mp);
+    }
+
+    globfree(&glb);
+
+    return b;
+}
+
+
+static nxt_int_t
+nxt_discovery_module(nxt_task_t *task, nxt_mp_t *mp, nxt_array_t *modules,
+    const char *name)
+{
+    void                  *dl;
+    nxt_str_t             version;
+    nxt_int_t             ret;
+    nxt_uint_t            i, j, n;
+    nxt_array_t           *mounts;
+    nxt_module_t          *module;
+    nxt_app_type_t        type;
+    nxt_fs_mount_t        *to;
+    nxt_app_module_t      *app;
+    const nxt_fs_mount_t  *from;
+
+    /*
+     * Only memory allocation failure should return NXT_ERROR.
+     * Any module processing errors are ignored.
+     */
+    ret = NXT_ERROR;
+
+    dl = dlopen(name, RTLD_GLOBAL | RTLD_NOW);
+
+    if (dl == NULL) {
+        nxt_alert(task, "dlopen(\"%s\"), failed: \"%s\"", name, dlerror());
+        return NXT_OK;
+    }
+
+    app = dlsym(dl, "nxt_app_module");
+
+    if (app != NULL) {
+        nxt_log(task, NXT_LOG_NOTICE, "module: %V %s \"%s\"",
+                &app->type, app->version, name);
+
+        if (app->compat_length != sizeof(compat)
+            || memcmp(app->compat, compat, sizeof(compat)) != 0)
+        {
+            nxt_log(task, NXT_LOG_NOTICE, "incompatible module %s", name);
+
+            goto done;
+        }
+
+        type = nxt_app_parse_type(app->type.start, app->type.length);
+
+        if (type == NXT_APP_UNKNOWN) {
+            nxt_log(task, NXT_LOG_NOTICE, "unknown module type %V", &app->type);
+
+            goto done;
+        }
+
+        module = modules->elts;
+        n = modules->nelts;
+
+        version.start = (u_char *) app->version;
+        version.length = nxt_strlen(app->version);
+
+        for (i = 0; i < n; i++) {
+            if (type == module[i].type
+                && nxt_strstr_eq(&module[i].version, &version))
+            {
+                nxt_log(task, NXT_LOG_NOTICE,
+                        "ignoring %s module with the same "
+                        "application language version %V %V as in %V",
+                        name, &app->type, &version, &module[i].file);
+
+                goto done;
+            }
+        }
+
+        module = nxt_array_add(modules);
+        if (module == NULL) {
+            goto fail;
+        }
+
+        module->type = type;
+
+        nxt_str_dup(mp, &module->version, &version);
+        if (module->version.start == NULL) {
+            goto fail;
+        }
+
+        nxt_str_dup(mp, &module->name, &app->type);
+        if (module->name.start == NULL) {
+            goto fail;
+        }
+
+        module->file.length = nxt_strlen(name);
+
+        module->file.start = nxt_mp_alloc(mp, module->file.length);
+        if (module->file.start == NULL) {
+            goto fail;
+        }
+
+        nxt_memcpy(module->file.start, name, module->file.length);
+
+        module->mounts = nxt_array_create(mp, app->nmounts,
+                                          sizeof(nxt_fs_mount_t));
+
+        if (nxt_slow_path(module->mounts == NULL)) {
+            goto fail;
+        }
+
+        mounts = module->mounts;
+
+        for (j = 0; j < app->nmounts; j++) {
+            from = &app->mounts[j];
+            to = nxt_array_zero_add(mounts);
+            if (nxt_slow_path(to == NULL)) {
+                goto fail;
+            }
+
+            to->src = nxt_cstr_dup(mp, to->src, from->src);
+            if (nxt_slow_path(to->src == NULL)) {
+                goto fail;
+            }
+
+            to->dst = nxt_cstr_dup(mp, to->dst, from->dst);
+            if (nxt_slow_path(to->dst == NULL)) {
+                goto fail;
+            }
+
+            to->name = nxt_cstr_dup(mp, to->name, from->name);
+            if (nxt_slow_path(to->name == NULL)) {
+                goto fail;
+            }
+
+            to->type = from->type;
+
+            if (from->data != NULL) {
+                to->data = nxt_cstr_dup(mp, to->data, from->data);
+                if (nxt_slow_path(to->data == NULL)) {
+                    goto fail;
+                }
+            }
+
+            to->flags = from->flags;
+        }
+
+    } else {
+        nxt_alert(task, "dlsym(\"%s\"), failed: \"%s\"", name, dlerror());
+    }
+
+done:
+
+    ret = NXT_OK;
+
+fail:
+
+    if (dlclose(dl) != 0) {
+        nxt_alert(task, "dlclose(\"%s\"), failed: \"%s\"", name, dlerror());
+    }
+
+    return ret;
+}
+
+
+static void
+nxt_discovery_completion_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_mp_t   *mp;
+    nxt_buf_t  *b;
+
+    b = obj;
+    mp = b->data;
+
+    nxt_mp_destroy(mp);
+}
+
+
+static void
+nxt_discovery_quit(nxt_task_t *task, nxt_port_recv_msg_t *msg, void *data)
+{
+    nxt_signal_quit_handler(task, msg);
+}
+
+
+static nxt_int_t
+nxt_proto_setup(nxt_task_t *task, nxt_process_t *process)
+{
+    nxt_int_t              ret;
+    nxt_app_lang_module_t  *lang;
+    nxt_common_app_conf_t  *app_conf;
+
+    app_conf = process->data.app;
+
+    nxt_queue_init(&nxt_proto_children);
+
+    nxt_app_conf = app_conf;
+
+    lang = nxt_app_lang_module(task->thread->runtime, &app_conf->type);
+    if (nxt_slow_path(lang == NULL)) {
+        nxt_alert(task, "unknown application type: \"%V\"", &app_conf->type);
+        return NXT_ERROR;
+    }
+
+    nxt_app = lang->module;
+
+    if (nxt_app == NULL) {
+        nxt_debug(task, "application language module: %s \"%s\"",
+                  lang->version, lang->file);
+
+        nxt_app = nxt_app_module_load(task, lang->file);
+        if (nxt_slow_path(nxt_app == NULL)) {
+            return NXT_ERROR;
+        }
+    }
+
+    if (nxt_slow_path(nxt_app_set_environment(app_conf->environment)
+                      != NXT_OK))
+    {
+        nxt_alert(task, "failed to set environment");
+        return NXT_ERROR;
+    }
+
+    if (nxt_app->setup != NULL) {
+        ret = nxt_app->setup(task, process, app_conf);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return ret;
+        }
+    }
+
+#if (NXT_HAVE_ISOLATION_ROOTFS)
+    if (process->isolation.rootfs != NULL) {
+        if (process->isolation.mounts != NULL) {
+            ret = nxt_isolation_prepare_rootfs(task, process);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                return ret;
+            }
+        }
+
+        ret = nxt_isolation_change_root(task, process);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NXT_ERROR;
+        }
+    }
+#endif
+
+    if (app_conf->working_directory != NULL
+        && app_conf->working_directory[0] != 0)
+    {
+        ret = chdir(app_conf->working_directory);
+
+        if (nxt_slow_path(ret != 0)) {
+            nxt_log(task, NXT_LOG_WARN, "chdir(%s) failed %E",
+                    app_conf->working_directory, nxt_errno);
+
+            return NXT_ERROR;
+        }
+    }
+
+    process->state = NXT_PROCESS_STATE_CREATED;
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_proto_start(nxt_task_t *task, nxt_process_data_t *data)
+{
+    nxt_debug(task, "prototype waiting for clone messages");
+
+    return NXT_OK;
+}
+
+
+#if (NXT_USE_CMSG_PID)
+
+/*
+ * Is the kernel-validated sender of this START_PROCESS allowed to make the
+ * prototype fork a worker?
+ *
+ * Only the router ever sends one (nxt_router_start_app_process_handler(),
+ * src/nxt_router.c:469, and nxt_router_app_prefork(), :3379), but every
+ * worker the prototype forks inherits the write end of the prototype's own
+ * port socket -- nxt_proc_keep_matrix[] does not list it, and
+ * nxt_process_close_ports() keeps the parent's port unconditionally -- and
+ * nxt_port_handler() dispatches on the wire type alone.  So without this
+ * test one compromised worker can spend the prototype's process budget, and,
+ * once #268 has the prototype answer for a child that dies, drive the
+ * router's start bookkeeping from the inside.
+ *
+ * The test has two arms because the prototype has two pid views of the
+ * router, and the credential the kernel writes is always relative to the
+ * receiver's pid namespace:
+ *
+ *  - Sharing main's namespace, the router is an ordinary visible process and
+ *    the credential is its global pid, which is what the inherited
+ *    rt->port_by_type[NXT_PROCESS_ROUTER] is keyed on.  This is the same
+ *    whitelist nxt_main_start_process_handler() applies
+ *    (src/nxt_main_process.c:532).
+ *
+ *  - Under "isolation": {"namespaces": {"pid": true}} the prototype is the
+ *    init of its own namespace (nxt_process.c:765) and the router lives in
+ *    an ancestor of it, so the router has no pid there at all: the kernel
+ *    translates an untranslatable sender to 0 (pid_vnr() returns 0 outside
+ *    the receiver's namespace; measured, not assumed).  Comparing against
+ *    the router's global pid would then refuse every legitimate start.  A
+ *    credential of 0 is therefore what "from outside this namespace" looks
+ *    like, and it is exactly the set the prototype does not fork: its
+ *    workers are forked with no clone flags of their own
+ *    (nxt_proto_start_process_handler() leaves process->isolation zeroed),
+ *    so each of them is inside this namespace and presents a non-zero
+ *    namespace-local pid.  What this arm authenticates is therefore a
+ *    namespace boundary, not an identity: it admits every holder of the
+ *    write end that sits outside this namespace.  By construction that is
+ *    main and the router (nxt_proc_keep_matrix[] keeps only those two in a
+ *    worker, and nxt_proc_send_matrix[] lets the prototype answer only
+ *    those two); main is trusted and does not send START_PROCESS.  A worker
+ *    that passes its inherited port out of the namespace over SCM_RIGHTS
+ *    turns an accomplice into an admitted sender, which needs a second
+ *    foothold and is the limit of what a credential can decide here.
+ *
+ * The reply addressing at "failed:" is deliberately left keyed on
+ * msg->port_msg.pid: the runtime port hash is keyed on the global pid, which
+ * in the isolated arm is precisely the number the credential cannot supply.
+ * That is why a refused message is not answered at all -- answering it would
+ * let the forger name any port and stream it likes and have the prototype
+ * cancel somebody else's RPC.  A forgery strands nothing: the router never
+ * armed an RPC for a message it did not send.  A genuine start refused by
+ * the router-port-is-NULL branch would be a different matter -- the router's
+ * RPC is keyed on the prototype (nxt_port_rpc_ex_set_peer(), src/nxt_router.c),
+ * so it would stay armed until the prototype dies -- but that branch is
+ * reachable only once the router is already gone, and a restarted router
+ * cannot address a pre-existing prototype at all: nxt_port_send_new_port()
+ * announces a newcomer outward and never announces existing peers to it.
+ */
+static nxt_bool_t
+nxt_proto_start_process_sender_ok(nxt_task_t *task, nxt_runtime_t *rt,
+    nxt_port_recv_msg_t *msg)
+{
+    nxt_port_t  *router_port;
+
+    if (rt->is_pid_isolated) {
+        return nxt_recv_msg_cmsg_pid(msg) == 0;
+    }
+
+    router_port = rt->port_by_type[NXT_PROCESS_ROUTER];
+
+    if (nxt_slow_path(router_port == NULL)) {
+        nxt_alert(task, "router port not found");
+        return 0;
+    }
+
+    return nxt_recv_msg_cmsg_pid(msg) == router_port->pid;
+}
+
+#endif
+
+
+static void
+nxt_proto_start_process_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    u_char              *p;
+    nxt_int_t           ret;
+    nxt_port_t          *port;
+    nxt_runtime_t       *rt;
+    nxt_process_t       *process;
+    nxt_process_init_t  *init;
+
+    rt = task->thread->runtime;
+
+#if (NXT_USE_CMSG_PID)
+    /*
+     * Before anything is allocated or forked, and without a reply: see
+     * nxt_proto_start_process_sender_ok().  The descriptors are closed here
+     * because this handler owns whatever the message carried -- the port
+     * read loop does not reclaim them (src/nxt_port_socket.c:1381).  The
+     * router's own START_PROCESS to a prototype carries none (both fds are
+     * -1 at src/nxt_router.c:469 and :3379; the shared port and queue only
+     * travel in the one it sends main), so this is for what a forger
+     * attaches, not for anything a legitimate message brings.
+     */
+    if (nxt_slow_path(!nxt_proto_start_process_sender_ok(task, rt, msg))) {
+        nxt_alert(task, "process %PI cannot start processes",
+                  nxt_recv_msg_cmsg_pid(msg));
+
+        nxt_port_recv_msg_close_fds(msg);
+
+        return;
+    }
+#endif
+
+    /*
+     * A prototype that got QUIT only waits for its workers to exit.  The
+     * router can still send START_PROCESS at that point.  On shutdown main
+     * sends QUIT to the prototype directly.  The prototype reports the exit
+     * of a worker to the router.  The router starts a replacement before
+     * its own QUIT arrives.  A worker forked now gets no QUIT from anyone.
+     * The prototype waits for that worker, so Unit does not exit.  Refuse
+     * the start.  The reply fails the RPC of the router and gives the slot
+     * back.
+     */
+    if (nxt_slow_path(nxt_proto_exiting)) {
+        nxt_debug(task, "prototype is exiting, start process refused");
+
+        nxt_port_recv_msg_close_fds(msg);
+
+        goto failed;
+    }
+
+    process = nxt_process_new(rt);
+    if (nxt_slow_path(process == NULL)) {
+        goto failed;
+    }
+
+    process->mem_pool = nxt_mp_create(1024, 128, 256, 32);
+    if (nxt_slow_path(process->mem_pool == NULL)) {
+        nxt_process_use(task, process, -1);
+        goto failed;
+    }
+
+    process->parent_port = rt->port_by_type[NXT_PROCESS_PROTOTYPE];
+
+    init = nxt_process_init(process);
+    *init = nxt_app_process;
+
+    process->name = nxt_mp_alloc(process->mem_pool, nxt_app_conf->name.length
+                                 + sizeof("\"\" application") + 1);
+
+    if (nxt_slow_path(process->name == NULL)) {
+        nxt_process_use(task, process, -1);
+
+        goto failed;
+    }
+
+    init->start = nxt_app->start;
+
+    init->name = (const char *) nxt_app_conf->name.start;
+
+    p = (u_char *) process->name;
+    *p++ = '"';
+    p = nxt_cpymem(p, nxt_app_conf->name.start, nxt_app_conf->name.length);
+    p = nxt_cpymem(p, "\" application", 13);
+    *p = '\0';
+
+    process->user_cred = &rt->user_cred;
+
+    process->data.app = nxt_app_conf;
+
+    /*
+     * Remember who to answer, not just which stream: the RPC is registered on
+     * the initiator's port, and by the time this child is reaped the message
+     * that named it is long gone.  nxt_proto_child_exited() is then the only
+     * thing left that can report a child which died before it was announced.
+     */
+    process->stream = msg->port_msg.stream;
+    process->stream_pid = msg->port_msg.pid;
+    process->stream_port = msg->port_msg.reply_port;
+
+    init->siblings = &nxt_proto_children;
+
+    ret = nxt_process_start(task, process);
+    if (nxt_slow_path(ret == NXT_ERROR)) {
+        nxt_process_use(task, process, -1);
+
+        goto failed;
+    }
+
+    nxt_proto_process_add(task, process);
+
+    return;
+
+failed:
+
+    port = nxt_runtime_port_find(rt, msg->port_msg.pid,
+                                 msg->port_msg.reply_port);
+
+    if (nxt_fast_path(port != NULL)) {
+        nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
+                              -1, msg->port_msg.stream, 0, NULL);
+    }
+}
+
+
+#if (NXT_TESTS)
+
+void
+nxt_proto_test_run_start_process_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg)
+{
+    nxt_proto_start_process_handler(task, msg);
+}
+
+
+void
+nxt_proto_test_set_exiting(nxt_bool_t exiting)
+{
+    nxt_proto_exiting = exiting;
+}
+
+#endif
+
+
+static void
+nxt_proto_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    uint8_t        quit_mode;
+    nxt_runtime_t  *rt;
+
+    /*
+     * The QUIT message from main carries a single nxt_port_quit_mode_t
+     * byte (see nxt_runtime_quit_buf()).  Forward it to the children
+     * unchanged so a graceful quit reaches every libunit context, not
+     * only the ports main contacts directly.  An empty body (legacy
+     * senders, or an allocation failure on the sender side) and any
+     * value other than the two defined ones normalise to
+     * NXT_PORT_QUIT_NORMAL, so a malformed sender cannot propagate a
+     * bogus byte through the whole worker pool.
+     */
+    quit_mode = NXT_PORT_QUIT_NORMAL;
+
+    if (msg->buf != NULL && nxt_buf_mem_used_size(&msg->buf->mem) >= 1
+        && msg->buf->mem.pos[0] == NXT_PORT_QUIT_GRACEFUL)
+    {
+        quit_mode = NXT_PORT_QUIT_GRACEFUL;
+    }
+
+    nxt_debug(task, "prototype quit handler (quit_mode=%d)", quit_mode);
+
+    rt = task->thread->runtime;
+    rt->quit_mode = quit_mode;
+
+    nxt_proto_quit_children(task);
+
+    nxt_proto_exiting = 1;
+
+    if (nxt_queue_is_empty(&nxt_proto_children)) {
+        nxt_process_quit(task, 0);
+    }
+}
+
+
+/*
+ * Tell every worker to go, and wait for the SIGCHLD of each: only when
+ * nxt_proto_children is empty does nxt_proto_sigchld_handler() run
+ * nxt_process_quit() for the prototype itself.
+ *
+ * A port message is how a worker is told, and a worker that has never sent
+ * PROCESS_READY is not reading its port yet.  That alone does not lose the
+ * message: the QUIT sits in the socket, and a module worker still inside the
+ * module's own start function reads it the moment nxt_unit_init() starts
+ * reading -- which is why an application that merely takes its time to start
+ * shuts down cleanly, and has to keep doing so.
+ *
+ * What is lost is the QUIT to a worker that will never read that port at
+ * all: a "type": "external" one exec'd the user's binary out of
+ * nxt_app_setup() before any of ours ran, and a module worker whose start
+ * function never returns is no better.  Such a worker outlives the request
+ * that asked for it and the prototype waits on it for good, so the pair
+ * survives every drain there is, including unitd's own exit.  Measured with
+ * an external application running /bin/sleep and a "limits":
+ * {"start_timeout"} that gives up on it: five rejected configuration PUTs
+ * left five prototypes and five workers alive, and replacing the
+ * configuration did not collect them either.
+ *
+ * The two are the same worker until one of them announces itself, and
+ * nothing here can tell them apart -- that is precisely the question
+ * "start_timeout" exists to answer.  So the QUIT goes to every worker as it
+ * always did, and where the application declared a bound, the prototype arms
+ * one of its own: SIGKILL for whatever is still silent when it expires, in
+ * nxt_proto_kill_silent().
+ *
+ * That deadline is strictly later than the router's, and by a whole
+ * "start_timeout": it is armed here, and this runs on a QUIT the router only
+ * sends once it has itself given up on the application.  A worker that would
+ * have announced itself within the bound the user asked for therefore gets
+ * that whole bound over again before anything is signalled.
+ *
+ * With no "start_timeout" nothing is armed and this is exactly what it was,
+ * unbounded -- as the wait for an application start is unbounded by default.
+ */
+
+static void
+nxt_proto_quit_children(nxt_task_t *task)
+{
+    nxt_bool_t          silent;
+    nxt_port_t          *port;
+    nxt_process_t       *process;
+    nxt_runtime_t       *rt;
+    nxt_event_engine_t  *engine;
+
+    rt = task->thread->runtime;
+
+    silent = 0;
+
+    nxt_queue_each(process, &nxt_proto_children, nxt_process_t, link) {
+
+        if (nxt_slow_path(process->state != NXT_PROCESS_STATE_READY)) {
+            silent = 1;
+        }
+
+        port = nxt_process_port_first(process);
+
+        /*
+         * The router stops its own workers before it quits the prototype.
+         * A worker can exit before the prototype handles its SIGCHLD.
+         * The QUIT to that worker then fails with EPIPE.
+         * nxt_socketpair_send_ex() logs this failure at info for a QUIT.
+         */
+        nxt_runtime_port_send_quit(task, rt, port);
+    }
+    nxt_queue_loop;
+
+    if (!silent || nxt_app_conf == NULL || nxt_app_conf->start_timeout == 0) {
+        return;
+    }
+
+    engine = task->thread->engine;
+
+    nxt_proto_kill_timer.bias = NXT_TIMER_DEFAULT_BIAS;
+    nxt_proto_kill_timer.work_queue = &engine->fast_work_queue;
+    nxt_proto_kill_timer.handler = nxt_proto_kill_silent;
+    nxt_proto_kill_timer.task = &engine->task;
+    nxt_proto_kill_timer.log = nxt_proto_kill_timer.task->log;
+
+    nxt_timer_add(engine, &nxt_proto_kill_timer, nxt_app_conf->start_timeout);
+
+    nxt_debug(task, "app \"%V\" quit deadline %M ms for a worker that has not "
+                    "announced itself",
+              &nxt_app_conf->name, nxt_app_conf->start_timeout);
+}
+
+
+/*
+ * The prototype's deadline expired: a worker it told to quit has still not
+ * announced itself, so it never read that QUIT and never will.
+ *
+ * Signal it, which is possible precisely because it never announced itself:
+ * the prototype forked it and knows its pid, where the router only ever
+ * learns one from PROCESS_READY.  SIGKILL, not SIGTERM, because what such a
+ * worker does with a catchable signal is the user's binary's business and one
+ * that ignores SIGTERM is the case this exists for; nothing is lost, because
+ * a worker that has not announced itself holds no port anyone can reach, no
+ * mapped queue (nxt_port_process_ready_handler() maps it at PROCESS_READY)
+ * and no request.
+ *
+ * Read process->isolated_pid, not ->pid: under "isolation": {"namespaces":
+ * {"pid": true}} nxt_proto_process_created_handler() rewrites ->pid to the
+ * global pid and only ->isolated_pid stays valid in this namespace.  It is
+ * the number waitpid() reports in nxt_proto_sigchld_handler(), and the one
+ * nxt_port_process_ready_handler() signals for the same reason.
+ */
+
+static void
+nxt_proto_kill_silent(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_process_t  *process;
+
+    nxt_queue_each(process, &nxt_proto_children, nxt_process_t, link) {
+
+        if (process->state == NXT_PROCESS_STATE_READY) {
+            continue;
+        }
+
+        nxt_log(task, NXT_LOG_INFO,
+                "app process %PI neither announced itself nor acted on the "
+                "quit it was sent within \"start_timeout\"; killing it",
+                process->isolated_pid);
+
+        if (nxt_fast_path(process->isolated_pid > 0)
+            && kill(process->isolated_pid, SIGKILL) == -1)
+        {
+            /*
+             * ESRCH is ordinary: the worker may already have exited with its
+             * SIGCHLD still pending, and that SIGCHLD drains it.
+             */
+            nxt_log(task, (nxt_errno == ESRCH) ? NXT_LOG_INFO : NXT_LOG_ALERT,
+                    "kill(%PI, SIGKILL) failed for an app process that never "
+                    "announced itself %E",
+                    process->isolated_pid, nxt_errno);
+        }
+    }
+    nxt_queue_loop;
+}
+
+
+static void
+nxt_proto_process_created_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_pid_t      isolated_pid, pid;
+    nxt_process_t  *process;
+
+    isolated_pid = nxt_recv_msg_cmsg_pid(msg);
+
+    process = nxt_proto_process_find(task, isolated_pid);
+    if (nxt_slow_path(process == NULL)) {
+        return;
+    }
+
+    process->state = NXT_PROCESS_STATE_CREATED;
+
+    pid = msg->port_msg.pid;
+
+    if (process->pid != pid) {
+        nxt_debug(task, "app process %PI (aka %PI) is created", isolated_pid,
+                  pid);
+
+        process->pid = pid;
+
+    } else {
+        nxt_debug(task, "app process %PI is created", isolated_pid);
+    }
+
+    if (!process->registered) {
+        nxt_assert(!nxt_queue_is_empty(&process->ports));
+
+        nxt_runtime_process_add(task, process);
+
+        nxt_port_use(task, nxt_process_port_first(process), -1);
+    }
+}
+
+
+static void
+nxt_proto_signal_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_trace(task, "signal signo:%d (%s) received, ignored",
+              (int) (uintptr_t) obj, data);
+}
+
+
+static void
+nxt_proto_sigterm_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_trace(task, "signal signo:%d (%s) received",
+              (int) (uintptr_t) obj, data);
+
+    /*
+     * A direct signal to the prototype is not the user-initiated
+     * lifecycle path (that goes main -> NXT_PORT_MSG_QUIT -> the
+     * message handler above): treat it as fast exit so children drop
+     * in-flight work rather than wait on a drain nobody requested.
+     */
+    task->thread->runtime->quit_mode = NXT_PORT_QUIT_NORMAL;
+
+    nxt_proto_quit_children(task);
+
+    nxt_proto_exiting = 1;
+
+    if (nxt_queue_is_empty(&nxt_proto_children)) {
+        nxt_process_quit(task, 0);
+    }
+}
+
+
+static void
+nxt_proto_sigchld_handler(nxt_task_t *task, void *obj, void *data)
+{
+    int            status;
+    nxt_err_t      err;
+    nxt_pid_t      pid;
+    nxt_port_t     *port;
+    nxt_process_t  *process;
+    nxt_runtime_t  *rt;
+
+    rt = task->thread->runtime;
+
+    nxt_debug(task, "proto sigchld handler signo:%d (%s)",
+              (int) (uintptr_t) obj, data);
+
+    for ( ;; ) {
+        pid = waitpid(-1, &status, WNOHANG);
+
+        if (pid == -1) {
+
+            switch (err = nxt_errno) {
+
+            case NXT_ECHILD:
+                return;
+
+            case NXT_EINTR:
+                continue;
+
+            default:
+                nxt_alert(task, "waitpid() failed: %E", err);
+                return;
+            }
+        }
+
+        nxt_debug(task, "waitpid(): %PI", pid);
+
+        if (pid == 0) {
+            return;
+        }
+
+        process = nxt_proto_process_remove(task, pid);
+
+        if (WTERMSIG(status)) {
+            if (rt->is_pid_isolated) {
+                nxt_alert(task, "app process %PI (isolated %PI) "
+                                "exited on signal %d%s",
+                          process != NULL ? process->pid : 0,
+                          pid, WTERMSIG(status),
+                          NXT_WCOREDUMP(status) ? " (core dumped)" : "");
+
+            } else {
+                nxt_alert(task, "app process %PI exited on signal %d%s",
+                          pid, WTERMSIG(status),
+                          NXT_WCOREDUMP(status) ? " (core dumped)" : "");
+            }
+
+        } else {
+            if (rt->is_pid_isolated) {
+                nxt_trace(task, "app process %PI (isolated %PI) "
+                                "exited with code %d",
+                          process != NULL ? process->pid : 0,
+                          pid, WEXITSTATUS(status));
+
+            } else {
+                nxt_trace(task, "app process %PI exited with code %d",
+                          pid, WEXITSTATUS(status));
+            }
+        }
+
+        if (process == NULL) {
+            continue;
+        }
+
+        if (process->registered) {
+            port = NULL;
+
+        } else {
+            nxt_assert(!nxt_queue_is_empty(&process->ports));
+
+            port = nxt_process_port_first(process);
+        }
+
+        nxt_proto_child_exited(task, process);
+
+        nxt_process_close_ports(task, process);
+
+        if (port != NULL) {
+            nxt_port_use(task, port, -1);
+        }
+
+        if (nxt_proto_exiting && nxt_queue_is_empty(&nxt_proto_children)) {
+            nxt_process_quit(task, 0);
+            return;
+        }
+    }
+}
+
+
+/*
+ * Report a reaped child of the prototype.  Every child is forked to satisfy a
+ * START_PROCESS request, and that request has an RPC handler armed on the
+ * initiator's port; something has to retire it when the child dies or the
+ * initiator waits forever.  This closes the case where the child dies.
+ *
+ * The case where the *prototype* dies part-way through an on-demand start is
+ * closed elsewhere and no longer belongs on this list:
+ * nxt_router_start_app_process_handler() keys that RPC on the prototype
+ * (nxt_port_rpc_ex_set_peer(), src/nxt_router.c), so the REMOVE_PID for the
+ * prototype reaches nxt_port_rpc_remove_peer() and fails the start, releasing
+ * the app->pending_processes slot with it.
+ *
+ * What that leaves is this function's case alone: a child that dies before
+ * PROCESS_CREATED, which no REMOVE_PID describes, because until the handshake
+ * completes the prototype does not necessarily know a globally valid pid for
+ * it.
+ *
+ * A child that got as far as PROCESS_CREATED is reported by REMOVE_PID, which
+ * carries ->stream: nxt_router_remove_pid_handler() turns a stream-bearing
+ * REMOVE_PID into an RPC error.  A child still in the CREATING state cannot be
+ * announced that way.  The pid is the whole content of REMOVE_PID, and until
+ * the PROCESS_CREATED exchange completes the prototype does not necessarily
+ * know a globally valid one: under pid isolation ->pid is still the
+ * namespace-local pid nxt_process_create() got from fork(), and the global pid
+ * only arrives with PROCESS_CREATED (see nxt_proto_process_created_handler()
+ * and 900828cc, which is why such a process is deliberately kept out of the
+ * global pid hash).  Broadcasting that pid would ask every receiver to remove
+ * whatever unrelated process happens to hold it.
+ *
+ * So the gate stays exactly as it was, and the CREATING case is answered
+ * directly instead: an RPC error to the port the start request came from,
+ * addressed by ->stream_pid/->stream_port rather than by any pid of the dead
+ * child.  It is the same message nxt_proto_start_process_handler() sends when
+ * the fork itself fails.
+ *
+ * Answering the initiator is not the whole job, though, because the initiator
+ * is not the only process left holding the child.  A worker that got as far as
+ * WHOAMI made main create a process record and a port for it, with main's end
+ * of the worker's port socket in it (nxt_main_process_whoami_handler()), and
+ * linked that record into the prototype's ->children.  REMOVE_PID is what
+ * retires it -- nxt_proc_remove_notify_matrix pairs a dying APP with MAIN --
+ * so a CREATING child that is only answered on the RPC leaves main holding a
+ * record and an fd until the prototype itself exits.  Before this whole fix
+ * that leak was capped by the wedge: the application stopped starting
+ * processes, so at most one could leak.  Now that the start RPC is retired and
+ * requests retry, a worker that keeps dying in that window costs main one
+ * record and one descriptor per attempt, without bound.
+ *
+ * The pid problem is the same one the gate exists for, so the answer is the
+ * same test the rest of the code already uses for "is this pid a usable global
+ * key": rt->is_pid_isolated, which nxt_process_create() consults to decide
+ * whether a forked child may go into the runtime hash at all.  When it is
+ * clear, the prototype shares main's pid namespace, ->pid is the fork() return
+ * in that namespace, and it is by construction the same number main read from
+ * SCM_CREDENTIALS on the WHOAMI message -- so REMOVE_PID is safe.  The
+ * notification is deliberately made after ->stream has been cleared, so it
+ * carries no stream: the initiator has already been answered directly, and a
+ * stream-bearing REMOVE_PID would make nxt_router_remove_pid_handler() fail
+ * the same RPC a second time.
+ *
+ * Ordering is not a race even though the two messages come from two processes:
+ * the worker's WHOAMI and the prototype's REMOVE_PID are both written to the
+ * single write end of main's port socketpair, inherited by every descendant,
+ * so they share one kernel queue.  The worker's WHOAMI write completes before
+ * it exits, and the prototype writes only after waitpid() has reaped it.  If
+ * the WHOAMI never reached the socket it died with the worker, and main has no
+ * record to retire.
+ *
+ * When rt->is_pid_isolated is set there is no safe pid to send: ->pid is the
+ * namespace-local one, and the global pid main and the router keyed their
+ * records on cannot be derived from it here.  Sending it anyway would ask
+ * every receiver to remove whatever unrelated process holds that number -- and
+ * a prototype's namespace-local counter climbs with each worker it forks, so
+ * it walks into the range the daemon's own pids occupy.  Removing a live
+ * sibling's ports drops requests, which is worse than the leak, so no
+ * REMOVE_PID is sent there.
+ *
+ * So the report goes to main alone, as REMOVE_CHILD_PID carrying the
+ * namespace-local pid.  Main holds both names -- the global pid from
+ * SCM_CREDENTIALS and the local one from the WHOAMI header -- and resolves
+ * the report among the sender's own children only.  It then tells the router
+ * by the global pid, so the router sees what a REMOVE_PID would have given it.
+ */
+
+void
+nxt_proto_child_exited(nxt_task_t *task, nxt_process_t *process)
+{
+    nxt_int_t      ret;
+    nxt_uint_t     level;
+    nxt_port_t     *port;
+    nxt_runtime_t  *rt;
+
+    if (process->state != NXT_PROCESS_STATE_CREATING) {
+        nxt_port_remove_notify_others(task, process);
+
+        return;
+    }
+
+    rt = task->thread->runtime;
+
+    /*
+     * A CREATING child whose initiator is already gone is the expected shape
+     * of a teardown rather than an anomaly of one, and the record leak noted
+     * below is moot once the prototype itself is on its way out.
+     */
+    level = nxt_proto_exiting ? NXT_LOG_WARN : NXT_LOG_ALERT;
+
+    if (process->stream != 0) {
+        port = nxt_runtime_port_find(rt, process->stream_pid,
+                                     process->stream_port);
+
+        if (nxt_slow_path(port == NULL)) {
+            if (rt->is_pid_isolated) {
+                nxt_log(task, level, "app process (isolated %PI) died before "
+                        "it was created and its start initiator %PI port %d "
+                        "is gone (stream %uD)", process->isolated_pid,
+                        process->stream_pid, (int) process->stream_port,
+                        process->stream);
+
+            } else {
+                nxt_log(task, level, "app process %PI died before it was "
+                        "created and its start initiator %PI port %d is gone "
+                        "(stream %uD)", process->pid, process->stream_pid,
+                        (int) process->stream_port, process->stream);
+            }
+
+            /* Nothing can carry the answer; do not leave it armed. */
+            process->stream = 0;
+
+        } else {
+            ret = nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
+                                        -1, process->stream, 0, NULL);
+
+            /*
+             * One answer per start request: nxt_port_rpc_handler() drops a
+             * stream it no longer knows, but the identifiers come from a
+             * shared counter and are reused, so a second error for a retired
+             * stream could land on somebody else's RPC.  So ->stream is
+             * cleared only once the answer has actually been written or
+             * queued, which is what makes the REMOVE_PID below streamless.
+             *
+             * Three failures reach this call site, and none of them leaves
+             * a message behind.  The prototype maps no queue for a router
+             * port -- nxt_app_new_port_handler() closes the queue descriptor
+             * every NEW_PORT carries, and main maps a queue only for an
+             * application port -- so nxt_port_socket_write2() never takes
+             * the shared-ring path that answers NXT_AGAIN.  What is left is
+             * nxt_port_msg_chk_insert() failing to allocate; an inline
+             * write that hit EAGAIN with no memory left to hold it for a
+             * later attempt; and an inline write to a router port whose
+             * peer has died.
+             *
+             * Keeping ->stream then lets the REMOVE_PID carry it, and
+             * nxt_router_remove_pid_handler() turns that into the same RPC
+             * error -- the fallback the CREATED path has always used.
+             * Clearing it regardless would leave the start RPC armed and
+             * rebuild the wedge this function exists to close, silently.
+             *
+             * That fallback is a second chance, not a guarantee: the
+             * REMOVE_PID allocates a buffer and a message of its own from
+             * the same pools and can fail the same way, and then only the
+             * application's "limits.start_timeout" retires the start.  The
+             * alert below is what makes that case visible instead of
+             * silent.  After an EAGAIN, REMOVE_PID cannot rescue it either:
+             * the same EAGAIN cleared write_ready, so REMOVE_PID is queued
+             * rather than sent, and the error handler that runs next drains
+             * it too.
+             */
+            if (nxt_fast_path(ret == NXT_OK)) {
+                process->stream = 0;
+
+            } else if (rt->is_pid_isolated) {
+                nxt_log(task, level, "app process (isolated %PI) died before "
+                        "it was created and could not be reported to its "
+                        "start initiator %PI port %d (stream %uD)",
+                        process->isolated_pid, process->stream_pid,
+                        (int) process->stream_port, process->stream);
+
+            } else {
+                nxt_log(task, level, "app process %PI died before it was "
+                        "created and could not be reported to its start "
+                        "initiator %PI port %d (stream %uD); the REMOVE_PID "
+                        "that follows carries the report unless it cannot be "
+                        "allocated either", process->pid, process->stream_pid,
+                        (int) process->stream_port, process->stream);
+            }
+        }
+    }
+
+    /*
+     * Under pid isolation the direct answer is the only vehicle: ->pid is the
+     * namespace-local one, so no REMOVE_PID may be sent for this child at
+     * all.  When that answer could not be allocated above, the start RPC is
+     * therefore left armed.  What retires it then is the prototype's own
+     * death -- the router keys that RPC on the process it sent START_PROCESS
+     * to (nxt_port_rpc_ex_set_peer(), src/nxt_router.c), so main's REMOVE_PID
+     * for the prototype reaches nxt_port_rpc_remove_peer() -- or, sooner and
+     * per application, "limits": {"start_timeout"}, which defaults to none.
+     * Closing it here needs an answer that cannot fail to allocate, which
+     * this layer has no way to reserve; tracked with the record leak in #310.
+     */
+
+    if (nxt_slow_path(rt->is_pid_isolated)) {
+        nxt_debug(task, "app process (isolated %PI) died before it was "
+                  "created", process->isolated_pid);
+
+        nxt_proto_report_child_pid(task, process, level);
+
+        /* No REMOVE_PID will carry it; do not leave it armed. */
+        process->stream = 0;
+
+        return;
+    }
+
+    nxt_port_remove_notify_others(task, process);
+}
+
+
+/*
+ * Tell main that a child of this prototype died, by its namespace-local pid.
+ * The message carries no stream: only the router turns one into an RPC error,
+ * and this goes to main alone.
+ *
+ * Ordering: the worker's WHOAMI and this message go to the same write end of
+ * main's port socketpair, and this runs only after waitpid() reaped the
+ * worker, so main reads the WHOAMI first.  This holds because main's port has
+ * no shared-memory queue.
+ */
+
+static void
+nxt_proto_report_child_pid(nxt_task_t *task, nxt_process_t *process,
+    nxt_uint_t level)
+{
+    nxt_buf_t      *buf;
+    nxt_port_t     *main_port;
+    nxt_runtime_t  *rt;
+
+    rt = task->thread->runtime;
+
+    main_port = rt->port_by_type[NXT_PROCESS_MAIN];
+    if (nxt_slow_path(main_port == NULL)) {
+        goto fail;
+    }
+
+    buf = nxt_buf_mem_ts_alloc(task, task->thread->engine->mem_pool,
+                               sizeof(nxt_pid_t));
+    if (nxt_slow_path(buf == NULL)) {
+        goto fail;
+    }
+
+    buf->mem.free = nxt_cpymem(buf->mem.free, &process->isolated_pid,
+                               sizeof(nxt_pid_t));
+
+    if (nxt_fast_path(nxt_port_socket_write(task, main_port,
+                                            NXT_PORT_MSG_REMOVE_CHILD_PID,
+                                            -1, 0, 0, buf)
+                      == NXT_OK))
+    {
+        return;
+    }
+
+    /* Still ours: the port layer takes the buffer only on NXT_OK. */
+
+    nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                       buf->completion_handler, task, buf, buf->parent);
+
+fail:
+
+    /* Main then keeps the record until this prototype exits (#310). */
+
+    nxt_log(task, level, "app process (isolated %PI) died before it was "
+            "created and could not be reported to the main process",
+            process->isolated_pid);
+}
+
+
+static nxt_app_module_t *
+nxt_app_module_load(nxt_task_t *task, const char *name)
+{
+    char              *err;
+    void              *dl;
+    nxt_app_module_t  *app;
+
+    dl = dlopen(name, RTLD_GLOBAL | RTLD_LAZY);
+
+    if (nxt_slow_path(dl == NULL)) {
+        err = dlerror();
+        nxt_alert(task, "dlopen(\"%s\") failed: \"%s\"",
+                  name, err != NULL ? err : "(null)");
+        return NULL;
+    }
+
+    app = dlsym(dl, "nxt_app_module");
+
+    if (nxt_slow_path(app == NULL)) {
+        err = dlerror();
+        nxt_alert(task, "dlsym(\"%s\", \"nxt_app_module\") failed: \"%s\"",
+                  name, err != NULL ? err : "(null)");
+
+        if (dlclose(dl) != 0) {
+            err = dlerror();
+            nxt_alert(task, "dlclose(\"%s\") failed: \"%s\"",
+                      name, err != NULL ? err : "(null)");
+        }
+    }
+
+    return app;
+}
+
+
+static nxt_int_t
+nxt_app_set_environment(nxt_conf_value_t *environment)
+{
+    char              *env, *p;
+    uint32_t          next;
+    nxt_str_t         name, value;
+    nxt_conf_value_t  *value_obj;
+
+    if (environment != NULL) {
+        next = 0;
+
+        for ( ;; ) {
+            value_obj = nxt_conf_next_object_member(environment, &name, &next);
+            if (value_obj == NULL) {
+                break;
+            }
+
+            nxt_conf_get_string(value_obj, &value);
+
+            env = nxt_malloc(name.length + value.length + 2);
+            if (nxt_slow_path(env == NULL)) {
+                return NXT_ERROR;
+            }
+
+            p = nxt_cpymem(env, name.start, name.length);
+            *p++ = '=';
+            p = nxt_cpymem(p, value.start, value.length);
+            *p = '\0';
+
+            if (nxt_slow_path(putenv(env) != 0)) {
+                return NXT_ERROR;
+            }
+        }
+    }
+
+    return NXT_OK;
+}
+
+
+nxt_int_t
+nxt_app_set_logs(void)
+{
+    nxt_int_t              ret;
+    nxt_file_t             file;
+    nxt_task_t             *task;
+    nxt_thread_t           *thr;
+    nxt_process_t          *process;
+    nxt_runtime_t          *rt;
+    nxt_common_app_conf_t  *app_conf;
+
+    thr = nxt_thread();
+
+    task = thr->task;
+
+    rt = task->thread->runtime;
+    if (!rt->daemon) {
+        return NXT_OK;
+    }
+
+    process = rt->port_by_type[NXT_PROCESS_PROTOTYPE]->process;
+    app_conf = process->data.app;
+
+    if (app_conf->stdout_log != NULL) {
+        nxt_memzero(&file, sizeof(nxt_file_t));
+        file.log_level = 1;
+        file.name = (u_char *) app_conf->stdout_log;
+        ret = nxt_file_open(task, &file, O_WRONLY | O_APPEND, O_CREAT, 0666);
+        if (ret == NXT_ERROR) {
+            return NXT_ERROR;
+        }
+
+        nxt_file_stdout(&file);
+        nxt_file_close(task, &file);
+    }
+
+    if (app_conf->stderr_log != NULL) {
+        nxt_memzero(&file, sizeof(nxt_file_t));
+        file.log_level = 1;
+        file.name = (u_char *) app_conf->stderr_log;
+        ret = nxt_file_open(task, &file, O_WRONLY | O_APPEND, O_CREAT, 0666);
+        if (ret == NXT_ERROR) {
+            return NXT_ERROR;
+        }
+
+        nxt_file_stderr(&file);
+        nxt_file_close(task, &file);
+    }
+
+    return NXT_OK;
+}
+
+
+static u_char *
+nxt_cstr_dup(nxt_mp_t *mp, u_char *dst, u_char *src)
+{
+    u_char  *p;
+    size_t  len;
+
+    len = nxt_strlen(src);
+
+    if (dst == NULL) {
+        dst = nxt_mp_alloc(mp, len + 1);
+        if (nxt_slow_path(dst == NULL)) {
+            return NULL;
+        }
+    }
+
+    p = nxt_cpymem(dst, src, len);
+    *p = '\0';
+
+    return dst;
+}
+
+
+static nxt_int_t
+nxt_app_setup(nxt_task_t *task, nxt_process_t *process)
+{
+    nxt_process_init_t  *init;
+
+    process->state = NXT_PROCESS_STATE_CREATED;
+
+    init = nxt_process_init(process);
+
+    return init->start(task, &process->data);
+}
+
+
+nxt_app_lang_module_t *
+nxt_app_lang_module(nxt_runtime_t *rt, nxt_str_t *name)
+{
+    u_char                 *p, *end, *version;
+    size_t                 version_length;
+    nxt_uint_t             i, n;
+    nxt_app_type_t         type;
+    nxt_app_lang_module_t  *lang;
+
+    end = name->start + name->length;
+    version = end;
+
+    for (p = name->start; p < end; p++) {
+        if (*p == ' ') {
+            version = p + 1;
+            break;
+        }
+
+        if (*p >= '0' && *p <= '9') {
+            version = p;
+            break;
+        }
+    }
+
+    type = nxt_app_parse_type(name->start, p - name->start);
+
+    if (type == NXT_APP_UNKNOWN) {
+        return NULL;
+    }
+
+    version_length = end - version;
+
+    lang = rt->languages->elts;
+    n = rt->languages->nelts;
+
+    for (i = 0; i < n; i++) {
+
+        /*
+         * Versions are sorted in descending order
+         * so first match chooses the highest version.
+         */
+
+        if (lang[i].type == type
+            && nxt_strvers_match(lang[i].version, version, version_length))
+        {
+            return &lang[i];
+        }
+    }
+
+    return NULL;
+}
+
+
+nxt_app_type_t
+nxt_app_parse_type(u_char *p, size_t length)
+{
+    nxt_str_t str;
+
+    str.length = length;
+    str.start = p;
+
+    if (nxt_str_eq(&str, "external", 8) || nxt_str_eq(&str, "go", 2)) {
+        return NXT_APP_EXTERNAL;
+
+    } else if (nxt_str_eq(&str, "python", 6)) {
+        return NXT_APP_PYTHON;
+
+    } else if (nxt_str_eq(&str, "php", 3)) {
+        return NXT_APP_PHP;
+
+    } else if (nxt_str_eq(&str, "perl", 4)) {
+        return NXT_APP_PERL;
+
+    } else if (nxt_str_eq(&str, "ruby", 4)) {
+        return NXT_APP_RUBY;
+
+    } else if (nxt_str_eq(&str, "java", 4)) {
+        return NXT_APP_JAVA;
+
+    } else if (nxt_str_eq(&str, "wasm-wasi-component", 19)) {
+        return NXT_APP_WASM_WC;
+
+    } else if (nxt_str_eq(&str, "wasm", 4)) {
+        return NXT_APP_WASM;
+    }
+
+    return NXT_APP_UNKNOWN;
+}
+
+
+nxt_int_t
+nxt_unit_default_init(nxt_task_t *task, nxt_unit_init_t *init,
+    nxt_common_app_conf_t *conf)
+{
+    nxt_port_t     *my_port, *proto_port, *router_port;
+    nxt_runtime_t  *rt;
+
+    nxt_memzero(init, sizeof(nxt_unit_init_t));
+
+    rt = task->thread->runtime;
+
+    proto_port = rt->port_by_type[NXT_PROCESS_PROTOTYPE];
+    if (nxt_slow_path(proto_port == NULL)) {
+        return NXT_ERROR;
+    }
+
+    router_port = rt->port_by_type[NXT_PROCESS_ROUTER];
+    if (nxt_slow_path(router_port == NULL)) {
+        return NXT_ERROR;
+    }
+
+    my_port = nxt_runtime_port_find(rt, nxt_pid, 0);
+    if (nxt_slow_path(my_port == NULL)) {
+        return NXT_ERROR;
+    }
+
+    init->ready_port.id.pid = proto_port->pid;
+    init->ready_port.id.id = proto_port->id;
+    init->ready_port.in_fd = -1;
+    init->ready_port.out_fd = proto_port->pair[1];
+
+    init->ready_stream = my_port->process->stream;
+
+    init->router_port.id.pid = router_port->pid;
+    init->router_port.id.id = router_port->id;
+    init->router_port.in_fd = -1;
+    init->router_port.out_fd = router_port->pair[1];
+
+    init->read_port.id.pid = my_port->pid;
+    init->read_port.id.id = my_port->id;
+    init->read_port.in_fd = my_port->pair[0];
+    init->read_port.out_fd = my_port->pair[1];
+
+    init->shared_port_fd = conf->shared_port_fd;
+    init->shared_queue_fd = conf->shared_queue_fd;
+
+    init->log_fd = 2;
+
+    init->shm_limit = conf->shm_limit;
+    init->request_limit = conf->request_limit;
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_proto_lvlhsh_isolated_pid_test(nxt_lvlhsh_query_t *lhq, void *data)
+{
+    nxt_pid_t      *qpid;
+    nxt_process_t  *process;
+
+    process = data;
+    qpid = (nxt_pid_t *) lhq->key.start;
+
+    if (*qpid == process->isolated_pid) {
+        return NXT_OK;
+    }
+
+    return NXT_DECLINED;
+}
+
+
+static const nxt_lvlhsh_proto_t  lvlhsh_processes_proto  nxt_aligned(64) = {
+    NXT_LVLHSH_DEFAULT,
+    nxt_proto_lvlhsh_isolated_pid_test,
+    nxt_lvlhsh_alloc,
+    nxt_lvlhsh_free,
+};
+
+
+nxt_inline void
+nxt_proto_process_lhq_pid(nxt_lvlhsh_query_t *lhq, nxt_pid_t *pid)
+{
+    lhq->key_hash = nxt_murmur_hash2(pid, sizeof(nxt_pid_t));
+    lhq->key.length = sizeof(nxt_pid_t);
+    lhq->key.start = (u_char *) pid;
+    lhq->proto = &lvlhsh_processes_proto;
+}
+
+
+static void
+nxt_proto_process_add(nxt_task_t *task, nxt_process_t *process)
+{
+    nxt_runtime_t       *rt;
+    nxt_lvlhsh_query_t  lhq;
+
+    rt = task->thread->runtime;
+
+    nxt_proto_process_lhq_pid(&lhq, &process->isolated_pid);
+
+    lhq.replace = 0;
+    lhq.value = process;
+    lhq.pool = rt->mem_pool;
+
+    switch (nxt_lvlhsh_insert(&nxt_proto_processes, &lhq)) {
+
+    case NXT_OK:
+        nxt_debug(task, "process (isolated %PI) added", process->isolated_pid);
+
+        nxt_queue_insert_tail(&nxt_proto_children, &process->link);
+        break;
+
+    default:
+        nxt_alert(task, "process (isolated %PI) failed to add",
+                  process->isolated_pid);
+        break;
+    }
+}
+
+
+static nxt_process_t *
+nxt_proto_process_remove(nxt_task_t *task, nxt_pid_t pid)
+{
+    nxt_runtime_t       *rt;
+    nxt_process_t       *process;
+    nxt_lvlhsh_query_t  lhq;
+
+    nxt_proto_process_lhq_pid(&lhq, &pid);
+
+    rt = task->thread->runtime;
+
+    lhq.pool = rt->mem_pool;
+
+    switch (nxt_lvlhsh_delete(&nxt_proto_processes, &lhq)) {
+
+    case NXT_OK:
+        nxt_debug(task, "process (isolated %PI) removed", pid);
+
+        process = lhq.value;
+
+        nxt_process_unlink(process);
+
+        break;
+
+    default:
+        nxt_debug(task, "process (isolated %PI) remove failed", pid);
+        process = NULL;
+        break;
+    }
+
+    return process;
+}
+
+
+static nxt_process_t *
+nxt_proto_process_find(nxt_task_t *task, nxt_pid_t pid)
+{
+    nxt_process_t       *process;
+    nxt_lvlhsh_query_t  lhq;
+
+    nxt_proto_process_lhq_pid(&lhq, &pid);
+
+    if (nxt_lvlhsh_find(&nxt_proto_processes, &lhq) == NXT_OK) {
+        process = lhq.value;
+
+    } else {
+        nxt_debug(task, "process (isolated %PI) not found", pid);
+
+        process = NULL;
+    }
+
+    return process;
+}

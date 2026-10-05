@@ -1,0 +1,39 @@
+Source: %%NAME%%
+Section: admin
+Priority: optional
+Maintainer: %%PACKAGE_VENDOR%%
+Build-Depends: debhelper (>= 11),
+               linux-libc-dev,
+               libssl-dev,
+               libpcre2-dev%%MODULE_BUILD_DEPENDS%%
+Standards-Version: 4.1.4
+Homepage: %%HOMEPAGE%%
+
+Package: %%NAME%%
+Section: admin
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends},
+         %%RUNTIME%%-r%%UNIT_VERSION%%%%MODULE_DEPENDS%%
+Provides: %%OLDNAME%% (= ${binary:Version})
+Conflicts: %%OLDNAME%%
+Replaces: %%OLDNAME%%
+Description: %%SUMMARY%%
+ NGINX Unit is a runtime and delivery environment for modern distributed
+ applications. It runs the application code in multiple languages
+ (PHP, Python, Go, etc.), and tightly couples it with traffic delivery
+ in and out of the application. Take this application server and proxy
+ directly in the cloud / container environments and fully control your app
+ dynamically via an API.
+ This package contains %%SUMMARY%%.
+
+Package: %%NAME%%-dbg
+Section: debug
+Architecture: any
+Priority: optional
+Depends: %%NAME%% (= ${binary:Version}),
+         ${misc:Depends}
+Provides: %%OLDNAME%%-dbg (= ${binary:Version})
+Conflicts: %%OLDNAME%%-dbg
+Replaces: %%OLDNAME%%-dbg
+Description: %%SUMMARY%% (debug symbols)
+ This package contains the debugging symbols for %%NAME%%

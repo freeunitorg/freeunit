@@ -1,0 +1,94 @@
+
+/*
+ * Copyright (C) Igor Sysoev
+ * Copyright (C) NGINX, Inc.
+ */
+
+#ifndef _NXT_MAIN_PROCESS_H_INCLUDED_
+#define _NXT_MAIN_PROCESS_H_INCLUDED_
+
+
+typedef enum {
+    NXT_SOCKET_ERROR_SYSTEM = 0,
+    NXT_SOCKET_ERROR_NOINET6,
+    NXT_SOCKET_ERROR_PORT,
+    NXT_SOCKET_ERROR_INUSE,
+    NXT_SOCKET_ERROR_NOADDR,
+    NXT_SOCKET_ERROR_ACCESS,
+    NXT_SOCKET_ERROR_PATH,
+} nxt_socket_error_t;
+
+
+nxt_int_t nxt_main_process_start(nxt_thread_t *thr, nxt_task_t *task,
+    nxt_runtime_t *runtime);
+nxt_int_t nxt_main_file_store(nxt_task_t *task, const char *dir,
+    const char *tmp_name, const char *name, u_char *buf, size_t size);
+
+
+/*
+ * A change of a file in a directory of the state, run by the store child
+ * of main.  The conf.json store is not a job.  See nxt_main_store_submit().
+ */
+
+#define NXT_MAIN_STORE_TMP  ".store.tmp"
+
+typedef enum {
+    NXT_MAIN_STORE_PUT = 0,
+    NXT_MAIN_STORE_DELETE,
+} nxt_main_store_op_t;
+
+typedef struct nxt_main_store_job_s  nxt_main_store_job_t;
+
+struct nxt_main_store_job_s {
+    nxt_main_store_job_t  *next;
+    nxt_main_store_op_t   op;
+    const char            *what;       /* For the alerts: "certificate". */
+    const char            *dir;        /* Flushed after the change. */
+    char                  *name;       /* "<dir><base>". */
+    const char            *base;
+    char                  *tmp;        /* PUT: "<dir>.store.tmp". */
+    u_char                *data;       /* PUT: nxt_malloc()ed, owned. */
+    size_t                size;
+    nxt_pid_t             reply_pid;   /* 0: nobody waits for an answer. */
+    nxt_port_id_t         reply_port;
+    uint32_t              stream;
+};
+
+nxt_main_store_job_t *nxt_main_store_job_create(nxt_main_store_op_t op,
+    const char *what, const nxt_str_t *dir, const nxt_str_t *name);
+void nxt_main_store_job_free(nxt_main_store_job_t *job);
+void nxt_main_store_submit(nxt_task_t *task, nxt_main_store_job_t *job);
+
+
+NXT_EXPORT extern nxt_uint_t                nxt_conf_ver;
+NXT_EXPORT extern const nxt_process_init_t  nxt_discovery_process;
+NXT_EXPORT extern const nxt_process_init_t  nxt_controller_process;
+NXT_EXPORT extern const nxt_process_init_t  nxt_router_process;
+NXT_EXPORT extern const nxt_process_init_t  nxt_proto_process;
+NXT_EXPORT extern const nxt_process_init_t  nxt_app_process;
+
+extern const nxt_sig_event_t  nxt_main_process_signals[];
+extern const nxt_sig_event_t  nxt_process_signals[];
+
+#if (NXT_TESTS)
+void nxt_main_test_process_new_failures(nxt_uint_t failures);
+void nxt_main_test_run_start_process_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+void nxt_main_test_run_whoami_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+void nxt_main_test_store_set_delay(nxt_msec_t delay);
+void nxt_main_test_store_schedule(nxt_task_t *task, u_char *p, size_t size);
+nxt_pid_t nxt_main_test_store_pid(void);
+nxt_bool_t nxt_main_test_store_exited(nxt_task_t *task, nxt_pid_t pid,
+    int status);
+void nxt_main_test_store_set_exiting(nxt_task_t *task, nxt_bool_t exiting);
+#if (NXT_USE_CMSG_PID)
+void nxt_main_test_run_name_child(nxt_task_t *task, nxt_process_t *pprocess,
+    nxt_process_t *process, nxt_pid_t ns_pid);
+void nxt_main_test_run_remove_child_pid_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+#endif
+#endif
+
+
+#endif /* _NXT_MAIN_PROCESS_H_INCLUDED_ */

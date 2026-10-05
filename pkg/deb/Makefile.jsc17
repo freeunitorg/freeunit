@@ -1,0 +1,71 @@
+MODULES+=		jsc17
+MODULE_SUFFIX_jsc17=	jsc17
+
+MODULE_SUMMARY_jsc17=	Java 17 module for $(BRAND_TITLE)
+
+MODULE_VERSION_jsc17=	$(VERSION)
+MODULE_RELEASE_jsc17=	1
+
+MODULE_CONFARGS_jsc17=	java --module=java17 --home=/usr/lib/jvm/java-17-openjdk-$$\(DEB_HOST_ARCH\) --jars=/usr/share/$(BRAND)-jsc-common/
+MODULE_MAKEARGS_jsc17=	java17
+MODULE_INSTARGS_jsc17=	java17-install
+
+MODULE_SOURCES_jsc17=	freeunit.example-jsc-app \
+			freeunit.example-jsc17-config
+
+BUILD_DEPENDS_jsc17=	openjdk-17-jdk-headless openjdk-17-jre-headless
+BUILD_DEPENDS+=		$(BUILD_DEPENDS_jsc17)
+
+MODULE_BUILD_DEPENDS_jsc17=,openjdk-17-jdk-headless
+MODULE_DEPENDS_jsc17=,openjdk-17-jre-headless,$(BRAND)-jsc-common (= $(MODULE_VERSION_jsc_common)-$(MODULE_RELEASE_jsc_common)~$(CODENAME))
+
+define MODULE_PREINSTALL_jsc17
+	mkdir -p debian/$(BRAND)-jsc17/usr/share/doc/$(BRAND)-jsc17/examples/jsc-app
+	install -m 644 -p debian/freeunit.example-jsc-app debian/$(BRAND)-jsc17/usr/share/doc/$(BRAND)-jsc17/examples/jsc-app/index.jsp
+	install -m 644 -p debian/freeunit.example-jsc17-config debian/$(BRAND)-jsc17/usr/share/doc/$(BRAND)-jsc17/examples/$(BRAND).config
+	install -m 644 -p src/java/README.JSR-340 debian/$(BRAND)-jsc17/usr/share/doc/$(BRAND)-jsc17/
+endef
+export MODULE_PREINSTALL_jsc17
+
+define MODULE_POSTINSTALL_jsc17
+	cd $$\(BUILDDIR_unit\) \&\& \
+        DESTDIR=$$\(INSTALLDIR\) make java-shared-uninstall
+endef
+export MODULE_POSTINSTALL_jsc17
+
+define MODULE_POST_jsc17
+cat <<BANNER
+----------------------------------------------------------------------
+
+The $(MODULE_SUMMARY_jsc17) has been installed.
+
+To check out the sample app, run these commands:
+
+ sudo service $(RUNTIME) restart
+ cd /usr/share/doc/$(BRAND)-$(MODULE_SUFFIX_jsc17)/examples
+ $(MODULE_CONFIG_PUT)
+ curl http://localhost:8800/
+
+Online documentation is available at $(DOCS_URL)
+
+NOTICE:
+
+This version of Unit code is made available in support of the open source
+development process.  This is an intermediate build made available for
+testing purposes only.  This Unit code is untested and presumed incompatible
+with the JSR 340 Java Servlet 3.1 specification.  You should not deploy or
+write to this code.  You should instead deploy and write production
+applications on pre-built binaries that have been tested and certified
+to meet the JSR-340 compatibility requirements such as certified binaries
+published for the JSR-340 reference implementation available at
+https://javaee.github.io/glassfish/.
+
+Redistribution of any Intermediate Build must retain this notice.
+
+Oracle and Java are registered trademarks of Oracle and/or its affiliates.
+Other names may be trademarks of their respective owners.
+
+----------------------------------------------------------------------
+BANNER
+endef
+export MODULE_POST_jsc17

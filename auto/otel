@@ -1,0 +1,43 @@
+
+# Copyright (C) NGINX, Inc.
+
+if [ $NXT_OTEL = YES ]; then
+
+    $echo "checking for OTEL requirements:"
+
+    $echo -n "  - checking for rust compiler ... "
+    if [ -z $(which rustc 2>/dev/null) ]; then
+        $echo "not found"
+        exit 1;
+    fi
+    $echo "found"
+
+    $echo -n "  - checking for cargo ... "
+    if [ -z $(which cargo 2>/dev/null) ]; then
+        $echo "not found."
+        exit 1;
+    fi
+    $echo "found"
+
+    # The src/otel crate links no TLS stack, so it needs no OpenSSL.
+    # On Linux, its other libraries come from NXT_LIBM, NXT_LIBS and
+    # the compiler driver (libc, libgcc_s).
+
+    case "$NXT_SYSTEM" in
+        Darwin)
+            NXT_OTEL_LIBS="-framework CoreFoundation -framework Security -framework SystemConfiguration"
+            ;;
+        *)
+            NXT_OTEL_LIBS=
+            ;;
+    esac
+
+    cat << END >> $NXT_AUTO_CONFIG_H
+
+#ifndef NXT_HAVE_OTEL
+#define NXT_HAVE_OTEL 1
+#endif
+
+END
+
+fi

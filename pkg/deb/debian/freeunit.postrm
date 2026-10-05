@@ -1,0 +1,19 @@
+#!/bin/sh
+
+set -e
+
+if [ "$1" = "purge" ]; then
+    # Remove the runtime state and logs the package created. Packaged files
+    # (binaries, the example config under /usr/share/doc) are handled by dpkg.
+    rm -rf /var/lib/%%RUNTIME%%
+    rm -f /var/log/%%RUNTIME%%.log /var/log/%%RUNTIME%%.log.*
+
+    # The system %%RUNTIME%% user/group is intentionally NOT removed on purge:
+    # files elsewhere on the system may still be owned by it, and deleting a
+    # system account invites UID reuse. This follows common Debian practice for
+    # daemon system accounts (see adduser(8) / Debian Policy on system users).
+fi
+
+#DEBHELPER#
+
+exit 0

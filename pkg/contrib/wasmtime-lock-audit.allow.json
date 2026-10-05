@@ -1,0 +1,19 @@
+{
+  "comment": [
+    "Findings against crates that the Wasmtime C API library links, and that",
+    "pkg/contrib cannot resolve by bumping the pin.  check-lock-audit.py fails",
+    "the audit on any other linked finding.  A finding outside the linked graph",
+    "needs no entry here; it is reported and ignored.",
+    "The version is part of the key, so a pin bump forces this file to be",
+    "reviewed again rather than carrying an acceptance forward silently."
+  ],
+  "allow": [
+    {
+      "kind": "yanked",
+      "id": null,
+      "package": "chacha20",
+      "version": "0.10.0",
+      "reason": "Linked through rand 0.10.1, which wasmtime-wasi uses to seed guest randomness. A yank is not an advisory: no RustSec record applies to this version. 0.10.1 is yanked as well and 0.10.2 is clean, but the Wasmtime 48.0.5 archive is vendored and its lock still names 0.10.0, so the version moves only when the pin does."
+    }
+  ]
+}

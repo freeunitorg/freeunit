@@ -1,0 +1,17 @@
+# Known UndefinedBehaviorSanitizer violations, waived by
+# .github/scripts/check-sanitizer-reports.sh so that the sanitizer gate can be
+# made blocking without first fixing every pre-existing site.
+#
+# Rules:
+#   - One POSIX extended regular expression per line, matched against the
+#     report line as it appears in the harness's unit.log.
+#   - Every entry names the issue tracking its fix.  An entry without one is a
+#     bug in this file: the point of the list is to shrink, and an unattributed
+#     waiver never does.
+#   - ASan/LSan/TSan reports cannot be waived here.  The script refuses to
+#     match them on purpose -- a memory-safety report fails the leg, always.
+#   - Pin the source location.  A bare message would waive the same class of
+#     violation everywhere in the tree, including a new one.
+#
+# No active waivers.  The last four (freeunitorg/freeunit#188, #200) are
+# fixed at their source.

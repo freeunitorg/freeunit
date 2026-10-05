@@ -1,0 +1,445 @@
+import gzip
+import hashlib
+import socket
+
+import pytest
+
+from unit.applications.lang.php import ApplicationPHP
+
+prerequisites = {'modules': {'php': 'any'}}
+
+client = ApplicationPHP()
+
+
+def configure_compression(encoding='gzip'):
+    conf = {
+        "compression": {
+            "types": ["text/html*"],
+            "compressors": [{"encoding": encoding}],
+        }
+    }
+
+    if encoding == 'gzip':
+        conf["compression"]["compressors"][0]["level"] = 1
+
+    resp = client.conf({"http": conf}, 'settings')
+
+    if 'success' in resp:
+        return
+
+    # Compressors are build options; skip only for that, so a broken config
+    # here fails loudly instead of quietly turning into a skipped test.
+    if 'supported compressor' in resp.get('detail', ''):
+        pytest.skip(f'unit built without {encoding} compression support')
+
+    pytest.fail(f'could not configure compression: {resp}')
+
+
+def dechunk(data):
+    body = b''
+
+    while True:
+        end = data.find(b'\r\n')
+        if end == -1:
+            pytest.fail('truncated chunk header')
+
+        try:
+            size = int(data[:end], 16)
+        except ValueError:
+            pytest.fail(f'invalid chunk size {data[:end]!r}')
+
+        if size == 0:
+            return body
+
+        body += data[end + 2 : end + 2 + size]
+        data = data[end + 2 + size + 2 :]
+
+
+def get_gzip(encoding='gzip'):
+    """
+    The shared client decodes bodies as text and splits chunked bodies on
+    CRLF, both of which destroy a compressed payload, so read the response
+    raw.  latin1 maps every byte 1:1, so encoding back recovers it exactly.
+    """
+    resp = client.get(
+        headers={
+            'Host': 'localhost',
+            'Accept-Encoding': encoding,
+            'Connection': 'close',
+        },
+        raw_resp=True,
+        encoding='latin1',
+        read_buffer_size=1024 * 1024,
+    )
+
+    head, _, body = resp.partition('\r\n\r\n')
+    lines = head.split('\r\n')
+
+    status = int(lines[0].split()[1])
+
+    headers = {}
+    for line in lines[1:]:
+        name, _, value = line.partition(':')
+        headers[name.strip()] = value.strip()
+
+    data = body.encode('latin1')
+
+    if headers.get('Transfer-Encoding') == 'chunked':
+        data = dechunk(data)
+
+    return status, headers, data
+
+
+def test_php_compression_large_body():
+    # The working reference case: a body large enough to travel through shared
+    # memory reaches the compressor as a port-mmap buffer and is compressed.
+    client.load('comp_large_body')
+    configure_compression()
+
+    status, headers, body = get_gzip()
+
+    assert status == 200, 'status'
+    assert headers['Content-Encoding'] == 'gzip', 'encoding advertised'
+    assert body[:2] == b'\x1f\x8b', 'gzip magic'
+    assert gzip.decompress(body) == b'A' * 100000, 'round-trips'
+
+
+@pytest.mark.skip(
+    reason='#162: small app responses are advertised gzip but sent '
+    'uncompressed'
+)
+def test_php_compression_small_body():
+    # Staged for issue #162.  nxt_http_comp_check_compression() commits to
+    # compression and emits Content-Encoding before any body buffer exists,
+    # but nxt_http_comp_compress_app_response() then declines the buffer:
+    #
+    #     if (!nxt_buf_is_port_mmap(*b)) { return NXT_OK; }
+    #
+    # A body small enough to arrive in an ordinary port message is plain
+    # memory, so it goes out verbatim under the Content-Encoding already sent
+    # and no client can decode it.
+    #
+    # Un-skip once #162 is fixed.  The assertion holds whichever way it is
+    # fixed: either the body really is gzip, or the encoding was never
+    # advertised.
+    client.load('comp_small_body')
+    configure_compression()
+
+    status, headers, body = get_gzip()
+
+    assert status == 200, 'status'
+
+    if headers.get('Content-Encoding') == 'gzip':
+        assert body[:2] == b'\x1f\x8b', 'advertised gzip must really be gzip'
+        assert gzip.decompress(body) == b'A' * 64, 'round-trips'
+
+    else:
+        # Declining to compress is an equally valid fix, as long as the
+        # encoding is not advertised.
+        assert body == b'A' * 64, 'uncompressed body delivered verbatim'
+
+
+RANDOM_BODY_SIZE = 9 * 1024 * 1024
+LEAK_REQUESTS = 15  # > 100 MB in total: more shared memory than an app may hold
+
+
+def raw_get(path, encoding, timeout=30, method='GET'):
+    """
+    A plain socket request.  The shared client cannot express "fail rather
+    than block forever", which is exactly the failure these tests look for.
+    """
+    sock = socket.create_connection(('127.0.0.1', 8080), timeout)
+    sock.settimeout(timeout)
+
+    try:
+        sock.sendall(
+            f'{method} {path} HTTP/1.1\r\n'
+            f'Host: localhost\r\n'
+            f'Accept-Encoding: {encoding}\r\n'
+            f'Connection: close\r\n\r\n'.encode()
+        )
+
+        chunks = []
+        while True:
+            data = sock.recv(256 * 1024)
+            if not data:
+                break
+            chunks.append(data)
+
+    finally:
+        sock.close()
+
+    resp = b''.join(chunks)
+    head, _, body = resp.partition(b'\r\n\r\n')
+    lines = head.split(b'\r\n')
+
+    status = int(lines[0].split()[1])
+
+    headers = {}
+    for line in lines[1:]:
+        name, _, value = line.partition(b':')
+        headers[name.strip().decode()] = value.strip().decode()
+
+    if headers.get('Transfer-Encoding') == 'chunked':
+        body = dechunk(body)
+
+    return status, headers, body
+
+
+def decompress(encoding, data):
+    if encoding == 'gzip':
+        return gzip.decompress(data)
+
+    if encoding == 'br':
+        brotli = pytest.importorskip(
+            'brotli', reason='python brotli bindings not installed'
+        )
+        return brotli.decompress(data)
+
+    if encoding == 'zstd':
+        try:
+            from compression import zstd  # Python >= 3.14
+
+            return zstd.decompress(data)
+        except ImportError:
+            zstandard = pytest.importorskip(
+                'zstandard', reason='python zstd bindings not installed'
+            )
+            return zstandard.ZstdDecompressor().decompressobj().decompress(data)
+
+    pytest.fail(f'no decompressor for {encoding}')
+
+
+@pytest.mark.parametrize('encoding', ['gzip', 'br', 'zstd'])
+def test_php_compression_large_random_body(encoding):
+    """
+    Coverage for the chain walk in nxt_http_comp_compress_app_response():
+    a multi-megabyte incompressible body arrives as a long sequence of
+    port-mmap buffers, so every compressor is driven across many calls with
+    the finishing one arriving last.  Check the body still round-trips.
+    """
+    client.load('comp_random_body')
+    configure_compression(encoding)
+
+    status, headers, body = raw_get(
+        f'/?n={RANDOM_BODY_SIZE}', encoding
+    )
+
+    assert status == 200, 'status'
+    assert headers['Content-Encoding'] == encoding, 'encoding advertised'
+
+    # The compressed body is framed either by Content-Length or by chunked
+    # transfer encoding -- never by both, and never by neither, or the client
+    # cannot tell where it ends.
+    has_clen = 'Content-Length' in headers
+    is_chunked = headers.get('Transfer-Encoding') == 'chunked'
+
+    assert has_clen != is_chunked, f'exactly one framing: {headers}'
+
+    if has_clen:
+        assert len(body) == int(headers['Content-Length']), 'framing consistent'
+
+    plain = decompress(encoding, body)
+
+    assert len(plain) == RANDOM_BODY_SIZE, 'full body length'
+    assert (
+        hashlib.sha256(plain).hexdigest() == headers['X-Body-Sha256']
+    ), 'round-trips byte for byte'
+
+
+def test_php_compression_shm_not_leaked():
+    """
+    Regression test for #177.
+
+    nxt_http_comp_compress_app_response() released the application's buffer
+    with nxt_buf_free(), a plain pool free that never runs the buffer's
+    completion handler.  For a port-mmap buffer that handler,
+    nxt_port_mmap_buf_completion(), is what marks the shared memory chunks
+    free again, so every compressed response leaked its chunks.
+
+    An application may hold only so much shared memory (shm_limit, 100 MB by
+    default), so the leak is fatal rather than merely wasteful: after enough
+    compressed bytes the worker can no longer allocate a buffer and the next
+    request never gets a response.  Before the fix this wedges partway
+    through the loop and the request below times out.
+    """
+    client.load('comp_random_body')
+    configure_compression()
+
+    for i in range(LEAK_REQUESTS):
+        status, headers, body = raw_get(
+            f'/?n={RANDOM_BODY_SIZE}', 'gzip'
+        )
+
+        assert status == 200, f'status of request {i}'
+        assert headers['Content-Encoding'] == 'gzip', f'encoding, request {i}'
+        assert (
+            hashlib.sha256(gzip.decompress(body)).hexdigest()
+            == headers['X-Body-Sha256']
+        ), f'body of request {i}'
+
+
+def test_php_compression_identity_refused():
+    # An application response is negotiated like a static one.  The client
+    # refuses identity and names no coding Unit can apply, so no acceptable
+    # representation is left and the answer is 406.
+    #
+    # nxt_router_response_ready_handler() used to read every non-NXT_OK
+    # result from nxt_http_comp_check_acceptable() as a server error and take
+    # the generic "fail:" path, which answers 503 -- a negotiation failure
+    # reported as the server being unable to serve anybody.
+    client.load('comp_large_body')
+    configure_compression()
+
+    status, headers, _ = raw_get('/', 'identity;q=0')
+
+    assert status == 406, 'no representation left for the application body'
+    assert headers.get('Vary') == 'Accept-Encoding', 'the 406 varies'
+    assert 'Content-Encoding' not in headers
+
+
+def test_php_compression_wildcard_offers_a_coding():
+    # The wildcard reaches the application path too.  Sect. 12.5.3: "*"
+    # matches any available content coding not explicitly listed.  So this
+    # client refuses the own bytes of the response and accepts everything
+    # else, gzip included.  Before, "*" was read as identity only.  Then
+    # nothing was acceptable, and the router answered 406 to a request that
+    # it could serve.
+    client.load('comp_large_body')
+    configure_compression()
+
+    status, headers, body = raw_get('/', 'identity;q=0, *;q=1')
+
+    assert status == 200, 'the wildcard offers gzip'
+    assert headers.get('Content-Encoding') == 'gzip', 'encoding advertised'
+    assert gzip.decompress(body) == b'A' * 100000, 'round-trips'
+
+    # A coding that the field names keeps its own weight, and the wildcard
+    # does not match it.  So gzip is worth 0.1 here, and gzip is still sent.
+    status, headers, body = raw_get('/', 'identity;q=0, *;q=0.5, gzip;q=0.1')
+
+    assert status == 200, 'an explicitly named gzip is still acceptable'
+    assert headers.get('Content-Encoding') == 'gzip', 'at its own weight'
+    assert gzip.decompress(body) == b'A' * 100000
+
+
+def test_php_compression_identity_refused_without_compressor():
+    # The same request with compression off: identity is then the only
+    # coding, and this client refused it.  This is the path that reaches the
+    # check with a NULL configuration.
+    client.load('comp_large_body')
+
+    status, headers, _ = raw_get('/', 'identity;q=0')
+
+    assert status == 406, 'identity is the only available coding'
+    assert headers.get('Vary') == 'Accept-Encoding', 'the 406 varies'
+    assert 'Content-Encoding' not in headers
+
+
+def test_php_compression_identity_refused_below_min_length():
+    # gzip is acceptable but never applied: "min_length" is above this body.
+    # So the response would fall back to the identity that the client
+    # refused.  The answer is 406, and still not 503.
+    client.load('comp_small_body')
+
+    # client.load() installs a configuration without a "settings" object.
+    # So a PUT to settings/http/compression is rejected.  The whole
+    # "settings" object is put, and the result is checked.  Before, the PUT
+    # failed silently, and this test passed through the no-compressor path.
+    assert 'success' in client.conf(
+        {
+            "http": {
+                "compression": {
+                    "types": ["text/html*"],
+                    "compressors": [
+                        {"encoding": "gzip", "min_length": 1000}
+                    ],
+                }
+            }
+        },
+        'settings',
+    ), 'gzip with min_length 1000'
+
+    status, headers, _ = raw_get('/', 'gzip, identity;q=0')
+
+    assert status == 406, 'a below-minimum gzip is not available'
+    assert 'Content-Encoding' not in headers
+
+    # The same response to a client that takes identity is unchanged.
+    status, headers, body = raw_get('/', 'gzip')
+
+    assert status == 200, 'identity is acceptable here'
+    assert 'Content-Encoding' not in headers
+    assert body == b'A' * 64, 'the body, uncompressed'
+
+
+def test_php_compression_identity_refused_no_representation():
+    # A 1xx, 204 or 304 describes no representation.  So there is nothing
+    # that the client could refuse, and no 406 to give.
+    #
+    # The length exits at the top of nxt_http_comp_check_acceptable() do not
+    # cover this.  nxt_http_response_content_length() stores the
+    # Content-Length field of an application without setting
+    # r->resp.content_length_n, which stays -1.  So a 204 or 304 that
+    # carries the field reached the compressor selection and came back 406.
+    # The status and the framing that nxt_http_request_header_send() would
+    # correct never got there.
+    client.load('no_body_status')
+    configure_compression()
+
+    status, headers, body = raw_get('/?status=204&cl', 'identity;q=0')
+
+    assert status == 204, 'a 204 has no representation to refuse'
+    assert 'Content-Encoding' not in headers
+    assert body == b'', 'no body on a 204'
+
+    status, headers, body = raw_get('/?status=304&cl', 'identity;q=0')
+
+    assert status == 304, 'a 304 describes the body the client already has'
+    assert 'Content-Encoding' not in headers
+    assert body == b'', 'no body on a 304'
+
+    # The same application, the same Content-Length, and a status that
+    # describes a representation: still 406.
+    status, headers, _ = raw_get('/?status=200&cl', 'identity;q=0')
+
+    assert status == 406, 'a 200 still has a representation to refuse'
+    assert 'Content-Encoding' not in headers
+
+
+def test_php_compression_identity_refused_head():
+    # A HEAD carries no body either.  But it still describes the
+    # representation that the equivalent GET would return (RFC 9110
+    # Sect. 9.3.2).  So it is negotiated like that GET, and a refused
+    # identity is a 406.  That is why the exemption above tests the status
+    # only, and never the method, and why
+    # nxt_http_request_is_bodyless_final() is the wrong question here.
+    client.load('comp_large_body')
+    configure_compression()
+
+    status, headers, _ = raw_get('/', 'identity;q=0', method='HEAD')
+
+    assert status == 406, 'a HEAD is negotiated like the GET it stands for'
+    assert 'Content-Encoding' not in headers
+
+    status, headers, _ = raw_get('/', 'gzip', method='HEAD')
+
+    assert status == 200, 'the same HEAD from a client that takes gzip'
+
+
+def test_php_compression_identity_refused_already_coded():
+    # The application coded its response itself.  That response is not
+    # identity, so the refusal of identity does not apply to it, and Unit
+    # does not negotiate it again: 200 in the coding of the application,
+    # without a compressor configured and with one.
+    client.load('comp_coded_body')
+
+    for configured in (False, True):
+        if configured:
+            configure_compression()
+
+        status, headers, body = raw_get('/', 'identity;q=0')
+
+        assert status == 200, f'a coded response is not identity: {configured}'
+        assert headers.get('Content-Encoding') == 'gzip', 'the coding kept'
+        assert gzip.decompress(body) == b'A' * 100000, 'coded once'

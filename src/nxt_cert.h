@@ -1,0 +1,52 @@
+
+/*
+ * Copyright (C) Valentin V. Bartenev
+ * Copyright (C) NGINX, Inc.
+ */
+
+#ifndef _NXT_CERT_INCLUDED_
+#define _NXT_CERT_INCLUDED_
+
+
+typedef struct nxt_cert_s       nxt_cert_t;
+typedef struct nxt_cert_info_s  nxt_cert_info_t;
+
+nxt_cert_t *nxt_cert_mem(nxt_task_t *task, nxt_buf_mem_t *mbuf);
+void nxt_cert_destroy(nxt_cert_t *cert);
+
+void nxt_cert_info_init(nxt_task_t *task, nxt_array_t *certs);
+nxt_int_t nxt_cert_info_save(nxt_str_t *name, nxt_cert_t *cert);
+nxt_cert_info_t *nxt_cert_info_create(nxt_str_t *name, nxt_cert_t *cert);
+nxt_int_t nxt_cert_info_replace(nxt_cert_info_t *info, nxt_cert_info_t **old);
+void nxt_cert_info_restore(nxt_cert_info_t *info, nxt_cert_info_t *old);
+void nxt_cert_info_release(nxt_cert_info_t *info);
+nxt_bool_t nxt_cert_info_equal(nxt_str_t *name, nxt_cert_t *cert);
+void nxt_cert_info_applied(nxt_str_t *name, nxt_bool_t applied);
+nxt_conf_value_t *nxt_cert_info_get(nxt_str_t *name);
+nxt_conf_value_t *nxt_cert_info_get_all(nxt_mp_t *mp);
+nxt_int_t nxt_cert_info_delete(nxt_str_t *name);
+
+/* A stored bundle is a chain and a key.  1 MiB can hold hundreds. */
+#define NXT_CERT_STORE_MAX_SIZE  (1024 * 1024)
+
+/*
+ * A bundle is the file "certs/<name>".  255 is NAME_MAX on Linux, the BSDs,
+ * macOS and Solaris.  The temporary file of main has a fixed name, so the
+ * store needs no room for a suffix.
+ */
+#define NXT_CERT_NAME_MAX_LENGTH  255
+
+nxt_array_t *nxt_cert_store_load(nxt_task_t *task, nxt_mp_t *mem_pool);
+void nxt_cert_store_release(nxt_array_t *certs);
+
+void nxt_cert_store_get(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp,
+    nxt_port_rpc_handler_t handler, void *ctx);
+void nxt_cert_store_put(nxt_task_t *task, nxt_str_t *name, nxt_buf_mem_t *mbuf,
+    nxt_mp_t *mp, nxt_port_rpc_handler_t handler, void *ctx);
+void nxt_cert_store_delete(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp);
+
+void nxt_cert_store_get_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
+void nxt_cert_store_put_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
+void nxt_cert_store_delete_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
+
+#endif /* _NXT_CERT_INCLUDED_ */

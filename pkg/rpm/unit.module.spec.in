@@ -1,0 +1,104 @@
+# distribution specific definitions
+%define bdir %{_builddir}/%{name}-%{version}
+
+%%MODULE_DEFINITIONS%%
+
+%if 0%{?rhel}%{?fedora}
+BuildRequires: gcc
+%if 0%{?amzn2}
+BuildRequires: openssl11-devel
+%else
+BuildRequires: openssl-devel
+%endif
+%endif
+
+%define unit_version %%UNIT_VERSION%%
+%define unit_release %%UNIT_RELEASE%%%{?dist}
+
+%define CC_OPT %{optflags}
+
+%define CONFIGURE_ARGS $(echo "%%CONFIGURE_ARGS%%")
+
+Name: %%NAME%%
+Summary: %%SUMMARY%%
+Version: %%VERSION%%
+Release: %%RELEASE%%%{?dist}
+License: ASL 2.0
+Vendor: %%PACKAGE_VENDOR%%
+URL: https://docs.freeunit.org/
+
+Source0: unit-%{version}.tar.gz
+%%MODULE_SOURCES%%
+
+BuildRequires: pcre2-devel
+
+Requires: freeunit-r%%UNIT_VERSION%%
+
+%description
+FreeUnit is a community-maintained LTS fork of NGINX Unit — a runtime and
+delivery environment for modern distributed applications. It runs application
+code in multiple languages (PHP, Python, Go, etc.), and tightly couples it
+with traffic delivery in and out of the application. Fully controllable
+via a REST API with zero-downtime reconfiguration.
+This package contains %%SUMMARY%%.
+
+%if (0%{?fedora}) || (0%{?rhel} >= 8)
+%define _debugsource_template %{nil}
+%endif
+
+%prep
+%setup -qcTn %{name}-%{unit_version}
+tar --strip-components=1 -zxf %{SOURCE0}
+
+%build
+%%MODULE_PREBUILD%%
+./configure \
+	%{CONFIGURE_ARGS} \
+	--modulesdir=%{_libdir}/unit/debug-modules \
+	--cc-opt="%{CC_OPT}" \
+	--debug
+./configure %%MODULE_CONFARGS%%
+make %%MODULE_MAKEARGS%%
+%{__mv} build build-debug
+./configure \
+	%{CONFIGURE_ARGS} \
+	--modulesdir=%{_libdir}/unit/modules \
+	--cc-opt="%{CC_OPT}"
+./configure %%MODULE_CONFARGS%%
+make %%MODULE_MAKEARGS%%
+%{__mv} build build-nodebug
+
+%install
+%{__mkdir} -p %{buildroot}%{_datadir}/doc/%%NAME%%
+if [ `basename %{SOURCE100}` == COPYRIGHT.%{name} ]; then
+%{__install} -m 644 -p %{SOURCE100} \
+    %{buildroot}%{_datadir}/doc/%%NAME%%/COPYRIGHT
+else
+%{__install} -m 644 -p NOTICE \
+    %{buildroot}%{_datadir}/doc/%%NAME%%/COPYRIGHT
+fi
+%%MODULE_PREINSTALL%%
+%{__ln_s} build-debug build
+DESTDIR=%{buildroot} make %%MODULE_INSTARGS%%
+%{__rm} -f build
+%{__ln_s} build-nodebug build
+DESTDIR=%{buildroot} make %%MODULE_INSTARGS%%
+%%MODULE_POSTINSTALL%%
+
+%check
+%{__rm} -rf %{buildroot}/usr/src
+cd %{bdir}
+grep -v 'usr/src' debugfiles.list > debugfiles.list.new && mv debugfiles.list.new debugfiles.list
+cat /dev/null > debugsources.list
+
+%post
+if [ $1 -eq 1 ]; then
+%%MODULE_POST%%
+fi
+
+%files
+%dir %{_datadir}/doc/%%NAME%%
+%{_datadir}/doc/%%NAME%%/*
+%%MODULE_FILES%%
+
+%changelog

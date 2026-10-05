@@ -1,0 +1,81 @@
+name: "Rust (rust-version)"
+
+# Builds every crate with the Rust release its "rust-version" declares.
+# The other pull request jobs build the crates with stable Rust only.
+# build-deb.yml pins Rust 1.88.0, but it does not run on pull requests.  So
+# a dependency update that raises a crate's floor could pass its pull
+# request and then break the deb build.  There is one leg per directory
+# with its own Cargo.lock, the same directories as the cargo entries in
+# .github/dependabot.yml.  A package without "rust-version" fails its leg.
+
+on:
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**/rust-toolchain.toml'
+      - 'tools/unitctl/unit-openapi/openapi-templates/**'
+      - 'docs/unit-openapi.yaml'
+      - '.github/scripts/check-rust-version.py'
+      - '.github/workflows/rust-version.yml'
+  push:
+    branches: master
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**/rust-toolchain.toml'
+      - 'tools/unitctl/unit-openapi/openapi-templates/**'
+      - 'docs/unit-openapi.yaml'
+      - '.github/scripts/check-rust-version.py'
+      - '.github/workflows/rust-version.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dir: tools/unitctl
+            setup: openapi
+          - dir: src/otel
+          - dir: src/wasm-wasi-component
+            setup: libunit
+          - dir: pkg/eol
+          - dir: test/fake_otlp
+          - dir: test/fake_upstream
+          - dir: test/wasm_component/hello_world
+            target: wasm32-wasip1
+          - dir: test/wasm_component/spin_loop
+            target: wasm32-wasip1
+    name: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+
+      # The OpenAPI client is generated, not tracked.  The generator also
+      # rewrites unit-openapi/Cargo.toml, so the tracked file is restored.
+      - name: Generate the OpenAPI client
+        if: matrix.setup == 'openapi'
+        run: |
+          make -C tools/unitctl CARGO=true openapi-generate
+          git checkout -- tools/unitctl/unit-openapi/Cargo.toml
+
+      # build.rs runs bindgen on the Unit headers and links nxt_unit.o.
+      - name: Build nxt_unit.o
+        if: matrix.setup == 'libunit'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev
+          ./configure --no-regex
+          make -j"$(nproc)" build/src/nxt_unit.o
+
+      - name: cargo check with rust-version
+        run: python3 .github/scripts/check-rust-version.py ${{ matrix.dir }} ${{ matrix.target }}

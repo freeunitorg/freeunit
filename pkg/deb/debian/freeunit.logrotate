@@ -1,0 +1,15 @@
+/var/log/%%RUNTIME%%.log {
+    daily
+    missingok
+    rotate 7
+    compress
+    delaycompress
+    nocreate
+    notifempty
+    su root root
+    postrotate
+        if [ -f %%RUNDIR%%/%%RUNTIME%%.pid ]; then
+            /bin/kill -SIGUSR1 `cat %%RUNDIR%%/%%RUNTIME%%.pid`
+        fi
+    endscript
+}

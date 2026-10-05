@@ -1,0 +1,1895 @@
+
+/*
+ * Copyright (C) Valentin V. Bartenev
+ * Copyright (C) NGINX, Inc.
+ */
+
+#include <nxt_main.h>
+#include <nxt_conf.h>
+#include <nxt_cert.h>
+#include <nxt_main_process.h>
+#include <nxt_span.h>
+
+#include <dirent.h>
+
+#include <openssl/bio.h>
+#include <openssl/pem.h>
+#include <openssl/evp.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <openssl/rsa.h>
+#include <openssl/err.h>
+
+
+/* The buffer X509_NAME_get_text_by_NID() used to be given, less the NUL. */
+#define NXT_CERT_NAME_TEXT_MAX  255
+
+/*
+ * The X509 name accessors were constified in stages, and not together:
+ * X509_NAME_get_entry() and X509_NAME_ENTRY_get_data() took const arguments
+ * from 1.1.0, but X509_NAME_get_index_by_NID() only from 3.0, and it is 4.0
+ * that constified the values all three return.  Qualifying from 3.0 is what
+ * satisfies every version at once -- an older header takes these pointers
+ * non-const, and 4.0 hands them back const -- so the boundary is 3.0 rather
+ * than the 1.1.0 the other guards in this file use.
+ */
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#define NXT_X509_CONST  const
+#else
+#define NXT_X509_CONST
+#endif
+
+
+struct nxt_cert_s {
+    EVP_PKEY          *key;
+    nxt_uint_t        count;
+    X509              *chain[];
+};
+
+
+/* The size of a SHA-256 digest. */
+#define NXT_CERT_DIGEST_LENGTH  32
+
+
+struct nxt_cert_info_s {
+    nxt_str_t         name;
+    nxt_conf_value_t  *value;
+    nxt_mp_t          *mp;
+
+    /* See nxt_cert_digest(). */
+    u_char            digest[NXT_CERT_DIGEST_LENGTH];
+
+    /*
+     * The disk or the router may not hold this bundle: the router refused
+     * the configuration with it, or a store failed and the file may hold
+     * either bundle.  See nxt_cert_info_equal().  The flag is only in the
+     * memory of the controller.  A new controller reads the bundles from
+     * disk with the flag clear, and a file changed by hand is not seen.  In
+     * these cases an equal upload is skipped until a different bundle is
+     * stored.
+     */
+    uint8_t           unapplied;  /* 1 bit */
+};
+
+
+typedef struct {
+    nxt_str_t         name;
+    nxt_fd_t          fd;
+} nxt_cert_item_t;
+
+
+static nxt_cert_t *nxt_cert_fd(nxt_task_t *task, nxt_fd_t fd);
+static nxt_cert_t *nxt_cert_bio(nxt_task_t *task, BIO *bio);
+static int nxt_nxt_cert_pem_suffix(char *pem_str, const char *suffix);
+
+static nxt_int_t nxt_cert_digest(nxt_cert_t *cert, u_char *digest);
+static nxt_cert_info_t *nxt_cert_info_find(nxt_str_t *name);
+static nxt_conf_value_t *nxt_cert_details(nxt_mp_t *mp, nxt_cert_t *cert);
+static nxt_conf_value_t *nxt_cert_name_details(nxt_mp_t *mp, X509 *x509,
+    nxt_bool_t issuer);
+static nxt_int_t nxt_cert_name_text(NXT_X509_CONST X509_NAME *x509_name,
+    int nid, nxt_str_t *str);
+static nxt_conf_value_t *nxt_cert_alt_names_details(nxt_mp_t *mp,
+    STACK_OF(GENERAL_NAME) *alt_names);
+static void nxt_cert_buf_completion(nxt_task_t *task, void *obj, void *data);
+
+
+static nxt_lvlhsh_t  nxt_cert_info;
+
+
+nxt_cert_t *
+nxt_cert_mem(nxt_task_t *task, nxt_buf_mem_t *mbuf)
+{
+    BIO         *bio;
+    nxt_cert_t  *cert;
+
+    bio = BIO_new_mem_buf(mbuf->pos, nxt_buf_mem_used_size(mbuf));
+    if (nxt_slow_path(bio == NULL)) {
+        nxt_openssl_log_error(task, NXT_LOG_ALERT, "BIO_new_mem_buf() failed");
+        return NULL;
+    }
+
+    cert = nxt_cert_bio(task, bio);
+
+    BIO_free(bio);
+
+    return cert;
+}
+
+
+static nxt_cert_t *
+nxt_cert_fd(nxt_task_t *task, nxt_fd_t fd)
+{
+    BIO         *bio;
+    nxt_cert_t  *cert;
+
+    bio = BIO_new_fd(fd, 0);
+    if (nxt_slow_path(bio == NULL)) {
+        nxt_openssl_log_error(task, NXT_LOG_ALERT, "BIO_new_fd() failed");
+        return NULL;
+    }
+
+    cert = nxt_cert_bio(task, bio);
+
+    BIO_free(bio);
+
+    return cert;
+}
+
+
+static nxt_cert_t *
+nxt_cert_bio(nxt_task_t *task, BIO *bio)
+{
+    int                  ret, suffix, key_id;
+    long                 length, reason;
+    char                 *type, *header;
+    X509                 *x509;
+    EVP_PKEY             *key;
+    nxt_uint_t           nalloc;
+    nxt_cert_t           *cert, *new_cert;
+    u_char               *data;
+    const u_char         *data_copy;
+    PKCS8_PRIV_KEY_INFO  *p8inf;
+
+    nalloc = 4;
+
+    cert = nxt_zalloc(sizeof(nxt_cert_t) + nalloc * sizeof(X509 *));
+    if (cert == NULL) {
+        return NULL;
+    }
+
+    for ( ;; ) {
+        ret = PEM_read_bio(bio, &type, &header, &data, &length);
+
+        if (ret == 0) {
+            reason = ERR_GET_REASON(ERR_peek_last_error());
+            if (reason != PEM_R_NO_START_LINE) {
+                nxt_openssl_log_error(task, NXT_LOG_ALERT,
+                                      "PEM_read_bio() failed");
+                goto fail;
+            }
+
+            ERR_clear_error();
+            break;
+        }
+
+        nxt_debug(task, "PEM type: \"%s\"", type);
+
+        key = NULL;
+        x509 = NULL;
+/*
+        EVP_CIPHER_INFO  cipher;
+
+        if (PEM_get_EVP_CIPHER_INFO(header, &cipher) != 0) {
+            nxt_alert(task, "encrypted PEM isn't supported");
+            goto done;
+        }
+*/
+        if (nxt_strcmp(type, PEM_STRING_PKCS8) == 0) {
+            nxt_alert(task, "PEM PKCS8 isn't supported");
+            goto done;
+        }
+
+        if (nxt_strcmp(type, PEM_STRING_PKCS8INF) == 0) {
+            data_copy = data;
+
+            p8inf = d2i_PKCS8_PRIV_KEY_INFO(NULL, &data_copy, length);
+
+            if (p8inf == NULL) {
+                nxt_openssl_log_error(task, NXT_LOG_ALERT,
+                                      "d2i_PKCS8_PRIV_KEY_INFO() failed");
+                goto done;
+            }
+
+            key = EVP_PKCS82PKEY(p8inf);
+
+            PKCS8_PRIV_KEY_INFO_free(p8inf);
+            goto done;
+        }
+
+        suffix = nxt_nxt_cert_pem_suffix(type, PEM_STRING_PKCS8INF);
+
+        if (suffix != 0) {
+
+            /*
+             * EVP_PKEY_asn1_find_str() and EVP_PKEY_asn1_get0_info() are
+             * deprecated in OpenSSL 3.6.
+             *
+             * OBJ_sn2nid() cannot replace them: the pem_str stored in
+             * EVP_PKEY_ASN1_METHOD ("EC", "RSA", "DSA") lives in a separate
+             * namespace from the OBJ short-name database — e.g. OBJ_sn2nid
+             * knows "id-ecPublicKey", not "EC".
+             *
+             * The only key types that ever appear in legacy "TYPE PRIVATE KEY"
+             * PEM blocks are RSA, DSA, and EC, so an explicit table is both
+             * complete and future-proof without touching the ASN1 method API.
+             */
+            {
+                static const struct {
+                    const char  *pem;
+                    int          id;
+                } pem_key_ids[] = {
+                    { "RSA", EVP_PKEY_RSA },
+                    { "DSA", EVP_PKEY_DSA },
+                    { "EC",  EVP_PKEY_EC  },
+                    { NULL, 0 }
+                };
+
+                char        key_type[64];
+                nxt_uint_t  i;
+
+                if ((size_t) suffix >= sizeof(key_type)) {
+                    goto done;
+                }
+
+                nxt_memcpy(key_type, type, suffix);
+                key_type[suffix] = '\0';
+
+                key_id = 0;
+
+                for (i = 0; pem_key_ids[i].pem != NULL; i++) {
+                    if (nxt_strcmp(key_type, pem_key_ids[i].pem) == 0) {
+                        key_id = pem_key_ids[i].id;
+                        break;
+                    }
+                }
+
+                if (key_id == 0) {
+                    nxt_openssl_log_error(task, NXT_LOG_ALERT,
+                                          "unknown PEM key type: \"%s\"",
+                                          key_type);
+                    goto done;
+                }
+            }
+
+            data_copy = data;
+
+            key = d2i_PrivateKey(key_id, NULL, &data_copy, length);
+            goto done;
+        }
+
+        if (nxt_strcmp(type, PEM_STRING_X509) == 0
+            || nxt_strcmp(type, PEM_STRING_X509_OLD) == 0)
+        {
+            data_copy = data;
+
+            x509 = d2i_X509(NULL, &data_copy, length);
+            if (x509 == NULL) {
+                nxt_openssl_log_error(task, NXT_LOG_ALERT,
+                                      "d2i_X509() failed");
+            }
+
+            goto done;
+        }
+
+        if (nxt_strcmp(type, PEM_STRING_X509_TRUSTED) == 0) {
+            data_copy = data;
+
+            x509 = d2i_X509_AUX(NULL, &data_copy, length);
+            if (x509 == NULL) {
+                nxt_openssl_log_error(task, NXT_LOG_ALERT,
+                                      "d2i_X509_AUX() failed");
+            }
+
+            goto done;
+        }
+
+        nxt_alert(task, "unsupported PEM type: \"%s\"", type);
+
+    done:
+
+        OPENSSL_free(data);
+        OPENSSL_free(header);
+        OPENSSL_free(type);
+
+        if (key != NULL) {
+            if (cert->key != NULL) {
+                EVP_PKEY_free(key);
+                nxt_alert(task, "multiple private keys in PEM");
+                goto fail;
+            }
+
+            cert->key = key;
+            continue;
+        }
+
+        if (x509 != NULL) {
+
+            if (cert->count == nalloc) {
+                nalloc += 4;
+
+                new_cert = nxt_realloc(cert, sizeof(nxt_cert_t)
+                                             + nalloc * sizeof(X509 *));
+                if (new_cert == NULL) {
+                    X509_free(x509);
+                    goto fail;
+                }
+
+                cert = new_cert;
+            }
+
+            cert->chain[cert->count++] = x509;
+            continue;
+        }
+
+        goto fail;
+    }
+
+    if (cert->key == NULL) {
+        nxt_alert(task, "no key found");
+        goto fail;
+    }
+
+    if (cert->count == 0) {
+        nxt_alert(task, "no certificates found");
+        goto fail;
+    }
+
+    /*
+     * The leaf comes first in the bundle.  A key that belongs to another
+     * certificate is refused here, at upload, instead of at the next
+     * reconfiguration of every listener that names the bundle.
+     */
+    if (X509_check_private_key(cert->chain[0], cert->key) != 1) {
+        nxt_openssl_log_error(task, NXT_LOG_ALERT,
+                              "certificate and private key do not match");
+        goto fail;
+    }
+
+    return cert;
+
+fail:
+
+    nxt_cert_destroy(cert);
+
+    return NULL;
+}
+
+
+static int
+nxt_nxt_cert_pem_suffix(char *pem_str, const char *suffix)
+{
+    char        *p;
+    nxt_uint_t  pem_len, suffix_len;
+
+    pem_len = strlen(pem_str);
+    suffix_len = strlen(suffix);
+
+    if (suffix_len + 1 >= pem_len) {
+        return 0;
+    }
+
+    p = pem_str + pem_len - suffix_len;
+
+    if (nxt_strcmp(p, suffix) != 0) {
+        return 0;
+    }
+
+    p--;
+
+    if (*p != ' ') {
+        return 0;
+    }
+
+    return p - pem_str;
+}
+
+
+void
+nxt_cert_destroy(nxt_cert_t *cert)
+{
+    nxt_uint_t  i;
+
+    EVP_PKEY_free(cert->key);
+
+    for (i = 0; i != cert->count; i++) {
+        X509_free(cert->chain[i]);
+    }
+
+    nxt_free(cert);
+}
+
+
+
+static nxt_int_t
+nxt_cert_info_hash_test(nxt_lvlhsh_query_t *lhq, void *data)
+{
+    nxt_cert_info_t  *info;
+
+    info = data;
+
+    if (nxt_strcasestr_eq(&lhq->key, &info->name)) {
+        return NXT_OK;
+    }
+
+    return NXT_DECLINED;
+}
+
+
+static const nxt_lvlhsh_proto_t  nxt_cert_info_hash_proto
+    nxt_aligned(64) =
+{
+    NXT_LVLHSH_DEFAULT,
+    nxt_cert_info_hash_test,
+    nxt_lvlhsh_alloc,
+    nxt_lvlhsh_free,
+};
+
+
+void
+nxt_cert_info_init(nxt_task_t *task, nxt_array_t *certs)
+{
+    uint32_t         i;
+    nxt_cert_t       *cert;
+    nxt_cert_item_t  *items;
+
+    for (items = certs->elts, i = 0; i < certs->nelts; i++) {
+        cert = nxt_cert_fd(task, items[i].fd);
+
+        if (nxt_slow_path(cert == NULL)) {
+            continue;
+        }
+
+        (void) nxt_cert_info_save(&items[i].name, cert);
+
+        nxt_cert_destroy(cert);
+    }
+}
+
+
+nxt_int_t
+nxt_cert_info_save(nxt_str_t *name, nxt_cert_t *cert)
+{
+    nxt_cert_info_t  *info, *old;
+
+    info = nxt_cert_info_create(name, cert);
+    if (nxt_slow_path(info == NULL)) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_slow_path(nxt_cert_info_replace(info, &old) != NXT_OK)) {
+        nxt_cert_info_release(info);
+        return NXT_ERROR;
+    }
+
+    nxt_cert_info_release(old);
+
+    return NXT_OK;
+}
+
+
+/*
+ * Make the metadata of a bundle without publishing it.  The controller calls
+ * this and nxt_cert_info_replace() before main replaces the file, so that a
+ * failed allocation does not change the stored bundle.
+ */
+nxt_cert_info_t *
+nxt_cert_info_create(nxt_str_t *name, nxt_cert_t *cert)
+{
+    nxt_mp_t          *mp;
+    nxt_cert_info_t   *info;
+    nxt_conf_value_t  *value;
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (nxt_slow_path(mp == NULL)) {
+        return NULL;
+    }
+
+    info = nxt_mp_get(mp, sizeof(nxt_cert_info_t));
+    if (nxt_slow_path(info == NULL)) {
+        goto fail;
+    }
+
+    name = nxt_str_dup(mp, &info->name, name);
+    if (nxt_slow_path(name == NULL)) {
+        goto fail;
+    }
+
+    value = nxt_cert_details(mp, cert);
+    if (nxt_slow_path(value == NULL)) {
+        goto fail;
+    }
+
+    if (nxt_slow_path(nxt_cert_digest(cert, info->digest) != NXT_OK)) {
+        goto fail;
+    }
+
+    info->mp = mp;
+    info->value = value;
+    info->unapplied = 0;
+
+    return info;
+
+fail:
+
+    nxt_mp_destroy(mp);
+    return NULL;
+}
+
+
+/*
+ * "digest" gets the SHA-256 digest of the SHA-256 digests of the
+ * certificates, in bundle order.  Two bundles with the same digest hold the
+ * same certificates.  They also hold the same key: nxt_cert_bio() has
+ * checked the key against the first certificate, and one public key has
+ * one private key.  The PEM text may still differ, in line breaks or in
+ * the key format.  The router loads the same contexts from either.
+ */
+static nxt_int_t
+nxt_cert_digest(nxt_cert_t *cert, u_char *digest)
+{
+    u_char        *p, *buf;
+    nxt_int_t     ret;
+    nxt_uint_t    i;
+    unsigned int  len;
+
+    buf = nxt_malloc(cert->count * EVP_MAX_MD_SIZE);
+    if (nxt_slow_path(buf == NULL)) {
+        return NXT_ERROR;
+    }
+
+    ret = NXT_ERROR;
+    p = buf;
+
+    for (i = 0; i < cert->count; i++) {
+        if (nxt_slow_path(X509_digest(cert->chain[i], EVP_sha256(), p, &len)
+                          != 1))
+        {
+            nxt_thread_log_alert("X509_digest() failed");
+            goto done;
+        }
+
+        p += len;
+    }
+
+    if (nxt_fast_path(EVP_Digest(buf, p - buf, digest, &len, EVP_sha256(),
+                                 NULL) == 1
+                      && len == NXT_CERT_DIGEST_LENGTH))
+    {
+        ret = NXT_OK;
+
+    } else {
+        nxt_thread_log_alert("EVP_Digest() failed");
+    }
+
+done:
+
+    nxt_free(buf);
+
+    return ret;
+}
+
+
+/*
+ * Whether "cert" holds the same certificates as the stored bundle "name",
+ * and the router has that bundle.  The controller then stores nothing and
+ * applies nothing.  After a store whose configuration the router refused,
+ * this is false until the same name is stored and applied once more, so a
+ * repeated upload of that bundle is a full one.
+ */
+nxt_bool_t
+nxt_cert_info_equal(nxt_str_t *name, nxt_cert_t *cert)
+{
+    u_char           digest[NXT_CERT_DIGEST_LENGTH];
+    nxt_cert_info_t  *info;
+
+    info = nxt_cert_info_find(name);
+
+    if (info == NULL || info->unapplied) {
+        return 0;
+    }
+
+    if (nxt_slow_path(nxt_cert_digest(cert, digest) != NXT_OK)) {
+        return 0;
+    }
+
+    return (memcmp(digest, info->digest, NXT_CERT_DIGEST_LENGTH) == 0);
+}
+
+
+/* The controller records whether the router took the stored bundle. */
+void
+nxt_cert_info_applied(nxt_str_t *name, nxt_bool_t applied)
+{
+    nxt_cert_info_t  *info;
+
+    info = nxt_cert_info_find(name);
+
+    if (info != NULL) {
+        info->unapplied = !applied;
+    }
+}
+
+
+/*
+ * Put the metadata in the hash.  "old" gets the old metadata of the same
+ * name, or NULL when the name is new.  The caller keeps "old" until it calls
+ * nxt_cert_info_release() or nxt_cert_info_restore().  On failure, the hash
+ * does not change.
+ */
+nxt_int_t
+nxt_cert_info_replace(nxt_cert_info_t *info, nxt_cert_info_t **old)
+{
+    nxt_int_t           ret;
+    nxt_lvlhsh_query_t  lhq;
+
+    lhq.key_hash = nxt_djb_hash(info->name.start, info->name.length);
+    lhq.replace = 1;
+    lhq.key = info->name;
+    lhq.value = info;
+    lhq.proto = &nxt_cert_info_hash_proto;
+
+    ret = nxt_lvlhsh_insert(&nxt_cert_info, &lhq);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return NXT_ERROR;
+    }
+
+    *old = (lhq.value != info) ? lhq.value : NULL;
+
+    return NXT_OK;
+}
+
+
+/*
+ * Undo nxt_cert_info_replace() after a failed store: put the old metadata
+ * back, or remove the name when it was new.  Both only free memory, so this
+ * cannot fail.  Releases "info".
+ *
+ * Main can fail or die after it renamed the new file over the old one, so
+ * the file can hold either bundle.  The old metadata is thus marked as not
+ * applied, and the next upload of either bundle is a full store.
+ */
+void
+nxt_cert_info_restore(nxt_cert_info_t *info, nxt_cert_info_t *old)
+{
+    nxt_lvlhsh_query_t  lhq;
+
+    lhq.key_hash = nxt_djb_hash(info->name.start, info->name.length);
+    lhq.key = info->name;
+    lhq.proto = &nxt_cert_info_hash_proto;
+
+    if (old != NULL) {
+        old->unapplied = 1;
+
+        lhq.replace = 1;
+        lhq.value = old;
+
+        (void) nxt_lvlhsh_insert(&nxt_cert_info, &lhq);
+
+    } else {
+        (void) nxt_lvlhsh_delete(&nxt_cert_info, &lhq);
+    }
+
+    nxt_cert_info_release(info);
+}
+
+
+void
+nxt_cert_info_release(nxt_cert_info_t *info)
+{
+    if (info != NULL) {
+        nxt_mp_destroy(info->mp);
+    }
+}
+
+
+static nxt_cert_info_t *
+nxt_cert_info_find(nxt_str_t *name)
+{
+    nxt_int_t           ret;
+    nxt_lvlhsh_query_t  lhq;
+
+    lhq.key_hash = nxt_djb_hash(name->start, name->length);
+    lhq.key = *name;
+    lhq.proto = &nxt_cert_info_hash_proto;
+
+    ret = nxt_lvlhsh_find(&nxt_cert_info, &lhq);
+    if (ret != NXT_OK) {
+        return NULL;
+    }
+
+    return lhq.value;
+}
+
+
+nxt_conf_value_t *
+nxt_cert_info_get(nxt_str_t *name)
+{
+    nxt_cert_info_t  *info;
+
+    info = nxt_cert_info_find(name);
+
+    return (info != NULL) ? info->value : NULL;
+}
+
+
+nxt_conf_value_t *
+nxt_cert_info_get_all(nxt_mp_t *mp)
+{
+    uint32_t           i;
+    nxt_cert_info_t    *info;
+    nxt_conf_value_t   *all;
+    nxt_lvlhsh_each_t  lhe;
+
+    nxt_lvlhsh_each_init(&lhe, &nxt_cert_info_hash_proto);
+
+    i = 0;
+
+    for ( ;; ) {
+        info = nxt_lvlhsh_each(&nxt_cert_info, &lhe);
+
+        if (info == NULL) {
+            break;
+        }
+
+        i++;
+    }
+
+    all = nxt_conf_create_object(mp, i);
+    if (nxt_slow_path(all == NULL)) {
+        return NULL;
+    }
+
+    nxt_lvlhsh_each_init(&lhe, &nxt_cert_info_hash_proto);
+
+    i = 0;
+
+    for ( ;; ) {
+        info = nxt_lvlhsh_each(&nxt_cert_info, &lhe);
+
+        if (info == NULL) {
+            break;
+        }
+
+        nxt_conf_set_member(all, &info->name, info->value, i);
+
+        i++;
+    }
+
+    return all;
+}
+
+
+static nxt_conf_value_t *
+nxt_cert_details(nxt_mp_t *mp, nxt_cert_t *cert)
+{
+    BIO               *bio;
+    X509              *x509;
+    u_char            *end;
+    EVP_PKEY          *key;
+    const ASN1_TIME   *asn1_time;
+    nxt_str_t         str;
+    nxt_int_t         ret;
+    nxt_uint_t        i;
+    unsigned int      md_len;
+    nxt_conf_value_t  *object, *chain, *element, *value;
+    u_char            buf[256], md[EVP_MAX_MD_SIZE];
+
+    static const u_char  hex[] = "0123456789ABCDEF";
+
+    static const nxt_str_t key_str = nxt_string("key");
+    static const nxt_str_t chain_str = nxt_string("chain");
+    static const nxt_str_t fingerprint_str = nxt_string("fingerprint");
+    static const nxt_str_t since_str = nxt_string("since");
+    static const nxt_str_t until_str = nxt_string("until");
+    static const nxt_str_t issuer_str = nxt_string("issuer");
+    static const nxt_str_t subject_str = nxt_string("subject");
+    static const nxt_str_t validity_str = nxt_string("validity");
+
+    object = nxt_conf_create_object(mp, 3);
+    if (nxt_slow_path(object == NULL)) {
+        return NULL;
+    }
+
+    if (cert->key != NULL) {
+        key = cert->key;
+
+        switch (EVP_PKEY_base_id(key)) {
+        case EVP_PKEY_RSA:
+            end = nxt_sprintf(buf, buf + sizeof(buf), "RSA (%d bits)",
+                              EVP_PKEY_bits(key));
+
+            str.length = end - buf;
+            str.start = buf;
+            break;
+
+        case EVP_PKEY_DH:
+            end = nxt_sprintf(buf, buf + sizeof(buf), "DH (%d bits)",
+                              EVP_PKEY_bits(key));
+
+            str.length = end - buf;
+            str.start = buf;
+            break;
+
+        case EVP_PKEY_EC:
+            nxt_str_set(&str, "ECDH");
+            break;
+
+        default:
+            nxt_str_set(&str, "unknown");
+        }
+
+        ret = nxt_conf_set_member_string_dup(object, mp, &key_str, &str, 0);
+
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NULL;
+        }
+
+    } else {
+        nxt_conf_set_member_null(object, &key_str, 0);
+    }
+
+    /*
+     * The SHA-256 fingerprint of the server certificate, in the form
+     * "openssl x509 -fingerprint -sha256" prints: uppercase hex, a colon
+     * between the bytes.  A renewal script compares it with the
+     * fingerprint of the file it has, and uploads only a new one.
+     */
+
+    if (nxt_slow_path(X509_digest(cert->chain[0], EVP_sha256(), md, &md_len)
+                      != 1))
+    {
+        nxt_thread_log_alert("X509_digest() failed");
+        return NULL;
+    }
+
+    end = buf;
+
+    for (i = 0; i < md_len; i++) {
+        if (i != 0) {
+            *end++ = ':';
+        }
+
+        *end++ = hex[md[i] >> 4];
+        *end++ = hex[md[i] & 0x0f];
+    }
+
+    str.length = end - buf;
+    str.start = buf;
+
+    ret = nxt_conf_set_member_string_dup(object, mp, &fingerprint_str, &str,
+                                         1);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return NULL;
+    }
+
+    chain = nxt_conf_create_array(mp, cert->count);
+    if (nxt_slow_path(chain == NULL)) {
+        return NULL;
+    }
+
+    for (i = 0; i < cert->count; i++) {
+        element = nxt_conf_create_object(mp, 3);
+        if (nxt_slow_path(element == NULL)) {
+            return NULL;
+        }
+
+        x509 = cert->chain[i];
+
+        value = nxt_cert_name_details(mp, x509, 0);
+        if (value == NULL) {
+            return NULL;
+        }
+
+        nxt_conf_set_member(element, &subject_str, value, 0);
+
+        value = nxt_cert_name_details(mp, x509, 1);
+        if (value == NULL) {
+            return NULL;
+        }
+
+        nxt_conf_set_member(element, &issuer_str, value, 1);
+
+        value = nxt_conf_create_object(mp, 2);
+        if (nxt_slow_path(value == NULL)) {
+            return NULL;
+        }
+
+        bio = BIO_new(BIO_s_mem());
+        if (nxt_slow_path(bio == NULL)) {
+            return NULL;
+        }
+
+        asn1_time = X509_get0_notBefore(x509);
+
+        ret = ASN1_TIME_print(bio, asn1_time);
+
+        if (nxt_fast_path(ret == 1)) {
+            str.length = BIO_get_mem_data(bio, &str.start);
+            ret = nxt_conf_set_member_string_dup(value, mp, &since_str, &str,
+                                                 0);
+        } else {
+            ret = NXT_ERROR;
+        }
+
+        BIO_free(bio);
+
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NULL;
+        }
+
+        bio = BIO_new(BIO_s_mem());
+        if (nxt_slow_path(bio == NULL)) {
+            return NULL;
+        }
+
+        asn1_time = X509_get0_notAfter(x509);
+
+        ret = ASN1_TIME_print(bio, asn1_time);
+
+        if (nxt_fast_path(ret == 1)) {
+            str.length = BIO_get_mem_data(bio, &str.start);
+            ret = nxt_conf_set_member_string_dup(value, mp, &until_str, &str,
+                                                 1);
+        } else {
+            ret = NXT_ERROR;
+        }
+
+        BIO_free(bio);
+
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NULL;
+        }
+
+        nxt_conf_set_member(element, &validity_str, value, 2);
+
+        nxt_conf_set_element(chain, i, element);
+    }
+
+    nxt_conf_set_member(object, &chain_str, chain, 2);
+
+    return object;
+}
+
+
+typedef struct {
+    int        nid;
+    nxt_str_t  name;
+} nxt_cert_nid_t;
+
+
+static nxt_conf_value_t *
+nxt_cert_name_details(nxt_mp_t *mp, X509 *x509, nxt_bool_t issuer)
+{
+    NXT_X509_CONST          X509_NAME  *x509_name;
+    nxt_str_t               str;
+    nxt_int_t               ret, found;
+    nxt_uint_t              i, n, count;
+    nxt_conf_value_t        *object, *names;
+    STACK_OF(GENERAL_NAME)  *alt_names;
+
+    static const nxt_cert_nid_t  nids[] = {
+        { NID_commonName, nxt_string("common_name") },
+        { NID_countryName, nxt_string("country") },
+        { NID_stateOrProvinceName, nxt_string("state_or_province") },
+        { NID_localityName, nxt_string("locality") },
+        { NID_organizationName, nxt_string("organization") },
+        { NID_organizationalUnitName, nxt_string("department") },
+    };
+
+    static const nxt_str_t alt_names_str = nxt_string("alt_names");
+
+    count = 0;
+
+    x509_name = issuer ? X509_get_issuer_name(x509)
+                       : X509_get_subject_name(x509);
+
+    for (n = 0; n != nxt_nitems(nids); n++) {
+
+        if (X509_NAME_get_index_by_NID(x509_name, nids[n].nid, -1) < 0) {
+            continue;
+        }
+
+        count++;
+    }
+
+    alt_names = X509_get_ext_d2i(x509, issuer ? NID_issuer_alt_name
+                                              : NID_subject_alt_name,
+                                 NULL, NULL);
+
+    if (alt_names != NULL) {
+        names = nxt_cert_alt_names_details(mp, alt_names);
+
+        sk_GENERAL_NAME_pop_free(alt_names, GENERAL_NAME_free);
+
+        if (nxt_slow_path(names == NULL)) {
+            return NULL;
+        }
+
+        count++;
+
+    } else {
+        names = NULL;
+    }
+
+    object = nxt_conf_create_object(mp, count);
+    if (nxt_slow_path(object == NULL)) {
+        return NULL;
+    }
+
+    for (n = 0, i = 0; n != nxt_nitems(nids) && i != count; n++) {
+
+        found = nxt_cert_name_text(x509_name, nids[n].nid, &str);
+
+        if (n == 1 && names != NULL) {
+            nxt_conf_set_member(object, &alt_names_str, names, i++);
+        }
+
+        if (found != NXT_OK) {
+            continue;
+        }
+
+        /*
+         * X509_NAME_get_text_by_NID() used to copy into a 256 byte buffer and
+         * report the truncated length.  Keep that cap: it is what the control
+         * API has always reported for pathologically long names.
+         */
+
+        if (str.length > NXT_CERT_NAME_TEXT_MAX) {
+            str.length = NXT_CERT_NAME_TEXT_MAX;
+        }
+
+        ret = nxt_conf_set_member_string_dup(object, mp, &nids[n].name,
+                                             &str, i++);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NULL;
+        }
+    }
+
+    return object;
+}
+
+
+/*
+ * Return the raw contents of the first entry of x509_name that carries nid,
+ * or NXT_DECLINED if there is none.
+ *
+ * This replaces X509_NAME_get_text_by_NID(), deprecated in OpenSSL 4.0.  The
+ * old function copied the entry verbatim into the caller's buffer; the entry
+ * accessors hand out the same bytes without the copy, pointing into the
+ * certificate, which outlives the returned string here.
+ *
+ * As before the bytes are neither NUL terminated nor guaranteed free of
+ * embedded NULs, so the caller must keep treating them as a counted string.
+ */
+
+static nxt_int_t
+nxt_cert_name_text(NXT_X509_CONST X509_NAME *x509_name, int nid,
+    nxt_str_t *str)
+{
+    int             i, len;
+    NXT_X509_CONST  ASN1_STRING      *data;
+    NXT_X509_CONST  X509_NAME_ENTRY  *entry;
+
+    i = X509_NAME_get_index_by_NID(x509_name, nid, -1);
+    if (i < 0) {
+        return NXT_DECLINED;
+    }
+
+    entry = X509_NAME_get_entry(x509_name, i);
+    if (nxt_slow_path(entry == NULL)) {
+        return NXT_DECLINED;
+    }
+
+    data = X509_NAME_ENTRY_get_data(entry);
+
+    len = ASN1_STRING_length(data);
+    if (nxt_slow_path(len < 0)) {
+        return NXT_DECLINED;
+    }
+
+    str->length = len;
+    str->start = (u_char *) ASN1_STRING_get0_data(data);
+
+    return NXT_OK;
+}
+
+
+static nxt_conf_value_t *
+nxt_cert_alt_names_details(nxt_mp_t *mp, STACK_OF(GENERAL_NAME) *alt_names)
+{
+    nxt_str_t         str;
+    nxt_int_t         ret;
+    nxt_uint_t        i, n, count;
+    GENERAL_NAME      *name;
+    nxt_conf_value_t  *array;
+
+    count = sk_GENERAL_NAME_num(alt_names);
+    n = 0;
+
+    for (i = 0; i != count; i++) {
+        name = sk_GENERAL_NAME_value(alt_names, i);
+
+        if (name->type != GEN_DNS) {
+            continue;
+        }
+
+        n++;
+    }
+
+    array = nxt_conf_create_array(mp, n);
+    if (nxt_slow_path(array == NULL)) {
+        return NULL;
+    }
+
+    for (n = 0, i = 0; n != count; n++) {
+        name = sk_GENERAL_NAME_value(alt_names, n);
+
+        if (name->type != GEN_DNS) {
+            continue;
+        }
+
+        str.length = ASN1_STRING_length(name->d.dNSName);
+        str.start = (u_char *) ASN1_STRING_get0_data(name->d.dNSName);
+
+        ret = nxt_conf_set_element_string_dup(array, mp, i++, &str);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NULL;
+        }
+    }
+
+    return array;
+}
+
+
+nxt_int_t
+nxt_cert_info_delete(nxt_str_t *name)
+{
+    nxt_int_t           ret;
+    nxt_cert_info_t     *info;
+    nxt_lvlhsh_query_t  lhq;
+
+    lhq.key_hash = nxt_djb_hash(name->start, name->length);
+    lhq.key = *name;
+    lhq.proto = &nxt_cert_info_hash_proto;
+
+    ret = nxt_lvlhsh_delete(&nxt_cert_info, &lhq);
+
+    if (ret == NXT_OK) {
+        info = lhq.value;
+        nxt_mp_destroy(info->mp);
+    }
+
+    return ret;
+}
+
+
+
+nxt_array_t *
+nxt_cert_store_load(nxt_task_t *task, nxt_mp_t *mp)
+{
+    DIR              *dir;
+    size_t           size, alloc;
+    u_char           *buf, *p;
+    nxt_str_t        name;
+    nxt_int_t        ret;
+    nxt_file_t       file;
+    nxt_array_t      *certs;
+    nxt_runtime_t    *rt;
+    struct dirent    *de;
+    nxt_cert_item_t  *item;
+
+    rt = task->thread->runtime;
+
+    if (nxt_slow_path(rt->certs.start == NULL)) {
+        nxt_alert(task, "no certificates storage directory");
+        return NULL;
+    }
+
+    certs = nxt_array_create(mp, 16, sizeof(nxt_cert_item_t));
+    if (nxt_slow_path(certs == NULL)) {
+        return NULL;
+    }
+
+    buf = NULL;
+    alloc = 0;
+
+    dir = opendir((char *) rt->certs.start);
+    if (nxt_slow_path(dir == NULL)) {
+        nxt_alert(task, "opendir(\"%s\") failed %E",
+                  rt->certs.start, nxt_errno);
+        goto fail;
+    }
+
+    for ( ;; ) {
+        de = readdir(dir);
+        if (de == NULL) {
+            break;
+        }
+
+        nxt_debug(task, "readdir(\"%s\"): \"%s\"", rt->certs.start, de->d_name);
+
+        name.length = nxt_strlen(de->d_name);
+        name.start = (u_char *) de->d_name;
+
+        /* ".", "..", and the names the store keeps for itself. */
+        if (name.start[0] == '.') {
+            continue;
+        }
+
+        item = nxt_array_add(certs);
+        if (nxt_slow_path(item == NULL)) {
+            goto fail;
+        }
+
+        item->fd = -1;
+
+        size = rt->certs.length + name.length + 1;
+
+        if (size > alloc) {
+            size += 32;
+
+            p = nxt_realloc(buf, size);
+            if (p == NULL) {
+                goto fail;
+            }
+
+            alloc = size;
+            buf = p;
+        }
+
+        p = nxt_cpymem(buf, rt->certs.start, rt->certs.length);
+        p = nxt_cpymem(p, name.start, name.length + 1);
+
+        nxt_memzero(&file, sizeof(nxt_file_t));
+
+        file.name = buf;
+
+        ret = nxt_file_open(task, &file, NXT_FILE_RDONLY, NXT_FILE_OPEN,
+                            NXT_FILE_OWNER_ACCESS);
+
+
+        if (nxt_slow_path(ret != NXT_OK)) {
+            nxt_array_remove_last(certs);
+            continue;
+        }
+
+        item->fd = file.fd;
+
+        if (nxt_slow_path(nxt_str_dup(mp, &item->name, &name) == NULL)) {
+            goto fail;
+        }
+    }
+
+    if (buf != NULL) {
+        nxt_free(buf);
+    }
+
+    (void) closedir(dir);
+
+    return certs;
+
+fail:
+
+    if (buf != NULL) {
+        nxt_free(buf);
+    }
+
+    if (dir != NULL) {
+        (void) closedir(dir);
+    }
+
+    nxt_cert_store_release(certs);
+
+    return NULL;
+}
+
+
+void
+nxt_cert_store_release(nxt_array_t *certs)
+{
+    uint32_t         i;
+    nxt_cert_item_t  *items;
+
+    for (items = certs->elts, i = 0;
+         i < certs->nelts;
+         i++)
+    {
+        nxt_fd_close(items[i].fd);
+    }
+
+    nxt_array_destroy(certs);
+}
+
+
+#if 0
+
+void
+nxt_cert_store_discovery_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    DIR            *dir;
+    size_t         size;
+    nxt_buf_t      *b;
+    nxt_int_t      ret;
+    nxt_port_t     *port;
+    nxt_runtime_t  *rt;
+    struct dirent  *de;
+
+    port = nxt_runtime_port_find(task->thread->runtime, msg->port_msg.pid,
+                                 msg->port_msg.reply_port);
+
+    if (nxt_slow_path(port == NULL)) {
+        return;
+    }
+
+    b = NULL;
+    dir = NULL;
+
+    rt = task->thread->runtime;
+
+    if (nxt_slow_path(rt->certs.start == NULL)) {
+        nxt_alert(task, "no certificates storage directory");
+        goto fail;
+    }
+
+    dir = opendir((char *) rt->certs.start);
+    if (nxt_slow_path(dir == NULL)) {
+        nxt_alert(task, "opendir(\"%s\") failed %E",
+                  rt->certs.start, nxt_errno);
+        goto fail;
+    }
+
+    size = 0;
+
+    for ( ;; ) {
+        de = readdir(dir);
+        if (de == NULL) {
+            break;
+        }
+
+        if (de->d_type != DT_REG) {
+            continue;
+        }
+
+        size += nxt_strlen(de->d_name) + 1;
+    }
+
+    b = nxt_port_mmap_get_buf(task, port, size);
+    if (nxt_slow_path(b == NULL)) {
+        goto fail;
+    }
+
+    rewinddir(dir);
+
+    for ( ;; ) {
+        de = readdir(dir);
+        if (de == NULL) {
+            break;
+        }
+
+        if (de->d_type != DT_REG) {
+            continue;
+        }
+
+        size = nxt_strlen(de->d_name) + 1;
+
+        if (nxt_slow_path(size > (size_t) nxt_buf_mem_free_size(&b->mem))) {
+            b->mem.free = b->mem.start;
+            break;
+        }
+
+        b->mem.free = nxt_cpymem(b->mem.free, de->d_name, size);
+    }
+
+    (void) closedir(dir);
+    dir = NULL;
+
+    if (nxt_slow_path(nxt_buf_mem_free_size(&b->mem) != 0)) {
+        nxt_alert(task, "certificates storage directory "
+                  "has changed while reading it");
+        goto fail;
+    }
+
+    ret = nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_READY_LAST, -1,
+                                msg->port_msg.stream, 0, b);
+
+    if (nxt_fast_path(ret == NXT_OK)) {
+        return;
+    }
+
+fail:
+
+    if (dir != NULL) {
+        (void) closedir(dir);
+    }
+
+    if (b != NULL) {
+        b->completion_handler(task, b, b->parent);
+    }
+
+    (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR, -1,
+                                 msg->port_msg.stream, 0, NULL);
+}
+
+#endif
+
+
+void
+nxt_cert_store_get(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp,
+    nxt_port_rpc_handler_t handler, void *ctx)
+{
+    uint32_t       stream;
+    nxt_int_t      ret;
+    nxt_buf_t      *b;
+    nxt_port_t     *main_port, *recv_port;
+    nxt_runtime_t  *rt;
+
+    b = nxt_buf_mem_alloc(mp, name->length + 1, 0);
+    if (nxt_slow_path(b == NULL)) {
+        goto fail;
+    }
+
+    b->completion_handler = nxt_cert_buf_completion;
+
+    nxt_buf_cpystr(b, name);
+    *b->mem.free++ = '\0';
+
+    rt = task->thread->runtime;
+    main_port = rt->port_by_type[NXT_PROCESS_MAIN];
+    recv_port = rt->port_by_type[rt->type];
+
+    stream = nxt_port_rpc_register_handler(task, recv_port, handler, handler,
+                                           -1, ctx);
+    if (nxt_slow_path(stream == 0)) {
+        goto fail;
+    }
+
+    ret = nxt_port_socket_write(task, main_port, NXT_PORT_MSG_CERT_GET, -1,
+                                stream, recv_port->id, b);
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_rpc_cancel(task, recv_port, stream);
+        goto fail;
+    }
+
+    /* Retain after hand-off: failure paths above must not leave an orphaned
+     * refcount that the completion handler can never release. */
+    nxt_mp_retain(mp);
+
+    return;
+
+fail:
+
+    handler(task, NULL, ctx);
+}
+
+
+static void
+nxt_cert_buf_completion(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_mp_t   *mp;
+    nxt_buf_t  *b;
+
+    b = obj;
+    mp = b->data;
+    nxt_assert(b->next == NULL);
+
+    nxt_mp_free(mp, b);
+    nxt_mp_release(mp);
+}
+
+
+void
+nxt_cert_store_get_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    u_char               *p;
+    nxt_int_t            ret;
+    nxt_str_t            name;
+    nxt_file_t           file;
+    nxt_port_t           *port;
+    nxt_runtime_t        *rt;
+    nxt_port_msg_type_t  type;
+
+    /*
+     * Look up the sender's port via the kernel-validated PID
+     * (SCM_CREDENTIALS).  msg->port_msg.pid is self-declared, so using
+     * it would let a compromised worker spoof the router and pull
+     * arbitrary certificate material out of main.
+     *
+     * Only the router reads bundles: it opens every bundle a listener
+     * names during a reconfiguration.  The controller parses a bundle
+     * from the request body and sends it to main with CERT_STORE; it
+     * never reads one back.
+     */
+    port = nxt_runtime_port_find(task->thread->runtime,
+                                 nxt_recv_msg_cmsg_pid(msg),
+                                 msg->port_msg.reply_port);
+
+    if (nxt_slow_path(port == NULL)) {
+        nxt_alert(task, "process port not found (pid %PI, reply_port %d)",
+                  nxt_recv_msg_cmsg_pid(msg), msg->port_msg.reply_port);
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    if (nxt_slow_path(port->type != NXT_PROCESS_ROUTER)) {
+        nxt_alert(task, "process %PI cannot read certificates",
+                  nxt_recv_msg_cmsg_pid(msg));
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    nxt_memzero(&file, sizeof(nxt_file_t));
+
+    file.fd = -1;
+    type = NXT_PORT_MSG_RPC_ERROR;
+
+    rt = task->thread->runtime;
+
+    if (nxt_slow_path(rt->certs.start == NULL)) {
+        nxt_alert(task, "no certificates storage directory");
+        goto error;
+    }
+
+    name.start = msg->buf->mem.pos;
+    name.length = nxt_strlen(name.start);
+
+    file.name = nxt_malloc(rt->certs.length + name.length + 1);
+
+    if (nxt_slow_path(file.name == NULL)) {
+        goto error;
+    }
+
+    p = nxt_cpymem(file.name, rt->certs.start, rt->certs.length);
+    p = nxt_cpymem(p, name.start, name.length + 1);
+
+    ret = nxt_file_open(task, &file, NXT_FILE_RDONLY, NXT_FILE_OPEN,
+                        NXT_FILE_OWNER_ACCESS);
+
+    nxt_free(file.name);
+
+    if (nxt_fast_path(ret == NXT_OK)) {
+        type = NXT_PORT_MSG_RPC_READY_LAST | NXT_PORT_MSG_CLOSE_FD;
+    }
+
+error:
+
+    if (nxt_port_socket_write(task, port, type, file.fd,
+                              msg->port_msg.stream, 0, NULL)
+        != NXT_OK
+        && file.fd != -1)
+    {
+        /*
+         * On send failure (e.g. malloc failure inside the port machinery)
+         * the port layer never takes ownership of the fd, so close it
+         * here to avoid leaking an open file descriptor in the privileged
+         * main process.  Use nxt_fd_close() rather than nxt_file_close():
+         * file.name has already been freed above and the latter would
+         * dereference it through "%FN" on a close-failure log path.
+         */
+        nxt_fd_close(file.fd);
+        file.fd = -1;
+    }
+}
+
+
+/*
+ * Send "mbuf" to main to store it as the bundle "name".  The bundle goes in
+ * a shared memory segment, as conf.json does.  The port message holds the
+ * NUL-terminated name, followed by the size.  "handler" gets RPC_READY when
+ * the file is in place, and RPC_ERROR or a NULL message otherwise.
+ */
+void
+nxt_cert_store_put(nxt_task_t *task, nxt_str_t *name, nxt_buf_mem_t *mbuf,
+    nxt_mp_t *mp, nxt_port_rpc_handler_t handler, void *ctx)
+{
+    void           *mem;
+    size_t         size;
+    uint32_t       stream;
+    nxt_fd_t       fd;
+    nxt_int_t      ret;
+    nxt_buf_t      *b;
+    nxt_port_t     *main_port, *ctl_port;
+    nxt_runtime_t  *rt;
+
+    size = nxt_buf_mem_used_size(mbuf);
+
+    fd = nxt_shm_open(task, size);
+    if (nxt_slow_path(fd == -1)) {
+        goto fail;
+    }
+
+    mem = nxt_mem_mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (nxt_slow_path(mem == MAP_FAILED)) {
+        goto fail;
+    }
+
+    nxt_memcpy(mem, mbuf->pos, size);
+    nxt_mem_munmap(mem, size);
+
+    b = nxt_buf_mem_alloc(mp, name->length + 1 + sizeof(size_t), 0);
+    if (nxt_slow_path(b == NULL)) {
+        goto fail;
+    }
+
+    b->completion_handler = nxt_cert_buf_completion;
+
+    nxt_buf_cpystr(b, name);
+    *b->mem.free++ = '\0';
+    b->mem.free = nxt_cpymem(b->mem.free, &size, sizeof(size_t));
+
+    rt = task->thread->runtime;
+    main_port = rt->port_by_type[NXT_PROCESS_MAIN];
+    ctl_port = rt->port_by_type[NXT_PROCESS_CONTROLLER];
+
+    stream = nxt_port_rpc_register_handler(task, ctl_port, handler, handler,
+                                           -1, ctx);
+    if (nxt_slow_path(stream == 0)) {
+        goto fail;
+    }
+
+    ret = nxt_port_socket_write(task, main_port,
+                                NXT_PORT_MSG_CERT_STORE | NXT_PORT_MSG_CLOSE_FD,
+                                fd, stream, ctl_port->id, b);
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_rpc_cancel(task, ctl_port, stream);
+        goto fail;
+    }
+
+    /* See nxt_cert_store_get(). */
+    nxt_mp_retain(mp);
+
+    return;
+
+fail:
+
+    /* The port layer owns the descriptor only after a successful write. */
+    if (fd != -1) {
+        nxt_fd_close(fd);
+    }
+
+    handler(task, NULL, ctx);
+}
+
+
+/*
+ * The name of a bundle in a message of the controller: NUL-terminated, not
+ * empty, at most NXT_CERT_NAME_MAX_LENGTH bytes, without "/", and not
+ * starting with ".".  The controller checks the name already, but it is
+ * unprivileged, and main builds a path from the name.  "span" is left at
+ * the first byte after the NUL.
+ */
+static nxt_int_t
+nxt_cert_store_name(nxt_buf_t *b, nxt_span_t *span, nxt_str_t *name)
+{
+    u_char        *nul;
+    const u_char  *start;
+
+    if (b == NULL) {
+        return NXT_ERROR;
+    }
+
+    nxt_span_init(span, b->mem.pos, b->mem.free);
+
+    nul = memchr(b->mem.pos, '\0', nxt_span_len(span));
+    if (nul == NULL) {
+        return NXT_ERROR;
+    }
+
+    name->length = nul - b->mem.pos;
+
+    if (nxt_span_take(span, name->length + 1, &start) != 0
+        || name->length == 0
+        || name->length > NXT_CERT_NAME_MAX_LENGTH
+        || start[0] == '.'
+        || memchr(start, '/', name->length) != NULL)
+    {
+        return NXT_ERROR;
+    }
+
+    name->start = b->mem.pos;
+
+    return NXT_OK;
+}
+
+
+/*
+ * Main's side of nxt_cert_store_put().  The store child of main writes the
+ * bundle to "certs/.store.tmp" and renames it over "certs/<name>", so a
+ * reader sees the old bundle or the new one, never a partial file.  The
+ * temporary name is fixed, so a name of NAME_MAX bytes still works, and one
+ * name is enough: one store child runs at a time, and a bundle name cannot
+ * start with ".".  The controller is unprivileged, so main checks the
+ * sender and the name again.
+ *
+ * Main answers when the store child exits (nxt_main_store_submit()), so
+ * the controller answers 200 only when the bundle is on disk.  The two
+ * fsync(2) calls of the store do not stop main.
+ */
+void
+nxt_cert_store_put_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    size_t                size;
+    u_char                *mem;
+    nxt_str_t             name;
+    nxt_file_t            file;
+    nxt_port_t            *port;
+    nxt_span_t            span;
+    nxt_runtime_t         *rt;
+    nxt_main_store_job_t  *job;
+
+    port = nxt_runtime_port_find(task->thread->runtime,
+                                 nxt_recv_msg_cmsg_pid(msg),
+                                 msg->port_msg.reply_port);
+
+    if (nxt_slow_path(port == NULL || port->type != NXT_PROCESS_CONTROLLER)) {
+        nxt_alert(task, "process %PI cannot store certificates",
+                  nxt_recv_msg_cmsg_pid(msg));
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    rt = task->thread->runtime;
+
+    mem = NULL;
+
+    if (nxt_slow_path(rt->certs.start == NULL)) {
+        nxt_alert(task, "no certificates storage directory");
+        goto fail;
+    }
+
+    if (nxt_slow_path(msg->fd[0] == -1)) {
+        nxt_alert(task, "cert_store_handler: invalid shm fd");
+        goto fail;
+    }
+
+    /* The message holds the NUL-terminated name, followed by the size. */
+
+    if (nxt_slow_path(nxt_cert_store_name(msg->buf, &span, &name) != NXT_OK
+                      || nxt_span_len(&span) != sizeof(size_t)))
+    {
+        nxt_alert(task, "cert_store_handler: invalid certificate name");
+        goto fail;
+    }
+
+    (void) nxt_span_copy(&span, &size, sizeof(size_t));
+
+    if (nxt_slow_path(size == 0 || size > NXT_CERT_STORE_MAX_SIZE)) {
+        nxt_alert(task, "cert_store_handler: invalid bundle size %uz", size);
+        goto fail;
+    }
+
+    /*
+     * Copy the bundle with pread() instead of mapping the segment: a
+     * sender can shrink a mapped segment, and a read past its end is
+     * SIGBUS in main.  A short pread() is only an error.
+     */
+
+    mem = nxt_malloc(size);
+    if (nxt_slow_path(mem == NULL)) {
+        goto fail;
+    }
+
+    nxt_memzero(&file, sizeof(nxt_file_t));
+    file.fd = msg->fd[0];
+
+    /* nxt_file_read() logs the name when pread() fails; it must not be NULL. */
+    file.name = name.start;
+
+    if (nxt_slow_path(nxt_file_read(&file, mem, size, 0) != (ssize_t) size)) {
+        nxt_alert(task, "cert_store_handler: short bundle read");
+        goto fail;
+    }
+
+    job = nxt_main_store_job_create(NXT_MAIN_STORE_PUT, "certificate",
+                                    &rt->certs, &name);
+    if (nxt_slow_path(job == NULL)) {
+        goto fail;
+    }
+
+    job->data = mem;
+    job->size = size;
+    job->reply_pid = port->pid;
+    job->reply_port = port->id;
+    job->stream = msg->port_msg.stream;
+
+    nxt_port_recv_msg_close_fds(msg);
+
+    nxt_main_store_submit(task, job);
+
+    return;
+
+fail:
+
+    (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR, -1,
+                                 msg->port_msg.stream, 0, NULL);
+
+    nxt_free(mem);
+    nxt_port_recv_msg_close_fds(msg);
+}
+
+
+void
+nxt_cert_store_delete(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp)
+{
+    nxt_buf_t      *b;
+    nxt_port_t     *main_port;
+    nxt_runtime_t  *rt;
+
+    b = nxt_buf_mem_alloc(mp, name->length + 1, 0);
+
+    if (nxt_fast_path(b != NULL)) {
+        nxt_buf_cpystr(b, name);
+        *b->mem.free++ = '\0';
+
+        rt = task->thread->runtime;
+        main_port = rt->port_by_type[NXT_PROCESS_MAIN];
+
+        (void) nxt_port_socket_write(task, main_port, NXT_PORT_MSG_CERT_DELETE,
+                                     -1, 0, 0, b);
+    }
+}
+
+
+/*
+ * The store child of main deletes the bundle, after any store that waits
+ * before it.  A delete in main could run before the rename() of an earlier
+ * store child of the same bundle, and that rename() would bring the bundle
+ * back.
+ */
+void
+nxt_cert_store_delete_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_str_t             name;
+    nxt_port_t            *ctl_port;
+    nxt_span_t            span;
+    nxt_runtime_t         *rt;
+    nxt_main_store_job_t  *job;
+
+    rt = task->thread->runtime;
+    ctl_port = rt->port_by_type[NXT_PROCESS_CONTROLLER];
+
+    if (nxt_slow_path(ctl_port == NULL)) {
+        nxt_alert(task, "controller port not found");
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    if (nxt_slow_path(nxt_recv_msg_cmsg_pid(msg) != ctl_port->pid)) {
+        nxt_alert(task, "process %PI cannot delete certificates",
+                  nxt_recv_msg_cmsg_pid(msg));
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    if (nxt_slow_path(rt->certs.start == NULL)) {
+        nxt_alert(task, "no certificates storage directory");
+        return;
+    }
+
+    if (nxt_slow_path(nxt_cert_store_name(msg->buf, &span, &name) != NXT_OK
+                      || nxt_span_len(&span) != 0))
+    {
+        nxt_alert(task, "cert_delete_handler: invalid certificate name");
+        return;
+    }
+
+    job = nxt_main_store_job_create(NXT_MAIN_STORE_DELETE, "certificate",
+                                    &rt->certs, &name);
+
+    if (nxt_fast_path(job != NULL)) {
+        nxt_main_store_submit(task, job);
+    }
+}

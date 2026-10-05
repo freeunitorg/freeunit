@@ -1,0 +1,9284 @@
+
+/*
+ * Copyright (C) Igor Sysoev
+ * Copyright (C) Valentin V. Bartenev
+ * Copyright (C) NGINX, Inc.
+ */
+
+#include <nxt_router.h>
+#include <nxt_conf.h>
+#include <nxt_status.h>
+#if (NXT_TLS)
+#include <nxt_cert.h>
+#endif
+#if (NXT_HAVE_NJS)
+#include <nxt_script.h>
+#endif
+#include <nxt_http.h>
+#include <nxt_port_memory_int.h>
+#include <nxt_unit_request.h>
+#include <nxt_unit_response.h>
+#include <nxt_router_request.h>
+#include <nxt_app_queue.h>
+#include <nxt_port_queue.h>
+#include <nxt_span.h>
+#include <nxt_http_compression.h>
+
+#if (NXT_HAVE_OTEL)
+#define NXT_OTEL_BATCH_DEFAULT     128
+#define NXT_OTEL_SAMPLING_DEFAULT  1
+#endif
+
+typedef struct {
+    nxt_str_t         type;
+    uint32_t          processes;
+    uint32_t          max_processes;
+    uint32_t          spare_processes;
+    nxt_msec_t        timeout;
+    nxt_msec_t        idle_timeout;
+    nxt_conf_value_t  *limits_value;
+    nxt_conf_value_t  *processes_value;
+    nxt_conf_value_t  *targets_value;
+    nxt_msec_t        start_timeout;
+} nxt_router_app_conf_t;
+
+
+typedef struct {
+    nxt_str_t         pass;
+    nxt_str_t         application;
+    int               backlog;
+} nxt_router_listener_conf_t;
+
+
+#if (NXT_TLS)
+
+typedef struct {
+    nxt_str_t               name;
+    nxt_socket_conf_t       *socket_conf;
+    nxt_router_temp_conf_t  *temp_conf;
+    nxt_tls_init_t          *tls_init;
+    nxt_bool_t              last;
+
+    nxt_queue_link_t        link;  /* for nxt_socket_conf_t.tls */
+} nxt_router_tlssock_t;
+
+#endif
+
+
+#if (NXT_HAVE_NJS)
+
+typedef struct {
+    nxt_str_t               name;
+    nxt_router_temp_conf_t  *temp_conf;
+    nxt_queue_link_t        link;
+} nxt_router_js_module_t;
+
+#endif
+
+
+typedef struct {
+    nxt_str_t               *name;
+    nxt_socket_conf_t       *socket_conf;
+    nxt_router_temp_conf_t  *temp_conf;
+    nxt_bool_t              last;
+} nxt_socket_rpc_t;
+
+
+typedef struct nxt_router_start_timer_s  nxt_router_start_timer_t;
+
+
+typedef struct {
+    nxt_app_t                 *app;
+    nxt_router_temp_conf_t    *temp_conf;
+    nxt_router_start_timer_t  *start_timer;
+    uint8_t                   proto;  /* 1 bit */
+} nxt_app_rpc_t;
+
+
+typedef struct {
+    nxt_app_joint_t           *app_joint;
+    nxt_router_start_timer_t  *start_timer;
+    uint32_t                  generation;
+    uint8_t                   proto;  /* 1 bit */
+    /*
+     * Not a start attempt at all any more: the registration was put back on
+     * the stream by nxt_router_app_start_expired() to reap the process the
+     * expired attempt left behind, and it owns an unaccounted_processes slot
+     * rather than a pending_processes one.
+     */
+    uint8_t                   expired;  /* 1 bit */
+} nxt_app_joint_rpc_t;
+
+
+/*
+ * Deadline for one START_PROCESS RPC.
+ *
+ * The only thing that can answer a start is the new worker itself, through
+ * nxt_unit_init() -> PROCESS_READY.  A process that is forked successfully but
+ * never gets there -- a "type": "external" binary that blocks before exec'ing
+ * anything of ours, a runtime stuck in its own init -- answers nothing and
+ * dies of nothing, so the RPC stays armed for the life of the router.  With
+ * the default "processes" that RPC is the sole continuation of
+ * nxt_router_conf_apply(), so the configuration PUT never returns and the
+ * controller queues every later request behind it, GET /status included.
+ *
+ * On expiry the RPC is failed through nxt_port_rpc_error(), which runs the
+ * handler that a real failure would have run.  Nothing here duplicates that
+ * recovery: the pending_processes and proto_port_requests accounting stays in
+ * nxt_router_app_port_error() / nxt_router_app_prefork_error() and runs once,
+ * driven by the RPC layer.
+ *
+ * The struct owns nothing but a copy of the application name, deliberately:
+ * holding an nxt_app_t or an nxt_app_joint_t reference would let a deadline
+ * extend the lifetime of the very object whose start it is giving up on.  Both
+ * ports are referenced, because the stream is only meaningful against the
+ * router port and the send queue is only reachable through the destination.
+ *
+ * Expiry cannot simply fail the RPC, because the START_PROCESS it is giving up
+ * on may not have left the router yet.  nxt_port_socket_write2() reports NXT_OK
+ * once the message is in dport->messages, and what it queued there is a shallow
+ * copy: the payload pointer, which on the config-apply path lives in
+ * tmcf->mem_pool, and the application's shared-port descriptor numbers, which
+ * it borrows.  Failing the RPC runs nxt_router_conf_error(), which unlinks the
+ * application (closing that shared port) and releases that pool -- and the
+ * queued copy would still be there, to be dereferenced and sent with
+ * SCM_RIGHTS when the destination finally drains.
+ *
+ * So the deadline is still armed at the write, and expiry resolves against the
+ * send queue first:
+ *
+ *   not yet started    nxt_port_socket_cancel() takes the message back and
+ *                      completes its buffer, and the failure is driven from
+ *                      that completion.
+ *   partially sent     left queued -- a fragment and the descriptors are
+ *                      already with the peer -- and the failure waits for the
+ *                      completion of the last fragment.  See the note on
+ *                      ->expired below.
+ *   fully sent         the message is gone from the queue but its completion
+ *                      can still be pending: nxt_port_write_handler() removes
+ *                      it and only then queues the buffer completion, which
+ *                      can land behind a timer handler already queued ahead of
+ *                      it.  Absence from the queue is not a lifetime boundary,
+ *                      so the failure again waits for the completion.
+ *   completed          ->send_done: nothing references the payload any more,
+ *                      so the RPC is failed inline.
+ *
+ * Everything but the last case therefore funnels through
+ * nxt_router_start_buf_completion(), which is the single point where the
+ * payload is known to be unreachable from the port layer.
+ *
+ * References: one for the RPC that holds it, one for the engine while the
+ * timer node is live, and one for a buffer completion that has yet to run.
+ */
+
+struct nxt_router_start_timer_s {
+    nxt_timer_t             timer;
+    /* The port the RPC is registered on, and the one it was written to. */
+    nxt_port_t              *port;
+    nxt_port_t              *dport;
+    /* The queued message's identity, for nxt_port_socket_cancel(). */
+    nxt_buf_t               *buf;
+    nxt_port_id_t           reply_port;
+    uint32_t                stream;
+    nxt_msec_t              timeout;
+    int32_t                 refs;
+    /* The timer node is live in the engine. */
+    uint8_t                 armed;      /* 1 bit */
+    /* The deadline fired; the RPC must be failed once the payload is free. */
+    uint8_t                 expired;    /* 1 bit */
+    /* The buffer completion has run: the port layer is done with the msg. */
+    uint8_t                 send_done;  /* 1 bit */
+    /* The RPC has retired, so nothing may fail it again. */
+    uint8_t                 retired;    /* 1 bit */
+    /*
+     * The START_PROCESS was taken back out of the send queue before the
+     * destination ever saw it, so no process was forked for it and there is
+     * nothing to account for.  See nxt_router_app_port_error().
+     */
+    uint8_t                 recalled;   /* 1 bit */
+    /*
+     * The payload's completion found bytes of it still unsent, so the
+     * destination never saw the whole message and forked nothing for it.
+     * The same conclusion as ->recalled, reached at the other end of a send
+     * the deadline could not take back.  See nxt_router_app_port_error().
+     */
+    uint8_t                 dropped;    /* 1 bit */
+    nxt_str_t               app_name;
+};
+
+
+static nxt_int_t nxt_router_prefork(nxt_task_t *task, nxt_process_t *process,
+    nxt_mp_t *mp);
+static nxt_int_t nxt_router_start(nxt_task_t *task, nxt_process_data_t *data);
+static void nxt_router_greet_controller(nxt_task_t *task,
+    nxt_port_t *controller_port);
+
+static nxt_int_t nxt_router_start_app_process(nxt_task_t *task, nxt_app_t *app);
+
+static nxt_bool_t nxt_router_msg_from(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, nxt_process_type_t type);
+static nxt_bool_t nxt_router_pid_is(nxt_task_t *task, nxt_pid_t pid,
+    nxt_process_type_t type);
+static nxt_bool_t nxt_router_msg_from_self(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static nxt_bool_t nxt_router_msg_sender_ok(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_router_msg_sender_refuse(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, const char *reason);
+static const char *nxt_router_new_port_check(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static const char *nxt_router_get_port_check(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static const char *nxt_router_get_mmap_check(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_router_gate_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_router_conf_data_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_router_app_restart_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_router_status_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_router_remove_pid_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+
+static nxt_router_temp_conf_t *nxt_router_temp_conf(nxt_task_t *task);
+static void nxt_router_conf_ready(nxt_task_t *task,
+    nxt_router_temp_conf_t *tmcf);
+static void nxt_router_conf_send(nxt_task_t *task,
+    nxt_router_temp_conf_t *tmcf, nxt_port_msg_type_t type);
+#if (NXT_TLS)
+static void nxt_router_conf_error_tls(nxt_task_t *task, nxt_queue_t *sockets);
+#endif
+
+static nxt_int_t nxt_router_conf_create(nxt_task_t *task,
+    nxt_router_temp_conf_t *tmcf, u_char *start, u_char *end);
+static nxt_int_t nxt_router_conf_process_static(nxt_task_t *task,
+    nxt_router_conf_t *rtcf, nxt_conf_value_t *conf);
+static nxt_http_forward_t *nxt_router_conf_forward(nxt_task_t *task,
+    nxt_mp_t *mp, nxt_conf_value_t *conf);
+static nxt_int_t nxt_router_conf_forward_header(nxt_mp_t *mp,
+    nxt_conf_value_t *conf, nxt_http_forward_header_t *fh);
+
+static nxt_app_t *nxt_router_app_find(nxt_queue_t *queue, nxt_str_t *name);
+static nxt_int_t nxt_router_apps_hash_test(nxt_lvlhsh_query_t *lhq, void *data);
+static nxt_int_t nxt_router_apps_hash_add(nxt_router_conf_t *rtcf,
+    nxt_app_t *app);
+static nxt_app_t *nxt_router_apps_hash_get(nxt_router_conf_t *rtcf,
+    nxt_str_t *name);
+static void nxt_router_apps_hash_use(nxt_task_t *task, nxt_router_conf_t *rtcf,
+    int i);
+
+static nxt_int_t nxt_router_app_queue_init(nxt_task_t *task,
+    nxt_port_t *port);
+static nxt_int_t nxt_router_port_queue_init(nxt_task_t *task,
+    nxt_port_t *port);
+static nxt_int_t nxt_router_port_queue_map(nxt_task_t *task,
+    nxt_port_t *port, nxt_fd_t fd);
+static void nxt_router_listen_socket_rpc_create(nxt_task_t *task,
+    nxt_router_temp_conf_t *tmcf, nxt_socket_conf_t *skcf);
+static void nxt_router_listen_socket_ready(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data);
+static void nxt_router_listen_socket_error(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data);
+#if (NXT_TLS)
+static void nxt_router_tls_rpc_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data);
+static nxt_int_t nxt_router_conf_tls_insert(nxt_router_temp_conf_t *tmcf,
+    nxt_conf_value_t *value, nxt_socket_conf_t *skcf, nxt_tls_init_t *tls_init,
+    nxt_bool_t last);
+#endif
+#if (NXT_HAVE_NJS)
+static void nxt_router_js_module_rpc_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data);
+static nxt_int_t nxt_router_js_module_insert(nxt_router_temp_conf_t *tmcf,
+    nxt_conf_value_t *value);
+#endif
+static void nxt_router_app_rpc_create(nxt_task_t *task,
+    nxt_router_temp_conf_t *tmcf, nxt_app_t *app);
+static void nxt_router_app_prefork_ready(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data);
+static void nxt_router_app_prefork_error(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data);
+static nxt_socket_conf_t *nxt_router_socket_conf(nxt_task_t *task,
+    nxt_router_temp_conf_t *tmcf, nxt_str_t *name, int backlog);
+static nxt_int_t nxt_router_listen_socket_find(nxt_router_temp_conf_t *tmcf,
+    nxt_socket_conf_t *nskcf, nxt_sockaddr_t *sa);
+
+static nxt_int_t nxt_router_engines_create(nxt_task_t *task,
+    nxt_router_t *router, nxt_router_temp_conf_t *tmcf,
+    const nxt_event_interface_t *interface);
+static nxt_int_t nxt_router_engine_conf_create(nxt_router_temp_conf_t *tmcf,
+    nxt_router_engine_conf_t *recf);
+static nxt_int_t nxt_router_engine_conf_update(nxt_router_temp_conf_t *tmcf,
+    nxt_router_engine_conf_t *recf);
+static nxt_int_t nxt_router_engine_conf_delete(nxt_router_temp_conf_t *tmcf,
+    nxt_router_engine_conf_t *recf);
+static nxt_int_t nxt_router_engine_joints_create(nxt_router_temp_conf_t *tmcf,
+    nxt_router_engine_conf_t *recf, nxt_queue_t *sockets,
+    nxt_work_handler_t handler);
+static nxt_int_t nxt_router_engine_quit(nxt_router_temp_conf_t *tmcf,
+    nxt_router_engine_conf_t *recf);
+static nxt_int_t nxt_router_engine_joints_delete(nxt_router_temp_conf_t *tmcf,
+    nxt_router_engine_conf_t *recf, nxt_queue_t *sockets);
+
+static nxt_int_t nxt_router_threads_create(nxt_task_t *task, nxt_runtime_t *rt,
+    nxt_router_temp_conf_t *tmcf);
+static nxt_int_t nxt_router_thread_create(nxt_task_t *task, nxt_runtime_t *rt,
+    nxt_event_engine_t *engine);
+static void nxt_router_apps_sort(nxt_task_t *task, nxt_router_t *router,
+    nxt_router_temp_conf_t *tmcf);
+
+static void nxt_router_engines_post(nxt_router_t *router,
+    nxt_router_temp_conf_t *tmcf);
+static void nxt_router_engine_post(nxt_event_engine_t *engine,
+    nxt_work_t *jobs);
+
+static void nxt_router_thread_start(void *data);
+static void nxt_router_rt_add_port(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_listen_socket_create(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_listen_socket_update(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_listen_socket_release_stale(nxt_task_t *task,
+    nxt_event_engine_t *engine, nxt_listen_socket_t *ls,
+    nxt_socket_conf_joint_t *keep);
+static void nxt_router_listen_socket_delete(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_worker_thread_quit(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_worker_thread_exit(nxt_task_t *task);
+static void nxt_router_listen_socket_close(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_thread_exit_handler(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_req_headers_ack_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, nxt_request_rpc_data_t *req_rpc_data);
+static void nxt_router_listen_socket_release(nxt_task_t *task,
+    nxt_socket_conf_t *skcf);
+
+static nxt_router_start_timer_t *nxt_router_start_timer_create(nxt_task_t *task,
+    nxt_app_t *app, nxt_port_t *port, nxt_port_t *dport, nxt_buf_t *b);
+static void nxt_router_start_timer_arm(nxt_task_t *task,
+    nxt_router_start_timer_t *st, uint32_t stream);
+static void nxt_router_start_timer_cancel(nxt_task_t *task,
+    nxt_router_start_timer_t *st);
+static void nxt_router_start_timer_use(nxt_task_t *task,
+    nxt_router_start_timer_t *st, int32_t delta);
+static void nxt_router_start_timeout(nxt_task_t *task, void *obj, void *data);
+static void nxt_router_start_timer_release(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_start_buf_completion(nxt_task_t *task,
+    nxt_router_start_timer_t *st, nxt_bool_t dropped);
+static void nxt_router_start_conf_buf_completion(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_start_app_buf_completion(nxt_task_t *task, void *obj,
+    void *data);
+
+static void nxt_router_app_port_ready(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data);
+static void nxt_router_app_port_error(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data);
+static void nxt_router_app_start_failed(nxt_task_t *task, nxt_app_t *app,
+    uint32_t count, nxt_bool_t unaccounted);
+static void nxt_router_app_start_expired(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_recv_msg_t *msg, nxt_app_joint_t *app_joint, uint32_t generation,
+    nxt_bool_t proto);
+static void nxt_router_app_unaccounted_release(nxt_task_t *task,
+    nxt_app_t *app);
+
+static void nxt_router_app_use(nxt_task_t *task, nxt_app_t *app, int i);
+static void nxt_router_app_unlink(nxt_task_t *task, nxt_app_t *app);
+
+static void nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_t *port, nxt_apr_action_t action);
+static void nxt_router_app_abandoned_settle(nxt_task_t *task,
+    nxt_request_rpc_data_t *req_rpc_data);
+static void nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
+    nxt_request_rpc_data_t *req_rpc_data);
+static void nxt_router_http_request_error(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_http_request_done(nxt_task_t *task, void *obj,
+    void *data);
+
+static void nxt_router_app_prepare_request(nxt_task_t *task,
+    nxt_request_rpc_data_t *req_rpc_data);
+static nxt_buf_t *nxt_router_prepare_msg(nxt_task_t *task,
+    nxt_http_request_t *r, nxt_app_t *app, const nxt_str_t *prefix,
+    nxt_http_status_t *status);
+
+static void nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data);
+static void nxt_router_adjust_idle_timer(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_app_idle_timeout(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_app_joint_release_handler(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_free_app(nxt_task_t *task, void *obj, void *data);
+
+static const nxt_http_request_state_t  nxt_http_request_send_state;
+static void nxt_http_request_send_body(nxt_task_t *task, void *obj, void *data);
+
+static void nxt_router_app_joint_use(nxt_task_t *task,
+    nxt_app_joint_t *app_joint, int i);
+
+static void nxt_router_http_request_release_post(nxt_task_t *task,
+    nxt_http_request_t *r);
+static void nxt_router_http_request_release(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_oosm_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
+static void nxt_router_detached_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid,
+    uint8_t state);
+static nxt_bool_t nxt_router_app_port_idle(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_t *port);
+static nxt_bool_t nxt_router_app_port_busy(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_t *port, const char *reason);
+static void nxt_router_get_port_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_router_get_mmap_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+
+extern const nxt_http_request_state_t  nxt_http_websocket;
+
+nxt_router_t  *nxt_router;
+
+static const nxt_str_t http_prefix = nxt_string("HTTP_");
+static const nxt_str_t empty_prefix = nxt_string("");
+
+static const nxt_str_t  *nxt_app_msg_prefix[] = {
+    [NXT_APP_EXTERNAL]  = &empty_prefix,
+    [NXT_APP_PYTHON]    = &empty_prefix,
+    [NXT_APP_PHP]       = &http_prefix,
+    [NXT_APP_PERL]      = &http_prefix,
+    [NXT_APP_RUBY]      = &http_prefix,
+    [NXT_APP_JAVA]      = &empty_prefix,
+    [NXT_APP_WASM]      = &empty_prefix,
+    [NXT_APP_WASM_WC]   = &empty_prefix,
+};
+
+
+/*
+ * Each application process has the write end of the main port of the
+ * router, and the sender sets the message type.  Thus the router accepts
+ * a message on this port only from its normal sender.  This table lists
+ * the gated types.  nxt_router_process_port_handlers points each of them
+ * to nxt_router_gate_handler().  That handler checks the sender of the
+ * row, then runs the check of the row if there is one, and then runs the
+ * handler of the row.  To gate one more type, add its row here and point
+ * its slot to nxt_router_gate_handler().
+ *
+ * The main port of the router has no shared memory queue.  Thus each
+ * message comes through the socket, and the kernel gives the pid of the
+ * sender (SCM_CREDENTIALS).  Without SCM_CREDENTIALS, the pid comes from
+ * the message header, which the sender sets.
+ *
+ * The sender checks read rt->port_by_type[].  NEW_PORT sets that slot, so
+ * NEW_PORT is gated too: only main can announce a port that is not an
+ * application port.
+ *
+ * The ports of the router engines are not gated.  Their messages can come
+ * through the shared memory queue, which carries no pid.
+ */
+
+typedef enum {
+    NXT_ROUTER_SENDER_NONE = 0,
+    NXT_ROUTER_SENDER_MAIN,
+    NXT_ROUTER_SENDER_CONTROLLER,
+    NXT_ROUTER_SENDER_MAIN_OR_PROTO,
+    /* Main, the controller or a registered prototype. */
+    NXT_ROUTER_SENDER_NOT_APP,
+    /* A registered application process that names itself in the header. */
+    NXT_ROUTER_SENDER_SELF,
+    /* Any sender.  The check of the row decides. */
+    NXT_ROUTER_SENDER_ANY,
+} nxt_router_sender_t;
+
+
+/* Returns NULL to accept the message, or the reason to refuse it. */
+
+typedef const char *(*nxt_router_gate_check_t)(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+
+
+typedef struct {
+    nxt_router_sender_t      sender;
+    nxt_router_gate_check_t  check;
+    nxt_port_handler_t       handler;
+} nxt_router_gate_t;
+
+
+static const nxt_router_gate_t  nxt_router_gates[NXT_PORT_MSG_MAX] = {
+    [_NXT_PORT_MSG_QUIT] =
+        { NXT_ROUTER_SENDER_MAIN, NULL, nxt_signal_quit_handler },
+    [_NXT_PORT_MSG_CHANGE_FILE] =
+        { NXT_ROUTER_SENDER_MAIN, NULL, nxt_port_change_log_file_handler },
+    [_NXT_PORT_MSG_ACCESS_LOG] =
+        { NXT_ROUTER_SENDER_MAIN, NULL, nxt_router_access_log_reopen_handler },
+    [_NXT_PORT_MSG_REMOVE_PID] =
+        { NXT_ROUTER_SENDER_MAIN_OR_PROTO, NULL,
+          nxt_router_remove_pid_handler },
+    [_NXT_PORT_MSG_DATA] =
+        { NXT_ROUTER_SENDER_CONTROLLER, NULL, nxt_router_conf_data_handler },
+    [_NXT_PORT_MSG_APP_RESTART] =
+        { NXT_ROUTER_SENDER_CONTROLLER, NULL,
+          nxt_router_app_restart_handler },
+    [_NXT_PORT_MSG_STATUS] =
+        { NXT_ROUTER_SENDER_CONTROLLER, NULL, nxt_router_status_handler },
+    [_NXT_PORT_MSG_NEW_PORT] =
+        { NXT_ROUTER_SENDER_ANY, nxt_router_new_port_check,
+          nxt_router_new_port_handler },
+    [_NXT_PORT_MSG_GET_PORT] =
+        { NXT_ROUTER_SENDER_SELF, nxt_router_get_port_check,
+          nxt_router_get_port_handler },
+    [_NXT_PORT_MSG_GET_MMAP] =
+        { NXT_ROUTER_SENDER_SELF, nxt_router_get_mmap_check,
+          nxt_router_get_mmap_handler },
+    [_NXT_PORT_MSG_MMAP] =
+        { NXT_ROUTER_SENDER_SELF, NULL, nxt_port_mmap_handler },
+    [_NXT_PORT_MSG_OOSM] =
+        { NXT_ROUTER_SENDER_SELF, NULL, nxt_router_oosm_handler },
+    /*
+     * An application sends its RPC replies to its own ports, never here.
+     * nxt_port_rpc_handler() does not compare the sender with the peer of
+     * the registration, so any process that passes can answer any stream.
+     */
+    [_NXT_PORT_MSG_RPC_READY] =
+        { NXT_ROUTER_SENDER_NOT_APP, NULL, nxt_port_rpc_handler },
+    [_NXT_PORT_MSG_RPC_ERROR] =
+        { NXT_ROUTER_SENDER_NOT_APP, NULL, nxt_port_rpc_handler },
+};
+
+
+static const nxt_port_handlers_t  nxt_router_process_port_handlers = {
+    .quit         = nxt_router_gate_handler,
+    .new_port     = nxt_router_gate_handler,
+    .get_port     = nxt_router_gate_handler,
+    .change_file  = nxt_router_gate_handler,
+    .mmap         = nxt_router_gate_handler,
+    .get_mmap     = nxt_router_gate_handler,
+    .data         = nxt_router_gate_handler,
+    .app_restart  = nxt_router_gate_handler,
+    .status       = nxt_router_gate_handler,
+    .remove_pid   = nxt_router_gate_handler,
+    .access_log   = nxt_router_gate_handler,
+    .rpc_ready    = nxt_router_gate_handler,
+    .rpc_error    = nxt_router_gate_handler,
+    .oosm         = nxt_router_gate_handler,
+    .detached     = nxt_router_detached_handler,
+};
+
+
+const nxt_process_init_t  nxt_router_process = {
+    .name           = "router",
+    .type           = NXT_PROCESS_ROUTER,
+    .prefork        = nxt_router_prefork,
+    .restart        = 1,
+    .setup          = nxt_process_core_setup,
+    .start          = nxt_router_start,
+    .port_handlers  = &nxt_router_process_port_handlers,
+    .signals        = nxt_process_signals,
+};
+
+
+/* Queues of nxt_socket_conf_t */
+nxt_queue_t  creating_sockets;
+nxt_queue_t  pending_sockets;
+nxt_queue_t  updating_sockets;
+nxt_queue_t  keeping_sockets;
+nxt_queue_t  deleting_sockets;
+
+
+static nxt_int_t
+nxt_router_prefork(nxt_task_t *task, nxt_process_t *process, nxt_mp_t *mp)
+{
+    nxt_runtime_stop_app_processes(task, task->thread->runtime);
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_router_start(nxt_task_t *task, nxt_process_data_t *data)
+{
+    nxt_int_t      ret;
+    nxt_port_t     *controller_port;
+    nxt_router_t   *router;
+    nxt_runtime_t  *rt;
+
+    rt = task->thread->runtime;
+
+    nxt_log(task, NXT_LOG_INFO, "router started");
+
+#if (NXT_TLS)
+    rt->tls = nxt_service_get(rt->services, "SSL/TLS", "OpenSSL");
+    if (nxt_slow_path(rt->tls == NULL)) {
+        return NXT_ERROR;
+    }
+
+    ret = rt->tls->library_init(task);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return ret;
+    }
+#endif
+
+    ret = nxt_http_init(task);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return ret;
+    }
+
+    router = nxt_zalloc(sizeof(nxt_router_t));
+    if (nxt_slow_path(router == NULL)) {
+        return NXT_ERROR;
+    }
+
+    nxt_queue_init(&router->engines);
+    nxt_queue_init(&router->sockets);
+    nxt_queue_init(&router->apps);
+
+    nxt_router = router;
+
+    controller_port = rt->port_by_type[NXT_PROCESS_CONTROLLER];
+    if (controller_port != NULL) {
+        nxt_router_greet_controller(task, controller_port);
+    }
+
+    return NXT_OK;
+}
+
+
+static void
+nxt_router_greet_controller(nxt_task_t *task, nxt_port_t *controller_port)
+{
+    nxt_port_socket_write(task, controller_port, NXT_PORT_MSG_PROCESS_READY,
+                          -1, 0, 0, NULL);
+}
+
+
+void
+nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
+    void *data)
+{
+    size_t                    size;
+    uint32_t                  stream;
+    nxt_fd_t                  port_fd, queue_fd;
+    nxt_err_t                 err;
+    nxt_int_t                 ret;
+    nxt_app_t                 *app;
+    nxt_buf_t                 *b;
+    nxt_bool_t                proto_gone;
+    nxt_port_t                *dport;
+    nxt_runtime_t             *rt;
+    nxt_app_joint_rpc_t       *app_joint_rpc;
+    nxt_router_start_timer_t  *st;
+
+    app = data;
+
+    st = NULL;
+    proto_gone = 0;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    dport = app->proto_port;
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    if (dport != NULL) {
+        nxt_debug(task, "app '%V' %p start process", &app->name, app);
+
+        b = NULL;
+        port_fd = -1;
+        queue_fd = -1;
+
+    } else {
+        if (app->proto_port_requests > 0) {
+            nxt_debug(task, "app '%V' %p wait for prototype process",
+                      &app->name, app);
+
+            app->proto_port_requests++;
+
+            goto skip;
+        }
+
+        nxt_debug(task, "app '%V' %p start prototype process", &app->name, app);
+
+        rt = task->thread->runtime;
+        dport = rt->port_by_type[NXT_PROCESS_MAIN];
+
+        size = app->name.length + 1 + app->conf.length;
+
+        b = nxt_buf_mem_alloc(task->thread->engine->mem_pool, size, 0);
+        if (nxt_slow_path(b == NULL)) {
+            goto failed;
+        }
+
+        nxt_buf_cpystr(b, &app->name);
+        *b->mem.free++ = '\0';
+        nxt_buf_cpystr(b, &app->conf);
+
+        port_fd = app->shared_port->pair[0];
+        queue_fd = app->shared_port->queue_fd;
+    }
+
+    app_joint_rpc = nxt_port_rpc_register_handler_ex(task, port,
+                                                     nxt_router_app_port_ready,
+                                                     nxt_router_app_port_error,
+                                                   sizeof(nxt_app_joint_rpc_t));
+    if (nxt_slow_path(app_joint_rpc == NULL)) {
+        goto failed;
+    }
+
+    stream = nxt_port_rpc_ex_stream(app_joint_rpc);
+
+    /*
+     * Before the write: the deadline resolves through the payload's completion
+     * handler, which nxt_port_socket_write2() may run before it returns.
+     */
+
+    st = nxt_router_start_timer_create(task, app, port, dport, b);
+
+    if (st != NULL && b != NULL) {
+        b->completion_handler = nxt_router_start_app_buf_completion;
+    }
+
+    ret = nxt_port_socket_write2(task, dport, NXT_PORT_MSG_START_PROCESS,
+                                 port_fd, queue_fd, stream, port->id, b);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_rpc_cancel(task, port, stream);
+
+        /*
+         * A worker start goes to the prototype.  The prototype can exit
+         * without a request from the router.  On shutdown main sends QUIT
+         * to every process directly.  The prototype reports the exit of its
+         * workers to the router (REMOVE_PID) and then exits.  The router
+         * can handle such a REMOVE_PID before its own QUIT.  It then starts
+         * a replacement worker in nxt_router_app_port_close(), and the
+         * socket of the prototype is already closed.  A prototype that
+         * crashes gives the same result.  The router cannot know this in
+         * advance: it clears ->proto_port only when the REMOVE_PID of the
+         * prototype arrives, or when it sends the QUIT itself.
+         *
+         * Nothing was sent, so nothing was forked.  The slot goes back
+         * below in the usual way.  Only the log level is different.  A
+         * prototype start goes to main.  Main is never expected to be gone,
+         * so that start keeps the alert.
+         */
+
+        err = dport->socket.error;
+
+        proto_gone = (b == NULL
+                      && (err == NXT_EPIPE || err == NXT_ECONNRESET
+                          || err == NXT_ECONNREFUSED));
+
+        goto failed;
+    }
+
+    app_joint_rpc->app_joint = app->joint;
+    app_joint_rpc->generation = app->generation;
+    app_joint_rpc->proto = (b != NULL);
+    app_joint_rpc->start_timer = st;
+
+    if (st != NULL) {
+        nxt_router_start_timer_arm(task, st, stream);
+    }
+
+    /*
+     * Key the registration by the process the START_PROCESS was sent to, so
+     * that its death retires the RPC.  Without a peer the registration is
+     * only ever retired by a reply on its own stream: when the prototype
+     * dies between forking the worker and that worker's PROCESS_READY, the
+     * REMOVE_PID the router gets for the prototype carries no stream (it
+     * had already reached READY itself, see nxt_main_process.c) and
+     * nxt_port_rpc_remove_peer() finds nothing to fail, so the attempt's
+     * pending_processes slot is never given back.
+     *
+     * For a prototype start the peer is the main process, which is
+     * harmless: its death is fatal anyway, and a prototype dying before
+     * READY is already reported by the stream-bearing REMOVE_PID.
+     *
+     * The setter cannot report a failed insert: it logs and leaves ->peer
+     * at -1 (src/nxt_port_rpc.c:301), so a pool allocation failure here
+     * restores the peerless registration -- as at every other call site.
+     */
+    nxt_port_rpc_ex_set_peer(task, port, app_joint_rpc, dport->pid);
+
+    if (b != NULL) {
+        app->proto_port_requests++;
+
+        b = NULL;
+    }
+
+    nxt_router_app_joint_use(task, app->joint, 1);
+
+    goto skip;
+
+failed:
+
+    /*
+     * The attempt is over and no handler remains armed for it -- the two
+     * earlier sites never armed one, and the third cancels its registration
+     * with nxt_port_rpc_cancel() -- so nothing will ever report it back.
+     * Release the pending_processes slot the initiator took, exactly as
+     * nxt_router_app_port_error() does for the attempts that do get that far.
+     */
+
+    if (proto_gone) {
+        nxt_debug(task, "app '%V' start attempt cancelled: prototype %PI "
+                  "is gone", &app->name, dport->pid);
+
+    } else {
+        nxt_alert(task, "app '%V' failed to start a process", &app->name);
+    }
+
+    if (st != NULL) {
+        /*
+         * Never armed, and the buffer below is freed without its completion
+         * handler ever running, so both references are dropped here.
+         */
+
+        if (b != NULL) {
+            nxt_router_start_timer_use(task, st, -1);
+        }
+
+        nxt_router_start_timer_use(task, st, -1);
+    }
+
+    if (b != NULL) {
+        nxt_mp_free(b->data, b);
+    }
+
+    nxt_router_app_start_failed(task, app, 1, 0);
+
+skip:
+
+    nxt_router_app_use(task, app, -1);
+}
+
+
+/*
+ * Create the deadline for a START_PROCESS RPC, before the write.
+ *
+ * Before, because the payload buffer has to carry a completion handler that
+ * knows about this struct: the deadline resolves through that completion, and
+ * nxt_port_socket_write2() can run it before it returns.
+ *
+ * The timer runs on the engine of the port the RPC is registered on -- always
+ * the router's own port, for both the config-apply prefork path
+ * (nxt_router_app_rpc_create()) and the on-demand path
+ * (nxt_router_start_app_process_handler(), reached by nxt_port_post() to that
+ * same port) -- so the expiry handler, the reply handlers it races and the
+ * buffer completion cannot run concurrently.
+ *
+ * A NULL return means no deadline, which is the configured behaviour for
+ * "start_timeout": 0 and the fallback if the allocation fails; the start is
+ * then exactly as unbounded as it was before this existed, which is worse than
+ * the alternative but not worse than failing a start over a small malloc.
+ */
+
+static nxt_router_start_timer_t *
+nxt_router_start_timer_create(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_t *port, nxt_port_t *dport, nxt_buf_t *b)
+{
+    nxt_msec_t                timeout;
+    nxt_router_start_timer_t  *st;
+
+    /* Immutable once the application is configured, so read unlocked. */
+    timeout = app->start_timeout;
+
+    if (timeout == 0) {
+        return NULL;
+    }
+
+    st = nxt_malloc(sizeof(nxt_router_start_timer_t) + app->name.length);
+    if (nxt_slow_path(st == NULL)) {
+        nxt_alert(task, "app \"%V\" start deadline not armed: out of memory",
+                  &app->name);
+
+        return NULL;
+    }
+
+    nxt_memzero(st, sizeof(nxt_router_start_timer_t));
+
+    st->app_name.start = nxt_pointer_to(st, sizeof(nxt_router_start_timer_t));
+    st->app_name.length = app->name.length;
+    nxt_memcpy(st->app_name.start, app->name.start, app->name.length);
+
+    st->timeout = timeout;
+    st->port = port;
+    st->dport = dport;
+    st->reply_port = port->id;
+    st->buf = b;
+
+    nxt_port_inc_use(port);
+    nxt_port_inc_use(dport);
+
+    /* The reference of the caller, which hands it to the RPC. */
+    st->refs = 1;
+
+    if (b == NULL) {
+        /*
+         * Nothing to wait for: a message with no payload and no descriptors
+         * (the worker-start leg, where the prototype is already up) leaves
+         * nothing of ours reachable from the send queue, so expiry can fail
+         * the RPC directly.
+         */
+        st->send_done = 1;
+
+    } else {
+        /* The reference of the pending buffer completion. */
+        st->refs++;
+
+        b->parent = st;
+    }
+
+    return st;
+}
+
+
+/*
+ * Arm it.  Separate from creation because the stream is only known once the
+ * RPC is registered, and because a write that fails must be able to drop the
+ * struct without ever having put a node in the engine's timer tree.
+ */
+
+static void
+nxt_router_start_timer_arm(nxt_task_t *task, nxt_router_start_timer_t *st,
+    uint32_t stream)
+{
+    nxt_event_engine_t  *engine;
+
+    st->stream = stream;
+
+    engine = task->thread->engine;
+
+    st->timer.bias = NXT_TIMER_DEFAULT_BIAS;
+    st->timer.work_queue = &engine->fast_work_queue;
+    st->timer.handler = nxt_router_start_timeout;
+    st->timer.task = &engine->task;
+    st->timer.log = st->timer.task->log;
+
+    /* The reference of the engine, while the timer node is live. */
+    st->refs++;
+    st->armed = 1;
+
+    nxt_timer_add(engine, &st->timer, st->timeout);
+
+    nxt_debug(task, "app \"%V\" stream #%uD start deadline %M ms",
+              &st->app_name, stream, st->timeout);
+}
+
+
+static void
+nxt_router_start_timer_use(nxt_task_t *task, nxt_router_start_timer_t *st,
+    int32_t delta)
+{
+    st->refs += delta;
+
+    nxt_assert(st->refs >= 0);
+
+    if (st->refs > 0) {
+        return;
+    }
+
+    nxt_port_use(task, st->port, -1);
+    nxt_port_use(task, st->dport, -1);
+
+    nxt_free(st);
+}
+
+
+/*
+ * The start answered, or its write failed: drop the RPC's reference and, with
+ * it, the deadline.
+ *
+ * nxt_timer_disable() is not enough -- it clears the enabled bit but leaves
+ * the node in the engine's rbtree, which would dangle the moment this struct
+ * is freed.  nxt_timer_delete() removes it, but its removal can itself be a
+ * queued change referencing the timer, so a non-zero return means the struct
+ * is still reachable from the engine: the engine's reference is then handed to
+ * a release handler instead of being dropped here.  Re-arming at zero is the
+ * same trick nxt_router_free_app() uses for app_joint->idle_timer.
+ *
+ * When the expiry handler is the caller's own caller, ->armed is already
+ * clear: the node has fired, so it owns the engine's reference and drops it
+ * itself.
+ */
+
+static void
+nxt_router_start_timer_cancel(nxt_task_t *task, nxt_router_start_timer_t *st)
+{
+    nxt_event_engine_t  *engine;
+
+    st->retired = 1;
+
+    if (st->armed) {
+        engine = task->thread->engine;
+
+        st->armed = 0;
+
+        if (nxt_timer_delete(engine, &st->timer)) {
+            st->timer.handler = nxt_router_start_timer_release;
+            nxt_timer_add(engine, &st->timer, 0);
+
+        } else {
+            nxt_router_start_timer_use(task, st, -1);
+        }
+    }
+
+    nxt_router_start_timer_use(task, st, -1);
+}
+
+
+static void
+nxt_router_start_timer_release(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_timer_t  *timer;
+
+    timer = obj;
+
+    nxt_router_start_timer_use(task,
+                    nxt_timer_data(timer, nxt_router_start_timer_t, timer), -1);
+}
+
+
+/*
+ * The deadline fired.  What it may do depends on where the START_PROCESS it is
+ * giving up on has got to; see the comment on nxt_router_start_timer_s.
+ */
+
+static void
+nxt_router_start_timeout(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_timer_t               *timer;
+    nxt_port_msg_cancel_t     cancelled;
+    nxt_router_start_timer_t  *st;
+
+    timer = obj;
+    st = nxt_timer_data(timer, nxt_router_start_timer_t, timer);
+
+    /*
+     * "unless a reply lands first" is not hedging.  The failure is driven
+     * from the payload's completion, which for a partly sent message waits
+     * for the rest of it to leave (see below), and a PROCESS_READY that
+     * arrives in that window retires the stream before the deadline can.
+     */
+
+    nxt_alert(task, "app \"%V\" process did not become ready in time; the "
+                    "deadline expired, and the start request (stream #%uD) "
+                    "will be failed unless a reply lands first.  The process, "
+                    "if it is still running, never called nxt_unit_init() -- "
+                    "raise \"limits\": {\"start_timeout\"} if the application "
+                    "simply needs longer to start",
+              &st->app_name, st->stream);
+
+    /*
+     * The node has fired, so it is out of the engine's tree: clearing ->armed
+     * both records that and keeps the error handler reached below from trying
+     * to delete it again through nxt_router_start_timer_cancel().  The
+     * engine's reference is this frame's now, and is dropped at the end.
+     */
+
+    st->armed = 0;
+    st->expired = 1;
+
+    /*
+     * Take the message back if there is still anything to take back.  Both
+     * shapes of START_PROCESS go through this, for different reasons.
+     *
+     * The one that carries a payload (a prototype start) must be recalled
+     * before its RPC can be failed at all: failing it releases the pool the
+     * payload lives in and the descriptors it borrows.
+     *
+     * The header-only one (a worker start, sent to a prototype that is already
+     * up) carries no router memory and no descriptors, so nothing about it is
+     * a lifetime hazard.  Recalling it is still worth doing: delivered after
+     * the stream is retired, it starts a worker whose PROCESS_READY answers
+     * nobody -- nxt_port_rpc_handler() drops an unknown stream -- leaving a
+     * process and a port the router is not tracking.  That is the same orphan
+     * the deadline already leaves when a worker is merely slow, since the
+     * router never learns its pid and so cannot kill it either, and reaping in
+     * the prototype is what will collect both; but there is no reason to
+     * create one while the message has not left yet.
+     *
+     * A destination whose port has a shared-memory queue is the case this
+     * cannot reach: nxt_port_socket_write2() puts the message straight into
+     * the ring, where it is already delivered, and only a READ_QUEUE
+     * notification can be left in port->messages.  Matching on the message
+     * type is what keeps this from recalling that notification and stranding a
+     * message that is genuinely on its way.
+     */
+
+    cancelled = nxt_port_socket_cancel(task, st->dport,
+                                       NXT_PORT_MSG_START_PROCESS,
+                                       st->stream, st->reply_port, st->buf);
+
+    /*
+     * Recalled before the destination saw it: no worker was forked for this
+     * start, so there is no process to account for and the slot goes back the
+     * ordinary way.  Accounting it would move a slot to unaccounted_processes
+     * that nothing can ever drain -- no PROCESS_READY and no REMOVE_PID are
+     * coming for a process that was never created -- which would turn the
+     * bound into a ratchet.  See nxt_router_app_port_error().
+     */
+
+    st->recalled = (cancelled == NXT_PORT_MSG_CANCELLED);
+
+    if (st->send_done) {
+        /*
+         * Nothing of ours is in the port layer's hands -- either the payload's
+         * completion has already run, or there was never a payload -- so the
+         * RPC is failed here.  There is nothing left to drive it otherwise: a
+         * header-only message has no buffers for the recall to complete.  The
+         * stream may meanwhile have been retired by a reply that landed in the
+         * same turn of the event loop; nxt_port_rpc_error() drops an unknown
+         * stream, so the race costs a debug line.
+         */
+
+        nxt_port_rpc_error(task, st->port, st->stream);
+
+    } else {
+        /*
+         * A payload still in flight: whichever of the three states it is in,
+         * the RPC is failed from nxt_router_start_buf_completion().
+         * NXT_PORT_MSG_CANCELLED has just queued that completion, and the
+         * other two mean the message is still being sent, so the completion is
+         * still to come.  Waiting is what keeps nxt_router_conf_error() from
+         * releasing a payload the send queue still points at.
+         *
+         * NXT_PORT_MSG_STARTED is the limitation of a protocol without
+         * cancellation: a destination that took one fragment and then stopped
+         * draining holds the failure off for as long as it stays stuck, and it
+         * is worth saying so, because from the outside that looks like a
+         * deadline that did not fire.  The wedge this deadline exists for -- a
+         * destination that is draining fine and a worker that never announces
+         * itself -- is unaffected, because there the message goes out whole.
+         */
+
+        if (cancelled == NXT_PORT_MSG_STARTED) {
+            nxt_alert(task, "app \"%V\" stream #%uD start request is partly "
+                            "sent; failing it has to wait for the rest of it "
+                            "to leave, and a reply that lands meanwhile wins",
+                      &st->app_name, st->stream);
+        }
+    }
+
+    /* The engine's reference: the timer node is gone. */
+
+    nxt_router_start_timer_use(task, st, -1);
+}
+
+
+/*
+ * Which way it left: the port layer advances the payload as it sends it, so
+ * bytes still unconsumed at its completion mean the destination never saw the
+ * whole message.  It was taken back by nxt_port_socket_cancel(), or dropped by
+ * nxt_port_msg_drop() because the destination died or the port layer could not
+ * requeue it -- and nothing was forked for a start that never arrived.
+ *
+ * One shape does not reach here.  An inline first fragment that hits EAGAIN
+ * and cannot be held for a later attempt is refused outright, with
+ * NXT_ERROR and the payload untouched, so the caller fails the start itself.
+ *
+ * ->recalled cannot answer this on its own: a message the deadline finds
+ * partly sent stays queued, and only its completion knows whether the rest of
+ * it ever left.  See nxt_router_app_port_error().
+ */
+
+nxt_inline nxt_bool_t
+nxt_router_start_buf_dropped(nxt_buf_t *b)
+{
+    return nxt_buf_mem_used_size(&b->mem) != 0;
+}
+
+
+/*
+ * The payload has left the port layer, one way or another: written in full,
+ * dropped by nxt_port_socket_cancel(), or released by nxt_port_error_handler()
+ * when the destination died.  This is the only point at which nothing in
+ * dport->messages can reach the buffer or the borrowed descriptors any more,
+ * so it is where an expired start is failed.
+ */
+
+static void
+nxt_router_start_buf_completion(nxt_task_t *task, nxt_router_start_timer_t *st,
+    nxt_bool_t dropped)
+{
+    nxt_bool_t  fail;
+
+    st->send_done = 1;
+    st->buf = NULL;
+    st->dropped = dropped;
+
+    fail = (st->expired && !st->retired);
+
+    if (fail) {
+        /*
+         * Nothing may touch b after this: failing the RPC reaches
+         * nxt_router_conf_error(), which releases the pool the buffer was
+         * allocated from.
+         */
+
+        nxt_port_rpc_error(task, st->port, st->stream);
+    }
+
+    nxt_router_start_timer_use(task, st, -1);
+}
+
+
+/*
+ * The config-apply payload is allocated from tmcf->mem_pool and freed with it,
+ * so this replaces nxt_buf_dummy_completion() and frees nothing.
+ */
+
+static void
+nxt_router_start_conf_buf_completion(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_router_start_buf_completion(task, data,
+                                    nxt_router_start_buf_dropped(obj));
+}
+
+
+/*
+ * The on-demand payload is allocated from the engine's pool and owns itself,
+ * so this replaces nxt_buf_completion(): it returns the buffer to that pool
+ * first, because failing the RPC below may not return at all cheaply.  The
+ * buffer never has a parent, so none of nxt_buf_parent_completion()'s work
+ * applies -- which is also why the context travels in b->parent and this
+ * handler is not nxt_buf_completion().
+ */
+
+static void
+nxt_router_start_app_buf_completion(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_buf_t                 *b;
+    nxt_bool_t                dropped;
+    nxt_router_start_timer_t  *st;
+
+    b = obj;
+    st = data;
+
+    nxt_assert(b->next == NULL);
+    nxt_assert(b->parent == st);
+
+    /* Read before the free: the answer is in the buffer's own pointers. */
+
+    dropped = nxt_router_start_buf_dropped(b);
+
+    nxt_mp_free(b->data, b);
+
+    nxt_router_start_buf_completion(task, st, dropped);
+}
+
+
+
+static void
+nxt_router_app_joint_use(nxt_task_t *task, nxt_app_joint_t *app_joint, int i)
+{
+    app_joint->use_count += i;
+
+    if (app_joint->use_count == 0) {
+        nxt_assert(app_joint->app == NULL);
+
+        nxt_free(app_joint);
+    }
+}
+
+
+static nxt_int_t
+nxt_router_start_app_process(nxt_task_t *task, nxt_app_t *app)
+{
+    nxt_int_t      res;
+    nxt_port_t     *router_port;
+    nxt_runtime_t  *rt;
+
+    nxt_debug(task, "app '%V' start process", &app->name);
+
+    rt = task->thread->runtime;
+    router_port = rt->port_by_type[NXT_PROCESS_ROUTER];
+
+    nxt_router_app_use(task, app, 1);
+
+    res = nxt_port_post(task, router_port, nxt_router_start_app_process_handler,
+                        app);
+
+    if (res == NXT_OK) {
+        return res;
+    }
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    app->pending_processes--;
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    nxt_router_app_use(task, app, -1);
+
+    return NXT_ERROR;
+}
+
+
+/*
+ * Take the queued request message back from the shared port queue.
+ * nxt_app_queue_cancel() (src/nxt_app_queue.h) is a CAS on the queue item's
+ * tracking word; nxt_unit_app_queue_recv() runs the same CAS from the worker
+ * side, so exactly one of the two wins and a false answer here means a worker
+ * claimed the slot first.
+ *
+ * The CAS runs at most once per request, and the answer is kept in
+ * ->msg_info.cancel for the callers that need it afterwards: both outcomes
+ * leave the tracking word at 0, so a second CAS would report a claim that
+ * never happened and clear ->is_port_mmap_sent on a chunk the worker owns.
+ */
+
+nxt_inline nxt_bool_t
+nxt_router_msg_retract(nxt_task_t *task, nxt_request_rpc_data_t *req_rpc_data)
+{
+    nxt_port_t      *app_port;
+    nxt_msg_info_t  *msg_info;
+
+    msg_info = &req_rpc_data->msg_info;
+
+    if (msg_info->buf == NULL) {
+        return 0;
+    }
+
+    if (msg_info->cancel == NXT_MSG_QUEUED) {
+        app_port = req_rpc_data->app_port;
+
+        if (app_port == NULL || app_port->id != NXT_SHARED_PORT_ID) {
+            /* Acknowledged: the message is the worker's, not the queue's. */
+            return 0;
+        }
+
+        if (nxt_app_queue_cancel(app_port->queue, msg_info->tracking_cookie,
+                                 req_rpc_data->stream))
+        {
+            msg_info->cancel = NXT_MSG_RETRACTED;
+
+            nxt_debug(task, "stream #%uD: cancelled by router",
+                      req_rpc_data->stream);
+
+        } else {
+            msg_info->cancel = NXT_MSG_CLAIMED;
+
+            nxt_debug(task, "stream #%uD: claimed by a worker",
+                      req_rpc_data->stream);
+        }
+    }
+
+    return msg_info->cancel == NXT_MSG_RETRACTED;
+}
+
+
+nxt_inline nxt_bool_t
+nxt_router_msg_cancel(nxt_task_t *task, nxt_request_rpc_data_t *req_rpc_data)
+{
+    nxt_buf_t       *b, *next;
+    nxt_bool_t      cancelled;
+    nxt_msg_info_t  *msg_info;
+
+    msg_info = &req_rpc_data->msg_info;
+
+    if (msg_info->buf == NULL) {
+        return 0;
+    }
+
+    cancelled = nxt_router_msg_retract(task, req_rpc_data);
+
+    for (b = msg_info->buf; b != NULL; b = next) {
+        next = b->next;
+        b->next = NULL;
+
+        if (b->is_port_mmap_sent) {
+            b->is_port_mmap_sent = cancelled == 0;
+        }
+
+        b->completion_handler(task, b, b->parent);
+    }
+
+    msg_info->buf = NULL;
+
+    return cancelled;
+}
+
+
+nxt_inline nxt_bool_t
+nxt_queue_chk_remove(nxt_queue_link_t *lnk)
+{
+    if (lnk->next != NULL) {
+        nxt_queue_remove(lnk);
+
+        lnk->next = NULL;
+
+        return 1;
+    }
+
+    return 0;
+}
+
+
+nxt_inline void
+nxt_request_rpc_data_unlink(nxt_task_t *task,
+    nxt_request_rpc_data_t *req_rpc_data)
+{
+    nxt_app_t           *app;
+    nxt_bool_t          unlinked;
+    nxt_http_request_t  *r;
+
+    nxt_router_msg_cancel(task, req_rpc_data);
+
+    app = req_rpc_data->app;
+
+    if (req_rpc_data->app_port != NULL) {
+        nxt_router_app_port_release(task, app, req_rpc_data->app_port,
+                                    req_rpc_data->apr_action);
+
+        req_rpc_data->app_port = NULL;
+    }
+
+    r = req_rpc_data->request;
+
+    if (r != NULL) {
+        r->timer_data = NULL;
+
+        nxt_router_http_request_release_post(task, r);
+
+        r->req_rpc_data = NULL;
+        req_rpc_data->request = NULL;
+
+        if (app != NULL) {
+            unlinked = 0;
+
+            nxt_thread_mutex_lock(&app->mutex);
+
+            if (r->app_link.next != NULL) {
+                nxt_queue_remove(&r->app_link);
+                r->app_link.next = NULL;
+
+                unlinked = 1;
+            }
+
+            nxt_thread_mutex_unlock(&app->mutex);
+
+            if (unlinked) {
+                nxt_mp_release(r->mem_pool);
+            }
+        }
+    }
+
+    if (app != NULL) {
+        nxt_router_app_use(task, app, -1);
+
+        req_rpc_data->app = NULL;
+    }
+
+    if (req_rpc_data->msg_info.body_fd != -1) {
+        nxt_fd_close(req_rpc_data->msg_info.body_fd);
+
+        req_rpc_data->msg_info.body_fd = -1;
+    }
+
+    if (req_rpc_data->rpc_cancel) {
+        req_rpc_data->rpc_cancel = 0;
+
+        nxt_port_rpc_cancel(task, task->thread->engine->port,
+                            req_rpc_data->stream);
+    }
+}
+
+
+void
+nxt_router_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_int_t      res;
+    nxt_app_t      *app;
+    nxt_port_t     *port, *main_app_port;
+    nxt_runtime_t  *rt;
+
+    nxt_port_new_port_handler(task, msg);
+
+    port = msg->u.new_port;
+
+    if (port != NULL && port->type == NXT_PROCESS_CONTROLLER) {
+        nxt_router_greet_controller(task, msg->u.new_port);
+    }
+
+    /*
+     * The router maps a queue for application ports only, so every other
+     * branch below has to release the queue descriptor that
+     * nxt_port_new_port_handler() left behind.  None of the RPC handlers
+     * reachable from here reads msg->fd, so closing before dispatching them
+     * takes nothing away.
+     */
+
+    if (port != NULL && port->type == NXT_PROCESS_PROTOTYPE)  {
+        nxt_port_recv_msg_close_fds(msg);
+
+        nxt_port_rpc_handler(task, msg);
+
+        return;
+    }
+
+    if (port == NULL || port->type != NXT_PROCESS_APP) {
+        nxt_port_recv_msg_close_fds(msg);
+
+        if (msg->port_msg.stream == 0) {
+            return;
+        }
+
+        msg->port_msg.type = _NXT_PORT_MSG_RPC_ERROR;
+
+    } else {
+        if (msg->fd[1] != -1) {
+            res = nxt_router_port_queue_map(task, port, msg->fd[1]);
+
+            /*
+             * Closed whether or not the mapping succeeded: the mapping does
+             * not keep the descriptor, and the dispatcher reclaims nothing a
+             * handler leaves behind.  The size check above is what makes this
+             * matter -- it lets a peer choose to be refused, so the failure
+             * return below handed that peer a descriptor of ours per message,
+             * which is the exhaustion the check exists to prevent.
+             *
+             * The return itself is left alone.  It also walks past the RPC
+             * dispatch below, so a refused queue leaves the pending start
+             * outstanding, and the port stays registered although a port
+             * whose queue was refused can never be reached.  Both are worth
+             * fixing and neither is fixable here: the port this handler is
+             * holding may be one nxt_port_new_port_handler() just created or
+             * one that was already live and serving, and nothing at this call
+             * site can tell them apart -- so failing the start or releasing
+             * the port would, for a forged duplicate NEW_PORT, do it to a
+             * working application port.  That needs the two handlers to agree
+             * on provenance first; see #223.
+             */
+
+            nxt_fd_close(msg->fd[1]);
+            msg->fd[1] = -1;
+
+            if (nxt_slow_path(res != NXT_OK)) {
+                return;
+            }
+        }
+    }
+
+    if (msg->port_msg.stream != 0) {
+        nxt_port_rpc_handler(task, msg);
+        return;
+    }
+
+    nxt_debug(task, "new port id %d (%d)", port->id, port->type);
+
+    /*
+     * An application's "main" port has id 0 and is announced carrying the
+     * stream of the start it answers, which the dispatch above consumes.
+     * Arriving here means id 0 with no stream, and the arm below cannot
+     * serve that pair: it looks the announcement up as a *sibling* of an
+     * already-known main port, and for id 0 that lookup finds the port
+     * itself.  Which of the two cases this is decides the remedy, and only
+     * nxt_port_new_port_handler() knows -- hence msg->new_port_created.
+     *
+     * Already registered: a worker that sent PROCESS_READY a second time.
+     * Its start stream was retired by the first announcement
+     * (nxt_port_process_ready_handler(), src/nxt_port.c), so the repeat
+     * carries none.  The port is live and its queue, if it brought one, was
+     * mapped above -- leave it alone.  Falling through would re-add it to
+     * the application hash: nxt_port_hash_add() declines the duplicate key,
+     * but ->port_hash_count is incremented regardless, and
+     * nxt_router_app_need_start() reads that count, so the router would
+     * believe it has workers it does not have.  It would also send a second
+     * PORT_ACK for one port.
+     *
+     * Created by this message: an application main port announced with no
+     * stream at all, which no start is waiting on and nothing else will
+     * complete.  Keeping it would leave a port registered in the runtime
+     * that no application owns and no PORT_ACK was ever sent for.  Undo the
+     * registration this message caused instead.
+     *
+     * An assertion is not enough for either: nxt_assert() compiles out in a
+     * release build, which is exactly where the miscount and the orphan
+     * would do their damage.
+     */
+    if (nxt_slow_path(port->id == 0)) {
+
+        if (msg->new_port_created) {
+            nxt_alert(task, "new port of process %PI has id 0 and no start "
+                      "stream; refused", port->pid);
+
+            nxt_port_close(task, port);
+            nxt_runtime_port_remove(task, port);
+
+            return;
+        }
+
+        nxt_log(task, NXT_LOG_WARN, "process %PI announced its main port "
+                "again with no start stream; already registered, ignored",
+                port->pid);
+
+        return;
+    }
+
+    /* Find 'main' app port and get app reference. */
+    rt = task->thread->runtime;
+
+    /*
+     * It is safe to access 'runtime->ports' hash because 'NEW_PORT'
+     * sent to main port (with id == 0) and processed in main thread.
+     */
+    main_app_port = nxt_port_hash_find(&rt->ports, port->pid, 0);
+    nxt_assert(main_app_port != NULL);
+
+    app = main_app_port->app;
+
+    if (nxt_fast_path(app != NULL)) {
+        nxt_thread_mutex_lock(&app->mutex);
+
+        /* TODO here should be find-and-add code because there can be
+           port waiters in port_hash */
+        nxt_port_hash_add(&app->port_hash, port);
+        app->port_hash_count++;
+
+        nxt_thread_mutex_unlock(&app->mutex);
+
+        port->app = app;
+    }
+
+    port->main_app_port = main_app_port;
+
+    nxt_port_socket_write(task, port, NXT_PORT_MSG_PORT_ACK, -1, 0, 0, NULL);
+}
+
+
+/* The sender pid against the port of the process type; see the gate table. */
+
+static nxt_bool_t
+nxt_router_msg_from(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    nxt_process_type_t type)
+{
+    nxt_port_t  *port;
+
+    /*
+     * Read at message time, because a restarted router gets the ports
+     * again through NEW_PORT.  A NULL port refuses the message.
+     */
+
+    port = task->thread->runtime->port_by_type[type];
+
+    return (port != NULL && nxt_recv_msg_cmsg_pid(msg) == port->pid);
+}
+
+
+/*
+ * Whether the pid is a registered process of the type.  A prototype sends
+ * REMOVE_PID for a child that it forked (nxt_proto_child_exited()).  The
+ * router cannot check that the pid is a child of that prototype: a child
+ * that stopped during its start has no record in the router.  Thus any
+ * registered prototype passes.
+ */
+
+static nxt_bool_t
+nxt_router_pid_is(nxt_task_t *task, nxt_pid_t pid, nxt_process_type_t type)
+{
+    nxt_bool_t     is;
+    nxt_process_t  *process;
+
+    process = nxt_runtime_process_ref(task->thread->runtime, pid);
+    if (process == NULL) {
+        return 0;
+    }
+
+    is = (nxt_process_type(process) == type);
+
+    nxt_process_use(task, process, -1);
+
+    return is;
+}
+
+
+/*
+ * The handlers of GET_PORT, GET_MMAP, MMAP and OOSM act for the process
+ * that the header names.  Only libunit sends them, for its own process.
+ */
+
+static nxt_bool_t
+nxt_router_msg_from_self(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_pid_t  pid;
+
+    pid = nxt_recv_msg_cmsg_pid(msg);
+
+    return (pid > 0 && pid == msg->port_msg.pid
+            && nxt_router_pid_is(task, pid, NXT_PROCESS_APP));
+}
+
+
+static nxt_bool_t
+nxt_router_msg_sender_ok(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_bool_t               ok;
+    const char               *reason;
+    const nxt_router_gate_t  *gate;
+
+    /* nxt_port_handler() dispatches only a type below NXT_PORT_MSG_MAX. */
+
+    gate = &nxt_router_gates[msg->port_msg.type];
+
+    switch (gate->sender) {
+
+    case NXT_ROUTER_SENDER_MAIN:
+        ok = nxt_router_msg_from(task, msg, NXT_PROCESS_MAIN);
+        break;
+
+    case NXT_ROUTER_SENDER_CONTROLLER:
+        ok = nxt_router_msg_from(task, msg, NXT_PROCESS_CONTROLLER);
+        break;
+
+    case NXT_ROUTER_SENDER_MAIN_OR_PROTO:
+        ok = nxt_router_msg_from(task, msg, NXT_PROCESS_MAIN)
+             || nxt_router_pid_is(task, nxt_recv_msg_cmsg_pid(msg),
+                                  NXT_PROCESS_PROTOTYPE);
+        break;
+
+    case NXT_ROUTER_SENDER_NOT_APP:
+        ok = nxt_router_msg_from(task, msg, NXT_PROCESS_MAIN)
+             || nxt_router_msg_from(task, msg, NXT_PROCESS_CONTROLLER)
+             || nxt_router_pid_is(task, nxt_recv_msg_cmsg_pid(msg),
+                                  NXT_PROCESS_PROTOTYPE);
+        break;
+
+    case NXT_ROUTER_SENDER_SELF:
+        ok = nxt_router_msg_from_self(task, msg);
+        break;
+
+    case NXT_ROUTER_SENDER_ANY:
+        ok = 1;
+        break;
+
+    default:
+        /* A type without a row has no sender that passes. */
+        ok = 0;
+        break;
+    }
+
+    reason = "wrong sender";
+
+    if (nxt_fast_path(ok)) {
+        reason = (gate->check != NULL) ? gate->check(task, msg) : NULL;
+
+        if (nxt_fast_path(reason == NULL)) {
+            return 1;
+        }
+    }
+
+    nxt_router_msg_sender_refuse(task, msg, reason);
+
+    return 0;
+}
+
+
+/*
+ * No reply: the sender selects the reply port and the stream, so a reply
+ * would let a false sender make the router write to any stream.
+ */
+
+static void
+nxt_router_msg_sender_refuse(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    const char *reason)
+{
+    nxt_alert(task, "process %PI sent message type %uD claiming process %PI; "
+              "refused: %s", nxt_recv_msg_cmsg_pid(msg),
+              (uint32_t) msg->port_msg.type, msg->port_msg.pid, reason);
+
+    nxt_port_recv_msg_close_fds(msg);
+
+#if (NXT_TESTS)
+    nxt_router_test_senders_refused++;
+#endif
+}
+
+
+/*
+ * Main announces every process.  A prototype announces the main port of
+ * each worker it starts (nxt_port_process_ready_handler()), with the stream
+ * of the start.  libunit announces the port of each context it adds, for
+ * its own process and with no stream (nxt_unit_send_port()).  Thus only
+ * main can announce a port that is not an application port.
+ */
+
+static const char *
+nxt_router_new_port_check(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_port_msg_new_port_t  new_port;
+
+    if (nxt_slow_path(nxt_port_new_port_msg(msg, &new_port) != NXT_OK)) {
+        return "short new port message";
+    }
+
+    if (nxt_router_msg_from(task, msg, NXT_PROCESS_MAIN)) {
+        return NULL;
+    }
+
+    if (nxt_slow_path(new_port.type != NXT_PROCESS_APP)) {
+        return "not an application port";
+    }
+
+    if (nxt_router_pid_is(task, nxt_recv_msg_cmsg_pid(msg),
+                          NXT_PROCESS_PROTOTYPE))
+    {
+        return NULL;
+    }
+
+    if (nxt_slow_path(!nxt_router_msg_from_self(task, msg)
+                      || new_port.pid != msg->port_msg.pid
+                      || msg->port_msg.stream != 0))
+    {
+        return "not a new port of the sender";
+    }
+
+    return NULL;
+}
+
+
+/*
+ * libunit asks for the port of a router engine that sent it a request
+ * (nxt_unit_get_port()).  The router does not give out other ports.
+ */
+
+static const char *
+nxt_router_get_port_check(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_port_t               *port;
+    nxt_span_t               span;
+    nxt_port_msg_get_port_t  get_port;
+
+    if (nxt_slow_path(msg->buf == NULL)) {
+        return "short get port message";
+    }
+
+    nxt_span_init(&span, msg->buf->mem.pos, msg->buf->mem.free);
+
+    if (nxt_slow_path(nxt_span_copy(&span, &get_port, sizeof(get_port)) != 0))
+    {
+        return "short get port message";
+    }
+
+    if (get_port.pid != nxt_pid) {
+        return "not a router port";
+    }
+
+    port = nxt_runtime_port_find(task->thread->runtime, get_port.pid,
+                                 get_port.id);
+
+    if (port != NULL && port->type != NXT_PROCESS_ROUTER) {
+        return "not a router port";
+    }
+
+    return NULL;
+}
+
+
+/* The reply goes to a port that the header names. */
+
+static const char *
+nxt_router_get_mmap_check(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_port_t  *port;
+
+    port = nxt_runtime_port_find(task->thread->runtime, msg->port_msg.pid,
+                                 msg->port_msg.reply_port);
+
+    if (port != NULL && port->type != NXT_PROCESS_APP) {
+        return "reply port is not an application port";
+    }
+
+    return NULL;
+}
+
+
+static void
+nxt_router_gate_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    if (nxt_fast_path(nxt_router_msg_sender_ok(task, msg))) {
+        nxt_router_gates[msg->port_msg.type].handler(task, msg);
+    }
+}
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_router_sender_test.c. */
+
+nxt_uint_t  nxt_router_test_senders_refused;
+
+
+nxt_bool_t
+nxt_router_test_msg_sender_ok(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    return nxt_router_msg_sender_ok(task, msg);
+}
+
+#endif
+
+
+static void
+nxt_router_conf_data_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    void                    *p;
+    size_t                  size;
+    nxt_int_t               ret;
+    nxt_port_t              *port;
+    nxt_router_temp_conf_t  *tmcf;
+
+    port = nxt_runtime_port_find(task->thread->runtime,
+                                 msg->port_msg.pid,
+                                 msg->port_msg.reply_port);
+    if (nxt_slow_path(port == NULL)) {
+        nxt_alert(task, "conf_data_handler: reply port not found");
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    p = MAP_FAILED;
+
+    /*
+     * Ancient compilers like gcc 4.8.5 on CentOS 7 wants 'size' to be
+     * initialized in 'cleanup' section.
+     */
+    size = 0;
+
+    tmcf = nxt_router_temp_conf(task);
+    if (nxt_slow_path(tmcf == NULL)) {
+        goto fail;
+    }
+
+    if (nxt_slow_path(msg->fd[0] == -1)) {
+        nxt_alert(task, "conf_data_handler: invalid shm fd");
+        goto fail;
+    }
+
+    if (nxt_buf_mem_used_size(&msg->buf->mem) != sizeof(size_t)) {
+        nxt_alert(task, "conf_data_handler: unexpected buffer size (%d)",
+                  (int) nxt_buf_mem_used_size(&msg->buf->mem));
+        goto fail;
+    }
+
+    nxt_memcpy(&size, msg->buf->mem.pos, sizeof(size_t));
+
+    p = nxt_mem_mmap(NULL, size, PROT_READ, MAP_SHARED, msg->fd[0], 0);
+
+    nxt_fd_close(msg->fd[0]);
+    msg->fd[0] = -1;
+
+    if (nxt_slow_path(p == MAP_FAILED)) {
+        goto fail;
+    }
+
+    nxt_debug(task, "conf_data_handler(%uz): %*s", size, size, p);
+
+    tmcf->router_conf->router = nxt_router;
+    tmcf->stream = msg->port_msg.stream;
+    tmcf->port = port;
+
+    nxt_port_use(task, tmcf->port, 1);
+
+    ret = nxt_router_conf_create(task, tmcf, p, nxt_pointer_to(p, size));
+
+    if (nxt_fast_path(ret == NXT_OK)) {
+        nxt_router_conf_apply(task, tmcf, NULL);
+
+    } else {
+        nxt_router_conf_error(task, tmcf);
+    }
+
+    goto cleanup;
+
+fail:
+
+    nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR, -1,
+                          msg->port_msg.stream, 0, NULL);
+
+    if (tmcf != NULL) {
+        nxt_mp_release(tmcf->mem_pool);
+    }
+
+cleanup:
+
+    if (p != MAP_FAILED) {
+        nxt_mem_munmap(p, size);
+    }
+
+    /*
+     * Close both descriptors: the configuration arrives on fd[0], but a
+     * compromised sender can attach a second one to any message and would
+     * otherwise leak a descriptor of the router on every forged message.
+     */
+    nxt_port_recv_msg_close_fds(msg);
+}
+
+
+static void
+nxt_router_app_restart_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_app_t            *app;
+    nxt_int_t            ret;
+    nxt_str_t            app_name;
+    nxt_port_t           *reply_port, *shared_port, *old_shared_port;
+    nxt_port_t           *proto_port;
+    nxt_port_msg_type_t  reply;
+
+    reply_port = nxt_runtime_port_find(task->thread->runtime,
+                                       msg->port_msg.pid,
+                                       msg->port_msg.reply_port);
+    if (nxt_slow_path(reply_port == NULL)) {
+        nxt_alert(task, "app_restart_handler: reply port not found");
+        return;
+    }
+
+    app_name.length = nxt_buf_mem_used_size(&msg->buf->mem);
+    app_name.start = msg->buf->mem.pos;
+
+    nxt_debug(task, "app_restart_handler: %V", &app_name);
+
+    app = nxt_router_app_find(&nxt_router->apps, &app_name);
+
+    if (nxt_fast_path(app != NULL)) {
+        shared_port = nxt_port_new(task, NXT_SHARED_PORT_ID, nxt_pid,
+                                   NXT_PROCESS_APP);
+        if (nxt_slow_path(shared_port == NULL)) {
+            goto fail;
+        }
+
+        ret = nxt_port_socket_init(task, shared_port, 0);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            nxt_port_use(task, shared_port, -1);
+            goto fail;
+        }
+
+        ret = nxt_router_app_queue_init(task, shared_port);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            nxt_port_write_close(shared_port);
+            nxt_port_read_close(shared_port);
+            nxt_port_use(task, shared_port, -1);
+            goto fail;
+        }
+
+        nxt_port_write_enable(task, shared_port);
+
+        nxt_thread_mutex_lock(&app->mutex);
+
+        proto_port = app->proto_port;
+
+        if (proto_port != NULL) {
+            nxt_debug(task, "send QUIT to prototype '%V' pid %PI", &app->name,
+                      proto_port->pid);
+
+            app->proto_port = NULL;
+            proto_port->app = NULL;
+        }
+
+        app->generation++;
+
+        shared_port->app = app;
+
+        old_shared_port = app->shared_port;
+        old_shared_port->app = NULL;
+
+        app->shared_port = shared_port;
+
+        nxt_thread_mutex_unlock(&app->mutex);
+
+        nxt_port_close(task, old_shared_port);
+        nxt_port_use(task, old_shared_port, -1);
+
+        if (proto_port != NULL) {
+            (void) nxt_port_socket_write(task, proto_port, NXT_PORT_MSG_QUIT,
+                                         -1, 0, 0, NULL);
+
+            nxt_port_close(task, proto_port);
+
+            nxt_port_use(task, proto_port, -1);
+        }
+
+        reply = NXT_PORT_MSG_RPC_READY_LAST;
+
+    } else {
+
+fail:
+
+        reply = NXT_PORT_MSG_RPC_ERROR;
+    }
+
+    nxt_port_socket_write(task, reply_port, reply, -1, msg->port_msg.stream,
+                          0, NULL);
+}
+
+
+static void
+nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    u_char               *p;
+    size_t               alloc;
+    nxt_app_t            *app;
+    nxt_buf_t            *b;
+    nxt_uint_t           type;
+    nxt_port_t           *port;
+    nxt_status_app_t     *app_stat;
+    nxt_event_engine_t   *engine;
+    nxt_status_report_t  *report;
+
+    port = nxt_runtime_port_find(task->thread->runtime,
+                                 msg->port_msg.pid,
+                                 msg->port_msg.reply_port);
+    if (nxt_slow_path(port == NULL)) {
+        nxt_alert(task, "nxt_router_status_handler(): reply port not found");
+        return;
+    }
+
+    alloc = sizeof(nxt_status_report_t);
+
+    nxt_queue_each(app, &nxt_router->apps, nxt_app_t, link) {
+
+        alloc += sizeof(nxt_status_app_t) + app->name.length;
+
+    } nxt_queue_loop;
+
+    b = nxt_buf_mem_alloc(port->mem_pool, alloc, 0);
+    if (nxt_slow_path(b == NULL)) {
+        type = NXT_PORT_MSG_RPC_ERROR;
+        goto fail;
+    }
+
+    report = (nxt_status_report_t *) b->mem.free;
+    b->mem.free = b->mem.end;
+
+    nxt_memzero(report, sizeof(nxt_status_report_t));
+
+    nxt_queue_each(engine, &nxt_router->engines, nxt_event_engine_t, link0) {
+
+        report->accepted_conns += engine->accepted_conns_cnt;
+        report->idle_conns += engine->idle_conns_cnt;
+        report->closed_conns += engine->closed_conns_cnt;
+        report->requests += engine->requests_cnt;
+
+    } nxt_queue_loop;
+
+#if (NXT_HAVE_OTEL)
+    /*
+     * Span export health.  The counters live in the Rust exporter wrapper,
+     * which runs in this process, so the router is the only place they can be
+     * read from.  A build without OTel, or a configuration with no
+     * "settings/telemetry", leaves the memzero'd zeros in place and
+     * nxt_status_get() then omits the "telemetry" object entirely.
+     */
+    report->otel_configured = nxt_otel_rs_export_stats(
+                                  &report->otel_spans_exported,
+                                  &report->otel_spans_failed);
+#endif
+
+    report->apps_count = 0;
+    app_stat = report->apps;
+    p = b->mem.end;
+
+    nxt_queue_each(app, &nxt_router->apps, nxt_app_t, link) {
+        p -= app->name.length;
+
+        nxt_memcpy(p, app->name.start, app->name.length);
+
+        app_stat->name.length = app->name.length;
+        app_stat->name.start = (u_char *) (p - b->mem.pos);
+
+        app_stat->active_requests = app->active_requests;
+        app_stat->pending_processes = app->pending_processes;
+        app_stat->processes = app->processes;
+        app_stat->unaccounted_processes = app->unaccounted_processes;
+        app_stat->idle_processes = app->idle_processes;
+        app_stat->detached_processes = app->detached_processes;
+
+        report->apps_count++;
+        app_stat++;
+    } nxt_queue_loop;
+
+    type = NXT_PORT_MSG_RPC_READY_LAST;
+
+fail:
+
+    if (nxt_slow_path(nxt_port_socket_write(task, port, type, -1,
+                                            msg->port_msg.stream, 0, b)
+                      != NXT_OK)
+        && b != NULL)
+    {
+        /*
+         * Still ours: the port layer takes the buffer only on NXT_OK, and
+         * this one lives in the reply port's pool, so it would sit there
+         * until the controller's port is released.
+         */
+
+        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                           b->completion_handler, task, b, b->parent);
+    }
+}
+
+
+static void
+nxt_router_app_process_remove_pid(nxt_task_t *task, nxt_port_t *port,
+    void *data)
+{
+    union {
+        nxt_pid_t  removed_pid;
+        void       *data;
+    } u;
+
+    u.data = data;
+
+    nxt_port_rpc_remove_peer(task, port, u.removed_pid);
+}
+
+
+static void
+nxt_router_remove_pid_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_event_engine_t  *engine;
+
+    nxt_port_remove_pid_handler(task, msg);
+
+    nxt_queue_each(engine, &nxt_router->engines, nxt_event_engine_t, link0)
+    {
+        if (nxt_fast_path(engine->port != NULL)) {
+            nxt_port_post(task, engine->port, nxt_router_app_process_remove_pid,
+                          msg->u.data);
+        }
+    }
+    nxt_queue_loop;
+
+    if (msg->port_msg.stream == 0) {
+        return;
+    }
+
+    msg->port_msg.type = _NXT_PORT_MSG_RPC_ERROR;
+
+    nxt_port_rpc_handler(task, msg);
+}
+
+
+static nxt_router_temp_conf_t *
+nxt_router_temp_conf(nxt_task_t *task)
+{
+    nxt_mp_t                *mp, *tmp;
+    nxt_router_conf_t       *rtcf;
+    nxt_router_temp_conf_t  *tmcf;
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (nxt_slow_path(mp == NULL)) {
+        return NULL;
+    }
+
+    rtcf = nxt_mp_zget(mp, sizeof(nxt_router_conf_t));
+    if (nxt_slow_path(rtcf == NULL)) {
+        goto out_free_mp;
+    }
+
+    rtcf->mem_pool = mp;
+
+    rtcf->tstr_state = nxt_tstr_state_new(mp, 0);
+    if (nxt_slow_path(rtcf->tstr_state == NULL)) {
+        goto out_free_mp;
+    }
+
+#if (NXT_HAVE_NJS)
+    nxt_http_register_js_proto(rtcf->tstr_state->jcf);
+#endif
+
+    tmp = nxt_mp_create(1024, 128, 256, 32);
+    if (nxt_slow_path(tmp == NULL)) {
+        goto out_free_tstr_state;
+    }
+
+    tmcf = nxt_mp_zget(tmp, sizeof(nxt_router_temp_conf_t));
+    if (nxt_slow_path(tmcf == NULL)) {
+        goto out_free;
+    }
+
+    tmcf->mem_pool = tmp;
+    tmcf->router_conf = rtcf;
+    tmcf->count = 1;
+    tmcf->engine = task->thread->engine;
+
+    tmcf->engines = nxt_array_create(tmcf->mem_pool, 4,
+                                     sizeof(nxt_router_engine_conf_t));
+    if (nxt_slow_path(tmcf->engines == NULL)) {
+        goto out_free;
+    }
+
+    nxt_queue_init(&creating_sockets);
+    nxt_queue_init(&pending_sockets);
+    nxt_queue_init(&updating_sockets);
+    nxt_queue_init(&keeping_sockets);
+    nxt_queue_init(&deleting_sockets);
+
+#if (NXT_TLS)
+    nxt_queue_init(&tmcf->tls);
+#endif
+
+#if (NXT_HAVE_NJS)
+    nxt_queue_init(&tmcf->js_modules);
+#endif
+
+    nxt_queue_init(&tmcf->apps);
+    nxt_queue_init(&tmcf->previous);
+
+    return tmcf;
+
+out_free:
+
+    nxt_mp_destroy(tmp);
+
+out_free_tstr_state:
+
+    if (rtcf->tstr_state != NULL) {
+        nxt_tstr_state_release(rtcf->tstr_state);
+    }
+
+out_free_mp:
+
+    nxt_mp_destroy(mp);
+
+    return NULL;
+}
+
+
+#if (NXT_TESTS)
+
+/*
+ * src/test/nxt_router_start_timeout_test.c drives the config-apply start
+ * against a real temporary configuration, because that is the one whose
+ * failure path releases the pool the START_PROCESS payload lives in.  Building
+ * one by hand would not do: nxt_router_temp_conf() is also what initialises the
+ * socket queues nxt_router_conf_error() walks.
+ */
+
+nxt_router_temp_conf_t *
+nxt_router_test_temp_conf(nxt_task_t *task)
+{
+    return nxt_router_temp_conf(task);
+}
+
+#endif
+
+
+nxt_inline nxt_bool_t
+nxt_router_app_need_start(nxt_app_t *app)
+{
+    return (app->active_requests
+              > app->port_hash_count + app->pending_processes)
+           || (app->spare_processes
+                > app->idle_processes + app->pending_processes);
+}
+
+
+void
+nxt_router_conf_apply(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_int_t                    ret;
+    nxt_app_t                    *app;
+    nxt_router_t                 *router;
+    nxt_runtime_t                *rt;
+    nxt_queue_link_t             *qlk;
+    nxt_socket_conf_t            *skcf;
+    nxt_router_conf_t            *rtcf;
+    nxt_router_temp_conf_t       *tmcf;
+    const nxt_event_interface_t  *interface;
+#if (NXT_TLS)
+    nxt_router_tlssock_t         *tls;
+#endif
+#if (NXT_HAVE_NJS)
+    nxt_router_js_module_t       *js_module;
+#endif
+
+    tmcf = obj;
+
+    qlk = nxt_queue_first(&pending_sockets);
+
+    if (qlk != nxt_queue_tail(&pending_sockets)) {
+        nxt_queue_remove(qlk);
+        nxt_queue_insert_tail(&creating_sockets, qlk);
+
+        skcf = nxt_queue_link_data(qlk, nxt_socket_conf_t, link);
+
+        nxt_router_listen_socket_rpc_create(task, tmcf, skcf);
+
+        return;
+    }
+
+#if (NXT_TLS)
+    qlk = nxt_queue_last(&tmcf->tls);
+
+    if (qlk != nxt_queue_head(&tmcf->tls)) {
+        nxt_queue_remove(qlk);
+
+        tls = nxt_queue_link_data(qlk, nxt_router_tlssock_t, link);
+
+        nxt_cert_store_get(task, &tls->name, tmcf->mem_pool,
+                           nxt_router_tls_rpc_handler, tls);
+        return;
+    }
+#endif
+
+#if (NXT_HAVE_NJS)
+    qlk = nxt_queue_last(&tmcf->js_modules);
+
+    if (qlk != nxt_queue_head(&tmcf->js_modules)) {
+        nxt_queue_remove(qlk);
+
+        js_module = nxt_queue_link_data(qlk, nxt_router_js_module_t, link);
+
+        nxt_script_store_get(task, &js_module->name, tmcf->mem_pool,
+                             nxt_router_js_module_rpc_handler, js_module);
+        return;
+    }
+#endif
+
+    rtcf = tmcf->router_conf;
+
+    ret = nxt_tstr_state_done(rtcf->tstr_state, NULL);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto fail;
+    }
+
+    nxt_queue_each(app, &tmcf->apps, nxt_app_t, link) {
+
+        if (nxt_router_app_need_start(app)) {
+            nxt_router_app_rpc_create(task, tmcf, app);
+            return;
+        }
+
+    } nxt_queue_loop;
+
+    if (rtcf->access_log != NULL && rtcf->access_log->fd == -1) {
+        nxt_router_access_log_open(task, tmcf);
+        return;
+    }
+
+    rt = task->thread->runtime;
+
+    interface = nxt_service_get(rt->services, "engine", NULL);
+
+    router = rtcf->router;
+
+    ret = nxt_router_engines_create(task, router, tmcf, interface);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto fail;
+    }
+
+    ret = nxt_router_threads_create(task, rt, tmcf);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto fail;
+    }
+
+    nxt_router_apps_sort(task, router, tmcf);
+
+    nxt_router_apps_hash_use(task, rtcf, 1);
+
+    nxt_router_engines_post(router, tmcf);
+
+    nxt_queue_add(&router->sockets, &updating_sockets);
+    nxt_queue_add(&router->sockets, &creating_sockets);
+
+    if (router->access_log != rtcf->access_log) {
+        nxt_router_access_log_use(&router->lock, rtcf->access_log);
+
+        nxt_router_access_log_release(task, &router->lock, router->access_log);
+
+        router->access_log = rtcf->access_log;
+    }
+
+    nxt_router_conf_ready(task, tmcf);
+
+    return;
+
+fail:
+
+    nxt_router_conf_error(task, tmcf);
+
+    return;
+}
+
+
+static void
+nxt_router_conf_wait(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_joint_job_t  *job;
+
+    job = obj;
+
+    nxt_router_conf_ready(task, job->tmcf);
+}
+
+
+/*
+ * Hand a joint job's temporary configuration reference back to the
+ * configuration thread.  Resetting work.next is not optional: the job was
+ * chained on recf->jobs when it was built, and posting a work item that still
+ * points at its old neighbour silently splices that neighbour into the target
+ * engine's locked queue.  The job must not be touched after the post -- the
+ * configuration thread may run nxt_router_conf_wait() and release the pool the
+ * job lives in at any point from here on.
+ */
+
+nxt_inline void
+nxt_router_conf_wait_post(nxt_joint_job_t *job)
+{
+    job->work.next = NULL;
+    job->work.handler = nxt_router_conf_wait;
+
+    nxt_event_engine_post(job->tmcf->engine, &job->work);
+}
+
+
+static void
+nxt_router_conf_ready(nxt_task_t *task, nxt_router_temp_conf_t *tmcf)
+{
+    uint32_t               count;
+    nxt_router_conf_t      *rtcf;
+    nxt_thread_spinlock_t  *lock;
+
+    nxt_debug(task, "temp conf %p count: %D", tmcf, tmcf->count);
+
+    if (--tmcf->count > 0) {
+        return;
+    }
+
+    nxt_router_conf_send(task, tmcf, NXT_PORT_MSG_RPC_READY_LAST);
+
+    rtcf = tmcf->router_conf;
+
+    lock = &rtcf->router->lock;
+
+    nxt_thread_spin_lock(lock);
+
+    count = rtcf->count;
+
+    nxt_thread_spin_unlock(lock);
+
+    nxt_debug(task, "rtcf %p: %D", rtcf, count);
+
+    if (count == 0) {
+        nxt_router_apps_hash_use(task, rtcf, -1);
+
+        nxt_router_access_log_release(task, lock, rtcf->access_log);
+
+        nxt_mp_destroy(rtcf->mem_pool);
+    }
+
+    nxt_mp_release(tmcf->mem_pool);
+}
+
+
+void
+nxt_router_conf_error(nxt_task_t *task, nxt_router_temp_conf_t *tmcf)
+{
+    nxt_app_t          *app;
+    nxt_socket_t       s;
+    nxt_router_t       *router;
+    nxt_queue_link_t   *qlk;
+    nxt_socket_conf_t  *skcf;
+    nxt_router_conf_t  *rtcf;
+
+    nxt_alert(task, "failed to apply new conf");
+
+    for (qlk = nxt_queue_first(&creating_sockets);
+         qlk != nxt_queue_tail(&creating_sockets);
+         qlk = nxt_queue_next(qlk))
+    {
+        skcf = nxt_queue_link_data(qlk, nxt_socket_conf_t, link);
+        s = skcf->listen->socket;
+
+        if (s != -1) {
+            nxt_socket_close(task, s);
+        }
+
+        nxt_free(skcf->listen);
+    }
+
+    rtcf = tmcf->router_conf;
+
+    nxt_queue_each(app, &tmcf->apps, nxt_app_t, link) {
+
+        nxt_router_app_unlink(task, app);
+
+    } nxt_queue_loop;
+
+    router = rtcf->router;
+
+    nxt_queue_add(&router->sockets, &keeping_sockets);
+    nxt_queue_add(&router->sockets, &deleting_sockets);
+
+    nxt_queue_add(&router->apps, &tmcf->previous);
+
+    // TODO: new engines and threads
+
+    nxt_router_access_log_release(task, &router->lock, rtcf->access_log);
+
+#if (NXT_TLS)
+    /*
+     * The new socket confs go with rtcf->mem_pool, but the TLS contexts
+     * built for them so far are OpenSSL allocations.  No connection uses
+     * them: the listen joints are posted to the engines only on success.
+     * The confs in keeping_sockets are the old ones and stay in use.
+     */
+    nxt_router_conf_error_tls(task, &creating_sockets);
+    nxt_router_conf_error_tls(task, &updating_sockets);
+#endif
+
+    nxt_mp_destroy(rtcf->mem_pool);
+
+    nxt_router_conf_send(task, tmcf, NXT_PORT_MSG_RPC_ERROR);
+
+    nxt_mp_release(tmcf->mem_pool);
+}
+
+
+#if (NXT_TLS)
+
+static void
+nxt_router_conf_error_tls(nxt_task_t *task, nxt_queue_t *sockets)
+{
+    nxt_queue_link_t   *qlk;
+    nxt_socket_conf_t  *skcf;
+
+    for (qlk = nxt_queue_first(sockets);
+         qlk != nxt_queue_tail(sockets);
+         qlk = nxt_queue_next(qlk))
+    {
+        skcf = nxt_queue_link_data(qlk, nxt_socket_conf_t, link);
+
+        /*
+         * A conf without a bundle failed before its first context.  A
+         * bundle whose server_init() failed has a NULL context, and
+         * SSL_CTX_free(NULL) does nothing.
+         */
+        if (skcf->tls != NULL && skcf->tls->bundle != NULL) {
+            task->thread->runtime->tls->server_free(task, skcf->tls);
+        }
+    }
+}
+
+#endif
+
+
+static void
+nxt_router_conf_send(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
+    nxt_port_msg_type_t type)
+{
+    nxt_port_socket_write(task, tmcf->port, type, -1, tmcf->stream, 0, NULL);
+
+    nxt_port_use(task, tmcf->port, -1);
+
+    tmcf->port = NULL;
+}
+
+
+static nxt_conf_map_t  nxt_router_conf[] = {
+    {
+        nxt_string("listen_threads"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_router_conf_t, threads),
+    },
+};
+
+
+static nxt_conf_map_t  nxt_router_app_conf[] = {
+    {
+        nxt_string("type"),
+        NXT_CONF_MAP_STR,
+        offsetof(nxt_router_app_conf_t, type),
+    },
+
+    {
+        nxt_string("limits"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_router_app_conf_t, limits_value),
+    },
+
+    {
+        nxt_string("processes"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_router_app_conf_t, processes),
+    },
+
+    {
+        nxt_string("processes"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_router_app_conf_t, processes_value),
+    },
+
+    {
+        nxt_string("targets"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_router_app_conf_t, targets_value),
+    },
+};
+
+
+static nxt_conf_map_t  nxt_router_app_limits_conf[] = {
+    {
+        nxt_string("timeout"),
+        NXT_CONF_MAP_MSEC,
+        offsetof(nxt_router_app_conf_t, timeout),
+    },
+
+    {
+        nxt_string("start_timeout"),
+        NXT_CONF_MAP_MSEC,
+        offsetof(nxt_router_app_conf_t, start_timeout),
+    },
+};
+
+
+static nxt_conf_map_t  nxt_router_app_processes_conf[] = {
+    {
+        nxt_string("spare"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_router_app_conf_t, spare_processes),
+    },
+
+    {
+        nxt_string("max"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_router_app_conf_t, max_processes),
+    },
+
+    {
+        nxt_string("idle_timeout"),
+        NXT_CONF_MAP_MSEC,
+        offsetof(nxt_router_app_conf_t, idle_timeout),
+    },
+};
+
+
+static nxt_conf_map_t  nxt_router_listener_conf[] = {
+    {
+        nxt_string("pass"),
+        NXT_CONF_MAP_STR_COPY,
+        offsetof(nxt_router_listener_conf_t, pass),
+    },
+
+    {
+        nxt_string("application"),
+        NXT_CONF_MAP_STR_COPY,
+        offsetof(nxt_router_listener_conf_t, application),
+    },
+
+    {
+        nxt_string("backlog"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_router_listener_conf_t, backlog),
+    },
+};
+
+
+static nxt_conf_map_t  nxt_router_http_conf[] = {
+    {
+        nxt_string("header_buffer_size"),
+        NXT_CONF_MAP_SIZE,
+        offsetof(nxt_socket_conf_t, header_buffer_size),
+    },
+
+    {
+        nxt_string("large_header_buffer_size"),
+        NXT_CONF_MAP_SIZE,
+        offsetof(nxt_socket_conf_t, large_header_buffer_size),
+    },
+
+    {
+        nxt_string("large_header_buffers"),
+        NXT_CONF_MAP_SIZE,
+        offsetof(nxt_socket_conf_t, large_header_buffers),
+    },
+
+    {
+        nxt_string("body_buffer_size"),
+        NXT_CONF_MAP_SIZE,
+        offsetof(nxt_socket_conf_t, body_buffer_size),
+    },
+
+    {
+        nxt_string("max_body_size"),
+        NXT_CONF_MAP_SIZE,
+        offsetof(nxt_socket_conf_t, max_body_size),
+    },
+
+    {
+        nxt_string("idle_timeout"),
+        NXT_CONF_MAP_MSEC,
+        offsetof(nxt_socket_conf_t, idle_timeout),
+    },
+
+    {
+        nxt_string("header_read_timeout"),
+        NXT_CONF_MAP_MSEC,
+        offsetof(nxt_socket_conf_t, header_read_timeout),
+    },
+
+    {
+        nxt_string("body_read_timeout"),
+        NXT_CONF_MAP_MSEC,
+        offsetof(nxt_socket_conf_t, body_read_timeout),
+    },
+
+    {
+        nxt_string("send_timeout"),
+        NXT_CONF_MAP_MSEC,
+        offsetof(nxt_socket_conf_t, send_timeout),
+    },
+
+    {
+        nxt_string("body_min_rate"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_socket_conf_t, body_min_rate),
+    },
+
+    {
+        nxt_string("send_min_rate"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_socket_conf_t, send_min_rate),
+    },
+
+    {
+        nxt_string("body_temp_path"),
+        NXT_CONF_MAP_STR,
+        offsetof(nxt_socket_conf_t, body_temp_path),
+    },
+
+    {
+        nxt_string("discard_unsafe_fields"),
+        NXT_CONF_MAP_INT8,
+        offsetof(nxt_socket_conf_t, discard_unsafe_fields),
+    },
+
+    {
+        nxt_string("log_route"),
+        NXT_CONF_MAP_INT8,
+        offsetof(nxt_socket_conf_t, log_route),
+    },
+
+    {
+        nxt_string("server_version"),
+        NXT_CONF_MAP_INT8,
+        offsetof(nxt_socket_conf_t, server_version),
+    },
+
+    {
+        nxt_string("chunked_transform"),
+        NXT_CONF_MAP_INT8,
+        offsetof(nxt_socket_conf_t, chunked_transform),
+    },
+};
+
+
+static nxt_conf_map_t  nxt_router_websocket_conf[] = {
+    {
+        nxt_string("max_frame_size"),
+        NXT_CONF_MAP_SIZE,
+        offsetof(nxt_websocket_conf_t, max_frame_size),
+    },
+
+    {
+        nxt_string("read_timeout"),
+        NXT_CONF_MAP_MSEC,
+        offsetof(nxt_websocket_conf_t, read_timeout),
+    },
+
+    {
+        nxt_string("keepalive_interval"),
+        NXT_CONF_MAP_MSEC,
+        offsetof(nxt_websocket_conf_t, keepalive_interval),
+    },
+
+};
+
+
+#if (NXT_HAVE_OTEL)
+
+/*
+ * The telemetry settings currently applied to the Rust exporter.
+ *
+ * nxt_otel_rs_init() flushes the live provider and builds a new one, which
+ * blocks the router's control thread for as long as the export of the pending
+ * batch takes -- up to the exporter's 10s timeout against an unreachable
+ * collector -- and drops whatever is in flight across the swap.  Every config
+ * apply used to pay that, including applies that do not touch
+ * /settings/telemetry at all (adding a route, changing an app).  Caching what
+ * was applied lets an unchanged telemetry section be a no-op.
+ *
+ * Only exact equality is treated as unchanged; anything the comparison cannot
+ * establish falls through to the rebuild, which is the old behaviour.
+ */
+typedef struct {
+    nxt_bool_t  configured;
+    nxt_str_t   endpoint;
+    nxt_str_t   protocol;
+    double      sample_fraction;
+    double      batch_size;
+} nxt_otel_applied_conf_t;
+
+
+static nxt_otel_applied_conf_t  nxt_otel_applied_conf;
+
+
+static nxt_bool_t
+nxt_router_otel_conf_unchanged(nxt_str_t *endpoint, nxt_str_t *protocol,
+    double sample_fraction, double batch_size)
+{
+    /*
+     * The doubles are re-parsed from the same JSON text on every apply, so an
+     * unchanged section reproduces them bit for bit; an exact comparison is
+     * therefore the right test here, and any inequality only costs a rebuild.
+     */
+    return nxt_otel_applied_conf.configured
+           && nxt_strstr_eq(&nxt_otel_applied_conf.endpoint, endpoint)
+           && nxt_strstr_eq(&nxt_otel_applied_conf.protocol, protocol)
+           && nxt_otel_applied_conf.sample_fraction == sample_fraction
+           && nxt_otel_applied_conf.batch_size == batch_size;
+}
+
+
+static nxt_int_t
+nxt_router_otel_conf_store_str(nxt_str_t *dst, const nxt_str_t *src)
+{
+    u_char  *p;
+
+    p = NULL;
+
+    if (src->length != 0) {
+        p = nxt_malloc(src->length);
+        if (nxt_slow_path(p == NULL)) {
+            return NXT_ERROR;
+        }
+
+        memcpy(p, src->start, src->length);
+    }
+
+    nxt_free(dst->start);
+
+    dst->start = p;
+    dst->length = src->length;
+
+    return NXT_OK;
+}
+
+
+/*
+ * Remember what was just handed to nxt_otel_rs_init().  The strings point into
+ * the configuration memory pool, which is released once this apply completes,
+ * so they have to be copied.  On any failure the cache is invalidated, which
+ * only means the next apply rebuilds unconditionally.
+ */
+static void
+nxt_router_otel_conf_remember(nxt_str_t *endpoint, nxt_str_t *protocol,
+    double sample_fraction, double batch_size)
+{
+    if (nxt_slow_path(nxt_router_otel_conf_store_str(
+                          &nxt_otel_applied_conf.endpoint, endpoint) != NXT_OK
+                      || nxt_router_otel_conf_store_str(
+                          &nxt_otel_applied_conf.protocol,
+                          protocol) != NXT_OK))
+    {
+        nxt_otel_applied_conf.configured = 0;
+        return;
+    }
+
+    nxt_otel_applied_conf.sample_fraction = sample_fraction;
+    nxt_otel_applied_conf.batch_size = batch_size;
+    nxt_otel_applied_conf.configured = 1;
+}
+
+#endif
+
+
+static nxt_int_t
+nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
+    u_char *start, u_char *end)
+{
+    u_char                      *p;
+    size_t                      size;
+    nxt_mp_t                    *mp, *app_mp;
+    uint32_t                    next, next_target;
+    nxt_int_t                   ret;
+    nxt_str_t                   name, target;
+    nxt_app_t                   *app, *prev;
+    nxt_str_t                   *t, *s, *targets;
+    nxt_uint_t                  n, i;
+    nxt_port_t                  *port;
+    nxt_router_t                *router;
+    nxt_app_joint_t             *app_joint;
+#if (NXT_TLS)
+    nxt_tls_init_t              *tls_init;
+    nxt_conf_value_t            *certificate;
+#endif
+#if (NXT_HAVE_NJS)
+    nxt_conf_value_t            *js_module;
+#endif
+#if (NXT_HAVE_OTEL)
+    double                      telemetry_sample_fraction, telemetry_batching;
+    nxt_str_t                   telemetry_endpoint, telemetry_proto;
+    nxt_conf_value_t            *otel, *otel_endpoint, *otel_sampling,
+                                *otel_batching, *otel_proto;
+#endif
+    nxt_conf_value_t            *root, *conf, *http, *value, *websocket;
+    nxt_conf_value_t            *comp;
+    nxt_conf_value_t            *applications, *application, *settings;
+    nxt_conf_value_t            *listeners, *listener;
+    nxt_socket_conf_t           *skcf;
+    nxt_router_conf_t           *rtcf;
+    nxt_http_routes_t           *routes;
+    nxt_event_engine_t          *engine;
+    nxt_app_lang_module_t       *lang;
+    nxt_router_app_conf_t       apcf;
+    nxt_router_listener_conf_t  lscf;
+
+    static const nxt_str_t  settings_path = nxt_string("/settings");
+    static const nxt_str_t  http_path = nxt_string("/settings/http");
+    static const nxt_str_t  applications_path = nxt_string("/applications");
+    static const nxt_str_t  listeners_path = nxt_string("/listeners");
+    static const nxt_str_t  routes_path = nxt_string("/routes");
+    static const nxt_str_t  access_log_path = nxt_string("/access_log");
+#if (NXT_TLS)
+    static const nxt_str_t  certificate_path = nxt_string("/tls/certificate");
+    static const nxt_str_t  conf_commands_path =
+                                nxt_string("/tls/conf_commands");
+    static const nxt_str_t  conf_cache_path =
+                                nxt_string("/tls/session/cache_size");
+    static const nxt_str_t  conf_timeout_path =
+                                nxt_string("/tls/session/timeout");
+    static const nxt_str_t  conf_tickets = nxt_string("/tls/session/tickets");
+#endif
+#if (NXT_HAVE_NJS)
+    static const nxt_str_t  js_module_path = nxt_string("/settings/js_module");
+#endif
+    static const nxt_str_t  static_path = nxt_string("/settings/http/static");
+    static const nxt_str_t  websocket_path =
+                                nxt_string("/settings/http/websocket");
+    static const nxt_str_t  compression_path =
+                                nxt_string("/settings/http/compression");
+    static const nxt_str_t  forwarded_path = nxt_string("/forwarded");
+    static const nxt_str_t  client_ip_path = nxt_string("/client_ip");
+#if (NXT_HAVE_OTEL)
+    static const nxt_str_t  telemetry_path = nxt_string("/settings/telemetry");
+    static const nxt_str_t  telemetry_endpoint_path =
+                                nxt_string("/settings/telemetry/endpoint");
+    static const nxt_str_t  telemetry_batch_path =
+                                nxt_string("/settings/telemetry/batch_size");
+    static const nxt_str_t  telemetry_sample_path =
+                                nxt_string("/settings/telemetry/sampling_ratio");
+    static const nxt_str_t  telemetry_proto_path =
+                                nxt_string("/settings/telemetry/protocol");
+#endif
+
+    root = nxt_conf_json_parse(tmcf->mem_pool, start, end, NULL);
+    if (root == NULL) {
+        nxt_alert(task, "configuration parsing error");
+        return NXT_ERROR;
+    }
+
+    rtcf = tmcf->router_conf;
+    mp = rtcf->mem_pool;
+
+    settings = nxt_conf_get_path(root, &settings_path);
+    if (settings != NULL) {
+        ret = nxt_conf_map_object(mp, settings, nxt_router_conf,
+                                  nxt_nitems(nxt_router_conf), rtcf);
+        if (ret != NXT_OK) {
+            nxt_alert(task, "router_conf map error");
+            return NXT_ERROR;
+        }
+    }
+
+    if (rtcf->threads == 0) {
+        rtcf->threads = nxt_ncpu;
+    }
+
+    conf = nxt_conf_get_path(root, &static_path);
+
+    ret = nxt_router_conf_process_static(task, rtcf, conf);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return NXT_ERROR;
+    }
+
+    router = rtcf->router;
+
+    applications = nxt_conf_get_path(root, &applications_path);
+
+    if (applications != NULL) {
+        next = 0;
+
+        for ( ;; ) {
+            application = nxt_conf_next_object_member(applications,
+                                                      &name, &next);
+            if (application == NULL) {
+                break;
+            }
+
+            nxt_debug(task, "application \"%V\"", &name);
+
+            size = nxt_conf_json_length(application, NULL);
+
+            app_mp = nxt_mp_create(4096, 128, 1024, 64);
+            if (nxt_slow_path(app_mp == NULL)) {
+                goto fail;
+            }
+
+            app = nxt_mp_get(app_mp, sizeof(nxt_app_t) + name.length + size);
+            if (app == NULL) {
+                goto app_fail;
+            }
+
+            nxt_memzero(app, sizeof(nxt_app_t));
+
+            app->mem_pool = app_mp;
+
+            app->name.start = nxt_pointer_to(app, sizeof(nxt_app_t));
+            app->conf.start = nxt_pointer_to(app, sizeof(nxt_app_t)
+                                                  + name.length);
+
+            p = nxt_conf_json_print(app->conf.start, application, NULL);
+            app->conf.length = p - app->conf.start;
+
+            nxt_assert(app->conf.length <= size);
+
+            nxt_debug(task, "application conf \"%V\"", &app->conf);
+
+            prev = nxt_router_app_find(&router->apps, &name);
+
+            if (prev != NULL && nxt_strstr_eq(&app->conf, &prev->conf)) {
+                nxt_mp_destroy(app_mp);
+
+                nxt_queue_remove(&prev->link);
+                nxt_queue_insert_tail(&tmcf->previous, &prev->link);
+
+                ret = nxt_router_apps_hash_add(rtcf, prev);
+                if (nxt_slow_path(ret != NXT_OK)) {
+                    goto fail;
+                }
+
+                continue;
+            }
+
+            apcf.processes = 1;
+            apcf.max_processes = 1;
+            apcf.spare_processes = 0;
+            apcf.timeout = 0;
+            apcf.start_timeout = NXT_APP_START_TIMEOUT;
+            apcf.idle_timeout = 15000;
+            apcf.limits_value = NULL;
+            apcf.processes_value = NULL;
+            apcf.targets_value = NULL;
+
+            app_joint = nxt_malloc(sizeof(nxt_app_joint_t));
+            if (nxt_slow_path(app_joint == NULL)) {
+                goto app_fail;
+            }
+
+            nxt_memzero(app_joint, sizeof(nxt_app_joint_t));
+
+            ret = nxt_conf_map_object(mp, application, nxt_router_app_conf,
+                                      nxt_nitems(nxt_router_app_conf), &apcf);
+            if (ret != NXT_OK) {
+                nxt_alert(task, "application map error");
+                goto app_fail;
+            }
+
+            if (apcf.limits_value != NULL) {
+
+                if (nxt_conf_type(apcf.limits_value) != NXT_CONF_OBJECT) {
+                    nxt_alert(task, "application limits is not object");
+                    goto app_fail;
+                }
+
+                ret = nxt_conf_map_object(mp, apcf.limits_value,
+                                        nxt_router_app_limits_conf,
+                                        nxt_nitems(nxt_router_app_limits_conf),
+                                        &apcf);
+                if (ret != NXT_OK) {
+                    nxt_alert(task, "application limits map error");
+                    goto app_fail;
+                }
+            }
+
+            if (apcf.processes_value != NULL
+                && nxt_conf_type(apcf.processes_value) == NXT_CONF_OBJECT)
+            {
+                ret = nxt_conf_map_object(mp, apcf.processes_value,
+                                     nxt_router_app_processes_conf,
+                                     nxt_nitems(nxt_router_app_processes_conf),
+                                     &apcf);
+                if (ret != NXT_OK) {
+                    nxt_alert(task, "application processes map error");
+                    goto app_fail;
+                }
+
+            } else {
+                apcf.max_processes = apcf.processes;
+                apcf.spare_processes = apcf.processes;
+            }
+
+            if (apcf.targets_value != NULL) {
+                n = nxt_conf_object_members_count(apcf.targets_value);
+
+                targets = nxt_mp_get(app_mp, sizeof(nxt_str_t) * n);
+                if (nxt_slow_path(targets == NULL)) {
+                    goto app_fail;
+                }
+
+                next_target = 0;
+
+                for (i = 0; i < n; i++) {
+                    (void) nxt_conf_next_object_member(apcf.targets_value,
+                                                       &target, &next_target);
+
+                    s = nxt_str_dup(app_mp, &targets[i], &target);
+                    if (nxt_slow_path(s == NULL)) {
+                        goto app_fail;
+                    }
+                }
+
+            } else {
+                targets = NULL;
+            }
+
+            nxt_debug(task, "application type: %V", &apcf.type);
+            nxt_debug(task, "application processes: %D", apcf.processes);
+            nxt_debug(task, "application request timeout: %M", apcf.timeout);
+
+            lang = nxt_app_lang_module(task->thread->runtime, &apcf.type);
+
+            if (lang == NULL) {
+                nxt_alert(task, "unknown application type: \"%V\"", &apcf.type);
+                goto app_fail;
+            }
+
+            nxt_debug(task, "application language module: \"%s\"", lang->file);
+
+            ret = nxt_thread_mutex_create(&app->mutex);
+            if (ret != NXT_OK) {
+                goto app_fail;
+            }
+
+            nxt_queue_init(&app->ports);
+            nxt_queue_init(&app->spare_ports);
+            nxt_queue_init(&app->idle_ports);
+            nxt_queue_init(&app->ack_waiting_req);
+
+            app->name.length = name.length;
+            nxt_memcpy(app->name.start, name.start, name.length);
+
+            app->type = lang->type;
+            app->max_processes = apcf.max_processes;
+            app->spare_processes = apcf.spare_processes;
+            app->max_pending_processes = apcf.spare_processes
+                                         ? apcf.spare_processes : 1;
+            app->timeout = apcf.timeout;
+            app->start_timeout = apcf.start_timeout;
+            app->idle_timeout = apcf.idle_timeout;
+
+            app->targets = targets;
+
+            engine = task->thread->engine;
+
+            app->engine = engine;
+
+            app->adjust_idle_work.handler = nxt_router_adjust_idle_timer;
+            app->adjust_idle_work.task = &engine->task;
+            app->adjust_idle_work.obj = app;
+
+            nxt_queue_insert_tail(&tmcf->apps, &app->link);
+
+            ret = nxt_router_apps_hash_add(rtcf, app);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                goto app_fail;
+            }
+
+            nxt_router_app_use(task, app, 1);
+
+            app->joint = app_joint;
+
+            app_joint->use_count = 1;
+            app_joint->app = app;
+
+            app_joint->idle_timer.bias = NXT_TIMER_DEFAULT_BIAS;
+            app_joint->idle_timer.work_queue = &engine->fast_work_queue;
+            app_joint->idle_timer.handler = nxt_router_app_idle_timeout;
+            app_joint->idle_timer.task = &engine->task;
+            app_joint->idle_timer.log = app_joint->idle_timer.task->log;
+
+            app_joint->free_app_work.handler = nxt_router_free_app;
+            app_joint->free_app_work.task = &engine->task;
+            app_joint->free_app_work.obj = app_joint;
+
+            port = nxt_port_new(task, NXT_SHARED_PORT_ID, nxt_pid,
+                                NXT_PROCESS_APP);
+            if (nxt_slow_path(port == NULL)) {
+                return NXT_ERROR;
+            }
+
+            ret = nxt_port_socket_init(task, port, 0);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                nxt_port_use(task, port, -1);
+                return NXT_ERROR;
+            }
+
+            ret = nxt_router_app_queue_init(task, port);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                nxt_port_write_close(port);
+                nxt_port_read_close(port);
+                nxt_port_use(task, port, -1);
+                return NXT_ERROR;
+            }
+
+            nxt_port_write_enable(task, port);
+            port->app = app;
+
+            app->shared_port = port;
+
+            nxt_thread_mutex_create(&app->outgoing.mutex);
+        }
+    }
+
+    conf = nxt_conf_get_path(root, &routes_path);
+    if (nxt_fast_path(conf != NULL)) {
+        routes = nxt_http_routes_create(task, tmcf, conf);
+        if (nxt_slow_path(routes == NULL)) {
+            return NXT_ERROR;
+        }
+
+        rtcf->routes = routes;
+    }
+
+    ret = nxt_upstreams_create(task, tmcf, root);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return ret;
+    }
+
+    http = nxt_conf_get_path(root, &http_path);
+#if 0
+    if (http == NULL) {
+        nxt_alert(task, "no \"http\" block");
+        return NXT_ERROR;
+    }
+#endif
+
+    websocket = nxt_conf_get_path(root, &websocket_path);
+
+    /*
+     * Compression is configured once for the whole router, not per listener.
+     * The return is deliberately not checked: a "compression" block the
+     * validator accepts but this cannot build -- one with no "compressors",
+     * which is not a required member -- leaves compression off rather than
+     * rejecting the configuration, which is what it has always done.
+     */
+    comp = nxt_conf_get_path(root, &compression_path);
+    if (comp != NULL) {
+        (void) nxt_http_comp_compression_init(task, rtcf, comp);
+    }
+
+    listeners = nxt_conf_get_path(root, &listeners_path);
+
+    if (listeners != NULL) {
+        next = 0;
+
+        for ( ;; ) {
+            listener = nxt_conf_next_object_member(listeners, &name, &next);
+            if (listener == NULL) {
+                break;
+            }
+
+            nxt_memzero(&lscf, sizeof(lscf));
+
+            lscf.backlog = -1;
+
+            ret = nxt_conf_map_object(mp, listener, nxt_router_listener_conf,
+                                      nxt_nitems(nxt_router_listener_conf),
+                                      &lscf);
+            if (ret != NXT_OK) {
+                nxt_alert(task, "listener map error");
+                goto fail;
+            }
+
+            nxt_debug(task, "application: %V", &lscf.application);
+
+            skcf = nxt_router_socket_conf(task, tmcf, &name, lscf.backlog);
+            if (skcf == NULL) {
+                goto fail;
+            }
+
+            // STUB, default values if http block is not defined.
+            skcf->header_buffer_size = 2048;
+            skcf->large_header_buffer_size = 8192;
+            skcf->large_header_buffers = 4;
+            skcf->discard_unsafe_fields = 1;
+            skcf->body_buffer_size = 16 * 1024;
+            skcf->max_body_size = 8 * 1024 * 1024;
+            skcf->proxy_header_buffer_size = 64 * 1024;
+            skcf->proxy_buffer_size = 4096;
+            skcf->proxy_buffers = 256;
+            skcf->idle_timeout = 30 * 1000;
+            skcf->header_read_timeout = 30 * 1000;
+            skcf->body_read_timeout = 30 * 1000;
+            skcf->send_timeout = 30 * 1000;
+            skcf->proxy_timeout = 60 * 1000;
+            skcf->proxy_send_timeout = 30 * 1000;
+            skcf->proxy_read_timeout = 30 * 1000;
+            skcf->body_min_rate = 0;
+            skcf->send_min_rate = 0;
+
+            skcf->server_version = 1;
+            skcf->chunked_transform = 0;
+
+            skcf->websocket_conf.max_frame_size = 1024 * 1024;
+            skcf->websocket_conf.read_timeout = 60 * 1000;
+            skcf->websocket_conf.keepalive_interval = 30 * 1000;
+
+            nxt_str_null(&skcf->body_temp_path);
+
+            if (http != NULL) {
+
+                ret = nxt_conf_map_object(mp, http, nxt_router_http_conf,
+                                          nxt_nitems(nxt_router_http_conf),
+                                          skcf);
+                if (ret != NXT_OK) {
+                    nxt_alert(task, "http map error");
+                    goto fail;
+                }
+
+            }
+
+            if (websocket != NULL) {
+                ret = nxt_conf_map_object(mp, websocket,
+                                          nxt_router_websocket_conf,
+                                          nxt_nitems(nxt_router_websocket_conf),
+                                          &skcf->websocket_conf);
+                if (ret != NXT_OK) {
+                    nxt_alert(task, "websocket map error");
+                    goto fail;
+                }
+            }
+
+            t = &skcf->body_temp_path;
+
+            if (t->length == 0) {
+                t->start = (u_char *) task->thread->runtime->tmp;
+                t->length = nxt_strlen(t->start);
+            }
+
+            conf = nxt_conf_get_path(listener, &forwarded_path);
+
+            if (conf != NULL) {
+                skcf->forwarded = nxt_router_conf_forward(task, mp, conf);
+                if (nxt_slow_path(skcf->forwarded == NULL)) {
+                    return NXT_ERROR;
+                }
+            }
+
+            conf = nxt_conf_get_path(listener, &client_ip_path);
+
+            if (conf != NULL) {
+                skcf->client_ip = nxt_router_conf_forward(task, mp, conf);
+                if (nxt_slow_path(skcf->client_ip == NULL)) {
+                    return NXT_ERROR;
+                }
+            }
+
+#if (NXT_TLS)
+            certificate = nxt_conf_get_path(listener, &certificate_path);
+
+            if (certificate != NULL) {
+                tls_init = nxt_mp_get(tmcf->mem_pool, sizeof(nxt_tls_init_t));
+                if (nxt_slow_path(tls_init == NULL)) {
+                    return NXT_ERROR;
+                }
+
+                tls_init->cache_size = 0;
+                tls_init->timeout = 300;
+
+                value = nxt_conf_get_path(listener, &conf_cache_path);
+                if (value != NULL) {
+                    tls_init->cache_size = nxt_conf_get_number(value);
+                }
+
+                value = nxt_conf_get_path(listener, &conf_timeout_path);
+                if (value != NULL) {
+                    tls_init->timeout = nxt_conf_get_number(value);
+                }
+
+                tls_init->conf_cmds = nxt_conf_get_path(listener,
+                                                        &conf_commands_path);
+
+                tls_init->tickets_conf = nxt_conf_get_path(listener,
+                                                           &conf_tickets);
+
+                n = nxt_conf_array_elements_count_or_1(certificate);
+
+                for (i = 0; i < n; i++) {
+                    value = nxt_conf_get_array_element_or_itself(certificate,
+                                                                 i);
+                    nxt_assert(value != NULL);
+
+                    ret = nxt_router_conf_tls_insert(tmcf, value, skcf,
+                                                     tls_init, i == 0);
+                    if (nxt_slow_path(ret != NXT_OK)) {
+                        goto fail;
+                    }
+                }
+            }
+#endif
+
+            skcf->listen->handler = nxt_http_conn_init;
+            skcf->router_conf = rtcf;
+            skcf->router_conf->count++;
+
+            if (lscf.pass.length != 0) {
+                skcf->action = nxt_http_action_create(task, tmcf, &lscf.pass);
+
+            /* COMPATIBILITY: listener application. */
+            } else if (lscf.application.length > 0) {
+                skcf->action = nxt_http_pass_application(task, rtcf,
+                                                         &lscf.application);
+            }
+
+            if (nxt_slow_path(skcf->action == NULL)) {
+                goto fail;
+            }
+        }
+    }
+
+    ret = nxt_http_routes_resolve(task, tmcf);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto fail;
+    }
+
+    value = nxt_conf_get_path(root, &access_log_path);
+
+    if (value != NULL) {
+        ret = nxt_router_access_log_create(task, rtcf, value);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            goto fail;
+        }
+    }
+
+#if (NXT_HAVE_NJS)
+    js_module = nxt_conf_get_path(root, &js_module_path);
+
+    if (js_module != NULL) {
+        if (nxt_conf_type(js_module) == NXT_CONF_ARRAY) {
+            n = nxt_conf_array_elements_count(js_module);
+
+            for (i = 0; i < n; i++) {
+                value = nxt_conf_get_array_element(js_module, i);
+
+                ret = nxt_router_js_module_insert(tmcf, value);
+                if (nxt_slow_path(ret != NXT_OK)) {
+                    goto fail;
+                }
+            }
+
+        } else {
+            /* NXT_CONF_STRING */
+
+            ret = nxt_router_js_module_insert(tmcf, js_module);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                goto fail;
+            }
+        }
+    }
+
+#endif
+
+#if (NXT_HAVE_OTEL)
+    otel = nxt_conf_get_path(root, &telemetry_path);
+
+    if (otel) {
+        otel_endpoint = nxt_conf_get_path(root, &telemetry_endpoint_path);
+        otel_batching = nxt_conf_get_path(root, &telemetry_batch_path);
+        otel_sampling = nxt_conf_get_path(root, &telemetry_sample_path);
+        otel_proto    = nxt_conf_get_path(root, &telemetry_proto_path);
+
+        nxt_conf_get_string(otel_endpoint, &telemetry_endpoint);
+        nxt_conf_get_string(otel_proto, &telemetry_proto);
+
+        telemetry_batching = otel_batching
+            ? nxt_conf_get_number(otel_batching)
+            : NXT_OTEL_BATCH_DEFAULT;
+
+        telemetry_sample_fraction = otel_sampling
+            ? nxt_conf_get_number(otel_sampling)
+            : NXT_OTEL_SAMPLING_DEFAULT;
+
+        /*
+         * Rebuild the exporter only when the telemetry settings actually
+         * differ.  nxt_otel_rs_is_init() is required as well so that a
+         * previous init that failed inside the Rust side (an exporter that
+         * could not be built) is retried rather than remembered as applied.
+         */
+        if (!nxt_router_otel_conf_unchanged(&telemetry_endpoint,
+                                            &telemetry_proto,
+                                            telemetry_sample_fraction,
+                                            telemetry_batching)
+            || !nxt_otel_rs_is_init())
+        {
+            nxt_otel_rs_init(&nxt_otel_log_callback, &telemetry_endpoint,
+                             &telemetry_proto, telemetry_sample_fraction,
+                             telemetry_batching);
+
+            nxt_router_otel_conf_remember(&telemetry_endpoint, &telemetry_proto,
+                                          telemetry_sample_fraction,
+                                          telemetry_batching);
+        }
+
+    } else if (nxt_otel_applied_conf.configured || nxt_otel_rs_is_init()) {
+        nxt_otel_rs_uninit();
+
+        nxt_free(nxt_otel_applied_conf.endpoint.start);
+        nxt_free(nxt_otel_applied_conf.protocol.start);
+        nxt_memzero(&nxt_otel_applied_conf, sizeof(nxt_otel_applied_conf));
+    }
+#endif
+
+    nxt_queue_add(&deleting_sockets, &router->sockets);
+    nxt_queue_init(&router->sockets);
+
+    return NXT_OK;
+
+app_fail:
+
+    nxt_mp_destroy(app_mp);
+
+fail:
+
+    nxt_queue_each(app, &tmcf->apps, nxt_app_t, link) {
+
+        nxt_queue_remove(&app->link);
+        nxt_thread_mutex_destroy(&app->mutex);
+        nxt_mp_destroy(app->mem_pool);
+
+    } nxt_queue_loop;
+
+    return NXT_ERROR;
+}
+
+
+#if (NXT_TLS)
+
+static nxt_int_t
+nxt_router_conf_tls_insert(nxt_router_temp_conf_t *tmcf,
+    nxt_conf_value_t *value, nxt_socket_conf_t *skcf,
+    nxt_tls_init_t *tls_init, nxt_bool_t last)
+{
+    nxt_router_tlssock_t  *tls;
+
+    tls = nxt_mp_get(tmcf->mem_pool, sizeof(nxt_router_tlssock_t));
+    if (nxt_slow_path(tls == NULL)) {
+        return NXT_ERROR;
+    }
+
+    tls->tls_init = tls_init;
+    tls->socket_conf = skcf;
+    tls->temp_conf = tmcf;
+    tls->last = last;
+    nxt_conf_get_string(value, &tls->name);
+
+    nxt_queue_insert_tail(&tmcf->tls, &tls->link);
+
+    return NXT_OK;
+}
+
+#endif
+
+
+#if (NXT_HAVE_NJS)
+
+static void
+nxt_router_js_module_rpc_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data)
+{
+    nxt_int_t               ret;
+    nxt_str_t               text;
+    nxt_router_conf_t       *rtcf;
+    nxt_router_temp_conf_t  *tmcf;
+    nxt_router_js_module_t  *js_module;
+
+    nxt_debug(task, "auto module rpc handler");
+
+    js_module = data;
+    tmcf = js_module->temp_conf;
+
+    if (msg == NULL || msg->port_msg.type == _NXT_PORT_MSG_RPC_ERROR) {
+        goto fail;
+    }
+
+    rtcf = tmcf->router_conf;
+
+    ret = nxt_script_file_read(msg->fd[0], &text);
+
+    nxt_fd_close(msg->fd[0]);
+    msg->fd[0] = -1;
+
+    if (nxt_slow_path(ret == NXT_ERROR)) {
+        goto fail;
+    }
+
+    if (text.length > 0) {
+        ret = nxt_js_add_module(rtcf->tstr_state->jcf, &js_module->name, &text);
+
+        nxt_free(text.start);
+
+        if (nxt_slow_path(ret == NXT_ERROR)) {
+            goto fail;
+        }
+    }
+
+    nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                       nxt_router_conf_apply, task, tmcf, NULL);
+    return;
+
+fail:
+
+    nxt_router_conf_error(task, tmcf);
+}
+
+
+static nxt_int_t
+nxt_router_js_module_insert(nxt_router_temp_conf_t *tmcf,
+    nxt_conf_value_t *value)
+{
+    nxt_router_js_module_t  *js_module;
+
+    js_module = nxt_mp_get(tmcf->mem_pool, sizeof(nxt_router_js_module_t));
+    if (nxt_slow_path(js_module == NULL)) {
+        return NXT_ERROR;
+    }
+
+    js_module->temp_conf = tmcf;
+    nxt_conf_get_string(value, &js_module->name);
+
+    nxt_queue_insert_tail(&tmcf->js_modules, &js_module->link);
+
+    return NXT_OK;
+}
+
+#endif
+
+
+static nxt_int_t
+nxt_router_conf_process_static(nxt_task_t *task, nxt_router_conf_t *rtcf,
+    nxt_conf_value_t *conf)
+{
+    uint32_t          next, i;
+    nxt_mp_t          *mp;
+    nxt_str_t         *type, exten, str, *s;
+    nxt_int_t         ret;
+    nxt_uint_t        exts;
+    nxt_conf_value_t  *mtypes_conf, *ext_conf, *value;
+
+    static const nxt_str_t  mtypes_path = nxt_string("/mime_types");
+
+    mp = rtcf->mem_pool;
+
+    ret = nxt_http_static_mtypes_init(mp, &rtcf->mtypes_hash);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return NXT_ERROR;
+    }
+
+    if (conf == NULL) {
+        return NXT_OK;
+    }
+
+    mtypes_conf = nxt_conf_get_path(conf, &mtypes_path);
+
+    if (mtypes_conf != NULL) {
+        next = 0;
+
+        for ( ;; ) {
+            ext_conf = nxt_conf_next_object_member(mtypes_conf, &str, &next);
+
+            if (ext_conf == NULL) {
+                break;
+            }
+
+            type = nxt_str_dup(mp, NULL, &str);
+            if (nxt_slow_path(type == NULL)) {
+                return NXT_ERROR;
+            }
+
+            if (nxt_conf_type(ext_conf) == NXT_CONF_STRING) {
+                s = nxt_conf_get_string_dup(ext_conf, mp, &exten);
+                if (nxt_slow_path(s == NULL)) {
+                    return NXT_ERROR;
+                }
+
+                ret = nxt_http_static_mtypes_hash_add(mp, &rtcf->mtypes_hash,
+                                                      &exten, type);
+                if (nxt_slow_path(ret != NXT_OK)) {
+                    return NXT_ERROR;
+                }
+
+                continue;
+            }
+
+            exts = nxt_conf_array_elements_count(ext_conf);
+
+            for (i = 0; i < exts; i++) {
+                value = nxt_conf_get_array_element(ext_conf, i);
+
+                s = nxt_conf_get_string_dup(value, mp, &exten);
+                if (nxt_slow_path(s == NULL)) {
+                    return NXT_ERROR;
+                }
+
+                ret = nxt_http_static_mtypes_hash_add(mp, &rtcf->mtypes_hash,
+                                                      &exten, type);
+                if (nxt_slow_path(ret != NXT_OK)) {
+                    return NXT_ERROR;
+                }
+            }
+        }
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_http_forward_t *
+nxt_router_conf_forward(nxt_task_t *task, nxt_mp_t *mp, nxt_conf_value_t *conf)
+{
+    nxt_int_t                   ret;
+    nxt_conf_value_t            *header_conf, *client_ip_conf, *protocol_conf;
+    nxt_conf_value_t            *source_conf, *recursive_conf;
+    nxt_http_forward_t          *forward;
+    nxt_http_route_addr_rule_t  *source;
+
+    static const nxt_str_t  header_path = nxt_string("/header");
+    static const nxt_str_t  client_ip_path = nxt_string("/client_ip");
+    static const nxt_str_t  protocol_path = nxt_string("/protocol");
+    static const nxt_str_t  source_path = nxt_string("/source");
+    static const nxt_str_t  recursive_path = nxt_string("/recursive");
+
+    header_conf = nxt_conf_get_path(conf, &header_path);
+
+    if (header_conf != NULL) {
+        client_ip_conf = nxt_conf_get_path(conf, &header_path);
+        protocol_conf = NULL;
+
+    } else {
+        client_ip_conf = nxt_conf_get_path(conf, &client_ip_path);
+        protocol_conf = nxt_conf_get_path(conf, &protocol_path);
+    }
+
+    source_conf = nxt_conf_get_path(conf, &source_path);
+    recursive_conf = nxt_conf_get_path(conf, &recursive_path);
+
+    if (source_conf == NULL
+        || (protocol_conf == NULL && client_ip_conf == NULL))
+    {
+        return NULL;
+    }
+
+    forward = nxt_mp_zget(mp, sizeof(nxt_http_forward_t));
+    if (nxt_slow_path(forward == NULL)) {
+        return NULL;
+    }
+
+    source = nxt_http_route_addr_rule_create(task, mp, source_conf);
+    if (nxt_slow_path(source == NULL)) {
+        return NULL;
+    }
+
+    forward->source = source;
+
+    if (recursive_conf != NULL) {
+        forward->recursive = nxt_conf_get_boolean(recursive_conf);
+    }
+
+    if (client_ip_conf != NULL) {
+        ret = nxt_router_conf_forward_header(mp, client_ip_conf,
+                                             &forward->client_ip);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NULL;
+        }
+    }
+
+    if (protocol_conf != NULL) {
+        ret = nxt_router_conf_forward_header(mp, protocol_conf,
+                                             &forward->protocol);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NULL;
+        }
+    }
+
+    return forward;
+}
+
+
+static nxt_int_t
+nxt_router_conf_forward_header(nxt_mp_t *mp, nxt_conf_value_t *conf,
+    nxt_http_forward_header_t *fh)
+{
+    char      c;
+    size_t    i;
+    uint32_t  hash;
+
+    fh->header = nxt_conf_get_string_dup(conf, mp, NULL);
+    if (nxt_slow_path(fh->header == NULL)) {
+        return NXT_ERROR;
+    }
+
+    hash = NXT_HTTP_FIELD_HASH_INIT;
+
+    for (i = 0; i < fh->header->length; i++) {
+        c = fh->header->start[i];
+        hash = nxt_http_field_hash_char(hash, nxt_lowcase(c));
+    }
+
+    hash = nxt_http_field_hash_end(hash) & 0xFFFF;
+
+    fh->header_hash = hash;
+
+    return NXT_OK;
+}
+
+
+static nxt_app_t *
+nxt_router_app_find(nxt_queue_t *queue, nxt_str_t *name)
+{
+    nxt_app_t  *app;
+
+    nxt_queue_each(app, queue, nxt_app_t, link) {
+
+        if (nxt_strstr_eq(name, &app->name)) {
+            return app;
+        }
+
+    } nxt_queue_loop;
+
+    return NULL;
+}
+
+
+static nxt_int_t
+nxt_router_app_queue_init(nxt_task_t *task, nxt_port_t *port)
+{
+    void       *mem;
+    nxt_int_t  fd;
+
+    fd = nxt_shm_open(task, sizeof(nxt_app_queue_t));
+    if (nxt_slow_path(fd == -1)) {
+        return NXT_ERROR;
+    }
+
+    mem = nxt_mem_mmap(NULL, sizeof(nxt_app_queue_t),
+                       PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (nxt_slow_path(mem == MAP_FAILED)) {
+        nxt_fd_close(fd);
+
+        return NXT_ERROR;
+    }
+
+    nxt_app_queue_init(mem);
+
+    port->queue_fd = fd;
+    port->queue = mem;
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_router_port_queue_init(nxt_task_t *task, nxt_port_t *port)
+{
+    void       *mem;
+    nxt_int_t  fd;
+
+    fd = nxt_shm_open(task, sizeof(nxt_port_queue_t));
+    if (nxt_slow_path(fd == -1)) {
+        return NXT_ERROR;
+    }
+
+    mem = nxt_mem_mmap(NULL, sizeof(nxt_port_queue_t),
+                       PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (nxt_slow_path(mem == MAP_FAILED)) {
+        nxt_fd_close(fd);
+
+        return NXT_ERROR;
+    }
+
+    nxt_port_queue_init(mem);
+
+    port->queue_fd = fd;
+    port->queue = mem;
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_router_port_queue_map(nxt_task_t *task, nxt_port_t *port, nxt_fd_t fd)
+{
+    void  *mem;
+
+    nxt_assert(fd != -1);
+
+    mem = nxt_port_queue_mmap(task, fd, sizeof(nxt_port_queue_t));
+    if (nxt_slow_path(mem == NULL)) {
+
+        return NXT_ERROR;
+    }
+
+    port->queue = mem;
+
+    return NXT_OK;
+}
+
+
+static const nxt_lvlhsh_proto_t  nxt_router_apps_hash_proto  nxt_aligned(64) = {
+    NXT_LVLHSH_DEFAULT,
+    nxt_router_apps_hash_test,
+    nxt_mp_lvlhsh_alloc,
+    nxt_mp_lvlhsh_free,
+};
+
+
+static nxt_int_t
+nxt_router_apps_hash_test(nxt_lvlhsh_query_t *lhq, void *data)
+{
+    nxt_app_t  *app;
+
+    app = data;
+
+    return nxt_strstr_eq(&lhq->key, &app->name) ? NXT_OK : NXT_DECLINED;
+}
+
+
+static nxt_int_t
+nxt_router_apps_hash_add(nxt_router_conf_t *rtcf, nxt_app_t *app)
+{
+    nxt_lvlhsh_query_t  lhq;
+
+    lhq.key_hash = nxt_djb_hash(app->name.start, app->name.length);
+    lhq.replace = 0;
+    lhq.key = app->name;
+    lhq.value = app;
+    lhq.proto = &nxt_router_apps_hash_proto;
+    lhq.pool = rtcf->mem_pool;
+
+    switch (nxt_lvlhsh_insert(&rtcf->apps_hash, &lhq)) {
+
+    case NXT_OK:
+        return NXT_OK;
+
+    case NXT_DECLINED:
+        nxt_thread_log_alert("router app hash adding failed: "
+                             "\"%V\" is already in hash", &lhq.key);
+        nxt_fallthrough;
+    default:
+        return NXT_ERROR;
+    }
+}
+
+
+static nxt_app_t *
+nxt_router_apps_hash_get(nxt_router_conf_t *rtcf, nxt_str_t *name)
+{
+    nxt_lvlhsh_query_t  lhq;
+
+    lhq.key_hash = nxt_djb_hash(name->start, name->length);
+    lhq.key = *name;
+    lhq.proto = &nxt_router_apps_hash_proto;
+
+    if (nxt_lvlhsh_find(&rtcf->apps_hash, &lhq) != NXT_OK) {
+        return NULL;
+    }
+
+    return lhq.value;
+}
+
+
+static void
+nxt_router_apps_hash_use(nxt_task_t *task, nxt_router_conf_t *rtcf, int i)
+{
+    nxt_app_t          *app;
+    nxt_lvlhsh_each_t  lhe;
+
+    nxt_lvlhsh_each_init(&lhe, &nxt_router_apps_hash_proto);
+
+    for ( ;; ) {
+        app = nxt_lvlhsh_each(&rtcf->apps_hash, &lhe);
+
+        if (app == NULL) {
+            break;
+        }
+
+        nxt_router_app_use(task, app, i);
+    }
+}
+
+
+typedef struct {
+    nxt_app_t  *app;
+    nxt_int_t  target;
+} nxt_http_app_conf_t;
+
+
+nxt_int_t
+nxt_router_application_init(nxt_router_conf_t *rtcf, nxt_str_t *name,
+    nxt_str_t *target, nxt_http_action_t *action)
+{
+    nxt_app_t            *app;
+    nxt_str_t            *targets;
+    nxt_uint_t           i;
+    nxt_http_app_conf_t  *conf;
+
+    app = nxt_router_apps_hash_get(rtcf, name);
+    if (app == NULL) {
+        return NXT_DECLINED;
+    }
+
+    conf = nxt_mp_get(rtcf->mem_pool, sizeof(nxt_http_app_conf_t));
+    if (nxt_slow_path(conf == NULL)) {
+        return NXT_ERROR;
+    }
+
+    action->handler = nxt_http_application_handler;
+    action->u.conf = conf;
+
+    conf->app = app;
+
+    if (target != NULL && target->length != 0) {
+        targets = app->targets;
+
+        for (i = 0; !nxt_strstr_eq(target, &targets[i]); i++);
+
+        conf->target = i;
+
+    } else {
+        conf->target = 0;
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_socket_conf_t *
+nxt_router_socket_conf(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
+    nxt_str_t *name, int backlog)
+{
+    size_t               size;
+    nxt_int_t            ret;
+    nxt_bool_t           wildcard;
+    nxt_sockaddr_t       *sa;
+    nxt_socket_conf_t    *skcf;
+    nxt_listen_socket_t  *ls;
+
+    sa = nxt_sockaddr_parse(tmcf->mem_pool, name);
+    if (nxt_slow_path(sa == NULL)) {
+        nxt_alert(task, "invalid listener \"%V\"", name);
+        return NULL;
+    }
+
+    sa->type = SOCK_STREAM;
+
+    nxt_debug(task, "router listener: \"%*s\"",
+              (size_t) sa->length, nxt_sockaddr_start(sa));
+
+    skcf = nxt_mp_zget(tmcf->router_conf->mem_pool, sizeof(nxt_socket_conf_t));
+    if (nxt_slow_path(skcf == NULL)) {
+        return NULL;
+    }
+
+    size = nxt_sockaddr_size(sa);
+
+    ret = nxt_router_listen_socket_find(tmcf, skcf, sa);
+
+    if (ret != NXT_OK) {
+
+        ls = nxt_zalloc(sizeof(nxt_listen_socket_t) + size);
+        if (nxt_slow_path(ls == NULL)) {
+            return NULL;
+        }
+
+        skcf->listen = ls;
+
+        ls->sockaddr = nxt_pointer_to(ls, sizeof(nxt_listen_socket_t));
+        nxt_memcpy(ls->sockaddr, sa, size);
+
+        nxt_listen_socket_remote_size(ls);
+
+        ls->socket = -1;
+        ls->backlog = backlog > -1 ? backlog : NXT_LISTEN_BACKLOG;
+        ls->flags = NXT_NONBLOCK;
+        ls->read_after_accept = 1;
+    }
+
+    switch (sa->u.sockaddr.sa_family) {
+#if (NXT_HAVE_UNIX_DOMAIN)
+    case AF_UNIX:
+        wildcard = 0;
+        break;
+#endif
+#if (NXT_INET6)
+    case AF_INET6:
+        wildcard = IN6_IS_ADDR_UNSPECIFIED(&sa->u.sockaddr_in6.sin6_addr);
+        break;
+#endif
+    case AF_INET:
+    default:
+        wildcard = (sa->u.sockaddr_in.sin_addr.s_addr == INADDR_ANY);
+        break;
+    }
+
+    if (!wildcard) {
+        skcf->sockaddr = nxt_mp_zget(tmcf->router_conf->mem_pool, size);
+        if (nxt_slow_path(skcf->sockaddr == NULL)) {
+            return NULL;
+        }
+
+        nxt_memcpy(skcf->sockaddr, sa, size);
+    }
+
+    return skcf;
+}
+
+
+static nxt_int_t
+nxt_router_listen_socket_find(nxt_router_temp_conf_t *tmcf,
+    nxt_socket_conf_t *nskcf, nxt_sockaddr_t *sa)
+{
+    nxt_router_t       *router;
+    nxt_queue_link_t   *qlk;
+    nxt_socket_conf_t  *skcf;
+
+    router = tmcf->router_conf->router;
+
+    for (qlk = nxt_queue_first(&router->sockets);
+         qlk != nxt_queue_tail(&router->sockets);
+         qlk = nxt_queue_next(qlk))
+    {
+        skcf = nxt_queue_link_data(qlk, nxt_socket_conf_t, link);
+
+        if (nxt_sockaddr_cmp(skcf->listen->sockaddr, sa)) {
+            nskcf->listen = skcf->listen;
+
+            nxt_queue_remove(qlk);
+            nxt_queue_insert_tail(&keeping_sockets, qlk);
+
+            nxt_queue_insert_tail(&updating_sockets, &nskcf->link);
+
+            return NXT_OK;
+        }
+    }
+
+    nxt_queue_insert_tail(&pending_sockets, &nskcf->link);
+
+    return NXT_DECLINED;
+}
+
+
+static void
+nxt_router_listen_socket_rpc_create(nxt_task_t *task,
+    nxt_router_temp_conf_t *tmcf, nxt_socket_conf_t *skcf)
+{
+    size_t            size;
+    uint32_t          stream;
+    nxt_int_t         ret;
+    nxt_buf_t         *b;
+    nxt_port_t        *main_port, *router_port;
+    nxt_runtime_t     *rt;
+    nxt_socket_rpc_t  *rpc;
+
+    rpc = nxt_mp_alloc(tmcf->mem_pool, sizeof(nxt_socket_rpc_t));
+    if (rpc == NULL) {
+        goto fail;
+    }
+
+    rpc->socket_conf = skcf;
+    rpc->temp_conf = tmcf;
+
+    size = nxt_sockaddr_size(skcf->listen->sockaddr);
+
+    b = nxt_buf_mem_alloc(tmcf->mem_pool, size, 0);
+    if (b == NULL) {
+        goto fail;
+    }
+
+    b->completion_handler = nxt_buf_dummy_completion;
+
+    b->mem.free = nxt_cpymem(b->mem.free, skcf->listen->sockaddr, size);
+
+    rt = task->thread->runtime;
+    main_port = rt->port_by_type[NXT_PROCESS_MAIN];
+    router_port = rt->port_by_type[NXT_PROCESS_ROUTER];
+
+    stream = nxt_port_rpc_register_handler(task, router_port,
+                                           nxt_router_listen_socket_ready,
+                                           nxt_router_listen_socket_error,
+                                           main_port->pid, rpc);
+    if (nxt_slow_path(stream == 0)) {
+        goto fail;
+    }
+
+    ret = nxt_port_socket_write(task, main_port, NXT_PORT_MSG_SOCKET, -1,
+                                stream, router_port->id, b);
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_rpc_cancel(task, router_port, stream);
+        goto fail;
+    }
+
+    return;
+
+fail:
+
+    nxt_router_conf_error(task, tmcf);
+}
+
+
+static void
+nxt_router_listen_socket_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data)
+{
+    nxt_int_t         ret;
+    nxt_socket_t      s;
+    nxt_socket_rpc_t  *rpc;
+
+    rpc = data;
+
+    s = msg->fd[0];
+
+    /* The listener owns the descriptor now. */
+    msg->fd[0] = -1;
+
+    ret = nxt_socket_nonblocking(task, s);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto fail;
+    }
+
+    nxt_socket_defer_accept(task, s, rpc->socket_conf->listen->sockaddr);
+
+    ret = nxt_listen_socket(task, s, rpc->socket_conf->listen->backlog);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto fail;
+    }
+
+    rpc->socket_conf->listen->socket = s;
+
+    nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                       nxt_router_conf_apply, task, rpc->temp_conf, NULL);
+
+    return;
+
+fail:
+
+    nxt_socket_close(task, s);
+
+    nxt_router_conf_error(task, rpc->temp_conf);
+}
+
+
+static void
+nxt_router_listen_socket_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data)
+{
+    nxt_socket_rpc_t        *rpc;
+    nxt_router_temp_conf_t  *tmcf;
+
+    rpc = data;
+    tmcf = rpc->temp_conf;
+
+#if 0
+    u_char                  *p;
+    size_t                  size;
+    uint8_t                 error;
+    nxt_buf_t               *in, *out;
+    nxt_sockaddr_t          *sa;
+
+    static nxt_str_t  socket_errors[] = {
+        nxt_string("ListenerSystem"),
+        nxt_string("ListenerNoIPv6"),
+        nxt_string("ListenerPort"),
+        nxt_string("ListenerInUse"),
+        nxt_string("ListenerNoAddress"),
+        nxt_string("ListenerNoAccess"),
+        nxt_string("ListenerPath"),
+    };
+
+    sa = rpc->socket_conf->listen->sockaddr;
+
+    in = nxt_buf_chk_make_plain(tmcf->mem_pool, msg->buf, msg->size);
+
+    if (nxt_slow_path(in == NULL)) {
+        return;
+    }
+
+    p = in->mem.pos;
+
+    error = *p++;
+
+    size = nxt_length("listen socket error: ")
+           + nxt_length("{listener: \"\", code:\"\", message: \"\"}")
+           + sa->length + socket_errors[error].length + (in->mem.free - p);
+
+    out = nxt_buf_mem_alloc(tmcf->mem_pool, size, 0);
+    if (nxt_slow_path(out == NULL)) {
+        return;
+    }
+
+    out->mem.free = nxt_sprintf(out->mem.free, out->mem.end,
+                        "listen socket error: "
+                        "{listener: \"%*s\", code:\"%V\", message: \"%*s\"}",
+                        (size_t) sa->length, nxt_sockaddr_start(sa),
+                        &socket_errors[error], in->mem.free - p, p);
+
+    nxt_debug(task, "%*s", out->mem.free - out->mem.pos, out->mem.pos);
+#endif
+
+    nxt_router_conf_error(task, tmcf);
+}
+
+
+#if (NXT_TLS)
+
+static void
+nxt_router_tls_rpc_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data)
+{
+    nxt_mp_t                *mp;
+    nxt_int_t               ret;
+    nxt_tls_conf_t          *tlscf;
+    nxt_router_tlssock_t    *tls;
+    nxt_tls_bundle_conf_t   *bundle;
+    nxt_router_temp_conf_t  *tmcf;
+
+    nxt_debug(task, "tls rpc handler");
+
+    tls = data;
+    tmcf = tls->temp_conf;
+
+    if (msg == NULL || msg->port_msg.type == _NXT_PORT_MSG_RPC_ERROR) {
+        goto fail;
+    }
+
+    mp = tmcf->router_conf->mem_pool;
+
+    if (tls->socket_conf->tls == NULL) {
+        tlscf = nxt_mp_zget(mp, sizeof(nxt_tls_conf_t));
+        if (nxt_slow_path(tlscf == NULL)) {
+            goto fail;
+        }
+
+        tlscf->no_wait_shutdown = 1;
+        tls->socket_conf->tls = tlscf;
+
+    } else {
+        tlscf = tls->socket_conf->tls;
+    }
+
+    tls->tls_init->conf = tlscf;
+
+    /*
+     * The error path frees bundle->ctx of every bundle in the chain, so
+     * the bundle must not hold a garbage pointer before server_init()
+     * sets it.
+     */
+    bundle = nxt_mp_zget(mp, sizeof(nxt_tls_bundle_conf_t));
+    if (nxt_slow_path(bundle == NULL)) {
+        goto fail;
+    }
+
+    if (nxt_slow_path(nxt_str_dup(mp, &bundle->name, &tls->name) == NULL)) {
+        goto fail;
+    }
+
+    /*
+     * The bundle owns the descriptor now.  server_init() closes it on
+     * every path and sets bundle->chain_file to -1.
+     */
+    bundle->chain_file = msg->fd[0];
+    msg->fd[0] = -1;
+
+    bundle->next = tlscf->bundle;
+    tlscf->bundle = bundle;
+
+    ret = task->thread->runtime->tls->server_init(task, mp, tls->tls_init,
+                                                  tls->last);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto fail;
+    }
+
+    nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                       nxt_router_conf_apply, task, tmcf, NULL);
+    return;
+
+fail:
+
+    nxt_router_conf_error(task, tmcf);
+}
+
+#endif
+
+
+static void
+nxt_router_app_rpc_create(nxt_task_t *task,
+    nxt_router_temp_conf_t *tmcf, nxt_app_t *app)
+{
+    size_t                    size;
+    uint32_t                  stream;
+    nxt_fd_t                  port_fd, queue_fd;
+    nxt_int_t                 ret;
+    nxt_buf_t                 *b;
+    nxt_port_t                *router_port, *dport;
+    nxt_runtime_t             *rt;
+    nxt_app_rpc_t             *rpc;
+    nxt_router_start_timer_t  *st;
+
+    rt = task->thread->runtime;
+
+    st = NULL;
+
+    dport = app->proto_port;
+
+    if (dport == NULL) {
+        nxt_debug(task, "app '%V' prototype prefork", &app->name);
+
+        size = app->name.length + 1 + app->conf.length;
+
+        b = nxt_buf_mem_alloc(tmcf->mem_pool, size, 0);
+        if (nxt_slow_path(b == NULL)) {
+            goto fail;
+        }
+
+        b->completion_handler = nxt_buf_dummy_completion;
+
+        nxt_buf_cpystr(b, &app->name);
+        *b->mem.free++ = '\0';
+        nxt_buf_cpystr(b, &app->conf);
+
+        dport = rt->port_by_type[NXT_PROCESS_MAIN];
+
+        port_fd = app->shared_port->pair[0];
+        queue_fd = app->shared_port->queue_fd;
+
+    } else {
+        nxt_debug(task, "app '%V' prefork", &app->name);
+
+        b = NULL;
+        port_fd = -1;
+        queue_fd = -1;
+    }
+
+    router_port = rt->port_by_type[NXT_PROCESS_ROUTER];
+
+    rpc = nxt_port_rpc_register_handler_ex(task, router_port,
+                                           nxt_router_app_prefork_ready,
+                                           nxt_router_app_prefork_error,
+                                           sizeof(nxt_app_rpc_t));
+    if (nxt_slow_path(rpc == NULL)) {
+        goto fail;
+    }
+
+    rpc->app = app;
+    rpc->temp_conf = tmcf;
+    rpc->proto = (b != NULL);
+
+    stream = nxt_port_rpc_ex_stream(rpc);
+
+    /*
+     * Before the write: the deadline resolves through the payload's completion
+     * handler, which nxt_port_socket_write2() may run before it returns.
+     */
+
+    st = nxt_router_start_timer_create(task, app, router_port, dport, b);
+
+    if (st != NULL && b != NULL) {
+        b->completion_handler = nxt_router_start_conf_buf_completion;
+    }
+
+    ret = nxt_port_socket_write2(task, dport, NXT_PORT_MSG_START_PROCESS,
+                                 port_fd, queue_fd, stream, router_port->id, b);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_rpc_cancel(task, router_port, stream);
+        goto fail;
+    }
+
+    if (b == NULL) {
+        nxt_port_rpc_ex_set_peer(task, router_port, rpc, dport->pid);
+
+        app->pending_processes++;
+    }
+
+    rpc->start_timer = st;
+
+    if (st != NULL) {
+        nxt_router_start_timer_arm(task, st, stream);
+    }
+
+    return;
+
+fail:
+
+    if (st != NULL) {
+        /*
+         * Never armed, and the payload dies with tmcf->mem_pool below without
+         * its completion handler ever running, so both references go here.
+         */
+
+        if (b != NULL) {
+            nxt_router_start_timer_use(task, st, -1);
+        }
+
+        nxt_router_start_timer_use(task, st, -1);
+    }
+
+    nxt_router_conf_error(task, tmcf);
+}
+
+
+#if (NXT_TESTS)
+
+void
+nxt_router_test_app_rpc_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
+    nxt_app_t *app)
+{
+    nxt_router_app_rpc_create(task, tmcf, app);
+}
+
+
+/*
+ * The request deadline, for src/test/nxt_router_app_timeout_test.c.  That test
+ * drives it through the engine's timer machinery, so the wrapper is installed
+ * as the timer handler rather than called.
+ */
+
+void
+nxt_router_test_app_timeout(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_router_app_timeout(task, obj, data);
+}
+
+#endif
+
+
+static void
+nxt_router_app_prefork_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data)
+{
+    nxt_app_t           *app;
+    nxt_port_t          *port;
+    nxt_app_rpc_t       *rpc;
+    nxt_event_engine_t  *engine;
+
+    rpc = data;
+    app = rpc->app;
+
+    if (rpc->start_timer != NULL) {
+        nxt_router_start_timer_cancel(task, rpc->start_timer);
+
+        rpc->start_timer = NULL;
+    }
+
+    port = msg->u.new_port;
+
+    nxt_assert(port != NULL);
+    nxt_assert(port->id == 0);
+
+    if (rpc->proto) {
+        nxt_assert(app->proto_port == NULL);
+        nxt_assert(port->type == NXT_PROCESS_PROTOTYPE);
+
+        nxt_port_inc_use(port);
+
+        app->proto_port = port;
+        port->app = app;
+
+        nxt_router_app_rpc_create(task, rpc->temp_conf, app);
+
+        return;
+    }
+
+    nxt_assert(port->type == NXT_PROCESS_APP);
+
+    port->app = app;
+    port->main_app_port = port;
+
+    app->pending_processes--;
+    app->processes++;
+    app->idle_processes++;
+
+    engine = task->thread->engine;
+
+    nxt_queue_insert_tail(&app->ports, &port->app_link);
+    nxt_queue_insert_tail(&app->spare_ports, &port->idle_link);
+
+    nxt_debug(task, "app '%V' move new port %PI:%d to spare_ports",
+              &app->name, port->pid, port->id);
+
+    nxt_port_hash_add(&app->port_hash, port);
+    app->port_hash_count++;
+
+    port->idle_start = 0;
+
+    nxt_port_inc_use(port);
+
+    nxt_port_socket_write(task, port, NXT_PORT_MSG_PORT_ACK, -1, 0, 0, NULL);
+
+    nxt_work_queue_add(&engine->fast_work_queue,
+                       nxt_router_conf_apply, task, rpc->temp_conf, NULL);
+}
+
+
+static void
+nxt_router_app_prefork_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data)
+{
+    nxt_app_t               *app;
+    nxt_app_rpc_t           *rpc;
+    nxt_router_temp_conf_t  *tmcf;
+
+    rpc = data;
+    app = rpc->app;
+    tmcf = rpc->temp_conf;
+
+    if (rpc->start_timer != NULL) {
+        nxt_router_start_timer_cancel(task, rpc->start_timer);
+
+        rpc->start_timer = NULL;
+    }
+
+    if (rpc->proto) {
+        nxt_log(task, NXT_LOG_WARN, "failed to start prototype \"%V\"",
+                &app->name);
+
+    } else {
+        nxt_log(task, NXT_LOG_WARN, "failed to start application \"%V\"",
+                &app->name);
+
+        app->pending_processes--;
+    }
+
+    nxt_router_conf_error(task, tmcf);
+}
+
+
+static nxt_int_t
+nxt_router_engines_create(nxt_task_t *task, nxt_router_t *router,
+    nxt_router_temp_conf_t *tmcf, const nxt_event_interface_t *interface)
+{
+    nxt_int_t                 ret;
+    nxt_uint_t                n, threads;
+    nxt_queue_link_t          *qlk;
+    nxt_router_engine_conf_t  *recf;
+
+    threads = tmcf->router_conf->threads;
+
+    tmcf->engines = nxt_array_create(tmcf->mem_pool, threads,
+                                     sizeof(nxt_router_engine_conf_t));
+    if (nxt_slow_path(tmcf->engines == NULL)) {
+        return NXT_ERROR;
+    }
+
+    n = 0;
+
+    for (qlk = nxt_queue_first(&router->engines);
+         qlk != nxt_queue_tail(&router->engines);
+         qlk = nxt_queue_next(qlk))
+    {
+        recf = nxt_array_zero_add(tmcf->engines);
+        if (nxt_slow_path(recf == NULL)) {
+            return NXT_ERROR;
+        }
+
+        recf->engine = nxt_queue_link_data(qlk, nxt_event_engine_t, link0);
+
+        if (n < threads) {
+            recf->action = NXT_ROUTER_ENGINE_KEEP;
+            ret = nxt_router_engine_conf_update(tmcf, recf);
+
+        } else {
+            recf->action = NXT_ROUTER_ENGINE_DELETE;
+            ret = nxt_router_engine_conf_delete(tmcf, recf);
+        }
+
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return ret;
+        }
+
+        n++;
+    }
+
+    tmcf->new_threads = n;
+
+    while (n < threads) {
+        recf = nxt_array_zero_add(tmcf->engines);
+        if (nxt_slow_path(recf == NULL)) {
+            return NXT_ERROR;
+        }
+
+        recf->action = NXT_ROUTER_ENGINE_ADD;
+
+        recf->engine = nxt_event_engine_create(task, interface, NULL, 0, 0);
+        if (nxt_slow_path(recf->engine == NULL)) {
+            return NXT_ERROR;
+        }
+
+        ret = nxt_router_engine_conf_create(tmcf, recf);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return ret;
+        }
+
+        n++;
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_router_engine_conf_create(nxt_router_temp_conf_t *tmcf,
+    nxt_router_engine_conf_t *recf)
+{
+    nxt_int_t  ret;
+
+    ret = nxt_router_engine_joints_create(tmcf, recf, &creating_sockets,
+                                          nxt_router_listen_socket_create);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return ret;
+    }
+
+    ret = nxt_router_engine_joints_create(tmcf, recf, &updating_sockets,
+                                          nxt_router_listen_socket_create);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return ret;
+    }
+
+    return ret;
+}
+
+
+static nxt_int_t
+nxt_router_engine_conf_update(nxt_router_temp_conf_t *tmcf,
+    nxt_router_engine_conf_t *recf)
+{
+    nxt_int_t  ret;
+
+    ret = nxt_router_engine_joints_create(tmcf, recf, &creating_sockets,
+                                          nxt_router_listen_socket_create);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return ret;
+    }
+
+    ret = nxt_router_engine_joints_create(tmcf, recf, &updating_sockets,
+                                          nxt_router_listen_socket_update);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return ret;
+    }
+
+    ret = nxt_router_engine_joints_delete(tmcf, recf, &deleting_sockets);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return ret;
+    }
+
+    return ret;
+}
+
+
+static nxt_int_t
+nxt_router_engine_conf_delete(nxt_router_temp_conf_t *tmcf,
+    nxt_router_engine_conf_t *recf)
+{
+    nxt_int_t  ret;
+
+    ret = nxt_router_engine_quit(tmcf, recf);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return ret;
+    }
+
+    ret = nxt_router_engine_joints_delete(tmcf, recf, &updating_sockets);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return ret;
+    }
+
+    return nxt_router_engine_joints_delete(tmcf, recf, &deleting_sockets);
+}
+
+
+static nxt_int_t
+nxt_router_engine_joints_create(nxt_router_temp_conf_t *tmcf,
+    nxt_router_engine_conf_t *recf, nxt_queue_t *sockets,
+    nxt_work_handler_t handler)
+{
+    nxt_int_t                ret;
+    nxt_joint_job_t          *job;
+    nxt_queue_link_t         *qlk;
+    nxt_socket_conf_t        *skcf;
+    nxt_socket_conf_joint_t  *joint;
+
+    for (qlk = nxt_queue_first(sockets);
+         qlk != nxt_queue_tail(sockets);
+         qlk = nxt_queue_next(qlk))
+    {
+        job = nxt_mp_get(tmcf->mem_pool, sizeof(nxt_joint_job_t));
+        if (nxt_slow_path(job == NULL)) {
+            return NXT_ERROR;
+        }
+
+        job->work.next = recf->jobs;
+        recf->jobs = &job->work;
+
+        job->task = tmcf->engine->task;
+        job->work.handler = handler;
+        job->work.task = &job->task;
+        job->work.obj = job;
+        job->tmcf = tmcf;
+
+        tmcf->count++;
+
+        joint = nxt_mp_alloc(tmcf->router_conf->mem_pool,
+                             sizeof(nxt_socket_conf_joint_t));
+        if (nxt_slow_path(joint == NULL)) {
+            return NXT_ERROR;
+        }
+
+        job->work.data = joint;
+
+        ret = nxt_upstreams_joint_create(tmcf, &joint->upstreams);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return ret;
+        }
+
+        joint->count = 1;
+        joint->stale = 0;
+
+        skcf = nxt_queue_link_data(qlk, nxt_socket_conf_t, link);
+        skcf->count++;
+        joint->socket_conf = skcf;
+
+        joint->engine = recf->engine;
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_router_engine_quit(nxt_router_temp_conf_t *tmcf,
+    nxt_router_engine_conf_t *recf)
+{
+    nxt_joint_job_t  *job;
+
+    job = nxt_mp_get(tmcf->mem_pool, sizeof(nxt_joint_job_t));
+    if (nxt_slow_path(job == NULL)) {
+        return NXT_ERROR;
+    }
+
+    job->work.next = recf->jobs;
+    recf->jobs = &job->work;
+
+    job->task = tmcf->engine->task;
+    job->work.handler = nxt_router_worker_thread_quit;
+    job->work.task = &job->task;
+    job->work.obj = job;
+    job->work.data = NULL;
+    job->tmcf = tmcf;
+
+    /*
+     * The job outlives this call on the target engine's locked queue, so hold
+     * the pool it lives in, as the joints create/delete jobs do.
+     */
+    tmcf->count++;
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_router_engine_joints_delete(nxt_router_temp_conf_t *tmcf,
+    nxt_router_engine_conf_t *recf, nxt_queue_t *sockets)
+{
+    nxt_joint_job_t   *job;
+    nxt_queue_link_t  *qlk;
+
+    for (qlk = nxt_queue_first(sockets);
+         qlk != nxt_queue_tail(sockets);
+         qlk = nxt_queue_next(qlk))
+    {
+        job = nxt_mp_get(tmcf->mem_pool, sizeof(nxt_joint_job_t));
+        if (nxt_slow_path(job == NULL)) {
+            return NXT_ERROR;
+        }
+
+        job->work.next = recf->jobs;
+        recf->jobs = &job->work;
+
+        job->task = tmcf->engine->task;
+        job->work.handler = nxt_router_listen_socket_delete;
+        job->work.task = &job->task;
+        job->work.obj = job;
+        job->work.data = nxt_queue_link_data(qlk, nxt_socket_conf_t, link);
+        job->tmcf = tmcf;
+
+        tmcf->count++;
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_router_threads_create(nxt_task_t *task, nxt_runtime_t *rt,
+    nxt_router_temp_conf_t *tmcf)
+{
+    nxt_int_t                 ret;
+    nxt_uint_t                i, threads;
+    nxt_router_engine_conf_t  *recf;
+
+    recf = tmcf->engines->elts;
+    threads = tmcf->router_conf->threads;
+
+    for (i = tmcf->new_threads; i < threads; i++) {
+        ret = nxt_router_thread_create(task, rt, recf[i].engine);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return ret;
+        }
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_router_thread_create(nxt_task_t *task, nxt_runtime_t *rt,
+    nxt_event_engine_t *engine)
+{
+    nxt_int_t            ret;
+    nxt_thread_link_t    *link;
+    nxt_thread_handle_t  handle;
+
+    link = nxt_zalloc(sizeof(nxt_thread_link_t));
+
+    if (nxt_slow_path(link == NULL)) {
+        return NXT_ERROR;
+    }
+
+    link->start = nxt_router_thread_start;
+    link->engine = engine;
+    link->work.handler = nxt_router_thread_exit_handler;
+    link->work.task = task;
+    link->work.data = link;
+
+    nxt_queue_insert_tail(&rt->engines, &engine->link);
+
+    ret = nxt_thread_create(&handle, link);
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_queue_remove(&engine->link);
+    }
+
+    return ret;
+}
+
+
+static void
+nxt_router_apps_sort(nxt_task_t *task, nxt_router_t *router,
+    nxt_router_temp_conf_t *tmcf)
+{
+    nxt_app_t  *app;
+
+    nxt_queue_each(app, &router->apps, nxt_app_t, link) {
+
+        nxt_router_app_unlink(task, app);
+
+    } nxt_queue_loop;
+
+    nxt_queue_add(&router->apps, &tmcf->previous);
+    nxt_queue_add(&router->apps, &tmcf->apps);
+}
+
+
+static void
+nxt_router_engines_post(nxt_router_t *router, nxt_router_temp_conf_t *tmcf)
+{
+    nxt_uint_t                n;
+    nxt_event_engine_t        *engine;
+    nxt_router_engine_conf_t  *recf;
+
+    recf = tmcf->engines->elts;
+
+    for (n = tmcf->engines->nelts; n != 0; n--) {
+        engine = recf->engine;
+
+        switch (recf->action) {
+
+        case NXT_ROUTER_ENGINE_KEEP:
+            break;
+
+        case NXT_ROUTER_ENGINE_ADD:
+            nxt_queue_insert_tail(&router->engines, &engine->link0);
+            break;
+
+        case NXT_ROUTER_ENGINE_DELETE:
+            nxt_queue_remove(&engine->link0);
+            break;
+        }
+
+        nxt_router_engine_post(engine, recf->jobs);
+
+        recf++;
+    }
+}
+
+
+static void
+nxt_router_engine_post(nxt_event_engine_t *engine, nxt_work_t *jobs)
+{
+    nxt_work_t  *work, *next;
+
+    for (work = jobs; work != NULL; work = next) {
+        next = work->next;
+        work->next = NULL;
+
+        nxt_event_engine_post(engine, work);
+    }
+}
+
+
+static nxt_port_handlers_t  nxt_router_app_port_handlers = {
+    .rpc_error       = nxt_port_rpc_handler,
+    .mmap            = nxt_port_mmap_handler,
+    .data            = nxt_port_rpc_handler,
+    .oosm            = nxt_router_oosm_handler,
+    .req_headers_ack = nxt_port_rpc_handler,
+};
+
+
+static void
+nxt_router_thread_start(void *data)
+{
+    nxt_int_t           ret;
+    nxt_port_t          *port;
+    nxt_task_t          *task;
+    nxt_work_t          *work;
+    nxt_thread_t        *thread;
+    nxt_thread_link_t   *link;
+    nxt_event_engine_t  *engine;
+
+    link = data;
+    engine = link->engine;
+    task = &engine->task;
+
+    thread = nxt_thread();
+
+    nxt_event_engine_thread_adopt(engine);
+
+    /* STUB */
+    thread->runtime = engine->task.thread->runtime;
+
+    engine->task.thread = thread;
+    engine->task.log = thread->log;
+    thread->engine = engine;
+    thread->task = &engine->task;
+
+    engine->mem_pool = nxt_mp_create(4096, 128, 1024, 64);
+    if (nxt_slow_path(engine->mem_pool == NULL)) {
+        return;
+    }
+
+    port = nxt_port_new(task, nxt_port_get_next_id(), nxt_pid,
+                        NXT_PROCESS_ROUTER);
+    if (nxt_slow_path(port == NULL)) {
+        return;
+    }
+
+    ret = nxt_port_socket_init(task, port, 0);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_use(task, port, -1);
+        return;
+    }
+
+    ret = nxt_router_port_queue_init(task, port);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_use(task, port, -1);
+        return;
+    }
+
+    engine->port = port;
+
+    nxt_port_enable(task, port, &nxt_router_app_port_handlers);
+
+    work = nxt_zalloc(sizeof(nxt_work_t));
+    if (nxt_slow_path(work == NULL)) {
+        return;
+    }
+
+    work->handler = nxt_router_rt_add_port;
+    work->task = link->work.task;
+    work->obj = work;
+    work->data = port;
+
+    nxt_event_engine_post(link->work.task->thread->engine, work);
+
+    nxt_event_engine_start(engine);
+}
+
+
+static void
+nxt_router_rt_add_port(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_int_t      res;
+    nxt_port_t     *port;
+    nxt_runtime_t  *rt;
+
+    rt = task->thread->runtime;
+    port = data;
+
+    nxt_free(obj);
+
+    res = nxt_port_hash_add(&rt->ports, port);
+
+    if (nxt_fast_path(res == NXT_OK)) {
+        nxt_port_use(task, port, 1);
+    }
+}
+
+
+static void
+nxt_router_listen_socket_create(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_joint_job_t          *job;
+    nxt_socket_conf_t        *skcf;
+    nxt_listen_event_t       *lev;
+    nxt_listen_socket_t      *ls;
+    nxt_thread_spinlock_t    *lock;
+    nxt_socket_conf_joint_t  *joint;
+
+    job = obj;
+    joint = data;
+
+    nxt_queue_insert_tail(&task->thread->engine->joints, &joint->link);
+
+    skcf = joint->socket_conf;
+    ls = skcf->listen;
+
+    /*
+     * This engine holds one reference on the listen socket, also when the
+     * listen event cannot be allocated below.  The last engine that
+     * releases its reference closes the socket, see
+     * nxt_router_listen_socket_release().
+     */
+    lock = &skcf->router_conf->router->lock;
+
+    nxt_thread_spin_lock(lock);
+    ls->count++;
+    nxt_thread_spin_unlock(lock);
+
+    lev = nxt_listen_event(task, ls);
+    if (nxt_slow_path(lev == NULL)) {
+        /*
+         * Only the lev allocation itself can fail here: a missing spare
+         * conn keeps the listener and is retried by its own timer
+         * (nxt_listen_event()).  Acknowledge the job so the configuration
+         * request completes instead of waiting forever.  The joint and
+         * the listen socket reference stay: releasing the joint here could
+         * drop the last reference to the configuration that is being
+         * applied.  A later update or delete of this listener releases
+         * both, see nxt_router_listen_socket_release_stale().  The release
+         * is deferred, not skipped: until that job, the stale joint keeps
+         * this configuration (its memory pool and TLS contexts) and the
+         * listen socket, so the address stays bound.
+         */
+        nxt_alert(task, "engine %p: listen socket %d: no memory for the "
+                  "listen event, no connections will be accepted on it",
+                  task->thread->engine, ls->socket);
+
+        joint->stale = 1;
+
+        nxt_router_conf_wait_post(job);
+        return;
+    }
+
+    lev->socket.data = joint;
+
+    nxt_router_conf_wait_post(job);
+}
+
+
+nxt_inline nxt_listen_event_t *
+nxt_router_listen_event(nxt_queue_t *listen_connections,
+    nxt_socket_conf_t *skcf)
+{
+    nxt_socket_t        fd;
+    nxt_queue_link_t    *qlk;
+    nxt_listen_event_t  *lev;
+
+    fd = skcf->listen->socket;
+
+    for (qlk = nxt_queue_first(listen_connections);
+         qlk != nxt_queue_tail(listen_connections);
+         qlk = nxt_queue_next(qlk))
+    {
+        lev = nxt_queue_link_data(qlk, nxt_listen_event_t, link);
+
+        if (fd == lev->socket.fd) {
+            return lev;
+        }
+    }
+
+    return NULL;
+}
+
+
+static void
+nxt_router_listen_socket_update(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_joint_job_t          *job;
+    nxt_event_engine_t       *engine;
+    nxt_listen_event_t       *lev;
+    nxt_socket_conf_joint_t  *joint, *old;
+
+    job = obj;
+    joint = data;
+
+    engine = task->thread->engine;
+
+    nxt_queue_insert_tail(&engine->joints, &joint->link);
+
+    lev = nxt_router_listen_event(&engine->listen_connections,
+                                  joint->socket_conf);
+
+    if (nxt_slow_path(lev == NULL)) {
+        /*
+         * The previous configuration could not allocate the listen event
+         * on this engine (nxt_router_listen_socket_create()), so there is
+         * nothing to update: create it now instead.  The create path
+         * links the joint itself, so unlink it again first.
+         */
+        nxt_queue_remove(&joint->link);
+
+        nxt_router_listen_socket_create(task, obj, data);
+
+        /*
+         * The job is posted: its task and data can be freed now, so the
+         * engine task is used below.  An update keeps the listen socket,
+         * so the stale joint of the failed create has the same one.  The
+         * create above took a new reference on it, so this release does
+         * not close it.
+         */
+        nxt_router_listen_socket_release_stale(&engine->task, engine,
+                                               joint->socket_conf->listen,
+                                               joint);
+        return;
+    }
+
+    old = lev->socket.data;
+    lev->socket.data = joint;
+    lev->listen = joint->socket_conf->listen;
+
+    nxt_router_conf_wait_post(job);
+
+    /*
+     * The task is allocated from configuration temporary
+     * memory pool so it can be freed after engine post operation.
+     */
+
+    nxt_router_conf_release(&engine->task, old);
+}
+
+
+static void
+nxt_router_listen_socket_delete(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_socket_conf_t        *skcf;
+    nxt_listen_event_t       *lev;
+    nxt_event_engine_t       *engine;
+    nxt_socket_conf_joint_t  *joint;
+
+    skcf = data;
+
+    engine = task->thread->engine;
+
+    lev = nxt_router_listen_event(&engine->listen_connections, skcf);
+
+    if (nxt_slow_path(lev == NULL)) {
+        /*
+         * The listen event was never allocated on this engine
+         * (nxt_router_listen_socket_create()), so there is no listener to
+         * close.  Release the stale joint and its listen socket reference
+         * first: if this was the last reference, the socket is closed, and
+         * the acknowledgement then means that the port is free, as after
+         * nxt_router_listen_socket_close_finish().  The listen socket is
+         * matched, not skcf: when an engine is removed
+         * (nxt_router_engine_conf_delete()), skcf is the socket conf of
+         * the new configuration, and the stale joint has the old one.
+         */
+        nxt_router_listen_socket_release_stale(&engine->task, engine,
+                                               skcf->listen, NULL);
+
+        nxt_router_conf_wait_post(obj);
+
+        if (engine->shutdown && nxt_queue_is_empty(&engine->joints)) {
+            nxt_router_worker_thread_exit(&engine->task);
+        }
+
+        return;
+    }
+
+    nxt_fd_event_delete(engine, &lev->socket);
+
+    nxt_debug(task, "engine %p: listen socket delete: %d", engine,
+              lev->socket.fd);
+
+    joint = lev->socket.data;
+    joint->close_job = obj;
+
+    lev->timer.handler = nxt_router_listen_socket_close;
+    lev->timer.work_queue = &engine->fast_work_queue;
+
+    nxt_timer_add(engine, &lev->timer, 0);
+}
+
+
+/*
+ * Releases the joints that a failed nxt_router_listen_socket_create() left
+ * in engine->joints for the listen socket ls, and the listen socket
+ * reference that each of them holds.  Such a joint has the stale flag.
+ * Only the flag is trusted, not ls alone: a request can hold the joint of
+ * a closed listener in engine->joints, and a new listen socket can have
+ * the address of the freed one.  "keep" is the joint of the current job.
+ * Each update or delete of ls releases its stale joints, so an engine has
+ * at most one of them for ls when this runs; the loop does not depend on
+ * that.  The order is the same as in nxt_router_listen_socket_close_finish():
+ * first the listen socket, which the last reference closes, then the
+ * joint.
+ */
+
+static void
+nxt_router_listen_socket_release_stale(nxt_task_t *task,
+    nxt_event_engine_t *engine, nxt_listen_socket_t *ls,
+    nxt_socket_conf_joint_t *keep)
+{
+    nxt_queue_link_t         *qlk, *next;
+    nxt_socket_conf_joint_t  *joint;
+
+    for (qlk = nxt_queue_first(&engine->joints);
+         qlk != nxt_queue_tail(&engine->joints);
+         qlk = next)
+    {
+        next = nxt_queue_next(qlk);
+
+        joint = nxt_queue_link_data(qlk, nxt_socket_conf_joint_t, link);
+
+        if (joint == keep) {
+            continue;
+        }
+
+        if (joint->stale && joint->socket_conf->listen == ls) {
+            nxt_debug(task, "engine %p: release stale joint %p", engine,
+                      joint);
+
+            nxt_router_listen_socket_release(task, joint->socket_conf);
+            nxt_router_conf_release(task, joint);
+        }
+    }
+}
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_router_stale_joint_test.c. */
+
+void
+nxt_router_test_listen_socket_release_stale(nxt_task_t *task,
+    nxt_event_engine_t *engine, nxt_listen_socket_t *ls,
+    nxt_socket_conf_joint_t *keep)
+{
+    nxt_router_listen_socket_release_stale(task, engine, ls, keep);
+}
+
+
+/* The listen socket jobs, for src/test/nxt_router_stale_joint_test.c. */
+
+void
+nxt_router_test_listen_socket_create(nxt_task_t *task, nxt_joint_job_t *job,
+    nxt_socket_conf_joint_t *joint)
+{
+    nxt_router_listen_socket_create(task, job, joint);
+}
+
+
+void
+nxt_router_test_listen_socket_update(nxt_task_t *task, nxt_joint_job_t *job,
+    nxt_socket_conf_joint_t *joint)
+{
+    nxt_router_listen_socket_update(task, job, joint);
+}
+
+#endif
+
+
+static void
+nxt_router_worker_thread_quit(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_joint_job_t     *job;
+    nxt_event_engine_t  *engine;
+
+    nxt_debug(task, "router worker thread quit");
+
+    job = obj;
+
+    engine = task->thread->engine;
+
+    engine->shutdown = 1;
+
+    /*
+     * Give the reference nxt_router_engine_quit() took back.  The task this
+     * handler was called with is allocated from the same pool as the job, so
+     * the exit below has to continue on the engine's own task.
+     */
+
+    nxt_router_conf_wait_post(job);
+
+    if (nxt_queue_is_empty(&engine->joints)) {
+        nxt_router_worker_thread_exit(&engine->task);
+    }
+}
+
+
+static void
+nxt_router_worker_thread_exit(nxt_task_t *task)
+{
+    /*
+     * Free per-thread caches whose storage lives in this thread and can only
+     * be released while running on it, then leave the thread.  New worker-exit
+     * paths must route through here so the cleanup is never forgotten.
+     */
+    nxt_http_static_buf_freelist_drain();
+
+    nxt_thread_exit(task->thread);
+}
+
+
+/*
+ * Two-phase close of a router listen event.
+ *
+ *   Accepting -> Draining: nxt_router_listen_socket_close() (phase 1)
+ *                          disarms accept(2), marks lev->draining = 1.
+ *                          If connections are in flight it also posts the
+ *                          close_job back to the configuration thread, so
+ *                          the control request does not wait for them.
+ *   Draining  -> Closed:   nxt_router_listen_socket_close_finish() (phase 2)
+ *                          runs once lev->count == 1 (no in-flight accepted
+ *                          connections), releases the FD and then posts the
+ *                          close_job if phase 1 did not already.
+ *
+ * The intermediate state lets in-flight TLS handshakes and accepted-but-
+ * not-yet-handled connections complete cleanly instead of being RST when
+ * the listener is reconfigured under load (mirrors the engine->shutdown
+ * pattern in nxt_router_worker_thread_quit()).
+ */
+
+static void nxt_router_listen_socket_close_ready(nxt_task_t *task,
+    nxt_socket_conf_joint_t *joint);
+static void nxt_router_listen_socket_close_finish(nxt_task_t *task,
+    nxt_listen_event_t *lev);
+
+
+static void
+nxt_router_listen_socket_close(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_timer_t              *timer;
+    nxt_listen_event_t       *lev;
+    nxt_event_engine_t       *engine;
+    nxt_socket_conf_joint_t  *joint;
+
+    timer = obj;
+    lev = nxt_timer_data(timer, nxt_listen_event_t, timer);
+
+    engine = task->thread->engine;
+    joint = lev->socket.data;
+
+    nxt_debug(task, "engine %p: listen socket close: %d draining:%d count:%D",
+              engine, lev->socket.fd, lev->draining, lev->count);
+
+    /*
+     * Phase 1: disarm accept(2).  nxt_router_listen_socket_delete() has
+     * already called nxt_fd_event_delete() on epoll/kqueue, but be
+     * defensive in case this entry point is reused or the event
+     * backend's delete is a no-op for events that were never armed
+     * (kqueue's behaviour differs from epoll's when an FD is closed
+     * with pending kevents, see nxt_kqueue_close()).
+     *
+     * Scope note: this drains *already-accepted* connections only.
+     * TCP connections completed by the kernel but still in the listen
+     * queue waiting for a userspace accept(2) are not preserved --
+     * they will be RST when the FD is released in phase 2 below.
+     * Draining the kernel accept queue is future work (full
+     * connection drain with timeout escalation).
+     */
+    if (!lev->draining) {
+        lev->draining = 1;
+
+        if (nxt_fd_event_is_active(lev->socket.read)) {
+            nxt_fd_event_disable_read(engine, &lev->socket);
+        }
+    }
+
+    /*
+     * Phase 2 gating: wait for accepted connections to release their
+     * refs.  lev->count == 1 means only the original listener ref
+     * remains (see nxt_listen_event() and nxt_conn_accept()).
+     *
+     * When connections are still in flight the configuration is
+     * acknowledged here, before the FD is released: the control request
+     * must not wait for idle client timing.  The listening FD then stays
+     * bound until the drain completes
+     * (nxt_router_listen_socket_release() closes it on the last engine's
+     * phase 2), so a configuration that re-adds the same address while
+     * the old listener drains can fail with EADDRINUSE at bind time in
+     * the main process -- a visible, retryable config error.  Closing
+     * the FD in phase 1 instead requires reworking the ls->count
+     * contract across engines and the nxt_process_quit() listen-queue
+     * walk; that belongs to the full-drain follow-up.
+     *
+     * With nothing in flight there is no drain to wait for, so the reply
+     * is deferred to nxt_router_listen_socket_close_finish() below,
+     * which sends it after the descriptor is closed.  That keeps the
+     * pre-drain contract -- a successful reconfiguration means the port
+     * is free -- for every listener that has no accepted connection on
+     * it.
+     */
+    if (lev->count > 1) {
+        nxt_debug(task, "engine %p: listen socket %d drain pending, "
+                  "in-flight: %D", engine, lev->socket.fd, lev->count - 1);
+
+        nxt_router_listen_socket_close_ready(task, joint);
+
+        return;
+    }
+
+    nxt_router_listen_socket_close_finish(task, lev);
+}
+
+
+static void
+nxt_router_listen_socket_close_ready(nxt_task_t *task,
+    nxt_socket_conf_joint_t *joint)
+{
+    nxt_joint_job_t  *job;
+
+    job = joint->close_job;
+    if (job == NULL) {
+        return;
+    }
+
+    joint->close_job = NULL;
+
+    /*
+     * The only record of the acknowledgement on the thread that issues
+     * it.  The configuration thread's "temp conf ... count" line is
+     * written after a cross-thread post, so where it lands in the log is
+     * a function of that thread's wake-up latency, not of where in the
+     * close path the acknowledgement was issued -- it stays in the same
+     * place whether this call is made before the descriptor is released
+     * or after it.  This line does not: it is written by the closing
+     * engine itself, between its own records, so the order of the close
+     * and the acknowledgement is readable from the log.
+     * test_listeners_close_before_reply asserts exactly that.
+     */
+    nxt_debug(task, "engine %p: listen socket close acknowledged",
+              task->thread->engine);
+
+    nxt_router_conf_wait_post(job);
+}
+
+
+static void
+nxt_router_listen_socket_close_finish(nxt_task_t *task,
+    nxt_listen_event_t *lev)
+{
+    nxt_socket_conf_joint_t  *joint;
+
+    nxt_debug(task, "engine %p: listen socket close finish: %d",
+              task->thread->engine, lev->socket.fd);
+
+    nxt_queue_remove(&lev->link);
+
+    joint = lev->socket.data;
+    lev->socket.data = NULL;
+
+    /* 'task' refers to lev->task and we cannot use after nxt_free() */
+    task = &task->thread->engine->task;
+
+    nxt_router_listen_socket_release(task, joint->socket_conf);
+
+    /*
+     * Acknowledge only now.  nxt_router_listen_socket_release() above
+     * drops this engine's reference to the listen socket, and on the
+     * last engine to reach phase 2 it performs the single
+     * nxt_socket_close() of the descriptor.  The configuration is not
+     * reported successful until every engine has acknowledged
+     * (nxt_router_conf_ready()), so acknowledging after the release --
+     * rather than before it, as this function used to -- puts the reply
+     * strictly after the close for a listener with nothing in flight.
+     *
+     * A listener that did have connections to drain acknowledged early
+     * in phase 1 and left joint->close_job NULL, so this is the no-op it
+     * has always been on that path, and the still-bound descriptor
+     * documented there remains its known limitation.
+     *
+     * The joint outlives the call: its listener reference is dropped by
+     * nxt_router_listen_event_release() below, and
+     * nxt_router_listen_socket_release() frees the nxt_listen_socket_t,
+     * not the socket configuration the joint points at.
+     */
+    nxt_router_listen_socket_close_ready(task, joint);
+
+    nxt_router_listen_event_release(task, lev, joint);
+}
+
+
+static void
+nxt_router_listen_socket_release(nxt_task_t *task, nxt_socket_conf_t *skcf)
+{
+#if (NXT_HAVE_UNIX_DOMAIN)
+    size_t                 size;
+    nxt_buf_t              *b;
+    nxt_port_t             *main_port;
+    nxt_runtime_t          *rt;
+    nxt_sockaddr_t         *sa;
+#endif
+    nxt_listen_socket_t    *ls;
+    nxt_thread_spinlock_t  *lock;
+
+    ls = skcf->listen;
+    lock = &skcf->router_conf->router->lock;
+
+    nxt_thread_spin_lock(lock);
+
+    nxt_debug(task, "engine %p: listen socket release: ls->count %D",
+              task->thread->engine, ls->count);
+
+    if (--ls->count != 0) {
+        ls = NULL;
+    }
+
+    nxt_thread_spin_unlock(lock);
+
+    if (ls == NULL) {
+        return;
+    }
+
+    nxt_socket_close(task, ls->socket);
+
+#if (NXT_HAVE_UNIX_DOMAIN)
+    sa = ls->sockaddr;
+    if (sa->u.sockaddr.sa_family != AF_UNIX
+        || sa->u.sockaddr_un.sun_path[0] == '\0')
+    {
+        goto out_free_ls;
+    }
+
+    size = nxt_sockaddr_size(ls->sockaddr);
+
+    b = nxt_buf_mem_alloc(task->thread->engine->mem_pool, size, 0);
+    if (b == NULL) {
+        goto out_free_ls;
+    }
+
+    b->mem.free = nxt_cpymem(b->mem.free, ls->sockaddr, size);
+
+    rt = task->thread->runtime;
+    main_port = rt->port_by_type[NXT_PROCESS_MAIN];
+
+    if (nxt_slow_path(nxt_port_socket_write(task, main_port,
+                                            NXT_PORT_MSG_SOCKET_UNLINK,
+                                            -1, 0, 0, b) != NXT_OK))
+    {
+        /* Still ours: the port layer takes the buffer only on NXT_OK. */
+
+        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                           b->completion_handler, task, b, b->parent);
+    }
+
+out_free_ls:
+#endif
+    nxt_free(ls);
+}
+
+
+void
+nxt_router_listen_event_release(nxt_task_t *task, nxt_listen_event_t *lev,
+    nxt_socket_conf_joint_t *joint)
+{
+    nxt_event_engine_t  *engine;
+
+    nxt_debug(task, "listen event count: %D draining:%d",
+              lev->count, lev->draining);
+
+    engine = task->thread->engine;
+
+    if (--lev->count == 0) {
+        if (lev->next != NULL) {
+            nxt_sockaddr_cache_free(engine, lev->next);
+
+            nxt_conn_free(task, lev->next);
+        }
+
+        nxt_free(lev);
+
+    } else if (lev->draining && lev->count == 1) {
+        /*
+         * Phase 1 of the two-phase close marked this listener as
+         * draining and deferred FD release because in-flight accepted
+         * connections still held refs.  The last such ref has just
+         * been dropped, so finalise the close now.  finish() drops
+         * the listener's own ref (count: 1 -> 0) and frees lev via
+         * the nxt_router_listen_event_release() call at its tail.
+         */
+        if (joint != NULL) {
+            nxt_router_conf_release(task, joint);
+            joint = NULL;
+        }
+
+        nxt_router_listen_socket_close_finish(task, lev);
+    }
+
+    if (joint != NULL) {
+        nxt_router_conf_release(task, joint);
+    }
+
+    if (engine->shutdown && nxt_queue_is_empty(&engine->joints)) {
+        nxt_router_worker_thread_exit(task);
+    }
+}
+
+
+void
+nxt_router_conf_release(nxt_task_t *task, nxt_socket_conf_joint_t *joint)
+{
+    nxt_socket_conf_t      *skcf;
+    nxt_router_conf_t      *rtcf;
+    nxt_thread_spinlock_t  *lock;
+
+    nxt_debug(task, "conf joint %p count: %D", joint, joint->count);
+
+    if (--joint->count != 0) {
+        return;
+    }
+
+    nxt_queue_remove(&joint->link);
+
+    /*
+     * The joint content can not be safely used after the critical
+     * section protected by the spinlock because its memory pool may
+     * be already destroyed by another thread.
+     */
+    skcf = joint->socket_conf;
+    rtcf = skcf->router_conf;
+    lock = &rtcf->router->lock;
+
+    nxt_thread_spin_lock(lock);
+
+    nxt_debug(task, "conf skcf %p: %D, rtcf %p: %D", skcf, skcf->count,
+              rtcf, rtcf->count);
+
+    if (--skcf->count != 0) {
+        skcf = NULL;
+        rtcf = NULL;
+
+    } else {
+        nxt_queue_remove(&skcf->link);
+
+        if (--rtcf->count != 0) {
+            rtcf = NULL;
+        }
+    }
+
+    nxt_thread_spin_unlock(lock);
+
+#if (NXT_TLS)
+    if (skcf != NULL && skcf->tls != NULL) {
+        task->thread->runtime->tls->server_free(task, skcf->tls);
+    }
+#endif
+
+    /* TODO remove engine->port */
+
+    if (rtcf != NULL) {
+        nxt_debug(task, "old router conf is destroyed");
+
+        nxt_router_apps_hash_use(task, rtcf, -1);
+
+        nxt_router_access_log_release(task, lock, rtcf->access_log);
+
+        nxt_tstr_state_release(rtcf->tstr_state);
+
+        nxt_mp_thread_adopt(rtcf->mem_pool);
+
+        nxt_mp_destroy(rtcf->mem_pool);
+    }
+}
+
+
+static void
+nxt_router_thread_exit_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_port_t           *port;
+    nxt_thread_link_t    *link;
+    nxt_event_engine_t   *engine;
+    nxt_thread_handle_t  handle;
+
+    handle = (nxt_thread_handle_t) (uintptr_t) obj;
+    link = data;
+
+    nxt_thread_wait(handle);
+
+    engine = link->engine;
+
+    nxt_queue_remove(&engine->link);
+
+    port = engine->port;
+
+    // TODO notify all apps
+
+    port->engine = task->thread->engine;
+    nxt_mp_thread_adopt(port->mem_pool);
+
+    /*
+     * The worker thread is gone, so nothing reads port->pair[0] any more:
+     * close the socket pair and the queue memfd, and drop the reference
+     * nxt_router_rt_add_port() took when it published the port in
+     * rt->ports.  Without this every engine removed by a listen_threads
+     * decrease leaks 3 descriptors (2 socketpair + 1 memfd) for the
+     * router's lifetime.
+     */
+    nxt_port_close(task, port);
+    nxt_runtime_port_remove(task, port);
+
+    nxt_port_use(task, port, -1);
+
+    nxt_mp_thread_adopt(engine->mem_pool);
+    nxt_mp_destroy(engine->mem_pool);
+
+    nxt_event_engine_free(engine);
+
+    nxt_free(link);
+}
+
+
+/*
+ * Decodes the nxt_unit_response_t that an application put into "b".  The
+ * buffer is shared memory the application can still write, so every value
+ * is read once, through volatile, into a local and checked before use: the
+ * field count against the buffer, each sptr with nxt_unit_sptr_in_buf().
+ * It is a separate function so that a test and the fuzz target
+ * (fuzzing/nxt_router_app_response_fuzz.c) can call it with a bare request.
+ */
+
+static nxt_int_t
+nxt_router_response_header_parse(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_buf_t *b)
+{
+    size_t                b_size, count;
+    u_char                *p;
+    uint32_t              piggyback_length;
+    nxt_int_t             ret;
+    nxt_unit_field_t      *f, uf;
+    nxt_http_field_t      *field;
+    nxt_unit_response_t   *resp;
+
+    b_size = nxt_buf_is_mem(b) ? nxt_buf_mem_used_size(&b->mem) : 0;
+
+    if (nxt_slow_path(b_size < sizeof(nxt_unit_response_t)
+                       || b_size > UINT32_MAX))
+    {
+        nxt_alert(task, "response buffer too small: %z", b_size);
+        return NXT_ERROR;
+    }
+
+    resp = (void *) b->mem.pos;
+    count = *(volatile uint32_t *) &resp->fields_count;
+
+    if (nxt_slow_path(count > (b_size - sizeof(nxt_unit_response_t))
+                              / sizeof(nxt_unit_field_t)))
+    {
+        nxt_alert(task, "response buffer too small for fields count: %uz",
+                  count);
+        return NXT_ERROR;
+    }
+
+    for (f = resp->fields; f < resp->fields + count; f++) {
+        uf = *(volatile nxt_unit_field_t *) f;
+
+        if (uf.skip) {
+            continue;
+        }
+
+        field = nxt_http_resp_field_add(&r->resp, r->mem_pool);
+
+        if (nxt_slow_path(field == NULL)) {
+            return NXT_ERROR;
+        }
+
+        field->hash = uf.hash;
+        field->skip = 0;
+        field->hopbyhop = 0;
+
+        field->name_length = uf.name_length;
+        field->value_length = uf.value_length;
+        field->name = nxt_unit_sptr_in_buf(&f->name, uf.name_length,
+                                           b->mem.pos, b_size);
+        field->value = nxt_unit_sptr_in_buf(&f->value, uf.value_length,
+                                            b->mem.pos, b_size);
+
+        if (nxt_slow_path(field->name == NULL || field->value == NULL)) {
+            nxt_alert(task, "response field sptr out of bounds");
+            return NXT_ERROR;
+        }
+
+        ret = nxt_http_field_process(field, &nxt_response_fields_hash, r);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NXT_ERROR;
+        }
+
+        nxt_debug(task, "header%s: %*s: %*s",
+                  (field->skip ? " skipped" : ""),
+                  (size_t) field->name_length, field->name,
+                  (size_t) field->value_length, field->value);
+
+        if (field->skip) {
+            if (r->resp.num_inline_fields > 0
+                && field == &r->resp.inline_fields[r->resp.num_inline_fields - 1])
+            {
+                r->resp.num_inline_fields--;
+            } else if (r->resp.fields != NULL && r->resp.fields->last != NULL) {
+                r->resp.fields->last->nelts--;
+            }
+        }
+    }
+
+    r->status = *(volatile uint16_t *) &resp->status;
+
+    piggyback_length = *(volatile uint32_t *) &resp->piggyback_content_length;
+
+    if (piggyback_length != 0) {
+        p = nxt_unit_sptr_in_buf(&resp->piggyback_content, piggyback_length,
+                                 b->mem.pos, b_size);
+        if (nxt_slow_path(p == NULL)) {
+            nxt_alert(task, "response piggyback content out of bounds");
+            return NXT_ERROR;
+        }
+
+        b->mem.pos = p;
+        b->mem.free = p + piggyback_length;
+
+    } else {
+        b->mem.pos = b->mem.free;
+    }
+
+    return NXT_OK;
+}
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_router_response_parse_test.c. */
+
+nxt_int_t
+nxt_router_test_response_header_parse(nxt_task_t *task,
+    nxt_http_request_t *r, nxt_buf_t *b)
+{
+    return nxt_router_response_header_parse(task, r, b);
+}
+
+#endif
+
+
+static void
+nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data)
+{
+    nxt_int_t               ret;
+    nxt_app_t               *app;
+    nxt_buf_t               *b, *next, *out, *last_b, *owned_b;
+    nxt_port_t              *app_port;
+    nxt_http_status_t       status;
+    nxt_http_request_t      *r;
+    nxt_request_rpc_data_t  *req_rpc_data;
+
+    /* What "fail:" answers with, unless a branch below knows better. */
+    status = NXT_HTTP_SERVICE_UNAVAILABLE;
+
+    /*
+     * An application response never legitimately carries a descriptor and
+     * this handler does not read msg->fd.  The dispatcher closes what a
+     * handler leaves behind, so this is belt and braces; it is here because
+     * an application owns its end of the port socket, which makes this the
+     * one handler a hostile peer reaches on every single request.
+     */
+    nxt_port_recv_msg_close_fds(msg);
+
+    req_rpc_data = data;
+
+    r = req_rpc_data->request;
+    if (nxt_slow_path(r == NULL)) {
+        /*
+         * A request the router gave up on.  The answer belongs to nobody and
+         * needs no reply, but the last message is the worker saying it is
+         * done: this is where the port it was running on may rejoin the idle
+         * economy.  A message that is not the last one proves nothing yet;
+         * the response can still be streaming.
+         */
+        if (msg->port_msg.last != 0) {
+            nxt_router_app_abandoned_settle(task, req_rpc_data);
+        }
+
+        return;
+    }
+
+    if (r->error) {
+        nxt_request_rpc_data_unlink(task, req_rpc_data);
+        return;
+    }
+
+    app = req_rpc_data->app;
+    nxt_assert(app != NULL);
+
+    if (msg->port_msg.type == _NXT_PORT_MSG_REQ_HEADERS_ACK) {
+        nxt_router_req_headers_ack_handler(task, msg, req_rpc_data);
+
+        return;
+    }
+
+    last_b = NULL;
+    owned_b = NULL;
+
+    b = (msg->size == 0) ? NULL : msg->buf;
+
+    if (msg->port_msg.last != 0) {
+        nxt_debug(task, "router data create last buf");
+
+        last_b = nxt_http_buf_last(r);
+
+        nxt_buf_chain_add(&b, last_b);
+
+        req_rpc_data->rpc_cancel = 0;
+
+        if (req_rpc_data->apr_action == NXT_APR_REQUEST_FAILED) {
+            req_rpc_data->apr_action = NXT_APR_GOT_RESPONSE;
+        }
+
+        nxt_request_rpc_data_unlink(task, req_rpc_data);
+
+    } else {
+        /*
+         * The deadline bounds the worker's answer, and an upgraded
+         * WebSocket has had its answer: the frames that follow are a
+         * session, however quiet (#422).
+         */
+        if (app->timeout != 0 && r->state != &nxt_http_websocket) {
+            r->timer.handler = nxt_router_app_timeout;
+            r->timer_data = req_rpc_data;
+            nxt_timer_add(task->thread->engine, &r->timer, app->timeout);
+        }
+    }
+
+    if (b == NULL) {
+        return;
+    }
+
+    if (msg->buf == b) {
+        /* Disable instant buffer completion/re-using by port. */
+        msg->buf = NULL;
+
+        /*
+         * The port will not complete these buffers anymore, track them
+         * to release the shared memory they hold on the error path.
+         */
+        owned_b = b;
+    }
+
+    if (r->header_sent) {
+        nxt_buf_chain_add(&r->out, b);
+        owned_b = NULL;
+        last_b = NULL;
+
+        ret = nxt_http_comp_compress_app_response(task, r, &r->out);
+        if (ret == NXT_ERROR) {
+            goto fail;
+        }
+
+        nxt_http_request_send_body(task, r, NULL);
+    } else {
+        ret = nxt_router_response_header_parse(task, r, b);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            goto fail;
+        }
+
+        if (nxt_buf_mem_used_size(&b->mem) == 0) {
+            next = b->next;
+            b->next = NULL;
+
+            if (owned_b == b) {
+                owned_b = next;
+            }
+
+            nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                               b->completion_handler, task, b, b->parent);
+
+            b = next;
+        }
+
+        /*
+         * Check compression before handing the chain over to r->out, so that
+         * the rejection below still owns it and releases it inline.  Both
+         * calls read r->resp and the request configuration, never r->out, so
+         * the order is free.
+         *
+         * An application response is always sent with a body, so the two
+         * halves run together here.  They are separate calls because the
+         * static path has to put precondition evaluation between them: a 406
+         * outranks a precondition, but a 304 must not leave an initialised
+         * compressor behind (RFC 9110 Sect. 13.2.1).
+         */
+        ret = nxt_http_comp_check_acceptable(task, r);
+        if (ret != NXT_OK) {
+            /*
+             * No acceptable representation is a fault of the request, not of
+             * the server, and it is the one non-NXT_OK result here that is
+             * not an error: the release below is still what the chain needs,
+             * but the answer is 406 rather than the 503 "fail:" gives
+             * everything else.
+             */
+            if (ret == NXT_HTTP_NOT_ACCEPTABLE) {
+                status = NXT_HTTP_NOT_ACCEPTABLE;
+            }
+
+            goto fail;
+        }
+
+        ret = nxt_http_comp_apply_compression(task, r);
+        if (ret != NXT_OK) {
+            goto fail;
+        }
+
+        if (b != NULL) {
+            nxt_buf_chain_add(&r->out, b);
+            owned_b = NULL;
+            last_b = NULL;
+        }
+
+        nxt_http_request_header_send(task, r, nxt_http_request_send_body, NULL);
+
+        if (r->websocket_handshake
+            && r->status == NXT_HTTP_SWITCHING_PROTOCOLS)
+        {
+            app_port = req_rpc_data->app_port;
+            if (nxt_slow_path(app_port == NULL)) {
+                goto fail;
+            }
+
+            nxt_thread_mutex_lock(&app->mutex);
+
+            app_port->main_app_port->active_websockets++;
+
+            nxt_thread_mutex_unlock(&app->mutex);
+
+            nxt_router_app_port_release(task, app, app_port, NXT_APR_UPGRADE);
+
+            /*
+             * The count above is undone by this action, and only by it:
+             * nxt_request_rpc_data_unlink() is the one path that runs for a
+             * websocket that ends, whichever side ends it, and ->app_port is
+             * still this port when it does.
+             */
+            req_rpc_data->apr_action = NXT_APR_WEBSOCKET_CLOSE;
+
+            nxt_debug(task, "stream #%uD upgrade", req_rpc_data->stream);
+
+            r->state = &nxt_http_websocket;
+
+            /*
+             * The 101 arrived as a non-last message, which re-armed the
+             * request deadline above; the upgrade ends the request, so the
+             * deadline goes with it (#422).
+             */
+            nxt_timer_disable(task->thread->engine, &r->timer);
+
+        } else {
+            r->state = &nxt_http_request_send_state;
+        }
+    }
+
+    return;
+
+fail:
+
+    /*
+     * nxt_http_buf_last() above cleared r->last as a side effect.  Put it
+     * back before nxt_http_request_error() runs: with headers not yet sent it
+     * builds a 503 whose body ends with nxt_http_buf_last(r), and a NULL there
+     * leaves the response without an NXT_BUF_SYNC_LAST buffer, so the request
+     * never completes and holds the connection until the send timeout.  With
+     * headers already sent it instead consumes r->last inline, via
+     * nxt_http_request_error_handler() and the protocol discard.  Either way
+     * the restore has to come first.
+     *
+     * This is only a pointer store -- it completes nothing and releases no
+     * shared memory -- so it does not disturb the ordering the two release
+     * loops below rely on.
+     *
+     * last_b is NULL at the two sites where the chain reached r->out: there
+     * the sync buffer is part of the chain drained below, and taking a second
+     * reference to it here would complete it twice.  That pairing is
+     * maintained a hundred lines above, so assert it rather than trust it.
+     */
+    nxt_assert(last_b == NULL || r->out == NULL);
+
+    if (last_b != NULL) {
+        r->last = last_b;
+    }
+
+    nxt_http_request_error(task, r, status);
+
+    /*
+     * Complete the buffers adopted from the port above, if any: nobody else
+     * holds them.  Stop at last_b: it is the request's own sync buffer, now
+     * owned by r->last again, and completing it here would close the request
+     * before the error response has been sent.
+     *
+     * This runs after the error response has been built on purpose.  Fields
+     * already added to r->resp point straight into the application's shared
+     * memory chunk, and completing these buffers hands that chunk back to
+     * the application; releasing it any earlier would make the response
+     * depend on nxt_http_request_error() having reset the field store first.
+     */
+    while (owned_b != NULL && owned_b != last_b) {
+        b = owned_b->next;
+        owned_b->next = NULL;
+        owned_b->completion_handler(task, owned_b, owned_b->parent);
+        owned_b = b;
+    }
+
+    /*
+     * Once the chain has been linked into r->out it is no longer tracked by
+     * owned_b, and nothing else would release it: nxt_http_request_error()
+     * installs an error body handler of its own and the protocol discard
+     * drains only the connection buffers and r->last.  Nothing in r->out was
+     * ever queued on the connection either -- nxt_http_request_send_body()
+     * clears r->out before handing the chain to nxt_http_request_send() --
+     * so these buffers are owned by the request alone and may be completed
+     * here.  A send_body work item already posted by the header send re-reads
+     * r->out when it runs and degrades to a no-op.
+     *
+     * The completions must be deferred rather than run inline like the loop
+     * above: this chain can carry the request's own sync buffer, whose
+     * completion handler is nxt_router_http_request_done(), and that closes
+     * the request and releases r->mem_pool.  Running it here would do so on
+     * the line above the nxt_request_rpc_data_unlink() that ends this
+     * function.  The loop above may stay inline only because it stops short
+     * of that buffer.
+     */
+    out = r->out;
+    r->out = NULL;
+
+    nxt_sendbuf_drain(task, &task->thread->engine->fast_work_queue, out);
+
+    nxt_request_rpc_data_unlink(task, req_rpc_data);
+}
+
+
+static void
+nxt_router_req_headers_ack_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, nxt_request_rpc_data_t *req_rpc_data)
+{
+    int                 res;
+    nxt_app_t           *app;
+    nxt_buf_t           *b, *next;
+    nxt_bool_t          start_process, unlinked;
+    nxt_port_t          *app_port, *main_app_port;
+    nxt_http_request_t  *r;
+
+    nxt_debug(task, "stream #%uD: got ack from %PI:%d",
+              req_rpc_data->stream,
+              msg->port_msg.pid, msg->port_msg.reply_port);
+
+    nxt_port_rpc_ex_set_peer(task, msg->port, req_rpc_data,
+                             msg->port_msg.pid);
+
+    app = req_rpc_data->app;
+    r = req_rpc_data->request;
+
+    unlinked = 0;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    if (r->app_link.next != NULL) {
+        nxt_queue_remove(&r->app_link);
+        r->app_link.next = NULL;
+
+        unlinked = 1;
+    }
+
+    app_port = nxt_port_hash_find(&app->port_hash, msg->port_msg.pid,
+                                  msg->port_msg.reply_port);
+    if (nxt_slow_path(app_port == NULL)) {
+        nxt_thread_mutex_unlock(&app->mutex);
+
+        nxt_http_request_error(task, r, NXT_HTTP_INTERNAL_SERVER_ERROR);
+
+        if (unlinked) {
+            nxt_mp_release(r->mem_pool);
+        }
+
+        return;
+    }
+
+    main_app_port = app_port->main_app_port;
+
+    start_process = nxt_router_app_port_busy(task, app, main_app_port, "ack");
+
+    main_app_port->active_requests++;
+
+    nxt_port_inc_use(app_port);
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    if (unlinked) {
+        nxt_mp_release(r->mem_pool);
+    }
+
+    if (start_process) {
+        nxt_router_start_app_process(task, app);
+    }
+
+    nxt_port_use(task, req_rpc_data->app_port, -1);
+
+    req_rpc_data->app_port = app_port;
+
+    b = req_rpc_data->msg_info.buf;
+
+    if (b != NULL) {
+        /* First buffer is already sent.  Start from second. */
+        b = b->next;
+
+        req_rpc_data->msg_info.buf->next = NULL;
+    }
+
+    if (req_rpc_data->msg_info.body_fd != -1 || b != NULL) {
+        nxt_debug(task, "stream #%uD: send body fd %d", req_rpc_data->stream,
+                  req_rpc_data->msg_info.body_fd);
+
+        if (req_rpc_data->msg_info.body_fd != -1) {
+            lseek(req_rpc_data->msg_info.body_fd, 0, SEEK_SET);
+        }
+
+        res = nxt_port_socket_write(task, app_port, NXT_PORT_MSG_REQ_BODY,
+                                    req_rpc_data->msg_info.body_fd,
+                                    req_rpc_data->stream,
+                                    task->thread->engine->port->id, b);
+
+        if (nxt_slow_path(res != NXT_OK)) {
+            /*
+             * This tail was cut from msg_info.buf above, so
+             * nxt_router_msg_cancel() walks a chain that no longer reaches
+             * it and nothing else completes it.  Its buffers are chunks of
+             * shared memory that no pool teardown reclaims, so return them
+             * here.  Queued rather than run inline, as the port layer does
+             * when it drops a message of its own.
+             */
+
+            while (b != NULL) {
+                next = b->next;
+                b->next = NULL;
+
+                nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                                   b->completion_handler, task, b, b->parent);
+
+                b = next;
+            }
+
+            nxt_http_request_error(task, r, NXT_HTTP_INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    if (app->timeout != 0) {
+        r->timer.handler = nxt_router_app_timeout;
+        r->timer_data = req_rpc_data;
+        nxt_timer_add(task->thread->engine, &r->timer, app->timeout);
+    }
+}
+
+
+static const nxt_http_request_state_t  nxt_http_request_send_state
+    nxt_aligned(64) =
+{
+    .error_handler = nxt_http_request_error_handler,
+};
+
+
+static void
+nxt_http_request_send_body(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_buf_t           *out;
+    nxt_http_request_t  *r;
+
+    r = obj;
+
+    out = r->out;
+
+    if (out != NULL) {
+        r->out = NULL;
+        nxt_http_request_send(task, r, out);
+    }
+}
+
+
+static void
+nxt_router_response_error_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data)
+{
+    nxt_request_rpc_data_t  *req_rpc_data;
+
+    req_rpc_data = data;
+
+    req_rpc_data->rpc_cancel = 0;
+
+    /*
+     * The worker is gone, so whatever the router gave up on it is over.  The
+     * settle does nothing unless this request is one of those.
+     */
+    nxt_router_app_abandoned_settle(task, req_rpc_data);
+
+    /* TODO cancel message and return if cancelled. */
+
+    if (req_rpc_data->request != NULL) {
+        nxt_http_request_error(task, req_rpc_data->request,
+                               NXT_HTTP_SERVICE_UNAVAILABLE);
+    }
+
+    nxt_request_rpc_data_unlink(task, req_rpc_data);
+}
+
+
+static void
+nxt_router_app_port_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data)
+{
+    uint32_t             n;
+    nxt_app_t            *app;
+    nxt_bool_t           start_process, restarted, superseded;
+    nxt_port_t           *port;
+    nxt_app_joint_t      *app_joint;
+    nxt_app_joint_rpc_t  *app_joint_rpc;
+
+    nxt_assert(data != NULL);
+
+    app_joint_rpc = data;
+    app_joint = app_joint_rpc->app_joint;
+    port = msg->u.new_port;
+
+    if (app_joint_rpc->start_timer != NULL) {
+        nxt_router_start_timer_cancel(task, app_joint_rpc->start_timer);
+
+        app_joint_rpc->start_timer = NULL;
+    }
+
+    nxt_assert(app_joint != NULL);
+    nxt_assert(port != NULL);
+    nxt_assert(port->id == 0);
+
+    app = app_joint->app;
+
+    nxt_router_app_joint_use(task, app_joint, -1);
+
+    if (nxt_slow_path(app == NULL)) {
+        nxt_debug(task, "new port ready for released app, send QUIT");
+
+        nxt_port_socket_write(task, port, NXT_PORT_MSG_QUIT, -1, 0, 0, NULL);
+
+        return;
+    }
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    restarted = (app->generation != app_joint_rpc->generation);
+
+    if (app_joint_rpc->proto) {
+        nxt_assert(port->type == NXT_PROCESS_PROTOTYPE);
+
+        if (app_joint_rpc->expired) {
+            /*
+             * Not a start attempt any more: the reaper armed by
+             * nxt_router_app_start_expired() for the prototype the deadline
+             * gave up on, which has announced itself after all.  The cohort
+             * it owned was released when the attempt was failed, so there is
+             * nothing to replay here, and the slot it holds is an
+             * unaccounted one.  Guarded rather than asserted for the reason
+             * given below, where a worker takes the same step.
+             */
+
+            nxt_assert(app->unaccounted_processes != 0);
+
+            if (nxt_fast_path(app->unaccounted_processes != 0)) {
+                app->unaccounted_processes--;
+            }
+
+            n = 0;
+
+        } else {
+            n = app->proto_port_requests;
+            app->proto_port_requests = 0;
+        }
+
+        /*
+         * A prototype that only just missed its deadline is adopted, exactly
+         * as a late worker is below -- unless the application has acquired a
+         * prototype meanwhile.  It can: failing the attempt clears
+         * proto_port_requests, so the next request starts a second prototype
+         * and two of them can be up at once, of which only one may ever be
+         * app->proto_port.  The other is QUIT here, which is also how the
+         * router disposes of one that belongs to a superseded generation.
+         */
+
+        superseded = restarted || app->proto_port != NULL;
+
+        if (nxt_slow_path(superseded)) {
+            nxt_thread_mutex_unlock(&app->mutex);
+
+            nxt_debug(task, "proto port ready for an app that has no use for "
+                            "it, send QUIT");
+
+            nxt_port_socket_write(task, port, NXT_PORT_MSG_QUIT, -1, 0, 0,
+                                  NULL);
+
+        } else {
+            port->app = app;
+            app->proto_port = port;
+
+            nxt_thread_mutex_unlock(&app->mutex);
+
+            nxt_port_use(task, port, 1);
+        }
+
+        port = task->thread->runtime->port_by_type[NXT_PROCESS_ROUTER];
+
+        while (n > 0) {
+            nxt_router_app_use(task, app, 1);
+
+            nxt_router_start_app_process_handler(task, port, app);
+
+            n--;
+        }
+
+        return;
+    }
+
+    nxt_assert(port->type == NXT_PROCESS_APP);
+
+    if (app_joint_rpc->expired) {
+        /*
+         * The worker beat the reaper: "limits": {"start_timeout"} gave up on
+         * its start and moved the slot to unaccounted_processes, and the
+         * process the router had no pid for has now announced itself.  Move
+         * the slot back and adopt the worker exactly as an in-time start is
+         * adopted below -- the sum nxt_router_app_can_start() is taken over
+         * does not change, and this is the only drain that recovers a slot
+         * without the process having to die.  The request that waited for it
+         * was answered when the deadline fired; the worker serves the next
+         * one.
+         */
+
+        /*
+         * Guarded rather than asserted, for the reason given in
+         * nxt_router_app_start_failed(): nxt_assert() is nothing in a release
+         * build, and of the two ways to be wrong here, decrementing a counter
+         * that is already zero is much the worse.  It wraps to UINT32_MAX and
+         * pins nxt_router_app_can_start() false for the application's
+         * lifetime, where failing to decrement merely leaks the slot.
+         * nxt_router_app_unaccounted_release() takes the same care.
+         */
+
+        nxt_assert(app->unaccounted_processes != 0);
+
+        if (nxt_fast_path(app->unaccounted_processes != 0)) {
+            app->unaccounted_processes--;
+        }
+
+    } else {
+        nxt_assert(app->pending_processes != 0);
+
+        app->pending_processes--;
+    }
+
+    if (nxt_slow_path(restarted)) {
+        nxt_debug(task, "new port ready for restarted app, send QUIT");
+
+        start_process = !task->thread->engine->shutdown
+                        && nxt_router_app_can_start(app)
+                        && nxt_router_app_need_start(app);
+
+        if (start_process) {
+            app->pending_processes++;
+        }
+
+        nxt_thread_mutex_unlock(&app->mutex);
+
+        nxt_port_socket_write(task, port, NXT_PORT_MSG_QUIT, -1, 0, 0, NULL);
+
+        if (start_process) {
+            nxt_router_start_app_process(task, app);
+        }
+
+        return;
+    }
+
+    port->app = app;
+    port->main_app_port = port;
+
+    app->processes++;
+    nxt_port_hash_add(&app->port_hash, port);
+    app->port_hash_count++;
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    nxt_debug(task, "app '%V' new port ready, pid %PI, %d/%d",
+              &app->name, port->pid, app->processes, app->pending_processes);
+
+    nxt_port_socket_write(task, port, NXT_PORT_MSG_PORT_ACK, -1, 0, 0, NULL);
+
+    nxt_router_app_port_release(task, app, port, NXT_APR_NEW_PORT);
+}
+
+
+static void
+nxt_router_app_port_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data)
+{
+    uint32_t             n;
+    nxt_bool_t           reap, restarted, expired, unsent;
+    nxt_app_t            *app;
+    nxt_app_joint_t      *app_joint;
+    nxt_app_joint_rpc_t  *app_joint_rpc;
+
+    nxt_assert(data != NULL);
+
+    app_joint_rpc = data;
+    app_joint = app_joint_rpc->app_joint;
+
+    expired = 0;
+    unsent = 0;
+
+    if (app_joint_rpc->start_timer != NULL) {
+        /* Read before the cancel, which is what drops the deadline. */
+        expired = app_joint_rpc->start_timer->expired;
+
+        /* The two ways the destination never saw the whole message. */
+        unsent = app_joint_rpc->start_timer->recalled
+                 || app_joint_rpc->start_timer->dropped;
+
+        nxt_router_start_timer_cancel(task, app_joint_rpc->start_timer);
+
+        app_joint_rpc->start_timer = NULL;
+    }
+
+    nxt_assert(app_joint != NULL);
+
+    app = app_joint->app;
+
+    /*
+     * A start the deadline gave up on keeps its stream watched, and the
+     * reaper that watches it inherits this attempt's reference rather than
+     * taking one of its own -- so that the joint cannot be released between
+     * the two.
+     *
+     * Both shapes of start are reaped, because both leave a process behind.
+     * A worker start leaves the worker the prototype forked for it.  A
+     * prototype start leaves the prototype itself: main forks it before it
+     * can answer, and one that never reaches PROCESS_READY forks no worker,
+     * so exactly one process comes of the attempt whatever the size of the
+     * cohort parked on it.  The cohort stands for requests, not for
+     * processes; only the reaped slot stands for a process.
+     *
+     * A start the destination never saw whole is the exception -- recalled
+     * out of the send queue, or dropped by the port layer with part of it
+     * still unsent.  Nothing was forked for either, so there is nothing to
+     * reap and the slot goes back the ordinary way.  Accounting one of those
+     * would move a slot to unaccounted_processes that nothing can drain: no
+     * PROCESS_READY and no REMOVE_PID are coming for a process that was
+     * never created, which would make the bound a ratchet.
+     */
+
+    reap = (expired && !unsent && app != NULL);
+
+    if (!reap) {
+        nxt_router_app_joint_use(task, app_joint, -1);
+    }
+
+    if (nxt_slow_path(app == NULL)) {
+        nxt_debug(task, "start error for released app");
+
+        return;
+    }
+
+    if (app_joint_rpc->expired) {
+        /*
+         * Not a start attempt: the reaper armed by
+         * nxt_router_app_start_expired() for a process the router had no
+         * pid for.  Being here is the whole point -- the process is gone,
+         * and its unaccounted_processes slot goes with it.
+         */
+
+        nxt_router_app_unaccounted_release(task, app);
+
+        return;
+    }
+
+    /*
+     * Two ways in are not failures at all, and both are excluded rather
+     * than tolerated.
+     *
+     * A restart: nxt_router_app_restart_handler() bumps app->generation
+     * and sends QUIT to the prototype, and a worker that prototype had
+     * already forked for an in-flight start goes with it.  The REMOVE_PID
+     * for that worker still carries the start's stream -- the prototype
+     * set it when it forked (nxt_application.c) and nothing clears it for
+     * a process that never became ready -- so the router retypes it into
+     * an RPC error and it lands here, reporting a start the operator
+     * themselves cancelled.  The RPC peer is not what brings it here: that
+     * is the process the START_PROCESS was sent to, and this arrives for
+     * the worker.  Generation is how nxt_router_app_port_ready() tells the
+     * same two apart before it quietly QUITs a port that arrives for a
+     * superseded one.
+     *
+     * And a shutdown: nxt_port_close() runs nxt_port_rpc_close() over the
+     * router port, which turns every registration still on it into an
+     * RPC error, so a start that was merely still pending when Unit was
+     * asked to stop would report itself as a failure.  Nothing bumps the
+     * generation there, so it needs its own test -- engine->shutdown, the
+     * same flag this file already consults before deciding to start
+     * another process at all.
+     *
+     * Only the log line is conditional either way: the cleanup below has
+     * to run regardless, since the slots and the parked requests belong
+     * to an attempt that is over whatever ended it.
+     */
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    restarted = (app->generation != app_joint_rpc->generation);
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    /*
+     * Otherwise: logged, not nxt_debug()d.  This handler is armed for one
+     * start attempt and disarmed the moment the port arrives, so it
+     * cannot fire for an ordinary worker exit or an idle timeout: every
+     * remaining call means an application process that was asked for will
+     * never exist, and the requests parked on it are about to be answered
+     * 503.  At debug level that was invisible in a default configuration,
+     * which left "the application returns 503" with no corresponding line
+     * anywhere in the log.
+     *
+     * NXT_LOG_ERR rather than nxt_alert(), which the early-failure path
+     * in nxt_router_start_app_process_handler() uses.  That one can only
+     * be Unit's own fault; this one is usually the application's -- a
+     * module that fails to import, a worker that exits during startup --
+     * and Unit is working exactly as designed when it reports one.
+     * [error] is emitted at the default log level, which is the whole
+     * point of the change.  One exception: a write to a prototype that is
+     * already gone is logged at debug level there, not as an alert.
+     *
+     * A different sentence from that alert, deliberately, even though
+     * the two describe the same disappointment.  The test suite skips
+     * expected alerts by an unanchored regex over the log
+     * (Log.check_alerts()), so a test that skipped this [error] line by
+     * quoting "failed to start a process" would silently swallow the
+     * alert as well, in every test that ran alongside it.  The two are
+     * worth telling apart; the level alone is a thin thing to rely on.
+     *
+     * It cannot say *why*: this is usually a REMOVE_PID that
+     * nxt_router_remove_pid_handler() retyped, and its payload is the
+     * dead pid and nothing else.  The reason is in whatever the dead
+     * process logged before exiting; this line is what tells the operator
+     * there is something to go and look for.
+     */
+
+    if (nxt_slow_path(restarted || task->thread->engine->shutdown)) {
+        nxt_debug(task, "app '%V' start attempt cancelled", &app->name);
+
+    } else if (expired) {
+        /*
+         * A third way in that is not what the line above describes: the
+         * "limits": {"start_timeout"} deadline failed this RPC itself.  The
+         * process it was waiting for very probably does exist -- the router
+         * never learns its pid, so it cannot say -- it simply never called
+         * nxt_unit_init().  "produced no process" would be the wrong thing
+         * to send an operator looking through the logs, and the deadline has
+         * already said the right one, naming the application and the knob.
+         */
+
+        nxt_debug(task, "app '%V' start attempt bounded by \"start_timeout\"",
+                  &app->name);
+
+    } else {
+        nxt_log(task, NXT_LOG_ERR,
+                "app '%V' start attempt produced no process", &app->name);
+    }
+
+    if (app_joint_rpc->proto) {
+        /*
+         * The prototype this RPC was armed for will never arrive, and only
+         * nxt_router_app_port_ready() clears proto_port_requests.  Left set,
+         * it makes every later nxt_router_start_app_process_handler() call
+         * for this application take the "wait for prototype process" branch
+         * and park without sending anything -- so no further port_ready or
+         * port_error can ever fire to clear it.  Only replacing the
+         * nxt_app_t recovers, and a reload does that only when the
+         * application's own config text changes.  Clear it here, and take
+         * the whole parked cohort: the initiator's slot, plus one for each
+         * caller that joined the wait.  This mirrors port_ready(), which
+         * takes the same count and replays that many starts on success.
+         *
+         * Where those slots go is decided below.  All of them go back when
+         * the attempt forked nothing; when it did, one of them stays behind
+         * with the prototype, which is the process it forked.
+         */
+
+        nxt_thread_mutex_lock(&app->mutex);
+
+        n = app->proto_port_requests;
+        app->proto_port_requests = 0;
+
+        nxt_thread_mutex_unlock(&app->mutex);
+
+        /*
+         * The counter is incremented in the same branch that sets ->proto,
+         * so an armed prototype RPC always owns at least its own slot.
+         */
+        nxt_assert(n != 0);
+
+    } else {
+        n = 1;
+    }
+
+    if (reap) {
+        /*
+         * One process was forked for this attempt, and the reaper accounts
+         * for it.  The rest of a prototype start's cohort goes back the
+         * ordinary way: those slots were taken by requests that joined the
+         * wait, and no process was forked for any of them.
+         */
+
+        if (n > 1) {
+            nxt_router_app_start_failed(task, app, n - 1, 0);
+        }
+
+        nxt_router_app_start_expired(task, app, msg, app_joint,
+                                     app_joint_rpc->generation,
+                                     app_joint_rpc->proto);
+
+        return;
+    }
+
+    nxt_router_app_start_failed(task, app, n, 0);
+}
+
+
+/*
+ * A start attempt that will never yield a port: give back the "count"
+ * pending_processes slots it owns and, if the application is left with no way
+ * to answer at all, fail the requests waiting for an acknowledgement instead
+ * of letting them sit until they time out.
+ *
+ * "count" is 1 for an ordinary attempt, which owns only its initiator's slot.
+ * A failed prototype attempt owns the whole parked cohort: see
+ * nxt_router_app_port_error().  Zero is the caller that owns no slot at all
+ * and only wants the requests answered: nxt_router_app_port_get(), for a
+ * request that arrives when the application can neither serve it nor start
+ * anything to serve it.
+ *
+ * "unaccounted" moves the slots to app->unaccounted_processes instead of
+ * giving them back, for the one caller whose attempt very probably did leave
+ * an OS process behind: nxt_router_app_start_expired().
+ */
+
+static void
+nxt_router_app_start_failed(nxt_task_t *task, nxt_app_t *app, uint32_t count,
+    nxt_bool_t unaccounted)
+{
+    nxt_queue_link_t    *link;
+    nxt_http_request_t  *r;
+
+    link = NULL;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    nxt_assert(app->pending_processes >= count);
+
+    /*
+     * The accounting above guarantees this, but nxt_assert() is nothing in a
+     * release build and the two directions are not equally bad: releasing one
+     * slot too few merely leaks it, while releasing one too many wraps the
+     * counter to UINT32_MAX and makes nxt_router_app_can_start() false
+     * forever -- a worse wedge than the one this path exists to clear.
+     */
+    if (nxt_slow_path(count > app->pending_processes)) {
+        count = app->pending_processes;
+    }
+
+    app->pending_processes -= count;
+
+    if (unaccounted) {
+        app->unaccounted_processes += count;
+    }
+
+    if (app->processes == 0 && !nxt_queue_is_empty(&app->ack_waiting_req)) {
+        link = nxt_queue_first(&app->ack_waiting_req);
+
+        nxt_queue_remove(link);
+        link->next = NULL;
+    }
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    while (link != NULL) {
+        r = nxt_container_of(link, nxt_http_request_t, app_link);
+
+        nxt_event_engine_post(r->engine, &r->err_work);
+
+        link = NULL;
+
+        nxt_thread_mutex_lock(&app->mutex);
+
+        if (app->processes == 0 && app->pending_processes == 0
+            && !nxt_queue_is_empty(&app->ack_waiting_req))
+        {
+            link = nxt_queue_first(&app->ack_waiting_req);
+
+            nxt_queue_remove(link);
+            link->next = NULL;
+        }
+
+        nxt_thread_mutex_unlock(&app->mutex);
+    }
+}
+
+
+/*
+ * A start that "limits": {"start_timeout"} gave up on.
+ *
+ * The attempt is over -- its requests are answered here, through
+ * nxt_router_app_start_failed() -- but unlike every other way an attempt can
+ * end, this one very probably leaves a process running.  Something was forked
+ * (only a forked process can fail to announce itself), and the router has no
+ * pid for it, because a pid is exactly what PROCESS_READY carries.  Giving
+ * the pending_processes slot back would therefore mean the next request forks
+ * another one, with nothing counting either: "processes": {"max"} would bound
+ * only the processes that work.  The slot moves to unaccounted_processes
+ * instead, where nxt_router_app_can_start() still sees it.
+ *
+ * "proto" says what was forked, and only nxt_router_app_port_ready() cares:
+ * a worker start leaves the worker its prototype forked, a prototype start
+ * leaves the prototype main forked for it.  A stuck prototype forks no worker
+ * of its own, so either way the attempt leaves exactly one process, and one
+ * slot accounts for it.  That a stuck prototype spends worker slots is
+ * deliberate: while it is stuck the application has no way to run a worker
+ * anyway, and the alternative -- a counter of its own -- would let prototypes
+ * and workers each grow to "max".
+ *
+ * That is a bound, not a leak, because the stream stays watched.  The reply
+ * this start gave up on can still arrive, and both shapes of it retire the
+ * slot:
+ *
+ *   - the process announces itself late, missing only the deadline;
+ *     nxt_router_app_port_ready() retires the slot and adopts it -- a worker
+ *     into ->processes, a prototype into ->proto_port unless the application
+ *     has one by then -- so a merely slow application costs one 503 and
+ *     nothing else;
+ *
+ *   - the process dies and the router is told with the start's own stream
+ *     still attached: for a worker by the prototype that forked it and
+ *     reaps it, for a prototype by main, which clears process->stream only
+ *     for a process that reached READY (see nxt_port_remove_notify_others(),
+ *     and nxt_router_remove_pid_handler(), which retypes that REMOVE_PID
+ *     into an RPC error) -- and nxt_router_app_port_error() gives the slot
+ *     back.
+ *
+ * Neither is guaranteed: a process wedged forever is exactly the case this
+ * exists for, and it holds its slot for as long as it lives.  That is the
+ * intended trade.  A configuration reload that replaces the nxt_app_t is the
+ * other way back.
+ */
+
+static void
+nxt_router_app_start_expired(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_recv_msg_t *msg, nxt_app_joint_t *app_joint, uint32_t generation,
+    nxt_bool_t proto)
+{
+    uint32_t             stream;
+    nxt_app_joint_rpc_t  *reaper;
+
+    stream = msg->port_msg.stream;
+
+    nxt_router_app_start_failed(task, app, 1, 1);
+
+    /*
+     * Only from inside this stream's own handler is the key free to take
+     * again; see nxt_port_rpc_register_handler_at().
+     */
+
+    reaper = nxt_port_rpc_register_handler_at(task, msg->port,
+                                              nxt_router_app_port_ready,
+                                              nxt_router_app_port_error,
+                                              stream,
+                                              sizeof(nxt_app_joint_rpc_t));
+
+    if (nxt_slow_path(reaper == NULL)) {
+        /*
+         * The bound holds -- the slot is already counted -- but nothing will
+         * hand it back, so say so: from here only a reload recovers it.
+         */
+
+        nxt_alert(task, "app \"%V\" cannot watch the process its expired "
+                        "start left behind; that \"processes\" slot is held "
+                        "until the application is reconfigured", &app->name);
+
+        nxt_router_app_joint_use(task, app_joint, -1);
+
+        return;
+    }
+
+    /* The reaper inherits the failed attempt's app_joint reference. */
+
+    reaper->app_joint = app_joint;
+    reaper->generation = generation;
+    reaper->expired = 1;
+
+    /*
+     * Which kind of process the slot stands for: nxt_router_app_port_ready()
+     * branches on ->proto before anything else, and a late prototype must
+     * not be adopted as though it were a worker.
+     */
+
+    reaper->proto = proto;
+
+    nxt_debug(task, "app '%V' stream #%uD kept to account for the process an "
+                    "expired start left behind", &app->name, stream);
+}
+
+
+/*
+ * The process an expired start left behind is accounted for at last: it died
+ * and the router was told.  Only nxt_router_app_start_expired() puts a slot
+ * here, and only this and nxt_router_app_port_ready() take one back.
+ */
+
+static void
+nxt_router_app_unaccounted_release(nxt_task_t *task, nxt_app_t *app)
+{
+    nxt_thread_mutex_lock(&app->mutex);
+
+    /*
+     * One reaper owns exactly one slot, so this cannot underflow; the test
+     * is here because a wrapped counter would pin nxt_router_app_can_start()
+     * false for the application's lifetime, which is worse than leaking the
+     * slot it is meant to release.
+     */
+
+    if (nxt_fast_path(app->unaccounted_processes != 0)) {
+        app->unaccounted_processes--;
+    }
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    nxt_debug(task, "app '%V' unaccounted process is gone, %d left",
+              &app->name, app->unaccounted_processes);
+}
+
+
+nxt_inline nxt_port_t *
+nxt_router_app_get_port_for_quit(nxt_task_t *task, nxt_app_t *app)
+{
+    nxt_port_t  *port;
+
+    port = NULL;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    nxt_queue_each(port, &app->ports, nxt_port_t, app_link) {
+
+        /* Caller is responsible to decrease port use count. */
+        nxt_queue_chk_remove(&port->app_link);
+
+        if (nxt_queue_chk_remove(&port->idle_link)) {
+            app->idle_processes--;
+
+            nxt_debug(task, "app '%V' move port %PI:%d out of %s for quit",
+                      &app->name, port->pid, port->id,
+                      (port->idle_start ? "idle_ports" : "spare_ports"));
+        }
+
+        nxt_port_hash_remove(&app->port_hash, port);
+        app->port_hash_count--;
+
+        port->app = NULL;
+        app->processes--;
+
+        break;
+
+    } nxt_queue_loop;
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    return port;
+}
+
+
+static void
+nxt_router_app_use(nxt_task_t *task, nxt_app_t *app, int i)
+{
+    int  c;
+
+    c = nxt_atomic_fetch_add(&app->use_count, i);
+
+    if (i < 0 && c == -i) {
+
+        if (task->thread->engine != app->engine) {
+            nxt_event_engine_post(app->engine, &app->joint->free_app_work);
+
+        } else {
+            nxt_router_free_app(task, app->joint, NULL);
+        }
+    }
+}
+
+
+static void
+nxt_router_app_unlink(nxt_task_t *task, nxt_app_t *app)
+{
+    nxt_debug(task, "app '%V' %p unlink", &app->name, app);
+
+    nxt_queue_remove(&app->link);
+
+    nxt_router_app_use(task, app, -1);
+}
+
+
+/*
+ * Refill spare_ports from the tail of idle_ports when a port leaves
+ * spare_ports.  Called with app->mutex held.
+ */
+static void
+nxt_router_app_spare_rebalance(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_t *port)
+{
+    nxt_port_t        *idle_port;
+    nxt_queue_link_t  *idle_lnk;
+
+    /* Check port was in 'spare_ports' using idle_start field. */
+    if (port->idle_start == 0 && app->idle_processes >= app->spare_processes) {
+        /*
+         * If there is a vacant space in spare ports,
+         * move the last idle to spare_ports.
+         */
+        nxt_assert(!nxt_queue_is_empty(&app->idle_ports));
+
+        idle_lnk = nxt_queue_last(&app->idle_ports);
+        idle_port = nxt_queue_link_data(idle_lnk, nxt_port_t, idle_link);
+        nxt_queue_remove(idle_lnk);
+
+        nxt_queue_insert_tail(&app->spare_ports, idle_lnk);
+
+        idle_port->idle_start = 0;
+
+        nxt_debug(task, "app '%V' move port %PI:%d from idle_ports "
+                  "to spare_ports",
+                  &app->name, idle_port->pid, idle_port->id);
+    }
+}
+
+
+/*
+ * Take a port out of the idle economy.  Called with app->mutex held; answers
+ * whether the caller must start a replacement process once it has dropped the
+ * lock.  Does nothing to a port that is not in one of the idle queues.
+ *
+ * Two events reach this transition.  An acknowledgement, where a worker has
+ * taken a request the router was still holding for it, and the start of
+ * detached work, where a worker the router has already parked as idle says it
+ * is in fact still running.  The second is why this is a function rather than
+ * a block: setting ->detached without unwinding leaves a port that
+ * nxt_router_app_port_idle() will refuse to insert again and that
+ * nxt_router_adjust_idle_timer() will still reap, so the flag and the unwind
+ * have to happen in one critical section.
+ *
+ * "reason" is for the debug log only.
+ */
+
+static nxt_bool_t
+nxt_router_app_port_busy(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
+    const char *reason)
+{
+    nxt_bool_t  start_process;
+
+    start_process = 0;
+
+    if (!nxt_queue_chk_remove(&port->idle_link)) {
+        return 0;
+    }
+
+    app->idle_processes--;
+
+    nxt_debug(task, "app '%V' move port %PI:%d out of %s (%s)",
+              &app->name, port->pid, port->id,
+              (port->idle_start ? "idle_ports" : "spare_ports"), reason);
+
+    nxt_router_app_spare_rebalance(task, app, port);
+
+    if (nxt_router_app_can_start(app) && nxt_router_app_need_start(app)) {
+        app->pending_processes++;
+        start_process = 1;
+    }
+
+    return start_process;
+}
+
+
+/*
+ * Hand a port back to the idle economy, if it is really idle.  Called with
+ * app->mutex held; answers whether the caller must post app->adjust_idle_work
+ * once it has dropped the lock, which is how the reaper's timer gets armed.
+ *
+ * Extracted from nxt_router_app_port_release() because the end of detached
+ * work reaches the same transition from nxt_router_detached_handler(), and a
+ * second copy of a block that touches three queues and two counters is how
+ * they drift apart.
+ */
+
+static nxt_bool_t
+nxt_router_app_port_idle(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port)
+{
+    nxt_bool_t  adjust_idle_timer;
+
+    adjust_idle_timer = 0;
+
+    if (port->pair[1] != -1
+        && port->active_requests == 0
+        && port->active_websockets == 0
+        && port->detached == 0
+        && port->idle_link.next == NULL)
+    {
+        if (app->idle_processes == app->spare_processes
+            && app->adjust_idle_work.data == NULL)
+        {
+            adjust_idle_timer = 1;
+            app->adjust_idle_work.data = app;
+            app->adjust_idle_work.next = NULL;
+        }
+
+        if (app->idle_processes < app->spare_processes) {
+            nxt_queue_insert_tail(&app->spare_ports, &port->idle_link);
+
+            nxt_debug(task, "app '%V' move port %PI:%d to spare_ports",
+                      &app->name, port->pid, port->id);
+
+        } else {
+            nxt_queue_insert_tail(&app->idle_ports, &port->idle_link);
+
+            port->idle_start = task->thread->engine->timers.now;
+
+            nxt_debug(task, "app '%V' move port %PI:%d to idle_ports",
+                      &app->name, port->pid, port->id);
+        }
+
+        app->idle_processes++;
+    }
+
+    return adjust_idle_timer;
+}
+
+
+/*
+ * The router gave up on a request a worker is running.  The 503 is the
+ * client's answer, but the worker does not know that and keeps executing, so
+ * the port must not go back into the idle economy when the request's
+ * accounting is released a moment from now: the reaper would QUIT a worker
+ * in the middle of a request, and the port would count as free against
+ * "processes": {"max"} while it is not.
+ *
+ * Enter the state a detached worker already has -- see
+ * nxt_router_detached_apply() -- and settle it when the worker answers, when
+ * the port closes, or when the application's own FINISH edge says its work is
+ * over.  "app_port" is the port the acknowledgement moved the request to:
+ * the worker's, never the shared queue.  Called before the unlink that
+ * releases the request.
+ *
+ * The state lands on app_port->main_app_port.  That is the same object the
+ * acknowledgement and a release reach through the same field, while a
+ * detached edge finds it by pid (nxt_router_detached_apply()); a worker's
+ * ports share one main port, so both identities name it.
+ */
+
+static void
+nxt_router_app_abandon(nxt_task_t *task, nxt_app_t *app,
+    nxt_request_rpc_data_t *req_rpc_data, nxt_port_t *app_port)
+{
+    nxt_bool_t  changed, start_process;
+    nxt_port_t  *port;
+
+    port = app_port->main_app_port;
+
+    /*
+     * Both the detached state and the rpc_data's own pointer outlive this
+     * call, and the state is published to another thread: the port close
+     * path takes the same mutex and drops the state's reference when it
+     * settles.  So both application references and the port reference are
+     * taken before the state can be seen, the way
+     * nxt_router_detached_apply() takes its own before the mutex; a close
+     * that arrived in between would otherwise drop a reference this call has
+     * not taken yet.  The request still holds an application reference of
+     * its own here, so the increment cannot resurrect a freed one.
+     */
+    nxt_router_app_use(task, app, 2);
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    changed = 0;
+
+    if (port->detached == 0) {
+        port->detached = 1;
+        app->detached_processes++;
+        changed = 1;
+    }
+
+    port->detached_router++;
+
+    nxt_port_inc_use(port);
+
+    /*
+     * Defensive, and symmetric with the detached START edge: a port with a
+     * live request is not in an idle queue, so this normally finds nothing
+     * to unwind and starts nothing.  It is here so that the flag and the
+     * unwind share this critical section whichever way the port got here.
+     */
+    start_process = nxt_router_app_port_busy(task, app, port, "abandoned");
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    if (!changed) {
+        /*
+         * The application was detached already, so its own edge owns that
+         * reference; this call keeps only the rpc_data's.
+         */
+        nxt_router_app_use(task, app, -1);
+    }
+
+    /*
+     * Keep the registration.  nxt_router_response_ready_handler() is what
+     * drops the answer of a request nobody tracks any more, and that is also
+     * where the port is taken back; the unlink that follows would cancel the
+     * registration first and the answer would never reach it.
+     */
+    req_rpc_data->rpc_cancel = 0;
+
+    req_rpc_data->abandoned_app = app;
+    req_rpc_data->abandoned_port = port;
+
+    if (start_process) {
+        nxt_router_start_app_process(task, app);
+    }
+}
+
+
+/*
+ * A worker the router gave up on has answered, or is gone.  Its port rejoins
+ * the idle economy if the router's own mark is the only thing holding it out
+ * -- an application START edge clears that mark and its FINISH edge is what
+ * ends the state then -- and the references the abandonment took are dropped
+ * either way.
+ */
+
+static void
+nxt_router_app_abandoned_settle(nxt_task_t *task,
+    nxt_request_rpc_data_t *req_rpc_data)
+{
+    nxt_port_t  *port;
+    nxt_app_t   *app;
+    nxt_bool_t  adjust_idle_timer, ours;
+
+    port = req_rpc_data->abandoned_port;
+
+    if (port == NULL) {
+        return;
+    }
+
+    app = req_rpc_data->abandoned_app;
+
+    req_rpc_data->abandoned_port = NULL;
+    req_rpc_data->abandoned_app = NULL;
+
+    ours = 0;
+    adjust_idle_timer = 0;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    if (port->detached_router != 0) {
+        port->detached_router--;
+
+        /*
+         * The port is free only once no reason is left: this was the last
+         * request the router gave up on, and the application is not running
+         * detached work of its own either.
+         */
+        if (port->detached_router == 0 && port->detached_app == 0
+            && port->detached != 0)
+        {
+            port->detached = 0;
+
+            app->detached_processes--;
+
+            adjust_idle_timer = nxt_router_app_port_idle(task, app, port);
+
+            ours = 1;
+        }
+    }
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    if (adjust_idle_timer) {
+        nxt_router_app_use(task, app, 1);
+        nxt_event_engine_post(app->engine, &app->adjust_idle_work);
+    }
+
+    if (ours) {
+        nxt_router_app_use(task, app, -1);
+    }
+
+    nxt_router_app_use(task, app, -1);
+    nxt_port_use(task, port, -1);
+}
+
+
+static void
+nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
+    nxt_apr_action_t action)
+{
+    int         inc_use;
+    uint32_t    got_response, dec_requests, dec_websockets;
+    nxt_bool_t  adjust_idle_timer;
+    nxt_port_t  *main_app_port;
+
+    nxt_assert(port != NULL);
+
+    inc_use = 0;
+    got_response = 0;
+    dec_requests = 0;
+    dec_websockets = 0;
+
+    switch (action) {
+    case NXT_APR_NEW_PORT:
+        break;
+    case NXT_APR_REQUEST_FAILED:
+        dec_requests = 1;
+        inc_use = -1;
+        break;
+    case NXT_APR_GOT_RESPONSE:
+        got_response = 1;
+        inc_use = -1;
+        break;
+    case NXT_APR_UPGRADE:
+        got_response = 1;
+        break;
+    case NXT_APR_CLOSE:
+        inc_use = -1;
+        break;
+    case NXT_APR_WEBSOCKET_CLOSE:
+        dec_websockets = 1;
+        inc_use = -1;
+        break;
+    }
+
+    nxt_debug(task, "app '%V' release port %PI:%d: %d %d %d", &app->name,
+              port->pid, port->id,
+              (int) inc_use, (int) got_response, (int) dec_websockets);
+
+    /*
+     * A websocket is upgraded from a request a worker has answered, so the
+     * port it is released on is that worker's own port, never the shared one.
+     */
+    nxt_assert(dec_websockets == 0 || port->id != NXT_SHARED_PORT_ID);
+
+    if (port->id == NXT_SHARED_PORT_ID) {
+        nxt_thread_mutex_lock(&app->mutex);
+
+        app->active_requests -= got_response + dec_requests;
+
+        nxt_thread_mutex_unlock(&app->mutex);
+
+        goto adjust_use;
+    }
+
+    main_app_port = port->main_app_port;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    main_app_port->active_requests -= got_response + dec_requests;
+    main_app_port->active_websockets -= dec_websockets;
+    app->active_requests -= got_response + dec_requests;
+
+    if (main_app_port->pair[1] != -1 && main_app_port->app_link.next == NULL) {
+        nxt_queue_insert_tail(&app->ports, &main_app_port->app_link);
+
+        nxt_port_inc_use(main_app_port);
+    }
+
+    adjust_idle_timer = nxt_router_app_port_idle(task, app, main_app_port);
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    if (adjust_idle_timer) {
+        nxt_router_app_use(task, app, 1);
+        nxt_event_engine_post(app->engine, &app->adjust_idle_work);
+    }
+
+    /* ? */
+    if (main_app_port->pair[1] == -1) {
+        nxt_debug(task, "app '%V' %p port %p already closed (pid %PI dead?)",
+                  &app->name, app, main_app_port, main_app_port->pid);
+
+        goto adjust_use;
+    }
+
+    nxt_debug(task, "app '%V' %p requests queue is empty, keep the port",
+              &app->name, app);
+
+adjust_use:
+
+    nxt_port_use(task, port, inc_use);
+}
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_router_websocket_test.c. */
+
+void
+nxt_router_test_app_port_release(nxt_task_t *task, nxt_app_t *app,
+    nxt_port_t *port, nxt_apr_action_t action)
+{
+    nxt_router_app_port_release(task, app, port, action);
+}
+
+#endif
+
+
+void
+nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
+{
+    nxt_app_t   *app;
+    nxt_bool_t  unchain, start_process, detached;
+
+    app = port->app;
+
+    nxt_assert(app != NULL);
+
+    detached = 0;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    if (port == app->proto_port) {
+        app->proto_port = NULL;
+        port->app = NULL;
+
+        nxt_thread_mutex_unlock(&app->mutex);
+
+        nxt_debug(task, "app '%V' prototype pid %PI closed", &app->name,
+                  port->pid);
+
+        nxt_port_use(task, port, -1);
+
+        return;
+    }
+
+    nxt_port_hash_remove(&app->port_hash, port);
+    app->port_hash_count--;
+
+    if (port->id != 0) {
+        nxt_thread_mutex_unlock(&app->mutex);
+
+        nxt_debug(task, "app '%V' port (%PI, %d) closed", &app->name,
+                  port->pid, port->id);
+
+        return;
+    }
+
+    unchain = nxt_queue_chk_remove(&port->app_link);
+
+    if (nxt_queue_chk_remove(&port->idle_link)) {
+        app->idle_processes--;
+
+        nxt_debug(task, "app '%V' move port %PI:%d out of %s before close",
+                  &app->name, port->pid, port->id,
+                  (port->idle_start ? "idle_ports" : "spare_ports"));
+
+        nxt_router_app_spare_rebalance(task, app, port);
+    }
+
+    app->processes--;
+
+    /*
+     * A worker can die in the middle of its detached work -- a fatal error
+     * after the response went out, or a kill.  This is the only path that
+     * runs for it then, so the count has to be settled here or the
+     * application never reaches the zero nxt_router_free_app() asserts on.
+     * The process is gone, so every unit of work it was running goes with
+     * it, however many the counts hold.  The matching application
+     * reference, the one the first reason took, is dropped below, outside
+     * the lock.
+     */
+
+    detached = port->detached;
+
+    if (detached) {
+        port->detached = 0;
+        port->detached_app = 0;
+        port->detached_router = 0;
+        app->detached_processes--;
+    }
+
+    start_process = !task->thread->engine->shutdown
+                    && nxt_router_app_can_start(app)
+                    && nxt_router_app_need_start(app);
+
+    if (start_process) {
+        app->pending_processes++;
+    }
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    nxt_debug(task, "app '%V' pid %PI closed", &app->name, port->pid);
+
+    if (unchain) {
+        nxt_port_use(task, port, -1);
+    }
+
+    if (start_process) {
+        nxt_router_start_app_process(task, app);
+    }
+
+    /*
+     * Keep the detached reference until the replacement start has taken its
+     * own.  After configuration removal this can be the last reference, so
+     * dropping it earlier frees app before nxt_router_start_app_process().
+     */
+
+    if (detached) {
+        nxt_router_app_use(task, app, -1);
+    }
+}
+
+
+static void
+nxt_router_adjust_idle_timer(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_app_t           *app;
+    nxt_bool_t          queued;
+    nxt_port_t          *port;
+    nxt_msec_t          timeout, threshold;
+    nxt_queue_link_t    *lnk;
+    nxt_event_engine_t  *engine;
+
+    app = obj;
+    queued = (data == app);
+
+    nxt_debug(task, "nxt_router_adjust_idle_timer: app \"%V\", queued %b",
+              &app->name, queued);
+
+    engine = task->thread->engine;
+
+    nxt_assert(app->engine == engine);
+
+    threshold = engine->timers.now + app->joint->idle_timer.bias;
+    timeout = 0;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    if (queued) {
+        app->adjust_idle_work.data = NULL;
+    }
+
+    nxt_debug(task, "app '%V' idle_processes %d, spare_processes %d",
+              &app->name,
+              (int) app->idle_processes, (int) app->spare_processes);
+
+    while (app->idle_processes > app->spare_processes) {
+
+        nxt_assert(!nxt_queue_is_empty(&app->idle_ports));
+
+        lnk = nxt_queue_first(&app->idle_ports);
+        port = nxt_queue_link_data(lnk, nxt_port_t, idle_link);
+
+        /*
+         * A worker running detached work must never be reachable from here:
+         * this loop clears ->app, which stops nxt_port_close() from ever
+         * running nxt_router_app_port_close() for the port, and the count
+         * and the application reference would then never be settled.
+         * nxt_router_app_port_idle() refuses to insert such a port and
+         * nxt_router_app_port_busy() takes one that is already here back
+         * out, both under this same mutex.
+         */
+
+        nxt_assert(port->detached == 0);
+
+        if (nxt_slow_path(port->detached != 0)) {
+            /*
+             * A release build.  A bare continue selects the same link again
+             * and spins with app->mutex held.  Take the port out of the idle
+             * queue only: the worker is alive, so it keeps ->app, stays in
+             * app->processes and gets no QUIT.  nxt_router_app_port_idle()
+             * inserts it again when the detached work ends.
+             */
+
+            nxt_queue_remove(lnk);
+            lnk->next = NULL;
+            app->idle_processes--;
+            continue;
+        }
+
+        timeout = port->idle_start + app->idle_timeout;
+
+        nxt_debug(task, "app '%V' pid %PI, start %M, timeout %M, threshold %M",
+                  &app->name, port->pid,
+                  port->idle_start, timeout, threshold);
+
+        if (timeout > threshold) {
+            break;
+        }
+
+        nxt_queue_remove(lnk);
+        lnk->next = NULL;
+
+        nxt_debug(task, "app '%V' move port %PI:%d out of idle_ports (timeout)",
+                  &app->name, port->pid, port->id);
+
+        nxt_queue_chk_remove(&port->app_link);
+
+        nxt_port_hash_remove(&app->port_hash, port);
+        app->port_hash_count--;
+
+        app->idle_processes--;
+        app->processes--;
+        port->app = NULL;
+
+        nxt_thread_mutex_unlock(&app->mutex);
+
+        nxt_debug(task, "app '%V' send QUIT to idle port %PI",
+                  &app->name, port->pid);
+
+        nxt_port_socket_write(task, port, NXT_PORT_MSG_QUIT, -1, 0, 0, NULL);
+
+        nxt_port_use(task, port, -1);
+
+        nxt_thread_mutex_lock(&app->mutex);
+    }
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    if (timeout > threshold) {
+        nxt_timer_add(engine, &app->joint->idle_timer, timeout - threshold);
+
+    } else {
+        nxt_timer_disable(engine, &app->joint->idle_timer);
+    }
+
+    if (queued) {
+        nxt_router_app_use(task, app, -1);
+    }
+}
+
+
+static void
+nxt_router_app_idle_timeout(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_timer_t      *timer;
+    nxt_app_joint_t  *app_joint;
+
+    timer = obj;
+    app_joint = nxt_container_of(timer, nxt_app_joint_t, idle_timer);
+
+    if (nxt_fast_path(app_joint->app != NULL)) {
+        nxt_router_adjust_idle_timer(task, app_joint->app, NULL);
+    }
+}
+
+
+static void
+nxt_router_app_joint_release_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_timer_t      *timer;
+    nxt_app_joint_t  *app_joint;
+
+    timer = obj;
+    app_joint = nxt_container_of(timer, nxt_app_joint_t, idle_timer);
+
+    nxt_router_app_joint_use(task, app_joint, -1);
+}
+
+
+static void
+nxt_router_free_app(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_app_t        *app;
+    nxt_port_t       *port, *proto_port;
+    nxt_app_joint_t  *app_joint;
+
+    app_joint = obj;
+    app = app_joint->app;
+
+    for ( ;; ) {
+        port = nxt_router_app_get_port_for_quit(task, app);
+        if (port == NULL) {
+            break;
+        }
+
+        nxt_port_use(task, port, -1);
+    }
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    for ( ;; ) {
+        port = nxt_port_hash_retrieve(&app->port_hash);
+        if (port == NULL) {
+            break;
+        }
+
+        app->port_hash_count--;
+
+        port->app = NULL;
+
+        nxt_port_close(task, port);
+
+        nxt_port_use(task, port, -1);
+    }
+
+    proto_port = app->proto_port;
+
+    if (proto_port != NULL) {
+        nxt_debug(task, "send QUIT to prototype '%V' pid %PI", &app->name,
+                  proto_port->pid);
+
+        app->proto_port = NULL;
+        proto_port->app = NULL;
+    }
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    if (proto_port != NULL) {
+        nxt_port_socket_write(task, proto_port, NXT_PORT_MSG_QUIT,
+                              -1, 0, 0, NULL);
+
+        nxt_port_close(task, proto_port);
+
+        nxt_port_use(task, proto_port, -1);
+    }
+
+    nxt_assert(app->proto_port == NULL);
+    nxt_assert(app->processes == 0);
+    nxt_assert(app->detached_processes == 0);
+    nxt_assert(app->active_requests == 0);
+    nxt_assert(app->port_hash_count == 0);
+    nxt_assert(app->idle_processes == 0);
+    nxt_assert(nxt_queue_is_empty(&app->ports));
+    nxt_assert(nxt_queue_is_empty(&app->spare_ports));
+    nxt_assert(nxt_queue_is_empty(&app->idle_ports));
+
+    nxt_port_mmaps_destroy(&app->outgoing, 1);
+
+    nxt_thread_mutex_destroy(&app->outgoing.mutex);
+
+    if (app->shared_port != NULL) {
+        app->shared_port->app = NULL;
+        nxt_port_close(task, app->shared_port);
+        nxt_port_use(task, app->shared_port, -1);
+
+        app->shared_port = NULL;
+    }
+
+    nxt_thread_mutex_destroy(&app->mutex);
+    nxt_mp_destroy(app->mem_pool);
+
+    app_joint->app = NULL;
+
+    if (nxt_timer_delete(task->thread->engine, &app_joint->idle_timer)) {
+        app_joint->idle_timer.handler = nxt_router_app_joint_release_handler;
+        nxt_timer_add(task->thread->engine, &app_joint->idle_timer, 0);
+
+    } else {
+        nxt_router_app_joint_use(task, app_joint, -1);
+    }
+}
+
+
+static void
+nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
+    nxt_request_rpc_data_t *req_rpc_data)
+{
+    nxt_bool_t          start_process, unanswerable;
+    nxt_port_t          *port;
+    nxt_http_request_t  *r;
+
+    start_process = 0;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    port = app->shared_port;
+    nxt_port_inc_use(port);
+
+    app->active_requests++;
+
+    if (nxt_router_app_can_start(app) && nxt_router_app_need_start(app)) {
+        app->pending_processes++;
+        start_process = 1;
+    }
+
+    /*
+     * Nothing is running, nothing is starting, and nothing may be started:
+     * every "processes" slot is held by a process an expired start left
+     * behind (nxt_router_app_start_expired()).  Only a start can take a
+     * request back out of ack_waiting_req, so parking this one would leave
+     * it there until it timed out.  Answer it below instead, at once.
+     *
+     * Reachable only through unaccounted_processes: with no process and
+     * none pending, nxt_router_app_can_start() is otherwise false only for
+     * "processes": {"max": 0}, which the configuration rejects.
+     */
+
+    unanswerable = (start_process == 0 && app->processes == 0
+                    && app->pending_processes == 0);
+
+    r = req_rpc_data->request;
+
+    /*
+     * Put request into application-wide list to be able to cancel request
+     * if something goes wrong with application processes.
+     */
+    nxt_queue_insert_tail(&app->ack_waiting_req, &r->app_link);
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    /*
+     * Retain request memory pool while request is linked in ack_waiting_req
+     * to guarantee request structure memory is accessble.
+     */
+    nxt_mp_retain(r->mem_pool);
+
+    req_rpc_data->app_port = port;
+    req_rpc_data->apr_action = NXT_APR_REQUEST_FAILED;
+
+    /*
+     * Bound the wait for a process.  Until a worker acknowledges the request
+     * the two dispatch paths that arm this timer have not run, so a request
+     * parked in ack_waiting_req has no deadline of its own: it waits for a
+     * worker that may never ask for it.  With detached work that wait is as
+     * long as the application chooses to run, which is what makes the
+     * deadline worth having -- "limits": {"timeout"} now bounds waiting for
+     * capacity, not only the time a worker spends on the request.
+     *
+     * The handler is the one those paths use, and it is shared with the
+     * post-acknowledgement deadline, where 503 is simply the right answer.
+     * Here it is right only if the request is still in the queue, so the
+     * handler retracts it first and tells the two deadlines apart by the
+     * answer; see nxt_router_app_timeout().
+     *
+     * An acknowledgement re-arms the same timer with the same handler, which
+     * nxt_timer_add() treats as a change, not a second timer.
+     */
+
+    if (app->timeout != 0) {
+        r->timer.handler = nxt_router_app_timeout;
+        r->timer_data = req_rpc_data;
+
+        nxt_timer_add(task->thread->engine, &r->timer, app->timeout);
+    }
+
+    if (start_process) {
+        nxt_router_start_app_process(task, app);
+
+    } else if (nxt_slow_path(unanswerable)) {
+        nxt_debug(task, "app '%V' has no process and may not start one",
+                  &app->name);
+
+        /* No slot of its own to give back: only the requests are wanted. */
+
+        nxt_router_app_start_failed(task, app, 0, 0);
+    }
+}
+
+
+void
+nxt_router_process_http_request(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_http_action_t *action)
+{
+    nxt_event_engine_t      *engine;
+    nxt_http_app_conf_t     *conf;
+    nxt_request_rpc_data_t  *req_rpc_data;
+
+    conf = action->u.conf;
+    engine = task->thread->engine;
+
+    r->app_target = conf->target;
+
+    req_rpc_data = nxt_port_rpc_register_handler_ex(task, engine->port,
+                                          nxt_router_response_ready_handler,
+                                          nxt_router_response_error_handler,
+                                          sizeof(nxt_request_rpc_data_t));
+    if (nxt_slow_path(req_rpc_data == NULL)) {
+        nxt_http_request_error(task, r, NXT_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    /*
+     * At this point we have request req_rpc_data allocated and registered
+     * in port handlers.  Need to fixup request memory pool.  Counterpart
+     * release will be called via following call chain:
+     *    nxt_request_rpc_data_unlink() ->
+     *        nxt_router_http_request_release_post() ->
+     *            nxt_router_http_request_release()
+     */
+    nxt_mp_retain(r->mem_pool);
+
+    r->timer.task = &engine->task;
+    r->timer.work_queue = &engine->fast_work_queue;
+    r->timer.log = engine->task.log;
+    r->timer.bias = NXT_TIMER_DEFAULT_BIAS;
+
+    r->engine = engine;
+    r->err_work.handler = nxt_router_http_request_error;
+    r->err_work.task = task;
+    r->err_work.obj = r;
+
+    req_rpc_data->stream = nxt_port_rpc_ex_stream(req_rpc_data);
+    req_rpc_data->app = conf->app;
+    req_rpc_data->msg_info.body_fd = -1;
+    req_rpc_data->rpc_cancel = 1;
+
+    nxt_router_app_use(task, conf->app, 1);
+
+    req_rpc_data->request = r;
+    r->req_rpc_data = req_rpc_data;
+
+    if (r->last != NULL) {
+        r->last->completion_handler = nxt_router_http_request_done;
+    }
+
+    nxt_router_app_port_get(task, conf->app, req_rpc_data);
+    nxt_router_app_prepare_request(task, req_rpc_data);
+}
+
+
+static void
+nxt_router_http_request_error(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_http_request_t  *r;
+
+    r = obj;
+
+    nxt_debug(task, "router http request error (rpc_data %p)", r->req_rpc_data);
+
+    nxt_http_request_error(task, r, NXT_HTTP_SERVICE_UNAVAILABLE);
+
+    if (r->req_rpc_data != NULL) {
+        nxt_request_rpc_data_unlink(task, r->req_rpc_data);
+    }
+
+    nxt_mp_release(r->mem_pool);
+}
+
+
+static void
+nxt_router_http_request_done(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_http_request_t  *r;
+
+    r = data;
+
+    nxt_debug(task, "router http request done (rpc_data %p)", r->req_rpc_data);
+
+    if (r->req_rpc_data != NULL) {
+        nxt_request_rpc_data_unlink(task, r->req_rpc_data);
+    }
+
+    nxt_http_request_close_handler(task, r, r->proto.any);
+}
+
+
+static void
+nxt_router_app_prepare_request(nxt_task_t *task,
+    nxt_request_rpc_data_t *req_rpc_data)
+{
+    nxt_app_t          *app;
+    nxt_buf_t          *buf, *body;
+    nxt_int_t          res;
+    nxt_port_t         *port, *reply_port;
+    nxt_http_status_t  status;
+
+    int                   notify;
+    struct {
+        nxt_port_msg_t       pm;
+        nxt_port_mmap_msg_t  mm;
+    } msg;
+
+
+    app = req_rpc_data->app;
+
+    nxt_assert(app != NULL);
+
+    port = req_rpc_data->app_port;
+
+    nxt_assert(port != NULL);
+    nxt_assert(port->queue != NULL);
+
+    reply_port = task->thread->engine->port;
+
+    buf = nxt_router_prepare_msg(task, req_rpc_data->request, app,
+                                 nxt_app_msg_prefix[app->type], &status);
+    if (nxt_slow_path(buf == NULL)) {
+        nxt_http_request_error(task, req_rpc_data->request, status);
+
+        return;
+    }
+
+    nxt_debug(task, "about to send %O bytes buffer to app process port %d",
+                    nxt_buf_used_size(buf),
+                    port->socket.fd);
+
+    req_rpc_data->msg_info.buf = buf;
+
+    body = req_rpc_data->request->body;
+
+    if (body != NULL && nxt_buf_is_file(body)) {
+        req_rpc_data->msg_info.body_fd = body->file->fd;
+
+        body->file->fd = -1;
+
+    } else {
+        req_rpc_data->msg_info.body_fd = -1;
+    }
+
+    msg.pm.stream = req_rpc_data->stream;
+    msg.pm.pid = reply_port->pid;
+    msg.pm.reply_port = reply_port->id;
+    msg.pm.type = NXT_PORT_MSG_REQ_HEADERS;
+    msg.pm.last = 0;
+    msg.pm.mmap = 1;
+    msg.pm.nf = 0;
+    msg.pm.mf = 0;
+
+    nxt_port_mmap_handler_t *mmap_handler = buf->parent;
+    nxt_port_mmap_header_t *hdr = mmap_handler->hdr;
+
+    msg.mm.mmap_id = hdr->id;
+    msg.mm.chunk_id = nxt_port_mmap_chunk_id(hdr, buf->mem.pos);
+    msg.mm.size = nxt_buf_used_size(buf);
+
+    res = nxt_app_queue_send(port->queue, &msg, sizeof(msg),
+                             req_rpc_data->stream, &notify,
+                             &req_rpc_data->msg_info.tracking_cookie);
+    if (nxt_fast_path(res == NXT_OK)) {
+        if (notify != 0) {
+            (void) nxt_port_socket_write(task, port,
+                                         NXT_PORT_MSG_READ_QUEUE,
+                                         -1, req_rpc_data->stream,
+                                         reply_port->id, NULL);
+
+        } else {
+            nxt_debug(task, "queue is not empty");
+        }
+
+        buf->is_port_mmap_sent = 1;
+        buf->mem.pos = buf->mem.free;
+
+    } else {
+        nxt_alert(task, "stream #%uD, app '%V': failed to send app message",
+                  req_rpc_data->stream, &app->name);
+
+        nxt_http_request_error(task, req_rpc_data->request,
+                               NXT_HTTP_INTERNAL_SERVER_ERROR);
+    }
+}
+
+
+
+
+
+/*
+ * Builds the nxt_unit_request_t for the application in shared memory.
+ *
+ * Every length that lands in a narrow field of the libunit protocol is
+ * checked before the buffer is allocated, and the request is refused rather
+ * than having the field truncated: a truncated length makes the application
+ * see a different string from the one that was copied (a 256-byte method
+ * arrived as an empty one), with the NUL terminator somewhere else.
+ *
+ *   - method_length is uint8_t, and the HTTP parser does not bound a method
+ *     (it is limited only by the header buffer): 501.
+ *   - a field's name_length is uint8_t.  nxt_http_parse_field_name() caps a
+ *     name at 255 bytes (NXT_HTTP_MAX_FIELD_NAME), which fits alone, but the
+ *     PHP/Perl/Ruby prefix "HTTP_" is added on top: names of 251..255 bytes
+ *     wrapped to 0..4.  431.
+ *   - version, the address and port texts are uint8_t as well but produced
+ *     by Unit itself; they are checked all the same, and fail with 500.
+ *   - the uint32_t lengths (server name, target, path, query, values) are
+ *     bounded by req_size <= PORT_MMAP_DATA_SIZE.
+ *
+ * On failure NULL is returned and *status says what to answer.
+ */
+
+static nxt_buf_t *
+nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_app_t *app, const nxt_str_t *prefix, nxt_http_status_t *status)
+{
+    void                *target_pos, *query_pos;
+    u_char              *pos, *end, *p, c;
+    size_t              fields_count, req_size, size, free_size;
+    size_t              copy_size;
+    nxt_off_t           content_length;
+    nxt_buf_t               *b, *buf, *out, **tail;
+    nxt_http_field_t        *field, *dup;
+    nxt_unit_field_t        *dst_field;
+    nxt_http_fields_iter_t  iter, dup_iter;
+    nxt_unit_request_t      *req;
+
+    *status = NXT_HTTP_INTERNAL_SERVER_ERROR;
+
+    if (nxt_slow_path(r->method->length > UINT8_MAX)) {
+        nxt_log(task, NXT_LOG_INFO, "app '%V': request method of %uz bytes "
+                "is too long for the application protocol", &app->name,
+                r->method->length);
+
+        *status = NXT_HTTP_NOT_IMPLEMENTED;
+        return NULL;
+    }
+
+    if (nxt_slow_path(r->version.length > UINT8_MAX
+                      || r->remote->address_length > UINT8_MAX
+                      || r->local->address_length > UINT8_MAX
+                      || nxt_sockaddr_port_length(r->local) > UINT8_MAX))
+    {
+        nxt_alert(task, "app '%V': request version or address too long for "
+                  "the application protocol", &app->name);
+
+        return NULL;
+    }
+
+    /* Every length is of data the request holds, so the sum cannot wrap. */
+
+    req_size = sizeof(nxt_unit_request_t)
+               + r->method->length + 1
+               + r->version.length + 1
+               + r->remote->address_length + 1
+               + r->local->address_length + 1
+               + nxt_sockaddr_port_length(r->local) + 1
+               + r->server_name.length + 1
+               + r->target.length + 1
+               + (r->path->start != r->target.start ? r->path->length + 1 : 0);
+
+    content_length = r->content_length_n < 0 ? 0 : r->content_length_n;
+    fields_count = 0;
+
+    nxt_http_fields_each(field, r->inline_fields, r->num_inline_fields,
+                         r->fields)
+    {
+        if (field->skip) {
+            continue;
+        }
+
+        fields_count++;
+
+        if (nxt_slow_path(field->name_length + prefix->length > UINT8_MAX)) {
+            nxt_log(task, NXT_LOG_INFO, "app '%V': header field name of %d "
+                    "bytes is too long for the application protocol with "
+                    "prefix \"%V\"", &app->name, (int) field->name_length,
+                    prefix);
+
+            *status = NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE;
+            return NULL;
+        }
+
+        req_size += field->name_length + prefix->length + 1
+                    + field->value_length + 1;
+    } nxt_http_fields_loop;
+
+    req_size += fields_count * sizeof(nxt_unit_field_t);
+
+    if (nxt_slow_path(req_size > PORT_MMAP_DATA_SIZE)) {
+        nxt_alert(task, "app '%V': headers too big to fit in shared memory "
+                  "(%uz)", &app->name, req_size);
+
+        return NULL;
+    }
+
+    out = nxt_port_mmap_get_buf(task, &app->outgoing,
+              nxt_min(req_size + content_length, PORT_MMAP_DATA_SIZE));
+    if (nxt_slow_path(out == NULL)) {
+        return NULL;
+    }
+
+    req = (nxt_unit_request_t *) out->mem.free;
+    out->mem.free += req_size;
+
+    req->app_target = r->app_target;
+
+    req->content_length = content_length;
+
+    p = (u_char *) (req->fields + fields_count);
+
+    nxt_debug(task, "fields_count=%d", (int) fields_count);
+
+    req->method_length = r->method->length;
+    nxt_unit_sptr_set(&req->method, p);
+    p = nxt_cpymem(p, r->method->start, r->method->length);
+    *p++ = '\0';
+
+    req->version_length = r->version.length;
+    nxt_unit_sptr_set(&req->version, p);
+    p = nxt_cpymem(p, r->version.start, r->version.length);
+    *p++ = '\0';
+
+    req->remote_length = r->remote->address_length;
+    nxt_unit_sptr_set(&req->remote, p);
+    p = nxt_cpymem(p, nxt_sockaddr_address(r->remote),
+                   r->remote->address_length);
+    *p++ = '\0';
+
+    req->local_addr_length = r->local->address_length;
+    nxt_unit_sptr_set(&req->local_addr, p);
+    p = nxt_cpymem(p, nxt_sockaddr_address(r->local), r->local->address_length);
+    *p++ = '\0';
+
+    req->local_port_length = nxt_sockaddr_port_length(r->local);
+    nxt_unit_sptr_set(&req->local_port, p);
+    p = nxt_cpymem(p, nxt_sockaddr_port(r->local),
+                   nxt_sockaddr_port_length(r->local));
+    *p++ = '\0';
+
+    req->tls = r->tls;
+    req->websocket_handshake = r->websocket_handshake;
+
+    req->server_name_length = r->server_name.length;
+    nxt_unit_sptr_set(&req->server_name, p);
+    p = nxt_cpymem(p, r->server_name.start, r->server_name.length);
+    *p++ = '\0';
+
+    target_pos = p;
+    req->target_length = (uint32_t) r->target.length;
+    nxt_unit_sptr_set(&req->target, p);
+    p = nxt_cpymem(p, r->target.start, r->target.length);
+    *p++ = '\0';
+
+    req->path_length = (uint32_t) r->path->length;
+    if (r->path->start == r->target.start) {
+        nxt_unit_sptr_set(&req->path, target_pos);
+
+    } else {
+        nxt_unit_sptr_set(&req->path, p);
+        p = nxt_cpymem(p, r->path->start, r->path->length);
+        *p++ = '\0';
+    }
+
+    req->query_length = (uint32_t) r->args->length;
+    if (r->args->start != NULL) {
+        query_pos = nxt_pointer_to(target_pos,
+                                   r->args->start - r->target.start);
+
+        nxt_unit_sptr_set(&req->query, query_pos);
+
+    } else {
+        req->query.offset = 0;
+    }
+
+    req->content_length_field = NXT_UNIT_NONE_FIELD;
+    req->content_type_field   = NXT_UNIT_NONE_FIELD;
+    req->cookie_field         = NXT_UNIT_NONE_FIELD;
+    req->authorization_field  = NXT_UNIT_NONE_FIELD;
+
+    dst_field = req->fields;
+
+    for (field = nxt_http_fields_first(&iter, r->inline_fields,
+                                       r->num_inline_fields, r->fields);
+         field != NULL;
+         field = nxt_http_fields_next(&iter))
+    {
+        if (field->skip) {
+            continue;
+        }
+
+        dst_field->hash = field->hash;
+        dst_field->skip = 0;
+        /* Checked to fit uint8_t when req_size was summed. */
+        dst_field->name_length = field->name_length + prefix->length;
+        dst_field->value_length = field->value_length;
+
+        if (field == r->content_length) {
+            req->content_length_field = dst_field - req->fields;
+
+        } else if (field == r->content_type) {
+            req->content_type_field = dst_field - req->fields;
+
+        } else if (field == r->cookie) {
+            req->cookie_field = dst_field - req->fields;
+
+        } else if (field == r->authorization) {
+            req->authorization_field = dst_field - req->fields;
+        }
+
+        nxt_debug(task, "add field 0x%04Xd, %d, %d, %p : %d %p",
+                  (int) field->hash, (int) field->skip,
+                  (int) field->name_length, field->name,
+                  (int) field->value_length, field->value);
+
+        if (prefix->length != 0) {
+            nxt_unit_sptr_set(&dst_field->name, p);
+            p = nxt_cpymem(p, prefix->start, prefix->length);
+
+            end = field->name + field->name_length;
+            for (pos = field->name; pos < end; pos++) {
+                c = *pos;
+
+                if (c >= 'a' && c <= 'z') {
+                    *p++ = (c & ~0x20);
+                    continue;
+                }
+
+                if (c == '-') {
+                    *p++ = '_';
+                    continue;
+                }
+
+                *p++ = c;
+            }
+
+        } else {
+            nxt_unit_sptr_set(&dst_field->name, p);
+            p = nxt_cpymem(p, field->name, field->name_length);
+        }
+
+        *p++ = '\0';
+
+        nxt_unit_sptr_set(&dst_field->value, p);
+        p = nxt_cpymem(p, field->value, field->value_length);
+
+        if (prefix->length != 0) {
+            dup_iter = iter;
+
+            for (dup = nxt_http_fields_next(&dup_iter);
+                 dup != NULL;
+                 dup = nxt_http_fields_next(&dup_iter))
+            {
+                if (dup->name_length != field->name_length
+                    || dup->skip
+                    || dup->hash != field->hash
+                    || nxt_memcasecmp(dup->name, field->name, dup->name_length))
+                {
+                    continue;
+                }
+
+                p = nxt_cpymem(p, ", ", 2);
+                p = nxt_cpymem(p, dup->value, dup->value_length);
+
+                dst_field->value_length += 2 + dup->value_length;
+
+                dup->skip = 1;
+            }
+        }
+
+        *p++ = '\0';
+
+        dst_field++;
+    }
+
+    req->fields_count = (uint32_t) (dst_field - req->fields);
+
+    nxt_unit_sptr_set(&req->preread_content, out->mem.free);
+
+    buf = out;
+    tail = &buf->next;
+
+    for (b = r->body; b != NULL; b = b->next) {
+        size = nxt_buf_mem_used_size(&b->mem);
+        pos = b->mem.pos;
+
+        while (size > 0) {
+            if (buf == NULL) {
+                free_size = nxt_min(size, PORT_MMAP_DATA_SIZE);
+
+                buf = nxt_port_mmap_get_buf(task, &app->outgoing, free_size);
+                if (nxt_slow_path(buf == NULL)) {
+                    while (out != NULL) {
+                        buf = out->next;
+                        out->next = NULL;
+                        out->completion_handler(task, out, out->parent);
+                        out = buf;
+                    }
+                    return NULL;
+                }
+
+                *tail = buf;
+                tail = &buf->next;
+
+            } else {
+                free_size = nxt_buf_mem_free_size(&buf->mem);
+                if (free_size < size
+                    && nxt_port_mmap_increase_buf(task, buf, size, 1)
+                       == NXT_OK)
+                {
+                    free_size = nxt_buf_mem_free_size(&buf->mem);
+                }
+            }
+
+            if (free_size > 0) {
+                copy_size = nxt_min(free_size, size);
+
+                buf->mem.free = nxt_cpymem(buf->mem.free, pos, copy_size);
+
+                size -= copy_size;
+                pos += copy_size;
+
+                if (size == 0) {
+                    break;
+                }
+            }
+
+            buf = NULL;
+        }
+    }
+
+    return out;
+}
+
+
+#if (NXT_TESTS)
+
+nxt_buf_t *
+nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_app_t *app, nxt_uint_t *status)
+{
+    nxt_buf_t          *b;
+    nxt_http_status_t  st;
+
+    b = nxt_router_prepare_msg(task, r, app, nxt_app_msg_prefix[app->type],
+                               &st);
+    *status = st;
+
+    return b;
+}
+
+#endif
+
+
+static void
+nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_timer_t              *timer;
+    nxt_msg_info_t           *msg_info;
+    nxt_http_request_t       *r;
+    nxt_request_rpc_data_t   *req_rpc_data;
+
+    timer = obj;
+
+    nxt_debug(task, "router app timeout");
+
+    r = nxt_timer_data(timer, nxt_http_request_t, timer);
+    req_rpc_data = r->timer_data;
+
+    msg_info = &req_rpc_data->msg_info;
+
+    /*
+     * Two deadlines share this handler.  After an acknowledgement a worker
+     * holds the request and 503 is the answer: it is too slow.  Before one
+     * the request is still in the shared port queue, and only the CAS in
+     * nxt_router_msg_retract() says whether it is still there.
+     *
+     * So retract before answering.  A retraction that loses means a worker
+     * took the request in that same instant: it is running, and a 503 here
+     * would both fail the request and run it -- twice, if the client
+     * retries.
+     *
+     * Leave a claimed request alone until its acknowledgement, and do not
+     * re-arm: the acknowledgement arms this timer again.  Do not answer it
+     * at a later expiry either.  The chain's tail is the request body that
+     * nxt_router_req_headers_ack_handler() still has to send, and libunit
+     * keeps the request until that body arrives.  An unlink here would drop
+     * the body and cancel the RPC, so a late acknowledgement is ignored and
+     * the request stays in the worker for ever.
+     *
+     * The acknowledgement replaces ->app_port with the worker's own port, so
+     * the shared port here means that it has not arrived yet.
+     */
+
+    if (msg_info->cancel == NXT_MSG_QUEUED) {
+        (void) nxt_router_msg_retract(task, req_rpc_data);
+    }
+
+    if (msg_info->cancel == NXT_MSG_CLAIMED
+        && req_rpc_data->app_port != NULL
+        && req_rpc_data->app_port->id == NXT_SHARED_PORT_ID)
+    {
+        nxt_debug(task, "stream #%uD: claimed, waiting for the ack",
+                  req_rpc_data->stream);
+
+        return;
+    }
+
+    /*
+     * The acknowledgement moves the request's port off the shared queue and
+     * onto the worker that took it; nxt_router_msg_retract() reads the same
+     * fact.  A request a worker is running is not the router's to release:
+     * its port has to stay out of the idle economy until the worker answers
+     * or closes.  See nxt_router_app_abandon().
+     *
+     * An upgraded stream is not such a request.  Its accounting was already
+     * given back by NXT_APR_UPGRADE, so no worker is running it and there is
+     * no slot to hold; what does keep the port out of the idle economy is the
+     * session count, and that one is settled by the unlink below, because the
+     * upgrade left NXT_APR_WEBSOCKET_CLOSE as the action.  The mark would
+     * instead report the worker "detached" for as long as the connection
+     * lives.  The websocket state is the upgrade itself -- it is assigned
+     * beside that release, and nowhere else -- so a handshake still in flight
+     * or one that failed, both of which do hold their accounting, still reach
+     * the abandon.
+     */
+    if (req_rpc_data->app_port != NULL
+        && req_rpc_data->app_port->id != NXT_SHARED_PORT_ID
+        && r->state != &nxt_http_websocket)
+    {
+        /* The request is still linked, so it holds the application. */
+        nxt_assert(req_rpc_data->app != NULL);
+
+        nxt_router_app_abandon(task, req_rpc_data->app, req_rpc_data,
+                               req_rpc_data->app_port);
+    }
+
+    nxt_http_request_error(task, r, NXT_HTTP_SERVICE_UNAVAILABLE);
+
+    nxt_request_rpc_data_unlink(task, req_rpc_data);
+}
+
+
+static void
+nxt_router_http_request_release_post(nxt_task_t *task, nxt_http_request_t *r)
+{
+    r->timer.handler = nxt_router_http_request_release;
+    nxt_timer_add(task->thread->engine, &r->timer, 0);
+}
+
+
+static void
+nxt_router_http_request_release(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_http_request_t  *r;
+
+    nxt_debug(task, "http request pool release");
+
+    r = nxt_timer_data(obj, nxt_http_request_t, timer);
+
+    nxt_mp_release(r->mem_pool);
+}
+
+
+/*
+ * An application says it answered a request and kept running, or that such
+ * work has finished.  PHP's fastcgi_finish_request() is the case this
+ * exists for: libunit reports the request done while the script runs on, so
+ * without this the router counts the worker idle, hands its slot back to
+ * "processes": {"max"}, and reaps a process that is still executing.
+ *
+ * Runs on the router's main thread, because the message arrives on the
+ * router's own port; see nxt_router_detached_handler().  The port is
+ * identified by pid alone: the accounting hangs off the application's main
+ * port, the one with id 0, and a worker has exactly one however many
+ * contexts it runs.  Looking it up rather than following ->main_app_port
+ * from the sender's port is also what keeps this off a stale pointer -- that
+ * field is never cleared, and the main port can be released while a sibling
+ * port of the same process is still registered.
+ *
+ * The application's edges are counted, not latched.  Several contexts of one
+ * worker can run detached work at once and the edge names none of them, so
+ * the port leaves the idle economy on the first start and rejoins it on the
+ * last finish, once the router has no abandoned request of its own left
+ * either.  app->detached_processes counts processes, so it moves on those two
+ * transitions only.  A finish with nothing to match -- a worker whose death
+ * has already settled the count, or a forged one -- changes nothing.
+ */
+
+static void
+nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid, uint8_t state)
+{
+    int                drop;
+    nxt_app_t          *app;
+    nxt_port_t         *port;
+    nxt_bool_t         changed, start_process, adjust_idle_timer;
+    const char         *alert;
+    nxt_runtime_t      *rt;
+    nxt_atomic_int_t   c;
+
+    rt = task->thread->runtime;
+
+    nxt_assert(task->thread->engine == rt->main_engine);
+
+    port = nxt_runtime_port_find(rt, pid, 0);
+
+    if (nxt_slow_path(port == NULL)) {
+        nxt_debug(task, "detached_handler: %PI has no main port", pid);
+        return;
+    }
+
+    app = port->app;
+
+    if (nxt_slow_path(app == NULL)) {
+        nxt_debug(task, "detached_handler: port %PI:%d has no application",
+                  pid, port->id);
+        return;
+    }
+
+    /*
+     * A reference, taken only if the application still has one.  The
+     * count reaching zero is what posts nxt_router_free_app() to this
+     * thread, and the last drop can happen on a worker engine while this
+     * edge is already on its way here: the request that held the
+     * application is released there, and a reconfiguration has already
+     * taken the configuration's reference.  A plain increment would
+     * resurrect an application whose free is queued behind this handler,
+     * and the start it may post below would then lock a mutex in freed
+     * memory.  Zero is treated exactly like no application at all; the
+     * free that is coming clears ->app and QUITs the worker.
+     */
+
+    for ( ;; ) {
+        c = app->use_count;
+
+        if (c == 0) {
+            nxt_debug(task, "detached_handler: app '%V' is being freed",
+                      &app->name);
+            return;
+        }
+
+        if (nxt_atomic_cmp_set(&app->use_count, c, c + 1)) {
+            break;
+        }
+    }
+
+    nxt_debug(task, "app '%V' port %PI:%d detached state %d",
+              &app->name, port->pid, port->id, (int) state);
+
+    alert = NULL;
+    changed = 0;
+    start_process = 0;
+    adjust_idle_timer = 0;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    if (state == NXT_PORT_DETACHED_START) {
+
+        /*
+         * A reason of the application's own, counted beside the router's
+         * count of requests it gave up on: neither may settle the other.
+         *
+         * Saturate rather than wrap.  The count is bounded by the contexts
+         * of one worker, so the maximum is out of reach for a sound sender;
+         * a wrap would read as "no detached work" and hand a running worker
+         * back to the reaper.
+         */
+
+        if (nxt_slow_path(port->detached_app == UINT32_MAX)) {
+            alert = "sent a detached start at the maximum count";
+
+        } else {
+            port->detached_app++;
+
+            if (port->detached == 0) {
+                port->detached = 1;
+                app->detached_processes++;
+                changed = 1;
+
+                /*
+                 * The worker may already have been parked as idle.  libunit
+                 * sends the start edge before the last response message, but
+                 * that only orders the two on the wire: the response is
+                 * answered by the engine that owns the request, this by the
+                 * main thread, and a request that was failed rather than
+                 * answered -- a "limits": {"timeout"} expiry, an error --
+                 * runs nxt_router_app_port_release() with no start edge in
+                 * sight at all, so the port can have been sitting in
+                 * idle_ports for as long as the application chose to keep
+                 * running.
+                 *
+                 * Unwind it here, exactly as an acknowledgement does.
+                 * Leaving it in place would be worse than not having this
+                 * message: the reaper would QUIT a worker that is still
+                 * executing -- the bug this exists to fix -- and would clear
+                 * ->app on the way, so nxt_router_app_port_close() would
+                 * never run and the count and the application reference
+                 * below would never be settled.
+                 */
+
+                start_process = nxt_router_app_port_busy(task, app, port,
+                                                         "detached");
+            }
+        }
+
+    } else if (nxt_slow_path(port->detached_app == 0)) {
+
+        /*
+         * An unmatched finish: a worker whose death has already settled the
+         * count, one otherwise out of step with the router, or a forged
+         * edge.  Leave the count at zero and touch neither
+         * app->detached_processes nor the reference.
+         */
+
+        alert = "sent an unmatched detached finish";
+
+    } else if (--port->detached_app == 0) {
+
+        /*
+         * The port leaves the detached state only when no reason is left:
+         * nothing here while a request the router gave up on is still
+         * running, and nothing for that request's answer while the
+         * application's own work is.
+         */
+        if (port->detached_router == 0 && port->detached != 0) {
+            port->detached = 0;
+            app->detached_processes--;
+            changed = 1;
+
+            /*
+             * Only now may this worker rejoin the idle economy.  Its last
+             * response went out long ago, so nothing else will run this
+             * transition for it.
+             */
+
+            adjust_idle_timer = nxt_router_app_port_idle(task, app, port);
+        }
+    }
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    /*
+     * The application can send a refused edge in a loop, so it is an alert
+     * once per port and debug output after that.
+     */
+
+    if (nxt_slow_path(alert != NULL)) {
+        if (port->detached_alerted == 0) {
+            port->detached_alerted = 1;
+            nxt_alert(task, "detached_handler: %PI %s", pid, alert);
+
+        } else {
+            nxt_debug(task, "detached_handler: %PI %s", pid, alert);
+        }
+    }
+
+    if (adjust_idle_timer) {
+        nxt_router_app_use(task, app, 1);
+        nxt_event_engine_post(app->engine, &app->adjust_idle_work);
+    }
+
+    /*
+     * Holding the reference taken above: this is the only caller that can
+     * reach nxt_router_start_app_process() with no reference of its own.
+     */
+
+    if (start_process) {
+        nxt_router_start_app_process(task, app);
+    }
+
+    /*
+     * A start edge that changed the state keeps the reference taken above:
+     * it is what keeps this worker's application alive for as long as the
+     * work runs.  A detached worker holds no request, and a request is what
+     * otherwise holds the application -- by the time the work starts
+     * nxt_request_rpc_data_unlink() has already dropped its reference, so a
+     * configuration reload could free the application out from under a
+     * process still executing.  The finish edge that changed the state
+     * returns it, and an edge that changed nothing returns only its own.
+     * One reference per process, then, not per counted edge: the inner
+     * starts and finishes take one and give it straight back, and a start
+     * that found the router's own mark already set leaves that reference to
+     * nxt_router_app_abandoned_settle().
+     */
+
+    drop = 1;
+
+    if (changed) {
+        drop = (state == NXT_PORT_DETACHED_START) ? 0 : 2;
+    }
+
+    if (drop != 0) {
+        nxt_router_app_use(task, app, -drop);
+    }
+}
+
+
+/*
+ * The edge arrives on the router's own port, whichever engine answered the
+ * request: libunit sends both edges to its router port, the way it sends
+ * OOSM.  That port is read on the main thread, which is where everything
+ * the edge touches lives -- rt->ports is read without a lock, which is only
+ * safe on the thread that adds to and removes from it, and an application
+ * is freed on app->engine, the same thread.  One socket per worker also
+ * keeps a finish edge behind the start edge that preceded it, which the
+ * ports of two engines could not: their reads race, and the flag would be
+ * cleared under the next request's work.
+ */
+
+static void
+nxt_router_detached_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    /*
+     * The pid in the message is chosen by the sender, and every worker holds
+     * a copy of this port.  Accept an edge only for the process that sent it,
+     * or a worker could pin another worker as detached or release one.  The
+     * router port has no shared memory queue, so the message always comes
+     * from the socket and carries the kernel's credentials.
+     */
+    if (nxt_slow_path(nxt_recv_msg_cmsg_pid(msg) != msg->port_msg.pid)) {
+        nxt_alert(task, "process %PI sent a detached edge for process %PI",
+                  nxt_recv_msg_cmsg_pid(msg), msg->port_msg.pid);
+        return;
+    }
+
+    if (nxt_slow_path(msg->buf == NULL
+                      || nxt_buf_used_size(msg->buf) < (int) sizeof(uint8_t)))
+    {
+        nxt_alert(task, "detached_handler: %PI sent no state byte",
+                  msg->port_msg.pid);
+        return;
+    }
+
+    if (*msg->buf->mem.pos != NXT_PORT_DETACHED_START
+        && *msg->buf->mem.pos != NXT_PORT_DETACHED_FINISH)
+    {
+        nxt_alert(task, "detached_handler: invalid state byte %d",
+                  (int) *msg->buf->mem.pos);
+        return;
+    }
+
+    nxt_router_detached_apply(task, msg->port_msg.pid, *msg->buf->mem.pos);
+}
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_router_detached_test.c. */
+
+void
+nxt_router_test_detached_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_router_detached_handler(task, msg);
+}
+
+#endif
+
+
+static void
+nxt_router_oosm_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    size_t                   mi;
+    uint32_t                 i;
+    nxt_bool_t               ack;
+    nxt_process_t            *process;
+    nxt_free_map_t           *m;
+    nxt_port_mmap_handler_t  *mmap_handler;
+
+    nxt_debug(task, "oosm in %PI", msg->port_msg.pid);
+
+    /*
+     * Referenced, not just found: .oosm is in both the router main and the
+     * router worker port handler tables, and the reference has to span the
+     * incoming.mutex critical section below.  Which engine actually receives
+     * a given OOSM depends on the port libunit sends it to, so this is not
+     * assumed either way -- what makes the reference necessary is that a
+     * worker engine can drop the last reference to the same process while
+     * this runs.
+     *
+     * It has to span the broadcast too, but note what that does and does not
+     * buy: it keeps the nxt_process_t allocated, and nothing more.  The ports
+     * nxt_process_broadcast_shm_ack() reaches through process->ports are
+     * refcounted separately and that queue is walked here without a lock, so
+     * this reference does not make the walk itself safe.
+     */
+
+    process = nxt_runtime_process_ref(task->thread->runtime,
+                                      msg->port_msg.pid);
+    if (nxt_slow_path(process == NULL)) {
+        return;
+    }
+
+    ack = 0;
+
+    /*
+     * To mitigate possible racing condition (when OOSM message received
+     * after some of the memory was already freed), need to try to find
+     * first free segment in shared memory and send ACK if found.
+     */
+
+    nxt_thread_mutex_lock(&process->incoming.mutex);
+
+    for (i = 0; i < process->incoming.size; i++) {
+        mmap_handler = process->incoming.elts[i].mmap_handler;
+
+        if (nxt_slow_path(mmap_handler == NULL)) {
+            continue;
+        }
+
+        m = mmap_handler->hdr->free_map;
+
+        for (mi = 0; mi < MAX_FREE_IDX; mi++) {
+            if (m[mi] != 0) {
+                ack = 1;
+
+                nxt_debug(task, "oosm: already free #%uD %uz = 0x%08xA",
+                          i, mi, m[mi]);
+
+                break;
+            }
+        }
+    }
+
+    nxt_thread_mutex_unlock(&process->incoming.mutex);
+
+    if (ack) {
+        nxt_process_broadcast_shm_ack(task, process);
+    }
+
+    /*
+     * The only release point: the process == NULL return above precedes the
+     * reference, and the loop breaks and continues but never returns.
+     */
+
+    nxt_process_use(task, process, -1);
+}
+
+
+static void
+nxt_router_get_mmap_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_fd_t                 fd;
+    nxt_port_t               *port;
+    nxt_runtime_t            *rt;
+    nxt_port_mmaps_t         *mmaps;
+    nxt_port_msg_get_mmap_t  *get_mmap_msg;
+    nxt_port_mmap_handler_t  *mmap_handler;
+
+    rt = task->thread->runtime;
+
+    port = nxt_runtime_port_find(rt, msg->port_msg.pid,
+                                 msg->port_msg.reply_port);
+    if (nxt_slow_path(port == NULL)) {
+        nxt_alert(task, "get_mmap_handler: reply_port %PI:%d not found",
+                  msg->port_msg.pid, msg->port_msg.reply_port);
+
+        return;
+    }
+
+    if (nxt_slow_path(nxt_buf_used_size(msg->buf)
+                      < (int) sizeof(nxt_port_msg_get_mmap_t)))
+    {
+        nxt_alert(task, "get_mmap_handler: message buffer too small (%d)",
+                  (int) nxt_buf_used_size(msg->buf));
+
+        return;
+    }
+
+    get_mmap_msg = (nxt_port_msg_get_mmap_t *) msg->buf->mem.pos;
+
+    /* nxt_router_get_mmap_check() refused a port of another type. */
+
+    if (nxt_slow_path(port->app == NULL)) {
+        nxt_alert(task, "get_mmap_handler: app == NULL for reply port %PI:%d",
+                  port->pid, port->id);
+
+        /* Best-effort RPC_ERROR; peer-side RPC timeout is the backstop. */
+        (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
+                                     -1, msg->port_msg.stream, 0, NULL);
+
+        return;
+    }
+
+    mmaps = &port->app->outgoing;
+    nxt_thread_mutex_lock(&mmaps->mutex);
+
+    if (nxt_slow_path(get_mmap_msg->id >= mmaps->size)) {
+        nxt_thread_mutex_unlock(&mmaps->mutex);
+
+        nxt_alert(task, "get_mmap_handler: mmap id is too big (%d)",
+                  (int) get_mmap_msg->id);
+
+        /* Best-effort RPC_ERROR; peer-side RPC timeout is the backstop. */
+        (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
+                                     -1, msg->port_msg.stream, 0, NULL);
+        return;
+    }
+
+    mmap_handler = mmaps->elts[get_mmap_msg->id].mmap_handler;
+
+    fd = mmap_handler->fd;
+
+    nxt_thread_mutex_unlock(&mmaps->mutex);
+
+    nxt_debug(task, "get mmap %PI:%d found",
+              msg->port_msg.pid, (int) get_mmap_msg->id);
+
+    (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_MMAP, fd, 0, 0, NULL);
+}
+
+
+static void
+nxt_router_get_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_port_t               *port, *reply_port;
+    nxt_runtime_t            *rt;
+    nxt_port_msg_get_port_t  *get_port_msg;
+
+    rt = task->thread->runtime;
+
+    reply_port = nxt_runtime_port_find(rt, msg->port_msg.pid,
+                                       msg->port_msg.reply_port);
+    if (nxt_slow_path(reply_port == NULL)) {
+        nxt_alert(task, "get_port_handler: reply_port %PI:%d not found",
+                  msg->port_msg.pid, msg->port_msg.reply_port);
+
+        return;
+    }
+
+    if (nxt_slow_path(nxt_buf_used_size(msg->buf)
+                      < (int) sizeof(nxt_port_msg_get_port_t)))
+    {
+        nxt_alert(task, "get_port_handler: message buffer too small (%d)",
+                  (int) nxt_buf_used_size(msg->buf));
+
+        return;
+    }
+
+    get_port_msg = (nxt_port_msg_get_port_t *) msg->buf->mem.pos;
+
+    port = nxt_runtime_port_find(rt, get_port_msg->pid, get_port_msg->id);
+    if (nxt_slow_path(port == NULL)) {
+        nxt_alert(task, "get_port_handler: port %PI:%d not found",
+                  get_port_msg->pid, get_port_msg->id);
+
+        return;
+    }
+
+    nxt_debug(task, "get port %PI:%d found", get_port_msg->pid,
+              get_port_msg->id);
+
+    (void) nxt_port_send_port(task, reply_port, port, msg->port_msg.stream);
+}

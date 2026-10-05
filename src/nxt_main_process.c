@@ -1,0 +1,3233 @@
+
+/*
+ * Copyright (C) Igor Sysoev
+ * Copyright (C) NGINX, Inc.
+ */
+
+#include <nxt_main.h>
+#include <nxt_runtime.h>
+#include <nxt_port.h>
+#include <nxt_main_process.h>
+#include <nxt_conf.h>
+#include <nxt_router.h>
+#include <nxt_port_queue.h>
+#include <nxt_checked.h>
+#if (NXT_TLS)
+#include <nxt_cert.h>
+#endif
+#if (NXT_HAVE_NJS)
+#include <nxt_script.h>
+#endif
+
+#include <sys/mount.h>
+#include <dirent.h>
+
+
+typedef struct {
+    nxt_socket_t        socket;
+    nxt_socket_error_t  error;
+    u_char              *start;
+    u_char              *end;
+} nxt_listening_socket_t;
+
+
+typedef struct {
+    nxt_uint_t          size;
+    nxt_conf_map_t      *map;
+} nxt_conf_app_map_t;
+
+
+/* The state store runs in a short-lived child of main, one at a time. */
+typedef struct {
+    nxt_pid_t             pid;        /* The running store child, or 0. */
+    nxt_bool_t            version;    /* It also stores the version file. */
+    nxt_bool_t            killed;     /* Main sent it SIGKILL. */
+    nxt_main_store_job_t  *job;       /* Its job, or NULL for conf.json. */
+    u_char                *pending;   /* The next conf.json store, or NULL. */
+    size_t                pending_size;
+    nxt_uint_t            ahead;      /* Queued jobs older than "pending". */
+    nxt_main_store_job_t  *jobs;      /* The jobs that wait, in order. */
+    nxt_bool_t            controller; /* Start it when the store ends. */
+} nxt_main_store_t;
+
+
+static nxt_int_t nxt_main_process_port_create(nxt_task_t *task,
+    nxt_runtime_t *rt);
+static void nxt_main_process_title(nxt_task_t *task);
+static void nxt_main_process_sigterm_handler(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_main_process_sigquit_handler(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_main_process_sigusr1_handler(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_main_process_sigchld_handler(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_main_process_signal_handler(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_main_process_cleanup(nxt_task_t *task, nxt_process_t *process);
+static void nxt_main_port_socket_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_main_port_socket_unlink_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static nxt_int_t nxt_main_listening_socket(nxt_sockaddr_t *sa,
+    nxt_listening_socket_t *ls);
+static void nxt_main_port_modules_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static int nxt_cdecl nxt_app_lang_compare(const void *v1, const void *v2);
+static void nxt_main_process_whoami_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+#if (NXT_USE_CMSG_PID)
+static void nxt_main_process_name_child(nxt_task_t *task,
+    nxt_process_t *pprocess, nxt_process_t *process, nxt_pid_t ns_pid);
+static void nxt_main_remove_child_pid_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+#endif
+static void nxt_main_port_conf_store_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_main_store_schedule(nxt_task_t *task, u_char *p,
+    size_t size);
+static void nxt_main_store_next(nxt_task_t *task);
+static nxt_pid_t nxt_main_store_fork(nxt_task_t *task);
+static void nxt_main_store_start(nxt_task_t *task, u_char *p, size_t size);
+static void nxt_main_store_start_job(nxt_task_t *task,
+    nxt_main_store_job_t *job);
+static nxt_int_t nxt_main_store_job_run(nxt_task_t *task,
+    nxt_main_store_job_t *job);
+static void nxt_main_store_job_done(nxt_task_t *task,
+    nxt_main_store_job_t *job, nxt_int_t ret);
+static void nxt_main_store_close_fds(void);
+#if (NXT_LINUX)
+static nxt_int_t nxt_main_store_close_proc_fds(void);
+#endif
+static nxt_int_t nxt_main_store_files(nxt_task_t *task, u_char *p,
+    size_t size, nxt_bool_t version);
+static void nxt_main_start_exit(nxt_task_t *task);
+static void nxt_main_store_cancel(nxt_task_t *task);
+static nxt_bool_t nxt_main_store_cancelled(nxt_pid_t pid, int status);
+static nxt_bool_t nxt_main_store_exited(nxt_task_t *task, nxt_pid_t pid,
+    int status);
+static nxt_int_t nxt_main_file_store_inherit(nxt_task_t *task,
+    nxt_file_t *tmp, const char *name);
+static void nxt_main_port_access_log_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+
+#if (NXT_TESTS)
+static nxt_uint_t  nxt_main_test_process_new_failure_count;
+static nxt_msec_t  nxt_main_test_store_delay;
+
+
+void
+nxt_main_test_process_new_failures(nxt_uint_t failures)
+{
+    nxt_main_test_process_new_failure_count = failures;
+}
+
+
+/*
+ * nxt_process_new() with an allocation-failure hook in front of it, in the
+ * shape of nxt_port_test_msg_alloc_failures() (src/nxt_port_socket.c): the
+ * count is decremented per call, so one armed failure fires once and the
+ * handler then behaves exactly as it does when the process record cannot
+ * be allocated.  The wrapper stands in front of the call rather than in
+ * place of the branch that follows it, so the code the test reaches stays
+ * the handler's own -- however this file happens to spell its response to
+ * a NULL process.
+ */
+nxt_inline nxt_process_t *
+nxt_main_process_new(nxt_runtime_t *rt)
+{
+    if (nxt_slow_path(nxt_main_test_process_new_failure_count != 0)) {
+        nxt_main_test_process_new_failure_count--;
+        return NULL;
+    }
+
+    return nxt_process_new(rt);
+}
+
+#else
+#define nxt_main_process_new(rt)  nxt_process_new(rt)
+#endif
+
+const nxt_sig_event_t  nxt_main_process_signals[] = {
+    nxt_event_signal(SIGHUP,  nxt_main_process_signal_handler),
+    nxt_event_signal(SIGINT,  nxt_main_process_sigterm_handler),
+    nxt_event_signal(SIGQUIT, nxt_main_process_sigquit_handler),
+    nxt_event_signal(SIGTERM, nxt_main_process_sigterm_handler),
+    nxt_event_signal(SIGCHLD, nxt_main_process_sigchld_handler),
+    nxt_event_signal(SIGUSR1, nxt_main_process_sigusr1_handler),
+    nxt_event_signal_end,
+};
+
+
+nxt_uint_t  nxt_conf_ver;
+
+static nxt_bool_t  nxt_exiting;
+
+static nxt_main_store_t  nxt_main_store;
+
+
+nxt_int_t
+nxt_main_process_start(nxt_thread_t *thr, nxt_task_t *task,
+    nxt_runtime_t *rt)
+{
+    rt->type = NXT_PROCESS_MAIN;
+
+    if (nxt_main_process_port_create(task, rt) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    nxt_main_process_title(task);
+
+    /*
+     * The discovery process will send a message processed by
+     * nxt_main_port_modules_handler() which starts the controller
+     * and router processes.
+     */
+    return nxt_process_init_start(task, nxt_discovery_process);
+}
+
+
+static nxt_conf_map_t  nxt_common_app_conf[] = {
+    {
+        nxt_string("type"),
+        NXT_CONF_MAP_STR,
+        offsetof(nxt_common_app_conf_t, type),
+    },
+
+    {
+        nxt_string("user"),
+        NXT_CONF_MAP_STR,
+        offsetof(nxt_common_app_conf_t, user),
+    },
+
+    {
+        nxt_string("group"),
+        NXT_CONF_MAP_STR,
+        offsetof(nxt_common_app_conf_t, group),
+    },
+
+    {
+        nxt_string("stdout"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_common_app_conf_t, stdout_log),
+    },
+
+    {
+        nxt_string("stderr"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_common_app_conf_t, stderr_log),
+    },
+
+    {
+        nxt_string("working_directory"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_common_app_conf_t, working_directory),
+    },
+
+    {
+        nxt_string("environment"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_common_app_conf_t, environment),
+    },
+
+    {
+        nxt_string("isolation"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_common_app_conf_t, isolation),
+    },
+
+    {
+        nxt_string("limits"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_common_app_conf_t, limits),
+    },
+
+};
+
+
+static nxt_conf_map_t  nxt_common_app_limits_conf[] = {
+    {
+        nxt_string("shm"),
+        NXT_CONF_MAP_SIZE,
+        offsetof(nxt_common_app_conf_t, shm_limit),
+    },
+
+    {
+        nxt_string("requests"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_common_app_conf_t, request_limit),
+    },
+
+    {
+        nxt_string("start_timeout"),
+        NXT_CONF_MAP_MSEC,
+        offsetof(nxt_common_app_conf_t, start_timeout),
+    },
+
+};
+
+
+static nxt_conf_map_t  nxt_external_app_conf[] = {
+    {
+        nxt_string("executable"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_common_app_conf_t, u.external.executable),
+    },
+
+    {
+        nxt_string("arguments"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_common_app_conf_t, u.external.arguments),
+    },
+
+};
+
+
+static nxt_conf_map_t  nxt_python_app_conf[] = {
+    {
+        nxt_string("home"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_common_app_conf_t, u.python.home),
+    },
+
+    {
+        nxt_string("path"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_common_app_conf_t, u.python.path),
+    },
+
+    {
+        nxt_string("protocol"),
+        NXT_CONF_MAP_STR,
+        offsetof(nxt_common_app_conf_t, u.python.protocol),
+    },
+
+    {
+        nxt_string("threads"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_common_app_conf_t, u.python.threads),
+    },
+
+    {
+        nxt_string("targets"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_common_app_conf_t, u.python.targets),
+    },
+
+    {
+        nxt_string("thread_stack_size"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_common_app_conf_t, u.python.thread_stack_size),
+    },
+};
+
+
+static nxt_conf_map_t  nxt_php_app_conf[] = {
+    {
+        nxt_string("targets"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_common_app_conf_t, u.php.targets),
+    },
+
+    {
+        nxt_string("options"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_common_app_conf_t, u.php.options),
+    },
+};
+
+
+static nxt_conf_map_t  nxt_perl_app_conf[] = {
+    {
+        nxt_string("script"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_common_app_conf_t, u.perl.script),
+    },
+
+    {
+        nxt_string("threads"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_common_app_conf_t, u.perl.threads),
+    },
+
+    {
+        nxt_string("thread_stack_size"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_common_app_conf_t, u.perl.thread_stack_size),
+    },
+};
+
+
+static nxt_conf_map_t  nxt_ruby_app_conf[] = {
+    {
+        nxt_string("script"),
+        NXT_CONF_MAP_STR,
+        offsetof(nxt_common_app_conf_t, u.ruby.script),
+    },
+    {
+        nxt_string("threads"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_common_app_conf_t, u.ruby.threads),
+    },
+    {
+        nxt_string("hooks"),
+        NXT_CONF_MAP_STR,
+        offsetof(nxt_common_app_conf_t, u.ruby.hooks),
+    }
+};
+
+
+static nxt_conf_map_t  nxt_java_app_conf[] = {
+    {
+        nxt_string("classpath"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_common_app_conf_t, u.java.classpath),
+    },
+    {
+        nxt_string("webapp"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_common_app_conf_t, u.java.webapp),
+    },
+    {
+        nxt_string("options"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_common_app_conf_t, u.java.options),
+    },
+    {
+        nxt_string("unit_jars"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_common_app_conf_t, u.java.unit_jars),
+    },
+    {
+        nxt_string("threads"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_common_app_conf_t, u.java.threads),
+    },
+    {
+        nxt_string("thread_stack_size"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_common_app_conf_t, u.java.thread_stack_size),
+    },
+
+};
+
+
+static nxt_conf_map_t  nxt_wasm_app_conf[] = {
+    {
+        nxt_string("module"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_common_app_conf_t, u.wasm.module),
+    },
+    {
+        nxt_string("request_handler"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_common_app_conf_t, u.wasm.request_handler),
+    },
+    {
+        nxt_string("malloc_handler"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_common_app_conf_t, u.wasm.malloc_handler),
+    },
+    {
+        nxt_string("free_handler"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_common_app_conf_t, u.wasm.free_handler),
+    },
+    {
+        nxt_string("module_init_handler"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_common_app_conf_t, u.wasm.module_init_handler),
+    },
+    {
+        nxt_string("module_end_handler"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_common_app_conf_t, u.wasm.module_end_handler),
+    },
+    {
+        nxt_string("request_init_handler"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_common_app_conf_t, u.wasm.request_init_handler),
+    },
+    {
+        nxt_string("request_end_handler"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_common_app_conf_t, u.wasm.request_end_handler),
+    },
+    {
+        nxt_string("response_end_handler"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_common_app_conf_t, u.wasm.response_end_handler),
+    },
+    {
+        nxt_string("access"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_common_app_conf_t, u.wasm.access),
+    },
+};
+
+
+static nxt_conf_map_t  nxt_wasm_wc_app_conf[] = {
+    {
+        nxt_string("component"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_common_app_conf_t, u.wasm_wc.component),
+    },
+    {
+        nxt_string("access"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_common_app_conf_t, u.wasm_wc.access),
+    },
+    {
+        nxt_string("execution_timeout"),
+        NXT_CONF_MAP_MSEC,
+        offsetof(nxt_common_app_conf_t, u.wasm_wc.execution_timeout),
+    },
+};
+
+
+static nxt_conf_app_map_t  nxt_app_maps[] = {
+    { nxt_nitems(nxt_external_app_conf),  nxt_external_app_conf },
+    { nxt_nitems(nxt_python_app_conf),    nxt_python_app_conf },
+    { nxt_nitems(nxt_php_app_conf),       nxt_php_app_conf },
+    { nxt_nitems(nxt_perl_app_conf),      nxt_perl_app_conf },
+    { nxt_nitems(nxt_ruby_app_conf),      nxt_ruby_app_conf },
+    { nxt_nitems(nxt_java_app_conf),      nxt_java_app_conf },
+    { nxt_nitems(nxt_wasm_app_conf),      nxt_wasm_app_conf },
+    { nxt_nitems(nxt_wasm_wc_app_conf),   nxt_wasm_wc_app_conf },
+};
+
+
+static void
+nxt_main_data_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_debug(task, "main data: %*s",
+              nxt_buf_mem_used_size(&msg->buf->mem), msg->buf->mem.pos);
+}
+
+
+static void
+nxt_main_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    void        *mem;
+    nxt_port_t  *port;
+
+    nxt_port_new_port_handler(task, msg);
+
+    port = msg->u.new_port;
+
+    if (port != NULL
+        && port->type == NXT_PROCESS_APP
+        && msg->fd[1] != -1)
+    {
+        mem = nxt_port_queue_mmap(task, msg->fd[1], sizeof(nxt_port_queue_t));
+
+        if (nxt_fast_path(mem != NULL)) {
+            port->queue = mem;
+
+        } else {
+            /*
+             * Not a fallback to the socket: a libunit process delivers a
+             * socket message only after dequeuing the READ_SOCKET marker
+             * that only a queue-holding sender emits, so everything main
+             * sends on this port -- CHANGE_FILE on log rotation, QUIT on
+             * shutdown -- would be suspended undelivered, and the second
+             * message fails the worker's context.  See issue #231.
+             */
+            nxt_alert(task, "cannot map the queue of port %PI:%d; the "
+                      "process cannot be reached on this port from main",
+                      port->pid, (int) port->id);
+        }
+    }
+
+    /*
+     * nxt_port_new_port_handler() leaves the queue descriptor to its caller,
+     * and only a new application port has a use for it here.  Anything else
+     * -- a port that already existed, a port that could not be created, a
+     * type whose queue main never maps -- used to keep the descriptor open
+     * in the most privileged process of all.
+     */
+    nxt_port_recv_msg_close_fds(msg);
+}
+
+
+static void
+nxt_main_start_process_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    u_char                 *start, *p, ch;
+    size_t                 type_len;
+    nxt_int_t              ret;
+    nxt_buf_t              *b;
+    nxt_port_t             *port;
+    nxt_runtime_t          *rt;
+    nxt_process_t          *process;
+    nxt_app_type_t         idx;
+    nxt_conf_value_t       *conf;
+    nxt_process_init_t     *init;
+    nxt_common_app_conf_t  *app_conf;
+
+    rt = task->thread->runtime;
+
+    /*
+     * Every exit below the fork() is either the successful one, which lets
+     * the new process answer for itself, or "failed:", which answers for it.
+     * Nothing may leave this handler in between: START_PROCESS carries the
+     * stream of an RPC the router has already armed
+     * (nxt_router_start_app_process_handler()), and only a reply retires it.
+     * A silent return leaves that RPC outstanding forever -- neither
+     * nxt_router_app_port_ready() nor nxt_router_app_port_error() ever runs,
+     * so app->proto_port_requests is never cleared, every later start for
+     * the application parks on the prototype that is not coming, and the
+     * requests waiting on it are never failed.  See issue #257.
+     */
+    process = NULL;
+
+    port = rt->port_by_type[NXT_PROCESS_ROUTER];
+    if (nxt_slow_path(port == NULL)) {
+        nxt_alert(task, "router port not found");
+        goto failed;
+    }
+
+    if (nxt_slow_path(port->pid != nxt_recv_msg_cmsg_pid(msg))) {
+        nxt_alert(task, "process %PI cannot start processes",
+                  nxt_recv_msg_cmsg_pid(msg));
+
+        goto failed;
+    }
+
+    process = nxt_main_process_new(rt);
+    if (nxt_slow_path(process == NULL)) {
+        goto failed;
+    }
+
+    process->mem_pool = nxt_mp_create(1024, 128, 256, 32);
+    if (process->mem_pool == NULL) {
+        goto failed;
+    }
+
+    process->parent_port = rt->port_by_type[NXT_PROCESS_MAIN];
+
+    init = nxt_process_init(process);
+
+    *init = nxt_proto_process;
+
+    b = nxt_buf_chk_make_plain(process->mem_pool, msg->buf, msg->size);
+    if (b == NULL) {
+        goto failed;
+    }
+
+    nxt_debug(task, "main start prototype: %*s", b->mem.free - b->mem.pos,
+              b->mem.pos);
+
+    app_conf = nxt_mp_zalloc(process->mem_pool, sizeof(nxt_common_app_conf_t));
+    if (nxt_slow_path(app_conf == NULL)) {
+        goto failed;
+    }
+
+    app_conf->shared_port_fd = msg->fd[0];
+    app_conf->shared_queue_fd = msg->fd[1];
+
+    start = b->mem.pos;
+
+    app_conf->name.start = start;
+    app_conf->name.length = nxt_strlen(start);
+
+    init->name = (const char *) start;
+
+    process->name = nxt_mp_alloc(process->mem_pool, app_conf->name.length
+                                 + sizeof("\"\" prototype") + 1);
+
+    if (nxt_slow_path(process->name == NULL)) {
+        goto failed;
+    }
+
+    p = (u_char *) process->name;
+    *p++ = '"';
+    p = nxt_cpymem(p, init->name, app_conf->name.length);
+    p = nxt_cpymem(p, "\" prototype", 11);
+    *p = '\0';
+
+    app_conf->shm_limit = 100 * 1024 * 1024;
+    app_conf->request_limit = 0;
+
+    start += app_conf->name.length + 1;
+
+    conf = nxt_conf_json_parse(process->mem_pool, start, b->mem.free, NULL);
+    if (conf == NULL) {
+        nxt_alert(task, "router app configuration parsing error");
+
+        goto failed;
+    }
+
+    rt = task->thread->runtime;
+
+    app_conf->user.start  = (u_char*)rt->user_cred.user;
+    app_conf->user.length = nxt_strlen(rt->user_cred.user);
+
+    ret = nxt_conf_map_object(process->mem_pool, conf, nxt_common_app_conf,
+                              nxt_nitems(nxt_common_app_conf), app_conf);
+
+    if (ret != NXT_OK) {
+        nxt_alert(task, "failed to map common app conf received from router");
+        goto failed;
+    }
+
+    for (type_len = 0; type_len != app_conf->type.length; type_len++) {
+        ch = app_conf->type.start[type_len];
+
+        if (ch == ' ' || nxt_isdigit(ch)) {
+            break;
+        }
+    }
+
+    idx = nxt_app_parse_type(app_conf->type.start, type_len);
+
+    if (nxt_slow_path(idx >= nxt_nitems(nxt_app_maps))) {
+        nxt_alert(task, "invalid app type %d received from router", (int) idx);
+        goto failed;
+    }
+
+    ret = nxt_conf_map_object(process->mem_pool, conf, nxt_app_maps[idx].map,
+                              nxt_app_maps[idx].size, app_conf);
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_alert(task, "failed to map app conf received from router");
+        goto failed;
+    }
+
+    if (app_conf->limits != NULL) {
+        ret = nxt_conf_map_object(process->mem_pool, app_conf->limits,
+                                  nxt_common_app_limits_conf,
+                                  nxt_nitems(nxt_common_app_limits_conf),
+                                  app_conf);
+
+        if (nxt_slow_path(ret != NXT_OK)) {
+            nxt_alert(task, "failed to map app limits received from router");
+            goto failed;
+        }
+    }
+
+    app_conf->shm_limit = nxt_app_shm_limit(app_conf->shm_limit);
+
+    app_conf->self = conf;
+
+    process->stream = msg->port_msg.stream;
+    process->data.app = app_conf;
+
+    ret = nxt_process_start(task, process);
+    if (nxt_fast_path(ret == NXT_OK || ret == NXT_AGAIN)) {
+
+        /* Close shared port fds only in main process. */
+        if (ret == NXT_OK) {
+            nxt_fd_close(app_conf->shared_port_fd);
+            nxt_fd_close(app_conf->shared_queue_fd);
+        }
+
+        /* Avoid fds close in caller. */
+        msg->fd[0] = -1;
+        msg->fd[1] = -1;
+
+        return;
+    }
+
+failed:
+
+    if (process != NULL) {
+        nxt_process_use(task, process, -1);
+    }
+
+    /*
+     * Answer on the port of the process the kernel says sent this, not the
+     * one the message claims to come from: msg->port_msg.pid is filled in by
+     * the sender (nxt_port_socket_write2()) and is not authenticated, and
+     * the two branches above now reach this reply before the router identity
+     * check has run -- or after it has failed.  Keyed on the credential, the
+     * RPC_ERROR can only ever retire an RPC of the sender's own, so a worker
+     * that forges a START_PROCESS cannot use main to cancel a stream of the
+     * router's choosing.  For a legitimate sender the two pids are equal,
+     * because nxt_port_socket_write2() sets port_msg.pid to its own nxt_pid;
+     * where SCM_CREDENTIALS is unavailable nxt_recv_msg_cmsg_pid() is
+     * defined as port_msg.pid, so the lookup is unchanged there.
+     */
+    port = nxt_runtime_port_find(rt, nxt_recv_msg_cmsg_pid(msg),
+                                 msg->port_msg.reply_port);
+
+    if (nxt_fast_path(port != NULL)) {
+        (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
+                                     -1, msg->port_msg.stream, 0, NULL);
+
+    } else {
+        /*
+         * Nothing to answer on: the sender is gone, or never had the port it
+         * named.  A dead sender's RPCs die with it, so this is only worth a
+         * diagnostic -- but a silent drop here is exactly the shape of the
+         * defect above, so it is not left silent.
+         */
+        nxt_alert(task, "cannot report a failed start back: reply port %d of "
+                  "process %PI not found", (int) msg->port_msg.reply_port,
+                  nxt_recv_msg_cmsg_pid(msg));
+    }
+
+    nxt_fd_close(msg->fd[0]);
+    msg->fd[0] = -1;
+
+    nxt_fd_close(msg->fd[1]);
+    msg->fd[1] = -1;
+}
+
+
+#if (NXT_TESTS)
+
+/*
+ * Public wrapper that lets src/test/nxt_main_start_process_reply_test.c
+ * invoke the static nxt_main_start_process_handler() directly with a
+ * synthesised runtime and message -- used to verify that every exit above
+ * the fork() answers the router's START_PROCESS RPC instead of returning
+ * silently and stranding it (issue #257).
+ */
+void
+nxt_main_test_run_start_process_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg)
+{
+    nxt_main_start_process_handler(task, msg);
+}
+
+
+/* Lets src/test/nxt_main_whoami_test.c drive the WHOAMI handler. */
+void
+nxt_main_test_run_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_main_process_whoami_handler(task, msg);
+}
+
+
+/*
+ * Let src/test/nxt_main_store_test.c drive the state store.  The delay
+ * makes each store child sleep before it stores, so that the test can act
+ * while the child runs.  The test reaps the child with waitpid() and
+ * gives the status to nxt_main_test_store_exited().
+ */
+void
+nxt_main_test_store_set_delay(nxt_msec_t delay)
+{
+    nxt_main_test_store_delay = delay;
+}
+
+
+void
+nxt_main_test_store_schedule(nxt_task_t *task, u_char *p, size_t size)
+{
+    nxt_main_store_schedule(task, p, size);
+}
+
+
+nxt_pid_t
+nxt_main_test_store_pid(void)
+{
+    return nxt_main_store.pid;
+}
+
+
+nxt_bool_t
+nxt_main_test_store_exited(nxt_task_t *task, nxt_pid_t pid, int status)
+{
+    return nxt_main_store_exited(task, pid, status);
+}
+
+
+/* Start the exit as the SIGTERM and SIGQUIT handlers do, or end it. */
+void
+nxt_main_test_store_set_exiting(nxt_task_t *task, nxt_bool_t exiting)
+{
+    if (exiting) {
+        nxt_main_start_exit(task);
+
+    } else {
+        nxt_exiting = 0;
+    }
+}
+
+
+#if (NXT_USE_CMSG_PID)
+
+void
+nxt_main_test_run_name_child(nxt_task_t *task, nxt_process_t *pprocess,
+    nxt_process_t *process, nxt_pid_t ns_pid)
+{
+    nxt_main_process_name_child(task, pprocess, process, ns_pid);
+}
+
+
+void
+nxt_main_test_run_remove_child_pid_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg)
+{
+    nxt_main_remove_child_pid_handler(task, msg);
+}
+
+#endif
+
+#endif
+
+
+static void
+nxt_main_process_created_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_port_t     *port;
+    nxt_process_t  *process;
+    nxt_runtime_t  *rt;
+
+    rt = task->thread->runtime;
+
+    /*
+     * Look up the sender's port via the kernel-validated PID
+     * (SCM_CREDENTIALS).  The PROCESS_CREATED message is sent by the
+     * newly created process itself (nxt_process_send_created()), and
+     * main registers that process's port under the same kernel PID
+     * (fork() return value, or the cmsg PID from the WHOAMI exchange),
+     * so this is a 1:1 replacement of the self-declared, spoofable
+     * msg->port_msg.pid.  Without it a compromised worker could pose
+     * as a process in the CREATING state and have main perform the
+     * privileged uid_map/gid_map writes at a moment of its choosing.
+     */
+    port = nxt_runtime_port_find(rt, nxt_recv_msg_cmsg_pid(msg),
+                                 msg->port_msg.reply_port);
+    if (nxt_slow_path(port == NULL)) {
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    /*
+     * Validate the process state at runtime rather than with nxt_assert():
+     * the assertions compile out in release builds (leaving no check) and
+     * abort main in debug builds.  Now that the sender is authenticated by
+     * kernel PID, only the process itself can reach here, but a compromised
+     * worker could still send a premature or duplicate PROCESS_CREATED for
+     * itself; reject anything not in the CREATING state instead of
+     * re-running the privileged uid_map/gid_map setup or crashing.
+     */
+    process = port->process;
+
+    if (nxt_slow_path(process == NULL
+                      || process->state != NXT_PROCESS_STATE_CREATING))
+    {
+        nxt_alert(task, "process %PI sent PROCESS_CREATED in unexpected state",
+                  nxt_recv_msg_cmsg_pid(msg));
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+#if (NXT_HAVE_LINUX_NS && NXT_HAVE_CLONE_NEWUSER)
+    if (nxt_is_clone_flag_set(process->isolation.clone.flags, NEWUSER)) {
+        if (nxt_slow_path(nxt_clone_credential_map(task, process->pid,
+                                                   process->user_cred,
+                                                   &process->isolation.clone)
+                          != NXT_OK))
+        {
+            (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR,
+                                         -1, msg->port_msg.stream, 0, NULL);
+            return;
+        }
+    }
+
+#endif
+
+    process->state = NXT_PROCESS_STATE_CREATED;
+
+    (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_READY_LAST,
+                                 -1, msg->port_msg.stream, 0, NULL);
+}
+
+
+static nxt_port_handlers_t  nxt_main_process_port_handlers = {
+    .data             = nxt_main_data_handler,
+    .new_port         = nxt_main_new_port_handler,
+    .process_created  = nxt_main_process_created_handler,
+    .process_ready    = nxt_port_process_ready_handler,
+    .whoami           = nxt_main_process_whoami_handler,
+    .remove_pid       = nxt_port_remove_pid_handler,
+#if (NXT_USE_CMSG_PID)
+    .remove_child_pid = nxt_main_remove_child_pid_handler,
+#endif
+    .start_process    = nxt_main_start_process_handler,
+    .socket           = nxt_main_port_socket_handler,
+    .socket_unlink    = nxt_main_port_socket_unlink_handler,
+    .modules          = nxt_main_port_modules_handler,
+    .conf_store       = nxt_main_port_conf_store_handler,
+#if (NXT_TLS)
+    .cert_get         = nxt_cert_store_get_handler,
+    .cert_delete      = nxt_cert_store_delete_handler,
+    .cert_store       = nxt_cert_store_put_handler,
+#endif
+#if (NXT_HAVE_NJS)
+    .script_get       = nxt_script_store_get_handler,
+    .script_delete    = nxt_script_store_delete_handler,
+    .script_store     = nxt_script_store_put_handler,
+#endif
+    .access_log       = nxt_main_port_access_log_handler,
+    .rpc_ready        = nxt_port_rpc_handler,
+    .rpc_error        = nxt_port_rpc_handler,
+};
+
+
+#if (NXT_USE_CMSG_PID)
+
+/*
+ * Keep a child's pid in the pid namespace of the prototype that forked it.
+ *
+ * Under "isolation": {"namespaces": {"pid": true}} a worker has two pids: the
+ * global one from SCM_CREDENTIALS, which keys main's record, and the local one
+ * the prototype got from fork().  The WHOAMI header carries the local one, and
+ * it is the only name the prototype has for a worker that dies before
+ * PROCESS_CREATED.  nxt_main_remove_child_pid_handler() resolves that name.
+ *
+ * The pair is kept even when the two numbers are equal: the counters are
+ * independent, so equality proves nothing.  A name a live sibling still holds
+ * is refused, and the new worker stays unnamed.  This happens without a
+ * forger too: the prototype forks a new worker with the local pid of one
+ * whose report main has not read yet.  Either way the cost is the #310 leak
+ * for that one worker.  Taking the name over would be worse: a late report
+ * for the old worker would then remove the live new one.
+ */
+
+static void
+nxt_main_process_name_child(nxt_task_t *task, nxt_process_t *pprocess,
+    nxt_process_t *process, nxt_pid_t ns_pid)
+{
+    nxt_process_t  *child;
+
+    /* 0 means "no name"; no namespace hands out 0 or a negative pid. */
+
+    if (nxt_slow_path(ns_pid <= 0)) {
+        return;
+    }
+
+    nxt_queue_each(child, &pprocess->children, nxt_process_t, link) {
+
+        if (child != process && child->parent_ns_pid == ns_pid) {
+            nxt_log(task, NXT_LOG_WARN, "pid %PI inside %PI is still held "
+                    "by process %PI; process %PI stays unnamed", ns_pid,
+                    pprocess->pid, child->pid, process->pid);
+
+            return;
+        }
+
+    } nxt_queue_loop;
+
+    nxt_debug(task, "process %PI is pid %PI inside %PI", process->pid,
+              ns_pid, pprocess->pid);
+
+    process->parent_ns_pid = ns_pid;
+}
+
+#endif
+
+
+static void
+nxt_main_process_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_buf_t      *buf;
+    nxt_pid_t      pid, ppid;
+    nxt_port_t     *port;
+    nxt_runtime_t  *rt;
+    nxt_process_t  *pprocess;
+
+    nxt_assert(msg->port_msg.reply_port == 0);
+
+    if (nxt_slow_path(msg->buf == NULL
+        || nxt_buf_used_size(msg->buf) != sizeof(nxt_pid_t)))
+    {
+        nxt_alert(task, "whoami: buffer is NULL or unexpected size");
+        goto fail;
+    }
+
+    nxt_memcpy(&ppid, msg->buf->mem.pos, sizeof(nxt_pid_t));
+
+    rt = task->thread->runtime;
+
+    /*
+     * Unreferenced: the main process runs a single engine.  That matters
+     * here specifically because the result outlives the call -- it is
+     * linked into pprocess->children below, a weak link cleaned up in
+     * nxt_runtime_process_free().  With one engine nothing can drop the
+     * last reference concurrently, so the link cannot outlive the process.
+     */
+
+    pprocess = nxt_runtime_process_find(rt, ppid);
+    if (nxt_slow_path(pprocess == NULL)) {
+        nxt_alert(task, "whoami: parent process %PI not found", ppid);
+        goto fail;
+    }
+
+    pid = nxt_recv_msg_cmsg_pid(msg);
+
+    nxt_debug(task, "whoami: from %PI, parent %PI, fd %d", pid, ppid,
+              msg->fd[0]);
+
+    /*
+     * The sender is not trusted, and "ppid" comes from its message.  Only
+     * two shapes are valid: a process forked by main sends no descriptor,
+     * and a worker forked by a prototype sends its port.  A process sends
+     * WHOAMI once, so a second one with a port is refused too; without
+     * that, it would get a second port and be linked into "children"
+     * twice, which corrupts the queue.
+     */
+
+    if (ppid == nxt_pid) {
+        if (nxt_slow_path(msg->fd[0] != -1)) {
+            nxt_alert(task, "whoami: process %PI sent a port", pid);
+            goto fail;
+        }
+
+    } else {
+        if (nxt_slow_path(nxt_process_type(pprocess)
+                          != NXT_PROCESS_PROTOTYPE))
+        {
+            nxt_alert(task, "whoami: process %PI named %PI as its parent, "
+                      "which is not a prototype", pid, ppid);
+            goto fail;
+        }
+
+        if (nxt_slow_path(msg->fd[0] == -1)) {
+            nxt_alert(task, "whoami: worker %PI sent no port", pid);
+            goto fail;
+        }
+
+        if (nxt_slow_path(nxt_runtime_port_find(rt, pid, 0) != NULL)) {
+            nxt_alert(task, "whoami: process %PI sent WHOAMI again", pid);
+            goto fail;
+        }
+    }
+
+    if (msg->fd[0] != -1) {
+        port = nxt_runtime_process_port_create(task, rt, pid, 0,
+                                               NXT_PROCESS_APP);
+        if (nxt_slow_path(port == NULL)) {
+            goto fail;
+        }
+
+        nxt_fd_nonblocking(task, msg->fd[0]);
+
+        port->pair[0] = -1;
+        port->pair[1] = msg->fd[0];
+        msg->fd[0] = -1;
+
+        port->max_size = 16 * 1024;
+        port->max_share = 64 * 1024;
+        port->socket.task = task;
+
+        nxt_port_write_enable(task, port);
+
+    } else {
+        port = nxt_runtime_port_find(rt, pid, 0);
+        if (nxt_slow_path(port == NULL)) {
+            goto fail;
+        }
+    }
+
+    if (ppid != nxt_pid) {
+        /* A new record: the checks above make it so. */
+        nxt_assert(port->process->link.next == NULL);
+
+        nxt_queue_insert_tail(&pprocess->children, &port->process->link);
+
+#if (NXT_USE_CMSG_PID)
+        nxt_main_process_name_child(task, pprocess, port->process,
+                                    msg->port_msg.pid);
+#endif
+    }
+
+    buf = nxt_buf_mem_alloc(task->thread->engine->mem_pool,
+                            sizeof(nxt_pid_t), 0);
+    if (nxt_slow_path(buf == NULL)) {
+        goto fail;
+    }
+
+    buf->mem.free = nxt_cpymem(buf->mem.free, &pid, sizeof(nxt_pid_t));
+
+    if (nxt_slow_path(nxt_port_socket_write(task, port,
+                                            NXT_PORT_MSG_RPC_READY_LAST, -1,
+                                            msg->port_msg.stream, 0, buf)
+                      != NXT_OK))
+    {
+        /* Still ours: the port layer takes the buffer only on NXT_OK. */
+
+        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                           buf->completion_handler, task, buf, buf->parent);
+    }
+
+fail:
+
+    /*
+     * Close both descriptors: WHOAMI carries one, but a compromised sender
+     * can attach a second to any message, and leaving it open here would
+     * leak a descriptor of the main process on every forged message.
+     */
+    nxt_port_recv_msg_close_fds(msg);
+}
+
+
+#if (NXT_USE_CMSG_PID)
+
+/*
+ * A prototype reports a worker of its own that died before PROCESS_CREATED,
+ * by the worker's namespace-local pid.  REMOVE_PID cannot carry that pid: it
+ * is broadcast, and elsewhere the number names an unrelated process.
+ *
+ * The sender is the pid from SCM_CREDENTIALS, and the name is looked up among
+ * that sender's own children only, so a prototype can retire its own workers
+ * and nothing else.  Main then tells the router by the global pid, as a
+ * REMOVE_PID would.  Main cannot check that the worker is really dead, so a
+ * bad prototype can drop the record of a live worker of its own; it can do
+ * the same with REMOVE_PID outside a pid namespace.
+ *
+ * Without a sender credential the handler is not registered at all: a pid
+ * namespace needs Linux, which has SO_PASSCRED.
+ */
+
+static void
+nxt_main_remove_child_pid_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    size_t         size;
+    nxt_buf_t      *buf;
+    nxt_pid_t      pid, sender;
+    nxt_runtime_t  *rt;
+    nxt_process_t  *pprocess, *child;
+
+    buf = msg->buf;
+    size = (buf != NULL) ? (size_t) nxt_buf_used_size(buf) : 0;
+
+    if (nxt_slow_path(size != sizeof(nxt_pid_t))) {
+        nxt_log(task, NXT_LOG_WARN, "REMOVE_CHILD_PID with a %uz byte "
+                "payload", size);
+        goto done;
+    }
+
+    nxt_memcpy(&pid, buf->mem.pos, sizeof(nxt_pid_t));
+
+    /* 0 is how "no name" is stored, so it must not match anything. */
+
+    if (nxt_slow_path(pid <= 0)) {
+        nxt_log(task, NXT_LOG_WARN, "REMOVE_CHILD_PID naming pid %PI", pid);
+        goto done;
+    }
+
+    sender = nxt_recv_msg_cmsg_pid(msg);
+
+    rt = task->thread->runtime;
+
+    pprocess = nxt_runtime_process_find(rt, sender);
+
+    if (pprocess == NULL) {
+        /* The prototype may have exited before this was read. */
+        nxt_debug(task, "REMOVE_CHILD_PID from unknown process %PI", sender);
+        goto done;
+    }
+
+    if (nxt_slow_path(nxt_process_type(pprocess) != NXT_PROCESS_PROTOTYPE)) {
+        nxt_alert(task, "process %PI is not a prototype and cannot report "
+                  "a child pid", sender);
+        goto done;
+    }
+
+    nxt_queue_each(child, &pprocess->children, nxt_process_t, link) {
+
+        if (child->parent_ns_pid != pid) {
+            continue;
+        }
+
+        nxt_debug(task, "remove child pid %PI (aka %PI) of %PI", pid,
+                  child->pid, sender);
+
+        /* As in nxt_main_process_sigchld_handler(). */
+
+        if (!nxt_exiting) {
+            nxt_port_remove_notify_others(task, child);
+        }
+
+        nxt_process_unlink(child);
+
+        nxt_process_close_ports(task, child);
+
+        goto done;
+
+    } nxt_queue_loop;
+
+    /* Not an error: a worker that died before WHOAMI left no record. */
+
+    nxt_debug(task, "process %PI reported child pid %PI, which it has no "
+              "record for", sender, pid);
+
+done:
+
+    nxt_port_recv_msg_close_fds(msg);
+}
+
+#endif
+
+
+static nxt_int_t
+nxt_main_process_port_create(nxt_task_t *task, nxt_runtime_t *rt)
+{
+    nxt_int_t      ret;
+    nxt_port_t     *port;
+    nxt_process_t  *process;
+
+    port = nxt_runtime_process_port_create(task, rt, nxt_pid, 0,
+                                           NXT_PROCESS_MAIN);
+    if (nxt_slow_path(port == NULL)) {
+        return NXT_ERROR;
+    }
+
+    process = port->process;
+
+    ret = nxt_port_socket_init(task, port, 0);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_use(task, port, -1);
+        return ret;
+    }
+
+    /*
+     * A main process port.  A write port is not closed
+     * since it should be inherited by processes.
+     */
+    nxt_port_enable(task, port, &nxt_main_process_port_handlers);
+
+    process->state = NXT_PROCESS_STATE_READY;
+
+    return NXT_OK;
+}
+
+
+static void
+nxt_main_process_title(nxt_task_t *task)
+{
+    u_char      *p, *end;
+    nxt_uint_t  i;
+    u_char      title[2048];
+
+    end = title + sizeof(title) - 1;
+
+    p = nxt_sprintf(title, end, "unit: main v" NXT_VERSION " [%s",
+                    nxt_process_argv[0]);
+
+    for (i = 1; nxt_process_argv[i] != NULL; i++) {
+        p = nxt_sprintf(p, end, " %s", nxt_process_argv[i]);
+    }
+
+    if (p < end) {
+        *p++ = ']';
+    }
+
+    *p = '\0';
+
+    nxt_process_title(task, "%s", title);
+}
+
+
+static void
+nxt_main_process_sigterm_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_runtime_t  *rt;
+
+    nxt_debug(task, "sigterm handler signo:%d (%s)",
+              (int) (uintptr_t) obj, data);
+
+    rt = task->thread->runtime;
+
+    /*
+     * Fast exit: do not drain in-flight requests.  The QUIT byte sent
+     * to libunit workers (see nxt_runtime_stop_app_processes()) carries
+     * NXT_PORT_QUIT_NORMAL so nxt_unit_quit() returns immediately.
+     */
+    rt->quit_mode = NXT_PORT_QUIT_NORMAL;
+
+    nxt_main_start_exit(task);
+
+    nxt_runtime_quit(task, 0);
+}
+
+
+static void
+nxt_main_process_sigquit_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_runtime_t  *rt;
+
+    nxt_debug(task, "sigquit handler signo:%d (%s)",
+              (int) (uintptr_t) obj, data);
+
+    rt = task->thread->runtime;
+
+    /*
+     * Graceful exit: ask libunit workers to drain in-flight requests
+     * before tearing the per-context state down (see nxt_unit_quit()).
+     */
+    rt->quit_mode = NXT_PORT_QUIT_GRACEFUL;
+
+    nxt_main_start_exit(task);
+
+    nxt_runtime_quit(task, 0);
+}
+
+
+static void
+nxt_main_process_sigusr1_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_mp_t        *mp;
+    nxt_int_t       ret;
+    nxt_uint_t      n;
+    nxt_port_t      *port;
+    nxt_file_t      *file, *new_file;
+    nxt_array_t     *new_files;
+    nxt_runtime_t   *rt;
+
+    nxt_log(task, NXT_LOG_NOTICE, "signal %d (%s) received, %s",
+            (int) (uintptr_t) obj, data, "log files rotation");
+
+    rt = task->thread->runtime;
+
+    port = rt->port_by_type[NXT_PROCESS_ROUTER];
+
+    if (nxt_fast_path(port != NULL)) {
+        (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_ACCESS_LOG,
+                                     -1, 0, 0, NULL);
+    }
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (mp == NULL) {
+        return;
+    }
+
+    n = nxt_list_nelts(rt->log_files);
+
+    new_files = nxt_array_create(mp, n, sizeof(nxt_file_t));
+    if (new_files == NULL) {
+        nxt_mp_destroy(mp);
+        return;
+    }
+
+    nxt_list_each(file, rt->log_files) {
+
+        /* This allocation cannot fail. */
+        new_file = nxt_array_add(new_files);
+
+        new_file->name = file->name;
+        new_file->fd = NXT_FILE_INVALID;
+        new_file->log_level = NXT_LOG_ALERT;
+
+        ret = nxt_file_open(task, new_file, O_WRONLY | O_APPEND, O_CREAT,
+                            NXT_FILE_OWNER_ACCESS);
+
+        if (ret != NXT_OK) {
+            goto fail;
+        }
+
+    } nxt_list_loop;
+
+    new_file = new_files->elts;
+
+    ret = nxt_file_stderr(&new_file[0]);
+
+    if (ret == NXT_OK) {
+        n = 0;
+
+        nxt_list_each(file, rt->log_files) {
+
+            nxt_port_change_log_file(task, rt, n, new_file[n].fd);
+            /*
+             * The old log file descriptor must be closed at the moment
+             * when no other threads use it.  dup2() allows to use the
+             * old file descriptor for new log file.  This change is
+             * performed atomically in the kernel.
+             */
+            (void) nxt_file_redirect(file, new_file[n].fd);
+
+            n++;
+
+        } nxt_list_loop;
+
+        nxt_mp_destroy(mp);
+        return;
+    }
+
+fail:
+
+    new_file = new_files->elts;
+    n = new_files->nelts;
+
+    while (n != 0) {
+        if (new_file->fd != NXT_FILE_INVALID) {
+            nxt_file_close(task, new_file);
+        }
+
+        new_file++;
+        n--;
+    }
+
+    nxt_mp_destroy(mp);
+}
+
+
+static void
+nxt_main_process_sigchld_handler(nxt_task_t *task, void *obj, void *data)
+{
+    int                 status;
+    nxt_int_t           ret;
+    nxt_err_t           err;
+    nxt_pid_t           pid;
+    nxt_port_t          *port;
+    nxt_queue_t         children;
+    nxt_runtime_t       *rt;
+    nxt_process_t       *process, *child;
+    nxt_process_init_t  init;
+
+    nxt_debug(task, "sigchld handler signo:%d (%s)",
+              (int) (uintptr_t) obj, data);
+
+    rt = task->thread->runtime;
+
+    for ( ;; ) {
+        pid = waitpid(-1, &status, WNOHANG);
+
+        if (pid == -1) {
+
+            switch (err = nxt_errno) {
+
+            case NXT_ECHILD:
+                return;
+
+            case NXT_EINTR:
+                continue;
+
+            default:
+                nxt_alert(task, "waitpid() failed: %E", err);
+                return;
+            }
+        }
+
+        nxt_debug(task, "waitpid(): %PI", pid);
+
+        if (pid == 0) {
+            return;
+        }
+
+        if (nxt_main_store_cancelled(pid, status)) {
+            /* Main stopped it; see nxt_main_store_cancel(). */
+            nxt_trace(task, "process %PI exited on signal %d",
+                      pid, WTERMSIG(status));
+
+        } else if (WTERMSIG(status)) {
+#ifdef WCOREDUMP
+            nxt_alert(task, "process %PI exited on signal %d%s",
+                      pid, WTERMSIG(status),
+                      WCOREDUMP(status) ? " (core dumped)" : "");
+#else
+            nxt_alert(task, "process %PI exited on signal %d",
+                      pid, WTERMSIG(status));
+#endif
+
+        } else {
+            nxt_trace(task, "process %PI exited with code %d",
+                      pid, WEXITSTATUS(status));
+        }
+
+        /*
+         * Unreferenced: the main process runs a single engine.  That
+         * matters here specifically because nxt_process_close_ports()
+         * below takes its own +1/-1 around the port loop, which on a
+         * process already at zero would be a second drop to zero and so a
+         * second teardown -- the defect fixed in nxt_port_remove_pid().
+         * With one engine, find() returning non-NULL implies use_count >= 1
+         * for the whole handler.
+         */
+
+        if (!nxt_main_store_exited(task, pid, status)) {
+            process = nxt_runtime_process_find(rt, pid);
+
+            if (process == NULL) {
+                continue;
+            }
+
+            nxt_main_process_cleanup(task, process);
+
+            /*
+             * ->stream is no longer cleared here.  It is cleared where the
+             * start RPC is actually answered -- on a successful NEW_PORT
+             * announcement in nxt_port_process_ready_handler() -- which is
+             * both earlier and narrower: the READY state is set before that
+             * announcement is written, so clearing on the state dropped the
+             * REMOVE_PID fallback for a start whose reply never went out.
+             * See issue #271.
+             */
+
+            nxt_queue_init(&children);
+
+            if (!nxt_queue_is_empty(&process->children)) {
+                nxt_queue_add(&children, &process->children);
+
+                nxt_queue_init(&process->children);
+
+                nxt_queue_each(child, &children, nxt_process_t, link) {
+                    port = nxt_process_port_first(child);
+
+                    (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_QUIT,
+                                                 -1, 0, 0, NULL);
+                } nxt_queue_loop;
+            }
+
+            if (nxt_exiting) {
+                nxt_process_close_ports(task, process);
+
+                nxt_queue_each(child, &children, nxt_process_t, link) {
+                    nxt_process_unlink(child);
+
+                    nxt_process_close_ports(task, child);
+                } nxt_queue_loop;
+
+            } else {
+                nxt_port_remove_notify_others(task, process);
+
+                nxt_queue_each(child, &children, nxt_process_t, link) {
+                    nxt_port_remove_notify_others(task, child);
+
+                    nxt_process_unlink(child);
+
+                    nxt_process_close_ports(task, child);
+                } nxt_queue_loop;
+
+                init = *(nxt_process_init_t *) nxt_process_init(process);
+
+                nxt_process_close_ports(task, process);
+
+                if (init.restart) {
+                    if (init.type == NXT_PROCESS_CONTROLLER
+                        && nxt_main_store.pid != 0)
+                    {
+                        /* See nxt_main_store_exited(). */
+                        nxt_log(task, NXT_LOG_INFO, "controller starts when "
+                                "state store child %PI ends",
+                                nxt_main_store.pid);
+
+                        nxt_main_store.controller = 1;
+                        continue;
+                    }
+
+                    ret = nxt_process_init_start(task, init);
+                    if (nxt_slow_path(ret == NXT_ERROR)) {
+                        nxt_alert(task, "failed to restart %s", init.name);
+                    }
+                }
+
+                continue;
+            }
+        }
+
+        /*
+         * At exit, main also waits for the store child.  In a container
+         * main is PID 1, and when it exits the kernel kills the child.
+         */
+        if (nxt_exiting && rt->nprocesses <= 1) {
+            if (nxt_main_store.pid != 0) {
+                nxt_debug(task, "waiting for state store child %PI",
+                          nxt_main_store.pid);
+                continue;
+            }
+
+            nxt_runtime_quit(task, 0);
+
+            return;
+        }
+    }
+}
+
+
+static void
+nxt_main_process_signal_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_trace(task, "signal signo:%d (%s) received, ignored",
+              (int) (uintptr_t) obj, data);
+}
+
+
+static void
+nxt_main_process_cleanup(nxt_task_t *task, nxt_process_t *process)
+{
+    if (process->isolation.cleanup != NULL) {
+        process->isolation.cleanup(task, process);
+    }
+
+    if (process->isolation.cgroup_cleanup != NULL) {
+        process->isolation.cgroup_cleanup(task, process);
+    }
+}
+
+
+static void
+nxt_main_port_socket_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    size_t                  size;
+    nxt_int_t               ret;
+    nxt_buf_t               *b, *out;
+    nxt_port_t              *port;
+    nxt_sockaddr_t          *sa;
+    nxt_port_msg_type_t     type;
+    nxt_listening_socket_t  ls;
+    u_char                  message[2048];
+
+    /*
+     * Look up the sender's port via the kernel-validated PID
+     * (SCM_CREDENTIALS).  msg->port_msg.pid is self-declared, so using
+     * it would let a compromised worker impersonate the router and
+     * ask main to bind a privileged listening socket.
+     */
+    port = nxt_runtime_port_find(task->thread->runtime,
+                                 nxt_recv_msg_cmsg_pid(msg),
+                                 msg->port_msg.reply_port);
+    if (nxt_slow_path(port == NULL)) {
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    if (nxt_slow_path(port->type != NXT_PROCESS_ROUTER)) {
+        nxt_alert(task, "process %PI cannot create listener sockets",
+                  nxt_recv_msg_cmsg_pid(msg));
+
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    b = msg->buf;
+    sa = (nxt_sockaddr_t *) b->mem.pos;
+
+    /* TODO check b size and make plain */
+
+    ls.socket = -1;
+    ls.error = NXT_SOCKET_ERROR_SYSTEM;
+    ls.start = message;
+    ls.end = message + sizeof(message);
+
+    nxt_debug(task, "listening socket \"%*s\"",
+              (size_t) sa->length, nxt_sockaddr_start(sa));
+
+    ret = nxt_main_listening_socket(sa, &ls);
+
+    if (ret == NXT_OK) {
+        nxt_debug(task, "socket(\"%*s\"): %d",
+                  (size_t) sa->length, nxt_sockaddr_start(sa), ls.socket);
+
+        out = NULL;
+
+        type = NXT_PORT_MSG_RPC_READY_LAST | NXT_PORT_MSG_CLOSE_FD;
+
+    } else {
+        size = ls.end - ls.start;
+
+        nxt_alert(task, "%*s", size, ls.start);
+
+        out = nxt_buf_mem_ts_alloc(task, task->thread->engine->mem_pool,
+                                   size + 1);
+        if (nxt_fast_path(out != NULL)) {
+            *out->mem.free++ = (uint8_t) ls.error;
+
+            out->mem.free = nxt_cpymem(out->mem.free, ls.start, size);
+        }
+
+        type = NXT_PORT_MSG_RPC_ERROR;
+    }
+
+    if (nxt_port_socket_write(task, port, type, ls.socket, msg->port_msg.stream,
+                              0, out)
+        != NXT_OK)
+    {
+        /*
+         * ls.socket is -1 unless nxt_main_listening_socket() succeeded.
+         * In that case the port layer did not take ownership, so close it
+         * explicitly.
+         */
+        if (ls.socket != -1) {
+            nxt_socket_close(task, ls.socket);
+        }
+
+        /*
+         * The buffer never reached the port queue, so the port layer will
+         * not run its completion.  Queue the completion to match normal
+         * port-layer cleanup semantics.
+         */
+        if (out != NULL) {
+            nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                               out->completion_handler, task, out,
+                               out->parent);
+        }
+    }
+}
+
+
+static nxt_int_t
+nxt_main_listening_socket(nxt_sockaddr_t *sa, nxt_listening_socket_t *ls)
+{
+    nxt_err_t         err;
+    nxt_socket_t      s;
+
+    const socklen_t   length = sizeof(int);
+    static const int  enable = 1;
+
+    s = socket(sa->u.sockaddr.sa_family, sa->type, 0);
+
+    if (nxt_slow_path(s == -1)) {
+        err = nxt_errno;
+
+#if (NXT_INET6)
+
+        if (err == EAFNOSUPPORT && sa->u.sockaddr.sa_family == AF_INET6) {
+            ls->error = NXT_SOCKET_ERROR_NOINET6;
+        }
+
+#endif
+
+        ls->end = nxt_sprintf(ls->start, ls->end,
+                              "socket(\\\"%*s\\\") failed %E",
+                              (size_t) sa->length, nxt_sockaddr_start(sa), err);
+
+        return NXT_ERROR;
+    }
+
+    if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &enable, length) != 0) {
+        ls->end = nxt_sprintf(ls->start, ls->end,
+                              "setsockopt(\\\"%*s\\\", SO_REUSEADDR) failed %E",
+                              (size_t) sa->length, nxt_sockaddr_start(sa),
+                              nxt_errno);
+        goto fail;
+    }
+
+#if (NXT_INET6)
+
+    if (sa->u.sockaddr.sa_family == AF_INET6) {
+
+        if (setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &enable, length) != 0) {
+            ls->end = nxt_sprintf(ls->start, ls->end,
+                               "setsockopt(\\\"%*s\\\", IPV6_V6ONLY) failed %E",
+                               (size_t) sa->length, nxt_sockaddr_start(sa),
+                               nxt_errno);
+            goto fail;
+        }
+    }
+
+#endif
+
+    if (bind(s, &sa->u.sockaddr, sa->socklen) != 0) {
+        err = nxt_errno;
+
+#if (NXT_HAVE_UNIX_DOMAIN)
+
+        if (sa->u.sockaddr.sa_family == AF_UNIX) {
+            switch (err) {
+
+            case EACCES:
+                ls->error = NXT_SOCKET_ERROR_ACCESS;
+                break;
+
+            case ENOENT:
+            case ENOTDIR:
+                ls->error = NXT_SOCKET_ERROR_PATH;
+                break;
+            }
+
+        } else
+#endif
+        {
+            switch (err) {
+
+            case EACCES:
+                ls->error = NXT_SOCKET_ERROR_PORT;
+                break;
+
+            case EADDRINUSE:
+                ls->error = NXT_SOCKET_ERROR_INUSE;
+                break;
+
+            case EADDRNOTAVAIL:
+                ls->error = NXT_SOCKET_ERROR_NOADDR;
+                break;
+            }
+        }
+
+        ls->end = nxt_sprintf(ls->start, ls->end, "bind(\\\"%*s\\\") failed %E",
+                              (size_t) sa->length, nxt_sockaddr_start(sa), err);
+        goto fail;
+    }
+
+#if (NXT_HAVE_UNIX_DOMAIN)
+
+    if (sa->u.sockaddr.sa_family == AF_UNIX
+        && sa->u.sockaddr_un.sun_path[0] != '\0')
+    {
+        char          *filename;
+        nxt_thread_t  *thr;
+
+        filename = sa->u.sockaddr_un.sun_path;
+
+        if (chmod(filename, 0666) != 0) {
+            ls->end = nxt_sprintf(ls->start, ls->end,
+                                  "chmod(\\\"%s\\\") failed %E",
+                                  filename, nxt_errno);
+            goto fail;
+        }
+
+        thr = nxt_thread();
+        nxt_runtime_listen_socket_add(thr->runtime, sa);
+    }
+
+#endif
+
+    ls->socket = s;
+
+    return NXT_OK;
+
+fail:
+
+    (void) close(s);
+
+    return NXT_ERROR;
+}
+
+
+static void
+nxt_main_port_socket_unlink_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+#if (NXT_HAVE_UNIX_DOMAIN)
+    size_t               i;
+    nxt_buf_t            *b;
+    const char           *filename;
+    nxt_port_t           *router_port;
+    nxt_runtime_t        *rt;
+    nxt_sockaddr_t       *sa;
+    nxt_listen_socket_t  *ls;
+
+    rt = task->thread->runtime;
+
+    /*
+     * Privileged unlink of an attacker-controllable path.  Only accept
+     * from the router; identify the sender via SCM_CREDENTIALS so a
+     * compromised worker cannot spoof the message and have main remove
+     * arbitrary files.
+     */
+    router_port = rt->port_by_type[NXT_PROCESS_ROUTER];
+    if (nxt_slow_path(router_port == NULL
+                      || nxt_recv_msg_cmsg_pid(msg) != router_port->pid))
+    {
+        nxt_alert(task, "process %PI cannot unlink listener sockets",
+                  nxt_recv_msg_cmsg_pid(msg));
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    b = msg->buf;
+    sa = (nxt_sockaddr_t *) b->mem.pos;
+
+    filename = sa->u.sockaddr_un.sun_path;
+    unlink(filename);
+
+    for (i = 0; i < rt->listen_sockets->nelts; i++) {
+        const char  *name;
+
+        ls = (nxt_listen_socket_t *) rt->listen_sockets->elts + i;
+        sa = ls->sockaddr;
+
+        if (sa->u.sockaddr.sa_family != AF_UNIX
+            || sa->u.sockaddr_un.sun_path[0] == '\0')
+        {
+            continue;
+        }
+
+        name = sa->u.sockaddr_un.sun_path;
+        if (strcmp(name, filename) != 0) {
+            continue;
+        }
+
+        nxt_array_remove(rt->listen_sockets, ls);
+        break;
+    }
+#endif
+}
+
+
+static nxt_conf_map_t  nxt_app_lang_module_map[] = {
+    {
+        nxt_string("type"),
+        NXT_CONF_MAP_INT,
+        offsetof(nxt_app_lang_module_t, type),
+    },
+
+    {
+        nxt_string("name"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_app_lang_module_t, name),
+    },
+
+    {
+        nxt_string("version"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_app_lang_module_t, version),
+    },
+
+    {
+        nxt_string("file"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_app_lang_module_t, file),
+    },
+};
+
+
+static nxt_conf_map_t  nxt_app_lang_mounts_map[] = {
+    {
+        nxt_string("src"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_fs_mount_t, src),
+    },
+    {
+        nxt_string("dst"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_fs_mount_t, dst),
+    },
+    {
+        nxt_string("name"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_fs_mount_t, name),
+    },
+    {
+        nxt_string("type"),
+        NXT_CONF_MAP_INT,
+        offsetof(nxt_fs_mount_t, type),
+    },
+    {
+        nxt_string("flags"),
+        NXT_CONF_MAP_INT,
+        offsetof(nxt_fs_mount_t, flags),
+    },
+    {
+        nxt_string("data"),
+        NXT_CONF_MAP_CSTRZ,
+        offsetof(nxt_fs_mount_t, data),
+    },
+};
+
+
+static void
+nxt_main_port_modules_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    uint32_t               index, jindex, nmounts;
+    nxt_mp_t               *mp;
+    nxt_int_t              ret;
+    nxt_buf_t              *b;
+    nxt_port_t             *port;
+    nxt_runtime_t          *rt;
+    nxt_fs_mount_t         *mnt;
+    nxt_conf_value_t       *conf, *root, *value, *mounts;
+    nxt_app_lang_module_t  *lang;
+
+    static const nxt_str_t root_path = nxt_string("/");
+    static const nxt_str_t mounts_name = nxt_string("mounts");
+
+    rt = task->thread->runtime;
+
+    /*
+     * Use the kernel-validated sender PID (SCM_CREDENTIALS) for both
+     * the authorisation check and the port lookup: msg->port_msg.pid
+     * is self-declared by the sender and a compromised worker can
+     * forge it to impersonate discovery / controller / router.  Guard
+     * against a NULL discovery slot — discovery exits after sending
+     * the modules message, so a late or duplicated message can arrive
+     * after rt->port_by_type[DISCOVERY] has been cleared.
+     */
+    if (nxt_slow_path(rt->port_by_type[NXT_PROCESS_DISCOVERY] == NULL
+                      || nxt_recv_msg_cmsg_pid(msg)
+                         != rt->port_by_type[NXT_PROCESS_DISCOVERY]->pid))
+    {
+        nxt_alert(task, "process %PI cannot send modules",
+                  nxt_recv_msg_cmsg_pid(msg));
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    if (nxt_exiting) {
+        nxt_debug(task, "ignoring discovered modules, exiting");
+        return;
+    }
+
+    port = nxt_runtime_port_find(task->thread->runtime,
+                                 nxt_recv_msg_cmsg_pid(msg),
+                                 msg->port_msg.reply_port);
+
+    if (nxt_fast_path(port != NULL)) {
+        (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR, -1,
+                                     msg->port_msg.stream, 0, NULL);
+    }
+
+    b = msg->buf;
+
+    if (b == NULL) {
+        return;
+    }
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (mp == NULL) {
+        return;
+    }
+
+    b = nxt_buf_chk_make_plain(mp, b, msg->size);
+
+    if (b == NULL) {
+        return;
+    }
+
+    nxt_debug(task, "application languages: \"%*s\"",
+              b->mem.free - b->mem.pos, b->mem.pos);
+
+    conf = nxt_conf_json_parse(mp, b->mem.pos, b->mem.free, NULL);
+    if (conf == NULL) {
+        nxt_alert(task, "discovery message is not valid JSON; "
+                        "no application modules will be available");
+        goto fail;
+    }
+
+    root = nxt_conf_get_path(conf, &root_path);
+    if (root == NULL) {
+        nxt_alert(task, "discovery message has no module list; "
+                        "no application modules will be available");
+        goto fail;
+    }
+
+    for (index = 0; /* void */ ; index++) {
+        value = nxt_conf_get_array_element(root, index);
+        if (value == NULL) {
+            break;
+        }
+
+        lang = nxt_array_zero_add(rt->languages);
+        if (lang == NULL) {
+            nxt_alert(task, "failed to record the module at index %uD", index);
+            goto fail;
+        }
+
+        lang->module = NULL;
+
+        ret = nxt_conf_map_object(rt->mem_pool, value, nxt_app_lang_module_map,
+                                  nxt_nitems(nxt_app_lang_module_map), lang);
+
+        if (ret != NXT_OK) {
+            nxt_alert(task, "unexpected members in the module at index %uD",
+                      index);
+            goto fail;
+        }
+
+        mounts = nxt_conf_get_object_member(value, &mounts_name, NULL);
+        if (mounts == NULL) {
+            nxt_alert(task, "missing mounts from discovery message.");
+            goto fail;
+        }
+
+        if (nxt_conf_type(mounts) != NXT_CONF_ARRAY) {
+            nxt_alert(task, "invalid mounts type from discovery message.");
+            goto fail;
+        }
+
+        nmounts = nxt_conf_array_elements_count(mounts);
+
+        lang->mounts = nxt_array_create(rt->mem_pool, nmounts,
+                                        sizeof(nxt_fs_mount_t));
+
+        if (lang->mounts == NULL) {
+            goto fail;
+        }
+
+        for (jindex = 0; /* */; jindex++) {
+            value = nxt_conf_get_array_element(mounts, jindex);
+            if (value == NULL) {
+                break;
+            }
+
+            mnt = nxt_array_zero_add(lang->mounts);
+            if (mnt == NULL) {
+                goto fail;
+            }
+
+            mnt->builtin = 1;
+            mnt->deps = 1;
+
+            ret = nxt_conf_map_object(rt->mem_pool, value,
+                                      nxt_app_lang_mounts_map,
+                                      nxt_nitems(nxt_app_lang_mounts_map), mnt);
+
+            if (ret != NXT_OK) {
+                goto fail;
+            }
+        }
+
+        nxt_debug(task, "lang %d %s \"%s\" (%d mounts)",
+                  lang->type, lang->version, lang->file, lang->mounts->nelts);
+    }
+
+    qsort(rt->languages->elts, rt->languages->nelts,
+          sizeof(nxt_app_lang_module_t), nxt_app_lang_compare);
+
+fail:
+
+    nxt_mp_destroy(mp);
+
+    ret = nxt_process_init_start(task, nxt_controller_process);
+    if (ret == NXT_OK) {
+        ret = nxt_process_init_start(task, nxt_router_process);
+    }
+
+    if (nxt_slow_path(ret == NXT_ERROR)) {
+        nxt_main_start_exit(task);
+
+        nxt_runtime_quit(task, 1);
+    }
+}
+
+
+static int nxt_cdecl
+nxt_app_lang_compare(const void *v1, const void *v2)
+{
+    int                          n;
+    const nxt_app_lang_module_t  *lang1, *lang2;
+
+    lang1 = v1;
+    lang2 = v2;
+
+    n = lang1->type - lang2->type;
+
+    if (n != 0) {
+        return n;
+    }
+
+    n = nxt_strverscmp(lang1->version, lang2->version);
+
+    /* Negate result to move higher versions to the beginning. */
+
+    return -n;
+}
+
+
+static void
+nxt_main_port_conf_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    void           *p;
+    size_t         size;
+    nxt_port_t     *ctl_port;
+    nxt_runtime_t  *rt;
+
+    rt = task->thread->runtime;
+
+    ctl_port = rt->port_by_type[NXT_PROCESS_CONTROLLER];
+
+    /*
+     * Use the kernel-validated sender PID (SCM_CREDENTIALS): msg->port_msg.pid
+     * is self-declared and a compromised worker can forge it to pose as the
+     * controller and have main rewrite the persistent configuration store —
+     * arbitrary configuration on the next reload is root code execution.
+     * The NULL guard covers the early-startup / late-teardown window in
+     * which the controller slot is unset.
+     */
+    if (nxt_slow_path(ctl_port == NULL
+                      || nxt_recv_msg_cmsg_pid(msg) != ctl_port->pid))
+    {
+        nxt_alert(task, "process %PI cannot store conf",
+                  nxt_recv_msg_cmsg_pid(msg));
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    p = MAP_FAILED;
+
+    /*
+     * Ancient compilers like gcc 4.8.5 on CentOS 7 wants 'size' to be
+     * initialized in 'cleanup' section.
+     */
+    size = 0;
+
+    if (nxt_slow_path(msg->fd[0] == -1)) {
+        nxt_alert(task, "conf_store_handler: invalid shm fd");
+        goto error;
+    }
+
+    if (nxt_buf_mem_used_size(&msg->buf->mem) != sizeof(size_t)) {
+        nxt_alert(task, "conf_store_handler: unexpected buffer size (%d)",
+                  (int) nxt_buf_mem_used_size(&msg->buf->mem));
+        goto error;
+    }
+
+    nxt_memcpy(&size, msg->buf->mem.pos, sizeof(size_t));
+
+    p = nxt_mem_mmap(NULL, size, PROT_READ, MAP_SHARED, msg->fd[0], 0);
+
+    nxt_fd_close(msg->fd[0]);
+    msg->fd[0] = -1;
+
+    if (nxt_slow_path(p == MAP_FAILED)) {
+        goto error;
+    }
+
+    nxt_debug(task, "conf_store_handler(%uz): %*s", size, size, p);
+
+    /* The scheduler owns the mapping from here on. */
+    nxt_main_store_schedule(task, p, size);
+
+    return;
+
+error:
+
+    nxt_alert(task, "failed to store current configuration");
+
+    if (p != MAP_FAILED) {
+        nxt_mem_munmap(p, size);
+    }
+
+    if (msg->fd[0] != -1) {
+        nxt_fd_close(msg->fd[0]);
+        msg->fd[0] = -1;
+    }
+}
+
+
+/*
+ * A store runs fsync(2) twice for each file, which can take tens of
+ * milliseconds.  A short-lived child does it, so main forks workers and
+ * handles signals in the meantime (issue #516).
+ *
+ * Only one store child runs at a time: two would race on the same
+ * temporary name.  A conf.json store that arrives while a child runs
+ * becomes the pending store, and a newer store replaces it.  Other stores
+ * are jobs (nxt_main_store_submit()).  They wait in a queue, and each one
+ * runs.  nxt_main_store_next() starts the next store when the child exits.
+ *
+ * The stores start in the order they came.  A newer conf.json store takes
+ * the place of the pending store that it replaces.  The order matters for
+ * a certificate DELETE: it must not run before an older conf.json store
+ * that stops naming the bundle.  Otherwise a crash between the two leaves
+ * a conf.json that names a deleted bundle, and the next start refuses
+ * that configuration.
+ *
+ * "p" is a mapping of "size" bytes; this function takes ownership of it.
+ */
+static void
+nxt_main_store_schedule(nxt_task_t *task, u_char *p, size_t size)
+{
+    nxt_main_store_job_t  *job;
+
+    if (nxt_main_store.pending != NULL) {
+        nxt_debug(task, "state store: a newer store replaces the pending one");
+
+        nxt_mem_munmap(nxt_main_store.pending, nxt_main_store.pending_size);
+
+    } else {
+        /* The jobs that wait now came first. */
+        nxt_main_store.ahead = 0;
+
+        for (job = nxt_main_store.jobs; job != NULL; job = job->next) {
+            nxt_main_store.ahead++;
+        }
+    }
+
+    nxt_main_store.pending = p;
+    nxt_main_store.pending_size = size;
+
+    if (nxt_main_store.pid == 0) {
+        nxt_main_store_next(task);
+        return;
+    }
+
+    if (nxt_exiting) {
+        nxt_main_store_cancel(task);
+    }
+}
+
+
+/*
+ * Main starts to exit.  The SIGTERM and SIGQUIT handlers call this, and so
+ * does the start failure.  The test hook nxt_main_test_store_set_exiting()
+ * calls it too, so src/test/nxt_main_store_test.c runs this code.
+ */
+static void
+nxt_main_start_exit(nxt_task_t *task)
+{
+    nxt_exiting = 1;
+
+    nxt_main_store_cancel(task);
+}
+
+
+/*
+ * At exit, main waits for the store child and then for the pending store.
+ * When a conf.json store is pending and a conf.json store child runs, that
+ * child stores a configuration that is no longer the last one, so main
+ * stops it with SIGKILL and waits for one store instead of two.  The next
+ * store starts when the child is reaped, so two stores still do not
+ * overlap.  Main never kills a job child: each job runs.
+ *
+ * Main does this only at exit.  While main runs, the child finishes, and
+ * the pending store waits for it.  A kill on each new store would let
+ * stores that come faster than one store takes keep conf.json old until
+ * they stop.
+ *
+ * A killed child leaves at most the temporary file, and the next store
+ * unlinks it first.  If the child is killed after a rename(), the file it
+ * renamed is complete, because it was flushed before the rename(); the
+ * next store flushes the directory again.  A killed child does not set
+ * nxt_conf_ver, so the next store writes the version file again.
+ */
+static void
+nxt_main_store_cancel(nxt_task_t *task)
+{
+    if (nxt_main_store.pid == 0
+        || nxt_main_store.job != NULL
+        || nxt_main_store.killed
+        || nxt_main_store.pending == NULL)
+    {
+        return;
+    }
+
+    /*
+     * The child is not reaped until the SIGCHLD handler runs, so its pid
+     * cannot belong to another process yet.
+     */
+    if (nxt_slow_path(kill(nxt_main_store.pid, SIGKILL) != 0)) {
+        nxt_alert(task, "kill(%PI, SIGKILL) failed %E",
+                  nxt_main_store.pid, nxt_errno);
+        return;
+    }
+
+    nxt_debug(task, "state store child %PI cancelled", nxt_main_store.pid);
+
+    nxt_main_store.killed = 1;
+}
+
+
+/*
+ * Allocate a job that changes "<dir><name>".  "dir" ends with "/", its
+ * "start" is NUL-terminated, and it must live as long as main, as
+ * rt->certs and rt->scripts do.  A PUT job writes through the temporary
+ * "<dir>.store.tmp".  One temporary name per directory is enough, because
+ * only one store runs at a time.  So the caller must refuse a "name" that
+ * starts with ".".  "what" names the kind of file in the alerts, for
+ * example "certificate".
+ *
+ * The caller then sets "data" and "size" of a PUT job (nxt_malloc()ed
+ * memory, which the job owns from here on), and "reply_pid", "reply_port"
+ * and "stream" when the sender waits for an answer.  It gives the job to
+ * nxt_main_store_submit(), or frees it with nxt_main_store_job_free().
+ */
+nxt_main_store_job_t *
+nxt_main_store_job_create(nxt_main_store_op_t op, const char *what,
+    const nxt_str_t *dir, const nxt_str_t *name)
+{
+    u_char                *p;
+    size_t                size, path;
+    nxt_main_store_job_t  *job;
+
+    /* "<dir><name>" and its NUL. */
+    if (nxt_size_add(dir->length, name->length, &path) != 0
+        || nxt_size_add(path, 1, &path) != 0
+        || nxt_size_add(sizeof(nxt_main_store_job_t), path, &size) != 0)
+    {
+        return NULL;
+    }
+
+    /* "<dir>.store.tmp" and its NUL. */
+    if (op == NXT_MAIN_STORE_PUT
+        && (nxt_size_add(size, dir->length, &size) != 0
+            || nxt_size_add(size, sizeof(NXT_MAIN_STORE_TMP), &size) != 0))
+    {
+        return NULL;
+    }
+
+    job = nxt_malloc(size);
+    if (nxt_slow_path(job == NULL)) {
+        return NULL;
+    }
+
+    nxt_memzero(job, sizeof(nxt_main_store_job_t));
+
+    job->op = op;
+    job->what = what;
+    job->dir = (const char *) dir->start;
+
+    p = (u_char *) job + sizeof(nxt_main_store_job_t);
+
+    job->name = (char *) p;
+    job->base = (char *) p + dir->length;
+
+    p = nxt_cpymem(p, dir->start, dir->length);
+    p = nxt_cpymem(p, name->start, name->length);
+    *p++ = '\0';
+
+    if (op == NXT_MAIN_STORE_PUT) {
+        job->tmp = (char *) p;
+
+        p = nxt_cpymem(p, dir->start, dir->length);
+        nxt_memcpy(p, NXT_MAIN_STORE_TMP, sizeof(NXT_MAIN_STORE_TMP));
+    }
+
+    return job;
+}
+
+
+void
+nxt_main_store_job_free(nxt_main_store_job_t *job)
+{
+    nxt_free(job->data);
+    nxt_free(job);
+}
+
+
+/*
+ * Queue a job after the jobs that wait already.  Main answers the sender
+ * when the job ends: RPC_READY_LAST when the child exited with 0, and
+ * RPC_ERROR otherwise.  When fork() fails, main runs the job itself and
+ * answers at once.  The job is freed after the answer.
+ */
+void
+nxt_main_store_submit(nxt_task_t *task, nxt_main_store_job_t *job)
+{
+    nxt_main_store_job_t  **last;
+
+    job->next = NULL;
+
+    for (last = &nxt_main_store.jobs; *last != NULL; last = &(*last)->next) {
+        /* void */
+    }
+
+    *last = job;
+
+    if (nxt_main_store.pid == 0) {
+        nxt_main_store_next(task);
+    }
+}
+
+
+/*
+ * Start stores until a child runs or nothing waits, in the order they came:
+ * see nxt_main_store_schedule().  A store that cannot fork runs in main,
+ * and then the next one starts.
+ */
+static void
+nxt_main_store_next(nxt_task_t *task)
+{
+    u_char                *p;
+    size_t                size;
+    nxt_main_store_job_t  *job;
+
+    while (nxt_main_store.pid == 0) {
+        job = nxt_main_store.jobs;
+        p = nxt_main_store.pending;
+
+        if (job != NULL && (p == NULL || nxt_main_store.ahead != 0)) {
+            nxt_main_store.jobs = job->next;
+            job->next = NULL;
+
+            if (nxt_main_store.ahead != 0) {
+                nxt_main_store.ahead--;
+            }
+
+            nxt_main_store_start_job(task, job);
+            continue;
+        }
+
+        if (p == NULL) {
+            return;
+        }
+
+        size = nxt_main_store.pending_size;
+
+        nxt_main_store.pending = NULL;
+        nxt_main_store.pending_size = 0;
+
+        nxt_main_store_start(task, p, size);
+    }
+}
+
+
+/*
+ * Fork a store child.  Returns the pid in main, 0 in the child and -1 when
+ * fork() fails.
+ *
+ * The signals of main stay blocked in the child, so SIGTERM or SIGINT sent
+ * to the process group does not stop the store.  The child ends with
+ * _exit(), which runs no atexit() handler of main.
+ */
+static nxt_pid_t
+nxt_main_store_fork(nxt_task_t *task)
+{
+    nxt_pid_t  pid;
+
+    pid = fork();
+
+    if (nxt_slow_path(pid < 0)) {
+        nxt_alert(task, "fork() failed for the state store %E", nxt_errno);
+        return -1;
+    }
+
+    if (pid == 0) {
+        nxt_pid = getpid();
+        task->thread->tid = 0;
+
+        nxt_main_store_close_fds();
+
+#if (NXT_TESTS)
+        if (nxt_main_test_store_delay != 0) {
+            nxt_nanosleep(nxt_main_test_store_delay * 1000000);
+        }
+#endif
+
+        return 0;
+    }
+
+    nxt_debug(task, "state store child %PI", pid);
+
+    nxt_main_store.pid = pid;
+
+    return pid;
+}
+
+
+static void
+nxt_main_store_start(nxt_task_t *task, u_char *p, size_t size)
+{
+    nxt_pid_t   pid;
+    nxt_bool_t  version;
+
+    /*
+     * The version file is stored again with each store until a child that
+     * stored it exits with 0.  Only then does main set nxt_conf_ver.
+     */
+    version = (nxt_conf_ver != NXT_VERNUM);
+
+    pid = nxt_main_store_fork(task);
+
+    if (nxt_slow_path(pid < 0)) {
+        /* Do not lose the store: do it in main, as before the child. */
+        if (nxt_main_store_files(task, p, size, version) == NXT_OK
+            && version)
+        {
+            nxt_conf_ver = NXT_VERNUM;
+        }
+
+        nxt_mem_munmap(p, size);
+        return;
+    }
+
+    if (pid == 0) {
+        if (nxt_main_store_files(task, p, size, version) != NXT_OK) {
+            _exit(1);
+        }
+
+        _exit(0);
+    }
+
+    /* The child has its own copy of the mapping. */
+    nxt_mem_munmap(p, size);
+
+    nxt_main_store.version = version;
+}
+
+
+static void
+nxt_main_store_start_job(nxt_task_t *task, nxt_main_store_job_t *job)
+{
+    nxt_pid_t  pid;
+
+    pid = nxt_main_store_fork(task);
+
+    if (nxt_slow_path(pid < 0)) {
+        nxt_main_store_job_done(task, job, nxt_main_store_job_run(task, job));
+        return;
+    }
+
+    if (pid == 0) {
+        if (nxt_main_store_job_run(task, job) != NXT_OK) {
+            _exit(1);
+        }
+
+        _exit(0);
+    }
+
+    /* The child has its own copy of the data. */
+    nxt_free(job->data);
+    job->data = NULL;
+
+    nxt_main_store.job = job;
+}
+
+
+static nxt_int_t
+nxt_main_store_job_run(nxt_task_t *task, nxt_main_store_job_t *job)
+{
+    if (job->op == NXT_MAIN_STORE_PUT) {
+        return nxt_main_file_store(task, job->dir, job->tmp, job->name,
+                                   job->data, job->size);
+    }
+
+    /* A file that is not there is deleted already. */
+    if (unlink(job->name) != 0) {
+        if (nxt_errno == NXT_ENOENT) {
+            return NXT_OK;
+        }
+
+        nxt_alert(task, "unlink(\"%s\") failed %E", job->name, nxt_errno);
+
+        return NXT_ERROR;
+    }
+
+    /* The file is gone; a failed flush only costs durability. */
+    (void) nxt_file_dir_sync(task, (nxt_file_name_t *) job->dir);
+
+    return NXT_OK;
+}
+
+
+/*
+ * Log a failed job, answer the sender and free the job.  Main logs the
+ * failure: the alerts of the child can go to a rotated log, because
+ * SIGUSR1 reopens the log in main only.  A sender that has gone has no
+ * port in the runtime any more, and gets no answer.
+ */
+static void
+nxt_main_store_job_done(nxt_task_t *task, nxt_main_store_job_t *job,
+    nxt_int_t ret)
+{
+    nxt_port_t           *port;
+    nxt_port_msg_type_t  type;
+
+    if (ret == NXT_OK) {
+        type = NXT_PORT_MSG_RPC_READY_LAST;
+
+    } else {
+        type = NXT_PORT_MSG_RPC_ERROR;
+
+        nxt_alert(task, "failed to %s %s \"%s\"",
+                  (job->op == NXT_MAIN_STORE_PUT) ? "store" : "delete",
+                  job->what, job->base);
+    }
+
+    if (job->reply_pid != 0) {
+        port = nxt_runtime_port_find(task->thread->runtime, job->reply_pid,
+                                     job->reply_port);
+
+        if (port != NULL) {
+            (void) nxt_port_socket_write(task, port, type, -1, job->stream,
+                                         0, NULL);
+        }
+    }
+
+    nxt_main_store_job_free(job);
+}
+
+
+/*
+ * The store child inherits every descriptor of main: the listen sockets,
+ * the ports and the log files.  A copy of a listen socket keeps the address
+ * bound while the child runs, so a listener that the router closes cannot
+ * be bound again until the store ends.  The child needs none of them.  It
+ * logs to stderr (nxt_log_time_handler() writes to nxt_stderr, which
+ * nxt_runtime_log_files_create() redirects to the log file), and it opens
+ * the files it writes.  So it closes every descriptor from 3 upwards.
+ *
+ * close_range() fails with ENOSYS on Linux before 5.9, and a seccomp
+ * profile can refuse it.  Then, on Linux, the child closes the descriptors
+ * that /proc/self/fd lists.  Only when that directory cannot be read does
+ * it close each number up to the limit: with a limit of 1048576 that loop
+ * took 862 to 892 ms per store.  All of this runs in the child, not in
+ * main.
+ */
+static void
+nxt_main_store_close_fds(void)
+{
+#if (NXT_HAVE_CLOSEFROM && !NXT_HAVE_CLOSE_RANGE && !NXT_HAVE_SYS_CLOSE_RANGE)
+
+    closefrom(3);
+
+#else
+
+    long  fd, max;
+
+#if (NXT_HAVE_CLOSE_RANGE)
+
+    if (close_range(3, ~0U, 0) == 0) {
+        return;
+    }
+
+#elif (NXT_HAVE_SYS_CLOSE_RANGE)
+
+    if (syscall(SYS_close_range, 3, ~0U, 0) == 0) {
+        return;
+    }
+
+#endif
+
+#if (NXT_LINUX)
+
+    if (nxt_main_store_close_proc_fds() == NXT_OK) {
+        return;
+    }
+
+#endif
+
+    max = sysconf(_SC_OPEN_MAX);
+
+    if (max <= 0) {
+        max = 1024;
+    }
+
+    for (fd = 3; fd < max; fd++) {
+        (void) close((int) fd);
+    }
+
+#endif
+}
+
+
+#if (NXT_LINUX)
+
+/*
+ * Close the descriptors from 3 upwards that /proc/self/fd lists, except
+ * the one that reads the directory.  A close changes the directory while
+ * it is read, and readdir() can then skip an entry.  So the scan runs
+ * again from the start until a scan closes nothing, as glibc does in
+ * __closefrom_fallback().
+ */
+static nxt_int_t
+nxt_main_store_close_proc_fds(void)
+{
+    int            dfd;
+    DIR            *dir;
+    nxt_int_t      fd;
+    nxt_bool_t     closed;
+    struct dirent  *de;
+
+    dir = opendir("/proc/self/fd");
+    if (dir == NULL) {
+        return NXT_ERROR;
+    }
+
+    dfd = dirfd(dir);
+
+    do {
+        closed = 0;
+
+        for ( ;; ) {
+            de = readdir(dir);
+            if (de == NULL) {
+                break;
+            }
+
+            /* "." and ".." do not parse. */
+            fd = nxt_int_parse((u_char *) de->d_name,
+                               nxt_strlen(de->d_name));
+
+            if (fd < 3 || fd == dfd) {
+                continue;
+            }
+
+            (void) close((int) fd);
+            closed = 1;
+        }
+
+        rewinddir(dir);
+
+    } while (closed);
+
+    (void) closedir(dir);
+
+    return NXT_OK;
+}
+
+#endif
+
+
+static nxt_int_t
+nxt_main_store_files(nxt_task_t *task, u_char *p, size_t size,
+    nxt_bool_t version)
+{
+    size_t         n;
+    nxt_int_t      ret;
+    nxt_runtime_t  *rt;
+    u_char         ver[NXT_INT_T_LEN];
+
+    rt = task->thread->runtime;
+
+    if (version) {
+        n = nxt_sprintf(ver, ver + NXT_INT_T_LEN, "%d", NXT_VERNUM) - ver;
+
+        ret = nxt_main_file_store(task, rt->state, rt->ver_tmp, rt->ver, ver, n);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            goto fail;
+        }
+    }
+
+    ret = nxt_main_file_store(task, rt->state, rt->conf_tmp, rt->conf, p, size);
+
+    if (nxt_fast_path(ret == NXT_OK)) {
+        return NXT_OK;
+    }
+
+fail:
+
+    nxt_alert(task, "failed to store current configuration");
+
+    return NXT_ERROR;
+}
+
+
+/* Whether "pid" is the store child that main killed, and it died of that. */
+static nxt_bool_t
+nxt_main_store_cancelled(nxt_pid_t pid, int status)
+{
+    return (pid == nxt_main_store.pid
+            && nxt_main_store.killed
+            && WIFSIGNALED(status)
+            && WTERMSIG(status) == SIGKILL);
+}
+
+
+/*
+ * Called by the SIGCHLD handler for every reaped pid.  Returns 1 when "pid"
+ * was the store child.  The child is not in the process registry and is not
+ * counted in rt->nprocesses.
+ *
+ * Main logs a failed store again: the alerts of the child can go to a
+ * rotated log, because SIGUSR1 reopens the log in main only.  A child that
+ * main killed is not a failure: a newer store is pending.  A child that
+ * exited before the signal arrived keeps its exit code.
+ *
+ * A controller that exits while a store child runs starts again here, when no
+ * store runs or waits.  nxt_controller_prefork() reads conf.json, the
+ * certificate bundles and the njs modules from disk.  Started at once, the new
+ * controller could read them before the child renames its file.  It would then
+ * keep the old state, and main would send the answer of the store to the
+ * controller that has gone.  Only the controller sends stores, so no store is
+ * added after main has reaped it.
+ */
+static nxt_bool_t
+nxt_main_store_exited(nxt_task_t *task, nxt_pid_t pid, int status)
+{
+    nxt_int_t             ret;
+    nxt_bool_t            ok;
+    nxt_main_store_job_t  *job;
+
+    if (pid != nxt_main_store.pid) {
+        return 0;
+    }
+
+    ok = (WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    job = nxt_main_store.job;
+
+    if (job != NULL) {
+        nxt_main_store_job_done(task, job, ok ? NXT_OK : NXT_ERROR);
+
+    } else if (ok) {
+        if (nxt_main_store.version) {
+            nxt_conf_ver = NXT_VERNUM;
+        }
+
+    } else if (nxt_main_store_cancelled(pid, status)) {
+        nxt_debug(task, "state store child %PI stopped, a newer store follows",
+                  pid);
+
+    } else {
+        nxt_alert(task, "state store child %PI failed, "
+                  "the configuration was not stored", pid);
+    }
+
+    nxt_main_store.pid = 0;
+    nxt_main_store.killed = 0;
+    nxt_main_store.job = NULL;
+
+    nxt_main_store_next(task);
+
+    if (nxt_main_store.pid == 0 && nxt_main_store.controller) {
+        nxt_main_store.controller = 0;
+
+        if (!nxt_exiting) {
+            ret = nxt_process_init_start(task, nxt_controller_process);
+            if (nxt_slow_path(ret == NXT_ERROR)) {
+                nxt_alert(task, "failed to restart controller");
+            }
+        }
+    }
+
+    return 1;
+}
+
+
+/*
+ * Replace "name" with "size" bytes of "buf" atomically: the content goes to
+ * "tmp_name", which the caller places in "dir" beside the destination, is
+ * flushed, and only then rename(2)d over "name", so a reader sees either
+ * the whole old file or the whole new one.  "dir" is flushed after the
+ * rename, without which the rename may not survive a power loss.  Every
+ * failure before the rename unlinks the temporary and leaves the existing
+ * "name" untouched.
+ *
+ * Because the replacement arrives by rename(), a "name" that was a symlink
+ * is replaced by a regular file rather than followed -- the price of
+ * atomicity.  A symlinked state *directory* is unaffected: "dir" and
+ * "tmp_name" resolve through it just as "name" does.
+ *
+ * The temporary is created 0600 as before; when the destination already
+ * exists, its mode and ownership are carried over to the replacement, so a
+ * state file an administrator has re-permissioned keeps its settings.
+ */
+nxt_int_t
+nxt_main_file_store(nxt_task_t *task, const char *dir, const char *tmp_name,
+    const char *name, u_char *buf, size_t size)
+{
+    size_t      written;
+    ssize_t     n;
+    nxt_int_t   ret;
+    nxt_file_t  file;
+
+    nxt_memzero(&file, sizeof(nxt_file_t));
+
+    file.name = (nxt_file_name_t *) tmp_name;
+
+    /*
+     * Without a log level nxt_file_open() reports nothing, and a failed
+     * store would be diagnosable only from the caller's summary alert.
+     * NXT_LOG_ALERT is zero, which is the "say nothing" value, so the
+     * loudest usable level here is NXT_LOG_ERR.
+     */
+    file.log_level = NXT_LOG_ERR;
+
+    /*
+     * Unlink first, then create exclusively, rather than opening the
+     * temporary with O_TRUNC.  The name is predictable and the store runs
+     * as root, so if --statedir is writable by anyone else that user can
+     * put a symbolic link there ahead of us: O_TRUNC would follow it and
+     * truncate whatever it addresses, and the rename below would then
+     * install the link as the state file.  O_EXCL refuses a link outright
+     * and refuses a regular file somebody hard-linked to a target we must
+     * not write, which O_NOFOLLOW alone would not.
+     *
+     * A leftover temporary from an interrupted store is still simply
+     * replaced -- that is what the unlink is for.  The window between the
+     * two is not a hole: something recreated in it makes the create fail,
+     * which loses the store and keeps the target, rather than the other
+     * way round.
+     */
+    if (nxt_slow_path(unlink(tmp_name) != 0 && nxt_errno != NXT_ENOENT)) {
+        nxt_alert(task, "unlink(\"%FN\") failed %E", file.name, nxt_errno);
+
+        return NXT_ERROR;
+    }
+
+    ret = nxt_file_open(task, &file, NXT_FILE_WRONLY,
+                        NXT_FILE_CREATE_EXCLUSIVE, NXT_FILE_OWNER_ACCESS);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return NXT_ERROR;
+    }
+
+    /*
+     * pwrite() is allowed to store less than it was asked for, and this
+     * store exists to survive a partial one: resume from where it stopped
+     * rather than turning a short write into a failed store.  A zero return
+     * carries no errno and cannot make progress, so it ends the loop.
+     */
+    for (written = 0; written < size; written += n) {
+        n = nxt_file_write(&file, buf + written, size - written, written);
+
+        if (nxt_slow_path(n <= 0)) {
+            /* nxt_file_write() logs the errno; a zero return has none. */
+            if (n == 0) {
+                nxt_alert(task, "write(\"%FN\") stored %uz of %uz bytes",
+                          file.name, written, size);
+            }
+
+            goto fail;
+        }
+    }
+
+    if (nxt_slow_path(nxt_main_file_store_inherit(task, &file, name)
+                      != NXT_OK))
+    {
+        goto fail;
+    }
+
+    /*
+     * rename() already orders the name change for readers; what this buys
+     * is the data reaching stable storage before the name points at it, so
+     * a crash cannot leave conf.json naming a file whose blocks were never
+     * written.
+     */
+    if (nxt_slow_path(nxt_file_sync(task, &file) != NXT_OK)) {
+        goto fail;
+    }
+
+    nxt_file_close(task, &file);
+    file.fd = NXT_FILE_INVALID;
+
+    if (nxt_slow_path(nxt_file_rename(file.name, (nxt_file_name_t *) name)
+                      != NXT_OK))
+    {
+        (void) nxt_file_delete(file.name);
+        return NXT_ERROR;
+    }
+
+    /* The destination is in place; a failed flush only costs durability. */
+    (void) nxt_file_dir_sync(task, (nxt_file_name_t *) dir);
+
+    return NXT_OK;
+
+fail:
+
+    if (file.fd != NXT_FILE_INVALID) {
+        nxt_file_close(task, &file);
+    }
+
+    (void) nxt_file_delete(file.name);
+
+    return NXT_ERROR;
+}
+
+
+/*
+ * Carry the destination's mode and ownership onto the temporary that is
+ * about to replace it.  A destination that does not exist yet, or that is
+ * not a regular file, keeps the 0600 the temporary was created with.
+ */
+static nxt_int_t
+nxt_main_file_store_inherit(nxt_task_t *task, nxt_file_t *tmp,
+    const char *name)
+{
+    nxt_file_info_t  fi;
+
+    /*
+     * lstat(), not nxt_file_info(), which stat()s a name and therefore
+     * follows a symbolic link.  The temporary is created exclusively
+     * because --statedir may be writable by another user; that same user
+     * can point the destination at a file of their own, and a stat() here
+     * would copy its ownership and mode onto the replacement -- aim it at
+     * something 0666 and conf.json comes back world-writable, and stays
+     * that way, because every later store inherits it again.
+     *
+     * On the path this is for -- an administrator's re-permissioned state
+     * file -- lstat() and stat() agree.
+     */
+    if (lstat(name, &fi) != 0) {
+        if (nxt_errno == NXT_ENOENT) {
+            return NXT_OK;
+        }
+
+        /*
+         * The temporary is written and 0600 is a serviceable result, so
+         * an unreadable destination costs the inheritance and not the
+         * store: refusing to persist the configuration at all is the worse
+         * outcome, which is the same trade the fchown() below makes.
+         */
+        nxt_log(task, NXT_LOG_INFO, "lstat(\"%FN\") failed %E",
+                (nxt_file_name_t *) name, nxt_errno);
+
+        return NXT_OK;
+    }
+
+    /*
+     * Only a regular file donates anything.  A symbolic link, or a
+     * destination somebody replaced with a device or a directory, leaves
+     * the temporary on the 0600 it was created with; the rename replaces
+     * whatever is there either way.
+     */
+    if (!S_ISREG(fi.st_mode)) {
+        return NXT_OK;
+    }
+
+    /*
+     * Ownership first, mode second.  A successful chown() clears set-user-ID
+     * and set-group-ID on a regular file -- Linux does it to root's chown()
+     * too -- so doing it the other way round would drop exactly the bits
+     * "fi.st_mode & 07777" is here to carry over.
+     *
+     * Main runs as root, so this normally succeeds; when it cannot change
+     * the owner the store still proceeds -- refusing to persist the
+     * configuration would be the worse failure.
+     */
+    if (nxt_slow_path(fchown(tmp->fd, fi.st_uid, fi.st_gid) != 0)) {
+        nxt_log(task, NXT_LOG_INFO, "fchown(%FD, \"%FN\") failed %E",
+                tmp->fd, tmp->name, nxt_errno);
+    }
+
+    if (nxt_slow_path(fchmod(tmp->fd, fi.st_mode & 07777) != 0)) {
+        nxt_alert(task, "fchmod(%FD, \"%FN\") failed %E",
+                  tmp->fd, tmp->name, nxt_errno);
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+
+static void
+nxt_main_port_access_log_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    u_char               *path;
+    nxt_int_t            ret;
+    nxt_file_t           file;
+    nxt_port_t           *port, *router_port;
+    nxt_runtime_t        *rt;
+    nxt_port_msg_type_t  type;
+
+    nxt_debug(task, "opening access log file");
+
+    rt = task->thread->runtime;
+
+    /*
+     * Privileged file open as root with an attacker-controllable path.
+     * Only accept from the router; identify the sender via
+     * SCM_CREDENTIALS so a compromised worker cannot spoof the message
+     * and have main create / append to /etc/passwd or any other
+     * privileged path.
+     */
+    router_port = rt->port_by_type[NXT_PROCESS_ROUTER];
+    if (nxt_slow_path(router_port == NULL
+                      || nxt_recv_msg_cmsg_pid(msg) != router_port->pid))
+    {
+        nxt_alert(task, "process %PI cannot open access log",
+                  nxt_recv_msg_cmsg_pid(msg));
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    path = msg->buf->mem.pos;
+
+    nxt_memzero(&file, sizeof(nxt_file_t));
+
+    file.name = (nxt_file_name_t *) path;
+    file.log_level = NXT_LOG_ERR;
+
+    ret = nxt_file_open(task, &file, O_WRONLY | O_APPEND, O_CREAT,
+                        NXT_FILE_OWNER_ACCESS);
+
+    type = (ret == NXT_OK) ? NXT_PORT_MSG_RPC_READY_LAST | NXT_PORT_MSG_CLOSE_FD
+                           : NXT_PORT_MSG_RPC_ERROR;
+
+    port = nxt_runtime_port_find(task->thread->runtime,
+                                 nxt_recv_msg_cmsg_pid(msg),
+                                 msg->port_msg.reply_port);
+
+    if (nxt_fast_path(port != NULL)) {
+        if (nxt_port_socket_write(task, port, type, file.fd,
+                                  msg->port_msg.stream, 0, NULL)
+            != NXT_OK
+            && file.fd != -1)
+        {
+            /*
+             * Port layer never took ownership of the fd (e.g. malloc
+             * failure inside nxt_port_msg_alloc); close it explicitly to
+             * avoid leaking the open file in the main process.
+             */
+            nxt_file_close(task, &file);
+        }
+
+    } else {
+        nxt_file_close(task, &file);
+    }
+}

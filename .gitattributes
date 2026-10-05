@@ -1,0 +1,8 @@
+*.c	diff=cpp
+*.h	diff=cpp
+
+.hg*	export-ignore
+pkg/**	export-ignore
+docs/*.*	export-ignore
+docs/Makefile	export-ignore
+docs/unit-openapi.yaml	-export-ignore

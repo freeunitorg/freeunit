@@ -1,0 +1,60 @@
+Source: %%PACKAGE%%
+Section: admin
+Priority: optional
+Maintainer: %%PACKAGE_VENDOR%%
+Build-Depends: debhelper (>= 11),
+               linux-libc-dev,
+               libssl-dev,
+               libpcre2-dev,
+               pkg-config,
+               clang,
+               llvm,
+               cargo,
+               rustc
+Standards-Version: 4.1.4
+Homepage: %%HOMEPAGE%%
+
+# freeunit is a drop-in replacement for upstream NGINX Unit: each package
+# Provides/Conflicts/Replaces its "unit" counterpart so installing freeunit
+# cleanly takes over from a stock "unit" install. The two are deliberately not
+# co-installable. Conflicts/Replaces are unversioned on purpose -- there is no
+# version of upstream "unit" we want present alongside freeunit. The literal
+# "unit" here is the fixed upstream package name, unaffected by the RUNTIME knob.
+Package: %%PACKAGE%%
+Section: admin
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Provides: unit (= ${binary:Version}), %%RUNTIME%%-r%%UNIT_VERSION%%
+Conflicts: unit
+Replaces: unit
+Description: NGINX Unit
+ NGINX Unit is a runtime and delivery environment for modern distributed
+ applications. It runs the application code in multiple languages
+ (PHP, Python, Go, etc.), and tightly couples it with traffic delivery
+ in and out of the application. Take this application server and proxy
+ directly in the cloud / container environments and fully control your app
+ dynamically via an API.
+
+Package: %%PACKAGE%%-dbg
+Section: debug
+Architecture: any
+Priority: optional
+Depends: %%PACKAGE%% (= ${binary:Version}),
+         ${misc:Depends}
+Provides: unit-dbg (= ${binary:Version})
+Conflicts: unit-dbg
+Replaces: unit-dbg
+Description: NGINX Unit (debug symbols)
+ This package contains the debugging symbols for NGINX Unit.
+
+Package: %%PACKAGE%%-dev
+Section: libdevel
+Priority: optional
+Architecture: any
+Depends: %%PACKAGE%% (= ${binary:Version}),
+         ${misc:Depends}
+Provides: unit-dev (= ${binary:Version})
+Conflicts: unit-dev
+Replaces: unit-dev
+Description: NGINX Unit (development files)
+ Library and include files required for NGINX Unit modules development.

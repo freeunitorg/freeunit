@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <title>Welcome to FreeUnit</title>
+        <style type="text/css">
+            body { background: white; color: black; font-family: sans-serif; margin: 2em; line-height: 1.5; }
+            h1,h2 { color: #00974d; }
+            li { margin-bottom: 0.5em; }
+            pre { background-color: beige; padding: 0.4em; }
+            hr { margin-top: 2em; border: 1px solid #00974d; }
+            .indent { margin-left: 1.5em; }
+        </style>
+    </head>
+    <body>
+        <h1>Welcome to FreeUnit</h1>
+        <p>Congratulations! FreeUnit is installed and running.</p>
+        <h3>Useful Links</h3>
+        <ul>
+            <li><b><a href="https://github.com/freeunitorg/freeunit">https://github.com/freeunitorg/freeunit</a></b><br>
+                Browse the source, open issues, and contribute to FreeUnit.</li>
+            <li><b><a href="https://github.com/freeunitorg/freeunit/discussions">https://github.com/freeunitorg/freeunit/discussions</a></b><br>
+                Ask questions and get help from the community.</li>
+            <li><b><a href="https://freeunit.org">https://freeunit.org</a></b><br>
+                FreeUnit project website.</li>
+        </ul>
+
+        <h2>Next steps</h2>
+
+        <h3>Check Current Configuration</h3>
+        <div class="indent">
+        <p>Unit's control API is currently listening for configuration changes
+           on the <a href="https://en.wikipedia.org/wiki/Unix_domain_socket">Unix socket</a> at
+           <b>/var/run/control.unit.sock</b> inside the container.<br>
+           To see the current configuration run:</p>
+        <pre>docker exec -ti &lt;containerID&gt; curl --unix-socket /var/run/control.unit.sock http://localhost/config</pre>
+        </div>
+
+        <hr>
+        <p><a href="https://freeunit.org">FreeUnit &mdash; the universal web app server</a><br>
+        FreeUnit Community &copy; 2026</p>
+    </body>
+</html>

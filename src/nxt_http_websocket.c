@@ -1,0 +1,204 @@
+
+/*
+ * Copyright (C) NGINX, Inc.
+ */
+
+#include <nxt_main.h>
+#include <nxt_router.h>
+#include <nxt_http.h>
+#include <nxt_router_request.h>
+#include <nxt_port_memory_int.h>
+#include <nxt_websocket.h>
+#include <nxt_websocket_header.h>
+
+
+static void nxt_http_websocket_client(nxt_task_t *task, void *obj, void *data);
+static void nxt_http_websocket_error_handler(nxt_task_t *task, void *obj,
+    void *data);
+
+
+const nxt_http_request_state_t  nxt_http_websocket
+    nxt_aligned(64) =
+{
+    .ready_handler = nxt_http_websocket_client,
+    .error_handler = nxt_http_websocket_error_handler,
+};
+
+
+static void
+nxt_http_websocket_client(nxt_task_t *task, void *obj, void *data)
+{
+    size_t                  frame_size, used_size, copy_size, buf_free_size;
+    size_t                  chunk_copy_size;
+    nxt_buf_t               *out, *buf, **out_tail, *b, *next;
+    nxt_int_t               res;
+    nxt_http_request_t      *r;
+    nxt_request_rpc_data_t  *req_rpc_data;
+    nxt_websocket_header_t  *wsh;
+
+    r = obj;
+    req_rpc_data = r->req_rpc_data;
+
+    if (nxt_slow_path(req_rpc_data == NULL)) {
+        nxt_debug(task, "websocket client frame for destroyed request");
+
+        return;
+    }
+
+    nxt_debug(task, "http websocket client frame");
+
+    wsh = (nxt_websocket_header_t *) r->ws_frame->mem.pos;
+
+    frame_size = nxt_websocket_frame_header_size(wsh)
+                  + nxt_websocket_frame_payload_len(wsh);
+
+    buf = NULL;
+    buf_free_size = 0;
+    out = NULL;
+    out_tail = &out;
+
+    b = r->ws_frame;
+
+    while (b != NULL && frame_size > 0) {
+        used_size = nxt_buf_mem_used_size(&b->mem);
+        copy_size = nxt_min(used_size, frame_size);
+
+        while (copy_size > 0) {
+            if (buf == NULL || buf_free_size == 0) {
+                buf_free_size = nxt_min(frame_size, PORT_MMAP_DATA_SIZE);
+
+                buf = nxt_port_mmap_get_buf(task, &req_rpc_data->app->outgoing,
+                                            buf_free_size);
+                if (nxt_slow_path(buf == NULL)) {
+                    while (out != NULL) {
+                        buf = out->next;
+                        out->next = NULL;
+                        out->completion_handler(task, out, out->parent);
+                        out = buf;
+                    }
+
+                    nxt_http_websocket_error_handler(task, r, r->proto.any);
+
+                    return;
+                }
+
+                *out_tail = buf;
+                out_tail = &buf->next;
+            }
+
+            chunk_copy_size = nxt_min(buf_free_size, copy_size);
+
+            buf->mem.free = nxt_cpymem(buf->mem.free, b->mem.pos,
+                                       chunk_copy_size);
+
+            copy_size -= chunk_copy_size;
+            b->mem.pos += chunk_copy_size;
+            buf_free_size -= chunk_copy_size;
+            frame_size -= chunk_copy_size;
+        }
+
+        next = b->next;
+        b->next = NULL;
+
+        if (nxt_buf_mem_used_size(&b->mem) == 0) {
+            nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                               b->completion_handler, task, b, b->parent);
+
+            r->ws_frame = next;
+        }
+
+        b = next;
+    }
+
+    res = nxt_port_socket_write(task, req_rpc_data->app_port,
+                                NXT_PORT_MSG_WEBSOCKET, -1,
+                                req_rpc_data->stream,
+                                task->thread->engine->port->id, out);
+    if (nxt_slow_path(res != NXT_OK)) {
+        /*
+         * The port layer did not take the chain, so it is still ours to
+         * return -- and nothing else will: these are chunks of the
+         * application's outgoing shared memory, which no pool teardown
+         * reclaims.  A frame lost this way costs the segment capacity
+         * permanently, and the application starves once enough have gone.
+         *
+         * Queued rather than run here, as nxt_port_msg_drop() queues its
+         * own: nxt_port_mmap_buf_completion() can post a SHM_ACK, and
+         * re-entering the port layer from inside this call is worth
+         * avoiding even on the way out.
+         */
+
+        while (out != NULL) {
+            next = out->next;
+            out->next = NULL;
+
+            nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                               out->completion_handler, task, out,
+                               out->parent);
+
+            out = next;
+        }
+
+        /*
+         * And fail the connection, the way the allocation failure above
+         * does.  A non-OK answer here means the application port is gone or
+         * its shared queue is full, so this frame is not reaching the
+         * application at all; carrying on would leave the peer's stream
+         * short a frame it is never told about, which for a fragmented
+         * message is a protocol error the client cannot detect.  This is
+         * what the "// TODO: handle" that used to stand here was asking
+         * for.
+         */
+
+        nxt_http_websocket_error_handler(task, r, r->proto.any);
+
+        return;
+    }
+
+    b = r->ws_frame;
+
+    if (b != NULL) {
+        used_size = nxt_buf_mem_used_size(&b->mem);
+
+        if (used_size > 0) {
+            nxt_memmove(b->mem.start, b->mem.pos, used_size);
+
+            b->mem.pos = b->mem.start;
+            b->mem.free = b->mem.start + used_size;
+        }
+    }
+
+    nxt_http_request_ws_frame_start(task, r, r->ws_frame);
+}
+
+
+static void
+nxt_http_websocket_error_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_http_request_t      *r;
+    nxt_request_rpc_data_t  *req_rpc_data;
+
+    nxt_debug(task, "http websocket error handler");
+
+    r = obj;
+    req_rpc_data = r->req_rpc_data;
+
+    if (req_rpc_data == NULL) {
+        nxt_debug(task, "  req_rpc_data is NULL");
+        goto close_handler;
+    }
+
+    if (req_rpc_data->app_port == NULL) {
+        nxt_debug(task, "  app_port is NULL");
+        goto close_handler;
+    }
+
+    (void) nxt_port_socket_write(task, req_rpc_data->app_port,
+                                 NXT_PORT_MSG_WEBSOCKET_LAST,
+                                 -1, req_rpc_data->stream,
+                                 task->thread->engine->port->id, NULL);
+
+close_handler:
+
+    nxt_http_request_close_handler(task, obj, data);
+}

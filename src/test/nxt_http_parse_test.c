@@ -1,0 +1,1224 @@
+
+/*
+ * Copyright (C) NGINX, Inc.
+ * Copyright (C) Valentin V. Bartenev
+ */
+
+#include <nxt_main.h>
+#include "nxt_tests.h"
+
+
+typedef struct {
+    nxt_str_t  method;
+    nxt_str_t  target;
+    nxt_str_t  args;
+    u_char     version[8] NXT_NONSTRING;
+
+    /* target with "/." */
+    unsigned   complex_target:1;
+    /* target with "%" */
+    unsigned   quoted_target:1;
+    /* target with " " */
+    unsigned   space_in_target:1;
+} nxt_http_parse_test_request_line_t;
+
+
+typedef struct {
+    nxt_int_t  result;
+    unsigned   discard_unsafe_fields:1;
+} nxt_http_parse_test_fields_t;
+
+
+typedef struct {
+    nxt_str_t  name;
+    nxt_str_t  value;
+} nxt_http_test_field_t;
+
+
+typedef struct {
+    nxt_uint_t                   count;
+    const nxt_http_test_field_t  *fields;
+} nxt_http_parse_test_headers_t;
+
+
+typedef union {
+    void                                *pointer;
+    nxt_http_parse_test_fields_t        fields;
+    nxt_http_parse_test_request_line_t  request_line;
+    nxt_http_parse_test_headers_t       headers;
+} nxt_http_parse_test_data_t;
+
+
+typedef struct {
+    nxt_str_t  request;
+    nxt_int_t  result;
+    nxt_int_t  (*handler)(nxt_http_request_parse_t *rp,
+                          nxt_http_parse_test_data_t *data,
+                          nxt_str_t *request, nxt_log_t *log);
+
+    nxt_http_parse_test_data_t  data;
+} nxt_http_parse_test_case_t;
+
+
+static nxt_int_t nxt_http_parse_test_run(nxt_http_request_parse_t *rp,
+    nxt_str_t *request);
+static nxt_int_t nxt_http_parse_test_bench(nxt_thread_t *thr,
+    nxt_str_t *request, nxt_lvlhsh_t *hash, const char *name, nxt_uint_t n);
+static void nxt_http_parse_test_hash_destroy(nxt_lvlhsh_t *hash);
+static nxt_int_t nxt_http_parse_test_request_line(nxt_http_request_parse_t *rp,
+    nxt_http_parse_test_data_t *data,
+    nxt_str_t *request, nxt_log_t *log);
+static nxt_int_t nxt_http_parse_test_fields(nxt_http_request_parse_t *rp,
+    nxt_http_parse_test_data_t *data, nxt_str_t *request, nxt_log_t *log);
+static nxt_int_t nxt_http_parse_test_discard_fields(nxt_thread_t *thr);
+static nxt_int_t nxt_http_parse_test_headers(nxt_http_request_parse_t *rp,
+    nxt_http_parse_test_data_t *data, nxt_str_t *request, nxt_log_t *log);
+
+
+static const nxt_http_test_field_t  nxt_http_test_headers_8[] = {
+    { nxt_string("Host"), nxt_string("example.com") },
+    { nxt_string("User-Agent"), nxt_string("UnitTester/1.0") },
+    { nxt_string("Accept"), nxt_string("text/html,application/xhtml+xml") },
+    { nxt_string("Accept-Language"), nxt_string("en-US,en;q=0.9") },
+    { nxt_string("Accept-Encoding"), nxt_string("gzip, deflate") },
+    { nxt_string("Connection"), nxt_string("keep-alive") },
+    { nxt_string("X-Custom-Header-7"), nxt_string("CustomValue7") },
+    { nxt_string("X-Custom-Header-8"), nxt_string("CustomValue8") },
+};
+
+
+static const nxt_http_test_field_t  nxt_http_test_headers_16[] = {
+    { nxt_string("Host"), nxt_string("example.com") },
+    { nxt_string("User-Agent"), nxt_string("UnitTester/1.0") },
+    { nxt_string("Accept"), nxt_string("*/*") },
+    { nxt_string("Accept-Language"), nxt_string("en-US") },
+    { nxt_string("Accept-Encoding"), nxt_string("gzip") },
+    { nxt_string("Connection"), nxt_string("keep-alive") },
+    { nxt_string("Cache-Control"), nxt_string("no-cache") },
+    { nxt_string("Pragma"), nxt_string("no-cache") },
+    { nxt_string("Header-09"), nxt_string("Val-09") },
+    { nxt_string("Header-10"), nxt_string("Val-10") },
+    { nxt_string("Header-11"), nxt_string("Val-11") },
+    { nxt_string("Header-12"), nxt_string("Val-12") },
+    { nxt_string("Header-13"), nxt_string("Val-13") },
+    { nxt_string("Header-14"), nxt_string("Val-14") },
+    { nxt_string("Header-15"), nxt_string("Val-15") },
+    { nxt_string("Header-16"), nxt_string("Val-16") },
+};
+
+
+static const nxt_http_test_field_t  nxt_http_test_headers_24[] = {
+    { nxt_string("Host"), nxt_string("example.com") },
+    { nxt_string("User-Agent"), nxt_string("UnitTester/1.0") },
+    { nxt_string("Accept"), nxt_string("*/*") },
+    { nxt_string("Accept-Language"), nxt_string("en-US") },
+    { nxt_string("Accept-Encoding"), nxt_string("gzip") },
+    { nxt_string("Connection"), nxt_string("keep-alive") },
+    { nxt_string("Cache-Control"), nxt_string("no-cache") },
+    { nxt_string("Pragma"), nxt_string("no-cache") },
+    { nxt_string("Header-09"), nxt_string("Val-09") },
+    { nxt_string("Header-10"), nxt_string("Val-10") },
+    { nxt_string("Header-11"), nxt_string("Val-11") },
+    { nxt_string("Header-12"), nxt_string("Val-12") },
+    { nxt_string("Header-13"), nxt_string("Val-13") },
+    { nxt_string("Header-14"), nxt_string("Val-14") },
+    { nxt_string("Header-15"), nxt_string("Val-15") },
+    { nxt_string("Header-16"), nxt_string("Val-16") },
+    { nxt_string("X-Empty-Value"), nxt_string("") },
+    { nxt_string("X-Spaced-Value"), nxt_string("padded-value") },
+    { nxt_string("X-Special_Chars.123"), nxt_string("special#val") },
+    { nxt_string("X-Repeated-Name"), nxt_string("first") },
+    { nxt_string("X-Repeated-Name"), nxt_string("second") },
+    { nxt_string("Header-22"), nxt_string("Val-22") },
+    { nxt_string("Header-23"), nxt_string("Val-23") },
+    { nxt_string("Header-24"), nxt_string("Val-24") },
+};
+
+
+static const nxt_http_test_field_t  nxt_http_test_headers_32[] = {
+    { nxt_string("H-01"), nxt_string("v-01") },
+    { nxt_string("H-02"), nxt_string("v-02") },
+    { nxt_string("H-03"), nxt_string("v-03") },
+    { nxt_string("H-04"), nxt_string("v-04") },
+    { nxt_string("H-05"), nxt_string("v-05") },
+    { nxt_string("H-06"), nxt_string("v-06") },
+    { nxt_string("H-07"), nxt_string("v-07") },
+    { nxt_string("H-08"), nxt_string("v-08") },
+    { nxt_string("H-09"), nxt_string("v-09") },
+    { nxt_string("H-10"), nxt_string("v-10") },
+    { nxt_string("H-11"), nxt_string("v-11") },
+    { nxt_string("H-12"), nxt_string("v-12") },
+    { nxt_string("H-13"), nxt_string("v-13") },
+    { nxt_string("H-14"), nxt_string("v-14") },
+    { nxt_string("H-15"), nxt_string("v-15") },
+    { nxt_string("H-16"), nxt_string("v-16") },
+    { nxt_string("H-17"), nxt_string("v-17") },
+    { nxt_string("H-18"), nxt_string("v-18") },
+    { nxt_string("H-19"), nxt_string("v-19") },
+    { nxt_string("H-20"), nxt_string("v-20") },
+    { nxt_string("H-21"), nxt_string("v-21") },
+    { nxt_string("H-22"), nxt_string("v-22") },
+    { nxt_string("H-23"), nxt_string("v-23") },
+    { nxt_string("H-24"), nxt_string("v-24") },
+    { nxt_string("H-25"), nxt_string("v-25") },
+    { nxt_string("H-26"), nxt_string("v-26") },
+    { nxt_string("H-27"), nxt_string("v-27") },
+    { nxt_string("H-28"), nxt_string("v-28") },
+    { nxt_string("H-29"), nxt_string("v-29") },
+    { nxt_string("H-30"), nxt_string("v-30") },
+    { nxt_string("H-31"), nxt_string("v-31") },
+    { nxt_string("H-32"), nxt_string("v-32") },
+};
+
+
+static nxt_int_t nxt_http_test_header_return(void *ctx, nxt_http_field_t *field,
+    uintptr_t data);
+
+
+static nxt_http_parse_test_case_t  nxt_http_test_cases[] = {
+    {
+        nxt_string("GET / HTTP/1.0\r\n\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_request_line,
+        { .request_line = {
+            nxt_string("GET"),
+            nxt_string("/"),
+            nxt_null_string,
+            "HTTP/1.0",
+            0, 0, 0
+        }}
+    },
+    {
+        nxt_string("XXX-METHOD    /d.ir/fi+le.ext?key=val    HTTP/1.2\n\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_request_line,
+        { .request_line = {
+            nxt_string("XXX-METHOD"),
+            nxt_string("/d.ir/fi+le.ext?key=val"),
+            nxt_string("key=val"),
+            "HTTP/1.2",
+            0, 0, 0
+        }}
+    },
+    {
+        nxt_string("GET /di.r/? HTTP/1.0\r\n\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_request_line,
+        { .request_line = {
+            nxt_string("GET"),
+            nxt_string("/di.r/?"),
+            nxt_string(""),
+            "HTTP/1.0",
+            0, 0, 0
+        }}
+    },
+    {
+        nxt_string("GEt / HTTP/1.0\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /\0 HTTP/1.0\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /\r HTTP/1.0\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /\n HTTP/1.0\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.0\r\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/2.0\r\n"),
+        NXT_HTTP_PARSE_UNSUPPORTED_VERSION,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /. HTTP/1.0\r\n\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_request_line,
+        { .request_line = {
+            nxt_string("GET"),
+            nxt_string("/."),
+            nxt_null_string,
+            "HTTP/1.0",
+            1, 0, 0
+        }}
+    },
+    {
+        nxt_string("GET /# HTTP/1.0\r\n\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_request_line,
+        { .request_line = {
+            nxt_string("GET"),
+            nxt_string("/#"),
+            nxt_null_string,
+            "HTTP/1.0",
+            1, 0, 0
+        }}
+    },
+    {
+        nxt_string("GET /?# HTTP/1.0\r\n\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_request_line,
+        { .request_line = {
+            nxt_string("GET"),
+            nxt_string("/?#"),
+            nxt_string(""),
+            "HTTP/1.0",
+            1, 0, 0
+        }}
+    },
+    {
+        nxt_string("GET // HTTP/1.0\r\n\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_request_line,
+        { .request_line = {
+            nxt_string("GET"),
+            nxt_string("//"),
+            nxt_null_string,
+            "HTTP/1.0",
+            1, 0, 0
+        }}
+    },
+    {
+        nxt_string("GET /%20 HTTP/1.0\r\n\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_request_line,
+        { .request_line = {
+            nxt_string("GET"),
+            nxt_string("/%20"),
+            nxt_null_string,
+            "HTTP/1.0",
+            0, 1, 0
+        }}
+    },
+    {
+        nxt_string("GET / a HTTP/1.0\r\n\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_request_line,
+        { .request_line = {
+            nxt_string("GET"),
+            nxt_string("/ a"),
+            nxt_null_string,
+            "HTTP/1.0",
+            0, 0, 1
+        }}
+    },
+    {
+        nxt_string("GET /na %20me.ext?args HTTP/1.0\r\n\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_request_line,
+        { .request_line = {
+            nxt_string("GET"),
+            nxt_string("/na %20me.ext?args"),
+            nxt_string("args"),
+            "HTTP/1.0",
+            0, 1, 1
+        }}
+    },
+    {
+        nxt_string("GET / HTTP/1.0 HTTP/1.1\r\n\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_request_line,
+        { .request_line = {
+            nxt_string("GET"),
+            nxt_string("/ HTTP/1.0"),
+            nxt_null_string,
+            "HTTP/1.1",
+            0, 0, 1
+        }}
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host: example.com\r\n\r\n"),
+        NXT_DONE,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host:example.com \r\n\r\n"),
+        NXT_DONE,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host:\r\n\r\n"),
+        NXT_DONE,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host example.com\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   ":Host: example.com\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Ho_st: example.com\r\n\r\n"),
+        NXT_DONE,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Ho\0st: example.com\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Ho\rst: example.com\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Ho\nst: example.com\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host : example.com\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host: exa\0mple.com\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host: exa\rmple.com\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host: exa\bmple.com\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host: пример.испытание\r\n\r\n"),
+        NXT_DONE,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host: xn--e1afmkfd.xn--80akhbyknj4f\r\n\r\n"),
+        NXT_DONE,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host: exa\nmple.com\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host: exa\tmple.com\r\n\r\n"),
+        NXT_DONE,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "X-Unknown-Header: value\r\n"
+                   "X-Good-Header: value\r\n"
+                   "!#$%&'*+.^_`|~: skipped\r\n\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_fields,
+        { .fields = { NXT_OK, 1 } }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "X-Good-Header: value\r\n"
+                   "X-Unknown-Header: value\r\n"
+                   "X-Bad-Header: value\r\n\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_fields,
+        { .fields = { NXT_ERROR, 1 } }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "!#$%&'*+.^_`|~: allowed\r\n\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_fields,
+        { .fields = { NXT_ERROR, 0 } }
+    },
+    {
+        nxt_string("GET /test-0-headers HTTP/1.1\r\n\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_headers,
+        { .headers = { 0, NULL } }
+    },
+    {
+        nxt_string("GET /test-8-headers HTTP/1.1\r\n"
+                   "Host: example.com\r\n"
+                   "User-Agent: UnitTester/1.0\r\n"
+                   "Accept: text/html,application/xhtml+xml\r\n"
+                   "Accept-Language: en-US,en;q=0.9\r\n"
+                   "Accept-Encoding: gzip, deflate\r\n"
+                   "Connection: keep-alive\r\n"
+                   "X-Custom-Header-7: CustomValue7\r\n"
+                   "X-Custom-Header-8: CustomValue8\r\n"
+                   "\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_headers,
+        { .headers = { 8, nxt_http_test_headers_8 } }
+    },
+    {
+        nxt_string("GET /test-16-headers HTTP/1.1\r\n"
+                   "Host: example.com\r\n"
+                   "User-Agent: UnitTester/1.0\r\n"
+                   "Accept: */*\r\n"
+                   "Accept-Language: en-US\r\n"
+                   "Accept-Encoding: gzip\r\n"
+                   "Connection: keep-alive\r\n"
+                   "Cache-Control: no-cache\r\n"
+                   "Pragma: no-cache\r\n"
+                   "Header-09: Val-09\r\n"
+                   "Header-10: Val-10\r\n"
+                   "Header-11: Val-11\r\n"
+                   "Header-12: Val-12\r\n"
+                   "Header-13: Val-13\r\n"
+                   "Header-14: Val-14\r\n"
+                   "Header-15: Val-15\r\n"
+                   "Header-16: Val-16\r\n"
+                   "\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_headers,
+        { .headers = { 16, nxt_http_test_headers_16 } }
+    },
+    {
+        nxt_string("GET /test-24-headers HTTP/1.1\r\n"
+                   "Host: example.com\r\n"
+                   "User-Agent: UnitTester/1.0\r\n"
+                   "Accept: */*\r\n"
+                   "Accept-Language: en-US\r\n"
+                   "Accept-Encoding: gzip\r\n"
+                   "Connection: keep-alive\r\n"
+                   "Cache-Control: no-cache\r\n"
+                   "Pragma: no-cache\r\n"
+                   "Header-09: Val-09\r\n"
+                   "Header-10: Val-10\r\n"
+                   "Header-11: Val-11\r\n"
+                   "Header-12: Val-12\r\n"
+                   "Header-13: Val-13\r\n"
+                   "Header-14: Val-14\r\n"
+                   "Header-15: Val-15\r\n"
+                   "Header-16: Val-16\r\n"
+                   "X-Empty-Value:\r\n"
+                   "X-Spaced-Value:   padded-value  \r\n"
+                   "X-Special_Chars.123: special#val\r\n"
+                   "X-Repeated-Name: first\r\n"
+                   "X-Repeated-Name: second\r\n"
+                   "Header-22: Val-22\r\n"
+                   "Header-23: Val-23\r\n"
+                   "Header-24: Val-24\r\n"
+                   "\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_headers,
+        { .headers = { 24, nxt_http_test_headers_24 } }
+    },
+    {
+        nxt_string("GET /test-32-headers HTTP/1.1\r\n"
+                   "H-01: v-01\r\n" "H-02: v-02\r\n" "H-03: v-03\r\n" "H-04: v-04\r\n"
+                   "H-05: v-05\r\n" "H-06: v-06\r\n" "H-07: v-07\r\n" "H-08: v-08\r\n"
+                   "H-09: v-09\r\n" "H-10: v-10\r\n" "H-11: v-11\r\n" "H-12: v-12\r\n"
+                   "H-13: v-13\r\n" "H-14: v-14\r\n" "H-15: v-15\r\n" "H-16: v-16\r\n"
+                   "H-17: v-17\r\n" "H-18: v-18\r\n" "H-19: v-19\r\n" "H-20: v-20\r\n"
+                   "H-21: v-21\r\n" "H-22: v-22\r\n" "H-23: v-23\r\n" "H-24: v-24\r\n"
+                   "H-25: v-25\r\n" "H-26: v-26\r\n" "H-27: v-27\r\n" "H-28: v-28\r\n"
+                   "H-29: v-29\r\n" "H-30: v-30\r\n" "H-31: v-31\r\n" "H-32: v-32\r\n"
+                   "\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_headers,
+        { .headers = { 32, nxt_http_test_headers_32 } }
+    },
+};
+
+
+static nxt_http_field_proc_t  nxt_http_test_fields[] = {
+    { nxt_string("X-Bad-Header"),
+      &nxt_http_test_header_return,
+      NXT_ERROR },
+
+    { nxt_string("X-Good-Header"),
+      &nxt_http_test_header_return,
+      NXT_OK },
+
+    { nxt_string("!#$%&'*+.^_`|~"),
+      &nxt_http_test_header_return,
+      NXT_ERROR },
+};
+
+
+static nxt_lvlhsh_t  nxt_http_test_fields_hash;
+
+
+static nxt_http_field_proc_t  nxt_http_test_bench_fields[] = {
+    { nxt_string("Host"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("User-Agent"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Accept"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Accept-Encoding"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Accept-Language"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Connection"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Content-Length"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Content-Range"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Content-Type"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Cookie"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Range"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("If-Range"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Transfer-Encoding"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Expect"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Via"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("If-Modified-Since"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("If-Unmodified-Since"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("If-Match"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("If-None-Match"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Referer"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Date"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Upgrade"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Authorization"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Keep-Alive"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("X-Forwarded-For"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("X-Forwarded-Host"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("X-Forwarded-Proto"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("X-Http-Method-Override"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("X-Real-IP"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("X-Request-ID"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("TE"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Pragma"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Cache-Control"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Origin"),
+      &nxt_http_test_header_return, NXT_OK },
+    { nxt_string("Upgrade-Insecure-Requests"),
+      &nxt_http_test_header_return, NXT_OK },
+};
+
+
+static nxt_str_t nxt_http_test_simple_request = nxt_string(
+    "GET /page HTTP/1.1\r\n"
+    "Host: example.com\r\n\r\n"
+);
+
+
+static nxt_str_t nxt_http_test_big_request = nxt_string(
+    "POST /path/to/very/interesting/article/on.this.site?arg1=value&arg2=value"
+        "2&very_big_arg=even_bigger_value HTTP/1.1\r\n"
+    "Host: www.example.com\r\n"
+    "User-Agent: Mozilla/5.0 (X11; Gentoo Linux x86_64; rv:42.0) Firefox/42.0"
+        "\r\n"
+    "Accept: text/html,application/json,application/xml;q=0.9,*/*;q=0.8\r\n"
+    "Accept-Language: ru-RU,ru;q=0.8,en-US;q=0.6,en;q=0.4\r\n"
+    "Accept-Encoding: gzip, deflate, br\r\n"
+    "If-Modified-Since: Wed, 31 Dec 1986 16:00:00 GMT\r\n"
+    "Referer: https://example.org/path/to/not-interesting/article.html\r\n"
+    "Cookie: name=value; name2=value2; some_big_cookie=iVBORw0KGgoAAAANSUhEUgA"
+        "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\r\n"
+    "Connection: keep-alive\r\n"
+    "Content-Length: 0\r\n"
+    "Upgrade-Insecure-Requests: 1\r\n"
+    "Pragma: no-cache\r\n"
+    "Cache-Control: no-cache\r\n"
+    "X-Forwarded-For: 192.0.2.0, 198.51.100.0, 203.0.113.0\r\n"
+    "\r\n"
+);
+
+
+/*
+ * nxt_http_fields_hash() and nxt_http_fields_hash_collisions() build a
+ * lvlhsh with the malloc-based nxt_http_fields_hash_proto (pool is NULL).
+ * The test drives them directly, so it must drain the hash itself here,
+ * the same way nxt_lvlhsh_retrieve() is used to tear down a lvlhsh in
+ * nxt_lvlhsh_test(), otherwise every bucket and level it allocated leaks.
+ */
+static void
+nxt_http_parse_test_hash_destroy(nxt_lvlhsh_t *hash)
+{
+    while (nxt_lvlhsh_retrieve(hash, &nxt_http_fields_hash_proto, NULL)
+           != NULL)
+    {
+        continue;
+    }
+}
+
+
+nxt_int_t
+nxt_http_parse_test(nxt_thread_t *thr)
+{
+    nxt_mp_t                    *mp_temp;
+    nxt_int_t                   rc;
+    nxt_uint_t                  i, colls, lvl_colls;
+    nxt_lvlhsh_t                hash;
+    nxt_http_request_parse_t    rp;
+    nxt_http_parse_test_case_t  *test;
+
+    nxt_thread_time_update(thr);
+
+    rc = nxt_http_fields_hash(&nxt_http_test_fields_hash,
+                              nxt_http_test_fields,
+                              nxt_nitems(nxt_http_test_fields));
+    if (rc != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    for (i = 0; i < nxt_nitems(nxt_http_test_cases); i++) {
+        test = &nxt_http_test_cases[i];
+
+        nxt_memzero(&rp, sizeof(nxt_http_request_parse_t));
+
+        mp_temp = nxt_mp_create(1024, 128, 256, 32);
+        if (mp_temp == NULL) {
+            return NXT_ERROR;
+        }
+
+        if (nxt_http_parse_request_init(&rp, mp_temp) != NXT_OK) {
+            return NXT_ERROR;
+        }
+
+        if (test->handler == &nxt_http_parse_test_fields) {
+            rp.discard_unsafe_fields = test->data.fields.discard_unsafe_fields;
+        }
+
+        rc = nxt_http_parse_test_run(&rp, &test->request);
+
+        if (rc != test->result) {
+            nxt_log_alert(thr->log, "http parse test case failed:\n"
+                                    " - request:\n\"%V\"\n"
+                                    " - result: %i (expected: %i)",
+                                    &test->request, rc, test->result);
+            return NXT_ERROR;
+        }
+
+        if (test->handler != NULL
+            && test->handler(&rp, &test->data, &test->request, thr->log)
+               != NXT_OK)
+        {
+            return NXT_ERROR;
+        }
+
+        nxt_mp_destroy(mp_temp);
+    }
+
+    if (nxt_http_parse_test_discard_fields(thr) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log, "http parse test passed");
+
+    nxt_memzero(&hash, sizeof(nxt_lvlhsh_t));
+
+    colls = nxt_http_fields_hash_collisions(&hash,
+                                        nxt_http_test_bench_fields,
+                                        nxt_nitems(nxt_http_test_bench_fields),
+                                        0);
+
+    nxt_http_parse_test_hash_destroy(&hash);
+
+    nxt_memzero(&hash, sizeof(nxt_lvlhsh_t));
+
+    lvl_colls = nxt_http_fields_hash_collisions(&hash,
+                                        nxt_http_test_bench_fields,
+                                        nxt_nitems(nxt_http_test_bench_fields),
+                                        1);
+
+    nxt_http_parse_test_hash_destroy(&hash);
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                  "http parse test hash collisions %ui out of %uz, level: %ui",
+                  colls, nxt_nitems(nxt_http_test_bench_fields), lvl_colls);
+
+    nxt_memzero(&hash, sizeof(nxt_lvlhsh_t));
+
+    rc = nxt_http_fields_hash(&hash, nxt_http_test_bench_fields,
+                              nxt_nitems(nxt_http_test_bench_fields));
+    if (rc != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_http_parse_test_bench(thr, &nxt_http_test_simple_request,
+                                  &hash, "simple", 1000000)
+        != NXT_OK)
+    {
+        nxt_http_parse_test_hash_destroy(&hash);
+        return NXT_ERROR;
+    }
+
+    if (nxt_http_parse_test_bench(thr, &nxt_http_test_big_request,
+                                  &hash, "big", 100000)
+        != NXT_OK)
+    {
+        nxt_http_parse_test_hash_destroy(&hash);
+        return NXT_ERROR;
+    }
+
+    nxt_http_parse_test_hash_destroy(&hash);
+
+    return NXT_OK;
+}
+
+
+/*
+ * With "discard_fields", fields are checked but not stored.  Then a reset of
+ * the handler is enough to parse the next block.  24 fields is more than the
+ * 16 inline fields.
+ */
+
+static nxt_int_t
+nxt_http_parse_test_discard_fields(nxt_thread_t *thr)
+{
+    u_char                    *p;
+    nxt_mp_t                  *mp;
+    nxt_int_t                 rc, ret;
+    nxt_uint_t                i, nfields;
+    nxt_buf_mem_t             buf;
+    nxt_http_field_t          *field;
+    nxt_http_request_parse_t  rp;
+    u_char                    block[24 * nxt_length("X-Field-00: v\r\n") + 2];
+
+    p = block;
+
+    for (i = 0; i < 24; i++) {
+        p = nxt_sprintf(p, block + sizeof(block), "X-Field-%02ui: v\r\n", i);
+    }
+
+    *p++ = '\r';
+    *p++ = '\n';
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (mp == NULL) {
+        return NXT_ERROR;
+    }
+
+    ret = NXT_ERROR;
+
+    nxt_memzero(&rp, sizeof(nxt_http_request_parse_t));
+
+    if (nxt_http_parse_request_init(&rp, mp) != NXT_OK) {
+        goto done;
+    }
+
+    rp.discard_fields = 1;
+
+    buf.start = block;
+    buf.pos = block;
+    buf.free = p;
+    buf.end = p;
+
+    rc = nxt_http_parse_fields(&rp, &buf);
+
+    if (rc != NXT_DONE || rp.num_inline_fields != 0 || rp.fields != NULL) {
+        nxt_log_alert(thr->log, "http parse discard fields test failed: "
+                      "rc %i, %ui inline fields, list %p",
+                      rc, (nxt_uint_t) rp.num_inline_fields, rp.fields);
+        goto done;
+    }
+
+    rp.handler = NULL;
+    rp.discard_fields = 0;
+
+    buf.pos = block;
+
+    rc = nxt_http_parse_fields(&rp, &buf);
+
+    nfields = 0;
+
+    nxt_http_fields_each(field, rp.inline_fields, rp.num_inline_fields,
+                         rp.fields)
+    {
+        nfields++;
+    } nxt_http_fields_loop;
+
+    if (rc != NXT_DONE || nfields != 24) {
+        nxt_log_alert(thr->log, "http parse fields reset test failed: "
+                      "rc %i, %ui fields", rc, nfields);
+        goto done;
+    }
+
+    ret = NXT_OK;
+
+done:
+
+    nxt_mp_destroy(mp);
+
+    return ret;
+}
+
+
+static nxt_int_t
+nxt_http_parse_test_run(nxt_http_request_parse_t *rp, nxt_str_t *request)
+{
+    nxt_int_t      rc;
+    nxt_buf_mem_t  buf;
+
+    buf.start = request->start;
+    buf.end = request->start + request->length;
+
+    buf.pos = buf.start;
+    buf.free = buf.pos + 1;
+
+    do {
+        buf.free++;
+        rc = nxt_http_parse_request(rp, &buf);
+    } while (buf.free < buf.end && rc == NXT_AGAIN);
+
+    return rc;
+}
+
+
+static nxt_int_t
+nxt_http_parse_test_bench(nxt_thread_t *thr, nxt_str_t *request,
+    nxt_lvlhsh_t *hash, const char *name, nxt_uint_t n)
+{
+    nxt_mp_t                  *mp;
+    nxt_nsec_t                start, end;
+    nxt_uint_t                i;
+    nxt_buf_mem_t             buf;
+    nxt_http_request_parse_t  rp;
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                  "http parse %s request bench started: %uz bytes, %ui runs",
+                  name, request->length, n);
+
+    buf.start = request->start;
+    buf.end = request->start + request->length;
+
+    nxt_thread_time_update(thr);
+    start = nxt_thread_monotonic_time(thr);
+
+    for (i = 0; nxt_fast_path(i < n); i++) {
+        nxt_memzero(&rp, sizeof(nxt_http_request_parse_t));
+
+        mp = nxt_mp_create(1024, 128, 256, 32);
+        if (nxt_slow_path(mp == NULL)) {
+            return NXT_ERROR;
+        }
+
+        if (nxt_slow_path(nxt_http_parse_request_init(&rp, mp) != NXT_OK)) {
+            return NXT_ERROR;
+        }
+
+        buf.pos = buf.start;
+        buf.free = buf.end;
+
+        if (nxt_slow_path(nxt_http_parse_request(&rp, &buf) != NXT_DONE)) {
+            nxt_log_alert(thr->log, "http parse %s request bench failed "
+                                    "while parsing", name);
+            return NXT_ERROR;
+        }
+
+        if (nxt_slow_path(nxt_http_fields_process(rp.inline_fields,
+                                                  rp.num_inline_fields,
+                                                  rp.fields, hash, NULL)
+                          != NXT_OK))
+        {
+            nxt_log_alert(thr->log, "http parse %s request bench failed "
+                                    "while fields processing", name);
+            return NXT_ERROR;
+        }
+
+        nxt_mp_destroy(mp);
+    }
+
+    nxt_thread_time_update(thr);
+    end = nxt_thread_monotonic_time(thr);
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                  "http parse %s request bench: %0.3fs",
+                  name, (end - start) / 1000000000.0);
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_http_parse_test_request_line(nxt_http_request_parse_t *rp,
+    nxt_http_parse_test_data_t *data, nxt_str_t *request, nxt_log_t *log)
+{
+    nxt_str_t  str;
+
+    nxt_http_parse_test_request_line_t  *test = &data->request_line;
+
+    if (rp->method.start != test->method.start
+        && !nxt_strstr_eq(&rp->method, &test->method))
+    {
+        nxt_log_alert(log, "http parse test case failed:\n"
+                           " - request:\n\"%V\"\n"
+                           " - method: \"%V\" (expected: \"%V\")",
+                           request, &rp->method, &test->method);
+        return NXT_ERROR;
+    }
+
+    str.length = rp->target_end - rp->target_start;
+    str.start = rp->target_start;
+
+    if (str.start != test->target.start
+        && !nxt_strstr_eq(&str, &test->target))
+    {
+        nxt_log_alert(log, "http parse test case failed:\n"
+                            " - request:\n\"%V\"\n"
+                            " - target: \"%V\" (expected: \"%V\")",
+                            request, &str, &test->target);
+        return NXT_ERROR;
+    }
+
+    if (rp->args.start != test->args.start
+        && !nxt_strstr_eq(&rp->args, &test->args))
+    {
+        nxt_log_alert(log, "http parse test case failed:\n"
+                           " - request:\n\"%V\"\n"
+                           " - args: \"%V\" (expected: \"%V\")",
+                           request, &rp->args, &test->args);
+        return NXT_ERROR;
+    }
+
+    if (memcmp(rp->version.str, test->version, 8) != 0) {
+        nxt_log_alert(log, "http parse test case failed:\n"
+                           " - request:\n\"%V\"\n"
+                           " - version: \"%*s\" (expected: \"%*s\")", request,
+                           (size_t) 8, rp->version.str,
+                           (size_t) 8, test->version);
+        return NXT_ERROR;
+    }
+
+    if (rp->complex_target != test->complex_target) {
+        nxt_log_alert(log, "http parse test case failed:\n"
+                           " - request:\n\"%V\"\n"
+                           " - complex_target: %d (expected: %d)",
+                           request, rp->complex_target, test->complex_target);
+        return NXT_ERROR;
+    }
+
+    if (rp->quoted_target != test->quoted_target) {
+        nxt_log_alert(log, "http parse test case failed:\n"
+                           " - request:\n\"%V\"\n"
+                           " - quoted_target: %d (expected: %d)",
+                           request, rp->quoted_target, test->quoted_target);
+        return NXT_ERROR;
+    }
+
+#if 0
+    if (rp->space_in_target != test->space_in_target) {
+        nxt_log_alert(log, "http parse test case failed:\n"
+                           " - request:\n\"%V\"\n"
+                           " - space_in_target: %d (expected: %d)",
+                           request, rp->space_in_target, test->space_in_target);
+        return NXT_ERROR;
+    }
+#endif
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_http_parse_test_fields(nxt_http_request_parse_t *rp,
+    nxt_http_parse_test_data_t *data, nxt_str_t *request, nxt_log_t *log)
+{
+    nxt_int_t  rc;
+
+    rc = nxt_http_fields_process(rp->inline_fields, rp->num_inline_fields,
+                                 rp->fields, &nxt_http_test_fields_hash, NULL);
+
+    if (rc != data->fields.result) {
+        nxt_log_alert(log, "http parse test hash failed:\n"
+                           " - request:\n\"%V\"\n"
+                           " - result: %i (expected: %i)",
+                           request, rc, data->fields.result);
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_http_test_header_return(void *ctx, nxt_http_field_t *field, uintptr_t data)
+{
+    return data;
+}
+
+
+static nxt_int_t
+nxt_http_parse_test_headers(nxt_http_request_parse_t *rp,
+    nxt_http_parse_test_data_t *data, nxt_str_t *request, nxt_log_t *log)
+{
+    nxt_uint_t                      i, nelts;
+    nxt_http_field_t                *field;
+    nxt_http_parse_test_headers_t  *expected;
+
+    expected = &data->headers;
+
+    /*
+     * Headers are stored inline (first 16) with any overflow spilling into
+     * the rp->fields list, so the total count is the sum of both and the
+     * only valid traversal is nxt_http_fields_each().
+     */
+    nelts = rp->num_inline_fields;
+    if (rp->fields != NULL) {
+        nelts += nxt_list_nelts(rp->fields);
+    }
+
+    if (nelts != expected->count) {
+        nxt_log_alert(log, "http parse headers test failed (count mismatch):\n"
+                           " - request:\n\"%V\"\n"
+                           " - count: %ui (expected: %ui)",
+                           request, nelts, expected->count);
+        return NXT_ERROR;
+    }
+
+    i = 0;
+    nxt_http_fields_each(field, rp->inline_fields, rp->num_inline_fields,
+                         rp->fields)
+    {
+        if (i >= expected->count) {
+            nxt_log_alert(log, "http parse headers test failed:\n"
+                               " - iterated beyond count %ui",
+                               expected->count);
+            return NXT_ERROR;
+        }
+
+        if (field->name_length != expected->fields[i].name.length
+            || memcmp(field->name, expected->fields[i].name.start,
+                      field->name_length) != 0)
+        {
+            nxt_log_alert(log, "http parse header name mismatch at [%ui]:\n"
+                               " - request:\n\"%V\"\n"
+                               " - got: \"%*s\" (expected: \"%V\")",
+                               i, request, (size_t) field->name_length,
+                               field->name, &expected->fields[i].name);
+            return NXT_ERROR;
+        }
+
+        if (field->value_length != expected->fields[i].value.length
+            || memcmp(field->value, expected->fields[i].value.start,
+                      field->value_length) != 0)
+        {
+            nxt_log_alert(log, "http parse header value mismatch at [%ui]:\n"
+                               " - request:\n\"%V\"\n"
+                               " - got: \"%*s\" (expected: \"%V\")",
+                               i, request, (size_t) field->value_length,
+                               field->value, &expected->fields[i].value);
+            return NXT_ERROR;
+        }
+
+        if (field->hash == 0 && field->name_length > 0) {
+            nxt_log_alert(log, "http parse header hash is 0 at [%ui]", i);
+            return NXT_ERROR;
+        }
+
+        i++;
+    } nxt_http_fields_loop;
+
+    if (i != expected->count) {
+        nxt_log_alert(log, "http parse headers test failed:\n"
+                           " - iteration count: %ui (expected: %ui)",
+                           i, expected->count);
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}

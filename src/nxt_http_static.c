@@ -1,0 +1,2229 @@
+
+/*
+ * Copyright (C) NGINX, Inc.
+ */
+
+#include <nxt_router.h>
+#include <nxt_http.h>
+#include <nxt_http_compression.h>
+
+
+typedef struct {
+    nxt_tstr_t                  *tstr;
+#if (NXT_HAVE_OPENAT2)
+    u_char                      *fname;
+#endif
+    uint8_t                     is_const;  /* 1 bit */
+} nxt_http_static_share_t;
+
+
+typedef struct {
+    nxt_uint_t                  nshares;
+    nxt_http_static_share_t     *shares;
+    nxt_str_t                   index;
+#if (NXT_HAVE_OPENAT2)
+    nxt_tstr_t                  *chroot;
+    nxt_uint_t                  resolve;
+#endif
+    nxt_http_route_rule_t       *types;
+} nxt_http_static_conf_t;
+
+
+#define NXT_HTTP_STATIC_BUF_COUNT  2
+#define NXT_HTTP_STATIC_BUF_SIZE   (128 * 1024)
+
+#if (NXT_HAVE_THREAD_STORAGE_CLASS)
+
+/*
+ * Recycle the fixed-size static-file buffer descriptors (NXT_BUF_FILE_SIZE)
+ * through a thread-local freelist to avoid a per-request malloc/free on the
+ * hot path.  This is only compiled when the compiler provides __thread
+ * storage: with nxt_thread_declare_data() over __thread the freelist head and
+ * count are plain thread-local variables, nxt_thread_get_data() resolves to
+ * their address, and nxt_thread_init_data() is a no-op -- so no runtime
+ * initialisation is required.
+ *
+ * On the pthread-specific-data fallback (see the #else branch) these keys
+ * would be uninitialised (-1) until nxt_thread_init_data() ran on each router
+ * thread; this module has no such per-thread init hook (only the core
+ * nxt_thread_context is initialised that way), so there we fall back to plain
+ * allocation rather than dereference an invalid TSD key.
+ *
+ * A router worker thread drains its own freelist via
+ * nxt_http_static_buf_freelist_drain() just before it exits (see
+ * nxt_router.c): the __thread head lives in the exiting thread's storage and
+ * can only be freed while running on that thread.  Without this drain, every
+ * listen_threads churn that destroys a worker thread would leak up to
+ * NXT_HTTP_STATIC_BUF_FREELIST_MAX descriptors -- an unbounded process leak.
+ */
+
+#define NXT_HTTP_STATIC_BUF_FREELIST_MAX  32
+
+static nxt_thread_declare_data(nxt_buf_t *, nxt_http_static_buf_freelist);
+static nxt_thread_declare_data(nxt_uint_t, nxt_http_static_buf_freelist_count);
+
+
+nxt_inline nxt_buf_t *
+nxt_http_static_buf_alloc(nxt_task_t *task, nxt_mp_t *mp)
+{
+    nxt_buf_t   *fb, **fl;
+    nxt_uint_t  *count;
+
+    fl = nxt_thread_get_data(nxt_http_static_buf_freelist);
+    count = nxt_thread_get_data(nxt_http_static_buf_freelist_count);
+
+    if (*fl != NULL) {
+        fb = *fl;
+        *fl = fb->next;
+        (*count)--;
+        nxt_memzero(fb, sizeof(nxt_buf_t));
+        return fb;
+    }
+
+    fb = nxt_malloc(NXT_BUF_FILE_SIZE);
+    if (nxt_fast_path(fb != NULL)) {
+        nxt_memzero(fb, sizeof(nxt_buf_t));
+    }
+
+    return fb;
+}
+
+
+nxt_inline void
+nxt_http_static_buf_free(nxt_buf_t *fb)
+{
+    nxt_buf_t   **fl;
+    nxt_uint_t  *count;
+
+    fl = nxt_thread_get_data(nxt_http_static_buf_freelist);
+    count = nxt_thread_get_data(nxt_http_static_buf_freelist_count);
+
+    if (*count < NXT_HTTP_STATIC_BUF_FREELIST_MAX) {
+        fb->next = *fl;
+        *fl = fb;
+        (*count)++;
+
+    } else {
+        nxt_free(fb);
+    }
+}
+
+
+void
+nxt_http_static_buf_freelist_drain(void)
+{
+    nxt_buf_t   *fb, *next, **fl;
+    nxt_uint_t  *count;
+
+    fl = nxt_thread_get_data(nxt_http_static_buf_freelist);
+    count = nxt_thread_get_data(nxt_http_static_buf_freelist_count);
+
+    for (fb = *fl; fb != NULL; fb = next) {
+        next = fb->next;
+        nxt_free(fb);
+    }
+
+    *fl = NULL;
+    *count = 0;
+}
+
+#else  /* !NXT_HAVE_THREAD_STORAGE_CLASS */
+
+nxt_inline nxt_buf_t *
+nxt_http_static_buf_alloc(nxt_task_t *task, nxt_mp_t *mp)
+{
+    nxt_buf_t  *fb;
+
+    fb = nxt_malloc(NXT_BUF_FILE_SIZE);
+    if (nxt_fast_path(fb != NULL)) {
+        nxt_memzero(fb, sizeof(nxt_buf_t));
+    }
+
+    return fb;
+}
+
+
+nxt_inline void
+nxt_http_static_buf_free(nxt_buf_t *fb)
+{
+    nxt_free(fb);
+}
+
+
+void
+nxt_http_static_buf_freelist_drain(void)
+{
+}
+
+#endif
+
+
+
+static nxt_http_action_t *nxt_http_static(nxt_task_t *task,
+    nxt_http_request_t *r, nxt_http_action_t *action);
+static void nxt_http_static_iterate(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_http_static_ctx_t *ctx);
+static void nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_http_static_ctx_t *ctx);
+static void nxt_http_static_next(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_http_static_ctx_t *ctx, nxt_http_status_t status);
+static nxt_http_status_t nxt_http_static_preconditions(nxt_http_request_t *r,
+    nxt_str_t *etag, nxt_bool_t weak, nxt_time_t mtime, nxt_bool_t date_ok);
+static nxt_bool_t nxt_http_static_etag_match(nxt_str_t *list, nxt_str_t *etag,
+    nxt_bool_t own_weak, nxt_bool_t strong);
+static nxt_http_status_t nxt_http_static_range(nxt_http_request_t *r,
+    nxt_str_t *etag, nxt_bool_t weak, nxt_time_t mtime, nxt_bool_t date_ok,
+    nxt_off_t size, nxt_off_t *start, nxt_off_t *end);
+#if (NXT_HAVE_OPENAT2)
+static u_char *nxt_http_static_chroot_match(u_char *chr, u_char *shr);
+#endif
+static void nxt_http_static_extract_extension(nxt_str_t *path,
+    nxt_str_t *exten);
+static void nxt_http_static_body_handler(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_http_static_buf_completion(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_http_static_buf_cleanup(nxt_task_t *task, void *obj,
+    void *data);
+
+static nxt_int_t nxt_http_static_mtypes_hash_test(nxt_lvlhsh_query_t *lhq,
+    void *data);
+static void *nxt_http_static_mtypes_hash_alloc(void *data, size_t size);
+static void nxt_http_static_mtypes_hash_free(void *data, void *p);
+
+
+static const nxt_http_request_state_t  nxt_http_static_send_state;
+
+
+nxt_int_t
+nxt_http_static_init(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
+    nxt_http_action_t *action, nxt_http_action_conf_t *acf)
+{
+    uint32_t                i;
+    nxt_mp_t                *mp;
+    nxt_str_t               str, *ret;
+    nxt_tstr_t              *tstr;
+    nxt_conf_value_t        *cv;
+    nxt_router_conf_t       *rtcf;
+    nxt_http_static_conf_t  *conf;
+
+    rtcf = tmcf->router_conf;
+    mp = rtcf->mem_pool;
+
+    conf = nxt_mp_zget(mp, sizeof(nxt_http_static_conf_t));
+    if (nxt_slow_path(conf == NULL)) {
+        return NXT_ERROR;
+    }
+
+    action->handler = nxt_http_static;
+    action->u.conf = conf;
+
+    conf->nshares = nxt_conf_array_elements_count_or_1(acf->share);
+    conf->shares = nxt_mp_zget(mp, sizeof(nxt_http_static_share_t)
+                                   * conf->nshares);
+    if (nxt_slow_path(conf->shares == NULL)) {
+        return NXT_ERROR;
+    }
+
+    for (i = 0; i < conf->nshares; i++) {
+        cv = nxt_conf_get_array_element_or_itself(acf->share, i);
+        nxt_conf_get_string(cv, &str);
+
+        tstr = nxt_tstr_compile(rtcf->tstr_state, &str, NXT_TSTR_STRZ);
+        if (nxt_slow_path(tstr == NULL)) {
+            return NXT_ERROR;
+        }
+
+        conf->shares[i].tstr = tstr;
+        conf->shares[i].is_const = nxt_tstr_is_const(tstr);
+    }
+
+    if (acf->index == NULL) {
+        nxt_str_set(&conf->index, "index.html");
+
+    } else {
+        ret = nxt_conf_get_string_dup(acf->index, mp, &conf->index);
+        if (nxt_slow_path(ret == NULL)) {
+            return NXT_ERROR;
+        }
+    }
+
+#if (NXT_HAVE_OPENAT2)
+    if (acf->chroot.length > 0) {
+        nxt_str_t   chr, shr;
+        nxt_bool_t  is_const;
+
+        conf->chroot = nxt_tstr_compile(rtcf->tstr_state, &acf->chroot,
+                                        NXT_TSTR_STRZ);
+        if (nxt_slow_path(conf->chroot == NULL)) {
+            return NXT_ERROR;
+        }
+
+        is_const = nxt_tstr_is_const(conf->chroot);
+
+        for (i = 0; i < conf->nshares; i++) {
+            conf->shares[i].is_const &= is_const;
+
+            if (conf->shares[i].is_const) {
+                nxt_tstr_str(conf->chroot, &chr);
+                nxt_tstr_str(conf->shares[i].tstr, &shr);
+
+                conf->shares[i].fname = nxt_http_static_chroot_match(chr.start,
+                                                                     shr.start);
+            }
+        }
+    }
+
+    if (acf->follow_symlinks != NULL
+        && !nxt_conf_get_boolean(acf->follow_symlinks))
+    {
+        conf->resolve |= RESOLVE_NO_SYMLINKS;
+    }
+
+    if (acf->traverse_mounts != NULL
+        && !nxt_conf_get_boolean(acf->traverse_mounts))
+    {
+        conf->resolve |= RESOLVE_NO_XDEV;
+    }
+#endif
+
+    if (acf->types != NULL) {
+        conf->types = nxt_http_route_types_rule_create(task, mp, acf->types);
+        if (nxt_slow_path(conf->types == NULL)) {
+            return NXT_ERROR;
+        }
+    }
+
+    if (acf->fallback != NULL) {
+        action->fallback = nxt_mp_alloc(mp, sizeof(nxt_http_action_t));
+        if (nxt_slow_path(action->fallback == NULL)) {
+            return NXT_ERROR;
+        }
+
+        return nxt_http_action_init(task, tmcf, acf->fallback,
+                                    action->fallback);
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_http_action_t *
+nxt_http_static(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_http_action_t *action)
+{
+    nxt_bool_t             need_body;
+    nxt_http_static_ctx_t  *ctx;
+
+    if (nxt_slow_path(!nxt_str_eq(r->method, "GET", 3))) {
+
+        if (!nxt_str_eq(r->method, "HEAD", 4)) {
+            if (action->fallback != NULL) {
+                if (nxt_slow_path(r->log_route)) {
+                    nxt_log(task, NXT_LOG_NOTICE, "\"fallback\" taken");
+                }
+                return action->fallback;
+            }
+
+            nxt_http_request_error(task, r, NXT_HTTP_METHOD_NOT_ALLOWED);
+            return NULL;
+        }
+
+        need_body = 0;
+
+    } else {
+        need_body = 1;
+    }
+
+    ctx = &r->static_ctx;
+    nxt_memzero(ctx, sizeof(nxt_http_static_ctx_t));
+
+    ctx->action = action;
+    ctx->need_body = need_body;
+
+    nxt_http_static_iterate(task, r, ctx);
+
+    return NULL;
+}
+
+
+static void
+nxt_http_static_iterate(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_http_static_ctx_t *ctx)
+{
+    nxt_int_t                ret;
+    nxt_router_conf_t        *rtcf;
+    nxt_http_static_conf_t   *conf;
+    nxt_http_static_share_t  *share;
+
+    conf = ctx->action->u.conf;
+
+    share = &conf->shares[ctx->share_idx];
+
+#if (NXT_DEBUG)
+    nxt_str_t  shr;
+    nxt_str_t  idx;
+
+    nxt_tstr_str(share->tstr, &shr);
+    idx = conf->index;
+
+#if (NXT_HAVE_OPENAT2)
+    nxt_str_t  chr;
+
+    if (conf->chroot != NULL) {
+        nxt_tstr_str(conf->chroot, &chr);
+
+    } else {
+        nxt_str_set(&chr, "");
+    }
+
+    nxt_debug(task, "http static: \"%V\", index: \"%V\" (chroot: \"%V\")",
+              &shr, &idx, &chr);
+#else
+    nxt_debug(task, "http static: \"%V\", index: \"%V\"", &shr, &idx);
+#endif
+#endif /* NXT_DEBUG */
+
+    if (share->is_const) {
+        nxt_tstr_str(share->tstr, &ctx->share);
+
+#if (NXT_HAVE_OPENAT2)
+        if (conf->chroot != NULL && ctx->share_idx == 0) {
+            nxt_tstr_str(conf->chroot, &ctx->chroot);
+        }
+#endif
+
+    } else {
+        rtcf = r->conf->socket_conf->router_conf;
+
+        ret = nxt_tstr_query_init(&r->tstr_query, rtcf->tstr_state,
+                                  &r->tstr_cache, r, r->mem_pool);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            goto fail;
+        }
+
+        ret = nxt_tstr_query(task, r->tstr_query, share->tstr, &ctx->share);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            goto fail;
+        }
+
+#if (NXT_HAVE_OPENAT2)
+        if (conf->chroot != NULL && ctx->share_idx == 0) {
+            ret = nxt_tstr_query(task, r->tstr_query, conf->chroot,
+                                 &ctx->chroot);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                goto fail;
+            }
+
+            /*
+             * "chroot" is resolved once (share_idx == 0) and reused for every
+             * share candidate.  This must run before the "share" NUL check
+             * below so ctx->chroot stays populated for the whole share chain
+             * even when a templated share is rejected and we advance to the
+             * next candidate; otherwise the fallback share would be opened
+             * without the configured chroot confinement.  An embedded NUL
+             * would truncate the root at openat2(), and since the same chroot
+             * applies to every share, a bad "chroot" dooms the whole action --
+             * fail the request rather than advancing to the next share (which
+             * would reuse the unchecked value).  Skip straight to the last
+             * share so nxt_http_static_next() bypasses the remaining shares
+             * (never re-resolving the bad chroot) yet still dispatches the
+             * action "fallback" when one is configured, matching how the share
+             * NUL rejection below behaves.
+             */
+            if (ctx->chroot.length > 0
+                && nxt_slow_path(memchr(ctx->chroot.start, '\0',
+                                        ctx->chroot.length) != NULL))
+            {
+                nxt_log(task, NXT_LOG_ERR, "rejected \"chroot\" path with an "
+                        "embedded zero byte");
+                ctx->share_idx = conf->nshares - 1;
+                nxt_http_static_next(task, r, ctx, NXT_HTTP_NOT_FOUND);
+                return;
+            }
+        }
+#endif
+
+        /*
+         * A templated "share" may resolve to an empty string (e.g. "$arg_name"
+         * with the argument absent).  An empty path can never name a file, and
+         * nxt_http_static_send() reads shr->start[shr->length - 1] unguarded --
+         * a zero length would underflow that to shr->start[-1].  Reject the
+         * empty candidate and try the next share.
+         */
+        if (nxt_slow_path(ctx->share.length == 0)) {
+            nxt_log(task, NXT_LOG_ERR, "rejected empty \"share\" path");
+            nxt_http_static_next(task, r, ctx, NXT_HTTP_NOT_FOUND);
+            return;
+        }
+
+        /*
+         * A templated "share" is resolved from request-controlled variables
+         * (e.g. "$uri", "$arg_name") and later handed to open()/openat2() as a
+         * NUL-terminated C string.  An embedded NUL would silently truncate the
+         * path at the sink, so reject this candidate and try the next share.
+         */
+        if (nxt_slow_path(memchr(ctx->share.start, '\0', ctx->share.length)
+                          != NULL))
+        {
+            nxt_log(task, NXT_LOG_ERR, "rejected \"share\" path with an "
+                    "embedded zero byte");
+            nxt_http_static_next(task, r, ctx, NXT_HTTP_NOT_FOUND);
+            return;
+        }
+    }
+
+    nxt_http_static_send(task, r, ctx);
+
+    return;
+
+fail:
+
+    nxt_http_request_error(task, r, NXT_HTTP_INTERNAL_SERVER_ERROR);
+}
+
+
+static void
+nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_http_static_ctx_t *ctx)
+{
+    size_t                  length, encode;
+    u_char                  *p, *end, *fname;
+    struct tm               tm;
+    nxt_buf_t               *fb;
+    nxt_int_t               ret;
+    nxt_str_t               *shr, *index, exten, *mtype, etag;
+    nxt_uint_t              level;
+    nxt_file_t              *f, file;
+    nxt_file_info_t         fi;
+    nxt_off_t               range_start, range_end;
+    nxt_bool_t              is_range, etag_weak, svgz;
+    nxt_http_status_t       rstatus;
+    nxt_http_field_t        *field, *coding;
+    nxt_http_status_t       status, pcond;
+    nxt_router_conf_t       *rtcf;
+    nxt_http_action_t       *action;
+    nxt_work_handler_t      body_handler;
+    nxt_http_static_conf_t  *conf;
+
+    static const nxt_str_t  svgz_exten = nxt_string(".svgz");
+    static const nxt_str_t  svg_mtype = nxt_string("image/svg+xml");
+
+    action = ctx->action;
+    conf = action->u.conf;
+    rtcf = r->conf->socket_conf->router_conf;
+
+    f = NULL;
+    mtype = NULL;
+    coding = NULL;
+
+    shr = &ctx->share;
+    index = &conf->index;
+
+    if (shr->start[shr->length - 1] == '/') {
+        nxt_http_static_extract_extension(index, &exten);
+
+        length = shr->length + index->length;
+
+        fname = nxt_mp_nget(r->mem_pool, length + 1);
+        if (nxt_slow_path(fname == NULL)) {
+            goto fail;
+        }
+
+        p = fname;
+        p = nxt_cpymem(p, shr->start, shr->length);
+        p = nxt_cpymem(p, index->start, index->length);
+        *p = '\0';
+
+    } else {
+        if (conf->types == NULL) {
+            nxt_str_null(&exten);
+
+        } else {
+            nxt_http_static_extract_extension(shr, &exten);
+            mtype = nxt_http_static_mtype_get(&rtcf->mtypes_hash, &exten);
+
+            ret = nxt_http_route_test_rule(r, conf->types, mtype->start,
+                                           mtype->length);
+            if (nxt_slow_path(ret == NXT_ERROR)) {
+                goto fail;
+            }
+
+            if (ret == 0) {
+                nxt_http_static_next(task, r, ctx, NXT_HTTP_FORBIDDEN);
+                return;
+            }
+        }
+
+        fname = ctx->share.start;
+    }
+
+    nxt_memzero(&file, sizeof(nxt_file_t));
+
+    file.name = fname;
+
+#if (NXT_HAVE_OPENAT2)
+    if (conf->resolve != 0 || ctx->chroot.length > 0) {
+        nxt_str_t                *chr;
+        nxt_uint_t               resolve;
+        nxt_http_static_share_t  *share;
+
+        share = &conf->shares[ctx->share_idx];
+
+        resolve = conf->resolve;
+        chr = &ctx->chroot;
+
+        if (chr->length > 0) {
+            resolve |= RESOLVE_IN_ROOT;
+
+            fname = share->is_const
+                    ? share->fname
+                    : nxt_http_static_chroot_match(chr->start, file.name);
+
+            if (fname != NULL) {
+                file.name = chr->start;
+                ret = nxt_file_open(task, &file, NXT_FILE_SEARCH, NXT_FILE_OPEN,
+                                    0);
+
+            } else {
+                file.error = NXT_EACCES;
+                ret = NXT_ERROR;
+            }
+
+        } else if (fname[0] == '/') {
+            file.name = (u_char *) "/";
+            ret = nxt_file_open(task, &file, NXT_FILE_SEARCH, NXT_FILE_OPEN, 0);
+
+        } else {
+            file.name = (u_char *) ".";
+            file.fd = AT_FDCWD;
+            ret = NXT_OK;
+        }
+
+        if (nxt_fast_path(ret == NXT_OK)) {
+            nxt_file_t  af;
+
+            af = file;
+            nxt_memzero(&file, sizeof(nxt_file_t));
+            file.name = fname;
+
+            ret = nxt_file_openat2(task, &file, NXT_FILE_RDONLY,
+                                   NXT_FILE_OPEN, 0, af.fd, resolve);
+
+            if (af.fd != AT_FDCWD) {
+                nxt_file_close(task, &af);
+            }
+        }
+
+    } else {
+        ret = nxt_file_open(task, &file, NXT_FILE_RDONLY, NXT_FILE_OPEN, 0);
+    }
+
+#else
+    ret = nxt_file_open(task, &file, NXT_FILE_RDONLY, NXT_FILE_OPEN, 0);
+#endif
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+
+        switch (file.error) {
+
+        /*
+         * For Unix domain sockets "errno" is set to:
+         *  - ENXIO on Linux;
+         *  - EOPNOTSUPP on *BSD, MacOSX, and Solaris.
+         */
+
+        case NXT_ENOENT:
+        case NXT_ENOTDIR:
+        case NXT_ENAMETOOLONG:
+#if (NXT_LINUX)
+        case NXT_ENXIO:
+#else
+        case NXT_EOPNOTSUPP:
+#endif
+            level = NXT_LOG_ERR;
+            status = NXT_HTTP_NOT_FOUND;
+            break;
+
+        case NXT_EACCES:
+#if (NXT_HAVE_OPENAT2)
+        case NXT_ELOOP:
+        case NXT_EXDEV:
+#endif
+            level = NXT_LOG_ERR;
+            status = NXT_HTTP_FORBIDDEN;
+            break;
+
+        default:
+            level = NXT_LOG_ALERT;
+            status = NXT_HTTP_INTERNAL_SERVER_ERROR;
+            break;
+        }
+
+        if (status != NXT_HTTP_NOT_FOUND) {
+#if (NXT_HAVE_OPENAT2)
+            nxt_str_t  *chr = &ctx->chroot;
+
+            if (chr->length > 0) {
+                nxt_log(task, level, "opening \"%s\" at \"%V\" failed %E",
+                        fname, chr, file.error);
+
+            } else {
+                nxt_log(task, level, "opening \"%s\" failed %E",
+                        fname, file.error);
+            }
+
+#else
+            nxt_log(task, level, "opening \"%s\" failed %E", fname, file.error);
+#endif
+        }
+
+        if (level == NXT_LOG_ERR) {
+            nxt_http_static_next(task, r, ctx, status);
+            return;
+        }
+
+        goto fail;
+    }
+
+    f = nxt_mp_get(r->mem_pool, sizeof(nxt_file_t));
+    if (nxt_slow_path(f == NULL)) {
+        nxt_file_close(task, &file);
+        goto fail;
+    }
+
+    *f = file;
+
+    ret = nxt_file_info(f, &fi);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto fail;
+    }
+
+    if (nxt_fast_path(nxt_is_file(&fi))) {
+        r->status = NXT_HTTP_OK;
+        r->resp.content_length_n = nxt_file_size(&fi);
+
+        field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+        if (nxt_slow_path(field == NULL)) {
+            goto fail;
+        }
+
+        nxt_http_field_name_set(field, "Last-Modified");
+
+        p = nxt_mp_nget(r->mem_pool, NXT_HTTP_DATE_LEN);
+        if (nxt_slow_path(p == NULL)) {
+            goto fail;
+        }
+
+        nxt_gmtime(nxt_file_mtime(&fi), &tm);
+
+        field->value = p;
+        field->value_length = nxt_http_date(p, &tm) - p;
+
+        if (exten.start == NULL) {
+            nxt_http_static_extract_extension(shr, &exten);
+        }
+
+        if (mtype == NULL) {
+            mtype = nxt_http_static_mtype_get(&rtcf->mtypes_hash, &exten);
+        }
+
+        /*
+         * A ".svgz" file is an SVG image stored with gzip coding, so it is
+         * sent with "Content-Encoding: gzip", as Apache does with
+         * "AddEncoding gzip svgz".  The coding is not negotiated.  A client
+         * without gzip in Accept-Encoding still gets the gzip bytes, because
+         * no other representation exists.
+         *
+         * The extension must also resolve to image/svg+xml.  An operator who
+         * maps ".svgz" to another type in "mime_types" gets no coding.
+         *
+         * The decision is made here because it also changes the ETag below.
+         */
+
+        svgz = (nxt_strcasestr_eq(&exten, &svgz_exten)
+                && nxt_strcasestr_eq(mtype, &svg_mtype));
+
+        field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+        if (nxt_slow_path(field == NULL)) {
+            goto fail;
+        }
+
+        nxt_http_field_name_set(field, "ETag");
+
+        /*
+         * RFC 9110 Sect. 8.8.1: a validator is strong only when the
+         * representation cannot change again without the validator changing
+         * with it.  Both of ours are derived from the whole-second mtime and
+         * the size, so a rewrite to the same size during the second the file
+         * was last written is invisible to both.  While the clock is still
+         * inside that second another write can still land there, so the tag
+         * cannot be promised strong; once the second has passed, no later
+         * write can reproduce this mtime and the tag is strong for good.
+         *
+         * Apache weakens on the same hazard (modules/http/http_etag.c, in
+         * ap_make_etag_ex()), though on a sliding second against a
+         * microsecond mtime rather than the calendar second a whole-second
+         * mtime gives us.  The tag's format does not change, so nothing
+         * already in a cache is invalidated by this.
+         *
+         * This reasons about the clock that stamped the file, so it holds
+         * only where that is the clock Unit reads.  On a remote filesystem
+         * the mtime comes from the server: if that clock trails this one,
+         * Unit can call a tag strong while the server can still write into
+         * the second it names.  Apache carries the same caveat.
+         *
+         * nxt_thread_time() is the cached per-thread clock.  If it lags, it
+         * reports the request as still inside the second and the tag is
+         * weakened when it need not have been -- the safe direction.
+         */
+
+        etag_weak = ((nxt_time_t) nxt_thread_time(task->thread)
+                     <= (nxt_time_t) nxt_file_mtime(&fi));
+
+        /*
+         * The tag of a ".svgz" file ends in "-gzip".  Before the file was
+         * sent with gzip coding, its tag had no suffix.  The response had no
+         * coding, or it was compressed a second time under the weak form of
+         * the tag.  A cache that stored either response sends that tag back
+         * in If-None-Match.  The new tag does not match it, so the cache
+         * gets a full 200 with the new header fields instead of a 304 that
+         * keeps the old entry.  Apache's mod_deflate adds the same suffix
+         * to the tag of a response it compresses.
+         */
+
+        length = nxt_length("W/") + NXT_TIME_T_HEXLEN + NXT_OFF_T_HEXLEN
+                 + nxt_length("-gzip") + 3;
+
+        p = nxt_mp_nget(r->mem_pool, length);
+        if (nxt_slow_path(p == NULL)) {
+            goto fail;
+        }
+
+        field->value = p;
+
+        if (etag_weak) {
+            *p++ = 'W';
+            *p++ = '/';
+        }
+        /*
+         * nxt_file_mtime() yields a native time_t, which need not be
+         * nxt_time_t: on QNX it is a 32-bit unsigned type against a 64-bit
+         * nxt_time_t.  "%T" reads an nxt_time_t from the argument list, so
+         * the value has to be converted before it is passed, not after.
+         */
+        end = field->value + length;
+
+        field->value_length = nxt_sprintf(p, end, "\"%xT-%xO%s\"",
+                                          (nxt_time_t) nxt_file_mtime(&fi),
+                                          nxt_file_size(&fi),
+                                          svgz ? (u_char *) "-gzip"
+                                               : (u_char *) "")
+                              - field->value;
+
+        /*
+         * The comparison functions work on the opaque tag, so "etag" skips
+         * the prefix; weakness travels beside it as a flag rather than in
+         * the string.  Leaving "W/" in here would make every If-None-Match
+         * miss, since the client sends back the opaque tag it was given.
+         */
+
+        etag.start = p;
+        etag.length = field->value_length - (p - field->value);
+
+        if (mtype->length != 0) {
+            field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+            if (nxt_slow_path(field == NULL)) {
+                goto fail;
+            }
+
+            nxt_http_field_name_set(field, "Content-Type");
+
+            field->value = mtype->start;
+            field->value_length = mtype->length;
+        }
+
+        r->resp.mime_type = mtype;
+
+        /*
+         * The Content-Encoding of a ".svgz" file is added before the
+         * acceptability check below.  That check skips a response that
+         * already has a Content-Encoding.  So the file is not compressed a
+         * second time, its ETag stays strong, and a Range applies to the
+         * stored bytes.
+         */
+
+        if (svgz) {
+            field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+            if (nxt_slow_path(field == NULL)) {
+                goto fail;
+            }
+
+            nxt_http_field_name_set(field, "Content-Encoding");
+
+            field->value = (u_char *) "gzip";
+            field->value_length = nxt_length("gzip");
+
+            coding = field;
+        }
+
+        /*
+         * RFC 9110 Sect. 13.2.1: an ordinary failure outranks a precondition.
+         * If no acceptable representation exists the answer is 406, and it
+         * must not be displaced by the 304 or 412 a validator would give --
+         * so ask about acceptability here, and apply the decision further
+         * down, on the path that actually sends a body.
+         */
+
+        ret = nxt_http_comp_check_acceptable(task, r);
+        if (ret == NXT_HTTP_NOT_ACCEPTABLE) {
+            /*
+             * Every other exit that answers without a body closes the file
+             * first -- the 304 and 416 branches below, and "fail:".  This one
+             * returns rather than reaching either, so it has to close its own,
+             * or one unauthenticated request costs the router a descriptor.
+             */
+            nxt_file_close(task, f);
+            f = NULL;
+
+            nxt_http_request_error(task, r, NXT_HTTP_NOT_ACCEPTABLE);
+            return;
+        } else if (ret != NXT_OK) {
+            goto fail;
+        }
+
+        /*
+         * A response with the stored coding of a ".svgz" file has a coding
+         * that an older cached response of the same file may lack.  The
+         * Last-Modified date did not change when the coding was added, so a
+         * date cannot tell the two apart.  Only the ETag can.  So a date
+         * gives no 304 and no range for such a response.  A client that
+         * sends If-None-Match or an entity-tag in If-Range is not affected.
+         */
+
+        pcond = nxt_http_static_preconditions(r, &etag, etag_weak,
+                                              nxt_file_mtime(&fi),
+                                              coding == NULL);
+
+        if (pcond != NXT_HTTP_OK) {
+            nxt_file_close(task, f);
+            f = NULL;
+
+            if (pcond == NXT_HTTP_PRECONDITION_FAILED) {
+                nxt_http_request_error(task, r, pcond);
+                return;
+            }
+
+            /*
+             * A 304 carries the validators and nothing else.
+             * content_length_n is reset so no Content-Length is emitted, and
+             * no body handler is scheduled; the h1 framing already
+             * special-cases 304, so keep-alive survives and the response is
+             * never chunked (src/nxt_h1proto.c).
+             */
+            r->status = NXT_HTTP_NOT_MODIFIED;
+            r->resp.content_length_n = -1;
+
+            /*
+             * RFC 9110 Sect. 15.4.5: a 304 should not carry representation
+             * metadata such as Content-Encoding.  A cache keeps the field it
+             * stored with the 200.  The compressed path also sends a 304
+             * without it.
+             */
+
+            if (coding != NULL) {
+                coding->skip = 1;
+            }
+
+            body_handler = NULL;
+
+            goto send;
+        }
+
+        field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+        if (nxt_slow_path(field == NULL)) {
+            goto fail;
+        }
+
+        nxt_http_field_name_set(field, "Accept-Ranges");
+
+        field->value = (u_char *) "bytes";
+        field->value_length = nxt_length("bytes");
+
+        /*
+         * A HEAD is range-processed exactly like the GET it stands for, and
+         * differs only in sending no body.  RFC 9110 Sect. 14.2 says range
+         * handling is defined for GET, which reads like an argument for
+         * ignoring Range here -- but Sect. 9.3.2 asks a HEAD to send the same
+         * header fields the GET would have sent, and nginx, Apache and Go's
+         * net/http all answer 206 with Content-Range to a HEAD.  "curl -I -r"
+         * relies on it.  Matching them is worth more than the stricter
+         * reading of a sentence about methods that do not define ranges.
+         */
+
+        rstatus = nxt_http_static_range(r, &etag, etag_weak,
+                                        nxt_file_mtime(&fi), coding == NULL,
+                                        nxt_file_size(&fi), &range_start,
+                                        &range_end);
+
+        /*
+         * A range is served as identity, so a client that sent
+         * "identity;q=0" must not be given one -- see the comment on the
+         * drop below.  Tested here rather than after the 416 branch so that
+         * ignoring the Range is all or nothing: an unsatisfiable range from
+         * such a client would otherwise still draw a 416 whose
+         * "Content-Range: bytes STAR/size" reports the size of exactly the
+         * representation it refused.
+         */
+
+        if (nxt_http_comp_identity_refused(r)) {
+            rstatus = NXT_HTTP_OK;
+        }
+
+        if (rstatus == NXT_HTTP_RANGE_NOT_SATISFIABLE) {
+            nxt_file_close(task, f);
+            f = NULL;
+
+            r->status = NXT_HTTP_RANGE_NOT_SATISFIABLE;
+            r->resp.content_length_n = 0;
+
+            /*
+             * A 416 has no body, so it has no content coding.  The
+             * error responses (406, 412, 500) need no such step:
+             * nxt_http_request_error() drops every field added here.
+             */
+
+            if (coding != NULL) {
+                coding->skip = 1;
+            }
+
+            field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+            if (nxt_slow_path(field == NULL)) {
+                goto fail;
+            }
+
+            nxt_http_field_name_set(field, "Content-Range");
+
+            length = nxt_length("bytes */") + NXT_OFF_T_LEN;
+
+            p = nxt_mp_nget(r->mem_pool, length);
+            if (nxt_slow_path(p == NULL)) {
+                goto fail;
+            }
+
+            field->value = p;
+            field->value_length = nxt_sprintf(p, p + length, "bytes */%O",
+                                              nxt_file_size(&fi))
+                                  - p;
+
+            body_handler = NULL;
+            goto send;
+        }
+
+        is_range = (rstatus == NXT_HTTP_PARTIAL_CONTENT);
+
+        /*
+         * Why the Range is dropped for a client that refused identity.
+         *
+         * Not because a coded range is impossible: Sect. 3.2 defines
+         * representation data as the bytes after content coding and Sect.
+         * 14.1.2 defines a byte range over that, so bytes 0-9 of the gzip
+         * representation is well defined -- and Unit codes the whole file
+         * into a temp file before sending, so it could slice that instead.
+         *
+         * Because a coded range is never resumable, and costs a whole file
+         * to answer.  A coded representation carries a weak entity-tag
+         * (nxt_http_comp_weaken_etag()), and nxt_http_static_range() above
+         * compares an "If-Range" strongly, so a resumed coded range always
+         * falls back to the full response -- the one thing a range request
+         * exists to avoid.  Meanwhile Unit compresses the whole file into a
+         * temp file to hand back ten bytes of it.
+         *
+         * So ignore the Range (Sect. 14.2 permits it) and send the full 200
+         * in the coding the client did accept.  That is already how this
+         * function answers a malformed range, a multi-range request and an
+         * If-Range mismatch, so it needs no new shape of response.  A 406
+         * would be the other reading, but it refuses a request that can be
+         * satisfied.
+         *
+         * Not reached when nothing is acceptable: that is already 406, from
+         * nxt_http_comp_check_acceptable() above.  That includes a response
+         * that no coding is applied to, where the full 200 would be
+         * identity again.
+         */
+
+        if (is_range) {
+            r->status = NXT_HTTP_PARTIAL_CONTENT;
+            r->resp.content_length_n = range_end - range_start + 1;
+
+            field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+            if (nxt_slow_path(field == NULL)) {
+                goto fail;
+            }
+
+            nxt_http_field_name_set(field, "Content-Range");
+
+            /*
+             * Three %O conversions, so three times NXT_OFF_T_LEN.  With two,
+             * 40 digits are available across start, end and size: 13 digits
+             * each still fits, 14 does not, so a file of about 10 TB with a
+             * range near its end truncates the header.  nxt_sprintf() clamps
+             * at the boundary, so the value is cut rather than the buffer
+             * overrun -- a wrong Content-Range rather than a crash.
+             */
+            length = nxt_length("bytes -/") + 3 * NXT_OFF_T_LEN;
+
+            p = nxt_mp_nget(r->mem_pool, length);
+            if (nxt_slow_path(p == NULL)) {
+                goto fail;
+            }
+
+            field->value = p;
+            field->value_length = nxt_sprintf(p, p + length,
+                                              "bytes %O-%O/%O", range_start,
+                                              range_end, nxt_file_size(&fi))
+                                  - p;
+        }
+
+        if (ctx->need_body && nxt_file_size(&fi) > 0) {
+
+            /*
+             * A satisfiable Range request is served as identity partial
+             * content: content-coding a byte slice would either compress
+             * the wrong bytes (coding the whole file, then slicing, defeats
+             * the point of a range request) or require re-deriving which
+             * coded bytes correspond to the requested identity range, which
+             * most codings do not support at all.  Skipping compression
+             * here is a plain read of the file, so it does not touch the
+             * temp-file swap that nxt_http_comp_compress_static_response()
+             * performs, nor r->resp.mime_type (already set above).
+             */
+
+            if (!is_range) {
+                ret = nxt_http_comp_apply_compression(task, r);
+                if (nxt_slow_path(ret != NXT_OK)) {
+                    goto fail;
+                }
+
+                if (nxt_http_comp_wants_compression(r)) {
+                    size_t     out_total;
+                    nxt_int_t  ret;
+
+                    ret = nxt_http_comp_compress_static_response(
+                                                        task, r, &f, &fi,
+                                                        NXT_HTTP_STATIC_BUF_SIZE,
+                                                        &out_total);
+                    if (ret == NXT_ERROR) {
+                        goto fail;
+                    }
+
+                    ret = nxt_file_info(f, &fi);
+                    if (nxt_slow_path(ret != NXT_OK)) {
+                        goto fail;
+                    }
+
+                    r->resp.content_length_n = out_total;
+                }
+            }
+
+            fb = nxt_http_static_buf_alloc(task, r->mem_pool);
+            if (nxt_slow_path(fb == NULL)) {
+                goto fail;
+            }
+
+            fb->file = f;
+
+            if (is_range) {
+                fb->file_pos = range_start;
+                fb->file_end = range_end + 1;
+
+            } else {
+                fb->file_end = nxt_file_size(&fi);
+            }
+
+            r->out = fb;
+
+            /*
+             * The descriptor is malloc-backed (freelist), not pool memory, so
+             * it is not reclaimed when the request pool is released.  On the
+             * normal path nxt_http_static_buf_completion() closes the file,
+             * clears r->out and returns fb to the freelist.  But if the header
+             * send below takes the error path the body handler is never
+             * scheduled and fb stays parked in r->out with the file still
+             * open; nothing else drains r->out (discard only drains connection
+             * buffers and r->last).  Register a pool cleanup that reclaims fb
+             * in exactly that case -- it is a no-op once r->out is cleared.
+             */
+            if (nxt_slow_path(nxt_mp_cleanup(r->mem_pool,
+                                             nxt_http_static_buf_cleanup,
+                                             task, fb, r) != NXT_OK))
+            {
+                r->out = NULL;
+                nxt_http_static_buf_free(fb);
+                goto fail;
+            }
+
+            body_handler = &nxt_http_static_body_handler;
+
+        } else {
+            nxt_file_close(task, f);
+            body_handler = NULL;
+        }
+
+    } else {
+        /* Not a file. */
+        nxt_file_close(task, f);
+
+        if (nxt_slow_path(!nxt_is_dir(&fi)
+                          || shr->start[shr->length - 1] == '/'))
+        {
+            nxt_log(task, NXT_LOG_ERR, "\"%FN\" is not a regular file",
+                    f->name);
+
+            nxt_http_static_next(task, r, ctx, NXT_HTTP_NOT_FOUND);
+            return;
+        }
+
+        f = NULL;
+
+        r->status = NXT_HTTP_MOVED_PERMANENTLY;
+        r->resp.content_length_n = 0;
+
+        field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+        if (nxt_slow_path(field == NULL)) {
+            goto fail;
+        }
+
+        nxt_http_field_name_set(field, "Location");
+
+        encode = nxt_encode_uri(NULL, r->path->start, r->path->length);
+        length = r->path->length + encode * 2 + 1;
+
+        if (r->args->length > 0) {
+            length += 1 + r->args->length;
+        }
+
+        p = nxt_mp_nget(r->mem_pool, length);
+        if (nxt_slow_path(p == NULL)) {
+            goto fail;
+        }
+
+        field->value = p;
+        field->value_length = length;
+
+        if (encode > 0) {
+            p = (u_char *) nxt_encode_uri(p, r->path->start, r->path->length);
+
+        } else {
+            p = nxt_cpymem(p, r->path->start, r->path->length);
+        }
+
+        *p++ = '/';
+
+        if (r->args->length > 0) {
+            *p++ = '?';
+            nxt_memcpy(p, r->args->start, r->args->length);
+        }
+
+        body_handler = NULL;
+    }
+
+send:
+
+    nxt_http_request_header_send(task, r, body_handler, NULL);
+
+    r->state = &nxt_http_static_send_state;
+    return;
+
+fail:
+
+    if (f != NULL) {
+        nxt_file_close(task, f);
+    }
+
+    nxt_http_request_error(task, r, NXT_HTTP_INTERNAL_SERVER_ERROR);
+}
+
+
+/*
+ * Conditional requests, RFC 9110 Sect. 13.2.2, evaluated in the order that
+ * section mandates: If-Match, then If-Unmodified-Since, then If-None-Match,
+ * then If-Modified-Since.  Returns NXT_HTTP_OK to serve the file normally,
+ * NXT_HTTP_NOT_MODIFIED for a 304, or NXT_HTTP_PRECONDITION_FAILED for a 412.
+ *
+ * The later step in each pair is consulted only when the earlier one is
+ * absent: a client that sends both an entity-tag and a date is asking to be
+ * judged by the entity-tag, even when the tag does not match.
+ *
+ * "date_ok" is 0 when the date does not identify the representation.  Then
+ * If-Modified-Since never gives a 304, because a 304 tells a cache to reuse
+ * the entry it has, and that entry can be stale.  If-Unmodified-Since needs
+ * no such gate.  A 412 makes no cache reuse an entry.  A request that passes
+ * gets the full 200 with the current header fields.
+ */
+
+static nxt_http_status_t
+nxt_http_static_preconditions(nxt_http_request_t *r, nxt_str_t *etag,
+    nxt_bool_t weak, nxt_time_t mtime, nxt_bool_t date_ok)
+{
+    nxt_str_t               value;
+    nxt_time_t              date;
+    nxt_bool_t              im_seen, im_match, inm_seen, inm_match;
+    nxt_http_field_t        *f, *ium, *ims;
+    nxt_http_fields_iter_t  iter;
+
+    /*
+     * RFC 9110 Sect. 5.3: repeated field lines are equivalent to one line
+     * holding the comma-separated concatenation.  If-Match and If-None-Match
+     * are both "#entity-tag" lists whose members are OR'd, so evaluating
+     * every line and remembering whether ANY of them matched is exactly that
+     * concatenation -- whereas keeping only the last line seen would refuse a
+     * legitimate request with 412 when an earlier If-Match line matched.
+     */
+
+    /*
+     * Judge a conditional request only against validators the client was
+     * actually given.  If "response_headers" replaces or removes ETag or
+     * Last-Modified, what this function would compare is not what went out
+     * (src/nxt_http_set_headers.c), so decline rather than answer 304 or 412
+     * on the strength of a tag the client never saw.  Serving the full
+     * response is always a correct answer to a conditional request.
+     */
+
+    if (nxt_http_set_headers_override_validators(r)) {
+        return NXT_HTTP_OK;
+    }
+
+    im_seen = 0;
+    im_match = 0;
+    inm_seen = 0;
+    inm_match = 0;
+    ium = NULL;
+    ims = NULL;
+
+    /*
+     * Request headers land in r->inline_fields and only spill into the
+     * r->fields list, so a list-only walk silently sees nothing on an
+     * ordinary request.  Use the iterator that covers both
+     * (src/nxt_http_parse.h).
+     */
+
+    for (f = nxt_http_fields_first(&iter, r->inline_fields,
+                                   r->num_inline_fields, r->fields);
+         f != NULL;
+         f = nxt_http_fields_next(&iter))
+    {
+        if (f->skip) {
+            continue;
+        }
+
+        switch (f->name_length) {
+
+        case nxt_length("If-Match"):
+            if (nxt_strncasecmp(f->name, (u_char *) "If-Match",
+                                nxt_length("If-Match")) == 0)
+            {
+                im_seen = 1;
+
+                if (!im_match) {
+                    value.start = f->value;
+                    value.length = f->value_length;
+
+                    /* Sect. 13.1.1: If-Match compares strongly. */
+
+                    im_match = nxt_http_static_etag_match(&value, etag, weak,
+                                                          1);
+                }
+            }
+
+            break;
+
+        case nxt_length("If-None-Match"):
+            if (nxt_strncasecmp(f->name, (u_char *) "If-None-Match",
+                                nxt_length("If-None-Match")) == 0)
+            {
+                inm_seen = 1;
+
+                if (!inm_match) {
+                    value.start = f->value;
+                    value.length = f->value_length;
+
+                    inm_match = nxt_http_static_etag_match(&value, etag, weak,
+                                                           0);
+                }
+            }
+
+            break;
+
+        case nxt_length("If-Modified-Since"):
+            if (nxt_strncasecmp(f->name, (u_char *) "If-Modified-Since",
+                                nxt_length("If-Modified-Since")) == 0)
+            {
+                ims = f;
+            }
+
+            break;
+
+        case nxt_length("If-Unmodified-Since"):
+            if (nxt_strncasecmp(f->name, (u_char *) "If-Unmodified-Since",
+                                nxt_length("If-Unmodified-Since")) == 0)
+            {
+                ium = f;
+            }
+
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    if (im_seen) {
+        if (!im_match) {
+            return NXT_HTTP_PRECONDITION_FAILED;
+        }
+
+    } else if (ium != NULL) {
+        date = nxt_time_parse(ium->value, ium->value_length);
+
+        if (date != (nxt_time_t) -1 && mtime > date) {
+            return NXT_HTTP_PRECONDITION_FAILED;
+        }
+    }
+
+    if (inm_seen) {
+        if (inm_match) {
+            return NXT_HTTP_NOT_MODIFIED;
+        }
+
+        return NXT_HTTP_OK;
+    }
+
+    if (ims != NULL && date_ok) {
+        date = nxt_time_parse(ims->value, ims->value_length);
+
+        /*
+         * An unparsable date is ignored rather than treated as an error.
+         * Sect. 13.1.3 makes "earlier than or equal to" the unmodified case;
+         * nginx offers an "exact" mode to survive a rollback to an older
+         * mtime, but the RFC comparison is what Unit implements.
+         */
+
+        if (date != (nxt_time_t) -1 && mtime <= date) {
+            return NXT_HTTP_NOT_MODIFIED;
+        }
+    }
+
+    return NXT_HTTP_OK;
+}
+
+
+/*
+ * Matches an entity-tag against an If-Match or If-None-Match list.
+ *
+ * "etag" is the opaque tag without any "W/"; "own_weak" says whether the tag
+ * Unit generated for this representation is weak, which it is while the
+ * request falls inside the second the file was last written.
+ *
+ * Sect. 8.8.3.2: the strong function matches only when both tags are strong,
+ * so a weak tag on either side fails it -- the client's, or our own.  The
+ * weak function strips the prefix and compares the opaque tags.
+ *
+ * "*" matches any existing representation, but only as the entire field
+ * value -- the grammar is "*" / #entity-tag, so it is not a list member.
+ */
+
+static nxt_bool_t
+nxt_http_static_etag_match(nxt_str_t *list, nxt_str_t *etag,
+    nxt_bool_t own_weak, nxt_bool_t strong)
+{
+    u_char     *p, *end, *start;
+    nxt_bool_t  weak;
+    nxt_str_t   tag;
+
+    p = list->start;
+    end = p + list->length;
+
+    while (p < end && (*p == ' ' || *p == '\t')) {
+        p++;
+    }
+
+    if (end - p == 1 && *p == '*') {
+        return 1;
+    }
+
+    if (own_weak && strong) {
+        /*
+         * A strong comparison needs both tags strong (Sect. 8.8.3.2), and
+         * ours is not, so no entity-tag in the list can match.  This is
+         * below the "*" test on purpose: "*" asks whether a representation
+         * exists at all, not whether a validator matches, so weakness does
+         * not bear on it.
+         */
+
+        return 0;
+    }
+
+    while (p < end) {
+
+        while (p < end && (*p == ' ' || *p == '\t' || *p == ',')) {
+            p++;
+        }
+
+        if (p == end) {
+            break;
+        }
+
+        weak = 0;
+
+        if (end - p >= 2 && p[0] == 'W' && p[1] == '/') {
+            weak = 1;
+            p += 2;
+        }
+
+        if (p == end || *p != '"') {
+            /* Not a valid entity-tag; skip to the next comma. */
+
+            while (p < end && *p != ',') {
+                p++;
+            }
+
+            continue;
+        }
+
+        start = p++;
+
+        while (p < end && *p != '"') {
+            p++;
+        }
+
+        if (p == end) {
+            break;
+        }
+
+        p++;
+
+        if (weak && strong) {
+            continue;
+        }
+
+        tag.start = start;
+        tag.length = p - start;
+
+        if (nxt_strstr_eq(&tag, etag)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+/*
+ * Parses a decimal run of digits starting at *p (bounded by end), advancing
+ * *p past what it consumed.  Returns the parsed value, or -1 if *p pointed
+ * at a non-digit (no digits consumed, *p left unchanged).
+ */
+
+static nxt_off_t
+nxt_http_static_range_number(u_char **p, u_char *end)
+{
+    u_char      *start;
+    nxt_off_t   value;
+
+    start = *p;
+
+    if (*p == end || **p < '0' || **p > '9') {
+        return -1;
+    }
+
+    value = 0;
+
+    while (*p < end && **p >= '0' && **p <= '9') {
+        /*
+         * Saturate rather than wrap.  A wrapped value goes NEGATIVE, and a
+         * negative first-pos passes both the "a >= size" and "b < a" tests,
+         * so the range is accepted and "rest = file_end - file_pos" in
+         * nxt_http_static_body_handler() comes out negative: nxt_min() casts
+         * it to a huge size_t, the buffer allocation fails, and the request
+         * is abandoned with the file still open in r->out.  One header per
+         * leaked descriptor is an unauthenticated denial of service.
+         *
+         * Saturating is also what the RFC asks for at both ends: a first-pos
+         * of NXT_OFF_T_MAX is >= size, so Sect. 14.1.2 gives 416, while a
+         * suffix that large means "the whole representation".
+         */
+
+        if (value > (NXT_OFF_T_MAX - (**p - '0')) / 10) {
+            value = NXT_OFF_T_MAX;
+
+            while (*p < end && **p >= '0' && **p <= '9') {
+                (*p)++;
+            }
+
+            return value;
+        }
+
+        value = value * 10 + (*(*p)++ - '0');
+    }
+
+    if (*p == start) {
+        return -1;
+    }
+
+    return value;
+}
+
+
+/*
+ * RFC 9110 Sect. 14.1-14.4: parses a "Range" request header and, when
+ * "If-Range" (Sect. 13.1.5) is present, applies it only if the precondition
+ * matches the current representation.
+ *
+ * Returns:
+ *   NXT_HTTP_OK                  -- no Range applies; serve the full 200.
+ *     (No Range header, a malformed Range, a multi-range request -- a
+ *     server may legally ignore Range entirely -- or an If-Range mismatch.)
+ *   NXT_HTTP_PARTIAL_CONTENT     -- "start"/"end" name an inclusive byte range
+ *     to serve as a 206; both are clamped to [0, size - 1].
+ *   NXT_HTTP_RANGE_NOT_SATISFIABLE -- the single range is out of bounds; the
+ *     caller answers 416 with a "Content-Range: bytes STAR/size" header.
+ *
+ * "date_ok" is 0 when the date does not identify the representation.  Then
+ * a date in If-Range never matches.
+ */
+
+static nxt_http_status_t
+nxt_http_static_range(nxt_http_request_t *r, nxt_str_t *etag,
+    nxt_bool_t weak, nxt_time_t mtime, nxt_bool_t date_ok, nxt_off_t size,
+    nxt_off_t *start, nxt_off_t *end)
+{
+    u_char                  *p, *last;
+    nxt_off_t               a, b, suffix;
+    nxt_time_t              date;
+    nxt_bool_t              match;
+    nxt_str_t               value;
+    nxt_http_field_t        *f, *range, *if_range;
+    nxt_http_fields_iter_t  iter;
+
+    range = NULL;
+    if_range = NULL;
+
+    for (f = nxt_http_fields_first(&iter, r->inline_fields,
+                                   r->num_inline_fields, r->fields);
+         f != NULL;
+         f = nxt_http_fields_next(&iter))
+    {
+        if (f->skip) {
+            continue;
+        }
+
+        switch (f->name_length) {
+
+        case nxt_length("Range"):
+            if (nxt_strncasecmp(f->name, (u_char *) "Range",
+                                nxt_length("Range")) == 0)
+            {
+                range = f;
+            }
+
+            break;
+
+        case nxt_length("If-Range"):
+            if (nxt_strncasecmp(f->name, (u_char *) "If-Range",
+                                nxt_length("If-Range")) == 0)
+            {
+                if_range = f;
+            }
+
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    if (range == NULL) {
+        return NXT_HTTP_OK;
+    }
+
+    if (if_range != NULL) {
+        value.start = if_range->value;
+        value.length = if_range->value_length;
+
+        if (value.length > 0 && (value.start[0] == '"'
+                                 || (value.length > 1
+                                     && value.start[0] == 'W'
+                                     && value.start[1] == '/')))
+        {
+            /* An entity-tag: Sect. 13.1.5 requires the strong comparison. */
+
+            match = nxt_http_static_etag_match(&value, etag, weak, 1);
+
+        } else {
+            date = nxt_time_parse(value.start, value.length);
+
+            /*
+             * Sect. 13.1.5: an exact match against the last modification,
+             * and only while that date is a strong validator.  Inside the
+             * second the file was written it is not: the client would splice
+             * a range from one version onto a copy of another, and unlike a
+             * bad conditional GET that produces a corrupt file rather than a
+             * stale one.  Refusing the If-Range costs a full response.
+             */
+
+            match = (date_ok && !weak && date != (nxt_time_t) -1
+                     && date == mtime);
+        }
+
+        if (!match) {
+            return NXT_HTTP_OK;
+        }
+    }
+
+    p = range->value;
+    last = p + range->value_length;
+
+    if ((size_t) (last - p) <= nxt_length("bytes=")
+        || nxt_strncasecmp(p, (u_char *) "bytes=", nxt_length("bytes=")) != 0)
+    {
+        return NXT_HTTP_OK;
+    }
+
+    p += nxt_length("bytes=");
+
+    /*
+     * Only a single range-spec is supported; a comma anywhere in the
+     * remainder marks a multi-range request, which a server may ignore.
+     */
+
+    if (memchr(p, ',', last - p) != NULL) {
+        return NXT_HTTP_OK;
+    }
+
+    if (*p == '-') {
+        p++;
+
+        suffix = nxt_http_static_range_number(&p, last);
+
+        if (suffix == -1 || p != last) {
+            return NXT_HTTP_OK;
+        }
+
+        /*
+         * A suffix range is unsatisfiable when it asks for nothing, and also
+         * against a zero-length representation: "size - suffix" would clamp
+         * to 0 while "size - 1" is -1, yielding "Content-Range: bytes 0--1/0".
+         */
+
+        if (suffix == 0 || size == 0) {
+            return NXT_HTTP_RANGE_NOT_SATISFIABLE;
+        }
+
+        a = (suffix < size) ? size - suffix : 0;
+        b = size - 1;
+
+    } else {
+        a = nxt_http_static_range_number(&p, last);
+
+        if (a == -1 || p == last || *p != '-') {
+            return NXT_HTTP_OK;
+        }
+
+        p++;
+
+        if (a >= size) {
+            return NXT_HTTP_RANGE_NOT_SATISFIABLE;
+        }
+
+        if (p == last) {
+            b = size - 1;
+
+        } else {
+            b = nxt_http_static_range_number(&p, last);
+
+            if (b == -1 || p != last || b < a) {
+                return NXT_HTTP_OK;
+            }
+
+            if (b >= size) {
+                b = size - 1;
+            }
+        }
+    }
+
+    *start = a;
+    *end = b;
+
+    return NXT_HTTP_PARTIAL_CONTENT;
+}
+
+
+static void
+nxt_http_static_next(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_http_static_ctx_t *ctx, nxt_http_status_t status)
+{
+    nxt_http_action_t       *action;
+    nxt_http_static_conf_t  *conf;
+
+    action = ctx->action;
+    conf = action->u.conf;
+
+    ctx->share_idx++;
+
+    if (ctx->share_idx < conf->nshares) {
+        nxt_http_static_iterate(task, r, ctx);
+        return;
+    }
+
+    if (action->fallback != NULL) {
+        if (nxt_slow_path(r->log_route)) {
+            nxt_log(task, NXT_LOG_NOTICE, "\"fallback\" taken");
+        }
+
+        r->action = action->fallback;
+        nxt_http_request_action(task, r, action->fallback);
+        return;
+    }
+
+    nxt_http_request_error(task, r, status);
+}
+
+
+#if (NXT_HAVE_OPENAT2)
+
+static u_char *
+nxt_http_static_chroot_match(u_char *chr, u_char *shr)
+{
+    if (*chr != *shr) {
+        return NULL;
+    }
+
+    chr++;
+    shr++;
+
+    for ( ;; ) {
+        if (*shr == '\0') {
+            return NULL;
+        }
+
+        if (*chr == *shr) {
+            chr++;
+            shr++;
+            continue;
+        }
+
+        if (*chr == '\0') {
+            break;
+        }
+
+        if (*chr == '/') {
+            if (chr[-1] == '/') {
+                chr++;
+                continue;
+            }
+
+        } else if (*shr == '/') {
+            if (shr[-1] == '/') {
+                shr++;
+                continue;
+            }
+        }
+
+        return NULL;
+    }
+
+    if (shr[-1] != '/' && *shr != '/') {
+        return NULL;
+    }
+
+    while (*shr == '/') {
+        shr++;
+    }
+
+    return (*shr != '\0') ? shr : NULL;
+}
+
+#endif
+
+
+static void
+nxt_http_static_extract_extension(nxt_str_t *path, nxt_str_t *exten)
+{
+    u_char  ch, *p, *end;
+
+    end = path->start + path->length;
+    p = end;
+
+    while (p > path->start) {
+        p--;
+        ch = *p;
+
+        switch (ch) {
+        case '/':
+            p++;
+            nxt_fallthrough;
+        case '.':
+            goto extension;
+        }
+    }
+
+extension:
+
+    exten->length = end - p;
+    exten->start = p;
+}
+
+
+static void
+nxt_http_static_body_handler(nxt_task_t *task, void *obj, void *data)
+{
+    size_t              alloc;
+    nxt_buf_t           *fb, *b, **next, *out;
+    nxt_off_t           rest;
+    nxt_int_t           n;
+    nxt_work_queue_t    *wq;
+    nxt_http_request_t  *r;
+
+    r = obj;
+    fb = r->out;
+
+    rest = fb->file_end - fb->file_pos;
+    out = NULL;
+    next = &out;
+    n = 0;
+
+    do {
+        alloc = nxt_min(rest, NXT_HTTP_STATIC_BUF_SIZE);
+
+        b = nxt_buf_mem_alloc(r->mem_pool, alloc, 0);
+        if (nxt_slow_path(b == NULL)) {
+            goto fail;
+        }
+
+        b->completion_handler = nxt_http_static_buf_completion;
+        b->parent = r;
+
+        nxt_mp_retain(r->mem_pool);
+
+        *next = b;
+        next = &b->next;
+
+        rest -= alloc;
+
+    } while (rest > 0 && ++n < NXT_HTTP_STATIC_BUF_COUNT);
+
+    wq = &task->thread->engine->fast_work_queue;
+
+    nxt_sendbuf_drain(task, wq, out);
+    return;
+
+fail:
+
+    while (out != NULL) {
+        b = out;
+        out = b->next;
+
+        nxt_mp_free(r->mem_pool, b);
+        nxt_mp_release(r->mem_pool);
+    }
+}
+
+
+static const nxt_http_request_state_t  nxt_http_static_send_state
+    nxt_aligned(64) =
+{
+    .error_handler = nxt_http_request_error_handler,
+};
+
+
+static void
+nxt_http_static_buf_completion(nxt_task_t *task, void *obj, void *data)
+{
+    ssize_t             n, size;
+    nxt_buf_t           *b, *fb, *next;
+    nxt_off_t           rest;
+    nxt_http_request_t  *r;
+
+    b = obj;
+    r = data;
+
+complete_buf:
+
+    fb = r->out;
+
+    if (nxt_slow_path(fb == NULL || r->error)) {
+        goto clean;
+    }
+
+    rest = fb->file_end - fb->file_pos;
+    size = nxt_buf_mem_size(&b->mem);
+
+    size = nxt_min(rest, (nxt_off_t) size);
+
+    n = nxt_file_read(fb->file, b->mem.start, size, fb->file_pos);
+
+    if (nxt_slow_path(n == NXT_ERROR)) {
+        nxt_http_request_error_handler(task, r, r->proto.any);
+        goto clean;
+    }
+
+    next = b->next;
+
+    if (n == rest) {
+        nxt_file_close(task, fb->file);
+        r->out = NULL;
+
+        nxt_http_static_buf_free(fb);
+
+        b->next = nxt_http_buf_last(r);
+
+    } else {
+        if (nxt_slow_path(n == 0)) {
+            /* file truncated since it was stat(2)'d */
+            nxt_http_request_error_handler(task, r, r->proto.any);
+            goto clean;
+        }
+        fb->file_pos += n;
+        b->next = NULL;
+    }
+
+    b->mem.pos = b->mem.start;
+    b->mem.free = b->mem.pos + n;
+
+    nxt_http_request_send(task, r, b);
+
+    if (next != NULL) {
+        b = next;
+        goto complete_buf;
+    }
+
+    return;
+
+clean:
+
+    /*
+     * The file goes first: the buffers below may hold the last references
+     * to the request pool, and when the pool is destroyed r is gone and
+     * nxt_http_static_buf_cleanup() would close the file a second time.
+     */
+    if (fb != NULL) {
+        nxt_file_close(task, fb->file);
+        r->out = NULL;
+
+        nxt_http_static_buf_free(fb);
+    }
+
+    do {
+        next = b->next;
+
+        nxt_mp_free(r->mem_pool, b);
+        nxt_mp_release(r->mem_pool);
+
+        b = next;
+    } while (b != NULL);
+}
+
+
+static void
+nxt_http_static_buf_cleanup(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_buf_t           *fb;
+    nxt_http_request_t  *r;
+
+    fb = obj;
+    r = data;
+
+    /*
+     * Runs once when the request pool is destroyed.  If fb is still parked in
+     * r->out the body handler / completion never ran (header send took the
+     * error path), so the file is still open and the descriptor still owned
+     * here: close and reclaim it.  Otherwise completion already cleared r->out
+     * and returned fb to the freelist, so this is a no-op.
+     */
+    if (r->out == fb) {
+        nxt_file_close(task, fb->file);
+        r->out = NULL;
+
+        nxt_http_static_buf_free(fb);
+    }
+}
+
+
+nxt_int_t
+nxt_http_static_mtypes_init(nxt_mp_t *mp, nxt_lvlhsh_t *hash)
+{
+    nxt_str_t   *type, exten;
+    nxt_int_t   ret;
+    nxt_uint_t  i;
+
+    static const struct {
+        nxt_str_t   type;
+        const char  *exten;
+    } default_types[] = {
+
+        { nxt_string("text/html"),      ".html"  },
+        { nxt_string("text/html"),      ".htm"   },
+        { nxt_string("text/css"),       ".css"   },
+
+        { nxt_string("image/svg+xml"),  ".svg"   },
+        { nxt_string("image/svg+xml"),  ".svgz"  },
+        { nxt_string("image/webp"),     ".webp"  },
+        { nxt_string("image/png"),      ".png"   },
+        { nxt_string("image/apng"),     ".apng"  },
+        { nxt_string("image/jpeg"),     ".jpeg"  },
+        { nxt_string("image/jpeg"),     ".jpg"   },
+        { nxt_string("image/gif"),      ".gif"   },
+        { nxt_string("image/x-icon"),   ".ico"   },
+
+        { nxt_string("image/avif"),           ".avif"  },
+        { nxt_string("image/avif-sequence"),  ".avifs" },
+
+        { nxt_string("font/woff"),      ".woff"  },
+        { nxt_string("font/woff2"),     ".woff2" },
+        { nxt_string("font/otf"),       ".otf"   },
+        { nxt_string("font/ttf"),       ".ttf"   },
+
+        { nxt_string("text/plain"),     ".txt"   },
+        { nxt_string("text/markdown"),  ".md"    },
+        { nxt_string("text/x-rst"),     ".rst"   },
+
+        { nxt_string("application/javascript"),  ".js"   },
+        { nxt_string("application/javascript"),  ".mjs"  },
+        { nxt_string("application/json"),        ".json" },
+        { nxt_string("application/xml"),         ".xml"  },
+        { nxt_string("application/rss+xml"),     ".rss"  },
+        { nxt_string("application/atom+xml"),    ".atom" },
+        { nxt_string("application/pdf"),         ".pdf"  },
+
+        { nxt_string("application/zip"),         ".zip"  },
+
+        { nxt_string("audio/mpeg"),       ".mp3"  },
+        { nxt_string("audio/ogg"),        ".ogg"  },
+        { nxt_string("audio/midi"),       ".midi" },
+        { nxt_string("audio/midi"),       ".mid"  },
+        { nxt_string("audio/flac"),       ".flac" },
+        { nxt_string("audio/aac"),        ".aac"  },
+        { nxt_string("audio/wav"),        ".wav"  },
+
+        { nxt_string("video/mpeg"),       ".mpeg" },
+        { nxt_string("video/mpeg"),       ".mpg"  },
+        { nxt_string("video/mp4"),        ".mp4"  },
+        { nxt_string("video/webm"),       ".webm" },
+        { nxt_string("video/x-msvideo"),  ".avi"  },
+
+        { nxt_string("application/octet-stream"),  ".exe" },
+        { nxt_string("application/octet-stream"),  ".bin" },
+        { nxt_string("application/octet-stream"),  ".dll" },
+        { nxt_string("application/octet-stream"),  ".iso" },
+        { nxt_string("application/octet-stream"),  ".img" },
+        { nxt_string("application/octet-stream"),  ".msi" },
+
+        { nxt_string("application/octet-stream"),  ".deb" },
+        { nxt_string("application/octet-stream"),  ".rpm" },
+
+        { nxt_string("application/x-httpd-php"),   ".php" },
+    };
+
+    for (i = 0; i < nxt_nitems(default_types); i++) {
+        type = (nxt_str_t *) &default_types[i].type;
+
+        exten.start = (u_char *) default_types[i].exten;
+        exten.length = nxt_strlen(exten.start);
+
+        ret = nxt_http_static_mtypes_hash_add(mp, hash, &exten, type);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NXT_ERROR;
+        }
+    }
+
+    return NXT_OK;
+}
+
+
+static const nxt_lvlhsh_proto_t  nxt_http_static_mtypes_hash_proto
+    nxt_aligned(64) =
+{
+    NXT_LVLHSH_DEFAULT,
+    nxt_http_static_mtypes_hash_test,
+    nxt_http_static_mtypes_hash_alloc,
+    nxt_http_static_mtypes_hash_free,
+};
+
+
+typedef struct {
+    nxt_str_t  exten;
+    nxt_str_t  *type;
+} nxt_http_static_mtype_t;
+
+
+nxt_int_t
+nxt_http_static_mtypes_hash_add(nxt_mp_t *mp, nxt_lvlhsh_t *hash,
+    const nxt_str_t *exten, nxt_str_t *type)
+{
+    nxt_lvlhsh_query_t       lhq;
+    nxt_http_static_mtype_t  *mtype;
+
+    mtype = nxt_mp_get(mp, sizeof(nxt_http_static_mtype_t));
+    if (nxt_slow_path(mtype == NULL)) {
+        return NXT_ERROR;
+    }
+
+    mtype->exten = *exten;
+    mtype->type = type;
+
+    lhq.key = *exten;
+    lhq.key_hash = nxt_djb_hash_lowcase(lhq.key.start, lhq.key.length);
+    lhq.replace = 1;
+    lhq.value = mtype;
+    lhq.proto = &nxt_http_static_mtypes_hash_proto;
+    lhq.pool = mp;
+
+    return nxt_lvlhsh_insert(hash, &lhq);
+}
+
+
+nxt_str_t *
+nxt_http_static_mtype_get(nxt_lvlhsh_t *hash, const nxt_str_t *exten)
+{
+    nxt_lvlhsh_query_t       lhq;
+    nxt_http_static_mtype_t  *mtype;
+
+    static nxt_str_t  empty = nxt_string("");
+
+    lhq.key = *exten;
+    lhq.key_hash = nxt_djb_hash_lowcase(lhq.key.start, lhq.key.length);
+    lhq.proto = &nxt_http_static_mtypes_hash_proto;
+
+    if (nxt_lvlhsh_find(hash, &lhq) == NXT_OK) {
+        mtype = lhq.value;
+        return mtype->type;
+    }
+
+    return &empty;
+}
+
+
+static nxt_int_t
+nxt_http_static_mtypes_hash_test(nxt_lvlhsh_query_t *lhq, void *data)
+{
+    nxt_http_static_mtype_t  *mtype;
+
+    mtype = data;
+
+    return nxt_strcasestr_eq(&lhq->key, &mtype->exten) ? NXT_OK : NXT_DECLINED;
+}
+
+
+static void *
+nxt_http_static_mtypes_hash_alloc(void *data, size_t size)
+{
+    return nxt_mp_align(data, size, size);
+}
+
+
+static void
+nxt_http_static_mtypes_hash_free(void *data, void *p)
+{
+    nxt_mp_free(data, p);
+}

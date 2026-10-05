@@ -1,0 +1,492 @@
+
+/*
+ * Copyright (C) Igor Sysoev
+ * Copyright (C) NGINX, Inc.
+ */
+
+#include <nxt_main.h>
+#include <nxt_application.h>
+#include "nxt_tests.h"
+
+
+extern char  **environ;
+
+nxt_module_init_t  nxt_init_modules[1];
+nxt_uint_t         nxt_init_modules_n;
+
+
+/*
+ * Whether the descriptor is still open in this process.  Several port tests
+ * assert on a descriptor's real state rather than on what a handler returned,
+ * because the bug they guard against is a close that did or did not happen.
+ */
+
+nxt_bool_t
+nxt_test_fd_is_open(nxt_fd_t fd)
+{
+    return fcntl(fd, F_GETFD) != -1;
+}
+
+
+/*
+ * Runs fn(data) in a child process.  Returns the exit status of the child,
+ * or -1 when the child did not exit.
+ */
+
+int
+nxt_test_in_child(nxt_thread_t *thr, const char *name, int (*fn)(void *),
+    void *data)
+{
+    int    status;
+    pid_t  child;
+
+    child = fork();
+
+    if (child == 0) {
+        _exit(fn(data));
+    }
+
+    if (child == -1) {
+        nxt_log_alert(thr->log, "%s: fork() failed %E", name, nxt_errno);
+        return -1;
+    }
+
+    /* A signal may interrupt waitpid().  Then it is called again. */
+
+    while (waitpid(child, &status, 0) != child) {
+        if (nxt_errno != NXT_EINTR) {
+            nxt_log_alert(thr->log, "%s: waitpid() failed %E", name,
+                          nxt_errno);
+            return -1;
+        }
+    }
+
+    if (!WIFEXITED(status)) {
+        nxt_log_alert(thr->log, "%s: child killed by signal %d", name,
+                      WTERMSIG(status));
+        return -1;
+    }
+
+    return WEXITSTATUS(status);
+}
+
+
+static nxt_int_t (*const nxt_security_tests[])(nxt_thread_t *) = {
+    nxt_checked_test, nxt_port_mmap_read_test,
+    nxt_router_response_parse_test, nxt_port_frag_test,
+    nxt_port_release_test, nxt_nncq_bound_test,
+#if (NXT_HAVE_REGEX)
+    nxt_regex_test,
+#endif
+};
+
+
+/* The function is defined here to prevent inline optimizations. */
+static nxt_bool_t
+nxt_msec_less(nxt_msec_t first, nxt_msec_t second)
+{
+    return (nxt_msec_diff(first, second) < 0);
+}
+
+
+/* A stored "shm" over UINT32_MAX must not wrap to its low 32 bits. */
+
+static nxt_int_t
+nxt_app_shm_limit_test(nxt_thread_t *thr)
+{
+    size_t      r;
+    nxt_uint_t  i;
+
+    static const struct {
+        size_t  in;
+        size_t  out;
+    } cases[] = {
+        { 0, 0 },
+        { 10 * 1024 * 1024, 10 * 1024 * 1024 },
+        { UINT32_MAX, UINT32_MAX },
+#if (NXT_SIZE_T_SIZE > 4)
+        { (size_t) UINT32_MAX + 1, UINT32_MAX },
+        { (size_t) UINT32_MAX + 10 * 1024 * 1024, UINT32_MAX },
+#endif
+        { SIZE_MAX, UINT32_MAX },
+    };
+
+    for (i = 0; i < nxt_nitems(cases); i++) {
+        r = nxt_app_shm_limit(cases[i].in);
+
+        NXT_TEST_CHECK(thr->log, r == cases[i].out,
+                       "app shm limit test failed: %uz gave %uz, not %uz",
+                       cases[i].in, r, cases[i].out);
+    }
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log, "app shm limit test passed");
+
+    return NXT_OK;
+}
+
+
+int nxt_cdecl
+main(int argc, char **argv)
+{
+    nxt_uint_t    i;
+    nxt_task_t    task;
+    nxt_thread_t  *thr;
+
+    if (nxt_lib_start("tests", argv, &environ) != NXT_OK) {
+        return 1;
+    }
+
+    nxt_main_log.level = NXT_LOG_INFO;
+    task.log  = &nxt_main_log;
+
+    thr = nxt_thread();
+    thr->task = &task;
+
+#if (NXT_TEST_RTDTSC)
+
+    if (nxt_process_argv[1] != NULL
+        && memcmp(nxt_process_argv[1], "rbm", 3) == 0)
+    {
+        if (nxt_rbtree1_mb_start(thr) != NXT_OK) {
+            return 1;
+        }
+
+        if (nxt_rbtree_mb_start(thr) != NXT_OK) {
+            return 1;
+        }
+
+        if (nxt_lvlhsh_test(thr, 500 * 1000, 0) != NXT_OK) {
+            return 1;
+        }
+
+        nxt_rbtree1_mb_insert(thr);
+        nxt_rbtree_mb_insert(thr);
+
+        if (nxt_lvlhsh_test(thr, 500 * 1000, 0) != NXT_OK) {
+            return 1;
+        }
+
+        nxt_rbtree1_mb_delete(thr);
+        nxt_rbtree_mb_delete(thr);
+
+        return 0;
+    }
+
+#endif
+
+    if (nxt_random_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_term_parse_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_msec_diff_test(thr, nxt_msec_less) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_rbtree_test(thr, 100 * 1000) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_rbtree_test(thr, 1000 * 1000) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_rbtree1_test(thr, 100 * 1000) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_rbtree1_test(thr, 1000 * 1000) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_mp_get_align_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_mp_test(thr, 100, 40000, 128 - 1) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_mp_test(thr, 100, 1000, 4096 - 1) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_mp_test(thr, 1000, 100, 64 * 1024 - 1) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_lvlhsh_test(thr, 2, 1) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_lvlhsh_test(thr, 100 * 1000, 1) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_lvlhsh_test(thr, 100 * 1000, 0) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_lvlhsh_test(thr, 1000 * 1000, 1) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_gmtime_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_sprintf_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_malloc_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_utf8_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_utf8_sanitize_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_http_parse_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_strverscmp_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_base64_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_string_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_buf_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_http_chunk_parse_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_http_validate_host_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_http_request_body_alloc_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_conf_json_depth_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_http_route_addr_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_conf_map_object_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_fail_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_fd_event_change_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_use_unless_zero_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_mmap_range_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_mmaps_max_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_mmap_size_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_ready_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_conn_close_idle_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_listen_event_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_conn_io_accept_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_runtime_idle_close_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_new_port_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_start_fail_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_start_fail_soak_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_start_proto_gone_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_proto_wedge_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_proto_death_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_start_timeout_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_app_timeout_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_remove_pid_soak_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_detached_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_sender_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_stale_joint_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_websocket_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_prepare_msg_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_main_start_process_reply_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_app_shm_limit_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_main_file_store_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_main_store_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_proto_creating_wedge_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_main_whoami_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_main_remove_child_pid_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_change_file_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_ctrunc_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_fd_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_rpc_fd_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_queued_fd_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    for (i = 0; i < nxt_nitems(nxt_security_tests); i++) {
+        if (nxt_security_tests[i](thr) != NXT_OK) {
+            return 1;
+        }
+    }
+
+    if (nxt_conn_close_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+#if (NXT_HAVE_OPENSSL)
+    if (nxt_openssl_server_init_test(thr) != NXT_OK) {
+        return 1;
+    }
+#endif
+
+#if (NXT_HAVE_CGROUP)
+    if (nxt_cgroup_test(thr) != NXT_OK) {
+        return 1;
+    }
+#endif
+
+    if (nxt_controller_peer_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_cpu_limit_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+#if (NXT_HAVE_CLONE_NEWUSER)
+    if (nxt_clone_creds_test(thr) != NXT_OK) {
+        return 1;
+    }
+#endif
+
+#if (NXT_HAVE_ISOLATION_ROOTFS)
+    if (nxt_isolation_mount_dst_test(thr) != NXT_OK) {
+        return 1;
+    }
+#endif
+
+    return 0;
+}

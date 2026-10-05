@@ -1,0 +1,18 @@
+{
+	"_comment": "defaultAction is SCMP_ACT_ALLOW intentionally. libseccomp ORs multiple NE conditions on the same arg index, so ERRNO+full-allowlist approach cannot reliably block a single domain. Explicit EQ deny rules above ALLOW default are the only reliable pattern. Do NOT change to SCMP_ACT_ERRNO without re-verifying AF_ALG is still blocked. Note: using this profile with --security-opt replaces Docker's default profile entirely; only AF_ALG is blocked here by design (single-purpose profile).",
+	"defaultAction": "SCMP_ACT_ALLOW",
+	"syscalls": [
+		{
+			"names": ["socket"],
+			"action": "SCMP_ACT_ERRNO",
+			"errnoRet": 1,
+			"args": [
+				{
+					"index": 0,
+					"value": 38,
+					"op": "SCMP_CMP_EQ"
+				}
+			]
+		}
+	]
+}

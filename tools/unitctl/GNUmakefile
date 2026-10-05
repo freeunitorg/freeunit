@@ -1,0 +1,170 @@
+MAKE_MAJOR_VER    := $(shell echo $(MAKE_VERSION) | cut -d'.' -f1)
+
+ifneq ($(shell test $(MAKE_MAJOR_VER) -gt 3; echo $$?),0)
+$(error Make version $(MAKE_VERSION) not supported, please install GNU Make 4.x)
+endif
+
+GREP               ?= $(shell command -v ggrep 2> /dev/null || command -v grep 2> /dev/null)
+SED                ?= $(shell command -v gsed 2> /dev/null || command -v sed 2> /dev/null)
+AWK                ?= $(shell command -v gawk 2> /dev/null || command -v awk 2> /dev/null)
+RUSTUP             ?= $(shell command -v rustup 2> /dev/null)
+ifeq ($(RUSTUP),)
+$(error Please install Rustup)
+endif
+
+RPM_ARCH           := $(shell uname -m)
+VERSION            ?= $(shell $(SED) -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' $(CURDIR)/unitctl/Cargo.toml)
+SRC_REPO           := https://github.com/nginxinc/unit-rust-sdk
+DEFAULT_TARGET     ?= $(shell $(RUSTUP) toolchain list | $(GREP) '(default)' | cut -d' ' -f1 | cut -d- -f2-)
+SHELL              := /bin/bash
+OUTPUT_BINARY      ?= unitctl
+PACKAGE_NAME       ?= unitctl
+CARGO              ?= cargo
+DOCKER             ?= docker
+DOCKER_BUILD_FLAGS ?= --load
+CHECKSUM           ?= sha256sum
+OPENAPI_GENERATOR_VERSION ?= 7.6.0
+
+# Define platform targets based off of the current host OS
+# If running MacOS, then build for MacOS platform targets installed in rustup
+# If running Linux, then build for Linux platform targets installed in rustup
+ifeq ($(shell uname -s),Darwin)
+	TARGETS       := $(sort $(shell $(RUSTUP) target list | \
+						$(GREP) '(installed)' | \
+						$(GREP) 'apple' | \
+						cut -d' ' -f1))
+else ifeq ($(shell uname -s),Linux)
+	TARGETS       := $(sort $(shell $(RUSTUP) target list | \
+						$(GREP) '(installed)' | \
+						$(GREP) 'linux' | \
+						cut -d' ' -f1))
+else
+	TARGETS       := $(DEFAULT_TARGET)
+endif
+
+RELEASE_BUILD_FLAGS ?= --quiet --release --bin $(OUTPUT_BINARY)
+
+# The musl artifact is built without the "tls" feature.  TLS pulls in
+# aws-lc-sys, a C library built by cmake, and that is the only thing making
+# this build need a C toolchain.
+target_feature_flags = $(if $(findstring musl,$(1)),--no-default-features,)
+
+# The rule above keys on a target name, so it only reaches the cross builds that
+# name one.  A native build on a musl host -- "make release" on Alpine, which is
+# how a distro packages this -- passes no --target and would otherwise keep TLS
+# and compile aws-lc-sys.  Ask rustc for the host triple and apply the same
+# rule.  Empty if rustc is absent, which leaves the flags unchanged.
+HOST_TARGET := $(shell rustc -vV 2>/dev/null | sed -n 's/^host: //p')
+HOST_FEATURE_FLAGS := $(call target_feature_flags,$(HOST_TARGET))
+
+Q = $(if $(filter 1,$V),,@)
+M = $(shell printf "\033[34;1m▶\033[0m")
+
+.PHONY: help
+help:
+	@$(GREP) --no-filename -E '^[ a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+		$(AWK) 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-28s\033[0m %s\n", $$1, $$2}' | \
+		sort
+
+.PHONY: clean
+clean: ; $(info $(M) cleaning...)@ ## Cleanup everything
+	$Q rm -rf $(CURDIR)/target
+
+.PHONY: list-targets
+list-targets: ## List all available platform targets
+	$Q echo $(TARGETS) | $(SED) -e 's/ /\n/g'
+
+.PHONY: all
+all: $(TARGETS) ## Build all available platform targets [see: list-targets]
+
+.PHONY: $(TARGETS)
+.ONESHELL: $(TARGETS)
+$(TARGETS): openapi-generate
+	$Q if [ ! -f "$(CURDIR)/target/$(@)/release/$(OUTPUT_BINARY)" ]; then
+		echo "$(M) building $(OUTPUT_BINARY) with flags [$(RELEASE_BUILD_FLAGS) $(call target_feature_flags,$@) --target $(@)]"
+		$(CARGO) build $(RELEASE_BUILD_FLAGS) $(call target_feature_flags,$@) --target $@
+	fi
+
+target target/debug:
+	$Q mkdir -p $@
+
+.PHONY: debug
+debug: target/debug/$(OUTPUT_BINARY)
+
+target/debug/$(OUTPUT_BINARY): openapi-generate
+	$Q echo "$(M) building $(OUTPUT_BINARY) in debug mode for the current platform"
+	$Q $(CARGO) build --bin $(OUTPUT_BINARY) $(HOST_FEATURE_FLAGS)
+
+.PHONY: release
+release: target/release/$(OUTPUT_BINARY)
+
+target/release/$(OUTPUT_BINARY): openapi-generate
+	$Q echo "$(M) building $(OUTPUT_BINARY) in release mode for the current platform"
+	$Q $(CARGO) build $(RELEASE_BUILD_FLAGS) $(HOST_FEATURE_FLAGS)
+
+.PHONY: test
+test: openapi-generate ## Run tests
+	$Q $(CARGO) test $(HOST_FEATURE_FLAGS)
+
+.ONESHELL: target/man/$(OUTPUT_BINARY).1.gz
+target/man/$(OUTPUT_BINARY).1.gz:
+	$Q $(info $(M) building distributable manpage)
+	mkdir -p target/man
+	$(SED) 's/%%VERSION%%/$(VERSION)/' \
+		man/$(OUTPUT_BINARY).1 > $(CURDIR)/target/man/$(OUTPUT_BINARY).1
+	gzip $(CURDIR)/target/man/$(OUTPUT_BINARY).1
+
+target/gz:
+	$Q mkdir -p target/gz
+
+.PHONY: manpage
+manpage: target/man/$(OUTPUT_BINARY).1.gz ## Builds man page
+
+.openapi_cache:
+	$Q mkdir -p $@
+
+## Generate (or regenerate) Unit API access code via a OpenAPI spec
+.PHONY: openapi-generate
+openapi-generate: .openapi_cache
+	$Q if [ ! -f "$(CURDIR)/unit-openapi/src/models/mod.rs" ]; then
+		set -e
+		echo "$(M) generating Unit API access code via a OpenAPI spec"
+		OPENAPI_GENERATOR_VERSION="$(OPENAPI_GENERATOR_VERSION)" \
+		OPENAPI_GENERATOR_DOWNLOAD_CACHE_DIR="$(CURDIR)/.openapi_cache" \
+		$(CURDIR)/build/openapi-generator-cli.sh \
+			generate \
+			--input-spec "$(CURDIR)/../../docs/unit-openapi.yaml" \
+			--config "$(CURDIR)/openapi-config.json" \
+			--template-dir "$(CURDIR)/unit-openapi/openapi-templates" \
+			--output "$(CURDIR)/unit-openapi" \
+			--generator-name rust
+		tmp="$$(mktemp)"
+		{ printf '%s\n' '#![allow(clippy::all)]'; cat "$(CURDIR)/unit-openapi/src/lib.rs"; } > "$$tmp"
+		mv "$$tmp" "$(CURDIR)/unit-openapi/src/lib.rs"
+		# Replace any remaining hyper 0.14 client paths produced by built-in templates
+		# with the hyper 1.x equivalents from hyper-util.
+		find "$(CURDIR)/unit-openapi/src" -name "*.rs" -exec \
+			$(SED) -i.bak \
+				-e 's|hyper::client::connect::Connect|hyper_util::client::legacy::connect::Connect|g' \
+				-e 's|hyper::client::Client<C>|hyper_util::client::legacy::Client<C, http_body_util::Full<bytes::Bytes>>|g' \
+				-e "s|C: Clone + std::marker::Send + Sync {|C: Clone + std::marker::Send + Sync + 'static {|g" \
+				-e 's|hyper::Body::from|bytes::Bytes::from|g' \
+			{} +
+		find "$(CURDIR)/unit-openapi/src" -name "*.rs.bak" -delete
+		$(CARGO) fmt
+	fi
+
+.PHONY: openapi-clean
+openapi-clean: ## Clean up generated OpenAPI files
+	$Q $(info $(M) cleaning up generated OpenAPI documentation)
+	$Q rm -rf "$(CURDIR)/unit-openapi/docs/*"
+	$Q $(info $(M) cleaning up generated OpenAPI api code)
+	$Q find "$(CURDIR)/unit-openapi/src/apis" \
+		! -name 'error.rs' -type f -exec rm -f {} +
+	$Q $(info $(M) cleaning up generated OpenAPI models code)
+	$Q rm -rf "$(CURDIR)/unit-openapi/src/models"
+
+include $(CURDIR)/build/package.mk
+include $(CURDIR)/build/container.mk
+include $(CURDIR)/build/release.mk
+include $(CURDIR)/build/github.mk

@@ -1,0 +1,1689 @@
+
+/*
+ * Copyright (C) Igor Sysoev
+ * Copyright (C) NGINX, Inc.
+ */
+
+#include <nxt_router.h>
+#include <nxt_http.h>
+#include <nxt_otel.h>
+
+
+static void nxt_http_request_start(nxt_task_t *task, void *obj, void *data);
+static nxt_int_t nxt_http_request_forward(nxt_task_t *task,
+    nxt_http_request_t *r, nxt_http_forward_t *forward);
+static void nxt_http_request_forward_client_ip(nxt_http_request_t *r,
+    nxt_http_forward_t *forward, nxt_array_t *fields);
+static nxt_sockaddr_t *nxt_http_request_client_ip_sockaddr(
+    nxt_http_request_t *r, u_char *start, size_t len);
+static void nxt_http_request_forward_protocol(nxt_http_request_t *r,
+    nxt_http_field_t *field);
+static void nxt_http_request_ready(nxt_task_t *task, void *obj, void *data);
+static void nxt_http_request_proto_info(nxt_task_t *task,
+    nxt_http_request_t *r);
+static nxt_bool_t nxt_http_request_is_bodyless(nxt_http_request_t *r);
+static void nxt_http_request_drop_framing_fields(nxt_http_request_t *r);
+static nxt_buf_t *nxt_http_request_body_drop(nxt_task_t *task,
+    nxt_http_request_t *r, nxt_buf_t *out);
+static void nxt_http_request_mem_buf_completion(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_http_request_done(nxt_task_t *task, void *obj, void *data);
+
+static u_char *nxt_http_date_cache_handler(u_char *buf, nxt_realtime_t *now,
+    struct tm *tm, size_t size, const char *format);
+
+static nxt_http_name_value_t *nxt_http_argument(nxt_array_t *array,
+    u_char *name, size_t name_length, uint32_t hash, u_char *start,
+    const u_char *end);
+static nxt_int_t nxt_http_cookie_parse(nxt_array_t *cookies, u_char *start,
+    const u_char *end);
+static nxt_http_name_value_t *nxt_http_cookie(nxt_array_t *array, u_char *name,
+    size_t name_length, u_char *start, const u_char *end);
+
+
+#define NXT_HTTP_COOKIE_HASH                                                  \
+    (nxt_http_field_hash_end(                                                 \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(NXT_HTTP_FIELD_HASH_INIT,                       \
+        'c'), 'o'), 'o'), 'k'), 'i'), 'e')) & 0xFFFF)
+
+
+static const nxt_http_request_state_t  nxt_http_request_init_state;
+static const nxt_http_request_state_t  nxt_http_request_body_state;
+
+
+nxt_time_string_t  nxt_http_date_cache = {
+    (nxt_atomic_uint_t) -1,
+    nxt_http_date_cache_handler,
+    NULL,
+    NXT_HTTP_DATE_LEN,
+    NXT_THREAD_TIME_GMT,
+    NXT_THREAD_TIME_SEC,
+};
+
+
+nxt_int_t
+nxt_http_init(nxt_task_t *task)
+{
+    nxt_int_t  ret;
+
+    ret = nxt_h1p_init(task);
+
+    if (ret != NXT_OK) {
+        return ret;
+    }
+
+    return nxt_http_response_hash_init(task);
+}
+
+
+nxt_int_t
+nxt_http_request_host(void *ctx, nxt_http_field_t *field, uintptr_t data)
+{
+    nxt_int_t           ret;
+    nxt_str_t           host;
+    nxt_http_request_t  *r;
+
+    r = ctx;
+
+    if (nxt_slow_path(r->host.start != NULL)) {
+        return NXT_HTTP_BAD_REQUEST;
+    }
+
+    host.length = field->value_length;
+    host.start = field->value;
+
+    ret = nxt_http_validate_host(&host, r->mem_pool);
+
+    if (nxt_fast_path(ret == NXT_OK)) {
+        r->host = host;
+    }
+
+    return ret;
+}
+
+
+nxt_int_t
+nxt_http_validate_host(nxt_str_t *host, nxt_mp_t *mp)
+{
+    u_char      *h, ch;
+    size_t      i, dot_pos, host_length;
+    nxt_bool_t  lowcase;
+
+    enum {
+        sw_usual,
+        sw_literal,
+        sw_rest
+    } state;
+
+    dot_pos = host->length;
+    host_length = host->length;
+
+    h = host->start;
+
+    lowcase = 0;
+    state = sw_usual;
+
+    for (i = 0; i < host->length; i++) {
+        ch = h[i];
+
+        if (ch > ']') {
+            /* Short path. */
+            continue;
+        }
+
+        switch (ch) {
+
+        case '.':
+            if (dot_pos == i - 1) {
+                return NXT_HTTP_BAD_REQUEST;
+            }
+
+            dot_pos = i;
+            break;
+
+        case ':':
+            if (state == sw_usual) {
+                host_length = i;
+                state = sw_rest;
+            }
+
+            break;
+
+        case '[':
+            if (i == 0) {
+                state = sw_literal;
+            }
+
+            break;
+
+        case ']':
+            if (state == sw_literal) {
+                host_length = i + 1;
+                state = sw_rest;
+            }
+
+            break;
+
+        case '/':
+            return NXT_HTTP_BAD_REQUEST;
+
+        default:
+            if (ch >= 'A' && ch <= 'Z') {
+                lowcase = 1;
+            }
+
+            break;
+        }
+    }
+
+    if (dot_pos == host_length - 1) {
+        host_length--;
+    }
+
+    host->length = host_length;
+
+    if (lowcase) {
+        host->start = nxt_mp_nget(mp, host_length);
+        if (nxt_slow_path(host->start == NULL)) {
+            return NXT_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        nxt_memcpy_lowcase(host->start, h, host_length);
+    }
+
+    return NXT_OK;
+}
+
+
+nxt_int_t
+nxt_http_request_field(void *ctx, nxt_http_field_t *field, uintptr_t offset)
+{
+    nxt_http_request_t  *r;
+
+    r = ctx;
+
+    nxt_value_at(nxt_http_field_t *, r, offset) = field;
+
+    return NXT_OK;
+}
+
+
+nxt_int_t
+nxt_http_request_content_length(void *ctx, nxt_http_field_t *field,
+    uintptr_t data)
+{
+    nxt_off_t           n, max_body_size;
+    nxt_http_request_t  *r;
+
+    r = ctx;
+
+    if (nxt_fast_path(r->content_length == NULL)) {
+        r->content_length = field;
+
+        n = nxt_off_t_parse(field->value, field->value_length);
+
+        if (nxt_fast_path(n >= 0)) {
+            r->content_length_n = n;
+
+            max_body_size = r->conf->socket_conf->max_body_size;
+
+            if (nxt_slow_path(n > max_body_size)) {
+                return NXT_HTTP_PAYLOAD_TOO_LARGE;
+            }
+
+            return NXT_OK;
+        }
+    }
+
+    return NXT_HTTP_BAD_REQUEST;
+}
+
+
+nxt_http_request_t *
+nxt_http_request_create(nxt_task_t *task)
+{
+    nxt_mp_t            *mp;
+    nxt_buf_t           *last;
+    nxt_http_request_t  *r;
+
+    mp = nxt_mp_create(4096, 128, 512, 32);
+    if (nxt_slow_path(mp == NULL)) {
+        return NULL;
+    }
+
+    r = nxt_mp_zget(mp, sizeof(nxt_http_request_t));
+    if (nxt_slow_path(r == NULL)) {
+        goto fail;
+    }
+
+    last = nxt_mp_zget(mp, NXT_BUF_SYNC_SIZE);
+    if (nxt_slow_path(last == NULL)) {
+        goto fail;
+    }
+
+    nxt_buf_set_sync(last);
+    nxt_buf_set_last(last);
+    last->completion_handler = nxt_http_request_done;
+    last->parent = r;
+    r->last = last;
+
+    r->mem_pool = mp;
+    r->content_length_n = -1;
+    r->resp.content_length_n = -1;
+    r->state = &nxt_http_request_init_state;
+
+    r->start_time = nxt_thread_monotonic_time(task->thread);
+
+    task->thread->engine->requests_cnt++;
+
+    r->tstr_cache.var.pool = mp;
+
+#if (NXT_HAVE_OTEL)
+    if (nxt_otel_rs_is_init()) {
+        r->otel = nxt_mp_zget(r->mem_pool, sizeof(nxt_otel_state_t));
+        if (nxt_slow_path(r->otel == NULL)) {
+            goto fail;
+        }
+        r->otel->status = NXT_OTEL_INIT_STATE;
+    }
+#endif
+
+    return r;
+
+fail:
+
+    nxt_mp_release(mp);
+
+    return NULL;
+}
+
+
+static const nxt_http_request_state_t  nxt_http_request_init_state
+    nxt_aligned(64) =
+{
+    .ready_handler = nxt_http_request_start,
+    .error_handler = nxt_http_request_close_handler,
+};
+
+
+static void
+nxt_http_request_start(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_int_t           ret;
+    nxt_socket_conf_t   *skcf;
+    nxt_http_request_t  *r;
+
+    r = obj;
+
+    NXT_OTEL_TRACE();
+
+    r->state = &nxt_http_request_body_state;
+
+    skcf = r->conf->socket_conf;
+
+    if (skcf->forwarded != NULL) {
+        ret = nxt_http_request_forward(task, r, skcf->forwarded);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            goto fail;
+        }
+    }
+
+    if (skcf->client_ip != NULL) {
+        ret = nxt_http_request_forward(task, r, skcf->client_ip);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            goto fail;
+        }
+    }
+
+    nxt_http_request_read_body(task, r);
+
+    return;
+
+fail:
+    nxt_http_request_error(task, r, NXT_HTTP_INTERNAL_SERVER_ERROR);
+}
+
+
+static nxt_int_t
+nxt_http_request_forward(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_http_forward_t *forward)
+{
+    nxt_int_t                  ret;
+    nxt_array_t                *client_ip_fields;
+    nxt_http_field_t           *f, **fields, *protocol_field;
+    nxt_http_forward_header_t  *client_ip, *protocol;
+
+    ret = nxt_http_route_addr_rule(r, forward->source, r->remote);
+    if (ret <= 0) {
+        return NXT_OK;
+    }
+
+    client_ip = &forward->client_ip;
+    protocol = &forward->protocol;
+
+    if (client_ip->header != NULL) {
+        client_ip_fields = nxt_array_create(r->mem_pool, 1,
+                                            sizeof(nxt_http_field_t *));
+        if (nxt_slow_path(client_ip_fields == NULL)) {
+            return NXT_ERROR;
+        }
+
+    } else {
+        client_ip_fields = NULL;
+    }
+
+    protocol_field = NULL;
+
+    nxt_http_fields_each(f, r->inline_fields, r->num_inline_fields, r->fields) {
+        if (client_ip_fields != NULL
+            && f->hash == client_ip->header_hash
+            && f->value_length > 0
+            && f->name_length == client_ip->header->length
+            && nxt_memcasecmp(f->name, client_ip->header->start,
+                              client_ip->header->length) == 0)
+        {
+            fields = nxt_array_add(client_ip_fields);
+            if (nxt_slow_path(fields == NULL)) {
+                return NXT_ERROR;
+            }
+
+            *fields = f;
+        }
+
+        if (protocol->header != NULL
+            && protocol_field == NULL
+            && f->hash == protocol->header_hash
+            && f->value_length > 0
+            && f->name_length == protocol->header->length
+            && nxt_memcasecmp(f->name, protocol->header->start,
+                              protocol->header->length) == 0)
+        {
+            protocol_field = f;
+        }
+    } nxt_http_fields_loop;
+
+    if (client_ip_fields != NULL) {
+        nxt_http_request_forward_client_ip(r, forward, client_ip_fields);
+    }
+
+    if (protocol_field != NULL) {
+        nxt_http_request_forward_protocol(r, protocol_field);
+    }
+
+    return NXT_OK;
+}
+
+
+static void
+nxt_http_request_forward_client_ip(nxt_http_request_t *r,
+    nxt_http_forward_t *forward, nxt_array_t *fields)
+{
+    u_char            *start, *p;
+    nxt_int_t         ret, i, len;
+    nxt_sockaddr_t    *sa, *prev_sa;
+    nxt_http_field_t  **f;
+
+    prev_sa = r->remote;
+    f = (nxt_http_field_t **) fields->elts;
+
+    i = fields->nelts;
+
+    while (i-- > 0) {
+        start = f[i]->value;
+        len = f[i]->value_length;
+
+        do {
+            for (p = start + len - 1; p > start; p--, len--) {
+                if (*p != ' ' && *p != ',') {
+                    break;
+                }
+            }
+
+            for (/* void */; p > start; p--) {
+                if (*p == ' ' || *p == ',') {
+                    p++;
+                    break;
+                }
+            }
+
+            sa = nxt_http_request_client_ip_sockaddr(r, p, len - (p - start));
+            if (nxt_slow_path(sa == NULL)) {
+                if (prev_sa != NULL) {
+                    r->remote = prev_sa;
+                }
+
+                return;
+            }
+
+            if (!forward->recursive) {
+                r->remote = sa;
+                return;
+            }
+
+            ret = nxt_http_route_addr_rule(r, forward->source, sa);
+            if (ret <= 0 || (i == 0 && p == start)) {
+                r->remote = sa;
+                return;
+            }
+
+            prev_sa = sa;
+            len = p - 1 - start;
+
+        } while (len > 0);
+    }
+}
+
+
+static nxt_sockaddr_t *
+nxt_http_request_client_ip_sockaddr(nxt_http_request_t *r, u_char *start,
+    size_t len)
+{
+    nxt_str_t       addr;
+    nxt_sockaddr_t  *sa;
+
+    addr.start = start;
+    addr.length = len;
+
+    sa = nxt_sockaddr_parse_optport(r->mem_pool, &addr);
+    if (nxt_slow_path(sa == NULL)) {
+        return NULL;
+    }
+
+    switch (sa->u.sockaddr.sa_family) {
+        case AF_INET:
+            if (sa->u.sockaddr_in.sin_addr.s_addr == INADDR_ANY) {
+                return NULL;
+            }
+
+            break;
+
+#if (NXT_INET6)
+        case AF_INET6:
+            if (IN6_IS_ADDR_UNSPECIFIED(&sa->u.sockaddr_in6.sin6_addr)) {
+                return NULL;
+            }
+
+            break;
+#endif /* NXT_INET6 */
+
+        default:
+            return NULL;
+    }
+
+    return sa;
+}
+
+
+static void
+nxt_http_request_forward_protocol(nxt_http_request_t *r,
+    nxt_http_field_t *field)
+{
+    if (field->value_length == 4) {
+        if (nxt_memcasecmp(field->value, "http", 4) == 0) {
+            r->tls = 0;
+        }
+
+    } else if (field->value_length == 5) {
+        if (nxt_memcasecmp(field->value, "https", 5) == 0) {
+            r->tls = 1;
+        }
+
+    } else if (field->value_length == 2) {
+        if (nxt_memcasecmp(field->value, "on", 2) == 0) {
+            r->tls = 1;
+        }
+    }
+}
+
+
+static const nxt_http_request_state_t  nxt_http_request_body_state
+    nxt_aligned(64) =
+{
+    .ready_handler = nxt_http_request_ready,
+    .error_handler = nxt_http_request_close_handler,
+};
+
+
+static nxt_int_t
+nxt_http_request_chunked_transform(nxt_http_request_t *r)
+{
+    size_t            size;
+    u_char            *p, *end;
+    nxt_http_field_t  *f;
+
+    r->chunked_field->skip = 1;
+
+    size = r->body->file_end;
+
+    f = nxt_http_req_field_zero_add(r);
+    if (nxt_slow_path(f == NULL)) {
+        return NXT_ERROR;
+    }
+
+    nxt_http_field_name_set(f, "Content-Length");
+
+    p = nxt_mp_nget(r->mem_pool, NXT_OFF_T_LEN);
+    if (nxt_slow_path(p == NULL)) {
+        return NXT_ERROR;
+    }
+
+    f->value = p;
+    end = nxt_sprintf(p, p + NXT_OFF_T_LEN, "%uz", size);
+    f->value_length = end - p;
+
+    r->content_length = f;
+    r->content_length_n = size;
+
+    return NXT_OK;
+}
+
+
+static void
+nxt_http_request_ready(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_int_t           ret;
+    nxt_http_action_t   *action;
+    nxt_http_request_t  *r;
+
+    r = obj;
+    action = r->conf->socket_conf->action;
+
+    NXT_OTEL_TRACE();
+
+    if (r->chunked) {
+        ret = nxt_http_request_chunked_transform(r);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            nxt_http_request_error(task, r, NXT_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        }
+    }
+
+    nxt_http_request_action(task, r, action);
+}
+
+
+void
+nxt_http_request_action(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_http_action_t *action)
+{
+    nxt_int_t  ret;
+
+    if (nxt_fast_path(action != NULL)) {
+
+        do {
+            ret = nxt_http_rewrite(task, r);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                break;
+            }
+
+            action = action->handler(task, r, action);
+
+            if (action == NULL) {
+                return;
+            }
+
+            if (action == NXT_HTTP_ACTION_ERROR) {
+                break;
+            }
+
+        } while (r->pass_count++ < 255);
+    }
+
+    nxt_http_request_error(task, r, NXT_HTTP_INTERNAL_SERVER_ERROR);
+}
+
+
+nxt_http_action_t *
+nxt_http_application_handler(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_http_action_t *action)
+{
+    nxt_debug(task, "http application handler");
+
+    /*
+     * TODO: need an application flag to get local address
+     * required by "SERVER_ADDR" in Pyhton and PHP. Not used in Go.
+     */
+    nxt_http_request_proto_info(task, r);
+
+    if (r->host.length != 0) {
+        r->server_name = r->host;
+
+    } else {
+        nxt_str_set(&r->server_name, "localhost");
+    }
+
+    nxt_router_process_http_request(task, r, action);
+
+    return NULL;
+}
+
+
+static void
+nxt_http_request_proto_info(nxt_task_t *task, nxt_http_request_t *r)
+{
+    if (nxt_fast_path(r->proto.any != NULL)) {
+        nxt_http_proto[r->protocol].local_addr(task, r);
+    }
+}
+
+
+void
+nxt_http_request_read_body(nxt_task_t *task, nxt_http_request_t *r)
+{
+    if (nxt_fast_path(r->proto.any != NULL)) {
+        nxt_http_proto[r->protocol].body_read(task, r);
+    }
+}
+
+
+/*
+ * Allocates r->body for a request body of body_length bytes, or of a
+ * length not known in advance when body_length is (size_t) -1.  A body
+ * that fits in body_buffer_size is kept in memory; a longer one goes to
+ * an unlinked temporary file under body_temp_path, with a memory part of
+ * body_buffer_size for the reads.  The protocol layer that fills the
+ * buffer enforces max_body_size on what it stores.
+ */
+
+nxt_int_t
+nxt_http_request_body_alloc(nxt_task_t *task, nxt_http_request_t *r,
+    size_t body_length)
+{
+    size_t             body_buffer_size;
+    nxt_buf_t          *b;
+    nxt_socket_conf_t  *skcf;
+
+    static const nxt_str_t tmp_name_pattern = nxt_string("/req-XXXXXXXX");
+
+    skcf = r->conf->socket_conf;
+
+    body_buffer_size = nxt_min(skcf->body_buffer_size, body_length);
+
+    if (body_length > body_buffer_size) {
+        nxt_str_t  *tmp_path, tmp_name;
+
+        tmp_path = &skcf->body_temp_path;
+
+        tmp_name.length = tmp_path->length + tmp_name_pattern.length;
+
+        b = nxt_buf_file_alloc(r->mem_pool,
+                               body_buffer_size + sizeof(nxt_file_t)
+                               + tmp_name.length + 1, 0);
+        if (nxt_slow_path(b == NULL)) {
+            return NXT_ERROR;
+        }
+
+        tmp_name.start = nxt_pointer_to(b->mem.start, sizeof(nxt_file_t));
+
+        memcpy(tmp_name.start, tmp_path->start, tmp_path->length);
+        memcpy(tmp_name.start + tmp_path->length, tmp_name_pattern.start,
+               tmp_name_pattern.length);
+        tmp_name.start[tmp_name.length] = '\0';
+
+        b->file = (nxt_file_t *) b->mem.start;
+        nxt_memzero(b->file, sizeof(nxt_file_t));
+        b->file->fd = -1;
+        b->file->size = body_length;
+
+        b->mem.start += sizeof(nxt_file_t) + tmp_name.length + 1;
+        b->mem.pos = b->mem.start;
+        b->mem.free = b->mem.start;
+
+        b->file->fd = mkstemp((char *) tmp_name.start);
+        if (nxt_slow_path(b->file->fd == -1)) {
+            nxt_alert(task, "mkstemp(%s) failed %E", tmp_name.start, nxt_errno);
+            return NXT_ERROR;
+        }
+
+        nxt_debug(task, "create body tmp file \"%V\", %d",
+                  &tmp_name, b->file->fd);
+
+        unlink((char *) tmp_name.start);
+
+    } else {
+        b = nxt_buf_mem_alloc(r->mem_pool, body_buffer_size, 0);
+        if (nxt_slow_path(b == NULL)) {
+            return NXT_ERROR;
+        }
+    }
+
+    r->body = b;
+
+    return NXT_OK;
+}
+
+
+void
+nxt_http_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_work_handler_t body_handler, void *data)
+{
+    u_char             *p, *end, *server_string;
+    nxt_int_t          ret;
+    nxt_http_field_t   *server, *date, *content_length;
+    nxt_socket_conf_t  *skcf;
+
+    ret = nxt_http_set_headers(r);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto fail;
+    }
+
+    /*
+     * "response_headers" has just run, and it replaces or removes a field it
+     * names outright.  A response chosen by negotiation still varies on
+     * Accept-Encoding whatever an operator wrote there -- almost always they
+     * are adding Origin for CORS, unaware Unit generates the field at all --
+     * so dropping it here would hand a shared cache the licence to serve one
+     * coding to every client.  Re-assert it.  The merge is idempotent: it
+     * leaves "*" alone, leaves a list that already names the header alone,
+     * and re-adds the field if it was removed.
+     */
+
+    if (r->resp.vary_accept_encoding) {
+        ret = nxt_http_comp_merge_vary(r);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            goto fail;
+        }
+    }
+
+    /*
+     * RFC 9112 Sect. 6.3: a 1xx, 204 or 304 response, and any response to a
+     * HEAD request, never has a message body, no matter what the response
+     * headers say.  Record that here, in the layer every response source
+     * (application, proxy, static, "return") passes through, so that the
+     * per-protocol header_send() can drop the framing and
+     * nxt_http_request_send() can drop the body buffers.  Without this an
+     * application that writes a body on 204/304 has those bytes forwarded
+     * verbatim and unframed, which a downstream parser reads as the start of
+     * the next response.
+     */
+    r->no_body = nxt_http_request_is_bodyless(r);
+
+    /*
+     * RFC 9110 Sect. 8.6: a server must not send Content-Length in a 1xx or
+     * 204 response.  A 304 keeps it -- there it describes the body the client
+     * already has -- and so does a HEAD response, where it describes the body
+     * the equivalent GET would return.
+     */
+    if (r->no_body
+        && (r->status < NXT_HTTP_OK || r->status == NXT_HTTP_NO_CONTENT))
+    {
+        if (r->resp.content_length != NULL) {
+            r->resp.content_length->skip = 1;
+        }
+
+        r->resp.content_length_n = -1;
+
+        /*
+         * r->resp.content_length only tracks the field the application sent.
+         * A Content-Length added by "response_headers" (nxt_http_set_headers.c)
+         * is a generic field, and an application-supplied Transfer-Encoding is
+         * one too; both are forbidden here and both would otherwise be
+         * serialized verbatim, desyncing the next response on a connection
+         * whose keep-alive this change preserves.  Sweep the whole field store.
+         */
+        nxt_http_request_drop_framing_fields(r);
+    }
+
+    /*
+     * TODO: "Server", "Date", and "Content-Length" processing should be moved
+     * to the last header filter.
+     */
+
+    server = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+    if (nxt_slow_path(server == NULL)) {
+        goto fail;
+    }
+
+    skcf = r->conf->socket_conf;
+    server_string = (u_char *) (skcf->server_version ? NXT_SERVER : NXT_NAME);
+
+    nxt_http_field_name_set(server, "Server");
+    server->value = server_string;
+    server->value_length = nxt_strlen(server_string);
+
+    if (r->resp.date == NULL) {
+        date = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+        if (nxt_slow_path(date == NULL)) {
+            goto fail;
+        }
+
+        nxt_http_field_name_set(date, "Date");
+
+        p = nxt_mp_nget(r->mem_pool, nxt_http_date_cache.size);
+        if (nxt_slow_path(p == NULL)) {
+            goto fail;
+        }
+
+        (void) nxt_thread_time_string(task->thread, &nxt_http_date_cache, p);
+
+        date->value = p;
+        date->value_length = nxt_http_date_cache.size;
+
+        r->resp.date = date;
+    }
+
+    if (r->resp.content_length_n != -1
+        && (r->resp.content_length == NULL || r->resp.content_length->skip))
+    {
+        content_length = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+        if (nxt_slow_path(content_length == NULL)) {
+            goto fail;
+        }
+
+        nxt_http_field_name_set(content_length, "Content-Length");
+
+        p = nxt_mp_nget(r->mem_pool, NXT_OFF_T_LEN);
+        if (nxt_slow_path(p == NULL)) {
+            goto fail;
+        }
+
+        content_length->value = p;
+        end = nxt_sprintf(p, p + NXT_OFF_T_LEN, "%O", r->resp.content_length_n);
+        content_length->value_length = end - p;
+
+        r->resp.content_length = content_length;
+    }
+
+    if (nxt_fast_path(r->proto.any != NULL)) {
+        nxt_http_proto[r->protocol].header_send(task, r, body_handler, data);
+    }
+
+    return;
+
+fail:
+
+    nxt_http_request_error(task, r, NXT_HTTP_INTERNAL_SERVER_ERROR);
+}
+
+
+void
+nxt_http_request_ws_frame_start(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_buf_t *ws_frame)
+{
+    if (r->proto.any != NULL) {
+        nxt_http_proto[r->protocol].ws_frame_start(task, r, ws_frame);
+    }
+}
+
+
+/*
+ * A *final* response that RFC 9112 Sect. 6.3 gives no message body: 204, 304,
+ * or any response to HEAD.  1xx is excluded on purpose.  A 1xx is an interim
+ * response -- the exchange continues with a final response after it -- so
+ * "carries no body" and "ends the exchange" are different questions for it,
+ * and a caller that needs the second one must not be answered with the first.
+ *
+ * The status is a parameter rather than a read of r->status because the proxy
+ * has to answer this question before r->status exists.  The h1 peer reader
+ * decides how to frame the upstream body while the upstream status still lives
+ * in peer->status; nxt_http_proxy_header_read() copies it into r->status only
+ * one step later.
+ */
+
+nxt_bool_t
+nxt_http_request_is_bodyless_final(nxt_http_request_t *r,
+    nxt_http_status_t status)
+{
+    if (status < NXT_HTTP_OK) {
+        return 0;
+    }
+
+    /* 204 and 304; the 1xx arm of that test is excluded above. */
+    if (nxt_http_status_no_representation(status)) {
+        return 1;
+    }
+
+    return r->method != NULL && nxt_str_eq(r->method, "HEAD", 4);
+}
+
+
+/*
+ * Tells whether a status describes no representation of its own: a 1xx
+ * interim response, a 204, and a 304.  The Content-Length of a 304 describes
+ * the body that the client already has.  Content negotiation has nothing to
+ * select for such a response, so the response cannot be 406.
+ *
+ * The method is not read on purpose.  That separates this from
+ * nxt_http_request_is_bodyless_final() above.  A HEAD response carries no
+ * body, but it still describes the representation that the equivalent GET
+ * would return (RFC 9110 Sect. 9.3.2).  So it is negotiated like that GET.
+ */
+
+nxt_bool_t
+nxt_http_status_no_representation(nxt_http_status_t status)
+{
+    return status < NXT_HTTP_OK
+           || status == NXT_HTTP_NO_CONTENT
+           || status == NXT_HTTP_NOT_MODIFIED;
+}
+
+
+static nxt_bool_t
+nxt_http_request_is_bodyless(nxt_http_request_t *r)
+{
+    /*
+     * A 101 upgrade is a 1xx status, but the bytes that follow its header are
+     * not a message body -- they are the upgraded protocol (WebSocket), and
+     * nxt_h1proto_websocket.c pushes them through nxt_http_request_send().
+     *
+     * The status matters as much as the flag.  websocket_handshake is set when
+     * the request headers are parsed (src/nxt_h1proto.c), long before the
+     * application chooses a status, and the h1 sender only treats the response
+     * as an upgrade when it is also 101 (src/nxt_h1proto.c).  Testing the flag
+     * alone would leave an application that answers a WebSocket-upgrade
+     * request with 204 plus a body on the unframed path.
+     */
+    if (r->websocket_handshake && r->status == NXT_HTTP_SWITCHING_PROTOCOLS) {
+        return 0;
+    }
+
+    if (r->status >= NXT_HTTP_CONTINUE && r->status < NXT_HTTP_OK) {
+        return 1;
+    }
+
+    return nxt_http_request_is_bodyless_final(r, r->status);
+}
+
+
+/*
+ * Mark every Content-Length and Transfer-Encoding response field skipped.
+ * Only for 1xx and 204, where RFC 9110 Sect. 8.6 and RFC 9112 Sect. 6.1 forbid
+ * both: a 304 keeps Content-Length, and so does a response to HEAD.
+ */
+
+static void
+nxt_http_request_drop_framing_fields(nxt_http_request_t *r)
+{
+    nxt_http_field_t  *field;
+
+    nxt_http_fields_each(field, r->resp.inline_fields, r->resp.num_inline_fields,
+                         r->resp.fields)
+    {
+        if (field->skip) {
+            continue;
+        }
+
+        if ((field->name_length == nxt_length("Content-Length")
+             && nxt_strncasecmp(field->name, (u_char *) "Content-Length",
+                                nxt_length("Content-Length")) == 0)
+            || (field->name_length == nxt_length("Transfer-Encoding")
+                && nxt_strncasecmp(field->name, (u_char *) "Transfer-Encoding",
+                                   nxt_length("Transfer-Encoding")) == 0))
+        {
+            field->skip = 1;
+        }
+
+    } nxt_http_fields_loop;
+}
+
+
+/*
+ * Strip the payload from a response that must not carry one, keeping the
+ * sync/last markers that drive request completion.  Data-only buffers are
+ * unlinked and drained so their completion handlers run and the shared memory
+ * they hold is released; a buffer that also carries the "last" marker stays in
+ * the chain but is emptied in place, so the request still finishes normally.
+ */
+
+static nxt_buf_t *
+nxt_http_request_body_drop(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_buf_t *out)
+{
+    size_t            dropped;
+    nxt_buf_t         *b, *next, **prev;
+    nxt_work_queue_t  *wq;
+
+    dropped = 0;
+    prev = &out;
+    wq = &task->thread->engine->fast_work_queue;
+
+    for (b = out; b != NULL; b = next) {
+        next = b->next;
+
+        if (nxt_buf_is_sync(b)) {
+            /*
+             * A sync buffer may be allocated with NXT_BUF_SYNC_SIZE, so it
+             * carries no payload and its mem.free/file fields must not even
+             * be read.  Keep it as is.
+             */
+            prev = &b->next;
+            continue;
+        }
+
+        dropped += nxt_buf_used_size(b);
+
+        if (nxt_buf_is_last(b)) {
+            /* Empty it in place; the "last" marker still ends the request. */
+            b->mem.pos = b->mem.free;
+
+            if (nxt_buf_is_file(b)) {
+                b->file_pos = b->file_end;
+            }
+
+            prev = &b->next;
+            continue;
+        }
+
+        *prev = next;
+        b->next = NULL;
+
+        nxt_sendbuf_drain(task, wq, b);
+    }
+
+    if (dropped != 0) {
+        nxt_debug(task, "http request body dropped on status %d: %uz bytes",
+                  (int) r->status, dropped);
+    }
+
+    return out;
+}
+
+
+void
+nxt_http_request_send(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
+{
+    if (r->no_body) {
+        out = nxt_http_request_body_drop(task, r, out);
+
+        if (out == NULL) {
+            return;
+        }
+    }
+
+    if (nxt_fast_path(r->proto.any != NULL)) {
+        nxt_http_proto[r->protocol].send(task, r, out);
+    }
+}
+
+
+nxt_buf_t *
+nxt_http_buf_mem(nxt_task_t *task, nxt_http_request_t *r, size_t size)
+{
+    nxt_buf_t  *b;
+
+    b = nxt_buf_mem_alloc(r->mem_pool, size, 0);
+    if (nxt_fast_path(b != NULL)) {
+        b->completion_handler = nxt_http_request_mem_buf_completion;
+        b->parent = r;
+        nxt_mp_retain(r->mem_pool);
+
+    } else {
+        nxt_http_request_error(task, r, NXT_HTTP_INTERNAL_SERVER_ERROR);
+    }
+
+    return b;
+}
+
+
+static void
+nxt_http_request_mem_buf_completion(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_buf_t           *b, *next;
+    nxt_http_request_t  *r;
+
+    b = obj;
+    r = data;
+
+    do {
+        next = b->next;
+
+        nxt_mp_free(r->mem_pool, b);
+        nxt_mp_release(r->mem_pool);
+
+        b = next;
+    } while (b != NULL);
+}
+
+
+nxt_buf_t *
+nxt_http_buf_last(nxt_http_request_t *r)
+{
+    nxt_buf_t  *last;
+
+    last = r->last;
+    r->last = NULL;
+
+    return last;
+}
+
+
+static void
+nxt_http_request_done(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_http_request_t  *r;
+
+    r = data;
+
+    nxt_debug(task, "http request done");
+
+    nxt_http_request_close_handler(task, r, r->proto.any);
+}
+
+
+void
+nxt_http_request_error_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_http_proto_t    proto;
+    nxt_http_request_t  *r;
+
+    r = obj;
+    proto.any = data;
+
+    nxt_debug(task, "http request error handler");
+
+    r->error = 1;
+
+    if (nxt_fast_path(proto.any != NULL)) {
+        nxt_http_proto[r->protocol].discard(task, r, nxt_http_buf_last(r));
+    }
+}
+
+
+void
+nxt_http_request_close_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_http_proto_t         proto;
+    nxt_router_conf_t        *rtcf;
+    nxt_http_request_t       *r;
+    nxt_http_protocol_t      protocol;
+    nxt_socket_conf_joint_t  *conf;
+    nxt_router_access_log_t  *access_log;
+
+    r = obj;
+    proto.any = data;
+
+    conf = r->conf;
+    rtcf = conf->socket_conf->router_conf;
+
+    if (!r->logged) {
+        r->logged = 1;
+
+        if (rtcf->access_log != NULL) {
+            access_log = rtcf->access_log;
+
+            if (nxt_http_cond_value(task, r, &rtcf->log_cond)) {
+                access_log->handler(task, r, access_log, rtcf->log_format);
+                return;
+            }
+        }
+    }
+
+    nxt_debug(task, "http request close handler");
+
+    r->proto.any = NULL;
+
+    if (r->body != NULL && nxt_buf_is_file(r->body)
+        && r->body->file->fd != -1)
+    {
+        nxt_fd_close(r->body->file->fd);
+
+        r->body->file->fd = -1;
+    }
+
+    if (r->tstr_query != NULL) {
+        nxt_tstr_query_release(r->tstr_query);
+    }
+
+    if (nxt_fast_path(proto.any != NULL)) {
+        protocol = r->protocol;
+
+        nxt_http_proto[protocol].close(task, proto, conf);
+
+        nxt_mp_release(r->mem_pool);
+    }
+}
+
+
+static u_char *
+nxt_http_date_cache_handler(u_char *buf, nxt_realtime_t *now, struct tm *tm,
+    size_t size, const char *format)
+{
+    return nxt_http_date(buf, tm);
+}
+
+
+nxt_array_t *
+nxt_http_arguments_parse(nxt_http_request_t *r)
+{
+    size_t                 name_length;
+    u_char                 *p, *dst, *dst_start, *start, *end, *name;
+    uint8_t                d0, d1;
+    uint32_t               hash;
+    nxt_array_t            *args;
+    nxt_http_name_value_t  *nv;
+
+    if (r->arguments != NULL) {
+        return r->arguments;
+    }
+
+    args = nxt_array_create(r->mem_pool, 2, sizeof(nxt_http_name_value_t));
+    if (nxt_slow_path(args == NULL)) {
+        return NULL;
+    }
+
+    if (nxt_slow_path(r->args->start == NULL)) {
+        goto end;
+    }
+
+    hash = NXT_HTTP_FIELD_HASH_INIT;
+    name = NULL;
+    name_length = 0;
+
+    dst_start = nxt_mp_nget(r->mem_pool, r->args->length);
+    if (nxt_slow_path(dst_start == NULL)) {
+        return NULL;
+    }
+
+    r->args_decoded.start = dst_start;
+
+    start = r->args->start;
+    end = start + r->args->length;
+
+    for (p = start, dst = dst_start; p < end; p++, dst++) {
+        *dst = *p;
+
+        switch (*p) {
+        case '=':
+            if (name == NULL) {
+                name_length = dst - dst_start;
+                name = dst_start;
+                dst_start = dst + 1;
+            }
+
+            continue;
+
+        case '&':
+            if (name_length != 0 || dst != dst_start) {
+                nv = nxt_http_argument(args, name, name_length, hash, dst_start,
+                                       dst);
+                if (nxt_slow_path(nv == NULL)) {
+                    return NULL;
+                }
+            }
+
+            hash = NXT_HTTP_FIELD_HASH_INIT;
+            name_length = 0;
+            name = NULL;
+            dst_start = dst + 1;
+
+            continue;
+
+        case '+':
+            *dst = ' ';
+
+            break;
+
+        case '%':
+            if (nxt_slow_path(end - p <= 2)) {
+                break;
+            }
+
+            d0 = nxt_hex2int[p[1]];
+            d1 = nxt_hex2int[p[2]];
+
+            if (nxt_slow_path((d0 | d1) >= 16)) {
+                break;
+            }
+
+            p += 2;
+            *dst = (d0 << 4) + d1;
+
+            break;
+        }
+
+        if (name == NULL) {
+            hash = nxt_http_field_hash_char(hash, *dst);
+        }
+    }
+
+    r->args_decoded.length = dst - r->args_decoded.start;
+
+    if (name_length != 0 || dst != dst_start) {
+        nv = nxt_http_argument(args, name, name_length, hash, dst_start, dst);
+        if (nxt_slow_path(nv == NULL)) {
+            return NULL;
+        }
+    }
+
+end:
+
+    r->arguments = args;
+
+    return args;
+}
+
+
+static nxt_http_name_value_t *
+nxt_http_argument(nxt_array_t *array, u_char *name, size_t name_length,
+    uint32_t hash, u_char *start, const u_char *end)
+{
+    size_t                 length;
+    nxt_http_name_value_t  *nv;
+
+    nv = nxt_array_add(array);
+    if (nxt_slow_path(nv == NULL)) {
+        return NULL;
+    }
+
+    nv->hash = nxt_http_field_hash_end(hash) & 0xFFFF;
+
+    length = end - start;
+
+    if (name == NULL) {
+        name_length = length;
+        name = start;
+        length = 0;
+    }
+
+    nv->name_length = name_length;
+    nv->value_length = length;
+    nv->name = name;
+    nv->value = start;
+
+    return nv;
+}
+
+
+nxt_array_t *
+nxt_http_cookies_parse(nxt_http_request_t *r)
+{
+    nxt_int_t         ret;
+    nxt_array_t       *cookies;
+    nxt_http_field_t  *f;
+
+    if (r->cookies != NULL) {
+        return r->cookies;
+    }
+
+    cookies = nxt_array_create(r->mem_pool, 2, sizeof(nxt_http_name_value_t));
+    if (nxt_slow_path(cookies == NULL)) {
+        return NULL;
+    }
+
+    nxt_http_fields_each(f, r->inline_fields, r->num_inline_fields, r->fields) {
+
+        if (f->hash != NXT_HTTP_COOKIE_HASH
+            || f->name_length != 6
+            || nxt_strncasecmp(f->name, (u_char *) "Cookie", 6) != 0)
+        {
+            continue;
+        }
+
+        ret = nxt_http_cookie_parse(cookies, f->value,
+                                    f->value + f->value_length);
+        if (ret != NXT_OK) {
+            return NULL;
+        }
+
+    } nxt_http_fields_loop;
+
+    r->cookies = cookies;
+
+    return cookies;
+}
+
+
+static nxt_int_t
+nxt_http_cookie_parse(nxt_array_t *cookies, u_char *start, const u_char *end)
+{
+    size_t                 name_length;
+    u_char                 c, *p, *name;
+    nxt_http_name_value_t  *nv;
+
+    name = NULL;
+    name_length = 0;
+
+    for (p = start; p < end; p++) {
+        c = *p;
+
+        if (c == '=' && name == NULL) {
+            while (start[0] == ' ') { start++; }
+
+            name_length = p - start;
+            name = start;
+
+            start = p + 1;
+
+        } else if (c == ';') {
+            if (name != NULL) {
+                nv = nxt_http_cookie(cookies, name, name_length, start, p);
+                if (nxt_slow_path(nv == NULL)) {
+                    return NXT_ERROR;
+                }
+            }
+
+            name = NULL;
+            start = p + 1;
+         }
+    }
+
+    if (name != NULL) {
+        nv = nxt_http_cookie(cookies, name, name_length, start, p);
+        if (nxt_slow_path(nv == NULL)) {
+            return NXT_ERROR;
+        }
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_http_name_value_t *
+nxt_http_cookie(nxt_array_t *array, u_char *name, size_t name_length,
+    u_char *start, const u_char *end)
+{
+    u_char                 c, *p;
+    uint32_t               hash;
+    nxt_http_name_value_t  *nv;
+
+    nv = nxt_array_add(array);
+    if (nxt_slow_path(nv == NULL)) {
+        return NULL;
+    }
+
+    nv->name_length = name_length;
+    nv->name = name;
+
+    hash = NXT_HTTP_FIELD_HASH_INIT;
+
+    for (p = name; p < name + name_length; p++) {
+        c = *p;
+        hash = nxt_http_field_hash_char(hash, c);
+    }
+
+    nv->hash = nxt_http_field_hash_end(hash) & 0xFFFF;
+
+    while (start < end && end[-1] == ' ') { end--; }
+
+    nv->value_length = end - start;
+    nv->value = start;
+
+    return nv;
+}
+
+
+int64_t
+nxt_http_field_hash(nxt_mp_t *mp, nxt_str_t *name, nxt_bool_t case_sensitive,
+    uint8_t encoding)
+{
+    u_char      c, *p, *src, *start, *end, plus;
+    uint8_t     d0, d1;
+    uint32_t    hash;
+    nxt_str_t   str;
+    nxt_uint_t  i;
+
+    str.length = name->length;
+
+    str.start = nxt_mp_nget(mp, str.length);
+    if (nxt_slow_path(str.start == NULL)) {
+        return -1;
+    }
+
+    p = str.start;
+
+    hash = NXT_HTTP_FIELD_HASH_INIT;
+
+    if (encoding == NXT_HTTP_URI_ENCODING_NONE) {
+        for (i = 0; i < name->length; i++) {
+            c = name->start[i];
+            *p++ = c;
+
+            c = case_sensitive ? c : nxt_lowcase(c);
+            hash = nxt_http_field_hash_char(hash, c);
+        }
+
+        goto end;
+    }
+
+    plus = (encoding == NXT_HTTP_URI_ENCODING_PLUS) ? ' ' : '+';
+
+    start = name->start;
+    end = start + name->length;
+
+    for (src = start; src < end; src++) {
+        c = *src;
+
+        switch (c) {
+        case '%':
+            if (nxt_slow_path(end - src <= 2)) {
+                return -1;
+            }
+
+            d0 = nxt_hex2int[src[1]];
+            d1 = nxt_hex2int[src[2]];
+            src += 2;
+
+            if (nxt_slow_path((d0 | d1) >= 16)) {
+                return -1;
+            }
+
+            c = (d0 << 4) + d1;
+            *p++ = c;
+            break;
+
+        case '+':
+            c = plus;
+            *p++ = c;
+            break;
+
+        default:
+            *p++ = c;
+            break;
+        }
+
+        c = case_sensitive ? c : nxt_lowcase(c);
+        hash = nxt_http_field_hash_char(hash, c);
+    }
+
+    str.length = p - str.start;
+
+end:
+
+    *name = str;
+
+    return nxt_http_field_hash_end(hash) & 0xFFFF;
+}
+
+
+int64_t
+nxt_http_argument_hash(nxt_mp_t *mp, nxt_str_t *name)
+{
+    return nxt_http_field_hash(mp, name, 1, NXT_HTTP_URI_ENCODING_PLUS);
+}
+
+
+int64_t
+nxt_http_header_hash(nxt_mp_t *mp, nxt_str_t *name)
+{
+    u_char     c, *p;
+    uint32_t   i, hash;
+    nxt_str_t  str;
+
+    str.length = name->length;
+
+    str.start = nxt_mp_nget(mp, str.length);
+    if (nxt_slow_path(str.start == NULL)) {
+        return -1;
+    }
+
+    p = str.start;
+    hash = NXT_HTTP_FIELD_HASH_INIT;
+
+    for (i = 0; i < name->length; i++) {
+        c = name->start[i];
+
+        if (c >= 'A' && c <= 'Z') {
+            *p = c | 0x20;
+
+        } else if (c == '_') {
+            *p = '-';
+
+        } else {
+            *p = c;
+        }
+
+        hash = nxt_http_field_hash_char(hash, *p);
+        p++;
+    }
+
+    *name = str;
+
+    return nxt_http_field_hash_end(hash) & 0xFFFF;
+}
+
+
+int64_t
+nxt_http_cookie_hash(nxt_mp_t *mp, nxt_str_t *name)
+{
+    return nxt_http_field_hash(mp, name, 1, NXT_HTTP_URI_ENCODING_NONE);
+}
+
+
+int
+nxt_http_cond_value(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_tstr_cond_t *cond)
+{
+    nxt_int_t          ret;
+    nxt_str_t          str;
+    nxt_bool_t         expr;
+    nxt_router_conf_t  *rtcf;
+
+    rtcf = r->conf->socket_conf->router_conf;
+
+    expr = 1;
+
+    if (cond->expr != NULL) {
+
+        if (nxt_tstr_is_const(cond->expr)) {
+            nxt_tstr_str(cond->expr, &str);
+
+        } else {
+            ret = nxt_tstr_query_init(&r->tstr_query, rtcf->tstr_state,
+                                      &r->tstr_cache, r, r->mem_pool);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                return -1;
+            }
+
+            ret = nxt_tstr_query(task, r->tstr_query, cond->expr, &str);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                return -1;
+            }
+        }
+
+        if (str.length == 0
+            || nxt_str_eq(&str, "0", 1)
+            || nxt_str_eq(&str, "false", 5)
+            || nxt_str_eq(&str, "null", 4)
+            || nxt_str_eq(&str, "undefined", 9))
+        {
+            expr = 0;
+        }
+    }
+
+    return cond->negate ^ expr;
+}

@@ -1,0 +1,145 @@
+
+/*
+ * Copyright (C) Igor Sysoev
+ * Copyright (C) NGINX, Inc.
+ */
+
+#ifndef _NXT_TESTS_H_INCLUDED_
+#define _NXT_TESTS_H_INCLUDED_
+
+
+typedef nxt_bool_t (*nxt_msec_less_t)(nxt_msec_t first, nxt_msec_t second);
+
+
+#define NXT_RBT_NODES  1500
+
+
+#if (__i386__ || __i386 || __amd64__ || __amd64)
+#if (NXT_GCC || NXT_CLANG)
+
+#define NXT_TEST_RTDTSC  1
+
+nxt_inline uint64_t
+nxt_rdtsc(void)
+{
+    uint32_t  eax, edx;
+
+    __asm__ volatile ("rdtsc" : "=a" (eax), "=d" (edx));
+
+    return ((uint64_t) edx << 32) | eax;
+}
+
+#endif
+#endif
+
+
+nxt_int_t nxt_term_parse_test(nxt_thread_t *thr);
+nxt_int_t nxt_msec_diff_test(nxt_thread_t *thr, nxt_msec_less_t);
+
+nxt_int_t nxt_rbtree_test(nxt_thread_t *thr, nxt_uint_t n);
+nxt_int_t nxt_rbtree1_test(nxt_thread_t *thr, nxt_uint_t n);
+
+#if (NXT_TEST_RTDTSC)
+
+nxt_int_t nxt_rbtree_mb_start(nxt_thread_t *thr);
+void nxt_rbtree_mb_insert(nxt_thread_t *thr);
+void nxt_rbtree_mb_delete(nxt_thread_t *thr);
+
+nxt_int_t nxt_rbtree1_mb_start(nxt_thread_t *thr);
+void nxt_rbtree1_mb_insert(nxt_thread_t *thr);
+void nxt_rbtree1_mb_delete(nxt_thread_t *thr);
+
+#endif
+
+nxt_int_t nxt_mp_test(nxt_thread_t *thr, nxt_uint_t runs, nxt_uint_t nblocks,
+    size_t max_size);
+nxt_int_t nxt_mp_get_align_test(nxt_thread_t *thr);
+nxt_int_t nxt_lvlhsh_test(nxt_thread_t *thr, nxt_uint_t n,
+    nxt_bool_t use_pool);
+
+nxt_int_t nxt_gmtime_test(nxt_thread_t *thr);
+nxt_int_t nxt_sprintf_test(nxt_thread_t *thr);
+nxt_int_t nxt_malloc_test(nxt_thread_t *thr);
+nxt_int_t nxt_utf8_test(nxt_thread_t *thr);
+nxt_int_t nxt_utf8_sanitize_test(nxt_thread_t *thr);
+nxt_int_t nxt_http_parse_test(nxt_thread_t *thr);
+nxt_int_t nxt_strverscmp_test(nxt_thread_t *thr);
+nxt_int_t nxt_base64_test(nxt_thread_t *thr);
+nxt_int_t nxt_string_test(nxt_thread_t *thr);
+nxt_int_t nxt_buf_test(nxt_thread_t *thr);
+nxt_int_t nxt_http_chunk_parse_test(nxt_thread_t *thr);
+nxt_int_t nxt_http_validate_host_test(nxt_thread_t *thr);
+nxt_int_t nxt_http_request_body_alloc_test(nxt_thread_t *thr);
+nxt_int_t nxt_conf_json_depth_test(nxt_thread_t *thr);
+nxt_int_t nxt_http_route_addr_test(nxt_thread_t *thr);
+nxt_int_t nxt_conf_map_object_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_fail_test(nxt_thread_t *thr);
+nxt_int_t nxt_fd_event_change_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_use_unless_zero_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_mmap_range_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_mmap_read_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_mmaps_max_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_mmap_size_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_ready_test(nxt_thread_t *thr);
+nxt_int_t nxt_conn_close_idle_test(nxt_thread_t *thr);
+nxt_int_t nxt_listen_event_test(nxt_thread_t *thr);
+nxt_int_t nxt_conn_io_accept_test(nxt_thread_t *thr);
+nxt_int_t nxt_runtime_idle_close_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_new_port_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_start_fail_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_start_fail_soak_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_start_proto_gone_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_proto_wedge_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_proto_death_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_start_timeout_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_app_timeout_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_remove_pid_soak_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_detached_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_sender_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_stale_joint_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_websocket_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_prepare_msg_test(nxt_thread_t *thr);
+nxt_int_t nxt_main_start_process_reply_test(nxt_thread_t *thr);
+nxt_int_t nxt_main_file_store_test(nxt_thread_t *thr);
+nxt_int_t nxt_main_store_test(nxt_thread_t *thr);
+nxt_int_t nxt_proto_creating_wedge_test(nxt_thread_t *thr);
+nxt_int_t nxt_main_whoami_test(nxt_thread_t *thr);
+nxt_int_t nxt_main_remove_child_pid_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_change_file_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_ctrunc_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_fd_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_rpc_fd_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_queued_fd_test(nxt_thread_t *thr);
+nxt_int_t nxt_checked_test(nxt_thread_t *thr);
+nxt_int_t nxt_conn_close_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_response_parse_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_frag_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_release_test(nxt_thread_t *thr);
+nxt_int_t nxt_nncq_bound_test(nxt_thread_t *thr);
+#if (NXT_HAVE_REGEX)
+nxt_int_t nxt_regex_test(nxt_thread_t *thr);
+#endif
+nxt_int_t nxt_openssl_server_init_test(nxt_thread_t *thr);
+nxt_int_t nxt_cgroup_test(nxt_thread_t *thr);
+nxt_int_t nxt_controller_peer_test(nxt_thread_t *thr);
+nxt_int_t nxt_cpu_limit_test(nxt_thread_t *thr);
+nxt_int_t nxt_clone_creds_test(nxt_thread_t *thr);
+#if (NXT_HAVE_ISOLATION_ROOTFS)
+nxt_int_t nxt_isolation_mount_dst_test(nxt_thread_t *thr);
+#endif
+
+nxt_bool_t nxt_test_fd_is_open(nxt_fd_t fd);
+int nxt_test_in_child(nxt_thread_t *thr, const char *name, int (*fn)(void *),
+    void *data);
+
+
+#define NXT_TEST_CHECK(log, cond, ...)                                        \
+    do {                                                                      \
+        if (!(cond)) {                                                        \
+            nxt_log_alert(log, __VA_ARGS__);                                  \
+            return NXT_ERROR;                                                 \
+        }                                                                     \
+    } while (0)
+
+
+#endif /* _NXT_TESTS_H_INCLUDED_ */

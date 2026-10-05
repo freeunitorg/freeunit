@@ -1,0 +1,15 @@
+[Unit]
+Description=%%BRAND_TITLE%% application server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=forking
+PIDFile=%%RUNDIR%%/%%RUNTIME%%.pid
+EnvironmentFile=-/etc/default/%%RUNTIME%%
+ExecStart=/usr/sbin/%%RUNTIME%%d $DAEMON_ARGS
+ExecReload=
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

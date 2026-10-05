@@ -1,0 +1,318 @@
+
+/*
+ * Copyright (C) Max Romanov
+ * Copyright (C) NGINX, Inc.
+ */
+
+#ifndef _NXT_PORT_MEMORY_INT_H_INCLUDED_
+#define _NXT_PORT_MEMORY_INT_H_INCLUDED_
+
+
+#include <stdint.h>
+#include <nxt_atomic.h>
+#include <nxt_clang.h>
+
+
+#ifdef NXT_MMAP_TINY_CHUNK
+
+#define PORT_MMAP_CHUNK_SIZE    16
+#define PORT_MMAP_HEADER_SIZE   1024
+#define PORT_MMAP_DATA_SIZE     1024
+
+#else
+
+#define PORT_MMAP_CHUNK_SIZE    (1024 * 16)
+#define PORT_MMAP_HEADER_SIZE   (1024 * 4)
+#define PORT_MMAP_DATA_SIZE     (1024 * 1024 * 10)
+
+#endif
+
+
+#define PORT_MMAP_SIZE          (PORT_MMAP_HEADER_SIZE + PORT_MMAP_DATA_SIZE)
+#define PORT_MMAP_CHUNK_COUNT   (PORT_MMAP_DATA_SIZE / PORT_MMAP_CHUNK_SIZE)
+
+/*
+ * The segment id of an incoming mmap is authored by the peer process and
+ * used as an index into nxt_process_t.incoming, so it has to be bounded.
+ *
+ * libunit assigns ids as append-only indices into its outgoing array and
+ * refuses to create a segment once that array reaches shm_mmap_limit, which
+ * is the uint32_t shm_limit / PORT_MMAP_DATA_SIZE, rounded up
+ * (nxt_unit_shm_mmap_limit()).  So no conforming peer can exceed
+ * floor(UINT32_MAX / PORT_MMAP_DATA_SIZE), whatever the configured shm limit.
+ *
+ * Derived from the geometry rather than written out, because
+ * NXT_MMAP_TINY_CHUNK changes PORT_MMAP_DATA_SIZE by four orders of
+ * magnitude: 410 segments here, but 4194304 in a tiny-chunk build, where a
+ * hard-coded production-sized bound would reject legitimate traffic.
+ */
+#define NXT_PORT_MMAP_MAX_SEGMENTS  (UINT32_MAX / PORT_MMAP_DATA_SIZE + 1)
+
+/*
+ * The most shared memory segments one process keeps for one peer, in each
+ * direction.  A segment id is an index into that array, and the array is
+ * grown to hold the id.  On both sides, the router and libunit, an incoming
+ * id is taken from the peer: from an mmap record in a port message, or from
+ * a segment header in memory the peer can still write.  Without a limit an
+ * id like 100000000 makes the receiver allocate and initialise an array of
+ * that many slots from one message.
+ *
+ * NXT_PORT_MMAP_MAX_SEGMENTS above bounds only the libunit-authored ids the
+ * router receives.  The router's own outgoing segments are not bounded by
+ * shm_limit, so libunit needs a limit of its own, and this one is used by
+ * both sides, in nxt_port_mmap_at() and nxt_unit_mmap_at().  Each segment
+ * holds PORT_MMAP_SIZE bytes, about 10 MiB, so 65536 segments are about
+ * 640 GiB of shared memory between one pair of processes: no real peer
+ * reaches it.  The arrays a bad id can grow are bounded too: at the limit
+ * the router's array of nxt_port_mmap_t (one pointer) is 512 KiB, and
+ * libunit's array of nxt_unit_mmap_t (a pointer, a pthread_t and a queue,
+ * 32 bytes on 64-bit) is 2 MiB.  The router refuses to create a segment
+ * past the limit, and both sides refuse an incoming id past it.
+ *
+ * In an NXT_MMAP_TINY_CHUNK build a segment is 2 KiB, so the limit is only
+ * 128 MiB of shared memory per pair; that build is for debugging.
+ */
+#define NXT_PORT_MMAPS_MAX  65536U
+
+
+typedef uint32_t  nxt_chunk_id_t;
+
+typedef nxt_atomic_uint_t  nxt_free_map_t;
+
+#define FREE_BITS (sizeof(nxt_free_map_t) * 8)
+
+#define FREE_IDX(nchunk) ((nchunk) / FREE_BITS)
+
+#define FREE_MASK(nchunk)                                                     \
+    ( 1ULL << ( (nchunk) % FREE_BITS ) )
+
+#define MAX_FREE_IDX FREE_IDX(PORT_MMAP_CHUNK_COUNT)
+
+
+/* Mapped at the start of shared memory segment. */
+struct nxt_port_mmap_header_s {
+    uint32_t        id;
+    nxt_pid_t       src_pid; /* For sanity check. */
+    nxt_pid_t       dst_pid; /* For sanity check. */
+    nxt_port_id_t   sent_over;
+    nxt_atomic_t    oosm;
+    nxt_free_map_t  free_map[MAX_FREE_IDX];
+    /*
+     * Not padding in the alignment sense: nxt_port_mmap_set_chunk_busy() is
+     * called with PORT_MMAP_CHUNK_COUNT to plant a permanently-busy sentinel
+     * one word past the last real word of free_map[], so that a multi-chunk
+     * allocation walking off the end of the segment fails to claim its
+     * continuation instead of reading past the end of the struct.
+     */
+    nxt_free_map_t  free_map_padding;
+
+    /*
+     * Not a live field.  It reserves the window that a peer built before the
+     * tracking bitmap was dropped still writes: such a peer memsets
+     * MAX_FREE_IDX words of free_tracking_map starting here and plants its
+     * sentinel one word past them.  A libunit of that vintage can create
+     * segments this build maps, so the window has to stay unused while those
+     * peers are supported.
+     *
+     * Reserved in the struct rather than only described in a comment, so
+     * that the next field added lands after it by construction instead of
+     * by the author having read this.  Removing the reservation is what
+     * turns the removal of the tracking bitmap into the same latent
+     * corruption it was meant to fix.
+     */
+    nxt_free_map_t  legacy_tracking_window[MAX_FREE_IDX + 1];
+};
+
+
+/*
+ * The header struct is mapped over the first PORT_MMAP_HEADER_SIZE bytes of
+ * the segment and chunk 0 starts right after it, so anything the struct
+ * declares beyond that boundary silently aliases payload.
+ */
+nxt_static_assert(sizeof(nxt_port_mmap_header_t) <= PORT_MMAP_HEADER_SIZE,
+                  "nxt_port_mmap_header_t overflows the segment header area");
+
+
+struct nxt_port_mmap_handler_s {
+    nxt_port_mmap_header_t  *hdr;
+    nxt_atomic_t            use_count;
+    nxt_fd_t                fd;
+};
+
+/*
+ * Element of nxt_process_t.incoming/outgoing, shared memory segment
+ * descriptor.
+ */
+struct nxt_port_mmap_s {
+    nxt_port_mmap_handler_t  *mmap_handler;
+};
+
+typedef struct nxt_port_mmap_msg_s nxt_port_mmap_msg_t;
+
+/* Passed as a second iov chunk when 'mmap' bit in nxt_port_msg_t is 1. */
+struct nxt_port_mmap_msg_s {
+    uint32_t            mmap_id;    /* Mmap index in nxt_process_t.outgoing. */
+    nxt_chunk_id_t      chunk_id;   /* Mmap chunk index. */
+    uint32_t            size;       /* Payload data size. */
+};
+
+
+nxt_inline nxt_bool_t
+nxt_port_mmap_get_free_chunk(nxt_free_map_t *m, nxt_chunk_id_t *c);
+
+#define nxt_port_mmap_get_chunk_busy(m, c)                                    \
+    ((m[FREE_IDX(c)] & FREE_MASK(c)) == 0)
+
+nxt_inline void
+nxt_port_mmap_set_chunk_busy(nxt_free_map_t *m, nxt_chunk_id_t c);
+
+nxt_inline nxt_bool_t
+nxt_port_mmap_chk_set_chunk_busy(nxt_free_map_t *m, nxt_chunk_id_t c);
+
+nxt_inline void
+nxt_port_mmap_set_chunk_free(nxt_free_map_t *m, nxt_chunk_id_t c);
+
+nxt_inline nxt_chunk_id_t
+nxt_port_mmap_chunk_id(nxt_port_mmap_header_t *hdr, const u_char *p)
+{
+    u_char  *mm_start;
+
+    mm_start = (u_char *) hdr;
+
+    return ((p - mm_start) - PORT_MMAP_HEADER_SIZE) / PORT_MMAP_CHUNK_SIZE;
+}
+
+
+nxt_inline u_char *
+nxt_port_mmap_chunk_start(nxt_port_mmap_header_t *hdr, nxt_chunk_id_t c)
+{
+    u_char  *mm_start;
+
+    mm_start = (u_char *) hdr;
+
+    return mm_start + PORT_MMAP_HEADER_SIZE + c * PORT_MMAP_CHUNK_SIZE;
+}
+
+
+/*
+ * Validate that a peer-supplied (chunk_id, size) pair describes a region
+ * wholly inside the mapped data area, and report the number of chunks the
+ * region spans via *nchunks.  Returns non-zero on success.
+ *
+ * *nchunks is always written, on the reject path as well: the callers log
+ * it in their diagnostics before dropping the message.
+ *
+ * The chunk count is computed here, in size_t, with the divide-then-adjust
+ * form.  For a peer-supplied uint32_t size it must never be written as
+ * (size + PORT_MMAP_CHUNK_SIZE - 1) / PORT_MMAP_CHUNK_SIZE: that addition is
+ * evaluated at 32 bits and wraps for size in [0xFFFFC001, 0xFFFFFFFF],
+ * yielding zero chunks and thus wrongly accepting the message.  (Elsewhere
+ * in this tree the same idiom is reached only with a size_t size, or with
+ * one a caller has already clamped to PORT_MMAP_DATA_SIZE.)  Keeping the
+ * arithmetic here, out of the callers, is what makes it testable.
+ *
+ * The subtraction on the constant side is underflow-safe only because the
+ * chunk_id test above has already established chunk_id < PORT_MMAP_CHUNK_COUNT.
+ * It is not an independent property: drop that test and
+ * PORT_MMAP_CHUNK_COUNT - chunk_id underflows to a huge size_t, which the
+ * count comparison then passes.
+ */
+nxt_inline nxt_bool_t
+nxt_port_mmap_chunk_range_valid(nxt_chunk_id_t chunk_id, uint32_t size,
+    size_t *nchunks)
+{
+    size_t  n;
+
+    n = size / PORT_MMAP_CHUNK_SIZE;
+
+    if ((size % PORT_MMAP_CHUNK_SIZE) != 0) {
+        n++;
+    }
+
+    *nchunks = n;
+
+    if (chunk_id >= PORT_MMAP_CHUNK_COUNT) {
+        return 0;
+    }
+
+    if (n > (size_t) PORT_MMAP_CHUNK_COUNT - chunk_id) {
+        return 0;
+    }
+
+    return 1;
+}
+
+
+nxt_inline nxt_bool_t
+nxt_port_mmap_get_free_chunk(nxt_free_map_t *m, nxt_chunk_id_t *c)
+{
+    const nxt_free_map_t  default_mask = (nxt_free_map_t) -1;
+
+    int             ffs;
+    size_t          i, start;
+    nxt_chunk_id_t  chunk;
+    nxt_free_map_t  bits, mask;
+
+    start = FREE_IDX(*c);
+    mask = default_mask << ((*c) % FREE_BITS);
+
+    for (i = start; i < MAX_FREE_IDX; i++) {
+        bits = m[i] & mask;
+        mask = default_mask;
+
+        if (bits == 0) {
+            continue;
+        }
+
+        ffs = __builtin_ffsll(bits);
+        if (ffs != 0) {
+            chunk = i * FREE_BITS + ffs - 1;
+
+            if (nxt_port_mmap_chk_set_chunk_busy(m, chunk)) {
+                *c = chunk;
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+
+nxt_inline void
+nxt_port_mmap_set_chunk_busy(nxt_free_map_t *m, nxt_chunk_id_t c)
+{
+    nxt_atomic_and_fetch(m + FREE_IDX(c), ~FREE_MASK(c));
+}
+
+
+nxt_inline nxt_bool_t
+nxt_port_mmap_chk_set_chunk_busy(nxt_free_map_t *m, nxt_chunk_id_t c)
+{
+    nxt_free_map_t  *f;
+    nxt_free_map_t  free_val, busy_val;
+
+    f = m + FREE_IDX(c);
+
+    while ( (*f & FREE_MASK(c)) != 0 ) {
+
+        free_val = *f | FREE_MASK(c);
+        busy_val = free_val & ~FREE_MASK(c);
+
+        if (nxt_atomic_cmp_set(f, free_val, busy_val) != 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+nxt_inline void
+nxt_port_mmap_set_chunk_free(nxt_free_map_t *m, nxt_chunk_id_t c)
+{
+    nxt_atomic_or_fetch(m + FREE_IDX(c), FREE_MASK(c));
+}
+
+
+#endif /* _NXT_PORT_MEMORY_INT_H_INCLUDED_ */

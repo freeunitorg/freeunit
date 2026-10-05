@@ -1,0 +1,100 @@
+name: "Lint (Whitespace)"
+
+# Get the repo with the commits(+1) in the series.
+# Process `git log --check` output to extract just the check errors.
+
+on:
+  pull_request:
+    types: [ opened, synchronize ]
+  push:
+    branches: [ master ]
+    # Release tags, for the version check below.  The whitespace step
+    # skips a tag: its commits were checked when they were pushed.
+    tags: [ '[0-9]+.[0-9]+.[0-9]+' ]
+
+concurrency:
+  # Cancel superseded runs for the same pull request.  Non-PR events fall back
+  # to the run id, which is unique, so a push is never grouped with another:
+  # Actions keeps only one PENDING run per group and would drop a queued commit
+  # even with cancel-in-progress false, which would break bisectability.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check-whitespace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+
+    - name: git log --check
+      id: check_out
+      if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      env:
+        BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+      run: |
+        # A push that creates a branch has an all-zero base.  A force-push
+        # can leave the base out of the clone.  Check only the head commit.
+        range="${BASE}.."
+        if test -z "${BASE}" \
+           || test "${BASE}" = 0000000000000000000000000000000000000000 \
+           || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null
+        then
+          if git rev-parse -q --verify HEAD^ >/dev/null
+          then
+            range="HEAD^..HEAD"
+          else
+            range="HEAD"
+          fi
+          echo "::notice::Base '${BASE}' is not usable. Checking ${range} only."
+        fi
+
+        # Run git log before the loop, so that its failure fails the step.
+        # It exits 2 when it finds a whitespace error; the loop reports it.
+        rc=0
+        git log --check --pretty=format:"--- %h %s" ${range} \
+          > "${RUNNER_TEMP}/check.log" || rc=$?
+        if test "${rc}" -ne 0 && test "${rc}" -ne 2
+        then
+          echo "::error::git log ${range} failed with exit status ${rc}."
+          exit 1
+        fi
+
+        log=
+        commit=
+        while read dash etc
+        do
+          case "${dash}" in
+          "---")
+            commit="${etc}"
+            ;;
+          "")
+            ;;
+          *)
+            if test -n "${commit}"
+            then
+              log="${log}\n${commit}"
+              echo ""
+              echo "--- ${commit}"
+            fi
+            commit=
+            log="${log}\n${dash} ${etc}"
+            echo "${dash} ${etc}"
+            ;;
+          esac
+        done < "${RUNNER_TEMP}/check.log"
+
+        if test -n "${log}"
+        then
+          exit 2
+        fi
+
+    # Every file that carries the release version agrees with the version
+    # file, and the generated Dockerfiles are up to date.  It needs no
+    # network.  It runs even when the whitespace check fails, and on every
+    # event: pull requests, pushes to master and release tags.
+    - name: Check the release version sites
+      if: ${{ !cancelled() }}
+      run: sh .github/scripts/check-version.sh
