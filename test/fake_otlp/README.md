@@ -27,6 +27,7 @@ built — mirroring FreeUnit's single `--otel` build. See PLAN.md.
 
 ```
 fake_otlp --port <N> [--protocol http|grpc] [--requests <N>] [--dump <FILE>]
+          [--status <CODE>]
 ```
 
 | Flag | Meaning |
@@ -35,6 +36,7 @@ fake_otlp --port <N> [--protocol http|grpc] [--requests <N>] [--dump <FILE>]
 | `--protocol P` | transport (table below); default `http` |
 | `--requests N` | exit after N export requests (default: run forever) |
 | `--dump FILE` | append each received request (raw bytes) to FILE |
+| `--status CODE` | answer each valid export with this HTTP status (default 200). For `grpc`, any other code answers `UNAVAILABLE`. The export is still counted and dumped. |
 
 ### Protocols
 

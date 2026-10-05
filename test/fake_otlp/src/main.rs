@@ -5,12 +5,16 @@
 ///
 /// Usage:
 ///   fake_otlp --port <N> [--protocol http|grpc] [--requests <N>] [--dump <FILE>]
+///             [--status <CODE>]
 ///
 ///   --port N       TCP port to listen on (127.0.0.1)
 ///   --protocol P   transport: "http" (default) or "grpc"
 ///                  (HTTP/2 unary TraceService/Export)
 ///   --requests N   exit after receiving N export requests (default: forever)
 ///   --dump FILE    append each received request to FILE
+///   --status CODE  answer each valid export with this HTTP status (default
+///                  200); for grpc, any code other than 200 answers UNAVAILABLE.
+///                  The export is still counted and dumped.
 ///
 /// HTTP behaviour:
 ///   * Accepts POST /v1/traces with Content-Type: application/x-protobuf and a
@@ -150,7 +154,7 @@ pub fn dump_request(dump: Option<&str>, bytes: &[u8]) {
 /// received, so a bare TCP probe (the test harness's readiness check, which
 /// connects and immediately closes) and malformed requests are not counted
 /// against --requests and are not written to the dump.
-fn handle(mut stream: TcpStream, dump: Option<&str>) -> bool {
+fn handle(mut stream: TcpStream, dump: Option<&str>, status: u16) -> bool {
     let req = match read_request(&mut stream) {
         Ok(r) => r,
         Err(_) => return false,
@@ -185,13 +189,17 @@ fn handle(mut stream: TcpStream, dump: Option<&str>) -> bool {
     );
     let _ = std::io::stdout().flush();
 
-    respond(&mut stream, "200 OK");
+    if status == 200 {
+        respond(&mut stream, "200 OK");
+    } else {
+        respond(&mut stream, &format!("{status} Fake Failure"));
+    }
     true
 }
 
 /// Serve OTLP/HTTP until `max_requests` valid exports have been received (or
 /// forever when `None`).
-fn serve_http(port: u16, max_requests: Option<usize>, dump: Option<&str>) {
+fn serve_http(port: u16, max_requests: Option<usize>, dump: Option<&str>, status: u16) {
     let listener = TcpListener::bind((HOST, port)).unwrap_or_else(|e| {
         eprintln!("bind {HOST}:{port} — {e}");
         process::exit(1);
@@ -201,7 +209,7 @@ fn serve_http(port: u16, max_requests: Option<usize>, dump: Option<&str>) {
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
-                if handle(s, dump) {
+                if handle(s, dump, status) {
                     count += 1;
                     if max_requests.map_or(false, |n| count >= n) {
                         break;
@@ -221,7 +229,7 @@ fn serve_http(port: u16, max_requests: Option<usize>, dump: Option<&str>) {
 fn usage() -> ! {
     eprintln!(
         "Usage: fake_otlp --port <N> [--protocol http|grpc] \
-         [--requests <N>] [--dump <FILE>]"
+         [--requests <N>] [--dump <FILE>] [--status <CODE>]"
     );
     process::exit(1);
 }
@@ -233,6 +241,7 @@ fn main() {
     let mut protocol = String::from("http");
     let mut max_requests: Option<usize> = None;
     let mut dump: Option<String> = None;
+    let mut status: u16 = 200;
 
     let mut i = 1;
     while i < args.len() {
@@ -255,6 +264,14 @@ fn main() {
                 i += 1;
                 dump = args.get(i).cloned();
             }
+            "--status" => {
+                i += 1;
+                status = args
+                    .get(i)
+                    .and_then(|v| v.parse().ok())
+                    .filter(|v| (200..=599).contains(v))
+                    .unwrap_or_else(|| usage());
+            }
             _ => {}
         }
         i += 1;
@@ -263,8 +280,8 @@ fn main() {
     let port = port.unwrap_or_else(|| usage());
 
     match protocol.as_str() {
-        "http" => serve_http(port, max_requests, dump.as_deref()),
-        "grpc" => grpc::serve_grpc(port, max_requests, dump),
+        "http" => serve_http(port, max_requests, dump.as_deref(), status),
+        "grpc" => grpc::serve_grpc(port, max_requests, dump, status),
         other => {
             eprintln!("fake_otlp: unknown --protocol {other:?} (use http or grpc)");
             process::exit(1);

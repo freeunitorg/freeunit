@@ -20,7 +20,10 @@ use opentelemetry::trace::{
     TraceId, TraceState, Tracer, TracerProvider,
 };
 use opentelemetry::{Context, Key, KeyValue, Value};
-use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig};
+use opentelemetry_otlp::{
+    Protocol, RetryPolicy, SpanExporter, WithExportConfig, WithHttpConfig,
+    WithTonicConfig,
+};
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{
     BatchConfigBuilder, BatchSpanProcessor, Sampler, SdkTracerProvider, SpanData,
@@ -213,12 +216,18 @@ impl<E: SdkSpanExporter> SdkSpanExporter for FailureTrackingExporter<E> {
 }
 
 /// Build the OTLP/HTTP exporter: the blocking reqwest client, no async runtime.
+///
+/// opentelemetry-otlp 0.33 retries a failed export up to 3 times by default.
+/// Both builders disable this. The batch worker blocks on each export, so the
+/// retries would hold the queue while the collector fails. A failed batch is
+/// counted as failed in /status and dropped.
 fn build_http_exporter(endpoint: String) -> Result<SpanExporter, String> {
     SpanExporter::builder()
         .with_http()
         .with_endpoint(endpoint)
         .with_protocol(Protocol::HttpBinary)
         .with_timeout(EXPORT_TIMEOUT)
+        .with_retry_policy(RetryPolicy::disabled())
         .build()
         .map_err(|e| format!("couldn't build otel http exporter: {e}"))
 }
@@ -240,6 +249,7 @@ fn build_grpc_exporter(endpoint: String) -> Result<SpanExporter, String> {
             .with_tonic()
             .with_endpoint(endpoint)
             .with_timeout(EXPORT_TIMEOUT)
+            .with_retry_policy(RetryPolicy::disabled())
             .build()
             .map_err(|e| format!("couldn't build otel grpc exporter: {e}"))?
     };

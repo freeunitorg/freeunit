@@ -45,8 +45,12 @@ def _get_free_port():
         return s.getsockname()[1]
 
 
-def _run_fake_otlp(port, requests=None, dump=None, protocol='http'):
+def _run_fake_otlp(
+    port, requests=None, dump=None, protocol='http', status=None
+):
     cmd = [FAKE_OTLP_BIN, '--port', str(port), '--protocol', protocol]
+    if status is not None:
+        cmd += ['--status', str(status)]
     if requests is not None:
         cmd += ['--requests', str(requests)]
     if dump is not None:
@@ -928,3 +932,38 @@ def test_otel_status_counts_failed_spans():
     assert telemetry is not None, '/status must report telemetry when configured'
     assert telemetry['spans']['failed'] > 0, 'a refused export must be counted'
     assert telemetry['spans']['exported'] == 0, 'nothing can have been exported'
+
+
+@_skipif_no_fake_otlp
+@pytest.mark.parametrize('protocol', ['http', 'grpc'])
+def test_otel_export_not_retried(tmp_path, protocol):
+    """A batch the collector refuses with a retryable error is sent once.
+
+    opentelemetry-otlp 0.33 retries such an export up to 3 times by default.
+    The batch worker blocks during the retries, so FreeUnit turns them off.
+    With batch_size 1 each failed span is one batch, so the collector must
+    see exactly one request per failed span.
+    """
+    port = _get_free_port()
+    dump = tmp_path / 'otlp_dump.bin'
+    proc = _run_fake_otlp(port, dump=str(dump), protocol=protocol, status=503)
+    try:
+        _configure_or_skip(port, protocol=protocol)
+
+        assert _get_until_header('traceparent')['status'] == 200
+
+        telemetry = _wait_for_spans('failed')
+        assert telemetry is not None, '/status must report telemetry'
+        assert telemetry['spans']['failed'] > 0, 'a 503 export must fail'
+
+        # With retries on, the last attempt of a batch comes about 1 s after
+        # the first.  Wait longer than that, then compare the counts.
+        time.sleep(4)
+
+        failed = _status_telemetry()['spans']['failed']
+        requests = dump.read_bytes().count(b'--fake_otlp-request-boundary--')
+        assert requests == failed, (
+            f'{requests} export requests for {failed} failed batches'
+        )
+    finally:
+        _kill(proc)
