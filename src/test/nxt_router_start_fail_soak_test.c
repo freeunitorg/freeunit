@@ -9,7 +9,7 @@
  * failed" sites in nxt_router_start_app_process_handler():
  *
  *   site 1  the prototype buffer allocation, forced by an app conf length
- *           no allocator can satisfy;
+ *           that makes nxt_mp_alloc() refuse the request;
  *   site 2  nxt_port_rpc_register_handler_ex(), forced by the NXT_TESTS
  *           rpc allocation hook;
  *   site 3  nxt_port_socket_write2(), forced by the NXT_TESTS port message
@@ -184,12 +184,20 @@ nxt_router_start_fail_soak_test(nxt_thread_t *thr)
         if (site == 0) {
             /*
              * Site 1: no prototype, so the handler builds the START_PROCESS
-             * payload first.  A length no allocator can serve makes
-             * nxt_buf_mem_alloc() return NULL before the buffer is written
-             * to, so app->conf may stay empty.
+             * payload first.  It asks nxt_buf_mem_alloc() for name, NUL and
+             * conf, and nxt_buf_mem_alloc() adds NXT_BUF_MEM_SIZE.  This
+             * length makes that request exactly 0xFFFFFFFF on every width.
+             * nxt_mp_alloc_large() refuses a size of 0xFFFFFFFF or more
+             * before it calls the allocator, so the buffer is never written
+             * to and app->conf may stay empty.
+             *
+             * On a 32-bit size_t 0xFFFFFFFF is SIZE_MAX, so this is the one
+             * length that makes nxt_mp_alloc_large() refuse the request on
+             * every width.
              */
             app->proto_port = NULL;
-            app->conf.length = (size_t) 1 << 46;
+            app->conf.length = (size_t) 0xFFFFFFFF - NXT_BUF_MEM_SIZE
+                               - app->name.length - 1;
 
         } else {
             app->proto_port = dport;
