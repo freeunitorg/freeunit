@@ -118,6 +118,7 @@ nxt_int_t nxt_router_response_parse_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_frag_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_release_test(nxt_thread_t *thr);
 nxt_int_t nxt_nncq_bound_test(nxt_thread_t *thr);
+nxt_int_t nxt_size_bound_test(nxt_thread_t *thr);
 #if (NXT_HAVE_REGEX)
 nxt_int_t nxt_regex_test(nxt_thread_t *thr);
 #endif

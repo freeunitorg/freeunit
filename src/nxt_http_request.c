@@ -7,6 +7,7 @@
 #include <nxt_router.h>
 #include <nxt_http.h>
 #include <nxt_otel.h>
+#include <nxt_checked.h>
 
 
 static void nxt_http_request_start(nxt_task_t *task, void *obj, void *data);
@@ -694,7 +695,7 @@ nxt_int_t
 nxt_http_request_body_alloc(nxt_task_t *task, nxt_http_request_t *r,
     size_t body_length)
 {
-    size_t             body_buffer_size;
+    size_t             body_buffer_size, size;
     nxt_buf_t          *b;
     nxt_socket_conf_t  *skcf;
 
@@ -711,9 +712,16 @@ nxt_http_request_body_alloc(nxt_task_t *task, nxt_http_request_t *r,
 
         tmp_name.length = tmp_path->length + tmp_name_pattern.length;
 
-        b = nxt_buf_file_alloc(r->mem_pool,
-                               body_buffer_size + sizeof(nxt_file_t)
-                               + tmp_name.length + 1, 0);
+        /* "body_buffer_size" can be near SIZE_MAX with a 32-bit size_t. */
+        if (nxt_slow_path(nxt_size_add(body_buffer_size,
+                                       sizeof(nxt_file_t) + tmp_name.length
+                                       + 1, &size)
+                          != 0))
+        {
+            return NXT_ERROR;
+        }
+
+        b = nxt_buf_file_alloc(r->mem_pool, size, 0);
         if (nxt_slow_path(b == NULL)) {
             return NXT_ERROR;
         }

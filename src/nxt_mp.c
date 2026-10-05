@@ -5,6 +5,7 @@
  */
 
 #include <nxt_main.h>
+#include <nxt_checked.h>
 
 
 /*
@@ -723,7 +724,7 @@ nxt_mp_alloc_large(nxt_mp_t *mp, size_t alignment, size_t size,
     nxt_bool_t freeable)
 {
     u_char          *p;
-    size_t          aligned_size;
+    size_t          aligned_size, alloc_size;
     uint8_t         type;
     nxt_mp_block_t  *block;
 
@@ -749,9 +750,28 @@ nxt_mp_alloc_large(nxt_mp_t *mp, size_t alignment, size_t size,
         type = NXT_MP_DISCRETE_BLOCK;
 
     } else {
-        aligned_size = nxt_align_size(size, sizeof(uintptr_t));
+        /*
+         * The block header follows the data.  With a 32-bit size_t the
+         * check above lets sizes through for which the aligned size, or
+         * the aligned size plus the header, does not fit in size_t.
+         */
+        if (nxt_slow_path(nxt_size_add(size, sizeof(uintptr_t) - 1,
+                                       &aligned_size)
+                          != 0))
+        {
+            return NULL;
+        }
 
-        p = nxt_memalign(alignment, aligned_size + sizeof(nxt_mp_block_t));
+        aligned_size &= ~(sizeof(uintptr_t) - 1);
+
+        if (nxt_slow_path(nxt_size_add(aligned_size, sizeof(nxt_mp_block_t),
+                                       &alloc_size)
+                          != 0))
+        {
+            return NULL;
+        }
+
+        p = nxt_memalign(alignment, alloc_size);
         if (nxt_slow_path(p == NULL)) {
             return NULL;
         }

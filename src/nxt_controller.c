@@ -12,6 +12,7 @@
 #include <nxt_status.h>
 #include <nxt_cert.h>
 #include <nxt_script.h>
+#include <nxt_checked.h>
 
 
 typedef struct {
@@ -699,6 +700,9 @@ nxt_controller_conf_send(nxt_task_t *task, nxt_mp_t *mp, nxt_conf_value_t *conf,
     controller_port = rt->port_by_type[NXT_PROCESS_CONTROLLER];
 
     size = nxt_conf_json_length(conf, NULL);
+    if (nxt_slow_path(size == SIZE_MAX)) {
+        return NXT_ERROR;
+    }
 
     b = nxt_buf_mem_alloc(mp, sizeof(size_t), 0);
     if (nxt_slow_path(b == NULL)) {
@@ -3085,6 +3089,9 @@ nxt_controller_conf_store(nxt_task_t *task, nxt_conf_value_t *conf)
     main_port = rt->port_by_type[NXT_PROCESS_MAIN];
 
     size = nxt_conf_json_length(conf, NULL);
+    if (nxt_slow_path(size == SIZE_MAX)) {
+        return;
+    }
 
     fd = nxt_shm_open(task, size);
     if (nxt_slow_path(fd == -1)) {
@@ -3276,7 +3283,14 @@ nxt_controller_response(nxt_task_t *task, nxt_controller_request_t *req,
 
     nxt_memzero(&pretty, sizeof(nxt_conf_json_pretty_t));
 
-    size = nxt_conf_json_length(value, &pretty) + 2;
+    /* The body and "\r\n". */
+    if (nxt_slow_path(nxt_size_add(nxt_conf_json_length(value, &pretty), 2,
+                                   &size)
+                      != 0))
+    {
+        nxt_controller_conn_close(task, c, req);
+        return;
+    }
 
     body = nxt_buf_mem_alloc(c->mem_pool, size, 0);
     if (nxt_slow_path(body == NULL)) {
