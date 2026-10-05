@@ -12,6 +12,16 @@
 #define NXT_PORT_UUZ_RACERS  8
 #define NXT_PORT_UUZ_ROUNDS  2000
 
+/*
+ * The flags below pass between threads.  nxt_atomic_t is only volatile, and
+ * a plain load gives no ordering on a weakly ordered CPU (aarch64, ppc64,
+ * riscv64, loongarch64).  Without acquire, a racer can see the new gen and
+ * still read the previous round's released = 1, and so count a legal win
+ * as a late one.
+ */
+#define nxt_port_uuz_load(p)      __atomic_load_n(p, __ATOMIC_ACQUIRE)
+#define nxt_port_uuz_store(p, v)  __atomic_store_n(p, v, __ATOMIC_RELEASE)
+
 
 typedef struct {
     nxt_port_t        *port;
@@ -211,7 +221,7 @@ nxt_port_uuz_test_race(nxt_thread_t *thr)
             nxt_log_alert(thr->log, "port use_unless_zero test: "
                           "pthread_create() failed");
 
-            ctx.stop = 1;
+            nxt_port_uuz_store(&ctx.stop, 1);
             nxt_atomic_fetch_add(&ctx.gen, 1);
 
             while (i > 0) {
@@ -227,10 +237,10 @@ nxt_port_uuz_test_race(nxt_thread_t *thr)
     ret = NXT_OK;
 
     for (round = 0; round < NXT_PORT_UUZ_ROUNDS; round++) {
-        ctx.port->use_count = 1;
-        ctx.released = 0;
-        ctx.late_wins = 0;
-        ctx.done = 0;
+        nxt_port_uuz_store(&ctx.port->use_count, 1);
+        nxt_port_uuz_store(&ctx.released, 0);
+        nxt_port_uuz_store(&ctx.late_wins, 0);
+        nxt_port_uuz_store(&ctx.done, 0);
 
         nxt_atomic_fetch_add(&ctx.gen, 1);
 
@@ -242,19 +252,19 @@ nxt_port_uuz_test_race(nxt_thread_t *thr)
              * A racer that won still holds a reference; wait for it.  It
              * cannot be held for long -- every winner drops immediately.
              */
-            while (ctx.port->use_count != 0) {
+            while (nxt_port_uuz_load(&ctx.port->use_count) != 0) {
                 nxt_thread_yield();
             }
         }
 
         /* From here on no lookup may produce a reference. */
-        ctx.released = 1;
+        nxt_port_uuz_store(&ctx.released, 1);
 
-        while (ctx.done != NXT_PORT_UUZ_RACERS) {
+        while (nxt_port_uuz_load(&ctx.done) != NXT_PORT_UUZ_RACERS) {
             nxt_thread_yield();
         }
 
-        if (nxt_slow_path(ctx.port->use_count != 0)) {
+        if (nxt_slow_path(nxt_port_uuz_load(&ctx.port->use_count) != 0)) {
             nxt_log_alert(thr->log, "port use_unless_zero test: use_count is "
                           "%A after round %ui, expected 0",
                           ctx.port->use_count, round);
@@ -271,7 +281,7 @@ nxt_port_uuz_test_race(nxt_thread_t *thr)
         }
     }
 
-    ctx.stop = 1;
+    nxt_port_uuz_store(&ctx.stop, 1);
     nxt_atomic_fetch_add(&ctx.gen, 1);
 
     for (i = 0; i < NXT_PORT_UUZ_RACERS; i++) {
@@ -307,7 +317,7 @@ nxt_port_uuz_racer(void *data)
 
     for ( ;; ) {
         for ( ;; ) {
-            gen = ctx->gen;
+            gen = nxt_port_uuz_load(&ctx->gen);
 
             if (gen != last_gen) {
                 break;
@@ -318,7 +328,7 @@ nxt_port_uuz_racer(void *data)
 
         last_gen = gen;
 
-        if (ctx->stop) {
+        if (nxt_port_uuz_load(&ctx->stop)) {
             return NULL;
         }
 
@@ -327,7 +337,7 @@ nxt_port_uuz_racer(void *data)
          * unambiguously after it decides what the outcome is allowed to be:
          * a try-ref after the drop must always be refused.
          */
-        late = (ctx->released != 0);
+        late = (nxt_port_uuz_load(&ctx->released) != 0);
 
         if (nxt_port_use_unless_zero(ctx->port)) {
             if (late) {
