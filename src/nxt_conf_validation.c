@@ -151,6 +151,8 @@ static nxt_int_t nxt_conf_vldt_requests(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_restored_range(nxt_conf_validation_t *vldt,
     const char *name, int64_t min, int64_t max, const char *effect);
+static nxt_int_t nxt_conf_vldt_size(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_threads(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_thread_stack_size(nxt_conf_validation_t *vldt,
@@ -429,15 +431,23 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_http_members[] = {
     }, {
         .name       = nxt_string("large_header_buffer_size"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_size,
+        .u.string   = "large_header_buffer_size",
     }, {
         .name       = nxt_string("large_header_buffers"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_size,
+        .u.string   = "large_header_buffers",
     }, {
         .name       = nxt_string("body_buffer_size"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_size,
+        .u.string   = "body_buffer_size",
     }, {
         .name       = nxt_string("max_body_size"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_size,
+        .u.string   = "max_body_size",
     }, {
         .name       = nxt_string("body_temp_path"),
         .type       = NXT_CONF_VLDT_STRING,
@@ -517,6 +527,8 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_websocket_members[] = {
     }, {
         .name       = nxt_string("max_frame_size"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_size,
+        .u.string   = "max_frame_size",
     },
 
     NXT_CONF_VLDT_END
@@ -561,6 +573,8 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_compressor_members[] = {
     }, {
         .name       = nxt_string("min_length"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_size,
+        .u.string   = "min_length",
     },
 
     NXT_CONF_VLDT_END
@@ -1415,6 +1429,8 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_app_limits_members[] = {
     }, {
         .name       = nxt_string("shm"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_size,
+        .u.string   = "shm",
     },
 
     NXT_CONF_VLDT_END
@@ -2942,6 +2958,59 @@ nxt_conf_vldt_restored_range(nxt_conf_validation_t *vldt, const char *name,
                          effect);
 
     vldt->pointer = pointer;
+
+    return NXT_OK;
+}
+
+
+/*
+ * A size option.  The number must be from 0 to NXT_SIZE_T_MAX
+ * (NXT_CONF_SIZE_BOUND in src/nxt_conf.h).  It is compared as a double: a
+ * conversion to an integer type first is undefined for a number out of range.
+ *
+ * Earlier versions accepted a negative size, and NXT_CONF_MAP_SIZE gave a
+ * size near SIZE_MAX.  A stored configuration with one is still loaded, with
+ * a warning, as nxt_controller_start() does for the encoding.  Else unitd
+ * would start with no configuration at all.  The control API refuses a
+ * negative size: vldt->restored is set only for the stored configuration.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_size(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
+    void *data)
+{
+    double      size;
+    nxt_str_t   pointer;
+    const char  *name;
+
+    name = data;
+    size = nxt_conf_get_number(value);
+
+    if (size < 0) {
+        if (vldt->restored && size >= -(double) NXT_CONF_SIZE_BOUND) {
+            pointer = vldt->pointer;
+            nxt_conf_vldt_render_pointer(vldt);
+
+            nxt_thread_log_error(NXT_LOG_WARN, "the restored configuration "
+                                 "has a negative \"%s\" at \"%V\".  The "
+                                 "control API now refuses it.  It is kept, "
+                                 "and it works as before; correct it to be "
+                                 "able to update the configuration.",
+                                 name, &vldt->pointer);
+
+            vldt->pointer = pointer;
+
+            return NXT_OK;
+        }
+
+        return nxt_conf_vldt_error(vldt, "The \"%s\" number must not be "
+                                   "negative.", name);
+    }
+
+    if (size >= (double) NXT_CONF_SIZE_BOUND) {
+        return nxt_conf_vldt_error(vldt, "The \"%s\" number must be less "
+                                   "than %uL.", name, NXT_CONF_SIZE_BOUND);
+    }
 
     return NXT_OK;
 }

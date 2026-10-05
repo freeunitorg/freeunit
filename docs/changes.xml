@@ -10,6 +10,21 @@
          date="2026-10-04" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="change">
+<para>
+the size options "large_header_buffer_size", "large_header_buffers",
+"body_buffer_size" and "max_body_size" in "settings/http", "max_frame_size" in
+"settings/http/websocket", "min_length" of a compressor, and the "shm" limit of
+an application now must not be negative.  With a 32-bit size_t they must also
+be less than 2147483648.  Before, a negative value became a very large size,
+and a value out of the range of ssize_t gave an undefined result.  A stored
+configuration from an earlier version that has a negative value is still
+loaded, with a warning; the control API refuses to store a new one.  With a
+32-bit size_t a stored value of 2147483648 or more, or less than -2147483648,
+is refused, and unitd starts with no configuration until it is corrected.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 with a 32-bit size_t, the memory pool did not check the sum of a large size,
