@@ -12,6 +12,18 @@
 
 <change type="bugfix">
 <para>
+with a 32-bit size_t, the memory pool did not check the sum of a large size,
+its alignment and its block header.  A request for 4294967269 to 4294967294
+bytes made a block of 0 to 24 bytes.  The buffer allocators added their header
+to a size without a check too.  These sums now use checked arithmetic, and such
+a request fails.  The same is done for the length of a configuration printed
+as JSON and for the request body buffer.  No path is known by which a client or
+an application gives such a size.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 an application could get the websocket frames of a client in the wrong order.
 The router puts each frame into shared memory.  When it starts a new segment,
 the application has to ask for it, and libunit kept the frame aside until the

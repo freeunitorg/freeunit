@@ -8,6 +8,7 @@
 
 #include <nxt_main.h>
 #include <nxt_conf.h>
+#include <nxt_checked.h>
 
 #include <float.h>
 #include <math.h>
@@ -2371,6 +2372,27 @@ nxt_conf_json_parse_error(nxt_conf_json_error_t *error, u_char *pos,
 }
 
 
+/* Adds n to len.  A sum that does not fit in size_t gives SIZE_MAX. */
+
+nxt_inline size_t
+nxt_conf_json_length_add(size_t len, size_t n)
+{
+    size_t  sum;
+
+    if (nxt_slow_path(nxt_size_add(len, n, &sum) != 0)) {
+        return SIZE_MAX;
+    }
+
+    return sum;
+}
+
+
+/*
+ * Returns SIZE_MAX if the length does not fit in size_t.  An escaped control
+ * byte takes six bytes, so the printed value can be six times longer than
+ * the value in memory.  No allocation of SIZE_MAX bytes succeeds.
+ */
+
 size_t
 nxt_conf_json_length(const nxt_conf_value_t *value,
     nxt_conf_json_pretty_t *pretty)
@@ -2445,7 +2467,8 @@ nxt_conf_json_string_length(const nxt_conf_value_t *value)
 
     nxt_conf_get_string(value, &str);
 
-    return 2 + nxt_conf_json_escape_length(str.start, str.length);
+    return nxt_conf_json_length_add(2, nxt_conf_json_escape_length(str.start,
+                                                                   str.length));
 }
 
 
@@ -2486,11 +2509,12 @@ nxt_conf_json_array_length(const nxt_conf_value_t *value,
     value = array->elements;
 
     for (n = 0; n < array->count; n++) {
-        len += nxt_conf_json_length(&value[n], pretty);
+        len = nxt_conf_json_length_add(len,
+                                       nxt_conf_json_length(&value[n], pretty));
 
         if (pretty != NULL) {
             /* Indentation and new line. */
-            len += pretty->level + 2;
+            len = nxt_conf_json_length_add(len, pretty->level + 2);
         }
     }
 
@@ -2499,12 +2523,12 @@ nxt_conf_json_array_length(const nxt_conf_value_t *value,
 
         if (n != 0) {
             /* Indentation and new line. */
-            len += pretty->level + 2;
+            len = nxt_conf_json_length_add(len, pretty->level + 2);
         }
     }
 
     /* Reserve space for "n" commas. */
-    return len + n;
+    return nxt_conf_json_length_add(len, n);
 }
 
 
@@ -2581,15 +2605,19 @@ nxt_conf_json_object_length(const nxt_conf_value_t *value,
     member = object->members;
 
     for (n = 0; n < object->count; n++) {
-        len += nxt_conf_json_string_length(&member[n].name) + 1
-               + nxt_conf_json_length(&member[n].value, pretty) + 1;
+        /* The name, ":", the value, and ",". */
+        len = nxt_conf_json_length_add(len,
+                               nxt_conf_json_string_length(&member[n].name));
+        len = nxt_conf_json_length_add(len,
+                               nxt_conf_json_length(&member[n].value, pretty));
+        len = nxt_conf_json_length_add(len, 2);
 
         if (pretty != NULL) {
             /*
              * Indentation, space after ":", new line, and possible
              * additional empty line between non-empty objects.
              */
-            len += pretty->level + 1 + 2 + 2;
+            len = nxt_conf_json_length_add(len, pretty->level + 1 + 2 + 2);
         }
     }
 
@@ -2597,7 +2625,7 @@ nxt_conf_json_object_length(const nxt_conf_value_t *value,
         pretty->level--;
 
         /* Indentation and new line. */
-        len += pretty->level + 2;
+        len = nxt_conf_json_length_add(len, pretty->level + 2);
     }
 
     return len;
@@ -2688,7 +2716,7 @@ nxt_conf_json_escape_length(u_char *p, size_t size)
         ch = *p++;
 
         if (ch == '\\' || ch == '"') {
-            len++;
+            len = nxt_conf_json_length_add(len, 1);
 
         } else if (ch <= 0x1F) {
 
@@ -2698,11 +2726,11 @@ nxt_conf_json_escape_length(u_char *p, size_t size)
             case '\t':
             case '\b':
             case '\f':
-                len++;
+                len = nxt_conf_json_length_add(len, 1);
                 break;
 
             default:
-                len += sizeof("\\u001F") - 2;
+                len = nxt_conf_json_length_add(len, sizeof("\\u001F") - 2);
             }
         }
 

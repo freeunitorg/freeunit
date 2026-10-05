@@ -22,6 +22,7 @@
 #include <nxt_app_queue.h>
 #include <nxt_port_queue.h>
 #include <nxt_span.h>
+#include <nxt_checked.h>
 #include <nxt_http_compression.h>
 
 #if (NXT_HAVE_OTEL)
@@ -3002,7 +3003,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     u_char *start, u_char *end)
 {
     u_char                      *p;
-    size_t                      size;
+    size_t                      size, app_size;
     nxt_mp_t                    *mp, *app_mp;
     uint32_t                    next, next_target;
     nxt_int_t                   ret;
@@ -3124,12 +3125,20 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 
             size = nxt_conf_json_length(application, NULL);
 
+            /* The nxt_app_t, the name, and the configuration. */
+            if (nxt_slow_path(nxt_size_add(sizeof(nxt_app_t) + name.length,
+                                           size, &app_size)
+                              != 0))
+            {
+                goto fail;
+            }
+
             app_mp = nxt_mp_create(4096, 128, 1024, 64);
             if (nxt_slow_path(app_mp == NULL)) {
                 goto fail;
             }
 
-            app = nxt_mp_get(app_mp, sizeof(nxt_app_t) + name.length + size);
+            app = nxt_mp_get(app_mp, app_size);
             if (app == NULL) {
                 goto app_fail;
             }

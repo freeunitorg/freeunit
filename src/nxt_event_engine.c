@@ -5,6 +5,7 @@
  */
 
 #include <nxt_main.h>
+#include <nxt_checked.h>
 
 
 typedef struct nxt_mem_cache_block_s  nxt_mem_cache_block_t;
@@ -682,12 +683,17 @@ done:
 void *
 nxt_event_engine_buf_mem_alloc(nxt_event_engine_t *engine, size_t size)
 {
-    nxt_buf_t  *b;
+    size_t     total;
     uint8_t    hint;
+    nxt_buf_t  *b;
+
+    if (nxt_slow_path(nxt_size_add(NXT_BUF_MEM_SIZE, size, &total) != 0)) {
+        return NULL;
+    }
 
     hint = NXT_EVENT_ENGINE_NO_MEM_HINT;
 
-    b = nxt_event_engine_mem_alloc(engine, &hint, NXT_BUF_MEM_SIZE + size);
+    b = nxt_event_engine_mem_alloc(engine, &hint, total);
     if (nxt_slow_path(b == NULL)) {
         return NULL;
     }

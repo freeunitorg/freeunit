@@ -8,6 +8,7 @@
 #include <nxt_router.h>
 #include <nxt_conf.h>
 #include <nxt_http.h>
+#include <nxt_checked.h>
 
 
 typedef struct {
@@ -357,7 +358,12 @@ nxt_router_access_log_json(nxt_task_t *task, nxt_http_request_t *r,
         nxt_conf_set_member_string(value, &member->name, &str, i);
     }
 
-    size = nxt_conf_json_length(value, NULL) + 1;
+    /* The record and "\n". */
+    if (nxt_slow_path(nxt_size_add(nxt_conf_json_length(value, NULL), 1, &size)
+                      != 0))
+    {
+        return NXT_ERROR;
+    }
 
     p = nxt_mp_nget(r->mem_pool, size);
     if (nxt_slow_path(p == NULL)) {
