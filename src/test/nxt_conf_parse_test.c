@@ -150,7 +150,20 @@ nxt_http_route_addr_test(nxt_thread_t *thr)
 
 
 
-/* Packed: the fields after "flag" are misaligned, for UBSan to catch. */
+/*
+ * Packed: the fields after "flag" are misaligned, for UBSan to catch.  Clang
+ * reports the nxt_str_t members with -Wunaligned-access on targets without
+ * unaligned access, such as ARMv6.  That misalignment is the purpose here.
+ * Clang 13 and older do not know the option and reject its name under
+ * -Werror, so it is ignored only where it exists.
+ */
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#if __has_warning("-Wunaligned-access")
+#pragma clang diagnostic ignored "-Wunaligned-access"
+#endif
+#endif
 
 typedef struct {
     uint8_t     flag;
@@ -168,6 +181,10 @@ typedef struct {
     uint8_t     bad8;
     int32_t     bad32;
 } nxt_packed nxt_conf_map_test_t;
+
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 
 #define nxt_conf_map_test_field(field, type)                                  \
