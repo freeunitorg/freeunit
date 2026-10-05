@@ -57,6 +57,15 @@ worker starts.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+with "large_header_buffers" set to 256 or more, the limit did not work.  The
+router counted the large buffers of a request header in 8 bits, so the count
+went back to 0 after 255.  A request header with many fields could then take
+memory until "header_read_timeout" ended it.  The bug had appeared in 1.29.0.
+</para>
+</change>
+
 </changes>
 
 

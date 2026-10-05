@@ -32,7 +32,7 @@ struct nxt_h1proto_s {
     nxt_http_chunk_parse_t    chunked_parse;
     nxt_off_t                 remainder;
 
-    uint8_t                   nbuffers;
+    size_t                    nbuffers;
     uint8_t                   header_buffer_slot;
     uint8_t                   large_buffer_slot;
     uint8_t                   keepalive;            /* 1 bit  */
