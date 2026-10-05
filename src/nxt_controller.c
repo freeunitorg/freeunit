@@ -414,6 +414,9 @@ nxt_controller_start(nxt_task_t *task, nxt_process_data_t *data)
     vldt.conf_pool = mp;
     vldt.ver = nxt_conf_ver;
 
+    /* nxt_conf_vldt_size() keeps a stored negative size, with a warning. */
+    vldt.restored = 1;
+
     /*
      * nxt_conf_vldt_app_shm() keeps a stored "shm" that is out of
      * range.
@@ -3090,6 +3093,8 @@ nxt_controller_conf_store(nxt_task_t *task, nxt_conf_value_t *conf)
 
     size = nxt_conf_json_length(conf, NULL);
     if (nxt_slow_path(size == SIZE_MAX)) {
+        nxt_alert(task, "failed to store current configuration: "
+                  "it is too large");
         return;
     }
 
