@@ -13,7 +13,9 @@
 # NXT_VERSION must be X.Y.Z.  Then each row of version-sites is checked by
 # its kind, as that file describes.  For "dockerfiles", "make dockerfiles"
 # runs in a temporary copy, and a Dockerfile in the tree that differs, is
-# missing, or is no longer generated is an error.
+# missing, or is no longer generated is an error.  The rows also hold
+# pins: versions that are not the release version, but must agree across
+# files.
 #
 # Run it from anywhere in the tree.  It needs sh, sed, awk, grep, make and
 # jq.  It changes no file and uses no network.
@@ -79,6 +81,12 @@ crate() {
 locked() {
     awk -v n="name = \"$2\"" '$0 == n { f = 1; next }
          f && /^version = / { gsub(/^version = "|"$/, ""); print; exit }' "$1"
+}
+
+# The X.Y.Z values that follow the extended regular expression $2 in $1.
+pins() {
+    grep -oE -e "$2[0-9]+\.[0-9]+\.[0-9]+" "$1" \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+$' || true
 }
 
 # Run "make dockerfiles" for directory $1 in a copy and compare.
@@ -201,6 +209,32 @@ while IFS=$tab read -r path kind a1 a2; do
                 err "$a1: $n stanzas with ver=\"$v\", expected 2"
             fi
         done ;;
+    pin-source|pin)
+        case $a1 in
+        ''|*[!a-z0-9_]*)
+            err "$sites: bad pin name \"$a1\" for $path"
+            continue ;;
+        esac
+        got=$(pins "$path" "$a2" | sort -u)
+        if [ "$kind" = pin-source ]; then
+            if [ "$(printf '%s\n' "$got" | grep -c .)" != 1 ]; then
+                err "$path: pin $a1 source gives \"$got\", expected one X.Y.Z"
+                continue
+            fi
+            eval "pin_$a1=\$got"
+            continue
+        fi
+        eval "want=\${pin_$a1:-}"
+        if [ -z "$want" ]; then
+            err "$sites: pin $a1 is used by $path before its pin-source row"
+        elif [ -z "$got" ]; then
+            err "$path: no pin $a1 after \"$a2\""
+        else
+            for v in $got; do
+                [ "$v" = "$want" ] \
+                    || err "$path: pin $a1 is $v after \"$a2\", the source has $want"
+            done
+        fi ;;
     *)
         err "$sites: unknown kind \"$kind\" for $path" ;;
     esac
