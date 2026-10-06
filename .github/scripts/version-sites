@@ -1,0 +1,73 @@
+# The files that carry the FreeUnit release version.
+#
+# This is the only list.  .github/scripts/check-version.sh checks every row,
+# tools/bump-version.sh edits the rows it can, and RELEASE-PROCESS.md points
+# here.  A new site needs one row here and nothing else.
+#
+# One row per site: the path, the kind, and up to two arguments, separated
+# by one tab.  Lines that start with "#" and empty lines are ignored.  The
+# version is NXT_VERSION from the "version" file.
+#
+#   line PREFIX [SUFFIX]  Each such line is PREFIX, the version, then
+#                         SUFFIX.  PREFIX and SUFFIX are sed basic regular
+#                         expressions without "#"; write a trailing space
+#                         as "[ ]".  Edited by the script.  PREFIX and
+#                         SUFFIX are two fields, so the tab between them
+#                         is where the version goes; a tab inside PREFIX
+#                         or SUFFIX is not possible.  They must not
+#                         contain a \( \) group: bump-version.sh puts
+#                         each one in a group and writes them back as
+#                         \1 and \2, and an inner group shifts the numbers.
+#   vernum PREFIX         The line is PREFIX, then NXT_VERNUM.  Edited.
+#   cargo-package         The [package] version of a Cargo.toml.  Edited.
+#   cargo-lock CRATE      The version of CRATE in a Cargo.lock.  Edited.
+#   dockerfiles           "make dockerfiles" in this directory produces the
+#                         Dockerfiles in the tree.  The script runs it.
+#   changelog-md          A "## [X.Y.Z]" section, its link, and an [Unreleased]
+#                         link that compares from unitctl/X.Y.Z.  By hand.
+#   security-md           A table row for X.Y.x whose status cell is
+#                         exactly "✅ Active" or "✅ LTS", and exactly
+#                         one row that says "✅ Active".  By hand.
+#   changes XML           A "Changes with FreeUnit X.Y.Z" block, and two
+#                         stanzas in XML for it and for the top block of
+#                         this file.  By hand.
+
+# The source.  configure, auto/make and the pkg Makefiles read it.  These
+# rows come first: bump-version.sh edits the rows in order, and "make
+# dockerfiles" reads this file.
+version	line	NXT_VERSION=
+version	vernum	NXT_VERNUM=
+
+# The title of the control API spec.  unitctl generates its client from it.
+docs/unit-openapi.yaml	line	  title: "FreeUnit[ ]	 (ex NGINX Unit)"
+
+# unitctl and its two library crates are versioned with FreeUnit.  The
+# unitctl/X.Y.Z tag and the release binaries take this number.
+tools/unitctl/unitctl/Cargo.toml	cargo-package
+tools/unitctl/unit-client-rs/Cargo.toml	cargo-package
+tools/unitctl/unit-openapi/Cargo.toml	cargo-package
+
+# Cargo rewrites a stale entry when it builds, and "cargo build --locked"
+# fails on it.
+tools/unitctl/Cargo.lock	cargo-lock	unitctl
+tools/unitctl/Cargo.lock	cargo-lock	unit-client-rs
+tools/unitctl/Cargo.lock	cargo-lock	unit-openapi
+
+# openapi-generator writes packageVersion into the generated crate, and
+# writes the README line from it.  The README is committed.
+tools/unitctl/openapi-config.json	line	  "packageVersion": "	",
+tools/unitctl/unit-openapi/README.md	line	- Package version:[ ]
+
+# The Dockerfiles clone the release and label the image with it.
+pkg/docker	dockerfiles
+
+# The hand-written builder Dockerfiles in pkg/docker/local/ are not
+# generated.  Each one sets the default of its UNIT_VERSION argument.
+pkg/docker/local/Dockerfile.minimal	line	ARG UNIT_VERSION=
+pkg/docker/local/Dockerfile.php-8.5	line	ARG UNIT_VERSION=
+pkg/docker/local/Dockerfile.wasm	line	ARG UNIT_VERSION=
+
+# Release notes and the support table, written by a person.
+tools/unitctl/CHANGELOG.md	changelog-md
+SECURITY.md	security-md
+CHANGES	changes	docs/changes.xml

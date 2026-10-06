@@ -55,3 +55,10 @@ jobs:
         then
           exit 2
         fi
+
+    # Every file that carries the release version agrees with the version
+    # file, and the generated Dockerfiles are up to date.  It needs no
+    # network.  It runs even when the whitespace check fails.
+    - name: Check the release version sites
+      if: ${{ !cancelled() }}
+      run: sh .github/scripts/check-version.sh
