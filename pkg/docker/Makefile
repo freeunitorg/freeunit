@@ -123,7 +123,7 @@ Dockerfile.%: ../../version template.Dockerfile
 
 build-%: Dockerfile.%
 	docker pull $(CONTAINER_$*)
-	docker build --no-cache -t unit:$(VERSION)-$* -f Dockerfile.$* .
+	docker build --no-cache --build-arg UNIT_VERSION=$(VERSION) -t unit:$(VERSION)-$* -f Dockerfile.$* .
 	touch $@
 
 # TODO(#milestone-1.35.8): uncomment and update GitFetch when publishing to
