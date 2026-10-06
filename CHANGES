@@ -1,6 +1,12 @@
 
 Changes with FreeUnit 1.37.1                                     04 Oct 2026
 
+    *) Bugfix: with "chunked_transform", a valid chunked request body got
+       400 when a read ended right after the data of a chunk, before the
+       CRLF after it. The data stayed in the read buffer, and the next read
+       was parsed after it. So the result depended on how the client's
+       writes reached the server. The bug had appeared in 1.35.5.
+
     *) Bugfix: unitd did not load the stored configuration when the
        "version" file in the state directory ended with a line end, as
        "echo 13700 > version" and most editors write it. It logged

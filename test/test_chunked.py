@@ -167,6 +167,47 @@ def test_chunked_malformed_later_read():
     assert elapsed < 3, elapsed
 
 
+def test_chunked_read_ends_after_chunk_data():
+    # A read that ended right after the chunk data, before its CRLF, left
+    # that data in the read buffer.  The next read was parsed after it, so
+    # the parser found "h" where the CRLF must be, and the request got 400.
+    # https://github.com/freeunitorg/freeunit/issues/543
+    head = (
+        b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+        b'Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n'
+    )
+
+    def send(writes, expect_body):
+        sock = client.http(writes[0], raw=True, no_recv=True)
+
+        # The pause puts each write in its own read.
+        for w in writes[1:]:
+            time.sleep(0.3)
+            sock.sendall(w)
+
+        resp = client.recvall(sock, read_timeout=10)
+        sock.close()
+
+        assert resp.startswith(b'HTTP/1.1 200 '), (writes, resp)
+        assert resp.endswith(b'\r\n\r\n' + expect_body), (writes, resp)
+
+    # The read after the header read ends after the chunk data.
+    send([head, b'5\r\nhello', b'\r\n0\r\n\r\n'], b'hello')
+
+    # The same, with a second chunk after the CRLF.
+    send(
+        [head, b'5\r\nhello', b'\r\n6\r\nworld!', b'\r\n0\r\n\r\n'],
+        b'helloworld!',
+    )
+
+    # The header read itself ends after the chunk data.
+    send([head + b'5\r\nhello', b'\r\n0\r\n\r\n'], b'hello')
+
+    # Controls: the read ends inside the data, or after its CRLF.
+    send([head, b'5\r\nhel', b'lo\r\n0\r\n\r\n'], b'hello')
+    send([head, b'5\r\nhello\r\n', b'0\r\n\r\n'], b'hello')
+
+
 def test_chunked_after_last():
     resp = client.get(
         headers={

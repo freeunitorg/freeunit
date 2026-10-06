@@ -398,6 +398,13 @@ nxt_http_chunk_buffer(nxt_http_chunk_parse_t *hcp, nxt_buf_t ***tail,
     hcp->chunk_size -= size;
 
     if (hcp->chunk_size == 0) {
+        /*
+         * The whole chunk data is in the output buffer.  Consume it, so
+         * that a caller that keeps the bytes after pos for the next read
+         * does not parse the data again as framing.
+         */
+        in->mem.pos = in->mem.free;
+
         return NXT_HTTP_CHUNK_END_ON_BORDER;
     }
 
