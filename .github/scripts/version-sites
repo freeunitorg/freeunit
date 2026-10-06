@@ -31,6 +31,14 @@
 #   changes XML           A "Changes with FreeUnit X.Y.Z" block, and two
 #                         stanzas in XML for it and for the top block of
 #                         this file.  By hand.
+#
+# Pins: a version that is not the release version, but must be the same in
+# several files.  bump-version.sh does not touch them.
+#
+#   pin-source NAME ERE   The pin NAME is the X.Y.Z that follows the
+#                         extended regular expression ERE in this file.
+#   pin NAME ERE          Every X.Y.Z that follows ERE in this file is the
+#                         pin NAME, and there is at least one.
 
 # The source.  configure, auto/make and the pkg Makefiles read it.  These
 # rows come first: bump-version.sh edits the rows in order, and "make
@@ -71,3 +79,18 @@ pkg/docker/local/Dockerfile.wasm	line	ARG UNIT_VERSION=
 tools/unitctl/CHANGELOG.md	changelog-md
 SECURITY.md	security-md
 CHANGES	changes	docs/changes.xml
+
+# Pin "rust": the Rust toolchain of the Docker images.  The 30 generated
+# Dockerfiles take it from the template.  The builder images are tagged
+# with it, and the files below name those tags or install the same Rust.
+pkg/docker/template.Dockerfile	pin-source	rust	RUST_VERSION=
+pkg/docker/Dockerfile.builder-trixie	pin	rust	--default-toolchain[ ]
+pkg/docker/Dockerfile.builder-php8.5	pin	rust	--default-toolchain[ ]
+pkg/docker/local/Dockerfile.minimal	pin	rust	freeunit-builder:[a-z0-9.]+-rust
+pkg/docker/local/Dockerfile.php-8.5	pin	rust	freeunit-builder:[a-z0-9.]+-rust
+pkg/docker/local/Dockerfile.wasm	pin	rust	freeunit-builder:[a-z0-9.]+-rust
+pkg/docker/build-local.sh	pin	rust	freeunit-builder:[a-z0-9.]+-rust
+pkg/docker/README.md	pin	rust	freeunit-builder:[a-z0-9.]+-rust
+test/README.md	pin	rust	freeunit-builder:[a-z0-9.]+-rust
+test/README.md	pin	rust	Rust[ ]
+test/run-local.sh	pin	rust	RUST_VERSION=

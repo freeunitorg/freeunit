@@ -83,7 +83,8 @@ while IFS=$tab read -r path kind a1 a2; do
         env -i PATH="$PATH" make -s -B -C "$path" dockerfiles \
             < /dev/null > /dev/null ;;
     *)
-        # Written by a person; check-version.sh reports them.
+        # Written by a person, or a pin that is not the release
+        # version.  check-version.sh reports them.
         ;;
     esac
 done < "$sites"
