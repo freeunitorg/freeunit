@@ -97,7 +97,7 @@ NXT_EXPORT u_char *nxt_memcasestrn(const u_char *s, const u_char *end,
     const char *ss, size_t length);
 NXT_EXPORT u_char *nxt_rmemstrn(const u_char *s, const u_char *end,
     const char *ss, size_t length);
-NXT_EXPORT size_t nxt_str_strip(const u_char *start, u_char *end);
+NXT_EXPORT size_t nxt_str_strip(const u_char *start, const u_char *end);
 
 
 typedef struct {
