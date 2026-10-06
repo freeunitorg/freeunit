@@ -213,4 +213,26 @@ NXT_EXPORT nxt_int_t nxt_app_set_logs(void);
 /* Reports a reaped child of the prototype; see nxt_proto_sigchld_handler(). */
 void nxt_proto_child_exited(nxt_task_t *task, nxt_process_t *process);
 
+
+/*
+ * libunit takes the "shm" limit as a uint32_t: nxt_unit_default_init() and
+ * nxt_external_start() pass it on.  The validator refuses a larger "shm",
+ * but a stored configuration can still have one, and a negative "shm" maps
+ * to a size near SIZE_MAX.  Such an application gets the largest limit, not
+ * the low 32 bits of the number.
+ */
+
+nxt_inline size_t
+nxt_app_shm_limit(size_t limit)
+{
+#if (NXT_SIZE_T_SIZE > 4)
+    if (limit > UINT32_MAX) {
+        return UINT32_MAX;
+    }
+#endif
+
+    return limit;
+}
+
+
 #endif /* _NXT_APPLICATION_H_INCLIDED_ */

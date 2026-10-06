@@ -37,9 +37,9 @@
  *
  * libunit assigns ids as append-only indices into its outgoing array and
  * refuses to create a segment once that array reaches shm_mmap_limit, which
- * is shm_limit / PORT_MMAP_DATA_SIZE computed in uint32_t.  So no conforming
- * peer can exceed floor(UINT32_MAX / PORT_MMAP_DATA_SIZE), whatever the
- * configured shm limit.
+ * is the uint32_t shm_limit / PORT_MMAP_DATA_SIZE, rounded up
+ * (nxt_unit_shm_mmap_limit()).  So no conforming peer can exceed
+ * floor(UINT32_MAX / PORT_MMAP_DATA_SIZE), whatever the configured shm limit.
  *
  * Derived from the geometry rather than written out, because
  * NXT_MMAP_TINY_CHUNK changes PORT_MMAP_DATA_SIZE by four orders of
