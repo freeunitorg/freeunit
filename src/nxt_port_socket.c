@@ -1946,7 +1946,11 @@ nxt_port_read_handler(nxt_task_t *task, void *obj, void *data)
         if (n == NXT_AGAIN) {
             nxt_port_buf_free(port, b);
 
-            nxt_fd_event_enable_read(task->thread->engine, &port->socket);
+            /* See the comment in nxt_port_queue_read_handler(). */
+            if (!nxt_fd_event_is_active(port->socket.read)) {
+                nxt_fd_event_enable_read(task->thread->engine, &port->socket);
+            }
+
             return;
         }
 
@@ -2248,7 +2252,16 @@ nxt_port_queue_read_handler(nxt_task_t *task, void *obj, void *data)
         if (n == NXT_AGAIN) {
             nxt_port_buf_free(port, b);
 
-            nxt_fd_event_enable_read(task->thread->engine, &port->socket);
+            /*
+             * An active read event stays registered, so EAGAIN needs no
+             * re-arm: the next datagram raises a new event.  On epoll the
+             * enable is an EPOLL_CTL_MOD even when the event is active, and
+             * this point is reached once per drain of the port.  Enable only
+             * an event that is not active.
+             */
+            if (!nxt_fd_event_is_active(port->socket.read)) {
+                nxt_fd_event_enable_read(task->thread->engine, &port->socket);
+            }
 
             continue;
         }

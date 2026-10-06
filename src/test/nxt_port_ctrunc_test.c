@@ -587,6 +587,7 @@ nxt_port_ctrunc_test_marked(nxt_thread_t *thr, nxt_socket_t *pair)
 #if (NXT_HAVE_UCRED)
 
 static nxt_uint_t  nxt_port_ctrunc_test_delivered;
+static nxt_uint_t  nxt_port_ctrunc_test_enables;
 
 
 static void
@@ -605,7 +606,16 @@ static void
 nxt_port_ctrunc_test_enable_read_stub(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev)
 {
-    /* The fixture engine polls nothing. */
+    /*
+     * The fixture engine polls nothing.  Count the calls, and leave the
+     * event active as a real engine does.  A drain that ends with EAGAIN
+     * must not re-arm an active read event: on epoll that costs an
+     * epoll_ctl() call per drain.
+     */
+
+    nxt_port_ctrunc_test_enables++;
+
+    ev->read = NXT_EVENT_ACTIVE;
 }
 
 
@@ -755,6 +765,7 @@ nxt_port_ctrunc_test_queue(nxt_thread_t *thr)
     nxt_port_msg_t             port_msg;
     nxt_port_queue_t          *queue;
     nxt_event_engine_t        *engine, *saved_engine;
+    nxt_uint_t                 enables;
     nxt_nncq_atomic_t          nitems;
 
     task = thr->task;
@@ -866,7 +877,15 @@ nxt_port_ctrunc_test_queue(nxt_thread_t *thr)
 
     nxt_port_ctrunc_test_delivered = 0;
 
+    enables = nxt_port_ctrunc_test_enables;
+
     port->socket.read_handler(task, &port->socket, NULL);
+
+    if (nxt_port_ctrunc_test_enables != enables) {
+        nxt_log_alert(thr->log, "port ctrunc test: drain 1 re-armed "
+                      "an active read event");
+        goto done;
+    }
 
     if (nxt_port_ctrunc_test_delivered != 0) {
         nxt_log_alert(thr->log, "port ctrunc test: a message with an "
@@ -903,7 +922,15 @@ nxt_port_ctrunc_test_queue(nxt_thread_t *thr)
 
     port->socket.read_ready = 1;
 
+    enables = nxt_port_ctrunc_test_enables;
+
     port->socket.read_handler(task, &port->socket, NULL);
+
+    if (nxt_port_ctrunc_test_enables != enables) {
+        nxt_log_alert(thr->log, "port ctrunc test: drain 2 re-armed "
+                      "an active read event");
+        goto done;
+    }
 
     if (nxt_port_ctrunc_test_delivered != 1) {
         nxt_log_alert(thr->log, "port ctrunc test: the message after a "
@@ -951,7 +978,15 @@ nxt_port_ctrunc_test_queue(nxt_thread_t *thr)
 
     port->socket.read_ready = 1;
 
+    enables = nxt_port_ctrunc_test_enables;
+
     port->socket.read_handler(task, &port->socket, NULL);
+
+    if (nxt_port_ctrunc_test_enables != enables) {
+        nxt_log_alert(thr->log, "port ctrunc test: drain 3 re-armed "
+                      "an active read event");
+        goto done;
+    }
 
     if (nxt_port_ctrunc_test_delivered != 1) {
         nxt_log_alert(thr->log, "port ctrunc test: a message queued behind a "
