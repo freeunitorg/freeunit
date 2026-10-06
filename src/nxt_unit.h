@@ -228,7 +228,50 @@ nxt_unit_request_info_t *nxt_unit_dequeue_request(nxt_unit_ctx_t *ctx);
  */
 int nxt_unit_run_once(nxt_unit_ctx_t *ctx);
 
+/*
+ * Process one message from "port", for an integration that drives its own
+ * event loop.  The call does not wait for a message.  It returns:
+ *
+ * - NXT_UNIT_OK: call again.  The call processed a message, or it found
+ *   no message and a FINISH retry is pending.  Get the delay before the
+ *   next call from nxt_unit_detached_retry_timeout().
+ * - NXT_UNIT_AGAIN: do not call again until the port becomes readable.
+ *   The call found no message and no retry is pending, or the context is
+ *   offline after the call: a QUIT was processed, or a retry completed a
+ *   deferred graceful quit, or the retries gave up.
+ * - NXT_UNIT_ERROR: the worker is closing.  Do not call again.
+ *
+ * A QUIT runs the quit callback inside the call.  When that callback calls
+ * nxt_unit_done(), the context can be freed when the call returns.  So
+ * after NXT_UNIT_AGAIN or NXT_UNIT_ERROR the caller must not use ctx or
+ * port again.  Only after NXT_UNIT_OK may it call
+ * nxt_unit_detached_retry_timeout().
+ */
 int nxt_unit_process_port_msg(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port);
+
+/*
+ * Get the delay before the next nxt_unit_process_port_msg() call, in
+ * milliseconds, for an integration that drives its own event loop.  Use it
+ * only after nxt_unit_process_port_msg() returns NXT_UNIT_OK.  After
+ * NXT_UNIT_AGAIN or NXT_UNIT_ERROR the context can be freed already, see
+ * nxt_unit_process_port_msg().  NXT_UNIT_OK means "call again".  Usually
+ * the call processed a message and more can wait.  But the call also
+ * returns NXT_UNIT_OK when it found no message and a FINISH retry is
+ * pending (see nxt_unit_request_done_detached()).  Then the next retry is
+ * not due until a deadline, and a call before it only receives.
+ *
+ * The function returns:
+ *
+ * - -1: no retry is pending, or the context is offline.  Call again at
+ *   once, as for any NXT_UNIT_OK.
+ * - 0: call again at once.  The retry is due now, or the last
+ *   nxt_unit_process_port_msg() call on the context processed a message.
+ * - more than 0: the last call found no message.  Call again after this
+ *   many milliseconds, or earlier when the port becomes readable.
+ *
+ * The value is not more than INT_MAX.
+ */
+int nxt_unit_detached_retry_timeout(nxt_unit_ctx_t *ctx);
 
 /* Destroy application library object. */
 void nxt_unit_done(nxt_unit_ctx_t *);
@@ -331,6 +374,19 @@ void nxt_unit_request_done(nxt_unit_request_info_t *req, int rc);
  * may run detached work at once: the worker stays busy until the last of
  * them returns.  PHP's fastcgi_finish_request() is the caller this exists
  * for, and PHP runs one context.
+ *
+ * The report to the router can fail.  Then libunit retries it from its
+ * read loops and from nxt_unit_process_port_msg().  The router holds the
+ * worker busy until a retry succeeds.  In that time nothing wakes an
+ * integration that drives its own event loop.  So while a retry is
+ * pending, nxt_unit_process_port_msg() returns NXT_UNIT_OK, and not
+ * NXT_UNIT_AGAIN, to ask for the next call.  The call never waits for the
+ * retry backoff, because a wait would block the event loop.  It keeps a
+ * deadline instead, and a call before the deadline only receives.  An
+ * integration that calls again on NXT_UNIT_OK must not call at once each
+ * time, or its loop spins until the deadline.  It gets the delay for the
+ * next call from nxt_unit_detached_retry_timeout().  The retries give up
+ * after about 0.8 s and close the worker.
  */
 void nxt_unit_request_done_detached(nxt_unit_request_info_t *req, int rc);
 
@@ -424,10 +480,14 @@ uint8_t  nxt_unit_test_ctx_detached_unreported(nxt_unit_ctx_t *ctx);
 void     nxt_unit_test_ctx_detached_start(nxt_unit_ctx_t *ctx);
 void     nxt_unit_test_ctx_detached_done(nxt_unit_ctx_t *ctx);
 int      nxt_unit_test_ctx_detached_retry(nxt_unit_ctx_t *ctx);
+nxt_unit_port_t  *nxt_unit_test_ctx_read_port(nxt_unit_ctx_t *ctx);
+uint64_t nxt_unit_test_detached_now(void);
 uint8_t  nxt_unit_test_ctx_online(nxt_unit_ctx_t *ctx);
 uint8_t  nxt_unit_test_ctx_ready(nxt_unit_ctx_t *ctx);
 void     nxt_unit_test_ctx_set_ready(nxt_unit_ctx_t *ctx, uint8_t val);
 void     nxt_unit_test_ctx_quit_graceful(nxt_unit_ctx_t *ctx);
+int      nxt_unit_test_add_queue_port(nxt_unit_ctx_t *ctx, pid_t pid,
+    uint16_t id, int out_fd, void *queue);
 #endif
 
 #if (NXT_TESTS || NXT_FUZZ_BUILD)

@@ -549,3 +549,34 @@ def test_http_header_fields_keepalive_spill():
             assert f'HTTP_X_TEST_{i}' in got, f'keep-alive field {i} of {count}'
 
     sock.close()
+
+
+def test_http_header_large_buffers_above_255():
+    # The parser rewinds only to the start of an incomplete field, so a
+    # header of many short fields takes one large buffer for every few
+    # fields.  The first buffer has the default size of 2048 bytes and holds
+    # about 68 fields.  With 128-byte large buffers and 30-byte fields, 4
+    # fields fit in one buffer, so 1200 fields take about 283 large buffers
+    # and 1350 fields take about 320.  The count of
+    # buffers was 8 bits wide, so a limit of 256 or more never fired.
+    client.load('empty')
+
+    assert 'success' in client.conf(
+        {
+            'http': {
+                'large_header_buffer_size': 128,
+                'large_header_buffers': 300,
+            }
+        },
+        'settings',
+    )
+
+    def fields(count, expect):
+        headers = {'Host': 'localhost', 'Connection': 'close'}
+        for i in range(count):
+            headers[f'X-{i:04}'] = 'a' * 20
+
+        assert client.get(headers=headers)['status'] == expect, count
+
+    fields(1200, 200)
+    fields(1350, 431)

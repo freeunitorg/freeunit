@@ -9,11 +9,16 @@
 #include "nxt_napi.h"
 
 
+struct port_data_t;
+
+
 class Unit : public nxt_napi {
 public:
     static napi_value init(napi_env env, napi_value exports);
 
 private:
+    friend struct port_data_t;
+
     Unit(napi_env env, napi_value jsthis);
     ~Unit();
 
@@ -81,6 +86,7 @@ private:
 
     napi_ref        wrapper_;
     nxt_unit_ctx_t  *unit_ctx_;
+    port_data_t     *ports_;
 };
 
 

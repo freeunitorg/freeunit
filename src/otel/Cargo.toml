@@ -2,6 +2,7 @@
 name = "otel"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 
 [lib]
 crate-type = ["staticlib"]
@@ -24,14 +25,14 @@ bench = false
 # staticlib), so both transports are plaintext — the endpoint must be plain
 # http:// (h2c for grpc).
 [dependencies]
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["trace"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
     "trace",
     "http-proto",
     "reqwest-blocking-client",
     "grpc-tonic",
 ] }
-opentelemetry-semantic-conventions = "0.32"
+opentelemetry-semantic-conventions = "0.33"
 tonic = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread"] }

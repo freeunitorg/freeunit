@@ -58,6 +58,40 @@ nxt_wasmtime_err_msg(wasmtime_error_t *error, wasm_trap_t *trap,
 }
 
 
+/*
+ * memory.grow can move the linear memory to a new address.  Read the base
+ * again after the guest has run, and before an import function reads or
+ * writes the memory.  The value is valid only until the guest runs again.
+ */
+static void
+nxt_wasmtime_update_baddr(nxt_wasm_ctx_t *ctx, wasmtime_context_t *wctx)
+{
+    ctx->baddr = wasmtime_memory_data(wctx, &nxt_wasmtime_ctx.memory)
+                 + ctx->baddr_off;
+}
+
+
+/*
+ * The guest can call an import before the host serves a request: from its
+ * start function or "_initialize" in wasmtime_linker_module(), from the
+ * malloc handler, or from the module_init hook.  The host has no request to
+ * answer then.  Before nxt_wasmtime_init_memory() it also has no handle for
+ * the memory.  An import that needs a request traps in that case.  The host
+ * serves a request only after nxt_wasmtime_init() succeeds, so a request
+ * implies a memory handle.  The host does not clear ctx->req after a
+ * request, so this check does not show that a request is still live.
+ */
+static wasm_trap_t *
+nxt_wasmtime_check_request(const nxt_wasm_ctx_t *ctx, const char *msg)
+{
+    if (ctx->req != NULL) {
+        return NULL;
+    }
+
+    return wasmtime_trap_new(msg, strlen(msg));
+}
+
+
 static wasm_trap_t *
 nxt_wasm_get_init_mem_size(void *env, wasmtime_caller_t *caller,
                            const wasmtime_val_t *args, size_t nargs,
@@ -74,6 +108,14 @@ nxt_wasm_response_end(void *env, wasmtime_caller_t *caller,
                       const wasmtime_val_t *args, size_t nargs,
                       wasmtime_val_t *results, size_t nresults)
 {
+    wasm_trap_t  *trap;
+
+    trap = nxt_wasmtime_check_request(env, "nxt_wasm_response_end() called "
+                                      "outside a request");
+    if (trap != NULL) {
+        return trap;
+    }
+
     nxt_wasm_do_response_end(env);
 
     return NULL;
@@ -85,6 +127,16 @@ nxt_wasm_send_response(void *env, wasmtime_caller_t *caller,
                        const wasmtime_val_t *args, size_t nargs,
                        wasmtime_val_t *results, size_t nresults)
 {
+    wasm_trap_t  *trap;
+
+    trap = nxt_wasmtime_check_request(env, "nxt_wasm_send_response() called "
+                                      "outside a request");
+    if (trap != NULL) {
+        return trap;
+    }
+
+    nxt_wasmtime_update_baddr(env, wasmtime_caller_context(caller));
+
     nxt_wasm_do_send_response(env, args[0].of.i32);
 
     return NULL;
@@ -96,6 +148,16 @@ nxt_wasm_send_headers(void *env, wasmtime_caller_t *caller,
                       const wasmtime_val_t *args, size_t nargs,
                       wasmtime_val_t *results, size_t nresults)
 {
+    wasm_trap_t  *trap;
+
+    trap = nxt_wasmtime_check_request(env, "nxt_wasm_send_headers() called "
+                                      "outside a request");
+    if (trap != NULL) {
+        return trap;
+    }
+
+    nxt_wasmtime_update_baddr(env, wasmtime_caller_context(caller));
+
     nxt_wasm_do_send_headers(env, args[0].of.i32);
 
     return NULL;
@@ -116,7 +178,7 @@ nxt_wasm_set_resp_status(void *env, wasmtime_caller_t *caller,
 
 
 static void
-nxt_wasmtime_execute_hook(const nxt_wasm_ctx_t *ctx, nxt_wasm_fh_t hook)
+nxt_wasmtime_execute_hook(nxt_wasm_ctx_t *ctx, nxt_wasm_fh_t hook)
 {
     const char             *name = ctx->fh[hook].func_name;
     wasm_trap_t            *trap = NULL;
@@ -129,6 +191,9 @@ nxt_wasmtime_execute_hook(const nxt_wasm_ctx_t *ctx, nxt_wasm_fh_t hook)
     }
 
     error = wasmtime_func_call(rt_ctx->ctx, func, NULL, 0, NULL, 0, &trap);
+
+    nxt_wasmtime_update_baddr(ctx, rt_ctx->ctx);
+
     if (error != NULL || trap != NULL) {
         nxt_wasmtime_err_msg(error, trap, "failed to call hook function [%s]",
                              name);
@@ -137,7 +202,7 @@ nxt_wasmtime_execute_hook(const nxt_wasm_ctx_t *ctx, nxt_wasm_fh_t hook)
 
 
 static int
-nxt_wasmtime_execute_request(const nxt_wasm_ctx_t *ctx)
+nxt_wasmtime_execute_request(nxt_wasm_ctx_t *ctx)
 {
     int                    i = 0;
     wasm_trap_t            *trap = NULL;
@@ -151,6 +216,9 @@ nxt_wasmtime_execute_request(const nxt_wasm_ctx_t *ctx)
     args[i++].of.i32 = ctx->baddr_off;
 
     error = wasmtime_func_call(rt_ctx->ctx, func, args, i, results, 1, &trap);
+
+    nxt_wasmtime_update_baddr(ctx, rt_ctx->ctx);
+
     if (error != NULL || trap != NULL) {
         nxt_wasmtime_err_msg(error, trap,
                              "failed to call function [->wasm_request_handler]"
@@ -258,6 +326,14 @@ nxt_wasmtime_get_function_exports(nxt_wasm_ctx_t *ctx)
                                  ctx->fh[i].func_name);
             return -1;
         }
+
+        if (item.kind != WASMTIME_EXTERN_FUNC) {
+            nxt_wasmtime_err_msg(NULL, NULL,
+                                 "module export (%s) is not a function",
+                                 ctx->fh[i].func_name);
+            return -1;
+        }
+
         ctx->fh[i].func = item.of.func;
     }
 
@@ -281,7 +357,9 @@ nxt_wasmtime_wasi_init(const nxt_wasm_ctx_t *ctx)
     wasi_config_inherit_stderr(wasi_config);
 
     for (dir = ctx->dirs; dir != NULL && *dir != NULL; dir++) {
-#if defined(WASMTIME_VERSION_MAJOR) && (WASMTIME_VERSION_MAJOR >= 27)
+#if defined(WASMTIME_VERSION_MAJOR) && (WASMTIME_VERSION_MAJOR >= 48)
+        wasi_config_preopen_dir(wasi_config, *dir, *dir, true);
+#elif defined(WASMTIME_VERSION_MAJOR) && (WASMTIME_VERSION_MAJOR >= 27)
         wasi_config_preopen_dir(wasi_config, *dir, *dir,
                 WASMTIME_WASI_DIR_PERMS_READ|WASMTIME_WASI_DIR_PERMS_WRITE,
                 WASMTIME_WASI_FILE_PERMS_READ|WASMTIME_WASI_FILE_PERMS_WRITE);
@@ -300,11 +378,50 @@ nxt_wasmtime_wasi_init(const nxt_wasm_ctx_t *ctx)
 }
 
 
+/*
+ * The host passes and reads wasm32 offsets.  A 64-bit memory has no 4 GiB
+ * limit, so it can grow past the address space that wasmtime reserved for
+ * it, and wasmtime then moves it.  Refuse such a memory before the host
+ * calls the malloc handler.
+ */
+static int
+nxt_wasmtime_check_memory(void)
+{
+    bool                ok, is64;
+    wasmtime_extern_t   item;
+    wasm_memorytype_t   *type;
+    nxt_wasmtime_ctx_t  *rt_ctx = &nxt_wasmtime_ctx;
+
+    ok = wasmtime_linker_get(rt_ctx->linker, rt_ctx->ctx, "", 0, "memory",
+                             strlen("memory"), &item);
+    if (!ok || item.kind != WASMTIME_EXTERN_MEMORY) {
+        nxt_wasmtime_err_msg(NULL, NULL, "couldn't get 'memory' from module");
+        return -1;
+    }
+
+    type = wasmtime_memory_type(rt_ctx->ctx, &item.of.memory);
+    is64 = wasmtime_memorytype_is64(type);
+    wasm_memorytype_delete(type);
+
+    if (is64) {
+        nxt_wasmtime_err_msg(NULL, NULL,
+                             "module memory is 64-bit; only a 32-bit memory "
+                             "is supported");
+        return -1;
+    }
+
+    return 0;
+}
+
+
 static int
 nxt_wasmtime_init_memory(nxt_wasm_ctx_t *ctx)
 {
     int                    i = 0;
     bool                   ok;
+    size_t                 need, size;
+    uint8_t                *base;
+    uint32_t               off;
     wasm_trap_t            *trap = NULL;
     wasmtime_val_t         args[1] = { };
     wasmtime_val_t         results[1] = { };
@@ -313,8 +430,10 @@ nxt_wasmtime_init_memory(nxt_wasm_ctx_t *ctx)
     nxt_wasmtime_ctx_t     *rt_ctx = &nxt_wasmtime_ctx;
     const nxt_wasm_func_t  *func = &ctx->fh[NXT_WASM_FH_MALLOC].func;
 
+    need = NXT_WASM_MEM_SIZE + NXT_WASM_PAGE_SIZE;
+
     args[i].kind = WASMTIME_I32;
-    args[i++].of.i32 = NXT_WASM_MEM_SIZE + NXT_WASM_PAGE_SIZE;
+    args[i++].of.i32 = need;
 
     error = wasmtime_func_call(rt_ctx->ctx, func, args, i, results, 1, &trap);
     if (error != NULL || trap != NULL) {
@@ -332,10 +451,36 @@ nxt_wasmtime_init_memory(nxt_wasm_ctx_t *ctx)
     }
     rt_ctx->memory = item.of.memory;
 
-    ctx->baddr_off = results[0].of.i32;
-    ctx->baddr = wasmtime_memory_data(rt_ctx->ctx, &rt_ctx->memory);
+    /*
+     * The guest returns a wasm32 pointer.  Read it as unsigned, and check
+     * that the bytes the host asked for fit in the linear memory from it.
+     */
+    off = (uint32_t) results[0].of.i32;
+    size = wasmtime_memory_data_size(rt_ctx->ctx, &rt_ctx->memory);
 
-    ctx->baddr += ctx->baddr_off;
+    if (size < need || off > size - need) {
+        nxt_wasmtime_err_msg(NULL, NULL,
+                             "malloc handler returned offset %u outside "
+                             "memory of %zu bytes", off, size);
+        return -1;
+    }
+
+    base = wasmtime_memory_data(rt_ctx->ctx, &rt_ctx->memory);
+
+    /*
+     * The host writes an nxt_wasm_request_t at this address.  The structure
+     * has uint64_t members, so the address must be aligned for it.
+     */
+    if ((uintptr_t) (base + off) % _Alignof(nxt_wasm_request_t) != 0) {
+        nxt_wasmtime_err_msg(NULL, NULL,
+                             "malloc handler returned offset %u that is not "
+                             "aligned to %zu bytes", off,
+                             _Alignof(nxt_wasm_request_t));
+        return -1;
+    }
+
+    ctx->baddr_off = off;
+    ctx->baddr = base + off;
 
     return 0;
 }
@@ -399,6 +544,11 @@ nxt_wasmtime_init(nxt_wasm_ctx_t *ctx)
     }
 
     err = nxt_wasmtime_get_function_exports(ctx);
+    if (err) {
+        return -1;
+    }
+
+    err = nxt_wasmtime_check_memory();
     if (err) {
         return -1;
     }

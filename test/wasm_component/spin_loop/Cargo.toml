@@ -2,6 +2,7 @@
 name = "test-wasi-component"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.78"
 
 [dependencies]
 bitflags = "2.4.2"

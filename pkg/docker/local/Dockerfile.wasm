@@ -1,8 +1,8 @@
 # Fast local build — uses pre-built builder image (no apt/Rust download).
-# Builder: ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1
+# Builder: ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.95.0
 # (same as minimal — wasmtime Rust build is included in that builder)
 
-FROM ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1 AS build
+FROM ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.95.0 AS build
 
 RUN set -ex \
     && mkdir -p /usr/lib/unit/modules /usr/lib/unit/debug-modules \
@@ -81,6 +81,7 @@ COPY --from=build /requirements.apt       /requirements.apt
 
 RUN set -ex \
     && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confold upgrade \
     && apt-get --no-install-recommends --no-install-suggests -y install \
          curl $(cat /requirements.apt) \
     && rm -rf /var/lib/apt/lists/* \

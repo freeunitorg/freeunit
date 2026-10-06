@@ -495,22 +495,19 @@ def test_node_websockets_2_10__2_11():
 
     _, sock, _ = ws.upgrade()
 
-    for i in range(0, 10):
-        ws.frame_write(sock, ws.OP_PING, f'payload-{i}')
+    pings = [f'payload-{i}' for i in range(0, 10)]
 
-    for i in range(0, 10):
-        frame = ws.frame_read(sock)
-        check_frame(frame, True, ws.OP_PONG, f'payload-{i}')
+    for payload in pings:
+        ws.frame_write(sock, ws.OP_PING, payload)
+
+    ws.pongs_read(sock, pings)
 
     # 2_11
 
-    for i in range(0, 10):
-        opcode = ws.OP_PING
-        ws.frame_write(sock, opcode, f'payload-{i}', chopsize=1)
+    for payload in pings:
+        ws.frame_write(sock, ws.OP_PING, payload, chopsize=1)
 
-    for i in range(0, 10):
-        frame = ws.frame_read(sock)
-        check_frame(frame, True, ws.OP_PONG, f'payload-{i}')
+    ws.pongs_read(sock, pings)
 
     close_connection(sock)
 
@@ -1292,7 +1289,7 @@ def test_node_websockets_9_1_1__9_6_6(system):
             payload = b'*' * length
 
         ws.frame_write(sock, opcode, payload, chopsize=chopsize)
-        frame = ws.frame_read(sock, read_timeout=5)
+        frame = ws.frame_read(sock, read_timeout=ws.LARGE_MESSAGE_TIMEOUT)
         check_frame(frame, True, opcode, payload)
 
     def check_message(opcode, f_size):
@@ -1302,7 +1299,7 @@ def test_node_websockets_9_1_1__9_6_6(system):
             payload = b'*' * 4 * 2**20
 
         ws.message(sock, opcode, payload, fragmention_size=f_size)
-        frame = ws.frame_read(sock, read_timeout=5)
+        frame = ws.frame_read(sock, read_timeout=ws.LARGE_MESSAGE_TIMEOUT)
         check_frame(frame, True, opcode, payload)
 
     check_payload(op_text, 64 * 2**10)  # 9_1_1

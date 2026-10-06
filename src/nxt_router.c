@@ -21,6 +21,7 @@
 #include <nxt_router_request.h>
 #include <nxt_app_queue.h>
 #include <nxt_port_queue.h>
+#include <nxt_span.h>
 #include <nxt_http_compression.h>
 
 #if (NXT_HAVE_OTEL)
@@ -214,6 +215,24 @@ static void nxt_router_greet_controller(nxt_task_t *task,
 
 static nxt_int_t nxt_router_start_app_process(nxt_task_t *task, nxt_app_t *app);
 
+static nxt_bool_t nxt_router_msg_from(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, nxt_process_type_t type);
+static nxt_bool_t nxt_router_pid_is(nxt_task_t *task, nxt_pid_t pid,
+    nxt_process_type_t type);
+static nxt_bool_t nxt_router_msg_from_self(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static nxt_bool_t nxt_router_msg_sender_ok(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_router_msg_sender_refuse(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, const char *reason);
+static const char *nxt_router_new_port_check(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static const char *nxt_router_get_port_check(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static const char *nxt_router_get_mmap_check(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_router_gate_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
 static void nxt_router_conf_data_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static void nxt_router_app_restart_handler(nxt_task_t *task,
@@ -228,6 +247,9 @@ static void nxt_router_conf_ready(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf);
 static void nxt_router_conf_send(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf, nxt_port_msg_type_t type);
+#if (NXT_TLS)
+static void nxt_router_conf_error_tls(nxt_task_t *task, nxt_queue_t *sockets);
+#endif
 
 static nxt_int_t nxt_router_conf_create(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf, u_char *start, u_char *end);
@@ -319,6 +341,9 @@ static void nxt_router_listen_socket_create(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_router_listen_socket_update(nxt_task_t *task, void *obj,
     void *data);
+static void nxt_router_listen_socket_release_stale(nxt_task_t *task,
+    nxt_event_engine_t *engine, nxt_listen_socket_t *ls,
+    nxt_socket_conf_joint_t *keep);
 static void nxt_router_listen_socket_delete(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_router_worker_thread_quit(nxt_task_t *task, void *obj,
@@ -435,21 +460,113 @@ static const nxt_str_t  *nxt_app_msg_prefix[] = {
 };
 
 
+/*
+ * Each application process has the write end of the main port of the
+ * router, and the sender sets the message type.  Thus the router accepts
+ * a message on this port only from its normal sender.  This table lists
+ * the gated types.  nxt_router_process_port_handlers points each of them
+ * to nxt_router_gate_handler().  That handler checks the sender of the
+ * row, then runs the check of the row if there is one, and then runs the
+ * handler of the row.  To gate one more type, add its row here and point
+ * its slot to nxt_router_gate_handler().
+ *
+ * The main port of the router has no shared memory queue.  Thus each
+ * message comes through the socket, and the kernel gives the pid of the
+ * sender (SCM_CREDENTIALS).  Without SCM_CREDENTIALS, the pid comes from
+ * the message header, which the sender sets.
+ *
+ * The sender checks read rt->port_by_type[].  NEW_PORT sets that slot, so
+ * NEW_PORT is gated too: only main can announce a port that is not an
+ * application port.
+ *
+ * The ports of the router engines are not gated.  Their messages can come
+ * through the shared memory queue, which carries no pid.
+ */
+
+typedef enum {
+    NXT_ROUTER_SENDER_NONE = 0,
+    NXT_ROUTER_SENDER_MAIN,
+    NXT_ROUTER_SENDER_CONTROLLER,
+    NXT_ROUTER_SENDER_MAIN_OR_PROTO,
+    /* Main, the controller or a registered prototype. */
+    NXT_ROUTER_SENDER_NOT_APP,
+    /* A registered application process that names itself in the header. */
+    NXT_ROUTER_SENDER_SELF,
+    /* Any sender.  The check of the row decides. */
+    NXT_ROUTER_SENDER_ANY,
+} nxt_router_sender_t;
+
+
+/* Returns NULL to accept the message, or the reason to refuse it. */
+
+typedef const char *(*nxt_router_gate_check_t)(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+
+
+typedef struct {
+    nxt_router_sender_t      sender;
+    nxt_router_gate_check_t  check;
+    nxt_port_handler_t       handler;
+} nxt_router_gate_t;
+
+
+static const nxt_router_gate_t  nxt_router_gates[NXT_PORT_MSG_MAX] = {
+    [_NXT_PORT_MSG_QUIT] =
+        { NXT_ROUTER_SENDER_MAIN, NULL, nxt_signal_quit_handler },
+    [_NXT_PORT_MSG_CHANGE_FILE] =
+        { NXT_ROUTER_SENDER_MAIN, NULL, nxt_port_change_log_file_handler },
+    [_NXT_PORT_MSG_ACCESS_LOG] =
+        { NXT_ROUTER_SENDER_MAIN, NULL, nxt_router_access_log_reopen_handler },
+    [_NXT_PORT_MSG_REMOVE_PID] =
+        { NXT_ROUTER_SENDER_MAIN_OR_PROTO, NULL,
+          nxt_router_remove_pid_handler },
+    [_NXT_PORT_MSG_DATA] =
+        { NXT_ROUTER_SENDER_CONTROLLER, NULL, nxt_router_conf_data_handler },
+    [_NXT_PORT_MSG_APP_RESTART] =
+        { NXT_ROUTER_SENDER_CONTROLLER, NULL,
+          nxt_router_app_restart_handler },
+    [_NXT_PORT_MSG_STATUS] =
+        { NXT_ROUTER_SENDER_CONTROLLER, NULL, nxt_router_status_handler },
+    [_NXT_PORT_MSG_NEW_PORT] =
+        { NXT_ROUTER_SENDER_ANY, nxt_router_new_port_check,
+          nxt_router_new_port_handler },
+    [_NXT_PORT_MSG_GET_PORT] =
+        { NXT_ROUTER_SENDER_SELF, nxt_router_get_port_check,
+          nxt_router_get_port_handler },
+    [_NXT_PORT_MSG_GET_MMAP] =
+        { NXT_ROUTER_SENDER_SELF, nxt_router_get_mmap_check,
+          nxt_router_get_mmap_handler },
+    [_NXT_PORT_MSG_MMAP] =
+        { NXT_ROUTER_SENDER_SELF, NULL, nxt_port_mmap_handler },
+    [_NXT_PORT_MSG_OOSM] =
+        { NXT_ROUTER_SENDER_SELF, NULL, nxt_router_oosm_handler },
+    /*
+     * An application sends its RPC replies to its own ports, never here.
+     * nxt_port_rpc_handler() does not compare the sender with the peer of
+     * the registration, so any process that passes can answer any stream.
+     */
+    [_NXT_PORT_MSG_RPC_READY] =
+        { NXT_ROUTER_SENDER_NOT_APP, NULL, nxt_port_rpc_handler },
+    [_NXT_PORT_MSG_RPC_ERROR] =
+        { NXT_ROUTER_SENDER_NOT_APP, NULL, nxt_port_rpc_handler },
+};
+
+
 static const nxt_port_handlers_t  nxt_router_process_port_handlers = {
-    .quit         = nxt_signal_quit_handler,
-    .new_port     = nxt_router_new_port_handler,
-    .get_port     = nxt_router_get_port_handler,
-    .change_file  = nxt_port_change_log_file_handler,
-    .mmap         = nxt_port_mmap_handler,
-    .get_mmap     = nxt_router_get_mmap_handler,
-    .data         = nxt_router_conf_data_handler,
-    .app_restart  = nxt_router_app_restart_handler,
-    .status       = nxt_router_status_handler,
-    .remove_pid   = nxt_router_remove_pid_handler,
-    .access_log   = nxt_router_access_log_reopen_handler,
-    .rpc_ready    = nxt_port_rpc_handler,
-    .rpc_error    = nxt_port_rpc_handler,
-    .oosm         = nxt_router_oosm_handler,
+    .quit         = nxt_router_gate_handler,
+    .new_port     = nxt_router_gate_handler,
+    .get_port     = nxt_router_gate_handler,
+    .change_file  = nxt_router_gate_handler,
+    .mmap         = nxt_router_gate_handler,
+    .get_mmap     = nxt_router_gate_handler,
+    .data         = nxt_router_gate_handler,
+    .app_restart  = nxt_router_gate_handler,
+    .status       = nxt_router_gate_handler,
+    .remove_pid   = nxt_router_gate_handler,
+    .access_log   = nxt_router_gate_handler,
+    .rpc_ready    = nxt_router_gate_handler,
+    .rpc_error    = nxt_router_gate_handler,
+    .oosm         = nxt_router_gate_handler,
     .detached     = nxt_router_detached_handler,
 };
 
@@ -1534,6 +1651,277 @@ nxt_router_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 }
 
 
+/* The sender pid against the port of the process type; see the gate table. */
+
+static nxt_bool_t
+nxt_router_msg_from(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    nxt_process_type_t type)
+{
+    nxt_port_t  *port;
+
+    /*
+     * Read at message time, because a restarted router gets the ports
+     * again through NEW_PORT.  A NULL port refuses the message.
+     */
+
+    port = task->thread->runtime->port_by_type[type];
+
+    return (port != NULL && nxt_recv_msg_cmsg_pid(msg) == port->pid);
+}
+
+
+/*
+ * Whether the pid is a registered process of the type.  A prototype sends
+ * REMOVE_PID for a child that it forked (nxt_proto_child_exited()).  The
+ * router cannot check that the pid is a child of that prototype: a child
+ * that stopped during its start has no record in the router.  Thus any
+ * registered prototype passes.
+ */
+
+static nxt_bool_t
+nxt_router_pid_is(nxt_task_t *task, nxt_pid_t pid, nxt_process_type_t type)
+{
+    nxt_bool_t     is;
+    nxt_process_t  *process;
+
+    process = nxt_runtime_process_ref(task->thread->runtime, pid);
+    if (process == NULL) {
+        return 0;
+    }
+
+    is = (nxt_process_type(process) == type);
+
+    nxt_process_use(task, process, -1);
+
+    return is;
+}
+
+
+/*
+ * The handlers of GET_PORT, GET_MMAP, MMAP and OOSM act for the process
+ * that the header names.  Only libunit sends them, for its own process.
+ */
+
+static nxt_bool_t
+nxt_router_msg_from_self(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_pid_t  pid;
+
+    pid = nxt_recv_msg_cmsg_pid(msg);
+
+    return (pid > 0 && pid == msg->port_msg.pid
+            && nxt_router_pid_is(task, pid, NXT_PROCESS_APP));
+}
+
+
+static nxt_bool_t
+nxt_router_msg_sender_ok(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_bool_t               ok;
+    const char               *reason;
+    const nxt_router_gate_t  *gate;
+
+    /* nxt_port_handler() dispatches only a type below NXT_PORT_MSG_MAX. */
+
+    gate = &nxt_router_gates[msg->port_msg.type];
+
+    switch (gate->sender) {
+
+    case NXT_ROUTER_SENDER_MAIN:
+        ok = nxt_router_msg_from(task, msg, NXT_PROCESS_MAIN);
+        break;
+
+    case NXT_ROUTER_SENDER_CONTROLLER:
+        ok = nxt_router_msg_from(task, msg, NXT_PROCESS_CONTROLLER);
+        break;
+
+    case NXT_ROUTER_SENDER_MAIN_OR_PROTO:
+        ok = nxt_router_msg_from(task, msg, NXT_PROCESS_MAIN)
+             || nxt_router_pid_is(task, nxt_recv_msg_cmsg_pid(msg),
+                                  NXT_PROCESS_PROTOTYPE);
+        break;
+
+    case NXT_ROUTER_SENDER_NOT_APP:
+        ok = nxt_router_msg_from(task, msg, NXT_PROCESS_MAIN)
+             || nxt_router_msg_from(task, msg, NXT_PROCESS_CONTROLLER)
+             || nxt_router_pid_is(task, nxt_recv_msg_cmsg_pid(msg),
+                                  NXT_PROCESS_PROTOTYPE);
+        break;
+
+    case NXT_ROUTER_SENDER_SELF:
+        ok = nxt_router_msg_from_self(task, msg);
+        break;
+
+    case NXT_ROUTER_SENDER_ANY:
+        ok = 1;
+        break;
+
+    default:
+        /* A type without a row has no sender that passes. */
+        ok = 0;
+        break;
+    }
+
+    reason = "wrong sender";
+
+    if (nxt_fast_path(ok)) {
+        reason = (gate->check != NULL) ? gate->check(task, msg) : NULL;
+
+        if (nxt_fast_path(reason == NULL)) {
+            return 1;
+        }
+    }
+
+    nxt_router_msg_sender_refuse(task, msg, reason);
+
+    return 0;
+}
+
+
+/*
+ * No reply: the sender selects the reply port and the stream, so a reply
+ * would let a false sender make the router write to any stream.
+ */
+
+static void
+nxt_router_msg_sender_refuse(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    const char *reason)
+{
+    nxt_alert(task, "process %PI sent message type %uD claiming process %PI; "
+              "refused: %s", nxt_recv_msg_cmsg_pid(msg),
+              (uint32_t) msg->port_msg.type, msg->port_msg.pid, reason);
+
+    nxt_port_recv_msg_close_fds(msg);
+
+#if (NXT_TESTS)
+    nxt_router_test_senders_refused++;
+#endif
+}
+
+
+/*
+ * Main announces every process.  A prototype announces the main port of
+ * each worker it starts (nxt_port_process_ready_handler()), with the stream
+ * of the start.  libunit announces the port of each context it adds, for
+ * its own process and with no stream (nxt_unit_send_port()).  Thus only
+ * main can announce a port that is not an application port.
+ */
+
+static const char *
+nxt_router_new_port_check(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_port_msg_new_port_t  new_port;
+
+    if (nxt_slow_path(nxt_port_new_port_msg(msg, &new_port) != NXT_OK)) {
+        return "short new port message";
+    }
+
+    if (nxt_router_msg_from(task, msg, NXT_PROCESS_MAIN)) {
+        return NULL;
+    }
+
+    if (nxt_slow_path(new_port.type != NXT_PROCESS_APP)) {
+        return "not an application port";
+    }
+
+    if (nxt_router_pid_is(task, nxt_recv_msg_cmsg_pid(msg),
+                          NXT_PROCESS_PROTOTYPE))
+    {
+        return NULL;
+    }
+
+    if (nxt_slow_path(!nxt_router_msg_from_self(task, msg)
+                      || new_port.pid != msg->port_msg.pid
+                      || msg->port_msg.stream != 0))
+    {
+        return "not a new port of the sender";
+    }
+
+    return NULL;
+}
+
+
+/*
+ * libunit asks for the port of a router engine that sent it a request
+ * (nxt_unit_get_port()).  The router does not give out other ports.
+ */
+
+static const char *
+nxt_router_get_port_check(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_port_t               *port;
+    nxt_span_t               span;
+    nxt_port_msg_get_port_t  get_port;
+
+    if (nxt_slow_path(msg->buf == NULL)) {
+        return "short get port message";
+    }
+
+    nxt_span_init(&span, msg->buf->mem.pos, msg->buf->mem.free);
+
+    if (nxt_slow_path(nxt_span_copy(&span, &get_port, sizeof(get_port)) != 0))
+    {
+        return "short get port message";
+    }
+
+    if (get_port.pid != nxt_pid) {
+        return "not a router port";
+    }
+
+    port = nxt_runtime_port_find(task->thread->runtime, get_port.pid,
+                                 get_port.id);
+
+    if (port != NULL && port->type != NXT_PROCESS_ROUTER) {
+        return "not a router port";
+    }
+
+    return NULL;
+}
+
+
+/* The reply goes to a port that the header names. */
+
+static const char *
+nxt_router_get_mmap_check(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_port_t  *port;
+
+    port = nxt_runtime_port_find(task->thread->runtime, msg->port_msg.pid,
+                                 msg->port_msg.reply_port);
+
+    if (port != NULL && port->type != NXT_PROCESS_APP) {
+        return "reply port is not an application port";
+    }
+
+    return NULL;
+}
+
+
+static void
+nxt_router_gate_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    if (nxt_fast_path(nxt_router_msg_sender_ok(task, msg))) {
+        nxt_router_gates[msg->port_msg.type].handler(task, msg);
+    }
+}
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_router_sender_test.c. */
+
+nxt_uint_t  nxt_router_test_senders_refused;
+
+
+nxt_bool_t
+nxt_router_test_msg_sender_ok(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    return nxt_router_msg_sender_ok(task, msg);
+}
+
+#endif
+
+
 static void
 nxt_router_conf_data_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
@@ -2232,12 +2620,51 @@ nxt_router_conf_error(nxt_task_t *task, nxt_router_temp_conf_t *tmcf)
 
     nxt_router_access_log_release(task, &router->lock, rtcf->access_log);
 
+#if (NXT_TLS)
+    /*
+     * The new socket confs go with rtcf->mem_pool, but the TLS contexts
+     * built for them so far are OpenSSL allocations.  No connection uses
+     * them: the listen joints are posted to the engines only on success.
+     * The confs in keeping_sockets are the old ones and stay in use.
+     */
+    nxt_router_conf_error_tls(task, &creating_sockets);
+    nxt_router_conf_error_tls(task, &updating_sockets);
+#endif
+
     nxt_mp_destroy(rtcf->mem_pool);
 
     nxt_router_conf_send(task, tmcf, NXT_PORT_MSG_RPC_ERROR);
 
     nxt_mp_release(tmcf->mem_pool);
 }
+
+
+#if (NXT_TLS)
+
+static void
+nxt_router_conf_error_tls(nxt_task_t *task, nxt_queue_t *sockets)
+{
+    nxt_queue_link_t   *qlk;
+    nxt_socket_conf_t  *skcf;
+
+    for (qlk = nxt_queue_first(sockets);
+         qlk != nxt_queue_tail(sockets);
+         qlk = nxt_queue_next(qlk))
+    {
+        skcf = nxt_queue_link_data(qlk, nxt_socket_conf_t, link);
+
+        /*
+         * A conf without a bundle failed before its first context.  A
+         * bundle whose server_init() failed has a NULL context, and
+         * SSL_CTX_free(NULL) does nothing.
+         */
+        if (skcf->tls != NULL && skcf->tls->bundle != NULL) {
+            task->thread->runtime->tls->server_free(task, skcf->tls);
+        }
+    }
+}
+
+#endif
 
 
 static void
@@ -2404,6 +2831,18 @@ static nxt_conf_map_t  nxt_router_http_conf[] = {
         nxt_string("send_timeout"),
         NXT_CONF_MAP_MSEC,
         offsetof(nxt_socket_conf_t, send_timeout),
+    },
+
+    {
+        nxt_string("body_min_rate"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_socket_conf_t, body_min_rate),
+    },
+
+    {
+        nxt_string("send_min_rate"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_socket_conf_t, send_min_rate),
     },
 
     {
@@ -2990,6 +3429,8 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             skcf->proxy_timeout = 60 * 1000;
             skcf->proxy_send_timeout = 30 * 1000;
             skcf->proxy_read_timeout = 30 * 1000;
+            skcf->body_min_rate = 0;
+            skcf->send_min_rate = 0;
 
             skcf->server_version = 1;
             skcf->chunked_transform = 0;
@@ -4042,7 +4483,12 @@ nxt_router_tls_rpc_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
     tls->tls_init->conf = tlscf;
 
-    bundle = nxt_mp_get(mp, sizeof(nxt_tls_bundle_conf_t));
+    /*
+     * The error path frees bundle->ctx of every bundle in the chain, so
+     * the bundle must not hold a garbage pointer before server_init()
+     * sets it.
+     */
+    bundle = nxt_mp_zget(mp, sizeof(nxt_tls_bundle_conf_t));
     if (nxt_slow_path(bundle == NULL)) {
         goto fail;
     }
@@ -4051,9 +4497,11 @@ nxt_router_tls_rpc_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         goto fail;
     }
 
+    /*
+     * The bundle owns the descriptor now.  server_init() closes it on
+     * every path and sets bundle->chain_file to -1.
+     */
     bundle->chain_file = msg->fd[0];
-
-    /* The bundle owns the descriptor now. */
     msg->fd[0] = -1;
 
     bundle->next = tlscf->bundle;
@@ -4506,6 +4954,7 @@ nxt_router_engine_joints_create(nxt_router_temp_conf_t *tmcf,
         }
 
         joint->count = 1;
+        joint->stale = 0;
 
         skcf = nxt_queue_link_data(qlk, nxt_socket_conf_t, link);
         skcf->count++;
@@ -4817,19 +5266,44 @@ nxt_router_listen_socket_create(nxt_task_t *task, void *obj, void *data)
     skcf = joint->socket_conf;
     ls = skcf->listen;
 
-    lev = nxt_listen_event(task, ls);
-    if (nxt_slow_path(lev == NULL)) {
-        nxt_router_listen_socket_release(task, skcf);
-        return;
-    }
-
-    lev->socket.data = joint;
-
+    /*
+     * This engine holds one reference on the listen socket, also when the
+     * listen event cannot be allocated below.  The last engine that
+     * releases its reference closes the socket, see
+     * nxt_router_listen_socket_release().
+     */
     lock = &skcf->router_conf->router->lock;
 
     nxt_thread_spin_lock(lock);
     ls->count++;
     nxt_thread_spin_unlock(lock);
+
+    lev = nxt_listen_event(task, ls);
+    if (nxt_slow_path(lev == NULL)) {
+        /*
+         * Only the lev allocation itself can fail here: a missing spare
+         * conn keeps the listener and is retried by its own timer
+         * (nxt_listen_event()).  Acknowledge the job so the configuration
+         * request completes instead of waiting forever.  The joint and
+         * the listen socket reference stay: releasing the joint here could
+         * drop the last reference to the configuration that is being
+         * applied.  A later update or delete of this listener releases
+         * both, see nxt_router_listen_socket_release_stale().  The release
+         * is deferred, not skipped: until that job, the stale joint keeps
+         * this configuration (its memory pool and TLS contexts) and the
+         * listen socket, so the address stays bound.
+         */
+        nxt_alert(task, "engine %p: listen socket %d: no memory for the "
+                  "listen event, no connections will be accepted on it",
+                  task->thread->engine, ls->socket);
+
+        joint->stale = 1;
+
+        nxt_router_conf_wait_post(job);
+        return;
+    }
+
+    lev->socket.data = joint;
 
     nxt_router_conf_wait_post(job);
 }
@@ -4878,6 +5352,30 @@ nxt_router_listen_socket_update(nxt_task_t *task, void *obj, void *data)
     lev = nxt_router_listen_event(&engine->listen_connections,
                                   joint->socket_conf);
 
+    if (nxt_slow_path(lev == NULL)) {
+        /*
+         * The previous configuration could not allocate the listen event
+         * on this engine (nxt_router_listen_socket_create()), so there is
+         * nothing to update: create it now instead.  The create path
+         * links the joint itself, so unlink it again first.
+         */
+        nxt_queue_remove(&joint->link);
+
+        nxt_router_listen_socket_create(task, obj, data);
+
+        /*
+         * The job is posted: its task and data can be freed now, so the
+         * engine task is used below.  An update keeps the listen socket,
+         * so the stale joint of the failed create has the same one.  The
+         * create above took a new reference on it, so this release does
+         * not close it.
+         */
+        nxt_router_listen_socket_release_stale(&engine->task, engine,
+                                               joint->socket_conf->listen,
+                                               joint);
+        return;
+    }
+
     old = lev->socket.data;
     lev->socket.data = joint;
     lev->listen = joint->socket_conf->listen;
@@ -4907,6 +5405,30 @@ nxt_router_listen_socket_delete(nxt_task_t *task, void *obj, void *data)
 
     lev = nxt_router_listen_event(&engine->listen_connections, skcf);
 
+    if (nxt_slow_path(lev == NULL)) {
+        /*
+         * The listen event was never allocated on this engine
+         * (nxt_router_listen_socket_create()), so there is no listener to
+         * close.  Release the stale joint and its listen socket reference
+         * first: if this was the last reference, the socket is closed, and
+         * the acknowledgement then means that the port is free, as after
+         * nxt_router_listen_socket_close_finish().  The listen socket is
+         * matched, not skcf: when an engine is removed
+         * (nxt_router_engine_conf_delete()), skcf is the socket conf of
+         * the new configuration, and the stale joint has the old one.
+         */
+        nxt_router_listen_socket_release_stale(&engine->task, engine,
+                                               skcf->listen, NULL);
+
+        nxt_router_conf_wait_post(obj);
+
+        if (engine->shutdown && nxt_queue_is_empty(&engine->joints)) {
+            nxt_router_worker_thread_exit(&engine->task);
+        }
+
+        return;
+    }
+
     nxt_fd_event_delete(engine, &lev->socket);
 
     nxt_debug(task, "engine %p: listen socket delete: %d", engine,
@@ -4920,6 +5442,84 @@ nxt_router_listen_socket_delete(nxt_task_t *task, void *obj, void *data)
 
     nxt_timer_add(engine, &lev->timer, 0);
 }
+
+
+/*
+ * Releases the joints that a failed nxt_router_listen_socket_create() left
+ * in engine->joints for the listen socket ls, and the listen socket
+ * reference that each of them holds.  Such a joint has the stale flag.
+ * Only the flag is trusted, not ls alone: a request can hold the joint of
+ * a closed listener in engine->joints, and a new listen socket can have
+ * the address of the freed one.  "keep" is the joint of the current job.
+ * Each update or delete of ls releases its stale joints, so an engine has
+ * at most one of them for ls when this runs; the loop does not depend on
+ * that.  The order is the same as in nxt_router_listen_socket_close_finish():
+ * first the listen socket, which the last reference closes, then the
+ * joint.
+ */
+
+static void
+nxt_router_listen_socket_release_stale(nxt_task_t *task,
+    nxt_event_engine_t *engine, nxt_listen_socket_t *ls,
+    nxt_socket_conf_joint_t *keep)
+{
+    nxt_queue_link_t         *qlk, *next;
+    nxt_socket_conf_joint_t  *joint;
+
+    for (qlk = nxt_queue_first(&engine->joints);
+         qlk != nxt_queue_tail(&engine->joints);
+         qlk = next)
+    {
+        next = nxt_queue_next(qlk);
+
+        joint = nxt_queue_link_data(qlk, nxt_socket_conf_joint_t, link);
+
+        if (joint == keep) {
+            continue;
+        }
+
+        if (joint->stale && joint->socket_conf->listen == ls) {
+            nxt_debug(task, "engine %p: release stale joint %p", engine,
+                      joint);
+
+            nxt_router_listen_socket_release(task, joint->socket_conf);
+            nxt_router_conf_release(task, joint);
+        }
+    }
+}
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_router_stale_joint_test.c. */
+
+void
+nxt_router_test_listen_socket_release_stale(nxt_task_t *task,
+    nxt_event_engine_t *engine, nxt_listen_socket_t *ls,
+    nxt_socket_conf_joint_t *keep)
+{
+    nxt_router_listen_socket_release_stale(task, engine, ls, keep);
+}
+
+
+/* The listen socket jobs, for src/test/nxt_router_stale_joint_test.c. */
+
+void
+nxt_router_test_listen_socket_create(nxt_task_t *task, nxt_joint_job_t *job,
+    nxt_socket_conf_joint_t *joint)
+{
+    nxt_router_listen_socket_create(task, job, joint);
+}
+
+
+void
+nxt_router_test_listen_socket_update(nxt_task_t *task, nxt_joint_job_t *job,
+    nxt_socket_conf_joint_t *joint)
+{
+    nxt_router_listen_socket_update(task, job, joint);
+}
+
+#endif
 
 
 static void
@@ -8599,7 +9199,7 @@ nxt_router_get_mmap_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     get_mmap_msg = (nxt_port_msg_get_mmap_t *) msg->buf->mem.pos;
 
-    nxt_assert(port->type == NXT_PROCESS_APP);
+    /* nxt_router_get_mmap_check() refused a port of another type. */
 
     if (nxt_slow_path(port->app == NULL)) {
         nxt_alert(task, "get_mmap_handler: app == NULL for reply port %PI:%d",

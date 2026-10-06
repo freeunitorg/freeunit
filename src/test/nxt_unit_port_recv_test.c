@@ -53,6 +53,8 @@
 static int   nxt_port_recv_test_failures;
 static int   nxt_port_recv_test_step;
 static int   nxt_port_recv_test_block;
+static int   nxt_port_recv_test_quit_done;
+static int   nxt_port_recv_test_quit_calls;
 static int   nxt_port_recv_test_shared_queue_fd = -1;
 static int   nxt_port_recv_test_sock_fd = -1;
 static int   nxt_port_recv_test_queue_fd = -1;
@@ -83,6 +85,21 @@ nxt_port_recv_test_assert(int cond, const char *name)
 static void
 nxt_port_recv_test_handler(nxt_unit_request_info_t *req)
 {
+}
+
+
+/*
+ * The quit callback of an embedder such as Node.js releases the context
+ * at once.  That can free it when the libunit call returns.
+ */
+static void
+nxt_port_recv_test_quit(nxt_unit_ctx_t *ctx)
+{
+    nxt_port_recv_test_quit_calls++;
+
+    if (nxt_port_recv_test_quit_done) {
+        nxt_unit_done(ctx);
+    }
 }
 
 
@@ -605,6 +622,378 @@ nxt_port_recv_test_deferred_quit_read(nxt_unit_ctx_t *ctx, int run_ctx,
 
 
 static void
+nxt_port_recv_test_deferred_quit_port_msg(nxt_unit_ctx_t *ctx,
+    const char *name)
+{
+    int    rc;
+    pid_t  pid;
+
+    /*
+     * An embedder that drives its own event loop never enters a libunit
+     * read loop.  So nxt_unit_process_port_msg() is the only wake-up that
+     * can run the retry.  Without it, the FINISH edge is never sent again,
+     * and the router holds the worker detached.  Here the retry completes
+     * a deferred graceful quit, which removes the read port.  So the call
+     * must also report "no message" and must not receive.  The alarm
+     * catches a wait for a message that the router will never send.
+     */
+
+    pid = fork();
+
+    if (pid == 0) {
+        nxt_port_recv_test_block = 1;
+
+        nxt_unit_test_ctx_set_ready(ctx, 1);
+        nxt_unit_test_ctx_set_detached(ctx, 1);
+        nxt_unit_test_ctx_set_detached_retries(ctx, 0);
+
+        nxt_unit_test_ctx_quit_graceful(ctx);
+
+        /* One failure: the handler return arms the retry, the retry sends. */
+        nxt_unit_test_send_detached_failures(1);
+        nxt_unit_test_ctx_detached_done(ctx);
+
+        if (nxt_unit_test_ctx_detached(ctx) != 1
+            || nxt_unit_test_ctx_detached_retries(ctx) != 1)
+        {
+            _exit(1);
+        }
+
+        alarm(5);
+
+        rc = nxt_unit_process_port_msg(ctx,
+                                       nxt_unit_test_ctx_read_port(ctx));
+
+        if (rc != NXT_UNIT_AGAIN
+            || nxt_unit_test_ctx_online(ctx) != 0
+            || nxt_unit_test_ctx_detached(ctx) != 0
+            || nxt_unit_test_ctx_detached_retries(ctx) != 0)
+        {
+            _exit(2);
+        }
+
+        _exit(0);
+    }
+
+    nxt_port_recv_test_child_wait(pid, name);
+}
+
+
+/*
+ * The clock of nxt_unit_detached_now(), in milliseconds, through a test
+ * hook.  The retries are paced with a deadline on that clock, so the
+ * test measures them with the same clock.
+ */
+
+static long
+nxt_port_recv_test_ms(uint64_t from, uint64_t to)
+{
+    return (long) (to - from);
+}
+
+
+static void
+nxt_port_recv_test_port_msg_retry_pending(nxt_unit_ctx_t *ctx,
+    const char *name)
+{
+    int              rc;
+    long             call_ms, max_ms;
+    pid_t            pid;
+    uint64_t         end, start, t0, t1;
+    unsigned int     calls;
+
+    /*
+     * A retry that fails again leaves the context online with the FINISH
+     * still pending.  Nothing else wakes the embedder: its read port stays
+     * quiet until unrelated traffic arrives.  The call must report
+     * NXT_UNIT_OK, because an embedder calls again on that code.  It must
+     * not report NXT_UNIT_AGAIN, which stops the embedder and leaves the
+     * worker detached.  The call must not wait for the backoff either,
+     * because that would freeze the embedder's event loop.  Each call
+     * returns at once, and a deadline paces the retries.  Reads block, so
+     * the alarm catches a wait for a message.  The slowest call catches a
+     * bounded wait.  The elapsed time catches retries that spin through the
+     * budget instead of pacing it.
+     */
+
+    pid = fork();
+
+    if (pid == 0) {
+        nxt_port_recv_test_block = 1;
+
+        nxt_unit_test_ctx_set_ready(ctx, 1);
+        nxt_unit_test_ctx_set_detached(ctx, 1);
+        nxt_unit_test_ctx_set_detached_retries(ctx, 0);
+        nxt_unit_test_send_detached_failures(20);
+
+        nxt_unit_test_ctx_detached_done(ctx);
+
+        if (nxt_unit_test_ctx_detached_retries(ctx) != 1) {
+            _exit(1);
+        }
+
+        alarm(10);
+
+        max_ms = 0;
+
+        start = nxt_unit_test_detached_now();
+
+        for (calls = 1; calls <= 10000000; calls++) {
+            t0 = nxt_unit_test_detached_now();
+
+            rc = nxt_unit_process_port_msg(ctx,
+                                           nxt_unit_test_ctx_read_port(ctx));
+
+            t1 = nxt_unit_test_detached_now();
+
+            call_ms = nxt_port_recv_test_ms(t0, t1);
+            max_ms = nxt_max(max_ms, call_ms);
+
+            if (rc != NXT_UNIT_OK) {
+                break;
+            }
+        }
+
+        end = nxt_unit_test_detached_now();
+
+        /*
+         * Each call reports "call me again" until the tenth retry reaches
+         * the give-up.  The give-up closes the worker instead of leaving it
+         * detached for good.
+         */
+
+        if (rc != NXT_UNIT_ERROR || calls <= 10) {
+            _exit(2);
+        }
+
+        if (nxt_unit_test_ctx_online(ctx) != 0
+            || nxt_unit_test_ctx_detached_retries(ctx) != 11)
+        {
+            _exit(3);
+        }
+
+        if (nxt_port_recv_test_ms(start, end) < 100) {
+            _exit(4);
+        }
+
+        /* The last backoff steps are 256 ms.  A wait that long is a block. */
+
+        if (max_ms >= 50) {
+            _exit(5);
+        }
+
+        _exit(0);
+    }
+
+    nxt_port_recv_test_child_wait(pid, name);
+}
+
+
+static void
+nxt_port_recv_test_ms_sleep(int ms)
+{
+    struct timespec  ts;
+
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000L;
+
+    (void) nanosleep(&ts, NULL);
+}
+
+
+static void
+nxt_port_recv_test_port_msg_retry_timeout(nxt_unit_ctx_t *ctx,
+    const char *name)
+{
+    int           rc, timeout;
+    pid_t         pid;
+    uint64_t      end, start;
+    unsigned int  calls;
+
+    /*
+     * An embedder calls again on NXT_UNIT_OK.  If it calls at once each
+     * time, its loop spins through the backoff until the deadline.  So
+     * nxt_unit_detached_retry_timeout() gives the delay to the deadline.
+     * An embedder that waits for that delay must still reach each retry
+     * and the give-up, with few calls.  The alarm catches a wait for a
+     * message.
+     */
+
+    pid = fork();
+
+    if (pid == 0) {
+        nxt_port_recv_test_block = 1;
+
+        nxt_unit_test_ctx_set_ready(ctx, 1);
+        nxt_unit_test_ctx_set_detached(ctx, 1);
+        nxt_unit_test_ctx_set_detached_retries(ctx, 0);
+        nxt_unit_test_send_detached_failures(20);
+
+        /* No retry is pending. */
+
+        if (nxt_unit_detached_retry_timeout(ctx) != -1) {
+            _exit(1);
+        }
+
+        nxt_unit_test_ctx_detached_done(ctx);
+
+        /* The first retry is due at once. */
+
+        if (nxt_unit_test_ctx_detached_retries(ctx) != 1
+            || nxt_unit_detached_retry_timeout(ctx) != 0)
+        {
+            _exit(2);
+        }
+
+        alarm(10);
+
+        /* The retry fails, and the call finds no message. */
+
+        rc = nxt_unit_process_port_msg(ctx,
+                                       nxt_unit_test_ctx_read_port(ctx));
+
+        timeout = nxt_unit_detached_retry_timeout(ctx);
+
+        if (rc != NXT_UNIT_OK || timeout <= 0 || timeout > 256) {
+            _exit(3);
+        }
+
+        /* After the deadline, the next retry is due at once. */
+
+        nxt_port_recv_test_ms_sleep(timeout + 1);
+
+        if (nxt_unit_detached_retry_timeout(ctx) != 0) {
+            _exit(4);
+        }
+
+        start = nxt_unit_test_detached_now();
+
+        for (calls = 1; calls <= 10000000; calls++) {
+            rc = nxt_unit_process_port_msg(ctx,
+                                           nxt_unit_test_ctx_read_port(ctx));
+            if (rc != NXT_UNIT_OK) {
+                break;
+            }
+
+            timeout = nxt_unit_detached_retry_timeout(ctx);
+
+            if (timeout > 0) {
+                nxt_port_recv_test_ms_sleep(timeout);
+            }
+        }
+
+        end = nxt_unit_test_detached_now();
+
+        if (rc != NXT_UNIT_ERROR || nxt_unit_test_ctx_online(ctx) != 0) {
+            _exit(5);
+        }
+
+        /* The give-up leaves nothing pending. */
+
+        if (nxt_unit_detached_retry_timeout(ctx) != -1) {
+            _exit(6);
+        }
+
+        /* The embedder waited: few calls, and the backoff still paced. */
+
+        if (calls > 30 || nxt_port_recv_test_ms(start, end) < 500) {
+            _exit(7);
+        }
+
+        _exit(0);
+    }
+
+    nxt_port_recv_test_child_wait(pid, name);
+}
+
+
+static void
+nxt_port_recv_test_shared_quit_retry(nxt_unit_ctx_t *ctx, unsigned int fails,
+    int expect, const char *name)
+{
+    int       rc;
+    pid_t     pid;
+    uint64_t  end, start;
+
+    /*
+     * The shared loop ends when nxt_unit_chk_ready() turns false.  That
+     * can happen with a finish retry pending: a graceful quit deferred on
+     * the detached state clears ->ready, and the request that ended the
+     * detached work can be the one that reached "request_limit".  The loop
+     * must run the retry before it leaves.  If not, the router holds the
+     * worker detached, and the deferred quit never completes.  Nothing is
+     * ready, so no read reaches the shared port.  The alarm catches a wait
+     * anyway.
+     */
+
+    pid = fork();
+
+    if (pid == 0) {
+        nxt_unit_test_ctx_set_ready(ctx, 1);
+        nxt_unit_test_ctx_set_detached(ctx, 1);
+        nxt_unit_test_ctx_set_detached_retries(ctx, 0);
+
+        nxt_unit_test_ctx_quit_graceful(ctx);
+
+        if (nxt_unit_test_ctx_ready(ctx) != 0
+            || nxt_unit_test_ctx_online(ctx) != 1)
+        {
+            _exit(1);
+        }
+
+        nxt_unit_test_send_detached_failures(fails);
+        nxt_unit_test_ctx_detached_done(ctx);
+
+        if (nxt_unit_test_ctx_detached_retries(ctx) != 1) {
+            _exit(2);
+        }
+
+        alarm(5);
+
+        start = nxt_unit_test_detached_now();
+
+        rc = nxt_unit_run_shared(ctx);
+
+        end = nxt_unit_test_detached_now();
+
+        if (rc != expect || nxt_unit_test_ctx_online(ctx) != 0) {
+            _exit(3);
+        }
+
+        /*
+         * A retry that succeeds clears the state and completes the quit.
+         * A retry that never succeeds reaches the give-up.  The give-up
+         * closes the worker instead of leaving it detached.
+         */
+
+        if (expect == NXT_UNIT_OK) {
+            if (nxt_unit_test_ctx_detached(ctx) != 0
+                || nxt_unit_test_ctx_detached_retries(ctx) != 0)
+            {
+                _exit(4);
+            }
+
+        } else if (nxt_unit_test_ctx_detached_retries(ctx) != 11) {
+            _exit(5);
+
+        } else if (nxt_port_recv_test_ms(start, end) < 100) {
+            /*
+             * The retries use the same backoff as the read loops, about
+             * 0.77 s in all.  A much shorter time means that the loop
+             * spins and burns the whole budget at once.
+             */
+
+            _exit(6);
+        }
+
+        _exit(0);
+    }
+
+    nxt_port_recv_test_child_wait(pid, name);
+}
+
+
+static void
 nxt_port_recv_test_socket_quit(nxt_unit_ctx_t *ctx, uint8_t ready,
     const char *name)
 {
@@ -660,6 +1049,75 @@ nxt_port_recv_test_socket_quit(nxt_unit_ctx_t *ctx, uint8_t ready,
         }
 
         if (nxt_unit_test_ctx_online(ctx) != 0) {
+            _exit(3);
+        }
+
+        _exit(0);
+    }
+
+    nxt_port_recv_test_child_wait(pid, name);
+}
+
+
+static void
+nxt_port_recv_test_port_msg_quit(nxt_unit_ctx_t *ctx, const char *name)
+{
+    int              rc;
+    pid_t            pid;
+    ssize_t          n;
+    nxt_unit_port_t  *port;
+
+    struct {
+        nxt_port_msg_t  msg;
+        uint8_t         quit_param;
+    } nxt_packed m;
+
+    /*
+     * A QUIT that nxt_unit_process_port_msg() processes runs the quit
+     * callback.  The callback of Node.js calls nxt_unit_done().  Then the
+     * reference of the call is the last one, and the return frees the
+     * context.  A caller that reads ctx after that, for example with
+     * nxt_unit_detached_retry_timeout(), touches freed memory.  So the call
+     * must return NXT_UNIT_AGAIN, "do not call again", and the caller must
+     * not use ctx or port after that.  The sanitizer catches a use after
+     * the free.  The alarm catches a wait for a message.
+     */
+
+    pid = fork();
+
+    if (pid == 0) {
+        nxt_port_recv_test_block = 1;
+        nxt_port_recv_test_quit_done = 1;
+        nxt_port_recv_test_quit_calls = 0;
+
+        nxt_unit_test_ctx_set_ready(ctx, 1);
+        nxt_unit_test_ctx_set_detached(ctx, 0);
+        nxt_unit_test_ctx_set_detached_retries(ctx, 0);
+
+        port = nxt_unit_test_ctx_read_port(ctx);
+
+        memset(&m, 0, sizeof(m));
+
+        m.msg.pid = getppid();
+        m.msg.type = _NXT_PORT_MSG_QUIT;
+        m.quit_param = NXT_PORT_QUIT_GRACEFUL;
+
+        n = write(nxt_port_recv_test_read_out_fd, &m, sizeof(m));
+        if (n != (ssize_t) sizeof(m)) {
+            _exit(1);
+        }
+
+        alarm(5);
+
+        rc = nxt_unit_process_port_msg(ctx, port);
+
+        /* ctx and port are freed here.  Only rc and the counter are safe. */
+
+        if (nxt_port_recv_test_quit_calls != 1) {
+            _exit(2);
+        }
+
+        if (rc != NXT_UNIT_AGAIN) {
             _exit(3);
         }
 
@@ -786,6 +1244,7 @@ main(void)
     init.callbacks.request_handler = nxt_port_recv_test_handler;
     init.callbacks.port_send = nxt_port_recv_test_send;
     init.callbacks.port_recv = nxt_port_recv_test_recv;
+    init.callbacks.quit = nxt_port_recv_test_quit;
 
     init.ready_port.id.pid = getpid();
     init.ready_port.id.id = 1;
@@ -893,12 +1352,32 @@ main(void)
         "bare socket quit stops a context not ready");
     nxt_port_recv_test_socket_quit(ctx, 1,
         "bare socket quit stops a ready context");
+    nxt_port_recv_test_port_msg_quit(ctx,
+        "nxt_unit_process_port_msg() stops the caller on a quit that frees");
+    nxt_port_recv_test_deferred_quit_port_msg(ctx,
+        "nxt_unit_process_port_msg() runs a pending finish retry");
+    nxt_port_recv_test_port_msg_retry_pending(ctx,
+        "nxt_unit_process_port_msg() asks for a call back, no wait");
+    nxt_port_recv_test_port_msg_retry_timeout(ctx,
+        "nxt_unit_detached_retry_timeout() paces the call back");
+    nxt_port_recv_test_shared_quit_retry(ctx, 1, NXT_UNIT_OK,
+        "nxt_unit_run_shared() runs a pending finish retry");
+    nxt_port_recv_test_shared_quit_retry(ctx, 20, NXT_UNIT_ERROR,
+        "nxt_unit_run_shared() reaches the give-up, not ready");
     nxt_port_recv_test_deferred_quit_read(ctx, 0,
         "nxt_unit_run() returns on a retry that completes a quit");
     nxt_port_recv_test_deferred_quit_read(ctx, 1,
         "nxt_unit_run_ctx() returns on a retry that completes a quit");
     nxt_port_recv_test_detached_single_fail(ctx);
 #endif
+
+    /*
+     * Release the library.  After main() returns, no root keeps it
+     * reachable, and LeakSanitizer reports it or not depending on stale
+     * stack contents.
+     */
+    nxt_unit_done(ctx2);
+    nxt_unit_done(ctx);
 
     if (nxt_port_recv_test_failures != 0) {
         printf("port_recv test: %d failure(s)\n",

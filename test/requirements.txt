@@ -1,2 +1,4 @@
-pyOpenSSL>=20.0.1
-pytest>=6.0.1
+# Needs Python 3.10 or newer (pytest 9). On an older host, run the tests in
+# a container with test/run-local.sh instead; see test/README.md.
+pyOpenSSL>=26.0.0
+pytest>=9.0.3

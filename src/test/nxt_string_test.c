@@ -11,6 +11,7 @@ nxt_int_t
 nxt_string_test(nxt_thread_t *thr)
 {
     u_char      *p;
+    size_t      n;
     nxt_uint_t  i;
     nxt_bool_t  enc;
 
@@ -49,6 +50,20 @@ nxt_string_test(nxt_thread_t *thr)
         { nxt_string("%"),          0 },   /* 1 byte */
         { nxt_string("%ZZ"),        0 },   /* invalid hex */
         { nxt_string(" "),          0 },   /* space must be escaped */
+    };
+
+    /* nxt_str_strip(): the length without trailing CR, LF, SP and HTAB. */
+    static const struct {
+        nxt_str_t  str;
+        size_t     length;
+    } strip[] = {
+        { nxt_string("13700"),        5 },
+        { nxt_string("13700\r\n"),    5 },
+        { nxt_string("13700 \t\n"),   5 },
+        { nxt_string("1 2\n"),        3 },   /* inner space stays */
+        { nxt_string(" 13700"),       6 },   /* leading space stays */
+        { nxt_string(" \t\r\n"),      0 },
+        { nxt_string(""),             0 },
     };
 
     nxt_thread_time_update(thr);
@@ -90,6 +105,18 @@ nxt_string_test(nxt_thread_t *thr)
             nxt_log_alert(thr->log, "nxt_is_complex_uri_encoded(\"%V\") failed: "
                           "got %d, expected %d", &cplx[i].uri, (int) enc,
                           (int) cplx[i].encoded);
+            return NXT_ERROR;
+        }
+    }
+
+    for (i = 0; i < nxt_nitems(strip); i++) {
+        n = nxt_str_strip(strip[i].str.start,
+                          strip[i].str.start + strip[i].str.length);
+
+        if (n != strip[i].length) {
+            nxt_log_alert(thr->log, "nxt_str_strip(\"%V\") failed: "
+                          "got %uz, expected %uz", &strip[i].str, n,
+                          strip[i].length);
             return NXT_ERROR;
         }
     }

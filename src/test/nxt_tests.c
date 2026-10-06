@@ -74,6 +74,9 @@ static nxt_int_t (*const nxt_security_tests[])(nxt_thread_t *) = {
     nxt_checked_test, nxt_port_mmap_read_test,
     nxt_router_response_parse_test, nxt_port_frag_test,
     nxt_port_release_test, nxt_nncq_bound_test,
+#if (NXT_HAVE_REGEX)
+    nxt_regex_test,
+#endif
 };
 
 
@@ -238,6 +241,14 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_http_validate_host_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_http_request_body_alloc_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_conf_json_depth_test(thr) != NXT_OK) {
         return 1;
     }
@@ -273,6 +284,23 @@ main(int argc, char **argv)
     if (nxt_port_ready_test(thr) != NXT_OK) {
         return 1;
     }
+
+    if (nxt_conn_close_idle_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_listen_event_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_conn_io_accept_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_runtime_idle_close_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_router_new_port_test(thr) != NXT_OK) {
         return 1;
     }
@@ -313,6 +341,14 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_router_sender_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_stale_joint_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_router_websocket_test(thr) != NXT_OK) {
         return 1;
     }
@@ -326,6 +362,10 @@ main(int argc, char **argv)
     }
 
     if (nxt_main_file_store_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_main_store_test(thr) != NXT_OK) {
         return 1;
     }
 
@@ -371,6 +411,12 @@ main(int argc, char **argv)
         return 1;
     }
 
+#if (NXT_HAVE_OPENSSL)
+    if (nxt_openssl_server_init_test(thr) != NXT_OK) {
+        return 1;
+    }
+#endif
+
 #if (NXT_HAVE_CGROUP)
     if (nxt_cgroup_test(thr) != NXT_OK) {
         return 1;
@@ -381,8 +427,18 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_cpu_limit_test(thr) != NXT_OK) {
+        return 1;
+    }
+
 #if (NXT_HAVE_CLONE_NEWUSER)
     if (nxt_clone_creds_test(thr) != NXT_OK) {
+        return 1;
+    }
+#endif
+
+#if (NXT_HAVE_ISOLATION_ROOTFS)
+    if (nxt_isolation_mount_dst_test(thr) != NXT_OK) {
         return 1;
     }
 #endif

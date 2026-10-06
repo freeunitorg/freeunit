@@ -1,11 +1,14 @@
 import re
 import socket
+import ssl
 import subprocess
 import time
 
 import pytest
 
 from unit.applications.lang.python import ApplicationPython
+from unit.applications.tls import ApplicationTLS
+from unit.option import option
 
 prerequisites = {'modules': {'python': 'any'}}
 
@@ -373,6 +376,760 @@ Connection: close
     finally:
         # The default no-restart suite preserves /settings between tests.
         client.conf_delete('settings/http/send_timeout')
+
+
+def min_rate_conf(conf):
+    assert 'success' in client.conf({'http': conf}, 'settings')
+
+
+def min_rate_reset():
+    # The default no-restart suite preserves /settings between tests.
+    for name in (
+        'body_read_timeout',
+        'body_min_rate',
+        'send_timeout',
+        'send_min_rate',
+        'chunked_transform',
+    ):
+        client.conf_delete(f'settings/http/{name}')
+
+
+BODY_RATE_RECORD = r'client body rate is less than body_min_rate'
+
+
+def min_rate_slow_body(sock, part, limit):
+    # Sends "part" about once each second for at most "limit" seconds, and
+    # reads what the router sends back.  Returns (closed, data, elapsed).
+    sock.settimeout(1)
+
+    start = time.monotonic()
+    data = b''
+    closed = False
+
+    while time.monotonic() - start < limit:
+        try:
+            sock.sendall(part)
+        except OSError:
+            closed = True
+            break
+
+        try:
+            chunk = sock.recv(4096)
+        except socket.timeout:
+            continue
+        except OSError:
+            closed = True
+            break
+
+        if not chunk:
+            closed = True
+            break
+
+        data += chunk
+
+    return closed, data, time.monotonic() - start
+
+
+@pytest.mark.parametrize('timeout', [2, 0])
+def test_settings_body_min_rate_slow_body(timeout, wait_for_record):
+    # A client sends the body 1 byte each second.  Each byte starts the
+    # body_read_timeout gap timer again, so only the rate floor can stop
+    # this client.  The floor check starts after the grace time (equal to
+    # body_read_timeout, 2 s).  The first body read after the grace time
+    # must give 408.  With body_read_timeout 0 there is no gap timer and
+    # no grace time, and each read is checked against the time since the
+    # previous read.  The first slow read must give 408.
+    client.load('empty')
+
+    min_rate_conf({'body_read_timeout': timeout, 'body_min_rate': 256})
+
+    try:
+        sock = socket.create_connection(('127.0.0.1', 8080))
+        sock.settimeout(1)
+        sock.sendall(
+            b'POST / HTTP/1.1\r\n'
+            b'Host: localhost\r\n'
+            b'Content-Length: 10000\r\n'
+            b'Connection: close\r\n\r\n'
+        )
+
+        closed, data, elapsed = min_rate_slow_body(sock, b'x', 12)
+        sock.close()
+
+        # The router closes the connection after the 408 response.  The
+        # client can get a reset before it reads the response, because
+        # the router does not read the rest of the body.
+        assert closed or data, 'slow body stopped'
+        assert data == b'' or data.startswith(b'HTTP/1.1 408'), 'slow body 408'
+        assert elapsed < 8, 'slow body stopped in time'
+        assert wait_for_record(BODY_RATE_RECORD) is not None, 'slow body log'
+
+    finally:
+        min_rate_reset()
+
+
+def test_settings_body_min_rate_chunked(wait_for_record):
+    # The same slow client as in the slow body test, with a chunked body.
+    # The client sends a chunk of 1 byte each second.  The chunked body is
+    # read in the same function as a body with Content-Length, but the
+    # chunk parser runs there first.  The floor counts the chunk framing
+    # too: 6 bytes each second, which is much less than 256.
+    client.load('empty')
+
+    min_rate_conf(
+        {
+            'body_read_timeout': 2,
+            'body_min_rate': 256,
+            'chunked_transform': True,
+        }
+    )
+
+    try:
+        sock = socket.create_connection(('127.0.0.1', 8080))
+        sock.sendall(
+            b'POST / HTTP/1.1\r\n'
+            b'Host: localhost\r\n'
+            b'Transfer-Encoding: chunked\r\n'
+            b'Connection: close\r\n\r\n'
+        )
+
+        closed, data, elapsed = min_rate_slow_body(sock, b'1\r\nx\r\n', 12)
+        sock.close()
+
+        assert closed or data, 'chunked body stopped'
+        assert data == b'' or data.startswith(
+            b'HTTP/1.1 408'
+        ), 'chunked body 408'
+        assert elapsed < 8, 'chunked body stopped in time'
+        assert wait_for_record(BODY_RATE_RECORD) is not None, 'chunked log'
+
+    finally:
+        min_rate_reset()
+
+
+def test_settings_body_min_rate_tls(wait_for_record):
+    # The same slow client as in the slow body test, on a TLS listener.
+    # The floor counts the bytes that the TLS layer gives to the router,
+    # so 1 byte each second is still below 256.
+    if not option.available['modules'].get('openssl'):
+        pytest.skip('requires openssl')
+
+    client.load('empty')
+
+    ApplicationTLS().certificate()
+
+    assert 'success' in client.conf(
+        {
+            "pass": "applications/empty",
+            "tls": {"certificate": "default"},
+        },
+        'listeners/*:8080',
+    )
+
+    min_rate_conf({'body_read_timeout': 2, 'body_min_rate': 256})
+
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+
+    try:
+        sock = context.wrap_socket(
+            socket.create_connection(('127.0.0.1', 8080))
+        )
+        sock.sendall(
+            b'POST / HTTP/1.1\r\n'
+            b'Host: localhost\r\n'
+            b'Content-Length: 10000\r\n'
+            b'Connection: close\r\n\r\n'
+        )
+
+        closed, data, elapsed = min_rate_slow_body(sock, b'x', 12)
+        sock.close()
+
+        assert closed or data, 'TLS slow body stopped'
+        assert data == b'' or data.startswith(
+            b'HTTP/1.1 408'
+        ), 'TLS slow body 408'
+        assert elapsed < 8, 'TLS slow body stopped in time'
+        assert wait_for_record(BODY_RATE_RECORD) is not None, 'TLS log'
+
+    finally:
+        min_rate_reset()
+
+
+def test_settings_body_min_rate_burst_then_slow(wait_for_record):
+    # A client sends half of the body at once, then 1 byte each second.
+    # With one average over the whole body, the burst would give credit
+    # for about 195 s at 256 bytes per second.  The rate is checked for
+    # each window of at least body_read_timeout, so the first slow window
+    # must give 408.
+    client.load('empty')
+
+    min_rate_conf({'body_read_timeout': 2, 'body_min_rate': 256})
+
+    try:
+        sock = socket.create_connection(('127.0.0.1', 8080))
+        sock.settimeout(1)
+        sock.sendall(
+            b'POST / HTTP/1.1\r\n'
+            b'Host: localhost\r\n'
+            b'Content-Length: 100000\r\n'
+            b'Connection: close\r\n\r\n'
+        )
+        sock.sendall(b'x' * 50000)
+
+        closed, data, elapsed = min_rate_slow_body(sock, b'x', 20)
+        sock.close()
+
+        assert closed or data, 'burst then slow body stopped'
+        assert data == b'' or data.startswith(
+            b'HTTP/1.1 408'
+        ), 'burst then slow body 408'
+        assert elapsed < 12, 'burst then slow body stopped in time'
+        assert (
+            wait_for_record(BODY_RATE_RECORD) is not None
+        ), 'burst then slow body log'
+
+    finally:
+        min_rate_reset()
+
+
+@pytest.mark.parametrize('timeout', [2, 0])
+def test_settings_body_min_rate_normal_body(timeout):
+    # A body that is sent faster than the floor must not be stopped, also
+    # with body_read_timeout 0, when each read is checked.  The second
+    # request on the same keep-alive connection comes after an idle time
+    # that is longer than the grace time.  It must start with new rate
+    # state.
+    client.load('empty')
+
+    min_rate_conf({'body_read_timeout': timeout, 'body_min_rate': 256})
+
+    def req(sock, close):
+        sock.sendall(
+            b'POST / HTTP/1.1\r\n'
+            b'Host: localhost\r\n'
+            b'Content-Length: 100000\r\n'
+            + (b'Connection: close\r\n' if close else b'')
+            + b'\r\n'
+        )
+
+        for _ in range(10):
+            time.sleep(0.2)
+            sock.sendall(b'x' * 10000)
+
+        return sock.recv(4096)
+
+    try:
+        sock = socket.create_connection(('127.0.0.1', 8080))
+        sock.settimeout(10)
+
+        assert req(sock, False).startswith(b'HTTP/1.1 200'), 'first'
+
+        time.sleep(3)
+
+        assert req(sock, True).startswith(b'HTTP/1.1 200'), 'second'
+
+        sock.close()
+
+    finally:
+        min_rate_reset()
+
+
+CONTINUE = b'HTTP/1.1 100 Continue\r\n\r\n'
+
+
+def min_rate_expect(length):
+    # Sends a header with "Expect: 100-continue" and reads the 100.  The
+    # client sends no body byte before it gets the 100.
+    sock = socket.create_connection(('127.0.0.1', 8080))
+    sock.sendall(
+        b'POST / HTTP/1.1\r\n'
+        b'Host: localhost\r\n'
+        b'Expect: 100-continue\r\n'
+        + f'Content-Length: {length}\r\n'.encode()
+        + b'Connection: close\r\n\r\n'
+    )
+
+    data = b''
+    sock.settimeout(5)
+
+    while len(data) < len(CONTINUE):
+        try:
+            part = sock.recv(len(CONTINUE) - len(data))
+        except socket.timeout:
+            break
+
+        if not part:
+            break
+
+        data += part
+
+    assert data == CONTINUE, '100 before the body'
+
+    return sock
+
+
+def test_settings_body_min_rate_expect_slow_body(wait_for_record):
+    # After a 100 (Continue), the body read state starts in another
+    # function.  The floor must be active there too.  Otherwise a client
+    # can avoid the floor with "Expect: 100-continue".  The client sends
+    # 1 byte each second after the 100 and must get 408.
+    client.load('empty')
+
+    min_rate_conf({'body_read_timeout': 2, 'body_min_rate': 256})
+
+    try:
+        sock = min_rate_expect(10000)
+        sock.settimeout(1)
+
+        closed, data, elapsed = min_rate_slow_body(sock, b'x', 12)
+        sock.close()
+
+        assert closed or data, 'slow body after 100 stopped'
+        assert data == b'' or data.startswith(
+            b'HTTP/1.1 408'
+        ), 'slow body after 100 408'
+        assert elapsed < 8, 'slow body after 100 stopped in time'
+        assert (
+            wait_for_record(BODY_RATE_RECORD) is not None
+        ), 'slow body after 100 log'
+
+    finally:
+        min_rate_reset()
+
+
+def test_settings_body_min_rate_expect_wait():
+    # The client reads the 100, waits 1 s, and then sends the body much
+    # faster than the floor.  The wait is shorter than body_read_timeout.
+    # Like the gap timer, the floor counts the wait in the first window.
+    # The client sends enough bytes before the first check, at 2 s, so
+    # it must get 200.
+    client.load('empty')
+
+    min_rate_conf({'body_read_timeout': 2, 'body_min_rate': 256})
+
+    try:
+        sock = min_rate_expect(20000)
+
+        time.sleep(1)
+
+        try:
+            for _ in range(20):
+                sock.sendall(b'x' * 1000)
+                time.sleep(0.1)
+
+        except OSError:
+            # The router answered early.  The status shows why.
+            pass
+
+        sock.settimeout(10)
+
+        try:
+            data = sock.recv(4096)
+        except OSError:
+            data = b''
+
+        sock.close()
+
+        assert data.startswith(b'HTTP/1.1 200'), 'wait after 100'
+
+    finally:
+        min_rate_reset()
+
+
+@pytest.mark.parametrize('timeout', [3, 0])
+def test_settings_send_min_rate_slow_read(timeout, system, wait_for_record):
+    # A client reads a large response slower than send_min_rate, but fast
+    # enough that the router can write some data before each send_timeout.
+    # Each write starts the send_timeout gap timer again, so only the rate
+    # floor can stop this client.  With send_timeout 0 there is no gap
+    # timer and no grace time, and each write is checked against the time
+    # since the previous write.
+    #
+    # The router counts the bytes that the kernel accepts.  On loopback the
+    # kernel send buffer grows to some MiB, and the kernel signals a write
+    # event only when about one third of the buffer is free.  A client that
+    # reads only some bytes each second thus gets no write events, and the
+    # gap timer stops it.  To test the floor, this test uses larger numbers:
+    # the floor is 8 MiB/s and the client reads about 1 MiB/s.  The logic
+    # is the same as for a floor of 256 B/s on a real network.
+    #
+    # After the router closes the connection, the kernel still gives the
+    # client the data in the socket buffers.  Thus the test finds the close
+    # in the router log.  The time limits are generous because the kernel
+    # buffer sizes and the time of the write events are not exact.
+    #
+    # The numbers above are for the Linux loopback buffers.  Other systems
+    # size and signal the send buffer in a different way.
+    if system != 'Linux':
+        pytest.skip('Linux loopback buffer sizes only')
+
+    client.load('body_generate')
+
+    min_rate_conf({'send_timeout': timeout, 'send_min_rate': 8388608})
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+        sock.settimeout(1)
+        sock.connect(('127.0.0.1', 8080))
+        sock.sendall(
+            b'GET / HTTP/1.1\r\n'
+            b'Host: localhost\r\n'
+            b'X-Length: 67108864\r\n'
+            b'Connection: close\r\n\r\n'
+        )
+
+        start = time.monotonic()
+        total = 0
+        closed = False
+
+        while time.monotonic() - start < 12:
+            time.sleep(0.05)
+
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                continue
+            except OSError:
+                closed = True
+                break
+
+            if not chunk:
+                closed = True
+                break
+
+            total += len(chunk)
+
+        assert (
+            wait_for_record(
+                r'client send rate is less than send_min_rate', wait=50
+            )
+            is not None
+        ), 'slow read stopped by the floor'
+
+        # Read the data that the kernel keeps.  Then the close must come.
+        sock.settimeout(5)
+
+        try:
+            while not closed:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    closed = True
+                total += len(chunk)
+        except OSError:
+            closed = True
+
+        sock.close()
+
+        assert closed, 'slow read connection closed'
+        assert total < 67108864, 'slow read response cut'
+
+    finally:
+        min_rate_reset()
+
+
+@pytest.mark.parametrize('timeout', [2, 0])
+def test_settings_send_min_rate_fast_read(timeout):
+    # A client that reads at full speed must get all the data, also with
+    # send_timeout 0, when each write is checked.  Two responses on one
+    # keep-alive connection check that the second response starts with
+    # new rate state.
+    client.load('body_generate')
+
+    min_rate_conf({'send_timeout': timeout, 'send_min_rate': 256})
+
+    try:
+        for _ in range(2):
+            resp = client.get(
+                headers={
+                    'Host': 'localhost',
+                    'X-Length': '4194304',
+                    'Connection': 'close',
+                },
+            )
+            assert resp['status'] == 200
+            assert len(resp['body']) == 4194304
+
+        sock = socket.create_connection(('127.0.0.1', 8080))
+        sock.settimeout(10)
+
+        for close in (False, True):
+            time.sleep(3)
+            sock.sendall(
+                b'GET / HTTP/1.1\r\n'
+                b'Host: localhost\r\n'
+                b'X-Length: 1048576\r\n'
+                + (b'Connection: close\r\n' if close else b'')
+                + b'\r\n'
+            )
+
+            data = b''
+            while b'\r\n\r\n' not in data:
+                data += sock.recv(65536)
+
+            head, body = data.split(b'\r\n\r\n', 1)
+            assert head.startswith(b'HTTP/1.1 200'), 'keep-alive status'
+
+            while len(body) < 1048576:
+                chunk = sock.recv(65536)
+                assert chunk, 'keep-alive body'
+                body += chunk
+
+            assert len(body) == 1048576, 'keep-alive length'
+
+        sock.close()
+
+    finally:
+        min_rate_reset()
+
+
+def test_settings_send_min_rate_slow_application():
+    # The send floor counts only the time when response data waits for the
+    # client.  The time when the router waits for the application is not
+    # counted.  Thus a slow application (for example a stream of events)
+    # is not stopped, also with a high floor.  The application sends 4
+    # parts with 1 s between them, which is longer than the grace time
+    # (send_timeout 2).  The client reads at full speed.
+    client.load('delayed')
+
+    min_rate_conf({'send_timeout': 2, 'send_min_rate': 8388608})
+
+    try:
+        body = '0123456789' * 400
+
+        resp = client.post(
+            headers={
+                'Host': 'localhost',
+                'X-Parts': '4',
+                'X-Delay': '1',
+                'Connection': 'close',
+            },
+            body=body,
+            read_timeout=30,
+        )
+
+        assert resp['status'] == 200, 'slow application status'
+        assert resp['body'] == body, 'slow application body'
+
+    finally:
+        min_rate_reset()
+
+
+def test_settings_send_min_rate_gap_longer_than_grace(search_in_file):
+    # The time between send periods is not counted, also when it is longer
+    # than the grace time.  The application sends 1000 bytes, waits 2.5 s,
+    # and sends 1000 bytes more.  The grace time is 2 s.  The client reads
+    # at full speed, so the first period stops after about 1 ms.  The second
+    # period starts again from its own write, and its first check sees about
+    # 2 ms, not 2.5 s.  If the gap was counted, the check after the second
+    # write would see about 2000 bytes in 2.5 s, below the floor.  That
+    # write sends the last data, so the client still gets the full body,
+    # but the router closes the connection.  Thus the test sends a second
+    # request on the same connection.  On a router that counts the gap,
+    # that request finds the connection closed ('gap header'), and this
+    # assertion fails before the log search.
+    client.load('send_bursts')
+
+    min_rate_conf({'send_timeout': 2, 'send_min_rate': 1048576})
+
+    sock = socket.create_connection(('127.0.0.1', 8080))
+    sock.settimeout(10)
+
+    def response(length):
+        data = b''
+        while b'\r\n\r\n' not in data:
+            chunk = sock.recv(65536)
+            assert chunk, 'gap header'
+            data += chunk
+
+        head, body = data.split(b'\r\n\r\n', 1)
+        assert head.startswith(b'HTTP/1.1 200'), 'gap status'
+
+        while len(body) < length:
+            chunk = sock.recv(65536)
+            assert chunk, 'gap body'
+            body += chunk
+
+        return body
+
+    try:
+        start = time.monotonic()
+
+        sock.sendall(
+            b'GET / HTTP/1.1\r\n'
+            b'Host: localhost\r\n'
+            b'X-Part-Size: 1000\r\n'
+            b'X-Bursts: 2\r\n'
+            b'X-Interval: 2.5\r\n\r\n'
+        )
+
+        assert response(2000) == b'x' * 2000, 'gap body'
+        assert time.monotonic() - start >= 2.5, 'gap time'
+
+        sock.sendall(
+            b'GET / HTTP/1.1\r\n'
+            b'Host: localhost\r\n'
+            b'X-Part-Size: 10\r\n'
+            b'Connection: close\r\n\r\n'
+        )
+
+        assert response(10) == b'x' * 10, 'gap keep-alive body'
+
+        assert (
+            search_in_file(r'client send rate is less than send_min_rate')
+            is None
+        ), 'gap not stopped by the floor'
+
+    finally:
+        sock.close()
+        min_rate_reset()
+
+
+def test_settings_send_min_rate_stream_slow_read(
+    system, temp_dir, wait_for_record
+):
+    # An application sends a stream in bursts, 1.5 s apart.  The client
+    # keeps the socket send buffer full.  Each 1.5 s it reads only one burst.
+    # Then the parts of the burst that wait can go out before send_timeout.
+    # Thus each write event empties the router write queue, and each send
+    # period stops there.  The router must check the rate at that point
+    # too.  Otherwise it never checks this client, and the client reads
+    # below the floor for as long as the stream lasts.
+    #
+    # The test uses a unix socket.  On Linux, the kernel takes a unix socket
+    # write of 32 KiB whole or not at all, and the send buffer has the fixed
+    # size net.core.wmem_default.  A write event comes when 3/4 of the
+    # buffer is free.  Thus a part that does not fit waits whole, and the
+    # next write event sends all the parts that wait.  No write sends only
+    # some of the queued data.
+    if system != 'Linux':
+        pytest.skip('Linux unix socket buffers only')
+
+    # A new unix socket gets this size, the router socket too.  A container
+    # can have no /proc/sys/net/core/wmem_default, so ask a socket.
+    pair = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    wmem = pair[0].getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+    pair[0].close()
+    pair[1].close()
+
+    # The first burst fills the send buffer, and 2 or 3 parts wait.  Each
+    # next burst is a little more than the space that a write event frees.
+    # The client reads one burst each time, so 2 or 3 parts wait in each
+    # cycle, for about 1 s.  With wmem_default 212992: 9, then 6 parts.
+    part = 32768
+    first = wmem // part + 3
+    parts = wmem * 3 // 4 // part + 2
+    bursts = 5
+    length = part * (first + parts * (bursts - 1))
+
+    client.load('send_bursts')
+
+    addr = f'{temp_dir}/sock'
+
+    assert 'success' in client.conf(
+        {f'unix:{addr}': {'application': 'send_bursts'}}, 'listeners'
+    )
+
+    # The router measures about one burst for each 1 s of waiting.  The
+    # floor is four bursts each second.
+    min_rate_conf({'send_timeout': 2, 'send_min_rate': 4 * parts * part})
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    start = time.monotonic()
+
+    def read(size):
+        # Returns "size" bytes, or less if the connection closes.
+        data = b''
+
+        while len(data) < size:
+            try:
+                chunk = sock.recv(min(65536, size - len(data)))
+            except OSError:
+                break
+
+            if not chunk:
+                break
+
+            data += chunk
+
+        return data
+
+    try:
+        sock.settimeout(5)
+        sock.connect(addr)
+        sock.sendall(
+            b'GET / HTTP/1.1\r\n'
+            b'Host: localhost\r\n'
+            + f'X-First: {first}\r\n'.encode()
+            + f'X-Parts: {parts}\r\n'.encode()
+            + f'X-Part-Size: {part}\r\n'.encode()
+            + f'X-Bursts: {bursts}\r\n'.encode()
+            + b'X-Interval: 1.5\r\n'
+            b'Connection: close\r\n\r\n'
+        )
+        start = time.monotonic()
+
+        head = b''
+        while not head.endswith(b'\r\n\r\n'):
+            byte = read(1)
+            if not byte:
+                break
+
+            head += byte
+
+        assert head.startswith(b'HTTP/1.1 200'), 'stream status'
+
+        total = 0
+
+        for burst in range(bursts):
+            time.sleep(max(0, start + 1.5 * burst + 1 - time.monotonic()))
+
+            size = parts * part if burst < bursts - 1 else length - total
+            got = len(read(size))
+            total += got
+
+            if got < size:
+                break
+
+        assert total < length, 'slow stream reader stopped'
+
+        assert (
+            wait_for_record(
+                r'client send rate is less than send_min_rate', wait=50
+            )
+            is not None
+        ), 'slow stream reader stopped by the floor'
+
+    finally:
+        sock.close()
+        min_rate_reset()
+
+        # The application still runs its schedule.  Let it end before the
+        # next test changes the configuration.
+        time.sleep(max(0, start + 7 - time.monotonic()))
+
+
+def test_settings_min_rate_validation():
+    client.load('empty')
+
+    try:
+        for name in ('body_min_rate', 'send_min_rate'):
+            assert 'error' in client.conf({'http': {name: -1}}, 'settings')
+            assert 'error' in client.conf({'http': {name: 1.5}}, 'settings')
+            assert 'error' in client.conf({'http': {name: '256'}}, 'settings')
+            assert 'error' in client.conf(
+                {'http': {name: 2147483648}}, 'settings'
+            )
+            assert 'success' in client.conf({'http': {name: 0}}, 'settings')
+            assert 'success' in client.conf(
+                {'http': {name: 2147483647}}, 'settings'
+            )
+            assert 'success' in client.conf({'http': {name: 256}}, 'settings')
+
+    finally:
+        min_rate_reset()
 
 
 def test_settings_idle_timeout():

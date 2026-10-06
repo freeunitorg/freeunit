@@ -198,14 +198,18 @@ class LifecycleApp:
             kwargs['headers'] = dict(KEEPALIVE)
             kwargs['start'] = True
             # the server will not close a keep-alive connection, so recvall()
-            # must be allowed to stop on a short timeout instead of on EOF.
+            # cannot stop on EOF.  framed=True stops the read when the
+            # response is complete by its Content-Length or its chunked
+            # framing.  Every app in RUNTIMES sends one of the two.  Before
+            # this, every keep-alive read waited for the full read_timeout:
+            # 15 reads in test_app_lifecycle_churn_under_keepalive, 30 s per
+            # runtime.
             #
-            # Every keep-alive read therefore costs this timeout in full, and
-            # the same timeout is all that separates "the response is
-            # complete" from "the app has not answered yet".  Two seconds
-            # buys margin over an ASan-instrumented worker on a loaded runner
-            # without paying much for it; the startup race that would need
-            # more than that is closed by waiting for the workers instead.
+            # read_timeout is now only the limit for an app that has not
+            # answered.  Two seconds gives margin for an ASan worker on a
+            # loaded runner.  A startup race that needs more than that is
+            # closed by waiting for the workers instead.
+            kwargs['framed'] = True
             kwargs['read_timeout'] = 2
 
             if sock is not None:
@@ -808,10 +812,11 @@ def test_app_lifecycle_app_fds_stable(app):
 
     The socket rule is therefore one bound, and the discovery ceiling is
     what makes it safe.  There are at most nxt_ncpu engines, the test does
-    not touch `listen_threads`, and nxt_ncpu is CPU_COUNT() of the affinity
-    mask, capped by _SC_NPROCESSORS_ONLN (nxt_lib.c) -- which is what
-    os.sched_getaffinity() reports here.  So: total socket growth across the
-    two windows may not exceed that ceiling.  Discovery can never exceed it,
+    not touch `listen_threads`, and nxt_ncpu is at most CPU_COUNT() of the
+    affinity mask, capped by _SC_NPROCESSORS_ONLN (nxt_lib.c) -- which is
+    what os.sched_getaffinity() reports here.  A cgroup v2 CPU limit can
+    only lower nxt_ncpu.  So: total socket growth across the two windows may
+    not exceed that ceiling.  Discovery can never exceed it,
     however the first touches fall across the windows -- one window, both,
     or a whole burst's worth of fresh engines on a machine with more CPUs
     than the burst has requests -- so this bound cannot be tripped by the
@@ -957,8 +962,9 @@ def test_app_lifecycle_app_fds_stable(app):
         )
 
     # sockets: bounded by the engine count, because port discovery is lazy
-    # and one-time per engine.  nxt_ncpu is CPU_COUNT() of the affinity mask
-    # (src/nxt_lib.c) and the test does not touch `listen_threads`.
+    # and one-time per engine.  nxt_ncpu is at most CPU_COUNT() of the
+    # affinity mask; a cgroup v2 CPU limit can only lower it (src/nxt_lib.c).
+    # The test does not touch `listen_threads`.
     ncpu = max(len(os.sched_getaffinity(0)), 1)
 
     sockets = [n.sockets for n in counts]

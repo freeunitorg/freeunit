@@ -31,15 +31,18 @@
 
 #if (NXT_HAVE_LINUX_NS)
 static nxt_int_t nxt_process_pipe_timer(nxt_fd_t fd, short event);
-static nxt_int_t nxt_process_check_pid_status(const nxt_fd_t *gc_pipe);
-static nxt_pid_t nxt_process_recv_pid(const nxt_fd_t *pid_pipe,
-    const nxt_fd_t *gc_pipe);
+static void nxt_process_fd_close(nxt_fd_t *fd);
+static void nxt_process_pipe_close(nxt_fd_t *pp);
+static nxt_int_t nxt_process_recv_status(const nxt_fd_t *gc_pipe);
+static void nxt_process_send_status(const nxt_fd_t *gc_pipe, int8_t status);
+static nxt_pid_t nxt_process_recv_pid(const nxt_fd_t *pid_pipe);
 static void nxt_process_send_pid(const nxt_fd_t *pid_pipe, nxt_pid_t pid);
 static nxt_int_t nxt_process_unshare(nxt_task_t *task, nxt_process_t *process,
-    nxt_fd_t *pid_pipe, nxt_fd_t *gc_pipe, nxt_bool_t use_pidns);
-static nxt_int_t nxt_process_init_pidns(nxt_task_t *task,
+    nxt_fd_t *pid_pipe, nxt_fd_t *gc_pipe, nxt_bool_t use_pidns,
+    nxt_bool_t use_cgroup);
+static nxt_int_t nxt_process_init_pipes(nxt_task_t *task,
     const nxt_process_t *process, nxt_fd_t *pid_pipe, nxt_fd_t *gc_pipe,
-    nxt_bool_t *use_pidns);
+    nxt_bool_t *use_pidns, nxt_bool_t *use_cgroup);
 #endif
 
 static nxt_pid_t nxt_process_create(nxt_task_t *task, nxt_process_t *process);
@@ -445,51 +448,74 @@ nxt_process_pipe_timer(nxt_fd_t fd, short event)
 }
 
 
+static void
+nxt_process_fd_close(nxt_fd_t *fd)
+{
+    if (*fd != -1) {
+        close(*fd);
+        *fd = -1;
+    }
+}
+
+
+static void
+nxt_process_pipe_close(nxt_fd_t *pp)
+{
+    /* A pipe that nxt_process_init_pipes() did not create is -1. */
+
+    nxt_process_fd_close(&pp[0]);
+    nxt_process_fd_close(&pp[1]);
+}
+
+
 static nxt_int_t
-nxt_process_check_pid_status(const nxt_fd_t *gc_pipe)
+nxt_process_recv_status(const nxt_fd_t *gc_pipe)
 {
     int8_t   status = -1;
     ssize_t  ret;
-
-    close(gc_pipe[1]);
 
     ret = nxt_process_pipe_timer(gc_pipe[0], POLLIN);
     if (ret == NXT_OK) {
         read(gc_pipe[0], &status, sizeof(int8_t));
     }
 
-    close(gc_pipe[0]);
-
     return status;
 }
 
 
-static nxt_pid_t
-nxt_process_recv_pid(const nxt_fd_t *pid_pipe, const nxt_fd_t *gc_pipe)
+static void
+nxt_process_send_status(const nxt_fd_t *gc_pipe, int8_t status)
 {
-    int8_t     status;
+    /*
+     * The parent keeps its read end open until nxt_process_pipe_close().
+     * So this write does not get EPIPE when the child has exited.
+     */
+    if (gc_pipe[1] != -1) {
+        write(gc_pipe[1], &status, sizeof(int8_t));
+    }
+}
+
+
+static nxt_pid_t
+nxt_process_recv_pid(const nxt_fd_t *pid_pipe)
+{
     ssize_t    ret;
     nxt_pid_t  pid;
 
     close(pid_pipe[1]);
-    close(gc_pipe[0]);
 
-    status = 0;
+    pid = -1;
 
     ret = nxt_process_pipe_timer(pid_pipe[0], POLLIN);
     if (ret == NXT_OK) {
         ret = read(pid_pipe[0], &pid, sizeof(nxt_pid_t));
-    }
 
-    if (ret <= 0) {
-        status = -1;
-        pid = -1;
+        if (ret <= 0) {
+            pid = -1;
+        }
     }
-
-    write(gc_pipe[1], &status, sizeof(int8_t));
 
     close(pid_pipe[0]);
-    close(gc_pipe[1]);
 
     return pid;
 }
@@ -514,74 +540,124 @@ nxt_process_send_pid(const nxt_fd_t *pid_pipe, nxt_pid_t pid)
 static nxt_int_t
 nxt_process_unshare(nxt_task_t *task, nxt_process_t *process,
                     nxt_fd_t *pid_pipe, nxt_fd_t *gc_pipe,
-                    nxt_bool_t use_pidns)
+                    nxt_bool_t use_pidns, nxt_bool_t use_cgroup)
 {
     int        ret;
     nxt_pid_t  pid;
 
-    if (process->isolation.clone.flags == 0) {
-        return NXT_OK;
-    }
+    /*
+     * The child only reads gc_pipe.  Without its own write end, a read
+     * gets end of file when the parent exits.
+     */
+    nxt_process_fd_close(&gc_pipe[1]);
 
-    ret = unshare(process->isolation.clone.flags);
-    if (nxt_slow_path(ret == -1)) {
-        nxt_alert(task, "unshare() failed for %s %E", process->name,
-                  nxt_errno);
-
-        if (use_pidns) {
-            nxt_pipe_close(task, gc_pipe);
-            nxt_pipe_close(task, pid_pipe);
+    if (use_cgroup) {
+        /*
+         * Wait until the parent has moved this process into its cgroup.
+         * A new cgroup namespace is rooted at the cgroup of the process
+         * at unshare() time.  A process from the fork(2) below starts in
+         * the cgroup of this process.
+         */
+        if (nxt_process_recv_status(gc_pipe) != 0) {
+            goto fail;
         }
-
-        return NXT_ERROR;
-    }
-
-    if (!use_pidns) {
-        return NXT_OK;
     }
 
     /*
-     * PID namespace requested. Employ a double fork(2) technique
-     * so that the prototype process will be placed into the new
-     * namespace and end up with PID 1 (as before with clone).
+     * Unshare all flags in one call.  With CLONE_NEWUSER, the kernel checks
+     * the other flags with the credentials from before the call.  A second
+     * unshare() after CLONE_NEWUSER uses the new credentials and can fail
+     * with EPERM, for example in the unprivileged_userns AppArmor profile
+     * of Ubuntu 24.04.
      */
-    pid = fork();
-    if (nxt_slow_path(pid < 0)) {
-        nxt_alert(task, "fork() failed for %s %E", process->name, nxt_errno);
-        nxt_pipe_close(task, gc_pipe);
-        nxt_pipe_close(task, pid_pipe);
-
-        return NXT_ERROR;
-
-    } else if (pid > 0) {
-        nxt_pipe_close(task, gc_pipe);
-        nxt_process_send_pid(pid_pipe, pid);
-
-        _exit(EXIT_SUCCESS);
+    if (process->isolation.clone.flags != 0) {
+        ret = unshare(process->isolation.clone.flags);
+        if (nxt_slow_path(ret == -1)) {
+            nxt_alert(task, "unshare() failed for %s %E", process->name,
+                      nxt_errno);
+            goto fail;
+        }
     }
 
-    nxt_pipe_close(task, pid_pipe);
-    ret = nxt_process_check_pid_status(gc_pipe);
-    if (ret == -1) {
-        return NXT_ERROR;
+    if (use_pidns) {
+        /*
+         * PID namespace requested. Employ a double fork(2) technique
+         * so that the prototype process will be placed into the new
+         * namespace and end up with PID 1 (as before with clone).
+         */
+        pid = fork();
+        if (nxt_slow_path(pid < 0)) {
+            nxt_alert(task, "fork() failed for %s %E", process->name,
+                      nxt_errno);
+            goto fail;
+
+        } else if (pid > 0) {
+            nxt_process_pipe_close(gc_pipe);
+            nxt_process_send_pid(pid_pipe, pid);
+
+            _exit(EXIT_SUCCESS);
+        }
+
+        nxt_process_pipe_close(pid_pipe);
+
+        /* Wait until the parent has the pid of this process. */
+
+        if (nxt_process_recv_status(gc_pipe) != 0) {
+            goto fail;
+        }
     }
+
+    nxt_process_pipe_close(gc_pipe);
 
     return NXT_OK;
+
+fail:
+
+    nxt_process_pipe_close(gc_pipe);
+    nxt_process_pipe_close(pid_pipe);
+
+    return NXT_ERROR;
 }
 
 
 static nxt_int_t
-nxt_process_init_pidns(nxt_task_t *task, const nxt_process_t *process,
+nxt_process_init_pipes(nxt_task_t *task, const nxt_process_t *process,
                        nxt_fd_t *pid_pipe, nxt_fd_t *gc_pipe,
-                       nxt_bool_t *use_pidns)
+                       nxt_bool_t *use_pidns, nxt_bool_t *use_cgroup)
 {
-    int ret;
+    int  ret;
+
+    pid_pipe[0] = pid_pipe[1] = -1;
+    gc_pipe[0] = gc_pipe[1] = -1;
 
     *use_pidns = 0;
+    *use_cgroup = 0;
 
 #if (NXT_HAVE_CLONE_NEWPID)
     *use_pidns = nxt_is_pid_isolated(process);
 #endif
+
+#if (NXT_HAVE_CGROUP)
+    *use_cgroup = (process->isolation.cgroup.path != NULL);
+#endif
+
+    if (!*use_pidns && !*use_cgroup) {
+        return NXT_OK;
+    }
+
+    /*
+     * gc_pipe carries status bytes from the parent to the new process.
+     * With a cgroup path, the parent sends 0 after it has moved the child
+     * into the cgroup.  The child waits for it before unshare() and before
+     * the pid isolation fork(2).  With pid isolation, the parent sends 0
+     * after it has read the pid of the grandchild from pid_pipe.  The
+     * grandchild waits for it.  -1, end of file or a timeout make the
+     * process exit.
+     */
+    ret = nxt_pipe_create(task, gc_pipe, 0, 0);
+    if (nxt_slow_path(ret == NXT_ERROR)) {
+        return NXT_ERROR;
+    }
 
     if (!*use_pidns) {
         return NXT_OK;
@@ -589,11 +665,7 @@ nxt_process_init_pidns(nxt_task_t *task, const nxt_process_t *process,
 
     ret = nxt_pipe_create(task, pid_pipe, 0, 0);
     if (nxt_slow_path(ret == NXT_ERROR)) {
-        return NXT_ERROR;
-    }
-
-    ret = nxt_pipe_create(task, gc_pipe, 0, 0);
-    if (nxt_slow_path(ret == NXT_ERROR)) {
+        nxt_process_pipe_close(gc_pipe);
         return NXT_ERROR;
     }
 
@@ -620,9 +692,10 @@ nxt_process_create(nxt_task_t *task, nxt_process_t *process)
 
 #if (NXT_HAVE_LINUX_NS)
     nxt_fd_t       pid_pipe[2], gc_pipe[2];
-    nxt_bool_t     use_pidns;
+    nxt_bool_t     use_pidns, use_cgroup;
 
-    ret = nxt_process_init_pidns(task, process, pid_pipe, gc_pipe, &use_pidns);
+    ret = nxt_process_init_pipes(task, process, pid_pipe, gc_pipe,
+                                 &use_pidns, &use_cgroup);
     if (ret == NXT_ERROR) {
         return -1;
     }
@@ -631,6 +704,12 @@ nxt_process_create(nxt_task_t *task, nxt_process_t *process)
     pid = fork();
     if (nxt_slow_path(pid < 0)) {
         nxt_alert(task, "fork() failed for %s %E", process->name, nxt_errno);
+
+#if (NXT_HAVE_LINUX_NS)
+        nxt_process_pipe_close(gc_pipe);
+        nxt_process_pipe_close(pid_pipe);
+#endif
+
         return pid;
     }
 
@@ -638,7 +717,8 @@ nxt_process_create(nxt_task_t *task, nxt_process_t *process)
         /* Child. */
 
 #if (NXT_HAVE_LINUX_NS)
-        ret = nxt_process_unshare(task, process, pid_pipe, gc_pipe, use_pidns);
+        ret = nxt_process_unshare(task, process, pid_pipe, gc_pipe,
+                                  use_pidns, use_cgroup);
         if (ret == NXT_ERROR) {
             _exit(EXIT_FAILURE);
         }
@@ -666,12 +746,56 @@ nxt_process_create(nxt_task_t *task, nxt_process_t *process)
 
     nxt_debug(task, "fork(%s): %PI", process->name, pid);
 
+#if (NXT_HAVE_CGROUP)
+    /*
+     * Move the child into its cgroup by the pid from fork().  The child
+     * waits for the status byte below before unshare() and before the pid
+     * isolation fork(2).  So a new cgroup namespace is rooted at this
+     * cgroup, and the grandchild starts in it.
+     */
+    ret = nxt_cgroup_proc_add(task, process, pid);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_alert(task, "cgroup: failed to add process %s to %s %E",
+                  process->name, process->isolation.cgroup.path, nxt_errno);
+        nxt_cgroup_cleanup(task, process);
+
 #if (NXT_HAVE_LINUX_NS)
+        /* The child waits for the status byte.  -1 makes it exit. */
+
+        nxt_process_send_status(gc_pipe, -1);
+        nxt_process_pipe_close(gc_pipe);
+        nxt_process_pipe_close(pid_pipe);
+#else
+        kill(pid, SIGTERM);
+#endif
+
+        return -1;
+    }
+#endif
+
+#if (NXT_HAVE_LINUX_NS)
+    if (use_cgroup) {
+        nxt_process_send_status(gc_pipe, 0);
+    }
+
     if (use_pidns) {
-        pid = nxt_process_recv_pid(pid_pipe, gc_pipe);
-        if (pid == -1) {
-            return pid;
+        pid = nxt_process_recv_pid(pid_pipe);
+        nxt_process_send_status(gc_pipe, (pid == -1) ? -1 : 0);
+    }
+
+    nxt_process_pipe_close(gc_pipe);
+
+    if (pid == -1) {
+#if (NXT_HAVE_CGROUP)
+        if (use_cgroup) {
+            /*
+             * The child can still be in the cgroup.  Then rmdir() fails
+             * and the directory stays.
+             */
+            nxt_cgroup_cleanup(task, process);
         }
+#endif
+        return pid;
     }
 #endif
 
@@ -692,17 +816,6 @@ nxt_process_create(nxt_task_t *task, nxt_process_t *process)
     } else {
         nxt_runtime_process_add(task, process);
     }
-
-#if (NXT_HAVE_CGROUP)
-    ret = nxt_cgroup_proc_add(task, process);
-    if (nxt_slow_path(ret != NXT_OK)) {
-        nxt_alert(task, "cgroup: failed to add process %s to %s %E",
-                  process->name, process->isolation.cgroup.path, nxt_errno);
-        nxt_cgroup_cleanup(task, process);
-        kill(pid, SIGTERM);
-        return -1;
-    }
-#endif
 
     return pid;
 }

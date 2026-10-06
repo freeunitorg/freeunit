@@ -1,3 +1,4 @@
+import socket
 import struct
 import time
 
@@ -557,22 +558,53 @@ def test_asgi_websockets_2_10__2_11():
 
     _, sock, _ = ws.upgrade()
 
-    for i in range(0, 10):
-        ws.frame_write(sock, ws.OP_PING, f'payload-{i}')
+    pings = [f'payload-{i}' for i in range(0, 10)]
 
-    for i in range(0, 10):
-        frame = ws.frame_read(sock)
-        check_frame(frame, True, ws.OP_PONG, f'payload-{i}')
+    for payload in pings:
+        ws.frame_write(sock, ws.OP_PING, payload)
+
+    ws.pongs_read(sock, pings)
 
     # 2_11
 
-    for i in range(0, 10):
-        opcode = ws.OP_PING
-        ws.frame_write(sock, opcode, f'payload-{i}', chopsize=1)
+    for payload in pings:
+        ws.frame_write(sock, ws.OP_PING, payload, chopsize=1)
 
-    for i in range(0, 10):
-        frame = ws.frame_read(sock)
-        check_frame(frame, True, ws.OP_PONG, f'payload-{i}')
+    ws.pongs_read(sock, pings)
+
+    close_connection(sock)
+
+
+def test_asgi_websockets_ping_pong_pending():
+    client.load('websockets/mirror')
+
+    # A client with a small receive buffer sends many PINGs and does not
+    # read.  While a PONG is not sent, the router must keep only the PONG
+    # for the most recent PING (RFC 6455 Section 5.5.3).  The connection
+    # must stay open, and the last PING must get its PONG.
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.connect(('127.0.0.1', 8080))
+
+    _, sock, _ = ws.upgrade(sock=sock)
+
+    pings = [f'{i:05}'.encode() * 25 for i in range(2000)]
+
+    sock.sendall(b''.join(ws.frame_to_send(ws.OP_PING, p) for p in pings))
+
+    answered = ws.pongs_read(sock, pings)
+
+    assert answered[0] == 0, 'first ping answered'
+    assert len(answered) < len(pings), 'pings not answered'
+
+    message = 'still open'
+
+    ws.frame_write(sock, ws.OP_TEXT, message)
+
+    frame = ws.frame_read(sock)
+    check_frame(frame, True, ws.OP_TEXT, message)
 
     close_connection(sock)
 
@@ -1372,7 +1404,7 @@ def test_asgi_websockets_9_1_1__9_6_6(system):
             payload = b'*' * length
 
         ws.frame_write(sock, opcode, payload, chopsize=chopsize)
-        frame = ws.frame_read(sock, read_timeout=5)
+        frame = ws.frame_read(sock, read_timeout=ws.LARGE_MESSAGE_TIMEOUT)
         check_frame(frame, True, opcode, payload)
 
     def check_message(opcode, f_size):
@@ -1382,7 +1414,7 @@ def test_asgi_websockets_9_1_1__9_6_6(system):
             payload = b'*' * 4 * 2**20
 
         ws.message(sock, opcode, payload, fragmention_size=f_size)
-        frame = ws.frame_read(sock, read_timeout=5)
+        frame = ws.frame_read(sock, read_timeout=ws.LARGE_MESSAGE_TIMEOUT)
         check_frame(frame, True, opcode, payload)
 
     check_payload(op_text, 64 * 2**10)  # 9_1_1

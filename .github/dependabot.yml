@@ -4,3 +4,78 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+
+  # Every Cargo.toml that has its own Cargo.lock.  tools/unitctl is one
+  # workspace, so its root covers the three member crates.  The tests build
+  # a copy of each test/wasm_component fixture with "cargo component build",
+  # which writes src/bindings.rs again.  The exports come from
+  # wasi::http::proxy::export!, so a bump cannot break a fixture through
+  # that file.
+  - package-ecosystem: cargo
+    directories:
+      - "/tools/unitctl"
+      - "/src/otel"
+      - "/src/wasm-wasi-component"
+      - "/pkg/eol"
+      - "/test/fake_otlp"
+      - "/test/fake_upstream"
+      - "/test/wasm_component/hello_world"
+      - "/test/wasm_component/spin_loop"
+    schedule:
+      interval: weekly
+    # Every version update below belongs to a group, and a group is one
+    # pull request for all directories.  So at most three version-update
+    # pull requests are open, whether the limit counts per directory or for
+    # the whole block.
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "build(deps)"
+    # A group is one pull request for all directories, so src/otel and
+    # test/fake_otlp move together in one otel pull request.
+    groups:
+      otel:
+        patterns:
+          - "opentelemetry*"
+          - "tonic*"
+          - "prost*"
+      # A group covers version updates only, so security updates need their
+      # own group to keep the otel crates together.
+      otel-security:
+        applies-to: security-updates
+        patterns:
+          - "opentelemetry*"
+          - "tonic*"
+          - "prost*"
+      # A group without "patterns" outranks "opentelemetry*" when Dependabot
+      # picks the most specific group, so the two groups below must exclude
+      # the otel crates.  Otherwise they claim them and split the stack.
+      minor-and-patch:
+        exclude-patterns:
+          - "opentelemetry*"
+          - "tonic*"
+          - "prost*"
+        update-types:
+          - "minor"
+          - "patch"
+      # Major updates, including a 0.x minor, which cargo rates as major.
+      # They come together in one pull request.
+      major:
+        exclude-patterns:
+          - "opentelemetry*"
+          - "tonic*"
+          - "prost*"
+        update-types:
+          - "major"
+    ignore:
+      # Wasmtime is updated by hand.  Its version is also pinned in
+      # pkg/contrib/src/wasmtime/version, EOL.md and pkg/eol.json, which a
+      # Dependabot pull request cannot change.  It stays on the 48 LTS line.
+      # This also stops Dependabot security pull requests for Wasmtime; the
+      # weekly audit.yml run reports its advisories instead.
+      - dependency-name: "wasmtime*"
+      # bindgen 0.68 emitted opaque structs under clang 22; 0.72 is the
+      # tested version.  A 0.x minor can break, so bump it by hand.
+      - dependency-name: "bindgen"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"

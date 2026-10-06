@@ -71,7 +71,13 @@ class ApplicationWasm(ApplicationProto):
 
         return output
 
-    def load(self, script, access_filesystem=None, **kwargs):
+    def load(
+        self,
+        script,
+        access_filesystem=None,
+        malloc_handler='luw_malloc_handler',
+        **kwargs,
+    ):
         module = self.prepare_env(script)
 
         app = {
@@ -79,7 +85,7 @@ class ApplicationWasm(ApplicationProto):
             'processes': {'spare': 0},
             'module': str(module),
             'request_handler': 'luw_request_handler',
-            'malloc_handler': 'luw_malloc_handler',
+            'malloc_handler': malloc_handler,
             'free_handler': 'luw_free_handler',
             # Without these two the guest's init hook never runs, so
             # request_buf stays NULL and luw_set_req_buf() memcpy()s to

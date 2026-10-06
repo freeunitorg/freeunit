@@ -139,8 +139,18 @@ jobs:
             # (#276), and skips on any build without --debug.  Every
             # build-test leg is a release build, so this leg is the only one
             # in which that test runs rather than skips.
+            #
+            # test_state_store forks a store child from main and stops main
+            # while the child runs (#516); it needs --restart, and this is
+            # the leg that runs that path under ASan.
+            #
+            # test_settings runs the body_min_rate and send_min_rate floors.
+            # A floor closes the connection from a read or a write handler,
+            # in the middle of a body or a response.  It also has a TLS case,
+            # which this leg runs because it is configured with --openssl.
             tests: >-
               test/test_graceful_reload.py
+              test/test_state_store.py
               test/test_listener_drain.py
               test/test_static.py
               test/test_conn_task_race.py
@@ -149,6 +159,7 @@ jobs:
               test/test_conn_recycle.py
               test/test_app_lifecycle.py
               test/test_configuration.py
+              test/test_settings.py
           - runtime: php
             apt: ""
             configure: php
@@ -156,9 +167,15 @@ jobs:
             # No --restart: test_php_application.py does not signal the master,
             # and --restart's teardown rmtree trips on test_php_application_
             # forbidden's restricted-permission fixture (rmtree PermissionError).
+            #
+            # test_php_targets is here for test_php_application_targets_cwd.
+            # On the old code it fails only when libunit fills released
+            # memory, and only a --debug build does that.  Every build-test
+            # leg is a release build.
             pytest_opts: ""
             tests: >-
               test/test_php_application.py
+              test/test_php_targets.py
               test/test_app_lifecycle.py
           # Go is where the app-side port-fd double-close actually manifested
           # (a flaky "close(N) failed: Bad file descriptor" in the go isolation
@@ -182,7 +199,7 @@ jobs:
               test/test_app_lifecycle.py
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Base tools + pytest (needed to run any leg) plus this runtime's extra
       # apt packages.  Runtimes whose toolchain is not in apt add a setup step
@@ -361,7 +378,7 @@ jobs:
 
       - name: Upload unit logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unit-logs-${{ matrix.runtime }}
           path: ${{ env.TMPDIR || '/tmp' }}/unit-test-*/unit.log

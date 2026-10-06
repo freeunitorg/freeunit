@@ -168,12 +168,12 @@ static void nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
 static void nxt_http_static_next(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_static_ctx_t *ctx, nxt_http_status_t status);
 static nxt_http_status_t nxt_http_static_preconditions(nxt_http_request_t *r,
-    nxt_str_t *etag, nxt_bool_t weak, nxt_time_t mtime);
+    nxt_str_t *etag, nxt_bool_t weak, nxt_time_t mtime, nxt_bool_t date_ok);
 static nxt_bool_t nxt_http_static_etag_match(nxt_str_t *list, nxt_str_t *etag,
     nxt_bool_t own_weak, nxt_bool_t strong);
 static nxt_http_status_t nxt_http_static_range(nxt_http_request_t *r,
-    nxt_str_t *etag, nxt_bool_t weak, nxt_time_t mtime, nxt_off_t size,
-    nxt_off_t *start, nxt_off_t *end);
+    nxt_str_t *etag, nxt_bool_t weak, nxt_time_t mtime, nxt_bool_t date_ok,
+    nxt_off_t size, nxt_off_t *start, nxt_off_t *end);
 #if (NXT_HAVE_OPENAT2)
 static u_char *nxt_http_static_chroot_match(u_char *chr, u_char *shr);
 #endif
@@ -497,14 +497,17 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_file_t              *f, file;
     nxt_file_info_t         fi;
     nxt_off_t               range_start, range_end;
-    nxt_bool_t              is_range, etag_weak;
+    nxt_bool_t              is_range, etag_weak, svgz;
     nxt_http_status_t       rstatus;
-    nxt_http_field_t        *field;
+    nxt_http_field_t        *field, *coding;
     nxt_http_status_t       status, pcond;
     nxt_router_conf_t       *rtcf;
     nxt_http_action_t       *action;
     nxt_work_handler_t      body_handler;
     nxt_http_static_conf_t  *conf;
+
+    static const nxt_str_t  svgz_exten = nxt_string(".svgz");
+    static const nxt_str_t  svg_mtype = nxt_string("image/svg+xml");
 
     action = ctx->action;
     conf = action->u.conf;
@@ -512,6 +515,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
 
     f = NULL;
     mtype = NULL;
+    coding = NULL;
 
     shr = &ctx->share;
     index = &conf->index;
@@ -716,6 +720,30 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         field->value = p;
         field->value_length = nxt_http_date(p, &tm) - p;
 
+        if (exten.start == NULL) {
+            nxt_http_static_extract_extension(shr, &exten);
+        }
+
+        if (mtype == NULL) {
+            mtype = nxt_http_static_mtype_get(&rtcf->mtypes_hash, &exten);
+        }
+
+        /*
+         * A ".svgz" file is an SVG image stored with gzip coding, so it is
+         * sent with "Content-Encoding: gzip", as Apache does with
+         * "AddEncoding gzip svgz".  The coding is not negotiated.  A client
+         * without gzip in Accept-Encoding still gets the gzip bytes, because
+         * no other representation exists.
+         *
+         * The extension must also resolve to image/svg+xml.  An operator who
+         * maps ".svgz" to another type in "mime_types" gets no coding.
+         *
+         * The decision is made here because it also changes the ETag below.
+         */
+
+        svgz = (nxt_strcasestr_eq(&exten, &svgz_exten)
+                && nxt_strcasestr_eq(mtype, &svg_mtype));
+
         field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
         if (nxt_slow_path(field == NULL)) {
             goto fail;
@@ -753,7 +781,19 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         etag_weak = ((nxt_time_t) nxt_thread_time(task->thread)
                      <= (nxt_time_t) nxt_file_mtime(&fi));
 
-        length = nxt_length("W/") + NXT_TIME_T_HEXLEN + NXT_OFF_T_HEXLEN + 3;
+        /*
+         * The tag of a ".svgz" file ends in "-gzip".  Before the file was
+         * sent with gzip coding, its tag had no suffix.  The response had no
+         * coding, or it was compressed a second time under the weak form of
+         * the tag.  A cache that stored either response sends that tag back
+         * in If-None-Match.  The new tag does not match it, so the cache
+         * gets a full 200 with the new header fields instead of a 304 that
+         * keeps the old entry.  Apache's mod_deflate adds the same suffix
+         * to the tag of a response it compresses.
+         */
+
+        length = nxt_length("W/") + NXT_TIME_T_HEXLEN + NXT_OFF_T_HEXLEN
+                 + nxt_length("-gzip") + 3;
 
         p = nxt_mp_nget(r->mem_pool, length);
         if (nxt_slow_path(p == NULL)) {
@@ -774,9 +814,11 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
          */
         end = field->value + length;
 
-        field->value_length = nxt_sprintf(p, end, "\"%xT-%xO\"",
+        field->value_length = nxt_sprintf(p, end, "\"%xT-%xO%s\"",
                                           (nxt_time_t) nxt_file_mtime(&fi),
-                                          nxt_file_size(&fi))
+                                          nxt_file_size(&fi),
+                                          svgz ? (u_char *) "-gzip"
+                                               : (u_char *) "")
                               - field->value;
 
         /*
@@ -788,14 +830,6 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
 
         etag.start = p;
         etag.length = field->value_length - (p - field->value);
-
-        if (exten.start == NULL) {
-            nxt_http_static_extract_extension(shr, &exten);
-        }
-
-        if (mtype == NULL) {
-            mtype = nxt_http_static_mtype_get(&rtcf->mtypes_hash, &exten);
-        }
 
         if (mtype->length != 0) {
             field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
@@ -810,6 +844,28 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         }
 
         r->resp.mime_type = mtype;
+
+        /*
+         * The Content-Encoding of a ".svgz" file is added before the
+         * acceptability check below.  That check skips a response that
+         * already has a Content-Encoding.  So the file is not compressed a
+         * second time, its ETag stays strong, and a Range applies to the
+         * stored bytes.
+         */
+
+        if (svgz) {
+            field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+            if (nxt_slow_path(field == NULL)) {
+                goto fail;
+            }
+
+            nxt_http_field_name_set(field, "Content-Encoding");
+
+            field->value = (u_char *) "gzip";
+            field->value_length = nxt_length("gzip");
+
+            coding = field;
+        }
 
         /*
          * RFC 9110 Sect. 13.2.1: an ordinary failure outranks a precondition.
@@ -836,8 +892,18 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
             goto fail;
         }
 
+        /*
+         * A response with the stored coding of a ".svgz" file has a coding
+         * that an older cached response of the same file may lack.  The
+         * Last-Modified date did not change when the coding was added, so a
+         * date cannot tell the two apart.  Only the ETag can.  So a date
+         * gives no 304 and no range for such a response.  A client that
+         * sends If-None-Match or an entity-tag in If-Range is not affected.
+         */
+
         pcond = nxt_http_static_preconditions(r, &etag, etag_weak,
-                                              nxt_file_mtime(&fi));
+                                              nxt_file_mtime(&fi),
+                                              coding == NULL);
 
         if (pcond != NXT_HTTP_OK) {
             nxt_file_close(task, f);
@@ -857,6 +923,17 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
              */
             r->status = NXT_HTTP_NOT_MODIFIED;
             r->resp.content_length_n = -1;
+
+            /*
+             * RFC 9110 Sect. 15.4.5: a 304 should not carry representation
+             * metadata such as Content-Encoding.  A cache keeps the field it
+             * stored with the 200.  The compressed path also sends a 304
+             * without it.
+             */
+
+            if (coding != NULL) {
+                coding->skip = 1;
+            }
 
             body_handler = NULL;
 
@@ -885,7 +962,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
          */
 
         rstatus = nxt_http_static_range(r, &etag, etag_weak,
-                                        nxt_file_mtime(&fi),
+                                        nxt_file_mtime(&fi), coding == NULL,
                                         nxt_file_size(&fi), &range_start,
                                         &range_end);
 
@@ -899,7 +976,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
          * representation it refused.
          */
 
-        if (nxt_http_comp_identity_refused()) {
+        if (nxt_http_comp_identity_refused(r)) {
             rstatus = NXT_HTTP_OK;
         }
 
@@ -909,6 +986,16 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
 
             r->status = NXT_HTTP_RANGE_NOT_SATISFIABLE;
             r->resp.content_length_n = 0;
+
+            /*
+             * A 416 has no body, so it has no content coding.  The
+             * error responses (406, 412, 500) need no such step:
+             * nxt_http_request_error() drops every field added here.
+             */
+
+            if (coding != NULL) {
+                coding->skip = 1;
+            }
 
             field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
             if (nxt_slow_path(field == NULL)) {
@@ -960,7 +1047,9 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
          * satisfied.
          *
          * Not reached when nothing is acceptable: that is already 406, from
-         * nxt_http_comp_check_acceptable() above.
+         * nxt_http_comp_check_acceptable() above.  That includes a response
+         * that no coding is applied to, where the full 200 would be
+         * identity again.
          */
 
         if (is_range) {
@@ -1016,7 +1105,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
                     goto fail;
                 }
 
-                if (nxt_http_comp_wants_compression()) {
+                if (nxt_http_comp_wants_compression(r)) {
                     size_t     out_total;
                     nxt_int_t  ret;
 
@@ -1165,11 +1254,17 @@ fail:
  * The later step in each pair is consulted only when the earlier one is
  * absent: a client that sends both an entity-tag and a date is asking to be
  * judged by the entity-tag, even when the tag does not match.
+ *
+ * "date_ok" is 0 when the date does not identify the representation.  Then
+ * If-Modified-Since never gives a 304, because a 304 tells a cache to reuse
+ * the entry it has, and that entry can be stale.  If-Unmodified-Since needs
+ * no such gate.  A 412 makes no cache reuse an entry.  A request that passes
+ * gets the full 200 with the current header fields.
  */
 
 static nxt_http_status_t
 nxt_http_static_preconditions(nxt_http_request_t *r, nxt_str_t *etag,
-    nxt_bool_t weak, nxt_time_t mtime)
+    nxt_bool_t weak, nxt_time_t mtime, nxt_bool_t date_ok)
 {
     nxt_str_t               value;
     nxt_time_t              date;
@@ -1304,7 +1399,7 @@ nxt_http_static_preconditions(nxt_http_request_t *r, nxt_str_t *etag,
         return NXT_HTTP_OK;
     }
 
-    if (ims != NULL) {
+    if (ims != NULL && date_ok) {
         date = nxt_time_parse(ims->value, ims->value_length);
 
         /*
@@ -1493,12 +1588,15 @@ nxt_http_static_range_number(u_char **p, u_char *end)
  *     to serve as a 206; both are clamped to [0, size - 1].
  *   NXT_HTTP_RANGE_NOT_SATISFIABLE -- the single range is out of bounds; the
  *     caller answers 416 with a "Content-Range: bytes STAR/size" header.
+ *
+ * "date_ok" is 0 when the date does not identify the representation.  Then
+ * a date in If-Range never matches.
  */
 
 static nxt_http_status_t
 nxt_http_static_range(nxt_http_request_t *r, nxt_str_t *etag,
-    nxt_bool_t weak, nxt_time_t mtime, nxt_off_t size, nxt_off_t *start,
-    nxt_off_t *end)
+    nxt_bool_t weak, nxt_time_t mtime, nxt_bool_t date_ok, nxt_off_t size,
+    nxt_off_t *start, nxt_off_t *end)
 {
     u_char                  *p, *last;
     nxt_off_t               a, b, suffix;
@@ -1574,7 +1672,8 @@ nxt_http_static_range(nxt_http_request_t *r, nxt_str_t *etag,
              * stale one.  Refusing the If-Range costs a full response.
              */
 
-            match = (!weak && date != (nxt_time_t) -1 && date == mtime);
+            match = (date_ok && !weak && date != (nxt_time_t) -1
+                     && date == mtime);
         }
 
         if (!match) {
@@ -1968,6 +2067,7 @@ nxt_http_static_mtypes_init(nxt_mp_t *mp, nxt_lvlhsh_t *hash)
         { nxt_string("text/css"),       ".css"   },
 
         { nxt_string("image/svg+xml"),  ".svg"   },
+        { nxt_string("image/svg+xml"),  ".svgz"  },
         { nxt_string("image/webp"),     ".webp"  },
         { nxt_string("image/png"),      ".png"   },
         { nxt_string("image/apng"),     ".apng"  },

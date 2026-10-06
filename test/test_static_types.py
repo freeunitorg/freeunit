@@ -1,3 +1,4 @@
+import gzip
 from pathlib import Path
 
 import pytest
@@ -172,3 +173,20 @@ def test_static_types_custom_mime(temp_dir):
         {"share": f'{temp_dir}/assets$uri', "types": ["test/mime-type"]}
     )
     check_body('/file', '')
+
+
+def test_static_types_svgz(temp_dir):
+    # ".svgz" is in the default MIME table as image/svg+xml.  So a "types"
+    # rule that names image/* serves it, with its stored gzip coding.
+    # Before, the file had no type and the rule refused it with 403.
+    data = gzip.compress(b'<svg xmlns="http://www.w3.org/2000/svg"/>', mtime=0)
+    Path(f'{temp_dir}/assets/a.svgz').write_bytes(data)
+
+    action_update({"share": f'{temp_dir}/assets$uri', "types": ["image/*"]})
+
+    resp = client.get(url='/a.svgz', encoding='latin-1')
+    assert resp['status'] == 200, 'image/* serves .svgz'
+    assert resp['headers']['Content-Type'] == 'image/svg+xml'
+    assert resp['headers']['Content-Encoding'] == 'gzip'
+    assert resp['headers']['ETag'].endswith('-gzip"')
+    assert resp['body'].encode('latin-1') == data

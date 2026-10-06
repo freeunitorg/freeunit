@@ -87,7 +87,7 @@ nxt_cgroup_rmdir_up(char *cgpath, const char *cgroot)
 
 
 nxt_int_t
-nxt_cgroup_proc_add(nxt_task_t *task, nxt_process_t *process)
+nxt_cgroup_proc_add(nxt_task_t *task, nxt_process_t *process, nxt_pid_t pid)
 {
     int        len;
     size_t     old_len;
@@ -103,15 +103,12 @@ nxt_cgroup_proc_add(nxt_task_t *task, nxt_process_t *process)
     }
 
     /*
-     * Resolve the cgroup path against /proc/<child>/cgroup rather than
-     * /proc/self/cgroup: the parent's cgroup view may differ from the
-     * just-forked child's, particularly when CLONE_NEWCGROUP is in play
-     * and the configured path is relative.  Reading the child's own
-     * /proc entry avoids a TOCTOU where the parent moves between cgroups
-     * after fork() but before this write.
+     * Resolve the cgroup path from /proc/<child>/cgroup, not from
+     * /proc/self/cgroup.  The parent can move to a different cgroup after
+     * fork() and before this write.  A relative path that uses the
+     * parent's entry then points to the wrong cgroup.
      */
-    ret = nxt_mk_cgpath(task, process->isolation.cgroup.path, cgprocs,
-                        process->pid);
+    ret = nxt_mk_cgpath(task, process->isolation.cgroup.path, cgprocs, pid);
     if (nxt_slow_path(ret == NXT_ERROR)) {
         return NXT_ERROR;
     }
@@ -168,7 +165,7 @@ nxt_cgroup_proc_add(nxt_task_t *task, nxt_process_t *process)
     }
 
     setvbuf(fp, NULL, _IONBF, 0);
-    len = fprintf(fp, "%d\n", process->pid);
+    len = fprintf(fp, "%d\n", pid);
     nxt_file_fclose(task, fp);
 
     if (nxt_slow_path(len < 0)) {

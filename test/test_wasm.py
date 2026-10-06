@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from unit.applications.lang.wasm import ApplicationWasm
 from unit.check.check_prerequisites import check_prerequisites
 from unit.option import option
@@ -61,3 +63,55 @@ def test_wasm_access_filesystem_denied():
         resp = client.get(url=url)
 
         assert resp['status'] == 404, url
+
+
+def test_wasm_malloc_handler_real_malloc():
+    client.load('hello', malloc_handler='malloc')
+
+    resp = client.get()
+
+    assert resp['status'] == 200
+    assert resp['body'] == 'Hello from wasm\n'
+
+
+def test_wasm_malloc_at_memory_end():
+    client.load('badmalloc', malloc_handler='edge_malloc')
+
+    resp = client.get()
+
+    assert resp['status'] == 200
+    assert resp['body'] == 'accepted\n'
+
+
+@pytest.mark.parametrize(
+    'handler', ['bad_malloc_neg', 'bad_malloc_big', 'bad_malloc_end']
+)
+def test_wasm_malloc_out_of_range(handler, wait_for_record):
+    client.load('badmalloc', malloc_handler=handler)
+
+    assert client.get()['status'] == 503
+
+    assert (
+        wait_for_record(r'malloc handler returned offset \d+ outside memory')
+        is not None
+    )
+
+
+def test_wasm_malloc_unaligned(wait_for_record):
+    client.load('badmalloc', malloc_handler='bad_malloc_odd')
+
+    assert client.get()['status'] == 503
+
+    record = r'malloc handler returned offset \d+ that is not aligned'
+    assert wait_for_record(record) is not None
+
+
+# The guest exports "__heap_base" as a global and "memory" as a memory.
+@pytest.mark.parametrize('handler', ['__heap_base', 'memory'])
+def test_wasm_handler_not_function(handler, wait_for_record):
+    client.load('hello', malloc_handler=handler)
+
+    assert client.get()['status'] == 503
+
+    record = rf'module export \({handler}\) is not a function'
+    assert wait_for_record(record) is not None

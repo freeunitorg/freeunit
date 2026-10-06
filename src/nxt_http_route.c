@@ -1184,13 +1184,31 @@ nxt_http_route_pattern_create(nxt_task_t *task, nxt_mp_t *mp,
 
 
 /*
- * Configured pattern strings are decoded once here at compile time,
- * while request URIs are decoded by the HTTP parser before they reach
- * the matcher.  Both paths funnel through the same nxt_decode_uri /
- * nxt_decode_uri_plus helpers; %XX semantics are symmetric, so a
- * "%2e%2e" in the configured pattern will compare against the same
- * bytes a request "%2e%2e" decoded into.  If either helper's behaviour
- * changes, route patterns and request URIs MUST be updated in lock-step.
+ * Configured pattern strings are decoded once here, at configuration time,
+ * by nxt_decode_uri() ("uri") or nxt_decode_uri_plus() ("arguments" and
+ * "query").  A regex pattern ("~...") is compiled as written and is not
+ * decoded.
+ *
+ * The request side does not use these helpers, and the two sides are not
+ * symmetric.
+ *
+ * The request path is decoded by nxt_http_parse_complex_target() in
+ * src/nxt_http_parse.c:
+ *   - most decoded bytes go back through its state machine, so an encoded
+ *     dot segment such as "/%2e%2e/" is normalized like "/../";
+ *   - a decoded '%', '#' or '?' is copied as a plain byte;
+ *   - "%00" is rejected;
+ *   - "/./" and "/../" segments and a trailing "/." or "/.." are removed,
+ *     and repeated slashes are merged;
+ *   - "encoded_slashes" keeps "%25" and "%2F" encoded, but only the
+ *     controller sets it.  The router never does.
+ * So a pattern that spells "%2e%2e" or "//" as a whole path segment can
+ * never match a normalized path.  A ".." inside a segment ("/a..b") is
+ * kept on both sides and compares as plain bytes.
+ *
+ * Request arguments and the query are decoded by nxt_http_arguments_parse()
+ * in src/nxt_http_request.c: '+' becomes a space, a bad or short "%XX" is
+ * copied as is, and "%00" is accepted.
  */
 static nxt_int_t
 nxt_http_route_decode_str(nxt_str_t *str, nxt_http_uri_encoding_t encoding)
@@ -2164,12 +2182,14 @@ nxt_http_route_pattern(nxt_http_request_t *r, nxt_http_route_pattern_t *pattern,
     if (pattern->regex) {
         if (r->regex_match == NULL) {
             /*
-             * Reuse one match-data struct across every pattern compiled
-             * against this request, so size it for the minimum ovector
-             * (one offset pair — the overall match).  Captures are not
-             * consulted by the matcher.  Passing 0 to PCRE2's
-             * pcre2_match_data_create() is undefined per the public
-             * docs; 1 is the documented minimum.
+             * One match object serves every pattern tested against this
+             * request.  Its match data holds the minimum ovector: one
+             * offset pair, the overall match.  The matcher does not read
+             * captures.  pcre2_match_data_create() treats an ovecsize of 0
+             * as 1 (pcre2_match_data_create(3)); 1 is passed to make the
+             * minimum explicit.  With PCRE1 the size counts ints, not
+             * pairs; pcre_exec() then returns 0 on a match, and
+             * nxt_regex_match() counts 0 as a match.
              */
             r->regex_match = nxt_regex_match_create(r->mem_pool, 1);
             if (nxt_slow_path(r->regex_match == NULL)) {

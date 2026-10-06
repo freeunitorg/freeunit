@@ -14,6 +14,28 @@ typedef struct {
 } nxt_http_header_val_t;
 
 
+/* The keys of r->action resolved for this request, one entry per key. */
+
+struct nxt_http_set_headers_ctx_s {
+    nxt_http_action_t       *action;
+    nxt_str_t               *value;
+    uint8_t                 *state;
+};
+
+
+typedef enum {
+    NXT_HTTP_SET_HEADERS_UNRESOLVED = 0,
+    NXT_HTTP_SET_HEADERS_RESOLVED,
+    NXT_HTTP_SET_HEADERS_REJECTED,
+} nxt_http_set_headers_state_t;
+
+
+static nxt_http_set_headers_ctx_t *nxt_http_set_headers_ctx(
+    nxt_http_request_t *r);
+static nxt_int_t nxt_http_set_headers_value(nxt_http_request_t *r,
+    nxt_http_set_headers_ctx_t *ctx, nxt_uint_t i);
+
+
 /*
  * Whether the matched action replaces or removes one of the validators the
  * static handler generates.
@@ -26,9 +48,7 @@ typedef struct {
  * evaluate preconditions at all in that case, which loses the 304 but is never
  * wrong.
  *
- * Only the name matters here.  The value may be a template resolved per
- * request, and resolving it this early would move tstr queries ahead of where
- * nxt_http_set_headers() runs them.
+ * Only the name matters here, so no template value is resolved.
  */
 
 nxt_bool_t
@@ -65,6 +85,93 @@ nxt_http_set_headers_override_validators(nxt_http_request_t *r)
     }
 
     return 0;
+}
+
+
+/*
+ * What nxt_http_set_headers() will later do to the response field "name".
+ *
+ * Code that runs before the header is sent can ask this.  Compression needs
+ * it: a Content-Encoding from "response_headers" replaces the one that a
+ * compressor adds.  So the compressor must not run.  Otherwise the body is
+ * coded twice and the field names one coding only.
+ *
+ * The value is resolved here with nxt_http_set_headers_value().  It stores
+ * the result on the request, and nxt_http_set_headers() uses that result.
+ * So each key is resolved once, and both see the same value, also for a
+ * JavaScript template.  A template value can resolve to bytes that are not
+ * safe in a field.  nxt_http_set_headers() then skips that key, so it
+ * counts as absent here too.  A null value removes the field.  An empty
+ * string is a value: the field is sent empty.  A variable that is not set
+ * gives an empty string.  A failed query gives NXT_HTTP_SET_HEADER_ERROR.
+ *
+ * Resolving a template this early is safe.  The query is synchronous.
+ * nxt_tstr_query_init() reuses r->tstr_query.  A cacheable variable keeps
+ * its value in r->tstr_cache for the rest of the request.
+ *
+ * The status test is the same as in nxt_http_set_headers().  Keys are
+ * applied in order, so the last key that matches and is not skipped gives
+ * the result.  The search goes back from the end and stops at that key.
+ */
+
+nxt_http_set_header_op_t
+nxt_http_set_headers_field_op(nxt_http_request_t *r, const char *name,
+    size_t length)
+{
+    nxt_int_t                   ret;
+    nxt_uint_t                  i;
+    nxt_http_action_t           *action;
+    nxt_http_header_val_t       *header;
+    nxt_http_set_headers_ctx_t  *ctx;
+
+    action = r->action;
+
+    if (action == NULL || action->set_headers == NULL) {
+        return NXT_HTTP_SET_HEADER_NONE;
+    }
+
+    if (r->status < NXT_HTTP_OK || r->status >= NXT_HTTP_BAD_REQUEST) {
+        return NXT_HTTP_SET_HEADER_NONE;
+    }
+
+    /* The context is made only when a key matches. */
+
+    ctx = NULL;
+
+    header = action->set_headers->elts;
+    i = action->set_headers->nelts;
+
+    while (i > 0) {
+        i--;
+
+        if (header[i].name.length != length
+            || nxt_memcasecmp(header[i].name.start, name, length) != 0)
+        {
+            continue;
+        }
+
+        if (ctx == NULL) {
+            ctx = nxt_http_set_headers_ctx(r);
+            if (nxt_slow_path(ctx == NULL)) {
+                return NXT_HTTP_SET_HEADER_ERROR;
+            }
+        }
+
+        ret = nxt_http_set_headers_value(r, ctx, i);
+
+        if (ret == NXT_DECLINED) {
+            continue;
+        }
+
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NXT_HTTP_SET_HEADER_ERROR;
+        }
+
+        return (ctx->value[i].start != NULL) ? NXT_HTTP_SET_HEADER_REPLACE
+                                             : NXT_HTTP_SET_HEADER_REMOVE;
+    }
+
+    return NXT_HTTP_SET_HEADER_NONE;
 }
 
 
@@ -153,6 +260,126 @@ nxt_http_header_value_is_safe(const nxt_str_t *v)
 }
 
 
+/*
+ * The resolved keys of r->action for this request.  The context is made on
+ * first use and kept in r->set_headers.  A request is allocated zeroed for
+ * each request, also on a keep-alive connection, so the pointer never comes
+ * from an earlier request.  The context is made again if r->action is not
+ * the action that it was made for.
+ */
+
+static nxt_http_set_headers_ctx_t *
+nxt_http_set_headers_ctx(nxt_http_request_t *r)
+{
+    nxt_uint_t                  n;
+    nxt_http_set_headers_ctx_t  *ctx;
+
+    ctx = r->set_headers;
+
+    /*
+     * Today the action does not change between the compression check and
+     * the header: the static fallback runs only before the check.  This
+     * test is a guard for a later path that changes r->action.
+     */
+
+    if (ctx != NULL && ctx->action == r->action) {
+        return ctx;
+    }
+
+    n = r->action->set_headers->nelts;
+
+    ctx = nxt_mp_zget(r->mem_pool, sizeof(nxt_http_set_headers_ctx_t));
+    if (nxt_slow_path(ctx == NULL)) {
+        return NULL;
+    }
+
+    ctx->value = nxt_mp_zalloc(r->mem_pool, sizeof(nxt_str_t) * n);
+    if (nxt_slow_path(ctx->value == NULL)) {
+        return NULL;
+    }
+
+    ctx->state = nxt_mp_zalloc(r->mem_pool, n);
+    if (nxt_slow_path(ctx->state == NULL)) {
+        return NULL;
+    }
+
+    ctx->action = r->action;
+    r->set_headers = ctx;
+
+    return ctx;
+}
+
+
+/*
+ * Resolve key "i" of "response_headers" once for this request, and store
+ * the result in ctx.  A later call returns the stored result.  So a
+ * template, a JavaScript one too, is run only once.
+ *
+ * A null value gives a null string, which removes the field.  A value that
+ * is not safe in a field gives NXT_DECLINED, and the key is skipped.
+ * nxt_http_set_headers() and nxt_http_set_headers_field_op() both use this,
+ * so they agree on what each key does.
+ */
+
+static nxt_int_t
+nxt_http_set_headers_value(nxt_http_request_t *r,
+    nxt_http_set_headers_ctx_t *ctx, nxt_uint_t i)
+{
+    nxt_int_t              ret;
+    nxt_str_t              *value;
+    nxt_router_conf_t      *rtcf;
+    nxt_http_header_val_t  *hv;
+
+    switch (ctx->state[i]) {
+
+    case NXT_HTTP_SET_HEADERS_RESOLVED:
+        return NXT_OK;
+
+    case NXT_HTTP_SET_HEADERS_REJECTED:
+        return NXT_DECLINED;
+
+    default:
+        break;
+    }
+
+    hv = ctx->action->set_headers->elts;
+    hv = &hv[i];
+    value = &ctx->value[i];
+
+    if (hv->value == NULL) {
+        nxt_str_null(value);
+
+    } else if (nxt_tstr_is_const(hv->value)) {
+        nxt_tstr_str(hv->value, value);
+
+    } else {
+        rtcf = r->conf->socket_conf->router_conf;
+
+        ret = nxt_tstr_query_init(&r->tstr_query, rtcf->tstr_state,
+                                  &r->tstr_cache, r, r->mem_pool);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NXT_ERROR;
+        }
+
+        ret = nxt_tstr_query(&r->task, r->tstr_query, hv->value, value);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NXT_ERROR;
+        }
+    }
+
+    if (value->start != NULL
+        && nxt_slow_path(!nxt_http_header_value_is_safe(value)))
+    {
+        ctx->state[i] = NXT_HTTP_SET_HEADERS_REJECTED;
+        return NXT_DECLINED;
+    }
+
+    ctx->state[i] = NXT_HTTP_SET_HEADERS_RESOLVED;
+
+    return NXT_OK;
+}
+
+
 static nxt_http_field_t *
 nxt_http_resp_header_find(nxt_http_request_t *r, u_char *name, size_t length)
 {
@@ -181,14 +408,13 @@ nxt_http_resp_header_find(nxt_http_request_t *r, u_char *name, size_t length)
 nxt_int_t
 nxt_http_set_headers(nxt_http_request_t *r)
 {
-    u_char                 *rejected;
-    nxt_int_t              ret;
-    nxt_uint_t             i, n;
-    nxt_str_t              *value;
-    nxt_http_field_t       *f;
-    nxt_router_conf_t      *rtcf;
-    nxt_http_action_t      *action;
-    nxt_http_header_val_t  *hv, *header;
+    nxt_int_t                   ret;
+    nxt_uint_t                  i, n;
+    nxt_str_t                   *value;
+    nxt_http_field_t            *f;
+    nxt_http_action_t           *action;
+    nxt_http_header_val_t       *hv, *header;
+    nxt_http_set_headers_ctx_t  *ctx;
 
     action = r->action;
 
@@ -200,66 +426,50 @@ nxt_http_set_headers(nxt_http_request_t *r)
         return NXT_OK;
     }
 
-    rtcf = r->conf->socket_conf->router_conf;
-
     header = action->set_headers->elts;
     n = action->set_headers->nelts;
 
-    value = nxt_mp_zalloc(r->mem_pool, sizeof(nxt_str_t) * n);
-    if (nxt_slow_path(value == NULL)) {
+    /*
+     * nxt_http_set_headers_field_op() can have resolved some keys already.
+     * Their stored results are used here, and they are not resolved again.
+     */
+
+    ctx = nxt_http_set_headers_ctx(r);
+    if (nxt_slow_path(ctx == NULL)) {
         return NXT_ERROR;
     }
 
-    rejected = nxt_mp_zalloc(r->mem_pool, n);
-    if (nxt_slow_path(rejected == NULL)) {
-        return NXT_ERROR;
-    }
+    value = ctx->value;
 
     for (i = 0; i < n; i++) {
         hv = &header[i];
 
-        if (hv->value == NULL) {
-            continue;
-        }
+        ret = nxt_http_set_headers_value(r, ctx, i);
 
-        if (nxt_tstr_is_const(hv->value)) {
-            nxt_tstr_str(hv->value, &value[i]);
-
-        } else {
-            ret = nxt_tstr_query_init(&r->tstr_query, rtcf->tstr_state,
-                                      &r->tstr_cache, r, r->mem_pool);
-            if (nxt_slow_path(ret != NXT_OK)) {
-                return NXT_ERROR;
-            }
-
-            ret = nxt_tstr_query(&r->task, r->tstr_query, hv->value, &value[i]);
-            if (nxt_slow_path(ret != NXT_OK)) {
-                return NXT_ERROR;
-            }
-        }
-
-        if (value[i].start != NULL
-            && nxt_slow_path(!nxt_http_header_value_is_safe(&value[i])))
-        {
+        if (nxt_slow_path(ret == NXT_DECLINED)) {
             nxt_log(&r->task, NXT_LOG_INFO,
                     "set_headers \"%V\": dropping value containing control "
                     "bytes (HTTP response-splitting protection)",
                     &hv->name);
 
             /*
-             * Mark the entry as rejected instead of clearing the value:
+             * The entry is marked as rejected instead of clearing the value:
              * a NULL value means "delete this header", and letting an
              * attacker-triggered rejection remove an existing response
              * header (e.g. an app-emitted X-Frame-Options) would fail
              * open.  Rejected entries are skipped entirely below, so a
              * pre-existing same-named header survives untouched.
              */
-            rejected[i] = 1;
+            continue;
+        }
+
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NXT_ERROR;
         }
     }
 
     for (i = 0; i < n; i++) {
-        if (rejected[i]) {
+        if (ctx->state[i] == NXT_HTTP_SET_HEADERS_REJECTED) {
             continue;
         }
 

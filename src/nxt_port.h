@@ -80,6 +80,9 @@ struct nxt_port_handlers_s {
 
     /* The controller asks main to store a certificate bundle.  Appended. */
     nxt_port_handler_t  cert_store;
+
+    /* The controller asks main to store an njs module.  Appended. */
+    nxt_port_handler_t  script_store;
 };
 
 
@@ -143,6 +146,7 @@ typedef enum {
                                   = nxt_port_handler_idx(remove_child_pid),
 
     _NXT_PORT_MSG_CERT_STORE      = nxt_port_handler_idx(cert_store),
+    _NXT_PORT_MSG_SCRIPT_STORE    = nxt_port_handler_idx(script_store),
 
     NXT_PORT_MSG_MAX              = sizeof(nxt_port_handlers_t)
                                     / sizeof(nxt_port_handler_t),
@@ -192,6 +196,7 @@ typedef enum {
     NXT_PORT_MSG_REMOVE_CHILD_PID
                               = nxt_msg_last(_NXT_PORT_MSG_REMOVE_CHILD_PID),
     NXT_PORT_MSG_CERT_STORE       = nxt_msg_last(_NXT_PORT_MSG_CERT_STORE),
+    NXT_PORT_MSG_SCRIPT_STORE     = nxt_msg_last(_NXT_PORT_MSG_SCRIPT_STORE),
 } nxt_port_msg_type_t;
 
 
@@ -201,7 +206,7 @@ typedef enum {
  * inserted before it fails the build.  Add new slots after it and move the
  * pin to the new last slot.
  */
-nxt_static_assert(_NXT_PORT_MSG_CERT_STORE == 36,
+nxt_static_assert(_NXT_PORT_MSG_SCRIPT_STORE == 37,
                   "a port message slot was inserted, not appended");
 
 
@@ -758,6 +763,8 @@ void nxt_port_rearm(nxt_task_t *task, nxt_port_t *port);
 void *nxt_port_queue_mmap(nxt_task_t *task, nxt_fd_t fd, size_t size);
 
 void nxt_port_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
+nxt_int_t nxt_port_new_port_msg(const nxt_port_recv_msg_t *msg,
+    nxt_port_msg_new_port_t *out);
 void nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 void nxt_port_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 void nxt_port_change_log_file_handler(nxt_task_t *task,

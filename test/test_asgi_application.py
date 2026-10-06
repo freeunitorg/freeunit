@@ -196,6 +196,57 @@ def test_asgi_application_204_transfer_encoding():
     ), '204 header transfer encoding'
 
 
+def get_header_then_body(url):
+    # The application sleeps after it sends the header.  Read for less
+    # time than the sleep: what arrives in that time came before the body.
+    # Then read the rest of the response.
+    sock = client.get(url=url, no_recv=True)
+
+    early = client.recvall(sock, read_timeout=0.5).decode()
+    rest = client.recvall(sock).decode()
+    sock.close()
+
+    return early, rest
+
+
+def test_asgi_application_header_before_body():
+    client.load('header_then_body')
+
+    resp = client.get(url='/?body=data')
+    assert resp['status'] == 200, 'start the application'
+
+    # The response has no Content-Length, so it is chunked.  The empty
+    # line that ends the header must come with the header, not with the
+    # first chunk.
+    early, rest = get_header_then_body('/?delay=2&body=data')
+
+    assert early.startswith('HTTP/1.1 200 OK\r\n'), 'status line'
+    assert 'x-header: 1\r\n' in early, 'header field'
+    assert 'Transfer-Encoding: chunked\r\n' in early, 'chunked'
+    assert early.endswith('\r\n\r\n'), 'header end before the body'
+    assert rest == '4\r\ndata\r\n0\r\n\r\n', 'chunks after the sleep'
+
+    # An empty body: the last chunk is the first chunk.
+    early, rest = get_header_then_body('/?delay=2')
+
+    assert early.endswith('\r\n\r\n'), 'empty body: header end'
+    assert rest == '0\r\n\r\n', 'empty body: last chunk only'
+
+    # Two responses on one connection.  The first chunk of the second
+    # response has no CRLF before it either.
+    one = 'Transfer-Encoding: chunked\r\n\r\n4\r\ndata\r\n0\r\n\r\n'
+
+    raw = client.http(
+        b'GET /?body=data HTTP/1.1\r\nHost: localhost\r\n\r\n'
+        b'GET /?body=data HTTP/1.1\r\nHost: localhost\r\n'
+        b'Connection: close\r\n\r\n',
+        raw=True,
+        raw_resp=True,
+    )
+
+    assert raw.count(one) == 2, 'keep-alive'
+
+
 def test_asgi_application_shm_ack_handle():
     # Minimum possible limit
     shm_limit = 10 * 1024 * 1024

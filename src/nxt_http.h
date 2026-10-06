@@ -65,6 +65,18 @@ typedef enum {
 } nxt_http_te_t;
 
 
+/* What "response_headers" will do to one response field. */
+typedef enum {
+    NXT_HTTP_SET_HEADER_NONE = 0,
+    NXT_HTTP_SET_HEADER_REPLACE,
+    NXT_HTTP_SET_HEADER_REMOVE,
+    NXT_HTTP_SET_HEADER_ERROR,
+} nxt_http_set_header_op_t;
+
+
+typedef struct nxt_http_set_headers_ctx_s  nxt_http_set_headers_ctx_t;
+
+
 typedef enum {
     NXT_HTTP_PROTO_H1 = 0,
     NXT_HTTP_PROTO_H2,
@@ -240,6 +252,7 @@ struct nxt_http_request_s {
 
     nxt_tstr_query_t                *tstr_query;
     nxt_tstr_cache_t                tstr_cache;
+    nxt_http_set_headers_ctx_t      *set_headers;
 
     nxt_http_action_t               *action;
     void                            *req_rpc_data;
@@ -262,6 +275,9 @@ struct nxt_http_request_s {
 #endif
 
     nxt_http_static_ctx_t           static_ctx;
+
+    /* Set by nxt_http_comp_check_acceptable(), from mem_pool. */
+    nxt_http_comp_ctx_t             *comp_ctx;
 
     nxt_http_status_t               status:16;
 
@@ -438,6 +454,8 @@ nxt_http_request_t *nxt_http_request_create(nxt_task_t *task);
 void nxt_http_request_error(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_status_t status);
 void nxt_http_request_read_body(nxt_task_t *task, nxt_http_request_t *r);
+nxt_int_t nxt_http_request_body_alloc(nxt_task_t *task, nxt_http_request_t *r,
+    size_t body_length);
 void nxt_http_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_work_handler_t body_handler, void *data);
 void nxt_http_request_ws_frame_start(nxt_task_t *task, nxt_http_request_t *r,
@@ -446,6 +464,7 @@ void nxt_http_request_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_buf_t *out);
 nxt_bool_t nxt_http_request_is_bodyless_final(nxt_http_request_t *r,
     nxt_http_status_t status);
+nxt_bool_t nxt_http_status_no_representation(nxt_http_status_t status);
 nxt_buf_t *nxt_http_buf_mem(nxt_task_t *task, nxt_http_request_t *r,
     size_t size);
 nxt_buf_t *nxt_http_buf_last(nxt_http_request_t *r);
@@ -454,6 +473,7 @@ void nxt_http_request_close_handler(nxt_task_t *task, void *obj, void *data);
 
 nxt_int_t nxt_http_request_host(void *ctx, nxt_http_field_t *field,
     uintptr_t data);
+nxt_int_t nxt_http_validate_host(nxt_str_t *host, nxt_mp_t *mp);
 nxt_int_t nxt_http_request_field(void *ctx, nxt_http_field_t *field,
     uintptr_t offset);
 nxt_int_t nxt_http_request_content_length(void *ctx, nxt_http_field_t *field,
@@ -502,6 +522,8 @@ nxt_int_t nxt_http_rewrite_init(nxt_router_conf_t *rtcf,
 nxt_int_t nxt_http_rewrite(nxt_task_t *task, nxt_http_request_t *r);
 
 nxt_bool_t nxt_http_set_headers_override_validators(nxt_http_request_t *r);
+nxt_http_set_header_op_t nxt_http_set_headers_field_op(nxt_http_request_t *r,
+    const char *name, size_t length);
 nxt_int_t nxt_http_comp_merge_vary(nxt_http_request_t *r);
 nxt_int_t nxt_http_set_headers_init(nxt_router_conf_t *rtcf,
     nxt_http_action_t *action, nxt_http_action_conf_t *acf);

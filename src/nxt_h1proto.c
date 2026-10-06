@@ -43,7 +43,13 @@ static nxt_int_t nxt_h1p_websocket_version(void *ctx, nxt_http_field_t *field,
     uintptr_t data);
 static nxt_int_t nxt_h1p_transfer_encoding(void *ctx, nxt_http_field_t *field,
     uintptr_t data);
+static nxt_int_t nxt_h1p_expect(void *ctx, nxt_http_field_t *field,
+    uintptr_t data);
 static void nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r);
+static nxt_int_t nxt_h1p_request_continue(nxt_task_t *task,
+    nxt_h1proto_t *h1p);
+static void nxt_h1p_conn_continue_sent(nxt_task_t *task, void *obj,
+    void *data);
 static void nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_h1p_request_local_addr(nxt_task_t *task, nxt_http_request_t *r);
@@ -58,6 +64,12 @@ static nxt_off_t nxt_h1p_request_body_bytes_sent(nxt_task_t *task,
 static void nxt_h1p_request_discard(nxt_task_t *task, nxt_http_request_t *r,
     nxt_buf_t *last);
 static void nxt_h1p_conn_request_error(nxt_task_t *task, void *obj, void *data);
+static nxt_bool_t nxt_h1p_rate_too_low(uint64_t bytes, uint64_t msec,
+    nxt_msec_t grace, int32_t rate);
+static void nxt_h1p_send_rate_start(nxt_task_t *task, nxt_h1proto_t *h1p,
+    nxt_http_request_t *r);
+static nxt_bool_t nxt_h1p_send_rate_check(nxt_task_t *task, nxt_conn_t *c);
+static void nxt_h1p_request_timedout(nxt_task_t *task, nxt_conn_t *c);
 static void nxt_h1p_conn_request_timeout(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_h1p_conn_request_send_timeout(nxt_task_t *task, void *obj,
@@ -120,6 +132,7 @@ static const nxt_conn_state_t  nxt_h1p_shutdown_state;
 #endif
 static const nxt_conn_state_t  nxt_h1p_idle_state;
 static const nxt_conn_state_t  nxt_h1p_header_parse_state;
+static const nxt_conn_state_t  nxt_h1p_continue_state;
 static const nxt_conn_state_t  nxt_h1p_read_body_state;
 static const nxt_conn_state_t  nxt_h1p_request_send_state;
 static const nxt_conn_state_t  nxt_h1p_timeout_response_state;
@@ -167,6 +180,7 @@ static nxt_http_field_proc_t           nxt_h1p_fields[] = {
     { nxt_string("Sec-WebSocket-Version"),
                                        &nxt_h1p_websocket_version, 0 },
     { nxt_string("Transfer-Encoding"), &nxt_h1p_transfer_encoding, 0 },
+    { nxt_string("Expect"),            &nxt_h1p_expect, 0 },
 
     { nxt_string("Host"),              &nxt_http_request_host, 0 },
     { nxt_string("Cookie"),            &nxt_http_request_field,
@@ -927,18 +941,44 @@ nxt_h1p_transfer_encoding(void *ctx, nxt_http_field_t *field, uintptr_t data)
 }
 
 
+/*
+ * RFC 9110, 10.1.1.  The router meets "100-continue" itself and ignores any
+ * other expectation, as nginx does.  An HTTP/1.0 client gets no 100.  The
+ * proxy has the whole body before it connects, so it does not forward the
+ * field.  The application still gets it.
+ */
+
+static nxt_int_t
+nxt_h1p_expect(void *ctx, nxt_http_field_t *field, uintptr_t data)
+{
+    nxt_http_request_t  *r;
+
+    r = ctx;
+    field->hopbyhop = 1;
+
+    if (field->value_length == nxt_length("100-continue")
+        && nxt_memcasecmp(field->value, "100-continue",
+                          nxt_length("100-continue")) == 0
+        && nxt_h1p_is_http11(r->proto.h1))
+    {
+        r->proto.h1->continue_pending = 1;
+    }
+
+    return NXT_OK;
+}
+
+
 static void
 nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
 {
-    size_t             size, body_length, body_buffer_size, body_rest;
+    size_t             size, body_length, body_rest;
     ssize_t            res;
     nxt_buf_t          *in, *b, *out, *chunk;
+    nxt_int_t          ret;
     nxt_conn_t         *c;
     nxt_h1proto_t      *h1p;
     nxt_socket_conf_t  *skcf;
     nxt_http_status_t  status;
-
-    static const nxt_str_t tmp_name_pattern = nxt_string("/req-XXXXXXXX");
 
     h1p = r->proto.h1;
     skcf = r->conf->socket_conf;
@@ -989,61 +1029,13 @@ nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
 
     body_length = (size_t) r->content_length_n;
 
-    body_buffer_size = nxt_min(skcf->body_buffer_size, body_length);
-
-    if (body_length > body_buffer_size) {
-        nxt_str_t  *tmp_path, tmp_name;
-
-        tmp_path = &skcf->body_temp_path;
-
-        tmp_name.length = tmp_path->length + tmp_name_pattern.length;
-
-        b = nxt_buf_file_alloc(r->mem_pool,
-                               body_buffer_size + sizeof(nxt_file_t)
-                               + tmp_name.length + 1, 0);
-        if (nxt_slow_path(b == NULL)) {
-            status = NXT_HTTP_INTERNAL_SERVER_ERROR;
-            goto error;
-        }
-
-        tmp_name.start = nxt_pointer_to(b->mem.start, sizeof(nxt_file_t));
-
-        memcpy(tmp_name.start, tmp_path->start, tmp_path->length);
-        memcpy(tmp_name.start + tmp_path->length, tmp_name_pattern.start,
-               tmp_name_pattern.length);
-        tmp_name.start[tmp_name.length] = '\0';
-
-        b->file = (nxt_file_t *) b->mem.start;
-        nxt_memzero(b->file, sizeof(nxt_file_t));
-        b->file->fd = -1;
-        b->file->size = body_length;
-
-        b->mem.start += sizeof(nxt_file_t) + tmp_name.length + 1;
-        b->mem.pos = b->mem.start;
-        b->mem.free = b->mem.start;
-
-        b->file->fd = mkstemp((char *) tmp_name.start);
-        if (nxt_slow_path(b->file->fd == -1)) {
-            nxt_alert(task, "mkstemp(%s) failed %E", tmp_name.start, nxt_errno);
-
-            status = NXT_HTTP_INTERNAL_SERVER_ERROR;
-            goto error;
-        }
-
-        nxt_debug(task, "create body tmp file \"%V\", %d",
-                  &tmp_name, b->file->fd);
-
-        unlink((char *) tmp_name.start);
-
-    } else {
-        b = nxt_buf_mem_alloc(r->mem_pool, body_buffer_size, 0);
-        if (nxt_slow_path(b == NULL)) {
-            status = NXT_HTTP_INTERNAL_SERVER_ERROR;
-            goto error;
-        }
+    ret = nxt_http_request_body_alloc(task, r, body_length);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        status = NXT_HTTP_INTERNAL_SERVER_ERROR;
+        goto error;
     }
 
-    r->body = b;
+    b = r->body;
 
     body_rest = r->chunked ? 1 : body_length;
 
@@ -1102,7 +1094,7 @@ nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
             }
 
         } else {
-            size = nxt_min(body_buffer_size, size);
+            size = nxt_min(size, (size_t) nxt_buf_mem_free_size(&b->mem));
             b->mem.free = nxt_cpymem(b->mem.free, in->mem.pos, size);
 
             in->mem.pos += size;
@@ -1117,8 +1109,41 @@ nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
         h1p->buffers = in;
         h1p->nbuffers++;
 
+        /*
+         * The body_min_rate floor counts each byte that a read returns
+         * in the body read state, chunk framing included.  The framing
+         * costs the client the same bandwidth, and max_body_size limits
+         * the payload.  The header block, and the body bytes that came
+         * with it, are not counted, because the first body read comes
+         * after this point.  Thus the first window is a little stricter.
+         * This is intentional.  The time starts at the start of the body
+         * read state.  After a 100 (Continue),
+         * nxt_h1p_conn_continue_sent() starts it again.
+         */
+        h1p->body_rate_on = (skcf->body_min_rate > 0);
+        h1p->body_rate_start = task->thread->engine->timers.now;
+        h1p->body_rate_bytes = 0;
+
         c = h1p->conn;
         c->read = b;
+
+        /*
+         * The 100 goes out also if a part of the body came with the header,
+         * as in nginx.  That part can be only chunk framing, and the client
+         * can still wait for the 100.  Nothing is written before the body
+         * is read, so the 100 cannot follow a response.  The flag is cleared
+         * when the 100 is queued, so a request gets one 100 at most.
+         */
+        if (h1p->continue_pending) {
+            ret = nxt_h1p_request_continue(task, h1p);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                status = NXT_HTTP_INTERNAL_SERVER_ERROR;
+                goto error;
+            }
+
+            return;
+        }
+
         c->read_state = &nxt_h1p_read_body_state;
 
         nxt_conn_read(task->thread->engine, c);
@@ -1146,6 +1171,93 @@ error:
 }
 
 
+/*
+ * Sends "100 Continue" on the normal write path.  The body is read only
+ * after the 100 is sent.  A write error or a send timeout closes the
+ * request, as for a response.
+ */
+
+static nxt_int_t
+nxt_h1p_request_continue(nxt_task_t *task, nxt_h1proto_t *h1p)
+{
+    nxt_buf_t   *b;
+    nxt_conn_t  *c;
+
+    static const char  continue_response[] = "HTTP/1.1 100 Continue\r\n\r\n";
+
+    nxt_debug(task, "h1p request continue");
+
+    c = h1p->conn;
+
+    /* The connection pool frees the buffer also if it is never sent. */
+    b = nxt_buf_mem_alloc(c->mem_pool, nxt_length(continue_response), 0);
+    if (nxt_slow_path(b == NULL)) {
+        return NXT_ERROR;
+    }
+
+    b->mem.free = nxt_cpymem(b->mem.free, continue_response,
+                             nxt_length(continue_response));
+
+    /* $body_bytes_sent does not count the 100. */
+    h1p->sent_before_body += nxt_length(continue_response);
+    h1p->continue_pending = 0;
+
+    c->write = b;
+    c->write_state = &nxt_h1p_continue_state;
+
+    nxt_conn_write(task->thread->engine, c);
+
+    return NXT_OK;
+}
+
+
+static const nxt_conn_state_t  nxt_h1p_continue_state
+    nxt_aligned(64) =
+{
+    .ready_handler = nxt_h1p_conn_continue_sent,
+    .error_handler = nxt_h1p_conn_request_error,
+
+    .timer_handler = nxt_h1p_conn_request_send_timeout,
+    .timer_value = nxt_h1p_conn_request_timer_value,
+    .timer_data = offsetof(nxt_socket_conf_t, send_timeout),
+    .timer_autoreset = 1,
+};
+
+
+static void
+nxt_h1p_conn_continue_sent(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_conn_t          *c;
+    nxt_h1proto_t       *h1p;
+    nxt_event_engine_t  *engine;
+
+    c = obj;
+
+    nxt_debug(task, "h1p conn continue sent");
+
+    engine = task->thread->engine;
+
+    c->write = nxt_sendbuf_completion(task, &engine->fast_work_queue, c->write);
+
+    if (c->write != NULL) {
+        nxt_conn_write(engine, c);
+        return;
+    }
+
+    /*
+     * The body read state starts now, and so does the body_read_timeout
+     * timer.  Thus the body_min_rate time starts again here.  The time
+     * when the 100 waited for space in the send buffer is not counted.
+     */
+    h1p = c->socket.data;
+    h1p->body_rate_start = engine->timers.now;
+
+    c->read_state = &nxt_h1p_read_body_state;
+
+    nxt_conn_read(engine, c);
+}
+
+
 static const nxt_conn_state_t  nxt_h1p_read_body_state
     nxt_aligned(64) =
 {
@@ -1166,6 +1278,7 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
     size_t              size, body_rest;
     ssize_t             res;
     nxt_buf_t           *b, *out, *chunk;
+    nxt_msec_t          msec;
     nxt_conn_t          *c;
     nxt_h1proto_t       *h1p;
     nxt_socket_conf_t   *skcf;
@@ -1192,11 +1305,14 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
             out = nxt_http_chunk_parse(task, &h1p->chunked_parse, b);
 
             if (h1p->chunked_parse.error) {
-                nxt_h1p_request_error(task, h1p, r);
+                h1p->keepalive = 0;
+                nxt_http_request_error(task, r,
+                                       NXT_HTTP_INTERNAL_SERVER_ERROR);
                 return;
             }
 
             if (h1p->chunked_parse.chunk_error) {
+                h1p->keepalive = 0;
                 nxt_http_request_error(task, r, NXT_HTTP_BAD_REQUEST);
                 return;
             }
@@ -1205,14 +1321,18 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
                 size = nxt_buf_mem_used_size(&chunk->mem);
                 res = nxt_fd_write(b->file->fd, chunk->mem.pos, size);
                 if (nxt_slow_path(res < (ssize_t) size)) {
-                    nxt_h1p_request_error(task, h1p, r);
+                    h1p->keepalive = 0;
+                    nxt_http_request_error(task, r,
+                                           NXT_HTTP_INTERNAL_SERVER_ERROR);
                     return;
                 }
 
                 b->file_end += size;
 
                 if ((size_t) b->file_end > skcf->max_body_size) {
-                    nxt_h1p_request_error(task, h1p, r);
+                    h1p->keepalive = 0;
+                    nxt_http_request_error(task, r,
+                                           NXT_HTTP_PAYLOAD_TOO_LARGE);
                     return;
                 }
             }
@@ -1251,7 +1371,9 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
 
             res = nxt_fd_write(b->file->fd, b->mem.pos, size);
             if (nxt_slow_path(res < (ssize_t) size)) {
-                nxt_h1p_request_error(task, h1p, r);
+                h1p->keepalive = 0;
+                nxt_http_request_error(task, r,
+                                       NXT_HTTP_INTERNAL_SERVER_ERROR);
                 return;
             }
 
@@ -1280,6 +1402,36 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
     nxt_debug(task, "h1p body rest: %uz", body_rest);
 
     if (body_rest != 0) {
+
+        if (h1p->body_rate_on) {
+            /*
+             * The bytes are counted only here.  The flag does not change
+             * in the body read state, and only a read that continues
+             * the body is checked.
+             */
+            h1p->body_rate_bytes += c->nbytes;
+
+            msec = (nxt_msec_t) (engine->timers.now - h1p->body_rate_start);
+
+            if (nxt_h1p_rate_too_low(h1p->body_rate_bytes, msec,
+                                     skcf->body_read_timeout,
+                                     skcf->body_min_rate))
+            {
+                nxt_log(task, NXT_LOG_INFO, "client body rate is less than "
+                        "body_min_rate %d: %uL bytes in %M ms",
+                        skcf->body_min_rate, h1p->body_rate_bytes, msec);
+
+                nxt_h1p_request_timedout(task, c);
+                return;
+            }
+
+            if (msec >= skcf->body_read_timeout) {
+                /* The window passed: the next window counts from now. */
+                h1p->body_rate_start = engine->timers.now;
+                h1p->body_rate_bytes = 0;
+            }
+        }
+
         nxt_conn_read(engine, c);
 
     } else {
@@ -1505,8 +1657,6 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
                 {
                     h1p->chunked = 1;
                     size += nxt_length(chunked);
-                    /* Trailing CRLF will be added by the first chunk header. */
-                    size -= nxt_length("\r\n");
                 }
 
             } else if (!r->no_body) {
@@ -1581,21 +1731,26 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
 
     if (h1p->chunked) {
         p = nxt_cpymem(p, chunked, nxt_length(chunked));
-        /* Trailing CRLF will be added by the first chunk header. */
-
-    } else {
-        *p++ = '\r'; *p++ = '\n';
     }
+
+    /*
+     * The header ends here, also for a chunked response.  Thus the client
+     * can use the header before the first body bytes come.
+     */
+    *p++ = '\r'; *p++ = '\n';
 
     header->mem.free = p;
 
-    h1p->header_size = nxt_buf_mem_used_size(&header->mem);
+    /* $body_bytes_sent does not count the header, or a 100 sent before. */
+    h1p->sent_before_body += nxt_buf_mem_used_size(&header->mem);
 
     c = h1p->conn;
 
     c->write = header;
     h1p->conn_write_tail = &header->next;
     c->write_state = &nxt_h1p_request_send_state;
+
+    nxt_h1p_send_rate_start(task, h1p, r);
 
     if (body_handler != NULL) {
         /*
@@ -1702,6 +1857,8 @@ nxt_h1p_request_send(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
         c->write = out;
         c->write_state = &nxt_h1p_request_send_state;
 
+        nxt_h1p_send_rate_start(task, h1p, r);
+
         nxt_conn_write(task->thread->engine, c);
 
     } else {
@@ -1716,15 +1873,24 @@ nxt_h1p_request_send(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
 }
 
 
+/*
+ * The data of a chunk ends with CRLF.  This CRLF starts the next chunk
+ * header or the last chunk.  Before the first chunk there is no data to end:
+ * the response header ends with its own CRLF.
+ */
+
 static nxt_buf_t *
 nxt_h1p_chunk_create(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
 {
+    u_char             *p;
     nxt_off_t          size;
     nxt_buf_t          *b, **prev, *header, *tail;
+    nxt_h1proto_t      *h1p;
 
     const size_t       chunk_size = 2 * nxt_length("\r\n") + NXT_OFF_T_HEXLEN;
     static const char  tail_chunk[] = "\r\n0\r\n\r\n";
 
+    h1p = r->proto.h1;
     size = 0;
     prev = &out;
 
@@ -1763,6 +1929,11 @@ nxt_h1p_chunk_create(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
             nxt_memcpy(tail->mem.free, tail_chunk, sizeof(tail_chunk));
             tail->mem.free += nxt_length(tail_chunk);
 
+            if (!h1p->chunk_sent && size == 0) {
+                /* No chunk data comes before the last chunk. */
+                tail->mem.pos += nxt_length("\r\n");
+            }
+
             break;
         }
 
@@ -1780,8 +1951,16 @@ nxt_h1p_chunk_create(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
     }
 
     header->next = out;
-    header->mem.free = nxt_sprintf(header->mem.free, header->mem.end,
-                                   "\r\n%xO\r\n", size);
+    p = header->mem.free;
+
+    if (h1p->chunk_sent) {
+        *p++ = '\r'; *p++ = '\n';
+    }
+
+    header->mem.free = nxt_sprintf(p, header->mem.end, "%xO\r\n", size);
+
+    h1p->chunk_sent = 1;
+
     return header;
 }
 
@@ -1794,7 +1973,7 @@ nxt_h1p_request_body_bytes_sent(nxt_task_t *task, nxt_http_proto_t proto)
 
     h1p = proto.h1;
 
-    sent = h1p->conn->sent - h1p->header_size;
+    sent = h1p->conn->sent - h1p->sent_before_body;
 
     return (sent > 0) ? sent : 0;
 }
@@ -1854,19 +2033,198 @@ nxt_h1p_conn_request_error(nxt_task_t *task, void *obj, void *data)
 }
 
 
+/*
+ * The minimum transfer rate floor: body_min_rate and send_min_rate.
+ *
+ * The body_read_timeout and send_timeout timers are gap timers.  Each
+ * read or write of one or more bytes starts the timer again.  Thus the
+ * timers stop a client that sends or reads nothing, but they do not stop
+ * a client that transfers one byte just before each timeout ("slow POST"
+ * and "slow read").  Such a client can keep a connection for ever.
+ *
+ * The rate floor stops this client.  The floor is added to the gap timers,
+ * it does not replace them.  The floor check runs only when a read or
+ * a write completes.  A client that stops fully causes no events, and the
+ * gap timer stops it.  A client that is slower than the floor still causes
+ * events, and the floor check stops it.
+ *
+ * The check starts after a grace time.  The grace time is equal to the gap
+ * timeout (body_read_timeout or send_timeout).  It lets TCP slow start and
+ * short network stops occur.  A total time limit is not used, because it
+ * also stops honest large transfers on slow links.
+ *
+ * A timeout of 0 turns the gap timer off: nxt_conn_timer() arms no timer
+ * for the value 0.  Then nothing stops a client that stops fully, because
+ * the floor check needs a read or a write.  The grace time is 0 too, so
+ * a new window starts after each check.  A body read is checked against
+ * the time since the previous read, or since the start of the body read
+ * state.  A write is checked against the time since the previous write,
+ * or since the start of the send period if that is later.  Thus the time
+ * between send periods is not counted.  A check in the same millisecond
+ * passes.
+ *
+ * The check is "bytes * 1000 < rate * msec" in 64-bit integers.  The
+ * validator keeps the rate at or below 2^31 - 1, and the check limits
+ * msec to 2^31 - 1.  Thus the product cannot overflow.
+ */
+
+static nxt_bool_t
+nxt_h1p_rate_too_low(uint64_t bytes, uint64_t msec, nxt_msec_t grace,
+    int32_t rate)
+{
+    if (rate <= 0 || msec < grace) {
+        return 0;
+    }
+
+    msec = nxt_min(msec, (uint64_t) NXT_INT32_T_MAX);
+
+    if (bytes >= UINT64_MAX / 1000) {
+        return 0;
+    }
+
+    return (bytes * 1000 < (uint64_t) rate * msec);
+}
+
+
+/*
+ * The send rate is measured only while response data waits for the client.
+ * A send period starts when the router gives data to an empty connection
+ * write queue.  The period stops when the client accepted all the queued
+ * data.  The time between periods is not counted: then the router waits
+ * for the application or for the upstream server, not for the client.
+ * Thus a slow response source (for example a stream of events) is not
+ * stopped by the floor.  The bytes and the time of the periods of one
+ * request are added together until a window of at least the grace time
+ * passes the check; then the next window starts from zero.  Thus bytes
+ * sent early in a response give no credit for a slow read later.
+ *
+ * The check runs after each write, also after the write that stops
+ * a period.  When the last data of the response goes out, the response
+ * is complete in the socket buffer.  Then a failed check only closes the
+ * connection instead of keeping it alive.
+ *
+ * WebSocket frames also use the request send state.  The floor is not
+ * used for a WebSocket connection.
+ */
+
+static void
+nxt_h1p_send_rate_start(nxt_task_t *task, nxt_h1proto_t *h1p,
+    nxt_http_request_t *r)
+{
+    if (h1p->send_rate_on
+        || h1p->websocket
+        || r->conf->socket_conf->send_min_rate <= 0)
+    {
+        return;
+    }
+
+    h1p->send_rate_on = 1;
+    h1p->send_rate_start = task->thread->engine->timers.now;
+    h1p->send_rate_sent = h1p->conn->sent;
+}
+
+
+static nxt_bool_t
+nxt_h1p_send_rate_check(nxt_task_t *task, nxt_conn_t *c)
+{
+    uint64_t            bytes, msec;
+    nxt_h1proto_t       *h1p;
+    nxt_socket_conf_t   *skcf;
+    nxt_http_request_t  *r;
+
+    h1p = c->socket.data;
+
+    if (!h1p->send_rate_on) {
+        return 0;
+    }
+
+    r = h1p->request;
+
+    if (nxt_slow_path(r == NULL)) {
+        return 0;
+    }
+
+    skcf = r->conf->socket_conf;
+
+    msec = h1p->send_rate_time
+           + (nxt_msec_t) (task->thread->engine->timers.now
+                           - h1p->send_rate_start);
+    bytes = h1p->send_rate_bytes;
+
+    if (c->sent > h1p->send_rate_sent) {
+        bytes += c->sent - h1p->send_rate_sent;
+    }
+
+    /*
+     * The check also runs when the write empties the queue.  An application
+     * or an upstream server that gives one buffer at a time can make each
+     * write event empty the queue.  Without the check there, the router
+     * never checks the rate of a client that keeps the socket buffer full.
+     */
+
+    if (!nxt_h1p_rate_too_low(bytes, msec, skcf->send_timeout,
+                              skcf->send_min_rate))
+    {
+        if (msec >= skcf->send_timeout) {
+            /* The window passed: the next window counts from now. */
+            msec = 0;
+            bytes = 0;
+
+            h1p->send_rate_time = 0;
+            h1p->send_rate_bytes = 0;
+            h1p->send_rate_start = task->thread->engine->timers.now;
+            h1p->send_rate_sent = c->sent;
+        }
+
+        if (c->write == NULL) {
+            /* The client accepted all the queued data: the period stops. */
+            h1p->send_rate_on = 0;
+            h1p->send_rate_time = msec;
+            h1p->send_rate_bytes = bytes;
+        }
+
+        return 0;
+    }
+
+    nxt_log(task, NXT_LOG_INFO, "client send rate is less than "
+            "send_min_rate %d: %uL bytes in %uL ms",
+            skcf->send_min_rate, bytes, msec);
+
+    /* The same steps as nxt_h1p_conn_request_send_timeout(). */
+
+    nxt_timer_disable(task->thread->engine, &c->write_timer);
+    c->block_write = 1;
+
+    nxt_h1p_request_error(task, h1p, r);
+
+    return 1;
+}
+
+
 static void
 nxt_h1p_conn_request_timeout(nxt_task_t *task, void *obj, void *data)
 {
-    nxt_conn_t          *c;
-    nxt_timer_t         *timer;
-    nxt_h1proto_t       *h1p;
-    nxt_http_request_t  *r;
+    nxt_timer_t  *timer;
 
     timer = obj;
 
     nxt_debug(task, "h1p conn request timeout");
 
-    c = nxt_read_timer_conn(timer);
+    nxt_h1p_request_timedout(task, nxt_read_timer_conn(timer));
+}
+
+
+/*
+ * The steps for a request read timeout: header_read_timeout,
+ * body_read_timeout, and the body_min_rate floor.
+ */
+
+static void
+nxt_h1p_request_timedout(nxt_task_t *task, nxt_conn_t *c)
+{
+    nxt_h1proto_t       *h1p;
+    nxt_http_request_t  *r;
+
     c->block_read = 1;
     /*
      * Disable SO_LINGER off during socket closing
@@ -1977,6 +2335,12 @@ nxt_h1p_conn_sent(nxt_task_t *task, void *obj, void *data)
     engine = task->thread->engine;
 
     c->write = nxt_sendbuf_completion(task, &engine->fast_work_queue, c->write);
+
+    if (c->write_state == &nxt_h1p_request_send_state
+        && nxt_slow_path(nxt_h1p_send_rate_check(task, c)))
+    {
+        return;
+    }
 
     if (c->write != NULL) {
         nxt_conn_write(engine, c);

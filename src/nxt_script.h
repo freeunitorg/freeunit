@@ -8,6 +8,16 @@
 #define _NXT_SCRIPT_INCLUDED_
 
 
+/*
+ * A module name is a file name in the scripts directory of the state, so
+ * NAME_MAX bounds it.
+ */
+#define NXT_SCRIPT_NAME_MAX_LENGTH  255
+
+/* Main copies a module into its memory to store it. */
+#define NXT_SCRIPT_STORE_MAX_SIZE   (16 * 1024 * 1024)
+
+
 typedef struct nxt_script_s  nxt_script_t;
 
 nxt_script_t *nxt_script_new(nxt_task_t *task, nxt_str_t *name, u_char *data,
@@ -25,9 +35,13 @@ void nxt_script_store_release(nxt_array_t *scripts);
 
 void nxt_script_store_get(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp,
     nxt_port_rpc_handler_t handler, void *ctx);
+void nxt_script_store_put(nxt_task_t *task, nxt_str_t *name,
+    nxt_buf_mem_t *mbuf, nxt_mp_t *mp, nxt_port_rpc_handler_t handler,
+    void *ctx);
 void nxt_script_store_delete(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp);
 
 void nxt_script_store_get_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
+void nxt_script_store_put_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 void nxt_script_store_delete_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 

@@ -180,6 +180,8 @@ NXT_TEST_SRCS=" \
     src/test/nxt_string_test.c \
     src/test/nxt_buf_test.c \
     src/test/nxt_http_chunk_parse_test.c \
+    src/test/nxt_http_validate_host_test.c \
+    src/test/nxt_http_request_body_alloc_test.c \
     src/test/nxt_conf_parse_test.c \
     src/test/nxt_port_fail_test.c \
     src/test/nxt_fd_event_change_test.c \
@@ -188,6 +190,10 @@ NXT_TEST_SRCS=" \
     src/test/nxt_port_mmap_read_test.c \
     src/test/nxt_port_mmaps_max_test.c \
     src/test/nxt_port_ready_test.c \
+    src/test/nxt_conn_close_idle_test.c \
+    src/test/nxt_listen_event_test.c \
+    src/test/nxt_conn_io_accept_test.c \
+    src/test/nxt_runtime_idle_close_test.c \
     src/test/nxt_router_new_port_test.c \
     src/test/nxt_router_start_fail_test.c \
     src/test/nxt_router_start_fail_soak_test.c \
@@ -198,9 +204,12 @@ NXT_TEST_SRCS=" \
     src/test/nxt_router_app_timeout_test.c \
     src/test/nxt_router_remove_pid_soak_test.c \
     src/test/nxt_router_detached_test.c \
+    src/test/nxt_router_sender_test.c \
+    src/test/nxt_router_stale_joint_test.c \
     src/test/nxt_router_websocket_test.c \
     src/test/nxt_main_start_process_reply_test.c \
     src/test/nxt_main_file_store_test.c \
+    src/test/nxt_main_store_test.c \
     src/test/nxt_proto_creating_wedge_test.c \
     src/test/nxt_main_whoami_test.c \
     src/test/nxt_main_remove_child_pid_test.c \
@@ -217,6 +226,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_port_frag_test.c \
     src/test/nxt_port_release_test.c \
     src/test/nxt_nncq_bound_test.c \
+    src/test/nxt_cpu_limit_test.c \
 "
 
 
@@ -231,6 +241,7 @@ fi
 
 if [ $NXT_HAVE_ROOTFS = YES ]; then
     NXT_LIB_SRCS="$NXT_LIB_SRCS src/nxt_fs_mount.c"
+    NXT_TEST_SRCS="$NXT_TEST_SRCS src/test/nxt_isolation_mount_dst_test.c"
 fi
 
 
@@ -242,6 +253,7 @@ fi
 
 if [ $NXT_OPENSSL = YES ]; then
     NXT_LIB_SRCS="$NXT_LIB_SRCS $NXT_LIB_OPENSSL_SRCS"
+    NXT_TEST_SRCS="$NXT_TEST_SRCS src/test/nxt_openssl_server_init_test.c"
 fi
 
 
@@ -266,6 +278,8 @@ if [ "$NXT_REGEX" = "YES" ]; then
     else
         NXT_LIB_SRCS="$NXT_LIB_SRCS $NXT_LIB_PCRE_SRCS"
     fi
+
+    NXT_TEST_SRCS="$NXT_TEST_SRCS src/test/nxt_regex_test.c"
 fi
 
 if [ "$NXT_HAVE_EPOLL" = "YES" -o "$NXT_TEST_BUILD_EPOLL" = "YES" ]; then
@@ -359,9 +373,12 @@ fi
 
 NXT_FUZZ_SRCS=" \
     fuzzing/nxt_basic_fuzz.c \
+    fuzzing/nxt_http_chunk_fuzz.c \
     fuzzing/nxt_http_controller_fuzz.c \
     fuzzing/nxt_http_h1p_fuzz.c \
     fuzzing/nxt_http_h1p_peer_fuzz.c \
+    fuzzing/nxt_http_h1p_peer_response_fuzz.c \
+    fuzzing/nxt_http_ws_utf8_fuzz.c \
     fuzzing/nxt_json_fuzz.c \
     fuzzing/nxt_router_app_response_fuzz.c \
     fuzzing/nxt_unit_msg_fuzz.c \

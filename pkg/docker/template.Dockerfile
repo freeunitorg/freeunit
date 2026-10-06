@@ -11,9 +11,10 @@ LABEL org.opencontainers.image.version="@@VERSION@@"
 RUN set -ex \
     && savedAptMark="$(apt-mark showmanual)" \
     && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confold upgrade \
     && apt-get install --no-install-recommends --no-install-suggests -y \
          ca-certificates git build-essential libssl-dev openssl libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev curl wget pkg-config pkgconf libclang-dev cmake \
-    && export RUST_VERSION=1.94.1 \
+    && export RUST_VERSION=1.95.0 \
     && export RUSTUP_HOME=/usr/src/unit/rustup \
     && export CARGO_HOME=/usr/src/unit/cargo \
     && export PATH=/usr/src/unit/cargo/bin:$PATH \

@@ -180,7 +180,7 @@ RUN set -ex \
          ca-certificates git build-essential libssl-dev openssl libpcre2-dev \
          zlib1g-dev libzstd-dev libbrotli-dev curl wget pkg-config pkgconf \
          libclang-dev cmake python3-pytest python3-openssl sudo procps \
-    && export RUST_VERSION=1.94.1 \
+    && export RUST_VERSION=1.95.0 \
     && export RUSTUP_HOME=/usr/src/unit/rustup \
     && export CARGO_HOME=/usr/src/unit/cargo \
     && export PATH=/usr/src/unit/cargo/bin:$PATH \

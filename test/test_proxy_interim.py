@@ -293,8 +293,9 @@ def test_proxy_interim_consumed(target):
 
 
 def test_proxy_interim_expect_continue():
-    """The upstream answers Expect with 100; the client gets only the final
-    response."""
+    """The upstream sends a 100 for /expect, and the proxy drops it.  The
+    client gets one 100 only: the router sends it before it reads the rest
+    of the body."""
 
     body = 'x' * 4096
 
@@ -307,7 +308,13 @@ def test_proxy_interim_expect_continue():
         '\r\n' + body
     )
 
-    check(raw, body=f'got {len(body)}')
+    # The first read holds at most header_buffer_size (2048) bytes, so the
+    # router always waits for the rest of the body.
+    router_continue = 'HTTP/1.1 100 Continue\r\n\r\n'
+
+    assert raw.startswith(router_continue), f'no 100 from the router: {raw!r}'
+
+    check(raw[len(router_continue) :], body=f'got {len(body)}')
 
 
 def test_proxy_interim_fields_not_leaked():

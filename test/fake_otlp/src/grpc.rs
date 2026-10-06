@@ -27,6 +27,7 @@ struct Collector {
     dump: Option<String>,
     count: Arc<AtomicUsize>,
     max_requests: Option<usize>,
+    status: u16,
     shutdown: Arc<tokio::sync::Notify>,
 }
 
@@ -59,13 +60,22 @@ impl TraceService for Collector {
             self.shutdown.notify_one();
         }
 
+        if self.status != 200 {
+            return Err(Status::unavailable("fake_otlp: --status failure"));
+        }
+
         Ok(Response::new(ExportTraceServiceResponse::default()))
     }
 }
 
 /// Serve OTLP/gRPC until `max_requests` exports have arrived (or forever when
 /// `None`). Runs on a multi-thread tokio runtime owned by this thread.
-pub fn serve_grpc(port: u16, max_requests: Option<usize>, dump: Option<String>) {
+pub fn serve_grpc(
+    port: u16,
+    max_requests: Option<usize>,
+    dump: Option<String>,
+    status: u16,
+) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -77,6 +87,7 @@ pub fn serve_grpc(port: u16, max_requests: Option<usize>, dump: Option<String>) 
             dump,
             count: Arc::new(AtomicUsize::new(0)),
             max_requests,
+            status,
             shutdown: shutdown.clone(),
         };
 

@@ -157,8 +157,10 @@ nxt_port_mmaps_destroy(nxt_port_mmaps_t *port_mmaps, nxt_bool_t free_elts)
 }
 
 
+#if (NXT_DEBUG)
 #define nxt_port_mmap_free_junk(p, size)                                      \
     memset((p), 0xA5, size)
+#endif
 
 
 static void
@@ -220,7 +222,9 @@ complete_buf:
         c = nxt_port_mmap_chunk_id(hdr, p);
     }
 
+#if (NXT_DEBUG)
     nxt_port_mmap_free_junk(p, b->mem.end - p);
+#endif
 
     nxt_debug(task, "mmap buf completion: %p [%p,%uz] (sent=%d), "
               "%PI->%PI,%d,%d", b, b->mem.start, b->mem.end - b->mem.start,

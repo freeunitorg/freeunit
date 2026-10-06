@@ -68,6 +68,8 @@ nxt_int_t nxt_base64_test(nxt_thread_t *thr);
 nxt_int_t nxt_string_test(nxt_thread_t *thr);
 nxt_int_t nxt_buf_test(nxt_thread_t *thr);
 nxt_int_t nxt_http_chunk_parse_test(nxt_thread_t *thr);
+nxt_int_t nxt_http_validate_host_test(nxt_thread_t *thr);
+nxt_int_t nxt_http_request_body_alloc_test(nxt_thread_t *thr);
 nxt_int_t nxt_conf_json_depth_test(nxt_thread_t *thr);
 nxt_int_t nxt_http_route_addr_test(nxt_thread_t *thr);
 nxt_int_t nxt_conf_map_object_test(nxt_thread_t *thr);
@@ -78,6 +80,10 @@ nxt_int_t nxt_port_mmap_range_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_mmap_read_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_mmaps_max_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_ready_test(nxt_thread_t *thr);
+nxt_int_t nxt_conn_close_idle_test(nxt_thread_t *thr);
+nxt_int_t nxt_listen_event_test(nxt_thread_t *thr);
+nxt_int_t nxt_conn_io_accept_test(nxt_thread_t *thr);
+nxt_int_t nxt_runtime_idle_close_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_new_port_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_start_fail_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_start_fail_soak_test(nxt_thread_t *thr);
@@ -88,10 +94,13 @@ nxt_int_t nxt_router_start_timeout_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_app_timeout_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_remove_pid_soak_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_detached_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_sender_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_stale_joint_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_websocket_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_prepare_msg_test(nxt_thread_t *thr);
 nxt_int_t nxt_main_start_process_reply_test(nxt_thread_t *thr);
 nxt_int_t nxt_main_file_store_test(nxt_thread_t *thr);
+nxt_int_t nxt_main_store_test(nxt_thread_t *thr);
 nxt_int_t nxt_proto_creating_wedge_test(nxt_thread_t *thr);
 nxt_int_t nxt_main_whoami_test(nxt_thread_t *thr);
 nxt_int_t nxt_main_remove_child_pid_test(nxt_thread_t *thr);
@@ -106,9 +115,17 @@ nxt_int_t nxt_router_response_parse_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_frag_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_release_test(nxt_thread_t *thr);
 nxt_int_t nxt_nncq_bound_test(nxt_thread_t *thr);
+#if (NXT_HAVE_REGEX)
+nxt_int_t nxt_regex_test(nxt_thread_t *thr);
+#endif
+nxt_int_t nxt_openssl_server_init_test(nxt_thread_t *thr);
 nxt_int_t nxt_cgroup_test(nxt_thread_t *thr);
 nxt_int_t nxt_controller_peer_test(nxt_thread_t *thr);
+nxt_int_t nxt_cpu_limit_test(nxt_thread_t *thr);
 nxt_int_t nxt_clone_creds_test(nxt_thread_t *thr);
+#if (NXT_HAVE_ISOLATION_ROOTFS)
+nxt_int_t nxt_isolation_mount_dst_test(nxt_thread_t *thr);
+#endif
 
 nxt_bool_t nxt_test_fd_is_open(nxt_fd_t fd);
 int nxt_test_in_child(nxt_thread_t *thr, const char *name, int (*fn)(void *),

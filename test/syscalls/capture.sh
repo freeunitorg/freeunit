@@ -156,6 +156,17 @@ done
 grep -q 'syscall drift canary' "$WORK/body.txt" \
     || die "served body is not the canary file"
 
+# Main stores the configuration in a child process.  Wait for conf.json, so
+# that the second PUT below stores over a file that exists.  When SIGQUIT
+# arrives while a store child runs and a newer store waits, main kills the
+# child, and the kill can come before the child created conf.json.
+i=0
+while [ ! -s "$WORK/state/conf.json" ]; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || die "conf.json was not stored within 10s"
+    sleep 0.1
+done
+
 # A second PUT, so the capture covers storing over state files that already
 # exist.  The first one writes conf.json and version into an empty statedir,
 # where nxt_main_file_store_inherit() finds no destination and returns before

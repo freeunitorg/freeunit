@@ -25,6 +25,7 @@ typedef struct nxt_upstreams_s                 nxt_upstreams_t;
 typedef struct nxt_router_access_log_s         nxt_router_access_log_t;
 typedef struct nxt_router_access_log_format_s  nxt_router_access_log_format_t;
 typedef struct nxt_http_comp_conf_s            nxt_http_comp_conf_t;
+typedef struct nxt_http_comp_ctx_s             nxt_http_comp_ctx_t;
 
 
 #define NXT_HTTP_ACTION_ERROR  ((nxt_http_action_t *) -1)
@@ -289,6 +290,10 @@ typedef struct {
     nxt_msec_t             proxy_send_timeout;
     nxt_msec_t             proxy_read_timeout;
 
+    /* Minimum client transfer rates in bytes per second, 0 is off. */
+    int32_t                body_min_rate;
+    int32_t                send_min_rate;
+
     nxt_websocket_conf_t   websocket_conf;
 
     nxt_str_t              body_temp_path;
@@ -316,6 +321,12 @@ typedef struct {
     nxt_socket_conf_t      *socket_conf;
 
     nxt_joint_job_t        *close_job;
+
+    /*
+     * The create job of this joint could not allocate the listen event,
+     * see nxt_router_listen_socket_release_stale().
+     */
+    uint8_t                stale;  /* 1 bit */
 
     nxt_upstream_t         **upstreams;
 
@@ -363,6 +374,12 @@ void nxt_router_access_log_reopen_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 
 #if (NXT_TESTS)
+/* The sender check of the router main port, for the router sender test. */
+nxt_bool_t nxt_router_test_msg_sender_ok(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+
+extern nxt_uint_t  nxt_router_test_senders_refused;
+
 /* The detached edge handler, for the sender check test. */
 void nxt_router_test_detached_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
@@ -380,6 +397,17 @@ void nxt_router_test_app_port_release(nxt_task_t *task, nxt_app_t *app,
 nxt_router_temp_conf_t *nxt_router_test_temp_conf(nxt_task_t *task);
 void nxt_router_test_app_rpc_create(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf, nxt_app_t *app);
+
+/* The release of stale listen joints, for the stale joint test. */
+void nxt_router_test_listen_socket_release_stale(nxt_task_t *task,
+    nxt_event_engine_t *engine, nxt_listen_socket_t *ls,
+    nxt_socket_conf_joint_t *keep);
+
+/* The listen socket create and update jobs, for the stale joint test. */
+void nxt_router_test_listen_socket_create(nxt_task_t *task,
+    nxt_joint_job_t *job, nxt_socket_conf_joint_t *joint);
+void nxt_router_test_listen_socket_update(nxt_task_t *task,
+    nxt_joint_job_t *job, nxt_socket_conf_joint_t *joint);
 
 /* The request deadline handler, for the app-timeout test. */
 void nxt_router_test_app_timeout(nxt_task_t *task, void *obj, void *data);

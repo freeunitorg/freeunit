@@ -14,6 +14,10 @@ GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 class ApplicationWebsocket(ApplicationProto):
 
+    # Seconds to wait for the echo of a large message (the 9_x tests).
+    # A debug build needs 3.6-4.4 s to echo 65536 fragments of 64 bytes.
+    LARGE_MESSAGE_TIMEOUT = 30
+
     OP_CONT = 0x00
     OP_TEXT = 0x01
     OP_BINARY = 0x02
@@ -30,7 +34,7 @@ class ApplicationWebsocket(ApplicationProto):
         sha1 = hashlib.sha1((key + GUID).encode()).digest()
         return base64.b64encode(sha1).decode()
 
-    def upgrade(self, headers=None):
+    def upgrade(self, headers=None, sock=None):
         key = None
 
         if headers is None:
@@ -44,10 +48,9 @@ class ApplicationWebsocket(ApplicationProto):
                 'Sec-WebSocket-Version': 13,
             }
 
-        sock = self.get(
-            headers=headers,
-            no_recv=True,
-        )
+        kwargs = {} if sock is None else {'sock': sock}
+
+        sock = self.get(headers=headers, no_recv=True, **kwargs)
 
         resp = ''
         while True:
@@ -139,6 +142,27 @@ class ApplicationWebsocket(ApplicationProto):
             pytest.fail('Received frame with mask')
 
         return frame
+
+    def pongs_read(self, sock, pings, read_timeout=60):
+        # RFC 6455 Section 5.5.3: while a PONG is not sent, the server can
+        # answer only the most recent PING.  Read PONGs until the one for the
+        # last PING.  They must answer PINGs in the order they were sent.
+
+        pings = [p.encode() if isinstance(p, str) else p for p in pings]
+        answered = []
+
+        while not answered or answered[-1] != len(pings) - 1:
+            frame = self.frame_read(sock, read_timeout)
+
+            assert frame['opcode'] == self.OP_PONG, 'pong opcode'
+            assert frame['data'] in pings, 'pong payload'
+
+            i = pings.index(frame['data'])
+            assert not answered or i > answered[-1], 'pong order'
+
+            answered.append(i)
+
+        return answered
 
     def frame_to_send(
         self,

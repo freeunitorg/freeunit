@@ -44,11 +44,18 @@ Create a commit that updates the docs/changes.xml for this release.
 As well as adding the various entries also update the 'date' and 'time'
 fields.
 
-## Generate the CHANGES file
+## Update the CHANGES file
 
-    $ make -C docs/ changes && mv build/CHANGES .
+CHANGES is maintained by hand: every changelog commit adds its entry to
+both docs/changes.xml and CHANGES.  For the release, retitle the top block
+and set its date, keeping the leading blank line and the column the date
+sits in:
 
-See 24ed91f40 for an example.
+    Changes with FreeUnit X.Y.Z                                     DD Mon YYYY
+
+Do not regenerate it with `make -C docs/ changes`: the generator titles the
+block "Changes with Unit" and wraps every entry differently from the file
+in the tree, so the result is a rewrite rather than an update.
 
 
 # Merge it
@@ -69,6 +76,13 @@ This should create a new tag object pointing to the "CHANGES" commit.
 The tag can be pushed just as the branch is. E.g.
 
     $ git push <upstream> 1.33.0
+
+Do not create the `unitctl/X.Y.Z` tag by hand.  Pushing `X.Y.Z` runs
+.github/workflows/unitctl.yml, whose release job creates `unitctl/X.Y.Z`
+and its release itself; a tag that already exists makes that step fail.
+The same push runs build-deb.yml and release-docker.yml; the latter logs
+in to Docker Hub, so the DOCKERHUB_USERNAME and DOCKERHUB_TOKEN secrets
+have to be set before the tag is pushed.
 
 
 # A new 'Release'

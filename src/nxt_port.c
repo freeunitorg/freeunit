@@ -10,6 +10,7 @@
 #include <nxt_router.h>
 #include <nxt_app_queue.h>
 #include <nxt_port_queue.h>
+#include <nxt_span.h>
 
 
 static void nxt_port_remove_pid(nxt_task_t *task, nxt_port_recv_msg_t *msg,
@@ -557,12 +558,38 @@ nxt_port_send_port(nxt_task_t *task, nxt_port_t *port, nxt_port_t *new_port,
 }
 
 
+/*
+ * Copies the body of a NEW_PORT message.  The sender sets the size.  A body
+ * shorter than nxt_port_msg_new_port_t is an error: the missing bytes would
+ * come from an earlier message in the same buffer.
+ */
+
+nxt_int_t
+nxt_port_new_port_msg(const nxt_port_recv_msg_t *msg,
+    nxt_port_msg_new_port_t *out)
+{
+    nxt_span_t  span;
+
+    if (nxt_slow_path(msg->buf == NULL)) {
+        return NXT_ERROR;
+    }
+
+    nxt_span_init(&span, msg->buf->mem.pos, msg->buf->mem.free);
+
+    if (nxt_slow_path(nxt_span_copy(&span, out, sizeof(*out)) != 0)) {
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+
 void
 nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
     nxt_port_t               *port;
     nxt_runtime_t            *rt;
-    nxt_port_msg_new_port_t  *new_port_msg;
+    nxt_port_msg_new_port_t  new_port_msg;
 
     rt = task->thread->runtime;
 
@@ -575,17 +602,21 @@ nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     msg->u.new_port = NULL;
     msg->new_port_created = 0;
 
-    new_port_msg = (nxt_port_msg_new_port_t *) msg->buf->mem.pos;
+    if (nxt_slow_path(nxt_port_new_port_msg(msg, &new_port_msg) != NXT_OK)) {
+        nxt_alert(task, "process %PI sent a short new port message; refused",
+                  msg->port_msg.pid);
 
-    /* TODO check b size and make plain */
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
 
     nxt_debug(task, "new port %d received for process %PI:%d",
-              msg->fd[0], new_port_msg->pid, new_port_msg->id);
+              msg->fd[0], new_port_msg.pid, new_port_msg.id);
 
-    port = nxt_runtime_port_find(rt, new_port_msg->pid, new_port_msg->id);
+    port = nxt_runtime_port_find(rt, new_port_msg.pid, new_port_msg.id);
     if (port != NULL) {
-        nxt_debug(task, "port %PI:%d already exists", new_port_msg->pid,
-              new_port_msg->id);
+        nxt_debug(task, "port %PI:%d already exists", new_port_msg.pid,
+              new_port_msg.id);
 
         msg->u.new_port = port;
 
@@ -622,9 +653,9 @@ nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         return;
     }
 
-    port = nxt_runtime_process_port_create(task, rt, new_port_msg->pid,
-                                           new_port_msg->id,
-                                           new_port_msg->type);
+    port = nxt_runtime_process_port_create(task, rt, new_port_msg.pid,
+                                           new_port_msg.id,
+                                           new_port_msg.type);
     if (nxt_slow_path(port == NULL)) {
         nxt_port_recv_msg_close_fds(msg);
         return;
@@ -638,8 +669,8 @@ nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     /* The port owns the descriptor now. */
     msg->fd[0] = -1;
 
-    port->max_size = new_port_msg->max_size;
-    port->max_share = new_port_msg->max_share;
+    port->max_size = new_port_msg.max_size;
+    port->max_share = new_port_msg.max_share;
 
     port->socket.task = task;
 
@@ -982,16 +1013,16 @@ nxt_port_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
      * set, nxt_port_remove_notify_others() puts it into the REMOVE_PID that
      * reports this process's death, and nxt_router_remove_pid_handler()
      * turns a stream-bearing REMOVE_PID into an RPC_ERROR
-     * (src/nxt_router.c:1147-1153).  That is the right fallback for a start
+     * (src/nxt_router.c).  That is the right fallback for a start
      * that never completed, and a liability afterwards: stream identifiers
-     * come from one 32-bit counter (nxt_stream_ident, src/nxt_port_rpc.c:11,
-     * bumped at src/nxt_port_rpc.c:164) that every request also draws on
-     * (src/nxt_router.c:5880), so once it wraps, an ordinary worker exit
-     * would fail whatever live RPC has inherited the number.  The reachable
-     * collision set is small -- the retype lands on the router's main port,
-     * which holds start, prefork, listen-socket and access-log
-     * registrations, while request RPCs live on the worker threads' engine
-     * ports -- but it is not empty.
+     * come from one 32-bit counter (nxt_stream_ident, src/nxt_port_rpc.c,
+     * bumped in nxt_port_rpc_register_handler_ex()) that every request also
+     * draws on (nxt_router_process_http_request()), so once it wraps, an
+     * ordinary worker exit would fail whatever live RPC has inherited the
+     * number.  The reachable collision set is small -- the retype lands on
+     * the router's main port, which holds start, prefork, listen-socket and
+     * access-log registrations, while request RPCs live on the worker
+     * threads' engine ports -- but it is not empty.
      *
      * Zeroing on the READY state alone is what this deliberately is not.
      * The state is set above and the announcement is sent here, and in

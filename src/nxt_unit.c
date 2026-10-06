@@ -84,6 +84,11 @@ static void nxt_unit_ctx_detached_done(nxt_unit_ctx_t *ctx);
 static int nxt_unit_ctx_detached_retry(nxt_unit_ctx_t *ctx);
 static int nxt_unit_detached_timeout(nxt_unit_ctx_impl_t *ctx_impl);
 static int nxt_unit_detached_poll(nxt_unit_ctx_t *ctx, int fd);
+static void nxt_unit_detached_sleep(nxt_unit_ctx_impl_t *ctx_impl);
+static uint64_t nxt_unit_detached_now(void);
+static uint64_t nxt_unit_detached_delay(nxt_unit_ctx_impl_t *ctx_impl,
+    uint64_t now);
+static int nxt_unit_detached_wake(nxt_unit_ctx_impl_t *ctx_impl);
 static int nxt_unit_send_detached(nxt_unit_ctx_t *ctx, uint8_t state);
 static int nxt_unit_process_req_body(nxt_unit_ctx_t *ctx,
     nxt_unit_recv_msg_t *recv_msg);
@@ -434,6 +439,24 @@ struct nxt_unit_ctx_impl_s {
 
     /* Failed FINISH sends so far; 0 when none is pending. */
     uint8_t                       detached_retries;
+
+    /*
+     * Set while nxt_unit_process_port_msg() runs.  The embedder owns the
+     * event loop, so a pending retry must not block it.
+     */
+    uint8_t                       detached_nowait;  /* 1 bit */
+
+    /*
+     * The last nxt_unit_process_port_msg() call found no message, and it
+     * returned NXT_UNIT_OK only for a pending FINISH retry.
+     */
+    uint8_t                       detached_idle;  /* 1 bit */
+
+    /*
+     * The earliest time for the next FINISH retry from
+     * nxt_unit_process_port_msg(), in milliseconds of a monotonic clock.
+     */
+    uint64_t                      detached_deadline;
 
     /*
      * The START edge was never delivered.  The worker retires when the
@@ -824,6 +847,9 @@ nxt_unit_ctx_init(nxt_unit_impl_t *lib, nxt_unit_ctx_impl_t *ctx_impl,
 
     ctx_impl->detached = NXT_UNIT_DETACHED_NONE;
     ctx_impl->detached_retries = 0;
+    ctx_impl->detached_nowait = 0;
+    ctx_impl->detached_idle = 0;
+    ctx_impl->detached_deadline = 0;
     ctx_impl->detached_unreported = 0;
 
     nxt_queue_init(&ctx_impl->free_req);
@@ -1444,6 +1470,39 @@ nxt_unit_process_new_port(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg)
 
     return NXT_UNIT_OK;
 }
+
+
+#if (NXT_TESTS)
+
+/*
+ * Adds a port with a shared memory queue, as NEW_PORT does for a router
+ * engine port.  libunit owns "out_fd" and "queue" from here on; "queue" is
+ * a mapping of sizeof(nxt_port_queue_t) bytes.
+ */
+
+int
+nxt_unit_test_add_queue_port(nxt_unit_ctx_t *ctx, pid_t pid, uint16_t id,
+    int out_fd, void *queue)
+{
+    nxt_unit_port_t  new_port, *port;
+
+    nxt_unit_port_id_init(&new_port.id, pid, id);
+
+    new_port.in_fd = -1;
+    new_port.out_fd = out_fd;
+    new_port.data = NULL;
+
+    port = nxt_unit_add_port(ctx, &new_port, queue);
+    if (nxt_slow_path(port == NULL)) {
+        return NXT_UNIT_ERROR;
+    }
+
+    nxt_unit_port_release(port);
+
+    return NXT_UNIT_OK;
+}
+
+#endif
 
 
 static int
@@ -3866,6 +3925,7 @@ nxt_unit_ctx_detached_done(nxt_unit_ctx_t *ctx)
 
     if (ctx_impl->detached_retries == 0) {
         ctx_impl->detached_retries = 1;
+        ctx_impl->detached_deadline = 0;
     }
 }
 
@@ -3952,13 +4012,15 @@ nxt_unit_detached_timeout(nxt_unit_ctx_impl_t *ctx_impl)
 /*
  * Wait for "fd" to become readable while a FINISH retry is pending.
  * Returns NXT_UNIT_AGAIN when the wait expires, so that the caller returns
- * to the read loop, which retries.
+ * to the read loop, which retries.  Inside nxt_unit_process_port_msg() the
+ * wait is zero.  The embedder's event loop must not block, so the backoff
+ * is a deadline there.
  */
 
 static int
 nxt_unit_detached_poll(nxt_unit_ctx_t *ctx, int fd)
 {
-    int                  nevents;
+    int                  nevents, timeout;
     struct pollfd        pfd;
     nxt_unit_ctx_impl_t  *ctx_impl;
 
@@ -3968,13 +4030,184 @@ nxt_unit_detached_poll(nxt_unit_ctx_t *ctx, int fd)
     pfd.events = POLLIN;
     pfd.revents = 0;
 
-    nevents = poll(&pfd, 1, nxt_unit_detached_timeout(ctx_impl));
+    timeout = ctx_impl->detached_nowait ? 0
+                                        : nxt_unit_detached_timeout(ctx_impl);
+
+    nevents = poll(&pfd, 1, timeout);
 
     if (nevents == 0 || (nevents == -1 && errno == EINTR)) {
         return NXT_UNIT_AGAIN;
     }
 
     return NXT_UNIT_OK;
+}
+
+
+/*
+ * Sleep for the backoff before the next FINISH retry.  This is for a caller
+ * that has no descriptor to wait on.  nxt_unit_detached_poll() does the
+ * same for a loop that has one.
+ */
+
+static void
+nxt_unit_detached_sleep(nxt_unit_ctx_impl_t *ctx_impl)
+{
+    struct timespec  ts;
+
+    ts.tv_sec = 0;
+    ts.tv_nsec = nxt_unit_detached_timeout(ctx_impl) * 1000000L;
+
+    (void) nanosleep(&ts, NULL);
+}
+
+
+/*
+ * The time for the FINISH retry deadline, in milliseconds.  libunit does
+ * not link nxt_monotonic_time(), so this makes the same choice of clock,
+ * in the same order, with one difference.  nxt_monotonic_time() prefers
+ * CLOCK_MONOTONIC_COARSE on Linux and CLOCK_MONOTONIC_FAST on FreeBSD.
+ * Those clocks lag up to one kernel tick behind the fine clock of the
+ * embedder's timers.  An embedder that waits for the delay from
+ * nxt_unit_detached_retry_timeout() would then find the retry not due
+ * yet, and wake up once more for each retry.  So the fine clock is used.
+ * See src/nxt_time.c for the other choices.
+ */
+
+static uint64_t
+nxt_unit_detached_now(void)
+{
+#if (NXT_HAVE_HG_GETHRTIME)
+
+    return (uint64_t) hg_gethrtime() / 1000000;
+
+#elif (NXT_SOLARIS || NXT_HPUX)
+
+    return (uint64_t) gethrtime() / 1000000;
+
+#elif (NXT_HAVE_CLOCK_MONOTONIC)
+
+    struct timespec  ts;
+
+    (void) clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    return (uint64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+
+#elif (NXT_MACOSX)
+
+    /*
+     * mach_absolute_time() returns ticks.  The timebase gives their length
+     * in nanoseconds as a fraction: 1/1 on Intel Macs, 125/3 on Apple
+     * silicon.  The quotient and the remainder are scaled apart, so the
+     * result is exact and no product can overflow before the nanoseconds
+     * themselves do, in centuries.
+     */
+
+    uint64_t                   ns, ticks;
+    mach_timebase_info_data_t  tb;
+
+    (void) mach_timebase_info(&tb);
+
+    ticks = mach_absolute_time();
+
+    ns = ticks / tb.denom * tb.numer + ticks % tb.denom * tb.numer / tb.denom;
+
+    return ns / 1000000;
+
+#else
+
+    /*
+     * No monotonic clock.  nxt_monotonic_time() emulates one with a
+     * per-thread state.  This helper keeps no state, so a step of the
+     * clock moves the deadline.  nxt_unit_detached_delay() bounds that.
+     */
+
+    struct timeval  tv;
+
+    (void) gettimeofday(&tv, NULL);
+
+    return (uint64_t) tv.tv_sec * 1000 + tv.tv_usec / 1000;
+
+#endif
+}
+
+
+/*
+ * The time from "now" to the FINISH retry deadline, in milliseconds, or 0
+ * when the retry is due.  A deadline that is more than one backoff step
+ * ahead can only come from a clock that went back.  The retry is due then:
+ * an early retry is harmless, and a late one holds the worker detached.
+ */
+
+static uint64_t
+nxt_unit_detached_delay(nxt_unit_ctx_impl_t *ctx_impl, uint64_t now)
+{
+    uint64_t  delay;
+
+    if (now >= ctx_impl->detached_deadline) {
+        return 0;
+    }
+
+    delay = ctx_impl->detached_deadline - now;
+
+    if (nxt_slow_path(delay > (uint64_t) nxt_unit_detached_timeout(ctx_impl))) {
+        return 0;
+    }
+
+    return delay;
+}
+
+
+/*
+ * Return the code for a call that found no message.  A pending FINISH
+ * retry needs another call, and the embedder's descriptor stays quiet
+ * until unrelated traffic arrives.  So report NXT_UNIT_OK: an integration
+ * that drives its own event loop calls again on that code, and
+ * NXT_UNIT_AGAIN stops it.  Nothing waits here.  The backoff is
+ * ->detached_deadline, and a call before the deadline only receives.
+ */
+
+static int
+nxt_unit_detached_wake(nxt_unit_ctx_impl_t *ctx_impl)
+{
+    if (nxt_fast_path(ctx_impl->detached_retries == 0 || !ctx_impl->online)) {
+        return NXT_UNIT_AGAIN;
+    }
+
+    ctx_impl->detached_idle = 1;
+
+    return NXT_UNIT_OK;
+}
+
+
+/*
+ * Tell an integration with its own event loop when to call
+ * nxt_unit_process_port_msg() again.  A delay is returned only after a
+ * call that found no message.  After a call that processed a message,
+ * more messages can wait, so the next call must come at once.
+ */
+
+int
+nxt_unit_detached_retry_timeout(nxt_unit_ctx_t *ctx)
+{
+    uint64_t             now;
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    if (ctx_impl->detached_retries == 0
+        || ctx_impl->detached_retries > 10
+        || !ctx_impl->online)
+    {
+        return -1;
+    }
+
+    if (!ctx_impl->detached_idle) {
+        return 0;
+    }
+
+    now = nxt_unit_detached_now();
+
+    return (int) nxt_min(nxt_unit_detached_delay(ctx_impl, now), INT_MAX);
 }
 
 
@@ -4052,6 +4285,24 @@ int
 nxt_unit_test_ctx_detached_retry(nxt_unit_ctx_t *ctx)
 {
     return nxt_unit_ctx_detached_retry(ctx);
+}
+
+
+nxt_unit_port_t *
+nxt_unit_test_ctx_read_port(nxt_unit_ctx_t *ctx)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    return ctx_impl->read_port;
+}
+
+
+uint64_t
+nxt_unit_test_detached_now(void)
+{
+    return nxt_unit_detached_now();
 }
 
 
@@ -5373,7 +5624,9 @@ nxt_unit_mmap_release(nxt_unit_ctx_t *ctx, nxt_port_mmap_header_t *hdr,
     nxt_chunk_id_t   c;
     nxt_unit_impl_t  *lib;
 
+#if (NXT_DEBUG)
     memset(start, 0xA5, size);
+#endif
 
     p = start;
     end = p + size;
@@ -6076,14 +6329,63 @@ nxt_unit_run_shared(nxt_unit_ctx_t *ctx)
     int                  rc;
     nxt_unit_impl_t      *lib;
     nxt_unit_read_buf_t  *rbuf;
+    nxt_unit_ctx_impl_t  *ctx_impl;
 
     nxt_unit_ctx_use(ctx);
 
     lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
 
     rc = NXT_UNIT_OK;
 
-    while (nxt_fast_path(nxt_unit_chk_ready(ctx))) {
+    while (nxt_fast_path(ctx_impl->online)) {
+
+        /*
+         * A request from the shared port also runs the application's
+         * handler.  So this loop can end detached work, and the finish
+         * report can fail.  Retry it here, as nxt_unit_run_ctx() does.  The
+         * wait below is bounded while a retry is pending.
+         */
+
+        if (nxt_slow_path(ctx_impl->detached_retries > 0)) {
+            rc = nxt_unit_ctx_detached_retry(ctx);
+            if (nxt_slow_path(rc != NXT_UNIT_OK)) {
+                break;
+            }
+
+            /*
+             * The retry can complete a deferred graceful quit.  That
+             * removes the read port.  Leave with the retry's NXT_UNIT_OK.
+             */
+
+            if (nxt_slow_path(!ctx_impl->online)) {
+                break;
+            }
+        }
+
+        if (nxt_slow_path(!nxt_unit_chk_ready(ctx))) {
+
+            /*
+             * No request can arrive now, so the loop ends here.  The loop
+             * runs on ->online and not on nxt_unit_chk_ready() for one
+             * reason: a pending retry must not be left behind here.  Both
+             * causes of a false nxt_unit_chk_ready() can occur with a retry
+             * pending.  The request that ended the detached work can be the
+             * one that reached "request_limit".  A graceful quit deferred on
+             * the detached state has already cleared ->ready.  There is no
+             * descriptor to wait on, so sleep for the backoff and retry
+             * above.  This goes on up to the give-up that closes the worker.
+             */
+
+            if (nxt_fast_path(ctx_impl->detached_retries == 0)) {
+                break;
+            }
+
+            nxt_unit_detached_sleep(ctx_impl);
+
+            continue;
+        }
+
         rbuf = nxt_unit_read_buf_get(ctx);
         if (nxt_slow_path(rbuf == NULL)) {
             rc = NXT_UNIT_ERROR;
@@ -6094,6 +6396,11 @@ nxt_unit_run_shared(nxt_unit_ctx_t *ctx)
 
         rc = nxt_unit_shared_port_recv(ctx, lib->shared_port, rbuf);
         if (rc == NXT_UNIT_AGAIN) {
+            if (nxt_slow_path(ctx_impl->detached_retries > 0)) {
+                nxt_unit_read_buf_release(ctx, rbuf);
+                continue;
+            }
+
             goto retry;
         }
 
@@ -6158,9 +6465,30 @@ nxt_unit_process_port_msg(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port)
 {
     int  rc;
 
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
     nxt_unit_ctx_use(ctx);
 
+    ctx_impl->detached_nowait = 1;
+    ctx_impl->detached_idle = 0;
+
     rc = nxt_unit_process_port_msg_impl(ctx, port);
+
+    ctx_impl->detached_nowait = 0;
+
+    /*
+     * A QUIT in this call runs the quit callback.  When the callback calls
+     * nxt_unit_done(), the reference above is the last one, and the release
+     * below frees the context.  The caller cannot know this from ctx, so
+     * tell it here: NXT_UNIT_AGAIN means "nothing to schedule, stop".  An
+     * offline context has no read port, so a call again has no use.
+     */
+
+    if (rc == NXT_UNIT_OK && nxt_slow_path(!ctx_impl->online)) {
+        rc = NXT_UNIT_AGAIN;
+    }
 
     nxt_unit_ctx_release(ctx);
 
@@ -6172,13 +6500,58 @@ static int
 nxt_unit_process_port_msg_impl(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port)
 {
     int                  rc;
+    uint64_t             now;
     nxt_unit_impl_t      *lib;
     nxt_unit_read_buf_t  *rbuf;
+    nxt_unit_ctx_impl_t  *ctx_impl;
 
     lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    /*
+     * The embedder runs its own event loop, so this call is the only
+     * wake-up that libunit gets.  The read loops retry from their own
+     * waits.  Run the retry before anything that can return early.  If
+     * not, a worker whose finish report failed stays detached in the
+     * router until traffic arrives.  The backoff is a deadline and not a
+     * wait, because a wait would block the embedder's loop.  A call before
+     * the deadline only receives.
+     */
+
+    if (nxt_slow_path(ctx_impl->detached_retries > 0 && ctx_impl->online)) {
+        now = nxt_unit_detached_now();
+
+        if (nxt_unit_detached_delay(ctx_impl, now) > 0) {
+            goto recv;
+        }
+
+        rc = nxt_unit_ctx_detached_retry(ctx);
+        if (nxt_slow_path(rc != NXT_UNIT_OK)) {
+            return rc;
+        }
+
+        if (ctx_impl->detached_retries > 0) {
+            ctx_impl->detached_deadline = now
+                                        + nxt_unit_detached_timeout(ctx_impl);
+        }
+
+        /*
+         * The retry can complete a graceful quit that was deferred on the
+         * detached state.  That removes the read port.  Report "no
+         * message" here.  A receive would wait for a message that the
+         * router will never send, and NXT_UNIT_AGAIN makes the embedder
+         * stop calling.
+         */
+
+        if (nxt_slow_path(!ctx_impl->online)) {
+            return NXT_UNIT_AGAIN;
+        }
+    }
+
+recv:
 
     if (port == lib->shared_port && !nxt_unit_chk_ready(ctx)) {
-        return NXT_UNIT_AGAIN;
+        return nxt_unit_detached_wake(ctx_impl);
     }
 
     rbuf = nxt_unit_read_buf_get(ctx);
@@ -6195,6 +6568,11 @@ nxt_unit_process_port_msg_impl(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port)
 
     if (rc != NXT_UNIT_OK) {
         nxt_unit_read_buf_release(ctx, rbuf);
+
+        if (rc == NXT_UNIT_AGAIN) {
+            return nxt_unit_detached_wake(ctx_impl);
+        }
+
         return rc;
     }
 
@@ -7050,13 +7428,31 @@ nxt_unit_port_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     nxt_int_t             rc;
     nxt_port_msg_t        msg;
     nxt_unit_impl_t       *lib;
+    const nxt_port_msg_t  *pm;
     nxt_unit_port_impl_t  *port_impl;
 
     lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
 
     port_impl = nxt_container_of(port, nxt_unit_port_impl_t, port);
+
+    /*
+     * A message that goes to the socket puts only a READ_SOCKET marker into
+     * the queue.  The marker does not tell who sent it.  For each marker,
+     * the reader takes the next datagram, and that datagram can be from
+     * another process (nxt_port_queue_read_handler()).  Thus a datagram can
+     * be read before a queue message that its sender sent earlier.  A
+     * datagram is never read after a queue message that its sender sent
+     * later.  So a message of a request goes into the queue only if it is
+     * the last message of the request.  A message of no request (stream 0)
+     * can also go into the queue, even if "last" is clear.  QUIT and
+     * RPC_READY to the port of a context are such messages.
+     */
+    pm = buf;
+
     if (port_impl->queue != NULL && (oob == NULL || oob->size == 0)
-        && buf_size <= NXT_PORT_QUEUE_MSG_SIZE)
+        && buf_size <= NXT_PORT_QUEUE_MSG_SIZE
+        && buf_size >= sizeof(nxt_port_msg_t)
+        && (pm->stream == 0 || pm->last))
     {
         rc = nxt_port_queue_send(port_impl->queue, buf, buf_size, &notify);
         if (nxt_slow_path(rc != NXT_OK)) {
@@ -7384,8 +7780,10 @@ nxt_unit_shared_port_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     nxt_unit_read_buf_t *rbuf)
 {
     int                   res;
+    nxt_unit_ctx_impl_t   *ctx_impl;
     nxt_unit_port_impl_t  *port_impl;
 
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
     port_impl = nxt_container_of(port, nxt_unit_port_impl_t, port);
 
 retry:
@@ -7397,6 +7795,23 @@ retry:
     }
 
     if (res == NXT_UNIT_AGAIN) {
+
+        /*
+         * Bound the wait while a detached finish retry is pending, as
+         * nxt_unit_ctx_port_recv() does.  Then the caller returns to its
+         * loop and retries.  Without this, the caller blocks here until a
+         * request comes.
+         */
+
+        if (nxt_slow_path(ctx_impl->detached_retries > 0
+                          && port->in_fd != -1))
+        {
+            res = nxt_unit_detached_poll(ctx, port->in_fd);
+            if (res != NXT_UNIT_OK) {
+                return res;
+            }
+        }
+
         res = nxt_unit_port_recv(ctx, port, rbuf);
         if (nxt_slow_path(res == NXT_UNIT_ERROR)) {
             return NXT_UNIT_ERROR;

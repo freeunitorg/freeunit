@@ -32,11 +32,12 @@ struct nxt_h1proto_s {
     nxt_http_chunk_parse_t    chunked_parse;
     nxt_off_t                 remainder;
 
-    uint8_t                   nbuffers;
+    size_t                    nbuffers;
     uint8_t                   header_buffer_slot;
     uint8_t                   large_buffer_slot;
     uint8_t                   keepalive;            /* 1 bit  */
     uint8_t                   chunked;              /* 1 bit  */
+    uint8_t                   chunk_sent;           /* 1 bit  */
     uint8_t                   websocket;            /* 1 bit  */
     uint8_t                   connection_upgrade;   /* 1 bit  */
     uint8_t                   upgrade_websocket;    /* 1 bit  */
@@ -46,13 +47,33 @@ struct nxt_h1proto_s {
     uint8_t                   websocket_cont_expected;  /* 1 bit */
     uint8_t                   websocket_closed;         /* 1 bit */
     uint8_t                   websocket_text;           /* 1 bit */
+    uint8_t                   websocket_pong_queued;    /* 1 bit */
+    uint8_t                   continue_pending;         /* 1 bit */
 
     nxt_h1p_ws_utf8_t         websocket_utf8;
 
-    uint32_t                  header_size;
+    /*
+     * Bytes written before the body: a 100 (Continue) and the response
+     * header.  $body_bytes_sent does not count them.
+     */
+    uint32_t                  sent_before_body;
+
+    /*
+     * The minimum transfer rate state of the current request.  The
+     * keep-alive code zeroes these fields before the next request.
+     */
+    uint8_t                   body_rate_on;         /* 1 bit  */
+    uint8_t                   send_rate_on;         /* 1 bit  */
+    nxt_msec_t                body_rate_start;
+    nxt_msec_t                send_rate_start;
+    uint64_t                  body_rate_bytes;
+    uint64_t                  send_rate_bytes;
+    uint64_t                  send_rate_time;
+    nxt_off_t                 send_rate_sent;
 
     nxt_http_field_t          *websocket_key;
     nxt_h1p_websocket_timer_t *websocket_timer;
+    nxt_buf_t                 *websocket_pong_next;
 
     nxt_http_request_t        *request;
     nxt_buf_t                 *buffers;

@@ -97,6 +97,117 @@ def test_chunked_max_body_size():
     )
 
 
+def test_chunked_max_body_size_later_read():
+    # The body crosses the limit in a read after the header read.  That
+    # check closed the connection with no status line.
+    # https://github.com/freeunitorg/freeunit/issues/542
+    assert 'success' in client.conf(
+        {'max_body_size': 8, 'chunked_transform': True}, 'settings/http'
+    )
+
+    def send(writes, connection_close):
+        head = (
+            b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+            b'Transfer-Encoding: chunked\r\n'
+        )
+
+        if connection_close:
+            head += b'Connection: close\r\n'
+
+        sock = client.http(head + b'\r\n', raw=True, no_recv=True)
+
+        # Each write ends with the CRLF after the chunk data, and goes in
+        # its own read.
+        for w in writes:
+            time.sleep(0.3)
+            sock.sendall(w)
+
+        resp = client.recvall(sock, read_timeout=10)
+        sock.close()
+
+        return resp
+
+    # The request does not ask to close, so "Connection: close" in the
+    # response shows that keep-alive was turned off.  The rest of the body
+    # is never read.
+    resp = send([b'5\r\nhello\r\n', b'6\r\nworld!\r\n'], False)
+    assert resp.startswith(b'HTTP/1.1 413 '), resp
+    assert b'\r\nConnection: close\r\n' in resp, resp
+
+    # Control: exactly 8 bytes is not over the limit.
+    resp = send([b'5\r\nhello\r\n', b'3\r\nabc\r\n', b'0\r\n\r\n'], True)
+    assert resp.startswith(b'HTTP/1.1 200 '), resp
+    assert resp.endswith(b'\r\n\r\nhelloabc'), resp
+
+
+def test_chunked_malformed_later_read():
+    # A malformed chunk in a read after the header read got 400, but the
+    # connection stayed open for a next request.
+    sock = client.http(
+        b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+        b'Transfer-Encoding: chunked\r\n\r\n',
+        raw=True,
+        no_recv=True,
+    )
+
+    # "X" stands where the CRLF after the chunk data must be.
+    time.sleep(0.3)
+    sock.sendall(b'5\r\nhelloXXXXXXXX')
+
+    start = time.monotonic()
+    resp = client.recvall(sock, read_timeout=5)
+    elapsed = time.monotonic() - start
+    sock.close()
+
+    assert resp.startswith(b'HTTP/1.1 400 '), resp
+    assert b'\r\nConnection: close\r\n' in resp, resp
+
+    # The server closes the connection.  recvall() returns at the end of
+    # the stream, not at its read timeout.
+    assert elapsed < 3, elapsed
+
+
+def test_chunked_read_ends_after_chunk_data():
+    # A read that ended right after the chunk data, before its CRLF, left
+    # that data in the read buffer.  The next read was parsed after it, so
+    # the parser found "h" where the CRLF must be, and the request got 400.
+    # https://github.com/freeunitorg/freeunit/issues/543
+    head = (
+        b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+        b'Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n'
+    )
+
+    def send(writes, expect_body):
+        sock = client.http(writes[0], raw=True, no_recv=True)
+
+        # The pause puts each write in its own read.
+        for w in writes[1:]:
+            time.sleep(0.3)
+            sock.sendall(w)
+
+        resp = client.recvall(sock, read_timeout=10)
+        sock.close()
+
+        assert resp.startswith(b'HTTP/1.1 200 '), (writes, resp)
+        assert resp.endswith(b'\r\n\r\n' + expect_body), (writes, resp)
+
+    # The read after the header read ends after the chunk data.
+    send([head, b'5\r\nhello', b'\r\n0\r\n\r\n'], b'hello')
+
+    # The same, with a second chunk after the CRLF.
+    send(
+        [head, b'5\r\nhello', b'\r\n6\r\nworld!', b'\r\n0\r\n\r\n'],
+        b'helloworld!',
+    )
+
+    # The header read itself ends after the chunk data.
+    send([head + b'5\r\nhello', b'\r\n0\r\n\r\n'], b'hello')
+
+    # Controls: the read ends inside the data, or after its CRLF.
+    send([head, b'5\r\nhel', b'lo\r\n0\r\n\r\n'], b'hello')
+    send([head, b'5\r\nhello\r\n', b'0\r\n\r\n'], b'hello')
+
+
 def test_chunked_after_last():
     resp = client.get(
         headers={

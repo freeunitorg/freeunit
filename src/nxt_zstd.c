@@ -51,7 +51,6 @@ nxt_zstd_compress(nxt_http_comp_compressor_ctx_t *ctx, const uint8_t *in_buf,
 
     if (last) {
         ret = ZSTD_endStream(zstd, &zoutb);
-        ZSTD_freeCStream(zstd);
     }
 
     if (ZSTD_isError(ret)) {
@@ -62,8 +61,17 @@ nxt_zstd_compress(nxt_http_comp_compressor_ctx_t *ctx, const uint8_t *in_buf,
 }
 
 
+static void
+nxt_zstd_free(nxt_http_comp_compressor_ctx_t *ctx)
+{
+    ZSTD_freeCStream(ctx->zstd_ctx);
+    ctx->zstd_ctx = NULL;
+}
+
+
 const nxt_http_comp_operations_t  nxt_http_comp_zstd_ops = {
     .init               = nxt_zstd_init,
     .bound              = nxt_zstd_bound,
     .deflate            = nxt_zstd_compress,
+    .free               = nxt_zstd_free,
 };

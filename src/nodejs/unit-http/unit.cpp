@@ -20,6 +20,7 @@ struct port_data_t {
     port_data_t(nxt_unit_ctx_t *c, nxt_unit_port_t *p);
 
     void process_port_msg();
+    void cancel();
     void stop();
 
     template<typename T>
@@ -31,10 +32,12 @@ struct port_data_t {
 
     nxt_unit_ctx_t   *ctx;
     nxt_unit_port_t  *port;
+    port_data_t      *next;
     uv_poll_t        poll;
     uv_timer_t       timer;
     int              ref_count;
     bool             scheduled;
+    bool             delayed;
     bool             stopped;
 };
 
@@ -48,7 +51,8 @@ struct req_data_t {
 
 
 port_data_t::port_data_t(nxt_unit_ctx_t *c, nxt_unit_port_t *p) :
-    ctx(c), port(p), ref_count(0), scheduled(false), stopped(false)
+    ctx(c), port(p), next(NULL), ref_count(0), scheduled(false),
+    delayed(false), stopped(false)
 {
     timer.type = UV_UNKNOWN_HANDLE;
 }
@@ -57,12 +61,35 @@ port_data_t::port_data_t(nxt_unit_ctx_t *c, nxt_unit_port_t *p) :
 void
 port_data_t::process_port_msg()
 {
-    int  rc, err;
+    int          rc, err, delay;
+    Unit         *obj;
+    port_data_t  *data;
 
     rc = nxt_unit_process_port_msg(ctx, port);
 
     if (rc != NXT_UNIT_OK) {
         return;
+    }
+
+    /*
+     * A QUIT in this call runs Unit::quit(), which stops all ports and
+     * calls nxt_unit_done().  The context can be freed now.  Do not use it.
+     * The port data stays until the uv close callbacks run.
+     */
+
+    if (stopped) {
+        return;
+    }
+
+    /*
+     * NXT_UNIT_OK also comes when the call found no message and a FINISH
+     * retry is pending.  The retry is not due before a deadline.  Wait for
+     * it with the timer, and do not spin the loop with zero timeouts.
+     */
+
+    delay = nxt_unit_detached_retry_timeout(ctx);
+    if (delay < 0) {
+        delay = 0;
     }
 
     if (timer.type == UV_UNKNOWN_HANDLE) {
@@ -76,18 +103,78 @@ port_data_t::process_port_msg()
         timer.data = this;
     }
 
-    if (!scheduled && !stopped) {
-        uv_timer_start(&timer, timer_callback, 0, 0);
+    /*
+     * Any call runs the retry of the context, whatever the port.  So one
+     * delayed call for each context is enough.  A delayed call is pending
+     * on this port or on the other port of the context.  Keep it, unless
+     * this call processed a message.  Then more messages can wait, so
+     * call again at once, and cancel the delayed call of the other port.
+     */
 
-        scheduled = true;
+    obj = reinterpret_cast<Unit *>(ctx->unit->data);
+
+    if (delay > 0) {
+        if (scheduled) {
+            return;
+        }
+
+        for (data = obj->ports_; data != NULL; data = data->next) {
+            if (data->delayed) {
+                return;
+            }
+        }
+
+    } else {
+        if (scheduled && !delayed) {
+            return;
+        }
+
+        for (data = obj->ports_; data != NULL; data = data->next) {
+            if (data != this && data->delayed) {
+                data->cancel();
+            }
+        }
     }
+
+    uv_timer_start(&timer, timer_callback, delay, 0);
+
+    scheduled = true;
+    delayed = (delay > 0);
+}
+
+
+void
+port_data_t::cancel()
+{
+    uv_timer_stop(&timer);
+
+    scheduled = false;
+    delayed = false;
 }
 
 
 void
 port_data_t::stop()
 {
+    Unit         *obj;
+    port_data_t  **link;
+
+    if (stopped) {
+        return;
+    }
+
     stopped = true;
+
+    /* The context can be freed after this.  Unlink from its ports. */
+
+    obj = reinterpret_cast<Unit *>(ctx->unit->data);
+
+    for (link = &obj->ports_; *link != NULL; link = &(*link)->next) {
+        if (*link == this) {
+            *link = next;
+            break;
+        }
+    }
 
     uv_poll_stop(&poll);
 
@@ -126,6 +213,8 @@ port_data_t::timer_callback(uv_timer_t *handle)
     data = get(handle);
 
     data->scheduled = false;
+    data->delayed = false;
+
     if (data->stopped) {
         return;
     }
@@ -150,7 +239,8 @@ port_data_t::delete_data(uv_handle_t* handle)
 Unit::Unit(napi_env env, napi_value jsthis):
     nxt_napi(env),
     wrapper_(wrap(jsthis, this, destroy)),
-    unit_ctx_(nullptr)
+    unit_ctx_(nullptr),
+    ports_(nullptr)
 {
     nxt_unit_debug(NULL, "Unit::Unit()");
 }
@@ -512,6 +602,9 @@ Unit::add_port(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port)
 
         data->ref_count++;
         data->poll.data = data;
+
+        data->next = obj->ports_;
+        obj->ports_ = data;
     }
 
     return NXT_UNIT_OK;
@@ -561,6 +654,16 @@ Unit::quit(nxt_unit_ctx_t *ctx)
 
     } catch (exception &e) {
         nxt_unit_debug(ctx, "quit: %s", e.str);
+    }
+
+    /*
+     * nxt_unit_done() can free the context.  No timer of its ports may
+     * call into libunit after that.  Stop the ports that libunit did not
+     * remove yet.  A later remove_port() call finds them stopped.
+     */
+
+    while (ports_ != NULL) {
+        ports_->stop();
     }
 
     nxt_unit_done(ctx);

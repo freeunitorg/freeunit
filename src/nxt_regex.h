@@ -9,13 +9,24 @@
 
 #if (NXT_HAVE_REGEX)
 
-typedef struct nxt_regex_s        nxt_regex_t;
+/*
+ * The most match steps that one match of one pattern may use.  The library
+ * default is 10,000,000.  The library counts steps from zero again at each
+ * start position of a pattern that is not anchored.  So such a pattern also
+ * gets a callout before each item, and one match may make at most this
+ * number of callouts in total.
+ */
+#define NXT_REGEX_MATCH_LIMIT  100000
 
- #if (NXT_HAVE_PCRE2)
-typedef void                      nxt_regex_match_t;
-#else
+/*
+ * The most bytes of a subject that a match error writes to the log.  The
+ * subject can come from a client.
+ */
+#define NXT_REGEX_LOG_SUBJECT  64
+
+
+typedef struct nxt_regex_s        nxt_regex_t;
 typedef struct nxt_regex_match_s  nxt_regex_match_t;
-#endif
 
 typedef struct {
     size_t      offset;

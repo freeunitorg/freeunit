@@ -175,9 +175,9 @@ ensure_builder() {
     # silently fall back to a local build.
     local IMG BDF
     case "$VARIANT" in
-        minimal|wasm) IMG="ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.94.1"
+        minimal|wasm) IMG="ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.95.0"
                       BDF="${SCRIPT_DIR}/Dockerfile.builder-trixie" ;;
-        php-8.5)      IMG="ghcr.io/freeunitorg/freeunit-builder:php8.5-rust1.94.1"
+        php-8.5)      IMG="ghcr.io/freeunitorg/freeunit-builder:php8.5-rust1.95.0"
                       BDF="${SCRIPT_DIR}/Dockerfile.builder-php8.5" ;;
         *)            return 0 ;;  # no builder for this variant
     esac

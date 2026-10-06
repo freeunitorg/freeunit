@@ -55,14 +55,14 @@ jobs:
             os: macos-latest
             target: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - run: rustup update stable
       - run: rustup target add ${{ matrix.target }}
 
       - name: Install cross
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
         with:
           tool: cross
 
@@ -103,7 +103,7 @@ jobs:
       run:
         working-directory: tools/unitctl
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - run: rustup update stable
       - run: rustup target add x86_64-unknown-linux-musl
@@ -205,18 +205,18 @@ jobs:
             target: x86_64-apple-darwin
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - run: rustup update stable
       - run: rustup target add ${{ matrix.target }}
 
       - name: Install cross
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
         with:
           tool: cross
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: rust-${{ matrix.build }}
           workspaces: ./tools/unitctl -> target
@@ -266,13 +266,13 @@ jobs:
           mv ./target/${{ matrix.target }}/release/unitctl unitctl-${{ env.SHORT_VERSION }}-${{ matrix.target }}
 
       - name: Upload sha256 sum
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unitctl-${{ env.SHORT_VERSION }}-${{ matrix.target }}.sha256
           path: tools/unitctl/unitctl-${{ env.SHORT_VERSION }}-${{ matrix.target }}.sha256
 
       - name: Upload unitctl
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unitctl-${{ env.SHORT_VERSION }}-${{ matrix.target }}
           path: tools/unitctl/unitctl-${{ env.SHORT_VERSION }}-${{ matrix.target }}
@@ -289,7 +289,7 @@ jobs:
           merge-multiple: true
 
       - name: Create GitHub release
-        uses: ncipollo/release-action@v1
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
         with:
           artifacts: "unitctl-*"
           prerelease: ${{ github.event_name == 'workflow_dispatch' }}
