@@ -28,7 +28,11 @@ tab=$(printf '\t')
 fail=0
 tmp=
 
-trap '[ -z "$tmp" ] || rm -rf "$tmp"' EXIT INT TERM
+# A trap that does not exit lets the script go on after the signal, so
+# INT and TERM exit, and the EXIT trap removes the temporary directory.
+trap '[ -z "$tmp" ] || rm -rf "$tmp"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 err() {
     printf 'check-version: %s\n' "$*" >&2
@@ -87,7 +91,12 @@ dockerfiles() {
     cp pkg/eol.json pkg/shasum.mak "$tmp/pkg/"
     cp "$d/Makefile" "$d/template.Dockerfile" "$tmp/$d/"
 
-    if ! make -s -C "$tmp/$d" dockerfiles < /dev/null > "$tmp/make.log" 2>&1; then
+    # The Makefile sets VERSION, MODULES, VARIANT and VERSIONS_<module>
+    # with "?=", so an exported variable of the same name would change the
+    # output.  Run make with no environment but PATH.
+    if ! env -i PATH="$PATH" make -s -C "$tmp/$d" dockerfiles \
+         < /dev/null > "$tmp/make.log" 2>&1
+    then
         cat "$tmp/make.log" >&2
         err "$d: \"make dockerfiles\" failed"
     fi
