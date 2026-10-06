@@ -83,12 +83,13 @@ jobs:
       # trigger of this workflow) and avoids coupling to the release that
       # publishes the dash-style tags (latest-python-3.13-slim).
       #
-      # The committed Dockerfile clones the pinned release tag, which does
-      # not exist yet while a release-prep PR is in flight (release-docker.yml
-      # rewrites the pin from the real tag at publish time).  Retarget the
-      # source checkout at the code under test instead: the merge commit this
-      # check reports against (github.sha) -- the same tree actions/checkout
-      # built above -- rather than the unmerged PR-branch head.
+      # The committed Dockerfile clones the tag named by the default of its
+      # UNIT_VERSION argument, which does not exist yet while a release-prep
+      # PR is in flight (release-docker.yml passes the real tag as a build
+      # argument at publish time).  Retarget the source checkout at the code
+      # under test instead: the merge commit this check reports against
+      # (github.sha) -- the same tree actions/checkout built above -- rather
+      # than the unmerged PR-branch head.
       - name: Point the source checkout at the code under test
         env:
           # Always the base repo + github.sha: on pull_request this is the PR

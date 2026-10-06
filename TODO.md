@@ -455,9 +455,6 @@ documentation and a hardcoded version, not missing infrastructure:
   it as a fast dev loop, not the documented smoke-test of record.
 
 Remaining gaps:
-- [ ] `pkg/docker/local/Dockerfile.*` hardcode `git clone -b 1.35.5` and
-      `LABEL ... version="1.35.5"` — bump on each release (for local branch
-      testing, override the clone ref per the CLAUDE.md note).
 - [ ] Decide the fate of the experimental `pkg/docker/local/` set: promote it to
       a documented/CI fast-path, or keep it as a personal dev shortcut. Until
       then, do not point users' "rebuild Docker images locally" flow at it as the

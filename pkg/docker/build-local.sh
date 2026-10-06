@@ -218,37 +218,30 @@ build_variant() {
     fi
     local IMAGE_TAG="freeunit:${VERSION}-${VARIANT}"
     local LOG_FILE="${LOG_DIR}/${VARIANT}.log"
-    local TMP_DOCKERFILE
-    TMP_DOCKERFILE="$(mktemp /tmp/Dockerfile.XXXXXX)"
 
     {
         echo "[$(date '+%H:%M:%S')] START  ${VARIANT}"
 
         if [[ ! -f "$DOCKERFILE" ]]; then
             echo "[$(date '+%H:%M:%S')] ERROR  Dockerfile not found: $DOCKERFILE"
-            rm -f "$TMP_DOCKERFILE"
             return 1
         fi
-
-        # Pin version (mirrors workflow sed step)
-        sed \
-            -e "s|-b [0-9][0-9.]*\( https://github.com/freeunitorg/freeunit\)|-b ${VERSION}\1|" \
-            -e "s|image.version=\"[^\"]*\"|image.version=\"${VERSION}\"|" \
-            "$DOCKERFILE" > "$TMP_DOCKERFILE"
 
         # Build command
         local CMD
         if $USE_BUILDX; then
             CMD=(docker buildx build
                 --platform "${PLATFORM}"
-                --file "$TMP_DOCKERFILE"
+                --build-arg "UNIT_VERSION=${VERSION}"
+                --file "$DOCKERFILE"
                 --tag "${IMAGE_TAG}"
                 --load
                 "${SCRIPT_DIR}"
             )
         else
             CMD=(docker build
-                --file "$TMP_DOCKERFILE"
+                --build-arg "UNIT_VERSION=${VERSION}"
+                --file "$DOCKERFILE"
                 --tag "${IMAGE_TAG}"
                 "${SCRIPT_DIR}"
             )
@@ -265,7 +258,6 @@ build_variant() {
 
         if $DRY_RUN; then
             echo "[$(date '+%H:%M:%S')] SKIP   dry-run mode"
-            rm -f "$TMP_DOCKERFILE"
             return 0
         fi
 
@@ -276,11 +268,8 @@ build_variant() {
         else
             local RC=$?
             echo "[$(date '+%H:%M:%S')] FAIL   ${VARIANT} — exit code ${RC}"
-            rm -f "$TMP_DOCKERFILE"
             return $RC
         fi
-
-        rm -f "$TMP_DOCKERFILE"
     } 2>&1 | tee "${LOG_FILE}"
 }
 

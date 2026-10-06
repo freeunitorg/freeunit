@@ -1,12 +1,17 @@
 FROM node:26-trixie
 
+# The FreeUnit release this image builds.  "make dockerfiles" writes the
+# default from NXT_VERSION in the version file.  release-docker.yml passes
+# the tag with --build-arg UNIT_VERSION=<tag>.
+ARG UNIT_VERSION=1.37.0
+
 LABEL org.opencontainers.image.title="FreeUnit (node-26)"
 LABEL org.opencontainers.image.description="Community build of FreeUnit for Docker."
 LABEL org.opencontainers.image.url="https://freeunit.org"
 LABEL org.opencontainers.image.source="https://github.com/freeunitorg/freeunit"
 LABEL org.opencontainers.image.documentation="https://github.com/freeunitorg/freeunit/blob/master/README.md"
 LABEL org.opencontainers.image.vendor="FreeUnit Community <team@freeunit.org>"
-LABEL org.opencontainers.image.version="1.37.0"
+LABEL org.opencontainers.image.version="${UNIT_VERSION}"
 
 RUN set -ex \
     && savedAptMark="$(apt-mark showmanual)" \
@@ -36,7 +41,7 @@ RUN set -ex \
     && mkdir -p /usr/lib/unit/modules /usr/lib/unit/debug-modules \
     && mkdir -p /usr/src/unit \
     && cd /usr/src/unit \
-    && git clone --depth 1 -b 1.37.0 https://github.com/freeunitorg/freeunit unit \
+    && git clone --depth 1 -b "${UNIT_VERSION}" https://github.com/freeunitorg/freeunit unit \
     && cd unit \
     && NCPU="$(getconf _NPROCESSORS_ONLN)" \
     && DEB_HOST_MULTIARCH="$(dpkg-architecture -q DEB_HOST_MULTIARCH)" \
