@@ -294,6 +294,9 @@ jobs:
           artifacts: "unitctl-*"
           prerelease: ${{ github.event_name == 'workflow_dispatch' }}
           tag: ${{ inputs.version && format('unitctl/{0}', inputs.version) || format('unitctl/{0}', github.ref_name) }}
+          # Without "commit", GitHub creates the new tag on the head of the
+          # default branch, not on the commit that triggered this run.
+          commit: ${{ github.sha }}
           body: >
             ## Unitctl
 
