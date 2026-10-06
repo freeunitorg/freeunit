@@ -38,6 +38,7 @@ import pytest
 from conftest import unit_run, unit_stop
 from unit.applications.proto import ApplicationProto
 from unit.log import Log
+from unit.utils import waitforsocket
 
 client = ApplicationProto()
 
@@ -375,6 +376,10 @@ def test_state_store_version_line_end(requires_restart, version):
         assert (
             client.conf_get('listeners') == VERSION_CONF['listeners']
         ), 'stored configuration loaded'
+
+        # GET /config can answer before the router has bound the listener.
+        waitforsocket(8080)
+
         assert client.get()['status'] == 204, 'stored configuration runs'
         assert not Log.findall(r'invalid version string'), 'no alert'
 

@@ -23,7 +23,7 @@ unitd did not load the stored configuration when the "version" file in the
 state directory ended with a line end, as "echo 13700 > version" and most
 editors write it.  It logged "invalid version string" and started with no
 configuration.  A line end, a space or a tab after the number is now ignored.
-Any other content is still an error.  The bug appeared in 1.26.0.
+Any other content is still an error.  The bug had appeared in 1.26.0.
 </para>
 </change>
 

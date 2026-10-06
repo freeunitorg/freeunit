@@ -13,7 +13,7 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        "invalid version string" and started with no configuration. A line
        end, a space or a tab after the number is now ignored. Any other
        content is still an error. unitd itself writes the file with no
-       line end. The bug appeared in 1.26.0.
+       line end. The bug had appeared in 1.26.0.
 
     *) Change: "--otel" no longer needs OpenSSL. Before, configure
        stopped with "OpenTelemetry support requires OpenSSL." when the
