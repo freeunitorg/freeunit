@@ -413,6 +413,9 @@ nxt_controller_start(nxt_task_t *task, nxt_process_data_t *data)
     vldt.conf_pool = mp;
     vldt.ver = nxt_conf_ver;
 
+    /* nxt_conf_vldt_app_shm() keeps a stored "shm" that is too large. */
+    vldt.restored = 1;
+
     /*
      * A state file written before this check existed can hold bytes the
      * control API would now refuse.  Rejecting it here would drop the whole

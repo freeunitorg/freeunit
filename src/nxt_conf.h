@@ -84,6 +84,7 @@ typedef struct {
     nxt_tstr_state_t     *tstr_state;
     nxt_mp_t             *conf_pool;
     nxt_uint_t           ver;
+    uint8_t              restored;    /* 1 bit: the stored configuration. */
     nxt_conf_vldt_path_t *path;       /* Stack (top = deepest segment). */
     nxt_str_t            pointer;     /* RFC 6901 pointer at error site. */
     nxt_str_t            suggestion;  /* "Did you mean X" member name. */

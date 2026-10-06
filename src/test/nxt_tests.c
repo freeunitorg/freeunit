@@ -5,6 +5,7 @@
  */
 
 #include <nxt_main.h>
+#include <nxt_application.h>
 #include "nxt_tests.h"
 
 
@@ -85,6 +86,42 @@ static nxt_bool_t
 nxt_msec_less(nxt_msec_t first, nxt_msec_t second)
 {
     return (nxt_msec_diff(first, second) < 0);
+}
+
+
+/* A stored "shm" over UINT32_MAX must not wrap to its low 32 bits. */
+
+static nxt_int_t
+nxt_app_shm_limit_test(nxt_thread_t *thr)
+{
+    size_t      r;
+    nxt_uint_t  i;
+
+    static const struct {
+        size_t  in;
+        size_t  out;
+    } cases[] = {
+        { 0, 0 },
+        { 10 * 1024 * 1024, 10 * 1024 * 1024 },
+        { UINT32_MAX, UINT32_MAX },
+#if (NXT_SIZE_T_SIZE > 4)
+        { (size_t) UINT32_MAX + 1, UINT32_MAX },
+        { (size_t) UINT32_MAX + 10 * 1024 * 1024, UINT32_MAX },
+#endif
+        { SIZE_MAX, UINT32_MAX },
+    };
+
+    for (i = 0; i < nxt_nitems(cases); i++) {
+        r = nxt_app_shm_limit(cases[i].in);
+
+        NXT_TEST_CHECK(thr->log, r == cases[i].out,
+                       "app shm limit test failed: %uz gave %uz, not %uz",
+                       cases[i].in, r, cases[i].out);
+    }
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log, "app shm limit test passed");
+
+    return NXT_OK;
 }
 
 
@@ -362,6 +399,10 @@ main(int argc, char **argv)
     }
 
     if (nxt_main_start_process_reply_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_app_shm_limit_test(thr) != NXT_OK) {
         return 1;
     }
 

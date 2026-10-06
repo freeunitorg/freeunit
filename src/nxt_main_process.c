@@ -706,6 +706,8 @@ nxt_main_start_process_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         }
     }
 
+    app_conf->shm_limit = nxt_app_shm_limit(app_conf->shm_limit);
+
     app_conf->self = conf;
 
     process->stream = msg->port_msg.stream;

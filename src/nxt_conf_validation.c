@@ -201,6 +201,8 @@ static nxt_int_t nxt_conf_vldt_object(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_app_limits(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_app_shm(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value);
 static nxt_int_t nxt_conf_vldt_processes(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_object_iterator(nxt_conf_validation_t *vldt,
@@ -3888,6 +3890,64 @@ nxt_conf_vldt_app_limits(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
                                    "The \"start_timeout\" number must not "
                                    "exceed %d.", NXT_INT32_T_MAX / 1000);
     }
+
+    return nxt_conf_vldt_app_shm(vldt, value);
+}
+
+
+/*
+ * "shm" is mapped to a size_t, but libunit takes it as a uint32_t: in
+ * nxt_unit_init_t.shm_limit (src/nxt_unit.h), which is public, and in the
+ * NXT_UNIT_INIT variable.  On 64-bit platforms, earlier versions cut a
+ * larger number to its low 32 bits: 4294967296 gave the smallest limit, one
+ * segment.
+ *
+ * The number is compared as a double: a conversion of a number out of range
+ * to an integer type is undefined.  A negative number is not checked here.
+ *
+ * A stored configuration with a larger number is still loaded, with a
+ * warning.  Else unitd would start with no configuration at all.
+ * nxt_main_start_process_handler() gives such an application UINT32_MAX.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_app_shm(nxt_conf_validation_t *vldt, nxt_conf_value_t *value)
+{
+    nxt_str_t             pointer;
+    nxt_conf_value_t      *shm;
+    nxt_conf_vldt_path_t  seg;
+
+    static const nxt_str_t  shm_str = nxt_string("shm");
+
+    shm = nxt_conf_get_object_member(value, &shm_str, NULL);
+
+    if (shm == NULL || nxt_conf_get_number(shm) <= (double) UINT32_MAX) {
+        return NXT_OK;
+    }
+
+    if (!vldt->restored) {
+        return nxt_conf_vldt_member_error(vldt, &shm_str,
+                                          "The \"shm\" number must not "
+                                          "exceed %uD.", (uint32_t) UINT32_MAX);
+    }
+
+    seg.prev = vldt->path;
+    seg.seg = shm_str;
+    vldt->path = &seg;
+
+    pointer = vldt->pointer;
+    nxt_conf_vldt_render_pointer(vldt);
+
+    nxt_thread_log_error(NXT_LOG_WARN, "the restored configuration has a "
+                         "\"shm\" number over %uD at \"%V\".  The control "
+                         "API now refuses it.  It is kept, and the "
+                         "application gets a limit of %uD bytes.  Correct it "
+                         "to be able to update the configuration.",
+                         (uint32_t) UINT32_MAX, &vldt->pointer,
+                         (uint32_t) UINT32_MAX);
+
+    vldt->pointer = pointer;
+    vldt->path = seg.prev;
 
     return NXT_OK;
 }

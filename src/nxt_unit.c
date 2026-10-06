@@ -563,6 +563,22 @@ typedef struct {
 static pid_t  nxt_unit_pid;
 
 
+/*
+ * The number of segments for a limit of shm_limit bytes, rounded up.  It
+ * was (shm_limit + PORT_MMAP_DATA_SIZE - 1) / PORT_MMAP_DATA_SIZE.  For a
+ * limit of 2^32 - PORT_MMAP_DATA_SIZE + 1 or more, the sum wrapped in
+ * uint32_t and gave 0, which nxt_unit_init() raises to one segment.  With
+ * 10 MiB segments that is from 4284481537 to 4294967295.
+ */
+
+nxt_inline uint32_t
+nxt_unit_shm_mmap_limit(uint32_t shm_limit)
+{
+    return shm_limit / PORT_MMAP_DATA_SIZE
+           + (shm_limit % PORT_MMAP_DATA_SIZE != 0);
+}
+
+
 nxt_unit_ctx_t *
 nxt_unit_init(nxt_unit_init_t *init)
 {
@@ -614,8 +630,7 @@ nxt_unit_init(nxt_unit_init_t *init)
             goto fail;
         }
 
-        lib->shm_mmap_limit = (shm_limit + PORT_MMAP_DATA_SIZE - 1)
-                                / PORT_MMAP_DATA_SIZE;
+        lib->shm_mmap_limit = nxt_unit_shm_mmap_limit(shm_limit);
         lib->request_limit = request_limit;
     }
 
@@ -753,8 +768,7 @@ nxt_unit_create(nxt_unit_init_t *init)
     lib->callbacks = init->callbacks;
 
     lib->request_data_size = init->request_data_size;
-    lib->shm_mmap_limit = (init->shm_limit + PORT_MMAP_DATA_SIZE - 1)
-                            / PORT_MMAP_DATA_SIZE;
+    lib->shm_mmap_limit = nxt_unit_shm_mmap_limit(init->shm_limit);
     lib->request_limit = init->request_limit;
 
     lib->processes.slot = NULL;
