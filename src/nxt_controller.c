@@ -65,6 +65,7 @@ static nxt_int_t nxt_controller_prefork(nxt_task_t *task,
     nxt_process_t *process, nxt_mp_t *mp);
 static nxt_int_t nxt_controller_file_read(nxt_task_t *task, const char *name,
     nxt_str_t *str, nxt_mp_t *mp);
+static nxt_int_t nxt_controller_version_parse(const nxt_str_t *ver);
 static nxt_int_t nxt_controller_start(nxt_task_t *task,
     nxt_process_data_t *data);
 static void nxt_controller_process_new_port_handler(nxt_task_t *task,
@@ -236,7 +237,7 @@ nxt_controller_prefork(nxt_task_t *task, nxt_process_t *process, nxt_mp_t *mp)
         }
 
         if (ret == NXT_OK) {
-            num = nxt_int_parse(ver.start, ver.length);
+            num = nxt_controller_version_parse(&ver);
 
             if (nxt_slow_path(num < 0)) {
                 nxt_alert(task, "failed to restore previous configuration: "
@@ -317,6 +318,35 @@ fail:
     nxt_file_close(task, &file);
 
     return NXT_ERROR;
+}
+
+
+/*
+ * unitd writes the version file with no line end.  A file written by hand
+ * or by an editor often ends with "\n" or "\r\n".  Skip trailing ASCII
+ * white space.  Any other byte that is not a digit is still an error, and so
+ * is a file with no digits.
+ */
+
+static nxt_int_t
+nxt_controller_version_parse(const nxt_str_t *ver)
+{
+    u_char  c;
+    size_t  length;
+
+    length = ver->length;
+
+    while (length != 0) {
+        c = ver->start[length - 1];
+
+        if (c != '\n' && c != '\r' && c != ' ' && c != '\t') {
+            break;
+        }
+
+        length--;
+    }
+
+    return nxt_int_parse(ver->start, length);
 }
 
 

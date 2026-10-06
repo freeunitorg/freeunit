@@ -1,6 +1,14 @@
 
 Changes with FreeUnit 1.37.1                                     04 Oct 2026
 
+    *) Bugfix: unitd did not load the stored configuration when the
+       "version" file in the state directory ended with a line end, as
+       "echo 13700 > version" and most editors write it. It logged
+       "invalid version string" and started with no configuration. A line
+       end, a space or a tab after the number is now ignored. Any other
+       content is still an error. unitd itself writes the file with no
+       line end. The bug appeared in 1.26.0.
+
     *) Change: "--otel" no longer needs OpenSSL. Before, configure
        stopped with "OpenTelemetry support requires OpenSSL." when the
        OpenSSL headers were missing, and it linked unitd with OpenSSL

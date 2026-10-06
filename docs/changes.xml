@@ -10,6 +10,16 @@
          date="2026-10-04" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="bugfix">
+<para>
+unitd did not load the stored configuration when the "version" file in the
+state directory ended with a line end, as "echo 13700 > version" and most
+editors write it.  It logged "invalid version string" and started with no
+configuration.  A line end, a space or a tab after the number is now ignored.
+Any other content is still an error.  The bug appeared in 1.26.0.
+</para>
+</change>
+
 <change type="change">
 <para>
 "--otel" no longer needs OpenSSL.  Before, configure stopped with

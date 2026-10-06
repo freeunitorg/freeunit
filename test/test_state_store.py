@@ -18,6 +18,9 @@ after an immediate SIGTERM, and that stores in quick succession leave the
 last configuration.  They need --restart only.  They catch a regression only
 when a store takes longer than the few milliseconds main needs to exit, so on
 a tmpfs they pass either way.
+
+The version tests seed a state directory by hand.  unitd writes the version
+file with no line end, but a file written by hand often has one.
 """
 
 import json
@@ -331,6 +334,73 @@ def test_state_store_serialised(requires_restart):
         alerts = re.findall(r'.+\[alert\].+', Log.read())
 
         assert alerts == [], 'no alert'
+
+    finally:
+        unit_stop()
+        shutil.rmtree(statedir, ignore_errors=True)
+
+
+VERSION_CONF = {
+    "listeners": {"*:8080": {"pass": "routes"}},
+    "routes": [{"action": {"return": 204}}],
+}
+
+
+def run_with_version(version):
+    """Start unitd on a state directory with this version file."""
+
+    unit_stop()
+
+    statedir = Path(tempfile.mkdtemp(prefix='unit-state-'))
+
+    (statedir / 'conf.json').write_text(json.dumps(VERSION_CONF))
+    (statedir / 'version').write_bytes(version)
+
+    unit_run(state_dir=str(statedir))
+
+    return statedir
+
+
+@pytest.mark.parametrize(
+    'version',
+    [b'13700\n', b'13700\r\n', b'13700 \t\n'],
+    ids=['lf', 'crlf', 'ws'],
+)
+def test_state_store_version_line_end(requires_restart, version):
+    """A line end after the number does not drop the stored configuration."""
+
+    statedir = run_with_version(version)
+
+    try:
+        assert (
+            client.conf_get('listeners') == VERSION_CONF['listeners']
+        ), 'stored configuration loaded'
+        assert client.get()['status'] == 204, 'stored configuration runs'
+        assert not Log.findall(r'invalid version string'), 'no alert'
+
+    finally:
+        unit_stop()
+        shutil.rmtree(statedir, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    'version',
+    [b'13700x\n', b'', b'\n', b' 13700', b'137\n00'],
+    ids=['suffix', 'empty', 'blank', 'leading', 'inner'],
+)
+def test_state_store_version_invalid(requires_restart, skip_alert, version):
+    """Other content is still an error, and nothing is restored."""
+
+    skip_alert(r'failed to restore previous configuration')
+
+    statedir = run_with_version(version)
+
+    try:
+        assert Log.wait_for_record(
+            r'failed to restore previous configuration: '
+            r'invalid version string'
+        ), 'alert'
+        assert client.conf_get('listeners') == {}, 'nothing restored'
 
     finally:
         unit_stop()
