@@ -270,9 +270,9 @@ static nxt_bool_t
 nxt_router_sender_test_accepts(nxt_uint_t from, nxt_uint_t sender,
     nxt_bool_t known)
 {
-    nxt_bool_t  main, controller, proto, worker;
+    nxt_bool_t  is_main, controller, proto, worker;
 
-    main = (known && sender == NXT_ROUTER_SENDER_TEST_MAIN);
+    is_main = (known && sender == NXT_ROUTER_SENDER_TEST_MAIN);
     controller = (known && sender == NXT_ROUTER_SENDER_TEST_CONTROLLER);
     proto = (sender == NXT_ROUTER_SENDER_TEST_PROTO);
     worker = (sender == NXT_ROUTER_SENDER_TEST_WORKER);
@@ -280,22 +280,22 @@ nxt_router_sender_test_accepts(nxt_uint_t from, nxt_uint_t sender,
     switch (from) {
 
     case NXT_ROUTER_SENDER_TEST_FROM_MAIN:
-        return main;
+        return is_main;
 
     case NXT_ROUTER_SENDER_TEST_FROM_CONTROLLER:
         return controller;
 
     case NXT_ROUTER_SENDER_TEST_FROM_MAIN_OR_PROTO:
-        return (main || proto);
+        return (is_main || proto);
 
     case NXT_ROUTER_SENDER_TEST_FROM_NOT_APP:
-        return (main || controller || proto);
+        return (is_main || controller || proto);
 
     case NXT_ROUTER_SENDER_TEST_FROM_SELF:
         return worker;
 
     default:
-        return (main || proto || worker);
+        return (is_main || proto || worker);
     }
 }
 
