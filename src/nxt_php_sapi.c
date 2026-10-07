@@ -102,8 +102,6 @@ static void nxt_php_disable(nxt_task_t *task, const char *type,
 #endif
 
 static nxt_int_t nxt_php_dirname(const nxt_str_t *file, nxt_str_t *dir);
-static void nxt_php_str_trim_trail(nxt_str_t *str, u_char t);
-static void nxt_php_str_trim_lead(nxt_str_t *str, u_char t);
 static nxt_bool_t nxt_php_path_is_under(const nxt_str_t *root,
     const nxt_str_t *path);
 nxt_inline u_char *nxt_realpath(const void *c);
@@ -594,14 +592,23 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
     target->root.length = nxt_strlen(p);
     target->root.start = p;
 
-    nxt_php_str_trim_trail(&target->root, '/');
+    while (target->root.length > 0
+           && target->root.start[target->root.length - 1] == '/')
+    {
+        target->root.length--;
+    }
+
+    target->root.start[target->root.length] = '\0';
 
     value = nxt_conf_get_object_member(conf, &script_str, NULL);
 
     if (value != NULL) {
         nxt_conf_get_string(value, &str);
 
-        nxt_php_str_trim_lead(&str, '/');
+        while (str.length > 0 && str.start[0] == '/') {
+            str.length--;
+            str.start++;
+        }
 
         tmp = nxt_malloc(target->root.length + 1 + str.length + 1);
         if (nxt_slow_path(tmp == NULL)) {
@@ -993,27 +1000,6 @@ nxt_php_dirname(const nxt_str_t *file, nxt_str_t *dir)
 }
 
 
-static void
-nxt_php_str_trim_trail(nxt_str_t *str, u_char t)
-{
-    while (str->length > 0 && str->start[str->length - 1] == t) {
-        str->length--;
-    }
-
-    str->start[str->length] = '\0';
-}
-
-
-static void
-nxt_php_str_trim_lead(nxt_str_t *str, u_char t)
-{
-    while (str->length > 0 && str->start[0] == t) {
-        str->length--;
-        str->start++;
-    }
-}
-
-
 /*
  * Checks that "path" names something below "root": "root", then '/', then
  * at least one more byte.  A plain prefix test would accept "/srv/app2/x.php"
@@ -1021,8 +1007,8 @@ nxt_php_str_trim_lead(nxt_str_t *str, u_char t)
  *
  * Both paths come from realpath(), so they are absolute and have no "."
  * or ".." components, no symbolic links and no repeated or trailing '/'.
- * nxt_php_str_trim_trail() trims the root "/" to length 0.  Every absolute
- * path except "/" itself is below that root.
+ * The root "/" is trimmed to length 0.  Every absolute path except "/"
+ * itself is below that root.
  */
 
 static nxt_bool_t
