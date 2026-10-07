@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from unit.applications.lang.php import ApplicationPHP
@@ -300,3 +301,95 @@ def test_php_application_index_nul():
     assert 'success' in conf_notargets_index(
         "index.php"
     ), 'clean notargets index still accepted'
+
+
+def test_php_application_root_cwd(temp_dir):
+    # The working directory of a root-only target must follow the script:
+    # in the same directory, in another directory, and after a script that
+    # called chdir().
+    for d in ('a', 'b'):
+        Path(f'{temp_dir}/{d}').mkdir()
+        Path(f'{temp_dir}/{d}/cwd.php').write_text(
+            '<?php echo getcwd() . "|" . file_get_contents("rel.txt");',
+            encoding='utf-8',
+        )
+        Path(f'{temp_dir}/{d}/rel.txt').write_text(d, encoding='utf-8')
+        Path(f'{temp_dir}/{d}/chdir.php').write_text(
+            '<?php chdir("/"); echo getcwd();', encoding='utf-8'
+        )
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "applications/root"}},
+            "applications": {
+                "root": {
+                    "type": client.get_application_type(),
+                    "processes": 1,
+                    "root": temp_dir,
+                }
+            },
+        }
+    )
+
+    def check(d):
+        cwd = str(Path(f'{temp_dir}/{d}').resolve())
+        assert client.get(url=f'/{d}/cwd.php')['body'] == f'{cwd}|{d}', d
+
+    for d in ('a', 'a', 'b', 'b', 'a'):
+        check(d)
+
+    assert client.get(url='/a/chdir.php')['body'] == '/'
+    check('a')
+
+    assert client.get(url='/b/chdir.php')['body'] == '/'
+    check('b')
+    check('a')
+
+
+def test_php_application_root_symlink_swap(temp_dir):
+    # A deploy can replace a script directory at the same path, for example
+    # by a rename of a new symlink over the old one.  The next request must
+    # run in the new directory, not in the old one.  The symlink is below
+    # "root", because the module resolves "root" itself only at startup.
+    for d in ('A', 'B'):
+        Path(f'{temp_dir}/{d}').mkdir()
+        Path(f'{temp_dir}/{d}/cwd.php').write_text(
+            '<?php echo getcwd() . "|" . file_get_contents("rel.txt");',
+            encoding='utf-8',
+        )
+        Path(f'{temp_dir}/{d}/rel.txt').write_text(d, encoding='utf-8')
+
+    def check(d):
+        cwd = str(Path(f'{temp_dir}/{d}').resolve())
+        assert client.get(url='/current/cwd.php')['body'] == f'{cwd}|{d}', d
+
+    os.symlink(f'{temp_dir}/A', f'{temp_dir}/current')
+
+    try:
+        assert 'success' in client.conf(
+            {
+                "listeners": {"*:8080": {"pass": "applications/root"}},
+                "applications": {
+                    "root": {
+                        "type": client.get_application_type(),
+                        "processes": 1,
+                        "root": temp_dir,
+                    }
+                },
+            }
+        )
+
+        check('A')
+        check('A')
+
+        os.symlink(f'{temp_dir}/B', f'{temp_dir}/next')
+        os.rename(f'{temp_dir}/next', f'{temp_dir}/current')
+
+        check('B')
+        check('B')
+
+    finally:
+        # The temp_dir cleanup does not handle a symlink.
+        for link in ('current', 'next'):
+            if os.path.islink(f'{temp_dir}/{link}'):
+                os.unlink(f'{temp_dir}/{link}')
