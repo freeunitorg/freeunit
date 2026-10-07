@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from multiprocessing import Process
 from pathlib import Path
 
@@ -82,12 +83,19 @@ _processes = []
 # unitd tree.
 _pgids = {}
 _fds_info = {
-    'main': {'fds': 0, 'skip': False},
-    'router': {'name': 'unit: router', 'pid': -1, 'fds': 0, 'skip': False},
+    'main': {'fds': 0, 'kinds': {}, 'skip': False},
+    'router': {
+        'name': 'unit: router',
+        'pid': -1,
+        'fds': 0,
+        'kinds': {},
+        'skip': False,
+    },
     'controller': {
         'name': 'unit: controller',
         'pid': -1,
         'fds': 0,
+        'kinds': {},
         'skip': False,
     },
 }
@@ -224,11 +232,11 @@ def run(request):
     # lazy initialization (e.g. OTel tokio runtime) that occurred after
     # unit_run() captured the initial baseline is not counted as a leak.
     if not option.restart:
-        _fds_info['main']['fds'] = _count_fds(unit_instance['pid'])
+        _fd_baseline(_fds_info['main'], unit_instance['pid'])
         router = _fds_info['router']
-        router['fds'] = _count_fds(router['pid'])
+        _fd_baseline(router, router['pid'])
         controller = _fds_info['controller']
-        controller['fds'] = _count_fds(controller['pid'])
+        _fd_baseline(controller, controller['pid'])
 
     yield
 
@@ -581,15 +589,15 @@ def unit_run(state_dir=None):
     if state_dir is None:
         _clear_conf()
 
-    _fds_info['main']['fds'] = _count_fds(unit_instance['pid'])
+    _fd_baseline(_fds_info['main'], unit_instance['pid'])
 
     router = _fds_info['router']
     router['pid'] = pid_by_name(router['name'])
-    router['fds'] = _count_fds(router['pid'])
+    _fd_baseline(router, router['pid'])
 
     controller = _fds_info['controller']
     controller['pid'] = pid_by_name(controller['name'])
-    controller['fds'] = _count_fds(controller['pid'])
+    _fd_baseline(controller, controller['pid'])
 
     Status._check_zeros()
 
@@ -843,11 +851,14 @@ def _check_fds(*, log=None):
             lambda: _count_fds(unit_instance['pid']) - ps['fds']
         )
         ps['fds'] += fds_diff
+        before, ps['kinds'] = ps['kinds'], _fd_kinds(unit_instance['pid'])
 
-        assert fds_diff <= option.fds_threshold, 'descriptors leak main process'
+        assert (
+            fds_diff <= option.fds_threshold
+        ), f'descriptors leak main process: {_fd_kinds_diff(before, ps["kinds"])}'
 
     else:
-        ps['fds'] = _count_fds(unit_instance['pid'])
+        _fd_baseline(ps, unit_instance['pid'])
 
     for name in ['controller', 'router']:
         ps = _fds_info[name]
@@ -857,14 +868,130 @@ def _check_fds(*, log=None):
         if not ps['skip']:
             fds_diff = waitforfds(lambda: _count_fds(ps['pid']) - ps['fds'])
             ps['fds'] += fds_diff
+            before, ps['kinds'] = ps['kinds'], _fd_kinds(ps['pid'])
 
             if not option.restart:
                 assert ps['pid'] == ps_pid, f'same pid {name}'
 
-            assert fds_diff <= option.fds_threshold, f'descriptors leak {name}'
+            assert (
+                fds_diff <= option.fds_threshold
+            ), f'descriptors leak {name}: {_fd_kinds_diff(before, ps["kinds"])}'
 
         else:
-            ps['fds'] = _count_fds(ps['pid'])
+            _fd_baseline(ps, ps['pid'])
+
+
+def _fd_baseline(ps, pid):
+    ps['fds'] = _count_fds(pid)
+    ps['kinds'] = _fd_kinds(pid)
+
+
+_TCP_STATES = {
+    '01': 'established',
+    '02': 'syn-sent',
+    '03': 'syn-recv',
+    '04': 'fin-wait1',
+    '05': 'fin-wait2',
+    '07': 'close',
+    '08': 'close-wait',
+    '09': 'last-ack',
+    '0A': 'listen',
+    '0B': 'closing',
+}
+
+
+def _socket_names(pid):
+    names = {}
+
+    for proto in ('tcp', 'tcp6', 'udp', 'udp6', 'netlink', 'unix'):
+        try:
+            lines = (
+                Path(f'/proc/{pid}/net/{proto}')
+                .read_text(encoding='utf-8')
+                .splitlines()[1:]
+            )
+        except OSError:
+            continue
+
+        for line in lines:
+            f = line.split()
+
+            if proto == 'unix':
+                if len(f) < 7:
+                    continue
+                path = f[7] if len(f) > 7 else ''
+                if re.fullmatch(r'@[0-9a-f]{5}', path):
+                    path = '@autobind'
+                names[f[6]] = f'unix:{path}' if path else 'unix'
+
+            elif len(f) > 9:
+                if proto.startswith('tcp'):
+                    name = f'{proto} {_TCP_STATES.get(f[3], f[3])}'
+                else:
+                    name = proto
+                names[f[9]] = name
+
+    return names
+
+
+def _fd_kind(target, sockets):
+    if target.startswith('socket:'):
+        return sockets.get(target[len('socket:') :].strip('[]'), 'socket')
+
+    for prefix, kind in (
+        ('pipe:', 'pipe'),
+        ('/memfd:', 'memfd'),
+    ):
+        if target.startswith(prefix):
+            return kind
+
+    if target.startswith('anon_inode:'):
+        return target[len('anon_inode:') :].strip('[]')
+
+    return target
+
+
+def _fd_kinds(pid):
+    kinds = Counter()
+    procfile = Path(f'/proc/{pid}/fd')
+
+    try:
+        fds = list(procfile.iterdir())
+    except OSError:
+        return kinds
+
+    targets = []
+
+    for fd in fds:
+        try:
+            targets.append(os.readlink(fd))
+        except OSError:
+            pass
+
+    sockets = (
+        _socket_names(pid)
+        if any(t.startswith('socket:') for t in targets)
+        else {}
+    )
+
+    for target in targets:
+        kinds[_fd_kind(target, sockets)] += 1
+
+    return kinds
+
+
+def _fd_kinds_diff(before, after):
+    if not before and not after:
+        return 'no /proc fd detail'
+
+    delta = Counter(after)
+    delta.subtract(before)
+    changed = sorted((k, n) for k, n in delta.items() if n)
+
+    if not changed:
+        return 'same descriptor kinds as the baseline'
+
+    return ', '.join(f'{k} {n:+d}' for k, n in changed)
 
 
 def _count_fds(pid):
