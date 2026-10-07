@@ -336,7 +336,7 @@ pub fn find_executable_path(specific_path: Result<String, Box<dyn StdError>>) ->
 mod tests {
     use super::*;
     use rand::rngs::StdRng;
-    use rand::{RngCore, SeedableRng};
+    use rand::{Rng, SeedableRng};
 
     // We don't need a secure seed for testing, in fact it is better that we have a
     // predictable value
