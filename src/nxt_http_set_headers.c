@@ -230,37 +230,6 @@ nxt_http_set_headers_init(nxt_router_conf_t *rtcf, nxt_http_action_t *action,
 
 
 /*
- * Reject values that would inject a header boundary into the response.
- * Templated values (e.g. $uri, $arg_*) can carry CR/LF/NUL bytes if the
- * client encodes them in the request, and writing those bytes verbatim
- * into the wire serialiser yields HTTP response splitting.  Static
- * config values are operator-controlled and trusted, but the check is
- * cheap enough to apply to both paths.
- *
- * Per the RFC 9110 field-value grammar, all control bytes other than
- * HTAB are rejected, including DEL (0x7F); lenient downstream proxies
- * may otherwise reinterpret them.  HTAB and high (0x80+) bytes are
- * left alone.
- */
-static nxt_bool_t
-nxt_http_header_value_is_safe(const nxt_str_t *v)
-{
-    u_char  c;
-    size_t  i;
-
-    for (i = 0; i < v->length; i++) {
-        c = v->start[i];
-
-        if ((c < 0x20 && c != '\t') || c == 0x7F) {
-            return 0;
-        }
-    }
-
-    return 1;
-}
-
-
-/*
  * The resolved keys of r->action for this request.  The context is made on
  * first use and kept in r->set_headers.  A request is allocated zeroed for
  * each request, also on a keep-alive connection, so the pointer never comes
@@ -325,6 +294,8 @@ static nxt_int_t
 nxt_http_set_headers_value(nxt_http_request_t *r,
     nxt_http_set_headers_ctx_t *ctx, nxt_uint_t i)
 {
+    u_char                 c;
+    size_t                 j;
     nxt_int_t              ret;
     nxt_str_t              *value;
     nxt_router_conf_t      *rtcf;
@@ -367,11 +338,29 @@ nxt_http_set_headers_value(nxt_http_request_t *r,
         }
     }
 
-    if (value->start != NULL
-        && nxt_slow_path(!nxt_http_header_value_is_safe(value)))
-    {
-        ctx->state[i] = NXT_HTTP_SET_HEADERS_REJECTED;
-        return NXT_DECLINED;
+    /*
+     * Reject values that would inject a header boundary into the response.
+     * Templated values (e.g. $uri, $arg_*) can carry CR/LF/NUL bytes if the
+     * client encodes them in the request, and writing those bytes verbatim
+     * into the wire serialiser yields HTTP response splitting.  Static
+     * config values are operator-controlled and trusted, but the check is
+     * cheap enough to apply to both paths.
+     *
+     * Per the RFC 9110 field-value grammar, all control bytes other than
+     * HTAB are rejected, including DEL (0x7F); lenient downstream proxies
+     * may otherwise reinterpret them.  HTAB and high (0x80+) bytes are
+     * left alone.
+     */
+
+    if (value->start != NULL) {
+        for (j = 0; j < value->length; j++) {
+            c = value->start[j];
+
+            if (nxt_slow_path((c < 0x20 && c != '\t') || c == 0x7F)) {
+                ctx->state[i] = NXT_HTTP_SET_HEADERS_REJECTED;
+                return NXT_DECLINED;
+            }
+        }
     }
 
     ctx->state[i] = NXT_HTTP_SET_HEADERS_RESOLVED;
