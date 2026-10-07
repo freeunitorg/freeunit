@@ -79,6 +79,21 @@ def pytest_addoption(parser):
         "translated onto it (see unit/port.py), so concurrent runs can each "
         "own a private band.  Default: UNIT_TEST_PORT, else 8080",
     )
+    # 300 s sits between two limits.  Below it, the slowest test that
+    # passes: the Autobahn 9.x case with --unsafe, 10.2 s on a release
+    # build, so 300 s leaves a factor of 29 for an emulated builder.  It is
+    # also above faulthandler_timeout in pytest.ini, so the stack dump at
+    # 120 s comes first.  Above it, the step that runs pytest in
+    # .github/workflows/build-test.yml, with timeout-minutes 12, that is
+    # 720 s.  That cap covers the whole run, so a hang costs a step its
+    # normal time plus this limit, and the step has to finish before the
+    # cap kills the report.
+    parser.addoption(
+        "--test-timeout",
+        type=int,
+        default=300,
+        help="Fail a test that runs longer than this many seconds; 0 is off",
+    )
 
 
 unit_instance = {}
@@ -130,6 +145,7 @@ def pytest_configure(config):
     option.unsafe = config.option.unsafe
     option.user = config.option.user
     option.restart = config.option.restart
+    option.test_timeout = config.option.test_timeout
 
     option.generated_tests = {}
     option.current_dir = os.path.abspath(
@@ -231,8 +247,78 @@ def check_prerequisites_module(request):
         check_prerequisites(request.module.prerequisites)
 
 
+# How long the deadline waits before it raises again, once it has expired
+# and the raise was caught.  Past the deadline every further second is time
+# the run already decided not to spend, so this is short: it drains a retry
+# loop quickly and breaks a stop() that hangs.
+REARM_SECONDS = 1
+
+
+def timeout_plugin_active(config):
+    # pytest-timeout takes its limit from --timeout, then PYTEST_TIMEOUT,
+    # then the "timeout" ini option.  Look in the same places.
+    if not config.pluginmanager.hasplugin('timeout'):
+        return False
+
+    for value in (
+        config.getoption('timeout'),
+        os.environ.get('PYTEST_TIMEOUT'),
+        config.getini('timeout'),
+    ):
+        if value not in (None, ''):
+            return float(value) > 0
+
+    return False
+
+
+@pytest.fixture
+def deadline(request):
+    # Limits the whole test, with the start and stop of unitd in run().
+    # A blocked socket call has no other limit.  pytest-timeout, when it is
+    # installed and enabled, uses SIGALRM too, so this guard steps aside.
+    seconds = option.test_timeout
+
+    if seconds <= 0 or timeout_plugin_active(request.config):
+        yield
+        return
+
+    message = f'The test ran longer than {seconds} s.'
+    expired = []
+
+    def expire(signum, frame):
+        expired.append(True)
+
+        # pytest.fail() raises a BaseException, and test code does catch
+        # that: _reload_and_poll_mounts() in test_go_isolation.py has an
+        # "except BaseException" around every request.  A caught failure
+        # would leave this one-shot alarm spent and the test running with
+        # no limit again, which is the hang this guard is here to stop.
+        # So re-arm, to interrupt the next wait as well, and record the
+        # expiry, so that teardown below fails a test that swallowed
+        # every raise and would otherwise finish green.
+        signal.alarm(REARM_SECONDS)
+
+        pytest.fail(message)
+
+    handler = signal.signal(signal.SIGALRM, expire)
+    signal.alarm(seconds)
+
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, handler)
+
+        # Only when the deadline did not already end the test, so the
+        # ordinary case stays a single failure report.
+        report = getattr(request.node, 'rep_call', None)
+
+        if expired and (report is None or not report.failed):
+            pytest.fail(f'{message}  The test caught the failure.')
+
+
 @pytest.fixture(autouse=True)
-def run(request):
+def run(request, deadline):
     unit = unit_run()
 
     option.skip_alerts = [
