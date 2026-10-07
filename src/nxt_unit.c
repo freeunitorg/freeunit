@@ -84,7 +84,6 @@ static void nxt_unit_ctx_detached_done(nxt_unit_ctx_t *ctx);
 static int nxt_unit_ctx_detached_retry(nxt_unit_ctx_t *ctx);
 static int nxt_unit_detached_timeout(nxt_unit_ctx_impl_t *ctx_impl);
 static int nxt_unit_detached_poll(nxt_unit_ctx_t *ctx, int fd);
-static void nxt_unit_detached_sleep(nxt_unit_ctx_impl_t *ctx_impl);
 static uint64_t nxt_unit_detached_now(void);
 static uint64_t nxt_unit_detached_delay(nxt_unit_ctx_impl_t *ctx_impl,
     uint64_t now);
@@ -4044,24 +4043,6 @@ nxt_unit_detached_poll(nxt_unit_ctx_t *ctx, int fd)
 
 
 /*
- * Sleep for the backoff before the next FINISH retry.  This is for a caller
- * that has no descriptor to wait on.  nxt_unit_detached_poll() does the
- * same for a loop that has one.
- */
-
-static void
-nxt_unit_detached_sleep(nxt_unit_ctx_impl_t *ctx_impl)
-{
-    struct timespec  ts;
-
-    ts.tv_sec = 0;
-    ts.tv_nsec = nxt_unit_detached_timeout(ctx_impl) * 1000000L;
-
-    (void) nanosleep(&ts, NULL);
-}
-
-
-/*
  * The time for the FINISH retry deadline, in milliseconds.  libunit does
  * not link nxt_monotonic_time(), so this makes the same choice of clock,
  * in the same order, with one difference.  nxt_monotonic_time() prefers
@@ -6328,6 +6309,7 @@ int
 nxt_unit_run_shared(nxt_unit_ctx_t *ctx)
 {
     int                  rc;
+    struct timespec      ts;
     nxt_unit_impl_t      *lib;
     nxt_unit_read_buf_t  *rbuf;
     nxt_unit_ctx_impl_t  *ctx_impl;
@@ -6375,14 +6357,19 @@ nxt_unit_run_shared(nxt_unit_ctx_t *ctx)
              * one that reached "request_limit".  A graceful quit deferred on
              * the detached state has already cleared ->ready.  There is no
              * descriptor to wait on, so sleep for the backoff and retry
-             * above.  This goes on up to the give-up that closes the worker.
+             * above.  nxt_unit_detached_poll() does the same for a loop that
+             * has one.  This goes on up to the give-up that closes the
+             * worker.
              */
 
             if (nxt_fast_path(ctx_impl->detached_retries == 0)) {
                 break;
             }
 
-            nxt_unit_detached_sleep(ctx_impl);
+            ts.tv_sec = 0;
+            ts.tv_nsec = nxt_unit_detached_timeout(ctx_impl) * 1000000L;
+
+            (void) nanosleep(&ts, NULL);
 
             continue;
         }
