@@ -27,13 +27,20 @@ on:
 
 env:
   # OpenSSL patch version built from source (see "Build OpenSSL" step). Only the
-  # patch level lives here; the 3.6 "slot" (/opt/openssl-3.6, OPENSSL36_* vars)
+  # patch level lives here; the 3.5 "slot" (/opt/openssl-3.5, OPENSSL35_* vars)
   # is stable across patch bumps and intentionally not templated.
-  OPENSSL_VERSION: 3.6.5
+  OPENSSL_VERSION: 3.5.9
+  # SHA256 of openssl-${OPENSSL_VERSION}.tar.gz, from
+  # https://github.com/openssl/openssl/releases/tag/openssl-3.5.9 and the
+  # .sha256 file next to the tarball on openssl.org.  Bump both together.
+  OPENSSL_SHA256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
   # OpenSSL 4.0 for the openssl4 leg below.  No distribution ships 4.0 yet, so
-  # like the 3.6 slot it is built from source; the /opt/openssl-4.0 slot is
+  # like the 3.5 slot it is built from source; the /opt/openssl-4.0 slot is
   # stable across patch bumps.
   OPENSSL4_VERSION: 4.0.3
+  # SHA256 of openssl-${OPENSSL4_VERSION}.tar.gz, from
+  # https://github.com/openssl/openssl/releases/tag/openssl-4.0.3.
+  OPENSSL4_SHA256: 325b5c806167c13b40b1ffeadfe0248197c00eccc4cf123ec1e28d2d2fd216d9
 
 concurrency:
   # Cancel superseded runs for the same pull request.  Non-PR events fall back
@@ -119,32 +126,33 @@ jobs:
           echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
           echo "CCACHE_MAXSIZE=500M" >> "$GITHUB_ENV"
 
-      - name: Cache OpenSSL 3.6
-        id: cache-openssl36
+      - name: Cache OpenSSL 3.5
+        id: cache-openssl35
         uses: actions/cache@v6
         with:
-          path: /opt/openssl-3.6
-          key: openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+          path: /opt/openssl-3.5
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ env.OPENSSL_SHA256 }}-${{ runner.os }}-${{ runner.arch }}
 
-      - name: Build OpenSSL 3.6
-        if: steps.cache-openssl36.outputs.cache-hit != 'true'
+      - name: Build OpenSSL 3.5
+        if: steps.cache-openssl35.outputs.cache-hit != 'true'
         run: |
           sudo apt-get -y install build-essential
           cd /tmp
           wget -q "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
+          echo "${OPENSSL_SHA256}  openssl-${OPENSSL_VERSION}.tar.gz" | sha256sum -c -
           tar -xzf "openssl-${OPENSSL_VERSION}.tar.gz"
           cd "openssl-${OPENSSL_VERSION}"
-          ./Configure --prefix=/opt/openssl-3.6 shared no-docs
+          ./Configure --prefix=/opt/openssl-3.5 shared no-docs
           make -j$(nproc)
-          sudo mkdir -p /opt/openssl-3.6
+          sudo mkdir -p /opt/openssl-3.5
           sudo make install_sw
 
-      - name: Set OpenSSL 3.6 build environment
+      - name: Set OpenSSL 3.5 build environment
         run: |
-          OSSL=/opt/openssl-3.6
+          OSSL=/opt/openssl-3.5
           LIBDIR=$( [ -d "$OSSL/lib64" ] && echo "$OSSL/lib64" || echo "$OSSL/lib" )
-          echo "OPENSSL36_INCDIR=${OSSL}/include" >> $GITHUB_ENV
-          echo "OPENSSL36_LIBDIR=${LIBDIR}"        >> $GITHUB_ENV
+          echo "OPENSSL35_INCDIR=${OSSL}/include" >> $GITHUB_ENV
+          echo "OPENSSL35_LIBDIR=${LIBDIR}"        >> $GITHUB_ENV
 
       - name: Cache njs
         id: cache-njs
@@ -208,13 +216,13 @@ jobs:
           rm -rf build Makefile
 
       - name: Configure unit
-        # LD_LIBRARY_PATH is set only for this step so that auto/feature
-        # test binaries load OpenSSL 3.6 at runtime.  It is NOT exported
-        # globally — doing so would break sudo (sudoers.so links against
-        # system libssl 3.3 which requires OPENSSL_3.3.0 from libcrypto,
-        # a symbol version that 3.6 does not export in the same slot).
+        # LD_LIBRARY_PATH is scoped to this step only so that auto/feature test
+        # binaries load OpenSSL 3.5; exporting it globally would break sudo,
+        # which links against the system libssl and libcrypto.  The build
+        # itself needs no such help: -Wl,-rpath below is baked into the
+        # binaries, and is honoured under sudo too.
         env:
-          LD_LIBRARY_PATH: ${{ env.OPENSSL36_LIBDIR }}
+          LD_LIBRARY_PATH: ${{ env.OPENSSL35_LIBDIR }}
         run: |
           ./configure \
             --tests \
@@ -224,8 +232,19 @@ jobs:
             --zstd \
             --brotli \
             --otel \
-            --cc-opt="-I${OPENSSL36_INCDIR} -I njs/src/ -I njs/build" \
-            --ld-opt="-L${OPENSSL36_LIBDIR} -Wl,-rpath,${OPENSSL36_LIBDIR} -L njs/build"
+            --cc-opt="-I${OPENSSL35_INCDIR} -I njs/src/ -I njs/build" \
+            --ld-opt="-L${OPENSSL35_LIBDIR} -Wl,-rpath,${OPENSSL35_LIBDIR} -L njs/build"
+
+      # This proves that the slot holds OpenSSL ${OPENSSL_VERSION}.  It cannot
+      # prove that the -L flag and the rpath took effect: configure runs its
+      # version probe with LD_LIBRARY_PATH on the slot (the step above), so the
+      # probe prints the slot version either way.  The ldd check after "Make
+      # unit" proves which libssl unitd loads.
+      - name: Assert configure found OpenSSL ${{ env.OPENSSL_VERSION }}
+        run: |
+          grep NXT_HAVE_OPENSSL_VERSION build/include/nxt_auto_config.h
+          grep -qF "#define NXT_HAVE_OPENSSL_VERSION  \"OpenSSL ${OPENSSL_VERSION} " \
+            build/include/nxt_auto_config.h
 
       # CARGO_INCREMENTAL=0, as for wasm-wasi-component: incremental data
       # only makes the cached src/otel/target bigger.  This build uses
@@ -236,6 +255,17 @@ jobs:
           CARGO_INCREMENTAL: 0
         run: |
           make -j$(nproc) -k || make
+
+      # unitd needs only OPENSSL_3.0.0 symbols, so without the rpath it would
+      # load the runner's system libssl.so.3 and every TLS test would still
+      # pass.  No LD_LIBRARY_PATH is set here, so ldd shows the real choice.
+      - name: Assert unitd loads OpenSSL from /opt/openssl-3.5
+        run: |
+          ldd build/sbin/unitd | grep -E 'libssl|libcrypto'
+          ldd build/sbin/unitd \
+            | grep -qE '=> /opt/openssl-3\.5/lib[0-9]*/libssl\.so\.3 '
+          ldd build/sbin/unitd \
+            | grep -qE '=> /opt/openssl-3\.5/lib[0-9]*/libcrypto\.so\.3 '
 
       # The default target is `all: unitd manpage`, so --tests above only
       # makes this target available -- it does not build it.  Without it
@@ -484,36 +514,31 @@ jobs:
           echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
           echo "CCACHE_MAXSIZE=500M" >> "$GITHUB_ENV"
 
-      - name: Cache OpenSSL 3.6
-        id: cache-openssl36
+      # This job builds nothing against OpenSSL.  unitd from the core artifact
+      # carries an rpath to /opt/openssl-3.5, so the slot must exist here with
+      # the same version.  The cache key matches the core job, so a miss only
+      # happens when the core job's cache entry was evicted or the runner
+      # architecture differs; the build then fills the slot the same way.
+      - name: Cache OpenSSL 3.5
+        id: cache-openssl35
         uses: actions/cache@v6
         with:
-          path: /opt/openssl-3.6
-          key: openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+          path: /opt/openssl-3.5
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ env.OPENSSL_SHA256 }}-${{ runner.os }}-${{ runner.arch }}
 
-      - name: Build OpenSSL 3.6
-        if: steps.cache-openssl36.outputs.cache-hit != 'true'
+      - name: Build OpenSSL 3.5
+        if: steps.cache-openssl35.outputs.cache-hit != 'true'
         run: |
           sudo apt-get -y install build-essential
           cd /tmp
           wget -q "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
+          echo "${OPENSSL_SHA256}  openssl-${OPENSSL_VERSION}.tar.gz" | sha256sum -c -
           tar -xzf "openssl-${OPENSSL_VERSION}.tar.gz"
           cd "openssl-${OPENSSL_VERSION}"
-          ./Configure --prefix=/opt/openssl-3.6 shared no-docs
+          ./Configure --prefix=/opt/openssl-3.5 shared no-docs
           make -j$(nproc)
-          sudo mkdir -p /opt/openssl-3.6
+          sudo mkdir -p /opt/openssl-3.5
           sudo make install_sw
-
-      - name: Set OpenSSL 3.6 build environment
-        # Keep OpenSSL 3.6 isolated in /opt/openssl-3.6.
-        # Mixing libssl.so.3 (3.3) with libcrypto.so.3 (3.6) breaks sudo,
-        # so we never overwrite system libraries.
-        # Export the two helper variables used in later steps.
-        run: |
-          OSSL=/opt/openssl-3.6
-          LIBDIR=$( [ -d "$OSSL/lib64" ] && echo "$OSSL/lib64" || echo "$OSSL/lib" )
-          echo "OPENSSL36_INCDIR=${OSSL}/include" >> $GITHUB_ENV
-          echo "OPENSSL36_LIBDIR=${LIBDIR}"        >> $GITHUB_ENV
 
       ##
       ## njs
@@ -568,6 +593,9 @@ jobs:
           test -f build/autoconf.data
           test -x build/sbin/unitd
           test -x build/unit_app_test
+          # The core job asserted the same; this proves the slot restored here.
+          ldd build/sbin/unitd \
+            | grep -qE '=> /opt/openssl-3\.5/lib[0-9]*/libssl\.so\.3 '
 
       ##
       ## Go
@@ -1184,13 +1212,14 @@ jobs:
         uses: actions/cache@v6
         with:
           path: /opt/openssl-4.0
-          key: openssl-${{ env.OPENSSL4_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+          key: openssl-${{ env.OPENSSL4_VERSION }}-${{ env.OPENSSL4_SHA256 }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Build OpenSSL 4.0
         if: steps.cache-openssl4.outputs.cache-hit != 'true'
         run: |
           cd /tmp
           wget -q "https://www.openssl.org/source/openssl-${OPENSSL4_VERSION}.tar.gz"
+          echo "${OPENSSL4_SHA256}  openssl-${OPENSSL4_VERSION}.tar.gz" | sha256sum -c -
           tar -xzf "openssl-${OPENSSL4_VERSION}.tar.gz"
           cd "openssl-${OPENSSL4_VERSION}"
           ./Configure --prefix=/opt/openssl-4.0 shared no-docs
@@ -1199,7 +1228,7 @@ jobs:
           sudo make install_sw
 
       - name: Set OpenSSL 4.0 build environment
-        # Same isolation as the 3.6 slot: never overwrite the system libraries,
+        # Same isolation as the 3.5 slot: never overwrite the system libraries,
         # because sudo links against them.
         run: |
           OSSL=/opt/openssl-4.0

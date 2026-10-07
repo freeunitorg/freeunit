@@ -47,7 +47,6 @@
 
 **Open questions (decide before August):**
 
-- [ ] OpenSSL 3.6 migration — verify clang-ast compatibility
 - [ ] Proxy request buffering (#58) — define scope (per-action vs global)
 
 ---
@@ -316,31 +315,6 @@ In-repo audit (2026-05-31):
   for `rust1.x` image (floating drifts; pin for reproducible CI).
 
 ---
-
-## OpenSSL 3.6 — test openssl-3.x branch
-
-Before the OpenSSL 3.6 migration can be considered fully validated:
-
-- [ ] Verify that the `openssl-3.x` branch (if it exists upstream or as a
-      fork reference) still applies cleanly on top of `master` with the new
-      `OBJ_sn2nid` / `OpenSSL_version_num` replacements.
-- [ ] Run the full CI matrix (`build-test.yml`) and confirm the new "Build OpenSSL 3.6"
-      step succeeds on both `amd64` and `arm64` runners.
-- [x] `clang-ast` workflow passes on `debian:testing` + system OpenSSL 1.1
-      via `./test/run-local-full.sh` (verified on `pre-1.35.5` branch).
-- [ ] Confirm `clang-ast` still passes when linked against OpenSSL 3.6
-      (previously broken by `EVP_PKEY_asn1_find_str` / `SSLeay` deprecations
-      — fixes need re-verification on the 3.6 build).
-- [ ] Smoke-test TLS in a Docker image built from `Dockerfile.minimal`
-      (now `debian:trixie-slim`) — load a certificate via the REST API and
-      make an HTTPS request.
-- [ ] Investigate `eclipse-temurin:11-jdk-noble` (Ubuntu 24.04, OpenSSL 3.3)
-      as the one remaining image that does NOT reach OpenSSL 3.6; decide
-      whether to build OpenSSL 3.6 from source in that Dockerfile or accept
-      the gap until eclipse-temurin gains a Debian trixie variant.
-
----
-
 
 ## PHP 8.5 Compatibility
 
