@@ -12,6 +12,13 @@
 
 <change type="bugfix">
 <para>
+on macOS with 16 KiB pages, every request to an application failed with
+"incoming_mmap: unexpected segment size".
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 with "chunked_transform", a valid chunked request body got 400 when a read
 ended right after the data of a chunk, before the CRLF after it.
 </para>

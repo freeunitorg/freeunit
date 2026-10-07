@@ -189,6 +189,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_port_mmap_range_test.c \
     src/test/nxt_port_mmap_read_test.c \
     src/test/nxt_port_mmaps_max_test.c \
+    src/test/nxt_port_mmap_size_test.c \
     src/test/nxt_port_ready_test.c \
     src/test/nxt_conn_close_idle_test.c \
     src/test/nxt_listen_event_test.c \

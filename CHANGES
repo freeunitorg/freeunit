@@ -1,6 +1,15 @@
 
 Changes with FreeUnit 1.37.1                                     04 Oct 2026
 
+    *) Bugfix: on macOS with 16 KiB pages, every request to an application
+       failed. The application logged "incoming_mmap: unexpected segment
+       size: 10502144 != 10489856" and exited. macOS rounds a shared memory
+       segment up to a whole page, and 1.37.0 required the exact size. A
+       larger segment is now accepted. A shorter one is still refused. The
+       check in the application appeared in 1.37.0. The same check in the
+       router appeared in 1.36.1 and dropped larger application responses
+       on macOS.
+
     *) Bugfix: with "chunked_transform", a valid chunked request body got
        400 when a read ended right after the data of a chunk, before the
        CRLF after it. The data stayed in the read buffer, and the next read

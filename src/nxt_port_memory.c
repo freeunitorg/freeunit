@@ -299,13 +299,17 @@ nxt_port_incoming_port_mmap(nxt_task_t *task, nxt_process_t *process,
     }
 
     /*
-     * The peer sizes the segment; chunk addressing and every munmap() use
-     * the PORT_MMAP_SIZE constant, so anything else is out of bounds one
-     * way or the other.
+     * The peer sizes the segment.  Chunk addressing and every munmap() use
+     * the PORT_MMAP_SIZE constant, so a shorter object faults on access and
+     * is refused.  A longer one is accepted: only the first PORT_MMAP_SIZE
+     * bytes are mapped.  The sender truncates the object to exactly
+     * PORT_MMAP_SIZE, but macOS rounds a shm object up to a whole page and
+     * PORT_MMAP_SIZE is not a multiple of 16 KiB, so fstat() reports more
+     * there.  nxt_port_queue_mmap() checks the queue the same way.
      */
-    if (nxt_slow_path(mmap_stat.st_size != PORT_MMAP_SIZE)) {
-        nxt_log(task, NXT_LOG_WARN, "unexpected shared memory segment size "
-                "%O from process %PI, expected %uz", mmap_stat.st_size,
+    if (nxt_slow_path(mmap_stat.st_size < (off_t) PORT_MMAP_SIZE)) {
+        nxt_log(task, NXT_LOG_WARN, "shared memory segment size %O "
+                "from process %PI is less than %uz", mmap_stat.st_size,
                 process->pid, (size_t) PORT_MMAP_SIZE);
 
         return NULL;

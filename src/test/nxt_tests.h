@@ -79,6 +79,7 @@ nxt_int_t nxt_port_use_unless_zero_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_mmap_range_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_mmap_read_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_mmaps_max_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_mmap_size_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_ready_test(nxt_thread_t *thr);
 nxt_int_t nxt_conn_close_idle_test(nxt_thread_t *thr);
 nxt_int_t nxt_listen_event_test(nxt_thread_t *thr);

@@ -5150,13 +5150,14 @@ nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd)
     }
 
     /*
-     * Every chunk offset is computed against PORT_MMAP_SIZE, and the
-     * munmap() calls use it too: a shorter object faults on access, a
-     * longer one leaks the excess mapping.  The router side requires the
-     * same (nxt_port_incoming_port_mmap()).
+     * Every chunk offset is computed against PORT_MMAP_SIZE, and only
+     * PORT_MMAP_SIZE bytes are mapped.  A shorter object faults on access
+     * and is refused.  A longer one is accepted: macOS rounds a shm object
+     * up to a whole page, and PORT_MMAP_SIZE is not a multiple of 16 KiB.
+     * The router side checks the same (nxt_port_incoming_port_mmap()).
      */
-    if (nxt_slow_path(mmap_stat.st_size != (off_t) PORT_MMAP_SIZE)) {
-        nxt_unit_alert(ctx, "incoming_mmap: unexpected segment size: %d != %d",
+    if (nxt_slow_path(mmap_stat.st_size < (off_t) PORT_MMAP_SIZE)) {
+        nxt_unit_alert(ctx, "incoming_mmap: segment size %d is less than %d",
                        (int) mmap_stat.st_size, (int) PORT_MMAP_SIZE);
 
         return NXT_UNIT_ERROR;

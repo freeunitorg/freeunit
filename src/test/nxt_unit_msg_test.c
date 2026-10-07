@@ -414,8 +414,17 @@ static const nxt_unit_msg_test_segment_t  segments[] = {
       NXT_UNIT_ERROR },
     { "segment shorter than PORT_MMAP_SIZE is refused",
       PORT_MMAP_HEADER_SIZE, 1, NXT_UNIT_ERROR },
-    { "segment longer than PORT_MMAP_SIZE is refused",
-      2 * PORT_MMAP_SIZE, 1, NXT_UNIT_ERROR },
+    /*
+     * A whole 64 KiB page short: macOS rounds a shm object up to a page,
+     * so a one-byte gap would vanish there.  10424320 rounds up to at most
+     * 10485760 for any page up to 64 KiB, still below PORT_MMAP_SIZE.
+     */
+    { "segment 64 KiB shorter than PORT_MMAP_SIZE is refused",
+      PORT_MMAP_SIZE - 65536, 1, NXT_UNIT_ERROR },
+    { "segment rounded up to a 16 KiB page is accepted",
+      (PORT_MMAP_SIZE + 16383) & ~(size_t) 16383, 1, NXT_UNIT_OK },
+    { "segment longer than PORT_MMAP_SIZE is accepted",
+      2 * PORT_MMAP_SIZE, 1, NXT_UNIT_OK },
 };
 
 
