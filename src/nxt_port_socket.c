@@ -26,7 +26,6 @@
 #define NXT_PORT_RETRY_MAX_DELAY  32
 
 
-static nxt_bool_t nxt_port_can_enqueue_buf(nxt_buf_t *b);
 static uint8_t nxt_port_enqueue_buf(nxt_task_t *task, nxt_port_msg_t *pm,
     void *qbuf, nxt_buf_t *b);
 static nxt_int_t nxt_port_msg_chk_insert(nxt_task_t *task, nxt_port_t *port,
@@ -297,7 +296,7 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
     int                  notify;
     uint8_t              qmsg_size;
     nxt_int_t            res;
-    nxt_bool_t           enqueued, send_failed;
+    nxt_bool_t           enqueued, send_failed, can_enqueue;
     nxt_port_send_msg_t  msg;
     struct {
         nxt_port_msg_t   pm;
@@ -347,6 +346,17 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
     if (port->queue != NULL && type != _NXT_PORT_MSG_READ_QUEUE) {
 
         /*
+         * Empty message, or a single non-chained buffer that either fits
+         * the shared-queue slot or is a port mmap.  Chained and oversized
+         * non-mmap buffers take the socket path instead.
+         */
+        can_enqueue = (b == NULL
+                       || (b->next == NULL
+                           && (nxt_buf_mem_used_size(&b->mem)
+                                   <= NXT_PORT_MAX_ENQUEUE_BUF_SIZE
+                               || nxt_buf_is_port_mmap(b))));
+
+        /*
          * A QUIT goes into the shared queue like any other message.
          * A worker that is still in nxt_unit_init() holds only one socket
          * message with no queue marker ("too many port socket messages").
@@ -355,7 +365,7 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
          * still marks it as a QUIT.  A failed wake-up to a worker that is
          * gone is then logged at info.
          */
-        if (fd == -1 && nxt_port_can_enqueue_buf(b)) {
+        if (fd == -1 && can_enqueue) {
             qmsg.pm = msg.port_msg;
 
             qmsg_size = sizeof(qmsg.pm);
@@ -496,22 +506,6 @@ queue_broken:
               (int) msg.port_msg.type, stream);
 
     return NXT_ERROR;
-}
-
-
-static nxt_bool_t
-nxt_port_can_enqueue_buf(nxt_buf_t *b)
-{
-    if (b == NULL) {
-        return 1;
-    }
-
-    if (b->next != NULL) {
-        return 0;
-    }
-
-    return (nxt_buf_mem_used_size(&b->mem) <= NXT_PORT_MAX_ENQUEUE_BUF_SIZE
-            || nxt_buf_is_port_mmap(b));
 }
 
 
