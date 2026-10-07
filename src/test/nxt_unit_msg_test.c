@@ -34,6 +34,11 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 
+#if (NXT_MACOSX)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
+
 
 /* What the request handler does with a request that arrived. */
 typedef enum {
@@ -554,6 +559,7 @@ nxt_unit_msg_test_get_mmap_follower_case(void *data)
 static int
 nxt_unit_msg_test_count_maps(void)
 {
+#if (NXT_LINUX)
     int   n;
     char  line[512];
     FILE  *f;
@@ -572,6 +578,61 @@ nxt_unit_msg_test_count_maps(void)
     fclose(f);
 
     return n;
+
+#elif (NXT_MACOSX)
+    int                             n;
+    kern_return_t                   kr;
+    mach_port_t                     object;
+    mach_vm_size_t                  size, page;
+    mach_vm_address_t               address;
+    mach_msg_type_number_t          count;
+    vm_region_basic_info_data_64_t  info;
+
+    /*
+     * Count the regions of exactly one segment, PORT_MMAP_SIZE rounded up
+     * to a page.  The share mode cannot identify them: a segment that is
+     * mapped but not touched reports SM_PRIVATE.
+     */
+
+    page = getpagesize();
+    address = 0;
+    n = 0;
+
+    for ( ;; ) {
+        count = VM_REGION_BASIC_INFO_COUNT_64;
+
+        kr = mach_vm_region(mach_task_self(), &address, &size,
+                            VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t) &info, &count, &object);
+
+        if (kr == KERN_INVALID_ADDRESS) {
+            break;
+        }
+
+        if (kr != KERN_SUCCESS) {
+            return -1;
+        }
+
+        if (object != MACH_PORT_NULL) {
+            mach_port_deallocate(mach_task_self(), object);
+        }
+
+        if (size >= PORT_MMAP_SIZE && size < PORT_MMAP_SIZE + page) {
+            n++;
+        }
+
+        if (size == 0 || address + size < address) {
+            break;
+        }
+
+        address += size;
+    }
+
+    return n;
+
+#else
+    return -1;
+#endif
 }
 
 
@@ -592,11 +653,11 @@ nxt_unit_msg_test_dup_id_case(void *data)
 
     after = nxt_unit_msg_test_count_maps();
 
-#if !(NXT_LINUX)
+#if !(NXT_LINUX || NXT_MACOSX)
     if (before < 0) {
-        /* No /proc/self/maps, for example on macOS. */
+        /* No mapping count method available on this platform. */
         printf("unit msg test: mapping count skipped, "
-               "no /proc/self/maps\n");
+               "no mapping count method\n");
         before = 0;
         after = 0;
     }
