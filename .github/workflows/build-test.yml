@@ -516,26 +516,7 @@ jobs:
 
       - name: Install packages
         timeout-minutes: 5
-        run: sudo apt-get -y install libbrotli-dev ccache
-
-      # ccache transparently caches C object files across runs. The Debian
-      # ccache package ships compiler symlinks in /usr/lib/ccache; putting it
-      # first on PATH makes `cc`/`gcc` resolve to ccache for njs, unit and the
-      # OpenSSL build with no configure changes. Falls back to real cc on any
-      # miss, so it can only speed things up, never break the build.
-      - name: Cache ccache
-        uses: actions/cache@v6
-        with:
-          path: ~/.ccache
-          key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.build }}-${{ github.run_id }}
-          restore-keys: |
-            ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.build }}-
-
-      - name: Enable ccache
-        run: |
-          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
-          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
-          echo "CCACHE_MAXSIZE=500M" >> "$GITHUB_ENV"
+        run: sudo apt-get -y install libbrotli-dev
 
       # This job builds nothing against OpenSSL.  unitd from the core artifact
       # carries an rpath to /opt/openssl-3.5, so the slot must exist here with
