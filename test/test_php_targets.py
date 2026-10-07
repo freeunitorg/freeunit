@@ -393,3 +393,58 @@ def test_php_application_root_symlink_swap(temp_dir):
         for link in ('current', 'next'):
             if os.path.islink(f'{temp_dir}/{link}'):
                 os.unlink(f'{temp_dir}/{link}')
+
+
+def test_php_application_targets_cwd_renamed_dir(temp_dir):
+    # The script path is resolved when the configuration is loaded.  The
+    # module changed the directory only when the target differed from the
+    # one of the previous request.  When a new tree is renamed into place
+    # between two requests for the same target, the script is opened from
+    # the new tree, but the working directory stays on the old one.
+    # Relative includes and reads then use the old tree.
+    root = Path(f'{temp_dir}/root')
+    app = root / 'app'
+    app.mkdir(parents=True)
+
+    script = (
+        '<?php echo getmypid(), "\\n", getcwd(), "\\n", '
+        'file_get_contents("data.txt");'
+    )
+
+    (app / 'index.php').write_text(script, encoding='utf-8')
+    (app / 'data.txt').write_text('v1', encoding='utf-8')
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "applications/targets/app"}},
+            "applications": {
+                "targets": {
+                    "type": client.get_application_type(),
+                    "processes": 1,
+                    "targets": {
+                        "app": {"root": str(root), "script": "app/index.php"},
+                    },
+                }
+            },
+        }
+    )
+
+    cwd = str(app.resolve())
+
+    pid, body = client.get()['body'].split('\n', 1)
+    assert body == f'{cwd}\nv1', 'old tree'
+
+    new = root / 'new'
+    new.mkdir()
+    (new / 'index.php').write_text(script, encoding='utf-8')
+    (new / 'data.txt').write_text('v2', encoding='utf-8')
+
+    app.rename(root / 'old')
+    new.rename(app)
+
+    # The same process must serve both requests.  A new process would
+    # change to the new tree at its first request, so the test would pass
+    # without the fix.
+    pid2, body = client.get()['body'].split('\n', 1)
+    assert pid2 == pid, 'same process'
+    assert body == f'{cwd}\nv2', 'new tree'
