@@ -1064,23 +1064,6 @@ nxt_http_comp_set_header(const nxt_http_comp_conf_t *conf,
 }
 
 
-static bool
-nxt_http_comp_is_resp_content_encoded(const nxt_http_request_t *r)
-{
-    nxt_http_field_t  *f;
-
-    nxt_http_fields_each(f, r->resp.inline_fields, r->resp.num_inline_fields,
-                         r->resp.fields)
-    {
-        if (nxt_strcasecmp(f->name, (const u_char *)"Content-Encoding") == 0) {
-            return true;
-        }
-    } nxt_http_fields_loop;
-
-    return false;
-}
-
-
 /*
  * Adds "Vary: Accept-Encoding", so a shared cache keys on the header that
  * chose this representation.
@@ -1310,6 +1293,7 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
     bool                      identity_refused;
     nxt_int_t                 ret, idx;
     nxt_str_t                 accept_encoding, mime_type = {};
+    nxt_http_field_t          *f;
     nxt_http_comp_ctx_t       *ctx;
     nxt_http_comp_conf_t      *conf = nxt_http_comp_request_conf(r);
     nxt_http_set_header_op_t  conf_op;
@@ -1347,9 +1331,18 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
         return NXT_OK;
     }
 
-    if (nxt_http_comp_is_resp_content_encoded(r)) {
-        return NXT_OK;
-    }
+    /*
+     * A Content-Encoding on the response means the application coded the
+     * body itself.  Unit does not code it again.
+     */
+
+    nxt_http_fields_each(f, r->resp.inline_fields, r->resp.num_inline_fields,
+                         r->resp.fields)
+    {
+        if (nxt_strcasecmp(f->name, (const u_char *)"Content-Encoding") == 0) {
+            return NXT_OK;
+        }
+    } nxt_http_fields_loop;
 
     /*
      * "response_headers" are applied after this, when the header is sent.
