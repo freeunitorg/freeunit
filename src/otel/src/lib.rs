@@ -35,7 +35,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::{ptr, slice};
 
 const TRACEPARENT_HEADER_LEN: u8 = 55;
@@ -568,34 +568,58 @@ unsafe fn nxt_otel_parent_context(
     Some(Context::new().with_remote_span_context(sc))
 }
 
-fn nxt_otel_build_span(tracer: &BoxedTracer, parent: &Context) -> BoxedSpan {
-    let builder = tracer.span_builder(SPAN_NAME).with_kind(SpanKind::Server);
+fn nxt_otel_build_span(
+    tracer: &BoxedTracer,
+    parent: &Context,
+    start: SystemTime,
+) -> BoxedSpan {
+    let builder = tracer
+        .span_builder(SPAN_NAME)
+        .with_kind(SpanKind::Server)
+        .with_start_time(start);
 
     tracer.build_with_context(builder, parent)
 }
 
+/// Create the span of a request.
+///
+/// `elapsed_ns` is the time since the request arrived, from the router's
+/// monotonic clock. The span is created only after the request header is
+/// parsed, or on an error before that, so without an explicit start the SDK
+/// would stamp the span with the creation time. A slow client's header read
+/// would then be missing from the span, and a 408 would last zero nanoseconds.
+/// The start is the wall clock now minus the elapsed time, which is the same
+/// interval `$request_time` reports. Two tests in test/test_otel.py assert a
+/// span duration and guard this argument: the split-header test and the 408
+/// test. Dropping the argument fails only those two.
 #[no_mangle]
 pub unsafe extern "C" fn nxt_otel_rs_get_or_create_trace(
     trace_id: *const c_char,
     parent_id: *const c_char,
     trace_flags: *const c_char,
     trace_state: *const nxt_str_t,
+    elapsed_ns: u64,
 ) -> *mut BoxedSpan {
     let parent = nxt_otel_parent_context(trace_id, parent_id, trace_flags, trace_state)
         .unwrap_or_else(Context::new);
+
+    let now = SystemTime::now();
+    let start = now
+        .checked_sub(Duration::from_nanos(elapsed_ns))
+        .unwrap_or(now);
 
     // The read guard is held across the build so the cached tracer cannot be
     // dropped by a concurrent reconfigure while a span is being made from it.
     let cached = tracer_slot().read().ok();
 
     let span = match cached.as_ref().and_then(|slot| slot.as_ref()) {
-        Some(tracer) => nxt_otel_build_span(tracer, &parent),
+        Some(tracer) => nxt_otel_build_span(tracer, &parent, start),
         None => {
             // No provider installed, or the lock is poisoned: fall back to the
             // global provider, which hands out a no-op tracer in that case.
             let tracer = global::tracer_provider().tracer(TRACER_NAME);
 
-            nxt_otel_build_span(&tracer, &parent)
+            nxt_otel_build_span(&tracer, &parent, start)
         }
     };
 

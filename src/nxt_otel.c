@@ -516,6 +516,8 @@ nxt_otel_drop_tracestate(nxt_http_request_t *r)
 static void
 nxt_otel_trace_and_span_init(nxt_task_t *task, nxt_http_request_t *r)
 {
+    nxt_nsec_t  now, elapsed;
+
     /*
      * Restarting the trace (no valid inbound traceparent was accepted):
      * drop any inbound tracestate per W3C Trace Context — vendor state
@@ -526,11 +528,23 @@ nxt_otel_trace_and_span_init(nxt_task_t *task, nxt_http_request_t *r)
         nxt_otel_drop_tracestate(r);
     }
 
+    /*
+     * The span is created after the whole request header is parsed, or on
+     * an error before that.  The SDK would stamp it with the creation time,
+     * so a slow header read would be missing from the span and a 408 would
+     * last zero nanoseconds.  Pass the time since the request arrived; the
+     * same interval as "$request_time".  The thread time is updated once per
+     * event loop turn, so the two values can be equal, never reversed.
+     */
+    now = nxt_thread_monotonic_time(task->thread);
+    elapsed = (now > r->start_time) ? now - r->start_time : 0;
+
     r->otel->trace =
         nxt_otel_rs_get_or_create_trace(r->otel->trace_id,
                                         r->otel->parent_id,
                                         r->otel->trace_flags,
-                                        &r->otel->trace_state);
+                                        &r->otel->trace_state,
+                                        (uint64_t) elapsed);
     if (r->otel->trace == NULL) {
         nxt_log(task, NXT_LOG_ERR, "error generating otel span");
         nxt_otel_state_transition(r->otel, NXT_OTEL_ERROR_STATE);
@@ -581,8 +595,16 @@ nxt_otel_test_and_call_state(nxt_task_t *task, nxt_http_request_t *r)
         nxt_otel_span_add_headers(task, r);
         break;
     case NXT_OTEL_BODY_STATE:
+        /*
+         * There are three calls on the normal path: request start (INIT),
+         * request ready (HEADER) and response header send.  The last one
+         * finds BODY, so it adds the body size and ends the span at once.
+         * The span must not start before the whole request header is
+         * parsed, or an inbound traceparent is not yet known.
+         */
         nxt_otel_span_add_body(r);
-        break;
+        nxt_fallthrough;
+
     case NXT_OTEL_COLLECT_STATE:
         nxt_otel_span_collect(task, r);
         break;
@@ -597,12 +619,34 @@ nxt_otel_test_and_call_state(nxt_task_t *task, nxt_http_request_t *r)
 void
 nxt_otel_request_error_path(nxt_task_t *task, nxt_http_request_t *r)
 {
-    if (r->otel == NULL || r->otel->trace == NULL) {
+    if (r->otel == NULL) {
         return;
     }
 
-    // response headers have been cleared
-    nxt_otel_propagate_header(task, r);
+    /*
+     * The error can come before the request attributes are added: in INIT
+     * while the header is still read (a 400 or a 408), or in HEADER while
+     * the body is read (a bad chunk or a body timeout).  Run the missing
+     * steps here, so that the span is started from the fields parsed so
+     * far, gets the request attributes and propagates the traceparent.
+     * In BODY these steps are done, so only the response field, cleared
+     * by the error, is added again.
+     */
+    if (r->otel->status == NXT_OTEL_INIT_STATE) {
+        nxt_otel_test_and_call_state(task, r);
+    }
+
+    if (r->otel->status == NXT_OTEL_HEADER_STATE) {
+        nxt_otel_test_and_call_state(task, r);
+
+    } else if (r->otel->trace != NULL) {
+        nxt_otel_propagate_header(task, r);
+    }
+
+    if (r->otel->trace == NULL) {
+        return;
+    }
+
     nxt_otel_state_transition(r->otel, NXT_OTEL_COLLECT_STATE);
     nxt_otel_test_and_call_state(task, r);
 }

@@ -93,9 +93,15 @@ nxt_static_assert(sizeof(nxt_otel_attr_t) == offsetof(nxt_otel_attr_t, sval)
 
 #if (NXT_HAVE_OTEL)
 extern void nxt_otel_rs_send_trace(void *trace);
+/*
+ * elapsed_ns is the time since the request arrived, from the monotonic clock
+ * that r->start_time uses.  The Rust side sets the span start to now minus
+ * this value, so a span created after the header is parsed, or on an error
+ * before that, still starts when the request arrived.
+ */
 extern void * nxt_otel_rs_get_or_create_trace(const u_char *trace_id,
     const u_char *parent_id, const u_char *trace_flags,
-    const nxt_str_t *trace_state);
+    const nxt_str_t *trace_state, uint64_t elapsed_ns);
 extern void nxt_otel_rs_init(
     void (*log_callback)(nxt_uint_t log_level, const char *log_string),
     const nxt_str_t *endpoint, const nxt_str_t *protocol,

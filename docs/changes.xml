@@ -19,6 +19,14 @@ on macOS with 16 KiB pages, every request to an application failed with
 
 <change type="bugfix">
 <para>
+with OpenTelemetry, the inbound "traceparent" was ignored when the request
+header arrived in more than one read; the span of a request that fails before
+it is complete had no request attributes.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 with "chunked_transform", a valid chunked request body got 400 when a read
 ended right after the data of a chunk, before the CRLF after it.
 </para>

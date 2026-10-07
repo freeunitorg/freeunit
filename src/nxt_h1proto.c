@@ -595,9 +595,6 @@ nxt_h1p_conn_request_init(nxt_task_t *task, void *obj, void *data)
             h1p->parser.discard_unsafe_fields = skcf->discard_unsafe_fields;
 
             nxt_h1p_conn_request_header_parse(task, c, h1p);
-
-            NXT_OTEL_TRACE();
-
             return;
         }
 
@@ -2028,6 +2025,17 @@ nxt_h1p_conn_request_error(nxt_task_t *task, void *obj, void *data)
     if (r->status == 0) {
         r->status = NXT_HTTP_BAD_REQUEST;
     }
+
+#if (NXT_HAVE_OTEL)
+    /*
+     * The request started, but the connection failed while the body was
+     * read.  Add the request attributes before the span is ended by the
+     * pool cleanup.  A request whose header is not complete has no span.
+     */
+    if (r->otel != NULL && r->otel->status == NXT_OTEL_HEADER_STATE) {
+        NXT_OTEL_TRACE();
+    }
+#endif
 
     nxt_h1p_request_error(task, h1p, r);
 }
