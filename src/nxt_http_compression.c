@@ -605,25 +605,6 @@ nxt_http_comp_compressor_lookup_enabled(const nxt_http_comp_conf_t *conf,
     return NXT_HTTP_COMP_SCHEME_UNKNOWN;
 }
 
-
-/*
- * Tells whether the token names the identity coding.  Identity is a
- * representation that each response has.  So it is recognised from the
- * static table, not from the enabled compressors: it must be recognised
- * with no compressor enabled.
- */
-
-static bool
-nxt_http_comp_token_is_identity(const nxt_str_t *token)
-{
-    const nxt_http_comp_type_t  *identity;
-
-    identity = &nxt_http_comp_compressors[NXT_HTTP_COMP_SCHEME_IDENTITY];
-
-    return nxt_strcasestr_eq(token, &identity->token);
-}
-
-
 /*
  * We need to parse the 'Accept-Encoding` header as described by
  * <https://www.rfc-editor.org/rfc/rfc9110.html#field.accept-encoding>
@@ -836,11 +817,12 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
     *tail = '\0';
 
     while ((tkn = strsep(&str, ","))) {
-        bool        wildcard;
-        char        *qptr;
-        double      qval = 1.0;
-        nxt_str_t   enc;
-        nxt_uint_t  ecidx;
+        bool                        wildcard;
+        char                        *qptr;
+        double                      qval = 1.0;
+        nxt_str_t                   enc;
+        nxt_uint_t                  ecidx;
+        const nxt_http_comp_type_t  *identity;
 
         qptr = nxt_http_comp_find_weight(tkn);
         if (qptr != NULL && !nxt_http_comp_parse_weight(qptr + 3, &qval)) {
@@ -871,13 +853,15 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
 
         /*
          * Identity says whether the own bytes of the response are
-         * acceptable.  That does not depend on the configured compressors.
-         * Read it before the lookup, so that a refusal still arrives when
-         * compression is off.  That is the one case where identity is all
-         * the server can offer.
+         * acceptable.  That does not depend on the configured compressors:
+         * it is recognised from the static table, so a refusal still
+         * arrives when compression is off.  That is the one case where
+         * identity is all the server can offer.  Read it before the lookup.
          */
 
-        if (nxt_http_comp_token_is_identity(&enc)) {
+        identity = &nxt_http_comp_compressors[NXT_HTTP_COMP_SCHEME_IDENTITY];
+
+        if (nxt_strcasestr_eq(&enc, &identity->token)) {
             ecidx = NXT_HTTP_COMP_SCHEME_IDENTITY;
             identity_named = true;
             identity_named_ok = (qval != 0.0);
