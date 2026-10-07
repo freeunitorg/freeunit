@@ -19,7 +19,7 @@ use opentelemetry::trace::{
     Span, SpanContext, SpanId, SpanKind, Status, TraceContextExt, TraceFlags,
     TraceId, TraceState, Tracer, TracerProvider,
 };
-use opentelemetry::{Context, Key, KeyValue, Value};
+use opentelemetry::{Context, Key, KeyValue, StringValue, Value};
 use opentelemetry_otlp::{
     Protocol, RetryPolicy, SpanExporter, WithExportConfig, WithHttpConfig,
     WithTonicConfig,
@@ -91,8 +91,43 @@ static ATTR_KEYS: [Key; NXT_OTEL_ATTR_MAX] = [
 /// Must equal `NXT_OTEL_ATTR_MAX` in `src/nxt_otel.h`.
 const NXT_OTEL_ATTR_MAX: usize = 11;
 
+/// Attribute values Unit knows at compile time, interned as `&'static str`.
+///
+/// Building a `Value::String` from an owned `String` is the last allocation in
+/// the attribute path: `StringValue` keeps a `&'static str` as it is and
+/// allocates only for owned text.  C passes the id of one of these entries in
+/// `nxt_otel_attr_t::ival` with `NXT_OTEL_ATTR_TYPE_STATIC`, so the values that
+/// do not vary per request -- the scheme, the protocol version and the
+/// application type -- cost no allocation at all.  Values that do vary (path,
+/// method, user agent, addresses, application name) keep the owned path.
+///
+/// The order is the contract with `nxt_otel_value_id_t` in `src/nxt_otel.h`,
+/// exactly as ATTR_KEYS is with `nxt_otel_attr_id_t`: add to the end, and add
+/// there in the same commit.
+static ATTR_VALUE_STRINGS: [&str; NXT_OTEL_VALUE_MAX] = [
+    // scheme
+    "http",
+    "https",
+    // network.protocol.version, the "HTTP/" prefix removed
+    "1.0",
+    "1.1",
+    // unit.application.type, from nxt_otel_app_type_value()
+    "python",
+    "php",
+    "perl",
+    "ruby",
+    "java",
+    "wasm",
+    "external",
+    "unknown",
+];
+
+/// Must equal `NXT_OTEL_VALUE_MAX` in `src/nxt_otel.h`.
+const NXT_OTEL_VALUE_MAX: usize = 12;
+
 const NXT_OTEL_ATTR_TYPE_STR: u32 = 0;
 const NXT_OTEL_ATTR_TYPE_I64: u32 = 1;
+const NXT_OTEL_ATTR_TYPE_STATIC: u32 = 2;
 
 /// One span attribute in a batch. Mirrors `nxt_otel_attr_t` in
 /// `src/nxt_otel.h`; the layouts must stay identical.
@@ -422,30 +457,66 @@ pub unsafe extern "C" fn nxt_otel_rs_init(
     }
 }
 
-// it's on the caller to pass in a buf of proper length
+/// Write the span's own context as a W3C `traceparent` value.
+///
+/// Returns the number of bytes written, not counting the terminating NUL, and
+/// the caller passes a buffer of `TRACEPARENT_HEADER_LEN + 1` bytes.  The value
+/// is assembled by hand: `format!` allocated a `String` per request to produce
+/// 55 bytes of hex.
 #[no_mangle]
-pub unsafe extern "C" fn nxt_otel_rs_copy_traceparent(buf: *mut c_char, span: *const BoxedSpan) {
+pub unsafe extern "C" fn nxt_otel_rs_copy_traceparent(
+    buf: *mut c_char,
+    span: *const BoxedSpan,
+) -> usize {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    const LEN: usize = TRACEPARENT_HEADER_LEN as usize;
+
     if buf.is_null() || span.is_null() {
-        return;
+        return 0;
     }
 
     let ctx = (*span).span_context();
-    let traceparent = format!(
-        "00-{:032x}-{:016x}-{:02x}",
-        ctx.trace_id(),    // 16 bytes, 32 hex
-        ctx.span_id(),     // 8 bytes, 16 hex
-        ctx.trace_flags()  // 1 byte, 2 hex
-    );
+    let trace_id = ctx.trace_id().to_bytes(); // 16 bytes, 32 hex
+    let span_id = ctx.span_id().to_bytes(); // 8 bytes, 16 hex
+    let flags = ctx.trace_flags().to_u8(); // 1 byte, 2 hex
 
-    debug_assert_eq!(traceparent.len(), TRACEPARENT_HEADER_LEN as usize);
+    let mut out = [0u8; LEN];
+    let mut p = 0;
 
-    ptr::copy_nonoverlapping(
-        traceparent.as_bytes().as_ptr() as *const c_char,
-        buf,
-        TRACEPARENT_HEADER_LEN as usize,
-    );
+    let put = |out: &mut [u8; LEN], p: &mut usize, b: u8| {
+        out[*p] = HEX[(b >> 4) as usize];
+        out[*p + 1] = HEX[(b & 0x0f) as usize];
+        *p += 2;
+    };
+
+    out[p] = b'0';
+    out[p + 1] = b'0';
+    out[p + 2] = b'-';
+    p += 3;
+
+    for b in trace_id {
+        put(&mut out, &mut p, b);
+    }
+
+    out[p] = b'-';
+    p += 1;
+
+    for b in span_id {
+        put(&mut out, &mut p, b);
+    }
+
+    out[p] = b'-';
+    p += 1;
+
+    put(&mut out, &mut p, flags);
+
+    debug_assert_eq!(p, LEN);
+
+    ptr::copy_nonoverlapping(out.as_ptr() as *const c_char, buf, p);
     // null terminator
-    *buf.add(TRACEPARENT_HEADER_LEN as usize) = 0;
+    *buf.add(p) = 0;
+
+    p
 }
 
 /// Set a stage's semantic-convention span attributes in one call.
@@ -461,6 +532,9 @@ pub unsafe extern "C" fn nxt_otel_rs_copy_traceparent(buf: *mut c_char, span: *c
 /// undo the `is_recording` gate that is the measured win. Attributes are set
 /// after the gate, on a span already known to be recording.
 ///
+/// Returns the number of attributes set.  C does not need it; the tests use
+/// it to see that an attribute was recorded and not dropped.
+///
 /// # Safety
 ///
 /// `attrs` must point at `n` initialised `nxt_otel_attr_t`, and each entry's
@@ -470,9 +544,9 @@ pub unsafe extern "C" fn nxt_otel_rs_add_attrs(
     trace: *mut BoxedSpan,
     attrs: *const nxt_otel_attr_t,
     n: usize,
-) {
+) -> usize {
     if trace.is_null() || attrs.is_null() || n == 0 {
-        return;
+        return 0;
     }
 
     let attrs = slice::from_raw_parts(attrs, n);
@@ -483,23 +557,47 @@ pub unsafe extern "C" fn nxt_otel_rs_add_attrs(
     // would be an allocation that buys nothing. The saving this function
     // exists for is the single FFI crossing and the static keys, not batching
     // inside the SDK.
-    for attr in attrs {
-        // A key_id C and Rust disagree about would index out of bounds;
-        // drop the attribute rather than panic across the FFI boundary.
-        let Some(key) = ATTR_KEYS.get(attr.key_id as usize) else {
-            continue;
-        };
+    let mut set = 0;
 
-        let value = match attr.r#type {
-            NXT_OTEL_ATTR_TYPE_I64 => Value::I64(attr.ival),
-            NXT_OTEL_ATTR_TYPE_STR => Value::String(nxt_str_to_string(&attr.sval).into()),
-            _ => continue,
+    for attr in attrs {
+        let Some((key, value)) = attr_key_value(attr) else {
+            continue;
         };
 
         // Cloning a Key built by `from_static_str` copies a &'static str --
         // no allocation, which is the point of the ATTR_KEYS table.
         (*trace).set_attribute(KeyValue::new(key.clone(), value));
+        set += 1;
     }
+
+    set
+}
+
+/// The key and the value of one attribute from C, or None when C and Rust
+/// disagree about its key id, its type or its value id.  Such an attribute is
+/// dropped: an index out of bounds must not panic across the FFI boundary.
+///
+/// # Safety
+///
+/// For `NXT_OTEL_ATTR_TYPE_STR`, `attr.sval` must reference valid bytes.
+unsafe fn attr_key_value(
+    attr: &nxt_otel_attr_t,
+) -> Option<(&'static Key, Value)> {
+    let key = ATTR_KEYS.get(attr.key_id as usize)?;
+
+    let value = match attr.r#type {
+        NXT_OTEL_ATTR_TYPE_I64 => Value::I64(attr.ival),
+        NXT_OTEL_ATTR_TYPE_STR => {
+            Value::String(nxt_str_to_string(&attr.sval).into())
+        }
+        NXT_OTEL_ATTR_TYPE_STATIC => {
+            let s = ATTR_VALUE_STRINGS.get(usize::try_from(attr.ival).ok()?)?;
+            Value::String(StringValue::from(*s))
+        }
+        _ => return None,
+    };
+
+    Some((key, value))
 }
 
 /// Whether the sampler kept this span.
@@ -760,5 +858,283 @@ pub unsafe extern "C" fn nxt_otel_rs_shutdown_tracer() {
     let rt = runtime_slot().lock().ok().and_then(|mut g| g.take());
     if let Some(rt) = rt {
         rt.shutdown_background();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    /*
+     * Count the allocations of one request-path call.
+     *
+     * The counter is thread local: cargo test runs the tests of a binary in
+     * parallel threads, and a neighbouring test allocating would be counted by
+     * a process-wide counter and make these assertions flaky.  The `const`
+     * initialiser matters too: a global allocator must not allocate on the
+     * first access of its own counter.  `try_with` rather than `with`, because
+     * a thread's local storage is gone before its exit finishes, and a panic
+     * inside the allocator would abort the test binary instead of failing a
+     * test.
+     */
+    thread_local! {
+        static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    struct CountingAllocator;
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
+            System.alloc(layout)
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            System.dealloc(ptr, layout)
+        }
+
+        unsafe fn realloc(
+            &self,
+            ptr: *mut u8,
+            layout: Layout,
+            new_size: usize,
+        ) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
+            System.realloc(ptr, layout, new_size)
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    fn allocations<F: FnOnce()>(f: F) -> usize {
+        let before = ALLOCATIONS.with(|n| n.get());
+        f();
+        ALLOCATIONS.with(|n| n.get()) - before
+    }
+
+    /// A span from a no-op tracer that this test owns.
+    ///
+    /// The span is built the way the request path builds it, but not from the
+    /// global provider.  Other tests in this binary install and shut down a
+    /// global provider, and a shut-down provider hands out spans with an empty
+    /// context.  A no-op tracer exports nothing, and its span keeps the parent
+    /// context it was built with.  The counts below are unaffected by that,
+    /// because a value is built before the no-op span drops it.  This is why
+    /// the request path checks the sampler before it builds anything.
+    fn test_span() -> *mut BoxedSpan {
+        let trace_id = CString::new("0af7651916cd43dd8448eb211c80319c").unwrap();
+        let parent_id = CString::new("b7ad6b7169203331").unwrap();
+        let flags = CString::new("01").unwrap();
+
+        let parent = unsafe {
+            nxt_otel_parent_context(
+                trace_id.as_ptr(),
+                parent_id.as_ptr(),
+                flags.as_ptr(),
+                ptr::null(),
+            )
+        }
+        .expect("a valid parent context");
+
+        let tracer = BoxedTracer::new(Box::new(
+            opentelemetry::trace::noop::NoopTracer::new(),
+        ));
+        let span = nxt_otel_build_span(&tracer, &parent, SystemTime::now());
+
+        Box::into_raw(Box::new(span))
+    }
+
+    fn release_span(span: *mut BoxedSpan) {
+        unsafe { drop(Box::from_raw(span)) };
+    }
+
+    /// The value is an id into ATTR_VALUE_STRINGS, not a pointer.
+    fn static_attr(key_id: u32, value_id: i64) -> nxt_otel_attr_t {
+        nxt_otel_attr_t {
+            key_id,
+            r#type: NXT_OTEL_ATTR_TYPE_STATIC,
+            ival: value_id,
+            sval: nxt_str_t {
+                length: 0,
+                start: ptr::null(),
+            },
+        }
+    }
+
+    fn is_lower_hex(s: &str) -> bool {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+
+    #[test]
+    fn traceparent_costs_no_allocation() {
+        let span = test_span();
+        let mut buf = [0 as c_char; TRACEPARENT_HEADER_LEN as usize + 1];
+        let mut written = 0;
+
+        let n = allocations(|| {
+            written =
+                unsafe { nxt_otel_rs_copy_traceparent(buf.as_mut_ptr(), span) };
+        });
+
+        let s = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
+
+        // A no-op span carries the context it was built with, so the ids below
+        // are the ones this test passed in.  That still pins the whole format:
+        // the version, both dashes, the widths, and lowercase hex.  The span-id
+        // segment is asserted by shape only, because a real provider generates
+        // it; test/test_otel.py checks the live ids.
+        assert_eq!(written, TRACEPARENT_HEADER_LEN as usize);
+        assert_eq!(s.len(), TRACEPARENT_HEADER_LEN as usize);
+        assert_eq!(&s[0..3], "00-");
+        assert_eq!(&s[3..35], "0af7651916cd43dd8448eb211c80319c");
+        assert_eq!(s.as_bytes()[35], b'-');
+        assert!(is_lower_hex(&s[36..52]), "span id: {}", &s[36..52]);
+        assert_eq!(s.as_bytes()[52], b'-');
+        assert_eq!(&s[53..55], "01");
+
+        assert_eq!(n, 0, "writing the traceparent allocated {n} times");
+
+        release_span(span);
+    }
+
+    // Ids of nxt_otel_attr_id_t and nxt_otel_value_id_t in src/nxt_otel.h.
+    // c_enum_ids_match() checks each one against the C header.
+    const ATTR_SCHEME: u32 = 2;
+    const ATTR_FLAVOR: u32 = 3;
+    const ATTR_APP_TYPE: u32 = 8;
+    const VAL_SCHEME_HTTP: i64 = 0;
+    const VAL_VERSION_1_1: i64 = 3;
+    const VAL_APP_PHP: i64 = 5;
+
+    /// The members of a C enum in `src/nxt_otel.h`, in order.
+    fn c_enum_members(name: &str) -> Vec<String> {
+        let header = include_str!("../../nxt_otel.h");
+        let end = header
+            .find(&format!("}} {name};"))
+            .unwrap_or_else(|| panic!("{name} not found in nxt_otel.h"));
+        let start = header[..end].rfind("typedef enum {").unwrap()
+            + "typedef enum {".len();
+
+        header[start..end]
+            .split(',')
+            .map(|m| m.split('=').next().unwrap().trim().to_string())
+            .filter(|m| !m.is_empty())
+            .collect()
+    }
+
+    fn c_enum_id(name: &str, member: &str) -> usize {
+        c_enum_members(name)
+            .iter()
+            .position(|m| m == member)
+            .unwrap_or_else(|| panic!("{member} not found in {name}"))
+    }
+
+    #[test]
+    fn c_enum_ids_match() {
+        let vals = c_enum_members("nxt_otel_value_id_t");
+        let keys = c_enum_members("nxt_otel_attr_id_t");
+
+        // The last member is the count.
+        assert_eq!(vals.last().unwrap(), "NXT_OTEL_VAL_MAX");
+        assert_eq!(vals.len() - 1, NXT_OTEL_VALUE_MAX);
+        assert_eq!(keys.last().unwrap(), "NXT_OTEL_ATTR_MAX");
+        assert_eq!(keys.len() - 1, NXT_OTEL_ATTR_MAX);
+
+        let attr = |m| c_enum_id("nxt_otel_attr_id_t", m) as u32;
+        let val = |m| c_enum_id("nxt_otel_value_id_t", m) as i64;
+
+        assert_eq!(attr("NXT_OTEL_ATTR_SCHEME"), ATTR_SCHEME);
+        assert_eq!(attr("NXT_OTEL_ATTR_FLAVOR"), ATTR_FLAVOR);
+        assert_eq!(attr("NXT_OTEL_ATTR_APP_TYPE"), ATTR_APP_TYPE);
+        assert_eq!(val("NXT_OTEL_VAL_SCHEME_HTTP"), VAL_SCHEME_HTTP);
+        assert_eq!(val("NXT_OTEL_VAL_VERSION_1_1"), VAL_VERSION_1_1);
+        assert_eq!(val("NXT_OTEL_VAL_APP_PHP"), VAL_APP_PHP);
+    }
+
+    fn static_attrs() -> [nxt_otel_attr_t; 3] {
+        [
+            static_attr(ATTR_SCHEME, VAL_SCHEME_HTTP),
+            static_attr(ATTR_FLAVOR, VAL_VERSION_1_1),
+            static_attr(ATTR_APP_TYPE, VAL_APP_PHP),
+        ]
+    }
+
+    #[test]
+    fn static_attribute_values_cost_no_allocation() {
+        let span = test_span();
+        let attrs = static_attrs();
+        let mut set = 0;
+
+        let n = allocations(|| unsafe {
+            set = nxt_otel_rs_add_attrs(span, attrs.as_ptr(), attrs.len());
+        });
+
+        assert_eq!(set, attrs.len(), "set {set} of {} attributes", attrs.len());
+        assert_eq!(n, 0, "interned attribute values allocated {n} times");
+
+        release_span(span);
+    }
+
+    #[test]
+    fn static_attribute_values_map_to_their_text() {
+        let got: Vec<(String, String)> = static_attrs()
+            .iter()
+            .map(|a| {
+                let (k, v) =
+                    unsafe { attr_key_value(a) }.expect("attribute dropped");
+                (k.as_str().to_string(), v.as_str().into_owned())
+            })
+            .collect();
+
+        assert_eq!(
+            got,
+            [
+                ("url.scheme", "http"),
+                ("network.protocol.version", "1.1"),
+                ("unit.application.type", "php"),
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+    }
+
+    #[test]
+    fn unknown_static_value_id_is_dropped() {
+        for id in [-1, NXT_OTEL_VALUE_MAX as i64] {
+            let a = static_attr(ATTR_APP_TYPE, id);
+            assert!(
+                unsafe { attr_key_value(&a) }.is_none(),
+                "id {id} was kept"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_attribute_values_still_allocate() {
+        // The positive control for the two tests above: a value that has to be
+        // copied allocates, so a counter that quietly stopped working fails
+        // here rather than passing there.
+        let span = test_span();
+        let attrs = [nxt_otel_attr_t {
+            key_id: 0, // http.request.method
+            r#type: NXT_OTEL_ATTR_TYPE_STR,
+            ival: 0,
+            sval: nxt_str_t {
+                length: 3,
+                start: b"GET".as_ptr(),
+            },
+        }];
+
+        let n = allocations(|| unsafe {
+            nxt_otel_rs_add_attrs(span, attrs.as_ptr(), attrs.len());
+        });
+
+        assert!(n >= 1, "an owned attribute value did not allocate");
+
+        release_span(span);
     }
 }

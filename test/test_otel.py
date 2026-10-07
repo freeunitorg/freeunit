@@ -8,6 +8,7 @@ import time
 import pytest
 
 from conftest import run_process
+from unit.option import option
 from unit.applications.proto import ApplicationProto
 from unit.utils import waitforsocket
 
@@ -164,6 +165,41 @@ def _has_keyed_int_attr(body, key, value):
     return False
 
 
+def _otlp_str_value(value):
+    """Encode an OTLP AnyValue string_value as it appears on the wire.
+
+    string_value is field 1 of AnyValue with length-delimited wire type, so the
+    tag byte is (1 << 3) | 2 == 0x0a, followed by the length as a varint and the
+    bytes themselves.
+    """
+    out = bytearray(b'\x0a')
+    length = len(value)
+    while True:
+        byte = length & 0x7F
+        length >>= 7
+        out.append(byte | 0x80 if length else byte)
+        if not length:
+            break
+    out += value
+    return bytes(out)
+
+
+def _has_keyed_str_attr(body, key, value):
+    """Whether `key` is followed by a string_value attribute equal to `value`.
+
+    Same anchoring rule as _has_keyed_int_attr: the payload holds raw trace ids
+    and timestamps, so only the bytes just after an occurrence of the key make
+    this a statement about the attribute.
+    """
+    want = _otlp_str_value(value)
+    at = body.find(key)
+    while at != -1:
+        if want in body[at + len(key):at + len(key) + 16]:
+            return True
+        at = body.find(key, at + 1)
+    return False
+
+
 def _span_times(body, trace_id):
     """Return (start_unix_nano, end_unix_nano) of the first span in the dump
     whose trace id is `trace_id`.
@@ -286,6 +322,65 @@ def test_otel_span_exported_with_service_name(tmp_path, protocol):
         assert b'http.request.method' in body, 'span must carry semconv method attr'
         assert b'url.path' in body, 'span must carry semconv url.path attr'
         assert b'http.response.status_code' in body, 'span must carry status attr'
+
+        # url.scheme and network.protocol.version are constant per request, and
+        # now travel as ids into a Rust-side table (nxt_otel_value_id_t).  Assert
+        # the value beside its key, not the key alone: a mis-keyed id keeps the
+        # key and changes the text.
+        assert _has_keyed_str_attr(
+            body, b'url.scheme', b'http'
+        ), 'span must carry url.scheme=http'
+        assert _has_keyed_str_attr(
+            body, b'network.protocol.version', b'1.1'
+        ), 'span must carry network.protocol.version=1.1'
+    finally:
+        _kill(proc)
+
+
+@_skipif_no_fake_otlp
+@pytest.mark.parametrize('protocol', ['http', 'grpc'])
+def test_otel_span_application_type(tmp_path, protocol):
+    """A request that reaches an application records unit.application.type.
+
+    The value travels as a nxt_otel_value_id_t into ATTR_VALUE_STRINGS on the
+    Rust side.  The return-200 route of the other tests never sets it.
+    """
+    if not option.available['modules'].get('python'):
+        pytest.skip('no python module')
+
+    port = _get_free_port()
+    dump = str(tmp_path / 'otlp_dump.bin')
+    proc = _run_fake_otlp(port, requests=1, dump=dump, protocol=protocol)
+    try:
+        # Skips when unit was built without --otel.
+        _configure_or_skip(port, protocol=protocol)
+
+        app = f'{option.test_dir}/python/empty'
+        conf = _config(_valid_telemetry(port, protocol=protocol))
+        conf['routes'] = [{"action": {"pass": "applications/empty"}}]
+        conf['applications'] = {
+            "empty": {
+                "type": "python",
+                "processes": {"spare": 0},
+                "path": app,
+                "working_directory": app,
+                "module": "wsgi",
+            }
+        }
+        assert 'success' in client.conf(conf)
+
+        assert _get_until_header('traceparent')['status'] == 200
+
+        try:
+            proc.wait(timeout=EXPORT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            pytest.fail('fake_otlp did not receive an exported span')
+
+        with open(dump, 'rb') as f:
+            body = f.read()
+        assert _has_keyed_str_attr(
+            body, b'unit.application.type', b'python'
+        ), 'span must carry unit.application.type=python'
     finally:
         _kill(proc)
 
