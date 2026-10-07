@@ -769,16 +769,17 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
      * explicit token wins.  "named" records the enabled codings that the
      * field listed.  The wildcard does not stand for these codings.
      */
-    bool       identity_allowed = true;
-    bool       identity_named = false;
-    bool       identity_named_ok = false;
-    bool       wildcard_seen = false;
-    char       *str, *tkn, *tail, *cur;
-    double     weight = 0.0;
-    double     wildcard_qval = 0.0;
-    uint32_t   named = 0;
-    nxt_off_t  clen = nxt_http_comp_resp_length(r);
-    nxt_int_t  idx = NXT_HTTP_COMP_SCHEME_IDENTITY;
+    bool             identity_allowed = true;
+    bool             identity_named = false;
+    bool             identity_named_ok = false;
+    bool             wildcard_seen = false;
+    char             *str, *tkn, *tail, *cur;
+    double           weight = 0.0;
+    double           wildcard_qval = 0.0;
+    uint32_t         named = 0;
+    nxt_off_t        clen = nxt_http_comp_resp_length(r);
+    nxt_int_t        idx = NXT_HTTP_COMP_SCHEME_IDENTITY;
+    const nxt_str_t  *identity;
 
     *identity_refused = false;
 
@@ -816,13 +817,14 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
     }
     *tail = '\0';
 
+    identity = &nxt_http_comp_compressors[NXT_HTTP_COMP_SCHEME_IDENTITY].token;
+
     while ((tkn = strsep(&str, ","))) {
-        bool                        wildcard;
-        char                        *qptr;
-        double                      qval = 1.0;
-        nxt_str_t                   enc;
-        nxt_uint_t                  ecidx;
-        const nxt_http_comp_type_t  *identity;
+        bool        wildcard;
+        char        *qptr;
+        double      qval = 1.0;
+        nxt_str_t   enc;
+        nxt_uint_t  ecidx;
 
         qptr = nxt_http_comp_find_weight(tkn);
         if (qptr != NULL && !nxt_http_comp_parse_weight(qptr + 3, &qval)) {
@@ -859,9 +861,7 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
          * identity is all the server can offer.  Read it before the lookup.
          */
 
-        identity = &nxt_http_comp_compressors[NXT_HTTP_COMP_SCHEME_IDENTITY];
-
-        if (nxt_strcasestr_eq(&enc, &identity->token)) {
+        if (nxt_strcasestr_eq(&enc, identity)) {
             ecidx = NXT_HTTP_COMP_SCHEME_IDENTITY;
             identity_named = true;
             identity_named_ok = (qval != 0.0);
