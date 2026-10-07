@@ -277,6 +277,13 @@ jobs:
           ldd build/sbin/unitd \
             | grep -qE '=> /opt/openssl-3\.5/lib[0-9]*/libcrypto\.so\.3 '
 
+      # The crate's unit tests count the allocations of the per-request span
+      # attribute and traceparent path, and assert the traceparent format.
+      # Nothing else runs them.  --release reuses the dependencies "Make unit"
+      # built in this job: the default test profile would rebuild all of them.
+      - name: Run the otel crate unit tests
+        run: cargo test --release --locked --manifest-path src/otel/Cargo.toml
+
       # The default target is `all: unitd manpage`, so --tests above only
       # makes this target available -- it does not build it.  Without it
       # build/unit_app_test does not exist and test_app_lifecycle.py's

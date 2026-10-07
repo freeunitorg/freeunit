@@ -41,9 +41,38 @@ typedef enum {
 } nxt_otel_attr_id_t;
 
 
+/*
+ * Attribute values Unit knows at compile time, by id rather than by pointer.
+ *
+ * The text lives on the Rust side in ATTR_VALUE_STRINGS, so a constant value
+ * costs no allocation: building a Value::String from owned text is the only
+ * allocation left in the attribute path.  The order of this enum and of that
+ * table is the contract between the two sides, exactly as nxt_otel_attr_id_t
+ * is with ATTR_KEYS: add to the end, and add to ATTR_VALUE_STRINGS in
+ * src/otel/src/lib.rs in the same commit.
+ */
+typedef enum {
+    NXT_OTEL_VAL_SCHEME_HTTP = 0,
+    NXT_OTEL_VAL_SCHEME_HTTPS,
+    NXT_OTEL_VAL_VERSION_1_0,
+    NXT_OTEL_VAL_VERSION_1_1,
+    NXT_OTEL_VAL_APP_PYTHON,
+    NXT_OTEL_VAL_APP_PHP,
+    NXT_OTEL_VAL_APP_PERL,
+    NXT_OTEL_VAL_APP_RUBY,
+    NXT_OTEL_VAL_APP_JAVA,
+    NXT_OTEL_VAL_APP_WASM,
+    NXT_OTEL_VAL_APP_EXTERNAL,
+    NXT_OTEL_VAL_APP_UNKNOWN,
+    NXT_OTEL_VAL_MAX
+} nxt_otel_value_id_t;
+
+
 /* Which member of nxt_otel_attr_t carries the value. */
-#define NXT_OTEL_ATTR_TYPE_STR  0
-#define NXT_OTEL_ATTR_TYPE_I64  1
+#define NXT_OTEL_ATTR_TYPE_STR     0
+#define NXT_OTEL_ATTR_TYPE_I64     1
+/* The value is a nxt_otel_value_id_t in ival. */
+#define NXT_OTEL_ATTR_TYPE_STATIC  2
 
 
 /*
@@ -106,8 +135,17 @@ extern void nxt_otel_rs_init(
     void (*log_callback)(nxt_uint_t log_level, const char *log_string),
     const nxt_str_t *endpoint, const nxt_str_t *protocol,
     double sample_fraction, double batch_size);
-extern void nxt_otel_rs_copy_traceparent(u_char *buffer, void *span);
-extern void nxt_otel_rs_add_attrs(void *trace,
+
+/* "00-" trace-id "-" span-id "-" flags, without the NUL. */
+#define NXT_OTEL_TRACEPARENT_LEN  55
+
+/*
+ * Write the span's own context as a W3C traceparent into buffer, which must
+ * hold NXT_OTEL_TRACEPARENT_LEN + 1 bytes, and return its length in bytes
+ * without the terminating NUL.  The value is always that fixed length.
+ */
+extern size_t nxt_otel_rs_copy_traceparent(u_char *buffer, void *span);
+extern size_t nxt_otel_rs_add_attrs(void *trace,
     const nxt_otel_attr_t *attrs, size_t n);
 extern void nxt_otel_rs_set_error(void *trace);
 extern uint8_t nxt_otel_rs_is_recording(void *trace);
