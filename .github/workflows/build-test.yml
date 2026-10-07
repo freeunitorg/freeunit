@@ -34,9 +34,10 @@ env:
   # https://github.com/openssl/openssl/releases/tag/openssl-3.5.9 and the
   # .sha256 file next to the tarball on openssl.org.  Bump both together.
   OPENSSL_SHA256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
-  # OpenSSL 4.0 for the openssl4 leg below.  No distribution ships 4.0 yet, so
-  # like the 3.5 slot it is built from source; the /opt/openssl-4.0 slot is
-  # stable across patch bumps.
+  # OpenSSL 4.0 for the openssl4 leg below.  Ubuntu does not ship 4.0 (Fedora 45
+  # does, see hardening-strict-fedora), so this leg builds it from source for
+  # the runner's toolchain and -DOPENSSL_NO_DEPRECATED.  The /opt/openssl-4.0
+  # slot is stable across patch bumps.
   OPENSSL4_VERSION: 4.0.3
   # SHA256 of openssl-${OPENSSL4_VERSION}.tar.gz, from
   # https://github.com/openssl/openssl/releases/tag/openssl-4.0.3.
@@ -1330,3 +1331,142 @@ jobs:
 
       - name: Run C tests
         run: sudo ./build/tests
+
+  # The same strict build with the newest gcc and clang: gcc 16.2.1 and clang
+  # 23.1.2 in a Fedora 45 container, which also brings OpenSSL 4.0.3.  The job
+  # above uses the runner's gcc 13.3 and clang 18.1.  Each new compiler adds
+  # warnings to -Wall and -Wextra, and -Werror makes each one a failure; the
+  # weekly rawhide job sees them up to 7 days later and does not run
+  # build/tests.  This job runs it, so a new optimizer meets the tests in the
+  # pull request.  The container runs as root, so there is no sudo, and its
+  # default capabilities are enough for build/tests.
+  hardening-strict-fedora:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+
+    container:
+      image: fedora:45
+
+    steps:
+      # git before checkout: without it actions/checkout downloads the tree
+      # through the REST API.  auto/cc/test needs which.  binutils and
+      # diffutils give check-test-hooks.sh nm, objcopy and cmp.
+      - name: Install packages
+        run: |
+          dnf -y install --setopt=install_weak_deps=False \
+              git gcc make which binutils diffutils findutils \
+              openssl-devel pcre2-devel
+          if [ "${{ matrix.cc }}" = clang ]; then
+            dnf -y install --setopt=install_weak_deps=False clang
+          fi
+
+      - uses: actions/checkout@v7
+
+      - name: Configure unit (--hardening=strict --tests --openssl)
+        run: |
+          ./configure \
+            --cc=${{ matrix.cc }} \
+            --hardening=strict \
+            --tests \
+            --openssl 2>&1 | tee configure.log
+          test "${PIPESTATUS[0]}" -eq 0
+
+      # The same flags as in hardening-strict.
+      - name: Assert configure found the hardening flags
+        run: |
+          grep -q 'hardening: .* strict$' configure.log
+          for flag in -fstack-protector-strong -fstack-clash-protection \
+                      -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack \
+                      -Wformat=2 -Wvla -Wimplicit-fallthrough \
+                      -ftrivial-auto-var-init=pattern
+          do
+            grep -q "checking for $flag \.\.\. found" configure.log \
+              || { echo "$flag was not found"; exit 1; }
+          done
+          grep -q 'checking for -D_FORTIFY_SOURCE=[23] \.\.\. found' \
+            configure.log \
+            || { echo "_FORTIFY_SOURCE was not found"; exit 1; }
+          grep -q 'define NXT_HAVE_BUILTIN_OVERFLOW' \
+            build/include/nxt_auto_config.h
+
+      - name: Build unitd and libunit
+        run: |
+          make -j4
+          make -j4 build/lib/libunit.a
+
+      - name: Build C tests
+        run: make -j4 tests
+
+      - name: Check the test hooks are in the test programs only
+        run: .github/scripts/check-test-hooks.sh
+
+      - name: Run C tests
+        run: ./build/tests
+
+      - name: Run libunit close-provenance test
+        run: ./build/unit_close_test
+
+      - name: Run libunit port_recv fd-ownership test
+        run: ./build/unit_port_recv_test
+
+      - name: Run libunit malformed port message test
+        run: ./build/unit_msg_test
+
+  # The oldest toolchain that the packages target.  pkg/rpm/Makefile builds
+  # for centos8 (RHEL 8), and AlmaLinux 8 ships the same gcc 8.5.0, OpenSSL
+  # 1.1.1k and PCRE2 10.32.  auto/ssltls requires OpenSSL 1.1.1 or later, and
+  # no other job builds against 1.1.1.  Default flags, as a package build
+  # uses.  The container runs as root, so there is no sudo.
+  c-tests-almalinux8:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    container:
+      image: almalinux:8
+
+    steps:
+      - name: Install packages
+        run: |
+          dnf -y install --setopt=install_weak_deps=False \
+              git gcc make which binutils diffutils findutils \
+              openssl-devel pcre2-devel
+
+      - uses: actions/checkout@v7
+
+      - name: Configure unit (--openssl --tests)
+        run: ./configure --openssl --tests
+
+      # Fail if configure found another OpenSSL than the 1.1.1 floor.
+      - name: Assert configure found OpenSSL 1.1.1
+        run: |
+          grep NXT_HAVE_OPENSSL_VERSION build/include/nxt_auto_config.h
+          grep -q '#define NXT_HAVE_OPENSSL_VERSION  "OpenSSL 1\.1\.1' \
+            build/include/nxt_auto_config.h
+
+      - name: Build unitd and libunit
+        run: |
+          make -j4
+          make -j4 build/lib/libunit.a
+
+      - name: Build C tests
+        run: make -j4 tests
+
+      - name: Check the test hooks are in the test programs only
+        run: .github/scripts/check-test-hooks.sh
+
+      - name: Run C tests
+        run: ./build/tests
+
+      - name: Run libunit close-provenance test
+        run: ./build/unit_close_test
+
+      - name: Run libunit port_recv fd-ownership test
+        run: ./build/unit_port_recv_test
+
+      - name: Run libunit malformed port message test
+        run: ./build/unit_msg_test
