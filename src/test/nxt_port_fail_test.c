@@ -318,6 +318,9 @@ nxt_port_fail_test_inline_drop(nxt_thread_t *thr)
     nxt_port_queue_t       *queue;
     nxt_event_interface_t  stub;
     u_char                 block[4096];
+#if (NXT_MACOSX)
+    nxt_err_t              err;
+#endif
 
     task = thr->task;
     task->thread = thr;
@@ -398,9 +401,34 @@ nxt_port_fail_test_inline_drop(nxt_thread_t *thr)
 
     nxt_memzero(block, sizeof(block));
 
-    while (send(pair[1], block, sizeof(block), 0) > 0) {
-        /* void */
+    for ( ;; ) {
+        n = send(pair[1], block, sizeof(block), 0);
+
+        if (n <= 0) {
+#if (NXT_MACOSX)
+            /* The errno of the send() that ended the fill. */
+            err = nxt_errno;
+#endif
+            break;
+        }
     }
+
+#if (NXT_MACOSX)
+    /*
+     * On macOS the fill stops with ENOBUFS, not EAGAIN.  A smaller message
+     * can still fit then, and a full socket that answers ENOBUFS takes the
+     * retry timer path.  This fixture has no timers, so the case runs only
+     * where the fill stops with EAGAIN.
+     */
+
+    if (err != EAGAIN) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port failure test: inline drop case skipped, "
+                      "the fill stopped with errno %d, not EAGAIN", err);
+        ret = NXT_OK;
+        goto done;
+    }
+#endif
 
     port->socket.write_ready = 1;
     port->socket.write = NXT_EVENT_INACTIVE;
@@ -2250,6 +2278,8 @@ done:
     thr->engine = &current;
 
     nxt_work_queue_cache_destroy(&current.work_queue_cache);
+
+    thr->engine = NULL;
 
     return ret;
 }

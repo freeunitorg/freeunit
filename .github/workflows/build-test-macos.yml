@@ -1,0 +1,83 @@
+name: "Build & Test (macOS)"
+
+on:
+  pull_request:
+    paths:
+      - configure
+      - 'auto/**'
+      - 'src/**'
+      - '.github/workflows/build-test-macos.yml'
+  push:
+    branches: master
+    paths:
+      - configure
+      - 'auto/**'
+      - 'src/**'
+      - '.github/workflows/build-test-macos.yml'
+
+concurrency:
+  # Same grouping as build-test.yml: cancel superseded PR runs, never group
+  # pushes.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # The C test programs on arm64 macOS, which has 16 KiB pages (issue 595,
+  # https://github.com/freeunitorg/freeunit/issues/595).  macos-15 is pinned
+  # so that an image change is a deliberate commit.  No modules, no pytest,
+  # no sudo.
+  c-tests-macos:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    env:
+      # The default macOS TMPDIR is long; a unix socket path under it can
+      # pass the 104-byte sun_path limit.
+      TMPDIR: /tmp
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Setup block: packages and the Homebrew paths.  Keep it together so it
+      # can become a composite action with a Brewfile later.
+      - name: Install packages
+        run: brew install make openssl@3 pcre2
+
+      - name: Show the machine and the page size
+        run: |
+          uname -m
+          sysctl hw.pagesize
+
+      # auto/ssltls probes plain -lssl, and macOS has no OpenSSL headers, so
+      # the Homebrew paths go in by hand.  rpath, not DYLD_LIBRARY_PATH: SIP
+      # strips DYLD_* from the environment of /bin/sh.
+      - name: Configure unit (--tests --openssl)
+        run: |
+          OSSL="$(brew --prefix openssl@3)"
+          PCRE="$(brew --prefix pcre2)"
+          ./configure --tests --openssl \
+            --cc-opt="-I${OSSL}/include -I${PCRE}/include" \
+            --ld-opt="-L${OSSL}/lib -Wl,-rpath,${OSSL}/lib -L${PCRE}/lib -Wl,-rpath,${PCRE}/lib"
+      # End of the setup block.
+
+      - name: Build unitd and libunit
+        run: |
+          gmake -j3
+          gmake -j3 build/lib/libunit.a
+
+      - name: Build C tests
+        run: gmake -j3 tests
+
+      - name: Run C tests
+        run: ./build/tests
+
+      # The segment table sends a real shm object of PORT_MMAP_SIZE bytes.
+      # Here fstat() reports it rounded up to a 16 KiB page.
+      - name: Run libunit malformed port message test
+        run: ./build/unit_msg_test
+
+      - name: Run libunit close-provenance test
+        run: ./build/unit_close_test
+
+      - name: Run libunit port_recv fd-ownership test
+        run: ./build/unit_port_recv_test

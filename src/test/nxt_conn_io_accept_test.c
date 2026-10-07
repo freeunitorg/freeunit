@@ -25,6 +25,8 @@
 #include "nxt_tests.h"
 
 
+#if (NXT_LINUX)
+
 static void
 nxt_conn_io_accept_test_handler(nxt_task_t *task, void *obj, void *data)
 {
@@ -43,6 +45,8 @@ nxt_conn_io_accept_test_disable_read(nxt_event_engine_t *engine,
 {
     ev->read = NXT_EVENT_INACTIVE;
 }
+
+#endif
 
 
 nxt_int_t

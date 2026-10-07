@@ -616,6 +616,30 @@ nxt_port_queued_fd_test_bounded(nxt_thread_t *thr)
         goto done;
     }
 
+#if (NXT_MACOSX)
+    {
+        int  size;
+
+        /*
+         * On macOS a full datagram socket answers ENOBUFS, which arms the
+         * retry timer.  This fixture has no timers, so give the peer room
+         * for every message.
+         */
+
+        size = 256 * 1024;
+
+        if (nxt_slow_path(setsockopt(pair[0], SOL_SOCKET, SO_RCVBUF, &size,
+                                     sizeof(size))
+                          == -1))
+        {
+            nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                          "port queued fd test: SO_RCVBUF failed %E",
+                          nxt_errno);
+            goto done;
+        }
+    }
+#endif
+
     port->pair[0] = pair[0];
     port->pair[1] = pair[1];
 

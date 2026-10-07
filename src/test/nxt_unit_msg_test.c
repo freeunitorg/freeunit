@@ -592,6 +592,16 @@ nxt_unit_msg_test_dup_id_case(void *data)
 
     after = nxt_unit_msg_test_count_maps();
 
+#if !(NXT_LINUX)
+    if (before < 0) {
+        /* No /proc/self/maps, for example on macOS. */
+        printf("unit msg test: mapping count skipped, "
+               "no /proc/self/maps\n");
+        before = 0;
+        after = 0;
+    }
+#endif
+
     if (before < 0 || after != before) {
         printf("unit msg test: %d segment mappings, was %d\n", after, before);
         return 2;
