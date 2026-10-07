@@ -93,6 +93,19 @@ is still loaded, with a warning, and the application gets a limit of
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a PHP target with "script" ran in a stale working directory after the
+directory of the script was replaced.  The module changed the directory only
+when a request came for another target.  When a new tree was renamed into
+place while unitd ran, the script was opened from the new tree, but relative
+includes and file reads used the old tree.  Deploys that rename a release
+directory into place were affected.  The directory is now set on every
+request, as for targets with "root" only.  This costs one chdir() call per
+request.  The bug had appeared in 1.16.0.
+</para>
+</change>
+
 </changes>
 
 

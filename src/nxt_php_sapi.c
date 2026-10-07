@@ -378,7 +378,6 @@ NXT_EXPORT nxt_app_module_t  nxt_app_module = {
 
 static nxt_php_target_t  *nxt_php_targets;
 static nxt_uint_t        nxt_php_targets_count;
-static nxt_int_t         nxt_php_last_target = -1;
 
 static nxt_unit_ctx_t    *nxt_php_unit_ctx;
 
@@ -1131,12 +1130,14 @@ nxt_php_request_handler(nxt_unit_request_info_t *req)
     ctx.script_dirname = target->script_dirname;
     ctx.script_name = target->script_name;
 
-    ctx.chdir = (app_target != nxt_php_last_target);
+    /*
+     * The script path was resolved when the configuration was loaded.
+     * A directory on it can be renamed or replaced while the process
+     * runs, so the working directory is set on every request.
+     */
+    ctx.chdir = 1;
 
     nxt_php_execute(&ctx, r);
-
-    /* nxt_php_execute() ended the request; r points to released memory. */
-    nxt_php_last_target = ctx.chdir ? -1 : app_target;
 }
 
 
@@ -1238,8 +1239,6 @@ nxt_php_dynamic_request(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
 
     nxt_free(ctx->script_filename.start);
     nxt_free(ctx->script_dirname.start);
-
-    nxt_php_last_target = -1;
 }
 
 
