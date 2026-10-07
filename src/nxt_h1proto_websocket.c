@@ -38,7 +38,6 @@ static void nxt_h1p_conn_ws_pong_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_buf_t *out);
 static void nxt_h1p_conn_ws_pong_sent(nxt_task_t *task, void *obj,
     void *data);
-static size_t nxt_h1p_ws_utf8_seqlen(u_char c);
 static nxt_int_t nxt_h1p_ws_utf8_begin(const u_char *seq, size_t n);
 static nxt_int_t nxt_h1p_ws_utf8_validate(nxt_h1p_ws_utf8_t *state,
     nxt_buf_t *b, u_char *start, size_t skip, size_t length,
@@ -441,28 +440,6 @@ nxt_h1p_conn_ws_keepalive_enable(nxt_task_t *task, nxt_h1proto_t *h1p)
 
 
 /*
- * Returns the length of the UTF-8 sequence a lead byte announces, or 0 when
- * the byte cannot begin one.  C0 and C1 have only overlong two-byte
- * encodings and F5..FF are beyond U+10FFFF, so neither can lead a sequence
- * (RFC 3629 Section 3).  Shortest form, surrogates, and the byte ranges that
- * apply only after E0, ED, F0 and F4 are left to nxt_utf8_decode().
- */
-static size_t
-nxt_h1p_ws_utf8_seqlen(u_char c)
-{
-    if (c >= 0xF0) {
-        return (c <= 0xF4) ? 4 : 0;
-    }
-
-    if (c >= 0xE0) {
-        return 3;
-    }
-
-    return (c >= 0xC2) ? 2 : 0;
-}
-
-
-/*
  * Decides whether the "n" bytes at "seq", the whole or the beginning of one
  * UTF-8 sequence, can be a valid character: NXT_OK when they already are,
  * NXT_AGAIN when a continuation is still needed, NXT_ERROR when no byte
@@ -477,11 +454,29 @@ nxt_h1p_ws_utf8_seqlen(u_char c)
 static nxt_int_t
 nxt_h1p_ws_utf8_begin(const u_char *seq, size_t n)
 {
-    u_char         buf[4];
+    u_char         buf[4], c;
     size_t         len;
     const u_char  *p;
 
-    len = nxt_h1p_ws_utf8_seqlen(seq[0]);
+    /*
+     * Length of the UTF-8 sequence the lead byte announces, or 0 when
+     * the byte cannot begin one.  C0 and C1 have only overlong two-byte
+     * encodings and F5..FF are beyond U+10FFFF, so neither can lead a
+     * sequence (RFC 3629 Section 3).  Shortest form, surrogates, and the
+     * byte ranges that apply only after E0, ED, F0 and F4 are left to
+     * nxt_utf8_decode().
+     */
+    c = seq[0];
+
+    if (c >= 0xF0) {
+        len = (c <= 0xF4) ? 4 : 0;
+
+    } else if (c >= 0xE0) {
+        len = 3;
+
+    } else {
+        len = (c >= 0xC2) ? 2 : 0;
+    }
 
     if (nxt_slow_path(len == 0)) {
         return NXT_ERROR;
