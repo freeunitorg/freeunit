@@ -276,3 +276,24 @@ case "$NXT_SYSTEM" in
         NXT_LIBS="$NXT_LIBRT $NXT_LIBDL $NXT_PTHREAD"
     ;;
 esac
+
+
+# "ar -D" stores zero time stamps, user IDs and group IDs in the archive,
+# so the same objects give the same library.  Not every ar has it.
+
+case "$NXT_STATIC_LINK" in
+    '$(AR) -r -c')
+        echo 'int nxt_ar_test;' > $NXT_AUTOTEST.c
+
+        if /bin/sh -c "($CC $NXT_CFLAGS -c -o $NXT_AUTOTEST.o \
+                        $NXT_AUTOTEST.c && rm -f $NXT_AUTOTEST.a \
+                        && $AR -r -c -D $NXT_AUTOTEST.a $NXT_AUTOTEST.o)" \
+            >> $NXT_AUTOCONF_ERR 2>&1
+        then
+            NXT_STATIC_LINK="\$(AR) -r -c -D"
+            $echo " + using ar -D"
+        fi
+
+        rm -f $NXT_AUTOTEST.c $NXT_AUTOTEST.o $NXT_AUTOTEST.a
+    ;;
+esac

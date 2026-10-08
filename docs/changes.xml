@@ -10,6 +10,31 @@
          date="2026-10-04" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="change">
+<para>
+the build directory is no longer stored in unitd and in the static libraries.
+Two builds of the same tree in different directories now give identical
+binaries.
+</para>
+</change>
+
+<change type="change">
+<para>
+the deb and rpm source tarballs now hold only tracked files, with sorted
+names, fixed owners and a fixed time.  RPM packages built with rpm 4.14 or
+later have a fixed build time and build host.
+</para>
+</change>
+
+<change type="change">
+<para>
+the OpenTelemetry library, the WebAssembly component module and unitctl are
+built with "--locked", and the cargo and source paths are remapped out of the
+binaries.  Java module jars get fixed entry times when SOURCE_DATE_EPOCH is
+set.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 the control API accepted a listener with neither "pass" nor "application",

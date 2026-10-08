@@ -42,7 +42,11 @@ else
 	TARGETS       := $(DEFAULT_TARGET)
 endif
 
-RELEASE_BUILD_FLAGS ?= --quiet --release --bin $(OUTPUT_BINARY)
+RELEASE_BUILD_FLAGS ?= --quiet --release --locked --bin $(OUTPUT_BINARY)
+
+# Keep the caller's RUSTFLAGS.  Remap the source and cargo paths so that the
+# binary does not carry the build directory.
+RUST_REMAP = RUSTFLAGS="$(strip $(RUSTFLAGS) --remap-path-prefix=$(CURDIR)=. --remap-path-prefix=$(or $(CARGO_HOME),$(HOME)/.cargo)=/cargo)"
 
 # The musl artifact is built without the "tls" feature.  TLS pulls in
 # aws-lc-sys, a C library built by cmake, and that is the only thing making
@@ -82,7 +86,7 @@ all: $(TARGETS) ## Build all available platform targets [see: list-targets]
 $(TARGETS): openapi-generate
 	$Q if [ ! -f "$(CURDIR)/target/$(@)/release/$(OUTPUT_BINARY)" ]; then
 		echo "$(M) building $(OUTPUT_BINARY) with flags [$(RELEASE_BUILD_FLAGS) $(call target_feature_flags,$@) --target $(@)]"
-		$(CARGO) build $(RELEASE_BUILD_FLAGS) $(call target_feature_flags,$@) --target $@
+		$(RUST_REMAP) $(CARGO) build $(RELEASE_BUILD_FLAGS) $(call target_feature_flags,$@) --target $@
 	fi
 
 target target/debug:
@@ -100,7 +104,7 @@ release: target/release/$(OUTPUT_BINARY)
 
 target/release/$(OUTPUT_BINARY): openapi-generate
 	$Q echo "$(M) building $(OUTPUT_BINARY) in release mode for the current platform"
-	$Q $(CARGO) build $(RELEASE_BUILD_FLAGS) $(HOST_FEATURE_FLAGS)
+	$Q $(RUST_REMAP) $(CARGO) build $(RELEASE_BUILD_FLAGS) $(HOST_FEATURE_FLAGS)
 
 .PHONY: test
 test: openapi-generate ## Run tests

@@ -206,10 +206,14 @@ else
 endif
 
 rpmbuild/SOURCES/unit-$(VERSION).tar.gz:
-	cd ../.. && tar -czf pkg/rpm/rpmbuild/SOURCES/unit-$(VERSION).tar.gz \
-		--transform "s#^#unit-$(VERSION)/#" \
-		LICENSE NOTICE CHANGES README.md CONTRIBUTING.md configure auto src \
-		test tools version go pkg/contrib docs/man/man8/unitd.8.in
+	cd ../.. && \
+	files="LICENSE NOTICE CHANGES README.md CONTRIBUTING.md configure auto src \
+		test tools version go pkg/contrib docs/man/man8/unitd.8.in" && \
+	epoch=$${SOURCE_DATE_EPOCH:-`git log -1 --format=%ct 2>/dev/null || echo 0`} && \
+	( git ls-files -z -- $$files 2>/dev/null || find $$files ! -type d -print0 ) | \
+	tar --null -T - --sort=name --mtime=@$$epoch --owner=0 --group=0 \
+		--numeric-owner --mode=go+r,go-w --transform "s#^#unit-$(VERSION)/#" -cf - | \
+	gzip -n > pkg/rpm/rpmbuild/SOURCES/unit-$(VERSION).tar.gz
 
 unit: check-build-depends-unit rpmbuild/SPECS/unit.spec rpmbuild/SOURCES/unit-$(VERSION).tar.gz
 	@echo "===> Building $@ package" ; \

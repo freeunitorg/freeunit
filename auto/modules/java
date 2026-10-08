@@ -207,6 +207,11 @@ if [ $nxt_found = no ]; then
 fi
 
 NXT_JAVA_VERSION=`$NXT_JAVAC -version 2>&1`
+
+nxt_jar_has_date=no
+if "$NXT_JAVA_HOME/bin/jar" --help 2>&1 | grep -q -e '--date'; then
+    nxt_jar_has_date=yes
+fi
 NXT_JAVA_VERSION=${NXT_JAVA_VERSION#javac }
 NXT_JAVA_INCLUDE="$NXT_JAVA_INCLUDE -I$NXT_BUILD_DIR/$NXT_JAVA_MODULE -DNXT_JAVA_VERSION=$NXT_JAVA_VERSION"
 
@@ -562,6 +567,31 @@ if ! grep ^$NXT_BUILD_DIR/$NXT_UNIT_JAR: $NXT_MAKEFILE 2>&1 > /dev/null; then
 
 NXT_JAVA_SRCS = $NXT_JAVA_SRCS
 
+NXT_JAR_HAS_DATE = $nxt_jar_has_date
+
+# With SOURCE_DATE_EPOCH set, pack a sorted file list with fixed times.
+# Without it, keep the old behaviour. Argument 1 is the class tree.
+define NXT_JAR_PACK
+(set -e; d=$NXT_BUILD_DIR/$NXT_JAVA_MODULE; \\
+if [ -z "\$\$SOURCE_DATE_EPOCH" ]; then \\
+    exec $NXT_JAVA_HOME/bin/jar c -C \$\$d META-INF -C \$\$d \$(1); \\
+fi; \\
+export LC_ALL=C; \\
+iso=\$\$(date -u -d @\$\$SOURCE_DATE_EPOCH +%Y-%m-%dT%H:%M:%S+00:00); \\
+dir=\$(1); \\
+list=\$\$(cd \$\$d && find META-INF \$\$dir -type f | sort); \\
+args=; \\
+if [ "$nxt_jar_has_date" = yes ]; then \\
+    datearg="--date=\$\$iso"; \\
+else \\
+    datearg=; \\
+    (cd \$\$d && touch -d @\$\$SOURCE_DATE_EPOCH \$\$list); \\
+fi; \\
+for f in \$\$list; do args="\$\$args -C \$\$d \$\$f"; done; \\
+exec $NXT_JAVA_HOME/bin/jar --create \$\$datearg \$\$args)
+endef
+
+
 $NXT_BUILD_DIR/$NXT_JAVA_MODULE/.nginx.unit.classes: \$(NXT_JAVA_SRCS) \\
     $NXT_BUILD_DIR/$NXT_WS_API_JAR
 	rm -rf $NXT_BUILD_DIR/$NXT_JAVA_MODULE/nginx/unit
@@ -582,8 +612,7 @@ $NXT_BUILD_DIR/$NXT_UNIT_JAR: \\
     $NXT_BUILD_DIR/$NXT_JAVA_MODULE/.nginx.unit.classes \\
     $NXT_BUILD_DIR/$NXT_JAVA_MODULE/META-INF/LICENSE \\
     $NXT_BUILD_DIR/$NXT_JAVA_MODULE/META-INF/NOTICE
-	$NXT_JAVA_HOME/bin/jar c -C $NXT_BUILD_DIR/$NXT_JAVA_MODULE META-INF \\
-		-C $NXT_BUILD_DIR/$NXT_JAVA_MODULE nginx/unit > \$@
+	\$(call NXT_JAR_PACK,nginx/unit) > \$@
 
 NXT_JAVA_WS_API_SRCS = $NXT_JAVA_WS_API_SRCS
 
@@ -597,8 +626,7 @@ $NXT_BUILD_DIR/$NXT_WS_API_JAR: \\
     $NXT_BUILD_DIR/$NXT_JAVA_MODULE/.javax.websocket.classes \\
     $NXT_BUILD_DIR/$NXT_JAVA_MODULE/META-INF/LICENSE \\
     $NXT_BUILD_DIR/$NXT_JAVA_MODULE/META-INF/NOTICE
-	$NXT_JAVA_HOME/bin/jar c -C $NXT_BUILD_DIR/$NXT_JAVA_MODULE META-INF \\
-		-C $NXT_BUILD_DIR/$NXT_JAVA_MODULE javax/websocket > \$@
+	\$(call NXT_JAR_PACK,javax/websocket) > \$@
 
 END
 

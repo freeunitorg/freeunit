@@ -1,6 +1,23 @@
 
 Changes with FreeUnit 1.37.1                                     04 Oct 2026
 
+    *) Change: the build directory is no longer stored in unitd and in
+       the static libraries. configure adds -ffile-prefix-map when the
+       compiler supports it, and "ar -D" when ar supports it. Two builds
+       of the same tree in different directories now give identical
+       unitd, libunit.a and libnxt.a. The "configured as" line no longer
+       shows path map flags passed with "--cc-opt".
+
+    *) Change: the deb and rpm source tarballs now hold only tracked
+       files, with sorted names, fixed owners and a fixed time. RPM
+       packages built with rpm 4.14 or later have a fixed build time and
+       build host.
+
+    *) Change: the OpenTelemetry library, the WebAssembly component
+       module and unitctl are built with "--locked", and the cargo and
+       source paths are remapped out of the binaries. Java module jars
+       get fixed entry times when SOURCE_DATE_EPOCH is set.
+
     *) Bugfix: the control API accepted a listener with neither "pass" nor
        "application". The router then refused the configuration, and the
        client got 500 "Failed to apply new configuration." with only
