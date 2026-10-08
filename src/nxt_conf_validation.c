@@ -4045,9 +4045,11 @@ nxt_conf_vldt_app_limits(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
  * segment.
  *
  * The number is compared as a double: a conversion of a number out of range
- * to an integer type is undefined.  A negative number is not checked here.
+ * to an integer type is undefined.  A negative number is refused too:
+ * nxt_conf_map_object() converts it to ssize_t, so -1 is stored in the
+ * size_t field as SIZE_MAX.
  *
- * A stored configuration with a larger number is still loaded, with a
+ * A stored configuration with such a number is still loaded, with a
  * warning.  Else unitd would start with no configuration at all.
  * nxt_main_start_process_handler() gives such an application UINT32_MAX.
  */
@@ -4055,7 +4057,7 @@ nxt_conf_vldt_app_limits(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
 static nxt_int_t
 nxt_conf_vldt_app_shm(nxt_conf_validation_t *vldt, nxt_conf_value_t *value)
 {
-    nxt_str_t             pointer;
+    double                num;
     nxt_conf_value_t      *shm;
     nxt_conf_vldt_path_t  seg;
 
@@ -4063,11 +4065,23 @@ nxt_conf_vldt_app_shm(nxt_conf_validation_t *vldt, nxt_conf_value_t *value)
 
     shm = nxt_conf_get_object_member(value, &shm_str, NULL);
 
-    if (shm == NULL || nxt_conf_get_number(shm) <= (double) UINT32_MAX) {
+    if (shm == NULL) {
+        return NXT_OK;
+    }
+
+    num = nxt_conf_get_number(shm);
+
+    if (num >= 0 && num <= (double) UINT32_MAX) {
         return NXT_OK;
     }
 
     if (!vldt->restored) {
+        if (num < 0) {
+            return nxt_conf_vldt_member_error(vldt, &shm_str,
+                                              "The \"shm\" number must not "
+                                              "be negative.");
+        }
+
         return nxt_conf_vldt_member_error(vldt, &shm_str,
                                           "The \"shm\" number must not "
                                           "exceed %uD.", (uint32_t) UINT32_MAX);
@@ -4077,18 +4091,11 @@ nxt_conf_vldt_app_shm(nxt_conf_validation_t *vldt, nxt_conf_value_t *value)
     seg.seg = shm_str;
     vldt->path = &seg;
 
-    pointer = vldt->pointer;
-    nxt_conf_vldt_render_pointer(vldt);
+    (void) nxt_conf_vldt_restored_range(vldt, "shm", 0, UINT32_MAX,
+                                        "on a 64-bit platform the "
+                                        "application gets a limit of "
+                                        "4294967295 bytes");
 
-    nxt_thread_log_error(NXT_LOG_WARN, "the restored configuration has a "
-                         "\"shm\" number over %uD at \"%V\".  The control "
-                         "API now refuses it.  It is kept, and the "
-                         "application gets a limit of %uD bytes.  Correct it "
-                         "to be able to update the configuration.",
-                         (uint32_t) UINT32_MAX, &vldt->pointer,
-                         (uint32_t) UINT32_MAX);
-
-    vldt->pointer = pointer;
     vldt->path = seg.prev;
 
     return NXT_OK;

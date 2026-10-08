@@ -413,7 +413,10 @@ nxt_controller_start(nxt_task_t *task, nxt_process_data_t *data)
     vldt.conf_pool = mp;
     vldt.ver = nxt_conf_ver;
 
-    /* nxt_conf_vldt_app_shm() keeps a stored "shm" that is too large. */
+    /*
+     * nxt_conf_vldt_app_shm() keeps a stored "shm" that is out of
+     * range.
+     */
     vldt.restored = 1;
 
     /*

@@ -89,7 +89,10 @@ nxt_msec_less(nxt_msec_t first, nxt_msec_t second)
 }
 
 
-/* A stored "shm" over UINT32_MAX must not wrap to its low 32 bits. */
+/*
+ * A stored "shm" over UINT32_MAX must not wrap to its low 32 bits.  A stored
+ * -1 is mapped to SIZE_MAX, so the { SIZE_MAX, UINT32_MAX } case covers it.
+ */
 
 static nxt_int_t
 nxt_app_shm_limit_test(nxt_thread_t *thr)
