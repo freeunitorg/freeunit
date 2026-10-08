@@ -102,6 +102,17 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        range of data type [-Werror=type-limits]". Builds with clang were
        not affected. The bug had appeared in 1.36.0.
 
+    *) Bugfix: an application worker whose WHOAMI the main process refused
+       was not told so. It waited for a reply for ever and stayed alive
+       until its prototype quit. This happens when a host pid is reused
+       while main still has the record of the old worker. On Linux, main
+       now answers a refused WHOAMI with an error, and also when it cannot
+       send the reply to an accepted one. The worker logs "WHOAMI failed,
+       exiting" and exits, and main logs the reason. On other platforms a
+       refused worker still waits, as before. Main also refuses a WHOAMI
+       for a record that is still linked to a prototype. The bug had
+       appeared in 1.37.0.
+
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 

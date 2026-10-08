@@ -76,6 +76,7 @@ void nxt_main_test_run_start_process_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 void nxt_main_test_run_whoami_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
+void nxt_main_test_whoami_ready_failures(nxt_uint_t failures);
 void nxt_main_test_store_set_delay(nxt_msec_t delay);
 void nxt_main_test_store_schedule(nxt_task_t *task, u_char *p, size_t size);
 nxt_pid_t nxt_main_test_store_pid(void);

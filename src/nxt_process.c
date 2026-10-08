@@ -1043,7 +1043,16 @@ nxt_process_whoami_ok(nxt_task_t *task, nxt_port_recv_msg_t *msg, void *data)
 static void
 nxt_process_whoami_error(nxt_task_t *task, nxt_port_recv_msg_t *msg, void *data)
 {
-    nxt_alert(task, "WHOAMI error");
+    nxt_process_t  *process;
+
+    process = data;
+
+    /*
+     * Main refused the message and logged why, or main is gone.  The
+     * process cannot run without the reply.
+     */
+
+    nxt_alert(task, "%s: WHOAMI failed, exiting", process->name);
 
     nxt_process_quit(task, 1);
 }
