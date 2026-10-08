@@ -39,7 +39,7 @@ leg with only that leg's parameter executing.  Adding a runtime is one entry.
 
 CI wiring note: .github/workflows/build-test.yml derives a per-module test glob
 (test/test_<module>*), so this file is named explicitly in that job's
-`testpath` -- otherwise only the python/unit legs would ever run it.
+`testpath` -- otherwise only the python legs would ever run it.
 """
 
 import os

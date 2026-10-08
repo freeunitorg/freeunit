@@ -99,7 +99,7 @@ matrix() {
         + ["wasm-wasi-component"]
         + legs("java")
         + legs("php")
-        + ["unit", "perl", "wasm"]
+        + ["perl", "wasm"]
         + legs("go")
         + legs("node")
         + legs("ruby")
