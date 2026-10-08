@@ -1491,6 +1491,74 @@ nxt_unit_msg_test_ws_unpark_case(void *data)
 }
 
 
+#define NXT_UNIT_MSG_TEST_NWAIT  8
+
+
+/*
+ * While nxt_unit_wait_shm_ack() waits for SHM_ACK, it reads on and puts
+ * every other message into pending_rbuf.  Each one took a whole read
+ * buffer, over 16 KiB, for a message of 20 bytes.  Now each one is a
+ * shrunk copy.
+ */
+static int
+nxt_unit_msg_test_shm_ack_case(void *data)
+{
+    int              notify;
+    void             *queue;
+    size_t           i, held;
+    nxt_unit_port_t  *port;
+
+    struct {
+        nxt_port_msg_t  msg;
+        uint32_t        payload;
+    } m;
+
+    port = nxt_unit_test_ctx_read_port(nxt_unit_msg_test_ctx);
+    queue = nxt_unit_test_port_queue(port);
+
+    if (queue == NULL) {
+        printf("unit msg test: the read port has no queue\n");
+        return 1;
+    }
+
+    memset(&m, 0, sizeof(m));
+
+    m.msg.stream = NXT_UNIT_MSG_TEST_STREAM;
+    m.msg.pid = getpid();
+    m.msg.type = _NXT_PORT_MSG_DATA;
+
+    for (i = 0; i < NXT_UNIT_MSG_TEST_NWAIT; i++) {
+        if (nxt_port_queue_send(queue, &m, sizeof(m), &notify) != NXT_OK) {
+            return 2;
+        }
+    }
+
+    m.msg.type = _NXT_PORT_MSG_SHM_ACK;
+
+    if (nxt_port_queue_send(queue, &m.msg, sizeof(m.msg), &notify) != NXT_OK) {
+        return 2;
+    }
+
+    if (nxt_unit_test_wait_shm_ack(nxt_unit_msg_test_ctx, &held)
+        != NXT_UNIT_OK)
+    {
+        return 3;
+    }
+
+    if (held == 0 || held >= NXT_UNIT_MSG_TEST_NWAIT * 1024) {
+        printf("unit msg test: %d messages of %d bytes wait in %d bytes\n",
+               NXT_UNIT_MSG_TEST_NWAIT, (int) sizeof(m), (int) held);
+
+        /* The child ends with _exit(), which does not flush stdout. */
+        fflush(stdout);
+
+        return 4;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
 int
 main(void)
 {
@@ -1652,6 +1720,11 @@ main(void)
     nxt_unit_msg_test_in_child("parked websocket frames keep their order "
                                "when the segment comes",
                                nxt_unit_msg_test_ws_unpark_case, NULL,
+                               NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("messages read while waiting for SHM_ACK "
+                               "wait shrunk",
+                               nxt_unit_msg_test_shm_ack_case, NULL,
                                NXT_UNIT_OK);
 
     /*
