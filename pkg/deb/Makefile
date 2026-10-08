@@ -280,10 +280,14 @@ else
 endif
 
 debuild/$(BRAND)_$(VERSION).orig.tar.gz: | debuild/$(SRCDIR)/debian
-	cd ../.. && tar -czf pkg/deb/debuild/$(SRCDIR).tar.gz \
-		--transform "s#^#$(SRCDIR)/#" \
-		LICENSE NOTICE CHANGES README.md CONTRIBUTING.md configure auto src \
-		test tools version go pkg/contrib docs/man/man8/unitd.8.in
+	cd ../.. && \
+	files="LICENSE NOTICE CHANGES README.md CONTRIBUTING.md configure auto src \
+		test tools version go pkg/contrib docs/man/man8/unitd.8.in" && \
+	epoch=$${SOURCE_DATE_EPOCH:-`git log -1 --format=%ct 2>/dev/null || echo 0`} && \
+	( git ls-files -z -- $$files 2>/dev/null || find $$files ! -type d -print0 ) | \
+	tar --null -T - --sort=name --mtime=@$$epoch --owner=0 --group=0 \
+		--numeric-owner --mode=go+r,go-w --transform "s#^#$(SRCDIR)/#" -cf - | \
+	gzip -n > pkg/deb/debuild/$(SRCDIR).tar.gz
 	mv debuild/$(SRCDIR).tar.gz debuild/$(BRAND)_$(VERSION).orig.tar.gz
 	cd debuild && tar zxf $(BRAND)_$(VERSION).orig.tar.gz
 
