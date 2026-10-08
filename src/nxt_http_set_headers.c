@@ -11,6 +11,9 @@
 typedef struct {
     nxt_str_t               name;
     nxt_tstr_t              *value;
+
+    /* A constant value has a control byte; set at configuration time. */
+    uint8_t                 unsafe;  /* 1 bit */
 } nxt_http_header_val_t;
 
 
@@ -34,6 +37,7 @@ static nxt_http_set_headers_ctx_t *nxt_http_set_headers_ctx(
     nxt_http_request_t *r);
 static nxt_int_t nxt_http_set_headers_value(nxt_http_request_t *r,
     nxt_http_set_headers_ctx_t *ctx, nxt_uint_t i);
+static nxt_bool_t nxt_http_set_headers_unsafe(const nxt_str_t *value);
 
 
 /*
@@ -211,6 +215,17 @@ nxt_http_set_headers_init(nxt_router_conf_t *rtcf, nxt_http_action_t *action,
             if (nxt_slow_path(hv->value == NULL)) {
                 return NXT_ERROR;
             }
+
+            /*
+             * A constant value is the same for each request, so it is
+             * checked here once.  The configuration validator already
+             * rejects these bytes, so this flag stays 0 in practice.
+             */
+
+            if (nxt_tstr_is_const(hv->value)) {
+                nxt_tstr_str(hv->value, &str);
+                hv->unsafe = nxt_http_set_headers_unsafe(&str);
+            }
         }
     }
 
@@ -283,10 +298,9 @@ static nxt_int_t
 nxt_http_set_headers_value(nxt_http_request_t *r,
     nxt_http_set_headers_ctx_t *ctx, nxt_uint_t i)
 {
-    u_char                 c;
-    size_t                 j;
     nxt_int_t              ret;
     nxt_str_t              *value;
+    nxt_bool_t             unsafe;
     nxt_router_conf_t      *rtcf;
     nxt_http_header_val_t  *hv;
 
@@ -308,9 +322,11 @@ nxt_http_set_headers_value(nxt_http_request_t *r,
 
     if (hv->value == NULL) {
         nxt_str_null(value);
+        unsafe = 0;
 
     } else if (nxt_tstr_is_const(hv->value)) {
         nxt_tstr_str(hv->value, value);
+        unsafe = hv->unsafe;
 
     } else {
         rtcf = r->conf->socket_conf->router_conf;
@@ -325,36 +341,53 @@ nxt_http_set_headers_value(nxt_http_request_t *r,
         if (nxt_slow_path(ret != NXT_OK)) {
             return NXT_ERROR;
         }
+
+        unsafe = nxt_http_set_headers_unsafe(value);
     }
 
-    /*
-     * Reject values that would inject a header boundary into the response.
-     * Templated values (e.g. $uri, $arg_*) can carry CR/LF/NUL bytes if the
-     * client encodes them in the request, and writing those bytes verbatim
-     * into the wire serialiser yields HTTP response splitting.  Static
-     * config values are operator-controlled and trusted, but the check is
-     * cheap enough to apply to both paths.
-     *
-     * Per the RFC 9110 field-value grammar, all control bytes other than
-     * HTAB are rejected, including DEL (0x7F); lenient downstream proxies
-     * may otherwise reinterpret them.  HTAB and high (0x80+) bytes are
-     * left alone.
-     */
-
-    if (value->start != NULL) {
-        for (j = 0; j < value->length; j++) {
-            c = value->start[j];
-
-            if (nxt_slow_path((c < 0x20 && c != '\t') || c == 0x7F)) {
-                ctx->state[i] = NXT_HTTP_SET_HEADERS_REJECTED;
-                return NXT_DECLINED;
-            }
-        }
+    if (nxt_slow_path(unsafe)) {
+        ctx->state[i] = NXT_HTTP_SET_HEADERS_REJECTED;
+        return NXT_DECLINED;
     }
 
     ctx->state[i] = NXT_HTTP_SET_HEADERS_RESOLVED;
 
     return NXT_OK;
+}
+
+
+/*
+ * Reject values that would inject a header boundary into the response.
+ * Templated values (e.g. $uri, $arg_*) can carry CR/LF/NUL bytes if the
+ * client encodes them in the request, and writing those bytes verbatim
+ * into the wire serialiser yields HTTP response splitting.  Static config
+ * values are operator-controlled and trusted, but they are checked too,
+ * once, by nxt_http_set_headers_init().
+ *
+ * Per the RFC 9110 field-value grammar, all control bytes other than HTAB
+ * are rejected, including DEL (0x7F); lenient downstream proxies may
+ * otherwise reinterpret them.  HTAB and high (0x80+) bytes are left alone.
+ */
+
+static nxt_bool_t
+nxt_http_set_headers_unsafe(const nxt_str_t *value)
+{
+    u_char  c;
+    size_t  j;
+
+    if (value->start == NULL) {
+        return 0;
+    }
+
+    for (j = 0; j < value->length; j++) {
+        c = value->start[j];
+
+        if (nxt_slow_path((c < 0x20 && c != '\t') || c == 0x7F)) {
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 
