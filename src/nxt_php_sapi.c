@@ -118,12 +118,16 @@ static int nxt_php_send_headers(sapi_headers_struct *sapi_headers TSRMLS_DC);
 static void *nxt_php_hash_str_find_ptr(const HashTable *ht,
     const nxt_str_t *str);
 static char *nxt_php_read_cookies(TSRMLS_D);
-static void nxt_php_set_sptr(nxt_unit_request_info_t *req, const char *name,
+static void nxt_php_set_sptr(nxt_unit_request_info_t *req, nxt_uint_t var,
     nxt_unit_sptr_t *v, uint32_t len, zval *track_vars_array TSRMLS_DC);
-nxt_inline void nxt_php_set_str(nxt_unit_request_info_t *req, const char *name,
+static void nxt_php_set_field(nxt_unit_request_info_t *req, const char *name,
+    nxt_unit_sptr_t *v, uint32_t len, zval *track_vars_array TSRMLS_DC);
+nxt_inline void nxt_php_set_str(nxt_unit_request_info_t *req, nxt_uint_t var,
     nxt_str_t *s, zval *track_vars_array TSRMLS_DC);
-static void nxt_php_set_cstr(nxt_unit_request_info_t *req, const char *name,
+static void nxt_php_set_cstr(nxt_unit_request_info_t *req, nxt_uint_t var,
     const char *str, uint32_t len, zval *track_vars_array TSRMLS_DC);
+nxt_inline void nxt_php_register(nxt_uint_t var, const char *str, size_t len,
+    zval *track_vars_array TSRMLS_DC);
 void nxt_php_register_variables(zval *track_vars_array TSRMLS_DC);
 #if NXT_PHP8
 static void nxt_php_log_message(const char *message, int syslog_type_int);
@@ -170,11 +174,106 @@ static const zend_function_entry  nxt_php_ext_functions[] = {
 zend_auto_global  *nxt_php_server_ag;
 
 
+/* The $_SERVER entries with a fixed name. */
+enum {
+    NXT_PHP_SERVER_SOFTWARE = 0,
+    NXT_PHP_SERVER_PROTOCOL,
+    NXT_PHP_PHP_SELF,
+    NXT_PHP_PATH_INFO,
+    NXT_PHP_SCRIPT_NAME,
+    NXT_PHP_SCRIPT_FILENAME,
+    NXT_PHP_DOCUMENT_ROOT,
+    NXT_PHP_REQUEST_METHOD,
+    NXT_PHP_REQUEST_URI,
+    NXT_PHP_QUERY_STRING,
+    NXT_PHP_REMOTE_ADDR,
+    NXT_PHP_SERVER_ADDR,
+    NXT_PHP_SERVER_NAME,
+    NXT_PHP_SERVER_PORT,
+    NXT_PHP_HTTPS,
+    NXT_PHP_CONTENT_LENGTH,
+    NXT_PHP_CONTENT_TYPE,
+    NXT_PHP_SERVER_NVARS,
+};
+
+
+static const nxt_str_t  nxt_php_server_names[NXT_PHP_SERVER_NVARS] = {
+    [NXT_PHP_SERVER_SOFTWARE] = nxt_string("SERVER_SOFTWARE"),
+    [NXT_PHP_SERVER_PROTOCOL] = nxt_string("SERVER_PROTOCOL"),
+    [NXT_PHP_PHP_SELF] = nxt_string("PHP_SELF"),
+    [NXT_PHP_PATH_INFO] = nxt_string("PATH_INFO"),
+    [NXT_PHP_SCRIPT_NAME] = nxt_string("SCRIPT_NAME"),
+    [NXT_PHP_SCRIPT_FILENAME] = nxt_string("SCRIPT_FILENAME"),
+    [NXT_PHP_DOCUMENT_ROOT] = nxt_string("DOCUMENT_ROOT"),
+    [NXT_PHP_REQUEST_METHOD] = nxt_string("REQUEST_METHOD"),
+    [NXT_PHP_REQUEST_URI] = nxt_string("REQUEST_URI"),
+    [NXT_PHP_QUERY_STRING] = nxt_string("QUERY_STRING"),
+    [NXT_PHP_REMOTE_ADDR] = nxt_string("REMOTE_ADDR"),
+    [NXT_PHP_SERVER_ADDR] = nxt_string("SERVER_ADDR"),
+    [NXT_PHP_SERVER_NAME] = nxt_string("SERVER_NAME"),
+    [NXT_PHP_SERVER_PORT] = nxt_string("SERVER_PORT"),
+    [NXT_PHP_HTTPS] = nxt_string("HTTPS"),
+    [NXT_PHP_CONTENT_LENGTH] = nxt_string("CONTENT_LENGTH"),
+    [NXT_PHP_CONTENT_TYPE] = nxt_string("CONTENT_TYPE"),
+};
+
+
+#if NXT_PHP8
+
+/*
+ * The fixed names and the two fixed values are interned in MINIT.  An
+ * entry that this module registers itself then needs no copy, scan, hash
+ * or free of its name.  With the filter extension, that is SERVER_SOFTWARE,
+ * PHP_SELF, PATH_INFO, SCRIPT_NAME, SCRIPT_FILENAME, DOCUMENT_ROOT and
+ * HTTPS; the filter registers the other entries itself.  Interned strings
+ * are immutable: a script that writes to such an entry replaces the value
+ * in its own $_SERVER and does not change the shared string.
+ */
+static zend_string  *nxt_php_server_keys[NXT_PHP_SERVER_NVARS];
+static zend_string  *nxt_php_server_software;
+static zend_string  *nxt_php_https_on;
+
+/*
+ * A bound for the $_SERVER size hint.  The field count comes from the
+ * router; the hint must not depend on it without a limit.
+ */
+#define NXT_PHP_SERVER_FIELDS_HINT  512
+
+
+static PHP_MINIT_FUNCTION(unit)
+{
+    nxt_uint_t       i;
+    const nxt_str_t  *name;
+
+    for (i = 0; i < NXT_PHP_SERVER_NVARS; i++) {
+        name = &nxt_php_server_names[i];
+
+        nxt_php_server_keys[i] = zend_string_init_interned(
+                                     (const char *) name->start,
+                                     name->length, 1);
+    }
+
+    nxt_php_server_software = zend_string_init_interned(
+                                  (const char *) nxt_server.start,
+                                  nxt_server.length, 1);
+
+    nxt_php_https_on = zend_string_init_interned("on", nxt_length("on"), 1);
+
+    return SUCCESS;
+}
+
+#endif
+
+
 static zend_module_entry  nxt_php_unit_module = {
     STANDARD_MODULE_HEADER,
     "unit",
     nxt_php_ext_functions,       /* function table */
+#if NXT_PHP8
+    PHP_MINIT(unit),             /* initialization */
+#else
     NULL,                        /* initialization */
+#endif
     NULL,                        /* shutdown */
     NULL,                        /* request initialization */
     NULL,                        /* request shutdown */
@@ -1537,6 +1636,11 @@ void
 nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
 {
     const char               *name;
+#if NXT_PHP8
+    zval                     value;
+    uint32_t                 size, nfields;
+    HashTable                *ht;
+#endif
     nxt_unit_field_t         *f, *f_end;
     nxt_php_run_ctx_t        *ctx;
     nxt_unit_request_t       *r;
@@ -1558,12 +1662,37 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
 
     nxt_unit_req_debug(req, "nxt_php_register_variables");
 
+#if NXT_PHP8
+    if (nxt_slow_path(Z_TYPE_P(track_vars_array) != IS_ARRAY)) {
+        return;
+    }
+
+    ht = Z_ARRVAL_P(track_vars_array);
+
+    /*
+     * PHP creates $_SERVER with 8 slots and doubles it as it fills.  Size
+     * it once for the fixed entries, the header fields, and the five
+     * PHP_AUTH_* and REQUEST_TIME* entries that PHP adds after this callback.
+     */
+    if (HT_FLAGS(ht) & HASH_FLAG_UNINITIALIZED) {
+        nfields = r->fields_count;
+
+        size = NXT_PHP_SERVER_NVARS + 5
+               + nxt_min(nfields, NXT_PHP_SERVER_FIELDS_HINT);
+
+        zend_hash_extend(ht, size, 0);
+    }
+
+    ZVAL_INTERNED_STR(&value, nxt_php_server_software);
+    zend_hash_update(ht, nxt_php_server_keys[NXT_PHP_SERVER_SOFTWARE], &value);
+#else
     php_register_variable_safe((char *) "SERVER_SOFTWARE",
                                (char *) nxt_server.start,
                                nxt_server.length, track_vars_array TSRMLS_CC);
+#endif
 
-    nxt_php_set_sptr(req, "SERVER_PROTOCOL", &r->version, r->version_length,
-                     track_vars_array TSRMLS_CC);
+    nxt_php_set_sptr(req, NXT_PHP_SERVER_PROTOCOL, &r->version,
+                     r->version_length, track_vars_array TSRMLS_CC);
 
     /*
      * 'PHP_SELF'
@@ -1577,14 +1706,14 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
      */
 
     if (ctx->path_info.length != 0) {
-        nxt_php_set_sptr(req, "PHP_SELF", &r->path, r->path_length,
+        nxt_php_set_sptr(req, NXT_PHP_PHP_SELF, &r->path, r->path_length,
                          track_vars_array TSRMLS_CC);
 
-        nxt_php_set_str(req, "PATH_INFO", &ctx->path_info,
+        nxt_php_set_str(req, NXT_PHP_PATH_INFO, &ctx->path_info,
                         track_vars_array TSRMLS_CC);
 
     } else {
-        nxt_php_set_str(req, "PHP_SELF", &ctx->script_name,
+        nxt_php_set_str(req, NXT_PHP_PHP_SELF, &ctx->script_name,
                         track_vars_array TSRMLS_CC);
     }
 
@@ -1595,7 +1724,7 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
      * filename of the current (i.e. included) file.
      */
 
-    nxt_php_set_str(req, "SCRIPT_NAME", &ctx->script_name,
+    nxt_php_set_str(req, NXT_PHP_SCRIPT_NAME, &ctx->script_name,
                     track_vars_array TSRMLS_CC);
 
     /*
@@ -1603,7 +1732,7 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
      * The absolute pathname of the currently executing script.
      */
 
-    nxt_php_set_str(req, "SCRIPT_FILENAME", &ctx->script_filename,
+    nxt_php_set_str(req, NXT_PHP_SCRIPT_FILENAME, &ctx->script_filename,
                     track_vars_array TSRMLS_CC);
 
     /*
@@ -1612,56 +1741,93 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
      * as defined in the server's configuration file.
      */
 
-    nxt_php_set_str(req, "DOCUMENT_ROOT", ctx->root,
+    nxt_php_set_str(req, NXT_PHP_DOCUMENT_ROOT, ctx->root,
                     track_vars_array TSRMLS_CC);
 
-    nxt_php_set_sptr(req, "REQUEST_METHOD", &r->method, r->method_length,
+    nxt_php_set_sptr(req, NXT_PHP_REQUEST_METHOD, &r->method, r->method_length,
                      track_vars_array TSRMLS_CC);
-    nxt_php_set_sptr(req, "REQUEST_URI", &r->target, r->target_length,
+    nxt_php_set_sptr(req, NXT_PHP_REQUEST_URI, &r->target, r->target_length,
                      track_vars_array TSRMLS_CC);
-    nxt_php_set_sptr(req, "QUERY_STRING", &r->query, r->query_length,
-                     track_vars_array TSRMLS_CC);
-
-    nxt_php_set_sptr(req, "REMOTE_ADDR", &r->remote, r->remote_length,
-                     track_vars_array TSRMLS_CC);
-    nxt_php_set_sptr(req, "SERVER_ADDR", &r->local_addr, r->local_addr_length,
+    nxt_php_set_sptr(req, NXT_PHP_QUERY_STRING, &r->query, r->query_length,
                      track_vars_array TSRMLS_CC);
 
-    nxt_php_set_sptr(req, "SERVER_NAME", &r->server_name, r->server_name_length,
+    nxt_php_set_sptr(req, NXT_PHP_REMOTE_ADDR, &r->remote, r->remote_length,
                      track_vars_array TSRMLS_CC);
-    nxt_php_set_sptr(req, "SERVER_PORT", &r->local_port, r->local_port_length,
-                     track_vars_array TSRMLS_CC);
+    nxt_php_set_sptr(req, NXT_PHP_SERVER_ADDR, &r->local_addr,
+                     r->local_addr_length, track_vars_array TSRMLS_CC);
+
+    nxt_php_set_sptr(req, NXT_PHP_SERVER_NAME, &r->server_name,
+                     r->server_name_length, track_vars_array TSRMLS_CC);
+    nxt_php_set_sptr(req, NXT_PHP_SERVER_PORT, &r->local_port,
+                     r->local_port_length, track_vars_array TSRMLS_CC);
 
     if (r->tls) {
-        nxt_php_set_cstr(req, "HTTPS", "on", 2, track_vars_array TSRMLS_CC);
+#if NXT_PHP8
+        nxt_unit_req_debug(req, "php: register HTTPS='on'");
+
+        ZVAL_INTERNED_STR(&value, nxt_php_https_on);
+        zend_hash_update(ht, nxt_php_server_keys[NXT_PHP_HTTPS], &value);
+#else
+        nxt_php_set_cstr(req, NXT_PHP_HTTPS, "on", 2,
+                         track_vars_array TSRMLS_CC);
+#endif
     }
 
     f_end = r->fields + r->fields_count;
     for (f = r->fields; f < f_end; f++) {
         name = nxt_unit_sptr_get(&f->name);
 
-        nxt_php_set_sptr(req, name, &f->value, f->value_length,
-                         track_vars_array TSRMLS_CC);
+        nxt_php_set_field(req, name, &f->value, f->value_length,
+                          track_vars_array TSRMLS_CC);
     }
 
     if (r->content_length_field != NXT_UNIT_NONE_FIELD) {
         f = r->fields + r->content_length_field;
 
-        nxt_php_set_sptr(req, "CONTENT_LENGTH", &f->value, f->value_length,
-                         track_vars_array TSRMLS_CC);
+        nxt_php_set_sptr(req, NXT_PHP_CONTENT_LENGTH, &f->value,
+                         f->value_length, track_vars_array TSRMLS_CC);
     }
 
     if (r->content_type_field != NXT_UNIT_NONE_FIELD) {
         f = r->fields + r->content_type_field;
 
-        nxt_php_set_sptr(req, "CONTENT_TYPE", &f->value, f->value_length,
-                         track_vars_array TSRMLS_CC);
+        nxt_php_set_sptr(req, NXT_PHP_CONTENT_TYPE, &f->value,
+                         f->value_length, track_vars_array TSRMLS_CC);
+    }
+}
+
+
+/*
+ * The input filter decides whether the value is registered here.  The
+ * filter extension registers the value itself and returns 0.
+ */
+
+static void
+nxt_php_set_sptr(nxt_unit_request_info_t *req, nxt_uint_t var,
+    nxt_unit_sptr_t *v, uint32_t len, zval *track_vars_array TSRMLS_DC)
+{
+    char          *str, *name;
+#if NXT_PHP7
+    size_t        new_len;
+#else
+    unsigned int  new_len;
+#endif
+
+    name = (char *) nxt_php_server_names[var].start;
+    str = nxt_unit_sptr_get(v);
+
+    nxt_unit_req_debug(req, "php: register %s='%.*s'", name, (int) len, str);
+
+    if (sapi_module.input_filter(PARSE_SERVER, name, &str, len,
+                                 &new_len TSRMLS_CC))
+    {
+        nxt_php_register(var, str, new_len, track_vars_array TSRMLS_CC);
     }
 }
 
 
 static void
-nxt_php_set_sptr(nxt_unit_request_info_t *req, const char *name,
+nxt_php_set_field(nxt_unit_request_info_t *req, const char *name,
     nxt_unit_sptr_t *v, uint32_t len, zval *track_vars_array TSRMLS_DC)
 {
     char          *str;
@@ -1685,11 +1851,35 @@ nxt_php_set_sptr(nxt_unit_request_info_t *req, const char *name,
 
 
 nxt_inline void
-nxt_php_set_str(nxt_unit_request_info_t *req, const char *name,
+nxt_php_set_str(nxt_unit_request_info_t *req, nxt_uint_t var,
     nxt_str_t *s, zval *track_vars_array TSRMLS_DC)
 {
-    nxt_php_set_cstr(req, name, (char *) s->start, s->length,
+    nxt_php_set_cstr(req, var, (char *) s->start, s->length,
                      track_vars_array TSRMLS_CC);
+}
+
+
+/*
+ * A fixed name needs none of the checks and none of the mangling that
+ * php_register_variable_safe() applies, so with PHP 8 its interned key
+ * goes into the array directly.
+ */
+
+nxt_inline void
+nxt_php_register(nxt_uint_t var, const char *str, size_t len,
+    zval *track_vars_array TSRMLS_DC)
+{
+#if NXT_PHP8
+    zval  value;
+
+    ZVAL_STRINGL_FAST(&value, str, len);
+
+    zend_hash_update(Z_ARRVAL_P(track_vars_array), nxt_php_server_keys[var],
+                     &value);
+#else
+    php_register_variable_safe((char *) nxt_php_server_names[var].start,
+                               (char *) str, len, track_vars_array TSRMLS_CC);
+#endif
 }
 
 
@@ -1729,17 +1919,18 @@ nxt_php_hash_str_find_ptr(const HashTable *ht, const nxt_str_t *str)
 
 
 static void
-nxt_php_set_cstr(nxt_unit_request_info_t *req, const char *name,
+nxt_php_set_cstr(nxt_unit_request_info_t *req, nxt_uint_t var,
     const char *cstr, uint32_t len, zval *track_vars_array TSRMLS_DC)
 {
     if (nxt_slow_path(cstr == NULL)) {
         return;
     }
 
-    nxt_unit_req_debug(req, "php: register %s='%.*s'", name, (int) len, cstr);
+    nxt_unit_req_debug(req, "php: register %s='%.*s'",
+                       (char *) nxt_php_server_names[var].start, (int) len,
+                       cstr);
 
-    php_register_variable_safe((char *) name, (char *) cstr, len,
-                               track_vars_array TSRMLS_CC);
+    nxt_php_register(var, cstr, len, track_vars_array TSRMLS_CC);
 }
 
 
