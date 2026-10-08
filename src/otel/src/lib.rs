@@ -155,6 +155,7 @@ type nxt_otel_log_cb = unsafe extern "C" fn(log_level: nxt_uint_t, msg: *const c
 
 /// The live tracer provider. Held so we can flush and shut it down cleanly on
 /// reconfigure or teardown. `None` means OTel is not currently configured.
+/// `IS_INIT` mirrors it for the request path.
 fn provider_slot() -> &'static Mutex<Option<SdkTracerProvider>> {
     static PROVIDER: Mutex<Option<SdkTracerProvider>> = Mutex::new(None);
     &PROVIDER
@@ -187,6 +188,24 @@ fn runtime_slot() -> &'static Mutex<Option<tokio::runtime::Runtime>> {
 /// forced by `force_flush`), so without this a batch that failed minutes
 /// before exit would leave nothing at all for the shutdown path to report.
 static EXPORT_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Mirrors whether `provider_slot()` holds a provider.
+///
+/// nxt_http_request_create() reads it on every request, on the worker engine
+/// threads, through `nxt_otel_rs_is_init`. That read must not take the
+/// provider mutex. The mutex costs two atomic read-modify-write operations
+/// per request, on one cache line that all worker threads share. A request
+/// also waits for the few instructions during which init or shutdown holds
+/// the mutex.
+///
+/// Only the router thread writes it. It is stored with `Release` after the
+/// provider and the tracer are installed, and loaded with `Acquire`. So a
+/// request that sees `true` also sees the tracer in `tracer_slot()`. It is
+/// cleared before a shutdown takes the tracer, so that new requests stop
+/// allocating `r->otel` first. A request that passed the check just before a
+/// shutdown still finds `tracer_slot()` empty. It then falls back to the
+/// global tracer, as it did when the check took the mutex.
+static IS_INIT: AtomicBool = AtomicBool::new(false);
 
 /// Spans in batches the exporter accepted, and spans in batches it rejected,
 /// since the live provider was installed.  Read out by
@@ -318,12 +337,10 @@ unsafe fn log_err(cb: nxt_otel_log_cb, msg: String) {
     }
 }
 
+/// Whether a provider is installed. Reads `IS_INIT` and takes no lock.
 #[no_mangle]
 pub unsafe extern "C" fn nxt_otel_rs_is_init() -> u8 {
-    provider_slot()
-        .lock()
-        .map(|g| g.is_some() as u8)
-        .unwrap_or(0)
+    IS_INIT.load(Ordering::Acquire) as u8
 }
 
 /// Report span export health for the `/status` API.
@@ -454,6 +471,7 @@ pub unsafe extern "C" fn nxt_otel_rs_init(
 
     if let Ok(mut slot) = provider_slot().lock() {
         *slot = Some(provider);
+        IS_INIT.store(true, Ordering::Release);
     }
 }
 
@@ -774,6 +792,11 @@ pub unsafe extern "C" fn nxt_otel_rs_send_trace(trace: *mut BoxedSpan) {
 /// export has failed", not "no spans were lost".
 #[no_mangle]
 pub unsafe extern "C" fn nxt_otel_rs_shutdown_bounded(timeout_ms: u64) -> u8 {
+    // Cleared first, so that a new request stops allocating r->otel before
+    // the tracer is dropped. One that read the flag just before falls back
+    // to the global tracer.
+    IS_INIT.store(false, Ordering::Release);
+
     // This path takes the provider without going through
     // nxt_otel_rs_shutdown_tracer(), so the cached tracer has to be dropped
     // here too: leaving it would hand out a tracer whose provider has
@@ -840,6 +863,11 @@ pub unsafe extern "C" fn nxt_otel_rs_shutdown_bounded(timeout_ms: u64) -> u8 {
 /// Flush and tear down the live tracer provider, if any.
 #[no_mangle]
 pub unsafe extern "C" fn nxt_otel_rs_shutdown_tracer() {
+    // Cleared first, so that a new request stops allocating r->otel before
+    // the tracer is dropped. One that read the flag just before falls back
+    // to the global tracer.
+    IS_INIT.store(false, Ordering::Release);
+
     // Dropped first: a tracer handed out after this point would belong to a
     // provider that is already being torn down.
     if let Ok(mut slot) = tracer_slot().write() {
@@ -866,6 +894,8 @@ mod tests {
     use super::*;
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
+    use std::sync::MutexGuard;
+    use std::time::Instant;
 
     /*
      * Count the allocations of one request-path call.
@@ -1136,5 +1166,180 @@ mod tests {
         assert!(n >= 1, "an owned attribute value did not allocate");
 
         release_span(span);
+    }
+
+    /// How long a helper thread holds the provider lock.
+    const HOLD: Duration = Duration::from_secs(1);
+
+    /// The longest time `nxt_otel_rs_is_init` may take while the lock is held.
+    /// Half of `HOLD`: the old code takes all of `HOLD`, and a loaded CI box
+    /// can delay the call by much less than this.
+    const LIMIT: Duration = Duration::from_millis(500);
+
+    /// Nothing listens on these ports, and no test ends a span, so nothing is
+    /// exported.
+    const ENDPOINT_A: &str = "http://127.0.0.1:1/v1/traces";
+    const ENDPOINT_B: &str = "http://127.0.0.1:2/v1/traces";
+
+    /// The slots are process globals, and cargo runs tests on parallel threads
+    /// in one process. So every test holds this lock.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    /// Set by `test_log` when init reports an error.
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "C" fn test_log(_log_level: nxt_uint_t, _msg: *const c_char) {
+        LOGGED.store(true, Ordering::Relaxed);
+    }
+
+    /// Take the test lock and start with no provider installed.
+    ///
+    /// A failed test can leave a provider behind, so the state is reset here.
+    fn serial() -> MutexGuard<'static, ()> {
+        let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+        unsafe { nxt_otel_rs_shutdown_tracer() };
+        // The shutdown leaves the shut-down provider installed globally, and
+        // its tracer builds spans with an empty context.  Install a no-op one.
+        global::set_tracer_provider(
+            opentelemetry::trace::noop::NoopTracerProvider::new(),
+        );
+        LOGGED.store(false, Ordering::Relaxed);
+
+        guard
+    }
+
+    fn nxt_str(s: &'static str) -> nxt_str_t {
+        nxt_str_t {
+            length: s.len(),
+            start: s.as_ptr(),
+        }
+    }
+
+    unsafe fn init(endpoint: &'static str, protocol: &'static str) {
+        let endpoint = nxt_str(endpoint);
+        let protocol = nxt_str(protocol);
+
+        nxt_otel_rs_init(test_log, &endpoint, &protocol, 1.0, 512.0);
+    }
+
+    fn provider_installed() -> bool {
+        provider_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    fn tracer_installed() -> bool {
+        tracer_slot()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// Call `nxt_otel_rs_is_init` while another thread holds the provider lock
+    /// for `HOLD`. Return the result and the time the call took.
+    fn is_init_while_provider_locked() -> (u8, Duration) {
+        let (tx, rx) = mpsc::channel();
+
+        let holder = std::thread::spawn(move || {
+            let _guard =
+                provider_slot().lock().unwrap_or_else(|e| e.into_inner());
+
+            tx.send(()).unwrap();
+            std::thread::sleep(HOLD);
+        });
+
+        // Measure only once the lock is held.
+        rx.recv().unwrap();
+
+        let start = Instant::now();
+        let v = unsafe { nxt_otel_rs_is_init() };
+        let elapsed = start.elapsed();
+
+        // Joined before any assertion, so the next test finds the lock free.
+        holder.join().unwrap();
+
+        (v, elapsed)
+    }
+
+    #[test]
+    fn is_init_does_not_wait_for_the_provider_lock() {
+        let _serial = serial();
+
+        let (v, elapsed) = is_init_while_provider_locked();
+
+        assert!(
+            elapsed < LIMIT,
+            "is_init() took {elapsed:?} while the provider lock was held"
+        );
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    fn init_and_shutdown_flip_is_init() {
+        let _serial = serial();
+
+        unsafe {
+            assert_eq!(nxt_otel_rs_is_init(), 0);
+
+            init(ENDPOINT_A, "http");
+            assert_eq!(nxt_otel_rs_is_init(), 1);
+            assert!(provider_installed());
+            assert!(tracer_installed());
+
+            let (v, elapsed) = is_init_while_provider_locked();
+
+            assert!(
+                elapsed < LIMIT,
+                "is_init() took {elapsed:?} while the provider lock was held"
+            );
+            assert_eq!(v, 1);
+
+            nxt_otel_rs_shutdown_tracer();
+            assert_eq!(nxt_otel_rs_is_init(), 0);
+            assert!(!provider_installed());
+            assert!(!tracer_installed());
+        }
+    }
+
+    #[test]
+    fn reconfigure_keeps_is_init_set() {
+        let _serial = serial();
+
+        unsafe {
+            init(ENDPOINT_A, "http");
+            assert_eq!(nxt_otel_rs_is_init(), 1);
+
+            // The second init shuts the first provider down, then installs a
+            // new one.
+            init(ENDPOINT_B, "http");
+            assert_eq!(nxt_otel_rs_is_init(), 1);
+            assert!(provider_installed());
+
+            // The status is not checked. This test is about the flag.
+            nxt_otel_rs_shutdown_bounded(2000);
+            assert_eq!(nxt_otel_rs_is_init(), 0);
+            assert!(!provider_installed());
+        }
+    }
+
+    #[test]
+    fn bad_protocol_keeps_the_live_provider() {
+        let _serial = serial();
+
+        unsafe {
+            init(ENDPOINT_A, "http");
+            assert_eq!(nxt_otel_rs_is_init(), 1);
+
+            // init rejects the protocol before it shuts anything down.
+            init(ENDPOINT_B, "bogus");
+            assert!(LOGGED.load(Ordering::Relaxed));
+            assert_eq!(nxt_otel_rs_is_init(), 1);
+            assert!(provider_installed());
+
+            nxt_otel_rs_shutdown_tracer();
+            assert_eq!(nxt_otel_rs_is_init(), 0);
+        }
     }
 }
