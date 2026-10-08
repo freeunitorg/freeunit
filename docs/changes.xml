@@ -10,6 +10,16 @@
          date="2026-10-04" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="feature">
+<para>
+--regex-jit enables optional PCRE2 JIT compilation. A library or pattern
+without usable JIT uses interpreted matching. Configuration cleanup releases
+JIT executable memory. A match that exhausts the default JIT stack is retried
+once in the interpreter with the same match limit. This option is off by
+default.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 the control API accepted a listener with neither "pass" nor "application",

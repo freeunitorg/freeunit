@@ -21,6 +21,7 @@ NXT_PCRE_LIB=
 
 NXT_REGEX=YES
 NXT_TRY_PCRE2=YES
+NXT_REGEX_JIT=NO
 
 NXT_TLS=NO
 NXT_OPENSSL=NO
@@ -111,6 +112,7 @@ do
 
         --no-regex)                      NXT_REGEX=NO                        ;;
         --no-pcre2)                      NXT_TRY_PCRE2=NO                    ;;
+        --regex-jit)                     NXT_REGEX_JIT=YES                   ;;
 
         --openssl)                       NXT_OPENSSL=YES                     ;;
 
@@ -156,6 +158,11 @@ do
     NXT_CONFIGURE_OPTIONS="$NXT_CONFIGURE_OPTIONS $nxt_opt"
 
 done
+
+if [ $NXT_REGEX_JIT = YES ] && [ $NXT_REGEX = NO ]; then
+    $echo "$0: error: --regex-jit requires regex support."
+    exit 1
+fi
 
 
 NXT_PREFIX="${NXT_PREFIX-"/usr/local"}"
