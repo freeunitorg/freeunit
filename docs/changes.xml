@@ -159,6 +159,13 @@ On other platforms a refused worker still waits, as before.
 </para>
 </change>
 
+<change type="change">
+<para>
+a TLS connection that fails because of what the client sent is now logged
+at "info" instead of "alert".
+</para>
+</change>
+
 </changes>
 
 
