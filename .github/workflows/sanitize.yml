@@ -201,10 +201,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # A stalled mirror must fail the step, not the job. Apt retries 3 times
+      # and treats 30 s without data as a stall. Later apt commands use this.
+      # Each job writes its own copy: jobs cannot share a step.
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
       # Base tools + pytest (needed to run any leg) plus this runtime's extra
       # apt packages.  Runtimes whose toolchain is not in apt add a setup step
       # instead (see PHP below) and leave `apt` empty.
       - name: Install packages
+        timeout-minutes: 5
         run: |
           sudo apt-get -y update
           sudo apt-get -y install build-essential libpcre2-dev libssl-dev \
@@ -319,6 +328,7 @@ jobs:
       # below scans.  pytest_opts is per-runtime (e.g. --restart for the
       # graceful tests).
       - name: Run ${{ matrix.runtime }} sanitizer subset
+        timeout-minutes: 10
         continue-on-error: ${{ matrix.experimental == true }}
         # TZ: same pin as build-test.yml's pytest step, and for the same
         # reason (see its comment) -- without it this leg's
