@@ -64,7 +64,7 @@ concurrency:
 jobs:
   sanitize:
     name: "sanitize (${{ matrix.runtime }})"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 40
 
     # NOTE: `continue-on-error` is deliberately NOT set at job level here.

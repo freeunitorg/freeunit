@@ -58,7 +58,7 @@ jobs:
   # per-version perl (tested against the runner's system perl), python "-slim"
   # and the "minimal" image — those are Docker packaging flavors, not test axes.
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     outputs:
       builds: ${{ steps.list.outputs.builds }}
@@ -98,7 +98,7 @@ jobs:
   # own module.  Flags here are a copy of what the legs ran before -- keep
   # the two in step if they ever change.
   core:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
 
     steps:
@@ -314,7 +314,7 @@ jobs:
 
   test:
     needs: [prepare, core]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # 45, not 30: the wasm leg now runs the suite on a cold contrib wasmtime
     # build (the cache key moves with the pin) and builds the guest toolchain.
     timeout-minutes: 45
@@ -935,7 +935,7 @@ jobs:
         # which skips itself, loudly, when the offset is zero).  Kolkata is
         # +05:30 all year: never UTC, no DST to shift it, and a half-hour
         # offset that also catches whole-hour assumptions.
-        # "sudo -E" below keeps it for unitd, which inherits pytest's env.
+        # sudo below passes it on to unitd, which inherits pytest's env.
         env:
           TZ: Asia/Kolkata
         run: |
@@ -952,7 +952,12 @@ jobs:
             set -o pipefail
             pytest-3 --print-log --unsafe ${{ steps.metadata.outputs.testpath }} 2>&1 | tee "$RUNNER_TEMP/pytest.out"
           else
-            sudo -E pytest-3 --print-log --unsafe ${{ steps.metadata.outputs.testpath }}
+            # ubuntu-26.04 ships sudo-rs, which ignores -E ("preserving the
+            # entire environment is not supported").  Pass the variables the
+            # suite reads by name; this works with sudo-rs and classic sudo.
+            sudo env UNIT_PYTHONHOME="${UNIT_PYTHONHOME:-}" \
+                     JAVA_HOME="${JAVA_HOME:-}" TZ="${TZ:-}" \
+              pytest-3 --print-log --unsafe ${{ steps.metadata.outputs.testpath }}
           fi
 
       # check_prerequisites() skips the whole file when the clang/wasi-sysroot
@@ -1019,7 +1024,10 @@ jobs:
         timeout-minutes: 5
         run: |
           export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
-          sudo -E /usr/bin/pytest-3 --print-log --restart \
+          # By name, not -E: see the step above.
+          sudo env UNIT_PYTHONHOME="${UNIT_PYTHONHOME:-}" \
+                   JAVA_HOME="${JAVA_HOME:-}" TZ="${TZ:-}" \
+            /usr/bin/pytest-3 --print-log --restart \
             test/test_asgi_lifespan.py \
             test/test_njs_modules.py \
             test/test_state_store.py \
@@ -1033,7 +1041,7 @@ jobs:
   # own check, like the language tests. sudo mirrors the pytest suite so
   # privilege-sensitive cases (clone creds) work.
   c-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
 
     steps:
@@ -1132,7 +1140,7 @@ jobs:
   # (test fixtures freeing what they allocated -- lvlhsh buckets, ports,
   # runtime processes).
   c-tests-asan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
 
     steps:
@@ -1209,7 +1217,7 @@ jobs:
   # a build plus the C test suite, no language modules and no pytest run, since
   # nothing above the TLS layer changes with the OpenSSL version.
   openssl4:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
 
     steps:
@@ -1295,7 +1303,7 @@ jobs:
   # would pass while testing nothing.  Cheap on purpose: a build plus the C
   # test suite, no language modules.
   hardening-strict:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
 
     strategy:
@@ -1365,7 +1373,7 @@ jobs:
   # pull request.  The container runs as root, so there is no sudo, and its
   # default capabilities are enough for build/tests.
   hardening-strict-fedora:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
 
     strategy:
@@ -1450,7 +1458,7 @@ jobs:
   # no other job builds against 1.1.1.  Default flags, as a package build
   # uses.  The container runs as root, so there is no sudo.
   c-tests-almalinux8:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
 
     container:

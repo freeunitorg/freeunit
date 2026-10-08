@@ -65,7 +65,7 @@ jobs:
     # future tool is covered the moment it is committed.  Passing it to the
     # audit job also makes that a matrix, so every failing lock is reported,
     # not just the first.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     outputs:
       locks: ${{ steps.list.outputs.locks }}
@@ -82,7 +82,7 @@ jobs:
 
   audit:
     needs: locks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -114,7 +114,7 @@ jobs:
     # library, so check-lock-audit.py fails only on a finding against a crate
     # that library actually links, and only when the allowlist does not carry
     # a reason for that exact version.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7

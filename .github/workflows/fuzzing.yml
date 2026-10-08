@@ -49,7 +49,7 @@ concurrency:
 jobs:
   libfuzzer:
     name: libFuzzer (ASan + UBSan)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Ten targets at a 60s budget is a little over ten minutes -- each
     # finishes within a second or two of its budget, and run-ci.sh caps the
     # worst case at two minutes each, twenty in all.  The clang/ASan build is

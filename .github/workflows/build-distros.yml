@@ -16,7 +16,7 @@ permissions:
 jobs:
 
   fedora-rawhide:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
 
     strategy:
@@ -161,7 +161,7 @@ jobs:
         if: matrix.compiler == 'gcc'
 
   alpine-edge:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
 
     strategy:
@@ -275,7 +275,7 @@ jobs:
   # tests the probe and nothing else, and it asserts the probe result instead of
   # trusting a green build, which would stay green with the fallback in place.
   alpine-no-linux-headers:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
 
     container:
@@ -313,7 +313,7 @@ jobs:
   # scheduled failure is reported as a tracking issue instead, the same way
   # eol-check.yml handles its weekly run.
   report:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     needs: [ fedora-rawhide, alpine-edge, alpine-no-linux-headers ]
     if: failure() && github.event_name == 'schedule'

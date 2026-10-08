@@ -74,7 +74,7 @@ concurrency:
 jobs:
   seccomp-af-alg:
     name: Verify AF_ALG seccomp mitigation
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Raised from 15 with the hardening matrix added at the end.  The image
     # build dominates; the matrix itself measured 57 seconds locally.
     timeout-minutes: 20

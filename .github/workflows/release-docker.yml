@@ -50,7 +50,7 @@ jobs:
   # Single source of truth for the release version and the variant list,
   # consumed by both `build` and `merge` via fromJSON().
   setup:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     outputs:
       version: ${{ steps.meta.outputs.version }}
@@ -109,7 +109,7 @@ jobs:
         arch:
           - name: amd64
             platform: linux/amd64
-            runner: ubuntu-latest
+            runner: ubuntu-26.04
           - name: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
@@ -154,7 +154,7 @@ jobs:
 
   merge:
     needs: [setup, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
       contents: read
