@@ -48,48 +48,21 @@ static nxt_int_t nxt_http_set_headers_value(nxt_http_request_t *r,
  * evaluate preconditions at all in that case, which loses the 304 but is never
  * wrong.
  *
- * Only the name matters here, so no template value is resolved.
+ * Only the name matters here, so no template value is resolved.  The names
+ * are fixed at configuration time, so nxt_http_set_headers_init() sets the
+ * flag.
  */
 
 nxt_bool_t
 nxt_http_set_headers_override_validators(nxt_http_request_t *r)
 {
-    nxt_uint_t             i, n;
-    nxt_http_action_t      *action;
-    nxt_http_header_val_t  *header;
-
-    action = r->action;
-
-    if (action == NULL || action->set_headers == NULL) {
-        return 0;
-    }
-
-    header = action->set_headers->elts;
-    n = action->set_headers->nelts;
-
-    for (i = 0; i < n; i++) {
-        if (header[i].name.length == nxt_length("ETag")
-            && nxt_strncasecmp(header[i].name.start, (u_char *) "ETag",
-                               nxt_length("ETag")) == 0)
-        {
-            return 1;
-        }
-
-        if (header[i].name.length == nxt_length("Last-Modified")
-            && nxt_strncasecmp(header[i].name.start,
-                               (u_char *) "Last-Modified",
-                               nxt_length("Last-Modified")) == 0)
-        {
-            return 1;
-        }
-    }
-
-    return 0;
+    return r->action != NULL && r->action->set_headers_validators;
 }
 
 
 /*
- * What nxt_http_set_headers() will later do to the response field "name".
+ * What nxt_http_set_headers() will later do to the response field
+ * Content-Encoding.
  *
  * Code that runs before the header is sent can ask this.  Compression needs
  * it: a Content-Encoding from "response_headers" replaces the one that a
@@ -112,11 +85,13 @@ nxt_http_set_headers_override_validators(nxt_http_request_t *r)
  * The status test is the same as in nxt_http_set_headers().  Keys are
  * applied in order, so the last key that matches and is not skipped gives
  * the result.  The search goes back from the end and stops at that key.
+ *
+ * nxt_http_set_headers_init() records whether a key has this name.  Without
+ * such a key, the search is not made.
  */
 
 nxt_http_set_header_op_t
-nxt_http_set_headers_field_op(nxt_http_request_t *r, const char *name,
-    size_t length)
+nxt_http_set_headers_encoding_op(nxt_http_request_t *r)
 {
     nxt_int_t                   ret;
     nxt_uint_t                  i;
@@ -124,9 +99,11 @@ nxt_http_set_headers_field_op(nxt_http_request_t *r, const char *name,
     nxt_http_header_val_t       *header;
     nxt_http_set_headers_ctx_t  *ctx;
 
+    static const nxt_str_t  content_encoding = nxt_string("Content-Encoding");
+
     action = r->action;
 
-    if (action == NULL || action->set_headers == NULL) {
+    if (action == NULL || !action->set_headers_encoding) {
         return NXT_HTTP_SET_HEADER_NONE;
     }
 
@@ -144,9 +121,7 @@ nxt_http_set_headers_field_op(nxt_http_request_t *r, const char *name,
     while (i > 0) {
         i--;
 
-        if (header[i].name.length != length
-            || nxt_memcasecmp(header[i].name.start, name, length) != 0)
-        {
+        if (!nxt_strcasestr_eq(&header[i].name, &content_encoding)) {
             continue;
         }
 
@@ -185,6 +160,10 @@ nxt_http_set_headers_init(nxt_router_conf_t *rtcf, nxt_http_action_t *action,
     nxt_conf_value_t       *value;
     nxt_http_header_val_t  *hv;
 
+    static const nxt_str_t  etag = nxt_string("ETag");
+    static const nxt_str_t  last_modified = nxt_string("Last-Modified");
+    static const nxt_str_t  content_encoding = nxt_string("Content-Encoding");
+
     headers = nxt_array_create(rtcf->mem_pool, 4,
                                sizeof(nxt_http_header_val_t));
     if (nxt_slow_path(headers == NULL)) {
@@ -214,6 +193,16 @@ nxt_http_set_headers_init(nxt_router_conf_t *rtcf, nxt_http_action_t *action,
         }
 
         nxt_memcpy(hv->name.start, name.start, name.length);
+
+        if (nxt_strcasestr_eq(&name, &etag)
+            || nxt_strcasestr_eq(&name, &last_modified))
+        {
+            action->set_headers_validators = 1;
+        }
+
+        if (nxt_strcasestr_eq(&name, &content_encoding)) {
+            action->set_headers_encoding = 1;
+        }
 
         if (nxt_conf_type(value) == NXT_CONF_STRING) {
             nxt_conf_get_string(value, &str);
@@ -286,8 +275,8 @@ nxt_http_set_headers_ctx(nxt_http_request_t *r)
  *
  * A null value gives a null string, which removes the field.  A value that
  * is not safe in a field gives NXT_DECLINED, and the key is skipped.
- * nxt_http_set_headers() and nxt_http_set_headers_field_op() both use this,
- * so they agree on what each key does.
+ * nxt_http_set_headers() and nxt_http_set_headers_encoding_op() both use
+ * this, so they agree on what each key does.
  */
 
 static nxt_int_t
@@ -419,7 +408,7 @@ nxt_http_set_headers(nxt_http_request_t *r)
     n = action->set_headers->nelts;
 
     /*
-     * nxt_http_set_headers_field_op() can have resolved some keys already.
+     * nxt_http_set_headers_encoding_op() can have resolved some keys already.
      * Their stored results are used here, and they are not resolved again.
      */
 
