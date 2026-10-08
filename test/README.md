@@ -170,7 +170,9 @@ When you write a test:
   use `port_map.expected(value)`.
 
 `test_port_map.py` runs `unit/port_lint.py`. It fails when a test uses a known
-port that is not mapped. CI also runs `test` with `--port 18080`.
+port that is not mapped. CI also runs `test` with `--port 18080`, on the Perl
+leg of a push to `master` or of a pull request that carries the `ci-full`
+label.
 
 (clang-ast static analysis is Docker-only — see the section below.)
 

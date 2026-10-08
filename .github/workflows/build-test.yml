@@ -131,7 +131,7 @@ jobs:
 
   # The core build, once for the whole run.  Every matrix leg below used to
   # run the same "Configure unit" and "Make unit" steps with the same flags,
-  # so the same objects were compiled 26 times.  This job does it once and
+  # so every leg compiled the same objects again.  This job does it once and
   # ships the result as an artifact; the legs unpack it and build only their
   # own module.  Flags here are a copy of what the legs ran before -- keep
   # the two in step if they ever change.
@@ -387,13 +387,6 @@ jobs:
           # libunit port/fd lifecycle covered in the python leg only.
           testpath="test/test_${module}* test/test_app_lifecycle.py"
 
-          # "unit" is the only leg that runs the language-agnostic suite in
-          # one piece; the Python-application tests self-skip there without
-          # the module, and every other test runs as written.
-          if [ "$module" = "unit" ]; then
-            testpath="test"
-          fi
-
           # A Python leg runs its interpreter-specific suites whole.  That is
           # what the three versions are for.  It also takes a share of the
           # other files, balanced by measured time (see below).  Three runs
@@ -407,10 +400,21 @@ jobs:
           # through the python module in test_python_* -- and an unmatched
           # pattern survives shell expansion literally, so pytest aborts the
           # whole leg with "file or directory not found" instead of running the
-          # rest.  `test/test_*.py` is depth 1 while the unit leg runs the whole
-          # `test` tree, so a nested test file would run on unit and on no
-          # python leg; keep the two definitions of "the suite" in step.
+          # rest.
+          #
+          # The python legs are the only legs that run the language-agnostic
+          # suite.  They list `test/test_*.py`, depth 1.  pytest also collects
+          # `*_test.py` and test files in subdirectories, but no leg would
+          # run such a file, so fail on one.
           if [ "$module" = "python" ]; then
+            stray=$(find test -name '*_test.py' -o \
+                              -path 'test/*/*' -name 'test_*.py')
+            if [ -n "${stray}" ]; then
+              echo "::error::no leg runs these test files:" \
+                   "$(echo "${stray}" | tr '\n' ' ')" >&2
+              exit 1
+            fi
+
             versions=$(jq -r '.runtimes.python | length' pkg/eol.json)
             shard=$(jq -r --arg v "${version}" \
               '[.runtimes.python[].version] | index($v)' pkg/eol.json)
@@ -919,7 +923,7 @@ jobs:
       ##
 
       - name: Cache Cargo artifacts
-        if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
+        if: steps.metadata.outputs.module == 'python'
         uses: actions/cache@v6
         with:
           path: |
@@ -932,17 +936,17 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-cargo-
 
       - name: Install Rust toolchain
-        if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
+        if: steps.metadata.outputs.module == 'python'
         run: rustup toolchain install stable --no-self-update --profile minimal
 
       - name: Build fake_upstream
-        if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
+        if: steps.metadata.outputs.module == 'python'
         run: |
           cargo build --release --manifest-path test/fake_upstream/Cargo.toml
           sudo cp test/fake_upstream/target/release/fake_upstream /usr/local/bin/
 
       - name: Build fake_otlp
-        if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
+        if: steps.metadata.outputs.module == 'python'
         run: |
           cargo build --release --manifest-path test/fake_otlp/Cargo.toml
           sudo cp test/fake_otlp/target/release/fake_otlp /usr/local/bin/
@@ -1026,9 +1030,28 @@ jobs:
       # The port map (test/unit/port.py) is the identity at the default base
       # of 8080, so every leg above proves only its no-op path: a literal that
       # bypasses the map is invisible until the base moves.  Two such literals
-      # shipped in the change that added the map.  Re-run the language-agnostic
-      # suite off-base here, on the one leg that runs the whole `test` tree, so
-      # the map itself is a machine check rather than a manual one.
+      # shipped in the change that added the map.  Re-run the suite off-base
+      # here, so the map itself is a machine check rather than a manual one.
+      #
+      # The leg is perl, and the event is a master push or a pull request
+      # labelled "ci-full".  The leg that used to run this step was unit, and
+      # that leg is gone.  perl replaces it because perl is the only other leg
+      # that builds one cheap module and skips every other language test, so
+      # `pytest test` here is the language-agnostic suite plus test_perl*.  The
+      # go and node fixtures still name port 8080, so those two legs cannot run
+      # off-base.  A python leg could, but each python leg runs only its share
+      # of the shared files, so the step would run three times and would make
+      # the python legs, which are the longest legs of a pull request, about
+      # three times longer.
+      #
+      # The event gate keeps a pull request at the wall time this workflow was
+      # trimmed for.  perl took 109 s and python-3.12 took 372 s in run
+      # 36318226905, and the unit leg ran for 3 min 57 s in run 37846680960, so
+      # the step on every pull request would most likely still leave perl
+      # shorter than python-3.12.  That is an estimate from two different runs,
+      # not a measurement, so the step stays off the pull request path until
+      # someone measures it.  A pull request that needs the check can carry the
+      # "ci-full" label.
       #
       # !cancelled() rather than the implicit success(): a failure in the run
       # above is reported on its own, and gating this on it would quietly take
@@ -1043,11 +1066,14 @@ jobs:
           TZ: Asia/Kolkata
         run: |
           sudo env TZ="${TZ:-}" pytest-3 --print-log --port 18080 test
-        if: ${{ !cancelled() && steps.metadata.outputs.module == 'unit' }}
+        if: >-
+          !cancelled() && steps.metadata.outputs.module == 'perl' &&
+          (github.event_name != 'pull_request' ||
+          contains(github.event.pull_request.labels.*.name, 'ci-full'))
 
       # test_capget_fallback.py needs a unitd that actually calls capget(),
       # which a root one never does, so every leg above skips it -- the file
-      # is inside "test" but has never once run.  Repeat it here without
+      # is in the suite but has never once run.  Repeat it here without
       # sudo.  The python leg is the one chosen because the test drives a
       # real application to show it inherits the shim harmlessly, and this
       # leg is where a language module exists.
