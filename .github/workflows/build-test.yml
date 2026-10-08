@@ -1021,6 +1021,7 @@ jobs:
       # unitd on its own state directory and stops it while a store runs.
       # test_njs_modules.py stores njs modules and starts unitd again to
       # check what it loads from the state directory.
+      # test_python_shm_limit_stored starts unitd on a stored configuration.
       # All need --restart, which the run above does not pass, so they skip
       # there.  Run them again.
       - name: Run the tests that restart unitd, with --restart
@@ -1030,6 +1031,7 @@ jobs:
             test/test_asgi_lifespan.py \
             test/test_njs_modules.py \
             test/test_state_store.py \
+            test/test_python_shm_limit.py::test_python_shm_limit_stored \
             test/test_tls.py::test_tls_certificate_update_restart
         if: ${{ !cancelled() && steps.metadata.outputs.module == 'python' }}
 

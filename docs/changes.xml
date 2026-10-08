@@ -87,9 +87,9 @@ on 64-bit platforms, the "shm" limit of an application was cut to its low
 32 bits.  libunit takes it as a 32-bit number.  So 4294967296 gave the smallest
 limit, one segment of 10 MiB.  A value from 4284481537 to 4294967295 also gave
 one segment, because the rounding to whole segments wrapped.  The control API
-now refuses a "shm" over 4294967295.  A stored configuration with such a value
-is still loaded, with a warning, and the application gets a limit of
-4294967295.  The bug had appeared in 1.14.0.
+now refuses a "shm" over 4294967295 or below 0.  A stored configuration with
+such a value is still loaded, with a warning.  On a 64-bit platform the
+application gets a limit of 4294967295.  The bug had appeared in 1.14.0.
 </para>
 </change>
 
