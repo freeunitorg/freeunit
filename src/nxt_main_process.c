@@ -76,6 +76,10 @@ static void nxt_main_port_modules_handler(nxt_task_t *task,
 static int nxt_cdecl nxt_app_lang_compare(const void *v1, const void *v2);
 static void nxt_main_process_whoami_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
+static nxt_int_t nxt_main_process_whoami_ready(nxt_task_t *task,
+    nxt_port_t *port, uint32_t stream, nxt_buf_t *buf);
+static void nxt_main_process_whoami_refuse(nxt_task_t *task, nxt_fd_t fd,
+    nxt_port_recv_msg_t *msg, nxt_process_t *pprocess);
 #if (NXT_USE_CMSG_PID)
 static void nxt_main_process_name_child(nxt_task_t *task,
     nxt_process_t *pprocess, nxt_process_t *process, nxt_pid_t ns_pid);
@@ -114,6 +118,7 @@ static void nxt_main_port_access_log_handler(nxt_task_t *task,
 #if (NXT_TESTS)
 static nxt_uint_t  nxt_main_test_process_new_failure_count;
 static nxt_msec_t  nxt_main_test_store_delay;
+static nxt_uint_t  nxt_main_test_whoami_ready_failure_count;
 
 
 void
@@ -801,6 +806,17 @@ nxt_main_test_run_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
 
 /*
+ * Make the next "failures" RPC_READY replies to WHOAMI fail before they are
+ * written, as a failed nxt_port_socket_write() does.
+ */
+void
+nxt_main_test_whoami_ready_failures(nxt_uint_t failures)
+{
+    nxt_main_test_whoami_ready_failure_count = failures;
+}
+
+
+/*
  * Let src/test/nxt_main_store_test.c drive the state store.  The delay
  * makes each store child sleep before it stores, so that the test can act
  * while the child runs.  The test reaps the child with waitpid() and
@@ -1027,11 +1043,16 @@ nxt_main_process_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
     nxt_buf_t      *buf;
     nxt_pid_t      pid, ppid;
+    nxt_bool_t     taken, replied;
     nxt_port_t     *port;
     nxt_runtime_t  *rt;
-    nxt_process_t  *pprocess;
+    nxt_process_t  *pprocess, *process;
 
     nxt_assert(msg->port_msg.reply_port == 0);
+
+    taken = 0;
+
+    pprocess = NULL;
 
     if (nxt_slow_path(msg->buf == NULL
         || nxt_buf_used_size(msg->buf) != sizeof(nxt_pid_t)))
@@ -1096,6 +1117,22 @@ nxt_main_process_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
             nxt_alert(task, "whoami: process %PI sent WHOAMI again", pid);
             goto fail;
         }
+
+        /*
+         * nxt_runtime_process_port_create() below reuses a record that
+         * exists for this pid.  If that record is still in a "children"
+         * queue, the insert below would link it twice.  No way to reach
+         * this state is known.  The check makes the invariant hold in a
+         * release build too, where the nxt_assert() below is compiled out.
+         */
+
+        process = nxt_runtime_process_find(rt, pid);
+
+        if (nxt_slow_path(process != NULL && process->link.next != NULL)) {
+            nxt_alert(task, "whoami: process %PI is already a child of "
+                      "a prototype", pid);
+            goto fail;
+        }
     }
 
     if (msg->fd[0] != -1) {
@@ -1110,6 +1147,7 @@ nxt_main_process_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         port->pair[0] = -1;
         port->pair[1] = msg->fd[0];
         msg->fd[0] = -1;
+        taken = 1;
 
         port->max_size = 16 * 1024;
         port->max_share = 64 * 1024;
@@ -1136,26 +1174,49 @@ nxt_main_process_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 #endif
     }
 
+    replied = 0;
+
     buf = nxt_buf_mem_alloc(task->thread->engine->mem_pool,
                             sizeof(nxt_pid_t), 0);
-    if (nxt_slow_path(buf == NULL)) {
-        goto fail;
+
+    if (nxt_fast_path(buf != NULL)) {
+        buf->mem.free = nxt_cpymem(buf->mem.free, &pid, sizeof(nxt_pid_t));
+
+        if (nxt_fast_path(nxt_main_process_whoami_ready(task, port,
+                                                        msg->port_msg.stream,
+                                                        buf)
+                          == NXT_OK))
+        {
+            replied = 1;
+
+        } else {
+            /* Still ours: the port layer takes the buffer only on NXT_OK. */
+
+            nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                               buf->completion_handler, task, buf,
+                               buf->parent);
+        }
     }
 
-    buf->mem.free = nxt_cpymem(buf->mem.free, &pid, sizeof(nxt_pid_t));
-
-    if (nxt_slow_path(nxt_port_socket_write(task, port,
-                                            NXT_PORT_MSG_RPC_READY_LAST, -1,
-                                            msg->port_msg.stream, 0, buf)
-                      != NXT_OK))
-    {
-        /* Still ours: the port layer takes the buffer only on NXT_OK. */
-
-        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
-                           buf->completion_handler, task, buf, buf->parent);
+    /*
+     * The worker waits for a reply on the port that main took.  If no
+     * RPC_READY went out, send it RPC_ERROR there, as for a refusal.
+     */
+    if (nxt_slow_path(!replied && taken)) {
+        nxt_main_process_whoami_refuse(task, port->pair[1], msg, pprocess);
     }
 
 fail:
+
+    /*
+     * An accepted WHOAMI has taken its descriptor or never had one.  So a
+     * descriptor still here means the message was refused.  The sender
+     * waits for the reply on the other end of that socket, and closing our
+     * copy does not wake it: the sender holds a copy too.  So tell it.
+     */
+    if (msg->fd[0] != -1) {
+        nxt_main_process_whoami_refuse(task, msg->fd[0], msg, pprocess);
+    }
 
     /*
      * Close both descriptors: WHOAMI carries one, but a compromised sender
@@ -1163,6 +1224,100 @@ fail:
      * leak a descriptor of the main process on every forged message.
      */
     nxt_port_recv_msg_close_fds(msg);
+}
+
+
+static nxt_int_t
+nxt_main_process_whoami_ready(nxt_task_t *task, nxt_port_t *port,
+    uint32_t stream, nxt_buf_t *buf)
+{
+#if (NXT_TESTS)
+    if (nxt_slow_path(nxt_main_test_whoami_ready_failure_count != 0)) {
+        nxt_main_test_whoami_ready_failure_count--;
+        return NXT_ERROR;
+    }
+#endif
+
+    return nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_READY_LAST, -1,
+                                 stream, 0, buf);
+}
+
+
+/*
+ * Answer a refused WHOAMI with RPC_ERROR on the descriptor that came with
+ * it, or on the port taken from it if the reply could not be sent.  The sender has registered the stream, so its error handler runs, and
+ * it logs the refusal and exits.
+ *
+ * The sender is not trusted, and it chooses both the descriptor and the
+ * stream.  A message that main writes passes every sender check of the
+ * receiver.  So an application could attach its copy of the router's port
+ * and make main fail a router RPC.  The answer is sent only if the socket
+ * was created by the prototype that the message names, as a worker's port
+ * is (nxt_process_start()).  Elsewhere the sender is not told.
+ *
+ * The message is one header with no payload, sent once and not queued: the
+ * descriptor is not a port of main, and it is closed right after this call.
+ * The send does not block, so that a sender cannot stall main.  If the send
+ * fails, the sender is not told; main logs that.
+ */
+
+static void
+nxt_main_process_whoami_refuse(nxt_task_t *task, nxt_fd_t fd,
+    nxt_port_recv_msg_t *msg, nxt_process_t *pprocess)
+{
+    ssize_t         n;
+    nxt_port_msg_t  pm;
+#if (NXT_HAVE_UCRED)
+    socklen_t       len;
+    struct ucred    cred;
+#endif
+
+    if (pprocess == NULL
+        || nxt_process_type(pprocess) != NXT_PROCESS_PROTOTYPE)
+    {
+        return;
+    }
+
+#if (NXT_HAVE_UCRED)
+    len = sizeof(struct ucred);
+
+    /*
+     * SO_PEERCRED names the process that called socketpair(), not the
+     * process that holds the socket.  That is enough because a worker holds
+     * exactly one socketpair end that the prototype created: its own port.
+     * nxt_process_child_fixup() closes the ports of the sibling workers in
+     * a new worker, and its other ports come from main and the router.
+     */
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0
+        || len != sizeof(struct ucred)
+        || cred.pid != pprocess->pid)
+    {
+        nxt_log(task, NXT_LOG_WARN, "whoami: process %PI sent a socket "
+                "that its prototype did not create", msg->port_msg.pid);
+        return;
+    }
+#else
+    return;
+#endif
+
+    nxt_memzero(&pm, sizeof(nxt_port_msg_t));
+
+    pm.stream = msg->port_msg.stream;
+    pm.pid = nxt_pid;
+    pm.type = _NXT_PORT_MSG_RPC_ERROR;
+    pm.last = 1;
+
+    /*
+     * MSG_DONTWAIT, not O_NONBLOCK: the sender shares the file status flags
+     * and could clear O_NONBLOCK.  The receiver sets SO_PASSCRED, so the
+     * kernel adds main's credentials.
+     */
+    n = send(fd, &pm, sizeof(nxt_port_msg_t), MSG_DONTWAIT);
+
+    if (nxt_slow_path(n != (ssize_t) sizeof(nxt_port_msg_t))) {
+        nxt_log(task, NXT_LOG_WARN, "whoami: the refusal was not sent to "
+                "process %PI", msg->port_msg.pid);
+    }
 }
 
 
