@@ -158,6 +158,71 @@ nxt_http_static_buf_freelist_drain(void)
 #endif
 
 
+/*
+ * Last-Modified and the ETag body are pure functions of the whole-second
+ * mtime and the size of the file.  A small table per thread keeps the
+ * formatted strings, so they are not formatted again for each response.
+ * "W/" and the "-gzip" suffix are added per response.  The table is
+ * direct-mapped: a slot keeps the last key that hashed to it.  The memory is
+ * fixed, and a miss costs the old formatting plus one copy.  No invalidation
+ * is needed: a changed key formats new strings, and an unchanged key gives
+ * the same strings that formatting would give.
+ */
+
+#define NXT_HTTP_STATIC_META_SLOTS  16
+
+typedef struct {
+    nxt_time_t  mtime;
+    nxt_off_t   size;
+    uint8_t     valid;
+    uint8_t     date_length;
+    uint8_t     etag_length;
+    u_char      date[NXT_HTTP_DATE_LEN];
+    /* The ETag without "W/", the "-gzip" suffix and the closing quote. */
+    u_char      etag[nxt_length("\"-") + NXT_TIME_T_HEXLEN + 1
+                     + NXT_OFF_T_HEXLEN];
+} nxt_http_static_meta_t;
+
+#if (NXT_HAVE_THREAD_STORAGE_CLASS)
+static nxt_thread_declare_data(nxt_http_static_meta_t,
+    nxt_http_static_meta_cache[NXT_HTTP_STATIC_META_SLOTS]);
+#endif
+
+
+static nxt_http_static_meta_t *
+nxt_http_static_meta(nxt_time_t mtime, nxt_off_t size, nxt_mp_t *mp)
+{
+    struct tm               tm;
+    nxt_http_static_meta_t  *m;
+
+#if (NXT_HAVE_THREAD_STORAGE_CLASS)
+    m = &nxt_http_static_meta_cache[((nxt_uint_t) mtime ^ (nxt_uint_t) size)
+                                    % NXT_HTTP_STATIC_META_SLOTS];
+
+    if (m->mtime == mtime && m->size == size && m->valid) {
+        return m;
+    }
+#else
+    m = nxt_mp_get(mp, sizeof(nxt_http_static_meta_t));
+    if (nxt_slow_path(m == NULL)) {
+        return NULL;
+    }
+#endif
+
+    nxt_gmtime(mtime, &tm);
+
+    m->date_length = nxt_http_date(m->date, &tm) - m->date;
+    /* "%T" reads an nxt_time_t; a native time_t can differ (QNX). */
+    m->etag_length = nxt_sprintf(m->etag, m->etag + sizeof(m->etag),
+                                 "\"%xT-%xO", mtime, size)
+                     - m->etag;
+    m->mtime = mtime;
+    m->size = size;
+    m->valid = 1;
+
+    return m;
+}
+
 
 static nxt_http_action_t *nxt_http_static(nxt_task_t *task,
     nxt_http_request_t *r, nxt_http_action_t *action);
@@ -489,7 +554,6 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
 {
     size_t                  length, encode;
     u_char                  *p, *end, *fname;
-    struct tm               tm;
     nxt_buf_t               *fb;
     nxt_int_t               ret;
     nxt_str_t               *shr, *index, exten, *mtype, etag;
@@ -505,6 +569,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_action_t       *action;
     nxt_work_handler_t      body_handler;
     nxt_http_static_conf_t  *conf;
+    nxt_http_static_meta_t  *meta;
 
     static const nxt_str_t  svgz_exten = nxt_string(".svgz");
     static const nxt_str_t  svg_mtype = nxt_string("image/svg+xml");
@@ -710,15 +775,20 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
 
         nxt_http_field_name_set(field, "Last-Modified");
 
-        p = nxt_mp_nget(r->mem_pool, NXT_HTTP_DATE_LEN);
+        meta = nxt_http_static_meta(nxt_file_mtime(&fi), nxt_file_size(&fi),
+                                    r->mem_pool);
+        if (nxt_slow_path(meta == NULL)) {
+            goto fail;
+        }
+
+        p = nxt_mp_nget(r->mem_pool, meta->date_length);
         if (nxt_slow_path(p == NULL)) {
             goto fail;
         }
 
-        nxt_gmtime(nxt_file_mtime(&fi), &tm);
-
         field->value = p;
-        field->value_length = nxt_http_date(p, &tm) - p;
+        field->value_length = meta->date_length;
+        nxt_memcpy(p, meta->date, meta->date_length);
 
         if (exten.start == NULL) {
             nxt_http_static_extract_extension(shr, &exten);
@@ -792,8 +862,8 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
          * to the tag of a response it compresses.
          */
 
-        length = nxt_length("W/") + NXT_TIME_T_HEXLEN + NXT_OFF_T_HEXLEN
-                 + nxt_length("-gzip") + 3;
+        length = nxt_length("W/") + meta->etag_length
+                 + nxt_length("-gzip\"");
 
         p = nxt_mp_nget(r->mem_pool, length);
         if (nxt_slow_path(p == NULL)) {
@@ -806,20 +876,16 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
             *p++ = 'W';
             *p++ = '/';
         }
-        /*
-         * nxt_file_mtime() yields a native time_t, which need not be
-         * nxt_time_t: on QNX it is a 32-bit unsigned type against a 64-bit
-         * nxt_time_t.  "%T" reads an nxt_time_t from the argument list, so
-         * the value has to be converted before it is passed, not after.
-         */
-        end = field->value + length;
 
-        field->value_length = nxt_sprintf(p, end, "\"%xT-%xO%s\"",
-                                          (nxt_time_t) nxt_file_mtime(&fi),
-                                          nxt_file_size(&fi),
-                                          svgz ? (u_char *) "-gzip"
-                                               : (u_char *) "")
-                              - field->value;
+        end = nxt_cpymem(p, meta->etag, meta->etag_length);
+
+        if (svgz) {
+            end = nxt_cpymem(end, "-gzip", nxt_length("-gzip"));
+        }
+
+        *end++ = '"';
+
+        field->value_length = end - field->value;
 
         /*
          * The comparison functions work on the opaque tag, so "etag" skips
