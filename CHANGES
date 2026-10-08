@@ -149,6 +149,21 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        other platforms, a level above 255 used only its low byte: 265 became
        9, with no notice. The bug had appeared in 1.35.0.
 
+    *) Change: libunit sends the response of a request through the shared
+       memory queue of the router port again. To keep the messages of a
+       request in order, 1.37.0 sent all of them to the socket, except the
+       last one. For a small PHP response that cost two more datagrams and
+       13.7% more instructions per request in the server. Now a response
+       moves to the queue with its first message that fits there, and its
+       later messages follow it there, so the order holds.
+       Response data over 15 bytes now goes into shared memory also below
+       1024 bytes, and holds a 16 KiB chunk of the "shm" limit until the
+       router has written it. When no chunk is free, a small write uses
+       plain memory and the socket, as before, and does not wait. A
+       websocket keeps the path of 1.37.0. An application of type
+       "external", such as Go or Node.js, gets the change when it is
+       built with the new libunit.
+
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 
