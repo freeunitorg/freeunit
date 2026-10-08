@@ -307,7 +307,7 @@ jobs:
 
   test:
     needs: [prepare, core]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     # 45, not 30: the wasm leg now runs the suite on a cold contrib wasmtime
     # build (the cache key moves with the pin) and builds the guest toolchain.
     timeout-minutes: 45
@@ -315,7 +315,6 @@ jobs:
       fail-fast: false
       matrix:
         build: ${{ fromJSON(needs.prepare.outputs.builds) }}
-        os: [ubuntu-latest]
 
     steps:
       - uses: actions/checkout@v7
