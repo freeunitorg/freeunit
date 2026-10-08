@@ -1606,3 +1606,58 @@ def test_tls_certificate_cstring_nul():
 
     resp = conf_cert(["default\0junk"])
     assert 'null character' in resp.get('detail', ''), 'array nul'
+
+
+def test_tls_handshake_old_version_log_level(wait_for_record, findall):
+    client.certificate()
+
+    resp = client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "routes",
+                    "tls": {
+                        "certificate": "default",
+                        "conf_commands": {"MinProtocol": "TLSv1.2"},
+                    },
+                }
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    )
+
+    if 'built without' in resp.get('detail', ''):
+        pytest.skip('built without conf_commands support')
+
+    assert 'success' in resp, 'load application configuration'
+
+    # A TLS 1.0 ClientHello with no extensions, as scanners send.  The
+    # server refuses it with "unsupported protocol" (258) or "version too
+    # low" (396) on OpenSSL, and "wrong version number" (267) on LibreSSL.
+    # All are the peer's fault and are logged at info.
+    # MinProtocol makes the server refuse TLS 1.0 whatever the library or
+    # distribution default is.
+    ciphers = b'\x00\x2f\xc0\x13'
+    body = (
+        b'\x03\x01'
+        + os.urandom(32)
+        + b'\x00'
+        + len(ciphers).to_bytes(2, 'big')
+        + ciphers
+        + b'\x01\x00'
+    )
+    handshake = b'\x01' + len(body).to_bytes(3, 'big') + body
+    record = b'\x16\x03\x01' + len(handshake).to_bytes(2, 'big') + handshake
+
+    with socket.create_connection(('127.0.0.1', 8080), timeout=5) as sock:
+        sock.sendall(record)
+        try:
+            sock.recv(1024)
+        except OSError:
+            pass
+
+    pattern = r'SSL_do_handshake.*(unsupported protocol|version too low|wrong version number)'
+
+    assert wait_for_record(rf'\[info\].*{pattern}') is not None
+    assert not findall(rf'\[alert\].*{pattern}')
