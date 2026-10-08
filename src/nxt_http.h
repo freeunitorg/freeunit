@@ -386,6 +386,10 @@ struct nxt_http_action_s {
     nxt_tstr_t                      *rewrite;
     nxt_array_t                     *set_headers;  /* of nxt_http_field_t */
     nxt_http_action_t               *fallback;
+
+    /* Key names in "response_headers", set by nxt_http_set_headers_init(). */
+    uint8_t                         set_headers_validators;  /* 1 bit */
+    uint8_t                         set_headers_encoding;    /* 1 bit */
 };
 
 
@@ -522,8 +526,8 @@ nxt_int_t nxt_http_rewrite_init(nxt_router_conf_t *rtcf,
 nxt_int_t nxt_http_rewrite(nxt_task_t *task, nxt_http_request_t *r);
 
 nxt_bool_t nxt_http_set_headers_override_validators(nxt_http_request_t *r);
-nxt_http_set_header_op_t nxt_http_set_headers_field_op(nxt_http_request_t *r,
-    const char *name, size_t length);
+nxt_http_set_header_op_t nxt_http_set_headers_encoding_op(
+    nxt_http_request_t *r);
 nxt_int_t nxt_http_comp_merge_vary(nxt_http_request_t *r);
 nxt_int_t nxt_http_set_headers_init(nxt_router_conf_t *rtcf,
     nxt_http_action_t *action, nxt_http_action_conf_t *acf);

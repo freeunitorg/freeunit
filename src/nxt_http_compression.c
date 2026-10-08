@@ -1350,8 +1350,7 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
      * absent.
      */
 
-    conf_op = nxt_http_set_headers_field_op(r, "Content-Encoding",
-                                            nxt_length("Content-Encoding"));
+    conf_op = nxt_http_set_headers_encoding_op(r);
 
     if (nxt_slow_path(conf_op == NXT_HTTP_SET_HEADER_ERROR)) {
         return NXT_ERROR;
