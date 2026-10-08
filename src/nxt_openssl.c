@@ -1759,6 +1759,7 @@ nxt_openssl_conn_error(nxt_task_t *task, nxt_err_t err, const char *fmt, ...)
 static nxt_uint_t
 nxt_openssl_log_error_level(nxt_err_t err)
 {
+    int            reason;
     unsigned long  lib_err;
 
     lib_err = ERR_peek_error();
@@ -1774,33 +1775,158 @@ nxt_openssl_log_error_level(nxt_err_t err)
         return nxt_socket_error_level(ERR_GET_REASON(lib_err));
     }
 
-    switch (ERR_GET_REASON(lib_err)) {
+    /*
+     * The reason codes below are SSL_R_* values.  Other libraries reuse the
+     * same numbers (RAND_R_ERROR_RETRIEVING_ENTROPY is 110, as is
+     * SSL_R_BAD_EXTENSION), so a crypto failure must not match them.
+     */
+    if (lib_err != 0 && ERR_GET_LIB(lib_err) != ERR_LIB_SSL) {
+        return NXT_LOG_ALERT;
+    }
+
+    reason = ERR_GET_REASON(lib_err);
+
+    switch (reason) {
 
     case 0:
         return nxt_socket_error_level(err);
 
+    /*
+     * Handshake and record failures caused by what the peer sent.  The list
+     * follows ngx_ssl_connection_error() in nginx; the TLS 1.3 era reasons
+     * (key share, signature algorithm, version too low, unsupported protocol)
+     * are what internet scanners trigger most.
+     *
+     * Two OpenSSL reasons are left out on purpose, so they reach the
+     * default branch below and log at alert.  SSL_R_CALLBACK_FAILED (234) is
+     * raised when the server's SNI callback, nxt_openssl_servername(),
+     * fails.  SSL_R_CERT_CB_ERROR (377) comes from a certificate callback,
+     * which Unit does not set today.  Both point at the server, not at the
+     * peer.  LibreSSL uses 234 for
+     * SSL_R_TLS_RSA_ENCRYPTED_VALUE_LENGTH_IS_WRONG, which the peer causes.
+     * No library defines both names, so the #ifdef on the LibreSSL name
+     * keeps OpenSSL's 234 out of the list.
+     */
+#ifdef SSL_R_NO_SUITABLE_KEY_SHARE
+    case SSL_R_NO_SUITABLE_KEY_SHARE:                     /*  101 */
+#endif
     case SSL_R_BAD_CHANGE_CIPHER_SPEC:                    /*  103 */
+#ifdef SSL_R_BAD_KEY_SHARE
+    case SSL_R_BAD_KEY_SHARE:                             /*  108 */
+#endif
+#ifdef SSL_R_BAD_EXTENSION
+    case SSL_R_BAD_EXTENSION:                             /*  110 */
+#endif
+#ifdef SSL_R_BAD_DIGEST_LENGTH
+    case SSL_R_BAD_DIGEST_LENGTH:                         /*  111 */
+#endif
+#ifdef SSL_R_MISSING_SIGALGS_EXTENSION
+    case SSL_R_MISSING_SIGALGS_EXTENSION:                 /*  112 */
+#endif
+#ifdef SSL_R_BAD_PACKET_LENGTH
+    case SSL_R_BAD_PACKET_LENGTH:                         /*  115 */
+#endif
+#ifdef SSL_R_NO_SUITABLE_SIGNATURE_ALGORITHM
+    case SSL_R_NO_SUITABLE_SIGNATURE_ALGORITHM:           /*  118 */
+#endif
+#ifdef SSL_R_BAD_KEY_UPDATE
+    case SSL_R_BAD_KEY_UPDATE:                            /*  122 */
+#endif
     case SSL_R_BLOCK_CIPHER_PAD_IS_WRONG:                 /*  129 */
+#ifdef SSL_R_CCS_RECEIVED_EARLY
+    case SSL_R_CCS_RECEIVED_EARLY:                        /*  133 */
+#endif
+#ifdef SSL_R_DATA_BETWEEN_CCS_AND_FINISHED
+    case SSL_R_DATA_BETWEEN_CCS_AND_FINISHED:             /*  145 */
+#endif
+#ifdef SSL_R_DATA_LENGTH_TOO_LONG
+    case SSL_R_DATA_LENGTH_TOO_LONG:                      /*  146 */
+#endif
     case SSL_R_DIGEST_CHECK_FAILED:                       /*  149 */
+#ifdef SSL_R_ENCRYPTED_LENGTH_TOO_LONG
+    case SSL_R_ENCRYPTED_LENGTH_TOO_LONG:                 /*  150 */
+#endif
     case SSL_R_ERROR_IN_RECEIVED_CIPHER_LIST:             /*  151 */
     case SSL_R_EXCESSIVE_MESSAGE_SIZE:                    /*  152 */
+#ifdef SSL_R_GOT_A_FIN_BEFORE_A_CCS
+    case SSL_R_GOT_A_FIN_BEFORE_A_CCS:                    /*  154 */
+#endif
+#ifdef SSL_R_HTTPS_PROXY_REQUEST
+    case SSL_R_HTTPS_PROXY_REQUEST:                       /*  155 */
+#endif
+#ifdef SSL_R_HTTP_REQUEST
+    case SSL_R_HTTP_REQUEST:                              /*  156 */
+#endif
     case SSL_R_LENGTH_MISMATCH:                           /*  159 */
+#ifdef SSL_R_LENGTH_TOO_SHORT
+    case SSL_R_LENGTH_TOO_SHORT:                          /*  160 */
+#endif
 #ifdef SSL_R_NO_CIPHERS_PASSED
     case SSL_R_NO_CIPHERS_PASSED:                         /*  182 */
 #endif
     case SSL_R_NO_CIPHERS_SPECIFIED:                      /*  183 */
+#ifdef SSL_R_BAD_CIPHER
+    case SSL_R_BAD_CIPHER:                                /*  186 */
+#endif
     case SSL_R_NO_COMPRESSION_SPECIFIED:                  /*  187 */
     case SSL_R_NO_SHARED_CIPHER:                          /*  193 */
+#ifdef SSL_R_PACKET_LENGTH_TOO_LONG
+    case SSL_R_PACKET_LENGTH_TOO_LONG:                    /*  198 */
+#endif
+#ifdef SSL_R_INVALID_ALERT
+    case SSL_R_INVALID_ALERT:                             /*  205 */
+#endif
     case SSL_R_RECORD_LENGTH_MISMATCH:                    /*  213 */
+#ifdef SSL_R_CLIENTHELLO_TLSEXT
+    case SSL_R_CLIENTHELLO_TLSEXT:                        /*  226 */
+#endif
 #ifdef SSL_R_PARSE_TLSEXT
     case SSL_R_PARSE_TLSEXT:                              /*  227 */
+#endif
+#ifdef SSL_R_TLS_RSA_ENCRYPTED_VALUE_LENGTH_IS_WRONG
+    case SSL_R_TLS_RSA_ENCRYPTED_VALUE_LENGTH_IS_WRONG:   /*  234 */
+#endif
+#ifdef SSL_R_NO_APPLICATION_PROTOCOL
+    case SSL_R_NO_APPLICATION_PROTOCOL:                   /*  235 */
 #endif
     case SSL_R_UNEXPECTED_MESSAGE:                        /*  244 */
     case SSL_R_UNEXPECTED_RECORD:                         /*  245 */
     case SSL_R_UNKNOWN_ALERT_TYPE:                        /*  246 */
     case SSL_R_UNKNOWN_PROTOCOL:                          /*  252 */
+#ifdef SSL_R_UNSUPPORTED_PROTOCOL
+    case SSL_R_UNSUPPORTED_PROTOCOL:                      /*  258 */
+#endif
     case SSL_R_WRONG_VERSION_NUMBER:                      /*  267 */
+#ifdef SSL_R_BAD_LENGTH
+    case SSL_R_BAD_LENGTH:                                /*  271 */
+#endif
     case SSL_R_DECRYPTION_FAILED_OR_BAD_RECORD_MAC:       /*  281 */
+#ifdef SSL_R_APPLICATION_DATA_AFTER_CLOSE_NOTIFY
+    case SSL_R_APPLICATION_DATA_AFTER_CLOSE_NOTIFY:       /*  291 */
+#endif
+#ifdef SSL_R_BAD_LEGACY_VERSION
+    case SSL_R_BAD_LEGACY_VERSION:                        /*  292 */
+#endif
+#ifdef SSL_R_MIXED_HANDSHAKE_AND_NON_HANDSHAKE_DATA
+    case SSL_R_MIXED_HANDSHAKE_AND_NON_HANDSHAKE_DATA:    /*  293 */
+#endif
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+    case SSL_R_UNEXPECTED_EOF_WHILE_READING:              /*  294 */
+#endif
+#ifdef SSL_R_RECORD_TOO_SMALL
+    case SSL_R_RECORD_TOO_SMALL:                          /*  298 */
+#endif
+#ifdef SSL_R_SSL3_SESSION_ID_TOO_LONG
+    case SSL_R_SSL3_SESSION_ID_TOO_LONG:                  /*  300 */
+#elif defined SSL_R_TLS_SESSION_ID_TOO_LONG
+    case SSL_R_TLS_SESSION_ID_TOO_LONG:                   /*  300 */
+#endif
+#ifdef SSL_R_BAD_ECPOINT
+    case SSL_R_BAD_ECPOINT:                               /*  306 */
+#endif
+#ifdef SSL_R_RECORD_LAYER_FAILURE
+    case SSL_R_RECORD_LAYER_FAILURE:                      /*  313 */
+#endif
 #ifdef SSL_R_RENEGOTIATE_EXT_TOO_LONG
     case SSL_R_RENEGOTIATE_EXT_TOO_LONG:                  /*  335 */
     case SSL_R_RENEGOTIATION_ENCODING_ERR:                /*  336 */
@@ -1809,8 +1935,26 @@ nxt_openssl_log_error_level(nxt_err_t err)
 #ifdef SSL_R_UNSAFE_LEGACY_RENEGOTIATION_DISABLED
     case SSL_R_UNSAFE_LEGACY_RENEGOTIATION_DISABLED:      /*  338 */
 #endif
+#ifdef SSL_R_NO_RENEGOTIATION
+    case SSL_R_NO_RENEGOTIATION:                          /*  339 */
+#endif
 #ifdef SSL_R_SCSV_RECEIVED_WHEN_RENEGOTIATING
     case SSL_R_SCSV_RECEIVED_WHEN_RENEGOTIATING:          /*  345 */
+#endif
+#ifdef SSL_R_INAPPROPRIATE_FALLBACK
+    case SSL_R_INAPPROPRIATE_FALLBACK:                    /*  373 */
+#endif
+#ifdef SSL_R_NO_SHARED_SIGNATURE_ALGORITHMS
+    case SSL_R_NO_SHARED_SIGNATURE_ALGORITHMS:            /*  376 */
+#endif
+#ifdef SSL_R_VERSION_TOO_LOW
+    case SSL_R_VERSION_TOO_LOW:                           /*  396 */
+#endif
+#ifdef SSL_R_TOO_MANY_WARN_ALERTS
+    case SSL_R_TOO_MANY_WARN_ALERTS:                      /*  409 */
+#endif
+#ifdef SSL_R_BAD_RECORD_TYPE
+    case SSL_R_BAD_RECORD_TYPE:                           /*  443 */
 #endif
     case 1000:/* SSL_R_SSLV3_ALERT_CLOSE_NOTIFY */
     case SSL_R_TLS_ALERT_UNEXPECTED_MESSAGE:            /* 1010 */
@@ -1838,9 +1982,30 @@ nxt_openssl_log_error_level(nxt_err_t err)
     case SSL_R_TLSV1_ALERT_INTERNAL_ERROR:                /* 1080 */
     case SSL_R_TLSV1_ALERT_USER_CANCELLED:                /* 1090 */
     case SSL_R_TLSV1_ALERT_NO_RENEGOTIATION:              /* 1100 */
+#ifdef SSL_R_TLSV1_CERTIFICATE_UNOBTAINABLE
+    case SSL_R_TLSV1_CERTIFICATE_UNOBTAINABLE:            /* 1111 */
+#endif
+#ifdef SSL_R_TLSV1_BAD_CERTIFICATE_STATUS_RESPONSE
+    case SSL_R_TLSV1_BAD_CERTIFICATE_STATUS_RESPONSE:     /* 1113 */
+#endif
+#ifdef SSL_R_TLSV1_BAD_CERTIFICATE_HASH_VALUE
+    case SSL_R_TLSV1_BAD_CERTIFICATE_HASH_VALUE:          /* 1114 */
+#endif
         return NXT_LOG_ERR;
 
     default:
+        /*
+         * Any other alert the peer sent (1000..1255, e.g. unrecognized name,
+         * certificate required) is the peer's decision, not a server fault.
+         * The certificate alerts above point at the server's certificate or
+         * OCSP response, so they stay at err.
+         */
+        if (reason >= SSL_AD_REASON_OFFSET
+            && reason <= SSL_AD_REASON_OFFSET + 255)
+        {
+            return NXT_LOG_INFO;
+        }
+
         return NXT_LOG_ALERT;
     }
 

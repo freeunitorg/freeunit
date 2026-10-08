@@ -113,6 +113,11 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        for a record that is still linked to a prototype. The bug had
        appeared in 1.37.0.
 
+    *) Change: a TLS connection that fails because of what the client
+       sent is now logged at "info" instead of "alert". This covers an old
+       protocol version, an unsupported key share or signature algorithm,
+       and most alerts from the client.
+
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 
