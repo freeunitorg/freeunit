@@ -1318,12 +1318,20 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
     /*
      * A Content-Encoding on the response means the application coded the
      * body itself.  Unit does not code it again.
+     *
+     * The length test only skips names that cannot match.  libunit and the
+     * static handler put a NUL at name_length, and nxt_strcasecmp() stops
+     * at the first NUL.  The router does not check that NUL.  The compare
+     * is kept, so a name with a NUL inside gives the same result as before.
      */
 
     nxt_http_fields_each(f, r->resp.inline_fields, r->resp.num_inline_fields,
                          r->resp.fields)
     {
-        if (nxt_strcasecmp(f->name, (const u_char *)"Content-Encoding") == 0) {
+        if (f->name_length >= nxt_length("Content-Encoding")
+            && nxt_strcasecmp(f->name, (const u_char *) "Content-Encoding")
+               == 0)
+        {
             return NXT_OK;
         }
     } nxt_http_fields_loop;
