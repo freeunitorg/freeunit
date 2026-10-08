@@ -12,6 +12,7 @@ on:
       - 'pkg/eol.json'
       - '.github/workflows/build-test.yml'
       - '.github/scripts/check-test-hooks.sh'
+      - '.github/scripts/test-matrix.sh'
   push:
     branches: master
     paths:
@@ -24,6 +25,7 @@ on:
       - 'pkg/eol.json'
       - '.github/workflows/build-test.yml'
       - '.github/scripts/check-test-hooks.sh'
+      - '.github/scripts/test-matrix.sh'
 
 env:
   # OpenSSL patch version built from source (see "Build OpenSSL" step). Only the
@@ -59,42 +61,73 @@ concurrency:
 jobs:
   # Single source of truth for the test matrix. The version-tested language
   # modules (go/java/node/php/python/ruby) are derived from pkg/eol.json; the
-  # fixed extras below are not runtime-versioned in CI. Excluded on purpose:
+  # fixed extras in .github/scripts/test-matrix.sh are not runtime-versioned
+  # in CI. Excluded on purpose:
   # per-version perl (tested against the runner's system perl), python "-slim"
   # and the "minimal" image — those are Docker packaging flavors, not test axes.
+  # A pull request gets one version of each runtime unless it changes that
+  # runtime's paths; .github/scripts/test-matrix.sh has the rules.
   prepare:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     outputs:
       builds: ${{ steps.list.outputs.builds }}
     steps:
+      # For a pull request, github.sha is the merge of the pull request into
+      # its base, and its first parent is the base.  Depth 2 fetches both.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      # The diff of the tested merge against its base is exactly what the
+      # run tests.  --no-renames lists both names of a renamed file, so a
+      # file moved out of a runtime's paths still counts for that runtime.
+      # When the diff fails or is empty, the step writes no list, and the
+      # next step builds the full matrix.  A pull request with the label
+      # "ci-full" skips this step, so it gets the full matrix too.  The
+      # label counts from the next push, or a close and reopen; a re-run
+      # does not see a new label.
+      - name: List the files that the pull request changes
+        id: files
+        if: >-
+          github.event_name == 'pull_request' &&
+          !contains(github.event.pull_request.labels.*.name, 'ci-full')
+        run: |
+          list="$RUNNER_TEMP/pr-files.txt"
+          if git diff --name-only --no-renames HEAD^1 HEAD > "$list" &&
+             [ -s "$list" ]
+          then
+            echo "list=${list}" >> "$GITHUB_OUTPUT"
+            echo "$(wc -l < "$list") changed files"
+          else
+            echo "::warning::could not list the changed files; every runtime version runs"
+          fi
+
+      # A broken rule in the script can drop legs from pull requests while
+      # the run stays green.  The self-test runs fixed cases of the rules
+      # and fails the run when one gives a different matrix.
+      - name: Check the matrix rules
+        run: .github/scripts/test-matrix.sh --self-test
+
       - name: Derive build list from pkg/eol.json
         id: list
-        # Slow legs come first in the list.  All 25 legs are created at
+        # Slow legs come first in the list.  All legs are created at
         # once.  The hosted runner pool is smaller than the matrix, so some
         # legs wait for a runner.  GitHub does not promise to start legs in
         # matrix order.  Two runs (36318226905 and 36322425869) showed no
         # such order: python-3.12 was last in the old matrix and started
         # last; it was first in this matrix and started 12th of 23.  The
-        # order is a hypothesis and has no cost.  The set of legs does not
-        # change.  Times from run 36318226905: python-3.12 372 s (pytest
+        # order is a hypothesis and has no cost; it does not change the set
+        # of legs.  Times from run 36318226905: python-3.12 372 s (pytest
         # 332 s; 243 s and 170 s on 3.13 and 3.14), wasm-wasi-component
         # 322 s, java 250 to 273 s, php-8.4 255 s.  Short legs: perl 109 s,
         # wasm 88 s, node about 150 s, ruby about 125 s.
+        env:
+          CHANGED: ${{ steps.files.outputs.list }}
         run: |
-          builds=$(jq -c '
-            def legs($rt): [ (.runtimes[$rt] // [])[] | $rt + "-" + .version ];
-            legs("python")
-            + ["wasm-wasi-component"]
-            + legs("java")
-            + legs("php")
-            + ["unit", "perl", "wasm"]
-            + legs("go")
-            + legs("node")
-            + legs("ruby")
-          ' pkg/eol.json)
+          builds=$(.github/scripts/test-matrix.sh pkg/eol.json "${CHANGED}")
           echo "builds=${builds}" >> "$GITHUB_OUTPUT"
+          echo "${builds}"
 
   # The core build, once for the whole run.  Every matrix leg below used to
   # run the same "Configure unit" and "Make unit" steps with the same flags,

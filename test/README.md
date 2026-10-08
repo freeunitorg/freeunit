@@ -237,6 +237,15 @@ test/
 
 ## CI
 
-All tests run on GitHub Actions for every PR and push to `master`. See
-`.github/workflows/build-test.yml` for the full matrix (PHP 8.3–8.5, Python 3.12–3.14,
-Go 1.25–1.26, Node.js 20/22/24/26, Java 17/21, Ruby 3.3/3.4/4.0, WASM, WASI).
+GitHub Actions runs the tests in `.github/workflows/build-test.yml`. The
+language versions come from `pkg/eol.json`.
+
+- A push to `master` runs every version of every runtime.
+- A pull request runs every Python version, Perl, WASM and WASI, and one
+  version each of Go, Java, Node.js, PHP and Ruby. A runtime whose own files
+  change gets every version. A change to `pkg/eol.json`, to `build-test.yml`
+  or to `.github/scripts/test-matrix.sh` gives the full matrix. So does the
+  `ci-full` label on the pull request.
+
+`.github/scripts/test-matrix.sh` has the rules and the version that a pull
+request gets for each runtime.
