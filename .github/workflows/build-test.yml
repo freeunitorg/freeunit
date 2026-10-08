@@ -1429,6 +1429,63 @@ jobs:
           grep -q 'define NXT_HAVE_BUILTIN_OVERFLOW' \
             build/include/nxt_auto_config.h
 
+      # The point of this job is the compiler and the OpenSSL line, so check
+      # that the image still brings them.  configure writes the version that
+      # auto/cc/test found into NXT_COMPILER_VERSION, as
+      # "gcc version 16.2.1 ..." or "clang version 23.1.2 ...", the same
+      # string it prints.  The header is read and not the log, because the
+      # header is what the build uses; the log line is for people and a
+      # distribution is free to put its own name in front of the version, as
+      # Ubuntu does with "Ubuntu clang version".  What is compared is a floor
+      # and not an exact version: the job exists for the oldest compiler that
+      # this image is expected to carry, gcc 16 or clang 23, so a gcc 17 or a
+      # clang 24 passes, and the job comment above is what a bump updates.
+      # The name is the one the same auto/cc/test detection reported, which is
+      # gcc or clang, and the literal cc when the compiler -v output matches
+      # neither.  Fedora 45 ships no OpenSSL 3.x, so the container must report
+      # a 4.x line, and anything else, or no version at all, fails with it
+      # printed.
+      - name: Assert the container toolchain is no older than the job target
+        run: |
+          version=$(awk -F'"' '/^#define NXT_COMPILER_VERSION/ { print $2 }' \
+                          build/include/nxt_auto_config.h)
+          if [ -z "$version" ]; then
+            echo "no NXT_COMPILER_VERSION in build/include/nxt_auto_config.h" \
+              >&2
+            exit 1
+          fi
+          case "$version" in
+            *"${{ matrix.cc }} version "*)
+              ;;
+            *)
+              echo "configure used \"$version\", not ${{ matrix.cc }}" >&2
+              exit 1
+              ;;
+          esac
+          major=$(echo "$version" | sed -n 's/.* version \([0-9][0-9]*\).*/\1/p')
+          case "$major" in
+            '' | *[!0-9]*)
+              echo "no major version in \"$version\"" >&2
+              exit 1
+              ;;
+          esac
+          case "${{ matrix.cc }}" in
+            gcc)   want=16 ;;
+            clang) want=23 ;;
+          esac
+          if [ "$major" -lt "$want" ]; then
+            echo "$version is older than the ${{ matrix.cc }} $want that this job expects" \
+              >&2
+            exit 1
+          fi
+          grep -q 'NXT_HAVE_OPENSSL_VERSION  "OpenSSL 4\.' \
+            build/include/nxt_auto_config.h || {
+            grep NXT_HAVE_OPENSSL_VERSION build/include/nxt_auto_config.h \
+              >&2 || true
+            echo "configure did not find the OpenSSL 4.x of fedora:45" >&2
+            exit 1
+          }
+
       - name: Build unitd and libunit
         run: |
           make -j4
