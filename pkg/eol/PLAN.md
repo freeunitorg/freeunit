@@ -119,7 +119,7 @@ still future work).
 ## CI wiring — DONE (2026-07)
 
 `.github/workflows/eol-check.yml` runs `cargo run --release --manifest-path
-pkg/eol/Cargo.toml -- --ci` on `ubuntu-latest`. Weekly `schedule:` cron (report-only,
+pkg/eol/Cargo.toml -- --ci` on `ubuntu-26.04`. Weekly `schedule:` cron (report-only,
 opens/updates a tracking issue on error) **plus** `pull_request:` on the eol
 data/tooling paths (hard-fails on validator errors). Distinguished by
 `github.event_name`; exit 2 (all fetches failed) is treated as a neutral outcome.
