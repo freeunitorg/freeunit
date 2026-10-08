@@ -42,7 +42,10 @@ if [ $NXT_OTEL = YES ]; then
 
 	cat << END >> $NXT_MAKEFILE
 
-RUST_FLAGS =		--release
+RUST_FLAGS =		--release --locked
+# Keep the caller's RUSTFLAGS.  Remap the source and cargo paths so that the
+# library does not carry the build directory.
+RUST_ENV =		RUSTFLAGS="\$\${RUSTFLAGS:+\$\$RUSTFLAGS }--remap-path-prefix=\$(CURDIR)=. --remap-path-prefix=\$\${CARGO_HOME:-\$\$HOME/.cargo}=/cargo"
 NXT_OTEL_LIB_STATIC =	$NXT_BUILD_DIR/lib/libotel.a
 
 END
@@ -686,7 +689,8 @@ NXT_OTEL_DEPS=" \
 
 \$(NXT_OTEL_LIB_STATIC): $NXT_OTEL_DEPS
 	\$(PP_CR) \$@
-	\$(v)cargo rustc \$(RUST_FLAGS) \\
+	\$(v)\$(RUST_ENV) \\
+		cargo rustc \$(RUST_FLAGS) \\
 		--manifest-path $NXT_OTEL_LIB_DIR/Cargo.toml \\
 		-- --emit link=../../$NXT_BUILD_DIR/lib/libotel.a
 END

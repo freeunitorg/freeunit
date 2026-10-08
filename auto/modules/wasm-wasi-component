@@ -84,10 +84,14 @@ $echo " + $NXT_WCM_MODULE module: $NXT_WCM_MOD_NAME"
 
 NXT_OS=$(uname -s)
 
+# Keep the caller's RUSTFLAGS and add path remapping for reproducible builds.
+# The text goes into the makefile, so make and the shell expand it later.
+NXT_CARGO_ENV='RUSTFLAGS="$${RUSTFLAGS:+$$RUSTFLAGS }--remap-path-prefix=$(CURDIR)=. --remap-path-prefix=$${CARGO_HOME:-$$HOME/.cargo}=/cargo"'
+
 if [ $NXT_OS = "Darwin" ]; then
-    NXT_CARGO_CMD="cargo rustc --release --manifest-path src/wasm-wasi-component/Cargo.toml -- --emit link=target/release/libwasm_wasi_component.so -C link-args='-undefined dynamic_lookup'"
+    NXT_CARGO_CMD="$NXT_CARGO_ENV cargo rustc --release --locked --manifest-path src/wasm-wasi-component/Cargo.toml -- --emit link=target/release/libwasm_wasi_component.so -C link-args='-undefined dynamic_lookup'"
 else
-    NXT_CARGO_CMD="cargo build --release --manifest-path src/wasm-wasi-component/Cargo.toml"
+    NXT_CARGO_CMD="$NXT_CARGO_ENV cargo build --release --locked --manifest-path src/wasm-wasi-component/Cargo.toml"
 fi
 
 
