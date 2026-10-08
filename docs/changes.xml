@@ -106,6 +106,18 @@ request.  The bug had appeared in 1.16.0.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+the control API accepted any integer for the timeouts in "settings/http", in
+"settings/http/websocket" and for "timeout" in "limits" of an application.
+They are now refused out of the range 0 to 2147483 seconds.  A stored
+configuration with such a value still loads, with a warning.  Numbers out of
+the range of an integer option now fail the configuration instead of giving
+an undefined value.  "requests" in "limits" and "thread_stack_size" are now
+refused above 2147483647, and "requests" below 0.
+</para>
+</change>
+
 </changes>
 
 

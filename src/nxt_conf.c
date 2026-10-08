@@ -602,6 +602,38 @@ nxt_conf_get_object_member(const nxt_conf_value_t *value, const nxt_str_t *name,
 }
 
 
+/*
+ * The conversion of a number to an integer type is defined only if the
+ * truncated number is in the range of that type (C11 6.3.1.4).  A signed
+ * type of N bits holds -2^(N-1) to 2^(N-1) - 1.  Each bound below is 2^(N-1).
+ * A power of two is exact as a double, so the check compares exact values.
+ */
+#define NXT_CONF_INT32_BOUND  ((uint64_t) NXT_INT32_T_MAX + 1)
+#define NXT_CONF_INT64_BOUND  ((uint64_t) NXT_INT64_T_MAX + 1)
+#define NXT_CONF_INT_BOUND    ((uint64_t) INT_MAX + 1)
+#define NXT_CONF_OFF_BOUND    ((uint64_t) NXT_OFF_T_MAX + 1)
+
+/*
+ * NXT_CONF_MAP_MSEC maps seconds to milliseconds in an unsigned 32-bit
+ * nxt_msec_t.  The largest number of seconds whose product fits is 4294967.
+ * The validator refuses a timeout out of 0 to 2147483 seconds, except in the
+ * stored configuration at startup (see nxt_conf_vldt_msec()).  Earlier
+ * versions accepted any number there, so the map does not fail the whole
+ * configuration.  A negative number, or one above 4294967, gives 4294967
+ * seconds.  A timer of more than NXT_INT32_T_MAX milliseconds fires at once
+ * (see nxt_msec_diff()), and so did -1 on x86, where the conversion gave
+ * 4294966296 milliseconds.  0 would disable the timer instead.
+ */
+#define NXT_CONF_MSEC_MAX     (UINT32_MAX / 1000)
+
+
+nxt_inline nxt_bool_t
+nxt_conf_map_in_range(double num, uint64_t bound)
+{
+    return num >= -(double) bound && num < (double) bound;
+}
+
+
 nxt_int_t
 nxt_conf_map_object(nxt_mp_t *mp, const nxt_conf_value_t *value,
     const nxt_conf_map_t *map, nxt_uint_t n, void *data)
@@ -666,16 +698,34 @@ nxt_conf_map_object(nxt_mp_t *mp, const nxt_conf_value_t *value,
             switch (map[i].type) {
 
             case NXT_CONF_MAP_INT32:
+                if (nxt_slow_path(!nxt_conf_map_in_range(num,
+                                                         NXT_CONF_INT32_BOUND)))
+                {
+                    return NXT_ERROR;
+                }
+
                 val.i32 = num;
                 len = sizeof(val.i32);
                 break;
 
             case NXT_CONF_MAP_INT64:
+                if (nxt_slow_path(!nxt_conf_map_in_range(num,
+                                                         NXT_CONF_INT64_BOUND)))
+                {
+                    return NXT_ERROR;
+                }
+
                 val.i64 = num;
                 len = sizeof(val.i64);
                 break;
 
             case NXT_CONF_MAP_INT:
+                if (nxt_slow_path(!nxt_conf_map_in_range(num,
+                                                         NXT_CONF_INT_BOUND)))
+                {
+                    return NXT_ERROR;
+                }
+
                 val.i = num;
                 len = sizeof(val.i);
                 break;
@@ -686,11 +736,21 @@ nxt_conf_map_object(nxt_mp_t *mp, const nxt_conf_value_t *value,
                 break;
 
             case NXT_CONF_MAP_OFF:
+                if (nxt_slow_path(!nxt_conf_map_in_range(num,
+                                                         NXT_CONF_OFF_BOUND)))
+                {
+                    return NXT_ERROR;
+                }
+
                 val.off = num;
                 len = sizeof(val.off);
                 break;
 
             case NXT_CONF_MAP_MSEC:
+                if (nxt_slow_path(num < 0 || num > NXT_CONF_MSEC_MAX)) {
+                    num = NXT_CONF_MSEC_MAX;
+                }
+
                 val.msec = (nxt_msec_t) num * 1000;
                 len = sizeof(val.msec);
                 break;

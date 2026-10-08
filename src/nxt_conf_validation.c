@@ -145,6 +145,12 @@ static nxt_int_t nxt_conf_vldt_listen_threads(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_min_rate(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_msec(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_requests(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_restored_range(nxt_conf_validation_t *vldt,
+    const char *name, int64_t min, int64_t max, const char *effect);
 static nxt_int_t nxt_conf_vldt_threads(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_thread_stack_size(nxt_conf_validation_t *vldt,
@@ -393,12 +399,18 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_http_members[] = {
     {
         .name       = nxt_string("header_read_timeout"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_msec,
+        .u.string   = "header_read_timeout",
     }, {
         .name       = nxt_string("body_read_timeout"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_msec,
+        .u.string   = "body_read_timeout",
     }, {
         .name       = nxt_string("send_timeout"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_msec,
+        .u.string   = "send_timeout",
     }, {
         .name       = nxt_string("body_min_rate"),
         .type       = NXT_CONF_VLDT_INTEGER,
@@ -412,6 +424,8 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_http_members[] = {
     }, {
         .name       = nxt_string("idle_timeout"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_msec,
+        .u.string   = "idle_timeout",
     }, {
         .name       = nxt_string("large_header_buffer_size"),
         .type       = NXT_CONF_VLDT_INTEGER,
@@ -492,10 +506,14 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_websocket_members[] = {
     {
         .name       = nxt_string("read_timeout"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_msec,
+        .u.string   = "read_timeout",
     }, {
 
         .name       = nxt_string("keepalive_interval"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_msec,
+        .u.string   = "keepalive_interval",
     }, {
         .name       = nxt_string("max_frame_size"),
         .type       = NXT_CONF_VLDT_INTEGER,
@@ -1385,12 +1403,15 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_app_limits_members[] = {
     {
         .name       = nxt_string("timeout"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_msec,
+        .u.string   = "timeout",
     }, {
         .name       = nxt_string("start_timeout"),
         .type       = NXT_CONF_VLDT_INTEGER,
     }, {
         .name       = nxt_string("requests"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_requests,
     }, {
         .name       = nxt_string("shm"),
         .type       = NXT_CONF_VLDT_INTEGER,
@@ -2841,6 +2862,113 @@ nxt_conf_vldt_min_rate(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
 }
 
 
+/*
+ * A timeout in seconds.  NXT_CONF_MAP_MSEC converts it to milliseconds in a
+ * 32-bit nxt_msec_t.  nxt_msec_diff() compares two such values as a signed
+ * difference, so a timeout above NXT_INT32_T_MAX milliseconds fires at once.
+ * The bound is the same as for "start_timeout".
+ *
+ * Earlier versions accepted any integer.  A stored configuration can have a
+ * value out of the range.  It is kept, with a warning.  nxt_conf_map_object()
+ * maps it to 4294967 seconds, so the timer fires at once, as before on x86.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_msec(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
+    void *data)
+{
+    double      num;
+    const char  *name;
+
+    name = data;
+    num = nxt_conf_get_number(value);
+
+    if (num >= 0 && num <= NXT_INT32_T_MAX / 1000) {
+        return NXT_OK;
+    }
+
+    if (!vldt->restored) {
+        if (num < 0) {
+            return nxt_conf_vldt_error(vldt, "The \"%s\" number must not "
+                                       "be negative.", name);
+        }
+
+        return nxt_conf_vldt_error(vldt, "The \"%s\" number must not "
+                                   "exceed %d.", name, NXT_INT32_T_MAX / 1000);
+    }
+
+    return nxt_conf_vldt_restored_range(vldt, name, 0, NXT_INT32_T_MAX / 1000,
+                                        "the timer fires at once");
+}
+
+
+/*
+ * A stored configuration from an earlier version can have a number that the
+ * control API now refuses.  Refusing it at startup would leave unitd with no
+ * configuration.  So it is kept, with a warning.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_restored_range(nxt_conf_validation_t *vldt, const char *name,
+    int64_t min, int64_t max, const char *effect)
+{
+    nxt_str_t  pointer;
+
+    pointer = vldt->pointer;
+    nxt_conf_vldt_render_pointer(vldt);
+
+    nxt_thread_log_error(NXT_LOG_WARN, "the restored configuration has a "
+                         "\"%s\" number out of the range %L to %L at \"%V\".  "
+                         "The control API now refuses it.  It is kept, and "
+                         "%s.  Correct it to be able to update the "
+                         "configuration.", name, min, max, &vldt->pointer,
+                         effect);
+
+    vldt->pointer = pointer;
+
+    return NXT_OK;
+}
+
+
+/*
+ * "requests" is mapped with NXT_CONF_MAP_INT32.  0, the default, means no
+ * limit.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_requests(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
+    void *data)
+{
+    double  num;
+
+    num = nxt_conf_get_number(value);
+
+    if (num >= 0 && num <= NXT_INT32_T_MAX) {
+        return NXT_OK;
+    }
+
+    if (!vldt->restored) {
+        if (num < 0) {
+            return nxt_conf_vldt_error(vldt, "The \"requests\" number must "
+                                       "be equal to or greater than 0.");
+        }
+
+        return nxt_conf_vldt_error(vldt, "The \"requests\" number must not "
+                                   "exceed %d.", NXT_INT32_T_MAX);
+    }
+
+    if (num < 0 && num >= -(double) NXT_INT32_T_MAX - 1) {
+        return nxt_conf_vldt_restored_range(vldt, "requests", 0,
+                                            NXT_INT32_T_MAX,
+                                            "it has the same effect as "
+                                            "before");
+    }
+
+    return nxt_conf_vldt_restored_range(vldt, "requests", 0, NXT_INT32_T_MAX,
+                                        "the application does not start");
+}
+
+
 static nxt_int_t
 nxt_conf_vldt_threads(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
     void *data)
@@ -2882,6 +3010,20 @@ nxt_conf_vldt_thread_stack_size(nxt_conf_validation_t *vldt,
         return nxt_conf_vldt_error(vldt, "The \"thread_stack_size\" number "
                              "must be a multiple of the system page size (%d).",
                              nxt_pagesize);
+    }
+
+    /* It is mapped with NXT_CONF_MAP_INT32. */
+
+    if (size > NXT_INT32_T_MAX) {
+        if (!vldt->restored) {
+            return nxt_conf_vldt_error(vldt, "The \"thread_stack_size\" "
+                                       "number must not exceed %d.",
+                                       NXT_INT32_T_MAX);
+        }
+
+        return nxt_conf_vldt_restored_range(vldt, "thread_stack_size",
+                                            min_size, NXT_INT32_T_MAX,
+                                            "the application does not start");
     }
 
     return NXT_OK;
