@@ -76,6 +76,19 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        targets with "root" only. This costs one chdir() call per request.
        The bug had appeared in 1.16.0.
 
+    *) Bugfix: the control API accepted any integer for the timeouts in
+       "settings/http", in "settings/http/websocket" and for "timeout" in
+       "limits" of an application. A negative timeout had no defined value.
+       A timeout above 2147483 seconds fired at once. They are now refused
+       out of the range 0 to 2147483 seconds, as "start_timeout" is. A
+       stored configuration with such a value still loads, with a warning,
+       and the timer fires at once, as a negative value did before on x86.
+       Numbers out of the range of an integer option now fail the
+       configuration instead of giving an undefined value. "requests" in
+       "limits" and "thread_stack_size" are now refused above 2147483647,
+       and "requests" below 0. See
+       https://github.com/freeunitorg/freeunit/issues/619.
+
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 

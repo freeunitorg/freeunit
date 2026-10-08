@@ -939,6 +939,32 @@ def test_python_application_path_invalid():
     check_path('["/blah", []]')
 
 
+def test_python_application_int32_validation():
+    client.load('empty')
+
+    app = 'applications/empty'
+
+    # Both options are mapped as 32-bit integers.
+    resp = client.conf({'requests': 2147483648}, f'{app}/limits')
+    assert 'error' in resp, 'requests 2147483648'
+    assert (
+        resp['detail'] == 'The "requests" number must not exceed 2147483647.'
+    ), 'requests message'
+
+    resp = client.conf({'requests': -1}, f'{app}/limits')
+    assert 'error' in resp, 'requests -1'
+
+    assert 'success' in client.conf({'requests': 0}, f'{app}/limits')
+    assert 'success' in client.conf({'requests': 2147483647}, f'{app}/limits')
+
+    resp = client.conf('2147483648', f'{app}/thread_stack_size')
+    assert 'error' in resp, 'thread_stack_size 2147483648'
+    assert (
+        resp['detail']
+        == 'The "thread_stack_size" number must not exceed 2147483647.'
+    ), 'thread_stack_size message'
+
+
 def test_python_application_threads():
     client.load('threads', threads=4)
 
