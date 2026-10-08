@@ -36,14 +36,6 @@ env:
   # https://github.com/openssl/openssl/releases/tag/openssl-3.5.9 and the
   # .sha256 file next to the tarball on openssl.org.  Bump both together.
   OPENSSL_SHA256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
-  # OpenSSL 4.0 for the openssl4 leg below.  Ubuntu does not ship 4.0 (Fedora 45
-  # does, see hardening-strict-fedora), so this leg builds it from source for
-  # the runner's toolchain and -DOPENSSL_NO_DEPRECATED.  The /opt/openssl-4.0
-  # slot is stable across patch bumps.
-  OPENSSL4_VERSION: 4.0.3
-  # SHA256 of openssl-${OPENSSL4_VERSION}.tar.gz, from
-  # https://github.com/openssl/openssl/releases/tag/openssl-4.0.3.
-  OPENSSL4_SHA256: 325b5c806167c13b40b1ffeadfe0248197c00eccc4cf123ec1e28d2d2fd216d9
   # The OpenSSL major that the Fedora container in hardening-strict-fedora is
   # expected to bring.  Fedora 45 ships the 4.0 line, so a 4.1 stays covered
   # while a 5.0 is a decision to take and a 3.x means the container moved.
@@ -422,7 +414,7 @@ jobs:
             # A jq miss prints "null" rather than failing, and a non-integer
             # in either comparison below fails open: the leg would run its
             # interpreter files, skip every shared one, and still report
-            # green.  Fail loudly instead, like the OpenSSL 4.0 assertion.
+            # green.  Fail loudly instead, like the OpenSSL assertions.
             case "${versions}" in
               ''|0|*[!0-9]*)
                 echo "::error::no python runtimes in pkg/eol.json" >&2
@@ -1299,170 +1291,25 @@ jobs:
           LSAN_OPTIONS: use_stacks=0
         run: ./build/unit_msg_test
 
-  # OpenSSL 4.0 compile gate.  4.0 removed nothing Unit uses, but it deprecated
-  # more of what Unit still calls, and 5.0 is where the deprecated symbols
-  # actually go away -- so the value here is having a leg that fails when a new
-  # deprecation lands, instead of noticing at removal time.  Deliberately cheap:
-  # a build plus the C test suite, no language modules and no pytest run, since
-  # nothing above the TLS layer changes with the OpenSSL version.
-  openssl4:
-    runs-on: ubuntu-26.04
-    timeout-minutes: 30
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Bound apt waits
-        run: |
-          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
-            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
-
-      - name: Install packages
-        timeout-minutes: 5
-        run: |
-          sudo apt-get -y update
-          sudo apt-get -y install build-essential libpcre2-dev
-
-      - name: Cache OpenSSL 4.0
-        id: cache-openssl4
-        uses: actions/cache@v6
-        with:
-          path: /opt/openssl-4.0
-          key: openssl-${{ env.OPENSSL4_VERSION }}-${{ env.OPENSSL4_SHA256 }}-${{ runner.os }}-${{ runner.arch }}
-
-      - name: Build OpenSSL 4.0
-        if: steps.cache-openssl4.outputs.cache-hit != 'true'
-        run: |
-          cd /tmp
-          wget -q "https://www.openssl.org/source/openssl-${OPENSSL4_VERSION}.tar.gz"
-          echo "${OPENSSL4_SHA256}  openssl-${OPENSSL4_VERSION}.tar.gz" | sha256sum -c -
-          tar -xzf "openssl-${OPENSSL4_VERSION}.tar.gz"
-          cd "openssl-${OPENSSL4_VERSION}"
-          ./Configure --prefix=/opt/openssl-4.0 shared no-docs
-          make -j$(nproc)
-          sudo mkdir -p /opt/openssl-4.0
-          sudo make install_sw
-
-      - name: Set OpenSSL 4.0 build environment
-        # Same isolation as the 3.5 slot: never overwrite the system libraries,
-        # because sudo links against them.
-        run: |
-          OSSL=/opt/openssl-4.0
-          LIBDIR=$( [ -d "$OSSL/lib64" ] && echo "$OSSL/lib64" || echo "$OSSL/lib" )
-          echo "OPENSSL4_INCDIR=${OSSL}/include" >> $GITHUB_ENV
-          echo "OPENSSL4_LIBDIR=${LIBDIR}"        >> $GITHUB_ENV
-
-      - name: Configure unit (--openssl --tests)
-        # LD_LIBRARY_PATH is scoped to this step only so that auto/feature test
-        # binaries load OpenSSL 4.0; exporting it globally would break sudo.
-        # The build itself needs no such help -- -Wl,-rpath below is baked into
-        # the binaries, and is honoured under sudo too.
-        env:
-          LD_LIBRARY_PATH: ${{ env.OPENSSL4_LIBDIR }}
-        run: |
-          ./configure \
-            --tests \
-            --openssl \
-            --cc-opt="-I${OPENSSL4_INCDIR} -DOPENSSL_NO_DEPRECATED" \
-            --ld-opt="-L${OPENSSL4_LIBDIR} -Wl,-rpath,${OPENSSL4_LIBDIR}"
-
-      # Assert rather than print: if the include/lib flags ever stop taking
-      # effect, configure falls back to the runner's system OpenSSL 3.x and the
-      # leg would pass while testing nothing it was added for.
-      - name: Assert configure found OpenSSL 4.0
-        run: |
-          grep NXT_HAVE_OPENSSL_VERSION build/include/nxt_auto_config.h
-          grep -q '#define NXT_HAVE_OPENSSL_VERSION  "OpenSSL 4\.' \
-            build/include/nxt_auto_config.h
-
-      - name: Build unit
-        run: make -j4
-
-      - name: Build C tests
-        run: make -j4 tests
-
-      - name: Run C tests
-        run: sudo ./build/tests
-
-  # --hardening=strict compile gate, with gcc and with clang.  auto/cc/test
-  # already passes -Werror to both, so a new warning from -Wformat=2, -Wvla or
+  # --hardening=strict compile gate with the newest gcc and clang: gcc 16.2.1
+  # and clang 23.1.2 in a Fedora 45 container, which also brings OpenSSL
+  # 4.0.3, the major declared in FEDORA_OPENSSL_MAJOR.  auto/cc/test already
+  # passes -Werror to both, so a new warning from -Wformat=2, -Wvla or
   # -Wimplicit-fallthrough (a fall-through without nxt_fallthrough) fails the
-  # job.  The assert step fails when a compiler stops accepting one of the
-  # probed flags: auto/cc/hardening only drops such a flag, so a plain build
-  # would pass while testing nothing.  Cheap on purpose: a build plus the C
-  # test suite, no language modules.
-  hardening-strict:
-    runs-on: ubuntu-26.04
-    timeout-minutes: 20
-
-    strategy:
-      fail-fast: false
-      matrix:
-        cc: [gcc, clang]
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Bound apt waits
-        run: |
-          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
-            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
-
-      - name: Install packages
-        timeout-minutes: 5
-        run: |
-          sudo apt-get -y update
-          sudo apt-get -y install build-essential libssl-dev libpcre2-dev clang
-
-      - name: Configure unit (--hardening=strict --tests --openssl)
-        run: |
-          ./configure \
-            --cc=${{ matrix.cc }} \
-            --hardening=strict \
-            --tests \
-            --openssl 2>&1 | tee configure.log
-          test "${PIPESTATUS[0]}" -eq 0
-
-      # Every flag that this job exists for must be found.  The FORTIFY probe
-      # falls back from level 3 to 2, so either level passes.  The CET and
-      # branch-protection flags are not asserted: each applies to one target
-      # only.
-      - name: Assert configure found the hardening flags
-        run: |
-          grep -q 'hardening: .* strict$' configure.log
-          for flag in -fstack-protector-strong -fstack-clash-protection \
-                      -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack \
-                      -Wformat=2 -Wvla -Wimplicit-fallthrough \
-                      -ftrivial-auto-var-init=pattern
-          do
-            grep -q "checking for $flag \.\.\. found" configure.log \
-              || { echo "$flag was not found"; exit 1; }
-          done
-          grep -q 'checking for -D_FORTIFY_SOURCE=[23] \.\.\. found' \
-            configure.log \
-            || { echo "_FORTIFY_SOURCE was not found"; exit 1; }
-          grep -q 'define NXT_HAVE_BUILTIN_OVERFLOW' \
-            build/include/nxt_auto_config.h
-
-      - name: Build unit
-        run: make -j4
-
-      - name: Build C tests
-        run: make -j4 tests
-
-      - name: Run C tests
-        run: sudo ./build/tests
-
-  # The same strict build with the newest gcc and clang: gcc 16.2.1 and clang
-  # 23.1.2 in a Fedora 45 container, which also brings OpenSSL 4.0.3, the
-  # major declared in FEDORA_OPENSSL_MAJOR.  The job
-  # above uses the runner's gcc 13.3 and clang 18.1.  Each new compiler adds
-  # warnings to -Wall and -Wextra, and -Werror makes each one a failure; the
-  # weekly rawhide job sees them up to 7 days later and does not run
-  # build/tests.  This job runs it, so a new optimizer meets the tests in the
-  # pull request.  The container runs as root, so there is no sudo, and its
-  # default capabilities are enough for build/tests.
+  # job.  Each new compiler adds warnings to -Wall
+  # and -Wextra, and -Werror makes each one a failure; the weekly rawhide job
+  # sees them up to 7 days later.  This job runs build/tests, so a new
+  # optimizer meets the tests in the pull request.  The container runs as
+  # root, so there is no sudo, and its default capabilities are enough for
+  # build/tests.
+  #
+  # The gcc leg also builds with -DOPENSSL_NO_DEPRECATED.  That hides every
+  # API that OpenSSL deprecates, the macros too, so a new deprecation fails
+  # the build when it lands and not when OpenSSL removes the API.  -Werror
+  # alone catches only the deprecated functions.  The clang leg builds as a
+  # distribution package does, with the deprecated API visible.
   hardening-strict-fedora:
+    name: hardening-strict-fedora (${{ matrix.cc }})
     runs-on: ubuntu-26.04
     timeout-minutes: 20
 
@@ -1470,6 +1317,9 @@ jobs:
       fail-fast: false
       matrix:
         cc: [gcc, clang]
+        include:
+          - cc: gcc
+            cc_opt: -DOPENSSL_NO_DEPRECATED
 
     container:
       image: fedora:45
@@ -1496,12 +1346,17 @@ jobs:
         run: |
           ./configure \
             --cc=${{ matrix.cc }} \
+            --cc-opt="${{ matrix.cc_opt }}" \
             --hardening=strict \
             --tests \
             --openssl 2>&1 | tee configure.log
           test "${PIPESTATUS[0]}" -eq 0
 
-      # The same flags as in hardening-strict.
+      # Every flag that this job exists for must be found.  auto/cc/hardening
+      # drops a flag that the compiler does not accept, so a plain build would
+      # pass while testing nothing.  The FORTIFY probe falls back from level 3
+      # to 2, so either level passes.  The CET and branch-protection flags are
+      # not asserted: each applies to one target only.
       - name: Assert configure found the hardening flags
         run: |
           grep -q 'hardening: .* strict$' configure.log
@@ -1581,6 +1436,9 @@ jobs:
             } >&2
             exit 1
           }
+          # Print the version on every run: fedora:45 moves with Fedora
+          # updates, so the log is the record of the patch level tested.
+          grep NXT_HAVE_OPENSSL_VERSION build/include/nxt_auto_config.h
 
       - name: Build unitd and libunit
         run: |
