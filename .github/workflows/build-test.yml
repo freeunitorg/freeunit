@@ -110,7 +110,16 @@ jobs:
           NJS_VERSION=$(sed -n "s/NJS_VERSION := \(.*\)/\1/p" pkg/contrib/src/njs/version)
           echo "njs_version=${NJS_VERSION}" >> "$GITHUB_OUTPUT"
 
+      # A stalled mirror must fail the step, not the job. Apt retries 3 times
+      # and treats 30 s without data as a stall. Later apt commands use this.
+      # Each job writes its own copy: jobs cannot share a step.
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
       - name: Install packages
+        timeout-minutes: 5
         run: sudo apt-get -y install libbrotli-dev ccache
 
       - name: Cache ccache
@@ -311,6 +320,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
       # Provides module, language version and testpath from build name
       - name: Output build metadata
         id: metadata
@@ -494,6 +508,7 @@ jobs:
           fi
 
       - name: Install packages
+        timeout-minutes: 5
         run: sudo apt-get -y install libbrotli-dev ccache
 
       # ccache transparently caches C object files across runs. The Debian
@@ -671,6 +686,7 @@ jobs:
       # https://github.com/actions/runner-images#available-images
 
       - name: Install libperl-dev
+        timeout-minutes: 5
         run: |
           sudo apt-get -y update
           sudo apt-get -y install libperl-dev
@@ -825,6 +841,7 @@ jobs:
         if: steps.metadata.outputs.module == 'wasm' && steps.cache-wasi-sysroot.outputs.cache-hit != 'true'
 
       - name: Install wasm guest toolchain
+        timeout-minutes: 5
         run: |
           sudo apt install -y clang lld
           sudo apt install -y "libclang-rt-$(clang -dumpversion | cut -d. -f1)-dev-wasm32"
@@ -935,10 +952,12 @@ jobs:
         if: steps.metadata.outputs.module != 'wasm'
 
       - name: Install pytest
+        timeout-minutes: 5
         run: |
           sudo apt install -y python3-pytest
 
       - name: Run ${{ steps.metadata.outputs.module }} tests
+        timeout-minutes: 12
         # GitHub runners are UTC, where localtime() and gmtime() agree, so a
         # UTC-only run cannot tell a correct HTTP-date from one rendered in
         # local time and labelled "GMT" (see test_static_last_modified_is_gmt,
@@ -1010,6 +1029,7 @@ jobs:
       # above would let one unrelated flake silently take that coverage away
       # again -- the very problem this step exists to fix.
       - name: Run capget fallback and configuration tests unprivileged
+        timeout-minutes: 5
         run: |
           export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
           /usr/bin/pytest-3 --print-log test/test_capget_fallback.py test/test_configuration.py
@@ -1025,6 +1045,7 @@ jobs:
       # All need --restart, which the run above does not pass, so they skip
       # there.  Run them again.
       - name: Run the tests that restart unitd, with --restart
+        timeout-minutes: 5
         run: |
           export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
           sudo -E /usr/bin/pytest-3 --print-log --restart \
@@ -1047,7 +1068,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
       - name: Install packages
+        timeout-minutes: 5
         run: |
           sudo apt-get -y update
           sudo apt-get -y install build-essential libssl-dev libpcre2-dev
@@ -1099,7 +1126,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
       - name: Install packages
+        timeout-minutes: 5
         run: |
           sudo apt-get -y update
           sudo apt-get -y install build-essential libpcre3-dev
@@ -1134,7 +1167,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
       - name: Install packages
+        timeout-minutes: 5
         run: |
           sudo apt-get -y update
           sudo apt-get -y install build-essential libssl-dev libpcre2-dev clang
@@ -1205,7 +1244,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
       - name: Install packages
+        timeout-minutes: 5
         run: |
           sudo apt-get -y update
           sudo apt-get -y install build-essential libpcre2-dev
@@ -1290,7 +1335,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
       - name: Install packages
+        timeout-minutes: 5
         run: |
           sudo apt-get -y update
           sudo apt-get -y install build-essential libssl-dev libpcre2-dev clang
@@ -1358,7 +1409,10 @@ jobs:
       # git before checkout: without it actions/checkout downloads the tree
       # through the REST API.  auto/cc/test needs which.  binutils and
       # diffutils give check-test-hooks.sh nm, objcopy and cmp.
+      # dnf already gives up on a mirror after 30 s without data (its default
+      # timeout); the step limit bounds the whole install.  It takes 15-33 s.
       - name: Install packages
+        timeout-minutes: 5
         run: |
           dnf -y install --setopt=install_weak_deps=False \
               git gcc make which binutils diffutils findutils \
@@ -1432,7 +1486,10 @@ jobs:
       image: almalinux:8
 
     steps:
+      # dnf already gives up on a mirror after 30 s without data (its default
+      # timeout); the step limit bounds the whole install.  It takes 15-33 s.
       - name: Install packages
+        timeout-minutes: 5
         run: |
           dnf -y install --setopt=install_weak_deps=False \
               git gcc make which binutils diffutils findutils \

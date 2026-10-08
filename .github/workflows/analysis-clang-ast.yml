@@ -37,7 +37,16 @@ jobs:
       image: debian:testing
 
     steps:
+      # A stalled mirror must fail the step, not the job. Apt retries 3 times
+      # and treats 30 s without data as a stall. Later apt commands use this.
+      # Each job writes its own copy: jobs cannot share a step.
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            tee /etc/apt/apt.conf.d/80-ci-bounds
+
       - name: Install tools/deps
+        timeout-minutes: 10
         run: |
           apt-get -y update
           apt-get -y install git wget curl llvm-dev libclang-dev clang make \
