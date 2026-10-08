@@ -42,6 +42,11 @@ env:
   # SHA256 of openssl-${OPENSSL4_VERSION}.tar.gz, from
   # https://github.com/openssl/openssl/releases/tag/openssl-4.0.3.
   OPENSSL4_SHA256: 325b5c806167c13b40b1ffeadfe0248197c00eccc4cf123ec1e28d2d2fd216d9
+  # The OpenSSL major that the Fedora container in hardening-strict-fedora is
+  # expected to bring.  Fedora 45 ships the 4.0 line, so a 4.1 stays covered
+  # while a 5.0 is a decision to take and a 3.x means the container moved.
+  # hardening-strict-fedora asserts the running container against this.
+  FEDORA_OPENSSL_MAJOR: "4"
 
 concurrency:
   # Cancel superseded runs for the same pull request.  Non-PR events fall back
@@ -1390,7 +1395,8 @@ jobs:
         run: sudo ./build/tests
 
   # The same strict build with the newest gcc and clang: gcc 16.2.1 and clang
-  # 23.1.2 in a Fedora 45 container, which also brings OpenSSL 4.0.3.  The job
+  # 23.1.2 in a Fedora 45 container, which also brings OpenSSL 4.0.3, the
+  # major declared in FEDORA_OPENSSL_MAJOR.  The job
   # above uses the runner's gcc 13.3 and clang 18.1.  Each new compiler adds
   # warnings to -Wall and -Wextra, and -Werror makes each one a failure; the
   # weekly rawhide job sees them up to 7 days later and does not run
@@ -1467,10 +1473,10 @@ jobs:
       # clang 24 passes, and the job comment above is what a bump updates.
       # The name is the one the same auto/cc/test detection reported, which is
       # gcc or clang, and the literal cc when the compiler -v output matches
-      # neither.  Fedora 45 ships no OpenSSL 3.x, so the container must report
-      # a 4.x line, and anything else, or no version at all, fails with it
-      # printed.
-      - name: Assert the container toolchain is no older than the job target
+      # neither.  Fedora 45 ships no OpenSSL 3.x, and the container must
+      # report the major in FEDORA_OPENSSL_MAJOR: a 4.1 stays covered, any
+      # other major, or no version at all, fails with the version printed.
+      - name: Assert the container toolchain versions
         run: |
           version=$(awk -F'"' '/^#define NXT_COMPILER_VERSION/ { print $2 }' \
                           build/include/nxt_auto_config.h)
@@ -1503,11 +1509,17 @@ jobs:
               >&2
             exit 1
           fi
-          grep -q 'NXT_HAVE_OPENSSL_VERSION  "OpenSSL 4\.' \
-            build/include/nxt_auto_config.h || {
+          # Built in two steps: a line continuation inside quotes keeps its
+          # leading spaces, which would not match the header.
+          openssl="NXT_HAVE_OPENSSL_VERSION  \"OpenSSL $FEDORA_OPENSSL_MAJOR"
+          openssl="$openssl\\."
+          grep -q "$openssl" build/include/nxt_auto_config.h || {
             grep NXT_HAVE_OPENSSL_VERSION build/include/nxt_auto_config.h \
               >&2 || true
-            echo "configure did not find the OpenSSL 4.x of fedora:45" >&2
+            {
+              echo "configure found no OpenSSL $FEDORA_OPENSSL_MAJOR.x for"
+              echo "fedora:45"
+            } >&2
             exit 1
           }
 
