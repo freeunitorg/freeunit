@@ -200,6 +200,13 @@ used only its low byte: 265 became 9, with no notice.  The bug had appeared in
 </para>
 </change>
 
+<change type="change">
+<para>
+a TLS connection that fails because of what the client sent is now logged
+at "info" instead of "alert".
+</para>
+</change>
+
 </changes>
 
 
