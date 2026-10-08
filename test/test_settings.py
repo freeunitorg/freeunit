@@ -167,6 +167,44 @@ def test_settings_size_validation():
         client.conf_delete('settings/http')
 
 
+def test_settings_compression_level_validation():
+    client.load('empty')
+
+    def put_level(level):
+        compressor = {'encoding': 'identity', 'level': level}
+        conf = {
+            'http': {
+                'compression': {
+                    'types': ['text/plain'],
+                    'compressors': compressor,
+                }
+            }
+        }
+
+        return client.put(
+            url='/config/settings',
+            sock_type='unix',
+            addr=f'{option.temp_dir}/control.unit.sock',
+            body=json.dumps(conf),
+        )
+
+    detail = 'The "level" number must be from -2147483648 to 2147483647.'
+
+    try:
+        for level in (2147483648, -2147483649):
+            resp = put_level(level)
+            assert resp['status'] == 400, f'level {level}'
+            assert json.loads(resp['body'])['detail'] == detail, level
+
+        for level in (2147483647, -2147483648, 1):
+            resp = put_level(level)
+            assert resp['status'] == 200, f'level {level}'
+
+    finally:
+        # The default no-restart suite preserves /settings between tests.
+        client.conf_delete('settings/http')
+
+
 STORED_CONF = {
     'listeners': {'*:8080': {'pass': 'routes'}},
     'routes': [{'action': {'return': 204}}],

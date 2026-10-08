@@ -14,6 +14,11 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        more, or less than -2147483648, is refused, and unitd starts with no
        configuration until it is corrected.
 
+    *) Bugfix: the "level" of a compressor accepted a number out of the
+       range of int, such as 2147483648. Its conversion to int was
+       undefined. The control API now refuses such a number with an error
+       that names "level".
+
     *) Bugfix: with a 32-bit size_t, the memory pool did not check the sum
        of a large size, its alignment and its block header. A request for
        4294967269 to 4294967294 bytes made a block of 0 to 24 bytes. The

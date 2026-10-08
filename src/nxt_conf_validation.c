@@ -153,6 +153,8 @@ static nxt_int_t nxt_conf_vldt_restored_range(nxt_conf_validation_t *vldt,
     const char *name, int64_t min, int64_t max, const char *effect);
 static nxt_int_t nxt_conf_vldt_size(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_int(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_threads(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_thread_stack_size(nxt_conf_validation_t *vldt,
@@ -570,6 +572,8 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_compressor_members[] = {
     }, {
         .name       = nxt_string("level"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_int,
+        .u.string   = "level",
     }, {
         .name       = nxt_string("min_length"),
         .type       = NXT_CONF_VLDT_INTEGER,
@@ -3052,6 +3056,32 @@ nxt_conf_vldt_requests(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
 
     return nxt_conf_vldt_restored_range(vldt, "requests", 0, NXT_INT32_T_MAX,
                                         "the application does not start");
+}
+
+
+/*
+ * An option that NXT_CONF_MAP_INT maps to an int.  A number out of the range
+ * of int cannot be mapped, and the router does not check the map status for
+ * the compressor options.  So the validator refuses it.  The number is
+ * compared as a double, as in nxt_conf_vldt_size().
+ */
+
+static nxt_int_t
+nxt_conf_vldt_int(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
+    void *data)
+{
+    double      num;
+    const char  *name;
+
+    name = data;
+    num = nxt_conf_get_number(value);
+
+    if (num < INT_MIN || num > INT_MAX) {
+        return nxt_conf_vldt_error(vldt, "The \"%s\" number must be from "
+                                   "%d to %d.", name, INT_MIN, INT_MAX);
+    }
+
+    return NXT_OK;
 }
 
 
