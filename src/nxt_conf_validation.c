@@ -2416,6 +2416,9 @@ nxt_conf_vldt_listener(nxt_conf_validation_t *vldt, nxt_str_t *name,
     nxt_str_t       str;
     nxt_sockaddr_t  *sa;
 
+    static const nxt_str_t  pass_str = nxt_string("pass");
+    static const nxt_str_t  app_str = nxt_string("application");
+
     if (nxt_slow_path(nxt_str_dup(vldt->pool, &str, name) == NULL)) {
         return NXT_ERROR;
     }
@@ -2430,6 +2433,20 @@ nxt_conf_vldt_listener(nxt_conf_validation_t *vldt, nxt_str_t *name,
     ret = nxt_conf_vldt_type(vldt, name, value, NXT_CONF_VLDT_OBJECT);
     if (ret != NXT_OK) {
         return ret;
+    }
+
+    /*
+     * The router refuses a listener with no action.  A stored configuration
+     * cannot have one, because the router never applied it, so a restored
+     * configuration is checked the same way.
+     */
+
+    if (nxt_conf_get_object_member(value, &pass_str, NULL) == NULL
+        && nxt_conf_get_object_member(value, &app_str, NULL) == NULL)
+    {
+        return nxt_conf_vldt_error(vldt, "The listener \"%V\" must have "
+                                   "either \"pass\" or \"application\" "
+                                   "option set.", name);
     }
 
     return nxt_conf_vldt_object(vldt, value, nxt_conf_vldt_listener_members);

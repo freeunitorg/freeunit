@@ -352,12 +352,16 @@ def test_access_log_cstring_nul(temp_dir):
     ), 'path valid'
 
 
-@pytest.mark.xfail(
-    reason='validation accepts an empty listener; the router then fails',
-    strict=False,
-)
 def test_listeners_empty():
-    assert 'error' in client.conf({"*:8080": {}}, 'listeners'), 'listener empty'
+    resp = client.conf({"*:8080": {}}, 'listeners')
+
+    assert resp.get('error') == 'Invalid configuration.', 'listener empty'
+    assert '"pass" or "application"' in resp['detail'], 'reason given'
+    assert resp['location']['path'] == '/listeners/*:8080', 'names listener'
+
+    resp = client.conf({"*:8080": {"backlog": 10}}, 'listeners')
+
+    assert '"pass" or "application"' in resp['detail'], 'no action member'
 
 
 def test_listeners_no_app():
