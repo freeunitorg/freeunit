@@ -58,11 +58,16 @@ jobs:
 
       # --tests has always been configured here, but only "all" was built,
       # so a toolchain that breaks the tests binary alone went unnoticed
-      # (musl's CMSG_NXTHDR under clang, #475).  build/tests itself is built,
-      # not run: the clone and credential cases need capabilities this
-      # container may not have, and nxt_tests.c has no per-test filter.
+      # (musl's CMSG_NXTHDR under clang, #475).
       - name: make tests
         run: make -j 4 tests
+
+      # build/tests runs here as root with the default container capabilities.
+      # It needs nothing more: nxt_clone_creds_test() only runs the credential
+      # map validators and never calls clone(), and no other case uses a
+      # namespace or a privileged call.
+      - name: Run C tests
+        run: ./build/tests
 
       # The two standalone binaries need no privileges and run here as they do
       # in build-test's c-tests.  See the same steps in alpine-edge for why.
@@ -194,11 +199,16 @@ jobs:
 
       # --tests has always been configured here, but only "all" was built,
       # so a toolchain that breaks the tests binary alone went unnoticed
-      # (musl's CMSG_NXTHDR under clang, #475).  build/tests itself is built,
-      # not run: the clone and credential cases need capabilities this
-      # container may not have, and nxt_tests.c has no per-test filter.
+      # (musl's CMSG_NXTHDR under clang, #475).
       - name: make tests
         run: make -j 4 tests
+
+      # build/tests runs here as root with the default container capabilities.
+      # It needs nothing more: nxt_clone_creds_test() only runs the credential
+      # map validators and never calls clone(), and no other case uses a
+      # namespace or a privileged call.
+      - name: Run C tests
+        run: ./build/tests
 
       # The two standalone binaries need no privileges, so they run here as
       # they do in build-test's c-tests.  unit_port_recv_test moves control
