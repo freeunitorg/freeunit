@@ -106,4 +106,10 @@ extern nxt_int_t nxt_http_comp_apply_compression(nxt_task_t *task,
 extern nxt_int_t nxt_http_comp_compression_init(nxt_task_t *task,
     nxt_router_conf_t *rtcf, const nxt_conf_value_t *comp_conf);
 
+#if (NXT_TESTS)
+extern nxt_int_t nxt_http_comp_test_select(nxt_http_request_t *r,
+    const nxt_str_t *value, nxt_bool_t compression, nxt_off_t min_len,
+    nxt_bool_t negotiate, bool *identity_refused);
+#endif
+
 #endif  /* _NXT_COMPRESSION_H_INCLUDED_ */

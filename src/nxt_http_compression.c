@@ -743,8 +743,8 @@ nxt_http_comp_resp_length(const nxt_http_request_t *r)
  * Tells whether "min_length" refuses this response.  A body of unknown
  * length is compressed, so it is never below the minimum.
  *
- * nxt_http_comp_select_compressor() and nxt_http_comp_apply_compression()
- * both call this, and they must get the same answer.  The first decides
+ * nxt_http_comp_negotiate() and nxt_http_comp_apply_compression() both
+ * call this, and they must get the same answer.  The first decides
  * which coding is selected.  The second decides whether the selected coding
  * is applied.
  */
@@ -758,9 +758,9 @@ nxt_http_comp_below_min_len(nxt_off_t clen,
 
 
 static nxt_int_t
-nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
-                                nxt_http_request_t *r, const nxt_str_t *token,
-                                bool *identity_refused)
+nxt_http_comp_negotiate(const nxt_http_comp_conf_t *conf,
+                        nxt_http_request_t *r, const nxt_str_t *token,
+                        bool *identity_refused)
 {
     /*
      * What the field said about identity.  "identity_named" and
@@ -986,6 +986,35 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
     }
 
     return idx;
+}
+
+
+/*
+ * Chooses the coding for the response, or returns -1 when the client refuses
+ * every coding that can be served.
+ *
+ * With compression off, identity is the only coding.  The client refuses it
+ * only with a weight of 0, and a weight comes after a ';'.  So an absent
+ * field or a value without a ';' always gives identity and refuses nothing,
+ * and the parse is not run.  A browser field such as "gzip, deflate, br,
+ * zstd" takes this path.  With compression on, a value without a ';' can
+ * still select a compressor, so the parse always runs.
+ */
+
+static nxt_int_t
+nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
+                                nxt_http_request_t *r, const nxt_str_t *token,
+                                bool *identity_refused)
+{
+    if (conf == NULL
+        && (token->length == 0
+            || memchr(token->start, ';', token->length) == NULL))
+    {
+        *identity_refused = false;
+        return NXT_HTTP_COMP_SCHEME_IDENTITY;
+    }
+
+    return nxt_http_comp_negotiate(conf, r, token, identity_refused);
 }
 
 
@@ -1749,3 +1778,42 @@ nxt_http_comp_compression_init(nxt_task_t *task, nxt_router_conf_t *rtcf,
 
     return NXT_OK;
 }
+
+
+#if (NXT_TESTS)
+
+/*
+ * For src/test/nxt_http_comp_select_test.c.  With "compression" set, every
+ * coding of this build is enabled once, with "min_len" for each compressor.
+ * With "negotiate" set, the full parse runs and the shortcut is not used.
+ */
+
+nxt_int_t
+nxt_http_comp_test_select(nxt_http_request_t *r, const nxt_str_t *value,
+    nxt_bool_t compression, nxt_off_t min_len, nxt_bool_t negotiate,
+    bool *identity_refused)
+{
+    nxt_uint_t                  i;
+    nxt_http_comp_conf_t        conf, *cp;
+    nxt_http_comp_compressor_t  enabled[NXT_NR_COMPRESSORS];
+
+    for (i = 0; i < NXT_NR_COMPRESSORS; i++) {
+        enabled[i].type = &nxt_http_comp_compressors[i];
+        enabled[i].opts.level = nxt_http_comp_compressors[i].def_compr;
+        enabled[i].opts.min_len = (i == 0) ? -1 : min_len;
+    }
+
+    conf.mime_types_rule = NULL;
+    conf.enabled = enabled;
+    conf.nr_enabled = NXT_NR_COMPRESSORS;
+
+    cp = compression ? &conf : NULL;
+
+    if (negotiate) {
+        return nxt_http_comp_negotiate(cp, r, value, identity_refused);
+    }
+
+    return nxt_http_comp_select_compressor(cp, r, value, identity_refused);
+}
+
+#endif
