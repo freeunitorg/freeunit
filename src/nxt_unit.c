@@ -3440,10 +3440,10 @@ nxt_unit_read_buf_release(nxt_unit_ctx_t *ctx,
 /*
  * A copy of rbuf with only the bytes of its message, for a message that
  * waits in pending_rbuf.  A read buffer is over 16 KiB, and a websocket
- * frame message is 28 bytes.  While a context waits for a segment, it
- * reads on, and thousands of messages can wait: the Node.js websocket
- * test held up to 28491 of them.  On an allocation failure, rbuf itself
- * waits.
+ * frame message is 28 bytes.  While a context waits for a segment, or for
+ * SHM_ACK in nxt_unit_wait_shm_ack(), it reads on and the messages wait.
+ * The Node.js websocket test held up to 28491 of them while a segment
+ * waited.  On an allocation failure, rbuf itself waits.
  */
 
 static nxt_unit_read_buf_t *
@@ -4447,6 +4447,51 @@ nxt_unit_test_ctx_read_port(nxt_unit_ctx_t *ctx)
 }
 
 
+void *
+nxt_unit_test_port_queue(nxt_unit_port_t *port)
+{
+    nxt_unit_port_impl_t  *port_impl;
+
+    port_impl = nxt_container_of(port, nxt_unit_port_impl_t, port);
+
+    return port_impl->queue;
+}
+
+
+/*
+ * Runs nxt_unit_wait_shm_ack(), then reports in "held" how many bytes the
+ * buffers in pending_rbuf take.
+ */
+
+int
+nxt_unit_test_wait_shm_ack(nxt_unit_ctx_t *ctx, size_t *held)
+{
+    int                  rc;
+    nxt_unit_ctx_impl_t  *ctx_impl;
+    nxt_unit_read_buf_t  *rbuf;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    rc = nxt_unit_wait_shm_ack(ctx);
+
+    *held = 0;
+
+    pthread_mutex_lock(&ctx_impl->mutex);
+
+    nxt_queue_each(rbuf, &ctx_impl->pending_rbuf, nxt_unit_read_buf_t, link) {
+
+        *held += rbuf->shrunk
+                 ? offsetof(nxt_unit_read_buf_t, buf) + (size_t) rbuf->size
+                 : sizeof(nxt_unit_read_buf_t);
+
+    } nxt_queue_loop;
+
+    pthread_mutex_unlock(&ctx_impl->mutex);
+
+    return rc;
+}
+
+
 uint64_t
 nxt_unit_test_detached_now(void)
 {
@@ -4937,6 +4982,8 @@ nxt_unit_wait_shm_ack(nxt_unit_ctx_t *ctx)
 
             continue;
         }
+
+        rbuf = nxt_unit_read_buf_shrink(ctx, rbuf);
 
         pthread_mutex_lock(&ctx_impl->mutex);
 
