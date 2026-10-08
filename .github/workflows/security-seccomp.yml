@@ -2,6 +2,19 @@ name: "Security (Seccomp AF_ALG)"
 
 on:
   push:
+    # Pull request branches are covered by pull_request; a push trigger on
+    # them ran the job twice.  A matching release tag runs it whatever
+    # changed: path filters are not evaluated for tag pushes, and without a
+    # tags list a trigger with only branches does not fire for tags at all.
+    # The list is the semver scheme plus the fork's packaging-build suffix,
+    # the same pair build-deb.yml uses: a packaging tag releases the same
+    # tree, so it runs the check too.  A unitctl/* tag does not match, on
+    # purpose: that release changes no image.
+    branches:
+      - master
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-build[0-9]+'
     paths:
       - 'pkg/docker/seccomp-no-af-alg.json'
       - 'pkg/docker/Dockerfile.*'
