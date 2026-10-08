@@ -1,6 +1,12 @@
 
 Changes with FreeUnit 1.37.1                                     04 Oct 2026
 
+    *) Bugfix: the control API accepted a listener with neither "pass" nor
+       "application". The router then refused the configuration, and the
+       client got 500 "Failed to apply new configuration." with only
+       "failed to apply new conf" in the log. The control API now answers
+       400 and names the listener. The router log also names it.
+
     *) Bugfix: on macOS with 16 KiB pages, every request to an application
        failed. The application logged "incoming_mmap: unexpected segment
        size: 10502144 != 10489856" and exited. macOS rounds a shared memory

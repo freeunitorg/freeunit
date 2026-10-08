@@ -3544,6 +3544,11 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             } else if (lscf.application.length > 0) {
                 skcf->action = nxt_http_pass_application(task, rtcf,
                                                          &lscf.application);
+
+            } else {
+                nxt_alert(task, "listener \"%V\": \"pass\" or "
+                          "\"application\" is required", &name);
+                goto fail;
             }
 
             if (nxt_slow_path(skcf->action == NULL)) {

@@ -12,6 +12,13 @@
 
 <change type="bugfix">
 <para>
+the control API accepted a listener with neither "pass" nor "application",
+and the router then refused the configuration with 500.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 on macOS with 16 KiB pages, every request to an application failed with
 "incoming_mmap: unexpected segment size".
 </para>
