@@ -183,13 +183,38 @@ jobs:
         run: |
           VERSION="${{ needs.setup.outputs.version }}"
           VARIANT="${{ matrix.variant }}"
+          GHCR_REPO="${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}"
+
+          # Up to 1.35.5 the variants had no hyphen after the language, and
+          # Java was "jsc": latest-php8.5, latest-jsc21.  GHCR still holds
+          # these tags, and some guides cite them.  Point them at the same
+          # image as latest-<variant>.  Only the variants that had such a
+          # tag get one.  No new old-style tag is created.  The old tags
+          # latest-go1.24 and latest-jsc11 have no variant and stay as they are.
+          LEGACY=""
+          case "${VARIANT}" in
+            go-1.25|go-1.26|node-20|node-22|node-24|perl-5.38|perl-5.40| \
+            php-8.3|php-8.4|php-8.5|python-3.12|python-3.12-slim| \
+            python-3.13|python-3.13-slim|python-3.14|python-3.14-slim| \
+            ruby-3.3|ruby-3.4)
+              LEGACY="latest-${VARIANT/-/}" ;;
+            java-17|java-21)
+              LEGACY="latest-jsc${VARIANT#java-}" ;;
+          esac
+
           # Per-arch images live in both registries; build a manifest in each.
           for REPO in \
-            "${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}" \
+            "${GHCR_REPO}" \
             "${{ env.DOCKERHUB_REGISTRY }}/${{ env.DOCKERHUB_IMAGE_NAME }}"; do
+            # The old-style tags exist on GHCR only.
+            EXTRA_TAGS=()
+            if [ "${REPO}" = "${GHCR_REPO}" ] && [ -n "${LEGACY}" ]; then
+              EXTRA_TAGS=(--tag "${REPO}:${LEGACY}")
+            fi
             docker buildx imagetools create \
               --tag ${REPO}:${VERSION}-${VARIANT} \
               --tag ${REPO}:latest-${VARIANT} \
+              "${EXTRA_TAGS[@]}" \
               --annotation "index:org.opencontainers.image.description=FreeUnit ${VERSION} (${VARIANT}) — community LTS fork of the NGINX Unit application server" \
               --annotation "index:org.opencontainers.image.title=FreeUnit (${VARIANT})" \
               --annotation "index:org.opencontainers.image.url=https://freeunit.org" \
