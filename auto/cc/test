@@ -148,5 +148,38 @@ case $NXT_CC_NAME in
 
 esac
 
+
+# Keep the build directory out of the debug info and of __FILE__.  The
+# probe runs with the flags that are already set, as the real build does.
+# -ffile-prefix-map needs GCC 8 or Clang 10.  Older compilers get
+# -fdebug-prefix-map, and a compiler with neither gets no flag.
+
+nxt_prefix_dir=`pwd`
+
+case "$nxt_prefix_dir" in
+    *[!A-Za-z0-9_./+@%:,-]*)
+        # Spaces and shell characters would break the Makefile.
+    ;;
+
+    *)
+        echo 'int main(void) { return 0; }' > $NXT_AUTOTEST.c
+
+        for nxt_prefix_flag in -ffile-prefix-map -fdebug-prefix-map; do
+            nxt_prefix_map="$nxt_prefix_flag=$nxt_prefix_dir=."
+
+            if /bin/sh -c "($CC $NXT_CFLAGS $nxt_prefix_map $NXT_CC_OPT \
+                            $CFLAGS -Werror -c -o $NXT_AUTOTEST.o \
+                            $NXT_AUTOTEST.c)" >> $NXT_AUTOCONF_ERR 2>&1
+            then
+                NXT_CFLAGS="$NXT_CFLAGS $nxt_prefix_map"
+                $echo " + using $nxt_prefix_flag"
+                break
+            fi
+        done
+
+        rm -f $NXT_AUTOTEST.c $NXT_AUTOTEST.o
+    ;;
+esac
+
 # Stop on error exit status again.
 set -e

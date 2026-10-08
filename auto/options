@@ -153,6 +153,13 @@ do
 
     nxt_opt=`$echo $nxt_option | sed -e "s/\(--[^=]*=\)\(.* .*\)/\1'\2'/"`
 
+    # A path map flag in --cc-opt holds the build directory of a packager.
+    # It does not belong in "unitd --version" or in unit.pc.
+    nxt_opt=`printf "%s\n" "$nxt_opt" | sed -E \
+        -e "s/ -f(file|debug|macro)-prefix-map=[^ ']*//g" \
+        -e "s/(--cc-opt=')?-f(file|debug|macro)-prefix-map=[^ ']* ?/\1/g" \
+        -e "s/^--cc-opt=('')?$//"`
+
     NXT_CONFIGURE_OPTIONS="$NXT_CONFIGURE_OPTIONS $nxt_opt"
 
 done
