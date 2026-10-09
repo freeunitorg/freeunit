@@ -13,10 +13,17 @@ import pytest
 from conftest import unit_run, unit_stop
 from unit.applications.tls import ApplicationTLS
 from unit.option import option
+from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'any', 'openssl': 'any'}}
 
 client = ApplicationTLS()
+
+
+def server_cert(**kwargs):
+    return ssl.get_server_certificate(
+        ('127.0.0.1', port_map.port(8080)), **kwargs
+    )
 
 
 def add_tls(application='empty', cert='default', port=8080):
@@ -186,7 +193,7 @@ def test_tls_certificate_update():
 
     add_tls()
 
-    cert_old = ssl.get_server_certificate(('127.0.0.1', 8080))
+    cert_old = server_cert()
 
     # The listener names the bundle, so Unit applies the configuration
     # again before it answers.
@@ -194,9 +201,7 @@ def test_tls_certificate_update():
         replace_cert().get('success') == 'Certificate chain updated.'
     ), 'replaced'
 
-    assert cert_old != ssl.get_server_certificate(
-        ('127.0.0.1', 8080)
-    ), 'update certificate'
+    assert cert_old != server_cert(), 'update certificate'
 
     assert 'chain' in client.conf_get('/certificates/default'), 'listed'
 
@@ -241,7 +246,9 @@ def test_tls_certificate_update_unchanged():
     context.maximum_version = ssl.TLSVersion.TLSv1_2
 
     def connect(session=None):
-        with socket.create_connection(('127.0.0.1', 8080)) as sock:
+        with socket.create_connection(
+            ('127.0.0.1', port_map.port(8080))
+        ) as sock:
             with context.wrap_socket(sock, session=session) as ssock:
                 ssock.sendall(b'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
 
@@ -366,9 +373,7 @@ def test_tls_certificate_update_inflight():
     resp = client.http(b'Connection: close\r\n\r\n', raw=True, sock=sock)
 
     assert resp['status'] == 200, 'in-flight request'
-    assert cert_old != ssl.get_server_certificate(
-        ('127.0.0.1', 8080)
-    ), 'new handshake, new cert'
+    assert cert_old != server_cert(), 'new handshake, new cert'
 
 
 def test_tls_certificate_update_mismatch(skip_alert):
@@ -380,16 +385,14 @@ def test_tls_certificate_update_mismatch(skip_alert):
 
     add_tls()
 
-    cert_old = ssl.get_server_certificate(('127.0.0.1', 8080))
+    cert_old = server_cert()
 
     # Unit refuses a bundle with the wrong key.  Nothing changes.
     client.certificate('other', False)
 
     assert 'error' in client.certificate_load('default', 'other'), 'refused'
 
-    assert cert_old == ssl.get_server_certificate(
-        ('127.0.0.1', 8080)
-    ), 'old certificate still served'
+    assert cert_old == server_cert(), 'old certificate still served'
 
     assert 'chain' in client.conf_get('/certificates/default'), 'still listed'
 
@@ -403,7 +406,7 @@ def test_tls_certificate_update_store_fail(skip_alert):
 
     add_tls()
 
-    cert_old = ssl.get_server_certificate(('127.0.0.1', 8080))
+    cert_old = server_cert()
     info_old = client.conf_get('/certificates/default')
 
     # A directory with a file in it blocks the temporary file of main.
@@ -417,9 +420,7 @@ def test_tls_certificate_update_store_fail(skip_alert):
 
     # The old metadata is back, and the old bundle stays in use.
     assert client.conf_get('/certificates/default') == info_old, 'old info'
-    assert cert_old == ssl.get_server_certificate(
-        ('127.0.0.1', 8080)
-    ), 'old certificate still served'
+    assert cert_old == server_cert(), 'old certificate still served'
 
     # A new name is removed from the metadata.
     assert 'error' in replace_cert('new'), 'new store failed'
@@ -629,7 +630,7 @@ def test_tls_certificate_update_router_restart(
             bundles[name] = k.read() + c.read()
 
     def served():
-        pem = ssl.get_server_certificate(('127.0.0.1', 8080), timeout=10)
+        pem = server_cert(timeout=10)
         return ssl.PEM_cert_to_DER_cert(pem)
 
     def der(name):
@@ -746,7 +747,7 @@ def test_tls_certificate_update_controller_restart(
             bundles[name] = k.read() + c.read()
 
     def served():
-        pem = ssl.get_server_certificate(('127.0.0.1', 8080), timeout=10)
+        pem = server_cert(timeout=10)
         return ssl.PEM_cert_to_DER_cert(pem)
 
     def der(name):
@@ -939,7 +940,7 @@ def test_tls_certificate_update_restart(requires_restart):
 
     assert 'success' in replace_cert(), 'replaced'
 
-    cert_new = ssl.get_server_certificate(('127.0.0.1', 8080))
+    cert_new = server_cert()
 
     temp_dir_old = option.temp_dir
     statedir = f'{temp_dir_old}/state'
@@ -956,9 +957,7 @@ def test_tls_certificate_update_restart(requires_restart):
         # its log, and removes its temp dir.  This test removes the old one.
         unit_run(state_dir=statedir)
 
-        assert cert_new == ssl.get_server_certificate(
-            ('127.0.0.1', 8080)
-        ), 'replaced bundle survives a restart'
+        assert cert_new == server_cert(), 'replaced bundle survives a restart'
 
         assert 'chain' in client.conf_get('/certificates/default'), 'listed'
 
@@ -1021,13 +1020,11 @@ def test_tls_certificate_change():
 
     add_tls()
 
-    cert_old = ssl.get_server_certificate(('127.0.0.1', 8080))
+    cert_old = server_cert()
 
     add_tls(cert='new')
 
-    assert cert_old != ssl.get_server_certificate(
-        ('127.0.0.1', 8080)
-    ), 'change certificate'
+    assert cert_old != server_cert(), 'change certificate'
 
 
 def test_tls_certificate_key_rsa():

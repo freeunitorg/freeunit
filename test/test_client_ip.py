@@ -2,6 +2,7 @@ import pytest
 
 from unit.applications.lang.python import ApplicationPython
 from unit.option import option
+from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'any'}}
 
@@ -35,8 +36,9 @@ def client_ip(options):
 
 def get_xff(xff, sock_type='ipv4'):
     address = {
-        'ipv4': ('127.0.0.1', 8081),
-        'ipv6': ('::1', 8082),
+        'ipv4': ('127.0.0.1', port_map.port(8081)),
+        'ipv6': ('::1', port_map.port(8082)),
+        # No port for a unix socket; port_map.port() passes None through.
         'unix': (f'{option.temp_dir}/sock', None),
     }
     (addr, port) = address[sock_type]

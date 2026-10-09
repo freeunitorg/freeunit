@@ -10,6 +10,7 @@ import pytest
 from conftest import run_process
 from unit.option import option
 from unit.applications.proto import ApplicationProto
+from unit import port as port_map
 from unit.utils import waitforsocket
 
 client = ApplicationProto()
@@ -550,7 +551,7 @@ def test_otel_traceparent_inherited_split_header(tmp_path):
         # Wait for the tracer before the request under test.
         assert _get_until_header('traceparent')['status'] == 200
 
-        sock = socket.create_connection(('127.0.0.1', 8080))
+        sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
         try:
             sock.sendall(b'GET / HTTP/1.1\r\nHost: localhost\r\n')
             time.sleep(HEADER_GAP)
@@ -606,7 +607,7 @@ def test_otel_split_header_400_span(tmp_path):
         # Wait for the tracer before the request under test.
         assert _get_until_header('traceparent')['status'] == 200
 
-        sock = socket.create_connection(('127.0.0.1', 8080))
+        sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
         try:
             sock.sendall(
                 b'GET / HTTP/1.1\r\nHost: localhost\r\n'
@@ -660,7 +661,7 @@ def test_otel_bad_chunk_400_span(tmp_path):
         # Wait for the tracer before the request under test.
         assert _get_until_header('traceparent')['status'] == 200
 
-        sock = socket.create_connection(('127.0.0.1', 8080))
+        sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
         try:
             sock.sendall(
                 b'POST / HTTP/1.1\r\nHost: localhost\r\n'
@@ -715,7 +716,7 @@ def test_otel_body_disconnect_span(tmp_path):
         # Wait for the tracer before the request under test.
         assert _get_until_header('traceparent')['status'] == 200
 
-        sock = socket.create_connection(('127.0.0.1', 8080))
+        sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
         sock.sendall(
             b'POST / HTTP/1.1\r\nHost: localhost\r\n'
             b'Content-Length: 100\r\n'
@@ -761,7 +762,7 @@ def test_otel_header_timeout_408_span(tmp_path):
         # Wait for the tracer before the request under test.
         assert _get_until_header('traceparent')['status'] == 200
 
-        sock = socket.create_connection(('127.0.0.1', 8080))
+        sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
         try:
             sock.sendall(
                 b'GET / HTTP/1.1\r\nHost: localhost\r\n'

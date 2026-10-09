@@ -11,6 +11,7 @@ import venv
 import pytest
 from packaging import version
 
+from unit import port as port_map
 from unit.applications.lang.python import ApplicationPython
 from unit.option import option
 
@@ -202,8 +203,8 @@ def test_python_application_query_string_absent():
 def test_python_application_server_port():
     client.load('server_port')
 
-    assert (
-        client.get()['headers']['Server-Port'] == '8080'
+    assert client.get()['headers']['Server-Port'] == str(
+        port_map.port(8080)
     ), 'Server-Port header'
 
 

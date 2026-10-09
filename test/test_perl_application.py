@@ -2,6 +2,7 @@ import re
 
 import pytest
 
+from unit import port as port_map
 from unit.applications.lang.perl import ApplicationPerl
 from unit.option import option
 
@@ -89,8 +90,8 @@ def test_perl_application_query_string_absent():
 def test_perl_application_server_port():
     client.load('server_port')
 
-    assert (
-        client.get()['headers']['Server-Port'] == '8080'
+    assert client.get()['headers']['Server-Port'] == str(
+        port_map.port(8080)
     ), 'Server-Port header'
 
 

@@ -38,6 +38,7 @@ import pytest
 from conftest import unit_run, unit_stop
 from unit.applications.proto import ApplicationProto
 from unit.log import Log
+from unit import port as port_map
 from unit.utils import waitforsocket
 
 client = ApplicationProto()
@@ -117,7 +118,9 @@ def test_state_store_full_filesystem(requires_restart, skip_alert):
 
         # The configuration that must survive.
         assert 'success' in client.conf(SMALL_CONF), 'the small store'
-        assert wait_for_stored(statedir, SMALL_CONF) is not None, 'stored'
+        assert wait_for_stored(
+            statedir, port_map.expected(SMALL_CONF)
+        ) is not None, 'stored'
 
         stored = (statedir / 'conf.json').read_bytes()
 
@@ -140,7 +143,9 @@ def test_state_store_full_filesystem(requires_restart, skip_alert):
         assert after == stored, (
             'conf.json was damaged by a store that could not complete'
         )
-        assert json.loads(after)['listeners'] == SMALL_CONF['listeners']
+        assert json.loads(after)['listeners'] == port_map.expected(
+            SMALL_CONF['listeners']
+        )
 
         # And nothing was left half-written next to it.
         assert [p.name for p in statedir.iterdir() if '.tmp' in p.name] == []
@@ -327,7 +332,7 @@ def test_state_store_serialised(requires_restart):
 
         conf = json.loads((statedir / 'conf.json').read_text(encoding='utf-8'))
 
-        assert conf == last, 'conf.json is the last configuration'
+        assert conf == port_map.expected(last), 'conf.json is the last conf'
         assert [p.name for p in statedir.iterdir() if '.tmp' in p.name] == []
 
         # Two stores that run at the same time race on the temporary name,
@@ -354,7 +359,9 @@ def run_with_version(version):
 
     statedir = Path(tempfile.mkdtemp(prefix='unit-state-'))
 
-    (statedir / 'conf.json').write_text(json.dumps(VERSION_CONF))
+    (statedir / 'conf.json').write_text(
+        json.dumps(port_map.expected(VERSION_CONF))
+    )
     (statedir / 'version').write_bytes(version)
 
     unit_run(state_dir=str(statedir))
@@ -374,11 +381,12 @@ def test_state_store_version_line_end(requires_restart, version):
 
     try:
         assert (
-            client.conf_get('listeners') == VERSION_CONF['listeners']
+            client.conf_get('listeners')
+            == port_map.expected(VERSION_CONF)['listeners']
         ), 'stored configuration loaded'
 
         # GET /config can answer before the router has bound the listener.
-        waitforsocket(8080)
+        waitforsocket(port_map.port(8080))
 
         assert client.get()['status'] == 204, 'stored configuration runs'
         assert not Log.findall(r'invalid version string'), 'no alert'

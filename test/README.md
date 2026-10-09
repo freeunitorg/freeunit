@@ -142,7 +142,35 @@ sudo pytest-3 --print-log --restart test/
 
 # 7. Save logs after execution
 sudo pytest-3 --print-log --save-log test/
+
+# 8. Move the suite off the default base port 8080
+sudo pytest-3 --print-log --port 18080 test/
 ```
+
+### Base port (`--port`)
+
+The suite uses `*:8080` and near ports. Only one run can use them in a network
+namespace. Use `--port N` to move the suite to a different band. Two runs on
+one host must use different bases, for example 8080 and 18080.
+
+`UNIT_TEST_PORT=N` sets the default. `sudo-rs` ignores `-E`, thus use `--port`
+under `sudo`.
+
+`test/unit/port.py` adds `N - 8080` to each known port: 8080–8085, 8090, 8443
+and the helper ports 7976–7999 (see `test/fake_upstream/README.md`). At the
+default base, the map does not change a port. The base must be 8080 plus a
+multiple of 1000, up to 32080, so that the bands of two runs do not overlap.
+
+When you write a test:
+
+- `client.get(port=8081)` and `"*:8081"` in a configuration: no change.
+- A raw socket, `ssl.get_server_certificate()`, a helper process, or a port
+  that Unit sends back: use `port_map.port(8081)`.
+- A configuration from `client.conf_get()` that you compare with a literal:
+  use `port_map.expected(value)`.
+
+`test_port_map.py` runs `unit/port_lint.py`. It fails when a test uses a known
+port that is not mapped. CI also runs `test` with `--port 18080`.
 
 (clang-ast static analysis is Docker-only — see the section below.)
 
@@ -186,6 +214,8 @@ test/
 ├── requirements.txt      # Python dependencies (pyOpenSSL, pytest)
 ├── run-local.sh          # Docker-based local test runner
 ├── unit/                 # Test utilities (HTTP helpers, status checks, logging)
+│   ├── port.py           # Base port map (--port)
+│   └── port_lint.py      # Finds port literals that bypass the map
 ├── test_*.py             # Core and Python tests
 ├── test_go*/             # Go application and isolation tests
 ├── test_java*/           # Java application and isolation tests
