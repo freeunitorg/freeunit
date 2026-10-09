@@ -13,12 +13,13 @@
 <change type="bugfix">
 <para>
 with a 32-bit size_t, the memory pool did not check the sum of a large size,
-its alignment and its block header.  A request for 4294967269 to 4294967294
-bytes made a block of 0 to 24 bytes.  The buffer allocators added their header
-to a size without a check too.  These sums now use checked arithmetic, and such
-a request fails.  The same is done for the length of a configuration printed
-as JSON and for the request body buffer.  No path is known by which a client or
-an application gives such a size.
+its alignment and its block header.  An allocation of 4294967269 to 4294967294
+bytes got a block of 0 to 24 bytes.  The buffer allocators added their header
+to a size without a check too, with either width of size_t.  These sums now use
+checked arithmetic, and such an allocation fails.  The same is done for the
+length of a configuration printed as JSON and for the request body buffer.
+With a negative "body_buffer_size" or "large_header_buffer_size" in the
+configuration, a request could reach a buffer allocator with such a size.
 </para>
 </change>
 
