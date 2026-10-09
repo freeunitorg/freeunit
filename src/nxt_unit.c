@@ -5402,7 +5402,15 @@ nxt_unit_get_outgoing_buf(nxt_unit_request_info_t *req, uint32_t size,
     mmap_buf->hdr = hdr;
     mmap_buf->buf.start = (char *) nxt_port_mmap_chunk_start(hdr, c);
     mmap_buf->buf.free = mmap_buf->buf.start;
-    mmap_buf->buf.end = mmap_buf->buf.start + nchunks * PORT_MMAP_CHUNK_SIZE;
+    /*
+     * A buffer that could have been plain gets no more room than asked for,
+     * as a plain one: else nxt_unit_response_write_nb() puts body data into
+     * the free rest of the chunk of the response headers, and the router
+     * sends that piggyback content without compression.
+     */
+    mmap_buf->buf.end = mmap_buf->buf.start
+                        + (plain_ok ? size
+                                    : (uint32_t) nchunks * PORT_MMAP_CHUNK_SIZE);
     mmap_buf->free_ptr = NULL;
     mmap_buf->ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
 
