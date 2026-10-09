@@ -142,8 +142,12 @@ struct nxt_mp_s {
     map |= (1 << chunk)
 
 
+#if (NXT_DEBUG)
 #define nxt_mp_free_junk(p, size)                                             \
     memset((p), 0x5A, size)
+#else
+#define nxt_mp_free_junk(p, size)
+#endif
 
 
 #if !(NXT_DEBUG_MEMORY)
