@@ -120,6 +120,12 @@ nxt_conf_value_t *nxt_conf_json_parse(nxt_mp_t *mp, u_char *start, u_char *end,
 #define nxt_conf_json_parse_str(mp, str)                                      \
     nxt_conf_json_parse(mp, (str)->start, (str)->start + (str)->length, NULL)
 
+/*
+ * nxt_conf_json_length() returns SIZE_MAX if the length does not fit in
+ * size_t.  No allocation of SIZE_MAX bytes succeeds.  A caller that adds to
+ * the length uses nxt_size_add().  A caller that sizes a shared memory
+ * segment with it refuses SIZE_MAX.
+ */
 size_t nxt_conf_json_length(const nxt_conf_value_t *value,
     nxt_conf_json_pretty_t *pretty);
 u_char *nxt_conf_json_print(u_char *p, const nxt_conf_value_t *value,
