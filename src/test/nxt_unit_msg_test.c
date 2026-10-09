@@ -50,6 +50,7 @@ typedef enum {
     NXT_UNIT_MSG_TEST_SMALL,
     NXT_UNIT_MSG_TEST_PLAIN_HELD,
     NXT_UNIT_MSG_TEST_NO_CHUNK,
+    NXT_UNIT_MSG_TEST_WRITE_FIRST,
 } nxt_unit_msg_test_mode_t;
 
 
@@ -105,6 +106,8 @@ static int nxt_unit_msg_test_respond(nxt_unit_request_info_t *req);
 static int nxt_unit_msg_test_respond_small(nxt_unit_request_info_t *req);
 static int nxt_unit_msg_test_respond_held(nxt_unit_request_info_t *req);
 static int nxt_unit_msg_test_respond_no_chunk(nxt_unit_request_info_t *req);
+static int nxt_unit_msg_test_respond_write_first(
+    nxt_unit_request_info_t *req);
 
 static int nxt_unit_msg_test_send_records_to(nxt_unit_ctx_t *ctx,
     const nxt_port_mmap_msg_t *records, size_t nrecords, size_t tail);
@@ -214,6 +217,14 @@ nxt_unit_msg_test_handler(nxt_unit_request_info_t *req)
     case NXT_UNIT_MSG_TEST_NO_CHUNK:
         nxt_unit_msg_test_handler_ok =
             nxt_unit_msg_test_respond_no_chunk(req) == NXT_UNIT_OK;
+
+        nxt_unit_request_done(req, NXT_UNIT_OK);
+
+        return;
+
+    case NXT_UNIT_MSG_TEST_WRITE_FIRST:
+        nxt_unit_msg_test_handler_ok =
+            nxt_unit_msg_test_respond_write_first(req) == NXT_UNIT_OK;
 
         nxt_unit_request_done(req, NXT_UNIT_OK);
 
@@ -1244,6 +1255,51 @@ nxt_unit_msg_test_respond_no_chunk(nxt_unit_request_info_t *req)
 }
 
 
+/*
+ * A body written before nxt_unit_response_send(), as the WSGI module does.
+ * nxt_unit_response_write_nb() puts into the fields message as many of the
+ * first body bytes as the fields buffer has left.  The buffer is asked for
+ * the exact size of the fields, so it must have nothing left.  Rounded up
+ * to a chunk of PORT_MMAP_CHUNK_SIZE bytes it takes the whole body, which
+ * the router does not compress (test/test_python_compression.py).
+ */
+static int
+nxt_unit_msg_test_respond_write_first(nxt_unit_request_info_t *req)
+{
+    int       rc;
+    uint32_t  left;
+
+    rc = nxt_unit_response_init(req, 200, 1,
+                                nxt_length("Content-Type")
+                                + nxt_length("text/html; charset=UTF-8"));
+
+    if (rc == NXT_UNIT_OK) {
+        rc = nxt_unit_response_add_field(req, "Content-Type",
+                                         nxt_length("Content-Type"),
+                                         "text/html; charset=UTF-8",
+                                         nxt_length("text/html; "
+                                                    "charset=UTF-8"));
+    }
+
+    if (rc != NXT_UNIT_OK) {
+        return rc;
+    }
+
+    left = req->response_buf->end - req->response_buf->free;
+
+    if (left != 0) {
+        printf("unit msg test: the fields buffer has %d bytes left, "
+               "expected 0\n", (int) left);
+        fflush(stdout);
+
+        return NXT_UNIT_ERROR;
+    }
+
+    return nxt_unit_response_write(req, NXT_UNIT_MSG_TEST_HELLO,
+                                   nxt_length(NXT_UNIT_MSG_TEST_HELLO));
+}
+
+
 /* A router engine port with a shared memory queue, as NEW_PORT adds it. */
 static void *
 nxt_unit_msg_test_engine_port(void)
@@ -1542,6 +1598,61 @@ nxt_unit_msg_test_small_case(void *data)
         fflush(stdout);
 
         return 8;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * A small buffer in shared memory keeps the exact size it was asked for.
+ * So the fields of a response go out as their own message, even when the
+ * body is written before nxt_unit_response_send(): the router gets the ack,
+ * the fields, the body and the last message.  With the buffer rounded up to
+ * a chunk, the body went inside the fields message, the router sent those
+ * bytes uncompressed under a "Content-Encoding" header and emitted no gzip
+ * trailer, and 10 cases of test/test_python_compression.py failed.
+ */
+static int
+nxt_unit_msg_test_exact_fields_case(void *data)
+{
+    char     seq[16];
+    void     *queue;
+    size_t   ndgrams;
+    uint8_t  qmsg[NXT_PORT_QUEUE_MSG_SIZE];
+
+    queue = nxt_unit_msg_test_engine_port();
+    if (queue == NULL) {
+        return 2;
+    }
+
+    /* The first response makes the segment. */
+    if (nxt_unit_msg_test_engine_request(NXT_UNIT_MSG_TEST_ORDER,
+                                         NXT_UNIT_MSG_TEST_STREAM - 1, 2)
+        != 0)
+    {
+        return 4;
+    }
+
+    while (nxt_port_queue_recv(queue, qmsg) >= 0) { /* void */ }
+
+    if (nxt_unit_msg_test_engine_request(NXT_UNIT_MSG_TEST_WRITE_FIRST,
+                                         NXT_UNIT_MSG_TEST_STREAM, 3)
+        != 0)
+    {
+        return 4;
+    }
+
+    if (nxt_unit_msg_test_router_read(queue, NXT_UNIT_MSG_TEST_STREAM,
+                                      nxt_length(NXT_UNIT_MSG_TEST_HELLO), 0,
+                                      seq, sizeof(seq), &ndgrams)
+        != 0)
+    {
+        return 5;
+    }
+
+    if (nxt_unit_msg_test_expect(seq, "AHBL") != 0) {
+        return 7;
     }
 
     return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
@@ -2390,6 +2501,11 @@ main(void)
 
     nxt_unit_msg_test_in_child("a small response sends one datagram",
                                nxt_unit_msg_test_small_case, NULL,
+                               NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("the fields of a response leave no room for "
+                               "the body",
+                               nxt_unit_msg_test_exact_fields_case, NULL,
                                NXT_UNIT_OK);
 
     nxt_unit_msg_test_in_child("without shared memory a response keeps its "
