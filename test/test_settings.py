@@ -13,6 +13,7 @@ from conftest import unit_run, unit_stop
 from unit.applications.lang.python import ApplicationPython
 from unit.applications.tls import ApplicationTLS
 from unit.option import option
+from unit import port as port_map
 from unit.status import Status
 
 prerequisites = {'modules': {'python': 'any'}}
@@ -449,7 +450,7 @@ def test_settings_body_min_rate_slow_body(timeout, wait_for_record):
     min_rate_conf({'body_read_timeout': timeout, 'body_min_rate': 256})
 
     try:
-        sock = socket.create_connection(('127.0.0.1', 8080))
+        sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
         sock.settimeout(1)
         sock.sendall(
             b'POST / HTTP/1.1\r\n'
@@ -490,7 +491,7 @@ def test_settings_body_min_rate_chunked(wait_for_record):
     )
 
     try:
-        sock = socket.create_connection(('127.0.0.1', 8080))
+        sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
         sock.sendall(
             b'POST / HTTP/1.1\r\n'
             b'Host: localhost\r\n'
@@ -539,7 +540,7 @@ def test_settings_body_min_rate_tls(wait_for_record):
 
     try:
         sock = context.wrap_socket(
-            socket.create_connection(('127.0.0.1', 8080))
+            socket.create_connection(('127.0.0.1', port_map.port(8080)))
         )
         sock.sendall(
             b'POST / HTTP/1.1\r\n'
@@ -573,7 +574,7 @@ def test_settings_body_min_rate_burst_then_slow(wait_for_record):
     min_rate_conf({'body_read_timeout': 2, 'body_min_rate': 256})
 
     try:
-        sock = socket.create_connection(('127.0.0.1', 8080))
+        sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
         sock.settimeout(1)
         sock.sendall(
             b'POST / HTTP/1.1\r\n'
@@ -626,7 +627,7 @@ def test_settings_body_min_rate_normal_body(timeout):
         return sock.recv(4096)
 
     try:
-        sock = socket.create_connection(('127.0.0.1', 8080))
+        sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
         sock.settimeout(10)
 
         assert req(sock, False).startswith(b'HTTP/1.1 200'), 'first'
@@ -647,7 +648,7 @@ CONTINUE = b'HTTP/1.1 100 Continue\r\n\r\n'
 def min_rate_expect(length):
     # Sends a header with "Expect: 100-continue" and reads the 100.  The
     # client sends no body byte before it gets the 100.
-    sock = socket.create_connection(('127.0.0.1', 8080))
+    sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
     sock.sendall(
         b'POST / HTTP/1.1\r\n'
         b'Host: localhost\r\n'
@@ -778,7 +779,7 @@ def test_settings_send_min_rate_slow_read(timeout, system, wait_for_record):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
         sock.settimeout(1)
-        sock.connect(('127.0.0.1', 8080))
+        sock.connect(('127.0.0.1', port_map.port(8080)))
         sock.sendall(
             b'GET / HTTP/1.1\r\n'
             b'Host: localhost\r\n'
@@ -857,7 +858,7 @@ def test_settings_send_min_rate_fast_read(timeout):
             assert resp['status'] == 200
             assert len(resp['body']) == 4194304
 
-        sock = socket.create_connection(('127.0.0.1', 8080))
+        sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
         sock.settimeout(10)
 
         for close in (False, True):
@@ -939,7 +940,7 @@ def test_settings_send_min_rate_gap_longer_than_grace(search_in_file):
 
     min_rate_conf({'send_timeout': 2, 'send_min_rate': 1048576})
 
-    sock = socket.create_connection(('127.0.0.1', 8080))
+    sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
     sock.settimeout(10)
 
     def response(length):

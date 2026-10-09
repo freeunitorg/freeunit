@@ -9,6 +9,7 @@ import zlib
 import pytest
 
 from unit.applications.lang.python import ApplicationPython
+from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'any'}}
 
@@ -348,7 +349,9 @@ def post(body, url='/', accept='gzip', timeout=30):
     # The "variables" application echoes the request body with the request's
     # Content-Type.  It needs a Custom-Header to build its response.  Raw
     # socket: the response body must not be decoded.
-    sock = socket.create_connection(('127.0.0.1', 8080), timeout)
+    sock = socket.create_connection(
+        ('127.0.0.1', port_map.port(8080)), timeout
+    )
     sock.settimeout(timeout)
 
     try:

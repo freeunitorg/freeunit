@@ -8,6 +8,7 @@ from packaging import version
 from unit.applications.lang.python import ApplicationPython
 from unit.applications.websockets import ApplicationWebsocket
 from unit.option import option
+from unit import port as port_map
 
 prerequisites = {
     'modules': {'python': lambda v: version.parse(v) >= version.parse('3.5')}
@@ -586,7 +587,7 @@ def test_asgi_websockets_ping_pong_pending():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    sock.connect(('127.0.0.1', 8080))
+    sock.connect(('127.0.0.1', port_map.port(8080)))
 
     _, sock, _ = ws.upgrade(sock=sock)
 

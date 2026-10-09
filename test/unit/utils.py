@@ -6,6 +6,8 @@ import time
 
 import pytest
 
+from unit import port as port_map
+
 
 def public_dir(path):
     os.chmod(path, 0o777)
@@ -60,7 +62,7 @@ def waitforsocket(port):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             try:
                 sock.settimeout(5)
-                sock.connect(('127.0.0.1', port))
+                sock.connect(('127.0.0.1', port_map.port(port)))
                 return
 
             except ConnectionRefusedError:

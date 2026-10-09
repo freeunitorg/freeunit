@@ -5,6 +5,7 @@ import pytest
 
 from unit.applications.lang.php import ApplicationPHP
 from unit.applications.tls import ApplicationTLS
+from unit import port as port_map
 from unit.option import option
 
 prerequisites = {'modules': {'php': 'any'}}
@@ -35,7 +36,7 @@ def fixed(resp):
         'DOCUMENT_ROOT': root_dir(),
         'REMOTE_ADDR': '127.0.0.1',
         'SERVER_ADDR': '127.0.0.1',
-        'SERVER_PORT': '8080',
+        'SERVER_PORT': str(port_map.port(8080)),
     }
 
 

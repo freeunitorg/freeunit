@@ -3,6 +3,7 @@ import subprocess
 
 import pytest
 
+from unit import port as port_map
 from unit.applications.lang.ruby import ApplicationRuby
 
 prerequisites = {'modules': {'ruby': 'all'}}
@@ -91,8 +92,8 @@ def test_ruby_application_query_string_absent():
 def test_ruby_application_server_port():
     client.load('server_port')
 
-    assert (
-        client.get()['headers']['Server-Port'] == '8080'
+    assert client.get()['headers']['Server-Port'] == str(
+        port_map.port(8080)
     ), 'Server-Port header'
 
 
