@@ -370,7 +370,11 @@ def test_app_start_timeout_retry_leaks_nothing():
     that, both processes survived every retry -- and unitd's own exit.
     """
 
-    retries = 5
+    # Every rejected PUT costs one full START_TIMEOUT deadline, so the count is
+    # the test's whole wall time.  Three of them detect the leak the same way
+    # five do: one surviving worker fails the first assertion below.  Five was
+    # 15s of a 63s module in CI (job 114117026130, 18.08s for this test).
+    retries = 3
 
     assert 'success' in client.conf(_serving_conf()), 'baseline configured'
 
