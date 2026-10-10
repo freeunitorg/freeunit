@@ -835,7 +835,7 @@ jobs:
       # Prebuilt binary instead of `cargo install cargo-component` (which
       # compiles it from source on every run). Same tool, much faster.
       - name: Install cargo-component
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-component
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
