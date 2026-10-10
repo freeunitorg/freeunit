@@ -1,0 +1,80 @@
+# Copyright (C) FreeUnit contributors.
+
+name: "Layout check (pahole)"
+
+# Compares the layout of the shared-memory structs between the base commit
+# and the head commit.  tools/perf/layout-check.sh builds unitd from both
+# commits in this one job, with the same compiler.  Thus the check needs no
+# baseline, and a new runner image cannot make it drift.  A change to a
+# shared-memory struct fails the job.  A change to a process-local struct
+# gives a warning only.
+#
+# Each pull request runs the job, with no path filter.  A skipped job
+# reports success, and a typedef, a build flag or a new header can change
+# a layout from a file that a filter does not name.  The job takes about
+# 40 s.
+
+on:
+  pull_request:
+  push:
+    branches: [ master ]
+  # A merge queue entry runs the check on the merged result too.
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Each push gets its own group.  Thus no queued commit is dropped.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  layout:
+    name: "shared-memory struct layout"
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # A pull request runs on a test merge commit.  Its first parent
+          # is the tip of the base branch.
+          fetch-depth: 2
+
+      # A stalled mirror must fail the step, not the job. Apt retries 3 times
+      # and treats 30 s without data as a stall. Later apt commands use this.
+      # Each job writes its own copy: jobs cannot share a step.
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
+      - name: Install pahole
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install --no-install-recommends dwarves
+
+      # For a pull request, the base is HEAD^1, not the base.sha of the
+      # event.  The base.sha can be older than the base branch in the test
+      # merge commit.  Then the check would also see the base branch
+      # commits between them.
+      - name: Get the base commit
+        id: base
+        env:
+          EVENT: ${{ github.event_name }}
+          EVENT_BASE: ${{ github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            base=$(git rev-parse HEAD^1)
+          else
+            git fetch --no-tags --depth=1 origin "$EVENT_BASE"
+            base=$EVENT_BASE
+          fi
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Compare the layouts
+        env:
+          CC: gcc
+          BASE: ${{ steps.base.outputs.sha }}
+        run: tools/perf/layout-check.sh "$BASE" HEAD
