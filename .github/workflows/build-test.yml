@@ -982,16 +982,30 @@ jobs:
           # they run unprivileged to keep the result reachable by pytest; the
           # others install applications as root.
           # --unsafe runs the long Autobahn 9.x websocket cases.
+          #
+          # The port map (test/unit/port.py) is the identity at the default
+          # base of 8080, so a run there proves only its no-op path: a literal
+          # that bypasses the map is invisible until the base moves.  Thus
+          # each leg runs off-base, except go and node: their fixtures name
+          # port 8080.  The python legs run the shared files between them, so
+          # each test file runs off-base once on each pull request, at no
+          # extra cost.  go and node keep the default base covered.  --port,
+          # not UNIT_TEST_PORT: sudo-rs ignores -E.
+          case "${{ steps.metadata.outputs.module }}" in
+            go|node) port= ;;
+            *) port="--port 18080" ;;
+          esac
           if [ "${{ matrix.build }}" == "wasm-wasi-component" ] || [ "${{ matrix.build }}" == "wasm" ]; then
             set -o pipefail
-            pytest-3 --print-log --unsafe ${{ steps.metadata.outputs.testpath }} 2>&1 | tee "$RUNNER_TEMP/pytest.out"
+            pytest-3 --print-log --unsafe ${port} ${{ steps.metadata.outputs.testpath }} 2>&1 | tee "$RUNNER_TEMP/pytest.out"
           else
             # ubuntu-26.04 ships sudo-rs, which ignores -E ("preserving the
             # entire environment is not supported").  Pass the variables the
             # suite reads by name; this works with sudo-rs and classic sudo.
             sudo env UNIT_PYTHONHOME="${UNIT_PYTHONHOME:-}" \
                      JAVA_HOME="${JAVA_HOME:-}" TZ="${TZ:-}" \
-              pytest-3 --print-log --unsafe ${{ steps.metadata.outputs.testpath }}
+              pytest-3 --print-log --unsafe ${port} \
+              ${{ steps.metadata.outputs.testpath }}
           fi
 
       # check_prerequisites() skips the whole file when the clang/wasi-sysroot
@@ -1018,50 +1032,6 @@ jobs:
               exit 1
             }
           fi
-
-      # The port map (test/unit/port.py) is the identity at the default base
-      # of 8080, so every leg above proves only its no-op path: a literal that
-      # bypasses the map is invisible until the base moves.  Two such literals
-      # shipped in the change that added the map.  Re-run the suite off-base
-      # here, so the map itself is a machine check rather than a manual one.
-      #
-      # The leg is perl, and the event is a master push or a pull request
-      # labelled "ci-full".  The leg that used to run this step was unit, and
-      # that leg is gone.  perl replaces it because perl is the only other leg
-      # that builds one cheap module and skips every other language test, so
-      # `pytest test` here is the language-agnostic suite plus test_perl*.  The
-      # go and node fixtures still name port 8080, so those two legs cannot run
-      # off-base.  A python leg could, but each python leg runs only its share
-      # of the shared files, so the step would run three times and would make
-      # the python legs, which are the longest legs of a pull request, about
-      # three times longer.
-      #
-      # The event gate keeps a pull request at the wall time this workflow was
-      # trimmed for.  perl took 109 s and python-3.12 took 372 s in run
-      # 36318226905, and the unit leg ran for 3 min 57 s in run 37846680960, so
-      # the step on every pull request would most likely still leave perl
-      # shorter than python-3.12.  That is an estimate from two different runs,
-      # not a measurement, so the step stays off the pull request path until
-      # someone measures it.  A pull request that needs the check can carry the
-      # "ci-full" label.
-      #
-      # !cancelled() rather than the implicit success(): a failure in the run
-      # above is reported on its own, and gating this on it would quietly take
-      # the off-base coverage away exactly when the suite is already unhappy.
-      #
-      # --port, not UNIT_TEST_PORT: sudo-rs on ubuntu-26.04 ignores -E, so an
-      # environment variable does not reach pytest, and the run silently
-      # stays on 8080.
-      - name: Run tests off the default base port
-        timeout-minutes: 12
-        env:
-          TZ: Asia/Kolkata
-        run: |
-          sudo env TZ="${TZ:-}" pytest-3 --print-log --port 18080 test
-        if: >-
-          !cancelled() && steps.metadata.outputs.module == 'perl' &&
-          (github.event_name != 'pull_request' ||
-          contains(github.event.pull_request.labels.*.name, 'ci-full'))
 
       # test_capget_fallback.py needs a unitd that actually calls capget(),
       # which a root one never does, so every leg above skips it -- the file
