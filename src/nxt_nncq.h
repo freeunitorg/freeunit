@@ -22,6 +22,20 @@
 typedef uint32_t nxt_nncq_atomic_t;
 typedef uint16_t nxt_nncq_cycle_t;
 
+/*
+ * head, tail and the entries wrap at the width of nxt_nncq_atomic_t.  The
+ * cycle of an index i is i / NXT_NNCQ_SIZE, truncated to nxt_nncq_cycle_t,
+ * and nxt_nncq_next_cycle() wraps with that type.  This is correct across
+ * the wrap only while the number of cycles is a multiple of the range of
+ * nxt_nncq_cycle_t: 2^32 / 16384 = 2^18 is.  nxt_app_nncq.h does not have
+ * this property and counts its cycles explicitly.
+ */
+nxt_static_assert((nxt_nncq_atomic_t) -1 % NXT_NNCQ_SIZE == NXT_NNCQ_SIZE - 1,
+                  "NXT_NNCQ_SIZE must divide the range of the index");
+nxt_static_assert(((nxt_nncq_atomic_t) -1 / NXT_NNCQ_SIZE + 1)
+                  % ((nxt_nncq_atomic_t) (nxt_nncq_cycle_t) -1 + 1) == 0,
+                  "the cycles must wrap with nxt_nncq_cycle_t");
+
 typedef struct {
     nxt_nncq_atomic_t  head;
     nxt_nncq_atomic_t  entries[NXT_NNCQ_SIZE];
@@ -82,7 +96,7 @@ static inline nxt_nncq_atomic_t
 nxt_nncq_new_entry(nxt_nncq_t const volatile *q, nxt_nncq_cycle_t cycle,
     nxt_nncq_atomic_t i)
 {
-    return cycle * NXT_NNCQ_SIZE + (i % NXT_NNCQ_SIZE);
+    return (nxt_nncq_atomic_t) cycle * NXT_NNCQ_SIZE + (i % NXT_NNCQ_SIZE);
 }
 
 
