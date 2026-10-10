@@ -9,6 +9,7 @@
 
 
 nxt_uint_t    nxt_ncpu = 1;
+nxt_uint_t    nxt_ncpu_unlimited;
 nxt_uint_t    nxt_pagesize;
 nxt_task_t    nxt_main_task;
 nxt_atomic_t  nxt_task_ident;
@@ -18,7 +19,7 @@ nxt_thread_declare_data(nxt_thread_t, nxt_thread_context);
 
 #if (NXT_LINUX)
 static nxt_uint_t nxt_cgroup_cpu_limit(void);
-static nxt_uint_t nxt_cgroup_cpu_max_read(const char *dir);
+static nxt_uint_t nxt_cgroup_cpu_max_read(const char *dir, void *data);
 #endif
 
 
@@ -135,10 +136,8 @@ nxt_lib_start(const char *app, char **argv, char ***envp)
         limit = nxt_cgroup_cpu_limit();
 
         if (limit != 0 && limit < (nxt_uint_t) n) {
-            nxt_log(&nxt_main_task, NXT_LOG_INFO,
-                    "the cgroup CPU limit lowers the CPU count from %d to %ui",
-                    n, limit);
-
+            /* nxt_runtime_start() writes the record to unit.log. */
+            nxt_ncpu_unlimited = n;
             n = (int) limit;
         }
     }
@@ -315,6 +314,165 @@ nxt_cgroup_relative_path(const char *cgroup, const char *root)
 }
 
 
+/*
+ * Takes one field and the space after it off the span.  Fails if no
+ * space follows the field.
+ */
+
+static nxt_int_t
+nxt_cgroup_mountinfo_field(nxt_span_t *span, const u_char **field,
+    size_t *len)
+{
+    size_t        n;
+    const u_char  *sp, *space;
+
+    sp = memchr(span->pos, ' ', nxt_span_len(span));
+    if (sp == NULL) {
+        return NXT_DECLINED;
+    }
+
+    n = sp - span->pos;
+
+    if (nxt_span_take(span, n, field) != 0
+        || nxt_span_take(span, 1, &space) != 0)
+    {
+        return NXT_DECLINED;
+    }
+
+    *len = n;
+
+    return NXT_OK;
+}
+
+
+/*
+ * Parses one line of /proc/self/mountinfo:
+ *
+ *   <id> <parent id> <major:minor> <root> <mount point> <options>
+ *   [<optional field> ...] - <type> <source> <super options>
+ *
+ * For a line of the type "cgroup2" with a mount point that is not empty,
+ * ends the root and the mount point with a NUL in place, decodes their
+ * escapes, sets "root" and "mnt" to them, and returns NXT_OK.  For any
+ * other line, returns NXT_DECLINED and does not change "root" or "mnt".
+ */
+
+nxt_int_t
+nxt_cgroup_mountinfo_parse(char *line, char **root, char **mnt)
+{
+    char          *root_start, *mnt_start;
+    size_t        n, root_len;
+    u_char        *start, *sep;
+    nxt_uint_t    i;
+    nxt_span_t    span;
+    const u_char  *field, *root_field;
+
+    start = (u_char *) line;
+
+    /* A path writes a space as "\040", so this is the separator. */
+
+    sep = (u_char *) strstr(line, " - cgroup2 ");
+    if (sep == NULL) {
+        return NXT_DECLINED;
+    }
+
+    /*
+     * The span keeps the space that starts the separator.  So a space ends
+     * every field, the mount point too.
+     */
+
+    nxt_span_init(&span, start, sep + 1);
+
+    /* The mount ID, the parent ID, "major:minor" and the root, last. */
+
+    root_field = NULL;
+    root_len = 0;
+
+    for (i = 0; i < 4; i++) {
+        if (nxt_cgroup_mountinfo_field(&span, &root_field, &root_len)
+            != NXT_OK)
+        {
+            return NXT_DECLINED;
+        }
+    }
+
+    /*
+     * The mount point ends at the next space.  It can be empty, or decode
+     * to empty, so it is checked after the unescape.
+     */
+
+    field = NULL;
+    n = 0;
+
+    if (nxt_cgroup_mountinfo_field(&span, &field, &n) != NXT_OK) {
+        return NXT_DECLINED;
+    }
+
+    /* Both fields end at a space inside "line". */
+
+    root_start = line + (root_field - start);
+    mnt_start = line + (field - start);
+
+    root_start[root_len] = '\0';
+    mnt_start[n] = '\0';
+
+    nxt_cgroup_mountinfo_unescape(root_start);
+    nxt_cgroup_mountinfo_unescape(mnt_start);
+
+    if (*mnt_start == '\0') {
+        return NXT_DECLINED;
+    }
+
+    *root = root_start;
+    *mnt = mnt_start;
+
+    return NXT_OK;
+}
+
+
+/*
+ * Returns the lowest CPU limit that "reader" returns for the directory
+ * "dir" and for each parent of it, up to the first "base" bytes of "dir".
+ * These bytes are the mount point of the cgroup2 file system, and that
+ * directory is read too.  Returns 0 if no level sets a limit.  Changes
+ * "dir".
+ */
+
+nxt_uint_t
+nxt_cgroup_cpu_limit_walk(char *dir, size_t base,
+    nxt_uint_t (*reader)(const char *dir, void *data), void *data)
+{
+    char        *slash;
+    size_t      len;
+    nxt_uint_t  limit, cpus;
+
+    limit = 0;
+    len = strlen(dir);
+
+    for ( ;; ) {
+        cpus = reader(dir, data);
+
+        if (cpus != 0 && (limit == 0 || cpus < limit)) {
+            limit = cpus;
+        }
+
+        if (len <= base) {
+            break;
+        }
+
+        slash = strrchr(dir + base, '/');
+        if (slash == NULL) {
+            break;
+        }
+
+        *slash = '\0';
+        len = slash - dir;
+    }
+
+    return limit;
+}
+
+
 #if (NXT_LINUX)
 
 /*
@@ -329,12 +487,12 @@ nxt_cgroup_relative_path(const char *cgroup, const char *root)
 static nxt_uint_t
 nxt_cgroup_cpu_limit(void)
 {
-    int         i, len;
-    char        *line, *p, *cgroup, *root, *mnt, *slash;
+    int         len;
+    char        *line, *cgroup, *root, *mnt;
     FILE        *fp;
-    size_t      size, base;
+    size_t      size;
     ssize_t     nread;
-    nxt_uint_t  limit, cpus;
+    nxt_uint_t  limit;
     const char  *rel;
     char        dir[NXT_MAX_PATH_LEN];
 
@@ -374,45 +532,9 @@ nxt_cgroup_cpu_limit(void)
     mnt = NULL;
 
     while (getline(&line, &size, fp) > 0) {
-        p = strstr(line, " - cgroup2 ");
-        if (p == NULL) {
-            continue;
+        if (nxt_cgroup_mountinfo_parse(line, &root, &mnt) == NXT_OK) {
+            break;
         }
-
-        *p = '\0';
-
-        /* "<id> <parent> <major:minor> <root> <mount point> ..." */
-
-        p = line;
-
-        for (i = 0; i < 3 && p != NULL; i++) {
-            p = strchr(p, ' ');
-
-            if (p != NULL) {
-                p++;
-            }
-        }
-
-        if (p == NULL) {
-            continue;
-        }
-
-        root = p;
-
-        p = strchr(p, ' ');
-        if (p == NULL) {
-            continue;
-        }
-
-        *p++ = '\0';
-        mnt = p;
-
-        p = strchr(p, ' ');
-        if (p != NULL) {
-            *p = '\0';
-        }
-
-        break;
     }
 
     fclose(fp);
@@ -420,9 +542,6 @@ nxt_cgroup_cpu_limit(void)
     if (mnt == NULL) {
         goto done;
     }
-
-    nxt_cgroup_mountinfo_unescape(root);
-    nxt_cgroup_mountinfo_unescape(mnt);
 
     /* The cgroup path is relative to the root of the cgroup namespace. */
 
@@ -436,27 +555,8 @@ nxt_cgroup_cpu_limit(void)
         goto done;
     }
 
-    base = strlen(mnt);
-
-    for ( ;; ) {
-        cpus = nxt_cgroup_cpu_max_read(dir);
-
-        if (cpus != 0 && (limit == 0 || cpus < limit)) {
-            limit = cpus;
-        }
-
-        if ((size_t) len <= base) {
-            break;
-        }
-
-        slash = strrchr(dir + base, '/');
-        if (slash == NULL) {
-            break;
-        }
-
-        *slash = '\0';
-        len = slash - dir;
-    }
+    limit = nxt_cgroup_cpu_limit_walk(dir, strlen(mnt),
+                                      nxt_cgroup_cpu_max_read, NULL);
 
 done:
 
@@ -468,7 +568,7 @@ done:
 
 
 static nxt_uint_t
-nxt_cgroup_cpu_max_read(const char *dir)
+nxt_cgroup_cpu_max_read(const char *dir, void *data)
 {
     int      fd, len;
     ssize_t  n;

@@ -12,6 +12,13 @@
 
 <change type="bugfix">
 <para>
+the record that the cgroup CPU limit lowers the CPU count went only to stderr,
+before the log file was open.  It is now written to the log file.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 with a 32-bit size_t, the memory pool did not check the sum of a large size,
 its alignment and its block header.  An allocation of 4294967269 to 4294967294
 bytes got a block of 0 to 24 bytes.  The buffer allocators added their header
