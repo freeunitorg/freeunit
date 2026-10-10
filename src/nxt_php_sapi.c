@@ -1481,6 +1481,9 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
         f = r->fields + r->content_type_field;
 
         SG(request_info).content_type = nxt_unit_sptr_get(&f->value);
+
+    } else {
+        SG(request_info).content_type = NULL;
     }
 
     if (r->cookie_field != NXT_UNIT_NONE_FIELD) {

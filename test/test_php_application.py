@@ -1153,3 +1153,53 @@ def test_php_application_content_length_not_reinstated():
         resp['headers']['Transfer-Encoding'] == 'chunked'
     ), 'chunked framing'
     assert resp['body'] == '0123456789', 'body intact'
+
+
+def test_php_application_content_type_reset(findall):
+    client.load('content_type_reset', processes=1)
+
+    # Request 1: a POST with a form content type, same worker.
+    resp1 = client.post(
+        headers={
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Host': 'localhost',
+            'Connection': 'close',
+        },
+        body='a=1&b=2',
+    )
+    assert 'post=a,b' in resp1['body']
+
+    # Request 1 may read the body once: that is the form handler this
+    # request asked for. A request without the header must not read it at
+    # all, because PHP reads the body at request startup when the SAPI
+    # content type is set. nxt_php_read_post() records each read, and its
+    # record is compiled out without --debug, so only the sanitize (php)
+    # leg, which builds --debug and runs this file, fails on the code
+    # before the fix. The release legs carry the assertions on $_POST and
+    # php://input only.
+    debug = bool(findall(r'\[debug\]'))
+    reads = len(findall(r'nxt_php_read_post'))
+
+    # Request 2: a POST with NO Content-Type header, same worker.
+    resp2 = client.post(
+        headers={'Host': 'localhost', 'Connection': 'close'},
+        body='c=3&d=4',
+    )
+    assert '|post=empty' in resp2['body'], 'body must not be parsed as a form'
+
+    if debug:
+        reads_after = len(findall(r'nxt_php_read_post'))
+        assert reads_after == reads, (
+            'a request without a "Content-Type" header read the body: '
+            f'{reads} reads before it, {reads_after} after'
+        )
+
+    # Request 3: the raw body is still available through php://input when
+    # the script asks for it.
+    resp3 = client.post(
+        url='/?raw',
+        headers={'Host': 'localhost', 'Connection': 'close'},
+        body='e=5&f=6',
+    )
+    assert '|post=empty' in resp3['body']
+    assert '|raw=e=5&f=6' in resp3['body']

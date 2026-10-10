@@ -518,6 +518,16 @@ See https://github.com/freeunitorg/freeunit/issues/715.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a PHP POST request without a "Content-Type" header could make PHP read the
+request body under the content type of the previous request served by the same
+worker process.  The SAPI content_type pointer was not cleared, and it pointed
+into the request buffer that the worker had already released.  PHP now leaves
+the body for php://input.
+</para>
+</change>
+
 </changes>
 
 
