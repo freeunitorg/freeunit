@@ -1,6 +1,24 @@
 
 Changes with FreeUnit 1.37.1                                     04 Oct 2026
 
+    *) Change: the size options "large_header_buffer_size",
+       "large_header_buffers", "body_buffer_size" and "max_body_size" in
+       "settings/http", "max_frame_size" in "settings/http/websocket",
+       "min_length" of a compressor, and the "shm" limit of an application
+       now must not be negative. With a 32-bit size_t they must also be less
+       than 2147483648. Before, a negative value became a very large size,
+       and a value out of the range of ssize_t gave an undefined result.
+       A stored configuration from an earlier version that has a negative
+       value is still loaded, with a warning; the control API refuses to
+       store a new one. With a 32-bit size_t a stored value of 2147483648 or
+       more, or less than -2147483648, is refused, and unitd starts with no
+       configuration until it is corrected.
+
+    *) Bugfix: the "level" of a compressor accepted a number out of the
+       range of int, such as 2147483648. Its conversion to int was
+       undefined. The control API now refuses such a number with an error
+       that names "level".
+
     *) Bugfix: with a 32-bit size_t, the memory pool did not check the sum
        of a large size, its alignment and its block header. An allocation
        of 4294967269 to 4294967294 bytes got a block of 0 to 24 bytes. The

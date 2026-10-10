@@ -8041,6 +8041,16 @@ components:
         in Unit."
 
       properties:
+        body_buffer_size:
+          type: integer
+          format: int64
+          minimum: 0
+          description: "Maximum number of bytes of a client’s request body
+            that Unit keeps in memory.  A larger body is stored in a
+            temporary file.  On 32-bit platforms, less than 2147483648."
+
+          default: 16384
+
         body_min_rate:
           type: integer
           minimum: 0
@@ -8098,6 +8108,26 @@ components:
 
           default: 180
 
+        large_header_buffer_size:
+          type: integer
+          format: int64
+          minimum: 0
+          description: "Size in bytes of each buffer for a request header
+            that does not fit in the first 2048 bytes.  A header field must
+            fit in one buffer.  On 32-bit platforms, less than 2147483648."
+
+          default: 8192
+
+        large_header_buffers:
+          type: integer
+          format: int64
+          minimum: 0
+          description: "Maximum number of buffers of
+            `large_header_buffer_size` bytes for a request header.
+            On 32-bit platforms, less than 2147483648."
+
+          default: 4
+
         log_route:
           type: boolean
           description: "Enables or disables router logging."
@@ -8105,8 +8135,10 @@ components:
 
         max_body_size:
           type: integer
+          format: int64
+          minimum: 0
           description: "Maximum number of bytes in the body of a
-            client’s request."
+            client’s request.  On 32-bit platforms, less than 2147483648."
 
           default: 8388608
 
@@ -8198,7 +8230,10 @@ components:
 
           min_length:
             type: integer
-            description: "Minimum amount of data to consider for compressing."
+            format: int64
+            minimum: 0
+            description: "Minimum amount of data to consider for compressing.
+              On 32-bit platforms, less than 2147483648."
 
     # /config/settings/http/compression/compressors/{arrayIndex}/encoding
     configSettingsHttpCompressionCompressorsCompressorEncoding:
@@ -8213,8 +8248,11 @@ components:
     # /config/settings/http/compression/compressors/{arrayIndex}/min_length
     configSettingsHttpCompressionCompressorsCompressorMinLength:
       type: integer
+      format: int64
+      minimum: 0
       description: "An integer describing the minimum length of data to
-        consider ofr compression."
+        consider ofr compression.  On 32-bit platforms, less than
+        2147483648."
 
     # /config/settings/http/static
     configSettingsHttpStatic:

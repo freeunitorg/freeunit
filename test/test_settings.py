@@ -21,6 +21,17 @@ prerequisites = {'modules': {'python': 'any'}}
 client = ApplicationPython()
 
 
+def build_define(header, name):
+    """A number that ./configure wrote for the unitd under test.  The
+    interpreter that runs the tests can have another width."""
+
+    path = Path(option.current_dir) / 'build/include' / header
+    found = re.search(fr'^#define {name}\s+(\d+)$', path.read_text(), re.M)
+    assert found is not None, f'{name} in {header}'
+
+    return int(found.group(1))
+
+
 def sysctl():
     try:
         out = subprocess.check_output(
@@ -84,15 +95,179 @@ def test_settings_large_header_buffers():
     big_headers(9, 431)
 
 
-@pytest.mark.skip('not yet')
-def test_settings_large_header_buffer_invalid():
-    def check_error(conf):
-        assert 'error' in client.conf({'http': conf}, 'settings')
+def test_settings_size_validation():
+    client.load('empty')
 
-    check_error({'large_header_buffer_size': -1})
-    check_error({'large_header_buffer_size': 0})
-    check_error({'large_header_buffers': -1})
-    check_error({'large_header_buffers': 0})
+    # The router maps each size to ssize_t (NXT_CONF_SIZE_BOUND).
+    size_t_size = build_define('nxt_auto_config.h', 'NXT_SIZE_T_SIZE')
+    bound = 2 ** (size_t_size * 8 - 1)
+
+    if bound == 2**31:
+        largest = bound - 1
+    else:
+        # The JSON parser refuses 2^63 itself: it is too long.
+        largest = 2**40
+
+    def http(name, value):
+        return {'http': {name: value}}
+
+    def compression(_, value):
+        compressor = {'encoding': 'identity', 'min_length': value}
+
+        return {
+            'http': {
+                'compression': {
+                    'types': ['text/plain'],
+                    'compressors': compressor,
+                }
+            }
+        }
+
+    members = [
+        ('large_header_buffer_size', 'settings', http),
+        ('large_header_buffers', 'settings', http),
+        ('body_buffer_size', 'settings', http),
+        ('max_body_size', 'settings', http),
+        (
+            'max_frame_size',
+            'settings',
+            lambda n, v: {'http': {'websocket': {n: v}}},
+        ),
+        ('min_length', 'settings', compression),
+        ('shm', 'applications/empty/limits', lambda n, v: {n: v}),
+    ]
+
+    try:
+        for name, url, conf in members:
+            resp = client.conf(conf(name, -1), url)
+            assert 'error' in resp, f'{name} -1'
+            assert 'must not be negative' in resp['detail'], name
+
+            resp = client.conf(conf(name, bound), url)
+            assert 'error' in resp, f'{name} {bound}'
+
+            if bound == 2**31:
+                assert f'must be less than {bound}.' in resp['detail'], name
+
+            assert 'error' in client.conf(conf(name, 1.5), url), name
+
+            # The application restarts with each "shm" limit: keep it usable.
+            if name == 'shm':
+                accepted = (100 * 1024 * 1024,)
+            else:
+                accepted = (0, largest)
+
+            for value in accepted:
+                assert 'success' in client.conf(
+                    conf(name, value), url
+                ), f'{name} {value}'
+
+    finally:
+        # The default no-restart suite preserves /settings between tests.
+        client.conf_delete('settings/http')
+
+
+def test_settings_compression_level_validation():
+    client.load('empty')
+
+    def put_level(level):
+        compressor = {'encoding': 'identity', 'level': level}
+        conf = {
+            'http': {
+                'compression': {
+                    'types': ['text/plain'],
+                    'compressors': compressor,
+                }
+            }
+        }
+
+        return client.put(
+            url='/config/settings',
+            sock_type='unix',
+            addr=f'{option.temp_dir}/control.unit.sock',
+            body=json.dumps(conf),
+        )
+
+    detail = 'The "level" number must be from -2147483648 to 2147483647.'
+
+    try:
+        for level in (2147483648, -2147483649):
+            resp = put_level(level)
+            assert resp['status'] == 400, f'level {level}'
+            assert json.loads(resp['body'])['detail'] == detail, level
+
+        for level in (2147483647, -2147483648, 1):
+            resp = put_level(level)
+            assert resp['status'] == 200, f'level {level}'
+
+    finally:
+        # The default no-restart suite preserves /settings between tests.
+        client.conf_delete('settings/http')
+
+
+STORED_CONF = {
+    'listeners': {'*:8080': {'pass': 'routes'}},
+    'routes': [{'action': {'return': 204}}],
+    'settings': {'http': {'max_body_size': -1}},
+}
+
+
+def run_with_stored_conf(version):
+    """Start unitd on a state directory that an earlier version wrote."""
+
+    unit_stop()
+
+    statedir = Path(tempfile.mkdtemp(prefix='unit-state-'))
+
+    (statedir / 'conf.json').write_text(json.dumps(STORED_CONF))
+
+    if version is not None:
+        (statedir / 'version').write_text(str(version))
+
+    unit_run(state_dir=str(statedir))
+
+    return statedir
+
+
+@pytest.mark.parametrize('version', [13700, None])
+def test_settings_size_negative_stored(
+    requires_restart, version, wait_for_record
+):
+    """Earlier versions accepted a negative size.  unitd still loads a
+    stored configuration with one, whatever its version file says, and the
+    control API refuses a new one."""
+
+    statedir = run_with_stored_conf(version)
+
+    try:
+        assert (
+            client.conf_get('settings/http/max_body_size') == -1
+        ), 'stored configuration loaded'
+        assert client.get()['status'] == 204, 'stored configuration runs'
+
+        assert wait_for_record(
+            r'\[warn\].+the restored configuration has a negative '
+            r'"max_body_size" at "/settings/http/max_body_size"'
+        ), 'warning'
+
+        # The control API validates the whole configuration.
+        resp = client.conf([{'action': {'return': 200}}], 'routes')
+        assert 'error' in resp, 'update refused'
+        assert 'must not be negative' in resp['detail']
+        assert resp['location']['path'] == '/settings/http/max_body_size'
+        assert client.get()['status'] == 204, 'configuration kept'
+
+        assert 'success' in client.conf(
+            '1048576', 'settings/http/max_body_size'
+        ), 'corrected'
+        assert 'success' in client.conf(
+            [{'action': {'return': 200}}], 'routes'
+        ), 'update after the correction'
+        assert client.get()['status'] == 200
+
+    finally:
+        unit_stop()
+        shutil.rmtree(statedir, ignore_errors=True)
 
 
 def test_settings_server_version():
@@ -1311,13 +1486,6 @@ def test_settings_max_body_size_large():
     resp = client.post(body=body, read_buffer_size=1024 * 1024)
     assert resp['status'] == 200, 'status size 32'
     assert resp['body'] == body, 'status body 32'
-
-
-@pytest.mark.skip('not yet')
-def test_settings_negative_value():
-    assert 'error' in client.conf(
-        {'http': {'max_body_size': -1}}, 'settings'
-    ), 'settings negative value'
 
 
 def test_settings_body_buffer_size():
