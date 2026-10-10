@@ -70,6 +70,10 @@ nxt_http_websocket_client(nxt_task_t *task, void *obj, void *data)
                 buf = nxt_port_mmap_get_buf(task, &req_rpc_data->app->outgoing,
                                             buf_free_size);
                 if (nxt_slow_path(buf == NULL)) {
+                    nxt_alert(task, "websocket frame refused: no free shared "
+                              "memory buffer for %z bytes, closing the "
+                              "connection", buf_free_size);
+
                     while (out != NULL) {
                         buf = out->next;
                         out->next = NULL;
