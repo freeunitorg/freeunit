@@ -442,9 +442,18 @@ jobs:
             # built, so one Python leg is enough for it.  The other language
             # legs still run it.  A file that is not in this list only costs
             # balance, not coverage.
+            #
+            # test_settings.py was 64 s in that run.  It cost 180 s on the
+            # python-3.13 leg of run 38018584167, measured by summing the gaps
+            # between consecutive tests of the file in the leg's log.  That
+            # leg ran 359 s against 253 s and 283 s on python-3.12 and
+            # python-3.14, because the entry sent the largest shared file to
+            # the leg that already had the most work.  170 s is that
+            # measurement less the sleeps the 408 change in the same pull
+            # request removes.  Re-measure a file when its cost changes.
             heavy="
               test/test_app_start_timeout.py:72
-              test/test_settings.py:64
+              test/test_settings.py:170
               test/test_otel.py:34
               test/test_proxy.py:27
               test/test_tls.py:22
