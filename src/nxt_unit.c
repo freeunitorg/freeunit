@@ -4492,6 +4492,47 @@ nxt_unit_test_wait_shm_ack(nxt_unit_ctx_t *ctx, size_t *held)
 }
 
 
+/*
+ * The read buffers of all contexts that are parked on a segment, or
+ * (size_t) -1 when the list of a segment is not linked to its head.
+ */
+
+size_t
+nxt_unit_test_parked_rbufs(nxt_unit_ctx_t *ctx)
+{
+    size_t            n;
+    nxt_unit_mmap_t   *mm, *end;
+    nxt_unit_impl_t   *lib;
+    nxt_queue_link_t  *head, *lnk;
+
+    lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
+
+    n = 0;
+
+    pthread_mutex_lock(&lib->incoming.mutex);
+
+    end = lib->incoming.elts + lib->incoming.size;
+
+    for (mm = lib->incoming.elts; mm < end; mm++) {
+
+        head = nxt_queue_head(&mm->awaiting_rbuf);
+
+        if (head->next->prev != head || head->prev->next != head) {
+            n = (size_t) -1;
+            break;
+        }
+
+        for (lnk = head->next; lnk != head; lnk = lnk->next) {
+            n++;
+        }
+    }
+
+    pthread_mutex_unlock(&lib->incoming.mutex);
+
+    return n;
+}
+
+
 uint64_t
 nxt_unit_test_detached_now(void)
 {
@@ -5057,10 +5098,24 @@ nxt_unit_mmap_at(nxt_unit_mmaps_t *mmaps, uint32_t i)
             return NULL;
         }
 
-        e = realloc(mmaps->elts, bytes);
+        /*
+         * Not realloc(): an empty list points to its own head, and a list
+         * of parked read buffers points back to it.  So each list moves to
+         * the head in the new array.
+         */
+        e = malloc(bytes);
         if (nxt_slow_path(e == NULL)) {
             return NULL;
         }
+
+        for (n = 0; n < mmaps->cap; n++) {
+            e[n] = mmaps->elts[n];
+
+            nxt_queue_init(&e[n].awaiting_rbuf);
+            nxt_queue_add(&e[n].awaiting_rbuf, &mmaps->elts[n].awaiting_rbuf);
+        }
+
+        free(mmaps->elts);
 
         mmaps->elts = e;
 

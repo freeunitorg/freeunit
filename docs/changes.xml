@@ -41,6 +41,15 @@ the new libunit.
 
 <change type="bugfix">
 <para>
+when libunit grew its array of shared memory segments, the lists of read
+buffers that waited for a segment still pointed into the old array.  libunit
+could then write into freed memory and not ask for a segment.  The bug had
+appeared in 1.19.0.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 on 32-bit platforms, the "min_length" option of a compressor did not work.  On
 little-endian platforms, such as x86, armv7 and armhf, a response shorter than
 "min_length" was compressed, and a client that refused identity got the

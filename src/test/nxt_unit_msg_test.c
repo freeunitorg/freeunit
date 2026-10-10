@@ -565,6 +565,74 @@ nxt_unit_msg_test_get_mmap_follower_case(void *data)
 }
 
 
+/*
+ * Records for segments 3, 9, 30 and 100 grow lib->incoming four times, and
+ * a read buffer parks on each segment between the growths.  The array was
+ * grown with realloc(), and the lists of the segments still pointed into
+ * the old array.  A later read buffer for such a segment, when it was not
+ * mapped yet, was written into freed memory.
+ */
+static int
+nxt_unit_msg_test_mmaps_grow_case(void *data)
+{
+    u_char               buf[sizeof(nxt_port_msg_t)
+                             + sizeof(nxt_port_mmap_msg_t)];
+    size_t               i, parked;
+    nxt_port_msg_t       msg;
+    nxt_port_mmap_msg_t  rec;
+
+    static const uint32_t  ids[] = { 3, 9, 30, 100 };
+
+    memset(&msg, 0, sizeof(msg));
+
+    msg.stream = 7;
+    msg.pid = getpid();
+    msg.type = _NXT_PORT_MSG_RPC_READY;
+    msg.last = 1;
+    msg.mmap = 1;
+
+    rec.chunk_id = 0;
+    rec.size = 100;
+
+    for (i = 0; i < nxt_nitems(ids); i++) {
+        rec.mmap_id = ids[i];
+
+        memcpy(buf, &msg, sizeof(msg));
+        memcpy(buf + sizeof(msg), &rec, sizeof(rec));
+
+        /* At once, not behind the buffer parked before. */
+        (void) nxt_unit_test_process_shared_msg(nxt_unit_msg_test_ctx, buf,
+                                                sizeof(buf), -1);
+    }
+
+    parked = nxt_unit_test_parked_rbufs(nxt_unit_msg_test_ctx);
+
+    if (parked != nxt_nitems(ids)) {
+        printf("unit msg test: after the growths: %ld parked\n",
+               (long) parked);
+
+        /* The child ends with _exit(), which does not flush stdout. */
+        fflush(stdout);
+
+        return 2;
+    }
+
+    for (i = 0; i < nxt_nitems(ids); i++) {
+        if (nxt_unit_msg_test_send_segment(PORT_MMAP_SIZE, ids[i])
+            != NXT_UNIT_OK)
+        {
+            return 3;
+        }
+    }
+
+    if (nxt_unit_test_parked_rbufs(nxt_unit_msg_test_ctx) != 0) {
+        return 3;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
 static int
 nxt_unit_msg_test_count_maps(void)
 {
@@ -1682,6 +1750,10 @@ main(void)
 
     nxt_unit_msg_test_in_child("failed get_mmap unparks the other contexts",
                                nxt_unit_msg_test_get_mmap_follower_case,
+                               NULL, NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("segment lists stay linked when the array "
+                               "grows", nxt_unit_msg_test_mmaps_grow_case,
                                NULL, NXT_UNIT_OK);
 
     nxt_unit_msg_test_in_child("duplicate segment id does not leak a mapping",
