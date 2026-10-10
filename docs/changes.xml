@@ -50,6 +50,16 @@ appeared in 1.19.0.
 
 <change type="bugfix">
 <para>
+when libunit freed a context, the read buffers that waited for a shared memory
+segment, or behind such a buffer, leaked with the descriptors of their
+messages.  In an application with more than one thread, another thread could
+then use the freed context, and the application could crash.  The bug had
+appeared in 1.19.0.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 on 32-bit platforms, the "min_length" option of a compressor did not work.  On
 little-endian platforms, such as x86, armv7 and armhf, a response shorter than
 "min_length" was compressed, and a client that refused identity got the

@@ -65,6 +65,7 @@ static int                      nxt_unit_msg_test_handler_ok;
 static int                      nxt_unit_msg_test_ws_calls;
 static int                      nxt_unit_msg_test_ws_ok;
 static int                      nxt_unit_msg_test_close_calls;
+static int                      nxt_unit_msg_test_get_mmaps;
 static char                     nxt_unit_msg_test_ws_order[8];
 static size_t                   nxt_unit_msg_test_ws_norder;
 static nxt_unit_msg_test_mode_t nxt_unit_msg_test_mode;
@@ -241,6 +242,10 @@ nxt_unit_msg_test_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
                                                  &rec, 1, 0);
 
         nxt_unit_msg_test_follower = NULL;
+    }
+
+    if (msg->type == _NXT_PORT_MSG_GET_MMAP) {
+        nxt_unit_msg_test_get_mmaps++;
     }
 
     return nxt_unit_msg_test_send_fails ? -1 : (ssize_t) buf_size;
@@ -627,6 +632,170 @@ nxt_unit_msg_test_mmaps_grow_case(void *data)
 
     if (nxt_unit_test_parked_rbufs(nxt_unit_msg_test_ctx) != 0) {
         return 3;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * A context is freed with a read buffer parked on segment 9, and with a
+ * message in pending_rbuf that brought a descriptor.  The parked buffer
+ * stayed on the list of the segment, and when the segment came,
+ * nxt_unit_unpark_rbufs() used the freed context.  The pending buffer and
+ * its descriptor leaked.
+ */
+static int
+nxt_unit_msg_test_ctx_free_case(void *data)
+{
+    int                  rc, fd, fds[2];
+    u_char               buf[sizeof(nxt_port_msg_t)
+                             + sizeof(nxt_port_mmap_msg_t)];
+    size_t               parked;
+    nxt_bool_t           is_open;
+    nxt_unit_ctx_t       *ctx2;
+    nxt_port_msg_t       msg;
+    nxt_port_mmap_msg_t  rec;
+
+    ctx2 = nxt_unit_ctx_alloc(nxt_unit_msg_test_ctx, NULL);
+    if (ctx2 == NULL || pipe(fds) == -1) {
+        return 1;
+    }
+
+    close(fds[1]);
+    fd = fds[0];
+
+    rec.mmap_id = 9;
+    rec.chunk_id = 0;
+    rec.size = 100;
+
+    (void) nxt_unit_msg_test_send_records_to(ctx2, &rec, 1, 0);
+
+    /* A record in segment 0 waits behind the parked one, with "fd". */
+
+    memset(&msg, 0, sizeof(msg));
+
+    msg.stream = 7;
+    msg.pid = getpid();
+    msg.type = _NXT_PORT_MSG_RPC_READY;
+    msg.last = 1;
+    msg.mmap = 1;
+
+    rec.mmap_id = 0;
+
+    memcpy(buf, &msg, sizeof(msg));
+    memcpy(buf + sizeof(msg), &rec, sizeof(rec));
+
+    (void) nxt_unit_test_process_msg(ctx2, buf, sizeof(buf), fd);
+
+    if (nxt_unit_test_parked_rbufs(nxt_unit_msg_test_ctx) != 1
+        || fcntl(fd, F_GETFD) == -1)
+    {
+        return 1;
+    }
+
+    nxt_unit_done(ctx2);
+
+    parked = nxt_unit_test_parked_rbufs(nxt_unit_msg_test_ctx);
+    is_open = (fcntl(fd, F_GETFD) != -1);
+
+    if (parked != 0 || is_open) {
+        printf("unit msg test: after the context was freed: %d parked, "
+               "fd %s\n", (int) parked, is_open ? "open" : "closed");
+
+        /* The child ends with _exit(), which does not flush stdout. */
+        fflush(stdout);
+
+        return 2;
+    }
+
+    rc = nxt_unit_msg_test_send_segment(PORT_MMAP_SIZE, 9);
+
+    return (rc == NXT_UNIT_OK) ? NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK) : 3;
+}
+
+
+/*
+ * The context that asked for segment 10 is freed, and the main context
+ * waits behind it for the same segment.  The answer would go to the port
+ * of the freed context, so the buffer of the main context goes back to it.
+ * The main context reads its record again, asks for the segment itself,
+ * and gets it when it comes.
+ */
+static int
+nxt_unit_msg_test_ctx_free_asker_case(void *data)
+{
+    int                  rc;
+    size_t               parked;
+    nxt_unit_ctx_t       *ctx2;
+    nxt_port_msg_t       msg;
+    nxt_port_mmap_msg_t  rec;
+
+    ctx2 = nxt_unit_ctx_alloc(nxt_unit_msg_test_ctx, NULL);
+    if (ctx2 == NULL) {
+        return 1;
+    }
+
+    rec.mmap_id = 10;
+    rec.chunk_id = 0;
+    rec.size = 100;
+
+    nxt_unit_msg_test_follower = nxt_unit_msg_test_ctx;
+    nxt_unit_msg_test_get_mmaps = 0;
+
+    (void) nxt_unit_msg_test_send_records_to(ctx2, &rec, 1, 0);
+
+    if (nxt_unit_msg_test_follower != NULL
+        || nxt_unit_msg_test_get_mmaps != 1
+        || nxt_unit_test_parked_rbufs(nxt_unit_msg_test_ctx) != 2)
+    {
+        return 1;
+    }
+
+    nxt_unit_done(ctx2);
+
+    parked = nxt_unit_test_parked_rbufs(nxt_unit_msg_test_ctx);
+
+    if (parked != 0) {
+        printf("unit msg test: after the asking context was freed: "
+               "%d parked\n", (int) parked);
+
+        /* The child ends with _exit(), which does not flush stdout. */
+        fflush(stdout);
+
+        return 2;
+    }
+
+    /* Any message makes the main context read its pending messages. */
+
+    memset(&msg, 0, sizeof(msg));
+
+    msg.pid = getpid();
+    msg.type = _NXT_PORT_MSG_RPC_READY;
+    msg.last = 1;
+
+    (void) nxt_unit_test_process_msg(nxt_unit_msg_test_ctx, &msg, sizeof(msg),
+                                     -1);
+
+    parked = nxt_unit_test_parked_rbufs(nxt_unit_msg_test_ctx);
+
+    if (parked != 1 || nxt_unit_msg_test_get_mmaps != 2) {
+        printf("unit msg test: after the main context read again: "
+               "%d parked, %d GET_MMAP\n", (int) parked,
+               nxt_unit_msg_test_get_mmaps);
+
+        /* The child ends with _exit(), which does not flush stdout. */
+        fflush(stdout);
+
+        return 3;
+    }
+
+    rc = nxt_unit_msg_test_send_segment(PORT_MMAP_SIZE, 10);
+
+    if (rc != NXT_UNIT_OK
+        || nxt_unit_test_parked_rbufs(nxt_unit_msg_test_ctx) != 0)
+    {
+        return 4;
     }
 
     return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
@@ -1755,6 +1924,15 @@ main(void)
     nxt_unit_msg_test_in_child("segment lists stay linked when the array "
                                "grows", nxt_unit_msg_test_mmaps_grow_case,
                                NULL, NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("a freed context leaves no read buffer "
+                               "waiting", nxt_unit_msg_test_ctx_free_case,
+                               NULL, NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("a freed context hands back its segment "
+                               "request",
+                               nxt_unit_msg_test_ctx_free_asker_case, NULL,
+                               NXT_UNIT_OK);
 
     nxt_unit_msg_test_in_child("duplicate segment id does not leak a mapping",
                                nxt_unit_msg_test_dup_id_case, NULL,

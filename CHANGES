@@ -30,6 +30,12 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        the old array. libunit could then write into freed memory and not
        ask for a segment. The bug had appeared in 1.19.0.
 
+    *) Bugfix: when libunit freed a context, the read buffers that waited
+       for a shared memory segment, or behind such a buffer, leaked with
+       the descriptors of their messages. In an application with more than
+       one thread, another thread could then use the freed context, and
+       the application could crash. The bug had appeared in 1.19.0.
+
     *) Bugfix: the control API accepted a listener with neither "pass" nor
        "application". The router then refused the configuration, and the
        client got 500 "Failed to apply new configuration." with only

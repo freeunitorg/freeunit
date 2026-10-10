@@ -142,6 +142,7 @@ static int nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd);
 
 static void nxt_unit_awake_ctx(nxt_unit_ctx_t *ctx,
     nxt_unit_ctx_impl_t *ctx_impl);
+static void nxt_unit_awake_port(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port);
 static int nxt_unit_mmaps_init(nxt_unit_mmaps_t *mmaps);
 nxt_inline void nxt_unit_process_use(nxt_unit_process_t *process);
 nxt_inline void nxt_unit_process_release(nxt_unit_process_t *process);
@@ -154,6 +155,8 @@ static int nxt_unit_mmap_read(nxt_unit_ctx_t *ctx,
 static int nxt_unit_get_mmap(nxt_unit_ctx_t *ctx, pid_t pid, uint32_t id);
 static void nxt_unit_unpark_rbufs(nxt_unit_ctx_t *ctx,
     nxt_queue_t *awaiting_rbuf);
+static void nxt_unit_take_awaiting_rbufs(nxt_queue_t *awaiting_rbuf,
+    nxt_unit_mmap_t *mm);
 static void nxt_unit_mmap_release(nxt_unit_ctx_t *ctx,
     nxt_port_mmap_header_t *hdr, void *start, uint32_t size);
 static int nxt_unit_send_shm_ack(nxt_unit_ctx_t *ctx, pid_t pid);
@@ -177,6 +180,10 @@ nxt_inline int nxt_unit_is_socket_quit(nxt_unit_read_buf_t *rbuf);
 static int nxt_unit_process_port_msg_impl(nxt_unit_ctx_t *ctx,
     nxt_unit_port_t *port);
 static void nxt_unit_ctx_free(nxt_unit_ctx_impl_t *ctx_impl);
+static void nxt_unit_ctx_free_rbufs(nxt_unit_impl_t *lib,
+    nxt_unit_ctx_impl_t *ctx_impl);
+static void nxt_unit_read_buf_drop(nxt_unit_ctx_impl_t *ctx_impl,
+    nxt_unit_read_buf_t *rbuf);
 static nxt_unit_port_t *nxt_unit_create_port(nxt_unit_ctx_t *ctx);
 
 static int nxt_unit_send_port(nxt_unit_ctx_t *ctx, nxt_unit_port_t *dst,
@@ -409,6 +416,14 @@ struct nxt_unit_ctx_impl_s {
      * pending_rbuf.
      */
     nxt_atomic_t                  parked;
+
+    /*
+     * The read buffers of this context that nxt_unit_unpark_rbufs() took
+     * off a segment and has not put into pending_rbuf yet.
+     * nxt_unit_ctx_free() waits until it is 0.  The wait does not include
+     * a write.
+     */
+    nxt_atomic_t                  unparking;
 
     pthread_mutex_t               mutex;
 
@@ -862,6 +877,7 @@ nxt_unit_ctx_init(nxt_unit_impl_t *lib, nxt_unit_ctx_impl_t *ctx_impl,
     ctx_impl->use_count = 1;
     ctx_impl->wait_items = 0;
     ctx_impl->parked = 0;
+    ctx_impl->unparking = 0;
     ctx_impl->online = 1;
     ctx_impl->ready = 0;
     ctx_impl->quit_param = NXT_QUIT_GRACEFUL;
@@ -5485,8 +5501,7 @@ nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd)
 
         hdr->sent_over = 0xFFFFu;
 
-        nxt_queue_add(&awaiting_rbuf, &mm->awaiting_rbuf);
-        nxt_queue_init(&mm->awaiting_rbuf);
+        nxt_unit_take_awaiting_rbufs(&awaiting_rbuf, mm);
 
         rc = NXT_UNIT_OK;
     }
@@ -5513,6 +5528,7 @@ nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd)
 static void
 nxt_unit_unpark_rbufs(nxt_unit_ctx_t *ctx, nxt_queue_t *awaiting_rbuf)
 {
+    nxt_unit_port_t      *port;
     nxt_queue_link_t     *lnk, *prev;
     nxt_unit_ctx_impl_t  *ctx_impl;
     nxt_unit_read_buf_t  *rbuf;
@@ -5532,27 +5548,82 @@ nxt_unit_unpark_rbufs(nxt_unit_ctx_t *ctx, nxt_queue_t *awaiting_rbuf)
 
         nxt_atomic_fetch_add(&ctx_impl->parked, -1);
 
+        port = (ctx == &ctx_impl->ctx) ? NULL : ctx_impl->read_port;
+
+        if (port != NULL) {
+            nxt_unit_port_use(port);
+        }
+
         pthread_mutex_unlock(&ctx_impl->mutex);
 
         nxt_atomic_fetch_add(&ctx_impl->wait_items, -1);
 
-        nxt_unit_awake_ctx(ctx, ctx_impl);
+        /*
+         * The last use of ctx_impl: nxt_unit_ctx_free() may free it now.
+         * The wake-up below can block in sendmsg(), so it uses the port
+         * reference, and nxt_unit_ctx_free() does not wait for it.
+         */
+        nxt_atomic_fetch_add(&ctx_impl->unparking, -1);
+
+        if (port != NULL) {
+            nxt_unit_awake_port(ctx, port);
+            nxt_unit_port_release(port);
+        }
     }
+}
+
+
+/*
+ * Moves the read buffers parked on "mm" to "awaiting_rbuf", for
+ * nxt_unit_unpark_rbufs().  The caller holds the mutex of the mmaps.  Each
+ * buffer counts in "unparking" of its context until it is unparked, and the
+ * count is what lets nxt_unit_ctx_free() wait for them.
+ */
+
+static void
+nxt_unit_take_awaiting_rbufs(nxt_queue_t *awaiting_rbuf, nxt_unit_mmap_t *mm)
+{
+    nxt_unit_read_buf_t  *rbuf;
+
+    nxt_queue_each(rbuf, &mm->awaiting_rbuf, nxt_unit_read_buf_t, link) {
+
+        nxt_atomic_fetch_add(&rbuf->ctx_impl->unparking, 1);
+
+    } nxt_queue_loop;
+
+    /*
+     * "awaiting_rbuf" is never the list of "mm" itself, and nxt_queue_add()
+     * would corrupt the list if it were: it would stitch the head to
+     * itself.  So a future caller that passes one list twice, or passes the
+     * list of "mm", fails here instead of walking a broken list later.
+     */
+
+    if (nxt_slow_path(awaiting_rbuf == &mm->awaiting_rbuf)) {
+        return;
+    }
+
+    nxt_queue_add(awaiting_rbuf, &mm->awaiting_rbuf);
+    nxt_queue_init(&mm->awaiting_rbuf);
 }
 
 
 static void
 nxt_unit_awake_ctx(nxt_unit_ctx_t *ctx, nxt_unit_ctx_impl_t *ctx_impl)
 {
-    nxt_port_msg_t  msg;
-
     if (nxt_fast_path(ctx == &ctx_impl->ctx)) {
         return;
     }
 
-    if (nxt_slow_path(ctx_impl->read_port == NULL
-                      || ctx_impl->read_port->out_fd == -1))
-    {
+    nxt_unit_awake_port(ctx, ctx_impl->read_port);
+}
+
+
+static void
+nxt_unit_awake_port(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port)
+{
+    nxt_port_msg_t  msg;
+
+    if (nxt_slow_path(port == NULL || port->out_fd == -1)) {
         nxt_unit_alert(ctx, "target context read_port is NULL or not writable");
 
         return;
@@ -5562,8 +5633,7 @@ nxt_unit_awake_ctx(nxt_unit_ctx_t *ctx, nxt_unit_ctx_impl_t *ctx_impl)
 
     msg.type = _NXT_PORT_MSG_RPC_READY;
 
-    (void) nxt_unit_port_send(ctx, ctx_impl->read_port,
-                              &msg, sizeof(msg), NULL);
+    (void) nxt_unit_port_send(ctx, port, &msg, sizeof(msg), NULL);
 }
 
 
@@ -5677,12 +5747,18 @@ nxt_unit_check_rbuf_mmap(nxt_unit_ctx_t *ctx, nxt_unit_mmaps_t *mmaps,
 
             pthread_mutex_lock(&mmaps->mutex);
 
+            /*
+             * Not the "mm" of nxt_unit_mmap_at() above: that call can grow
+             * the array, which now always moves it, so "mm" may be a freed
+             * element by the time the mutex is held again.  Read the slot
+             * afresh from the array.
+             */
+
             if (mmaps->elts[id].hdr == NULL) {
                 nxt_queue_remove(&rbuf->link);
                 res = NXT_UNIT_ERROR;
 
-                nxt_queue_add(&awaiting_rbuf, &mmaps->elts[id].awaiting_rbuf);
-                nxt_queue_init(&mmaps->elts[id].awaiting_rbuf);
+                nxt_unit_take_awaiting_rbufs(&awaiting_rbuf, &mmaps->elts[id]);
 
             } else {
                 res = NXT_UNIT_AGAIN;
@@ -7058,6 +7134,8 @@ nxt_unit_ctx_free(nxt_unit_ctx_impl_t *ctx_impl)
 
     } nxt_queue_loop;
 
+    nxt_unit_ctx_free_rbufs(lib, ctx_impl);
+
     nxt_queue_each(rbuf, &ctx_impl->free_rbuf, nxt_unit_read_buf_t, link)
     {
         if (rbuf != &ctx_impl->ctx_read_buf) {
@@ -7083,6 +7161,118 @@ nxt_unit_ctx_free(nxt_unit_ctx_impl_t *ctx_impl)
     }
 
     nxt_unit_lib_release(lib);
+}
+
+
+/*
+ * Frees the read buffers of a context that wait: the ones parked on a
+ * segment and the ones in pending_rbuf.  A graceful quit waits for them,
+ * but a non-graceful quit and the last nxt_unit_ctx_release() do not.  A
+ * parked buffer stayed on the list of its segment.  When the segment came,
+ * nxt_unit_unpark_rbufs() used the freed context.
+ *
+ * The first buffer on the list of a segment asked the router for it, and
+ * the answer goes to the port of this context.  So when that buffer is of
+ * this context, the buffers of other contexts behind it go back to them,
+ * and they ask again, as in nxt_unit_check_rbuf_mmap().
+ *
+ * No thread uses this context any more, so only nxt_unit_unpark_rbufs()
+ * can still change "parked" and pending_rbuf.  Without a parked buffer,
+ * lib->incoming is not touched: nxt_unit_create() can free the main context
+ * when lib->incoming is not initialized.
+ */
+
+static void
+nxt_unit_ctx_free_rbufs(nxt_unit_impl_t *lib, nxt_unit_ctx_impl_t *ctx_impl)
+{
+    nxt_bool_t           first, asked;
+    nxt_queue_t          others, rbufs;
+    nxt_unit_mmap_t      *mm, *end;
+    nxt_unit_read_buf_t  *rbuf;
+
+    nxt_queue_init(&others);
+    nxt_queue_init(&rbufs);
+
+    if (ctx_impl->parked > 0) {
+        pthread_mutex_lock(&lib->incoming.mutex);
+
+        end = lib->incoming.elts + lib->incoming.size;
+
+        for (mm = lib->incoming.elts; mm < end; mm++) {
+            first = 1;
+            asked = 0;
+
+            nxt_queue_each(rbuf, &mm->awaiting_rbuf, nxt_unit_read_buf_t,
+                           link)
+            {
+                if (rbuf->ctx_impl == ctx_impl) {
+                    asked |= first;
+
+                    nxt_queue_remove(&rbuf->link);
+                    nxt_queue_insert_tail(&rbufs, &rbuf->link);
+                }
+
+                first = 0;
+
+            } nxt_queue_loop;
+
+            if (asked) {
+                nxt_unit_take_awaiting_rbufs(&others, mm);
+            }
+        }
+
+        pthread_mutex_unlock(&lib->incoming.mutex);
+
+        nxt_unit_unpark_rbufs(&ctx_impl->ctx, &others);
+    }
+
+    /* Another thread may still put buffers of this context in pending_rbuf. */
+    while (ctx_impl->unparking != 0) {
+        nxt_thread_yield();
+    }
+
+    pthread_mutex_lock(&ctx_impl->mutex);
+
+    nxt_queue_add(&rbufs, &ctx_impl->pending_rbuf);
+    nxt_queue_init(&ctx_impl->pending_rbuf);
+
+    pthread_mutex_unlock(&ctx_impl->mutex);
+
+    nxt_queue_each(rbuf, &rbufs, nxt_unit_read_buf_t, link) {
+
+        nxt_unit_read_buf_drop(ctx_impl, rbuf);
+
+    } nxt_queue_loop;
+}
+
+
+/*
+ * Frees a read buffer whose message was not processed, and closes the
+ * descriptors that came with the message.
+ */
+
+static void
+nxt_unit_read_buf_drop(nxt_unit_ctx_impl_t *ctx_impl, nxt_unit_read_buf_t *rbuf)
+{
+    int  fd[2];
+
+    fd[0] = -1;
+    fd[1] = -1;
+
+    /* With truncated control data, fd[] still has the descriptors that came. */
+    (void) nxt_socket_msg_oob_get_fds(&rbuf->oob, fd);
+
+    if (fd[0] != -1) {
+        nxt_unit_close(fd[0]);
+    }
+
+    if (fd[1] != -1) {
+        nxt_unit_close(fd[1]);
+    }
+
+    if (rbuf != &ctx_impl->ctx_read_buf) {
+        nxt_unit_free(&ctx_impl->ctx, rbuf);
+    }
 }
 
 
