@@ -81,3 +81,111 @@ jobs:
 
       - name: Run libunit port_recv fd-ownership test
         run: ./build/unit_port_recv_test
+
+      # The C suites call the library in this process and never start the
+      # daemon.  This step does: unitd, the control API, and a real request
+      # answered by build/unit_app_test.  That is the path issue 595 came
+      # through, the router's half of the shared memory size check, which no
+      # C program exercises.  It also covers the shared memory of the port
+      # queue and the state store on 16 KiB pages.
+      - name: Run unitd and serve a request from unit_app_test
+        run: |
+          set -eu
+
+          smoke_dir="$PWD/.macos-smoke"
+          rm -rf "$smoke_dir"
+          mkdir -p "$smoke_dir/state"
+
+          port=8391
+          control_sock="$smoke_dir/control.unit.sock"
+          unitd_log="$smoke_dir/unit.log"
+          pidfile="$smoke_dir/unit.pid"
+
+          # The step's shell waits for unitd at the end.  A daemon that exits
+          # early fails the request below, and the log check says why.
+          ./build/sbin/unitd --no-daemon \
+              --statedir "$smoke_dir/state" \
+              --pid "$pidfile" \
+              --log "$unitd_log" \
+              --control "unix:$control_sock" \
+              --tmpdir "$smoke_dir" &
+
+          # The control API answering means unitd finished initializing and
+          # created the shared memory the router allocates on 16 KiB pages.
+          up=0
+          i=0
+          while [ "$i" -lt 100 ]; do
+              if curl -sS -m 2 --unix-socket "$control_sock" \
+                       http://localhost/certificates > /dev/null 2>&1; then
+                  up=1
+                  break
+              fi
+              i=$((i + 1))
+              sleep 0.2
+          done
+
+          if [ "$up" -eq 0 ]; then
+              echo "the control API did not answer within 20 s"
+              cat "$unitd_log" || true
+              exit 1
+          fi
+
+          # One json line, so the step needs no heredoc: a heredoc terminator
+          # would have to start at column 0, outside this YAML block scalar.
+          config=$(printf '{"listeners":{"127.0.0.1:8391":{"pass":"applications/smoke"}},"applications":{"smoke":{"type":"external","executable":"%s","processes":1}}}' "$PWD/build/unit_app_test")
+
+          printf '%s\n' "$config"
+          printf '%s\n' "$config" > "$smoke_dir/config.json"
+
+          curl -sS -m 10 --unix-socket "$control_sock" \
+               -X PUT -d @"$smoke_dir/config.json" http://localhost/config
+          echo
+
+          why="the listener did not answer"
+          answer=0
+          last=""
+          i=0
+          while [ "$i" -lt 100 ]; do
+              last=$(printf 'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' \
+                     | nc -w 5 127.0.0.1 "$port" || true)
+
+              case "$last" in
+                  *"Hello world!"*)
+                      answer=1
+                      break
+                      ;;
+                  *" 500 "*)
+                      why="the request got 500"
+                      ;;
+              esac
+
+              i=$((i + 1))
+              sleep 0.2
+          done
+
+          printf '%s\n' "$last"
+
+          if [ "$answer" -ne 1 ]; then
+              echo "$why"
+              cat "$unitd_log" || true
+              exit 1
+          fi
+
+          if ! kill -0 "$(cat "$pidfile")" 2> /dev/null; then
+              echo "unitd died while the request was served"
+              cat "$unitd_log" || true
+              exit 1
+          fi
+
+          case "$(cat "$unitd_log")" in
+              *"failed to start"* | *"failed to apply new conf"* \
+              | *"failed to start a process"*)
+                  echo "unitd logged a start failure"
+                  cat "$unitd_log"
+                  exit 1
+                  ;;
+          esac
+
+          kill "$(cat "$pidfile")" 2> /dev/null || true
+          wait || true
+          rm -rf "$smoke_dir"
