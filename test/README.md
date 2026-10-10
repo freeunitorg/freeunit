@@ -251,3 +251,9 @@ language versions come from `pkg/eol.json`.
 
 `.github/scripts/test-matrix.sh` has the rules and the version that a pull
 request gets for each runtime.
+
+`.github/workflows/nightly.yml` runs two compile gates on `master` once a
+night and on demand: `--hardening=strict` with the runner's gcc and clang,
+and a build against upstream OpenSSL 4.0 at a pinned version. Pull requests
+and pushes do not run them. A failed nightly run opens or updates a tracking
+issue.

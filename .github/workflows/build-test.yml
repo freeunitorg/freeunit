@@ -1278,6 +1278,9 @@ jobs:
   # the build when it lands and not when OpenSSL removes the API.  -Werror
   # alone catches only the deprecated functions.  The clang leg builds as a
   # distribution package does, with the deprecated API visible.
+  #
+  # nightly.yml runs the same strict gate with the runner's gcc and clang and
+  # builds against upstream OpenSSL 4.0 at a pinned version, once a night.
   hardening-strict-fedora:
     name: hardening-strict-fedora (${{ matrix.cc }})
     runs-on: ubuntu-26.04
