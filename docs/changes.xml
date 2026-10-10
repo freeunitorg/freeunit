@@ -36,15 +36,18 @@ again until the queue takes it.
 
 <change type="bugfix">
 <para>
-on Linux with a 32-bit glibc, several source files had a 32-bit off_t, and the
-other files had a 64-bit off_t.  The files include a system header before
-nxt_unix.h, which sets _FILE_OFFSET_BITS: nxt_http_compression.c, nxt_zlib.c,
-nxt_brotli.c, nxt_zstd.c, nxt_upstream_round_robin.c and four libunit test
-programs.  A struct with an off_t then had different layouts in different
-files.  The "min_length" compression option was written as 8 bytes into a
-4-byte field, and build/tests crashed.  configure now adds
--D_FILE_OFFSET_BITS=64 on Linux, and the build fails when off_t does not have
-the size that configure measured.  musl and 64-bit systems were not affected.
+on a system where off_t is 32 bits by default (32-bit Linux with glibc,
+Solaris, HP-UX and QNX), several source files had a 32-bit off_t, and the
+other files had a 64-bit off_t.  On Linux, Solaris and HP-UX the files include
+a system header before nxt_unix.h, which sets _FILE_OFFSET_BITS:
+nxt_http_compression.c, nxt_zlib.c, nxt_brotli.c, nxt_zstd.c,
+nxt_upstream_round_robin.c and four libunit test programs.  On QNX nxt_unix.h
+does not set the macro at all.  A struct with an off_t then had different
+layouts in different files.  The "min_length" compression option was written
+as 8 bytes into a 4-byte field, and build/tests crashed.  configure now adds
+-D_FILE_OFFSET_BITS=64 on those four systems, and the build fails when off_t
+does not have the size that configure measured.  musl and 64-bit systems were
+not affected.
 </para>
 </change>
 

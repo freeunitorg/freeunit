@@ -73,6 +73,12 @@ case "$NXT_SYSTEM" in
     SunOS)
         nxt_have=NXT_SOLARIS . auto/have
 
+        # 32-bit Solaris gives off_t 32 bits by default.  Its
+        # <sys/feature_tests.h> defines _FILE_OFFSET_BITS 32 itself, so
+        # nxt_unix.h cannot raise it in a file that includes a system
+        # header first.
+        NXT_CFLAGS="$NXT_CFLAGS -D_FILE_OFFSET_BITS=64"
+
         case "$NXT_CC_NAME" in
 
             SunC):
@@ -222,6 +228,11 @@ case "$NXT_SYSTEM" in
     HP-UX)
         nxt_have=NXT_HPUX . auto/have
 
+        # As on Solaris: 32-bit HP-UX gives off_t 32 bits by default, and
+        # nxt_unix.h sets the macro too late for a file that includes a
+        # system header first.
+        NXT_CFLAGS="$NXT_CFLAGS -D_FILE_OFFSET_BITS=64"
+
         NXT_EXEC_LINK="\$(CC)"
         NXT_SHARED_LOCAL_EXEC_LINK=
 
@@ -242,6 +253,9 @@ case "$NXT_SYSTEM" in
 
     QNX)
         nxt_have=NXT_QNX . auto/have
+
+        # On a 32-bit QNX target off_t is 32 bits unless this macro is set.
+        NXT_CFLAGS="$NXT_CFLAGS -D_FILE_OFFSET_BITS=64"
 
         NXT_STATIC_LINK="\$(AR) -r -c"
         NXT_SHARED_LINK="\$(CC) -shared"

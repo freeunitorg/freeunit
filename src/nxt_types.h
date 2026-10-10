@@ -138,8 +138,9 @@ typedef uint32_t             nxt_uoff_t;
 /*
  * configure measures off_t with _FILE_OFFSET_BITS 64.  A source file that
  * includes a system header before this one without that macro gets a
- * different off_t on 32-bit glibc, and the layout of each struct with an
- * off_t differs between the files.
+ * different off_t on a system where off_t is 32 bits by default (32-bit
+ * glibc, Solaris, HP-UX, QNX), and the layout of each struct with an off_t
+ * differs between the files.
  */
 nxt_static_assert(sizeof(off_t) == NXT_OFF_T_SIZE,
                   "off_t does not have the size that configure measured");

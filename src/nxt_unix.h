@@ -114,7 +114,9 @@
 
 #if (NXT_HPUX)
 
-#define _FILE_OFFSET_BITS  64
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS  64       /* Also set by configure. */
+#endif
 
 /*
  * HP-UX provides three sockets API:
