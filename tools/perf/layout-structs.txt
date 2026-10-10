@@ -1,0 +1,50 @@
+# Copyright (C) FreeUnit contributors.
+#
+# The structs and the macros that tools/perf/layout-check.sh compares.
+# Each line is "<kind> <name>".
+#
+# shm:   Processes share the struct through shared memory.  A change to
+#        its layout fails the check.  The router reads the requests
+#        that libunit writes and the responses that it writes back, so
+#        both directions are listed.
+#        nxt_port_msg_t and nxt_port_mmap_msg_s are copied as bytes into
+#        the data of a port queue item, and the reader decodes them with
+#        its own layout.  pahole sees only the byte array there, so they
+#        are listed on their own.  The same is true for the other
+#        message payloads that libunit and unitd both decode: GET_MMAP
+#        and GET_PORT (libunit to the router), NEW_PORT (the router to
+#        libunit), and the WebSocket frame header in a shared buffer.
+# const: A macro that sets the geometry of the shared memory.  pahole
+#        does not see a macro, thus a program that is built with the
+#        headers of the commit prints its value.  A change fails.  For
+#        example, nxt_port_mmap_chunk_start() finds the data of a chunk
+#        with PORT_MMAP_HEADER_SIZE and PORT_MMAP_CHUNK_SIZE.
+# local: The struct is in the memory of one process.  A change to its
+#        layout gives a warning.
+#
+# If you remove an entry from this list, the check fails.
+
+shm    nxt_nncq_t
+shm    nxt_app_nncq_t
+shm    nxt_port_queue_t
+shm    nxt_port_queue_item_t
+shm    nxt_app_queue_t
+shm    nxt_app_queue_item_t
+shm    nxt_port_mmap_header_s
+shm    nxt_unit_request_s
+shm    nxt_unit_response_s
+shm    nxt_port_msg_t
+shm    nxt_port_mmap_msg_s
+shm    nxt_port_msg_get_mmap_t
+shm    nxt_port_msg_get_port_t
+shm    nxt_port_msg_new_port_t
+shm    nxt_websocket_header_t
+
+const  PORT_MMAP_HEADER_SIZE
+const  PORT_MMAP_DATA_SIZE
+const  PORT_MMAP_CHUNK_SIZE
+const  PORT_MMAP_SIZE
+const  PORT_MMAP_CHUNK_COUNT
+
+local  nxt_port_s
+local  nxt_unit_ctx_impl_s
