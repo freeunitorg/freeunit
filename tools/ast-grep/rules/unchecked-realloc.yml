@@ -1,0 +1,19 @@
+id: unchecked-realloc
+language: c
+severity: warning
+message: >-
+  The result of realloc() is stored in the pointer that is resized. When
+  realloc() fails, it returns NULL and keeps the old block. This assignment
+  then loses the only pointer to the old block, and the next use reads NULL.
+  Store the result in a temporary pointer and check it first. The rule also
+  matches nxt_realloc() (src/nxt_malloc.h).
+# The patterns have no ";", so they match the assignment itself.  A pattern
+# that ends with ";" matches a statement only, and it misses
+# "if ((p = realloc(p, n)) == NULL)".  The last two patterns take a cast of
+# the result.
+rule:
+  any:
+    - pattern: $X = realloc($X, $$$)
+    - pattern: $X = nxt_realloc($X, $$$)
+    - pattern: $X = ($T) realloc($X, $$$)
+    - pattern: $X = ($T) nxt_realloc($X, $$$)

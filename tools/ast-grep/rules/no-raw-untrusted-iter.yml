@@ -1,0 +1,15 @@
+id: no-raw-untrusted-iter
+language: c
+severity: warning
+message: >-
+  A byte copy loop ("*dst++ = *src++"). Use nxt_cpymem() or memcpy() with a
+  length that a helper checked: nxt_size_add() or nxt_size_mul() in
+  src/nxt_checked.h, or nxt_span_copy() in src/nxt_span.h. Then the length is
+  checked once, and the loop bound is not trusted.
+note: >-
+  The rule matches only the statement "*dst++ = *src++;". It does not match
+  a loop that walks an array of records with a pointer. Such a loop is not
+  wrong by itself. It needs a second look when the source is untrusted input,
+  such as a message from a peer.
+rule:
+  pattern: "*$DST++ = *$SRC++;"
