@@ -802,6 +802,307 @@ nxt_unit_msg_test_ctx_free_asker_case(void *data)
 }
 
 
+/*
+ * The threaded cases stop one thread in nxt_unit_unpark_rbufs(), after it
+ * took the buffers off a segment and before it put them into pending_rbuf,
+ * and free a context from another thread.  nxt_unit_ctx_free() has to wait
+ * for that buffer: it is not on the segment and not pending, it only counts
+ * in "unparking".  Each case sets alarm(), so a free that never returns
+ * kills the child instead of hanging the suite.
+ */
+
+typedef struct {
+    pthread_mutex_t  mutex;
+    pthread_cond_t   cond;
+    int              stopped;
+    int              go;
+} nxt_unit_msg_test_stop_t;
+
+
+static nxt_unit_msg_test_stop_t  nxt_unit_msg_test_stop = {
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0
+};
+
+
+static void
+nxt_unit_msg_test_unpark_stop(void *data)
+{
+    nxt_unit_msg_test_stop_t  *stop;
+
+    stop = data;
+
+    pthread_mutex_lock(&stop->mutex);
+
+    stop->stopped = 1;
+    pthread_cond_broadcast(&stop->cond);
+
+    while (!stop->go) {
+        pthread_cond_wait(&stop->cond, &stop->mutex);
+    }
+
+    pthread_mutex_unlock(&stop->mutex);
+}
+
+
+static void
+nxt_unit_msg_test_unpark_wait_stopped(void)
+{
+    pthread_mutex_lock(&nxt_unit_msg_test_stop.mutex);
+
+    while (!nxt_unit_msg_test_stop.stopped) {
+        pthread_cond_wait(&nxt_unit_msg_test_stop.cond,
+                          &nxt_unit_msg_test_stop.mutex);
+    }
+
+    pthread_mutex_unlock(&nxt_unit_msg_test_stop.mutex);
+}
+
+
+static void
+nxt_unit_msg_test_unpark_go(void)
+{
+    pthread_mutex_lock(&nxt_unit_msg_test_stop.mutex);
+
+    nxt_unit_msg_test_stop.go = 1;
+    pthread_cond_broadcast(&nxt_unit_msg_test_stop.cond);
+
+    pthread_mutex_unlock(&nxt_unit_msg_test_stop.mutex);
+}
+
+
+typedef struct {
+    nxt_unit_ctx_t  *ctx;
+    nxt_atomic_t    done;
+} nxt_unit_msg_test_free_t;
+
+
+static void *
+nxt_unit_msg_test_free_thread(void *data)
+{
+    nxt_unit_msg_test_free_t  *f;
+
+    f = data;
+
+    nxt_unit_done(f->ctx);
+
+    nxt_atomic_xchg(&f->done, 1);
+
+    return NULL;
+}
+
+
+static void *
+nxt_unit_msg_test_segment_thread(void *data)
+{
+    (void) nxt_unit_msg_test_send_segment(PORT_MMAP_SIZE,
+                                          (uint32_t) (uintptr_t) data);
+
+    return NULL;
+}
+
+
+/*
+ * The free must not return while the other thread holds a buffer of the
+ * context.  200 ms is long enough for a free that does not wait to return.
+ */
+static int
+nxt_unit_msg_test_free_waits(nxt_unit_msg_test_free_t *f)
+{
+    usleep(200000);
+
+    if (f->done) {
+        printf("unit msg test: the context was freed while another thread "
+               "unparked its buffer\n");
+
+        /* The child ends with _exit(), which does not flush stdout. */
+        fflush(stdout);
+
+        return 0;
+    }
+
+    return 1;
+}
+
+
+/*
+ * Thread A gets segment 11 and stops with the buffer of context Y in its
+ * hands.  Thread B frees Y.  The free waits for A, and then drops the
+ * buffer and closes the descriptor of its message.
+ */
+static int
+nxt_unit_msg_test_ctx_free_thread_case(void *data)
+{
+    int                       fd, fds[2], waited;
+    u_char                    buf[sizeof(nxt_port_msg_t)
+                                  + sizeof(nxt_port_mmap_msg_t)];
+    size_t                    parked;
+    pthread_t                 a, b;
+    nxt_bool_t                is_open;
+    nxt_port_msg_t            msg;
+    nxt_port_mmap_msg_t       rec;
+    nxt_unit_msg_test_free_t  f;
+
+    alarm(10);
+
+    f.ctx = nxt_unit_ctx_alloc(nxt_unit_msg_test_ctx, NULL);
+    f.done = 0;
+
+    if (f.ctx == NULL || pipe(fds) == -1) {
+        return 1;
+    }
+
+    close(fds[1]);
+    fd = fds[0];
+
+    /* Y reads a record in segment 11, with "fd", and parks. */
+
+    memset(&msg, 0, sizeof(msg));
+
+    msg.stream = 7;
+    msg.pid = getpid();
+    msg.type = _NXT_PORT_MSG_RPC_READY;
+    msg.last = 1;
+    msg.mmap = 1;
+
+    rec.mmap_id = 11;
+    rec.chunk_id = 0;
+    rec.size = 100;
+
+    memcpy(buf, &msg, sizeof(msg));
+    memcpy(buf + sizeof(msg), &rec, sizeof(rec));
+
+    (void) nxt_unit_test_process_msg(f.ctx, buf, sizeof(buf), fd);
+
+    if (nxt_unit_test_parked_rbufs(nxt_unit_msg_test_ctx) != 1) {
+        return 1;
+    }
+
+    nxt_unit_test_set_unpark_hook(NXT_UNIT_TEST_UNPARK_TAKEN,
+                                  nxt_unit_msg_test_unpark_stop,
+                                  &nxt_unit_msg_test_stop);
+
+    if (pthread_create(&a, NULL, nxt_unit_msg_test_segment_thread,
+                       (void *) (uintptr_t) 11) != 0)
+    {
+        return 1;
+    }
+
+    nxt_unit_msg_test_unpark_wait_stopped();
+
+    if (pthread_create(&b, NULL, nxt_unit_msg_test_free_thread, &f) != 0) {
+        return 1;
+    }
+
+    waited = nxt_unit_msg_test_free_waits(&f);
+
+    nxt_unit_msg_test_unpark_go();
+
+    pthread_join(a, NULL);
+    pthread_join(b, NULL);
+
+    parked = nxt_unit_test_parked_rbufs(nxt_unit_msg_test_ctx);
+    is_open = (fcntl(fd, F_GETFD) != -1);
+
+    if (!waited || parked != 0 || is_open) {
+        printf("unit msg test: after the threaded free: %s, %d parked, "
+               "fd %s\n", waited ? "waited" : "did not wait", (int) parked,
+               is_open ? "open" : "closed");
+
+        /* The child ends with _exit(), which does not flush stdout. */
+        fflush(stdout);
+
+        return 2;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * Context Y asks for segment 12, and context X parks behind it.  Thread A
+ * frees Y: it hands the buffer of X back and stops before the wake-up of
+ * the port of X.  The buffer is pending in X, so thread B frees X without
+ * a wait, and removes the port of X.  A then wakes that port: the
+ * reference that A took on the port keeps it alive.  ASan reports a
+ * use-after-free here without the reference.
+ */
+static int
+nxt_unit_msg_test_ctx_free_asker_thread_case(void *data)
+{
+    int                       freed;
+    size_t                    parked;
+    pthread_t                 a, b;
+    nxt_unit_msg_test_free_t  fy, fx;
+    nxt_port_mmap_msg_t       rec;
+
+    alarm(10);
+
+    fy.ctx = nxt_unit_ctx_alloc(nxt_unit_msg_test_ctx, NULL);
+    fx.ctx = nxt_unit_ctx_alloc(nxt_unit_msg_test_ctx, NULL);
+    fy.done = 0;
+    fx.done = 0;
+
+    if (fy.ctx == NULL || fx.ctx == NULL) {
+        return 1;
+    }
+
+    rec.mmap_id = 12;
+    rec.chunk_id = 0;
+    rec.size = 100;
+
+    nxt_unit_msg_test_follower = fx.ctx;
+    nxt_unit_msg_test_get_mmaps = 0;
+
+    (void) nxt_unit_msg_test_send_records_to(fy.ctx, &rec, 1, 0);
+
+    if (nxt_unit_msg_test_follower != NULL
+        || nxt_unit_msg_test_get_mmaps != 1
+        || nxt_unit_test_parked_rbufs(nxt_unit_msg_test_ctx) != 2)
+    {
+        return 1;
+    }
+
+    nxt_unit_test_set_unpark_hook(NXT_UNIT_TEST_UNPARK_WAKE,
+                                  nxt_unit_msg_test_unpark_stop,
+                                  &nxt_unit_msg_test_stop);
+
+    if (pthread_create(&a, NULL, nxt_unit_msg_test_free_thread, &fy) != 0) {
+        return 1;
+    }
+
+    nxt_unit_msg_test_unpark_wait_stopped();
+
+    if (pthread_create(&b, NULL, nxt_unit_msg_test_free_thread, &fx) != 0) {
+        return 1;
+    }
+
+    /* The free of X does not wait for the wake-up. */
+
+    pthread_join(b, NULL);
+
+    freed = !fy.done;
+
+    nxt_unit_msg_test_unpark_go();
+
+    pthread_join(a, NULL);
+
+    parked = nxt_unit_test_parked_rbufs(nxt_unit_msg_test_ctx);
+
+    if (!freed || parked != 0) {
+        printf("unit msg test: after the threaded free of the asker: "
+               "%s, %d parked\n", freed ? "X freed first" : "Y done first",
+               (int) parked);
+
+        /* The child ends with _exit(), which does not flush stdout. */
+        fflush(stdout);
+
+        return 2;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
 static int
 nxt_unit_msg_test_count_maps(void)
 {
@@ -1933,6 +2234,16 @@ main(void)
                                "request",
                                nxt_unit_msg_test_ctx_free_asker_case, NULL,
                                NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("a freed context waits for the thread that "
+                               "unparks its buffer",
+                               nxt_unit_msg_test_ctx_free_thread_case, NULL,
+                               NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("a context freed during the wake-up of its "
+                               "port keeps the port alive",
+                               nxt_unit_msg_test_ctx_free_asker_thread_case,
+                               NULL, NXT_UNIT_OK);
 
     nxt_unit_msg_test_in_child("duplicate segment id does not leak a mapping",
                                nxt_unit_msg_test_dup_id_case, NULL,

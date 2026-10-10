@@ -5514,6 +5514,48 @@ nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd)
 }
 
 
+#if (NXT_TESTS)
+
+/*
+ * A test hook in nxt_unit_unpark_rbufs(), for one call.  A test stops a
+ * thread there and frees a context from another thread.
+ *
+ * NXT_UNIT_TEST_UNPARK_TAKEN: at the start, with a buffer.  The buffers are
+ * off the list of the segment, they count in "unparking", and they are not
+ * in pending_rbuf yet.
+ *
+ * NXT_UNIT_TEST_UNPARK_WAKE: before the wake-up of the port of another
+ * context.  The buffer is in pending_rbuf and "unparking" no longer counts
+ * it, so nxt_unit_ctx_free() of that context can return.
+ */
+
+static nxt_atomic_t  nxt_unit_test_unpark_stage;
+static void          (*nxt_unit_test_unpark_hook)(void *data);
+static void          *nxt_unit_test_unpark_data;
+
+
+void
+nxt_unit_test_set_unpark_hook(int stage, void (*hook)(void *data),
+    void *data)
+{
+    nxt_unit_test_unpark_hook = hook;
+    nxt_unit_test_unpark_data = data;
+
+    nxt_atomic_xchg(&nxt_unit_test_unpark_stage, (hook != NULL) ? stage : 0);
+}
+
+
+static void
+nxt_unit_test_unpark_point(int stage)
+{
+    if (nxt_atomic_cmp_set(&nxt_unit_test_unpark_stage, stage, 0)) {
+        nxt_unit_test_unpark_hook(nxt_unit_test_unpark_data);
+    }
+}
+
+#endif
+
+
 /*
  * Hands the read buffers parked on a segment back to their contexts as
  * pending, so each context reads its message again.  A parked buffer was
@@ -5532,6 +5574,12 @@ nxt_unit_unpark_rbufs(nxt_unit_ctx_t *ctx, nxt_queue_t *awaiting_rbuf)
     nxt_queue_link_t     *lnk, *prev;
     nxt_unit_ctx_impl_t  *ctx_impl;
     nxt_unit_read_buf_t  *rbuf;
+
+#if (NXT_TESTS)
+    if (!nxt_queue_is_empty(awaiting_rbuf)) {
+        nxt_unit_test_unpark_point(NXT_UNIT_TEST_UNPARK_TAKEN);
+    }
+#endif
 
     for (lnk = nxt_queue_last(awaiting_rbuf);
          lnk != nxt_queue_head(awaiting_rbuf);
@@ -5566,6 +5614,9 @@ nxt_unit_unpark_rbufs(nxt_unit_ctx_t *ctx, nxt_queue_t *awaiting_rbuf)
         nxt_atomic_fetch_add(&ctx_impl->unparking, -1);
 
         if (port != NULL) {
+#if (NXT_TESTS)
+            nxt_unit_test_unpark_point(NXT_UNIT_TEST_UNPARK_WAKE);
+#endif
             nxt_unit_awake_port(ctx, port);
             nxt_unit_port_release(port);
         }

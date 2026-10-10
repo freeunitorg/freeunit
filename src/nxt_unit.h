@@ -484,6 +484,10 @@ nxt_unit_port_t  *nxt_unit_test_ctx_read_port(nxt_unit_ctx_t *ctx);
 void     *nxt_unit_test_port_queue(nxt_unit_port_t *port);
 int      nxt_unit_test_wait_shm_ack(nxt_unit_ctx_t *ctx, size_t *held);
 size_t   nxt_unit_test_parked_rbufs(nxt_unit_ctx_t *ctx);
+#define NXT_UNIT_TEST_UNPARK_TAKEN  1
+#define NXT_UNIT_TEST_UNPARK_WAKE   2
+void     nxt_unit_test_set_unpark_hook(int stage, void (*hook)(void *data),
+    void *data);
 uint64_t nxt_unit_test_detached_now(void);
 uint8_t  nxt_unit_test_ctx_online(nxt_unit_ctx_t *ctx);
 uint8_t  nxt_unit_test_ctx_ready(nxt_unit_ctx_t *ctx);
