@@ -94,6 +94,35 @@ length arithmetic on untrusted input, use `nxt_size_add()` and
 `nxt_size_mul()` from `src/nxt_checked.h`. For record parsing, use
 `nxt_span_t` from `src/nxt_span.h`.
 
+Two CI checks look at each pull request. `ast-grep baseline` runs the
+rules in `tools/ast-grep/` over `src/`, without `src/test/`. It fails on
+a match that is not in `tools/ast-grep/baseline.json`. It also fails on
+a stale entry: an entry in `baseline.json` that no match uses any more.
+When you fix a match, remove its entry, or run the `--update` command
+below. The rules find some known shapes only. A green check does not
+show that the code uses `nxt_size_add()` or `nxt_span_t` where it must:
+for example, a sum of three lengths or a hand-written `p + n <= end`
+check does not match. `require a test for a src/ change` warns when a PR changes a
+file under `src/` and no file under `test/` or `src/test/`. If the
+change needs no test, add the `no-test-needed` label, or a trailer with
+the reason to one of your commits:
+
+```
+No-Test-Reason: the change only renames a local variable
+```
+
+To run the ast-grep check before you push (ast-grep 0.45.3 must be
+installed):
+
+```console
+$ ast-grep test -c tools/ast-grep/sgconfig.yml
+$ python3 tools/ast-grep/check_baseline.py
+```
+
+When a new match is reviewed and safe, run
+`python3 tools/ast-grep/check_baseline.py --update` and commit
+`baseline.json` with the change.
+
 ## Commit Messages
 
 Use conventional commits format:

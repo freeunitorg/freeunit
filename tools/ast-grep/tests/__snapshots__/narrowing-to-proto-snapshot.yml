@@ -1,0 +1,28 @@
+id: narrowing-to-proto
+snapshots:
+  ? |
+    void f(nxt_buf_t *b) {
+        uint8_t n = (uint8_t) b->len;
+    }
+  : labels:
+    - source: (uint8_t) b->len
+      style: primary
+      start: 39
+      end: 55
+  ? |
+    void f(nxt_unit_request_t *req, nxt_http_request_t *r) {
+        req->method_length = r->method->length;
+    }
+  : labels:
+    - source: req->method_length = r->method->length
+      style: primary
+      start: 61
+      end: 99
+    - source: method_length
+      style: secondary
+      start: 66
+      end: 79
+    - source: req->method_length
+      style: secondary
+      start: 61
+      end: 79

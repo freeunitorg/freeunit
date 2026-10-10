@@ -1,0 +1,68 @@
+name: "Lint (ast-grep)"
+
+# Runs on each pull request and on each push to master.  The job fails on
+# a match that is not in tools/ast-grep/baseline.json, and on a baseline
+# entry that no match uses any more.  The run on master shows at once when
+# a merge made the baseline stale.
+#
+# A label change does not run this workflow: a skipped job reports success,
+# so a run for a label could make a failed scan look green.  The label check
+# is in require-tests.yml.
+
+on:
+  pull_request:
+    types: [ opened, synchronize, reopened ]
+  push:
+    branches: [ master ]
+  # A merge queue entry runs the check on the merged result too.
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Each push gets its own group.  Thus no queued commit is dropped.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ast-grep:
+    name: "ast-grep baseline"
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    env:
+      # The snapshot tests and the matched text can change between
+      # ast-grep releases.  Change the version and the baseline together.
+      AST_GREP_VERSION: 0.45.3
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache ast-grep
+        id: cache-ast-grep
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/ast-grep
+          key: ast-grep-${{ runner.os }}-${{ runner.arch }}-${{ env.AST_GREP_VERSION }}
+
+      # install-action has no manifest for ast-grep.  It falls back to
+      # cargo-binstall, which reads a bare version as an exact one.
+      - name: Install ast-grep
+        if: steps.cache-ast-grep.outputs.cache-hit != 'true'
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: ast-grep@${{ env.AST_GREP_VERSION }}
+
+      - name: Check the ast-grep version
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          version="$("$HOME/.cargo/bin/ast-grep" --version)"
+          echo "$version"
+          test "$version" = "ast-grep $AST_GREP_VERSION"
+
+      - name: Test the rules
+        run: ast-grep test -c tools/ast-grep/sgconfig.yml
+
+      - name: Check for new violations
+        run: |
+          python3 tools/ast-grep/check_baseline_test.py
+          python3 tools/ast-grep/check_baseline.py
