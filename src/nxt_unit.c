@@ -30,6 +30,28 @@
 #define NXT_UNIT_LOCAL_BUF_SIZE  \
     (NXT_UNIT_MAX_PLAIN_SIZE + sizeof(nxt_port_msg_t))
 
+/* The most data a plain message can carry and still fit a queue item. */
+#define NXT_UNIT_QUEUE_PLAIN_SIZE  \
+    (NXT_PORT_QUEUE_MSG_SIZE - sizeof(nxt_port_msg_t))
+
+/* nxt_unit_impl_t.shm: what the outgoing shared memory last showed. */
+#define NXT_UNIT_SHM_UNKNOWN  0
+#define NXT_UNIT_SHM_OK       1
+#define NXT_UNIT_SHM_FAILED   2     /* A new segment failed. */
+#define NXT_UNIT_SHM_FULL     3     /* At the "shm" limit, no free chunk. */
+
+/* Seconds before a small buffer tries shared memory again after FAILED. */
+#define NXT_UNIT_SHM_RETRY    60
+
+/* nxt_unit_request_info_impl_t.queue_state; see nxt_unit_req_send(). */
+#define NXT_UNIT_REQ_UNQUEUED  0    /* No message in the queue yet. */
+#define NXT_UNIT_REQ_QUEUED    1    /* Messages in the queue. */
+#define NXT_UNIT_REQ_SOCKET    2    /* On the socket until the last one. */
+
+/* nxt_unit_req_queue_drain(): yields, then sleeps of 100 us, up to 1 s. */
+#define NXT_UNIT_DRAIN_YIELDS   100
+#define NXT_UNIT_DRAIN_TIMEOUT  1000    /* Milliseconds. */
+
 /*
  * Wire-protocol QUIT mode selector.  The canonical enum lives in
  * src/nxt_port.h alongside NXT_PORT_MSG_QUIT itself; the aliases
@@ -126,7 +148,7 @@ static nxt_unit_mmap_buf_t *nxt_unit_request_preread(
 static ssize_t nxt_unit_buf_read(nxt_unit_buf_t **b, uint64_t *len, void *dst,
     size_t size);
 static nxt_port_mmap_header_t *nxt_unit_mmap_get(nxt_unit_ctx_t *ctx,
-    nxt_unit_port_t *port, nxt_chunk_id_t *c, int *n, int min_n);
+    nxt_unit_port_t *port, nxt_chunk_id_t *c, int *n, int min_n, int probe);
 static int nxt_unit_send_oosm(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port);
 static int nxt_unit_wait_shm_ack(nxt_unit_ctx_t *ctx);
 static nxt_unit_mmap_t *nxt_unit_mmap_at(nxt_unit_mmaps_t *mmaps, uint32_t i);
@@ -135,9 +157,9 @@ static nxt_port_mmap_header_t *nxt_unit_new_mmap(nxt_unit_ctx_t *ctx,
 static int nxt_unit_shm_open(nxt_unit_ctx_t *ctx, size_t size);
 static int nxt_unit_send_mmap(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     int fd);
-static int nxt_unit_get_outgoing_buf(nxt_unit_ctx_t *ctx,
-    nxt_unit_port_t *port, uint32_t size,
-    uint32_t min_size, nxt_unit_mmap_buf_t *mmap_buf, char *local_buf);
+static int nxt_unit_get_outgoing_buf(nxt_unit_request_info_t *req,
+    uint32_t size, uint32_t min_size, nxt_unit_mmap_buf_t *mmap_buf,
+    char *local_buf);
 static int nxt_unit_incoming_mmap(nxt_unit_ctx_t *ctx, pid_t pid, int fd);
 
 static void nxt_unit_awake_ctx(nxt_unit_ctx_t *ctx,
@@ -200,6 +222,12 @@ static int nxt_unit_get_port(nxt_unit_ctx_t *ctx, nxt_unit_port_id_t *port_id);
 static ssize_t nxt_unit_port_send(nxt_unit_ctx_t *ctx,
     nxt_unit_port_t *port, const void *buf, size_t buf_size,
     const nxt_send_oob_t *oob);
+static ssize_t nxt_unit_req_send(nxt_unit_request_info_t *req,
+    const void *buf, size_t buf_size);
+static int nxt_unit_req_queue_drain(nxt_unit_request_info_t *req);
+static ssize_t nxt_unit_port_send_impl(nxt_unit_ctx_t *ctx,
+    nxt_unit_port_t *port, const void *buf, size_t buf_size,
+    const nxt_send_oob_t *oob, int queue);
 static ssize_t nxt_unit_sendmsg(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     int fd, const void *buf, size_t buf_size, const nxt_send_oob_t *oob);
 static int nxt_unit_ctx_port_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
@@ -359,6 +387,10 @@ struct nxt_unit_request_info_impl_s {
     nxt_unit_req_state_t     state;
     uint8_t                  websocket;
     uint8_t                  in_hash;
+
+    /* NXT_UNIT_REQ_*, and the queue tail after its last queue message. */
+    uint8_t                  queue_state;
+    nxt_nncq_atomic_t        queue_tail;
 
     /*  for nxt_unit_ctx_impl_t.free_req or active_req */
     nxt_queue_link_t         link;
@@ -526,6 +558,10 @@ struct nxt_unit_impl_s {
 
     nxt_unit_mmaps_t         incoming;
     nxt_unit_mmaps_t         outgoing;
+
+    /* NXT_UNIT_SHM_* and the time of the next try after FAILED (seconds). */
+    nxt_atomic_t             shm;
+    nxt_atomic_t             shm_retry;
 
     pid_t                    pid;
     int                      log_fd;
@@ -797,6 +833,8 @@ nxt_unit_create(nxt_unit_init_t *init)
     lib->request_count = 0;
     lib->router_port = NULL;
     lib->shared_port = NULL;
+    lib->shm = NXT_UNIT_SHM_UNKNOWN;
+    lib->shm_retry = 0;
 
     rc = nxt_unit_ctx_init(lib, &lib->main_ctx, init->ctx_data);
     if (nxt_slow_path(rc != NXT_UNIT_OK)) {
@@ -1856,6 +1894,14 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
     req_impl->state = NXT_UNIT_RS_START;
     req_impl->websocket = 0;
     req_impl->in_hash = 0;
+    /*
+     * The frames of a websocket can wait in the router for a slow client.
+     * In plain memory they wait in the router's heap; in shared memory each
+     * would hold a chunk of the "shm" limit of the application.  So a
+     * websocket stays on the socket, as in 1.37.0.
+     */
+    req_impl->queue_state = hdr.websocket_handshake ? NXT_UNIT_REQ_SOCKET
+                                                    : NXT_UNIT_REQ_UNQUEUED;
 
     nxt_unit_debug(ctx, "#%"PRIu32": %.*s %.*s (%d)", recv_msg->stream,
                    (int) hdr.method_length, method,
@@ -2113,8 +2159,7 @@ nxt_unit_send_req_headers_ack(nxt_unit_request_info_t *req)
     msg.reply_port = ctx_impl->read_port->id.id;
     msg.type = _NXT_PORT_MSG_REQ_HEADERS_ACK;
 
-    res = nxt_unit_port_send(req->ctx, req->response_port,
-                             &msg, sizeof(msg), NULL);
+    res = nxt_unit_req_send(req, &msg, sizeof(msg));
     if (nxt_slow_path(res != sizeof(msg))) {
         return NXT_UNIT_ERROR;
     }
@@ -3017,9 +3062,7 @@ nxt_unit_response_buf_alloc(nxt_unit_request_info_t *req, uint32_t size)
 
     nxt_unit_mmap_buf_insert_tail(&req_impl->outgoing_buf, mmap_buf);
 
-    rc = nxt_unit_get_outgoing_buf(req->ctx, req->response_port,
-                                   size, size, mmap_buf,
-                                   NULL);
+    rc = nxt_unit_get_outgoing_buf(req, size, size, mmap_buf, NULL);
     if (nxt_slow_path(rc != NXT_UNIT_OK)) {
         nxt_unit_mmap_buf_release(mmap_buf);
 
@@ -3262,8 +3305,7 @@ nxt_unit_mmap_buf_send(nxt_unit_request_info_t *req,
                        (int) m.mmap_msg.chunk_id,
                        (int) m.mmap_msg.size);
 
-        res = nxt_unit_port_send(req->ctx, req->response_port, &m, sizeof(m),
-                                 NULL);
+        res = nxt_unit_req_send(req, &m, sizeof(m));
         if (nxt_slow_path(res != sizeof(m))) {
             goto free_buf;
         }
@@ -3313,9 +3355,8 @@ nxt_unit_mmap_buf_send(nxt_unit_request_info_t *req,
                        req_impl->stream,
                        (int) (sizeof(m.msg) + m.mmap_msg.size));
 
-        res = nxt_unit_port_send(req->ctx, req->response_port,
-                                 buf->start - sizeof(m.msg),
-                                 m.mmap_msg.size + sizeof(m.msg), NULL);
+        res = nxt_unit_req_send(req, buf->start - sizeof(m.msg),
+                                m.mmap_msg.size + sizeof(m.msg));
 
         if (nxt_slow_path(res != (ssize_t) (m.mmap_msg.size + sizeof(m.msg)))) {
             goto free_buf;
@@ -3567,8 +3608,8 @@ nxt_unit_response_write_nb(nxt_unit_request_info_t *req, const void *start,
         min_part_size = nxt_min(min_size, part_size);
         min_part_size = nxt_min(min_part_size, PORT_MMAP_CHUNK_SIZE);
 
-        rc = nxt_unit_get_outgoing_buf(req->ctx, req->response_port, part_size,
-                                       min_part_size, &mmap_buf, local_buf);
+        rc = nxt_unit_get_outgoing_buf(req, part_size, min_part_size,
+                                       &mmap_buf, local_buf);
         if (nxt_slow_path(rc != NXT_UNIT_OK)) {
             return -rc;
         }
@@ -3666,8 +3707,7 @@ nxt_unit_response_write_cb(nxt_unit_request_info_t *req,
 
         buf_size = nxt_min(read_info->buf_size, PORT_MMAP_DATA_SIZE);
 
-        rc = nxt_unit_get_outgoing_buf(req->ctx, req->response_port,
-                                       buf_size, buf_size,
+        rc = nxt_unit_get_outgoing_buf(req, buf_size, buf_size,
                                        &mmap_buf, local_buf);
         if (nxt_slow_path(rc != NXT_UNIT_OK)) {
             return rc;
@@ -4547,8 +4587,7 @@ skip_response_send:
                                    : _NXT_PORT_MSG_RPC_ERROR;
     msg.last = 1;
 
-    (void) nxt_unit_port_send(req->ctx, req->response_port,
-                              &msg, sizeof(msg), NULL);
+    (void) nxt_unit_req_send(req, &msg, sizeof(msg));
 
     nxt_unit_request_info_release(req);
 }
@@ -4586,8 +4625,7 @@ nxt_unit_websocket_sendv(nxt_unit_request_info_t *req, uint8_t opcode,
     buf_size = 10 + payload_len;
     alloc_size = nxt_min(buf_size, PORT_MMAP_DATA_SIZE);
 
-    rc = nxt_unit_get_outgoing_buf(req->ctx, req->response_port,
-                                   alloc_size, alloc_size,
+    rc = nxt_unit_get_outgoing_buf(req, alloc_size, alloc_size,
                                    &mmap_buf, local_buf);
     if (nxt_slow_path(rc != NXT_UNIT_OK)) {
         return rc;
@@ -4629,8 +4667,7 @@ nxt_unit_websocket_sendv(nxt_unit_request_info_t *req, uint8_t opcode,
 
                 alloc_size = nxt_min(buf_size, PORT_MMAP_DATA_SIZE);
 
-                rc = nxt_unit_get_outgoing_buf(req->ctx, req->response_port,
-                                               alloc_size, alloc_size,
+                rc = nxt_unit_get_outgoing_buf(req, alloc_size, alloc_size,
                                                &mmap_buf, local_buf);
                 if (nxt_slow_path(rc != NXT_UNIT_OK)) {
                     return rc;
@@ -4736,9 +4773,16 @@ nxt_unit_websocket_done(nxt_unit_websocket_frame_t *ws)
 }
 
 
+/*
+ * With "probe" set, the caller can use plain memory instead: then at the
+ * "shm" limit this returns NULL at once, without OOSM and without asking
+ * the router for a SHM_ACK.  Below the limit, a probe can still make a new
+ * segment.
+ */
+
 static nxt_port_mmap_header_t *
 nxt_unit_mmap_get(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
-    nxt_chunk_id_t *c, int *n, int min_n)
+    nxt_chunk_id_t *c, int *n, int min_n, int probe)
 {
     int                     res, nchunks, i;
     uint32_t                outgoing_size;
@@ -4805,12 +4849,20 @@ retry:
             }
         }
 
-        hdr->oosm = 1;
+        if (!probe) {
+            hdr->oosm = 1;
+        }
     }
 
     if (outgoing_size >= lib->shm_mmap_limit) {
         /* Cannot allocate more shared memory. */
+        lib->shm = NXT_UNIT_SHM_FULL;
+
         pthread_mutex_unlock(&lib->outgoing.mutex);
+
+        if (probe) {
+            return NULL;
+        }
 
         if (min_n == 0) {
             *n = 0;
@@ -4857,7 +4909,11 @@ skip:
 
 unlock:
 
-    nxt_atomic_fetch_add(&lib->outgoing.allocated_chunks, *n);
+    if (nxt_fast_path(hdr != NULL)) {
+        lib->shm = NXT_UNIT_SHM_OK;
+
+        nxt_atomic_fetch_add(&lib->outgoing.allocated_chunks, *n);
+    }
 
     nxt_unit_debug(ctx, "allocated_chunks %d",
                    (int) lib->outgoing.allocated_chunks);
@@ -5035,6 +5091,18 @@ nxt_unit_mmap_at(nxt_unit_mmaps_t *mmaps, uint32_t i)
 }
 
 
+#if (NXT_TESTS)
+static unsigned int  nxt_unit_test_new_mmap_failure_count;
+
+
+void
+nxt_unit_test_new_mmap_failures(unsigned int failures)
+{
+    nxt_unit_test_new_mmap_failure_count = failures;
+}
+#endif
+
+
 static nxt_port_mmap_header_t *
 nxt_unit_new_mmap(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port, int n)
 {
@@ -5046,11 +5114,17 @@ nxt_unit_new_mmap(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port, int n)
 
     lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
 
+#if (NXT_TESTS)
+    if (nxt_slow_path(nxt_unit_test_new_mmap_failure_count > 0)) {
+        nxt_unit_test_new_mmap_failure_count--;
+        goto fail;
+    }
+#endif
+
     mm = nxt_unit_mmap_at(&lib->outgoing, lib->outgoing.size);
     if (nxt_slow_path(mm == NULL)) {
         nxt_unit_alert(ctx, "failed to add mmap to outgoing array");
-
-        return NULL;
+        goto fail;
     }
 
     fd = nxt_unit_shm_open(ctx, PORT_MMAP_SIZE);
@@ -5110,6 +5184,11 @@ nxt_unit_new_mmap(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port, int n)
 remove_fail:
 
     lib->outgoing.size--;
+
+fail:
+
+    lib->shm = NXT_UNIT_SHM_FAILED;
+    lib->shm_retry = nxt_unit_detached_now() / 1000 + NXT_UNIT_SHM_RETRY;
 
     return NULL;
 }
@@ -5219,46 +5298,94 @@ nxt_unit_send_mmap(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port, int fd)
 }
 
 
-static int
-nxt_unit_get_outgoing_buf(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
-    uint32_t size, uint32_t min_size,
-    nxt_unit_mmap_buf_t *mmap_buf, char *local_buf)
+#if (NXT_TESTS)
+static unsigned int  nxt_unit_test_shm_probe_failure_count;
+
+
+/* The next "failures" small buffers find no free chunk. */
+
+void
+nxt_unit_test_shm_probe_failures(unsigned int failures)
 {
-    int                     nchunks, min_nchunks;
-    nxt_chunk_id_t          c;
-    nxt_port_mmap_header_t  *hdr;
+    nxt_unit_test_shm_probe_failure_count = failures;
+}
+#endif
 
-    if (size <= NXT_UNIT_MAX_PLAIN_SIZE) {
-        if (local_buf != NULL) {
-            mmap_buf->free_ptr = NULL;
-            mmap_buf->plain_ptr = local_buf;
 
-        } else {
-            mmap_buf->free_ptr = nxt_unit_malloc(ctx,
-                                                 size + sizeof(nxt_port_msg_t));
-            if (nxt_slow_path(mmap_buf->free_ptr == NULL)) {
-                return NXT_UNIT_ERROR;
-            }
+/*
+ * A buffer for "size" bytes of the response of "req", in shared memory or,
+ * up to NXT_UNIT_MAX_PLAIN_SIZE, in plain memory.  A plain buffer goes to
+ * the router as one message with the data, so above
+ * NXT_UNIT_QUEUE_PLAIN_SIZE bytes it does not fit a queue item and goes to
+ * the socket.  A shared memory buffer goes as a 28-byte message.
+ *
+ * A small buffer gets shared memory only if it can without waiting.  Else it
+ * gets plain memory, which never waits.  A request that has no message in
+ * the queue yet then stays on the socket until its last message.  A request
+ * with messages in the queue moves to the socket when the buffer is sent
+ * (nxt_unit_req_send()).
+ */
 
-            mmap_buf->plain_ptr = mmap_buf->free_ptr;
+static int
+nxt_unit_get_outgoing_buf(nxt_unit_request_info_t *req, uint32_t size,
+    uint32_t min_size, nxt_unit_mmap_buf_t *mmap_buf, char *local_buf)
+{
+    int                           nchunks, min_nchunks, plain_ok;
+    uint32_t                      now;
+    nxt_chunk_id_t                c;
+    nxt_unit_ctx_t                *ctx;
+    nxt_unit_impl_t               *lib;
+    nxt_port_mmap_header_t        *hdr;
+    nxt_unit_port_impl_t          *port_impl;
+    nxt_unit_request_info_impl_t  *req_impl;
+
+    ctx = req->ctx;
+    lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
+    port_impl = nxt_container_of(req->response_port, nxt_unit_port_impl_t,
+                                 port);
+    req_impl = nxt_container_of(req, nxt_unit_request_info_impl_t, req);
+
+    plain_ok = (size <= NXT_UNIT_MAX_PLAIN_SIZE);
+
+    if (size <= NXT_UNIT_QUEUE_PLAIN_SIZE
+        || (plain_ok
+            && (port_impl->queue == NULL
+                || req_impl->queue_state == NXT_UNIT_REQ_SOCKET)))
+    {
+        goto plain;
+    }
+
+    if (plain_ok && lib->shm == NXT_UNIT_SHM_FAILED) {
+        now = nxt_unit_detached_now() / 1000;
+
+        if (now < lib->shm_retry) {
+            goto plain;
         }
 
-        mmap_buf->hdr = NULL;
-        mmap_buf->buf.start = mmap_buf->plain_ptr + sizeof(nxt_port_msg_t);
-        mmap_buf->buf.free = mmap_buf->buf.start;
-        mmap_buf->buf.end = mmap_buf->buf.start + size;
-
-        nxt_unit_debug(ctx, "outgoing plain buffer allocation: (%p, %d)",
-                       mmap_buf->buf.start, (int) size);
-
-        return NXT_UNIT_OK;
+        lib->shm_retry = now + NXT_UNIT_SHM_RETRY;
     }
+
+#if (NXT_TESTS)
+    if (plain_ok && nxt_unit_test_shm_probe_failure_count > 0) {
+        nxt_unit_test_shm_probe_failure_count--;
+        goto plain;
+    }
+#endif
 
     nchunks = (size + PORT_MMAP_CHUNK_SIZE - 1) / PORT_MMAP_CHUNK_SIZE;
     min_nchunks = (min_size + PORT_MMAP_CHUNK_SIZE - 1) / PORT_MMAP_CHUNK_SIZE;
 
-    hdr = nxt_unit_mmap_get(ctx, port, &c, &nchunks, min_nchunks);
+    if (plain_ok) {
+        min_nchunks = nchunks;
+    }
+
+    hdr = nxt_unit_mmap_get(ctx, req->response_port, &c, &nchunks,
+                            min_nchunks, plain_ok);
     if (nxt_slow_path(hdr == NULL)) {
+        if (plain_ok) {
+            goto plain;
+        }
+
         if (nxt_fast_path(min_nchunks == 0 && nchunks == 0)) {
             mmap_buf->hdr = NULL;
             mmap_buf->buf.start = NULL;
@@ -5275,13 +5402,53 @@ nxt_unit_get_outgoing_buf(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     mmap_buf->hdr = hdr;
     mmap_buf->buf.start = (char *) nxt_port_mmap_chunk_start(hdr, c);
     mmap_buf->buf.free = mmap_buf->buf.start;
-    mmap_buf->buf.end = mmap_buf->buf.start + nchunks * PORT_MMAP_CHUNK_SIZE;
+    /*
+     * A buffer that could have been plain gets no more room than asked for,
+     * as a plain one: else nxt_unit_response_write_nb() puts body data into
+     * the free rest of the chunk of the response headers, and the router
+     * sends that piggyback content without compression.
+     */
+    mmap_buf->buf.end = mmap_buf->buf.start
+                        + (plain_ok ? size
+                                    : (uint32_t) nchunks * PORT_MMAP_CHUNK_SIZE);
     mmap_buf->free_ptr = NULL;
     mmap_buf->ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
 
     nxt_unit_debug(ctx, "outgoing mmap allocation: (%d,%d,%d)",
                   (int) hdr->id, (int) c,
                   (int) (nchunks * PORT_MMAP_CHUNK_SIZE));
+
+    return NXT_UNIT_OK;
+
+plain:
+
+    if (size > NXT_UNIT_QUEUE_PLAIN_SIZE
+        && req_impl->queue_state == NXT_UNIT_REQ_UNQUEUED)
+    {
+        req_impl->queue_state = NXT_UNIT_REQ_SOCKET;
+    }
+
+    if (local_buf != NULL) {
+        mmap_buf->free_ptr = NULL;
+        mmap_buf->plain_ptr = local_buf;
+
+    } else {
+        mmap_buf->free_ptr = nxt_unit_malloc(ctx,
+                                             size + sizeof(nxt_port_msg_t));
+        if (nxt_slow_path(mmap_buf->free_ptr == NULL)) {
+            return NXT_UNIT_ERROR;
+        }
+
+        mmap_buf->plain_ptr = mmap_buf->free_ptr;
+    }
+
+    mmap_buf->hdr = NULL;
+    mmap_buf->buf.start = mmap_buf->plain_ptr + sizeof(nxt_port_msg_t);
+    mmap_buf->buf.free = mmap_buf->buf.start;
+    mmap_buf->buf.end = mmap_buf->buf.start + size;
+
+    nxt_unit_debug(ctx, "outgoing plain buffer allocation: (%p, %d)",
+                   mmap_buf->buf.start, (int) size);
 
     return NXT_UNIT_OK;
 }
@@ -7657,40 +7824,192 @@ nxt_unit_get_port(nxt_unit_ctx_t *ctx, nxt_unit_port_id_t *port_id)
 }
 
 
+/*
+ * Sends a message of no request (stream 0).  The messages of a request go
+ * through nxt_unit_req_send().
+ */
+
 static ssize_t
 nxt_unit_port_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     const void *buf, size_t buf_size, const nxt_send_oob_t *oob)
+{
+    const nxt_port_msg_t  *pm;
+
+    pm = buf;
+
+    return nxt_unit_port_send_impl(ctx, port, buf, buf_size, oob,
+                                   buf_size >= sizeof(nxt_port_msg_t)
+                                   && pm->stream == 0);
+}
+
+
+/*
+ * Sends a message of a request to the router.
+ *
+ * A router engine port has a shared memory queue and a socket, and all
+ * processes of an application write to it.  A message that goes to the
+ * socket puts only a READ_SOCKET marker into the queue.  The marker does not
+ * tell who sent it.  For each marker, the router reads the next datagram,
+ * and that datagram can be from another process
+ * (nxt_port_queue_read_handler()).  Thus a datagram can be read before a
+ * queue message that its sender sent earlier.  A datagram is never read
+ * after a queue message that its sender sent later.
+ *
+ * So once a message of a request has gone into the queue, the later
+ * messages of the request go into the queue too, and the router gets them
+ * in the order they were sent.  The data of such a request is in shared
+ * memory, sent as a 28-byte message, or fits a queue item
+ * (nxt_unit_get_outgoing_buf()).  If a message does not fit, the request
+ * first waits until the router has taken its queue messages
+ * (nxt_unit_req_queue_drain()), then moves to the socket for good.
+ *
+ * A request moves to the queue with its first message that fits there, if
+ * the last shared memory allocation of this process worked, so that the data
+ * that follows will likely fit there too.  A request with a plain buffer over
+ * NXT_UNIT_QUEUE_PLAIN_SIZE bytes, or a websocket, stays on the socket
+ * (NXT_UNIT_REQ_SOCKET).  The last message of a request can always go into
+ * the queue, as nothing follows it.
+ *
+ * The acknowledgement goes to the socket, so every request sends at least
+ * one datagram, as in 1.36.1.  A marker whose datagram never came (a
+ * sendmsg() that failed after the marker, or a process killed between the
+ * two) leaves the router one datagram behind for good.  The datagrams of
+ * later requests keep it moving.  Without them, it would stop at the marker.
+ */
+
+static ssize_t
+nxt_unit_req_send(nxt_unit_request_info_t *req, const void *buf,
+    size_t buf_size)
+{
+    int                           queue;
+    ssize_t                       res;
+    nxt_unit_impl_t               *lib;
+    nxt_port_queue_t              *port_queue;
+    const nxt_port_msg_t          *pm;
+    nxt_unit_port_impl_t          *port_impl;
+    nxt_unit_request_info_impl_t  *req_impl;
+
+    lib = nxt_container_of(req->unit, nxt_unit_impl_t, unit);
+    port_impl = nxt_container_of(req->response_port, nxt_unit_port_impl_t,
+                                 port);
+    req_impl = nxt_container_of(req, nxt_unit_request_info_impl_t, req);
+
+    pm = buf;
+    port_queue = port_impl->queue;
+
+    queue = (port_queue != NULL
+             && buf_size <= NXT_PORT_QUEUE_MSG_SIZE
+             && buf_size >= sizeof(nxt_port_msg_t)
+             && pm->type != _NXT_PORT_MSG_REQ_HEADERS_ACK
+             && (pm->last
+                 || req_impl->queue_state == NXT_UNIT_REQ_QUEUED
+                 || (req_impl->queue_state == NXT_UNIT_REQ_UNQUEUED
+                     && lib->shm == NXT_UNIT_SHM_OK)));
+
+    if (queue) {
+        if (req_impl->queue_state == NXT_UNIT_REQ_UNQUEUED) {
+            req_impl->queue_state = NXT_UNIT_REQ_QUEUED;
+        }
+
+    } else if (req_impl->queue_state == NXT_UNIT_REQ_QUEUED) {
+        if (nxt_slow_path(nxt_unit_req_queue_drain(req) != NXT_UNIT_OK)) {
+            return -1;
+        }
+
+        req_impl->queue_state = NXT_UNIT_REQ_SOCKET;
+    }
+
+    res = nxt_unit_port_send_impl(req->ctx, req->response_port, buf,
+                                  buf_size, NULL, queue);
+
+    if (queue) {
+        req_impl->queue_tail = nxt_nncq_tail(&port_queue->queue);
+    }
+
+    return res;
+}
+
+
+/*
+ * Waits until the router has taken every message that "req" put into the
+ * queue of its port.  The router takes no queue item while it waits for the
+ * datagram of a READ_SOCKET marker (nxt_port_queue_read_handler()).  So once
+ * the queue head has passed the last item of the request, every marker
+ * before that item has its datagram, and a datagram sent now is read after
+ * the items.  The router takes queue items as fast as it runs, not as fast
+ * as clients read: the wait is short, unless the router is stuck at a
+ * marker whose datagram has not come.  Then it ends with an error after
+ * NXT_UNIT_DRAIN_TIMEOUT, and the message is not sent.
+ */
+
+static int
+nxt_unit_req_queue_drain(nxt_unit_request_info_t *req)
+{
+    int                           i;
+    uint64_t                      deadline;
+    struct timespec               ts;
+    nxt_port_queue_t              *port_queue;
+    nxt_nncq_atomic_t             head;
+    nxt_unit_port_impl_t          *port_impl;
+    nxt_unit_request_info_impl_t  *req_impl;
+
+    port_impl = nxt_container_of(req->response_port, nxt_unit_port_impl_t,
+                                 port);
+    req_impl = nxt_container_of(req, nxt_unit_request_info_impl_t, req);
+
+    port_queue = port_impl->queue;
+    deadline = 0;
+
+    for (i = 0; ; i++) {
+        head = nxt_nncq_head(&port_queue->queue);
+
+        if ((int32_t) (head - req_impl->queue_tail) >= 0) {
+            return NXT_UNIT_OK;
+        }
+
+        if (i < NXT_UNIT_DRAIN_YIELDS) {
+            nxt_sched_yield();
+            continue;
+        }
+
+        if (deadline == 0) {
+            deadline = nxt_unit_detached_now() + NXT_UNIT_DRAIN_TIMEOUT;
+
+        } else if (nxt_unit_detached_now() >= deadline) {
+            break;
+        }
+
+        ts.tv_sec = 0;
+        ts.tv_nsec = 100000;
+
+        (void) nanosleep(&ts, NULL);
+    }
+
+    nxt_unit_req_alert(req, "the router has not taken the queue messages "
+                       "of the request");
+
+    return NXT_UNIT_ERROR;
+}
+
+
+static ssize_t
+nxt_unit_port_send_impl(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
+    const void *buf, size_t buf_size, const nxt_send_oob_t *oob, int queue)
 {
     int                   notify;
     ssize_t               ret;
     nxt_int_t             rc;
     nxt_port_msg_t        msg;
     nxt_unit_impl_t       *lib;
-    const nxt_port_msg_t  *pm;
     nxt_unit_port_impl_t  *port_impl;
 
     lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
 
     port_impl = nxt_container_of(port, nxt_unit_port_impl_t, port);
 
-    /*
-     * A message that goes to the socket puts only a READ_SOCKET marker into
-     * the queue.  The marker does not tell who sent it.  For each marker,
-     * the reader takes the next datagram, and that datagram can be from
-     * another process (nxt_port_queue_read_handler()).  Thus a datagram can
-     * be read before a queue message that its sender sent earlier.  A
-     * datagram is never read after a queue message that its sender sent
-     * later.  So a message of a request goes into the queue only if it is
-     * the last message of the request.  A message of no request (stream 0)
-     * can also go into the queue, even if "last" is clear.  QUIT and
-     * RPC_READY to the port of a context are such messages.
-     */
-    pm = buf;
-
-    if (port_impl->queue != NULL && (oob == NULL || oob->size == 0)
+    if (queue && port_impl->queue != NULL && (oob == NULL || oob->size == 0)
         && buf_size <= NXT_PORT_QUEUE_MSG_SIZE
-        && buf_size >= sizeof(nxt_port_msg_t)
-        && (pm->stream == 0 || pm->last))
+        && buf_size >= sizeof(nxt_port_msg_t))
     {
         rc = nxt_port_queue_send(port_impl->queue, buf, buf_size, &notify);
         if (nxt_slow_path(rc != NXT_OK)) {

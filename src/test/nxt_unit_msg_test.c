@@ -47,7 +47,18 @@ typedef enum {
     NXT_UNIT_MSG_TEST_RAISE_COUNT,
     NXT_UNIT_MSG_TEST_UPGRADE,
     NXT_UNIT_MSG_TEST_ORDER,
+    NXT_UNIT_MSG_TEST_SMALL,
+    NXT_UNIT_MSG_TEST_PLAIN_HELD,
+    NXT_UNIT_MSG_TEST_NO_CHUNK,
+    NXT_UNIT_MSG_TEST_WRITE_FIRST,
 } nxt_unit_msg_test_mode_t;
+
+
+/* A message that libunit sent to the socket of the engine port. */
+typedef struct {
+    nxt_port_msg_t  msg;
+    uint32_t        size;     /* Of the data, in shared memory or plain. */
+} nxt_unit_msg_test_dgram_t;
 
 
 #define NXT_UNIT_MSG_TEST_ROUTER_PORT  2
@@ -55,6 +66,11 @@ typedef enum {
 #define NXT_UNIT_MSG_TEST_FIELDS       32
 #define NXT_UNIT_MSG_TEST_STREAM       7
 #define NXT_UNIT_MSG_TEST_BODY         "ab"
+#define NXT_UNIT_MSG_TEST_JSON         "{\"message\":\"No route found\"}"
+#define NXT_UNIT_MSG_TEST_HELLO        "hello\n"
+#define NXT_UNIT_MSG_TEST_HELD_SIZE    500
+#define NXT_UNIT_MSG_TEST_PART_SIZE    100
+#define NXT_UNIT_MSG_TEST_WRITE_SIZE   2000
 
 
 static int                      nxt_unit_msg_test_failures;
@@ -74,12 +90,24 @@ static nxt_unit_ctx_t           *nxt_unit_msg_test_follower;
 static nxt_port_mmap_header_t   *nxt_unit_msg_test_seg0;
 static uint16_t                 nxt_unit_msg_test_reply_port
                                     = NXT_UNIT_MSG_TEST_ROUTER_PORT;
+static uint32_t                 nxt_unit_msg_test_stream
+                                    = NXT_UNIT_MSG_TEST_STREAM;
 
-/* What libunit sent to the socket of the engine port, in order. */
-static nxt_port_msg_t           nxt_unit_msg_test_dgrams[16];
-static size_t                   nxt_unit_msg_test_ndgrams;
+/*
+ * What libunit sent to the socket of the engine port, in order.  The mutex
+ * is for nxt_unit_msg_test_router_thread().
+ */
+static nxt_unit_msg_test_dgram_t  nxt_unit_msg_test_dgrams[16];
+static size_t                     nxt_unit_msg_test_ndgrams;
+static pthread_mutex_t            nxt_unit_msg_test_dgrams_mutex
+                                      = PTHREAD_MUTEX_INITIALIZER;
 
 static int nxt_unit_msg_test_respond(nxt_unit_request_info_t *req);
+static int nxt_unit_msg_test_respond_small(nxt_unit_request_info_t *req);
+static int nxt_unit_msg_test_respond_held(nxt_unit_request_info_t *req);
+static int nxt_unit_msg_test_respond_no_chunk(nxt_unit_request_info_t *req);
+static int nxt_unit_msg_test_respond_write_first(
+    nxt_unit_request_info_t *req);
 
 static int nxt_unit_msg_test_send_records_to(nxt_unit_ctx_t *ctx,
     const nxt_port_mmap_msg_t *records, size_t nrecords, size_t tail);
@@ -169,6 +197,38 @@ nxt_unit_msg_test_handler(nxt_unit_request_info_t *req)
         nxt_unit_request_done(req, NXT_UNIT_OK);
 
         return;
+
+    case NXT_UNIT_MSG_TEST_SMALL:
+        nxt_unit_msg_test_handler_ok =
+            nxt_unit_msg_test_respond_small(req) == NXT_UNIT_OK;
+
+        nxt_unit_request_done(req, NXT_UNIT_OK);
+
+        return;
+
+    case NXT_UNIT_MSG_TEST_PLAIN_HELD:
+        nxt_unit_msg_test_handler_ok =
+            nxt_unit_msg_test_respond_held(req) == NXT_UNIT_OK;
+
+        nxt_unit_request_done(req, NXT_UNIT_OK);
+
+        return;
+
+    case NXT_UNIT_MSG_TEST_NO_CHUNK:
+        nxt_unit_msg_test_handler_ok =
+            nxt_unit_msg_test_respond_no_chunk(req) == NXT_UNIT_OK;
+
+        nxt_unit_request_done(req, NXT_UNIT_OK);
+
+        return;
+
+    case NXT_UNIT_MSG_TEST_WRITE_FIRST:
+        nxt_unit_msg_test_handler_ok =
+            nxt_unit_msg_test_respond_write_first(req) == NXT_UNIT_OK;
+
+        nxt_unit_request_done(req, NXT_UNIT_OK);
+
+        return;
     }
 
     nxt_unit_request_done(req, NXT_UNIT_ERROR);
@@ -212,19 +272,35 @@ static ssize_t
 nxt_unit_msg_test_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     const void *buf, size_t buf_size, const void *oob, size_t oob_size)
 {
-    const nxt_port_msg_t  *msg;
-    nxt_port_mmap_msg_t   rec;
+    const nxt_port_msg_t       *msg;
+    nxt_port_mmap_msg_t        rec;
+    nxt_unit_msg_test_dgram_t  *d;
 
     msg = buf;
+
+    pthread_mutex_lock(&nxt_unit_msg_test_dgrams_mutex);
 
     if (port->id.id == NXT_UNIT_MSG_TEST_ENGINE_PORT
         && buf_size >= sizeof(nxt_port_msg_t)
         && msg->type != _NXT_PORT_MSG_READ_QUEUE
         && nxt_unit_msg_test_ndgrams < nxt_nitems(nxt_unit_msg_test_dgrams))
     {
-        memcpy(&nxt_unit_msg_test_dgrams[nxt_unit_msg_test_ndgrams++], msg,
-               sizeof(nxt_port_msg_t));
+        d = &nxt_unit_msg_test_dgrams[nxt_unit_msg_test_ndgrams++];
+
+        memcpy(&d->msg, msg, sizeof(nxt_port_msg_t));
+
+        if (msg->mmap
+            && buf_size >= sizeof(nxt_port_msg_t) + sizeof(nxt_port_mmap_msg_t))
+        {
+            memcpy(&rec, msg + 1, sizeof(rec));
+            d->size = rec.size;
+
+        } else {
+            d->size = buf_size - sizeof(nxt_port_msg_t);
+        }
     }
+
+    pthread_mutex_unlock(&nxt_unit_msg_test_dgrams_mutex);
 
     /*
      * While one context asks the router for a segment, another one reads
@@ -779,7 +855,7 @@ nxt_unit_msg_test_send_chunk(uint8_t type, uint8_t last, nxt_chunk_id_t chunk,
     memset(&msg, 0, sizeof(msg));
 
     /* The router port was registered with the pid libunit started with. */
-    msg.stream = NXT_UNIT_MSG_TEST_STREAM;
+    msg.stream = nxt_unit_msg_test_stream;
     msg.pid = nxt_unit_msg_test_pid;
     msg.reply_port = nxt_unit_msg_test_reply_port;
     msg.type = type;
@@ -1025,8 +1101,8 @@ nxt_unit_msg_test_preread_race_case(void *data)
 
 
 /*
- * A Drupal REST error: a header of many fields, over 1024 bytes, goes into
- * shared memory; a short JSON body goes as a plain message.
+ * A Drupal REST error: a header of many fields, over 1024 bytes, in shared
+ * memory, and a short JSON body.
  */
 static int
 nxt_unit_msg_test_respond(nxt_unit_request_info_t *req)
@@ -1035,7 +1111,6 @@ nxt_unit_msg_test_respond(nxt_unit_request_info_t *req)
     char  name[] = "X-Test-00";
 
     static const char  value[] = "config:field.storage.entity_test.field_test";
-    static const char  body[] = "{\"message\":\"No route found\"}";
 
     rc = nxt_unit_response_init(req, 404, NXT_UNIT_MSG_TEST_FIELDS,
                                 NXT_UNIT_MSG_TEST_FIELDS
@@ -1054,10 +1129,358 @@ nxt_unit_msg_test_respond(nxt_unit_request_info_t *req)
     }
 
     if (rc == NXT_UNIT_OK) {
-        rc = nxt_unit_response_write(req, body, nxt_length(body));
+        rc = nxt_unit_response_write(req, NXT_UNIT_MSG_TEST_JSON,
+                                     nxt_length(NXT_UNIT_MSG_TEST_JSON));
     }
 
     return rc;
+}
+
+
+/* A hello world, as the PHP module sends it: header, body, then last. */
+static int
+nxt_unit_msg_test_respond_small(nxt_unit_request_info_t *req)
+{
+    int  rc;
+
+    rc = nxt_unit_response_init(req, 200, 1,
+                                nxt_length("Content-Type")
+                                + nxt_length("text/html; charset=UTF-8"));
+
+    if (rc == NXT_UNIT_OK) {
+        rc = nxt_unit_response_add_field(req, "Content-Type",
+                                         nxt_length("Content-Type"),
+                                         "text/html; charset=UTF-8",
+                                         nxt_length("text/html; "
+                                                    "charset=UTF-8"));
+    }
+
+    if (rc == NXT_UNIT_OK) {
+        rc = nxt_unit_response_send(req);
+    }
+
+    if (rc == NXT_UNIT_OK) {
+        rc = nxt_unit_response_write(req, NXT_UNIT_MSG_TEST_HELLO,
+                                     nxt_length(NXT_UNIT_MSG_TEST_HELLO));
+    }
+
+    return rc;
+}
+
+
+/*
+ * A buffer allocated before the header is sent and sent after a later
+ * write, as the Java module does with its output buffer.
+ */
+static int
+nxt_unit_msg_test_respond_held(nxt_unit_request_info_t *req)
+{
+    int             rc;
+    char            data[NXT_UNIT_MSG_TEST_WRITE_SIZE];
+    nxt_unit_buf_t  *buf;
+
+    rc = nxt_unit_response_init(req, 200, 1,
+                                nxt_length("Content-Type")
+                                + nxt_length("text/plain"));
+
+    if (rc == NXT_UNIT_OK) {
+        rc = nxt_unit_response_add_field(req, "Content-Type",
+                                         nxt_length("Content-Type"),
+                                         "text/plain",
+                                         nxt_length("text/plain"));
+    }
+
+    if (rc != NXT_UNIT_OK) {
+        return rc;
+    }
+
+    buf = nxt_unit_response_buf_alloc(req, NXT_UNIT_MSG_TEST_HELD_SIZE);
+    if (buf == NULL) {
+        return NXT_UNIT_ERROR;
+    }
+
+    memset(buf->free, 'C', NXT_UNIT_MSG_TEST_HELD_SIZE);
+    buf->free += NXT_UNIT_MSG_TEST_HELD_SIZE;
+
+    memset(data, 'B', sizeof(data));
+
+    rc = nxt_unit_response_send(req);
+
+    if (rc == NXT_UNIT_OK) {
+        rc = nxt_unit_response_write(req, data, sizeof(data));
+    }
+
+    if (rc == NXT_UNIT_OK) {
+        rc = nxt_unit_buf_send(buf);
+
+    } else {
+        nxt_unit_buf_free(buf);
+    }
+
+    return rc;
+}
+
+
+/* A header in shared memory, then a body part that finds no free chunk. */
+static int
+nxt_unit_msg_test_respond_no_chunk(nxt_unit_request_info_t *req)
+{
+    int   rc;
+    char  part[NXT_UNIT_MSG_TEST_PART_SIZE];
+
+    rc = nxt_unit_response_init(req, 200, 1,
+                                nxt_length("Content-Type")
+                                + nxt_length("text/plain"));
+
+    if (rc == NXT_UNIT_OK) {
+        rc = nxt_unit_response_add_field(req, "Content-Type",
+                                         nxt_length("Content-Type"),
+                                         "text/plain",
+                                         nxt_length("text/plain"));
+    }
+
+    if (rc == NXT_UNIT_OK) {
+        rc = nxt_unit_response_send(req);
+    }
+
+    if (rc == NXT_UNIT_OK) {
+        memset(part, 'B', sizeof(part));
+
+        nxt_unit_test_shm_probe_failures(1);
+
+        rc = nxt_unit_response_write(req, part, sizeof(part));
+    }
+
+    return rc;
+}
+
+
+/*
+ * A body written before nxt_unit_response_send(), as the WSGI module does.
+ * nxt_unit_response_write_nb() puts into the fields message as many of the
+ * first body bytes as the fields buffer has left.  The buffer is asked for
+ * the exact size of the fields, so it must have nothing left.  Rounded up
+ * to a chunk of PORT_MMAP_CHUNK_SIZE bytes it takes the whole body, which
+ * the router does not compress (test/test_python_compression.py).
+ */
+static int
+nxt_unit_msg_test_respond_write_first(nxt_unit_request_info_t *req)
+{
+    int       rc;
+    uint32_t  left;
+
+    rc = nxt_unit_response_init(req, 200, 1,
+                                nxt_length("Content-Type")
+                                + nxt_length("text/html; charset=UTF-8"));
+
+    if (rc == NXT_UNIT_OK) {
+        rc = nxt_unit_response_add_field(req, "Content-Type",
+                                         nxt_length("Content-Type"),
+                                         "text/html; charset=UTF-8",
+                                         nxt_length("text/html; "
+                                                    "charset=UTF-8"));
+    }
+
+    if (rc != NXT_UNIT_OK) {
+        return rc;
+    }
+
+    left = req->response_buf->end - req->response_buf->free;
+
+    if (left != 0) {
+        printf("unit msg test: the fields buffer has %d bytes left, "
+               "expected 0\n", (int) left);
+        fflush(stdout);
+
+        return NXT_UNIT_ERROR;
+    }
+
+    return nxt_unit_response_write(req, NXT_UNIT_MSG_TEST_HELLO,
+                                   nxt_length(NXT_UNIT_MSG_TEST_HELLO));
+}
+
+
+/* A router engine port with a shared memory queue, as NEW_PORT adds it. */
+static void *
+nxt_unit_msg_test_engine_port(void)
+{
+    int   rc, pair[2];
+    void  *queue;
+
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) == -1) {
+        perror("socketpair");
+        return NULL;
+    }
+
+    queue = mmap(NULL, sizeof(nxt_port_queue_t), PROT_READ | PROT_WRITE,
+                 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (queue == MAP_FAILED) {
+        perror("mmap");
+        return NULL;
+    }
+
+    nxt_port_queue_init(queue);
+
+    rc = nxt_unit_test_add_queue_port(nxt_unit_msg_test_ctx,
+                                      nxt_unit_msg_test_pid,
+                                      NXT_UNIT_MSG_TEST_ENGINE_PORT, pair[0],
+                                      queue);
+    if (rc != NXT_UNIT_OK) {
+        printf("unit msg test: engine port not added\n");
+        return NULL;
+    }
+
+    nxt_unit_msg_test_reply_port = NXT_UNIT_MSG_TEST_ENGINE_PORT;
+
+    return queue;
+}
+
+
+/*
+ * Sends a request on "stream" to the engine port and lets the handler
+ * answer it in "mode".  Returns 0 if the handler answered.
+ */
+static int
+nxt_unit_msg_test_engine_request(nxt_unit_msg_test_mode_t mode,
+    uint32_t stream, nxt_chunk_id_t chunk)
+{
+    int  rc;
+
+    nxt_unit_msg_test_mode = mode;
+    nxt_unit_msg_test_stream = stream;
+    nxt_unit_msg_test_ndgrams = 0;
+
+    rc = nxt_unit_msg_test_send_request(chunk, NULL);
+
+    if (rc != NXT_UNIT_OK || nxt_unit_msg_test_handler_calls != 1
+        || !nxt_unit_msg_test_handler_ok
+        || nxt_unit_msg_test_ndgrams == nxt_nitems(nxt_unit_msg_test_dgrams))
+    {
+        printf("unit msg test: response failed: %d\n", rc);
+        fflush(stdout);
+
+        return -1;
+    }
+
+    return 0;
+}
+
+
+/* Process "Y": a marker in the queue now, its datagram on the socket later. */
+static int
+nxt_unit_msg_test_marker_y(void *queue)
+{
+    int      notify;
+    uint8_t  type;
+
+    type = _NXT_PORT_MSG_READ_SOCKET;
+
+    return nxt_port_queue_send(queue, &type, 1, &notify) == NXT_OK ? 0 : -1;
+}
+
+
+static void
+nxt_unit_msg_test_dgram_y(void)
+{
+    nxt_unit_msg_test_dgram_t  *d;
+
+    d = &nxt_unit_msg_test_dgrams[nxt_unit_msg_test_ndgrams++];
+
+    memset(d, 0, sizeof(*d));
+
+    d->msg.stream = 0x7FFF;
+    d->msg.type = _NXT_PORT_MSG_DATA;
+}
+
+
+/*
+ * Reads the queue as the router does (nxt_port_queue_read_handler()): a
+ * queue message, or for each READ_SOCKET marker the next datagram.  Writes
+ * the messages of "stream" into "seq": 'A' the acknowledgement, 'L' the last
+ * message, 'B' data of "body" bytes, 'C' of "body2" bytes, 'H' other data.
+ * Counts the datagrams of "stream" into "*ndgrams".  Returns 0, or -1 for a
+ * marker without a datagram or a bad queue item.
+ */
+static int
+nxt_unit_msg_test_router_read(void *queue, uint32_t stream, uint32_t body,
+    uint32_t body2, char *seq, size_t len, size_t *ndgrams)
+{
+    size_t                     n, next;
+    ssize_t                    size;
+    uint8_t                    qmsg[NXT_PORT_QUEUE_MSG_SIZE];
+    nxt_port_mmap_msg_t        rec;
+    nxt_unit_msg_test_dgram_t  d;
+
+    *ndgrams = 0;
+
+    for (next = 0; next < nxt_unit_msg_test_ndgrams; next++) {
+        *ndgrams += (nxt_unit_msg_test_dgrams[next].msg.stream == stream);
+    }
+
+    n = 0;
+    next = 0;
+
+    while (n < len - 1) {
+        size = nxt_port_queue_recv(queue, qmsg);
+        if (size < 0) {
+            break;
+        }
+
+        if (size == 1 && qmsg[0] == _NXT_PORT_MSG_READ_SOCKET) {
+            if (next == nxt_unit_msg_test_ndgrams) {
+                printf("unit msg test: a marker without a datagram\n");
+                return -1;
+            }
+
+            d = nxt_unit_msg_test_dgrams[next++];
+
+        } else if (size >= (ssize_t) sizeof(nxt_port_msg_t)) {
+            memcpy(&d.msg, qmsg, sizeof(nxt_port_msg_t));
+
+            d.size = size - sizeof(nxt_port_msg_t);
+
+            if (d.msg.mmap
+                && size >= (ssize_t) (sizeof(nxt_port_msg_t) + sizeof(rec)))
+            {
+                memcpy(&rec, qmsg + sizeof(nxt_port_msg_t), sizeof(rec));
+                d.size = rec.size;
+            }
+
+        } else {
+            printf("unit msg test: a %d-byte queue message\n", (int) size);
+            return -1;
+        }
+
+        if (d.msg.stream != stream) {
+            continue;
+        }
+
+        seq[n++] = (d.msg.type == _NXT_PORT_MSG_REQ_HEADERS_ACK) ? 'A'
+                   : d.msg.last ? 'L'
+                   : (d.size == body) ? 'B'
+                   : (d.size == body2) ? 'C' : 'H';
+    }
+
+    seq[n] = '\0';
+
+    return 0;
+}
+
+
+static int
+nxt_unit_msg_test_expect(const char *seq, const char *expect)
+{
+    if (strcmp(seq, expect) != 0) {
+        printf("unit msg test: the router got \"%s\", expected \"%s\" "
+               "(ack, header, body, last)\n", seq, expect);
+
+        /* The child ends with _exit(), which does not flush stdout. */
+        fflush(stdout);
+
+        return -1;
+    }
+
+    return 0;
 }
 
 
@@ -1076,111 +1499,551 @@ nxt_unit_msg_test_respond(nxt_unit_request_info_t *req)
 static int
 nxt_unit_msg_test_order_case(void *data)
 {
-    int             rc, pair[2], notify;
-    char            seq[16];
-    void            *queue;
-    size_t          n, next;
-    ssize_t         size;
-    uint8_t         qmsg[NXT_PORT_QUEUE_MSG_SIZE];
-    nxt_port_msg_t  m;
+    char    seq[16];
+    void    *queue;
+    size_t  ndgrams;
 
-    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) == -1) {
-        perror("socketpair");
-        return 1;
-    }
-
-    queue = mmap(NULL, sizeof(nxt_port_queue_t), PROT_READ | PROT_WRITE,
-                 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (queue == MAP_FAILED) {
-        perror("mmap");
-        return 1;
-    }
-
-    nxt_port_queue_init(queue);
-
-    rc = nxt_unit_test_add_queue_port(nxt_unit_msg_test_ctx,
-                                      nxt_unit_msg_test_pid,
-                                      NXT_UNIT_MSG_TEST_ENGINE_PORT, pair[0],
-                                      queue);
-    if (rc != NXT_UNIT_OK) {
-        printf("unit msg test: engine port not added\n");
+    queue = nxt_unit_msg_test_engine_port();
+    if (queue == NULL) {
         return 2;
     }
 
-    /* Y's marker. */
-    qmsg[0] = _NXT_PORT_MSG_READ_SOCKET;
-
-    if (nxt_port_queue_send(queue, qmsg, 1, &notify) != NXT_OK) {
+    if (nxt_unit_msg_test_marker_y(queue) != 0) {
         return 3;
     }
 
-    nxt_unit_msg_test_mode = NXT_UNIT_MSG_TEST_ORDER;
-    nxt_unit_msg_test_reply_port = NXT_UNIT_MSG_TEST_ENGINE_PORT;
-    nxt_unit_msg_test_ndgrams = 0;
-
-    rc = nxt_unit_msg_test_send_request(2, NULL);
-
-    if (rc != NXT_UNIT_OK || nxt_unit_msg_test_handler_calls != 1
-        || !nxt_unit_msg_test_handler_ok
-        || nxt_unit_msg_test_ndgrams == nxt_nitems(nxt_unit_msg_test_dgrams))
+    if (nxt_unit_msg_test_engine_request(NXT_UNIT_MSG_TEST_ORDER,
+                                         NXT_UNIT_MSG_TEST_STREAM, 2)
+        != 0)
     {
-        printf("unit msg test: response failed: %d\n", rc);
         return 4;
     }
 
-    /* Y's datagram. */
-    memset(&m, 0, sizeof(m));
+    nxt_unit_msg_test_dgram_y();
 
-    m.stream = NXT_UNIT_MSG_TEST_STREAM + 1;
-    m.type = _NXT_PORT_MSG_DATA;
+    if (nxt_unit_msg_test_router_read(queue, NXT_UNIT_MSG_TEST_STREAM,
+                                      nxt_length(NXT_UNIT_MSG_TEST_JSON), 0,
+                                      seq, sizeof(seq), &ndgrams)
+        != 0)
+    {
+        return 5;
+    }
 
-    nxt_unit_msg_test_dgrams[nxt_unit_msg_test_ndgrams++] = m;
+    if (nxt_unit_msg_test_expect(seq, "AHBL") != 0) {
+        return 7;
+    }
 
-    /* The router reads the queue, and the next datagram for each marker. */
-    n = 0;
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * Once this process has a shared memory segment, a small response sends one
+ * datagram, the acknowledgement.  The header (in shared memory), the body (a
+ * plain message that fits into a queue item) and the last message go into
+ * the queue.  Before, the acknowledgement, the header and the body went to
+ * the socket.
+ */
+static int
+nxt_unit_msg_test_small_case(void *data)
+{
+    char     seq[16];
+    void     *queue;
+    size_t   ndgrams;
+    uint8_t  qmsg[NXT_PORT_QUEUE_MSG_SIZE];
+
+    queue = nxt_unit_msg_test_engine_port();
+    if (queue == NULL) {
+        return 2;
+    }
+
+    /* The first response makes the segment. */
+    if (nxt_unit_msg_test_engine_request(NXT_UNIT_MSG_TEST_ORDER,
+                                         NXT_UNIT_MSG_TEST_STREAM - 1, 2)
+        != 0)
+    {
+        return 4;
+    }
+
+    while (nxt_port_queue_recv(queue, qmsg) >= 0) { /* void */ }
+
+    if (nxt_unit_msg_test_marker_y(queue) != 0) {
+        return 3;
+    }
+
+    if (nxt_unit_msg_test_engine_request(NXT_UNIT_MSG_TEST_SMALL,
+                                         NXT_UNIT_MSG_TEST_STREAM, 3)
+        != 0)
+    {
+        return 4;
+    }
+
+    nxt_unit_msg_test_dgram_y();
+
+    if (nxt_unit_msg_test_router_read(queue, NXT_UNIT_MSG_TEST_STREAM,
+                                      nxt_length(NXT_UNIT_MSG_TEST_HELLO), 0,
+                                      seq, sizeof(seq), &ndgrams)
+        != 0)
+    {
+        return 5;
+    }
+
+    if (nxt_unit_msg_test_expect(seq, "AHBL") != 0) {
+        return 7;
+    }
+
+    if (ndgrams != 1) {
+        printf("unit msg test: a small response sent %d datagrams, "
+               "expected 1\n", (int) ndgrams);
+        fflush(stdout);
+
+        return 8;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * A small buffer in shared memory keeps the exact size it was asked for.
+ * So the fields of a response go out as their own message, even when the
+ * body is written before nxt_unit_response_send(): the router gets the ack,
+ * the fields, the body and the last message.  With the buffer rounded up to
+ * a chunk, the body went inside the fields message, the router sent those
+ * bytes uncompressed under a "Content-Encoding" header and emitted no gzip
+ * trailer, and 10 cases of test/test_python_compression.py failed.
+ */
+static int
+nxt_unit_msg_test_exact_fields_case(void *data)
+{
+    char     seq[16];
+    void     *queue;
+    size_t   ndgrams;
+    uint8_t  qmsg[NXT_PORT_QUEUE_MSG_SIZE];
+
+    queue = nxt_unit_msg_test_engine_port();
+    if (queue == NULL) {
+        return 2;
+    }
+
+    /* The first response makes the segment. */
+    if (nxt_unit_msg_test_engine_request(NXT_UNIT_MSG_TEST_ORDER,
+                                         NXT_UNIT_MSG_TEST_STREAM - 1, 2)
+        != 0)
+    {
+        return 4;
+    }
+
+    while (nxt_port_queue_recv(queue, qmsg) >= 0) { /* void */ }
+
+    if (nxt_unit_msg_test_engine_request(NXT_UNIT_MSG_TEST_WRITE_FIRST,
+                                         NXT_UNIT_MSG_TEST_STREAM, 3)
+        != 0)
+    {
+        return 4;
+    }
+
+    if (nxt_unit_msg_test_router_read(queue, NXT_UNIT_MSG_TEST_STREAM,
+                                      nxt_length(NXT_UNIT_MSG_TEST_HELLO), 0,
+                                      seq, sizeof(seq), &ndgrams)
+        != 0)
+    {
+        return 5;
+    }
+
+    if (nxt_unit_msg_test_expect(seq, "AHBL") != 0) {
+        return 7;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * Without shared memory a request stays on the socket until its last
+ * message, which goes into the queue.  The case needs a process with no
+ * segment yet; the parent made none before the fork, which the count of 3
+ * datagrams checks.
+ */
+static int
+nxt_unit_msg_test_no_shm_case(void *data)
+{
+    char    seq[16];
+    void    *queue;
+    size_t  ndgrams;
+
+    queue = nxt_unit_msg_test_engine_port();
+    if (queue == NULL) {
+        return 2;
+    }
+
+    nxt_unit_test_new_mmap_failures(1);
+
+    if (nxt_unit_msg_test_marker_y(queue) != 0) {
+        return 3;
+    }
+
+    if (nxt_unit_msg_test_engine_request(NXT_UNIT_MSG_TEST_SMALL,
+                                         NXT_UNIT_MSG_TEST_STREAM, 2)
+        != 0)
+    {
+        return 4;
+    }
+
+    nxt_unit_msg_test_dgram_y();
+
+    if (nxt_unit_msg_test_router_read(queue, NXT_UNIT_MSG_TEST_STREAM,
+                                      nxt_length(NXT_UNIT_MSG_TEST_HELLO), 0,
+                                      seq, sizeof(seq), &ndgrams)
+        != 0)
+    {
+        return 5;
+    }
+
+    if (nxt_unit_msg_test_expect(seq, "AHBL") != 0) {
+        return 7;
+    }
+
+    if (ndgrams != 3) {
+        printf("unit msg test: %d datagrams without shared memory, "
+               "expected 3\n", (int) ndgrams);
+        fflush(stdout);
+
+        return 8;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * A plain buffer over 15 bytes cannot go into the queue.  When one is
+ * allocated, the request stays on the socket until its last message, even
+ * if a later write gets shared memory.  Otherwise that write would go into
+ * the queue, and the plain buffer, sent after it, would have to wait for the
+ * router to take it (here, with no router, until the wait fails).
+ */
+static int
+nxt_unit_msg_test_plain_held_case(void *data)
+{
+    char    seq[16];
+    void    *queue;
+    size_t  ndgrams;
+
+    queue = nxt_unit_msg_test_engine_port();
+    if (queue == NULL) {
+        return 2;
+    }
+
+    /* The header gets no segment, so plain memory; the 2000-byte write does. */
+    nxt_unit_test_new_mmap_failures(1);
+
+    if (nxt_unit_msg_test_marker_y(queue) != 0) {
+        return 3;
+    }
+
+    if (nxt_unit_msg_test_engine_request(NXT_UNIT_MSG_TEST_PLAIN_HELD,
+                                         NXT_UNIT_MSG_TEST_STREAM, 2)
+        != 0)
+    {
+        return 4;
+    }
+
+    nxt_unit_msg_test_dgram_y();
+
+    if (nxt_unit_msg_test_router_read(queue, NXT_UNIT_MSG_TEST_STREAM,
+                                      NXT_UNIT_MSG_TEST_WRITE_SIZE,
+                                      NXT_UNIT_MSG_TEST_HELD_SIZE,
+                                      seq, sizeof(seq), &ndgrams)
+        != 0)
+    {
+        return 5;
+    }
+
+    if (nxt_unit_msg_test_expect(seq, "AHBCL") != 0) {
+        return 7;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * The frames of a websocket can wait in the router for a slow client, so
+ * they stay in plain memory and on the socket, as in 1.37.0, even when this
+ * process has shared memory.  The 101 response goes to the socket.
+ */
+static int
+nxt_unit_msg_test_ws_socket_case(void *data)
+{
+    char     seq[16];
+    void     *queue;
+    size_t   ndgrams;
+    uint8_t  qmsg[NXT_PORT_QUEUE_MSG_SIZE];
+
+    queue = nxt_unit_msg_test_engine_port();
+    if (queue == NULL) {
+        return 2;
+    }
+
+    /* The first response makes the segment. */
+    if (nxt_unit_msg_test_engine_request(NXT_UNIT_MSG_TEST_ORDER,
+                                         NXT_UNIT_MSG_TEST_STREAM - 1, 2)
+        != 0)
+    {
+        return 4;
+    }
+
+    while (nxt_port_queue_recv(queue, qmsg) >= 0) { /* void */ }
+
+    nxt_unit_msg_test_mode = NXT_UNIT_MSG_TEST_UPGRADE;
+    nxt_unit_msg_test_stream = NXT_UNIT_MSG_TEST_STREAM;
+    nxt_unit_msg_test_ndgrams = 0;
+
+    if (nxt_unit_msg_test_send_request(3, nxt_unit_msg_test_edit_handshake)
+        != NXT_UNIT_OK
+        || nxt_unit_msg_test_handler_calls != 1
+        || !nxt_unit_msg_test_handler_ok)
+    {
+        printf("unit msg test: upgrade failed\n");
+        fflush(stdout);
+
+        return 4;
+    }
+
+    if (nxt_unit_msg_test_router_read(queue, NXT_UNIT_MSG_TEST_STREAM, 0, 0,
+                                      seq, sizeof(seq), &ndgrams)
+        != 0)
+    {
+        return 5;
+    }
+
+    if (nxt_unit_msg_test_expect(seq, "AH") != 0) {
+        return 7;
+    }
+
+    if (ndgrams != 2) {
+        printf("unit msg test: a websocket sent %d datagrams, expected 2\n",
+               (int) ndgrams);
+        fflush(stdout);
+
+        return 8;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/* The router as a thread, for nxt_unit_msg_test_drain_case(). */
+typedef struct {
+    void               *queue;
+    nxt_nncq_atomic_t  tail;        /* After Y's marker. */
+    char               seq[16];
+    size_t             n;
+    int                early;       /* Data of the request came before Y's. */
+} nxt_unit_msg_test_router_t;
+
+
+static void *
+nxt_unit_msg_test_router_thread(void *data)
+{
+    int                         i, done, y, armed;
+    size_t                      next, k;
+    ssize_t                     size;
+    uint8_t                     qmsg[NXT_PORT_QUEUE_MSG_SIZE];
+    nxt_port_queue_t            *q;
+    nxt_port_mmap_msg_t         rec;
+    nxt_unit_msg_test_dgram_t   d;
+    nxt_unit_msg_test_router_t  *r;
+
+    r = data;
+    q = r->queue;
     next = 0;
+    done = 0;
+    y = 0;
+    armed = -1;
 
-    while (n < sizeof(seq) - 1) {
-        size = nxt_port_queue_recv(queue, qmsg);
+    /* About two seconds in steps of 100 us. */
+    for (i = 0; !done && i < 20000 && r->n < sizeof(r->seq) - 1; i++) {
+        size = nxt_port_queue_recv(q, qmsg);
         if (size < 0) {
-            break;
-        }
-
-        if (size == 1 && qmsg[0] == _NXT_PORT_MSG_READ_SOCKET) {
-            if (next == nxt_unit_msg_test_ndgrams) {
-                printf("unit msg test: a marker without a datagram\n");
-                return 5;
-            }
-
-            m = nxt_unit_msg_test_dgrams[next++];
-
-        } else if (size >= (ssize_t) sizeof(nxt_port_msg_t)) {
-            memcpy(&m, qmsg, sizeof(nxt_port_msg_t));
-
-        } else {
-            printf("unit msg test: a %d-byte queue message\n", (int) size);
-            return 6;
-        }
-
-        if (m.stream != NXT_UNIT_MSG_TEST_STREAM) {
+            (void) usleep(100);
             continue;
         }
 
-        seq[n++] = (m.type == _NXT_PORT_MSG_REQ_HEADERS_ACK) ? 'A'
-                   : m.last ? 'L'
-                   : m.mmap ? 'H' : 'B';
+        if (size == 1 && qmsg[0] == _NXT_PORT_MSG_READ_SOCKET) {
+
+            for ( ;; ) {
+                pthread_mutex_lock(&nxt_unit_msg_test_dgrams_mutex);
+
+                if (next < nxt_unit_msg_test_ndgrams) {
+                    d = nxt_unit_msg_test_dgrams[next++];
+                    pthread_mutex_unlock(&nxt_unit_msg_test_dgrams_mutex);
+                    break;
+                }
+
+                /*
+                 * Y sends its datagram 20 ms after the request put its header
+                 * into the queue: the ack's marker and the header follow Y's
+                 * marker.  A data datagram of the request before that one is
+                 * too early.
+                 */
+                if (!y && armed < 0
+                    && (int32_t) (nxt_nncq_tail(&q->queue) - (r->tail + 2))
+                       >= 0)
+                {
+                    armed = i;
+                }
+
+                if (!y && armed >= 0 && i - armed >= 200) {
+                    for (k = 0; k < nxt_unit_msg_test_ndgrams; k++) {
+                        if (nxt_unit_msg_test_dgrams[k].msg.stream
+                                == NXT_UNIT_MSG_TEST_STREAM
+                            && nxt_unit_msg_test_dgrams[k].msg.type
+                               != _NXT_PORT_MSG_REQ_HEADERS_ACK)
+                        {
+                            r->early = 1;
+                        }
+                    }
+
+                    nxt_unit_msg_test_dgram_y();
+                    y = 1;
+                }
+
+                pthread_mutex_unlock(&nxt_unit_msg_test_dgrams_mutex);
+
+                (void) usleep(100);
+
+                if (++i >= 20000) {
+                    return NULL;
+                }
+            }
+
+        } else if (size >= (ssize_t) sizeof(nxt_port_msg_t)) {
+            memcpy(&d.msg, qmsg, sizeof(nxt_port_msg_t));
+
+            d.size = size - sizeof(nxt_port_msg_t);
+
+            if (d.msg.mmap
+                && size >= (ssize_t) (sizeof(nxt_port_msg_t) + sizeof(rec)))
+            {
+                memcpy(&rec, qmsg + sizeof(nxt_port_msg_t), sizeof(rec));
+                d.size = rec.size;
+            }
+
+        } else {
+            return NULL;
+        }
+
+        if (d.msg.stream != NXT_UNIT_MSG_TEST_STREAM) {
+            continue;
+        }
+
+        r->seq[r->n++] = (d.msg.type == _NXT_PORT_MSG_REQ_HEADERS_ACK) ? 'A'
+                         : d.msg.last ? 'L'
+                         : (d.size == NXT_UNIT_MSG_TEST_PART_SIZE) ? 'B'
+                         : 'H';
+
+        done = d.msg.last;
     }
 
-    seq[n] = '\0';
+    return NULL;
+}
 
-    if (strcmp(seq, "AHBL") != 0) {
-        printf("unit msg test: the router got \"%s\", expected \"AHBL\" "
-               "(ack, header, body, last)\n", seq);
 
-        /* The child ends with _exit(), which does not flush stdout. */
+/*
+ * A request has its header in the queue, and its body part finds no free
+ * chunk, so it gets plain memory.  It must not send that part to the
+ * socket while the router still has its header ahead: the ack's marker is
+ * in the queue before the header, and the router waits there for a
+ * datagram (the ack took Y's marker), which comes 20 ms later from Y.  The
+ * request waits until the router has taken the header, then sends the part
+ * to the socket.
+ */
+static int
+nxt_unit_msg_test_drain_case(void *data)
+{
+    void                        *queue;
+    size_t                      i, ndgrams;
+    uint8_t                     qmsg[NXT_PORT_QUEUE_MSG_SIZE];
+    pthread_t                   thread;
+    nxt_unit_msg_test_router_t  r;
+
+    queue = nxt_unit_msg_test_engine_port();
+    if (queue == NULL) {
+        return 2;
+    }
+
+    /* The first response makes the segment. */
+    if (nxt_unit_msg_test_engine_request(NXT_UNIT_MSG_TEST_ORDER,
+                                         NXT_UNIT_MSG_TEST_STREAM - 1, 2)
+        != 0)
+    {
+        return 4;
+    }
+
+    while (nxt_port_queue_recv(queue, qmsg) >= 0) { /* void */ }
+
+    if (nxt_unit_msg_test_marker_y(queue) != 0) {
+        return 3;
+    }
+
+    memset(&r, 0, sizeof(r));
+    r.queue = queue;
+    r.tail = nxt_nncq_tail(&((nxt_port_queue_t *) queue)->queue);
+
+    nxt_unit_msg_test_ndgrams = 0;
+
+    if (pthread_create(&thread, NULL, nxt_unit_msg_test_router_thread, &r)
+        != 0)
+    {
+        return 2;
+    }
+
+    nxt_unit_msg_test_mode = NXT_UNIT_MSG_TEST_NO_CHUNK;
+    nxt_unit_msg_test_stream = NXT_UNIT_MSG_TEST_STREAM;
+
+    if (nxt_unit_msg_test_send_request(3, NULL) != NXT_UNIT_OK
+        || nxt_unit_msg_test_handler_calls != 1
+        || !nxt_unit_msg_test_handler_ok)
+    {
+        printf("unit msg test: response failed\n");
         fflush(stdout);
 
+        (void) pthread_join(thread, NULL);
+        return 4;
+    }
+
+    (void) pthread_join(thread, NULL);
+
+    r.seq[r.n] = '\0';
+
+    ndgrams = 0;
+
+    for (i = 0; i < nxt_unit_msg_test_ndgrams; i++) {
+        ndgrams += (nxt_unit_msg_test_dgrams[i].msg.stream
+                    == NXT_UNIT_MSG_TEST_STREAM);
+    }
+
+    if (r.early) {
+        printf("unit msg test: the body part went out before the router took "
+               "the header\n");
+        fflush(stdout);
+
+        return 9;
+    }
+
+    if (nxt_unit_msg_test_expect(r.seq, "AHBL") != 0) {
         return 7;
+    }
+
+    /* The ack and the body part went to the socket. */
+    if (ndgrams != 2) {
+        printf("unit msg test: %d datagrams after the drain, expected 2\n",
+               (int) ndgrams);
+        fflush(stdout);
+
+        return 8;
     }
 
     return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
@@ -1634,6 +2497,32 @@ main(void)
     nxt_unit_msg_test_in_child("response messages keep their order through "
                                "the queue and the socket",
                                nxt_unit_msg_test_order_case, NULL,
+                               NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("a small response sends one datagram",
+                               nxt_unit_msg_test_small_case, NULL,
+                               NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("the fields of a response leave no room for "
+                               "the body",
+                               nxt_unit_msg_test_exact_fields_case, NULL,
+                               NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("without shared memory a response keeps its "
+                               "order on the socket",
+                               nxt_unit_msg_test_no_shm_case, NULL,
+                               NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("a plain buffer keeps its request on the "
+                               "socket", nxt_unit_msg_test_plain_held_case,
+                               NULL, NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("a websocket stays on the socket",
+                               nxt_unit_msg_test_ws_socket_case, NULL,
+                               NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("a request leaves the queue after the router "
+                               "took it", nxt_unit_msg_test_drain_case, NULL,
                                NXT_UNIT_OK);
 
     nxt_unit_msg_test_in_child("masked websocket frame in shared memory",
