@@ -70,6 +70,8 @@ nxt_runtime_create(nxt_task_t *task)
 
     rt->control_uid = (nxt_uid_t) -1;
     rt->control_gid = (nxt_gid_t) -1;
+    rt->status_uid = (nxt_uid_t) -1;
+    rt->status_gid = (nxt_gid_t) -1;
 
     nxt_thread_mutex_create(&rt->processes_mutex);
 
@@ -709,6 +711,13 @@ nxt_runtime_exit(nxt_task_t *task, void *obj, void *data)
                 (void) nxt_file_delete(name);
             }
 
+            sa = rt->status_listen;
+
+            if (sa != NULL && sa->u.sockaddr.sa_family == AF_UNIX) {
+                name = (nxt_file_name_t *) sa->u.sockaddr_un.sun_path;
+                (void) nxt_file_delete(name);
+            }
+
             for (i = 0; i < rt->listen_sockets->nelts; i++) {
                 nxt_listen_socket_t  *ls;
 
@@ -905,7 +914,7 @@ static nxt_int_t
 nxt_runtime_conf_init(nxt_task_t *task, nxt_runtime_t *rt)
 {
     nxt_int_t                    ret;
-    nxt_str_t                    control;
+    nxt_str_t                    control, status;
     nxt_uint_t                   n;
     nxt_file_t                   *file;
     const char                   *slash;
@@ -1072,6 +1081,24 @@ nxt_runtime_conf_init(nxt_task_t *task, nxt_runtime_t *rt)
         return NXT_ERROR;
     }
 
+    if (rt->status_addr != NULL) {
+        status.length = nxt_strlen(rt->status_addr);
+        status.start = (u_char *) rt->status_addr;
+
+        sa = nxt_sockaddr_parse(rt->mem_pool, &status);
+        if (nxt_slow_path(sa == NULL)) {
+            return NXT_ERROR;
+        }
+
+        sa->type = SOCK_STREAM;
+
+        rt->status_listen = sa;
+
+        if (nxt_runtime_status_socket(task, rt) != NXT_OK) {
+            return NXT_ERROR;
+        }
+    }
+
     return NXT_OK;
 }
 
@@ -1095,6 +1122,14 @@ nxt_runtime_conf_read_cmd(nxt_task_t *task, nxt_runtime_t *rt)
                         "option \"--control-user\" requires a username\n";
     static const char  no_control_group[] =
                         "option \"--control-group\" requires a group name\n";
+    static const char  no_status[] =
+                       "option \"--status\" requires socket address\n";
+    static const char  no_status_mode[] =
+                        "option \"--status-mode\" requires a mode\n";
+    static const char  no_status_user[] =
+                        "option \"--status-user\" requires a username\n";
+    static const char  no_status_group[] =
+                        "option \"--status-group\" requires a group name\n";
     static const char  no_user[] = "option \"--user\" requires username\n";
     static const char  no_group[] = "option \"--group\" requires group name\n";
     static const char  no_pid[] = "option \"--pid\" requires filename\n";
@@ -1129,6 +1164,17 @@ nxt_runtime_conf_read_cmd(nxt_task_t *task, nxt_runtime_t *rt)
         "  --control-user USER    set the owner of the control API socket\n"
         "\n"
         "  --control-group GROUP  set the group of the control API socket\n"
+        "\n"
+        "  --status ADDRESS     set address of the read-only status socket,\n"
+        "                       which serves only GET /status\n"
+        "                       default: none\n"
+        "\n"
+        "  --status-mode MODE   set mode of the status socket\n"
+        "                       default: 0600\n"
+        "\n"
+        "  --status-user USER   set the owner of the status socket\n"
+        "\n"
+        "  --status-group GROUP  set the group of the status socket\n"
         "\n"
         "  --pid FILE           set pid filename\n"
         "                       default: \"" NXT_PID "\"\n"
@@ -1216,6 +1262,61 @@ nxt_runtime_conf_read_cmd(nxt_task_t *task, nxt_runtime_t *rt)
             p = *argv++;
 
             rt->control_group = p;
+
+            continue;
+        }
+
+        if (nxt_strcmp(p, "--status") == 0) {
+            if (*argv == NULL) {
+                write(STDERR_FILENO, no_status, nxt_length(no_status));
+                return NXT_ERROR;
+            }
+
+            p = *argv++;
+
+            rt->status_addr = p;
+
+            continue;
+        }
+
+        if (nxt_strcmp(p, "--status-mode") == 0) {
+            if (*argv == NULL) {
+                write(STDERR_FILENO, no_status_mode,
+                      nxt_length(no_status_mode));
+                return NXT_ERROR;
+            }
+
+            p = *argv++;
+
+            rt->status_mode = strtoul(p, NULL, 8);
+
+            continue;
+        }
+
+        if (nxt_strcmp(p, "--status-user") == 0) {
+            if (*argv == NULL) {
+                write(STDERR_FILENO, no_status_user,
+                      nxt_length(no_status_user));
+                return NXT_ERROR;
+            }
+
+            p = *argv++;
+
+            rt->status_user = p;
+
+            continue;
+        }
+
+        if (nxt_strcmp(p, "--status-group") == 0) {
+            if (*argv == NULL) {
+                write(STDERR_FILENO, no_status_group,
+                      nxt_length(no_status_group));
+                return NXT_ERROR;
+            }
+
+            p = *argv++;
+
+            rt->status_group = p;
 
             continue;
         }
