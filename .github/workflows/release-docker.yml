@@ -9,7 +9,10 @@
 #   build  — variant × arch matrix; builds and pushes per-arch images.
 #   merge  — variant matrix; stitches the per-arch images into a manifest.
 #
-# Adding/dropping a variant: edit the VARIANTS list in the `setup` job only.
+# Adding/dropping a variant: edit pkg/eol.json.  The `setup` job derives the
+# variant list from it.  If the variant had an old-style GHCR tag (up to
+# 1.35.5, for example latest-php8.5), also edit the old-style list in
+# `setup`; the run stops if a variant in that list is not built.
 # The Dockerfile path is derived as pkg/docker/Dockerfile.<variant>, so the
 # variant name must match the Dockerfile suffix.
 #
@@ -55,6 +58,7 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
       variants: ${{ steps.meta.outputs.variants }}
+      legacy: ${{ steps.meta.outputs.legacy }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -93,6 +97,30 @@ jobs:
             end
           ] | flatten' pkg/eol.json)
           echo "variants=${variants}" >> "$GITHUB_OUTPUT"
+
+          # Up to 1.35.5 the variants had no hyphen after the language, and
+          # Java was "jsc": latest-php8.5, latest-jsc21.  GHCR still holds
+          # these tags, and some guides cite them.  The merge job points
+          # each one at the same image as latest-<variant>.  Only these
+          # variants had such a tag; no new old-style tag is made.  Each one
+          # must still be built: a renamed or dropped variant stops the run
+          # here, so its old-style tag does not go stale without a notice.
+          legacy=$(jq -cn --argjson built "${variants}" '
+            [ "go-1.25", "go-1.26", "java-17", "java-21",
+              "node-20", "node-22", "node-24", "perl-5.38", "perl-5.40",
+              "php-8.3", "php-8.4", "php-8.5",
+              "python-3.12", "python-3.12-slim", "python-3.13",
+              "python-3.13-slim", "python-3.14", "python-3.14-slim",
+              "ruby-3.3", "ruby-3.4" ] as $old
+            | ($old - $built) as $gone
+            | if ($gone | length) > 0
+              then error("old-style tag for a variant that is not built: "
+                         + ($gone | join(", ")))
+              else [ $old[] | { (.): ("latest-" + (if startswith("java-")
+                       then "jsc" + ltrimstr("java-")
+                       else sub("-"; "") end)) } ] | add
+              end')
+          echo "legacy=${legacy}" >> "$GITHUB_OUTPUT"
 
   build:
     needs: setup
@@ -184,23 +212,8 @@ jobs:
           VERSION="${{ needs.setup.outputs.version }}"
           VARIANT="${{ matrix.variant }}"
           GHCR_REPO="${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}"
-
-          # Up to 1.35.5 the variants had no hyphen after the language, and
-          # Java was "jsc": latest-php8.5, latest-jsc21.  GHCR still holds
-          # these tags, and some guides cite them.  Point them at the same
-          # image as latest-<variant>.  Only the variants that had such a
-          # tag get one.  No new old-style tag is created.  The old tags
-          # latest-go1.24 and latest-jsc11 have no variant and stay as they are.
-          LEGACY=""
-          case "${VARIANT}" in
-            go-1.25|go-1.26|node-20|node-22|node-24|perl-5.38|perl-5.40| \
-            php-8.3|php-8.4|php-8.5|python-3.12|python-3.12-slim| \
-            python-3.13|python-3.13-slim|python-3.14|python-3.14-slim| \
-            ruby-3.3|ruby-3.4)
-              LEGACY="latest-${VARIANT/-/}" ;;
-            java-17|java-21)
-              LEGACY="latest-jsc${VARIANT#java-}" ;;
-          esac
+          # The old-style tag of this variant, or empty (see the setup job).
+          LEGACY="${{ fromJSON(needs.setup.outputs.legacy)[matrix.variant] }}"
 
           # Per-arch images live in both registries; build a manifest in each.
           for REPO in \
