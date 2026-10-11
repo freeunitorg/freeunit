@@ -423,6 +423,10 @@ nxt_int_t nxt_router_test_response_header_parse(nxt_task_t *task,
  */
 nxt_buf_t *nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     nxt_app_t *app, nxt_uint_t *status);
+
+/* The engine thread start, for the engine port test. */
+nxt_int_t nxt_router_test_thread_create(nxt_task_t *task, nxt_runtime_t *rt,
+    nxt_event_engine_t *engine);
 #endif
 
 

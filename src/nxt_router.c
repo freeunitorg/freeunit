@@ -335,9 +335,9 @@ static void nxt_router_engines_post(nxt_router_t *router,
 static void nxt_router_engine_post(nxt_event_engine_t *engine,
     nxt_work_t *jobs);
 
+static nxt_port_t *nxt_router_engine_port_create(nxt_task_t *task,
+    nxt_runtime_t *rt);
 static void nxt_router_thread_start(void *data);
-static void nxt_router_rt_add_port(nxt_task_t *task, void *obj,
-    void *data);
 static void nxt_router_listen_socket_create(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_router_listen_socket_update(nxt_task_t *task, void *obj,
@@ -5072,6 +5072,7 @@ nxt_router_thread_create(nxt_task_t *task, nxt_runtime_t *rt,
     nxt_event_engine_t *engine)
 {
     nxt_int_t            ret;
+    nxt_port_t           *port;
     nxt_thread_link_t    *link;
     nxt_thread_handle_t  handle;
 
@@ -5080,6 +5081,30 @@ nxt_router_thread_create(nxt_task_t *task, nxt_runtime_t *rt,
     if (nxt_slow_path(link == NULL)) {
         return NXT_ERROR;
     }
+
+    /*
+     * The port of the engine goes into rt->ports here, on the main thread,
+     * before the engine thread exists.  The engine sends requests to
+     * applications with this port as the reply port, and libunit asks the
+     * main thread for it with GET_PORT (nxt_router_get_port_handler()).  If
+     * the engine thread published the port itself, it would post the work to
+     * the main thread and start to accept connections at once.  A GET_PORT
+     * read in the same poll as that post is handled first, finds no port and
+     * gets no reply, and the request then waits for ever.
+     */
+    port = nxt_router_engine_port_create(task, rt);
+    if (nxt_slow_path(port == NULL)) {
+        nxt_free(link);
+        return NXT_ERROR;
+    }
+
+    /*
+     * The main thread can post to the port before the engine thread starts,
+     * see nxt_router_remove_pid_handler().  The work waits in the queue of
+     * the engine.  nxt_port_enable() sets the same engine again.
+     */
+    port->engine = engine;
+    engine->port = port;
 
     link->start = nxt_router_thread_start;
     link->engine = engine;
@@ -5093,10 +5118,82 @@ nxt_router_thread_create(nxt_task_t *task, nxt_runtime_t *rt,
 
     if (nxt_slow_path(ret != NXT_OK)) {
         nxt_queue_remove(&engine->link);
+
+        engine->port = NULL;
+
+        /* No engine thread runs, so the last release must happen here. */
+        port->engine = NULL;
+
+        nxt_port_close(task, port);
+
+        /* This drops the hash reference. */
+        nxt_runtime_port_remove(task, port);
+
+        /* This drops the reference from nxt_port_new(). */
+        nxt_port_use(task, port, -1);
     }
 
     return ret;
 }
+
+
+/*
+ * Creates the port of a new engine and adds it to rt->ports.  The reference
+ * from nxt_port_new() belongs to the engine.  The hash takes one more.
+ * nxt_runtime_port_remove() drops the hash reference, and an explicit
+ * nxt_port_use(-1) drops the engine reference.
+ */
+
+static nxt_port_t *
+nxt_router_engine_port_create(nxt_task_t *task, nxt_runtime_t *rt)
+{
+    nxt_int_t   ret;
+    nxt_port_t  *port;
+
+    port = nxt_port_new(task, nxt_port_get_next_id(), nxt_pid,
+                        NXT_PROCESS_ROUTER);
+    if (nxt_slow_path(port == NULL)) {
+        return NULL;
+    }
+
+    ret = nxt_port_socket_init(task, port, 0);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_use(task, port, -1);
+        return NULL;
+    }
+
+    ret = nxt_router_port_queue_init(task, port);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_close(task, port);
+        nxt_port_use(task, port, -1);
+        return NULL;
+    }
+
+    ret = nxt_port_hash_add(&rt->ports, port);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_close(task, port);
+        nxt_port_use(task, port, -1);
+        return NULL;
+    }
+
+    nxt_port_use(task, port, 1);
+
+    return port;
+}
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_router_engine_port_test.c. */
+
+nxt_int_t
+nxt_router_test_thread_create(nxt_task_t *task, nxt_runtime_t *rt,
+    nxt_event_engine_t *engine)
+{
+    return nxt_router_thread_create(task, rt, engine);
+}
+
+#endif
 
 
 static void
@@ -5175,10 +5272,8 @@ static nxt_port_handlers_t  nxt_router_app_port_handlers = {
 static void
 nxt_router_thread_start(void *data)
 {
-    nxt_int_t           ret;
     nxt_port_t          *port;
     nxt_task_t          *task;
-    nxt_work_t          *work;
     nxt_thread_t        *thread;
     nxt_thread_link_t   *link;
     nxt_event_engine_t  *engine;
@@ -5204,61 +5299,19 @@ nxt_router_thread_start(void *data)
         return;
     }
 
-    port = nxt_port_new(task, nxt_port_get_next_id(), nxt_pid,
-                        NXT_PROCESS_ROUTER);
-    if (nxt_slow_path(port == NULL)) {
-        return;
-    }
+    /*
+     * The main thread created the port and added it to rt->ports in
+     * nxt_router_thread_create().  This thread reads it from now on.
+     */
+    port = engine->port;
 
-    ret = nxt_port_socket_init(task, port, 0);
-    if (nxt_slow_path(ret != NXT_OK)) {
-        nxt_port_use(task, port, -1);
-        return;
-    }
+    nxt_mp_thread_adopt(port->mem_pool);
 
-    ret = nxt_router_port_queue_init(task, port);
-    if (nxt_slow_path(ret != NXT_OK)) {
-        nxt_port_use(task, port, -1);
-        return;
-    }
-
-    engine->port = port;
+    port->socket.task = task;
 
     nxt_port_enable(task, port, &nxt_router_app_port_handlers);
 
-    work = nxt_zalloc(sizeof(nxt_work_t));
-    if (nxt_slow_path(work == NULL)) {
-        return;
-    }
-
-    work->handler = nxt_router_rt_add_port;
-    work->task = link->work.task;
-    work->obj = work;
-    work->data = port;
-
-    nxt_event_engine_post(link->work.task->thread->engine, work);
-
     nxt_event_engine_start(engine);
-}
-
-
-static void
-nxt_router_rt_add_port(nxt_task_t *task, void *obj, void *data)
-{
-    nxt_int_t      res;
-    nxt_port_t     *port;
-    nxt_runtime_t  *rt;
-
-    rt = task->thread->runtime;
-    port = data;
-
-    nxt_free(obj);
-
-    res = nxt_port_hash_add(&rt->ports, port);
-
-    if (nxt_fast_path(res == NXT_OK)) {
-        nxt_port_use(task, port, 1);
-    }
 }
 
 
@@ -5966,11 +6019,13 @@ nxt_router_thread_exit_handler(nxt_task_t *task, void *obj, void *data)
 
     /*
      * The worker thread is gone, so nothing reads port->pair[0] any more:
-     * close the socket pair and the queue memfd, and drop the reference
-     * nxt_router_rt_add_port() took when it published the port in
-     * rt->ports.  Without this every engine removed by a listen_threads
-     * decrease leaks 3 descriptors (2 socketpair + 1 memfd) for the
-     * router's lifetime.
+     * close the socket pair and the queue memfd.  Without this every engine
+     * removed by a listen_threads decrease leaks 3 descriptors (2 socketpair
+     * + 1 memfd) for the router's lifetime.
+     *
+     * nxt_runtime_port_remove() drops the reference that
+     * nxt_router_engine_port_create() took for rt->ports.  The explicit
+     * drop after it is the engine reference from nxt_port_new().
      */
     nxt_port_close(task, port);
     nxt_runtime_port_remove(task, port);

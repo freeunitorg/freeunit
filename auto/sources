@@ -209,6 +209,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_router_sender_test.c \
     src/test/nxt_router_stale_joint_test.c \
     src/test/nxt_router_websocket_test.c \
+    src/test/nxt_router_engine_port_test.c \
     src/test/nxt_main_start_process_reply_test.c \
     src/test/nxt_main_file_store_test.c \
     src/test/nxt_main_store_test.c \
