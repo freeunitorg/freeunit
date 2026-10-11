@@ -6458,13 +6458,13 @@ components:
           body_min_rate: 256
           body_read_timeout: 30
           compression:
-          types:
-            - "text/*"
-          compressors:
-            - { "encoding": "gzip", "level": 3, "min_length": 2048 }
-            - { "encoding": "deflate", "min_length": 1024 }
-            - { "encoding": "zstd", "min_length": 0 }
-            - { "encoding": "br" }
+            types:
+              - "text/*"
+            compressors:
+              - { "encoding": "gzip", "level": 3, "min_length": 2048 }
+              - { "encoding": "deflate", "min_length": 1024 }
+              - { "encoding": "zstd", "min_length": 0 }
+              - { "encoding": "br" }
           discard_unsafe_fields: true
           header_read_timeout: 30
           idle_timeout: 180
