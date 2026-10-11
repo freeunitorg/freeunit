@@ -6,6 +6,54 @@
 
 
 <changes apply="unit"
+         ver="1.38.0" rev="1"
+         date="2026-10-06" time="00:00:00 +0000"
+         packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change type="feature">
+<para>
+a top-level "schedules" object.  A schedule makes FreeUnit send a periodic
+internal request to an application, with no client and no extra process, for
+example a cron trigger for Drupal or another PHP application.  Each schedule
+has a "pass" ("applications/&lt;name&gt;"; routes and upstreams are not
+supported), a "uri" that is sent as a "GET", and an "interval" in seconds.
+The optional keys are "jitter", "timeout", "overlap" ("skip"), "headers" and
+"run_on_start".  A run is a normal application request: "/status" counts it
+in "requests.total", it goes through "limits" and the application queue, and
+the access log records it.  "/status/schedules" shows the counters of each
+schedule.  When a run passes its "timeout", FreeUnit stops waiting for it.
+The application process continues, and it counts against "processes" until
+it answers or exits.
+</para>
+</change>
+
+</changes>
+
+
+<changes apply="unit-php unit-php8.3 unit-php8.4 unit-php8.5
+                unit-python unit-python2.7
+                unit-python3.8 unit-python3.9 unit-python3.10 unit-python3.11
+                unit-python3.12 unit-python3.13 unit-python3.14
+                unit-go
+                unit-perl
+                unit-ruby
+                unit-jsc-common unit-jsc11 unit-jsc17 unit-jsc18
+                unit-jsc19 unit-jsc20 unit-jsc21
+                unit-wasm"
+         ver="1.38.0" rev="1"
+         date="2026-10-06" time="00:00:00 +0000"
+         packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change>
+<para>
+FreeUnit updated to 1.38.0.
+</para>
+</change>
+
+</changes>
+
+
+<changes apply="unit"
          ver="1.37.1" rev="1"
          date="2026-10-04" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">

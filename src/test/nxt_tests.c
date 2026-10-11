@@ -78,6 +78,7 @@ static nxt_int_t (*const nxt_security_tests[])(nxt_thread_t *) = {
 #if (NXT_HAVE_REGEX)
     nxt_regex_test,
 #endif
+    nxt_router_schedule_test,
 };
 
 
