@@ -126,11 +126,11 @@ def dechunk(data):
         data = data[end + 2 + size + 2 :]
 
 
-def fetch(rid, encoding):
+def fetch(rid, encoding, extra=None):
     # latin1 maps each byte to one character, so encoding back gives the
     # compressed bytes exactly.
     resp = client.get(
-        headers=request_headers(rid, encoding, PARTS),
+        headers={**request_headers(rid, encoding, PARTS), **(extra or {})},
         raw_resp=True,
         encoding='latin1',
         read_buffer_size=65536,
@@ -147,13 +147,17 @@ def fetch(rid, encoding):
     return int(lines[0].split()[1]), headers, body.encode('latin1')
 
 
-def check(rid, encoding, decode):
+def check(rid, encoding, decode, extra=None, want=None):
     """Returns None for a correct response, else what is wrong with it."""
 
-    status, headers, body = fetch(rid, encoding)
+    status, headers, body = fetch(rid, encoding, extra)
 
     if status != 200:
         return f'status {status}'
+
+    for name, value in (want or {}).items():
+        if headers.get(name) != value:
+            return f'{name} is {str(headers.get(name))[:40]!r}'
 
     if headers.get('Content-Encoding') != encoding:
         return f'Content-Encoding {headers.get("Content-Encoding")}'
@@ -338,6 +342,26 @@ def test_python_compression_app_timeout(encoding):
     time.sleep(1)
 
     assert check(2001, encoding, decode) is None, 'response after the timeout'
+
+
+@pytest.mark.parametrize('encoding', ENCODINGS)
+def test_python_compression_large_header(encoding):
+    # libunit sends a response buffer over 1024 bytes (the status, the field
+    # descriptors and the field bytes) to the router through shared memory.
+    # The WSGI module sends the headers with the first body write, so libunit
+    # puts the first body part into the same message, behind the fields.  The
+    # router must compress that part like the parts after it, and end the
+    # stream after the last part.  Before the fix, the first part went out
+    # uncompressed, and the stream had no end.  The large field must come
+    # back, which shows that the headers took the shared memory path.
+    decode = decoder(encoding)
+    setup_compression(encoding)
+
+    bad = check(
+        3001, encoding, decode, {'X-Pad': '2048'}, {'X-Pad': 'p' * 2048}
+    )
+
+    assert bad is None, bad
 
 
 # Large enough to reach the router through shared memory, so the compressor

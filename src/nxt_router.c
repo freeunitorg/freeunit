@@ -6283,6 +6283,26 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         }
 
         if (b != NULL) {
+            /*
+             * libunit can put the first body part into the headers message,
+             * behind the fields.  It goes through the compressor like the
+             * parts that follow it, so that the compressor counts it toward
+             * the length that ends the stream.  The compressor releases the
+             * shared memory of the headers through the fast work queue.  That
+             * queue runs after the header send below has copied the fields.
+             *
+             * The chain is compressed before it reaches r->out.  On failure,
+             * the compressor gives back its output, the buffer that failed
+             * and the rest of the chain, with the sync buffer at the tail.
+             * "fail:" then puts the sync buffer back as r->last, so that the
+             * error response can end, and releases the other buffers.
+             */
+            ret = nxt_http_comp_compress_app_response(task, r, &b);
+            if (ret == NXT_ERROR) {
+                owned_b = b;
+                goto fail;
+            }
+
             nxt_buf_chain_add(&r->out, b);
             owned_b = NULL;
             last_b = NULL;
