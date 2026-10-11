@@ -728,10 +728,17 @@ def test_php_application_disable_functions_nonexistent():
     assert re.search(r'exec: \/\w+', body), 'disable_functions nonexistent exec'
 
 
-def test_php_application_disable_classes():
-    versions = option.available['modules'].get('php', [])
-    if versions and versions[0].split('.')[:2] >= ['8', '5']:
+def skip_without_disable_classes():
+    # The version this test runs on, not the first one installed: with
+    # several PHP modules the test is generated once per version.
+    version = client.get_application_type().partition(' ')[2]
+
+    if tuple(int(n) for n in re.findall(r'\d+', version)[:2]) >= (8, 5):
         pytest.skip('disable_classes removed in PHP 8.5')
+
+
+def test_php_application_disable_classes():
+    skip_without_disable_classes()
 
     client.load('date_time')
 
@@ -744,13 +751,11 @@ def test_php_application_disable_classes():
 
     assert not re.search(
         r'012345', client.get()['body']
-    ), 'disable_classes before'
+    ), 'disable_classes after'
 
 
 def test_php_application_disable_classes_user():
-    versions = option.available['modules'].get('php', [])
-    if versions and versions[0].split('.')[:2] >= ['8', '5']:
-        pytest.skip('disable_classes removed in PHP 8.5')
+    skip_without_disable_classes()
 
     client.load('date_time')
 
@@ -763,7 +768,7 @@ def test_php_application_disable_classes_user():
 
     assert not re.search(
         r'012345', client.get()['body']
-    ), 'disable_classes before'
+    ), 'disable_classes after'
 
 
 def test_php_application_error_log(findall, wait_for_record):

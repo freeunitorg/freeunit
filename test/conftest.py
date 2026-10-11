@@ -189,9 +189,11 @@ def pytest_generate_tests(metafunc):
         metafunc.fixturenames.append('tmp_ct')
         metafunc.parametrize('tmp_ct', versions)
 
+        # The key is the test's pytest id, "name[version]", which is what
+        # get_application_type() reads back from PYTEST_CURRENT_TEST.
         for version in versions:
             option.generated_tests[
-                f'{metafunc.function.__name__} [{version}]'
+                f'{metafunc.function.__name__}[{version}]'
             ] = f'{app_type} {version}'
 
     # take available module from option and generate tests for each version
