@@ -279,6 +279,9 @@ struct nxt_http_request_s {
     /* Set by nxt_http_comp_check_acceptable(), from mem_pool. */
     nxt_http_comp_ctx_t             *comp_ctx;
 
+    /* When a websocket frame first found the application queue full. */
+    nxt_msec_t                      ws_paused_at;
+
     nxt_http_status_t               status:16;
 
     uint8_t                         log_route;    /* 1 bit */
@@ -292,6 +295,7 @@ struct nxt_http_request_s {
     uint8_t                         logged;       /* 1 bit  */
     uint8_t                         header_sent;  /* 1 bit  */
     uint8_t                         inconsistent; /* 1 bit  */
+    uint8_t                         ws_paused;    /* 1 bit  */
     uint8_t                         truncated;    /* 1 bit  */
     uint8_t                         error;        /* 1 bit  */
     uint8_t                         websocket_handshake;  /* 1 bit */

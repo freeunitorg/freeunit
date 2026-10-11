@@ -12,6 +12,19 @@
 
 <change type="bugfix">
 <para>
+when the port queue of an application was full, the router closed a websocket
+connection with no CLOSE frame.  A full queue means that the application reads
+slower than the client sends, for example a message of many small frames.  The
+router now stops reading from the client and sends the frame again every 5 ms.
+When the application reads nothing for the websocket "read_timeout", the router
+closes the connection, as before.  The message that tells the application about
+the close was lost on a full queue, so the worker did not stop; it is now sent
+again until the queue takes it.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 on Linux with a 32-bit glibc, several source files had a 32-bit off_t, and the
 other files had a 64-bit off_t.  The files include a system header before
 nxt_unix.h, which sets _FILE_OFFSET_BITS: nxt_http_compression.c, nxt_zlib.c,
