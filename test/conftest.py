@@ -945,16 +945,20 @@ def _check_processes():
 
 @print_log_on_assert
 def _check_fds(*, log=None):
-    def waitforfds(diff):
+    def waitforfds(pid, base):
+        # The count and the descriptor kinds come from one listing, so the
+        # "+N fds" of a leak message matches the kinds that it names.
         for _ in range(600):
-            fds_diff = diff()
+            sample = _fd_targets(pid)
+            count = sample[0] if sample is not None else _count_fds(pid)
+            fds_diff = count - base
 
             if fds_diff <= option.fds_threshold:
                 break
 
             time.sleep(0.1)
 
-        return fds_diff
+        return fds_diff, sample[1] if sample is not None else []
 
     # The three processes share one network namespace: read its socket
     # tables once per check.
@@ -962,12 +966,10 @@ def _check_fds(*, log=None):
 
     ps = _fds_info['main']
     if not ps['skip']:
-        fds_diff = waitforfds(
-            lambda: _count_fds(unit_instance['pid']) - ps['fds']
-        )
+        fds_diff, targets = waitforfds(unit_instance['pid'], ps['fds'])
         ps['fds'] += fds_diff
         before, ps['kinds'] = ps['kinds'], _fd_kinds(
-            unit_instance['pid'], tables
+            unit_instance['pid'], tables, targets
         )
 
         assert fds_diff <= option.fds_threshold, _fd_leak(
@@ -983,9 +985,11 @@ def _check_fds(*, log=None):
         ps['pid'] = pid_by_name(ps['name'])
 
         if not ps['skip']:
-            fds_diff = waitforfds(lambda: _count_fds(ps['pid']) - ps['fds'])
+            fds_diff, targets = waitforfds(ps['pid'], ps['fds'])
             ps['fds'] += fds_diff
-            before, ps['kinds'] = ps['kinds'], _fd_kinds(ps['pid'], tables)
+            before, ps['kinds'] = ps['kinds'], _fd_kinds(
+                ps['pid'], tables, targets
+            )
 
             if not option.restart:
                 assert ps['pid'] == ps_pid, f'same pid {name}'
@@ -999,8 +1003,15 @@ def _check_fds(*, log=None):
 
 
 def _fd_baseline(ps, pid, tables=None):
-    ps['fds'] = _count_fds(pid)
-    ps['kinds'] = _fd_kinds(pid, tables)
+    sample = _fd_targets(pid)
+
+    if sample is None:
+        ps['fds'] = _count_fds(pid)
+        ps['kinds'] = Counter()
+        return
+
+    ps['fds'], targets = sample
+    ps['kinds'] = _fd_kinds(pid, tables, targets)
 
 
 _TCP_STATES = {
@@ -1015,6 +1026,7 @@ _TCP_STATES = {
     '09': 'last-ack',
     '0A': 'listen',
     '0B': 'closing',
+    '0C': 'new-syn-recv',
 }
 
 
@@ -1094,14 +1106,13 @@ def _fd_kind(target, sockets):
     )
 
 
-def _fd_kinds(pid, tables=None):
-    kinds = Counter()
-    procfile = Path(f'/proc/{pid}/fd')
-
+def _fd_targets(pid):
+    """Count the descriptors of a process and read their targets, from one
+    listing of /proc/<pid>/fd.  None when there is no such listing."""
     try:
-        fds = list(procfile.iterdir())
+        fds = list(Path(f'/proc/{pid}/fd').iterdir())
     except OSError:
-        return kinds
+        return None
 
     targets = []
 
@@ -1109,7 +1120,21 @@ def _fd_kinds(pid, tables=None):
         try:
             targets.append(os.readlink(fd))
         except OSError:
+            # The descriptor closed after the listing.  It still counts,
+            # as it does in _count_fds().
             pass
+
+    return len(fds), targets
+
+
+def _fd_kinds(pid, tables=None, targets=None):
+    kinds = Counter()
+
+    if targets is None:
+        sample = _fd_targets(pid)
+        if sample is None:
+            return kinds
+        targets = sample[1]
 
     sockets = (
         _socket_names(pid, tables)
