@@ -4,6 +4,7 @@ import re
 import shutil
 import socket
 import ssl
+import struct
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -1732,3 +1733,153 @@ def test_tls_handshake_bad_binder_log_level(temp_dir, wait_for_record, findall):
 
     assert wait_for_record(rf'\[info\].*{pattern}') is not None
     assert not findall(rf'\[alert\].*{pattern}')
+
+
+def tls_alert_in_handshake(alert):
+    # Stop the server in SSL_do_handshake() with a fatal alert from the
+    # client.  The alert goes before ChangeCipherSpec, so it is a plaintext
+    # record and needs no TLS stack on the client.  The server turns alert N
+    # into reason SSL_AD_REASON_OFFSET + N (1000 + N).
+
+    client.certificate()
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "routes",
+                    "tls": {"certificate": "default"},
+                }
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    ), 'load configuration'
+
+    def ext(ext_type, data):
+        length = len(data).to_bytes(2, 'big')
+        return ext_type.to_bytes(2, 'big') + length + data
+
+    # A TLS 1.2 ClientHello: no supported_versions extension, ECDHE and
+    # RSA key exchange suites for the RSA default certificate.
+    ciphers = b'\xc0\x2f\xc0\x13\x00\x9c\x00\x2f'
+    extensions = (
+        ext(0x000A, b'\x00\x04\x00\x1d\x00\x17')  # x25519, secp256r1
+        + ext(0x000B, b'\x01\x00')  # uncompressed points
+        + ext(0x000D, b'\x00\x04\x08\x04\x04\x01')  # rsa_pss, rsa_pkcs1
+    )
+    body = (
+        b'\x03\x03'
+        + os.urandom(32)
+        + b'\x00'
+        + len(ciphers).to_bytes(2, 'big')
+        + ciphers
+        + b'\x01\x00'
+        + len(extensions).to_bytes(2, 'big')
+        + extensions
+    )
+    hello = b'\x01' + len(body).to_bytes(3, 'big') + body
+    record = b'\x16\x03\x01' + len(hello).to_bytes(2, 'big') + hello
+
+    def recv_exact(sock, n):
+        data = b''
+
+        while len(data) < n:
+            chunk = sock.recv(n - len(data))
+            assert chunk, 'connection closed in the first flight'
+            data += chunk
+
+        return data
+
+    with socket.create_connection(
+        ('127.0.0.1', port_map.port(8080)), timeout=5
+    ) as sock:
+        sock.sendall(record)
+
+        # Read the first flight up to ServerHelloDone, so that the server
+        # waits for the next client flight when the alert comes.
+        handshake = b''
+        done = False
+
+        while not done:
+            rtype, _, length = struct.unpack('!BHH', recv_exact(sock, 5))
+            payload = recv_exact(sock, length)
+
+            assert rtype == 0x16, f'record type {rtype} in the first flight'
+
+            handshake += payload
+
+            while len(handshake) >= 4:
+                mlen = int.from_bytes(handshake[1:4], 'big')
+
+                if len(handshake) < 4 + mlen:
+                    break
+
+                done = done or handshake[0] == 14  # ServerHelloDone
+                handshake = handshake[4 + mlen :]
+
+        sock.sendall(b'\x15\x03\x03\x00\x02\x02' + bytes([alert]))
+
+        try:
+            while sock.recv(1024):
+                pass
+        except OSError:
+            pass
+
+
+@pytest.mark.parametrize(
+    'alert, text',
+    [
+        (10, 'unexpected message'),
+        (20, 'bad record mac'),
+        (21, 'decryption failed'),
+        (22, 'record overflow'),
+        (30, 'decompression failure'),
+        (40, 'handshake failure'),
+        (47, 'illegal parameter'),
+        (110, 'unsupported extension'),
+        (112, 'unrecognized name'),
+    ],
+)
+def test_tls_handshake_alert_info_log_level(
+    alert, text, findall, wait_for_record
+):
+    # nxt_openssl_log_error_level() logs an alert from the peer at info in
+    # two ways.  Alerts 10, 20, 21, 22, 30, 40 and 47 (reasons 1010 to 1047)
+    # are in the explicit info list.  unsupported_extension (110) and
+    # unrecognized_name (112), reasons 1110 and 1112, are in no list: an
+    # alert in the 1000..1255 range that is not listed is the peer's
+    # decision and reaches info through the range default.
+    tls_alert_in_handshake(alert)
+
+    pattern = (
+        rf'SSL_do_handshake\(\d+\) failed \({1000 + alert}: [^)]*{text}\)'
+    )
+
+    assert wait_for_record(rf'\[info\].*{pattern}') is not None, 'info'
+    assert not findall(rf'\[alert\].*{pattern}'), 'no alert'
+
+
+# The alerts listed at err in nxt_openssl_log_error_level(): the
+# certificate alerts (bad_certificate is 42) and the others that point at
+# the server's setup.  None of them may fall into the info default of the
+# alert range.
+#
+# The source guards 1111, 1113 and 1114 with #ifdef.  On a library that
+# does not define SSL_R_TLSV1_CERTIFICATE_UNOBTAINABLE,
+# SSL_R_TLSV1_BAD_CERTIFICATE_STATUS_RESPONSE or
+# SSL_R_TLSV1_BAD_CERTIFICATE_HASH_VALUE, that reason reaches the range
+# default and logs at info, so the 111, 113 or 114 case fails there
+# although the code is correct.
+@pytest.mark.parametrize(
+    'alert',
+    [41, 42, 43, 44, 45, 46, 48, 49, 50, 51, 60, 70, 71, 80, 90, 100]
+    + [111, 113, 114],
+)
+def test_tls_handshake_alert_err_log_level(alert, findall, wait_for_record):
+    tls_alert_in_handshake(alert)
+
+    pattern = rf'SSL_do_handshake\(\d+\) failed \({1000 + alert}: '
+
+    assert wait_for_record(rf'\[error\].*{pattern}') is not None, 'error'
+    assert not findall(rf'\[info\].*{pattern}'), 'no info'
