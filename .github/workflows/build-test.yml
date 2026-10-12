@@ -1210,17 +1210,35 @@ jobs:
 
       # -fno-sanitize-recover: the first UBSan report fails the job.
       # nxt_conf_map_object_test fails only under UBSan.
-      - name: Configure unit (ASan+LSan+UBSan, --tests)
+      - name: Configure unit (ASan+LSan+UBSan, --tests, --openssl)
         run: |
           ./configure \
             --cc=clang \
             --debug \
             --tests \
+            --openssl \
             --cc-opt="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g" \
             --ld-opt="-fsanitize=address,undefined"
 
+      # The hook gate needs the plain objects as well as the instrumented ones:
+      # it compares X.o with X.test.o, and it checks the hook symbols against
+      # unitd, libnxt.a, libunit.a and nxt_unit.o.  "make tests" builds the
+      # instrumented archive only.
+      - name: Build unitd and libunit
+        run: |
+          make -j4
+          make -j4 build/lib/libunit.a
+
       - name: Build C tests
         run: make -j4 tests
+
+      # The gate derives the hook set from the difference between the two
+      # objects, so it depends on what the optimizer inlines away.  This leg is
+      # the only --debug build of the C suite: c-tests, c-tests-almalinux8 and
+      # hardening-strict-fedora are release builds.  --openssl above is what
+      # puts nxt_openssl.c and its hooks in the set.
+      - name: Check the test hooks are in the test programs only
+        run: .github/scripts/check-test-hooks.sh
 
       # sudo for the same reason as c-tests above: the clone creds cases
       # need real root. Running as root does not disable LeakSanitizer --
