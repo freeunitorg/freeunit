@@ -95,7 +95,7 @@ static void nxt_h1p_idle_response_timeout(nxt_task_t *task, void *obj,
     void *data);
 static nxt_msec_t nxt_h1p_idle_response_timer_value(nxt_conn_t *c,
     uintptr_t data);
-static void nxt_h1p_shutdown(nxt_task_t *task, nxt_conn_t *c);
+void nxt_h1p_shutdown(nxt_task_t *task, nxt_conn_t *c);
 static void nxt_h1p_closing(nxt_task_t *task, nxt_conn_t *c);
 static void nxt_h1p_conn_ws_shutdown(nxt_task_t *task, void *obj, void *data);
 static void nxt_h1p_conn_closing(nxt_task_t *task, void *obj, void *data);
@@ -504,20 +504,23 @@ nxt_h1p_idle_io_read_handler(nxt_task_t *task, nxt_conn_t *c)
 static void
 nxt_h1p_conn_proto_init(nxt_task_t *task, void *obj, void *data)
 {
-    nxt_conn_t     *c;
-    nxt_h1proto_t  *h1p;
+    nxt_conn_t      *c;
+    nxt_h1p_slot_t  *slot;
+    nxt_h1proto_t   *h1p;
 
     c = obj;
 
     nxt_debug(task, "h1p conn proto init");
 
-    h1p = nxt_mp_zget(c->mem_pool, sizeof(nxt_h1proto_t));
-    if (nxt_slow_path(h1p == NULL)) {
+    slot = nxt_mp_zget(c->mem_pool, sizeof(*slot));
+    if (nxt_slow_path(slot == NULL)) {
         nxt_h1p_closing(task, c);
         return;
     }
 
-    c->socket.data = h1p;
+    h1p = &slot->h1p;
+    slot->owner = c;
+    c->socket.data = slot;
     h1p->conn = c;
 
     nxt_h1p_conn_request_init(task, c, h1p);
@@ -1250,7 +1253,13 @@ nxt_h1p_conn_continue_sent(nxt_task_t *task, void *obj, void *data)
      * timer.  Thus the body_min_rate time starts again here.  The time
      * when the 100 waited for space in the send buffer is not counted.
      */
-    h1p = c->socket.data;
+    h1p = nxt_h1p_from_conn(c);
+
+    if (nxt_slow_path(h1p == NULL)) {
+        nxt_h1p_shutdown(task, c);
+        return;
+    }
+
     h1p->body_rate_start = engine->timers.now;
 
     c->read_state = &nxt_h1p_read_body_state;
@@ -1783,8 +1792,20 @@ nxt_h1p_complete_buffers(nxt_task_t *task, nxt_h1proto_t *h1p, nxt_bool_t all)
 
     nxt_debug(task, "h1p complete buffers");
 
-    b = h1p->buffers;
     c = h1p->conn;
+
+    if (nxt_slow_path(c == NULL)) {
+        /*
+         * Not a h1proto of a live connection: the socket.data slot can hold
+         * a peer object, and a h1proto whose connection is already gone has
+         * no buffers left to complete.  Reading c->read here is the crash
+         * this guards against -- a read of nxt_conn_t.read (0x50 on LP64)
+         * with a valid object pointer and a zero conn.
+         */
+        return;
+    }
+
+    b = h1p->buffers;
     in = c->read;
 
     if (b != NULL) {
@@ -2144,9 +2165,9 @@ nxt_h1p_send_rate_check(nxt_task_t *task, nxt_conn_t *c)
     nxt_socket_conf_t   *skcf;
     nxt_http_request_t  *r;
 
-    h1p = c->socket.data;
+    h1p = nxt_h1p_from_conn(c);
 
-    if (!h1p->send_rate_on) {
+    if (nxt_slow_path(h1p == NULL || !h1p->send_rate_on)) {
         return 0;
     }
 
@@ -2244,7 +2265,13 @@ nxt_h1p_request_timedout(nxt_task_t *task, nxt_conn_t *c)
      */
     c->socket.timedout = 0;
 
-    h1p = c->socket.data;
+    h1p = nxt_h1p_from_conn(c);
+
+    if (nxt_slow_path(h1p == NULL)) {
+        nxt_h1p_shutdown(task, c);
+        return;
+    }
+
     h1p->keepalive = 0;
     r = h1p->request;
 
@@ -2269,7 +2296,13 @@ nxt_h1p_conn_request_send_timeout(nxt_task_t *task, void *obj, void *data)
 
     c = nxt_write_timer_conn(timer);
     c->block_write = 1;
-    h1p = c->socket.data;
+
+    h1p = nxt_h1p_from_conn(c);
+
+    if (nxt_slow_path(h1p == NULL)) {
+        nxt_h1p_shutdown(task, c);
+        return;
+    }
 
     nxt_h1p_request_error(task, h1p, h1p->request);
 }
@@ -2278,9 +2311,25 @@ nxt_h1p_conn_request_send_timeout(nxt_task_t *task, void *obj, void *data)
 nxt_msec_t
 nxt_h1p_conn_request_timer_value(nxt_conn_t *c, uintptr_t data)
 {
-    nxt_h1proto_t  *h1p;
+    nxt_h1proto_t            *h1p;
+    nxt_socket_conf_joint_t  *joint;
 
-    h1p = c->socket.data;
+    h1p = nxt_h1p_from_conn(c);
+
+    if (nxt_slow_path(h1p == NULL)) {
+        /*
+         * The h1proto is gone, so its request is too.  The value comes from
+         * the configuration the connection was accepted under; a zero would
+         * make an autoreset timer fire in a loop.
+         */
+        joint = (c->listen != NULL) ? c->listen->socket.data : NULL;
+
+        if (nxt_slow_path(joint == NULL)) {
+            return 1;
+        }
+
+        return nxt_value_at(nxt_msec_t, joint->socket_conf, data);
+    }
 
     return nxt_value_at(nxt_msec_t, h1p->request->conf->socket_conf, data);
 }
@@ -2627,7 +2676,7 @@ nxt_h1p_idle_response_timer_value(nxt_conn_t *c, uintptr_t data)
 }
 
 
-static void
+void
 nxt_h1p_shutdown(nxt_task_t *task, nxt_conn_t *c)
 {
     nxt_timer_t    *timer;
@@ -2635,7 +2684,7 @@ nxt_h1p_shutdown(nxt_task_t *task, nxt_conn_t *c)
 
     nxt_debug(task, "h1p shutdown");
 
-    h1p = c->socket.data;
+    h1p = nxt_h1p_from_conn(c);
 
     if (h1p != NULL) {
         nxt_h1p_complete_buffers(task, h1p, 1);
