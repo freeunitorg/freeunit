@@ -12,6 +12,17 @@
 
 <change type="bugfix">
 <para>
+the control API accepted a compression "level" out of the range of an
+integer, such as 2147483648.  The router then did not apply the "compression"
+block, and compression was off for the whole configuration.  Such a number is
+now refused.  A stored configuration with it still loads, with a warning, and
+compression stays off.  The control API refuses other updates until the
+"level" is corrected.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 when the port queue of an application was full, the router closed a websocket
 connection with no CLOSE frame.  A full queue means that the application reads
 slower than the client sends, for example a message of many small frames.  The

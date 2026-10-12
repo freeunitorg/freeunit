@@ -159,6 +159,8 @@ static nxt_int_t nxt_conf_vldt_compressors(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_compression(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value);
+static nxt_int_t nxt_conf_vldt_compression_level(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_compression_encoding(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_routes(nxt_conf_validation_t *vldt,
@@ -558,6 +560,7 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_compressor_members[] = {
     }, {
         .name       = nxt_string("level"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_compression_level,
     }, {
         .name       = nxt_string("min_length"),
         .type       = NXT_CONF_VLDT_INTEGER,
@@ -2944,6 +2947,40 @@ nxt_conf_vldt_restored_range(nxt_conf_validation_t *vldt, const char *name,
     vldt->pointer = pointer;
 
     return NXT_OK;
+}
+
+
+/*
+ * The "level" of a compressor is mapped with NXT_CONF_MAP_INT.  The router
+ * does not check the result of nxt_http_comp_compression_init(), so a
+ * number out of the range of an int turned compression off for the whole
+ * configuration.  A number in the range but not supported by the encoder
+ * is replaced with its default level, with a notice in the log, when the
+ * router applies the configuration.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_compression_level(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    double  num;
+
+    num = nxt_conf_get_number(value);
+
+    if (num >= -(double) NXT_INT32_T_MAX - 1 && num <= NXT_INT32_T_MAX) {
+        return NXT_OK;
+    }
+
+    if (!vldt->restored) {
+        return nxt_conf_vldt_error(vldt, "The \"level\" number must be "
+                                   "between %d and %d.",
+                                   -NXT_INT32_T_MAX - 1, NXT_INT32_T_MAX);
+    }
+
+    return nxt_conf_vldt_restored_range(vldt, "level",
+                                        -(int64_t) NXT_INT32_T_MAX - 1,
+                                        NXT_INT32_T_MAX,
+                                        "compression is off");
 }
 
 
