@@ -81,41 +81,44 @@ appeared in 1.19.0.
 
 <change type="bugfix">
 <para>
-on 32-bit platforms, the "min_length" option of a compressor did not work.  On
-little-endian platforms, such as x86, armv7 and armhf, a response shorter than
-"min_length" was compressed, and a client that refused identity got the
-compressed response instead of a 406.  On big-endian platforms, a compressor
-with "min_length" compressed no response shorter than 4 GiB.  The bug had
-appeared in 1.35.0.
+the control API accepted a listener with neither "pass" nor "application".  The
+router then refused the configuration, and the client got 500 "Failed to apply
+new configuration."  with only "failed to apply new conf" in the log.  The
+control API now answers 400 and names the listener.  The router log also names
+it.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
-the control API accepted a listener with neither "pass" nor "application",
-and the router then refused the configuration with 500.
-</para>
-</change>
-
-<change type="bugfix">
-<para>
-on macOS with 16 KiB pages, every request to an application failed with
-"incoming_mmap: unexpected segment size".
+on macOS with 16 KiB pages, every request to an application failed.  The
+application logged "incoming_mmap: unexpected segment size: 10502144 !=
+10489856" and exited.  macOS rounds a shared memory segment up to a whole page,
+and 1.37.0 required the exact size.  A larger segment is now accepted.  A
+shorter one is still refused.  The check in the application appeared in 1.37.0.
+The same check in the router appeared in 1.36.1 and dropped larger application
+responses on macOS.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
 with OpenTelemetry, the inbound "traceparent" was ignored when the request
-header arrived in more than one read; the span of a request that fails before
-it is complete had no request attributes.
+header arrived in more than one read.  The span started after the first read,
+before the header was parsed, so it got a new trace ID.  The span now starts
+after the whole header is parsed, with the arrival of the request as its start
+time.  The span of a request that fails before it is complete, such as a 400 or
+a 408, now has the request attributes.  The bug had appeared in 1.34.0.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
 with "chunked_transform", a valid chunked request body got 400 when a read
-ended right after the data of a chunk, before the CRLF after it.
+ended right after the data of a chunk, before the CRLF after it.  The data
+stayed in the read buffer, and the next read was parsed after it.  So the
+result depended on how the client's writes reached the server.  The bug had
+appeared in 1.35.5.
 </para>
 </change>
 
@@ -125,7 +128,8 @@ unitd did not load the stored configuration when the "version" file in the
 state directory ended with a line end, as "echo 13700 > version" and most
 editors write it.  It logged "invalid version string" and started with no
 configuration.  A line end, a space or a tab after the number is now ignored.
-Any other content is still an error.  The bug had appeared in 1.26.0.
+Any other content is still an error.  unitd itself writes the file with no line
+end.  The bug had appeared in 1.26.0.
 </para>
 </change>
 
@@ -196,12 +200,15 @@ request.  The bug had appeared in 1.16.0.
 <change type="bugfix">
 <para>
 the control API accepted any integer for the timeouts in "settings/http", in
-"settings/http/websocket" and for "timeout" in "limits" of an application.
-They are now refused out of the range 0 to 2147483 seconds.  A stored
-configuration with such a value still loads, with a warning.  Numbers out of
-the range of an integer option now fail the configuration instead of giving
-an undefined value.  "requests" in "limits" and "thread_stack_size" are now
-refused above 2147483647, and "requests" below 0.
+"settings/http/websocket" and for "timeout" in "limits" of an application.  A
+negative timeout had no defined value.  A timeout above 2147483 seconds fired
+at once.  They are now refused out of the range 0 to 2147483 seconds, as
+"start_timeout" is.  A stored configuration with such a value still loads, with
+a warning, and the timer fires at once, as a negative value did before on x86.
+Numbers out of the range of an integer option now fail the configuration
+instead of giving an undefined value.  "requests" in "limits" and
+"thread_stack_size" are now refused above 2147483647, and "requests" below 0.
+See https://github.com/freeunitorg/freeunit/issues/619.
 </para>
 </change>
 
@@ -217,9 +224,24 @@ clang were not affected.  The bug had appeared in 1.36.0.
 <change type="bugfix">
 <para>
 an application worker whose WHOAMI the main process refused was not told so.
-It waited for ever and stayed alive until its prototype quit.  On Linux, the
-worker now logs "WHOAMI failed, exiting" and exits, and main logs the reason.
-On other platforms a refused worker still waits, as before.
+It waited for a reply for ever and stayed alive until its prototype quit.  This
+happens when a host pid is reused while main still has the record of the old
+worker.  On Linux, main now answers a refused WHOAMI with an error, and also
+when it cannot send the reply to an accepted one.  The worker logs "WHOAMI
+failed, exiting" and exits, and main logs the reason.  On other platforms a
+refused worker still waits, as before.  Main also refuses a WHOAMI for a record
+that is still linked to a prototype.  The bug had appeared in 1.37.0.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+on 32-bit platforms, the "min_length" option of a compressor did not work.  On
+little-endian platforms, such as x86, armv7 and armhf, a response shorter than
+"min_length" was compressed, and a client that refused identity got the
+compressed response instead of a 406.  On big-endian platforms, a compressor
+with "min_length" compressed no response shorter than 4 GiB.  The bug had
+appeared in 1.35.0.
 </para>
 </change>
 
@@ -235,8 +257,9 @@ used only its low byte: 265 became 9, with no notice.  The bug had appeared in
 
 <change type="change">
 <para>
-a TLS connection that fails because of what the client sent is now logged
-at "info" instead of "alert".
+a TLS connection that fails because of what the client sent is now logged at
+"info" instead of "alert".  This covers an old protocol version, an unsupported
+key share or signature algorithm, and most alerts from the client.
 </para>
 </change>
 
