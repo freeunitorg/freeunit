@@ -2035,6 +2035,38 @@ nxt_openssl_log_error_level(nxt_err_t err)
 }
 
 
+#if (NXT_TESTS)
+
+/*
+ * Returns the level that nxt_openssl_log_error_level() gives to an SSL error
+ * with this reason, for src/test/nxt_openssl_log_level_test.c.  A peer can
+ * send only alert codes 0 to 255, so a reason outside the alert range cannot
+ * come over the wire.
+ */
+
+nxt_uint_t
+nxt_openssl_test_log_level(int reason)
+{
+    nxt_uint_t  level;
+
+    ERR_clear_error();
+
+#ifdef ERR_raise
+    ERR_raise(ERR_LIB_SSL, reason);
+#else
+    ERR_put_error(ERR_LIB_SSL, 0, reason, __FILE__, __LINE__);
+#endif
+
+    level = nxt_openssl_log_error_level(0);
+
+    ERR_clear_error();
+
+    return level;
+}
+
+#endif
+
+
 void nxt_cdecl
 nxt_openssl_log_error(nxt_task_t *task, nxt_uint_t level, const char *fmt, ...)
 {

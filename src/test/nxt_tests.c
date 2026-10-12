@@ -471,6 +471,10 @@ main(int argc, char **argv)
     if (nxt_openssl_server_init_test(thr) != NXT_OK) {
         return 1;
     }
+
+    if (nxt_openssl_log_level_test(thr) != NXT_OK) {
+        return 1;
+    }
 #endif
 
 #if (NXT_HAVE_CGROUP)
