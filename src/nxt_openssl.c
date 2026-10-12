@@ -1807,7 +1807,9 @@ nxt_openssl_log_error_level(nxt_err_t err)
      * (key share, signature algorithm, version too low, unsupported protocol)
      * are what internet scanners trigger most.  A TLS 1.3 resumption with a
      * binder that does not verify (253) is not in nginx's list; the binder
-     * comes from the client, so it is listed here too.
+     * comes from the client, so it is listed here too.  The same holds for
+     * a TLS 1.3 key share without the supported groups extension (209):
+     * RFC 8446 requires the extension, and only the client can omit it.
      *
      * Three reasons are left out on purpose, so they reach the default
      * branch below and log at alert.  In Unit, all three point at the
@@ -1892,6 +1894,9 @@ nxt_openssl_log_error_level(nxt_err_t err)
 #endif
 #ifdef SSL_R_INVALID_ALERT
     case SSL_R_INVALID_ALERT:                             /*  205 */
+#endif
+#ifdef SSL_R_MISSING_SUPPORTED_GROUPS_EXTENSION
+    case SSL_R_MISSING_SUPPORTED_GROUPS_EXTENSION:        /*  209 */
 #endif
     case SSL_R_RECORD_LENGTH_MISMATCH:                    /*  213 */
 #ifdef SSL_R_PARSE_TLSEXT

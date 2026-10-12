@@ -1663,6 +1663,70 @@ def test_tls_handshake_old_version_log_level(wait_for_record, findall):
     assert not findall(rf'\[alert\].*{pattern}')
 
 
+def test_tls_handshake_no_supported_groups_log_level(wait_for_record, findall):
+    client.certificate()
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "routes",
+                    "tls": {"certificate": "default"},
+                }
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    ), 'load application configuration'
+
+    # A TLS 1.3 ClientHello with a key share and no supported_groups
+    # extension, which RFC 8446 requires.  OpenSSL refuses it with
+    # "missing supported groups extension" (209): the client left the
+    # extension out, so the router logs it at info, not alert.
+    def ext(kind, data):
+        return kind.to_bytes(2, 'big') + len(data).to_bytes(2, 'big') + data
+
+    share = b'\x00\x1d' + (32).to_bytes(2, 'big') + os.urandom(32)
+    sigalgs = b'\x04\x03\x08\x04\x04\x01'
+    exts = (
+        ext(0x002B, b'\x02\x03\x04')  # supported_versions: TLS 1.3
+        + ext(0x000D, len(sigalgs).to_bytes(2, 'big') + sigalgs)
+        + ext(0x0033, len(share).to_bytes(2, 'big') + share)  # key_share
+    )
+    ciphers = b'\x13\x01\x13\x02'
+    body = (
+        b'\x03\x03'
+        + os.urandom(32)
+        + b'\x00'
+        + len(ciphers).to_bytes(2, 'big')
+        + ciphers
+        + b'\x01\x00'
+        + len(exts).to_bytes(2, 'big')
+        + exts
+    )
+    handshake = b'\x01' + len(body).to_bytes(3, 'big') + body
+    record = b'\x16\x03\x01' + len(handshake).to_bytes(2, 'big') + handshake
+
+    with socket.create_connection(
+        ('127.0.0.1', port_map.port(8080)), timeout=5
+    ) as sock:
+        sock.sendall(record)
+        try:
+            sock.recv(1024)
+        except OSError:
+            pass
+
+    pattern = r'SSL_do_handshake.*missing supported groups extension'
+
+    # LibreSSL has no reason 209 and refuses the hello for another reason.
+    assert wait_for_record(r'SSL_do_handshake') is not None
+    if not findall(pattern):
+        pytest.skip('the TLS library has no "missing supported groups"')
+
+    assert findall(rf'\[info\].*{pattern}')
+    assert not findall(rf'\[alert\].*{pattern}')
+
+
 def test_tls_handshake_bad_binder_log_level(temp_dir, wait_for_record, findall):
     client.certificate()
 
