@@ -559,6 +559,20 @@ only one of two descriptors.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+the router could crash while it completed the buffers of a request whose
+connection was already gone.  The function that completes them takes the
+connection from the h1proto object it is given and read the connection's input
+buffer through it without checking that the object was a h1proto of a live
+connection.  The socket.data slot that carries a h1proto also holds the peer of
+a proxied request, and a h1proto whose connection is gone has a zero conn, so
+an object that was neither reached the read with a zero connection: a read of
+address 0x50.  The slot is now read as a h1proto only when the object points
+back at the connection, and the completion path leaves a zero connection alone.
+</para>
+</change>
+
 </changes>
 
 

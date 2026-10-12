@@ -179,6 +179,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_base64_test.c \
     src/test/nxt_string_test.c \
     src/test/nxt_buf_test.c \
+    src/test/nxt_h1proto_conn_test.c \
     src/test/nxt_http_chunk_parse_test.c \
     src/test/nxt_http_validate_host_test.c \
     src/test/nxt_http_request_body_alloc_test.c \
