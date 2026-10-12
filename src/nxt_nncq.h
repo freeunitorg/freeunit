@@ -102,8 +102,13 @@ nxt_nncq_init(nxt_nncq_t volatile *q)
 }
 
 
+/*
+ * Puts "val" at the tail and stores in "*pos" the tail value that the item
+ * took.  The head passes "*pos" when the item is taken.
+ */
 static inline nxt_int_t
-nxt_nncq_enqueue(nxt_nncq_t volatile *q, nxt_nncq_atomic_t val)
+nxt_nncq_enqueue_pos(nxt_nncq_t volatile *q, nxt_nncq_atomic_t val,
+    nxt_nncq_atomic_t *pos)
 {
     nxt_nncq_cycle_t   e_cycle, t_cycle;
     nxt_nncq_atomic_t  n, t, e, j, r;
@@ -130,11 +135,22 @@ nxt_nncq_enqueue(nxt_nncq_t volatile *q, nxt_nncq_atomic_t val)
         if (nxt_atomic_cmp_set(&q->entries[j], e, n)) {
             nxt_nncq_tail_cmp_inc(q, t);
 
+            *pos = t;
+
             return NXT_OK;
         }
     }
 
     return NXT_ERROR;
+}
+
+
+static inline nxt_int_t
+nxt_nncq_enqueue(nxt_nncq_t volatile *q, nxt_nncq_atomic_t val)
+{
+    nxt_nncq_atomic_t  pos;
+
+    return nxt_nncq_enqueue_pos(q, val, &pos);
 }
 
 
