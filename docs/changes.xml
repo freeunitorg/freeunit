@@ -292,6 +292,15 @@ and calls the component API no longer loads.  The wasm-wasi-component module
 is not affected.
 </para>
 </change>
+<change type="bugfix">
+<para>
+a PUT of an application configuration bigger than about 64 KiB never got an
+answer, and later control requests hung too.  The router sent the first 64 KiB
+of the message to main and queued the rest, but did not ask to be woken up to
+send it.  The bug came from NGINX Unit.
+</para>
+</change>
+
 
 </changes>
 

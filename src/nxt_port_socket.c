@@ -1273,6 +1273,37 @@ next_fragment:
                         msg = qmsg;
 
                         use_delta++;
+
+                        /*
+                         * Only the inline call gets here: a message from
+                         * the queue has msg->link.next set.  The rest of
+                         * the message now waits in port->messages, and only
+                         * the write handler sends it.  The socket did not
+                         * return EAGAIN, so no edge from the peer will bring
+                         * that handler back if the event is not armed: a
+                         * disabled event has no write interest, and with
+                         * EPOLLET a socket that stays writable gives no
+                         * later edge.
+                         * Without a re-arm, a message bigger than
+                         * port->max_share stops after its first fragments,
+                         * and every later message on the port waits behind
+                         * it.
+                         *
+                         * Re-arm even if the event looks active.  The write
+                         * handler can be on port->engine now, between
+                         * finding the queue empty and disabling the event;
+                         * the test of the event state below would then see
+                         * it active and skip the re-arm, and the disable
+                         * would strand the rest of the message.
+                         * nxt_port_rearm() posts to port->engine, so the
+                         * re-arm runs after that disable.  On port->engine
+                         * itself no handler can run in between, and the
+                         * re-arm of an active event costs one epoll_ctl().
+                         */
+
+                        enable_write = 1;
+
+                        break;
                     }
 
                 } else {

@@ -207,6 +207,12 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        than FreeUnit that links that file and calls the component API no
        longer loads. The wasm-wasi-component module is not affected.
 
+    *) Bugfix: a PUT of an application configuration bigger than about
+       64 KiB never got an answer, and later control requests hung too.
+       The router sent the first 64 KiB of the message to main and queued
+       the rest, but did not ask to be woken up to send it. The bug came
+       from NGINX Unit.
+
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 

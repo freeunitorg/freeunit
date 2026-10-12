@@ -457,6 +457,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_port_share_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     for (i = 0; i < nxt_nitems(nxt_security_tests); i++) {
         if (nxt_security_tests[i](thr) != NXT_OK) {
             return 1;
