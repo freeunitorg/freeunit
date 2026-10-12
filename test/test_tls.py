@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import shutil
 import socket
 import ssl
@@ -1657,6 +1658,77 @@ def test_tls_handshake_old_version_log_level(wait_for_record, findall):
             pass
 
     pattern = r'SSL_do_handshake.*(unsupported protocol|version too low|wrong version number)'
+
+    assert wait_for_record(rf'\[info\].*{pattern}') is not None
+    assert not findall(rf'\[alert\].*{pattern}')
+
+
+def test_tls_handshake_bad_binder_log_level(temp_dir, wait_for_record, findall):
+    client.certificate()
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "routes",
+                    "tls": {
+                        "certificate": "default",
+                        "session": {"cache_size": 10, "tickets": True},
+                    },
+                }
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    ), 'load application configuration'
+
+    # A TLS 1.3 resumption whose binder does not verify.  The client saves
+    # a session, one byte of its resumption secret is changed, and the
+    # client resumes with it.  The server refuses the binder (253): the
+    # client sent it, so the router logs it at info, not alert.
+    connect = f'127.0.0.1:{port_map.port(8080)}'
+    good = f'{temp_dir}/session.pem'
+    bad = f'{temp_dir}/session-bad.pem'
+
+    def s_client(*args):
+        return subprocess.run(
+            ['openssl', 's_client', '-connect', connect, '-tls1_3', '-ign_eof']
+            + list(args),
+            input=b'GET / HTTP/1.0\r\n\r\n',
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+
+    s_client('-sess_out', good)
+
+    text = subprocess.check_output(
+        ['openssl', 'sess_id', '-in', good, '-text', '-noout']
+    ).decode()
+    # LibreSSL labels the field "Master-Key" and does not resume TLS 1.3
+    # sessions with a PSK, so there is no binder to refuse.
+    m = re.search(r'Resumption PSK: ([0-9A-F]+)', text)
+    if m is None:
+        pytest.skip('the TLS library offers no TLS 1.3 resumption PSK')
+
+    psk = bytes.fromhex(m.group(1))
+
+    der = subprocess.check_output(
+        ['openssl', 'sess_id', '-in', good, '-outform', 'DER']
+    )
+    i = der.find(psk)
+    assert i > 0, 'resumption secret in the session'
+
+    der = der[:i] + bytes([der[i] ^ 1]) + der[i + 1 :]
+    subprocess.run(
+        ['openssl', 'sess_id', '-inform', 'DER', '-out', bad],
+        input=der,
+        check=True,
+    )
+
+    s_client('-sess_in', bad)
+
+    pattern = r'SSL_do_handshake.*binder does not verify'
 
     assert wait_for_record(rf'\[info\].*{pattern}') is not None
     assert not findall(rf'\[alert\].*{pattern}')

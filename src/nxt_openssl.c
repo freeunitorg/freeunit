@@ -1805,7 +1805,9 @@ nxt_openssl_log_error_level(nxt_err_t err)
      * Handshake and record failures caused by what the peer sent.  The list
      * follows ngx_ssl_connection_error() in nginx; the TLS 1.3 era reasons
      * (key share, signature algorithm, version too low, unsupported protocol)
-     * are what internet scanners trigger most.
+     * are what internet scanners trigger most.  A TLS 1.3 resumption with a
+     * binder that does not verify (253) is not in nginx's list; the binder
+     * comes from the client, so it is listed here too.
      *
      * Three reasons are left out on purpose, so they reach the default
      * branch below and log at alert.  In Unit, all three point at the
@@ -1905,6 +1907,9 @@ nxt_openssl_log_error_level(nxt_err_t err)
     case SSL_R_UNEXPECTED_RECORD:                         /*  245 */
     case SSL_R_UNKNOWN_ALERT_TYPE:                        /*  246 */
     case SSL_R_UNKNOWN_PROTOCOL:                          /*  252 */
+#ifdef SSL_R_BINDER_DOES_NOT_VERIFY
+    case SSL_R_BINDER_DOES_NOT_VERIFY:                    /*  253 */
+#endif
 #ifdef SSL_R_UNSUPPORTED_PROTOCOL
     case SSL_R_UNSUPPORTED_PROTOCOL:                      /*  258 */
 #endif
