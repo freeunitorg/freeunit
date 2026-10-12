@@ -232,6 +232,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_nncq_bound_test.c \
     src/test/nxt_size_bound_test.c \
     src/test/nxt_cpu_limit_test.c \
+    src/test/nxt_usdt_test.c \
 "
 
 

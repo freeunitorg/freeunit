@@ -5,6 +5,7 @@
  */
 
 #include <nxt_main.h>
+#include <nxt_usdt.h>
 
 #include <nxt_application.h>
 #include <nxt_cgroup.h>
@@ -798,6 +799,9 @@ nxt_process_create(nxt_task_t *task, nxt_process_t *process)
         return pid;
     }
 #endif
+
+    /* The global pid of the child, also with pid isolation. */
+    NXT_USDT(process__spawn, pid);
 
     process->pid = pid;
     process->isolated_pid = pid;

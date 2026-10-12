@@ -8,6 +8,7 @@
 #include <nxt_socket_msg.h>
 #include <nxt_port_queue.h>
 #include <nxt_port_memory_int.h>
+#include <nxt_usdt.h>
 
 
 #define NXT_PORT_MAX_ENQUEUE_BUF_SIZE \
@@ -396,6 +397,10 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
             }
 
             if (notify == 0) {
+                if (res == NXT_OK) {
+                    NXT_USDT(port__send, stream, type & NXT_PORT_MSG_MASK);
+                }
+
                 return res;
             }
 
@@ -486,6 +491,14 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
         }
 
         res = NXT_OK;
+    }
+
+    /*
+     * Only an accepted message fires.  The queue branch can turn msg into
+     * a READ_QUEUE marker, so the probe takes the arguments of the call.
+     */
+    if (res == NXT_OK) {
+        NXT_USDT(port__send, stream, type & NXT_PORT_MSG_MASK);
     }
 
     return res;
@@ -2756,6 +2769,10 @@ nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
 
                 b = fmsg->buf;
 
+                /* The last fragment: one probe for the whole message. */
+                NXT_USDT(port__recv, fmsg->port_msg.stream,
+                         fmsg->port_msg.type);
+
                 port->handler(task, fmsg);
 
                 /*
@@ -2829,6 +2846,8 @@ nxt_port_read_msg_process(nxt_task_t *task, nxt_port_t *port,
                     nxt_port_mmap_read(task, msg);
                     b = msg->buf;
                 }
+
+                NXT_USDT(port__recv, msg->port_msg.stream, msg->port_msg.type);
 
                 port->handler(task, msg);
             }

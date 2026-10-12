@@ -156,6 +156,13 @@ FreeUnit includes built-in OpenTelemetry support (compiled with `--otel`):
 }
 ```
 
+## USDT Probes
+
+`./configure --usdt` adds static probes for bpftrace, perf and SystemTap.
+They trace port messages, the app queue, process starts and requests.
+[docs/usdt.md](docs/usdt.md) lists them, and [tools/usdt/](tools/usdt/) has
+bpftrace scripts.
+
 ## WebAssembly
 
 FreeUnit supports running WebAssembly Components (WASI 0.2).

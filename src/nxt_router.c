@@ -24,6 +24,7 @@
 #include <nxt_span.h>
 #include <nxt_checked.h>
 #include <nxt_http_compression.h>
+#include <nxt_usdt.h>
 
 #if (NXT_HAVE_OTEL)
 #define NXT_OTEL_BATCH_DEFAULT     128
@@ -1357,6 +1358,9 @@ nxt_router_msg_retract(nxt_task_t *task, nxt_request_rpc_data_t *req_rpc_data)
                                  req_rpc_data->stream))
         {
             msg_info->cancel = NXT_MSG_RETRACTED;
+
+            NXT_USDT(queue__cancel, msg_info->tracking_cookie,
+                     req_rpc_data->stream);
 
             nxt_debug(task, "stream #%uD: cancelled by router",
                       req_rpc_data->stream);

@@ -1107,10 +1107,14 @@ jobs:
         timeout-minutes: 5
         run: |
           sudo apt-get -y update
-          sudo apt-get -y install build-essential libssl-dev libpcre2-dev
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev \
+            systemtap-sdt-dev
 
-      - name: Configure unit (--tests)
-        run: ./configure --openssl --tests
+      # --usdt is here because no other job compiles the probes.  The other
+      # C test jobs build without it, so nxt_usdt_test runs with and without
+      # the probes.
+      - name: Configure unit (--tests --usdt)
+        run: ./configure --openssl --tests --usdt
 
       - name: Build unitd and libunit
         run: |
@@ -1119,6 +1123,18 @@ jobs:
 
       - name: Build C tests
         run: make -j4 tests
+
+      # Every NXT_USDT() name in the source must be a probe note in unitd or
+      # libunit.a.  A probe in a language module needs its module added here.
+      - name: Check the USDT probes are in the build
+        run: |
+          src=$(grep -rhoE --exclude-dir=test --exclude=nxt_usdt.h \
+                  'NXT_USDT\([a-z_]+' src | sed 's/NXT_USDT(//' | sort -u)
+          bin=$(LC_ALL=C readelf -n build/sbin/unitd build/lib/libunit.a |
+                  sed -n 's/^ *Name: //p' | sort -u)
+          echo "$src"
+          test -n "$src"
+          test "$src" = "$bin"
 
       # The hooks (fault-injection branches and counters inside
       # "#if (NXT_TESTS)") must reach the test programs and nothing else.

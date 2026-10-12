@@ -8,6 +8,7 @@
 #include <nxt_http.h>
 #include <nxt_otel.h>
 #include <nxt_checked.h>
+#include <nxt_usdt.h>
 
 
 static void nxt_http_request_start(nxt_task_t *task, void *obj, void *data);
@@ -1222,6 +1223,9 @@ nxt_http_request_close_handler(nxt_task_t *task, void *obj, void *data)
     }
 
     nxt_debug(task, "http request close handler");
+
+    /* Every request ends here once.  Status 0: no response was sent. */
+    NXT_USDT(request__done, (uintptr_t) r, (nxt_int_t) r->status);
 
     r->proto.any = NULL;
 

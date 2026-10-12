@@ -249,6 +249,14 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        the memory of the request was not freed. The bug had appeared in
        1.29.0.
 
+    *) Feature: the --usdt configure option adds static USDT probes for
+       bpftrace, perf and SystemTap, with the provider "freeunit". They
+       trace port messages, the app queue, process starts and the start and
+       end of each request. docs/usdt.md lists them, and tools/usdt/ has two
+       bpftrace scripts. A build with the option needs sys/sdt.h. Each probe
+       is a nop until a tracer attaches. Without the option, the probes are
+       not in the build.
+
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 

@@ -10,6 +10,7 @@
 #include "nxt_socket_msg.h"
 #include "nxt_port_queue.h"
 #include "nxt_app_queue.h"
+#include "nxt_usdt.h"
 
 #include "nxt_unit.h"
 #include "nxt_unit_request.h"
@@ -8890,6 +8891,8 @@ retry:
         port_msg = (nxt_port_msg_t *) rbuf->buf;
 
         if (nxt_app_queue_cancel(queue, cookie, port_msg->stream)) {
+            NXT_USDT(queue__dequeue, cookie, port_msg->stream);
+
             lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
 
             if (lib->request_limit != 0) {

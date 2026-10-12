@@ -8,6 +8,7 @@
 
 
 #include <nxt_app_nncq.h>
+#include <nxt_usdt.h>
 
 
 /* Using Numeric Naive Circular Queue as a backend. */
@@ -75,7 +76,12 @@ nxt_app_queue_send(nxt_app_queue_t volatile *q, const void *p,
     qi->tracking = tracking;
     *cookie = i;
 
+    /* Before the enqueue: a worker can dequeue as soon as the slot is in. */
+    NXT_USDT(queue__enqueue, i, tracking);
+
     if (nxt_slow_path(nxt_app_nncq_enqueue(&q->queue, i) != NXT_OK)) {
+        NXT_USDT(queue__enqueue__fail, i, tracking);
+
         (void) nxt_app_nncq_enqueue(&q->free_items, i);
 
         return NXT_ERROR;

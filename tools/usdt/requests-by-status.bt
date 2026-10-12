@@ -1,0 +1,36 @@
+#!/usr/bin/env bpftrace
+/*
+ * Copyright (C) FreeUnit contributors.
+ *
+ * Requests by status, latency by status, and requests in flight.
+ *   bpftrace tools/usdt/requests-by-status.bt <path to unitd>
+ * @inflight is a sum() because the probes fire on many CPUs at once.
+ */
+
+usdt:$1:freeunit:request__start
+{
+    @req_start[arg0] = nsecs;
+    @inflight = sum(1);
+}
+
+usdt:$1:freeunit:request__done
+{
+    @by_status[arg1] = count();
+
+    if (@req_start[arg0]) {
+        @latency_by_status_ns[arg1] = hist(nsecs - @req_start[arg0]);
+        delete(@req_start[arg0]);
+        @inflight = sum(-1);
+    }
+}
+
+interval:s:10
+{
+    print(@by_status);
+    print(@inflight);
+}
+
+END
+{
+    clear(@req_start);
+}
