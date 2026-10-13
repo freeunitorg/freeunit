@@ -1417,14 +1417,17 @@ next_fragment:
 
                         /*
                          * Leave the loop the ordinary way instead of raising
-                         * the error handler.  The socket is alive, and the
-                         * ordinary exit re-arms the write event that
-                         * nxt_socketpair_send() just cleared.  Without that
-                         * re-arm, everything queued on this port from here
-                         * on -- including work another thread inserted
-                         * during this send -- would wait for a writable
-                         * event that never comes.
+                         * the error handler, and re-arm.  The socket is
+                         * alive.  nxt_socketpair_send() set write_ready to
+                         * 0, so from here on nxt_port_msg_chk_insert()
+                         * queues what other threads send, and only the
+                         * write handler sends it.  Without a re-arm, that
+                         * work would wait for a writable event that never
+                         * comes.  Re-arm even if the event looks active,
+                         * for the reason given below.
                          */
+
+                        enable_write = 1;
 
                         break;
                     }
@@ -1437,6 +1440,37 @@ next_fragment:
                 msg = qmsg;
 
                 use_delta++;
+
+                /*
+                 * Only the inline call gets here: a message from the queue
+                 * has msg->link.next set.  The message now waits in
+                 * port->messages, and only the write handler sends it.
+                 *
+                 * EAGAIN does not keep the write event armed.
+                 * nxt_socketpair_send() sets only write_ready to 0; it does
+                 * not change the event state.  The edge that comes when the
+                 * peer reads reaches the handler only while the event has
+                 * write interest.  nxt_port_fd_disable_write() removes that
+                 * interest, and with EPOLLET a later readiness gives no
+                 * edge.  After ENOBUFS or ENOMEM the socket is not full, and
+                 * no edge comes at all.
+                 *
+                 * So re-arm even if the event looks active, as on the
+                 * max_share exit above.  The write handler can be on
+                 * port->engine now, between finding the queue empty and
+                 * disabling the event; the test of the event state below
+                 * would then see it active and skip the re-arm, and the
+                 * disable would strand the message.  nxt_port_rearm() posts
+                 * to port->engine, so the re-arm runs after that disable.
+                 *
+                 * Leave the loop here, and do not read write_ready again:
+                 * the poller on port->engine can set it again, and the
+                 * next pass of an inline call would send "data" again.
+                 */
+
+                enable_write = 1;
+
+                break;
             }
         }
 

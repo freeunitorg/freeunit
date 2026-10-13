@@ -23,6 +23,13 @@
  * it.  The inline send must still post a re-arm, and the re-arm, which runs
  * on port->engine after that disable, must bring the rest of the message
  * out.
+ *
+ * A third message goes out from another engine to a full socket, with the
+ * event still active.  The inline send gets EAGAIN and queues the message.
+ * Then the owner disables the event, and the peer reads.  EAGAIN does not
+ * keep the event armed: a disabled event has no write interest, so the
+ * read raises no edge.  Only a re-arm that the inline send posts brings the
+ * message out.
  */
 
 #include <nxt_main.h>
@@ -49,6 +56,7 @@ static void nxt_port_share_test_drain(nxt_work_queue_t *wq);
 static nxt_int_t nxt_port_share_test_send(nxt_task_t *task, nxt_mp_t *mp,
     nxt_port_t *port);
 static void nxt_port_share_test_recv(nxt_fd_t sock);
+static nxt_int_t nxt_port_share_test_fill(nxt_fd_t sock);
 
 
 static nxt_uint_t  nxt_port_share_test_enables;
@@ -104,7 +112,11 @@ nxt_port_share_test_drain(nxt_work_queue_t *wq)
 }
 
 
-/* Count the datagrams the peer has, and the ones that end a message. */
+/*
+ * Count the datagrams of the test stream the peer has, and the ones that
+ * end a message.  The filler datagrams of the third message are read and
+ * not counted.
+ */
 
 static void
 nxt_port_share_test_recv(nxt_fd_t sock)
@@ -131,9 +143,54 @@ nxt_port_share_test_recv(nxt_fd_t sock)
             return;
         }
 
+        if (pm.stream != 7) {
+            continue;
+        }
+
         nxt_port_share_test_frags++;
         nxt_port_share_test_last += !pm.mf;
     }
+}
+
+
+/*
+ * Fill the socket until a send gets EAGAIN.  Each filler is a bare header
+ * with stream 0, which nxt_port_share_test_recv() does not count.
+ *
+ * On macOS the fill stops with ENOBUFS, not EAGAIN.  The write handler on
+ * the owner then takes the retry timer path, and this fixture has no
+ * timers, so the caller skips the case there, as nxt_port_fail_test does.
+ * NXT_DECLINED reports that.
+ */
+
+static nxt_int_t
+nxt_port_share_test_fill(nxt_fd_t sock)
+{
+    int             size;
+    ssize_t         n;
+    nxt_uint_t      i;
+    nxt_port_msg_t  pm;
+
+    size = 4096;
+
+    (void) setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
+
+    nxt_memzero(&pm, sizeof(nxt_port_msg_t));
+
+    for (i = 0; i < 100000; i++) {
+        n = send(sock, &pm, sizeof(nxt_port_msg_t), MSG_DONTWAIT);
+
+        if (n == -1) {
+            if (nxt_socket_errno == NXT_EAGAIN) {
+                return NXT_OK;
+            }
+
+            return (nxt_socket_errno == NXT_ENOBUFS) ? NXT_DECLINED
+                                                     : NXT_ERROR;
+        }
+    }
+
+    return NXT_ERROR;
 }
 
 
@@ -174,7 +231,7 @@ nxt_port_share_test(nxt_thread_t *thr)
 {
     nxt_mp_t               *mp;
     nxt_fd_t               pair[2];
-    nxt_int_t              ret;
+    nxt_int_t              ret, fill;
     nxt_uint_t             round;
     nxt_task_t             *task;
     nxt_port_t             *port;
@@ -352,6 +409,99 @@ nxt_port_share_test(nxt_thread_t *thr)
                       "port share test: with the event active at the inline "
                       "send, the peer got %ui of %d fragments, %ui last, %ui "
                       "completions, %ui re-arms, queue %s",
+                      nxt_port_share_test_frags, NXT_PORT_SHARE_TEST_FRAGS,
+                      nxt_port_share_test_last,
+                      nxt_port_share_test_completions,
+                      nxt_port_share_test_enables,
+                      nxt_queue_is_empty(&port->messages) ? "empty"
+                                                          : "not empty");
+        goto owner_done;
+    }
+
+    /*
+     * The third message, from this engine again, to a socket that is full.
+     * The event still looks active: the write handler on the owner has
+     * found the queue empty and disables the event after the inline send
+     * has looked at it.
+     */
+
+    nxt_port_share_test_enables = 0;
+    nxt_port_share_test_completions = 0;
+    nxt_port_share_test_frags = 0;
+    nxt_port_share_test_last = 0;
+
+    fill = nxt_port_share_test_fill(pair[1]);
+
+    if (fill == NXT_DECLINED) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port share test: EAGAIN case skipped, the fill "
+                      "stopped with ENOBUFS, not EAGAIN");
+        ret = NXT_OK;
+        goto owner_done;
+    }
+
+    if (fill != NXT_OK) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port share test: could not fill the socket");
+        goto owner_done;
+    }
+
+    port->socket.write = NXT_EVENT_ACTIVE;
+    port->socket.write_ready = 1;
+
+    if (nxt_port_share_test_send(task, mp, port) != NXT_OK) {
+        goto owner_done;
+    }
+
+    nxt_port_share_test_drain(&engine.fast_work_queue);
+
+    if (port->socket.write_ready || nxt_queue_is_empty(&port->messages)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port share test: the send to a full socket did not "
+                      "get EAGAIN");
+        goto owner_done;
+    }
+
+    /* The write handler on the owner disables the event now. */
+
+    port->socket.write = NXT_EVENT_DISABLED;
+
+    /* The owner runs what was posted to it.  Then the peer reads. */
+
+    thr->engine = &owner;
+
+    nxt_locked_work_queue_move(thr, &owner.locked_work_queue,
+                               &owner.fast_work_queue);
+    nxt_port_share_test_drain(&owner.fast_work_queue);
+
+    nxt_port_share_test_recv(pair[0]);
+
+    /*
+     * The event loop: the read raises an edge only on an armed event, and
+     * the poller sets write_ready before it runs the handler.
+     */
+
+    for (round = 0;
+         round < 32 && port->socket.write == NXT_EVENT_ACTIVE;
+         round++)
+    {
+        port->socket.write_ready = 1;
+        port->socket.write_handler(task, &port->socket, NULL);
+        nxt_port_share_test_drain(&owner.fast_work_queue);
+        nxt_port_share_test_recv(pair[0]);
+    }
+
+    thr->engine = &engine;
+
+    if (nxt_port_share_test_frags != NXT_PORT_SHARE_TEST_FRAGS
+        || nxt_port_share_test_last != 1
+        || nxt_port_share_test_completions != 1
+        || !nxt_queue_is_empty(&port->messages))
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "port share test: after EAGAIN with the event active "
+                      "at the inline send, the peer got %ui of %d fragments, "
+                      "%ui last, %ui completions, %ui re-arms, queue %s",
                       nxt_port_share_test_frags, NXT_PORT_SHARE_TEST_FRAGS,
                       nxt_port_share_test_last,
                       nxt_port_share_test_completions,

@@ -386,6 +386,15 @@ of the message to main and queued the rest, but did not ask to be woken up to
 send it.  The bug came from NGINX Unit.
 </para>
 </change>
+<change type="bugfix">
+<para>
+a message between two FreeUnit processes could stay queued, and every later
+message on the same channel waited behind it.  This could occur when one
+thread sent to a full channel at the same time as the thread that owns the
+channel stopped waiting for it to become writable.  The sender did not ask to
+be woken up again.  The bug came from NGINX Unit.
+</para>
+</change>
 
 <change type="bugfix">
 <para>
