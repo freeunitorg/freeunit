@@ -353,6 +353,17 @@ if the header was already sent.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+each thread of unitd now keeps up to 32 freed pool clusters, at most 128 KiB
+(about 80 KiB with today's pool sizes), for reuse.  With musl, the router
+makes fewer mmap() calls and page faults per request.  The cache is off
+without __thread, under the address, hardware address, memory and thread
+sanitizers, and with -DNXT_MP_NO_CLUSTER_CACHE=1 or -DNXT_DEBUG_MEMORY=1
+in --cc-opt.  See https://github.com/freeunitorg/freeunit/issues/688.
+</para>
+</change>
+
 <change type="change">
 <para>
 the Wasmtime library of the wasm module is now built without the

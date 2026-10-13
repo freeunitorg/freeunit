@@ -128,7 +128,8 @@ nxt_thread_trampoline(void *data)
     /*
      * nxt_thread_time_cleanup() should be called only if a thread
      * would be canceled, so ignore it here because nxt_thread_exit()
-     * calls nxt_thread_time_free() as well.
+     * calls nxt_thread_time_free() and nxt_mp_cluster_cache_drain()
+     * as well.
      */
     pthread_cleanup_pop(0);
 
@@ -176,6 +177,14 @@ nxt_thread_time_cleanup(void *data)
     nxt_log_debug(thr->log, "thread time cleanup");
 
     nxt_thread_time_free(thr);
+
+    /*
+     * A canceled thread does not call nxt_thread_exit().  The handler runs
+     * on the canceled thread, so it frees the pool cluster cache of that
+     * thread.  When nxt_thread_exit() runs inside start(), pthread_exit()
+     * calls this handler after it, and the cache is already empty.
+     */
+    nxt_mp_cluster_cache_drain();
 }
 
 
@@ -201,6 +210,9 @@ nxt_thread_exit(nxt_thread_t *thr)
 
         nxt_event_engine_post(engine, &link->work);
     }
+
+    /* The cache is in the storage of this thread, so free it here. */
+    nxt_mp_cluster_cache_drain();
 
     nxt_thread_time_free(thr);
 

@@ -239,6 +239,214 @@ nxt_mp_thread_adopt(nxt_mp_t *mp)
 }
 
 
+/*
+ * Each thread keeps a small cache of freed cluster memory.  The router
+ * creates a pool for every request and destroys it when the request ends.
+ * Without the cache, every request allocates and frees the clusters of its
+ * pool.  The musl allocator unmaps a group of such blocks when the last
+ * block of the group is freed, so the next request often maps the memory
+ * again: mmap(), munmap() and page faults.
+ *
+ * The cache holds up to NXT_MP_CLUSTER_CACHE_MAX clusters of at most
+ * NXT_MP_CLUSTER_CACHE_SIZE bytes, so a thread keeps at most 128 KiB.  It
+ * holds up to NXT_MP_CLUSTER_CACHE_SAME clusters of one size and alignment,
+ * so the 1024-byte clusters of closed connections leave room for the
+ * 4096-byte clusters of request pools, and the other way round.  A pool
+ * takes a cluster of the same size and alignment from the cache of the
+ * thread that allocates the cluster.  A pool returns its clusters to the
+ * cache of the thread that frees them.  This may be another thread than the
+ * one that created the pool (see nxt_mp_thread_adopt()).  This is safe,
+ * because a cluster is plain heap memory.
+ *
+ * nxt_thread_exit() frees the cache of the thread.  A canceled thread does
+ * not call it; its cleanup handler, nxt_thread_time_cleanup(), frees the
+ * cache instead.  The main thread keeps its cache until the process exits.
+ * The threads that language modules start with pthread_create() free
+ * nothing, but they use no pools.  A process made by fork() gets a copy of
+ * the cache of the thread that forked only.  The copies of the caches of
+ * the other threads stay until the new process exits or calls exec().
+ *
+ * A reused cluster still holds the data of its last pool.  nxt_memalign()
+ * does not zero memory either.  The page map of a cluster is in its block
+ * descriptor, which nxt_zalloc() allocates apart.  Callers that need zeroed
+ * memory use nxt_mp_zalloc(), nxt_mp_zalign() or nxt_mp_zget().
+ *
+ * Valgrind sees a cached cluster as allocated memory, so it does not report
+ * a use after free of a destroyed pool.  Turn the cache off for it with
+ * NXT_MP_NO_CLUSTER_CACHE (nxt_mp.h).
+ *
+ * NXT_MP_CLUSTER_CACHE in nxt_mp.h says whether the cache is compiled in.
+ */
+
+
+#if (NXT_TESTS)
+
+/* The number of nxt_memalign() calls for cluster memory in all threads. */
+static nxt_atomic_t  nxt_mp_test_cluster_allocs;
+
+/* The number of clusters that nxt_mp_cluster_cache_drain() freed. */
+static nxt_atomic_t  nxt_mp_test_cluster_drains;
+
+#endif
+
+
+#if (NXT_MP_CLUSTER_CACHE)
+
+/*
+ * The limits fit the two cluster sizes of today: 16 connection clusters of
+ * 1024 bytes and 16 request clusters of 4096 bytes fill the 32 slots.  The
+ * cache removes nothing to make room.  A cluster that finds no room is
+ * freed, so a third size gets a slot only when the other two leave one.
+ */
+
+#define NXT_MP_CLUSTER_CACHE_MAX   32
+#define NXT_MP_CLUSTER_CACHE_SAME  16
+#define NXT_MP_CLUSTER_CACHE_SIZE  4096
+
+
+typedef struct {
+    void                     *start;
+    uint32_t                 size;
+    uint32_t                 alignment;
+} nxt_mp_cached_cluster_t;
+
+
+typedef struct {
+    nxt_uint_t               count;
+    nxt_mp_cached_cluster_t  clusters[NXT_MP_CLUSTER_CACHE_MAX];
+} nxt_mp_cluster_cache_t;
+
+
+static nxt_thread_declare_data(nxt_mp_cluster_cache_t, nxt_mp_cluster_cache);
+
+
+/* Returns NULL if the cache has no cluster of the pool's size. */
+
+static void *
+nxt_mp_cluster_get(nxt_mp_t *mp)
+{
+    void                     *p;
+    nxt_uint_t               i;
+    nxt_mp_cluster_cache_t   *cache;
+    nxt_mp_cached_cluster_t  *c;
+
+    cache = nxt_thread_get_data(nxt_mp_cluster_cache);
+
+    for (i = 0; i < cache->count; i++) {
+        c = &cache->clusters[i];
+
+        if (c->size == mp->cluster_size
+            && c->alignment == mp->page_alignment)
+        {
+            p = c->start;
+
+            cache->count--;
+            *c = cache->clusters[cache->count];
+
+            return p;
+        }
+    }
+
+    return NULL;
+}
+
+
+/*
+ * A cluster is put once: nxt_mp_destroy() and nxt_mp_chunk_free() put it
+ * after it leaves the block tree of its pool.
+ */
+
+static void
+nxt_mp_cluster_put(nxt_mp_t *mp, void *p)
+{
+    nxt_uint_t               i, same;
+    nxt_mp_cluster_cache_t   *cache;
+    nxt_mp_cached_cluster_t  *c;
+
+    if (mp->cluster_size > NXT_MP_CLUSTER_CACHE_SIZE) {
+        nxt_free(p);
+        return;
+    }
+
+    cache = nxt_thread_get_data(nxt_mp_cluster_cache);
+
+    same = 0;
+
+    for (i = 0; i < cache->count; i++) {
+        c = &cache->clusters[i];
+
+        /*
+         * The cluster is freed twice.  A second copy in the cache would give
+         * one cluster to two pools, so keep one.  This finds the second free
+         * only while the cluster is still in the cache of this thread.  If
+         * the first copy went to a live pool, the second put is not found,
+         * and the cache holds a cluster that the pool owns.
+         */
+        if (nxt_slow_path(c->start == p)) {
+            nxt_thread_log_alert("mp %p: cluster %p is freed twice", mp, p);
+            return;
+        }
+
+        if (c->size == mp->cluster_size
+            && c->alignment == mp->page_alignment)
+        {
+            same++;
+        }
+    }
+
+    if (same < NXT_MP_CLUSTER_CACHE_SAME
+        && cache->count < NXT_MP_CLUSTER_CACHE_MAX)
+    {
+        c = &cache->clusters[cache->count++];
+
+        c->start = p;
+        c->size = mp->cluster_size;
+        c->alignment = mp->page_alignment;
+
+        return;
+    }
+
+    nxt_free(p);
+}
+
+
+/*
+ * Each entry leaves the cache before it is freed.  A second call, even from
+ * a cancellation point inside nxt_free(), then frees nothing twice.
+ */
+
+void
+nxt_mp_cluster_cache_drain(void)
+{
+    nxt_mp_cluster_cache_t  *cache;
+
+    cache = nxt_thread_get_data(nxt_mp_cluster_cache);
+
+    while (cache->count != 0) {
+        cache->count--;
+
+#if (NXT_TESTS)
+        (void) nxt_atomic_fetch_add(&nxt_mp_test_cluster_drains, 1);
+#endif
+
+        nxt_free(cache->clusters[cache->count].start);
+    }
+}
+
+#else
+
+#define nxt_mp_cluster_get(mp)     NULL
+#define nxt_mp_cluster_put(mp, p)  nxt_free(p)
+
+
+void
+nxt_mp_cluster_cache_drain(void)
+{
+}
+
+#endif
+
+
 nxt_mp_t *
 nxt_mp_create(size_t cluster_size, size_t page_alignment, size_t page_size,
     size_t min_chunk_size)
@@ -314,6 +522,43 @@ nxt_mp_test_retain_count(nxt_mp_t *mp)
     return mp->retain;
 }
 
+
+nxt_uint_t
+nxt_mp_test_cluster_alloc_count(void)
+{
+    return nxt_mp_test_cluster_allocs;
+}
+
+
+nxt_uint_t
+nxt_mp_test_cluster_drain_count(void)
+{
+    return nxt_mp_test_cluster_drains;
+}
+
+
+#if (NXT_MP_CLUSTER_CACHE)
+
+void
+nxt_mp_test_cluster_put_twice(nxt_mp_t *mp, void *p)
+{
+    nxt_mp_cluster_put(mp, p);
+    nxt_mp_cluster_put(mp, p);
+}
+
+
+nxt_uint_t
+nxt_mp_test_cluster_cache_count(void)
+{
+    nxt_mp_cluster_cache_t  *cache;
+
+    cache = nxt_thread_get_data(nxt_mp_cluster_cache);
+
+    return cache->count;
+}
+
+#endif
+
 #endif
 
 
@@ -346,6 +591,12 @@ nxt_mp_destroy(nxt_mp_t *mp)
         block = (nxt_mp_block_t *) node;
 
         p = block->start;
+
+        if (block->type == NXT_MP_CLUSTER_BLOCK) {
+            nxt_free(block);
+            nxt_mp_cluster_put(mp, p);
+            continue;
+        }
 
         if (block->type != NXT_MP_EMBEDDED_BLOCK) {
             nxt_free(block);
@@ -694,10 +945,18 @@ nxt_mp_alloc_cluster(nxt_mp_t *mp)
 
     cluster->size = mp->cluster_size;
 
-    cluster->start = nxt_memalign(mp->page_alignment, mp->cluster_size);
-    if (nxt_slow_path(cluster->start == NULL)) {
-        nxt_free(cluster);
-        return NULL;
+    cluster->start = nxt_mp_cluster_get(mp);
+
+    if (cluster->start == NULL) {
+#if (NXT_TESTS)
+        (void) nxt_atomic_fetch_add(&nxt_mp_test_cluster_allocs, 1);
+#endif
+
+        cluster->start = nxt_memalign(mp->page_alignment, mp->cluster_size);
+        if (nxt_slow_path(cluster->start == NULL)) {
+            nxt_free(cluster);
+            return NULL;
+        }
     }
 
     n--;
@@ -994,7 +1253,7 @@ nxt_mp_chunk_free(nxt_mp_t *mp, nxt_mp_block_t *cluster, u_char *p)
     p = cluster->start;
 
     nxt_free(cluster);
-    nxt_free(p);
+    nxt_mp_cluster_put(mp, p);
 
     return NULL;
 }

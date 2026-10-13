@@ -5626,8 +5626,9 @@ nxt_router_worker_thread_exit(nxt_task_t *task)
 {
     /*
      * Free per-thread caches whose storage lives in this thread and can only
-     * be released while running on it, then leave the thread.  New worker-exit
-     * paths must route through here so the cleanup is never forgotten.
+     * be released while running on it, then leave the thread.  The pool
+     * cluster cache is freed in nxt_thread_exit().  New worker-exit paths must
+     * route through here so the cleanup is never forgotten.
      */
     nxt_http_static_buf_freelist_drain();
 
