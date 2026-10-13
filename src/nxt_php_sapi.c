@@ -1308,7 +1308,9 @@ nxt_zend_stream_init_fp(zend_file_handle *handle, FILE *fp,
 static void
 nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
 {
+#if (PHP_VERSION_ID < 80100)
     FILE              *fp;
+#endif
 #if (PHP_VERSION_ID < 50600)
     void              *read_post;
 #endif
@@ -1320,6 +1322,26 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
 
     nxt_unit_req_debug(ctx->req, "PHP execute script %s", filename);
 
+#if (PHP_VERSION_ID >= 80100)
+
+    /*
+     * musl's fopen() opens the file with O_CLOEXEC and PHP then sets
+     * FD_CLOEXEC on the resulting stream twice, so opening the script here only
+     * to hand the descriptor over costs calls that access() and PHP's own open
+     * do not need.  nxt_php_handle_fs_err() keeps the 403/404 mapping for both.
+     */
+    if (access(filename, R_OK) != 0) {
+        nxt_int_t  ec;
+
+        nxt_unit_req_debug(ctx->req, "PHP access(\"%s\") failed", filename);
+
+        ec = nxt_php_handle_fs_err(ctx->req);
+        nxt_unit_request_done(ctx->req, ec);
+        return;
+    }
+
+#else
+
     fp = fopen(filename, "re");
     if (fp == NULL) {
         nxt_int_t  ec;
@@ -1330,6 +1352,8 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
         nxt_unit_request_done(ctx->req, ec);
         return;
     }
+
+#endif
 
     SG(server_context) = ctx;
     SG(options) |= SAPI_OPTION_NO_CHDIR;
@@ -1381,7 +1405,9 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
         nxt_unit_req_debug(ctx->req, "php_request_startup() failed");
 
         nxt_unit_request_done(ctx->req, NXT_UNIT_ERROR);
+#if (PHP_VERSION_ID < 80100)
         fclose(fp);
+#endif
 
         return;
     }
@@ -1394,7 +1420,11 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
      */
     nxt_php_vcwd_chdir(ctx->req, ctx->script_dirname.start);
 
+#if (PHP_VERSION_ID >= 80100)
+    zend_stream_init_filename(&file_handle, filename);
+#else
     nxt_zend_stream_init_fp(&file_handle, fp, filename);
+#endif
 
     php_execute_script(&file_handle TSRMLS_CC);
 

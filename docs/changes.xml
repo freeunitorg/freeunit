@@ -420,7 +420,18 @@ FreeUnit updated to 1.37.1.
 </para>
 </change>
 
+<change type="change">
+<para>
+the PHP module opened an application script with fopen() on every request, which
+on musl cost an open, two fcntl() calls and a close per request, because the PHP
+build there sets FD_CLOEXEC on the stream after opening it.  The script is now
+checked with access() and opened by PHP itself.  See
+https://github.com/freeunitorg/freeunit/issues/688.
+</para>
+</change>
+
 </changes>
+
 
 
 <changes apply="unit"

@@ -286,6 +286,13 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        not in the build.
 
 
+    *) Change: the PHP module opened an application script with fopen() on every
+       request, which on musl cost an open, two fcntl() calls and a close per
+       request, because the PHP build there sets FD_CLOEXEC on the stream after
+       opening it.  The script is now checked with access() and opened by PHP
+       itself.  See https://github.com/freeunitorg/freeunit/issues/688.
+
+
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 
     *) Bugfix: a chunked request body that grew over "max_body_size"
