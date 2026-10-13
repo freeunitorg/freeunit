@@ -12,6 +12,27 @@
 
 <change type="bugfix">
 <para>
+with "compression" on, a response could reach the client as a corrupt or
+endless stream.  When the response header fields were over about 1 KiB, the
+first part of the body, up to 16 KiB, went out uncompressed under
+"Content-Encoding".  Python WSGI, Python ASGI, Perl and Ruby applications sent
+such responses.  The bug was in 1.35.0 and later.  See
+https://github.com/freeunitorg/freeunit/issues/666.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a request that arrived while unitd started could hang for ever, and the log
+showed "get_port_handler: port N:1 not found".  A router thread accepted the
+connection before the router knew the port of that thread.  "limits.timeout"
+did not end such a request.  The bug was in 1.19.0 and later.  See
+https://github.com/freeunitorg/freeunit/issues/667.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 the control API accepted a compression "level" out of the range of an
 integer, such as 2147483648.  The router then did not apply the "compression"
 block, and compression was off for the whole configuration.  Such a number is
