@@ -1,6 +1,14 @@
 
 Changes with FreeUnit 1.37.1                                     04 Oct 2026
 
+    *) Change: the control API now answers a configuration PUT only after
+       the store child of main has written the configuration and flushed
+       it. Before, the answer came first, so a 200 did not mean that the
+       configuration was on the disk. A PUT takes one store longer: about
+       7 ms on a fast disk, 22 ms on a slow one. A store that fails is
+       answered with 500 "Failed to store the configuration."; the new
+       configuration runs, but a restart loads the one before it.
+
     *) Bugfix: the control API answered 200 to a DELETE of an njs module or
        of a certificate before the store child had removed its file. A
        delete that failed was reported as success, and the module or the

@@ -12,6 +12,7 @@
 
 <change type="change">
 <para>
+<<<<<<< HEAD
 reproducible builds: with SOURCE_DATE_EPOCH set, unitd, the static libraries,
 source tarballs, rpm, rust and jar builds no longer carry build paths, host
 names, kernel release or times.  RPM packages built with rpm 4.14 or later
@@ -80,6 +81,17 @@ before the store child had removed its file.  A delete that failed was
 reported as success, and the module or the certificate left the list while its
 file stayed in the state directory.  The answer now waits for the store child,
 and a failed delete is answered with 500 and keeps the entry listed.
+</para>
+</change>
+
+<change type="change">
+<para>
+the control API now answers a configuration PUT only after the store child of
+main has written the configuration and flushed it.  Before, the answer came
+first, so a 200 did not mean that the configuration was on the disk.  A PUT
+takes one store longer: about 7 ms on a fast disk, 22 ms on a slow one.  A
+store that fails is answered with 500 "Failed to store the configuration.";
+the new configuration runs, but a restart loads the one before it.
 </para>
 </change>
 
