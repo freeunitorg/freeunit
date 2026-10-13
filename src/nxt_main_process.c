@@ -48,6 +48,9 @@ typedef struct {
     nxt_uint_t            ahead;      /* Queued jobs older than "pending". */
     nxt_main_store_job_t  *jobs;      /* The jobs that wait, in order. */
     nxt_bool_t            controller; /* Start it when the store ends. */
+    nxt_pid_t             reply_pid;  /* The controller that waits, or 0. */
+    nxt_port_id_t         reply_port;
+    uint32_t              stream;
 } nxt_main_store_t;
 
 
@@ -99,6 +102,7 @@ static nxt_int_t nxt_main_store_job_run(nxt_task_t *task,
     nxt_main_store_job_t *job);
 static void nxt_main_store_job_done(nxt_task_t *task,
     nxt_main_store_job_t *job, nxt_int_t ret);
+static void nxt_main_store_reply(nxt_task_t *task, nxt_int_t ret);
 static void nxt_main_store_close_fds(void);
 #if (NXT_LINUX)
 static nxt_int_t nxt_main_store_close_proc_fds(void);
@@ -2369,6 +2373,7 @@ nxt_main_port_conf_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
     void           *p;
     size_t         size;
+    uint32_t       stream;
     nxt_port_t     *ctl_port;
     nxt_runtime_t  *rt;
 
@@ -2392,6 +2397,8 @@ nxt_main_port_conf_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         nxt_port_recv_msg_close_fds(msg);
         return;
     }
+
+    stream = msg->port_msg.stream;
 
     p = MAP_FAILED;
 
@@ -2425,6 +2432,18 @@ nxt_main_port_conf_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     nxt_debug(task, "conf_store_handler(%uz): %*s", size, size, p);
 
+    /*
+     * The controller answers the client only when this store ends, so it
+     * waits for the answer.  A second store cannot wait: the controller
+     * postpones the next request until it has this answer.  Answer that
+     * impossible waiter rather than leaving it waiting for ever.
+     */
+    nxt_main_store_reply(task, NXT_ERROR);
+
+    nxt_main_store.reply_pid = ctl_port->pid;
+    nxt_main_store.reply_port = ctl_port->id;
+    nxt_main_store.stream = stream;
+
     /* The scheduler owns the mapping from here on. */
     nxt_main_store_schedule(task, p, size);
 
@@ -2441,6 +2460,11 @@ error:
     if (msg->fd[0] != -1) {
         nxt_fd_close(msg->fd[0]);
         msg->fd[0] = -1;
+    }
+
+    if (stream != 0) {
+        (void) nxt_port_socket_write(task, ctl_port, NXT_PORT_MSG_RPC_ERROR,
+                                     -1, stream, 0, NULL);
     }
 }
 
@@ -2841,6 +2865,40 @@ nxt_main_store_job_run(nxt_task_t *task, nxt_main_store_job_t *job)
 
 
 /*
+ * Answer the controller that waits for the conf.json store, if one does.
+ * The controller holds the answer of a configuration PUT until this
+ * message arrives, so a 200 means that the configuration is on the disk.
+ * A return of "ret" other than NXT_OK says that it is not, and that a
+ * restart loads the configuration before it.
+ */
+static void
+nxt_main_store_reply(nxt_task_t *task, nxt_int_t ret)
+{
+    nxt_port_t  *port;
+
+    if (nxt_main_store.reply_pid == 0) {
+        return;
+    }
+
+    port = nxt_runtime_port_find(task->thread->runtime,
+                                 nxt_main_store.reply_pid,
+                                 nxt_main_store.reply_port);
+
+    if (port != NULL) {
+        (void) nxt_port_socket_write(task, port,
+                                     (ret == NXT_OK)
+                                         ? NXT_PORT_MSG_RPC_READY_LAST
+                                         : NXT_PORT_MSG_RPC_ERROR,
+                                     -1, nxt_main_store.stream, 0, NULL);
+    }
+
+    nxt_main_store.reply_pid = 0;
+    nxt_main_store.reply_port = 0;
+    nxt_main_store.stream = 0;
+}
+
+
+/*
  * Log a failed job, answer the sender and free the job.  Main logs the
  * failure: the alerts of the child can go to a rotated log, because
  * SIGUSR1 reopens the log in main only.  A sender that has gone has no
@@ -3085,13 +3143,24 @@ nxt_main_store_exited(nxt_task_t *task, nxt_pid_t pid, int status)
             nxt_conf_ver = NXT_VERNUM;
         }
 
+        nxt_main_store_reply(task, NXT_OK);
+
     } else if (nxt_main_store_cancelled(pid, status)) {
         nxt_debug(task, "state store child %PI stopped, a newer store follows",
                   pid);
 
+        /*
+         * Main killed it to store a newer configuration instead, so this
+         * one may or may not be on the disk.  The controller cannot be
+         * told that it is, and unitd is exiting.
+         */
+        nxt_main_store_reply(task, NXT_ERROR);
+
     } else {
         nxt_alert(task, "state store child %PI failed, "
                   "the configuration was not stored", pid);
+
+        nxt_main_store_reply(task, NXT_ERROR);
     }
 
     nxt_main_store.pid = 0;

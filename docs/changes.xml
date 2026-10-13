@@ -10,6 +10,17 @@
          date="2026-10-04" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="change">
+<para>
+the control API now answers a configuration PUT only after the store child of
+main has written the configuration and flushed it.  Before, the answer came
+first, so a 200 did not mean that the configuration was on the disk.  A PUT
+takes one store longer: about 7 ms on a fast disk, 22 ms on a slow one.  A
+store that fails is answered with 500 "Failed to store the configuration.";
+the new configuration runs, but a restart loads the one before it.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 with "compression" on, a response could reach the client as a corrupt or
