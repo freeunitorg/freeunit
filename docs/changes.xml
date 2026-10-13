@@ -39,6 +39,17 @@ This option is off by default.
 </para>
 </change>
 
+<change type="change">
+<para>
+a small application response now reaches the router in
+one message less.  Python, Perl and Ruby applications send the
+header and a body that fits in the same message, and PHP sends
+its header with its first output instead of before it.  A PHP
+response with no body is one message.  Responses with larger
+bodies, and their compression, are unchanged.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 when a burst of requests arrived for an application with multiple worker

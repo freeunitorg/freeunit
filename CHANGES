@@ -21,6 +21,13 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        with the callout budget that the JIT attempt left. This option is
        off by default.
 
+    *) Change: a small application response now reaches the router in
+       one message less. Python, Perl and Ruby applications send the
+       header and a body that fits in the same message, and PHP sends
+       its header with its first output instead of before it. A PHP
+       response with no body is one message. Responses with larger
+       bodies, and their compression, are unchanged.
+
     *) Bugfix: when a burst of requests arrived for an application with
        multiple worker processes or threads, only the first request woke a
        worker, forcing that worker to process the entire burst sequentially

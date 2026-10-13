@@ -1734,6 +1734,12 @@ nxt_php_flush(void *server_context)
     if (!SG(headers_sent)) {
         (void) sapi_send_headers(TSRMLS_C);
     }
+
+    if (nxt_unit_response_is_init(ctx->req)
+        && !nxt_unit_response_is_sent(ctx->req))
+    {
+        (void) nxt_unit_response_send(ctx->req);
+    }
 }
 
 
@@ -1807,13 +1813,6 @@ nxt_php_send_headers(sapi_headers_struct *sapi_headers TSRMLS_DC)
         nxt_unit_response_add_field(req, h->header, colon - h->header,
                                     value,
                                     h->header_len - (value - h->header));
-    }
-
-    rc = nxt_unit_response_send(req);
-    if (nxt_slow_path(rc != NXT_UNIT_OK)) {
-        nxt_unit_req_debug(req, "failed to send response");
-
-        return SAPI_HEADER_SEND_FAILED;
     }
 
     return SAPI_HEADER_SENT_SUCCESSFULLY;

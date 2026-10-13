@@ -1203,3 +1203,29 @@ def test_php_application_content_type_reset(findall):
     )
     assert '|post=empty' in resp3['body']
     assert '|raw=e=5&f=6' in resp3['body']
+
+
+def test_php_application_header_only():
+    client.load('header')
+
+    resp = client.get(
+        headers={
+            'Host': 'localhost',
+            'Connection': 'close',
+            'X-Header': 'Location: /x',
+        }
+    )
+    assert resp['status'] == 302, 'status'
+    assert resp['headers']['Location'] == '/x', 'Location header'
+    assert resp['body'] == '', 'body empty'
+
+    resp = client.head(
+        headers={
+            'Host': 'localhost',
+            'Connection': 'close',
+            'X-Header': 'X-Custom: val',
+        }
+    )
+    assert resp['status'] == 200, 'HEAD status'
+    assert resp['headers']['X-Custom'] == 'val', 'HEAD header'
+    assert resp['body'] == '', 'HEAD body empty'
