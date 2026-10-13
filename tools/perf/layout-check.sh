@@ -12,7 +12,7 @@
 # with debug information.  Then it runs pahole on each struct and compares
 # the two results.  For a "shm" struct, pahole also shows the layout of
 # the structs in it.  For a "const" macro, a small program that is built
-# with the headers of the commit prints the value.
+# with the headers of the commit prints its value in each geometry arm.
 #
 #   - A change to a "shm" struct fails.  Processes that are built from
 #     different commits share these structs, so the change breaks the ABI
@@ -78,8 +78,10 @@ list() {
 
 # build COMMIT DIR: build unitd and nxt_unit.o of COMMIT in DIR.  Then
 # build and run a program that prints the "const" values of the HEAD list
-# with the headers of COMMIT, to DIR.const.  A macro that the headers do
-# not define is not printed.
+# with the headers of COMMIT, to DIR.const.  The geometry macros have a
+# definition in each NXT_MMAP_TINY_CHUNK arm, so the program is built
+# twice, and each value is tagged with its arm.  A macro that an arm does
+# not define prints no line for it.
 
 build() {
     echo "build $1"
@@ -112,10 +114,33 @@ build() {
     } > "$2/layout_const.c"
 
     (cd "$2" && "${CC:-cc}" -funsigned-char -std=gnu11 -I src -I build/include \
-         -o layout_const layout_const.c && ./layout_const) \
+         -o layout_const layout_const.c \
+         && ./layout_const | sed 's/^/default /') \
         > "$2.const" 2> "$2.log" || {
         cat "$2.log"
-        echo "error: the const program of $1 failed" >&2
+        echo "error: the const program of $1 (default) failed" >&2
+        exit 2
+    }
+
+    # The tiny arm is a separate compilation: a macro definition chosen by
+    # #ifdef NXT_MMAP_TINY_CHUNK is not reached in the build above, so a
+    # change to it would otherwise read as "same" here.
+    #
+    # The pipe to sed hides the exit status of the program: a program that
+    # dies after printing some lines is not reported here, and the missing
+    # value is then reported as "is not in the build of the head commit".
+    # A macro that the headers do not define prints no line for it, and a
+    # macro that is defined but is not a value is a compile error.
+    #
+    # The log is appended to, not truncated, as in the build above, so
+    # that no compiler output of this function is discarded.
+    (cd "$2" && "${CC:-cc}" -funsigned-char -std=gnu11 -DNXT_MMAP_TINY_CHUNK \
+         -I src -I build/include \
+         -o layout_const layout_const.c \
+         && ./layout_const | sed 's/^/tiny /') \
+        >> "$2.const" 2>> "$2.log" || {
+        cat "$2.log"
+        echo "error: the const program of $1 (tiny) failed" >&2
         exit 2
     }
 }
@@ -132,7 +157,11 @@ build() {
 
 layout() {
     if [ "$2" = const ]; then
-        awk -v name="$3" '$1 == name' "$1.const"
+        # DIR.const holds "<arm> <name> <value>" lines for both arms, so
+        # both are returned for the macro: the comparison below then sees
+        # a change to either the default or the tiny geometry.  The name
+        # is in the second field, because the arm tag is the first.
+        awk -v name="$3" '$2 == name' "$1.const"
         return
     fi
 
