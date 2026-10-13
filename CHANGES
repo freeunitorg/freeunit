@@ -240,6 +240,12 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        the rest, but did not ask to be woken up to send it. The bug came
        from NGINX Unit.
 
+    *) Bugfix: when the access log record of a request failed, the router
+       did not close the request. A JS "format" that throws an exception
+       for a request is one cause. The client connection stayed open, and
+       the memory of the request was not freed. The bug had appeared in
+       1.29.0.
+
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 

@@ -47,8 +47,6 @@ static nxt_int_t nxt_router_access_log_text(nxt_task_t *task,
 static nxt_int_t nxt_router_access_log_json(nxt_task_t *task,
     nxt_http_request_t *r, nxt_router_access_log_ctx_t *ctx,
     nxt_router_access_log_format_t *format);
-static void nxt_router_access_log_write(nxt_task_t *task, nxt_http_request_t *r,
-    nxt_router_access_log_ctx_t *ctx);
 static void nxt_router_access_log_ready(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
 static void nxt_router_access_log_error(nxt_task_t *task,
@@ -248,7 +246,7 @@ nxt_router_access_log_writer(nxt_task_t *task, nxt_http_request_t *r,
 
     ctx = nxt_mp_get(r->mem_pool, sizeof(nxt_router_access_log_ctx_t));
     if (nxt_slow_path(ctx == NULL)) {
-        return;
+        goto close;
     }
 
     ctx->access_log = access_log;
@@ -261,8 +259,18 @@ nxt_router_access_log_writer(nxt_task_t *task, nxt_http_request_t *r,
     }
 
     if (ret == NXT_OK) {
-        nxt_router_access_log_write(task, r, ctx);
+        nxt_fd_write(ctx->access_log->fd, ctx->text.start, ctx->text.length);
     }
+
+close:
+
+    /*
+     * nxt_http_request_close_handler() calls this function and returns.  The
+     * request is closed here, also when the record fails, for example when a
+     * JS format throws.  r->logged is set, so this call does not log again.
+     */
+
+    nxt_http_request_close_handler(task, r, r->proto.any);
 }
 
 
@@ -378,16 +386,6 @@ nxt_router_access_log_json(nxt_task_t *task, nxt_http_request_t *r,
     ctx->text.length = p - ctx->text.start;
 
     return NXT_OK;
-}
-
-
-static void
-nxt_router_access_log_write(nxt_task_t *task, nxt_http_request_t *r,
-    nxt_router_access_log_ctx_t *ctx)
-{
-    nxt_fd_write(ctx->access_log->fd, ctx->text.start, ctx->text.length);
-
-    nxt_http_request_close_handler(task, r, r->proto.any);
 }
 
 

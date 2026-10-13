@@ -570,6 +570,53 @@ def test_access_log_format_njs(require, search_in_file, wait_for_record):
     check_format(log_format, '{"status":"200","uri":"/"}')
 
 
+@pytest.mark.parametrize(
+    'log_format',
+    [
+        '`${vars.uri} ${args.x.length}`',
+        {'uri': '`${vars.uri}`', 'x': '`${args.x.length}`'},
+    ],
+)
+def test_access_log_njs_exception(
+    log_format, require, search_in_file, skip_alert, wait_for_record
+):
+    require({'modules': {'njs': 'any'}})
+    skip_alert(r'js exception')
+
+    load('empty')
+    set_format(log_format)
+
+    # Without "x" in the query, "args.x" is undefined and the format throws.
+    # The request gets no record, but it must still be closed: the client
+    # asked for "Connection: close", so the server must close the socket.
+    sock = client.get(url='/fail', no_recv=True)
+    sock.settimeout(10)
+
+    data = b''
+    closed = False
+
+    try:
+        while True:
+            part = sock.recv(4096)
+            if not part:
+                closed = True
+                break
+
+            data += part
+
+    except TimeoutError:
+        pass
+
+    sock.close()
+
+    assert data.startswith(b'HTTP/1.1 200 '), 'response sent'
+    assert closed, 'connection closed after a failed access log format'
+
+    assert client.get(url='/ok?x=abc')['status'] == 200
+    assert wait_for_record(r'/ok', 'access.log') is not None
+    assert search_in_file(r'/fail', 'access.log') is None
+
+
 def test_access_log_incorrect(temp_dir, skip_alert):
     skip_alert(r'failed to apply new conf')
 
