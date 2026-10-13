@@ -1,6 +1,13 @@
 
 Changes with FreeUnit 1.37.1                                     04 Oct 2026
 
+    *) Bugfix: the control API answered 200 to a DELETE of an njs module or
+       of a certificate before the store child had removed its file. A
+       delete that failed was reported as success, and the module or the
+       certificate left the list while its file stayed in the state
+       directory. The answer now waits for the store child, and a failed
+       delete is answered with 500 and keeps the entry listed.
+
     *) Change: reproducible builds: with SOURCE_DATE_EPOCH set, unitd, the
        static libraries, source tarballs, rpm, rust and jar builds no
        longer carry build paths, host names, kernel release or times.
