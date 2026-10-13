@@ -34,6 +34,14 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        application about the close was lost on a full queue, so the worker
        did not stop; it is now sent again until the queue takes it.
 
+    *) Bugfix: when the router could not get shared memory for a websocket
+       frame, the log said that a buffer pool was dry. The memory the
+       router uses for frames is not bounded by the application "shm"
+       limit, so a shortage is not what happened. The message now names
+       the bytes that were wanted, the frame size and the connection it
+       costs; the alert logged before it names the cause. See
+       https://github.com/freeunitorg/freeunit/issues/658.
+
     *) Bugfix: on a system where off_t is 32 bits by default (32-bit
        Linux with glibc, Solaris, HP-UX and QNX), several source files
        had a 32-bit off_t, and the other files had a 64-bit off_t. On

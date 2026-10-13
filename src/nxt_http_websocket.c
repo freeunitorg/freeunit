@@ -103,9 +103,18 @@ nxt_http_websocket_client(nxt_task_t *task, void *obj, void *data)
                 buf = nxt_port_mmap_get_buf(task, &req_rpc_data->app->outgoing,
                                             buf_free_size);
                 if (nxt_slow_path(buf == NULL)) {
-                    nxt_alert(task, "websocket frame refused: no free shared "
-                              "memory buffer for %uz bytes, closing the "
-                              "connection", buf_free_size);
+                    /*
+                     * A temporary shortage is not the cause here: the router
+                     * grows its own outgoing segments on demand, and this
+                     * returns null when that fails.  The alert written while
+                     * the buffer was allocated names the reason; this line
+                     * names the consequence, the bytes that were wanted, and
+                     * the frame they belong to (one buffer holds at most
+                     * PORT_MMAP_DATA_SIZE bytes of it).
+                     */
+                    nxt_alert(task, "websocket: no shared memory buffer for "
+                              "%uz bytes of a %uz byte frame, closing the "
+                              "connection", buf_free_size, frame_size);
 
                     while (out != NULL) {
                         buf = out->next;

@@ -474,7 +474,7 @@ nxt_port_new_port_mmap(nxt_task_t *task, nxt_port_mmaps_t *mmaps, nxt_int_t n)
     /* Mark as busy chunk followed the last available chunk. */
     nxt_port_mmap_set_chunk_busy(hdr->free_map, PORT_MMAP_CHUNK_COUNT);
 
-    nxt_log(task, NXT_LOG_DEBUG, "new mmap #%D created for %PI -> ...",
+    nxt_log(task, NXT_LOG_DEBUG, "new mmap #%uD created for %PI -> ...",
             hdr->id, nxt_pid);
 
     return mmap_handler;
@@ -709,19 +709,19 @@ nxt_port_mmap_get_buf(nxt_task_t *task, nxt_port_mmaps_t *mmaps, size_t size)
     nxt_port_mmap_header_t   *hdr;
     nxt_port_mmap_handler_t  *mmap_handler;
 
-    nxt_debug(task, "request %z bytes shm buffer", size);
+    nxt_debug(task, "request %uz bytes shm buffer", size);
 
     nchunks = (size + PORT_MMAP_CHUNK_SIZE - 1) / PORT_MMAP_CHUNK_SIZE;
 
     if (nxt_slow_path(nchunks > PORT_MMAP_CHUNK_COUNT)) {
-        nxt_alert(task, "requested buffer (%z) too big", size);
+        nxt_alert(task, "requested buffer (%uz) too big", size);
 
         return NULL;
     }
 
     b = nxt_buf_mem_ts_alloc(task, task->thread->engine->mem_pool, 0);
     if (nxt_slow_path(b == NULL)) {
-        nxt_alert(task, "failed to allocate a buffer for %z bytes of shared "
+        nxt_alert(task, "failed to allocate a buffer for %uz bytes of shared "
                   "memory", size);
 
         return NULL;
@@ -749,7 +749,7 @@ nxt_port_mmap_get_buf(nxt_task_t *task, nxt_port_mmaps_t *mmaps, size_t size)
     b->mem.free = b->mem.start;
     b->mem.end = b->mem.start + nchunks * PORT_MMAP_CHUNK_SIZE;
 
-    nxt_debug(task, "outgoing mmap buf allocation: %p [%p,%uz] %PI->%PI,%d,%d",
+    nxt_debug(task, "outgoing mmap buf allocation: %p [%p,%uz] %PI->%PI,%uD,%uD",
               b, b->mem.start, b->mem.end - b->mem.start,
               hdr->src_pid, hdr->dst_pid, hdr->id, c);
 
