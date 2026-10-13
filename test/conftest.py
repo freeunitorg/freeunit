@@ -292,9 +292,19 @@ def deadline(request):
 
     message = f'The test ran longer than {seconds} s.'
     expired = []
+    in_body = []
 
     def expire(signum, frame):
         expired.append(True)
+
+        # The call report exists as soon as the test body has returned or
+        # raised.  While it is absent, the deadline fired inside setup or
+        # the body, and a raise the body swallows would leave the test
+        # green.  Record that for the teardown check below.  A fire after
+        # it, in run()'s teardown, raises out of that teardown and reports
+        # itself, so it must not be reported a second time.
+        if getattr(request.node, 'rep_call', None) is None:
+            in_body.append(True)
 
         # pytest.fail() raises a BaseException, and test code does catch
         # that: _reload_and_poll_mounts() in test_go_isolation.py has an
@@ -317,11 +327,15 @@ def deadline(request):
         signal.alarm(0)
         signal.signal(signal.SIGALRM, handler)
 
-        # Only when the deadline did not already end the test, so the
-        # ordinary case stays a single failure report.
+        # Report only a deadline the test body swallowed, so the test
+        # cannot finish green.  A hang in setup leaves no call report, and
+        # a hang in run()'s teardown leaves a report that passed: both
+        # already raise out of their own phase.  Reporting those here
+        # would add a second failure for one hang, and would say the test
+        # caught a failure it never saw.
         report = getattr(request.node, 'rep_call', None)
 
-        if expired and (report is None or not report.failed):
+        if expired and in_body and report is not None and not report.failed:
             pytest.fail(f'{message}  The test caught the failure.')
 
 
