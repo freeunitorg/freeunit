@@ -69,6 +69,13 @@ typedef struct {
     nxt_app_t               *abandoned_app;
 
     nxt_bool_t              rpc_cancel;
+
+    /*
+     * Set when the deadline expired once for a request that a worker
+     * claimed from the shared queue and did not acknowledge.  See
+     * nxt_router_app_timeout().
+     */
+    uint8_t                 claimed_expired;
 } nxt_request_rpc_data_t;
 
 

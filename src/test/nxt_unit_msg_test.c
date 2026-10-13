@@ -82,6 +82,8 @@ static int                      nxt_unit_msg_test_ws_calls;
 static int                      nxt_unit_msg_test_ws_ok;
 static int                      nxt_unit_msg_test_close_calls;
 static int                      nxt_unit_msg_test_get_mmaps;
+static int                      nxt_unit_msg_test_rpc_errors;
+static int                      nxt_unit_msg_test_get_ports;
 static char                     nxt_unit_msg_test_ws_order[8];
 static size_t                   nxt_unit_msg_test_ws_norder;
 static nxt_unit_msg_test_mode_t nxt_unit_msg_test_mode;
@@ -294,6 +296,26 @@ nxt_unit_msg_test_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     msg = buf;
 
     pthread_mutex_lock(&nxt_unit_msg_test_dgrams_mutex);
+
+    /*
+     * What the router reads as the end of a failed request.  "last" makes
+     * nxt_port_rpc_handler() delete the registration; without it the
+     * registration and its port reference stay.
+     */
+    if (buf_size >= sizeof(nxt_port_msg_t)
+        && msg->type == _NXT_PORT_MSG_RPC_ERROR
+        && msg->stream == NXT_UNIT_MSG_TEST_STREAM
+        && msg->last == 1
+        && msg->pid == nxt_unit_msg_test_pid)
+    {
+        nxt_unit_msg_test_rpc_errors++;
+    }
+
+    if (buf_size >= sizeof(nxt_port_msg_t)
+        && msg->type == _NXT_PORT_MSG_GET_PORT)
+    {
+        nxt_unit_msg_test_get_ports++;
+    }
 
     if (port->id.id == NXT_UNIT_MSG_TEST_ENGINE_PORT
         && buf_size >= sizeof(nxt_port_msg_t)
@@ -1150,6 +1172,7 @@ nxt_unit_msg_test_send_request(nxt_chunk_id_t chunk,
 
     nxt_unit_msg_test_handler_calls = 0;
     nxt_unit_msg_test_handler_ok = 0;
+    nxt_unit_msg_test_rpc_errors = 0;
 
     return nxt_unit_msg_test_send_chunk(_NXT_PORT_MSG_REQ_HEADERS, 1, chunk,
                                         size);
@@ -1212,32 +1235,38 @@ typedef struct {
     nxt_chunk_id_t            chunk;
     int                       expect;
     int                       handler_calls;
+    /*
+     * RPC_ERROR messages for the stream.  A refused request gets one, so
+     * that the router does not wait for an acknowledgement.  A handler
+     * that fails the request sends one through nxt_unit_request_done().
+     */
+    int                       rpc_errors;
 } nxt_unit_msg_test_request_t;
 
 
 static const nxt_unit_msg_test_request_t  requests[] = {
     { "well-formed request reaches the handler", NULL,
-      NXT_UNIT_MSG_TEST_READ_BODY, 2, NXT_UNIT_OK, 1 },
+      NXT_UNIT_MSG_TEST_READ_BODY, 2, NXT_UNIT_OK, 1, 1 },
     { "target sptr out of buffer is refused", nxt_unit_msg_test_edit_target,
-      NXT_UNIT_MSG_TEST_READ_BODY, 2, NXT_UNIT_ERROR, 0 },
+      NXT_UNIT_MSG_TEST_READ_BODY, 2, NXT_UNIT_ERROR, 0, 1 },
     { "preread sptr out of buffer is refused", nxt_unit_msg_test_edit_preread,
-      NXT_UNIT_MSG_TEST_READ_BODY, 2, NXT_UNIT_ERROR, 0 },
+      NXT_UNIT_MSG_TEST_READ_BODY, 2, NXT_UNIT_ERROR, 0, 1 },
     { "fields_count past the buffer is refused", nxt_unit_msg_test_edit_count,
-      NXT_UNIT_MSG_TEST_READ_BODY, 2, NXT_UNIT_ERROR, 0 },
+      NXT_UNIT_MSG_TEST_READ_BODY, 2, NXT_UNIT_ERROR, 0, 1 },
     { "cached field index out of range is refused",
       nxt_unit_msg_test_edit_index,
-      NXT_UNIT_MSG_TEST_READ_BODY, 2, NXT_UNIT_ERROR, 0 },
+      NXT_UNIT_MSG_TEST_READ_BODY, 2, NXT_UNIT_ERROR, 0, 1 },
     { "field name sptr out of buffer is refused",
       nxt_unit_msg_test_edit_field_name,
-      NXT_UNIT_MSG_TEST_READ_BODY, 2, NXT_UNIT_ERROR, 0 },
+      NXT_UNIT_MSG_TEST_READ_BODY, 2, NXT_UNIT_ERROR, 0, 1 },
     { "field name inside fields[] is refused",
       nxt_unit_msg_test_edit_field_inside,
-      NXT_UNIT_MSG_TEST_READ_BODY, 2, NXT_UNIT_ERROR, 0 },
+      NXT_UNIT_MSG_TEST_READ_BODY, 2, NXT_UNIT_ERROR, 0, 1 },
     { "duplicate fields are grouped", NULL,
-      NXT_UNIT_MSG_TEST_GROUP_DUP, 2, NXT_UNIT_OK, 1 },
+      NXT_UNIT_MSG_TEST_GROUP_DUP, 2, NXT_UNIT_OK, 1, 1 },
     { "fields_count raised after the check stays in the buffer", NULL,
       NXT_UNIT_MSG_TEST_RAISE_COUNT, PORT_MMAP_CHUNK_COUNT - 1, NXT_UNIT_OK,
-      1 },
+      1, 1 },
 };
 
 
@@ -1262,7 +1291,344 @@ nxt_unit_msg_test_request_case(void *data)
         return 2;
     }
 
+    if (nxt_unit_msg_test_rpc_errors != t->rpc_errors) {
+        printf("unit msg test: %d RPC_ERROR messages, expected %d\n",
+               nxt_unit_msg_test_rpc_errors, t->rpc_errors);
+
+        /* The child ends with _exit(), which does not flush stdout. */
+        fflush(stdout);
+
+        return 3;
+    }
+
     return NXT_UNIT_MSG_TEST_RC(rc);
+}
+
+
+/*
+ * A request that a worker takes from the shared queue waits in the router
+ * for REQ_HEADERS_ACK.  libunit failed some requests before that
+ * acknowledgement and did not tell the router, so the router waited for
+ * ever.  Each case below fails a request before the acknowledgement, and
+ * the router must get exactly one RPC_ERROR for its stream.
+ */
+
+static int
+nxt_unit_msg_test_send_not_mmap(void)
+{
+    nxt_port_msg_t  msg;
+
+    memset(&msg, 0, sizeof(msg));
+
+    msg.stream = NXT_UNIT_MSG_TEST_STREAM;
+    msg.pid = nxt_unit_msg_test_pid;
+    msg.reply_port = nxt_unit_msg_test_reply_port;
+    msg.type = _NXT_PORT_MSG_REQ_HEADERS;
+    msg.last = 1;
+
+    return nxt_unit_test_process_msg(nxt_unit_msg_test_ctx, &msg, sizeof(msg),
+                                     -1);
+}
+
+
+static int
+nxt_unit_msg_test_send_short(void)
+{
+    return nxt_unit_msg_test_send_chunk(_NXT_PORT_MSG_REQ_HEADERS, 1, 2, 8);
+}
+
+
+static int
+nxt_unit_msg_test_send_bad_record(void)
+{
+    return nxt_unit_msg_test_send_chunk(_NXT_PORT_MSG_REQ_HEADERS, 1,
+                                        PORT_MMAP_CHUNK_COUNT, 100);
+}
+
+
+static int
+nxt_unit_msg_test_send_no_req_info(void)
+{
+    nxt_unit_test_request_info_failures(1);
+
+    return nxt_unit_msg_test_send_request(2, NULL);
+}
+
+
+typedef struct {
+    const char  *name;
+    int         (*send)(void);
+} nxt_unit_msg_test_unacked_t;
+
+
+static const nxt_unit_msg_test_unacked_t  unacked[] = {
+    { "request not in shared memory gets RPC_ERROR",
+      nxt_unit_msg_test_send_not_mmap },
+    { "request shorter than its header gets RPC_ERROR",
+      nxt_unit_msg_test_send_short },
+    { "request with a bad mmap record gets RPC_ERROR",
+      nxt_unit_msg_test_send_bad_record },
+    { "request with no request info gets RPC_ERROR",
+      nxt_unit_msg_test_send_no_req_info },
+};
+
+
+static int
+nxt_unit_msg_test_unacked_case(void *data)
+{
+    int                                rc;
+    const nxt_unit_msg_test_unacked_t  *t = data;
+
+    nxt_unit_msg_test_mode = NXT_UNIT_MSG_TEST_READ_BODY;
+    nxt_unit_msg_test_handler_calls = 0;
+    nxt_unit_msg_test_rpc_errors = 0;
+
+    rc = t->send();
+
+    if (rc != NXT_UNIT_ERROR || nxt_unit_msg_test_handler_calls != 0
+        || nxt_unit_msg_test_rpc_errors != 1)
+    {
+        printf("unit msg test: rc %d, handler %d, %d RPC_ERROR messages, "
+               "expected rc %d, handler 0, 1 RPC_ERROR\n", rc,
+               nxt_unit_msg_test_handler_calls, nxt_unit_msg_test_rpc_errors,
+               NXT_UNIT_ERROR);
+
+        /* The child ends with _exit(), which does not flush stdout. */
+        fflush(stdout);
+
+        return 1;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * When libunit has no descriptor for the reply port, it cannot send
+ * RPC_ERROR.  It must then release the request.  It kept the request
+ * active instead, with ->response_port not set, or set to a port with no
+ * descriptor.  The next quit called the close handler, and RPC_ERROR went
+ * through that pointer.
+ *
+ * "get_port_fails" 0: the router's pid is unknown ("process not found").
+ * 1: the reply port is unknown, and GET_PORT cannot be sent.
+ */
+
+static int
+nxt_unit_msg_test_send_to_port(pid_t pid, uint16_t reply_port)
+{
+    u_char               *p;
+    u_char               buf[sizeof(nxt_port_msg_t)
+                             + sizeof(nxt_port_mmap_msg_t)];
+    uint32_t             size;
+    nxt_port_msg_t       msg;
+    nxt_port_mmap_msg_t  rec;
+
+    p = nxt_port_mmap_chunk_start(nxt_unit_msg_test_seg0, 2);
+
+    size = nxt_unit_msg_test_write_request(p);
+
+    memset(&msg, 0, sizeof(msg));
+
+    msg.stream = NXT_UNIT_MSG_TEST_STREAM;
+    msg.pid = pid;
+    msg.reply_port = reply_port;
+    msg.type = _NXT_PORT_MSG_REQ_HEADERS;
+    msg.last = 1;
+    msg.mmap = 1;
+
+    rec.mmap_id = 0;
+    rec.chunk_id = 2;
+    rec.size = size;
+
+    memcpy(buf, &msg, sizeof(msg));
+    memcpy(buf + sizeof(msg), &rec, sizeof(rec));
+
+    return nxt_unit_test_process_msg(nxt_unit_msg_test_ctx, buf, sizeof(buf),
+                                     -1);
+}
+
+
+static int
+nxt_unit_msg_test_no_port_case(void *data)
+{
+    int             rc, get_port_fails;
+    nxt_port_msg_t  msg;
+
+    get_port_fails = *(const int *) data;
+
+    nxt_unit_msg_test_mode = NXT_UNIT_MSG_TEST_READ_BODY;
+
+    nxt_unit_msg_test_handler_calls = 0;
+    nxt_unit_msg_test_rpc_errors = 0;
+    nxt_unit_msg_test_send_fails = get_port_fails;
+
+    rc = nxt_unit_msg_test_send_to_port(get_port_fails
+                                        ? nxt_unit_msg_test_pid
+                                        : nxt_unit_msg_test_pid + 1, 9);
+
+    nxt_unit_msg_test_send_fails = 0;
+
+    if (rc != NXT_UNIT_ERROR || nxt_unit_msg_test_handler_calls != 0
+        || nxt_unit_msg_test_rpc_errors != 0)
+    {
+        printf("unit msg test: rc %d, handler %d, %d RPC_ERROR messages\n",
+               rc, nxt_unit_msg_test_handler_calls,
+               nxt_unit_msg_test_rpc_errors);
+        fflush(stdout);
+
+        return 1;
+    }
+
+    /* A QUIT with no parameter is NXT_PORT_QUIT_NORMAL. */
+    memset(&msg, 0, sizeof(msg));
+
+    msg.pid = nxt_unit_msg_test_pid;
+    msg.type = _NXT_PORT_MSG_QUIT;
+    msg.last = 1;
+
+    nxt_unit_msg_test_close_calls = 0;
+
+    (void) nxt_unit_test_process_msg(nxt_unit_msg_test_ctx, &msg, sizeof(msg),
+                                     -1);
+
+    if (nxt_unit_msg_test_close_calls != 0
+        || nxt_unit_msg_test_rpc_errors != 0)
+    {
+        printf("unit msg test: the quit found the request active: "
+               "%d close calls, %d RPC_ERROR messages\n",
+               nxt_unit_msg_test_close_calls, nxt_unit_msg_test_rpc_errors);
+        fflush(stdout);
+
+        return 2;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * A port whose GET_PORT failed stayed in lib->ports with no descriptor.
+ * A later request to it found it, waited for a NEW_PORT that nobody asked
+ * for, and did not send GET_PORT again.
+ */
+
+static int
+nxt_unit_msg_test_get_port_again_case(void *data)
+{
+    int  rc;
+
+    nxt_unit_msg_test_mode = NXT_UNIT_MSG_TEST_READ_BODY;
+
+    nxt_unit_msg_test_send_fails = 1;
+
+    rc = nxt_unit_msg_test_send_to_port(nxt_unit_msg_test_pid, 9);
+
+    nxt_unit_msg_test_send_fails = 0;
+
+    if (rc != NXT_UNIT_ERROR) {
+        printf("unit msg test: rc %d, expected %d\n", rc, NXT_UNIT_ERROR);
+        fflush(stdout);
+
+        return 1;
+    }
+
+    nxt_unit_msg_test_get_ports = 0;
+
+    rc = nxt_unit_msg_test_send_to_port(nxt_unit_msg_test_pid, 9);
+
+    if (rc != NXT_UNIT_OK || nxt_unit_msg_test_get_ports != 1) {
+        printf("unit msg test: the second request: rc %d, %d GET_PORT "
+               "messages, expected rc %d, 1 GET_PORT\n", rc,
+               nxt_unit_msg_test_get_ports, NXT_UNIT_OK);
+        fflush(stdout);
+
+        return 2;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * A request that fails before its acknowledgement while the GET_PORT of an
+ * earlier request to the same reply port is still in flight.  The port is in
+ * lib->ports but not ready, so libunit cannot send RPC_ERROR; it logs that,
+ * and the warning must name the port as not ready, not as not known.
+ */
+
+static int
+nxt_unit_msg_test_port_not_ready_case(void *data)
+{
+    int             rc, saved, fds[2];
+    char            log[4096];
+    ssize_t         n;
+    nxt_port_msg_t  msg;
+
+    nxt_unit_msg_test_mode = NXT_UNIT_MSG_TEST_READ_BODY;
+
+    nxt_unit_msg_test_get_ports = 0;
+
+    rc = nxt_unit_msg_test_send_to_port(nxt_unit_msg_test_pid, 9);
+
+    if (rc != NXT_UNIT_OK || nxt_unit_msg_test_get_ports != 1) {
+        printf("unit msg test: the first request: rc %d, %d GET_PORT "
+               "messages, expected rc %d, 1 GET_PORT\n", rc,
+               nxt_unit_msg_test_get_ports, NXT_UNIT_OK);
+        fflush(stdout);
+
+        return 1;
+    }
+
+    if (pipe(fds) == -1) {
+        return 2;
+    }
+
+    saved = dup(STDERR_FILENO);
+
+    if (saved == -1
+        || dup2(fds[1], STDERR_FILENO) == -1
+        || fcntl(fds[0], F_SETFL, O_NONBLOCK) == -1)
+    {
+        return 2;
+    }
+
+    memset(&msg, 0, sizeof(msg));
+
+    msg.stream = NXT_UNIT_MSG_TEST_STREAM;
+    msg.pid = nxt_unit_msg_test_pid;
+    msg.reply_port = 9;
+    msg.type = _NXT_PORT_MSG_REQ_HEADERS;
+    msg.last = 1;
+
+    nxt_unit_msg_test_rpc_errors = 0;
+
+    rc = nxt_unit_test_process_msg(nxt_unit_msg_test_ctx, &msg, sizeof(msg),
+                                   -1);
+
+    (void) dup2(saved, STDERR_FILENO);
+    close(saved);
+    close(fds[1]);
+
+    n = read(fds[0], log, sizeof(log) - 1);
+    close(fds[0]);
+
+    log[n > 0 ? n : 0] = '\0';
+
+    if (rc != NXT_UNIT_ERROR || nxt_unit_msg_test_rpc_errors != 0
+        || strstr(log, "is not ready") == NULL
+        || strstr(log, "is not known") != NULL)
+    {
+        printf("unit msg test: the failed request: rc %d, %d RPC_ERROR "
+               "messages, expected rc %d, 0 RPC_ERROR and a \"not ready\" "
+               "warning; log: %s\n", rc, nxt_unit_msg_test_rpc_errors,
+               NXT_UNIT_ERROR, log);
+        fflush(stdout);
+
+        return 3;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
 }
 
 
@@ -3184,6 +3550,7 @@ main(void)
     nxt_port_mmap_msg_t  rec[2];
 
     static const int  whole_frame = 1, short_frame = 0;
+    static const int  get_port_fails = 1, process_not_found = 0;
 
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, ready) == -1
         || socketpair(AF_UNIX, SOCK_DGRAM, 0, router) == -1
@@ -3321,6 +3688,29 @@ main(void)
                                    nxt_unit_msg_test_request_case,
                                    (void *) &requests[i], requests[i].expect);
     }
+
+    for (i = 0; i < nxt_nitems(unacked); i++) {
+        nxt_unit_msg_test_in_child(unacked[i].name,
+                                   nxt_unit_msg_test_unacked_case,
+                                   (void *) &unacked[i], NXT_UNIT_OK);
+    }
+
+    nxt_unit_msg_test_in_child("request from an unknown process is released",
+                               nxt_unit_msg_test_no_port_case,
+                               (void *) &process_not_found, NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("request whose GET_PORT failed is released",
+                               nxt_unit_msg_test_no_port_case,
+                               (void *) &get_port_fails, NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("port whose GET_PORT failed is asked for "
+                               "again", nxt_unit_msg_test_get_port_again_case,
+                               NULL, NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("request that fails while its port is not "
+                               "ready is reported as not ready",
+                               nxt_unit_msg_test_port_not_ready_case, NULL,
+                               NXT_UNIT_OK);
 
     nxt_unit_msg_test_in_child("preread offset changed after the check is "
                                "not followed",

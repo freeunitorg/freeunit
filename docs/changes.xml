@@ -386,6 +386,20 @@ option, the probes are not in the build.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a request that a worker took from the shared queue and did not acknowledge
+could wait for ever.  With "limits": {"timeout"} set, the router now logs an
+alert at the first deadline and answers 503 at the second, so the client waits
+up to two times the timeout.  libunit now tells the router when it fails a
+request before the acknowledgement, and the router answers 503.  With the
+default timeout of 0, three cases still leave the request waiting: a worker that
+dies between the claim and the acknowledgement, a request that libunit fails
+while the reply port is not known or not ready, and a request whose GET_PORT
+cannot be sent.  See https://github.com/freeunitorg/freeunit/issues/665.
+</para>
+</change>
+
 </changes>
 
 

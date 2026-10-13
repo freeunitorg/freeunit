@@ -8804,13 +8804,36 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
      * would both fail the request and run it -- twice, if the client
      * retries.
      *
-     * Leave a claimed request alone until its acknowledgement, and do not
-     * re-arm: the acknowledgement arms this timer again.  Do not answer it
-     * at a later expiry either.  The chain's tail is the request body that
-     * nxt_router_req_headers_ack_handler() still has to send, and libunit
-     * keeps the request until that body arrives.  An unlink here would drop
-     * the body and cancel the RPC, so a late acknowledgement is ignored and
-     * the request stays in the worker for ever.
+     * Do not answer a claimed request at its first expiry.  The chain's
+     * tail is the request body that nxt_router_req_headers_ack_handler()
+     * still has to send, and libunit keeps the request until that body
+     * arrives.  An unlink drops that body.
+     *
+     * The acknowledgement usually comes within microseconds of the claim.
+     * A whole timeout without it means that the worker failed or died
+     * before it sent one.  Log an alert, because nothing else reports this
+     * state, and re-arm the timer.  The acknowledgement replaces the timer
+     * with its own deadline.
+     *
+     * At the second expiry, answer 503 and unlink, as for a request that a
+     * worker acknowledged and runs too long.  The unlink cancels the RPC.
+     * A late acknowledgement or response then finds no handler in
+     * nxt_port_rpc_handler() and is dropped.  The port layer completes the
+     * buffers of a message that no handler took.
+     *
+     * The router cannot mark the worker detached, as nxt_router_app_abandon()
+     * does for an acknowledged request.  The request is still on the shared
+     * port, and the router does not know which worker claimed it.
+     *
+     * A worker that does get the request after the 503 can still run it.  If
+     * the body did not fit in the headers message, the worker waits for a
+     * body that does not come.  The next QUIT from the router has no
+     * parameter, so libunit fails every active request then
+     * (nxt_unit_quit()).
+     *
+     * The unlink leaves the shared memory of the headers to the worker:
+     * nxt_router_msg_cancel() keeps ->is_port_mmap_sent, because the
+     * retraction lost.
      *
      * The acknowledgement replaces ->app_port with the worker's own port, so
      * the shared port here means that it has not arrived yet.
@@ -8824,10 +8847,27 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
         && req_rpc_data->app_port != NULL
         && req_rpc_data->app_port->id == NXT_SHARED_PORT_ID)
     {
-        nxt_debug(task, "stream #%uD: claimed, waiting for the ack",
-                  req_rpc_data->stream);
+        /* The request is still linked, so it holds the application. */
+        nxt_assert(req_rpc_data->app != NULL);
 
-        return;
+        if (req_rpc_data->claimed_expired == 0) {
+            req_rpc_data->claimed_expired = 1;
+
+            nxt_alert(task, "app \"%V\": stream #%uD was claimed by a worker, "
+                      "and the %M ms deadline expired without an "
+                      "acknowledgement",
+                      &req_rpc_data->app->name, req_rpc_data->stream,
+                      req_rpc_data->app->timeout);
+
+            nxt_timer_add(task->thread->engine, timer,
+                          req_rpc_data->app->timeout);
+
+            return;
+        }
+
+        nxt_log(task, NXT_LOG_WARN, "app \"%V\": stream #%uD is still not "
+                "acknowledged, answering 503", &req_rpc_data->app->name,
+                req_rpc_data->stream);
     }
 
     /*
@@ -8884,6 +8924,25 @@ nxt_router_http_request_release(nxt_task_t *task, void *obj, void *data)
 
     nxt_mp_release(r->mem_pool);
 }
+
+
+#if (NXT_TESTS)
+
+/*
+ * A request RPC with the handlers that nxt_router_process_http_request()
+ * registers, for src/test/nxt_router_app_timeout_test.c.
+ */
+
+void *
+nxt_router_test_request_rpc_register(nxt_task_t *task, nxt_port_t *port)
+{
+    return nxt_port_rpc_register_handler_ex(task, port,
+                                            nxt_router_response_ready_handler,
+                                            nxt_router_response_error_handler,
+                                            sizeof(nxt_request_rpc_data_t));
+}
+
+#endif
 
 
 /*
