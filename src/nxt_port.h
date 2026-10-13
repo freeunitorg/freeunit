@@ -271,6 +271,16 @@ typedef struct {
 } nxt_port_msg_t;
 
 
+/*
+ * The message header is copied as bytes into the data of a port queue item,
+ * and the reader decodes it with its own layout.
+ */
+nxt_static_assert(offsetof(nxt_port_msg_t, mmap) == 12,
+                  "nxt_port_msg_t: mmap moved");
+nxt_static_assert(sizeof(nxt_port_msg_t) == 16,
+                  "nxt_port_msg_t: size changed");
+
+
 typedef struct {
     nxt_queue_link_t    link;
     nxt_buf_t           *buf;
