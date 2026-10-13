@@ -75,6 +75,16 @@ application needs a rebuild against the new libunit.
 
 <change type="bugfix">
 <para>
+the control API answered 200 to a DELETE of an njs module or of a certificate
+before the store child had removed its file.  A delete that failed was
+reported as success, and the module or the certificate left the list while its
+file stayed in the state directory.  The answer now waits for the store child,
+and a failed delete is answered with 500 and keeps the entry listed.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 with "compression" on, a response could reach the client as a corrupt or
 endless stream.  When the response header fields were over about 1 KiB, the
 first part of the body, up to 16 KiB, went out uncompressed under
