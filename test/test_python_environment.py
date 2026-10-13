@@ -160,3 +160,15 @@ def test_python_environment_replace_default():
         )['body']
         == home_default
     ), 'restore default'
+
+
+def test_python_environment_executable_no_path():
+    # With no "home", the module starts Python from the interpreter it was
+    # built against, not from a PATH search: with no Python in the PATH,
+    # sys.executable is still a working interpreter.
+    client.load('executable', environment={'PATH': '/nonexistent'})
+
+    resp = client.get()
+    assert resp['status'] == 200, 'status'
+    assert resp['headers']['X-Executable'].startswith('/'), 'absolute'
+    assert resp['headers']['X-Executable-Ok'] == 'True', 'executable'

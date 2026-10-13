@@ -243,6 +243,19 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        the rest, but did not ask to be woken up to send it. The bug came
        from NGINX Unit.
 
+    *) Bugfix: an embedded Python interpreter could load the standard
+       library of another Python. When an application had no "home"
+       option, the interpreter found its prefix through a search for
+       "python3" in PATH. With a Python installed outside the system
+       prefix, a system Python of the same minor version could win, and
+       imports failed for the modules that differed. The interpreter
+       that the module is built against is now recorded at configure
+       time and used as the program name when the application
+       configuration does not set "home", which still wins. If neither
+       that interpreter nor its standard library is there at run time, a
+       warning is logged and PATH is searched as before. The environment,
+       such as PYTHONPATH, is used as before.
+
     *) Bugfix: when the access log record of a request failed, the router
        did not close the request. A JS "format" that throws an exception
        for a request is one cause. The client connection stayed open, and

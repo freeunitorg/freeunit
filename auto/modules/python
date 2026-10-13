@@ -157,6 +157,33 @@ for p in sys.path:
 
 print("};\n\n")
 
+# The interpreter the module is built against.  An application with no "home"
+# starts with it as the program name; without it, CPython looks for "python3"
+# in PATH, and a system Python of the same minor version can win.  Written as
+# a C string here rather than passed as -D, so that any path compiles: each
+# byte outside printable ASCII, and the quote, the backslash and the question
+# mark (no trigraphs), is an octal escape.
+def c_string(path):
+    if not isinstance(path, bytes):
+        path = path.encode(sys.getfilesystemencoding(), "surrogateescape")
+    lit = ""
+    for b in bytearray(path):
+        if 32 <= b < 127 and b not in (34, 63, 92):
+            lit += chr(b)
+        else:
+            lit += "\\%03o" % b
+    return lit
+
+exe = sys.executable
+if exe:
+    print("#define NXT_PYTHON_EXECUTABLE  \"%s\"\n" % c_string(exe))
+
+    # A file of the standard library mounted above.  In a rootfs the
+    # interpreter binary is not mounted, but the prefix search from its path
+    # still finds this library.
+    print("#define NXT_PYTHON_STDLIB_FILE  \"%s\"\n"
+          % c_string(os.path.join(base, "os.py")))
+
 ' > $NXT_BUILD_DIR/include/$NXT_PYTHON_MOUNTS_HEADER
 
 
