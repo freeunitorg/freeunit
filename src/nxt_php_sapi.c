@@ -1332,8 +1332,17 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
      */
     if (access(filename, R_OK) != 0) {
         nxt_int_t  ec;
+        nxt_err_t  save_errno;
+
+        /*
+         * nxt_php_handle_fs_err() keys its reply on errno.  Preserve the
+         * value that access() set in case logging overwrites it.
+         */
+        save_errno = errno;
 
         nxt_unit_req_debug(ctx->req, "PHP access(\"%s\") failed", filename);
+
+        nxt_set_errno(save_errno);
 
         ec = nxt_php_handle_fs_err(ctx->req);
         nxt_unit_request_done(ctx->req, ec);
@@ -1345,8 +1354,17 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
     fp = fopen(filename, "re");
     if (fp == NULL) {
         nxt_int_t  ec;
+        nxt_err_t  save_errno;
+
+        /*
+         * nxt_php_handle_fs_err() keys its reply on errno.  Preserve the
+         * value that fopen() set in case logging overwrites it.
+         */
+        save_errno = errno;
 
         nxt_unit_req_debug(ctx->req, "PHP fopen(\"%s\") failed", filename);
+
+        nxt_set_errno(save_errno);
 
         ec = nxt_php_handle_fs_err(ctx->req);
         nxt_unit_request_done(ctx->req, ec);
