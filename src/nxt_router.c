@@ -245,6 +245,11 @@ static void nxt_router_remove_pid_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 
 static nxt_router_temp_conf_t *nxt_router_temp_conf(nxt_task_t *task);
+static void nxt_router_conf_start(nxt_task_t *task, nxt_port_t *port,
+    uint32_t stream, nxt_fd_t fd, size_t size);
+static void nxt_router_conf_end(nxt_task_t *task);
+static void nxt_router_conf_deferred_handler(nxt_task_t *task, void *obj,
+    void *data);
 static void nxt_router_conf_ready(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf);
 static void nxt_router_conf_send(nxt_task_t *task,
@@ -591,6 +596,22 @@ nxt_queue_t  pending_sockets;
 nxt_queue_t  updating_sockets;
 nxt_queue_t  keeping_sockets;
 nxt_queue_t  deleting_sockets;
+
+/*
+ * Set while a configuration apply is in progress, until nxt_router_conf_ready()
+ * or nxt_router_conf_error() ends it.  All applies share the socket queues
+ * above, and nxt_router_temp_conf() initialises them again.  Two applies
+ * would free the same listener twice, so a new configuration waits.
+ */
+static nxt_bool_t  nxt_router_conf_applying;
+
+/* The newest configuration that waits for the apply to end. */
+static struct {
+    nxt_port_t      *port;
+    uint32_t        stream;
+    nxt_fd_t        fd;
+    size_t          size;
+} nxt_router_conf_deferred;
 
 
 static nxt_int_t
@@ -1930,11 +1951,9 @@ nxt_router_test_msg_sender_ok(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 static void
 nxt_router_conf_data_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
-    void                    *p;
-    size_t                  size;
-    nxt_int_t               ret;
-    nxt_port_t              *port;
-    nxt_router_temp_conf_t  *tmcf;
+    size_t      size;
+    nxt_fd_t    fd;
+    nxt_port_t  *port;
 
     port = nxt_runtime_port_find(task->thread->runtime,
                                  msg->port_msg.pid,
@@ -1945,36 +1964,107 @@ nxt_router_conf_data_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         return;
     }
 
-    p = MAP_FAILED;
+    if (nxt_buf_mem_used_size(&msg->buf->mem) != sizeof(size_t)) {
+        nxt_alert(task, "conf_data_handler: unexpected buffer size (%d)",
+                  (int) nxt_buf_mem_used_size(&msg->buf->mem));
+
+        nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR, -1,
+                              msg->port_msg.stream, 0, NULL);
+
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+    nxt_memcpy(&size, msg->buf->mem.pos, sizeof(size_t));
+
+    /* The configuration descriptor is ours from here on. */
+
+    fd = msg->fd[0];
+    msg->fd[0] = -1;
+
+    /* Close any other descriptor, so a forged message cannot leak one. */
+    nxt_port_recv_msg_close_fds(msg);
 
     /*
-     * Ancient compilers like gcc 4.8.5 on CentOS 7 wants 'size' to be
-     * initialized in 'cleanup' section.
+     * A waiting configuration also makes the new one wait.  After an apply
+     * ends, the waiting one starts from the work queue, and a configuration
+     * that arrives before that must not start first: the older one would
+     * then be applied after it.
      */
-    size = 0;
+
+    if (nxt_slow_path(nxt_router_conf_applying
+                      || nxt_router_conf_deferred.port != NULL))
+    {
+        /*
+         * Do not refuse it: the controller takes an error as "the stored
+         * configuration is invalid".  Keep only the newest waiting
+         * configuration.  Answer an older one with an error, because its
+         * sender was replaced.
+         */
+
+        if (nxt_router_conf_deferred.port != NULL) {
+            nxt_log(task, NXT_LOG_WARN, "conf_data_handler: a newer "
+                    "configuration replaces the one waiting for the apply");
+
+            nxt_port_socket_write(task, nxt_router_conf_deferred.port,
+                                  NXT_PORT_MSG_RPC_ERROR, -1,
+                                  nxt_router_conf_deferred.stream, 0, NULL);
+
+            if (nxt_router_conf_deferred.fd != -1) {
+                nxt_fd_close(nxt_router_conf_deferred.fd);
+            }
+
+            nxt_port_use(task, nxt_router_conf_deferred.port, -1);
+
+            nxt_router_conf_deferred.port = NULL;
+        }
+
+        nxt_debug(task, "conf_data_handler: a configuration is being "
+                  "applied, the new one waits");
+
+        nxt_port_use(task, port, 1);
+
+        nxt_router_conf_deferred.port = port;
+        nxt_router_conf_deferred.stream = msg->port_msg.stream;
+        nxt_router_conf_deferred.fd = fd;
+        nxt_router_conf_deferred.size = size;
+
+#if (NXT_TESTS)
+        nxt_router_test_confs_deferred++;
+#endif
+
+        return;
+    }
+
+    nxt_router_conf_start(task, port, msg->port_msg.stream, fd, size);
+}
+
+
+static void
+nxt_router_conf_start(nxt_task_t *task, nxt_port_t *port, uint32_t stream,
+    nxt_fd_t fd, size_t size)
+{
+    void                    *p;
+    nxt_int_t               ret;
+    nxt_router_conf_t       *rtcf;
+    nxt_router_temp_conf_t  *tmcf;
+
+    p = MAP_FAILED;
 
     tmcf = nxt_router_temp_conf(task);
     if (nxt_slow_path(tmcf == NULL)) {
         goto fail;
     }
 
-    if (nxt_slow_path(msg->fd[0] == -1)) {
+    if (nxt_slow_path(fd == -1)) {
         nxt_alert(task, "conf_data_handler: invalid shm fd");
         goto fail;
     }
 
-    if (nxt_buf_mem_used_size(&msg->buf->mem) != sizeof(size_t)) {
-        nxt_alert(task, "conf_data_handler: unexpected buffer size (%d)",
-                  (int) nxt_buf_mem_used_size(&msg->buf->mem));
-        goto fail;
-    }
+    p = nxt_mem_mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
 
-    nxt_memcpy(&size, msg->buf->mem.pos, sizeof(size_t));
-
-    p = nxt_mem_mmap(NULL, size, PROT_READ, MAP_SHARED, msg->fd[0], 0);
-
-    nxt_fd_close(msg->fd[0]);
-    msg->fd[0] = -1;
+    nxt_fd_close(fd);
+    fd = -1;
 
     if (nxt_slow_path(p == MAP_FAILED)) {
         goto fail;
@@ -1983,10 +2073,13 @@ nxt_router_conf_data_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_debug(task, "conf_data_handler(%uz): %*s", size, size, p);
 
     tmcf->router_conf->router = nxt_router;
-    tmcf->stream = msg->port_msg.stream;
+    tmcf->stream = stream;
     tmcf->port = port;
 
     nxt_port_use(task, tmcf->port, 1);
+
+    /* Ended by nxt_router_conf_ready() or nxt_router_conf_error(). */
+    nxt_router_conf_applying = 1;
 
     ret = nxt_router_conf_create(task, tmcf, p, nxt_pointer_to(p, size));
 
@@ -1997,29 +2090,78 @@ nxt_router_conf_data_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         nxt_router_conf_error(task, tmcf);
     }
 
-    goto cleanup;
+    nxt_mem_munmap(p, size);
+
+    return;
 
 fail:
 
-    nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR, -1,
-                          msg->port_msg.stream, 0, NULL);
+    nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR, -1, stream, 0,
+                          NULL);
 
     if (tmcf != NULL) {
+        /* Free what nxt_router_temp_conf() made, including the rtcf pool. */
+        rtcf = tmcf->router_conf;
+
+        if (rtcf->tstr_state != NULL) {
+            nxt_tstr_state_release(rtcf->tstr_state);
+        }
+
+        nxt_mp_destroy(rtcf->mem_pool);
         nxt_mp_release(tmcf->mem_pool);
     }
 
-cleanup:
+    if (fd != -1) {
+        nxt_fd_close(fd);
+    }
 
     if (p != MAP_FAILED) {
         nxt_mem_munmap(p, size);
     }
+}
 
-    /*
-     * Close both descriptors: the configuration arrives on fd[0], but a
-     * compromised sender can attach a second one to any message and would
-     * otherwise leak a descriptor of the router on every forged message.
-     */
-    nxt_port_recv_msg_close_fds(msg);
+
+/*
+ * Ends an apply.  The waiting configuration starts from the work queue, not
+ * from here, because the caller still releases the apply that ended.
+ */
+
+static void
+nxt_router_conf_end(nxt_task_t *task)
+{
+    nxt_router_conf_applying = 0;
+
+    if (nxt_router_conf_deferred.port != NULL) {
+        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                           nxt_router_conf_deferred_handler, task, NULL, NULL);
+    }
+}
+
+
+static void
+nxt_router_conf_deferred_handler(nxt_task_t *task, void *obj, void *data)
+{
+    size_t      size;
+    uint32_t    stream;
+    nxt_fd_t    fd;
+    nxt_port_t  *port;
+
+    port = nxt_router_conf_deferred.port;
+
+    if (port == NULL || nxt_router_conf_applying) {
+        /* Another apply started first; its end posts this again. */
+        return;
+    }
+
+    stream = nxt_router_conf_deferred.stream;
+    fd = nxt_router_conf_deferred.fd;
+    size = nxt_router_conf_deferred.size;
+
+    nxt_router_conf_deferred.port = NULL;
+
+    nxt_router_conf_start(task, port, stream, fd, size);
+
+    nxt_port_use(task, port, -1);
 }
 
 
@@ -2369,6 +2511,39 @@ nxt_router_test_temp_conf(nxt_task_t *task)
     return nxt_router_temp_conf(task);
 }
 
+
+/* For src/test/nxt_router_conf_overlap_test.c. */
+
+nxt_uint_t  nxt_router_test_confs_deferred;
+
+
+void
+nxt_router_test_conf_data_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_router_conf_data_handler(task, msg);
+}
+
+
+void
+nxt_router_test_conf_applying_set(nxt_bool_t applying)
+{
+    nxt_router_conf_applying = applying;
+}
+
+
+nxt_bool_t
+nxt_router_test_conf_deferred(void)
+{
+    return (nxt_router_conf_deferred.port != NULL);
+}
+
+
+nxt_bool_t
+nxt_router_test_conf_applying(void)
+{
+    return nxt_router_conf_applying;
+}
+
 #endif
 
 
@@ -2554,6 +2729,8 @@ nxt_router_conf_ready(nxt_task_t *task, nxt_router_temp_conf_t *tmcf)
         return;
     }
 
+    nxt_router_conf_end(task);
+
     nxt_router_conf_send(task, tmcf, NXT_PORT_MSG_RPC_READY_LAST);
 
     rtcf = tmcf->router_conf;
@@ -2591,6 +2768,8 @@ nxt_router_conf_error(nxt_task_t *task, nxt_router_temp_conf_t *tmcf)
     nxt_router_conf_t  *rtcf;
 
     nxt_alert(task, "failed to apply new conf");
+
+    nxt_router_conf_end(task);
 
     for (qlk = nxt_queue_first(&creating_sockets);
          qlk != nxt_queue_tail(&creating_sockets);

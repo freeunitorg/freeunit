@@ -395,6 +395,14 @@ void nxt_router_test_app_port_release(nxt_task_t *task, nxt_app_t *app,
  * releases, for the start-deadline test.
  */
 nxt_router_temp_conf_t *nxt_router_test_temp_conf(nxt_task_t *task);
+
+/* The deferral of an overlapping apply, for the conf overlap test. */
+extern nxt_uint_t  nxt_router_test_confs_deferred;
+void nxt_router_test_conf_data_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+void nxt_router_test_conf_applying_set(nxt_bool_t applying);
+nxt_bool_t nxt_router_test_conf_applying(void);
+nxt_bool_t nxt_router_test_conf_deferred(void);
 void nxt_router_test_app_rpc_create(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf, nxt_app_t *app);
 
