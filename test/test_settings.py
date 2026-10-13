@@ -114,7 +114,7 @@ def test_settings_server_version():
 def test_settings_header_read_timeout():
     client.load('empty')
 
-    def req():
+    def req(expect_408=False):
         (_, sock) = client.http(
             b"""GET / HTTP/1.1
 """,
@@ -123,6 +123,23 @@ def test_settings_header_read_timeout():
             raw=True,
         )
 
+        if expect_408:
+            # header_read_timeout answers by itself: the timer callback writes
+            # "408 Request Timeout" and closes (nxt_h1p_request_timedout(),
+            # src/nxt_h1proto.c).  The rest of the header is not what makes
+            # the server answer, so read that response instead of sleeping
+            # past the timer and then writing into a connection the server
+            # has already finished with.  15s bounds a timer that never fires
+            # to a failure here, not to recvall()'s 60s default.
+            resp = client.http(b'', sock=sock, raw=True, read_timeout=15)
+
+            assert 'status' in resp, f'no response before the timer: {resp}'
+
+            return resp
+
+        # The second half asserts that the *new* value took effect: the rest
+        # of the header must arrive after the old 2s boundary and still be
+        # served, so this sleep has to outlast that boundary.
         time.sleep(3)
 
         return client.http(
@@ -137,7 +154,7 @@ Connection: close
     assert 'success' in client.conf(
         {'http': {'header_read_timeout': 2}}, 'settings'
     )
-    assert req()['status'] == 408, 'status header read timeout'
+    assert req(expect_408=True)['status'] == 408, 'status header read timeout'
 
     assert 'success' in client.conf(
         {'http': {'header_read_timeout': 7}}, 'settings'
@@ -200,7 +217,7 @@ def test_settings_header_read_timeout_update():
 def test_settings_body_read_timeout():
     client.load('empty')
 
-    def req():
+    def req(expect_408=False):
         (_, sock) = client.http(
             b"""POST / HTTP/1.1
 Host: localhost
@@ -214,6 +231,18 @@ Connection: close
             raw=True,
         )
 
+        if expect_408:
+            # body_read_timeout is a gap timer that starts with the body read
+            # state (src/nxt_h1proto.c), so the 408 arrives with no body ever
+            # sent.  Read it, for the same reason as the header test above.
+            resp = client.http(b'', sock=sock, raw=True, read_timeout=15)
+
+            assert 'status' in resp, f'no response before the timer: {resp}'
+
+            return resp
+
+        # The body has to arrive after the old 2s boundary and still be
+        # served, so that the assertion below is about the new value.
         time.sleep(3)
 
         return client.http(b"""0123456789""", sock=sock, raw=True)
@@ -221,7 +250,7 @@ Connection: close
     assert 'success' in client.conf(
         {'http': {'body_read_timeout': 2}}, 'settings'
     )
-    assert req()['status'] == 408, 'status body read timeout'
+    assert req(expect_408=True)['status'] == 408, 'status body read timeout'
 
     assert 'success' in client.conf(
         {'http': {'body_read_timeout': 7}}, 'settings'
@@ -1237,13 +1266,26 @@ def test_settings_timeout_stored(
 def test_settings_idle_timeout():
     client.load('empty')
 
-    def req():
+    def req(expect_408=False):
         (_, sock) = client.get(
             headers={'Host': 'localhost', 'Connection': 'keep-alive'},
             start=True,
             read_timeout=1,
         )
 
+        if expect_408:
+            # The idle timer writes "408 Request Timeout" and closes by
+            # itself (nxt_h1p_idle_timeout() -> nxt_h1p_idle_response(),
+            # src/nxt_h1proto.c); the next request is not what produces it.
+            # Read it instead of sleeping past the timer.
+            resp = client.http(b'', sock=sock, raw=True, read_timeout=15)
+
+            assert 'status' in resp, f'no response before the timer: {resp}'
+
+            return resp
+
+        # The second half needs the new value to take effect: the next request
+        # must arrive after the old 2s boundary and still be served.
         time.sleep(3)
 
         return client.get(sock=sock)
@@ -1251,7 +1293,7 @@ def test_settings_idle_timeout():
     assert client.get()['status'] == 200, 'init'
 
     assert 'success' in client.conf({'http': {'idle_timeout': 2}}, 'settings')
-    assert req()['status'] == 408, 'status idle timeout'
+    assert req(expect_408=True)['status'] == 408, 'status idle timeout'
 
     assert 'success' in client.conf({'http': {'idle_timeout': 7}}, 'settings')
     assert req()['status'] == 200, 'status idle timeout 2'
@@ -1260,8 +1302,17 @@ def test_settings_idle_timeout():
 def test_settings_idle_timeout_2():
     client.load('empty')
 
-    def req():
+    def req(expect_408=False):
         sock = client.http(b'', raw=True, no_recv=True)
+
+        if expect_408:
+            # Nothing was written on the connection, so the accepted-socket
+            # state's timer is the one that fires and answers, as above.
+            resp = client.http(b'', sock=sock, raw=True, read_timeout=15)
+
+            assert 'status' in resp, f'no response before the timer: {resp}'
+
+            return resp
 
         time.sleep(3)
 
@@ -1270,7 +1321,7 @@ def test_settings_idle_timeout_2():
     assert client.get()['status'] == 200, 'init'
 
     assert 'success' in client.conf({'http': {'idle_timeout': 1}}, 'settings')
-    assert req()['status'] == 408, 'status idle timeout'
+    assert req(expect_408=True)['status'] == 408, 'status idle timeout'
 
     assert 'success' in client.conf({'http': {'idle_timeout': 7}}, 'settings')
     assert req()['status'] == 200, 'status idle timeout 2'
