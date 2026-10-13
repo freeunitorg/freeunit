@@ -1207,8 +1207,29 @@ jobs:
   # (test fixtures freeing what they allocated -- lvlhsh buckets, ports,
   # runtime processes).
   c-tests-asan:
+    # Both compilers, or the C core is sanitized by exactly one of them.  The
+    # gcc branches of the sanitizer detection that
+    # https://github.com/freeunitorg/freeunit/pull/693 adds to nxt_clang.h
+    # (__SANITIZE_ADDRESS__ and friends) would then never run here.  Both legs
+    # of this matrix use one flag set, so a UBSan report fails both or
+    # neither.  The runtime leg in sanitize.yml keeps UBSan recoverable on
+    # purpose: aborting on the first report kills an exec'd application worker
+    # mid-response (see the halt_on_error note and the "Configure unit"
+    # comment there).  This leg runs one test process with no allowlist, so it
+    # fails fast.
+    # MemorySanitizer cannot be added to this matrix: gcc rejects the option
+    # outright ("unrecognized argument to '-fsanitize=' option: 'memory'", gcc
+    # 15.3.0 and 16.2.0), so MSan stays a clang-only leg.  HWAddressSanitizer
+    # builds on both compilers but aborts at startup on x86_64 ("requires a
+    # kernel with tagged address ABI"), so it belongs on an aarch64 leg.
+    name: "c-tests-asan (${{ matrix.cc }})"
     runs-on: ubuntu-26.04
     timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [clang, gcc]
 
     steps:
       - uses: actions/checkout@v7
@@ -1226,14 +1247,26 @@ jobs:
 
       # -fno-sanitize-recover: the first UBSan report fails the job.
       # nxt_conf_map_object_test fails only under UBSan.
+      #
+      # -O1 is spelled out as in sanitize.yml: --cc-opt lands after the
+      # built-in -O, so a change of that default cannot split the two
+      # workflows.
+      #
+      # detect_leaks=0 for configure only, as in sanitize.yml: auto/feature
+      # runs its probes, and auto/malloc's malloc_usable_size() probe does not
+      # free.  With LeakSanitizer on, the probe exits nonzero, configure
+      # prints "found but is not working", and NXT_HAVE_MALLOC_USABLE_SIZE is
+      # dropped.  The tests below still run with leak detection on.
       - name: Configure unit (ASan+LSan+UBSan, --tests, --openssl)
+        env:
+          ASAN_OPTIONS: "detect_leaks=0"
         run: |
           ./configure \
-            --cc=clang \
+            --cc=${{ matrix.cc }} \
             --debug \
             --tests \
             --openssl \
-            --cc-opt="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g" \
+            --cc-opt="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -O1 -g" \
             --ld-opt="-fsanitize=address,undefined"
 
       # The hook gate needs the plain objects as well as the instrumented ones:

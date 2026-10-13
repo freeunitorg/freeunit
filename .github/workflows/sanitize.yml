@@ -259,11 +259,23 @@ jobs:
         env:
           ASAN_OPTIONS: "detect_leaks=0"
         run: |
+          # gcc: this leg sanitizes the runtimes, the C-core leg above runs both
+          # compilers over the unit tests.  Spelled out rather than inherited from
+          # the image, so a change of default compiler is a change of coverage and
+          # has to be made here.
+          #
+          # UBSan stays recoverable here, unlike in c-tests-asan: the allowlist
+          # this leg's gate reads is a post-hoc log scan, so aborting on the first
+          # report would fail a job for a violation the list waives, and would kill
+          # an exec'd app worker mid-response (the reason halt_on_error is not set
+          # above either).  c-tests-asan has no allowlist, which is why it can and
+          # does fail fast.
           ./configure \
+            --cc=gcc \
             --debug \
             --tests \
             --openssl \
-            --cc-opt="-fsanitize=address,undefined -fno-omit-frame-pointer -O1" \
+            --cc-opt="-fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g" \
             --ld-opt="-fsanitize=address,undefined"
 
       - name: Make unit
