@@ -30,6 +30,8 @@
 #define NXT_UNIT_MAX_PLAIN_SIZE  1024
 #define NXT_UNIT_LOCAL_BUF_SIZE  \
     (NXT_UNIT_MAX_PLAIN_SIZE + sizeof(nxt_port_msg_t))
+#define NXT_UNIT_RESPONSE_PLAIN_ALLOC  \
+    (NXT_UNIT_MAX_PLAIN_SIZE - sizeof(nxt_port_msg_t))
 
 /* The most data a plain message can carry and still fit a queue item. */
 #define NXT_UNIT_QUEUE_PLAIN_SIZE  \
@@ -2908,6 +2910,10 @@ nxt_unit_response_init(nxt_unit_request_info_t *req,
         return NXT_UNIT_ERROR;
     }
 
+    if (buf_size < NXT_UNIT_RESPONSE_PLAIN_ALLOC) {
+        buf_size = NXT_UNIT_RESPONSE_PLAIN_ALLOC;
+    }
+
     if (nxt_slow_path(req->response_buf != NULL)) {
         buf = req->response_buf;
 
@@ -2987,6 +2993,10 @@ nxt_unit_response_realloc(nxt_unit_request_info_t *req,
                            "(max_fields_count=%"PRIu32", max_fields_size=%"PRIu32")",
                            max_fields_count, max_fields_size);
         return NXT_UNIT_ERROR;
+    }
+
+    if (buf_size < NXT_UNIT_RESPONSE_PLAIN_ALLOC) {
+        buf_size = NXT_UNIT_RESPONSE_PLAIN_ALLOC;
     }
 
     nxt_unit_req_debug(req, "realloc %"PRIu32"", buf_size);
@@ -3806,7 +3816,16 @@ nxt_unit_response_write_nb(nxt_unit_request_info_t *req, const void *start,
     /* Check if response is not send yet. */
     if (nxt_slow_path(req->response_buf != NULL)) {
         part_size = req->response_buf->end - req->response_buf->free;
-        part_size = nxt_min(size, part_size);
+
+        if (req->response_buf->end - req->response_buf->start
+            <= NXT_UNIT_MAX_PLAIN_SIZE
+            && size > part_size)
+        {
+            part_size = 0;
+
+        } else {
+            part_size = nxt_min(size, part_size);
+        }
 
         rc = nxt_unit_response_add_content(req, part_start, part_size);
         if (nxt_slow_path(rc != NXT_UNIT_OK)) {
@@ -3883,31 +3902,34 @@ nxt_unit_response_write_cb(nxt_unit_request_info_t *req,
 
     /* Check if response is not send yet. */
     if (nxt_slow_path(req->response_buf != NULL)) {
-
-        /* Enable content in headers buf. */
-        rc = nxt_unit_response_add_content(req, "", 0);
-        if (nxt_slow_path(rc != NXT_UNIT_OK)) {
-            nxt_unit_req_error(req, "Failed to add piggyback content");
-
-            return rc;
-        }
-
         buf = req->response_buf;
 
-        while (buf->end - buf->free > 0) {
-            n = read_info->read(read_info, buf->free, buf->end - buf->free);
-            if (nxt_slow_path(n < 0)) {
-                nxt_unit_req_error(req, "Read error");
+        if (buf->end - buf->start > NXT_UNIT_MAX_PLAIN_SIZE
+            || read_info->buf_size <= (uint32_t) (buf->end - buf->free))
+        {
+            /* Enable content in headers buf. */
+            rc = nxt_unit_response_add_content(req, "", 0);
+            if (nxt_slow_path(rc != NXT_UNIT_OK)) {
+                nxt_unit_req_error(req, "Failed to add piggyback content");
 
-                return NXT_UNIT_ERROR;
+                return rc;
             }
 
-            /* Manually increase sizes. */
-            buf->free += n;
-            req->response->piggyback_content_length += n;
+            while (buf->end - buf->free > 0) {
+                n = read_info->read(read_info, buf->free, buf->end - buf->free);
+                if (nxt_slow_path(n < 0)) {
+                    nxt_unit_req_error(req, "Read error");
 
-            if (read_info->eof) {
-                break;
+                    return NXT_UNIT_ERROR;
+                }
+
+                /* Manually increase sizes. */
+                buf->free += n;
+                req->response->piggyback_content_length += n;
+
+                if (read_info->eof) {
+                    break;
+                }
             }
         }
 
