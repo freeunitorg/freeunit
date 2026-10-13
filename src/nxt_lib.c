@@ -476,6 +476,57 @@ nxt_cgroup_cpu_limit_walk(char *dir, size_t base,
 #if (NXT_LINUX)
 
 /*
+ * Finds in the mountinfo lines of "fp" the first cgroup2 mount whose root
+ * contains "cgroup".  A mount whose root does not contain the cgroup does
+ * not show it.  Go takes the first such mount too.  Writes the directory
+ * of the cgroup to "dir" and the length of the mount point to "base".
+ * Returns NXT_DECLINED if no mount contains the cgroup, or if the
+ * directory does not fit in "size" bytes.
+ */
+
+nxt_int_t
+nxt_cgroup_mountinfo_find(FILE *fp, const char *cgroup, char *dir,
+    size_t size, size_t *base)
+{
+    int         len;
+    char        *line, *root, *mnt;
+    size_t      line_size;
+    nxt_int_t   ret;
+    const char  *rel;
+
+    line = NULL;
+    line_size = 0;
+    ret = NXT_DECLINED;
+
+    while (getline(&line, &line_size, fp) > 0) {
+        if (nxt_cgroup_mountinfo_parse(line, &root, &mnt) != NXT_OK) {
+            continue;
+        }
+
+        /* The cgroup path is relative to the root of the cgroup namespace. */
+
+        rel = nxt_cgroup_relative_path(cgroup, root);
+        if (rel == NULL) {
+            continue;
+        }
+
+        len = snprintf(dir, size, "%s%s", mnt, rel);
+
+        if (len >= 0 && (size_t) len < size) {
+            *base = strlen(mnt);
+            ret = NXT_OK;
+        }
+
+        break;
+    }
+
+    nxt_free(line);
+
+    return ret;
+}
+
+
+/*
  * Returns the lowest CPU limit of the cgroup v2 directories from the
  * cgroup of this process up to the root of the cgroup2 mount, or 0 if
  * no level sets a limit.  The root of the mount is the root of the cgroup
@@ -487,13 +538,12 @@ nxt_cgroup_cpu_limit_walk(char *dir, size_t base,
 static nxt_uint_t
 nxt_cgroup_cpu_limit(void)
 {
-    int         len;
-    char        *line, *cgroup, *root, *mnt;
+    char        *line, *cgroup;
     FILE        *fp;
-    size_t      size;
+    size_t      size, base;
     ssize_t     nread;
+    nxt_int_t   ret;
     nxt_uint_t  limit;
-    const char  *rel;
     char        dir[NXT_MAX_PATH_LEN];
 
     line = NULL;
@@ -528,35 +578,16 @@ nxt_cgroup_cpu_limit(void)
         goto done;
     }
 
-    root = NULL;
-    mnt = NULL;
-
-    while (getline(&line, &size, fp) > 0) {
-        if (nxt_cgroup_mountinfo_parse(line, &root, &mnt) == NXT_OK) {
-            break;
-        }
-    }
+    ret = nxt_cgroup_mountinfo_find(fp, cgroup, dir, sizeof(dir), &base);
 
     fclose(fp);
 
-    if (mnt == NULL) {
+    if (ret != NXT_OK) {
         goto done;
     }
 
-    /* The cgroup path is relative to the root of the cgroup namespace. */
-
-    rel = nxt_cgroup_relative_path(cgroup, root);
-    if (rel == NULL) {
-        goto done;
-    }
-
-    len = snprintf(dir, sizeof(dir), "%s%s", mnt, rel);
-    if (len < 0 || (size_t) len >= sizeof(dir)) {
-        goto done;
-    }
-
-    limit = nxt_cgroup_cpu_limit_walk(dir, strlen(mnt),
-                                      nxt_cgroup_cpu_max_read, NULL);
+    limit = nxt_cgroup_cpu_limit_walk(dir, base, nxt_cgroup_cpu_max_read,
+                                      NULL);
 
 done:
 

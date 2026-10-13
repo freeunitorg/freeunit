@@ -56,6 +56,16 @@ typedef struct {
 } nxt_cpu_limit_walk_case_t;
 
 
+/* "dir" is NULL if no mount contains the cgroup. */
+
+typedef struct {
+    const char  *mountinfo;
+    const char  *cgroup;
+    const char  *dir;
+    size_t      base;
+} nxt_cpu_limit_find_case_t;
+
+
 typedef struct {
     const nxt_cpu_limit_walk_case_t  *test;
     size_t                           len;
@@ -66,6 +76,9 @@ typedef struct {
 
 static nxt_int_t nxt_cpu_limit_mountinfo_test(nxt_thread_t *thr);
 static nxt_int_t nxt_cpu_limit_walk_test(nxt_thread_t *thr);
+#if (NXT_LINUX)
+static nxt_int_t nxt_cpu_limit_find_test(nxt_thread_t *thr);
+#endif
 static nxt_uint_t nxt_cpu_limit_walk_read(const char *dir, void *data);
 
 
@@ -173,6 +186,12 @@ nxt_cpu_limit_test(nxt_thread_t *thr)
     if (nxt_cpu_limit_walk_test(thr) != NXT_OK) {
         return NXT_ERROR;
     }
+
+#if (NXT_LINUX)
+    if (nxt_cpu_limit_find_test(thr) != NXT_OK) {
+        return NXT_ERROR;
+    }
+#endif
 
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "cpu limit test passed");
 
@@ -297,6 +316,80 @@ nxt_cpu_limit_mountinfo_test(nxt_thread_t *thr)
 
     return NXT_OK;
 }
+
+
+#if (NXT_LINUX)
+
+static nxt_int_t
+nxt_cpu_limit_find_test(nxt_thread_t *thr)
+{
+    FILE        *fp;
+    size_t      base;
+    nxt_int_t   ret;
+    nxt_uint_t  i;
+    char        dir[32];
+
+    static const nxt_cpu_limit_find_case_t  cases[] = {
+
+        /* The first cgroup2 mount does not contain the cgroup. */
+        { "22 28 0:21 / /proc rw - proc proc rw\n"
+          "40 30 0:31 /other.slice /mnt/other rw - cgroup2 none rw\n"
+          "41 30 0:31 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+          "/app.slice/app", "/sys/fs/cgroup/app.slice/app", 14 },
+
+        /* Two mounts contain the cgroup: the first one is taken. */
+        { "40 30 0:31 /app.slice /mnt/slice rw - cgroup2 none rw\n"
+          "41 30 0:31 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+          "/app.slice/app", "/mnt/slice/app", 10 },
+
+        /* The root of the mount is the cgroup. */
+        { "40 30 0:31 /app.slice/app /mnt/app rw - cgroup2 none rw\n",
+          "/app.slice/app", "/mnt/app", 8 },
+
+        /* No cgroup2 mount contains the cgroup. */
+        { "22 28 0:21 / /proc rw - proc proc rw\n"
+          "40 30 0:31 /other.slice /mnt/other rw - cgroup2 none rw\n",
+          "/app.slice/app", NULL, 0 },
+
+        /* The directory does not fit in 32 bytes. */
+        { "41 30 0:31 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+          "/kubepods.slice/pod1", NULL, 0 },
+    };
+
+    for (i = 0; i < nxt_nitems(cases); i++) {
+        fp = fmemopen((char *) cases[i].mountinfo, strlen(cases[i].mountinfo),
+                      "r");
+
+        NXT_TEST_CHECK(thr->log, fp != NULL,
+                       "find case %ui: fmemopen() failed %E", i, nxt_errno);
+
+        dir[0] = '\0';
+        base = 0;
+
+        ret = nxt_cgroup_mountinfo_find(fp, cases[i].cgroup, dir, sizeof(dir),
+                                        &base);
+
+        fclose(fp);
+
+        if (cases[i].dir == NULL) {
+            NXT_TEST_CHECK(thr->log, ret == NXT_DECLINED,
+                           "find case %ui: %i, expected NXT_DECLINED", i, ret);
+            continue;
+        }
+
+        NXT_TEST_CHECK(thr->log,
+                       ret == NXT_OK
+                       && strcmp(dir, cases[i].dir) == 0
+                       && base == cases[i].base,
+                       "find case %ui: %i, \"%s\", base %uz, "
+                       "expected \"%s\", base %uz",
+                       i, ret, dir, base, cases[i].dir, cases[i].base);
+    }
+
+    return NXT_OK;
+}
+
+#endif
 
 
 static nxt_int_t
