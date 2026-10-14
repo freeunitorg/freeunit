@@ -1325,10 +1325,13 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
 #if (PHP_VERSION_ID >= 80100)
 
     /*
-     * musl's fopen() opens the file with O_CLOEXEC and PHP then sets
-     * FD_CLOEXEC on the resulting stream twice, so opening the script here only
-     * to hand the descriptor over costs calls that access() and PHP's own open
-     * do not need.  nxt_php_handle_fs_err() keeps the 403/404 mapping for both.
+     * musl's fopen() opens the file with O_CLOEXEC and then sets FD_CLOEXEC
+     * twice with fcntl(), so opening the script here only to hand the
+     * descriptor over costs an open, two fcntl() calls and a close per request
+     * that access() and PHP's own open do not need.  nxt_php_handle_fs_err()
+     * keeps the 403/404 mapping for both.  PHP now opens the script, as in
+     * PHP-FPM, so "open_basedir" applies to it, a directory that matches the
+     * request is refused, and the descriptor is not close-on-exec.
      */
     if (access(filename, R_OK) != 0) {
         nxt_int_t  ec;

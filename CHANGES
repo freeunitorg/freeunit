@@ -318,12 +318,17 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        request whose GET_PORT cannot be sent. See
        https://github.com/freeunitorg/freeunit/issues/665.
 
-
-    *) Change: the PHP module opened an application script with fopen() on every
-       request, which on musl cost an open, two fcntl() calls and a close per
-       request, because the PHP build there sets FD_CLOEXEC on the stream after
-       opening it.  The script is now checked with access() and opened by PHP
-       itself.  See https://github.com/freeunitorg/freeunit/issues/688.
+    *) Change: the PHP module opened an application script with fopen() on
+       every request.  On musl that cost an open, two fcntl() calls and a
+       close per request, because musl's fopen() sets FD_CLOEXEC on the
+       stream after opening it.  The script is now checked with access() and
+       opened by PHP itself, as in PHP-FPM.  "open_basedir" now applies to
+       the main script, a request that names a directory
+       ending in ".php" fails instead of running an empty script (the status the
+       client gets depends on "display_errors"), the script descriptor is
+       not close-on-exec, and "auto_prepend_file" is listed before the
+       script in get_included_files().  See
+       https://github.com/freeunitorg/freeunit/issues/688.
 
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
