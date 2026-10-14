@@ -8393,6 +8393,15 @@ nxt_router_app_prepare_request(nxt_task_t *task,
                                          reply_port->id, NULL);
 
         } else {
+            /*
+             * Coalesced wake: "notified" was already 1, so a READ_QUEUE
+             * datagram is still outstanding and this request rides it.
+             * No datagram here: at most one wake per burst.  The probe
+             * makes coalesced enqueues countable against queue__enqueue.
+             */
+            NXT_USDT(queue__coalesce, req_rpc_data->msg_info.tracking_cookie,
+                     req_rpc_data->stream);
+
             nxt_debug(task, "queue is not empty");
         }
 

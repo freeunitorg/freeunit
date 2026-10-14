@@ -24,6 +24,14 @@ typedef struct {
 
 
 typedef struct {
+    /*
+     * One-wake flag: at most one READ_QUEUE datagram is outstanding per
+     * queue.  The sender enqueues first and then flips 0->1
+     * (nxt_app_queue_send()); only the flipper sends the datagram.  The receiver clears the flag when it consumes the
+     * datagram (nxt_app_queue_notification_received()) and then re-checks
+     * the queue.  A queue hit must never clear it: the pending wake
+     * belongs to the items still queued.
+     */
     nxt_app_nncq_atomic_t  notified;
     nxt_app_nncq_t         free_items;
     nxt_app_nncq_t         queue;

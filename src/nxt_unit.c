@@ -8916,6 +8916,13 @@ retry:
             return NXT_UNIT_ERROR;
         }
 
+        /*
+         * One-wake protocol: a queue hit above returns without touching
+         * "notified", so a pending wake stays pending for the items still
+         * queued.  Only a consumed READ_QUEUE clears it, and "goto retry"
+         * then re-checks the queue, so a request enqueued between the
+         * clear and the check still rides this wake.
+         */
         if (nxt_unit_is_read_queue(rbuf)) {
             nxt_app_queue_notification_received(port_impl->queue);
 

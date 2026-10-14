@@ -14,6 +14,7 @@ until a tracer attaches.
 | `queue__enqueue__fail` | `nxt_app_queue_send()`, when the enqueue then fails | `slot, tracking id` |
 | `queue__dequeue` | `nxt_unit_app_queue_recv()`, in the application | `slot, tracking id` |
 | `queue__cancel` | `nxt_router_msg_retract()`, in the router | `slot, tracking id` |
+| `queue__coalesce` | `nxt_router_app_prepare_request()`, when the enqueue finds a wake already pending (`notify == 0`) | `slot, tracking id` |
 | `process__spawn` | `nxt_process_create()`, in the parent | `child pid` (global, also with pid isolation) |
 | `request__start` | `nxt_h1p_conn_request_init()` | `(uintptr_t) r` |
 | `request__done` | `nxt_http_request_close_handler()`, once per request | `(uintptr_t) r, status` (0: no response) |
