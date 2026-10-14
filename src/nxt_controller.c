@@ -143,8 +143,10 @@ static void nxt_controller_app_restart_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
 static void nxt_controller_conf_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
-static void nxt_controller_conf_store(nxt_task_t *task,
-    nxt_conf_value_t *conf);
+static void nxt_controller_process_conf_store(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data);
+static nxt_int_t nxt_controller_conf_store(nxt_task_t *task,
+    nxt_conf_value_t *conf, nxt_controller_request_t *req);
 static void nxt_controller_response(nxt_task_t *task,
     nxt_controller_request_t *req, nxt_controller_response_t *resp);
 static u_char *nxt_controller_date(u_char *buf, nxt_realtime_t *now,
@@ -163,6 +165,8 @@ static nxt_uint_t              nxt_controller_router_ready;
 static nxt_controller_conf_t   nxt_controller_conf;
 static nxt_queue_t             nxt_controller_waiting_requests;
 static nxt_bool_t              nxt_controller_waiting_init_conf;
+/* The configuration is applied, and main still stores it. */
+static nxt_bool_t              nxt_controller_conf_storing;
 #if (NXT_TLS)
 static nxt_bool_t              nxt_controller_cert_storing;
 /* A stored bundle that waits for the first configuration of a router. */
@@ -1922,6 +1926,8 @@ nxt_controller_store_in_flight(void)
 
     storing = 0;
 
+    storing |= nxt_controller_conf_storing;
+
 #if (NXT_TLS)
     storing |= nxt_controller_cert_storing;
 #endif
@@ -2904,10 +2910,24 @@ nxt_controller_conf_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
         nxt_controller_conf = req->conf;
 
-        nxt_controller_conf_store(task, req->conf.root);
+        /*
+         * The client waits until the store child of main has written the
+         * configuration and flushed it, so a 200 means "on the disk".  The
+         * answer comes from nxt_controller_process_conf_store().
+         */
+        nxt_controller_conf_storing = 1;
 
-        resp.status = 200;
-        resp.title = (u_char *) "Reconfiguration done.";
+        if (nxt_fast_path(nxt_controller_conf_store(task, req->conf.root, req)
+                          == NXT_OK))
+        {
+            return;
+        }
+
+        nxt_controller_conf_storing = 0;
+
+        resp.status = 500;
+        resp.title = (u_char *) "Failed to store the configuration.";
+        resp.offset = -1;
 
     } else {
         nxt_mp_destroy(req->conf.pool);
@@ -2915,6 +2935,44 @@ nxt_controller_conf_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         resp.status = 500;
         resp.title = (u_char *) "Failed to apply new configuration.";
         resp.offset = -1;
+    }
+
+    nxt_controller_response(task, req, &resp);
+
+    nxt_controller_flush_requests(task);
+}
+
+
+/*
+ * Main answers the store of a configuration only when its store child has
+ * ended.  The configuration runs either way; this answer says whether it
+ * reached the disk.
+ */
+static void
+nxt_controller_process_conf_store(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data)
+{
+    nxt_controller_request_t   *req;
+    nxt_controller_response_t  resp;
+
+    req = data;
+
+    nxt_controller_conf_storing = 0;
+
+    nxt_memzero(&resp, sizeof(nxt_controller_response_t));
+
+    if (msg == NULL || msg->port_msg.type != NXT_PORT_MSG_RPC_READY) {
+        /*
+         * The configuration runs, but a restart loads the one before it.
+         * The client must not read this as stored.
+         */
+        resp.status = 500;
+        resp.title = (u_char *) "Failed to store the configuration.";
+        resp.offset = -1;
+
+    } else {
+        resp.status = 200;
+        resp.title = (u_char *) "Reconfiguration done.";
     }
 
     nxt_controller_response(task, req, &resp);
@@ -3072,30 +3130,33 @@ nxt_controller_app_restart_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 }
 
 
-static void
-nxt_controller_conf_store(nxt_task_t *task, nxt_conf_value_t *conf)
+static nxt_int_t
+nxt_controller_conf_store(nxt_task_t *task, nxt_conf_value_t *conf,
+    nxt_controller_request_t *req)
 {
     void           *mem;
     u_char         *end;
     size_t         size;
+    uint32_t       stream;
     nxt_fd_t       fd;
     nxt_int_t      rc;
     nxt_buf_t      *b;
-    nxt_port_t     *main_port;
+    nxt_port_t     *main_port, *controller_port;
     nxt_runtime_t  *rt;
 
     rt = task->thread->runtime;
 
     main_port = rt->port_by_type[NXT_PROCESS_MAIN];
+    controller_port = rt->port_by_type[NXT_PROCESS_CONTROLLER];
 
     size = nxt_conf_json_length(conf, NULL);
     if (nxt_slow_path(size == SIZE_MAX)) {
-        return;
+        return NXT_ERROR;
     }
 
     fd = nxt_shm_open(task, size);
     if (nxt_slow_path(fd == -1)) {
-        return;
+        return NXT_ERROR;
     }
 
     mem = nxt_mem_mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -3116,9 +3177,17 @@ nxt_controller_conf_store(nxt_task_t *task, nxt_conf_value_t *conf)
 
     b->mem.free = nxt_cpymem(b->mem.pos, &size, sizeof(size_t));
 
+    stream = nxt_port_rpc_register_handler(task, controller_port,
+                                           nxt_controller_process_conf_store,
+                                           nxt_controller_process_conf_store,
+                                           -1, req);
+    if (nxt_slow_path(stream == 0)) {
+        goto fail_b;
+    }
+
     rc = nxt_port_socket_write(task, main_port,
                                NXT_PORT_MSG_CONF_STORE | NXT_PORT_MSG_CLOSE_FD,
-                               fd, 0, -1, b);
+                               fd, stream, controller_port->id, b);
 
     if (nxt_slow_path(rc != NXT_OK)) {
         /*
@@ -3127,17 +3196,28 @@ nxt_controller_conf_store(nxt_task_t *task, nxt_conf_value_t *conf)
          * queue the buffer completion so the engine memory pool is
          * not left with an unreclaimed buffer.
          */
+        nxt_port_rpc_cancel(task, controller_port, stream);
+
         nxt_fd_close(fd);
 
         nxt_work_queue_add(&task->thread->engine->fast_work_queue,
                            b->completion_handler, task, b, b->parent);
+
+        return NXT_ERROR;
     }
 
-    return;
+    return NXT_OK;
+
+fail_b:
+
+    nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                       b->completion_handler, task, b, b->parent);
 
 fail:
 
     nxt_fd_close(fd);
+
+    return NXT_ERROR;
 }
 
 

@@ -1,6 +1,14 @@
 
 Changes with FreeUnit 1.37.1                                     04 Oct 2026
 
+    *) Change: the control API now answers a configuration PUT only after
+       the store child of main has written the configuration and flushed
+       it. Before, the answer came first, so a 200 did not mean that the
+       configuration was on the disk. A PUT takes one store longer: about
+       7 ms on a fast disk, 22 ms on a slow one. A store that fails is
+       answered with 500 "Failed to store the configuration."; the new
+       configuration runs, but a restart loads the one before it.
+
     *) Bugfix: with "compression" on, a response could reach the client
        as a corrupt or endless stream. When the response header fields
        were over about 1 KiB, the first part of the body, up to 16 KiB,
