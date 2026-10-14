@@ -101,7 +101,7 @@ nxt_port_ctrunc_test_exchange(nxt_thread_t *thr, nxt_socket_t *pair,
     iov[0].iov_base = &payload;
     iov[0].iov_len = sizeof(payload);
 
-    n = nxt_sendmsg(pair[1], iov, 1, &send_oob);
+    n = nxt_sendmsg(pair[1], iov, 1, &send_oob, 0);
 
     if (n != (ssize_t) sizeof(payload)) {
         nxt_log_alert(thr->log, "port ctrunc test sendmsg failed %E",
@@ -646,7 +646,7 @@ nxt_port_ctrunc_test_send_bad(nxt_thread_t *thr, nxt_socket_t fd,
     iov[0].iov_base = port_msg;
     iov[0].iov_len = sizeof(nxt_port_msg_t);
 
-    n = nxt_sendmsg(fd, iov, 1, &oob);
+    n = nxt_sendmsg(fd, iov, 1, &oob, 0);
 
     (void) close(fds[0]);
 
@@ -674,7 +674,7 @@ nxt_port_ctrunc_test_send_good(nxt_thread_t *thr, nxt_socket_t fd,
     iov[0].iov_base = port_msg;
     iov[0].iov_len = sizeof(nxt_port_msg_t);
 
-    n = nxt_sendmsg(fd, iov, 1, NULL);
+    n = nxt_sendmsg(fd, iov, 1, NULL, 0);
 
     if (n != (ssize_t) sizeof(nxt_port_msg_t)) {
         nxt_log_alert(thr->log, "port ctrunc test sendmsg failed %E",

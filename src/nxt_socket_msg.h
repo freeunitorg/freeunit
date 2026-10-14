@@ -106,9 +106,11 @@ typedef struct {
 /**
  * The nxt_sendmsg is a wrapper for sendmsg.
  * The oob struct must be initialized using nxt_socket_msg_oob_init().
+ * flags go to sendmsg(2) unchanged; pass MSG_DONTWAIT for a send that must
+ * never block (the caller handles EAGAIN).
  */
 NXT_EXPORT ssize_t nxt_sendmsg(nxt_socket_t s, nxt_iobuf_t *iob,
-    nxt_uint_t niob, const nxt_send_oob_t *oob);
+    nxt_uint_t niob, const nxt_send_oob_t *oob, int flags);
 
 /**
  * The nxt_recvmsg is a wrapper for recvmsg.
