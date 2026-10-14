@@ -7374,7 +7374,18 @@ recv:
 
     nxt_unit_process_ready_req(ctx);
 
-    return rc;
+    /*
+     * A message was read, so more can wait in the queue.  NXT_UNIT_AGAIN
+     * here only means that a pending message was parked again, for a
+     * segment it waits for.  Passed on, it makes the embedder stop and
+     * wait for the port to become readable.  But the router signals the
+     * port only when its queue turns non-empty, so a queue that is still
+     * full stays silent, and the MMAP reply that the parked message waits
+     * for needs room in that same queue.  Ask for a call again instead;
+     * the call that finds the queue empty answers NXT_UNIT_AGAIN.
+     */
+
+    return NXT_UNIT_OK;
 }
 
 
