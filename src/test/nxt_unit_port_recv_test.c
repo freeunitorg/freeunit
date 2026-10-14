@@ -700,7 +700,7 @@ nxt_port_recv_test_port_msg_retry_pending(nxt_unit_ctx_t *ctx,
     long             call_ms, max_ms;
     pid_t            pid;
     uint64_t         end, start, t0, t1;
-    unsigned int     calls;
+    unsigned int     calls, max_call;
 
     /*
      * A retry that fails again leaves the context online with the FINISH
@@ -735,6 +735,7 @@ nxt_port_recv_test_port_msg_retry_pending(nxt_unit_ctx_t *ctx,
         alarm(10);
 
         max_ms = 0;
+        max_call = 0;
 
         start = nxt_unit_test_detached_now();
 
@@ -747,7 +748,11 @@ nxt_port_recv_test_port_msg_retry_pending(nxt_unit_ctx_t *ctx,
             t1 = nxt_unit_test_detached_now();
 
             call_ms = nxt_port_recv_test_ms(t0, t1);
-            max_ms = nxt_max(max_ms, call_ms);
+
+            if (call_ms > max_ms) {
+                max_ms = call_ms;
+                max_call = calls;
+            }
 
             if (rc != NXT_UNIT_OK) {
                 break;
@@ -776,9 +781,18 @@ nxt_port_recv_test_port_msg_retry_pending(nxt_unit_ctx_t *ctx,
             _exit(4);
         }
 
-        /* The last backoff steps are 256 ms.  A wait that long is a block. */
+        /*
+         * The last backoff steps are 256 ms.  A wait that long is a block.
+         * A loaded runner can stall one call for less, so report the value
+         * and where it happened: the log of the next failure says whether it
+         * was a block or a blip, and whether it came early or late.
+         */
 
         if (max_ms >= 50) {
+            fprintf(stderr,
+                    "port_recv test: %s: slowest call %ld ms at call %u of %u\n",
+                    name, max_ms, max_call, calls);
+
             _exit(5);
         }
 
