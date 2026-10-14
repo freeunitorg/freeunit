@@ -48,3 +48,4 @@ const  PORT_MMAP_CHUNK_COUNT
 
 local  nxt_port_s
 local  nxt_unit_ctx_impl_s
+local  nxt_unit_request_info_s
