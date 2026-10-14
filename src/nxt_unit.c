@@ -4112,12 +4112,46 @@ nxt_unit_buf_read(nxt_unit_buf_t **b, uint64_t *len, void *dst, size_t size)
 
 #if (NXT_TESTS)
 static unsigned int  nxt_unit_test_send_detached_failure_count;
+static unsigned int  nxt_unit_test_send_detached_finish_failure_count;
+static unsigned int  nxt_unit_test_send_detached_finish_injected_count;
 
 
 void
 nxt_unit_test_send_detached_failures(unsigned int failures)
 {
     nxt_unit_test_send_detached_failure_count = failures;
+}
+
+
+/*
+ * The same, for the FINISH edge alone.  A test that arms a shared count and
+ * then calls nxt_unit_request_done_detached() never reaches FINISH with
+ * anything left to spend: START is sent first, inside that call, and its
+ * retry loop consumes the count before the handler returns.  FINISH then
+ * goes out on its first attempt and the retry path is not run at all.  The
+ * count here is consumed by FINISH and by nothing else.
+ */
+
+void
+nxt_unit_test_send_detached_finish_failures(unsigned int failures)
+{
+    nxt_unit_test_send_detached_finish_failure_count = failures;
+    nxt_unit_test_send_detached_finish_injected_count = 0;
+}
+
+
+/*
+ * How many FINISH sends the count above has turned into a failure since the
+ * count was last set.  A caller asks after the run: a count armed for n
+ * failures that reports n here failed the FINISH edge n times, and one that
+ * reports less had its failures spent on START, which is sent first and
+ * which a shared count cannot tell apart from FINISH.
+ */
+
+unsigned int
+nxt_unit_test_send_detached_finish_injected(void)
+{
+    return nxt_unit_test_send_detached_finish_injected_count;
 }
 #endif
 
@@ -4135,6 +4169,14 @@ nxt_unit_send_detached(nxt_unit_ctx_t *ctx, uint8_t state)
 #if (NXT_TESTS)
     if (nxt_slow_path(nxt_unit_test_send_detached_failure_count > 0)) {
         nxt_unit_test_send_detached_failure_count--;
+        return NXT_UNIT_ERROR;
+    }
+
+    if (state == NXT_PORT_DETACHED_FINISH
+        && nxt_slow_path(nxt_unit_test_send_detached_finish_failure_count > 0))
+    {
+        nxt_unit_test_send_detached_finish_failure_count--;
+        nxt_unit_test_send_detached_finish_injected_count++;
         return NXT_UNIT_ERROR;
     }
 #endif

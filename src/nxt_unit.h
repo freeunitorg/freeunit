@@ -471,6 +471,8 @@ void nxt_unit_req_log(nxt_unit_request_info_t *req, int level,
 
 #if (NXT_TESTS)
 void     nxt_unit_test_send_detached_failures(unsigned int failures);
+void     nxt_unit_test_send_detached_finish_failures(unsigned int failures);
+unsigned int  nxt_unit_test_send_detached_finish_injected(void);
 void     nxt_unit_test_request_info_failures(unsigned int failures);
 uint8_t  nxt_unit_test_ctx_detached(nxt_unit_ctx_t *ctx);
 uint8_t  nxt_unit_test_ctx_detached_retries(nxt_unit_ctx_t *ctx);

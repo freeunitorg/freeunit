@@ -30,14 +30,34 @@
 #define FIELD_SEP     ": "
 #define BODY          "  Body:\n"
 
+/*
+ * -d: answer detached, with the first FINISH sends failing, so libunit runs
+ * its retry deadline instead of reporting the finish on the first try.  The
+ * bare flag injects DETACHED_FAILURES; -d N injects N.  The run must end
+ * with all of them spent on FINISH, so a build where they land on another
+ * edge is caught before this process exits rather than passing silently.
+ *
+ * A count above the retry budget ends differently: the retries give up,
+ * the worker is retired with the remaining failures unspent, and that is
+ * the give-up path, not a misplaced injection.
+ */
+#define DETACHED_FAILURES  2
+
 
 static int ready_handler(nxt_unit_ctx_t *ctx);
 static void *worker(void *main_ctx);
 static void greeting_app_request_handler(nxt_unit_request_info_t *req);
+#if (NXT_TESTS)
+static void detached_request_done(nxt_unit_request_info_t *req, int rc);
+static void detached_done(nxt_unit_ctx_t *ctx);
+#endif
 static inline char *copy(char *p, const void *src, uint32_t len);
 
 
 static int        thread_count;
+static int        detached;
+static int        detached_failures;
+static int        detached_armed;
 static pthread_t  *threads;
 
 
@@ -50,6 +70,10 @@ main(int argc, char **argv)
 
     if (argc == 3 && strcmp(argv[1], "-t") == 0) {
         thread_count = atoi(argv[2]);
+
+    } else if (argc >= 2 && argc <= 3 && strcmp(argv[1], "-d") == 0) {
+        detached = 1;
+        detached_failures = (argc == 3) ? atoi(argv[2]) : DETACHED_FAILURES;
     }
 
     memset(&init, 0, sizeof(nxt_unit_init_t));
@@ -81,6 +105,16 @@ main(int argc, char **argv)
 
         nxt_unit_free(ctx, threads);
     }
+
+#if (NXT_TESTS)
+    /*
+     * The last verdict, before nxt_unit_done() releases the context.  NULL
+     * because a verdict must not need a live context: this call sits on the
+     * teardown path, and the alert it prints goes to stderr either way,
+     * which is where a log after the context is gone also goes.
+     */
+    detached_done(NULL);
+#endif
 
     nxt_unit_done(ctx);
 
@@ -268,8 +302,84 @@ greeting_app_request_handler(nxt_unit_request_info_t *req)
 
 fail:
 
+    if (detached) {
+        detached_request_done(req, rc);
+        return;
+    }
+
     nxt_unit_request_done(req, rc);
 }
+
+
+#if (NXT_TESTS)
+
+/*
+ * The client has the response before this handler returns, and libunit
+ * reports the finish on its own deadline while nxt_unit_run() keeps the
+ * loop turning.  The failures are armed for the FINISH edge alone, so the
+ * START that nxt_unit_request_done_detached() sends first cannot spend
+ * them, and the public call is used as is.
+ */
+
+static void
+detached_request_done(nxt_unit_request_info_t *req, int rc)
+{
+    /*
+     * The previous request's FINISH retries have run by now (the workflow
+     * waits past their deadline), so check them here, while unitd still
+     * runs: a miss is logged before the workflow reads the log.  A check
+     * after nxt_unit_run() would only run once unitd is stopped.
+     */
+    if (detached_armed) {
+        detached_done(req->ctx);
+    }
+
+    nxt_unit_test_send_detached_finish_failures(detached_failures);
+    detached_armed = 1;
+
+    nxt_unit_request_done_detached(req, rc);
+}
+
+
+/*
+ * Called for the previous request when the next one arrives, and once more
+ * before nxt_unit_done(), so the FINISH retries have run their course.
+ * Every injected failure must have gone to the FINISH edge:
+ * one that went to START instead left FINISH to be reported on its first
+ * attempt, which is the empty test this injection exists to replace.  The
+ * count is per request and the last request is the one left standing, so
+ * this asks about that one.
+ */
+
+static void
+detached_done(nxt_unit_ctx_t *ctx)
+{
+    unsigned int  injected;
+
+    if (!detached || detached_failures == 0) {
+        return;
+    }
+
+    injected = nxt_unit_test_send_detached_finish_injected();
+
+    if (injected != (unsigned int) detached_failures) {
+        nxt_unit_alert(ctx, "unit_app_test: the injected failures did not "
+                      "reach the detached finish: %d injected, %d spent on "
+                      "FINISH", detached_failures, (int) injected);
+
+        exit(1);
+    }
+
+    /*
+     * The verdict the workflow requires.  Without it a run that armed
+     * nothing, or that never reached this check, leaves the step green on
+     * the requests alone, which is the state this check exists to end.
+     */
+    nxt_unit_alert(ctx, "unit_app_test: %d injected failures, all spent on "
+                  "FINISH", detached_failures);
+}
+
+#endif
 
 
 static inline char *
