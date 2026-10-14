@@ -36,7 +36,8 @@
  *     order.  A conf.json store that arrives between them runs between
  *     them, and it does not kill the certificate child, even when main
  *     exits.  A DELETE that follows a PUT of the same bundle runs after
- *     it, so the bundle is gone at the end.
+ *     it, so the bundle is gone at the end, and it answers the controller
+ *     only when its child has removed the file.
  */
 
 #include <nxt_main.h>
@@ -961,7 +962,7 @@ nxt_main_store_test_put(nxt_task_t *task, nxt_main_store_test_paths_t *paths,
 /* DELETE /certificates/<name>, as nxt_cert_store_delete() sends it. */
 static void
 nxt_main_store_test_delete(nxt_task_t *task, nxt_port_t *port,
-    const char *name)
+    const char *name, uint32_t stream)
 {
     size_t               len;
     nxt_buf_t            b;
@@ -972,7 +973,7 @@ nxt_main_store_test_delete(nxt_task_t *task, nxt_port_t *port,
 
     nxt_memcpy(buf, name, len);
 
-    nxt_main_store_test_msg(&msg, &b, buf, len, port, 0, -1);
+    nxt_main_store_test_msg(&msg, &b, buf, len, port, stream, -1);
 
     nxt_cert_store_delete_handler(task, &msg);
 }
@@ -1213,9 +1214,16 @@ nxt_main_store_test_certs(nxt_thread_t *thr, nxt_task_t *task,
 
     nxt_main_test_store_set_delay(0);
 
-    nxt_main_store_test_delete(task, port, "three");
+    nxt_main_store_test_delete(task, port, "three", 0x44444444);
 
     if (nxt_main_store_test_reap(thr, task, "the third bundle") != NXT_OK) {
+        goto done;
+    }
+
+    if (nxt_main_store_test_reply(thr, port, 3, 0x33333333,
+                                  "the third bundle")
+        != NXT_OK)
+    {
         goto done;
     }
 
@@ -1226,8 +1234,9 @@ nxt_main_store_test_certs(nxt_thread_t *thr, nxt_task_t *task,
         goto done;
     }
 
-    if (nxt_main_store_test_reply(thr, port, 3, 0x33333333,
-                                  "the third bundle")
+    /* The DELETE answers when its child has removed the bundle. */
+    if (nxt_main_store_test_reply(thr, port, 4, 0x44444444,
+                                  "the DELETE of the third bundle")
         != NXT_OK)
     {
         goto done;
