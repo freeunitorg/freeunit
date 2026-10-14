@@ -95,6 +95,7 @@ nxt_int_t nxt_router_start_proto_gone_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_proto_wedge_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_proto_death_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_start_timeout_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_conf_overlap_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_app_timeout_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_remove_pid_soak_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_detached_test(nxt_thread_t *thr);
