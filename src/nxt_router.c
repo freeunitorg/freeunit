@@ -602,6 +602,9 @@ nxt_queue_t  deleting_sockets;
  * or nxt_router_conf_error() ends it.  All applies share the socket queues
  * above, and nxt_router_temp_conf() initialises them again.  Two applies
  * would free the same listener twice, so a new configuration waits.
+ *
+ * An apply must always end with one of those two, or this flag stays set and
+ * every later configuration waits for ever.
  */
 static nxt_bool_t  nxt_router_conf_applying;
 
@@ -2109,9 +2112,13 @@ fail:
 
         nxt_mp_destroy(rtcf->mem_pool);
         nxt_mp_release(tmcf->mem_pool);
-    }
 
-    if (fd != -1) {
+    } else if (fd != -1) {
+        /*
+         * nxt_router_temp_conf() already failed, so it did not take the
+         * descriptor.  Nothing else owns it, and nxt_port_recv_msg_close_fds()
+         * could not close it because msg->fd[0] was cleared above.
+         */
         nxt_fd_close(fd);
     }
 
@@ -2135,6 +2142,8 @@ nxt_router_conf_end(nxt_task_t *task)
         nxt_work_queue_add(&task->thread->engine->fast_work_queue,
                            nxt_router_conf_deferred_handler, task, NULL, NULL);
     }
+
+    nxt_assert(nxt_router_conf_applying == 0);
 }
 
 
