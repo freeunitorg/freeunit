@@ -47,6 +47,7 @@ FIRST = 'install -p -m u=rw,go=r src/nxt_unit.h'
 # counting braces, so a nested struct or union does not end it.
 OPEN = re.compile(r'\b(typedef\s+)?(struct|union)\s+(?:([A-Za-z_]\w*)\s*)?\{')
 NAME = re.compile(r'\s*([A-Za-z_]\w*)\s*;')
+ENUM = re.compile(r'\benum\s+(?:[A-Za-z_]\w*\s*)?\{([^}]*)\}')
 COMMENT = re.compile(r'/\*.*?\*/|//[^\n]*', re.S)
 
 
@@ -145,6 +146,28 @@ def definitions(text):
     return names
 
 
+def enumerators(header):
+    """The enum constants in one header.
+
+    A module compiles an enum constant into its code: NXT_UNIT_ERROR is
+    compared with what libunit returns, NXT_UNIT_HASH_CONTENT_LENGTH with
+    the hash the router wrote into shared memory.  A new value changes
+    their meaning with no change of any layout, so each constant needs an
+    "enum" entry, and layout-check.sh fails when its value changes.
+    """
+
+    text = COMMENT.sub(' ', Path(header).read_text())
+    names = []
+
+    for body in ENUM.findall(text):
+        for item in body.split(','):
+            m = re.match(r'\s*([A-Za-z_]\w*)', item)
+            if m:
+                names.append(m.group(1))
+
+    return names
+
+
 def self_test():
     """The definition shapes the scan accepts, pinned."""
 
@@ -187,7 +210,7 @@ def listed():
             continue
 
         parts = line.split()
-        if len(parts) != 2 or parts[0] not in ('shm', 'local', 'const'):
+        if len(parts) != 2 or parts[0] not in ('shm', 'local', 'const', 'enum'):
             die(f'{LIST}:{n}: bad line: {line}')
 
         names.add(parts[1])
@@ -202,6 +225,7 @@ def main():
 
     have = listed()
     missing = []
+    enums = []
 
     for header in installed_headers():
         if header.startswith(BUILD + '/') and not Path(header).exists():
@@ -213,6 +237,10 @@ def main():
             if not names & have:
                 missing.append((header, name, sorted(names)))
 
+        for name in enumerators(header):
+            if name not in have:
+                enums.append((header, name))
+
     if missing:
         print('these structs are in the installed headers and not in the '
               f'{LIST}:')
@@ -222,9 +250,20 @@ def main():
         print()
         print('Add each as "local", or as "shm" when both processes read it '
               'through shared memory.')
+
+    if enums:
+        print('these enum constants are in the installed headers and not in '
+              f'the {LIST}:')
+        for header, name in enums:
+            print(f'  {name:32} {header}')
+        print()
+        print('Add each as "enum".')
+
+    if missing or enums:
         sys.exit(1)
 
-    print(f'ok: every struct in the installed headers is in the {LIST}')
+    print('ok: every struct and enum constant in the installed headers is '
+          f'in the {LIST}')
 
 
 main()
