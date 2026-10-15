@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from unit import port as port_map
 from unit.applications.proto import ApplicationProto
 from unit.option import option
 
@@ -52,7 +53,10 @@ def _burst(n, url):
     they reach the router while earlier ones are still queued."""
 
     req = f'GET {url} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
-    socks = [socket.create_connection(('127.0.0.1', 8080)) for _ in range(n)]
+    socks = [
+        socket.create_connection(('127.0.0.1', port_map.port(8080)))
+        for _ in range(n)
+    ]
 
     start = time.monotonic()
 
