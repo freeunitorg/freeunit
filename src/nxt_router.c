@@ -8467,7 +8467,8 @@ nxt_router_app_prepare_request(nxt_task_t *task,
 
         } else {
             /*
-             * No doorbell: the item landed at or beyond depth_bound, or the
+             * No doorbell: the item landed at or beyond depth_bound, the
+             * one-reader flag was already set (depth_bound 1), or the
              * shared port is backlogged (above), so enough READ_QUEUE
              * datagrams are already outstanding to wake every reader, and a
              * worker re-checks the queue after each one.  The probe counts
