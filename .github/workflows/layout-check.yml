@@ -74,7 +74,7 @@ jobs:
           echo "sha=$base" >> "$GITHUB_OUTPUT"
 
       - name: Check that the list covers every installed struct
-        run: tools/perf/layout-coverage.py
+        run: tools/perf/layout-coverage.py --self-test && tools/perf/layout-coverage.py
 
       - name: Compare the layouts
         env:

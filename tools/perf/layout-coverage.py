@@ -14,7 +14,7 @@
 # The list is what makes the layout check look, and this script is what
 # keeps the list complete.
 #
-#   tools/perf/layout-coverage.py
+#   tools/perf/layout-coverage.py [--self-test]
 #
 # The headers come from the install rule in auto/make, so a new installed
 # header needs no edit here.  A new struct in one of them fails this check
@@ -36,9 +36,12 @@ MAKE = Path('auto/make')
 # The install rule names the first header; the rest follow, one per line,
 # each but the last ending in a backslash.
 FIRST = 'install -p -m u=rw,go=r src/nxt_unit.h'
-NAMED = re.compile(r'^(?:struct|union) ([A-Za-z_][A-Za-z0-9_]*) \{', re.M)
-ANON = re.compile(r'^typedef (?:struct|union) \{[^}]*\} ([A-Za-z_][A-Za-z0-9_]*);', re.M | re.S)
-ALIAS = re.compile(r'^typedef (?:struct|union) ([A-Za-z_][A-Za-z0-9_]*) ([A-Za-z_][A-Za-z0-9_]*);', re.M)
+# The start of a definition: "struct tag {", "union tag {",
+# "typedef struct tag {", or "typedef struct {".  The body is then read by
+# counting braces, so a nested struct or union does not end it.
+OPEN = re.compile(r'\b(typedef\s+)?(struct|union)\s+(?:([A-Za-z_]\w*)\s*)?\{')
+NAME = re.compile(r'\s*([A-Za-z_]\w*)\s*;')
+COMMENT = re.compile(r'/\*.*?\*/|//[^\n]*', re.S)
 
 
 def die(message):
@@ -90,19 +93,78 @@ def structs(header):
     still asks for the tag.
     """
 
-    text = Path(header).read_text()
+    return definitions(Path(header).read_text())
+
+
+def definitions(text):
+    """The entry names for the struct and union definitions in text.
+
+    Only top-level definitions count: a struct or union defined inside
+    another one is part of its layout.  An anonymous struct that is not a
+    typedef has no name pahole can find, thus it is skipped.
+    """
+
+    text = COMMENT.sub(' ', text)
     names = {}
+    pos = 0
 
-    for tag in NAMED.findall(text):
-        names.setdefault(tag, set()).add(tag)
+    while True:
+        m = OPEN.search(text, pos)
+        if not m:
+            break
 
-    for alias, tag in ALIAS.findall(text):
-        names.setdefault(tag, set()).add(alias)
+        depth = 0
+        for end in range(m.end() - 1, len(text)):
+            if text[end] == '{':
+                depth += 1
+            elif text[end] == '}':
+                depth -= 1
+                if depth == 0:
+                    break
+        else:
+            die(f'unbalanced braces after "{m.group(0)}"')
 
-    for name in ANON.findall(text):
-        names.setdefault(name, set()).add(name)
+        pos = end + 1
+        typedef, tag = m.group(1), m.group(3)
+
+        if tag:
+            names.setdefault(tag, {tag})
+        elif typedef:
+            n = NAME.match(text, pos)
+            if n:
+                names.setdefault(n.group(1), {n.group(1)})
 
     return names
+
+
+def self_test():
+    """The definition shapes the scan accepts, pinned."""
+
+    cases = [
+        ('struct a_s { int x; };', {'a_s'}),
+        ('union u_u { int x; char c; };', {'u_u'}),
+        ('typedef struct t_s { int x; } t_t;', {'t_s'}),
+        ('typedef struct { int x; } anon_t;', {'anon_t'}),
+        ('typedef struct { struct { int a; } inner; } nest_t;', {'nest_t'}),
+        ('typedef union { int a; } anon_u_t;', {'anon_u_t'}),
+        ('struct o_s { union { int a; } u; struct i_s { int b; } i; };',
+         {'o_s'}),
+        ('typedef struct a_s a_t;\nstruct a_s *p;', set()),
+        ('/* struct c_s { int x; }; */', set()),
+    ]
+
+    bad = 0
+    for text, want in cases:
+        got = set(definitions(text))
+        if got != want:
+            print(f'self-test: {text!r}: got {sorted(got)}, '
+                  f'want {sorted(want)}')
+            bad += 1
+
+    if bad:
+        sys.exit(1)
+
+    print(f'ok: {len(cases)} self-test cases')
 
 
 def listed():
@@ -126,6 +188,10 @@ def listed():
 
 
 def main():
+    if sys.argv[1:] == ['--self-test']:
+        self_test()
+        return
+
     have = listed()
     missing = []
 
