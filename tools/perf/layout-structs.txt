@@ -14,6 +14,9 @@
 #        message payloads that libunit and unitd both decode: GET_MMAP
 #        and GET_PORT (libunit to the router), NEW_PORT (the router to
 #        libunit), and the WebSocket frame header in a shared buffer.
+#        nxt_unit_sptr_u is the serialized pointer in the three
+#        nxt_unit_*_s structs above: a union, listed on its own so that
+#        a change to it fails by name, not only through --expand_types.
 # const: A macro that sets the geometry of the shared memory.  pahole
 #        does not see a macro, thus a program that is built with the
 #        headers of the commit prints its value.  A change fails.  For
@@ -43,6 +46,7 @@ shm    nxt_port_msg_get_mmap_t
 shm    nxt_port_msg_get_port_t
 shm    nxt_port_msg_new_port_t
 shm    nxt_websocket_header_t
+shm    nxt_unit_sptr_u
 
 const  PORT_MMAP_HEADER_SIZE
 const  PORT_MMAP_DATA_SIZE

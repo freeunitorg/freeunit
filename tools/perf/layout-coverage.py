@@ -2,12 +2,14 @@
 
 # Copyright (C) FreeUnit contributors.
 #
-# Checks that every struct a language module can see has an entry in
+# Checks that every struct and union a language module can see has an entry in
 # tools/perf/layout-structs.txt, so that tools/perf/layout-check.sh watches
 # it.
 #
 # A module is built against the headers that "make install" copies, and it
-# lays those structs out itself.  A change under a module that was built
+# lays those structs out itself.  A union is the same: pahole -C dumps it in
+# the same layout form, and a union that is nested only in "local" structs
+# is compared nowhere else.  A change under a module that was built
 # against the old header is silent: the module reads the wrong offsets.
 # The list is what makes the layout check look, and this script is what
 # keeps the list complete.
@@ -34,9 +36,9 @@ MAKE = Path('auto/make')
 # The install rule names the first header; the rest follow, one per line,
 # each but the last ending in a backslash.
 FIRST = 'install -p -m u=rw,go=r src/nxt_unit.h'
-NAMED = re.compile(r'^struct ([A-Za-z_][A-Za-z0-9_]*) \{', re.M)
-ANON = re.compile(r'^typedef struct \{[^}]*\} ([A-Za-z_][A-Za-z0-9_]*);', re.M | re.S)
-ALIAS = re.compile(r'^typedef struct ([A-Za-z_][A-Za-z0-9_]*) ([A-Za-z_][A-Za-z0-9_]*);', re.M)
+NAMED = re.compile(r'^(?:struct|union) ([A-Za-z_][A-Za-z0-9_]*) \{', re.M)
+ANON = re.compile(r'^typedef (?:struct|union) \{[^}]*\} ([A-Za-z_][A-Za-z0-9_]*);', re.M | re.S)
+ALIAS = re.compile(r'^typedef (?:struct|union) ([A-Za-z_][A-Za-z0-9_]*) ([A-Za-z_][A-Za-z0-9_]*);', re.M)
 
 
 def die(message):
