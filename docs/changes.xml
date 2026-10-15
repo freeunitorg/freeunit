@@ -12,6 +12,29 @@
 
 <change type="bugfix">
 <para>
+when a burst of requests arrived for an application with multiple worker
+processes or threads, only the first request woke a worker, forcing that worker
+to process the entire burst sequentially while the other workers stayed asleep.
+If a worker died while holding a notification, subsequent requests could also
+stall indefinitely.  The router now bounds queue notifications by the number
+of active worker processes and threads, rearms pending requests on worker exit,
+and workers retry the shared queue on poll timeout.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+after 4294705152 requests to one application without a restart, the application
+queue stopped returning request slots.  131072 requests later every request to
+the application got a 500 until the application was restarted.  Before 1.37.0
+the application and then the router spun at 100% CPU instead.  At 5000 requests
+per second this took ten days.  The fix is in unitd and libunit; a Go or Node.js
+application needs a rebuild against the new libunit.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 with "compression" on, a response could reach the client as a corrupt or
 endless stream.  When the response header fields were over about 1 KiB, the
 first part of the body, up to 16 KiB, went out uncompressed under

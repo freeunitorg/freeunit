@@ -12,8 +12,10 @@ rule:
     - pattern: nxt_port_socket_write2($$$);
     - pattern: nxt_port_mmap_get_buf($$$);
     - pattern: nxt_app_queue_send($$$);
+    - pattern: nxt_app_queue_send_bound($$$);
     - pattern: nxt_port_queue_send($$$);
     - pattern: (void) nxt_port_socket_write2($$$);
     - pattern: (void) nxt_port_mmap_get_buf($$$);
     - pattern: (void) nxt_app_queue_send($$$);
+    - pattern: (void) nxt_app_queue_send_bound($$$);
     - pattern: (void) nxt_port_queue_send($$$);

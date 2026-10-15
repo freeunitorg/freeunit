@@ -25,12 +25,12 @@ typedef struct {
 
 typedef struct {
     /*
-     * One-wake flag: at most one READ_QUEUE datagram is outstanding per
-     * queue.  The sender enqueues first and then flips 0->1
-     * (nxt_app_queue_send()); only the flipper sends the datagram.  The receiver clears the flag when it consumes the
-     * datagram (nxt_app_queue_notification_received()) and then re-checks
-     * the queue.  A queue hit must never clear it: the pending wake
-     * belongs to the items still queued.
+     * Legacy one-wake flag.  This router no longer reads or sets it: the
+     * doorbell is decided by queue position (nxt_app_queue_send_bound()),
+     * so up to depth_bound READ_QUEUE datagrams can be outstanding.  The
+     * field stays for layout/ABI, and the receiver still clears it
+     * (nxt_app_queue_notification_received()) for an older router that
+     * gates its doorbell on it.
      */
     nxt_app_nncq_atomic_t  notified;
     nxt_app_nncq_t         free_items;
@@ -55,13 +55,37 @@ nxt_app_queue_init(nxt_app_queue_t volatile *q)
 }
 
 
-nxt_inline nxt_int_t
-nxt_app_queue_send(nxt_app_queue_t volatile *q, const void *p,
-    uint8_t size, uint32_t tracking, int *notify, uint32_t *cookie)
+nxt_inline uint32_t
+nxt_app_queue_depth(nxt_app_queue_t volatile *q)
 {
-    int                    n;
+    return (uint32_t) (nxt_app_nncq_tail(&q->queue)
+                       - nxt_app_nncq_head(&q->queue));
+}
+
+
+/*
+ * Doorbell decision for a producer whose item landed at queue position t,
+ * given a (possibly late) sample of head.  pos < depth_bound rings so up to
+ * depth_bound idle workers get woken.  pos < 0 must also ring: a concurrent
+ * producer enqueued t + 1 and rang, a worker then consumed slot t before this
+ * producer sampled head, and t + 1 is now queued with nobody to wake a second
+ * idle worker.  An extra doorbell is harmless; a missing one stalls.
+ */
+nxt_inline int
+nxt_app_queue_notify_decision(int32_t pos, uint32_t depth_bound)
+{
+    return (pos < 0 || (uint32_t) pos < depth_bound);
+}
+
+
+nxt_inline nxt_int_t
+nxt_app_queue_send_bound(nxt_app_queue_t volatile *q, const void *p,
+    uint8_t size, uint32_t tracking, int *notify, uint32_t *cookie,
+    uint32_t depth_bound)
+{
+    int32_t                pos;
     nxt_app_queue_item_t   *qi;
-    nxt_app_nncq_atomic_t  i;
+    nxt_app_nncq_atomic_t  i, t;
 
     /*
      * qi->data is NXT_APP_QUEUE_MSG_SIZE bytes; refuse to enqueue an
@@ -70,6 +94,10 @@ nxt_app_queue_send(nxt_app_queue_t volatile *q, const void *p,
      */
     if (nxt_slow_path(size > NXT_APP_QUEUE_MSG_SIZE)) {
         return NXT_ERROR;
+    }
+
+    if (nxt_slow_path(depth_bound == 0)) {
+        depth_bound = 1;
     }
 
     i = nxt_app_nncq_dequeue(&q->free_items);
@@ -87,7 +115,7 @@ nxt_app_queue_send(nxt_app_queue_t volatile *q, const void *p,
     /* Before the enqueue: a worker can dequeue as soon as the slot is in. */
     NXT_USDT(queue__enqueue, i, tracking);
 
-    if (nxt_slow_path(nxt_app_nncq_enqueue(&q->queue, i) != NXT_OK)) {
+    if (nxt_slow_path(nxt_app_nncq_enqueue_pos(&q->queue, i, &t) != NXT_OK)) {
         NXT_USDT(queue__enqueue__fail, i, tracking);
 
         (void) nxt_app_nncq_enqueue(&q->free_items, i);
@@ -95,20 +123,33 @@ nxt_app_queue_send(nxt_app_queue_t volatile *q, const void *p,
         return NXT_ERROR;
     }
 
-    n = nxt_atomic_cmp_set(&q->notified, 0, 1);
+    pos = (int32_t) (t - nxt_app_nncq_head(&q->queue));
 
     if (notify != NULL) {
-        *notify = n;
+        *notify = nxt_app_queue_notify_decision(pos, depth_bound);
     }
 
     return NXT_OK;
 }
 
 
+nxt_inline nxt_int_t
+nxt_app_queue_send(nxt_app_queue_t volatile *q, const void *p,
+    uint8_t size, uint32_t tracking, int *notify, uint32_t *cookie)
+{
+    return nxt_app_queue_send_bound(q, p, size, tracking, notify, cookie, 1);
+}
+
+
 nxt_inline void
 nxt_app_queue_notification_received(nxt_app_queue_t volatile *q)
 {
-    q->notified = 0;
+    /*
+     * Clear the legacy flag for compatibility with pre-change unitd
+     * routers (e.g. an application rebuilt against this libunit run by an
+     * older router that still gates notifications with q->notified).
+     */
+    (void) nxt_atomic_cmp_set(&q->notified, 1, 0);
 }
 
 

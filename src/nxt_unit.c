@@ -6652,6 +6652,10 @@ nxt_unit_read_buf(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf)
         }
     }
 
+    if (timeout < 0) {
+        timeout = 1000;
+    }
+
     if (ctx_impl->wait_items > 0 || !nxt_unit_chk_ready(ctx)) {
         return nxt_unit_ctx_port_recv(ctx, ctx_impl->read_port, rbuf);
     }
@@ -6709,6 +6713,10 @@ retry:
     nevents = poll(fds, nfds, timeout);
 
     if (nxt_slow_path(nevents == 0)) {
+        if (ctx_impl->detached_retries == 0) {
+            goto retry;
+        }
+
         /* A pending FINISH retry bounded the wait; the caller retries. */
         rbuf->size = -1;
 
@@ -8917,11 +8925,12 @@ retry:
         }
 
         /*
-         * One-wake protocol: a queue hit above returns without touching
-         * "notified", so a pending wake stays pending for the items still
-         * queued.  Only a consumed READ_QUEUE clears it, and "goto retry"
-         * then re-checks the queue, so a request enqueued between the
-         * clear and the check still rides this wake.
+         * A READ_QUEUE is a doorbell, not a message: consume it and
+         * "goto retry" to re-check the queue.  A request enqueued without
+         * a doorbell (position at or beyond depth_bound) is still found
+         * here, by this or another worker woken by an earlier doorbell.
+         * Clearing the legacy "notified" flag only matters for an older
+         * router.
          */
         if (nxt_unit_is_read_queue(rbuf)) {
             nxt_app_queue_notification_received(port_impl->queue);

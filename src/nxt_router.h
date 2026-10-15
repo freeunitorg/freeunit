@@ -170,6 +170,7 @@ struct nxt_app_s {
     uint32_t               pending_processes;
     uint32_t               processes;
     uint32_t               idle_processes;
+    uint32_t               threads;
 
     /*
      * Workers that answered a request and kept running.  Counted in

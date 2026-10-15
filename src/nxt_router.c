@@ -36,6 +36,7 @@ typedef struct {
     uint32_t          processes;
     uint32_t          max_processes;
     uint32_t          spare_processes;
+    uint32_t          threads;
     nxt_msec_t        timeout;
     nxt_msec_t        idle_timeout;
     nxt_conf_value_t  *limits_value;
@@ -2719,6 +2720,12 @@ static nxt_conf_map_t  nxt_router_app_conf[] = {
     },
 
     {
+        nxt_string("threads"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_router_app_conf_t, threads),
+    },
+
+    {
         nxt_string("targets"),
         NXT_CONF_MAP_PTR,
         offsetof(nxt_router_app_conf_t, targets_value),
@@ -3181,6 +3188,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             apcf.processes = 1;
             apcf.max_processes = 1;
             apcf.spare_processes = 0;
+            apcf.threads = 1;
             apcf.timeout = 0;
             apcf.start_timeout = NXT_APP_START_TIMEOUT;
             apcf.idle_timeout = 15000;
@@ -3289,6 +3297,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             app->type = lang->type;
             app->max_processes = apcf.max_processes;
             app->spare_processes = apcf.spare_processes;
+            app->threads = nxt_max(apcf.threads, 1);
             app->max_pending_processes = apcf.spare_processes
                                          ? apcf.spare_processes : 1;
             app->timeout = apcf.timeout;
@@ -7777,7 +7786,8 @@ void
 nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
 {
     nxt_app_t   *app;
-    nxt_bool_t  unchain, start_process, detached;
+    nxt_port_t  *shared_port;
+    nxt_bool_t  unchain, start_process, detached, rearm;
 
     app = port->app;
 
@@ -7855,6 +7865,18 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
         app->pending_processes++;
     }
 
+    rearm = 0;
+    shared_port = app->shared_port;
+    if (shared_port != NULL) {
+        nxt_port_use(task, shared_port, 1);
+
+        if (shared_port->queue != NULL
+            && nxt_app_queue_depth(shared_port->queue) > 0)
+        {
+            rearm = 1;
+        }
+    }
+
     nxt_thread_mutex_unlock(&app->mutex);
 
     nxt_debug(task, "app '%V' pid %PI closed", &app->name, port->pid);
@@ -7865,6 +7887,16 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
 
     if (start_process) {
         nxt_router_start_app_process(task, app);
+    }
+
+    if (shared_port != NULL) {
+        if (rearm) {
+            (void) nxt_port_socket_write(task, shared_port,
+                                         NXT_PORT_MSG_READ_QUEUE,
+                                         -1, 0, 0, NULL);
+        }
+
+        nxt_port_use(task, shared_port, -1);
     }
 
     /*
@@ -8317,6 +8349,8 @@ static void
 nxt_router_app_prepare_request(nxt_task_t *task,
     nxt_request_rpc_data_t *req_rpc_data)
 {
+    size_t             workers;
+    uint32_t           bound;
     nxt_app_t          *app;
     nxt_buf_t          *buf, *body;
     nxt_int_t          res;
@@ -8382,9 +8416,19 @@ nxt_router_app_prepare_request(nxt_task_t *task,
     msg.mm.chunk_id = nxt_port_mmap_chunk_id(hdr, buf->mem.pos);
     msg.mm.size = nxt_buf_used_size(buf);
 
-    res = nxt_app_queue_send(port->queue, &msg, sizeof(msg),
-                             req_rpc_data->stream, &notify,
-                             &req_rpc_data->msg_info.tracking_cookie);
+    if (nxt_slow_path(nxt_size_mul(nxt_max(app->processes, 1),
+                                   nxt_max(app->threads, 1), &workers)
+                      != 0 || workers > UINT32_MAX))
+    {
+        bound = UINT32_MAX;
+    } else {
+        bound = (uint32_t) workers;
+    }
+
+    res = nxt_app_queue_send_bound(port->queue, &msg, sizeof(msg),
+                                   req_rpc_data->stream, &notify,
+                                   &req_rpc_data->msg_info.tracking_cookie,
+                                   bound);
     if (nxt_fast_path(res == NXT_OK)) {
         if (notify != 0) {
             (void) nxt_port_socket_write(task, port,
@@ -8394,12 +8438,12 @@ nxt_router_app_prepare_request(nxt_task_t *task,
 
         } else {
             /*
-             * Coalesced wake: "notified" was already 1, so a READ_QUEUE
-             * datagram is still outstanding and this request rides it.
-             * No datagram here: at most one wake per burst.  The probe
-             * makes coalesced enqueues countable against queue__enqueue.
+             * No doorbell: the item landed at or beyond depth_bound, so
+             * enough READ_QUEUE datagrams are already outstanding to wake
+             * every reader, and a worker re-checks the queue after each
+             * one.  The probe counts these against queue__enqueue.
              */
-            NXT_USDT(queue__coalesce, req_rpc_data->msg_info.tracking_cookie,
+            NXT_USDT(queue__no_doorbell, req_rpc_data->msg_info.tracking_cookie,
                      req_rpc_data->stream);
 
             nxt_debug(task, "queue is not empty");
