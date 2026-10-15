@@ -939,6 +939,7 @@ nxt_unit_ctx_init(nxt_unit_impl_t *lib, nxt_unit_ctx_impl_t *ctx_impl,
     ctx_impl->online = 1;
     ctx_impl->ready = 0;
     ctx_impl->quit_param = NXT_QUIT_GRACEFUL;
+    ctx_impl->quit_pending = 0;
 
     /*
      * Explicitly, like every field above it: this function initialises the
