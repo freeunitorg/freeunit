@@ -28,6 +28,12 @@
 #   - A "shm" struct with a different layout in unitd and in nxt_unit.o of
 #     the HEAD build fails.
 #
+# The list must also cover every struct defined in a header that "make
+# install" copies: a module is built against those headers and lays the
+# struct out itself, so a change to one of them is as silent as a change to
+# a shared struct.  tools/perf/layout-coverage.py checks that half, and the
+# layout job runs it before this comparison.
+#
 # Exit status: 0 if the check passes, 1 if a layout check fails, 2 for an
 # error of the check itself (a bad argument, a bad line in the list, a
 # failed build).  CC selects the compiler.  PAHOLE selects pahole, which is

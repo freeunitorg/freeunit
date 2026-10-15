@@ -20,7 +20,10 @@
 #        example, nxt_port_mmap_chunk_start() finds the data of a chunk
 #        with PORT_MMAP_HEADER_SIZE and PORT_MMAP_CHUNK_SIZE.
 # local: The struct is in the memory of one process.  A change to its
-#        layout gives a warning.
+#        layout gives a warning.  Every struct defined in a header that
+#        "make install" copies is listed, because a module is built
+#        against those headers and lays the struct out itself:
+#        tools/perf/layout-coverage.py fails when one is missing.
 #
 # If you remove an entry from this list, the check fails.
 
@@ -31,6 +34,7 @@ shm    nxt_port_queue_item_t
 shm    nxt_app_queue_t
 shm    nxt_app_queue_item_t
 shm    nxt_port_mmap_header_s
+shm    nxt_unit_field_s
 shm    nxt_unit_request_s
 shm    nxt_unit_response_s
 shm    nxt_port_msg_t
@@ -47,5 +51,14 @@ const  PORT_MMAP_SIZE
 const  PORT_MMAP_CHUNK_COUNT
 
 local  nxt_port_s
+local  nxt_unit_buf_s
+local  nxt_unit_callbacks_s
 local  nxt_unit_ctx_impl_s
+local  nxt_unit_ctx_s
+local  nxt_unit_init_s
+local  nxt_unit_port_id_s
+local  nxt_unit_port_s
+local  nxt_unit_read_info_s
 local  nxt_unit_request_info_s
+local  nxt_unit_s
+local  nxt_unit_websocket_frame_s
