@@ -8430,6 +8430,21 @@ nxt_router_app_prepare_request(nxt_task_t *task,
                                    &req_rpc_data->msg_info.tracking_cookie,
                                    bound);
     if (nxt_fast_path(res == NXT_OK)) {
+        /*
+         * The shared port carries nothing but READ_QUEUE (a worker's own
+         * port carries other messages too, so it is left alone).  While its
+         * socket is full or messages already wait for it, the workers have
+         * unread doorbells, so another one wakes nobody new; queueing it
+         * would only grow port->messages without bound while busy workers
+         * keep dequeuing ahead of their doorbells.
+         */
+        if (notify != 0 && port->id == NXT_SHARED_PORT_ID
+            && nxt_port_socket_backlogged(port))
+        {
+            nxt_debug(task, "shared port backlogged, doorbell skipped");
+            notify = 0;
+        }
+
         if (notify != 0) {
             (void) nxt_port_socket_write(task, port,
                                          NXT_PORT_MSG_READ_QUEUE,
@@ -8438,10 +8453,11 @@ nxt_router_app_prepare_request(nxt_task_t *task,
 
         } else {
             /*
-             * No doorbell: the item landed at or beyond depth_bound, so
-             * enough READ_QUEUE datagrams are already outstanding to wake
-             * every reader, and a worker re-checks the queue after each
-             * one.  The probe counts these against queue__enqueue.
+             * No doorbell: the item landed at or beyond depth_bound, or the
+             * shared port is backlogged (above), so enough READ_QUEUE
+             * datagrams are already outstanding to wake every reader, and a
+             * worker re-checks the queue after each one.  The probe counts
+             * these against queue__enqueue.
              */
             NXT_USDT(queue__no_doorbell, req_rpc_data->msg_info.tracking_cookie,
                      req_rpc_data->stream);

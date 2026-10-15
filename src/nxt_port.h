@@ -682,6 +682,7 @@ void nxt_port_read_close(nxt_port_t *port);
  *   The inline nxt_port_socket_write() wrapper below inherits this
  *   contract.
  */
+nxt_bool_t nxt_port_socket_backlogged(nxt_port_t *port);
 nxt_int_t nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port,
     nxt_uint_t type, nxt_fd_t fd, nxt_fd_t fd2, uint32_t stream,
     nxt_port_id_t reply_port, nxt_buf_t *b);

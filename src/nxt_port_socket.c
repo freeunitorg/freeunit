@@ -556,6 +556,29 @@ nxt_port_enqueue_buf(nxt_task_t *task, nxt_port_msg_t *pm, void *qbuf,
 }
 
 
+/*
+ * Whether a write to the port would be queued in port->messages rather than
+ * reach the socket: the socket buffer is full or earlier messages are still
+ * waiting for it.  The answer is a snapshot; callers use it only to skip a
+ * message that is redundant while the peer has unread ones (READ_QUEUE).
+ */
+
+nxt_bool_t
+nxt_port_socket_backlogged(nxt_port_t *port)
+{
+    nxt_bool_t  backlogged;
+
+    nxt_thread_mutex_lock(&port->write_mutex);
+
+    backlogged = !port->socket.write_ready
+                 || !nxt_queue_is_empty(&port->messages);
+
+    nxt_thread_mutex_unlock(&port->write_mutex);
+
+    return backlogged;
+}
+
+
 static nxt_int_t
 nxt_port_msg_chk_insert(nxt_task_t *task, nxt_port_t *port,
     nxt_port_send_msg_t *msg)

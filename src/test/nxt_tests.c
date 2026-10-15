@@ -463,6 +463,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_port_doorbell_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_port_share_test(thr) != NXT_OK) {
         return 1;
     }

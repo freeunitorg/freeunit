@@ -114,6 +114,7 @@ nxt_int_t nxt_port_ctrunc_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_fd_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_rpc_fd_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_queued_fd_test(nxt_thread_t *thr);
+nxt_int_t nxt_port_doorbell_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_share_test(nxt_thread_t *thr);
 nxt_int_t nxt_checked_test(nxt_thread_t *thr);
 nxt_int_t nxt_conn_close_test(nxt_thread_t *thr);
