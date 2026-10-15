@@ -65,6 +65,14 @@ https://github.com/freeunitorg/freeunit/issues/666.
 
 <change type="bugfix">
 <para>
+with "compression" on, a response body of up to 15 bytes from an application
+went out uncompressed under "Content-Encoding", so no client could decode it.
+See https://github.com/freeunitorg/freeunit/issues/162.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 a request that arrived while unitd started could hang for ever, and the log
 showed "get_port_handler: port N:1 not found".  A router thread accepted the
 connection before the router knew the port of that thread.  "limits.timeout"

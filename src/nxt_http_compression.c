@@ -296,12 +296,14 @@ nxt_http_comp_compress_app_response(nxt_task_t *task, nxt_http_request_t *r,
         in->next = NULL;
 
         /*
-         * Buffers that did not come through shared memory are passed
-         * through untouched: the trailing sync/last buffer carries no data,
-         * and a plain-mode response is not compressed at all (the same
-         * condition the single-buffer version tested on the head).
+         * Only the trailing sync/last buffer, which carries no data, is
+         * passed through untouched.  A body small enough to travel in an
+         * ordinary port message arrives as plain memory rather than as a
+         * port-mmap buffer; it is compressed all the same, because the
+         * Content-Encoding field has already been committed (#162).  Both
+         * kinds are released through their own completion handler below.
          */
-        if (!nxt_buf_is_port_mmap(in)) {
+        if (nxt_buf_is_sync(in) || !nxt_buf_is_mem(in)) {
             *tail = in;
             tail = &in->next;
             continue;
