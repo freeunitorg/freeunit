@@ -229,6 +229,7 @@ static void nxt_unit_remove_pid(nxt_unit_impl_t *lib, pid_t pid);
 static void nxt_unit_remove_process(nxt_unit_impl_t *lib,
     nxt_unit_process_t *process);
 static void nxt_unit_quit(nxt_unit_ctx_t *ctx, uint8_t quit_param);
+static void nxt_unit_check_quit_pending(nxt_unit_ctx_t *ctx);
 static void nxt_unit_send_quit(nxt_unit_ctx_t *ctx,
     nxt_unit_ctx_impl_t *target, uint8_t quit_param);
 static void nxt_unit_take_quit(nxt_unit_ctx_t *ctx, nxt_atomic_uint_t pending);
@@ -524,7 +525,8 @@ struct nxt_unit_ctx_impl_s {
 
     /*
      * A QUIT that another context could not send to this one without
-     * blocking: its quit_param + 1, or 0.  nxt_unit_process_msg() takes it.
+     * blocking: its quit_param + 1, or 0.  nxt_unit_process_msg() takes it
+     * after the message in hand.
      */
     nxt_atomic_t                  quit_pending;
 
@@ -1290,7 +1292,6 @@ nxt_unit_process_msg(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf,
     nxt_unit_request_info_t **preq)
 {
     int                  rc;
-    nxt_atomic_uint_t    pending;
     pid_t                pid;
     uint8_t              quit_param;
     nxt_port_msg_t       *port_msg;
@@ -1298,13 +1299,6 @@ nxt_unit_process_msg(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf,
     nxt_unit_recv_msg_t  recv_msg;
 
     lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
-
-    pending = ((nxt_unit_ctx_impl_t *) nxt_container_of(ctx,
-               nxt_unit_ctx_impl_t, ctx))->quit_pending;
-
-    if (nxt_slow_path(pending != 0)) {
-        nxt_unit_take_quit(ctx, pending);
-    }
 
     recv_msg.incoming_buf = NULL;
     recv_msg.fd[0] = -1;
@@ -1514,7 +1508,39 @@ done:
         nxt_unit_read_buf_release(ctx, rbuf);
     }
 
+    /*
+     * A QUIT that could not be sent waits in quit_pending (see
+     * nxt_unit_send_quit()).  It is taken after the message in hand, not
+     * before: that message was already read from the port, so it was sent
+     * before the dropped QUIT datagram would have arrived.  Taking the
+     * QUIT first could take the context offline and then create a request
+     * on it from this very buffer; with a body to come, that request was
+     * never finished.  Taken after, a graceful QUIT waits for the request
+     * like any other, and a normal QUIT closes it through close_handler.
+     * A request handed back through "preq" is not ours to close yet: the
+     * caller runs it next, so the QUIT stays pending for the next message.
+     */
+    if (preq == NULL || *preq == NULL) {
+        nxt_unit_check_quit_pending(ctx);
+    }
+
     return rc;
+}
+
+
+static void
+nxt_unit_check_quit_pending(nxt_unit_ctx_t *ctx)
+{
+    nxt_atomic_uint_t    pending;
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    pending = ctx_impl->quit_pending;
+
+    if (nxt_slow_path(pending != 0)) {
+        nxt_unit_take_quit(ctx, pending);
+    }
 }
 
 
@@ -8385,8 +8411,8 @@ nxt_unit_quit(nxt_unit_ctx_t *ctx, uint8_t quit_param)
  * and taken back only when the send succeeds whole.  When the datagram is
  * dropped, the socket of the target is full, so the target has unread
  * messages and will run nxt_unit_process_msg(), which checks quit_pending
- * first.  Setting it before the send closes the window where the target
- * drains its socket between a failed send and a late store and goes back to
+ * after each message.  Setting it before the send closes the window where
+ * the target drains its socket between a failed send and a late store and goes back to
  * poll() with the QUIT never delivered.  If the target takes the pending
  * QUIT and also reads the datagram, the second nxt_unit_quit() is harmless:
  * it returns early once the context is offline, and a repeated graceful
