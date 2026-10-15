@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 
 #define CONTENT_TYPE  "Content-Type"
@@ -184,6 +185,16 @@ greeting_app_request_handler(nxt_unit_request_info_t *req)
     nxt_unit_buf_t      *buf;
     nxt_unit_field_t    *f;
     nxt_unit_request_t  *r;
+
+    /* A target of "/sleep" holds the context for a second (tests). */
+    r = req->request;
+
+    if (r->path_length == nxt_length("/sleep")
+        && memcmp(nxt_unit_sptr_get(&r->path), "/sleep",
+                  nxt_length("/sleep")) == 0)
+    {
+        sleep(1);
+    }
 
     rc = nxt_unit_response_init(req, 200 /* Status code. */,
                                 1 /* Number of response headers. */,

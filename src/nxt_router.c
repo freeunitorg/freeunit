@@ -8350,7 +8350,7 @@ nxt_router_app_prepare_request(nxt_task_t *task,
     nxt_request_rpc_data_t *req_rpc_data)
 {
     size_t             workers;
-    uint32_t           bound;
+    uint32_t           bound, readers;
     nxt_app_t          *app;
     nxt_buf_t          *buf, *body;
     nxt_int_t          res;
@@ -8424,6 +8424,20 @@ nxt_router_app_prepare_request(nxt_task_t *task,
     } else {
         bound = (uint32_t) workers;
     }
+
+    /*
+     * Every registered context reads the shared queue, and an "external"
+     * application allocates contexts of its own (nxt_unit_ctx_alloc(),
+     * one NEW_PORT each) with no "threads" setting to say so.
+     * ->port_hash_count counts each process's main port and each context
+     * port the router registered, so it is the number of queue readers
+     * whenever it exceeds processes * threads.
+     */
+    nxt_thread_mutex_lock(&app->mutex);
+    readers = app->port_hash_count;
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    bound = nxt_max(bound, readers);
 
     res = nxt_app_queue_send_bound(port->queue, &msg, sizeof(msg),
                                    req_rpc_data->stream, &notify,
