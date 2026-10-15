@@ -1363,6 +1363,75 @@ nxt_unit_msg_test_send_request(nxt_chunk_id_t chunk,
 }
 
 
+/*
+ * A request with a body arrives while a graceful QUIT is pending (the
+ * QUIT datagram was dropped on a full socket).  The QUIT used to be taken
+ * before the message in hand, so the context went offline and the request
+ * from that same buffer was created on it; its body then had no reader and
+ * the request hung.  The QUIT must be taken after the message: the context
+ * stays online until the body arrives and the request is done, and then
+ * quits.  alarm() turns a hang into a failure.
+ */
+
+static void
+nxt_unit_msg_test_edit_more_body(nxt_unit_request_t *r)
+{
+    r->content_length = nxt_length(NXT_UNIT_MSG_TEST_BODY "cd");
+}
+
+
+static int
+nxt_unit_msg_test_quit_pending_body_case(void *data)
+{
+    int     rc;
+    u_char  *p;
+
+    nxt_unit_msg_test_mode = NXT_UNIT_MSG_TEST_READ_BODY;
+
+    alarm(10);
+
+    nxt_unit_test_ctx_set_quit_pending(nxt_unit_msg_test_ctx,
+                                       1 /* NXT_QUIT_GRACEFUL */);
+
+    rc = nxt_unit_msg_test_send_request(2, nxt_unit_msg_test_edit_more_body);
+
+    if (rc != NXT_UNIT_OK || nxt_unit_msg_test_handler_calls != 0
+        || !nxt_unit_test_ctx_online(nxt_unit_msg_test_ctx))
+    {
+        printf("unit msg test: after headers rc %d, handler %d, online %d, "
+               "expected rc %d, handler 0, online 1\n", rc,
+               nxt_unit_msg_test_handler_calls,
+               (int) nxt_unit_test_ctx_online(nxt_unit_msg_test_ctx),
+               NXT_UNIT_OK);
+        fflush(stdout);
+
+        return 1;
+    }
+
+    p = nxt_port_mmap_chunk_start(nxt_unit_msg_test_seg0, 3);
+    memcpy(p, "cd", 2);
+
+    rc = nxt_unit_msg_test_send_chunk(_NXT_PORT_MSG_REQ_BODY, 1, 3, 2);
+
+    alarm(0);
+
+    if (rc != NXT_UNIT_OK || nxt_unit_msg_test_handler_calls != 1
+        || nxt_unit_test_ctx_online(nxt_unit_msg_test_ctx))
+    {
+        printf("unit msg test: after body rc %d, handler %d, online %d, "
+               "expected rc %d, handler 1, online 0\n", rc,
+               nxt_unit_msg_test_handler_calls,
+               (int) nxt_unit_test_ctx_online(nxt_unit_msg_test_ctx),
+               NXT_UNIT_OK);
+        fflush(stdout);
+
+        return 2;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
 static void
 nxt_unit_msg_test_edit_target(nxt_unit_request_t *r)
 {
@@ -3799,6 +3868,10 @@ main(void)
                                    "block and is not lost",
                                    nxt_unit_msg_test_quit_full_case, NULL,
                                    NXT_UNIT_OK);
+        nxt_unit_msg_test_in_child("grok713 request with a body during a "
+                                   "pending quit completes",
+                                   nxt_unit_msg_test_quit_pending_body_case,
+                                   NULL, NXT_UNIT_OK);
         return nxt_unit_msg_test_failures != 0;
     }
 
@@ -3881,6 +3954,11 @@ main(void)
     nxt_unit_msg_test_in_child("a QUIT over a full socket does not block and "
                                "is not lost",
                                nxt_unit_msg_test_quit_full_case, NULL,
+                               NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("a request with a body during a pending quit "
+                               "completes",
+                               nxt_unit_msg_test_quit_pending_body_case, NULL,
                                NXT_UNIT_OK);
 
     nxt_unit_msg_test_in_child("duplicate segment id does not leak a mapping",
