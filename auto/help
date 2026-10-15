@@ -47,6 +47,7 @@ cat << END
   --no-unix-sockets    disable Unix domain sockets support
   --no-regex           disable regular expression support
   --no-pcre2           force using PCRE library
+  --regex-jit          try PCRE2 JIT, with interpreted fallback (off by default)
 
   --openssl            enable OpenSSL library usage
 
