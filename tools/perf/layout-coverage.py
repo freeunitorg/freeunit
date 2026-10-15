@@ -33,6 +33,12 @@ from pathlib import Path
 LIST = Path('tools/perf/layout-structs.txt')
 MAKE = Path('auto/make')
 
+# The rule also copies two headers that ./configure writes:
+# nxt_auto_config.h and nxt_version.h.  They hold only macros today, but
+# they are scanned when they exist, so a struct added to the generator is
+# not missed.  Without a configured tree they are skipped with a note.
+BUILD = 'build/include'
+
 # The install rule names the first header; the rest follow, one per line,
 # each but the last ending in a backslash.
 FIRST = 'install -p -m u=rw,go=r src/nxt_unit.h'
@@ -64,6 +70,8 @@ def installed_headers():
 
         while True:
             headers += re.findall(r'src/[A-Za-z0-9_]+\.h', lines[i])
+            headers += [f'{BUILD}/{h}' for h in re.findall(
+                r'\$NXT_BUILD_DIR/include/([A-Za-z0-9_]+\.h)', lines[i])]
 
             if not lines[i].rstrip().endswith('\\'):
                 break
@@ -196,6 +204,11 @@ def main():
     missing = []
 
     for header in installed_headers():
+        if header.startswith(BUILD + '/') and not Path(header).exists():
+            print(f'note: {header} is not generated, not scanned '
+                  '(run ./configure first)')
+            continue
+
         for name, names in sorted(structs(header).items()):
             if not names & have:
                 missing.append((header, name, sorted(names)))
