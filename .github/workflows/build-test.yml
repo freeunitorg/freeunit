@@ -293,8 +293,25 @@ jobs:
       - name: Make unit
         env:
           CARGO_INCREMENTAL: 0
+          # Exercise the encoded-flags branch and retain source paths in
+          # debug info, so the check below detects a missing remap.
+          CARGO_ENCODED_RUSTFLAGS: -Cdebuginfo=1
         run: |
           make -j$(nproc) -k || make
+
+      - name: Assert encoded Rust flags preserve path remapping
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          archive = Path('build/lib/libotel.a').read_bytes()
+          if not archive:
+              raise SystemExit('::error::the otel archive is empty')
+          if os.fsencode(os.getcwd()) in archive:
+              raise SystemExit('::error::the otel archive contains the build path')
+          print('otel archive contains no build path with encoded Rust flags')
+          PY
 
       # unitd needs only OPENSSL_3.0.0 symbols, so without the rpath it would
       # load the runner's system libssl.so.3 and every TLS test would still
