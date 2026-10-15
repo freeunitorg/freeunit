@@ -248,6 +248,15 @@ def pytest_runtest_makereport(item):
 
     setattr(item, f'rep_{rep.when}', rep)
 
+    # A deadline that fired in teardown and was caught there leaves the
+    # teardown report passed.  Fail it here, once: a raise that escaped
+    # has already failed the report.
+    expired = getattr(item, 'deadline_teardown_expired', None)
+
+    if rep.when == 'teardown' and expired and rep.passed:
+        rep.outcome = 'failed'
+        rep.longrepr = f'{expired}  A teardown caught the failure.'
+
 
 @pytest.fixture(scope='module', autouse=True)
 def check_prerequisites_module(request):
@@ -305,6 +314,10 @@ def deadline(request):
         # itself, so it must not be reported a second time.
         if getattr(request.node, 'rep_call', None) is None:
             in_body.append(True)
+        else:
+            # In teardown, a cleanup may catch the raise too.  The
+            # makereport hook fails the teardown report if it passed.
+            request.node.deadline_teardown_expired = message
 
         # pytest.fail() raises a BaseException, and test code does catch
         # that: _reload_and_poll_mounts() in test_go_isolation.py has an
