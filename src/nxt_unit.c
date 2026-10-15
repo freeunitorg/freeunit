@@ -229,6 +229,9 @@ static void nxt_unit_remove_pid(nxt_unit_impl_t *lib, pid_t pid);
 static void nxt_unit_remove_process(nxt_unit_impl_t *lib,
     nxt_unit_process_t *process);
 static void nxt_unit_quit(nxt_unit_ctx_t *ctx, uint8_t quit_param);
+static void nxt_unit_send_quit(nxt_unit_ctx_t *ctx,
+    nxt_unit_ctx_impl_t *target, uint8_t quit_param);
+static void nxt_unit_take_quit(nxt_unit_ctx_t *ctx, nxt_atomic_uint_t pending);
 static int nxt_unit_get_port(nxt_unit_ctx_t *ctx, nxt_unit_port_id_t *port_id);
 static ssize_t nxt_unit_port_send(nxt_unit_ctx_t *ctx,
     nxt_unit_port_t *port, const void *buf, size_t buf_size,
@@ -518,6 +521,12 @@ struct nxt_unit_ctx_impl_s {
      * returned NXT_UNIT_OK only for a pending FINISH retry.
      */
     uint8_t                       detached_idle;  /* 1 bit */
+
+    /*
+     * A QUIT that another context could not send to this one without
+     * blocking: its quit_param + 1, or 0.  nxt_unit_process_msg() takes it.
+     */
+    nxt_atomic_t                  quit_pending;
 
     /*
      * The earliest time for the next FINISH retry from
@@ -1280,6 +1289,7 @@ nxt_unit_process_msg(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf,
     nxt_unit_request_info_t **preq)
 {
     int                  rc;
+    nxt_atomic_uint_t    pending;
     pid_t                pid;
     uint8_t              quit_param;
     nxt_port_msg_t       *port_msg;
@@ -1287,6 +1297,13 @@ nxt_unit_process_msg(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf,
     nxt_unit_recv_msg_t  recv_msg;
 
     lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
+
+    pending = ((nxt_unit_ctx_impl_t *) nxt_container_of(ctx,
+               nxt_unit_ctx_impl_t, ctx))->quit_pending;
+
+    if (nxt_slow_path(pending != 0)) {
+        nxt_unit_take_quit(ctx, pending);
+    }
 
     recv_msg.incoming_buf = NULL;
     recv_msg.fd[0] = -1;
@@ -4800,6 +4817,17 @@ nxt_unit_test_detached_now(void)
 }
 
 
+void
+nxt_unit_test_ctx_set_quit_pending(nxt_unit_ctx_t *ctx, uint8_t quit_param)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    ctx_impl->quit_pending = (nxt_atomic_uint_t) quit_param + 1;
+}
+
+
 uint8_t
 nxt_unit_test_ctx_online(nxt_unit_ctx_t *ctx)
 {
@@ -5950,7 +5978,7 @@ nxt_unit_unpark_rbufs(nxt_unit_ctx_t *ctx, nxt_queue_t *awaiting_rbuf)
 
         /*
          * The last use of ctx_impl: nxt_unit_ctx_free() may free it now.
-         * The wake-up below can block in sendmsg(), so it uses the port
+         * The wake-up below runs after that, so it uses the port
          * reference, and nxt_unit_ctx_free() does not wait for it.
          */
         nxt_atomic_fetch_add(&ctx_impl->unparking, -1);
@@ -6027,9 +6055,10 @@ nxt_unit_awake_port(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port)
      * This is a wake-up, not data, and the caller is often the thread that
      * frees a context and must make progress: if the target stopped reading,
      * its socket is full, and a blocking send here hangs the worker at quit
-     * (issue 663).  MSG_DONTWAIT bounds it; the target is already readable in
-     * exactly that case, so the nudge is not needed.  The port reference stays
-     * held by the caller for the lifetime of this call.
+     * (issue 663).  So it is sent with MSG_DONTWAIT, and a port_send callback
+     * gets that through nxt_unit_port_send_flags(); the target is already
+     * readable when its socket is full, so the nudge is not needed then.  The
+     * port reference stays held by the caller for the lifetime of this call.
      */
     (void) nxt_unit_port_send_impl(ctx, port, &msg, sizeof(msg), NULL, 1,
                                    NULL, MSG_DONTWAIT);
@@ -8254,10 +8283,6 @@ nxt_unit_quit(nxt_unit_ctx_t *ctx, uint8_t quit_param)
     nxt_unit_request_info_t       *req;
     nxt_unit_request_info_impl_t  *req_impl;
 
-    struct {
-        nxt_port_msg_t            msg;
-        uint8_t                   quit_param;
-    } nxt_packed m;
 
     lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
     ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
@@ -8331,12 +8356,6 @@ nxt_unit_quit(nxt_unit_ctx_t *ctx, uint8_t quit_param)
         return;
     }
 
-    memset(&m.msg, 0, sizeof(nxt_port_msg_t));
-
-    m.msg.pid = lib->pid;
-    m.msg.type = _NXT_PORT_MSG_QUIT;
-    m.quit_param = quit_param;
-
     pthread_mutex_lock(&lib->mutex);
 
     nxt_queue_each(ctx_impl, &lib->contexts, nxt_unit_ctx_impl_t, link) {
@@ -8348,12 +8367,96 @@ nxt_unit_quit(nxt_unit_ctx_t *ctx, uint8_t quit_param)
             continue;
         }
 
-        (void) nxt_unit_port_send(ctx, ctx_impl->read_port,
-                                  &m, sizeof(m), NULL);
+        nxt_unit_send_quit(ctx, ctx_impl, quit_param);
 
     } nxt_queue_loop;
 
     pthread_mutex_unlock(&lib->mutex);
+}
+
+
+/*
+ * A QUIT carries quit_param, so it is data, not a nudge, and must not be
+ * lost.  It is still sent with MSG_DONTWAIT: the broadcast holds lib->mutex,
+ * and a context that stopped reading must not hang the sender (issue 663).
+ * A port with a queue keeps the QUIT in the queue and only its READ_QUEUE
+ * nudge can be dropped.  The QUIT is put in "quit_pending" before the send
+ * and taken back only when the send succeeds whole.  When the datagram is
+ * dropped, the socket of the target is full, so the target has unread
+ * messages and will run nxt_unit_process_msg(), which checks quit_pending
+ * first.  Setting it before the send closes the window where the target
+ * drains its socket between a failed send and a late store and goes back to
+ * poll() with the QUIT never delivered.  If the target takes the pending
+ * QUIT and also reads the datagram, the second nxt_unit_quit() is harmless:
+ * it returns early once the context is offline, and a repeated graceful
+ * quit neither re-removes the port nor re-broadcasts.  A full queue or any
+ * other send failure leaves the QUIT pending too.  There is no retry loop,
+ * so nothing spins while the target is busy.
+ */
+
+static void
+nxt_unit_send_quit(nxt_unit_ctx_t *ctx, nxt_unit_ctx_impl_t *target,
+    uint8_t quit_param)
+{
+    ssize_t            res;
+    nxt_bool_t         owned;
+    nxt_atomic_uint_t  set;
+    nxt_unit_impl_t    *lib;
+
+    struct {
+        nxt_port_msg_t  msg;
+        uint8_t         quit_param;
+    } nxt_packed m;
+
+    lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
+
+    memset(&m.msg, 0, sizeof(nxt_port_msg_t));
+
+    m.msg.pid = lib->pid;
+    m.msg.type = _NXT_PORT_MSG_QUIT;
+    m.quit_param = quit_param;
+
+    set = (nxt_atomic_uint_t) quit_param + 1;
+
+    /* A normal quit overrides a pending graceful one. */
+    if (quit_param == NXT_QUIT_NORMAL) {
+        target->quit_pending = set;
+        owned = 1;
+
+    } else {
+        owned = nxt_atomic_cmp_set(&target->quit_pending, 0, set);
+    }
+
+    res = nxt_unit_port_send_impl(ctx, target->read_port, &m, sizeof(m), NULL,
+                                  1, NULL, MSG_DONTWAIT);
+    if (nxt_fast_path(res == (ssize_t) sizeof(m))) {
+        if (owned) {
+            /* Delivered; take it back unless the target took it already. */
+            (void) nxt_atomic_cmp_set(&target->quit_pending, set, 0);
+        }
+
+        return;
+    }
+
+    nxt_unit_debug(ctx, "quit: port{%d,%d} not sent (%d), quit %d pending",
+                   (int) target->read_port->id.pid,
+                   (int) target->read_port->id.id, (int) res,
+                   (int) quit_param);
+}
+
+
+static void
+nxt_unit_take_quit(nxt_unit_ctx_t *ctx, nxt_atomic_uint_t pending)
+{
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    if (nxt_atomic_cmp_set(&ctx_impl->quit_pending, pending, 0)) {
+        nxt_unit_debug(ctx, "quit: pending quit %d", (int) pending - 1);
+
+        nxt_unit_quit(ctx, (uint8_t) (pending - 1));
+    }
 }
 
 
@@ -8609,6 +8712,47 @@ nxt_unit_req_send_error(nxt_unit_request_info_t *req)
 }
 
 
+/*
+ * The send flags of the port_send callback call in progress on this thread.
+ * The callback signature is ABI and has no flags argument, so a callback that
+ * honours non-blocking wake-ups (the Go adapter) asks for them with
+ * nxt_unit_port_send_flags().  Callbacks that never ask keep the old blocking
+ * behaviour.
+ */
+static __thread int  nxt_unit_cb_send_flags;
+
+
+int
+nxt_unit_port_send_flags(nxt_unit_ctx_t *ctx)
+{
+    (void) ctx;
+
+    return nxt_unit_cb_send_flags;
+}
+
+
+static ssize_t
+nxt_unit_port_send_cb(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
+    const void *buf, size_t buf_size, const void *oob, size_t oob_size,
+    int flags)
+{
+    int              saved;
+    ssize_t          ret;
+    nxt_unit_impl_t  *lib;
+
+    lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
+
+    saved = nxt_unit_cb_send_flags;
+    nxt_unit_cb_send_flags = flags;
+
+    ret = lib->callbacks.port_send(ctx, port, buf, buf_size, oob, oob_size);
+
+    nxt_unit_cb_send_flags = saved;
+
+    return ret;
+}
+
+
 static ssize_t
 nxt_unit_port_send_impl(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     const void *buf, size_t buf_size, const nxt_send_oob_t *oob, int queue,
@@ -8661,8 +8805,9 @@ nxt_unit_port_send_impl(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
                                (int) ret);
 
             } else {
-                ret = lib->callbacks.port_send(ctx, port, &msg,
-                                               sizeof(nxt_port_msg_t), NULL, 0);
+                ret = nxt_unit_port_send_cb(ctx, port, &msg,
+                                            sizeof(nxt_port_msg_t), NULL, 0,
+                                            flags);
 
                 nxt_unit_debug(ctx, "port{%d,%d} sendcb %d read_queue",
                                (int) port->id.pid, (int) port->id.id,
@@ -8697,9 +8842,9 @@ nxt_unit_port_send_impl(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     }
 
     if (lib->callbacks.port_send != NULL) {
-        ret = lib->callbacks.port_send(ctx, port, buf, buf_size,
-                                       oob != NULL ? oob->buf : NULL,
-                                       oob != NULL ? oob->size : 0);
+        ret = nxt_unit_port_send_cb(ctx, port, buf, buf_size,
+                                    oob != NULL ? oob->buf : NULL,
+                                    oob != NULL ? oob->size : 0, flags);
 
         nxt_unit_debug(ctx, "port{%d,%d} sendcb %d",
                        (int) port->id.pid, (int) port->id.id,
@@ -8750,11 +8895,13 @@ retry:
          * queue, only its READ_QUEUE notification is dropped: the message
          * stays in the queue, and nxt_unit_ctx_port_recv() reads the queue
          * before the socket on each call.  A caller that asked for a
-         * non-blocking send (a wake-up in nxt_unit_ctx_free_rbufs()) must not
-         * hang on that, so EAGAIN ends here with a debug line.
+         * non-blocking send (a wake-up from nxt_unit_unpark_rbufs()) must not
+         * hang on that, so EAGAIN ends here with a debug line.  macOS and the
+         * BSDs report a full datagram socket with ENOBUFS instead, so that
+         * ends here too for such a send.
          */
         if ((flags & MSG_DONTWAIT) != 0
-            && (err == EAGAIN || err == EWOULDBLOCK))
+            && (err == NXT_EAGAIN || err == ENOBUFS))
         {
             nxt_unit_debug(ctx, "sendmsg(%d, %d): peer already has readable "
                            "data, non-blocking wake-up dropped",
@@ -9180,11 +9327,6 @@ nxt_unit_app_queue_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     nxt_unit_impl_t       *lib;
     nxt_unit_port_impl_t  *port_impl;
 
-    struct {
-        nxt_port_msg_t    msg;
-        uint8_t           quit_param;
-    } nxt_packed m;
-
     port_impl = nxt_container_of(port, nxt_unit_port_impl_t, port);
     queue = port_impl->queue;
 
@@ -9208,14 +9350,8 @@ retry:
                 if (nxt_slow_path(count >= lib->request_limit)) {
                     nxt_unit_debug(ctx, "request limit reached");
 
-                    memset(&m.msg, 0, sizeof(nxt_port_msg_t));
-
-                    m.msg.pid = lib->pid;
-                    m.msg.type = _NXT_PORT_MSG_QUIT;
-                    m.quit_param = NXT_QUIT_GRACEFUL;
-
-                    (void) nxt_unit_port_send(ctx, lib->main_ctx.read_port,
-                                              &m, sizeof(m), NULL);
+                    nxt_unit_send_quit(ctx, &lib->main_ctx,
+                                       NXT_QUIT_GRACEFUL);
                 }
             }
 

@@ -52,7 +52,8 @@ nxt_cgo_port_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     const void *buf, size_t buf_size, const void *oob, size_t oob_size)
 {
     return nxt_go_port_send(port->id.pid, port->id.id,
-                            (void *) buf, buf_size, (void *) oob, oob_size);
+                            (void *) buf, buf_size, (void *) oob, oob_size,
+                            nxt_unit_port_send_flags(ctx));
 }
 
 
