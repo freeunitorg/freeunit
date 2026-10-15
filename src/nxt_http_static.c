@@ -1151,6 +1151,35 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
                                   - p;
         }
 
+        /*
+         * A HEAD request runs the same negotiation as GET, so that it gets
+         * the same Content-Encoding, Vary, weak entity-tag and Content-Length
+         * (RFC 9110 Sect. 9.3.2, #391).  Only the body is not produced.  The
+         * coded length comes from a sizing pass over the same chunks GET
+         * compresses; it makes no temp file.
+         */
+
+        if (!ctx->need_body && !is_range && nxt_file_size(&fi) > 0) {
+            ret = nxt_http_comp_apply_compression(task, r);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                goto fail;
+            }
+
+            if (nxt_http_comp_wants_compression(r)) {
+                size_t  out_total;
+
+                ret = nxt_http_comp_static_response_length(
+                                                    task, r, f, &fi,
+                                                    NXT_HTTP_STATIC_BUF_SIZE,
+                                                    &out_total);
+                if (nxt_slow_path(ret != NXT_OK)) {
+                    goto fail;
+                }
+
+                r->resp.content_length_n = out_total;
+            }
+        }
+
         if (ctx->need_body && nxt_file_size(&fi) > 0) {
 
             /*
