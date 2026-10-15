@@ -82,8 +82,12 @@ def installed_headers():
 def structs(header):
     """The names a list entry can use for the structs in one header.
 
-    A struct has a tag, a typedef name, or both.  The list may use any of
-    them, because pahole -C takes any of them.
+    The entry must be the tag, or the name of an anonymous typedef.  An
+    alias of a tagged struct does not work: pahole -C with the alias
+    prints only the "typedef struct tag alias;" line, with no layout, so
+    layout-check.sh would report it "same" after any change.  The alias is
+    also only known in the header that declares it, so the defining header
+    still asks for the tag.
     """
 
     text = Path(header).read_text()
