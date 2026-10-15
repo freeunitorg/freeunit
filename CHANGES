@@ -40,6 +40,11 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        in 1.35.0 and later. See
        https://github.com/freeunitorg/freeunit/issues/666.
 
+    *) Bugfix: with "compression" on, a HEAD request for a static file got
+       no "Content-Encoding" and the uncompressed length, while GET got the
+       coded response. HEAD now has the same header fields as GET. See
+       https://github.com/freeunitorg/freeunit/issues/391.
+
     *) Bugfix: with "compression" on, a response body of up to 15 bytes
        from an application went out uncompressed under "Content-Encoding",
        so no client could decode it. See

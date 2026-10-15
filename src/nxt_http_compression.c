@@ -378,6 +378,70 @@ fail:
 }
 
 
+/*
+ * The length nxt_http_comp_compress_static_response() would give the same
+ * file, for HEAD (RFC 9110 Sect. 9.3.2).  It runs the same chunks through
+ * the same compressor, so the length is the one GET sends, but into a
+ * scratch buffer that is reused for each chunk: no temp file is made, and
+ * the output is dropped.  The stream ends with the last chunk.
+ */
+
+nxt_int_t
+nxt_http_comp_static_response_length(nxt_task_t *task, nxt_http_request_t *r,
+                                     nxt_file_t *f, nxt_file_info_t *fi,
+                                     size_t static_buf_len, size_t *out_total)
+{
+    bool                 last;
+    size_t               in_size, out_size, rest, n;
+    ssize_t              cbytes;
+    uint8_t              *in, *out;
+    nxt_int_t            ret;
+    nxt_http_comp_ctx_t  *ctx = r->comp_ctx;
+
+    *out_total = 0;
+
+    in_size = nxt_file_size(fi);
+    out_size = nxt_http_comp_bound(ctx, nxt_min(in_size, static_buf_len))
+               + NXT_HTTP_COMP_FLUSH_SLACK;
+
+    in = nxt_mem_mmap(NULL, in_size, PROT_READ, MAP_SHARED, f->fd, 0);
+    if (nxt_slow_path(in == MAP_FAILED)) {
+        nxt_alert(task, "mmap(%uz) of source failed %E", in_size, nxt_errno);
+        return NXT_ERROR;
+    }
+
+    out = nxt_malloc(out_size);
+    if (nxt_slow_path(out == NULL)) {
+        nxt_mem_munmap(in, in_size);
+        return NXT_ERROR;
+    }
+
+    ret = NXT_OK;
+    rest = in_size;
+
+    do {
+        n = nxt_min(rest, static_buf_len);
+
+        last = n == rest;
+
+        cbytes = nxt_http_comp_compress(ctx, out, out_size,
+                                        in + in_size - rest, n, last);
+        if (cbytes == -1) {
+            ret = NXT_ERROR;
+            break;
+        }
+
+        *out_total += cbytes;
+        rest -= n;
+    } while (rest > 0);
+
+    nxt_free(out);
+    nxt_mem_munmap(in, in_size);
+
+    return ret;
+}
+
+
 nxt_int_t
 nxt_http_comp_compress_static_response(nxt_task_t *task, nxt_http_request_t *r,
                                        nxt_file_t **f, nxt_file_info_t *fi,
@@ -1571,8 +1635,8 @@ nxt_http_comp_weaken_etag(nxt_http_request_t *r)
 
 /*
  * Applies the decision nxt_http_comp_check_acceptable() reached: adds the
- * Content-Encoding header and initialises the compressor.  Call it only on a
- * path that will actually send a body.
+ * Content-Encoding header and initialises the compressor.  Call it on a path
+ * that sends a body, or for HEAD, which must carry the same fields as GET.
  */
 
 nxt_int_t
