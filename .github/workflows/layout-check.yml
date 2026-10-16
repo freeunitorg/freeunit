@@ -9,6 +9,11 @@ name: "Layout check (pahole)"
 # shared-memory struct fails the job.  A change to a process-local struct
 # gives a warning only.
 #
+# The same job also compares the declarations of the public functions
+# (tools/perf/api-signatures.py, from the headers of both commits) and the
+# structs and enumerators the headers carry (tools/perf/layout-coverage.py,
+# from the head).  Neither needs a build.
+#
 # Each pull request runs the job, with no path filter.  A skipped job
 # reports success, and a typedef, a build flag or a new header can change
 # a layout from a file that a filter does not name.  The job takes about
@@ -75,6 +80,11 @@ jobs:
 
       - name: Check that the list covers every installed struct
         run: tools/perf/layout-coverage.py --self-test && tools/perf/layout-coverage.py
+
+      - name: Check the public declarations
+        env:
+          BASE: ${{ steps.base.outputs.sha }}
+        run: tools/perf/api-signatures.py "$BASE" HEAD
 
       - name: Compare the layouts
         env:
