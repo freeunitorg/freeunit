@@ -14,7 +14,7 @@
  * nxt_atomic_release() must set a release barrier.
  */
 
-#if (NXT_HAVE_GCC_ATOMIC) /* GCC __sync_* intrinsics and __atomic_load_n */
+#if (NXT_HAVE_GCC_ATOMIC) /* GCC __sync_* intrinsics and __atomic_* builtins */
 
 typedef intptr_t                    nxt_atomic_int_t;
 typedef uintptr_t                   nxt_atomic_uint_t;
@@ -46,6 +46,23 @@ typedef volatile nxt_atomic_uint_t  nxt_atomic_t;
 
 #define nxt_atomic_load(value)                                                \
     __atomic_load_n(value, __ATOMIC_RELAXED)
+
+
+/*
+ * An acquire load, for a reader that must also observe data published with
+ * the value, such as an entry of a lock-free queue whose payload the
+ * producer wrote before its compare-and-swap.  The matching release is that
+ * compare-and-swap, a full barrier.
+ */
+
+#define nxt_atomic_load_acquire(value)                                        \
+    __atomic_load_n(value, __ATOMIC_ACQUIRE)
+
+
+/* A relaxed store: it carries no ordering and publishes no data. */
+
+#define nxt_atomic_store(value, new_value)                                    \
+    __atomic_store_n(value, new_value, __ATOMIC_RELAXED)
 
 
 #define nxt_atomic_try_lock(lock)                                             \

@@ -253,7 +253,7 @@ nxt_http_websocket_queue_full(nxt_port_t *port)
 
     q = port->queue;
 
-    return q != NULL && q->nitems >= NXT_PORT_QUEUE_SIZE;
+    return q != NULL && nxt_atomic_load(&q->nitems) >= NXT_PORT_QUEUE_SIZE;
 }
 
 

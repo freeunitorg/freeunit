@@ -9156,7 +9156,7 @@ nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid, uint8_t state)
      */
 
     for ( ;; ) {
-        c = app->use_count;
+        c = nxt_atomic_load(&app->use_count);
 
         if (c == 0) {
             nxt_debug(task, "detached_handler: app '%V' is being freed",

@@ -5147,7 +5147,12 @@ retry:
         }
 
         if (!probe) {
-            hdr->oosm = 1;
+            /*
+             * No data is published with the flag and setting it twice changes
+             * nothing; the clear is the side that uses the compare-and-set
+             * result.
+             */
+            nxt_atomic_store(&hdr->oosm, 1);
         }
     }
 

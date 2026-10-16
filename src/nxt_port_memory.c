@@ -625,7 +625,11 @@ nxt_port_mmap_get(nxt_task_t *task, nxt_port_mmaps_t *mmaps, nxt_chunk_id_t *c,
             }
         }
 
-        hdr->oosm = 1;
+        /*
+         * No data is published with the flag and setting it twice changes
+         * nothing; the clear is the side that uses the compare-and-set result.
+         */
+        nxt_atomic_store(&hdr->oosm, 1);
     }
 
     /* TODO introduce port_mmap limit and release wait. */

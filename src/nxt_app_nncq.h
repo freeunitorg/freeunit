@@ -43,14 +43,14 @@ typedef struct {
 static inline nxt_app_nncq_atomic_t
 nxt_app_nncq_head(nxt_app_nncq_t const volatile *q)
 {
-    return q->head;
+    return nxt_atomic_load(&q->head);
 }
 
 
 static inline nxt_app_nncq_atomic_t
 nxt_app_nncq_tail(nxt_app_nncq_t const volatile *q)
 {
-    return q->tail;
+    return nxt_atomic_load(&q->tail);
 }
 
 
@@ -131,7 +131,7 @@ nxt_app_nncq_enqueue_pos(nxt_app_nncq_t volatile *q, nxt_app_nncq_atomic_t val,
     for (r = 0; r < NXT_APP_NNCQ_RETRIES; r++) {
         t = nxt_app_nncq_tail(q);
         j = nxt_app_nncq_map(q, t);
-        e = q->entries[j];
+        e = nxt_atomic_load_acquire(&q->entries[j]);
 
         e_cycle = nxt_app_nncq_cycle(q, e);
         t_cycle = nxt_app_nncq_cycle(q, t);
@@ -178,7 +178,7 @@ nxt_app_nncq_dequeue(nxt_app_nncq_t volatile *q)
     for (r = 0; r < NXT_APP_NNCQ_RETRIES; r++) {
         h = nxt_app_nncq_head(q);
         j = nxt_app_nncq_map(q, h);
-        e = q->entries[j];
+        e = nxt_atomic_load_acquire(&q->entries[j]);
 
         e_cycle = nxt_app_nncq_cycle(q, e);
         h_cycle = nxt_app_nncq_cycle(q, h);

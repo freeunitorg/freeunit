@@ -78,7 +78,7 @@ nxt_thread_spin_lock(nxt_thread_spinlock_t *lock)
 
             nxt_cpu_pause();
 
-            if (*lock == 0) {
+            if (nxt_atomic_load(lock) == 0) {
                 goto again;
             }
         }

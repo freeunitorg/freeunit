@@ -214,7 +214,7 @@ nxt_port_use_unless_zero(nxt_port_t *port)
     nxt_atomic_int_t  c;
 
     for ( ;; ) {
-        c = port->use_count;
+        c = nxt_atomic_load(&port->use_count);
 
         if (c <= 0) {
             return 0;
@@ -1539,7 +1539,7 @@ nxt_port_use(nxt_task_t *task, nxt_port_t *port, int i)
      */
 
     for ( ;; ) {
-        c = port->use_count;
+        c = nxt_atomic_load(&port->use_count);
 
         if (c != -i) {
             nxt_assert(c > -i);

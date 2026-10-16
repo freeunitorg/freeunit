@@ -205,7 +205,7 @@ nxt_thread_pool_wait(nxt_thread_pool_t *tp)
     }
 
     do {
-        threads = tp->threads;
+        threads = nxt_atomic_load(&tp->threads);
 
         if (threads >= tp->max_threads) {
             return;
