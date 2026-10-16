@@ -28,6 +28,12 @@
 #        change fails, as for "const".  The program that prints the
 #        "const" values prints these too, without the #ifdef that is
 #        false for an enum constant.
+#        The message numbers of the port protocol are here as well: each
+#        _NXT_PORT_MSG_* value is the offset of a slot in
+#        nxt_port_handlers_t, so inserting or reordering a slot renumbers
+#        the wire protocol even when the build still passes.
+#        tools/perf/layout-coverage.py reads src/nxt_port.h too, so a new
+#        slot fails the check until it is listed.
 # local: The struct is in the memory of one process.  A change to its
 #        layout gives a warning.  Every struct defined in a header that
 #        "make install" copies is listed, because a module is built
@@ -94,6 +100,7 @@ enum   NXT_WEBSOCKET_CR_EXTENSION_REQUIRED
 enum   NXT_WEBSOCKET_CR_INTERNAL_SERVER_ERROR
 enum   NXT_WEBSOCKET_CR_TLS_HANDSHAKE_FAILED
 
+local  nxt_port_handlers_t
 local  nxt_port_s
 local  nxt_unit_buf_s
 local  nxt_unit_callbacks_s
@@ -106,3 +113,95 @@ local  nxt_unit_read_info_s
 local  nxt_unit_request_info_s
 local  nxt_unit_s
 local  nxt_unit_websocket_frame_s
+
+# The message numbers of the wire protocol.  Each value is the offset of
+# a slot in nxt_port_handlers_t, so appending is the only safe edit.
+enum   NXT_PORT_DETACHED_FINISH
+enum   NXT_PORT_DETACHED_START
+enum   NXT_PORT_MSG_ACCESS_LOG
+enum   NXT_PORT_MSG_APP_RESTART
+enum   NXT_PORT_MSG_CANCELLED
+enum   NXT_PORT_MSG_CERT_DELETE
+enum   NXT_PORT_MSG_CERT_GET
+enum   NXT_PORT_MSG_CERT_STORE
+enum   NXT_PORT_MSG_CHANGE_FILE
+enum   NXT_PORT_MSG_CLOSE_FD
+enum   NXT_PORT_MSG_CONF_STORE
+enum   NXT_PORT_MSG_DATA
+enum   NXT_PORT_MSG_DATA_LAST
+enum   NXT_PORT_MSG_DETACHED
+enum   NXT_PORT_MSG_GET_MMAP
+enum   NXT_PORT_MSG_GET_PORT
+enum   NXT_PORT_MSG_LAST
+enum   NXT_PORT_MSG_MASK
+enum   NXT_PORT_MSG_MMAP
+enum   NXT_PORT_MSG_MODULES
+enum   NXT_PORT_MSG_NEW_PORT
+enum   NXT_PORT_MSG_NOT_FOUND
+enum   NXT_PORT_MSG_OOSM
+enum   NXT_PORT_MSG_PORT_ACK
+enum   NXT_PORT_MSG_PROCESS_CREATED
+enum   NXT_PORT_MSG_PROCESS_READY
+enum   NXT_PORT_MSG_QUIT
+enum   NXT_PORT_MSG_READ_QUEUE
+enum   NXT_PORT_MSG_READ_SOCKET
+enum   NXT_PORT_MSG_REMOVE_CHILD_PID
+enum   NXT_PORT_MSG_REMOVE_PID
+enum   NXT_PORT_MSG_REQ_BODY
+enum   NXT_PORT_MSG_REQ_HEADERS
+enum   NXT_PORT_MSG_RPC_ERROR
+enum   NXT_PORT_MSG_RPC_READY
+enum   NXT_PORT_MSG_RPC_READY_LAST
+enum   NXT_PORT_MSG_SCRIPT_DELETE
+enum   NXT_PORT_MSG_SCRIPT_GET
+enum   NXT_PORT_MSG_SCRIPT_STORE
+enum   NXT_PORT_MSG_SHM_ACK
+enum   NXT_PORT_MSG_SOCKET
+enum   NXT_PORT_MSG_SOCKET_UNLINK
+enum   NXT_PORT_MSG_STARTED
+enum   NXT_PORT_MSG_START_PROCESS
+enum   NXT_PORT_MSG_STATUS
+enum   NXT_PORT_MSG_SYNC
+enum   NXT_PORT_MSG_WEBSOCKET
+enum   NXT_PORT_MSG_WEBSOCKET_LAST
+enum   NXT_PORT_MSG_WHOAMI
+enum   NXT_PORT_QUIT_GRACEFUL
+enum   NXT_PORT_QUIT_NORMAL
+enum   _NXT_PORT_MSG_ACCESS_LOG
+enum   _NXT_PORT_MSG_APP_RESTART
+enum   _NXT_PORT_MSG_CERT_DELETE
+enum   _NXT_PORT_MSG_CERT_GET
+enum   _NXT_PORT_MSG_CERT_STORE
+enum   _NXT_PORT_MSG_CHANGE_FILE
+enum   _NXT_PORT_MSG_CONF_STORE
+enum   _NXT_PORT_MSG_DATA
+enum   _NXT_PORT_MSG_DETACHED
+enum   _NXT_PORT_MSG_GET_MMAP
+enum   _NXT_PORT_MSG_GET_PORT
+enum   _NXT_PORT_MSG_MMAP
+enum   _NXT_PORT_MSG_MODULES
+enum   _NXT_PORT_MSG_NEW_PORT
+enum   _NXT_PORT_MSG_OOSM
+enum   _NXT_PORT_MSG_PORT_ACK
+enum   _NXT_PORT_MSG_PROCESS_CREATED
+enum   _NXT_PORT_MSG_PROCESS_READY
+enum   _NXT_PORT_MSG_QUIT
+enum   _NXT_PORT_MSG_READ_QUEUE
+enum   _NXT_PORT_MSG_READ_SOCKET
+enum   _NXT_PORT_MSG_REMOVE_CHILD_PID
+enum   _NXT_PORT_MSG_REMOVE_PID
+enum   _NXT_PORT_MSG_REQ_BODY
+enum   _NXT_PORT_MSG_REQ_HEADERS
+enum   _NXT_PORT_MSG_REQ_HEADERS_ACK
+enum   _NXT_PORT_MSG_RPC_ERROR
+enum   _NXT_PORT_MSG_RPC_READY
+enum   _NXT_PORT_MSG_SCRIPT_DELETE
+enum   _NXT_PORT_MSG_SCRIPT_GET
+enum   _NXT_PORT_MSG_SCRIPT_STORE
+enum   _NXT_PORT_MSG_SHM_ACK
+enum   _NXT_PORT_MSG_SOCKET
+enum   _NXT_PORT_MSG_SOCKET_UNLINK
+enum   _NXT_PORT_MSG_START_PROCESS
+enum   _NXT_PORT_MSG_STATUS
+enum   _NXT_PORT_MSG_WEBSOCKET
+enum   _NXT_PORT_MSG_WHOAMI

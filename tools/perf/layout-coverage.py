@@ -39,6 +39,20 @@ MAKE = Path('auto/make')
 # not missed.  Without a configured tree they are skipped with a note.
 BUILD = 'build/include'
 
+# Headers that are not installed and still carry values both processes use.
+# src/nxt_port.h holds nxt_port_handlers_t, and every _NXT_PORT_MSG_* value
+# is the offset of a slot in it, so inserting or reordering a slot renumbers
+# the wire protocol.  An enumerator here is listed as "enum" and compared by
+# value, and this file is why a new slot fails the check until it is listed.
+PROTOCOL_HEADERS = ['src/nxt_port.h']
+
+# A value that grows when a slot is appended.  Appending is the safe edit,
+# so pinning this one would block every future message: it is skipped here
+# and not listed.  NXT_PORT_MSG_MAX is sizeof(nxt_port_handlers_t) divided
+# by sizeof(nxt_port_handler_t) (src/nxt_port.h), so it moves on an append
+# while every existing number stays.
+APPEND_SAFE = {'NXT_PORT_MSG_MAX'}
+
 # The install rule names the first header; the rest follow, one per line,
 # each but the last ending in a backslash.
 FIRST = 'install -p -m u=rw,go=r src/nxt_unit.h'
@@ -240,6 +254,13 @@ def main():
         for name in enumerators(header):
             if name not in have:
                 enums.append((header, name))
+
+    for header in PROTOCOL_HEADERS:
+        for name in enumerators(header):
+            if name in APPEND_SAFE or name in have:
+                continue
+
+            enums.append((header, name))
 
     if missing:
         print('these structs are in the installed headers and not in the '
