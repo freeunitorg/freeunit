@@ -1229,6 +1229,7 @@ static int
 nxt_unit_process_read_msg(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf)
 {
     int                  wait;
+    nxt_atomic_t         parked;
     nxt_unit_ctx_impl_t  *ctx_impl;
 
     if (!nxt_unit_is_ordered(rbuf)) {
@@ -1242,10 +1243,17 @@ nxt_unit_process_read_msg(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf)
     wait = ctx_impl->parked > 0
            || !nxt_queue_is_empty(&ctx_impl->pending_rbuf);
 
+    parked = ctx_impl->parked;
+
     pthread_mutex_unlock(&ctx_impl->mutex);
 
     if (!wait) {
         return nxt_unit_process_msg(ctx, rbuf, NULL);
+    }
+
+    if (parked > 0) {
+        nxt_unit_debug(ctx, "reading is paused, %u buffers wait for mmap "
+                       "segments", (unsigned) parked);
     }
 
     /*
@@ -5257,6 +5265,14 @@ nxt_unit_wait_shm_ack(nxt_unit_ctx_t *ctx)
 
     ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
 
+    /*
+     * Unlike the parked buffer above, this wait blocks the thread in
+     * recv: a dump that shows every thread in epoll rules this state out,
+     * and this line in the log names it when the wait is real.
+     */
+    nxt_unit_log(ctx, NXT_UNIT_LOG_INFO, "the application waits for a "
+                 "shared memory ack, the thread blocks in recv");
+
     while (1) {
         rbuf = nxt_unit_read_buf_get(ctx);
         if (nxt_slow_path(rbuf == NULL)) {
@@ -5275,6 +5291,10 @@ nxt_unit_wait_shm_ack(nxt_unit_ctx_t *ctx)
 
         if (nxt_unit_is_shm_ack(rbuf)) {
             nxt_unit_read_buf_release(ctx, rbuf);
+
+            nxt_unit_debug(ctx, "the shared memory ack arrived, the wait is "
+                           "over");
+
             break;
         }
 
@@ -6058,6 +6078,7 @@ nxt_unit_check_rbuf_mmap(nxt_unit_ctx_t *ctx, nxt_unit_mmaps_t *mmaps,
     nxt_unit_read_buf_t *rbuf)
 {
     int                  res, need_rbuf;
+    nxt_atomic_t         parked;
     nxt_queue_t          awaiting_rbuf;
     nxt_unit_mmap_t      *mm;
     nxt_unit_ctx_impl_t  *ctx_impl;
@@ -6084,7 +6105,7 @@ nxt_unit_check_rbuf_mmap(nxt_unit_ctx_t *ctx, nxt_unit_mmaps_t *mmaps,
     nxt_queue_insert_tail(&mm->awaiting_rbuf, &rbuf->link);
 
     /* Before the unlock: nxt_unit_unpark_rbufs() can take rbuf after it. */
-    nxt_atomic_fetch_add(&rbuf->ctx_impl->parked, 1);
+    parked = nxt_atomic_fetch_add(&rbuf->ctx_impl->parked, 1);
 
     pthread_mutex_unlock(&mmaps->mutex);
 
@@ -6093,6 +6114,17 @@ nxt_unit_check_rbuf_mmap(nxt_unit_ctx_t *ctx, nxt_unit_mmaps_t *mmaps,
     nxt_atomic_fetch_add(&ctx_impl->wait_items, 1);
 
     if (need_rbuf) {
+        /*
+         * The first buffer parked on this segment: the context reads
+         * nothing until the segment arrives (the parked count gates
+         * nxt_unit_process_read_msg()), so this line and the one in
+         * nxt_unit_process_read_msg() say whether a connection that went
+         * quiet is waiting for a segment or for something else.
+         */
+        nxt_unit_log(ctx, NXT_UNIT_LOG_INFO, "the first read buffer waits "
+                     "for mmap segment %u of port %d, reading paused, %u "
+                     "parked", (unsigned) id, (int) pid, (unsigned) parked + 1);
+
         res = nxt_unit_get_mmap(ctx, pid, id);
         if (nxt_slow_path(res == NXT_UNIT_ERROR)) {
             /*
