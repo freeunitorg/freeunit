@@ -77,10 +77,21 @@ mkdir -p $NXT_BUILD_DIR/var/log/unit
 . auto/cc/hardening
 
 
+# With SOURCE_DATE_EPOCH set, as reproducible build tools do, keep the
+# kernel release and version of the build host out of the configuration
+# header.  The system name and platform stay: they follow the target.
+
+if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
+    NXT_SYSTEM_EMBED="$NXT_SYSTEM $NXT_SYSTEM_PLATFORM"
+else
+    NXT_SYSTEM_EMBED="$NXT_SYSTEM $NXT_SYSTEM_VERSION $NXT_SYSTEM_PLATFORM"
+fi
+
+
 cat << END >> $NXT_AUTO_CONFIG_H
 
 #define NXT_CONFIGURE_OPTIONS  "$NXT_CONFIGURE_OPTIONS"
-#define NXT_SYSTEM_VERSION     "$NXT_SYSTEM $NXT_SYSTEM_VERSION $NXT_SYSTEM_PLATFORM"
+#define NXT_SYSTEM_VERSION     "$NXT_SYSTEM_EMBED"
 #define NXT_COMPILER_VERSION   "$NXT_CC_VERSION"
 
 #define NXT_PID                "$NXT_PID"

@@ -10,6 +10,25 @@
          date="2026-10-04" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="change">
+<para>
+reproducible builds: with SOURCE_DATE_EPOCH set, unitd, the static libraries,
+source tarballs, rpm, rust and jar builds no longer carry build paths, host
+names, kernel release or times.  RPM packages built with rpm 4.14 or later
+have a fixed build time and build host.
+</para>
+</change>
+
+<change type="feature">
+<para>
+--regex-jit enables optional PCRE2 JIT compilation. A library or pattern
+without usable JIT uses interpreted matching. Configuration cleanup releases
+JIT executable memory. A match that exhausts the default JIT stack is retried
+once in the interpreter with the callout budget that the JIT attempt left.
+This option is off by default.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 when a burst of requests arrived for an application with multiple worker

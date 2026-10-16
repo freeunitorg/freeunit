@@ -1207,6 +1207,98 @@ jobs:
       - name: Run C tests
         run: sudo ./build/tests
 
+  # JIT is opt-in, so the default jobs do not execute its regression cases.
+  c-tests-jit:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [none, address]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev
+
+      - name: Configure unit with PCRE2 JIT
+        env:
+          SANITIZER: ${{ matrix.sanitizer }}
+        run: |
+          if [ "$SANITIZER" = address ]; then
+            ASAN_OPTIONS=detect_leaks=0 ./configure \
+              --openssl --debug --hardening=strict --tests --regex-jit \
+              --cc-opt='-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g' \
+              --ld-opt='-fsanitize=address,undefined'
+          else
+            ./configure --openssl --debug --hardening=strict --tests --regex-jit
+          fi
+
+      - name: Build unitd, libunit and C tests
+        run: |
+          make -j4
+          make -j4 build/lib/libunit.a
+          make -j4 tests
+
+      - name: Check test-hook isolation
+        run: .github/scripts/check-test-hooks.sh
+
+      - name: Run C tests
+        run: |
+          set -o pipefail
+          sudo env ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+            ./build/tests 2>&1 | tee jit-tests.log
+          grep -F 'regex JIT test passed: execution, fallback, cleanup' jit-tests.log
+
+  # The routing tests against a --regex-jit build: configuration
+  # validation, route matching on the engine threads, reconfiguration and
+  # the limit-hit error with JIT-compiled patterns.  Its own build, so the
+  # shared core build that the other pytest legs use stays without JIT.
+  routing-jit:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
+      - name: Install packages
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev \
+            python3-dev python3-pytest
+
+      - name: Configure unit with PCRE2 JIT
+        run: ./configure --openssl --debug --regex-jit
+
+      - name: Make unit and the python3 module
+        run: |
+          make -j4
+          ./configure python --config=python3-config
+          make -j4 python3
+
+      - name: Assert the build has --regex-jit
+        run: ./build/sbin/unitd --version 2>&1 | grep -F -- --regex-jit
+
+      # The test files with "~" route or match patterns.  The one in
+      # test_static_compression.py is left out: it needs a --zlib build.
+      # --port as in the test legs, so the run is off the default base port.
+      - name: Run routing tests
+        timeout-minutes: 8
+        run: |
+          sudo /usr/bin/pytest-3 --print-log --port 18080 \
+            test/test_routing.py \
+            test/test_route_if.py \
+            test/test_static_types.py
+
   # Same C unit-test suite as c-tests above, built with AddressSanitizer and
   # run with LeakSanitizer's default ASAN_OPTIONS (detect_leaks is on unless
   # something turns it off). Separate from sanitize.yml: that workflow runs

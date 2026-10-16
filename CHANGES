@@ -1,6 +1,19 @@
 
 Changes with FreeUnit 1.37.1                                     04 Oct 2026
 
+    *) Change: reproducible builds: with SOURCE_DATE_EPOCH set, unitd, the
+       static libraries, source tarballs, rpm, rust and jar builds no
+       longer carry build paths, host names, kernel release or times.
+       RPM packages built with rpm 4.14 or later have a fixed build time
+       and build host.
+
+    *) Feature: --regex-jit enables optional PCRE2 JIT compilation. A
+       library or pattern without usable JIT uses interpreted matching.
+       Configuration cleanup releases JIT executable memory. A match that
+       exhausts the default JIT stack is retried once in the interpreter
+       with the callout budget that the JIT attempt left. This option is
+       off by default.
+
     *) Bugfix: when a burst of requests arrived for an application with
        multiple worker processes or threads, only the first request woke a
        worker, forcing that worker to process the entire burst sequentially

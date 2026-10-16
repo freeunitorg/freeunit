@@ -242,11 +242,15 @@ test/
 GitHub Actions runs the tests in `.github/workflows/build-test.yml`. The
 language versions come from `pkg/eol.json`.
 
-- A push to `master` runs every version of every runtime.
+- A push to `master` runs every version of every runtime, except Node.js and
+  Java. Those two run the oldest supported version, the newest version and,
+  when it is neither of those, the newest LTS: Node.js 22 and 26, Java 17, 25
+  and 27 today.
 - A pull request runs every Python version, Perl, WASM and WASI, and one
   version each of Go, Java, Node.js, PHP and Ruby. A runtime whose own files
-  change gets every version. A change to `pkg/eol.json`, to `build-test.yml`
-  or to `.github/scripts/test-matrix.sh` gives the full matrix. So does the
+  change gets every version, except Node.js and Java, which get the legs
+  above. A change to `pkg/eol.json`, to `build-test.yml` or to
+  `.github/scripts/test-matrix.sh` gives the full matrix. So does the
   `ci-full` label on the pull request.
 
 `.github/scripts/test-matrix.sh` has the rules and the version that a pull
