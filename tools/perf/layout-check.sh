@@ -101,7 +101,8 @@ build() {
     # --no-regex: the build needs no PCRE library.  E=0: a new compiler
     # warning in an old commit must not stop the check.
     (cd "$2" && ./configure --no-regex \
-     && make -j"$(nproc)" E=0 build/sbin/unitd build/src/nxt_unit.o) \
+     && make -j"$(nproc)" E=0 build/sbin/unitd build/src/nxt_unit.o \
+        build/lib/libunit.a) \
         > "$2.log" 2>&1 || {
         tail -n 50 "$2.log"
         echo "error: the build of $1 failed" >&2
@@ -215,6 +216,53 @@ layout() {
 }
 
 
+# strip_comments: the headers without their comments.  A usage example in
+# src/nxt_unit.h names a static helper (nxt_unit_process_msg), and a name in
+# a comment is not a declaration.
+
+strip_comments() {
+    awk '
+        {
+            out = ""
+            i = 1
+            while (i <= length($0)) {
+                two = substr($0, i, 2)
+                if (block) {
+                    if (two == "*/") { block = 0; i += 2 } else { i++ }
+                    continue
+                }
+                if (two == "/*") { block = 1; i += 2; continue }
+                if (two == "//") { break }
+                out = out substr($0, i, 1)
+                i++
+            }
+            print out
+        }'
+}
+
+
+# symbols DIR: the functions the installed headers of DIR declare and the
+# object exports, one per line.  A module or an embedder links those by
+# name: a name that the base has and the head does not is a break, even
+# when the tree itself builds.  The archive is read, not one object, so
+# moving a function between the objects of libunit.a stays free.  A static
+# function is not exported, thus it is not in the second set, and renaming
+# a helper stays free.
+
+symbols() {
+    cat "$1"/src/nxt_unit*.h 2>/dev/null \
+        | strip_comments \
+        | grep -hoE '\bnxt_unit_[a-z0-9_]+\(' \
+        | tr -d '(' | sort -u > "$work/declared"
+
+    nm --extern-only --defined-only --format=posix \
+        "$1/build/lib/libunit.a" 2>/dev/null \
+        | awk '$2 ~ /^[TDBR]$/ { print $1 }' | sort -u > "$work/defined"
+
+    grep -F -x -f "$work/defined" "$work/declared" || true
+}
+
+
 list "$base" > "$work/base.list"
 list "$head" > "$work/head.list"
 
@@ -234,6 +282,16 @@ build "$head" "$work/head" "$work/head.list"
 fail=
 warn=
 skip=
+
+symbols "$work/base" > "$work/base.sym"
+symbols "$work/head" > "$work/head.sym"
+
+while read -r name <&3; do
+    grep -q -x -F "$name" "$work/head.sym" && continue
+
+    echo "::error::$name is declared in the installed headers of the base and not defined by the head build"
+    fail="$fail $name"
+done 3< "$work/base.sym"
 
 while read -r kind name <&3; do
     layout "$work/base" "$kind" "$name" > "$work/old"
