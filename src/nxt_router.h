@@ -164,12 +164,21 @@ struct nxt_app_s {
 
     nxt_str_t              name;
 
-    uint32_t               port_hash_count;
+    /*
+     * The accounting counters are atomics.  The config-apply prefork path
+     * updates some of them without the application lock, so a plain uint32_t
+     * was a C-level data race; the atomic type makes those updates defined.
+     * Every read that can run on another thread is a nxt_atomic_load(), and
+     * the readers that also run under app->mutex keep it, because the lock
+     * still serializes the port set and the queue transitions the counters
+     * describe.
+     */
+    nxt_atomic_t           port_hash_count;
 
-    uint32_t               active_requests;
-    uint32_t               pending_processes;
-    uint32_t               processes;
-    uint32_t               idle_processes;
+    nxt_atomic_t           active_requests;
+    nxt_atomic_t           pending_processes;
+    nxt_atomic_t           processes;
+    nxt_atomic_t           idle_processes;
     uint32_t               threads;
 
     /*
@@ -179,7 +188,7 @@ struct nxt_app_s {
      * idle_ports and asserts that queue is non-empty while idle_processes
      * exceeds spare_processes.
      */
-    uint32_t               detached_processes;
+    nxt_atomic_t           detached_processes;
 
     /*
      * Application processes the router asked for, that were forked, and that
@@ -194,7 +203,7 @@ struct nxt_app_s {
      * accounted for: it announces itself late, or it dies and the router is
      * told.  See nxt_router_app_start_expired() in src/nxt_router.c.
      */
-    uint32_t               unaccounted_processes;
+    nxt_atomic_t           unaccounted_processes;
 
     uint32_t               max_processes;
     uint32_t               spare_processes;
@@ -245,9 +254,56 @@ struct nxt_app_s {
 nxt_inline nxt_bool_t
 nxt_router_app_can_start(nxt_app_t *app)
 {
-    return app->processes + app->pending_processes
-               + app->unaccounted_processes < app->max_processes
-            && app->pending_processes < app->max_pending_processes;
+    return nxt_atomic_load(&app->processes)
+               + nxt_atomic_load(&app->pending_processes)
+               + nxt_atomic_load(&app->unaccounted_processes)
+           < app->max_processes
+            && nxt_atomic_load(&app->pending_processes)
+           < app->max_pending_processes;
+}
+
+
+/*
+ * Park a request in the application-wide list, and take it back out.  They
+ * take the link rather than the request so that they can live here, where
+ * the request struct is only forward-declared, for the same reason as the
+ * gate above: the timeout regression test calls the same code the router
+ * calls, so a dropped membership bit or a dropped clear cannot pass the
+ * suite.
+ */
+
+nxt_inline void
+nxt_router_app_request_park(nxt_app_t *app, nxt_queue_link_t *app_link,
+    nxt_request_rpc_data_t *req_rpc_data)
+{
+    nxt_queue_insert_tail(&app->ack_waiting_req, app_link);
+
+    nxt_atomic_xchg(&req_rpc_data->app_linked, 1);
+}
+
+
+/*
+ * Take a request out of the application-wide list and clear its membership
+ * flag, the removal the acknowledgement runs.  Called with app->mutex held;
+ * answers whether the request was linked.  The removal stays spelled out
+ * rather than calling the router's nxt_queue_chk_remove(), which is not
+ * visible here.
+ */
+
+nxt_inline nxt_bool_t
+nxt_router_app_request_unpark(nxt_queue_link_t *app_link,
+    nxt_request_rpc_data_t *req_rpc_data)
+{
+    if (app_link->next == NULL) {
+        return 0;
+    }
+
+    nxt_queue_remove(app_link);
+    app_link->next = NULL;
+
+    nxt_atomic_cmp_set(&req_rpc_data->app_linked, 1, 0);
+
+    return 1;
 }
 
 

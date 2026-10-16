@@ -192,7 +192,7 @@ nxt_router_detached_test_edge(nxt_thread_t *thr, nxt_task_t *task,
     {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router detached test: %s: detached_app %uD, "
-                      "detached %d, alerted %d, count %uD, use count %d; "
+                      "detached %d, alerted %d, count %uA, use count %d; "
                       "expected %uD, %d, %d, %uD, %d",
                       e->name, port->detached_app, (int) port->detached,
                       (int) port->detached_alerted, app->detached_processes,

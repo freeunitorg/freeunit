@@ -281,7 +281,7 @@ nxt_router_app_timeout_test_arm(nxt_task_t *task, nxt_event_engine_t *engine,
     nxt_thread_mutex_lock(&app->mutex);
 
     app->active_requests++;
-    nxt_queue_insert_tail(&app->ack_waiting_req, &r->app_link);
+    nxt_router_app_request_park(app, &r->app_link, req_rpc_data);
 
     nxt_thread_mutex_unlock(&app->mutex);
 
@@ -338,7 +338,7 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
     nxt_runtime_t                      *rt, *saved_rt;
     nxt_app_queue_t                    *queue;
     nxt_event_engine_t                 engine, *saved_engine;
-    nxt_router_app_timeout_test_req_t  claimed, unclaimed;
+    nxt_router_app_timeout_test_req_t  claimed, unclaimed, skipped;
     nxt_log_t                          engine_log;
 
     nxt_thread_time_update(thr);
@@ -688,6 +688,27 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
     }
 
     /*
+     * The park's queue membership is tracked by the atomic flag on the rpc
+     * data.  The unlink must have removed the request from ack_waiting_req
+     * and cleared the flag; a skipped removal leaves the request linked and
+     * its pool reference unreleased.
+     */
+
+    if (!nxt_queue_is_empty(&app->ack_waiting_req)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: an unlinked request is still "
+                      "in ack_waiting_req");
+        goto done;
+    }
+
+    if (nxt_atomic_load(&unclaimed.req_rpc_data->app_linked) != 0) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: the unlink left the request "
+                      "marked as parked");
+        goto done;
+    }
+
+    /*
      * The retraction has to be real, not just reported: a worker reaching the
      * item now must find it cancelled and skip it, which is what
      * nxt_unit_app_queue_recv() does with a CAS that answers false.
@@ -697,6 +718,83 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router app timeout test: a worker still claimed a "
                       "retracted message");
+        goto done;
+    }
+
+    /*
+     * The unlink's other branch.  The request is armed like the control
+     * above, then unparked with the helper the acknowledgement calls, so the
+     * deadline meets a flag that is already clear and the unlink takes no
+     * lock and releases nothing.  This is the leg that pins the
+     * acknowledgement's clear -- nothing above tests the flag's second
+     * transition -- and the only exercise of the skip branch, which no
+     * assertion can see: both branches leave the same state, by design.
+     */
+
+    if (nxt_slow_path(nxt_router_app_timeout_test_arm(task, &engine, req_mp,
+                                                      app, NULL, 0x4323,
+                                                      &skipped)
+                      != NXT_OK))
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: could not arm a request");
+        goto done;
+    }
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    if (!nxt_router_app_request_unpark(&skipped.r->app_link,
+                                       skipped.req_rpc_data))
+    {
+        nxt_thread_mutex_unlock(&app->mutex);
+
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: a parked request was not "
+                      "linked");
+        goto done;
+    }
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    if (nxt_atomic_load(&skipped.req_rpc_data->app_linked) != 0) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: the acknowledgement left the "
+                      "request marked as parked");
+        goto done;
+    }
+
+    nxt_router_app_timeout_test_completions = 0;
+
+    nxt_router_app_timeout_test_tick(task, &engine, app->timeout);
+
+    if (skipped.req_rpc_data->msg_info.cancel != NXT_MSG_RETRACTED
+        || skipped.r->error == 0 || skipped.r->req_rpc_data != NULL)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: a request whose flag was "
+                      "already clear was not answered (cancel %d, error %d)",
+                      (int) skipped.req_rpc_data->msg_info.cancel,
+                      (int) skipped.r->error);
+        goto done;
+    }
+
+    if (nxt_router_app_timeout_test_completions != 2
+        || skipped.header->is_port_mmap_sent != 0)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: a retracted message did not "
+                      "give its shared memory back (%ui buffers, sent %d)",
+                      nxt_router_app_timeout_test_completions,
+                      (int) skipped.header->is_port_mmap_sent);
+        goto done;
+    }
+
+    if (!nxt_queue_is_empty(&app->ack_waiting_req)
+        || nxt_atomic_load(&skipped.req_rpc_data->app_linked) != 0)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: the skip branch disturbed "
+                      "the queue or the flag");
         goto done;
     }
 

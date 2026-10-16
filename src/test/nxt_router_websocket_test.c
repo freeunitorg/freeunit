@@ -107,7 +107,7 @@ nxt_router_websocket_test_step(nxt_thread_t *thr, nxt_task_t *task,
     {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router websocket test: %s: websockets %uD, idle %d, "
-                      "idle processes %uD, use count %d; expected "
+                      "idle processes %uA, use count %d; expected "
                       "%uD, %d, %uD, %d",
                       step->name, port->active_websockets, (int) idle,
                       app->idle_processes, (int) port->use_count,

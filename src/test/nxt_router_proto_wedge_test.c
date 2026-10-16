@@ -248,7 +248,7 @@ nxt_router_proto_wedge_test(nxt_thread_t *thr)
     if (app->pending_processes != 0 || joint->use_count != 1) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router proto wedge test: failed prototype left "
-                      "pending %uD joint %uD (expected 0 and 1)",
+                      "pending %uA joint %uD (expected 0 and 1)",
                       app->pending_processes, joint->use_count);
         goto done;
     }
@@ -286,7 +286,7 @@ nxt_router_proto_wedge_test(nxt_thread_t *thr)
     {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router proto wedge test: second release left pending "
-                      "%uD joint %uD proto_port_requests %uD "
+                      "%uA joint %uD proto_port_requests %uD "
                       "(expected 0, 1 and 0)",
                       app->pending_processes, joint->use_count,
                       app->proto_port_requests);

@@ -14,7 +14,7 @@
  * nxt_atomic_release() must set a release barrier.
  */
 
-#if (NXT_HAVE_GCC_ATOMIC) /* GCC 4.1 builtin atomic operations */
+#if (NXT_HAVE_GCC_ATOMIC) /* GCC __sync_* intrinsics and __atomic_load_n */
 
 typedef intptr_t                    nxt_atomic_int_t;
 typedef uintptr_t                   nxt_atomic_uint_t;
@@ -36,6 +36,16 @@ typedef volatile nxt_atomic_uint_t  nxt_atomic_t;
 
 #define nxt_atomic_fetch_add(value, add)                                      \
     __sync_fetch_and_add(value, add)
+
+
+/*
+ * An atomic load, for readers that race an update without taking the lock
+ * the writer holds.  A plain read of an nxt_atomic_t is still a data race;
+ * a decision over several fields needs the lock instead.
+ */
+
+#define nxt_atomic_load(value)                                                \
+    __atomic_load_n(value, __ATOMIC_RELAXED)
 
 
 #define nxt_atomic_try_lock(lock)                                             \

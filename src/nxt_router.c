@@ -1312,7 +1312,7 @@ nxt_router_start_app_process(nxt_task_t *task, nxt_app_t *app)
 
     nxt_thread_mutex_lock(&app->mutex);
 
-    app->pending_processes--;
+    nxt_atomic_fetch_add(&app->pending_processes, -1);
 
     nxt_thread_mutex_unlock(&app->mutex);
 
@@ -1457,16 +1457,25 @@ nxt_request_rpc_data_unlink(nxt_task_t *task,
         if (app != NULL) {
             unlinked = 0;
 
-            nxt_thread_mutex_lock(&app->mutex);
+            /*
+             * The request's own thread clears the flag when it unlinks, so
+             * a zero here proves the queue no longer points at the request
+             * and the application lock can be skipped.  A one can be stale
+             * -- the main thread's drain removes the link but leaves the
+             * flag -- so the queue is always re-checked under the lock.  A
+             * compare-and-swap both tests and clears, and the
+             * acknowledgement's clear, also a compare-and-swap and so a full
+             * barrier, orders its removal before any reader that sees the
+             * zero.  This clear precedes the removal it guards; the field
+             * comment says why that window is safe.
+             */
+            if (nxt_atomic_cmp_set(&req_rpc_data->app_linked, 1, 0)) {
+                nxt_thread_mutex_lock(&app->mutex);
 
-            if (r->app_link.next != NULL) {
-                nxt_queue_remove(&r->app_link);
-                r->app_link.next = NULL;
+                unlinked = nxt_queue_chk_remove(&r->app_link);
 
-                unlinked = 1;
+                nxt_thread_mutex_unlock(&app->mutex);
             }
-
-            nxt_thread_mutex_unlock(&app->mutex);
 
             if (unlinked) {
                 nxt_mp_release(r->mem_pool);
@@ -1644,7 +1653,7 @@ nxt_router_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         /* TODO here should be find-and-add code because there can be
            port waiters in port_hash */
         nxt_port_hash_add(&app->port_hash, port);
-        app->port_hash_count++;
+        nxt_atomic_fetch_add(&app->port_hash_count, 1);
 
         nxt_thread_mutex_unlock(&app->mutex);
 
@@ -2195,12 +2204,25 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         app_stat->name.length = app->name.length;
         app_stat->name.start = (u_char *) (p - b->mem.pos);
 
-        app_stat->active_requests = app->active_requests;
-        app_stat->pending_processes = app->pending_processes;
-        app_stat->processes = app->processes;
-        app_stat->unaccounted_processes = app->unaccounted_processes;
-        app_stat->idle_processes = app->idle_processes;
-        app_stat->detached_processes = app->detached_processes;
+        /*
+         * The sources are nxt_atomic_t and other threads update them while
+         * this report holds no lock -- some of those updates without that
+         * lock either -- so each read is an atomic load.  Every counter is
+         * also bounded far below 2^32 -- by max_processes, by the port set,
+         * or by the in-flight request count -- so the casts to the 32-bit
+         * report fields cannot truncate.
+         */
+        app_stat->active_requests =
+            (uint32_t) nxt_atomic_load(&app->active_requests);
+        app_stat->pending_processes =
+            (uint32_t) nxt_atomic_load(&app->pending_processes);
+        app_stat->processes = (uint32_t) nxt_atomic_load(&app->processes);
+        app_stat->unaccounted_processes =
+            (uint32_t) nxt_atomic_load(&app->unaccounted_processes);
+        app_stat->idle_processes =
+            (uint32_t) nxt_atomic_load(&app->idle_processes);
+        app_stat->detached_processes =
+            (uint32_t) nxt_atomic_load(&app->detached_processes);
 
         report->apps_count++;
         app_stat++;
@@ -2376,10 +2398,12 @@ nxt_router_test_temp_conf(nxt_task_t *task)
 nxt_inline nxt_bool_t
 nxt_router_app_need_start(nxt_app_t *app)
 {
-    return (app->active_requests
-              > app->port_hash_count + app->pending_processes)
+    return (nxt_atomic_load(&app->active_requests)
+              > nxt_atomic_load(&app->port_hash_count)
+                + nxt_atomic_load(&app->pending_processes))
            || (app->spare_processes
-                > app->idle_processes + app->pending_processes);
+                > nxt_atomic_load(&app->idle_processes)
+                  + nxt_atomic_load(&app->pending_processes));
 }
 
 
@@ -4638,7 +4662,7 @@ nxt_router_app_rpc_create(nxt_task_t *task,
     if (b == NULL) {
         nxt_port_rpc_ex_set_peer(task, router_port, rpc, dport->pid);
 
-        app->pending_processes++;
+        nxt_atomic_fetch_add(&app->pending_processes, 1);
     }
 
     rpc->start_timer = st;
@@ -4735,9 +4759,9 @@ nxt_router_app_prefork_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     port->app = app;
     port->main_app_port = port;
 
-    app->pending_processes--;
-    app->processes++;
-    app->idle_processes++;
+    nxt_atomic_fetch_add(&app->pending_processes, -1);
+    nxt_atomic_fetch_add(&app->processes, 1);
+    nxt_atomic_fetch_add(&app->idle_processes, 1);
 
     engine = task->thread->engine;
 
@@ -4748,7 +4772,7 @@ nxt_router_app_prefork_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
               &app->name, port->pid, port->id);
 
     nxt_port_hash_add(&app->port_hash, port);
-    app->port_hash_count++;
+    nxt_atomic_fetch_add(&app->port_hash_count, 1);
 
     port->idle_start = 0;
 
@@ -4787,7 +4811,7 @@ nxt_router_app_prefork_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         nxt_log(task, NXT_LOG_WARN, "failed to start application \"%V\"",
                 &app->name);
 
-        app->pending_processes--;
+        nxt_atomic_fetch_add(&app->pending_processes, -1);
     }
 
     nxt_router_conf_error(task, tmcf);
@@ -6518,16 +6542,9 @@ nxt_router_req_headers_ack_handler(nxt_task_t *task,
     app = req_rpc_data->app;
     r = req_rpc_data->request;
 
-    unlinked = 0;
-
     nxt_thread_mutex_lock(&app->mutex);
 
-    if (r->app_link.next != NULL) {
-        nxt_queue_remove(&r->app_link);
-        r->app_link.next = NULL;
-
-        unlinked = 1;
-    }
+    unlinked = nxt_router_app_request_unpark(&r->app_link, req_rpc_data);
 
     app_port = nxt_port_hash_find(&app->port_hash, msg->port_msg.pid,
                                   msg->port_msg.reply_port);
@@ -6727,10 +6744,12 @@ nxt_router_app_port_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
              * given below, where a worker takes the same step.
              */
 
-            nxt_assert(app->unaccounted_processes != 0);
+            nxt_assert(nxt_atomic_load(&app->unaccounted_processes) != 0);
 
-            if (nxt_fast_path(app->unaccounted_processes != 0)) {
-                app->unaccounted_processes--;
+            if (nxt_fast_path(nxt_atomic_load(&app->unaccounted_processes)
+                              != 0))
+            {
+                nxt_atomic_fetch_add(&app->unaccounted_processes, -1);
             }
 
             n = 0;
@@ -6808,16 +6827,17 @@ nxt_router_app_port_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
          * nxt_router_app_unaccounted_release() takes the same care.
          */
 
-        nxt_assert(app->unaccounted_processes != 0);
+        nxt_assert(nxt_atomic_load(&app->unaccounted_processes) != 0);
 
-        if (nxt_fast_path(app->unaccounted_processes != 0)) {
-            app->unaccounted_processes--;
+        if (nxt_fast_path(nxt_atomic_load(&app->unaccounted_processes) != 0))
+        {
+            nxt_atomic_fetch_add(&app->unaccounted_processes, -1);
         }
 
     } else {
-        nxt_assert(app->pending_processes != 0);
+        nxt_assert(nxt_atomic_load(&app->pending_processes) != 0);
 
-        app->pending_processes--;
+        nxt_atomic_fetch_add(&app->pending_processes, -1);
     }
 
     if (nxt_slow_path(restarted)) {
@@ -6828,7 +6848,7 @@ nxt_router_app_port_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
                         && nxt_router_app_need_start(app);
 
         if (start_process) {
-            app->pending_processes++;
+            nxt_atomic_fetch_add(&app->pending_processes, 1);
         }
 
         nxt_thread_mutex_unlock(&app->mutex);
@@ -6845,14 +6865,16 @@ nxt_router_app_port_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     port->app = app;
     port->main_app_port = port;
 
-    app->processes++;
+    nxt_atomic_fetch_add(&app->processes, 1);
     nxt_port_hash_add(&app->port_hash, port);
-    app->port_hash_count++;
+    nxt_atomic_fetch_add(&app->port_hash_count, 1);
 
     nxt_thread_mutex_unlock(&app->mutex);
 
-    nxt_debug(task, "app '%V' new port ready, pid %PI, %d/%d",
-              &app->name, port->pid, app->processes, app->pending_processes);
+    nxt_debug(task, "app '%V' new port ready, pid %PI, %uA/%uA",
+              &app->name, port->pid,
+              nxt_atomic_load(&app->processes),
+              nxt_atomic_load(&app->pending_processes));
 
     nxt_port_socket_write(task, port, NXT_PORT_MSG_PORT_ACK, -1, 0, 0, NULL);
 
@@ -7118,31 +7140,51 @@ nxt_router_app_start_failed(nxt_task_t *task, nxt_app_t *app, uint32_t count,
 {
     nxt_queue_link_t    *link;
     nxt_http_request_t  *r;
+    nxt_atomic_uint_t   pending;
+    uint32_t            release_count;
 
     link = NULL;
 
     nxt_thread_mutex_lock(&app->mutex);
 
-    nxt_assert(app->pending_processes >= count);
+    nxt_assert(nxt_atomic_load(&app->pending_processes) >= count);
 
     /*
      * The accounting above guarantees this, but nxt_assert() is nothing in a
      * release build and the two directions are not equally bad: releasing one
      * slot too few merely leaks it, while releasing one too many wraps the
-     * counter to UINT32_MAX and makes nxt_router_app_can_start() false
-     * forever -- a worse wedge than the one this path exists to clear.
+     * counter and makes nxt_router_app_can_start() false forever -- a worse
+     * wedge than the one this path exists to clear.  The counter is an atomic
+     * that the gate also reads without this lock, so the clamp and the
+     * release are one compare-and-swap and not two steps.  Each retry clamps
+     * the same requested count against the value it read, so a transiently
+     * low reading cannot shrink the release.  The clamp is a release-build
+     * net: src/test/nxt_router_start_fail_test.c drives it, and a debug
+     * build asserts before it.
      */
-    if (nxt_slow_path(count > app->pending_processes)) {
-        count = app->pending_processes;
-    }
+    for ( ;; ) {
+        pending = nxt_atomic_load(&app->pending_processes);
 
-    app->pending_processes -= count;
+        release_count = nxt_min(count, (uint32_t) pending);
+
+        if (nxt_fast_path(nxt_atomic_cmp_set(&app->pending_processes,
+                                             pending,
+                                             pending - release_count)))
+        {
+            count = release_count;
+
+            break;
+        }
+    }
 
     if (unaccounted) {
-        app->unaccounted_processes += count;
+        nxt_atomic_fetch_add(&app->unaccounted_processes,
+                             (nxt_atomic_uint_t) count);
     }
 
-    if (app->processes == 0 && !nxt_queue_is_empty(&app->ack_waiting_req)) {
+    if (nxt_atomic_load(&app->processes) == 0
+        && !nxt_queue_is_empty(&app->ack_waiting_req))
+    {
         link = nxt_queue_first(&app->ack_waiting_req);
 
         nxt_queue_remove(link);
@@ -7160,7 +7202,8 @@ nxt_router_app_start_failed(nxt_task_t *task, nxt_app_t *app, uint32_t count,
 
         nxt_thread_mutex_lock(&app->mutex);
 
-        if (app->processes == 0 && app->pending_processes == 0
+        if (nxt_atomic_load(&app->processes) == 0
+            && nxt_atomic_load(&app->pending_processes) == 0
             && !nxt_queue_is_empty(&app->ack_waiting_req))
         {
             link = nxt_queue_first(&app->ack_waiting_req);
@@ -7295,14 +7338,14 @@ nxt_router_app_unaccounted_release(nxt_task_t *task, nxt_app_t *app)
      * slot it is meant to release.
      */
 
-    if (nxt_fast_path(app->unaccounted_processes != 0)) {
-        app->unaccounted_processes--;
+    if (nxt_fast_path(nxt_atomic_load(&app->unaccounted_processes) != 0)) {
+        nxt_atomic_fetch_add(&app->unaccounted_processes, -1);
     }
 
     nxt_thread_mutex_unlock(&app->mutex);
 
-    nxt_debug(task, "app '%V' unaccounted process is gone, %d left",
-              &app->name, app->unaccounted_processes);
+    nxt_debug(task, "app '%V' unaccounted process is gone, %uA left",
+              &app->name, nxt_atomic_load(&app->unaccounted_processes));
 }
 
 
@@ -7321,7 +7364,7 @@ nxt_router_app_get_port_for_quit(nxt_task_t *task, nxt_app_t *app)
         nxt_queue_chk_remove(&port->app_link);
 
         if (nxt_queue_chk_remove(&port->idle_link)) {
-            app->idle_processes--;
+            nxt_atomic_fetch_add(&app->idle_processes, -1);
 
             nxt_debug(task, "app '%V' move port %PI:%d out of %s for quit",
                       &app->name, port->pid, port->id,
@@ -7329,10 +7372,10 @@ nxt_router_app_get_port_for_quit(nxt_task_t *task, nxt_app_t *app)
         }
 
         nxt_port_hash_remove(&app->port_hash, port);
-        app->port_hash_count--;
+        nxt_atomic_fetch_add(&app->port_hash_count, -1);
 
         port->app = NULL;
-        app->processes--;
+        nxt_atomic_fetch_add(&app->processes, -1);
 
         break;
 
@@ -7386,7 +7429,9 @@ nxt_router_app_spare_rebalance(nxt_task_t *task, nxt_app_t *app,
     nxt_queue_link_t  *idle_lnk;
 
     /* Check port was in 'spare_ports' using idle_start field. */
-    if (port->idle_start == 0 && app->idle_processes >= app->spare_processes) {
+    if (port->idle_start == 0
+        && nxt_atomic_load(&app->idle_processes) >= app->spare_processes)
+    {
         /*
          * If there is a vacant space in spare ports,
          * move the last idle to spare_ports.
@@ -7437,7 +7482,7 @@ nxt_router_app_port_busy(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
         return 0;
     }
 
-    app->idle_processes--;
+    nxt_atomic_fetch_add(&app->idle_processes, -1);
 
     nxt_debug(task, "app '%V' move port %PI:%d out of %s (%s)",
               &app->name, port->pid, port->id,
@@ -7446,7 +7491,7 @@ nxt_router_app_port_busy(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     nxt_router_app_spare_rebalance(task, app, port);
 
     if (nxt_router_app_can_start(app) && nxt_router_app_need_start(app)) {
-        app->pending_processes++;
+        nxt_atomic_fetch_add(&app->pending_processes, 1);
         start_process = 1;
     }
 
@@ -7478,7 +7523,7 @@ nxt_router_app_port_idle(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port)
         && port->detached == 0
         && port->idle_link.next == NULL)
     {
-        if (app->idle_processes == app->spare_processes
+        if (nxt_atomic_load(&app->idle_processes) == app->spare_processes
             && app->adjust_idle_work.data == NULL)
         {
             adjust_idle_timer = 1;
@@ -7486,7 +7531,7 @@ nxt_router_app_port_idle(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port)
             app->adjust_idle_work.next = NULL;
         }
 
-        if (app->idle_processes < app->spare_processes) {
+        if (nxt_atomic_load(&app->idle_processes) < app->spare_processes) {
             nxt_queue_insert_tail(&app->spare_ports, &port->idle_link);
 
             nxt_debug(task, "app '%V' move port %PI:%d to spare_ports",
@@ -7501,7 +7546,7 @@ nxt_router_app_port_idle(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port)
                       &app->name, port->pid, port->id);
         }
 
-        app->idle_processes++;
+        nxt_atomic_fetch_add(&app->idle_processes, 1);
     }
 
     return adjust_idle_timer;
@@ -7557,7 +7602,7 @@ nxt_router_app_abandon(nxt_task_t *task, nxt_app_t *app,
 
     if (port->detached == 0) {
         port->detached = 1;
-        app->detached_processes++;
+        nxt_atomic_fetch_add(&app->detached_processes, 1);
         changed = 1;
     }
 
@@ -7645,7 +7690,7 @@ nxt_router_app_abandoned_settle(nxt_task_t *task,
         {
             port->detached = 0;
 
-            app->detached_processes--;
+            nxt_atomic_fetch_add(&app->detached_processes, -1);
 
             adjust_idle_timer = nxt_router_app_port_idle(task, app, port);
 
@@ -7673,10 +7718,11 @@ static void
 nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     nxt_apr_action_t action)
 {
-    int         inc_use;
-    uint32_t    got_response, dec_requests, dec_websockets;
-    nxt_bool_t  adjust_idle_timer;
-    nxt_port_t  *main_app_port;
+    int                inc_use;
+    uint32_t           got_response, dec_requests, dec_websockets;
+    nxt_bool_t         adjust_idle_timer;
+    nxt_atomic_int_t   req_dec;
+    nxt_port_t         *main_app_port;
 
     nxt_assert(port != NULL);
 
@@ -7708,6 +7754,8 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
         break;
     }
 
+    req_dec = -((nxt_atomic_int_t) (got_response + dec_requests));
+
     nxt_debug(task, "app '%V' release port %PI:%d: %d %d %d", &app->name,
               port->pid, port->id,
               (int) inc_use, (int) got_response, (int) dec_websockets);
@@ -7721,7 +7769,7 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     if (port->id == NXT_SHARED_PORT_ID) {
         nxt_thread_mutex_lock(&app->mutex);
 
-        app->active_requests -= got_response + dec_requests;
+        nxt_atomic_fetch_add(&app->active_requests, req_dec);
 
         nxt_thread_mutex_unlock(&app->mutex);
 
@@ -7734,7 +7782,7 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
 
     main_app_port->active_requests -= got_response + dec_requests;
     main_app_port->active_websockets -= dec_websockets;
-    app->active_requests -= got_response + dec_requests;
+    nxt_atomic_fetch_add(&app->active_requests, req_dec);
 
     if (main_app_port->pair[1] != -1 && main_app_port->app_link.next == NULL) {
         nxt_queue_insert_tail(&app->ports, &main_app_port->app_link);
@@ -7812,7 +7860,7 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
     }
 
     nxt_port_hash_remove(&app->port_hash, port);
-    app->port_hash_count--;
+    nxt_atomic_fetch_add(&app->port_hash_count, -1);
 
     if (port->id != 0) {
         nxt_thread_mutex_unlock(&app->mutex);
@@ -7826,7 +7874,7 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
     unchain = nxt_queue_chk_remove(&port->app_link);
 
     if (nxt_queue_chk_remove(&port->idle_link)) {
-        app->idle_processes--;
+        nxt_atomic_fetch_add(&app->idle_processes, -1);
 
         nxt_debug(task, "app '%V' move port %PI:%d out of %s before close",
                   &app->name, port->pid, port->id,
@@ -7835,7 +7883,7 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
         nxt_router_app_spare_rebalance(task, app, port);
     }
 
-    app->processes--;
+    nxt_atomic_fetch_add(&app->processes, -1);
 
     /*
      * A worker can die in the middle of its detached work -- a fatal error
@@ -7854,7 +7902,7 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
         port->detached = 0;
         port->detached_app = 0;
         port->detached_router = 0;
-        app->detached_processes--;
+        nxt_atomic_fetch_add(&app->detached_processes, -1);
     }
 
     start_process = !task->thread->engine->shutdown
@@ -7862,7 +7910,7 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
                     && nxt_router_app_need_start(app);
 
     if (start_process) {
-        app->pending_processes++;
+        nxt_atomic_fetch_add(&app->pending_processes, 1);
     }
 
     rearm = 0;
@@ -7940,11 +7988,11 @@ nxt_router_adjust_idle_timer(nxt_task_t *task, void *obj, void *data)
         app->adjust_idle_work.data = NULL;
     }
 
-    nxt_debug(task, "app '%V' idle_processes %d, spare_processes %d",
+    nxt_debug(task, "app '%V' idle_processes %uA, spare_processes %d",
               &app->name,
-              (int) app->idle_processes, (int) app->spare_processes);
+              nxt_atomic_load(&app->idle_processes), (int) app->spare_processes);
 
-    while (app->idle_processes > app->spare_processes) {
+    while (nxt_atomic_load(&app->idle_processes) > app->spare_processes) {
 
         nxt_assert(!nxt_queue_is_empty(&app->idle_ports));
 
@@ -7974,7 +8022,7 @@ nxt_router_adjust_idle_timer(nxt_task_t *task, void *obj, void *data)
 
             nxt_queue_remove(lnk);
             lnk->next = NULL;
-            app->idle_processes--;
+            nxt_atomic_fetch_add(&app->idle_processes, -1);
             continue;
         }
 
@@ -7997,10 +8045,10 @@ nxt_router_adjust_idle_timer(nxt_task_t *task, void *obj, void *data)
         nxt_queue_chk_remove(&port->app_link);
 
         nxt_port_hash_remove(&app->port_hash, port);
-        app->port_hash_count--;
+        nxt_atomic_fetch_add(&app->port_hash_count, -1);
 
-        app->idle_processes--;
-        app->processes--;
+        nxt_atomic_fetch_add(&app->idle_processes, -1);
+        nxt_atomic_fetch_add(&app->processes, -1);
         port->app = NULL;
 
         nxt_thread_mutex_unlock(&app->mutex);
@@ -8085,7 +8133,7 @@ nxt_router_free_app(nxt_task_t *task, void *obj, void *data)
             break;
         }
 
-        app->port_hash_count--;
+        nxt_atomic_fetch_add(&app->port_hash_count, -1);
 
         port->app = NULL;
 
@@ -8116,11 +8164,11 @@ nxt_router_free_app(nxt_task_t *task, void *obj, void *data)
     }
 
     nxt_assert(app->proto_port == NULL);
-    nxt_assert(app->processes == 0);
-    nxt_assert(app->detached_processes == 0);
-    nxt_assert(app->active_requests == 0);
-    nxt_assert(app->port_hash_count == 0);
-    nxt_assert(app->idle_processes == 0);
+    nxt_assert(nxt_atomic_load(&app->processes) == 0);
+    nxt_assert(nxt_atomic_load(&app->detached_processes) == 0);
+    nxt_assert(nxt_atomic_load(&app->active_requests) == 0);
+    nxt_assert(nxt_atomic_load(&app->port_hash_count) == 0);
+    nxt_assert(nxt_atomic_load(&app->idle_processes) == 0);
     nxt_assert(nxt_queue_is_empty(&app->ports));
     nxt_assert(nxt_queue_is_empty(&app->spare_ports));
     nxt_assert(nxt_queue_is_empty(&app->idle_ports));
@@ -8167,10 +8215,10 @@ nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
     port = app->shared_port;
     nxt_port_inc_use(port);
 
-    app->active_requests++;
+    nxt_atomic_fetch_add(&app->active_requests, 1);
 
     if (nxt_router_app_can_start(app) && nxt_router_app_need_start(app)) {
-        app->pending_processes++;
+        nxt_atomic_fetch_add(&app->pending_processes, 1);
         start_process = 1;
     }
 
@@ -8186,8 +8234,9 @@ nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
      * "processes": {"max": 0}, which the configuration rejects.
      */
 
-    unanswerable = (start_process == 0 && app->processes == 0
-                    && app->pending_processes == 0);
+    unanswerable = (start_process == 0
+                    && nxt_atomic_load(&app->processes) == 0
+                    && nxt_atomic_load(&app->pending_processes) == 0);
 
     r = req_rpc_data->request;
 
@@ -8195,7 +8244,7 @@ nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
      * Put request into application-wide list to be able to cancel request
      * if something goes wrong with application processes.
      */
-    nxt_queue_insert_tail(&app->ack_waiting_req, &r->app_link);
+    nxt_router_app_request_park(app, &r->app_link, req_rpc_data);
 
     nxt_thread_mutex_unlock(&app->mutex);
 
@@ -8351,6 +8400,7 @@ nxt_router_app_prepare_request(nxt_task_t *task,
 {
     size_t             workers;
     uint32_t           bound, readers;
+    nxt_atomic_uint_t  processes;
     nxt_app_t          *app;
     nxt_buf_t          *buf, *body;
     nxt_int_t          res;
@@ -8416,7 +8466,14 @@ nxt_router_app_prepare_request(nxt_task_t *task,
     msg.mm.chunk_id = nxt_port_mmap_chunk_id(hdr, buf->mem.pos);
     msg.mm.size = nxt_buf_used_size(buf);
 
-    if (nxt_slow_path(nxt_size_mul(nxt_max(app->processes, 1),
+    /*
+     * The counter is loaded atomically: a request engine updates it while
+     * this thread reads it, with no lock between the two.
+     */
+
+    processes = nxt_atomic_load(&app->processes);
+
+    if (nxt_slow_path(nxt_size_mul(nxt_max(processes, 1),
                                    nxt_max(app->threads, 1), &workers)
                       != 0 || workers > UINT32_MAX))
     {
@@ -8432,10 +8489,11 @@ nxt_router_app_prepare_request(nxt_task_t *task,
      * ->port_hash_count counts each process's main port and each context
      * port the router registered, so it is the number of queue readers
      * whenever it exceeds processes * threads.
+     *
+     * The counter is loaded atomically: a prefork updates it without
+     * app->mutex, so taking the lock would not serialize the read anyway.
      */
-    nxt_thread_mutex_lock(&app->mutex);
-    readers = app->port_hash_count;
-    nxt_thread_mutex_unlock(&app->mutex);
+    readers = (uint32_t) nxt_atomic_load(&app->port_hash_count);
 
     bound = nxt_max(bound, readers);
 
@@ -9141,7 +9199,7 @@ nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid, uint8_t state)
 
             if (port->detached == 0) {
                 port->detached = 1;
-                app->detached_processes++;
+                nxt_atomic_fetch_add(&app->detached_processes, 1);
                 changed = 1;
 
                 /*
@@ -9191,7 +9249,7 @@ nxt_router_detached_apply(nxt_task_t *task, nxt_pid_t pid, uint8_t state)
          */
         if (port->detached_router == 0 && port->detached != 0) {
             port->detached = 0;
-            app->detached_processes--;
+            nxt_atomic_fetch_add(&app->detached_processes, -1);
             changed = 1;
 
             /*

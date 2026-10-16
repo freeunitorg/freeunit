@@ -251,7 +251,7 @@ nxt_router_start_proto_gone_test_run(nxt_thread_t *thr, nxt_err_t inject,
 
     if (app->pending_processes != 0) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
-                      "router start proto gone test: pending_processes %uD "
+                      "router start proto gone test: pending_processes %uA "
                       "leaked (expected 0, inject %d)",
                       app->pending_processes, (int) inject);
         goto done;

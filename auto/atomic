@@ -3,15 +3,18 @@
 # Copyright (C) NGINX, Inc.
 
 
-# GCC 4.1+ builtin atomic operations.
+# GCC atomic builtins: the 4.1 __sync_* intrinsics and the 4.7 __atomic_load_n,
+# both of which src/nxt_atomic.h uses.
 
 nxt_feature="GCC builtin atomic operations"
 nxt_feature_name=NXT_HAVE_GCC_ATOMIC
 nxt_feature_run=yes
 nxt_feature_incs=
 nxt_feature_libs=
-nxt_feature_test="int main(void) {
-                      long  n = 0;
+nxt_feature_test="#include <stdint.h>
+
+                  int main(void) {
+                      volatile uintptr_t  n = 0;
 
                       if (!__sync_bool_compare_and_swap(&n, 0, 3))
                           return 1;
@@ -27,6 +30,8 @@ nxt_feature_test="int main(void) {
                           return 1;
                       __sync_lock_release(&n);
                       if (n != 0)
+                          return 1;
+                      if (__atomic_load_n(&n, __ATOMIC_RELAXED) != 0)
                           return 1;
                       return 0;
                   }"
