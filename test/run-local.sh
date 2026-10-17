@@ -68,7 +68,9 @@ get_module_test() {
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-log()  { echo "[$(date '+%H:%M:%S')] $*"; }
+# A closed terminal makes echo fail with EIO. Under set -e that would end the
+# EXIT trap before the cleanup, so a log line never fails.
+log()  { echo "[$(date '+%H:%M:%S')] $*" || :; }
 info() { log "INFO  $*"; }
 err()  { log "ERROR $*" >&2; }
 
@@ -196,6 +198,11 @@ cleanup_tmp() {
     fi
 }
 trap cleanup_tmp EXIT
+# dash and ash skip the EXIT trap when a signal kills the shell; exit instead.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 131' QUIT
+trap 'exit 143' TERM
 
 # ---------------------------------------------------------------------------
 # Pre-flight
