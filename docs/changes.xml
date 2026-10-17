@@ -493,13 +493,28 @@ cannot be sent.  See https://github.com/freeunitorg/freeunit/issues/665.
 the PHP module opened an application script with fopen() on every request.  On
 musl that cost an open, two fcntl() calls and a close per request, because
 musl's fopen() sets FD_CLOEXEC on the stream after opening it.  The script is
-now checked with access() and opened by PHP itself, as in PHP-FPM.
-"open_basedir" now applies to the main script, a request that names a directory
-ending in ".php" fails instead of running an empty script (the status
-the client gets depends on "display_errors"), the script descriptor is not
-close-on-exec, and "auto_prepend_file" is listed before the script in
-get_included_files().  See
+now opened by PHP itself, as in PHP-FPM.
+"open_basedir" now applies to the main script, a request that names a path
+which is not a regular file fails instead of running an empty script, the
+script descriptor is not close-on-exec, and "auto_prepend_file" is listed
+before the script in get_included_files().  See
 https://github.com/freeunitorg/freeunit/issues/688.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the PHP module let "display_errors" decide the status of a request whose script
+PHP could not open.  With "display_errors" on, a script outside "open_basedir"
+and a path that is not a regular file answered 200 with PHP's warning and the
+script path in the body; with it off, both answered an empty 500.  A directory
+or a FIFO at the script path is now refused with 404 before it is opened, which
+stops a FIFO from parking the worker, and a script outside "open_basedir" gets
+403.  The open is nonblocking and the opened file is checked, so replacing a
+regular script with a FIFO cannot park the worker.  Filesystem errors are
+preserved before PHP resolves the path, so an overlong script path gets 404.
+Neither answer carries PHP's diagnostics.
+See https://github.com/freeunitorg/freeunit/issues/715.
 </para>
 </change>
 
