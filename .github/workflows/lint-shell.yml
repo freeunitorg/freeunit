@@ -41,3 +41,6 @@ jobs:
           command -v dash
           sh .github/scripts/lint-shell.sh \
             "docker run --rm -v $PWD:/mnt -w /mnt $SHELLCHECK_IMAGE"
+
+      - name: Check the unitc control-target argv
+        run: ./test/unitc/argv_test.sh

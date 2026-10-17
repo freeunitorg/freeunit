@@ -123,6 +123,43 @@ When a new match is reviewed and safe, run
 `python3 tools/ast-grep/check_baseline.py --update` and commit
 `baseline.json` with the change.
 
+### Shell scripts
+
+`Lint (shell)` checks the shell scripts in every pull request and on every
+push to master. `.github/scripts/lint-shell.sh` picks each tracked file by
+its first line. A `#!/bin/sh` file gets `shellcheck -s sh -S warning` and
+`dash -n`; a `#!/bin/bash` file gets `shellcheck -s bash -S warning` and
+`bash -n`. `configure` and the generated `*.in` files are skipped. A
+`#!/bin/sh` file must not run a bare `set -o pipefail`; use the guarded
+form:
+
+```sh
+set -eu
+# shellcheck disable=SC3040
+if (set -o pipefail) 2>/dev/null; then
+    set -o pipefail
+fi
+```
+
+Run the check before you push. The image is pinned by digest:
+
+```console
+$ sh .github/scripts/lint-shell.sh \
+    "docker run --rm -v $PWD:/mnt -w /mnt \
+     koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d"
+```
+
+A clean shellcheck does not prove that the arguments are right. A variable
+that holds an option string such as `--unix-socket <path> _` must be
+expanded unquoted, and the URL stays quoted: `$UNIT_CTRL"$URI"`. A script
+that builds a command line needs a test with stub commands that asserts the
+argv on each path it covers; `test/unitc/argv_test.sh` is the example (the
+PUT, GET and DELETE paths), and `Lint (shell)` runs it.
+
+Adding `set -e` or `set -f` to an existing script is a behaviour change;
+say so in the commit. Do not use `echo` for user text: dash expands
+backslashes in it, so use `printf '%s\n'`.
+
 ## Commit Messages
 
 Use conventional commits format:

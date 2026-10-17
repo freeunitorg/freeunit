@@ -176,6 +176,17 @@ on each pull request.
 
 (clang-ast static analysis is Docker-only — see the section below.)
 
+### Shell scripts
+
+`test/run-local.sh` and `test/run-local-full.sh` are POSIX sh, and so are the
+other tracked `#!/bin/sh` scripts. `Lint (shell)` runs
+`.github/scripts/lint-shell.sh`, which checks them with
+`shellcheck -s sh -S warning` and `dash -n`. The same job runs
+`test/unitc/argv_test.sh`, which stubs `curl`, `docker`, `ssh` and `ps` and
+asserts the `tools/unitc` control-target argv for the local socket,
+`docker://`, `ssh://` and `http://` on the PUT path, and for GET and DELETE
+under `script(1)`. CI runs both on every pull request.
+
 ## Static analysis (clang-ast)
 
 `./test/run-local-full.sh` runs the C build under the
