@@ -28,7 +28,7 @@ if [ "$1" = "unitd" ] || [ "$1" = "unitd-debug" ]; then
         echo "$0: Launching Unit daemon to perform initial configuration..."
         /usr/sbin/$1 --control unix:/var/run/control.unit.sock
 
-        for i in $(/usr/bin/seq $WAITLOOPS); do
+        for _ in $(/usr/bin/seq $WAITLOOPS); do
             if [ ! -S /var/run/control.unit.sock ]; then
                 echo "$0: Waiting for control socket to be created..."
                 /bin/sleep $SLEEPSEC
@@ -77,9 +77,9 @@ if [ "$1" = "unitd" ] || [ "$1" = "unitd-debug" ]; then
         fi
 
         echo "$0: Stopping Unit daemon after initial configuration..."
-        kill -TERM $(/bin/cat /var/run/unit.pid)
+        kill -TERM "$(/bin/cat /var/run/unit.pid)"
 
-        for i in $(/usr/bin/seq $WAITLOOPS); do
+        for _ in $(/usr/bin/seq $WAITLOOPS); do
             if [ -S /var/run/control.unit.sock ]; then
                 echo "$0: Waiting for control socket to be removed..."
                 /bin/sleep $SLEEPSEC
@@ -88,7 +88,7 @@ if [ "$1" = "unitd" ] || [ "$1" = "unitd-debug" ]; then
             fi
         done
         if [ -S /var/run/control.unit.sock ]; then
-            kill -KILL $(/bin/cat /var/run/unit.pid)
+            kill -KILL "$(/bin/cat /var/run/unit.pid)"
             rm -f /var/run/control.unit.sock
         fi
 

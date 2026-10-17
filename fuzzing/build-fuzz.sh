@@ -7,7 +7,7 @@ export CXXFLAGS="-g -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -fsanitize=addres
 export LIB_FUZZING_ENGINE="-fsanitize=fuzzer"
 
 ./configure --no-regex --no-pcre2 --fuzz=$LIB_FUZZING_ENGINE
-make fuzz -j$(nproc)
+make fuzz -j"$(nproc)"
 
 mkdir -p build/fuzz_basic_seed
 mkdir -p build/fuzz_http_chunk_seed

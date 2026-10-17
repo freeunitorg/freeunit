@@ -311,7 +311,7 @@ if [[ "$PARALLEL" -gt 1 ]] && command -v parallel &>/dev/null; then
     parallel --jobs "${PARALLEL}" --joblog "${JOBLOG}" \
         build_variant ::: "${VARIANTS[@]}" || true
     # Parse joblog for failures
-    while IFS=$'\t' read -r seq host starttime runtime send receive exitval signal command _rest; do
+    while IFS=$'\t' read -r seq _ _ _ _ _ exitval _ command _rest; do
         [[ "$seq" == "Seq" ]] && continue   # header line
         variant="${command##* }"             # last word is the variant name
         if [[ "$exitval" -ne 0 ]]; then

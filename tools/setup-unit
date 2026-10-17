@@ -1,5 +1,9 @@
 #!/bin/sh
 
+# dash, busybox ash and bash all have "local".  "local x=$(cmd)" keeps
+# the exit status of cmd out of set -e on purpose in this script.
+# shellcheck disable=SC3043,SC2155
+
 #####################################################################
 #
 # Copyright (C) NGINX, Inc.
@@ -12,6 +16,7 @@
 set -euf;
 
 # pipefail is not in POSIX; use it when the shell supports it.
+# shellcheck disable=SC3040
 if (set -o pipefail) 2>/dev/null; then
     set -o pipefail;
 fi;
@@ -316,6 +321,8 @@ unit_ctl()
 
         trap_cmd="ssh -S '$ssh_ctrl' -O exit '$remote' 2>/dev/null;
                   unlink '$local_sock';";
+        # The variables expand now, on purpose: they are local.
+        # shellcheck disable=SC2064
         trap "$trap_cmd" EXIT;
 
         sock="unix:$local_sock";
@@ -324,15 +331,15 @@ unit_ctl()
     case $1 in
     edit)
         shift;
-        unit_ctl_edit ---s "$sock" $@;
+        unit_ctl_edit ---s "$sock" "$@";
         ;;
     http)
         shift;
-        unit_ctl_http ---s "$sock" $@;
+        unit_ctl_http ---s "$sock" "$@";
         ;;
     insert)
         shift;
-        unit_ctl_insert ---s "$sock" $@;
+        unit_ctl_insert ---s "$sock" "$@";
         ;;
     *)
         err "ctl: $1: Unknown argument.";
@@ -517,6 +524,8 @@ unit_ctl_http()
     fi;
     local req_path="$2";
 
+    # The filter prints "--unix-socket <path> <url>": split it into words.
+    # shellcheck disable=SC2046
     curl --fail-with-body $curl_options -X $method -d@- \
             $(echo "$sock" | unit_sock_filter -c)${req_path};
 }
@@ -1006,7 +1015,7 @@ unit_os_probe()
         shift;
     done;
 
-    local os=$(uname | tr '[:upper:]' '[:lower:]')
+    local os="$(uname | tr '[:upper:]' '[:lower:]')"
 
     if [ "$os" != 'linux' ] && [ "$os" != 'freebsd' ]; then
         err "os-probe: The OS isn't Linux or FreeBSD; can't proceed."
@@ -1027,15 +1036,15 @@ unit_os_probe()
 
         if [ -f "$osRelease" ]; then
             # The value for the ID and VERSION_ID may or may not be in quotes
-            local osName=$(grep "^ID=" "$osRelease" | sed s/\"//g | awk -F= '{ print $2 }' ||:)
-            local osVersion=$(grep '^VERSION_ID=' "$osRelease" | sed s/\"//g | awk -F= '{ print $2 }' || lsb_release -cs)
+            local osName="$(grep "^ID=" "$osRelease" | sed s/\"//g | awk -F= '{ print $2 }' ||:)"
+            local osVersion="$(grep '^VERSION_ID=' "$osRelease" | sed s/\"//g | awk -F= '{ print $2 }' || lsb_release -cs)"
         else
             err "os-probe: Unable to determine OS and version, or the OS isn't supported."
         fi
     else
         local pkgMngr='pkg';
         local osName=$os
-        local osVersion=$(uname -rs | awk -F '[ -]' '{print $2}' ||:)
+        local osVersion="$(uname -rs | awk -F '[ -]' '{print $2}' ||:)"
         if [ -z "$osVersion" ]; then
             err 'os-probe: Unable to get the FreeBSD version.'
         fi
@@ -1254,10 +1263,10 @@ __EOF__";
     echo 'This script sets up the NGINX Unit repository';
 
     if ! test $# -ge 3; then
-        local os_pkg_name_version=$(unit_os_probe || warn "On macOS, try 'brew install nginx/unit/unit'.")
-        local pkg_mngr=$(echo "$os_pkg_name_version" | awk -F: '{print $1}')
-        local os_name=$(echo "$os_pkg_name_version" | awk -F: '{print $2}')
-        local os_version=$(echo "$os_pkg_name_version" | awk -F: '{print $3}')
+        local os_pkg_name_version="$(unit_os_probe || warn "On macOS, try 'brew install nginx/unit/unit'.")"
+        local pkg_mngr="$(echo "$os_pkg_name_version" | awk -F: '{print $1}')"
+        local os_name="$(echo "$os_pkg_name_version" | awk -F: '{print $2}')"
+        local os_version="$(echo "$os_pkg_name_version" | awk -F: '{print $3}')"
     fi;
 
     # Call the appropriate installation function
@@ -1442,11 +1451,11 @@ unit_sock()
     case $1 in
     filter)
         shift;
-        unit_sock_filter $@;
+        unit_sock_filter "$@";
         ;;
     find)
         shift;
-        unit_sock_find $@;
+        unit_sock_find "$@";
         ;;
     *)
         err "sock: $1: Unknown subcommand.";
@@ -1617,43 +1626,43 @@ fi;
 case $1 in
 cmd)
     shift;
-    unit_cmd $@;
+    unit_cmd "$@";
     ;;
 ctl)
     shift;
-    unit_ctl $@;
+    unit_ctl "$@";
     ;;
 freeport)
     shift;
-    unit_freeport $@;
+    unit_freeport "$@";
     ;;
 json-ins)
     shift;
-    unit_json_ins $@;
+    unit_json_ins "$@";
     ;;
 os-probe)
     shift;
-    unit_os_probe $@;
+    unit_os_probe "$@";
     ;;
 ps)
     shift;
-    unit_ps $@;
+    unit_ps "$@";
     ;;
 repo-config)
     shift;
-    unit_repo_config $@;
+    unit_repo_config "$@";
     ;;
 restart)
     shift;
-    unit_restart $@;
+    unit_restart "$@";
     ;;
 sock)
     shift;
-    unit_sock $@;
+    unit_sock "$@";
     ;;
 welcome)
     shift;
-    unit_ctl_welcome $@;
+    unit_ctl_welcome "$@";
     ;;
 *)
     err "$1: Unknown command.";

@@ -1,0 +1,43 @@
+name: "Lint (shell)"
+
+# Runs shellcheck and a parse check on each tracked shell script.  The
+# script picks the files by their first line, so most of them have no
+# extension.  Thus there is no paths filter: the check takes about 5 s.
+# .github/scripts/lint-shell.sh has the rules.  Run it locally with:
+#   sh .github/scripts/lint-shell.sh \
+#     "docker run --rm -v $PWD:/mnt -w /mnt koalaman/shellcheck:v0.11.0"
+
+on:
+  pull_request:
+    types: [ opened, synchronize, reopened ]
+  push:
+    branches: [ master ]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Each push gets its own group.  Thus no queued commit is dropped.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  shell:
+    name: "shellcheck and parse"
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    env:
+      # Change the version and fix the new warnings in the same commit.
+      SHELLCHECK_IMAGE: koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Pull shellcheck
+        run: docker pull "$SHELLCHECK_IMAGE"
+
+      - name: Check the shell scripts
+        run: |
+          command -v dash
+          sh .github/scripts/lint-shell.sh \
+            "docker run --rm -v $PWD:/mnt -w /mnt $SHELLCHECK_IMAGE"
