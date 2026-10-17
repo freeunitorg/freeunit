@@ -337,7 +337,17 @@ void
 nxt_port_enable(nxt_task_t *task, nxt_port_t *port,
     const nxt_port_handlers_t *handlers)
 {
-    port->pid = nxt_pid;
+    /*
+     * The engine's port already carries this pid: it is created with it on
+     * the main thread and published to rt->ports before the engine starts,
+     * and the main thread can be looking it up while this thread runs.  A
+     * redundant store would race that lookup's read, so store a pid only
+     * when it is not there yet.
+     */
+    if (port->pid != nxt_pid) {
+        port->pid = nxt_pid;
+    }
+
     port->handler = nxt_port_handler;
     port->data = (nxt_port_handler_t *) (handlers);
 
