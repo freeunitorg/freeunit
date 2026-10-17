@@ -1038,6 +1038,152 @@ done:
 #endif /* NXT_HAVE_UCRED */
 
 
+/*
+ * NXT_CMSG_NXTHDR() must return a last header that the kernel truncated.
+ * When the kernel cuts SCM_RIGHTS to one descriptor, the control data ends
+ * right after that descriptor.  The padding to the next alignment boundary
+ * is not there.  CMSG_NXTHDR() of glibc before 2.37 (unpatched) requires
+ * that padding.  Thus it skipped the header, and the descriptor leaked
+ * (https://github.com/freeunitorg/freeunit/issues/766).
+ *
+ * The case builds the buffer by hand, so it needs no kernel truncation.
+ * Thus it also runs where the kernel driven cases are skipped, for example
+ * under qemu-user.  Without the fix, it fails only where the C library has
+ * the old check: glibc before 2.37 (unpatched), for example on Ubuntu 22.04
+ * and CentOS 6.  With a patched glibc, it passes without the fix too.  The
+ * old check is also written out below.  It shows that the buffer is the one
+ * that the old check rejects.
+ *
+ * "type" and "size" give the type and the data length of the first header.
+ * The second header is the truncated SCM_RIGHTS.  On Linux, the kernel puts
+ * the credential header before SCM_RIGHTS.
+ */
+
+static nxt_int_t
+nxt_port_ctrunc_test_nxthdr(nxt_thread_t *thr, int type, size_t size)
+{
+    size_t          off;
+    u_char          *end;
+    struct msghdr   msg;
+    struct cmsghdr  *first, *second, *next;
+
+    union {
+        struct cmsghdr  cm;
+        u_char          buf[NXT_CTRUNC_TEST_CRED_SPACE
+                            + CMSG_SPACE(sizeof(int)) * 2];
+    } ctl;
+
+    off = CMSG_SPACE(size);
+
+    if (off + CMSG_SPACE(sizeof(int)) > sizeof(ctl.buf)) {
+        nxt_log_alert(thr->log, "port ctrunc test: the first header of "
+                      "type %d does not fit the buffer", type);
+        return NXT_ERROR;
+    }
+
+    nxt_memzero(&ctl, sizeof(ctl));
+    nxt_memzero(&msg, sizeof(struct msghdr));
+
+    msg.msg_control = ctl.buf;
+
+    first = (struct cmsghdr *) ctl.buf;
+    first->cmsg_level = SOL_SOCKET;
+    first->cmsg_type = type;
+    first->cmsg_len = CMSG_LEN(size);
+
+    second = (struct cmsghdr *) (ctl.buf + off);
+    second->cmsg_level = SOL_SOCKET;
+    second->cmsg_type = SCM_RIGHTS;
+    second->cmsg_len = CMSG_LEN(sizeof(int));
+
+    /* The control data ends at the descriptor, before the padding. */
+    msg.msg_controllen = off + CMSG_LEN(sizeof(int));
+    end = ctl.buf + msg.msg_controllen;
+
+    if ((size_t) CMSG_SPACE(sizeof(int)) != (size_t) CMSG_LEN(sizeof(int))) {
+        /*
+         * This is the check of the next header in __cmsg_nxthdr() of glibc
+         * before 2.37 (unpatched).  The header and its padding must be in
+         * the buffer.  CMSG_ALIGN() is not portable, so CMSG_SPACE() gives
+         * the length with the padding.
+         */
+
+        if ((u_char *) (second + 1) <= end
+            && (u_char *) second + CMSG_SPACE(sizeof(int)) <= end)
+        {
+            nxt_log_alert(thr->log, "port ctrunc test: the buffer is not "
+                          "the shape that the old glibc check rejects");
+            return NXT_ERROR;
+        }
+    }
+
+    next = NXT_CMSG_NXTHDR(&msg, first);
+
+    if (next != second) {
+        nxt_log_alert(thr->log, "port ctrunc test: NXT_CMSG_NXTHDR() did "
+                      "not return the truncated last header (first header "
+                      "type %d)", type);
+        return NXT_ERROR;
+    }
+
+    if (NXT_CMSG_NXTHDR(&msg, second) != NULL) {
+        nxt_log_alert(thr->log, "port ctrunc test: NXT_CMSG_NXTHDR() "
+                      "returned a header after the last one (first header "
+                      "type %d)", type);
+        return NXT_ERROR;
+    }
+
+#if (defined(__GLIBC__))
+    /*
+     * A cmsg_len shorter than a header is not walked.  Only the glibc walk
+     * of NXT_CMSG_NXTHDR() checks it.  CMSG_NXTHDR() of other C libraries,
+     * for example musl, does not.  The callers check it before the walk.
+     */
+
+    first->cmsg_len = sizeof(struct cmsghdr) - 1;
+
+    next = NXT_CMSG_NXTHDR(&msg, first);
+
+    first->cmsg_len = CMSG_LEN(size);
+
+    if (next != NULL) {
+        nxt_log_alert(thr->log, "port ctrunc test: NXT_CMSG_NXTHDR() walked "
+                      "a header shorter than struct cmsghdr (first header "
+                      "type %d)", type);
+        return NXT_ERROR;
+    }
+#endif
+
+    /* A cmsg_len longer than the buffer is not walked. */
+
+    first->cmsg_len = msg.msg_controllen + 1;
+
+    next = NXT_CMSG_NXTHDR(&msg, first);
+
+    first->cmsg_len = CMSG_LEN(size);
+
+    if (next != NULL) {
+        nxt_log_alert(thr->log, "port ctrunc test: NXT_CMSG_NXTHDR() walked "
+                      "a header longer than the buffer (first header type "
+                      "%d)", type);
+        return NXT_ERROR;
+    }
+
+    /* A next header that does not fit is not returned. */
+
+    msg.msg_controllen = off + sizeof(struct cmsghdr) - 1;
+
+    if (NXT_CMSG_NXTHDR(&msg, first) != NULL) {
+        nxt_log_alert(thr->log, "port ctrunc test: NXT_CMSG_NXTHDR() "
+                      "returned a partial header (first header type %d)",
+                      type);
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+
 nxt_int_t
 nxt_port_ctrunc_test(nxt_thread_t *thr)
 {
@@ -1047,6 +1193,19 @@ nxt_port_ctrunc_test(nxt_thread_t *thr)
 
     nxt_thread_time_update(thr);
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "port ctrunc test started");
+
+    if (nxt_port_ctrunc_test_nxthdr(thr, SCM_RIGHTS, sizeof(int)) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+#if (NXT_CRED_USECMSG)
+    if (nxt_port_ctrunc_test_nxthdr(thr, NXT_CRED_CMSGTYPE,
+                                    sizeof(nxt_socket_cred_t))
+        != NXT_OK)
+    {
+        return NXT_ERROR;
+    }
+#endif
 
     task = thr->task;
     task->thread = thr;
