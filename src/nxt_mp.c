@@ -526,14 +526,14 @@ nxt_mp_test_retain_count(nxt_mp_t *mp)
 nxt_uint_t
 nxt_mp_test_cluster_alloc_count(void)
 {
-    return nxt_mp_test_cluster_allocs;
+    return nxt_atomic_load(&nxt_mp_test_cluster_allocs);
 }
 
 
 nxt_uint_t
 nxt_mp_test_cluster_drain_count(void)
 {
-    return nxt_mp_test_cluster_drains;
+    return nxt_atomic_load(&nxt_mp_test_cluster_drains);
 }
 
 

@@ -19,11 +19,12 @@ static void nxt_thread_key_dtor(void *data);
 void
 nxt_thread_init_data(nxt_thread_specific_data_t tsd)
 {
-    void           *p;
-    nxt_err_t      err;
-    pthread_key_t  key;
+    void             *p;
+    nxt_err_t        err;
+    pthread_key_t    key;
+    nxt_atomic_int_t key_id;
 
-    while ((nxt_atomic_int_t) tsd->key < 0) {
+    while ((nxt_atomic_int_t) nxt_atomic_load(&tsd->key) < 0) {
         /*
          * Atomic allocation of a key number.
          * -1 means an uninitialized key,
@@ -37,13 +38,23 @@ nxt_thread_init_data(nxt_thread_specific_data_t tsd)
                 goto fail;
             }
 
-            tsd->key = (nxt_atomic_t) key;
+            /*
+             * The compare-and-swap is a full barrier.  It publishes the key
+             * together with the state that pthread_key_create() wrote.
+             * This thread holds the -2 lock, so the swap always succeeds.
+             */
+            (void) nxt_atomic_cmp_set(&tsd->key, -2, (nxt_atomic_uint_t) key);
 
-            nxt_main_log_debug("pthread_key_create(): %A", tsd->key);
+            nxt_main_log_debug("pthread_key_create(): %A",
+                               nxt_atomic_load(&tsd->key));
         }
     }
 
-    if (pthread_getspecific((pthread_key_t) tsd->key) != NULL) {
+    /* The acquire load pairs with the compare-and-swap that set the key. */
+
+    key_id = (nxt_atomic_int_t) nxt_atomic_load_acquire(&tsd->key);
+
+    if (pthread_getspecific((pthread_key_t) key_id) != NULL) {
         return;
     }
 
@@ -52,12 +63,12 @@ nxt_thread_init_data(nxt_thread_specific_data_t tsd)
         goto fail;
     }
 
-    err = pthread_setspecific((pthread_key_t) tsd->key, p);
+    err = pthread_setspecific((pthread_key_t) key_id, p);
     if (err == 0) {
         return;
     }
 
-    nxt_main_log_alert("pthread_setspecific(%A) failed %E", tsd->key, err);
+    nxt_main_log_alert("pthread_setspecific(%A) failed %E", key_id, err);
 
 fail:
 

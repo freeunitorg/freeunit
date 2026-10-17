@@ -378,23 +378,26 @@ static nxt_atomic_uint_t
 nxt_thread_time_string_slot(nxt_time_string_t *ts)
 {
     static nxt_atomic_t  slot;
+    nxt_atomic_int_t     slot_id;
 
-    while (nxt_slow_path((nxt_atomic_int_t) nxt_atomic_load(&ts->slot) < 0))
-    {
+    slot_id = (nxt_atomic_int_t) nxt_atomic_load(&ts->slot);
+
+    while (nxt_slow_path(slot_id < 0)) {
         /*
          * Atomic allocation of a slot number.
          * -1 means an uninitialized slot,
          * -2 is the initializing lock to assure the single value for the slot.
          */
         if (nxt_atomic_cmp_set(&ts->slot, -1, -2)) {
-            nxt_atomic_store(&ts->slot,
-                             (nxt_atomic_int_t) nxt_atomic_fetch_add(&slot, 1));
+            nxt_atomic_store(&ts->slot, nxt_atomic_fetch_add(&slot, 1));
 
             /* No "break" here since it adds only dispensable "jmp". */
         }
+
+        slot_id = (nxt_atomic_int_t) nxt_atomic_load(&ts->slot);
     }
 
-    return (nxt_atomic_uint_t) nxt_atomic_load(&ts->slot);
+    return (nxt_atomic_uint_t) slot_id;
 }
 
 

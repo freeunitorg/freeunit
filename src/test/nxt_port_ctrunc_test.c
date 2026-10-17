@@ -856,7 +856,7 @@ nxt_port_ctrunc_test_queue(nxt_thread_t *thr)
         goto done;
     }
 
-    nitems = queue->nitems;
+    nitems = nxt_atomic_load(&queue->nitems);
 
     nxt_memzero(&port_msg, sizeof(nxt_port_msg_t));
     port_msg.type = _NXT_PORT_MSG_QUIT;
@@ -893,11 +893,12 @@ nxt_port_ctrunc_test_queue(nxt_thread_t *thr)
         goto done;
     }
 
-    if (queue->nitems != nitems) {
+    if (nxt_atomic_load(&queue->nitems) != nitems) {
         nxt_log_alert(thr->log, "port ctrunc test: a refused message left "
                       "queue->nitems at %uD, was %uD; the port would never "
                       "be notified again",
-                      (uint32_t) queue->nitems, (uint32_t) nitems);
+                      (uint32_t) nxt_atomic_load(&queue->nitems),
+                      (uint32_t) nitems);
         goto done;
     }
 
@@ -994,10 +995,11 @@ nxt_port_ctrunc_test_queue(nxt_thread_t *thr)
         goto done;
     }
 
-    if (queue->nitems != nitems) {
+    if (nxt_atomic_load(&queue->nitems) != nitems) {
         nxt_log_alert(thr->log, "port ctrunc test: draining past a refused "
                       "message left queue->nitems at %uD, was %uD",
-                      (uint32_t) queue->nitems, (uint32_t) nitems);
+                      (uint32_t) nxt_atomic_load(&queue->nitems),
+                      (uint32_t) nitems);
         goto done;
     }
 

@@ -1239,7 +1239,7 @@ nxt_unit_process_read_msg(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf)
 
     pthread_mutex_lock(&ctx_impl->mutex);
 
-    wait = ctx_impl->parked > 0
+    wait = nxt_atomic_load(&ctx_impl->parked) > 0
            || !nxt_queue_is_empty(&ctx_impl->pending_rbuf);
 
     pthread_mutex_unlock(&ctx_impl->mutex);
@@ -3504,7 +3504,7 @@ nxt_unit_mmap_buf_send(nxt_unit_request_info_t *req,
                             (int) m.mmap_msg.chunk_id - (int) first_free_chunk);
 
         nxt_unit_debug(req->ctx, "allocated_chunks %d",
-                       (int) lib->outgoing.allocated_chunks);
+                       (int) nxt_atomic_load(&lib->outgoing.allocated_chunks));
 
     } else {
         if (nxt_slow_path(mmap_buf->plain_ptr == NULL
@@ -5158,7 +5158,7 @@ retry:
 
     if (outgoing_size >= lib->shm_mmap_limit) {
         /* Cannot allocate more shared memory. */
-        lib->shm = NXT_UNIT_SHM_FULL;
+        nxt_atomic_store(&lib->shm, NXT_UNIT_SHM_FULL);
 
         pthread_mutex_unlock(&lib->outgoing.mutex);
 
@@ -5170,7 +5170,8 @@ retry:
             *n = 0;
         }
 
-        if (nxt_slow_path(lib->outgoing.allocated_chunks + min_n
+        if (nxt_slow_path(nxt_atomic_load(&lib->outgoing.allocated_chunks)
+                          + min_n
                           >= lib->shm_mmap_limit * PORT_MMAP_CHUNK_COUNT))
         {
             /* Memory allocated by application, but not send to router. */
@@ -5212,13 +5213,13 @@ skip:
 unlock:
 
     if (nxt_fast_path(hdr != NULL)) {
-        lib->shm = NXT_UNIT_SHM_OK;
+        nxt_atomic_store(&lib->shm, NXT_UNIT_SHM_OK);
 
         nxt_atomic_fetch_add(&lib->outgoing.allocated_chunks, *n);
     }
 
     nxt_unit_debug(ctx, "allocated_chunks %d",
-                   (int) lib->outgoing.allocated_chunks);
+                   (int) nxt_atomic_load(&lib->outgoing.allocated_chunks));
 
     pthread_mutex_unlock(&lib->outgoing.mutex);
 
@@ -5505,8 +5506,9 @@ remove_fail:
 
 fail:
 
-    lib->shm = NXT_UNIT_SHM_FAILED;
-    lib->shm_retry = nxt_unit_detached_now() / 1000 + NXT_UNIT_SHM_RETRY;
+    nxt_atomic_store(&lib->shm, NXT_UNIT_SHM_FAILED);
+    nxt_atomic_store(&lib->shm_retry,
+                     nxt_unit_detached_now() / 1000 + NXT_UNIT_SHM_RETRY);
 
     return NULL;
 }
@@ -5673,14 +5675,14 @@ nxt_unit_get_outgoing_buf(nxt_unit_request_info_t *req, uint32_t size,
         goto plain;
     }
 
-    if (plain_ok && lib->shm == NXT_UNIT_SHM_FAILED) {
+    if (plain_ok && nxt_atomic_load(&lib->shm) == NXT_UNIT_SHM_FAILED) {
         now = nxt_unit_detached_now() / 1000;
 
-        if (now < lib->shm_retry) {
+        if (now < nxt_atomic_load(&lib->shm_retry)) {
             goto plain;
         }
 
-        lib->shm_retry = now + NXT_UNIT_SHM_RETRY;
+        nxt_atomic_store(&lib->shm_retry, now + NXT_UNIT_SHM_RETRY);
     }
 
 #if (NXT_TESTS)
@@ -6371,7 +6373,7 @@ nxt_unit_mmap_release(nxt_unit_ctx_t *ctx, nxt_port_mmap_header_t *hdr,
         nxt_atomic_fetch_add(&lib->outgoing.allocated_chunks, -freed_chunks);
 
         nxt_unit_debug(ctx, "allocated_chunks %d",
-                       (int) lib->outgoing.allocated_chunks);
+                       (int) nxt_atomic_load(&lib->outgoing.allocated_chunks));
     }
 
     if (hdr->dst_pid == lib->pid
@@ -6661,7 +6663,9 @@ nxt_unit_read_buf(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf)
         timeout = 1000;
     }
 
-    if (ctx_impl->wait_items > 0 || !nxt_unit_chk_ready(ctx)) {
+    if (nxt_atomic_load(&ctx_impl->wait_items) > 0
+        || !nxt_unit_chk_ready(ctx))
+    {
         return nxt_unit_ctx_port_recv(ctx, ctx_impl->read_port, rbuf);
     }
 
@@ -6784,7 +6788,8 @@ nxt_unit_chk_ready(nxt_unit_ctx_t *ctx)
 
     return (ctx_impl->ready
             && (lib->request_limit == 0
-                || lib->request_count < lib->request_limit));
+                || nxt_atomic_load(&lib->request_count)
+                   < lib->request_limit));
 }
 
 
@@ -6814,7 +6819,7 @@ nxt_unit_process_pending_rbuf(nxt_unit_ctx_t *ctx)
     for ( ;; ) {
         pthread_mutex_lock(&ctx_impl->mutex);
 
-        if (ctx_impl->parked > 0
+        if (nxt_atomic_load(&ctx_impl->parked) > 0
             || nxt_queue_is_empty(&ctx_impl->pending_rbuf))
         {
             pthread_mutex_unlock(&ctx_impl->mutex);
@@ -7568,7 +7573,7 @@ nxt_unit_ctx_free_rbufs(nxt_unit_impl_t *lib, nxt_unit_ctx_impl_t *ctx_impl)
     nxt_queue_init(&others);
     nxt_queue_init(&rbufs);
 
-    if (ctx_impl->parked > 0) {
+    if (nxt_atomic_load(&ctx_impl->parked) > 0) {
         pthread_mutex_lock(&lib->incoming.mutex);
 
         end = lib->incoming.elts + lib->incoming.size;
@@ -7601,8 +7606,12 @@ nxt_unit_ctx_free_rbufs(nxt_unit_impl_t *lib, nxt_unit_ctx_impl_t *ctx_impl)
         nxt_unit_unpark_rbufs(&ctx_impl->ctx, &others);
     }
 
-    /* Another thread may still put buffers of this context in pending_rbuf. */
-    while (ctx_impl->unparking != 0) {
+    /*
+     * Another thread may still put buffers of this context in pending_rbuf.
+     * The acquire load pairs with the full barrier of its decrement, so the
+     * free below comes after the last access of that thread.
+     */
+    while (nxt_atomic_load_acquire(&ctx_impl->unparking) != 0) {
         nxt_thread_yield();
     }
 
@@ -8218,7 +8227,7 @@ nxt_unit_quit(nxt_unit_ctx_t *ctx, uint8_t quit_param)
 
         quit = nxt_queue_is_empty(&ctx_impl->active_req)
                && nxt_queue_is_empty(&ctx_impl->pending_rbuf)
-               && ctx_impl->wait_items == 0
+               && nxt_atomic_load(&ctx_impl->wait_items) == 0
                && ctx_impl->detached == NXT_UNIT_DETACHED_NONE;
 
         pthread_mutex_unlock(&ctx_impl->mutex);
@@ -8411,7 +8420,7 @@ nxt_unit_req_send(nxt_unit_request_info_t *req, const void *buf,
              && (pm->last
                  || req_impl->queue_state == NXT_UNIT_REQ_QUEUED
                  || (req_impl->queue_state == NXT_UNIT_REQ_UNQUEUED
-                     && lib->shm == NXT_UNIT_SHM_OK)));
+                     && nxt_atomic_load(&lib->shm) == NXT_UNIT_SHM_OK)));
 
     if (!queue && req_impl->queue_state == NXT_UNIT_REQ_QUEUED) {
         if (nxt_slow_path(nxt_unit_req_queue_drain(req) != NXT_UNIT_OK)) {
@@ -9075,6 +9084,7 @@ static int
 nxt_unit_app_queue_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     nxt_unit_read_buf_t *rbuf)
 {
+    nxt_atomic_uint_t     count;
     uint32_t              cookie;
     nxt_port_msg_t        *port_msg;
     nxt_app_queue_t       *queue;
@@ -9104,9 +9114,9 @@ retry:
             lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
 
             if (lib->request_limit != 0) {
-                nxt_atomic_fetch_add(&lib->request_count, 1);
+                count = nxt_atomic_fetch_add(&lib->request_count, 1) + 1;
 
-                if (nxt_slow_path(lib->request_count >= lib->request_limit)) {
+                if (nxt_slow_path(count >= lib->request_limit)) {
                     nxt_unit_debug(ctx, "request limit reached");
 
                     memset(&m.msg, 0, sizeof(nxt_port_msg_t));

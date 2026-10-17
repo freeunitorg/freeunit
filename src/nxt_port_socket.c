@@ -826,7 +826,7 @@ nxt_port_announce(nxt_task_t *task, nxt_port_t *port)
      * else's descriptor.
      */
 
-    if (port->announce == 0 || port->pair[1] == -1) {
+    if (nxt_atomic_load(&port->announce) == 0 || port->pair[1] == -1) {
         return NXT_OK;
     }
 
@@ -1244,7 +1244,7 @@ next_fragment:
 
         n = nxt_socketpair_send_ex(&port->socket, msg->fd, iov, sb.niov + 1,
                                    msg->peer_may_be_gone
-                                   || port->quit_sent != 0);
+                                   || nxt_atomic_load(&port->quit_sent) != 0);
 
         if (n > 0) {
             /*
@@ -1534,7 +1534,7 @@ cleanup:
         if (retry_later) {
             nxt_port_retry_later(task, port);
 
-        } else if (enable_write || port->announce != 0) {
+        } else if (enable_write || nxt_atomic_load(&port->announce) != 0) {
             nxt_port_rearm(task, port);
         }
     }

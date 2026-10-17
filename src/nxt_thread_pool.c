@@ -26,7 +26,7 @@ nxt_thread_pool_create(nxt_uint_t max_threads, nxt_nsec_t timeout,
         return NULL;
     }
 
-    tp->max_threads = max_threads;
+    nxt_atomic_store(&tp->max_threads, max_threads);
     tp->timeout = timeout;
     tp->engine = engine;
     tp->task.thread = engine->task.thread;
@@ -62,11 +62,11 @@ nxt_thread_pool_init(nxt_thread_pool_t *tp)
     nxt_thread_link_t    *link;
     nxt_thread_handle_t  handle;
 
-    if (nxt_fast_path(tp->ready)) {
+    if (nxt_fast_path(nxt_atomic_load(&tp->ready) != 0)) {
         return NXT_OK;
     }
 
-    if (tp->max_threads == 0) {
+    if (nxt_atomic_load(&tp->max_threads) == 0) {
         /* The pool is being destroyed. */
         return NXT_ERROR;
     }
@@ -75,7 +75,7 @@ nxt_thread_pool_init(nxt_thread_pool_t *tp)
 
     ret = NXT_OK;
 
-    if (!tp->ready) {
+    if (nxt_atomic_load(&tp->ready) == 0) {
 
         nxt_thread_log_debug("thread pool init");
 
@@ -90,7 +90,7 @@ nxt_thread_pool_init(nxt_thread_pool_t *tp)
                 link->work.data = tp;
 
                 if (nxt_thread_create(&handle, link) == NXT_OK) {
-                    tp->ready = 1;
+                    nxt_atomic_store(&tp->ready, 1);
                     goto done;
                 }
             }
@@ -207,7 +207,7 @@ nxt_thread_pool_wait(nxt_thread_pool_t *tp)
     do {
         threads = nxt_atomic_load(&tp->threads);
 
-        if (threads >= tp->max_threads) {
+        if (threads >= nxt_atomic_load(&tp->max_threads)) {
             return;
         }
 
@@ -233,17 +233,18 @@ nxt_thread_pool_destroy(nxt_thread_pool_t *tp)
 
     thr = nxt_thread();
 
-    nxt_log_debug(thr->log, "thread pool destroy: %A", tp->ready);
+    nxt_log_debug(thr->log, "thread pool destroy: %A",
+                  nxt_atomic_load(&tp->ready));
 
-    if (!tp->ready) {
+    if (nxt_atomic_load(&tp->ready) == 0) {
         nxt_work_queue_add(&thr->engine->fast_work_queue, tp->exit,
                            &tp->engine->task, tp, NULL);
         return;
     }
 
-    if (tp->max_threads != 0) {
+    if (nxt_atomic_load(&tp->max_threads) != 0) {
         /* Disable new threads creation and mark a pool as being destroyed. */
-        tp->max_threads = 0;
+        nxt_atomic_store(&tp->max_threads, 0);
 
         nxt_work_set(&tp->work, nxt_thread_pool_exit, &tp->task, tp, NULL);
 
