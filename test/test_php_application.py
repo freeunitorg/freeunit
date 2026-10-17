@@ -1153,3 +1153,50 @@ def test_php_application_content_length_not_reinstated():
         resp['headers']['Transfer-Encoding'] == 'chunked'
     ), 'chunked framing'
     assert resp['body'] == '0123456789', 'body intact'
+
+
+@pytest.mark.parametrize(
+    'method,header,status',
+    [('get', 'Location: /x', 302), ('head', 'X-Custom: val', 200)],
+)
+def test_php_application_header_only(
+    method, header, status, findall, wait_for_record
+):
+    client.load('header')
+
+    resp = getattr(client, method)(
+        url=f'/?header_only={method}',
+        headers={
+            'Host': 'localhost',
+            'Connection': 'close',
+            'X-Header': header,
+        }
+    )
+    name, value = header.split(': ', 1)
+    assert resp['status'] == status, 'status'
+    assert resp['headers'][name] == value, 'response header'
+    assert resp['body'] == '', 'body empty'
+
+    # RPC debug records count messages for both the socket and queue paths.
+    # The PHP sanitizer CI leg builds with --debug and runs this file.
+    if not findall(r'\[debug\]'):
+        pytest.skip('response message count needs a --debug build')
+
+    streams = findall(
+        rf'\[unit\] #(\d+): {method.upper()} '
+        rf'/\?header_only={method} \(0\)$'
+    )
+    assert len(streams) == 1, f'{method} request stream'
+    stream = streams[0]
+
+    last = wait_for_record(
+        rf'rpc: stream #{stream} last handler, type (\d+)$'
+    )
+    assert last is not None, f'{method} response completed'
+
+    # Ignore the request-header acknowledgement: DATA has the same type
+    # as the final response message, and must occur exactly once.
+    messages = findall(
+        rf'rpc: stream #{stream} (?:last )?handler, type {last[1]}$'
+    )
+    assert len(messages) == 1, f'{method} response messages: {len(messages)}'

@@ -23,6 +23,7 @@
 #include "nxt_app_queue.h"
 #include "nxt_unit.h"
 #include "nxt_unit_request.h"
+#include "nxt_unit_response.h"
 #include "nxt_unit_websocket.h"
 
 #include <pthread.h>
@@ -71,6 +72,7 @@ typedef struct {
 #define NXT_UNIT_MSG_TEST_HELD_SIZE    500
 #define NXT_UNIT_MSG_TEST_PART_SIZE    100
 #define NXT_UNIT_MSG_TEST_WRITE_SIZE   2000
+#define NXT_UNIT_RESPONSE_PLAIN_ALLOC  1008
 
 
 static int                      nxt_unit_msg_test_failures;
@@ -1882,10 +1884,10 @@ nxt_unit_msg_test_respond_no_chunk(nxt_unit_request_info_t *req)
 /*
  * A body written before nxt_unit_response_send(), as the WSGI module does.
  * nxt_unit_response_write_nb() puts into the fields message as many of the
- * first body bytes as the fields buffer has left.  The buffer is asked for
- * the exact size of the fields, so it must have nothing left.  Rounded up
- * to a chunk of PORT_MMAP_CHUNK_SIZE bytes it takes the whole body, which
- * the router does not compress (test/test_python_compression.py).
+ * first body bytes as the fields buffer has left.  A small buffer has room
+ * for NXT_UNIT_RESPONSE_PLAIN_ALLOC bytes, so it takes the whole small body
+ * as piggyback content.  The router gets the ack, the combined fields+body
+ * message and the last message: "ABL".
  */
 static int
 nxt_unit_msg_test_respond_write_first(nxt_unit_request_info_t *req)
@@ -1911,16 +1913,29 @@ nxt_unit_msg_test_respond_write_first(nxt_unit_request_info_t *req)
 
     left = req->response_buf->end - req->response_buf->free;
 
-    if (left != 0) {
+    if (left != NXT_UNIT_RESPONSE_PLAIN_ALLOC - 78) {
         printf("unit msg test: the fields buffer has %d bytes left, "
-               "expected 0\n", (int) left);
+               "expected %d\n", (int) left,
+               (int) (NXT_UNIT_RESPONSE_PLAIN_ALLOC - 78));
         fflush(stdout);
 
         return NXT_UNIT_ERROR;
     }
 
-    return nxt_unit_response_write(req, NXT_UNIT_MSG_TEST_HELLO,
-                                   nxt_length(NXT_UNIT_MSG_TEST_HELLO));
+    rc = nxt_unit_response_write(req, NXT_UNIT_MSG_TEST_HELLO,
+                                 nxt_length(NXT_UNIT_MSG_TEST_HELLO));
+    if (rc != NXT_UNIT_OK) {
+        return rc;
+    }
+
+    if (!nxt_unit_response_is_sent(req)) {
+        printf("unit msg test: response was not sent after write\n");
+        fflush(stdout);
+
+        return NXT_UNIT_ERROR;
+    }
+
+    return NXT_UNIT_OK;
 }
 
 
@@ -2255,13 +2270,11 @@ nxt_unit_msg_test_small_case(void *data)
 
 
 /*
- * A small buffer in shared memory keeps the exact size it was asked for.
- * So the fields of a response go out as their own message, even when the
- * body is written before nxt_unit_response_send(): the router gets the ack,
- * the fields, the body and the last message.  With the buffer rounded up to
- * a chunk, the body went inside the fields message, the router sent those
- * bytes uncompressed under a "Content-Encoding" header and emitted no gzip
- * trailer, and 10 cases of test/test_python_compression.py failed.
+ * A small buffer of up to 1008 bytes is allocated at 1008 bytes to leave
+ * room for a small body.  When the body is written before
+ * nxt_unit_response_send(), it is sent inside the fields message as
+ * piggyback content.  The router gets the ack ('A'), the combined message
+ * ('B' for data of 84 bytes), and the last message ('L'): "ABL".
  */
 static int
 nxt_unit_msg_test_exact_fields_case(void *data)
@@ -2294,14 +2307,14 @@ nxt_unit_msg_test_exact_fields_case(void *data)
     }
 
     if (nxt_unit_msg_test_router_read(queue, NXT_UNIT_MSG_TEST_STREAM,
-                                      nxt_length(NXT_UNIT_MSG_TEST_HELLO), 0,
-                                      seq, sizeof(seq), &ndgrams)
+                                      78 + nxt_length(NXT_UNIT_MSG_TEST_HELLO),
+                                      0, seq, sizeof(seq), &ndgrams)
         != 0)
     {
         return 5;
     }
 
-    if (nxt_unit_msg_test_expect(seq, "AHBL") != 0) {
+    if (nxt_unit_msg_test_expect(seq, "ABL") != 0) {
         return 7;
     }
 
@@ -3726,8 +3739,8 @@ main(void)
                                nxt_unit_msg_test_small_case, NULL,
                                NXT_UNIT_OK);
 
-    nxt_unit_msg_test_in_child("the fields of a response leave no room for "
-                               "the body",
+    nxt_unit_msg_test_in_child("a small response carries its body in one "
+                               "message",
                                nxt_unit_msg_test_exact_fields_case, NULL,
                                NXT_UNIT_OK);
 
