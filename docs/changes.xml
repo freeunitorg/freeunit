@@ -19,6 +19,16 @@ have a fixed build time and build host.
 </para>
 </change>
 
+<change type="change">
+<para>
+configure now stops with an error when the compiler and libc do not provide
+a working __thread (thread-local storage).  Before, configure used pthread
+keys instead and gave no warning.  Such a build had no memory pool cluster
+cache and no thread-local caches for static files.  All supported systems
+have __thread.  The pthread key code will be removed in a later release.
+</para>
+</change>
+
 <change type="feature">
 <para>
 --regex-jit enables optional PCRE2 JIT compilation. A library or pattern
