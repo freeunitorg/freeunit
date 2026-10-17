@@ -18,6 +18,7 @@ RPC_CMD=""
 METHOD=PUT
 CONF_FILES=""
 EDIT_FILENAME=""
+OUTPUT_STATUS=0
 
 while [ $# -gt 0 ]; do
 	OPTION=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
@@ -271,9 +272,15 @@ cat_conf_files() {
 
 # Keep the curl exit status ($1) and show the response that curl saved
 #
+# The status of the output filter is kept too: a response that is not
+# valid JSON is a failure the caller has to see, not a zero exit after
+# a jq error on stderr.  The control API answers in JSON in every case;
+# yq only changes the presentation.
+#
 show_response() {
 	CURL_STATUS=$1
 	$OUTPUT < "/tmp/${0##*/}.$$.out"
+	OUTPUT_STATUS=$?
 	rm -f "/tmp/${0##*/}.$$.out"
 }
 
@@ -363,6 +370,12 @@ fi
 
 if [ "$CURL_STATUS" -eq 0 ]; then
 	rm -f /tmp/"${0##*/}".$$* 2> /dev/null
+	if [ "$OUTPUT_STATUS" -gt 128 ]; then
+		exit "$OUTPUT_STATUS" # The filter died of a signal, e.g. SIGPIPE from `unitc /config | head`
+	elif [ "$OUTPUT_STATUS" -ne 0 ]; then
+		printf '%s: ERROR: the response is not valid JSON (the output filter exited with status %s)\n' "${0##*/}" "$OUTPUT_STATUS" >&2
+		exit 5 # 1 usage, 2 socket or editor, 3 INSERT, 4 curl
+	fi
 	if [ "$SHOW_LOG" -gt 0 ] && [ $NOLOG -eq 0 ] && [ $QUIET -eq 0 ]; then
 		printf '%s' "${0##*/}: Waiting for log..."
 		sleep "$SHOW_LOG"

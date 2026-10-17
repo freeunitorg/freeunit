@@ -528,6 +528,18 @@ the body for php://input.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+tools/unitc ignored the exit status of the program that formats the response.
+When a request succeeded but the response was not valid JSON, jq or yq printed
+a parse error and unitc still exited with status 0, so a script could not tell
+a good response from a broken one.  unitc now keeps the status of the filter and
+exits with 5, naming the format of the response instead of curl(1).  A response
+with no body still exits with 0.  See
+https://github.com/freeunitorg/freeunit/issues/761.
+</para>
+</change>
+
 </changes>
 
 
