@@ -4,15 +4,16 @@ name: "Layout check (pahole)"
 
 # Compares the layout of the shared-memory structs between the base commit
 # and the head commit.  tools/perf/layout-check.sh builds unitd from both
-# commits in this one job, with the same compiler.  Thus the check needs no
-# baseline, and a new runner image cannot make it drift.  A change to a
-# shared-memory struct fails the job.  A change to a process-local struct
-# gives a warning only.
+# commits in this one job, with the same compiler, once as is and once with
+# -DNXT_MMAP_TINY_CHUNK.  Thus the check needs no baseline, and a new runner
+# image cannot make it drift.  A change to a shared-memory struct, or to a
+# process-local struct that a module lays out from the installed headers,
+# fails the job.
 #
 # Each pull request runs the job, with no path filter.  A skipped job
 # reports success, and a typedef, a build flag or a new header can change
 # a layout from a file that a filter does not name.  The job takes about
-# 40 s.
+# 80 s.
 
 on:
   pull_request:
@@ -75,6 +76,9 @@ jobs:
 
       - name: Check that the list covers every installed struct
         run: tools/perf/layout-coverage.py --self-test && tools/perf/layout-coverage.py
+
+      - name: Test the layout comparison
+        run: tools/perf/layout-check.sh --self-test
 
       - name: Compare the layouts
         env:

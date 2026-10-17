@@ -35,9 +35,10 @@
 #        tools/perf/layout-coverage.py reads src/nxt_port.h too, so a new
 #        slot fails the check until it is listed.
 # local: The struct is in the memory of one process.  A change to its
-#        layout gives a warning.  Every struct defined in a header that
-#        "make install" copies is listed, because a module is built
-#        against those headers and lays the struct out itself:
+#        layout fails, as for "shm": every struct defined in a header
+#        that "make install" copies is listed, because a module is built
+#        against those headers and lays the struct out itself, and a
+#        module built from the other commit then reads it wrong.
 #        tools/perf/layout-coverage.py fails when one is missing.
 #
 # If you remove an entry from this list, the check fails.
