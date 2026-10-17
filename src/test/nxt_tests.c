@@ -359,6 +359,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_conn_counters_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_router_new_port_test(thr) != NXT_OK) {
         return 1;
     }

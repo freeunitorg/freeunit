@@ -109,7 +109,7 @@ nxt_app_queue_send_bound(nxt_app_queue_t volatile *q, const void *p,
 
     qi->size = size;
     nxt_memcpy(qi->data, p, size);
-    qi->tracking = tracking;
+    nxt_atomic_store(&qi->tracking, tracking);
     *cookie = i;
 
     /* Before the enqueue: a worker can dequeue as soon as the slot is in. */

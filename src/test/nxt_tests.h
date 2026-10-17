@@ -89,6 +89,7 @@ nxt_int_t nxt_conn_close_idle_test(nxt_thread_t *thr);
 nxt_int_t nxt_listen_event_test(nxt_thread_t *thr);
 nxt_int_t nxt_conn_io_accept_test(nxt_thread_t *thr);
 nxt_int_t nxt_runtime_idle_close_test(nxt_thread_t *thr);
+nxt_int_t nxt_conn_counters_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_new_port_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_start_fail_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_start_fail_soak_test(nxt_thread_t *thr);
