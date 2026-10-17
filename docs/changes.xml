@@ -550,6 +550,15 @@ https://github.com/freeunitorg/freeunit/issues/761.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+with a glibc before 2.37 that does not have the fix for glibc bug 28846, for
+example the one of Ubuntu 22.04, a descriptor delivered in a truncated control
+message on a port socket leaked.  The kernel truncates this message when it
+can install only one of two descriptors.
+</para>
+</change>
+
 </changes>
 
 
