@@ -13,6 +13,26 @@
 #include <pthread.h>
 
 
+/*
+ * The hang guard around the concurrent cases.  ThreadSanitizer slows the
+ * queue loops enough that the ordinary bound fires on a healthy run; the
+ * guard stays, with room.  GCC defines __SANITIZE_THREAD__; Clang needs
+ * __has_feature().
+ */
+
+#if defined(__SANITIZE_THREAD__)
+#define NXT_APP_QUEUE_TEST_TSAN  1
+#elif (defined(__clang__) && defined(__has_feature))
+#if __has_feature(thread_sanitizer)
+#define NXT_APP_QUEUE_TEST_TSAN  1
+#endif
+#endif
+
+#ifndef NXT_APP_QUEUE_TEST_TSAN
+#define NXT_APP_QUEUE_TEST_TSAN  0
+#endif
+
+
 static int
 nxt_app_queue_test_death_recovery(void *data)
 {
@@ -493,7 +513,11 @@ nxt_app_queue_test_child(void *data)
 
     tc = data;
 
-    alarm(5);
+    /*
+     * The concurrent cases are slow under ThreadSanitizer; a healthy run
+     * must not trip the hang guard.
+     */
+    alarm(NXT_APP_QUEUE_TEST_TSAN ? 60 : 5);
 
     q = nxt_zalloc(sizeof(nxt_app_queue_t));
     if (q == NULL) {
