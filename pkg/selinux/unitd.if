@@ -1,0 +1,39 @@
+## <summary>FreeUnit application server (unitd).</summary>
+
+########################################
+## <summary>
+##	Connect to unitd over the control unix stream socket.
+## </summary>
+## <param name="domain">
+##	<summary>
+##	Domain allowed access.
+##	</summary>
+## </param>
+#
+interface(`unitd_stream_connect',`
+	gen_require(`
+		type unitd_t, unitd_var_run_t;
+	')
+
+	files_search_pids($1)
+	stream_connect_pattern($1, unitd_var_run_t, unitd_var_run_t, unitd_t)
+')
+
+########################################
+## <summary>
+##	Read unitd log files.
+## </summary>
+## <param name="domain">
+##	<summary>
+##	Domain allowed access.
+##	</summary>
+## </param>
+#
+interface(`unitd_read_log',`
+	gen_require(`
+		type unitd_log_t;
+	')
+
+	logging_search_logs($1)
+	read_files_pattern($1, unitd_log_t, unitd_log_t)
+')
