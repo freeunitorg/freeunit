@@ -203,8 +203,6 @@ typedef struct {
 } nxt_http_peer_t;
 
 
-typedef struct nxt_http_action_s nxt_http_action_t;
-
 typedef struct {
     nxt_http_action_t           *action;
     nxt_str_t                   share;
