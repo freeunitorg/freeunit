@@ -17,6 +17,7 @@ URI=""
 RPC_CMD=""
 METHOD=PUT
 CONF_FILES=""
+EDIT_FILENAME=""
 
 while [ $# -gt 0 ]; do
 	OPTION=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
@@ -38,7 +39,7 @@ while [ $# -gt 0 ]; do
 					exit 1
 					;;
 				*)
-					echo "${0##*/}: ERROR: Invalid format ($2)" >&2
+					printf '%s\n' "${0##*/}: ERROR: Invalid format ($2)" >&2
 					exit 1
 					;;
 			esac
@@ -65,7 +66,7 @@ while [ $# -gt 0 ]; do
 			;;
 
 		"HEAD" | "PATCH" | "PURGE" | "OPTIONS")
-			echo "${0##*/}: ERROR: Invalid HTTP method ($OPTION)" >&2
+			printf '%s\n' "${0##*/}: ERROR: Invalid HTTP method ($OPTION)" >&2
 			exit 1
 			;;
 
@@ -74,7 +75,7 @@ while [ $# -gt 0 ]; do
 				CONF_FILES="$CONF_FILES
 $1"
 				if [ "${1##*.}" = "yaml" ]; then
-					echo "${0##*/}: INFO: converting $1 to JSON"
+					printf '%s\n' "${0##*/}: INFO: converting $1 to JSON"
 					shift; set -- "--format" "yaml" "$@" # Apply the command line option
 				else
 					shift
@@ -86,7 +87,7 @@ $1"
 				UNIT_CTRL=$1
 				shift
 			else
-				echo "${0##*/}: ERROR: Invalid option ($1)" >&2
+				printf '%s\n' "${0##*/}: ERROR: Invalid option ($1)" >&2
 				exit 1
 			fi
 			;;
@@ -205,7 +206,7 @@ if [ $REMOTE -eq 0 ]; then
 			if [ -r "$SOCK_FILE" ]; then
 				UNIT_CTRL="--unix-socket $SOCK_FILE _"
 			else
-				echo "${0##*/}: ERROR: cannot read unitd control socket: $SOCK_FILE" >&2
+				printf '%s\n' "${0##*/}: ERROR: cannot read unitd control socket: $SOCK_FILE" >&2
 				ls -l "$SOCK_FILE"
 				exit 2
 			fi
@@ -227,8 +228,8 @@ if [ $REMOTE -eq 0 ]; then
 		# Cache the discovery for this unit PID (and cleanup any old files)
 		#
 		rm -f /tmp/"${0##*/}".* 2> /dev/null
-		echo "UNIT_CTRL=\"${UNIT_CTRL}\"" > "/tmp/${0##*/}.$PID.env"
-		echo "ERROR_LOG=\"${ERROR_LOG}\"" >> "/tmp/${0##*/}.$PID.env"
+		printf '%s\n' "UNIT_CTRL=\"${UNIT_CTRL}\"" > "/tmp/${0##*/}.$PID.env"
+		printf '%s\n' "ERROR_LOG=\"${ERROR_LOG}\"" >> "/tmp/${0##*/}.$PID.env"
 	fi
 fi
 
@@ -370,23 +371,31 @@ if [ "$CURL_STATUS" -eq 0 ]; then
 	fi
 elif [ "$CURL_STATUS" -eq 22 ]; then
 	echo "${0##*/}: ERROR: configuration not applied" >&2
-	if [ "$METHOD" = "EDIT" ]; then
+	if [ "$METHOD" = "EDIT" ] && [ -n "$EDIT_FILENAME" ]; then
+		RESTORED=1
 		if [ -f "/tmp/${0##*/}.$$_js_module" ]; then
 			echo "${0##*/}: NOTICE: restoring previous configuration" >&2
 			# shellcheck disable=SC2086
 			printf "%s" "$(cat "/tmp/${0##*/}.$$bak")" | $CURL_CMD -X PUT --data-binary @- $UNIT_CTRL"$URI" && \
-			cat "/tmp/${0##*/}.$$_js_module" | $CURL_CMD -X PUT --data-binary @- $UNIT_CTRL/config/settings/js_module 2> "/tmp/${0##*/}.$$"
+			cat "/tmp/${0##*/}.$$_js_module" | $CURL_CMD -X PUT --data-binary @- $UNIT_CTRL/config/settings/js_module 2> "/tmp/${0##*/}.$$" || RESTORED=0
 		fi
-		echo "${0##*/}: NOTICE: $(ls "$EDIT_FILENAME".*) contains unapplied edits" >&2
-		rm "/tmp/${0##*/}.$$" "$EDIT_FILENAME"
+		printf '%s\n' "${0##*/}: NOTICE: $(ls "$EDIT_FILENAME".*) contains unapplied edits" >&2
+		if [ $RESTORED -eq 1 ]; then
+			rm -f "/tmp/${0##*/}.$$bak" "/tmp/${0##*/}.$$_js_module"
+		else
+			printf '%s\n' "${0##*/}: ERROR: restore failed; the previous module is in /tmp/${0##*/}.$$bak and the settings in /tmp/${0##*/}.$$_js_module" >&2
+		fi
+		rm -f "$EDIT_FILENAME"
 	fi
+	rm -f "/tmp/${0##*/}.$$"
 	exit 4
 else
 	echo "${0##*/}: ERROR: curl(1) exited with an error ($CURL_STATUS)" >&2
 	if [ "$CURL_STATUS" -eq 7 ] && [ $REMOTE -eq 0 ]; then
 		echo "${0##*/}: Check that you have permission to access the Unit control socket, or try again with sudo(8)" >&2
+		rm -f "/tmp/${0##*/}.$$"
 	else
-		echo "${0##*/}: Trying to access $UNIT_CTRL$URI" >&2
+		printf '%s\n' "${0##*/}: Trying to access $UNIT_CTRL$URI" >&2
 		cat "/tmp/${0##*/}.$$" && rm -f "/tmp/${0##*/}.$$"
 	fi
 	exit 4
