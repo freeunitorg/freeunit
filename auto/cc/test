@@ -174,6 +174,51 @@ case $NXT_CC_NAME in
 esac
 
 
+# GCC before 4.7 gives some -Wextra warnings for code that newer GCC and
+# Clang accept.  For each such warning, a probe compiles a short example
+# with the warning flags of the build.  When the example fails only because
+# of the warning, the build turns off that one warning.
+
+nxt_cc_try_quiet()
+{
+    nxt_warning=$1
+
+    cat << END > $NXT_AUTOTEST.c
+$2
+int main(void) { return 0; }
+END
+
+    if /bin/sh -c "($CC $NXT_CFLAGS $NXT_CC_OPT $CFLAGS \
+                    -c -o $NXT_AUTOTEST.o $NXT_AUTOTEST.c)" \
+        >> $NXT_AUTOCONF_ERR 2>&1
+    then
+        :
+
+    elif /bin/sh -c "($CC $NXT_CFLAGS -Wno-$nxt_warning $NXT_CC_OPT \
+                      $CFLAGS -c -o $NXT_AUTOTEST.o $NXT_AUTOTEST.c)" \
+        >> $NXT_AUTOCONF_ERR 2>&1
+    then
+        NXT_CFLAGS="$NXT_CFLAGS -Wno-$nxt_warning"
+        $echo " + using -Wno-$nxt_warning"
+    fi
+
+    rm -f $NXT_AUTOTEST.c $NXT_AUTOTEST.o
+}
+
+
+if [ $NXT_CC_NAME = gcc ]; then
+
+    # GCC 4.4 warns about the initializers "{}" and "{ 0 }" of a structure,
+    # and about a designated initializer of a nested member.
+
+    nxt_cc_try_quiet missing-field-initializers \
+'struct nxt_autotest_s { int a; int b; };
+int nxt_autotest(void);
+int nxt_autotest(void) { struct nxt_autotest_s s = {}; return s.a + s.b; }'
+
+fi
+
+
 # Keep the build directory out of the debug info and of __FILE__.  The
 # probe runs with the flags that are already set, as the real build does.
 # -ffile-prefix-map needs GCC 8 or Clang 10.  Older compilers get
