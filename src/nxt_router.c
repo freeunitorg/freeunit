@@ -2172,10 +2172,10 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     nxt_queue_each(engine, &nxt_router->engines, nxt_event_engine_t, link0) {
 
-        report->accepted_conns += engine->accepted_conns_cnt;
-        report->idle_conns += engine->idle_conns_cnt;
-        report->closed_conns += engine->closed_conns_cnt;
-        report->requests += engine->requests_cnt;
+        report->accepted_conns += nxt_atomic_load(&engine->accepted_conns_cnt);
+        report->idle_conns += nxt_atomic_load(&engine->idle_conns_cnt);
+        report->closed_conns += nxt_atomic_load(&engine->closed_conns_cnt);
+        report->requests += nxt_atomic_load(&engine->requests_cnt);
 
     } nxt_queue_loop;
 
@@ -9388,7 +9388,7 @@ nxt_router_oosm_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     uint32_t                 i;
     nxt_bool_t               ack;
     nxt_process_t            *process;
-    nxt_free_map_t           *m;
+    nxt_free_map_t           free_map, *m;
     nxt_port_mmap_handler_t  *mmap_handler;
 
     nxt_debug(task, "oosm in %PI", msg->port_msg.pid);
@@ -9435,11 +9435,13 @@ nxt_router_oosm_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         m = mmap_handler->hdr->free_map;
 
         for (mi = 0; mi < MAX_FREE_IDX; mi++) {
-            if (m[mi] != 0) {
+            free_map = nxt_atomic_load(&m[mi]);
+
+            if (free_map != 0) {
                 ack = 1;
 
                 nxt_debug(task, "oosm: already free #%uD %uz = 0x%08xA",
-                          i, mi, m[mi]);
+                          i, mi, free_map);
 
                 break;
             }

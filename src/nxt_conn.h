@@ -347,13 +347,13 @@ ssize_t nxt_event_conn_io_send(nxt_conn_t *c, void *buf, size_t size);
         if (c->idle != NXT_CONN_TRACK_IDLE) {                                 \
             if (c->idle == NXT_CONN_TRACK_ACTIVE) {                           \
                 nxt_queue_remove(&c->link);                                   \
-                e->active_conns_cnt--;                                        \
             }                                                                 \
                                                                               \
             nxt_queue_insert_head(&e->idle_connections, &c->link);           \
                                                                               \
             c->idle = NXT_CONN_TRACK_IDLE;                                    \
-            e->idle_conns_cnt++;                                              \
+            nxt_atomic_store(&e->idle_conns_cnt,                              \
+                             nxt_atomic_load(&e->idle_conns_cnt) + 1);        \
         }                                                                     \
     } while (0)
 
@@ -379,12 +379,12 @@ ssize_t nxt_event_conn_io_send(nxt_conn_t *c, void *buf, size_t size);
                                                                               \
         if (c->idle == NXT_CONN_TRACK_IDLE) {                                 \
             nxt_queue_remove(&c->link);                                       \
-            e->idle_conns_cnt--;                                              \
+            nxt_atomic_store(&e->idle_conns_cnt,                              \
+                             nxt_atomic_load(&e->idle_conns_cnt) - 1);        \
                                                                               \
             nxt_queue_insert_head(&e->active_connections, &c->link);         \
                                                                               \
             c->idle = NXT_CONN_TRACK_ACTIVE;                                  \
-            e->active_conns_cnt++;                                            \
         }                                                                     \
     } while (0)
 
@@ -398,7 +398,7 @@ ssize_t nxt_event_conn_io_send(nxt_conn_t *c, void *buf, size_t size);
  *   NXT_CONN_TRACK_NONE   - untracked (controller clients, proxy peers, or a
  *                           conn already untracked here): no-op (idempotent).
  *
- * Unlinks the conn, decrements the queue's counter, increments
+ * Unlinks the conn, decrements idle_conns_cnt if idle, increments
  * closed_conns_cnt, and sets c->idle = TRACK_NONE.  Being idempotent, a conn
  * untracked by nxt_runtime_close_idle_connections() before it scheduled the
  * async close is not unlinked or counted a second time in the close handler.
@@ -411,14 +411,13 @@ ssize_t nxt_event_conn_io_send(nxt_conn_t *c, void *buf, size_t size);
             nxt_queue_remove(&c->link);                                       \
                                                                               \
             if (c->idle == NXT_CONN_TRACK_IDLE) {                             \
-                e->idle_conns_cnt--;                                          \
-                                                                              \
-            } else {                                                          \
-                e->active_conns_cnt--;                                        \
+                nxt_atomic_store(&e->idle_conns_cnt,                          \
+                                 nxt_atomic_load(&e->idle_conns_cnt) - 1);    \
             }                                                                 \
                                                                               \
             c->idle = NXT_CONN_TRACK_NONE;                                    \
-            e->closed_conns_cnt++;                                            \
+            nxt_atomic_store(&e->closed_conns_cnt,                            \
+                             nxt_atomic_load(&e->closed_conns_cnt) + 1);      \
         }                                                                     \
     } while (0)
 
