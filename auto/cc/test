@@ -216,6 +216,18 @@ if [ $NXT_CC_NAME = gcc ]; then
 int nxt_autotest(void);
 int nxt_autotest(void) { struct nxt_autotest_s s = {}; return s.a + s.b; }'
 
+    # The checks of nxt_router_prepare_msg() compare uint8_t members of a
+    # structure with UINT8_MAX in nxt_slow_path().  GCC 9 to 15 do not warn
+    # about such a comparison in a macro argument.  GCC 4.4 warns that it is
+    # always false.
+
+    nxt_cc_try_quiet type-limits \
+'#include <stdint.h>
+#define nxt_autotest_expect(x)  __builtin_expect((long) (x), 0)
+typedef struct { uint8_t  n; } nxt_autotest_t;
+int nxt_autotest(nxt_autotest_t *t);
+int nxt_autotest(nxt_autotest_t *t) { return nxt_autotest_expect(t->n > UINT8_MAX); }'
+
 fi
 
 
