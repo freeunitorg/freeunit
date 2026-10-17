@@ -93,6 +93,9 @@ extern const nxt_http_comp_operations_t  nxt_http_comp_brotli_ops;
 
 extern nxt_int_t nxt_http_comp_compress_app_response(nxt_task_t *task,
     nxt_http_request_t *r, nxt_buf_t **b);
+extern nxt_int_t nxt_http_comp_static_response_length(nxt_task_t *task,
+    nxt_http_request_t *r, nxt_file_t *f, nxt_file_info_t *fi,
+    size_t static_buf_len, size_t *out_total);
 extern nxt_int_t nxt_http_comp_compress_static_response(nxt_task_t *task,
     nxt_http_request_t *r, nxt_file_t **f, nxt_file_info_t *fi,
     size_t static_buf_len, size_t *out_total);
