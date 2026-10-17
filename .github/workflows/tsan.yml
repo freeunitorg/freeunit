@@ -1,0 +1,94 @@
+name: "ThreadSanitizer (C tests)"
+
+# The C suite, built with ThreadSanitizer, is the gate that catches a mixed
+# atomic/plain access before a reviewer does.  #730 and #736 were two rounds
+# of exactly that class, and CI had no leg that could see it: both changes
+# rested on inspection and external reproductions.  The suite is clean on
+# this tree, so a report here is a regression, not a flake.
+#
+# halt_on_error=0 keeps one report from hiding the rest, so a red log lists
+# every report in one run.  The job fails on the scan, not on the suite's
+# exit code alone, because a report does not abort a test.  log_path sends
+# the per-process report to a file: the suite forks, and the children's
+# reports would otherwise interleave with the test output.
+
+on:
+  pull_request:
+    paths:
+      - configure
+      - 'auto/**'
+      - 'src/**'
+      - '.github/workflows/tsan.yml'
+      - '.github/scripts/check-test-hooks.sh'
+  push:
+    branches: [ master ]
+    paths:
+      - configure
+      - 'auto/**'
+      - 'src/**'
+      - '.github/workflows/tsan.yml'
+      - '.github/scripts/check-test-hooks.sh'
+
+concurrency:
+  # Cancel superseded runs for the same pull request.  Non-PR events fall back
+  # to the run id, which is unique, so a push is never grouped with another:
+  # Actions keeps only one PENDING run per group and would drop a queued commit
+  # even with cancel-in-progress false, which would break bisectability.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  tsan:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev
+
+      - name: Configure unit (ThreadSanitizer, --tests, --openssl)
+        run: |
+          ./configure \
+            --debug \
+            --tests \
+            --openssl \
+            --cc-opt="-fsanitize=thread -fno-omit-frame-pointer -O1 -g" \
+            --ld-opt="-fsanitize=thread"
+
+      - name: Build unitd and the test programs
+        run: |
+          make -j"$(nproc)"
+          make -j"$(nproc)" build/lib/libunit.a
+          make -j"$(nproc)" tests
+
+      # The gate compares the plain objects with the -tests ones, and needs
+      # build/lib/libunit.a, which make tests does not build.
+      - name: Check the test hooks
+        run: .github/scripts/check-test-hooks.sh
+
+      - name: Run the C suite
+        run: |
+          mkdir -p tsan-logs
+          set +e
+          TSAN_OPTIONS="halt_on_error=0 log_path=${PWD}/tsan-logs/tsan" \
+            ./build/tests > tsan-run.log 2>&1
+          rc=$?
+          set -e
+          cat tsan-run.log
+          if grep -r "WARNING: ThreadSanitizer" tsan-run.log tsan-logs; then
+            echo "ThreadSanitizer reported a race" >&2
+            exit 1
+          fi
+          exit "$rc"
+
+      - name: Upload the logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tsan-logs
+          path: |
+            tsan-run.log
+            tsan-logs/
