@@ -28,11 +28,11 @@
 
 /*
  * nxt_static_assert() fails the compilation when the condition does not
- * hold.  auto/cc/test adds -std=gnu11 only on its gcc and clang branches
- * and leaves the generic "cc" branch alone, so a compiler defaulting to
- * pre-C11 has to fall back to declaring an array with a negative size;
- * there the message survives only in the type name, which has to be unique
- * per use, hence the token pasting.
+ * hold.  auto/cc/test gives GCC and Clang the newest -std that they accept.
+ * GCC 4.4 and 4.5 get -std=gnu99, and the generic "cc" branch gets no -std.
+ * A compiler without C11 then has to fall back to declaring an array with a
+ * negative size; there the message survives only in the type name, which
+ * has to be unique per use, hence the token pasting.
  */
 
 #if (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L)
