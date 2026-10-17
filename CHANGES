@@ -404,6 +404,12 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        curl(1). A response with no body still exits with 0. See
        https://github.com/freeunitorg/freeunit/issues/761.
 
+    *) Bugfix: with a glibc before 2.37 that does not have the fix for glibc
+       bug 28846, for example on Ubuntu 22.04, a descriptor delivered in a
+       truncated control message on a port socket leaked. The kernel
+       truncates this message when it can install only one of two
+       descriptors.
+
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 
