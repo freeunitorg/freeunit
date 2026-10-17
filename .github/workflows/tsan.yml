@@ -11,6 +11,18 @@ name: "ThreadSanitizer (C tests)"
 # exit code alone, because a report does not abort a test.  log_path sends
 # the per-process report to a file: the suite forks, and the children's
 # reports would otherwise interleave with the test output.
+#
+# Every instrumented process runs under `setarch -R`, ASLR off.  Kernel 6.6
+# and newer randomise the mmap base wider than TSan's shadow mapping
+# tolerates, and a process that starts with it on dies before main() with
+# "FATAL: ThreadSanitizer: unexpected memory mapping".  The GitHub image
+# happens to be configured in a way that does not trip it, which is why the
+# leg passed without this at first; the project's own build host (6.8) does,
+# and there the failure is the whole run with zero tests, not a race.  The
+# prefix is on configure and make as well, because both execute instrumented
+# binaries of their own: auto/feature's probes and the version-header
+# generator.  setarch is util-linux and needs no privileges;
+# `sysctl vm.mmap_rnd_bits=28` is the alternative and edits the host.
 
 on:
   pull_request:
@@ -51,7 +63,7 @@ jobs:
 
       - name: Configure unit (ThreadSanitizer, --tests, --openssl)
         run: |
-          ./configure \
+          setarch -R ./configure \
             --debug \
             --tests \
             --openssl \
@@ -60,20 +72,27 @@ jobs:
 
       - name: Build unitd and the test programs
         run: |
-          make -j"$(nproc)"
-          make -j"$(nproc)" build/lib/libunit.a
-          make -j"$(nproc)" tests
+          setarch -R make -j"$(nproc)"
+          setarch -R make -j"$(nproc)" build/lib/libunit.a
+          setarch -R make -j"$(nproc)" tests
 
       # The gate compares the plain objects with the -tests ones, and needs
       # build/lib/libunit.a, which make tests does not build.
       - name: Check the test hooks
         run: .github/scripts/check-test-hooks.sh
 
+      # Unprivileged on purpose, unlike c-tests and c-tests-asan, which run
+      # sudo for the clone creds cases: the suite covers both paths and this
+      # leg does not need root.  If that changes, sudo drops the environment,
+      # so the form that keeps the scan honest is
+      # `sudo env TSAN_OPTIONS=... setarch -R ./build/tests`; a bare
+      # `sudo ./build/tests` loses log_path and the job would pass with
+      # reports sitting unread in the default location.
       - name: Run the C suite
         run: |
           mkdir -p tsan-logs
           set +e
-          TSAN_OPTIONS="halt_on_error=0 log_path=${PWD}/tsan-logs/tsan" \
+          setarch -R env TSAN_OPTIONS="halt_on_error=0 log_path=${PWD}/tsan-logs/tsan" \
             ./build/tests > tsan-run.log 2>&1
           rc=$?
           set -e
