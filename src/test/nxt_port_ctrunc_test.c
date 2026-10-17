@@ -1038,6 +1038,94 @@ done:
 #endif /* NXT_HAVE_UCRED */
 
 
+/*
+ * NXT_CMSG_NXTHDR() must return a last header that the kernel truncated.
+ * When SCM_RIGHTS is cut to one descriptor, the control data ends right
+ * after that descriptor, without the padding to the next alignment
+ * boundary.  CMSG_NXTHDR() of glibc 2.12 requires that padding, so it
+ * skipped the header and the descriptor leaked
+ * (https://github.com/freeunitorg/freeunit/issues/766).
+ *
+ * The buffer is built by hand, so the case does not depend on the kernel or
+ * on the C library of the host.  The glibc 2.12 check is also written out
+ * below, to show that this buffer is the one that it rejects.
+ */
+
+static nxt_int_t
+nxt_port_ctrunc_test_nxthdr(nxt_thread_t *thr)
+{
+    u_char          *end;
+    struct msghdr   msg;
+    struct cmsghdr  *first, *second, *next;
+
+    union {
+        struct cmsghdr  cm;
+        u_char          buf[CMSG_SPACE(sizeof(int)) * 3];
+    } ctl;
+
+    nxt_memzero(&ctl, sizeof(ctl));
+    nxt_memzero(&msg, sizeof(struct msghdr));
+
+    msg.msg_control = ctl.buf;
+
+    first = (struct cmsghdr *) ctl.buf;
+    first->cmsg_level = SOL_SOCKET;
+    first->cmsg_type = SCM_RIGHTS;
+    first->cmsg_len = CMSG_LEN(sizeof(int));
+
+    second = (struct cmsghdr *) (ctl.buf + CMSG_SPACE(sizeof(int)));
+    second->cmsg_level = SOL_SOCKET;
+    second->cmsg_type = SCM_RIGHTS;
+    second->cmsg_len = CMSG_LEN(sizeof(int));
+
+    /* The control data ends at the descriptor, before the padding. */
+    msg.msg_controllen = CMSG_SPACE(sizeof(int)) + CMSG_LEN(sizeof(int));
+    end = ctl.buf + msg.msg_controllen;
+
+    if ((size_t) CMSG_SPACE(sizeof(int)) != (size_t) CMSG_LEN(sizeof(int))) {
+        /*
+         * The glibc 2.12 check of the next header, as in __cmsg_nxthdr():
+         * the header and its padding must be in the buffer.  CMSG_ALIGN()
+         * is not portable, so CMSG_SPACE() gives the padded length.
+         */
+
+        if ((u_char *) (second + 1) <= end
+            && (u_char *) second + CMSG_SPACE(sizeof(int)) <= end)
+        {
+            nxt_log_alert(thr->log, "port ctrunc test: the buffer is not the "
+                          "shape that glibc 2.12 rejects");
+            return NXT_ERROR;
+        }
+    }
+
+    next = NXT_CMSG_NXTHDR(&msg, first);
+
+    if (next != second) {
+        nxt_log_alert(thr->log, "port ctrunc test: NXT_CMSG_NXTHDR() did "
+                      "not return the truncated last header");
+        return NXT_ERROR;
+    }
+
+    if (NXT_CMSG_NXTHDR(&msg, second) != NULL) {
+        nxt_log_alert(thr->log, "port ctrunc test: NXT_CMSG_NXTHDR() "
+                      "returned a header after the last one");
+        return NXT_ERROR;
+    }
+
+    /* A next header that does not fit is not returned. */
+
+    msg.msg_controllen = CMSG_SPACE(sizeof(int)) + sizeof(struct cmsghdr) - 1;
+
+    if (NXT_CMSG_NXTHDR(&msg, first) != NULL) {
+        nxt_log_alert(thr->log, "port ctrunc test: NXT_CMSG_NXTHDR() "
+                      "returned a partial header");
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+
 nxt_int_t
 nxt_port_ctrunc_test(nxt_thread_t *thr)
 {
@@ -1047,6 +1135,10 @@ nxt_port_ctrunc_test(nxt_thread_t *thr)
 
     nxt_thread_time_update(thr);
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "port ctrunc test started");
+
+    if (nxt_port_ctrunc_test_nxthdr(thr) != NXT_OK) {
+        return NXT_ERROR;
+    }
 
     task = thr->task;
     task->thread = thr;

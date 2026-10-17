@@ -9,6 +9,8 @@
 #include <sys/un.h>
 #endif
 
+#include <nxt_span.h>
+
 
 #if (NXT_HAVE_UCRED)
 #define NXT_CRED_USECMSG    1
@@ -116,16 +118,50 @@ NXT_EXPORT ssize_t nxt_recvmsg(nxt_socket_t s,
     nxt_iobuf_t *iob, nxt_uint_t niob, nxt_recv_oob_t *oob);
 
 
+/*
+ * On glibc, NXT_CMSG_NXTHDR() does not use CMSG_NXTHDR().  CMSG_NXTHDR() of
+ * glibc 2.12 returns NULL when the padding after the data of the next header
+ * is not in the buffer.  The kernel cuts off that padding when it truncates
+ * SCM_RIGHTS to one descriptor.  The descriptor that the kernel installed is
+ * then not found, and it leaks.  glibc 2.28 of RHEL 8.10 and glibc 2.36 of
+ * Debian 12 have a newer check without this problem.  The function below
+ * does the same as the newer check.  The current header and its padding must
+ * be in the buffer, and the whole next header must be in the buffer.  The
+ * caller checks the cmsg_len of the next header.
+ */
+
 nxt_inline struct cmsghdr *
 NXT_CMSG_NXTHDR(struct msghdr *msgh, struct cmsghdr *cmsg)
 {
-#if !defined(__GLIBC__) && defined(__clang__)
+#if (defined(__GLIBC__))
+    const u_char  *p;
+    nxt_span_t    span;
+
+    nxt_span_init(&span, (u_char *) cmsg,
+                  (u_char *) msgh->msg_control + msgh->msg_controllen);
+
+    if (cmsg->cmsg_len < sizeof(struct cmsghdr)
+        || nxt_span_take(&span, cmsg->cmsg_len, &p) != 0
+        || nxt_span_take(&span, CMSG_ALIGN(cmsg->cmsg_len) - cmsg->cmsg_len,
+                         &p) != 0
+        || nxt_span_len(&span) < sizeof(struct cmsghdr))
+    {
+        return NULL;
+    }
+
+    return (struct cmsghdr *) span.pos;
+
+#else
+
+#if (defined(__clang__))
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wsign-compare"
 #endif
     return CMSG_NXTHDR(msgh, cmsg);
-#if !defined(__GLIBC__) && defined(__clang__)
+#if (defined(__clang__))
 #pragma clang diagnostic pop
+#endif
+
 #endif
 }
 
