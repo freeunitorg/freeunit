@@ -81,6 +81,13 @@ struct nxt_runtime_s {
     nxt_uid_t              control_uid;        /* resolved, or -1 */
     nxt_gid_t              control_gid;        /* resolved, or -1 */
 
+    const char             *status_addr;
+    mode_t                 status_mode;
+    const char             *status_user;
+    const char             *status_group;
+    nxt_uid_t              status_uid;         /* resolved, or -1 */
+    nxt_gid_t              status_gid;         /* resolved, or -1 */
+
     nxt_str_t              certs;
     nxt_str_t              scripts;
 
@@ -96,6 +103,10 @@ struct nxt_runtime_s {
 
     nxt_sockaddr_t         *controller_listen;
     nxt_listen_socket_t    *controller_socket;
+
+    /* The read-only status socket, NULL unless "--status" is given. */
+    nxt_sockaddr_t         *status_listen;
+    nxt_listen_socket_t    *status_socket;
 };
 
 
@@ -143,6 +154,7 @@ NXT_EXPORT nxt_port_t *nxt_runtime_port_find(nxt_runtime_t *rt, nxt_pid_t pid,
 
 /* STUB */
 nxt_int_t nxt_runtime_controller_socket(nxt_task_t *task, nxt_runtime_t *rt);
+nxt_int_t nxt_runtime_status_socket(nxt_task_t *task, nxt_runtime_t *rt);
 nxt_bool_t nxt_controller_peer_allowed(nxt_uid_t uid, nxt_gid_t gid,
     const nxt_gid_t *groups, nxt_uint_t ngroups, nxt_uid_t euid,
     nxt_uid_t ctl_uid, nxt_gid_t ctl_gid);
