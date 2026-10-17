@@ -14,7 +14,7 @@
  * nxt_atomic_release() must set a release barrier.
  */
 
-#if (NXT_HAVE_GCC_ATOMIC) /* GCC __sync_* intrinsics and __atomic_* builtins */
+#if (NXT_HAVE_GCC_ATOMIC) /* GCC __sync_* intrinsics */
 
 typedef intptr_t                    nxt_atomic_int_t;
 typedef uintptr_t                   nxt_atomic_uint_t;
@@ -37,6 +37,8 @@ typedef volatile nxt_atomic_uint_t  nxt_atomic_t;
 #define nxt_atomic_fetch_add(value, add)                                      \
     __sync_fetch_and_add(value, add)
 
+
+#if (NXT_HAVE_GCC_ATOMIC_ORDERED) /* GCC __atomic_* builtins */
 
 /*
  * An atomic load, for readers that race an update without taking the lock
@@ -63,6 +65,57 @@ typedef volatile nxt_atomic_uint_t  nxt_atomic_t;
 
 #define nxt_atomic_store(value, new_value)                                    \
     __atomic_store_n(value, new_value, __ATOMIC_RELAXED)
+
+
+/*
+ * A release store, for a writer that publishes data written before it.
+ * The matching acquire is nxt_atomic_load_acquire().
+ */
+
+#define nxt_atomic_store_release(value, new_value)                            \
+    __atomic_store_n(value, new_value, __ATOMIC_RELEASE)
+
+
+#else /* !(NXT_HAVE_GCC_ATOMIC_ORDERED) */
+
+/*
+ * GCC before 4.7 has no __atomic_* builtins.  The macros below use volatile
+ * accesses and __sync_synchronize() instead.  All call sites use objects of
+ * 32 bits or of pointer width.  An aligned volatile access of such an object
+ * is a single load or store on every supported CPU.  A load is a statement
+ * expression, so that it is not an lvalue.
+ */
+
+#define nxt_atomic_load(value)                                                \
+    ({ *(volatile __typeof__(*(value)) *) (value); })
+
+
+/*
+ * The full barrier after the load is stronger than an acquire barrier.  It
+ * is correct on every CPU.  __typeof__() keeps the const and volatile
+ * qualifiers of the object.  Thus the local variable is initialized, and it
+ * is never assigned.
+ */
+
+#define nxt_atomic_load_acquire(value)                                        \
+    ({                                                                        \
+        __typeof__(*(value))  nxt_atomic_value = nxt_atomic_load(value);      \
+                                                                              \
+        __sync_synchronize();                                                 \
+        nxt_atomic_value;                                                     \
+    })
+
+
+#define nxt_atomic_store(value, new_value)                                    \
+    ((void) (*(volatile __typeof__(*(value)) *) (value) = (new_value)))
+
+
+/* The full barrier before the store is stronger than a release barrier. */
+
+#define nxt_atomic_store_release(value, new_value)                            \
+    (__sync_synchronize(), nxt_atomic_store(value, new_value))
+
+#endif /* NXT_HAVE_GCC_ATOMIC_ORDERED */
 
 
 #define nxt_atomic_try_lock(lock)                                             \

@@ -19,8 +19,8 @@
  * still read the previous round's released = 1, and so count a legal win
  * as a late one.
  */
-#define nxt_port_uuz_load(p)      __atomic_load_n(p, __ATOMIC_ACQUIRE)
-#define nxt_port_uuz_store(p, v)  __atomic_store_n(p, v, __ATOMIC_RELEASE)
+#define nxt_port_uuz_load(p)      nxt_atomic_load_acquire(p)
+#define nxt_port_uuz_store(p, v)  nxt_atomic_store_release(p, v)
 
 
 typedef struct {
