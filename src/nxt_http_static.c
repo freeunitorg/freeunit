@@ -1027,6 +1027,15 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
          * reading of a sentence about methods that do not define ranges.
          */
 
+        /*
+         * nxt_http_static_range() sets the range only for a 206 response.
+         * Only a 206 response uses it.  GCC 4.4 cannot see this, and it
+         * gives a "may be used uninitialized" warning without these lines.
+         */
+
+        range_start = 0;
+        range_end = 0;
+
         rstatus = nxt_http_static_range(r, &etag, etag_weak,
                                         nxt_file_mtime(&fi), coding == NULL,
                                         nxt_file_size(&fi), &range_start,
