@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # run-local.sh — runs FreeUnit tests inside a Docker container
 # mirrors pkg/docker/template.Dockerfile for build process
 #
@@ -27,12 +27,18 @@
 #
 # To force rebuild: docker rmi freeunit-test:local
 
-set -euo pipefail
+set -eu
+
+# pipefail is not in POSIX; use it when the shell supports it.
+# shellcheck disable=SC3040
+if (set -o pipefail) 2>/dev/null; then
+    set -o pipefail
+fi
 
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 IMAGE_NAME="freeunit-test:local"
 DRY_RUN=false
@@ -41,18 +47,23 @@ TMP_DIR=""
 # ---------------------------------------------------------------------------
 # Known modules and their test paths (glob patterns for pytest)
 # ---------------------------------------------------------------------------
-declare -A MODULE_TESTS=(
-    [unit]="test"
-    [python]="test"
-    [go]="test/test_go*"
-    [java]="test/test_java*"
-    [node]="test/test_node*"
-    [perl]="test/test_perl*"
-    [php]="test/test_php*"
-    [ruby]="test/test_ruby*"
-    [wasm]="test/test_wasm*"
-    [wasm-wasi-component]="test/test_wasm-wasi-component*"
-)
+KNOWN_MODULES="unit python go java node perl php ruby wasm wasm-wasi-component"
+
+get_module_test() {
+    case "$1" in
+        unit) echo "test" ;;
+        python) echo "test" ;;
+        go) echo "test/test_go*" ;;
+        java) echo "test/test_java*" ;;
+        node) echo "test/test_node*" ;;
+        perl) echo "test/test_perl*" ;;
+        php) echo "test/test_php*" ;;
+        ruby) echo "test/test_ruby*" ;;
+        wasm) echo "test/test_wasm*" ;;
+        wasm-wasi-component) echo "test/test_wasm-wasi-component*" ;;
+        *) return 1 ;;
+    esac
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -69,42 +80,94 @@ usage() {
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
-MODULES=()
-TEST_ARGS=()
+MODULES=""
+MODULES_DISPLAY=""
+TEST_ARGS=""
 
-while [[ $# -gt 0 ]]; do
+add_module() {
+    if [ -z "$MODULES" ]; then
+        MODULES="$1"
+        MODULES_DISPLAY="$1"
+    else
+        MODULES="${MODULES}
+$1"
+        MODULES_DISPLAY="$MODULES_DISPLAY $1"
+    fi
+}
+
+add_test_arg() {
+    if [ -z "$TEST_ARGS" ]; then
+        TEST_ARGS="$1"
+    else
+        TEST_ARGS="${TEST_ARGS}
+$1"
+    fi
+}
+
+while [ $# -gt 0 ]; do
     case "$1" in
-        -m) [[ -z "${2:-}" || "$2" == -* ]] && { err "-m requires an argument"; exit 1; }; MODULES+=("$2"); shift 2 ;;
-        -t) [[ -z "${2:-}" || "$2" == -* ]] && { err "-t requires an argument"; exit 1; }; TEST_ARGS+=("$2"); shift 2 ;;
+        -m)
+            case "${2:-}" in
+                "" | -*) err "-m requires an argument"; exit 1 ;;
+            esac
+            add_module "$2"
+            shift 2
+            ;;
+        -t)
+            case "${2:-}" in
+                "" | -*) err "-t requires an argument"; exit 1 ;;
+            esac
+            targ="$2"
+            case "$targ" in
+                test/*) ;;
+                test_*) targ="test/$targ" ;;
+            esac
+            add_test_arg "$targ"
+            shift 2
+            ;;
         -n) DRY_RUN=true; shift ;;
         -h) usage ;;
         -*) err "Unknown option: $1"; exit 1 ;;
-        *) MODULES+=("$1"); shift ;;
+        *)
+            if [ -z "$1" ]; then
+                err "Unknown module: '$1'. Known: $KNOWN_MODULES"
+                exit 1
+            fi
+            add_module "$1"
+            shift
+            ;;
     esac
 done
 
 # Defaults: no -t and no modules → run full unit test suite
-if [[ ${#TEST_ARGS[@]} -eq 0 ]] && [[ ${#MODULES[@]} -eq 0 ]]; then
-    MODULES=("unit")
+if [ -z "$TEST_ARGS" ] && [ -z "$MODULES" ]; then
+    MODULES="unit"
+    MODULES_DISPLAY="unit"
 fi
 
-# Normalize: prepend test/ when -t is bare test_*.py or test_*.py::nodeid
-for i in "${!TEST_ARGS[@]}"; do
-    if [[ "${TEST_ARGS[$i]}" == test_* && "${TEST_ARGS[$i]}" != test/* ]]; then
-        TEST_ARGS[$i]="test/${TEST_ARGS[$i]}"
-    fi
-done
-
 # Expand modules → test path patterns (only when -t not given)
-if [[ ${#TEST_ARGS[@]} -eq 0 ]] && [[ ${#MODULES[@]} -gt 0 ]]; then
-    for m in "${MODULES[@]}"; do
-        if [[ -n "${MODULE_TESTS[$m]:-}" ]]; then
-            TEST_ARGS+=("${MODULE_TESTS[$m]}")
+if [ -z "$TEST_ARGS" ] && [ -n "$MODULES" ]; then
+    while IFS= read -r m || [ -n "$m" ]; do
+        [ -n "$m" ] || continue
+        if tpath=$(get_module_test "$m"); then
+            add_test_arg "$tpath"
         else
-            err "Unknown module: '$m'. Known: ${!MODULE_TESTS[*]}"
+            err "Unknown module: '$m'. Known: $KNOWN_MODULES"
             exit 1
         fi
-    done
+    done <<EOF
+$MODULES
+EOF
+fi
+
+# Populate positional parameters with final test arguments
+set --
+if [ -n "$TEST_ARGS" ]; then
+    while IFS= read -r arg || [ -n "$arg" ]; do
+        [ -n "$arg" ] && set -- "$@" "$arg"
+    done <<EOF
+$TEST_ARGS
+EOF
 fi
 
 # ---------------------------------------------------------------------------
@@ -121,7 +184,7 @@ prepare_tmp() {
 }
 
 cleanup_tmp() {
-    if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
+    if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
         info "Removing tmp dir $TMP_DIR"
         # The test container runs as root (--privileged, isolation tests need
         # namespaces/cgroups), so build artifacts under $TMP_DIR are root-owned
@@ -137,14 +200,14 @@ trap cleanup_tmp EXIT
 # ---------------------------------------------------------------------------
 # Pre-flight
 # ---------------------------------------------------------------------------
-if ! command -v docker &>/dev/null; then
+if ! command -v docker >/dev/null 2>&1; then
     err "docker not found in PATH"; exit 1
 fi
 
 info "============================================================"
 info "FreeUnit local test run"
-info "  Modules  : ${MODULES[*]:--}"
-info "  Test args: ${TEST_ARGS[*]}"
+info "  Modules  : ${MODULES_DISPLAY:--}"
+info "  Test args: $*"
 info "  Dry-run  : ${DRY_RUN}"
 info "============================================================"
 
@@ -152,14 +215,13 @@ info "============================================================"
 # Build the test image if it doesn't exist
 # ---------------------------------------------------------------------------
 build_image() {
-    if docker image inspect "$IMAGE_NAME" &>/dev/null; then
+    if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
         info "Using cached image: $IMAGE_NAME"
         return 0
     fi
 
     info "Building test image: $IMAGE_NAME"
 
-    local DOCKERFILE
     DOCKERFILE="$(mktemp /tmp/Dockerfile.test.XXXXXX)"
 
     # Note: <<'EOF' — no shell expansion; $@, $(...) are literal for Docker/bash
@@ -275,11 +337,11 @@ EOF
 # Run tests
 # ---------------------------------------------------------------------------
 run_tests() {
-    info "Running: pytest-3 --print-log ${TEST_ARGS[*]}"
+    info "Running: pytest-3 --print-log $*"
 
     if $DRY_RUN; then
         info "Dry-run: would execute:"
-        echo "  docker run --rm --privileged -v ${TMP_DIR}:/unit -w /unit ${IMAGE_NAME} ${TEST_ARGS[*]}"
+        echo "  docker run --rm --privileged -v ${TMP_DIR}:/unit -w /unit ${IMAGE_NAME} $*"
         return 0
     fi
 
@@ -288,7 +350,7 @@ run_tests() {
         -v "${TMP_DIR}:/unit" \
         -w /unit \
         "${IMAGE_NAME}" \
-        "${TEST_ARGS[@]}"
+        "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -296,4 +358,4 @@ run_tests() {
 # ---------------------------------------------------------------------------
 prepare_tmp
 build_image
-run_tests
+run_tests "$@"
