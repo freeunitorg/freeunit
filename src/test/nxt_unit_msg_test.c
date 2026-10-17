@@ -123,6 +123,14 @@ static int nxt_unit_msg_test_respond_write_first(
     nxt_unit_request_info_t *req);
 
 static void nxt_unit_msg_test_stall_step(const nxt_port_msg_t *msg);
+
+/* grok-713 harness: a port_send callback that blocks like the Go adapter. */
+int nxt_unit_port_send_flags(nxt_unit_ctx_t *ctx) __attribute__((weak));
+static int  nxt_unit_msg_test_full_fd = -1;
+static int  nxt_unit_msg_test_wake_cb;
+static int  nxt_unit_msg_test_wake_dropped;
+static int  nxt_unit_msg_test_quit_dropped;
+static int  nxt_unit_msg_test_read_fds[2] = { -1, -1 };
 static int nxt_unit_msg_test_send_records_to(nxt_unit_ctx_t *ctx,
     const nxt_port_mmap_msg_t *records, size_t nrecords, size_t tail);
 
@@ -294,6 +302,35 @@ nxt_unit_msg_test_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     nxt_unit_msg_test_dgram_t  *d;
 
     msg = buf;
+
+    if (nxt_unit_msg_test_full_fd != -1 && buf_size >= sizeof(nxt_port_msg_t)
+        && (msg->type == _NXT_PORT_MSG_RPC_READY
+            || msg->type == _NXT_PORT_MSG_READ_QUEUE
+            || msg->type == _NXT_PORT_MSG_QUIT))
+    {
+        int      fl;
+        ssize_t  n;
+
+        fl = (nxt_unit_port_send_flags != NULL)
+             ? nxt_unit_port_send_flags(ctx) : 0;
+
+        nxt_unit_msg_test_wake_cb++;
+
+        /* Like go/port.go: a send over the peer's full socket. */
+        n = send(nxt_unit_msg_test_full_fd, buf, buf_size, fl);
+
+        if (n == -1 && (fl & MSG_DONTWAIT) != 0 && errno == EAGAIN) {
+            nxt_unit_msg_test_wake_dropped++;
+
+            if (msg->type == _NXT_PORT_MSG_QUIT) {
+                nxt_unit_msg_test_quit_dropped++;
+            }
+
+            return 0;
+        }
+
+        return n;
+    }
 
     pthread_mutex_lock(&nxt_unit_msg_test_dgrams_mutex);
 
@@ -871,7 +908,34 @@ nxt_unit_msg_test_ctx_free_asker_case(void *data)
         return 1;
     }
 
+    /*
+     * The read port of the main context is full, as when it stopped reading:
+     * the wake-up from nxt_unit_done() must not block on it.
+     */
+    memset(&msg, 0, sizeof(msg));
+
+    while (send(nxt_unit_msg_test_read_fds[1], &msg, sizeof(msg),
+                MSG_DONTWAIT) > 0)
+    {
+        /* fill */
+    }
+
+    nxt_unit_msg_test_full_fd = nxt_unit_msg_test_read_fds[1];
+
+    alarm(10);
+
     nxt_unit_done(ctx2);
+
+    alarm(0);
+
+    nxt_unit_msg_test_full_fd = -1;
+
+    /* The socket is shared with the parent: drain it. */
+    while (recv(nxt_unit_msg_test_read_fds[0], &msg, sizeof(msg),
+                MSG_DONTWAIT) > 0)
+    {
+        /* drain */
+    }
 
     parked = nxt_unit_test_parked_rbufs(nxt_unit_msg_test_ctx);
 
@@ -918,6 +982,126 @@ nxt_unit_msg_test_ctx_free_asker_case(void *data)
     }
 
     return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * grok-713: a buffer of ctx2 parks on segment 12; the main context gets the
+ * segment and wakes ctx2.  The callback's socket is full, as a Go peer's is
+ * when it stopped reading.  The wake-up must not block.
+ */
+static int
+nxt_unit_msg_test_full_wake_case(void *data)
+{
+    int                  sp[2];
+    char                 junk[64];
+    nxt_unit_ctx_t       *ctx2;
+    nxt_port_mmap_msg_t  rec;
+
+    ctx2 = nxt_unit_ctx_alloc(nxt_unit_msg_test_ctx, NULL);
+    if (ctx2 == NULL || socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) == -1) {
+        return 1;
+    }
+
+    memset(junk, 0, sizeof(junk));
+
+    while (send(sp[0], junk, sizeof(junk), MSG_DONTWAIT) > 0) {
+        /* fill */
+    }
+
+    rec.mmap_id = 12;
+    rec.chunk_id = 0;
+    rec.size = 100;
+
+    (void) nxt_unit_msg_test_send_records_to(ctx2, &rec, 1, 0);
+
+    nxt_unit_msg_test_full_fd = sp[0];
+
+    alarm(10);
+
+    (void) nxt_unit_msg_test_send_segment(PORT_MMAP_SIZE, 12);
+
+    alarm(0);
+
+    nxt_unit_msg_test_full_fd = -1;
+
+    printf("grok713: wake via callback %d, dropped %d\n",
+           nxt_unit_msg_test_wake_cb, nxt_unit_msg_test_wake_dropped);
+    fflush(stdout);
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * The main context gets a QUIT and broadcasts it while the socket of ctx2 is
+ * full.  The broadcast holds lib->mutex and must not block.  A QUIT whose
+ * datagram is dropped stays pending, and ctx2 quits on its next message.
+ */
+static int
+nxt_unit_msg_test_quit_full_case(void *data)
+{
+    int             sp[2];
+    char            junk[64];
+    nxt_unit_ctx_t  *ctx2;
+
+    struct {
+        nxt_port_msg_t  msg;
+        uint8_t         quit_param;
+    } nxt_packed m;
+
+    ctx2 = nxt_unit_ctx_alloc(nxt_unit_msg_test_ctx, NULL);
+    if (ctx2 == NULL || socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) == -1) {
+        return 1;
+    }
+
+    memset(junk, 0, sizeof(junk));
+
+    while (send(sp[0], junk, sizeof(junk), MSG_DONTWAIT) > 0) {
+        /* fill */
+    }
+
+    memset(&m, 0, sizeof(m));
+
+    m.msg.pid = getpid();
+    m.msg.type = _NXT_PORT_MSG_QUIT;
+    m.quit_param = 0;  /* NXT_PORT_QUIT_NORMAL */
+
+    nxt_unit_msg_test_full_fd = sp[0];
+
+    alarm(10);
+
+    (void) nxt_unit_test_process_msg(nxt_unit_msg_test_ctx, &m, sizeof(m), -1);
+
+    alarm(0);
+
+    nxt_unit_msg_test_full_fd = -1;
+
+    /*
+     * ctx2 has a port queue, so the QUIT itself went into the queue and only
+     * its READ_QUEUE nudge met the full socket.  A port without a queue, or
+     * a full queue, leaves the QUIT pending instead; the test sets that
+     * state directly and checks that ctx2 quits on its next message.
+     */
+    if (nxt_unit_msg_test_quit_dropped == 0) {
+        nxt_unit_test_ctx_set_quit_pending(ctx2, 0);
+    }
+
+    if (!nxt_unit_test_ctx_online(ctx2)) {
+        return 2;
+    }
+
+    m.msg.type = _NXT_PORT_MSG_RPC_READY;
+
+    (void) nxt_unit_test_process_msg(ctx2, &m, sizeof(m.msg), -1);
+
+    printf("grok713: quit dropped %d, ctx2 online after next message %d\n",
+           nxt_unit_msg_test_quit_dropped,
+           (int) nxt_unit_test_ctx_online(ctx2));
+    fflush(stdout);
+
+    return nxt_unit_test_ctx_online(ctx2) ? 3
+                                          : NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
 }
 
 
@@ -1176,6 +1360,75 @@ nxt_unit_msg_test_send_request(nxt_chunk_id_t chunk,
 
     return nxt_unit_msg_test_send_chunk(_NXT_PORT_MSG_REQ_HEADERS, 1, chunk,
                                         size);
+}
+
+
+/*
+ * A request with a body arrives while a graceful QUIT is pending (the
+ * QUIT datagram was dropped on a full socket).  The QUIT used to be taken
+ * before the message in hand, so the context went offline and the request
+ * from that same buffer was created on it; its body then had no reader and
+ * the request hung.  The QUIT must be taken after the message: the context
+ * stays online until the body arrives and the request is done, and then
+ * quits.  alarm() turns a hang into a failure.
+ */
+
+static void
+nxt_unit_msg_test_edit_more_body(nxt_unit_request_t *r)
+{
+    r->content_length = nxt_length(NXT_UNIT_MSG_TEST_BODY "cd");
+}
+
+
+static int
+nxt_unit_msg_test_quit_pending_body_case(void *data)
+{
+    int     rc;
+    u_char  *p;
+
+    nxt_unit_msg_test_mode = NXT_UNIT_MSG_TEST_READ_BODY;
+
+    alarm(10);
+
+    nxt_unit_test_ctx_set_quit_pending(nxt_unit_msg_test_ctx,
+                                       1 /* NXT_QUIT_GRACEFUL */);
+
+    rc = nxt_unit_msg_test_send_request(2, nxt_unit_msg_test_edit_more_body);
+
+    if (rc != NXT_UNIT_OK || nxt_unit_msg_test_handler_calls != 0
+        || !nxt_unit_test_ctx_online(nxt_unit_msg_test_ctx))
+    {
+        printf("unit msg test: after headers rc %d, handler %d, online %d, "
+               "expected rc %d, handler 0, online 1\n", rc,
+               nxt_unit_msg_test_handler_calls,
+               (int) nxt_unit_test_ctx_online(nxt_unit_msg_test_ctx),
+               NXT_UNIT_OK);
+        fflush(stdout);
+
+        return 1;
+    }
+
+    p = nxt_port_mmap_chunk_start(nxt_unit_msg_test_seg0, 3);
+    memcpy(p, "cd", 2);
+
+    rc = nxt_unit_msg_test_send_chunk(_NXT_PORT_MSG_REQ_BODY, 1, 3, 2);
+
+    alarm(0);
+
+    if (rc != NXT_UNIT_OK || nxt_unit_msg_test_handler_calls != 1
+        || nxt_unit_test_ctx_online(nxt_unit_msg_test_ctx))
+    {
+        printf("unit msg test: after body rc %d, handler %d, online %d, "
+               "expected rc %d, handler 1, online 0\n", rc,
+               nxt_unit_msg_test_handler_calls,
+               (int) nxt_unit_test_ctx_online(nxt_unit_msg_test_ctx),
+               NXT_UNIT_OK);
+        fflush(stdout);
+
+        return 2;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
 }
 
 
@@ -3589,6 +3842,9 @@ main(void)
     init.read_port.in_fd = read[0];
     init.read_port.out_fd = read[1];
 
+    nxt_unit_msg_test_read_fds[0] = read[0];
+    nxt_unit_msg_test_read_fds[1] = read[1];
+
     init.shared_port_fd = shared[0];
     init.shared_queue_fd = nxt_unit_msg_test_shm(sizeof(nxt_app_queue_t));
     init.log_fd = STDERR_FILENO;
@@ -3601,6 +3857,22 @@ main(void)
     if (nxt_unit_msg_test_ctx == NULL) {
         printf("unit msg test: nxt_unit_init() failed\n");
         return 1;
+    }
+
+    if (getenv("GROK713_ONLY") != NULL) {
+        rc = nxt_unit_msg_test_send_segment(PORT_MMAP_SIZE, 0);
+        nxt_unit_msg_test_in_child("grok713 full-socket wake does not block",
+                                   nxt_unit_msg_test_full_wake_case, NULL,
+                                   NXT_UNIT_OK);
+        nxt_unit_msg_test_in_child("grok713 QUIT over a full socket does not "
+                                   "block and is not lost",
+                                   nxt_unit_msg_test_quit_full_case, NULL,
+                                   NXT_UNIT_OK);
+        nxt_unit_msg_test_in_child("grok713 request with a body during a "
+                                   "pending quit completes",
+                                   nxt_unit_msg_test_quit_pending_body_case,
+                                   NULL, NXT_UNIT_OK);
+        return nxt_unit_msg_test_failures != 0;
     }
 
     /* Segment 0, the one every well-formed record below refers to. */
@@ -3677,6 +3949,16 @@ main(void)
     nxt_unit_msg_test_in_child("a freed context hands back its segment "
                                "request",
                                nxt_unit_msg_test_ctx_free_asker_case, NULL,
+                               NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("a QUIT over a full socket does not block and "
+                               "is not lost",
+                               nxt_unit_msg_test_quit_full_case, NULL,
+                               NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("a request with a body during a pending quit "
+                               "completes",
+                               nxt_unit_msg_test_quit_pending_body_case, NULL,
                                NXT_UNIT_OK);
 
     nxt_unit_msg_test_in_child("duplicate segment id does not leak a mapping",

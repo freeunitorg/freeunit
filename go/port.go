@@ -189,7 +189,7 @@ func nxt_go_remove_port(unit *C.nxt_unit_t, ctx *C.nxt_unit_ctx_t,
 
 //export nxt_go_port_send
 func nxt_go_port_send(pid C.int, id C.int, buf unsafe.Pointer, buf_size C.int,
-	oob unsafe.Pointer, oob_size C.int) C.ssize_t {
+	oob unsafe.Pointer, oob_size C.int, flags C.int) C.ssize_t {
 
 	key := port_key{
 		pid: int(pid),
@@ -201,6 +201,11 @@ func nxt_go_port_send(pid C.int, id C.int, buf unsafe.Pointer, buf_size C.int,
 	if p == nil {
 		nxt_go_alert("port %d:%d not found", pid, id)
 		return 0
+	}
+
+	if flags&C.int(syscall.MSG_DONTWAIT) != 0 {
+		return C.ssize_t(nxt_go_port_send_nb(p, GoBytes(buf, buf_size),
+			GoBytes(oob, oob_size)))
 	}
 
 	n, oobn, err := p.snd.WriteMsgUnix(GoBytes(buf, buf_size),
@@ -309,4 +314,43 @@ func nxt_go_port_recv(pid C.int, id C.int, buf unsafe.Pointer, buf_size C.int,
 	}
 
 	return C.ssize_t(n)
+}
+
+// nxt_go_port_send_nb sends a wake-up libunit asked to be non-blocking.  A
+// full socket means the peer already has unread datagrams, so EAGAIN is not
+// an error: the wake-up is dropped and 0 is returned, as libunit does itself.
+func nxt_go_port_send_nb(p *port, b []byte, oob []byte) int {
+	rc, err := p.snd.SyscallConn()
+	if err != nil {
+		nxt_go_warn("SyscallConn: %s", err)
+		return -1
+	}
+
+	n := 0
+	var serr error
+
+	err = rc.Write(func(fd uintptr) bool {
+		for {
+			n, serr = syscall.SendmsgN(int(fd), b, oob, nil,
+				syscall.MSG_DONTWAIT)
+			if serr != syscall.EINTR {
+				return true
+			}
+		}
+	})
+
+	if err == nil {
+		err = serr
+	}
+
+	if err == syscall.EAGAIN {
+		return 0
+	}
+
+	if err != nil {
+		nxt_go_warn("non-blocking write: %s", err)
+		return -1
+	}
+
+	return n
 }
