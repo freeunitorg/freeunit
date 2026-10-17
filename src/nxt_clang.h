@@ -32,7 +32,9 @@
  * GCC 4.4 and 4.5 get -std=gnu99, and the generic "cc" branch gets no -std.
  * A compiler without C11 then has to fall back to declaring an array with a
  * negative size; there the message survives only in the type name, which
- * has to be unique per use, hence the token pasting.
+ * has to be unique per use, hence the token pasting.  C99 does not allow a
+ * repeated typedef.  A line number repeats when two headers assert on the
+ * same line, so the name uses __COUNTER__ when the compiler has it.
  */
 
 #if (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L)
@@ -48,9 +50,15 @@
 #define nxt_static_assert_name(prefix, line)                                  \
     nxt_static_assert_paste(prefix, line)
 
+#if (defined(__COUNTER__))
+#define nxt_static_assert_id  __COUNTER__
+#else
+#define nxt_static_assert_id  __LINE__
+#endif
+
 #define nxt_static_assert(cond, msg)                                          \
     typedef char nxt_static_assert_name(nxt_static_assert_failed_,            \
-                                        __LINE__)[(cond) ? 1 : -1]
+                                        nxt_static_assert_id)[(cond) ? 1 : -1]
 
 #endif
 
