@@ -1191,6 +1191,43 @@ jobs:
       - name: Run libunit malformed port message test
         run: ./build/unit_msg_test
 
+  # Compile-only leg with 32-bit size_t and pointers and a 64-bit off_t, the
+  # widths of i386, armv7 and armhf.  A type-width -Werror (#582, #579) folds
+  # only there and cannot show up in an amd64 job.  Nothing is linked against
+  # 32-bit libraries beyond libc, so --no-regex and no --openssl; build/tests
+  # is compiled and not run.  This leg blocks pull requests, as #632 asks.
+  build-m32:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
+      - name: Install packages
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential gcc-multilib
+
+      - name: Configure unit (-m32 -D_FILE_OFFSET_BITS=64)
+        run: >-
+          ./configure --tests --no-regex
+          --cc-opt='-m32 -D_FILE_OFFSET_BITS=64' --ld-opt='-m32'
+
+      - name: Build unitd
+        run: make -j4
+
+      - name: Check the target is 32-bit
+        run: file build/sbin/unitd | grep -q "ELF 32-bit"
+
+      - name: Build C tests (not run)
+        run: make -j4 tests
+
   # The C unit-test suite with PCRE 1 instead of PCRE2.  nxt_pcre.c has its
   # own match limits, recursion limit and callout.  No other job compiles
   # it.  ubuntu-24.04 is pinned because it still ships libpcre3-dev.
