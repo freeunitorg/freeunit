@@ -28,7 +28,7 @@ def script_tree(temp_dir):
     return root
 
 
-def load_script_tree(root, **kwargs):
+def load_script_tree(root, script=None, **kwargs):
     client.load('script_open', **kwargs)
     assert 'success' in client.conf(
         json.dumps(root), 'applications/script_open/root'
@@ -36,6 +36,10 @@ def load_script_tree(root, **kwargs):
     assert 'success' in client.conf(
         json.dumps(root), 'applications/script_open/working_directory'
     )
+    if script is not None:
+        assert 'success' in client.conf(
+            json.dumps(script), 'applications/script_open/script'
+        )
 
 
 def test_php_script_open_basedir():
@@ -249,6 +253,63 @@ def test_php_script_open_fifo_replaced_after_stat(script_tree):
                 if Path(script).is_fifo():
                     fd = os.open(script, os.O_RDWR | os.O_NONBLOCK)
                     os.close(fd)
+
+
+def test_php_script_open_static_script_basedir_display_errors_on(script_tree):
+    load_script_tree(
+        script_tree,
+        script='info.php',
+        options={
+            'admin': {
+                'open_basedir': '/nonexistent',
+                'display_errors': '1',
+            }
+        },
+    )
+
+    resp = client.get(url='/')
+
+    assert resp['status'] == 403, 'static script outside open_basedir'
+    assert resp['body'] == '', 'no PHP diagnostics'
+
+
+def test_php_script_open_static_script_opcache(script_tree):
+    script = Path(f'{script_tree}/info.php')
+    script.write_text(
+        '<?php\n'
+        'header("X-OPcache: " . (int) ('
+        'function_exists("opcache_is_script_cached") '
+        '&& opcache_is_script_cached(__FILE__)));\n'
+        'echo implode(", ", array_map("basename", get_included_files()));\n',
+        encoding='utf-8',
+    )
+
+    load_script_tree(
+        script_tree,
+        script='info.php',
+        processes={'spare': 1, 'max': 1},
+        options={
+            'admin': {
+                'opcache.enable': '1',
+                'opcache.enable_cli': '1',
+                'opcache.validate_timestamps': '0',
+                'opcache.file_update_protection': '0',
+            }
+        },
+    )
+
+    resp = client.get(url='/')
+    assert resp['status'] == 200, resp
+    assert resp['body'] == 'info.php', resp
+
+    if resp['headers'].get('X-OPcache') != '1':
+        pytest.skip('opcache is not enabled')
+
+    script.unlink()
+
+    resp = client.get(url='/')
+    assert resp['status'] == 200, resp
+    assert resp['body'] == 'info.php', resp
 
 
 # Keep the FIFO parking regression last: the pre-fix code blocks in open().

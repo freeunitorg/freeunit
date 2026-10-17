@@ -63,6 +63,7 @@ typedef struct {
     nxt_str_t                script_filename;
     nxt_str_t                script_dirname;
     nxt_unit_request_info_t  *req;
+    uint8_t                  static_script;  /* 1 bit */
 } nxt_php_run_ctx_t;
 
 
@@ -698,6 +699,19 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
             goto fail;
         }
 
+        {
+            struct stat  sb;
+
+            if (nxt_slow_path(stat((const char *) p, &sb) != 0
+                              || !S_ISREG(sb.st_mode)))
+            {
+                nxt_alert(task, "script \"%s\" is not a regular file", p);
+                nxt_free(p);
+                nxt_str_null(&target->script_filename);
+                goto fail;
+            }
+        }
+
         ret = nxt_php_dirname(&target->script_filename,
                               &target->script_dirname);
         if (nxt_slow_path(ret != NXT_OK)) {
@@ -1188,6 +1202,7 @@ nxt_php_request_handler(nxt_unit_request_info_t *req)
     ctx.script_filename = target->script_filename;
     ctx.script_dirname = target->script_dirname;
     ctx.script_name = target->script_name;
+    ctx.static_script = 1;
 
     nxt_php_execute(&ctx, r);
 }
@@ -1412,24 +1427,30 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
 
     nxt_unit_req_debug(ctx->req, "PHP execute script %s", filename);
 
-    /* Preserve path errors before PHP's virtual-CWD resolver changes errno. */
-    if (nxt_slow_path(stat(filename, &sb) != 0)) {
-        nxt_int_t  ec;
+#if (PHP_VERSION_ID >= 80100)
+    if (!ctx->static_script) {
+#endif
+        /* Preserve path errors before PHP's virtual-CWD resolver changes errno. */
+        if (nxt_slow_path(stat(filename, &sb) != 0)) {
+            nxt_int_t  ec;
 
-        ec = nxt_php_handle_fs_err(ctx->req);
-        nxt_unit_request_done(ctx->req, ec);
+            ec = nxt_php_handle_fs_err(ctx->req);
+            nxt_unit_request_done(ctx->req, ec);
 
-        return;
+            return;
+        }
+
+        if (nxt_slow_path(!S_ISREG(sb.st_mode))) {
+            nxt_int_t  ec;
+
+            ec = nxt_unit_response_init(ctx->req, NXT_HTTP_NOT_FOUND, 0, 0);
+            nxt_unit_request_done(ctx->req, ec);
+
+            return;
+        }
+#if (PHP_VERSION_ID >= 80100)
     }
-
-    if (nxt_slow_path(!S_ISREG(sb.st_mode))) {
-        nxt_int_t  ec;
-
-        ec = nxt_unit_response_init(ctx->req, NXT_HTTP_NOT_FOUND, 0, 0);
-        nxt_unit_request_done(ctx->req, ec);
-
-        return;
-    }
+#endif
 
 #if (PHP_VERSION_ID < 80100)
     fd = open(filename, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
@@ -1551,57 +1572,78 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
     nxt_php_vcwd_chdir(ctx->req, ctx->script_dirname.start);
 
 #if (PHP_VERSION_ID >= 80100)
-    /*
-     * The script is opened once, here, and php_execute_script() runs the
-     * stream this open produced.  Its nonblocking open and descriptor check
-     * also cover a file replaced after the preliminary stat().
-     * PHP's stream layer applies "open_basedir" and its diagnostics are off
-     * for the open, so a refusal is a status from here and not a warning in
-     * the body.
-     */
-    zend_stream_init_filename(&file_handle, filename);
+    if (ctx->static_script) {
+        /*
+         * A fixed "script" target was resolved and verified as a regular file
+         * under the root when the configuration was loaded.  Passing
+         * ZEND_HANDLE_FILENAME lets OPcache serve the cached script from
+         * shared memory without a per-request stat(), open(), fstat() and
+         * close().  php_check_open_basedir_ex() enforces "open_basedir"
+         * without emitting PHP diagnostics.
+         */
+        PG(display_errors) = display_errors;
 
-    errno = 0;
-    open_ret = nxt_php_stream_open(&file_handle);
-
-    PG(display_errors) = display_errors;
-
-    if (nxt_slow_path(open_ret == FAILURE)) {
-        int  status;
-
-        switch (errno) {
-        case EACCES:
-        case EPERM:
-        case ELOOP:
-        case ENFILE:
-            status = NXT_HTTP_FORBIDDEN;
-            break;
-        case ENOENT:
-        case ENOTDIR:
-        case ENAMETOOLONG:
-        case EISDIR:
-            status = NXT_HTTP_NOT_FOUND;
-            break;
-        default:
-            status = NXT_HTTP_INTERNAL_SERVER_ERROR;
-            break;
+        if (nxt_slow_path(php_check_open_basedir_ex(filename, 0) != 0)) {
+            SG(sapi_headers).http_response_code = NXT_HTTP_FORBIDDEN;
+            (void) sapi_send_headers(TSRMLS_C);
+            goto shutdown;
         }
 
-        nxt_unit_req_debug(ctx->req,
-                           "PHP script \"%s\" cannot be opened (%d: %s)",
-                           filename, errno, strerror(errno));
+        zend_stream_init_filename(&file_handle, filename);
 
-        SG(sapi_headers).http_response_code = status;
-
+    } else {
         /*
-         * Nothing writes output on this path, so the status has to be sent
-         * here.  nxt_unit_request_done() would answer its own 200.
+         * The script is opened once, here, and php_execute_script() runs the
+         * stream this open produced.  Its nonblocking open and descriptor
+         * check also cover a file replaced after the preliminary stat().
+         * PHP's stream layer applies "open_basedir" and its diagnostics are
+         * off for the open, so a refusal is a status from here and not a
+         * warning in the body.
          */
-        (void) sapi_send_headers(TSRMLS_C);
+        zend_stream_init_filename(&file_handle, filename);
 
-        zend_destroy_file_handle(&file_handle);
+        errno = 0;
+        open_ret = nxt_php_stream_open(&file_handle);
 
-        goto shutdown;
+        PG(display_errors) = display_errors;
+
+        if (nxt_slow_path(open_ret == FAILURE)) {
+            int  status;
+
+            switch (errno) {
+            case EACCES:
+            case EPERM:
+            case ELOOP:
+            case ENFILE:
+                status = NXT_HTTP_FORBIDDEN;
+                break;
+            case ENOENT:
+            case ENOTDIR:
+            case ENAMETOOLONG:
+            case EISDIR:
+                status = NXT_HTTP_NOT_FOUND;
+                break;
+            default:
+                status = NXT_HTTP_INTERNAL_SERVER_ERROR;
+                break;
+            }
+
+            nxt_unit_req_debug(ctx->req,
+                               "PHP script \"%s\" cannot be opened (%d: %s)",
+                               filename, errno, strerror(errno));
+
+            SG(sapi_headers).http_response_code = status;
+
+            /*
+             * Nothing writes output on this path, so the status has to be sent
+             * here.  nxt_unit_request_done() would answer its own 200.
+             */
+            (void) sapi_send_headers(TSRMLS_C);
+
+            zend_destroy_file_handle(&file_handle);
+
+            goto shutdown;
+        }
     }
 #endif
 
