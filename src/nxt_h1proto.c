@@ -538,7 +538,12 @@ nxt_h1p_conn_request_init(nxt_task_t *task, void *obj, void *data)
     nxt_socket_conf_joint_t  *joint;
 
     c = obj;
-    h1p = data;
+    h1p = nxt_h1p_from_conn(c);
+
+    if (nxt_slow_path(h1p == NULL)) {
+        nxt_h1p_shutdown(task, c);
+        return;
+    }
 
     nxt_debug(task, "h1p conn request init");
 
@@ -639,7 +644,12 @@ nxt_h1p_conn_request_header_parse(nxt_task_t *task, void *obj, void *data)
     nxt_http_request_t  *r;
 
     c = obj;
-    h1p = data;
+    h1p = nxt_h1p_from_conn(c);
+
+    if (nxt_slow_path(h1p == NULL)) {
+        nxt_h1p_shutdown(task, c);
+        return;
+    }
 
     nxt_debug(task, "h1p conn header parse");
 
@@ -1296,7 +1306,12 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
     nxt_event_engine_t  *engine;
 
     c = obj;
-    h1p = data;
+    h1p = nxt_h1p_from_conn(c);
+
+    if (nxt_slow_path(h1p == NULL)) {
+        nxt_h1p_shutdown(task, c);
+        return;
+    }
 
     nxt_debug(task, "h1p conn request body read");
 
@@ -2029,17 +2044,24 @@ nxt_h1p_request_discard(nxt_task_t *task, nxt_http_request_t *r,
 static void
 nxt_h1p_conn_request_error(nxt_task_t *task, void *obj, void *data)
 {
+    nxt_conn_t          *c;
     nxt_h1proto_t       *h1p;
     nxt_http_request_t  *r;
 
-    h1p = data;
+    c = obj;
+    h1p = nxt_h1p_from_conn(c);
+
+    if (nxt_slow_path(h1p == NULL)) {
+        nxt_h1p_shutdown(task, c);
+        return;
+    }
 
     nxt_debug(task, "h1p conn request error");
 
     r = h1p->request;
 
     if (nxt_slow_path(r == NULL)) {
-        nxt_h1p_shutdown(task, h1p->conn);
+        nxt_h1p_shutdown(task, c);
         return;
     }
 
