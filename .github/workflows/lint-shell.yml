@@ -36,6 +36,9 @@ jobs:
       - name: Pull shellcheck
         run: docker pull "$SHELLCHECK_IMAGE"
 
+      - name: Test the file selection
+        run: sh .github/scripts/lint-shell-test.sh
+
       - name: Check the shell scripts
         run: |
           command -v dash
