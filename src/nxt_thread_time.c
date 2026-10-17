@@ -30,8 +30,6 @@
  */
 
 
-static void nxt_time_thread(void *data);
-static void nxt_thread_time_shared(nxt_monotonic_time_t *now);
 static void nxt_thread_realtime_update(nxt_thread_t *thr,
     nxt_monotonic_time_t *now);
 static u_char *nxt_thread_time_string_no_cache(nxt_thread_t *thr,
@@ -41,20 +39,10 @@ static nxt_time_string_cache_t *nxt_thread_time_string_cache(nxt_thread_t *thr,
     nxt_atomic_uint_t slot);
 
 
-static nxt_atomic_int_t               nxt_gmtoff;
-static nxt_bool_t                     nxt_use_shared_time = 0;
-static volatile nxt_monotonic_time_t  nxt_shared_time;
-
-
 void
 nxt_thread_time_update(nxt_thread_t *thr)
 {
-    if (nxt_use_shared_time) {
-        nxt_thread_time_shared(&thr->time.now);
-
-    } else {
-        nxt_monotonic_time(&thr->time.now);
-    }
+    nxt_monotonic_time(&thr->time.now);
 }
 
 
@@ -75,101 +63,6 @@ nxt_thread_time_free(nxt_thread_t *thr)
 
         nxt_free(tsc);
         thr->time.strings = NULL;
-    }
-}
-
-
-void
-nxt_time_thread_start(nxt_msec_t interval)
-{
-    nxt_thread_link_t    *link;
-    nxt_thread_handle_t  handle;
-
-    link = nxt_zalloc(sizeof(nxt_thread_link_t));
-
-    if (nxt_fast_path(link != NULL)) {
-        link->start = nxt_time_thread;
-        link->work.data = (void *) (uintptr_t) interval;
-
-        (void) nxt_thread_create(&handle, link);
-    }
-}
-
-
-static void
-nxt_time_thread(void *data)
-{
-    nxt_nsec_t            interval, rest;
-    nxt_thread_t          *thr;
-    nxt_monotonic_time_t  now;
-
-    interval = (uintptr_t) data;
-    interval *= 1000000;
-
-    thr = nxt_thread();
-    /*
-     * The time thread is never preempted by asynchronous signals, since
-     * the signals are processed synchronously by dedicated thread.
-     */
-    thr->time.signal = -1;
-
-    nxt_log_debug(thr->log, "time thread");
-
-    nxt_memzero(&now, sizeof(nxt_monotonic_time_t));
-
-    nxt_monotonic_time(&now);
-    nxt_thread_realtime_update(thr, &now);
-
-    nxt_shared_time = now;
-    nxt_use_shared_time = 1;
-
-    for ( ;; ) {
-        rest = 1000000000 - now.realtime.nsec;
-
-        nxt_nanosleep(nxt_min(interval, rest));
-
-        nxt_monotonic_time(&now);
-        nxt_thread_realtime_update(thr, &now);
-
-        nxt_shared_time = now;
-
-#if 0
-        thr->time.now = now;
-        nxt_log_debug(thr->log, "time thread");
-#endif
-
-#if 0
-        if (nxt_exiting) {
-            nxt_use_shared_time = 0;
-            return;
-        }
-#endif
-    }
-}
-
-
-static void
-nxt_thread_time_shared(nxt_monotonic_time_t *now)
-{
-    nxt_uint_t  n;
-    nxt_time_t  t;
-    nxt_nsec_t  m, u;
-
-    /* Lock-free thread time update. */
-
-    for ( ;; ) {
-        *now = nxt_shared_time;
-
-        t = nxt_shared_time.realtime.sec;
-        n = nxt_shared_time.realtime.nsec;
-        m = nxt_shared_time.monotonic;
-        u = nxt_shared_time.update;
-
-        if (now->realtime.sec == t && now->realtime.nsec == n
-            && now->monotonic == m && now->update == u)
-        {
-            return;
-        }
     }
 }
 
@@ -363,7 +256,8 @@ nxt_thread_time_string_no_cache(nxt_thread_t *thr, nxt_time_string_t *ts,
             nxt_localtime(now.sec, &tm);
 
         } else {
-            nxt_gmtime(now.sec + nxt_gmtoff, &tm);
+            tm = thr->time.localtime;
+            nxt_gmtime(now.sec + nxt_timezone(&tm), &tm);
         }
 
     } else {
@@ -405,7 +299,7 @@ static nxt_time_string_cache_t *
 nxt_thread_time_string_cache(nxt_thread_t *thr, nxt_atomic_uint_t slot)
 {
     size_t                   size;
-    nxt_atomic_uint_t        i, nstrings;
+    nxt_uint_t               i, nstrings;
     nxt_time_string_cache_t  *tsc;
 
     if (nxt_fast_path(slot < thr->time.nstrings)) {
