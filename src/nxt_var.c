@@ -51,7 +51,7 @@ static nxt_int_t nxt_var_cache_test(nxt_lvlhsh_query_t *lhq, void *data);
 static nxt_str_t *nxt_var_cache_value(nxt_task_t *task, nxt_tstr_state_t *state,
     nxt_var_cache_t *cache, nxt_var_ref_t *ref, void *ctx);
 
-static u_char *nxt_var_next_part(u_char *start, u_char *end, nxt_str_t *part);
+u_char *nxt_var_next_part(u_char *start, u_char *end, nxt_str_t *part);
 
 
 static const nxt_lvlhsh_proto_t  nxt_var_hash_proto  nxt_aligned(64) = {
@@ -393,7 +393,7 @@ nxt_var_test(nxt_tstr_state_t *state, nxt_str_t *str, u_char *error)
 }
 
 
-static u_char *
+u_char *
 nxt_var_next_part(u_char *start, u_char *end, nxt_str_t *part)
 {
     size_t      length;

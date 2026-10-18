@@ -11,6 +11,8 @@ All cases are expressed using listeners + routes so they run without any
 language SAPI module configured.
 """
 
+import pytest
+
 from unit import port as port_map
 from unit.control import Control
 
@@ -211,3 +213,65 @@ def test_backward_compat_error_shape_preserved():
     assert 'success' not in r
     # Legacy message wording preserved verbatim.
     assert r['detail'] == 'Unknown parameter "foo".'
+
+
+def _access_log(access_format):
+    return {
+        "listeners": {"*:8080": {"pass": "routes"}},
+        "routes": [{"action": {"return": 200}}],
+        "access_log": {"path": "/tmp/a", "format": access_format},
+    }
+
+
+@pytest.mark.parametrize(
+    'variable',
+    [
+        'authorization',
+        'proxy_authorization',
+        'cookie',
+        'set_cookie',
+    ],
+)
+def test_access_log_refuses_credential_header_variable(variable):
+    r = _put(_access_log(f"$header_{variable}"))
+    assert 'error' in r
+    assert r['location']['path'] == '/access_log/format'
+    assert f'header_{variable}' in r['detail']
+
+    # The variable grammar preserves case, the header name is matched without.
+    r = _put(_access_log(f"$header_{variable.capitalize()}"))
+    assert 'error' in r
+    assert r['location']['path'] == '/access_log/format'
+
+
+def test_access_log_refuses_credential_header_in_a_template():
+    # A field is refused, not only a format that is exactly the variable.
+    r = _put(_access_log("seen $header_cookie at $time_local"))
+    assert 'error' in r
+    assert r['location']['path'] == '/access_log/format'
+    assert 'header_cookie' in r['detail']
+
+    # The braced spelling is the same variable.
+    r = _put(_access_log("${header_set_cookie}"))
+    assert 'error' in r
+    assert r['location']['path'] == '/access_log/format'
+
+
+def test_access_log_refuses_credential_header_in_object_format():
+    r = _put(
+        _access_log(
+            {
+                "time": "$time_local",
+                "auth": "Bearer $header_authorization",
+            }
+        )
+    )
+    assert 'error' in r
+    assert r['location']['path'] == '/access_log/format/auth'
+    assert 'header_authorization' in r['detail']
+
+
+def test_access_log_keeps_other_header_variables():
+    r = _put(_access_log("$header_referer $header_user_agent"))
+    assert 'success' in r
+    assert 'error' not in r
