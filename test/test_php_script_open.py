@@ -28,7 +28,7 @@ def script_tree(temp_dir):
     return root
 
 
-def load_script_tree(root, **kwargs):
+def load_script_tree(root, script=None, **kwargs):
     client.load('script_open', **kwargs)
     assert 'success' in client.conf(
         json.dumps(root), 'applications/script_open/root'
@@ -36,6 +36,10 @@ def load_script_tree(root, **kwargs):
     assert 'success' in client.conf(
         json.dumps(root), 'applications/script_open/working_directory'
     )
+    if script is not None:
+        assert 'success' in client.conf(
+            json.dumps(script), 'applications/script_open/script'
+        )
 
 
 def test_php_script_open_basedir():
@@ -251,7 +255,167 @@ def test_php_script_open_fifo_replaced_after_stat(script_tree):
                     os.close(fd)
 
 
-# Keep the FIFO parking regression last: the pre-fix code blocks in open().
+def test_php_script_open_static_script_basedir_display_errors_on(script_tree):
+    load_script_tree(
+        script_tree,
+        script='info.php',
+        options={
+            'admin': {
+                'open_basedir': '/nonexistent',
+                'display_errors': '1',
+            }
+        },
+    )
+
+    resp = client.get(url='/')
+
+    assert resp['status'] == 403, 'static script outside open_basedir'
+    assert resp['body'] == '', 'no PHP diagnostics'
+
+
+def test_php_script_open_static_script_basedir_allowed(script_tree):
+    # A control for the denial test above, with "open_basedir" set to the
+    # tree: an inverted check would refuse the fixed script inside it.
+    load_script_tree(
+        script_tree,
+        script='info.php',
+        options={'admin': {'open_basedir': script_tree}},
+    )
+
+    resp = client.get(url='/')
+
+    assert resp['status'] == 200, 'static script inside open_basedir'
+    assert resp['body'] == 'info.php', resp
+
+
+def test_php_script_open_static_script_unlinked(script_tree):
+    script = Path(f'{script_tree}/info.php')
+    load_script_tree(
+        script_tree,
+        script='info.php',
+        processes={'spare': 1, 'max': 1},
+        # display_errors is on, as in a PHP with no php.ini.  If PHP opened
+        # the fixed script itself, a removed script would answer 200 with
+        # its path in the body.  OPcache is off so that the module's open,
+        # and not the cache, answers.
+        options={'admin': {'display_errors': '1', 'opcache.enable': '0'}},
+    )
+
+    resp = client.get(url='/')
+    assert resp['status'] == 200, resp
+    assert resp['body'] == 'info.php', resp
+
+    script.unlink()
+
+    resp = client.get(url='/')
+    assert resp['status'] == 404, resp
+    assert resp['body'] == '', resp
+
+
+def test_php_script_open_static_script_directory(script_tree):
+    # A fixed target has no per-request stat(), so the opened descriptor is
+    # the only check that refuses a directory at the script path.
+    script = Path(f'{script_tree}/info.php')
+    load_script_tree(
+        script_tree,
+        script='info.php',
+        processes={'spare': 1, 'max': 1},
+        options={'admin': {'display_errors': '1', 'opcache.enable': '0'}},
+    )
+
+    resp = client.get(url='/')
+    assert resp['status'] == 200, resp
+
+    script.unlink()
+    script.mkdir()
+
+    resp = client.get(url='/')
+    assert resp['status'] == 404, resp
+    assert resp['body'] == '', resp
+
+
+def test_php_script_open_static_script_opcache(script_tree):
+    script = Path(f'{script_tree}/info.php')
+
+    def write_script(body):
+        script.write_text(
+            '<?php\n'
+            'header("X-OPcache: " . (int) ('
+            'function_exists("opcache_is_script_cached") '
+            '&& opcache_is_script_cached(__FILE__)));\n'
+            f'echo "{body}";\n',
+            encoding='utf-8',
+        )
+
+    write_script('first')
+
+    load_script_tree(
+        script_tree,
+        script='info.php',
+        processes={'spare': 1, 'max': 1},
+        options={
+            'admin': {
+                'display_errors': '1',
+                'opcache.validate_timestamps': '0',
+                'opcache.file_update_protection': '0',
+            }
+        },
+    )
+
+    resp = client.get(url='/')
+    assert resp['status'] == 200, resp
+    assert resp['body'] == 'first', resp
+
+    if resp['headers'].get('X-OPcache') != '1':
+        pytest.skip('opcache is not enabled')
+
+    # The stream the module opens does not defeat OPcache: with timestamps
+    # not validated, the compiled script is served and the new content is
+    # not read.
+    write_script('second')
+
+    resp = client.get(url='/')
+    assert resp['status'] == 200, resp
+    assert resp['body'] == 'first', resp
+
+    # The file still governs: the script is opened on every request, so a
+    # removed script is refused although OPcache holds its compiled form.
+    script.unlink()
+
+    resp = client.get(url='/')
+    assert resp['status'] == 404, resp
+    assert resp['body'] == '', resp
+
+
+# Keep the FIFO parking regressions last: the pre-fix code blocks in open().
+def test_php_script_open_z_static_script_fifo_replaced(script_tree):
+    script = f'{script_tree}/info.php'
+    load_script_tree(
+        script_tree,
+        script='info.php',
+        processes={'spare': 1, 'max': 1},
+        options={'admin': {'display_errors': '1', 'opcache.enable': '0'}},
+    )
+
+    resp = client.get(url='/')
+    assert resp['status'] == 200, resp
+
+    fifo = f'{script_tree}/replacement'
+    os.mkfifo(fifo)
+    os.replace(fifo, script)
+
+    try:
+        resp = client.get(url='/', read_timeout=2)
+
+        assert resp.get('status') == 404, resp
+        assert resp.get('body') == '', resp
+    finally:
+        # Release a blocking pre-fix open so teardown stays usable.
+        if Path(script).is_fifo():
+            fd = os.open(script, os.O_RDWR | os.O_NONBLOCK)
+            os.close(fd)
+
+
 def test_php_script_open_z_fifo(script_tree):
     os.mkfifo(f'{script_tree}/fifo.php')
     load_script_tree(

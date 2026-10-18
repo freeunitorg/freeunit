@@ -63,6 +63,7 @@ typedef struct {
     nxt_str_t                script_filename;
     nxt_str_t                script_dirname;
     nxt_unit_request_info_t  *req;
+    uint8_t                  static_script;  /* 1 bit */
 } nxt_php_run_ctx_t;
 
 
@@ -1188,6 +1189,7 @@ nxt_php_request_handler(nxt_unit_request_info_t *req)
     ctx.script_filename = target->script_filename;
     ctx.script_dirname = target->script_dirname;
     ctx.script_name = target->script_name;
+    ctx.static_script = 1;
 
     nxt_php_execute(&ctx, r);
 }
@@ -1412,23 +1414,35 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
 
     nxt_unit_req_debug(ctx->req, "PHP execute script %s", filename);
 
-    /* Preserve path errors before PHP's virtual-CWD resolver changes errno. */
-    if (nxt_slow_path(stat(filename, &sb) != 0)) {
-        nxt_int_t  ec;
+    /*
+     * A dynamic target's path comes from the request.  Its errors are
+     * preserved here, before PHP's virtual-CWD resolver changes errno, so an
+     * overlong path gets 404.  A fixed "script" target was resolved with
+     * realpath() when the configuration was loaded, so its path cannot be
+     * overlong, and the nonblocking open below with its descriptor check
+     * answers everything this stat() would: 404 for a missing script, a
+     * directory or a FIFO, and 403 for one that cannot be read.  The stat()
+     * is skipped for it; the open is not, so the file still governs what
+     * runs, whatever OPcache holds.
+     */
+    if (!ctx->static_script) {
+        if (nxt_slow_path(stat(filename, &sb) != 0)) {
+            nxt_int_t  ec;
 
-        ec = nxt_php_handle_fs_err(ctx->req);
-        nxt_unit_request_done(ctx->req, ec);
+            ec = nxt_php_handle_fs_err(ctx->req);
+            nxt_unit_request_done(ctx->req, ec);
 
-        return;
-    }
+            return;
+        }
 
-    if (nxt_slow_path(!S_ISREG(sb.st_mode))) {
-        nxt_int_t  ec;
+        if (nxt_slow_path(!S_ISREG(sb.st_mode))) {
+            nxt_int_t  ec;
 
-        ec = nxt_unit_response_init(ctx->req, NXT_HTTP_NOT_FOUND, 0, 0);
-        nxt_unit_request_done(ctx->req, ec);
+            ec = nxt_unit_response_init(ctx->req, NXT_HTTP_NOT_FOUND, 0, 0);
+            nxt_unit_request_done(ctx->req, ec);
 
-        return;
+            return;
+        }
     }
 
 #if (PHP_VERSION_ID < 80100)
