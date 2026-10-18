@@ -695,6 +695,16 @@ expression in a "match" object "if" still ends the request with a 500.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+an access log record that was not written whole was lost without a count.  A
+lost record is now counted, the next record starts after the marker
+"#freeunit: lost N record(s)", the error log gets at most one warning per
+second, GET /status reports the count, and a JSON record over 4096 bytes is
+dropped and counted.  See https://github.com/freeunitorg/freeunit/issues/541.
+</para>
+</change>
+
 </changes>
 
 

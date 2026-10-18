@@ -212,6 +212,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_router_remove_pid_soak_test.c \
     src/test/nxt_router_detached_test.c \
     src/test/nxt_router_sender_test.c \
+    src/test/nxt_router_access_log_test.c \
     src/test/nxt_router_stale_joint_test.c \
     src/test/nxt_router_websocket_test.c \
     src/test/nxt_router_engine_port_test.c \

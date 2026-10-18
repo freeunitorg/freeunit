@@ -1,6 +1,13 @@
 
 Changes with FreeUnit 1.37.1                                     04 Oct 2026
 
+    *) Bugfix: an access log record that was not written whole was lost
+       without a count. A lost record is now counted, the next record
+       starts after the marker "#freeunit: lost N record(s)", the error log
+       gets at most one warning per second, GET /status reports the count,
+       and a JSON record over 4096 bytes is dropped and counted. See
+       https://github.com/freeunitorg/freeunit/issues/541.
+
     *) Bugfix: a request whose access log "if" condition could not be
        rendered, for example when a JS expression threw, was written to
        the access log. The unrendered condition was read as true, so a

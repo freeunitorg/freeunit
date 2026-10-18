@@ -2282,15 +2282,16 @@ fail:
 static void
 nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
-    u_char               *p;
-    size_t               alloc;
-    nxt_app_t            *app;
-    nxt_buf_t            *b;
-    nxt_uint_t           type;
-    nxt_port_t           *port;
-    nxt_status_app_t     *app_stat;
-    nxt_event_engine_t   *engine;
-    nxt_status_report_t  *report;
+    u_char                   *p;
+    size_t                   alloc;
+    nxt_app_t                *app;
+    nxt_buf_t                *b;
+    nxt_uint_t               type;
+    nxt_port_t               *port;
+    nxt_status_app_t         *app_stat;
+    nxt_event_engine_t       *engine;
+    nxt_status_report_t      *report;
+    nxt_router_access_log_t  *access_log;
 
     port = nxt_runtime_port_find(task->thread->runtime,
                                  msg->port_msg.pid,
@@ -2344,6 +2345,13 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     report->apps_count = 0;
     app_stat = report->apps;
     p = b->mem.end;
+
+    access_log = nxt_router->access_log;
+
+    if (access_log != NULL) {
+        report->access_log_configured = 1;
+        report->access_log_lost = nxt_router_access_log_lost_count(access_log);
+    }
 
     nxt_queue_each(app, &nxt_router->apps, nxt_app_t, link) {
         p -= app->name.length;

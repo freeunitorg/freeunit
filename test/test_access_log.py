@@ -648,6 +648,9 @@ def test_access_log_njs_exception(
     assert wait_for_record(r'/ok', 'access.log') is not None
     assert search_in_file(r'/fail', 'access.log') is None
 
+    # A record that could not be built is counted.
+    assert client.conf_get('/status')['access_log']['lost'] == 1
+
 
 def test_access_log_incorrect(temp_dir, skip_alert):
     skip_alert(r'failed to apply new conf')
@@ -666,3 +669,94 @@ def test_access_log_incorrect(temp_dir, skip_alert):
     ), 'access_log format incorrect'
 
     assert 'error' in client.conf('$arg_', 'access_log/if')
+
+
+def test_access_log_record_bound_includes_the_newline(wait_for_record):
+    load('empty')
+    set_format({'big': '$header_x_big'})
+
+    # {"big":"..."} and "\n" are 11 bytes and the value.  4096 bytes fit.
+    assert client.get(headers={'X-Big': 'a' * 4085})['status'] == 200
+    assert wait_for_record(r'a{4085}', 'access.log') is not None
+    assert client.conf_get('/status')['access_log']['lost'] == 0
+
+    # 4097 bytes do not.
+    assert client.get(headers={'X-Big': 'b' * 4086})['status'] == 200
+    assert client.get(url='/next')['status'] == 200
+    assert (
+        wait_for_record(r'#freeunit: lost 1 record\(s\)', 'access.log')
+        is not None
+    ), 'marker'
+
+    assert not any(
+        len(line) >= 4096 for line in _read_log_lines()
+    ), 'no record over the bound reaches the file'
+
+    assert client.conf_get('/status')['access_log'] == {'lost': 1}
+
+
+def test_access_log_text_record_keeps_its_own_bound(wait_for_record):
+    load('empty')
+    set_format('$header_x_big')
+
+    # The text format shipped without a record bound; a long line is written
+    # and is not counted as a loss.  Bounding it is a separate decision.
+    assert client.get(headers={'X-Big': 'a' * 5000})['status'] == 200
+
+    assert wait_for_record(r'a{5000}', 'access.log') is not None
+    assert client.conf_get('/status')['access_log']['lost'] == 0
+
+
+def _wait_for_more(findall, pattern, count):
+    for _ in range(50):
+        if len(findall(pattern)) > count:
+            break
+
+        time.sleep(0.1)
+
+    return len(findall(pattern))
+
+
+def test_access_log_rate_limits_the_warning(findall):
+    load('empty')
+
+    assert 'success' in client.conf(
+        {'path': '/dev/full', 'format': '$request_uri'}, 'access_log'
+    )
+
+    warning = r'access log ".+": .+; the record is lost'
+    summary = r'access log records lost \d+ times'
+
+    # The moderation state outlives a test.  After 2 s the timer of an
+    # earlier loss has fired, and the next loss is reported.
+    time.sleep(2)
+
+    warnings = len(findall(warning))
+    summaries = len(findall(summary))
+
+    for _ in range(10):
+        assert client.get()['status'] == 200
+
+    status = {}
+
+    for _ in range(50):
+        status = client.conf_get('/status')
+
+        if status.get('access_log', {}).get('lost') == 10:
+            break
+
+        time.sleep(0.1)
+
+    assert status['access_log'] == {'lost': 10}, 'every loss is counted'
+
+    # The moderation timer sums up the losses it did not report.
+    assert _wait_for_more(findall, summary, summaries) == summaries + 1
+    warnings_burst = len(findall(warning)) - warnings
+
+    assert 1 <= warnings_burst <= 2, 'one warning per second'
+
+    # After the summary the next loss is reported again.
+    warnings = len(findall(warning))
+
+    assert client.get()['status'] == 200
+    assert _wait_for_more(findall, warning, warnings) == warnings + 1

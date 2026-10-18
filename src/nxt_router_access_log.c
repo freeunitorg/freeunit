@@ -20,7 +20,7 @@ typedef struct {
 
 typedef struct {
     nxt_str_t                       text;
-    nxt_router_access_log_t         *access_log;
+    uint8_t                         too_large;  /* 1 bit */
 } nxt_router_access_log_ctx_t;
 
 
@@ -44,6 +44,16 @@ static void nxt_router_access_log_warn(nxt_task_t *task,
 static void nxt_router_access_log_writer(nxt_task_t *task,
     nxt_http_request_t *r, nxt_router_access_log_t *access_log,
     nxt_router_access_log_format_t *format);
+static void nxt_router_access_log_record(nxt_task_t *task,
+    nxt_router_access_log_t *access_log, u_char *start, size_t length);
+static ssize_t nxt_router_access_log_write(nxt_fd_t fd, u_char *start,
+    size_t length);
+static void nxt_router_access_log_lost(nxt_task_t *task,
+    nxt_router_access_log_t *access_log, nxt_bool_t torn, const char *reason);
+static nxt_int_t nxt_router_access_log_mark(
+    nxt_router_access_log_t *access_log);
+static void nxt_router_access_log_reopened(
+    nxt_router_access_log_t *access_log);
 static nxt_int_t nxt_router_access_log_text(nxt_task_t *task,
     nxt_http_request_t *r, nxt_router_access_log_ctx_t *ctx, nxt_tstr_t *tstr);
 static nxt_int_t nxt_router_access_log_json(nxt_task_t *task,
@@ -122,6 +132,8 @@ nxt_router_access_log_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
             nxt_alert(task, "failed to allocate access log structure");
             return NXT_ERROR;
         }
+
+        nxt_memzero(access_log, sizeof(nxt_router_access_log_t));
 
         access_log->fd = -1;
         access_log->handler = &nxt_router_access_log_writer;
@@ -305,10 +317,12 @@ nxt_router_access_log_writer(nxt_task_t *task, nxt_http_request_t *r,
 
     ctx = nxt_mp_get(r->mem_pool, sizeof(nxt_router_access_log_ctx_t));
     if (nxt_slow_path(ctx == NULL)) {
+        nxt_router_access_log_lost(task, access_log, 0,
+                                   "no memory for the record context");
         goto close;
     }
 
-    ctx->access_log = access_log;
+    ctx->too_large = 0;
 
     if (format->tstr != NULL) {
         ret = nxt_router_access_log_text(task, r, ctx, format->tstr);
@@ -317,8 +331,15 @@ nxt_router_access_log_writer(nxt_task_t *task, nxt_http_request_t *r,
         ret = nxt_router_access_log_json(task, r, ctx, format);
     }
 
-    if (ret == NXT_OK) {
-        nxt_fd_write(ctx->access_log->fd, ctx->text.start, ctx->text.length);
+    if (ret != NXT_OK) {
+        nxt_router_access_log_lost(task, access_log, 0,
+                                   ctx->too_large
+                                   ? "the record is over the size bound"
+                                   : "the record could not be built");
+
+    } else {
+        nxt_router_access_log_record(task, access_log, ctx->text.start,
+                                     ctx->text.length);
     }
 
 close:
@@ -330,6 +351,236 @@ close:
      */
 
     nxt_http_request_close_handler(task, r, r->proto.any);
+}
+
+
+/*
+ * One record is one write(), and a short write is not resumed.  All router
+ * threads share the descriptor.  O_APPEND makes one write() atomic, not a
+ * sequence of them, so a resumed write can land after a record of another
+ * thread.  On a regular file a short write means that the file system
+ * refused the rest (ENOSPC, EDQUOT, EFBIG, EIO), so a retry fails too.  A
+ * blocking write of up to PIPE_BUF bytes to a pipe is never short.
+ *
+ * A short write is counted lost and leaves the log inside a line ("torn").
+ * The next record first writes "\n" and the marker.  Until then, records are
+ * dropped and counted.  A record that another thread started to write before
+ * the tear can still join the torn line.
+ */
+
+static void
+nxt_router_access_log_record(nxt_task_t *task,
+    nxt_router_access_log_t *access_log, u_char *start, size_t length)
+{
+    ssize_t  n;
+
+    if (nxt_slow_path(nxt_atomic_load(&access_log->gap) != 0)
+        && nxt_router_access_log_mark(access_log) != NXT_OK)
+    {
+        nxt_router_access_log_lost(task, access_log, 0,
+                                   "the log ends inside a lost record");
+        return;
+    }
+
+    n = nxt_router_access_log_write(access_log->fd, start, length);
+
+    if (nxt_slow_path(n < 0 || (size_t) n != length)) {
+        nxt_router_access_log_lost(task, access_log, n > 0,
+                                   "the write did not complete");
+    }
+}
+
+
+#if (NXT_TESTS)
+
+/* The next writes to fail without data, and the next writes to be short. */
+nxt_uint_t  nxt_router_access_log_test_failed_writes;
+nxt_uint_t  nxt_router_access_log_test_short_writes;
+
+
+void
+nxt_router_access_log_test_record(nxt_task_t *task,
+    nxt_router_access_log_t *access_log, u_char *start, size_t length)
+{
+    nxt_router_access_log_record(task, access_log, start, length);
+}
+
+
+void
+nxt_router_access_log_test_reopened(nxt_router_access_log_t *access_log)
+{
+    nxt_router_access_log_reopened(access_log);
+}
+
+#endif
+
+
+static ssize_t
+nxt_router_access_log_write(nxt_fd_t fd, u_char *start, size_t length)
+{
+    ssize_t  n;
+
+#if (NXT_TESTS)
+    if (nxt_router_access_log_test_failed_writes != 0) {
+        nxt_router_access_log_test_failed_writes--;
+        return -1;
+    }
+
+    if (nxt_router_access_log_test_short_writes != 0 && length > 1) {
+        nxt_router_access_log_test_short_writes--;
+        length /= 2;
+    }
+#endif
+
+    do {
+        n = write(fd, start, length);
+    } while (n == -1 && nxt_errno == NXT_EINTR);
+
+    return n;
+}
+
+
+/*
+ * One warning per second, not one per lost record: a full disk must not turn
+ * the access log loss into an error log flood.  The status counter carries
+ * the exact number.  The counters are 64-bit also on 32-bit builds, so they
+ * are kept under the spin lock.  It is held for a few instructions and never
+ * across a write().
+ */
+
+static void
+nxt_router_access_log_lost(nxt_task_t *task,
+    nxt_router_access_log_t *access_log, nxt_bool_t torn, const char *reason)
+{
+    static nxt_log_moderation_t  nxt_access_log_lost_log_moderation = {
+        NXT_LOG_WARN, 1, "access log records lost", NXT_LOG_MODERATION
+    };
+
+    nxt_thread_spin_lock(&access_log->lock);
+
+    access_log->lost++;
+    access_log->pending++;
+
+    if (torn) {
+        access_log->torn = 1;
+    }
+
+    nxt_atomic_store(&access_log->gap, 1);
+
+    nxt_thread_spin_unlock(&access_log->lock);
+
+    nxt_log_moderate(&nxt_access_log_lost_log_moderation, NXT_LOG_WARN,
+                     task->log, "access log \"%V\": %s; the record is lost",
+                     &access_log->path, reason);
+}
+
+
+uint64_t
+nxt_router_access_log_lost_count(nxt_router_access_log_t *access_log)
+{
+    uint64_t  lost;
+
+    nxt_thread_spin_lock(&access_log->lock);
+
+    lost = access_log->lost;
+
+    nxt_thread_spin_unlock(&access_log->lock);
+
+    return lost;
+}
+
+
+/*
+ * Writes "\n" after a torn record and the marker of the records lost since
+ * the last marker, in one write().  One thread at a time does it.  Returns
+ * NXT_OK when the log ends on a line boundary and a record can follow.
+ */
+
+static nxt_int_t
+nxt_router_access_log_mark(nxt_router_access_log_t *access_log)
+{
+    u_char      *p, buf[64];
+    size_t      length;
+    ssize_t     n;
+    uint64_t    pending;
+    nxt_int_t   ret;
+    nxt_bool_t  torn;
+
+    nxt_thread_spin_lock(&access_log->lock);
+
+    if (access_log->marking) {
+        ret = (access_log->torn || access_log->marking_torn) ? NXT_ERROR
+                                                              : NXT_OK;
+        nxt_thread_spin_unlock(&access_log->lock);
+
+        return ret;
+    }
+
+    pending = access_log->pending;
+    torn = access_log->torn;
+
+    access_log->pending = 0;
+    access_log->torn = 0;
+    access_log->marking = (pending != 0 || torn);
+    access_log->marking_torn = torn;
+
+    nxt_atomic_store(&access_log->gap, access_log->marking);
+
+    nxt_thread_spin_unlock(&access_log->lock);
+
+    if (pending == 0 && !torn) {
+        return NXT_OK;
+    }
+
+    p = buf;
+
+    if (torn) {
+        *p++ = '\n';
+    }
+
+    if (pending != 0) {
+        p = nxt_sprintf(p, buf + sizeof(buf),
+                        "#freeunit: lost %uL record(s)\n", pending);
+    }
+
+    length = p - buf;
+
+    n = nxt_router_access_log_write(access_log->fd, buf, length);
+
+    nxt_thread_spin_lock(&access_log->lock);
+
+    if (n < 0 || (size_t) n != length) {
+        access_log->pending += pending;
+
+        if (torn || n > 0) {
+            access_log->torn = 1;
+        }
+    }
+
+    access_log->marking = 0;
+    access_log->marking_torn = 0;
+
+    nxt_atomic_store(&access_log->gap,
+                     (access_log->pending != 0 || access_log->torn));
+
+    ret = access_log->torn ? NXT_ERROR : NXT_OK;
+
+    nxt_thread_spin_unlock(&access_log->lock);
+
+    return ret;
+}
+
+
+/* A reopened file is new, so it does not end inside a record. */
+
+static void
+nxt_router_access_log_reopened(nxt_router_access_log_t *access_log)
+{
+    nxt_thread_spin_lock(&access_log->lock);
+
+    access_log->torn = 0;
+
+    nxt_thread_spin_unlock(&access_log->lock);
 }
 
 
@@ -443,6 +694,15 @@ nxt_router_access_log_json(nxt_task_t *task, nxt_http_request_t *r,
     *p++ = '\n';
 
     ctx->text.length = p - ctx->text.start;
+
+    /*
+     * The printed length, not the estimate: nxt_conf_json_length() counts
+     * one "," too many.
+     */
+    if (ctx->text.length > NXT_ACCESS_LOG_MAX_RECORD) {
+        ctx->too_large = 1;
+        return NXT_ERROR;
+    }
 
     return NXT_OK;
 }
@@ -680,6 +940,9 @@ nxt_router_access_log_reopen_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         if (nxt_slow_path(dup2(msg->fd[0], access_log->fd) == -1)) {
             nxt_alert(task, "dup2(%FD, %FD) failed %E",
                       msg->fd[0], access_log->fd, nxt_errno);
+
+        } else {
+            nxt_router_access_log_reopened(access_log);
         }
     }
 

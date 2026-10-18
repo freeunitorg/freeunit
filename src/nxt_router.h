@@ -391,12 +391,43 @@ typedef struct {
 } nxt_socket_conf_joint_t;
 
 
+/*
+ * One JSON record is written with one write().  A record past this bound is
+ * dropped whole and counted: a truncated JSON object is invalid, and a
+ * consumer would drop it anyway, later and with less detail.  The bound
+ * includes the trailing newline.  It equals PIPE_BUF on Linux, so a record
+ * to a pipe is one atomic write.  The text format keeps its own line length:
+ * it is the format that shipped first, and bounding it is a separate
+ * decision.
+ */
+#define NXT_ACCESS_LOG_MAX_RECORD  4096
+
+
 struct nxt_router_access_log_s {
     void                   (*handler)(nxt_task_t *task, nxt_http_request_t *r,
                                       nxt_router_access_log_t *access_log,
                                       nxt_router_access_log_format_t *format);
     nxt_fd_t               fd;
     nxt_str_t              path;
+
+    /*
+     * The loss state.  "lock" protects the fields below it.  "gap" is 1 while
+     * any of them asks for work, so a record reads one atomic word, not the
+     * lock.
+     */
+    nxt_atomic_t           gap;
+    nxt_thread_spinlock_t  lock;
+    /* All records lost; the status report reads it. */
+    uint64_t               lost;
+    /* The records lost since the last marker. */
+    uint64_t               pending;
+    /* The log ends inside a lost record. */
+    uint8_t                torn;          /* 1 bit */
+    /* A thread writes the marker. */
+    uint8_t                marking;       /* 1 bit */
+    /* That marker starts with "\n" after a torn record. */
+    uint8_t                marking_torn;  /* 1 bit */
+
     uint32_t               count;
 };
 
@@ -429,8 +460,17 @@ void nxt_router_start_app_process_handler(nxt_task_t *task, nxt_port_t *port,
 
 void nxt_router_access_log_reopen_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
+uint64_t nxt_router_access_log_lost_count(nxt_router_access_log_t *access_log);
 
 #if (NXT_TESTS)
+/* The access log record write and its faults, for the access log test. */
+void nxt_router_access_log_test_record(nxt_task_t *task,
+    nxt_router_access_log_t *access_log, u_char *start, size_t length);
+void nxt_router_access_log_test_reopened(nxt_router_access_log_t *access_log);
+
+extern nxt_uint_t  nxt_router_access_log_test_failed_writes;
+extern nxt_uint_t  nxt_router_access_log_test_short_writes;
+
 /* The sender check of the router main port, for the router sender test. */
 nxt_bool_t nxt_router_test_msg_sender_ok(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
