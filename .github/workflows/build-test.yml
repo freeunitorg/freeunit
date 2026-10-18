@@ -1260,6 +1260,44 @@ jobs:
       - name: Build C tests (not run)
         run: make -j4 tests
 
+  # The oldest compiler the tree still builds with: GCC 4.4.7 and glibc 2.12
+  # of RHEL 6.  It has no -std=gnu11 and no __atomic_* builtins, so the job
+  # tests the fallbacks for both.  It is a best-effort target:
+  # there is no package for it.  The build runs in a plain docker run, not
+  # in a job container, because the Node of the checkout action cannot run
+  # on glibc 2.12.  CentOS 6 is end of life, so yum reads the vault.  There
+  # is no OpenSSL (1.0.1 is below the 1.1.1 floor) and no PCRE2.
+  c-tests-centos6:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build and run the C tests in CentOS 6.10
+        run: |
+          docker run --rm -v "$PWD":/src -w /src centos:6.10 bash -ec '
+            sed -i "s|^mirrorlist=|#mirrorlist=|; s|^#baseurl=http://mirror.centos.org/centos/\$releasever|baseurl=http://vault.centos.org/6.10|" \
+                /etc/yum.repos.d/CentOS-Base.repo
+            yum -y -q install gcc make which
+            gcc --version | head -1
+            ./configure --no-regex --tests
+            make -j4
+            make -j4 build/lib/libunit.a
+            make -j4 tests
+            sh .github/scripts/check-test-hooks.sh
+            ./build/tests
+            ./build/unit_close_test
+            ./build/unit_port_recv_test
+            ./build/unit_msg_test
+          '
+
+      # The container runs as root: give the files back so that the runner
+      # can clean up the workspace.
+      - name: Give the build tree back to the runner user
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" "$PWD"
+
   # The C unit-test suite with PCRE 1 instead of PCRE2.  nxt_pcre.c has its
   # own match limits, recursion limit and callout.  No other job compiles
   # it.  ubuntu-24.04 is pinned because it still ships libpcre3-dev.
