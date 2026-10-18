@@ -54,6 +54,40 @@ fi # clang
 fi # gcc
 
 
+# Compiles the program in $1 with the build flags and the flags in $2.
+# The exit status tells if the compilation succeeded.
+
+nxt_cc_try()
+{
+    printf '%s\n' "$1" > $NXT_AUTOTEST.c
+
+    /bin/sh -c "($CC $NXT_CFLAGS ${2-} $NXT_CC_OPT $CFLAGS \
+                 -c -o $NXT_AUTOTEST.o $NXT_AUTOTEST.c)" \
+        >> $NXT_AUTOCONF_ERR 2>&1
+    nxt_ret=$?
+
+    rm -f $NXT_AUTOTEST.c $NXT_AUTOTEST.o
+
+    return $nxt_ret
+}
+
+
+# Every later probe uses NXT_CFLAGS, so a -std that the compiler rejects
+# fails all of them.  GCC 4.6 knows only -std=gnu1x, and GCC 4.4 and 4.5
+# know only -std=gnu99.
+
+nxt_cc_try_std()
+{
+    for nxt_std in -std=gnu11 -std=gnu1x -std=gnu99; do
+        if nxt_cc_try 'int main(void) { return 0; }' $nxt_std; then
+            NXT_CFLAGS="$NXT_CFLAGS $nxt_std"
+            $echo " + using $nxt_std"
+            break
+        fi
+    done
+}
+
+
 case $NXT_CC_NAME in
 
     gcc)
@@ -69,7 +103,7 @@ case $NXT_CC_NAME in
 
         NXT_CFLAGS="$NXT_CFLAGS -funsigned-char"
 
-        NXT_CFLAGS="$NXT_CFLAGS -std=gnu11"
+        nxt_cc_try_std
 
         NXT_CFLAGS="$NXT_CFLAGS -O"
         NXT_CFLAGS="$NXT_CFLAGS -Wall -Wextra"
@@ -113,7 +147,7 @@ case $NXT_CC_NAME in
 
         NXT_CFLAGS="$NXT_CFLAGS -funsigned-char"
 
-        NXT_CFLAGS="$NXT_CFLAGS -std=gnu11"
+        nxt_cc_try_std
 
         NXT_CFLAGS="$NXT_CFLAGS -O"
         NXT_CFLAGS="$NXT_CFLAGS -Wall -Wextra"
@@ -147,6 +181,32 @@ case $NXT_CC_NAME in
     ;;
 
 esac
+
+
+# GCC 4.4 gives some -Wextra warnings for code that newer compilers accept.
+# The build turns off such a warning only if a probe shows that it misfires.
+
+nxt_cc_try_quiet()
+{
+    if ! nxt_cc_try "$2" && nxt_cc_try "$2" -Wno-$1; then
+        NXT_CFLAGS="$NXT_CFLAGS -Wno-$1"
+        $echo " + using -Wno-$1"
+    fi
+}
+
+# GCC 4.4 warns about the initializer "{}".
+
+nxt_cc_try_quiet missing-field-initializers \
+    'int main(void) { struct { int a; int b; } s = {}; return s.a + s.b; }'
+
+# nxt_router_prepare_msg() checks uint8_t members against UINT8_MAX in
+# nxt_slow_path().  GCC 4.4 warns that this check is always false, and
+# newer GCC does not.
+
+nxt_cc_try_quiet type-limits '#include <stdint.h>
+#define nxt_slow_path(x)  __builtin_expect((long) (x), 0)
+int main(int argc, char **argv)
+{ struct { uint8_t n; } s = { argc }; return nxt_slow_path(s.n > UINT8_MAX); }'
 
 
 # Keep the build directory out of the debug info and of __FILE__.  The
