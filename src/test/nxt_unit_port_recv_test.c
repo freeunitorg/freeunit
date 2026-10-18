@@ -33,6 +33,7 @@
 #include "nxt_main.h"
 #include "nxt_socket_msg.h"
 #include "nxt_port.h"
+#include "nxt_port_memory_int.h"
 #include "nxt_port_queue.h"
 #include "nxt_app_queue.h"
 #include "nxt_unit.h"
@@ -803,6 +804,149 @@ nxt_port_recv_test_port_msg_retry_pending(nxt_unit_ctx_t *ctx,
 }
 
 
+/* A segment the router would hand over, from this process to itself. */
+
+static int
+nxt_port_recv_test_segment(nxt_unit_ctx_t *ctx, uint32_t id)
+{
+    int                     fd;
+    nxt_port_msg_t          msg;
+    nxt_port_mmap_header_t  *hdr;
+
+    fd = nxt_port_recv_test_shm(PORT_MMAP_SIZE);
+    if (fd == -1) {
+        return NXT_UNIT_ERROR;
+    }
+
+    hdr = mmap(NULL, PORT_MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
+               fd, 0);
+    if (hdr == MAP_FAILED) {
+        perror("mmap");
+        close(fd);
+        return NXT_UNIT_ERROR;
+    }
+
+    hdr->id = id;
+    hdr->src_pid = getpid();
+    hdr->dst_pid = getpid();
+
+    munmap(hdr, PORT_MMAP_SIZE);
+
+    memset(&msg, 0, sizeof(msg));
+
+    msg.pid = getpid();
+    msg.type = _NXT_PORT_MSG_MMAP;
+    msg.last = 1;
+
+    return nxt_unit_test_process_msg(ctx, &msg, sizeof(msg), fd);
+}
+
+
+static void
+nxt_port_recv_test_port_msg_repark(nxt_unit_ctx_t *ctx, int run_once,
+    const char *name)
+{
+    int                  rc;
+    u_char               buf[sizeof(nxt_port_msg_t)
+                             + 2 * sizeof(nxt_port_mmap_msg_t)];
+    pid_t                pid;
+    nxt_unit_ctx_t       *ctx2;
+    nxt_port_msg_t       msg;
+    nxt_port_mmap_msg_t  rec[2];
+
+    /*
+     * A message of "ctx2" parks on segment 9, and its second record is in
+     * segment 10.  Segment 9 comes to the main context, which puts the
+     * message back to the pending messages of "ctx2" and the wake-up into
+     * the read port queue of "ctx2".  The call reads the wake-up, and the
+     * pending message parks again, on segment 10.  A message was read, so
+     * more can wait in the queue: the call must report NXT_UNIT_OK.  It
+     * reported the NXT_UNIT_AGAIN of the pending message, which makes an
+     * embedder stop.  The next call finds the queue empty and reports
+     * NXT_UNIT_AGAIN.  nxt_unit_run_once() waits for a message, so it gets
+     * no second call.  The alarm catches a wait.
+     *
+     * The context of main() is offline after its empty read, and the
+     * queues are shared with the children, so a new context is used.
+     */
+
+    pid = fork();
+
+    if (pid == 0) {
+        ctx2 = nxt_unit_ctx_alloc(ctx, NULL);
+        if (ctx2 == NULL) {
+            _exit(6);
+        }
+
+        nxt_unit_test_ctx_set_ready(ctx2, 1);
+
+        memset(&msg, 0, sizeof(msg));
+
+        msg.stream = 7;
+        msg.pid = getpid();
+        msg.type = _NXT_PORT_MSG_RPC_READY;
+        msg.last = 1;
+        msg.mmap = 1;
+
+        rec[0].mmap_id = 9;
+        rec[0].chunk_id = 0;
+        rec[0].size = 100;
+
+        rec[1].mmap_id = 10;
+        rec[1].chunk_id = 0;
+        rec[1].size = 100;
+
+        memcpy(buf, &msg, sizeof(msg));
+        memcpy(buf + sizeof(msg), rec, sizeof(rec));
+
+        (void) nxt_unit_test_process_msg(ctx2, buf, sizeof(buf), -1);
+
+        if (nxt_unit_test_parked_rbufs(ctx2) != 1) {
+            _exit(1);
+        }
+
+        if (nxt_port_recv_test_segment(ctx, 9) != NXT_UNIT_OK
+            || nxt_unit_test_parked_rbufs(ctx2) != 0)
+        {
+            _exit(2);
+        }
+
+        alarm(5);
+
+        if (run_once) {
+            rc = nxt_unit_run_once(ctx2);
+
+        } else {
+            rc = nxt_unit_process_port_msg(ctx2,
+                                           nxt_unit_test_ctx_read_port(ctx2));
+        }
+
+        if (rc != NXT_UNIT_OK) {
+            fprintf(stderr, "port_recv test: %s: %d after a message was read\n",
+                    name, rc);
+
+            _exit(3);
+        }
+
+        if (nxt_unit_test_parked_rbufs(ctx2) != 1) {
+            _exit(4);
+        }
+
+        if (!run_once
+            && nxt_unit_process_port_msg(ctx2,
+                                         nxt_unit_test_ctx_read_port(ctx2))
+               != NXT_UNIT_AGAIN)
+        {
+            _exit(5);
+        }
+
+        _exit(0);
+    }
+
+    nxt_port_recv_test_child_wait(pid, name);
+}
+
+
 static void
 nxt_port_recv_test_ms_sleep(int ms)
 {
@@ -1372,6 +1516,10 @@ main(void)
         "nxt_unit_process_port_msg() runs a pending finish retry");
     nxt_port_recv_test_port_msg_retry_pending(ctx,
         "nxt_unit_process_port_msg() asks for a call back, no wait");
+    nxt_port_recv_test_port_msg_repark(ctx, 0,
+        "nxt_unit_process_port_msg() asks for a call after a read");
+    nxt_port_recv_test_port_msg_repark(ctx, 1,
+        "nxt_unit_run_once() asks for a call after a read");
     nxt_port_recv_test_port_msg_retry_timeout(ctx,
         "nxt_unit_detached_retry_timeout() paces the call back");
     nxt_port_recv_test_shared_quit_retry(ctx, 1, NXT_UNIT_OK,

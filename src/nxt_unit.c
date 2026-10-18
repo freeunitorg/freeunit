@@ -6616,7 +6616,14 @@ nxt_unit_run_once_impl(nxt_unit_ctx_t *ctx)
 
     nxt_unit_process_ready_req(ctx);
 
-    return rc;
+    /*
+     * A message was read; ask for another call, as
+     * nxt_unit_process_port_msg_impl() does.  NXT_UNIT_AGAIN from the
+     * pending messages only means that one was parked again, and an
+     * embedder with its own event loop takes it as "stop".
+     */
+
+    return NXT_UNIT_OK;
 }
 
 
@@ -7384,7 +7391,18 @@ recv:
 
     nxt_unit_process_ready_req(ctx);
 
-    return rc;
+    /*
+     * A message was read; ask for another call.  The next call answers
+     * NXT_UNIT_AGAIN when the queue is empty.  Do not pass on the result of
+     * the pending messages: NXT_UNIT_AGAIN there means that one was parked
+     * again, for a segment it waits for, and it makes the embedder stop and
+     * wait for the port to become readable.  But the router signals the
+     * port only when its queue turns non-empty, so a queue that is still
+     * full stays silent, and the MMAP reply that the parked message waits
+     * for needs room in that same queue.
+     */
+
+    return NXT_UNIT_OK;
 }
 
 
