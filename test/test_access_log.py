@@ -634,3 +634,89 @@ def test_access_log_incorrect(temp_dir, skip_alert):
     ), 'access_log format incorrect'
 
     assert 'error' in client.conf('$arg_', 'access_log/if')
+
+
+def test_access_log_drops_an_oversized_record(wait_for_record):
+    load('empty')
+    set_format({'big': '$header_x_big'})
+
+    # The value and its newline are over the 4096-byte JSON record bound.
+    assert client.get(headers={'X-Big': 'a' * 5000})['status'] == 200
+
+    # The next record is written, so the gap gets its marker.
+    assert client.get()['status'] == 200
+
+    assert (
+        wait_for_record(r'#freeunit: lost 1 record\(s\)', 'access.log')
+        is not None
+    ), 'marker'
+
+    assert not any(
+        len(line) > 4096 for line in _read_log_lines()
+    ), 'no record over the bound reaches the file'
+
+    assert client.conf_get('/status')['access_log'] == {
+        'path': f'{option.temp_dir}/access.log',
+        'lost': 1,
+    }
+
+
+def test_access_log_text_record_keeps_its_own_bound(wait_for_record):
+    load('empty')
+    set_format('$header_x_big')
+
+    # The text format shipped without a record bound; a long line is written
+    # and is not counted as a loss.  Bounding it is a separate decision.
+    assert client.get(headers={'X-Big': 'a' * 5000})['status'] == 200
+
+    assert wait_for_record(r'a{5000}', 'access.log') is not None
+    assert client.conf_get('/status')['access_log']['lost'] == 0
+
+
+def test_access_log_counts_a_failed_write():
+    load('empty')
+
+    assert 'success' in client.conf(
+        {'path': '/dev/full', 'format': '$request_uri'}, 'access_log'
+    )
+
+    assert client.get()['status'] == 200
+
+    status = {}
+
+    for _ in range(50):
+        status = client.conf_get('/status')
+
+        if status.get('access_log', {}).get('lost'):
+            break
+
+        time.sleep(0.1)
+
+    assert status['access_log'] == {'path': '/dev/full', 'lost': 1}
+
+
+def test_access_log_rate_limits_the_warning(findall):
+    load('empty')
+
+    assert 'success' in client.conf(
+        {'path': '/dev/full', 'format': '$request_uri'}, 'access_log'
+    )
+
+    for _ in range(10):
+        assert client.get()['status'] == 200
+
+    status = {}
+
+    for _ in range(50):
+        status = client.conf_get('/status')
+
+        if status.get('access_log', {}).get('lost') == 10:
+            break
+
+        time.sleep(0.1)
+
+    assert status['access_log']['lost'] == 10, 'every loss is counted'
+
+    assert (
+        len(findall(r'access log ".+": .+; the record is lost')) <= 2
+    ), 'one warning per second, not one per lost record'

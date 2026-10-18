@@ -2282,15 +2282,16 @@ fail:
 static void
 nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
-    u_char               *p;
-    size_t               alloc;
-    nxt_app_t            *app;
-    nxt_buf_t            *b;
-    nxt_uint_t           type;
-    nxt_port_t           *port;
-    nxt_status_app_t     *app_stat;
-    nxt_event_engine_t   *engine;
-    nxt_status_report_t  *report;
+    u_char                   *p;
+    size_t                   alloc;
+    nxt_app_t                *app;
+    nxt_buf_t                *b;
+    nxt_uint_t               type;
+    nxt_port_t               *port;
+    nxt_status_app_t         *app_stat;
+    nxt_event_engine_t       *engine;
+    nxt_status_report_t      *report;
+    nxt_router_access_log_t  *access_log;
 
     port = nxt_runtime_port_find(task->thread->runtime,
                                  msg->port_msg.pid,
@@ -2300,7 +2301,13 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         return;
     }
 
+    access_log = nxt_router->access_log;
+
     alloc = sizeof(nxt_status_report_t);
+
+    if (access_log != NULL) {
+        alloc += access_log->path.length;
+    }
 
     nxt_queue_each(app, &nxt_router->apps, nxt_app_t, link) {
 
@@ -2344,6 +2351,18 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     report->apps_count = 0;
     app_stat = report->apps;
     p = b->mem.end;
+
+    if (access_log != NULL) {
+        p -= access_log->path.length;
+
+        nxt_memcpy(p, access_log->path.start, access_log->path.length);
+
+        report->access_log_configured = 1;
+        report->access_log_lost =
+            (uint64_t) nxt_atomic_load(&access_log->lost);
+        report->access_log_path.length = access_log->path.length;
+        report->access_log_path.start = (u_char *) (p - b->mem.pos);
+    }
 
     nxt_queue_each(app, &nxt_router->apps, nxt_app_t, link) {
         p -= app->name.length;

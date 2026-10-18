@@ -20,7 +20,7 @@ typedef struct {
 
 typedef struct {
     nxt_str_t                       text;
-    nxt_router_access_log_t         *access_log;
+    uint8_t                         too_large;  /* 1 bit */
 } nxt_router_access_log_ctx_t;
 
 
@@ -37,6 +37,10 @@ struct nxt_router_access_log_format_s {
 };
 
 
+/* Two retries complete a short write on a blocking descriptor. */
+#define NXT_ACCESS_LOG_WRITE_RETRIES  2
+
+
 static nxt_router_access_log_format_t *nxt_router_access_log_format_create(
     nxt_task_t *task, nxt_router_conf_t *rtcf, nxt_conf_value_t *value);
 static void nxt_router_access_log_warn(nxt_task_t *task,
@@ -44,6 +48,12 @@ static void nxt_router_access_log_warn(nxt_task_t *task,
 static void nxt_router_access_log_writer(nxt_task_t *task,
     nxt_http_request_t *r, nxt_router_access_log_t *access_log,
     nxt_router_access_log_format_t *format);
+static nxt_int_t nxt_router_access_log_write(
+    nxt_router_access_log_t *access_log, u_char *start, size_t length);
+static void nxt_router_access_log_lost(nxt_task_t *task,
+    nxt_router_access_log_t *access_log, const char *reason);
+static void nxt_router_access_log_mark_lost(
+    nxt_router_access_log_t *access_log);
 static nxt_int_t nxt_router_access_log_text(nxt_task_t *task,
     nxt_http_request_t *r, nxt_router_access_log_ctx_t *ctx, nxt_tstr_t *tstr);
 static nxt_int_t nxt_router_access_log_json(nxt_task_t *task,
@@ -126,6 +136,9 @@ nxt_router_access_log_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
         access_log->fd = -1;
         access_log->handler = &nxt_router_access_log_writer;
         access_log->count = 1;
+
+        nxt_atomic_store(&access_log->lost, 0);
+        nxt_atomic_store(&access_log->pending, 0);
 
         access_log->path.length = alcf.path.length;
         access_log->path.start = (u_char *) access_log
@@ -305,10 +318,12 @@ nxt_router_access_log_writer(nxt_task_t *task, nxt_http_request_t *r,
 
     ctx = nxt_mp_get(r->mem_pool, sizeof(nxt_router_access_log_ctx_t));
     if (nxt_slow_path(ctx == NULL)) {
+        nxt_router_access_log_lost(task, access_log,
+                                   "no memory for the record context");
         goto close;
     }
 
-    ctx->access_log = access_log;
+    ctx->too_large = 0;
 
     if (format->tstr != NULL) {
         ret = nxt_router_access_log_text(task, r, ctx, format->tstr);
@@ -317,8 +332,21 @@ nxt_router_access_log_writer(nxt_task_t *task, nxt_http_request_t *r,
         ret = nxt_router_access_log_json(task, r, ctx, format);
     }
 
-    if (ret == NXT_OK) {
-        nxt_fd_write(ctx->access_log->fd, ctx->text.start, ctx->text.length);
+    if (ret != NXT_OK) {
+        nxt_router_access_log_lost(task, access_log,
+                                   ctx->too_large
+                                   ? "the record is over the size bound"
+                                   : "the record could not be built");
+
+    } else if (nxt_router_access_log_write(access_log, ctx->text.start,
+                                           ctx->text.length)
+               != NXT_OK)
+    {
+        nxt_router_access_log_lost(task, access_log,
+                                   "the write did not complete");
+
+    } else {
+        nxt_router_access_log_mark_lost(access_log);
     }
 
 close:
@@ -330,6 +358,112 @@ close:
      */
 
     nxt_http_request_close_handler(task, r, r->proto.any);
+}
+
+
+/*
+ * One record is one write() and one retry loop: a short write is completed
+ * with the same buffer, so the record is never split into two records or
+ * resumed after a later record has been appended.  A descriptor that keeps
+ * refusing the remainder ends the loop, and the caller counts one loss,
+ * whichever way the record was lost.
+ */
+
+static nxt_int_t
+nxt_router_access_log_write(nxt_router_access_log_t *access_log, u_char *start,
+    size_t length)
+{
+    size_t      left, n;
+    ssize_t     res;
+    u_char      *p;
+    nxt_uint_t  retries;
+
+    p = start;
+    left = length;
+    retries = 0;
+
+    for ( ;; ) {
+        res = write(access_log->fd, p, left);
+
+        if (res > 0) {
+            n = res;
+            p += n;
+            left -= n;
+
+            if (left == 0) {
+                return NXT_OK;
+            }
+
+            if (++retries > NXT_ACCESS_LOG_WRITE_RETRIES) {
+                return NXT_ERROR;
+            }
+
+            continue;
+        }
+
+        if (res == -1 && nxt_errno == NXT_EINTR) {
+            continue;
+        }
+
+        return NXT_ERROR;
+    }
+}
+
+
+/*
+ * One warning per second, not one per lost record: a full disk must not turn
+ * the access log loss into an error log flood.  The status counter carries
+ * the exact number.
+ */
+
+static void
+nxt_router_access_log_lost(nxt_task_t *task,
+    nxt_router_access_log_t *access_log, const char *reason)
+{
+    static nxt_log_moderation_t  nxt_access_log_lost_log_moderation = {
+        NXT_LOG_WARN, 0, "access log records lost", NXT_LOG_MODERATION
+    };
+
+    nxt_atomic_fetch_add(&access_log->lost, 1);
+    nxt_atomic_fetch_add(&access_log->pending, 1);
+
+    nxt_log_moderate(&nxt_access_log_lost_log_moderation, NXT_LOG_WARN,
+                     task->log, "access log \"%V\": %s; the record is lost",
+                     &access_log->path, reason);
+}
+
+
+/*
+ * The marker is written with the first record that gets through after a gap,
+ * so a reader of the log itself sees where the gap is.  It is best-effort: a
+ * marker the descriptor refuses changes nothing, the counter already moved.
+ */
+
+static void
+nxt_router_access_log_mark_lost(nxt_router_access_log_t *access_log)
+{
+    u_char             buf[64];
+    u_char             *p;
+    nxt_str_t          text;
+    nxt_atomic_uint_t  lost;
+
+    if (nxt_atomic_load(&access_log->pending) == 0) {
+        return;
+    }
+
+    lost = nxt_atomic_xchg(&access_log->pending, 0);
+
+    if (lost == 0) {
+        return;
+    }
+
+    p = nxt_sprintf(buf, buf + sizeof(buf),
+                    "#freeunit: lost %uA record(s)\n", lost);
+
+    text.start = buf;
+    text.length = p - buf;
+
+    (void) nxt_router_access_log_write(access_log, text.start, text.length);
 }
 
 
@@ -425,10 +559,22 @@ nxt_router_access_log_json(nxt_task_t *task, nxt_http_request_t *r,
         nxt_conf_set_member_string(value, &member->name, &str, i);
     }
 
-    /* The record and "\n". */
+    /*
+     * The record and "\n".  nxt_conf_json_length() reports an unrepresentable
+     * length as SIZE_MAX; nxt_size_add() refuses the addition rather than
+     * wrapping, so the record never reaches nxt_mp_nget() with that size.
+     * A record over the bound is dropped whole: a truncated object is not
+     * JSON, and a consumer would drop it anyway, later and with less detail.
+     */
+
     if (nxt_slow_path(nxt_size_add(nxt_conf_json_length(value, NULL), 1, &size)
                       != 0))
     {
+        return NXT_ERROR;
+    }
+
+    if (size > NXT_ACCESS_LOG_MAX_RECORD) {
+        ctx->too_large = 1;
         return NXT_ERROR;
     }
 

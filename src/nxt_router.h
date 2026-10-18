@@ -391,12 +391,29 @@ typedef struct {
 } nxt_socket_conf_joint_t;
 
 
+/*
+ * One JSON record is written with one write().  A record past this bound is
+ * dropped whole and counted: a truncated JSON object is invalid, and a
+ * consumer would drop it anyway, later and with less detail.  The bound
+ * includes the trailing newline.  The text format keeps its own line length:
+ * it is the format that shipped first, and bounding it is a separate
+ * decision.
+ */
+#define NXT_ACCESS_LOG_MAX_RECORD  4096
+
+
 struct nxt_router_access_log_s {
     void                   (*handler)(nxt_task_t *task, nxt_http_request_t *r,
                                       nxt_router_access_log_t *access_log,
                                       nxt_router_access_log_format_t *format);
     nxt_fd_t               fd;
     nxt_str_t              path;
+
+    /* Records the writer dropped; read by the status report. */
+    nxt_atomic_t           lost;
+    /* Dropped records not yet marked in the log itself. */
+    nxt_atomic_t           pending;
+
     uint32_t               count;
 };
 
