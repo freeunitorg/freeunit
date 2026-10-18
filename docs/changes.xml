@@ -663,6 +663,15 @@ back at the connection, and the completion path leaves a zero connection alone.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+with --hardening=default or strict, the Perl module did not build when the
+ccflags of Perl had -D_FORTIFY_SOURCE=2, as the perl Docker images have.
+The compiler stopped with '"_FORTIFY_SOURCE" redefined'.  configure now
+removes the -D_FORTIFY_SOURCE of Perl when it added its own.
+</para>
+</change>
+
 </changes>
 
 
