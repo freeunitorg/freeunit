@@ -567,7 +567,10 @@ stops a FIFO from parking the worker, and a script outside "open_basedir" gets
 403.  The open is nonblocking and the opened file is checked, so replacing a
 regular script with a FIFO cannot park the worker.  Filesystem errors are
 preserved before PHP resolves the path, so an overlong script path gets 404.
-Neither answer carries PHP's diagnostics.
+Neither answer carries PHP's diagnostics.  A fixed "script" that is missing
+still answers 404, but PHP now starts the request first.  With
+"session.auto_start" on, such a 404 carries a new PHPSESSID cookie and a
+Content-type header.
 See https://github.com/freeunitorg/freeunit/issues/715.
 </para>
 </change>
@@ -614,6 +617,46 @@ a proxied request, and a h1proto whose connection is gone has a zero conn, so
 an object that was neither reached the read with a zero connection: a read of
 address 0x50.  The slot is now read as a h1proto only when the object points
 back at the connection, and the completion path leaves a zero connection alone.
+</para>
+</change>
+
+<change type="change">
+<para>
+tools/unitc and tools/setup-unit now run with /bin/sh and no longer need bash.
+They work with dash, BusyBox ash and the BSD sh.  unitc now exits with 4 when
+curl reports an HTTP error; before, it exited with 0.  The response, edit and
+cache files that unitc writes under /tmp are created with umask 077, because
+they hold the configuration.  A file name or URI with a space now reaches curl
+as one argument.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+while an application waited for the router to free shared memory, libunit kept
+each message that arrived in the meantime in a read buffer of 16 KiB, also when
+the message was 20 bytes.  A client that reads slowly and sends fast could make
+the application hold thousands of such buffers.  A waiting message now takes a
+copy of its own size.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+in a debug build of the PHP module, a script that could not be opened could
+answer 404 instead of 403, or 503 instead of 403 or 404.  The debug log call
+changed errno before the module chose the status; on a minimal Alpine image a
+denied script answered 404 on every request.  Release builds were not affected.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+data races between the threads of unitd and libunit on shared counters,
+reference counts, queue entries and the time cache.  The lock-free port queues
+now read a queue entry with an acquire load, so a consumer that sees the entry
+also sees the payload written before it, also on platforms with weak memory
+ordering, such as arm64.  None of these races is known to have caused a crash.
 </para>
 </change>
 
