@@ -109,6 +109,7 @@ nxt_int_t nxt_router_stale_joint_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_websocket_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_prepare_msg_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_engine_port_test(nxt_thread_t *thr);
+nxt_int_t nxt_router_access_log_test(nxt_thread_t *thr);
 nxt_int_t nxt_main_start_process_reply_test(nxt_thread_t *thr);
 nxt_int_t nxt_main_file_store_test(nxt_thread_t *thr);
 nxt_int_t nxt_main_store_test(nxt_thread_t *thr);

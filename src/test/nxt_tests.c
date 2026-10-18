@@ -439,6 +439,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_router_access_log_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_main_start_process_reply_test(thr) != NXT_OK) {
         return 1;
     }

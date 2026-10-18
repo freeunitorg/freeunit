@@ -5483,6 +5483,89 @@ paths:
                 Closed:
                   value: 1307
 
+  /status/access_log:
+    summary: "Endpoint for the `access_log` status object"
+    get:
+      operationId: getStatusAccessLog
+      summary: "Retrieve the access log status object"
+      description: "Retrieves the `access_log` status object that represents
+        the access log's write health."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `access_log` object exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/statusAccessLog"
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/statusAccessLog"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /status/access_log/path:
+    summary: "Endpoint for the access log path"
+    get:
+      operationId: getStatusAccessLogPath
+      summary: "Retrieve the access log path"
+      description: "Retrieves the path of the configured access log."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `path` string exists in the configuration."
+
+          content:
+            application/json:
+              schema:
+                type: string
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/statusAccessLogPath"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /status/access_log/lost:
+    summary: "Endpoint for the lost access log records number"
+    get:
+      operationId: getStatusAccessLogLost
+      summary: "Retrieve the lost access log records number"
+      description: "Retrieves the number of access log records dropped
+        because the record could not be built or the write did not
+        complete."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `lost` number exists in the configuration."
+
+          content:
+            application/json:
+              schema:
+                type: integer
+                format: int64
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/statusAccessLogLost"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
   /status/telemetry:
     summary: "Endpoint for the `telemetry` status object"
     get:
@@ -6684,6 +6767,9 @@ components:
           closed: 1050
         requests:
           total: 1307
+        access_log:
+          path: "/var/log/unit/access.log"
+          lost: 0
         telemetry:
           spans:
             exported: 4096
@@ -6795,6 +6881,21 @@ components:
       summary: "Regular requests status object"
       value:
         total: 1307
+
+    # /status/access_log
+    statusAccessLog:
+      summary: "Regular access log status object"
+      value:
+        path: "/var/log/unit/access.log"
+        lost: 0
+
+    statusAccessLogPath:
+      summary: "Path of the configured access log"
+      value: "/var/log/unit/access.log"
+
+    statusAccessLogLost:
+      summary: "Access log records dropped by the writer"
+      value: 0
 
     # /status/telemetry
     statusTelemetry:
@@ -8388,6 +8489,9 @@ components:
         requests:
           $ref: "#/components/schemas/statusRequests"
 
+        access_log:
+          $ref: "#/components/schemas/statusAccessLog"
+
         telemetry:
           $ref: "#/components/schemas/statusTelemetry"
 
@@ -8487,6 +8591,24 @@ components:
           type: integer
           format: int64
           description: "Total non-API requests during the instance’s lifetime."
+
+    # /status/access_log
+    statusAccessLog:
+      description: "Represents the access log's write health. The object is
+        omitted unless the configuration has an access log, so its absence is
+        how a client tells a log that is off from a log that lost nothing."
+      type: object
+      properties:
+        path:
+          type: string
+          description: "Path of the configured access log."
+
+        lost:
+          type: integer
+          format: int64
+          description: "Records dropped because the record could not be
+            built or the write did not complete. Cumulative for the live
+            log."
 
     # /status/telemetry
     statusTelemetry:

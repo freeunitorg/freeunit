@@ -666,3 +666,153 @@ def test_access_log_incorrect(temp_dir, skip_alert):
     ), 'access_log format incorrect'
 
     assert 'error' in client.conf('$arg_', 'access_log/if')
+
+
+def test_access_log_writes_a_large_record(wait_for_record):
+    load('empty')
+
+    # 1.37.1 has no record bound: the JSON object and the text format both
+    # write a long record whole, and it is not counted as a loss.  The bound
+    # and the per-field cap are 1.38 decisions.
+    set_format({'big': '$header_x_big'})
+
+    assert client.get(headers={'X-Big': 'a' * 5000})['status'] == 200
+
+    assert wait_for_record(r'a{5000}', 'access.log') is not None, 'json'
+    assert client.conf_get('/status')['access_log']['lost'] == 0
+
+    set_format('$header_x_big')
+
+    assert client.get(headers={'X-Big': 'b' * 5000})['status'] == 200
+
+    assert wait_for_record(r'b{5000}', 'access.log') is not None, 'text'
+    assert client.conf_get('/status')['access_log']['lost'] == 0
+
+
+def test_access_log_marks_a_build_loss(require, wait_for_record, skip_alert):
+    require({'modules': {'njs': 'any'}})
+
+    load('empty')
+    set_format('`${args.x.length}`')
+    skip_alert(r'js exception:')
+
+    # No "x": the template throws, so the record cannot be built.  The loss
+    # is counted; the next good record writes the marker on its own line.
+    assert client.get()['status'] == 200
+
+    status = {}
+
+    for _ in range(50):
+        status = client.conf_get('/status')
+
+        if status.get('access_log', {}).get('lost'):
+            break
+
+        time.sleep(0.1)
+
+    assert status['access_log']['lost'] == 1, 'build failure counted'
+
+    assert client.get(url='/?x=1')['status'] == 200
+
+    assert (
+        wait_for_record(r'#freeunit: lost 1 record\(s\)', 'access.log')
+        is not None
+    ), 'marker'
+    assert wait_for_record(r'^1$', 'access.log') is not None, 'next record'
+
+    # The marker comes first, where the lost record would have been, and a
+    # record that was never written leaves no blank line.
+    with open(f'{option.temp_dir}/access.log', 'rb') as f:
+        assert f.read() == b'#freeunit: lost 1 record(s)\n1\n', 'marker first'
+
+
+def test_access_log_status_absent():
+    load('empty')
+
+    assert 'success' in client.conf_delete('access_log')
+
+    assert 'access_log' not in client.conf_get('/status')
+    assert 'error' in client.conf_get('/status/access_log')
+
+
+def test_access_log_counts_a_failed_write():
+    load('empty')
+
+    assert 'success' in client.conf(
+        {'path': '/dev/full', 'format': '$request_uri'}, 'access_log'
+    )
+
+    assert client.get()['status'] == 200
+
+    status = {}
+
+    for _ in range(50):
+        status = client.conf_get('/status')
+
+        if status.get('access_log', {}).get('lost'):
+            break
+
+        time.sleep(0.1)
+
+    assert status['access_log'] == {'path': '/dev/full', 'lost': 1}
+
+
+def test_access_log_rate_limits_the_warning(findall):
+    load('empty')
+
+    assert 'success' in client.conf(
+        {'path': '/dev/full', 'format': '$request_uri'}, 'access_log'
+    )
+
+    # The loss warning moderation is one static per router process, and the
+    # log reader only sees text written after its previous read.  An earlier
+    # test may have used the current moderation second, so cross the interval
+    # before the first loss this test relies on.
+    time.sleep(1.1)
+
+    for _ in range(10):
+        assert client.get()['status'] == 200
+
+    status = {}
+
+    for _ in range(50):
+        status = client.conf_get('/status')
+
+        if status.get('access_log', {}).get('lost') == 10:
+            break
+
+        time.sleep(0.1)
+
+    assert status['access_log']['lost'] == 10, 'every loss is counted'
+
+    time.sleep(0.1)
+
+    first = len(findall(r'access log ".+": .+; the record is lost'))
+
+    assert first >= 1, 'the first second warns'
+
+    # Cross the moderation interval: a second loss after it must warn again.
+    # With the old limit 0 the first message is allowed and every later one
+    # is suppressed forever, so this assertion fails on the base code.
+
+    time.sleep(1.2)
+
+    assert client.get()['status'] == 200
+
+    for _ in range(50):
+        status = client.conf_get('/status')
+
+        if status.get('access_log', {}).get('lost') == 11:
+            break
+
+        time.sleep(0.1)
+
+    assert status['access_log']['lost'] == 11
+
+    time.sleep(0.1)
+
+    second = len(findall(r'access log ".+": .+; the record is lost'))
+
+    assert (
+        second == first + 1
+    ), 'one warning per second, not one per lost record'

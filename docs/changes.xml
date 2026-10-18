@@ -705,6 +705,15 @@ takes 32% fewer router instructions.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+the access log write result was ignored: a short write or a failed write lost
+a record with no count and no mark in the log. A record that cannot be built
+or written is now counted, the next record writes "#freeunit: lost N
+record(s)", and GET /status reports the count.
+</para>
+</change>
+
 </changes>
 
 

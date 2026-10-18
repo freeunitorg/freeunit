@@ -502,6 +502,12 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        only when the object points back at the connection, and the
        completion path leaves a zero connection alone.
 
+    *) Bugfix: the access log write result was ignored: a short write or a
+       failed write lost a record with no count and no mark in the log. A
+       record that cannot be built or written is now counted, the next
+       record writes "#freeunit: lost N record(s)", and GET /status reports
+       the count.
+
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 

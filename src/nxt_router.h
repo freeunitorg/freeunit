@@ -47,6 +47,8 @@ typedef struct {
     nxt_queue_t              apps;     /* of nxt_app_t */
 
     nxt_router_access_log_t  *access_log;
+    /* The live logs of all configurations; under the lock. */
+    nxt_queue_t              access_logs;
 } nxt_router_t;
 
 
@@ -397,6 +399,35 @@ struct nxt_router_access_log_s {
                                       nxt_router_access_log_format_t *format);
     nxt_fd_t               fd;
     nxt_str_t              path;
+
+    /*
+     * One mutex per log.  O_APPEND makes a single write() atomic, not the
+     * retry loop, the marker or the repair of a torn record: all of them are
+     * one critical section, or two engines interleave and both records are
+     * unreadable.  The reopen replaces the descriptor under it too, so a
+     * record and its retries go to one file.  It is held across a write(),
+     * which blocks.
+     */
+    nxt_thread_mutex_t     mutex;
+
+    /*
+     * The counters are 64-bit also on a 32-bit build, so they are read and
+     * changed under a spin lock.  It is held for a few instructions, never
+     * across a write(), so the status report does not wait for a stalled
+     * log.  It nests inside the mutex.
+     */
+    nxt_thread_spinlock_t  lock;
+
+    /* Records the writer dropped; under the lock. */
+    uint64_t               lost;
+    /* Dropped records not yet marked in the log itself; under the lock. */
+    uint64_t               pending;
+
+    /* The log ends inside a line; under the mutex. */
+    uint8_t                torn;
+
+    /* The link in the router's live logs and the count; under its lock. */
+    nxt_queue_link_t       link;
     uint32_t               count;
 };
 
@@ -415,6 +446,8 @@ void nxt_router_conf_release(nxt_task_t *task, nxt_socket_conf_joint_t *joint);
 
 nxt_int_t nxt_router_access_log_create(nxt_task_t *task,
     nxt_router_conf_t *rtcf, nxt_conf_value_t *value);
+nxt_router_access_log_t *nxt_router_access_log_get(nxt_task_t *task,
+    nxt_router_t *router, nxt_str_t *path);
 void nxt_router_access_log_open(nxt_task_t *task, nxt_router_temp_conf_t *tmcf);
 void nxt_router_access_log_use(nxt_thread_spinlock_t *lock,
     nxt_router_access_log_t *access_log);
@@ -444,6 +477,20 @@ void nxt_router_test_detached_handler(nxt_task_t *task,
 /* The port release, for the websocket accounting test. */
 void nxt_router_test_app_port_release(nxt_task_t *task, nxt_app_t *app,
     nxt_port_t *port, nxt_apr_action_t action);
+
+/*
+ * The access log record write, the loss of a record that could not be built,
+ * the reopen reply and the write faults, for the access log test.
+ */
+void nxt_router_access_log_test_record(nxt_task_t *task,
+    nxt_router_access_log_t *access_log, u_char *start, size_t length);
+void nxt_router_access_log_test_lost(nxt_task_t *task,
+    nxt_router_access_log_t *access_log);
+nxt_int_t nxt_router_access_log_test_reopen_ready(nxt_task_t *task,
+    nxt_router_access_log_t *access_log, nxt_fd_t fd);
+
+extern const ssize_t  *nxt_router_access_log_test_fault;
+extern nxt_uint_t     nxt_router_access_log_test_faults;
 #endif
 
 #if (NXT_TESTS)
