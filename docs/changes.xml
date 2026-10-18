@@ -463,6 +463,16 @@ such as PYTHONPATH, is used as before.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+the router could crash with signal 11 when unitd stopped while a configuration
+was still being applied and the next one was waiting.  The router took the
+waiting configuration while the first one was pending, and when both failed,
+it freed the same listener twice.  The router now applies one configuration
+at a time: one that comes while another is applied waits for its end.
+</para>
+</change>
+
 
 <change type="bugfix">
 <para>
