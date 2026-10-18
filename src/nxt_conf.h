@@ -62,6 +62,16 @@ typedef struct {
 } nxt_conf_map_t;
 
 
+/*
+ * NXT_CONF_MAP_SIZE converts a number to ssize_t.  So a size must be at least
+ * -NXT_CONF_SIZE_BOUND and less than NXT_CONF_SIZE_BOUND, NXT_SIZE_T_MAX + 1:
+ * 2^31 with a 32-bit size_t, 2^63 with a 64-bit size_t.  A power of two is
+ * exact as a double.  The validator refuses a negative size, except in the
+ * stored configuration at startup.
+ */
+#define NXT_CONF_SIZE_BOUND  ((uint64_t) NXT_SIZE_T_MAX + 1)
+
+
 typedef struct {
     uint32_t             level;
     uint8_t              more_space;  /* 1 bit. */

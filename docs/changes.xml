@@ -75,6 +75,40 @@ https://github.com/freeunitorg/freeunit/issues/666.
 
 <change type="bugfix">
 <para>
+with "compression" on, a HEAD request for a static file got no
+"Content-Encoding" and the uncompressed length, while GET got the coded
+response.  HEAD now has the same header fields as GET.  See
+https://github.com/freeunitorg/freeunit/issues/391.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+with "compression" on, a small response body from an application went out
+uncompressed under "Content-Encoding", so no client could decode it.  That was a
+body of up to 15 bytes, and of up to 1024 bytes in some modes: when the router
+port had no queue, the request was in socket mode, or shared memory failed.  See
+https://github.com/freeunitorg/freeunit/issues/162.
+</para>
+</change>
+
+<change type="change">
+<para>
+the size options "large_header_buffer_size", "large_header_buffers",
+"body_buffer_size" and "max_body_size" in "settings/http", "max_frame_size" in
+"settings/http/websocket", "min_length" of a compressor, and the "shm" limit of
+an application now must not be negative.  With a 32-bit size_t they must also
+be less than 2147483648.  Before, a negative value became a very large size,
+and a value out of the range of ssize_t gave an undefined result.  A stored
+configuration from an earlier version that has a negative value is still
+loaded, with a warning; the control API refuses to store a new one.  With a
+32-bit size_t a stored value of 2147483648 or more, or less than -2147483648,
+is refused, and unitd starts with no configuration until it is corrected.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 a request that arrived while unitd started could hang for ever, and the log
 showed "get_port_handler: port N:1 not found".  A router thread accepted the
 connection before the router knew the port of that thread.  "limits.timeout"

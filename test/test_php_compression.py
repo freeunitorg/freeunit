@@ -105,39 +105,20 @@ def test_php_compression_large_body():
     assert gzip.decompress(body) == b'A' * 100000, 'round-trips'
 
 
-@pytest.mark.skip(
-    reason='#162: small app responses are advertised gzip but sent '
-    'uncompressed'
-)
 def test_php_compression_small_body():
-    # Staged for issue #162.  nxt_http_comp_check_compression() commits to
-    # compression and emits Content-Encoding before any body buffer exists,
-    # but nxt_http_comp_compress_app_response() then declines the buffer:
-    #
-    #     if (!nxt_buf_is_port_mmap(*b)) { return NXT_OK; }
-    #
-    # A body small enough to arrive in an ordinary port message is plain
-    # memory, so it goes out verbatim under the Content-Encoding already sent
-    # and no client can decode it.
-    #
-    # Un-skip once #162 is fixed.  The assertion holds whichever way it is
-    # fixed: either the body really is gzip, or the encoding was never
-    # advertised.
+    # Issue #162: a body small enough to arrive in an ordinary port message
+    # (plain memory, not a port-mmap buffer) used to go out verbatim under
+    # the Content-Encoding already committed, so no client could decode it.
+    # It is compressed like a shared-memory body now.
     client.load('comp_small_body')
     configure_compression()
 
     status, headers, body = get_gzip()
 
     assert status == 200, 'status'
-
-    if headers.get('Content-Encoding') == 'gzip':
-        assert body[:2] == b'\x1f\x8b', 'advertised gzip must really be gzip'
-        assert gzip.decompress(body) == b'A' * 64, 'round-trips'
-
-    else:
-        # Declining to compress is an equally valid fix, as long as the
-        # encoding is not advertised.
-        assert body == b'A' * 64, 'uncompressed body delivered verbatim'
+    assert headers['Content-Encoding'] == 'gzip', 'encoding advertised'
+    assert body[:2] == b'\x1f\x8b', 'advertised gzip must really be gzip'
+    assert gzip.decompress(body) == b'A' * 8, 'round-trips'
 
 
 RANDOM_BODY_SIZE = 9 * 1024 * 1024
@@ -373,7 +354,7 @@ def test_php_compression_identity_refused_below_min_length():
 
     assert status == 200, 'identity is acceptable here'
     assert 'Content-Encoding' not in headers
-    assert body == b'A' * 64, 'the body, uncompressed'
+    assert body == b'A' * 8, 'the body, uncompressed'
 
 
 def test_php_compression_identity_refused_no_representation():
