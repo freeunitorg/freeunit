@@ -262,6 +262,20 @@ With apt-cacher-ng, repeated builds that share base layers are significantly fas
 Builder mode (`-b`) for `minimal`, `wasm`, and `php-8.5` cuts those three variants to
 ~2–3 min each by skipping apt and Rust downloads entirely.
 
+### Build flags
+
+`--cc-opt` and `--ld-opt` are the CFLAGS and LDFLAGS of `dpkg-buildflags`.
+The hardening flags come from `./configure --hardening=default` (see `auto/cc/hardening`),
+including `-D_FORTIFY_SOURCE`, which `dpkg-buildflags` puts only in CPPFLAGS.
+The build stops when `build/autoconf.data` has no `-D_FORTIFY_SOURCE` after configure.
+Do not add the CPPFLAGS as well: their `-D_FORTIFY_SOURCE=2` makes the level 3 probe fail.
+unitd and libunit are not fortified yet: `src/nxt_unix.h` undefines `_FORTIFY_SOURCE`
+(https://github.com/freeunitorg/freeunit/issues/773).
+The `-specs=` flags are removed. `unitd --version` stores the configure options, and they
+would name `/usr/share/dpkg/no-pie-*.specs`. libdpkg-perl owns those files, and the image
+purges it with the build packages. A module build that reuses the stored options then fails
+with "cannot read spec file". With `-fPIC` and `-pie` set, the specs did nothing.
+
 ## CI workflow
 
 The GitHub Actions workflow (`.github/workflows/release-docker.yml`) builds and pushes

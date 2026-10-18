@@ -672,6 +672,19 @@ removes the -D_FORTIFY_SOURCE of Perl when it added its own.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+the Docker images lost -D_FORTIFY_SOURCE from their build flags in 1.35.3,
+so the language modules were built without _FORTIFY_SOURCE.  The images are
+now configured with --hardening=default, which adds it back with the other
+hardening flags.  The image build stops when configure did not add it.
+unitd itself is still not fortified, because src/nxt_unix.h
+undefines _FORTIFY_SOURCE.  See
+https://github.com/freeunitorg/freeunit/issues/757 and
+https://github.com/freeunitorg/freeunit/issues/773.
+</para>
+</change>
+
 </changes>
 
 
