@@ -28,11 +28,9 @@
 
 /*
  * nxt_static_assert() fails the compilation when the condition does not
- * hold.  auto/cc/test adds -std=gnu11 only on its gcc and clang branches
- * and leaves the generic "cc" branch alone, so a compiler defaulting to
- * pre-C11 has to fall back to declaring an array with a negative size;
- * there the message survives only in the type name, which has to be unique
- * per use, hence the token pasting.
+ * hold.  Without C11, it declares an extern array with a negative size.
+ * C99 allows a repeated extern declaration but not a repeated typedef, so
+ * every use can have the same name.
  */
 
 #if (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L)
@@ -42,15 +40,8 @@
 
 #else
 
-#define nxt_static_assert_paste(prefix, line)                                 \
-    prefix##line
-
-#define nxt_static_assert_name(prefix, line)                                  \
-    nxt_static_assert_paste(prefix, line)
-
 #define nxt_static_assert(cond, msg)                                          \
-    typedef char nxt_static_assert_name(nxt_static_assert_failed_,            \
-                                        __LINE__)[(cond) ? 1 : -1]
+    extern char nxt_static_assert_failed[(cond) ? 1 : -1]
 
 #endif
 

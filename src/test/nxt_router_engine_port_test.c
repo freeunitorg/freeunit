@@ -119,7 +119,7 @@ nxt_router_engine_port_test_child(void *data)
     port = NULL;
 
     for (i = 0; i < NXT_ROUTER_ENGINE_PORT_TEST_WAIT; i++) {
-        port = __atomic_load_n(&engine->port, __ATOMIC_ACQUIRE);
+        port = nxt_atomic_load_acquire(&engine->port);
         if (port != NULL) {
             break;
         }

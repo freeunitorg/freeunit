@@ -397,7 +397,7 @@ nxt_app_queue_race_worker(void *arg)
     for ( ;; ) {
         nxt_barrier_wait(&ctx->start);
 
-        if (__atomic_load_n(&ctx->stop, __ATOMIC_ACQUIRE)) {
+        if (nxt_atomic_load_acquire(&ctx->stop)) {
             break;
         }
 
@@ -405,7 +405,7 @@ nxt_app_queue_race_worker(void *arg)
         (void) nxt_app_queue_send_bound(ctx->q, msg, sizeof(msg),
                                         (uint32_t) w->id, &notify, &cookie, 1);
         if (notify > 0) {
-            __atomic_fetch_add(&ctx->notify_count, 1, __ATOMIC_RELAXED);
+            (void) nxt_atomic_fetch_add(&ctx->notify_count, 1);
         }
 
         nxt_barrier_wait(&ctx->done);
@@ -441,7 +441,7 @@ nxt_app_queue_test_concurrent_race(void *data)
         if (pthread_create(&threads[i], NULL, nxt_app_queue_race_worker,
                            &workers[i]) != 0)
         {
-            __atomic_store_n(&ctx.stop, 1, __ATOMIC_RELEASE);
+            nxt_atomic_store_release(&ctx.stop, 1);
             nxt_barrier_wait(&ctx.start);
 
             while (i > 0) {
@@ -456,12 +456,12 @@ nxt_app_queue_test_concurrent_race(void *data)
     }
 
     for (r = 0; r < rounds; r++) {
-        __atomic_store_n(&ctx.notify_count, 0, __ATOMIC_RELAXED);
+        nxt_atomic_store(&ctx.notify_count, 0);
 
         nxt_barrier_wait(&ctx.start);
         nxt_barrier_wait(&ctx.done);
 
-        if (__atomic_load_n(&ctx.notify_count, __ATOMIC_RELAXED) == 0) {
+        if (nxt_atomic_load(&ctx.notify_count) == 0) {
             zero_rounds++;
         }
 
@@ -470,7 +470,7 @@ nxt_app_queue_test_concurrent_race(void *data)
         }
     }
 
-    __atomic_store_n(&ctx.stop, 1, __ATOMIC_RELEASE);
+    nxt_atomic_store_release(&ctx.stop, 1);
     nxt_barrier_wait(&ctx.start);
 
     for (i = 0; i < NXT_APP_QUEUE_TEST_RACERS; i++) {
