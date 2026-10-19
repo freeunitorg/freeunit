@@ -145,6 +145,11 @@ nxt_thread_mutex_lock(nxt_thread_mutex_t *mtx)
 }
 
 
+/*
+ * Non-blocking mutex acquisition completing the lock/trylock/unlock triad.
+ * Kept as a fundamental concurrency primitive for non-blocking contexts to
+ * avoid deadlock or latency spikes when contending for shared state.
+ */
 nxt_bool_t
 nxt_thread_mutex_trylock(nxt_thread_mutex_t *mtx)
 {

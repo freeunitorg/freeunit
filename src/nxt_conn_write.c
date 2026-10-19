@@ -409,47 +409,6 @@ nxt_conn_io_send(nxt_task_t *task, nxt_sendbuf_t *sb, void *buf, size_t size)
 }
 
 
-/* Obsolete interfaces. */
-
-size_t
-nxt_event_conn_write_limit(nxt_conn_t *c)
-{
-    ssize_t                 limit, correction;
-    nxt_event_write_rate_t  *rate;
-
-    rate = c->rate;
-
-    if (rate == NULL) {
-        return c->max_chunk;
-    }
-
-    limit = rate->limit;
-    correction = limit - (size_t) rate->average;
-
-    nxt_debug(c->socket.task, "event conn correction:%z average:%0.3f",
-              correction, rate->average);
-
-    limit += correction;
-
-    if (limit <= 0) {
-        return 0;
-    }
-
-    if (rate->limit_after != 0) {
-        limit += rate->limit_after;
-        limit = nxt_min((size_t) limit, rate->max_limit);
-    }
-
-    return nxt_min((size_t) limit, c->max_chunk);
-}
-
-
-nxt_bool_t
-nxt_event_conn_write_delayed(nxt_event_engine_t *engine, nxt_conn_t *c,
-    size_t sent)
-{
-    return 0;
-}
 
 
 ssize_t

@@ -181,22 +181,6 @@ nxt_var_field_new(nxt_mp_t *mp, nxt_str_t *name, uint32_t hash)
 }
 
 
-nxt_var_field_t *
-nxt_var_field_get(nxt_array_t *fields, uint16_t index)
-{
-    nxt_uint_t       nfields;
-    nxt_var_field_t  *field;
-
-    field = fields->elts;
-    nfields = fields->nelts;
-
-    if (nfields > 0 && index <= nfields) {
-        return &field[index];
-    }
-
-    return NULL;
-}
-
 
 static nxt_int_t
 nxt_var_cache_test(nxt_lvlhsh_query_t *lhq, void *data)

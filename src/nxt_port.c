@@ -423,12 +423,6 @@ nxt_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 }
 
 
-void
-nxt_port_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
-{
-    nxt_runtime_quit(task, 0);
-}
-
 
 /*
  * Announce a port to every peer the send matrix pairs it with, carrying
@@ -1397,12 +1391,6 @@ nxt_port_remove_pid(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     }
 }
 
-
-void
-nxt_port_empty_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
-{
-    nxt_debug(task, "port empty handler");
-}
 
 
 typedef struct {

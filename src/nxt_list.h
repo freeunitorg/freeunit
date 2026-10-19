@@ -31,11 +31,6 @@ typedef struct {
 } nxt_list_t;
 
 
-typedef struct {
-    nxt_list_part_t             *part;
-    uintptr_t                   elt;
-} nxt_list_next_t;
-
 
 #define nxt_list_part(list)                                                   \
     (&(list)->part)
@@ -95,12 +90,6 @@ nxt_list_elt(nxt_list_t *list, nxt_uint_t n)
 NXT_EXPORT nxt_list_t *nxt_list_create(nxt_mp_t *mp, nxt_uint_t n, size_t size);
 NXT_EXPORT void *nxt_list_add(nxt_list_t *list);
 NXT_EXPORT void *nxt_list_zero_add(nxt_list_t *list);
-
-NXT_EXPORT void *nxt_list_next(nxt_list_t *list, nxt_list_next_t *next);
-
-
-#define nxt_list_next_value(list, next)                                       \
-    (nxt_pointer_to(nxt_list_data((next)->part), (next)->elt * (list)->size))
 
 
 nxt_inline nxt_uint_t
