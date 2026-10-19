@@ -6508,12 +6508,29 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     }
 
     if (r->header_sent) {
+        /*
+         * Compress the part that just arrived, never the whole of r->out:
+         * that chain can still hold output the compressor produced for an
+         * earlier part, and the compressor must not be fed its own output.
+         * Such a buffer is memory and not sync, so the walk below would
+         * take it as application body.  If the earlier part ended the
+         * stream (a small body that travelled with the response header
+         * does), the second call fails and the response turns into a 503
+         * after its header has been committed.
+         */
+        ret = nxt_http_comp_compress_app_response(task, r, &b);
+
+        /*
+         * Link what the compressor gives back into r->out in both cases.
+         * On failure that is the part and the rest of the chain, with the
+         * request's sync buffer at the tail; the fail path drains r->out
+         * and must own it from there, not release it as owned_b.
+         */
         nxt_buf_chain_add(&r->out, b);
         owned_b = NULL;
         last_b = NULL;
 
-        ret = nxt_http_comp_compress_app_response(task, r, &r->out);
-        if (ret == NXT_ERROR) {
+        if (nxt_slow_path(ret == NXT_ERROR)) {
             goto fail;
         }
 
