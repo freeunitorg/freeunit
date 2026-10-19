@@ -323,6 +323,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_signalfd_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_poll_engine_test(thr) != NXT_OK) {
         return 1;
     }

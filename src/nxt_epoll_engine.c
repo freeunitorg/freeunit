@@ -772,7 +772,7 @@ nxt_epoll_add_signal(nxt_event_engine_t *engine)
 static void
 nxt_epoll_signalfd_handler(nxt_task_t *task, void *obj, void *data)
 {
-    int                      n;
+    int                      n, err;
     nxt_fd_event_t           *ev;
     nxt_work_handler_t       handler;
     struct signalfd_siginfo  sfd;
@@ -783,11 +783,16 @@ nxt_epoll_signalfd_handler(nxt_task_t *task, void *obj, void *data)
     nxt_debug(task, "signalfd handler");
 
     n = read(ev->fd, &sfd, sizeof(struct signalfd_siginfo));
+    err = nxt_errno;
 
     nxt_debug(task, "read signalfd(%d): %d", ev->fd, n);
 
+    if (nxt_epoll_signalfd_eagain(n, err)) {
+        return;
+    }
+
     if (n != sizeof(struct signalfd_siginfo)) {
-        nxt_alert(task, "read signalfd(%d) failed %E", ev->fd, nxt_errno);
+        nxt_alert(task, "read signalfd(%d) failed %E", ev->fd, err);
         return;
     }
 
