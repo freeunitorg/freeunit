@@ -1155,7 +1155,6 @@ def test_php_application_content_length_not_reinstated():
     assert resp['body'] == '0123456789', 'body intact'
 
 
-<<<<<<< HEAD
 def test_php_application_content_type_reset(findall):
     client.load('content_type_reset', processes=1)
 

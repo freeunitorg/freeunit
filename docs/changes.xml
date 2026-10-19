@@ -12,7 +12,6 @@
 
 <change type="change">
 <para>
-<<<<<<< HEAD
 reproducible builds: with SOURCE_DATE_EPOCH set, unitd, the static libraries,
 source tarballs, rpm, rust and jar builds no longer carry build paths, host
 names, kernel release or times.  RPM packages built with rpm 4.14 or later
