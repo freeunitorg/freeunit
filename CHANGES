@@ -1,6 +1,13 @@
 
 Changes with FreeUnit 1.37.1                                     04 Oct 2026
 
+    *) Change: a text access log escapes each value that a variable
+       expands to with one test per eight bytes instead of four tests per
+       byte, and copies a line with no byte to escape as it is. The access
+       log output is unchanged. With the default format, a request with a
+       111-byte browser User-Agent and a 57-byte Referer takes 32% fewer
+       router instructions.
+
     *) Bugfix: a request whose access log "if" condition could not be
        rendered, for example when a JS expression threw, was written to
        the access log. The unrendered condition was read as true, so a

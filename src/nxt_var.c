@@ -43,12 +43,6 @@ struct nxt_var_query_s {
 #define NXT_VAR_ONES   ((uint64_t) 0x0101010101010101ULL)
 #define NXT_VAR_HIGH   ((uint64_t) 0x8080808080808080ULL)
 
-#define NXT_VAR_ZERO(w)                                                       \
-    (((w) - NXT_VAR_ONES) & ~(w) & NXT_VAR_HIGH)
-
-#define NXT_VAR_BELOW(w, n)                                                   \
-    (((w) - NXT_VAR_ONES * (n)) & ~(w) & NXT_VAR_HIGH)
-
 
 static nxt_int_t nxt_var_hash_test(nxt_lvlhsh_query_t *lhq, void *data);
 static nxt_var_decl_t *nxt_var_hash_find(nxt_str_t *name);
@@ -494,12 +488,14 @@ nxt_var_escaped(u_char c)
 
 
 /*
- * nxt_var_escape_word() tests eight bytes at once: it is true if one of them
- * is below 0x20, is 0x7F or more, or is '"' or '\\', the bytes that
- * nxt_var_escaped() escapes.  The test is exact for each of the four terms:
- * a carry in "w + NXT_VAR_ONES" needs a byte 0xFF, which "w" itself already
- * flags, and NXT_VAR_ZERO() and NXT_VAR_BELOW() are the usual "haszero" and
- * "hasless" tests, exact for n up to 0x80.
+ * nxt_var_escape_word() is true if one of eight bytes is a byte that
+ * nxt_var_escaped() escapes.  Each term sets the high bit of such a byte:
+ * "w + 1" of a byte from 0x7F to 0xFE, "w - 0x20" of a byte below 0x20 or
+ * from 0xA0 to 0xFF, and "(w ^ c) - 1" of a byte equal to c.  A term may set
+ * the high bit of another byte too, but only of a byte to escape anyway, or,
+ * by a carry or a borrow, of the byte after one; so the test is zero for a
+ * word with no byte to escape and non-zero for a word with one.  It does not
+ * depend on the byte order.
  *
  * The escape functions test each block of eight bytes once.  A clean block,
  * the common case, is passed or copied whole; a block with a byte to escape
@@ -514,44 +510,38 @@ nxt_var_escape_word(const u_char *p)
 
     nxt_memcpy(&w, p, 8);
 
-    return (((w | (w + NXT_VAR_ONES)) & NXT_VAR_HIGH)
-            | NXT_VAR_BELOW(w, 0x20)
-            | NXT_VAR_ZERO(w ^ (NXT_VAR_ONES * '"'))
-            | NXT_VAR_ZERO(w ^ (NXT_VAR_ONES * '\\'))) != 0;
+    return (((w + NXT_VAR_ONES)
+             | (w - NXT_VAR_ONES * 0x20)
+             | ((w ^ NXT_VAR_ONES * '"') - NXT_VAR_ONES)
+             | ((w ^ NXT_VAR_ONES * '\\') - NXT_VAR_ONES))
+            & NXT_VAR_HIGH) != 0;
 }
 
 
 size_t
 nxt_var_escape_length(const u_char *p, size_t length)
 {
-    size_t        size;
-    const u_char  *end, *stop;
-
-    /* An absent value has a NULL start and no bytes. */
-
-    if (length == 0) {
-        return 0;
-    }
+    size_t  size, i, stop;
 
     size = length;
-    end = p + length;
+    i = 0;
 
-    while (p < end) {
+    while (i < length) {
 
-        if (end - p >= 8) {
-            stop = p + 8;
+        if (length - i >= 8) {
+            stop = i + 8;
 
-            if (!nxt_var_escape_word(p)) {
-                p = stop;
+            if (!nxt_var_escape_word(&p[i])) {
+                i = stop;
                 continue;
             }
 
         } else {
-            stop = end;
+            stop = length;
         }
 
-        while (p < stop) {
-            if (nxt_var_escaped(*p++)) {
+        while (i < stop) {
+            if (nxt_var_escaped(p[i++])) {
                 /* One byte becomes the four of "\xHH". */
                 size += 3;
             }
@@ -565,34 +555,30 @@ nxt_var_escape_length(const u_char *p, size_t length)
 u_char *
 nxt_var_escape(u_char *dst, const u_char *src, size_t length)
 {
-    u_char        c;
-    const u_char  *end, *stop;
+    u_char  c;
+    size_t  i, stop;
 
     static const u_char  hex[] = "0123456789ABCDEF";
 
-    if (length == 0) {
-        return dst;
-    }
+    i = 0;
 
-    end = src + length;
+    while (i < length) {
 
-    while (src < end) {
+        if (length - i >= 8) {
+            stop = i + 8;
 
-        if (end - src >= 8) {
-            stop = src + 8;
-
-            if (!nxt_var_escape_word(src)) {
-                dst = nxt_cpymem(dst, src, 8);
-                src = stop;
+            if (!nxt_var_escape_word(&src[i])) {
+                dst = nxt_cpymem(dst, &src[i], 8);
+                i = stop;
                 continue;
             }
 
         } else {
-            stop = end;
+            stop = length;
         }
 
-        while (src < stop) {
-            c = *src++;
+        while (i < stop) {
+            c = src[i++];
 
             if (!nxt_var_escaped(c)) {
                 *dst++ = c;
@@ -616,7 +602,7 @@ nxt_var_interpreter(nxt_task_t *task, nxt_tstr_state_t *state,
     nxt_uint_t flags)
 {
     u_char         *p, *src;
-    size_t         length, last, next;
+    size_t         length, size, escaped, last, next;
     uint32_t       index;
     nxt_str_t      *value, **part;
     nxt_uint_t     i;
@@ -631,6 +617,7 @@ nxt_var_interpreter(nxt_task_t *task, nxt_tstr_state_t *state,
     subs = nxt_var_subs(var);
 
     length = var->length;
+    escaped = 0;
 
     for (i = 0; i < var->vars; i++) {
         index = subs[i].index;
@@ -649,7 +636,9 @@ nxt_var_interpreter(nxt_task_t *task, nxt_tstr_state_t *state,
         length -= subs[i].length;
 
         if (flags & NXT_VAR_ESCAPE) {
-            length += nxt_var_escape_length(value->start, value->length);
+            size = nxt_var_escape_length(value->start, value->length);
+            escaped += size - value->length;
+            length += size;
 
         } else {
             length += value->length;
@@ -658,6 +647,12 @@ nxt_var_interpreter(nxt_task_t *task, nxt_tstr_state_t *state,
         if ((flags & NXT_VAR_LOGGING) && value->start == NULL) {
             length += 1;
         }
+    }
+
+    /* No value has a byte to escape, the common case: copy them as they are. */
+
+    if (escaped == 0) {
+        flags &= ~NXT_VAR_ESCAPE;
     }
 
     p = nxt_mp_nget(cache->pool, length);
