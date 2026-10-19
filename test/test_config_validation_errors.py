@@ -11,10 +11,18 @@ All cases are expressed using listeners + routes so they run without any
 language SAPI module configured.
 """
 
+import json
+import shutil
+import tempfile
+import time
+from pathlib import Path
+
 import pytest
 
+from conftest import unit_run, unit_stop
 from unit import port as port_map
 from unit.control import Control
+from unit.option import option
 
 client = Control()
 
@@ -219,45 +227,52 @@ def _access_log(access_format):
     return {
         "listeners": {"*:8080": {"pass": "routes"}},
         "routes": [{"action": {"return": 200}}],
-        "access_log": {"path": "/tmp/a", "format": access_format},
+        "access_log": {
+            "path": f'{option.temp_dir}/access.log',
+            "format": access_format,
+        },
     }
+
+
+def _warning(variable, field=None):
+    if field is None:
+        return (
+            rf'\[warn\].+the access log format uses the "{variable}" '
+            r'variable\.  It writes the value'
+        )
+
+    return (
+        rf'\[warn\].+the access log format uses the "{variable}" '
+        rf'variable in the "{field}" field\.'
+    )
 
 
 @pytest.mark.parametrize(
     'variable',
     [
-        'authorization',
-        'proxy_authorization',
-        'cookie',
-        'set_cookie',
+        'header_authorization',
+        'header_Proxy_Authorization',
+        'header_cookie',
+        'header_set_cookie',
+        'response_header_set_cookie',
+        'response_header_Authorization',
     ],
 )
-def test_access_log_refuses_credential_header_variable(variable):
-    r = _put(_access_log(f"$header_{variable}"))
-    assert 'error' in r
-    assert r['location']['path'] == '/access_log/format'
-    assert f'header_{variable}' in r['detail']
+def test_access_log_warns_on_credential_header(
+    variable, wait_for_record, findall
+):
+    # The configuration is accepted, as in earlier versions, with a warning.
+    r = _put(_access_log(f"seen ${{{variable}}} at $time_local"))
+    assert 'success' in r
+    assert wait_for_record(_warning(variable))
 
-    # The variable grammar preserves case, the header name is matched without.
-    r = _put(_access_log(f"$header_{variable.capitalize()}"))
-    assert 'error' in r
-    assert r['location']['path'] == '/access_log/format'
-
-
-def test_access_log_refuses_credential_header_in_a_template():
-    # A field is refused, not only a format that is exactly the variable.
-    r = _put(_access_log("seen $header_cookie at $time_local"))
-    assert 'error' in r
-    assert r['location']['path'] == '/access_log/format'
-    assert 'header_cookie' in r['detail']
-
-    # The braced spelling is the same variable.
-    r = _put(_access_log("${header_set_cookie}"))
-    assert 'error' in r
-    assert r['location']['path'] == '/access_log/format'
+    # One warning for one variable.
+    assert len(findall(_warning(variable))) == 1
 
 
-def test_access_log_refuses_credential_header_in_object_format():
+def test_access_log_warns_on_credential_header_in_object_format(
+    wait_for_record,
+):
     r = _put(
         _access_log(
             {
@@ -266,12 +281,97 @@ def test_access_log_refuses_credential_header_in_object_format():
             }
         )
     )
-    assert 'error' in r
-    assert r['location']['path'] == '/access_log/format/auth'
-    assert 'header_authorization' in r['detail']
-
-
-def test_access_log_keeps_other_header_variables():
-    r = _put(_access_log("$header_referer $header_user_agent"))
     assert 'success' in r
-    assert 'error' not in r
+    assert wait_for_record(
+        _warning('header_authorization', 'auth')
+    )
+
+
+def test_access_log_no_warning_for_a_refused_update(search_in_file):
+    # The router warns when it applies the format, so a configuration that
+    # the control API refuses gives no warning.
+    conf = _access_log("[$header_proxy_authorization]")
+    conf['unknown'] = 1
+
+    assert 'error' in _put(conf)
+    assert search_in_file(r'"header_proxy_authorization" variable') is None
+
+
+def test_access_log_no_warning_on_other_header_variables(search_in_file):
+    r = _put(
+        _access_log(
+            "$header_referer $header_user_agent "
+            "$response_header_content_length $header_authorization_x"
+        )
+    )
+    assert 'success' in r
+    assert (
+        search_in_file(
+            r'uses the "(header_referer|header_user_agent'
+            r'|response_header_content_length|header_authorization_x)"'
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    'access_format, field',
+    [
+        ("c=[$header_cookie]", None),
+        ({"t": "$time_local", "c": "$header_cookie"}, 'c'),
+    ],
+)
+def test_access_log_credential_header_stored(
+    access_format, field, requires_restart, wait_for_record
+):
+    """A stored configuration with a credential header in the access log
+    format loads, warns, serves, logs the header as before, and can still
+    be updated through the API."""
+
+    assert 'success' in _put(_access_log("$remote_addr"))
+
+    unit_stop()
+
+    # unit_run() makes a new temporary directory, so the log is kept beside
+    # the state.
+    statedir = Path(tempfile.mkdtemp(prefix='unit-state-'))
+    log = statedir / 'access.log'
+
+    conf = _access_log(access_format)
+    conf['access_log']['path'] = str(log)
+    (statedir / 'conf.json').write_text(
+        json.dumps(port_map.expected(conf))
+    )
+
+    try:
+        unit_run(state_dir=str(statedir))
+
+        assert (
+            client.conf_get('access_log/format') == access_format
+        ), 'stored configuration loaded'
+
+        assert wait_for_record(_warning('header_cookie', field)), 'warning'
+
+        assert (
+            client.get(
+                headers={
+                    'Host': 'localhost',
+                    'Cookie': 'session=STORED',
+                    'Connection': 'close',
+                }
+            )['status']
+            == 200
+        ), 'served'
+
+        for _ in range(50):
+            if log.exists() and 'STORED' in log.read_text():
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail('the header is not in the access log')
+
+        assert 'success' in client.conf(conf['routes'], 'routes'), 'update'
+
+    finally:
+        unit_stop()
+        shutil.rmtree(statedir, ignore_errors=True)

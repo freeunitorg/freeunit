@@ -254,9 +254,6 @@ static nxt_int_t nxt_conf_vldt_access_log_format(nxt_conf_validation_t *vldt,
 static nxt_int_t nxt_conf_vldt_access_log_format_field(
     nxt_conf_validation_t *vldt, const nxt_str_t *name,
     nxt_conf_value_t *value);
-static nxt_int_t nxt_conf_vldt_access_log_var(nxt_conf_validation_t *vldt,
-    const nxt_str_t *name, nxt_str_t *value);
-static nxt_bool_t nxt_conf_vldt_access_log_secret(nxt_str_t *name);
 
 static nxt_int_t nxt_conf_vldt_isolation(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
@@ -2291,120 +2288,6 @@ nxt_conf_vldt_var(nxt_conf_validation_t *vldt, const nxt_str_t *name,
     if (nxt_tstr_test(vldt->tstr_state, value, error) != NXT_OK) {
         return nxt_conf_vldt_error(vldt, "%s in the \"%V\" value.",
                                    error, name);
-    }
-
-    return NXT_OK;
-}
-
-
-/*
- * The access log format must not be able to copy a credential to disk.
- * nxt_http_unknown_var_ref() accepts any header name, and the format
- * validator only asks whether the variable exists, so $header_authorization
- * and $header_cookie pass today and put a bearer token and a session cookie
- * in the log file.
- *
- * The comparison follows nxt_http_header_hash(): a header name is matched
- * without case, and '_' in the variable spelling means '-' in the header.
- * The names here are the ones that carry credentials by definition.  Any
- * other name can still carry a secret, and an njs template can read a header
- * through the request object, so this is a guardrail, not a proof.
- */
-
-static nxt_bool_t
-nxt_conf_vldt_access_log_secret(nxt_str_t *name)
-{
-    u_char                  c;
-    size_t                  i, length;
-    nxt_uint_t              n;
-    const nxt_str_t        *denied;
-    static const nxt_str_t  denied_names[] = {
-        nxt_string("authorization"),
-        nxt_string("proxy-authorization"),
-        nxt_string("cookie"),
-        nxt_string("set-cookie"),
-    };
-
-    /*
-     * Only a name with the literal "header_" prefix reaches the request
-     * headers: the resolver matches that prefix with memcmp(), not with a
-     * case-insensitive comparison.
-     */
-
-    if (name->length < 7 || memcmp(name->start, "header_", 7) != 0) {
-        return 0;
-    }
-
-    length = name->length - 7;
-
-    for (n = 0; n < nxt_nitems(denied_names); n++) {
-        denied = &denied_names[n];
-
-        if (denied->length != length) {
-            continue;
-        }
-
-        for (i = 0; i < length; i++) {
-            c = name->start[7 + i];
-
-            if (c == '_') {
-                c = '-';
-            }
-
-            if ((c | 0x20) != denied->start[i]) {
-                break;
-            }
-        }
-
-        if (i == length) {
-            return 1;
-        }
-    }
-
-    return 0;
-}
-
-
-static nxt_int_t
-nxt_conf_vldt_access_log_var(nxt_conf_validation_t *vldt, const nxt_str_t *name,
-    nxt_str_t *value)
-{
-    u_char     *p, *end, *next;
-    nxt_int_t  ret;
-    nxt_str_t  part;
-
-    ret = nxt_conf_vldt_var(vldt, name, value);
-
-    if (ret != NXT_OK) {
-        return ret;
-    }
-
-    /* An njs template reads a header through the request object. */
-
-    if (nxt_tstr_is_js(value)) {
-        return NXT_OK;
-    }
-
-    p = value->start;
-    end = p + value->length;
-
-    while (p < end) {
-        next = nxt_var_next_part(p, end, &part);
-
-        if (nxt_slow_path(next == NULL)) {
-            /* nxt_conf_vldt_var() has already accepted the syntax. */
-            return NXT_ERROR;
-        }
-
-        if (part.start != NULL
-            && nxt_conf_vldt_access_log_secret(&part))
-        {
-            return nxt_conf_vldt_error(vldt, "The \"%V\" variable must not "
-                                       "be used in the access log: the header "
-                                       "can carry a credential.", &part);
-        }
-
-        p = next;
     }
 
     return NXT_OK;
@@ -5369,7 +5252,7 @@ nxt_conf_vldt_access_log(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
         seg.seg = format_str;
         vldt->path = &seg;
 
-        ret = nxt_conf_vldt_access_log_var(vldt, &format_str, &conf.format);
+        ret = nxt_conf_vldt_var(vldt, &format_str, &conf.format);
 
         vldt->path = seg.prev;
 
@@ -5416,7 +5299,7 @@ nxt_conf_vldt_access_log_format_field(nxt_conf_validation_t *vldt,
     nxt_conf_get_string(value, &str);
 
     if (nxt_is_tstr(&str)) {
-        return nxt_conf_vldt_access_log_var(vldt, name, &str);
+        return nxt_conf_vldt_var(vldt, name, &str);
     }
 
     return NXT_OK;

@@ -78,6 +78,7 @@ nxt_str_t *nxt_var_get(nxt_task_t *task, nxt_tstr_state_t *state,
 
 nxt_int_t nxt_http_unknown_var_ref(nxt_mp_t *mp, nxt_var_ref_t *ref,
     nxt_str_t *name);
+nxt_bool_t nxt_http_var_credential(const nxt_str_t *name);
 
 
 #endif /* _NXT_VAR_H_INCLUDED_ */

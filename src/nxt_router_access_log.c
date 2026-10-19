@@ -39,6 +39,8 @@ struct nxt_router_access_log_format_s {
 
 static nxt_router_access_log_format_t *nxt_router_access_log_format_create(
     nxt_task_t *task, nxt_router_conf_t *rtcf, nxt_conf_value_t *value);
+static void nxt_router_access_log_warn(nxt_task_t *task,
+    const nxt_str_t *field, nxt_str_t *str);
 static void nxt_router_access_log_writer(nxt_task_t *task,
     nxt_http_request_t *r, nxt_router_access_log_t *access_log,
     nxt_router_access_log_format_t *format);
@@ -199,6 +201,8 @@ nxt_router_access_log_format_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
 
                 nxt_conf_get_string(cv, &str);
 
+                nxt_router_access_log_warn(task, &name, &str);
+
                 member[i].tstr = nxt_tstr_compile(rtcf->tstr_state, &str,
                                                   NXT_TSTR_LOGGING);
                 if (nxt_slow_path(member[i].tstr == NULL)) {
@@ -213,6 +217,8 @@ nxt_router_access_log_format_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
 
         } else {
             nxt_conf_get_string(value, &str);
+
+            nxt_router_access_log_warn(task, NULL, &str);
         }
 
     } else {
@@ -234,6 +240,59 @@ nxt_router_access_log_format_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
     }
 
     return format;
+}
+
+
+/*
+ * A format that names a credential header writes a bearer token or a session
+ * cookie into the log file.  It is accepted, as in earlier versions, with a
+ * warning.  The warning is here and not in the validator, so that a
+ * configuration that the control API refuses gives none.  The text describes
+ * the format, so it stays true also when the router then fails to apply the
+ * configuration, for example when the new log file cannot be opened.  An
+ * njs template reads a header through the request object, and the format
+ * string cannot show that.
+ */
+
+static void
+nxt_router_access_log_warn(nxt_task_t *task, const nxt_str_t *field,
+    nxt_str_t *str)
+{
+    u_char     *p, *end, *next;
+    nxt_str_t  part;
+
+    if (nxt_tstr_is_js(str)) {
+        return;
+    }
+
+    p = str->start;
+    end = p + str->length;
+
+    while (p < end) {
+        next = nxt_var_next_part(p, end, &part);
+
+        if (next == NULL) {
+            /* The validator has accepted the syntax. */
+            return;
+        }
+
+        if (part.start != NULL && nxt_http_var_credential(&part)) {
+
+            if (field != NULL) {
+                nxt_log(task, NXT_LOG_WARN, "the access log format uses the "
+                        "\"%V\" variable in the \"%V\" field.  It writes "
+                        "the value of a header that can carry a credential.",
+                        &part, field);
+
+            } else {
+                nxt_log(task, NXT_LOG_WARN, "the access log format uses the "
+                        "\"%V\" variable.  It writes the value of a header "
+                        "that can carry a credential.", &part);
+            }
+        }
+
+        p = next;
+    }
 }
 
 

@@ -107,6 +107,19 @@ is refused, and unitd starts with no configuration until it is corrected.
 </para>
 </change>
 
+<change type="change">
+<para>
+unitd now writes a warning to its log each time it applies a configuration with
+an access log format that names the Authorization, Proxy-Authorization, Cookie
+or Set-Cookie header, as $header_&lt;name&gt; or $response_header_&lt;name&gt;,
+because the log file then holds a bearer token or a session cookie.  The
+configuration is still accepted, and the header is still written to the log.
+Other variables can copy a secret to the log too, with no warning:
+$cookie_&lt;name&gt;, $arg_&lt;name&gt;, $args, $request_uri, $request_line, a
+header with another name and an njs template.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 a request that arrived while unitd started could hang for ever, and the log
