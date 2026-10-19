@@ -66,6 +66,7 @@ nxt_int_t nxt_utf8_sanitize_test(nxt_thread_t *thr);
 nxt_int_t nxt_http_parse_test(nxt_thread_t *thr);
 nxt_int_t nxt_strverscmp_test(nxt_thread_t *thr);
 nxt_int_t nxt_base64_test(nxt_thread_t *thr);
+nxt_int_t nxt_var_escape_test(nxt_thread_t *thr);
 nxt_int_t nxt_string_test(nxt_thread_t *thr);
 nxt_int_t nxt_buf_test(nxt_thread_t *thr);
 nxt_int_t nxt_h1proto_conn_test(nxt_thread_t *thr);

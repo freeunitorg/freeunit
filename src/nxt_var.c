@@ -40,6 +40,15 @@ struct nxt_var_query_s {
 #define nxt_var_raw_start(var)                                                \
     ((var)->data + (var)->vars * sizeof(nxt_var_sub_t))
 
+#define NXT_VAR_ONES   ((uint64_t) 0x0101010101010101ULL)
+#define NXT_VAR_HIGH   ((uint64_t) 0x8080808080808080ULL)
+
+#define NXT_VAR_ZERO(w)                                                       \
+    (((w) - NXT_VAR_ONES) & ~(w) & NXT_VAR_HIGH)
+
+#define NXT_VAR_BELOW(w, n)                                                   \
+    (((w) - NXT_VAR_ONES * (n)) & ~(w) & NXT_VAR_HIGH)
+
 
 static nxt_int_t nxt_var_hash_test(nxt_lvlhsh_query_t *lhq, void *data);
 static nxt_var_decl_t *nxt_var_hash_find(nxt_str_t *name);
@@ -484,17 +493,68 @@ nxt_var_escaped(u_char c)
 }
 
 
+/*
+ * nxt_var_escape_word() tests eight bytes at once: it is true if one of them
+ * is below 0x20, is 0x7F or more, or is '"' or '\\', the bytes that
+ * nxt_var_escaped() escapes.  The test is exact for each of the four terms:
+ * a carry in "w + NXT_VAR_ONES" needs a byte 0xFF, which "w" itself already
+ * flags, and NXT_VAR_ZERO() and NXT_VAR_BELOW() are the usual "haszero" and
+ * "hasless" tests, exact for n up to 0x80.
+ *
+ * The escape functions test each block of eight bytes once.  A clean block,
+ * the common case, is passed or copied whole; a block with a byte to escape
+ * goes through the byte loop, so a value with many such bytes costs about
+ * what the plain byte loop costs.
+ */
+
+nxt_inline nxt_bool_t
+nxt_var_escape_word(const u_char *p)
+{
+    uint64_t  w;
+
+    nxt_memcpy(&w, p, 8);
+
+    return (((w | (w + NXT_VAR_ONES)) & NXT_VAR_HIGH)
+            | NXT_VAR_BELOW(w, 0x20)
+            | NXT_VAR_ZERO(w ^ (NXT_VAR_ONES * '"'))
+            | NXT_VAR_ZERO(w ^ (NXT_VAR_ONES * '\\'))) != 0;
+}
+
+
 size_t
 nxt_var_escape_length(const u_char *p, size_t length)
 {
-    size_t  size, i;
+    size_t        size;
+    const u_char  *end, *stop;
+
+    /* An absent value has a NULL start and no bytes. */
+
+    if (length == 0) {
+        return 0;
+    }
 
     size = length;
+    end = p + length;
 
-    for (i = 0; i < length; i++) {
-        if (nxt_var_escaped(p[i])) {
-            /* One byte becomes the four of "\xHH". */
-            size += 3;
+    while (p < end) {
+
+        if (end - p >= 8) {
+            stop = p + 8;
+
+            if (!nxt_var_escape_word(p)) {
+                p = stop;
+                continue;
+            }
+
+        } else {
+            stop = end;
+        }
+
+        while (p < stop) {
+            if (nxt_var_escaped(*p++)) {
+                /* One byte becomes the four of "\xHH". */
+                size += 3;
+            }
         }
     }
 
@@ -505,23 +565,45 @@ nxt_var_escape_length(const u_char *p, size_t length)
 u_char *
 nxt_var_escape(u_char *dst, const u_char *src, size_t length)
 {
+    u_char        c;
+    const u_char  *end, *stop;
+
     static const u_char  hex[] = "0123456789ABCDEF";
 
-    size_t  i;
-    u_char  c;
+    if (length == 0) {
+        return dst;
+    }
 
-    for (i = 0; i < length; i++) {
-        c = src[i];
+    end = src + length;
 
-        if (!nxt_var_escaped(c)) {
-            *dst++ = c;
-            continue;
+    while (src < end) {
+
+        if (end - src >= 8) {
+            stop = src + 8;
+
+            if (!nxt_var_escape_word(src)) {
+                dst = nxt_cpymem(dst, src, 8);
+                src = stop;
+                continue;
+            }
+
+        } else {
+            stop = end;
         }
 
-        *dst++ = '\\';
-        *dst++ = 'x';
-        *dst++ = hex[c >> 4];
-        *dst++ = hex[c & 0xf];
+        while (src < stop) {
+            c = *src++;
+
+            if (!nxt_var_escaped(c)) {
+                *dst++ = c;
+                continue;
+            }
+
+            *dst++ = '\\';
+            *dst++ = 'x';
+            *dst++ = hex[c >> 4];
+            *dst++ = hex[c & 0xf];
+        }
     }
 
     return dst;

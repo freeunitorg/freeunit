@@ -271,6 +271,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_var_escape_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_string_test(thr) != NXT_OK) {
         return 1;
     }
