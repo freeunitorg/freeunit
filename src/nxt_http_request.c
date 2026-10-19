@@ -1218,7 +1218,8 @@ nxt_http_request_close_handler(nxt_task_t *task, void *obj, void *data)
         if (rtcf->access_log != NULL) {
             access_log = rtcf->access_log;
 
-            if (nxt_http_cond_value(task, r, &rtcf->log_cond)) {
+            /* -1 means that the condition could not be rendered: no record. */
+            if (nxt_http_cond_value(task, r, &rtcf->log_cond) > 0) {
                 access_log->handler(task, r, access_log, rtcf->log_format);
                 return;
             }

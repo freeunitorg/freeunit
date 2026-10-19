@@ -552,6 +552,38 @@ def test_access_log_if_njs(require, search_in_file, wait_for_record):
     assert search_in_file(r'^/foo_2$', 'access.log') is None
 
 
+def test_access_log_if_njs_exception(
+    require, search_in_file, skip_alert, wait_for_record
+):
+    require({'modules': {'njs': 'any'}})
+    skip_alert(r'js exception')
+
+    load('empty')
+    set_format('$uri')
+
+    # Without "x" in the query, "args.x" is undefined and the condition
+    # throws.  An unrendered condition is not a true one, so the request
+    # gets no record; the same expression in a route "match" ends the
+    # request with a 500.
+    set_if('`${args.x.length == 1}`')
+
+    assert client.get(url='/throws')['status'] == 200
+    assert client.get(url='/logged?x=a')['status'] == 200
+
+    # "!" negates the value of a condition that renders.  It does not turn
+    # the failure to render one into a record.
+    set_if('!`${args.x.length == 1}`')
+
+    assert client.get(url='/throws_negated')['status'] == 200
+    assert client.get(url='/logged_negated?x=ab')['status'] == 200
+
+    assert wait_for_record(r'^/logged$', 'access.log') is not None
+    assert wait_for_record(r'^/logged_negated$', 'access.log') is not None
+
+    assert search_in_file(r'^/throws$', 'access.log') is None
+    assert search_in_file(r'^/throws_negated$', 'access.log') is None
+
+
 def test_access_log_format_njs(require, search_in_file, wait_for_record):
     require({'modules': {'njs': 'any'}})
 

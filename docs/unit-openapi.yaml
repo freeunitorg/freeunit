@@ -1012,6 +1012,90 @@ paths:
         "404":
           $ref: "#/components/responses/responseNotFound"
 
+  /config/access_log/if:
+    summary: "Endpoint for the `if` access log option"
+    get:
+      operationId: getAccessLogIf
+      summary: "Retrieve the access log if option"
+      description: "Retrieves the `if` option that represents the condition a
+        request must meet to be
+        [logged](https://unit.nginx.org/configuration/#access-log)
+        in the `access_log` object."
+
+      tags:
+        - access log
+        - config
+
+      responses:
+        "200":
+          description: "OK; the `if` option exists in the configuration."
+
+          content:
+            application/json:
+              schema:
+                type: string
+
+              examples:
+                if:
+                  value: "`${vars.status != 200}`"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+    put:
+      operationId: updateAccessLogIf
+      summary: "Create or overwrite the access log if option"
+      description: "Creates or overwrites the `if` option in the `access_log`
+        object. A request is logged when the condition renders to anything
+        other than an empty string, `0`, `false`, `null`, or `undefined`; a
+        leading `!` negates the result. A condition that cannot be rendered,
+        such as a JS expression that throws, is not true: the request is not
+        logged. A JS expression that throws is reported in the error log."
+
+      tags:
+        - access log
+        - config
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: string
+
+            examples:
+              if:
+                value: "`${vars.status != 200}`"
+
+      responses:
+        "200":
+          $ref: "#/components/responses/responseOkUpdated"
+
+        "400":
+          $ref: "#/components/responses/responseBadRequest"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+        "500":
+          $ref: "#/components/responses/responseInternalError"
+
+    delete:
+      operationId: deleteAccessLogIf
+      summary: "Delete the access log if option"
+      description: "Deletes the `if` option from the `access_log` object;
+        every request is logged again."
+      tags:
+        - access log
+        - config
+
+      responses:
+        "200":
+          $ref: "#/components/responses/responseOkDeleted"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
   /config/access_log/path:
     summary: "Endpoint for the `path` access log option"
     get:
@@ -7024,6 +7108,17 @@ components:
 
           default: '$remote_addr - - [$time_local] "$request_line" $status
             $body_bytes_sent "$header_referer" "$header_user_agent"'
+
+        if:
+          description: "Condition that must be true for a request to be
+            logged. The value is a template string; it is false when it
+            renders to an empty string, `0`, `false`, `null`, or
+            `undefined`, and true otherwise. A leading `!` negates the
+            result. A condition that cannot be rendered, such as a JS
+            expression that throws, is not true: the request is not logged.
+            A JS expression that throws is reported in the error log."
+
+          type: string
 
         path:
           type: string
