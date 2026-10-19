@@ -72,6 +72,16 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        more, or less than -2147483648, is refused, and unitd starts with no
        configuration until it is corrected.
 
+    *) Change: unitd now writes a warning to its log each time it applies a
+       configuration with an access log format that names the Authorization,
+       Proxy-Authorization, Cookie or Set-Cookie header, as $header_<name> or
+       $response_header_<name>, because the log file then holds a bearer token
+       or a session cookie. The configuration is still accepted, and the
+       header is still written to the log. Other variables can copy a secret
+       to the log too, with no warning: $cookie_<name>, $arg_<name>, $args,
+       $request_uri, $request_line, a header with another name and an njs
+       template.
+
     *) Bugfix: a request that arrived while unitd started could hang for
        ever, and the log showed "get_port_handler: port N:1 not found". A
        router thread accepted the connection before the router knew the
