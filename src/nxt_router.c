@@ -8721,22 +8721,26 @@ nxt_router_app_prepare_request(nxt_task_t *task,
          * socket is full or messages already wait for it, the workers have
          * unread doorbells, so another one wakes nobody new; queueing it
          * would only grow port->messages without bound while busy workers
-         * keep dequeuing ahead of their doorbells.
+         * keep dequeuing ahead of their doorbells.  The test and the send
+         * share one port->write_mutex critical section.
          */
-        if (notify != 0 && port->id == NXT_SHARED_PORT_ID
-            && nxt_port_socket_backlogged(port))
-        {
-            nxt_debug(task, "shared port backlogged, doorbell skipped");
-            notify = 0;
-        }
+        if (notify != 0 && port->id == NXT_SHARED_PORT_ID) {
+            if (nxt_port_socket_doorbell(task, port, req_rpc_data->stream,
+                                         reply_port->id)
+                == NXT_DONE)
+            {
+                nxt_debug(task, "shared port backlogged, doorbell skipped");
+                notify = 0;
+            }
 
-        if (notify != 0) {
+        } else if (notify != 0) {
             (void) nxt_port_socket_write(task, port,
                                          NXT_PORT_MSG_READ_QUEUE,
                                          -1, req_rpc_data->stream,
                                          reply_port->id, NULL);
+        }
 
-        } else {
+        if (notify == 0) {
             /*
              * No doorbell: the item landed at or beyond depth_bound, the
              * one-reader flag was already set (depth_bound 1), or the

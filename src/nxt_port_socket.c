@@ -29,8 +29,11 @@
 
 static uint8_t nxt_port_enqueue_buf(nxt_task_t *task, nxt_port_msg_t *pm,
     void *qbuf, nxt_buf_t *b);
+static nxt_int_t nxt_port_socket_send(nxt_task_t *task, nxt_port_t *port,
+    nxt_uint_t type, nxt_fd_t fd, nxt_fd_t fd2, uint32_t stream,
+    nxt_port_id_t reply_port, nxt_buf_t *b, nxt_bool_t skip_backlogged);
 static nxt_int_t nxt_port_msg_chk_insert(nxt_task_t *task, nxt_port_t *port,
-    nxt_port_send_msg_t *msg);
+    nxt_port_send_msg_t *msg, nxt_bool_t skip_backlogged);
 static nxt_port_send_msg_t *nxt_port_msg_alloc(const nxt_port_send_msg_t *m);
 static nxt_int_t nxt_port_msg_dup_fds(nxt_port_send_msg_t *msg);
 static nxt_int_t nxt_port_write_msgs(nxt_task_t *task, void *obj,
@@ -294,6 +297,34 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
     nxt_fd_t fd, nxt_fd_t fd2, uint32_t stream, nxt_port_id_t reply_port,
     nxt_buf_t *b)
 {
+    return nxt_port_socket_send(task, port, type, fd, fd2, stream, reply_port,
+                                b, 0);
+}
+
+
+/*
+ * Send a READ_QUEUE doorbell unless the port is backlogged: the socket
+ * buffer is full or earlier messages still wait in port->messages.  Then the
+ * peer has unread doorbells and this one is redundant.  The test and the
+ * send decision share one port->write_mutex critical section, in
+ * nxt_port_msg_chk_insert().  A skipped doorbell is not queued and answers
+ * NXT_DONE.
+ */
+
+nxt_int_t
+nxt_port_socket_doorbell(nxt_task_t *task, nxt_port_t *port, uint32_t stream,
+    nxt_port_id_t reply_port)
+{
+    return nxt_port_socket_send(task, port, NXT_PORT_MSG_READ_QUEUE, -1, -1,
+                                stream, reply_port, NULL, 1);
+}
+
+
+static nxt_int_t
+nxt_port_socket_send(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
+    nxt_fd_t fd, nxt_fd_t fd2, uint32_t stream, nxt_port_id_t reply_port,
+    nxt_buf_t *b, nxt_bool_t skip_backlogged)
+{
     int                  notify;
     uint8_t              qmsg_size;
     nxt_int_t            res;
@@ -433,7 +464,7 @@ nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port, nxt_uint_t type,
         }
     }
 
-    res = nxt_port_msg_chk_insert(task, port, &msg);
+    res = nxt_port_msg_chk_insert(task, port, &msg, skip_backlogged);
     if (nxt_fast_path(res == NXT_DECLINED)) {
         /*
          * Inline, with this stack copy: the answer is whether the port took
@@ -556,32 +587,9 @@ nxt_port_enqueue_buf(nxt_task_t *task, nxt_port_msg_t *pm, void *qbuf,
 }
 
 
-/*
- * Whether a write to the port would be queued in port->messages rather than
- * reach the socket: the socket buffer is full or earlier messages are still
- * waiting for it.  The answer is a snapshot; callers use it only to skip a
- * message that is redundant while the peer has unread ones (READ_QUEUE).
- */
-
-nxt_bool_t
-nxt_port_socket_backlogged(nxt_port_t *port)
-{
-    nxt_bool_t  backlogged;
-
-    nxt_thread_mutex_lock(&port->write_mutex);
-
-    backlogged = !port->socket.write_ready
-                 || !nxt_queue_is_empty(&port->messages);
-
-    nxt_thread_mutex_unlock(&port->write_mutex);
-
-    return backlogged;
-}
-
-
 static nxt_int_t
 nxt_port_msg_chk_insert(nxt_task_t *task, nxt_port_t *port,
-    nxt_port_send_msg_t *msg)
+    nxt_port_send_msg_t *msg, nxt_bool_t skip_backlogged)
 {
     nxt_int_t   res;
     nxt_bool_t  has_fd, over_bound;
@@ -595,6 +603,10 @@ nxt_port_msg_chk_insert(nxt_task_t *task, nxt_port_t *port,
                       && nxt_queue_is_empty(&port->messages)))
     {
         res = NXT_DECLINED;
+
+    } else if (skip_backlogged) {
+        /* Backlogged: see nxt_port_socket_doorbell(). */
+        res = NXT_DONE;
 
     } else if (nxt_slow_path(has_fd
                              && port->fd_messages >= NXT_PORT_MAX_FD_MSGS))
