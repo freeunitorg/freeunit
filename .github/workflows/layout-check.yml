@@ -10,10 +10,10 @@ name: "Layout check (pahole)"
 # process-local struct that a module lays out from the installed headers,
 # fails the job.
 #
-# The same job also compares the declarations of the public functions
-# (tools/perf/api-signatures.py, from the headers of both commits) and the
-# structs and enumerators the headers carry (tools/perf/layout-coverage.py,
-# from the head).  Neither needs a build.
+# The same job also compares the declarations of the public functions and
+# callback typedefs (tools/perf/api-signatures.py, from the headers of both
+# commits) and the structs and enumerators the headers carry
+# (tools/perf/layout-coverage.py, from the head).  Neither needs a build.
 #
 # Each pull request runs the job, with no path filter.  A skipped job
 # reports success, and a typedef, a build flag or a new header can change

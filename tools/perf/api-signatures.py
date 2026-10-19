@@ -2,15 +2,17 @@
 
 # Copyright (C) FreeUnit contributors.
 #
-# Checks that the declarations of the public functions did not change between
-# two commits.
+# Checks that the declarations of the public functions and of the public
+# function-pointer typedefs did not change between two commits.
 #
 # A module or an embedder compiles the declarations of the installed headers
 # into its own object, so a change to a return type or to a parameter type
 # breaks it.  The tree builds and links without a word.
 # tools/perf/layout-check.sh covers a public function that disappears.  This
-# check compares only the functions declared in both commits.  It skips the
-# nxt_unit_test_ functions: they are NXT_TESTS hooks, not shipped ABI.
+# check compares only the declarations that are in both commits.  It skips
+# the nxt_unit_test_ functions: they are NXT_TESTS hooks, not shipped ABI.
+# The callbacks in nxt_unit_callbacks_s are struct members, not typedefs;
+# the pahole layout check prints their prototypes and compares them.
 #
 #   tools/perf/api-signatures.py BASE [HEAD]
 #   tools/perf/api-signatures.py --self-test
@@ -19,7 +21,8 @@
 # whitespace and the spaces around "*" are normalized, and parameter names
 # are dropped.  Thus a reformat or a parameter rename does not report.
 # Types, in return position and in the parameter list, do.  A macro that
-# stands for a type is compared as written.
+# stands for a type is compared as written.  A function-pointer typedef is
+# compared as its prototype, with the typedef keyword dropped.
 #
 # Run it from the repository root.
 #
@@ -36,6 +39,11 @@ COMMENT = re.compile(r'/\*.*?\*/|//[^\n]*', re.S)
 # A preprocessor line with its continuation lines.
 DIRECTIVE = re.compile(r'^[ \t]*#(?:[^\n\\]|\\\n)*', re.M)
 FUNC = re.compile(r'\b(nxt_unit_[a-z0-9_]+)\s*\(')
+# A function-pointer typedef: the name sits between "(*" and ")(", so FUNC
+# does not see it.
+FUNC_PTR = re.compile(
+    r'\btypedef\b\s*(?P<ret>[^;{}]*?)\s*\(\s*\*\s*'
+    r'(?P<name>nxt_unit_[a-z0-9_]+)\s*\)\s*\(')
 # A trailing word of a parameter is a name unless it is one of these.  The
 # list keeps "unsigned int" and friends whole when the parameter is unnamed.
 TYPES = {
@@ -113,6 +121,22 @@ def parameters(text):
     return out
 
 
+def inside_parens(piece, start):
+    """The text between START and its matching ")", or None."""
+
+    depth = 1
+    i = start
+
+    while i < len(piece) and depth:
+        if piece[i] == '(':
+            depth += 1
+        elif piece[i] == ')':
+            depth -= 1
+        i += 1
+
+    return piece[start:i - 1] if depth == 0 else None
+
+
 def drop_name(parameter):
     """A parameter without its name: "nxt_unit_ctx_t *ctx" -> "nxt_unit_ctx_t *"."""
 
@@ -139,6 +163,22 @@ def parse(text):
     text = re.sub(r'\s+', ' ', text)
 
     for piece in re.split(r'[;{}]', text):
+        m = FUNC_PTR.search(piece)
+        if m:
+            name = m.group('name')
+            # The NXT_TESTS hooks are not shipped ABI.
+            if name.startswith('nxt_unit_test_'):
+                continue
+
+            proto = inside_parens(piece, m.end())
+            ret = m.group('ret').strip()
+            if proto is None or not ret:
+                continue
+
+            args = ', '.join(drop_name(a) for a in parameters(proto))
+            found[name] = f'{ret} (*{name})({args})'
+            continue
+
         m = FUNC.search(piece)
         if not m:
             continue
@@ -148,18 +188,8 @@ def parse(text):
         if name.startswith('nxt_unit_test_'):
             continue
 
-        start = m.end()
-        depth = 1
-        i = start
-
-        while i < len(piece) and depth:
-            if piece[i] == '(':
-                depth += 1
-            elif piece[i] == ')':
-                depth -= 1
-            i += 1
-
-        if depth:
+        proto = inside_parens(piece, m.end())
+        if proto is None:
             continue
 
         ret = piece[:m.start()].strip()
@@ -167,7 +197,7 @@ def parse(text):
         if not ret:
             continue
 
-        args = ', '.join(drop_name(a) for a in parameters(piece[start:i - 1]))
+        args = ', '.join(drop_name(a) for a in parameters(proto))
         sep = '' if ret.endswith('*') else ' '
         found[name] = f'{ret}{sep}{name}({args})'
 
@@ -204,6 +234,13 @@ def self_test():
          {'nxt_unit_e':
           'static inline void nxt_unit_e(nxt_unit_sptr_t *, void *)'}),
         ('char*nxt_unit_f(int*x);', {'nxt_unit_f': 'char *nxt_unit_f(int *)'}),
+        ('typedef ssize_t (*nxt_unit_g)(nxt_unit_read_info_t *info,\n'
+         '    void *dst);',
+         {'nxt_unit_g':
+          'ssize_t (*nxt_unit_g)(nxt_unit_read_info_t *, void *)'}),
+        ('typedef int(*nxt_unit_h)(int);',
+         {'nxt_unit_h': 'int (*nxt_unit_h)(int)'}),
+        ('typedef void (*read_cb_t)(int);', {}),
     ]
 
     bad = 0
