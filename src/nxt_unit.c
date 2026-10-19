@@ -3642,6 +3642,18 @@ nxt_unit_free_outgoing_buf(nxt_unit_mmap_buf_t *mmap_buf)
 }
 
 
+#if (NXT_TESTS)
+static unsigned int  nxt_unit_test_read_buf_failure_count;
+
+
+void
+nxt_unit_test_read_buf_failures(unsigned int failures)
+{
+    nxt_unit_test_read_buf_failure_count = failures;
+}
+#endif
+
+
 static nxt_unit_read_buf_t *
 nxt_unit_read_buf_get(nxt_unit_ctx_t *ctx)
 {
@@ -3656,7 +3668,9 @@ nxt_unit_read_buf_get(nxt_unit_ctx_t *ctx)
 
     pthread_mutex_unlock(&ctx_impl->mutex);
 
-    nxt_socket_msg_oob_reset(&rbuf->oob);
+    if (nxt_fast_path(rbuf != NULL)) {
+        nxt_socket_msg_oob_reset(&rbuf->oob);
+    }
 
     return rbuf;
 }
@@ -3667,6 +3681,13 @@ nxt_unit_read_buf_get_impl(nxt_unit_ctx_impl_t *ctx_impl)
 {
     nxt_queue_link_t     *link;
     nxt_unit_read_buf_t  *rbuf;
+
+#if (NXT_TESTS)
+    if (nxt_slow_path(nxt_unit_test_read_buf_failure_count > 0)) {
+        nxt_unit_test_read_buf_failure_count--;
+        return NULL;
+    }
+#endif
 
     if (!nxt_queue_is_empty(&ctx_impl->free_rbuf)) {
         link = nxt_queue_first(&ctx_impl->free_rbuf);

@@ -511,6 +511,7 @@ int      nxt_unit_test_add_queue_port(nxt_unit_ctx_t *ctx, pid_t pid,
     uint16_t id, int out_fd, void *queue);
 void     nxt_unit_test_new_mmap_failures(unsigned int failures);
 void     nxt_unit_test_shm_probe_failures(unsigned int failures);
+void     nxt_unit_test_read_buf_failures(unsigned int failures);
 #endif
 
 #if (NXT_TESTS || NXT_FUZZ_BUILD)
