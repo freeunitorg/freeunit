@@ -1357,6 +1357,28 @@ nxt_port_recv_test_detached_persistent_fail(nxt_unit_ctx_t *ctx)
         WIFEXITED(status) && WEXITSTATUS(status) == 0,
         "persistent send failures trigger give-up teardown outside request");
 }
+
+
+static void
+nxt_port_recv_test_read_buf_fail(nxt_unit_ctx_t *ctx)
+{
+    pid_t  pid;
+
+    pid = fork();
+
+    if (pid == 0) {
+        int  rc;
+
+        nxt_unit_test_read_buf_failures(1);
+
+        rc = nxt_unit_run_once(ctx);
+
+        _exit(rc == NXT_UNIT_ERROR ? 0 : 1);
+    }
+
+    nxt_port_recv_test_child_wait(pid,
+        "nxt_unit_run_once() handles read buffer allocation failure");
+}
 #endif
 
 
@@ -1530,6 +1552,7 @@ main(void)
         "nxt_unit_run() returns on a retry that completes a quit");
     nxt_port_recv_test_deferred_quit_read(ctx, 1,
         "nxt_unit_run_ctx() returns on a retry that completes a quit");
+    nxt_port_recv_test_read_buf_fail(ctx2);
     nxt_port_recv_test_detached_single_fail(ctx);
 #endif
 
