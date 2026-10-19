@@ -360,12 +360,12 @@ jobs:
 
       # The legs link modules against libunit.a and run the prebuilt unitd
       # and unit_app_test.  Nothing they build relinks unitd, so the 124 MB
-      # Rust staticlib is dead weight in the artifact.  Keep unitd's symbol
-      # table but drop its debug info: the symbol table still names frames
-      # in a backtrace.
+      # Rust staticlib and the 10 MB core archive are dead weight in the
+      # artifact.  Keep unitd's symbol table but drop its debug info: the
+      # symbol table still names frames in a backtrace.
       - name: Trim the core build
         run: |
-          rm -f build/lib/libotel.a
+          rm -f build/lib/libotel.a build/lib/libnxt.a
           strip --strip-debug build/sbin/unitd
 
       # tar, not a bare upload: actions/upload-artifact stores a zip and
