@@ -1090,7 +1090,7 @@ nxt_process_broadcast_shm_ack(nxt_task_t *task, nxt_process_t *process)
      *
      * Only the lookup is done under the mutex.  Everything after it takes
      * other locks (nxt_process_use() takes this very mutex), and
-     * rt->processes_mutex is a leaf -- see src/nxt_process.c:150.
+     * rt->processes_mutex is a leaf -- see nxt_process_use().
      */
 
     nxt_thread_mutex_lock(&rt->processes_mutex);

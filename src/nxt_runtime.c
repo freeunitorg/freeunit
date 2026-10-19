@@ -1680,7 +1680,7 @@ nxt_runtime_process_free(nxt_runtime_t *rt, nxt_process_t *process)
         nxt_process_unlink(child);
     } nxt_queue_loop;
 
-    nxt_assert(process->use_count == 0);
+    nxt_assert(nxt_atomic_load(&process->use_count) == 0);
     nxt_assert(process->registered == 0);
     nxt_assert(nxt_queue_is_empty(&process->ports));
 
@@ -1872,8 +1872,7 @@ nxt_runtime_process_find(nxt_runtime_t *rt, nxt_pid_t pid)
  *
  * Cost, since this sits on the shared-memory message path: the find already
  * took the mutex, so the increment itself is free; the matching release in
- * nxt_process_use() is one additional acquisition of the same uncontended
- * global mutex per lookup.
+ * nxt_process_use() takes no lock unless it drops the last reference.
  */
 
 nxt_process_t *
@@ -1890,7 +1889,7 @@ nxt_runtime_process_ref(nxt_runtime_t *rt, nxt_pid_t pid)
 
     if (nxt_lvlhsh_find(&rt->processes, &lhq) == NXT_OK) {
         process = lhq.value;
-        process->use_count++;
+        (void) nxt_atomic_fetch_add(&process->use_count, 1);
 
     } else {
         nxt_thread_log_debug("process %PI not found", pid);
@@ -1923,7 +1922,7 @@ nxt_runtime_process_get(nxt_runtime_t *rt, nxt_pid_t pid)
          */
 
         process = lhq.value;
-        process->use_count++;
+        (void) nxt_atomic_fetch_add(&process->use_count, 1);
 
         nxt_thread_mutex_unlock(&rt->processes_mutex);
 

@@ -286,7 +286,7 @@ nxt_port_release(nxt_task_t *task, nxt_port_t *port)
          * before the unlink takes the mutex and fails the try-ref, and every
          * reader after it cannot reach the port at all.
          *
-         * rt->processes_mutex must stay a leaf (src/nxt_process.c:150), so
+         * rt->processes_mutex must stay a leaf (see nxt_process_use()), so
          * the process reference is dropped after the unlock:
          * nxt_process_use() takes the same mutex itself.
          */

@@ -113,7 +113,12 @@ struct nxt_process_s {
     nxt_queue_t              ports;      /* of nxt_port_t.link */
     nxt_process_state_t      state;
     nxt_bool_t               registered;
-    nxt_int_t                use_count;
+
+    /*
+     * Changed only by atomic operations.  It reaches zero only under
+     * rt->processes_mutex; see nxt_process_use().
+     */
+    nxt_atomic_t             use_count;
 
     /*
      * Latched, under rt->processes_mutex, when use_count reaches zero.  A
