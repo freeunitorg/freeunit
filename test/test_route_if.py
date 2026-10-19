@@ -3,8 +3,12 @@
 The condition uses the same syntax as the "if" option of the access log:
 a template string that is false when it renders to an empty string, "0",
 "false", "null" or "undefined", and true otherwise; a leading "!" negates
-the result.
+the result.  A condition that fails to render, such as an njs expression
+that throws, is an error in a route match rather than a non-match: the
+request ends as 500.  The access log writes no record for such a request.
 """
+
+import json
 
 import pytest
 
@@ -31,7 +35,7 @@ def setup_method_fixture():
 
 def set_if(condition):
     assert 'success' in client.conf(
-        f'"{condition}"', 'routes/0/match/if'
+        json.dumps(condition), 'routes/0/match/if'
     ), 'if configure'
 
 
@@ -80,6 +84,18 @@ def test_route_if_variable():
     assert client.get(url='/?bar=1')['status'] == 200, 'two variables'
     assert client.get(url='/?baz=1')['status'] == 404, 'two variables empty'
 
+    # The falsy set is compared against the rendered value, so a variable
+    # carrying one of those literals is false just as the literal is.
+
+    set_if('$arg_foo')
+    for value in ['0', 'false', 'null', 'undefined']:
+        assert (
+            client.get(url=f'/?foo={value}')['status'] == 404
+        ), f'"{value}" through a variable'
+    assert (
+        client.get(url='/?foo=00')['status'] == 200
+    ), '"00" through a variable'
+
 
 def test_route_if_njs(require):
     require({'modules': {'njs': 'any'}})
@@ -100,7 +116,7 @@ def test_route_if_njs(require):
 
     # regular expression
 
-    set_if('`${/^\\\\/admin/.test(uri)}`')
+    set_if('`${/^\\/admin/.test(uri)}`')
     assert client.get(url='/admin/index.html')['status'] == 200, 'regexp'
     assert client.get(url='/user/index.html')['status'] == 404, 'regexp no match'
 
@@ -123,6 +139,23 @@ def test_route_if_njs(require):
     set_if("`${vars.arg_foo != '' ? 1 : 0}`")
     assert client.get(url='/?foo=1')['status'] == 200, 'variable exists'
     assert client.get(url='/?bar=1')['status'] == 404, 'variable missing'
+
+
+def test_route_if_njs_exception(require, skip_alert):
+    require({'modules': {'njs': 'any'}})
+    skip_alert(r'js exception:')
+
+    # A condition that passes validation but throws at run time cannot be
+    # resolved to true or false, so the request fails instead of matching.
+
+    set_if('`${uri.a.a}`')
+    assert client.get()['status'] == 500, 'njs exception'
+
+    # Negating it does not turn the error into a match: the expression is
+    # evaluated before the negation is applied.
+
+    set_if('!`${uri.a.a}`')
+    assert client.get()['status'] == 500, 'negated njs exception'
 
 
 def test_route_if_match():
@@ -187,6 +220,14 @@ def test_route_if_invalid():
     assert 'error' in client.conf('1', 'routes/0/match/if'), 'not a string'
     assert 'error' in client.conf('["$arg_foo"]', 'routes/0/match/if'), 'array'
 
+    # A leading "!" does not excuse an invalid condition: nxt_conf_vldt_if()
+    # strips it and validates the rest.  This is rejected without the strip
+    # too; the case that needs the strip is in test_route_if_invalid_njs().
+
+    assert 'error' in client.conf(
+        '"!$arg_"', 'routes/0/match/if'
+    ), 'negated invalid var'
+
 
 def test_route_if_invalid_njs(require):
     require({'modules': {'njs': 'any'}})
@@ -194,3 +235,11 @@ def test_route_if_invalid_njs(require):
     assert 'error' in client.conf(
         '"`${args.foo`"', 'routes/0/match/if'
     ), 'invalid njs'
+
+    # Accepting this one needs the "!" stripped: nxt_tstr_is_js() looks for
+    # the backtick at offset 0, so an unstripped "!" would send the template
+    # to the variable parser, which rejects "${".
+
+    assert 'success' in client.conf(
+        '"!`${args.foo}`"', 'routes/0/match/if'
+    ), 'negated valid njs'

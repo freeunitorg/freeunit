@@ -30,7 +30,7 @@ def set_format(log_format):
 
 
 def set_if(condition):
-    assert 'success' in client.conf(f'"{condition}"', 'access_log/if')
+    assert 'success' in client.conf(json.dumps(condition), 'access_log/if')
 
 
 def test_access_log_keepalive(wait_for_record):
