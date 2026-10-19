@@ -1,0 +1,10 @@
+/usr/sbin/unitd		--	gen_context(system_u:object_r:unitd_exec_t,s0)
+
+/usr/lib/systemd/system/unit.*	--	gen_context(system_u:object_r:unitd_unit_file_t,s0)
+
+/var/run/unit(/.*)?		gen_context(system_u:object_r:unitd_var_run_t,s0)
+/run/unit(/.*)?			gen_context(system_u:object_r:unitd_var_run_t,s0)
+
+/var/log/unit(/.*)?		gen_context(system_u:object_r:unitd_log_t,s0)
+
+/var/lib/unit(/.*)?		gen_context(system_u:object_r:unitd_var_lib_t,s0)

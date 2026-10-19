@@ -1,0 +1,73 @@
+policy_module(unitd, 0.1.0)
+
+########################################
+#
+# Declarations
+#
+# Proof of concept only: confines unitd's main/router/controller
+# processes in a single unitd_t domain. Application processes
+# (PHP, Python, ...) currently stay in unitd_t too; a separate
+# application domain is future work.
+#
+
+type unitd_t;
+type unitd_exec_t;
+init_daemon_domain(unitd_t, unitd_exec_t)
+
+type unitd_unit_file_t;
+systemd_unit_file(unitd_unit_file_t)
+
+type unitd_var_run_t;
+files_pid_file(unitd_var_run_t)
+
+type unitd_log_t;
+logging_log_file(unitd_log_t)
+
+type unitd_var_lib_t;
+files_type(unitd_var_lib_t)
+
+########################################
+#
+# Local policy
+#
+
+# unitd starts as root, forks prototypes and drops to the "unit" user.
+allow unitd_t self:capability { chown dac_override fowner fsetid kill net_bind_service setgid setuid sys_resource };
+allow unitd_t self:process { fork setrlimit signal_perms };
+allow unitd_t self:fifo_file rw_fifo_file_perms;
+allow unitd_t self:unix_stream_socket { connectto create_stream_socket_perms };
+allow unitd_t self:unix_dgram_socket create_socket_perms;
+allow unitd_t self:tcp_socket create_stream_socket_perms;
+allow unitd_t self:udp_socket create_socket_perms;
+
+# Control socket (control.unit.sock) and pid file.
+manage_dirs_pattern(unitd_t, unitd_var_run_t, unitd_var_run_t)
+manage_files_pattern(unitd_t, unitd_var_run_t, unitd_var_run_t)
+manage_sock_files_pattern(unitd_t, unitd_var_run_t, unitd_var_run_t)
+files_pid_filetrans(unitd_t, unitd_var_run_t, { dir file sock_file })
+
+# Log file.
+manage_dirs_pattern(unitd_t, unitd_log_t, unitd_log_t)
+manage_files_pattern(unitd_t, unitd_log_t, unitd_log_t)
+logging_log_filetrans(unitd_t, unitd_log_t, { dir file })
+
+# State directory (conf.json, certs, scripts).
+manage_dirs_pattern(unitd_t, unitd_var_lib_t, unitd_var_lib_t)
+manage_files_pattern(unitd_t, unitd_var_lib_t, unitd_var_lib_t)
+files_var_lib_filetrans(unitd_t, unitd_var_lib_t, { dir file })
+
+# Listeners on HTTP ports.
+corenet_tcp_bind_generic_node(unitd_t)
+corenet_tcp_bind_http_port(unitd_t)
+corenet_tcp_connect_http_port(unitd_t)
+
+# Language modules and static content.
+files_read_usr_files(unitd_t)
+libs_exec_lib_files(unitd_t)
+miscfiles_read_localization(unitd_t)
+apache_read_sys_content(unitd_t)
+
+kernel_read_system_state(unitd_t)
+dev_read_urand(unitd_t)
+auth_use_nsswitch(unitd_t)
+logging_send_syslog_msg(unitd_t)
