@@ -175,7 +175,9 @@ if [ $nxt_found = no ]; then
                      \(thread-local storage support in the compiler and libc\).
     $echo The test either did not compile with \"$CC\" or did not run \
           correctly.
-    $echo If it did not compile, $NXT_AUTOCONF_ERR has the compiler output.
+    $echo $NXT_AUTOCONF_ERR has the compiler and test output.
+    $echo Use a compiler and libc with __thread, and build on a host that
+    $echo can run test programs.
     $echo
     exit 1;
 fi
