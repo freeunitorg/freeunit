@@ -53,6 +53,16 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        applications read only the first Accept-Encoding line of a
        request; it now reads every line.
 
+    *) Change: libunit on Linux 5.7 and later, 5.6.13 and later, and
+       5.4.41 and later now wakes one idle thread for each request
+       instead of all idle threads of the application. With 8 PHP
+       processes and one connection, an i5-6200U used 24% less CPU for
+       each request. With 2 processes and 2 connections on one CPU, it
+       served 7% to 10% fewer requests per second. On older releases,
+       and if the kernel does not accept the new wait, libunit waits as
+       before. This includes a distribution kernel that has the fix but
+       reports an older release.
+
     *) Change: a text access log escapes each value that a variable
        expands to with one test per eight bytes instead of four tests per
        byte, and copies a line with no byte to escape as it is. The access
