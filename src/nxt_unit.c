@@ -27,6 +27,20 @@
 #endif
 #endif
 
+/*
+ * The wait set of a context, for nxt_unit_wait_set_wait().  It is for an
+ * epoll set of the read port (read_fd) and the shared port (shared_fd):
+ * ep_fd is the descriptor of the set, and err is the errno of its first
+ * failure.  ep_fd is -1 when the set is not made.  The wait uses poll(),
+ * and it does not make a set.
+ */
+typedef struct {
+    int  ep_fd;
+    int  read_fd;
+    int  shared_fd;
+    int  err;
+} nxt_unit_wait_set_t;
+
 #define NXT_UNIT_MAX_PLAIN_SIZE  1024
 #define NXT_UNIT_LOCAL_BUF_SIZE  \
     (NXT_UNIT_MAX_PLAIN_SIZE + sizeof(nxt_port_msg_t))
@@ -195,6 +209,9 @@ static nxt_unit_process_t *nxt_unit_process_find(nxt_unit_impl_t *lib,
 static nxt_unit_process_t *nxt_unit_process_pop_first(nxt_unit_impl_t *lib);
 static int nxt_unit_run_once_impl(nxt_unit_ctx_t *ctx);
 static int nxt_unit_read_buf(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf);
+static void nxt_unit_wait_set_init(nxt_unit_wait_set_t *ws);
+static int nxt_unit_wait_set_wait(nxt_unit_wait_set_t *ws, struct pollfd *fds,
+    nxt_uint_t nfds, int timeout);
 static int nxt_unit_chk_ready(nxt_unit_ctx_t *ctx);
 static int nxt_unit_process_pending_rbuf(nxt_unit_ctx_t *ctx);
 static void nxt_unit_process_ready_req(nxt_unit_ctx_t *ctx);
@@ -543,6 +560,9 @@ struct nxt_unit_ctx_impl_s {
      * request handler returns.
      */
     uint8_t                       detached_unreported;  /* 1 bit */
+
+    /* See nxt_unit_wait_set_wait(). */
+    nxt_unit_wait_set_t           wait_set;
 
     nxt_unit_mmap_buf_t           ctx_buf[2];
     nxt_unit_read_buf_t           ctx_read_buf;
@@ -982,6 +1002,8 @@ nxt_unit_ctx_init(nxt_unit_impl_t *lib, nxt_unit_ctx_impl_t *ctx_impl,
 
     ctx_impl->read_port = NULL;
     ctx_impl->requests.slot = NULL;
+
+    nxt_unit_wait_set_init(&ctx_impl->wait_set);
 
     return NXT_UNIT_OK;
 }
@@ -6867,7 +6889,7 @@ retry:
 
     fds[1].revents = 0;
 
-    nevents = poll(fds, nfds, timeout);
+    nevents = nxt_unit_wait_set_wait(&ctx_impl->wait_set, fds, nfds, timeout);
 
     if (nxt_slow_path(nevents == 0)) {
         if (ctx_impl->detached_retries == 0) {
@@ -6923,6 +6945,91 @@ retry:
 
     return NXT_UNIT_ERROR;
 }
+
+
+static void
+nxt_unit_wait_set_init(nxt_unit_wait_set_t *ws)
+{
+    ws->ep_fd = -1;
+    ws->read_fd = -1;
+    ws->shared_fd = -1;
+    ws->err = 0;
+}
+
+
+/*
+ * Waits for a message on the read port of a context (fds[0]) and, when
+ * nfds is 2, on the shared port of the application (fds[1]).  It waits as
+ * poll(fds, nfds, timeout) does, and returns the same values.
+ *
+ * The router sends one READ_QUEUE datagram to the shared port for each
+ * request that it puts in the first "depth_bound" positions of the queue
+ * (nxt_app_queue_send_bound()).  With poll(), each datagram wakes every
+ * context that waits, in every process of the application.  One context
+ * takes the request.  The others make a recvmsg() that fails with EAGAIN,
+ * and wait again.  src/test/nxt_unit_wake_test.c counts these wakeups.
+ */
+
+static int
+nxt_unit_wait_set_wait(nxt_unit_wait_set_t *ws, struct pollfd *fds,
+    nxt_uint_t nfds, int timeout)
+{
+    return poll(fds, nfds, timeout);
+}
+
+
+#if (NXT_TESTS)
+
+/*
+ * For src/test/nxt_unit_wake_test.c: a wait set without a context, and one
+ * wait of a context on it.  revents[0] is for read_fd, and revents[1] is
+ * for shared_fd.
+ */
+
+void *
+nxt_unit_test_wait_set_new(void)
+{
+    nxt_unit_wait_set_t  *ws;
+
+    ws = nxt_unit_malloc(NULL, sizeof(nxt_unit_wait_set_t));
+    if (ws != NULL) {
+        nxt_unit_wait_set_init(ws);
+    }
+
+    return ws;
+}
+
+
+int
+nxt_unit_test_wait(void *ws, int read_fd, int shared_fd, int timeout,
+    short *revents)
+{
+    int            n;
+    struct pollfd  fds[2];
+
+    fds[0].fd = read_fd;
+    fds[0].events = POLLIN;
+    fds[0].revents = 0;
+    fds[1].fd = shared_fd;
+    fds[1].events = POLLIN;
+    fds[1].revents = 0;
+
+    n = nxt_unit_wait_set_wait(ws, fds, 2, timeout);
+
+    revents[0] = fds[0].revents;
+    revents[1] = fds[1].revents;
+
+    return n;
+}
+
+
+void
+nxt_unit_test_wait_set_free(void *ws)
+{
+    nxt_unit_free(NULL, ws);
+}
+
+#endif
 
 
 static int
