@@ -17,6 +17,12 @@
 #include "nxt_unit_typedefs.h"
 
 
+/*
+ * A binding that declares these structs again in another language must
+ * match their layout: see docs/libunit-abi.md, and tools/perf/layout-dump.sh
+ * for the offsets on a platform.
+ */
+
 enum {
     NXT_UNIT_OK          = 0,
     NXT_UNIT_ERROR       = 1,

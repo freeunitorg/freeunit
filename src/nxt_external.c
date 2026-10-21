@@ -118,7 +118,7 @@ nxt_external_start(nxt_task_t *task, nxt_process_data_t *data)
 
     end = buf + sizeof(buf);
 
-    /* nxt_unit_read_env() reads this; keep the two in step. */
+    /* nxt_unit_read_env() reads this; docs/libunit-abi.md has the format. */
 
     p = nxt_sprintf(buf, end,
                     "%s/%d;%uD;"
