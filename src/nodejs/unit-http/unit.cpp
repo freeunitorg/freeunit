@@ -355,6 +355,7 @@ Unit::create_server(napi_env env, napi_callback_info info)
 
     memset(&unit_init, 0, sizeof(nxt_unit_init_t));
 
+    unit_init.size = sizeof(nxt_unit_init_t);
     unit_init.data = obj;
     unit_init.callbacks.request_handler   = request_handler_cb;
     unit_init.callbacks.websocket_handler = websocket_handler_cb;

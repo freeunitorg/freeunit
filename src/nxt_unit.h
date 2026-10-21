@@ -129,6 +129,12 @@ struct nxt_unit_request_info_s {
 /*
  * Set of application-specific callbacks.  The application may leave all
  * optional callbacks as NULL.
+ *
+ * Frozen since 1.38 at these 12 members.  nxt_unit_init_t holds the struct
+ * by value, so a member added here would move every field after
+ * "callbacks" in nxt_unit_init_t, and an embedder that mirrors the struct
+ * in another language would read them at the old offsets.  A new hook is
+ * added at the end of nxt_unit_init_t, after "size".
  */
 struct nxt_unit_callbacks_s {
     /*
@@ -176,14 +182,28 @@ struct nxt_unit_callbacks_s {
     ssize_t  (*port_recv)(nxt_unit_ctx_t *, nxt_unit_port_t *port,
                  void *buf, size_t buf_size, void *oob, size_t *oob_size);
 
+    /*
+     * The main context became ready for requests.  Optional.  A result
+     * other than NXT_UNIT_OK stops the read loop.
+     */
     int      (*ready_handler)(nxt_unit_ctx_t *);
 };
 
+nxt_unit_layout_assert(callbacks_frozen,
+    sizeof(nxt_unit_callbacks_t) == 12 * sizeof(void (*)(void)),
+    "nxt_unit_callbacks_t is frozen: add a hook after nxt_unit_init_t.size");
 
+
+/*
+ * The fields up to "size" keep their offsets.  Fields and hooks that a
+ * later release adds go after "size", and libunit reads one only when
+ * "size" covers it.  An embedder that mirrors the struct sets "size" to the
+ * size of its mirror.
+ */
 struct nxt_unit_init_s {
     void                  *data;     /* Opaque pointer to user-defined data. */
     void                  *ctx_data; /* Opaque pointer to user-defined data. */
-    int                   max_pending_requests;
+    int                   max_pending_requests;  /* Unused. */
 
     uint32_t              request_data_size;
     uint32_t              shm_limit;
@@ -191,6 +211,11 @@ struct nxt_unit_init_s {
 
     nxt_unit_callbacks_t  callbacks;
 
+    /*
+     * Unless ready_port.id.pid, ready_stream and read_port.id.pid are all
+     * set, nxt_unit_init() ignores the fields from here to log_fd, and
+     * shm_limit and request_limit, and reads them from NXT_UNIT_INIT.
+     */
     nxt_unit_port_t       ready_port;
     uint32_t              ready_stream;
     nxt_unit_port_t       router_port;
@@ -198,6 +223,14 @@ struct nxt_unit_init_s {
     int                   shared_port_fd;
     int                   shared_queue_fd;
     int                   log_fd;
+
+    /*
+     * sizeof(nxt_unit_init_t) as the caller built it, or 0 for the struct
+     * of 1.38, which ends here.  On LP64 the field takes the padding at the
+     * end, so the size stays 248 bytes.  nxt_unit_init() refuses a size
+     * that is smaller than the 1.38 struct or larger than its own.
+     */
+    uint32_t              size;
 };
 
 

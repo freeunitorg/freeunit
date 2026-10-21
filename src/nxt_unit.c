@@ -37,6 +37,10 @@
 #define NXT_UNIT_QUEUE_PLAIN_SIZE  \
     (NXT_PORT_QUEUE_MSG_SIZE - sizeof(nxt_port_msg_t))
 
+/* nxt_unit_init_t up to and including "size", as 1.38 has it. */
+#define NXT_UNIT_INIT_SIZE_1_38  \
+    (offsetof(nxt_unit_init_t, size) + sizeof(uint32_t))
+
 /* nxt_unit_impl_t.shm: what the outgoing shared memory last showed. */
 #define NXT_UNIT_SHM_UNKNOWN  0
 #define NXT_UNIT_SHM_OK       1
@@ -831,7 +835,27 @@ static nxt_unit_impl_t *
 nxt_unit_create(nxt_unit_init_t *init)
 {
     int              rc;
+    size_t           size;
     nxt_unit_impl_t  *lib;
+
+    /*
+     * 0 is the struct of 1.38, which ends with "size".  A field added after
+     * it is read only when "size" covers it, and a caller that knows more
+     * fields than this libunit is refused: it was built for a later one.
+     */
+    size = init->size;
+
+    if (nxt_slow_path(size != 0
+                      && (size < NXT_UNIT_INIT_SIZE_1_38
+                          || size > sizeof(nxt_unit_init_t))))
+    {
+        nxt_unit_alert(NULL, "nxt_unit_init_t.size is %u, while this libunit "
+                       "takes 0, or %u to %u", (unsigned) size,
+                       (unsigned) NXT_UNIT_INIT_SIZE_1_38,
+                       (unsigned) sizeof(nxt_unit_init_t));
+
+        return NULL;
+    }
 
     if (nxt_slow_path(init->callbacks.request_handler == NULL)) {
         nxt_unit_alert(NULL, "request_handler is NULL");
