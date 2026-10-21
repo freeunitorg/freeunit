@@ -792,7 +792,12 @@ nxt_epoll_signalfd_handler(nxt_task_t *task, void *obj, void *data)
     }
 
     if (n != sizeof(struct signalfd_siginfo)) {
-        nxt_alert(task, "read signalfd(%d) failed %E", ev->fd, err);
+        if (n == -1) {
+            nxt_alert(task, "read signalfd(%d) failed %E", ev->fd, err);
+        } else {
+            nxt_alert(task, "read signalfd(%d) returned %d", ev->fd, n);
+        }
+
         return;
     }
 
@@ -800,6 +805,20 @@ nxt_epoll_signalfd_handler(nxt_task_t *task, void *obj, void *data)
 
     handler(task, (void *) (uintptr_t) sfd.ssi_signo, NULL);
 }
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_signalfd_test.c. */
+
+void
+nxt_epoll_test_signalfd_handler(nxt_task_t *task, nxt_fd_event_t *ev,
+    nxt_work_handler_t handler)
+{
+    nxt_epoll_signalfd_handler(task, ev, handler);
+}
+
+#endif
 
 #endif
 

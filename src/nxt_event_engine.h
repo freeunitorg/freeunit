@@ -264,6 +264,12 @@ nxt_epoll_signalfd_eagain(ssize_t n, int err)
     return (n == -1 && err == NXT_EAGAIN);
 }
 
+#if (NXT_TESTS)
+/* The signalfd read handler, for the signalfd test. */
+void nxt_epoll_test_signalfd_handler(nxt_task_t *task, nxt_fd_event_t *ev,
+    nxt_work_handler_t handler);
+#endif
+
 #endif
 
 

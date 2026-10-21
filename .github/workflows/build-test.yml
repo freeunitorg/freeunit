@@ -358,11 +358,13 @@ jobs:
       - name: Make the libunit test application
         run: make -j$(nproc) build/unit_app_test
 
-      # The legs link modules against libunit.a and run the prebuilt unitd
-      # and unit_app_test.  Nothing they build relinks unitd, so the 124 MB
-      # Rust staticlib and the 10 MB core archive are dead weight in the
-      # artifact.  Keep unitd's symbol table but drop its debug info: the
-      # symbol table still names frames in a backtrace.
+      # The legs build their module from the shipped core objects and run
+      # the prebuilt unitd and unit_app_test: node and go archive
+      # libunit.a, ruby and php compile build/src/nxt_unit.o.  No leg runs
+      # make all, so unitd is not relinked.  The 124 MB Rust staticlib and
+      # the 10 MB core archive are dead weight in the artifact.  Keep
+      # unitd's symbol table but drop its debug info: the symbol table
+      # still names frames in a backtrace.
       - name: Trim the core build
         run: |
           rm -f build/lib/libotel.a build/lib/libnxt.a
