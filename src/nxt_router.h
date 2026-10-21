@@ -393,6 +393,14 @@ typedef struct {
 } nxt_socket_conf_joint_t;
 
 
+/*
+ * Draft for the 1.38 configurable bound (D2): a JSON record past this size is
+ * dropped whole and counted.  The bound includes the trailing newline.  The
+ * text format stays unbounded; that decision is part of the same work.
+ */
+#define NXT_ACCESS_LOG_MAX_RECORD  4096
+
+
 struct nxt_router_access_log_s {
     void                   (*handler)(nxt_task_t *task, nxt_http_request_t *r,
                                       nxt_router_access_log_t *access_log,
