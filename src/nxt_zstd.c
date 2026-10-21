@@ -9,6 +9,10 @@
 
 #include <zstd.h>
 
+#if (ZSTD_VERSION_NUMBER < 10400)
+#error "zstd compression needs libzstd 1.4.0 or later (ZSTD_compressStream2)"
+#endif
+
 #include "nxt_http_compression.h"
 
 
@@ -34,6 +38,14 @@ nxt_zstd_bound(const nxt_http_comp_compressor_ctx_t *ctx, size_t in_len)
 }
 
 
+/*
+ * Each call flushes, as zlib (Z_SYNC_FLUSH) and brotli (BROTLI_OPERATION_FLUSH)
+ * do, so a part of a streamed response leaves as soon as it arrives.  The
+ * last call ends the frame.  The caller sizes the output buffer for that;
+ * input or flushed output that does not fit is an error, not a partial
+ * write.
+ */
+
 static ssize_t
 nxt_zstd_compress(nxt_http_comp_compressor_ctx_t *ctx, const uint8_t *in_buf,
                   size_t in_len, uint8_t *out_buf, size_t out_len, bool last)
@@ -43,17 +55,10 @@ nxt_zstd_compress(nxt_http_comp_compressor_ctx_t *ctx, const uint8_t *in_buf,
     ZSTD_inBuffer   zinb = { .src = in_buf, .size = in_len };
     ZSTD_outBuffer  zoutb = { .dst = out_buf, .size = out_len };
 
-    ret = ZSTD_compressStream(zstd, &zoutb, &zinb);
+    ret = ZSTD_compressStream2(zstd, &zoutb, &zinb,
+                               last ? ZSTD_e_end : ZSTD_e_flush);
 
-    if (zinb.pos < zinb.size) {
-        ret = ZSTD_flushStream(zstd, &zoutb);
-    }
-
-    if (last) {
-        ret = ZSTD_endStream(zstd, &zoutb);
-    }
-
-    if (ZSTD_isError(ret)) {
+    if (ZSTD_isError(ret) || ret != 0 || zinb.pos < zinb.size) {
         return -1;
     }
 

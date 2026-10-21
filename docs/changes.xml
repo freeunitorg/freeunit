@@ -714,6 +714,22 @@ record(s)", and GET /status reports the count.
 </para>
 </change>
 
+<change type="change">
+<para>
+zstd 1.4.0 or later is now required to build with "--zstd"; configure fails
+with an explicit message on older releases.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a zstd-compressed response held its output until a full 128 KiB block was
+ready or the response ended, so a streamed response (PHP flush(), server-sent
+events) stalled with zstd while gzip and br delivered each part. Each part is
+now flushed.
+</para>
+</change>
+
 </changes>
 
 

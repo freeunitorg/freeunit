@@ -1,6 +1,14 @@
 
 Changes with FreeUnit 1.37.1                                     04 Oct 2026
 
+    *) Bugfix: a zstd-compressed response held its output until a full
+       128 KiB block was ready or the response ended, so a streamed
+       response (PHP flush(), server-sent events) stalled with zstd while
+       gzip and br delivered each part. Each part is now flushed.
+
+    *) Change: zstd 1.4.0 or later is now required to build with "--zstd";
+       configure fails with an explicit message on older releases.
+
     *) Change: a text access log escapes each value that a variable
        expands to with one test per eight bytes instead of four tests per
        byte, and copies a line with no byte to escape as it is. The access

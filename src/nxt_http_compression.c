@@ -480,6 +480,14 @@ nxt_http_comp_compress_static_response(nxt_task_t *task, nxt_http_request_t *r,
     tfile.name = (nxt_file_name_t *)tmp_path;
 
     in_size = nxt_file_size(fi);
+
+    /*
+     * One bound for the whole file, although each static_buf_len piece but
+     * the last is flushed.  The bound of the whole file covers those flush
+     * markers: for zstd, a 3-byte block header per piece, while for a file
+     * of n bytes with more than one 128 KiB piece bound(n) - n is at least
+     * n / 256, that is at least 512 bytes per piece.
+     */
     out_size = nxt_http_comp_bound(ctx, in_size);
 
     ret = ftruncate(tfile.fd, out_size);
