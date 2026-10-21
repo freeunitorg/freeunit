@@ -28,11 +28,28 @@
 #endif
 
 /*
- * The wait set of a context, for nxt_unit_wait_set_wait().  It is for an
- * epoll set of the read port (read_fd) and the shared port (shared_fd):
- * ep_fd is the descriptor of the set, and err is the errno of its first
- * failure.  ep_fd is -1 when the set is not made.  The wait uses poll(),
- * and it does not make a set.
+ * An idle context waits on its read port and on the shared port of the
+ * application.  With poll(), one READ_QUEUE datagram on the shared port
+ * wakes every idle context of every process of the application.  With an
+ * epoll set per context and EPOLLEXCLUSIVE on the shared port, it wakes
+ * one.  See nxt_unit_wait_set_wait().
+ */
+#if (NXT_HAVE_EPOLL) && defined(EPOLLEXCLUSIVE)
+#define NXT_UNIT_EPOLL      1
+#include <sys/utsname.h>
+#else
+#define NXT_UNIT_EPOLL      0
+#endif
+
+#define NXT_UNIT_EPOLL_OFF  (-2)
+
+/*
+ * The wait set of a context, for nxt_unit_wait_set_wait(): an epoll set of
+ * the read port (read_fd) and the shared port (shared_fd).  ep_fd is the
+ * descriptor of the set.  It is -1 when the set is not made, and
+ * NXT_UNIT_EPOLL_OFF when the context does not use a set; then the wait
+ * uses poll().  err is the errno of the first failure, 0 before it.  Only
+ * that failure is reported.
  */
 typedef struct {
     int  ep_fd;
@@ -209,9 +226,18 @@ static nxt_unit_process_t *nxt_unit_process_find(nxt_unit_impl_t *lib,
 static nxt_unit_process_t *nxt_unit_process_pop_first(nxt_unit_impl_t *lib);
 static int nxt_unit_run_once_impl(nxt_unit_ctx_t *ctx);
 static int nxt_unit_read_buf(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf);
+static int nxt_unit_ctx_wait(nxt_unit_ctx_t *ctx, struct pollfd *fds,
+    nxt_uint_t nfds, int timeout);
 static void nxt_unit_wait_set_init(nxt_unit_wait_set_t *ws);
+static void nxt_unit_wait_set_free(nxt_unit_wait_set_t *ws);
 static int nxt_unit_wait_set_wait(nxt_unit_wait_set_t *ws, struct pollfd *fds,
     nxt_uint_t nfds, int timeout);
+#if (NXT_UNIT_EPOLL)
+static int nxt_unit_epoll_kernel(void);
+static void nxt_unit_epoll_kernel_init(void);
+static int nxt_unit_epoll_release(const char *release);
+static int nxt_unit_wait_set_crowded(int fd);
+#endif
 static int nxt_unit_chk_ready(nxt_unit_ctx_t *ctx);
 static int nxt_unit_process_pending_rbuf(nxt_unit_ctx_t *ctx);
 static void nxt_unit_process_ready_req(nxt_unit_ctx_t *ctx);
@@ -6926,7 +6952,7 @@ retry:
 
     fds[1].revents = 0;
 
-    nevents = nxt_unit_wait_set_wait(&ctx_impl->wait_set, fds, nfds, timeout);
+    nevents = nxt_unit_ctx_wait(ctx, fds, nfds, timeout);
 
     if (nxt_slow_path(nevents == 0)) {
         if (ctx_impl->detached_retries == 0) {
@@ -6946,7 +6972,7 @@ retry:
             goto retry;
         }
 
-        nxt_unit_alert(ctx, "poll(%d,%d) failed: %s (%d)",
+        nxt_unit_alert(ctx, "wait(%d,%d) failed: %s (%d)",
                        fds[0].fd, fds[1].fd, strerror(err), err);
 
         rbuf->size = -1;
@@ -6954,7 +6980,7 @@ retry:
         return (err == EAGAIN) ? NXT_UNIT_AGAIN : NXT_UNIT_ERROR;
     }
 
-    nxt_unit_debug(ctx, "poll(%d,%d): %d, revents [%04X, %04X]",
+    nxt_unit_debug(ctx, "wait(%d,%d): %d, revents [%04X, %04X]",
                    fds[0].fd, fds[1].fd, nevents, fds[0].revents,
                    fds[1].revents);
 
@@ -6976,7 +7002,7 @@ retry:
         return res;
     }
 
-    nxt_unit_alert(ctx, "poll(%d,%d): %d unexpected revents [%04uXi, %04uXi]",
+    nxt_unit_alert(ctx, "wait(%d,%d): %d unexpected revents [%04uXi, %04uXi]",
                    fds[0].fd, fds[1].fd, nevents, fds[0].revents,
                    fds[1].revents);
 
@@ -6994,6 +7020,76 @@ nxt_unit_wait_set_init(nxt_unit_wait_set_t *ws)
 }
 
 
+static void
+nxt_unit_wait_set_free(nxt_unit_wait_set_t *ws)
+{
+    if (ws->ep_fd >= 0) {
+        nxt_unit_close(ws->ep_fd);
+    }
+
+    ws->ep_fd = -1;
+}
+
+
+/*
+ * Waits as nxt_unit_wait_set_wait() does, in the wait set of the context.
+ * The first failure of the set is reported one time.
+ */
+
+static int
+nxt_unit_ctx_wait(nxt_unit_ctx_t *ctx, struct pollfd *fds, nxt_uint_t nfds,
+    int timeout)
+{
+    int                  n, err;
+    nxt_unit_ctx_impl_t  *ctx_impl;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    err = ctx_impl->wait_set.err;
+
+    n = nxt_unit_wait_set_wait(&ctx_impl->wait_set, fds, nfds, timeout);
+
+    if (nxt_slow_path(err == 0 && ctx_impl->wait_set.err != 0)) {
+        /* The caller reads errno when n is -1. */
+        err = errno;
+
+        nxt_unit_debug(ctx, "epoll set for the ports failed: %s (%d); "
+                       "using poll()%s", strerror(ctx_impl->wait_set.err),
+                       ctx_impl->wait_set.err,
+                       (ctx_impl->wait_set.ep_fd == NXT_UNIT_EPOLL_OFF)
+                       ? "" : " until a later wait makes the set");
+
+        errno = err;
+    }
+
+    return n;
+}
+
+
+#if (NXT_UNIT_EPOLL) && (NXT_TESTS)
+/*
+ * Thread-local: a waiter thread that the test started just before may reach
+ * the check at the same time as the thread that armed the failure.  With a
+ * global, it could take the failure that was meant for the other thread.
+ */
+static __thread unsigned int  nxt_unit_test_wait_set_failure_count;
+static __thread int           nxt_unit_test_wait_set_failure_errno;
+
+
+/*
+ * For src/test/nxt_unit_wake_test.c: the next "failures" epoll sets are not
+ * made, as if epoll_create1() failed with errno "err".
+ */
+
+void
+nxt_unit_test_wait_set_failures(unsigned int failures, int err)
+{
+    nxt_unit_test_wait_set_failure_count = failures;
+    nxt_unit_test_wait_set_failure_errno = err;
+}
+#endif
+
+
 /*
  * Waits for a message on the read port of a context (fds[0]) and, when
  * nfds is 2, on the shared port of the application (fds[1]).  It waits as
@@ -7005,14 +7101,317 @@ nxt_unit_wait_set_init(nxt_unit_wait_set_t *ws)
  * context that waits, in every process of the application.  One context
  * takes the request.  The others make a recvmsg() that fails with EAGAIN,
  * and wait again.  src/test/nxt_unit_wake_test.c counts these wakeups.
+ *
+ * On Linux, the wait for the two ports uses an epoll set of the context,
+ * with EPOLLEXCLUSIVE on the shared port.  The kernel wakes one context
+ * that waits in epoll_wait().  The epoll sets of busy contexts get the
+ * event on their ready list, and the kernel goes on to the next context.
+ *
+ * Why no request is lost:
+ *
+ *   - A context reads the queue before it waits (nxt_unit_read_buf()).
+ *   - The context that a READ_QUEUE wakes reads its read port first, as
+ *     with poll(), and then the shared port.  nxt_unit_shared_port_recv()
+ *     takes a request or reads READ_QUEUE datagrams until the socket is
+ *     empty, and then reads the queue again.
+ *   - A context that took a request or a message of its read port leaves
+ *     the READ_QUEUE in the socket.  The event stays on the ready list of
+ *     its set (level-triggered), so its next wait returns at once for it.
+ *   - If the woken context took a QUIT from its read port and stops, the
+ *     READ_QUEUE wakes no other context.  The request is not lost: it
+ *     waits for the next READ_QUEUE, or for the wait of another context
+ *     to end.
+ *   - The wait ends after "timeout" (1 second) also, and the context then
+ *     reads the queue again.
+ *
+ * The next READ_QUEUE must wake a different context.  Linux before 5.7
+ * removes a woken waiter from the wait queue of its epoll set only when
+ * the waiter runs again.  Until then, each READ_QUEUE goes to that set,
+ * and the other idle contexts stay asleep.  Linux 5.7 removes the waiter
+ * when it wakes it (commit 412895f03cbf, also in 5.6.13 and 5.4.41).
+ * Thus a context uses a set only on these releases
+ * (nxt_unit_epoll_kernel()).  On other releases, it uses poll() as before.
+ *
+ * A waiter that its timeout or a signal woke is a different case.  Before
+ * Linux 6.0 (commit a16ceb139610), it also stays in the wait queue until
+ * it runs, and a READ_QUEUE in that short time goes to its set.  That
+ * context is awake already: when its wait returns, it reads the queue and
+ * the shared port.  Thus no context is left asleep with a request.
+ *
+ * The set costs one descriptor for each context.  A context does not keep
+ * a set when the process uses half of its RLIMIT_NOFILE or more
+ * (nxt_unit_wait_set_crowded()).  Then the descriptors stay free for the
+ * application.
+ *
+ * The descriptors of the two ports stay open while the context lives: the
+ * context holds its read port, and the library holds the shared port.  If
+ * a descriptor is different from the one in the set, the set is made
+ * again.  If the set cannot be made, this wait uses poll().  After an
+ * error that can go away, such as EMFILE, the next wait tries again.
  */
 
 static int
 nxt_unit_wait_set_wait(nxt_unit_wait_set_t *ws, struct pollfd *fds,
     nxt_uint_t nfds, int timeout)
 {
+#if (NXT_UNIT_EPOLL)
+    int                 i, n, err;
+    struct epoll_event  ev[2];
+
+    if (nfds != 2 || ws->ep_fd == NXT_UNIT_EPOLL_OFF) {
+        return poll(fds, nfds, timeout);
+    }
+
+    if (ws->ep_fd >= 0
+        && (ws->read_fd != fds[0].fd || ws->shared_fd != fds[1].fd))
+    {
+        nxt_unit_wait_set_free(ws);
+    }
+
+    if (ws->ep_fd < 0) {
+        if (nxt_slow_path(!nxt_unit_epoll_kernel())) {
+            errno = ENOTSUP;
+            goto fail;
+        }
+
+#if (NXT_TESTS)
+        if (nxt_slow_path(nxt_unit_test_wait_set_failure_count > 0)) {
+            nxt_unit_test_wait_set_failure_count--;
+
+            errno = nxt_unit_test_wait_set_failure_errno;
+            goto fail;
+        }
+#endif
+
+        ws->ep_fd = epoll_create1(EPOLL_CLOEXEC);
+        if (nxt_slow_path(ws->ep_fd == -1)) {
+            goto fail;
+        }
+
+        /*
+         * The process uses half of its descriptors or more.  The context
+         * uses poll() until it ends, and does not try again: each try
+         * would cost an epoll_create1() and a close().
+         */
+
+        if (nxt_slow_path(nxt_unit_wait_set_crowded(ws->ep_fd))) {
+            nxt_unit_wait_set_free(ws);
+
+            if (ws->err == 0) {
+                ws->err = EMFILE;
+            }
+
+            ws->ep_fd = NXT_UNIT_EPOLL_OFF;
+
+            return poll(fds, nfds, timeout);
+        }
+
+        nxt_memzero(ev, sizeof(ev));
+
+        ev[0].events = EPOLLIN;
+        ev[0].data.u32 = 0;
+
+        ev[1].events = EPOLLIN | EPOLLEXCLUSIVE;
+        ev[1].data.u32 = 1;
+
+        if (nxt_slow_path(epoll_ctl(ws->ep_fd, EPOLL_CTL_ADD, fds[0].fd,
+                                    &ev[0]) == -1
+                          || epoll_ctl(ws->ep_fd, EPOLL_CTL_ADD, fds[1].fd,
+                                       &ev[1]) == -1))
+        {
+            goto fail;
+        }
+
+        ws->read_fd = fds[0].fd;
+        ws->shared_fd = fds[1].fd;
+    }
+
+    n = epoll_wait(ws->ep_fd, ev, 2, timeout);
+
+    for (i = 0; i < n; i++) {
+        /* The EPOLLIN, EPOLLERR and EPOLLHUP bits are the poll() bits. */
+        fds[ev[i].data.u32 & 1].revents = (short) ev[i].events;
+    }
+
+    return n;
+
+fail:
+
+    err = errno;
+
+    nxt_unit_wait_set_free(ws);
+
+    if (ws->err == 0) {
+        ws->err = err;
+    }
+
+    /*
+     * A limit of descriptors or of memory can go away.  The set stays not
+     * made, and the next wait tries again: it costs one epoll_create1(), or
+     * the calls that make the set and close it.  Other errors stay, such as
+     * EINVAL from a kernel without EPOLLEXCLUSIVE, ENOSYS, EPERM, or
+     * ENOTSUP from a kernel before 5.7.  Then the context uses poll() until
+     * it ends.
+     */
+
+    switch (err) {
+    case EMFILE:
+    case ENFILE:
+    case ENOMEM:
+    case ENOSPC:
+        break;
+
+    default:
+        ws->ep_fd = NXT_UNIT_EPOLL_OFF;
+        break;
+    }
+#endif
+
     return poll(fds, nfds, timeout);
 }
+
+
+#if (NXT_UNIT_EPOLL)
+
+/*
+ * Returns 1 when the kernel removes a woken waiter from the wait queue of
+ * its epoll set at the wakeup.  See nxt_unit_wait_set_wait().  uname() runs
+ * one time in the process.
+ */
+
+static pthread_once_t  nxt_unit_epoll_kernel_once = PTHREAD_ONCE_INIT;
+static int             nxt_unit_epoll_kernel_ok;
+
+
+static int
+nxt_unit_epoll_kernel(void)
+{
+    (void) pthread_once(&nxt_unit_epoll_kernel_once,
+                        nxt_unit_epoll_kernel_init);
+
+    return nxt_unit_epoll_kernel_ok;
+}
+
+
+static void
+nxt_unit_epoll_kernel_init(void)
+{
+    struct utsname  u;
+
+    nxt_unit_epoll_kernel_ok = (uname(&u) == 0
+                                && nxt_unit_epoll_release(u.release));
+}
+
+
+/*
+ * Returns 1 for a Linux release that has the commit 412895f03cbf ("epoll:
+ * atomically remove wait entry on wake up"): 5.7 and later, 5.6.13 and
+ * later 5.6 releases, and 5.4.41 and later 5.4 releases.  4.19 and older
+ * stable releases do not have it.
+ *
+ * A distribution kernel can have the commit with an older release, such as
+ * "5.4.0-150-generic" or "4.18.0-553.el8".  Then the result is 0, and the
+ * contexts use poll() as before.
+ */
+
+static int
+nxt_unit_epoll_release(const char *release)
+{
+    int         i, v[3];
+    const char  *p;
+
+    v[0] = 0;
+    v[1] = 0;
+    v[2] = 0;
+
+    p = release;
+
+    for (i = 0; i < 3; i++) {
+        if (*p < '0' || *p > '9') {
+            break;
+        }
+
+        while (*p >= '0' && *p <= '9') {
+            if (v[i] > 99999) {
+                return 0;
+            }
+
+            v[i] = v[i] * 10 + (*p - '0');
+            p++;
+        }
+
+        if (*p != '.') {
+            i++;
+            break;
+        }
+
+        p++;
+    }
+
+    /* The major and the minor numbers are necessary. */
+
+    if (i < 2) {
+        return 0;
+    }
+
+    if (v[0] != 5) {
+        return v[0] > 5;
+    }
+
+    switch (v[1]) {
+    case 4:
+        return v[2] >= 41;
+
+    case 6:
+        return v[2] >= 13;
+
+    default:
+        return v[1] >= 7;
+    }
+}
+
+
+/*
+ * Returns 1 when the descriptor "fd" is at half of the soft RLIMIT_NOFILE
+ * or above.  A new descriptor takes the lowest free number, so the process
+ * uses "fd" descriptors or more.
+ */
+
+static int
+nxt_unit_wait_set_crowded(int fd)
+{
+    struct rlimit  rlim;
+
+    if (getrlimit(RLIMIT_NOFILE, &rlim) != 0
+        || rlim.rlim_cur == RLIM_INFINITY)
+    {
+        return 0;
+    }
+
+    return (rlim_t) fd >= rlim.rlim_cur / 2;
+}
+
+
+#if (NXT_TESTS)
+
+/*
+ * For src/test/nxt_unit_wake_test.c: the result of nxt_unit_epoll_release()
+ * for "release", or of nxt_unit_epoll_kernel() when "release" is NULL.
+ */
+
+int
+nxt_unit_test_epoll_release(const char *release)
+{
+    if (release == NULL) {
+        return nxt_unit_epoll_kernel();
+    }
+
+    return nxt_unit_epoll_release(release);
+}
+
+#endif
+
+#endif
 
 
 #if (NXT_TESTS)
@@ -7060,9 +7459,19 @@ nxt_unit_test_wait(void *ws, int read_fd, int shared_fd, int timeout,
 }
 
 
+/* 1 when the wait set "ws" has an epoll set. */
+
+int
+nxt_unit_test_wait_set_epoll(void *ws)
+{
+    return ((nxt_unit_wait_set_t *) ws)->ep_fd >= 0;
+}
+
+
 void
 nxt_unit_test_wait_set_free(void *ws)
 {
+    nxt_unit_wait_set_free(ws);
     nxt_unit_free(NULL, ws);
 }
 
@@ -7833,6 +8242,8 @@ nxt_unit_ctx_free(nxt_unit_ctx_impl_t *ctx_impl)
     nxt_queue_remove(&ctx_impl->link);
 
     pthread_mutex_unlock(&lib->mutex);
+
+    nxt_unit_wait_set_free(&ctx_impl->wait_set);
 
     if (nxt_fast_path(ctx_impl->read_port != NULL)) {
         nxt_unit_remove_port(lib, NULL, &ctx_impl->read_port->id);
