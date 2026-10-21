@@ -1230,6 +1230,9 @@ jobs:
       - name: Run libunit malformed port message test
         run: ./build/unit_msg_test
 
+      - name: Run libunit wake test
+        run: ./build/unit_wake_test
+
   # Compile-only leg with 32-bit size_t and pointers and a 64-bit off_t, the
   # widths of i386, armv7 and armhf.  A type-width -Werror (#582, #579) folds
   # only there and cannot show up in an amd64 job.  Nothing is linked against
@@ -1297,6 +1300,7 @@ jobs:
             ./build/unit_close_test
             ./build/unit_port_recv_test
             ./build/unit_msg_test
+            ./build/unit_wake_test
           '
 
       # The container runs as root: give the files back so that the runner
@@ -1563,6 +1567,9 @@ jobs:
           LSAN_OPTIONS: use_stacks=0
         run: ./build/unit_msg_test
 
+      - name: Run libunit wake test
+        run: ./build/unit_wake_test
+
   # --hardening=strict compile gate with the newest gcc and clang: gcc 16.2.1
   # and clang 23.1.2 in a Fedora 45 container, which also brings OpenSSL
   # 4.0.3, the major declared in FEDORA_OPENSSL_MAJOR.  auto/cc/test already
@@ -1738,6 +1745,9 @@ jobs:
       - name: Run libunit malformed port message test
         run: ./build/unit_msg_test
 
+      - name: Run libunit wake test
+        run: ./build/unit_wake_test
+
   # The oldest toolchain that the packages target.  pkg/rpm/Makefile builds
   # for centos8 (RHEL 8), and AlmaLinux 8 ships the same gcc 8.5.0, OpenSSL
   # 1.1.1k and PCRE2 10.32.  auto/ssltls requires OpenSSL 1.1.1 or later, and
@@ -1794,3 +1804,6 @@ jobs:
 
       - name: Run libunit malformed port message test
         run: ./build/unit_msg_test
+
+      - name: Run libunit wake test
+        run: ./build/unit_wake_test
