@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from unit.applications.proto import ApplicationProto
+from unit.compression import zstd_decompress
 
 client = ApplicationProto()
 
@@ -1151,9 +1152,32 @@ def test_static_compression_head_matches_get(temp_dir):
     assert plain_headers['Content-Length'] == str(len('body{color:red}' * 500))
 
 
-def test_static_compression_head_length_many_chunks(temp_dir):
+def _set_compressor(coding):
+    """Configures one compressor for text/css, or skips the test."""
+
+    resp = client.conf(
+        {
+            "types": ["text/css"],
+            "compressors": [{"encoding": coding, "level": 5, "min_length": 10}],
+        },
+        'settings/http/compression',
+    )
+
+    if 'success' in resp:
+        return
+
+    if 'supported compressor' in resp.get('detail', ''):
+        pytest.skip(f'unit built without {coding} compression support')
+
+    pytest.fail(f'could not configure {coding} compression: {resp}')
+
+
+@pytest.mark.parametrize('coding', ['gzip', 'zstd'])
+def test_static_compression_head_length_many_chunks(temp_dir, coding):
     # More than one NXT_HTTP_STATIC_BUF_SIZE chunk (128 KiB): the HEAD sizing
-    # pass has to flush at the same chunk boundaries as GET.
+    # pass has to flush at the same chunk boundaries as GET, and the coded
+    # body of each compressor has to decode from the temp file.  zstd flushes
+    # every piece too, so its frame is built from several flush blocks here.
     path = f'{temp_dir}/assets/huge.css'
     Path(path).write_bytes(
         b''.join(b'.c%d{color:#%06x}\n' % (i, i * 7919 % 0xFFFFFF)
@@ -1161,14 +1185,19 @@ def test_static_compression_head_length_many_chunks(temp_dir):
     )
     _age(path)
 
-    _, get_headers, body = _raw_get(
-        url='/huge.css', **{'Accept-Encoding': 'gzip'}
+    decode = gzip.decompress if coding == 'gzip' else zstd_decompress
+    _set_compressor(coding)
+
+    get_status, get_headers, body = _raw_get(
+        url='/huge.css', **{'Accept-Encoding': coding}
     )
-    _, head_headers, _ = _raw_get(
-        url='/huge.css', method='HEAD', **{'Accept-Encoding': 'gzip'}
+    head_status, head_headers, _ = _raw_get(
+        url='/huge.css', method='HEAD', **{'Accept-Encoding': coding}
     )
 
-    assert gzip.decompress(body) == Path(path).read_bytes(), 'GET body'
-    assert head_headers.get('Content-Encoding') == 'gzip', 'HEAD coded'
+    assert get_status == head_status == 200, 'status'
+    assert get_headers.get('Content-Encoding') == coding, 'GET coded'
+    assert decode(body) == Path(path).read_bytes(), 'GET body'
+    assert head_headers.get('Content-Encoding') == coding, 'HEAD coded'
     assert head_headers['Content-Length'] == get_headers['Content-Length']
     assert int(head_headers['Content-Length']) == len(body)

@@ -9,6 +9,7 @@ import zlib
 import pytest
 
 from unit.applications.lang.python import ApplicationPython
+from unit.compression import zstd_decompress, zstd_stream_decoder
 from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'any'}}
@@ -37,25 +38,7 @@ def decoder(encoding):
         return zlib.decompress
 
     if encoding == 'zstd':
-        try:
-            from compression import zstd  # Python 3.14 and later.
-
-            return zstd.decompress
-        except ImportError:
-            pass
-
-        zstandard = pytest.importorskip('zstandard')
-
-        def decode(data):
-            d = zstandard.ZstdDecompressor().decompressobj()
-            out = d.decompress(data)
-
-            if not d.eof:
-                raise ValueError('zstd frame is not complete')
-
-            return out
-
-        return decode
+        return zstd_decompress
 
     return pytest.importorskip('brotli').decompress
 
@@ -290,16 +273,7 @@ def stream_decoder(encoding):
         return zlib.decompressobj().decompress
 
     if encoding == 'zstd':
-        try:
-            from compression import zstd  # Python 3.14 and later.
-
-            return zstd.ZstdDecompressor().decompress
-        except ImportError:
-            pass
-
-        zstandard = pytest.importorskip('zstandard')
-
-        return zstandard.ZstdDecompressor().decompressobj().decompress
+        return zstd_stream_decoder()
 
     return pytest.importorskip('brotli').Decompressor().process
 

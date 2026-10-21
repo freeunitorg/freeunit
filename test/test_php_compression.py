@@ -5,6 +5,7 @@ import socket
 import pytest
 
 from unit.applications.lang.php import ApplicationPHP
+from unit.compression import zstd_decompress
 from unit import port as port_map
 
 prerequisites = {'modules': {'php': 'any'}}
@@ -181,15 +182,7 @@ def decompress(encoding, data):
         return brotli.decompress(data)
 
     if encoding == 'zstd':
-        try:
-            from compression import zstd  # Python >= 3.14
-
-            return zstd.decompress(data)
-        except ImportError:
-            zstandard = pytest.importorskip(
-                'zstandard', reason='python zstd bindings not installed'
-            )
-            return zstandard.ZstdDecompressor().decompressobj().decompress(data)
+        return zstd_decompress(data)
 
     pytest.fail(f'no decompressor for {encoding}')
 
