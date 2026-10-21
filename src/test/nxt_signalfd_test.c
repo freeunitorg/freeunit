@@ -28,17 +28,20 @@ static const nxt_signalfd_case_t  nxt_signalfd_cases[] = {
 
 
 typedef struct {
-    ssize_t     size;    /* SIGHUP siginfo bytes in the pipe; -1: fd -1 */
+    ssize_t     size;    /* siginfo bytes in the pipe; -1: fd -1 */
     const char  *alert;
-    uint32_t    signo;
+    nxt_uint_t  dispatches;
+    uint32_t    signo;   /* the last signal dispatched */
 } nxt_signalfd_handler_case_t;
 
 
 static const nxt_signalfd_handler_case_t  nxt_signalfd_handler_cases[] = {
-    { 0, NULL, 0 },                         /* EAGAIN: a spurious wakeup */
-    { -1, "failed", 0 },                    /* EBADF */
-    { 2, "returned 2", 0 },                 /* a short read */
-    { sizeof(struct signalfd_siginfo), NULL, SIGHUP },
+    { 0, NULL, 0, 0 },                      /* EAGAIN: a spurious wakeup */
+    { -1, "failed", 0, 0 },                 /* EBADF */
+    { 2, "returned 2", 0, 0 },              /* a short read */
+    { sizeof(struct signalfd_siginfo), NULL, 1, SIGHUP },
+    /* Two different signals pending: one call reads both. */
+    { 2 * sizeof(struct signalfd_siginfo), NULL, 2, SIGCHLD },
 };
 
 
@@ -85,7 +88,9 @@ nxt_signalfd_handler_test(nxt_thread_t *thr, nxt_fd_t *fds)
     nxt_fd_event_t                     ev;
     const nxt_signalfd_handler_case_t  *c;
 
-    static const struct signalfd_siginfo  si = { .ssi_signo = SIGHUP };
+    static const struct signalfd_siginfo  si[2] = {
+        { .ssi_signo = SIGHUP }, { .ssi_signo = SIGCHLD }
+    };
 
     NXT_TEST_CHECK(thr->log, fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0,
                    "fcntl() failed %E", nxt_errno);
@@ -103,7 +108,7 @@ nxt_signalfd_handler_test(nxt_thread_t *thr, nxt_fd_t *fds)
         c = &nxt_signalfd_handler_cases[i];
 
         NXT_TEST_CHECK(thr->log,
-                       c->size <= 0 || write(fds[1], &si, c->size) == c->size,
+                       c->size <= 0 || write(fds[1], si, c->size) == c->size,
                        "write() failed %E", nxt_errno);
 
         ev.fd = (c->size == -1) ? -1 : fds[0];
@@ -119,7 +124,7 @@ nxt_signalfd_handler_test(nxt_thread_t *thr, nxt_fd_t *fds)
                        nxt_signalfd_alerts == (c->alert != NULL)
                        && (c->alert == NULL
                            || strstr((char *) nxt_signalfd_alert, c->alert))
-                       && nxt_signalfd_dispatches == (c->signo != 0)
+                       && nxt_signalfd_dispatches == c->dispatches
                        && nxt_signalfd_signo == c->signo,
                        "signalfd handler case %ui: %ui alerts \"%s\", "
                        "%ui dispatches of signal %uD",

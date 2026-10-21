@@ -508,6 +508,9 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        record writes "#freeunit: lost N record(s)", and GET /status reports
        the count.
 
+    *) Change: a process reads every pending signal from its signalfd
+       in one wakeup, instead of one signal per epoll wakeup.
+
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 
