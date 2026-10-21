@@ -105,7 +105,6 @@ local  nxt_port_handlers_t
 local  nxt_port_s
 local  nxt_unit_buf_s
 local  nxt_unit_callbacks_s
-local  nxt_unit_ctx_impl_s
 local  nxt_unit_ctx_s
 local  nxt_unit_init_s
 local  nxt_unit_port_id_s
