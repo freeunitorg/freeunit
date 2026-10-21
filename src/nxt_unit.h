@@ -35,6 +35,19 @@ enum {
 
 #define NXT_UNIT_INIT_ENV  "NXT_UNIT_INIT"
 
+/*
+ * The number of the protocol between libunit and the Unit daemon: the port
+ * messages, the port and application queues, the shared memory segments
+ * and the format of NXT_UNIT_INIT.  The daemon writes it after NXT_VERSION
+ * in NXT_UNIT_INIT ("1.38.0/1;..."), and libunit refuses to start when
+ * either differs from its own.  The version alone does not tell two builds
+ * of one release apart, and an application that links libunit statically
+ * keeps the libunit of its build.  Bump the number in the change that
+ * makes a libunit of the old number misread the daemon, or the reverse;
+ * tools/perf/layout-check.sh fails on most such changes.
+ */
+#define NXT_UNIT_PROTOCOL_VERSION  1
+
 #define NXT_UNIT_SHARED_PORT_ID  ((uint16_t) 0xFFFFu)
 
 /*

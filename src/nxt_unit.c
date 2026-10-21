@@ -1111,12 +1111,14 @@ nxt_unit_read_env(nxt_unit_port_t *ready_port, nxt_unit_port_t *router_port,
     int *log_fd, uint32_t *stream,
     uint32_t *shm_limit, uint32_t *request_limit)
 {
-    int       rc;
-    int       ready_fd, router_fd, read_in_fd, read_out_fd;
-    char      *unit_init, *version_end, *vars;
-    size_t    version_length;
-    int64_t   ready_pid, router_pid, read_pid;
-    uint32_t  ready_stream, router_id, ready_id, read_id;
+    int         rc, n;
+    int         ready_fd, router_fd, read_in_fd, read_out_fd;
+    char        *unit_init, *version_end, *vars;
+    char        own_protocol[16];
+    size_t      version_length, protocol_length;
+    int64_t     ready_pid, router_pid, read_pid;
+    uint32_t    ready_stream, router_id, ready_id, read_id;
+    const char  *protocol;
 
     unit_init = getenv(NXT_UNIT_INIT_ENV);
     if (nxt_slow_path(unit_init == NULL)) {
@@ -1134,7 +1136,25 @@ nxt_unit_read_env(nxt_unit_port_t *ready_port, nxt_unit_port_t *router_port,
         return NXT_UNIT_ERROR;
     }
 
+    /*
+     * "<NXT_VERSION>/<NXT_UNIT_PROTOCOL_VERSION>".  A daemon older than the
+     * protocol number writes only the version: that is protocol 0, which
+     * no libunit speaks.  Both parts must be equal to ours.
+     */
+
     version_length = version_end - unit_init;
+
+    protocol = memchr(unit_init, '/', version_length);
+
+    if (protocol != NULL) {
+        version_length = protocol - unit_init;
+        protocol++;
+        protocol_length = version_end - protocol;
+
+    } else {
+        protocol = "0";
+        protocol_length = 1;
+    }
 
     rc = version_length != nxt_length(NXT_VERSION)
          || memcmp(unit_init, NXT_VERSION, nxt_length(NXT_VERSION));
@@ -1143,6 +1163,21 @@ nxt_unit_read_env(nxt_unit_port_t *ready_port, nxt_unit_port_t *router_port,
         nxt_unit_alert(NULL, "versions mismatch: the Unit daemon has version "
                        "%.*s, while the app was compiled with libunit %s",
                        (int) version_length, unit_init, NXT_VERSION);
+
+        return NXT_UNIT_ERROR;
+    }
+
+    n = snprintf(own_protocol, sizeof(own_protocol), "%d",
+                 NXT_UNIT_PROTOCOL_VERSION);
+
+    rc = protocol_length != (size_t) n
+         || memcmp(protocol, own_protocol, protocol_length) != 0;
+
+    if (nxt_slow_path(rc != 0)) {
+        nxt_unit_alert(NULL, "protocol mismatch: the Unit daemon %s speaks "
+                       "libunit protocol %.*s, while the app was compiled "
+                       "with libunit protocol %s", NXT_VERSION,
+                       (int) protocol_length, protocol, own_protocol);
 
         return NXT_UNIT_ERROR;
     }

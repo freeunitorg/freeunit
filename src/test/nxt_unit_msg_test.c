@@ -3806,6 +3806,96 @@ nxt_unit_msg_test_shm_ack_case(void *data)
 }
 
 
+/*
+ * NXT_UNIT_INIT starts with "<NXT_VERSION>/<NXT_UNIT_PROTOCOL_VERSION>".
+ * Two builds of one release can speak different protocols, so libunit
+ * refuses a daemon whose number differs from its own, or that writes
+ * none, although the version is the same.  The variable has no fields
+ * after the version, so a version that is accepted fails at the fields;
+ * the log tells which check refused it.
+ */
+
+typedef struct {
+    const char  *name;
+    const char  *version;    /* NULL: NXT_VERSION. */
+    int         protocol;    /* Added to NXT_UNIT_PROTOCOL_VERSION. */
+    int         form;        /* 0: "V;x", 1: "V/P;x", 2: "V/;x". */
+    const char  *expect;     /* In the log. */
+} nxt_unit_msg_test_handshake_t;
+
+
+static const nxt_unit_msg_test_handshake_t  handshakes[] = {
+    { "NXT_UNIT_INIT with this version and protocol is accepted",
+      NULL, 0, 1, "invalid number of variables" },
+    { "NXT_UNIT_INIT with no protocol number is refused",
+      NULL, 0, 0, "protocol mismatch" },
+    { "NXT_UNIT_INIT with an empty protocol number is refused",
+      NULL, 0, 2, "protocol mismatch" },
+    { "NXT_UNIT_INIT with another protocol number is refused",
+      NULL, 1, 1, "protocol mismatch" },
+    { "NXT_UNIT_INIT with another version is refused",
+      "0.0.0", 0, 1, "versions mismatch" },
+};
+
+
+static int
+nxt_unit_msg_test_handshake_case(void *data)
+{
+    int                                  fd;
+    char                                 env[128], log[2048];
+    FILE                                 *f;
+    ssize_t                              n;
+    const char                           *version;
+    nxt_unit_init_t                      init;
+    const nxt_unit_msg_test_handshake_t  *t = data;
+
+    version = (t->version != NULL) ? t->version : NXT_VERSION;
+
+    if (t->form == 0) {
+        snprintf(env, sizeof(env), "%s;x", version);
+
+    } else if (t->form == 1) {
+        snprintf(env, sizeof(env), "%s/%d;x", version,
+                 NXT_UNIT_PROTOCOL_VERSION + t->protocol);
+
+    } else {
+        snprintf(env, sizeof(env), "%s/;x", version);
+    }
+
+    if (setenv(NXT_UNIT_INIT_ENV, env, 1) != 0) {
+        return 1;
+    }
+
+    /* libunit logs to stderr until it has the log fd of the daemon. */
+    f = tmpfile();
+    if (f == NULL || dup2(fileno(f), STDERR_FILENO) == -1) {
+        return 2;
+    }
+
+    memset(&init, 0, sizeof(init));
+    init.callbacks.request_handler = nxt_unit_msg_test_handler;
+
+    if (nxt_unit_init(&init) != NULL) {
+        return 3;
+    }
+
+    fd = fileno(f);
+
+    n = pread(fd, log, sizeof(log) - 1, 0);
+    log[n > 0 ? n : 0] = '\0';
+
+    if (strstr(log, t->expect) == NULL) {
+        printf("unit msg test: %s=\"%s\" logged \"%s\", expected \"%s\"\n",
+               NXT_UNIT_INIT_ENV, env, log, t->expect);
+        fflush(stdout);
+
+        return 4;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
 int
 main(void)
 {
@@ -4083,6 +4173,12 @@ main(void)
                                "wait shrunk",
                                nxt_unit_msg_test_shm_ack_case, NULL,
                                NXT_UNIT_OK);
+
+    for (i = 0; i < nxt_nitems(handshakes); i++) {
+        nxt_unit_msg_test_in_child(handshakes[i].name,
+                                   nxt_unit_msg_test_handshake_case,
+                                   (void *) &handshakes[i], NXT_UNIT_OK);
+    }
 
     /*
      * Release the library.  Otherwise the global context pointer keeps it
