@@ -209,6 +209,9 @@ nxt_inline int nxt_unit_is_quit(nxt_unit_read_buf_t *rbuf);
 nxt_inline int nxt_unit_is_mmap(nxt_unit_read_buf_t *rbuf);
 nxt_inline int nxt_unit_is_ordered(nxt_unit_read_buf_t *rbuf);
 nxt_inline int nxt_unit_is_socket_quit(nxt_unit_read_buf_t *rbuf);
+nxt_inline int nxt_unit_is_graceful_quit(nxt_unit_read_buf_t *rbuf);
+static void nxt_unit_quit_drain(nxt_unit_ctx_t *ctx,
+    nxt_unit_read_buf_t *rbuf);
 static int nxt_unit_process_port_msg_impl(nxt_unit_ctx_t *ctx,
     nxt_unit_port_t *port);
 static void nxt_unit_ctx_free(nxt_unit_ctx_impl_t *ctx_impl);
@@ -4974,6 +4977,21 @@ nxt_unit_test_ctx_quit_graceful(nxt_unit_ctx_t *ctx)
 {
     nxt_unit_quit(ctx, NXT_QUIT_GRACEFUL);
 }
+
+
+/* As if "count" requests were taken under a request limit of "limit". */
+
+void
+nxt_unit_test_request_limit(nxt_unit_ctx_t *ctx, uint32_t limit,
+    uint32_t count)
+{
+    nxt_unit_impl_t  *lib;
+
+    lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
+
+    lib->request_limit = limit;
+    nxt_atomic_store(&lib->request_count, count);
+}
 #endif
 
 
@@ -6943,6 +6961,13 @@ retry:
             goto retry;
         }
 
+        if (res == NXT_UNIT_OK
+            && (fds[1].revents & POLLIN) != 0
+            && nxt_unit_is_graceful_quit(rbuf))
+        {
+            nxt_unit_quit_drain(ctx, rbuf);
+        }
+
         return res;
     }
 
@@ -7296,6 +7321,111 @@ nxt_unit_is_socket_quit(nxt_unit_read_buf_t *rbuf)
     }
 
     return 0;
+}
+
+
+/*
+ * A graceful QUIT as nxt_runtime_port_send_quit() and nxt_unit_send_quit()
+ * write it: the header and the quit mode.  Without the byte, the QUIT is a
+ * normal one.
+ */
+
+nxt_inline int
+nxt_unit_is_graceful_quit(nxt_unit_read_buf_t *rbuf)
+{
+    nxt_port_msg_t  *port_msg;
+
+    if (rbuf->size != (ssize_t) sizeof(nxt_port_msg_t) + 1) {
+        return 0;
+    }
+
+    port_msg = (nxt_port_msg_t *) rbuf->buf;
+
+    return port_msg->type == _NXT_PORT_MSG_QUIT
+           && !port_msg->mmap
+           && (uint8_t) rbuf->buf[sizeof(nxt_port_msg_t)]
+              == NXT_QUIT_GRACEFUL;
+}
+
+
+/*
+ * "rbuf" has a graceful QUIT from the read port, and the wait that found it
+ * also found the shared port readable: the router rang it for a request.
+ * The read port is read first, so the QUIT would take the context offline
+ * and leave that request in the queue.  When the router woke only this
+ * context for it (one idle context, or EPOLLEXCLUSIVE), the request then
+ * waits for the next doorbell, or for another context to wake up at the
+ * end of its 1 s wait.
+ *
+ * So take one request from the queue, put it in "rbuf" instead of the
+ * QUIT, and keep the QUIT in quit_pending.  nxt_unit_process_msg() takes
+ * the QUIT after the request, as it takes a QUIT that could not be sent
+ * (nxt_unit_send_quit()), and a graceful quit waits for the request as for
+ * any other.  The QUIT leaves the context not ready, so no second request
+ * is read.
+ *
+ * The QUIT is kept as it is when:
+ *
+ *   - the context is not ready: the request limit is reached, maybe by
+ *     another context since the wait;
+ *   - a QUIT is pending already;
+ *   - a read buffer is parked or pending: the request would wait behind
+ *     it, and the QUIT with it.
+ *
+ * A normal QUIT never comes here: it stops the worker at once.
+ */
+
+static void
+nxt_unit_quit_drain(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf)
+{
+    int                  busy;
+    nxt_unit_impl_t      *lib;
+    nxt_unit_ctx_impl_t  *ctx_impl;
+    nxt_unit_read_buf_t  *req_rbuf;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    if (!nxt_unit_chk_ready(ctx)
+        || nxt_atomic_load(&ctx_impl->quit_pending) != 0)
+    {
+        return;
+    }
+
+    pthread_mutex_lock(&ctx_impl->mutex);
+
+    busy = nxt_atomic_load(&ctx_impl->parked) > 0
+           || !nxt_queue_is_empty(&ctx_impl->pending_rbuf);
+
+    pthread_mutex_unlock(&ctx_impl->mutex);
+
+    if (busy) {
+        return;
+    }
+
+    req_rbuf = nxt_unit_read_buf_get(ctx);
+    if (nxt_slow_path(req_rbuf == NULL)) {
+        return;
+    }
+
+    lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
+
+    if (nxt_unit_app_queue_recv(ctx, lib->shared_port, req_rbuf)
+        != NXT_UNIT_OK)
+    {
+        nxt_unit_read_buf_release(ctx, req_rbuf);
+
+        return;
+    }
+
+    /* A QUIT that became pending meanwhile is taken after the request too. */
+    (void) nxt_atomic_cmp_set(&ctx_impl->quit_pending, 0,
+                              (nxt_atomic_uint_t) NXT_QUIT_GRACEFUL + 1);
+
+    nxt_unit_debug(ctx, "graceful quit after one more request");
+
+    nxt_unit_rbuf_cpy(rbuf, req_rbuf);
+
+    nxt_unit_read_buf_release(ctx, req_rbuf);
 }
 
 
