@@ -3,14 +3,14 @@
 > Verified on:
 > - Debian 13 Trixie (kernel `6.12.63+deb13-amd64`), OpenSSL 3.5.7, PHP 8.4.26 ✓
 > - Ubuntu 24.04 LTS (jammy, kernel `6.8.x`), OpenSSL 3.2.x
-> - **Local testing: chi.holder.ru on FreeUnit 1.37.0 with PHP 8.5.12 embed SAPI ✓** (built from source)
+> - Local testing: FreeUnit 1.37.0 with PHP 8.5.12 embed SAPI ✓ (built from source)
 >
 > FreeUnit 1.37.0 + PHP 8.5.12 (built from source), verified with phpinfo().
 > Last verified: October 22, 2026.
 > PHP 8.5.12 fixes two critical RCE bugs (CVE-2026-109618, CVE-2026-109619).
 > Do not use PHP 8.5.11 or older.
 > PHP 8.5 build time: ~3 min (make), ~2 sec (PHP module).
-> Localhost test: PHP 8.5.12 running at http://chi.holder.ru:8080/phpinfo.php ✓
+> Localhost test: PHP 8.5.12 running at http://myapp.local:8080/phpinfo.php ✓
 
 ## Quick Start (TL;DR) — with PHP 8.5
 
@@ -414,40 +414,40 @@ curl http://localhost:8080/
 
 ### Local hostname testing (dev/testing)
 
-To test with a local hostname (e.g., `chi.holder.ru`):
+To test with a local hostname (e.g., `myapp.local`):
 
 ```bash
 # 1. Add to /etc/hosts
-sudo tee -a /etc/hosts <<< "127.0.0.1 chi.holder.ru"
+sudo tee -a /etc/hosts <<< "127.0.0.1 myapp.local"
 
 # 2. Create app directory
-sudo mkdir -p /var/www/chi.holder.ru
-echo '<?php phpinfo(); ?>' | sudo tee /var/www/chi.holder.ru/phpinfo.php
+sudo mkdir -p /var/www/myapp.local
+echo '<?php phpinfo(); ?>' | sudo tee /var/www/myapp.local/phpinfo.php
 
 # 3. Configure FreeUnit
 curl -X PUT --unix-socket /run/unit/control.sock http://localhost/config << 'EOF'
 {
   "applications": {
-    "chi": {
+    "myapp": {
       "type": "php",
-      "root": "/var/www/chi.holder.ru"
+      "root": "/var/www/myapp.local"
     }
   },
   "listeners": {
     "*:8080": {
-      "pass": "applications/chi"
+      "pass": "applications/myapp"
     }
   }
 }
 EOF
 
 # 4. Test (verified October 2026 with PHP 8.5.12)
-curl http://chi.holder.ru:8080/phpinfo.php
+curl http://myapp.local:8080/phpinfo.php
 # Expected output: PHP Version 8.5.12 (or your configured PHP version)
 ```
 
 **Local testing notes (October 5, 2026):**
-- Successfully tested chi.holder.ru with PHP 8.5.12 built from source
+- Successfully tested myapp.local with PHP 8.5.12 built from source
 - FreeUnit module dynamically loads libphp.so at startup — ensure `/lib/libphp.so` points to correct PHP version
 - Testing verified: phpinfo() displays correct PHP version (8.5.12)
 
