@@ -312,7 +312,7 @@ nxt_router_remove_pid_soak_test(nxt_thread_t *thr)
         {
             nxt_log_error(NXT_LOG_NOTICE, thr->log,
                           "router remove pid soak test: iteration %ui armed "
-                          "start left pending %uD joint %uD app use %d "
+                          "start left pending %uA joint %uD app use %d "
                           "(expected %uD, 2 and 1)",
                           i, app->pending_processes, joint->use_count,
                           (int) app->use_count, baseline + 1);
@@ -343,7 +343,7 @@ nxt_router_remove_pid_soak_test(nxt_thread_t *thr)
         if (app->pending_processes != baseline + 1 || joint->use_count != 2) {
             nxt_log_error(NXT_LOG_NOTICE, thr->log,
                           "router remove pid soak test: iteration %ui "
-                          "unregistered stream released pending %uD joint %uD "
+                          "unregistered stream released pending %uA joint %uD "
                           "(expected %uD and 2)",
                           i, app->pending_processes, joint->use_count,
                           baseline + 1);
@@ -372,7 +372,7 @@ nxt_router_remove_pid_soak_test(nxt_thread_t *thr)
         if (app->pending_processes != baseline) {
             nxt_log_error(NXT_LOG_NOTICE, thr->log,
                           "router remove pid soak test: iteration %ui "
-                          "pending_processes %uD (expected %uD)",
+                          "pending_processes %uA (expected %uD)",
                           i, app->pending_processes, baseline);
             goto done;
         }

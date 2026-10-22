@@ -7,6 +7,9 @@
 #define _NXT_ROUTER_REQUEST_H_INCLUDED_
 
 
+#include <nxt_atomic.h>
+
+
 typedef enum {
     /* Not offered to nxt_app_queue_cancel() yet. */
     NXT_MSG_QUEUED = 0,
@@ -69,6 +72,31 @@ typedef struct {
     nxt_app_t               *abandoned_app;
 
     nxt_bool_t              rpc_cancel;
+
+    /*
+     * Nonzero while ->request is linked in app->ack_waiting_req.  The
+     * request's own router thread writes it: set by the park, cleared by the
+     * acknowledgement as it takes the request out of that queue
+     * (nxt_router_req_headers_ack_handler()) and by
+     * nxt_request_rpc_data_unlink() as it decides whether to.  The
+     * application's main thread can drain the same queue -- a failed start --
+     * but leaves the flag set, so a zero read means the queue no longer
+     * points at the request and the unlink can skip the application lock.
+     *
+     * The unlink clears before it re-checks the queue under the lock, so a
+     * zero is visible for that moment while the request is still linked.
+     * That window is safe: no other live thread unlinks the same rpc data,
+     * and the engine-teardown unlink, the one write from another thread,
+     * runs after the request's thread has been joined.
+     */
+    nxt_atomic_t            app_linked;
+
+    /*
+     * Set when the deadline expired once for a request that a worker
+     * claimed from the shared queue and did not acknowledge.  See
+     * nxt_router_app_timeout().
+     */
+    uint8_t                 claimed_expired;
 } nxt_request_rpc_data_t;
 
 

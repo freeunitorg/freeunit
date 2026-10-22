@@ -42,7 +42,14 @@ else
 	TARGETS       := $(DEFAULT_TARGET)
 endif
 
-RELEASE_BUILD_FLAGS ?= --quiet --release --bin $(OUTPUT_BINARY)
+RELEASE_BUILD_FLAGS ?= --quiet --release --locked --bin $(OUTPUT_BINARY)
+
+# Keep the caller's RUSTFLAGS.  Remap the source and cargo paths so that the
+# binary does not carry the build directory.  Cargo ignores RUSTFLAGS when
+# CARGO_ENCODED_RUSTFLAGS is set, so the remap goes to whichever one cargo
+# reads.  Cargo splits RUSTFLAGS on whitespace, so the remap is skipped when
+# either path contains any.
+RUST_REMAP = env "$$(c=$${CARGO_HOME:-$$HOME/.cargo}; case "$(CURDIR)$$c" in (*[[:space:]]*) r= ;; (*) r="--remap-path-prefix=$(CURDIR)=. --remap-path-prefix=$$c=/cargo" ;; esac; if [ -n "$${CARGO_ENCODED_RUSTFLAGS+x}" ]; then printf "CARGO_ENCODED_RUSTFLAGS=%s" "$$CARGO_ENCODED_RUSTFLAGS"; if [ -n "$$r" ]; then [ -z "$$CARGO_ENCODED_RUSTFLAGS" ] || printf "\037"; printf "%s" "$$r" | tr " " "\037"; fi; else printf "RUSTFLAGS=%s" "$${RUSTFLAGS:+$$RUSTFLAGS$${r:+ }}$$r"; fi)"
 
 # The musl artifact is built without the "tls" feature.  TLS pulls in
 # aws-lc-sys, a C library built by cmake, and that is the only thing making
@@ -82,7 +89,7 @@ all: $(TARGETS) ## Build all available platform targets [see: list-targets]
 $(TARGETS): openapi-generate
 	$Q if [ ! -f "$(CURDIR)/target/$(@)/release/$(OUTPUT_BINARY)" ]; then
 		echo "$(M) building $(OUTPUT_BINARY) with flags [$(RELEASE_BUILD_FLAGS) $(call target_feature_flags,$@) --target $(@)]"
-		$(CARGO) build $(RELEASE_BUILD_FLAGS) $(call target_feature_flags,$@) --target $@
+		$(RUST_REMAP) $(CARGO) build $(RELEASE_BUILD_FLAGS) $(call target_feature_flags,$@) --target $@
 	fi
 
 target target/debug:
@@ -100,7 +107,7 @@ release: target/release/$(OUTPUT_BINARY)
 
 target/release/$(OUTPUT_BINARY): openapi-generate
 	$Q echo "$(M) building $(OUTPUT_BINARY) in release mode for the current platform"
-	$Q $(CARGO) build $(RELEASE_BUILD_FLAGS) $(HOST_FEATURE_FLAGS)
+	$Q $(RUST_REMAP) $(CARGO) build $(RELEASE_BUILD_FLAGS) $(HOST_FEATURE_FLAGS)
 
 .PHONY: test
 test: openapi-generate ## Run tests

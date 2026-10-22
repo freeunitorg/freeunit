@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from unit.applications.proto import ApplicationProto
+from unit.compression import zstd_decompress
 
 client = ApplicationProto()
 
@@ -1113,3 +1114,90 @@ def test_static_compression_level_above_int8(wait_for_record):
         )
         is not None
     ), 'level 265 is out of range'
+
+
+def test_static_compression_head_matches_get(temp_dir):
+    # https://github.com/freeunitorg/freeunit/issues/391: HEAD skipped the
+    # compression step, so it answered with no Content-Encoding and the
+    # identity length while GET answered gzip.  RFC 9110 Sect. 9.3.2: HEAD
+    # carries the same fields as GET, less the ones learnt only while
+    # generating the content.  The coded length is computed, not omitted.
+    _age(f'{temp_dir}/assets/big.css')
+
+    get_status, get_headers, body = _raw_get(
+        method='GET', **{'Accept-Encoding': 'gzip'}
+    )
+    head_status, head_headers, head_body = _raw_get(
+        method='HEAD', **{'Accept-Encoding': 'gzip'}
+    )
+
+    assert get_status == head_status == 200, 'status'
+    assert get_headers['Content-Encoding'] == 'gzip', 'GET coded'
+    assert gzip.decompress(body) == b'body{color:red}' * 500, 'GET body'
+
+    assert head_headers.get('Content-Encoding') == 'gzip', 'HEAD coded'
+    assert head_headers.get('Vary') == get_headers.get('Vary'), 'HEAD Vary'
+    assert head_headers.get('ETag') == get_headers.get('ETag'), 'HEAD ETag'
+    assert head_headers['ETag'].startswith('W/'), 'HEAD weak ETag'
+    assert head_headers['Content-Length'] == get_headers['Content-Length'], (
+        'HEAD gives the coded length GET sends'
+    )
+    assert int(head_headers['Content-Length']) == len(body), 'coded length'
+    assert 'Transfer-Encoding' not in head_headers, 'HEAD not chunked'
+    assert head_body == b'', 'HEAD has no body'
+
+    # Identity is unchanged: no Accept-Encoding, the real length.
+    _, plain_headers, _ = _raw_get(method='HEAD')
+    assert 'Content-Encoding' not in plain_headers, 'identity HEAD'
+    assert plain_headers['Content-Length'] == str(len('body{color:red}' * 500))
+
+
+def _set_compressor(coding):
+    """Configures one compressor for text/css, or skips the test."""
+
+    resp = client.conf(
+        {
+            "types": ["text/css"],
+            "compressors": [{"encoding": coding, "level": 5, "min_length": 10}],
+        },
+        'settings/http/compression',
+    )
+
+    if 'success' in resp:
+        return
+
+    if 'supported compressor' in resp.get('detail', ''):
+        pytest.skip(f'unit built without {coding} compression support')
+
+    pytest.fail(f'could not configure {coding} compression: {resp}')
+
+
+@pytest.mark.parametrize('coding', ['gzip', 'zstd'])
+def test_static_compression_head_length_many_chunks(temp_dir, coding):
+    # More than one NXT_HTTP_STATIC_BUF_SIZE chunk (128 KiB): the HEAD sizing
+    # pass has to flush at the same chunk boundaries as GET, and the coded
+    # body of each compressor has to decode from the temp file.  zstd flushes
+    # every piece too, so its frame is built from several flush blocks here.
+    path = f'{temp_dir}/assets/huge.css'
+    Path(path).write_bytes(
+        b''.join(b'.c%d{color:#%06x}\n' % (i, i * 7919 % 0xFFFFFF)
+                 for i in range(20000))
+    )
+    _age(path)
+
+    decode = gzip.decompress if coding == 'gzip' else zstd_decompress
+    _set_compressor(coding)
+
+    get_status, get_headers, body = _raw_get(
+        url='/huge.css', **{'Accept-Encoding': coding}
+    )
+    head_status, head_headers, _ = _raw_get(
+        url='/huge.css', method='HEAD', **{'Accept-Encoding': coding}
+    )
+
+    assert get_status == head_status == 200, 'status'
+    assert get_headers.get('Content-Encoding') == coding, 'GET coded'
+    assert decode(body) == Path(path).read_bytes(), 'GET body'
+    assert head_headers.get('Content-Encoding') == coding, 'HEAD coded'
+    assert head_headers['Content-Length'] == get_headers['Content-Length']
+    assert int(head_headers['Content-Length']) == len(body)

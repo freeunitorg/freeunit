@@ -9,7 +9,7 @@
 
 ssize_t
 nxt_sendmsg(nxt_socket_t s, nxt_iobuf_t *iob, nxt_uint_t niob,
-    const nxt_send_oob_t *oob)
+    const nxt_send_oob_t *oob, int flags)
 {
     struct msghdr  msg;
 
@@ -29,7 +29,7 @@ nxt_sendmsg(nxt_socket_t s, nxt_iobuf_t *iob, nxt_uint_t niob,
         msg.msg_controllen = 0;
     }
 
-    return sendmsg(s, &msg, 0);
+    return sendmsg(s, &msg, flags);
 }
 
 

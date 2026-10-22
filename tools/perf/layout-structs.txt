@@ -1,0 +1,208 @@
+# Copyright (C) FreeUnit contributors.
+#
+# The structs and the macros that tools/perf/layout-check.sh compares.
+# Each line is "<kind> <name>".
+#
+# shm:   Processes share the struct through shared memory.  A change to
+#        its layout fails the check.  The router reads the requests
+#        that libunit writes and the responses that it writes back, so
+#        both directions are listed.
+#        nxt_port_msg_t and nxt_port_mmap_msg_s are copied as bytes into
+#        the data of a port queue item, and the reader decodes them with
+#        its own layout.  pahole sees only the byte array there, so they
+#        are listed on their own.  The same is true for the other
+#        message payloads that libunit and unitd both decode: GET_MMAP
+#        and GET_PORT (libunit to the router), NEW_PORT (the router to
+#        libunit), and the WebSocket frame header in a shared buffer.
+#        nxt_unit_sptr_u is the serialized pointer in the three
+#        nxt_unit_*_s structs above: a union, listed on its own so that
+#        a change to it fails by name, not only through --expand_types.
+# const: A macro that sets the geometry of the shared memory.  pahole
+#        does not see a macro, thus a program that is built with the
+#        headers of the commit prints its value.  A change fails.  For
+#        example, nxt_port_mmap_chunk_start() finds the data of a chunk
+#        with PORT_MMAP_HEADER_SIZE and PORT_MMAP_CHUNK_SIZE.
+# enum:  An enum constant in a header that "make install" copies.  A
+#        module compiles the value into its code (NXT_UNIT_ERROR,
+#        NXT_UNIT_HASH_CONTENT_LENGTH in src/python and src/java), so a
+#        change fails, as for "const".  The program that prints the
+#        "const" values prints these too, without the #ifdef that is
+#        false for an enum constant.
+#        The message numbers of the port protocol are here as well: each
+#        _NXT_PORT_MSG_* value is the offset of a slot in
+#        nxt_port_handlers_t, so inserting or reordering a slot renumbers
+#        the wire protocol even when the build still passes.
+#        tools/perf/layout-coverage.py reads src/nxt_port.h too, so a new
+#        slot fails the check until it is listed.
+# local: The struct is in the memory of one process.  A change to its
+#        layout fails, as for "shm": every struct defined in a header
+#        that "make install" copies is listed, because a module is built
+#        against those headers and lays the struct out itself, and a
+#        module built from the other commit then reads it wrong.
+#        tools/perf/layout-coverage.py fails when one is missing.
+#
+# If you remove an entry from this list, the check fails.
+
+shm    nxt_nncq_t
+shm    nxt_app_nncq_t
+shm    nxt_port_queue_t
+shm    nxt_port_queue_item_t
+shm    nxt_app_queue_t
+shm    nxt_app_queue_item_t
+shm    nxt_port_mmap_header_s
+shm    nxt_unit_field_s
+shm    nxt_unit_request_s
+shm    nxt_unit_response_s
+shm    nxt_port_msg_t
+shm    nxt_port_mmap_msg_s
+shm    nxt_port_msg_get_mmap_t
+shm    nxt_port_msg_get_port_t
+shm    nxt_port_msg_new_port_t
+shm    nxt_websocket_header_t
+shm    nxt_unit_sptr_u
+
+const  PORT_MMAP_HEADER_SIZE
+const  PORT_MMAP_DATA_SIZE
+const  PORT_MMAP_CHUNK_SIZE
+const  PORT_MMAP_SIZE
+const  PORT_MMAP_CHUNK_COUNT
+
+enum   NXT_UNIT_OK
+enum   NXT_UNIT_ERROR
+enum   NXT_UNIT_AGAIN
+enum   NXT_UNIT_CANCELLED
+enum   NXT_UNIT_LOG_ALERT
+enum   NXT_UNIT_LOG_ERR
+enum   NXT_UNIT_LOG_WARN
+enum   NXT_UNIT_LOG_NOTICE
+enum   NXT_UNIT_LOG_INFO
+enum   NXT_UNIT_LOG_DEBUG
+enum   NXT_UNIT_HASH_CONTENT_LENGTH
+enum   NXT_UNIT_HASH_CONTENT_TYPE
+enum   NXT_UNIT_HASH_COOKIE
+enum   NXT_WEBSOCKET_OP_CONT
+enum   NXT_WEBSOCKET_OP_TEXT
+enum   NXT_WEBSOCKET_OP_BINARY
+enum   NXT_WEBSOCKET_OP_CLOSE
+enum   NXT_WEBSOCKET_OP_PING
+enum   NXT_WEBSOCKET_OP_PONG
+enum   NXT_WEBSOCKET_OP_CTRL
+enum   NXT_WEBSOCKET_CR_NORMAL
+enum   NXT_WEBSOCKET_CR_GOING_AWAY
+enum   NXT_WEBSOCKET_CR_PROTOCOL_ERROR
+enum   NXT_WEBSOCKET_CR_UNPROCESSABLE_INPUT
+enum   NXT_WEBSOCKET_CR_RESERVED
+enum   NXT_WEBSOCKET_CR_NOT_PROVIDED
+enum   NXT_WEBSOCKET_CR_ABNORMAL
+enum   NXT_WEBSOCKET_CR_INVALID_DATA
+enum   NXT_WEBSOCKET_CR_POLICY_VIOLATION
+enum   NXT_WEBSOCKET_CR_MESSAGE_TOO_BIG
+enum   NXT_WEBSOCKET_CR_EXTENSION_REQUIRED
+enum   NXT_WEBSOCKET_CR_INTERNAL_SERVER_ERROR
+enum   NXT_WEBSOCKET_CR_TLS_HANDSHAKE_FAILED
+
+local  nxt_port_handlers_t
+local  nxt_port_s
+local  nxt_unit_buf_s
+local  nxt_unit_callbacks_s
+local  nxt_unit_ctx_impl_s
+local  nxt_unit_ctx_s
+local  nxt_unit_init_s
+local  nxt_unit_port_id_s
+local  nxt_unit_port_s
+local  nxt_unit_read_info_s
+local  nxt_unit_request_info_s
+local  nxt_unit_s
+local  nxt_unit_websocket_frame_s
+
+# The message numbers of the wire protocol.  Each value is the offset of
+# a slot in nxt_port_handlers_t, so appending is the only safe edit.
+enum   NXT_PORT_DETACHED_FINISH
+enum   NXT_PORT_DETACHED_START
+enum   NXT_PORT_MSG_ACCESS_LOG
+enum   NXT_PORT_MSG_APP_RESTART
+enum   NXT_PORT_MSG_CANCELLED
+enum   NXT_PORT_MSG_CERT_DELETE
+enum   NXT_PORT_MSG_CERT_GET
+enum   NXT_PORT_MSG_CERT_STORE
+enum   NXT_PORT_MSG_CHANGE_FILE
+enum   NXT_PORT_MSG_CLOSE_FD
+enum   NXT_PORT_MSG_CONF_STORE
+enum   NXT_PORT_MSG_DATA
+enum   NXT_PORT_MSG_DATA_LAST
+enum   NXT_PORT_MSG_DETACHED
+enum   NXT_PORT_MSG_GET_MMAP
+enum   NXT_PORT_MSG_GET_PORT
+enum   NXT_PORT_MSG_LAST
+enum   NXT_PORT_MSG_MASK
+enum   NXT_PORT_MSG_MMAP
+enum   NXT_PORT_MSG_MODULES
+enum   NXT_PORT_MSG_NEW_PORT
+enum   NXT_PORT_MSG_NOT_FOUND
+enum   NXT_PORT_MSG_OOSM
+enum   NXT_PORT_MSG_PORT_ACK
+enum   NXT_PORT_MSG_PROCESS_CREATED
+enum   NXT_PORT_MSG_PROCESS_READY
+enum   NXT_PORT_MSG_QUIT
+enum   NXT_PORT_MSG_READ_QUEUE
+enum   NXT_PORT_MSG_READ_SOCKET
+enum   NXT_PORT_MSG_REMOVE_CHILD_PID
+enum   NXT_PORT_MSG_REMOVE_PID
+enum   NXT_PORT_MSG_REQ_BODY
+enum   NXT_PORT_MSG_REQ_HEADERS
+enum   NXT_PORT_MSG_RPC_ERROR
+enum   NXT_PORT_MSG_RPC_READY
+enum   NXT_PORT_MSG_RPC_READY_LAST
+enum   NXT_PORT_MSG_SCRIPT_DELETE
+enum   NXT_PORT_MSG_SCRIPT_GET
+enum   NXT_PORT_MSG_SCRIPT_STORE
+enum   NXT_PORT_MSG_SHM_ACK
+enum   NXT_PORT_MSG_SOCKET
+enum   NXT_PORT_MSG_SOCKET_UNLINK
+enum   NXT_PORT_MSG_STARTED
+enum   NXT_PORT_MSG_START_PROCESS
+enum   NXT_PORT_MSG_STATUS
+enum   NXT_PORT_MSG_SYNC
+enum   NXT_PORT_MSG_WEBSOCKET
+enum   NXT_PORT_MSG_WEBSOCKET_LAST
+enum   NXT_PORT_MSG_WHOAMI
+enum   NXT_PORT_QUIT_GRACEFUL
+enum   NXT_PORT_QUIT_NORMAL
+enum   _NXT_PORT_MSG_ACCESS_LOG
+enum   _NXT_PORT_MSG_APP_RESTART
+enum   _NXT_PORT_MSG_CERT_DELETE
+enum   _NXT_PORT_MSG_CERT_GET
+enum   _NXT_PORT_MSG_CERT_STORE
+enum   _NXT_PORT_MSG_CHANGE_FILE
+enum   _NXT_PORT_MSG_CONF_STORE
+enum   _NXT_PORT_MSG_DATA
+enum   _NXT_PORT_MSG_DETACHED
+enum   _NXT_PORT_MSG_GET_MMAP
+enum   _NXT_PORT_MSG_GET_PORT
+enum   _NXT_PORT_MSG_MMAP
+enum   _NXT_PORT_MSG_MODULES
+enum   _NXT_PORT_MSG_NEW_PORT
+enum   _NXT_PORT_MSG_OOSM
+enum   _NXT_PORT_MSG_PORT_ACK
+enum   _NXT_PORT_MSG_PROCESS_CREATED
+enum   _NXT_PORT_MSG_PROCESS_READY
+enum   _NXT_PORT_MSG_QUIT
+enum   _NXT_PORT_MSG_READ_QUEUE
+enum   _NXT_PORT_MSG_READ_SOCKET
+enum   _NXT_PORT_MSG_REMOVE_CHILD_PID
+enum   _NXT_PORT_MSG_REMOVE_PID
+enum   _NXT_PORT_MSG_REQ_BODY
+enum   _NXT_PORT_MSG_REQ_HEADERS
+enum   _NXT_PORT_MSG_REQ_HEADERS_ACK
+enum   _NXT_PORT_MSG_RPC_ERROR
+enum   _NXT_PORT_MSG_RPC_READY
+enum   _NXT_PORT_MSG_SCRIPT_DELETE
+enum   _NXT_PORT_MSG_SCRIPT_GET
+enum   _NXT_PORT_MSG_SCRIPT_STORE
+enum   _NXT_PORT_MSG_SHM_ACK
+enum   _NXT_PORT_MSG_SOCKET
+enum   _NXT_PORT_MSG_SOCKET_UNLINK
+enum   _NXT_PORT_MSG_START_PROCESS
+enum   _NXT_PORT_MSG_STATUS
+enum   _NXT_PORT_MSG_WEBSOCKET
+enum   _NXT_PORT_MSG_WHOAMI

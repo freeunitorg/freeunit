@@ -108,6 +108,8 @@ u_char *nxt_openssl_copy_error(u_char *p, u_char *end);
 #define NXT_OPENSSL_TEST_FAIL_BIO_NEW  2
 
 NXT_EXPORT extern nxt_uint_t  nxt_openssl_test_fail;
+
+NXT_EXPORT nxt_uint_t nxt_openssl_test_log_level(int reason);
 #endif
 #endif
 

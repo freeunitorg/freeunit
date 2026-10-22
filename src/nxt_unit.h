@@ -148,7 +148,13 @@ struct nxt_unit_callbacks_s {
     /* Shared memory release acknowledgement. Optional. */
     void     (*shm_ack_handler)(nxt_unit_ctx_t *);
 
-    /* Send data and control to process pid using port id. Optional. */
+    /*
+     * Send data and control to process pid using port id. Optional.
+     * libunit sends some wake-ups non-blocking: a callback must check
+     * nxt_unit_port_send_flags() and, when it has MSG_DONTWAIT, send without
+     * blocking and return 0 on EAGAIN.  A blocking send there can hang the
+     * wake-up of a context that is freed while its peer's socket is full.
+     */
     ssize_t  (*port_send)(nxt_unit_ctx_t *, nxt_unit_port_t *port,
                  const void *buf, size_t buf_size,
                  const void *oob, size_t oob_size);
@@ -216,6 +222,13 @@ int nxt_unit_run(nxt_unit_ctx_t *);
 int nxt_unit_run_ctx(nxt_unit_ctx_t *ctx);
 
 int nxt_unit_run_shared(nxt_unit_ctx_t *ctx);
+
+/*
+ * Inside a port_send callback: the sendmsg() flags libunit would have used
+ * (MSG_DONTWAIT for wake-ups that must not block).  A callback that cannot
+ * deliver a MSG_DONTWAIT send without blocking returns 0 instead.
+ */
+int nxt_unit_port_send_flags(nxt_unit_ctx_t *ctx);
 
 nxt_unit_request_info_t *nxt_unit_dequeue_request(nxt_unit_ctx_t *ctx);
 
@@ -471,6 +484,9 @@ void nxt_unit_req_log(nxt_unit_request_info_t *req, int level,
 
 #if (NXT_TESTS)
 void     nxt_unit_test_send_detached_failures(unsigned int failures);
+void     nxt_unit_test_send_detached_finish_failures(unsigned int failures);
+unsigned int  nxt_unit_test_send_detached_finish_injected(void);
+void     nxt_unit_test_request_info_failures(unsigned int failures);
 uint8_t  nxt_unit_test_ctx_detached(nxt_unit_ctx_t *ctx);
 uint8_t  nxt_unit_test_ctx_detached_retries(nxt_unit_ctx_t *ctx);
 void     nxt_unit_test_ctx_set_detached(nxt_unit_ctx_t *ctx, uint8_t val);
@@ -481,13 +497,21 @@ void     nxt_unit_test_ctx_detached_start(nxt_unit_ctx_t *ctx);
 void     nxt_unit_test_ctx_detached_done(nxt_unit_ctx_t *ctx);
 int      nxt_unit_test_ctx_detached_retry(nxt_unit_ctx_t *ctx);
 nxt_unit_port_t  *nxt_unit_test_ctx_read_port(nxt_unit_ctx_t *ctx);
+void     *nxt_unit_test_port_queue(nxt_unit_port_t *port);
+int      nxt_unit_test_wait_shm_ack(nxt_unit_ctx_t *ctx, size_t *held);
+size_t   nxt_unit_test_parked_rbufs(nxt_unit_ctx_t *ctx);
 uint64_t nxt_unit_test_detached_now(void);
 uint8_t  nxt_unit_test_ctx_online(nxt_unit_ctx_t *ctx);
+void     nxt_unit_test_ctx_set_quit_pending(nxt_unit_ctx_t *ctx,
+             uint8_t quit_param);
 uint8_t  nxt_unit_test_ctx_ready(nxt_unit_ctx_t *ctx);
 void     nxt_unit_test_ctx_set_ready(nxt_unit_ctx_t *ctx, uint8_t val);
 void     nxt_unit_test_ctx_quit_graceful(nxt_unit_ctx_t *ctx);
 int      nxt_unit_test_add_queue_port(nxt_unit_ctx_t *ctx, pid_t pid,
     uint16_t id, int out_fd, void *queue);
+void     nxt_unit_test_new_mmap_failures(unsigned int failures);
+void     nxt_unit_test_shm_probe_failures(unsigned int failures);
+void     nxt_unit_test_read_buf_failures(unsigned int failures);
 #endif
 
 #if (NXT_TESTS || NXT_FUZZ_BUILD)

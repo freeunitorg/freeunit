@@ -28,6 +28,29 @@ typedef struct nxt_mp_s  nxt_mp_t;
 
 
 /*
+ * Each thread keeps freed pool clusters for reuse (see nxt_mp.c).  The cache
+ * needs __thread storage.  It is off with NXT_DEBUG_MEMORY, where a pool
+ * allocates every block apart, and with NXT_HEAP_SANITIZER (nxt_clang.h): a
+ * reused cluster would hide a use after free of a destroyed pool.  A build
+ * also turns it off with --cc-opt=-DNXT_MP_NO_CLUSTER_CACHE=1, for example
+ * for Valgrind, which sees a cached cluster as allocated memory.  The switch
+ * cannot turn the cache on.  NXT_DEBUG_MEMORY is set the same way:
+ * --cc-opt=-DNXT_DEBUG_MEMORY=1.
+ */
+
+#ifndef NXT_MP_NO_CLUSTER_CACHE
+#define NXT_MP_NO_CLUSTER_CACHE  0
+#endif
+
+#if (NXT_HAVE_THREAD_STORAGE_CLASS && !(NXT_DEBUG_MEMORY)                     \
+     && !(NXT_HEAP_SANITIZER) && !(NXT_MP_NO_CLUSTER_CACHE))
+#define NXT_MP_CLUSTER_CACHE  1
+#else
+#define NXT_MP_CLUSTER_CACHE  0
+#endif
+
+
+/*
  * nxt_mp_create() creates a memory pool and sets the pool's retention
  * counter to 1.
  */
@@ -52,6 +75,13 @@ NXT_EXPORT void nxt_mp_retain(nxt_mp_t *mp);
  */
 NXT_EXPORT void nxt_mp_release(nxt_mp_t *mp);
 
+/*
+ * nxt_mp_cluster_cache_drain() frees the cluster memory that the calling
+ * thread keeps for reuse.  nxt_thread_exit() calls it, and so does the
+ * cleanup handler of a canceled thread.
+ */
+NXT_EXPORT void nxt_mp_cluster_cache_drain(void);
+
 #if (NXT_TESTS)
 /*
  * Returns the current retention count.  Used by
@@ -60,6 +90,29 @@ NXT_EXPORT void nxt_mp_release(nxt_mp_t *mp);
  * baseline (1) when the send fails.
  */
 NXT_EXPORT uint32_t nxt_mp_test_retain_count(nxt_mp_t *mp);
+
+/*
+ * Returns the number of nxt_memalign() calls for cluster memory, in all
+ * threads, since the process started.  A call that fails counts too.
+ */
+NXT_EXPORT nxt_uint_t nxt_mp_test_cluster_alloc_count(void);
+
+/*
+ * Returns the number of clusters that nxt_mp_cluster_cache_drain() freed,
+ * in all threads, since the process started.
+ */
+NXT_EXPORT nxt_uint_t nxt_mp_test_cluster_drain_count(void);
+
+#if (NXT_MP_CLUSTER_CACHE)
+/*
+ * Gives the cluster memory "p" of the pool "mp" to the cache of the calling
+ * thread twice, as a path that frees one cluster twice would.
+ */
+NXT_EXPORT void nxt_mp_test_cluster_put_twice(nxt_mp_t *mp, void *p);
+
+/* Returns the number of clusters in the cache of the calling thread. */
+NXT_EXPORT nxt_uint_t nxt_mp_test_cluster_cache_count(void);
+#endif
 #endif
 
 /* nxt_mp_test_sizes() tests validity of memory pool parameters. */

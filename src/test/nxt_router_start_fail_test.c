@@ -21,7 +21,9 @@
  *
  * This single-shot test reaches that third site only.  All three failure
  * sites, and the accounting across repeated failures, are covered by
- * src/test/nxt_router_start_fail_soak_test.c.
+ * src/test/nxt_router_start_fail_soak_test.c.  A release-only leg here
+ * drives the clamp at the top of nxt_router_app_start_failed() as well; a
+ * debug build asserts before that clamp and compiles the leg out.
  */
 
 #include <nxt_main.h>
@@ -135,7 +137,7 @@ nxt_router_start_fail_test(nxt_thread_t *thr)
 
     if (app->pending_processes != 0) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
-                      "router start fail test: pending_processes %uD leaked "
+                      "router start fail test: pending_processes %uA leaked "
                       "(expected 0)", app->pending_processes);
         goto done;
     }
@@ -146,6 +148,35 @@ nxt_router_start_fail_test(nxt_thread_t *thr)
                       (int) app->use_count);
         goto done;
     }
+
+#if !(NXT_DEBUG)
+
+    /*
+     * The clamp: a release build reaching this point with the slot already
+     * given back is the miscount the clamp exists for, and without it the
+     * subtraction wraps and nxt_router_app_can_start() is false for ever.
+     * A debug build asserts before the clamp, so the leg is compiled out
+     * there -- the same shape as nxt_port_release_test.c's refused pair.
+     */
+
+    app->pending_processes = 0;
+    app->use_count = 2;
+
+    nxt_port_test_msg_alloc_failures(1);
+
+    nxt_router_start_app_process_handler(task, router_port, app);
+
+    nxt_port_test_msg_alloc_failures(0);
+
+    if (app->pending_processes != 0) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router start fail test: the clamp let the release wrap "
+                      "pending_processes to %uA (expected 0)",
+                      app->pending_processes);
+        goto done;
+    }
+
+#endif
 
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "router start fail test passed");
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 #
 # unfreeze-sync.sh — migrate relevant nginx/unit issues to freeunitorg/freeunit
 #
@@ -10,82 +10,94 @@
 #   ./unfreeze-sync.sh --preview 50    # preview first 50 issues
 #   DRY_RUN=false ./unfreeze-sync.sh    # actually create issues
 
-set -euo pipefail
+set -eu
+
+# pipefail is not in POSIX; use it when the shell supports it.
+# shellcheck disable=SC3040
+if (set -o pipefail) 2>/dev/null; then
+  set -o pipefail
+fi
 
 UPSTREAM_REPO="nginx/unit"
 TARGET_REPO="freeunitorg/freeunit"
 
 # keywords for filtering (extend as needed)
-KEYWORDS=(
-  "php"
-  "crash"
-  "segfault"
-  "wasm"
-  "wamr"
-  "bun"
-  "python"
-  "docker"
-  "fedora"
-  "ubuntu"
-  "logging"
-  "rewrite"
-)
+KEYWORDS="
+  php
+  crash
+  segfault
+  wasm
+  wamr
+  bun
+  python
+  docker
+  fedora
+  ubuntu
+  logging
+  rewrite
+"
 
-# ported labels map (api name => color) — must match labels imported by unfreeze-labels.sh
+# ported labels check — must match labels imported by unfreeze-labels.sh
 # GitHub API returns full names with emoji, e.g. "z-bug 🐞", "z-enhancement ⬆️"
-# name may contain colons, use | as entry separator
-declare -A LABELS=(
-  ["z-bug 🐞"]="ededed"
-  ["z-enhancement ⬆️"]="ededed"
-  ["z-crasher"]="ededed"
-  ["z-configuration"]="ededed"
-  ["z-c"]="ededed"
-  ["z-community"]="ededed"
-  ["z-documentation-update-needed"]="ededed"
-  ["z-Difficulty: ⭐️"]="ededed"
-  ["z-Difficulty: ⭐️ ⭐️"]="ededed"
-  ["z-Difficulty: ⭐️ ⭐️ ⭐️"]="ededed"
-  ["z-duplicate"]="ededed"
-  ["z-go"]="ededed"
-  ["z-infrastructure"]="ededed"
-  ["z-invalid"]="ededed"
-  ["z-java"]="ededed"
-  ["z-needs-investigation"]="ededed"
-  ["z-node-js"]="ededed"
-  ["z-notabug"]="ededed"
-  ["z-packages"]="ededed"
-  ["z-php"]="ededed"
-  ["z-python"]="ededed"
-  ["z-question"]="ededed"
-  ["z-ready4dev 🚀"]="ededed"
-  ["z-roadmap"]="ededed"
-  ["z-ruby"]="ededed"
-  ["z-rust"]="ededed"
-  ["z-toolchain"]="ededed"
-  ["z-wasm"]="ededed"
-  ["z-wontfix"]="ededed"
-  ["L-Go"]="2b67c6"
-  ["L-Java"]="2b67c6"
-  ["L-JavaScript"]="2b67c6"
-  ["L-Libunit"]="2b67c6"
-  ["L-Perl"]="2b67c6"
-  ["L-PHP"]="2b67c6"
-  ["L-Python"]="2b67c6"
-  ["L-Ruby"]="2b67c6"
-  ["L-WebAssembly"]="2b67c6"
-  ["T-Defect"]="98e6ae"
-  ["T-Enhancement"]="98e6ae"
-  ["T-Other"]="98e6ae"
-  ["X-Needs-Discussion"]="ff7979"
-  ["X-Needs-Info"]="ff7979"
-  ["X-Release-Blocker"]="ff7979"
-)
+is_known_label() {
+  case "$1" in
+    "z-bug 🐞" | \
+    "z-enhancement ⬆️" | \
+    "z-crasher" | \
+    "z-configuration" | \
+    "z-c" | \
+    "z-community" | \
+    "z-documentation-update-needed" | \
+    "z-Difficulty: ⭐️" | \
+    "z-Difficulty: ⭐️ ⭐️" | \
+    "z-Difficulty: ⭐️ ⭐️ ⭐️" | \
+    "z-duplicate" | \
+    "z-go" | \
+    "z-infrastructure" | \
+    "z-invalid" | \
+    "z-java" | \
+    "z-needs-investigation" | \
+    "z-node-js" | \
+    "z-notabug" | \
+    "z-packages" | \
+    "z-php" | \
+    "z-python" | \
+    "z-question" | \
+    "z-ready4dev 🚀" | \
+    "z-roadmap" | \
+    "z-ruby" | \
+    "z-rust" | \
+    "z-toolchain" | \
+    "z-wasm" | \
+    "z-wontfix" | \
+    "L-Go" | \
+    "L-Java" | \
+    "L-JavaScript" | \
+    "L-Libunit" | \
+    "L-Perl" | \
+    "L-PHP" | \
+    "L-Python" | \
+    "L-Ruby" | \
+    "L-WebAssembly" | \
+    "T-Defect" | \
+    "T-Enhancement" | \
+    "T-Other" | \
+    "X-Needs-Discussion" | \
+    "X-Needs-Info" | \
+    "X-Release-Blocker")
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
 
 # --- args ---
 DRY_RUN="${DRY_RUN:-true}"
 
 LIMIT=5
-while [[ $# -gt 0 ]]; do
+while [ $# -gt 0 ]; do
   case "$1" in
     --preview)
       DRY_RUN="true"
@@ -114,25 +126,47 @@ echo "Dry-run:  $DRY_RUN"
 echo
 
 # --- check gh ---
-if ! command -v gh >/dev/null; then
-  echo "ERROR: gh CLI not installed"
+if ! command -v gh >/dev/null 2>&1; then
+  echo "ERROR: gh CLI not installed" >&2
   exit 1
 fi
 
 gh auth status >/dev/null 2>&1 || {
-  echo "ERROR: gh not authenticated"
+  echo "ERROR: gh not authenticated" >&2
   exit 1
 }
 
 # --- keyword filter ---
 matches_keywords() {
-  local text="$1"
-  for kw in "${KEYWORDS[@]}"; do
-    if grep -iq "$kw" <<< "$text"; then
+  text="$1"
+  for kw in $KEYWORDS; do
+    if printf '%s\n' "$text" | grep -i -e "$kw" >/dev/null; then
       return 0
     fi
   done
   return 1
+}
+
+# --- create issue helper with labels ---
+create_issue_with_labels() {
+  target_repo="$1"
+  draft_title="$2"
+  new_issue_body="$3"
+  shift 3
+
+  # In POSIX sh, convert label list into --label "$lbl" arguments
+  n_labels=$#
+  while [ "$n_labels" -gt 0 ]; do
+    set -- "$@" --label "$1"
+    shift
+    n_labels=$((n_labels - 1))
+  done
+
+  gh issue create \
+    --repo "$target_repo" \
+    --title "$draft_title" \
+    --body "$new_issue_body" \
+    "$@"
 }
 
 # --- fetch existing unfreeze issue titles to detect duplicates ---
@@ -154,24 +188,25 @@ ISSUES_JSON=$(gh issue list \
   --limit "$LIMIT" \
   --json number,title,body,author,url,state,createdAt,labels)
 
-COUNT=$(echo "$ISSUES_JSON" | jq length)
+COUNT=$(printf '%s\n' "$ISSUES_JSON" | jq length)
 echo "Fetched $COUNT issues"
 echo
 
 # --- process ---
-echo "$ISSUES_JSON" | jq -c '.[]' | while read -r issue; do
-  NUMBER=$(echo "$issue" | jq -r '.number')
-  TITLE=$(echo "$issue" | jq -r '.title')
-  BODY=$(echo "$issue" | jq -r '.body // ""')
-  AUTHOR=$(echo "$issue" | jq -r '.author.login')
-  URL=$(echo "$issue" | jq -r '.url')
-  STATE=$(echo "$issue" | jq -r '.state')
-  CREATED=$(echo "$issue" | jq -r '.createdAt | split("T")[0]')
-  UPSTREAM_LABELS_JSON=$(echo "$issue" | jq -r '[.labels[] | .name] | join("\n")')
+printf '%s\n' "$ISSUES_JSON" | jq -c '.[]' | while read -r issue; do
+  NUMBER=$(printf '%s\n' "$issue" | jq -r '.number')
+  TITLE=$(printf '%s\n' "$issue" | jq -r '.title')
+  BODY=$(printf '%s\n' "$issue" | jq -r '.body // ""')
+  AUTHOR=$(printf '%s\n' "$issue" | jq -r '.author.login')
+  URL=$(printf '%s\n' "$issue" | jq -r '.url')
+  STATE=$(printf '%s\n' "$issue" | jq -r '.state')
+  CREATED=$(printf '%s\n' "$issue" | jq -r '.createdAt | split("T")[0]')
+  UPSTREAM_LABELS_JSON=$(printf '%s\n' "$issue" | jq -r '[.labels[] | .name] | join("\n")')
 
   TEXT="$TITLE"
   if [ -n "$BODY" ]; then
-    TEXT="$TEXT"$'\n'"$BODY"
+    TEXT="${TEXT}
+${BODY}"
   fi
 
   if ! matches_keywords "$TEXT"; then
@@ -181,7 +216,7 @@ echo "$ISSUES_JSON" | jq -c '.[]' | while read -r issue; do
   DRAFT_TITLE="[unfreeze] $TITLE"
 
   # --- dedup check (exact line match against "[unfreeze] title") ---
-  if grep -qxF "$DRAFT_TITLE" <<< "$EXISTING_TITLES"; then
+  if printf '%s\n' "$EXISTING_TITLES" | grep -xF "$DRAFT_TITLE" >/dev/null; then
     echo "SKIP (exists): #$NUMBER $TITLE"
     continue
   fi
@@ -194,16 +229,20 @@ echo "$ISSUES_JSON" | jq -c '.[]' | while read -r issue; do
   echo "Upstream labels: $UPSTREAM_LABELS_JSON"
 
   # --- build label list for new issue ---
-  LABELS_TO_ADD=("unfreeze" "needs-repro")
-  IFS=$'\n' read -ra UL <<< "$UPSTREAM_LABELS_JSON"
-  for ul in "${UL[@]}"; do
-    # GitHub API normalizes label names
-    if [[ -v "LABELS[$ul]" ]]; then
-      LABELS_TO_ADD+=("$ul")
-    fi
-  done
+  set -- "unfreeze" "needs-repro"
+  if [ -n "$UPSTREAM_LABELS_JSON" ]; then
+    while IFS= read -r ul || [ -n "$ul" ]; do
+      [ -z "$ul" ] && continue
+      if is_known_label "$ul"; then
+        set -- "$@" "$ul"
+      fi
+    done <<EOF
+$UPSTREAM_LABELS_JSON
+EOF
+  fi
 
   # --- upstream comment ---
+  # shellcheck disable=SC2034
   COMMENT_BODY=$(cat <<EOF
 Hi @$AUTHOR,
 
@@ -228,6 +267,7 @@ EOF
 
   # --- escape body for markdown safe embedding ---
   if [ -n "$BODY" ]; then
+    # shellcheck disable=SC2016
     BODY_ESCAPED=$(printf '%s' "$BODY" | sed 's/\\/\\\\/g; s/`/\\`/g; s/---/\\-\\-\\-/g')
     BODY_BLOCK="
 ## Original Issue
@@ -260,7 +300,7 @@ Needs:
 
   if [ "$DRY_RUN" = "true" ]; then
     echo "[DRY] Would create issue: $DRAFT_TITLE"
-    echo "Labels: ${LABELS_TO_ADD[*]}"
+    echo "Labels: $*"
     echo "--- draft body preview ---"
     printf '%s\n' "$NEW_ISSUE_BODY" | head -n 30
     echo "... (truncated)"
@@ -275,17 +315,7 @@ Needs:
     # fi
 
     echo "Creating issue in $TARGET_REPO..."
-    # build --label args
-    LABEL_ARGS=()
-    for lbl in "${LABELS_TO_ADD[@]}"; do
-      LABEL_ARGS+=(--label "$lbl")
-    done
-
-    gh issue create \
-      --repo "$TARGET_REPO" \
-      --title "$DRAFT_TITLE" \
-      --body "$NEW_ISSUE_BODY" \
-      "${LABEL_ARGS[@]}"
+    create_issue_with_labels "$TARGET_REPO" "$DRAFT_TITLE" "$NEW_ISSUE_BODY" "$@"
   fi
 
 done

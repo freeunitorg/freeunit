@@ -46,9 +46,13 @@ nxt_port_queue_init(nxt_port_queue_t volatile *q)
 }
 
 
+/*
+ * Stores in "*pos" the position of the item in the queue; the queue head
+ * passes it when the reader takes the item.
+ */
 nxt_inline nxt_int_t
-nxt_port_queue_send(nxt_port_queue_t volatile *q, const void *p, uint8_t size,
-    int *notify)
+nxt_port_queue_send_pos(nxt_port_queue_t volatile *q, const void *p,
+    uint8_t size, int *notify, nxt_nncq_atomic_t *pos)
 {
     nxt_nncq_atomic_t      i;
     nxt_port_queue_item_t  *qi;
@@ -74,7 +78,7 @@ nxt_port_queue_send(nxt_port_queue_t volatile *q, const void *p, uint8_t size,
     qi->size = size;
     nxt_memcpy(qi->data, p, size);
 
-    if (nxt_slow_path(nxt_nncq_enqueue(&q->queue, i) != NXT_OK)) {
+    if (nxt_slow_path(nxt_nncq_enqueue_pos(&q->queue, i, pos) != NXT_OK)) {
         (void) nxt_nncq_enqueue(&q->free_items, i);
 
         *notify = 0;
@@ -86,6 +90,49 @@ nxt_port_queue_send(nxt_port_queue_t volatile *q, const void *p, uint8_t size,
     *notify = (i == 0);
 
     return NXT_OK;
+}
+
+
+nxt_inline nxt_int_t
+nxt_port_queue_send(nxt_port_queue_t volatile *q, const void *p, uint8_t size,
+    int *notify)
+{
+    nxt_nncq_atomic_t  pos;
+
+    return nxt_port_queue_send_pos(q, p, size, notify, &pos);
+}
+
+
+/*
+ * Whether the reader has taken the item that nxt_port_queue_send_pos()
+ * put at "pos".  The items that wait in the queue are those from the head
+ * up to the tail, and there are at most NXT_PORT_QUEUE_SIZE of them.  So an
+ * item not yet taken is less than the smaller of the two ahead of the head.
+ * Any other distance means that the head has passed it, also after the
+ * 32-bit counters wrap.
+ *
+ * The head is read first.  Between the two reads, the reader can take items
+ * and writers can put items in; both only widen the window, so an item not
+ * yet taken is always inside it.  After a full lap of the counters since the
+ * item, a taken item reads as not taken only while the head is behind its
+ * position and the tail is past it: the caller then waits until the head
+ * passes it, at most NXT_PORT_QUEUE_SIZE items later.  The bound on the
+ * window keeps a peer that writes a tail behind the head from widening the
+ * window past the queue size.
+ */
+nxt_inline nxt_bool_t
+nxt_port_queue_taken(nxt_port_queue_t volatile *q, nxt_nncq_atomic_t pos)
+{
+    nxt_nncq_atomic_t  head, waiting;
+
+    head = nxt_nncq_head(&q->queue);
+    waiting = nxt_nncq_tail(&q->queue) - head;
+
+    if (waiting > NXT_PORT_QUEUE_SIZE) {
+        waiting = NXT_PORT_QUEUE_SIZE;
+    }
+
+    return (nxt_nncq_atomic_t) (pos - head) >= waiting;
 }
 
 

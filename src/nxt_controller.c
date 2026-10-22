@@ -37,6 +37,12 @@ typedef struct {
     nxt_cert_info_t           *old;
     nxt_controller_request_t  *req;
 } nxt_controller_cert_store_t;
+
+
+typedef struct {
+    nxt_str_t                 name;
+    nxt_controller_request_t  *req;
+} nxt_controller_cert_delete_t;
 #endif
 
 
@@ -45,6 +51,12 @@ typedef struct {
     nxt_str_t                 name;
     nxt_controller_request_t  *req;
 } nxt_controller_script_store_t;
+
+
+typedef struct {
+    nxt_str_t                 name;
+    nxt_controller_request_t  *req;
+} nxt_controller_script_delete_t;
 #endif
 
 
@@ -120,6 +132,8 @@ static void nxt_controller_process_cert(nxt_task_t *task,
     nxt_controller_request_t *req, nxt_str_t *path);
 static void nxt_controller_cert_store_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
+static void nxt_controller_cert_delete_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data);
 static void nxt_controller_cert_apply(nxt_task_t *task,
     nxt_controller_cert_store_t *store);
 static void nxt_controller_cert_apply_handler(nxt_task_t *task,
@@ -133,6 +147,8 @@ static void nxt_controller_process_script(nxt_task_t *task,
     nxt_controller_request_t *req, nxt_str_t *path);
 static void nxt_controller_process_script_save(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
+static void nxt_controller_process_script_delete(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data);
 static nxt_bool_t nxt_controller_script_in_use(nxt_str_t *name);
 static void nxt_controller_script_cleanup(nxt_task_t *task, void *obj,
     void *data);
@@ -143,8 +159,10 @@ static void nxt_controller_app_restart_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
 static void nxt_controller_conf_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
-static void nxt_controller_conf_store(nxt_task_t *task,
-    nxt_conf_value_t *conf);
+static void nxt_controller_process_conf_store(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data);
+static nxt_int_t nxt_controller_conf_store(nxt_task_t *task,
+    nxt_conf_value_t *conf, nxt_controller_request_t *req);
 static void nxt_controller_response(nxt_task_t *task,
     nxt_controller_request_t *req, nxt_controller_response_t *resp);
 static u_char *nxt_controller_date(u_char *buf, nxt_realtime_t *now,
@@ -163,13 +181,17 @@ static nxt_uint_t              nxt_controller_router_ready;
 static nxt_controller_conf_t   nxt_controller_conf;
 static nxt_queue_t             nxt_controller_waiting_requests;
 static nxt_bool_t              nxt_controller_waiting_init_conf;
+/* The configuration is applied, and main still stores it. */
+static nxt_bool_t              nxt_controller_conf_storing;
 #if (NXT_TLS)
 static nxt_bool_t              nxt_controller_cert_storing;
+static nxt_bool_t              nxt_controller_cert_deleting;
 /* A stored bundle that waits for the first configuration of a router. */
 static nxt_controller_cert_store_t  *nxt_controller_cert_stored;
 #endif
 #if (NXT_HAVE_NJS)
 static nxt_bool_t              nxt_controller_script_storing;
+static nxt_bool_t              nxt_controller_script_deleting;
 #endif
 static nxt_conf_value_t        *nxt_controller_status;
 
@@ -413,6 +435,9 @@ nxt_controller_start(nxt_task_t *task, nxt_process_data_t *data)
     vldt.conf = conf;
     vldt.conf_pool = mp;
     vldt.ver = nxt_conf_ver;
+
+    /* nxt_conf_vldt_size() keeps a stored negative size, with a warning. */
+    vldt.restored = 1;
 
     /*
      * nxt_conf_vldt_app_shm() keeps a stored "shm" that is out of
@@ -1922,12 +1947,16 @@ nxt_controller_store_in_flight(void)
 
     storing = 0;
 
+    storing |= nxt_controller_conf_storing;
+
 #if (NXT_TLS)
     storing |= nxt_controller_cert_storing;
+    storing |= nxt_controller_cert_deleting;
 #endif
 
 #if (NXT_HAVE_NJS)
     storing |= nxt_controller_script_storing;
+    storing |= nxt_controller_script_deleting;
 #endif
 
     return storing;
@@ -2091,6 +2120,7 @@ nxt_controller_process_cert(nxt_task_t *task,
     nxt_conf_value_t             *value;
     nxt_controller_response_t    resp;
     nxt_controller_cert_store_t  *store;
+    nxt_controller_cert_delete_t *del;
 
     name.length = path->length - 1;
     name.start = path->start + 1;
@@ -2113,8 +2143,11 @@ nxt_controller_process_cert(nxt_task_t *task,
 
     if (nxt_str_eq(&req->parser.method, "GET", 3)) {
 
-        /* While main stores a bundle, its metadata can roll back.  Wait. */
-        if (nxt_controller_cert_storing) {
+        /*
+         * While main stores or deletes a bundle, its metadata can roll
+         * back, or name a file that is already gone.  Wait.
+         */
+        if (nxt_controller_cert_storing || nxt_controller_cert_deleting) {
             nxt_queue_insert_tail(&nxt_controller_waiting_requests,
                                   &req->link);
             return;
@@ -2237,16 +2270,28 @@ nxt_controller_process_cert(nxt_task_t *task,
             goto cert_in_use;
         }
 
-        if (nxt_cert_info_delete(&name) != NXT_OK) {
+        if (nxt_cert_info_get(&name) == NULL) {
             goto cert_not_found;
         }
 
-        nxt_cert_store_delete(task, &name, c->mem_pool);
+        del = nxt_mp_get(c->mem_pool, sizeof(nxt_controller_cert_delete_t));
+        if (nxt_slow_path(del == NULL)) {
+            goto alloc_fail;
+        }
 
-        resp.status = 200;
-        resp.title = (u_char *) "Certificate deleted.";
+        nxt_controller_cert_deleting = 1;
 
-        nxt_controller_response(task, req, &resp);
+        del->name = name;
+        del->req = req;
+
+        /*
+         * The bundle stays listed, and the answer waits, until the store
+         * child has removed the file: see
+         * nxt_controller_store_in_flight().
+         */
+
+        nxt_cert_store_delete(task, &name, c->mem_pool,
+                              nxt_controller_cert_delete_handler, del);
         return;
     }
 
@@ -2387,6 +2432,41 @@ nxt_controller_cert_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     }
 
     nxt_controller_cert_apply(task, store);
+}
+
+
+static void
+nxt_controller_cert_delete_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data)
+{
+    nxt_controller_response_t     resp;
+    nxt_controller_cert_delete_t  *del;
+
+    del = data;
+
+    nxt_controller_cert_deleting = 0;
+
+    nxt_memzero(&resp, sizeof(nxt_controller_response_t));
+
+    if (msg == NULL || msg->port_msg.type != NXT_PORT_MSG_RPC_READY) {
+        /*
+         * The bundle could not be removed.  Keep it listed: its file is
+         * still in the store, and the next start loads it again.
+         */
+        resp.status = 500;
+        resp.title = (u_char *) "Failed to delete certificate.";
+        resp.offset = -1;
+
+    } else {
+        (void) nxt_cert_info_delete(&del->name);
+
+        resp.status = 200;
+        resp.title = (u_char *) "Certificate deleted.";
+    }
+
+    nxt_controller_response(task, del->req, &resp);
+
+    nxt_controller_flush_requests(task);
 }
 
 
@@ -2556,6 +2636,7 @@ nxt_controller_process_script(nxt_task_t *task,
     nxt_conf_value_t               *value;
     nxt_controller_response_t      resp;
     nxt_controller_script_store_t  *store;
+    nxt_controller_script_delete_t *del;
     u_char                         error[NXT_MAX_ERROR_STR];
 
     name.length = path->length - 1;
@@ -2579,8 +2660,11 @@ nxt_controller_process_script(nxt_task_t *task,
 
     if (nxt_str_eq(&req->parser.method, "GET", 3)) {
 
-        /* While main stores a module, its metadata can roll back.  Wait. */
-        if (nxt_controller_script_storing) {
+        /*
+         * While main stores or deletes a module, its metadata can roll
+         * back, or name a file that is already gone.  Wait.
+         */
+        if (nxt_controller_script_storing || nxt_controller_script_deleting) {
             nxt_queue_insert_tail(&nxt_controller_waiting_requests,
                                   &req->link);
             return;
@@ -2688,16 +2772,28 @@ nxt_controller_process_script(nxt_task_t *task,
             goto script_in_use;
         }
 
-        if (nxt_script_info_delete(&name) != NXT_OK) {
+        if (nxt_script_info_get(&name) == NULL) {
             goto script_not_found;
         }
 
-        nxt_script_store_delete(task, &name, c->mem_pool);
+        del = nxt_mp_get(c->mem_pool, sizeof(nxt_controller_script_delete_t));
+        if (nxt_slow_path(del == NULL)) {
+            goto alloc_fail;
+        }
 
-        resp.status = 200;
-        resp.title = (u_char *) "JS module deleted.";
+        nxt_controller_script_deleting = 1;
 
-        nxt_controller_response(task, req, &resp);
+        del->name = name;
+        del->req = req;
+
+        /*
+         * The module stays listed, and the answer waits, until the store
+         * child has removed the file: see
+         * nxt_controller_store_in_flight().
+         */
+
+        nxt_script_store_delete(task, &name, c->mem_pool,
+                                nxt_controller_process_script_delete, del);
         return;
     }
 
@@ -2821,6 +2917,41 @@ nxt_controller_process_script_save(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 }
 
 
+static void
+nxt_controller_process_script_delete(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data)
+{
+    nxt_controller_response_t       resp;
+    nxt_controller_script_delete_t  *del;
+
+    del = data;
+
+    nxt_controller_script_deleting = 0;
+
+    nxt_memzero(&resp, sizeof(nxt_controller_response_t));
+
+    if (msg == NULL || msg->port_msg.type != NXT_PORT_MSG_RPC_READY) {
+        /*
+         * The module could not be removed.  Keep it listed: its file is
+         * still in the store, and the next start loads it again.
+         */
+        resp.status = 500;
+        resp.title = (u_char *) "Failed to delete script.";
+        resp.offset = -1;
+
+    } else {
+        (void) nxt_script_info_delete(&del->name);
+
+        resp.status = 200;
+        resp.title = (u_char *) "JS module deleted.";
+    }
+
+    nxt_controller_response(task, del->req, &resp);
+
+    nxt_controller_flush_requests(task);
+}
+
+
 static nxt_bool_t
 nxt_controller_script_in_use(nxt_str_t *name)
 {
@@ -2904,10 +3035,24 @@ nxt_controller_conf_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
         nxt_controller_conf = req->conf;
 
-        nxt_controller_conf_store(task, req->conf.root);
+        /*
+         * The client waits until the store child of main has written the
+         * configuration and flushed it, so a 200 means "on the disk".  The
+         * answer comes from nxt_controller_process_conf_store().
+         */
+        nxt_controller_conf_storing = 1;
 
-        resp.status = 200;
-        resp.title = (u_char *) "Reconfiguration done.";
+        if (nxt_fast_path(nxt_controller_conf_store(task, req->conf.root, req)
+                          == NXT_OK))
+        {
+            return;
+        }
+
+        nxt_controller_conf_storing = 0;
+
+        resp.status = 500;
+        resp.title = (u_char *) "Failed to store the configuration.";
+        resp.offset = -1;
 
     } else {
         nxt_mp_destroy(req->conf.pool);
@@ -2915,6 +3060,44 @@ nxt_controller_conf_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         resp.status = 500;
         resp.title = (u_char *) "Failed to apply new configuration.";
         resp.offset = -1;
+    }
+
+    nxt_controller_response(task, req, &resp);
+
+    nxt_controller_flush_requests(task);
+}
+
+
+/*
+ * Main answers the store of a configuration only when its store child has
+ * ended.  The configuration runs either way; this answer says whether it
+ * reached the disk.
+ */
+static void
+nxt_controller_process_conf_store(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data)
+{
+    nxt_controller_request_t   *req;
+    nxt_controller_response_t  resp;
+
+    req = data;
+
+    nxt_controller_conf_storing = 0;
+
+    nxt_memzero(&resp, sizeof(nxt_controller_response_t));
+
+    if (msg == NULL || msg->port_msg.type != NXT_PORT_MSG_RPC_READY) {
+        /*
+         * The configuration runs, but a restart loads the one before it.
+         * The client must not read this as stored.
+         */
+        resp.status = 500;
+        resp.title = (u_char *) "Failed to store the configuration.";
+        resp.offset = -1;
+
+    } else {
+        resp.status = 200;
+        resp.title = (u_char *) "Reconfiguration done.";
     }
 
     nxt_controller_response(task, req, &resp);
@@ -3072,30 +3255,35 @@ nxt_controller_app_restart_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 }
 
 
-static void
-nxt_controller_conf_store(nxt_task_t *task, nxt_conf_value_t *conf)
+static nxt_int_t
+nxt_controller_conf_store(nxt_task_t *task, nxt_conf_value_t *conf,
+    nxt_controller_request_t *req)
 {
     void           *mem;
     u_char         *end;
     size_t         size;
+    uint32_t       stream;
     nxt_fd_t       fd;
     nxt_int_t      rc;
     nxt_buf_t      *b;
-    nxt_port_t     *main_port;
+    nxt_port_t     *main_port, *controller_port;
     nxt_runtime_t  *rt;
 
     rt = task->thread->runtime;
 
     main_port = rt->port_by_type[NXT_PROCESS_MAIN];
+    controller_port = rt->port_by_type[NXT_PROCESS_CONTROLLER];
 
     size = nxt_conf_json_length(conf, NULL);
     if (nxt_slow_path(size == SIZE_MAX)) {
-        return;
+        nxt_alert(task, "failed to store current configuration: "
+                  "it is too large");
+        return NXT_ERROR;
     }
 
     fd = nxt_shm_open(task, size);
     if (nxt_slow_path(fd == -1)) {
-        return;
+        return NXT_ERROR;
     }
 
     mem = nxt_mem_mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -3116,9 +3304,17 @@ nxt_controller_conf_store(nxt_task_t *task, nxt_conf_value_t *conf)
 
     b->mem.free = nxt_cpymem(b->mem.pos, &size, sizeof(size_t));
 
+    stream = nxt_port_rpc_register_handler(task, controller_port,
+                                           nxt_controller_process_conf_store,
+                                           nxt_controller_process_conf_store,
+                                           -1, req);
+    if (nxt_slow_path(stream == 0)) {
+        goto fail_b;
+    }
+
     rc = nxt_port_socket_write(task, main_port,
                                NXT_PORT_MSG_CONF_STORE | NXT_PORT_MSG_CLOSE_FD,
-                               fd, 0, -1, b);
+                               fd, stream, controller_port->id, b);
 
     if (nxt_slow_path(rc != NXT_OK)) {
         /*
@@ -3127,17 +3323,28 @@ nxt_controller_conf_store(nxt_task_t *task, nxt_conf_value_t *conf)
          * queue the buffer completion so the engine memory pool is
          * not left with an unreclaimed buffer.
          */
+        nxt_port_rpc_cancel(task, controller_port, stream);
+
         nxt_fd_close(fd);
 
         nxt_work_queue_add(&task->thread->engine->fast_work_queue,
                            b->completion_handler, task, b, b->parent);
+
+        return NXT_ERROR;
     }
 
-    return;
+    return NXT_OK;
+
+fail_b:
+
+    nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                       b->completion_handler, task, b, b->parent);
 
 fail:
 
     nxt_fd_close(fd);
+
+    return NXT_ERROR;
 }
 
 

@@ -1,4 +1,8 @@
-#!/usr/bin/env bash
+#!/bin/sh
+
+# dash, busybox ash and bash all have "local".  "local x=$(cmd)" keeps
+# the exit status of cmd out of set -e on purpose in this script.
+# shellcheck disable=SC3043,SC2155
 
 #####################################################################
 #
@@ -9,25 +13,13 @@
 #####################################################################
 
 
-if test -n ${BASH_VERSION} && test "${BASH_VERSINFO[0]}" -eq 3; then
-    >&2 cat <<__EOF__ ;
-Your version of bash(1) isn't supported by this script.  You're probably
-running on macOS.  We recommend that you either install a newer version
-of bash(1) or run this script with another shell, such as zsh(1):
+set -euf;
 
-    $ ${SUDO_USER:+sudo }zsh $0 ...
-__EOF__
-    exit 1;
+# pipefail is not in POSIX; use it when the shell supports it.
+# shellcheck disable=SC3040
+if (set -o pipefail) 2>/dev/null; then
+    set -o pipefail;
 fi;
-
-
-set -Eefuo pipefail;
-
-test -v BASH_VERSION \
-&& shopt -s lastpipe;
-
-test -v ZSH_VERSION \
-&& setopt sh_word_split;
 
 
 export LC_ALL=C
@@ -170,15 +162,11 @@ dry_run_eval()
     fi;
 }
 
+# POSIX has no way to query a trap (trap -p is a bash/ksh extension), so the
+# command to run is kept in trap_cmd when the trap is set.
 run_trap()
 {
-    trap -p "$1" \
-    | tr -d '\n' \
-    | sed "s/[^']*'\(.*\)'[^']*/\1/" \
-    | sed "s/'\\\\''/'/g" \
-    | read -r trap_cmd;
-
-    eval $trap_cmd;
+    eval "${trap_cmd-}";
     trap - "$1";
 }
 
@@ -282,7 +270,7 @@ __EOF__
 unit_ctl()
 {
 
-    if test -v UNIT_CTL_SOCK; then
+    if test -n "${UNIT_CTL_SOCK+x}"; then
         local sock="$UNIT_CTL_SOCK";
     fi;
 
@@ -313,7 +301,7 @@ unit_ctl()
         err 'ctl: Missing subcommand.';
     fi;
 
-    if ! test -v sock; then
+    if ! test -n "${sock+x}"; then
         local sock="$(unit_sock_find)";
     fi;
 
@@ -331,8 +319,11 @@ unit_ctl()
                    -o 'ExitOnForwardFailure yes' \
                    -L "$local_sock:$remote_sock" "$remote";
 
-        trap "ssh -S '$ssh_ctrl' -O exit '$remote' 2>/dev/null;
-              unlink '$local_sock';" EXIT;
+        trap_cmd="ssh -S '$ssh_ctrl' -O exit '$remote' 2>/dev/null;
+                  unlink '$local_sock';";
+        # The variables expand now, on purpose: they are local.
+        # shellcheck disable=SC2064
+        trap "$trap_cmd" EXIT;
 
         sock="unix:$local_sock";
     fi;
@@ -340,22 +331,22 @@ unit_ctl()
     case $1 in
     edit)
         shift;
-        unit_ctl_edit ---s "$sock" $@;
+        unit_ctl_edit ---s "$sock" "$@";
         ;;
     http)
         shift;
-        unit_ctl_http ---s "$sock" $@;
+        unit_ctl_http ---s "$sock" "$@";
         ;;
     insert)
         shift;
-        unit_ctl_insert ---s "$sock" $@;
+        unit_ctl_insert ---s "$sock" "$@";
         ;;
     *)
         err "ctl: $1: Unknown argument.";
         ;;
     esac;
 
-    if test -v remote; then
+    if test -n "${remote+x}"; then
         run_trap EXIT;
     fi;
 }
@@ -421,30 +412,39 @@ unit_ctl_edit()
     fi;
     local req_path="$1";
 
-    echo "$req_path" \
-    | sed 's%^/js_modules/.*%.js%' \
-    | sed 's%^/config\>.*%.json%' \
-    | sed 's%^/.*%.txt%' \
-    | xargs mktemp --suffix \
-    | read -r tmp;
+    suffix=$(echo "$req_path" \
+        | sed 's%^/js_modules/.*%.js%' \
+        | sed 's%^/config\>.*%.json%' \
+        | sed 's%^/.*%.txt%');
+    tmp=$(mktemp "${TMPDIR:-/tmp}/unit-ctl.XXXXXX");
+    mv "$tmp" "$tmp$suffix";
+    tmp="$tmp$suffix";
 
     unit_ctl_http ---s "$sock" -c --no-progress-meter GET "$req_path" \
             </dev/null >"$tmp";
 
     $(
-        ((test -v VISUAL && test -n "$VISUAL") && printf '%s\n' "$VISUAL") \
-        || ((test -v EDITOR && test -n "$EDITOR") && printf '%s\n' "$EDITOR") \
-        || command -v editor \
-        || command -v vi \
-        || command -v vim \
-        || echo ed;
+        if test -n "${VISUAL+x}" && test -n "$VISUAL"; then
+            printf '%s\n' "$VISUAL";
+        elif test -n "${EDITOR+x}" && test -n "$EDITOR"; then
+            printf '%s\n' "$EDITOR";
+        elif command -v editor; then
+            :
+        elif command -v vi; then
+            :
+        elif command -v vim; then
+            :
+        else
+            echo ed;
+        fi;
     ) "$tmp";
 
-    trap "info 'ctl: edit: Invalid configuration saved in <$tmp>.'" ERR
-
-    unit_ctl_http ---s "$sock" PUT "$req_path" <"$tmp";
-
-    trap - ERR;
+    unit_ctl_http ---s "$sock" PUT "$req_path" <"$tmp" \
+    || {
+        rc=$?;
+        info "ctl: edit: Invalid configuration saved in <$tmp>.";
+        exit "$rc";
+    };
 }
 
 
@@ -524,6 +524,8 @@ unit_ctl_http()
     fi;
     local req_path="$2";
 
+    # The filter prints "--unix-socket <path> <url>": split it into words.
+    # shellcheck disable=SC2046
     curl --fail-with-body $curl_options -X $method -d@- \
             $(echo "$sock" | unit_sock_filter -c)${req_path};
 }
@@ -646,19 +648,17 @@ unit_ctl_welcome()
     || err 'welcome: curl(1) not found in PATH.  It must be installed to run this script.';
 
     www='/srv/www/unit/index.html';
-    if test -e "$www" && ! test -v force || ! test -w /srv; then
+    if test -e "$www" && ! test -n "${force+x}" || ! test -w /srv; then
         www="$HOME/srv/www/unit/index.html";
     fi;
-    if test -e "$www" && ! test -v force; then
+    if test -e "$www" && ! test -n "${force+x}"; then
         www="$(mktemp)";
         mv "$www" "$www.html";
         www="$www.html"
     fi;
 
-    unit_ps -t m \
-    | wc -l \
-    | read -r nprocs \
-    ||:
+    nprocs=$(unit_ps -t m | wc -l) \
+    || :;
 
     if test 0 -eq "$nprocs"; then
         warn "welcome: NGINX Unit isn't running.";
@@ -674,12 +674,11 @@ unit_ctl_welcome()
     curl $curl_opt/ >/dev/null 2>&1 \
     || err "welcome: Can't reach the control API socket.";
 
-    if ! test -v force; then
-        unit_cmd \
-        | read -r cmd;
+    if ! test -n "${force+x}"; then
+        cmd=$(unit_cmd);
 
         # Check unitd is not configured already.
-        echo "$cmd" \
+        conffile=$(echo "$cmd" \
         | if grep '\--statedir' >/dev/null; then
             echo "$cmd" \
             | sed 's/ --/\n--/g' \
@@ -691,9 +690,8 @@ unit_ctl_welcome()
             | grep 'default:' \
             | sed 's/ *default: "\(.*\)"/\1/';
         fi \
-        | sed 's,$,/conf.json,' \
-        | read -r conffile \
-        ||:;
+        | sed 's,$,/conf.json,') \
+        || :;
 
         if test -e $conffile; then
             if ! unit_ctl_http ---s "$sock" 'GET' '/config' </dev/null 2>/dev/null | grep -q '^{}.\?$';  # The '.\?' is for the possible carriage return.
@@ -704,11 +702,10 @@ unit_ctl_welcome()
         fi;
     fi;
 
-    (
+    port=$(
         unit_freeport \
         || err "welcome: Can't find an available port.";
-    ) \
-    | read -r port;
+    );
 
     dry_run_echo 'Create a file to serve:';
     dry_run_eval "mkdir -p $(dirname $www);";
@@ -1018,7 +1015,7 @@ unit_os_probe()
         shift;
     done;
 
-    local os=$(uname | tr '[:upper:]' '[:lower:]')
+    local os="$(uname | tr '[:upper:]' '[:lower:]')"
 
     if [ "$os" != 'linux' ] && [ "$os" != 'freebsd' ]; then
         err "os-probe: The OS isn't Linux or FreeBSD; can't proceed."
@@ -1039,15 +1036,15 @@ unit_os_probe()
 
         if [ -f "$osRelease" ]; then
             # The value for the ID and VERSION_ID may or may not be in quotes
-            local osName=$(grep "^ID=" "$osRelease" | sed s/\"//g | awk -F= '{ print $2 }' ||:)
-            local osVersion=$(grep '^VERSION_ID=' "$osRelease" | sed s/\"//g | awk -F= '{ print $2 }' || lsb_release -cs)
+            local osName="$(grep "^ID=" "$osRelease" | sed s/\"//g | awk -F= '{ print $2 }' ||:)"
+            local osVersion="$(grep '^VERSION_ID=' "$osRelease" | sed s/\"//g | awk -F= '{ print $2 }' || lsb_release -cs)"
         else
             err "os-probe: Unable to determine OS and version, or the OS isn't supported."
         fi
     else
         local pkgMngr='pkg';
         local osName=$os
-        local osVersion=$(uname -rs | awk -F '[ -]' '{print $2}' ||:)
+        local osVersion="$(uname -rs | awk -F '[ -]' '{print $2}' ||:)"
         if [ -z "$osVersion" ]; then
             err 'os-probe: Unable to get the FreeBSD version.'
         fi
@@ -1119,7 +1116,7 @@ unit_ps()
     done;
 
     ps awwx \
-    | if test -v type; then
+    | if test -n "${type+x}"; then
         grep ${type_c:+-e 'unit: controller'} \
              ${type_m:+-e 'unit: main'} \
              ${type_r:+-e 'unit: router'};
@@ -1266,10 +1263,10 @@ __EOF__";
     echo 'This script sets up the NGINX Unit repository';
 
     if ! test $# -ge 3; then
-        local os_pkg_name_version=$(unit_os_probe || warn "On macOS, try 'brew install nginx/unit/unit'.")
-        local pkg_mngr=$(echo "$os_pkg_name_version" | awk -F: '{print $1}')
-        local os_name=$(echo "$os_pkg_name_version" | awk -F: '{print $2}')
-        local os_version=$(echo "$os_pkg_name_version" | awk -F: '{print $3}')
+        local os_pkg_name_version="$(unit_os_probe || warn "On macOS, try 'brew install nginx/unit/unit'.")"
+        local pkg_mngr="$(echo "$os_pkg_name_version" | awk -F: '{print $1}')"
+        local os_name="$(echo "$os_pkg_name_version" | awk -F: '{print $2}')"
+        local os_version="$(echo "$os_pkg_name_version" | awk -F: '{print $3}')"
     fi;
 
     # Call the appropriate installation function
@@ -1364,7 +1361,7 @@ unit_restart()
 
     printf '%s\n' "$cmds" \
     | while read -r cmd; do
-        if test -v log_flag; then
+        if test -n "${log_flag+x}"; then
             (
                 echo "$cmd" \
                 | grep '\--log' \
@@ -1377,7 +1374,7 @@ unit_restart()
             | xargs rm -f;
         fi;
 
-        if test -v state_flag; then
+        if test -n "${state_flag+x}"; then
             (
                 echo "$cmd" \
                 | grep '\--statedir' \
@@ -1454,11 +1451,11 @@ unit_sock()
     case $1 in
     filter)
         shift;
-        unit_sock_filter $@;
+        unit_sock_filter "$@";
         ;;
     find)
         shift;
-        unit_sock_find $@;
+        unit_sock_find "$@";
         ;;
     *)
         err "sock: $1: Unknown subcommand.";
@@ -1497,7 +1494,7 @@ unit_sock_filter()
     while test $# -ge 1; do
         case "$1" in
         -c | --curl)
-            if test -v ssh_flag; then
+            if test -n "${ssh_flag+x}"; then
                 err "sock: filter: $1: Missing argument.";
             fi;
             local curl_flag='yes';
@@ -1507,7 +1504,7 @@ unit_sock_filter()
             exit 0;
             ;;
         -s | --ssh)
-            if test -v curl_flag; then
+            if test -n "${curl_flag+x}"; then
                 err "sock: filter: $1: Missing argument.";
             fi;
             local ssh_flag='yes';
@@ -1524,7 +1521,7 @@ unit_sock_filter()
 
     while read -r control; do
 
-        if test -v curl_flag; then
+        if test -n "${curl_flag+x}"; then
             if echo "$control" | grep '^unix:' >/dev/null; then
                 unix_socket="$(echo "$control" | sed 's/unix:/--unix-socket /')";
                 host='http://localhost';
@@ -1535,9 +1532,9 @@ unit_sock_filter()
 
             echo "$unix_socket $host";
 
-        elif test -v ssh_flag; then
+        elif test -n "${ssh_flag+x}"; then
             echo "$control" \
-            | sed -E 's,^(unix:|http://|https://),,';
+            | sed -e 's,^unix:,,' -e 's,^http://,,' -e 's,^https://,,';
 
         else
             echo "$control";
@@ -1629,43 +1626,43 @@ fi;
 case $1 in
 cmd)
     shift;
-    unit_cmd $@;
+    unit_cmd "$@";
     ;;
 ctl)
     shift;
-    unit_ctl $@;
+    unit_ctl "$@";
     ;;
 freeport)
     shift;
-    unit_freeport $@;
+    unit_freeport "$@";
     ;;
 json-ins)
     shift;
-    unit_json_ins $@;
+    unit_json_ins "$@";
     ;;
 os-probe)
     shift;
-    unit_os_probe $@;
+    unit_os_probe "$@";
     ;;
 ps)
     shift;
-    unit_ps $@;
+    unit_ps "$@";
     ;;
 repo-config)
     shift;
-    unit_repo_config $@;
+    unit_repo_config "$@";
     ;;
 restart)
     shift;
-    unit_restart $@;
+    unit_restart "$@";
     ;;
 sock)
     shift;
-    unit_sock $@;
+    unit_sock "$@";
     ;;
 welcome)
     shift;
-    unit_ctl_welcome $@;
+    unit_ctl_welcome "$@";
     ;;
 *)
     err "$1: Unknown command.";

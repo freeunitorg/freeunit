@@ -177,8 +177,10 @@ NXT_TEST_SRCS=" \
     src/test/nxt_http_parse_test.c \
     src/test/nxt_strverscmp_test.c \
     src/test/nxt_base64_test.c \
+    src/test/nxt_var_escape_test.c \
     src/test/nxt_string_test.c \
     src/test/nxt_buf_test.c \
+    src/test/nxt_h1proto_conn_test.c \
     src/test/nxt_http_chunk_parse_test.c \
     src/test/nxt_http_validate_host_test.c \
     src/test/nxt_http_request_body_alloc_test.c \
@@ -186,6 +188,8 @@ NXT_TEST_SRCS=" \
     src/test/nxt_conf_parse_test.c \
     src/test/nxt_port_fail_test.c \
     src/test/nxt_fd_event_change_test.c \
+    src/test/nxt_signalfd_test.c \
+    src/test/nxt_poll_engine_test.c \
     src/test/nxt_port_use_unless_zero_test.c \
     src/test/nxt_port_mmap_range_test.c \
     src/test/nxt_port_mmap_read_test.c \
@@ -196,6 +200,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_listen_event_test.c \
     src/test/nxt_conn_io_accept_test.c \
     src/test/nxt_runtime_idle_close_test.c \
+    src/test/nxt_conn_counters_test.c \
     src/test/nxt_router_new_port_test.c \
     src/test/nxt_router_start_fail_test.c \
     src/test/nxt_router_start_fail_soak_test.c \
@@ -203,12 +208,15 @@ NXT_TEST_SRCS=" \
     src/test/nxt_router_proto_wedge_test.c \
     src/test/nxt_router_proto_death_test.c \
     src/test/nxt_router_start_timeout_test.c \
+    src/test/nxt_router_conf_overlap_test.c \
     src/test/nxt_router_app_timeout_test.c \
     src/test/nxt_router_remove_pid_soak_test.c \
     src/test/nxt_router_detached_test.c \
     src/test/nxt_router_sender_test.c \
     src/test/nxt_router_stale_joint_test.c \
     src/test/nxt_router_websocket_test.c \
+    src/test/nxt_router_engine_port_test.c \
+    src/test/nxt_router_access_log_test.c \
     src/test/nxt_main_start_process_reply_test.c \
     src/test/nxt_main_file_store_test.c \
     src/test/nxt_main_store_test.c \
@@ -220,6 +228,8 @@ NXT_TEST_SRCS=" \
     src/test/nxt_port_fd_test.c \
     src/test/nxt_port_rpc_fd_test.c \
     src/test/nxt_port_queued_fd_test.c \
+    src/test/nxt_port_doorbell_test.c \
+    src/test/nxt_port_share_test.c \
     src/test/nxt_controller_peer_test.c \
     src/test/nxt_checked_test.c \
     src/test/nxt_conn_close_test.c \
@@ -227,9 +237,13 @@ NXT_TEST_SRCS=" \
     src/test/nxt_router_response_parse_test.c \
     src/test/nxt_port_frag_test.c \
     src/test/nxt_port_release_test.c \
+    src/test/nxt_process_use_test.c \
     src/test/nxt_nncq_bound_test.c \
+    src/test/nxt_nncq_wrap_test.c \
+    src/test/nxt_app_queue_test.c \
     src/test/nxt_size_bound_test.c \
     src/test/nxt_cpu_limit_test.c \
+    src/test/nxt_usdt_test.c \
 "
 
 
@@ -257,6 +271,7 @@ fi
 if [ $NXT_OPENSSL = YES ]; then
     NXT_LIB_SRCS="$NXT_LIB_SRCS $NXT_LIB_OPENSSL_SRCS"
     NXT_TEST_SRCS="$NXT_TEST_SRCS src/test/nxt_openssl_server_init_test.c"
+    NXT_TEST_SRCS="$NXT_TEST_SRCS src/test/nxt_openssl_log_level_test.c"
 fi
 
 

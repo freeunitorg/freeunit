@@ -10,6 +10,233 @@
          date="2026-10-04" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="change">
+<para>
+a process reads every pending signal from its signalfd in one wakeup, instead
+of one signal per epoll wakeup.
+</para>
+</change>
+
+<change type="change">
+<para>
+reproducible builds: with SOURCE_DATE_EPOCH set, unitd, the static libraries,
+source tarballs, rpm, rust and jar builds no longer carry build paths, host
+names, kernel release or times.  RPM packages built with rpm 4.14 or later
+have a fixed build time and build host.
+</para>
+</change>
+
+<change type="change">
+<para>
+configure now stops with an error when the compiler and libc do not provide
+a working __thread (thread-local storage).  Before, configure used pthread
+keys instead and gave no warning.  Such a build had no memory pool cluster
+cache and no thread-local caches for static files.  All supported systems
+have __thread.  The pthread key code will be removed in a later release.
+</para>
+</change>
+
+<change type="feature">
+<para>
+--regex-jit enables optional PCRE2 JIT compilation. A library or pattern
+without usable JIT uses interpreted matching. Configuration cleanup releases
+JIT executable memory. A match that exhausts the default JIT stack is retried
+once in the interpreter with the callout budget that the JIT attempt left.
+This option is off by default.
+</para>
+</change>
+
+<change type="change">
+<para>
+a small application response now reaches the router in
+one message less.  Python, Perl and Ruby applications send the
+header and a body that fits in the same message, and PHP sends
+its header with its first output instead of before it.  A PHP
+response with no body is one message.  Responses with larger
+bodies, and their compression, are unchanged.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+when a burst of requests arrived for an application with multiple worker
+processes or threads, only the first request woke a worker, forcing that worker
+to process the entire burst sequentially while the other workers stayed asleep.
+If a worker died while holding a notification, subsequent requests could also
+stall indefinitely.  The router now bounds queue notifications by the number
+of active worker processes and threads, rearms pending requests on worker exit,
+and workers retry the shared queue on poll timeout.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+after 4294705152 requests to one application without a restart, the application
+queue stopped returning request slots.  131072 requests later every request to
+the application got a 500 until the application was restarted.  Before 1.37.0
+the application and then the router spun at 100% CPU instead.  At 5000 requests
+per second this took ten days.  The fix is in unitd and libunit; a Go or Node.js
+application needs a rebuild against the new libunit.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the control API answered 200 to a DELETE of an njs module or of a certificate
+before the store child had removed its file.  A delete that failed was
+reported as success, and the module or the certificate left the list while its
+file stayed in the state directory.  The answer now waits for the store child,
+and a failed delete is answered with 500 and keeps the entry listed.
+</para>
+</change>
+
+<change type="change">
+<para>
+the control API now answers a configuration PUT only after the store child of
+main has written the configuration and flushed it.  Before, the answer came
+first, so a 200 did not mean that the configuration was on the disk.  A PUT
+takes one store longer: about 7 ms on a fast disk, 22 ms on a slow one.  A
+store that fails is answered with 500 "Failed to store the configuration.";
+the new configuration runs, but a restart loads the one before it.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+with "compression" on, a response could reach the client as a corrupt or
+endless stream.  When the response header fields were over about 1 KiB, the
+first part of the body, up to 16 KiB, went out uncompressed under
+"Content-Encoding".  Python WSGI, Python ASGI, Perl and Ruby applications sent
+such responses.  The bug was in 1.35.0 and later.  See
+https://github.com/freeunitorg/freeunit/issues/666.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+with "compression" on, a HEAD request for a static file got no
+"Content-Encoding" and the uncompressed length, while GET got the coded
+response.  HEAD now has the same header fields as GET.  See
+https://github.com/freeunitorg/freeunit/issues/391.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+with "compression" on, a small response body from an application went out
+uncompressed under "Content-Encoding", so no client could decode it.  That was a
+body of up to 15 bytes, and of up to 1024 bytes in some modes: when the router
+port had no queue, the request was in socket mode, or shared memory failed.  See
+https://github.com/freeunitorg/freeunit/issues/162.
+</para>
+</change>
+
+<change type="change">
+<para>
+the size options "large_header_buffer_size", "large_header_buffers",
+"body_buffer_size" and "max_body_size" in "settings/http", "max_frame_size" in
+"settings/http/websocket", "min_length" of a compressor, and the "shm" limit of
+an application now must not be negative.  With a 32-bit size_t they must also
+be less than 2147483648.  Before, a negative value became a very large size,
+and a value out of the range of ssize_t gave an undefined result.  A stored
+configuration from an earlier version that has a negative value is still
+loaded, with a warning; the control API refuses to store a new one.  With a
+32-bit size_t a stored value of 2147483648 or more, or less than -2147483648,
+is refused, and unitd starts with no configuration until it is corrected.
+</para>
+</change>
+
+<change type="change">
+<para>
+unitd now writes a warning to its log each time it applies a configuration with
+an access log format that names the Authorization, Proxy-Authorization, Cookie
+or Set-Cookie header, as $header_&lt;name&gt; or $response_header_&lt;name&gt;,
+because the log file then holds a bearer token or a session cookie.  The
+configuration is still accepted, and the header is still written to the log.
+Other variables can copy a secret to the log too, with no warning:
+$cookie_&lt;name&gt;, $arg_&lt;name&gt;, $args, $request_uri, $request_line, a
+header with another name and an njs template.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a request that arrived while unitd started could hang for ever, and the log
+showed "get_port_handler: port N:1 not found".  A router thread accepted the
+connection before the router knew the port of that thread.  "limits.timeout"
+did not end such a request.  The bug was in 1.19.0 and later.  See
+https://github.com/freeunitorg/freeunit/issues/667.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the control API accepted a compression "level" out of the range of an
+integer, such as 2147483648.  The router then did not apply the "compression"
+block, and compression was off for the whole configuration.  Such a number is
+now refused.  A stored configuration with it still loads, with a warning, and
+compression stays off.  The control API refuses other updates until the
+"level" is corrected.  See
+https://github.com/freeunitorg/freeunit/issues/647.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+when the port queue of an application was full, the router closed a websocket
+connection with no CLOSE frame.  A full queue means that the application reads
+slower than the client sends, for example a message of many small frames.  The
+router now stops reading from the client and sends the frame again every 5 ms.
+When the application reads nothing for the websocket "read_timeout", the router
+closes the connection, as before.  The message that tells the application about
+the close was lost on a full queue, so the worker did not stop; it is now sent
+again until the queue takes it.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+when the router could not get shared memory for a websocket frame, the log said
+that a buffer pool was dry.  The memory the router uses for frames is not
+bounded by the application "shm" limit, so a shortage is not what happened.  The
+message now names the bytes that were wanted, the frame size and the connection
+it costs; the alert logged before it names the cause.  See
+https://github.com/freeunitorg/freeunit/issues/658.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+on a system where off_t is 32 bits by default (32-bit Linux with glibc,
+Solaris, HP-UX and QNX), several source files had a 32-bit off_t, and the
+other files had a 64-bit off_t.  On Linux, Solaris and HP-UX the files include
+a system header before nxt_unix.h, which sets _FILE_OFFSET_BITS:
+nxt_http_compression.c, nxt_zlib.c, nxt_brotli.c, nxt_zstd.c,
+nxt_upstream_round_robin.c and four libunit test programs.  On QNX nxt_unix.h
+does not set the macro at all.  A struct with an off_t then had different
+layouts in different files.  The "min_length" compression option was written
+as 8 bytes into a 4-byte field, and build/tests crashed.  configure now adds
+-D_FILE_OFFSET_BITS=64 on those four systems, and the build fails when off_t
+does not have the size that configure measured.  musl and 64-bit systems were
+not affected.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the record that the cgroup CPU limit lowers the CPU count went only to stderr,
+before the log file was open.  It is now written to the log file.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+unitd read only the first cgroup2 mount in /proc/self/mountinfo.  If its root
+did not contain the cgroup of unitd, the CPU limit was not found.  unitd now
+takes the first cgroup2 mount whose root contains its cgroup.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 with a 32-bit size_t, the memory pool did not check the sum of a large size,
@@ -33,49 +260,71 @@ segment it already had, and it replayed the frames it kept aside in reverse.
 A fragmented message could reach the application short, and the connection
 could then close with a protocol error.  Whole messages could swap.  This
 needed a client that sent faster than the application read.  The bug had
-appeared in 1.19.0.  The fix is in libunit.  Node.js and Python ASGI
-applications get it.  A Node.js application gets it when it is built with
+appeared in 1.19.0.  The fix is in libunit.  Node.js, Python ASGI and Java
+websocket applications get it; a Node.js application needs a rebuild against
 the new libunit.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
-on 32-bit platforms, the "min_length" option of a compressor did not work.  On
-little-endian platforms, such as x86, armv7 and armhf, a response shorter than
-"min_length" was compressed, and a client that refused identity got the
-compressed response instead of a 406.  On big-endian platforms, a compressor
-with "min_length" compressed no response shorter than 4 GiB.  The bug had
-appeared in 1.35.0.
+when libunit grew its array of shared memory segments, the lists of read
+buffers that waited for a segment still pointed into the old array.  libunit
+could then write into freed memory and not ask for a segment.  The bug had
+appeared in 1.19.0.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
-the control API accepted a listener with neither "pass" nor "application",
-and the router then refused the configuration with 500.
+when libunit freed a context, the read buffers that waited for a shared memory
+segment, or behind such a buffer, leaked with the descriptors of their
+messages.  In an application with more than one thread, another thread could
+then use the freed context, and the application could crash.  The bug had
+appeared in 1.19.0.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
-on macOS with 16 KiB pages, every request to an application failed with
-"incoming_mmap: unexpected segment size".
+the control API accepted a listener with neither "pass" nor "application".  The
+router then refused the configuration, and the client got 500 "Failed to apply
+new configuration."  with only "failed to apply new conf" in the log.  The
+control API now answers 400 and names the listener.  The router log also names
+it.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+on macOS with 16 KiB pages, every request to an application failed.  The
+application logged "incoming_mmap: unexpected segment size: 10502144 !=
+10489856" and exited.  macOS rounds a shared memory segment up to a whole page,
+and 1.37.0 required the exact size.  A larger segment is now accepted.  A
+shorter one is still refused.  The check in the application appeared in 1.37.0.
+The same check in the router appeared in 1.36.1 and dropped larger application
+responses on macOS.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
 with OpenTelemetry, the inbound "traceparent" was ignored when the request
-header arrived in more than one read; the span of a request that fails before
-it is complete had no request attributes.
+header arrived in more than one read.  The span started after the first read,
+before the header was parsed, so it got a new trace ID.  The span now starts
+after the whole header is parsed, with the arrival of the request as its start
+time.  The span of a request that fails before it is complete, such as a 400 or
+a 408, now has the request attributes.  The bug had appeared in 1.34.0.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
 with "chunked_transform", a valid chunked request body got 400 when a read
-ended right after the data of a chunk, before the CRLF after it.
+ended right after the data of a chunk, before the CRLF after it.  The data
+stayed in the read buffer, and the next read was parsed after it.  So the
+result depended on how the client's writes reached the server.  The bug had
+appeared in 1.35.5.
 </para>
 </change>
 
@@ -85,7 +334,8 @@ unitd did not load the stored configuration when the "version" file in the
 state directory ended with a line end, as "echo 13700 > version" and most
 editors write it.  It logged "invalid version string" and started with no
 configuration.  A line end, a space or a tab after the number is now ignored.
-Any other content is still an error.  The bug had appeared in 1.26.0.
+Any other content is still an error.  unitd itself writes the file with no line
+end.  The bug had appeared in 1.26.0.
 </para>
 </change>
 
@@ -156,12 +406,15 @@ request.  The bug had appeared in 1.16.0.
 <change type="bugfix">
 <para>
 the control API accepted any integer for the timeouts in "settings/http", in
-"settings/http/websocket" and for "timeout" in "limits" of an application.
-They are now refused out of the range 0 to 2147483 seconds.  A stored
-configuration with such a value still loads, with a warning.  Numbers out of
-the range of an integer option now fail the configuration instead of giving
-an undefined value.  "requests" in "limits" and "thread_stack_size" are now
-refused above 2147483647, and "requests" below 0.
+"settings/http/websocket" and for "timeout" in "limits" of an application.  A
+negative timeout had no defined value.  A timeout above 2147483 seconds fired
+at once.  They are now refused out of the range 0 to 2147483 seconds, as
+"start_timeout" is.  A stored configuration with such a value still loads, with
+a warning, and the timer fires at once, as a negative value did before on x86.
+Numbers out of the range of an integer option now fail the configuration
+instead of giving an undefined value.  "requests" in "limits" and
+"thread_stack_size" are now refused above 2147483647, and "requests" below 0.
+See https://github.com/freeunitorg/freeunit/issues/619.
 </para>
 </change>
 
@@ -177,9 +430,24 @@ clang were not affected.  The bug had appeared in 1.36.0.
 <change type="bugfix">
 <para>
 an application worker whose WHOAMI the main process refused was not told so.
-It waited for ever and stayed alive until its prototype quit.  On Linux, the
-worker now logs "WHOAMI failed, exiting" and exits, and main logs the reason.
-On other platforms a refused worker still waits, as before.
+It waited for a reply for ever and stayed alive until its prototype quit.  This
+happens when a host pid is reused while main still has the record of the old
+worker.  On Linux, main now answers a refused WHOAMI with an error, and also
+when it cannot send the reply to an accepted one.  The worker logs "WHOAMI
+failed, exiting" and exits, and main logs the reason.  On other platforms a
+refused worker still waits, as before.  Main also refuses a WHOAMI for a record
+that is still linked to a prototype.  The bug had appeared in 1.37.0.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+on 32-bit platforms, the "min_length" option of a compressor did not work.  On
+little-endian platforms, such as x86, armv7 and armhf, a response shorter than
+"min_length" was compressed, and a client that refused identity got the
+compressed response instead of a 406.  On big-endian platforms, a compressor
+with "min_length" compressed no response shorter than 4 GiB.  The bug had
+appeared in 1.35.0.
 </para>
 </change>
 
@@ -190,6 +458,282 @@ not work.  A positive level became 0, and a negative level became -1.  For gzip
 and deflate, level 0 does not compress.  On other platforms, a level above 255
 used only its low byte: 265 became 9, with no notice.  The bug had appeared in
 1.35.0.
+</para>
+</change>
+
+<change type="change">
+<para>
+a TLS connection that fails because of what the client sent is now logged at
+"info" instead of "alert".  This covers an old protocol version, an unsupported
+key share or signature algorithm, a TLS 1.3 key share without the supported
+groups extension, a TLS 1.3 resumption with a binder that does not verify, and
+most alerts from the client.
+</para>
+</change>
+
+<change type="change">
+<para>
+libunit sends the response of a request through the shared memory queue of the
+router port again.  To keep the messages of a request in order, 1.37.0 sent all
+of them to the socket, except the last one.  For a small PHP response that cost
+two more datagrams and 13.7% more instructions per request in the server.  Now
+a response moves to the queue with its first message that fits there, and its
+later messages follow it there, so the order holds.  Response data over 15
+bytes now goes into shared memory also below 1024 bytes, and holds a 16 KiB
+chunk of the "shm" limit until the router has written it.  When no chunk is
+free, a small write uses plain memory and the socket, as before, and does not
+wait for shared memory.  A websocket keeps the path of 1.37.0.  An application
+of type "external", such as Go or Node.js, gets the change when it is built
+with the new libunit.  A response that moves from the queue to the socket first
+waits up to 1 second for the router to take its queue messages.  If the router
+does not take them, the request ends with a 503, or with a truncated response
+if the header was already sent.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+each thread of unitd now keeps up to 32 freed pool clusters, at most 128 KiB
+(about 80 KiB with today's pool sizes), for reuse.  With musl, the router
+makes fewer mmap() calls and page faults per request.  The cache is off
+without __thread, under the address, hardware address, memory and thread
+sanitizers, and with -DNXT_MP_NO_CLUSTER_CACHE=1 or -DNXT_DEBUG_MEMORY=1
+in --cc-opt.  See https://github.com/freeunitorg/freeunit/issues/688.
+</para>
+</change>
+
+<change type="change">
+<para>
+the Wasmtime library of the wasm module is now built without the
+component-model C API.  The module loads core WebAssembly modules only and
+never called that API.  libwasmtime.so shrinks from 32.4 MB to 23.6 MB and no
+longer exports the 156 wasmtime_component_* functions, the
+wasmtime_config_wasm_component_model_* options and the six
+wasmtime_module_type_* functions: clone, delete, import_count, import_nth,
+export_count and export_nth.  The packages install libwasmtime.so in the
+system library directory.  A program other than FreeUnit that links that file
+and calls the component API no longer loads.  The wasm-wasi-component module
+is not affected.
+</para>
+</change>
+<change type="bugfix">
+<para>
+a PUT of an application configuration bigger than about 64 KiB never got an
+answer, and later control requests hung too.  The router sent the first 64 KiB
+of the message to main and queued the rest, but did not ask to be woken up to
+send it.  The bug came from NGINX Unit.
+</para>
+</change>
+<change type="bugfix">
+<para>
+a message between two FreeUnit processes could stay queued, and every later
+message on the same channel waited behind it.  This could occur when one
+thread sent to a full channel at the same time as the thread that owns the
+channel stopped waiting for it to become writable.  The sender did not ask to
+be woken up again.  The bug came from NGINX Unit.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+an embedded Python interpreter could load the standard library of another
+Python.  When an application had no "home" option, the interpreter found its
+prefix through a search for "python3" in PATH.  With a Python installed
+outside the system prefix, a system Python of the same minor version could
+win, and imports failed for the modules that differed.  The interpreter that
+the module is built against is now recorded at configure time and used as the
+program name when the application configuration does not set "home", which
+still wins.  If neither that interpreter nor its standard library is there at
+run time, a warning is logged and PATH is searched as before.  The environment,
+such as PYTHONPATH, is used as before.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the router could crash with signal 11 when unitd stopped while a configuration
+was still being applied and the next one was waiting.  The router took the
+waiting configuration while the first one was pending, and when both failed,
+it freed the same listener twice.  The router now applies one configuration
+at a time: one that comes while another is applied waits for its end.
+</para>
+</change>
+
+
+<change type="bugfix">
+<para>
+when the access log record of a request failed, the router did not close the
+request.  A JS "format" that throws an exception for a request is one cause.
+The client connection stayed open, and the memory of the request was not
+freed.  The bug had appeared in 1.29.0.
+</para>
+</change>
+
+<change type="feature">
+<para>
+the --usdt configure option adds static USDT probes for bpftrace, perf and
+SystemTap, with the provider "freeunit".  They trace port messages, the app
+queue, process starts and the start and end of each request.  docs/usdt.md
+lists them, and tools/usdt/ has two bpftrace scripts.  A build with the option
+needs sys/sdt.h.  Each probe is a nop until a tracer attaches.  Without the
+option, the probes are not in the build.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a request that a worker took from the shared queue and did not acknowledge
+could wait for ever.  With "limits": {"timeout"} set, the router now logs an
+alert at the first deadline and answers 503 at the second, so the client waits
+up to two times the timeout.  libunit now tells the router when it fails a
+request before the acknowledgement, and the router answers 503.  With the
+default timeout of 0, three cases still leave the request waiting: a worker that
+dies between the claim and the acknowledgement, a request that libunit fails
+while the reply port is not known or not ready, and a request whose GET_PORT
+cannot be sent.  See https://github.com/freeunitorg/freeunit/issues/665.
+</para>
+</change>
+
+<change type="change">
+<para>
+the PHP module opened an application script with fopen() on every request.  On
+musl that cost an open, two fcntl() calls and a close per request, because
+musl's fopen() sets FD_CLOEXEC on the stream after opening it.  The script is
+now opened by PHP itself, as in PHP-FPM.
+"open_basedir" now applies to the main script, a request that names a path
+which is not a regular file fails instead of running an empty script, the
+script descriptor is not close-on-exec, and "auto_prepend_file" is listed
+before the script in get_included_files().  See
+https://github.com/freeunitorg/freeunit/issues/688.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the PHP module let "display_errors" decide the status of a request whose script
+PHP could not open.  With "display_errors" on, a script outside "open_basedir"
+and a path that is not a regular file answered 200 with PHP's warning and the
+script path in the body; with it off, both answered an empty 500.  A directory
+or a FIFO at the script path is now refused with 404 before it is opened, which
+stops a FIFO from parking the worker, and a script outside "open_basedir" gets
+403.  The open is nonblocking and the opened file is checked, so replacing a
+regular script with a FIFO cannot park the worker.  Filesystem errors are
+preserved before PHP resolves the path, so an overlong script path gets 404.
+Neither answer carries PHP's diagnostics.
+See https://github.com/freeunitorg/freeunit/issues/715.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a PHP POST request without a "Content-Type" header could make PHP read the
+request body under the content type of the previous request served by the same
+worker process.  The SAPI content_type pointer was not cleared, and it pointed
+into the request buffer that the worker had already released.  PHP now leaves
+the body for php://input.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+tools/unitc ignored the exit status of the program that formats the response.
+When a request succeeded but the response was not valid JSON, jq or yq printed
+a parse error and unitc still exited with status 0, so a script could not tell
+a good response from a broken one.  unitc now keeps the status of the filter and
+exits with 5, naming the format of the response instead of curl(1).  A response
+with no body still exits with 0.  See
+https://github.com/freeunitorg/freeunit/issues/761.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+with a glibc before 2.37 that does not have the fix for glibc bug 28846, for
+example on Ubuntu 22.04, a descriptor delivered in a truncated control message
+on a port socket leaked.  The kernel truncates this message when it can install
+only one of two descriptors.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the router could crash while it completed the buffers of a request whose
+connection was already gone.  The function that completes them takes the
+connection from the h1proto object it is given and read the connection's input
+buffer through it without checking that the object was a h1proto of a live
+connection.  The socket.data slot that carries a h1proto also holds the peer of
+a proxied request, and a h1proto whose connection is gone has a zero conn, so
+an object that was neither reached the read with a zero connection: a read of
+address 0x50.  The slot is now read as a h1proto only when the object points
+back at the connection, and the completion path leaves a zero connection alone.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+with --hardening=default or strict, the Perl module did not build when the
+ccflags of Perl had -D_FORTIFY_SOURCE=2, as the perl Docker images have.
+The compiler stopped with '"_FORTIFY_SOURCE" redefined'.  configure now
+removes the -D_FORTIFY_SOURCE of Perl when it added its own.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the Docker images lost -D_FORTIFY_SOURCE from their build flags in 1.35.3,
+so the language modules were built without _FORTIFY_SOURCE.  The images are
+now configured with --hardening=default, which adds it back with the other
+hardening flags.  The image build stops when configure did not add it.
+unitd itself is still not fortified, because src/nxt_unix.h
+undefines _FORTIFY_SOURCE.  See
+https://github.com/freeunitorg/freeunit/issues/757 and
+https://github.com/freeunitorg/freeunit/issues/773.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a request whose access log "if" condition could not be rendered, for example
+when a JS expression threw, was written to the access log.  The unrendered
+condition was read as true, so a throwing "if" logged every request instead of
+none, while a throwing "format" wrote no record at all.  Such a request is now
+not logged, and the exception is still reported in the error log.  The same
+expression in a "match" object "if" still ends the request with a 500.
+</para>
+</change>
+
+<change type="change">
+<para>
+a text access log escapes each value that a variable expands to with one test
+per eight bytes instead of four tests per byte, and copies a line with no byte
+to escape as it is.  The access log output is unchanged.  With the default
+format, a request with a 111-byte browser User-Agent and a 57-byte Referer
+takes 32% fewer router instructions.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the access log write result was ignored: a short write or a failed write lost
+a record with no count and no mark in the log. A record that cannot be built
+or written is now counted, the next record writes "#freeunit: lost N
+record(s)", and GET /status reports the count.
+</para>
+</change>
+
+<change type="change">
+<para>
+zstd 1.4.0 or later is now required to build with "--zstd"; configure fails
+with an explicit message on older releases.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a zstd-compressed response held its output until a full 128 KiB block was
+ready or the response ended, so a streamed response (PHP flush(), server-sent
+events) stalled with zstd while gzip and br delivered each part. Each part is
+now flushed.
 </para>
 </change>
 

@@ -8,6 +8,7 @@
 
 
 #include <nxt_app_nncq.h>
+#include <nxt_usdt.h>
 
 
 /* Using Numeric Naive Circular Queue as a backend. */
@@ -23,6 +24,14 @@ typedef struct {
 
 
 typedef struct {
+    /*
+     * One-wake flag.  With depth_bound 1 (one reader) the router rings
+     * only on its 0->1 transition, and the receiver clears it
+     * (nxt_app_queue_notification_received()).  With more readers the
+     * doorbell is decided by queue position (nxt_app_queue_send_bound()),
+     * so up to depth_bound READ_QUEUE datagrams can be outstanding; the
+     * receiver still clears the flag for an older router that gates on it.
+     */
     nxt_app_nncq_atomic_t  notified;
     nxt_app_nncq_t         free_items;
     nxt_app_nncq_t         queue;
@@ -46,13 +55,38 @@ nxt_app_queue_init(nxt_app_queue_t volatile *q)
 }
 
 
+nxt_inline uint32_t
+nxt_app_queue_depth(nxt_app_queue_t volatile *q)
+{
+    return (uint32_t) (nxt_app_nncq_tail(&q->queue)
+                       - nxt_app_nncq_head(&q->queue));
+}
+
+
+/*
+ * Doorbell decision for a producer whose item landed at queue position t,
+ * given a (possibly late) sample of head.  pos < depth_bound rings so up to
+ * depth_bound idle workers get woken.  pos < 0 must also ring: a concurrent
+ * producer enqueued t + 1 and rang, a worker then consumed slot t before this
+ * producer sampled head, and t + 1 is now queued with nobody to wake a second
+ * idle worker.  An extra doorbell is harmless; a missing one stalls.
+ */
+nxt_inline int
+nxt_app_queue_notify_decision(int32_t pos, uint32_t depth_bound)
+{
+    return (pos < 0 || (uint32_t) pos < depth_bound);
+}
+
+
 nxt_inline nxt_int_t
-nxt_app_queue_send(nxt_app_queue_t volatile *q, const void *p,
-    uint8_t size, uint32_t tracking, int *notify, uint32_t *cookie)
+nxt_app_queue_send_bound(nxt_app_queue_t volatile *q, const void *p,
+    uint8_t size, uint32_t tracking, int *notify, uint32_t *cookie,
+    uint32_t depth_bound)
 {
     int                    n;
+    int32_t                pos;
     nxt_app_queue_item_t   *qi;
-    nxt_app_nncq_atomic_t  i;
+    nxt_app_nncq_atomic_t  i, t;
 
     /*
      * qi->data is NXT_APP_QUEUE_MSG_SIZE bytes; refuse to enqueue an
@@ -61,6 +95,10 @@ nxt_app_queue_send(nxt_app_queue_t volatile *q, const void *p,
      */
     if (nxt_slow_path(size > NXT_APP_QUEUE_MSG_SIZE)) {
         return NXT_ERROR;
+    }
+
+    if (nxt_slow_path(depth_bound == 0)) {
+        depth_bound = 1;
     }
 
     i = nxt_app_nncq_dequeue(&q->free_items);
@@ -72,16 +110,32 @@ nxt_app_queue_send(nxt_app_queue_t volatile *q, const void *p,
 
     qi->size = size;
     nxt_memcpy(qi->data, p, size);
-    qi->tracking = tracking;
+    nxt_atomic_store(&qi->tracking, tracking);
     *cookie = i;
 
-    if (nxt_slow_path(nxt_app_nncq_enqueue(&q->queue, i) != NXT_OK)) {
+    /* Before the enqueue: a worker can dequeue as soon as the slot is in. */
+    NXT_USDT(queue__enqueue, i, tracking);
+
+    if (nxt_slow_path(nxt_app_nncq_enqueue_pos(&q->queue, i, &t) != NXT_OK)) {
+        NXT_USDT(queue__enqueue__fail, i, tracking);
+
         (void) nxt_app_nncq_enqueue(&q->free_items, i);
 
         return NXT_ERROR;
     }
 
-    n = nxt_atomic_cmp_set(&q->notified, 0, 1);
+    if (depth_bound == 1) {
+        /*
+         * One reader: coalesce on the flag, ring only until the reader
+         * takes the notification.  libunit drains the queue before it
+         * sleeps (nxt_unit_process_port_msg() returns OK after a read).
+         */
+        n = nxt_atomic_cmp_set(&q->notified, 0, 1);
+
+    } else {
+        pos = (int32_t) (t - nxt_app_nncq_head(&q->queue));
+        n = nxt_app_queue_notify_decision(pos, depth_bound);
+    }
 
     if (notify != NULL) {
         *notify = n;
@@ -91,10 +145,23 @@ nxt_app_queue_send(nxt_app_queue_t volatile *q, const void *p,
 }
 
 
+nxt_inline nxt_int_t
+nxt_app_queue_send(nxt_app_queue_t volatile *q, const void *p,
+    uint8_t size, uint32_t tracking, int *notify, uint32_t *cookie)
+{
+    return nxt_app_queue_send_bound(q, p, size, tracking, notify, cookie, 1);
+}
+
+
 nxt_inline void
 nxt_app_queue_notification_received(nxt_app_queue_t volatile *q)
 {
-    q->notified = 0;
+    /*
+     * Clear the legacy flag for compatibility with pre-change unitd
+     * routers (e.g. an application rebuilt against this libunit run by an
+     * older router that still gates notifications with q->notified).
+     */
+    (void) nxt_atomic_cmp_set(&q->notified, 1, 0);
 }
 
 
@@ -143,6 +210,20 @@ nxt_app_queue_recv(nxt_app_queue_t volatile *q, void *p, uint32_t *cookie)
     *cookie = i;
 
     (void) nxt_app_nncq_enqueue(&q->free_items, i);
+
+    /*
+     * Re-arm the one-reader doorbell once the queue is drained, whether or
+     * not the READ_QUEUE that set the flag was read.  A worker that is
+     * already awake, or that dies before it reads the datagram, would
+     * otherwise leave "notified" at 1 and every later request in silence.
+     * A producer that enqueues between the dequeue and this clear sees the
+     * flag still set and does not ring; the caller re-checks the queue
+     * before it sleeps (nxt_unit_process_port_msg() returns OK after a
+     * read), so that item is still found.
+     */
+    if (nxt_app_queue_depth(q) == 0) {
+        (void) nxt_atomic_cmp_set(&q->notified, 1, 0);
+    }
 
     return size;
 }

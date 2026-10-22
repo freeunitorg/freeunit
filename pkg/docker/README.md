@@ -214,6 +214,36 @@ A summary (OK / FAILED) is printed at the end.
 | `ruby-3.4` | ruby:3.4 |
 | `ruby-4.0` | ruby:4.0 |
 
+## Alpine / musl allocator note
+
+On musl (Alpine) FreeUnit uses 12 to 17 percent more server CPU per request
+than on glibc, and the extra is system time: musl's allocator returns freed
+blocks to the kernel at once, so steady-state allocations cost `mmap`,
+`munmap` and page faults on every request. In the router this is largely
+fixed since 1.37.1 (per-thread reuse of freed pool clusters); under Drupal
+the gap lives in PHP's own allocations and preloading another allocator
+closes it. Measured on Drupal 12 `/user/login` (arm64):
+
+| variant | system us/req | page faults/req |
+|---------|--------------|-----------------|
+| musl mallocng | 1162 | 199 |
+| musl + `LD_PRELOAD=libjemalloc.so.2` | 479 | 48 |
+| glibc (Debian, same host) | 496 | 1.4 |
+
+mimalloc (v3, built from source; the Alpine package ships v2) measures the
+same way. The preload must reach every process of the instance — unitd and
+all application workers — e.g. `Environment=LD_PRELOAD=...` in the service
+file or `-e LD_PRELOAD=...` on `docker run`. Memory use of the preloaded
+allocator was measured next to CPU in
+https://github.com/freeunitorg/freeunit/issues/688 before choosing one.
+
+Limitation: the preload travels through the environment, so it has no effect
+where secure execution drops it — a set-id unitd or a unitd binary with file
+capabilities (for example to bind privileged ports that way) keeps mallocng
+with no warning. The test suite checks the same rule in
+`test/test_capget_fallback.py:152-175`. Linking the allocator at build time
+is the alternative for such deployments.
+
 ## Reference build environment
 
 Measured full build (all 23 variants, `./build-local.sh`) on the maintainer's local machine:
@@ -231,6 +261,20 @@ Measured full build (all 23 variants, `./build-local.sh`) on the maintainer's lo
 With apt-cacher-ng, repeated builds that share base layers are significantly faster.
 Builder mode (`-b`) for `minimal`, `wasm`, and `php-8.5` cuts those three variants to
 ~2–3 min each by skipping apt and Rust downloads entirely.
+
+### Build flags
+
+`--cc-opt` and `--ld-opt` are the CFLAGS and LDFLAGS of `dpkg-buildflags`.
+The hardening flags come from `./configure --hardening=default` (see `auto/cc/hardening`),
+including `-D_FORTIFY_SOURCE`, which `dpkg-buildflags` puts only in CPPFLAGS.
+The build stops when `build/autoconf.data` has no `-D_FORTIFY_SOURCE` after configure.
+Do not add the CPPFLAGS as well: their `-D_FORTIFY_SOURCE=2` makes the level 3 probe fail.
+unitd and libunit are not fortified yet: `src/nxt_unix.h` undefines `_FORTIFY_SOURCE`
+(https://github.com/freeunitorg/freeunit/issues/773).
+The `-specs=` flags are removed. `unitd --version` stores the configure options, and they
+would name `/usr/share/dpkg/no-pie-*.specs`. libdpkg-perl owns those files, and the image
+purges it with the build packages. A module build that reuses the stored options then fails
+with "cannot read spec file". With `-fPIC` and `-pie` set, the specs did nothing.
 
 ## CI workflow
 

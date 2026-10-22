@@ -37,6 +37,17 @@ typedef struct {
     uint64_t          otel_spans_failed;
     uint8_t           otel_configured;
 
+    /*
+     * The access log is one per configuration, not one per application.  Its
+     * path is stored as an offset from this report, as the app names are, so
+     * the whole report stays one buffer.  access_log_configured says whether
+     * a log is configured at all: without it the object is omitted, as
+     * "telemetry" is, rather than reported as zero losses.
+     */
+    uint64_t          access_log_lost;
+    nxt_str_t         access_log_path;
+    uint8_t           access_log_configured;
+
     size_t            apps_count;
     nxt_status_app_t  apps[];
 } nxt_status_report_t;

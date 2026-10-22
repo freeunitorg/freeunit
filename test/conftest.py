@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from multiprocessing import Process
 from pathlib import Path
 
@@ -79,6 +80,21 @@ def pytest_addoption(parser):
         "translated onto it (see unit/port.py), so concurrent runs can each "
         "own a private band.  Default: UNIT_TEST_PORT, else 8080",
     )
+    # 300 s sits between two limits.  Below it, the slowest test that
+    # passes: the Autobahn 9.x case with --unsafe, 10.2 s on a release
+    # build, so 300 s leaves a factor of 29 for an emulated builder.  It is
+    # also above faulthandler_timeout in pytest.ini, so the stack dump at
+    # 120 s comes first.  Above it, the step that runs pytest in
+    # .github/workflows/build-test.yml, with timeout-minutes 12, that is
+    # 720 s.  That cap covers the whole run, so a hang costs a step its
+    # normal time plus this limit, and the step has to finish before the
+    # cap kills the report.
+    parser.addoption(
+        "--test-timeout",
+        type=int,
+        default=300,
+        help="Fail a test that runs longer than this many seconds; 0 is off",
+    )
 
 
 unit_instance = {}
@@ -91,12 +107,19 @@ _processes = []
 # unitd tree.
 _pgids = {}
 _fds_info = {
-    'main': {'fds': 0, 'skip': False},
-    'router': {'name': 'unit: router', 'pid': -1, 'fds': 0, 'skip': False},
+    'main': {'fds': 0, 'kinds': {}, 'skip': False},
+    'router': {
+        'name': 'unit: router',
+        'pid': -1,
+        'fds': 0,
+        'kinds': {},
+        'skip': False,
+    },
     'controller': {
         'name': 'unit: controller',
         'pid': -1,
         'fds': 0,
+        'kinds': {},
         'skip': False,
     },
 }
@@ -130,6 +153,7 @@ def pytest_configure(config):
     option.unsafe = config.option.unsafe
     option.user = config.option.user
     option.restart = config.option.restart
+    option.test_timeout = config.option.test_timeout
 
     option.generated_tests = {}
     option.current_dir = os.path.abspath(
@@ -224,6 +248,15 @@ def pytest_runtest_makereport(item):
 
     setattr(item, f'rep_{rep.when}', rep)
 
+    # A deadline that fired in teardown and was caught there leaves the
+    # teardown report passed.  Fail it here, once: a raise that escaped
+    # has already failed the report.
+    expired = getattr(item, 'deadline_teardown_expired', None)
+
+    if rep.when == 'teardown' and expired and rep.passed:
+        rep.outcome = 'failed'
+        rep.longrepr = f'{expired}  A teardown caught the failure.'
+
 
 @pytest.fixture(scope='module', autouse=True)
 def check_prerequisites_module(request):
@@ -231,8 +264,96 @@ def check_prerequisites_module(request):
         check_prerequisites(request.module.prerequisites)
 
 
+# How long the deadline waits before it raises again, once it has expired
+# and the raise was caught.  Past the deadline every further second is time
+# the run already decided not to spend, so this is short: it drains a retry
+# loop quickly and breaks a stop() that hangs.
+REARM_SECONDS = 1
+
+
+def timeout_plugin_active(config):
+    # pytest-timeout takes its limit from --timeout, then PYTEST_TIMEOUT,
+    # then the "timeout" ini option.  Look in the same places.
+    if not config.pluginmanager.hasplugin('timeout'):
+        return False
+
+    for value in (
+        config.getoption('timeout'),
+        os.environ.get('PYTEST_TIMEOUT'),
+        config.getini('timeout'),
+    ):
+        if value not in (None, ''):
+            return float(value) > 0
+
+    return False
+
+
+@pytest.fixture
+def deadline(request):
+    # Limits the whole test, with the start and stop of unitd in run().
+    # A blocked socket call has no other limit.  pytest-timeout, when it is
+    # installed and enabled, uses SIGALRM too, so this guard steps aside.
+    seconds = option.test_timeout
+
+    if seconds <= 0 or timeout_plugin_active(request.config):
+        yield
+        return
+
+    message = f'The test ran longer than {seconds} s.'
+    expired = []
+    in_body = []
+
+    def expire(signum, frame):
+        expired.append(True)
+
+        # The call report exists as soon as the test body has returned or
+        # raised.  While it is absent, the deadline fired inside setup or
+        # the body, and a raise the body swallows would leave the test
+        # green.  Record that for the teardown check below.  A fire after
+        # it, in run()'s teardown, raises out of that teardown and reports
+        # itself, so it must not be reported a second time.
+        if getattr(request.node, 'rep_call', None) is None:
+            in_body.append(True)
+        else:
+            # In teardown, a cleanup may catch the raise too.  The
+            # makereport hook fails the teardown report if it passed.
+            request.node.deadline_teardown_expired = message
+
+        # pytest.fail() raises a BaseException, and test code does catch
+        # that: _reload_and_poll_mounts() in test_go_isolation.py has an
+        # "except BaseException" around every request.  A caught failure
+        # would leave this one-shot alarm spent and the test running with
+        # no limit again, which is the hang this guard is here to stop.
+        # So re-arm, to interrupt the next wait as well, and record the
+        # expiry, so that teardown below fails a test that swallowed
+        # every raise and would otherwise finish green.
+        signal.alarm(REARM_SECONDS)
+
+        pytest.fail(message)
+
+    handler = signal.signal(signal.SIGALRM, expire)
+    signal.alarm(seconds)
+
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, handler)
+
+        # Report only a deadline the test body swallowed, so the test
+        # cannot finish green.  A hang in setup leaves no call report, and
+        # a hang in run()'s teardown leaves a report that passed: both
+        # already raise out of their own phase.  Reporting those here
+        # would add a second failure for one hang, and would say the test
+        # caught a failure it never saw.
+        report = getattr(request.node, 'rep_call', None)
+
+        if expired and in_body and report is not None and not report.failed:
+            pytest.fail(f'{message}  The test caught the failure.')
+
+
 @pytest.fixture(autouse=True)
-def run(request):
+def run(request, deadline):
     unit = unit_run()
 
     option.skip_alerts = [
@@ -249,11 +370,11 @@ def run(request):
     # lazy initialization (e.g. OTel tokio runtime) that occurred after
     # unit_run() captured the initial baseline is not counted as a leak.
     if not option.restart:
-        _fds_info['main']['fds'] = _count_fds(unit_instance['pid'])
+        _fd_baseline(_fds_info['main'], unit_instance['pid'])
         router = _fds_info['router']
-        router['fds'] = _count_fds(router['pid'])
+        _fd_baseline(router, router['pid'])
         controller = _fds_info['controller']
-        controller['fds'] = _count_fds(controller['pid'])
+        _fd_baseline(controller, controller['pid'])
 
     yield
 
@@ -606,15 +727,15 @@ def unit_run(state_dir=None):
     if state_dir is None:
         _clear_conf()
 
-    _fds_info['main']['fds'] = _count_fds(unit_instance['pid'])
+    _fd_baseline(_fds_info['main'], unit_instance['pid'])
 
     router = _fds_info['router']
     router['pid'] = pid_by_name(router['name'])
-    router['fds'] = _count_fds(router['pid'])
+    _fd_baseline(router, router['pid'])
 
     controller = _fds_info['controller']
     controller['pid'] = pid_by_name(controller['name'])
-    controller['fds'] = _count_fds(controller['pid'])
+    _fd_baseline(controller, controller['pid'])
 
     Status._check_zeros()
 
@@ -851,28 +972,39 @@ def _check_processes():
 
 @print_log_on_assert
 def _check_fds(*, log=None):
-    def waitforfds(diff):
+    def waitforfds(pid, base):
+        # The count and the descriptor kinds come from one listing, so the
+        # "+N fds" of a leak message matches the kinds that it names.
         for _ in range(600):
-            fds_diff = diff()
+            sample = _fd_targets(pid)
+            count = sample[0] if sample is not None else _count_fds(pid)
+            fds_diff = count - base
 
             if fds_diff <= option.fds_threshold:
                 break
 
             time.sleep(0.1)
 
-        return fds_diff
+        return fds_diff, sample[1] if sample is not None else []
+
+    # The three processes share one network namespace: read its socket
+    # tables once per check.
+    tables = {}
 
     ps = _fds_info['main']
     if not ps['skip']:
-        fds_diff = waitforfds(
-            lambda: _count_fds(unit_instance['pid']) - ps['fds']
-        )
+        fds_diff, targets = waitforfds(unit_instance['pid'], ps['fds'])
         ps['fds'] += fds_diff
+        before, ps['kinds'] = ps['kinds'], _fd_kinds(
+            unit_instance['pid'], tables, targets
+        )
 
-        assert fds_diff <= option.fds_threshold, 'descriptors leak main process'
+        assert fds_diff <= option.fds_threshold, _fd_leak(
+            'main process', fds_diff, before, ps['kinds']
+        )
 
     else:
-        ps['fds'] = _count_fds(unit_instance['pid'])
+        _fd_baseline(ps, unit_instance['pid'], tables)
 
     for name in ['controller', 'router']:
         ps = _fds_info[name]
@@ -880,16 +1012,186 @@ def _check_fds(*, log=None):
         ps['pid'] = pid_by_name(ps['name'])
 
         if not ps['skip']:
-            fds_diff = waitforfds(lambda: _count_fds(ps['pid']) - ps['fds'])
+            fds_diff, targets = waitforfds(ps['pid'], ps['fds'])
             ps['fds'] += fds_diff
+            before, ps['kinds'] = ps['kinds'], _fd_kinds(
+                ps['pid'], tables, targets
+            )
 
             if not option.restart:
                 assert ps['pid'] == ps_pid, f'same pid {name}'
 
-            assert fds_diff <= option.fds_threshold, f'descriptors leak {name}'
+            assert fds_diff <= option.fds_threshold, _fd_leak(
+                name, fds_diff, before, ps['kinds']
+            )
 
         else:
-            ps['fds'] = _count_fds(ps['pid'])
+            _fd_baseline(ps, ps['pid'], tables)
+
+
+def _fd_baseline(ps, pid, tables=None):
+    sample = _fd_targets(pid)
+
+    if sample is None:
+        ps['fds'] = _count_fds(pid)
+        ps['kinds'] = Counter()
+        return
+
+    ps['fds'], targets = sample
+    ps['kinds'] = _fd_kinds(pid, tables, targets)
+
+
+_TCP_STATES = {
+    '01': 'established',
+    '02': 'syn-sent',
+    '03': 'syn-recv',
+    '04': 'fin-wait1',
+    '05': 'fin-wait2',
+    '06': 'time-wait',
+    '07': 'close',
+    '08': 'close-wait',
+    '09': 'last-ack',
+    '0A': 'listen',
+    '0B': 'closing',
+    '0C': 'new-syn-recv',
+}
+
+
+def _parse_socket_table(proto, text):
+    """Map socket inodes to names from the decoded text of /proc/net/<proto>."""
+    names = {}
+
+    for line in text.splitlines()[1:]:
+        # The last unix column is the path, and it can hold spaces.
+        f = line.split(maxsplit=7 if proto == 'unix' else -1)
+
+        if proto == 'unix':
+            if len(f) < 7:
+                continue
+            path = f[7] if len(f) > 7 else ''
+            if re.fullmatch(r'@[0-9a-f]{5}', path):
+                path = '@autobind'
+            names[f[6]] = f'unix:{path}' if path else 'unix'
+
+        elif len(f) > 9:
+            if proto.startswith('tcp'):
+                name = f'{proto} {_TCP_STATES.get(f[3], f[3])}'
+            else:
+                name = proto
+            names[f[9]] = name
+
+    return names
+
+
+def _socket_names(pid, tables=None):
+    # tables caches the parsed result by network namespace.
+    try:
+        key = os.readlink(f'/proc/{pid}/ns/net')
+    except OSError:
+        key = None
+
+    if tables is not None and key is not None and key in tables:
+        return tables[key]
+
+    names = {}
+
+    for proto in ('tcp', 'tcp6', 'udp', 'udp6', 'netlink', 'unix'):
+        try:
+            text = (
+                Path(f'/proc/{pid}/net/{proto}')
+                .read_bytes()
+                .decode('utf-8', 'backslashreplace')
+            )
+        except OSError:
+            continue
+
+        names.update(_parse_socket_table(proto, text))
+
+    if tables is not None and key is not None:
+        tables[key] = names
+
+    return names
+
+
+def _fd_kind(target, sockets):
+    if target.startswith('socket:'):
+        return sockets.get(target[len('socket:') :].strip('[]'), 'socket')
+
+    for prefix, kind in (
+        ('pipe:', 'pipe'),
+        ('/memfd:', 'memfd'),
+    ):
+        if target.startswith(prefix):
+            return kind
+
+    if target.startswith('anon_inode:'):
+        return target[len('anon_inode:') :].strip('[]')
+
+    # os.readlink gives surrogates for a name that is not UTF-8.
+    return target.encode('utf-8', 'surrogateescape').decode(
+        'utf-8', 'backslashreplace'
+    )
+
+
+def _fd_targets(pid):
+    """Count the descriptors of a process and read their targets, from one
+    listing of /proc/<pid>/fd.  None when there is no such listing."""
+    try:
+        fds = list(Path(f'/proc/{pid}/fd').iterdir())
+    except OSError:
+        return None
+
+    targets = []
+
+    for fd in fds:
+        try:
+            targets.append(os.readlink(fd))
+        except OSError:
+            # The descriptor closed after the listing.  It still counts,
+            # as it does in _count_fds().
+            pass
+
+    return len(fds), targets
+
+
+def _fd_kinds(pid, tables=None, targets=None):
+    kinds = Counter()
+
+    if targets is None:
+        sample = _fd_targets(pid)
+        if sample is None:
+            return kinds
+        targets = sample[1]
+
+    sockets = (
+        _socket_names(pid, tables)
+        if any(t.startswith('socket:') for t in targets)
+        else {}
+    )
+
+    for target in targets:
+        kinds[_fd_kind(target, sockets)] += 1
+
+    return kinds
+
+
+def _fd_leak(name, fds_diff, before, after):
+    kinds = _fd_kinds_diff(before, after)
+    return f'descriptors leak {name}: {fds_diff:+d} fds, {kinds}'
+
+
+def _fd_kinds_diff(before, after):
+    if not before and not after:
+        return 'no /proc fd detail'
+
+    delta = Counter(after)
+    delta.subtract(before)
+    changed = sorted((k, n) for k, n in delta.items() if n)
+
+    if not changed:
+        return 'same descriptor kinds as the baseline'
+
+    return ', '.join(f'{k} {n:+d}' for k, n in changed)
 
 
 def _count_fds(pid):

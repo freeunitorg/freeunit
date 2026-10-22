@@ -207,6 +207,11 @@ if [ $nxt_found = no ]; then
 fi
 
 NXT_JAVA_VERSION=`$NXT_JAVAC -version 2>&1`
+
+nxt_jar_has_date=no
+if "$NXT_JAVA_HOME/bin/jar" --help 2>&1 | grep -q -e '--date'; then
+    nxt_jar_has_date=yes
+fi
 NXT_JAVA_VERSION=${NXT_JAVA_VERSION#javac }
 NXT_JAVA_INCLUDE="$NXT_JAVA_INCLUDE -I$NXT_BUILD_DIR/$NXT_JAVA_MODULE -DNXT_JAVA_VERSION=$NXT_JAVA_VERSION"
 
@@ -562,6 +567,47 @@ if ! grep ^$NXT_BUILD_DIR/$NXT_UNIT_JAR: $NXT_MAKEFILE 2>&1 > /dev/null; then
 
 NXT_JAVA_SRCS = $NXT_JAVA_SRCS
 
+# "yes" when the jar tool accepts --date (JDK 17 or later).
+NXT_JAR_HAS_DATE = $nxt_jar_has_date
+
+# With SOURCE_DATE_EPOCH set, pack a sorted file list with fixed times.
+# Without it, keep the old behaviour. Argument 1 is the class tree.
+# The epoch is converted with GNU "date -d @N" or BSD "date -r N", and
+# times are set with POSIX "touch -t" in UTC.  It is clamped to the range
+# that "jar --date" accepts, 1980-01-01T00:00:02Z to 2099-12-31T23:59:59Z.
+# A jar without --date (JDK < 17) would stamp the manifest it generates
+# with the current time, so supply our own manifest with a fixed time.
+define NXT_JAR_PACK
+(set -e; d=$NXT_BUILD_DIR/$NXT_JAVA_MODULE; \\
+if [ -z "\$\$SOURCE_DATE_EPOCH" ]; then \\
+    exec $NXT_JAVA_HOME/bin/jar c -C \$\$d META-INF -C \$\$d \$(1); \\
+fi; \\
+export LC_ALL=C TZ=UTC; \\
+e=\$\$SOURCE_DATE_EPOCH; \\
+if [ \$\$e -lt 315532802 ]; then e=315532802; \\
+elif [ \$\$e -gt 4102444799 ]; then e=4102444799; fi; \\
+iso=\$\$(date -u -d @\$\$e +%Y-%m-%dT%H:%M:%S+00:00 2>/dev/null || \\
+    date -u -r \$\$e +%Y-%m-%dT%H:%M:%S+00:00); \\
+stamp=\$\$(date -u -d @\$\$e +%Y%m%d%H%M.%S 2>/dev/null || \\
+    date -u -r \$\$e +%Y%m%d%H%M.%S); \\
+dir=\$(1); \\
+list=\$\$(cd \$\$d && find META-INF \$\$dir -type f | sort); \\
+args=; \\
+for f in \$\$list; do args="\$\$args -C \$\$d \$\$f"; done; \\
+if [ "\$(NXT_JAR_HAS_DATE)" = yes ]; then \\
+    exec $NXT_JAVA_HOME/bin/jar --create --date=\$\$iso \$\$args; \\
+fi; \\
+m=\$\$d.manifest.\$\$(echo \$\$dir | tr / .); \\
+rm -rf \$\$m; mkdir -p \$\$m/META-INF; \\
+printf 'Manifest-Version: 1.0\\r\\n\\r\\n' > \$\$m/META-INF/MANIFEST.MF; \\
+(cd \$\$d && touch -t \$\$stamp \$\$list); \\
+touch -t \$\$stamp \$\$m/META-INF/MANIFEST.MF; \\
+$NXT_JAVA_HOME/bin/jar --create --no-manifest \\
+    -C \$\$m META-INF/MANIFEST.MF \$\$args; \\
+rm -rf \$\$m)
+endef
+
+
 $NXT_BUILD_DIR/$NXT_JAVA_MODULE/.nginx.unit.classes: \$(NXT_JAVA_SRCS) \\
     $NXT_BUILD_DIR/$NXT_WS_API_JAR
 	rm -rf $NXT_BUILD_DIR/$NXT_JAVA_MODULE/nginx/unit
@@ -582,8 +628,7 @@ $NXT_BUILD_DIR/$NXT_UNIT_JAR: \\
     $NXT_BUILD_DIR/$NXT_JAVA_MODULE/.nginx.unit.classes \\
     $NXT_BUILD_DIR/$NXT_JAVA_MODULE/META-INF/LICENSE \\
     $NXT_BUILD_DIR/$NXT_JAVA_MODULE/META-INF/NOTICE
-	$NXT_JAVA_HOME/bin/jar c -C $NXT_BUILD_DIR/$NXT_JAVA_MODULE META-INF \\
-		-C $NXT_BUILD_DIR/$NXT_JAVA_MODULE nginx/unit > \$@
+	\$(call NXT_JAR_PACK,nginx/unit) > \$@
 
 NXT_JAVA_WS_API_SRCS = $NXT_JAVA_WS_API_SRCS
 
@@ -597,8 +642,7 @@ $NXT_BUILD_DIR/$NXT_WS_API_JAR: \\
     $NXT_BUILD_DIR/$NXT_JAVA_MODULE/.javax.websocket.classes \\
     $NXT_BUILD_DIR/$NXT_JAVA_MODULE/META-INF/LICENSE \\
     $NXT_BUILD_DIR/$NXT_JAVA_MODULE/META-INF/NOTICE
-	$NXT_JAVA_HOME/bin/jar c -C $NXT_BUILD_DIR/$NXT_JAVA_MODULE META-INF \\
-		-C $NXT_BUILD_DIR/$NXT_JAVA_MODULE javax/websocket > \$@
+	\$(call NXT_JAR_PACK,javax/websocket) > \$@
 
 END
 

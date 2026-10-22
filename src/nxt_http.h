@@ -123,7 +123,6 @@ typedef union {
 
 typedef struct {
     nxt_http_field_t                inline_fields[16];
-    uint8_t                         num_inline_fields;
     nxt_list_t                      *fields;
     nxt_http_field_t                *date;
     nxt_http_field_t                *content_type;
@@ -138,6 +137,12 @@ typedef struct {
      * nxt_http_request_header_send() re-asserts it once that has run.
      */
     uint8_t                         vary_accept_encoding;  /* 1 bit */
+
+    /*
+     * After the pointers, not in front of "fields": a byte there leaves
+     * seven bytes of padding.
+     */
+    uint8_t                         num_inline_fields;
 } nxt_http_response_t;
 
 
@@ -180,7 +185,6 @@ typedef struct {
     nxt_http_request_t              *request;
     nxt_upstream_server_t           *server;
     nxt_http_field_t                inline_fields[16];
-    uint8_t                         num_inline_fields;
     nxt_list_t                      *fields;
     nxt_buf_t                       *body;
 
@@ -190,10 +194,14 @@ typedef struct {
     uint8_t                         closed;           /* 1 bit  */
     /* number of 1xx responses dropped */
     uint8_t                         num_interim;
+
+    /*
+     * After the pointers, not in front of "fields": a byte there leaves
+     * seven bytes of padding.
+     */
+    uint8_t                         num_inline_fields;
 } nxt_http_peer_t;
 
-
-typedef struct nxt_http_action_s nxt_http_action_t;
 
 typedef struct {
     nxt_http_action_t           *action;
@@ -232,7 +240,6 @@ struct nxt_http_request_s {
     nxt_array_t                     *arguments;  /* of nxt_http_name_value_t */
     nxt_array_t                     *cookies;    /* of nxt_http_name_value_t */
     nxt_http_field_t                inline_fields[16];
-    uint8_t                         num_inline_fields;
     nxt_list_t                      *fields;
     nxt_http_field_t                *content_type;
     nxt_http_field_t                *content_length;
@@ -279,6 +286,9 @@ struct nxt_http_request_s {
     /* Set by nxt_http_comp_check_acceptable(), from mem_pool. */
     nxt_http_comp_ctx_t             *comp_ctx;
 
+    /* When a websocket frame first found the application queue full. */
+    nxt_msec_t                      ws_paused_at;
+
     nxt_http_status_t               status:16;
 
     uint8_t                         log_route;    /* 1 bit */
@@ -292,11 +302,18 @@ struct nxt_http_request_s {
     uint8_t                         logged;       /* 1 bit  */
     uint8_t                         header_sent;  /* 1 bit  */
     uint8_t                         inconsistent; /* 1 bit  */
+    uint8_t                         ws_paused;    /* 1 bit  */
     uint8_t                         truncated;    /* 1 bit  */
     uint8_t                         error;        /* 1 bit  */
     uint8_t                         websocket_handshake;  /* 1 bit */
     uint8_t                         chunked;  /* 1 bit */
     uint8_t                         no_body;  /* 1 bit */
+
+    /*
+     * After the byte flags, not in front of "fields": a byte there leaves
+     * seven bytes of padding.
+     */
+    uint8_t                         num_inline_fields;
 };
 
 

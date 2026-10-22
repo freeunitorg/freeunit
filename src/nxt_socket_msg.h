@@ -9,6 +9,8 @@
 #include <sys/un.h>
 #endif
 
+#include <nxt_span.h>
+
 
 #if (NXT_HAVE_UCRED)
 #define NXT_CRED_USECMSG    1
@@ -104,9 +106,11 @@ typedef struct {
 /**
  * The nxt_sendmsg is a wrapper for sendmsg.
  * The oob struct must be initialized using nxt_socket_msg_oob_init().
+ * flags go to sendmsg(2) unchanged; pass MSG_DONTWAIT for a send that must
+ * never block (the caller handles EAGAIN).
  */
 NXT_EXPORT ssize_t nxt_sendmsg(nxt_socket_t s, nxt_iobuf_t *iob,
-    nxt_uint_t niob, const nxt_send_oob_t *oob);
+    nxt_uint_t niob, const nxt_send_oob_t *oob, int flags);
 
 /**
  * The nxt_recvmsg is a wrapper for recvmsg.
@@ -116,16 +120,42 @@ NXT_EXPORT ssize_t nxt_recvmsg(nxt_socket_t s,
     nxt_iobuf_t *iob, nxt_uint_t niob, nxt_recv_oob_t *oob);
 
 
+/*
+ * CMSG_NXTHDR() of glibc before 2.37 requires the padding after the data of
+ * the next header.  The kernel cuts off that padding when it truncates
+ * SCM_RIGHTS, so the descriptor in that header leaks.  The check below is
+ * the one of glibc 2.37.  The caller checks the cmsg_len of the next header.
+ */
+
 nxt_inline struct cmsghdr *
 NXT_CMSG_NXTHDR(struct msghdr *msgh, struct cmsghdr *cmsg)
 {
-#if !defined(__GLIBC__) && defined(__clang__)
+#if (defined(__GLIBC__))
+    const u_char  *p;
+    nxt_span_t    span;
+
+    nxt_span_init(&span, (u_char *) cmsg,
+                  (u_char *) msgh->msg_control + msgh->msg_controllen);
+
+    if (cmsg->cmsg_len < sizeof(struct cmsghdr)
+        || nxt_span_take(&span, cmsg->cmsg_len, &p) != 0
+        || nxt_span_take(&span, CMSG_ALIGN(cmsg->cmsg_len) - cmsg->cmsg_len,
+                         &p) != 0
+        || nxt_span_take(&span, sizeof(struct cmsghdr), &p) != 0)
+    {
+        return NULL;
+    }
+
+    return (struct cmsghdr *) p;
+#else
+#if (defined(__clang__))
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wsign-compare"
 #endif
     return CMSG_NXTHDR(msgh, cmsg);
-#if !defined(__GLIBC__) && defined(__clang__)
+#if (defined(__clang__))
 #pragma clang diagnostic pop
+#endif
 #endif
 }
 

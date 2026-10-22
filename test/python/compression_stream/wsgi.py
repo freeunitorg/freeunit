@@ -14,13 +14,18 @@ def application(environ, start_response):
     token = b'<%06d>' % rid
     part = (token * (size // len(token) + 1))[:size]
 
-    start_response(
-        '200 OK',
-        [
-            ('Content-Type', 'text/plain'),
-            ('Content-Length', str(size * parts)),
-        ],
-    )
+    headers = [
+        ('Content-Type', 'text/plain'),
+        ('Content-Length', str(size * parts)),
+    ]
+
+    # A large field makes the response buffer too large for a plain port
+    # message (1024 bytes), so libunit sends it through shared memory.
+    pad = int(environ.get('HTTP_X_PAD', '0'))
+    if pad:
+        headers.append(('X-Pad', 'p' * pad))
+
+    start_response('200 OK', headers)
 
     def body():
         for i in range(parts):

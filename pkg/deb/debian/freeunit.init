@@ -25,6 +25,7 @@ test -f $DAEMON || exit 0
 umask 022
 
 # Read configuration variable file if it is present
+# shellcheck source=/dev/null
 [ -r /etc/default/$NAME ] && . /etc/default/$NAME
 
 case "$1" in

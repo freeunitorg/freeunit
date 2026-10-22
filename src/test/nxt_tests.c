@@ -74,10 +74,13 @@ nxt_test_in_child(nxt_thread_t *thr, const char *name, int (*fn)(void *),
 static nxt_int_t (*const nxt_security_tests[])(nxt_thread_t *) = {
     nxt_checked_test, nxt_port_mmap_read_test,
     nxt_router_response_parse_test, nxt_port_frag_test,
-    nxt_port_release_test, nxt_nncq_bound_test, nxt_size_bound_test,
+    nxt_port_release_test, nxt_process_use_test, nxt_nncq_bound_test,
+    nxt_nncq_wrap_test,
+    nxt_app_queue_test, nxt_size_bound_test, nxt_mp_cluster_cache_test,
 #if (NXT_HAVE_REGEX)
     nxt_regex_test,
 #endif
+    nxt_usdt_test,
 };
 
 
@@ -269,11 +272,19 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_var_escape_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_string_test(thr) != NXT_OK) {
         return 1;
     }
 
     if (nxt_buf_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_h1proto_conn_test(thr) != NXT_OK) {
         return 1;
     }
 
@@ -317,6 +328,14 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_signalfd_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_poll_engine_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_port_use_unless_zero_test(thr) != NXT_OK) {
         return 1;
     }
@@ -353,6 +372,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_conn_counters_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_router_new_port_test(thr) != NXT_OK) {
         return 1;
     }
@@ -381,6 +404,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_router_conf_overlap_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_router_app_timeout_test(thr) != NXT_OK) {
         return 1;
     }
@@ -406,6 +433,14 @@ main(int argc, char **argv)
     }
 
     if (nxt_router_prepare_msg_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_engine_port_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_router_access_log_test(thr) != NXT_OK) {
         return 1;
     }
 
@@ -457,6 +492,14 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_port_doorbell_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_port_share_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     for (i = 0; i < nxt_nitems(nxt_security_tests); i++) {
         if (nxt_security_tests[i](thr) != NXT_OK) {
             return 1;
@@ -469,6 +512,10 @@ main(int argc, char **argv)
 
 #if (NXT_HAVE_OPENSSL)
     if (nxt_openssl_server_init_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_openssl_log_level_test(thr) != NXT_OK) {
         return 1;
     }
 #endif

@@ -28,11 +28,9 @@
 
 /*
  * nxt_static_assert() fails the compilation when the condition does not
- * hold.  auto/cc/test adds -std=gnu11 only on its gcc and clang branches
- * and leaves the generic "cc" branch alone, so a compiler defaulting to
- * pre-C11 has to fall back to declaring an array with a negative size;
- * there the message survives only in the type name, which has to be unique
- * per use, hence the token pasting.
+ * hold.  Without C11, it declares an extern array with a negative size.
+ * C99 allows a repeated extern declaration but not a repeated typedef, so
+ * every use can have the same name.
  */
 
 #if (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L)
@@ -42,15 +40,8 @@
 
 #else
 
-#define nxt_static_assert_paste(prefix, line)                                 \
-    prefix##line
-
-#define nxt_static_assert_name(prefix, line)                                  \
-    nxt_static_assert_paste(prefix, line)
-
 #define nxt_static_assert(cond, msg)                                          \
-    typedef char nxt_static_assert_name(nxt_static_assert_failed_,            \
-                                        __LINE__)[(cond) ? 1 : -1]
+    extern char nxt_static_assert_failed[(cond) ? 1 : -1]
 
 #endif
 
@@ -65,6 +56,39 @@
 
 #define nxt_pragma_loop_disable_vectorization
 
+#endif
+
+
+/*
+ * NXT_HEAP_SANITIZER is 1 when a sanitizer tracks the memory that free()
+ * releases.  AddressSanitizer and HWAddressSanitizer report an access to it.
+ * MemorySanitizer marks it as uninitialized.  ThreadSanitizer reports an
+ * access from another thread that races with the free.  Code that keeps
+ * freed memory for reuse must not do so then.  Otherwise the sanitizer does
+ * not see a use after free.  GCC defines __SANITIZE_ADDRESS__,
+ * __SANITIZE_HWADDRESS__ and __SANITIZE_THREAD__.  Clang defines none of
+ * them, so it is asked with __has_feature().  GCC has no MemorySanitizer.
+ * The undefined behavior and leak sanitizers do not set this macro.
+ */
+
+#if (defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_HWADDRESS__)        \
+     || defined(__SANITIZE_THREAD__))
+
+#define NXT_HEAP_SANITIZER  1
+
+#elif (defined(__clang__) && defined(__has_feature))
+
+#if (__has_feature(address_sanitizer)                                         \
+     || __has_feature(hwaddress_sanitizer)                                    \
+     || __has_feature(memory_sanitizer)                                       \
+     || __has_feature(thread_sanitizer))
+#define NXT_HEAP_SANITIZER  1
+#endif
+
+#endif
+
+#ifndef NXT_HEAP_SANITIZER
+#define NXT_HEAP_SANITIZER  0
 #endif
 
 

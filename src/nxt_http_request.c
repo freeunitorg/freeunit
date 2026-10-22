@@ -8,6 +8,7 @@
 #include <nxt_http.h>
 #include <nxt_otel.h>
 #include <nxt_checked.h>
+#include <nxt_usdt.h>
 
 
 static void nxt_http_request_start(nxt_task_t *task, void *obj, void *data);
@@ -250,6 +251,7 @@ nxt_http_request_create(nxt_task_t *task)
 {
     nxt_mp_t            *mp;
     nxt_buf_t           *last;
+    nxt_event_engine_t  *engine;
     nxt_http_request_t  *r;
 
     mp = nxt_mp_create(4096, 128, 512, 32);
@@ -280,7 +282,9 @@ nxt_http_request_create(nxt_task_t *task)
 
     r->start_time = nxt_thread_monotonic_time(task->thread);
 
-    task->thread->engine->requests_cnt++;
+    engine = task->thread->engine;
+    nxt_atomic_store(&engine->requests_cnt,
+                     nxt_atomic_load(&engine->requests_cnt) + 1);
 
     r->tstr_cache.var.pool = mp;
 
@@ -1214,7 +1218,8 @@ nxt_http_request_close_handler(nxt_task_t *task, void *obj, void *data)
         if (rtcf->access_log != NULL) {
             access_log = rtcf->access_log;
 
-            if (nxt_http_cond_value(task, r, &rtcf->log_cond)) {
+            /* -1 means that the condition could not be rendered: no record. */
+            if (nxt_http_cond_value(task, r, &rtcf->log_cond) > 0) {
                 access_log->handler(task, r, access_log, rtcf->log_format);
                 return;
             }
@@ -1222,6 +1227,9 @@ nxt_http_request_close_handler(nxt_task_t *task, void *obj, void *data)
     }
 
     nxt_debug(task, "http request close handler");
+
+    /* Every request ends here once.  Status 0: no response was sent. */
+    NXT_USDT(request__done, (uintptr_t) r, (nxt_int_t) r->status);
 
     r->proto.any = NULL;
 

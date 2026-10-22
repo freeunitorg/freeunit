@@ -9,6 +9,7 @@ import zlib
 import pytest
 
 from unit.applications.lang.python import ApplicationPython
+from unit.compression import zstd_decompress, zstd_stream_decoder
 from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'any'}}
@@ -37,25 +38,7 @@ def decoder(encoding):
         return zlib.decompress
 
     if encoding == 'zstd':
-        try:
-            from compression import zstd  # Python 3.14 and later.
-
-            return zstd.decompress
-        except ImportError:
-            pass
-
-        zstandard = pytest.importorskip('zstandard')
-
-        def decode(data):
-            d = zstandard.ZstdDecompressor().decompressobj()
-            out = d.decompress(data)
-
-            if not d.eof:
-                raise ValueError('zstd frame is not complete')
-
-            return out
-
-        return decode
+        return zstd_decompress
 
     return pytest.importorskip('brotli').decompress
 
@@ -126,11 +109,11 @@ def dechunk(data):
         data = data[end + 2 + size + 2 :]
 
 
-def fetch(rid, encoding):
+def fetch(rid, encoding, extra=None):
     # latin1 maps each byte to one character, so encoding back gives the
     # compressed bytes exactly.
     resp = client.get(
-        headers=request_headers(rid, encoding, PARTS),
+        headers={**request_headers(rid, encoding, PARTS), **(extra or {})},
         raw_resp=True,
         encoding='latin1',
         read_buffer_size=65536,
@@ -147,13 +130,17 @@ def fetch(rid, encoding):
     return int(lines[0].split()[1]), headers, body.encode('latin1')
 
 
-def check(rid, encoding, decode):
+def check(rid, encoding, decode, extra=None, want=None):
     """Returns None for a correct response, else what is wrong with it."""
 
-    status, headers, body = fetch(rid, encoding)
+    status, headers, body = fetch(rid, encoding, extra)
 
     if status != 200:
         return f'status {status}'
+
+    for name, value in (want or {}).items():
+        if headers.get(name) != value:
+            return f'{name} is {str(headers.get(name))[:40]!r}'
 
     if headers.get('Content-Encoding') != encoding:
         return f'Content-Encoding {headers.get("Content-Encoding")}'
@@ -225,8 +212,8 @@ def start_streams(encoding, parts, delay):
         socks.append(sock)
 
     # The router initialises the stream before it sends the header.  The
-    # empty line at the end of the header goes out with the first chunk,
-    # which for zstd can be the last one, so do not wait for it.
+    # empty line at the end of the header goes out with the first chunk, so
+    # do not wait for it.
     coded = b'\r\nContent-Encoding: ' + encoding.encode() + b'\r\n'
 
     for sock in socks:
@@ -276,6 +263,86 @@ def test_python_compression_concurrent_streams(encoding):
     assert not bad, describe(bad)
 
 
+def stream_decoder(encoding):
+    """Returns a function that decodes the next bytes of a body, or skips."""
+
+    if encoding == 'gzip':
+        return zlib.decompressobj(16 + zlib.MAX_WBITS).decompress
+
+    if encoding == 'deflate':
+        return zlib.decompressobj().decompress
+
+    if encoding == 'zstd':
+        return zstd_stream_decoder()
+
+    return pytest.importorskip('brotli').Decompressor().process
+
+
+@pytest.mark.parametrize('encoding', ENCODINGS)
+def test_python_compression_part_flushed(encoding):
+    # Each part of a streamed response must reach the client compressed and
+    # complete before the next part is written (#788).  zstd held its output
+    # until a full 128 KiB block or the end of the response.
+    decode = stream_decoder(encoding)
+    setup_compression(encoding)
+
+    sock = client.get(
+        headers=request_headers(2001, encoding, parts=2, delay=3),
+        no_recv=True,
+    )
+    sock.settimeout(30)
+
+    data = b''
+    while b'\r\n\r\n' not in data:
+        part = sock.recv(4096)
+        assert part, 'the response starts'
+        data += part
+
+    head, _, data = data.partition(b'\r\n\r\n')
+    assert b'Transfer-Encoding: chunked' in head, 'chunked'
+
+    sock.settimeout(1)
+
+    # The second part comes 3 s after the first.  Read for 2 s and decode
+    # each complete chunk: the first part must be in what arrived.
+    decoded = b''
+    deadline = time.monotonic() + 2
+
+    while time.monotonic() < deadline:
+        while True:
+            # The CRLF after the data of a chunk can come with the next one.
+            if data.startswith(b'\r\n'):
+                data = data[2:]
+
+            end = data.find(b'\r\n')
+            if end == -1:
+                break
+
+            size = int(data[:end], 16)
+            if len(data) < end + 2 + size:
+                break
+
+            assert size != 0, 'the response is still streaming'
+
+            decoded += decode(data[end + 2 : end + 2 + size])
+            data = data[end + 2 + size :]
+
+        if len(decoded) >= SIZE:
+            break
+
+        try:
+            part = sock.recv(4096)
+        except socket.timeout:
+            continue
+
+        assert part, 'the response is still streaming'
+        data += part
+
+    sock.close()
+
+    assert decoded == expected(2001, parts=1), 'the first part, decoded'
+
+
 @pytest.mark.parametrize('encoding', ENCODINGS)
 def test_python_compression_client_close(encoding):
     # Clients that close the connection in the middle of a compressed body,
@@ -309,9 +376,7 @@ def test_python_compression_client_close(encoding):
 def test_python_compression_app_timeout(encoding):
     # The application stops for longer than "limits": {"timeout"} in the
     # middle of a compressed body.  The router then closes the connection,
-    # and must free the stream of the response.  A client close does not do
-    # this for zstd: the router writes no zstd data until the last part, so
-    # it does not see the close before the stream ends.
+    # and must free the stream of the response.
     decode = decoder(encoding)
     setup_compression(encoding, limits={"timeout": 1})
 
@@ -338,6 +403,26 @@ def test_python_compression_app_timeout(encoding):
     time.sleep(1)
 
     assert check(2001, encoding, decode) is None, 'response after the timeout'
+
+
+@pytest.mark.parametrize('encoding', ENCODINGS)
+def test_python_compression_large_header(encoding):
+    # libunit sends a response buffer over 1024 bytes (the status, the field
+    # descriptors and the field bytes) to the router through shared memory.
+    # The WSGI module sends the headers with the first body write, so libunit
+    # puts the first body part into the same message, behind the fields.  The
+    # router must compress that part like the parts after it, and end the
+    # stream after the last part.  Before the fix, the first part went out
+    # uncompressed, and the stream had no end.  The large field must come
+    # back, which shows that the headers took the shared memory path.
+    decode = decoder(encoding)
+    setup_compression(encoding)
+
+    bad = check(
+        3001, encoding, decode, {'X-Pad': '2048'}, {'X-Pad': 'p' * 2048}
+    )
+
+    assert bad is None, bad
 
 
 # Large enough to reach the router through shared memory, so the compressor

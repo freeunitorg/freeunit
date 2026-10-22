@@ -732,6 +732,18 @@ nxt_conf_map_object(nxt_mp_t *mp, const nxt_conf_value_t *value,
                 break;
 
             case NXT_CONF_MAP_SIZE:
+                /*
+                 * The conversion of a number out of the range of ssize_t is
+                 * undefined.  A negative number in the range is defined: -1
+                 * gives SIZE_MAX.  A stored configuration from an earlier
+                 * version can have one (see nxt_conf_vldt_size()).
+                 */
+                if (nxt_slow_path(num < -(double) NXT_CONF_SIZE_BOUND
+                                  || num >= (double) NXT_CONF_SIZE_BOUND))
+                {
+                    return NXT_ERROR;
+                }
+
                 val.size = num;
                 len = sizeof(val.size);
                 break;

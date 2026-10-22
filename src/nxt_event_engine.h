@@ -250,6 +250,29 @@ typedef struct {
 } nxt_epoll_engine_t;
 
 
+#if (NXT_HAVE_SIGNALFD)
+
+/*
+ * The signalfd descriptor is non-blocking.  epoll may report it readable
+ * after another thread has consumed the signal, and then read() returns
+ * EAGAIN.  That is a spurious wakeup, not an error.
+ */
+
+nxt_inline nxt_bool_t
+nxt_epoll_signalfd_eagain(ssize_t n, int err)
+{
+    return (n == -1 && err == NXT_EAGAIN);
+}
+
+#if (NXT_TESTS)
+/* The signalfd read handler, for the signalfd test. */
+void nxt_epoll_test_signalfd_handler(nxt_task_t *task, nxt_fd_event_t *ev,
+    nxt_work_handler_t handler);
+#endif
+
+#endif
+
+
 extern const nxt_event_interface_t  nxt_epoll_edge_engine;
 extern const nxt_event_interface_t  nxt_epoll_level_engine;
 
@@ -519,7 +542,6 @@ struct nxt_event_engine_s {
 
     nxt_atomic_uint_t          accepted_conns_cnt;
     nxt_atomic_uint_t          idle_conns_cnt;
-    nxt_atomic_uint_t          active_conns_cnt;
     nxt_atomic_uint_t          closed_conns_cnt;
     nxt_atomic_uint_t          requests_cnt;
 

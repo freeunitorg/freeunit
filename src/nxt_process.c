@@ -5,6 +5,7 @@
  */
 
 #include <nxt_main.h>
+#include <nxt_usdt.h>
 
 #include <nxt_application.h>
 #include <nxt_cgroup.h>
@@ -139,20 +140,44 @@ nxt_process_new(nxt_runtime_t *rt)
 void
 nxt_process_use(nxt_task_t *task, nxt_process_t *process, int i)
 {
-    nxt_int_t      use_count;
-    nxt_bool_t     released;
-    nxt_runtime_t  *rt;
+    nxt_int_t          use_count;
+    nxt_bool_t         released;
+    nxt_runtime_t      *rt;
+    nxt_atomic_uint_t  c;
 
     rt = task->thread->runtime;
 
     /*
-     * The count is mutated from every engine thread, so it is serialized on
-     * rt->processes_mutex rather than made atomic: an atomic increment would
-     * still let a lookup take a reference on a process whose teardown has
-     * already started.  Dropping to zero therefore unlinks the process from
-     * rt->processes while the mutex is still held, which makes {find, ref}
-     * and {unref to zero, unlink} mutually exclusive.  The teardown itself
-     * runs after the unlock -- it takes other locks and must not nest.
+     * A drop that leaves at least one reference takes no lock.  The
+     * compare-and-swap never stores zero, so the count still reaches zero
+     * only under rt->processes_mutex, in the critical section below that
+     * unlinks the process.  A lookup that finds the process under the mutex
+     * therefore still sees a count of one or more, as before.  The
+     * compare-and-swap is a full barrier: the accesses of this thread to
+     * the process happen before the teardown that the last drop starts.
+     */
+
+    if (i < 0) {
+        c = nxt_atomic_load(&process->use_count);
+
+        while ((nxt_atomic_int_t) c > -i) {
+            if (nxt_atomic_cmp_set(&process->use_count, c, c + i)) {
+                return;
+            }
+
+            c = nxt_atomic_load(&process->use_count);
+        }
+    }
+
+    /*
+     * The count is mutated from every engine thread.  Every change other
+     * than the drop above is serialized on rt->processes_mutex: a lock-free
+     * drop to zero would let a lookup take a reference on a process whose
+     * teardown has already started.  Dropping to zero therefore unlinks the
+     * process from rt->processes while the mutex is still held, which makes
+     * {find, ref} and {unref to zero, unlink} mutually exclusive.  The
+     * teardown itself runs after the unlock -- it takes other locks and must
+     * not nest.
      *
      * This makes rt->processes_mutex reachable from any nxt_port_use()
      * that drops a last port reference, including callers that already hold
@@ -167,8 +192,7 @@ nxt_process_use(nxt_task_t *task, nxt_process_t *process, int i)
 
     nxt_thread_mutex_lock(&rt->processes_mutex);
 
-    process->use_count += i;
-    use_count = process->use_count;
+    use_count = (nxt_int_t) (nxt_atomic_fetch_add(&process->use_count, i) + i);
 
     /*
      * A second drop to zero is not detectable from use_count or registered
@@ -798,6 +822,9 @@ nxt_process_create(nxt_task_t *task, nxt_process_t *process)
         return pid;
     }
 #endif
+
+    /* The global pid of the child, also with pid isolation. */
+    NXT_USDT(process__spawn, pid);
 
     process->pid = pid;
     process->isolated_pid = pid;

@@ -51,5 +51,43 @@ struct nxt_unit_request_s {
 };
 
 
+/*
+ * The request is shared memory: the router parses it where libunit wrote it.
+ * The 44 bytes before content_length are four-byte aligned on every target.
+ * The offset of content_length then depends on the alignment of uint64_t in
+ * a structure: four bytes on i386 and eight bytes on the other targets.  The
+ * numbers are absolute, so a consumer that is built with another alignment
+ * rule, for example gcc -malign-double on i386, fails the build.  A target
+ * with another rule needs its own numbers here.
+ */
+nxt_unit_layout_assert(request_authorization_field,
+                       offsetof(nxt_unit_request_t, authorization_field) == 40,
+                       "nxt_unit_request_t: authorization_field moved");
+
+#if defined(__i386__)
+
+nxt_unit_layout_assert(request_content_length,
+                       offsetof(nxt_unit_request_t, content_length) == 44,
+                       "nxt_unit_request_t: content_length moved");
+nxt_unit_layout_assert(request_size, sizeof(nxt_unit_request_t) == 92,
+                       "nxt_unit_request_t: an sptr or the size moved");
+
+#else
+
+nxt_unit_layout_assert(request_content_length,
+                       offsetof(nxt_unit_request_t, content_length) == 48,
+                       "nxt_unit_request_t: content_length moved");
+nxt_unit_layout_assert(request_size, sizeof(nxt_unit_request_t) == 96,
+                       "nxt_unit_request_t: an sptr or the size moved");
+
+#endif
+
+nxt_unit_layout_assert(request_method,
+                       offsetof(nxt_unit_request_t, method)
+                       == offsetof(nxt_unit_request_t, content_length)
+                          + sizeof(uint64_t),
+                       "nxt_unit_request_t: method moved");
+
+
 #endif /* _NXT_UNIT_REQUEST_H_INCLUDED_ */
 

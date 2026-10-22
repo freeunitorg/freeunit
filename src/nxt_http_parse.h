@@ -60,7 +60,6 @@ struct nxt_http_request_parse_s {
     nxt_http_ver_t            version;
 
     nxt_http_field_t          inline_fields[16];
-    uint8_t                   num_inline_fields;
 
     nxt_list_t                *fields;
     nxt_mp_t                  *mem_pool;
@@ -85,6 +84,12 @@ struct nxt_http_request_parse_s {
 #endif
     /* Preserve encoded '/' (%2F) and '%' (%25). */
     uint8_t                   encoded_slashes;        /* 1 bit */
+
+    /*
+     * After the flags, not in front of "fields": a byte there leaves seven
+     * bytes of padding.
+     */
+    uint8_t                   num_inline_fields;
 };
 
 

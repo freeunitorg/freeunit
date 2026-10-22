@@ -21,6 +21,17 @@ prerequisites = {'modules': {'python': 'any'}}
 client = ApplicationPython()
 
 
+def build_define(header, name):
+    """A number that ./configure wrote for the unitd under test.  The
+    interpreter that runs the tests can have another width."""
+
+    path = Path(option.current_dir) / 'build/include' / header
+    found = re.search(fr'^#define {name}\s+(\d+)$', path.read_text(), re.M)
+    assert found is not None, f'{name} in {header}'
+
+    return int(found.group(1))
+
+
 def sysctl():
     try:
         out = subprocess.check_output(
@@ -84,15 +95,143 @@ def test_settings_large_header_buffers():
     big_headers(9, 431)
 
 
-@pytest.mark.skip('not yet')
-def test_settings_large_header_buffer_invalid():
-    def check_error(conf):
-        assert 'error' in client.conf({'http': conf}, 'settings')
+def test_settings_size_validation():
+    client.load('empty')
 
-    check_error({'large_header_buffer_size': -1})
-    check_error({'large_header_buffer_size': 0})
-    check_error({'large_header_buffers': -1})
-    check_error({'large_header_buffers': 0})
+    # The router maps each size to ssize_t (NXT_CONF_SIZE_BOUND).
+    size_t_size = build_define('nxt_auto_config.h', 'NXT_SIZE_T_SIZE')
+    bound = 2 ** (size_t_size * 8 - 1)
+
+    if bound == 2**31:
+        largest = bound - 1
+    else:
+        # The JSON parser refuses 2^63 itself: it is too long.
+        largest = 2**40
+
+    def http(name, value):
+        return {'http': {name: value}}
+
+    def compression(_, value):
+        compressor = {'encoding': 'identity', 'min_length': value}
+
+        return {
+            'http': {
+                'compression': {
+                    'types': ['text/plain'],
+                    'compressors': compressor,
+                }
+            }
+        }
+
+    members = [
+        ('large_header_buffer_size', 'settings', http),
+        ('large_header_buffers', 'settings', http),
+        ('body_buffer_size', 'settings', http),
+        ('max_body_size', 'settings', http),
+        (
+            'max_frame_size',
+            'settings',
+            lambda n, v: {'http': {'websocket': {n: v}}},
+        ),
+        ('min_length', 'settings', compression),
+        ('shm', 'applications/empty/limits', lambda n, v: {n: v}),
+    ]
+
+    try:
+        for name, url, conf in members:
+            resp = client.conf(conf(name, -1), url)
+            assert 'error' in resp, f'{name} -1'
+            assert 'must not be negative' in resp['detail'], name
+
+            resp = client.conf(conf(name, bound), url)
+            assert 'error' in resp, f'{name} {bound}'
+
+            if bound == 2**31:
+                assert f'must be less than {bound}.' in resp['detail'], name
+
+            assert 'error' in client.conf(conf(name, 1.5), url), name
+
+            # The application restarts with each "shm" limit: keep it usable.
+            if name == 'shm':
+                accepted = (100 * 1024 * 1024,)
+            else:
+                accepted = (0, largest)
+
+            for value in accepted:
+                assert 'success' in client.conf(
+                    conf(name, value), url
+                ), f'{name} {value}'
+
+    finally:
+        # The default no-restart suite preserves /settings between tests.
+        client.conf_delete('settings/http')
+
+
+STORED_CONF = {
+    'listeners': {'*:8080': {'pass': 'routes'}},
+    'routes': [{'action': {'return': 204}}],
+    'settings': {'http': {'max_body_size': -1}},
+}
+
+
+def run_with_stored_conf(version):
+    """Start unitd on a state directory that an earlier version wrote."""
+
+    unit_stop()
+
+    statedir = Path(tempfile.mkdtemp(prefix='unit-state-'))
+
+    (statedir / 'conf.json').write_text(
+        json.dumps(port_map.expected(STORED_CONF))
+    )
+
+    if version is not None:
+        (statedir / 'version').write_text(str(version))
+
+    unit_run(state_dir=str(statedir))
+
+    return statedir
+
+
+@pytest.mark.parametrize('version', [13700, None])
+def test_settings_size_negative_stored(
+    requires_restart, version, wait_for_record
+):
+    """Earlier versions accepted a negative size.  unitd still loads a
+    stored configuration with one, whatever its version file says, and the
+    control API refuses a new one."""
+
+    statedir = run_with_stored_conf(version)
+
+    try:
+        assert (
+            client.conf_get('settings/http/max_body_size') == -1
+        ), 'stored configuration loaded'
+        assert client.get()['status'] == 204, 'stored configuration runs'
+
+        assert wait_for_record(
+            r'\[warn\].+the restored configuration has a negative '
+            r'"max_body_size" at "/settings/http/max_body_size"'
+        ), 'warning'
+
+        # The control API validates the whole configuration.
+        resp = client.conf([{'action': {'return': 200}}], 'routes')
+        assert 'error' in resp, 'update refused'
+        assert 'must not be negative' in resp['detail']
+        assert resp['location']['path'] == '/settings/http/max_body_size'
+        assert client.get()['status'] == 204, 'configuration kept'
+
+        assert 'success' in client.conf(
+            '1048576', 'settings/http/max_body_size'
+        ), 'corrected'
+        assert 'success' in client.conf(
+            [{'action': {'return': 200}}], 'routes'
+        ), 'update after the correction'
+        assert client.get()['status'] == 200
+
+    finally:
+        unit_stop()
+        shutil.rmtree(statedir, ignore_errors=True)
 
 
 def test_settings_server_version():
@@ -114,7 +253,7 @@ def test_settings_server_version():
 def test_settings_header_read_timeout():
     client.load('empty')
 
-    def req():
+    def req(expect_408=False):
         (_, sock) = client.http(
             b"""GET / HTTP/1.1
 """,
@@ -123,6 +262,23 @@ def test_settings_header_read_timeout():
             raw=True,
         )
 
+        if expect_408:
+            # header_read_timeout answers by itself: the timer callback writes
+            # "408 Request Timeout" and closes (nxt_h1p_request_timedout(),
+            # src/nxt_h1proto.c).  The rest of the header is not what makes
+            # the server answer, so read that response instead of sleeping
+            # past the timer and then writing into a connection the server
+            # has already finished with.  15s bounds a timer that never fires
+            # to a failure here, not to recvall()'s 60s default.
+            resp = client.http(b'', sock=sock, raw=True, read_timeout=15)
+
+            assert 'status' in resp, f'no response before the timer: {resp}'
+
+            return resp
+
+        # The second half asserts that the *new* value took effect: the rest
+        # of the header must arrive after the old 2s boundary and still be
+        # served, so this sleep has to outlast that boundary.
         time.sleep(3)
 
         return client.http(
@@ -137,7 +293,7 @@ Connection: close
     assert 'success' in client.conf(
         {'http': {'header_read_timeout': 2}}, 'settings'
     )
-    assert req()['status'] == 408, 'status header read timeout'
+    assert req(expect_408=True)['status'] == 408, 'status header read timeout'
 
     assert 'success' in client.conf(
         {'http': {'header_read_timeout': 7}}, 'settings'
@@ -200,7 +356,7 @@ def test_settings_header_read_timeout_update():
 def test_settings_body_read_timeout():
     client.load('empty')
 
-    def req():
+    def req(expect_408=False):
         (_, sock) = client.http(
             b"""POST / HTTP/1.1
 Host: localhost
@@ -214,6 +370,18 @@ Connection: close
             raw=True,
         )
 
+        if expect_408:
+            # body_read_timeout is a gap timer that starts with the body read
+            # state (src/nxt_h1proto.c), so the 408 arrives with no body ever
+            # sent.  Read it, for the same reason as the header test above.
+            resp = client.http(b'', sock=sock, raw=True, read_timeout=15)
+
+            assert 'status' in resp, f'no response before the timer: {resp}'
+
+            return resp
+
+        # The body has to arrive after the old 2s boundary and still be
+        # served, so that the assertion below is about the new value.
         time.sleep(3)
 
         return client.http(b"""0123456789""", sock=sock, raw=True)
@@ -221,7 +389,7 @@ Connection: close
     assert 'success' in client.conf(
         {'http': {'body_read_timeout': 2}}, 'settings'
     )
-    assert req()['status'] == 408, 'status body read timeout'
+    assert req(expect_408=True)['status'] == 408, 'status body read timeout'
 
     assert 'success' in client.conf(
         {'http': {'body_read_timeout': 7}}, 'settings'
@@ -1237,13 +1405,26 @@ def test_settings_timeout_stored(
 def test_settings_idle_timeout():
     client.load('empty')
 
-    def req():
+    def req(expect_408=False):
         (_, sock) = client.get(
             headers={'Host': 'localhost', 'Connection': 'keep-alive'},
             start=True,
             read_timeout=1,
         )
 
+        if expect_408:
+            # The idle timer writes "408 Request Timeout" and closes by
+            # itself (nxt_h1p_idle_timeout() -> nxt_h1p_idle_response(),
+            # src/nxt_h1proto.c); the next request is not what produces it.
+            # Read it instead of sleeping past the timer.
+            resp = client.http(b'', sock=sock, raw=True, read_timeout=15)
+
+            assert 'status' in resp, f'no response before the timer: {resp}'
+
+            return resp
+
+        # The second half needs the new value to take effect: the next request
+        # must arrive after the old 2s boundary and still be served.
         time.sleep(3)
 
         return client.get(sock=sock)
@@ -1251,7 +1432,7 @@ def test_settings_idle_timeout():
     assert client.get()['status'] == 200, 'init'
 
     assert 'success' in client.conf({'http': {'idle_timeout': 2}}, 'settings')
-    assert req()['status'] == 408, 'status idle timeout'
+    assert req(expect_408=True)['status'] == 408, 'status idle timeout'
 
     assert 'success' in client.conf({'http': {'idle_timeout': 7}}, 'settings')
     assert req()['status'] == 200, 'status idle timeout 2'
@@ -1260,8 +1441,17 @@ def test_settings_idle_timeout():
 def test_settings_idle_timeout_2():
     client.load('empty')
 
-    def req():
+    def req(expect_408=False):
         sock = client.http(b'', raw=True, no_recv=True)
+
+        if expect_408:
+            # Nothing was written on the connection, so the accepted-socket
+            # state's timer is the one that fires and answers, as above.
+            resp = client.http(b'', sock=sock, raw=True, read_timeout=15)
+
+            assert 'status' in resp, f'no response before the timer: {resp}'
+
+            return resp
 
         time.sleep(3)
 
@@ -1270,7 +1460,7 @@ def test_settings_idle_timeout_2():
     assert client.get()['status'] == 200, 'init'
 
     assert 'success' in client.conf({'http': {'idle_timeout': 1}}, 'settings')
-    assert req()['status'] == 408, 'status idle timeout'
+    assert req(expect_408=True)['status'] == 408, 'status idle timeout'
 
     assert 'success' in client.conf({'http': {'idle_timeout': 7}}, 'settings')
     assert req()['status'] == 200, 'status idle timeout 2'
@@ -1311,13 +1501,6 @@ def test_settings_max_body_size_large():
     resp = client.post(body=body, read_buffer_size=1024 * 1024)
     assert resp['status'] == 200, 'status size 32'
     assert resp['body'] == body, 'status body 32'
-
-
-@pytest.mark.skip('not yet')
-def test_settings_negative_value():
-    assert 'error' in client.conf(
-        {'http': {'max_body_size': -1}}, 'settings'
-    ), 'settings negative value'
 
 
 def test_settings_body_buffer_size():

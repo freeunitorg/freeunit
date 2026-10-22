@@ -176,6 +176,17 @@ on each pull request.
 
 (clang-ast static analysis is Docker-only — see the section below.)
 
+### Shell scripts
+
+`test/run-local.sh` and `test/run-local-full.sh` are POSIX sh, and so are the
+other tracked `#!/bin/sh` scripts. `Lint (shell)` runs
+`.github/scripts/lint-shell.sh`, which checks them with
+`shellcheck -s sh -S warning` and `dash -n`. The same job runs
+`test/unitc/argv_test.sh`, which stubs `curl`, `docker`, `ssh` and `ps` and
+asserts the `tools/unitc` control-target argv for the local socket,
+`docker://`, `ssh://` and `http://` on the PUT path, and for GET and DELETE
+under `script(1)`. CI runs both on every pull request.
+
 ## Static analysis (clang-ast)
 
 `./test/run-local-full.sh` runs the C build under the
@@ -242,11 +253,15 @@ test/
 GitHub Actions runs the tests in `.github/workflows/build-test.yml`. The
 language versions come from `pkg/eol.json`.
 
-- A push to `master` runs every version of every runtime.
+- A push to `master` runs every version of every runtime, except Node.js and
+  Java. Those two run the oldest supported version, the newest version and,
+  when it is neither of those, the newest LTS: Node.js 22 and 26, Java 17, 25
+  and 27 today.
 - A pull request runs every Python version, Perl, WASM and WASI, and one
   version each of Go, Java, Node.js, PHP and Ruby. A runtime whose own files
-  change gets every version. A change to `pkg/eol.json`, to `build-test.yml`
-  or to `.github/scripts/test-matrix.sh` gives the full matrix. So does the
+  change gets every version, except Node.js and Java, which get the legs
+  above. A change to `pkg/eol.json`, to `build-test.yml` or to
+  `.github/scripts/test-matrix.sh` gives the full matrix. So does the
   `ci-full` label on the pull request.
 
 `.github/scripts/test-matrix.sh` has the rules and the version that a pull

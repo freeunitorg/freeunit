@@ -1012,6 +1012,90 @@ paths:
         "404":
           $ref: "#/components/responses/responseNotFound"
 
+  /config/access_log/if:
+    summary: "Endpoint for the `if` access log option"
+    get:
+      operationId: getAccessLogIf
+      summary: "Retrieve the access log if option"
+      description: "Retrieves the `if` option that represents the condition a
+        request must meet to be
+        [logged](https://unit.nginx.org/configuration/#access-log)
+        in the `access_log` object."
+
+      tags:
+        - access log
+        - config
+
+      responses:
+        "200":
+          description: "OK; the `if` option exists in the configuration."
+
+          content:
+            application/json:
+              schema:
+                type: string
+
+              examples:
+                if:
+                  value: "`${vars.status != 200}`"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+    put:
+      operationId: updateAccessLogIf
+      summary: "Create or overwrite the access log if option"
+      description: "Creates or overwrites the `if` option in the `access_log`
+        object. A request is logged when the condition renders to anything
+        other than an empty string, `0`, `false`, `null`, or `undefined`; a
+        leading `!` negates the result. A condition that cannot be rendered,
+        such as a JS expression that throws, is not true: the request is not
+        logged. A JS expression that throws is reported in the error log."
+
+      tags:
+        - access log
+        - config
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: string
+
+            examples:
+              if:
+                value: "`${vars.status != 200}`"
+
+      responses:
+        "200":
+          $ref: "#/components/responses/responseOkUpdated"
+
+        "400":
+          $ref: "#/components/responses/responseBadRequest"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+        "500":
+          $ref: "#/components/responses/responseInternalError"
+
+    delete:
+      operationId: deleteAccessLogIf
+      summary: "Delete the access log if option"
+      description: "Deletes the `if` option from the `access_log` object;
+        every request is logged again."
+      tags:
+        - access log
+        - config
+
+      responses:
+        "200":
+          $ref: "#/components/responses/responseOkDeleted"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
   /config/access_log/path:
     summary: "Endpoint for the `path` access log option"
     get:
@@ -5399,6 +5483,89 @@ paths:
                 Closed:
                   value: 1307
 
+  /status/access_log:
+    summary: "Endpoint for the `access_log` status object"
+    get:
+      operationId: getStatusAccessLog
+      summary: "Retrieve the access log status object"
+      description: "Retrieves the `access_log` status object that represents
+        the access log's write health."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `access_log` object exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/statusAccessLog"
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/statusAccessLog"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /status/access_log/path:
+    summary: "Endpoint for the access log path"
+    get:
+      operationId: getStatusAccessLogPath
+      summary: "Retrieve the access log path"
+      description: "Retrieves the path of the configured access log."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `path` string exists in the configuration."
+
+          content:
+            application/json:
+              schema:
+                type: string
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/statusAccessLogPath"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /status/access_log/lost:
+    summary: "Endpoint for the lost access log records number"
+    get:
+      operationId: getStatusAccessLogLost
+      summary: "Retrieve the lost access log records number"
+      description: "Retrieves the number of access log records dropped
+        because the record could not be built or the write did not
+        complete."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `lost` number exists in the configuration."
+
+          content:
+            application/json:
+              schema:
+                type: integer
+                format: int64
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/statusAccessLogLost"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
   /status/telemetry:
     summary: "Endpoint for the `telemetry` status object"
     get:
@@ -6600,6 +6767,9 @@ components:
           closed: 1050
         requests:
           total: 1307
+        access_log:
+          path: "/var/log/unit/access.log"
+          lost: 0
         telemetry:
           spans:
             exported: 4096
@@ -6711,6 +6881,21 @@ components:
       summary: "Regular requests status object"
       value:
         total: 1307
+
+    # /status/access_log
+    statusAccessLog:
+      summary: "Regular access log status object"
+      value:
+        path: "/var/log/unit/access.log"
+        lost: 0
+
+    statusAccessLogPath:
+      summary: "Path of the configured access log"
+      value: "/var/log/unit/access.log"
+
+    statusAccessLogLost:
+      summary: "Access log records dropped by the writer"
+      value: 0
 
     # /status/telemetry
     statusTelemetry:
@@ -7024,6 +7209,17 @@ components:
 
           default: '$remote_addr - - [$time_local] "$request_line" $status
             $body_bytes_sent "$header_referer" "$header_user_agent"'
+
+        if:
+          description: "Condition that must be true for a request to be
+            logged. The value is a template string; it is false when it
+            renders to an empty string, `0`, `false`, `null`, or
+            `undefined`, and true otherwise. A leading `!` negates the
+            result. A condition that cannot be rendered, such as a JS
+            expression that throws, is not true: the request is not logged.
+            A JS expression that throws is reported in the error log."
+
+          type: string
 
         path:
           type: string
@@ -8041,6 +8237,16 @@ components:
         in Unit."
 
       properties:
+        body_buffer_size:
+          type: integer
+          format: int64
+          minimum: 0
+          description: "Maximum number of bytes of a client’s request body
+            that Unit keeps in memory.  A larger body is stored in a
+            temporary file.  On 32-bit platforms, less than 2147483648."
+
+          default: 16384
+
         body_min_rate:
           type: integer
           minimum: 0
@@ -8098,6 +8304,26 @@ components:
 
           default: 180
 
+        large_header_buffer_size:
+          type: integer
+          format: int64
+          minimum: 0
+          description: "Size in bytes of each buffer for a request header
+            that does not fit in the first 2048 bytes.  A header field must
+            fit in one buffer.  On 32-bit platforms, less than 2147483648."
+
+          default: 8192
+
+        large_header_buffers:
+          type: integer
+          format: int64
+          minimum: 0
+          description: "Maximum number of buffers of
+            `large_header_buffer_size` bytes for a request header.
+            On 32-bit platforms, less than 2147483648."
+
+          default: 4
+
         log_route:
           type: boolean
           description: "Enables or disables router logging."
@@ -8105,8 +8331,10 @@ components:
 
         max_body_size:
           type: integer
+          format: int64
+          minimum: 0
           description: "Maximum number of bytes in the body of a
-            client’s request."
+            client’s request.  On 32-bit platforms, less than 2147483648."
 
           default: 8388608
 
@@ -8198,7 +8426,10 @@ components:
 
           min_length:
             type: integer
-            description: "Minimum amount of data to consider for compressing."
+            format: int64
+            minimum: 0
+            description: "Minimum amount of data to consider for compressing.
+              On 32-bit platforms, less than 2147483648."
 
     # /config/settings/http/compression/compressors/{arrayIndex}/encoding
     configSettingsHttpCompressionCompressorsCompressorEncoding:
@@ -8213,8 +8444,11 @@ components:
     # /config/settings/http/compression/compressors/{arrayIndex}/min_length
     configSettingsHttpCompressionCompressorsCompressorMinLength:
       type: integer
+      format: int64
+      minimum: 0
       description: "An integer describing the minimum length of data to
-        consider ofr compression."
+        consider ofr compression.  On 32-bit platforms, less than
+        2147483648."
 
     # /config/settings/http/static
     configSettingsHttpStatic:
@@ -8254,6 +8488,9 @@ components:
 
         requests:
           $ref: "#/components/schemas/statusRequests"
+
+        access_log:
+          $ref: "#/components/schemas/statusAccessLog"
 
         telemetry:
           $ref: "#/components/schemas/statusTelemetry"
@@ -8354,6 +8591,24 @@ components:
           type: integer
           format: int64
           description: "Total non-API requests during the instance’s lifetime."
+
+    # /status/access_log
+    statusAccessLog:
+      description: "Represents the access log's write health. The object is
+        omitted unless the configuration has an access log, so its absence is
+        how a client tells a log that is off from a log that lost nothing."
+      type: object
+      properties:
+        path:
+          type: string
+          description: "Path of the configured access log."
+
+        lost:
+          type: integer
+          format: int64
+          description: "Records dropped because the record could not be
+            built or the write did not complete. Cumulative for the live
+            log."
 
     # /status/telemetry
     statusTelemetry:

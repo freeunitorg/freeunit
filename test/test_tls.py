@@ -1,8 +1,10 @@
 import io
 import os
+import re
 import shutil
 import socket
 import ssl
+import struct
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -1603,3 +1605,345 @@ def test_tls_certificate_cstring_nul():
 
     resp = conf_cert(["default\0junk"])
     assert 'null character' in resp.get('detail', ''), 'array nul'
+
+
+def test_tls_handshake_old_version_log_level(wait_for_record, findall):
+    client.certificate()
+
+    resp = client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "routes",
+                    "tls": {
+                        "certificate": "default",
+                        "conf_commands": {"MinProtocol": "TLSv1.2"},
+                    },
+                }
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    )
+
+    if 'built without' in resp.get('detail', ''):
+        pytest.skip('built without conf_commands support')
+
+    assert 'success' in resp, 'load application configuration'
+
+    # A TLS 1.0 ClientHello with no extensions, as scanners send.  The
+    # server refuses it with "unsupported protocol" (258) or "version too
+    # low" (396) on OpenSSL, and "wrong version number" (267) on LibreSSL.
+    # All are the peer's fault and are logged at info.
+    # MinProtocol makes the server refuse TLS 1.0 whatever the library or
+    # distribution default is.
+    ciphers = b'\x00\x2f\xc0\x13'
+    body = (
+        b'\x03\x01'
+        + os.urandom(32)
+        + b'\x00'
+        + len(ciphers).to_bytes(2, 'big')
+        + ciphers
+        + b'\x01\x00'
+    )
+    handshake = b'\x01' + len(body).to_bytes(3, 'big') + body
+    record = b'\x16\x03\x01' + len(handshake).to_bytes(2, 'big') + handshake
+
+    with socket.create_connection(
+        ('127.0.0.1', port_map.port(8080)), timeout=5
+    ) as sock:
+        sock.sendall(record)
+        try:
+            sock.recv(1024)
+        except OSError:
+            pass
+
+    pattern = r'SSL_do_handshake.*(unsupported protocol|version too low|wrong version number)'
+
+    assert wait_for_record(rf'\[info\].*{pattern}') is not None
+    assert not findall(rf'\[alert\].*{pattern}')
+
+
+def test_tls_handshake_no_supported_groups_log_level(wait_for_record, findall):
+    client.certificate()
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "routes",
+                    "tls": {"certificate": "default"},
+                }
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    ), 'load application configuration'
+
+    # A TLS 1.3 ClientHello with a key share and no supported_groups
+    # extension, which RFC 8446 requires.  OpenSSL refuses it with
+    # "missing supported groups extension" (209): the client left the
+    # extension out, so the router logs it at info, not alert.
+    def ext(kind, data):
+        return kind.to_bytes(2, 'big') + len(data).to_bytes(2, 'big') + data
+
+    share = b'\x00\x1d' + (32).to_bytes(2, 'big') + os.urandom(32)
+    sigalgs = b'\x04\x03\x08\x04\x04\x01'
+    exts = (
+        ext(0x002B, b'\x02\x03\x04')  # supported_versions: TLS 1.3
+        + ext(0x000D, len(sigalgs).to_bytes(2, 'big') + sigalgs)
+        + ext(0x0033, len(share).to_bytes(2, 'big') + share)  # key_share
+    )
+    ciphers = b'\x13\x01\x13\x02'
+    body = (
+        b'\x03\x03'
+        + os.urandom(32)
+        + b'\x00'
+        + len(ciphers).to_bytes(2, 'big')
+        + ciphers
+        + b'\x01\x00'
+        + len(exts).to_bytes(2, 'big')
+        + exts
+    )
+    handshake = b'\x01' + len(body).to_bytes(3, 'big') + body
+    record = b'\x16\x03\x01' + len(handshake).to_bytes(2, 'big') + handshake
+
+    with socket.create_connection(
+        ('127.0.0.1', port_map.port(8080)), timeout=5
+    ) as sock:
+        sock.sendall(record)
+        try:
+            sock.recv(1024)
+        except OSError:
+            pass
+
+    pattern = r'SSL_do_handshake.*missing supported groups extension'
+
+    # LibreSSL has no reason 209 and refuses the hello for another reason.
+    assert wait_for_record(r'SSL_do_handshake') is not None
+    if not findall(pattern):
+        pytest.skip('the TLS library has no "missing supported groups"')
+
+    assert findall(rf'\[info\].*{pattern}')
+    assert not findall(rf'\[alert\].*{pattern}')
+
+
+def test_tls_handshake_bad_binder_log_level(temp_dir, wait_for_record, findall):
+    client.certificate()
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "routes",
+                    "tls": {
+                        "certificate": "default",
+                        "session": {"cache_size": 10, "tickets": True},
+                    },
+                }
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    ), 'load application configuration'
+
+    # A TLS 1.3 resumption whose binder does not verify.  The client saves
+    # a session, one byte of its resumption secret is changed, and the
+    # client resumes with it.  The server refuses the binder (253): the
+    # client sent it, so the router logs it at info, not alert.
+    connect = f'127.0.0.1:{port_map.port(8080)}'
+    good = f'{temp_dir}/session.pem'
+    bad = f'{temp_dir}/session-bad.pem'
+
+    def s_client(*args):
+        return subprocess.run(
+            ['openssl', 's_client', '-connect', connect, '-tls1_3', '-ign_eof']
+            + list(args),
+            input=b'GET / HTTP/1.0\r\n\r\n',
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+
+    s_client('-sess_out', good)
+
+    text = subprocess.check_output(
+        ['openssl', 'sess_id', '-in', good, '-text', '-noout']
+    ).decode()
+    # LibreSSL labels the field "Master-Key" and does not resume TLS 1.3
+    # sessions with a PSK, so there is no binder to refuse.
+    m = re.search(r'Resumption PSK: ([0-9A-F]+)', text)
+    if m is None:
+        pytest.skip('the TLS library offers no TLS 1.3 resumption PSK')
+
+    psk = bytes.fromhex(m.group(1))
+
+    der = subprocess.check_output(
+        ['openssl', 'sess_id', '-in', good, '-outform', 'DER']
+    )
+    i = der.find(psk)
+    assert i > 0, 'resumption secret in the session'
+
+    der = der[:i] + bytes([der[i] ^ 1]) + der[i + 1 :]
+    subprocess.run(
+        ['openssl', 'sess_id', '-inform', 'DER', '-out', bad],
+        input=der,
+        check=True,
+    )
+
+    s_client('-sess_in', bad)
+
+    pattern = r'SSL_do_handshake.*binder does not verify'
+
+    assert wait_for_record(rf'\[info\].*{pattern}') is not None
+    assert not findall(rf'\[alert\].*{pattern}')
+
+
+def tls_alert_in_handshake(alert):
+    # Stop the server in SSL_do_handshake() with a fatal alert from the
+    # client.  The alert goes before ChangeCipherSpec, so it is a plaintext
+    # record and needs no TLS stack on the client.  The server turns alert N
+    # into reason SSL_AD_REASON_OFFSET + N (1000 + N).
+
+    client.certificate()
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "routes",
+                    "tls": {"certificate": "default"},
+                }
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    ), 'load configuration'
+
+    def ext(ext_type, data):
+        length = len(data).to_bytes(2, 'big')
+        return ext_type.to_bytes(2, 'big') + length + data
+
+    # A TLS 1.2 ClientHello: no supported_versions extension, ECDHE and
+    # RSA key exchange suites for the RSA default certificate.
+    ciphers = b'\xc0\x2f\xc0\x13\x00\x9c\x00\x2f'
+    extensions = (
+        ext(0x000A, b'\x00\x04\x00\x1d\x00\x17')  # x25519, secp256r1
+        + ext(0x000B, b'\x01\x00')  # uncompressed points
+        + ext(0x000D, b'\x00\x04\x08\x04\x04\x01')  # rsa_pss, rsa_pkcs1
+    )
+    body = (
+        b'\x03\x03'
+        + os.urandom(32)
+        + b'\x00'
+        + len(ciphers).to_bytes(2, 'big')
+        + ciphers
+        + b'\x01\x00'
+        + len(extensions).to_bytes(2, 'big')
+        + extensions
+    )
+    hello = b'\x01' + len(body).to_bytes(3, 'big') + body
+    record = b'\x16\x03\x01' + len(hello).to_bytes(2, 'big') + hello
+
+    def recv_exact(sock, n):
+        data = b''
+
+        while len(data) < n:
+            chunk = sock.recv(n - len(data))
+            assert chunk, 'connection closed in the first flight'
+            data += chunk
+
+        return data
+
+    with socket.create_connection(
+        ('127.0.0.1', port_map.port(8080)), timeout=5
+    ) as sock:
+        sock.sendall(record)
+
+        # Read the first flight up to ServerHelloDone, so that the server
+        # waits for the next client flight when the alert comes.
+        handshake = b''
+        done = False
+
+        while not done:
+            rtype, _, length = struct.unpack('!BHH', recv_exact(sock, 5))
+            payload = recv_exact(sock, length)
+
+            assert rtype == 0x16, f'record type {rtype} in the first flight'
+
+            handshake += payload
+
+            while len(handshake) >= 4:
+                mlen = int.from_bytes(handshake[1:4], 'big')
+
+                if len(handshake) < 4 + mlen:
+                    break
+
+                done = done or handshake[0] == 14  # ServerHelloDone
+                handshake = handshake[4 + mlen :]
+
+        sock.sendall(b'\x15\x03\x03\x00\x02\x02' + bytes([alert]))
+
+        try:
+            while sock.recv(1024):
+                pass
+        except OSError:
+            pass
+
+
+@pytest.mark.parametrize(
+    'alert, text',
+    [
+        (10, 'unexpected message'),
+        (20, 'bad record mac'),
+        (21, 'decryption failed'),
+        (22, 'record overflow'),
+        (30, 'decompression failure'),
+        (40, 'handshake failure'),
+        (47, 'illegal parameter'),
+        (110, 'unsupported extension'),
+        (112, 'unrecognized name'),
+    ],
+)
+def test_tls_handshake_alert_info_log_level(
+    alert, text, findall, wait_for_record
+):
+    # nxt_openssl_log_error_level() logs an alert from the peer at info in
+    # two ways.  Alerts 10, 20, 21, 22, 30, 40 and 47 (reasons 1010 to 1047)
+    # are in the explicit info list.  unsupported_extension (110) and
+    # unrecognized_name (112), reasons 1110 and 1112, are in no list: an
+    # alert in the 1000..1255 range that is not listed is the peer's
+    # decision and reaches info through the range default.
+    tls_alert_in_handshake(alert)
+
+    pattern = (
+        rf'SSL_do_handshake\(\d+\) failed \({1000 + alert}: [^)]*{text}\)'
+    )
+
+    assert wait_for_record(rf'\[info\].*{pattern}') is not None, 'info'
+    assert not findall(rf'\[alert\].*{pattern}'), 'no alert'
+
+
+# The alerts listed at err in nxt_openssl_log_error_level(): the
+# certificate alerts (bad_certificate is 42) and the others that point at
+# the server's setup.  None of them may fall into the info default of the
+# alert range.
+#
+# The source guards 1111, 1113 and 1114 with #ifdef.  On a library that
+# does not define SSL_R_TLSV1_CERTIFICATE_UNOBTAINABLE,
+# SSL_R_TLSV1_BAD_CERTIFICATE_STATUS_RESPONSE or
+# SSL_R_TLSV1_BAD_CERTIFICATE_HASH_VALUE, that reason reaches the range
+# default and logs at info, so the 111, 113 or 114 case fails there
+# although the code is correct.
+@pytest.mark.parametrize(
+    'alert',
+    [41, 42, 43, 44, 45, 46, 48, 49, 50, 51, 60, 70, 71, 80, 90, 100]
+    + [111, 113, 114],
+)
+def test_tls_handshake_alert_err_log_level(alert, findall, wait_for_record):
+    tls_alert_in_handshake(alert)
+
+    pattern = rf'SSL_do_handshake\(\d+\) failed \({1000 + alert}: '
+
+    assert wait_for_record(rf'\[error\].*{pattern}') is not None, 'error'
+    assert not findall(rf'\[info\].*{pattern}'), 'no info'

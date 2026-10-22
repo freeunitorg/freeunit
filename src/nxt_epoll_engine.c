@@ -772,7 +772,7 @@ nxt_epoll_add_signal(nxt_event_engine_t *engine)
 static void
 nxt_epoll_signalfd_handler(nxt_task_t *task, void *obj, void *data)
 {
-    int                      n;
+    int                      n, err;
     nxt_fd_event_t           *ev;
     nxt_work_handler_t       handler;
     struct signalfd_siginfo  sfd;
@@ -782,19 +782,45 @@ nxt_epoll_signalfd_handler(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "signalfd handler");
 
-    n = read(ev->fd, &sfd, sizeof(struct signalfd_siginfo));
+    for ( ;; ) {
+        n = read(ev->fd, &sfd, sizeof(struct signalfd_siginfo));
+        err = nxt_errno;
 
-    nxt_debug(task, "read signalfd(%d): %d", ev->fd, n);
+        nxt_debug(task, "read signalfd(%d): %d", ev->fd, n);
 
-    if (n != sizeof(struct signalfd_siginfo)) {
-        nxt_alert(task, "read signalfd(%d) failed %E", ev->fd, nxt_errno);
-        return;
+        if (nxt_epoll_signalfd_eagain(n, err)) {
+            return;
+        }
+
+        if (n != sizeof(struct signalfd_siginfo)) {
+            if (n == -1) {
+                nxt_alert(task, "read signalfd(%d) failed %E", ev->fd, err);
+            } else {
+                nxt_alert(task, "read signalfd(%d) returned %d", ev->fd, n);
+            }
+
+            return;
+        }
+
+        nxt_debug(task, "signalfd(%d) signo:%d", ev->fd, sfd.ssi_signo);
+
+        handler(task, (void *) (uintptr_t) sfd.ssi_signo, NULL);
     }
-
-    nxt_debug(task, "signalfd(%d) signo:%d", ev->fd, sfd.ssi_signo);
-
-    handler(task, (void *) (uintptr_t) sfd.ssi_signo, NULL);
 }
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_signalfd_test.c. */
+
+void
+nxt_epoll_test_signalfd_handler(nxt_task_t *task, nxt_fd_event_t *ev,
+    nxt_work_handler_t handler)
+{
+    nxt_epoll_signalfd_handler(task, ev, handler);
+}
+
+#endif
 
 #endif
 

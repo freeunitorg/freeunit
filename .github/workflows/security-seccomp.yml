@@ -125,6 +125,34 @@ jobs:
       - name: Build FreeUnit python-3.13-slim image
         run: docker build -t freeunit:seccomp-test -f pkg/docker/Dockerfile.python-3.13-slim pkg/docker
 
+      # The image flags lost -D_FORTIFY_SOURCE in 1.35.3 and no check saw it:
+      # https://github.com/freeunitorg/freeunit/issues/757.  Copy the
+      # binaries out of the image and read them with the runner's binutils.
+      # unitd has no _chk imports: src/nxt_unix.h undefines _FORTIFY_SOURCE
+      # (https://github.com/freeunitorg/freeunit/issues/773).  The
+      # __memcpy_chk import of the python module proves that FORTIFY
+      # reaches the modules.
+      - name: Check the hardening of the FreeUnit image
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          d=$(mktemp -d)
+          c=$(docker create freeunit:seccomp-test)
+          docker cp "$c:/usr/sbin/unitd" "$d/unitd"
+          docker cp "$c:/usr/lib/unit/modules" "$d/modules"
+          docker rm "$c" > /dev/null
+          docker run --rm --entrypoint /usr/sbin/unitd freeunit:seccomp-test --version 2>&1 \
+            | grep -q -- '--hardening=default' || fail "unitd was not configured with --hardening=default"
+          export LC_ALL=C
+          readelf -lW "$d/unitd" | grep -q INTERP || fail "unitd: no PT_INTERP"
+          for f in "$d/unitd" "$d"/modules/*.unit.so; do
+            readelf -hW "$f" | grep -qE 'Type: +DYN' || fail "$f: not ET_DYN"
+            readelf -lW "$f" | grep -q GNU_RELRO || fail "$f: no GNU_RELRO"
+            readelf -dW "$f" | grep -qE '\(FLAGS\) +BIND_NOW' || fail "$f: no BIND_NOW"
+            [ "$(readelf -lW "$f" | awk '$1 == "GNU_STACK" { print $7 }')" = RW ] || fail "$f: GNU_STACK is not RW"
+            objdump -T "$f" | grep -q '__stack_chk_fail' || fail "$f: no __stack_chk_fail"
+          done
+          objdump -T "$d"/modules/python3*.unit.so | grep -q '__memcpy_chk' || fail "python module: no __memcpy_chk"
+
       - name: Run seccomp tests (FreeUnit image)
         run: bash test/security/seccomp/test-af-alg.sh freeunit:seccomp-test
 

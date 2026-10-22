@@ -82,6 +82,10 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           set -eux
+          # Bound apt for this job: a 30 s stall timeout per connection. Retries
+          # "3" matches apt's default. Error-Mode "any" makes apt update fail on
+          # a stalled mirror; without it apt update warns and exits 0.
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30"; APT::Update::Error-Mode "any";' > /etc/apt/apt.conf.d/80-ci-bounds
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates
 
@@ -185,6 +189,8 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           set -eux
+          # Bound apt as in build-trixie (see the step above).
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30"; APT::Update::Error-Mode "any";' > /etc/apt/apt.conf.d/80-ci-bounds
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates
 
@@ -316,6 +322,8 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           set -eux
+          # Bound apt as in build-trixie (see the step above).
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30"; APT::Update::Error-Mode "any";' > /etc/apt/apt.conf.d/80-ci-bounds
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates
 

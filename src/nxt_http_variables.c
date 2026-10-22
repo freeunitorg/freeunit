@@ -134,6 +134,79 @@ nxt_http_register_variables(void)
 }
 
 
+/*
+ * A variable that names a header that carries a credential by definition:
+ * Authorization, Proxy-Authorization, Cookie or Set-Cookie, after "header_"
+ * (a request header) or "response_header_" (a response header), the two
+ * prefixes that nxt_http_unknown_var_ref() resolves to a header.  The router
+ * warns about such a variable in an access log format.
+ *
+ * The comparison follows nxt_http_header_hash() for a request header and
+ * nxt_http_field_name_cmp() for a response header: a header name is matched
+ * without case, and '_' in the variable spelling means '-' in the header.
+ * The prefix is matched with memcmp(), as nxt_http_unknown_var_ref() does.
+ *
+ * This is a guardrail, not a proof.  A secret still reaches the log through
+ * $cookie_<name> (a value from the Cookie header), $arg_<name>, $args,
+ * $request_uri and $request_line (the query string), any header with another
+ * name, such as X-Api-Key, and an njs template, which reads a header through
+ * the request object.
+ */
+
+nxt_bool_t
+nxt_http_var_credential(const nxt_str_t *name)
+{
+    u_char                  c;
+    size_t                  i, length, prefix;
+    nxt_uint_t              n;
+    const nxt_str_t        *denied;
+    static const nxt_str_t  denied_names[] = {
+        nxt_string("authorization"),
+        nxt_string("proxy-authorization"),
+        nxt_string("cookie"),
+        nxt_string("set-cookie"),
+    };
+
+    if (nxt_str_start(name, "header_", 7)) {
+        prefix = 7;
+
+    } else if (nxt_str_start(name, "response_header_", 16)) {
+        prefix = 16;
+
+    } else {
+        return 0;
+    }
+
+    length = name->length - prefix;
+
+    for (n = 0; n < nxt_nitems(denied_names); n++) {
+        denied = &denied_names[n];
+
+        if (denied->length != length) {
+            continue;
+        }
+
+        for (i = 0; i < length; i++) {
+            c = name->start[prefix + i];
+
+            if (c == '_') {
+                c = '-';
+            }
+
+            if (nxt_lowcase(c) != denied->start[i]) {
+                break;
+            }
+        }
+
+        if (i == length) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
 nxt_int_t
 nxt_http_unknown_var_ref(nxt_mp_t *mp, nxt_var_ref_t *ref, nxt_str_t *name)
 {

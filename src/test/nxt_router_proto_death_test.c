@@ -191,7 +191,7 @@ nxt_router_proto_death_test(nxt_thread_t *thr)
     {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router proto death test: successful start left "
-                      "pending %uD joint %uD app use %d (expected 1, 2 and 1)",
+                      "pending %uA joint %uD app use %d (expected 1, 2 and 1)",
                       app->pending_processes, joint->use_count,
                       (int) app->use_count);
         goto done;
@@ -208,7 +208,7 @@ nxt_router_proto_death_test(nxt_thread_t *thr)
     if (app->pending_processes != 0 || joint->use_count != 1) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router proto death test: prototype death left pending "
-                      "%uD joint %uD (expected 0 and 1) -- the start RPC was "
+                      "%uA joint %uD (expected 0 and 1) -- the start RPC was "
                       "not retired", app->pending_processes,
                       joint->use_count);
         goto done;
@@ -224,7 +224,7 @@ nxt_router_proto_death_test(nxt_thread_t *thr)
     if (!nxt_router_app_can_start(app)) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router proto death test: app cannot start after the "
-                      "prototype's death, processes %uD pending %uD",
+                      "prototype's death, processes %uA pending %uA",
                       app->processes, app->pending_processes);
         goto done;
     }
@@ -242,7 +242,7 @@ nxt_router_proto_death_test(nxt_thread_t *thr)
     if (app->pending_processes != 1 || joint->use_count != 1) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router proto death test: repeated sweep left pending "
-                      "%uD joint %uD (expected 1 and 1)",
+                      "%uA joint %uD (expected 1 and 1)",
                       app->pending_processes, joint->use_count);
         goto done;
     }

@@ -1607,6 +1607,67 @@ def test_asgi_websockets_message_over_buffer_limit():
     check_close(sock, 1009)  # 1009 - CLOSE_TOO_LARGE
 
 
+def test_asgi_websockets_app_queue_full(wait_for_record):
+    client.load('websockets/stall')
+
+    _, sock, _ = ws.upgrade()
+
+    # The application blocks for 2 s on "stall" and reads nothing.  The
+    # router puts each frame of the next message in the application port
+    # queue, 16384 items, so 20000 one-byte frames fill it.  The router must
+    # wait for room, not close the connection.  The bytes differ, so a frame
+    # out of order shows.
+    ws.frame_write(sock, ws.OP_TEXT, 'stall')
+
+    payload = bytes(i % 251 for i in range(20000))
+    ws.message(sock, ws.OP_BINARY, payload, fragmention_size=1)
+
+    frame = ws.message_read(sock, read_timeout=30)
+
+    assert frame['opcode'] == ws.OP_BINARY, 'opcode'
+    assert frame['data'] == payload, 'payload'
+
+    assert wait_for_record(
+        r'websocket: the application queue is full, reading from the '
+        r'client paused'
+    ), 'paused'
+
+    close_connection(sock)
+
+
+def test_asgi_websockets_app_queue_full_timeout(wait_for_record):
+    client.load('websockets/stall')
+
+    assert 'success' in client.conf(
+        {'http': {'websocket': {'read_timeout': 1, 'keepalive_interval': 0}}},
+        'settings',
+    ), 'read_timeout'
+
+    _, sock, _ = ws.upgrade()
+
+    # The application reads nothing for 2 s, longer than the 1 s
+    # "read_timeout": the router stops waiting and fails the connection.
+    ws.frame_write(sock, ws.OP_TEXT, 'stall')
+    ws.message(sock, ws.OP_BINARY, b'*' * 20000, fragmention_size=1)
+
+    assert wait_for_record(
+        r'websocket: the application read nothing for 1000 ms, closing'
+    ), 'closed'
+
+    # The router closes the connection.  A reset is also a close: the
+    # client frames the router did not read are still in its socket.  An
+    # open socket raises a timeout here.
+    sock.settimeout(5)
+
+    try:
+        assert sock.recv(1) == b'', 'connection closed'
+
+    except ConnectionResetError:
+        pass
+
+    sock.close()
+
+
 def test_asgi_websockets_second_frame_over_buffer_limit():
     client.load('websockets/mirror')
 

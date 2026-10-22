@@ -131,6 +131,12 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 20
 
+    # Cargo rebuilds the whole target when the Rust flags change, and the
+    # otel cache key below carries this value.  The Make step passes it to
+    # cargo as CARGO_ENCODED_RUSTFLAGS.
+    env:
+      RUST_ENCODED_FLAGS: -Cdebuginfo=1
+
     steps:
       - uses: actions/checkout@v7
 
@@ -220,14 +226,24 @@ jobs:
       # covers only C.  In run 36318226905 that cargo build took 44.5 s of
       # the 55 s of "Make unit", on every run.  This step caches the crates
       # and the target directory.  The target directory is cargo's default,
-      # src/otel/target: auto/make gives no --target-dir.  The key has the
-      # rustc version: the runner image updates rust, and a different rustc
-      # rebuilds the target anyway.  The otel crate itself is rebuilt on
-      # every run, because checkout gives its sources a new mtime.  Local
-      # test with a warm target: 52 s -> 2 s.
+      # src/otel/target: auto/make gives no --target-dir.  The otel crate
+      # itself is rebuilt on every run, because checkout gives its sources a
+      # new mtime.  Local test with a warm target: 52 s -> 2 s.
+      #
+      # Cargo rebuilds the whole target when rustc or the Rust flags change.
+      # The key covers the rustc version, the flags, auto/make (which builds
+      # the --remap-path-prefix flags), the two remapped paths, and the lock
+      # file.  The restore prefix stops after the flags: a target built with
+      # other flags is useless, and restoring it is slower than a miss.  The v2 prefix
+      # skips the entry saved before the remap existed: restoring that one
+      # rebuilt all 117 crates on every run, and a primary-key hit stopped
+      # the post step from replacing it.
       - name: Read rustc version
         id: rustc
-        run: echo "version=$(rustc -V | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "version=$(rustc -V | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
+          echo "flags=$(printf '%s' "${RUST_ENCODED_FLAGS}" | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
+          echo "paths=$(printf '%s %s' "$GITHUB_WORKSPACE" "${CARGO_HOME:-$HOME/.cargo}" | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
 
       - name: Cache the otel Rust build
         uses: actions/cache@v6
@@ -236,9 +252,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             src/otel/target
-          key: otel-cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('src/otel/Cargo.lock') }}
+          key: otel-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-${{ steps.rustc.outputs.flags }}-${{ steps.rustc.outputs.paths }}-${{ hashFiles('auto/make', 'src/otel/Cargo.lock') }}
           restore-keys: |
-            otel-cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-
+            otel-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-${{ steps.rustc.outputs.flags }}-${{ steps.rustc.outputs.paths }}-
 
       # An --otel build without --openssl must not link OpenSSL.  The
       # src/otel crate links no TLS stack.  This check reads the link
@@ -293,8 +309,26 @@ jobs:
       - name: Make unit
         env:
           CARGO_INCREMENTAL: 0
+          # Exercise the encoded-flags branch and retain source paths in
+          # debug info, so the check below detects a missing remap.  The job
+          # env carries the same value into the otel cache key.
+          CARGO_ENCODED_RUSTFLAGS: ${{ env.RUST_ENCODED_FLAGS }}
         run: |
           make -j$(nproc) -k || make
+
+      - name: Assert encoded Rust flags preserve path remapping
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          archive = Path('build/lib/libotel.a').read_bytes()
+          if not archive:
+              raise SystemExit('::error::the otel archive is empty')
+          if os.fsencode(os.getcwd()) in archive:
+              raise SystemExit('::error::the otel archive contains the build path')
+          print('otel archive contains no build path with encoded Rust flags')
+          PY
 
       # unitd needs only OPENSSL_3.0.0 symbols, so without the rpath it would
       # load the runner's system libssl.so.3 and every TLS test would still
@@ -324,21 +358,34 @@ jobs:
       - name: Make the libunit test application
         run: make -j$(nproc) build/unit_app_test
 
+      # The legs build their module from the shipped core objects and run
+      # the prebuilt unitd and unit_app_test: node and go archive
+      # libunit.a, ruby and php compile build/src/nxt_unit.o.  No leg runs
+      # make all, so unitd is not relinked.  The 124 MB Rust staticlib and
+      # the 10 MB core archive are dead weight in the artifact.  Keep
+      # unitd's symbol table but drop its debug info: the symbol table
+      # still names frames in a backtrace.
+      - name: Trim the core build
+        run: |
+          rm -f build/lib/libotel.a build/lib/libnxt.a
+          strip --strip-debug build/sbin/unitd
+
       # tar, not a bare upload: actions/upload-artifact stores a zip and
       # restores neither the executable bit nor mtimes.  Both matter here --
       # the legs run build/unit_app_test directly, and `make <module>` decides
       # what to rebuild from mtimes.  The root Makefile is generated by
       # configure (it just includes build/Makefile), so it travels too, and
       # build/autoconf.data is what a module configure sources for the core's
-      # flags.
+      # flags.  zstd, not gzip: it compresses on all cores, and the runner
+      # already has it for the cache action.
       - name: Pack the core build
-        run: tar -czf /tmp/unit-core-build.tar.gz Makefile build
+        run: tar -c --use-compress-program 'zstd -T0 -3' -f /tmp/unit-core-build.tar.zst Makefile build
 
       - name: Upload the core build
         uses: actions/upload-artifact@v7
         with:
           name: unit-core-build
-          path: /tmp/unit-core-build.tar.gz
+          path: /tmp/unit-core-build.tar.zst
           retention-days: 1
           compression-level: 0
 
@@ -442,9 +489,21 @@ jobs:
             # built, so one Python leg is enough for it.  The other language
             # legs still run it.  A file that is not in this list only costs
             # balance, not coverage.
+            #
+            # test_settings.py was 64 s in that run.  It cost 180 s on the
+            # python-3.13 leg of
+            # https://github.com/freeunitorg/freeunit/actions/runs/38018584167
+            # measured by summing the gaps between consecutive tests of the
+            # file in the leg's log.  That leg ran 359 s against 253 s and
+            # 283 s on python-3.12 and python-3.14, because the entry sent
+            # the largest shared file to the leg that already had the most
+            # work.  The 408 change in the same pull request removes about
+            # 7 s of sleeps, so the cost is about 174 s.  The entry uses 170
+            # s: the shards only need a good balance.  Re-measure a file when
+            # its cost changes.
             heavy="
               test/test_app_start_timeout.py:72
-              test/test_settings.py:64
+              test/test_settings.py:170
               test/test_otel.py:34
               test/test_proxy.py:27
               test/test_tls.py:22
@@ -609,7 +668,7 @@ jobs:
         # date.  Everything under build/ came from this same commit, so there
         # is no real staleness to mask.
         run: |
-          tar -xzf /tmp/unit-core-build.tar.gz
+          tar -x --use-compress-program unzstd -f /tmp/unit-core-build.tar.zst
           find Makefile build -exec touch {} +
           test -f build/autoconf.data
           test -x build/sbin/unitd
@@ -864,7 +923,7 @@ jobs:
       # Prebuilt binary instead of `cargo install cargo-component` (which
       # compiles it from source on every run). Same tool, much faster.
       - name: Install cargo-component
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-component
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
@@ -873,11 +932,15 @@ jobs:
       # crates built from nothing on every run.  This step caches the
       # crates and the target directory, like the otel build in the core
       # job.  "Setup rust" above installs the latest stable, so the key has
-      # the rustc version.  This crate is rebuilt on every run, because
-      # checkout gives its sources a new mtime.
+      # the rustc version.  The key also covers the module script, which
+      # builds the --remap-path-prefix flags, and the two remapped paths.
+      # This crate is rebuilt on every run, because checkout gives its
+      # sources a new mtime.
       - name: Read rustc version
         id: rustc
-        run: echo "version=$(rustc -V | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "version=$(rustc -V | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
+          echo "paths=$(printf '%s %s' "$GITHUB_WORKSPACE" "${CARGO_HOME:-$HOME/.cargo}" | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
 
       - name: Cache the wasm-wasi-component Rust build
@@ -887,9 +950,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             src/wasm-wasi-component/target
-          key: wasm-wasi-component-cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('src/wasm-wasi-component/Cargo.lock') }}
+          key: wasm-wasi-component-cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-${{ steps.rustc.outputs.paths }}-${{ hashFiles('auto/modules/wasm-wasi-component', 'src/wasm-wasi-component/Cargo.lock') }}
           restore-keys: |
-            wasm-wasi-component-cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-
+            wasm-wasi-component-cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-${{ steps.rustc.outputs.paths }}-
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
 
       - name: Configure wasm-wasi-component
@@ -1065,8 +1128,10 @@ jobs:
       # unitd on its own state directory and stops it while a store runs.
       # test_njs_modules.py stores njs modules and starts unitd again to
       # check what it loads from the state directory.
-      # test_python_shm_limit_stored and test_settings_timeout_stored start
-      # unitd on a stored configuration.
+      # test_python_shm_limit_stored, test_settings_timeout_stored,
+      # test_settings_size_negative_stored and
+      # test_access_log_credential_header_stored start unitd on a stored
+      # configuration.
       # All need --restart, which the run above does not pass, so they skip
       # there.  Run them again, off the default base port: no other step runs
       # a requires_restart test with --port.
@@ -1083,6 +1148,8 @@ jobs:
             test/test_state_store.py \
             test/test_python_shm_limit.py::test_python_shm_limit_stored \
             test/test_settings.py::test_settings_timeout_stored \
+            test/test_settings.py::test_settings_size_negative_stored \
+            test/test_config_validation_errors.py::test_access_log_credential_header_stored \
             test/test_tls.py::test_tls_certificate_update_restart
         if: ${{ !cancelled() && steps.metadata.outputs.module == 'python' }}
 
@@ -1107,10 +1174,14 @@ jobs:
         timeout-minutes: 5
         run: |
           sudo apt-get -y update
-          sudo apt-get -y install build-essential libssl-dev libpcre2-dev
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev \
+            systemtap-sdt-dev
 
-      - name: Configure unit (--tests)
-        run: ./configure --openssl --tests
+      # --usdt is here because no other job compiles the probes.  The other
+      # C test jobs build without it, so nxt_usdt_test runs with and without
+      # the probes.
+      - name: Configure unit (--tests --usdt)
+        run: ./configure --openssl --tests --usdt
 
       - name: Build unitd and libunit
         run: |
@@ -1119,6 +1190,18 @@ jobs:
 
       - name: Build C tests
         run: make -j4 tests
+
+      # Every NXT_USDT() name in the source must be a probe note in unitd or
+      # libunit.a.  A probe in a language module needs its module added here.
+      - name: Check the USDT probes are in the build
+        run: |
+          src=$(grep -rhoE --exclude-dir=test --exclude=nxt_usdt.h \
+                  'NXT_USDT\([a-z_]+' src | sed 's/NXT_USDT(//' | sort -u)
+          bin=$(LC_ALL=C readelf -n build/sbin/unitd build/lib/libunit.a |
+                  sed -n 's/^ *Name: //p' | sort -u)
+          echo "$src"
+          test -n "$src"
+          test "$src" = "$bin"
 
       # The hooks (fault-injection branches and counters inside
       # "#if (NXT_TESTS)") must reach the test programs and nothing else.
@@ -1145,6 +1228,81 @@ jobs:
       # hide a use-after-unlink that the release build would show.
       - name: Run libunit malformed port message test
         run: ./build/unit_msg_test
+
+  # Compile-only leg with 32-bit size_t and pointers and a 64-bit off_t, the
+  # widths of i386, armv7 and armhf.  A type-width -Werror (#582, #579) folds
+  # only there and cannot show up in an amd64 job.  Nothing is linked against
+  # 32-bit libraries beyond libc, so --no-regex and no --openssl; build/tests
+  # is compiled and not run.  This leg blocks pull requests, as #632 asks.
+  build-m32:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
+      - name: Install packages
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential gcc-multilib
+
+      - name: Configure unit (-m32 -D_FILE_OFFSET_BITS=64)
+        run: >-
+          ./configure --tests --no-regex
+          --cc-opt='-m32 -D_FILE_OFFSET_BITS=64' --ld-opt='-m32'
+
+      - name: Build unitd
+        run: make -j4
+
+      - name: Check the target is 32-bit
+        run: file build/sbin/unitd | grep -q "ELF 32-bit"
+
+      - name: Build C tests (not run)
+        run: make -j4 tests
+
+  # The oldest compiler the tree still builds with: GCC 4.4.7 and glibc 2.12
+  # of RHEL 6.  It has no -std=gnu11 and no __atomic_* builtins, so the job
+  # tests the fallbacks for both.  It is a best-effort target:
+  # there is no package for it.  The build runs in a plain docker run, not
+  # in a job container, because the Node of the checkout action cannot run
+  # on glibc 2.12.  CentOS 6 is end of life, so yum reads the vault.  There
+  # is no OpenSSL (1.0.1 is below the 1.1.1 floor) and no PCRE2.
+  c-tests-centos6:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build and run the C tests in CentOS 6.10
+        run: |
+          docker run --rm -v "$PWD":/src -w /src centos:6.10 bash -ec '
+            sed -i "s|^mirrorlist=|#mirrorlist=|; s|^#baseurl=http://mirror.centos.org/centos/\$releasever|baseurl=http://vault.centos.org/6.10|" \
+                /etc/yum.repos.d/CentOS-Base.repo
+            yum -y -q install gcc make which
+            gcc --version | head -1
+            ./configure --no-regex --tests
+            make -j4
+            make -j4 build/lib/libunit.a
+            make -j4 tests
+            sh .github/scripts/check-test-hooks.sh
+            ./build/tests
+            ./build/unit_close_test
+            ./build/unit_port_recv_test
+            ./build/unit_msg_test
+          '
+
+      # The container runs as root: give the files back so that the runner
+      # can clean up the workspace.
+      - name: Give the build tree back to the runner user
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" "$PWD"
 
   # The C unit-test suite with PCRE 1 instead of PCRE2.  nxt_pcre.c has its
   # own match limits, recursion limit and callout.  No other job compiles
@@ -1179,6 +1337,98 @@ jobs:
       - name: Run C tests
         run: sudo ./build/tests
 
+  # JIT is opt-in, so the default jobs do not execute its regression cases.
+  c-tests-jit:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [none, address]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev
+
+      - name: Configure unit with PCRE2 JIT
+        env:
+          SANITIZER: ${{ matrix.sanitizer }}
+        run: |
+          if [ "$SANITIZER" = address ]; then
+            ASAN_OPTIONS=detect_leaks=0 ./configure \
+              --openssl --debug --hardening=strict --tests --regex-jit \
+              --cc-opt='-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g' \
+              --ld-opt='-fsanitize=address,undefined'
+          else
+            ./configure --openssl --debug --hardening=strict --tests --regex-jit
+          fi
+
+      - name: Build unitd, libunit and C tests
+        run: |
+          make -j4
+          make -j4 build/lib/libunit.a
+          make -j4 tests
+
+      - name: Check test-hook isolation
+        run: .github/scripts/check-test-hooks.sh
+
+      - name: Run C tests
+        run: |
+          set -o pipefail
+          sudo env ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+            ./build/tests 2>&1 | tee jit-tests.log
+          grep -F 'regex JIT test passed: execution, fallback, cleanup' jit-tests.log
+
+  # The routing tests against a --regex-jit build: configuration
+  # validation, route matching on the engine threads, reconfiguration and
+  # the limit-hit error with JIT-compiled patterns.  Its own build, so the
+  # shared core build that the other pytest legs use stays without JIT.
+  routing-jit:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
+      - name: Install packages
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev \
+            python3-dev python3-pytest
+
+      - name: Configure unit with PCRE2 JIT
+        run: ./configure --openssl --debug --regex-jit
+
+      - name: Make unit and the python3 module
+        run: |
+          make -j4
+          ./configure python --config=python3-config
+          make -j4 python3
+
+      - name: Assert the build has --regex-jit
+        run: ./build/sbin/unitd --version 2>&1 | grep -F -- --regex-jit
+
+      # The test files with "~" route or match patterns.  The one in
+      # test_static_compression.py is left out: it needs a --zlib build.
+      # --port as in the test legs, so the run is off the default base port.
+      - name: Run routing tests
+        timeout-minutes: 8
+        run: |
+          sudo /usr/bin/pytest-3 --print-log --port 18080 \
+            test/test_routing.py \
+            test/test_route_if.py \
+            test/test_static_types.py
+
   # Same C unit-test suite as c-tests above, built with AddressSanitizer and
   # run with LeakSanitizer's default ASAN_OPTIONS (detect_leaks is on unless
   # something turns it off). Separate from sanitize.yml: that workflow runs
@@ -1191,8 +1441,29 @@ jobs:
   # (test fixtures freeing what they allocated -- lvlhsh buckets, ports,
   # runtime processes).
   c-tests-asan:
+    # Both compilers, or the C core is sanitized by exactly one of them.  The
+    # gcc branches of the sanitizer detection that
+    # https://github.com/freeunitorg/freeunit/pull/693 adds to nxt_clang.h
+    # (__SANITIZE_ADDRESS__ and friends) would then never run here.  Both legs
+    # of this matrix use one flag set, so a UBSan report fails both or
+    # neither.  The runtime leg in sanitize.yml keeps UBSan recoverable on
+    # purpose: aborting on the first report kills an exec'd application worker
+    # mid-response (see the halt_on_error note and the "Configure unit"
+    # comment there).  This leg runs one test process with no allowlist, so it
+    # fails fast.
+    # MemorySanitizer cannot be added to this matrix: gcc rejects the option
+    # outright ("unrecognized argument to '-fsanitize=' option: 'memory'", gcc
+    # 15.3.0 and 16.2.0), so MSan stays a clang-only leg.  HWAddressSanitizer
+    # builds on both compilers but aborts at startup on x86_64 ("requires a
+    # kernel with tagged address ABI"), so it belongs on an aarch64 leg.
+    name: "c-tests-asan (${{ matrix.cc }})"
     runs-on: ubuntu-26.04
     timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [clang, gcc]
 
     steps:
       - uses: actions/checkout@v7
@@ -1210,17 +1481,47 @@ jobs:
 
       # -fno-sanitize-recover: the first UBSan report fails the job.
       # nxt_conf_map_object_test fails only under UBSan.
-      - name: Configure unit (ASan+LSan+UBSan, --tests)
+      #
+      # -O1 is spelled out as in sanitize.yml: --cc-opt lands after the
+      # built-in -O, so a change of that default cannot split the two
+      # workflows.
+      #
+      # detect_leaks=0 for configure only, as in sanitize.yml: auto/feature
+      # runs its probes, and auto/malloc's malloc_usable_size() probe does not
+      # free.  With LeakSanitizer on, the probe exits nonzero, configure
+      # prints "found but is not working", and NXT_HAVE_MALLOC_USABLE_SIZE is
+      # dropped.  The tests below still run with leak detection on.
+      - name: Configure unit (ASan+LSan+UBSan, --tests, --openssl)
+        env:
+          ASAN_OPTIONS: "detect_leaks=0"
         run: |
           ./configure \
-            --cc=clang \
+            --cc=${{ matrix.cc }} \
             --debug \
             --tests \
-            --cc-opt="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g" \
+            --openssl \
+            --cc-opt="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -O1 -g" \
             --ld-opt="-fsanitize=address,undefined"
+
+      # The hook gate needs the plain objects as well as the instrumented ones:
+      # it compares X.o with X.test.o, and it checks the hook symbols against
+      # unitd, libnxt.a, libunit.a and nxt_unit.o.  "make tests" builds the
+      # instrumented archive only.
+      - name: Build unitd and libunit
+        run: |
+          make -j4
+          make -j4 build/lib/libunit.a
 
       - name: Build C tests
         run: make -j4 tests
+
+      # The gate derives the hook set from the difference between the two
+      # objects, so it depends on what the optimizer inlines away.  This leg is
+      # the only --debug build of the C suite: c-tests, c-tests-almalinux8 and
+      # hardening-strict-fedora are release builds.  --openssl above is what
+      # puts nxt_openssl.c and its hooks in the set.
+      - name: Check the test hooks are in the test programs only
+        run: .github/scripts/check-test-hooks.sh
 
       # sudo for the same reason as c-tests above: the clone creds cases
       # need real root. Running as root does not disable LeakSanitizer --

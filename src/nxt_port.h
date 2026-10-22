@@ -271,6 +271,16 @@ typedef struct {
 } nxt_port_msg_t;
 
 
+/*
+ * The message header is copied as bytes into the data of a port queue item,
+ * and the reader decodes it with its own layout.
+ */
+nxt_static_assert(offsetof(nxt_port_msg_t, mmap) == 12,
+                  "nxt_port_msg_t: mmap moved");
+nxt_static_assert(sizeof(nxt_port_msg_t) == 16,
+                  "nxt_port_msg_t: size changed");
+
+
 typedef struct {
     nxt_queue_link_t    link;
     nxt_buf_t           *buf;
@@ -675,6 +685,13 @@ void nxt_port_read_close(nxt_port_t *port);
 nxt_int_t nxt_port_socket_write2(nxt_task_t *task, nxt_port_t *port,
     nxt_uint_t type, nxt_fd_t fd, nxt_fd_t fd2, uint32_t stream,
     nxt_port_id_t reply_port, nxt_buf_t *b);
+
+/*
+ * READ_QUEUE only, with no descriptor and no buffer.  NXT_DONE: the port is
+ * backlogged, so nothing was queued.  Otherwise as nxt_port_socket_write2().
+ */
+nxt_int_t nxt_port_socket_doorbell(nxt_task_t *task, nxt_port_t *port,
+    uint32_t stream, nxt_port_id_t reply_port);
 
 
 typedef enum {

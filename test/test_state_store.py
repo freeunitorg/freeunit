@@ -9,15 +9,17 @@ filesystem leaves no conf.json at all.
 
 The failure is arranged by putting the state directory on a 64 KiB tmpfs,
 which needs root and CAP_SYS_ADMIN (pytest as root in a --privileged
-container) as well as --restart; the test skips otherwise.
+container) as well as --restart; the test skips otherwise.  A store that
+fails is answered with 500, and the configuration before it stays the one
+that a restart loads.
 
 Main runs each store in a short-lived child process, one at a time, and waits
 for it before it exits (https://github.com/freeunitorg/freeunit/issues/516).
-The other tests here check that a configuration answered with 200 is on disk
-after an immediate SIGTERM, and that stores in quick succession leave the
-last configuration.  They need --restart only.  They catch a regression only
-when a store takes longer than the few milliseconds main needs to exit, so on
-a tmpfs they pass either way.
+The controller answers a PUT only after that child has written and flushed
+the file, so a 200 means that the configuration is on the disk.  The other
+tests here check that a configuration answered with 200 is on disk after an
+immediate SIGTERM, and that stores in quick succession leave the last
+configuration.  They need --restart only.
 
 The version tests seed a state directory by hand.  unitd writes the version
 file with no line end, but a file written by hand often has one.
@@ -63,8 +65,12 @@ def big_conf(routes):
 
 
 def wait_for_stored(statedir, expected, wait=100):
-    """The store is asynchronous: the controller answers the PUT and only
-    then asks the main process to persist it."""
+    """The configuration in <statedir>/conf.json, when its listeners match
+    "expected".
+
+    The controller answers a PUT only after the store child of main has
+    written and flushed that file, so the first look finds it.  The retries
+    are a guard against a slower machine, not a part of the contract."""
 
     conf_json = statedir / 'conf.json'
 
@@ -124,9 +130,10 @@ def test_state_store_full_filesystem(requires_restart, skip_alert):
 
         stored = (statedir / 'conf.json').read_bytes()
 
-        assert 'success' in client.conf(big_conf(400)), 'the large PUT'
+        # The configuration is too large for the filesystem, so the store
+        # child fails.  The answer waits for that child and refuses.
+        assert 'error' in client.conf(big_conf(400)), 'the large PUT'
 
-        # The store is attempted asynchronously; wait for it to give up.
         # The store child logs the first alert, and main logs the second
         # when it reaps the child.
         assert Log.wait_for_record(
@@ -257,9 +264,13 @@ def test_state_store_survives_exit(requires_restart):
         shutil.rmtree(statedir, ignore_errors=True)
 
 
-def test_state_store_pending_at_exit(requires_restart):
-    """Stores that wait behind a running store child are not dropped at
-    exit: the last configuration is on disk."""
+def test_state_store_many_at_exit(requires_restart):
+    """Four accepted configurations leave the last one on disk when SIGTERM
+    follows the last answer, and no store child outlives main.
+
+    Every answer waits for its store, so no store waits in line here.  The
+    C test nxt_main_store_test() covers a store that waits behind another,
+    and the SIGKILL of a store child at exit."""
 
     unit_stop()
 
