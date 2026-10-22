@@ -1,51 +1,87 @@
-# Debian 13 (Trixie) / Ubuntu 24.04 LTS — Build from Source
+# Debian 13 (Trixie) / Ubuntu 24.04 LTS (Noble) — Build from Source
 
 > Verified on:
-> - Debian 13 Trixie (kernel `6.12.63+deb13-amd64`), OpenSSL 3.5.7, PHP 8.4.26 ✓
-> - Ubuntu 24.04 LTS (jammy, kernel `6.8.x`), OpenSSL 3.2.x
-> - Local testing: FreeUnit 1.37.0 with PHP 8.5.12 embed SAPI ✓ (built from source)
+> - Debian 13 Trixie (kernel `6.12.x`), OpenSSL 3.5.7, FreeUnit 1.37.0 with PHP 8.5.12 embed SAPI ✓
+> - Ubuntu 24.04 LTS (Noble): same steps, with the Ubuntu notes below. Not yet tested by the author.
 >
-> FreeUnit 1.37.0 + PHP 8.5.12 (built from source), verified with phpinfo().
-> Last verified: October 22, 2026.
+> Last verified on Debian 13: October 22, 2026.
 > PHP 8.5.12 fixes two critical RCE bugs (CVE-2026-109618, CVE-2026-109619).
 > Do not use PHP 8.5.11 or older.
-> PHP 8.5 build time: ~3 min (make), ~2 sec (PHP module).
-> Localhost test: PHP 8.5.12 running at http://myapp.local:8080/phpinfo.php ✓
+>
+> | PHP branch | First safe release | Unsafe releases |
+> |------------|--------------------|-----------------|
+> | 8.5 | 8.5.12 | 8.5.11 and older |
+> | 8.4 | 8.4.27 | 8.4.26 and older |
+> | 8.3 | 8.3.36 | 8.3.35 and older |
+> | 8.2 | 8.2.35 | 8.2.34 and older |
+>
+> Use the first safe release or a newer one. The PHP project does not fix PHP 8.1 and older. Do not use them.
+> PHP 8.2 reaches end of life on 31 December 2026.
+>
+> Distribution packages:
+> - Debian 13 (Trixie): `php8.4` 8.4.27-1~deb13u1 or newer (DSA-6574-1). Version 8.4.26 is not safe.
+> - Ubuntu 24.04 (Noble): see USN-8948-1 for the fixed `php8.3` version. Make sure that your package is at least that version.
+>
+> Sources: [PHP changelog](https://www.php.net/ChangeLog-8.php),
+> [Debian security tracker](https://security-tracker.debian.org/tracker/CVE-2026-109618).
 
-## Quick Start (TL;DR) — with PHP 8.5
+Debian 13 is the main target. Ubuntu differences are marked **Ubuntu**.
 
-**Official method** (used by FreeUnit CI):
+## Quick Start (TL;DR) — PHP 8.5 from packages
+
+**Debian 13 (Trixie):**
 
 ```bash
-# 1. Add deb.sury.org + install PHP 8.5
-sudo apt-get update && sudo apt-get install -y ca-certificates curl gnupg lsb-release
+# 1. Add deb.sury.org and install PHP 8.5
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg lsb-release
 sudo curl -fsSL https://packages.sury.org/php/apt.gpg -o /usr/share/keyrings/sury-php.gpg
-sudo tee /etc/apt/sources.list.d/sury-php.sources >/dev/null <<'SURY'
+CODENAME=$(lsb_release -sc)    # trixie
+sudo tee /etc/apt/sources.list.d/sury-php.sources >/dev/null <<SURY
 Types: deb
 URIs: https://packages.sury.org/php/
-Suites: $(lsb_release -sc)
+Suites: ${CODENAME}
 Components: main
 Signed-By: /usr/share/keyrings/sury-php.gpg
 SURY
 sudo apt-get update
 sudo apt-get install -y php8.5-dev libphp8.5-embed build-essential libssl-dev \
     libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev
+```
 
+**Ubuntu 24.04 (Noble):** use the Sury PPA instead of the lines above.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y software-properties-common
+sudo add-apt-repository -y ppa:ondrej/php
+sudo apt-get install -y php8.5-dev libphp8.5-embed build-essential libssl-dev \
+    libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev
+```
+
+Then, on both systems:
+
+```bash
 # 2. Build FreeUnit + PHP module
 git clone https://github.com/freeunitorg/freeunit.git && cd freeunit
+git checkout 1.37.0
 ./configure --prefix=/usr --libdir=/usr/lib/x86_64-linux-gnu \
     --statedir=/var/lib/unit --logdir=/var/log/unit \
     --runstatedir=/run/unit --control=unix:/run/unit/control.sock \
     --openssl --zlib --brotli --zstd \
     --modulesdir=/usr/lib/x86_64-linux-gnu/unit/modules
 make -j$(nproc)
-./configure php --config=php-config8.5 && make php && sudo make php-install
 sudo make install
+./configure php --config=php-config8.5
+make php && sudo make php-install
 
-# 3. Start & verify
+# 3. Create the systemd unit (see "systemd Service" below), then:
+sudo systemctl daemon-reload
 sudo systemctl enable --now unit
 systemctl status unit
 ```
+
+> `make install` does **not** install a systemd unit. You must create it yourself.
 
 ## Prerequisites
 
@@ -63,117 +99,84 @@ sudo apt-get install -y build-essential gcc make git \
 
 | Source | PHP versions | Notes |
 |--------|-------------|-------|
-| Debian native | 8.4 (Trixie), 8.2 (Bookworm) | **Requires libphp-embed** |
-| Ubuntu native | 8.2 (LTS), 8.3 (24.10) | **Requires libphp-embed** |
-| Sury DPA (PPA) | 7.4 — 8.5 (Ubuntu only) | Third-party, Ubuntu only |
+| Debian native | 8.4 (Trixie) | Needs the embed package |
+| Ubuntu native | 8.3 (24.04 Noble) | Needs the embed package |
+| deb.sury.org | 7.4 — 8.5 | Debian only |
+| Sury PPA (`ppa:ondrej/php`) | 7.4 — 8.5 | Ubuntu only |
 | Build from source | Any PHP version | Full control, longer build |
 
-### Option A: native Debian/Ubuntu PHP (8.2–8.4)
+### Option A: native distribution PHP
 
 ```bash
-# Debian 13 installs PHP 8.4 (not 8.3)
+# Debian 13 installs PHP 8.4, Ubuntu 24.04 installs PHP 8.3
 sudo apt-get install -y php php-cli php-dev php-mbstring \
-    php-mysql php-pdo php-xml php-curl
+    php-mysql php-xml php-curl
 
-# For embed SAPI (required for FreeUnit)
+# Embed SAPI (required for FreeUnit)
 sudo apt-get install -y libphp-embed
 
-# Check PHP version and installation path
 php -v
 php-config --version
-# Output: PHP 8.4.26-1~deb13u1 (cli)
+# Debian 13 output: PHP 8.4.x
 ```
 
 > **Note:** `php-sodium` is not available in Debian 13 repos — omit it.
 > The `libphp-embed` package is **required** to build the PHP module.
 
-Build FreeUnit PHP module from source:
+Build the FreeUnit PHP module (after the FreeUnit build from the "Build" section):
 
 ```bash
-git clone https://github.com/freeunitorg/freeunit.git
-cd freeunit
-
 ./configure php
 make -j$(nproc) php
 sudo make php-install
 
-# Verify installation
 ls -lh /usr/lib/x86_64-linux-gnu/unit/modules/php.unit.so
-# Output: 380K
 ```
 
-### Option B: deb.sury.org (PHP 8.5 on Debian & Ubuntu)
+### Option B: Sury packages (PHP 8.5)
 
-**Recommended for both Debian and Ubuntu** (used by official FreeUnit CI).
+**Recommended.** The official [build-deb.yml workflow](https://github.com/freeunitorg/freeunit/blob/master/.github/workflows/build-deb.yml)
+uses `setup_sury_if_needed "8.3 8.4 8.5"` on Debian trixie.
 
-deb.sury.org works on Debian too (not just Ubuntu). This matches the official
-[build-deb.yml workflow](https://github.com/freeunitorg/freeunit/blob/master/.github/workflows/build-deb.yml#L101)
-which uses `setup_sury_if_needed "8.3 8.4 8.5"` on Debian trixie.
+- **Debian 13:** `deb.sury.org` (`packages.sury.org/php`).
+- **Ubuntu 24.04:** `ppa:ondrej/php`. This is a different source from `deb.sury.org`.
 
 ```bash
-# 1. Set up deb.sury.org (works on Debian and Ubuntu)
-sudo apt-get update
-sudo apt-get install -y --no-install-recommends \
-    ca-certificates curl gnupg lsb-release
+# 1. Set up the repository (see Quick Start for Debian and Ubuntu commands)
 
-sudo curl -fsSL https://packages.sury.org/php/apt.gpg \
-    -o /usr/share/keyrings/sury-php.gpg
-
-sudo tee /etc/apt/sources.list.d/sury-php.sources >/dev/null <<'SURY'
-Types: deb
-URIs: https://packages.sury.org/php/
-Suites: $(lsb_release -sc)
-Components: main
-Signed-By: /usr/share/keyrings/sury-php.gpg
-SURY
-
-sudo apt-get update
-
-# 2. Remove native PHP (optional — if you have it installed)
-# sudo apt-get remove -y php* libphp-embed
-
-# 3. Install PHP 8.5 from Sury
+# 2. Install PHP 8.5
 sudo apt-get install -y php8.5 php8.5-cli php8.5-dev php8.5-mbstring \
-    php8.5-mysql php8.5-pdo php8.5-xml php8.5-curl libphp8.5-embed
+    php8.5-mysql php8.5-xml php8.5-curl libphp8.5-embed
 
-# Verify installation
 php8.5 -v
 # Output: PHP 8.5.12 (cli) ...
 
-# 4. Build FreeUnit module against PHP 8.5
+# 3. Build the FreeUnit module against PHP 8.5
 cd /path/to/freeunit
 ./configure php --config=php-config8.5
 make -j$(nproc) php
 sudo make php-install
 
-# Verify
 ls -lh /usr/lib/x86_64-linux-gnu/unit/modules/php.unit.so
 ```
 
-> **Why Sury?** Fast (prebuilt), same method as official CI, works on both Debian and Ubuntu.
-> See [.github/workflows/build-deb.yml](https://github.com/freeunitorg/freeunit/blob/master/.github/workflows/build-deb.yml)
-> for how FreeUnit CI builds PHP 8.5 modules officially.
+> **Why Sury?** Prebuilt, updated by `apt`, same method as the official CI.
 
 ### Option C: Build PHP from source (Advanced)
 
-**Not recommended — use Option B instead** (deb.sury.org is simpler, official CI method).
-
-Only consider this if you need a PHP version not in deb.sury.org, or want custom compile flags.
+Use this only if you need a PHP version that Sury does not ship, or custom compile flags.
+It works the same on Debian 13 and Ubuntu 24.04.
 
 ```bash
-# Install all build dependencies
+# Build dependencies
 sudo apt-get install -y libxml2-dev libsqlite3-dev libcurl4-openssl-dev \
     liboniguruma-dev libtidy-dev libargon2-dev libsodium-dev \
     autoconf automake libtool pkg-config bison re2c
 
-# Clone PHP source (PHP 8.5 branch — same as CentOS/AlmaLinux Remi)
 git clone https://github.com/php/php-src.git php-src
 cd php-src
+git checkout php-8.5.12
 
-# Checkout stable PHP 8.5 (or use master for bleeding-edge)
-git checkout php-8.5.12  # Latest stable 8.5
-
-# Build configuration (same extensions as native PHP)
 ./buildconf --force
 ./configure --prefix=/opt/php-8.5 \
     --with-config-file-path=/etc/php/8.5 \
@@ -186,78 +189,52 @@ git checkout php-8.5.12  # Latest stable 8.5
 make clean && make -j$(nproc)
 sudo make install
 
-# Verify custom PHP installation
 /opt/php-8.5/bin/php -v
 # Output: PHP 8.5.12 (cli) ...
 
-# Verify embed SAPI library was built
+# The embed SAPI library must exist
 ls -lh /opt/php-8.5/lib/libphp.so
-# Output: -rw-r--r-- libphp.so (shared object)
 
-# Update system libphp symlink to use PHP 8.5 (required for FreeUnit module)
+# Point the system libphp symlink to PHP 8.5
 sudo ln -sf /opt/php-8.5/lib/libphp.so /lib/libphp.so
 
-# Build FreeUnit module against PHP 8.5
+# Build the FreeUnit module against PHP 8.5
 cd ../freeunit
 ./configure php --config=/opt/php-8.5/bin/php-config
 make -j$(nproc) php
 sudo make php-install
 
-# Verify module was built and linked against PHP 8.5
-ls -lh /usr/lib/x86_64-linux-gnu/unit/modules/php.unit.so
+# Check the link
 ldd /usr/lib/x86_64-linux-gnu/unit/modules/php.unit.so | grep libphp
 # Output: libphp.so => /lib/libphp.so -> /opt/php-8.5/lib/libphp.so
 
-# Restart FreeUnit daemon to load the new module
-sudo pkill unitd
-sleep 1
-sudo /path/to/unitd --no-daemon &
+# Restart FreeUnit to load the new module
+sudo systemctl restart unit
 ```
 
-**Build notes (October 2026, verified on Debian 13):**
-- **CRITICAL:** `--enable-embed` flag is **required** for FreeUnit module (PHP 8.5 renamed this flag from `--enable-embedded` in PHP 8.4)
-- PHP 8.5.12 source build: ~3 min (incremental make), ~8 min (full clean build) on 8 CPU cores
-- CLI binary: 70M (sapi/cli/php, debug symbols included)
-- Verified working configure flags for FreeUnit: `--enable-fpm`, `--enable-cli`, `--enable-cgi`, **`--enable-embed`**, `--enable-mbstring`, `--with-openssl`, `--with-zlib`, `--with-curl`, `--with-mysqli`, `--enable-xml`
-- Embed SAPI library: `/opt/php-8.5/lib/libphp.so` (created by `--enable-embed`)
-- Required build dependencies: `libxml2-dev`, `libcurl4-openssl-dev`, `liboniguruma-dev`, `libsodium-dev`, `autoconf`, `automake`, `libtool`, `pkg-config`, `bison`, `re2c`
-- **System symlink setup:** FreeUnit dynamically loads `libphp.so` at runtime. If you build multiple PHP versions, update `/lib/libphp.so` symlink to point to the desired version.
+**Build notes:**
+- `--enable-embed` is **required**. It builds the embed SAPI (`libphp.so`) that FreeUnit loads.
+- PHP 8.5.12 build: ~3 min (incremental), ~8 min (full clean build) on 8 CPU cores.
+- FreeUnit loads `libphp.so` at runtime. If you build several PHP versions, point `/lib/libphp.so` to the one you want.
 
 **Troubleshooting:**
-- `no PHP embed SAPI found` → Add `--enable-embed` to configure and rebuild
-- FreeUnit shows old PHP version → Check `/lib/libphp.so` symlink with `ls -la /lib/libphp.so` and `ldd /usr/lib/x86_64-linux-gnu/unit/modules/php.unit.so`
-
-**Comparison with CentOS/AlmaLinux:**
-- **CentOS/AlmaLinux:** Use Remi repository (`dnf enable php:remi-8.5`)
-- **Debian:** Build from source (no Remi equivalent for Debian)
-- **Ubuntu:** Use Sury DPA (`ppa:ondrej/php`)
-
-> **Setup time:** PHP build takes ~3-5 minutes on 8 CPU cores.
-> After this, you'll have the latest PHP 8.5 + FreeUnit module ready.
+- `no PHP embed SAPI found` → add `--enable-embed` to the PHP configure and rebuild.
+- FreeUnit shows an old PHP version → check `ls -la /lib/libphp.so` and `ldd .../php.unit.so`.
 
 ### Comparison
 
-| Feature | A: Native | B: Sury deb.sury.org | C: Build from Source |
-|---------|-----------|-----|----------------------|
-| **PHP version** | 8.4 (Deb13), 8.2–8.3 (Ubuntu) | **8.5 (any OS)** | 8.5.12 (any OS) |
-| **Setup time** | 1 min | **2 min** ⭐ | 5–10 min (build) |
-| **Setup complexity** | Low | **Low** ⭐ | High |
-| **System integration** | Native (`/usr/bin`) | **Native** ⭐ | Custom (`/opt/php-8.5`) |
-| **PHP updates** | `apt update` | **`apt update`** ⭐ | Manual (rebuild) |
-| **OS Support** | Debian ✓ Ubuntu ✓ | **Debian ✓ Ubuntu ✓** ⭐ | Debian ✓ Ubuntu ✓ |
-| **apt dependency resolution** | ✓ Full | **✓ Full** ⭐ | ✗ Manual |
-| **Official CI support** | No | **Yes** ⭐ | No |
-| **Recommended for** | Dev (8.4) | **Production (8.5)** ⭐ | Older PHP versions |
+| Feature | A: Native | B: Sury | C: Source |
+|---------|-----------|---------|-----------|
+| **PHP version** | 8.4 (Debian 13), 8.3 (Ubuntu 24.04) | **8.5** | 8.5.12 or any |
+| **Setup time** | 1 min | **2 min** | 5–10 min |
+| **Updates** | `apt upgrade` | **`apt upgrade`** | Manual rebuild |
+| **System integration** | `/usr/bin` | **`/usr/bin`** | `/opt/php-8.5` |
+| **Used by official CI** | No | **Yes** | No |
 
 **Recommendation:**
-- **PHP 8.4?** → Option A (native, 1 min)
-- **PHP 8.5 anywhere?** → **Option B (Sury deb.sury.org, 2 min)** ⭐
-- **Bleeding-edge/custom?** → Option C (build from source, 10 min)
-
-**Parity with CentOS/AlmaLinux:**
-- **CentOS/AlmaLinux:** Remi repository (`dnf enable php:remi-8.5`)
-- **Debian/Ubuntu:** Sury deb.sury.org (`packages.sury.org/php/`) — same approach ✓
-- See [build-deb.yml](https://github.com/freeunitorg/freeunit/blob/master/.github/workflows/build-deb.yml) for official workflow
+- PHP 8.4 (Debian) or 8.3 (Ubuntu) is enough → Option A.
+- PHP 8.5 → **Option B**.
+- Custom flags or other version → Option C.
 
 ## Build
 
@@ -265,7 +242,7 @@ sudo /path/to/unitd --no-daemon &
 git clone https://github.com/freeunitorg/freeunit.git
 cd freeunit
 
-git checkout v1.37.0   # or master / latest tag
+git checkout 1.37.0   # or master
 
 ./configure --prefix=/usr \
     --libdir=/usr/lib/x86_64-linux-gnu \
@@ -279,37 +256,56 @@ git checkout v1.37.0   # or master / latest tag
 make -j$(nproc)
 ```
 
-**Build output (verified on Debian 13):**
-```
-Linking successful:
-  -lssl -lcrypto (OpenSSL 3.5.7)
-  -lpcre2-8 (PCRE2 10.46)
-  -lz (zlib 1.3.1)
-  -lzstd (Zstandard 1.5.7)
-  -lbrotlienc (Brotli 1.1.0)
+Run the common `./configure` first. A language module `./configure php` needs it.
 
-Compile time: ~16 seconds on 8 CPU cores
-Binary size: 3.4M (unitd daemon)
-```
-
-> **Note on libdir:** Debian/Ubuntu use `/usr/lib/x86_64-linux-gnu` (multiarch) instead of `/usr/lib64`.
-> Adjust `--modulesdir` accordingly.
+> **Note on libdir:** Debian and Ubuntu use `/usr/lib/x86_64-linux-gnu` (multiarch) instead of `/usr/lib64`.
 >
-> **OTEL support** is optional. It requires Rust ≥ 1.88 (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`).
-> To enable it, add `--otel` to the configure flags. The example above omits it for a faster build.
+> **OTEL support** is optional. It needs Rust ≥ 1.88. Add `--otel` to the configure flags to enable it.
 >
 > `--user` / `--group` are omitted because the systemd service runs unitd directly.
 > To restrict the runtime user, add `User=unit` and `Group=unit` to the `[Service]` section,
 > and create the user: `sudo useradd -r -s /usr/sbin/nologin unit`.
 
+### PHP module
+
+FreeUnit loads PHP through the module `php.unit.so`. The module links to the embed library `libphp.so`.
+You must build the module against the PHP version that you want to run.
+
+1. Install the PHP embed package, or build PHP with `--enable-embed` (see Options A, B, and C).
+2. Run the common `./configure` from the "Build" section. Do this one time.
+3. Configure the module. Use the `php-config` of your PHP version:
+
+   ```bash
+   # Native PHP (Debian 13: 8.4, Ubuntu 24.04: 8.3)
+   ./configure php
+
+   # Sury PHP 8.5
+   ./configure php --config=php-config8.5
+
+   # PHP 8.5 built from source
+   ./configure php --config=/opt/php-8.5/bin/php-config
+   ```
+
+4. Build and install the module:
+
+   ```bash
+   make -j$(nproc) php
+   sudo make php-install
+   ```
+
+5. Restart the service: `sudo systemctl restart unit`.
+6. Make sure that the module is loaded. Run the command from the "Verify" section.
+
+If you update PHP, build the module again. The module does not follow the PHP version by itself.
+If you run `./configure php` a second time, the common `./configure` must run first.
+Otherwise the command stops with `duplicate php module configured`.
+
 ### Language modules (non-PHP)
 
-PHP module setup varies by option above. For other languages:
-
 ```bash
-# Python (python3-dev already installed for PHP)
+# Python
 ./configure python --config=python3-config
-make -j$(nproc) python-install
+make -j$(nproc) python3-install
 
 # Go, Node.js, Ruby, Perl, Java, WASM — see ./configure --help
 ```
@@ -320,12 +316,13 @@ make -j$(nproc) python-install
 sudo make install
 ```
 
-Binaries land at:
-- `/usr/sbin/unitd` — release daemon
-- `/usr/sbin/unitd-debug` — debug daemon (if `--debug` was used)
+Files:
+- `/usr/sbin/unitd` — daemon
 - `/usr/lib/x86_64-linux-gnu/unit/modules/*.unit.so` — language modules
 
 ## systemd Service
+
+`make install` does not create a unit. Create it before you enable the service:
 
 ```bash
 sudo tee /etc/systemd/system/unit.service << 'EOF'
@@ -345,44 +342,46 @@ RuntimeDirectory=unit
 RuntimeDirectoryMode=0755
 TimeoutStartSec=30s
 LimitNOFILE=65535
-LimitCORE=infinity
 Restart=on-failure
 RestartSec=3s
-CPUQuota=70%
-TasksMax=512
-Nice=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+sudo mkdir -p /var/log/unit /var/lib/unit
 sudo systemctl daemon-reload
 sudo systemctl enable --now unit
 ```
 
 ### Why `Type=simple` + `--no-daemon`
 
-The original NGINX Unit packages used `Type=forking` with `PIDFile=`, which creates a
-race between systemd and unitd writing the PID file. `--no-daemon` keeps the process
-attached to systemd as a direct child process — no PID file, no race, clean lifecycle management.
+The packaged units in `pkg/deb` use `Type=forking` with `PIDFile=`. This unit uses
+`--no-daemon` instead, so unitd stays a direct child of systemd. No PID file is needed.
 
-`RuntimeDirectory=unit` ensures `/run/unit` is created on start and removed on stop.
+`RuntimeDirectory=unit` creates `/run/unit` on start and removes it on stop.
 
-### Why resource limits
+### Optional resource limits
 
-`CPUQuota`, `TasksMax`, and `Nice` are set as a safety net after past incidents where
-runaway worker processes consumed excessive resources. Kept enabled for observability
-until the root causes are confirmed fixed across all workloads.
+Add these to `[Service]` only if you need to cap the service. They can slow a busy server:
+
+```ini
+CPUQuota=70%
+TasksMax=512
+Nice=5
+```
+
+Always use `systemctl restart unit` to restart. Do not use `pkill unitd`; systemd will fight it.
 
 ## Verify
 
 ```bash
 systemctl status unit
 
-# Check loaded modules
-curl --unix-socket /run/unit/control.sock http://localhost/config
+# Loaded modules are listed in /status (not /config)
+curl --unix-socket /run/unit/control.sock http://localhost/status
 
-# Expected output includes "modules" with loaded language modules:
+# Expected output includes:
 #   "modules": { "php": { "version": "8.x.y", "lib": "/usr/lib/x86_64-linux-gnu/unit/modules/php.unit.so" } }
 ```
 
@@ -414,7 +413,7 @@ curl http://localhost:8080/
 
 ### Local hostname testing (dev/testing)
 
-To test with a local hostname (e.g., `myapp.local`):
+To test with a local hostname (for example `myapp.local`):
 
 ```bash
 # 1. Add to /etc/hosts
@@ -425,31 +424,25 @@ sudo mkdir -p /var/www/myapp.local
 echo '<?php phpinfo(); ?>' | sudo tee /var/www/myapp.local/phpinfo.php
 
 # 3. Configure FreeUnit
-curl -X PUT --unix-socket /run/unit/control.sock http://localhost/config << 'EOF'
+curl -X PUT --unix-socket /run/unit/control.sock http://localhost/config/applications/myapp << 'EOF'
 {
-  "applications": {
-    "myapp": {
-      "type": "php",
-      "root": "/var/www/myapp.local"
-    }
-  },
-  "listeners": {
-    "*:8080": {
-      "pass": "applications/myapp"
-    }
-  }
+    "type": "php",
+    "root": "/var/www/myapp.local"
 }
 EOF
 
-# 4. Test (verified October 2026 with PHP 8.5.12)
+curl -X PUT --unix-socket /run/unit/control.sock http://localhost/config/listeners/'*:8080' << 'EOF'
+{
+    "pass": "applications/myapp"
+}
+EOF
+
+# 4. Test
 curl http://myapp.local:8080/phpinfo.php
 # Expected output: PHP Version 8.5.12 (or your configured PHP version)
 ```
 
-**Local testing notes (October 5, 2026):**
-- Successfully tested myapp.local with PHP 8.5.12 built from source
-- FreeUnit module dynamically loads libphp.so at startup — ensure `/lib/libphp.so` points to correct PHP version
-- Testing verified: phpinfo() displays correct PHP version (8.5.12)
+FreeUnit loads `libphp.so` at startup. Make sure `/lib/libphp.so` points to the PHP version you want.
 
 ## Logs
 
@@ -459,10 +452,7 @@ tail -f /var/log/unit/unit.log
 
 ### Access log
 
-Unit supports per-config access logs via the `access_log` directive:
-
 ```bash
-# Add access log to config
 curl -X PUT --unix-socket /run/unit/control.sock \
     http://localhost/config/access_log << 'EOF'
 {
@@ -470,9 +460,7 @@ curl -X PUT --unix-socket /run/unit/control.sock \
     "format": "$remote_addr - - [$time_local] \"$request_line\" $status $body_bytes_sent \"$header_referer\" \"$header_user_agent\""
 }
 EOF
-```
 
-```bash
 tail -f /var/log/unit/access.log
 ```
 
@@ -490,57 +478,41 @@ tail -f /var/log/unit/access.log
 
 | Distro | PHP 8.5 method | Package system | See also |
 |--------|----------------|---|---|
-| **Debian/Ubuntu** | deb.sury.org | apt | This doc (Option B) |
-| **CentOS/AlmaLinux** | Remi repository | dnf | [CENTOS.ALMALINUX.md](CENTOS.ALMALINUX.md) |
+| **Debian 13** | deb.sury.org | apt | This doc (Option B) |
+| **Ubuntu 24.04** | `ppa:ondrej/php` | apt | This doc (Option B) |
+| **CentOS/AlmaLinux** | Remi repository (`dnf module enable php:remi-8.5`) | dnf | [CENTOS.ALMALINUX.md](CENTOS.ALMALINUX.md) |
 | **Remi details** | `unit-php` prebuilt | dnf | [REMI.md](REMI.md) |
 
-**Key finding:** Debian/Ubuntu now have **parity with CentOS/AlmaLinux**:
-- CentOS: `dnf enable php:remi-8.5` → install pre-built Remi packages
-- Debian/Ubuntu: `packages.sury.org/php` → install Sury pre-built packages
-- **Both** follow the same "use pre-built PHP" strategy (not build-from-source)
-
-This approach is validated by the official FreeUnit CI workflow.
+All of them use prebuilt PHP packages, which is also what the official CI does.
 
 ## Migration from NGINX Unit
 
-If upgrading from the archived NGINX Unit `.deb` packages:
+If you upgrade from the archived NGINX Unit `.deb` packages:
 
 ```bash
-# Stop old service
 sudo systemctl stop unit
-
-# Remove old package
 sudo apt-get remove unit -y
 
 # (Optional) Remove old state
 # sudo rm -rf /var/lib/unit/*
 
-# Build and install FreeUnit (steps above)
+# Then build and install FreeUnit (steps above)
 ```
 
-The control socket path may change depending on the old package version.
-If you have scripts referencing the old socket path, update them:
+The control socket path can differ between package versions.
+If you have scripts that use the old path, find them:
 
 ```bash
-# Find references to old socket paths
 grep -r 'unit.sock\|unit/control' /etc/ /srv/ /home/ --include='*.sh' --include='*.conf' -l 2>/dev/null
 ```
 
-### Debian/Ubuntu package compatibility
-
-FreeUnit is API/ABI compatible with NGINX Unit 1.35.0+. If the official archived
-NGINX Unit `.deb` packages are ever restored, FreeUnit can coexist or replace them
-without application reconfiguration (assuming the same socket path is used).
-
 ## Troubleshooting
 
-**PHP embed SAPI not found when building PHP module:**
+**PHP embed SAPI not found when building the PHP module:**
 ```bash
 # Error: "no PHP embed SAPI found"
-# Solution: Install libphp-embed package
-sudo apt-get install -y libphp-embed
+sudo apt-get install -y libphp-embed    # or libphp8.5-embed for Sury
 
-# Then retry:
 ./configure php
 make php
 sudo make php-install
@@ -549,34 +521,35 @@ sudo make php-install
 **`unitd` won't start, "address already in use":**
 ```bash
 sudo ss -tlnp | grep 8080
-# Kill stale process or change listener port
+# Stop the other process or change the listener port
 ```
 
 **PHP module not found:**
 ```bash
 ls /usr/lib/x86_64-linux-gnu/unit/modules/
-# Expected: php.unit.so (380K for PHP 8.4)
+# Expected: php.unit.so
 # If empty:
 cd /path/to/freeunit
 ./configure php && make php && sudo make php-install
 ```
 
+**`Please run common ./configure before configuring module php`:**
+```bash
+# Run the common configure (see "Build") first, then the module configure.
+```
+
 **Permission denied on control socket:**
 ```bash
 ls -la /run/unit/control.sock
-# Run curl with sudo, or add user to the appropriate group
-sudo usermod -aG unit $USER
-# (Requires login/logout to take effect)
+# Run curl with sudo
 ```
 
 **PHP module version mismatch:**
 ```bash
-# Verify PHP version used for module
 php -v
-# Expected: PHP 8.4.26-1~deb13u1 (cli)
-
-# If PHP was updated after module compilation, rebuild:
+# If PHP was updated after the module was built, rebuild:
 ./configure php && make php && sudo make php-install
+sudo systemctl restart unit
 ```
 
 **Building against custom PHP (`/opt/php-*`):**
@@ -587,27 +560,15 @@ make php
 sudo make php-install
 ```
 
-**FreeUnit showing wrong PHP version after module build:**
+**FreeUnit shows the wrong PHP version after a module build:**
 ```bash
-# Problem: Module built against PHP 8.5 but FreeUnit shows PHP 8.4 in phpinfo()
-# Root cause: /lib/libphp.so still points to old PHP version
-
-# Verify which libphp library the module is using:
+# Cause: /lib/libphp.so still points to an old PHP version
 ldd /usr/lib/x86_64-linux-gnu/unit/modules/php.unit.so | grep libphp
-# Output should show: libphp.so => /lib/libphp.so
-
-# Check what /lib/libphp.so currently points to:
 ls -la /lib/libphp.so
-# If it shows: libphp.so -> libphp8.4.so (old version)
 
-# Update the symlink to the new PHP version:
+# Fix: update the symlink, then restart
 sudo ln -sf /opt/php-8.5/lib/libphp.so /lib/libphp.so
+sudo systemctl restart unit
 
-# Restart FreeUnit daemon:
-sudo pkill unitd
-sleep 1
-sudo /usr/sbin/unitd --no-daemon &
-
-# Verify phpinfo() now shows correct PHP version
 curl http://localhost:8080/phpinfo.php | grep "PHP Version"
 ```
