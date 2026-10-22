@@ -7225,6 +7225,16 @@ components:
           type: string
           description: "Pathname of the access log file."
 
+        log_credentials:
+          type: boolean
+          description: "If `false`, a variable that names the
+            Authorization, Proxy-Authorization, Cookie or Set-Cookie
+            header (`$header_<name>` or `$response_header_<name>`) is
+            written to the log as `REDACTED`.  If `true`, the header value
+            is written to the log."
+
+          default: false
+
     # /config/applications
     configApplications:
       type: object

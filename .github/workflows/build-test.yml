@@ -1130,7 +1130,7 @@ jobs:
       # check what it loads from the state directory.
       # test_python_shm_limit_stored, test_settings_timeout_stored,
       # test_settings_size_negative_stored and
-      # test_access_log_credential_header_stored start unitd on a stored
+      # test_access_log_credentials_stored start unitd on a stored
       # configuration.
       # All need --restart, which the run above does not pass, so they skip
       # there.  Run them again, off the default base port: no other step runs
@@ -1149,7 +1149,7 @@ jobs:
             test/test_python_shm_limit.py::test_python_shm_limit_stored \
             test/test_settings.py::test_settings_timeout_stored \
             test/test_settings.py::test_settings_size_negative_stored \
-            test/test_config_validation_errors.py::test_access_log_credential_header_stored \
+            test/test_access_log_credentials.py::test_access_log_credentials_stored \
             test/test_tls.py::test_tls_certificate_update_restart
         if: ${{ !cancelled() && steps.metadata.outputs.module == 'python' }}
 
