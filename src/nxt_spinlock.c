@@ -88,6 +88,11 @@ nxt_thread_spin_lock(nxt_thread_spinlock_t *lock)
 }
 
 
+/*
+ * Non-blocking spinlock acquisition completing the lock/trylock/unlock triad.
+ * Kept as a fundamental concurrency primitive for non-blocking poll loops
+ * where spinning across thread iterations would induce unacceptable latency.
+ */
 nxt_bool_t
 nxt_thread_spin_trylock(nxt_thread_spinlock_t *lock)
 {

@@ -40,7 +40,6 @@ NXT_LIB_SRCS=" \
     src/nxt_array.c \
     src/nxt_list.c \
     src/nxt_buf.c \
-    src/nxt_buf_pool.c \
     src/nxt_recvbuf.c \
     src/nxt_sendbuf.c \
     src/nxt_thread.c \
@@ -63,7 +62,6 @@ NXT_LIB_SRCS=" \
     src/nxt_conn_read.c \
     src/nxt_conn_write.c \
     src/nxt_conn_close.c \
-    src/nxt_conn_proxy.c \
     src/nxt_sockaddr.c \
     src/nxt_listen_socket.c \
     src/nxt_upstream.c \

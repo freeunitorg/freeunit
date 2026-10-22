@@ -664,7 +664,6 @@ void nxt_port_reset_next_id(void);
 
 nxt_int_t nxt_port_socket_init(nxt_task_t *task, nxt_port_t *port,
     size_t max_size);
-void nxt_port_destroy(nxt_port_t *port);
 void nxt_port_close(nxt_task_t *task, nxt_port_t *port);
 void nxt_port_write_enable(nxt_task_t *task, nxt_port_t *port);
 void nxt_port_write_close(nxt_port_t *port);
@@ -779,7 +778,6 @@ void nxt_port_remove_notify_others(nxt_task_t *task, nxt_process_t *process);
 void nxt_port_rearm(nxt_task_t *task, nxt_port_t *port);
 void *nxt_port_queue_mmap(nxt_task_t *task, nxt_fd_t fd, size_t size);
 
-void nxt_port_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 nxt_int_t nxt_port_new_port_msg(const nxt_port_recv_msg_t *msg,
     nxt_port_msg_new_port_t *out);
 void nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
@@ -789,7 +787,6 @@ void nxt_port_change_log_file_handler(nxt_task_t *task,
 void nxt_port_mmap_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 void nxt_port_data_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 void nxt_port_remove_pid_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
-void nxt_port_empty_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg);
 
 nxt_int_t nxt_port_post(nxt_task_t *task, nxt_port_t *port,
     nxt_port_post_handler_t handler, void *data);

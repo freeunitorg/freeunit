@@ -18,15 +18,6 @@ typedef struct {
 } nxt_buf_ts_t;
 
 
-void
-nxt_buf_mem_init(nxt_buf_t *b, void *start, size_t size)
-{
-    b->mem.start = start;
-    b->mem.pos = start;
-    b->mem.free = start;
-    b->mem.end = nxt_pointer_to(start, size);
-}
-
 
 nxt_buf_t *
 nxt_buf_mem_alloc(nxt_mp_t *mp, size_t size, nxt_uint_t flags)
