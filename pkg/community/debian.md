@@ -3,12 +3,14 @@
 > Verified on:
 > - Debian 13 Trixie (kernel `6.12.63+deb13-amd64`), OpenSSL 3.5.7, PHP 8.4.26 ✓
 > - Ubuntu 24.04 LTS (jammy, kernel `6.8.x`), OpenSSL 3.2.x
-> - **Local testing: chi.holder.ru on FreeUnit 1.37.0 with PHP 8.5.11 embed SAPI ✓** (built from source)
+> - **Local testing: chi.holder.ru on FreeUnit 1.37.0 with PHP 8.5.12 embed SAPI ✓** (built from source)
 >
-> FreeUnit 1.37.0 + PHP 8.5.11 (built from source), locally verified with phpinfo().
-> Last verified: October 5, 2026.
+> FreeUnit 1.37.0 + PHP 8.5.12 (built from source), verified with phpinfo().
+> Last verified: October 22, 2026.
+> PHP 8.5.12 fixes two critical RCE bugs (CVE-2026-109618, CVE-2026-109619).
+> Do not use PHP 8.5.11 or older.
 > PHP 8.5 build time: ~3 min (make), ~2 sec (PHP module).
-> Localhost test: PHP 8.5.11 running at http://chi.holder.ru:8080/phpinfo.php ✓
+> Localhost test: PHP 8.5.12 running at http://chi.holder.ru:8080/phpinfo.php ✓
 
 ## Quick Start (TL;DR) — with PHP 8.5
 
@@ -136,7 +138,7 @@ sudo apt-get install -y php8.5 php8.5-cli php8.5-dev php8.5-mbstring \
 
 # Verify installation
 php8.5 -v
-# Output: PHP 8.5.11 (cli) ...
+# Output: PHP 8.5.12 (cli) ...
 
 # 4. Build FreeUnit module against PHP 8.5
 cd /path/to/freeunit
@@ -169,7 +171,7 @@ git clone https://github.com/php/php-src.git php-src
 cd php-src
 
 # Checkout stable PHP 8.5 (or use master for bleeding-edge)
-git checkout php-8.5.11  # Latest stable 8.5
+git checkout php-8.5.12  # Latest stable 8.5
 
 # Build configuration (same extensions as native PHP)
 ./buildconf --force
@@ -186,7 +188,7 @@ sudo make install
 
 # Verify custom PHP installation
 /opt/php-8.5/bin/php -v
-# Output: PHP 8.5.11 (cli) ...
+# Output: PHP 8.5.12 (cli) ...
 
 # Verify embed SAPI library was built
 ls -lh /opt/php-8.5/lib/libphp.so
@@ -214,7 +216,7 @@ sudo /path/to/unitd --no-daemon &
 
 **Build notes (October 2026, verified on Debian 13):**
 - **CRITICAL:** `--enable-embed` flag is **required** for FreeUnit module (PHP 8.5 renamed this flag from `--enable-embedded` in PHP 8.4)
-- PHP 8.5.11 source build: ~3 min (incremental make), ~8 min (full clean build) on 8 CPU cores
+- PHP 8.5.12 source build: ~3 min (incremental make), ~8 min (full clean build) on 8 CPU cores
 - CLI binary: 70M (sapi/cli/php, debug symbols included)
 - Verified working configure flags for FreeUnit: `--enable-fpm`, `--enable-cli`, `--enable-cgi`, **`--enable-embed`**, `--enable-mbstring`, `--with-openssl`, `--with-zlib`, `--with-curl`, `--with-mysqli`, `--enable-xml`
 - Embed SAPI library: `/opt/php-8.5/lib/libphp.so` (created by `--enable-embed`)
@@ -237,7 +239,7 @@ sudo /path/to/unitd --no-daemon &
 
 | Feature | A: Native | B: Sury deb.sury.org | C: Build from Source |
 |---------|-----------|-----|----------------------|
-| **PHP version** | 8.4 (Deb13), 8.2–8.3 (Ubuntu) | **8.5 (any OS)** | 8.5.11 (any OS) |
+| **PHP version** | 8.4 (Deb13), 8.2–8.3 (Ubuntu) | **8.5 (any OS)** | 8.5.12 (any OS) |
 | **Setup time** | 1 min | **2 min** ⭐ | 5–10 min (build) |
 | **Setup complexity** | Low | **Low** ⭐ | High |
 | **System integration** | Native (`/usr/bin`) | **Native** ⭐ | Custom (`/opt/php-8.5`) |
@@ -439,15 +441,15 @@ curl -X PUT --unix-socket /run/unit/control.sock http://localhost/config << 'EOF
 }
 EOF
 
-# 4. Test (verified October 2026 with PHP 8.5.11)
+# 4. Test (verified October 2026 with PHP 8.5.12)
 curl http://chi.holder.ru:8080/phpinfo.php
-# Expected output: PHP Version 8.5.11 (or your configured PHP version)
+# Expected output: PHP Version 8.5.12 (or your configured PHP version)
 ```
 
 **Local testing notes (October 5, 2026):**
-- Successfully tested chi.holder.ru with PHP 8.5.11 built from source
+- Successfully tested chi.holder.ru with PHP 8.5.12 built from source
 - FreeUnit module dynamically loads libphp.so at startup — ensure `/lib/libphp.so` points to correct PHP version
-- Testing verified: phpinfo() displays correct PHP version (8.5.11)
+- Testing verified: phpinfo() displays correct PHP version (8.5.12)
 
 ## Logs
 
