@@ -242,6 +242,9 @@ nxt_epoll_create(nxt_event_engine_t *engine, nxt_uint_t mchanges,
     engine->u.epoll.mode = mode;
     engine->u.epoll.mchanges = mchanges;
     engine->u.epoll.mevents = mevents;
+#if (NXT_HAVE_EVENTFD)
+    engine->u.epoll.eventfd.fd = -1;
+#endif
 #if (NXT_HAVE_SIGNALFD)
     engine->u.epoll.signalfd.fd = -1;
 #endif
@@ -256,13 +259,40 @@ nxt_epoll_create(nxt_event_engine_t *engine, nxt_uint_t mchanges,
         goto fail;
     }
 
+    /*
+     * The engine descriptors are close-on-exec, so that an external
+     * application does not inherit them.  EPOLL_CLOEXEC, SFD_CLOEXEC and
+     * EFD_CLOEXEC come with epoll_create1() and the flags arguments of
+     * signalfd() and eventfd().  Without them, fcntl() sets the flag.
+     */
+
+#if (defined EPOLL_CLOEXEC)
+    engine->u.epoll.fd = epoll_create1(EPOLL_CLOEXEC);
+
+    if (engine->u.epoll.fd == -1) {
+        nxt_alert(&engine->task, "epoll_create1() failed %E", nxt_errno);
+        goto fail;
+    }
+#else
     engine->u.epoll.fd = epoll_create(1);
+
     if (engine->u.epoll.fd == -1) {
         nxt_alert(&engine->task, "epoll_create() failed %E", nxt_errno);
         goto fail;
     }
+#endif
 
+#if !(defined EPOLL_CLOEXEC)
+    if (nxt_fd_cloexec(&engine->task, engine->u.epoll.fd) != NXT_OK) {
+        goto fail;
+    }
+#endif
+
+#if (defined EPOLL_CLOEXEC)
+    nxt_debug(&engine->task, "epoll_create1(): %d", engine->u.epoll.fd);
+#else
     nxt_debug(&engine->task, "epoll_create(): %d", engine->u.epoll.fd);
+#endif
 
     if (engine->signals != NULL) {
 
@@ -725,15 +755,16 @@ nxt_epoll_add_signal(nxt_event_engine_t *engine)
     }
 
     /*
-     * Glibc signalfd() wrapper always has the flags argument.  Glibc 2.7
-     * and 2.8 signalfd() wrappers call the original signalfd() syscall
-     * without the flags argument.  Glibc 2.9+ signalfd() wrapper at first
-     * tries to call signalfd4() syscall and if it fails then calls the
-     * original signalfd() syscall.  For this reason the non-blocking mode
-     * is set separately.
+     * SFD_CLOEXEC and EFD_CLOEXEC need Linux 2.6.27, which SOCK_NONBLOCK in
+     * nxt_socket_create() already needs.  O_NONBLOCK is still set with
+     * fcntl() below.
      */
 
+#if (defined SFD_CLOEXEC)
+    fd = signalfd(-1, &engine->signals->sigmask, SFD_CLOEXEC);
+#else
     fd = signalfd(-1, &engine->signals->sigmask, 0);
+#endif
 
     if (fd == -1) {
         nxt_alert(&engine->task, "signalfd(%d) failed %E",
@@ -746,6 +777,14 @@ nxt_epoll_add_signal(nxt_event_engine_t *engine)
     if (nxt_fd_nonblocking(&engine->task, fd) != NXT_OK) {
         return NXT_ERROR;
     }
+
+#if !(defined SFD_CLOEXEC)
+    /* nxt_epoll_free() closes engine->u.epoll.signalfd.fd. */
+
+    if (nxt_fd_cloexec(&engine->task, fd) != NXT_OK) {
+        return NXT_ERROR;
+    }
+#endif
 
     nxt_debug(&engine->task, "signalfd(): %d", fd);
 
@@ -836,15 +875,16 @@ nxt_epoll_enable_post(nxt_event_engine_t *engine, nxt_work_handler_t handler)
     engine->u.epoll.post_handler = handler;
 
     /*
-     * Glibc eventfd() wrapper always has the flags argument.  Glibc 2.7
-     * and 2.8 eventfd() wrappers call the original eventfd() syscall
-     * without the flags argument.  Glibc 2.9+ eventfd() wrapper at first
-     * tries to call eventfd2() syscall and if it fails then calls the
-     * original eventfd() syscall.  For this reason the non-blocking mode
-     * is set separately.
+     * SFD_CLOEXEC and EFD_CLOEXEC need Linux 2.6.27, which SOCK_NONBLOCK in
+     * nxt_socket_create() already needs.  O_NONBLOCK is still set with
+     * fcntl() below.
      */
 
+#if (defined EFD_CLOEXEC)
+    engine->u.epoll.eventfd.fd = eventfd(0, EFD_CLOEXEC);
+#else
     engine->u.epoll.eventfd.fd = eventfd(0, 0);
+#endif
 
     if (engine->u.epoll.eventfd.fd == -1) {
         nxt_alert(&engine->task, "eventfd() failed %E", nxt_errno);
@@ -855,6 +895,13 @@ nxt_epoll_enable_post(nxt_event_engine_t *engine, nxt_work_handler_t handler)
     if (nxt_slow_path(ret != NXT_OK)) {
         return NXT_ERROR;
     }
+
+#if !(defined EFD_CLOEXEC)
+    ret = nxt_fd_cloexec(&engine->task, engine->u.epoll.eventfd.fd);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return NXT_ERROR;
+    }
+#endif
 
     nxt_debug(&engine->task, "eventfd(): %d", engine->u.epoll.eventfd.fd);
 
