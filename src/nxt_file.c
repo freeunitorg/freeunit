@@ -16,11 +16,19 @@ nxt_file_open(nxt_task_t *task, nxt_file_t *file, nxt_uint_t mode,
 #endif
 
     /* O_NONBLOCK is to prevent blocking on FIFOs, special devices, etc. */
-    mode |= (O_NONBLOCK | create);
+    mode |= (O_NONBLOCK | create | NXT_FILE_CLOEXEC);
 
     file->fd = open((char *) file->name, mode, access);
 
     file->error = (file->fd == -1) ? nxt_errno : 0;
+
+#if !(defined O_CLOEXEC)
+    if (file->fd != -1 && nxt_fd_cloexec(task, file->fd) != NXT_OK) {
+        file->error = nxt_errno;
+        (void) close(file->fd);
+        file->fd = -1;
+    }
+#endif
 
 #if (NXT_DEBUG)
     nxt_thread_time_update(task->thread);
@@ -54,7 +62,7 @@ nxt_file_openat2(nxt_task_t *task, nxt_file_t *file, nxt_uint_t mode,
     nxt_memzero(&how, sizeof(how));
 
     /* O_NONBLOCK is to prevent blocking on FIFOs, special devices, etc. */
-    mode |= (O_NONBLOCK | create);
+    mode |= (O_NONBLOCK | create | NXT_FILE_CLOEXEC);
 
     how.flags = mode;
     how.mode = access;
@@ -63,6 +71,14 @@ nxt_file_openat2(nxt_task_t *task, nxt_file_t *file, nxt_uint_t mode,
     file->fd = syscall(SYS_openat2, dfd, file->name, &how, sizeof(how));
 
     file->error = (file->fd == -1) ? nxt_errno : 0;
+
+#if !(defined O_CLOEXEC)
+    if (file->fd != -1 && nxt_fd_cloexec(task, file->fd) != NXT_OK) {
+        file->error = nxt_errno;
+        (void) close(file->fd);
+        file->fd = -1;
+    }
+#endif
 
 #if (NXT_DEBUG)
     nxt_thread_time_update(task->thread);
@@ -703,6 +719,26 @@ nxt_fd_blocking(nxt_task_t *task, nxt_fd_t fd)
 #endif /* NXT_HAVE_FIONBIO */
 
 
+/*
+ * Sets close-on-exec on a descriptor that was created without it.  Use the
+ * O_CLOEXEC, SOCK_CLOEXEC or similar flag of the creating call where the
+ * platform has one: then no other thread can fork() and exec() while the
+ * descriptor is inheritable.
+ */
+
+nxt_int_t
+nxt_fd_cloexec(nxt_task_t *task, nxt_fd_t fd)
+{
+    if (nxt_fast_path(fcntl(fd, F_SETFD, FD_CLOEXEC) != -1)) {
+        return NXT_OK;
+    }
+
+    nxt_alert(task, "fcntl(%d, F_SETFD, FD_CLOEXEC) failed %E", fd, nxt_errno);
+
+    return NXT_ERROR;
+}
+
+
 ssize_t
 nxt_fd_write(nxt_fd_t fd, u_char *buf, size_t size)
 {
@@ -800,6 +836,9 @@ nxt_file_fclose(nxt_task_t *task, FILE *fp)
  * nxt_file_redirect() redirects the file to the fd descriptor.
  * Then the fd descriptor is closed -- on the failing paths as well, so that
  * the caller can hand the descriptor over unconditionally.
+ *
+ * dup2() clears close-on-exec on file->fd.  The flag is set again, so that
+ * a log file that was reopened does not leak into an external application.
  */
 
 nxt_int_t
@@ -819,6 +858,11 @@ nxt_file_redirect(nxt_file_t *file, nxt_fd_t fd)
         (void) close(fd);
 
         return NXT_ERROR;
+    }
+
+    if (fcntl(file->fd, F_SETFD, FD_CLOEXEC) == -1) {
+        nxt_thread_log_alert("fcntl(%FD, F_SETFD, FD_CLOEXEC, \"%FN\") "
+                             "failed %E", file->fd, file->name, nxt_errno);
     }
 
     if (close(fd) != 0) {

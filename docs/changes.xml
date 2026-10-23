@@ -10,6 +10,16 @@
          date="2026-10-04" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="bugfix">
+<para>
+an "external" application, such as a Go or Node.js application, inherited
+descriptors that it cannot use: the epoll, signalfd and eventfd descriptors of
+Unit, the control socket and a second copy of the log file.  Unit now creates,
+opens and receives its descriptors close-on-exec.  The application keeps stdin,
+stdout, stderr and the descriptors that NXT_UNIT_INIT names.
+</para>
+</change>
+
 <change type="change">
 <para>
 a process reads every pending signal from its signalfd in one wakeup, instead

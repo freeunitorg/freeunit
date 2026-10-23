@@ -230,6 +230,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_port_queued_fd_test.c \
     src/test/nxt_port_doorbell_test.c \
     src/test/nxt_port_share_test.c \
+    src/test/nxt_cloexec_test.c \
     src/test/nxt_controller_peer_test.c \
     src/test/nxt_checked_test.c \
     src/test/nxt_conn_close_test.c \

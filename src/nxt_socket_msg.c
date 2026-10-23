@@ -50,7 +50,14 @@ nxt_recvmsg(nxt_socket_t s, nxt_iobuf_t *iob, nxt_uint_t niob,
     /* Cleared so that MSG_CTRUNC below is read from what recvmsg() wrote. */
     msg.msg_flags = 0;
 
-    n = recvmsg(s, &msg, 0);
+    /*
+     * Received descriptors are close-on-exec, as Unit's own are.  Only an
+     * external application process calls exec(), and nxt_external_start()
+     * clears the flag on the descriptors it hands over in NXT_UNIT_INIT.
+     * Where MSG_CMSG_CLOEXEC is absent, nxt_socket_msg_oob_get() and
+     * nxt_socket_msg_oob_get_fds() set the flag.
+     */
+    n = recvmsg(s, &msg, NXT_MSG_CMSG_CLOEXEC);
 
     if (nxt_fast_path(n != -1)) {
         oob->size = msg.msg_controllen;

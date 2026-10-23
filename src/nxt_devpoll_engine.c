@@ -128,12 +128,18 @@ nxt_devpoll_create(nxt_event_engine_t *engine, nxt_uint_t mchanges,
         goto fail;
     }
 
-    engine->u.devpoll.fd = open("/dev/poll", O_RDWR);
+    engine->u.devpoll.fd = open("/dev/poll", O_RDWR | NXT_FILE_CLOEXEC);
 
     if (engine->u.devpoll.fd == -1) {
         nxt_alert(&engine->task, "open(\"/dev/poll\") failed %E", nxt_errno);
         goto fail;
     }
+
+#if !(defined O_CLOEXEC)
+    if (nxt_fd_cloexec(&engine->task, engine->u.devpoll.fd) != NXT_OK) {
+        goto fail;
+    }
+#endif
 
     nxt_debug(&engine->task, "open(\"/dev/poll\"): %d", engine->u.devpoll.fd);
 

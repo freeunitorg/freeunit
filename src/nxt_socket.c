@@ -25,6 +25,16 @@ nxt_socket_create(nxt_task_t *task, nxt_uint_t domain, nxt_uint_t type,
 
 #endif
 
+    /*
+     * The socket is close-on-exec, so that an external application does not
+     * inherit it.  The control socket is an example: main creates it before
+     * it forks the prototype processes.
+     */
+
+#if (defined SOCK_CLOEXEC)
+    type |= SOCK_CLOEXEC;
+#endif
+
     s = socket(domain, type, protocol);
 
     if (nxt_slow_path(s == -1)) {
@@ -34,6 +44,15 @@ nxt_socket_create(nxt_task_t *task, nxt_uint_t domain, nxt_uint_t type,
     }
 
     nxt_debug(task, "socket(): %d", s);
+
+#if !(defined SOCK_CLOEXEC)
+
+    if (nxt_slow_path(nxt_fd_cloexec(task, s) != NXT_OK)) {
+        nxt_socket_close(task, s);
+        return -1;
+    }
+
+#endif
 
 #if !(NXT_HAVE_SOCK_NONBLOCK)
 
