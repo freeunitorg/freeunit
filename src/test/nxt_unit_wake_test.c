@@ -21,17 +21,27 @@
  *      thread does not try to make the set again.
  *   5. When the set was not made for an error that can go away (EMFILE),
  *      the next wait makes it, and one datagram wakes one thread again.
+ *   6. After NXT_UNIT_EPOLL_REORDER wakes for the shared port, the next
+ *      wait adds the port to the set again, and the set still reports it.
+ *   7. With fewer CPUs than the minimum, the set is not made, and the
+ *      thread waits in poll().
+ *   8. The CPUs are the CPUs of the affinity mask, not the online CPUs: a
+ *      process that runs on 2 CPUs of a larger system counts 2.
+ *
+ * The minimum of CPUs is set to 0 for 1-6, so that they run on any system.
  */
 
 #include "nxt_main.h"
 #include "nxt_unit.h"
 
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 
 
 #if (NXT_HAVE_EPOLL) && defined(EPOLLEXCLUSIVE)
@@ -277,6 +287,72 @@ nxt_wake_test_drain(void)
 }
 
 
+/*
+ * 8. A child process runs on 2 CPUs of its affinity mask, and counts its
+ * CPUs.  The count must be 2, not the number of online CPUs.  The case
+ * needs 2 CPUs in the mask and more than 2 online CPUs.
+ */
+
+static void
+nxt_wake_test_cpu_count(void)
+{
+#if (NXT_HAVE_LINUX_SCHED_GETAFFINITY)
+    int        i, k, n, status;
+    long       online;
+    pid_t      pid, w;
+    cpu_set_t  all, two;
+
+    CPU_ZERO(&all);
+    CPU_ZERO(&two);
+
+    online = sysconf(_SC_NPROCESSORS_ONLN);
+
+    if (sched_getaffinity(0, sizeof(all), &all) != 0
+        || CPU_COUNT(&all) < 2 || online <= 2)
+    {
+        printf("wake test: the CPU count is skipped, %ld online CPUs\n",
+               online);
+        return;
+    }
+
+    k = 0;
+
+    for (i = 0; i < CPU_SETSIZE && k < 2; i++) {
+        if (CPU_ISSET(i, &all)) {
+            CPU_SET(i, &two);
+            k++;
+        }
+    }
+
+    pid = fork();
+
+    if (pid == 0) {
+        if (sched_setaffinity(0, sizeof(two), &two) != 0) {
+            _exit(255);
+        }
+
+        _exit(nxt_unit_test_cpu_count());
+    }
+
+    n = -1;
+
+    if (pid > 0) {
+        do {
+            w = waitpid(pid, &status, 0);
+        } while (w == -1 && errno == EINTR);
+
+        if (w == pid && WIFEXITED(status)) {
+            n = WEXITSTATUS(status);
+        }
+    }
+
+    nxt_wake_test_assert(n == 2, "a process on 2 CPUs counts 2 CPUs", n);
+#else
+    printf("wake test: the CPU count is skipped, no sched_getaffinity()\n");
+#endif
+}
+
+
 int
 main(void)
 {
@@ -290,6 +366,8 @@ main(void)
         perror("socketpair");
         return 1;
     }
+
+    nxt_unit_test_wait_set_min_cpus(0);
 
     for (i = 0; i < NXT_WAKE_TEST_THREADS; i++) {
         t = &nxt_wake_test_threads[i];
@@ -431,6 +509,72 @@ main(void)
     for (i = 0; i < NXT_WAKE_TEST_THREADS; i++) {
         nxt_unit_test_wait_set_free(nxt_wake_test_threads[i].ws);
     }
+
+    /*
+     * 6. A context that the shared port woke 16 times adds the port to its
+     * set again at the next wait.  The set is still used, and it reports
+     * the datagram that waits in the socket.
+     */
+
+    ws = nxt_unit_test_wait_set_new();
+    if (ws == NULL) {
+        return 1;
+    }
+
+    t = &nxt_wake_test_threads[0];
+
+    nxt_wake_test_ring();
+
+    for (i = 0; i < 16; i++) {
+        n = nxt_unit_test_wait(ws, t->read[0], nxt_wake_test_shared[0], 0,
+                               revents);
+        if (n != 1 || (revents[1] & POLLIN) == 0) {
+            break;
+        }
+    }
+
+    nxt_wake_test_assert(i == 16 && nxt_unit_test_wait_set_shared_wakes(ws)
+                         == 16, "the shared port woke the context 16 times", i);
+
+    n = nxt_unit_test_wait(ws, t->read[0], nxt_wake_test_shared[0], 0,
+                           revents);
+
+    nxt_wake_test_assert(n == 1 && (revents[1] & POLLIN) != 0
+                         && nxt_unit_test_wait_set_epoll(ws)
+                         && nxt_unit_test_wait_set_shared_wakes(ws) == 1,
+                         "after the reorder, the set reports the port", n);
+
+    k = nxt_wake_test_drain();
+    nxt_wake_test_assert(k == 1, "the reorder read no datagram", k);
+
+    nxt_unit_test_wait_set_free(ws);
+
+    /*
+     * 7. With fewer online CPUs than the minimum, the wait does not make
+     * the set, and it reports the shared port as poll() does.
+     */
+
+    nxt_unit_test_wait_set_min_cpus(INT_MAX);
+
+    ws = nxt_unit_test_wait_set_new();
+    if (ws == NULL) {
+        return 1;
+    }
+
+    nxt_wake_test_ring();
+
+    n = nxt_unit_test_wait(ws, t->read[0], nxt_wake_test_shared[0], 0,
+                           revents);
+
+    nxt_wake_test_assert(n == 1 && (revents[1] & POLLIN) != 0
+                         && !nxt_unit_test_wait_set_epoll(ws),
+                         "with few CPUs, the context waits in poll()", n);
+
+    (void) nxt_wake_test_drain();
+
+    nxt_unit_test_wait_set_free(ws);
+
+    nxt_wake_test_cpu_count();
 
     printf("wake test: %s\n", nxt_wake_test_failures ? "FAILED" : "passed");
 

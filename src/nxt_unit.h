@@ -507,6 +507,9 @@ int      nxt_unit_test_wait(void *ws, int read_fd, int shared_fd, int timeout,
 int      nxt_unit_test_wait_set_epoll(void *ws);
 void     nxt_unit_test_wait_set_free(void *ws);
 void     nxt_unit_test_wait_set_fail(int err);
+void     nxt_unit_test_wait_set_min_cpus(int n);
+int      nxt_unit_test_cpu_count(void);
+int      nxt_unit_test_wait_set_shared_wakes(void *ws);
 uint8_t  nxt_unit_test_ctx_online(nxt_unit_ctx_t *ctx);
 void     nxt_unit_test_ctx_set_quit_pending(nxt_unit_ctx_t *ctx,
              uint8_t quit_param);
