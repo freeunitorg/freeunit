@@ -526,6 +526,13 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        its descriptors close-on-exec. The application keeps stdin, stdout,
        stderr and the descriptors that NXT_UNIT_INIT names.
 
+    *) Bugfix: the router stopped accepting connections at about 1000
+       open connections when unitd started with a soft RLIMIT_NOFILE of
+       1024, which is the default in Docker containers. The router and
+       the controller now raise their soft limit to the hard limit, but
+       not above 1048576. Application processes keep the limit that
+       unitd started with.
+
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 

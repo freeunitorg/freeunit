@@ -50,6 +50,7 @@ munmap
 open
 prctl
 pread64
+prlimit64
 pwrite64
 read
 recvfrom
