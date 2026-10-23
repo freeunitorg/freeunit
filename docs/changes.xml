@@ -12,6 +12,16 @@
 
 <change type="bugfix">
 <para>
+the router stopped accepting connections at about 1000 open connections
+when unitd started with a soft RLIMIT_NOFILE of 1024, which is the default
+in Docker containers.  The router and the controller now raise their soft
+limit to the hard limit, but not above 1048576.  Application processes keep
+the limit that unitd started with.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 an "external" application, such as a Go or Node.js application, inherited
 descriptors that it cannot use: the epoll, signalfd and eventfd descriptors of
 Unit, the control socket and a second copy of the log file.  Unit now creates,
