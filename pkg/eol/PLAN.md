@@ -175,6 +175,8 @@ Optionally patch `pkg/docker/Makefile` in place.
 [ OK    ] php 8.3 8.4 8.5 — in sync
 ```
 
+Since this example was written, go 1.24 and node 20 have been dropped before their drop dates, because upstream no longer fixes known CVEs in them. The comment at the top of `.github/workflows/release-docker.yml` names the CVEs.
+
 Exit code: `0` = in sync · `1` = missing or stale Dockerfiles
 
 ### New CLI flag: `--docker-makefile [DIR]`

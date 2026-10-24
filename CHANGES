@@ -548,6 +548,10 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        not above 1048576. Application processes keep the limit that
        unitd started with.
 
+    *) Change: the Node.js 20 Docker image (node-20) is no longer built.
+       Node.js 20 reached upstream end-of-life on 2026-04-30 and receives
+       no fix for CVE-2026-111497 in its bundled Brotli decoder.
+
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 
