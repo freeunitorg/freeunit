@@ -83,6 +83,9 @@ nxt_pid_t nxt_main_test_store_pid(void);
 nxt_bool_t nxt_main_test_store_exited(nxt_task_t *task, nxt_pid_t pid,
     int status);
 void nxt_main_test_store_set_exiting(nxt_task_t *task, nxt_bool_t exiting);
+void nxt_main_test_run_port_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+nxt_uint_t nxt_main_test_port_refused(void);
 #if (NXT_USE_CMSG_PID)
 void nxt_main_test_run_name_child(nxt_task_t *task, nxt_process_t *pprocess,
     nxt_process_t *process, nxt_pid_t ns_pid);
