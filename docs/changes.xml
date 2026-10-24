@@ -777,6 +777,14 @@ now flushed.
 </para>
 </change>
 
+<change type="change">
+<para>
+the Node.js 20 Docker image (node-20) is no longer built.  Node.js 20 reached
+upstream end-of-life on 2026-04-30 and receives no fix for CVE-2026-111497 in
+its bundled Brotli decoder.
+</para>
+</change>
+
 </changes>
 
 

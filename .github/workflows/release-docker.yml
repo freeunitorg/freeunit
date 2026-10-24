@@ -28,6 +28,11 @@
 #   RCE, CVSS 8.8), CVE-2026-33814 (HTTP/2 client DoS), CVE-2026-27142
 #   (html/template XSS), cgo DNS double-free, go tool pack path traversal —
 #   fixed only in 1.25.9+/1.26.2+.
+#
+#   node-20 is intentionally NOT built: Node.js upstream stopped patching
+#   after 20.20.2 (2026-04-30 EOL), leaving CVE-2026-111497 (bundled Brotli
+#   1.1.0 decoder out-of-bounds write, CVSS v4.0 9.2) unfixed.  It is
+#   patched only in 22.23.4+/24.22.1+/26.12.1+.
 
 name: "Release (Docker Images)"
 
@@ -107,7 +112,7 @@ jobs:
           # here, so its old-style tag does not go stale without a notice.
           legacy=$(jq -cn --argjson built "${variants}" '
             [ "go-1.25", "go-1.26", "java-17", "java-21",
-              "node-20", "node-22", "node-24", "perl-5.38", "perl-5.40",
+              "node-22", "node-24", "perl-5.38", "perl-5.40",
               "php-8.3", "php-8.4", "php-8.5",
               "python-3.12", "python-3.12-slim", "python-3.13",
               "python-3.13-slim", "python-3.14", "python-3.14-slim",

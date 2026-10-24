@@ -80,7 +80,7 @@ tools/unitctl/CHANGELOG.md	changelog-md
 SECURITY.md	security-md
 CHANGES	changes	docs/changes.xml
 
-# Pin "rust": the Rust toolchain of the Docker images.  The 30 generated
+# Pin "rust": the Rust toolchain of the Docker images.  The 29 generated
 # Dockerfiles take it from the template.  The builder images are tagged
 # with it, and the files below name those tags or install the same Rust.
 pkg/docker/template.Dockerfile	pin-source	rust	RUST_VERSION=
