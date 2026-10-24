@@ -13,7 +13,14 @@
       "id": null,
       "package": "chacha20",
       "version": "0.10.0",
-      "reason": "Linked through rand 0.10.1, which wasmtime-wasi uses to seed guest randomness. A yank is not an advisory: no RustSec record applies to this version. 0.10.1 is yanked as well and 0.10.2 is clean, but the Wasmtime 48.0.5 archive is vendored and its lock still names 0.10.0, so the version moves only when the pin does."
+      "reason": "Linked through rand 0.10.1, which wasmtime-wasi uses to seed guest randomness. A yank is not an advisory: no RustSec record applies to this version in the audited database. The Wasmtime 48.0.7 archive is vendored and its lock still names chacha20 0.10.0, so it cannot be updated independently of the source pin."
+    },
+    {
+      "kind": "unsound",
+      "id": "RUSTSEC-2026-0386",
+      "package": "tokio",
+      "version": "1.51.1",
+      "reason": "Linked by the Wasmtime 48.0.7 C API even with component-model, component-model-async and wasi-http disabled. RUSTSEC-2026-0386 concerns safe AsyncFd constructors accepting AsRawFd without guaranteeing a valid, owned and unchanged descriptor. All 245 linked package source trees other than Tokio, including Wasmtime, contain no AsyncFd callers; Tokio's own AsyncFd implementation is not used by this build. The source archive is vendored, so this exact version cannot be updated independently. Recheck reachability and remove this exception at the next pin bump."
     }
   ]
 }
