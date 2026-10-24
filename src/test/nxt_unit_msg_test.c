@@ -133,6 +133,18 @@ static int  nxt_unit_msg_test_wake_cb;
 static int  nxt_unit_msg_test_wake_dropped;
 static int  nxt_unit_msg_test_quit_dropped;
 static int  nxt_unit_msg_test_read_fds[2] = { -1, -1 };
+static int  nxt_unit_msg_test_shared_fds[2] = { -1, -1 };
+static int  nxt_unit_msg_test_shared_queue_fd = -1;
+
+/* See nxt_unit_msg_test_quit_drain_case(). */
+static int              nxt_unit_msg_test_real_recv;
+static int              nxt_unit_msg_test_drain_limit;
+static nxt_app_queue_t  *nxt_unit_msg_test_drain_queue;
+
+static struct {
+    nxt_port_msg_t       msg;
+    nxt_port_mmap_msg_t  rec;
+} nxt_packed  nxt_unit_msg_test_drain_item;
 static int nxt_unit_msg_test_send_records_to(nxt_unit_ctx_t *ctx,
     const nxt_port_mmap_msg_t *records, size_t nrecords, size_t tail);
 
@@ -414,9 +426,41 @@ static ssize_t
 nxt_unit_msg_test_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port, void *buf,
     size_t buf_size, void *oob, size_t *oob_size)
 {
+    int       notify;
+    ssize_t   n;
+    uint32_t  cookie;
+
     *oob_size = 0;
 
-    return 0;
+    if (!nxt_unit_msg_test_real_recv) {
+        return 0;
+    }
+
+    /* A blocking read, as libunit makes without this callback. */
+    n = recv(port->in_fd, buf, buf_size, 0);
+
+    /*
+     * The router puts a request in the shared queue after the context
+     * checked the queue and before the context read the read port.
+     */
+    if (n > 0 && port->in_fd == nxt_unit_msg_test_read_fds[0]
+        && nxt_unit_msg_test_drain_queue != NULL)
+    {
+        (void) nxt_app_queue_send(nxt_unit_msg_test_drain_queue,
+                                  &nxt_unit_msg_test_drain_item,
+                                  sizeof(nxt_unit_msg_test_drain_item),
+                                  nxt_unit_msg_test_drain_item.msg.stream,
+                                  &notify, &cookie);
+
+        nxt_unit_msg_test_drain_queue = NULL;
+
+        /* Another context took the last request the limit allows. */
+        if (nxt_unit_msg_test_drain_limit) {
+            nxt_unit_test_request_limit(ctx, 1, 1);
+        }
+    }
+
+    return n;
 }
 
 
@@ -3806,6 +3850,324 @@ nxt_unit_msg_test_shm_ack_case(void *data)
 }
 
 
+/*
+ * A graceful QUIT on the read port, and the shared port readable in the
+ * same wait: the router rang it for a request.  The context reads the read
+ * port first.  It serves that request and then quits, and it takes no
+ * other.  A normal QUIT stops the worker at once and leaves the request in
+ * the queue for another one; so does a graceful QUIT when the request
+ * limit was reached since the wait, or when the shared port was not
+ * readable.
+ *
+ * The request must not be in the queue when the context checks the queue
+ * before it waits, or it is taken there.  So the recv callback puts it in
+ * the queue when it reads the QUIT, after the wait.  alarm() turns a hang
+ * into a failure.
+ */
+
+typedef struct {
+    const char  *name;
+    uint8_t     quit_param;   /* NXT_PORT_QUIT_*. */
+    int         doorbell;     /* The shared port is readable. */
+    int         limit;        /* The request limit is reached meanwhile. */
+    int         served;       /* The request is served. */
+} nxt_unit_msg_test_drain_t;
+
+
+static const nxt_unit_msg_test_drain_t  quit_drains[] = {
+    { "graceful QUIT serves the request rung for, then quits",
+      NXT_PORT_QUIT_GRACEFUL, 1, 0, 1 },
+    { "normal QUIT leaves the request rung for in the queue",
+      NXT_PORT_QUIT_NORMAL, 1, 0, 0 },
+    { "graceful QUIT at the request limit leaves the request",
+      NXT_PORT_QUIT_GRACEFUL, 1, 1, 0 },
+    { "graceful QUIT with no doorbell leaves the request",
+      NXT_PORT_QUIT_GRACEFUL, 0, 0, 0 },
+};
+
+
+static int
+nxt_unit_msg_test_quit_drain_case(void *data)
+{
+    int                              rc, left;
+    u_char                           *p, junk[64];
+    uint32_t                         cookie;
+    nxt_app_queue_t                  *q;
+    nxt_port_msg_t                   bell;
+    const nxt_unit_msg_test_drain_t  *t = data;
+
+    struct {
+        nxt_port_msg_t  msg;
+        uint8_t         quit_param;
+    } nxt_packed  quit;
+
+    alarm(10);
+
+    /* What earlier cases left on the two sockets, which this child shares. */
+    while (recv(nxt_unit_msg_test_read_fds[0], junk, sizeof(junk),
+                MSG_DONTWAIT) >= 0)
+    { /* void */ }
+
+    while (recv(nxt_unit_msg_test_shared_fds[0], junk, sizeof(junk),
+                MSG_DONTWAIT) >= 0)
+    { /* void */ }
+
+    nxt_port_queue_init(nxt_unit_test_port_queue(
+                            nxt_unit_test_ctx_read_port(nxt_unit_msg_test_ctx)));
+
+    q = mmap(NULL, sizeof(nxt_app_queue_t), PROT_READ | PROT_WRITE,
+             MAP_SHARED, nxt_unit_msg_test_shared_queue_fd, 0);
+    if (q == MAP_FAILED) {
+        return 1;
+    }
+
+    nxt_app_queue_init(q);
+
+    /* The request, as the router enqueues it: a record over chunk 2. */
+    p = nxt_port_mmap_chunk_start(nxt_unit_msg_test_seg0, 2);
+
+    memset(&nxt_unit_msg_test_drain_item, 0,
+           sizeof(nxt_unit_msg_test_drain_item));
+
+    nxt_unit_msg_test_drain_item.msg.stream = nxt_unit_msg_test_stream;
+    nxt_unit_msg_test_drain_item.msg.pid = nxt_unit_msg_test_pid;
+    nxt_unit_msg_test_drain_item.msg.reply_port = nxt_unit_msg_test_reply_port;
+    nxt_unit_msg_test_drain_item.msg.type = _NXT_PORT_MSG_REQ_HEADERS;
+    nxt_unit_msg_test_drain_item.msg.last = 1;
+    nxt_unit_msg_test_drain_item.msg.mmap = 1;
+    nxt_unit_msg_test_drain_item.rec.mmap_id = 0;
+    nxt_unit_msg_test_drain_item.rec.chunk_id = 2;
+    nxt_unit_msg_test_drain_item.rec.size =
+                                     nxt_unit_msg_test_write_request(p);
+
+    nxt_unit_msg_test_drain_queue = q;
+    nxt_unit_msg_test_drain_limit = t->limit;
+
+    nxt_unit_msg_test_mode = NXT_UNIT_MSG_TEST_READ_BODY;
+    nxt_unit_msg_test_handler_calls = 0;
+    nxt_unit_msg_test_handler_ok = 0;
+    nxt_unit_msg_test_quit_called = 0;
+
+    if (t->doorbell) {
+        memset(&bell, 0, sizeof(bell));
+        bell.type = _NXT_PORT_MSG_READ_QUEUE;
+
+        if (write(nxt_unit_msg_test_shared_fds[1], &bell, sizeof(bell))
+            != (ssize_t) sizeof(bell))
+        {
+            return 2;
+        }
+    }
+
+    /* The QUIT nxt_runtime_port_send_quit() writes. */
+    memset(&quit, 0, sizeof(quit));
+    quit.msg.pid = nxt_unit_msg_test_pid;
+    quit.msg.type = _NXT_PORT_MSG_QUIT;
+    quit.quit_param = t->quit_param;
+
+    if (write(nxt_unit_msg_test_read_fds[1], &quit, sizeof(quit))
+        != (ssize_t) sizeof(quit))
+    {
+        return 3;
+    }
+
+    nxt_unit_test_ctx_set_ready(nxt_unit_msg_test_ctx, 1);
+    nxt_unit_msg_test_real_recv = 1;
+
+    rc = nxt_unit_run(nxt_unit_msg_test_ctx);
+
+    alarm(0);
+
+    /* The request is still in the queue unless it was served. */
+    left = nxt_app_queue_recv(q, junk, &cookie) != -1;
+
+    if (rc != NXT_UNIT_OK
+        || nxt_unit_test_ctx_online(nxt_unit_msg_test_ctx)
+        || !nxt_unit_msg_test_quit_called
+        || nxt_unit_msg_test_drain_queue != NULL
+        || nxt_unit_msg_test_handler_calls != t->served
+        || nxt_unit_msg_test_handler_ok != t->served
+        || left == t->served)
+    {
+        printf("unit msg test: rc %d, online %d, quit %d, handler %d/%d, "
+               "request left %d, expected rc %d, online 0, quit 1, "
+               "handler %d/%d, request left %d\n", rc,
+               (int) nxt_unit_test_ctx_online(nxt_unit_msg_test_ctx),
+               nxt_unit_msg_test_quit_called, nxt_unit_msg_test_handler_calls,
+               nxt_unit_msg_test_handler_ok, left, NXT_UNIT_OK, t->served,
+               t->served, !t->served);
+        fflush(stdout);
+
+        return 4;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * Runs nxt_unit_init() on "init", which must fail, and checks that libunit
+ * logged "expect".  libunit logs to stderr until it has the log fd of the
+ * daemon, so stderr goes to a file.  Returns 0, or the step that failed.
+ */
+static int
+nxt_unit_msg_test_init_refused(nxt_unit_init_t *init, const char *expect)
+{
+    char     log[2048];
+    FILE     *f;
+    ssize_t  n;
+
+    f = tmpfile();
+    if (f == NULL || dup2(fileno(f), STDERR_FILENO) == -1) {
+        return 2;
+    }
+
+    if (nxt_unit_init(init) != NULL) {
+        return 3;
+    }
+
+    n = pread(fileno(f), log, sizeof(log) - 1, 0);
+    log[n > 0 ? n : 0] = '\0';
+
+    if (strstr(log, expect) == NULL) {
+        printf("unit msg test: logged \"%s\", expected \"%s\"\n", log,
+               expect);
+        fflush(stdout);
+
+        return 4;
+    }
+
+    return 0;
+}
+
+
+/*
+ * NXT_UNIT_INIT starts with "<NXT_VERSION>/<NXT_UNIT_PROTOCOL_VERSION>".
+ * Two builds of one release can speak different protocols, so libunit
+ * refuses a daemon whose number differs from its own, or that writes
+ * none, although the version is the same.  The variable has no fields
+ * after the version, so a version that is accepted fails at the fields;
+ * the log tells which check refused it.
+ */
+
+typedef struct {
+    const char  *name;
+    const char  *version;    /* NULL: NXT_VERSION. */
+    int         protocol;    /* Added to NXT_UNIT_PROTOCOL_VERSION. */
+    int         form;        /* 0: "V;x", 1: "V/P;x", 2: "V/;x". */
+    const char  *expect;     /* In the log. */
+} nxt_unit_msg_test_handshake_t;
+
+
+static const nxt_unit_msg_test_handshake_t  handshakes[] = {
+    { "NXT_UNIT_INIT with this version and protocol is accepted",
+      NULL, 0, 1, "invalid number of variables" },
+    { "NXT_UNIT_INIT with no protocol number is refused",
+      NULL, 0, 0, "protocol mismatch" },
+    { "NXT_UNIT_INIT with an empty protocol number is refused",
+      NULL, 0, 2, "protocol mismatch" },
+    { "NXT_UNIT_INIT with another protocol number is refused",
+      NULL, 1, 1, "protocol mismatch" },
+    { "NXT_UNIT_INIT with another version is refused",
+      "0.0.0", 0, 1, "versions mismatch" },
+};
+
+
+static int
+nxt_unit_msg_test_handshake_case(void *data)
+{
+    int                                  rc;
+    char                                 env[128];
+    const char                           *version;
+    nxt_unit_init_t                      init;
+    const nxt_unit_msg_test_handshake_t  *t = data;
+
+    version = (t->version != NULL) ? t->version : NXT_VERSION;
+
+    if (t->form == 0) {
+        snprintf(env, sizeof(env), "%s;x", version);
+
+    } else if (t->form == 1) {
+        snprintf(env, sizeof(env), "%s/%d;x", version,
+                 NXT_UNIT_PROTOCOL_VERSION + t->protocol);
+
+    } else {
+        snprintf(env, sizeof(env), "%s/;x", version);
+    }
+
+    if (setenv(NXT_UNIT_INIT_ENV, env, 1) != 0) {
+        return 1;
+    }
+
+    memset(&init, 0, sizeof(init));
+    init.callbacks.request_handler = nxt_unit_msg_test_handler;
+
+    rc = nxt_unit_msg_test_init_refused(&init, t->expect);
+    if (rc != 0) {
+        printf("unit msg test: with %s=\"%s\"\n", NXT_UNIT_INIT_ENV, env);
+        fflush(stdout);
+
+        return rc;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * nxt_unit_init_t.size is 0 or the size of the struct as the caller built
+ * it.  A size that libunit accepts gets as far as NXT_UNIT_INIT, which the
+ * child does not have.  A caller built for a later libunit, or a mirror
+ * shorter than the 1.38 struct, is refused before anything else.
+ */
+
+typedef struct {
+    const char  *name;
+    int         set;         /* 0: size 0, 1: sizeof + delta. */
+    int         delta;
+    const char  *expect;     /* In the log. */
+} nxt_unit_msg_test_init_size_t;
+
+
+static const nxt_unit_msg_test_init_size_t  init_sizes[] = {
+    { "nxt_unit_init_t.size 0 is accepted", 0, 0,
+      "is not in the current environment" },
+    { "nxt_unit_init_t.size of the struct is accepted", 1, 0,
+      "is not in the current environment" },
+    { "nxt_unit_init_t.size of a later struct is refused", 1, 8,
+      "nxt_unit_init_t.size is" },
+    { "nxt_unit_init_t.size short of the 1.38 struct is refused", 1, -8,
+      "nxt_unit_init_t.size is" },
+};
+
+
+static int
+nxt_unit_msg_test_init_size_case(void *data)
+{
+    int                                  rc;
+    nxt_unit_init_t                      init;
+    const nxt_unit_msg_test_init_size_t  *t = data;
+
+    if (unsetenv(NXT_UNIT_INIT_ENV) != 0) {
+        return 1;
+    }
+
+    memset(&init, 0, sizeof(init));
+    init.callbacks.request_handler = nxt_unit_msg_test_handler;
+
+    if (t->set) {
+        init.size = (uint32_t) ((int) sizeof(init) + t->delta);
+    }
+
+    rc = nxt_unit_msg_test_init_refused(&init, t->expect);
+    if (rc != 0) {
+        return rc;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
 int
 main(void)
 {
@@ -3858,6 +4220,9 @@ main(void)
     nxt_unit_msg_test_read_fds[0] = read[0];
     nxt_unit_msg_test_read_fds[1] = read[1];
 
+    nxt_unit_msg_test_shared_fds[0] = shared[0];
+    nxt_unit_msg_test_shared_fds[1] = shared[1];
+
     init.shared_port_fd = shared[0];
     init.shared_queue_fd = nxt_unit_msg_test_shm(sizeof(nxt_app_queue_t));
     init.log_fd = STDERR_FILENO;
@@ -3865,6 +4230,9 @@ main(void)
     if (init.shared_queue_fd == -1) {
         return 1;
     }
+
+    /* nxt_unit_init() closes it once it is mapped. */
+    nxt_unit_msg_test_shared_queue_fd = dup(init.shared_queue_fd);
 
     nxt_unit_msg_test_ctx = nxt_unit_init(&init);
     if (nxt_unit_msg_test_ctx == NULL) {
@@ -4083,6 +4451,24 @@ main(void)
                                "wait shrunk",
                                nxt_unit_msg_test_shm_ack_case, NULL,
                                NXT_UNIT_OK);
+
+    for (i = 0; i < nxt_nitems(handshakes); i++) {
+        nxt_unit_msg_test_in_child(handshakes[i].name,
+                                   nxt_unit_msg_test_handshake_case,
+                                   (void *) &handshakes[i], NXT_UNIT_OK);
+    }
+
+    for (i = 0; i < nxt_nitems(init_sizes); i++) {
+        nxt_unit_msg_test_in_child(init_sizes[i].name,
+                                   nxt_unit_msg_test_init_size_case,
+                                   (void *) &init_sizes[i], NXT_UNIT_OK);
+    }
+
+    for (i = 0; i < nxt_nitems(quit_drains); i++) {
+        nxt_unit_msg_test_in_child(quit_drains[i].name,
+                                   nxt_unit_msg_test_quit_drain_case,
+                                   (void *) &quit_drains[i], NXT_UNIT_OK);
+    }
 
     /*
      * Release the library.  Otherwise the global context pointer keeps it

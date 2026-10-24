@@ -17,6 +17,12 @@
 #include "nxt_unit_typedefs.h"
 
 
+/*
+ * A binding that declares these structs again in another language must
+ * match their layout: see docs/libunit-abi.md, and tools/perf/layout-dump.sh
+ * for the offsets on a platform.
+ */
+
 enum {
     NXT_UNIT_OK          = 0,
     NXT_UNIT_ERROR       = 1,
@@ -34,6 +40,19 @@ enum {
 };
 
 #define NXT_UNIT_INIT_ENV  "NXT_UNIT_INIT"
+
+/*
+ * The number of the protocol between libunit and the Unit daemon: the port
+ * messages, the port and application queues, the shared memory segments
+ * and the format of NXT_UNIT_INIT.  The daemon writes it after NXT_VERSION
+ * in NXT_UNIT_INIT ("1.38.0/1;..."), and libunit refuses to start when
+ * either differs from its own.  The version alone does not tell two builds
+ * of one release apart, and an application that links libunit statically
+ * keeps the libunit of its build.  Bump the number in the change that
+ * makes a libunit of the old number misread the daemon, or the reverse;
+ * tools/perf/layout-check.sh fails on most such changes.
+ */
+#define NXT_UNIT_PROTOCOL_VERSION  1
 
 #define NXT_UNIT_SHARED_PORT_ID  ((uint16_t) 0xFFFFu)
 
@@ -116,6 +135,12 @@ struct nxt_unit_request_info_s {
 /*
  * Set of application-specific callbacks.  The application may leave all
  * optional callbacks as NULL.
+ *
+ * Frozen since 1.38 at these 12 members.  nxt_unit_init_t holds the struct
+ * by value, so a member added here would move every field after
+ * "callbacks" in nxt_unit_init_t, and an embedder that mirrors the struct
+ * in another language would read them at the old offsets.  A new hook is
+ * added at the end of nxt_unit_init_t, after "size".
  */
 struct nxt_unit_callbacks_s {
     /*
@@ -163,14 +188,28 @@ struct nxt_unit_callbacks_s {
     ssize_t  (*port_recv)(nxt_unit_ctx_t *, nxt_unit_port_t *port,
                  void *buf, size_t buf_size, void *oob, size_t *oob_size);
 
+    /*
+     * The main context became ready for requests.  Optional.  A result
+     * other than NXT_UNIT_OK stops the read loop.
+     */
     int      (*ready_handler)(nxt_unit_ctx_t *);
 };
 
+nxt_unit_layout_assert(callbacks_frozen,
+    sizeof(nxt_unit_callbacks_t) == 12 * sizeof(void (*)(void)),
+    "nxt_unit_callbacks_t is frozen: add a hook after nxt_unit_init_t.size");
 
+
+/*
+ * The fields up to "size" keep their offsets.  Fields and hooks that a
+ * later release adds go after "size", and libunit reads one only when
+ * "size" covers it.  An embedder that mirrors the struct sets "size" to the
+ * size of its mirror.
+ */
 struct nxt_unit_init_s {
     void                  *data;     /* Opaque pointer to user-defined data. */
     void                  *ctx_data; /* Opaque pointer to user-defined data. */
-    int                   max_pending_requests;
+    int                   max_pending_requests;  /* Unused. */
 
     uint32_t              request_data_size;
     uint32_t              shm_limit;
@@ -178,6 +217,11 @@ struct nxt_unit_init_s {
 
     nxt_unit_callbacks_t  callbacks;
 
+    /*
+     * Unless ready_port.id.pid, ready_stream and read_port.id.pid are all
+     * set, nxt_unit_init() ignores the fields from here to log_fd, and
+     * shm_limit and request_limit, and reads them from NXT_UNIT_INIT.
+     */
     nxt_unit_port_t       ready_port;
     uint32_t              ready_stream;
     nxt_unit_port_t       router_port;
@@ -185,6 +229,14 @@ struct nxt_unit_init_s {
     int                   shared_port_fd;
     int                   shared_queue_fd;
     int                   log_fd;
+
+    /*
+     * sizeof(nxt_unit_init_t) as the caller built it, or 0 for the struct
+     * of 1.38, which ends here.  On LP64 the field takes the padding at the
+     * end, so the size stays 248 bytes.  nxt_unit_init() refuses a size
+     * that is smaller than the 1.38 struct or larger than its own.
+     */
+    uint32_t              size;
 };
 
 
@@ -507,6 +559,8 @@ void     nxt_unit_test_ctx_set_quit_pending(nxt_unit_ctx_t *ctx,
 uint8_t  nxt_unit_test_ctx_ready(nxt_unit_ctx_t *ctx);
 void     nxt_unit_test_ctx_set_ready(nxt_unit_ctx_t *ctx, uint8_t val);
 void     nxt_unit_test_ctx_quit_graceful(nxt_unit_ctx_t *ctx);
+void     nxt_unit_test_request_limit(nxt_unit_ctx_t *ctx, uint32_t limit,
+    uint32_t count);
 int      nxt_unit_test_add_queue_port(nxt_unit_ctx_t *ctx, pid_t pid,
     uint16_t id, int out_fd, void *queue);
 void     nxt_unit_test_new_mmap_failures(unsigned int failures);
