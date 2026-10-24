@@ -10,6 +10,26 @@
          date="2026-10-04" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="security">
+<para>
+update Wasmtime, wasmtime-wasi and wasmtime-wasi-http to 48.0.7 for
+RUSTSEC-2026-0350 through RUSTSEC-2026-0359, RUSTSEC-2026-0361 through
+RUSTSEC-2026-0364, and RUSTSEC-2026-0375 through RUSTSEC-2026-0379.
+Cranelift moves to 0.135.7 with Wasmtime. The contrib C API pin is
+48.0.7 too.
+</para>
+<para>
+Update unitctl's rustls-webpki to 0.103.16 for RUSTSEC-2026-0382 and
+webpki-roots to 1.0.10 for RUSTSEC-2026-0381.
+</para>
+<para>
+The vendored C API source lock retains yanked chacha20 0.10.0 and Tokio
+1.51.1 (RUSTSEC-2026-0386). These exact versions have documented audit
+exceptions; no caller of the affected Tokio AsyncFd constructors was
+found in the linked downstream sources.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 the router stopped accepting connections at about 1000 open connections
