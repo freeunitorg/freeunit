@@ -561,3 +561,49 @@ def test_python_compression_app_coding_removed_is_not_coded_again():
         assert status == 200, f'{accept}: status'
         assert 'Content-Encoding' not in headers, f'{accept}: removed'
         assert body == BODY, f'{accept}: the application bytes'
+
+
+def test_python_compression_empty_content_length():
+    # An application response with "Content-Length: 0" carries the length in
+    # the field, not in content_length_n.  Before the fix it was coded: the
+    # field was dropped for an empty chunked body with Content-Encoding, and
+    # "identity;q=0" was answered with 406.  An empty body has no bytes to
+    # code or to refuse.
+    configure(None)
+
+    for accept in ('gzip', 'gzip, identity;q=0', 'identity;q=0'):
+        status, headers, body = post(b'', accept=accept)
+
+        assert status == 200, f'{accept}: status'
+        assert 'Content-Encoding' not in headers, f'{accept}: not coded'
+        assert headers.get('Content-Length') == '0', f'{accept}: length kept'
+        assert body == b'', f'{accept}: empty body'
+
+
+@pytest.mark.parametrize('body', ['hello', ''])
+@pytest.mark.parametrize('encoding', ENCODINGS)
+def test_python_compression_short_body(encoding, body):
+    # The application declares "Content-Length: 10" and sends fewer bytes, or
+    # none.  No data buffer completes the declared length, so the stream is
+    # ended at the last buffer.  Before the fix the coded body ended without
+    # the stream's trailer, and a client could not decode it.
+    setup_compression(encoding)
+
+    status, headers, coded = fetch(
+        1,
+        encoding,
+        extra={
+            'X-Parts': '1',
+            'X-Delay': '0',
+            'X-Body': body,
+            'X-Content-Length': '10',
+        },
+    )
+
+    assert status == 200, 'status'
+    assert headers.get('Content-Encoding') == encoding, 'coded'
+
+    coded = dechunk(coded)
+
+    assert coded != b'', 'a coded body is never empty'
+    assert decoder(encoding)(coded) == body.encode(), 'complete stream'

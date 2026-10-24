@@ -304,6 +304,35 @@ nxt_http_comp_compress_app_response(nxt_task_t *task, nxt_http_request_t *r,
          * kinds are released through their own completion handler below.
          */
         if (nxt_buf_is_sync(in) || !nxt_buf_is_mem(in)) {
+            /*
+             * The last buffer with the stream still open: the application
+             * sent fewer bytes than its Content-Length said, so no data
+             * buffer ended the stream.  The Content-Encoding field is
+             * committed, so the stream is ended here, with no input.  A
+             * HEAD response drops its body buffers, this one included.
+             */
+            if (nxt_buf_is_last(in) && ctx->live) {
+                buf_len = nxt_http_comp_bound(ctx, 0)
+                          + NXT_HTTP_COMP_FLUSH_SLACK;
+
+                buf = nxt_buf_mem_ts_alloc(task, r->mem_pool, buf_len);
+                if (nxt_slow_path(buf == NULL)) {
+                    goto fail;
+                }
+
+                cbytes = nxt_http_comp_compress(ctx, buf->mem.start, buf_len,
+                                                NULL, 0, true);
+                if (nxt_slow_path(cbytes == -1)) {
+                    buf->completion_handler(task, buf, buf->parent);
+                    goto fail;
+                }
+
+                buf->mem.free += cbytes;
+
+                *tail = buf;
+                tail = &buf->next;
+            }
+
             *tail = in;
             tail = &in->next;
             continue;
@@ -333,7 +362,12 @@ nxt_http_comp_compress_app_response(nxt_task_t *task, nxt_http_request_t *r,
         cbytes = nxt_http_comp_compress(ctx, buf->mem.start, buf_len,
                                         in->mem.pos, in_len, last);
         if (nxt_slow_path(cbytes == -1)) {
-            nxt_buf_free(buf->data, buf);
+            /*
+             * nxt_buf_mem_ts_alloc() retained the pool; only the buffer's
+             * completion handler releases it.  nxt_buf_free() is a plain
+             * pool free, and left the pool retained once per failure.
+             */
+            buf->completion_handler(task, buf, buf->parent);
             goto fail;
         }
 
@@ -807,20 +841,45 @@ nxt_http_comp_accept_encoding(nxt_http_request_t *r, nxt_str_t *value)
 /*
  * The length that the compressor decision uses.  Returns -1 when the length
  * of the body is not known yet.
+ *
+ * An application's Content-Length arrives as a field.  Its value is not
+ * NUL-terminated by contract, and nxt_http_response_content_length() has
+ * already accepted it with optional whitespace around the digits, kept
+ * verbatim.  So the same trim runs here, and the digits are parsed over
+ * their length: strtol() read past the value, and on a 32-bit platform
+ * saturated at LONG_MAX for a body of 2 GiB or more.
  */
 
 static nxt_off_t
 nxt_http_comp_resp_length(const nxt_http_request_t *r)
 {
+    size_t            length;
+    const u_char      *p;
+    nxt_http_field_t  *f;
+
     if (r->resp.content_length_n > -1) {
         return r->resp.content_length_n;
     }
 
-    if (r->resp.content_length != NULL) {
-        return strtol((char *) r->resp.content_length->value, NULL, 10);
+    f = r->resp.content_length;
+
+    if (f == NULL) {
+        return -1;
     }
 
-    return -1;
+    p = f->value;
+    length = f->value_length;
+
+    while (length > 0 && (*p == ' ' || *p == '\t')) {
+        p++;
+        length--;
+    }
+
+    while (length > 0 && (p[length - 1] == ' ' || p[length - 1] == '\t')) {
+        length--;
+    }
+
+    return nxt_off_t_parse(p, length);
 }
 
 
@@ -1402,11 +1461,13 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
      */
     r->comp_ctx = NULL;
 
-    if (r->resp.content_length == NULL && r->resp.content_length_n == -1) {
-        return NXT_OK;
-    }
-
-    if (r->resp.content_length_n == 0) {
+    /*
+     * No length, or an empty body.  An application's "Content-Length: 0"
+     * is a field, not content_length_n, so it is read through the same
+     * function as the "min_length" test.  Before, such a response was
+     * coded to an empty stream, or refused with 406 for "identity;q=0".
+     */
+    if (nxt_http_comp_resp_length(r) <= 0) {
         return NXT_OK;
     }
 

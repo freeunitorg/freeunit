@@ -14,9 +14,18 @@ def application(environ, start_response):
     token = b'<%06d>' % rid
     part = (token * (size // len(token) + 1))[:size]
 
+    # X-Body replaces the generated part, and X-Content-Length the length
+    # the response declares, so a test can send fewer bytes than declared.
+    custom = environ.get('HTTP_X_BODY')
+    if custom is not None:
+        part = custom.encode()
+        size = len(part)
+
+    clen = environ.get('HTTP_X_CONTENT_LENGTH', str(size * parts))
+
     headers = [
         ('Content-Type', 'text/plain'),
-        ('Content-Length', str(size * parts)),
+        ('Content-Length', clen),
     ]
 
     # A large field makes the response buffer too large for a plain port
