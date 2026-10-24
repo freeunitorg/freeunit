@@ -29,6 +29,16 @@ of one signal per epoll wakeup.
 
 <change type="change">
 <para>
+libunit on Linux now wakes one idle thread for each request instead of all
+idle threads of the application.  With 8 PHP processes and one connection,
+an i5-6200U used 24% less CPU for each request.  With 2 processes and 2
+connections on one CPU, it used 4% more.  If the kernel does not accept
+the new wait, libunit waits as before.
+</para>
+</change>
+
+<change type="change">
+<para>
 reproducible builds: with SOURCE_DATE_EPOCH set, unitd, the static libraries,
 source tarballs, rpm, rust and jar builds no longer carry build paths, host
 names, kernel release or times.  RPM packages built with rpm 4.14 or later
