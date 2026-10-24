@@ -391,6 +391,30 @@ def test_variables_header_user_agent(search_in_file, wait_for_record):
     check_user_agent('no')
 
 
+def test_variables_header_transfer_encoding():
+    # The parser marks Transfer-Encoding "skip" so that it is not forwarded.
+    # The variable still has its value.
+    assert 'success' in client.conf(
+        {"http": {"chunked_transform": True}}, 'settings'
+    )
+    assert 'success' in client.conf(
+        {"X-TE": "$header_transfer_encoding"},
+        'routes/0/action/response_headers',
+    )
+
+    resp = client.post(
+        headers={
+            'Host': 'localhost',
+            'Transfer-Encoding': 'chunked',
+            'Connection': 'close',
+        },
+        body='1\r\nx\r\n0\r\n\r\n',
+    )
+
+    assert resp['status'] == 200, 'status'
+    assert resp['headers'].get('X-TE') == 'chunked', '$header_transfer_encoding'
+
+
 def test_variables_many(search_in_file, wait_for_record):
     def check_vars(uri, expect):
         reg = fr'^{re.escape(expect)}$'

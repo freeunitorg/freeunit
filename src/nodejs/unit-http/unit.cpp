@@ -727,26 +727,135 @@ lowcase(char c)
 }
 
 
+/*
+ * Node.js keeps the first value of these fields and drops the later ones
+ * (matchKnownFields() in lib/_http_incoming.js).  The router answers a
+ * second Host or Content-Length line with 400.
+ */
+
+static bool
+single_value_field(const char *name, uint8_t length)
+{
+    size_t  i;
+
+#define NXT_NODE_FIELD(s)  { s, sizeof(s) - 1 }
+
+    static const struct {
+        const char  *name;
+        size_t      length;
+    }  fields[] = {
+        NXT_NODE_FIELD("age"),
+        NXT_NODE_FIELD("authorization"),
+        NXT_NODE_FIELD("content-length"),
+        NXT_NODE_FIELD("content-type"),
+        NXT_NODE_FIELD("etag"),
+        NXT_NODE_FIELD("expires"),
+        NXT_NODE_FIELD("from"),
+        NXT_NODE_FIELD("host"),
+        NXT_NODE_FIELD("if-modified-since"),
+        NXT_NODE_FIELD("if-unmodified-since"),
+        NXT_NODE_FIELD("last-modified"),
+        NXT_NODE_FIELD("location"),
+        NXT_NODE_FIELD("max-forwards"),
+        NXT_NODE_FIELD("proxy-authorization"),
+        NXT_NODE_FIELD("referer"),
+        NXT_NODE_FIELD("retry-after"),
+        NXT_NODE_FIELD("server"),
+        NXT_NODE_FIELD("user-agent"),
+    };
+
+#undef NXT_NODE_FIELD
+
+    for (i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        if (fields[i].length == length
+            && memcmp(fields[i].name, name, length) == 0)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
 inline void
 Unit::append_header(nxt_unit_field_t *f, napi_value headers,
     napi_value raw_headers, uint32_t idx)
 {
-    char        *name;
-    uint8_t     i;
-    napi_value  str, vstr;
+    bool         has_prop;
+    char         *name, *val, *buf, lowname[256];
+    size_t       prev_len, len;
+    uint8_t      i;
+    const char   *sep;
+    napi_value   str, vstr, key, prev, joined;
+    napi_status  status;
 
     name = (char *) nxt_unit_sptr_get(&f->name);
+    val = (char *) nxt_unit_sptr_get(&f->value);
 
     str = create_string_latin1(name, f->name_length);
-
-    for (i = 0; i < f->name_length; i++) {
-        name[i] = lowcase(name[i]);
-    }
-
-    vstr = set_named_property(headers, name, f->value, f->value_length);
+    vstr = create_string_latin1(val, f->value_length);
 
     set_element(raw_headers, idx * 2, str);
     set_element(raw_headers, idx * 2 + 1, vstr);
+
+    for (i = 0; i < f->name_length; i++) {
+        lowname[i] = lowcase(name[i]);
+    }
+    lowname[f->name_length] = '\0';
+
+    key = create_string_latin1(lowname, f->name_length);
+
+    status = napi_has_own_property(env(), headers, key, &has_prop);
+    if (status != napi_ok) {
+        throw exception("Failed to check header property");
+    }
+
+    if (!has_prop) {
+        status = napi_set_property(env(), headers, key, vstr);
+        if (status != napi_ok) {
+            throw exception("Failed to set header property");
+        }
+
+        return;
+    }
+
+    if (single_value_field(lowname, f->name_length)) {
+        return;
+    }
+
+    prev = get_property(headers, key);
+    prev_len = get_value_string_latin1(prev, NULL, 0);
+
+    sep = (f->hash == NXT_UNIT_HASH_COOKIE && f->name_length == 6
+           && memcmp(lowname, "cookie", 6) == 0)
+          ? "; " : ", ";
+
+    len = prev_len + 2 + f->value_length;
+
+    buf = (char *) nxt_unit_malloc(unit_ctx_, len + 1);
+    if (buf == NULL) {
+        throw exception("Failed to allocate header value");
+    }
+
+    try {
+        get_value_string_latin1(prev, buf, prev_len + 1);
+        memcpy(buf + prev_len, sep, 2);
+        memcpy(buf + prev_len + 2, val, f->value_length);
+
+        joined = create_string_latin1(buf, len);
+
+    } catch (...) {
+        nxt_unit_free(unit_ctx_, buf);
+        throw;
+    }
+
+    nxt_unit_free(unit_ctx_, buf);
+
+    status = napi_set_property(env(), headers, key, joined);
+    if (status != napi_ok) {
+        throw exception("Failed to set header property");
+    }
 }
 
 

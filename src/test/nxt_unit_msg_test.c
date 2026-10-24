@@ -207,11 +207,14 @@ nxt_unit_msg_test_handler(nxt_unit_request_info_t *req)
         f = r->fields;
 
         nxt_unit_msg_test_handler_ok =
-            r->fields_count == 3
+            r->fields_count == 4
+            && r->authorization_field == 3
             && f[1].name_length == nxt_length("X-Dup")
             && nxt_unit_sptr_get(&f[1].name) == nxt_unit_sptr_get(&f[2].name)
             && memcmp(nxt_unit_sptr_get(&f[1].value), "1", 1) == 0
             && memcmp(nxt_unit_sptr_get(&f[2].value), "2", 1) == 0
+            && f[3].name_length == nxt_length("Authorization")
+            && memcmp(nxt_unit_sptr_get(&f[3].value), "Bearer tok", 10) == 0
             && f[0].name_length == nxt_length("Host")
             && memcmp(nxt_unit_sptr_get(&f[0].value), "localhost", 9) == 0;
 
@@ -1271,6 +1274,7 @@ nxt_unit_msg_test_write_request(u_char *p)
     } fields[] = {
         { "Host", "localhost" },
         { "X-Dup", "1" },
+        { "Authorization", "Bearer tok" },
         { "x-dup", "2" },
     };
 
@@ -1283,7 +1287,7 @@ nxt_unit_msg_test_write_request(u_char *p)
     r->content_length_field = NXT_UNIT_NONE_FIELD;
     r->content_type_field = NXT_UNIT_NONE_FIELD;
     r->cookie_field = NXT_UNIT_NONE_FIELD;
-    r->authorization_field = NXT_UNIT_NONE_FIELD;
+    r->authorization_field = 2;
 
     r->content_length = nxt_length(NXT_UNIT_MSG_TEST_BODY);
 
