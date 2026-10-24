@@ -24,6 +24,12 @@ struct nxt_http_field_s {
     uint16_t                  hash;
     uint8_t                   skip:1;
     uint8_t                   hopbyhop:1;
+    /*
+     * Only nxt_router_prepare_msg() uses it: it marks a request line that
+     * it joins to an earlier line of the same name, and it clears the mark
+     * before it returns.
+     */
+    uint8_t                   merged:1;
     uint8_t                   name_length;
     uint32_t                  value_length;
     u_char                    *name;

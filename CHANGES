@@ -24,6 +24,16 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
     *) Change: zstd 1.4.0 or later is now required to build with "--zstd";
        configure fails with an explicit message on older releases.
 
+    *) Bugfix: a request with two Cookie, Content-Type or Authorization
+       lines to a PHP, Perl or Ruby application did not set the value
+       that the application reads for that field. The router joined the
+       lines into one field but did not tell the application which field
+       it was: PHP filled no $_COOKIE and no PHP_AUTH_USER, and PHP, Perl
+       and Ruby set no CONTENT_TYPE. Cookie lines are now joined with
+       "; " instead of ", ". The response compression of these
+       applications read only the first Accept-Encoding line of a
+       request; it now reads every line.
+
     *) Change: a text access log escapes each value that a variable
        expands to with one test per eight bytes instead of four tests per
        byte, and copies a line with no byte to escape as it is. The access
