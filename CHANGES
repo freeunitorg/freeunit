@@ -15,6 +15,15 @@ Changes with FreeUnit 1.38.0                                     09 Nov 2026
        target already is that path. REQUEST_URI keeps the original request
        target. See https://github.com/nginx/unit/issues/1615.
 
+    *) Feature: PHP runs a fixed "script" target from OPcache without
+       opening the script file on each request, when
+       "opcache.validate_timestamps" is off. A warm request then makes a
+       stat and an access call on the script file in place of the open, the
+       fstat calls, the lseek and the close. The request opens the script as
+       before when "open_basedir", "opcache.revalidate_path" or
+       "opcache.restrict_api" is set, when the script is not cached, and on
+       PHP older than 8.1.
+
 
 Changes with FreeUnit 1.37.2                                     09 Nov 2026
 
