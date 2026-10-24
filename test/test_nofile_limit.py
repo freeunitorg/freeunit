@@ -1,5 +1,4 @@
 import resource
-import socket
 import subprocess
 import time
 from pathlib import Path
@@ -7,7 +6,6 @@ from pathlib import Path
 import pytest
 
 from unit.applications.lang.python import ApplicationPython
-from unit.option import option
 
 prerequisites = {'modules': {'python': 'any'}}
 
@@ -48,28 +46,6 @@ def wait_pid(title, ppid=None, exclude=None):
         time.sleep(0.1)
 
     return None
-
-
-def wait_control():
-    # The control client fails the test on a refused connect, so wait for
-    # the restarted controller to accept on the control socket first.
-
-    addr = f'{option.temp_dir}/control.unit.sock'
-
-    for _ in range(50):
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-
-        try:
-            sock.connect(addr)
-            return True
-
-        except (ConnectionRefusedError, FileNotFoundError):
-            time.sleep(0.1)
-
-        finally:
-            sock.close()
-
-    return False
 
 
 def soft_limit(pid):
@@ -116,7 +92,8 @@ def test_nofile_limit(skip_alert, skip_fds_check, unit_pid, temp_dir):
 
         name = f'nofile-{temp_dir.split("/")[-1]}'
 
-        assert wait_control(), 'controller did not accept'
+        # The control listening socket is held by main, so the connect in
+        # load() queues until the restarted controller answers.
 
         client.load('empty', name)
 
