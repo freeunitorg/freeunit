@@ -11,6 +11,7 @@ package unit
 import "C"
 
 import (
+	"io"
 	"net/http"
 )
 
@@ -36,6 +37,9 @@ func (r *response) Write(p []byte) (n int, err error) {
 
 	for written < l {
 		res := C.nxt_cgo_response_write(r.c_req, br, C.uint32_t(l - written))
+		if res < 0 {
+			return written, io.ErrShortWrite
+		}
 
 		written += int(res)
 		br += C.uintptr_t(res)
@@ -68,6 +72,9 @@ func (r *response) WriteHeader(code int) {
 	fields_size := 0
 
 	for k, vv := range r.header {
+		if len(k) > 255 {
+			continue
+		}
 		for _, v := range vv {
 			fields++
 			fields_size += len(k) + len(v)
@@ -78,6 +85,9 @@ func (r *response) WriteHeader(code int) {
 		C.uint32_t(fields_size))
 
 	for k, vv := range r.header {
+		if len(k) > 255 {
+			continue
+		}
 		for _, v := range vv {
 			C.nxt_unit_response_add_field(r.c_req, str_ref(k), C.uint8_t(len(k)),
 				str_ref(v), C.uint32_t(len(v)))

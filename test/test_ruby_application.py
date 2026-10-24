@@ -323,6 +323,16 @@ def test_ruby_application_header_custom():
         '',
     ], 'header custom'
 
+    resp = client.post(
+        headers={
+            'Host': 'localhost',
+            'X-Long-Name': '1',
+            'Connection': 'close',
+        },
+        body='',
+    )
+    assert resp['status'] == 503, 'header custom name > 255'
+
 
 @pytest.mark.skip('not yet')
 def test_ruby_application_header_custom_non_printable():

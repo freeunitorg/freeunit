@@ -244,6 +244,40 @@ def test_node_application_set_header_array_with_override():
     ], 'set header array with override'
 
 
+def test_node_application_set_header_array_empty():
+    client.load('set_header_array_empty')
+
+    resp = client.get()
+    assert resp['status'] == 200, 'empty array status'
+    assert resp['body'] == 'body', 'empty array body'
+    assert 'Set-Cookie' not in resp['headers'], 'empty array'
+
+    resp = client.get(url='/last')
+    assert resp['status'] == 200, 'empty array last status'
+    assert resp['body'] == 'body', 'empty array last body'
+    assert resp['headers'].get('X-Header') == '1', 'empty array last header'
+    assert 'Set-Cookie' not in resp['headers'], 'empty array last'
+
+    resp = client.get(url='/override')
+    assert resp['status'] == 200, 'empty array override status'
+    assert 'Set-Cookie' not in resp['headers'], 'empty array override'
+
+    resp = client.get(url='/two')
+    assert resp['status'] == 200, 'two values status'
+    assert resp['headers'].get('Set-Cookie') == ['a=1', 'b=2'], 'two values'
+    assert 'X-Empty' not in resp['headers'], 'two values empty array'
+
+
+def test_node_application_set_header_array_empty_first():
+    client.load('set_header_array_empty')
+
+    resp = client.get(url='/first')
+    assert resp['status'] == 200, 'empty array first status'
+    assert resp['body'] == 'body', 'empty array first body'
+    assert resp['headers'].get('X-Header') == '1', 'empty array first header'
+    assert 'Set-Cookie' not in resp['headers'], 'empty array first'
+
+
 @pytest.mark.skip('not yet')
 def test_node_application_status_message():
     client.load('status_message')

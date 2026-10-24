@@ -39,7 +39,7 @@ class ApplicationWebsocket(ApplicationProto):
         sha1 = hashlib.sha1((key + GUID).encode()).digest()
         return base64.b64encode(sha1).decode()
 
-    def upgrade(self, headers=None, sock=None):
+    def upgrade(self, headers=None, sock=None, read_timeout=60):
         key = None
 
         if headers is None:
@@ -59,7 +59,7 @@ class ApplicationWebsocket(ApplicationProto):
 
         resp = ''
         while True:
-            rlist = select.select([sock], [], [], 60)[0]
+            rlist = select.select([sock], [], [], read_timeout)[0]
             if not rlist:
                 pytest.fail("Can't read response from server.")
 

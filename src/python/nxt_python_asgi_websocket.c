@@ -261,7 +261,7 @@ static PyObject *
 nxt_py_asgi_websocket_accept(nxt_py_asgi_websocket_t *ws, PyObject *dict)
 {
     int                          rc;
-    char                         *subprotocol_str;
+    const char                   *subprotocol_str;
     PyObject                     *res, *headers, *subprotocol;
     Py_ssize_t                   subprotocol_len;
     nxt_py_asgi_calc_size_ctx_t  calc_size_ctx;
@@ -304,12 +304,17 @@ nxt_py_asgi_websocket_accept(nxt_py_asgi_websocket_t *ws, PyObject *dict)
         if (nxt_slow_path(res == NULL)) {
             return NULL;
         }
+
+        Py_DECREF(res);
     }
 
     subprotocol = PyDict_GetItem(dict, nxt_py_subprotocol_str);
     if (subprotocol != NULL && PyUnicode_Check(subprotocol)) {
-        subprotocol_str = PyUnicode_DATA(subprotocol);
-        subprotocol_len = PyUnicode_GET_LENGTH(subprotocol);
+        subprotocol_str = PyUnicode_AsUTF8AndSize(subprotocol,
+                                                  &subprotocol_len);
+        if (nxt_slow_path(subprotocol_str == NULL)) {
+            return NULL;
+        }
 
         calc_size_ctx.fields_size += ws_protocol.length + subprotocol_len;
         calc_size_ctx.fields_count++;
@@ -336,6 +341,8 @@ nxt_py_asgi_websocket_accept(nxt_py_asgi_websocket_t *ws, PyObject *dict)
         if (nxt_slow_path(res == NULL)) {
             return NULL;
         }
+
+        Py_DECREF(res);
     }
 
     if (subprotocol_len > 0) {
@@ -576,6 +583,7 @@ nxt_py_asgi_websocket_handler(nxt_unit_websocket_frame_t *frame)
     if (nxt_slow_path(msg == NULL)) {
         exc = PyErr_Occurred();
         Py_INCREF(exc);
+        PyErr_Clear();
 
         goto raise;
     }
@@ -1027,6 +1035,7 @@ nxt_py_asgi_websocket_close_handler(nxt_unit_request_info_t *req)
     if (nxt_slow_path(msg == NULL)) {
         exc = PyErr_Occurred();
         Py_INCREF(exc);
+        PyErr_Clear();
 
         nxt_py_asgi_websocket_receive_fail(ws, exc);
 
@@ -1114,6 +1123,8 @@ nxt_py_asgi_websocket_done(PyObject *self, PyObject *future)
     while (!nxt_queue_is_empty(&ws->pending_frames)) {
         nxt_unit_websocket_done(nxt_py_asgi_websocket_pop_frame(ws));
     }
+
+    Py_CLEAR(ws->receive_future);
 
     nxt_unit_request_done(ws->req, rc);
 

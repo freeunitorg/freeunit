@@ -185,8 +185,6 @@ nxt_java_OutputStream_write(JNIEnv *env, jclass cls, jlong req_info_ptr,
     req = nxt_jlong2ptr(req_info_ptr);
     data = req->data;
 
-    ptr = (*env)->GetPrimitiveArrayCritical(env, b, NULL);
-
     while (len > 0) {
         buf = nxt_java_OutputStream_req_buf(env, req);
         if (buf == NULL) {
@@ -196,7 +194,16 @@ nxt_java_OutputStream_write(JNIEnv *env, jclass cls, jlong req_info_ptr,
         copy = buf->end - buf->free;
         copy = copy < len ? copy : len;
 
+        ptr = (*env)->GetPrimitiveArrayCritical(env, b, NULL);
+        if (ptr == NULL) {
+            nxt_java_throw_IOException(env, "Failed to get byte array");
+            return;
+        }
+
         memcpy(buf->free, ptr + off, copy);
+
+        (*env)->ReleasePrimitiveArrayCritical(env, b, ptr, JNI_ABORT);
+
         buf->free += copy;
 
         len -= copy;
@@ -209,8 +216,6 @@ nxt_java_OutputStream_write(JNIEnv *env, jclass cls, jlong req_info_ptr,
             }
         }
     }
-
-    (*env)->ReleasePrimitiveArrayCritical(env, b, ptr, 0);
 }
 
 

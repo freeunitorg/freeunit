@@ -4013,24 +4013,25 @@ nxt_unit_request_read(nxt_unit_request_info_t *req, void *dst, size_t size)
     buf_res = nxt_unit_buf_read(&req->content_buf, &req->content_length,
                                 dst, size);
 
-    if (buf_res < (ssize_t) size && req->content_fd != -1) {
+    if ((size_t) buf_res < size && req->content_fd != -1) {
+        dst = nxt_pointer_to(dst, buf_res);
+        size -= (size_t) buf_res;
+
         res = read(req->content_fd, dst, size);
         if (nxt_slow_path(res < 0)) {
             nxt_unit_req_alert(req, "failed to read content: %s (%d)",
                                strerror(errno), errno);
 
-            return res;
+            return (buf_res > 0) ? buf_res : res;
         }
 
-        if (res < (ssize_t) size) {
+        if ((size_t) res < size) {
             nxt_unit_close(req->content_fd);
 
             req->content_fd = -1;
         }
 
         req->content_length -= res;
-
-        dst = nxt_pointer_to(dst, res);
 
     } else {
         res = 0;
