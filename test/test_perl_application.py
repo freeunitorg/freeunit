@@ -58,6 +58,68 @@ def test_perl_application(date_to_sec_epoch, sec_epoch):
     assert resp['body'] == body, 'body'
 
 
+def test_perl_application_content_type_lines():
+    # The router joins the two lines into one field.  Before, it did not
+    # tell the application which field that was, so CONTENT_TYPE was unset.
+    client.load('variables')
+
+    resp = client.post(
+        headers={
+            'Host': 'localhost',
+            'Content-Type': ['text/plain', 'charset=utf-8'],
+            'Connection': 'close',
+        },
+        body='x',
+    )
+
+    assert resp['status'] == 200, 'status'
+    assert (
+        resp['headers'].get('Content-Type') == 'text/plain, charset=utf-8'
+    ), 'CONTENT_TYPE'
+
+
+def test_perl_application_compression_accept_encoding_lines():
+    # Only the second Accept-Encoding line names gzip.  Before, the router
+    # marked that line skipped when it joined the lines for the application,
+    # and the response compression read the first line only.
+    client.load('variables')
+
+    resp = client.conf(
+        {
+            "http": {
+                "compression": {
+                    "types": ["text/plain"],
+                    "compressors": [{"encoding": "gzip"}],
+                }
+            }
+        },
+        'settings',
+    )
+
+    if 'supported compressor' in resp.get('detail', ''):
+        pytest.skip('unit built without gzip compression support')
+
+    assert 'success' in resp, 'compression'
+
+    # The coded body is not parsed: only the header is checked.
+    resp = client.post(
+        headers={
+            'Host': 'localhost',
+            'Content-Type': 'text/plain',
+            'Accept-Encoding': ['deflate', 'gzip'],
+            'Connection': 'close',
+        },
+        body='x' * 1024,
+        raw_resp=True,
+        encoding='latin1',
+    )
+
+    head = resp.partition('\r\n\r\n')[0].split('\r\n')
+
+    assert head[0].startswith('HTTP/1.1 200 '), 'status'
+    assert 'Content-Encoding: gzip' in head[1:], 'gzip'
+
+
 def test_perl_application_query_string():
     client.load('query_string')
 

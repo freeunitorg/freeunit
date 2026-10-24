@@ -60,6 +60,18 @@ the limit that unitd started with.
 
 <change type="bugfix">
 <para>
+a request with two Cookie, Content-Type or Authorization lines to a PHP, Perl
+or Ruby application did not set the value that the application reads for that
+field.  The router joined the lines into one field but did not tell the
+application which field it was: PHP filled no $_COOKIE and no PHP_AUTH_USER,
+and PHP, Perl and Ruby set no CONTENT_TYPE.  Cookie lines are now joined with
+"; " instead of ", ".  The response compression of these applications read
+only the first Accept-Encoding line of a request; it now reads every line.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 an "external" application, such as a Go or Node.js application, inherited
 descriptors that it cannot use: the epoll, signalfd and eventfd descriptors of
 Unit, the control socket and a second copy of the log file.  Unit now creates,
