@@ -82,6 +82,16 @@ stdout, stderr and the descriptors that NXT_UNIT_INIT names.
 
 <change type="change">
 <para>
+the main process now accepts NEW_PORT and REMOVE_PID only from a prototype,
+and only for an application process that this prototype started, as the
+router does for the messages on its main port.  NEW_PORT must also be for an
+application port.  Every core process now refuses a NEW_PORT message with a
+process type out of range.
+</para>
+</change>
+
+<change type="change">
+<para>
 a process reads every pending signal from its signalfd in one wakeup, instead
 of one signal per epoll wakeup.
 </para>

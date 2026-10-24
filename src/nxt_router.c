@@ -1853,7 +1853,7 @@ nxt_router_new_port_check(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_port_msg_new_port_t  new_port;
 
     if (nxt_slow_path(nxt_port_new_port_msg(msg, &new_port) != NXT_OK)) {
-        return "short new port message";
+        return "short or bad new port message";
     }
 
     if (nxt_router_msg_from(task, msg, NXT_PROCESS_MAIN)) {
