@@ -1255,10 +1255,9 @@ nxt_unit_process_read_msg(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf)
 
     pthread_mutex_lock(&ctx_impl->mutex);
 
-    wait = nxt_atomic_load(&ctx_impl->parked) > 0
-           || !nxt_queue_is_empty(&ctx_impl->pending_rbuf);
+    parked = nxt_atomic_load(&ctx_impl->parked);
 
-    parked = ctx_impl->parked;
+    wait = parked > 0 || !nxt_queue_is_empty(&ctx_impl->pending_rbuf);
 
     pthread_mutex_unlock(&ctx_impl->mutex);
 
@@ -1538,7 +1537,7 @@ nxt_unit_check_quit_pending(nxt_unit_ctx_t *ctx)
 
     ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
 
-    pending = ctx_impl->quit_pending;
+    pending = nxt_atomic_load(&ctx_impl->quit_pending);
 
     if (nxt_slow_path(pending != 0)) {
         nxt_unit_take_quit(ctx, pending);
@@ -8490,7 +8489,7 @@ nxt_unit_send_quit(nxt_unit_ctx_t *ctx, nxt_unit_ctx_impl_t *target,
 
     /* A normal quit overrides a pending graceful one. */
     if (quit_param == NXT_QUIT_NORMAL) {
-        target->quit_pending = set;
+        nxt_atomic_store(&target->quit_pending, set);
         owned = 1;
 
     } else {
