@@ -742,6 +742,40 @@ expression in a "match" object "if" still ends the request with a 500.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+duplicate Cookie headers in a request to a Python WSGI application were
+joined with ", " instead of "; ".  Python's http.cookies then read
+"a=1, b=2" as the value "1," for "a".
+</para>
+</change>
+
+<change type="change">
+<para>
+CONTENT_TYPE of a Python WSGI application now holds all Content-Type headers
+of the request, joined with ", ", as HTTP_CONTENT_TYPE does.  Before, it held
+only the first one.
+</para>
+</change>
+
+<change type="change">
+<para>
+req.headers of a Node.js application now joins duplicate headers: Cookie
+headers with "; ", other headers with ", ".  As in Node.js, only the first
+header is kept for Authorization, Content-Type, User-Agent, Referer and the
+other fields that Node.js does not join.  Duplicate Set-Cookie headers of a
+request are joined with ", ", where Node.js gives an array.  Before, the last
+header replaced the earlier ones.  req.rawHeaders is unchanged.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+when libunit moved the duplicate headers of a request next to each other,
+the index of the Authorization header could point at another header.
+</para>
+</change>
+
 <change type="change">
 <para>
 a text access log escapes each value that a variable expands to with one test

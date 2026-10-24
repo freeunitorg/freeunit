@@ -151,6 +151,38 @@ def test_perl_application_errors_print(wait_for_record):
     ), 'errors print'
 
 
+def test_perl_application_cookie_var_dup():
+    # The router joins the two Cookie lines for the application.  A cookie
+    # variable read after that still sees both lines.
+    client.load('body_empty')
+
+    assert 'success' in client.conf(
+        [
+            {
+                "action": {
+                    "pass": "applications/body_empty",
+                    "response_headers": {"X-Cookie-B": "$cookie_b"},
+                }
+            }
+        ],
+        'routes',
+    )
+    assert 'success' in client.conf(
+        {"*:8080": {"pass": "routes"}}, 'listeners'
+    )
+
+    resp = client.get(
+        headers={
+            'Host': 'localhost',
+            'Cookie': ['a=1', 'b=2'],
+            'Connection': 'close',
+        }
+    )
+
+    assert resp['status'] == 200, 'status'
+    assert resp['headers'].get('X-Cookie-B') == '2', '$cookie_b'
+
+
 def test_perl_application_header_equal_names():
     client.load('header_equal_names')
 

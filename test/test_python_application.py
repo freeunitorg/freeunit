@@ -108,6 +108,27 @@ a""".encode(),
     assert resp['headers']['Request-Uri'] == '/bar', 'REQUEST_URI unchanged'
 
 
+def test_python_application_header_dup():
+    client.load('header_dup')
+
+    resp = client.get(
+        headers={
+            'Host': 'localhost',
+            'Cookie': ['a=1', 'b=2'],
+            'X-Dup': ['1', '2'],
+            'Content-Type': ['text/plain', 'text/html'],
+            'Connection': 'close',
+        }
+    )
+
+    assert resp['status'] == 200, 'status'
+    headers = resp['headers']
+    assert headers['X-Cookie'] == 'a=1; b=2', 'Cookie lines joined with "; "'
+    assert headers['X-Dup'] == '1, 2', 'other lines joined with ", "'
+    assert headers['X-Http-Content-Type'] == 'text/plain, text/html'
+    assert headers['X-Content-Type'] == 'text/plain, text/html', 'CONTENT_TYPE'
+
+
 def test_python_application_query_string():
     client.load('query_string')
 

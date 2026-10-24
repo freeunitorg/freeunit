@@ -69,10 +69,10 @@ static int nxt_python_add_char(nxt_python_ctx_t *pctx, PyObject *name,
 static int nxt_python_add_py_string(nxt_python_ctx_t *pctx, PyObject *name,
     PyObject *value);
 static int nxt_python_add_field(nxt_python_ctx_t *pctx,
-    nxt_unit_field_t *field, int n, uint32_t vl);
+    nxt_unit_request_t *r, uint32_t field_idx, int n, uint32_t vl);
 static PyObject *nxt_python_field_name(const char *name, uint8_t len);
 static PyObject *nxt_python_field_value(nxt_unit_field_t *f, int n,
-    uint32_t vl);
+    uint32_t vl, const char *sep);
 static int nxt_python_add_obj(nxt_python_ctx_t *pctx, PyObject *name,
     PyObject *value);
 
@@ -682,23 +682,9 @@ nxt_python_get_environ(nxt_python_ctx_t *pctx,
             vl += 2 + f2->value_length;
         }
 
-        RC(nxt_python_add_field(pctx, f, j - i, vl));
+        RC(nxt_python_add_field(pctx, r, i, j - i, vl));
 
         i = j;
-    }
-
-    if (r->content_length_field != NXT_UNIT_NONE_FIELD) {
-        f = r->fields + r->content_length_field;
-
-        RC(nxt_python_add_sptr(pctx, nxt_py_content_length_str, &f->value,
-                               f->value_length));
-    }
-
-    if (r->content_type_field != NXT_UNIT_NONE_FIELD) {
-        f = r->fields + r->content_type_field;
-
-        RC(nxt_python_add_sptr(pctx, nxt_py_content_type_str, &f->value,
-                               f->value_length));
     }
 
 #undef RC
@@ -774,12 +760,15 @@ static int nxt_python_add_py_string(nxt_python_ctx_t *pctx, PyObject *name,
 
 
 static int
-nxt_python_add_field(nxt_python_ctx_t *pctx, nxt_unit_field_t *field, int n,
-    uint32_t vl)
+nxt_python_add_field(nxt_python_ctx_t *pctx, nxt_unit_request_t *r,
+    uint32_t field_idx, int n, uint32_t vl)
 {
-    char      *src;
-    PyObject  *name, *value;
+    char              *src;
+    const char        *sep;
+    PyObject          *name, *value;
+    nxt_unit_field_t  *field;
 
+    field = r->fields + field_idx;
     src = nxt_unit_sptr_get(&field->name);
 
     name = nxt_python_field_name(src, field->name_length);
@@ -792,7 +781,9 @@ nxt_python_add_field(nxt_python_ctx_t *pctx, nxt_unit_field_t *field, int n,
         return NXT_UNIT_ERROR;
     }
 
-    value = nxt_python_field_value(field, n, vl);
+    sep = (field_idx == r->cookie_field) ? "; " : ", ";
+
+    value = nxt_python_field_value(field, n, vl, sep);
 
     if (nxt_slow_path(value == NULL)) {
         nxt_unit_req_error(pctx->req,
@@ -809,6 +800,29 @@ nxt_python_add_field(nxt_python_ctx_t *pctx, nxt_unit_field_t *field, int n,
                            "Python failed to set the \"%s\" environ value",
                            PyUnicode_AsUTF8(name));
         goto fail;
+    }
+
+    if (field_idx == r->content_length_field) {
+        if (nxt_slow_path(PyDict_SetItem(pctx->environ,
+                                         nxt_py_content_length_str, value)
+                          != 0))
+        {
+            nxt_unit_req_error(pctx->req,
+                               "Python failed to set the \"CONTENT_LENGTH\" "
+                               "environ value");
+            goto fail;
+        }
+
+    } else if (field_idx == r->content_type_field) {
+        if (nxt_slow_path(PyDict_SetItem(pctx->environ,
+                                         nxt_py_content_type_str, value)
+                          != 0))
+        {
+            nxt_unit_req_error(pctx->req,
+                               "Python failed to set the \"CONTENT_TYPE\" "
+                               "environ value");
+            goto fail;
+        }
     }
 
     Py_DECREF(name);
@@ -867,7 +881,7 @@ nxt_python_field_name(const char *name, uint8_t len)
 
 
 static PyObject *
-nxt_python_field_value(nxt_unit_field_t *f, int n, uint32_t vl)
+nxt_python_field_value(nxt_unit_field_t *f, int n, uint32_t vl, const char *sep)
 {
     int       i;
     char      *p, *src;
@@ -888,7 +902,7 @@ nxt_python_field_value(nxt_unit_field_t *f, int n, uint32_t vl)
         p = nxt_cpymem(p, src, f->value_length);
 
         for (i = 1; i < n; i++) {
-            p = nxt_cpymem(p, ", ", 2);
+            p = nxt_cpymem(p, sep, 2);
 
             src = nxt_unit_sptr_get(&f[i].value);
             p = nxt_cpymem(p, src, f[i].value_length);
@@ -915,7 +929,7 @@ nxt_python_field_value(nxt_unit_field_t *f, int n, uint32_t vl)
     p = nxt_cpymem(p, src, f->value_length);
 
     for (i = 1; i < n; i++) {
-        p = nxt_cpymem(p, ", ", 2);
+        p = nxt_cpymem(p, sep, 2);
 
         src = nxt_unit_sptr_get(&f[i].value);
         p = nxt_cpymem(p, src, f[i].value_length);

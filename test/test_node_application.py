@@ -1,3 +1,4 @@
+import json
 import re
 
 import pytest
@@ -99,6 +100,45 @@ def test_node_application_get_variables():
     assert resp['headers']['X-Var-1'] == 'val1', 'GET variables'
     assert resp['headers']['X-Var-2'] == '', 'GET variables 2'
     assert resp['headers']['X-Var-3'] == '', 'GET variables 3'
+
+
+def test_node_application_header_dup():
+    client.load('header_dup')
+
+    resp = client.get(
+        headers={
+            'Host': 'localhost',
+            'Cookie': ['a=1', 'b=2'],
+            'X-Dup': ['1', '2'],
+            'User-Agent': ['first', 'second'],
+            'Connection': 'close',
+        }
+    )
+
+    assert resp['status'] == 200, 'status'
+    body = json.loads(resp['body'])
+    headers = body['headers']
+    assert headers['cookie'] == 'a=1; b=2', 'Cookie lines joined with "; "'
+    assert headers['x-dup'] == '1, 2', 'other lines joined with ", "'
+    assert headers['user-agent'] == 'first', 'first User-Agent kept'
+    assert body['raw'] == [
+        'Host',
+        'localhost',
+        'Cookie',
+        'a=1',
+        'Cookie',
+        'b=2',
+        'X-Dup',
+        '1',
+        'X-Dup',
+        '2',
+        'User-Agent',
+        'first',
+        'User-Agent',
+        'second',
+        'Connection',
+        'close',
+    ], 'rawHeaders'
 
 
 def test_node_application_post_variables():
