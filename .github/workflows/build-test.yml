@@ -1175,13 +1175,14 @@ jobs:
         run: |
           sudo apt-get -y update
           sudo apt-get -y install build-essential libssl-dev libpcre2-dev \
-            systemtap-sdt-dev
+            systemtap-sdt-dev zlib1g-dev libzstd-dev libbrotli-dev
 
       # --usdt is here because no other job compiles the probes.  The other
       # C test jobs build without it, so nxt_usdt_test runs with and without
-      # the probes.
+      # the probes.  --zlib, --zstd and --brotli are here so
+      # nxt_http_comp_select_test runs the compressor checks.
       - name: Configure unit (--tests --usdt)
-        run: ./configure --openssl --tests --usdt
+        run: ./configure --openssl --zlib --zstd --brotli --tests --usdt
 
       - name: Build unitd and libunit
         run: |

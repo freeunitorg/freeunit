@@ -3,6 +3,7 @@
  * Copyright (C) F5, Inc.
  */
 
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -49,23 +50,34 @@ nxt_zlib_deflate(nxt_http_comp_compressor_ctx_t *ctx, const uint8_t *in_buf,
                  size_t in_len, uint8_t *out_buf, size_t out_len, bool last)
 {
     int       ret;
-    size_t    compressed_bytes;
+    uInt      avail_out;
     z_stream  *z = &ctx->zlib_ctx;
 
-    z->avail_in = in_len;
+    if (in_len > UINT_MAX) {
+        return -1;
+    }
+
+    /*
+     * avail_out is an unsigned int.  The static path passes the rest of a
+     * mapping sized for the whole file, and for a file of 3.5 GiB or more
+     * that is above UINT_MAX on a 64-bit platform: the plain conversion kept
+     * only the low 32 bits, so a 128 KiB piece could get a few bytes of
+     * room, and the input it did not consume was dropped in silence.
+     */
+    avail_out = (out_len > UINT_MAX) ? UINT_MAX : (uInt) out_len;
+
+    z->avail_in = (uInt) in_len;
     z->next_in = (z_const Bytef *)in_buf;
 
-    z->avail_out = out_len;
+    z->avail_out = avail_out;
     z->next_out = out_buf;
-
-    compressed_bytes = z->total_out;
 
     ret = deflate(z, last ? Z_FINISH : Z_SYNC_FLUSH);
     if (ret == Z_STREAM_ERROR || ret == Z_BUF_ERROR) {
         return -1;
     }
 
-    return z->total_out - compressed_bytes;
+    return avail_out - z->avail_out;
 }
 
 

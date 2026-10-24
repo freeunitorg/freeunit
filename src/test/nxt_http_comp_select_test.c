@@ -203,6 +203,112 @@ nxt_hcs_expect(nxt_hcs_ctx_t *ctx)
     NXT_TEST_CHECK(ctx->thr->log, res > 0 && !refused,
                    "http comp select test failed: \"gzip\" with "
                    "compression on gave %i/%d", res, (int) refused);
+
+    {
+        nxt_http_field_t  cl_field;
+
+        nxt_memzero(&cl_field, sizeof(cl_field));
+        ctx->r->resp.content_length = &cl_field;
+
+        /*
+         * An application's Content-Length is read over value_length, not to
+         * a NUL: "100" followed by "999" in memory is 100.  That is below
+         * min_len 1000, so gzip is not selected, and the refused identity
+         * gives -1.  strtol() read 100999 and selected gzip.
+         */
+        cl_field.value = (u_char *) "100999";
+        cl_field.value_length = 3;
+
+        value.start = (u_char *) "gzip, identity;q=0";
+        value.length = nxt_length("gzip, identity;q=0");
+
+        res = nxt_http_comp_test_select(ctx->r, &value, 1, 1000, 0, &refused);
+
+        NXT_TEST_CHECK(ctx->thr->log, res == -1 && refused,
+                       "http comp select bounded clen test failed: %i/%d",
+                       res, (int) refused);
+
+        /*
+         * Whitespace around the digits is trimmed, as the response parser
+         * accepted it: " 100\t" is 100, below min_len, so identity (0) is
+         * selected and not refused.  strtol() gave the same; this pins the
+         * trim in front of nxt_off_t_parse(), which takes digits only.
+         */
+        value.start = (u_char *) "gzip";
+        value.length = nxt_length("gzip");
+
+        cl_field.value = (u_char *) " 100\t";
+        cl_field.value_length = 5;
+
+        res = nxt_http_comp_test_select(ctx->r, &value, 1, 1000, 0, &refused);
+
+        NXT_TEST_CHECK(ctx->thr->log, res == 0 && !refused,
+                       "http comp select trimmed clen test failed: %i/%d",
+                       res, (int) refused);
+
+        ctx->r->resp.content_length = NULL;
+    }
+
+#if (NXT_64BIT) && defined(MAP_NORESERVE)
+    {
+        ssize_t                         n, exact;
+        uint8_t                         out[1024], *map;
+        nxt_http_comp_compressor_ctx_t  cctx;
+
+        static const uint8_t  str[] = "the gzip output length is clamped";
+
+        /* The low 32 bits of this length are zero. */
+        static const size_t  map_len = (size_t) UINT_MAX + 1;
+
+        /*
+         * nxt_zlib_deflate() clamps an output length above UINT_MAX to
+         * UINT_MAX, the most that avail_out can hold.  The plain conversion
+         * kept the low 32 bits, zero here, so deflate() had no room and the
+         * call gave -1.  The mapping is reserved, not backed: only the pages
+         * written cost memory.  A platform that refuses it skips the check.
+         */
+        nxt_memzero(&cctx, sizeof(cctx));
+        cctx.level = 6;
+
+        NXT_TEST_CHECK(ctx->thr->log,
+                       nxt_http_comp_gzip_ops.init(&cctx) == 0,
+                       "gzip init failed");
+
+        exact = nxt_http_comp_gzip_ops.deflate(&cctx, str, sizeof(str) - 1,
+                                               out, sizeof(out), true);
+        nxt_http_comp_gzip_ops.free(&cctx);
+
+        NXT_TEST_CHECK(ctx->thr->log, exact > 0,
+                       "gzip of %uz bytes gave %z", sizeof(str) - 1, exact);
+
+        map = nxt_mem_mmap(NULL, map_len, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | NXT_MEM_MAP_ANON | MAP_NORESERVE,
+                           -1, 0);
+
+        if (map == MAP_FAILED) {
+            nxt_log_error(NXT_LOG_NOTICE, ctx->thr->log,
+                          "gzip clamp check skipped: mmap(%uz) failed %E",
+                          map_len, nxt_errno);
+
+        } else {
+            nxt_memzero(&cctx, sizeof(cctx));
+            cctx.level = 6;
+
+            NXT_TEST_CHECK(ctx->thr->log,
+                           nxt_http_comp_gzip_ops.init(&cctx) == 0,
+                           "gzip init failed");
+
+            n = nxt_http_comp_gzip_ops.deflate(&cctx, str, sizeof(str) - 1,
+                                               map, map_len, true);
+            nxt_http_comp_gzip_ops.free(&cctx);
+            nxt_mem_munmap(map, map_len);
+
+            NXT_TEST_CHECK(ctx->thr->log, n == exact,
+                           "gzip with out_len %uz gave %z, not %z",
+                           map_len, n, exact);
+        }
+    }
+#endif
 #endif
 
     return NXT_OK;
