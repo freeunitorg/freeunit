@@ -726,12 +726,33 @@ nxt_http_comp_accept_encoding(nxt_http_request_t *r, nxt_str_t *value)
 {
     u_char                  *p;
     size_t                  len;
+    uint16_t                hash;
     nxt_uint_t              n;
     nxt_http_field_t        *f, *first;
     nxt_http_fields_iter_t  iter;
 
     static const nxt_str_t  accept_encoding = nxt_string("Accept-Encoding");
 
+    f = r->accept_encoding;
+
+    if (f == NULL) {
+        nxt_str_null(value);
+        return NXT_OK;
+    }
+
+    if (nxt_fast_path(!r->multi_accept_encoding)) {
+        if (nxt_slow_path(f->skip)) {
+            nxt_str_null(value);
+            return NXT_OK;
+        }
+
+        value->start = f->value;
+        value->length = f->value_length;
+
+        return NXT_OK;
+    }
+
+    hash = f->hash;
     n = 0;
     len = 0;
     first = NULL;
@@ -741,7 +762,8 @@ nxt_http_comp_accept_encoding(nxt_http_request_t *r, nxt_str_t *value)
          f != NULL;
          f = nxt_http_fields_next(&iter))
     {
-        if (f->skip || f->name_length != accept_encoding.length
+        if (f->skip || f->hash != hash
+            || f->name_length != accept_encoding.length
             || nxt_strncasecmp(f->name, accept_encoding.start,
                                accept_encoding.length) != 0)
         {
@@ -786,7 +808,8 @@ nxt_http_comp_accept_encoding(nxt_http_request_t *r, nxt_str_t *value)
          f != NULL;
          f = nxt_http_fields_next(&iter))
     {
-        if (f->skip || f->name_length != accept_encoding.length
+        if (f->skip || f->hash != hash
+            || f->name_length != accept_encoding.length
             || nxt_strncasecmp(f->name, accept_encoding.start,
                                accept_encoding.length) != 0)
         {
@@ -1899,6 +1922,13 @@ nxt_http_comp_test_select(nxt_http_request_t *r, const nxt_str_t *value,
     }
 
     return nxt_http_comp_select_compressor(cp, r, value, identity_refused);
+}
+
+
+nxt_int_t
+nxt_http_comp_test_accept_encoding(nxt_http_request_t *r, nxt_str_t *value)
+{
+    return nxt_http_comp_accept_encoding(r, value);
 }
 
 #endif
