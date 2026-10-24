@@ -94,6 +94,8 @@ nxt_py_asgi_http_create(nxt_unit_request_info_t *req)
 
     if (nxt_fast_path(http != NULL)) {
         http->req = req;
+        http->link.next = NULL;
+        http->link.prev = NULL;
         http->receive_future = NULL;
         http->send_future = NULL;
         http->content_length = -1;
@@ -195,6 +197,17 @@ nxt_py_asgi_http_read_msg(nxt_py_asgi_http_t *http)
         body_buf = PyBytes_AS_STRING(body);
 
         read_res = nxt_unit_request_read(req, body_buf, size);
+        if (nxt_slow_path(read_res < 0)) {
+            Py_DECREF(body);
+            return PyErr_Format(PyExc_RuntimeError,
+                                "failed to read request body");
+        }
+
+        if (nxt_slow_path(read_res < size)) {
+            if (nxt_slow_path(_PyBytes_Resize(&body, read_res) < 0)) {
+                return NULL;
+            }
+        }
 
     } else {
         body = NULL;
@@ -572,8 +585,14 @@ nxt_py_asgi_http_drain(nxt_queue_link_t *lnk)
 
     http = nxt_container_of(lnk, nxt_py_asgi_http_t, link);
 
-    body_str = PyBytes_AS_STRING(http->send_body) + http->send_body_off;
-    body_len = PyBytes_GET_SIZE(http->send_body) - http->send_body_off;
+    if (PyBytes_Check(http->send_body)) {
+        body_str = PyBytes_AS_STRING(http->send_body) + http->send_body_off;
+        body_len = PyBytes_GET_SIZE(http->send_body) - http->send_body_off;
+
+    } else {
+        body_str = PyByteArray_AS_STRING(http->send_body) + http->send_body_off;
+        body_len = PyByteArray_GET_SIZE(http->send_body) - http->send_body_off;
+    }
 
     nxt_unit_req_debug(http->req, "asgi_http_drain: %d", (int) body_len);
 
@@ -679,6 +698,15 @@ nxt_py_asgi_http_done(PyObject *self, PyObject *future)
 
         rc = NXT_UNIT_OK;
     }
+
+    if (http->link.next != NULL) {
+        nxt_queue_remove(&http->link);
+        http->link.next = NULL;
+    }
+
+    Py_CLEAR(http->send_body);
+    Py_CLEAR(http->send_future);
+    Py_CLEAR(http->receive_future);
 
     nxt_unit_request_done(http->req, rc);
 

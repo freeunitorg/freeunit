@@ -271,11 +271,22 @@ def test_asgi_application_shm_ack_handle():
 
 
 def test_asgi_application_body_bytearray():
-    client.load('body_bytearray')
+    shm_limit = 10 * 1024 * 1024
+    max_body_size = 12 * 1024 * 1024
+
+    client.load('body_bytearray', limits={"shm": shm_limit})
+
+    assert 'success' in client.conf(
+        f'{{"http":{{"max_body_size": {max_body_size} }}}}',
+        'settings',
+    )
 
     body = '0123456789'
-
     assert client.post(body=body)['body'] == body
+
+    large_body = '0123456789AB' * 1024 * 1024
+    resp = client.post(body=large_body, read_buffer_size=1024 * 1024)
+    assert resp['body'] == large_body, 'bytearray drain across shm_ack'
 
 
 def test_asgi_keepalive_body():

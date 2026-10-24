@@ -141,6 +141,33 @@ def test_perl_application_input_copy():
     assert client.post(body=body)['body'] == body, 'input copy'
 
 
+def test_perl_application_input_read_after_done(findall):
+    client.load('input_read_after_done')
+
+    body = '0123456789'
+
+    # The env holds an object whose DESTROY reads psgi.input.  It runs
+    # after the request is done, when the env is released.
+    resp = client.post(body=body)
+    assert resp['status'] == 200, 'status'
+    assert resp['headers']['X-Read'] == 'none', 'no earlier read'
+    pid = resp['headers']['X-Pid']
+
+    # This response reports the read from DESTROY.  The app then reads
+    # psgi.input after $writer->close.
+    resp = client.post(url='/?streaming', body=body)
+    assert resp['status'] == 200, 'streaming status'
+    assert resp['headers']['X-Pid'] == pid, 'same worker after DESTROY'
+    assert resp['headers']['X-Read'] == '0', 'DESTROY read gets EOF'
+
+    resp = client.get()
+    assert resp['status'] == 200, 'status after streaming'
+    assert resp['headers']['X-Pid'] == pid, 'same worker after close'
+    assert resp['headers']['X-Read'] == '0', 'read after close gets EOF'
+
+    assert findall(r'exited on signal') == [], 'worker crash'
+
+
 def test_perl_application_errors_print(wait_for_record):
     client.load('errors_print')
 
@@ -198,6 +225,7 @@ def test_perl_application_body_io_file():
     client.load('body_io_file')
 
     assert client.get()['body'] == 'body\n', 'body io file'
+    assert client.get()['body'] == 'body\n', 'body io file retained handle'
 
 
 def test_perl_streaming_body_multiple_responses():

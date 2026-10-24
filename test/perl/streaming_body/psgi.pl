@@ -9,5 +9,7 @@ my $app = sub {
 
       $writer->write("Hello World!");
       $writer->close;
+      $writer->write("after close");
+      $writer->close;
     };
 };

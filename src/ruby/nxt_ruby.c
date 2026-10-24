@@ -902,7 +902,7 @@ nxt_ruby_rack_result_headers(nxt_unit_request_info_t *req, VALUE result,
     rb_hash_foreach(headers, nxt_ruby_hash_add,
                     (VALUE) (uintptr_t) &headers_info);
 
-    return rc;
+    return headers_info.rc;
 }
 
 
@@ -914,7 +914,9 @@ nxt_ruby_hash_info(VALUE r_key, VALUE r_value, VALUE arg)
 
     headers_info = (void *) (uintptr_t) arg;
 
-    if (nxt_slow_path(TYPE(r_key) != T_STRING)) {
+    if (nxt_slow_path(TYPE(r_key) != T_STRING
+                      || RSTRING_LEN(r_key) > UINT8_MAX))
+    {
         nxt_unit_req_error(headers_info->req,
                            "Ruby: Wrong header entry 'key' from application");
 
@@ -962,7 +964,7 @@ nxt_ruby_hash_info(VALUE r_key, VALUE r_value, VALUE arg)
     pos = value;
 
     for ( ;; ) {
-        pos = strchr(pos, '\n');
+        pos = memchr(pos, '\n', value_end - pos);
 
         if (pos == NULL) {
             break;
@@ -1052,7 +1054,7 @@ nxt_ruby_hash_add(VALUE r_key, VALUE r_value, VALUE arg)
     pos = value;
 
     for ( ;; ) {
-        pos = strchr(pos, '\n');
+        pos = memchr(pos, '\n', value_end - pos);
 
         if (pos == NULL) {
             break;
@@ -1088,13 +1090,22 @@ fail:
 }
 
 
+typedef struct {
+    int                      rc;
+    VALUE                    body;
+    nxt_unit_request_info_t  *req;
+} nxt_ruby_write_info_t;
+
+
 static int
 nxt_ruby_rack_result_body(nxt_unit_request_info_t *req, VALUE result)
 {
-    int    rc;
-    VALUE  fn, body;
+    int                    rc;
+    VALUE                  fn, body;
+    nxt_ruby_write_info_t  wi;
 
     body = rb_ary_entry(result, 2);
+    rc = NXT_UNIT_OK;
 
     if (rb_respond_to(body, rb_intern("to_path"))) {
 
@@ -1103,32 +1114,36 @@ nxt_ruby_rack_result_body(nxt_unit_request_info_t *req, VALUE result)
             nxt_unit_req_error(req,
                                "Ruby: Failed to get 'body' file path from "
                                "application");
-
-            return NXT_UNIT_ERROR;
+            rc = NXT_UNIT_ERROR;
+            goto close;
         }
 
         rc = nxt_ruby_rack_result_body_file_write(req, fn);
-        if (nxt_slow_path(rc != NXT_UNIT_OK)) {
-            return rc;
-        }
 
     } else if (rb_respond_to(body, rb_intern("each"))) {
+        wi.rc = NXT_UNIT_OK;
+        wi.body = Qnil;
+        wi.req = req;
+
         rb_block_call(body, rb_intern("each"), 0, NULL,
-                      nxt_ruby_rack_result_body_each, (VALUE) (uintptr_t) req);
+                      nxt_ruby_rack_result_body_each, (VALUE) (uintptr_t) &wi);
+
+        rc = wi.rc;
 
     } else {
         nxt_unit_req_error(req,
                            "Ruby: Invalid response 'body' format "
                            "from application");
-
-        return NXT_UNIT_ERROR;
+        rc = NXT_UNIT_ERROR;
     }
+
+close:
 
     if (rb_respond_to(body, rb_intern("close"))) {
         rb_funcall(body, rb_intern("close"), 0);
     }
 
-    return NXT_UNIT_OK;
+    return rc;
 }
 
 
@@ -1181,11 +1196,13 @@ nxt_ruby_rack_result_body_file_write(nxt_unit_request_info_t *req,
     nxt_ruby_rack_file_t  ruby_file;
     nxt_ruby_read_info_t  ri;
 
-    fd = open(RSTRING_PTR(filepath), O_RDONLY, 0);
+    fd = open(StringValueCStr(filepath), O_RDONLY, 0);
     if (nxt_slow_path(fd == -1)) {
         nxt_unit_req_error(req,
-                           "Ruby: Failed to open content file \"%s\": %s (%d)",
-                           RSTRING_PTR(filepath), strerror(errno), errno);
+                           "Ruby: Failed to open content file \"%.*s\": "
+                           "%s (%d)",
+                           (int) RSTRING_LEN(filepath), RSTRING_PTR(filepath),
+                           strerror(errno), errno);
 
         return NXT_UNIT_ERROR;
     }
@@ -1193,8 +1210,9 @@ nxt_ruby_rack_result_body_file_write(nxt_unit_request_info_t *req,
     rc = fstat(fd, &finfo);
     if (nxt_slow_path(rc == -1)) {
         nxt_unit_req_error(req,
-                           "Ruby: Content file fstat(\"%s\") failed: %s (%d)",
-                           RSTRING_PTR(filepath), strerror(errno), errno);
+                           "Ruby: Content file fstat(\"%.*s\") failed: %s (%d)",
+                           (int) RSTRING_LEN(filepath), RSTRING_PTR(filepath),
+                           strerror(errno), errno);
 
         close(fd);
 
@@ -1239,28 +1257,27 @@ nxt_ruby_response_write_cb(void *data)
 }
 
 
-typedef struct {
-    VALUE                    body;
-    nxt_unit_request_info_t  *req;
-} nxt_ruby_write_info_t;
-
-
 static VALUE
 nxt_ruby_rack_result_body_each(VALUE body, VALUE arg, int argc,
     const VALUE *argv, VALUE blockarg)
 {
-    nxt_ruby_write_info_t  wi;
+    int                    rc;
+    nxt_ruby_write_info_t  *wi;
 
     if (TYPE(body) != T_STRING) {
         return Qnil;
     }
 
-    wi.body = body;
-    wi.req = (void *) (uintptr_t) arg;
+    wi = (void *) (uintptr_t) arg;
+    wi->body = body;
 
-    (void) rb_thread_call_without_gvl(nxt_ruby_response_write,
-                                      (void *) (uintptr_t) &wi,
-                                      nxt_ruby_ubf, wi.req->ctx);
+    rc = (intptr_t) rb_thread_call_without_gvl(nxt_ruby_response_write,
+                                               (void *) (uintptr_t) wi,
+                                               nxt_ruby_ubf, wi->req->ctx);
+    if (nxt_slow_path(rc != NXT_UNIT_OK)) {
+        wi->rc = rc;
+        rb_iter_break();
+    }
 
     return Qnil;
 }
@@ -1305,18 +1322,22 @@ nxt_ruby_exception_log(nxt_unit_request_info_t *req, uint32_t level,
     ary = rb_funcall(err, rb_intern("backtrace"), 0);
 
     if (RARRAY_LEN(ary) == 0) {
-        nxt_unit_req_log(req, level, "Ruby: %s (%s)", RSTRING_PTR(msg),
-                         RSTRING_PTR(eclass));
+        nxt_unit_req_log(req, level, "Ruby: %.*s (%.*s)",
+                         (int) RSTRING_LEN(msg), RSTRING_PTR(msg),
+                         (int) RSTRING_LEN(eclass), RSTRING_PTR(eclass));
 
         return;
     }
 
-    nxt_unit_req_log(req, level, "Ruby: %s: %s (%s)",
+    nxt_unit_req_log(req, level, "Ruby: %.*s: %.*s (%.*s)",
+                     (int) RSTRING_LEN(RARRAY_PTR(ary)[0]),
                      RSTRING_PTR(RARRAY_PTR(ary)[0]),
-                     RSTRING_PTR(msg), RSTRING_PTR(eclass));
+                     (int) RSTRING_LEN(msg), RSTRING_PTR(msg),
+                     (int) RSTRING_LEN(eclass), RSTRING_PTR(eclass));
 
     for (i = 1; i < RARRAY_LEN(ary); i++) {
-        nxt_unit_req_log(req, level, "from %s",
+        nxt_unit_req_log(req, level, "from %.*s",
+                         (int) RSTRING_LEN(RARRAY_PTR(ary)[i]),
                          RSTRING_PTR(RARRAY_PTR(ary)[i]));
     }
 }

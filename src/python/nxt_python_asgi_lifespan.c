@@ -355,11 +355,11 @@ nxt_py_asgi_lifespan_target_shutdown(nxt_py_asgi_lifespan_t *lifespan)
     PyObject                *msg, *future, *res;
     nxt_py_asgi_ctx_data_t  *ctx_data;
 
-    ctx_data = lifespan->ctx_data;
-
     if (nxt_slow_path(lifespan == NULL || lifespan->disabled)) {
         return NXT_UNIT_OK;
     }
+
+    ctx_data = lifespan->ctx_data;
 
     lifespan->shutdown_called = 1;
 

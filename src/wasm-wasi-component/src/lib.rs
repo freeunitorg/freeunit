@@ -83,19 +83,21 @@ unsafe extern "C" fn setup(
                 &mut bindings::nxt_string("filesystem"),
                 ptr::null_mut(),
             );
-            for i in 0..bindings::nxt_conf_object_members_count(dirs_ptr) {
-                let value = bindings::nxt_conf_get_array_element(
-                    dirs_ptr,
-                    i.try_into().unwrap(),
-                );
-                let mut s = bindings::nxt_string("");
-                bindings::nxt_conf_get_string(value, &mut s);
-                dirs.push(
-                    std::str::from_utf8(std::slice::from_raw_parts(
-                        s.start, s.length,
-                    ))?
-                    .to_string(),
-                );
+            if !dirs_ptr.is_null() {
+                for i in 0..bindings::nxt_conf_array_elements_count(dirs_ptr) {
+                    let value = bindings::nxt_conf_get_array_element(
+                        dirs_ptr,
+                        i.try_into()?,
+                    );
+                    let mut s = bindings::nxt_string("");
+                    bindings::nxt_conf_get_string(value, &mut s);
+                    dirs.push(
+                        std::str::from_utf8(std::slice::from_raw_parts(
+                            s.start, s.length,
+                        ))?
+                        .to_string(),
+                    );
+                }
             }
         }
 
@@ -460,10 +462,7 @@ impl GlobalState {
             "HTTP/1.1" => request.version(http::Version::HTTP_11),
             "HTTP/2.0" => request.version(http::Version::HTTP_2),
             "HTTP/3.0" => request.version(http::Version::HTTP_3),
-            version => {
-                println!("unknown version: {version}");
-                request
-            }
+            _ => request,
         };
 
         let uri = http::Uri::builder()
@@ -489,7 +488,7 @@ impl GlobalState {
         // but for now this slurps up the entire body into memory and puts it
         // all in a single `BytesMut` which is then converted to `Bytes`.
         let mut body =
-            BytesMut::with_capacity(info.content_length().try_into().unwrap());
+            BytesMut::with_capacity(info.content_length().try_into()?);
 
         // TODO: can this perform a partial read?
         // TODO: how to make this async at the nxt level?
@@ -505,14 +504,13 @@ impl GlobalState {
     ) -> Result<T> {
         info.init_response(
             response.status().as_u16(),
-            response.headers().len().try_into().unwrap(),
+            response.headers().len().try_into()?,
             response
                 .headers()
                 .iter()
                 .map(|(k, v)| k.as_str().len() + v.len())
                 .sum::<usize>()
-                .try_into()
-                .unwrap(),
+                .try_into()?,
         )?;
         for (k, v) in response.headers() {
             info.add_field(k.as_str().as_bytes(), v.as_bytes())?;

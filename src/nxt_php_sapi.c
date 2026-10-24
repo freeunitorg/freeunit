@@ -1173,6 +1173,11 @@ nxt_php_request_handler(nxt_unit_request_info_t *req)
 
     r = req->request;
     app_target = r->app_target;
+    if (nxt_slow_path(app_target >= nxt_php_targets_count)) {
+        nxt_unit_request_done(req, NXT_UNIT_ERROR);
+        return;
+    }
+
     target = &nxt_php_targets[app_target];
 
     nxt_memzero(&ctx, sizeof(ctx));
@@ -1548,6 +1553,7 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
 #if (PHP_VERSION_ID >= 80100)
         PG(display_errors) = display_errors;
 #endif
+        SG(server_context) = NULL;
         nxt_unit_request_done(ctx->req, NXT_UNIT_ERROR);
 #if (PHP_VERSION_ID < 80100)
         fclose(fp);
@@ -1643,6 +1649,8 @@ shutdown:
 #endif
 
     php_request_shutdown(NULL);
+
+    SG(server_context) = NULL;
 
     if (ctx->req != NULL) {
         nxt_unit_request_done(ctx->req, NXT_UNIT_OK);

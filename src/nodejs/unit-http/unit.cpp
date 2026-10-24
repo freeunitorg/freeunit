@@ -427,6 +427,7 @@ Unit::request_handler(nxt_unit_request_info_t *req)
 
     } catch (exception &e) {
         nxt_unit_req_warn(req, "request_handler: %s", e.str);
+        nxt_unit_request_done(req, NXT_UNIT_ERROR);
     }
 }
 
@@ -850,6 +851,7 @@ napi_value
 Unit::request_read(napi_env env, napi_callback_info info)
 {
     void                     *data;
+    ssize_t                  res;
     uint32_t                 wm;
     nxt_napi                 napi(env);
     napi_value               this_arg, argv, buffer;
@@ -876,7 +878,14 @@ Unit::request_read(napi_env env, napi_callback_info info)
         }
 
         buffer = napi.create_buffer((size_t) wm, &data);
-        nxt_unit_request_read(req, data, wm);
+        res = nxt_unit_request_read(req, data, wm);
+        if (res <= 0) {
+            return nullptr;
+        }
+
+        if ((uint32_t) res < wm) {
+            buffer = napi.create_buffer_copy(data, (size_t) res);
+        }
 
     } catch (exception &e) {
         napi.throw_error(e);
@@ -948,7 +957,19 @@ Unit::response_send_headers(napi_env env, napi_callback_info info)
             name = napi.get_element(array_entry, 0);
             value = napi.get_element(array_entry, 1);
 
+            is_array = napi.is_array(value);
+            array_len = is_array ? napi.get_array_length(value) : 0;
+
+            /* setHeader() counts no bytes for an empty array. */
+            if (is_array && array_len == 0) {
+                continue;
+            }
+
             name_len = napi.get_value_string_latin1(name, ptr, header_len);
+            if (header_len < name_len + 1) {
+                throw exception("Response headers buffer overflow");
+            }
+
             name_ptr = ptr;
 
             ptr += name_len + 1;
@@ -956,12 +977,12 @@ Unit::response_send_headers(napi_env env, napi_callback_info info)
 
             hash = nxt_unit_field_hash(name_ptr, name_len);
 
-            is_array = napi.is_array(value);
-
             if (is_array) {
-                array_len = napi.get_array_length(value);
-
                 for (j = 0; j < array_len; j++) {
+                    if (req->response->fields_count >= keys_count) {
+                        throw exception("Response headers count overflow");
+                    }
+
                     array_val = napi.get_element(value, j);
 
                     val_type = napi.type_of(array_val);
@@ -972,6 +993,9 @@ Unit::response_send_headers(napi_env env, napi_callback_info info)
 
                     value_len = napi.get_value_string_latin1(array_val, ptr,
                                                              header_len);
+                    if (header_len < value_len + 1) {
+                        throw exception("Response headers buffer overflow");
+                    }
 
                     f = req->response->fields + req->response->fields_count;
                     f->skip = 0;
@@ -991,6 +1015,10 @@ Unit::response_send_headers(napi_env env, napi_callback_info info)
                 }
 
             } else {
+                if (req->response->fields_count >= keys_count) {
+                    throw exception("Response headers count overflow");
+                }
+
                 val_type = napi.type_of(value);
 
                 if (val_type != napi_string) {
@@ -998,6 +1026,9 @@ Unit::response_send_headers(napi_env env, napi_callback_info info)
                 }
 
                 value_len = napi.get_value_string_latin1(value, ptr, header_len);
+                if (header_len < value_len + 1) {
+                    throw exception("Response headers buffer overflow");
+                }
 
                 f = req->response->fields + req->response->fields_count;
                 f->skip = 0;

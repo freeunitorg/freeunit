@@ -733,6 +733,10 @@ nxt_java_Request_sendWsFrameBuf(JNIEnv *env, jclass cls,
             return;
         }
 
+        if (!nxt_unit_response_is_sent(req)) {
+            nxt_unit_response_send(req);
+        }
+
         nxt_unit_websocket_send(req, opCode, last, b + pos, len);
 
     } else {
@@ -792,8 +796,15 @@ nxt_java_Request_closeWs(JNIEnv *env, jclass cls, jlong req_info_ptr)
 
     data = req->data;
 
-    (*env)->DeleteGlobalRef(env, data->jresp);
-    (*env)->DeleteGlobalRef(env, data->jreq);
+    if (data->jresp != NULL) {
+        (*env)->DeleteGlobalRef(env, data->jresp);
+        data->jresp = NULL;
+    }
+
+    if (data->jreq != NULL) {
+        (*env)->DeleteGlobalRef(env, data->jreq);
+        data->jreq = NULL;
+    }
 
     nxt_unit_request_done(req, NXT_UNIT_OK);
 }

@@ -333,6 +333,11 @@ nxt_python_request_handler(nxt_unit_request_info_t *req)
 
     prepare_environ = 1;
 
+    if (nxt_slow_path(req->request->app_target >= nxt_py_targets->count)) {
+        rc = NXT_UNIT_ERROR;
+        goto done;
+    }
+
     target = &nxt_py_targets->target[req->request->app_target];
 
     environ = nxt_python_get_environ(pctx, target);
@@ -1160,14 +1165,22 @@ nxt_python_str_buf(PyObject *str, char **buf, uint32_t *len, PyObject **bytes)
 static PyObject *
 nxt_py_write(PyObject *self, PyObject *str)
 {
-    int  rc;
+    int               rc;
+    nxt_python_ctx_t  *pctx;
+
+    pctx = (nxt_python_ctx_t *) self;
+    if (nxt_slow_path(pctx->req == NULL)) {
+        return PyErr_Format(PyExc_RuntimeError,
+                            "write() is called "
+                            "outside of WSGI request processing");
+    }
 
     if (nxt_fast_path(!PyBytes_Check(str))) {
         return PyErr_Format(PyExc_TypeError, "the argument is not a %s",
                             NXT_PYTHON_BYTES_TYPE);
     }
 
-    rc = nxt_python_write((nxt_python_ctx_t *) self, str);
+    rc = nxt_python_write(pctx, str);
     if (nxt_slow_path(rc != NXT_UNIT_OK)) {
         return PyErr_Format(PyExc_RuntimeError,
                             "failed to write response value");
@@ -1188,6 +1201,7 @@ static PyObject *
 nxt_py_input_read(nxt_python_ctx_t *pctx, PyObject *args)
 {
     char        *buf;
+    ssize_t     res;
     PyObject    *content, *obj;
     Py_ssize_t  size, n;
 
@@ -1233,7 +1247,18 @@ nxt_py_input_read(nxt_python_ctx_t *pctx, PyObject *args)
 
     buf = PyBytes_AS_STRING(content);
 
-    size = nxt_unit_request_read(pctx->req, buf, size);
+    res = nxt_unit_request_read(pctx->req, buf, size);
+    if (nxt_slow_path(res < 0)) {
+        Py_DECREF(content);
+        PyErr_SetString(PyExc_IOError, "failed to read request body");
+        return NULL;
+    }
+
+    if (nxt_slow_path((Py_ssize_t) res < size)) {
+        if (nxt_slow_path(_PyBytes_Resize(&content, res) < 0)) {
+            return NULL;
+        }
+    }
 
     return content;
 }
@@ -1309,6 +1334,15 @@ nxt_py_input_getline(nxt_python_ctx_t *pctx, size_t size)
     buf = PyBytes_AS_STRING(content);
 
     res = nxt_unit_request_read(pctx->req, buf, res);
+    if (nxt_slow_path(res < 0)) {
+        Py_DECREF(content);
+        PyErr_SetString(PyExc_IOError, "failed to read request body");
+        return NULL;
+    }
+
+    if (nxt_slow_path(_PyBytes_Resize(&content, res) < 0)) {
+        return NULL;
+    }
 
     return content;
 }

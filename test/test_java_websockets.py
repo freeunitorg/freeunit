@@ -1,4 +1,8 @@
+import os
+import re
+import signal
 import struct
+import subprocess
 import time
 
 import pytest
@@ -53,6 +57,28 @@ def check_frame(frame, fin, opcode, payload, decode=True):
     assert data == payload, 'payload'
 
 
+def kill_application(name, unit_pid):
+    # A worker in an endless loop does not quit.  It fails the teardown of
+    # this test and of every later test, so kill it.  The prototype is a
+    # child of the main process, and the application is its child.
+    ps = subprocess.check_output(
+        ['ps', 'ax', '-o', 'pid=', '-o', 'ppid=', '-o', 'args=']
+    ).decode()
+
+    def child(ppid, kind):
+        pattern = fr'^\s*(\d+)\s+{ppid}\s+unit: "{name}" {kind}'
+        m = re.search(pattern, ps, re.M)
+        return None if m is None else m.group(1)
+
+    prototype = child(unit_pid, 'prototype')
+    if prototype is None:
+        return
+
+    application = child(prototype, 'application')
+    if application is not None:
+        os.kill(int(application), signal.SIGKILL)
+
+
 def test_java_websockets_handshake():
     client.load('websockets_mirror')
 
@@ -63,6 +89,29 @@ def test_java_websockets_handshake():
     assert resp['headers']['Upgrade'] == 'websocket', 'upgrade'
     assert resp['headers']['Connection'] == 'Upgrade', 'connection'
     assert resp['headers']['Sec-WebSocket-Accept'] == ws.accept(key), 'key'
+
+
+def test_java_websockets_handshake_header(unit_pid):
+    client.load('websockets_handshake_header')
+
+    # Start the application first.  Its start must not count against the
+    # short handshake timeout below.
+    assert client.get()['status'] == 200, 'start'
+
+    # The configurator adds X-Handshake after Request.upgrade().  Before the
+    # fix, the worker looped for ever on this header, so wait a few seconds.
+    try:
+        resp, sock, key = ws.upgrade(read_timeout=5)
+
+    except BaseException:
+        kill_application('websockets_handshake_header', unit_pid)
+        raise
+
+    sock.close()
+
+    assert resp['status'] == 101, 'status'
+    assert resp['headers']['Sec-WebSocket-Accept'] == ws.accept(key), 'key'
+    assert resp['headers']['X-Handshake'] == '1', 'handshake header'
 
 
 def test_java_websockets_mirror():

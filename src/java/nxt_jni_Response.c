@@ -32,7 +32,7 @@ static void JNICALL nxt_java_Response_addIntHeader(JNIEnv *env, jclass cls,
     jlong req_info_ptr, jarray name, jint value);
 
 static void nxt_java_add_int_header(nxt_unit_request_info_t *req,
-    const char *name, uint8_t name_len, int value);
+    const char *name, uint32_t name_len, int value);
 
 static jboolean JNICALL nxt_java_Response_containsHeader(JNIEnv *env,
     jclass cls, jlong req_info_ptr, jarray name);
@@ -267,6 +267,13 @@ nxt_java_Response_addHeader(JNIEnv *env, jclass cls, jlong req_info_ptr,
     nxt_unit_request_info_t  *req;
 
     name_len = (*env)->GetArrayLength(env, name);
+    if (name_len > UINT8_MAX) {
+        nxt_unit_req_warn(nxt_jlong2ptr(req_info_ptr),
+                          "addHeader: header name is too long: %d",
+                          (int) name_len);
+        return;
+    }
+
     value_len = (*env)->GetArrayLength(env, value);
 
     req = nxt_java_get_response_info(req_info_ptr, 1, name_len + value_len + 2);
@@ -319,7 +326,8 @@ nxt_java_get_response_info(jlong req_info_ptr, uint32_t extra_fields,
     data = req->data;
 
     if (!nxt_unit_response_is_init(req)) {
-        max_size = nxt_unit_buf_max();
+        max_size = nxt_unit_buf_max() - sizeof(nxt_unit_response_t)
+                   - 16 * (sizeof(nxt_unit_field_t) + 2);
         max_size = max_size < data->header_size ? max_size : data->header_size;
 
         rc = nxt_unit_response_init(req, 200, 16, max_size);
@@ -334,21 +342,53 @@ nxt_java_get_response_info(jlong req_info_ptr, uint32_t extra_fields,
                        - req->response->fields_count
         || extra_data > (uint32_t) (buf->end - buf->free))
     {
-        p = buf->start + sizeof(nxt_unit_response_t)
-            + req->response_max_fields * sizeof(nxt_unit_field_t);
+        uint32_t  max_fields, needed_size, overhead, limit;
 
-        max_size = 2 * (buf->end - p);
-        if (max_size > nxt_unit_buf_max()) {
-            nxt_unit_req_warn(req, "required max_size is too big: %"PRIu32,
-                max_size);
+        /*
+         * nxt_java_Request_upgrade() initializes the response with zero
+         * fields.  Doubling zero stays zero, so start from 16, as above.
+         */
+        max_fields = 2 * req->response_max_fields;
+        if (max_fields < 16) {
+            max_fields = 16;
+        }
+
+        while (max_fields < req->response->fields_count + extra_fields) {
+            max_fields *= 2;
+        }
+
+        overhead = sizeof(nxt_unit_response_t)
+                   + max_fields * (sizeof(nxt_unit_field_t) + 2);
+        if (overhead >= nxt_unit_buf_max()) {
+            nxt_unit_req_warn(req, "required max_fields is too big: %"PRIu32,
+                max_fields);
             return NULL;
         }
 
-        rc = nxt_unit_response_realloc(req, 2 * req->response_max_fields,
-                                       max_size);
+        limit = nxt_unit_buf_max() - overhead;
+
+        p = buf->start + sizeof(nxt_unit_response_t)
+            + req->response_max_fields * sizeof(nxt_unit_field_t);
+
+        needed_size = (uint32_t) (buf->free - p) + extra_data;
+        max_size = 2 * (buf->end - p);
+        while (max_size < needed_size) {
+            max_size *= 2;
+        }
+
+        if (max_size > limit) {
+            max_size = limit;
+            if (max_size < needed_size) {
+                nxt_unit_req_warn(req, "required max_size is too big: %"PRIu32,
+                    needed_size);
+                return NULL;
+            }
+        }
+
+        rc = nxt_unit_response_realloc(req, max_fields, max_size);
         if (rc != NXT_UNIT_OK) {
             nxt_unit_req_warn(req, "reallocation failed: %"PRIu32", %"PRIu32,
-                2 * req->response_max_fields, max_size);
+                max_fields, max_size);
             return NULL;
         }
     }
@@ -366,6 +406,12 @@ nxt_java_Response_addIntHeader(JNIEnv *env, jclass cls, jlong req_info_ptr,
     nxt_unit_request_info_t  *req;
 
     name_len = (*env)->GetArrayLength(env, name);
+    if (name_len > UINT8_MAX) {
+        nxt_unit_req_warn(nxt_jlong2ptr(req_info_ptr),
+                          "addIntHeader: header name is too long: %d",
+                          (int) name_len);
+        return;
+    }
 
     req = nxt_java_get_response_info(req_info_ptr, 1, name_len + 40);
     if (req == NULL) {
@@ -386,7 +432,7 @@ nxt_java_Response_addIntHeader(JNIEnv *env, jclass cls, jlong req_info_ptr,
 
 static void
 nxt_java_add_int_header(nxt_unit_request_info_t *req, const char *name,
-    uint8_t name_len, int value)
+    uint32_t name_len, int value)
 {
     char                 *p;
     nxt_unit_field_t     *f;
@@ -671,6 +717,13 @@ nxt_java_response_set_header(jlong req_info_ptr,
     nxt_unit_field_t         *f, *e;
     nxt_unit_response_t      *resp;
     nxt_unit_request_info_t  *req;
+
+    if (name_len > UINT8_MAX) {
+        nxt_unit_req_warn(nxt_jlong2ptr(req_info_ptr),
+                          "setHeader: header name is too long: %d",
+                          (int) name_len);
+        return NXT_UNIT_ERROR;
+    }
 
     req = nxt_java_get_response_info(req_info_ptr, 0, 0);
     if (req == NULL) {
