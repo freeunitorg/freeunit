@@ -77,6 +77,95 @@ def test_chunked_pipeline():
     assert len(re.findall('$', resp)) == 1
     assert len(re.findall('%', resp)) == 1
 
+    continue_resp = b'HTTP/1.1 100 Continue\r\n\r\n'
+
+    def read_continue(sock):
+        data = b''
+        sock.settimeout(5)
+
+        while len(data) < len(continue_resp):
+            part = sock.recv(len(continue_resp) - len(data))
+            if not part:
+                break
+
+            data += part
+
+        assert data == continue_resp
+
+    # Pipelined request arriving in the same body read after "0\r\n\r\n".
+    sock = client.http(
+        b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+        b'Expect: 100-continue\r\n'
+        b'Transfer-Encoding: chunked\r\n\r\n',
+        raw=True,
+        no_recv=True,
+    )
+    read_continue(sock)
+    sock.sendall(
+        b'1\r\n$\r\n0\r\n\r\n'
+        b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+        b'Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n'
+        b'1\r\n%\r\n0\r\n\r\n'
+    )
+    resp = client.recvall(sock, read_timeout=5).decode()
+    sock.close()
+
+    assert len(re.findall('200 OK', resp)) == 2
+    assert len(re.findall('Content-Length: 1', resp)) == 2
+    assert len(re.findall(r'\$', resp)) == 1
+    assert len(re.findall('%', resp)) == 1
+
+    # S2: Content-Length larger than body_buffer_size (16 KiB) with a
+    # pipelined second request arriving in the final body read.
+    sock = client.http(
+        b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+        b'Expect: 100-continue\r\n'
+        b'Content-Length: 17000\r\n\r\n',
+        raw=True,
+        no_recv=True,
+    )
+    read_continue(sock)
+    sock.sendall(
+        b'a' * 17000
+        + b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+        b'Content-Length: 1\r\nConnection: close\r\n\r\n%'
+    )
+    resp = client.recvall(sock, read_timeout=5).decode()
+    sock.close()
+
+    assert len(re.findall('200 OK', resp)) == 2
+    assert len(re.findall('Content-Length: 17000', resp)) == 1
+    assert len(re.findall('Content-Length: 1\r\n', resp)) == 1
+    assert 'a' * 17000 in resp
+    assert resp.endswith('\r\n\r\n%')
+
+    # S3: Chunked file-backed body split across CHUNK_MIDDLE in the first
+    # read ("1000\r\nabc") and the remaining 4093 chunk bytes + "0\r\n\r\n"
+    # + pipelined request in the second read.
+    sock = client.http(
+        b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+        b'Expect: 100-continue\r\n'
+        b'Transfer-Encoding: chunked\r\n\r\n'
+        b'1000\r\nabc',
+        raw=True,
+        no_recv=True,
+    )
+    read_continue(sock)
+    sock.sendall(
+        b'a' * 4093
+        + b'\r\n0\r\n\r\n'
+        + b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+        b'Content-Length: 1\r\nConnection: close\r\n\r\n%'
+    )
+    resp = client.recvall(sock, read_timeout=5).decode()
+    sock.close()
+
+    assert len(re.findall('200 OK', resp)) == 2
+    assert len(re.findall('Content-Length: 4096', resp)) == 1
+    assert len(re.findall('Content-Length: 1\r\n', resp)) == 1
+    assert 'abc' + 'a' * 4093 in resp
+    assert resp.endswith('\r\n\r\n%')
+
 
 def test_chunked_max_body_size():
     assert 'success' in client.conf(
@@ -275,6 +364,33 @@ def test_chunked_trailer():
 
 def test_chunked_transform():
     assert 'success' in client.conf(
+        [
+            {
+                "match": {"headers": {"Content-Length": "5"}},
+                "action": {
+                    "return": 200,
+                    "response_headers": {"X-CL": "$header_content_length"},
+                },
+            }
+        ],
+        'routes',
+    )
+    assert 'success' in client.conf(
+        {"*:8080": {"pass": "routes"}}, 'listeners'
+    )
+
+    resp = client.get(
+        headers={
+            'Host': 'localhost',
+            'Connection': 'close',
+            'Transfer-Encoding': 'chunked',
+        },
+        body='5\r\nhello\r\n0\r\n\r\n',
+    )
+    assert resp['status'] == 200
+    assert resp['headers']['X-CL'] == '5'
+
+    assert 'success' in client.conf(
         {"http": {"chunked_transform": False}}, 'settings'
     )
 
@@ -288,6 +404,10 @@ def test_chunked_transform():
             body='0\r\n\r\n',
         )['status']
         == 411
+    )
+
+    assert 'success' in client.conf(
+        {"*:8080": {"pass": "applications/mirror"}}, 'listeners'
     )
 
 

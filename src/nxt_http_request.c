@@ -53,6 +53,25 @@ static nxt_http_name_value_t *nxt_http_cookie(nxt_array_t *array, u_char *name,
      nxt_http_field_hash_char(NXT_HTTP_FIELD_HASH_INIT,                       \
         'c'), 'o'), 'o'), 'k'), 'i'), 'e')) & 0xFFFF)
 
+#define NXT_HTTP_CONTENT_LENGTH_HASH                                          \
+    (nxt_http_field_hash_end(                                                 \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(NXT_HTTP_FIELD_HASH_INIT,                       \
+        'c'), 'o'), 'n'), 't'), 'e'), 'n'), 't'), '-'), 'l'), 'e'), 'n'),     \
+        'g'), 't'), 'h')) & 0xFFFF)
+
 
 static const nxt_http_request_state_t  nxt_http_request_init_state;
 static const nxt_http_request_state_t  nxt_http_request_body_state;
@@ -571,6 +590,7 @@ nxt_http_request_chunked_transform(nxt_http_request_t *r)
     }
 
     nxt_http_field_name_set(f, "Content-Length");
+    f->hash = NXT_HTTP_CONTENT_LENGTH_HASH;
 
     p = nxt_mp_nget(r->mem_pool, NXT_OFF_T_LEN);
     if (nxt_slow_path(p == NULL)) {

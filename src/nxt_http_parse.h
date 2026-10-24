@@ -114,11 +114,11 @@ typedef struct {
     uint8_t                   chunk_error;  /* 1 bit */
     uint8_t                   error;        /* 1 bit */
     /*
-     * The caller owns the buffers it passes in and releases them itself, so
-     * nxt_http_chunk_parse() must not hand a buffer that yielded no data slice
-     * to its completion handler.  Set by the request path, where the buffers
-     * are the connection's; left zero by the proxy response path, which drops
-     * its reference before parsing and relies on that recycle.
+     * The caller owns the input buffers and consumes the returned slice chain
+     * synchronously without running slice completion handlers, so
+     * nxt_http_chunk_parse() must neither retain mem_pool/input buffers per
+     * slice nor schedule input buffer completion handlers.  Set by the request
+     * path and unit tests; left zero by the proxy response path.
      */
     uint8_t                   retain_buffers;  /* 1 bit */
 } nxt_http_chunk_parse_t;

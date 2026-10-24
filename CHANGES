@@ -16,6 +16,13 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        documented audit exceptions; no caller of the affected Tokio
        AsyncFd constructors was found in the linked downstream sources.
 
+    *) Bugfix: fixed HTTP/1.1 request and chunked body parsing bugs:
+       pipelined requests after file-backed or chunked request bodies,
+       the hash of the synthesized Content-Length header on de-chunked
+       requests, DEL (0x7F) rejection in request and proxied response
+       header field values, and upstream chunked proxy buffer pool
+       retention.
+
     *) Bugfix: a zstd-compressed response held its output until a full
        128 KiB block was ready or the response ended, so a streamed
        response (PHP flush(), server-sent events) stalled with zstd while
