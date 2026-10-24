@@ -1091,6 +1091,9 @@ nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
 
                 if (h1p->chunked_parse.last) {
                     body_rest = 0;
+
+                } else {
+                    in->mem.pos = in->mem.free;
                 }
 
             } else {
@@ -1119,6 +1122,14 @@ nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
     nxt_debug(task, "h1p body rest: %uz", body_rest);
 
     if (body_rest != 0) {
+        if (nxt_buf_is_file(b) && !r->chunked
+            && body_rest < (size_t) nxt_buf_mem_size(&b->mem))
+        {
+            /* Avoid reading pipelined bytes of the next request into b->mem. */
+            b->mem.free = b->mem.end - body_rest;
+            b->mem.pos = b->mem.free;
+        }
+
         in->next = h1p->buffers;
         h1p->buffers = in;
         h1p->nbuffers++;
@@ -1461,6 +1472,38 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
 
     } else {
         if (nxt_buf_is_file(b)) {
+            size = nxt_buf_mem_used_size(&b->mem);
+
+            if (size != 0) {
+                nxt_buf_t  *rest;
+
+                rest = h1p->buffers;
+
+                if (rest != NULL
+                    && size <= (size_t) nxt_buf_mem_free_size(&rest->mem))
+                {
+                    rest->mem.free = nxt_cpymem(rest->mem.free, b->mem.pos,
+                                                size);
+
+                } else {
+                    rest = nxt_event_engine_buf_mem_alloc(engine,
+                                       nxt_max(size, skcf->header_buffer_size));
+                    if (nxt_slow_path(rest == NULL)) {
+                        h1p->keepalive = 0;
+                        nxt_http_request_error(task, r,
+                                               NXT_HTTP_INTERNAL_SERVER_ERROR);
+                        return;
+                    }
+
+                    rest->mem.free = nxt_cpymem(rest->mem.pos, b->mem.pos,
+                                                size);
+
+                    rest->next = h1p->buffers;
+                    h1p->buffers = rest;
+                    h1p->nbuffers++;
+                }
+            }
+
             b->mem.start = NULL;
             b->mem.end = NULL;
             b->mem.pos = NULL;
@@ -3432,6 +3475,28 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
         }
 
         if (nxt_buf_mem_used_size(&b->mem) != 0) {
+            if (h1p->chunked) {
+                /*
+                 * r->resp fields ($response_header_*) point into the header
+                 * buffer "b".  Hold "b" until r->mem_pool is destroyed after
+                 * access logging so neither a framing-only tail ("0\r\n\r\n")
+                 * nor early slice completion recycles "b" while r->resp still
+                 * references it.
+                 */
+                if (nxt_slow_path(nxt_http_proxy_buf_mem_hold(task, r, b)
+                                  != NXT_OK))
+                {
+                    peer->status = NXT_HTTP_INTERNAL_SERVER_ERROR;
+                    break;
+                }
+
+                /*
+                 * retain = 1 keeps the parser from queueing b's completion;
+                 * the pool cleanup owns the buffer now.
+                 */
+                b->retain = 1;
+            }
+
             nxt_h1p_peer_body_process(task, peer, b);
             return;
         }
@@ -3635,6 +3700,19 @@ nxt_h1p_peer_body_process(nxt_task_t *task, nxt_http_peer_t *peer,
         out = nxt_http_chunk_parse(task, &h1p->chunked_parse, out);
 
         if (h1p->chunked_parse.chunk_error || h1p->chunked_parse.error) {
+            nxt_buf_t         *b, *next;
+            nxt_work_queue_t  *wq;
+
+            wq = &task->thread->engine->fast_work_queue;
+
+            for (b = out; b != NULL; b = next) {
+                next = b->next;
+                b->next = NULL;
+
+                nxt_work_queue_add(wq, b->completion_handler, task, b,
+                                   b->parent);
+            }
+
             peer->status = NXT_HTTP_BAD_GATEWAY;
             r = peer->request;
             r->state->error_handler(task, r, peer);

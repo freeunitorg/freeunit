@@ -96,7 +96,7 @@ nxt_http_chunk_parse(nxt_task_t *task, nxt_http_chunk_parse_t *hcp,
 
                 if (nxt_slow_path(ret == NXT_ERROR)) {
                     hcp->error = 1;
-                    return out;
+                    goto done;
                 }
 
                 state = sw_chunk_end_newline;
@@ -241,7 +241,7 @@ nxt_http_chunk_parse(nxt_task_t *task, nxt_http_chunk_parse_t *hcp,
                     }
 
                     hcp->last = 1;
-                    return out;
+                    goto done;
                 }
 
                 goto chunk_error;
@@ -351,6 +351,20 @@ chunk_error:
 
     hcp->chunk_error = 1;
 
+done:
+
+    while (b != NULL) {
+        next = b->next;
+        b->next = NULL;
+
+        if (b->retain == 0 && !hcp->retain_buffers) {
+            nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                               b->completion_handler, task, b, b->parent);
+        }
+
+        b = next;
+    }
+
     return out;
 }
 
@@ -374,11 +388,13 @@ nxt_http_chunk_buffer(nxt_http_chunk_parse_t *hcp, nxt_buf_t ***tail,
     **tail = b;
     *tail = &b->next;
 
-    nxt_mp_retain(hcp->mem_pool);
-    b->completion_handler = nxt_http_chunk_buf_completion;
-
     b->parent = in;
-    in->retain++;
+
+    if (!hcp->retain_buffers) {
+        nxt_mp_retain(hcp->mem_pool);
+        b->completion_handler = nxt_http_chunk_buf_completion;
+        in->retain++;
+    }
     b->mem.pos = p;
     b->mem.start = p;
 

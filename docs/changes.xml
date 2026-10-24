@@ -32,6 +32,16 @@ found in the linked downstream sources.
 
 <change type="bugfix">
 <para>
+fixed HTTP/1.1 request and chunked body parsing bugs: pipelined requests
+after file-backed or chunked request bodies, the hash of the synthesized
+Content-Length header on de-chunked requests, DEL (0x7F) rejection in
+request and proxied response header field values, and upstream chunked
+proxy buffer pool retention.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 the router stopped accepting connections at about 1000 open connections
 when unitd started with a soft RLIMIT_NOFILE of 1024, which is the default
 in Docker containers.  The router and the controller now raise their soft
