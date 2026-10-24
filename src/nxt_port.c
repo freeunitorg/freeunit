@@ -372,7 +372,9 @@ nxt_port_enable(nxt_task_t *task, nxt_port_t *port,
  * nxt_main_process_created_handler(), nxt_main_start_process_handler(),
  * nxt_port_process_ready_handler(), nxt_proto_process_created_handler(),
  * nxt_proto_start_process_handler() and the cert/script/socket/
- * access-log handlers already are.
+ * access-log handlers already are.  NEW_PORT and REMOVE_PID on the main
+ * port go through nxt_main_gate_handler(), as the router main port goes
+ * through nxt_router_gates[].
  *
  * What is left is the table-driven part: a per-message-type sender
  * ACL applied here, in the dispatcher, so that a handler which
@@ -571,7 +573,9 @@ nxt_port_send_port(nxt_task_t *task, nxt_port_t *port, nxt_port_t *new_port,
 /*
  * Copies the body of a NEW_PORT message.  The sender sets the size.  A body
  * shorter than nxt_port_msg_new_port_t is an error: the missing bytes would
- * come from an earlier message in the same buffer.
+ * come from an earlier message in the same buffer.  The sender also sets the
+ * type, and the receiver uses it as an index of rt->port_by_type[] and of
+ * nxt_proc_send_matrix[], so a type out of range is an error too.
  */
 
 nxt_int_t
@@ -587,6 +591,10 @@ nxt_port_new_port_msg(const nxt_port_recv_msg_t *msg,
     nxt_span_init(&span, msg->buf->mem.pos, msg->buf->mem.free);
 
     if (nxt_slow_path(nxt_span_copy(&span, out, sizeof(*out)) != 0)) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_slow_path((nxt_uint_t) out->type >= NXT_PROCESS_MAX)) {
         return NXT_ERROR;
     }
 
@@ -613,8 +621,8 @@ nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     msg->new_port_created = 0;
 
     if (nxt_slow_path(nxt_port_new_port_msg(msg, &new_port_msg) != NXT_OK)) {
-        nxt_alert(task, "process %PI sent a short new port message; refused",
-                  msg->port_msg.pid);
+        nxt_alert(task, "process %PI sent a short or bad new port message; "
+                  "refused", msg->port_msg.pid);
 
         nxt_port_recv_msg_close_fds(msg);
         return;
