@@ -1,6 +1,13 @@
 
 Changes with FreeUnit 1.37.1                                     04 Oct 2026
 
+    *) Change: the main process now accepts NEW_PORT and REMOVE_PID only
+       from a prototype, and only for an application process that this
+       prototype started, as the router does for the messages on its main
+       port. NEW_PORT must also be for an application port. Every core
+       process now refuses a NEW_PORT message with a process type out of
+       range.
+
     *) Bugfix: a zstd-compressed response held its output until a full
        128 KiB block was ready or the response ended, so a streamed
        response (PHP flush(), server-sent events) stalled with zstd while
