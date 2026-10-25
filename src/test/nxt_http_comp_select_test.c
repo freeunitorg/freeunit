@@ -152,6 +152,110 @@ nxt_hcs_random(uint32_t *state)
 }
 
 
+#if (NXT_HAVE_BROTLI)
+
+/*
+ * nxt_brotli_compress() writes the whole flush or the whole end of the
+ * stream, or it fails.  An output buffer 2 bytes short of what the call
+ * needs gives -1, not a part of the output, and a buffer of exactly that
+ * size is enough.  Quality 1 is the fast path of the encoder, 5 and 11 are
+ * the other path.
+ */
+
+static ssize_t
+nxt_hcs_brotli_call(int8_t level, bool last, bool empty, size_t out_len)
+{
+    ssize_t                         n;
+    uint8_t                         out[1024];
+    nxt_http_comp_compressor_ctx_t  cctx;
+
+    static const uint8_t  in[] = "FreeUnit compression test string for an "
+                                 "incomplete flush or finish.";
+
+    nxt_memzero(&cctx, sizeof(cctx));
+    cctx.level = level;
+
+    if (nxt_http_comp_brotli_ops.init(&cctx) != 0) {
+        return -2;
+    }
+
+    n = nxt_http_comp_brotli_ops.deflate(&cctx, in, empty ? 0 : sizeof(in) - 1,
+                                         out, nxt_min(out_len, sizeof(out)),
+                                         last);
+
+    nxt_http_comp_brotli_ops.free(&cctx);
+
+    return n;
+}
+
+
+static nxt_int_t
+nxt_hcs_brotli(nxt_hcs_ctx_t *ctx)
+{
+    bool        last;
+    ssize_t     need, n;
+    nxt_uint_t  i, k;
+
+    static const int8_t  levels[] = { 1, 5, 11 };
+
+    for (i = 0; i < nxt_nitems(levels); i++) {
+        for (k = 0; k < 2; k++) {
+            last = (k == 1);
+
+            need = nxt_hcs_brotli_call(levels[i], last, false, 1024);
+
+            NXT_TEST_CHECK(ctx->thr->log, need > 4,
+                           "brotli level %d %s gave %z", (int) levels[i],
+                           last ? "finish" : "flush", need);
+
+            n = nxt_hcs_brotli_call(levels[i], last, false, need - 2);
+
+            NXT_TEST_CHECK(ctx->thr->log, n == -1,
+                           "brotli level %d %s into %z of %z bytes "
+                           "returned %z, expected -1", (int) levels[i],
+                           last ? "finish" : "flush", need - 2, need, n);
+
+            n = nxt_hcs_brotli_call(levels[i], last, false, 4);
+
+            NXT_TEST_CHECK(ctx->thr->log, n == -1,
+                           "brotli level %d %s into 4 bytes returned %z, "
+                           "expected -1", (int) levels[i],
+                           last ? "finish" : "flush", n);
+
+            n = nxt_hcs_brotli_call(levels[i], last, false, need);
+
+            NXT_TEST_CHECK(ctx->thr->log, n == need,
+                           "brotli level %d %s into %z bytes returned %z",
+                           (int) levels[i], last ? "finish" : "flush",
+                           need, n);
+        }
+    }
+
+    /*
+     * The application path compresses an empty last part, so the end of the
+     * stream alone must work.  It is one byte.
+     */
+
+    for (i = 0; i < nxt_nitems(levels); i++) {
+        n = nxt_hcs_brotli_call(levels[i], true, true, 1024);
+
+        NXT_TEST_CHECK(ctx->thr->log, n == 1,
+                       "brotli level %d finish of an empty part gave %z, "
+                       "expected 1", (int) levels[i], n);
+
+        n = nxt_hcs_brotli_call(levels[i], true, true, 0);
+
+        NXT_TEST_CHECK(ctx->thr->log, n == -1,
+                       "brotli level %d finish of an empty part into 0 bytes "
+                       "returned %z, expected -1", (int) levels[i], n);
+    }
+
+    return NXT_OK;
+}
+
+#endif
+
+
 static nxt_int_t
 nxt_hcs_expect(nxt_hcs_ctx_t *ctx)
 {
@@ -464,6 +568,12 @@ nxt_http_comp_select_test(nxt_thread_t *thr)
     if (ret == NXT_OK) {
         ret = nxt_hcs_expect(&ctx);
     }
+
+#if (NXT_HAVE_BROTLI)
+    if (ret == NXT_OK) {
+        ret = nxt_hcs_brotli(&ctx);
+    }
+#endif
 
     if (r->mem_pool != NULL) {
         nxt_mp_destroy(r->mem_pool);
