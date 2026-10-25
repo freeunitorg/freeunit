@@ -187,13 +187,17 @@ nxt_strncasecmp(const u_char *s1, const u_char *s2, size_t length)
         c1 = *s1++;
         c2 = *s2++;
 
-        c1 = nxt_lowcase(c1);
-        c2 = nxt_lowcase(c2);
+        /* Equal bytes need no case folding. */
 
-        n = c1 - c2;
+        if (c1 != c2) {
+            c1 = nxt_lowcase(c1);
+            c2 = nxt_lowcase(c2);
 
-        if (n != 0) {
-            return n;
+            n = c1 - c2;
+
+            if (n != 0) {
+                return n;
+            }
         }
 
         if (c1 == 0) {
@@ -219,13 +223,17 @@ nxt_memcasecmp(const void *p1, const void *p2, size_t length)
         c1 = *s1++;
         c2 = *s2++;
 
-        c1 = nxt_lowcase(c1);
-        c2 = nxt_lowcase(c2);
+        /* Equal bytes need no case folding. */
 
-        n = c1 - c2;
+        if (c1 != c2) {
+            c1 = nxt_lowcase(c1);
+            c2 = nxt_lowcase(c2);
 
-        if (n != 0) {
-            return n;
+            n = c1 - c2;
+
+            if (n != 0) {
+                return n;
+            }
         }
     }
 
