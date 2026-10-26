@@ -982,12 +982,112 @@ nxt_h1p_expect(void *ctx, nxt_http_field_t *field, uintptr_t data)
 }
 
 
+/*
+ * Write the decoded data slices of one chunked parse to the body file and
+ * free each slice.  On the request path the parser does not install
+ * nxt_http_chunk_buf_completion() (retain_buffers is set), so no completion
+ * runs for a slice, and without this function the request memory pool keeps
+ * one buffer per chunk until the request ends.  The chain is consumed here
+ * and never queued: a queued slice would be freed a second time by its
+ * default completion.  When the function fails the request, the slices that
+ * it has not reached stay in the pool until the request ends.
+ *
+ * The slices are gathered into an iovec of NXT_IOBUF_MAX entries and written
+ * with one writev().  Once the iovec is full, each further slice is moved
+ * down onto the end of the last entry.  So one parse costs one write call
+ * however many chunks it holds, and a large slice is moved only after
+ * NXT_IOBUF_MAX others.
+ *
+ * The move is safe because the parser lists the slices of one read buffer
+ * in address order, with the chunk framing that it consumed between them:
+ * the end of the last entry never lies above the next slice, and the move
+ * never reaches a slice that is not written yet.  The function checks this
+ * for every slice and fails the request if it does not hold.  It returns
+ * NXT_HTTP_OK, or the HTTP status to fail the request with.
+ */
+
+static nxt_http_status_t
+nxt_h1p_body_chunks_write(nxt_buf_t *b, nxt_buf_t *out, size_t max_body_size)
+{
+    u_char        *p, *prev;
+    size_t        size, total;
+    ssize_t       n;
+    nxt_uint_t    niov;
+    nxt_buf_t     *chunk, *next, *parent;
+    struct iovec  iov[NXT_IOBUF_MAX];
+
+    if (out == NULL) {
+        return NXT_HTTP_OK;
+    }
+
+    total = 0;
+    niov = 0;
+    prev = out->mem.pos;
+    parent = out->parent;
+
+    for (chunk = out; chunk != NULL; chunk = next) {
+        next = chunk->next;
+
+        if (nxt_slow_path(chunk->parent != parent || chunk->mem.pos < prev)) {
+            nxt_thread_log_alert("chunked body slices are not in order");
+            return NXT_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        size = nxt_buf_mem_used_size(&chunk->mem);
+        prev = chunk->mem.free;
+
+        if (niov < nxt_nitems(iov)) {
+            iov[niov].iov_base = chunk->mem.pos;
+            iov[niov].iov_len = size;
+            niov++;
+
+        } else {
+            p = iov[niov - 1].iov_base;
+            p += iov[niov - 1].iov_len;
+
+            nxt_memmove(p, chunk->mem.pos, size);
+
+            iov[niov - 1].iov_len += size;
+        }
+
+        /* The slices share one read buffer, so the sum cannot overflow. */
+        total += size;
+
+        /* The slice is written now, so free it instead of pooling it. */
+        nxt_buf_free(chunk->data, chunk);
+    }
+
+    n = writev(b->file->fd, iov, niov);
+
+    if (nxt_slow_path(n < (ssize_t) total)) {
+        if (n == -1) {
+            nxt_thread_log_alert("writev(%FD, %ui) of %uz failed %E",
+                                 b->file->fd, niov, total, nxt_errno);
+
+        } else {
+            nxt_thread_log_alert("writev(%FD, %ui) wrote %z of %uz",
+                                 b->file->fd, niov, n, total);
+        }
+
+        return NXT_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    b->file_end += total;
+
+    if ((size_t) b->file_end > max_body_size) {
+        return NXT_HTTP_PAYLOAD_TOO_LARGE;
+    }
+
+    return NXT_HTTP_OK;
+}
+
+
 static void
 nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
 {
     size_t             size, body_length, body_rest;
     ssize_t            res;
-    nxt_buf_t          *in, *b, *out, *chunk;
+    nxt_buf_t          *in, *b, *out;
     nxt_int_t          ret;
     nxt_conn_t         *c;
     nxt_h1proto_t      *h1p;
@@ -1072,21 +1172,10 @@ nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
                     goto error;
                 }
 
-                for (chunk = out; chunk != NULL; chunk = chunk->next) {
-                    size = nxt_buf_mem_used_size(&chunk->mem);
-
-                    res = nxt_fd_write(b->file->fd, chunk->mem.pos, size);
-                    if (nxt_slow_path(res < (ssize_t) size)) {
-                        status = NXT_HTTP_INTERNAL_SERVER_ERROR;
-                        goto error;
-                    }
-
-                    b->file_end += size;
-
-                    if ((size_t) b->file_end > skcf->max_body_size) {
-                        status = NXT_HTTP_PAYLOAD_TOO_LARGE;
-                        goto error;
-                    }
+                status = nxt_h1p_body_chunks_write(b, out,
+                                                   skcf->max_body_size);
+                if (nxt_slow_path(status != NXT_HTTP_OK)) {
+                    goto error;
                 }
 
                 if (h1p->chunked_parse.last) {
@@ -1308,10 +1397,11 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
 {
     size_t              size, body_rest;
     ssize_t             res;
-    nxt_buf_t           *b, *out, *chunk;
+    nxt_buf_t           *b, *out;
     nxt_msec_t          msec;
     nxt_conn_t          *c;
     nxt_h1proto_t       *h1p;
+    nxt_http_status_t   status;
     nxt_socket_conf_t   *skcf;
     nxt_http_request_t  *r;
     nxt_event_engine_t  *engine;
@@ -1353,24 +1443,11 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
                 return;
             }
 
-            for (chunk = out; chunk != NULL; chunk = chunk->next) {
-                size = nxt_buf_mem_used_size(&chunk->mem);
-                res = nxt_fd_write(b->file->fd, chunk->mem.pos, size);
-                if (nxt_slow_path(res < (ssize_t) size)) {
-                    h1p->keepalive = 0;
-                    nxt_http_request_error(task, r,
-                                           NXT_HTTP_INTERNAL_SERVER_ERROR);
-                    return;
-                }
-
-                b->file_end += size;
-
-                if ((size_t) b->file_end > skcf->max_body_size) {
-                    h1p->keepalive = 0;
-                    nxt_http_request_error(task, r,
-                                           NXT_HTTP_PAYLOAD_TOO_LARGE);
-                    return;
-                }
+            status = nxt_h1p_body_chunks_write(b, out, skcf->max_body_size);
+            if (nxt_slow_path(status != NXT_HTTP_OK)) {
+                h1p->keepalive = 0;
+                nxt_http_request_error(task, r, status);
+                return;
             }
 
             if (h1p->chunked_parse.last) {

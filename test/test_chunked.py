@@ -1,8 +1,10 @@
 import re
 import socket
+import sys
 import time
 
 import pytest
+from conftest import pid_by_name
 from unit.applications.lang.python import ApplicationPython
 from unit import port as port_map
 
@@ -409,6 +411,122 @@ def test_chunked_transform():
     assert 'success' in client.conf(
         {"*:8080": {"pass": "applications/mirror"}}, 'listeners'
     )
+
+
+def _proc_field(path, name):
+    try:
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                if line.startswith(name + ':'):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        return None
+
+    return None
+
+
+@pytest.mark.skipif(
+    sys.platform != 'linux',
+    reason='reads the router /proc/<pid>/status and /proc/<pid>/io',
+)
+def test_chunked_body_memory():
+    # Each decoded chunk is one buffer from the request memory pool.  The
+    # router frees the buffers as it writes them, one writev() per parsed
+    # read buffer, so it holds a bounded number of them and makes one write
+    # per read, not one per chunk.  Reads the router's peak RSS and write
+    # syscall count from /proc.
+    assert 'success' in client.conf([{"action": {"return": 200}}], 'routes')
+    assert 'success' in client.conf(
+        {"*:8080": {"pass": "routes"}}, 'listeners'
+    )
+
+    router = pid_by_name('unit: router')
+    assert router is not None, 'router pid'
+
+    status = f'/proc/{router}/status'
+    io = f'/proc/{router}/io'
+
+    hwm0 = _proc_field(status, 'VmHWM')
+    syscw0 = _proc_field(io, 'syscw')
+    vmpeak = _proc_field(status, 'VmPeak')
+
+    if hwm0 is None or syscw0 is None:
+        pytest.skip('router /proc/<pid>/{status,io} is unreadable')
+
+    # n is large enough that one held buffer per chunk would raise the
+    # router's peak RSS above the heap high-water mark that an earlier test
+    # in the same unitd leaves (glibc keeps freed pages resident), so the
+    # RSS bound can fail in a shared unitd too.  The decoded body, n bytes,
+    # is under the default max_body_size, so this is not a 413.
+    n = 1000000
+    body = b'1\r\nx\r\n' * n + b'0\r\n\r\n'
+
+    resp = client.post(
+        headers={
+            'Host': 'localhost',
+            'Connection': 'close',
+            'Transfer-Encoding': 'chunked',
+        },
+        body=body,
+    )
+    assert resp['status'] == 200
+
+    hwm1 = _proc_field(status, 'VmHWM')
+    syscw1 = _proc_field(io, 'syscw')
+
+    assert hwm1 is not None and syscw1 is not None
+
+    # The write bound is relative to n.  One writev() per read buffer is a
+    # few hundred writes for this body on a release build (382 measured),
+    # and about n/8 on a debug build, where the debug log lines of the
+    # memory pool's malloc, free and posix_memalign calls are writes too
+    # (116,242 measured).  One write per chunk would be at least n.
+    syscalls = syscw1 - syscw0
+
+    assert syscalls < n // 2, f'{syscalls} write syscalls for {n} chunks'
+
+    # The RSS bound runs only on an uninstrumented build.  AddressSanitizer
+    # reserves a shadow of terabytes (VmPeak) and grows RSS for this
+    # workload however the slices are handled; the write bound above still
+    # holds under it.
+    if vmpeak is not None and vmpeak < 100 * 1024 * 1024:
+        peak_growth = hwm1 - hwm0
+
+        assert peak_growth < 10000, (
+            f'router peak RSS grew {peak_growth} kB for {n} chunks'
+        )
+
+
+def test_chunked_many_chunks_body():
+    # More chunks in a read than one writev() takes.  The router moves the
+    # slices beyond the first ones down in the read buffer and writes them
+    # with one call, so a wrong move shows in the body that the application
+    # gets back.  The chunks have 1 to 13 bytes, so the size lines use the
+    # hex digits 1 to 9 and a to d, and the reads cut the chunks at
+    # different places.
+    chunks = []
+
+    for i in range(20000):
+        chunks.append(
+            ''.join(chr(97 + (i + j) % 26) for j in range(1 + i % 13))
+        )
+
+    body = ''.join(f'{len(c):x}\r\n{c}\r\n' for c in chunks) + '0\r\n\r\n'
+
+    resp = client.get(
+        headers={
+            'Host': 'localhost',
+            'Connection': 'close',
+            'Transfer-Encoding': 'chunked',
+        },
+        body=body,
+    )
+
+    expect_body = ''.join(chunks)
+
+    assert resp['status'] == 200, 'status'
+    assert resp['headers']['Content-Length'] == str(len(expect_body)), 'length'
+    assert resp['body'] == expect_body, 'body'
 
 
 def test_chunked_invalid():
