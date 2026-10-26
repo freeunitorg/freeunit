@@ -81,6 +81,20 @@ def test_go_application_404():
     assert re.search(r'<title>404 Not Found</title>', resp['body']), '404 body'
 
 
+def test_go_application_header_long_name():
+    client.load('header_long_name')
+
+    resp = client.get()
+
+    assert resp['status'] == 200, 'status'
+    assert resp['body'] == 'body', 'body'
+    assert resp['headers']['X-Short'] == '1', 'short name'
+
+    # A name longer than 255 bytes is dropped, not cut to its low byte.
+    long_names = [h for h in resp['headers'] if h.lower().startswith('x-a')]
+    assert long_names == [], 'long name'
+
+
 def test_go_keepalive_body():
     client.load('mirror')
 
