@@ -86,6 +86,44 @@ def test_asgi_websockets_subprotocol():
     assert resp['headers']['sec-websocket-protocol'] == 'chat', 'key'
 
 
+def test_asgi_websockets_subprotocol_utf8():
+    client.load('websockets/subprotocol_utf8')
+
+    resp, sock, _ = ws.upgrade()
+    sock.close()
+
+    # The header carries the UTF-8 bytes of the string, not its internal
+    # UCS-2 bytes.
+    assert resp['status'] == 101, 'status'
+    assert (
+        resp['headers']['sec-websocket-protocol'] == 'chat-\u0442'
+    ), 'utf-8 subprotocol'
+
+
+def test_asgi_websockets_receive_invalid_utf8(findall, skip_alert):
+    skip_alert(r'Failed to create Unicode for payload')
+
+    client.load('websockets/receive_invalid_utf8')
+
+    _, sock, _ = ws.upgrade()
+
+    # A text frame that is not valid UTF-8 fails receive().  The module
+    # clears the Python error before it gives the exception to the
+    # application, so the application gets the exception and the call
+    # to set_exception() succeeds.  The router does not check the UTF-8
+    # of a frame with an RSV bit set, so RSV1 brings the bytes to the
+    # module.
+    ws.frame_write(sock, ws.OP_TEXT, b'\xff\xfe', rsv1=True)
+    frame = ws.frame_read(sock)
+
+    check_frame(frame, True, ws.OP_TEXT, 'RuntimeError')
+
+    sock.close()
+
+    assert findall(r'set_exception\' call failed') == [], 'set_exception'
+    assert findall(r'SystemError') == [], 'no SystemError'
+
+
 def test_asgi_websockets_mirror():
     client.load('websockets/mirror')
 
