@@ -284,6 +284,15 @@ def test_node_application_set_header_array_with_override():
     ], 'set header array with override'
 
 
+def test_node_application_set_header_array_mutate():
+    client.load('set_header_array_mutate')
+
+    resp = client.get()
+    assert resp['status'] == 200, 'status'
+    assert resp['body'] == 'body', 'body'
+    assert resp['headers'].get('Set-Cookie') == 'a=1', 'array copied'
+
+
 def test_node_application_set_header_array_empty():
     client.load('set_header_array_empty')
 
