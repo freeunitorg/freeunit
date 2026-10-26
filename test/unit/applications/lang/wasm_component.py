@@ -41,7 +41,9 @@ class ApplicationWasmComponent(ApplicationProto):
 
         return output
 
-    def load(self, script, execution_timeout=None, limits=None, **kwargs):
+    def load(
+        self, script, execution_timeout=None, limits=None, access=None, **kwargs
+    ):
         self.prepare_env(script)
 
         component_path = f'{option.temp_dir}/wasm_component/{script}/target/wasm32-wasip1/release/test_wasi_component.wasm'
@@ -57,6 +59,9 @@ class ApplicationWasmComponent(ApplicationProto):
 
         if limits is not None:
             app["limits"] = limits
+
+        if access is not None:
+            app["access"] = access
 
         self._load_conf(
             {
