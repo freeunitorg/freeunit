@@ -334,6 +334,19 @@ def test_ruby_application_header_custom():
     assert resp['status'] == 503, 'header custom name > 255'
 
 
+def test_ruby_application_header_custom_nul():
+    client.load('header_custom')
+
+    # A newline after a NUL byte still splits the value into two fields.
+    resp = client.post(body='a\x00b\nc')
+
+    assert resp['status'] == 200, 'status'
+    assert resp['headers']['Custom-Header'] == [
+        'a\x00b',
+        'c',
+    ], 'header custom nul'
+
+
 @pytest.mark.skip('not yet')
 def test_ruby_application_header_custom_non_printable():
     client.load('header_custom')
@@ -425,6 +438,21 @@ def test_ruby_application_body_file():
     client.load('body_file')
 
     assert client.get()['body'] == 'body\n', 'body file'
+
+
+def test_ruby_application_body_close_error(wait_for_record):
+    client.load('body_close_error')
+
+    assert client.get()['status'] == 503, 'body file error status'
+
+    assert (
+        wait_for_record(r'\[error\].+Failed to open content file') is not None
+    ), 'body file error'
+
+    # The module calls body.close also when it fails to send the body.
+    resp = client.get(url='/closed')
+    assert resp['status'] == 200, 'closed status'
+    assert resp['headers']['X-Closed'] == '1', 'body closed'
 
 
 def test_ruby_keepalive_body():
