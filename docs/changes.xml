@@ -42,6 +42,14 @@ proxy buffer pool retention.
 
 <change type="bugfix">
 <para>
+with "chunked_transform" on, a request with a chunked body held memory and made
+write calls in proportion to its number of chunks.  The decoded chunks of each
+read are now written with one call and freed as they are written.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 the router stopped accepting connections at about 1000 open connections
 when unitd started with a soft RLIMIT_NOFILE of 1024, which is the default
 in Docker containers.  The router and the controller now raise their soft

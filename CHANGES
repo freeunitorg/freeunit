@@ -23,6 +23,11 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        header field values, and upstream chunked proxy buffer pool
        retention.
 
+    *) Bugfix: with "chunked_transform" on, a request with a chunked body
+       held memory and made write calls in proportion to its number of
+       chunks. The decoded chunks of each read are now written with one
+       call and freed as they are written.
+
     *) Bugfix: a zstd-compressed response held its output until a full
        128 KiB block was ready or the response ended, so a streamed
        response (PHP flush(), server-sent events) stalled with zstd while
