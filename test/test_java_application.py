@@ -377,6 +377,29 @@ def test_java_application_header():
     assert headers['X-Set-Test2'] == '', 'set empty header'
 
 
+def test_java_application_header_long_name():
+    client.load('header_size')
+
+    resp = client.get()
+    assert resp['status'] == 200, 'status'
+    assert resp['headers']['X-Short'] == '1', 'short name'
+
+    # A name longer than 255 bytes is dropped, not cut to its low byte.
+    long_names = [
+        h for h in resp['headers'] if h.lower()[:3] in ('x-a', 'x-b', 'x-c')
+    ]
+    assert long_names == [], 'long names'
+
+
+def test_java_application_header_large_value():
+    client.load('header_size')
+
+    resp = client.get(url='/large')
+    assert resp['status'] == 200, 'status'
+    assert resp['headers'].get('X-Large') == 'x' * 100000, 'large value'
+    assert resp['headers']['X-Short'] == '1', 'header after large value'
+
+
 def test_java_application_content_type():
     client.load('content_type')
 
