@@ -260,6 +260,60 @@ def test_perl_application_body_io_file():
     assert client.get()['body'] == 'body\n', 'body io file retained handle'
 
 
+def test_perl_application_body_io_file_close():
+    client.load('body_io_file_close')
+
+    resp = client.get()
+    assert resp['body'] == 'body\n', 'body io file'
+    assert resp['headers']['X-Prev-Open'] == '0', 'no previous handle'
+
+    # The application keeps the handle of the previous response.  The
+    # module closes it when the response is sent.
+    resp = client.get()
+    assert resp['body'] == 'body\n', 'body io file again'
+    assert resp['headers']['X-Prev-Open'] == '0', 'previous handle closed'
+
+
+def test_perl_application_body_io_lines_empty():
+    client.load('body_io_lines')
+
+    resp = client.get(url='/?empty')
+    assert resp['status'] == 200, 'status'
+    assert resp['body'] == 'abcd', 'empty lines do not end the body'
+    assert client.get()['headers']['X-Closed'] == '1', 'body closed'
+
+
+def test_perl_application_body_io_lines_rs():
+    client.load('body_io_lines')
+
+    resp = client.get()
+    assert resp['body'] == 'abcd', 'body'
+    assert resp['headers']['X-RS'] == '0a', 'record separator'
+
+    # The module sets $/ to read the body.  It gives the old value back.
+    resp = client.get()
+    assert resp['body'] == 'abcd', 'body again'
+    assert resp['headers']['X-RS'] == '0a', 'record separator restored'
+
+
+def test_perl_application_threads_init_fail(
+    findall, skip_alert, wait_for_record
+):
+    skip_alert(r'PSGI: Failed to parse script')
+    client.load('threads_init_fail', threads=2)
+
+    assert client.get()['status'] == 503, 'application start fails'
+
+    assert wait_for_record(r'second load') is not None, 'second load fails'
+    assert (
+        wait_for_record(r'app process \d+ exited with code 1') is not None
+    ), 'application exit'
+
+    # The second thread was never created.  The module must not join it.
+    assert findall(r'join failed') == [], 'no join of a thread never created'
+    assert findall(r'exited on signal') == [], 'no crash'
+
+
 def test_perl_streaming_body_multiple_responses():
     client.load('streaming_body_multiple_responses')
 
