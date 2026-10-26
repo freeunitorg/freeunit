@@ -22,6 +22,17 @@ def test_wasm_component():
     assert req['body'] == 'Hello'
 
 
+def test_wasm_component_access_empty(findall):
+    # "access" without "filesystem" gives no directories.
+    client.load('hello_world', access={})
+
+    resp = client.get()
+    assert resp['status'] == 200, 'status'
+    assert resp['body'] == 'Hello', 'body'
+
+    assert findall(r'exited on signal') == [], 'no crash'
+
+
 def test_wasm_component_cstring_nul():
     # "component" is consumed as a NUL-terminated C-string path; an embedded
     # NUL (survives JSON parsing) or an empty value must be rejected at
