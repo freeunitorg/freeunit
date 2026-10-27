@@ -1810,6 +1810,7 @@ nxt_unit_default_init(nxt_task_t *task, nxt_unit_init_t *init,
 
     init->shm_limit = conf->shm_limit;
     init->request_limit = conf->request_limit;
+    init->max_processes = conf->max_processes;
 
     return NXT_OK;
 }

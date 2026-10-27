@@ -185,6 +185,12 @@ struct nxt_unit_init_s {
     int                   shared_port_fd;
     int                   shared_queue_fd;
     int                   log_fd;
+
+    /*
+     * The most processes of the application, or 0 when it is not known.
+     * See nxt_unit_wait_set_init().
+     */
+    uint32_t              max_processes;
 };
 
 
@@ -501,7 +507,8 @@ void     *nxt_unit_test_port_queue(nxt_unit_port_t *port);
 int      nxt_unit_test_wait_shm_ack(nxt_unit_ctx_t *ctx, size_t *held);
 size_t   nxt_unit_test_parked_rbufs(nxt_unit_ctx_t *ctx);
 uint64_t nxt_unit_test_detached_now(void);
-void     *nxt_unit_test_wait_set_new(void);
+void     *nxt_unit_test_wait_set_new(uint32_t max_processes);
+int64_t  nxt_unit_test_read_env_processes(void);
 int      nxt_unit_test_wait(void *ws, int read_fd, int shared_fd, int timeout,
     short *revents);
 int      nxt_unit_test_wait_set_epoll(void *ws);

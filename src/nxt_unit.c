@@ -44,6 +44,16 @@
 #define NXT_UNIT_EPOLL_OFF  (-2)
 
 /*
+ * A context uses a wait set only when the application can have this number
+ * of processes or more ("processes" or "processes": {"max"}).  With 2
+ * processes, the set lost 3 to 7 percent of the requests per second (one
+ * or two CPUs) and 5 to 6 percent at 8 and 12 connections (four CPUs).
+ * With 4 and 8 processes, it gained at 1 and 2 connections.  3 processes
+ * were not measured.
+ */
+#define NXT_UNIT_EPOLL_MIN_PROCESSES  4
+
+/*
  * The wait set of a context, for nxt_unit_wait_set_wait(): an epoll set of
  * the read port (read_fd) and the shared port (shared_fd).  ep_fd is the
  * descriptor of the set.  It is -1 when the set is not made, and
@@ -126,7 +136,7 @@ static int nxt_unit_read_env(nxt_unit_port_t *ready_port,
     nxt_unit_port_t *router_port, nxt_unit_port_t *read_port,
     int *shared_port_fd, int *shared_queue_fd,
     int *log_fd, uint32_t *stream, uint32_t *shm_limit,
-    uint32_t *request_limit);
+    uint32_t *request_limit, uint32_t *max_processes);
 static int nxt_unit_ready(nxt_unit_ctx_t *ctx, int ready_fd, uint32_t stream,
     int queue_fd);
 static int nxt_unit_process_read_msg(nxt_unit_ctx_t *ctx,
@@ -228,7 +238,8 @@ static int nxt_unit_run_once_impl(nxt_unit_ctx_t *ctx);
 static int nxt_unit_read_buf(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf);
 static int nxt_unit_ctx_wait(nxt_unit_ctx_t *ctx, struct pollfd *fds,
     nxt_uint_t nfds, int timeout);
-static void nxt_unit_wait_set_init(nxt_unit_wait_set_t *ws);
+static void nxt_unit_wait_set_init(nxt_unit_wait_set_t *ws,
+    uint32_t max_processes);
 static void nxt_unit_wait_set_free(nxt_unit_wait_set_t *ws);
 static int nxt_unit_wait_set_wait(nxt_unit_wait_set_t *ws, struct pollfd *fds,
     nxt_uint_t nfds, int timeout);
@@ -626,6 +637,9 @@ struct nxt_unit_impl_s {
     uint32_t                 shm_mmap_limit;
     uint32_t                 request_limit;
 
+    /* The most processes of the application, or 0 when it is not known. */
+    uint32_t                 max_processes;
+
     pthread_mutex_t          mutex;
 
     nxt_lvlhsh_t             processes;        /* of nxt_unit_process_t */
@@ -720,7 +734,7 @@ nxt_unit_init(nxt_unit_init_t *init)
 {
     int              rc, queue_fd, shared_queue_fd;
     void             *mem;
-    uint32_t         ready_stream, shm_limit, request_limit;
+    uint32_t         ready_stream, shm_limit, request_limit, max_processes;
     nxt_unit_ctx_t   *ctx;
     nxt_unit_impl_t  *lib;
     nxt_unit_port_t  ready_port, router_port, read_port, shared_port;
@@ -761,13 +775,23 @@ nxt_unit_init(nxt_unit_init_t *init)
         rc = nxt_unit_read_env(&ready_port, &router_port, &read_port,
                                &shared_port.in_fd, &shared_queue_fd,
                                &lib->log_fd, &ready_stream, &shm_limit,
-                               &request_limit);
+                               &request_limit, &max_processes);
         if (nxt_slow_path(rc != NXT_UNIT_OK)) {
             goto fail;
         }
 
         lib->shm_mmap_limit = nxt_unit_shm_mmap_limit(shm_limit);
         lib->request_limit = request_limit;
+        lib->max_processes = max_processes;
+
+        /* The main context did not wait yet. */
+        nxt_unit_wait_set_init(&lib->main_ctx.wait_set, max_processes);
+    }
+
+    if (lib->main_ctx.wait_set.ep_fd == NXT_UNIT_EPOLL_OFF) {
+        nxt_unit_debug(NULL, "%u processes, fewer than %d; the contexts wait "
+                       "in poll()", lib->max_processes,
+                       NXT_UNIT_EPOLL_MIN_PROCESSES);
     }
 
     if (nxt_slow_path(lib->shm_mmap_limit < 1)) {
@@ -906,6 +930,7 @@ nxt_unit_create(nxt_unit_init_t *init)
     lib->request_data_size = init->request_data_size;
     lib->shm_mmap_limit = nxt_unit_shm_mmap_limit(init->shm_limit);
     lib->request_limit = init->request_limit;
+    lib->max_processes = init->max_processes;
 
     lib->processes.slot = NULL;
     lib->ports.slot = NULL;
@@ -1029,7 +1054,7 @@ nxt_unit_ctx_init(nxt_unit_impl_t *lib, nxt_unit_ctx_impl_t *ctx_impl,
     ctx_impl->read_port = NULL;
     ctx_impl->requests.slot = NULL;
 
-    nxt_unit_wait_set_init(&ctx_impl->wait_set);
+    nxt_unit_wait_set_init(&ctx_impl->wait_set, lib->max_processes);
 
     return NXT_UNIT_OK;
 }
@@ -1157,7 +1182,7 @@ static int
 nxt_unit_read_env(nxt_unit_port_t *ready_port, nxt_unit_port_t *router_port,
     nxt_unit_port_t *read_port, int *shared_port_fd, int *shared_queue_fd,
     int *log_fd, uint32_t *stream,
-    uint32_t *shm_limit, uint32_t *request_limit)
+    uint32_t *shm_limit, uint32_t *request_limit, uint32_t *max_processes)
 {
     int       rc;
     int       ready_fd, router_fd, read_in_fd, read_out_fd;
@@ -1203,13 +1228,13 @@ nxt_unit_read_env(nxt_unit_port_t *ready_port, nxt_unit_port_t *router_port,
                 "%"PRId64",%"PRIu32",%d;"
                 "%"PRId64",%"PRIu32",%d,%d;"
                 "%d,%d;"
-                "%d,%"PRIu32",%"PRIu32,
+                "%d,%"PRIu32",%"PRIu32",%"PRIu32,
                 &ready_stream,
                 &ready_pid, &ready_id, &ready_fd,
                 &router_pid, &router_id, &router_fd,
                 &read_pid, &read_id, &read_in_fd, &read_out_fd,
                 shared_port_fd, shared_queue_fd,
-                log_fd, shm_limit, request_limit);
+                log_fd, shm_limit, request_limit, max_processes);
 
     if (nxt_slow_path(rc == EOF)) {
         nxt_unit_alert(NULL, "sscanf(%s) failed: %s (%d) for %s env",
@@ -1218,9 +1243,9 @@ nxt_unit_read_env(nxt_unit_port_t *ready_port, nxt_unit_port_t *router_port,
         return NXT_UNIT_ERROR;
     }
 
-    if (nxt_slow_path(rc != 16)) {
+    if (nxt_slow_path(rc != 17)) {
         nxt_unit_alert(NULL, "invalid number of variables in %s env: "
-                       "found %d of %d in %s", NXT_UNIT_INIT_ENV, rc, 16, vars);
+                       "found %d of %d in %s", NXT_UNIT_INIT_ENV, rc, 17, vars);
 
         return NXT_UNIT_ERROR;
     }
@@ -7010,10 +7035,19 @@ retry:
 }
 
 
+/*
+ * With fewer than NXT_UNIT_EPOLL_MIN_PROCESSES processes, the context does
+ * not use a set, and it waits in poll().  0 is a number that is not known,
+ * as for an application that calls nxt_unit_init() itself without
+ * NXT_UNIT_INIT; then the context uses a set.
+ */
+
 static void
-nxt_unit_wait_set_init(nxt_unit_wait_set_t *ws)
+nxt_unit_wait_set_init(nxt_unit_wait_set_t *ws, uint32_t max_processes)
 {
-    ws->ep_fd = -1;
+    ws->ep_fd = (max_processes != 0
+                 && max_processes < NXT_UNIT_EPOLL_MIN_PROCESSES)
+                ? NXT_UNIT_EPOLL_OFF : -1;
     ws->read_fd = -1;
     ws->shared_fd = -1;
     ws->err = 0;
@@ -7142,6 +7176,9 @@ nxt_unit_test_wait_set_failures(unsigned int failures, int err)
  * a set when the process uses half of its RLIMIT_NOFILE or more
  * (nxt_unit_wait_set_crowded()).  Then the descriptors stay free for the
  * application.
+ *
+ * A context does not use a set when the application can have fewer than
+ * NXT_UNIT_EPOLL_MIN_PROCESSES processes (nxt_unit_wait_set_init()).
  *
  * The descriptors of the two ports stay open while the context lives: the
  * context holds its read port, and the library holds the shared port.  If
@@ -7417,22 +7454,44 @@ nxt_unit_test_epoll_release(const char *release)
 #if (NXT_TESTS)
 
 /*
- * For src/test/nxt_unit_wake_test.c: a wait set without a context, and one
- * wait of a context on it.  revents[0] is for read_fd, and revents[1] is
- * for shared_fd.
+ * For src/test/nxt_unit_wake_test.c: a wait set without a context, as for
+ * an application with "max_processes" processes, and one wait of a context
+ * on it.  revents[0] is for read_fd, and revents[1] is for shared_fd.
  */
 
 void *
-nxt_unit_test_wait_set_new(void)
+nxt_unit_test_wait_set_new(uint32_t max_processes)
 {
     nxt_unit_wait_set_t  *ws;
 
     ws = nxt_unit_malloc(NULL, sizeof(nxt_unit_wait_set_t));
     if (ws != NULL) {
-        nxt_unit_wait_set_init(ws);
+        nxt_unit_wait_set_init(ws, max_processes);
     }
 
     return ws;
+}
+
+
+/*
+ * For src/test/nxt_unit_wake_test.c: reads the NXT_UNIT_INIT variable as
+ * nxt_unit_init() does, and returns the number of processes in it.  Returns
+ * -1 when the variable is not valid.
+ */
+
+int64_t
+nxt_unit_test_read_env_processes(void)
+{
+    int              rc, shared_port_fd, shared_queue_fd, log_fd;
+    uint32_t         stream, shm_limit, request_limit, max_processes;
+    nxt_unit_port_t  ready_port, router_port, read_port;
+
+    rc = nxt_unit_read_env(&ready_port, &router_port, &read_port,
+                           &shared_port_fd, &shared_queue_fd, &log_fd,
+                           &stream, &shm_limit, &request_limit,
+                           &max_processes);
+
+    return (rc == NXT_UNIT_OK) ? (int64_t) max_processes : -1;
 }
 
 

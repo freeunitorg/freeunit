@@ -156,6 +156,14 @@ struct nxt_common_app_conf_s {
      */
     nxt_msec_t                 start_timeout;
 
+    /*
+     * "processes", or "processes": {"max"}: the most processes of the
+     * application.  libunit uses it to choose how a context waits.  See
+     * nxt_unit_wait_set_init().
+     */
+    nxt_conf_value_t           *processes;
+    uint32_t                   max_processes;
+
     nxt_fd_t                   shared_port_fd;
     nxt_fd_t                   shared_queue_fd;
 

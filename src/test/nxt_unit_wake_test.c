@@ -33,6 +33,10 @@
  *      the first woken thread, if that thread did not run yet.
  *   9. When the process uses half of its RLIMIT_NOFILE or more, the set is
  *      not kept, and the thread does not try again.
+ *  10. When the application can have fewer than 4 processes, each thread
+ *      waits in poll().  With 4, or when the number is not known (0), each
+ *      thread uses a set.
+ *  11. NXT_UNIT_INIT gives the number of processes.
  */
 
 #include "nxt_main.h"
@@ -40,6 +44,7 @@
 
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/resource.h>
@@ -66,6 +71,7 @@ typedef struct {
 
 
 static int                     nxt_wake_test_failures;
+static uint32_t                nxt_wake_test_processes;
 static int                     nxt_wake_test_shared[2] = { -1, -1 };
 static nxt_atomic_t            nxt_wake_test_ready;
 static nxt_atomic_t            nxt_wake_test_woken;
@@ -203,7 +209,7 @@ nxt_wake_test_start(int err)
     for (i = 0; i < NXT_WAKE_TEST_THREADS; i++) {
         t = &nxt_wake_test_threads[i];
 
-        t->ws = nxt_unit_test_wait_set_new();
+        t->ws = nxt_unit_test_wait_set_new(nxt_wake_test_processes);
         if (t->ws == NULL) {
             return -1;
         }
@@ -382,7 +388,7 @@ nxt_wake_test_read_port(void)
 
     t = &nxt_wake_test_threads[0];
 
-    ws = nxt_unit_test_wait_set_new();
+    ws = nxt_unit_test_wait_set_new(0);
 
     if (ws == NULL || send(t->read[1], "m", 1, 0) != 1) {
         return 1;
@@ -609,7 +615,7 @@ nxt_wake_test_crowded(int read_fd)
     low = rlim;
     low.rlim_cur = 2 * (rlim_t) fd;
 
-    ws = nxt_unit_test_wait_set_new();
+    ws = nxt_unit_test_wait_set_new(0);
 
     if (ws == NULL || setrlimit(RLIMIT_NOFILE, &low) != 0) {
         perror("setrlimit");
@@ -634,7 +640,7 @@ nxt_wake_test_crowded(int read_fd)
 
     low.rlim_cur = 2 * (rlim_t) fd + 2;
 
-    ws = nxt_unit_test_wait_set_new();
+    ws = nxt_unit_test_wait_set_new(0);
 
     if (ws == NULL || setrlimit(RLIMIT_NOFILE, &low) != 0) {
         perror("setrlimit");
@@ -650,6 +656,57 @@ nxt_wake_test_crowded(int read_fd)
                          "below half of RLIMIT_NOFILE, the set is kept", fd);
 
     nxt_unit_test_wait_set_free(ws);
+
+    return 0;
+}
+
+
+/*
+ * 10. With 2 processes, no thread uses a set, and one datagram wakes every
+ * thread.  With 4, one datagram wakes one thread.  0 (not known) is case 5.
+ */
+
+static int
+nxt_wake_test_processes_gate(void)
+{
+    int  k;
+
+    nxt_wake_test_processes = 2;
+
+    if (nxt_wake_test_start(0) != 0) {
+        return 1;
+    }
+
+    k = nxt_wake_test_epoll_sets();
+    nxt_wake_test_assert(k == 0, "with 2 processes, no context uses a set", k);
+
+    nxt_wake_test_all("with 2 processes, one READ_QUEUE wakes every context");
+
+    k = nxt_wake_test_drain();
+    nxt_wake_test_assert(k == 1, "with 2 processes, the datagram stays", k);
+
+    nxt_wake_test_free_sets();
+
+    nxt_wake_test_processes = 4;
+
+    if (nxt_wake_test_start(0) != 0) {
+        return 1;
+    }
+
+    k = nxt_wake_test_epoll_sets();
+    nxt_wake_test_assert(k == NXT_WAKE_TEST_THREADS,
+                         "with 4 processes, every context uses its set", k);
+
+    nxt_wake_test_one_each("with 4 processes, one READ_QUEUE wakes one",
+                           "with 4 processes, each READ_QUEUE wakes one more");
+
+    k = nxt_wake_test_drain();
+    nxt_wake_test_assert(k == NXT_WAKE_TEST_THREADS,
+                         "with 4 processes, no context read a datagram", k);
+
+    nxt_wake_test_free_sets();
+
+    nxt_wake_test_processes = 0;
 
     return 0;
 }
@@ -713,7 +770,8 @@ nxt_wake_test_epoll(void)
     nxt_wake_test_free_sets();
 
     if (nxt_wake_test_back_to_back(2) != 0
-        || nxt_wake_test_crowded(nxt_wake_test_threads[0].read[0]) != 0)
+        || nxt_wake_test_crowded(nxt_wake_test_threads[0].read[0]) != 0
+        || nxt_wake_test_processes_gate() != 0)
     {
         return 1;
     }
@@ -724,12 +782,52 @@ nxt_wake_test_epoll(void)
 #endif
 
 
+/*
+ * 11. The number of processes is the last field of NXT_UNIT_INIT
+ * (src/nxt_external.c).  A variable without it is not valid.
+ */
+
+static void
+nxt_wake_test_env(void)
+{
+    int64_t  n;
+
+    static const char  with[] = NXT_VERSION ";1;1,0,-1;1,0,-1;1,0,-1,-1;"
+                                "-1,-1;2,1048576,0,6";
+    static const char  without[] = NXT_VERSION ";1;1,0,-1;1,0,-1;1,0,-1,-1;"
+                                   "-1,-1;2,1048576,0,";
+
+    if (setenv(NXT_UNIT_INIT_ENV, with, 1) != 0) {
+        perror("setenv");
+        nxt_wake_test_failures++;
+        return;
+    }
+
+    n = nxt_unit_test_read_env_processes();
+    nxt_wake_test_assert(n == 6, "NXT_UNIT_INIT gives 6 processes", (long) n);
+
+    if (setenv(NXT_UNIT_INIT_ENV, without, 1) != 0) {
+        perror("setenv");
+        nxt_wake_test_failures++;
+        return;
+    }
+
+    n = nxt_unit_test_read_env_processes();
+    nxt_wake_test_assert(n == -1, "NXT_UNIT_INIT without processes fails",
+                         (long) n);
+
+    (void) unsetenv(NXT_UNIT_INIT_ENV);
+}
+
+
 static int
 nxt_wake_test_end(int rc)
 {
     if (rc != 0) {
         return 1;
     }
+
+    nxt_wake_test_env();
 
     printf("wake test: %s\n", nxt_wake_test_failures ? "FAILED" : "passed");
 

@@ -252,6 +252,29 @@ static nxt_conf_map_t  nxt_common_app_conf[] = {
         offsetof(nxt_common_app_conf_t, limits),
     },
 
+    /* An integer, or an object with "max", as in nxt_router_app_conf. */
+
+    {
+        nxt_string("processes"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_common_app_conf_t, max_processes),
+    },
+
+    {
+        nxt_string("processes"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_common_app_conf_t, processes),
+    },
+
+};
+
+
+static nxt_conf_map_t  nxt_common_app_processes_conf[] = {
+    {
+        nxt_string("max"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_common_app_conf_t, max_processes),
+    },
 };
 
 
@@ -658,6 +681,7 @@ nxt_main_start_process_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     app_conf->shm_limit = 100 * 1024 * 1024;
     app_conf->request_limit = 0;
+    app_conf->max_processes = 1;
 
     start += app_conf->name.length + 1;
 
@@ -712,6 +736,21 @@ nxt_main_start_process_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
         if (nxt_slow_path(ret != NXT_OK)) {
             nxt_alert(task, "failed to map app limits received from router");
+            goto failed;
+        }
+    }
+
+    if (app_conf->processes != NULL
+        && nxt_conf_type(app_conf->processes) == NXT_CONF_OBJECT)
+    {
+        ret = nxt_conf_map_object(process->mem_pool, app_conf->processes,
+                                  nxt_common_app_processes_conf,
+                                  nxt_nitems(nxt_common_app_processes_conf),
+                                  app_conf);
+
+        if (nxt_slow_path(ret != NXT_OK)) {
+            nxt_alert(task, "failed to map app processes received from "
+                      "router");
             goto failed;
         }
     }
