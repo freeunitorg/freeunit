@@ -4,6 +4,9 @@ FROM node:26-trixie
 # default from NXT_VERSION in the version file.  release-docker.yml passes
 # the tag with --build-arg UNIT_VERSION=<tag>.
 ARG UNIT_VERSION=1.37.0
+# Optional commit timestamp for reproducible builds (PR #626).  When unset,
+# the build step falls back to the commit timestamp of the cloned tag.
+ARG SOURCE_DATE_EPOCH
 
 LABEL org.opencontainers.image.title="FreeUnit (node-26)"
 LABEL org.opencontainers.image.description="Community build of FreeUnit for Docker."
@@ -43,6 +46,7 @@ RUN set -ex \
     && cd /usr/src/unit \
     && git clone --depth 1 -b "${UNIT_VERSION}" https://github.com/freeunitorg/freeunit unit \
     && cd unit \
+    && export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}" \
     && NCPU="$(getconf _NPROCESSORS_ONLN)" \
     && DEB_HOST_MULTIARCH="$(dpkg-architecture -q DEB_HOST_MULTIARCH)" \
     && CC_OPT="$(DEB_BUILD_MAINT_OPTIONS="hardening=+all,-pie" DEB_CFLAGS_MAINT_APPEND="-fPIC" dpkg-buildflags --get CFLAGS | tr ' ' '\n' | grep -v '^-specs=' | tr '\n' ' ')" \

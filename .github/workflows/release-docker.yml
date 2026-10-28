@@ -1,67 +1,75 @@
-# .github/workflows/release-docker.yml
+# Build and publish multi-arch (amd64 + arm64) Docker images for FreeUnit
+# to GitHub Container Registry (ghcr.io/freeunitorg/freeunit) and
+# Docker Hub (docker.io/freeunitorg/freeunit).
 #
-# Builds multi-arch Docker images (amd64 + arm64) and pushes to GHCR.
-# Triggered on FreeUnit release tags (semver, e.g. 1.35.0) or manually
-# via workflow_dispatch.
+# Architecture:
+#   setup -> build (variants x 2 native archs, max 20 parallel;
+#                   or a filtered subset when `inputs.variants` is passed)
+#         -> merge (per variant: combines -amd64 and -arm64 into multi-arch
+#                   manifests for `<version>-<variant>`, `latest-<variant>`,
+#                   and immutable `<version>-<variant>-<YYYYMMDD>`)
+#         -> cleanup (deletes temporary per-arch tags from both registries)
 #
-# Structure:
-#   setup  — single source of truth: emits the version and the variant list.
-#   build  — variant × arch matrix; builds and pushes per-arch images.
-#   merge  — variant matrix; stitches the per-arch images into a manifest.
+# Why native runners instead of QEMU:
+#   Building arm64 via QEMU emulation on amd64 takes 30-45 minutes per image
+#   because ./configure + make compiles C from source. Native ubuntu-24.04-arm
+#   runners compile in ~2-3 minutes — a 10-15x speedup.
 #
-# Adding/dropping a variant: edit pkg/eol.json.  The `setup` job derives the
-# variant list from it.  If the variant had an old-style GHCR tag (up to
-# 1.35.5, for example latest-php8.5), also edit the old-style list in
-# `setup`; the run stops if a variant in that list is not built.
-# The Dockerfile path is derived as pkg/docker/Dockerfile.<variant>, so the
-# variant name must match the Dockerfile suffix.
+# Variant list:
+#   Derived dynamically from pkg/eol.json in the setup job. No hardcoded list
+#   to maintain here — adding/removing a version in eol.json (and running
+#   `make dockerfiles` in pkg/docker/) is enough.
+#   For manual rebuilds (e.g. when an upstream language base image ships a
+#   patch release without a new FreeUnit core release), `workflow_dispatch`
+#   accepts an optional `variants` filter (comma-separated exact variant names
+#   or language prefixes such as `php` or `php-8.5,python-3.14`).
 #
-# Language version support policy:
-#   Each image is supported for 1 year after the language/runtime EOL.
-#   The variant list and EOL dates live in pkg/eol.json (single source of
-#   truth) — the `setup` job derives the build matrix from it, so this file
-#   no longer duplicates the per-version table. EOL reference:
-#   https://endoflife.date
-#
-#   go-1.24 is intentionally NOT built: Go upstream stopped patching after
-#   1.24.13 (2026-02-04), leaving unfixed CVEs — CVE-2026-27140 (cmd/cgo SWIG
-#   RCE, CVSS 8.8), CVE-2026-33814 (HTTP/2 client DoS), CVE-2026-27142
-#   (html/template XSS), cgo DNS double-free, go tool pack path traversal —
-#   fixed only in 1.25.9+/1.26.2+.
-#
-#   node-20 is intentionally NOT built: Node.js upstream stopped patching
-#   after 20.20.2 (2026-04-30 EOL), leaving CVE-2026-111497 (bundled Brotli
-#   1.1.0 decoder out-of-bounds write, CVSS v4.0 9.2) unfixed.  It is
-#   patched only in 22.23.4+/24.22.1+/26.12.1+.
+# Required secrets:
+#   DOCKERHUB_USERNAME — Docker Hub account username
+#   DOCKERHUB_TOKEN    — Docker Hub access token (Read, Write, Delete)
+#   GITHUB_TOKEN       — automatic; needs packages:write permission
 
-name: "Release (Docker Images)"
+name: Release Docker Images
 
 on:
   push:
-    # Only FreeUnit release tags (semver). Must NOT match unitctl/* tags,
-    # otherwise a unitctl release would trigger a full image build.
     tags:
       - '[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Version tag (e.g. 1.35.0)'
+        description: 'Version tag (e.g. 1.37.1)'
         required: true
+        type: string
+      variants:
+        description: 'Optional comma-separated list of variants or prefixes to rebuild (e.g. php or php-8.5,python-3.14); empty = all'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
 
 env:
   GHCR_REGISTRY: ghcr.io
-  GHCR_IMAGE_NAME: freeunitorg/freeunit
+  GHCR_IMAGE_NAME: ${{ github.repository }}
   DOCKERHUB_REGISTRY: docker.io
   DOCKERHUB_IMAGE_NAME: freeunitorg/freeunit
 
 jobs:
-  # Single source of truth for the release version and the variant list,
-  # consumed by both `build` and `merge` via fromJSON().
+  # ---------------------------------------------------------------------------
+  # 1. Determine version tag and read variant list from pkg/eol.json
+  # ---------------------------------------------------------------------------
   setup:
     runs-on: ubuntu-26.04
-    timeout-minutes: 10
     outputs:
       version: ${{ steps.meta.outputs.version }}
+      revision: ${{ steps.meta.outputs.revision }}
+      source_date_epoch: ${{ steps.meta.outputs.source_date_epoch }}
+      build_date: ${{ steps.meta.outputs.build_date }}
       variants: ${{ steps.meta.outputs.variants }}
       legacy: ${{ steps.meta.outputs.legacy }}
     steps:
@@ -70,9 +78,13 @@ jobs:
 
       - name: Resolve version and variant list
         id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_VARIANTS: ${{ inputs.variants }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.tag }}"
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            VERSION="${INPUT_TAG#v}"
           else
             VERSION="${GITHUB_REF_NAME#v}"
           fi
@@ -90,17 +102,51 @@ jobs:
             exit 1
           fi
 
+          REVISION=$(git rev-parse "refs/tags/${VERSION}^{commit}")
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct "refs/tags/${VERSION}^{commit}")
+          BUILD_DATE=$(date -u +%Y%m%d)
+          {
+            echo "revision=${REVISION}"
+            echo "source_date_epoch=${SOURCE_DATE_EPOCH}"
+            echo "build_date=${BUILD_DATE}"
+          } >> "$GITHUB_OUTPUT"
+
           # Variant list is derived from pkg/eol.json (single source of truth).
           # Each runtime version -> "<runtime>-<version>"; a null version (wasm,
           # minimal) -> just "<runtime>"; "slim": true adds a "-slim" sibling.
           # Variant == Dockerfile suffix (pkg/docker/Dockerfile.<variant>).
-          variants=$(jq -c '[
+          all_variants=$(jq -c '[
             .runtimes | to_entries[] | .key as $rt | .value[] |
             if .version == null then $rt
             else ([$rt + "-" + .version]
                   + (if .slim then [$rt + "-" + .version + "-slim"] else [] end))
             end
           ] | flatten' pkg/eol.json)
+
+          if [ -n "${INPUT_VARIANTS}" ]; then
+            variants=$(jq -cn \
+              --argjson all "${all_variants}" \
+              --arg raw "${INPUT_VARIANTS}" '
+              ($raw | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $filters
+              | if ($filters | length) == 0 then
+                  error("variants filter is blank")
+                else
+                  ($filters | map(. as $f |
+                    if ($all | index($f)) != null then [$f]
+                    else [ $all[] | select(startswith(($f | rtrimstr("-")) + "-") or startswith($f)) ]
+                    end
+                    | if length == 0 then error("no variant matches filter: " + $f) else . end
+                  ) | flatten | unique) as $selected
+                  | [ $all[] | select(IN($selected[])) ]
+                end
+            ')
+          else
+            variants="${all_variants}"
+          fi
+          if [ "$(jq 'length' <<< "${variants}")" -eq 0 ]; then
+            echo "::error::no variants matched '${INPUT_VARIANTS}'"
+            exit 1
+          fi
           echo "variants=${variants}" >> "$GITHUB_OUTPUT"
 
           # Up to 1.35.5 the variants had no hyphen after the language, and
@@ -108,35 +154,47 @@ jobs:
           # these tags, and some guides cite them.  The merge job points
           # each one at the same image as latest-<variant>.  Only these
           # variants had such a tag; no new old-style tag is made.  Each one
-          # must still be built: a renamed or dropped variant stops the run
-          # here, so its old-style tag does not go stale without a notice.
-          legacy=$(jq -cn --argjson built "${variants}" '
+          # must still be built on a full release run; when `inputs.variants`
+          # filters the run to a subset, check and emit only the old-style
+          # tags whose variants are included in the current run (while still
+          # verifying none were dropped from pkg/eol.json).
+          legacy=$(jq -cn \
+            --argjson all "${all_variants}" \
+            --argjson built "${variants}" \
+            --arg filter "${INPUT_VARIANTS}" '
             [ "go-1.25", "go-1.26", "java-17", "java-21",
               "node-22", "node-24", "perl-5.38", "perl-5.40",
               "php-8.3", "php-8.4", "php-8.5",
               "python-3.12", "python-3.12-slim", "python-3.13",
               "python-3.13-slim", "python-3.14", "python-3.14-slim",
               "ruby-3.3", "ruby-3.4" ] as $old
-            | ($old - $built) as $gone
+            | (if ($filter | gsub("^\\s+|\\s+$"; "") | length) > 0
+               then [ $old[] | select(IN($built[])) ]
+               else $old
+               end) as $expected
+            | (($old - $all) + ($expected - $built) | unique) as $gone
             | if ($gone | length) > 0
               then error("old-style tag for a variant that is not built: "
                          + ($gone | join(", ")))
-              else [ $old[] | { (.): ("latest-" + (if startswith("java-")
+              else ([ $expected[] | { (.): ("latest-" + (if startswith("java-")
                        then "jsc" + ltrimstr("java-")
-                       else sub("-"; "") end)) } ] | add
+                       else sub("-"; "") end)) } ] | add) // {}
               end')
           echo "legacy=${legacy}" >> "$GITHUB_OUTPUT"
 
+          echo "Version: ${VERSION} (revision ${REVISION}, SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}, build_date=${BUILD_DATE})"
+          echo "Variants ($(jq 'length' <<< "${variants}")): ${variants}"
+          echo "Legacy tags ($(jq 'length' <<< "${legacy}")): ${legacy}"
+
+  # ---------------------------------------------------------------------------
+  # 2. Build per-arch images on native runners (amd64 + arm64 in parallel)
+  # ---------------------------------------------------------------------------
   build:
     needs: setup
     runs-on: ${{ matrix.arch.runner }}
-    timeout-minutes: 90
-    permissions:
-      contents: read
-      packages: write
-
     strategy:
       fail-fast: false
+      max-parallel: 20
       matrix:
         variant: ${{ fromJSON(needs.setup.outputs.variants) }}
         arch:
@@ -146,20 +204,19 @@ jobs:
           - name: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
-
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
       - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.GHCR_REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -167,58 +224,123 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Resolve base image and runtime metadata
+        id: base
+        env:
+          VARIANT: ${{ matrix.variant }}
+          PLATFORM: ${{ matrix.arch.platform }}
+        run: |
+          base_ref=$(awk '/^FROM /{print $2; exit}' "pkg/docker/Dockerfile.${VARIANT}")
+          case "${base_ref}" in
+            */*) base_name="docker.io/${base_ref}" ;;
+            *)   base_name="docker.io/library/${base_ref}" ;;
+          esac
+          docker pull --platform "${PLATFORM}" "${base_ref}"
+          base_digest=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${base_ref}" \
+            | sed -n 's/.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' | head -n 1)
+          if [ -z "${base_digest}" ]; then
+            echo "::error::failed to resolve repo digest for ${base_ref}"
+            exit 1
+          fi
+          runtime_version=$(docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${base_ref}" \
+            | sed -n 's/^\(GOLANG\|JAVA\|NODE\|PERL\|PHP\|PYTHON\|RUBY\)_VERSION=//p' \
+            | head -n 1)
+          if [ -z "${runtime_version}" ] && [ "${VARIANT}" = "wasm" ]; then
+            runtime_version=$(jq -r '.dependencies.wasmtime_c_api.version' pkg/eol.json)
+          elif [ -z "${runtime_version}" ]; then
+            runtime_version=$(docker run --rm --platform "${PLATFORM}" "${base_ref}" \
+              sh -c 'cat /etc/debian_version 2>/dev/null || true' | tr -d '\r\n')
+          fi
+          {
+            echo "base_name=${base_name}"
+            echo "base_digest=${base_digest}"
+            echo "runtime_version=${runtime_version}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Base image: ${base_name}@${base_digest} (runtime_version=${runtime_version})"
+
       - name: Build and push (${{ matrix.arch.name }})
         uses: docker/build-push-action@v7
         with:
           context: pkg/docker
           file: pkg/docker/Dockerfile.${{ matrix.variant }}
           platforms: ${{ matrix.arch.platform }}
-          # The Dockerfile clones this tag and puts it in the version label.
+          pull: true
+          provenance: mode=max
+          sbom: true
+          # The Dockerfile clones this tag, puts it in the version label,
+          # and builds reproducibly using the tag commit's SOURCE_DATE_EPOCH.
           build-args: |
             UNIT_VERSION=${{ needs.setup.outputs.version }}
+            SOURCE_DATE_EPOCH=${{ needs.setup.outputs.source_date_epoch }}
           push: true
           tags: |
             ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}:${{ needs.setup.outputs.version }}-${{ matrix.variant }}-${{ matrix.arch.name }}
             ${{ env.DOCKERHUB_REGISTRY }}/${{ env.DOCKERHUB_IMAGE_NAME }}:${{ needs.setup.outputs.version }}-${{ matrix.variant }}-${{ matrix.arch.name }}
           labels: |
             org.opencontainers.image.source=https://github.com/freeunitorg/freeunit
+            org.opencontainers.image.version=${{ needs.setup.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.setup.outputs.revision }}
+            org.opencontainers.image.base.name=${{ steps.base.outputs.base_name }}
+            org.opencontainers.image.base.digest=${{ steps.base.outputs.base_digest }}
+            org.freeunit.runtime.version=${{ steps.base.outputs.runtime_version }}
+          annotations: |
+            org.opencontainers.image.source=https://github.com/freeunitorg/freeunit
+            org.opencontainers.image.version=${{ needs.setup.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.setup.outputs.revision }}
+            org.opencontainers.image.base.name=${{ steps.base.outputs.base_name }}
+            org.opencontainers.image.base.digest=${{ steps.base.outputs.base_digest }}
+            org.freeunit.runtime.version=${{ steps.base.outputs.runtime_version }}
           cache-from: type=gha,scope=${{ matrix.arch.name }}-${{ matrix.variant }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch.name }}-${{ matrix.variant }}
 
+  # ---------------------------------------------------------------------------
+  # 3. Merge amd64 + arm64 into multi-arch manifests and push final tags
+  # ---------------------------------------------------------------------------
   merge:
     needs: [setup, build]
     runs-on: ubuntu-26.04
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      packages: write
-
     strategy:
       fail-fast: false
+      max-parallel: 10
       matrix:
         variant: ${{ fromJSON(needs.setup.outputs.variants) }}
-
     steps:
       - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.GHCR_REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
       - name: Create and push multi-arch manifest
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+          REVISION: ${{ needs.setup.outputs.revision }}
+          BUILD_DATE: ${{ needs.setup.outputs.build_date }}
+          VARIANT: ${{ matrix.variant }}
+          LEGACY: ${{ fromJSON(needs.setup.outputs.legacy)[matrix.variant] }}
         run: |
-          VERSION="${{ needs.setup.outputs.version }}"
-          VARIANT="${{ matrix.variant }}"
           GHCR_REPO="${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}"
-          # The old-style tag of this variant, or empty (see the setup job).
-          LEGACY="${{ fromJSON(needs.setup.outputs.legacy)[matrix.variant] }}"
+
+          raw_idx=$(docker buildx imagetools inspect --raw "${GHCR_REPO}:${VERSION}-${VARIANT}-amd64")
+          BASE_NAME=$(jq -r '(.annotations["org.opencontainers.image.base.name"] // .manifests[0].annotations["org.opencontainers.image.base.name"]) // empty' <<< "${raw_idx}")
+          RUNTIME_VER=$(jq -r '(.annotations["org.freeunit.runtime.version"] // .manifests[0].annotations["org.freeunit.runtime.version"]) // empty' <<< "${raw_idx}")
+          EXTRA_ANNOTATIONS=()
+          if [ -n "${BASE_NAME}" ]; then
+            EXTRA_ANNOTATIONS+=(--annotation "index:org.opencontainers.image.base.name=${BASE_NAME}")
+          fi
+          if [ -n "${RUNTIME_VER}" ]; then
+            EXTRA_ANNOTATIONS+=(--annotation "index:org.freeunit.runtime.version=${RUNTIME_VER}")
+          fi
 
           # Per-arch images live in both registries; build a manifest in each.
           for REPO in \
@@ -230,8 +352,9 @@ jobs:
               EXTRA_TAGS=(--tag "${REPO}:${LEGACY}")
             fi
             docker buildx imagetools create \
-              --tag ${REPO}:${VERSION}-${VARIANT} \
-              --tag ${REPO}:latest-${VARIANT} \
+              --tag "${REPO}:${VERSION}-${VARIANT}" \
+              --tag "${REPO}:${VERSION}-${VARIANT}-${BUILD_DATE}" \
+              --tag "${REPO}:latest-${VARIANT}" \
               "${EXTRA_TAGS[@]}" \
               --annotation "index:org.opencontainers.image.description=FreeUnit ${VERSION} (${VARIANT}) — community LTS fork of the NGINX Unit application server" \
               --annotation "index:org.opencontainers.image.title=FreeUnit (${VARIANT})" \
@@ -239,7 +362,66 @@ jobs:
               --annotation "index:org.opencontainers.image.source=https://github.com/freeunitorg/freeunit" \
               --annotation "index:org.opencontainers.image.vendor=FreeUnit Community" \
               --annotation "index:org.opencontainers.image.version=${VERSION}" \
-              ${REPO}:${VERSION}-${VARIANT}-amd64 \
-              ${REPO}:${VERSION}-${VARIANT}-arm64
-            docker buildx imagetools inspect ${REPO}:${VERSION}-${VARIANT}
+              --annotation "index:org.opencontainers.image.revision=${REVISION}" \
+              "${EXTRA_ANNOTATIONS[@]}" \
+              "${REPO}:${VERSION}-${VARIANT}-amd64" \
+              "${REPO}:${VERSION}-${VARIANT}-arm64"
+            docker buildx imagetools inspect "${REPO}:${VERSION}-${VARIANT}"
+          done
+
+  # ---------------------------------------------------------------------------
+  # 4. Delete temporary per-arch tags (-amd64, -arm64) from both registries
+  # ---------------------------------------------------------------------------
+  cleanup:
+    needs: [setup, merge]
+    if: always() && needs.merge.result == 'success'
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Delete temporary tags from Docker Hub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          VERSION: ${{ needs.setup.outputs.version }}
+          VARIANTS: ${{ needs.setup.outputs.variants }}
+        run: |
+          TOKEN=$(curl -sf -X POST https://hub.docker.com/v2/users/login \
+            -H "Content-Type: application/json" \
+            -d "{\"username\": \"${DOCKERHUB_USERNAME}\", \"password\": \"${DOCKERHUB_TOKEN}\"}" \
+            | jq -r '.token')
+
+          for variant in $(echo "${VARIANTS}" | jq -r '.[]'); do
+            for arch in amd64 arm64; do
+              tag="${VERSION}-${variant}-${arch}"
+              echo "Deleting Docker Hub tag: ${tag}"
+              curl -sf -X DELETE \
+                "https://hub.docker.com/v2/repositories/${DOCKERHUB_IMAGE_NAME}/tags/${tag}/" \
+                -H "Authorization: JWT ${TOKEN}" || echo "Warning: failed to delete ${tag}"
+            done
+          done
+
+      - name: Delete temporary tags from GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.setup.outputs.version }}
+          VARIANTS: ${{ needs.setup.outputs.variants }}
+        run: |
+          # Fetch all package versions once and map tag -> version ID locally
+          PACKAGE_VERSIONS=$(gh api --paginate \
+            "/orgs/${{ github.repository_owner }}/packages/container/freeunit/versions" \
+            --jq '.[] | {id: .id, tags: .metadata.container.tags}')
+
+          for variant in $(echo "${VARIANTS}" | jq -r '.[]'); do
+            for arch in amd64 arm64; do
+              tag="${VERSION}-${variant}-${arch}"
+              version_id=$(echo "${PACKAGE_VERSIONS}" \
+                | jq -r "select(.tags[]? == \"${tag}\") | .id" | head -n1)
+              if [ -n "${version_id}" ]; then
+                echo "Deleting GHCR tag: ${tag} (version ${version_id})"
+                gh api --method DELETE \
+                  "/orgs/${{ github.repository_owner }}/packages/container/freeunit/versions/${version_id}" \
+                  || echo "Warning: failed to delete ${tag}"
+              else
+                echo "GHCR tag ${tag} not found, skipping"
+              fi
+            done
           done
