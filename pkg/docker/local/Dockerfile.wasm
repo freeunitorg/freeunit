@@ -5,7 +5,7 @@
 # The FreeUnit release this image builds.  The default is the release
 # version.  build-local.sh passes its -v value with
 # --build-arg UNIT_VERSION=<version>.
-ARG UNIT_VERSION=1.37.0
+ARG UNIT_VERSION=1.37.1
 
 FROM ghcr.io/freeunitorg/freeunit-builder:trixie-rust1.95.0 AS build
 ARG UNIT_VERSION
