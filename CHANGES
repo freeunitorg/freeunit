@@ -1,5 +1,5 @@
 
-Changes with FreeUnit 1.37.1                                     04 Oct 2026
+Changes with FreeUnit 1.37.1                                     28 Oct 2026
 
     *) Security: update Wasmtime, wasmtime-wasi and wasmtime-wasi-http
        to 48.0.7 for RUSTSEC-2026-0350 through RUSTSEC-2026-0359,
@@ -537,7 +537,10 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
        so replacing a regular script with a FIFO cannot park the worker.
        Filesystem errors are preserved before PHP resolves the path, so
        an overlong script path gets 404.  Neither answer carries PHP's
-       diagnostics.  See
+       diagnostics.  A fixed "script" that is missing still answers 404,
+       but PHP now starts the request first.  With "session.auto_start"
+       on, such a 404 carries a new PHPSESSID cookie and a Content-type
+       header.  See
        https://github.com/freeunitorg/freeunit/issues/715.
 
     *) Bugfix: a PHP POST request without a "Content-Type" header could
@@ -600,6 +603,60 @@ Changes with FreeUnit 1.37.1                                     04 Oct 2026
     *) Change: the Node.js 20 Docker image (node-20) is no longer built.
        Node.js 20 reached upstream end-of-life on 2026-04-30 and receives
        no fix for CVE-2026-111497 in its bundled Brotli decoder.
+
+    *) Change: tools/unitc and tools/setup-unit now run with /bin/sh and no
+       longer need bash. They work with dash, BusyBox ash and the BSD sh.
+       unitc now exits with 4 when curl reports an HTTP error; before, it
+       exited with 0. The response, edit and cache files that unitc writes
+       under /tmp are created with umask 077, because they hold the
+       configuration. A file name or URI with a space now reaches curl as
+       one argument.
+
+    *) Bugfix: while an application waited for the router to free shared
+       memory, libunit kept each message that arrived in the meantime in a
+       read buffer of 16 KiB, also when the message was 20 bytes. A client
+       that reads slowly and sends fast could make the application hold
+       thousands of such buffers. A waiting message now takes a copy of its
+       own size.
+
+    *) Bugfix: in a debug build of the PHP module, a script that could not
+       be opened could answer 404 instead of 403, or 503 instead of 403 or
+       404. The debug log call changed errno before the module chose the
+       status; on a minimal Alpine image a denied script answered 404 on
+       every request. Release builds were not affected.
+
+    *) Bugfix: data races between the threads of unitd and libunit on shared
+       counters, reference counts, queue entries and the time cache. The
+       lock-free port queues now read a queue entry with an acquire load, so
+       a consumer that sees the entry also sees the payload written before
+       it, also on platforms with weak memory ordering, such as arm64. None
+       of these races is known to have caused a crash.
+
+    *) Bugfix: nxt_unit_read_buf_get() in libunit dereferenced the buffer
+       pointer before checking that nxt_unit_malloc() succeeded.
+
+    *) Bugfix: with "compression" on, an application response with
+       "Content-Length: 0" was compressed, and got 406 when
+       "Accept-Encoding" refused "identity". A compressed response that
+       the application ended after fewer bytes than "Content-Length" left
+       out the stream trailer, and a failed compression buffer leaked the
+       request memory pool. Static files from 3.5 GiB truncated the zlib
+       output buffer size to 32 bits.
+
+    *) Bugfix: in libunit and the language modules: nxt_unit_request_read()
+       stopped after the inline buffer of a request body that continued in
+       a body file; the ASGI module did not check the WebSocket
+       "subprotocol" type or turn a post-handshake receive error into
+       "websocket.disconnect", and the WSGI write() callable ignored a
+       flush error; the PHP module set $argc and $argv with
+       "register_argc_argv" off; the Perl module left unread body bytes,
+       "$/" and its worker thread across requests or exit; the Ruby module
+       truncated ":" in header values and did not close "rack.input"; the
+       Java module read header names from the value pointer and could
+       overflow a grown buffer; the Go module indexed an empty header
+       name; the Node.js module mutated an array passed to setHeader();
+       and the Wasm module left a failed request open and accepted an
+       empty "access" object.
 
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
