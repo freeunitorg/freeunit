@@ -3,7 +3,7 @@ FROM node:22-trixie
 # The FreeUnit release this image builds.  "make dockerfiles" writes the
 # default from NXT_VERSION in the version file.  release-docker.yml passes
 # the tag with --build-arg UNIT_VERSION=<tag>.
-ARG UNIT_VERSION=1.37.0
+ARG UNIT_VERSION=1.37.1
 # Optional commit timestamp for reproducible builds (PR #626).  When unset,
 # the build step falls back to the commit timestamp of the cloned tag.
 ARG SOURCE_DATE_EPOCH
