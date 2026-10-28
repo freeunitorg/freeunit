@@ -278,8 +278,44 @@ with "cannot read spec file". With `-fPIC` and `-pie` set, the specs did nothing
 ## CI workflow
 
 The GitHub Actions workflow (`.github/workflows/release-docker.yml`) builds and pushes
-images to GHCR (`ghcr.io/freeunitorg/freeunit`) on every `v*` release tag or
-via `workflow_dispatch`. It produces:
+multi-arch (`linux/amd64`, `linux/arm64`) images to GHCR (`ghcr.io/freeunitorg/freeunit`)
+and Docker Hub (`docker.io/freeunitorg/freeunit`) on every release tag or via
+`workflow_dispatch`.
 
-- Per-arch tags: `VERSION-VARIANT-amd64`, `VERSION-VARIANT-arm64`
-- Multi-arch manifest: `VERSION-VARIANT`, `latest-VARIANT`
+### Rebuilding individual variants without a new FreeUnit release
+
+When an upstream runtime base image (for example `php:8.5-cli-trixie` or
+`python:3.14-slim`) publishes a patch release or Debian security update, trigger
+`Release Docker Images` via `workflow_dispatch` with:
+
+- `tag`: the FreeUnit release tag to rebuild (e.g. `1.37.1`)
+- `variants` *(optional)*: comma-separated list of exact variant names or language
+  prefixes (e.g. `php` to rebuild `php-8.3`, `php-8.4`, `php-8.5`, or
+  `php-8.5,python-3.14`); leave empty to build all variants in `pkg/eol.json`.
+
+### Tagging and provenance policy
+
+- **Floating tags** (`<version>-<variant>` and `latest-<variant>`, plus legacy
+  `latest-<lang><ver>` aliases on GHCR): overwritten on rebuild so deployments
+  pinning `1.37.1-php-8.5` automatically receive patched upstream runtimes while
+  keeping FreeUnit core pinned to `1.37.1`.
+- **Immutable build-date tag** (`<version>-<variant>-<YYYYMMDD>`, e.g.
+  `1.37.1-php-8.5-20261028`): published alongside the floating tags so users who
+  require an immutable tag reference can pin a specific rebuild date (or pin by
+  `@sha256:<digest>`).
+- **Temporary per-arch tags** (`<version>-<variant>-amd64`,
+  `<version>-<variant>-arm64`): merged into the multi-arch index and deleted in the
+  `cleanup` job.
+- **OCI annotations and labels**:
+  - `org.opencontainers.image.version` — FreeUnit core release version (`1.37.1`)
+  - `org.opencontainers.image.revision` — exact git commit SHA of the FreeUnit tag
+  - `org.opencontainers.image.base.name` — canonical upstream base image reference
+    (e.g. `docker.io/library/php:8.5-cli-trixie`)
+  - `org.opencontainers.image.base.digest` — upstream base image `sha256` digest
+    pulled at build time (`pull: true`)
+  - `org.freeunit.runtime.version` — exact upstream runtime patch version detected
+    from the base image (e.g. `8.5.12`)
+- **Build provenance and SBOM**: `provenance: mode=max` and `sbom: true` attach
+  SLSA provenance and SPDX SBOM attestations to the image index, and
+  `SOURCE_DATE_EPOCH` (set to the FreeUnit tag commit timestamp) ensures
+  reproducible compilation of `unitd` and modules per PR #626.
