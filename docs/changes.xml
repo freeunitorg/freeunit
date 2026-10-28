@@ -10,6 +10,14 @@
          date="2026-10-04" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="feature">
+<para>
+PHP exposes the current path without query arguments in
+$_SERVER['UNIT_REWRITTEN_PATH'], including after a route rewrite.
+REQUEST_URI remains the original URI (nginx/unit#1615).
+</para>
+</change>
+
 <change type="security">
 <para>
 update Wasmtime, wasmtime-wasi and wasmtime-wasi-http to 48.0.7 for
