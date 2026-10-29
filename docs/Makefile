@@ -1,6 +1,7 @@
 #!/usr/bin/make
 
 DEST=	../build
+ROOT=	..
 XSLS?=	xslscript.pl
 
 PACKAGES=	unit 							\
@@ -22,7 +23,55 @@ CURTIME:=$(shell date +"%H:%M:%S %z")
 
 all:		changes changelogs
 
-changes:	$(DEST)/CHANGES
+# The changelog in the root of the tree is generated from changes.xml.  Edit
+# changes.xml, not CHANGES, and run this target again.
+changes:	$(DEST)/CHANGES stylesheet-check
+	@if [ changes.xsls -nt changes.xslt ]; then \
+		echo "docs: changes.xsls is newer than changes.xslt." >&2; \
+		echo "docs: the compiled form can be stale; run \"make xslt\"." >&2; \
+	fi
+	@if cmp -s $(DEST)/CHANGES $(ROOT)/CHANGES; then \
+		echo "docs: the CHANGES file is up to date."; \
+	else \
+		echo "docs: the CHANGES file is updated from $(DEST)/CHANGES."; \
+		cp $(DEST)/CHANGES $(ROOT)/CHANGES; \
+	fi
+
+# The check target compares the generated changelog with the file in the root
+# of the tree.  It fails when the two differ and changes no file in the tree.
+# The CI job runs it, so that a hand-edited CHANGES file is caught.
+check:	$(DEST)/CHANGES stylesheet-check
+	@if cmp -s $(DEST)/CHANGES $(ROOT)/CHANGES; then \
+		echo "docs: the CHANGES file matches the generated one."; \
+	else \
+		echo "docs: the CHANGES file differs from the generated one." >&2; \
+		echo "docs: run \"make -C docs changes\" and commit the result." >&2; \
+		exit 1; \
+	fi
+
+# The stylesheet in the tree is the compiled form of changes.xsls.  The
+# compiler, xslscript.pl, is not packaged in most distributions, so the build
+# rule is not part of the default target: set XSLS to its path and run
+# "make xslt" after a change to changes.xsls.
+xslt:
+	$(XSLS) -o changes.xslt changes.xsls
+
+# The check target compares the named templates of the two stylesheets.  The
+# compiler is not available in most environments, so the check cannot compare
+# the body of a template.  It catches the common case of a change to
+# changes.xsls that no one compiled into changes.xslt.
+stylesheet-check:
+	@mkdir -p $(DEST)
+	@grep -oE 'X:template [A-Za-z_][A-Za-z0-9_-]*' changes.xsls \
+		| awk '{print $$2}' | sort -u > $(DEST)/.templates-xsls
+	@grep -oE '<xsl:template name="[A-Za-z_][A-Za-z0-9_-]*"' changes.xslt \
+		| sed 's/.*name="//; s/"$$//' | sort -u > $(DEST)/.templates-xslt
+	@if diff -u $(DEST)/.templates-xsls $(DEST)/.templates-xslt; then \
+		echo "docs: the two stylesheets define the same templates."; \
+	else \
+		echo "docs: the two stylesheets differ; run \"make xslt\"." >&2; \
+		exit 1; \
+	fi
 
 changelogs:	$(addsuffix .rpm-changelog, $(addprefix $(DEST)/, $(PACKAGES))) \
 		$(addsuffix .deb-changelog, $(addprefix $(DEST)/, $(PACKAGES)))
@@ -62,8 +111,7 @@ $(DEST)/%.deb-changelog:	changes.dtd 				\
 		--stringparam curtime '$(CURTIME)'			\
 		-o $@ changes.xslt changes.xml
 
-changes.xslt:	changes.xsls
-	$(XSLS) -o $@ $<
-
 clean:
 	rm -rf $(DEST)
+
+.PHONY: all changes check changelogs xslt stylesheet-check clean

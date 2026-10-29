@@ -65,7 +65,12 @@ VARIANT_php ?=		cli-$(VARIANT)
 $(foreach phpversion, $(VERSIONS_php), $(eval CONTAINER_php-$(phpversion) = php:$(phpversion)-$(VARIANT_php)))
 CONFIGURE_php ?=	php
 INSTALL_php ?=		php-install
-RUN_php ?=			ldconfig
+# The ini fragment hardens every PHP application in the image, including the ones
+# a user adds later through the control API.  The value goes through sed, so the
+# ampersands are escaped and the quotes are double: a single quote closes
+# the shell quoting of the sed expression.
+PHP_INI_FRAGMENT = session.upload_progress.enabled = 0
+RUN_php ?=			ldconfig \&\& mkdir -p /usr/local/etc/php/conf.d \&\& echo "$(PHP_INI_FRAGMENT)" > /usr/local/etc/php/conf.d/zz-freeunit-security.ini
 MODULE_PREBUILD_php ?= /bin/true
 
 VERSIONS_python ?=  $(call eol_versions,python)
@@ -103,12 +108,16 @@ MODVERSIONS = $(foreach module, $(MODULES), $(foreach modversion, $(shell for v 
 MODVERSIONS += $(foreach module, $(MODULES_SLIM), $(foreach modversion, $(shell for v in $(VERSIONS_$(module)); do echo $$v; done | sort -r), $(module)-$(modversion)-slim))
 MODVERSIONS += wasm minimal
 
+# Every Dockerfile of a PHP image.  The generated ones come from the template.
+# The local ones are written by hand.
+PHP_DOCKERFILES = $(wildcard Dockerfile.php-*) $(wildcard local/Dockerfile.php-*)
+
 modname = $(shell echo $1 | /usr/bin/tr -d '.01234567890-' | sed 's/slim//')
 
 dockerfiles: $(addprefix Dockerfile., $(MODVERSIONS))
 build: $(addprefix build-, $(MODVERSIONS))
 
-Dockerfile.%: ../../version template.Dockerfile
+Dockerfile.%: ../../version template.Dockerfile Makefile
 	@echo "===> Building $@"
 	cat template.Dockerfile | sed \
 			-e 's,@@VERSION@@,$(VERSION),g' \
@@ -125,6 +134,17 @@ build-%: Dockerfile.%
 	docker pull $(CONTAINER_$*)
 	docker build --no-cache --build-arg UNIT_VERSION=$(VERSION) -t unit:$(VERSION)-$* -f Dockerfile.$* .
 	touch $@
+
+# The local Dockerfiles are written by hand, so their PHP ini fragment can
+# drift from the value of RUN_php.  This target compares them.  The CI job
+# runs it, so that a local image and a published image carry the same setting.
+check:
+	@for f in $(PHP_DOCKERFILES); do \
+		grep -qF '$(PHP_INI_FRAGMENT)' "$$f" \
+			|| { echo "pkg/docker: $$f does not carry the PHP ini fragment" >&2; \
+			     exit 1; }; \
+	done
+	@echo "pkg/docker: every PHP Dockerfile carries the ini fragment"
 
 # TODO(#milestone-1.35.8): uncomment and update GitFetch when publishing to
 # Docker Hub Official Images.  Target date: 2026-08-28 (1.35.8 release).
@@ -172,4 +192,4 @@ clean:
 	rm -f $(addprefix build-, $(MODVERSIONS))
 	rm -rf build-logs
 
-.PHONY: default build dockerfiles clean
+.PHONY: default build dockerfiles check clean

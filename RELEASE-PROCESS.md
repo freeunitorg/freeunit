@@ -56,18 +56,41 @@ Create a commit that updates the docs/changes.xml for this release.
 As well as adding the various entries also update the 'date' and 'time'
 fields.
 
-## Update the CHANGES file
+Each entry is a `<change>` with a `type` of bugfix, feature, change,
+security or workaround, and one or more `<para>` elements.  A paragraph
+becomes a paragraph of the changelog, so use a second `<para>` for the
+paragraphs of one entry that stand apart.
 
-CHANGES is maintained by hand: every changelog commit adds its entry to
-both docs/changes.xml and CHANGES.  For the release, retitle the top block
-and set its date, keeping the leading blank line and the column the date
-sits in:
+## The CHANGES file
 
-    Changes with FreeUnit X.Y.Z                                     DD Mon YYYY
+The CHANGES file in the root of the tree is generated from
+docs/changes.xml:
 
-Do not regenerate it with `make -C docs/ changes`: the generator titles the
-block "Changes with Unit" and wraps every entry differently from the file
-in the tree, so the result is a rewrite rather than an update.
+    $ make -C docs changes
+
+It writes build/CHANGES and copies it over CHANGES.  Never edit CHANGES by
+hand: edit docs/changes.xml and run the command again.  A hand edit is lost
+the next time the file is generated, and the two files diverge.
+
+The CI job "Check the generated files" runs "make -C docs check" and compares
+the generated file with the committed one.  The job fails when the two differ.
+Run the target before the release commit.
+
+The packager of a stanza names the product in the title.  A stanza packed
+by "FreeUnit Packaging" is titled "Changes with FreeUnit X.Y.Z".  Any other
+packager is titled "Changes with Unit X.Y.Z".
+The date of a block comes from the 'date' and 'time' fields of its stanza.
+
+The stylesheet that renders the file, docs/changes.xslt, is the compiled
+form of docs/changes.xsls.  xslscript.pl, which compiles it, is not
+packaged in most distributions, so the compiled file is committed and the
+two must be changed together.  If xslscript.pl is at hand, "make -C docs
+xslt XSLS=/path/to/xslscript.pl" rebuilds it.
+
+The target "make -C docs stylesheet-check" compares the named templates of
+the two files.  It fails when they differ.  The compiler is not available in
+most environments, so the target cannot compare the body of a template.
+Run it after a change to either file.
 
 
 # Merge it
