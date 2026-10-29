@@ -8,6 +8,7 @@
 #include "SAPI.h"
 #include "php_main.h"
 #include "php_variables.h"
+#include "zend_exceptions.h"
 #include "ext/standard/php_standard.h"
 
 #include <nxt_main.h>
@@ -1393,6 +1394,275 @@ nxt_php_stream_open(zend_file_handle *handle)
 
     return SUCCESS;
 }
+
+
+/* The status for a script that nxt_php_stream_open() cannot open. */
+static int
+nxt_php_open_status(int err)
+{
+    switch (err) {
+    case EACCES:
+    case EPERM:
+    case ELOOP:
+    case ENFILE:
+        return NXT_HTTP_FORBIDDEN;
+    case ENOENT:
+    case ENOTDIR:
+    case ENAMETOOLONG:
+    case EISDIR:
+        return NXT_HTTP_NOT_FOUND;
+    default:
+        return NXT_HTTP_INTERNAL_SERVER_ERROR;
+    }
+}
+
+
+/*
+ * The stream of a script that runs from OPcache without an open.  On a cache
+ * hit, nothing reads it.  If the compile misses the cache, which can happen
+ * after nxt_php_opcache_serves() said that OPcache holds the script, the
+ * compile reads the stream, and the first read opens the script.
+ */
+typedef struct {
+    php_stream               *stream;
+    const char               *filename;
+    nxt_unit_request_info_t  *req;
+} nxt_php_miss_t;
+
+
+/*
+ * The script is opened as nxt_php_execute() opens it when OPcache does not
+ * serve it: the open is nonblocking, the descriptor must be a regular file,
+ * and display_errors is off for the open.  If the open fails, the status is
+ * set as nxt_php_execute() sets it, and zend_bailout() ends the script before
+ * PHP reports a failed read.  So a removed, unreadable or refused script
+ * gets the status and no body, as without OPcache.  An "auto_prepend_file"
+ * script has already run.  Its output stays in the body; if it has sent the
+ * response headers (flush(), or output with "output_buffering" off), the
+ * status cannot change, and the request ends with that output and no body
+ * from the script.
+ */
+static void
+nxt_php_miss_open(nxt_php_miss_t *miss)
+{
+    int               display_errors, err;
+    zend_result       ret;
+    zend_file_handle  fh;
+
+    if (nxt_fast_path(miss->stream != NULL)) {
+        return;
+    }
+
+    zend_stream_init_filename(&fh, miss->filename);
+
+    display_errors = PG(display_errors);
+    PG(display_errors) = 0;
+
+    errno = 0;
+    ret = nxt_php_stream_open(&fh);
+    err = errno;
+
+    PG(display_errors) = display_errors;
+
+    if (nxt_fast_path(ret == SUCCESS)) {
+        /* The stream is closed by nxt_php_miss_close(). */
+        miss->stream = fh.handle.stream.handle;
+        fh.handle.stream.handle = NULL;
+    }
+
+    zend_destroy_file_handle(&fh);
+
+    if (nxt_fast_path(ret == SUCCESS)) {
+        nxt_unit_req_debug(miss->req, "PHP script \"%s\" missed OPcache "
+                           "and is opened", miss->filename);
+        return;
+    }
+
+    nxt_unit_req_debug(miss->req, "PHP script \"%s\" missed OPcache "
+                       "and cannot be opened (%d: %s)",
+                       miss->filename, err, strerror(err));
+
+    SG(sapi_headers).http_response_code = nxt_php_open_status(err);
+
+    /* As in nxt_php_execute(): nxt_unit_request_done() would answer 200. */
+    (void) sapi_send_headers(TSRMLS_C);
+
+    zend_bailout();
+}
+
+
+static ssize_t
+nxt_php_miss_read(void *handle, char *buf, size_t size)
+{
+    nxt_php_miss_t  *miss;
+
+    miss = handle;
+
+    nxt_php_miss_open(miss);
+
+    return nxt_php_stream_read(miss->stream, buf, size);
+}
+
+
+static size_t
+nxt_php_miss_size(void *handle)
+{
+    nxt_php_miss_t  *miss;
+
+    miss = handle;
+
+    nxt_php_miss_open(miss);
+
+    return nxt_php_stream_size(miss->stream);
+}
+
+
+static void
+nxt_php_miss_close(void *handle)
+{
+    nxt_php_miss_t  *miss;
+
+    miss = handle;
+
+    if (miss->stream != NULL) {
+        nxt_php_stream_close(miss->stream);
+        miss->stream = NULL;
+    }
+}
+
+
+/*
+ * The value of an ini entry, or NULL when it has no value or does not
+ * exist, as with OPcache not loaded.
+ */
+static zend_string *
+nxt_php_ini_value(const char *name, size_t len)
+{
+    zend_ini_entry  *ini;
+
+    ini = zend_hash_str_find_ptr(EG(ini_directives), name, len);
+
+    return (ini != NULL) ? ini->value : NULL;
+}
+
+
+/*
+ * Whether a fixed "script" target can run from OPcache without an open of
+ * its path.  Each condition below that fails sends the request to the open
+ * path, which answers every error itself:
+ *
+ *   - "open_basedir" is empty.  With it set, php_check_open_basedir_ex()
+ *     resolves the path again, with a stat() for each path component, so
+ *     the checks here cost as much as the open that they save, or more:
+ *     29 file syscalls against 25 per request for a script 6 directories
+ *     deep.
+ *   - "opcache.validate_timestamps" is off.  With it on, the file decides
+ *     what runs, so the open path is used.
+ *   - "opcache.revalidate_path" is off.  With it on, OPcache opens the path
+ *     and finds the script by the opened path, instead of a lookup by the
+ *     key.
+ *   - "opcache.restrict_api" is empty.  With it set,
+ *     opcache_is_script_cached() warns on every request and returns false:
+ *     validate_api_restriction() compares SG(request_info).path_translated,
+ *     which this module leaves NULL.
+ *   - OPcache holds the script.  OPcache has no C interface for this, so the
+ *     userland function is called.  With the timestamps not validated, it is a
+ *     hash lookup and makes no syscall.
+ *   - The path is a regular file that this process can read.  The open
+ *     path checks the same, so a removed, replaced or unreadable script gets
+ *     the status that it gets without OPcache.  access() tests the real
+ *     ids; a worker sets all its ids with setuid() and setgid(), so it is
+ *     the test that open() makes.
+ *
+ * What runs is the compiled script, as with any OPcache hit; with the
+ * timestamps not validated, a changed file is not compiled again.
+ *
+ * The checks take no lock on the cache.  After the query, these make the
+ * compile miss: an opcache_invalidate() of the script, a cache restart that
+ * another process completes, or an "auto_prepend_file" script that calls
+ * opcache_invalidate() or uses ini_set() to disable OPcache or to turn
+ * "opcache.revalidate_path" on.  The compile then reads the stream that
+ * nxt_php_execute() gives it, and nxt_php_miss_open() opens the script as
+ * the open path does and answers a failed open with its status.
+ */
+static nxt_int_t
+nxt_php_opcache_serves(nxt_php_run_ctx_t *ctx, const char *filename)
+{
+    zval           param, retval;
+    nxt_int_t      cached;
+    struct stat    sb;
+    zend_string    *value;
+    zend_function  *fn;
+
+    if (!ctx->static_script) {
+        return 0;
+    }
+
+    if (PG(open_basedir) != NULL && PG(open_basedir)[0] != '\0') {
+        return 0;
+    }
+
+    /*
+     * A boolean setting without a value counts as on, so the open path is
+     * used.  zend_ini_parse_bool() is the rule that OnUpdateBool applies.
+     */
+    value = nxt_php_ini_value("opcache.validate_timestamps",
+                              nxt_length("opcache.validate_timestamps"));
+    if (value == NULL || zend_ini_parse_bool(value)) {
+        return 0;
+    }
+
+    value = nxt_php_ini_value("opcache.revalidate_path",
+                              nxt_length("opcache.revalidate_path"));
+    if (value == NULL || zend_ini_parse_bool(value)) {
+        return 0;
+    }
+
+    value = nxt_php_ini_value("opcache.restrict_api",
+                              nxt_length("opcache.restrict_api"));
+    if (value != NULL && ZSTR_LEN(value) != 0) {
+        return 0;
+    }
+
+    fn = zend_hash_str_find_ptr(EG(function_table), "opcache_is_script_cached",
+                                nxt_length("opcache_is_script_cached"));
+    if (fn == NULL) {
+        return 0;
+    }
+
+    ZVAL_UNDEF(&retval);
+    ZVAL_STRINGL(&param, filename, ctx->script_filename.length);
+
+    zend_call_known_function(fn, NULL, NULL, &retval, 1, &param, NULL);
+
+    zval_ptr_dtor(&param);
+
+    cached = (Z_TYPE(retval) == IS_TRUE);
+
+    zval_ptr_dtor(&retval);
+
+    if (nxt_slow_path(EG(exception) != NULL)) {
+        zend_clear_exception();
+
+        return 0;
+    }
+
+    if (!cached) {
+        return 0;
+    }
+
+    if (stat(filename, &sb) != 0 || !S_ISREG(sb.st_mode)) {
+        return 0;
+    }
+
+    if (access(filename, R_OK) != 0) {
+        return 0;
+    }
+
+    return 1;
+}
+
+
 #endif
 
 
@@ -1409,6 +1679,7 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
 #if (PHP_VERSION_ID >= 80100)
     int               display_errors;
     zend_result       open_ret;
+    nxt_php_miss_t    miss;
 #endif
     const char        *filename;
     nxt_unit_field_t  *f;
@@ -1424,11 +1695,9 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
      * preserved here, before PHP's virtual-CWD resolver changes errno, so an
      * overlong path gets 404.  A fixed "script" target was resolved with
      * realpath() when the configuration was loaded, so its path cannot be
-     * overlong, and the nonblocking open below with its descriptor check
-     * answers everything this stat() would: 404 for a missing script, a
-     * directory or a FIFO, and 403 for one that cannot be read.  The stat()
-     * is skipped for it; the open is not, so the file still governs what
-     * runs, whatever OPcache holds.
+     * overlong, and the checks after the request startup answer everything
+     * this stat() would: 404 for a missing script, a directory or a FIFO, and
+     * 403 for one that cannot be read.  The stat() is skipped for it.
      */
     if (!ctx->static_script) {
         if (nxt_slow_path(stat(filename, &sb) != 0)) {
@@ -1575,46 +1844,48 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
 
 #if (PHP_VERSION_ID >= 80100)
     /*
-     * The script is opened once, here, and php_execute_script() runs the
-     * stream this open produced.  Its nonblocking open and descriptor check
-     * also cover a file replaced after the preliminary stat().
-     * PHP's stream layer applies "open_basedir" and its diagnostics are off
-     * for the open, so a refusal is a status from here and not a warning in
-     * the body.
+     * A fixed "script" target that OPcache holds runs without an open of its
+     * path; nxt_php_opcache_serves() says when.  It gets a stream that opens
+     * the script on the first read, which only a compile that misses the
+     * cache makes; see nxt_php_miss_t.  Otherwise the script is
+     * opened once, here, and php_execute_script() runs the stream this open
+     * produced.  Its nonblocking open and descriptor check also cover a file
+     * replaced after the preliminary stat().  PHP's stream layer applies
+     * "open_basedir" and its diagnostics are off for the open, so a refusal
+     * is a status from here and not a warning in the body.
      */
     zend_stream_init_filename(&file_handle, filename);
 
-    errno = 0;
-    open_ret = nxt_php_stream_open(&file_handle);
+    if (nxt_php_opcache_serves(ctx, filename)) {
+        nxt_unit_req_debug(ctx->req, "PHP script \"%s\" runs from OPcache "
+                           "without an open", filename);
+
+        miss.stream = NULL;
+        miss.filename = filename;
+        miss.req = ctx->req;
+
+        file_handle.type = ZEND_HANDLE_STREAM;
+        file_handle.handle.stream.handle = &miss;
+        file_handle.handle.stream.reader = nxt_php_miss_read;
+        file_handle.handle.stream.closer = nxt_php_miss_close;
+        file_handle.handle.stream.fsizer = nxt_php_miss_size;
+        file_handle.handle.stream.isatty = 0;
+
+        open_ret = SUCCESS;
+
+    } else {
+        errno = 0;
+        open_ret = nxt_php_stream_open(&file_handle);
+    }
 
     PG(display_errors) = display_errors;
 
     if (nxt_slow_path(open_ret == FAILURE)) {
-        int  status;
-
-        switch (errno) {
-        case EACCES:
-        case EPERM:
-        case ELOOP:
-        case ENFILE:
-            status = NXT_HTTP_FORBIDDEN;
-            break;
-        case ENOENT:
-        case ENOTDIR:
-        case ENAMETOOLONG:
-        case EISDIR:
-            status = NXT_HTTP_NOT_FOUND;
-            break;
-        default:
-            status = NXT_HTTP_INTERNAL_SERVER_ERROR;
-            break;
-        }
-
         nxt_unit_req_debug(ctx->req,
                            "PHP script \"%s\" cannot be opened (%d: %s)",
                            filename, errno, strerror(errno));
 
-        SG(sapi_headers).http_response_code = status;
+        SG(sapi_headers).http_response_code = nxt_php_open_status(errno);
 
         /*
          * Nothing writes output on this path, so the status has to be sent
