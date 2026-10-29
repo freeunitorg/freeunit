@@ -957,6 +957,15 @@ generated Dockerfiles now depend on the Makefile.
 </para>
 </change>
 
+<change type="change">
+<para>
+the release workflow now checks the built PHP image before it creates the
+final and the floating tags.  The check reads the PHP version, the ini
+setting, the libbrotli1 version and the daemon version.  A failing check
+stops the release.
+</para>
+</change>
+
 </changes>
 
 

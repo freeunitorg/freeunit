@@ -146,6 +146,17 @@ check:
 	done
 	@echo "pkg/docker: every PHP Dockerfile carries the ini fragment"
 
+# The check script reads the PHP version, the upload progress setting, the
+# libbrotli1 version and the daemon version of one built image.  The caller
+# names the image with IMAGE=<tag>.  The target passes the version of this
+# Makefile as the expected daemon version.
+verify:
+	@if [ -z "$(IMAGE)" ]; then \
+		echo "pkg/docker: the IMAGE variable is empty, name the image with IMAGE=<tag>" >&2; \
+		exit 1; \
+	fi
+	./verify-php-cve.sh "$(IMAGE)" "$(VERSION)"
+
 # TODO(#milestone-1.35.8): uncomment and update GitFetch when publishing to
 # Docker Hub Official Images.  Target date: 2026-08-28 (1.35.8 release).
 #library:
@@ -192,4 +203,4 @@ clean:
 	rm -f $(addprefix build-, $(MODVERSIONS))
 	rm -rf build-logs
 
-.PHONY: default build dockerfiles check clean
+.PHONY: default build dockerfiles check verify clean

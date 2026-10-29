@@ -27,6 +27,19 @@ docker run --rm --entrypoint sh ghcr.io/freeunitorg/freeunit:latest-php-8.5 \
 # Expected: session.upload_progress.enabled => Off => Off
 ```
 
+The target `make -C pkg/docker verify IMAGE=<tag>` checks a built image. It runs
+the script `verify-php-cve.sh`. The script reads the PHP version, the ini
+setting `session.upload_progress.enabled`, the `libbrotli1` version and the
+daemon version. The target expects the daemon version of the `version` file.
+Pass `VERSION=<version>` to check another version. The release workflow runs
+the target for the PHP images after the build and passes the version of the
+release tag. A failing check stops the release, so the final and the floating
+tags are not created.
+
+```bash
+make -C pkg/docker verify IMAGE=ghcr.io/freeunitorg/freeunit:latest-php-8.5
+```
+
 ## Security: CVE-2026-31431 (AF_ALG privilege escalation)
 
 CVE-2026-31431 is a **kernel bug** (CVSS 7.8) — local privilege escalation via

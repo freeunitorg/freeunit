@@ -671,6 +671,11 @@ Changes with FreeUnit 1.37.1                                     30 Oct 2026
        Makefile of that directory changed, so a new build value stayed out
        of the images. The generated Dockerfiles now depend on the Makefile.
 
+    *) Change: the release workflow now checks the built PHP image before it
+       creates the final and the floating tags. The check reads the PHP
+       version, the ini setting, the libbrotli1 version and the daemon
+       version. A failing check stops the release.
+
 
 Changes with FreeUnit 1.37.0                                     04 Oct 2026
 

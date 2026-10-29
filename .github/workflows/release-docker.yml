@@ -293,6 +293,23 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.arch.name }}-${{ matrix.variant }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch.name }}-${{ matrix.variant }}
 
+      - name: Verify PHP image (${{ matrix.arch.name }})
+        if: startsWith(matrix.variant, 'php-')
+        env:
+          IMAGE: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}:${{ needs.setup.outputs.version }}-${{ matrix.variant }}-${{ matrix.arch.name }}
+          PLATFORM: ${{ matrix.arch.platform }}
+        run: |
+          # The check reads four values inside the pushed image: the PHP
+          # version, the upload progress setting, the libbrotli1 version and
+          # the daemon version.  A failure stops this job, so the merge job
+          # creates no final tag and no floating tag.
+          #
+          # The expected daemon version comes from the release tag, not from
+          # the checkout.  The build job checks out the dispatch ref, so the
+          # version file of the checkout can name another version.
+          docker pull --platform "${PLATFORM}" "${IMAGE}"
+          make -C pkg/docker verify IMAGE="${IMAGE}" VERSION="${{ needs.setup.outputs.version }}"
+
   # ---------------------------------------------------------------------------
   # 3. Merge amd64 + arm64 into multi-arch manifests and push final tags
   # ---------------------------------------------------------------------------
