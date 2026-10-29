@@ -63,7 +63,7 @@ The value `On` in `php -i` marks a vulnerable state.
 | `session.upload_progress.enabled=0` | Done | The PHP images write `/usr/local/etc/php/conf.d/zz-freeunit-security.ini` at build time. The `RUN_php` value in `pkg/docker/Makefile` creates it. The `zz-` prefix makes it load last in `conf.d`. |
 | `libbrotli1` at 1.1.0-2+deb13u1 or newer | Partial | The Dockerfile installs `libbrotli-dev` after `apt-get upgrade`. The version comes from the apt sources of the base image, not from a pin. A build that runs before `trixie-security` publishes the fix keeps the vulnerable library. |
 | `pkg/docker/verify-php-cve.sh` | Done | The file checks the PHP version, the ini setting, the `libbrotli1` version and the daemon version of an image. |
-| The release workflow runs the check | **Missing** | `.github/workflows/release-docker.yml` builds and pushes the image. It runs no check step. |
+| The release workflow runs the check | Done | The step `Verify PHP image (amd64)` or `Verify PHP image (arm64)` of `.github/workflows/release-docker.yml` runs the script for every PHP image after the build. The expected daemon version comes from the release tag. A failing check stops the job, so the merge job creates no final tag and no floating tag. The tag of the per-architecture image stays in the registries. |
 | `unitd` version in the published image | 1.37.1 | The workflow reads the version from the tag and passes it as `UNIT_VERSION`. The `version` file of this release names `1.37.1`. The workflow refuses to publish when the `version` file at that tag names a different version. |
 
 The ini file covers every PHP application in the image, also the ones a user adds
@@ -74,21 +74,33 @@ passes it to PHP as an ini value.
 
 ### The scope of the 1.37.1 release
 
-The release 1.37.1 adds the ini fragment to the PHP images. It does not add
-the check to the release workflow, and it does not pin the PHP version or the
-Brotli version. The ini fragment lowers the risk of CVE-2026-115560. It does
-not close the other CVEs of this list. Only a patched PHP version closes them.
+The release 1.37.1 adds the ini fragment to the PHP images. It also adds the
+check to the release workflow. It does not pin the PHP version or the Brotli
+version. The ini fragment lowers the risk of CVE-2026-115560. It does not
+close the other CVEs of this list. Only a patched PHP version closes them.
 
-### Two gaps that need a decision
+### One gap that needs a decision
 
-1. **The workflow step.** The check script is in the repository. The release workflow does not run it. A published image is not gated by the check.
-2. **The version assertions.** A floating base tag gives the newest patch at build time.
+1. **The version assertions in the build.** A floating base tag resolves to the newest patch of its branch at build time.
    The build asserts no PHP version and no Brotli version.
+   The release workflow checks the image after the build, so a release never publishes an image that fails the check.
+   A build outside the release workflow is not checked.
 
 ## How to check an image
 
-The script `pkg/docker/verify-php-cve.sh` runs the checks of this section and
-reports the result of each one. It exits 1 when a check fails.
+The target `make -C pkg/docker verify IMAGE=<tag>` runs the checks of this
+section and reports the result of each one. It exits 1 when a check fails.
+The target expects the daemon version of the `version` file of the checkout.
+Pass `VERSION=<version>` to check another version.
+The release workflow runs the same target for the PHP images after the build.
+It passes the version of the release tag.
+
+```sh
+make -C pkg/docker verify IMAGE=ghcr.io/freeunitorg/freeunit:latest-php-8.5
+```
+
+The script `pkg/docker/verify-php-cve.sh` does the same work. It takes the
+image and the expected version of the daemon.
 
 ```sh
 pkg/docker/verify-php-cve.sh ghcr.io/freeunitorg/freeunit:latest-php-8.5 1.37.1
@@ -179,9 +191,10 @@ docker rm -f "$N"
 
 | Task | Description | Status |
 |------|-------------|--------|
-| The `upload_progress` ini file | Add `session.upload_progress.enabled=0` to the PHP images. | Done — `RUN_php` in `pkg/docker/Makefile` writes the ini fragment. |
-| The check script | Add `pkg/docker/verify-php-cve.sh` and run it in `release-docker.yml` before the push. | Partly done — the script is in the repository. The step in the release workflow is open. |
-| The version assertions | Fail the build when the PHP version or the `libbrotli1` version is below the fixed version. | Open |
+| The `upload_progress` ini file | Add `session.upload_progress.enabled=0` to the PHP images. | Done. `RUN_php` in `pkg/docker/Makefile` writes the ini fragment. |
+| The check script | Add `pkg/docker/verify-php-cve.sh` and run it in `release-docker.yml` after the build. | Done. The script and the step in the release workflow are in place. |
+| The version assertions | Fail the release when the PHP version or the `libbrotli1` version is below the fixed version. | Partial. The release workflow checks the built image and stops the release. The build itself asserts nothing. |
+| The tag of a failed image | Delete the tag of the per-architecture image when the check fails. The cleanup job does not run, because the merge job does not succeed. | Open |
 | The worker stop on a failed `php_request_startup()` | Stop the worker in `src/nxt_php_sapi.c` when the request startup fails. | Open |
 | The published images | The published images keep their old state until a new release tag appears. | Waiting for a decision |
 
