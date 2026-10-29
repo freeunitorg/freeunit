@@ -27,21 +27,21 @@
       "id": "RUSTSEC-2026-0403",
       "package": "zstd-safe",
       "version": "7.0.0",
-      "reason": "Linked by the Wasmtime 48.0.7 C API through crates/cache (zstd = { version = \"0.13.0\" in crates/cache/Cargo.toml). RUSTSEC-2026-0403 concerns uninitialized memory exposure via the streaming decoder read::Decoder for a legacy frame header. The wasmtime-cache crate only calls zstd::decode_all and zstd::encode_all (crates/cache/src/lib.rs:258,267), which are the documented safe bulk API and are explicitly not affected by this advisory. No AsyncFd callers exist in wasmtime-cache. The source archive is vendored, so this exact version cannot be updated independently of the source pin."
+      "reason": "Linked by the Wasmtime 48.0.7 C API through crates/cache (zstd = { version = \"0.13.0\" in crates/cache/Cargo.toml). RUSTSEC-2026-0403 concerns uninitialized memory exposure via zstd::stream::write::Decoder on a legacy (v0.4-v0.7) frame. The wasmtime-cache crate only calls zstd::decode_all and zstd::encode_all (crates/cache/src/lib.rs:258,267), which the advisory explicitly lists as unaffected. The source archive is vendored, so this exact version cannot be updated independently of the source pin."
     },
     {
       "kind": "unsound",
       "id": "RUSTSEC-2026-0395",
       "package": "zstd-safe",
       "version": "7.0.0",
-      "reason": "Linked by the Wasmtime 48.0.7 C API through crates/cache (zstd = { version = \"0.13.0\" in crates/cache/Cargo.toml). RUSTSEC-2026-0395 concerns a use-after-free with CParameter::StableInBuffer. The wasmtime-cache crate only calls zstd::decode_all and zstd::encode_all (crates/cache/src/lib.rs:258,267), which do not exercise CParameter. The source archive is vendored, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
+      "reason": "Linked by the Wasmtime 48.0.7 C API through crates/cache (zstd = { version = \"0.13.0\" in crates/cache/Cargo.toml). RUSTSEC-2026-0395 concerns a use-after-free with CParameter::StableInBuffer. The wasmtime-cache crate only calls zstd::decode_all and zstd::encode_all (crates/cache/src/lib.rs:258,267), which never set CParameter::StableInBuffer; no call to set_parameter appears in the crate source. The source archive is vendored, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
     },
     {
       "kind": "unsound",
       "id": "RUSTSEC-2026-0397",
       "package": "zstd-safe",
       "version": "7.0.0",
-      "reason": "Linked by the Wasmtime 48.0.7 C API through crates/cache (zstd = { version = \"0.13.0\" in crates/cache/Cargo.toml). RUSTSEC-2026-0397 concerns uninitialized memory exposure via OutBuffer::around_pos. The wasmtime-cache crate only calls zstd::decode_all and zstd::encode_all (crates/cache/src/lib.rs:258,267), which do not use OutBuffer directly. The source archive is vendored, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
+      "reason": "Linked by the Wasmtime 48.0.7 C API through crates/cache (zstd = { version = \"0.13.0\" in crates/cache/Cargo.toml). RUSTSEC-2026-0397 concerns uninitialized memory exposure via OutBuffer::around_pos when called with a position past the initialised length. The wasmtime-cache crate only calls zstd::decode_all and zstd::encode_all (crates/cache/src/lib.rs:258,267), which pass positions strictly within the initialised length; the flaw is not reachable through this call path. The source archive is vendored, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
     },
     {
       "kind": "unsound",
@@ -55,7 +55,7 @@
       "id": "RUSTSEC-2026-0400",
       "package": "zstd-safe",
       "version": "7.0.0",
-      "reason": "Linked by the Wasmtime 48.0.7 C API through crates/cache (zstd = { version = \"0.13.0\" in crates/cache/Cargo.toml). RUSTSEC-2026-0400 concerns a use-after-free of a dictionary after a one-shot call on a context with an open stream. The wasmtime-cache crate only calls zstd::decode_all and zstd::encode_all (crates/cache/src/lib.rs:258,267), which do not open a stream and hold a dictionary simultaneously. The source archive is vendored, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
+      "reason": "Linked by the Wasmtime 48.0.7 C API through crates/cache (zstd = { version = \"0.13.0\" in crates/cache/Cargo.toml). RUSTSEC-2026-0400 concerns a use-after-free of a dictionary after a one-shot call on a context with an open stream. The wasmtime-cache crate only calls zstd::decode_all and zstd::encode_all (crates/cache/src/lib.rs:258,267), which do not hold a dictionary across a streaming boundary. The source archive is vendored, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
     },
     {
       "kind": "unsound",
