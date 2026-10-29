@@ -4,6 +4,29 @@ This directory contains Dockerfiles for all FreeUnit language variants and
 a helper script (`build-local.sh`) for building them locally — mirroring
 the behavior of `.github/workflows/release-docker.yml`.
 
+## Security: PHP session upload progress
+
+The PHP images set `session.upload_progress.enabled = 0` through the ini fragment
+`/usr/local/etc/php/conf.d/zz-freeunit-security.ini`. The `RUN_php` value in the
+`Makefile` creates the file. The command `make dockerfiles` copies the value into
+`Dockerfile.php-*`.
+
+The setting applies to every PHP application in the image. It also applies to the
+applications that a user adds later through the control API. The `zz-` prefix makes
+the file load last in `conf.d`, so it wins over the directives of the files that load
+before it.
+
+The PHP default is on, so the change removes the session upload progress feature
+from the image. See `pkg/community/PHP.CVE.md` for the CVE map.
+
+Check it in a built image:
+
+```bash
+docker run --rm --entrypoint sh ghcr.io/freeunitorg/freeunit:latest-php-8.5 \
+    -c "php -i | grep -E '^session\.upload_progress\.enabled'"
+# Expected: session.upload_progress.enabled => Off => Off
+```
+
 ## Security: CVE-2026-31431 (AF_ALG privilege escalation)
 
 CVE-2026-31431 is a **kernel bug** (CVSS 7.8) — local privilege escalation via
