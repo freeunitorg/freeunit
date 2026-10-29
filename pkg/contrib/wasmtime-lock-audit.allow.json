@@ -34,7 +34,7 @@
       "id": "RUSTSEC-2026-0395",
       "package": "zstd-safe",
       "version": "7.0.0",
-      "reason": "Linked by the Wasmtime 48.0.7 C API through crates/cache (zstd = { version = \"0.13.0\" in crates/cache/Cargo.toml). RUSTSEC-2026-0395 concerns a use-after-free with CParameter::StableInBuffer. The wasmtime-cache crate only calls zstd::decode_all and zstd::encode_all (crates/cache/src/lib.rs:258,267), which never set CParameter::StableInBuffer; no call to set_parameter appears in the crate source. The source archive is vendored, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
+      "reason": "Linked by the Wasmtime 48.0.7 C API through crates/cache (zstd = { version = \"0.13.0\" in crates/cache/Cargo.toml). RUSTSEC-2026-0395 concerns a use-after-free with CParameter::StableInBuffer. The wasmtime-cache crate only calls zstd::decode_all and zstd::encode_all (crates/cache/src/lib.rs:258,267), which never enable StableInBuffer; encode_all sets only CompressionLevel. The source archive is vendored, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
     },
     {
       "kind": "unsound",
