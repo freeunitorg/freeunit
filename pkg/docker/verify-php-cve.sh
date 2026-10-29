@@ -33,6 +33,10 @@ fi
 image=$1
 want_unit=${2:-}
 
+# The expected daemon version matches as a whole token, so 1.37.1 does not
+# accept 1.37.10.  The dots of the version are escaped for the pattern.
+want_unit_esc=$(printf '%s\n' "$want_unit" | sed 's/[.[\*^$\\]/\\&/g')
+
 # The first PHP version of each branch that carries the fix of the critical
 # RCEs.
 php_min_8_2=8.2.35
@@ -112,7 +116,8 @@ fi
 
 if [ -z "$want_unit" ]; then
 	report SKIP "unitd" "$unitd"
-elif printf '%s\n' "$unitd" | grep -qF "$want_unit"; then
+elif printf '%s\n' "$unitd" \
+	| grep -qE "(^|[^0-9.])${want_unit_esc}([^0-9.]|$)"; then
 	pass_check "unitd" "$unitd"
 else
 	fail_check "unitd" "$unitd does not name $want_unit"
