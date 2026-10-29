@@ -20,7 +20,77 @@
       "id": "RUSTSEC-2026-0386",
       "package": "tokio",
       "version": "1.51.1",
-      "reason": "Linked by the Wasmtime 48.0.7 C API even with component-model, component-model-async and wasi-http disabled. RUSTSEC-2026-0386 concerns safe AsyncFd constructors accepting AsRawFd without guaranteeing a valid, owned and unchanged descriptor. All 245 linked package source trees other than Tokio, including Wasmtime, contain no AsyncFd callers; Tokio's own AsyncFd implementation is not used by this build. The source archive is vendored, so this exact version cannot be updated independently. Recheck reachability and remove this exception at the next pin bump."
+      "reason": "Linked by the Wasmtime 48.0.7 C API even with component-model, component-model-async and wasi-http disabled. RUSTSEC-2026-0386 concerns safe AsyncFd constructors accepting AsRawFd without guaranteeing a valid, owned and unchanged descriptor. All 245 linked package source trees other than Tokio, including Wasmtime, contain no AsyncFd callers; Tokio's own AsyncFd implementation is not used by this build. The source archive is vendored, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
+    },
+    {
+      "kind": "vulnerability",
+      "id": "RUSTSEC-2026-0403",
+      "package": "zstd-safe",
+      "version": "7.0.0",
+      "reason": "Linked by the Wasmtime 48.0.7 C API through wasmtime_byteorder. RUSTSEC-2026-0403 (also listed as an unsound warning) concerns uninitialized memory exposure during streaming decompression of a legacy frame. The Wasmtime 48.0.7 source archive is vendored and its Cargo.lock cannot be repaired in-tree, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
+    },
+    {
+      "kind": "unsound",
+      "id": "RUSTSEC-2026-0395",
+      "package": "zstd-safe",
+      "version": "7.0.0",
+      "reason": "Linked by the Wasmtime 48.0.7 C API through wasmtime_byteorder. RUSTSEC-2026-0395 concerns a use-after-free with CParameter::StableInBuffer. The Wasmtime 48.0.7 source archive is vendored and its Cargo.lock cannot be repaired in-tree, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
+    },
+    {
+      "kind": "unsound",
+      "id": "RUSTSEC-2026-0397",
+      "package": "zstd-safe",
+      "version": "7.0.0",
+      "reason": "Linked by the Wasmtime 48.0.7 C API through wasmtime_byteorder. RUSTSEC-2026-0397 concerns uninitialized memory exposure via OutBuffer::around_pos. The Wasmtime 48.0.7 source archive is vendored and its Cargo.lock cannot be repaired in-tree, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
+    },
+    {
+      "kind": "unsound",
+      "id": "RUSTSEC-2026-0399",
+      "package": "zstd-safe",
+      "version": "7.0.0",
+      "reason": "Linked by the Wasmtime 48.0.7 C API through wasmtime_byteorder. RUSTSEC-2026-0399 concerns a use-after-free through init_using_cdict and init_using_ddict. The Wasmtime 48.0.7 source archive is vendored and its Cargo.lock cannot be repaired in-tree, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
+    },
+    {
+      "kind": "unsound",
+      "id": "RUSTSEC-2026-0400",
+      "package": "zstd-safe",
+      "version": "7.0.0",
+      "reason": "Linked by the Wasmtime 48.0.7 C API through wasmtime_byteorder. RUSTSEC-2026-0400 concerns a use-after-free of a dictionary after a one-shot call on a context with an open stream. The Wasmtime 48.0.7 source archive is vendored and its Cargo.lock cannot be repaired in-tree, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
+    },
+    {
+      "kind": "unsound",
+      "id": "RUSTSEC-2026-0401",
+      "package": "zstd-safe",
+      "version": "7.0.0",
+      "reason": "Linked by the Wasmtime 48.0.7 C API through wasmtime_byteorder. RUSTSEC-2026-0401 concerns an out-of-bounds read in train_from_buffer when sample sizes overflow. The Wasmtime 48.0.7 source archive is vendored and its Cargo.lock cannot be repaired in-tree, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
+    },
+    {
+      "kind": "unsound",
+      "id": "RUSTSEC-2026-0402",
+      "package": "zstd-safe",
+      "version": "7.0.0",
+      "reason": "Linked by the Wasmtime 48.0.7 C API through wasmtime_byteorder. RUSTSEC-2026-0402 concerns a heap buffer overflow in CCtx::try_clone on a multithreaded context. The Wasmtime 48.0.7 source archive is vendored and its Cargo.lock cannot be repaired in-tree, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
+    },
+    {
+      "kind": "unsound",
+      "id": "RUSTSEC-2026-0404",
+      "package": "zstd-safe",
+      "version": "7.0.0",
+      "reason": "Linked by the Wasmtime 48.0.7 C API through wasmtime_byteorder. RUSTSEC-2026-0404 concerns a double free in DCtx::try_clone. The Wasmtime 48.0.7 source archive is vendored and its Cargo.lock cannot be repaired in-tree, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
+    },
+    {
+      "kind": "unsound",
+      "id": "RUSTSEC-2026-0406",
+      "package": "zstd-safe",
+      "version": "7.0.0",
+      "reason": "Linked by the Wasmtime 48.0.7 C API through wasmtime_byteorder. RUSTSEC-2026-0406 concerns a use-after-free when changing a multithreaded context with an unfinished frame. The Wasmtime 48.0.7 source archive is vendored and its Cargo.lock cannot be repaired in-tree, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
+    },
+    {
+      "kind": "vulnerability",
+      "id": "RUSTSEC-2026-0410",
+      "package": "zstd-sys",
+      "version": "2.0.9+zstd.1.5.5",
+      "reason": "Linked by the Wasmtime 48.0.7 C API as the zstd-sys dependency of zstd-safe. RUSTSEC-2026-0410 concerns a WebAssembly allocator shim that corrupts memory on allocation failure. The Wasmtime 48.0.7 source archive is vendored and its Cargo.lock cannot be repaired in-tree, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
     }
   ]
 }
