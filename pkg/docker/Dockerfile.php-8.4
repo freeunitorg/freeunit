@@ -98,7 +98,7 @@ RUN set -ex \
        done \
     && apt-mark showmanual | xargs apt-mark auto > /dev/null \
     && { [ -z "$savedAptMark" ] || apt-mark manual $savedAptMark; } \
-    && ldconfig \
+    && ldconfig && mkdir -p /usr/local/etc/php/conf.d && echo "session.upload_progress.enabled = 0" > /usr/local/etc/php/conf.d/zz-freeunit-security.ini \
     && mkdir -p /var/lib/unit/ \
     && mkdir -p /docker-entrypoint.d/ \
     && groupadd --gid 999 unit \

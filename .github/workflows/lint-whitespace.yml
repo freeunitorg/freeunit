@@ -98,3 +98,15 @@ jobs:
     - name: Check the release version sites
       if: ${{ !cancelled() }}
       run: sh .github/scripts/check-version.sh
+
+    # The generated files in the tree must match their sources.  The
+    # changelog comes from docs/changes.xml, and every PHP Dockerfile must
+    # carry the ini fragment of the Makefile.  It needs the network only for
+    # the packages.  It runs even when the whitespace check fails.
+    - name: Check the generated files
+      if: ${{ !cancelled() }}
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends xsltproc libxml2-utils
+        make -C docs check
+        make -C pkg/docker check

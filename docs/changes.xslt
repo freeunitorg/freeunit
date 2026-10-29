@@ -67,6 +67,7 @@
     <xsl:variable name="dow"> <xsl:call-template name="day_of_week"><xsl:with-param select="$date_" name="date"/></xsl:call-template></xsl:variable>
     <xsl:variable name="apply"> <xsl:call-template name="string_in_list"><xsl:with-param select="@apply" name="list"/><xsl:with-param select="$pkgname" name="string"/></xsl:call-template></xsl:variable>
     <xsl:variable name="pkgname_"> <xsl:call-template name="beautify"><xsl:with-param select="$pkgname" name="pkgname"/></xsl:call-template></xsl:variable>
+    <xsl:variable name="product_"> <xsl:call-template name="product"><xsl:with-param select="@packager" name="packager"/><xsl:with-param select="$pkgname_" name="pkgname"/></xsl:call-template></xsl:variable>
 
     <xsl:choose>
     <xsl:when test="$pkgname='unit' and $format='generic' and @rev!=1"/>
@@ -77,7 +78,7 @@
         <xsl:text>&#10;</xsl:text>
 
         <xsl:value-of select="substring(concat($conf/changes/title,
-                           $pkgname_,
+                           $product_,
                            ' ', @ver,
                            '                                                    '),
                     1, $conf/changes/length)"/>
@@ -242,6 +243,16 @@
 <xsl:template name="beautify"><xsl:param name="pkgname"/>
     <xsl:choose>
         <xsl:when test="$pkgname='unit'">Unit</xsl:when>
+        <xsl:otherwise>
+            <xsl:value-of select="$pkgname"/>
+        </xsl:otherwise>
+    </xsl:choose>
+</xsl:template>
+
+
+<xsl:template name="product"><xsl:param name="packager"/><xsl:param name="pkgname"/>
+    <xsl:choose>
+        <xsl:when test="starts-with($packager, 'FreeUnit')">FreeUnit</xsl:when>
         <xsl:otherwise>
             <xsl:value-of select="$pkgname"/>
         </xsl:otherwise>

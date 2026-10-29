@@ -30,7 +30,8 @@
 #                         one row that says "✅ Active".  By hand.
 #   changes XML           A "Changes with FreeUnit X.Y.Z" block, and two
 #                         stanzas in XML for it and for the top block of
-#                         this file.  By hand.
+#                         this file.  The CHANGES file is generated from
+#                         the XML with "make -C docs changes".
 #
 # Pins: a version that is not the release version, but must be the same in
 # several files.  bump-version.sh does not touch them.

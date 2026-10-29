@@ -7,7 +7,7 @@
 
 <changes apply="unit"
          ver="1.37.1" rev="1"
-         date="2026-10-28" time="00:00:00 +0000"
+         date="2026-10-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change type="security">
@@ -48,13 +48,29 @@ read are now written with one call and freed as they are written.
 </para>
 </change>
 
+<change type="change">
+<para>
+the main process now accepts NEW_PORT and REMOVE_PID only from a prototype,
+and only for an application process that this prototype started, as the
+router does for the messages on its main port.  NEW_PORT must also be for an
+application port.  Every core process now refuses a NEW_PORT message with a
+process type out of range.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
-the router stopped accepting connections at about 1000 open connections
-when unitd started with a soft RLIMIT_NOFILE of 1024, which is the default
-in Docker containers.  The router and the controller now raise their soft
-limit to the hard limit, but not above 1048576.  Application processes keep
-the limit that unitd started with.
+a zstd-compressed response held its output until a full 128 KiB block was
+ready or the response ended, so a streamed response (PHP flush(), server-sent
+events) stalled with zstd while gzip and br delivered each part. Each part is
+now flushed.
+</para>
+</change>
+
+<change type="change">
+<para>
+zstd 1.4.0 or later is now required to build with "--zstd"; configure fails
+with an explicit message on older releases.
 </para>
 </change>
 
@@ -70,30 +86,79 @@ only the first Accept-Encoding line of a request; it now reads every line.
 </para>
 </change>
 
+<change type="change">
+<para>
+a text access log escapes each value that a variable expands to with one test
+per eight bytes instead of four tests per byte, and copies a line with no byte
+to escape as it is.  The access log output is unchanged.  With the default
+format, a request with a 111-byte browser User-Agent and a 57-byte Referer
+takes 32% fewer router instructions.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
-an "external" application, such as a Go or Node.js application, inherited
-descriptors that it cannot use: the epoll, signalfd and eventfd descriptors of
-Unit, the control socket and a second copy of the log file.  Unit now creates,
-opens and receives its descriptors close-on-exec.  The application keeps stdin,
-stdout, stderr and the descriptors that NXT_UNIT_INIT names.
+a request whose access log "if" condition could not be rendered, for example
+when a JS expression threw, was written to the access log.  The unrendered
+condition was read as true, so a throwing "if" logged every request instead of
+none, while a throwing "format" wrote no record at all.  Such a request is now
+not logged, and the exception is still reported in the error log.  The same
+expression in a "match" object "if" still ends the request with a 500.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+duplicate Cookie headers in a request to a Python WSGI application were
+joined with ", " instead of "; ".  Python's http.cookies then read
+"a=1, b=2" as the value "1," for "a".
 </para>
 </change>
 
 <change type="change">
 <para>
-the main process now accepts NEW_PORT and REMOVE_PID only from a prototype,
-and only for an application process that this prototype started, as the
-router does for the messages on its main port.  NEW_PORT must also be for an
-application port.  Every core process now refuses a NEW_PORT message with a
-process type out of range.
+CONTENT_TYPE of a Python WSGI application now holds all Content-Type headers
+of the request, joined with ", ", as HTTP_CONTENT_TYPE does.  Before, it held
+only the first one.
 </para>
 </change>
 
 <change type="change">
 <para>
-a process reads every pending signal from its signalfd in one wakeup, instead
-of one signal per epoll wakeup.
+req.headers of a Node.js application now joins duplicate headers: Cookie
+headers with "; ", other headers with ", ".  As in Node.js, only the first
+header is kept for Authorization, Content-Type, User-Agent, Referer and the
+other fields that Node.js does not join.  Duplicate Set-Cookie headers of a
+request are joined with ", ", where Node.js gives an array.  Before, the last
+header replaced the earlier ones.  req.rawHeaders is unchanged.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+when libunit moved the duplicate headers of a request next to each other,
+the index of the Authorization header could point at another header.
+</para>
+</change>
+
+<change type="change">
+<para>
+the control API now answers a configuration PUT only after the store child of
+main has written the configuration and flushed it.  Before, the answer came
+first, so a 200 did not mean that the configuration was on the disk.  A PUT
+takes one store longer: about 7 ms on a fast disk, 22 ms on a slow one.  A
+store that fails is answered with 500 "Failed to store the configuration.";
+the new configuration runs, but a restart loads the one before it.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the control API answered 200 to a DELETE of an njs module or of a certificate
+before the store child had removed its file.  A delete that failed was
+reported as success, and the module or the certificate left the list while its
+file stayed in the state directory.  The answer now waits for the store child,
+and a failed delete is answered with 500 and keeps the entry listed.
 </para>
 </change>
 
@@ -157,27 +222,6 @@ the application got a 500 until the application was restarted.  Before 1.37.0
 the application and then the router spun at 100% CPU instead.  At 5000 requests
 per second this took ten days.  The fix is in unitd and libunit; a Go or Node.js
 application needs a rebuild against the new libunit.
-</para>
-</change>
-
-<change type="bugfix">
-<para>
-the control API answered 200 to a DELETE of an njs module or of a certificate
-before the store child had removed its file.  A delete that failed was
-reported as success, and the module or the certificate left the list while its
-file stayed in the state directory.  The answer now waits for the store child,
-and a failed delete is answered with 500 and keeps the entry listed.
-</para>
-</change>
-
-<change type="change">
-<para>
-the control API now answers a configuration PUT only after the store child of
-main has written the configuration and flushed it.  Before, the answer came
-first, so a 200 did not mean that the configuration was on the disk.  A PUT
-takes one store longer: about 7 ms on a fast disk, 22 ms on a slow one.  A
-store that fails is answered with 500 "Failed to store the configuration.";
-the new configuration runs, but a restart loads the one before it.
 </para>
 </change>
 
@@ -596,6 +640,7 @@ and calls the component API no longer loads.  The wasm-wasi-component module
 is not affected.
 </para>
 </change>
+
 <change type="bugfix">
 <para>
 a PUT of an application configuration bigger than about 64 KiB never got an
@@ -604,6 +649,7 @@ of the message to main and queued the rest, but did not ask to be woken up to
 send it.  The bug came from NGINX Unit.
 </para>
 </change>
+
 <change type="bugfix">
 <para>
 a message between two FreeUnit processes could stay queued, and every later
@@ -638,7 +684,6 @@ it freed the same listener twice.  The router now applies one configuration
 at a time: one that comes while another is applied waits for its end.
 </para>
 </change>
-
 
 <change type="bugfix">
 <para>
@@ -754,83 +799,6 @@ back at the connection, and the completion path leaves a zero connection alone.
 
 <change type="bugfix">
 <para>
-with --hardening=default or strict, the Perl module did not build when the
-ccflags of Perl had -D_FORTIFY_SOURCE=2, as the perl Docker images have.
-The compiler stopped with '"_FORTIFY_SOURCE" redefined'.  configure now
-removes the -D_FORTIFY_SOURCE of Perl when it added its own.
-</para>
-</change>
-
-<change type="bugfix">
-<para>
-the Docker images lost -D_FORTIFY_SOURCE from their build flags in 1.35.3,
-so the language modules were built without _FORTIFY_SOURCE.  The images are
-now configured with --hardening=default, which adds it back with the other
-hardening flags.  The image build stops when configure did not add it.
-unitd itself is still not fortified, because src/nxt_unix.h
-undefines _FORTIFY_SOURCE.  See
-https://github.com/freeunitorg/freeunit/issues/757 and
-https://github.com/freeunitorg/freeunit/issues/773.
-</para>
-</change>
-
-<change type="bugfix">
-<para>
-a request whose access log "if" condition could not be rendered, for example
-when a JS expression threw, was written to the access log.  The unrendered
-condition was read as true, so a throwing "if" logged every request instead of
-none, while a throwing "format" wrote no record at all.  Such a request is now
-not logged, and the exception is still reported in the error log.  The same
-expression in a "match" object "if" still ends the request with a 500.
-</para>
-</change>
-
-<change type="bugfix">
-<para>
-duplicate Cookie headers in a request to a Python WSGI application were
-joined with ", " instead of "; ".  Python's http.cookies then read
-"a=1, b=2" as the value "1," for "a".
-</para>
-</change>
-
-<change type="change">
-<para>
-CONTENT_TYPE of a Python WSGI application now holds all Content-Type headers
-of the request, joined with ", ", as HTTP_CONTENT_TYPE does.  Before, it held
-only the first one.
-</para>
-</change>
-
-<change type="change">
-<para>
-req.headers of a Node.js application now joins duplicate headers: Cookie
-headers with "; ", other headers with ", ".  As in Node.js, only the first
-header is kept for Authorization, Content-Type, User-Agent, Referer and the
-other fields that Node.js does not join.  Duplicate Set-Cookie headers of a
-request are joined with ", ", where Node.js gives an array.  Before, the last
-header replaced the earlier ones.  req.rawHeaders is unchanged.
-</para>
-</change>
-
-<change type="bugfix">
-<para>
-when libunit moved the duplicate headers of a request next to each other,
-the index of the Authorization header could point at another header.
-</para>
-</change>
-
-<change type="change">
-<para>
-a text access log escapes each value that a variable expands to with one test
-per eight bytes instead of four tests per byte, and copies a line with no byte
-to escape as it is.  The access log output is unchanged.  With the default
-format, a request with a 111-byte browser User-Agent and a 57-byte Referer
-takes 32% fewer router instructions.
-</para>
-</change>
-
-<change type="bugfix">
-<para>
 the access log write result was ignored: a short write or a failed write lost
 a record with no count and no mark in the log. A record that cannot be built
 or written is now counted, the next record writes "#freeunit: lost N
@@ -840,17 +808,28 @@ record(s)", and GET /status reports the count.
 
 <change type="change">
 <para>
-zstd 1.4.0 or later is now required to build with "--zstd"; configure fails
-with an explicit message on older releases.
+a process reads every pending signal from its signalfd in one wakeup, instead
+of one signal per epoll wakeup.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
-a zstd-compressed response held its output until a full 128 KiB block was
-ready or the response ended, so a streamed response (PHP flush(), server-sent
-events) stalled with zstd while gzip and br delivered each part. Each part is
-now flushed.
+an "external" application, such as a Go or Node.js application, inherited
+descriptors that it cannot use: the epoll, signalfd and eventfd descriptors of
+Unit, the control socket and a second copy of the log file.  Unit now creates,
+opens and receives its descriptors close-on-exec.  The application keeps stdin,
+stdout, stderr and the descriptors that NXT_UNIT_INIT names.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the router stopped accepting connections at about 1000 open connections
+when unitd started with a soft RLIMIT_NOFILE of 1024, which is the default
+in Docker containers.  The router and the controller now raise their soft
+limit to the hard limit, but not above 1048576.  Application processes keep
+the limit that unitd started with.
 </para>
 </change>
 
@@ -939,6 +918,45 @@ accepted an empty "access" object.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+with --hardening=default or strict, the Perl module did not build when the
+ccflags of Perl had -D_FORTIFY_SOURCE=2, as the perl Docker images have.
+The compiler stopped with '"_FORTIFY_SOURCE" redefined'.  configure now
+removes the -D_FORTIFY_SOURCE of Perl when it added its own.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the Docker images lost -D_FORTIFY_SOURCE from their build flags in 1.35.3,
+so the language modules were built without _FORTIFY_SOURCE.  The images are
+now configured with --hardening=default, which adds it back with the other
+hardening flags.  The image build stops when configure did not add it.
+unitd itself is still not fortified, because src/nxt_unix.h
+undefines _FORTIFY_SOURCE.  See
+https://github.com/freeunitorg/freeunit/issues/757 and
+https://github.com/freeunitorg/freeunit/issues/773.
+</para>
+</change>
+
+<change type="change">
+<para>
+the PHP Docker images now set "session.upload_progress.enabled = 0" through an
+ini fragment in /usr/local/etc/php/conf.d.  The setting applies to every PHP
+application in the image.  It also applies to the applications that a user
+adds later through the control API.  The build writes the fragment.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the Dockerfiles in pkg/docker were not regenerated when the Makefile of that
+directory changed, so a new build value stayed out of the images.  The
+generated Dockerfiles now depend on the Makefile.
+</para>
+</change>
+
 </changes>
 
 
@@ -953,7 +971,7 @@ accepted an empty "access" object.
                 unit-jsc19 unit-jsc20 unit-jsc21
                 unit-wasm"
          ver="1.37.1" rev="1"
-         date="2026-10-28" time="00:00:00 +0000"
+         date="2026-10-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change>
@@ -969,27 +987,6 @@ FreeUnit updated to 1.37.1.
          ver="1.37.0" rev="1"
          date="2026-10-04" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
-
-<change type="change">
-<para>
-on Linux, the default number of router threads ("listen_threads") is now at
-most the CPU limit of the cgroup v2 group of unitd and of its parent groups
-("cpu.max"), rounded up to whole CPUs.  Before, it was the number of CPUs that
-unitd could run on, so a container limited to 2 CPUs on a 64-CPU host started
-64 router threads.  Now it starts 2.  A limit of 1.5 CPUs also gives 2
-threads.  An explicit "listen_threads" is not changed.  With a private cgroup
-namespace, only the limits inside the namespace are seen.  The limit is read
-once, when unitd starts.  cgroup v1 is not read.
-</para>
-</change>
-
-<change type="bugfix">
-<para>
-after 2^32 RPC registrations the stream counter wrapped and handed out
-stream 0, which callers read as a failure.  The registration stayed.
-Stream 0 is now skipped.
-</para>
-</change>
 
 <change type="bugfix">
 <para>
@@ -1099,15 +1096,6 @@ reads the stored files.
 </para>
 </change>
 
-<change type="security">
-<para>
-the wasm module did not check the offset that the malloc handler of the guest
-returned.  A negative or large offset put the request buffer outside the
-linear memory of the guest.  The worker now refuses such an offset, or an
-offset that is not aligned, and exits at startup.
-</para>
-</change>
-
 <change type="bugfix">
 <para>
 a regular expression in the configuration could run for up to 10,000,000
@@ -1121,6 +1109,15 @@ subject needs a "large_header_buffer_size" above its default of 8192.  With
 PCRE 1 and with PCRE2 before 10.30, a match also stops at 2,000 nested calls
 and does not overflow the thread stack.  There, a repeated group on a subject
 of more than about 1,000 bytes can get a 500 response.
+</para>
+</change>
+
+<change type="security">
+<para>
+the wasm module did not check the offset that the malloc handler of the guest
+returned.  A negative or large offset put the request buffer outside the
+linear memory of the guest.  The worker now refuses such an offset, or an
+offset that is not aligned, and exits at startup.
 </para>
 </change>
 
@@ -1144,6 +1141,45 @@ namespace of an application was rooted at the cgroup of the main process, not
 at the configured cgroup.  The application saw its own cgroup as
 "/scope/python" instead of "/".  The namespace is now created after the process
 is moved into its cgroup.
+</para>
+</change>
+
+<change type="change">
+<para>
+on macOS, a stored state file is now flushed with fcntl(F_BARRIERFSYNC), and
+its directory with fcntl(F_FULLFSYNC) after the rename, so the file also leaves
+the cache of the drive.  Plain fsync(2) there does not flush that cache, and a
+power loss could lose a stored configuration.
+</para>
+</change>
+
+<change type="security">
+<para>
+the router and libunit read records from shared memory that the other
+process can still write, without enough checks.  A buffer that was not a whole
+number of records was read past its end.  In libunit, a segment id of
+UINT32_MAX wrapped the size of the segment array, a segment of any size was
+accepted, a duplicate segment id replaced a segment that buffers still used,
+and a field could point before the field array.  The router trusted a busy
+chunk marker that the application can clear.  All of these are now checked.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+after 2^32 RPC registrations the stream counter wrapped and handed out
+stream 0, which callers read as a failure.  The registration stayed.
+Stream 0 is now skipped.
+</para>
+</change>
+
+<change type="security">
+<para>
+the wasm module read the base address of the linear memory of the guest only
+once, at startup.  A guest with a 64-bit memory could grow it past 4 GiB, and
+wasmtime then moved it.  The module then read and wrote the old address, and
+the worker crashed.  The module now refuses a 64-bit memory.  It also reads
+the base address again after the guest runs.
 </para>
 </change>
 
@@ -1171,104 +1207,6 @@ not be used.  Now only the module that does not compile is left out.
 </para>
 </change>
 
-<change type="change">
-<para>
-on macOS, a stored state file is now flushed with fcntl(F_BARRIERFSYNC), and
-its directory with fcntl(F_FULLFSYNC) after the rename, so the file also leaves
-the cache of the drive.  Plain fsync(2) there does not flush that cache, and a
-power loss could lose a stored configuration.
-</para>
-</change>
-
-<change type="bugfix">
-<para>
-when unitd ran as root and the control socket was given to another user or
-group with --control-user or --control-group, that user passed the socket file
-permissions but the controller then closed the connection.  The controller now
-also accepts the configured user, and a peer in the configured group.
-</para>
-</change>
-
-<change type="bugfix">
-<para>
-a worker that got a QUIT before it was ready did not act on it, and ran until
-it was killed 15 seconds later, so unitd was slow to exit.  The worker now
-exits at once.
-</para>
-</change>
-
-<change type="bugfix">
-<para>
-at shutdown, the router could ask a prototype that was already exiting to
-start a new worker.  The prototype then forked a worker that nobody stopped,
-and unitd did not exit.  If the prototype was gone, the router logged a false
-alert.  The prototype now refuses the start, and the router logs a gone
-prototype at the debug level.
-</para>
-</change>
-
-<change>
-<para>
-a QUIT that fails because the worker already exited is now logged at the info
-level, not as an alert.
-</para>
-</change>
-
-<change type="bugfix">
-<para>
-when a router thread ran out of connections or file descriptors, the log got
-an "epoll_ctl() failed (2: No such file or directory)" alert every 100
-milliseconds until a connection was freed.
-</para>
-</change>
-
-<change type="bugfix">
-<para>
-when a router thread could not allocate the listen event while a listener was
-added, a configuration request could wait forever, or a listening socket
-shared by several router threads could be closed too early.  When the thread
-had no free connection slot instead, the listener never accepted connections.
-Now the request completes, and a listener without a free slot starts to accept
-connections when a slot is free.
-</para>
-</change>
-
-<change type="bugfix">
-<para>
-at shutdown, idle client connections were closed but not freed.  They are now
-closed through their protocol handlers.
-</para>
-</change>
-
-<change type="bugfix">
-<para>
-on systems without accept4(), an accepted socket that could not be made
-non-blocking was closed and then still used.
-</para>
-</change>
-
-<change type="security">
-<para>
-the router and libunit read records from shared memory that the other
-process can still write, without enough checks.  A buffer that was not a whole
-number of records was read past its end.  In libunit, a segment id of
-UINT32_MAX wrapped the size of the segment array, a segment of any size was
-accepted, a duplicate segment id replaced a segment that buffers still used,
-and a field could point before the field array.  The router trusted a busy
-chunk marker that the application can clear.  All of these are now checked.
-</para>
-</change>
-
-<change type="security">
-<para>
-the wasm module read the base address of the linear memory of the guest only
-once, at startup.  A guest with a 64-bit memory could grow it past 4 GiB, and
-wasmtime then moved it.  The module then read and wrote the old address, and
-the worker crashed.  The module now refuses a 64-bit memory.  It also reads
-the base address again after the guest runs.
-</para>
-</change>
-
 <change type="bugfix">
 <para>
 a keep-alive TLS connection that was idle across a reconfiguration could
@@ -1291,6 +1229,19 @@ queued handler now does nothing.
 a static file response that failed after the request was closed could close
 the file descriptor twice.  The second close could close a descriptor that
 another connection had got in the meantime.
+</para>
+</change>
+
+<change type="change">
+<para>
+on Linux, the default number of router threads ("listen_threads") is now at
+most the CPU limit of the cgroup v2 group of unitd and of its parent groups
+("cpu.max"), rounded up to whole CPUs.  Before, it was the number of CPUs that
+unitd could run on, so a container limited to 2 CPUs on a 64-CPU host started
+64 router threads.  Now it starts 2.  A limit of 1.5 CPUs also gives 2
+threads.  An explicit "listen_threads" is not changed.  With a private cgroup
+namespace, only the limits inside the namespace are seen.  The limit is read
+once, when unitd starts.  cgroup v1 is not read.
 </para>
 </change>
 
@@ -1366,6 +1317,73 @@ router does not check senders there.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+when unitd ran as root and the control socket was given to another user or
+group with --control-user or --control-group, that user passed the socket file
+permissions but the controller then closed the connection.  The controller now
+also accepts the configured user, and a peer in the configured group.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a worker that got a QUIT before it was ready did not act on it, and ran until
+it was killed 15 seconds later, so unitd was slow to exit.  The worker now
+exits at once.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+at shutdown, the router could ask a prototype that was already exiting to
+start a new worker.  The prototype then forked a worker that nobody stopped,
+and unitd did not exit.  If the prototype was gone, the router logged a false
+alert.  The prototype now refuses the start, and the router logs a gone
+prototype at the debug level.
+</para>
+</change>
+
+<change type="change">
+<para>
+a QUIT that fails because the worker already exited is now logged at the
+info level, not as an alert.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+when a router thread ran out of connections or file descriptors, the log got
+an "epoll_ctl() failed (2: No such file or directory)" alert every 100
+milliseconds until a connection was freed.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+when a router thread could not allocate the listen event while a listener was
+added, a configuration request could wait forever, or a listening socket
+shared by several router threads could be closed too early.  When the thread
+had no free connection slot instead, the listener never accepted connections.
+Now the request completes, and a listener without a free slot starts to accept
+connections when a slot is free.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+at shutdown, idle client connections were closed but not freed.  They are now
+closed through their protocol handlers.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+on systems without accept4(), an accepted socket that could not be made
+non-blocking was closed and then still used.
+</para>
+</change>
+
 <change type="security">
 <para>
 an application could write an unexpected value into an entry of a shared
@@ -1401,17 +1419,17 @@ segments it creates.
 
 <change type="bugfix">
 <para>
-The proxy recognised an upstream Transfer-Encoding only when its value was
-exactly "chunked".  "Chunked" or "gzip, chunked" was not recognised, so the
+the proxy recognised an upstream Transfer-Encoding only when its value was
+exactly "chunked". "Chunked" or "gzip, chunked" was not recognised, so the
 body was framed by Content-Length or by connection close, and the chunk
-framing reached the client as body bytes.  The value is now parsed as a list
-of codings, and coding names are compared without case.  One "chunked" is
-decoded.  Any other transfer coding, and chunked together with
+framing reached the client as body bytes. The value is now parsed as a list
+of codings, and coding names are compared without case. One "chunked" is
+decoded. Any other transfer coding, and chunked together with
 Content-Length, fails the request with 502: the proxy cannot decode such a
-body, and it never forwards Transfer-Encoding to the client.  A response to
-HEAD, and any 204 or 304, is exempt from both 502s: it ends at the first empty
-line, so no Transfer-Encoding frames it.  Before, such a response gave 502 when
-it carried chunked together with Content-Length.
+body, and it never forwards Transfer-Encoding to the client. A response to
+HEAD, and any 204 or 304, is exempt from both 502s: it ends at the first
+empty line, so no Transfer-Encoding frames it. Before, such a response gave
+502 when it carried chunked together with Content-Length.
 </para>
 </change>
 
@@ -1601,20 +1619,21 @@ value once and check every offset against the buffer.
 <change type="security">
 <para>
 the string form of "access_log" "format" wrote what a variable expanded to
-without escaping it.  "$uri" is the percent-decoded target, so a request for
+without escaping it. "$uri" is the percent-decoded target, so a request for
 "/%0d%0a..." put a real CRLF in the log and the rest of the line read as a
-record of a request that never happened.  Bytes a variable expands to are now
-escaped the way nginx escapes them: the quote, the backslash, every byte below
-0x20, 0x7F and every byte above it all become "\xHH".  nginx emits no short
-forms, so a reader that already unescapes an nginx log reads this one.  The
-text of the
-format itself is unchanged, except for an "njs" format, which produces the
-whole record and is escaped whole.  A value that carries a quote of its own now
-shows it escaped: an entity-tag logged through "$response_header_etag" reads
-\x22abc\x22 rather than "abc", and a non-ASCII path reads "\xD0\xBF..." rather than
-its bytes.  A log parser that expected the raw bytes has to be updated, though "\xHH" is
-reversible and the bytes can be recovered from it.  The object form of "format"
-is unaffected by this change, but it is not a way to keep bytes either: it
+record of a request that never happened. Bytes a variable expands to are now
+escaped the way nginx escapes them: the quote, the backslash, every byte
+below 0x20, 0x7F and every byte above it all become "\xHH". nginx emits no
+short forms, so a reader that already unescapes an nginx log reads this one.
+The text of the format itself is unchanged, so a tab or a quote an operator
+wrote still reaches the log as itself; an "njs" format is the exception,
+because it produces the whole record and all of it is escaped. A value that
+carries a quote of its own now shows it escaped: an entity-tag logged
+through "$response_header_etag" reads \x22abc\x22 rather than "abc", and a
+non-ASCII path reads "\xD0\xBF..." rather than its bytes. A log parser that
+expected the raw bytes has to be updated, though "\xHH" is reversible and
+the bytes can be recovered from it. The object form of "format" is
+unaffected by this change, but it is not a way to keep bytes either: it
 replaces anything that is not valid UTF-8 with U+FFFD before it serializes.
 </para>
 </change>
@@ -1637,26 +1656,9 @@ then not valid JSON.  The string form keeps them, written as \xHH.
 </para>
 </change>
 
-<change type="security">
+<change type="change">
 <para>
-a port message that was queued because the peer's socket was not writable
-borrowed the descriptors it carried -- for NEW_PORT, another port's socket
-and queue -- so a port closed before the queue drained left the deferred
-sendmsg() naming a closed number, or an unrelated descriptor that had since
-reused it.  The queued copy now owns duplicates and closes them after the
-send (#388).
-</para>
-</change>
-
-<change type="bugfix">
-<para>
-a process could stop hearing from a peer for good.  When the wake-up that
-tells a peer to read the shared queue failed because the kernel could not
-allocate for it, the port treated the peer as dead: the wake-up was dropped
-and, since a later message raises one only when the queue was empty, no
-later message on that port raised one either.  The wake-up is now kept and
-retried, and the retry no longer waits for a socket event that a socket that
-never filled up will not deliver (#392).
+upgrade contrib njs to 1.0.1.
 </para>
 </change>
 
@@ -1672,44 +1674,26 @@ somebody else.  A port now drops its pending changes before it is freed
 </para>
 </change>
 
-<change type="change">
+<change type="bugfix">
 <para>
-upgrade contrib njs to 1.0.1.
+a process could stop hearing from a peer for good.  When the wake-up that
+tells a peer to read the shared queue failed because the kernel could not
+allocate for it, the port treated the peer as dead: the wake-up was dropped
+and, since a later message raises one only when the queue was empty, no
+later message on that port raised one either.  The wake-up is now kept and
+retried, and the retry no longer waits for a socket event that a socket that
+never filled up will not deliver (#392).
 </para>
 </change>
 
-<change type="change">
+<change type="security">
 <para>
-removed the unused job cluster (nxt_job.c, nxt_job.h, and
-nxt_event_conn_job_sendfile.c).  The offload path they implemented had no
-caller anywhere in the tree and its thread pool handoff was structurally
-unreachable, since the connection field it read was never assigned.
-</para>
-</change>
-
-<change type="feature">
-<para>
-byte-range requests for static files.  A "share" action answers a "Range"
-header naming a single range with "206 Partial Content" and a
-"Content-Range" header, an unsatisfiable one with "416 Range Not
-Satisfiable", and advertises support with "Accept-Ranges: bytes".
-"If-Range" is honoured, so a range is served only while the client's copy
-is still current.  A request naming several ranges is answered in full, as
-a server that does not implement multipart ranges may.
-</para>
-</change>
-
-<change type="feature">
-<para>
-conditional requests for static files.  A "share" action now answers a GET
-or HEAD carrying "If-None-Match" or "If-Modified-Since" with "304 Not
-Modified" when the file's validators still match, so a client that already
-holds the file is not sent it again.  Unit emitted "ETag" and
-"Last-Modified" before, but ignored both when they came back.  "If-Match"
-and "If-Unmodified-Since" are evaluated first and answer "412 Precondition
-Failed" when they do not hold.  Entity-tag comparison is weak for
-"If-None-Match" and strong for "If-Match", and "*" matches any
-representation, per RFC 9110.
+a port message that was queued because the peer's socket was not writable
+borrowed the descriptors it carried -- for NEW_PORT, another port's socket
+and queue -- so a port closed before the queue drained left the deferred
+sendmsg() naming a closed number, or an unrelated descriptor that had since
+reused it.  The queued copy now owns duplicates and closes them after the
+send (#388).
 </para>
 </change>
 
@@ -1735,6 +1719,78 @@ that cannot decode them, or the uncompressed copy to one that could have had
 the small version.  The header is sent on the identity response as well as
 the compressed one, since the identity response is the one a cache must not
 reuse for a client that accepts gzip.
+</para>
+</change>
+
+<change type="change">
+<para>
+removed the unused job cluster (nxt_job.c, nxt_job.h, and
+nxt_event_conn_job_sendfile.c).  The offload path they implemented had no
+caller anywhere in the tree and its thread pool handoff was structurally
+unreachable, since the connection field it read was never assigned.
+</para>
+</change>
+
+<change type="feature">
+<para>
+byte-range requests for static files. A "share" action now answers a
+satisfiable single-range "Range: bytes=..." request with "206 Partial
+Content" and a matching "Content-Range", and an unsatisfiable one with "416
+Range Not Satisfiable"; "Accept-Ranges: bytes" is now sent on a plain 200 as
+well. The three single-range forms are supported -- "A-B", "A-" and the
+suffix form "-N" -- with the end clamped to the last byte of the file; a
+multi-range request is ignored and answered with the full 200, as RFC 9110
+permits. "If-Range" is honoured against the file's entity-tag (strong
+comparison) or its "Last-Modified" date, falling back to the full 200 on a
+mismatch. Preconditions (RFC 9110 Sect. 13.2.2) are still evaluated first,
+so a 304 or 412 outcome wins over any Range. A response served from a Range
+is not content-coded; compression still applies to a full 200.
+</para>
+</change>
+
+<change type="change">
+<para>
+unitctl builds TLS support behind a "tls" Cargo feature, on by default.  The
+musl build turns it off, so the static binary no longer links a C TLS library
+and no longer accepts an "https://" control socket address; it refuses one with
+a message naming the feature.  A Unix socket or a plain "http://" address is
+unaffected, and a build with default features behaves as before.
+</para>
+</change>
+
+<change type="change">
+<para>
+unitctl sends a JSON configuration file as it was written.  It parsed the file
+and re-serialized it before, which kept the last of two object members with the
+same name and re-spelled numbers, so the server never saw what the operator
+wrote.  Unit now reports the duplicate itself, with the line and column of the
+file.  A file that is not valid UTF-8 is no longer refused by unitctl; Unit
+refuses it and names the member.  The "edit" command no longer accepts JSON5 comments in the temporary
+file.
+</para>
+</change>
+
+<change type="change">
+<para>
+unitctl no longer reads JSON5.  A ".json5" file is refused by name, with a
+message saying to convert it first; "json5 -o config.json config.json5" does
+that, and "jq" reformats ordinary JSON.  Nothing parsed JSON5 after the
+configuration upload path stopped parsing its input, so this removes a parser
+that only the refusal path still reached, and two crates with it.
+</para>
+</change>
+
+<change type="feature">
+<para>
+conditional requests for static files. A "share" action now answers a GET or
+HEAD carrying "If-None-Match" or "If-Modified-Since" with "304 Not Modified"
+when the file's validators still match, so a client that already holds the
+file is no longer sent it again. Unit emitted "ETag" and "Last-Modified"
+before, but ignored both when they came back. Entity-tag comparison is weak
+and "*" matches any representation; a present "If-None-Match" takes
+precedence over "If-Modified-Since", per RFC 9110. "If-Match" and
+"If-Unmodified-Since" are evaluated first and answer "412 Precondition
+Failed" when they do not hold.
 </para>
 </change>
 
@@ -1774,6 +1830,28 @@ consume the router's descriptor table, stopping every application behind it.
 A fragment stream that is started and never completed still retains its
 descriptor; that needs a bound on pending fragments and is tracked in
 freeunitorg/freeunit#343.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+unitctl gave up on a configuration it could not decode as UTF-8.  Unit stores
+the bytes it is given, so a configuration can hold bytes no UTF-8 decoder
+accepts; "unitctl execute" and "unitctl export" then failed with "JSON error
+[path=/config]" and left the operator no way to read or back up the
+configuration.  Both work now: the document is shown with the undecodable
+bytes replaced and the members they fall in named, and "export" stores the
+server's bytes verbatim.  "unitctl edit" refuses such a configuration rather
+than writing the replacements back over it.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+unitctl reordered the members of a configuration.  "unitctl edit" and "unitctl
+export" passed the document through an unordered map, so members came back in
+an arbitrary order and an edit rewrote the whole configuration even where
+nothing had changed.  The order the server sent is now kept.
 </para>
 </change>
 
@@ -1929,28 +2007,6 @@ application that relied on them now needs "user": "root".
 </para>
 </change>
 
-<change type="bugfix">
-<para>
-unitctl gave up on a configuration it could not decode as UTF-8.  Unit stores
-the bytes it is given, so a configuration can hold bytes no UTF-8 decoder
-accepts; "unitctl execute" and "unitctl export" then failed with "JSON error
-[path=/config]" and left the operator no way to read or back up the
-configuration.  Both work now: the document is shown with the undecodable
-bytes replaced and the members they fall in named, and "export" stores the
-server's bytes verbatim.  "unitctl edit" refuses such a configuration rather
-than writing the replacements back over it.
-</para>
-</change>
-
-<change type="bugfix">
-<para>
-unitctl reordered the members of a configuration.  "unitctl edit" and "unitctl
-export" passed the document through an unordered map, so members came back in
-an arbitrary order and an edit rewrote the whole configuration even where
-nothing had changed.  The order the server sent is now kept.
-</para>
-</change>
-
 <change type="security">
 <para>
 unitctl no longer depends on rustls-pemfile or on hyper's "http2" feature.
@@ -1968,8 +2024,8 @@ line -- so HTTP/2 support was never usable against the server itself.
 <change type="change">
 <para>
 unitctl no longer offers HTTP/2 in the TLS handshake it makes to a remote
-control API.  This follows from the "http2" feature removal above.  A TLS-
-terminating proxy placed in front of a remote control API must now speak
+control API. This follows from the "http2" feature removal above. A
+TLS-terminating proxy placed in front of a remote control API must now speak
 HTTP/1.1 to unitctl; one that only accepts HTTP/2 can no longer be reached.
 </para>
 </change>
@@ -1991,16 +2047,6 @@ control API.  It also removes serde_yaml and unsafe-libyaml; the latter is a
 c2rust transpile of libyaml with 218 unsafe functions and no RustSec advisory.
 tools/unitc is unaffected: it still converts configuration to and from YAML,
 using yq.
-</para>
-</change>
-
-<change type="change">
-<para>
-unitctl builds TLS support behind a "tls" Cargo feature, on by default.  The
-musl build turns it off, so the static binary no longer links a C TLS library
-and no longer accepts an "https://" control socket address; it refuses one with
-a message naming the feature.  A Unix socket or a plain "http://" address is
-unaffected, and a build with default features behaves as before.
 </para>
 </change>
 
@@ -2028,24 +2074,16 @@ deleted the file as part of an unrelated cleanup.
 <change type="change">
 <para>
 the entity-tag and last-modified date of a static file are now weak while
-the request falls inside the second the file was last written, because a
-rewrite to the same size during that second changes neither validator.
-If-Match and the If-Range forms stop matching in that window, so a range
-conditioned on If-Range falls back to the full response; an unconditional
-Range is unaffected.  The tag keeps its format, so nothing already cached is
-invalidated.
-</para>
-</change>
-
-<change type="change">
-<para>
-unitctl sends a JSON configuration file as it was written.  It parsed the file
-and re-serialized it before, which kept the last of two object members with the
-same name and re-spelled numbers, so the server never saw what the operator
-wrote.  Unit now reports the duplicate itself, with the line and column of the
-file.  A file that is not valid UTF-8 is no longer refused by unitctl; Unit
-refuses it and names the member.  The "edit" command no longer accepts JSON5 comments in the temporary
-file.
+the request falls inside the second the file was last written. Both are
+derived from the whole-second modification time and the size, so a rewrite
+to the same size during that second changes neither, and RFC 9110 Sect.
+8.8.1 reserves a strong validator for one that cannot miss a change.
+"If-Match" and "If-Range" stop matching inside that window, so a range
+request conditioned on "If-Range" is answered with the full 200 rather than
+a slice keyed to a validator Unit cannot vouch for; an unconditional "Range"
+is unaffected. "If-Match: *" is unaffected too, since "*" asks whether a
+representation exists, not whether a validator matches. The tag keeps its
+format, so nothing already held in a cache is invalidated.
 </para>
 </change>
 
@@ -2061,16 +2099,6 @@ error instead of a clean "unsupported".  CyaSSL was renamed wolfSSL and
 PolarSSL became mbedTLS, both in 2015, so the flags also target products
 that no longer exist under these names.  The OpenSSL backend is
 unaffected; none of these files were ever part of a default build.
-</para>
-</change>
-
-<change type="change">
-<para>
-unitctl no longer reads JSON5.  A ".json5" file is refused by name, with a
-message saying to convert it first; "json5 -o config.json config.json5" does
-that, and "jq" reformats ordinary JSON.  Nothing parsed JSON5 after the
-configuration upload path stopped parsing its input, so this removes a parser
-that only the refusal path still reached, and two crates with it.
 </para>
 </change>
 
@@ -2153,13 +2181,16 @@ limit applied to the next message.
 <change type="bugfix">
 <para>
 a byte-range request from a client that refused the identity coding is no
-longer answered with identity bytes.  A range is served as identity, so
-Range together with "Accept-Encoding: identity;q=0" returned a 206 carrying
-exactly the bytes the client said it would not take; the range is now
-ignored and the full 200 is sent in a coding the client accepts.  An
-unsatisfiable range from such a client is no longer answered with 416 either.
-A request that accepts no coding at all is still 406.  Several Accept-Encoding
-lines in one request are now read as one comma-joined value; previously only the
+longer answered with identity bytes. A range is served as identity, so
+"Range" together with "Accept-Encoding: identity;q=0" returned a "206
+Partial Content" carrying exactly the bytes the client said it would not
+take. The range is now ignored and the full "200 OK" is sent in a coding the
+client does accept. Ignoring the range is all or nothing, so an
+unsatisfiable range from such a client is no longer answered with "416"
+either. A request that accepts no coding at all is still "406 Not
+Acceptable", and a range from a client that does accept identity is still a
+206. Several "Accept-Encoding" lines in one request are now read as the
+single comma-joined value RFC 9110 defines them to be; previously only the
 first was consulted.
 </para>
 </change>
@@ -2167,75 +2198,78 @@ first was consulted.
 <change type="bugfix">
 <para>
 a response that no compressor applies to is no longer sent as identity to a
-client that refused the identity coding.  With a compressor configured,
+client that refused the identity coding. With a compressor configured,
 "Accept-Encoding: gzip, identity;q=0" was accepted because gzip was
-acceptable.  When the media type of the response was outside "types", or the
+acceptable. When the media type of the response was outside "types", or the
 response had no media type, the response was then sent uncompressed: the
-identity bytes that the request had refused.  Such a request now gets 406,
-with a Range header and without one.  A 406 from this negotiation carries
-"Vary: Accept-Encoding".  A 1xx, 204 or 304 response is never negotiated, so
-an application that sends one of these with a Content-Length is not affected.
-A response with no body, and a response that carries its own
-Content-Encoding, are not affected either.
+identity bytes that the request had refused. Such a request now gets "406
+Not Acceptable", with a "Range" header and without one. A 406 from this
+negotiation carries "Vary: Accept-Encoding". A 1xx, 204 or 304 response is
+never negotiated, so an application that sends one of these with a
+"Content-Length" is not affected. A response with no body, and a response
+that carries its own "Content-Encoding", are not affected either.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
-"*" in Accept-Encoding now stands for each enabled compressor that the client
-did not name.  Before, it stood for the identity coding only.
-"identity;q=0, *;q=1" was answered 406 with gzip enabled and applicable,
-because the wildcard could select only identity, and the same field refused
-identity.  A coding that the field names keeps its own weight.  The wildcard
-does not match it, and the named coding wins a tie: "gzip, *" now sends gzip.
-Before, it sent the response uncompressed.
+"*" in "Accept-Encoding" now stands for each enabled compressor that the
+client did not name. Before, it stood for the identity coding only.
+"identity;q=0, *;q=1" was answered "406 Not Acceptable" with gzip enabled
+and applicable, because the wildcard could select only identity, and the
+same field refused identity. A coding that the field names keeps its own
+weight. The wildcard does not match it, and the named coding wins a tie:
+"gzip, *" now sends gzip. Before, it sent the response uncompressed.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
-a compressor below its own min_length is no longer selected before a
-compressor with a lower weight that can be applied.  min_length belongs to
-each compressor.  With gzip at 1000 and deflate at 0, a 100-byte response was
-sent uncompressed, because gzip had the higher weight.  A client that refused
-the identity coding got the same uncompressed bytes.  Such a client now gets
-deflate.  When each compressor that the client accepts is below its
-min_length, the client gets 406 instead of the bytes it refused.
+a compressor below its own "min_length" is no longer selected before a
+compressor with a lower weight that can be applied. "min_length" belongs to
+each compressor. With gzip at 1000 and deflate at 0, a 100-byte response was
+sent uncompressed, because gzip had the higher weight. A client that refused
+the identity coding got the same uncompressed bytes. Such a client now gets
+deflate. When each compressor that the client accepts is below its
+"min_length", the client gets "406 Not Acceptable" instead of the bytes it
+refused.
 </para>
 </change>
 
 <change type="change">
 <para>
-a server with no compression configured now answers 406 to a request whose
-Accept-Encoding refuses the identity coding: "identity;q=0", or "*;q=0" with
-no more specific entry for identity.  Identity is the only coding that such a
-server has.  Before, it sent the response, or the requested range of it, in
-the bytes that the client had refused.  To read that refusal, each response
-with a known length above zero now looks at its own Content-Encoding and at
-the request Accept-Encoding.  Before, these checks ran only with a compressor
+a server with no compression configured now answers "406 Not Acceptable" to
+a request whose "Accept-Encoding" refuses the identity coding:
+"identity;q=0", or "*;q=0" with no more specific entry for identity.
+Identity is the only coding that such a server has. Before, it sent the
+response, or the requested range of it, in the bytes that the client had
+refused. To read that refusal, each response with a known length above zero
+now looks at its own "Content-Encoding" and at the request
+"Accept-Encoding". Before, these checks ran only with a compressor
 configured.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
-a malformed weight in Accept-Encoding is no longer read as a refusal.  The
+a malformed weight in "Accept-Encoding" is no longer read as a refusal. The
 qvalue was converted with strtod(), which takes no digits at all from
 "identity;q=" and from "identity;q=abc" and reports zero, so either one
-answered 406 to a client that had refused nothing; "q=0x0" and "q=0e0" did the
-same.  An element whose weight does not match the grammar of RFC 9110
-Sect. 12.4.2 is now ignored, as an element naming an unknown coding already
-was.  This also removes "q=nan", which passed the 0-to-1 range check and then
-outranked every real weight.
+answered "406 Not Acceptable" to a client that had refused nothing; "q=0x0"
+and "q=0e0" did the same. An element whose weight does not match the grammar
+of RFC 9110 Sect. 12.4.2 is now ignored, as an element naming an unknown
+coding already was. This also removes "q=nan", which passed the 0-to-1 range
+check -- a NaN compares false against both bounds -- and then outranked
+every real weight.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
-a negotiation failure on Accept-Encoding was answered with 503 instead of 406
-when the response came from an application.  The router treated every result
-of the acceptability check other than success as a server error; only the
-static path reported the 406.
+a negotiation failure on "Accept-Encoding" was answered with "503 Service
+Unavailable" instead of "406 Not Acceptable" when the response came from an
+application. The router treated every result of the acceptability check
+other than success as a server error; only the static path reported the 406.
 </para>
 </change>
 
@@ -2779,6 +2813,201 @@ FreeUnit updated to 1.36.1.
          date="2026-07-16" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="bugfix">
+<para>
+the controller crashed in debug builds when a control-socket connection
+closed after the active-connection tracking change, and leaked the accepted
+file descriptor when a control connection failed during initialization or
+body allocation; connection tracking and teardown now route through the
+engine's tracking macros and the close path.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+ignore a malformed incoming "traceparent" header and restart the trace per
+W3C Trace Context instead of rejecting the request with HTTP 500; the
+malformed header is dropped instead of being forwarded alongside the
+restarted one, and context accepted from a valid duplicate is preserved.
+Values are now validated in full (segment lengths, lowercase hex, no
+all-zero ids, no "ff" version), so content-invalid values restart the trace
+instead of being re-emitted verbatim. An inbound "tracestate" is dropped
+together with the rejected context (kept when the traceparent is inherited).
+The injected "traceparent" fields are now zero-initialized; garbage flag
+bits could get the header randomly dropped from proxied requests and
+responses.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+reject empty values and embedded NUL bytes in configuration strings that are
+later used as NUL-terminated C strings ("user", "group",
+"working_directory", "stdout", "stderr", "executable", and the per-language
+application targets) and in pathname unix socket addresses, closing a
+silent-truncation target confusion.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+reject empty values and embedded NUL bytes in the remaining configuration
+strings used as NUL-terminated C strings outside application options: the
+"access_log" path (string and object forms), the TLS "certificate" and njs
+"js_module" store names, and the PHP "options.file" php.ini path.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+reject an embedded NUL byte in a templated static-serving path ("share" and
+"chroot") after it is resolved from request-controlled variables and before
+it reaches open()/openat2(), preventing a silent truncation that could serve
+a different file than the resolved path.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+mount rootfs automount destinations onto the openat2 validated descriptor
+via "/proc/self/fd" instead of re-resolving the path, closing a check-to-use
+window in which a destination component could be swapped for a symlink
+escaping the rootfs.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+treat duplicate upstream "Content-Length" headers in a proxied response as
+inconsistent — both headers are dropped and the body is read to EOF instead
+of trusting either length, preventing a response-smuggling
+desynchronization.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+keep downstream keepalive disabled after a duplicate or invalid upstream
+"Content-Length"; a clean upstream close no longer re-enables it, so an
+HTTP/1.1 client cannot reuse the connection past the re-framed response. The
+complete body still ends with its terminal chunk — body truncation is now
+tracked separately from the inconsistent flag.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+bound the request-header fields region against the shared memory message
+size in libunit, validate every field name/value serialized pointer and the
+cached header-field indexes before use, and range-check off/len in the Java
+InputStream read() binding, preventing out-of-bounds access on a malformed
+request.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+fix a libunit port-fd double-close race in the Go language module:
+getUnixConn() wrapped the raw shared-port descriptor (which net.FileConn
+dups) and a deferred Close() closed the original descriptor number while
+libunit still owned it, an intermittent double-close that raised an EBADF
+alert or, worse, closed an unrelated reused live descriptor. Go now dup(2)s
+the descriptor and wraps only the dup, so libunit remains the sole owner
+and closer; libunit additionally holds a port reference across the
+out-of-mutex add_port callback window so a concurrent destroy cannot free
+the port mid-callback.
+</para>
+</change>
+
+<change type="feature">
+<para>
+SIGQUIT now performs a graceful stop — application workers drain in-flight
+requests before exiting; SIGTERM remains the fast exit that drops them.
+</para>
+</change>
+
+<change type="change">
+<para>
+upgrade the wasm-wasi-component wasmtime crates from 35.0.0 to 36.0.12,
+clearing the wasmtime sandbox-escape advisories, with the accompanying
+WasiView/WasiHttpView source migration.
+</para>
+</change>
+
+<change type="change">
+<para>
+upgrade contrib njs to 1.0.0.
+</para>
+</change>
+
+<change type="change">
+<para>
+the Debian packages are rebranded to "freeunit": the package set
+(freeunit, freeunit-dev, freeunit-php8.x, freeunit-python3.x,
+freeunit-perl, freeunit-ruby, freeunit-go, freeunit-wasm and the
+freeunit-jscNN Java modules), the
+daemon binary (/usr/sbin/freeunitd), the control socket
+(control.freeunit.sock), the state directory (/var/lib/freeunit), the log
+(/var/log/freeunit.log) and the systemd/init service are all renamed. Each
+package Provides/Conflicts/Replaces its upstream "unit" counterpart, so
+installing freeunit cleanly takes over a stock "unit" install; the two are
+deliberately not co-installable. The compiled-in "Unit" identity, the
+unitc/setup-unit tools and the development headers keep their upstream
+names by design.
+</para>
+</change>
+
+<change type="feature">
+<para>
+two-phase listener close — reconfiguration disarms a removed listener first
+and releases its descriptor only after pending accept references drain,
+instead of resetting them.
+</para>
+</change>
+
+<change type="change">
+<para>
+the event engine now tracks in-flight connections on a dedicated active
+connections queue, symmetric with idle tracking — groundwork for graceful
+connection draining; connection accounting in the "/status" API is exact on
+all close paths.
+</para>
+</change>
+
+<change type="change">
+<para>
+broaden the regression test suite — proxy Content-Length and
+chunked-response relay framing, OpenTelemetry 5xx tracing and inbound
+traceparent handling, and Java ServletInputStream bounds — and run the C
+unit-test suite in CI, which was previously compiled but never executed.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+authorize privileged IPC message types by the kernel-validated sender PID
+(SCM_CREDENTIALS), close any received descriptors on every rejected
+privileged message, and cap port queue item size at the slot data bound.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+reject control characters (CR, LF, NUL, DEL) in "set_headers" names and
+values at configuration load, including the literal segments of templated
+values.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+handle buffer-allocation failure in the port read handlers with an orderly
+teardown instead of a NULL-pointer dereference, route a connection write
+error after a partial send to the error handler immediately, and free the
+timer batching array on engine teardown.
+</para>
+</change>
+
 <change type="feature">
 <para>
 upgrade the OpenTelemetry Rust crates from 0.24 to 0.32 and rewrite the
@@ -2844,15 +3073,83 @@ exporter; only HttpBinary was ever selected.
 
 <change type="bugfix">
 <para>
-fix a libunit port-fd double-close race in the Go language module:
-getUnixConn() wrapped the raw shared-port descriptor (which net.FileConn
-dups) and a deferred Close() closed the original descriptor number while
-libunit still owned it, an intermittent double-close that raised an EBADF
-alert or, worse, closed an unrelated reused live descriptor. Go now dup(2)s
-the descriptor and wraps only the dup, so libunit remains the sole owner
-and closer; libunit additionally holds a port reference across the
-out-of-mutex add_port callback window so a concurrent destroy cannot free
-the port mid-callback.
+fix a rootfs automount reload race: sever the worker's mount namespace
+propagation (MS_REC|MS_PRIVATE) before mounting and let a per-worker
+automount be reaped with the namespace instead of being unmounted from the
+host, so a configuration reload no longer races the previous worker
+generation's teardown against the new prototype's procfs mount
+(freeunitorg/freeunit#83).
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+validate that a loaded TLS private key matches its certificate at config
+time, and guard the wildcard-name SAN matcher against a zero-length SAN
+entry.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+correct IPv4 /32 CIDR fallthrough, symmetric URI/pattern decoding, the PCRE2
+match-data ovector size, and short port-range parsing in HTTP routing;
+document the case-insensitive host matcher and the capset stance.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+tighten file-descriptor and CLOEXEC lifetime — CLOEXEC-protect accepted
+sockets and pipe ends, close the pipe end on nxt_fd_nonblocking() failure
+and the source fd on compression mmap failure, and narrow the accept4()
+fallback to ENOSYS.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+tighten WebSocket frame-bound checks — reject truncated extended-length
+frames in libunit, validate the 64-bit extended-length MSB (RFC 6455), fix a
+no-op frame-size decrement that could copy bytes beyond the declared
+payload, bound the Java sendWsFrame JNI arguments, and guard
+pending_payload_len overflow in the Python ASGI handler.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+bounds-check peer-supplied shared-memory offsets — range-check chunk_id and
+chunk_id+nchunks in incoming mmap messages, close a lookup/dereference
+window on the incoming-mmap handler, reject response-buffer size overflow,
+and validate request sptr offsets before use.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+bounds-check app-supplied arguments across the language bindings (PHP header
+skip / realpath / PATH_INFO; Python WSGI and ASGI checks; Perl ERRSV scrub;
+Java InputStream.readLine off/len; WASM guest offsets).
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+tighten isolation boundaries — require a matching peer UID (root or Unit's
+own effective UID) on the unix control socket, so the "control-user",
+"control-group", and "control-mode" permissions are defense-in-depth rather
+than a means to delegate control-API access; resolve mount destinations with
+openat2(RESOLVE_BENEATH); and resolve relative cgroup paths against the
+child's /proc/&lt;pid&gt;/cgroup.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+reject embedded NUL bytes in the "rootfs" and cgroup "path" isolation
+options, and validate "rootfs" as an absolute path other than "/" at
+configuration time.
 </para>
 </change>
 
@@ -2869,42 +3166,45 @@ with ENAMETOOLONG when "/cgroup.procs" plus the trailing NUL cannot fit.
 <change type="bugfix">
 <para>
 fail cgroup setup when the per-process pool allocation that caches the
-created directory for cleanup fails; the directory is removed and setup
-errors out instead of moving the process into a cgroup that could never be
-cleaned up -- a cgroup directory leak under memory pressure.
+created directory for cleanup fails; the directory is now removed and setup
+errors out, rather than moving the process into a cgroup that could never be
+cleaned up — a cgroup directory leak under memory pressure.
 </para>
 </change>
 
 <change type="bugfix">
 <para>
-keep downstream keepalive disabled after a duplicate or invalid upstream
-"Content-Length"; a clean upstream close no longer re-enables it, so an
-HTTP/1.1 client cannot reuse the connection past the re-framed response. The
-complete body still ends with its terminal chunk -- body truncation is now
-tracked separately from the inconsistent flag.
+reject a "rootfs" that lexically resolves to "/" (such as "/.", "/..", or
+"/foo/.."); chroot("/") is a no-op and would silently defeat rootfs
+isolation.
 </para>
 </change>
 
-<change type="change">
+<change type="bugfix">
 <para>
-upgrade contrib njs to 1.0.0.
+cap JSON parser depth and element counts in the controller, scrub PHP
+TrueAsync exception state before the prototype fork, and bind the Ruby
+rack.input / rack.errors handles to their originating request.
 </para>
 </change>
 
-<change type="change">
+<change type="bugfix">
 <para>
-the Debian packages are rebranded to "freeunit": the package set
-(freeunit, freeunit-dev, freeunit-php8.x, freeunit-python3.x,
-freeunit-perl, freeunit-ruby, freeunit-go, freeunit-wasm and the
-freeunit-jscNN Java modules), the
-daemon binary (/usr/sbin/freeunitd), the control socket
-(control.freeunit.sock), the state directory (/var/lib/freeunit), the log
-(/var/log/freeunit.log) and the systemd/init service are all renamed. Each
-package Provides/Conflicts/Replaces its upstream "unit" counterpart, so
-installing freeunit cleanly takes over a stock "unit" install; the two are
-deliberately not co-installable. The compiled-in "Unit" identity, the
-unitc/setup-unit tools and the development headers keep their upstream
-names by design.
+bound proxy Content-Length and URI/string helpers — truncate a proxied
+response body that exceeds its Content-Length and close the connection, flag
+invalid or oversized upstream Content-Length, fix an
+nxt_is_complex_uri_encoded() off-by-one, and reject over-long lengths in
+nxt_rmemstrn().
+</para>
+</change>
+
+<change type="feature">
+<para>
+enforce the runtime/OS end-of-life policy automatically — the unit-eol-check
+tool now fails when a shipped variant has outlived its support window
+(supported_until past EOL + grace), and a new eol-check GitHub workflow
+validates pkg/eol.json against endoflife.date on every relevant pull request
+and weekly on a schedule.
 </para>
 </change>
 
@@ -2937,11 +3237,12 @@ FreeUnit updated to 1.36.0.
 
 <change type="feature">
 <para>
-automatically convert chunked request bodies to Content-Length
-when forwarding to upstream servers via proxy action.
-This enables compatibility with backends that do not support
-Transfer-Encoding: chunked (e.g., Gitea, servers requiring
-Content-Length).
+automatically convert chunked request bodies to Content-Length when
+forwarding to upstream servers via proxy action. This enables compatibility
+with backends that do not support Transfer-Encoding: chunked (e.g., Gitea,
+servers requiring Content-Length). Fixes freeunitorg/freeunit#58, resolves
+nginx/unit#445 (client chunked), nginx/unit#1088 (duplicate TE), and
+nginx/unit#1278 (RFC 9112 epic).
 </para>
 </change>
 
@@ -2968,6 +3269,20 @@ and ensures proper connection cleanup.
 </para>
 </change>
 
+<change type="feature">
+<para>
+add unfreeze-sync.sh script for automated migration of issues
+from nginx/unit to freeunitorg/freeunit with label mapping,
+deduplication, and dry-run preview support.
+</para>
+</change>
+
+<change type="change">
+<para>
+upgrade contrib njs to 0.9.8.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 fix mem-pool retain leak in cert/script-store IPC paths
@@ -2982,20 +3297,6 @@ all reachable when nxt_port_msg_alloc fails inside the port machinery.
 fix isolation mount comparator ordering to ensure procfs mounts
 before tmpfs before bind/lang-deps; avoids flaky ENOENT on procfs
 mount in rootfs isolation with automount.
-</para>
-</change>
-
-<change type="change">
-<para>
-upgrade contrib njs to 0.9.8.
-</para>
-</change>
-
-<change type="feature">
-<para>
-add unfreeze-sync.sh script for automated migration of issues
-from nginx/unit to freeunitorg/freeunit with label mapping,
-deduplication, and dry-run preview support.
 </para>
 </change>
 
@@ -3105,8 +3406,8 @@ all dependency tarballs are now served from FreeUnit infrastructure.
 
 <change type="feature">
 <para>
-upgrade contrib dependencies: njs 0.9.6, libunit-wasm 0.5.0, wasmtime 43.0.0,
-wasi-sysroot 27.0.
+upgrade contrib dependencies — njs 0.9.6, libunit-wasm 0.5.0, wasmtime
+43.0.0, wasi-sysroot 27.0.
 </para>
 </change>
 
@@ -3179,8 +3480,8 @@ to fix builds against PHP versions that do not expose this callback.
 
 <change type="bugfix">
 <para>
-fix Ruby language module build in clang-ast workflow on debian:testing: resolve
-Debian multiarch library path mismatch and suppress
+fix Ruby language module build in clang-ast workflow on debian:testing —
+resolve Debian multiarch library path mismatch and suppress
 -Wdefault-const-init-field-unsafe from clang 21 on Ruby 3.3 headers.
 </para>
 </change>
@@ -3221,7 +3522,7 @@ switch all Docker base images from debian:bookworm to debian:trixie.
 
 <change type="feature">
 <para>
-add PHP 8.5 pre_request_init SAPI callback support.
+add PHP 8.5 pre_request_init SAPI callback support (nxt_php_sapi.c).
 </para>
 </change>
 
@@ -3239,7 +3540,7 @@ build CI against OpenSSL 3.6.
 
 <change type="change">
 <para>
-fork from nginx/unit as FreeUnit: community LTS continuation of the Unit
+fork from nginx/unit as FreeUnit — community LTS continuation of the Unit
 application server.
 </para>
 </change>
