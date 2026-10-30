@@ -235,6 +235,25 @@ nxt_http_request_field(void *ctx, nxt_http_field_t *field, uintptr_t offset)
 
 
 nxt_int_t
+nxt_http_request_accept_encoding(void *ctx, nxt_http_field_t *field,
+    uintptr_t data)
+{
+    nxt_http_request_t  *r;
+
+    r = ctx;
+
+    if (r->accept_encoding == NULL) {
+        r->accept_encoding = field;
+
+    } else {
+        r->multi_accept_encoding = 1;
+    }
+
+    return NXT_OK;
+}
+
+
+nxt_int_t
 nxt_http_request_content_length(void *ctx, nxt_http_field_t *field,
     uintptr_t data)
 {

@@ -248,6 +248,7 @@ struct nxt_http_request_s {
     nxt_http_field_t                *referer;
     nxt_http_field_t                *user_agent;
     nxt_http_field_t                *authorization;
+    nxt_http_field_t                *accept_encoding;
     nxt_off_t                       content_length_n;
 
     nxt_sockaddr_t                  *remote;
@@ -308,6 +309,7 @@ struct nxt_http_request_s {
     uint8_t                         websocket_handshake;  /* 1 bit */
     uint8_t                         chunked;  /* 1 bit */
     uint8_t                         no_body;  /* 1 bit */
+    uint8_t                         multi_accept_encoding;  /* 1 bit */
 
     /*
      * After the byte flags, not in front of "fields": a byte there leaves
@@ -497,6 +499,8 @@ nxt_int_t nxt_http_request_host(void *ctx, nxt_http_field_t *field,
 nxt_int_t nxt_http_validate_host(nxt_str_t *host, nxt_mp_t *mp);
 nxt_int_t nxt_http_request_field(void *ctx, nxt_http_field_t *field,
     uintptr_t offset);
+nxt_int_t nxt_http_request_accept_encoding(void *ctx, nxt_http_field_t *field,
+    uintptr_t data);
 nxt_int_t nxt_http_request_content_length(void *ctx, nxt_http_field_t *field,
     uintptr_t data);
 
