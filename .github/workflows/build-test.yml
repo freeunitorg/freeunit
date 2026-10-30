@@ -1267,6 +1267,32 @@ jobs:
       - name: Build C tests (not run)
         run: make -j4 tests
 
+  # Exercise the runtime size validation with matching 32-bit unitd and
+  # Python.  The compile-only -m32 leg cannot catch API/test ABI assumptions.
+  test-python-32bit:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run shared-memory and WebSocket tests in 32-bit Alpine
+        run: |
+          docker run --rm --platform linux/386 \
+            -v "$GITHUB_WORKSPACE:/src" -w /src i386/alpine:edge \
+            sh -ec '
+              apk add --no-cache build-base python3-dev py3-pytest \
+                py3-openssl procps-ng pcre2-dev openssl-dev file
+              ./configure --openssl --prefix=/src/build
+              ./configure python --config=python3-config
+              make -j2
+              file build/sbin/unitd | grep "ELF 32-bit"
+              python3 -c "import struct; assert struct.calcsize(\"P\") == 4"
+              python3 -m pytest test/test_python_shm_limit.py \
+                test/test_asgi_websockets.py --restart --durations=20 \
+                -k "shm_limit or close_then_exception or message_over_buffer_limit or second_frame_over_buffer_limit or app_queue_full_timeout"
+            '
+
   # The oldest compiler the tree still builds with: GCC 4.4.7 and glibc 2.12
   # of RHEL 6.  It has no -std=gnu11 and no __atomic_* builtins, so the job
   # tests the fallbacks for both.  It is a best-effort target:
