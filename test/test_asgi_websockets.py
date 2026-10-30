@@ -1,6 +1,8 @@
 import socket
 import struct
+import tempfile
 import time
+from pathlib import Path
 
 import pytest
 from packaging import version
@@ -8,6 +10,7 @@ from packaging import version
 from unit.applications.lang.python import ApplicationPython
 from unit.applications.websockets import ApplicationWebsocket
 from unit.option import option
+from unit.utils import waitforfiles
 from unit import port as port_map
 
 prerequisites = {
@@ -71,6 +74,22 @@ def test_asgi_websockets_handshake():
 
     # remove "mirror" application
     client.load('websockets/subprotocol')
+
+
+def test_asgi_websockets_close_then_exception():
+    client.load('websockets/close_exception')
+
+    # A coroutine exception must not turn an already queued close frame
+    # into an RPC error that discards it.  Repeat to expose queue ordering.
+    for _ in range(3):
+        _, sock, _ = ws.upgrade()
+        try:
+            ws.frame_write(sock, ws.OP_TEXT, 'close')
+            frame = ws.message_read(sock)
+            assert frame['data'] == b'x' * (4 * 1024 * 1024), 'queued body'
+            check_close(sock, 1008, no_close=True)
+        finally:
+            sock.close()
 
 
 def test_asgi_websockets_subprotocol():
@@ -1674,8 +1693,27 @@ def test_asgi_websockets_app_queue_full(wait_for_record):
 
 
 def test_asgi_websockets_app_queue_full_timeout(wait_for_record):
-    client.load('websockets/stall')
+    # A fixed 2 s application sleep does not guarantee a full queue for
+    # 1 s: sending 20000 fragments can itself take seconds on slower CPUs.
+    # Hold the application until the timeout assertion finishes instead.
+    with tempfile.TemporaryDirectory(prefix='unit-ws-stall-') as directory:
+        Path(directory).chmod(0o777)
+        gate = str(Path(directory) / 'gate')
+        client.load(
+            'websockets/stall', environment={'UNIT_TEST_STALL_GATE': gate}
+        )
 
+        try:
+            check_app_queue_full_timeout(wait_for_record, gate)
+        finally:
+            Path(gate + '.release').touch()
+            if Path(gate + '.started').exists():
+                assert waitforfiles(
+                    gate + '.released', timeout=150
+                ), 'application released'
+
+
+def check_app_queue_full_timeout(wait_for_record, gate):
     assert 'success' in client.conf(
         {'http': {'websocket': {'read_timeout': 1, 'keepalive_interval': 0}}},
         'settings',
@@ -1683,27 +1721,28 @@ def test_asgi_websockets_app_queue_full_timeout(wait_for_record):
 
     _, sock, _ = ws.upgrade()
 
-    # The application reads nothing for 2 s, longer than the 1 s
-    # "read_timeout": the router stops waiting and fails the connection.
     ws.frame_write(sock, ws.OP_TEXT, 'stall')
-    ws.message(sock, ws.OP_BINARY, b'*' * 20000, fragmention_size=1)
-
-    assert wait_for_record(
-        r'websocket: the application read nothing for 1000 ms, closing'
-    ), 'closed'
-
-    # The router closes the connection.  A reset is also a close: the
-    # client frames the router did not read are still in its socket.  An
-    # open socket raises a timeout here.
-    sock.settimeout(5)
-
     try:
-        assert sock.recv(1) == b'', 'connection closed'
+        assert waitforfiles(gate + '.started', timeout=150), 'application stalled'
+        ws.message(sock, ws.OP_BINARY, b'*' * 20000, fragmention_size=1)
 
-    except ConnectionResetError:
-        pass
+        assert wait_for_record(
+            r'websocket: the application read nothing for 1000 ms, closing'
+        ), 'closed'
 
-    sock.close()
+        # The router closes the connection.  A reset is also a close: the
+        # client frames the router did not read are still in its socket.  An
+        # open socket raises a timeout here.
+        sock.settimeout(5)
+
+        try:
+            assert sock.recv(1) == b'', 'connection closed'
+
+        except ConnectionResetError:
+            pass
+
+    finally:
+        sock.close()
 
 
 def test_asgi_websockets_second_frame_over_buffer_limit():

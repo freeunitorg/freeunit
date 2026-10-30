@@ -13,7 +13,7 @@ prerequisites = {'modules': {'php': 'any'}}
 client = ApplicationPHP()
 
 
-def configure_compression(encoding='gzip'):
+def configure_compression(encoding='gzip', level=None):
     conf = {
         "compression": {
             "types": ["text/html*"],
@@ -23,6 +23,9 @@ def configure_compression(encoding='gzip'):
 
     if encoding == 'gzip':
         conf["compression"]["compressors"][0]["level"] = 1
+
+    if level is not None:
+        conf["compression"]["compressors"][0]["level"] = level
 
     resp = client.conf({"http": conf}, 'settings')
 
@@ -106,20 +109,21 @@ def test_php_compression_large_body():
     assert gzip.decompress(body) == b'A' * 100000, 'round-trips'
 
 
-def test_php_compression_small_body():
+@pytest.mark.parametrize('encoding', ['gzip', 'br', 'zstd'])
+def test_php_compression_small_body(encoding):
     # Issue #162: a body small enough to arrive in an ordinary port message
     # (plain memory, not a port-mmap buffer) used to go out verbatim under
     # the Content-Encoding already committed, so no client could decode it.
     # It is compressed like a shared-memory body now.
     client.load('comp_small_body')
-    configure_compression()
+    # Leave Brotli/Zstandard at their default levels on this small body.
+    configure_compression(encoding)
 
-    status, headers, body = get_gzip()
+    status, headers, body = get_gzip(encoding)
 
     assert status == 200, 'status'
-    assert headers['Content-Encoding'] == 'gzip', 'encoding advertised'
-    assert body[:2] == b'\x1f\x8b', 'advertised gzip must really be gzip'
-    assert gzip.decompress(body) == b'A' * 8, 'round-trips'
+    assert headers['Content-Encoding'] == encoding, 'encoding advertised'
+    assert decompress(encoding, body) == b'A' * 8, 'round-trips'
 
 
 RANDOM_BODY_SIZE = 9 * 1024 * 1024
@@ -196,7 +200,10 @@ def test_php_compression_large_random_body(encoding):
     the finishing one arriving last.  Check the body still round-trips.
     """
     client.load('comp_random_body')
-    configure_compression(encoding)
+    # Exercise the multi-buffer path without making the 30 s I/O timeout
+    # depend on Brotli's default quality 11 processing 9 MiB of random data.
+    # Default-level coverage uses the small-body test above.
+    configure_compression(encoding, level=1 if encoding == 'br' else None)
 
     status, headers, body = raw_get(
         f'/?n={RANDOM_BODY_SIZE}', encoding
