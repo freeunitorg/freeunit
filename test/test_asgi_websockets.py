@@ -1686,7 +1686,23 @@ def test_asgi_websockets_app_queue_full_timeout(wait_for_record):
     # The application reads nothing for 2 s, longer than the 1 s
     # "read_timeout": the router stops waiting and fails the connection.
     ws.frame_write(sock, ws.OP_TEXT, 'stall')
-    ws.message(sock, ws.OP_BINARY, b'*' * 20000, fragmention_size=1)
+
+    # One sendall for the whole fragmented message.  A write per frame can
+    # take longer than the application's 2 s stall on a slow builder; the
+    # queue then fills after the application has started reading again, and
+    # the connection read timeout can beat the queue wait timeout.
+    frames = []
+    op = ws.OP_BINARY
+
+    for i in range(20000):
+        frames.append(ws.frame_to_send(op, b'*', fin=i == 19999))
+        op = ws.OP_CONT
+
+    try:
+        sock.sendall(b''.join(frames))
+
+    except (BrokenPipeError, ConnectionResetError):
+        pass
 
     assert wait_for_record(
         r'websocket: the application read nothing for 1000 ms, closing'
