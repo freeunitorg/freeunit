@@ -40,16 +40,9 @@ def test_tls_conf_command():
 
     (_, sock) = client.get_ssl(start=True)
 
-    shared_ciphers = sock.shared_ciphers()
-
-    if not shared_ciphers:
-        pytest.skip('no shared ciphers')
-
-    protocols = list(set(c[1] for c in shared_ciphers))
-    protocol = sock.cipher()[1]
-
-    if '/' in protocol:
-        pytest.skip('Complex protocol format.')
+    # shared_ciphers() is a server-side API: on the client socket this test
+    # holds it returns None.  Ask the connection which protocol it uses.
+    protocol = sock.version()
 
     assert 'success' in client.conf(
         {
@@ -61,19 +54,17 @@ def test_tls_conf_command():
 
     sock.close()
 
-    if len(protocols) > 1:
+    try:
         (_, sock) = client.get_ssl(start=True)
 
-        cipher = sock.cipher()
-        assert cipher[1] != protocol, 'new protocol used'
-
-        shared_ciphers = sock.shared_ciphers()
-        ciphers = list(set(c for c in shared_ciphers if c[1] == cipher[1]))
-
-        sock.close()
-    else:
+    except (ssl.SSLError, ConnectionRefusedError):
         check_no_connection()
         pytest.skip('One TLS protocol available only.')
+
+    cipher = sock.cipher()
+    assert cipher[1] != protocol, 'new protocol used'
+
+    sock.close()
 
     # Set two conf_commands (disable protocol and cipher).
 
@@ -88,17 +79,18 @@ def test_tls_conf_command():
         'listeners/*:8080/tls',
     ), 'cipher disabled'
 
-    if len(ciphers) > 1:
+    try:
         (_, sock) = client.get_ssl(start=True)
 
+    except (ssl.SSLError, ConnectionRefusedError):
+        check_no_connection()
+
+    else:
         cipher_new = sock.cipher()
         assert cipher_new[1] == cipher[1], 'previous protocol used'
         assert cipher_new[0] != cipher[0], 'new cipher used'
 
         sock.close()
-
-    else:
-        check_no_connection()
 
 
 def test_tls_conf_command_invalid(skip_alert):
