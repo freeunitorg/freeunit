@@ -50,3 +50,13 @@ def zstd_stream_decoder():
     )
 
     return zstandard.ZstdDecompressor().decompressobj().decompress
+
+
+def brotli_decompress(data):
+    """Decodes one complete brotli stream, or skips the test."""
+
+    brotli = pytest.importorskip(
+        'brotli', reason='python brotli bindings not installed'
+    )
+
+    return brotli.decompress(data)

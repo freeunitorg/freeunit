@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from unit.applications.proto import ApplicationProto
-from unit.compression import zstd_decompress
+from unit.compression import brotli_decompress, zstd_decompress
 
 client = ApplicationProto()
 
@@ -1172,12 +1172,13 @@ def _set_compressor(coding):
     pytest.fail(f'could not configure {coding} compression: {resp}')
 
 
-@pytest.mark.parametrize('coding', ['gzip', 'zstd'])
+@pytest.mark.parametrize('coding', ['gzip', 'zstd', 'br'])
 def test_static_compression_head_length_many_chunks(temp_dir, coding):
     # More than one NXT_HTTP_STATIC_BUF_SIZE chunk (128 KiB): the HEAD sizing
     # pass has to flush at the same chunk boundaries as GET, and the coded
-    # body of each compressor has to decode from the temp file.  zstd flushes
-    # every piece too, so its frame is built from several flush blocks here.
+    # body of each compressor has to decode from the temp file.  zstd and br
+    # flush every piece too, so their frames are built from several flush
+    # blocks here.
     path = f'{temp_dir}/assets/huge.css'
     Path(path).write_bytes(
         b''.join(b'.c%d{color:#%06x}\n' % (i, i * 7919 % 0xFFFFFF)
@@ -1185,7 +1186,12 @@ def test_static_compression_head_length_many_chunks(temp_dir, coding):
     )
     _age(path)
 
-    decode = gzip.decompress if coding == 'gzip' else zstd_decompress
+    decoders = {
+        'gzip': gzip.decompress,
+        'zstd': zstd_decompress,
+        'br': brotli_decompress,
+    }
+    decode = decoders[coding]
     _set_compressor(coding)
 
     get_status, get_headers, body = _raw_get(
