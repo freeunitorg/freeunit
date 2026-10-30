@@ -102,7 +102,9 @@ nxt_js_conf_new(nxt_mp_t *mp, nxt_bool_t test)
 void
 nxt_js_conf_release(nxt_js_conf_t *jcf)
 {
-    njs_vm_destroy(jcf->vm);
+    if (jcf->vm != NULL) {
+        njs_vm_destroy(jcf->vm);
+    }
 }
 
 
