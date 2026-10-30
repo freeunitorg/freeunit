@@ -298,15 +298,6 @@ nxt_conn_timer(nxt_event_engine_t *engine, nxt_conn_t *c,
 }
 
 
-void
-nxt_conn_work_queue_set(nxt_conn_t *c, nxt_work_queue_t *wq)
-{
-    c->read_work_queue = wq;
-    c->write_work_queue = wq;
-    c->read_timer.work_queue = wq;
-    c->write_timer.work_queue = wq;
-}
-
 
 nxt_sockaddr_t *
 nxt_conn_local_addr(nxt_task_t *task, nxt_conn_t *c)

@@ -210,8 +210,6 @@ struct nxt_buf_s {
     (nxt_buf_is_file(b) ? (b)->file_end - (b)->file_pos:                      \
                           nxt_buf_mem_used_size(&(b)->mem))
 
-
-NXT_EXPORT void nxt_buf_mem_init(nxt_buf_t *b, void *start, size_t size);
 NXT_EXPORT nxt_buf_t *nxt_buf_mem_alloc(nxt_mp_t *mp, size_t size,
     nxt_uint_t flags);
 NXT_EXPORT nxt_buf_t *nxt_buf_mem_ts_alloc(nxt_task_t *task, nxt_mp_t *mp,

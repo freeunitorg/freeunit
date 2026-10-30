@@ -106,8 +106,6 @@ typedef nxt_int_t (*nxt_module_init_t)(nxt_thread_t *thr, nxt_runtime_t *rt);
 nxt_int_t nxt_runtime_create(nxt_task_t *task);
 void nxt_runtime_quit(nxt_task_t *task, nxt_uint_t status);
 
-void nxt_runtime_event_engine_free(nxt_runtime_t *rt);
-
 nxt_int_t nxt_runtime_thread_pool_create(nxt_thread_t *thr, nxt_runtime_t *rt,
     nxt_uint_t max_threads, nxt_nsec_t timeout);
 
@@ -146,16 +144,12 @@ nxt_int_t nxt_runtime_controller_socket(nxt_task_t *task, nxt_runtime_t *rt);
 nxt_bool_t nxt_controller_peer_allowed(nxt_uid_t uid, nxt_gid_t gid,
     const nxt_gid_t *groups, nxt_uint_t ngroups, nxt_uid_t euid,
     nxt_uid_t ctl_uid, nxt_gid_t ctl_gid);
-
-nxt_str_t *nxt_current_directory(nxt_mp_t *mp);
-
 nxt_listen_socket_t *nxt_runtime_listen_socket_add(nxt_runtime_t *rt,
     nxt_sockaddr_t *sa);
 nxt_int_t nxt_runtime_listen_sockets_create(nxt_task_t *task,
     nxt_runtime_t *rt);
 nxt_int_t nxt_runtime_listen_sockets_enable(nxt_task_t *task,
     nxt_runtime_t *rt);
-nxt_file_t *nxt_runtime_log_file_add(nxt_runtime_t *rt, nxt_str_t *name);
 
 /* STUB */
 void nxt_cdecl nxt_log_time_handler(nxt_uint_t level, nxt_log_t *log,
