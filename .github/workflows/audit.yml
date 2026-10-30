@@ -96,7 +96,7 @@ jobs:
       # Prebuilt binary instead of `cargo install cargo-audit`, which would
       # compile it from source on every run.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-audit
 
@@ -130,7 +130,7 @@ jobs:
           python3 -m pytest pkg/contrib/test_check_lock_audit.py
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-audit
 
