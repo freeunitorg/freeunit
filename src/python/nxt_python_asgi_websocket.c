@@ -617,10 +617,11 @@ too_big:
 
     status_code = htons(NXT_WEBSOCKET_CR_MESSAGE_TOO_BIG);
 
-    (void) nxt_unit_websocket_send(ws->req, NXT_WEBSOCKET_OP_CLOSE,
-                                   1, &status_code, 2);
-
-    ws->state = NXT_WS_CLOSED;
+    if (nxt_unit_websocket_send(ws->req, NXT_WEBSOCKET_OP_CLOSE,
+                                1, &status_code, 2) == NXT_UNIT_OK)
+    {
+        ws->state = NXT_WS_CLOSED;
+    }
 
     if (ws->receive_future == NULL) {
         ws->receive_exc_str = nxt_py_message_too_big_str;
@@ -1118,6 +1119,15 @@ nxt_py_asgi_websocket_done(PyObject *self, PyObject *future)
 
         rc = nxt_unit_websocket_send(ws->req, NXT_WEBSOCKET_OP_CLOSE,
                                      1, &status_code, 2);
+    }
+
+    if (ws->state == NXT_WS_CLOSED) {
+        /*
+         * A close frame is already on the wire.  The protocol exchange is
+         * over; an unhandled Python exception must not turn the request into
+         * an error, because the router's error path discards that frame.
+         */
+        rc = NXT_UNIT_OK;
     }
 
     while (!nxt_queue_is_empty(&ws->pending_frames)) {
