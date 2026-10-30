@@ -348,6 +348,17 @@ jobs:
       - name: Run the otel crate unit tests
         run: cargo test --release --locked --manifest-path src/otel/Cargo.toml
 
+      # The c-tests job configures without --njs, so this is the only leg
+      # that runs the C suite against a real njs.  The invalid shm fd path
+      # in nxt_router_conf_overlap_test releases a temporary configuration
+      # before nxt_js_compile() creates the VM.  Without the guard in
+      # nxt_js.c, njs_vm_destroy(NULL) segfaults there.
+      - name: Build C tests
+        run: make -j$(nproc) tests
+
+      - name: Run C tests with njs
+        run: sudo ./build/tests
+
       # The default target is `all: unitd manpage`, so --tests above only
       # makes this target available -- it does not build it.  Without it
       # build/unit_app_test does not exist and test_app_lifecycle.py's
