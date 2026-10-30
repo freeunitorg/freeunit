@@ -1666,6 +1666,9 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_access_log_members[] = {
         .name       = nxt_string("if"),
         .type       = NXT_CONF_VLDT_STRING,
         .validator  = nxt_conf_vldt_if,
+    }, {
+        .name       = nxt_string("log_credentials"),
+        .type       = NXT_CONF_VLDT_BOOLEAN,
     },
 
     NXT_CONF_VLDT_END
