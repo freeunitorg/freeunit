@@ -415,6 +415,7 @@ build "$head" "$work/head" "$work/head.list"
 
 fail=
 skip=
+wire=
 
 symbols "$work/base" > "$work/base.sym"
 symbols "$work/head" > "$work/head.sym"
@@ -429,7 +430,9 @@ done 3< "$work/base.sym"
 while read -r kind name <&3; do
     layout "$work/base" "$kind" "$name" > "$work/old"
     layout "$work/head" "$kind" "$name" > "$work/new"
+    before=$fail
     verdict "$kind" "$name" "$work/old" "$work/new"
+    [ "$fail" = "$before" ] || [ "$kind" = local ] || wire=1
 done 3< "$work/head.list"
 
 while read -r kind name <&3; do
@@ -451,6 +454,13 @@ fi
 
 if [ -n "$fail" ]; then
     echo "::error::The layout check failed:$fail (see $0)"
+
+    # A "local" struct is in the memory of one process: no protocol.
+    if [ -n "$wire" ]; then
+        echo "A shm, const or enum entry changed: the change needs a new" \
+             "NXT_UNIT_PROTOCOL_VERSION in src/nxt_unit.h."
+    fi
+
     exit 1
 fi
 

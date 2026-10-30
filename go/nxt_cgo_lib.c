@@ -24,6 +24,8 @@ nxt_cgo_run(uintptr_t handler)
 
     memset(&init, 0, sizeof(init));
 
+    init.size = sizeof(init);
+
     init.callbacks.request_handler = nxt_go_request_handler;
     init.callbacks.add_port        = nxt_go_add_port;
     init.callbacks.remove_port     = nxt_go_remove_port;

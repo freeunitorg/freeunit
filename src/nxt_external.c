@@ -118,14 +118,17 @@ nxt_external_start(nxt_task_t *task, nxt_process_data_t *data)
 
     end = buf + sizeof(buf);
 
+    /* nxt_unit_read_env() reads this; docs/libunit-abi.md has the format. */
+
     p = nxt_sprintf(buf, end,
-                    "%s;%uD;"
+                    "%s/%d;%uD;"
                     "%PI,%ud,%d;"
                     "%PI,%ud,%d;"
                     "%PI,%ud,%d,%d;"
                     "%d,%d;"
                     "%d,%z,%uD,%Z",
-                    NXT_VERSION, my_port->process->stream,
+                    NXT_VERSION, NXT_UNIT_PROTOCOL_VERSION,
+                    my_port->process->stream,
                     proto_port->pid, proto_port->id, proto_port->pair[1],
                     router_port->pid, router_port->id, router_port->pair[1],
                     my_port->pid, my_port->id, my_port->pair[0],
