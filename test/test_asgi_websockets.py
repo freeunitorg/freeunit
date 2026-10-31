@@ -73,6 +73,25 @@ def test_asgi_websockets_handshake():
     client.load('websockets/subprotocol')
 
 
+def test_asgi_websockets_close_then_exception():
+    client.load('websockets/close_exception')
+
+    # A coroutine exception must not turn an already queued close frame
+    # into an RPC error that discards it.  The 4 MiB body is more than the
+    # kernel socket buffers take at once, so the close frame is still in
+    # the router's write queue when the exception arrives.  Repeat to
+    # expose queue ordering.
+    for _ in range(3):
+        _, sock, _ = ws.upgrade()
+        try:
+            ws.frame_write(sock, ws.OP_TEXT, 'close')
+            frame = ws.message_read(sock)
+            assert frame['data'] == b'x' * (4 * 1024 * 1024), 'queued body'
+            check_close(sock, 1008, no_close=True)
+        finally:
+            sock.close()
+
+
 def test_asgi_websockets_subprotocol():
     client.load('websockets/subprotocol')
 
