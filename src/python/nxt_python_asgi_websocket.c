@@ -38,6 +38,7 @@ typedef struct {
     PyObject                 *receive_future;
     PyObject                 *receive_exc_str;
     int                      state;
+    int                      close_rc;
     nxt_queue_t              pending_frames;
     uint64_t                 pending_payload_len;
     int                      pending_fins;
@@ -131,6 +132,7 @@ nxt_py_asgi_websocket_create(nxt_unit_request_info_t *req)
         ws->receive_future = NULL;
         ws->receive_exc_str = NULL;
         ws->state = NXT_WS_INIT;
+        ws->close_rc = NXT_UNIT_OK;
         nxt_queue_init(&ws->pending_frames);
         ws->pending_payload_len = 0;
         ws->pending_fins = 0;
@@ -617,8 +619,8 @@ too_big:
 
     status_code = htons(NXT_WEBSOCKET_CR_MESSAGE_TOO_BIG);
 
-    (void) nxt_unit_websocket_send(ws->req, NXT_WEBSOCKET_OP_CLOSE,
-                                   1, &status_code, 2);
+    ws->close_rc = nxt_unit_websocket_send(ws->req, NXT_WEBSOCKET_OP_CLOSE,
+                                           1, &status_code, 2);
 
     ws->state = NXT_WS_CLOSED;
 
@@ -1118,6 +1120,16 @@ nxt_py_asgi_websocket_done(PyObject *self, PyObject *future)
 
         rc = nxt_unit_websocket_send(ws->req, NXT_WEBSOCKET_OP_CLOSE,
                                      1, &status_code, 2);
+
+    } else if (ws->state == NXT_WS_CLOSED) {
+        /*
+         * The WebSocket is already closed: a close frame is queued, or
+         * the handshake was refused with 403.  An exception raised after
+         * that (including "message too big") must not send RPC_ERROR:
+         * the router would discard the queued output before writing it.
+         * Report an actual failure to send the close frame, however.
+         */
+        rc = ws->close_rc;
     }
 
     while (!nxt_queue_is_empty(&ws->pending_frames)) {
