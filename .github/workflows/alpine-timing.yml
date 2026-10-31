@@ -1,0 +1,68 @@
+name: "Alpine timing and word size"
+
+# The tests that depend on timing or on the word size, on Alpine (musl), on
+# x86_64, 32-bit x86 and 32-bit ARM, once normally and once on one CPU.  The 1.37.1
+# regressions passed the x86 CI and failed on downstream Alpine builders in
+# exactly this shape.  About three minutes a job.
+#
+# The nightly run adds native arm64 and an emulated build with the C tests on
+# ppc64le and riscv64.  The emulated legs run no pytest: under qemu-user the
+# process titles ("unit: router") are not visible to ps, and the harness
+# finds the router and controller by title.
+
+on:
+  pull_request:
+  push:
+    branches: [ master ]
+  schedule:
+    - cron: '41 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+
+  timing:
+    name: timing (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '[{"platform":"linux/amd64","runner":"ubuntu-24.04"},{"platform":"linux/386","runner":"ubuntu-24.04"},{"platform":"linux/arm/v7","runner":"ubuntu-24.04-arm"},{"platform":"linux/arm64","runner":"ubuntu-24.04-arm"}]' || '[{"platform":"linux/amd64","runner":"ubuntu-24.04"},{"platform":"linux/386","runner":"ubuntu-24.04"},{"platform":"linux/arm/v7","runner":"ubuntu-24.04-arm"}]') }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build and test in Alpine
+        run: |
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "$GITHUB_WORKSPACE:/src" -w /src alpine:3.24 \
+            sh .github/scripts/alpine-timing.sh
+
+  emulated:
+    # No matrix value in the name: a skipped job shows the expression as is.
+    name: emulated C tests
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ linux/ppc64le, linux/riscv64 ]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-qemu-action@v3
+
+      - name: Build and run the C tests in Alpine
+        run: |
+          docker run --rm --platform ${{ matrix.platform }} -e MODE=c \
+            -v "$GITHUB_WORKSPACE:/src" -w /src alpine:3.24 \
+            sh .github/scripts/alpine-timing.sh
