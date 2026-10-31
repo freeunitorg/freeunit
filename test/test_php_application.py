@@ -214,6 +214,165 @@ def test_php_application_query_string_rewrite():
     assert resp['headers']['Unit-Rewritten-Path'] == '/new'
 
 
+@pytest.mark.parametrize(
+    'url, path, query',
+    [
+        ('/', '/', ''),
+        ('/?', '/', ''),
+        ('/a%20b?x=1', '/a b', 'x=1'),
+        ('/%6Eew', '/new', ''),
+        ('/a/b/../c', '/a/c', ''),
+        ('/a/%2e%2e/c', '/c', ''),
+        ('//a//b/./c', '/a/b/c', ''),
+        ('/a%2Fb', '/a/b', ''),
+        ('/a%3Fb%23c?x=%2F', '/a?b#c', 'x=%2F'),
+        ('/%E4%B8%AD', '/\u4e2d', ''),
+    ],
+)
+def test_php_application_rewritten_path_no_rewrite(url, path, query):
+    client.load('rewritten_path')
+    assert 'success' in client.conf(
+        '"index.php"', 'applications/rewritten_path/script',
+    )
+
+    resp = client.getjson(url=url)
+    assert resp['status'] == 200
+    data = resp['body']
+    assert data['present'] is True
+    assert data['path'] == path
+    assert data['request_uri'] == url
+    assert data['query'] == query
+    if data['filter_available']:
+        assert data['filter_path'] == path
+        assert data['filter_request_uri'] == url
+
+
+@pytest.mark.parametrize(
+    'rewrite, url, path',
+    [
+        ('/new', '/old?x=1', '/new'),
+        ('/new?discarded', '/old?x=1', '/new'),
+        ('/a%20b//c/../d', '/old?x=1', '/a b/d'),
+        ('/new$uri', '/old?x=1', '/new/old'),
+        ('/new$uri', '/a%20b?x=1', '/new/a b'),
+        ('/old', '/old?x=1', '/old'),
+    ],
+)
+def test_php_application_rewritten_path_rewrite(rewrite, url, path):
+    client.load('rewritten_path')
+    assert 'success' in client.conf(
+        '"index.php"', 'applications/rewritten_path/script',
+    )
+    assert 'success' in client.conf(
+        [{'action': {
+            'rewrite': rewrite,
+            'pass': 'applications/rewritten_path',
+        }}],
+        'routes',
+    )
+    assert 'success' in client.conf('"routes"', 'listeners/*:8080/pass')
+
+    resp = client.getjson(url=url)
+    assert resp['status'] == 200
+    data = resp['body']
+    assert data['present'] is True
+    assert data['path'] == path
+    assert data['request_uri'] == url
+    assert data['query'] == 'x=1'
+    if data['filter_available']:
+        assert data['filter_path'] == path
+        assert data['filter_request_uri'] == url
+
+
+def test_php_application_rewritten_path_multiple_rewrites():
+    client.load('rewritten_path')
+    assert 'success' in client.conf(
+        '"index.php"', 'applications/rewritten_path/script',
+    )
+    assert 'success' in client.conf(
+        {
+            'first': [{'action': {
+                'rewrite': '/mid', 'pass': 'routes/second',
+            }}],
+            'second': [{'action': {
+                'rewrite': '/final$uri',
+                'pass': 'applications/rewritten_path',
+            }}],
+        },
+        'routes',
+    )
+    assert 'success' in client.conf('"routes/first"', 'listeners/*:8080/pass')
+
+    resp = client.getjson(url='/old?x=1')
+    assert resp['status'] == 200
+    assert resp['body']['path'] == '/final/mid'
+    assert resp['body']['request_uri'] == '/old?x=1'
+    assert resp['body']['query'] == 'x=1'
+
+
+def test_php_application_rewritten_path_path_info():
+    client.load('rewritten_path')
+
+    resp = client.getjson(url='/index.php/a%20b?x=1')
+    assert resp['status'] == 200
+    assert resp['body']['path'] == '/index.php/a b'
+    assert resp['body']['path_info'] == '/a b'
+    assert resp['body']['php_self'] == '/index.php/a b'
+    assert resp['body']['request_uri'] == '/index.php/a%20b?x=1'
+
+
+def test_php_application_rewritten_path_filter_input():
+    client.load('rewritten_path')
+
+    resp = client.getjson(url='/index.php/a%20b?x=1')
+    assert resp['status'] == 200
+    data = resp['body']
+    if not data['filter_available']:
+        pytest.skip('filter extension is not loaded')
+
+    assert data['present'] is True
+    assert data['filter_path'] == '/index.php/a b'
+    assert data['filter_request_uri'] == '/index.php/a%20b?x=1'
+
+
+def test_php_application_rewritten_path_worker_reuse():
+    client.load('rewritten_path', processes=1)
+    assert 'success' in client.conf(
+        '"index.php"', 'applications/rewritten_path/script',
+    )
+    assert 'success' in client.conf(
+        [
+            {
+                'match': {'uri': '/old'},
+                'action': {
+                    'rewrite': '/new', 'pass': 'applications/rewritten_path',
+                },
+            },
+            {'action': {'pass': 'applications/rewritten_path'}},
+        ],
+        'routes',
+    )
+    assert 'success' in client.conf('"routes"', 'listeners/*:8080/pass')
+
+    for url, path in [('/old', '/new'), ('/a%20b', '/a b'), ('/old', '/new')]:
+        resp = client.getjson(
+            url=url,
+            headers={
+                'Host': 'localhost',
+                'Connection': 'close',
+                'Unit-Rewritten-Path': '/spoofed',
+            },
+        )
+        assert resp['status'] == 200
+        data = resp['body']
+        assert data['present'] is True
+        assert data['path'] == path
+        assert data['request_uri'] == url
+        assert data['http_path'] == '/spoofed'
+        if data['filter_available']:
+            assert data['filter_path'] == path
+
+
 def test_php_application_fastcgi_finish_request(findall, unit_pid):
     client.load('fastcgi_finish_request')
 

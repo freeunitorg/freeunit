@@ -1,9 +1,11 @@
 
 Changes with FreeUnit 1.37.1                                     04 Oct 2026
 
-    *) Feature: PHP exposes the current path without query arguments in
-       $_SERVER['UNIT_REWRITTEN_PATH'], including after a route rewrite.
-       REQUEST_URI remains the original URI (nginx/unit#1615).
+    *) Feature: PHP exposes the decoded, normalized request path without
+       the query in $_SERVER['UNIT_REWRITTEN_PATH'], even without a rewrite.
+       After a route rewrite it is the rewritten path.  REQUEST_URI keeps
+       the original request target.  See
+       https://github.com/nginx/unit/issues/1615.
 
     *) Security: update Wasmtime, wasmtime-wasi and wasmtime-wasi-http
        to 48.0.7 for RUSTSEC-2026-0350 through RUSTSEC-2026-0359,

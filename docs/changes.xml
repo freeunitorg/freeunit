@@ -12,9 +12,11 @@
 
 <change type="feature">
 <para>
-PHP exposes the current path without query arguments in
-$_SERVER['UNIT_REWRITTEN_PATH'], including after a route rewrite.
-REQUEST_URI remains the original URI (nginx/unit#1615).
+PHP exposes the decoded, normalized request path without the query in
+$_SERVER['UNIT_REWRITTEN_PATH'], even without a rewrite.
+After a route rewrite it is the rewritten path.
+REQUEST_URI keeps the original request target.
+See https://github.com/nginx/unit/issues/1615.
 </para>
 </change>
 
