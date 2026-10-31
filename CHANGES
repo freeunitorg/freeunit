@@ -1,4 +1,7 @@
 
+Changes with FreeUnit 1.37.2                                     31 Oct 2026
+
+
 Changes with FreeUnit 1.37.1                                     30 Oct 2026
 
     *) Security: update Wasmtime, wasmtime-wasi and wasmtime-wasi-http to
