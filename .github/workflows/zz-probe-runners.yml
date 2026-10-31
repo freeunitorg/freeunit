@@ -1,0 +1,43 @@
+# TEMPORARY: lists which hosted runner labels this repo can use and what
+# hardware they give.  Not for merge.
+name: "zz probe runners"
+
+on:
+  push:
+    branches: [ claude/freeunit-c-vulnerabilities-perf-mvssit ]
+    paths: [ '.github/workflows/zz-probe-runners.yml' ]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ ubuntu-22.04, ubuntu-24.04, ubuntu-26.04,
+                  ubuntu-22.04-arm, ubuntu-24.04-arm, ubuntu-26.04-arm,
+                  macos-15, macos-15-intel, macos-26 ]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Hardware
+        shell: bash
+        run: |
+          {
+            echo "### ${{ matrix.runner }}"
+            echo '```'
+            uname -srm
+            if command -v lscpu > /dev/null; then
+              lscpu | grep -E '^(Model name|CPU\(s\)|Thread|Core|Socket|Flags)' | cut -c1-200
+              free -g | head -2
+              nproc
+            else
+              sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+            fi
+            df -h / | tail -1
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Single-thread speed (openssl speed sha256, 3 s)
+        shell: bash
+        run: openssl speed -seconds 3 sha256 2>/dev/null | tail -1 | tee -a "$GITHUB_STEP_SUMMARY"
