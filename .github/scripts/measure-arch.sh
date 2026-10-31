@@ -20,7 +20,7 @@ stage() {
 
 if command -v apk > /dev/null; then
     stage deps sh -c 'apk add -q gcc make musl-dev openssl-dev pcre2-dev \
-        linux-headers python3-dev py3-pytest py3-openssl curl'
+        linux-headers python3-dev py3-pytest py3-openssl curl procps'
 else
     stage deps sh -c 'apt-get -qq update && apt-get -qq -y install build-essential \
         libssl-dev libpcre2-dev python3-dev python3-pytest python3-openssl curl'
@@ -31,7 +31,7 @@ stage configure ./configure --openssl --tests
 stage make make -j"$nproc"
 stage make-tests make -j"$nproc" tests
 stage c-tests ./build/tests
-stage configure-python ./configure python
+stage configure-python ./configure python --config=python3-config
 stage make-python make -j"$nproc"
 stage pytest-ws python3 -m pytest -q -p no:cacheprovider \
     test/test_asgi_websockets.py test/test_python_shm_limit.py
