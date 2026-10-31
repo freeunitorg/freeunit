@@ -1,0 +1,65 @@
+# TEMPORARY: measures runner speed for the multi-arch nightly design.
+# Not for merge.
+name: "zz measure arch"
+
+on:
+  push:
+    branches: [ claude/freeunit-c-vulnerabilities-perf-mvssit ]
+    paths: [ '.github/workflows/zz-measure-arch.yml', '.github/scripts/measure-arch.sh' ]
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ ubuntu-24.04, ubuntu-24.04-arm, ubuntu-26.04 ]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo .github/scripts/measure-arch.sh native-${{ matrix.runner }}
+      - if: always()
+        run: cat measure-*.tsv >> "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: measure-native-${{ matrix.runner }}
+          path: |
+            measure-*.tsv
+            log-*.txt
+
+  alpine:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { host: ubuntu-24.04,     platform: linux/amd64 }
+          - { host: ubuntu-24.04-arm, platform: linux/arm64 }
+          - { host: ubuntu-24.04,     platform: linux/386 }
+          - { host: ubuntu-24.04-arm, platform: linux/arm/v7 }
+          - { host: ubuntu-24.04,     platform: linux/riscv64 }
+          - { host: ubuntu-24.04,     platform: linux/ppc64le }
+          - { host: ubuntu-24.04,     platform: linux/s390x }
+    runs-on: ${{ matrix.host }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v3
+      - name: Measure in alpine:edge ${{ matrix.platform }}
+        run: |
+          label=alpine-$(echo '${{ matrix.platform }}' | tr '/' '-')-on-${{ matrix.host }}
+          docker run --rm --privileged --platform '${{ matrix.platform }}' \
+            -v "$PWD:/src" -w /src alpine:edge \
+            sh -c "apk add -q util-linux && .github/scripts/measure-arch.sh $label"
+      - if: always()
+        run: cat measure-*.tsv >> "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: measure-${{ strategy.job-index }}
+          path: |
+            measure-*.tsv
+            log-*.txt
