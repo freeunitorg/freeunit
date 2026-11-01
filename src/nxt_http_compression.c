@@ -132,6 +132,9 @@ struct nxt_http_comp_conf_s {
     nxt_http_route_rule_t       *mime_types_rule;
     nxt_http_comp_compressor_t  *enabled;
     nxt_uint_t                  nr_enabled;
+
+    /* "hold_timeout", milliseconds; 0 means an application is not held. */
+    nxt_msec_t                  hold_timeout;
 };
 
 static const nxt_conf_map_t  nxt_http_comp_compressors_opts_map[] = {
@@ -887,6 +890,57 @@ nxt_http_comp_resp_length(const nxt_http_request_t *r)
     }
 
     return nxt_off_t_parse(p, length);
+}
+
+
+/*
+ * How many body bytes the router may hold back before it sends the header of
+ * an application response, or 0 when it must not hold any.
+ *
+ * "min_length" applies only to a known length, and an application that
+ * writes its body in parts sends no length: libunit sends each write as its
+ * own message, and the router learns the end only from the last one.  So a
+ * short streamed body was always coded, header and all, before its size was
+ * known.  With "hold_timeout" set, the router keeps such a body until it
+ * reaches the "min_length" of the selected coding, ends, or the timeout
+ * fires, and then decides with what it has.
+ *
+ * Call it after nxt_http_comp_check_acceptable(): it asks the coding that
+ * negotiation selected, before nxt_http_comp_apply_compression() commits to
+ * it.  A response that needs no compressor (none selected, identity, a
+ * Content-Encoding of its own, a type the "types" rule refuses) or has a
+ * length is never held: there is nothing to wait for.
+ */
+
+nxt_off_t
+nxt_http_comp_hold_length(nxt_http_request_t *r)
+{
+    nxt_off_t             min_len;
+    nxt_http_comp_ctx_t   *ctx = r->comp_ctx;
+    nxt_http_comp_conf_t  *conf = nxt_http_comp_request_conf(r);
+
+    if (conf == NULL || conf->hold_timeout == 0 || ctx == NULL
+        || ctx->sel_idx <= NXT_HTTP_COMP_SCHEME_IDENTITY)
+    {
+        return 0;
+    }
+
+    if (nxt_http_comp_resp_length(r) != -1) {
+        return 0;
+    }
+
+    min_len = conf->enabled[ctx->sel_idx].opts.min_len;
+
+    return (min_len > 0) ? min_len : 0;
+}
+
+
+nxt_msec_t
+nxt_http_comp_hold_timeout(nxt_http_request_t *r)
+{
+    nxt_http_comp_conf_t  *conf = nxt_http_comp_request_conf(r);
+
+    return (conf != NULL) ? conf->hold_timeout : 0;
 }
 
 
@@ -1874,8 +1928,12 @@ nxt_http_comp_compression_init(nxt_task_t *task, nxt_router_conf_t *rtcf,
     nxt_conf_value_t      *comps, *mimes;
     nxt_http_comp_conf_t  *conf;
 
+    double                num;
+    nxt_conf_value_t      *hold;
+
     static const nxt_str_t  comps_str = nxt_string("compressors");
     static const nxt_str_t  mimes_str = nxt_string("types");
+    static const nxt_str_t  hold_str = nxt_string("hold_timeout");
 
     conf = nxt_mp_zalloc(rtcf->mem_pool, sizeof(nxt_http_comp_conf_t));
     if (nxt_slow_path(conf == NULL)) {
@@ -1889,6 +1947,20 @@ nxt_http_comp_compression_init(nxt_task_t *task, nxt_router_conf_t *rtcf,
                                                          rtcf->mem_pool, mimes);
         if (nxt_slow_path(conf->mime_types_rule == NULL)) {
             return NXT_ERROR;
+        }
+    }
+
+    /*
+     * The control API takes an integer from 0 to NXT_INT32_T_MAX.  A stored
+     * configuration can still hold any number, so it is tested here again:
+     * out of range, the conversion is undefined, and nothing is held.
+     */
+    hold = nxt_conf_get_object_member(comp_conf, &hold_str, NULL);
+    if (hold != NULL) {
+        num = nxt_conf_get_number(hold);
+
+        if (num > 0 && num <= NXT_INT32_T_MAX) {
+            conf->hold_timeout = num;
         }
     }
 

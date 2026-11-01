@@ -6433,17 +6433,526 @@ nxt_router_test_response_header_parse(nxt_task_t *task,
 #endif
 
 
+/*
+ * The hold of an application response ("hold_timeout" in
+ * "settings/http/compression").
+ *
+ * libunit sends each write of an application as a message of its own, and
+ * the header fields go with the first one.  A body that is written in parts
+ * has no Content-Length, so the router learns its size only from the last
+ * message, and "min_length" never applies: a 200-byte body written in five
+ * parts was coded, with the coding's own overhead, before anything knew it
+ * was 200 bytes.
+ *
+ * With a hold, the router does not send the header of such a response at
+ * once.  It copies the body into router memory as it arrives, and decides
+ * at the first of: the body reaches "min_length" of the coding that
+ * negotiation selected, the last message arrives (the length is then known
+ * and negotiated as such), or the hold timer fires.  The bytes are copied,
+ * not kept: each message is shared memory the application owns, and pinning
+ * it for the hold would take chunks out of the application's pool.
+ *
+ * The hold is r->comp_hold, from r->mem_pool.  Its timer is its own:
+ * r->timer is the application deadline and is re-armed on each message.  An
+ * armed hold timer keeps a reference to r->mem_pool, because a pending timer
+ * must not be freed with the pool; the reference is dropped when the timer
+ * fires, or by nxt_router_comp_hold_cancel().
+ */
+
+struct nxt_router_comp_hold_s {
+    nxt_timer_t         timer;
+    nxt_http_request_t  *r;
+
+    /* The body so far: nxt_buf_mem_alloc() from r->mem_pool, no reference. */
+    nxt_buf_t           *buf;
+
+    nxt_off_t           min_len;
+};
+
+
+/*
+ * The fields of an application response point into the buffer of its first
+ * message, which is the application's shared memory.  A held response gives
+ * that buffer back before the header is sent, so the fields are copied into
+ * the request pool first.  Every field is copied, skipped ones too: the
+ * Content-Encoding test in nxt_http_comp_check_acceptable() reads them all.
+ * The NUL after each name and value keeps what libunit provides, and what
+ * nxt_strcasecmp() in that test relies on.
+ */
+
+static nxt_int_t
+nxt_router_response_fields_copy(nxt_http_request_t *r)
+{
+    u_char            *p;
+    size_t            size;
+    nxt_http_field_t  *f;
+
+    size = 0;
+
+    nxt_http_fields_each(f, r->resp.inline_fields, r->resp.num_inline_fields,
+                         r->resp.fields)
+    {
+        size += f->name_length + f->value_length + 2;
+    } nxt_http_fields_loop;
+
+    if (size == 0) {
+        return NXT_OK;
+    }
+
+    p = nxt_mp_nget(r->mem_pool, size);
+    if (nxt_slow_path(p == NULL)) {
+        return NXT_ERROR;
+    }
+
+    nxt_http_fields_each(f, r->resp.inline_fields, r->resp.num_inline_fields,
+                         r->resp.fields)
+    {
+        nxt_memcpy(p, f->name, f->name_length);
+        p[f->name_length] = '\0';
+        f->name = p;
+        p += f->name_length + 1;
+
+        nxt_memcpy(p, f->value, f->value_length);
+        p[f->value_length] = '\0';
+        f->value = p;
+        p += f->value_length + 1;
+    } nxt_http_fields_loop;
+
+    return NXT_OK;
+}
+
+
+/*
+ * Text/event-stream is a stream of events that a client must see as they
+ * are written; holding one back defeats it.  Parameters may follow the type.
+ */
+
+static nxt_bool_t
+nxt_router_response_is_event_stream(nxt_http_request_t *r)
+{
+    size_t            length;
+    u_char            *p;
+    nxt_http_field_t  *f;
+
+    static const nxt_str_t  type = nxt_string("text/event-stream");
+
+    f = r->resp.content_type;
+
+    if (f == NULL || f->skip) {
+        return 0;
+    }
+
+    p = f->value;
+    length = f->value_length;
+
+    while (length > 0 && (*p == ' ' || *p == '\t')) {
+        p++;
+        length--;
+    }
+
+    if (length < type.length
+        || nxt_strncasecmp(p, type.start, type.length) != 0)
+    {
+        return 0;
+    }
+
+    return length == type.length || p[type.length] == ';'
+           || p[type.length] == ' ' || p[type.length] == '\t';
+}
+
+
+/*
+ * How many bytes a response may be held for, or 0 when it is not held.
+ * A 1xx (a 101 upgrade too), 204, 304 or HEAD response has no body to wait
+ * for, and an event stream must not wait.  The rest is the compression
+ * module's: a selected coding with a "min_length", and no known length.
+ */
+
+static nxt_off_t
+nxt_router_comp_hold_length(nxt_http_request_t *r)
+{
+    if (r->status < NXT_HTTP_OK
+        || nxt_http_request_is_bodyless_final(r, r->status)
+        || nxt_router_response_is_event_stream(r))
+    {
+        return 0;
+    }
+
+    return nxt_http_comp_hold_length(r);
+}
+
+
+static void
+nxt_router_comp_hold_release(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_router_comp_hold_t  *hold;
+
+    hold = nxt_timer_data(obj, nxt_router_comp_hold_t, timer);
+
+    nxt_mp_release(hold->r->mem_pool);
+}
+
+
+/*
+ * Ends a hold without sending anything: the caller commits the held bytes
+ * itself, or the response fails.  The timer is deleted.  A timer that the
+ * engine still has a change or a queued expiry for cannot be freed yet, so
+ * it is re-armed to fire at once with a handler that only drops the pool
+ * reference, as nxt_router_start_timer_cancel() does.
+ */
+
+static void
+nxt_router_comp_hold_cancel(nxt_task_t *task, nxt_http_request_t *r)
+{
+    nxt_event_engine_t      *engine;
+    nxt_router_comp_hold_t  *hold;
+
+    hold = r->comp_hold;
+    r->comp_hold = NULL;
+
+    if (hold->buf != NULL) {
+        nxt_mp_free(r->mem_pool, hold->buf);
+        hold->buf = NULL;
+    }
+
+    engine = task->thread->engine;
+
+    if (nxt_timer_delete(engine, &hold->timer)) {
+        hold->timer.handler = nxt_router_comp_hold_release;
+        nxt_timer_add(engine, &hold->timer, 0);
+        return;
+    }
+
+    nxt_mp_release(r->mem_pool);
+}
+
+
+/* The data bytes of an application message. */
+
+static size_t
+nxt_router_buf_data_size(nxt_buf_t *b)
+{
+    size_t  size;
+
+    size = 0;
+
+    for ( /* void */ ; b != NULL; b = b->next) {
+        if (nxt_buf_is_mem(b) && !nxt_buf_is_sync(b)) {
+            size += nxt_buf_mem_used_size(&b->mem);
+        }
+    }
+
+    return size;
+}
+
+
+/*
+ * Copies the data of an application message into the hold, and gives each
+ * buffer back to the application through its own completion handler: the
+ * port no longer completes them (see the caller).  Room for the whole
+ * message is made first, so a failure consumes nothing and the caller still
+ * owns the chain.  What is left in *chain is what carries no data: the
+ * request's sync buffer of the last message.
+ */
+
+static nxt_int_t
+nxt_router_comp_hold_add(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_buf_t **chain)
+{
+    size_t                  size, used, cap;
+    nxt_buf_t               *b, *next, *buf, *rest, **tail;
+    nxt_router_comp_hold_t  *hold;
+
+    hold = r->comp_hold;
+
+    size = nxt_router_buf_data_size(*chain);
+
+    buf = hold->buf;
+    used = (buf != NULL) ? nxt_buf_mem_used_size(&buf->mem) : 0;
+
+    if (buf == NULL || size > (size_t) nxt_buf_mem_free_size(&buf->mem)) {
+        /*
+         * Doubling keeps the copies linear.  The hold ends at "min_length",
+         * so the buffer stays near min_len plus one message.
+         */
+        cap = (buf != NULL) ? 2 * (size_t) (buf->mem.end - buf->mem.start)
+                            : (size_t) nxt_min(hold->min_len, 4096);
+
+        if (nxt_slow_path(nxt_size_add(used, size, &size) != 0)) {
+            return NXT_ERROR;
+        }
+
+        cap = nxt_max(cap, size);
+
+        b = nxt_buf_mem_alloc(r->mem_pool, cap, 0);
+        if (nxt_slow_path(b == NULL)) {
+            return NXT_ERROR;
+        }
+
+        if (buf != NULL) {
+            b->mem.free = nxt_cpymem(b->mem.free, buf->mem.pos, used);
+            nxt_mp_free(r->mem_pool, buf);
+        }
+
+        hold->buf = b;
+        buf = b;
+    }
+
+    rest = NULL;
+    tail = &rest;
+
+    for (b = *chain; b != NULL; b = next) {
+        next = b->next;
+        b->next = NULL;
+
+        if (!nxt_buf_is_mem(b) || nxt_buf_is_sync(b)) {
+            *tail = b;
+            tail = &b->next;
+            continue;
+        }
+
+        buf->mem.free = nxt_cpymem(buf->mem.free, b->mem.pos,
+                                   nxt_buf_mem_used_size(&b->mem));
+
+        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                           b->completion_handler, task, b, b->parent);
+    }
+
+    *chain = rest;
+
+    return NXT_OK;
+}
+
+
+static void
+nxt_router_comp_hold_buf_completion(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_mp_t   *mp;
+    nxt_buf_t  *b, *next;
+
+    b = obj;
+
+    do {
+        next = b->next;
+        mp = b->data;
+
+        nxt_mp_free(mp, b);
+        nxt_mp_release(mp);
+
+        b = next;
+    } while (b != NULL);
+}
+
+
+/*
+ * Sends the header of a held response and the bytes held for it.  The hold
+ * has ended already; "buf" is what it held, and *chain is what follows it:
+ * the sync buffer when the last message ended the hold, else nothing.
+ *
+ * With the last message here, the length is known.  It is set before the
+ * coding is negotiated again, so "min_length" applies as it does for a
+ * response that declares its length, and an identity response goes out
+ * with Content-Length instead of chunked.  A coding replaces that length
+ * with chunked framing (nxt_http_comp_set_header()).  The held bytes go to
+ * the compressor as one buffer, so they are coded in one call, with no
+ * flush in between.
+ *
+ * On failure *chain is what the caller has to release, with the sync buffer
+ * at its tail if there was one, and *status the answer.
+ */
+
+static nxt_int_t
+nxt_router_comp_hold_commit(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_buf_t *buf, nxt_buf_t **chain, nxt_http_status_t *status)
+{
+    nxt_int_t  ret;
+    nxt_buf_t  *b;
+
+    b = *chain;
+
+    if (b != NULL) {
+        r->resp.content_length_n = nxt_buf_mem_used_size(&buf->mem);
+    }
+
+    if (nxt_buf_mem_used_size(&buf->mem) == 0) {
+        nxt_mp_free(r->mem_pool, buf);
+
+    } else {
+        /*
+         * From here the buffer travels like any response buffer, so it
+         * holds the pool until it is completed.
+         */
+        nxt_mp_retain(r->mem_pool);
+
+        buf->completion_handler = nxt_router_comp_hold_buf_completion;
+        buf->next = b;
+        b = buf;
+    }
+
+    ret = nxt_http_comp_check_acceptable(task, r);
+    if (ret != NXT_OK) {
+        if (ret == NXT_HTTP_NOT_ACCEPTABLE) {
+            *status = NXT_HTTP_NOT_ACCEPTABLE;
+        }
+
+        goto fail;
+    }
+
+    ret = nxt_http_comp_apply_compression(task, r);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto fail;
+    }
+
+    if (b != NULL) {
+        ret = nxt_http_comp_compress_app_response(task, r, &b);
+        if (nxt_slow_path(ret == NXT_ERROR)) {
+            goto fail;
+        }
+
+        nxt_buf_chain_add(&r->out, b);
+    }
+
+    *chain = NULL;
+
+    nxt_http_request_header_send(task, r, nxt_http_request_send_body, NULL);
+
+    r->state = &nxt_http_request_send_state;
+
+    return NXT_OK;
+
+fail:
+
+    *chain = b;
+
+    return NXT_ERROR;
+}
+
+
+/*
+ * The hold timer fired: the response is committed with what it has, and its
+ * length is still unknown, so it is coded.  Nothing is sent when the request
+ * has meanwhile been answered or has failed, or the application is no
+ * longer linked to it (its timeout, its exit): what ended the request then
+ * answered it, or will.
+ */
+
+static void
+nxt_router_comp_hold_timeout(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_mp_t                *mp;
+    nxt_buf_t               *buf, *chain, *next;
+    nxt_int_t               ret;
+    nxt_http_status_t       status;
+    nxt_http_request_t      *r;
+    nxt_router_comp_hold_t  *hold;
+
+    hold = nxt_timer_data(obj, nxt_router_comp_hold_t, timer);
+
+    r = hold->r;
+    mp = r->mem_pool;
+
+    nxt_debug(task, "router response hold timeout");
+
+    if (nxt_slow_path(r->comp_hold != hold)) {
+        nxt_mp_release(mp);
+        return;
+    }
+
+    r->comp_hold = NULL;
+
+    buf = hold->buf;
+    hold->buf = NULL;
+
+    if (r->header_sent || r->error || r->req_rpc_data == NULL) {
+        if (buf != NULL) {
+            nxt_mp_free(mp, buf);
+        }
+
+        nxt_mp_release(mp);
+        return;
+    }
+
+    status = NXT_HTTP_SERVICE_UNAVAILABLE;
+    chain = NULL;
+
+    ret = nxt_router_comp_hold_commit(task, r, buf, &chain, &status);
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_http_request_error(task, r, status);
+
+        /* No sync buffer here: the last message has not arrived. */
+        while (chain != NULL) {
+            next = chain->next;
+            chain->next = NULL;
+            chain->completion_handler(task, chain, chain->parent);
+            chain = next;
+        }
+
+        nxt_request_rpc_data_unlink(task, r->req_rpc_data);
+    }
+
+    nxt_mp_release(mp);
+}
+
+
+/*
+ * Starts the hold of a response whose header has just been parsed.  The
+ * timer is armed once, here: the hold ends within "hold_timeout" of the
+ * first message, however the application paces the rest.
+ */
+
+static nxt_int_t
+nxt_router_comp_hold_start(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_off_t min_len)
+{
+    nxt_event_engine_t      *engine;
+    nxt_router_comp_hold_t  *hold;
+
+    if (nxt_slow_path(nxt_router_response_fields_copy(r) != NXT_OK)) {
+        return NXT_ERROR;
+    }
+
+    hold = nxt_mp_zget(r->mem_pool, sizeof(nxt_router_comp_hold_t));
+    if (nxt_slow_path(hold == NULL)) {
+        return NXT_ERROR;
+    }
+
+    engine = task->thread->engine;
+
+    hold->r = r;
+    hold->min_len = min_len;
+
+    hold->timer.task = &engine->task;
+    hold->timer.work_queue = &engine->fast_work_queue;
+    hold->timer.log = engine->task.log;
+    hold->timer.handler = nxt_router_comp_hold_timeout;
+
+    /* The default bias of 50 ms would be most of a typical hold. */
+    hold->timer.bias = 0;
+
+    nxt_mp_retain(r->mem_pool);
+
+    r->comp_hold = hold;
+
+    nxt_timer_add(engine, &hold->timer, nxt_http_comp_hold_timeout(r));
+
+    return NXT_OK;
+}
+
+
 static void
 nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
+    nxt_off_t               hold_len;
     nxt_int_t               ret;
     nxt_app_t               *app;
-    nxt_buf_t               *b, *next, *out, *last_b, *owned_b;
+    nxt_buf_t               *b, *next, *out, *last_b, *owned_b, *held;
     nxt_port_t              *app_port;
     nxt_http_status_t       status;
     nxt_http_request_t      *r;
     nxt_request_rpc_data_t  *req_rpc_data;
+    nxt_router_comp_hold_t  *hold;
 
     /* What "fail:" answers with, unless a branch below knows better. */
     status = NXT_HTTP_SERVICE_UNAVAILABLE;
@@ -6476,6 +6985,10 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     }
 
     if (r->error) {
+        if (r->comp_hold != NULL) {
+            nxt_router_comp_hold_cancel(task, r);
+        }
+
         nxt_request_rpc_data_unlink(task, req_rpc_data);
         return;
     }
@@ -6565,6 +7078,38 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         }
 
         nxt_http_request_send_body(task, r, NULL);
+
+    } else if (r->comp_hold != NULL) {
+        /*
+         * A held response: its header has been parsed, and this message is
+         * more of its body, not another header.
+         */
+        ret = nxt_router_comp_hold_add(task, r, &b);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            goto fail;
+        }
+
+        /* The sync buffer of the last message, or nothing. */
+        owned_b = b;
+
+        hold = r->comp_hold;
+        held = hold->buf;
+
+        if (last_b == NULL
+            && (nxt_off_t) nxt_buf_mem_used_size(&held->mem) < hold->min_len)
+        {
+            return;
+        }
+
+        hold->buf = NULL;
+        nxt_router_comp_hold_cancel(task, r);
+
+        ret = nxt_router_comp_hold_commit(task, r, held, &b, &status);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            owned_b = b;
+            goto fail;
+        }
+
     } else {
         ret = nxt_router_response_header_parse(task, r, b);
         if (nxt_slow_path(ret != NXT_OK)) {
@@ -6611,6 +7156,33 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
             }
 
             goto fail;
+        }
+
+        /*
+         * A body of unknown length that may still turn out shorter than
+         * "min_length" is held instead of sent; see the comment above
+         * nxt_router_comp_hold_start().  A first message that reaches the
+         * minimum already, or is the last one, is not.
+         */
+        hold_len = (last_b == NULL) ? nxt_router_comp_hold_length(r) : 0;
+
+        if (hold_len > 0
+            && (nxt_off_t) nxt_router_buf_data_size(b) < hold_len)
+        {
+            ret = nxt_router_comp_hold_start(task, r, hold_len);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                goto fail;
+            }
+
+            ret = nxt_router_comp_hold_add(task, r, &b);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                goto fail;
+            }
+
+            /* Not the last message, so every buffer was data. */
+            nxt_assert(b == NULL);
+
+            return;
         }
 
         ret = nxt_http_comp_apply_compression(task, r);
@@ -6713,6 +7285,15 @@ fail:
 
     if (last_b != NULL) {
         r->last = last_b;
+    }
+
+    /*
+     * A held response that fails sends nothing of what it held.  The held
+     * bytes are router memory and the application buffers were given back
+     * as they were copied, so only the hold itself and its timer go.
+     */
+    if (r->comp_hold != NULL) {
+        nxt_router_comp_hold_cancel(task, r);
     }
 
     nxt_http_request_error(task, r, status);
@@ -6922,6 +7503,10 @@ nxt_router_response_error_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     /* TODO cancel message and return if cancelled. */
 
     if (req_rpc_data->request != NULL) {
+        if (req_rpc_data->request->comp_hold != NULL) {
+            nxt_router_comp_hold_cancel(task, req_rpc_data->request);
+        }
+
         nxt_http_request_error(task, req_rpc_data->request,
                                NXT_HTTP_SERVICE_UNAVAILABLE);
     }
@@ -8610,6 +9195,10 @@ nxt_router_http_request_error(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "router http request error (rpc_data %p)", r->req_rpc_data);
 
+    if (r->comp_hold != NULL) {
+        nxt_router_comp_hold_cancel(task, r);
+    }
+
     nxt_http_request_error(task, r, NXT_HTTP_SERVICE_UNAVAILABLE);
 
     if (r->req_rpc_data != NULL) {
@@ -8628,6 +9217,16 @@ nxt_router_http_request_done(nxt_task_t *task, void *obj, void *data)
     r = data;
 
     nxt_debug(task, "router http request done (rpc_data %p)", r->req_rpc_data);
+
+    /*
+     * The request ends while its response may still be held: an armed hold
+     * timer keeps r->mem_pool, and no application message may come to
+     * cancel it before "hold_timeout" expires.  The application timeout
+     * and the error handlers drop the hold for the same reason.
+     */
+    if (r->comp_hold != NULL) {
+        nxt_router_comp_hold_cancel(task, r);
+    }
 
     if (r->req_rpc_data != NULL) {
         nxt_request_rpc_data_unlink(task, r->req_rpc_data);
@@ -9333,6 +9932,10 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
 
         nxt_router_app_abandon(task, req_rpc_data->app, req_rpc_data,
                                req_rpc_data->app_port);
+    }
+
+    if (r->comp_hold != NULL) {
+        nxt_router_comp_hold_cancel(task, r);
     }
 
     nxt_http_request_error(task, r, NXT_HTTP_SERVICE_UNAVAILABLE);

@@ -436,3 +436,61 @@ def test_php_compression_identity_refused_already_coded():
         assert status == 200, f'a coded response is not identity: {configured}'
         assert headers.get('Content-Encoding') == 'gzip', 'the coding kept'
         assert gzip.decompress(body) == b'A' * 100000, 'coded once'
+
+
+def configure_hold(hold_timeout=1000, min_length=1024):
+    assert 'success' in client.conf(
+        {
+            "http": {
+                "compression": {
+                    "types": ["text/html*"],
+                    "compressors": [
+                        {"encoding": "gzip", "min_length": min_length}
+                    ],
+                    "hold_timeout": hold_timeout,
+                }
+            }
+        },
+        'settings',
+    ), 'compression with a hold'
+
+
+def test_php_compression_hold_small_unknown_length():
+    # A script that echoes 200 bytes in five parts sends no Content-Length.
+    # With "hold_timeout", the router holds the body until it ends below
+    # "min_length", and sends it as identity, with its length.
+    client.load('comp_unknown_small')
+    configure_hold()
+
+    status, headers, body = raw_get('/', 'gzip')
+
+    assert status == 200, 'status'
+    assert 'Content-Encoding' not in headers, 'not coded'
+    assert headers.get('Content-Length') == '200', 'the length, now known'
+    assert headers.get('Vary') == 'Accept-Encoding', 'negotiated: vary'
+    assert body == b'C' * 200, 'the body'
+
+
+def test_php_compression_hold_large_unknown_length():
+    # 100 KB echoed in parts reaches "min_length" at once: coded.
+    client.load('comp_unknown_length')
+    configure_hold()
+
+    status, headers, body = raw_get('/', 'gzip')
+
+    assert status == 200, 'status'
+    assert headers['Content-Encoding'] == 'gzip', 'coded'
+    assert headers.get('Transfer-Encoding') == 'chunked', 'chunked'
+    assert gzip.decompress(body) == b'B' * 100000, 'round-trips'
+
+
+def test_php_compression_hold_head():
+    # A HEAD is never held: it sends no body, so there is nothing to wait
+    # for.  The response still ends, without a body.
+    client.load('comp_unknown_small')
+    configure_hold()
+
+    status, headers, body = raw_get('/', 'gzip', method='HEAD')
+
+    assert status == 200, 'status'
+    assert body == b'', 'no body'
