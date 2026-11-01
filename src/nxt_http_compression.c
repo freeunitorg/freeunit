@@ -516,13 +516,18 @@ nxt_http_comp_compress_static_response(nxt_task_t *task, nxt_http_request_t *r,
     in_size = nxt_file_size(fi);
 
     /*
-     * One bound for the whole file, although each static_buf_len piece but
-     * the last is flushed.  The bound of the whole file covers those flush
-     * markers: for zstd, a 3-byte block header per piece, while for a file
-     * of n bytes with more than one 128 KiB piece bound(n) - n is at least
-     * n / 256, that is at least 512 bytes per piece.
+     * One bound for the whole file, plus room for the flush marker each
+     * static_buf_len piece but the last ends with.  bound() promises room
+     * for one call over the whole input, not for the flushes.  zlib's bound
+     * for the non-default 9-bit window is the conservative one, about n / 8
+     * to spare, which hid that; with the 15-bit window it is tight, and an
+     * incompressible file of more than one piece filled the mapping before
+     * Z_FINISH completed, about 5 bytes short per flush.
+     * NXT_HTTP_COMP_FLUSH_SLACK per piece is what the application path adds
+     * per part as well.
      */
-    out_size = nxt_http_comp_bound(ctx, in_size);
+    out_size = nxt_http_comp_bound(ctx, in_size)
+               + (in_size / static_buf_len + 1) * NXT_HTTP_COMP_FLUSH_SLACK;
 
     ret = ftruncate(tfile.fd, out_size);
     if (nxt_slow_path(ret == -1)) {
@@ -1749,6 +1754,7 @@ nxt_http_comp_apply_compression(nxt_task_t *task, nxt_http_request_t *r)
     ctx->idx = idx;
     ctx->type = compressor->type;
     ctx->ctx.level = compressor->opts.level;
+    ctx->ctx.size_hint = ctx->resp_clen;
 
     /*
      * Registered before the stream exists, so that no stream is left without

@@ -1,5 +1,6 @@
 import gzip
 import os
+import random
 import zlib
 from pathlib import Path
 
@@ -1201,3 +1202,22 @@ def test_static_compression_head_length_many_chunks(temp_dir, coding):
     assert head_headers.get('Content-Encoding') == coding, 'HEAD coded'
     assert head_headers['Content-Length'] == get_headers['Content-Length']
     assert int(head_headers['Content-Length']) == len(body)
+
+
+def test_static_compression_incompressible_multi_piece(temp_dir):
+    # A static file is compressed in 128 KiB pieces, each but the last ended
+    # with a flush, into one buffer sized by the compressor's bound for the
+    # whole file.  With zlib's 15-bit window that bound is tight, and an
+    # incompressible file of several pieces filled the buffer about 5 bytes
+    # per flush short: Z_FINISH did not complete and a truncated gzip body
+    # was sent as a success.
+    data = random.Random(42).randbytes(512 * 1024 + 7)
+    Path(f'{temp_dir}/assets/noise.css').write_bytes(data)
+
+    status, hdrs, body = _raw_get(
+        url='/noise.css', **{'Accept-Encoding': 'gzip'}
+    )
+
+    assert status == 200, 'status'
+    assert hdrs.get('Content-Encoding') == 'gzip', 'coded'
+    assert gzip.decompress(body) == data, 'complete gzip stream'
