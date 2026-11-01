@@ -1,0 +1,225 @@
+name: "PHP pre-release and php-src next"
+
+# A manual check of the PHP module against PHP versions that are not
+# released yet.  Two lines run in one dispatch, as separate jobs, so a
+# failure on one does not hide the result of the other:
+#
+#   - rc:   a PHP release candidate tarball, the code that will ship as the
+#           next PHP release (8.6.0RC4 by default);
+#   - next: php-src git (master by default), the code after that release.
+#
+# Each line is built twice: NTS, and ZTS with --enable-zts
+# --disable-zend-signals, the configure line of the official 8.6 images,
+# which are thread safe with no NTS variant.  The module runs one PHP
+# thread either way, but only a ZTS build exercises its ZTS paths
+# (php_tsrm_startup() and the TSRM-cached globals).
+#
+# Today "next" is 8.7.0-dev.  Its sapi_module_struct drops five fields
+# (terminate_process, get_fd, force_http_10, get_target_uid/gid, see
+# UPGRADING.INTERNALS on php-src master).  The module builds against it
+# only with https://github.com/freeunitorg/freeunit/pull/854, which
+# initializes the struct by member name.  Before that is merged, a red
+# "next" job means "8.7 work is needed"; after it, a red "next" job is a
+# real 8.7 regression.  Either way it is not a result about the RC.
+#
+# Each job builds PHP with the embed SAPI, then unitd and the PHP module
+# with the three compressors, starts unitd, and checks that a PHP
+# application answers and that gzip, br and zstd are on the wire.
+
+on:
+  # A pull request that changes this file runs it with the defaults below,
+  # so the workflow is tested before it lands; nothing else triggers it.
+  pull_request:
+    paths:
+      - .github/workflows/php-next.yml
+  workflow_dispatch:
+    inputs:
+      php_tarball:
+        description: 'rc: tarball name, without the extension'
+        required: false
+        default: 'php-8.6.0RC4'
+      php_base_url:
+        description: 'rc: directory that holds the tarball'
+        required: false
+        default: 'https://downloads.php.net/~mbeccati'
+      php_sha256:
+        description: 'rc: SHA-256 of the .tar.xz from the release announcement (empty skips the check)'
+        required: false
+        default: ''
+      php_ref:
+        description: 'next: php-src branch, tag or commit'
+        required: false
+        default: 'master'
+
+permissions:
+  contents: read
+
+jobs:
+  php:
+    name: php-${{ matrix.line }}-${{ matrix.ts }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    env:
+      TS: ${{ matrix.ts }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # A pull request runs only "rc": "next" does not compile without
+        # #854 (see the top), and a pull request must not be red for it.
+        line: ${{ fromJSON(github.event_name == 'pull_request' && '["rc"]' || '["rc", "next"]') }}
+        ts: [ nts, zts ]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf bison re2c pkg-config git \
+            libssl-dev libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev \
+            brotli zstd
+
+      - name: Fetch PHP (release candidate tarball)
+        if: matrix.line == 'rc'
+        env:
+          TARBALL: ${{ inputs.php_tarball || 'php-8.6.0RC4' }}
+          BASE: ${{ inputs.php_base_url || 'https://downloads.php.net/~mbeccati' }}
+          SHA256: ${{ inputs.php_sha256 }}
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/dl"
+          cd "$RUNNER_TEMP/dl"
+          curl -fsSL --retry 3 -o "$TARBALL.tar.xz" "$BASE/$TARBALL.tar.xz"
+          if [ -n "$SHA256" ]; then
+            echo "$SHA256  $TARBALL.tar.xz" | sha256sum -c -
+          else
+            echo "::warning::no php_sha256 given; the tarball is not verified"
+          fi
+          tar xf "$TARBALL.tar.xz"
+          mv "$TARBALL" "$RUNNER_TEMP/php-src"
+          echo "PHP source: rc, $BASE/$TARBALL.tar.xz" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fetch PHP (php-src git)
+        if: matrix.line == 'next'
+        env:
+          REF: ${{ inputs.php_ref || 'master' }}
+        run: |
+          set -eux
+          git init -q "$RUNNER_TEMP/php-src"
+          cd "$RUNNER_TEMP/php-src"
+          git fetch -q --depth 1 https://github.com/php/php-src.git "$REF"
+          git checkout -q FETCH_HEAD
+          ./buildconf --force
+          echo "PHP source: next, php-src $REF at $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build PHP
+        run: |
+          set -eux
+          P="$RUNNER_TEMP/php"
+          cd "$RUNNER_TEMP/php-src"
+          grep -m1 'define PHP_VERSION ' main/php_version.h
+          # The embed SAPI needs the CLI SAPI since 8.6; the CLI is on by
+          # default, also with --disable-all.
+          ts_opts=
+          if [ "$TS" = zts ]; then
+            ts_opts="--enable-zts --disable-zend-signals"
+          fi
+          # shellcheck disable=SC2086
+          ./configure --prefix="$P" \
+            --disable-all --enable-embed=shared --with-zlib \
+            --without-libxml --disable-dom \
+            --without-sqlite3 --without-pdo-sqlite $ts_opts
+          make -j"$(nproc)"
+          make install
+          "$P/bin/php" -v
+          # The build is the thread safety the job asked for.
+          "$P/bin/php" -r 'echo PHP_ZTS ? "zts" : "nts";' | grep -qx "$TS"
+          grep -m1 'define PHP_VERSION ' main/php_version.h >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build unitd and the PHP module
+        run: |
+          set -eux
+          P="$RUNNER_TEMP/php"
+          ./configure --openssl --zlib --zstd --brotli \
+            --prefix="$RUNNER_TEMP/unit" --statedir="$RUNNER_TEMP/state"
+          # --lib-path adds an rpath, so the module finds libphp.so.
+          ./configure php --config="$P/bin/php-config" --lib-path="$P/lib"
+          make -j"$(nproc)"
+          make -j"$(nproc)" php
+          make install
+          ls -l "$RUNNER_TEMP/unit/lib/unit/modules/"
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          U="$RUNNER_TEMP/unit"
+          mkdir -p "$RUNNER_TEMP/www" "$RUNNER_TEMP/state"
+          cat > "$RUNNER_TEMP/www/index.php" <<'PHP'
+          <?php
+          // The router compresses an application response only when its
+          // length is known (nxt_http_comp_check_acceptable), so the body is
+          // built first and sent with a Content-Length.
+          $body = 'ok:' . PHP_VERSION . ' ' . (PHP_ZTS ? 'zts' : 'nts') . "\n"
+              . str_repeat('compression-probe-0123456789abcdef', 400);
+          header('Content-Type: text/html');
+          header('Content-Length: ' . strlen($body));
+          echo $body;
+          PHP
+
+          "$U/sbin/unitd" --version
+          "$U/sbin/unitd" --no-daemon \
+            --control "unix:$RUNNER_TEMP/control.sock" \
+            --statedir "$RUNNER_TEMP/state" \
+            --pid "$RUNNER_TEMP/unit.pid" \
+            --log "$RUNNER_TEMP/unit.log" \
+            --tmpdir "$RUNNER_TEMP" &
+
+          for _ in $(seq 60); do
+            [ -S "$RUNNER_TEMP/control.sock" ] && break
+            sleep 1
+          done
+          [ -S "$RUNNER_TEMP/control.sock" ] \
+            || { echo "unitd did not open the control socket"; exit 1; }
+
+          # -f: a refused configuration fails the step.
+          curl -fsS --unix-socket "$RUNNER_TEMP/control.sock" -X PUT \
+            --data-binary @- http://localhost/config <<JSON
+          {"listeners":{"127.0.0.1:8080":{"pass":"applications/app"}},
+           "settings":{"http":{"compression":{"types":["text/html*"],
+             "compressors":[{"encoding":"gzip","level":1},
+                            {"encoding":"br","level":1},
+                            {"encoding":"zstd","level":1}]}}},
+           "applications":{"app":{"type":"php","root":"$RUNNER_TEMP/www","script":"index.php"}}}
+          JSON
+          echo
+
+          # The application must answer 200 with its own first line: an
+          # error page also gets a Content-Encoding, so the encoding checks
+          # below do not prove that PHP ran.
+          curl -fsS -o "$RUNNER_TEMP/body" http://127.0.0.1:8080/
+          head -c 200 "$RUNNER_TEMP/body"; echo
+          head -n 1 "$RUNNER_TEMP/body" | grep -E "^ok:[0-9]+\.[0-9]+\.[^ ]* $TS\$" \
+            || { echo "the PHP application did not answer"; exit 1; }
+
+          # Each coding must be advertised and must decode to the plain
+          # body, byte for byte.
+          for enc in gzip br zstd; do
+            curl -fsS -H "Accept-Encoding: $enc" -D "$RUNNER_TEMP/h.$enc" \
+              -o "$RUNNER_TEMP/b.$enc" http://127.0.0.1:8080/
+            grep -qi "^content-encoding: $enc" "$RUNNER_TEMP/h.$enc" \
+              || { echo "missing Content-Encoding: $enc"; exit 1; }
+            case "$enc" in
+            gzip) gzip -dc < "$RUNNER_TEMP/b.$enc" ;;
+            br)   brotli -dc < "$RUNNER_TEMP/b.$enc" ;;
+            zstd) zstd -dcq < "$RUNNER_TEMP/b.$enc" ;;
+            esac > "$RUNNER_TEMP/d.$enc"
+            cmp "$RUNNER_TEMP/body" "$RUNNER_TEMP/d.$enc" \
+              || { echo "$enc does not decode to the plain body"; exit 1; }
+            printf '%-5s %s -> %s bytes\n' "$enc" \
+              "$(wc -c < "$RUNNER_TEMP/b.$enc")" "$(wc -c < "$RUNNER_TEMP/d.$enc")"
+          done
+
+      - name: Unit log
+        if: always()
+        run: tail -60 "$RUNNER_TEMP/unit.log" || true
