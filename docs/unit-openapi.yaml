@@ -8397,6 +8397,23 @@ components:
         compressors:
           $ref: "#/components/schemas/configSettingsHttpCompressionCompressors"
 
+        hold_timeout:
+          type: integer
+          minimum: 0
+          maximum: 60000
+          description: "Milliseconds an application response of unknown
+            length may be held before its header is sent, so that
+            `min_length` can apply to it.  The response is sent when its
+            body reaches the `min_length` of the selected compressor, when
+            it ends (its length is then known), or when this time has
+            passed.  1xx, 204, 304, HEAD and already coded responses, and a
+            response whose Content-Type from the application is
+            `text/event-stream`, are never held.  Absent or 0, no response
+            is held.  A client that closes while its response is held is
+            noticed only when the response is sent.  10 is a reasonable value: a typical PHP
+            response ends well within it, and a slow stream waits at
+            most that long for its first byte."
+
     # /config/settings/http/compression/types
     configSettingsHttpCompressionTypes:
       type: array
@@ -8432,8 +8449,11 @@ components:
             format: int64
             minimum: 0
             description: "Minimum amount of data to consider for compressing.
-              It applies only to a response of known length; a response of
-              unknown length is compressed whatever its size.
+              It applies to a response of known length.  A response of
+              unknown length is compressed whatever its size, unless
+              `hold_timeout` is set: then it applies to such a response as
+              to a declared length, when the response ends within that
+              time.
               On 32-bit platforms, less than 2147483648."
 
     # /config/settings/http/compression/compressors/{arrayIndex}/encoding
