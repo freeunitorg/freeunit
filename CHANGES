@@ -1,4 +1,14 @@
 
+Changes with FreeUnit 1.37.2                                     31 Oct 2026
+
+    *) Change: the gzip and deflate compressors now use the 32 KiB window
+       and memLevel 8, the zlib defaults, instead of a 512-byte window. For
+       a response of known length both shrink to fit it, as in nginx.
+       Responses are smaller and cost less CPU; a compressed stream of
+       unknown length holds about 256 KiB of zlib state instead of about 130
+       KiB.
+
+
 Changes with FreeUnit 1.37.1                                     30 Oct 2026
 
     *) Security: update Wasmtime, wasmtime-wasi and wasmtime-wasi-http to
