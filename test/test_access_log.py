@@ -671,14 +671,15 @@ def test_access_log_incorrect(temp_dir, skip_alert):
 def test_access_log_writes_a_large_record(wait_for_record):
     load('empty')
 
-    # 1.37.1 has no record bound: the JSON object and the text format both
-    # write a long record whole, and it is not counted as a loss.  The bound
-    # and the per-field cap are 1.38 decisions.
+    # A JSON record at the 4096-byte bound, the newline included, is written
+    # whole: '{"big":""}' and the newline are 11 bytes.  The text format has
+    # no bound and writes a longer record whole.  Neither is counted as a
+    # loss.
     set_format({'big': '$header_x_big'})
 
-    assert client.get(headers={'X-Big': 'a' * 5000})['status'] == 200
+    assert client.get(headers={'X-Big': 'a' * 4085})['status'] == 200
 
-    assert wait_for_record(r'a{5000}', 'access.log') is not None, 'json'
+    assert wait_for_record(r'a{4085}', 'access.log') is not None, 'json'
     assert client.conf_get('/status')['access_log']['lost'] == 0
 
     set_format('$header_x_big')
@@ -687,6 +688,32 @@ def test_access_log_writes_a_large_record(wait_for_record):
 
     assert wait_for_record(r'b{5000}', 'access.log') is not None, 'text'
     assert client.conf_get('/status')['access_log']['lost'] == 0
+
+
+def test_access_log_drops_an_oversized_record(wait_for_record):
+    load('empty')
+    set_format({'big': '$header_x_big'})
+
+    # One byte over the 4096-byte JSON record bound, the newline included:
+    # test_access_log_writes_a_large_record writes the record a byte shorter.
+    assert client.get(headers={'X-Big': 'a' * 4086})['status'] == 200
+
+    # The next record is written, so the gap gets its marker.
+    assert client.get()['status'] == 200
+
+    assert (
+        wait_for_record(r'#freeunit: lost 1 record\(s\)', 'access.log')
+        is not None
+    ), 'marker'
+
+    assert not any(
+        len(line) > 4096 for line in _read_log_lines()
+    ), 'no record over the bound reaches the file'
+
+    assert client.conf_get('/status')['access_log'] == {
+        'path': f'{option.temp_dir}/access.log',
+        'lost': 1,
+    }
 
 
 def test_access_log_marks_a_build_loss(require, wait_for_record, skip_alert):
