@@ -249,6 +249,35 @@ nxt_hcs_expect(nxt_hcs_ctx_t *ctx)
         ctx->r->resp.content_length = NULL;
     }
 
+    {
+        ssize_t                         n;
+        uint8_t                         out[4];
+        nxt_http_comp_compressor_ctx_t  cctx;
+
+        static const uint8_t  str[] = "a last call with no room left";
+
+        /*
+         * A last call whose output cannot hold the whole stream leaves
+         * Z_FINISH unfinished: deflate() returns Z_OK, not Z_STREAM_END.
+         * nxt_zlib_deflate() must report that as an error.  Returning the
+         * bytes written would send a truncated body as a success.
+         */
+        nxt_memzero(&cctx, sizeof(cctx));
+        cctx.level = 6;
+
+        NXT_TEST_CHECK(ctx->thr->log,
+                       nxt_http_comp_gzip_ops.init(&cctx) == 0,
+                       "gzip init failed");
+
+        n = nxt_http_comp_gzip_ops.deflate(&cctx, str, sizeof(str) - 1,
+                                           out, sizeof(out), true);
+        nxt_http_comp_gzip_ops.free(&cctx);
+
+        NXT_TEST_CHECK(ctx->thr->log, n == -1,
+                       "gzip of %uz bytes into %uz gave %z, not -1",
+                       sizeof(str) - 1, sizeof(out), n);
+    }
+
 #if (NXT_64BIT) && defined(MAP_NORESERVE)
     {
         ssize_t                         n, exact;
