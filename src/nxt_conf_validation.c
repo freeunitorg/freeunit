@@ -165,6 +165,8 @@ static nxt_int_t nxt_conf_vldt_compression_level(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_compression_encoding(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_compression_hold_timeout(
+    nxt_conf_validation_t *vldt, nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_routes(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_routes_member(nxt_conf_validation_t *vldt,
@@ -557,6 +559,10 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_compression_members[] = {
         .name       = nxt_string("compressors"),
         .type       = NXT_CONF_VLDT_OBJECT | NXT_CONF_VLDT_ARRAY,
         .validator  = nxt_conf_vldt_compressors,
+    }, {
+        .name       = nxt_string("hold_timeout"),
+        .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_compression_hold_timeout,
     },
 
     NXT_CONF_VLDT_END
@@ -2997,6 +3003,37 @@ nxt_conf_vldt_compression_level(nxt_conf_validation_t *vldt,
                                         -(int64_t) NXT_INT32_T_MAX - 1,
                                         NXT_INT32_T_MAX,
                                         "compression is off");
+}
+
+
+/*
+ * "hold_timeout" is in milliseconds, unlike the timeouts of "http", which
+ * are in seconds: it bounds how long a response header is held back, and
+ * that is meant to be a fraction of a second.  It is mapped to an
+ * nxt_msec_t, and the timer compares times as a signed 32-bit difference,
+ * so the number must not exceed NXT_INT32_T_MAX.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_compression_hold_timeout(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    double  num;
+
+    num = nxt_conf_get_number(value);
+
+    if (num >= 0 && num <= NXT_INT32_T_MAX) {
+        return NXT_OK;
+    }
+
+    if (!vldt->restored) {
+        return nxt_conf_vldt_error(vldt, "The \"hold_timeout\" number must "
+                                   "be between 0 and %d.", NXT_INT32_T_MAX);
+    }
+
+    return nxt_conf_vldt_restored_range(vldt, "hold_timeout", 0,
+                                        NXT_INT32_T_MAX,
+                                        "no response is held");
 }
 
 

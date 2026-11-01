@@ -106,6 +106,8 @@ extern nxt_int_t nxt_http_comp_check_acceptable(nxt_task_t *task,
     nxt_http_request_t *r);
 extern nxt_int_t nxt_http_comp_apply_compression(nxt_task_t *task,
     nxt_http_request_t *r);
+extern nxt_off_t nxt_http_comp_hold_length(nxt_http_request_t *r);
+extern nxt_msec_t nxt_http_comp_hold_timeout(nxt_http_request_t *r);
 extern nxt_int_t nxt_http_comp_compression_init(nxt_task_t *task,
     nxt_router_conf_t *rtcf, const nxt_conf_value_t *comp_conf);
 
