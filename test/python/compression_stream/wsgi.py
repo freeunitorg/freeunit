@@ -23,10 +23,11 @@ def application(environ, start_response):
 
     clen = environ.get('HTTP_X_CONTENT_LENGTH', str(size * parts))
 
-    headers = [
-        ('Content-Type', 'text/plain'),
-        ('Content-Length', clen),
-    ]
+    # X-Content-Length: none sends no Content-Length, so the router does not
+    # know the length and sends the body chunked.
+    headers = [('Content-Type', 'text/plain')]
+    if clen != 'none':
+        headers.append(('Content-Length', clen))
 
     # A large field makes the response buffer too large for a plain port
     # message (1024 bytes), so libunit sends it through shared memory.

@@ -122,6 +122,22 @@ def test_php_compression_small_body():
     assert gzip.decompress(body) == b'A' * 8, 'round-trips'
 
 
+def test_php_compression_unknown_length():
+    # Most PHP scripts echo their output and send no Content-Length (#856).
+    # The router used to skip compression for an unknown length, so these
+    # responses were never compressed.
+    client.load('comp_unknown_length')
+    configure_compression()
+
+    status, headers, body = get_gzip()
+
+    assert status == 200, 'status'
+    assert headers['Content-Encoding'] == 'gzip', 'encoding advertised'
+    assert headers.get('Transfer-Encoding') == 'chunked', 'chunked'
+    assert 'Content-Length' not in headers, 'no length'
+    assert gzip.decompress(body) == b'B' * 100000, 'round-trips'
+
+
 RANDOM_BODY_SIZE = 9 * 1024 * 1024
 LEAK_REQUESTS = 15  # > 100 MB in total: more shared memory than an app may hold
 
