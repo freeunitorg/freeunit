@@ -25,8 +25,6 @@
 
 #if (PHP_VERSION_ID >= 70100)
 #define NXT_HAVE_PHP_LOG_MESSAGE_WITH_SYSLOG_TYPE 1
-#else
-#define NXT_HAVE_PHP_INTERRUPTS 1
 #endif
 
 #if (PHP_VERSION_ID >= 70000)
@@ -353,66 +351,37 @@ PHP_FUNCTION(fastcgi_finish_request)
 }
 
 
+/*
+ * Designated initializers: only the members the module sets are listed, the
+ * rest are zero.  PHP adds and removes members of sapi_module_struct (8.7
+ * removed terminate_process, get_fd, force_http_10, get_target_uid and
+ * get_target_gid), and a positional list then shifts every member after the
+ * change; without -Werror that is a silent mismatch.  A removed member that
+ * is named here fails to compile instead.
+ */
 static sapi_module_struct  nxt_php_sapi_module =
 {
-    (char *) "cli-server",
-    (char *) "unit",
+    .name                      = (char *) "cli-server",
+    .pretty_name               = (char *) "unit",
 
-    nxt_php_startup,             /* startup */
-    php_module_shutdown_wrapper, /* shutdown */
+    .startup                   = nxt_php_startup,
+    .shutdown                  = php_module_shutdown_wrapper,
 
-    NULL,                        /* activate */
-    NULL,                        /* deactivate */
+    .ub_write                  = nxt_php_unbuffered_write,
+    .flush                     = nxt_php_flush,
 
-    nxt_php_unbuffered_write,    /* unbuffered write */
-    nxt_php_flush,               /* flush */
-    NULL,                        /* get uid */
-    NULL,                        /* getenv */
+    .sapi_error                = php_error,
 
-    php_error,                   /* error handler */
+    .send_headers              = nxt_php_send_headers,
 
-    NULL,                        /* header handler */
-    nxt_php_send_headers,        /* send headers handler */
-    NULL,                        /* send header handler */
+    .read_post                 = nxt_php_read_post,
+    .read_cookies              = nxt_php_read_cookies,
 
-    nxt_php_read_post,           /* read POST data */
-    nxt_php_read_cookies,        /* read Cookies */
+    .register_server_variables = nxt_php_register_variables,
+    .log_message               = nxt_php_log_message,
 
-    nxt_php_register_variables,  /* register server variables */
-    nxt_php_log_message,         /* log message */
-    NULL,                        /* get request time */
-    NULL,                        /* terminate process */
-
-    NULL,                        /* php_ini_path_override */
-#ifdef NXT_HAVE_PHP_INTERRUPTS
-    NULL,                        /* block_interruptions */
-    NULL,                        /* unblock_interruptions */
-#endif
-    NULL,                        /* default_post_reader */
-    NULL,                        /* treat_data */
-    NULL,                        /* executable_location */
-
-    0,                           /* php_ini_ignore */
 #ifdef NXT_HAVE_PHP_IGNORE_CWD
-    1,                           /* php_ini_ignore_cwd */
-#endif
-    NULL,                        /* get_fd */
-
-    NULL,                        /* force_http_10 */
-
-    NULL,                        /* get_target_uid */
-    NULL,                        /* get_target_gid */
-
-    NULL,                        /* input_filter */
-
-    NULL,                        /* ini_defaults */
-    0,                           /* phpinfo_as_text */
-
-    NULL,                        /* ini_entries */
-    NULL,                        /* additional_functions */
-    NULL,                        /* input_filter_init */
-#if NXT_PHP_PRE_REQUEST_INIT
-    NULL,                        /* pre_request_init */
+    .php_ini_ignore_cwd        = 1,
 #endif
 };
 
