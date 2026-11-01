@@ -318,6 +318,15 @@ multi-arch (`linux/amd64`, `linux/arm64`) images to GHCR (`ghcr.io/freeunitorg/f
 and Docker Hub (`docker.io/freeunitorg/freeunit`) on every release tag or via
 `workflow_dispatch`.
 
+`.github/workflows/docker-nightly.yml` builds FreeUnit master on a schedule for PHP
+versions without a release image: `nightly-php-8.6` every night (from
+`php:8.6-rc-cli-trixie`, `php:8.6-cli-trixie` once 8.6.0 is out) and `weekly-php-8.7`
+every Monday (from a PHP built from php-src master by
+`pkg/docker/nightly/Dockerfile.php-src`), each also with a
+`<channel>-<variant>-YYYYMMDD` tag. It pushes to GHCR only, `linux/amd64` only. The
+build and smoke job has a read-only token; a separate publish job, which never runs
+on `pull_request`, holds `packages: write`. These images are not for production.
+
 ### Rebuilding individual variants without a new FreeUnit release
 
 When an upstream runtime base image (for example `php:8.5-cli-trixie` or

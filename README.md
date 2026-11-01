@@ -73,6 +73,22 @@ Full list of variants (including `python-3.14`, `perl-5.40`, `ruby-3.3`, slim
 Python variants, etc.) is in the
 [docker workflow](.github/workflows/release-docker.yml).
 
+#### Scheduled images for unreleased PHP
+
+FreeUnit master is also built on a schedule for PHP versions that have no
+release image yet, and published to GHCR only:
+
+| Variant | Built | Image |
+|---------|-------|-------|
+| PHP 8.6 (RC until 8.6.0) | every night | `ghcr.io/freeunitorg/freeunit:nightly-php-8.6` |
+| PHP 8.7 (php-src master) | every Monday | `ghcr.io/freeunitorg/freeunit:weekly-php-8.7` |
+
+Each build also has a dated tag, for example `nightly-php-8.6-20261102`.
+These images are `linux/amd64` only, follow the current development code
+of both FreeUnit and PHP, and are not for production.  Their labels name
+the FreeUnit commit, the base image and, for 8.7, the php-src commit.  See
+[the workflow](.github/workflows/docker-nightly.yml).
+
 ```console
 $ docker pull ghcr.io/freeunitorg/freeunit:latest-minimal
 $ mkdir /tmp/unit-control
