@@ -37,6 +37,10 @@
 #define NXT_UNIT_QUEUE_PLAIN_SIZE  \
     (NXT_PORT_QUEUE_MSG_SIZE - sizeof(nxt_port_msg_t))
 
+/* nxt_unit_init_t up to and including "size", as 1.38 has it. */
+#define NXT_UNIT_INIT_SIZE_1_38  \
+    (offsetof(nxt_unit_init_t, size) + sizeof(uint32_t))
+
 /* nxt_unit_impl_t.shm: what the outgoing shared memory last showed. */
 #define NXT_UNIT_SHM_UNKNOWN  0
 #define NXT_UNIT_SHM_OK       1
@@ -205,6 +209,9 @@ nxt_inline int nxt_unit_is_quit(nxt_unit_read_buf_t *rbuf);
 nxt_inline int nxt_unit_is_mmap(nxt_unit_read_buf_t *rbuf);
 nxt_inline int nxt_unit_is_ordered(nxt_unit_read_buf_t *rbuf);
 nxt_inline int nxt_unit_is_socket_quit(nxt_unit_read_buf_t *rbuf);
+nxt_inline int nxt_unit_is_graceful_quit(nxt_unit_read_buf_t *rbuf);
+static void nxt_unit_quit_drain(nxt_unit_ctx_t *ctx,
+    nxt_unit_read_buf_t *rbuf);
 static int nxt_unit_process_port_msg_impl(nxt_unit_ctx_t *ctx,
     nxt_unit_port_t *port);
 static void nxt_unit_ctx_free(nxt_unit_ctx_impl_t *ctx_impl);
@@ -831,7 +838,27 @@ static nxt_unit_impl_t *
 nxt_unit_create(nxt_unit_init_t *init)
 {
     int              rc;
+    size_t           size;
     nxt_unit_impl_t  *lib;
+
+    /*
+     * 0 is the struct of 1.38, which ends with "size".  A field added after
+     * it is read only when "size" covers it, and a caller that knows more
+     * fields than this libunit is refused: it was built for a later one.
+     */
+    size = init->size;
+
+    if (nxt_slow_path(size != 0
+                      && (size < NXT_UNIT_INIT_SIZE_1_38
+                          || size > sizeof(nxt_unit_init_t))))
+    {
+        nxt_unit_alert(NULL, "nxt_unit_init_t.size is %u, while this libunit "
+                       "takes 0, or %u to %u", (unsigned) size,
+                       (unsigned) NXT_UNIT_INIT_SIZE_1_38,
+                       (unsigned) sizeof(nxt_unit_init_t));
+
+        return NULL;
+    }
 
     if (nxt_slow_path(init->callbacks.request_handler == NULL)) {
         nxt_unit_alert(NULL, "request_handler is NULL");
@@ -1111,12 +1138,14 @@ nxt_unit_read_env(nxt_unit_port_t *ready_port, nxt_unit_port_t *router_port,
     int *log_fd, uint32_t *stream,
     uint32_t *shm_limit, uint32_t *request_limit)
 {
-    int       rc;
-    int       ready_fd, router_fd, read_in_fd, read_out_fd;
-    char      *unit_init, *version_end, *vars;
-    size_t    version_length;
-    int64_t   ready_pid, router_pid, read_pid;
-    uint32_t  ready_stream, router_id, ready_id, read_id;
+    int         rc, n;
+    int         ready_fd, router_fd, read_in_fd, read_out_fd;
+    char        *unit_init, *version_end, *vars;
+    char        own_protocol[16];
+    size_t      version_length, protocol_length;
+    int64_t     ready_pid, router_pid, read_pid;
+    uint32_t    ready_stream, router_id, ready_id, read_id;
+    const char  *protocol;
 
     unit_init = getenv(NXT_UNIT_INIT_ENV);
     if (nxt_slow_path(unit_init == NULL)) {
@@ -1134,7 +1163,25 @@ nxt_unit_read_env(nxt_unit_port_t *ready_port, nxt_unit_port_t *router_port,
         return NXT_UNIT_ERROR;
     }
 
+    /*
+     * "<NXT_VERSION>/<NXT_UNIT_PROTOCOL_VERSION>".  A daemon older than the
+     * protocol number writes only the version: that is protocol 0, which
+     * no libunit speaks.  Both parts must be equal to ours.
+     */
+
     version_length = version_end - unit_init;
+
+    protocol = memchr(unit_init, '/', version_length);
+
+    if (protocol != NULL) {
+        version_length = protocol - unit_init;
+        protocol++;
+        protocol_length = version_end - protocol;
+
+    } else {
+        protocol = "0";
+        protocol_length = 1;
+    }
 
     rc = version_length != nxt_length(NXT_VERSION)
          || memcmp(unit_init, NXT_VERSION, nxt_length(NXT_VERSION));
@@ -1143,6 +1190,21 @@ nxt_unit_read_env(nxt_unit_port_t *ready_port, nxt_unit_port_t *router_port,
         nxt_unit_alert(NULL, "versions mismatch: the Unit daemon has version "
                        "%.*s, while the app was compiled with libunit %s",
                        (int) version_length, unit_init, NXT_VERSION);
+
+        return NXT_UNIT_ERROR;
+    }
+
+    n = snprintf(own_protocol, sizeof(own_protocol), "%d",
+                 NXT_UNIT_PROTOCOL_VERSION);
+
+    rc = protocol_length != (size_t) n
+         || memcmp(protocol, own_protocol, protocol_length) != 0;
+
+    if (nxt_slow_path(rc != 0)) {
+        nxt_unit_alert(NULL, "protocol mismatch: the Unit daemon %s speaks "
+                       "libunit protocol %.*s, while the app was compiled "
+                       "with libunit protocol %s", NXT_VERSION,
+                       (int) protocol_length, protocol, own_protocol);
 
         return NXT_UNIT_ERROR;
     }
@@ -4973,6 +5035,21 @@ nxt_unit_test_ctx_quit_graceful(nxt_unit_ctx_t *ctx)
 {
     nxt_unit_quit(ctx, NXT_QUIT_GRACEFUL);
 }
+
+
+/* As if "count" requests were taken under a request limit of "limit". */
+
+void
+nxt_unit_test_request_limit(nxt_unit_ctx_t *ctx, uint32_t limit,
+    uint32_t count)
+{
+    nxt_unit_impl_t  *lib;
+
+    lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
+
+    lib->request_limit = limit;
+    nxt_atomic_store(&lib->request_count, count);
+}
 #endif
 
 
@@ -6942,6 +7019,13 @@ retry:
             goto retry;
         }
 
+        if (res == NXT_UNIT_OK
+            && (fds[1].revents & POLLIN) != 0
+            && nxt_unit_is_graceful_quit(rbuf))
+        {
+            nxt_unit_quit_drain(ctx, rbuf);
+        }
+
         return res;
     }
 
@@ -7295,6 +7379,111 @@ nxt_unit_is_socket_quit(nxt_unit_read_buf_t *rbuf)
     }
 
     return 0;
+}
+
+
+/*
+ * A graceful QUIT as nxt_runtime_port_send_quit() and nxt_unit_send_quit()
+ * write it: the header and the quit mode.  Without the byte, the QUIT is a
+ * normal one.
+ */
+
+nxt_inline int
+nxt_unit_is_graceful_quit(nxt_unit_read_buf_t *rbuf)
+{
+    nxt_port_msg_t  *port_msg;
+
+    if (rbuf->size != (ssize_t) sizeof(nxt_port_msg_t) + 1) {
+        return 0;
+    }
+
+    port_msg = (nxt_port_msg_t *) rbuf->buf;
+
+    return port_msg->type == _NXT_PORT_MSG_QUIT
+           && !port_msg->mmap
+           && (uint8_t) rbuf->buf[sizeof(nxt_port_msg_t)]
+              == NXT_QUIT_GRACEFUL;
+}
+
+
+/*
+ * "rbuf" has a graceful QUIT from the read port, and the wait that found it
+ * also found the shared port readable: the router rang it for a request.
+ * The read port is read first, so the QUIT would take the context offline
+ * and leave that request in the queue.  When the router woke only this
+ * context for it (one idle context, or EPOLLEXCLUSIVE), the request then
+ * waits for the next doorbell, or for another context to wake up at the
+ * end of its 1 s wait.
+ *
+ * So take one request from the queue, put it in "rbuf" instead of the
+ * QUIT, and keep the QUIT in quit_pending.  nxt_unit_process_msg() takes
+ * the QUIT after the request, as it takes a QUIT that could not be sent
+ * (nxt_unit_send_quit()), and a graceful quit waits for the request as for
+ * any other.  The QUIT leaves the context not ready, so no second request
+ * is read.
+ *
+ * The QUIT is kept as it is when:
+ *
+ *   - the context is not ready: the request limit is reached, maybe by
+ *     another context since the wait;
+ *   - a QUIT is pending already;
+ *   - a read buffer is parked or pending: the request would wait behind
+ *     it, and the QUIT with it.
+ *
+ * A normal QUIT never comes here: it stops the worker at once.
+ */
+
+static void
+nxt_unit_quit_drain(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf)
+{
+    int                  busy;
+    nxt_unit_impl_t      *lib;
+    nxt_unit_ctx_impl_t  *ctx_impl;
+    nxt_unit_read_buf_t  *req_rbuf;
+
+    ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+    if (!nxt_unit_chk_ready(ctx)
+        || nxt_atomic_load(&ctx_impl->quit_pending) != 0)
+    {
+        return;
+    }
+
+    pthread_mutex_lock(&ctx_impl->mutex);
+
+    busy = nxt_atomic_load(&ctx_impl->parked) > 0
+           || !nxt_queue_is_empty(&ctx_impl->pending_rbuf);
+
+    pthread_mutex_unlock(&ctx_impl->mutex);
+
+    if (busy) {
+        return;
+    }
+
+    req_rbuf = nxt_unit_read_buf_get(ctx);
+    if (nxt_slow_path(req_rbuf == NULL)) {
+        return;
+    }
+
+    lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
+
+    if (nxt_unit_app_queue_recv(ctx, lib->shared_port, req_rbuf)
+        != NXT_UNIT_OK)
+    {
+        nxt_unit_read_buf_release(ctx, req_rbuf);
+
+        return;
+    }
+
+    /* A QUIT that became pending meanwhile is taken after the request too. */
+    (void) nxt_atomic_cmp_set(&ctx_impl->quit_pending, 0,
+                              (nxt_atomic_uint_t) NXT_QUIT_GRACEFUL + 1);
+
+    nxt_unit_debug(ctx, "graceful quit after one more request");
+
+    nxt_unit_rbuf_cpy(rbuf, req_rbuf);
+
+    nxt_unit_read_buf_release(ctx, req_rbuf);
 }
 
 

@@ -14,7 +14,11 @@
 # The list is what makes the layout check look, and this script is what
 # keeps the list complete.
 #
-#   tools/perf/layout-coverage.py [--self-test]
+#   tools/perf/layout-coverage.py [--self-test | --list]
+#
+# --list prints the structs and the enum constants of the installed headers,
+# one "struct NAME HEADER" or "enum NAME HEADER" line each, and checks
+# nothing.  tools/perf/layout-dump.sh prints their layouts from it.
 #
 # The headers come from the install rule in auto/make, so a new installed
 # header needs no edit here.  A new struct in one of them fails this check
@@ -232,9 +236,27 @@ def listed():
     return names
 
 
+def list_installed():
+    """The structs and enum constants of the installed headers."""
+
+    for header in installed_headers():
+        if not Path(header).exists():
+            die(f'no {header} (run ./configure first)')
+
+        for name in sorted(structs(header)):
+            print(f'struct {name} {header}')
+
+        for name in enumerators(header):
+            print(f'enum {name} {header}')
+
+
 def main():
     if sys.argv[1:] == ['--self-test']:
         self_test()
+        return
+
+    if sys.argv[1:] == ['--list']:
+        list_installed()
         return
 
     have = listed()
