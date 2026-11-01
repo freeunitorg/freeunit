@@ -10,6 +10,16 @@
          date="2026-10-31" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="change">
+<para>
+the gzip and deflate compressors now use the 32 KiB window and memLevel 8,
+the zlib defaults, instead of a 512-byte window.  For a response of known
+length both shrink to fit it, as in nginx.  Responses are smaller and cost
+less CPU; a compressed stream of unknown length holds about 256 KiB of zlib
+state instead of about 130 KiB.
+</para>
+</change>
+
 </changes>
 
 
