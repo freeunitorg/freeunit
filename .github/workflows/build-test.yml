@@ -501,20 +501,25 @@ jobs:
             # legs still run it.  A file that is not in this list only costs
             # balance, not coverage.
             #
-            # test_settings.py was 64 s in that run.  It cost 180 s on the
-            # python-3.13 leg of
-            # https://github.com/freeunitorg/freeunit/actions/runs/38018584167
-            # measured by summing the gaps between consecutive tests of the
-            # file in the leg's log.  That leg ran 359 s against 253 s and
-            # 283 s on python-3.12 and python-3.14, because the entry sent
-            # the largest shared file to the leg that already had the most
-            # work.  The 408 change in the same pull request removes about
-            # 7 s of sleeps, so the cost is about 174 s.  The entry uses 170
-            # s: the shards only need a good balance.  Re-measure a file when
-            # its cost changes.
+            # test_settings.py cost 170 s on the python-3.13 leg of
+            # https://github.com/freeunitorg/freeunit/actions/runs/40428047422
+            # (360 s of pytest), 59 s of it test_settings_send_timeout: its
+            # 40 MiB body went through recvall(), which appended 4 KiB reads
+            # to a bytes object.  recvall() collects into a bytearray now
+            # (#866).  The JUnit report of run 41226901509 puts the file's
+            # tests at 125 s with that copy capped; the full body adds less
+            # than a second.
+            #
+            # The entries are in descending order of time: each one goes to
+            # the least loaded shard, so a large file late in the list would
+            # land on a shard that is already full.
+            #
+            # The python legs upload a JUnit report (junit-python-*), which
+            # has the time of each test, to recompute the table from.
+            # Re-measure a file when its cost changes.
             heavy="
+              test/test_settings.py:125
               test/test_app_start_timeout.py:72
-              test/test_settings.py:170
               test/test_otel.py:34
               test/test_proxy.py:27
               test/test_tls.py:22
@@ -1076,11 +1081,29 @@ jobs:
             # ubuntu-26.04 ships sudo-rs, which ignores -E ("preserving the
             # entire environment is not supported").  Pass the variables the
             # suite reads by name; this works with sudo-rs and classic sudo.
+            #
+            # The python legs also write a JUnit report, uploaded below, so
+            # the heavy= shard table can be recomputed from measured times.
+            junit=
+            if [ "${{ steps.metadata.outputs.module }}" == "python" ]; then
+              junit="--junitxml=$RUNNER_TEMP/junit-python-${{ steps.metadata.outputs.version }}.xml"
+            fi
             sudo env UNIT_PYTHONHOME="${UNIT_PYTHONHOME:-}" \
                      JAVA_HOME="${JAVA_HOME:-}" TZ="${TZ:-}" \
-              pytest-3 --print-log --unsafe ${port} \
+              pytest-3 --print-log --unsafe ${port} ${junit} \
               ${{ steps.metadata.outputs.testpath }}
           fi
+
+      # Per-test times of the python legs, for the heavy= table above.
+      # always(): a failed or timed-out run still has times worth keeping.
+      - name: Upload the JUnit report
+        if: ${{ always() && steps.metadata.outputs.module == 'python' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-python-${{ steps.metadata.outputs.version }}
+          path: ${{ runner.temp }}/junit-python-${{ steps.metadata.outputs.version }}.xml
+          retention-days: 14
+          if-no-files-found: ignore
 
       # check_prerequisites() skips the whole file when the clang/wasi-sysroot
       # fixture cannot be built, so an incomplete toolchain would leave this
