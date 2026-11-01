@@ -1,0 +1,286 @@
+name: "Docker nightly (FreeUnit master, PHP pre-release)"
+
+# Scheduled images of FreeUnit master for PHP versions that have no release
+# image yet.  They go to GHCR only, as
+#   ghcr.io/freeunitorg/freeunit:<channel>-<variant>
+#   ghcr.io/freeunitorg/freeunit:<channel>-<variant>-<YYYYMMDD>
+# and never to Docker Hub.  The release images stay in release-docker.yml,
+# built from pkg/eol.json.
+#
+# Variants:
+#   php-8.6: channel "nightly", every night.
+#            FROM php:8.6-cli-trixie once it exists (8.6.0 GA), until then
+#            php:8.6-rc-cli-trixie.  The 8.6 images are thread safe (ZTS)
+#            and have no mbstring.  At GA, 8.6 goes into pkg/eol.json and the
+#            release images, and this variant can go.
+#   php-8.7: channel "weekly", every Monday: it compiles PHP from source,
+#            about 8 minutes of a runner, and php-src master does not need
+#            a daily image.  FROM a PHP built from php-src master
+#            (pkg/docker/nightly/Dockerfile.php-src).
+#
+# Each cron line runs one variant; a pull request and a manual dispatch run
+# both.
+#
+# The FreeUnit Dockerfile is generated in the job from
+# pkg/docker/template.Dockerfile with the base image passed to make, so no
+# extra Dockerfile.php-* is committed (check-version.sh treats those as
+# generated from pkg/eol.json).  Each image is smoke-tested before it is
+# pushed.  A pull request that changes this workflow or pkg/docker/nightly/
+# builds and tests the images from its own branch, and pushes nothing.
+#
+# Two jobs.  "image" builds and tests with a read-only token: a pull request
+# runs the workflow file from its own branch, so the job that runs on
+# pull_request must not hold packages: write, or a branch could push over
+# the release tags of ghcr.io/freeunitorg/freeunit.  "publish" holds that
+# permission, never runs on pull_request, and pushes the tested image that
+# "image" handed over as an artifact.
+#
+# The images are amd64 only, and not for production.
+
+on:
+  schedule:
+    # The variant matrix below compares github.event.schedule with these
+    # two strings: change them in both places.
+    - cron: '17 3 * * *'   # php-8.6, nightly
+    - cron: '47 3 * * 1'   # php-8.7, weekly
+  pull_request:
+    paths:
+      - .github/workflows/docker-nightly.yml
+      - pkg/docker/nightly/**
+  workflow_dispatch:
+    inputs:
+      php_ref:
+        description: 'php-8.7: php-src branch, tag or commit'
+        required: false
+        default: 'master'
+      push:
+        description: 'Push the images to GHCR'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# Cancel only a superseded pull request run.  A scheduled or dispatched
+# run on master must not cancel another one between its two pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  image:
+    # GitHub appends the matrix values to the name.
+    name: image
+    # template.Dockerfile clones freeunitorg/freeunit by branch name, so a
+    # pull request from a fork would build an upstream branch, or none.
+    # Such a pull request cannot push either; it skips the job.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.publish.outputs.publish }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(github.event.schedule == '17 3 * * *' && '[{"variant":"php-8.6","version":"8.6","channel":"nightly"}]' || github.event.schedule == '47 3 * * 1' && '[{"variant":"php-8.7","version":"8.7","channel":"weekly"}]' || '[{"variant":"php-8.6","version":"8.6","channel":"nightly"},{"variant":"php-8.7","version":"8.7","channel":"weekly"}]') }}
+
+    env:
+      VARIANT: ${{ matrix.variant }}
+      VERSION: ${{ matrix.version }}
+      CHANNEL: ${{ matrix.channel }}
+      # The FreeUnit branch the image clones: the pull request branch, or
+      # master.  template.Dockerfile clones it by name.
+      UNIT_REF: ${{ github.head_ref || 'master' }}
+      PHP_REF: ${{ inputs.php_ref || 'master' }}
+      IMAGE: ghcr.io/${{ github.repository }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Base image
+        run: |
+          set -eux
+          case "$VARIANT" in
+          php-8.6)
+            # Fall back to the RC only when the GA tag does not exist.  Any
+            # other registry error fails the job, so a transient error does
+            # not publish an RC image under the nightly tag after GA.
+            if out=$(docker manifest inspect php:8.6-cli-trixie 2>&1); then
+              base=php:8.6-cli-trixie
+            elif printf '%s\n' "$out" | grep -qi 'no such manifest'; then
+              base=php:8.6-rc-cli-trixie
+            else
+              printf '%s\n' "$out"
+              exit 1
+            fi
+            docker pull "$base"
+            ;;
+          php-8.7)
+            base=freeunit-nightly-base:php-8.7
+            docker build --build-arg PHP_REF="$PHP_REF" -t "$base" \
+              -f pkg/docker/nightly/Dockerfile.php-src pkg/docker/nightly
+            ;;
+          esac
+          unit_rev=$(git ls-remote "https://github.com/${{ github.repository }}" \
+            "refs/heads/$UNIT_REF" | cut -f1)
+          base_id=$(docker image inspect --format '{{ index .RepoDigests 0 }}' "$base" 2>/dev/null \
+            || docker image inspect --format '{{ .Id }}' "$base")
+          php_src=$(docker run --rm "$base" sh -c 'cat /usr/local/etc/php-src.commit 2>/dev/null' || true)
+          {
+            echo "BASE=$base"
+            echo "BASE_ID=$base_id"
+            echo "UNIT_REV=$unit_rev"
+            echo "PHP_SRC=$php_src"
+            echo "DAY=$(date -u +%Y%m%d)"
+          } >> "$GITHUB_ENV"
+          {
+            echo "### $VARIANT"
+            echo "- base: \`$base\` (\`$base_id\`)"
+            echo "- FreeUnit: \`$UNIT_REF\` at \`$unit_rev\`"
+            [ -z "$php_src" ] || echo "- php-src: \`$php_src\`"
+            docker run --rm "$base" php -r 'echo "- PHP: ", PHP_VERSION, (PHP_ZTS ? " ZTS" : " NTS"), "\n";'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate the Dockerfile
+        run: |
+          set -eux
+          make -C pkg/docker VERSIONS_php="$VERSION" \
+            "CONTAINER_$VARIANT=$BASE" "Dockerfile.$VARIANT"
+          grep -m1 '^FROM' "pkg/docker/Dockerfile.$VARIANT"
+
+      - name: Build
+        run: |
+          set -eux
+          # The template clones UNIT_REF by branch name and labels the
+          # image with it; the labels below name the dated tag, the commit
+          # and the base instead, so a dated image says what it contains.
+          docker build --pull=false --build-arg UNIT_VERSION="$UNIT_REF" \
+            --label "org.opencontainers.image.version=$CHANNEL-$VARIANT-$DAY" \
+            --label "org.opencontainers.image.revision=$UNIT_REV" \
+            --label "org.opencontainers.image.base.name=$BASE" \
+            --label "org.opencontainers.image.base.digest=$BASE_ID" \
+            --label "org.freeunit.php-src.commit=$PHP_SRC" \
+            -t "freeunit-nightly:$VARIANT" \
+            -f "pkg/docker/Dockerfile.$VARIANT" pkg/docker
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/www" "$RUNNER_TEMP/init"
+          cat > "$RUNNER_TEMP/www/index.php" <<'PHP'
+          <?php
+          echo 'ok:', PHP_VERSION, (PHP_ZTS ? ' ZTS' : ' NTS'), "\n";
+          PHP
+          # The entrypoint applies /docker-entrypoint.d/*.json with a
+          # temporary daemon, stops it and then starts the final one.  A
+          # PUT from outside could reach the temporary daemon and be lost,
+          # so the configuration goes through that directory.
+          cat > "$RUNNER_TEMP/init/config.json" <<'JSON'
+          {"listeners":{"*:8080":{"pass":"applications/php"}},
+           "applications":{"php":{"type":"php","root":"/www","script":"index.php"}}}
+          JSON
+          chmod -R a+rX "$RUNNER_TEMP/www" "$RUNNER_TEMP/init"
+          docker run -d --name smoke -p 127.0.0.1:8080:8080 \
+            -v "$RUNNER_TEMP/www:/www:ro" \
+            -v "$RUNNER_TEMP/init:/docker-entrypoint.d:ro" \
+            "freeunit-nightly:$VARIANT"
+          body=
+          for _ in $(seq 60); do
+            body=$(curl -fsS http://127.0.0.1:8080/ 2>/dev/null) && break
+            sleep 1
+          done
+          echo "$body"
+          printf '%s\n' "$body" | grep -E "^ok:$VERSION\." \
+            || { echo "the PHP application did not answer with PHP $VERSION"; exit 1; }
+          docker exec smoke unitd --version
+          echo "- answer: \`$body\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Unit log
+        if: always()
+        run: docker logs smoke 2>&1 | tail -60 || true
+
+      - name: Decide whether to publish
+        id: publish
+        run: |
+          if [ "${{ github.event_name }}" = schedule ] \
+             || { [ "${{ github.event_name }}" = workflow_dispatch ] && [ "${{ inputs.push }}" = true ]; }; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save the image
+        if: steps.publish.outputs.publish == 'true'
+        run: |
+          set -eux
+          docker save "freeunit-nightly:$VARIANT" | gzip -1 > "$RUNNER_TEMP/image.tar.gz"
+          echo "$DAY" > "$RUNNER_TEMP/day"
+
+      - uses: actions/upload-artifact@v7
+        if: steps.publish.outputs.publish == 'true'
+        with:
+          name: image-${{ matrix.variant }}
+          path: |
+            ${{ runner.temp }}/image.tar.gz
+            ${{ runner.temp }}/day
+          retention-days: 1
+
+  publish:
+    # No matrix value in the name: a skipped job shows the expression as is.
+    name: publish
+    needs: image
+    # Never on pull_request: this job holds packages: write.
+    # !cancelled(): one variant that fails to build (php-src master can
+    # break) must not hold back the other.  The failed variant has no
+    # artifact, so its publish leg fails at the download and stays red.
+    if: >-
+      !cancelled() && github.event_name != 'pull_request'
+      && needs.image.outputs.publish == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(github.event.schedule == '17 3 * * *' && '[{"variant":"php-8.6","version":"8.6","channel":"nightly"}]' || github.event.schedule == '47 3 * * 1' && '[{"variant":"php-8.7","version":"8.7","channel":"weekly"}]' || '[{"variant":"php-8.6","version":"8.6","channel":"nightly"},{"variant":"php-8.7","version":"8.7","channel":"weekly"}]') }}
+
+    env:
+      VARIANT: ${{ matrix.variant }}
+      CHANNEL: ${{ matrix.channel }}
+      IMAGE: ghcr.io/${{ github.repository }}
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: image-${{ matrix.variant }}
+          path: ${{ runner.temp }}/image
+
+      - name: Load the image
+        run: |
+          set -eux
+          gunzip -c "$RUNNER_TEMP/image/image.tar.gz" | docker load
+          echo "DAY=$(cat "$RUNNER_TEMP/image/day")" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        run: |
+          set -eux
+          # The dated tag first: a run that stops between the two pushes
+          # leaves the floating tag on the previous, complete build.
+          for tag in "$CHANNEL-$VARIANT-$DAY" "$CHANNEL-$VARIANT"; do
+            docker tag "freeunit-nightly:$VARIANT" "$IMAGE:$tag"
+            docker push "$IMAGE:$tag"
+          done
+          echo "- pushed: \`$IMAGE:$CHANNEL-$VARIANT-$DAY\`, \`$IMAGE:$CHANNEL-$VARIANT\`" >> "$GITHUB_STEP_SUMMARY"
