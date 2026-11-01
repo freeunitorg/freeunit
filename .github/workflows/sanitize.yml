@@ -172,10 +172,15 @@ jobs:
             # On the old code it fails only when libunit fills released
             # memory, and only a --debug build does that.  Every build-test
             # leg is a release build.
+            #
+            # test_php_script_open checks the debug record that says a fixed
+            # script ran from OPcache without an open; it skips that check
+            # without --debug.
             pytest_opts: ""
             tests: >-
               test/test_php_application.py
               test/test_php_targets.py
+              test/test_php_script_open.py
               test/test_app_lifecycle.py
           # Go is where the app-side port-fd double-close actually manifested
           # (a flaky "close(N) failed: Bad file descriptor" in the go isolation
