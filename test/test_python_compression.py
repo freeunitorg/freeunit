@@ -607,3 +607,109 @@ def test_python_compression_short_body(encoding, body):
 
     assert coded != b'', 'a coded body is never empty'
     assert decoder(encoding)(coded) == body.encode(), 'complete stream'
+
+
+@pytest.mark.parametrize('encoding', ENCODINGS)
+def test_python_compression_unknown_length(encoding):
+    # A streamed response with no Content-Length (#856).  The router used to
+    # skip compression for an unknown length, so such a response, and any
+    # PHP script that does not send Content-Length, was never compressed.
+    # It is coded, sent chunked, and the last buffer ends the stream.
+    setup_compression(encoding)
+
+    status, headers, coded = fetch(
+        3001, encoding, extra={'X-Content-Length': 'none'}
+    )
+
+    assert status == 200, 'status'
+    assert headers.get('Content-Encoding') == encoding, 'coded'
+    assert headers.get('Transfer-Encoding') == 'chunked', 'chunked'
+    assert 'Content-Length' not in headers, 'no length'
+    assert headers.get('Vary') == 'Accept-Encoding', 'vary'
+    assert decoder(encoding)(dechunk(coded)) == expected(3001), 'decodes'
+
+
+@pytest.mark.parametrize('encoding', ENCODINGS)
+def test_python_compression_unknown_length_part_flushed(encoding):
+    # With no Content-Length, each part must still reach the client while
+    # the response streams: the stream is flushed after each part and ended
+    # only by the last buffer.
+    decode = stream_decoder(encoding)
+    setup_compression(encoding)
+
+    sock = client.get(
+        headers={
+            **request_headers(3002, encoding, parts=2, delay=3),
+            'X-Content-Length': 'none',
+        },
+        no_recv=True,
+    )
+    sock.settimeout(30)
+
+    data = b''
+    while b'\r\n\r\n' not in data:
+        part = sock.recv(4096)
+        assert part, 'the response starts'
+        data += part
+
+    head, _, data = data.partition(b'\r\n\r\n')
+    assert b'Content-Encoding: ' + encoding.encode() in head, 'coded'
+
+    sock.settimeout(1)
+
+    decoded = b''
+    deadline = time.monotonic() + 2
+
+    while time.monotonic() < deadline and len(decoded) < SIZE:
+        while True:
+            if data.startswith(b'\r\n'):
+                data = data[2:]
+
+            end = data.find(b'\r\n')
+            if end == -1:
+                break
+
+            size = int(data[:end], 16)
+            if len(data) < end + 2 + size:
+                break
+
+            assert size != 0, 'the response is still streaming'
+
+            decoded += decode(data[end + 2 : end + 2 + size])
+            data = data[end + 2 + size :]
+
+        if len(decoded) >= SIZE:
+            break
+
+        try:
+            part = sock.recv(4096)
+        except socket.timeout:
+            continue
+
+        assert part, 'the response is still streaming'
+        data += part
+
+    sock.close()
+
+    assert decoded == expected(3002, parts=1), 'the first part, decoded'
+
+
+def test_python_compression_unknown_length_identity_refused():
+    # With an unknown length, "identity;q=0" used to get the identity body
+    # it refused, because negotiation was skipped.  It is negotiated now:
+    # an acceptable coding is used, and none at all is a 406.
+    setup_compression('gzip')
+
+    status, headers, coded = fetch(
+        3003, 'gzip, identity;q=0', extra={'X-Content-Length': 'none'}
+    )
+
+    assert status == 200, 'status'
+    assert headers.get('Content-Encoding') == 'gzip', 'coded'
+    assert gzip.decompress(dechunk(coded)) == expected(3003), 'decodes'
+
+    status, _, _ = fetch(
+        3004, 'identity;q=0', extra={'X-Content-Length': 'none'}
+    )
+
+    assert status == 406, 'nothing acceptable'

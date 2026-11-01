@@ -340,7 +340,14 @@ nxt_http_comp_compress_app_response(nxt_task_t *task, nxt_http_request_t *r,
 
         in_len = in->mem.free - in->mem.pos;
 
-        last = ctx->clen_sent + in_len == ctx->resp_clen;
+        /*
+         * A known length ends the stream with the byte that reaches it.
+         * An unknown one ends it with the last buffer: a data buffer that
+         * carries the flag, or else the sync buffer above.
+         */
+        last = (ctx->resp_clen == -1)
+               ? nxt_buf_is_last(in)
+               : ctx->clen_sent + in_len == ctx->resp_clen;
 
         if (in_len == 0 && !last) {
             goto release;
@@ -1462,12 +1469,20 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
     r->comp_ctx = NULL;
 
     /*
-     * No length, or an empty body.  An application's "Content-Length: 0"
-     * is a field, not content_length_n, so it is read through the same
-     * function as the "min_length" test.  Before, such a response was
-     * coded to an empty stream, or refused with 406 for "identity;q=0".
+     * An empty body has nothing to code.  An application's
+     * "Content-Length: 0" is a field, not content_length_n, so it is read
+     * through the same function as the "min_length" test.  Before, such a
+     * response was coded to an empty stream, or refused with 406 for
+     * "identity;q=0".
+     *
+     * A body of unknown length (-1) is negotiated and coded like any other:
+     * it is sent chunked, and the last buffer of the response ends the
+     * stream.  "min_length" applies only to a known length, see
+     * nxt_http_comp_below_min_len().  Unknown length used to skip
+     * compression as well, so a streamed application response, and any PHP
+     * script that does not send Content-Length, was never compressed (#856).
      */
-    if (nxt_http_comp_resp_length(r) <= 0) {
+    if (nxt_http_comp_resp_length(r) == 0) {
         return NXT_OK;
     }
 
