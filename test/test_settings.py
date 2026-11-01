@@ -485,6 +485,9 @@ Connection: close
     assert re.search(r'200 OK', data), 'send timeout status  2'
     assert len(data) > data_len, 'send timeout data 2'
 
+    # The default run keeps /settings between tests.
+    assert 'success' in client.conf_delete('settings/http/send_timeout')
+
 
 def test_settings_send_timeout_recovery(temp_dir):
     # test_settings_send_timeout checks the framing of a single aborted
