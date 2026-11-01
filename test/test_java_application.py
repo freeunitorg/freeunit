@@ -152,7 +152,7 @@ def test_java_application_session_active(date_to_sec_epoch, sec_epoch):
     assert (
         abs(
             date_to_sec_epoch(resp['headers']['X-Session-Last-Access-Time'])
-            - sec_epoch
+            - sec_epoch()
         )
         < 5
     ), 'session last access time'

@@ -1,4 +1,5 @@
 import atexit
+import datetime
 import fcntl
 import json
 import os
@@ -1276,8 +1277,18 @@ def pytest_sessionfinish():
 
 @pytest.fixture
 def date_to_sec_epoch():
+    # Seconds since the epoch, independent of the host time zone.  A date
+    # with a numeric offset (%z) is converted by that offset.  A date
+    # without one is UTC: HTTP dates ("GMT") and OpenSSL validity dates
+    # are.  time.mktime() would read it as local time instead, which is
+    # off by the zone offset, and by another hour at a DST change.
     def _date_to_sec_epoch(date, template='%a, %d %b %Y %X %Z'):
-        return time.mktime(time.strptime(date, template))
+        parsed = datetime.datetime.strptime(date, template)
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+
+        return parsed.timestamp()
 
     return _date_to_sec_epoch
 
@@ -1319,7 +1330,11 @@ def search_in_file():
 
 @pytest.fixture
 def sec_epoch():
-    return time.mktime(time.gmtime())
+    # Return a function, not a value.  The fixture runs before the test
+    # starts the application, which can take several seconds on a slow
+    # host.  Read the clock when the test checks the time.  time.time() is
+    # the epoch in UTC; compare it with date_to_sec_epoch(), which is too.
+    return time.time
 
 
 @pytest.fixture()
