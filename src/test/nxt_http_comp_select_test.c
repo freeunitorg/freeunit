@@ -311,6 +311,74 @@ nxt_hcs_expect(nxt_hcs_ctx_t *ctx)
 #endif
 #endif
 
+    /*
+     * nxt_http_request_accept_encoding() caches the first Accept-Encoding
+     * field on r->accept_encoding and sets r->multi_accept_encoding only when
+     * a second header line arrives.  A single header is returned in O(1)
+     * without walking r->inline_fields.
+     */
+    ctx->r->accept_encoding = NULL;
+    ctx->r->multi_accept_encoding = 0;
+    ctx->r->num_inline_fields = 0;
+
+    res = nxt_http_comp_test_accept_encoding(ctx->r, &value);
+    NXT_TEST_CHECK(ctx->thr->log, res == NXT_OK && value.length == 0,
+                   "http comp accept-encoding test failed: absent gave %uz",
+                   value.length);
+
+    ctx->r->inline_fields[0].hash = 0x5678;
+    ctx->r->inline_fields[0].skip = 0;
+    ctx->r->inline_fields[0].name = (u_char *) "Accept-Encoding";
+    ctx->r->inline_fields[0].name_length = nxt_length("Accept-Encoding");
+    ctx->r->inline_fields[0].value = (u_char *) "gzip";
+    ctx->r->inline_fields[0].value_length = nxt_length("gzip");
+
+    (void) nxt_http_request_accept_encoding(ctx->r,
+                                            &ctx->r->inline_fields[0], 0);
+
+    /*
+     * Single header fast path: num_inline_fields is still 0, so a scan of
+     * inline_fields would find nothing.
+     */
+    res = nxt_http_comp_test_accept_encoding(ctx->r, &value);
+    NXT_TEST_CHECK(ctx->thr->log,
+                   res == NXT_OK && value.length == nxt_length("gzip")
+                   && memcmp(value.start, "gzip", nxt_length("gzip")) == 0,
+                   "http comp accept-encoding test failed: single fast-path "
+                   "gave \"%*s\" (%uz)", value.length, value.start,
+                   value.length);
+
+    ctx->r->inline_fields[0].skip = 1;
+    res = nxt_http_comp_test_accept_encoding(ctx->r, &value);
+    NXT_TEST_CHECK(ctx->thr->log, res == NXT_OK && value.length == 0,
+                   "http comp accept-encoding test failed: skipped single "
+                   "gave %uz", value.length);
+    ctx->r->inline_fields[0].skip = 0;
+
+    ctx->r->inline_fields[1].hash = 0x5678;
+    ctx->r->inline_fields[1].skip = 0;
+    ctx->r->inline_fields[1].name = (u_char *) "Accept-Encoding";
+    ctx->r->inline_fields[1].name_length = nxt_length("Accept-Encoding");
+    ctx->r->inline_fields[1].value = (u_char *) "br";
+    ctx->r->inline_fields[1].value_length = nxt_length("br");
+    ctx->r->num_inline_fields = 2;
+
+    (void) nxt_http_request_accept_encoding(ctx->r,
+                                            &ctx->r->inline_fields[1], 0);
+
+    res = nxt_http_comp_test_accept_encoding(ctx->r, &value);
+    NXT_TEST_CHECK(ctx->thr->log,
+                   res == NXT_OK && ctx->r->multi_accept_encoding == 1
+                   && value.length == nxt_length("gzip, br")
+                   && memcmp(value.start, "gzip, br",
+                             nxt_length("gzip, br")) == 0,
+                   "http comp accept-encoding test failed: multi gave \"%*s\"",
+                   value.length, value.start);
+
+    ctx->r->accept_encoding = NULL;
+    ctx->r->multi_accept_encoding = 0;
+    ctx->r->num_inline_fields = 0;
+
     return NXT_OK;
 }
 

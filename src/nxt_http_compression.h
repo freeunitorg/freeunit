@@ -113,6 +113,8 @@ extern nxt_int_t nxt_http_comp_compression_init(nxt_task_t *task,
 extern nxt_int_t nxt_http_comp_test_select(nxt_http_request_t *r,
     const nxt_str_t *value, nxt_bool_t compression, nxt_off_t min_len,
     nxt_bool_t negotiate, bool *identity_refused);
+extern nxt_int_t nxt_http_comp_test_accept_encoding(nxt_http_request_t *r,
+    nxt_str_t *value);
 #endif
 
 #endif  /* _NXT_COMPRESSION_H_INCLUDED_ */
