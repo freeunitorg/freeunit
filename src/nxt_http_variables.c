@@ -138,8 +138,8 @@ nxt_http_register_variables(void)
  * A variable that names a header that carries a credential by definition:
  * Authorization, Proxy-Authorization, Cookie or Set-Cookie, after "header_"
  * (a request header) or "response_header_" (a response header), the two
- * prefixes that nxt_http_unknown_var_ref() resolves to a header.  The router
- * warns about such a variable in an access log format.
+ * prefixes that nxt_http_unknown_var_ref() resolves to a header.  The access
+ * log writes such a variable as "REDACTED".
  *
  * The comparison follows nxt_http_header_hash() for a request header and
  * nxt_http_field_name_cmp() for a response header: a header name is matched
