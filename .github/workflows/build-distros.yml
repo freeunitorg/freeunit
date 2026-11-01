@@ -77,6 +77,9 @@ jobs:
       - name: Run libunit port_recv fd-ownership test
         run: ./build/unit_port_recv_test
 
+      - name: Run libunit wake test
+        run: ./build/unit_wake_test
+
       - name: configure unit-php
         run: ./configure php
 
@@ -220,6 +223,9 @@ jobs:
 
       - name: Run libunit port_recv fd-ownership test
         run: ./build/unit_port_recv_test
+
+      - name: Run libunit wake test
+        run: ./build/unit_wake_test
 
       - name: configure unit-php
         run: |
