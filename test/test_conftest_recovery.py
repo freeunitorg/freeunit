@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import conftest
+from unit import port as port_map
 from unit.option import Options
 
 # The session cases run the real conftest.py in a child pytest session:
@@ -148,6 +149,10 @@ def test_survives(survives):
 
 def test_mounted(mounted):
     record(pgid=unit_instance['pgid'], temp_dir=unit_instance['temp_dir'])
+
+
+def test_base():
+    record(base=int(os.environ['_UNIT_TEST_PORT_BASE']))
 '''
 
 
@@ -157,9 +162,15 @@ def run_child(tmp_path, *names):
     (tmp_path / 'test_child.py').write_text(textwrap.dedent(TESTS))
     record = tmp_path / 'record.jsonl'
 
+    # The child resolves its own port base from --port or UNIT_TEST_PORT
+    # and else falls back to 8080.  Give it the base of this session, or
+    # it binds 8080 where that port is taken.
+    base = str(port_map.base())
+
     env = dict(os.environ)
     env['RECORD'] = str(record)
     env['UNIT_TEST_PROCESS_TIMEOUT'] = str(PROCESS_TIMEOUT)
+    env['UNIT_TEST_PORT'] = base
 
     child = subprocess.Popen(
         [
@@ -173,6 +184,8 @@ def run_child(tmp_path, *names):
             '-q',
             '--durations=0',
             '--durations-min=0',
+            '--port',
+            base,
             *[f'test_child.py::test_{name}' for name in names],
         ],
         cwd=tmp_path,
@@ -317,3 +330,12 @@ def test_recovery_kills_group(monkeypatch, tmp_path):
         if p.poll() is None:
             os.killpg(p.pid, signal.SIGKILL)
             p.wait()
+
+
+def test_recovery_child_uses_parent_port_base(tmp_path):
+    # Run off the default base (--port), a child that fell back to 8080
+    # failed where 8080 is taken.
+    counts, rec, text = run_child(tmp_path, 'base')
+
+    assert counts == {'passed': 1}, text
+    assert rec[0]['base'] == port_map.base(), text
