@@ -194,6 +194,13 @@ struct nxt_conn_s {
     uint8_t                       sendfile;     /* 2 bits */
     uint8_t                       tcp_nodelay;  /* 1 bit */
 
+    /*
+     * A PROXY protocol v2 header said that the client spoke TLS to the
+     * proxy.  The connection itself has no TLS session: u.tls stays NULL,
+     * and only the requests report "https" to the applications.
+     */
+    uint8_t                       proxy_protocol_tls;  /* 1 bit */
+
     nxt_queue_link_t              link;
     nxt_conn_t                    *next;
 };

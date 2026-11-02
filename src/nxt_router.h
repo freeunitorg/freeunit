@@ -364,6 +364,10 @@ typedef struct {
     uint8_t                server_version;         /* 1 bit */
     uint8_t                chunked_transform;      /* 1 bit */
 
+    /* NXT_PROXY_PROTOCOL_OFF, _V1 or _V2: the header every connection
+     * on the listener must start with. */
+    uint8_t                proxy_protocol;         /* 2 bits */
+
     nxt_http_forward_t     *forwarded;
     nxt_http_forward_t     *client_ip;
 

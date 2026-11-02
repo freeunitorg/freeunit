@@ -49,6 +49,7 @@ typedef struct {
 typedef struct {
     nxt_str_t         pass;
     nxt_str_t         application;
+    nxt_str_t         proxy_protocol;
     int               backlog;
 } nxt_router_listener_conf_t;
 
@@ -3037,6 +3038,12 @@ static nxt_conf_map_t  nxt_router_listener_conf[] = {
         NXT_CONF_MAP_INT32,
         offsetof(nxt_router_listener_conf_t, backlog),
     },
+
+    {
+        nxt_string("proxy_protocol"),
+        NXT_CONF_MAP_STR,
+        offsetof(nxt_router_listener_conf_t, proxy_protocol),
+    },
 };
 
 
@@ -3707,6 +3714,10 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 
             skcf->server_version = 1;
             skcf->chunked_transform = 0;
+
+            /* The validator has already refused any other value. */
+            skcf->proxy_protocol =
+                nxt_proxy_protocol_version(&lscf.proxy_protocol);
 
             skcf->websocket_conf.max_frame_size = 1024 * 1024;
             skcf->websocket_conf.read_timeout = 60 * 1000;
