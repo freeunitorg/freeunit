@@ -324,8 +324,10 @@ versions without a release image: `nightly-php-8.6` every night (from
 every Monday (from a PHP built from php-src master by
 `pkg/docker/nightly/Dockerfile.php-src`), each also with a
 `<channel>-<variant>-YYYYMMDD` tag. It pushes to GHCR only, `linux/amd64` only. The
-build and smoke job has a read-only token; a separate publish job, which never runs
-on `pull_request`, holds `packages: write`. These images are not for production.
+build and smoke job has a read-only token; a separate publish job holds
+`packages: write` and runs only from `master`, on a schedule or on a dispatch with
+`push=true`, never on `pull_request` or a dispatch of another branch. These images
+are not for production.
 
 ### Rebuilding individual variants without a new FreeUnit release
 
