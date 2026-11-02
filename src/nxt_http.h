@@ -546,6 +546,7 @@ nxt_bool_t nxt_http_set_headers_override_validators(nxt_http_request_t *r);
 nxt_http_set_header_op_t nxt_http_set_headers_encoding_op(
     nxt_http_request_t *r);
 nxt_int_t nxt_http_comp_merge_vary(nxt_http_request_t *r);
+void nxt_http_comp_drop_accept_ranges(nxt_http_request_t *r);
 nxt_int_t nxt_http_set_headers_init(nxt_router_conf_t *rtcf,
     nxt_http_action_t *action, nxt_http_action_conf_t *acf);
 nxt_int_t nxt_http_set_headers(nxt_http_request_t *r);

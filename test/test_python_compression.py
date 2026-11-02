@@ -762,3 +762,40 @@ def test_python_compression_brotli_window(clen):
 
     assert brotli_lgwin(coded) <= 19, 'window'
     assert decoder('br')(coded) == body, 'decodes'
+
+
+@pytest.mark.parametrize(
+    'names',
+    [
+        pytest.param('Accept-Ranges', id='canonical'),
+        pytest.param('accept-ranges', id='lower'),
+        pytest.param('Accept-Ranges,ACCEPT-RANGES', id='twice'),
+    ],
+)
+def test_python_compression_accept_ranges(names):
+    # An application's own Accept-Ranges counts identity bytes, so every
+    # such field goes from the coded response, in any letter case.  The
+    # identity response keeps them all.
+    setup_compression('gzip')
+    extra = {
+        'X-Parts': '1',
+        'X-Body': '0123456789' * 10,
+        'X-Accept-Ranges': names,
+    }
+
+    def ranges(headers):
+        return [k for k in headers if k.lower() == 'accept-ranges']
+
+    status, headers, coded = fetch(3010, 'gzip', extra=extra)
+
+    assert status == 200, 'status'
+    assert headers.get('Content-Encoding') == 'gzip', 'coded'
+    assert ranges(headers) == [], 'coded: no Accept-Ranges'
+    assert gzip.decompress(dechunk(coded)) == b'0123456789' * 10, 'decodes'
+
+    status, headers, body = fetch(3011, 'identity', extra=extra)
+
+    assert status == 200, 'identity status'
+    assert 'Content-Encoding' not in headers, 'identity'
+    assert sorted(ranges(headers)) == sorted(names.split(',')), 'identity'
+    assert body == b'0123456789' * 10, 'identity body'

@@ -1173,6 +1173,46 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
 }
 
 
+/*
+ * Matches on name_length + nxt_memcasecmp(), not nxt_strcasecmp(): a field
+ * name is length-tracked, and its NUL is not part of the type's contract.
+ */
+
+static void
+nxt_http_comp_skip_fields(nxt_http_request_t *r, const char *name,
+    size_t length)
+{
+    nxt_http_field_t  *f;
+
+    nxt_http_fields_each(f, r->resp.inline_fields, r->resp.num_inline_fields,
+                         r->resp.fields)
+    {
+        if (f->name_length == length
+            && nxt_memcasecmp(f->name, name, length) == 0)
+        {
+            f->skip = true;
+        }
+    } nxt_http_fields_loop;
+}
+
+
+/*
+ * A coded body is never served in ranges: a Range request gets identity
+ * bytes.  So a coded response does not advertise ranges.  Called after
+ * "response_headers", which can add the field too.  Only an applied coding
+ * counts, not a static range served as identity.
+ */
+
+void
+nxt_http_comp_drop_accept_ranges(nxt_http_request_t *r)
+{
+    if (nxt_http_comp_wants_compression(r)) {
+        nxt_http_comp_skip_fields(r, "Accept-Ranges",
+                                  nxt_length("Accept-Ranges"));
+    }
+}
+
+
 static nxt_int_t
 nxt_http_comp_set_header(const nxt_http_comp_conf_t *conf,
                          nxt_http_request_t *r, nxt_uint_t comp_idx)
@@ -1201,8 +1241,6 @@ nxt_http_comp_set_header(const nxt_http_comp_conf_t *conf,
     r->resp.content_length_n = -1;
 
     if (r->resp.mime_type == NULL) {
-        nxt_http_field_t *f;
-
         /*
          * As per RFC 2616 section 4.4 item 3, you should not send
          * Content-Length when a Transfer-Encoding header is present.
@@ -1210,22 +1248,10 @@ nxt_http_comp_set_header(const nxt_http_comp_conf_t *conf,
          * Skip every Content-Length, not just the first: leaving a second one
          * behind would emit an advertised body length alongside the chunked
          * framing this response now uses, which a downstream parser can use to
-         * re-frame the body.  Match on name_length + nxt_memcasecmp() rather
-         * than nxt_strcasecmp(): nxt_http_field_t carries a length-tracked
-         * name and only happens to be NUL-terminated on the paths that reach
-         * compression today (libunit-built app responses and static-file
-         * literals), which is not part of the type's contract.
+         * re-frame the body.
          */
-        nxt_http_fields_each(f, r->resp.inline_fields, r->resp.num_inline_fields,
-                             r->resp.fields)
-        {
-            if (f->name_length == nxt_length("Content-Length")
-                && nxt_memcasecmp(f->name, "Content-Length",
-                                  nxt_length("Content-Length")) == 0)
-            {
-                f->skip = true;
-            }
-        } nxt_http_fields_loop;
+        nxt_http_comp_skip_fields(r, "Content-Length",
+                                  nxt_length("Content-Length"));
     }
 
     return NXT_OK;

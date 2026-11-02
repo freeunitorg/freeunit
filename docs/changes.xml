@@ -92,6 +92,14 @@ refuses other updates until "compressors" is added.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a response that Unit compressed kept "Accept-Ranges", from the static
+handler, the application or "response_headers", although a coded body is
+never served in ranges.  It is removed now, as in nginx.
+</para>
+</change>
+
 </changes>
 
 

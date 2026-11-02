@@ -822,6 +822,12 @@ nxt_http_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
         }
     }
 
+    /* After "response_headers", which can add the field. */
+
+    if (r->comp_ctx != NULL) {
+        nxt_http_comp_drop_accept_ranges(r);
+    }
+
     /*
      * RFC 9112 Sect. 6.3: a 1xx, 204 or 304 response, and any response to a
      * HEAD request, never has a message body, no matter what the response
