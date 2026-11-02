@@ -28,12 +28,17 @@ name: "Docker nightly (FreeUnit master, PHP pre-release)"
 # pushed.  A pull request that changes this workflow or pkg/docker/nightly/
 # builds and tests the images from its own branch, and pushes nothing.
 #
-# Two jobs.  "image" builds and tests with a read-only token: a pull request
-# runs the workflow file from its own branch, so the job that runs on
-# pull_request must not hold packages: write, or a branch could push over
-# the release tags of ghcr.io/freeunitorg/freeunit.  "publish" holds that
-# permission, never runs on pull_request, and pushes the tested image that
-# "image" handed over as an artifact.
+# Three jobs.  "decide" is the one gate: publication is allowed only from
+# refs/heads/master, that is on a schedule or on a dispatch of master with
+# push=true.  "image" builds and smoke-tests both variants with a read-only
+# token.  "publish" holds packages: write and pushes the tested image that
+# "image" handed over as an artifact, when "decide" allows it.
+#
+# Push access to the repository is the trust boundary.  A branch can edit
+# this workflow and can give its own workflow packages: write, so the gate
+# stops a branch dispatch from publishing a feature image by mistake; it
+# does not stop someone who can push to this repository.  A server-side gate
+# would be an environment with a deployment-branch rule of master.
 #
 # The images are amd64 only, and not for production.
 
@@ -68,9 +73,34 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  decide:
+    # One gate for the two jobs below: a normal job, not a matrix job, so
+    # the output is one value and no leg can leave it unset.
+    name: decide
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.publish.outputs.publish }}
+    steps:
+      - name: Decide whether to publish
+        id: publish
+        env:
+          PUSH: ${{ inputs.push }}
+        run: |
+          publish=false
+          if [ "$GITHUB_REF" = refs/heads/master ] \
+             && { [ "$GITHUB_EVENT_NAME" = schedule ] \
+                  || { [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$PUSH" = true ]; }; }; then
+            publish=true
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
   image:
     # GitHub appends the matrix values to the name.
     name: image
+    needs: decide
     # template.Dockerfile clones freeunitorg/freeunit by branch name, so a
     # pull request from a fork would build an upstream branch, or none.
     # Such a pull request cannot push either; it skips the job.
@@ -81,8 +111,6 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
-    outputs:
-      publish: ${{ steps.publish.outputs.publish }}
     strategy:
       fail-fast: false
       matrix:
@@ -203,25 +231,15 @@ jobs:
         if: always()
         run: docker logs smoke 2>&1 | tail -60 || true
 
-      - name: Decide whether to publish
-        id: publish
-        run: |
-          if [ "${{ github.event_name }}" = schedule ] \
-             || { [ "${{ github.event_name }}" = workflow_dispatch ] && [ "${{ inputs.push }}" = true ]; }; then
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Save the image
-        if: steps.publish.outputs.publish == 'true'
+        if: needs.decide.outputs.publish == 'true'
         run: |
           set -eux
           docker save "freeunit-nightly:$VARIANT" | gzip -1 > "$RUNNER_TEMP/image.tar.gz"
           echo "$DAY" > "$RUNNER_TEMP/day"
 
       - uses: actions/upload-artifact@v7
-        if: steps.publish.outputs.publish == 'true'
+        if: needs.decide.outputs.publish == 'true'
         with:
           name: image-${{ matrix.variant }}
           path: |
@@ -232,14 +250,16 @@ jobs:
   publish:
     # No matrix value in the name: a skipped job shows the expression as is.
     name: publish
-    needs: image
-    # Never on pull_request: this job holds packages: write.
+    needs: [decide, image]
+    # "decide" is the one gate.  It allows publication only from
+    # refs/heads/master, so a pull request ref and a dispatch of another
+    # branch skip this job.  Push access to the repository is the trust
+    # boundary; see the header.
     # !cancelled(): one variant that fails to build (php-src master can
     # break) must not hold back the other.  The failed variant has no
     # artifact, so its publish leg fails at the download and stays red.
     if: >-
-      !cancelled() && github.event_name != 'pull_request'
-      && needs.image.outputs.publish == 'true'
+      !cancelled() && needs.decide.outputs.publish == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
