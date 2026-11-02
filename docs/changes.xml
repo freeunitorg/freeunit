@@ -10,6 +10,14 @@
          date="2026-10-31" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="security">
+<para>
+update Wasmtime, wasmtime-wasi and wasmtime-wasi-http to 48.0.8 for
+RUSTSEC-2026-0420, RUSTSEC-2026-0423 and RUSTSEC-2026-0424.  Cranelift moves
+to 0.135.8 with Wasmtime.  The contrib C API pin is 48.0.8 too.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 an ASGI application that sent a WebSocket close frame and then raised an
