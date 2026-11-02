@@ -107,6 +107,10 @@ _processes = []
 # interpreter exit so an error path that bypassed unit_stop can never leak a
 # unitd tree.
 _pgids = {}
+# Temp dirs that _recover_unit() left behind on purpose: the unitd group
+# survived SIGKILL, or a mount under the dir is still busy.  Session
+# shutdown must not remove them either.
+_retained_temp_dirs = set()
 _fds_info = {
     'main': {'fds': 0, 'kinds': {}, 'skip': False},
     'router': {
@@ -1078,6 +1082,7 @@ def _recover_unit():
             f'kept {temp_dir}, the next test starts a new unitd',
             file=sys.stderr,
         )
+        _retained_temp_dirs.add(temp_dir)
         return
 
     print(
@@ -1093,6 +1098,7 @@ def _recover_unit():
     # temp dir.  Leave the dir behind then.
     if is_findmnt and not waitforunmount(temp_dir, timeout=50):
         print(f'kept {temp_dir}: still mounted', file=sys.stderr)
+        _retained_temp_dirs.add(temp_dir)
         return
 
     try:
@@ -1401,6 +1407,11 @@ def pytest_sessionfinish():
 
     public_dir(option.cache_dir)
     shutil.rmtree(option.cache_dir)
+
+    # A recovery on the last test leaves option.temp_dir at the dir it
+    # kept.  Keep it here too, with its unitd.pgid file and its mounts.
+    if option.temp_dir in _retained_temp_dirs:
+        return
 
     if not option.save_log and Path(option.temp_dir).is_dir():
         public_dir(option.temp_dir)
