@@ -245,6 +245,8 @@ A summary (OK / FAILED) is printed at the end.
 | `python-3.13-slim` | python:3.13-slim |
 | `python-3.14` | python:3.14 |
 | `python-3.14-slim` | python:3.14-slim |
+| `python-3.15` | python:3.15 |
+| `python-3.15-slim` | python:3.15-slim |
 | `ruby-3.3` | ruby:3.3 |
 | `ruby-3.4` | ruby:3.4 |
 | `ruby-4.0` | ruby:4.0 |
