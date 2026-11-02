@@ -58,6 +58,8 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        the static handler, the application or "response_headers", although a
        coded body is never served in ranges. It is removed now, as in nginx.
 
+    *) Feature: Docker images for Python 3.15.
+
 
 Changes with FreeUnit 1.37.1                                     30 Oct 2026
 

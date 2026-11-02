@@ -100,6 +100,12 @@ never served in ranges.  It is removed now, as in nginx.
 </para>
 </change>
 
+<change type="feature">
+<para>
+Docker images for Python 3.15.
+</para>
+</change>
+
 </changes>
 
 

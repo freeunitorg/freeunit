@@ -76,7 +76,8 @@
     "python": [
       {"version": "3.12", "eol": "2028-10", "supported_until": "2029-10", "slim": true},
       {"version": "3.13", "eol": "2029-10", "supported_until": "2030-10", "slim": true},
-      {"version": "3.14", "eol": "2030-10", "supported_until": "2031-10", "slim": true}
+      {"version": "3.14", "eol": "2030-10", "supported_until": "2031-10", "slim": true},
+      {"version": "3.15", "eol": "2031-10", "supported_until": "2032-10", "slim": true}
     ],
     "ruby": [
       {"version": "3.3", "eol": "2027-03", "supported_until": "2028-03"},

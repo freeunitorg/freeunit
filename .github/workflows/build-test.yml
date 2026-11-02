@@ -438,12 +438,13 @@ jobs:
           testpath="test/test_${module}* test/test_app_lifecycle.py"
 
           # A Python leg runs its interpreter-specific suites whole.  That is
-          # what the three versions are for.  It also takes a share of the
-          # other files, balanced by measured time (see below).  Three runs
-          # of the whole language-agnostic suite cost about 12 minutes per
-          # leg, twice any other language, for tests that no interpreter
-          # distinguishes.  Each shared file now runs on one Python version
-          # instead of three.  The union over the legs does not change.
+          # what the Python versions are for.  It also takes a share of the
+          # other files, balanced by measured time (see below).  A run of the
+          # whole language-agnostic suite on every version costs about 12
+          # minutes per leg, twice any other language, for tests that no
+          # interpreter distinguishes.  Each shared file now runs on one
+          # Python version instead of on all of them.  The union over the
+          # legs does not change.
           #
           # Both lists are built from the files that exist, never from a glob
           # handed to pytest.  There is no test_wsgi_*.py -- WSGI is exercised

@@ -56,6 +56,7 @@ and are available for `linux/amd64` and `linux/arm64`.
 | PHP 8.5 | `ghcr.io/freeunitorg/freeunit:latest-php-8.5` |
 | PHP 8.4 | `ghcr.io/freeunitorg/freeunit:latest-php-8.4` |
 | PHP 8.3 | `ghcr.io/freeunitorg/freeunit:latest-php-8.3` |
+| Python 3.15 | `ghcr.io/freeunitorg/freeunit:latest-python-3.15` |
 | Python 3.14 | `ghcr.io/freeunitorg/freeunit:latest-python-3.14` |
 | Python 3.13 | `ghcr.io/freeunitorg/freeunit:latest-python-3.13` |
 | Python 3.12 | `ghcr.io/freeunitorg/freeunit:latest-python-3.12` |
