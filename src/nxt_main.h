@@ -98,8 +98,6 @@ typedef struct {
 
 #include <nxt_djb_hash.h>
 #include <nxt_murmur_hash.h>
-#include <nxt_hash.h>
-
 #include <nxt_sort.h>
 #include <nxt_list.h>
 
@@ -107,7 +105,6 @@ typedef struct {
 
 typedef struct nxt_buf_s                nxt_buf_t;
 #include <nxt_buf.h>
-#include <nxt_buf_pool.h>
 #include <nxt_recvbuf.h>
 
 typedef struct nxt_conn_s               nxt_conn_t;
