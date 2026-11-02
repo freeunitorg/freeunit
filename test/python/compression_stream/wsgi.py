@@ -25,7 +25,9 @@ def application(environ, start_response):
 
     # X-Content-Length: none sends no Content-Length, so the router does not
     # know the length and sends the body chunked.
-    headers = [('Content-Type', 'text/plain')]
+    headers = [
+        ('Content-Type', environ.get('HTTP_X_CONTENT_TYPE', 'text/plain'))
+    ]
     if clen != 'none':
         headers.append(('Content-Length', clen))
 
