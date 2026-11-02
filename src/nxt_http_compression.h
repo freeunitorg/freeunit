@@ -41,7 +41,13 @@
 #define NXT_HTTP_COMP_ZSTD_COMP_MAX            22
 #endif
 #if NXT_HAVE_BROTLI
-#define NXT_HTTP_COMP_BROTLI_DEFAULT_LEVEL     BROTLI_DEFAULT_QUALITY
+/*
+ * Quality 5, not the library default 11: 11 is meant for offline
+ * compression, and per response it costs much more CPU (not timed here)
+ * and about 6 MiB of state (lgwin 19) for some 10 % smaller output.
+ * 5 matches the cap for streamed responses, so one default covers both.
+ */
+#define NXT_HTTP_COMP_BROTLI_DEFAULT_LEVEL     5
 #define NXT_HTTP_COMP_BROTLI_COMP_MIN          BROTLI_MIN_QUALITY
 #define NXT_HTTP_COMP_BROTLI_COMP_MAX          BROTLI_MAX_QUALITY
 #endif

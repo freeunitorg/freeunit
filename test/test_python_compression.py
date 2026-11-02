@@ -745,11 +745,11 @@ BROTLI_BODY = ' '.join(
 
 
 @pytest.mark.parametrize(
-    'clen, quality', [('none', 5), (str(len(BROTLI_BODY)), 11)]
+    'clen, quality', [('none', 5), (str(len(BROTLI_BODY)), 5)]
 )
 def test_python_compression_brotli_window_quality(clen, quality):
     # The window is capped at 19 bits, whatever the length.  A known length
-    # keeps the configured quality, 11 by default; a stream of unknown
+    # keeps the configured quality, 5 by default; a stream of unknown
     # length uses at most 5.
     setup_compression('br')
     body = BROTLI_BODY.encode()
@@ -768,3 +768,55 @@ def test_python_compression_brotli_window_quality(clen, quality):
     assert brotli_lgwin(coded) <= 19, 'window'
     assert decoder('br')(coded) == body, 'decodes'
     assert coded in brotli_encodes(body, quality), f'quality {quality}'
+
+
+def test_python_compression_brotli_configured_quality():
+    # A configured quality still applies to a known length.
+    client.load('compression_stream', threads=32)
+    assert 'success' in client.conf(
+        {
+            "http": {
+                "compression": {
+                    "types": ["text/plain"],
+                    "compressors": [{"encoding": "br", "level": 11}],
+                }
+            }
+        },
+        'settings',
+    )
+    body = BROTLI_BODY.encode()
+
+    _, _, coded = fetch(1, 'br', extra={'X-Parts': '1', 'X-Body': BROTLI_BODY})
+    coded = dechunk(coded)
+
+    assert coded in brotli_encodes(body, 11), 'quality 11'
+
+
+@pytest.mark.parametrize('types', [None, ['text/event-stream*']])
+def test_python_compression_event_stream(types):
+    # Server-sent events are not compressed by default, only when a "types"
+    # rule names them.
+    client.load('compression_stream', threads=32)
+    comp = {"compressors": [{"encoding": "gzip"}]}
+    if types is not None:
+        comp["types"] = types
+    assert 'success' in client.conf({"http": {"compression": comp}}, 'settings')
+
+    status, headers, coded = fetch(
+        1,
+        'gzip',
+        extra={
+            'X-Content-Type': 'text/event-stream; charset=utf-8',
+            'X-Content-Length': 'none',
+        },
+    )
+
+    assert status == 200, 'status'
+    body = dechunk(coded)
+
+    if types is None:
+        assert 'Content-Encoding' not in headers, 'not coded'
+        assert body == expected(1), 'identity body'
+    else:
+        assert headers.get('Content-Encoding') == 'gzip', 'coded'
+        assert gzip.decompress(body) == expected(1), 'decodes'

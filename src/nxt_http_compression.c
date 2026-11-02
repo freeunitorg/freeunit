@@ -189,6 +189,23 @@ static const nxt_http_comp_type_t  nxt_http_comp_compressors[] = {
 };
 
 
+static nxt_bool_t
+nxt_http_comp_is_event_stream(const nxt_str_t *mime_type)
+{
+    static const nxt_str_t  sse = nxt_string("text/event-stream");
+
+    if (mime_type->length < sse.length
+        || nxt_strncasecmp(mime_type->start, sse.start, sse.length) != 0)
+    {
+        return 0;
+    }
+
+    return mime_type->length == sse.length
+           || mime_type->start[sse.length] == ';'
+           || mime_type->start[sse.length] == ' ';
+}
+
+
 nxt_inline nxt_http_comp_conf_t *
 nxt_http_comp_request_conf(const nxt_http_request_t *r)
 {
@@ -1623,6 +1640,18 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
      */
 
     if (mime_type.start == NULL) {
+        return identity_refused ? nxt_http_comp_not_acceptable(r) : NXT_OK;
+    }
+
+    /*
+     * Server-sent events are not compressed unless a "types" rule asks for
+     * them: such a stream holds its compressor for as long as it is open,
+     * and each event is flushed, so it gains little.
+     */
+
+    if (conf->mime_types_rule == NULL
+        && nxt_http_comp_is_event_stream(&mime_type))
+    {
         return identity_refused ? nxt_http_comp_not_acceptable(r) : NXT_OK;
     }
 
