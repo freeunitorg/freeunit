@@ -8390,6 +8390,9 @@ components:
     configSettingsHttpCompression:
       type: object
       description: "An object that describes HTTP compression."
+      required:
+        - compressors
+
       properties:
         types:
           $ref: "#/components/schemas/configSettingsHttpCompressionTypes"

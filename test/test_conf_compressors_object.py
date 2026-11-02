@@ -2,6 +2,9 @@
 
 #647: a "level" out of the range of an int was accepted, and compression
 was off for the whole configuration.
+
+A "compression" object without "compressors" passed validation, and
+compression was off for the whole configuration, with no log line.
 """
 
 import json
@@ -36,6 +39,37 @@ def test_compressors_object_form(compressor, result):
         {"settings": {"http": {"compression": compression}}, **base}
     )
     assert 'success' in client.conf(base), 'the router is still alive'
+
+
+def test_compressors_required():
+    base = {
+        "listeners": {"*:8080": {"pass": "routes"}},
+        "routes": [{"action": {"return": 200}}],
+    }
+
+    compression = {"types": ["text/css"]}
+    resp = client.conf(
+        {"settings": {"http": {"compression": compression}}, **base}
+    )
+
+    assert 'error' in resp, 'no compressors'
+    assert resp.get('detail') == 'Required parameter "compressors" is missing.'
+
+    compression = {
+        "types": ["text/css"],
+        "compressors": {"encoding": "identity"},
+    }
+    assert 'success' in client.conf(
+        {"settings": {"http": {"compression": compression}}, **base}
+    )
+
+    resp = client.conf_delete('settings/http/compression/compressors')
+
+    assert 'error' in resp, 'compressors deleted'
+    assert resp.get('detail') == 'Required parameter "compressors" is missing.'
+    assert client.conf_get('settings/http/compression/compressors') == {
+        "encoding": "identity"
+    }, 'configuration unchanged'
 
 
 @pytest.mark.parametrize(
@@ -125,6 +159,60 @@ def test_compressors_level_stored(
         assert 'success' in client.conf(
             '1', 'settings/http/compression/compressors/level'
         ), 'level corrected'
+        assert 'success' in client.conf(base['routes'], 'routes'), 'update'
+
+    finally:
+        unit_stop()
+        shutil.rmtree(statedir, ignore_errors=True)
+
+
+def test_compressors_missing_stored(
+    requires_restart, wait_for_record, monkeypatch
+):
+    """Earlier versions accepted a "compression" object without
+    "compressors" and compressed nothing.  unitd still loads such a stored
+    configuration, warns, and serves requests.  An update through the API
+    is refused until "compressors" is added."""
+
+    base = {
+        "listeners": {"*:8080": {"pass": "routes"}},
+        "routes": [{"action": {"return": 200}}],
+    }
+    assert 'success' in client.conf(base)
+
+    conf = client.conf_get()
+    conf['settings'] = {'http': {'compression': {'types': ['text/css']}}}
+
+    unit_stop()
+
+    statedir = Path(tempfile.mkdtemp(prefix='unit-state-'))
+    (statedir / 'conf.json').write_text(json.dumps(conf))
+
+    monkeypatch.setattr(Status, '_check_zeros', lambda: None)
+
+    try:
+        unit_run(state_dir=str(statedir))
+
+        assert client.conf_get('settings/http/compression') == {
+            'types': ['text/css']
+        }, 'stored configuration loaded'
+
+        assert wait_for_record(
+            r'\[warn\].+the restored configuration has no "compressors" at '
+            r'"/settings/http/compression/compressors"'
+        ), 'warning'
+
+        assert client.get()['status'] == 200, 'served'
+
+        resp = client.conf(base['routes'], 'routes')
+        assert 'error' in resp, 'update refused'
+        assert resp['location']['path'] == (
+            '/settings/http/compression/compressors'
+        ), 'pointer'
+
+        assert 'success' in client.conf(
+            {'encoding': 'identity'}, 'settings/http/compression/compressors'
+        ), 'compressors added'
         assert 'success' in client.conf(base['routes'], 'routes'), 'update'
 
     finally:

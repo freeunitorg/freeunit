@@ -74,6 +74,16 @@ longer compresses a 206, as in nginx; a client that refuses identity gets 406.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a "compression" object without "compressors" passed validation, and
+compression was off for the whole configuration, with no log line.  Such a
+configuration is now refused, with the reason.  A stored configuration with
+it still loads, with a warning, and compression stays off; the control API
+refuses other updates until "compressors" is added.
+</para>
+</change>
+
 </changes>
 
 
