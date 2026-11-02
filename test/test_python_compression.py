@@ -707,3 +707,64 @@ def test_python_compression_unknown_length_below_min_length():
     assert status == 200, 'status'
     assert headers.get('Content-Encoding') == 'gzip', 'coded'
     assert gzip.decompress(dechunk(coded)) == b'0123456789', 'decodes'
+
+
+def brotli_lgwin(coded):
+    # The window size the stream header declares (RFC 7932, 9.1).
+    first = coded[0]
+
+    if not first & 1:
+        return 16
+
+    n = (first >> 1) & 7
+    if n:
+        return 17 + n
+
+    n = (first >> 4) & 7
+    return 10 if n == 1 else 8 + n
+
+
+def brotli_encodes(body, quality):
+    # The stream for a quality, flushed after the body or not, then finished.
+    brotli = pytest.importorskip('brotli')
+    found = []
+
+    for flush in (True, False):
+        c = brotli.Compressor(quality=quality, lgwin=19)
+        out = c.process(body)
+        if flush:
+            out += c.flush()
+        found.append(out + c.finish())
+
+    return found
+
+
+BROTLI_BODY = ' '.join(
+    'w%d' % ((i * 7919) % 613) for i in range(300)
+)
+
+
+@pytest.mark.parametrize(
+    'clen, quality', [('none', 5), (str(len(BROTLI_BODY)), 11)]
+)
+def test_python_compression_brotli_window_quality(clen, quality):
+    # The window is capped at 19 bits, whatever the length.  A known length
+    # keeps the configured quality, 11 by default; a stream of unknown
+    # length uses at most 5.
+    setup_compression('br')
+    body = BROTLI_BODY.encode()
+
+    status, headers, coded = fetch(
+        1,
+        'br',
+        extra={'X-Parts': '1', 'X-Body': BROTLI_BODY, 'X-Content-Length': clen},
+    )
+
+    assert status == 200, 'status'
+    assert headers.get('Content-Encoding') == 'br', 'coded'
+
+    coded = dechunk(coded)
+
+    assert brotli_lgwin(coded) <= 19, 'window'
+    assert decoder('br')(coded) == body, 'decodes'
+    assert coded in brotli_encodes(body, quality), f'quality {quality}'
