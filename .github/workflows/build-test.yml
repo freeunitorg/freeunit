@@ -26,6 +26,12 @@ on:
       - '.github/workflows/build-test.yml'
       - '.github/scripts/check-test-hooks.sh'
       - '.github/scripts/test-matrix.sh'
+  # The weekly run tests every Python version.  A pull request and a master
+  # push test the oldest and the newest one; see .github/scripts/test-matrix.sh.
+  # The path filters above do not apply to this event.
+  schedule:
+    - cron: '23 3 * * 0'
+  workflow_dispatch:
 
 env:
   # OpenSSL patch version built from source (see "Build OpenSSL" step). Only the
@@ -58,7 +64,8 @@ jobs:
   # per-version perl (tested against the runner's system perl), python "-slim"
   # and the "minimal" image — those are Docker packaging flavors, not test axes.
   # A pull request gets one version of each runtime unless it changes that
-  # runtime's paths; .github/scripts/test-matrix.sh has the rules.
+  # runtime's paths, and the oldest and the newest Python whatever it
+  # changes; .github/scripts/test-matrix.sh has the rules.
   prepare:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
@@ -76,7 +83,8 @@ jobs:
       # file moved out of a runtime's paths still counts for that runtime.
       # When the diff fails or is empty, the step writes no list, and the
       # next step builds the full matrix.  A pull request with the label
-      # "ci-full" skips this step, so it gets the full matrix too.  The
+      # "ci-full" skips this step, so it gets the full matrix too, with
+      # every Python version (see the next step).  The
       # label counts from the next push, or a close and reopen; a re-run
       # does not see a new label.
       - name: List the files that the pull request changes
@@ -116,8 +124,18 @@ jobs:
         # wasm 88 s, node about 150 s, ruby about 125 s.
         env:
           CHANGED: ${{ steps.files.outputs.list }}
+          EVENT: ${{ github.event_name }}
+          # contains() of a missing label list is false, so only a pull
+          # request with the label sets this.
+          CI_FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci-full') }}
         run: |
-          builds=$(.github/scripts/test-matrix.sh pkg/eol.json "${CHANGED}")
+          # The weekly run, a manual run and a pull request with the
+          # "ci-full" label test every Python version.
+          flag=""
+          case "${EVENT}:${CI_FULL}" in
+            schedule:*|workflow_dispatch:*|*:true) flag="--scheduled" ;;
+          esac
+          builds=$(.github/scripts/test-matrix.sh ${flag} pkg/eol.json "${CHANGED}")
           echo "builds=${builds}" >> "$GITHUB_OUTPUT"
           echo "${builds}"
 
@@ -422,6 +440,8 @@ jobs:
       # Provides module, language version and testpath from build name
       - name: Output build metadata
         id: metadata
+        env:
+          BUILDS: ${{ needs.prepare.outputs.builds }}
         run: |
           if [ "${{ matrix.build }}" = "wasm-wasi-component" ]; then
             module="wasm-wasi-component"
@@ -466,9 +486,16 @@ jobs:
               exit 1
             fi
 
-            versions=$(jq -r '.runtimes.python | length' pkg/eol.json)
-            shard=$(jq -r --arg v "${version}" \
-              '[.runtimes.python[].version] | index($v)' pkg/eol.json)
+            # The shards are the Python legs that this run has: two on a
+            # pull request or a master push, every version in the weekly
+            # run.  Counting the versions in pkg/eol.json instead would
+            # give a shard to a leg that does not run, and its files would
+            # not be tested.
+            versions=$(jq -r '[.[] | select(startswith("python-"))] | length' \
+              <<< "${BUILDS}")
+            shard=$(jq -r --arg b "python-${version}" \
+              '[.[] | select(startswith("python-"))] | index($b)' \
+              <<< "${BUILDS}")
 
             # A jq miss prints "null" rather than failing, and a non-integer
             # in either comparison below fails open: the leg would run its
@@ -476,14 +503,14 @@ jobs:
             # green.  Fail loudly instead, like the OpenSSL assertions.
             case "${versions}" in
               ''|0|*[!0-9]*)
-                echo "::error::no python runtimes in pkg/eol.json" >&2
+                echo "::error::no python legs in the matrix" >&2
                 exit 1
                 ;;
             esac
 
             case "${shard}" in
               ''|*[!0-9]*)
-                echo "::error::no shard for python-${version} in pkg/eol.json" >&2
+                echo "::error::no shard for python-${version} in the matrix" >&2
                 exit 1
                 ;;
             esac
@@ -1832,3 +1859,52 @@ jobs:
 
       - name: Run libunit malformed port message test
         run: ./build/unit_msg_test
+
+  # The middle Python versions run only in the weekly run, so its red check
+  # is easy to miss.  A scheduled failure is reported as a tracking issue,
+  # as nightly.yml, build-distros.yml and eol-check.yml do.  A manual run
+  # reports nothing: whoever started it is watching it.
+  report:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    # Every job above, so any red job of the weekly run is reported.
+    needs:
+      - prepare
+      - core
+      - test
+      - c-tests
+      - build-m32
+      - c-tests-centos6
+      - c-tests-pcre1
+      - c-tests-jit
+      - routing-jit
+      - c-tests-asan
+      - hardening-strict-fedora
+      - c-tests-almalinux8
+    if: failure() && github.event_name == 'schedule'
+    permissions:
+      issues: write
+
+    steps:
+      - name: Open or update tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # No checkout here, so gh has no git remote to infer the repository.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          title='Weekly build-test run is failing (every Python version)'
+          {
+            echo 'The weekly build-test run failed on master.  It is the only'
+            echo 'run that tests the Python versions between the oldest and the'
+            echo 'newest, so a merged change can break them unseen.'
+            echo
+            echo "Commit: ${{ github.sha }}"
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > issue-body.md
+          existing=$(gh issue list --state open --search "in:title ${title}" \
+            --json number,title --jq ".[] | select(.title == \"${title}\") | .number" | head -n1)
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body-file issue-body.md
+          else
+            gh issue create --title "${title}" --body-file issue-body.md
+          fi
