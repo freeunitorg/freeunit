@@ -3005,8 +3005,9 @@ paths:
       summary: "Retrieve the proxy_protocol option in a listener"
       description: "Retrieves the `proxy_protocol` option that names the
         version of the PROXY protocol header the `{listenerName}` listener
-        expects at the start of every connection.  The address in the header
-        becomes the client address of the connection."
+        expects at the start of every connection, as a string, or as an
+        object with the version and the trusted peers.  The address in the
+        header becomes the client address of the connection."
 
       tags:
         - listeners
@@ -3029,13 +3030,17 @@ paths:
                 example1:
                   $ref: "#/components/examples/configListenerProxyProtocol"
 
+                example2:
+                  $ref: "#/components/examples/configListenerProxyProtocolTrusted"
+
         "404":
           $ref: "#/components/responses/responseNotFound"
 
     put:
       operationId: updateListenerProxyProtocol
       summary: "Update the proxy_protocol option in a listener"
-      description: "Overwrites the `proxy_protocol` option."
+      description: "Overwrites the `proxy_protocol` option: a version
+        string, or an object with the version and the trusted peers."
       tags:
         - listeners
         - config
@@ -3053,6 +3058,9 @@ paths:
             examples:
               example1:
                 $ref: "#/components/examples/configListenerProxyProtocol"
+
+              example2:
+                $ref: "#/components/examples/configListenerProxyProtocolTrusted"
 
       responses:
         "200":
@@ -6623,6 +6631,15 @@ components:
       summary: "PROXY protocol version expected by a listener"
       value: "v2"
 
+    # /config/listeners/{listenerName}/proxy_protocol
+    configListenerProxyProtocolTrusted:
+      summary: "PROXY protocol version and trusted peers"
+      value:
+        version: "v2"
+        trusted:
+          - "10.0.0.0/8"
+          - "192.168.1.10"
+
     # /config/listeners/{listenerName}/tls
     configListenerTls:
       summary: "TLS object in a listener"
@@ -8186,6 +8203,15 @@ components:
 
     # /config/listeners/{listenerName}/proxy_protocol
     configListenerProxyProtocol:
+      description: "The PROXY protocol header that the listener expects at the
+        start of every connection.  Either a string with the version, which
+        trusts every peer, or an object that adds a list of trusted peers."
+      oneOf:
+        - $ref: "#/components/schemas/configListenerProxyProtocolVersion"
+        - $ref: "#/components/schemas/configListenerProxyProtocolObject"
+
+    # /config/listeners/{listenerName}/proxy_protocol
+    configListenerProxyProtocolVersion:
       type: string
       enum:
         - "v1"
@@ -8206,10 +8232,42 @@ components:
         HTTP request or a TLS ClientHello, is closed without a response;
         the header must arrive within the `idle_timeout` of the `http`
         settings.  A v1 line is at most 107 bytes and a v2 header at most
-        1024 bytes in total; a longer header is refused.  The option has
-        no trusted-source list: the listener must be reachable only from
-        the proxy, because any peer can announce any address.
+        1024 bytes in total; a longer header is refused.  The string form
+        trusts every peer: any peer that can connect can announce any
+        address, so the listener must be reachable only from the proxy.
+        Use the object form to name the trusted peers.
         Default: `off`, the listener expects no header."
+
+    # /config/listeners/{listenerName}/proxy_protocol
+    configListenerProxyProtocolObject:
+      type: object
+      required:
+        - version
+      additionalProperties: false
+      description: "The PROXY protocol header with a list of trusted peers."
+      properties:
+        version:
+          type: string
+          enum:
+            - "v1"
+            - "v2"
+          description: "The version of the header; same as the string form."
+
+        trusted:
+          description: "Defines address-based patterns for the peers that may
+            send the header; the syntax and the matching are those of
+            `forwarded.source`.  The check is on the real peer address,
+            before the header is read.  The connection of any other peer is
+            closed without a response, with or without a header, and the
+            address in its header is not used or logged.  Without
+            `trusted`, every peer is trusted.  An empty array trusts no
+            peer.  A negated pattern subtracts: `[\"!10.0.0.0/8\"]` trusts
+            every peer outside `10.0.0.0/8`.  The list is refused on a UNIX
+            domain listener, whose peers have no IP address.  The log line
+            of a dropped peer is limited to 10 a second."
+          anyOf:
+            - type: string
+            - $ref: "#/components/schemas/stringArray"
 
     # /config/listeners/{listenerName}/tls/certificate
     configListenerTlsCertificate:
