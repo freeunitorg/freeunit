@@ -73,36 +73,3 @@ nxt_list_zero_add(nxt_list_t *list)
 
     return p;
 }
-
-
-void *
-nxt_list_next(nxt_list_t *list, nxt_list_next_t *next)
-{
-    if (next->part != NULL) {
-        next->elt++;
-
-        if (next->elt < next->part->nelts) {
-            return nxt_list_next_value(list, next);
-        }
-
-        next->part = next->part->next;
-
-        if (next->part != NULL) {
-            next->elt = 0;
-            return nxt_list_data(next->part);
-        }
-
-    } else {
-        next->part = nxt_list_part(list);
-        /*
-         * The first list part is allocated together with
-         * a nxt_list_t itself and it may never be NULL.
-         */
-        if (next->part->nelts != 0) {
-            return nxt_list_data(next->part);
-        }
-
-    }
-
-    return NULL;
-}
