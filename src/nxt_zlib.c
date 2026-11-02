@@ -23,25 +23,40 @@
  * So the window is 15 bits and memLevel 8, the zlib defaults, as nginx
  * uses.  For a body of known length both shrink as in nginx's gzip filter:
  * a window larger than the body (less the 262 bytes zlib keeps back) buys
- * nothing.  An unknown length keeps the full size.
+ * nothing.
+ *
+ * An unknown length (a streamed application response: SSE, long-poll,
+ * chunked output) gets a 4 KiB window and memLevel 6, about 54 KiB of
+ * state, 2^(wbits + 2) + 2^(memLevel + 9) plus some 6 KiB, instead of
+ * about 262 KiB for 15/8.  Such a stream can stay open for its whole life,
+ * and it flushes each part, so a long window gains it little.
  */
+
+#define NXT_ZLIB_STREAM_WBITS     12
+#define NXT_ZLIB_STREAM_MEMLEVEL  6
+
 
 static void
 nxt_zlib_params(const nxt_http_comp_compressor_ctx_t *ctx, int *wbits,
                 int *memlevel)
 {
+    if (ctx->size_hint <= 0) {
+        *wbits = NXT_ZLIB_STREAM_WBITS;
+        *memlevel = NXT_ZLIB_STREAM_MEMLEVEL;
+
+        return;
+    }
+
     *wbits = 15;
     *memlevel = 8;
 
-    if (ctx->size_hint > 0) {
-        while (*wbits > 9 && ctx->size_hint < (1 << (*wbits - 1)) - 262) {
-            (*wbits)--;
-            (*memlevel)--;
-        }
+    while (*wbits > 9 && ctx->size_hint < (1 << (*wbits - 1)) - 262) {
+        (*wbits)--;
+        (*memlevel)--;
+    }
 
-        if (*memlevel < 1) {
-            *memlevel = 1;
-        }
+    if (*memlevel < 1) {
+        *memlevel = 1;
     }
 }
 

@@ -29,8 +29,13 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        is now compressed. "min_length" applies only to a response of known
        length. A client that refuses identity and accepts no configured
        coding gets 406. Each such stream holds its compressor state while it
-       is open: about 256 KiB for gzip and deflate, 3.7 MB for zstd, and 43
-       MB for Brotli at quality 11.
+       is open: about 55 KB for gzip, 1.7 MB for zstd, and 6 MB for Brotli.
+
+    *) Change: the Brotli compressor now uses a window of at most 512 KiB
+       (19 bits) and gets a known length as a size hint; before, a response
+       at quality 11 could hold about 43 MB of state. The zstd compressor
+       shrinks its window to a known length. The coded bytes stay valid for
+       any client.
 
     *) Bugfix: an application response with status 206 was compressed while
        it kept its Content-Range, which counts the bytes of the uncompressed
