@@ -24,6 +24,19 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        unknown length holds about 256 KiB of zlib state instead of about 130
        KiB.
 
+    *) Change: a response of unknown length, such as a streamed application
+       response or the output of a PHP script that sends no Content-Length,
+       is now compressed. "min_length" applies only to a response of known
+       length. A client that refuses identity and accepts no configured
+       coding gets 406. Each such stream holds its compressor state while it
+       is open: about 256 KiB for gzip and deflate, 3.7 MB for zstd, and 43
+       MB for Brotli at quality 11.
+
+    *) Bugfix: an application response with status 206 was compressed while
+       it kept its Content-Range, which counts the bytes of the uncompressed
+       body. Unit no longer compresses a 206, as in nginx; a client that
+       refuses identity gets 406.
+
 
 Changes with FreeUnit 1.37.1                                     30 Oct 2026
 

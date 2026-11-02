@@ -4204,7 +4204,8 @@ paths:
       operationId: getSettingsHttpCompressionCompressorsCompressorMinLength
       summary: "Retrieve the compressor min_length object"
       description: "Retrieves the compressor `min_length` object that
-        represents the minimum length of data to compress."
+        represents the minimum length of data to compress.  It applies only
+        to a response of known length."
 
       tags:
         - settings
@@ -4235,7 +4236,8 @@ paths:
       summary: "Create or overwrite a compressors array min_length item in
         HTTP compression"
       description: "Overwrites the compressor `min_length` integer that
-        represents the minimum length of data to compress."
+        represents the minimum length of data to compress.  It applies only
+        to a response of known length."
 
       tags:
         - settings
@@ -4273,7 +4275,8 @@ paths:
       summary: "Delete a compressors array min_length item in HTTP
         compression"
       description: "Deletes the compressor `min_length` integer that
-        represents the minimum length of data to compress."
+        represents the minimum length of data to compress.  It applies only
+        to a response of known length."
 
       tags:
         - settings
@@ -8429,6 +8432,8 @@ components:
             format: int64
             minimum: 0
             description: "Minimum amount of data to consider for compressing.
+              It applies only to a response of known length; a response of
+              unknown length is compressed whatever its size.
               On 32-bit platforms, less than 2147483648."
 
     # /config/settings/http/compression/compressors/{arrayIndex}/encoding
