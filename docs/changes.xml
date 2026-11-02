@@ -6,6 +6,73 @@
 
 
 <changes apply="unit"
+         ver="1.37.2" rev="1"
+         date="2026-10-31" time="00:00:00 +0000"
+         packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change type="bugfix">
+<para>
+an ASGI application that sent a WebSocket close frame and then raised an
+exception could make the client see a closed connection without the close
+frame.  A message above the 10 MiB buffer limit gave EOF instead of close code
+1009 when the close frame was still queued.  The router now writes the queued
+close frame before it closes the connection.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+in a build with njs, a configuration update that failed before the new
+configuration was created, for example on a shared memory error, released an
+njs VM that was never compiled and crashed the router.
+</para>
+</change>
+
+<change type="feature">
+<para>
+the PHP module now builds with PHP 8.7, which removed five members of
+"sapi_module_struct".  The module names the members that it sets, so a member
+that PHP removes no longer shifts the others.
+</para>
+</change>
+
+<change type="change">
+<para>
+the gzip and deflate compressors now use the 32 KiB window and memLevel 8,
+the zlib defaults, instead of a 512-byte window.  For a response of known
+length both shrink to fit it, as in nginx.  Responses are smaller and cost
+less CPU; a compressed stream of unknown length holds about 256 KiB of zlib
+state instead of about 130 KiB.
+</para>
+</change>
+
+</changes>
+
+
+<changes apply="unit-php unit-php8.3 unit-php8.4 unit-php8.5
+                unit-python unit-python2.7
+                unit-python3.8 unit-python3.9 unit-python3.10 unit-python3.11
+                unit-python3.12 unit-python3.13 unit-python3.14
+                unit-go
+                unit-perl
+                unit-ruby
+                unit-jsc-common unit-jsc11 unit-jsc17 unit-jsc18
+                unit-jsc19 unit-jsc20 unit-jsc21
+                unit-wasm"
+         ver="1.37.2" rev="1"
+         date="2026-10-31" time="00:00:00 +0000"
+         packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change>
+<para>
+FreeUnit updated to 1.37.2.
+</para>
+</change>
+
+</changes>
+
+
+<changes apply="unit"
          ver="1.37.1" rev="1"
          date="2026-10-30" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
