@@ -22,6 +22,8 @@
 #        headers of the commit prints its value.  A change fails.  For
 #        example, nxt_port_mmap_chunk_start() finds the data of a chunk
 #        with PORT_MMAP_HEADER_SIZE and PORT_MMAP_CHUNK_SIZE.
+#        NXT_UNIT_PROTOCOL_VERSION is here too: a change of it is a change
+#        of the protocol, and the failure asks the pull request to say so.
 # enum:  An enum constant in a header that "make install" copies.  A
 #        module compiles the value into its code (NXT_UNIT_ERROR,
 #        NXT_UNIT_HASH_CONTENT_LENGTH in src/python and src/java), so a
@@ -66,6 +68,7 @@ const  PORT_MMAP_DATA_SIZE
 const  PORT_MMAP_CHUNK_SIZE
 const  PORT_MMAP_SIZE
 const  PORT_MMAP_CHUNK_COUNT
+const  NXT_UNIT_PROTOCOL_VERSION
 
 enum   NXT_UNIT_OK
 enum   NXT_UNIT_ERROR

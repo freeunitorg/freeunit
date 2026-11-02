@@ -787,14 +787,21 @@ nxt_wake_test_epoll(void)
  * (src/nxt_external.c).  A variable without it is not valid.
  */
 
+#define NXT_WAKE_TEST_STR(x)   #x
+#define NXT_WAKE_TEST_XSTR(x)  NXT_WAKE_TEST_STR(x)
+#define NXT_WAKE_TEST_VERSION  \
+    NXT_VERSION "/" NXT_WAKE_TEST_XSTR(NXT_UNIT_PROTOCOL_VERSION)
+
 static void
 nxt_wake_test_env(void)
 {
     int64_t  n;
 
-    static const char  with[] = NXT_VERSION ";1;1,0,-1;1,0,-1;1,0,-1,-1;"
+    static const char  with[] = NXT_WAKE_TEST_VERSION
+                                ";1;1,0,-1;1,0,-1;1,0,-1,-1;"
                                 "-1,-1;2,1048576,0,6";
-    static const char  without[] = NXT_VERSION ";1;1,0,-1;1,0,-1;1,0,-1,-1;"
+    static const char  without[] = NXT_WAKE_TEST_VERSION
+                                   ";1;1,0,-1;1,0,-1;1,0,-1,-1;"
                                    "-1,-1;2,1048576,0,";
 
     if (setenv(NXT_UNIT_INIT_ENV, with, 1) != 0) {
