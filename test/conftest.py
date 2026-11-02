@@ -289,6 +289,11 @@ def timeout_plugin_active(config):
     return False
 
 
+# True while the deadline fixture below owns SIGALRM.  pytest-timeout uses
+# SIGALRM too when it is active, and _recover_unit() must not cancel that.
+_deadline_alarm = []
+
+
 @pytest.fixture
 def deadline(request):
     # Limits the whole test, with the start and stop of unitd in run().
@@ -334,12 +339,14 @@ def deadline(request):
 
     handler = signal.signal(signal.SIGALRM, expire)
     signal.alarm(seconds)
+    _deadline_alarm.append(True)
 
     try:
         yield
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, handler)
+        _deadline_alarm.clear()
 
         # Report only a deadline the test body swallowed, so the test
         # cannot finish green.  A hang in setup leaves no call report, and
@@ -394,27 +401,48 @@ def run(request, deadline):
         shutil.rmtree(unit['temp_dir'])
         Log.set_pos(0)
 
-    # clean temp_dir before the next test
+    # The checks below are the ones that see unitd itself.  When one of
+    # them fails or is interrupted (a leftover process, an fd leak, the
+    # deadline), the shared unitd may carry the fault into every later
+    # test.  So stop that unitd and let the next test start a fresh one.
+    try:
+        # clean temp_dir before the next test
 
-    if not option.restart:
-        _clear_conf(log=log)
+        if not option.restart:
+            _clear_conf(log=log)
 
-        # Workers must be gone before their files are.  _clear_conf() returns
-        # on the controller's ack, but the router quits workers asynchronously,
-        # and a java one still in scanClasses() keeps reading temp_dir.
-        # Only wait here: the identity asserts belong after _check_fds(),
-        # which is what refreshes the router/controller pids a respawn test
-        # has changed.
-        _wait_for_processes()
-        _clear_temp_dir()
+            # Workers must be gone before their files are.  _clear_conf()
+            # returns on the controller's ack, but the router quits workers
+            # asynchronously, and a java one still in scanClasses() keeps
+            # reading temp_dir.  Only wait here: the identity asserts belong
+            # after _check_fds(), which is what refreshes the router/
+            # controller pids a respawn test has changed.  When this wait
+            # ran out, a process outlived the test: report that now, as the
+            # cause.  The fd leak it holds would only wait and hide it.
+            procs = _wait_for_processes()
+            if len(procs) > 3:
+                _check_processes(procs)
 
-    # check descriptors
+            _clear_temp_dir()
 
-    _check_fds(log=log)
+        # check descriptors
 
-    # check processes id's and amount
+        _check_fds(log=log)
 
-    _check_processes()
+        # check processes id's and amount
+
+        _check_processes()
+
+    except BaseException:
+        # The failure above is the report.  A recovery that fails too must
+        # not replace it.
+        try:
+            _recover_unit()
+        except Exception as err:
+            print(
+                f'\nrecovery after teardown failed: {err!r}', file=sys.stderr
+            )
+        raise
 
     # Teardown logs too, after the snapshot at the top of this fixture, so
     # read again or those lines are charged to the next test.  Not under
@@ -721,9 +749,31 @@ def unit_run(state_dir=None):
     unit_instance['control_sock'] = control_sock
     unit_instance['unitd'] = unitd
 
-    unit_instance['pid'] = (
-        Path(f'{temporary_dir}/unit.pid').read_text(encoding='utf-8').rstrip()
-    )
+    # The control socket is set up in nxt_runtime_conf_init(), before
+    # nxt_runtime_pid_file_create() writes unit.pid.  Under load the file
+    # is missing, or opened with O_TRUNC and still empty, when the socket
+    # appears.  Unit ends the pid with a newline: wait for it.
+    pid_file = Path(f'{temporary_dir}/unit.pid')
+    pid_end = time.monotonic() + start_timeout
+    pid = ''
+
+    while True:
+        try:
+            pid = pid_file.read_text(encoding='utf-8')
+        except FileNotFoundError:
+            pid = ''
+
+        if pid.endswith('\n') and pid.strip().isdigit():
+            break
+
+        if time.monotonic() >= pid_end:
+            _reap_group(p, p.pid, timeout=5)
+            Log.print_log()
+            sys.exit(f'Could not read the pid of unit from {pid_file}')
+
+        time.sleep(0.1)
+
+    unit_instance['pid'] = pid.rstrip()
 
     if state_dir is None:
         _clear_conf()
@@ -915,60 +965,142 @@ def _clear_temp_dir():
                         time.sleep(1)
 
 
-def _wait_for_processes():
+# How long teardown waits for the app processes of a test to exit.
+# Wall time, not a count of polls: one "ps" can take most of a second on
+# an emulated builder.
+PROCESS_WAIT_SECONDS = int(os.environ.get('UNIT_TEST_PROCESS_TIMEOUT', 60))
+
+
+def _unit_processes():
     main_pid = unit_instance['pid']
 
-    for _ in range(600):
-        out = (
-            subprocess.check_output(
-                ['ps', '-ax', '-o', 'pid', '-o', 'ppid', '-o', 'command']
-            )
-            .decode()
-            .splitlines()
+    out = (
+        subprocess.check_output(
+            ['ps', '-ax', '-o', 'pid', '-o', 'ppid', '-o', 'command']
         )
-        # match only the pid/ppid columns; a substring match against the
-        # whole line can catch unrelated processes whose arguments contain
-        # the same number (e.g. agetty's baud rates vs. pid 9600)
-        out = [l for l in out if main_pid in l.split()[:2]]
+        .decode()
+        .splitlines()
+    )
+    # match only the pid/ppid columns; a substring match against the
+    # whole line can catch unrelated processes whose arguments contain
+    # the same number (e.g. agetty's baud rates vs. pid 9600)
+    return [l for l in out if main_pid in l.split()[:2]]
 
-        if len(out) <= 3:
-            break
+
+def _wait_for_processes(timeout=None):
+    if timeout is None:
+        timeout = PROCESS_WAIT_SECONDS
+
+    end = time.monotonic() + timeout
+
+    while True:
+        out = _unit_processes()
+
+        if len(out) <= 3 or time.monotonic() >= end:
+            return out
 
         time.sleep(0.1)
 
-    return out
+
+def _processes_message(text, out):
+    lines = '\n'.join(f'    {l.strip()}' for l in out)
+    return f'{text}; {len(out)} left:\n{lines}'
 
 
-def _check_processes():
+def _check_processes(out=None):
     router_pid = _fds_info['router']['pid']
     controller_pid = _fds_info['controller']['pid']
     main_pid = unit_instance['pid']
 
-    out = _wait_for_processes()
+    if out is None:
+        out = _wait_for_processes()
 
     if option.restart:
-        assert len(out) == 0, 'all termimated'
+        assert len(out) == 0, _processes_message('all terminated', out)
         return
 
-    assert len(out) == 3, 'main, router, and controller expected'
+    # More than three means the wait ran out; fewer returns at once.
+    waited = f' after {PROCESS_WAIT_SECONDS} s' if len(out) > 3 else ''
 
-    out = [l for l in out if 'unit: main' not in l]
-    assert len(out) == 2, 'one main'
+    assert len(out) == 3, _processes_message(
+        f'main, router, and controller expected{waited}', out
+    )
 
-    out = [
+    rest = [l for l in out if 'unit: main' not in l]
+    assert len(rest) == 2, _processes_message('one main', out)
+
+    rest = [
         l
-        for l in out
+        for l in rest
         if re.search(fr'{router_pid}\s+{main_pid}.*unit: router', l) is None
     ]
-    assert len(out) == 1, 'one router'
+    assert len(rest) == 1, _processes_message('one router', out)
 
-    out = [
+    rest = [
         l
-        for l in out
+        for l in rest
         if re.search(fr'{controller_pid}\s+{main_pid}.*unit: controller', l)
         is None
     ]
-    assert len(out) == 0, 'one controller'
+    assert len(rest) == 0, _processes_message('one controller', out)
+
+
+def _recover_unit():
+    # Called when a teardown check of the shared unitd failed.  Kill its
+    # whole process group, so no leftover worker outlives it, and forget
+    # it: the next unit_run() starts a fresh unitd in a new temp dir.
+    # Under --restart, unit_stop() has already reaped the group; only a
+    # process that left it can remain, and that is reported, not hunted.
+    #
+    # The deadline re-arms SIGALRM every second once it has fired.  Its
+    # own teardown cancels the alarm after this one; cancel it now, or it
+    # interrupts the reap below.  A pytest-timeout alarm is not ours.
+    if _deadline_alarm:
+        signal.alarm(0)
+
+    p = unit_instance.get('process')
+    pgid = unit_instance.get('pgid')
+
+    if p is None or option.restart:
+        return
+
+    _reap_group(p, pgid, timeout=1)
+    _forget_pgid(p, pgid)
+
+    temp_dir = unit_instance.get('temp_dir')
+    unit_instance.clear()
+
+    # A group that survived SIGKILL keeps its temp dir: _forget_pgid() kept
+    # its unitd.pgid file there for an external sweeper.
+    if _group_alive(p, pgid):
+        print(
+            f'\nteardown failed: unitd group {pgid} survived SIGKILL; '
+            f'kept {temp_dir}, the next test starts a new unitd',
+            file=sys.stderr,
+        )
+        return
+
+    print(
+        f'\nteardown failed: unitd {pgid} killed, the next test starts '
+        'a new one',
+        file=sys.stderr,
+    )
+
+    if temp_dir is None or option.save_log:
+        return
+
+    # A mount that is still there would let rmtree() reach outside the
+    # temp dir.  Leave the dir behind then.
+    if is_findmnt and not waitforunmount(temp_dir, timeout=50):
+        print(f'kept {temp_dir}: still mounted', file=sys.stderr)
+        return
+
+    try:
+        public_dir(temp_dir)
+    except OSError:
+        pass
+
+    shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 @print_log_on_assert

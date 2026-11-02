@@ -13,6 +13,7 @@ from conftest import (
     _socket_names,
 )
 from unit.log import Log
+from unit.option import Options
 
 HEADER = 'Num RefCount Protocol Flags Type St Inode Path\n'
 
@@ -152,7 +153,11 @@ def test_fd_kinds_leak_message_count_from_the_listing(monkeypatch):
     monkeypatch.setattr(conftest, '_count_fds', lambda pid: 1000000)
     monkeypatch.setattr(conftest, 'pid_by_name', lambda name: pid)
     monkeypatch.setattr(conftest.time, 'sleep', lambda seconds: None)
-    monkeypatch.setattr(conftest.option, 'fds_threshold', 0, raising=False)
+    # Options keeps its values in a class dict, not in the instance
+    # __dict__.  pytest 9.2 monkeypatch.setattr() reads the instance
+    # __dict__, records no old value, and its undo() then fails in
+    # delattr() before it restores the patches above.
+    monkeypatch.setitem(Options._options, 'fds_threshold', 0)
     monkeypatch.setattr(Log, 'print_log', staticmethod(lambda log=None: None))
     monkeypatch.setitem(conftest.unit_instance, 'pid', pid)
     monkeypatch.setitem(
