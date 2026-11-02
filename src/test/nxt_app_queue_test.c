@@ -33,6 +33,26 @@
 #endif
 
 
+/*
+ * The concurrent race case does a fixed number of rounds.  A loaded builder
+ * can make each round slow, so the case has no bound on its total time.
+ * It fails only when no round finishes within NXT_APP_QUEUE_TEST_STALL
+ * seconds.  The same guard also covers the teardown after the last round.
+ * There is no total cap on purpose.  The case can take as long as it keeps
+ * finishing rounds, and the CI job timeout is the outer bound.
+ */
+
+#define NXT_APP_QUEUE_TEST_ROUNDS  20000
+
+#if (NXT_APP_QUEUE_TEST_TSAN)
+#define NXT_APP_QUEUE_TEST_STALL      60
+#define NXT_APP_QUEUE_TEST_STALL_STR  "60"
+#else
+#define NXT_APP_QUEUE_TEST_STALL      10
+#define NXT_APP_QUEUE_TEST_STALL_STR  "10"
+#endif
+
+
 static int
 nxt_app_queue_test_death_recovery(void *data)
 {
@@ -381,6 +401,46 @@ typedef struct {
 } nxt_app_queue_race_worker_t;
 
 
+/* The number of finished rounds.  The SIGALRM handler reads it. */
+static volatile sig_atomic_t  nxt_app_queue_race_rounds;
+
+
+/*
+ * The SIGALRM handler of the concurrent race case.  It uses only
+ * async-signal-safe calls: it formats the round count by hand, writes the
+ * message with write() and exits with _exit().
+ */
+static void
+nxt_app_queue_race_stalled(int signo)
+{
+    long        n;
+    size_t      len;
+    char        *p;
+    char        num[24];
+    static const char  head[] = "app queue concurrent race: no progress in "
+                                NXT_APP_QUEUE_TEST_STALL_STR " s, ";
+    static const char  tail[] = " rounds done\n";
+
+    (void) signo;
+
+    n = nxt_app_queue_race_rounds;
+    p = num + sizeof(num);
+
+    do {
+        *(--p) = (char) ('0' + n % 10);
+        n /= 10;
+    } while (n != 0);
+
+    len = num + sizeof(num) - p;
+
+    (void) write(STDERR_FILENO, head, sizeof(head) - 1);
+    (void) write(STDERR_FILENO, p, len);
+    (void) write(STDERR_FILENO, tail, sizeof(tail) - 1);
+
+    _exit(3);
+}
+
+
 static void *
 nxt_app_queue_race_worker(void *arg)
 {
@@ -424,8 +484,20 @@ nxt_app_queue_test_concurrent_race(void *data)
     uint32_t                     cookie;
     uint8_t                      buf[NXT_APP_QUEUE_MSG_SIZE];
     long                         r, zero_rounds;
-    const long                   rounds = 20000;
+    const long                   rounds = NXT_APP_QUEUE_TEST_ROUNDS;
     int                          i;
+    struct sigaction             sa;
+
+    nxt_memzero(&sa, sizeof(sa));
+    sa.sa_handler = nxt_app_queue_race_stalled;
+    sigemptyset(&sa.sa_mask);
+
+    if (sigaction(SIGALRM, &sa, NULL) != 0) {
+        return 3;
+    }
+
+    nxt_app_queue_race_rounds = 0;
+    alarm(NXT_APP_QUEUE_TEST_STALL);
 
     nxt_memzero(&ctx, sizeof(ctx));
     ctx.q = data;
@@ -468,6 +540,10 @@ nxt_app_queue_test_concurrent_race(void *data)
         while (nxt_app_queue_recv(ctx.q, buf, &cookie) >= 0) {
             /* drain */
         }
+
+        /* The round finished: restart the stall guard. */
+        nxt_app_queue_race_rounds = r + 1;
+        alarm(NXT_APP_QUEUE_TEST_STALL);
     }
 
     nxt_atomic_store_release(&ctx.stop, 1);
@@ -479,6 +555,8 @@ nxt_app_queue_test_concurrent_race(void *data)
 
     nxt_barrier_destroy(&ctx.start);
     nxt_barrier_destroy(&ctx.done);
+
+    alarm(0);
 
     if (zero_rounds > 0) {
         fprintf(stderr, "concurrent race: %ld of %ld rounds had zero wakeups\n",
@@ -514,8 +592,8 @@ nxt_app_queue_test_child(void *data)
     tc = data;
 
     /*
-     * The concurrent cases can take longer on slow or contended builders,
-     * especially under ThreadSanitizer.  Keep a bounded hang guard.
+     * A hang guard for the whole case.  The concurrent race case replaces
+     * it with a guard that it restarts after each round.
      */
     alarm(NXT_APP_QUEUE_TEST_TSAN ? 60 : 30);
 
