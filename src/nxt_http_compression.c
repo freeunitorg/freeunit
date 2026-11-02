@@ -305,11 +305,12 @@ nxt_http_comp_compress_app_response(nxt_task_t *task, nxt_http_request_t *r,
          */
         if (nxt_buf_is_sync(in) || !nxt_buf_is_mem(in)) {
             /*
-             * The last buffer with the stream still open: the application
-             * sent fewer bytes than its Content-Length said, so no data
-             * buffer ended the stream.  The Content-Encoding field is
-             * committed, so the stream is ended here, with no input.  A
-             * HEAD response drops its body buffers, this one included.
+             * The last buffer with the stream still open: the length is
+             * unknown, or the application sent fewer bytes than its
+             * Content-Length said, so no data buffer ended the stream.
+             * The Content-Encoding field is committed, so the stream is
+             * ended here, with no input.  A HEAD response drops its body
+             * buffers, this one included.
              */
             if (nxt_buf_is_last(in) && ctx->live) {
                 buf_len = nxt_http_comp_bound(ctx, 0)
@@ -340,6 +341,11 @@ nxt_http_comp_compress_app_response(nxt_task_t *task, nxt_http_request_t *r,
 
         in_len = in->mem.free - in->mem.pos;
 
+        /*
+         * A known length ends the stream with the byte that reaches it.
+         * An unknown length (-1) is never reached here: the last buffer,
+         * a sync buffer, ends the stream above.
+         */
         last = ctx->clen_sent + in_len == ctx->resp_clen;
 
         if (in_len == 0 && !last) {
@@ -1467,12 +1473,20 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
     r->comp_ctx = NULL;
 
     /*
-     * No length, or an empty body.  An application's "Content-Length: 0"
-     * is a field, not content_length_n, so it is read through the same
-     * function as the "min_length" test.  Before, such a response was
-     * coded to an empty stream, or refused with 406 for "identity;q=0".
+     * An empty body has nothing to code.  An application's
+     * "Content-Length: 0" is a field, not content_length_n, so it is read
+     * through the same function as the "min_length" test.  Before, such a
+     * response was coded to an empty stream, or refused with 406 for
+     * "identity;q=0".
+     *
+     * A body of unknown length (-1) is negotiated and coded like any other:
+     * it is sent chunked, and the last buffer of the response ends the
+     * stream.  "min_length" applies only to a known length, see
+     * nxt_http_comp_below_min_len().  Unknown length used to skip
+     * compression as well, so a streamed application response, and any PHP
+     * script that does not send Content-Length, was never compressed (#856).
      */
-    if (nxt_http_comp_resp_length(r) <= 0) {
+    if (nxt_http_comp_resp_length(r) == 0) {
         return NXT_OK;
     }
 
@@ -1580,6 +1594,17 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
 
     if (conf == NULL) {
         return NXT_OK;
+    }
+
+    /*
+     * An application's 206 carries its own Content-Range, which counts the
+     * bytes of the identity body.  A coded body would not match it, so a
+     * 206 is not coded, as in nginx.  The static path asks while the
+     * status is still 200, and does not code a range itself.
+     */
+
+    if (r->status == NXT_HTTP_PARTIAL_CONTENT) {
+        return identity_refused ? nxt_http_comp_not_acceptable(r) : NXT_OK;
     }
 
     if (r->resp.mime_type != NULL) {
