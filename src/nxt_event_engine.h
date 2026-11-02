@@ -576,15 +576,6 @@ void nxt_event_engine_buf_mem_completion(nxt_task_t *task, void *obj,
     void *data);
 
 
-nxt_inline nxt_event_engine_t *
-nxt_thread_event_engine(void)
-{
-    nxt_thread_t  *thr;
-
-    thr = nxt_thread();
-    return thr->engine;
-}
-
 #if (NXT_DEBUG)
 
 NXT_EXPORT void nxt_event_engine_thread_adopt(nxt_event_engine_t *engine);

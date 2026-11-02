@@ -204,14 +204,6 @@ socketpair_fail:
 
 
 void
-nxt_port_destroy(nxt_port_t *port)
-{
-    nxt_socket_close(port->socket.task, port->socket.fd);
-    nxt_mp_destroy(port->mem_pool);
-}
-
-
-void
 nxt_port_write_enable(nxt_task_t *task, nxt_port_t *port)
 {
     port->socket.fd = port->pair[1];

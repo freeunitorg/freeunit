@@ -38,7 +38,6 @@ typedef struct {
 NXT_EXPORT void nxt_realtime(nxt_realtime_t *now);
 NXT_EXPORT void nxt_monotonic_time(nxt_monotonic_time_t *now);
 NXT_EXPORT void nxt_localtime(nxt_time_t s, struct tm *tm);
-NXT_EXPORT void nxt_timezone_update(void);
 
 /*
  * Both localtime() and localtime_r() are not Async-Signal-Safe, therefore,
