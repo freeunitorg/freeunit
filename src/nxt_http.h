@@ -286,6 +286,13 @@ struct nxt_http_request_s {
     /* Set by nxt_http_comp_check_acceptable(), from mem_pool. */
     nxt_http_comp_ctx_t             *comp_ctx;
 
+    /*
+     * An application response whose header the router holds back while it
+     * waits to learn whether the body reaches "min_length"; see
+     * nxt_router_comp_hold_start().  From mem_pool.
+     */
+    nxt_router_comp_hold_t          *comp_hold;
+
     /* When a websocket frame first found the application queue full. */
     nxt_msec_t                      ws_paused_at;
 

@@ -46,6 +46,14 @@
 #define NXT_HTTP_COMP_BROTLI_COMP_MAX          BROTLI_MAX_QUALITY
 #endif
 
+/*
+ * The largest "hold_timeout", in milliseconds.  A held response keeps its
+ * request pool, up to "min_length" plus one message of router memory and
+ * its connection until it is committed, and a client close is noticed only
+ * then, so the hold must stay short.
+ */
+#define NXT_HTTP_COMP_HOLD_TIMEOUT_MAX         60000
+
 
 typedef struct nxt_http_comp_compressor_ctx_s  nxt_http_comp_compressor_ctx_t;
 typedef struct nxt_http_comp_operations_s      nxt_http_comp_operations_t;
@@ -113,6 +121,8 @@ extern nxt_int_t nxt_http_comp_check_acceptable(nxt_task_t *task,
     nxt_http_request_t *r);
 extern nxt_int_t nxt_http_comp_apply_compression(nxt_task_t *task,
     nxt_http_request_t *r);
+extern nxt_off_t nxt_http_comp_hold_length(nxt_http_request_t *r);
+extern nxt_msec_t nxt_http_comp_hold_timeout(nxt_http_request_t *r);
 extern nxt_int_t nxt_http_comp_compression_init(nxt_task_t *task,
     nxt_router_conf_t *rtcf, const nxt_conf_value_t *comp_conf);
 

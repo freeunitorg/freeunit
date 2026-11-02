@@ -762,3 +762,450 @@ def test_python_compression_brotli_window(clen):
 
     assert brotli_lgwin(coded) <= 19, 'window'
     assert decoder('br')(coded) == body, 'decodes'
+
+
+# "hold_timeout": a body of unknown length is held until it reaches the
+# "min_length" of the selected coding, ends, or the timeout fires.  The
+# header goes out only then, so "min_length" can apply to such a body.
+HOLD_MIN = 1024
+
+
+def setup_hold(hold_timeout, encoding='gzip', types=None, min_length=HOLD_MIN):
+    client.load('compression_stream', threads=32)
+
+    compression = {
+        "types": types or ["text/plain"],
+        "compressors": [{"encoding": encoding, "min_length": min_length}],
+    }
+
+    if hold_timeout is not None:
+        compression["hold_timeout"] = hold_timeout
+
+    resp = client.conf({"http": {"compression": compression}}, 'settings')
+
+    if 'supported compressor' in resp.get('detail', ''):
+        pytest.skip(f'unit built without {encoding} compression support')
+
+    assert 'success' in resp, f'hold configured: {resp}'
+
+
+def parts_body(rid, size, parts):
+    token = b'<%06d>' % rid
+
+    return (token * (size // len(token) + 1))[:size] * parts
+
+
+def fetch_parts(rid, parts, size, delay, accept='gzip', extra=None):
+    return fetch(
+        rid,
+        accept,
+        extra={
+            'X-Parts': str(parts),
+            'X-Size': str(size),
+            'X-Delay': str(delay),
+            'X-Content-Length': 'none',
+            **(extra or {}),
+        },
+    )
+
+
+def read_head(sock):
+    data = b''
+    while b'\r\n\r\n' not in data:
+        part = sock.recv(4096)
+        assert part, 'the response starts'
+        data += part
+
+    return data.partition(b'\r\n\r\n')
+
+
+def first_chunk(sock):
+    """Reads the head and the first chunk; returns head, chunk, rest."""
+
+    head, _, data = read_head(sock)
+
+    while True:
+        end = data.find(b'\r\n')
+        if end != -1:
+            size = int(data[:end], 16)
+            if len(data) >= end + 2 + size:
+                break
+
+        part = sock.recv(4096)
+        assert part, 'the response is still streaming'
+        data += part
+
+    assert size != 0, 'the response is still streaming'
+
+    return head, data[end + 2 : end + 2 + size], data
+
+
+def recv_all(sock, data):
+    sock.settimeout(10)
+
+    while True:
+        part = sock.recv(4096)
+        if not part:
+            break
+        data += part
+
+    sock.close()
+
+    return data
+
+
+def stream_parts(rid, parts, size, delay):
+    sock = client.get(
+        headers={
+            **request_headers(rid, 'gzip', parts=parts, delay=delay),
+            'X-Size': str(size),
+            'X-Content-Length': 'none',
+        },
+        no_recv=True,
+    )
+    sock.settimeout(5)
+
+    return sock
+
+
+def test_python_compression_hold_timeout_validation():
+    client.load('compression_stream')
+
+    # Capped at 60 s: a held response keeps its memory and connection
+    # until it is sent, even when the client is gone.
+    for value in (-1, 60001, 2**31, 1.5, "100", True):
+        assert 'error' in client.conf(
+            {
+                "http": {
+                    "compression": {
+                        "compressors": [{"encoding": "gzip"}],
+                        "hold_timeout": value,
+                    }
+                }
+            },
+            'settings',
+        ), f'{value!r} refused'
+
+    setup_hold(60000)
+    setup_hold(0)
+
+
+def test_python_compression_hold_small_unknown_length():
+    # Five writes of 40 bytes and no Content-Length.  Below "min_length",
+    # so the hold sees the end of the body and sends it as identity with
+    # its length, instead of coding 200 bytes, chunked.
+    setup_hold(1000)
+
+    status, headers, body = fetch_parts(4001, 5, 40, 0.01)
+
+    assert status == 200, 'status'
+    assert 'Content-Encoding' not in headers, 'not coded'
+    assert headers.get('Content-Length') == '200', 'the length, now known'
+    assert 'Transfer-Encoding' not in headers, 'not chunked'
+    assert headers.get('Vary') == 'Accept-Encoding', 'negotiated: vary'
+    assert body == parts_body(4001, 40, 5), 'the body'
+
+
+def test_python_compression_hold_large_unknown_length():
+    # A first write above "min_length": coded, as without a hold, and out
+    # before the second write.  libunit may send its start with the header
+    # fields and the rest as a message of its own, so the hold may start
+    # and end by size within that one write.
+    setup_hold(5000)
+
+    fetch_parts(4002, 1, 40, 0)
+
+    decode = stream_decoder('gzip')
+
+    start = time.monotonic()
+    sock = stream_parts(4012, 2, SIZE, 1.5)
+
+    head, chunk, data = first_chunk(sock)
+
+    assert time.monotonic() - start < 1.0, 'not held'
+    assert b'Content-Encoding: gzip' in head, 'coded'
+    assert b'Transfer-Encoding: chunked' in head, 'chunked'
+    assert b'Content-Length' not in head, 'no length'
+    assert decode(chunk) == parts_body(4012, SIZE, 1), 'the first part'
+
+    data = recv_all(sock, data)
+
+    assert gzip.decompress(dechunk(data)) == parts_body(4012, SIZE, 2), 'decodes'
+
+
+def test_python_compression_hold_reaches_min_length():
+    # Three writes of 600 bytes, 1.5 s apart: the first is held, the second
+    # brings the hold to 1200 bytes, above "min_length", so the header and
+    # both parts go out then, before the third write and long before the
+    # hold timer.
+    setup_hold(5000)
+
+    fetch_parts(4003, 1, 40, 0)
+
+    decode = stream_decoder('gzip')
+
+    start = time.monotonic()
+    sock = stream_parts(4013, 3, 600, 1.5)
+
+    head, chunk, data = first_chunk(sock)
+    elapsed = time.monotonic() - start
+
+    assert b'Content-Encoding: gzip' in head, 'coded'
+    assert b'Transfer-Encoding: chunked' in head, 'chunked'
+    assert 1.0 < elapsed < 2.5, f'held for {elapsed:.3f} s: to the second part'
+    assert decode(chunk) == parts_body(4013, 600, 2), 'the held parts'
+
+    data = recv_all(sock, data)
+
+    assert gzip.decompress(dechunk(data)) == parts_body(4013, 600, 3), 'decodes'
+
+
+def test_python_compression_hold_timer():
+    # A slow stream below "min_length": the hold timer ends the hold, and
+    # the first part reaches the client coded, long before the second part
+    # is written.
+    setup_hold(50)
+
+    # The first request starts the application.
+    fetch_parts(4004, 1, 40, 0)
+
+    decode = stream_decoder('gzip')
+
+    start = time.monotonic()
+    sock = stream_parts(4005, 3, 40, 0.6)
+
+    head, chunk, data = first_chunk(sock)
+
+    assert b'Content-Encoding: gzip' in head, 'coded'
+    assert b'Transfer-Encoding: chunked' in head, 'chunked'
+    assert decode(chunk) == parts_body(4005, 40, 1), 'the first part, decoded'
+    assert time.monotonic() - start < 0.5, 'the first part before the second'
+
+    data = recv_all(sock, data)
+
+    assert gzip.decompress(dechunk(data)) == parts_body(4005, 40, 3), 'decodes'
+
+
+def head_time(sock):
+    start = time.monotonic()
+    head, _, _ = read_head(sock)
+    return head, time.monotonic() - start
+
+
+def test_python_compression_hold_exempt_event_stream():
+    # An event stream is never held, even below "min_length".
+    setup_hold(5000, types=["text/*"])
+
+    fetch_parts(4006, 1, 40, 0)
+
+    sock = client.get(
+        headers={
+            **request_headers(4007, 'gzip', parts=2, delay=2),
+            'X-Size': '40',
+            'X-Content-Length': 'none',
+            'X-Content-Type': 'text/event-stream; charset=utf-8',
+        },
+        no_recv=True,
+    )
+    sock.settimeout(10)
+
+    head, elapsed = head_time(sock)
+    sock.close()
+
+    assert b'Content-Encoding: gzip' in head, 'coded at once, as before'
+    assert elapsed < 1.5, f'not held: {elapsed:.3f} s'
+
+    # The same response as text/plain is held until it ends.
+    sock = client.get(
+        headers={
+            **request_headers(4008, 'gzip', parts=2, delay=2),
+            'X-Size': '40',
+            'X-Content-Length': 'none',
+        },
+        no_recv=True,
+    )
+    sock.settimeout(10)
+
+    head, elapsed = head_time(sock)
+    sock.close()
+
+    assert elapsed >= 1.5, f'held: {elapsed:.3f} s'
+    assert b'Content-Length: 80' in head, 'identity, with its length'
+
+
+def test_python_compression_hold_exempt_head():
+    # A HEAD response has no body to wait for.
+    setup_hold(5000)
+
+    fetch_parts(4009, 1, 40, 0)
+
+    sock = client.head(
+        headers={
+            **request_headers(4010, 'gzip', parts=2, delay=2),
+            'X-Size': '40',
+            'X-Content-Length': 'none',
+        },
+        no_recv=True,
+    )
+    sock.settimeout(10)
+
+    head, elapsed = head_time(sock)
+    sock.close()
+
+    assert head.startswith(b'HTTP/1.1 200'), 'status'
+    assert elapsed < 1.5, f'not held: {elapsed:.3f} s'
+
+
+def test_python_compression_hold_identity_refused():
+    # A held body whose end arrives below "min_length" is negotiated with
+    # its length, as a response that declares it: a client that refuses
+    # identity gets the 406 that a known length gets.  A body that reaches
+    # the minimum is coded.
+    setup_hold(1000)
+
+    status, headers, _ = fetch_parts(4011, 5, 40, 0.01, 'gzip, identity;q=0')
+
+    assert status == 406, 'gzip is below its minimum, identity refused'
+    assert headers.get('Vary') == 'Accept-Encoding', 'the 406 varies'
+
+    status, headers, coded = fetch_parts(
+        4012, PARTS, SIZE, 0.01, 'gzip, identity;q=0'
+    )
+
+    assert status == 200, 'status'
+    assert headers.get('Content-Encoding') == 'gzip', 'coded'
+    assert gzip.decompress(dechunk(coded)) == expected(4012), 'decodes'
+
+    status, _, _ = fetch_parts(4013, 5, 40, 0.01, 'identity;q=0')
+
+    assert status == 406, 'nothing acceptable'
+
+
+def test_python_compression_hold_absent():
+    # Without "hold_timeout", "min_length" does not apply to an unknown
+    # length, as before: the short body is coded.
+    setup_hold(None)
+
+    status, headers, coded = fetch_parts(4014, 5, 40, 0.01)
+
+    assert status == 200, 'status'
+    assert headers.get('Content-Encoding') == 'gzip', 'coded'
+    assert gzip.decompress(dechunk(coded)) == parts_body(4014, 40, 5), 'decodes'
+
+
+def test_python_compression_hold_many():
+    # Many held responses at once, some committed by their end, some by
+    # their size.  A write over 1024 bytes cannot fall back to a plain port
+    # message, so it takes shared memory, one 16 KiB chunk here.  Each
+    # application buffer is given back as soon as it is copied: these
+    # responses take 7000 chunks, more than the 100 MB an application may
+    # hold, so a leak would leave the last check unanswered.
+    setup_hold(2000, min_length=65536)
+
+    results = []
+
+    def run(rid):
+        parts, size = (8, 2000) if rid % 2 else (6, 16000)
+        status, headers, body = fetch_parts(rid, parts, size, 0.01)
+
+        if headers.get('Transfer-Encoding') == 'chunked':
+            body = dechunk(body)
+
+        if headers.get('Content-Encoding') == 'gzip':
+            body = gzip.decompress(body)
+
+        results.append(status == 200 and body == parts_body(rid, size, parts))
+
+    for base in range(0, 1000, 40):
+        threads = [
+            threading.Thread(target=run, args=(5000 + base + i,))
+            for i in range(40)
+        ]
+
+        for t in threads:
+            t.start()
+
+        for t in threads:
+            t.join(timeout=60)
+
+    assert len(results) == 1000 and all(results), 'every held response'
+
+    status, headers, body = fetch_parts(4015, 8, 2000, 0.01)
+
+    assert status == 200, 'still served'
+    assert 'Content-Encoding' not in headers, 'below the minimum: identity'
+    assert body == parts_body(4015, 2000, 8), 'the body'
+
+
+def test_python_compression_hold_client_close_served():
+    # Clients that reset while their responses are held.  The router does
+    # not see the close then: nothing is written and the read is blocked.
+    # The hold timer (or the end of the response) commits the response, the
+    # write fails, and the request goes.  This checks only that the router
+    # keeps serving; that the timer bounds the retention is the cap on
+    # "hold_timeout".
+    setup_hold(1000)
+
+    fetch_parts(4016, 1, 40, 0)
+
+    socks = []
+    for i in range(20):
+        sock = client.get(
+            headers={
+                **request_headers(4100 + i, 'gzip', parts=4, delay=0.2),
+                'X-Size': '40',
+                'X-Content-Length': 'none',
+            },
+            no_recv=True,
+        )
+        socks.append(sock)
+
+    time.sleep(0.1)
+
+    for sock in socks:
+        sock.setsockopt(
+            socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0)
+        )
+        sock.close()
+
+    # Past the end of the applications' responses and the hold timeout.
+    time.sleep(1.5)
+
+    status, headers, body = fetch_parts(4017, 5, 40, 0.01)
+
+    assert status == 200 and body == parts_body(4017, 40, 5), 'still served'
+
+
+def test_python_compression_hold_app_timeout():
+    # The application deadline expires while the response is held: the
+    # header has not been sent, so the client gets a 503, and the router
+    # keeps serving.  The deadline also cancels the hold timer; that is not
+    # observable from here (the timer would only keep the request pool and
+    # then send nothing), so this does not prove the early cancel.
+    client.load('compression_stream', threads=32, limits={"timeout": 1})
+
+    assert 'success' in client.conf(
+        {
+            "http": {
+                "compression": {
+                    "types": ["text/plain"],
+                    "compressors": [
+                        {"encoding": "gzip", "min_length": HOLD_MIN}
+                    ],
+                    "hold_timeout": 2000,
+                }
+            }
+        },
+        'settings',
+    )
+
+    status, _, _ = fetch_parts(4018, 2, 40, 1.5)
+
+    assert status == 503, 'the deadline, while held'
+
+    # The hold timer fires, then the application ends that response.
+    time.sleep(2)
+
+    status, headers, body = fetch_parts(4019, 5, 40, 0.01)
+
+    assert status == 200 and body == parts_body(4019, 40, 5), 'still served'
