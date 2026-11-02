@@ -326,6 +326,14 @@ def test_upstreams_rr_delay():
 
 
 def test_upstreams_rr_active_req():
+    # The POST requests below wait for their bodies across four
+    # configuration changes.  On a slow builder a change takes about 10 s,
+    # so the wait passed the default body_read_timeout of 30 s and Unit
+    # answered 408.  The test is about upstream changes, not that timeout.
+    assert 'success' in client.conf(
+        {"http": {"body_read_timeout": 3600}}, 'settings'
+    ), 'body_read_timeout'
+
     conns = 5
     socks = []
     socks2 = []
