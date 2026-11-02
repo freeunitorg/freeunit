@@ -7,11 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.37.2] - 2026-11-09
+
 ### Security
 - `unitctl` discovered a running unitd by its process title alone and trusted
   whatever matched. A local user could run a process titled `unit: main` and
   have `unitctl` act on their decoy; it now trusts only a unitd owned by the
   superuser or by the user running it.
+
+### Changed
+- Version bump to track the FreeUnit 1.37.2 release.
+- sysinfo 0.39.6 → 0.40.1, with its default features off: only "system" and "user" are
+  built, so the musl and aarch64 builds no longer need `statx()`. When the process list
+  or the user list cannot be read, unitctl now prints "Failed to list processes" or
+  "Failed to list users" and reports no processes or no user names.
+- tokio 1.53.3 → 1.54.1, cc 1.10.0 → 1.11.1.
 
 ## [1.37.1] - 2026-10-28
 
@@ -109,7 +119,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Previous releases
 See earlier versions for additional change history.
 
-[Unreleased]: https://github.com/freeunitorg/freeunit/compare/unitctl/1.37.1...HEAD
+[Unreleased]: https://github.com/freeunitorg/freeunit/compare/unitctl/1.37.2...HEAD
+[1.37.2]: https://github.com/freeunitorg/freeunit/releases/tag/unitctl/1.37.2
 [1.37.1]: https://github.com/freeunitorg/freeunit/releases/tag/unitctl/1.37.1
 [1.37.0]: https://github.com/freeunitorg/freeunit/releases/tag/unitctl/1.37.0
 [1.36.1]: https://github.com/freeunitorg/freeunit/releases/tag/unitctl/1.36.1
