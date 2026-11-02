@@ -3644,10 +3644,11 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 
     /*
      * Compression is configured once for the whole router, not per listener.
-     * The return is deliberately not checked: a "compression" block the
-     * validator accepts but this cannot build -- one with no "compressors",
-     * which is not a required member -- leaves compression off rather than
-     * rejecting the configuration, which is what it has always done.
+     * The return is deliberately not checked: a "compression" block that
+     * this cannot build leaves compression off rather than rejecting the
+     * configuration.  The control API refuses a block with no "compressors";
+     * a stored configuration from an earlier version can still have one, and
+     * nxt_conf_vldt_compression_object() keeps it with a warning.
      */
     comp = nxt_conf_get_path(root, &compression_path);
     if (comp != NULL) {
