@@ -32,8 +32,11 @@ name: "Docker nightly (FreeUnit master, PHP pre-release)"
 # runs the workflow file from its own branch, so the job that runs on
 # pull_request must not hold packages: write, or a branch could push over
 # the release tags of ghcr.io/freeunitorg/freeunit.  "publish" holds that
-# permission, never runs on pull_request, and pushes the tested image that
-# "image" handed over as an artifact.
+# permission and pushes the tested image that "image" handed over as an
+# artifact.  It runs only from refs/heads/master, on a schedule or on a
+# dispatch with push=true.  A dispatch of another branch runs the workflow
+# file of that branch, so the event check alone would not keep a branch away
+# from the release tags.
 #
 # The images are amd64 only, and not for production.
 
@@ -81,8 +84,6 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
-    outputs:
-      publish: ${{ steps.publish.outputs.publish }}
     strategy:
       fail-fast: false
       matrix:
@@ -203,25 +204,31 @@ jobs:
         if: always()
         run: docker logs smoke 2>&1 | tail -60 || true
 
-      - name: Decide whether to publish
-        id: publish
+      - name: Decide whether to save the image
+        id: save
+        # The publish job repeats this decision in its if.  Both use the
+        # default branch: an upload from another ref is never pushed, and a
+        # publish without an artifact fails at the download.
+        env:
+          PUSH: ${{ inputs.push }}
         run: |
-          if [ "${{ github.event_name }}" = schedule ] \
-             || { [ "${{ github.event_name }}" = workflow_dispatch ] && [ "${{ inputs.push }}" = true ]; }; then
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "publish=false" >> "$GITHUB_OUTPUT"
+          save=false
+          if [ "$GITHUB_REF" = refs/heads/master ] \
+             && { [ "$GITHUB_EVENT_NAME" = schedule ] \
+                  || { [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$PUSH" = true ]; }; }; then
+            save=true
           fi
+          echo "save=$save" >> "$GITHUB_OUTPUT"
 
       - name: Save the image
-        if: steps.publish.outputs.publish == 'true'
+        if: steps.save.outputs.save == 'true'
         run: |
           set -eux
           docker save "freeunit-nightly:$VARIANT" | gzip -1 > "$RUNNER_TEMP/image.tar.gz"
           echo "$DAY" > "$RUNNER_TEMP/day"
 
       - uses: actions/upload-artifact@v7
-        if: steps.publish.outputs.publish == 'true'
+        if: steps.save.outputs.save == 'true'
         with:
           name: image-${{ matrix.variant }}
           path: |
@@ -233,13 +240,19 @@ jobs:
     # No matrix value in the name: a skipped job shows the expression as is.
     name: publish
     needs: image
-    # Never on pull_request: this job holds packages: write.
+    # This job holds packages: write, so it must never run for a ref that a
+    # branch controls.  refs/heads/master keeps it to the default branch: a
+    # pull request ref and a dispatch of another branch skip it.  A branch
+    # dispatch would run the workflow file of that branch, so the event
+    # check alone is not enough.
     # !cancelled(): one variant that fails to build (php-src master can
     # break) must not hold back the other.  The failed variant has no
     # artifact, so its publish leg fails at the download and stays red.
     if: >-
       !cancelled() && github.event_name != 'pull_request'
-      && needs.image.outputs.publish == 'true'
+      && github.ref == 'refs/heads/master'
+      && (github.event_name == 'schedule'
+          || (github.event_name == 'workflow_dispatch' && inputs.push))
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
