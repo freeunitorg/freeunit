@@ -95,6 +95,11 @@ static nxt_int_t nxt_conf_vldt_mtypes_type(nxt_conf_validation_t *vldt,
     nxt_str_t *name, nxt_conf_value_t *value);
 static nxt_int_t nxt_conf_vldt_mtypes_extension(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value);
+static nxt_int_t nxt_conf_vldt_proxy_protocol_version(
+    nxt_conf_validation_t *vldt, nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_proxy_protocol_object_version(
+    nxt_conf_validation_t *vldt, nxt_conf_value_t *value, void *data);
+static nxt_conf_vldt_object_t  nxt_conf_vldt_proxy_protocol_members[];
 static nxt_int_t nxt_conf_vldt_proxy_protocol(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_listener(nxt_conf_validation_t *vldt,
@@ -613,7 +618,7 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_listener_members[] = {
         .validator  = nxt_conf_vldt_listen_backlog,
     }, {
         .name       = nxt_string("proxy_protocol"),
-        .type       = NXT_CONF_VLDT_STRING,
+        .type       = NXT_CONF_VLDT_STRING | NXT_CONF_VLDT_OBJECT,
         .validator  = nxt_conf_vldt_proxy_protocol,
     },
 
@@ -625,6 +630,22 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_listener_members[] = {
         .u.members  = nxt_conf_vldt_tls_members,
     },
 #endif
+
+    NXT_CONF_VLDT_END
+};
+
+
+static nxt_conf_vldt_object_t  nxt_conf_vldt_proxy_protocol_members[] = {
+    {
+        .name       = nxt_string("version"),
+        .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_proxy_protocol_object_version,
+        .flags      = NXT_CONF_VLDT_REQUIRED
+    }, {
+        .name       = nxt_string("trusted"),
+        .type       = NXT_CONF_VLDT_STRING | NXT_CONF_VLDT_ARRAY,
+        .validator  = nxt_conf_vldt_match_addrs,
+    },
 
     NXT_CONF_VLDT_END
 };
@@ -2476,12 +2497,55 @@ nxt_conf_vldt_listener(nxt_conf_validation_t *vldt, nxt_str_t *name,
                                    "option set.", name);
     }
 
-    return nxt_conf_vldt_object(vldt, value, nxt_conf_vldt_listener_members);
+    ret = nxt_conf_vldt_object(vldt, value, nxt_conf_vldt_listener_members);
+    if (ret != NXT_OK) {
+        return ret;
+    }
+
+#if (NXT_HAVE_UNIX_DOMAIN)
+    if (sa->u.sockaddr.sa_family == AF_UNIX) {
+        nxt_conf_value_t  *pp;
+
+        static const nxt_str_t  pp_str = nxt_string("proxy_protocol");
+        static const nxt_str_t  trusted_str = nxt_string("trusted");
+
+        /*
+         * The trusted list matches IP addresses, and a peer of a UNIX
+         * domain listener has none: the list would drop every client.
+         */
+        pp = nxt_conf_get_object_member(value, &pp_str, NULL);
+
+        if (pp != NULL
+            && nxt_conf_type(pp) == NXT_CONF_OBJECT
+            && nxt_conf_get_object_member(pp, &trusted_str, NULL) != NULL)
+        {
+            return nxt_conf_vldt_error(vldt, "The \"trusted\" list of "
+                                       "\"proxy_protocol\" cannot be used "
+                                       "on the UNIX domain listener \"%V\".",
+                                       name);
+        }
+    }
+#endif
+
+    return NXT_OK;
 }
 
 
 static nxt_int_t
 nxt_conf_vldt_proxy_protocol(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    if (nxt_conf_type(value) == NXT_CONF_OBJECT) {
+        return nxt_conf_vldt_object(vldt, value,
+                                    nxt_conf_vldt_proxy_protocol_members);
+    }
+
+    return nxt_conf_vldt_proxy_protocol_version(vldt, value, data);
+}
+
+
+static nxt_int_t
+nxt_conf_vldt_proxy_protocol_version(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data)
 {
     nxt_str_t  version;
@@ -2496,6 +2560,29 @@ nxt_conf_vldt_proxy_protocol(nxt_conf_validation_t *vldt,
 
     return nxt_conf_vldt_error(vldt, "The \"proxy_protocol\" value must be "
                                "\"v1\", \"v2\" or \"off\".");
+}
+
+
+/*
+ * The object form names a version: "off" there would turn the option off
+ * and silently drop the "trusted" list.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_proxy_protocol_object_version(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    nxt_str_t  version;
+
+    nxt_conf_get_string(value, &version);
+
+    if (nxt_proxy_protocol_version(&version) != NXT_PROXY_PROTOCOL_OFF) {
+        return NXT_OK;
+    }
+
+    return nxt_conf_vldt_error(vldt, "The \"version\" of the "
+                               "\"proxy_protocol\" object must be \"v1\" "
+                               "or \"v2\".");
 }
 
 

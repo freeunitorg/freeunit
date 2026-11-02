@@ -680,3 +680,284 @@ def test_proxy_protocol_timeout(search_in_file):
     ), 'timeout is logged'
 
     assert_serves()
+
+
+# The trusted source list.
+
+
+def test_proxy_protocol_object_conf():
+    assert 'success' in listener({'version': 'v1'}), 'version only'
+    assert 'success' in listener({'version': 'v2', 'trusted': '127.0.0.1'})
+    assert 'success' in listener(
+        {'version': 'v2', 'trusted': ['10.0.0.0/8', '127.0.0.1', '::1']}
+    ), 'array, same syntax as forwarded.source'
+    assert 'success' in listener(
+        {'version': 'v2', 'trusted': ['10.0.0.1-10.0.0.9', '!10.0.0.5']}
+    ), 'range and negation'
+    assert 'success' in listener({'version': 'v2', 'trusted': []}), 'empty'
+
+    # The bad values are refused by the matcher the "forwarded" option uses.
+    for bad in ['10.0.0.0/33', '10.0.0.0/', 'x', '10.0.0.1:99999', 1, True]:
+        assert 'error' in listener(
+            {'version': 'v2', 'trusted': bad}
+        ), f'trusted {bad!r}'
+
+    assert 'error' in listener(
+        {'version': 'v2', 'trusted': ['127.0.0.1', '10.0.0.0/33']}
+    ), 'bad member of an array'
+
+    # "version" is required in the object form and is "v1" or "v2": "off"
+    # there would drop the trusted list without a word.
+    assert 'error' in listener({'trusted': '127.0.0.1'}), 'no version'
+    assert 'error' in listener({}), 'empty object'
+
+    for bad in ['off', 'v3', 'V2', '', 2, None, ['v2']]:
+        assert 'error' in listener({'version': bad}), f'version {bad!r}'
+
+    assert 'error' in listener(
+        {'version': 'off', 'trusted': '127.0.0.1'}
+    ), 'off with trusted'
+
+    assert 'error' in listener(
+        {'version': 'v2', 'unknown': 1}
+    ), 'unknown key'
+    assert 'error' in listener(
+        {'version': 'v2', 'trusted': '127.0.0.1', 'source': '127.0.0.1'}
+    ), 'unknown key next to valid ones'
+
+    # The string form is unchanged.
+    assert 'success' in listener('v2')
+    assert 'error' in listener('v3')
+
+    # The option is updated in place through its own endpoint.
+    assert 'success' in client.conf(
+        {'version': 'v1', 'trusted': '127.0.0.1'},
+        'listeners/127.0.0.1:8081/proxy_protocol',
+    )
+    assert 'success' in client.conf(
+        '"v2"', 'listeners/127.0.0.1:8081/proxy_protocol'
+    )
+
+
+def test_proxy_protocol_trusted(wait_for_record):
+    assert 'success' in client.conf(
+        {
+            'path': f'{option.temp_dir}/access.log',
+            'format': '$remote_addr "$request_line" $status',
+        },
+        'access_log',
+    ), 'access_log configure'
+
+    assert 'success' in listener({'version': 'v2', 'trusted': '127.0.0.1'})
+
+    resp = request(pp2_header(src='203.0.113.7'))
+    assert resp['status'] == 200
+    assert resp['headers']['Remote-Addr'] == '203.0.113.7'
+
+    assert (
+        wait_for_record(r'^203\.0\.113\.7 "GET / HTTP/1.1" 200$', 'access.log')
+        is not None
+    ), 'announced address in the access log'
+
+    # A CIDR, an array, v1 and the same rule as "forwarded.source".
+    assert 'success' in listener({'version': 'v2', 'trusted': '127.0.0.0/8'})
+    assert request(pp2_header(src='203.0.113.8'))['headers'][
+        'Remote-Addr'
+    ] == '203.0.113.8'
+
+    assert 'success' in listener(
+        {'version': 'v1', 'trusted': ['10.0.0.0/8', '127.0.0.1']}
+    )
+    assert request(pp1_header(src='203.0.113.9'))['headers'][
+        'Remote-Addr'
+    ] == '203.0.113.9'
+
+    assert 'success' in listener(
+        {'version': 'v2', 'trusted': ['10.0.0.0/8', '!127.0.0.2', '127.0.0.0/24']}
+    )
+    assert request(pp2_header(src='203.0.113.10'))['headers'][
+        'Remote-Addr'
+    ] == '203.0.113.10'
+
+
+def test_proxy_protocol_untrusted(search_in_file, findall, wait_for_record):
+    assert 'success' in client.conf(
+        {
+            'path': f'{option.temp_dir}/access.log',
+            'format': '$remote_addr "$request_line" $status',
+        },
+        'access_log',
+    ), 'access_log configure'
+
+    assert 'success' in listener({'version': 'v2', 'trusted': '10.0.0.0/8'})
+
+    # A header from a peer outside the list.
+    assert_dropped(pp2_header(src='203.0.113.77'))
+
+    # No header from a peer outside the list: closed as well.
+    assert_dropped(b'')
+
+    # A v1 line where v2 is configured.
+    assert_dropped(pp1_header(src='203.0.113.77'))
+
+    assert len(findall(r'PROXY protocol: the peer 127\.0\.0\.1:\d+ is not in')) == 3, (
+        'one line per dropped connection'
+    )
+    assert (
+        search_in_file(
+            r'\[info\].*PROXY protocol: the peer 127\.0\.0\.1:\d+ is not in '
+            r'"trusted", the connection is dropped'
+        )
+        is not None
+    ), 'drop is logged'
+
+    # The header was not read: no log line has the announced address, and
+    # the header-parsing messages do not appear.
+    assert search_in_file(r'203\.0\.113\.77') is None, 'address not in unit.log'
+    assert search_in_file(r'header is missing or invalid') is None
+    assert search_in_file(r'2001:db8') is None
+
+    # A listener that trusts the peer again serves, and the access log has
+    # no line of the dropped connections.
+    assert 'success' in listener({'version': 'v2', 'trusted': '127.0.0.1'})
+    assert request(pp2_header(src='203.0.113.78'))['status'] == 200
+
+    assert wait_for_record(r'^203\.0\.113\.78 ', 'access.log') is not None
+    # The positive record above shows the log is written; a plain search
+    # is enough for the absent ones.
+    assert search_in_file(r'^203\.0\.113\.77 ', 'access.log') is None, (
+        'address not in the access log'
+    )
+    assert search_in_file(r'^127\.0\.0\.1 ', 'access.log') is None, (
+        'dropped connection is not in the access log'
+    )
+
+
+def test_proxy_protocol_trusted_unix(temp_dir):
+    # A UNIX domain peer has no IP address: a trusted list would drop all.
+    addr = f'unix:{temp_dir}/pp.sock'
+    conf = {'pass': 'applications/forwarded_header'}
+
+    assert 'error' in client.conf(
+        {addr: {**conf, 'proxy_protocol': {'version': 'v2', 'trusted': []}}},
+        'listeners',
+    ), 'trusted on a unix listener'
+    assert 'success' in client.conf(
+        {addr: {**conf, 'proxy_protocol': {'version': 'v2'}}}, 'listeners'
+    ), 'object form without trusted'
+    assert 'success' in client.conf(
+        {addr: {**conf, 'proxy_protocol': 'v2'}}, 'listeners'
+    ), 'string form'
+
+
+def test_proxy_protocol_untrusted_moderated(findall, wait_for_record):
+    # The drop line is moderated: at most 10 lines a second, then a count.
+    assert 'success' in listener({'version': 'v2', 'trusted': '10.0.0.0/8'})
+
+    # Each peer sends a header: a silent one is accepted only after the
+    # deferred accept of the listener, about 1 s.
+    for _ in range(40):
+        assert_dropped(pp2_header(src='203.0.113.77'))
+
+    assert (
+        wait_for_record(r'PROXY protocol: untrusted peers were dropped \d+ times')
+        is not None
+    ), 'the count of the suppressed lines'
+    assert len(findall(r'is not in "trusted", the connection is dropped')) < 40
+
+
+def test_proxy_protocol_untrusted_silent(search_in_file):
+    # A peer that sends nothing is checked at accept, not after the header
+    # timeout.
+    assert 'success' in client.conf({'http': {'idle_timeout': 30}}, 'settings')
+    assert 'success' in listener({'version': 'v2', 'trusted': '10.0.0.0/8'})
+
+    sock = connect()
+    start = time.monotonic()
+    assert recv_all(sock) == b''
+    elapsed = time.monotonic() - start
+    sock.close()
+
+    assert elapsed < 3, f'dropped at accept, not after {elapsed:.1f} s'
+    assert (
+        search_in_file(r'is not in "trusted", the connection is dropped')
+        is not None
+    )
+    assert search_in_file(r'PROXY protocol header did not arrive') is None
+
+
+def test_proxy_protocol_untrusted_negated():
+    assert 'success' in listener({'version': 'v2', 'trusted': '!127.0.0.1'})
+    assert_dropped(pp2_header(src='203.0.113.77'))
+
+    assert 'success' in listener({'version': 'v2', 'trusted': []})
+    assert_dropped(pp2_header(src='203.0.113.77'))
+
+
+def test_proxy_protocol_untrusted_split(search_in_file):
+    assert 'success' in listener({'version': 'v2', 'trusted': '10.0.0.0/8'})
+
+    # A partial header from an untrusted peer: closed without a response.
+    sock = connect()
+    sock.sendall(pp2_header(src='203.0.113.77')[:10])
+    sock.settimeout(5)
+    assert recv_all(sock) == b''
+    sock.close()
+
+    assert search_in_file(r'203\.0\.113\.77') is None
+
+
+def test_proxy_protocol_trusted_tls():
+    client.certificate()
+
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+
+    assert 'success' in listener(
+        {'version': 'v2', 'trusted': '127.0.0.1'}, tls=True
+    )
+
+    sock = connect()
+    sock.sendall(pp2_header(src='203.0.113.7'))
+    ssock = context.wrap_socket(sock, server_hostname='localhost')
+    ssock.sendall(REQUEST)
+    resp = client._resp_to_dict(recv_all(ssock).decode())
+    ssock.close()
+
+    assert resp['headers']['Remote-Addr'] == '203.0.113.7'
+
+    # An untrusted peer gets no handshake.
+    assert 'success' in listener(
+        {'version': 'v2', 'trusted': '10.0.0.0/8'}, tls=True
+    )
+
+    # Read the plain socket: wrap_socket() skips the handshake without
+    # an error when a reset makes getpeername() fail with ENOTCONN.
+    sock = connect()
+    sock.sendall(pp2_header(src='203.0.113.77'))
+    sock.settimeout(5)
+
+    try:
+        data = sock.recv(1)
+    except ConnectionError:
+        data = b''
+
+    sock.close()
+
+    assert data == b''
+
+
+def test_proxy_protocol_trusted_forwarded():
+    # The trusted list sees the real peer; "forwarded" sees the announced one.
+    assert 'success' in listener(
+        {'version': 'v2', 'trusted': '127.0.0.1'},
+        forwarded={'client_ip': 'X-Forwarded-For', 'source': '203.0.113.0/24'},
+    )
+
+    resp = request(
+        pp2_header(src='203.0.113.5'),
+        request=b'GET / HTTP/1.1\r\nHost: localhost\r\n'
+        b'X-Forwarded-For: 198.51.100.9\r\nConnection: close\r\n\r\n',
+    )
+    assert resp['headers']['Remote-Addr'] == '198.51.100.9'
