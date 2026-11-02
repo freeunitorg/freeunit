@@ -95,6 +95,8 @@ static nxt_int_t nxt_conf_vldt_mtypes_type(nxt_conf_validation_t *vldt,
     nxt_str_t *name, nxt_conf_value_t *value);
 static nxt_int_t nxt_conf_vldt_mtypes_extension(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value);
+static nxt_int_t nxt_conf_vldt_proxy_protocol(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_listener(nxt_conf_validation_t *vldt,
     nxt_str_t *name, nxt_conf_value_t *value);
 #if (NXT_TLS)
@@ -609,6 +611,10 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_listener_members[] = {
         .name       = nxt_string("backlog"),
         .type       = NXT_CONF_VLDT_NUMBER,
         .validator  = nxt_conf_vldt_listen_backlog,
+    }, {
+        .name       = nxt_string("proxy_protocol"),
+        .type       = NXT_CONF_VLDT_STRING,
+        .validator  = nxt_conf_vldt_proxy_protocol,
     },
 
 #if (NXT_TLS)
@@ -2471,6 +2477,25 @@ nxt_conf_vldt_listener(nxt_conf_validation_t *vldt, nxt_str_t *name,
     }
 
     return nxt_conf_vldt_object(vldt, value, nxt_conf_vldt_listener_members);
+}
+
+
+static nxt_int_t
+nxt_conf_vldt_proxy_protocol(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    nxt_str_t  version;
+
+    nxt_conf_get_string(value, &version);
+
+    if (nxt_str_eq(&version, "off", 3)
+        || nxt_proxy_protocol_version(&version) != NXT_PROXY_PROTOCOL_OFF)
+    {
+        return NXT_OK;
+    }
+
+    return nxt_conf_vldt_error(vldt, "The \"proxy_protocol\" value must be "
+                               "\"v1\", \"v2\" or \"off\".");
 }
 
 
