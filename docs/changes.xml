@@ -7,14 +7,14 @@
 
 <changes apply="unit"
          ver="1.37.2" rev="1"
-         date="2026-10-31" time="00:00:00 +0000"
+         date="2026-11-06" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change type="security">
 <para>
 update Wasmtime, wasmtime-wasi and wasmtime-wasi-http to 48.0.8 for
-RUSTSEC-2026-0420, RUSTSEC-2026-0423 and RUSTSEC-2026-0424.  Cranelift moves
-to 0.135.8 with Wasmtime.  The contrib C API pin is 48.0.8 too.
+RUSTSEC-2026-0420 through RUSTSEC-2026-0424.  Cranelift moves to 0.135.8 with
+Wasmtime.  The contrib C API pin is 48.0.8 too.
 </para>
 </change>
 
@@ -49,8 +49,8 @@ that PHP removes no longer shifts the others.
 the gzip and deflate compressors now use the 32 KiB window and memLevel 8,
 the zlib defaults, instead of a 512-byte window.  For a response of known
 length both shrink to fit it, as in nginx.  Responses are smaller and cost
-less CPU; a compressed stream of unknown length holds about 256 KiB of zlib
-state instead of about 130 KiB.
+less CPU.  A compressed stream of unknown length uses a 4 KiB window and
+memLevel 6, about 54 KiB of zlib state.
 </para>
 </change>
 
@@ -71,6 +71,15 @@ the Brotli compressor now uses a window of at most 512 KiB (19 bits) and gets
 a known length as a size hint; before, a response at quality 11 could hold
 about 43 MB of state.  The zstd compressor shrinks its window to a known
 length.  The coded bytes stay valid for any client.
+</para>
+</change>
+
+<change type="change">
+<para>
+the Brotli compressor now reports an error when its output buffer is too small
+for a flush, instead of returning a cut stream.  No case was found where the
+buffers that Unit allocates are too small.  A coded body can be up to 2 bytes
+shorter.
 </para>
 </change>
 
@@ -106,6 +115,72 @@ Docker images for Python 3.15.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+when an application process exited while it waited for shared memory, the
+router could send the shared memory notice to the closed port.  It logged a
+"Bad file descriptor" error, or another process that got the same descriptor
+number quit with "too many port socket messages".
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a request taken from the shared application queue could be dropped with
+nobody left to answer it.  The router can reuse a queue slot for a new
+request as soon as the worker returns the old one, and the worker could then
+fail to claim the message it had just read.  The worker now claims the
+message before its slot goes back to the free list.  The fix is in libunit;
+an application built against an older libunit needs a rebuild.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+with the default "limits": {"timeout"} of 0, a request that an application
+process took from the queue and never acknowledged, for example because the
+process was killed, waited for ever, and the application kept a reference
+that blocked its prototype from being stopped after a reconfiguration.  Such
+a request is now answered 503 after about 10 seconds; a request still waiting
+in the queue waits as before.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a segmentation fault might have occurred in the router process if
+"idle_timeout" expired before the 408 response could be written, for example
+when a TLS client sent a ClientHello and then stopped.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+requests to an application could wait for ever when an application process
+asked the router for the port of a router thread that no longer existed: the
+router did not answer.  The router now answers the refusal, and libunit ends
+the requests that waited for the port.  The fix needs the new libunit; an
+application built against an older libunit keeps the old behaviour.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+when the last process of an application died, requests that it had taken
+from the queue but not yet started were answered with an error or, with
+"limits": {"timeout"} of 0, after a delay.  Now they are given to the new
+process.  A request that the dead process had already started is answered
+503 at once and is never run twice.
+</para>
+</change>
+
+<change type="change">
+<para>
+upgrade contrib njs to 1.0.2, which fixes memory-safety bugs in the njs
+engine.
+</para>
+</change>
+
 </changes>
 
 
@@ -120,7 +195,7 @@ Docker images for Python 3.15.
                 unit-jsc19 unit-jsc20 unit-jsc21
                 unit-wasm"
          ver="1.37.2" rev="1"
-         date="2026-10-31" time="00:00:00 +0000"
+         date="2026-11-06" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change>
