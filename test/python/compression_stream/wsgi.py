@@ -35,6 +35,13 @@ def application(environ, start_response):
     if pad:
         headers.append(('X-Pad', 'p' * pad))
 
+    # X-Accept-Ranges names the fields to send, comma-separated, each with
+    # the value "bytes", so a test can send it in another letter case or
+    # twice.
+    for name in environ.get('HTTP_X_ACCEPT_RANGES', '').split(','):
+        if name:
+            headers.append((name, 'bytes'))
+
     # X-Range sends a 206 with that Content-Range.
     status = '200 OK'
     crange = environ.get('HTTP_X_RANGE')

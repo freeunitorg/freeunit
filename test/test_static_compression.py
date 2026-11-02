@@ -55,6 +55,44 @@ def test_static_compression_baseline():
     assert resp['headers']['Content-Encoding'] == 'gzip', 'gzip applied'
 
 
+@pytest.mark.parametrize('configured', [False, True])
+def test_static_compression_no_accept_ranges(temp_dir, configured):
+    # A coded response is never served in ranges, so it does not advertise
+    # them, even when "response_headers" adds the field after the coding.
+    # The identity response does, and a Range still gets a 206 of the
+    # identity bytes.
+    if configured:
+        assert 'success' in client.conf(
+            {
+                "share": f'{temp_dir}/assets$uri',
+                "response_headers": {"Accept-Ranges": "bytes"},
+            },
+            'routes/0/action',
+        ), 'configure'
+
+    def get(**headers):
+        return client.get(
+            url='/big.css',
+            headers={'Host': 'localhost', 'Connection': 'close', **headers},
+        )
+
+    coded = get(**{'Accept-Encoding': 'gzip'})
+    assert coded['status'] == 200, 'coded status'
+    assert coded['headers']['Content-Encoding'] == 'gzip', 'coded'
+    assert 'Accept-Ranges' not in coded['headers'], 'coded: no Accept-Ranges'
+
+    plain = get()
+    assert plain['status'] == 200, 'identity status'
+    assert 'Content-Encoding' not in plain['headers'], 'identity'
+    assert plain['headers']['Accept-Ranges'] == 'bytes', 'identity: ranges'
+
+    part = get(**{'Accept-Encoding': 'gzip', 'Range': 'bytes=0-3'})
+    assert part['status'] == 206, 'range status'
+    assert 'Content-Encoding' not in part['headers'], 'range not coded'
+    assert part['headers']['Accept-Ranges'] == 'bytes', 'range: ranges'
+    assert part['body'] == 'body', 'range body'
+
+
 def test_static_compression_regex_match_limit(
     require, temp_dir, wait_for_record
 ):
