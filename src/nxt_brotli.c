@@ -12,6 +12,17 @@
 #include "nxt_http_compression.h"
 
 
+/*
+ * The window is capped at 19 bits (512 KiB), as Pingora does; 18 would
+ * halve it again.  The library default, 22 bits, costs some 43 MB of state
+ * per stream at quality 11, and a web response gains little from a window
+ * larger than 512 KiB.  A known length is passed as a size hint.
+ */
+
+#define NXT_BROTLI_LGWIN             19
+#define NXT_BROTLI_MAX_SIZE_HINT     ((nxt_off_t) 1 << 30)
+
+
 static int
 nxt_brotli_init(nxt_http_comp_compressor_ctx_t *ctx)
 {
@@ -21,7 +32,15 @@ nxt_brotli_init(nxt_http_comp_compressor_ctx_t *ctx)
     if (*brotli == NULL) {
         return -1;
     }
+
     BrotliEncoderSetParameter(*brotli, BROTLI_PARAM_QUALITY, ctx->level);
+    BrotliEncoderSetParameter(*brotli, BROTLI_PARAM_LGWIN, NXT_BROTLI_LGWIN);
+
+    if (ctx->size_hint > 0) {
+        BrotliEncoderSetParameter(*brotli, BROTLI_PARAM_SIZE_HINT,
+                                  (uint32_t) nxt_min(ctx->size_hint,
+                                                     NXT_BROTLI_MAX_SIZE_HINT));
+    }
 
     return 0;
 }
