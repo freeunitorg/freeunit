@@ -368,6 +368,10 @@ typedef struct {
      * on the listener must start with. */
     uint8_t                proxy_protocol;         /* 2 bits */
 
+    /* NULL: every peer is trusted.  Otherwise the peers that may send
+     * the header; a connection from any other peer is closed. */
+    struct nxt_http_route_addr_rule_s  *proxy_trusted;
+
     nxt_http_forward_t     *forwarded;
     nxt_http_forward_t     *client_ip;
 

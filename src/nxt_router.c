@@ -49,7 +49,6 @@ typedef struct {
 typedef struct {
     nxt_str_t         pass;
     nxt_str_t         application;
-    nxt_str_t         proxy_protocol;
     int               backlog;
 } nxt_router_listener_conf_t;
 
@@ -264,6 +263,8 @@ static nxt_int_t nxt_router_conf_create(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf, u_char *start, u_char *end);
 static nxt_int_t nxt_router_conf_process_static(nxt_task_t *task,
     nxt_router_conf_t *rtcf, nxt_conf_value_t *conf);
+static nxt_int_t nxt_router_conf_proxy_protocol(nxt_task_t *task, nxt_mp_t *mp,
+    nxt_conf_value_t *listener, nxt_socket_conf_t *skcf);
 static nxt_http_forward_t *nxt_router_conf_forward(nxt_task_t *task,
     nxt_mp_t *mp, nxt_conf_value_t *conf);
 static nxt_int_t nxt_router_conf_forward_header(nxt_mp_t *mp,
@@ -3039,11 +3040,6 @@ static nxt_conf_map_t  nxt_router_listener_conf[] = {
         offsetof(nxt_router_listener_conf_t, backlog),
     },
 
-    {
-        nxt_string("proxy_protocol"),
-        NXT_CONF_MAP_STR,
-        offsetof(nxt_router_listener_conf_t, proxy_protocol),
-    },
 };
 
 
@@ -3715,9 +3711,10 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             skcf->server_version = 1;
             skcf->chunked_transform = 0;
 
-            /* The validator has already refused any other value. */
-            skcf->proxy_protocol =
-                nxt_proxy_protocol_version(&lscf.proxy_protocol);
+            ret = nxt_router_conf_proxy_protocol(task, mp, listener, skcf);
+            if (ret != NXT_OK) {
+                goto fail;
+            }
 
             skcf->websocket_conf.max_frame_size = 1024 * 1024;
             skcf->websocket_conf.read_timeout = 60 * 1000;
@@ -4132,6 +4129,50 @@ nxt_router_conf_process_static(nxt_task_t *task, nxt_router_conf_t *rtcf,
             }
         }
     }
+
+    return NXT_OK;
+}
+
+
+/*
+ * The "proxy_protocol" option of a listener: the string "v1", "v2" or
+ * "off", or the object {"version": ..., "trusted": ...}.  The validator
+ * has already refused any other shape.  "trusted" is the same address
+ * rule as "forwarded.source".
+ */
+
+static nxt_int_t
+nxt_router_conf_proxy_protocol(nxt_task_t *task, nxt_mp_t *mp,
+    nxt_conf_value_t *listener, nxt_socket_conf_t *skcf)
+{
+    nxt_str_t         version;
+    nxt_conf_value_t  *conf, *trusted;
+
+    static const nxt_str_t  proxy_protocol_str = nxt_string("proxy_protocol");
+    static const nxt_str_t  version_str = nxt_string("version");
+    static const nxt_str_t  trusted_str = nxt_string("trusted");
+
+    conf = nxt_conf_get_object_member(listener, &proxy_protocol_str, NULL);
+    if (conf == NULL) {
+        return NXT_OK;
+    }
+
+    if (nxt_conf_type(conf) == NXT_CONF_OBJECT) {
+        trusted = nxt_conf_get_object_member(conf, &trusted_str, NULL);
+
+        if (trusted != NULL) {
+            skcf->proxy_trusted = nxt_http_route_addr_rule_create(task, mp,
+                                                                  trusted);
+            if (nxt_slow_path(skcf->proxy_trusted == NULL)) {
+                return NXT_ERROR;
+            }
+        }
+
+        conf = nxt_conf_get_object_member(conf, &version_str, NULL);
+    }
+
+    nxt_conf_get_string(conf, &version);
+    skcf->proxy_protocol = nxt_proxy_protocol_version(&version);
 
     return NXT_OK;
 }
