@@ -49,6 +49,8 @@ typedef struct {
     nxt_router_access_log_t  *access_log;
     /* The live logs of all configurations; under the lock. */
     nxt_queue_t              access_logs;
+    /* The live "limit_req" zones of all configurations; under the lock. */
+    nxt_queue_t              limit_zones;
 } nxt_router_t;
 
 
@@ -69,6 +71,9 @@ typedef struct {
     nxt_tstr_cond_t                 log_cond;
     nxt_router_access_log_t         *access_log;
     nxt_router_access_log_format_t  *log_format;
+
+    /* Of nxt_http_limit_zone_conf_t; NULL without a "limit_req". */
+    nxt_array_t                     *limit_zones;
 
     /*
      * Compression state, allocated from mem_pool above and reachable from a

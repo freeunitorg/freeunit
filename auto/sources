@@ -53,6 +53,7 @@ NXT_LIB_SRCS=" \
     src/nxt_work_queue.c \
     src/nxt_service.c \
     src/nxt_log_moderation.c \
+    src/nxt_limit_zone.c \
     src/nxt_event_engine.c \
     src/nxt_timer.c \
     src/nxt_fd_event.c \
@@ -85,6 +86,7 @@ NXT_LIB_SRCS=" \
     src/nxt_http_route.c \
     src/nxt_http_route_addr.c \
     src/nxt_http_rewrite.c \
+    src/nxt_http_limit_req.c \
     src/nxt_http_set_headers.c \
     src/nxt_http_return.c \
     src/nxt_http_static.c \
@@ -183,6 +185,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_http_validate_host_test.c \
     src/test/nxt_http_request_body_alloc_test.c \
     src/test/nxt_http_comp_select_test.c \
+    src/test/nxt_http_limit_req_test.c \
     src/test/nxt_conf_parse_test.c \
     src/test/nxt_port_fail_test.c \
     src/test/nxt_fd_event_change_test.c \
@@ -232,6 +235,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_cloexec_test.c \
     src/test/nxt_controller_peer_test.c \
     src/test/nxt_checked_test.c \
+    src/test/nxt_limit_zone_test.c \
     src/test/nxt_conn_close_test.c \
     src/test/nxt_router_prepare_msg_test.c \
     src/test/nxt_router_response_parse_test.c \

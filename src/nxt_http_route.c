@@ -6,6 +6,7 @@
 
 #include <nxt_router.h>
 #include <nxt_http.h>
+#include <nxt_http_limit_req.h>
 #include <nxt_sockaddr.h>
 #include <nxt_http_route_addr.h>
 #include <nxt_regex.h>
@@ -682,6 +683,11 @@ static nxt_conf_map_t  nxt_http_route_action_conf[] = {
         NXT_CONF_MAP_PTR,
         offsetof(nxt_http_action_conf_t, fallback)
     },
+    {
+        nxt_string("limit_req"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_http_action_conf_t, limit_req)
+    },
 };
 
 
@@ -717,6 +723,13 @@ nxt_http_action_init(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 
     if (acf.set_headers != NULL) {
         ret = nxt_http_set_headers_init(rtcf, action, &acf);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return ret;
+        }
+    }
+
+    if (acf.limit_req != NULL) {
+        ret = nxt_http_limit_req_init(task, tmcf, action, acf.limit_req);
         if (nxt_slow_path(ret != NXT_OK)) {
             return ret;
         }
@@ -1658,6 +1671,44 @@ nxt_http_route_handler(nxt_task_t *task, nxt_http_request_t *r,
     }
 
     nxt_http_request_error(task, r, NXT_HTTP_NOT_FOUND);
+
+    return NULL;
+}
+
+
+/*
+ * The action a route selects for the request, without taking it: no log,
+ * no 404, r->action is not set.  NULL when the action is not a route, when
+ * no step matches, or when a match fails.  The rate limiter uses it before
+ * the body is read; the matches look at the request line and the header
+ * fields only, so the choice is the one the route handler makes later.
+ */
+
+nxt_http_action_t *
+nxt_http_route_peek(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_http_action_t *start)
+{
+    size_t             i;
+    nxt_http_route_t   *route;
+    nxt_http_action_t  *action;
+
+    if (start->handler != nxt_http_route_handler) {
+        return NULL;
+    }
+
+    route = start->u.route;
+
+    for (i = 0; i < route->items; i++) {
+        action = nxt_http_route_match(task, r, route->match[i]);
+
+        if (action == NXT_HTTP_ACTION_ERROR) {
+            return NULL;
+        }
+
+        if (action != NULL) {
+            return action;
+        }
+    }
 
     return NULL;
 }
