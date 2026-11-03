@@ -278,18 +278,22 @@ def stream_decoder(encoding):
     return pytest.importorskip('brotli').Decompressor().process
 
 
+@pytest.mark.parametrize('length', ['known', 'none'])
 @pytest.mark.parametrize('encoding', ENCODINGS)
-def test_python_compression_part_flushed(encoding):
+def test_python_compression_part_flushed(encoding, length):
     # Each part of a streamed response must reach the client compressed and
     # complete before the next part is written (#788).  zstd held its output
-    # until a full 128 KiB block or the end of the response.
+    # until a full 128 KiB block or the end of the response.  With no
+    # Content-Length (#856), only the last buffer ends the stream.
     decode = stream_decoder(encoding)
     setup_compression(encoding)
 
-    sock = client.get(
-        headers=request_headers(2001, encoding, parts=2, delay=3),
-        no_recv=True,
-    )
+    rid = 2001 if length == 'known' else 3002
+    headers = request_headers(rid, encoding, parts=2, delay=3)
+    if length == 'none':
+        headers['X-Content-Length'] = 'none'
+
+    sock = client.get(headers=headers, no_recv=True)
     sock.settimeout(30)
 
     data = b''
@@ -300,6 +304,7 @@ def test_python_compression_part_flushed(encoding):
 
     head, _, data = data.partition(b'\r\n\r\n')
     assert b'Transfer-Encoding: chunked' in head, 'chunked'
+    assert b'Content-Encoding: ' + encoding.encode() in head, 'coded'
 
     sock.settimeout(1)
 
@@ -340,7 +345,7 @@ def test_python_compression_part_flushed(encoding):
 
     sock.close()
 
-    assert decoded == expected(2001, parts=1), 'the first part, decoded'
+    assert decoded == expected(rid, parts=1), 'the first part, decoded'
 
 
 @pytest.mark.parametrize('encoding', ENCODINGS)
@@ -561,3 +566,236 @@ def test_python_compression_app_coding_removed_is_not_coded_again():
         assert status == 200, f'{accept}: status'
         assert 'Content-Encoding' not in headers, f'{accept}: removed'
         assert body == BODY, f'{accept}: the application bytes'
+
+
+def test_python_compression_empty_content_length():
+    # An application response with "Content-Length: 0" carries the length in
+    # the field, not in content_length_n.  Before the fix it was coded: the
+    # field was dropped for an empty chunked body with Content-Encoding, and
+    # "identity;q=0" was answered with 406.  An empty body has no bytes to
+    # code or to refuse.
+    configure(None)
+
+    for accept in ('gzip', 'gzip, identity;q=0', 'identity;q=0'):
+        status, headers, body = post(b'', accept=accept)
+
+        assert status == 200, f'{accept}: status'
+        assert 'Content-Encoding' not in headers, f'{accept}: not coded'
+        assert headers.get('Content-Length') == '0', f'{accept}: length kept'
+        assert body == b'', f'{accept}: empty body'
+
+
+@pytest.mark.parametrize('body', ['hello', ''])
+@pytest.mark.parametrize('encoding', ENCODINGS)
+def test_python_compression_short_body(encoding, body):
+    # The application declares "Content-Length: 10" and sends fewer bytes, or
+    # none.  No data buffer completes the declared length, so the stream is
+    # ended at the last buffer.  Before the fix the coded body ended without
+    # the stream's trailer, and a client could not decode it.
+    setup_compression(encoding)
+
+    status, headers, coded = fetch(
+        1,
+        encoding,
+        extra={
+            'X-Parts': '1',
+            'X-Delay': '0',
+            'X-Body': body,
+            'X-Content-Length': '10',
+        },
+    )
+
+    assert status == 200, 'status'
+    assert headers.get('Content-Encoding') == encoding, 'coded'
+
+    coded = dechunk(coded)
+
+    assert coded != b'', 'a coded body is never empty'
+    assert decoder(encoding)(coded) == body.encode(), 'complete stream'
+
+
+@pytest.mark.parametrize('encoding', ENCODINGS)
+def test_python_compression_unknown_length(encoding):
+    # A streamed response with no Content-Length (#856).  The router used to
+    # skip compression for an unknown length, so such a response, and any
+    # PHP script that does not send Content-Length, was never compressed.
+    # It is coded, sent chunked, and the last buffer ends the stream.
+    setup_compression(encoding)
+
+    status, headers, coded = fetch(
+        3001, encoding, extra={'X-Content-Length': 'none'}
+    )
+
+    assert status == 200, 'status'
+    assert headers.get('Content-Encoding') == encoding, 'coded'
+    assert headers.get('Transfer-Encoding') == 'chunked', 'chunked'
+    assert 'Content-Length' not in headers, 'no length'
+    assert headers.get('Vary') == 'Accept-Encoding', 'vary'
+    assert decoder(encoding)(dechunk(coded)) == expected(3001), 'decodes'
+
+
+def test_python_compression_unknown_length_identity_refused():
+    # With an unknown length, "identity;q=0" used to get the identity body
+    # it refused, because negotiation was skipped.  It is negotiated now:
+    # an acceptable coding is used, and none at all is a 406.
+    setup_compression('gzip')
+
+    status, headers, coded = fetch(
+        3003, 'gzip, identity;q=0', extra={'X-Content-Length': 'none'}
+    )
+
+    assert status == 200, 'status'
+    assert headers.get('Content-Encoding') == 'gzip', 'coded'
+    assert gzip.decompress(dechunk(coded)) == expected(3003), 'decodes'
+
+    status, _, _ = fetch(
+        3004, 'identity;q=0', extra={'X-Content-Length': 'none'}
+    )
+
+    assert status == 406, 'nothing acceptable'
+
+
+@pytest.mark.parametrize('length', ['known', 'none'])
+def test_python_compression_unknown_length_206(length):
+    # An application's 206 is not coded, whatever its length: its
+    # Content-Range counts identity bytes.  "identity;q=0" then has nothing
+    # acceptable, so it is a 406.
+    setup_compression('gzip')
+    extra = {
+        'X-Parts': '1',
+        'X-Body': '0123456789',
+        'X-Content-Length': '10' if length == 'known' else 'none',
+        'X-Range': 'bytes 0-9/1000',
+    }
+    rid = 3005 if length == 'none' else 3008
+
+    status, headers, body = fetch(rid, 'gzip', extra=extra)
+
+    assert status == 206, 'status'
+    assert 'Content-Encoding' not in headers, 'not coded'
+    assert headers.get('Content-Range') == 'bytes 0-9/1000', 'range'
+    if length == 'none':
+        body = dechunk(body)
+    assert body == b'0123456789', 'identity body'
+
+    # gzip is selected, so the 406 comes from the 206 branch, not from an
+    # Accept-Encoding with no acceptable coding at all.
+    status, headers, _ = fetch(rid + 1, 'gzip, identity;q=0', extra=extra)
+
+    assert status == 406, 'identity refused'
+    assert headers.get('Vary') == 'Accept-Encoding', 'vary'
+
+
+def test_python_compression_unknown_length_below_min_length():
+    # "min_length" applies only to a known length.  A short stream of
+    # unknown length is coded.
+    setup_compression('gzip')
+    assert 'success' in client.conf(
+        {
+            "http": {
+                "compression": {
+                    "types": ["text/plain"],
+                    "compressors": [{"encoding": "gzip", "min_length": 1000}],
+                }
+            }
+        },
+        'settings',
+    )
+
+    status, headers, coded = fetch(
+        3007,
+        'gzip',
+        extra={
+            'X-Parts': '1',
+            'X-Body': '0123456789',
+            'X-Content-Length': 'none',
+        },
+    )
+
+    assert status == 200, 'status'
+    assert headers.get('Content-Encoding') == 'gzip', 'coded'
+    assert gzip.decompress(dechunk(coded)) == b'0123456789', 'decodes'
+
+
+def brotli_lgwin(coded):
+    # The window size the stream header declares (RFC 7932, 9.1).
+    first = coded[0]
+
+    if not first & 1:
+        return 16
+
+    n = (first >> 1) & 7
+    if n:
+        return 17 + n
+
+    n = (first >> 4) & 7
+    return 10 if n == 1 else 8 + n
+
+
+BROTLI_BODY = ' '.join(
+    'w%d' % ((i * 7919) % 613) for i in range(300)
+)
+
+
+@pytest.mark.parametrize(
+    'clen',
+    [
+        pytest.param('none', id='unknown'),
+        pytest.param(str(len(BROTLI_BODY)), id='known'),
+    ],
+)
+def test_python_compression_brotli_window(clen):
+    # The window is capped at 19 bits, whatever the length.
+    setup_compression('br')
+    body = BROTLI_BODY.encode()
+
+    status, headers, coded = fetch(
+        1,
+        'br',
+        extra={'X-Parts': '1', 'X-Body': BROTLI_BODY, 'X-Content-Length': clen},
+    )
+
+    assert status == 200, 'status'
+    assert headers.get('Content-Encoding') == 'br', 'coded'
+
+    coded = dechunk(coded)
+
+    assert brotli_lgwin(coded) <= 19, 'window'
+    assert decoder('br')(coded) == body, 'decodes'
+
+
+@pytest.mark.parametrize(
+    'names',
+    [
+        pytest.param('Accept-Ranges', id='canonical'),
+        pytest.param('accept-ranges', id='lower'),
+        pytest.param('Accept-Ranges,ACCEPT-RANGES', id='twice'),
+    ],
+)
+def test_python_compression_accept_ranges(names):
+    # An application's own Accept-Ranges counts identity bytes, so every
+    # such field goes from the coded response, in any letter case.  The
+    # identity response keeps them all.
+    setup_compression('gzip')
+    extra = {
+        'X-Parts': '1',
+        'X-Body': '0123456789' * 10,
+        'X-Accept-Ranges': names,
+    }
+
+    def ranges(headers):
+        return [k for k in headers if k.lower() == 'accept-ranges']
+
+    status, headers, coded = fetch(3010, 'gzip', extra=extra)
+
+    assert status == 200, 'status'
+    assert headers.get('Content-Encoding') == 'gzip', 'coded'
+    assert ranges(headers) == [], 'coded: no Accept-Ranges'
+    assert gzip.decompress(dechunk(coded)) == b'0123456789' * 10, 'decodes'
+
+    status, headers, body = fetch(3011, 'identity', extra=extra)
+
+    assert status == 200, 'identity status'
+    assert 'Content-Encoding' not in headers, 'identity'
+    assert sorted(ranges(headers)) == sorted(names.split(',')), 'identity'
+    assert body == b'0123456789' * 10, 'identity body'

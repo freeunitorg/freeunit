@@ -282,7 +282,7 @@ WebSocketRequest.prototype.accept = function(acceptedProtocol, allowedOrigin, co
         }
 
         protocolFullCase = protocolFullCase.replace(headerSanitizeRegExp, '');
-        response += 'Sec-WebSocket-Protocol: ' + protocolFullCase + '\r\n';
+        response.setHeader('Sec-WebSocket-Protocol', protocolFullCase);
     }
     this.requestedProtocols = null;
 
@@ -302,6 +302,7 @@ WebSocketRequest.prototype.accept = function(acceptedProtocol, allowedOrigin, co
             throw new Error('Value supplied for "cookies" argument must be an array.');
         }
         var seenCookies = {};
+        var cookieHeaders = [];
         cookies.forEach(function(cookie) {
             if (!cookie.name || !cookie.value) {
                 this.reject(500);
@@ -410,8 +411,11 @@ WebSocketRequest.prototype.accept = function(acceptedProtocol, allowedOrigin, co
                 cookieParts.push('HttpOnly');
             }
 
-            response.addHeader('Set-Cookie', cookieParts.join(';'));
+            cookieHeaders.push(cookieParts.join(';'));
         }.bind(this));
+        if (cookieHeaders.length > 0) {
+            response.setHeader('Set-Cookie', cookieHeaders);
+        }
     }
 
     // TODO: handle negotiated extensions
@@ -463,14 +467,14 @@ WebSocketRequest.prototype.reject = function(status, reason, extraHeaders) {
 
     if (reason) {
         reason = reason.replace(headerSanitizeRegExp, '');
-        response.addHeader('X-WebSocket-Reject-Reason', reason);
+        response.setHeader('X-WebSocket-Reject-Reason', reason);
     }
 
     if (extraHeaders) {
         for (var key in extraHeaders) {
             var sanitizedValue = extraHeaders[key].toString().replace(headerSanitizeRegExp, '');
             var sanitizedKey = key.replace(headerSanitizeRegExp, '');
-            response += (sanitizedKey + ': ' + sanitizedValue + '\r\n');
+            response.setHeader(sanitizedKey, sanitizedValue);
         }
     }
 

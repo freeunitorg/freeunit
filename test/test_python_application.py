@@ -49,7 +49,7 @@ custom-header: BLAH
 
     date = headers.pop('Date')
     assert date[-4:] == ' GMT', 'date header timezone'
-    assert abs(date_to_sec_epoch(date) - sec_epoch) < 5, 'date header'
+    assert abs(date_to_sec_epoch(date) - sec_epoch()) < 5, 'date header'
 
     assert headers == {
         'Connection': 'close',
@@ -106,6 +106,27 @@ a""".encode(),
         raw=True,
     )
     assert resp['headers']['Request-Uri'] == '/bar', 'REQUEST_URI unchanged'
+
+
+def test_python_application_header_dup():
+    client.load('header_dup')
+
+    resp = client.get(
+        headers={
+            'Host': 'localhost',
+            'Cookie': ['a=1', 'b=2'],
+            'X-Dup': ['1', '2'],
+            'Content-Type': ['text/plain', 'text/html'],
+            'Connection': 'close',
+        }
+    )
+
+    assert resp['status'] == 200, 'status'
+    headers = resp['headers']
+    assert headers['X-Cookie'] == 'a=1; b=2', 'Cookie lines joined with "; "'
+    assert headers['X-Dup'] == '1, 2', 'other lines joined with ", "'
+    assert headers['X-Http-Content-Type'] == 'text/plain, text/html'
+    assert headers['X-Content-Type'] == 'text/plain, text/html', 'CONTENT_TYPE'
 
 
 def test_python_application_query_string():
@@ -265,7 +286,15 @@ def test_python_keepalive_body():
 
 
 def test_python_keepalive_reconfigure():
-    client.load('mirror')
+    # Each load rewrites conf.json, and the controller answers only after
+    # that.  On a slow disk one load took 11 s, so a socket idled past the
+    # default idle_timeout of 30 s between its second and third request, and
+    # Unit answered "408 Request Timeout" with an empty body.  The test is
+    # about reconfiguration, not about the idle timeout, so make the timeout
+    # longer than the test can run.
+    settings = {'http': {'idle_timeout': 3600}}
+
+    client.load('mirror', settings=settings)
 
     assert client.get()['status'] == 200, 'init'
 
@@ -286,7 +315,7 @@ def test_python_keepalive_reconfigure():
 
         assert resp['body'] == body, 'keep-alive open'
 
-        client.load('mirror', processes=i + 1)
+        client.load('mirror', processes=i + 1, settings=settings)
 
         socks.append(sock)
 
@@ -304,14 +333,15 @@ def test_python_keepalive_reconfigure():
 
         assert resp['body'] == body, 'keep-alive request'
 
-        client.load('mirror', processes=i + 1)
+        client.load('mirror', processes=i + 1, settings=settings)
 
     for i in range(conns):
         resp = client.post(sock=socks[i], body=body)
 
+        assert resp['status'] == 200, 'keep-alive close status'
         assert resp['body'] == body, 'keep-alive close'
 
-        client.load('mirror', processes=i + 1)
+        client.load('mirror', processes=i + 1, settings=settings)
 
 
 def test_python_keepalive_reconfigure_2():

@@ -27,6 +27,10 @@ type request struct {
 func (r *request) Read(p []byte) (n int, err error) {
 	res := C.nxt_cgo_request_read(r.c_req, buf_ref(p), C.uint32_t(len(p)))
 
+	if res < 0 {
+		return 0, io.ErrUnexpectedEOF
+	}
+
 	if res == 0 && len(p) > 0 {
 		return 0, io.EOF
 	}

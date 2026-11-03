@@ -40,7 +40,6 @@ NXT_LIB_SRCS=" \
     src/nxt_array.c \
     src/nxt_list.c \
     src/nxt_buf.c \
-    src/nxt_buf_pool.c \
     src/nxt_recvbuf.c \
     src/nxt_sendbuf.c \
     src/nxt_thread.c \
@@ -63,7 +62,6 @@ NXT_LIB_SRCS=" \
     src/nxt_conn_read.c \
     src/nxt_conn_write.c \
     src/nxt_conn_close.c \
-    src/nxt_conn_proxy.c \
     src/nxt_sockaddr.c \
     src/nxt_listen_socket.c \
     src/nxt_upstream.c \
@@ -223,6 +221,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_proto_creating_wedge_test.c \
     src/test/nxt_main_whoami_test.c \
     src/test/nxt_main_remove_child_pid_test.c \
+    src/test/nxt_main_port_gate_test.c \
     src/test/nxt_port_change_file_test.c \
     src/test/nxt_port_ctrunc_test.c \
     src/test/nxt_port_fd_test.c \
@@ -243,6 +242,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_nncq_wrap_test.c \
     src/test/nxt_app_queue_test.c \
     src/test/nxt_size_bound_test.c \
+    src/test/nxt_casecmp_test.c \
     src/test/nxt_cpu_limit_test.c \
     src/test/nxt_process_nofile_test.c \
     src/test/nxt_usdt_test.c \

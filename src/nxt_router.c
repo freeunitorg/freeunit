@@ -1853,7 +1853,7 @@ nxt_router_new_port_check(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_port_msg_new_port_t  new_port;
 
     if (nxt_slow_path(nxt_port_new_port_msg(msg, &new_port) != NXT_OK)) {
-        return "short new port message";
+        return "short or bad new port message";
     }
 
     if (nxt_router_msg_from(task, msg, NXT_PROCESS_MAIN)) {
@@ -3644,10 +3644,11 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 
     /*
      * Compression is configured once for the whole router, not per listener.
-     * The return is deliberately not checked: a "compression" block the
-     * validator accepts but this cannot build -- one with no "compressors",
-     * which is not a required member -- leaves compression off rather than
-     * rejecting the configuration, which is what it has always done.
+     * The return is deliberately not checked: a "compression" block that
+     * this cannot build leaves compression off rather than rejecting the
+     * configuration.  The control API refuses a block with no "compressors";
+     * a stored configuration from an earlier version can still have one, and
+     * nxt_conf_vldt_compression_object() keeps it with a warning.
      */
     comp = nxt_conf_get_path(root, &compression_path);
     if (comp != NULL) {
@@ -8833,6 +8834,7 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     size_t              fields_count, req_size, size, free_size;
     size_t              copy_size;
     nxt_off_t           content_length;
+    const char          *sep;
     nxt_buf_t               *b, *buf, *out, **tail;
     nxt_http_field_t        *field, *dup;
     nxt_unit_field_t        *dst_field;
@@ -8882,6 +8884,9 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
         if (field->skip) {
             continue;
         }
+
+        /* No line is joined yet.  The copy loop marks the joined lines. */
+        field->merged = 0;
 
         fields_count++;
 
@@ -9003,6 +9008,12 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
             continue;
         }
 
+        /* The line is joined to an earlier one.  Clear the mark. */
+        if (field->merged) {
+            field->merged = 0;
+            continue;
+        }
+
         dst_field->hash = field->hash;
         dst_field->skip = 0;
         /* Checked to fit uint8_t when req_size was summed. */
@@ -9059,6 +9070,7 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
         p = nxt_cpymem(p, field->value, field->value_length);
 
         if (prefix->length != 0) {
+            sep = NULL;
             dup_iter = iter;
 
             for (dup = nxt_http_fields_next(&dup_iter);
@@ -9073,12 +9085,47 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
                     continue;
                 }
 
-                p = nxt_cpymem(p, ", ", 2);
+                /*
+                 * Cookie lines are joined with "; ", as an HTTP/2 decoder
+                 * joins them for a non-HTTP/2 context (RFC 9113,
+                 * Section 8.2.3).  PHP splits the cookie string at ";"
+                 * only.  The other lines take a comma (RFC 9110,
+                 * Section 5.3).
+                 */
+                if (sep == NULL) {
+                    sep = (field->name_length == nxt_length("Cookie")
+                           && nxt_memcasecmp(field->name, "Cookie",
+                                             nxt_length("Cookie")) == 0)
+                          ? "; " : ", ";
+                }
+
+                /*
+                 * The h1 field handlers point r->content_type, r->cookie
+                 * and r->authorization at the last line of their name.
+                 * A second Content-Length line is refused with 400 by
+                 * nxt_http_request_content_length().
+                 */
+                if (dup == r->content_type) {
+                    req->content_type_field = dst_field - req->fields;
+
+                } else if (dup == r->cookie) {
+                    req->cookie_field = dst_field - req->fields;
+
+                } else if (dup == r->authorization) {
+                    req->authorization_field = dst_field - req->fields;
+                }
+
+                p = nxt_cpymem(p, sep, 2);
                 p = nxt_cpymem(p, dup->value, dup->value_length);
 
                 dst_field->value_length += 2 + dup->value_length;
 
-                dup->skip = 1;
+                /*
+                 * The mark is not "skip": the phases after this one read
+                 * the request fields.  The response compression reads
+                 * every Accept-Encoding line.
+                 */
+                dup->merged = 1;
             }
         }
 

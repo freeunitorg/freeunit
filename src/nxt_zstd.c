@@ -16,6 +16,40 @@
 #include "nxt_http_compression.h"
 
 
+/*
+ * Without a size level 3 uses a 2 MiB window (windowLog 21), some 3.5 MiB
+ * of state per stream.  A stream of unknown length gets windowLog 17,
+ * 128 KiB.  For a known length the window is shrunk to the body, as for
+ * zlib.  The length is not pledged: an application may send fewer bytes
+ * than it declares, and a pledged size then fails the frame.
+ */
+
+#define NXT_ZSTD_STREAM_WINDOWLOG  17
+#define NXT_ZSTD_MIN_WINDOWLOG     10
+#define NXT_ZSTD_MAX_WINDOWLOG     21
+
+
+static int
+nxt_zstd_windowlog(const nxt_http_comp_compressor_ctx_t *ctx)
+{
+    int  wlog;
+
+    if (ctx->size_hint <= 0) {
+        return NXT_ZSTD_STREAM_WINDOWLOG;
+    }
+
+    wlog = NXT_ZSTD_MIN_WINDOWLOG;
+
+    while (wlog < NXT_ZSTD_MAX_WINDOWLOG
+           && ctx->size_hint > ((nxt_off_t) 1 << wlog))
+    {
+        wlog++;
+    }
+
+    return wlog;
+}
+
+
 static int
 nxt_zstd_init(nxt_http_comp_compressor_ctx_t *ctx)
 {
@@ -25,7 +59,16 @@ nxt_zstd_init(nxt_http_comp_compressor_ctx_t *ctx)
     if (*zstd == NULL) {
         return -1;
     }
-    ZSTD_initCStream(*zstd, ctx->level);
+
+    if (ZSTD_isError(ZSTD_CCtx_setParameter(*zstd, ZSTD_c_compressionLevel,
+                                            ctx->level))
+        || ZSTD_isError(ZSTD_CCtx_setParameter(*zstd, ZSTD_c_windowLog,
+                                               nxt_zstd_windowlog(ctx))))
+    {
+        ZSTD_freeCStream(*zstd);
+        *zstd = NULL;
+        return -1;
+    }
 
     return 0;
 }

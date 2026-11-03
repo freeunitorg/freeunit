@@ -44,6 +44,8 @@
 /* What the request handler does with a request that arrived. */
 typedef enum {
     NXT_UNIT_MSG_TEST_READ_BODY = 0,
+    NXT_UNIT_MSG_TEST_READ_SPLIT_BODY,
+    NXT_UNIT_MSG_TEST_READ_SPLIT_BODY_EBADF,
     NXT_UNIT_MSG_TEST_GROUP_DUP,
     NXT_UNIT_MSG_TEST_RAISE_COUNT,
     NXT_UNIT_MSG_TEST_UPGRADE,
@@ -174,6 +176,30 @@ nxt_unit_msg_test_handler(nxt_unit_request_info_t *req)
 
         break;
 
+    case NXT_UNIT_MSG_TEST_READ_SPLIT_BODY:
+        memset(buf, 0x5A, sizeof(buf));
+
+        n = nxt_unit_request_read(req, buf, 4);
+
+        nxt_unit_msg_test_handler_ok =
+            n == 4
+            && memcmp(buf, "abcd", 4) == 0
+            && (u_char) buf[4] == 0x5A;
+
+        break;
+
+    case NXT_UNIT_MSG_TEST_READ_SPLIT_BODY_EBADF:
+        memset(buf, 0x5A, sizeof(buf));
+
+        n = nxt_unit_request_read(req, buf, 4);
+
+        nxt_unit_msg_test_handler_ok =
+            n == 2
+            && memcmp(buf, "ab", 2) == 0
+            && (u_char) buf[2] == 0x5A;
+
+        break;
+
     case NXT_UNIT_MSG_TEST_GROUP_DUP:
         nxt_unit_request_group_dup_fields(req);
 
@@ -181,11 +207,14 @@ nxt_unit_msg_test_handler(nxt_unit_request_info_t *req)
         f = r->fields;
 
         nxt_unit_msg_test_handler_ok =
-            r->fields_count == 3
+            r->fields_count == 4
+            && r->authorization_field == 3
             && f[1].name_length == nxt_length("X-Dup")
             && nxt_unit_sptr_get(&f[1].name) == nxt_unit_sptr_get(&f[2].name)
             && memcmp(nxt_unit_sptr_get(&f[1].value), "1", 1) == 0
             && memcmp(nxt_unit_sptr_get(&f[2].value), "2", 1) == 0
+            && f[3].name_length == nxt_length("Authorization")
+            && memcmp(nxt_unit_sptr_get(&f[3].value), "Bearer tok", 10) == 0
             && f[0].name_length == nxt_length("Host")
             && memcmp(nxt_unit_sptr_get(&f[0].value), "localhost", 9) == 0;
 
@@ -1245,6 +1274,7 @@ nxt_unit_msg_test_write_request(u_char *p)
     } fields[] = {
         { "Host", "localhost" },
         { "X-Dup", "1" },
+        { "Authorization", "Bearer tok" },
         { "x-dup", "2" },
     };
 
@@ -1257,7 +1287,7 @@ nxt_unit_msg_test_write_request(u_char *p)
     r->content_length_field = NXT_UNIT_NONE_FIELD;
     r->content_type_field = NXT_UNIT_NONE_FIELD;
     r->cookie_field = NXT_UNIT_NONE_FIELD;
-    r->authorization_field = NXT_UNIT_NONE_FIELD;
+    r->authorization_field = 2;
 
     r->content_length = nxt_length(NXT_UNIT_MSG_TEST_BODY);
 
@@ -1428,6 +1458,115 @@ nxt_unit_msg_test_quit_pending_body_case(void *data)
         fflush(stdout);
 
         return 2;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * A request whose body starts in preread_content ("ab") and continues in
+ * content_fd ("cd").  nxt_unit_request_read() must advance dst and reduce
+ * the remaining size after reading from content_buf so that read() appends
+ * at dst + buf_res without overwriting the preread bytes or overflowing dst.
+ */
+static int
+nxt_unit_msg_test_split_body_fd_case(void *data)
+{
+    int             rc, pfd[2];
+    nxt_port_msg_t  msg;
+
+    if (pipe(pfd) != 0) {
+        return 1;
+    }
+
+    if (write(pfd[1], "cdef", 4) != 4) {
+        close(pfd[0]);
+        close(pfd[1]);
+        return 1;
+    }
+
+    close(pfd[1]);
+
+    nxt_unit_msg_test_mode = NXT_UNIT_MSG_TEST_READ_SPLIT_BODY;
+
+    rc = nxt_unit_msg_test_send_request(2, nxt_unit_msg_test_edit_more_body);
+    if (rc != NXT_UNIT_OK || nxt_unit_msg_test_handler_calls != 0) {
+        close(pfd[0]);
+        return 2;
+    }
+
+    memset(&msg, 0, sizeof(msg));
+
+    msg.stream = nxt_unit_msg_test_stream;
+    msg.pid = nxt_unit_msg_test_pid;
+    msg.reply_port = nxt_unit_msg_test_reply_port;
+    msg.type = _NXT_PORT_MSG_REQ_BODY;
+    msg.last = 1;
+
+    rc = nxt_unit_test_process_msg(nxt_unit_msg_test_ctx, &msg, sizeof(msg),
+                                   pfd[0]);
+
+    if (rc != NXT_UNIT_OK || nxt_unit_msg_test_handler_calls != 1
+        || !nxt_unit_msg_test_handler_ok)
+    {
+        printf("unit msg test: split body fd rc %d, handler %d, ok %d\n",
+               rc, nxt_unit_msg_test_handler_calls,
+               nxt_unit_msg_test_handler_ok);
+        fflush(stdout);
+
+        return 3;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * When read() on content_fd fails (e.g. EBADF on a write-only pipe end)
+ * after preread bytes ("ab") have already been copied from content_buf,
+ * nxt_unit_request_read() must return the 2 preread bytes rather than -1.
+ */
+static int
+nxt_unit_msg_test_split_body_fd_ebadf_case(void *data)
+{
+    int             rc, pfd[2];
+    nxt_port_msg_t  msg;
+
+    if (pipe(pfd) != 0) {
+        return 1;
+    }
+
+    close(pfd[0]);
+
+    nxt_unit_msg_test_mode = NXT_UNIT_MSG_TEST_READ_SPLIT_BODY_EBADF;
+
+    rc = nxt_unit_msg_test_send_request(2, nxt_unit_msg_test_edit_more_body);
+    if (rc != NXT_UNIT_OK || nxt_unit_msg_test_handler_calls != 0) {
+        close(pfd[1]);
+        return 2;
+    }
+
+    memset(&msg, 0, sizeof(msg));
+
+    msg.stream = nxt_unit_msg_test_stream;
+    msg.pid = nxt_unit_msg_test_pid;
+    msg.reply_port = nxt_unit_msg_test_reply_port;
+    msg.type = _NXT_PORT_MSG_REQ_BODY;
+    msg.last = 1;
+
+    rc = nxt_unit_test_process_msg(nxt_unit_msg_test_ctx, &msg, sizeof(msg),
+                                   pfd[1]);
+
+    if (rc != NXT_UNIT_OK || nxt_unit_msg_test_handler_calls != 1
+        || !nxt_unit_msg_test_handler_ok)
+    {
+        printf("unit msg test: split body fd ebadf rc %d, handler %d, ok %d\n",
+               rc, nxt_unit_msg_test_handler_calls,
+               nxt_unit_msg_test_handler_ok);
+        fflush(stdout);
+
+        return 3;
     }
 
     return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
@@ -3973,6 +4112,16 @@ main(void)
                                "completes",
                                nxt_unit_msg_test_quit_pending_body_case, NULL,
                                NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("a request body split across content_buf and "
+                               "content_fd is read without overflow",
+                               nxt_unit_msg_test_split_body_fd_case, NULL,
+                               NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("a content_fd read error after preread bytes "
+                               "returns the preread bytes",
+                               nxt_unit_msg_test_split_body_fd_ebadf_case,
+                               NULL, NXT_UNIT_OK);
 
     nxt_unit_msg_test_in_child("duplicate segment id does not leak a mapping",
                                nxt_unit_msg_test_dup_id_case, NULL,

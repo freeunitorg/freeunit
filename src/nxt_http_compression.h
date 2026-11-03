@@ -53,6 +53,13 @@ typedef struct nxt_http_comp_operations_s      nxt_http_comp_operations_t;
 struct nxt_http_comp_compressor_ctx_s {
     int8_t level;
 
+    /*
+     * The length of the body when it is known, else 0 or -1.  zlib sizes
+     * its window and hash from it, as nginx does: a short body needs no
+     * 32 KiB window.
+     */
+    nxt_off_t size_hint;
+
     union {
 #if NXT_HAVE_ZLIB
         z_stream zlib_ctx;

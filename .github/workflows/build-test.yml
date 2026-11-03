@@ -348,6 +348,17 @@ jobs:
       - name: Run the otel crate unit tests
         run: cargo test --release --locked --manifest-path src/otel/Cargo.toml
 
+      # The c-tests job configures without --njs, so this is the only leg
+      # that runs the C suite against a real njs.  The invalid shm fd path
+      # in nxt_router_conf_overlap_test releases a temporary configuration
+      # before nxt_js_compile() creates the VM.  Without the guard in
+      # nxt_js.c, njs_vm_destroy(NULL) segfaults there.
+      - name: Build C tests
+        run: make -j$(nproc) tests
+
+      - name: Run C tests with njs
+        run: sudo ./build/tests
+
       # The default target is `all: unitd manpage`, so --tests above only
       # makes this target available -- it does not build it.  Without it
       # build/unit_app_test does not exist and test_app_lifecycle.py's
@@ -427,12 +438,13 @@ jobs:
           testpath="test/test_${module}* test/test_app_lifecycle.py"
 
           # A Python leg runs its interpreter-specific suites whole.  That is
-          # what the three versions are for.  It also takes a share of the
-          # other files, balanced by measured time (see below).  Three runs
-          # of the whole language-agnostic suite cost about 12 minutes per
-          # leg, twice any other language, for tests that no interpreter
-          # distinguishes.  Each shared file now runs on one Python version
-          # instead of three.  The union over the legs does not change.
+          # what the Python versions are for.  It also takes a share of the
+          # other files, balanced by measured time (see below).  A run of the
+          # whole language-agnostic suite on every version costs about 12
+          # minutes per leg, twice any other language, for tests that no
+          # interpreter distinguishes.  Each shared file now runs on one
+          # Python version instead of on all of them.  The union over the
+          # legs does not change.
           #
           # Both lists are built from the files that exist, never from a glob
           # handed to pytest.  There is no test_wsgi_*.py -- WSGI is exercised
@@ -490,20 +502,25 @@ jobs:
             # legs still run it.  A file that is not in this list only costs
             # balance, not coverage.
             #
-            # test_settings.py was 64 s in that run.  It cost 180 s on the
-            # python-3.13 leg of
-            # https://github.com/freeunitorg/freeunit/actions/runs/38018584167
-            # measured by summing the gaps between consecutive tests of the
-            # file in the leg's log.  That leg ran 359 s against 253 s and
-            # 283 s on python-3.12 and python-3.14, because the entry sent
-            # the largest shared file to the leg that already had the most
-            # work.  The 408 change in the same pull request removes about
-            # 7 s of sleeps, so the cost is about 174 s.  The entry uses 170
-            # s: the shards only need a good balance.  Re-measure a file when
-            # its cost changes.
+            # test_settings.py cost 170 s on the python-3.13 leg of
+            # https://github.com/freeunitorg/freeunit/actions/runs/40428047422
+            # (360 s of pytest), 59 s of it test_settings_send_timeout: its
+            # 40 MiB body went through recvall(), which appended 4 KiB reads
+            # to a bytes object.  recvall() collects into a bytearray now
+            # (#866).  The JUnit report of run 41226901509 puts the file's
+            # tests at 125 s with that copy capped; the full body adds less
+            # than a second.
+            #
+            # The entries are in descending order of time: each one goes to
+            # the least loaded shard, so a large file late in the list would
+            # land on a shard that is already full.
+            #
+            # The python legs upload a JUnit report (junit-python-*), which
+            # has the time of each test, to recompute the table from.
+            # Re-measure a file when its cost changes.
             heavy="
+              test/test_settings.py:125
               test/test_app_start_timeout.py:72
-              test/test_settings.py:170
               test/test_otel.py:34
               test/test_proxy.py:27
               test/test_tls.py:22
@@ -923,7 +940,7 @@ jobs:
       # Prebuilt binary instead of `cargo install cargo-component` (which
       # compiles it from source on every run). Same tool, much faster.
       - name: Install cargo-component
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: cargo-component
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
@@ -1065,11 +1082,29 @@ jobs:
             # ubuntu-26.04 ships sudo-rs, which ignores -E ("preserving the
             # entire environment is not supported").  Pass the variables the
             # suite reads by name; this works with sudo-rs and classic sudo.
+            #
+            # The python legs also write a JUnit report, uploaded below, so
+            # the heavy= shard table can be recomputed from measured times.
+            junit=
+            if [ "${{ steps.metadata.outputs.module }}" == "python" ]; then
+              junit="--junitxml=$RUNNER_TEMP/junit-python-${{ steps.metadata.outputs.version }}.xml"
+            fi
             sudo env UNIT_PYTHONHOME="${UNIT_PYTHONHOME:-}" \
                      JAVA_HOME="${JAVA_HOME:-}" TZ="${TZ:-}" \
-              pytest-3 --print-log --unsafe ${port} \
+              pytest-3 --print-log --unsafe ${port} ${junit} \
               ${{ steps.metadata.outputs.testpath }}
           fi
+
+      # Per-test times of the python legs, for the heavy= table above.
+      # always(): a failed or timed-out run still has times worth keeping.
+      - name: Upload the JUnit report
+        if: ${{ always() && steps.metadata.outputs.module == 'python' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-python-${{ steps.metadata.outputs.version }}
+          path: ${{ runner.temp }}/junit-python-${{ steps.metadata.outputs.version }}.xml
+          retention-days: 14
+          if-no-files-found: ignore
 
       # check_prerequisites() skips the whole file when the clang/wasi-sysroot
       # fixture cannot be built, so an incomplete toolchain would leave this
@@ -1129,9 +1164,10 @@ jobs:
       # test_njs_modules.py stores njs modules and starts unitd again to
       # check what it loads from the state directory.
       # test_python_shm_limit_stored, test_settings_timeout_stored,
-      # test_settings_size_negative_stored and
-      # test_access_log_credential_header_stored start unitd on a stored
-      # configuration.
+      # test_settings_size_negative_stored,
+      # test_access_log_credential_header_stored,
+      # test_compressors_level_stored and test_compressors_missing_stored
+      # start unitd on a stored configuration.
       # All need --restart, which the run above does not pass, so they skip
       # there.  Run them again, off the default base port: no other step runs
       # a requires_restart test with --port.
@@ -1150,6 +1186,8 @@ jobs:
             test/test_settings.py::test_settings_timeout_stored \
             test/test_settings.py::test_settings_size_negative_stored \
             test/test_config_validation_errors.py::test_access_log_credential_header_stored \
+            test/test_conf_compressors_object.py::test_compressors_level_stored \
+            test/test_conf_compressors_object.py::test_compressors_missing_stored \
             test/test_tls.py::test_tls_certificate_update_restart
         if: ${{ !cancelled() && steps.metadata.outputs.module == 'python' }}
 
@@ -1175,13 +1213,14 @@ jobs:
         run: |
           sudo apt-get -y update
           sudo apt-get -y install build-essential libssl-dev libpcre2-dev \
-            systemtap-sdt-dev
+            systemtap-sdt-dev zlib1g-dev libzstd-dev libbrotli-dev
 
       # --usdt is here because no other job compiles the probes.  The other
       # C test jobs build without it, so nxt_usdt_test runs with and without
-      # the probes.
+      # the probes.  --zlib, --zstd and --brotli are here so
+      # nxt_http_comp_select_test runs the compressor checks.
       - name: Configure unit (--tests --usdt)
-        run: ./configure --openssl --tests --usdt
+        run: ./configure --openssl --zlib --zstd --brotli --tests --usdt
 
       - name: Build unitd and libunit
         run: |

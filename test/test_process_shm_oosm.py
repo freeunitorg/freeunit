@@ -92,12 +92,28 @@ def _body(resp, size):
     return resp[-size:]
 
 
+def _require_debug_build():
+    """The evidence below is nxt_debug() output, compiled out unless Unit was
+    configured with --debug.  Skip loudly rather than let the test degrade
+    into a smoke test that proves nothing.  No leg of this repository's CI
+    runs this file on a --debug build with the PHP module; run it by hand
+    on such a build.  Ask the log before the workload, not after it: a
+    release build would otherwise run the whole kill workload only to skip.
+    client.load() and the settings PUT above it already wrote debug records
+    in a --debug build."""
+
+    if not Log.findall(r'\[debug\]'):
+        pytest.skip('OOSM evidence needs a --debug build')
+
+
 def test_process_shm_oosm():
     client.load(APP, limits={"shm": SHM_LIMIT}, processes=1)
 
     assert 'success' in client.conf(
         {"listen_threads": LISTEN_THREADS}, 'settings'
     ), 'listen_threads'
+
+    _require_debug_build()
 
     sock = client.get(url=f'/?mb={RESPONSE_MB}', no_recv=True)
 
@@ -112,14 +128,6 @@ def test_process_shm_oosm():
     assert body.count(b'x') == RESPONSE_SIZE, 'intact response'
 
     log = Log.read()
-
-    # The records asserted on below are nxt_debug()/nxt_unit_debug(), compiled
-    # out unless Unit was configured with --debug.  Skip loudly rather than
-    # let the test degrade into a smoke test that proves nothing about the
-    # path it claims to cover.  The sanitiser workflow builds --debug, which
-    # is the leg this test exists for.
-    if '[debug]' not in log:
-        pytest.skip('OOSM evidence needs a --debug build')
 
     # nxt_router_oosm_handler() logs this on entry, immediately before the
     # reference it now takes; its presence is the proof that the converted
@@ -167,11 +175,11 @@ KILL_INTERVAL = 0.4
 STALLERS = 3
 
 # Bounded on purpose: this is a race driver, not a soak.  Five kills at 0.4 s
-# is about three seconds of workload, cheap enough for every leg including the
-# sanitiser ones.  It is timing-dependent by nature: a green run is evidence
-# only in the same weak sense as test_process_abrupt_teardown.py, and the
-# deterministic check of the primitive this test exercises lives in the C
-# suite (src/test/nxt_port_use_unless_zero_test.c).
+# is about three seconds of workload, cheap enough for any --debug run.  It is
+# timing-dependent by nature: a green run is evidence only in the same weak
+# sense as test_process_abrupt_teardown.py, and the deterministic check of
+# the primitive this test exercises lives in the C suite
+# (src/test/nxt_port_use_unless_zero_test.c).
 
 
 def _oosm_app_pids():
@@ -244,6 +252,8 @@ def test_process_shm_oosm_kill(skip_alert):
     assert 'success' in client.conf(
         {"listen_threads": LISTEN_THREADS}, 'settings'
     ), 'listen_threads'
+
+    _require_debug_build()
 
     stop = threading.Event()
     failures = []
@@ -325,9 +335,6 @@ def test_process_shm_oosm_kill(skip_alert):
     assert _body(resp, 1024 * 1024).count(b'x') == 1024 * 1024, (
         'still serving'
     )
-
-    if '[debug]' not in log:
-        pytest.skip('OOSM evidence needs a --debug build')
 
     # Same proof as the test above that the OOSM round trip really ran; here
     # it also establishes that the kills landed on a blocked worker rather

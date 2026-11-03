@@ -7,6 +7,15 @@
 #include "nxt_tests.h"
 
 
+static void
+nxt_http_chunk_test_buf_completion(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_uint_t  *completed = data;
+
+    (*completed)++;
+}
+
+
 nxt_int_t
 nxt_http_chunk_parse_test(nxt_thread_t *thr)
 {
@@ -251,6 +260,170 @@ nxt_http_chunk_parse_test(nxt_thread_t *thr)
                 return NXT_ERROR;
             }
         }
+    }
+
+    /*
+     * retain_buffers == 1 (request body path): non-empty chunk slices are
+     * consumed synchronously by the caller without running completion
+     * handlers, so nxt_http_chunk_buffer() must not retain hcp->mem_pool or
+     * increment b.retain.
+     */
+    {
+        nxt_mp_t   *mp;
+        nxt_buf_t  *out;
+        nxt_str_t  body = nxt_string("5\r\nhello\r\n3\r\nbye\r\n0\r\n\r\n");
+
+        mp = nxt_mp_create(1024, 128, 256, 32);
+        if (mp == NULL) {
+            return NXT_ERROR;
+        }
+
+        nxt_memzero(&hcp, sizeof(nxt_http_chunk_parse_t));
+        hcp.mem_pool = mp;
+        hcp.retain_buffers = 1;
+
+        nxt_memzero(&b, sizeof(nxt_buf_t));
+        b.mem.pos = body.start;
+        b.mem.free = body.start + body.length;
+
+        out = nxt_http_chunk_parse(thr->task, &hcp, &b);
+
+        if (out == NULL || out->next == NULL || out->next->next != NULL
+            || out->parent != &b || out->next->parent != &b
+            || nxt_buf_mem_used_size(&out->mem) != 5
+            || memcmp(out->mem.pos, "hello", 5) != 0
+            || nxt_buf_mem_used_size(&out->next->mem) != 3
+            || memcmp(out->next->mem.pos, "bye", 3) != 0
+            || hcp.chunk_error != 0 || hcp.error != 0 || hcp.last != 1
+            || b.retain != 0 || nxt_mp_test_retain_count(mp) != 1)
+        {
+            nxt_log_alert(thr->log,
+                          "nxt_http_chunk_parse() retain_buffers=1 test "
+                          "failed: retain=%uD mp_retain=%uD",
+                          b.retain, nxt_mp_test_retain_count(mp));
+            nxt_mp_destroy(mp);
+            return NXT_ERROR;
+        }
+
+        nxt_mp_release(mp);
+    }
+
+    /*
+     * retain_buffers == 0 (upstream proxy path): an input buffer that produces
+     * no data slices (e.g., a separate terminal "0\r\n\r\n" buffer or a
+     * malformed chunk) must still have its completion_handler queued on
+     * fast_work_queue so the upstream buffer's pool retention is released.
+     */
+    {
+        void                *obj, *data;
+        nxt_mp_t            *mp;
+        nxt_buf_t           *out;
+        nxt_task_t          *task;
+        nxt_uint_t          completed;
+        nxt_thread_t        *saved_thread;
+        nxt_event_engine_t  engine, *saved_engine;
+        nxt_work_handler_t  handler;
+        nxt_str_t           last_chunk = nxt_string("0\r\n\r\n");
+        nxt_str_t           bad_chunk = nxt_string("5\r\nhello\r\nz\r\n");
+
+        nxt_memzero(&engine, sizeof(nxt_event_engine_t));
+        nxt_work_queue_cache_create(&engine.work_queue_cache, 16);
+        engine.fast_work_queue.cache = &engine.work_queue_cache;
+        nxt_work_queue_name(&engine.fast_work_queue, "test");
+
+        saved_thread = thr->task->thread;
+        saved_engine = thr->engine;
+        thr->task->thread = thr;
+        thr->engine = &engine;
+
+        completed = 0;
+
+        nxt_memzero(&hcp, sizeof(nxt_http_chunk_parse_t));
+        nxt_memzero(&b, sizeof(nxt_buf_t));
+        b.mem.pos = last_chunk.start;
+        b.mem.free = last_chunk.start + last_chunk.length;
+        b.completion_handler = nxt_http_chunk_test_buf_completion;
+        b.parent = &completed;
+
+        (void) nxt_http_chunk_parse(thr->task, &hcp, &b);
+
+        while (engine.fast_work_queue.head != NULL) {
+            handler = nxt_work_queue_pop(&engine.fast_work_queue, &task, &obj,
+                                         &data);
+            handler(task, obj, data);
+        }
+
+        if (hcp.last != 1 || hcp.chunk_error != 0 || completed != 1) {
+            thr->engine = saved_engine;
+            thr->task->thread = saved_thread;
+            nxt_work_queue_cache_destroy(&engine.work_queue_cache);
+            nxt_log_alert(thr->log,
+                          "nxt_http_chunk_parse() terminal completion test "
+                          "failed: last=%d chunk_error=%d completed=%ui",
+                          (int) hcp.last, (int) hcp.chunk_error, completed);
+            return NXT_ERROR;
+        }
+
+        mp = nxt_mp_create(1024, 128, 256, 32);
+        if (mp == NULL) {
+            thr->engine = saved_engine;
+            thr->task->thread = saved_thread;
+            nxt_work_queue_cache_destroy(&engine.work_queue_cache);
+            return NXT_ERROR;
+        }
+
+        completed = 0;
+
+        nxt_memzero(&hcp, sizeof(nxt_http_chunk_parse_t));
+        hcp.mem_pool = mp;
+
+        nxt_memzero(&b, sizeof(nxt_buf_t));
+        b.mem.pos = bad_chunk.start;
+        b.mem.free = bad_chunk.start + bad_chunk.length;
+        b.completion_handler = nxt_http_chunk_test_buf_completion;
+        b.parent = &completed;
+
+        out = nxt_http_chunk_parse(thr->task, &hcp, &b);
+
+        if (out == NULL || hcp.chunk_error != 1
+            || b.retain != 1 || nxt_mp_test_retain_count(mp) != 2)
+        {
+            thr->engine = saved_engine;
+            thr->task->thread = saved_thread;
+            nxt_work_queue_cache_destroy(&engine.work_queue_cache);
+            nxt_log_alert(thr->log,
+                          "nxt_http_chunk_parse() error slice test failed: "
+                          "chunk_error=%d retain=%uD mp_retain=%uD",
+                          (int) hcp.chunk_error, b.retain,
+                          nxt_mp_test_retain_count(mp));
+            nxt_mp_destroy(mp);
+            return NXT_ERROR;
+        }
+
+        out->completion_handler(thr->task, out, out->parent);
+
+        while (engine.fast_work_queue.head != NULL) {
+            handler = nxt_work_queue_pop(&engine.fast_work_queue, &task, &obj,
+                                         &data);
+            handler(task, obj, data);
+        }
+
+        thr->engine = saved_engine;
+        thr->task->thread = saved_thread;
+        nxt_work_queue_cache_destroy(&engine.work_queue_cache);
+
+        if (b.retain != 0 || completed != 1
+            || nxt_mp_test_retain_count(mp) != 1)
+        {
+            nxt_log_alert(thr->log,
+                          "nxt_http_chunk_parse() error completion test "
+                          "failed: retain=%uD completed=%ui mp_retain=%uD",
+                          b.retain, completed, nxt_mp_test_retain_count(mp));
+            nxt_mp_destroy(mp);
+            return NXT_ERROR;
+        }
+
+        nxt_mp_release(mp);
     }
 
     nxt_log_error(NXT_LOG_NOTICE, thr->log,

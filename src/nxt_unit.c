@@ -2761,12 +2761,14 @@ nxt_unit_request_group_dup_fields(nxt_unit_request_info_t *req)
     char                *name, *jname;
     void                *start;
     uint32_t            i, j, n, size;
+    uint64_t            bit, seen_hashes, dup_hashes;
     nxt_unit_field_t    *fields, f, fi, fj;
     nxt_unit_request_t  *r;
 
     static const nxt_str_t  content_length = nxt_string("content-length");
     static const nxt_str_t  content_type = nxt_string("content-type");
     static const nxt_str_t  cookie = nxt_string("cookie");
+    static const nxt_str_t  authorization = nxt_string("authorization");
 
     nxt_unit_req_debug(req, "group_dup_fields");
 
@@ -2778,7 +2780,8 @@ nxt_unit_request_group_dup_fields(nxt_unit_request_info_t *req)
      * sibling process can write, and this runs later.  So the count is read
      * once and checked again, each field is copied out before use, and the
      * names are resolved with nxt_unit_sptr_in_buf().  A request that does
-     * not pass is left as it is.
+     * not pass is left as it is.  So is a request without duplicate hashes:
+     * it returns below, before any name is resolved.
      */
     start = req->request_buf->start;
     size = req->request_buf->end - req->request_buf->start;
@@ -2791,6 +2794,25 @@ nxt_unit_request_group_dup_fields(nxt_unit_request_info_t *req)
     {
         nxt_unit_req_warn(req, "group_dup_fields: fields_count %"PRIu32
                           " exceeds buffer", n);
+        return;
+    }
+
+    /*
+     * Two fields with equal hashes set the same bit.  So a field whose bit
+     * is not in dup_hashes has no duplicate, and a request with no bit in
+     * dup_hashes has nothing to group.
+     */
+
+    seen_hashes = 0;
+    dup_hashes = 0;
+
+    for (i = 0; i < n; i++) {
+        bit = 1ULL << (fields[i].hash & 63);
+        dup_hashes |= seen_hashes & bit;
+        seen_hashes |= bit;
+    }
+
+    if (nxt_fast_path(dup_hashes == 0)) {
         return;
     }
 
@@ -2835,6 +2857,20 @@ nxt_unit_request_group_dup_fields(nxt_unit_request_info_t *req)
             }
 
             break;
+
+        case NXT_UNIT_HASH_AUTHORIZATION:
+            if (fi.name_length == authorization.length
+                && nxt_unit_memcasecmp(name, authorization.start,
+                                       authorization.length) == 0)
+            {
+                r->authorization_field = i;
+            }
+
+            break;
+        }
+
+        if ((dup_hashes & (1ULL << (fi.hash & 63))) == 0) {
+            continue;
         }
 
         for (j = i + 1; j < n; j++) {
@@ -4013,24 +4049,25 @@ nxt_unit_request_read(nxt_unit_request_info_t *req, void *dst, size_t size)
     buf_res = nxt_unit_buf_read(&req->content_buf, &req->content_length,
                                 dst, size);
 
-    if (buf_res < (ssize_t) size && req->content_fd != -1) {
+    if ((size_t) buf_res < size && req->content_fd != -1) {
+        dst = nxt_pointer_to(dst, buf_res);
+        size -= (size_t) buf_res;
+
         res = read(req->content_fd, dst, size);
         if (nxt_slow_path(res < 0)) {
             nxt_unit_req_alert(req, "failed to read content: %s (%d)",
                                strerror(errno), errno);
 
-            return res;
+            return (buf_res > 0) ? buf_res : res;
         }
 
-        if (res < (ssize_t) size) {
+        if ((size_t) res < size) {
             nxt_unit_close(req->content_fd);
 
             req->content_fd = -1;
         }
 
         req->content_length -= res;
-
-        dst = nxt_pointer_to(dst, res);
 
     } else {
         res = 0;

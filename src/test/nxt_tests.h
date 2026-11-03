@@ -116,6 +116,7 @@ nxt_int_t nxt_main_store_test(nxt_thread_t *thr);
 nxt_int_t nxt_proto_creating_wedge_test(nxt_thread_t *thr);
 nxt_int_t nxt_main_whoami_test(nxt_thread_t *thr);
 nxt_int_t nxt_main_remove_child_pid_test(nxt_thread_t *thr);
+nxt_int_t nxt_main_port_gate_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_change_file_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_ctrunc_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_fd_test(nxt_thread_t *thr);
@@ -134,6 +135,7 @@ nxt_int_t nxt_nncq_bound_test(nxt_thread_t *thr);
 nxt_int_t nxt_nncq_wrap_test(nxt_thread_t *thr);
 nxt_int_t nxt_app_queue_test(nxt_thread_t *thr);
 nxt_int_t nxt_size_bound_test(nxt_thread_t *thr);
+nxt_int_t nxt_casecmp_test(nxt_thread_t *thr);
 #if (NXT_HAVE_REGEX)
 nxt_int_t nxt_regex_test(nxt_thread_t *thr);
 #endif

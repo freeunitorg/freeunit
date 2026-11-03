@@ -159,6 +159,8 @@ static nxt_int_t nxt_conf_vldt_thread_stack_size(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_compressors(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_compression_object(
+    nxt_conf_validation_t *vldt, nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_compression(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value);
 static nxt_int_t nxt_conf_vldt_compression_level(nxt_conf_validation_t *vldt,
@@ -478,7 +480,7 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_http_members[] = {
     }, {
         .name       = nxt_string("compression"),
         .type       = NXT_CONF_VLDT_OBJECT,
-        .validator  = nxt_conf_vldt_object,
+        .validator  = nxt_conf_vldt_compression_object,
         .u.members  = nxt_conf_vldt_compression_members,
     },
 
@@ -3165,6 +3167,55 @@ nxt_conf_vldt_compressors(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
     /* NXT_CONF_OBJECT */
 
     return nxt_conf_vldt_object(vldt, value, nxt_conf_vldt_compressor_members);
+}
+
+
+/*
+ * A "compression" object needs "compressors".  Without it the router cannot
+ * build compression and leaves it off, so earlier versions accepted such an
+ * object and compressed nothing.  The control API now refuses it.  A stored
+ * configuration with one is still loaded, with a warning: refusing it at
+ * startup would leave unitd with no configuration.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_compression_object(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    nxt_int_t             ret;
+    nxt_str_t             pointer;
+    nxt_conf_vldt_path_t  seg;
+
+    static const nxt_str_t  compressors = nxt_string("compressors");
+
+    if (nxt_conf_get_object_member(value, &compressors, NULL) == NULL) {
+        seg.prev = vldt->path;
+        seg.seg = compressors;
+        vldt->path = &seg;
+
+        if (!vldt->restored) {
+            ret = nxt_conf_vldt_error(vldt, "Required parameter \"%V\" "
+                                      "is missing.", &compressors);
+            vldt->path = seg.prev;
+
+            return ret;
+        }
+
+        pointer = vldt->pointer;
+        nxt_conf_vldt_render_pointer(vldt);
+
+        nxt_thread_log_error(NXT_LOG_WARN, "the restored configuration has "
+                             "no \"%V\" at \"%V\".  The control API now "
+                             "refuses it.  It is kept, and compression is "
+                             "off.  Add \"%V\" to be able to update the "
+                             "configuration.", &compressors, &vldt->pointer,
+                             &compressors);
+
+        vldt->pointer = pointer;
+        vldt->path = seg.prev;
+    }
+
+    return nxt_conf_vldt_object(vldt, value, data);
 }
 
 

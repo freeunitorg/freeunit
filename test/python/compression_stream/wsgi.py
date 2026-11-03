@@ -14,10 +14,20 @@ def application(environ, start_response):
     token = b'<%06d>' % rid
     part = (token * (size // len(token) + 1))[:size]
 
-    headers = [
-        ('Content-Type', 'text/plain'),
-        ('Content-Length', str(size * parts)),
-    ]
+    # X-Body replaces the generated part, and X-Content-Length the length
+    # the response declares, so a test can send fewer bytes than declared.
+    custom = environ.get('HTTP_X_BODY')
+    if custom is not None:
+        part = custom.encode()
+        size = len(part)
+
+    clen = environ.get('HTTP_X_CONTENT_LENGTH', str(size * parts))
+
+    # X-Content-Length: none sends no Content-Length, so the router does not
+    # know the length and sends the body chunked.
+    headers = [('Content-Type', 'text/plain')]
+    if clen != 'none':
+        headers.append(('Content-Length', clen))
 
     # A large field makes the response buffer too large for a plain port
     # message (1024 bytes), so libunit sends it through shared memory.
@@ -25,7 +35,21 @@ def application(environ, start_response):
     if pad:
         headers.append(('X-Pad', 'p' * pad))
 
-    start_response('200 OK', headers)
+    # X-Accept-Ranges names the fields to send, comma-separated, each with
+    # the value "bytes", so a test can send it in another letter case or
+    # twice.
+    for name in environ.get('HTTP_X_ACCEPT_RANGES', '').split(','):
+        if name:
+            headers.append((name, 'bytes'))
+
+    # X-Range sends a 206 with that Content-Range.
+    status = '200 OK'
+    crange = environ.get('HTTP_X_RANGE')
+    if crange is not None:
+        status = '206 Partial Content'
+        headers.append(('Content-Range', crange))
+
+    start_response(status, headers)
 
     def body():
         for i in range(parts):

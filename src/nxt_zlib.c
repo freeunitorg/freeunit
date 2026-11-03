@@ -3,6 +3,7 @@
  * Copyright (C) F5, Inc.
  */
 
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -12,14 +13,65 @@
 #include "nxt_http_compression.h"
 
 
+/*
+ * The window and the hash size.  The window was fixed at 9 bits (512
+ * bytes), inherited from NGINX Unit: deflate then finds no match farther
+ * back than 512 bytes, and a 100 KB text page came out 28 % larger than
+ * with the 32 KiB window, at 4 times the CPU (zlib level 1, 10 parts).  The
+ * memory it saved was small: the hash, 2^(memLevel + 9) bytes, dominates.
+ *
+ * So the window is 15 bits and memLevel 8, the zlib defaults, as nginx
+ * uses.  For a body of known length both shrink as in nginx's gzip filter:
+ * a window larger than the body (less the 262 bytes zlib keeps back) buys
+ * nothing.
+ *
+ * An unknown length (a streamed application response: SSE, long-poll,
+ * chunked output) gets a 4 KiB window and memLevel 6, about 54 KiB of
+ * state, 2^(wbits + 2) + 2^(memLevel + 9) plus some 6 KiB, instead of
+ * about 262 KiB for 15/8.  Such a stream can stay open for its whole life,
+ * and it flushes each part, so a long window gains it little.
+ */
+
+#define NXT_ZLIB_STREAM_WBITS     12
+#define NXT_ZLIB_STREAM_MEMLEVEL  6
+
+
+static void
+nxt_zlib_params(const nxt_http_comp_compressor_ctx_t *ctx, int *wbits,
+                int *memlevel)
+{
+    if (ctx->size_hint <= 0) {
+        *wbits = NXT_ZLIB_STREAM_WBITS;
+        *memlevel = NXT_ZLIB_STREAM_MEMLEVEL;
+
+        return;
+    }
+
+    *wbits = 15;
+    *memlevel = 8;
+
+    while (*wbits > 9 && ctx->size_hint < (1 << (*wbits - 1)) - 262) {
+        (*wbits)--;
+        (*memlevel)--;
+    }
+
+    if (*memlevel < 1) {
+        *memlevel = 1;
+    }
+}
+
+
 static int
 nxt_zlib_gzip_init(nxt_http_comp_compressor_ctx_t *ctx)
 {
+    int       wbits, memlevel;
     z_stream  *z = &ctx->zlib_ctx;
 
     *z = (z_stream){};
 
-    return deflateInit2(z, ctx->level, Z_DEFLATED, 9 + 16, 8,
+    nxt_zlib_params(ctx, &wbits, &memlevel);
+
+    return deflateInit2(z, ctx->level, Z_DEFLATED, wbits + 16, memlevel,
                         Z_DEFAULT_STRATEGY);
 }
 
@@ -27,11 +79,15 @@ nxt_zlib_gzip_init(nxt_http_comp_compressor_ctx_t *ctx)
 static int
 nxt_zlib_deflate_init(nxt_http_comp_compressor_ctx_t *ctx)
 {
+    int       wbits, memlevel;
     z_stream  *z = &ctx->zlib_ctx;
 
     *z = (z_stream){};
 
-    return deflateInit2(z, ctx->level, Z_DEFLATED, 9, 8, Z_DEFAULT_STRATEGY);
+    nxt_zlib_params(ctx, &wbits, &memlevel);
+
+    return deflateInit2(z, ctx->level, Z_DEFLATED, wbits, memlevel,
+                        Z_DEFAULT_STRATEGY);
 }
 
 
@@ -49,23 +105,43 @@ nxt_zlib_deflate(nxt_http_comp_compressor_ctx_t *ctx, const uint8_t *in_buf,
                  size_t in_len, uint8_t *out_buf, size_t out_len, bool last)
 {
     int       ret;
-    size_t    compressed_bytes;
+    uInt      avail_out;
     z_stream  *z = &ctx->zlib_ctx;
 
-    z->avail_in = in_len;
+    if (in_len > UINT_MAX) {
+        return -1;
+    }
+
+    /*
+     * avail_out is an unsigned int.  The static path passes the rest of a
+     * mapping sized for the whole file, and for a file of 3.5 GiB or more
+     * that is above UINT_MAX on a 64-bit platform: the plain conversion kept
+     * only the low 32 bits, so a 128 KiB piece could get a few bytes of
+     * room, and the input it did not consume was dropped in silence.
+     */
+    avail_out = (out_len > UINT_MAX) ? UINT_MAX : (uInt) out_len;
+
+    z->avail_in = (uInt) in_len;
     z->next_in = (z_const Bytef *)in_buf;
 
-    z->avail_out = out_len;
+    z->avail_out = avail_out;
     z->next_out = out_buf;
-
-    compressed_bytes = z->total_out;
 
     ret = deflate(z, last ? Z_FINISH : Z_SYNC_FLUSH);
     if (ret == Z_STREAM_ERROR || ret == Z_BUF_ERROR) {
         return -1;
     }
 
-    return z->total_out - compressed_bytes;
+    /*
+     * Z_FINISH that ran out of output space returns Z_OK and leaves the
+     * stream unfinished.  The caller frees the stream after the last call,
+     * so a short buffer here would send a truncated body as a success.
+     */
+    if (last && ret != Z_STREAM_END) {
+        return -1;
+    }
+
+    return avail_out - z->avail_out;
 }
 
 

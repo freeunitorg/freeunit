@@ -514,10 +514,10 @@ nxt_app_queue_test_child(void *data)
     tc = data;
 
     /*
-     * The concurrent cases are slow under ThreadSanitizer; a healthy run
-     * must not trip the hang guard.
+     * The concurrent cases can take longer on slow or contended builders,
+     * especially under ThreadSanitizer.  Keep a bounded hang guard.
      */
-    alarm(NXT_APP_QUEUE_TEST_TSAN ? 60 : 5);
+    alarm(NXT_APP_QUEUE_TEST_TSAN ? 60 : 30);
 
     q = nxt_zalloc(sizeof(nxt_app_queue_t));
     if (q == NULL) {

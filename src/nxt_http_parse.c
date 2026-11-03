@@ -672,6 +672,11 @@ nxt_http_parse_field_value(nxt_http_request_parse_t *rp, u_char **pos,
         p++;
     }
 
+    /* Reject DEL here, not in the scan loop, to keep that loop short. */
+    if (nxt_slow_path(memchr(start, 0x7F, p - start) != NULL)) {
+        return NXT_HTTP_PARSE_INVALID;
+    }
+
     *pos = p;
 
     if (nxt_fast_path(p != start)) {

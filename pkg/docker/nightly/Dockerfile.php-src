@@ -1,0 +1,93 @@
+# A PHP base image built from php-src git, for the nightly FreeUnit image of
+# a PHP version that has no official image yet (php-src master).  It lays
+# PHP out the way the official php:*-cli images do: everything under
+# /usr/local, php-config on PATH, libphp.so from the embed SAPI in
+# /usr/local/lib, and the ini directory in /usr/local/etc/php.  The FreeUnit
+# Dockerfile generated from pkg/docker/template.Dockerfile builds on top.
+#
+# The configure line follows the official 8.6 image (thread safe, embed,
+# no Zend signals), with mbstring added back, and so do the hardening flags
+# (PHP_CFLAGS, PHP_LDFLAGS), --enable-option-checking=fatal and the cleanup:
+# an option that php-src removes or renames fails the build instead of
+# being ignored, the binaries are stripped, and the build packages are
+# purged, keeping only the libraries the installed files link.  dpkg-query
+# also prints "diversion by ..." lines for the merged /usr, and a package
+# list "a, b: path" for a shared path; both are filtered before apt-mark.  It has no
+# docker-php-ext-install helpers.  Not for production.
+
+FROM debian:trixie-slim
+
+ARG PHP_REF=master
+
+ENV PHP_INI_DIR=/usr/local/etc/php
+
+# From the official php:8.6-rc trixie cli Dockerfile.
+ENV PHP_CFLAGS="-fstack-protector-strong -fpic -fpie -O2 -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64"
+ENV PHP_CPPFLAGS="$PHP_CFLAGS"
+ENV PHP_LDFLAGS="-Wl,-O1 -pie"
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl; \
+    savedAptMark="$(apt-mark showmanual)"; \
+    apt-get install -y --no-install-recommends \
+        git autoconf bison re2c pkg-config \
+        build-essential libssl-dev zlib1g-dev libcurl4-openssl-dev \
+        libonig-dev libsqlite3-dev libxml2-dev libsodium-dev \
+        libreadline-dev libargon2-dev; \
+    rm -rf /var/lib/apt/lists/*; \
+    mkdir -p "$PHP_INI_DIR/conf.d"; \
+    git init -q /usr/src/php; \
+    cd /usr/src/php; \
+    git fetch -q --depth 1 https://github.com/php/php-src.git "$PHP_REF"; \
+    git checkout -q FETCH_HEAD; \
+    git rev-parse HEAD > /usr/local/etc/php-src.commit; \
+    ./buildconf --force; \
+    export CFLAGS="$PHP_CFLAGS" CPPFLAGS="$PHP_CPPFLAGS" \
+        LDFLAGS="$PHP_LDFLAGS"; \
+    ./configure \
+        --enable-option-checking=fatal \
+        --with-config-file-path="$PHP_INI_DIR" \
+        --with-config-file-scan-dir="$PHP_INI_DIR/conf.d" \
+        --with-mhash \
+        --enable-mysqlnd \
+        --with-password-argon2 \
+        --with-sodium=shared \
+        --with-pdo-sqlite=/usr \
+        --with-sqlite3=/usr \
+        --with-curl \
+        --with-iconv \
+        --with-openssl \
+        --with-readline \
+        --with-zlib \
+        --enable-mbstring \
+        --enable-embed \
+        --enable-zts \
+        --disable-zend-signals; \
+    make -j "$(nproc)"; \
+    find -type f -name '*.a' -delete; \
+    make install; \
+    find /usr/local -type f -perm '/0111' \
+        -exec sh -euc 'strip --strip-all "$@" || :' -- '{}' +; \
+    make clean; \
+    cp php.ini-* "$PHP_INI_DIR/"; \
+    cd /; \
+    rm -rf /usr/src/php; \
+    apt-mark auto '.*' > /dev/null; \
+    [ -z "$savedAptMark" ] || apt-mark manual $savedAptMark > /dev/null; \
+    find /usr/local -type f -executable -exec ldd '{}' ';' \
+        | awk '/=>/ { so = $(NF-1); if (index(so, "/usr/local/") == 1) { next }; gsub("^/(usr/)?", "", so); printf "*%s\n", so }' \
+        | sort -u \
+        | xargs -r dpkg-query --search \
+        | awk -F': ' '!/^diversion /{ print $1 }' \
+        | tr ', ' '\n\n' \
+        | sed '/^$/d' \
+        | sort -u \
+        | xargs -r apt-mark manual; \
+    apt-get purge -y --auto-remove \
+        -o APT::AutoRemove::RecommendsImportant=false; \
+    rm -rf /var/lib/apt/lists/*; \
+    ldconfig; \
+    php -v
+
+CMD ["php", "-a"]

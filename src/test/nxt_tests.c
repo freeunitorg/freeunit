@@ -77,6 +77,7 @@ static nxt_int_t (*const nxt_security_tests[])(nxt_thread_t *) = {
     nxt_port_release_test, nxt_process_use_test, nxt_nncq_bound_test,
     nxt_nncq_wrap_test,
     nxt_app_queue_test, nxt_size_bound_test, nxt_mp_cluster_cache_test,
+    nxt_casecmp_test,
 #if (NXT_HAVE_REGEX)
     nxt_regex_test,
 #endif
@@ -469,6 +470,10 @@ main(int argc, char **argv)
     }
 
     if (nxt_main_remove_child_pid_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_main_port_gate_test(thr) != NXT_OK) {
         return 1;
     }
 

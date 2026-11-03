@@ -1104,7 +1104,7 @@ def test_tls_certificate_chain_options(date_to_sec_epoch, sec_epoch):
 
     assert (
         abs(
-            sec_epoch
+            sec_epoch()
             - date_to_sec_epoch(cert['validity']['since'], date_format)
         )
         < 60
