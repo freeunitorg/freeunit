@@ -1312,11 +1312,44 @@ jobs:
           echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
             sudo tee /etc/apt/apt.conf.d/80-ci-bounds
 
+      # The .deb files are kept across runs, so a slow mirror costs less.
+      # The key changes every ISO week, and restore-keys only match the same
+      # week, so a stale cache is never restored.
+      - name: Compute the week of the package cache
+        id: week
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache apt packages
+        uses: actions/cache@v6
+        with:
+          path: ~/apt-archives
+          key: ${{ runner.os }}-m32-pkgs-${{ steps.week.outputs.week }}-${{ hashFiles('.github/workflows/build-test.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-m32-pkgs-${{ steps.week.outputs.week }}-
+
+      # Three attempts, each bounded to 4 minutes, with a pause of 10 and
+      # then 20 seconds between them.
       - name: Install packages
-        timeout-minutes: 5
+        timeout-minutes: 14
         run: |
-          sudo apt-get -y update
-          sudo apt-get -y install build-essential gcc-multilib
+          arch="$HOME/apt-archives"
+          mkdir -p "$arch/partial"
+          for n in 1 2 3; do
+            if sudo timeout 240 sh -c '
+                 apt-get -y update &&
+                 apt-get -y -o Dir::Cache::Archives="$1" \
+                   install build-essential gcc-multilib' sh "$arch"
+            then
+              break
+            fi
+            if [ "$n" = 3 ]; then
+              exit 1
+            fi
+            echo "Install attempt $n failed, retrying"
+            sleep $((n * 10))
+          done
+          sudo rm -rf "$arch/partial" "$arch/lock"
+          sudo chown -R "$(id -u):$(id -g)" "$arch"
 
       - name: Configure unit (-m32 -D_FILE_OFFSET_BITS=64)
         run: >-
