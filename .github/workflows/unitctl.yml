@@ -59,6 +59,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # The base list lets the exclude below drop a leg: an exclude does
+        # not remove an include-only entry.
+        build: [linux-x86_64, macos-aarch64]
         include:
           - build: linux-x86_64
             os: ubuntu-26.04
@@ -66,6 +69,10 @@ jobs:
           - build: macos-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
+        # A pull request runs the Linux leg only.  The macOS leg, musl and
+        # build run on the master push, the release tag and the weekly run.
+        exclude:
+          - build: ${{ github.event_name == 'pull_request' && 'macos-aarch64' || 'none' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -109,6 +116,8 @@ jobs:
     # *host* -- "make release" on Alpine -- is not built here.  The make rule
     # for that host is checked below instead, which is the part that can be
     # checked without a musl runner.
+    # Not on a pull request; see the test matrix above.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     defaults:
@@ -189,6 +198,8 @@ jobs:
             | grep -q -- '--no-default-features'
 
   build:
+    # Not on a pull request; see the test matrix above.
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     defaults:
