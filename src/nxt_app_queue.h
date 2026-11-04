@@ -177,9 +177,23 @@ nxt_app_queue_cancel(nxt_app_queue_t volatile *q, uint32_t cookie,
 }
 
 
+/*
+ * Take the next item.  When "claimed" is not NULL, also claim the item
+ * before its slot goes back to the free list: the first four bytes of the
+ * item are the tracking value it was sent with (the stream of the
+ * nxt_port_msg_t), and the CAS on the slot's tracking word runs while the
+ * slot is still ours.  Once the slot is free the router may reuse it for a
+ * new request with a new tracking value; a CAS after that would fail, the
+ * reader would drop the request as cancelled, and the router's own CAS in
+ * nxt_app_queue_cancel() would fail too and report a claim, so nobody would
+ * answer the request.
+ */
+
 nxt_inline ssize_t
-nxt_app_queue_recv(nxt_app_queue_t volatile *q, void *p, uint32_t *cookie)
+nxt_app_queue_recv_claim(nxt_app_queue_t volatile *q, void *p,
+    uint32_t *cookie, nxt_bool_t *claimed)
 {
+    uint32_t               tracking;
     size_t                 size;
     nxt_app_queue_item_t   *qi;
     nxt_app_nncq_atomic_t  i;
@@ -187,6 +201,11 @@ nxt_app_queue_recv(nxt_app_queue_t volatile *q, void *p, uint32_t *cookie)
     i = nxt_app_nncq_dequeue(&q->queue);
     if (i == nxt_app_nncq_empty(&q->queue)) {
         *cookie = 0;
+
+        if (claimed != NULL) {
+            *claimed = 0;
+        }
+
         return -1;
     }
 
@@ -209,6 +228,23 @@ nxt_app_queue_recv(nxt_app_queue_t volatile *q, void *p, uint32_t *cookie)
     nxt_memcpy(p, qi->data, size);
     *cookie = i;
 
+    if (claimed != NULL) {
+        *claimed = 0;
+
+        if (size >= sizeof(uint32_t)) {
+            nxt_memcpy(&tracking, p, sizeof(uint32_t));
+            *claimed = nxt_atomic_cmp_set(&qi->tracking, tracking, 0);
+        }
+    }
+
+#if (NXT_TESTS) && defined(NXT_APP_QUEUE_TEST_CLAIM_HOOK)
+    /*
+     * The claim window: the item is claimed, its slot is not free yet.
+     * Only src/test/nxt_app_queue_test.c defines the macro.
+     */
+    NXT_APP_QUEUE_TEST_CLAIM_HOOK(q, i);
+#endif
+
     (void) nxt_app_nncq_enqueue(&q->free_items, i);
 
     /*
@@ -226,6 +262,13 @@ nxt_app_queue_recv(nxt_app_queue_t volatile *q, void *p, uint32_t *cookie)
     }
 
     return size;
+}
+
+
+nxt_inline ssize_t
+nxt_app_queue_recv(nxt_app_queue_t volatile *q, void *p, uint32_t *cookie)
+{
+    return nxt_app_queue_recv_claim(q, p, cookie, NULL);
 }
 
 

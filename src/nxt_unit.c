@@ -9427,9 +9427,9 @@ static int
 nxt_unit_app_queue_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     nxt_unit_read_buf_t *rbuf)
 {
+    nxt_bool_t            claimed;
     nxt_atomic_uint_t     count;
     uint32_t              cookie;
-    nxt_port_msg_t        *port_msg;
     nxt_app_queue_t       *queue;
     nxt_unit_impl_t       *lib;
     nxt_unit_port_impl_t  *port_impl;
@@ -9439,15 +9439,15 @@ nxt_unit_app_queue_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
 
 retry:
 
-    rbuf->size = nxt_app_queue_recv(queue, rbuf->buf, &cookie);
+    rbuf->size = nxt_app_queue_recv_claim(queue, rbuf->buf, &cookie,
+                                          &claimed);
 
     nxt_unit_debug(NULL, "app_queue_recv: %d", (int) rbuf->size);
 
     if (rbuf->size >= (ssize_t) sizeof(nxt_port_msg_t)) {
-        port_msg = (nxt_port_msg_t *) rbuf->buf;
-
-        if (nxt_app_queue_cancel(queue, cookie, port_msg->stream)) {
-            NXT_USDT(queue__dequeue, cookie, port_msg->stream);
+        if (claimed) {
+            NXT_USDT(queue__dequeue, cookie,
+                     ((nxt_port_msg_t *) rbuf->buf)->stream);
 
             lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
 
