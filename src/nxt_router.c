@@ -444,6 +444,9 @@ static nxt_bool_t nxt_router_app_port_idle(nxt_task_t *task, nxt_app_t *app,
     nxt_port_t *port);
 static nxt_bool_t nxt_router_app_port_busy(nxt_task_t *task, nxt_app_t *app,
     nxt_port_t *port, const char *reason);
+static void nxt_router_get_port_refuse(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, nxt_port_t *reply_port,
+    nxt_port_msg_get_port_t *get_port_msg);
 static void nxt_router_get_port_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static void nxt_router_get_mmap_handler(nxt_task_t *task,
@@ -9897,6 +9900,58 @@ nxt_router_get_mmap_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 }
 
 
+/*
+ * The port that libunit asks for is gone, for instance the engine that
+ * sent the request went away with a reconfiguration.  Without an answer,
+ * the requests that libunit parked for that port (->awaiting_req) wait for
+ * ever, and so does the worker.  RPC_ERROR names the refused port, so
+ * libunit can release them (nxt_unit_process_port_refused()).
+ *
+ * Only a libunit that sets NXT_PORT_GET_PORT_ANSWER_REFUSAL gets the
+ * answer.  An older libunit alerts on an RPC_ERROR and returns an error
+ * from its receive path, which is worse than no answer.
+ */
+
+static void
+nxt_router_get_port_refuse(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    nxt_port_t *reply_port, nxt_port_msg_get_port_t *get_port_msg)
+{
+    nxt_int_t                    ret;
+    nxt_buf_t                    *b;
+    nxt_port_msg_get_port_t      *refused;
+    nxt_port_msg_get_port_ext_t  ext;
+
+    if (nxt_buf_used_size(msg->buf) < (int) sizeof(nxt_port_msg_get_port_ext_t))
+    {
+        return;
+    }
+
+    nxt_memcpy(&ext, msg->buf->mem.pos, sizeof(ext));
+
+    if ((ext.flags & NXT_PORT_GET_PORT_ANSWER_REFUSAL) == 0) {
+        return;
+    }
+
+    b = nxt_buf_mem_ts_alloc(task, task->thread->engine->mem_pool,
+                             sizeof(nxt_port_msg_get_port_t));
+    if (nxt_slow_path(b == NULL)) {
+        return;
+    }
+
+    refused = (nxt_port_msg_get_port_t *) b->mem.pos;
+    *refused = *get_port_msg;
+    b->mem.free += sizeof(nxt_port_msg_get_port_t);
+
+    ret = nxt_port_socket_write(task, reply_port, NXT_PORT_MSG_RPC_ERROR, -1,
+                                0, 0, b);
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                           b->completion_handler, task, b, b->parent);
+    }
+}
+
+
 static void
 nxt_router_get_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
@@ -9930,6 +9985,8 @@ nxt_router_get_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     if (nxt_slow_path(port == NULL)) {
         nxt_alert(task, "get_port_handler: port %PI:%d not found",
                   get_port_msg->pid, get_port_msg->id);
+
+        nxt_router_get_port_refuse(task, msg, reply_port, get_port_msg);
 
         return;
     }
