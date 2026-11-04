@@ -479,9 +479,11 @@ nxt_app_queue_race_worker(void *arg)
             break;
         }
 
+        /* The tracking value stands for a stream, and a stream is never 0. */
         notify = 0;
         (void) nxt_app_queue_send_bound(ctx->q, msg, sizeof(msg),
-                                        (uint32_t) w->id, &notify, &cookie, 1);
+                                        (uint32_t) w->id + 1, &notify, &cookie,
+                                        1);
         if (notify > 0) {
             (void) nxt_atomic_fetch_add(&ctx->notify_count, 1);
         }
@@ -717,6 +719,254 @@ nxt_app_queue_test_claim_empty(void *data)
 }
 
 
+/*
+ * Every legal transition of a slot, and the illegal ones, which fail and
+ * change nothing.  The message carries its stream in its first four bytes,
+ * as the router's nxt_port_msg_t does, so nxt_app_queue_recv_claim() can
+ * claim it.
+ */
+static int
+nxt_app_queue_test_slot_states(void *data)
+{
+    uint32_t         cookie, c1, c2, c3, stream;
+    nxt_bool_t       claimed;
+    nxt_app_queue_t  *q;
+    uint8_t          msg[NXT_APP_QUEUE_MSG_SIZE];
+    uint8_t          buf[NXT_APP_QUEUE_MSG_SIZE];
+
+    q = data;
+    nxt_memzero(msg, sizeof(msg));
+
+    /* free -> queued, with stream 7. */
+    stream = 7;
+    nxt_memcpy(msg, &stream, sizeof(stream));
+
+    if (nxt_app_queue_send(q, msg, sizeof(msg), 7, NULL, &c1) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_app_queue_slot_state(q, c1, 7) != NXT_APP_QUEUE_SLOT_QUEUED) {
+        return 2;
+    }
+
+    /* The slot is not the slot of stream 8. */
+    if (nxt_app_queue_slot_state(q, c1, 8) != NXT_APP_QUEUE_SLOT_IDLE) {
+        return 3;
+    }
+
+    /* A retraction and a claim with the wrong stream fail, nothing moves. */
+    if (nxt_app_queue_slot_retract(q, c1, 8)
+        || nxt_app_queue_slot_claim(q, c1, 8)
+        || nxt_app_queue_slot_state(q, c1, 7) != NXT_APP_QUEUE_SLOT_QUEUED)
+    {
+        return 4;
+    }
+
+    /* dequeued -> claimed -> free, by the reader. */
+    if (nxt_app_queue_recv_claim(q, buf, &cookie, &claimed) != sizeof(msg)
+        || cookie != c1 || !claimed)
+    {
+        return 5;
+    }
+
+    if (nxt_app_queue_slot_state(q, c1, 7) != NXT_APP_QUEUE_SLOT_IDLE) {
+        return 6;
+    }
+
+    /* After a claim, a retraction fails; so does a second claim. */
+    if (nxt_app_queue_cancel(q, c1, 7) || nxt_app_queue_slot_claim(q, c1, 7)) {
+        return 7;
+    }
+
+    /* queued -> retracted, by the router, with stream 9. */
+    stream = 9;
+    nxt_memcpy(msg, &stream, sizeof(stream));
+
+    if (nxt_app_queue_send(q, msg, sizeof(msg), 9, NULL, &c2) != NXT_OK) {
+        return 8;
+    }
+
+    if (!nxt_app_queue_cancel(q, c2, 9)
+        || nxt_app_queue_slot_state(q, c2, 9) != NXT_APP_QUEUE_SLOT_IDLE)
+    {
+        return 9;
+    }
+
+    /* A second retraction fails: the answer is given once. */
+    if (nxt_app_queue_cancel(q, c2, 9)) {
+        return 10;
+    }
+
+    /* The reader still dequeues the item, and its claim loses. */
+    if (nxt_app_queue_recv_claim(q, buf, &cookie, &claimed) != sizeof(msg)
+        || cookie != c2 || claimed)
+    {
+        return 11;
+    }
+
+    /*
+     * A reader with no claim frees the slot with the stream still in it.
+     * This is why free -> queued is a store: the next send reuses the slot
+     * whatever the word holds.
+     */
+    stream = 10;
+    nxt_memcpy(msg, &stream, sizeof(stream));
+
+    if (nxt_app_queue_send(q, msg, sizeof(msg), 10, NULL, &c3) != NXT_OK) {
+        return 12;
+    }
+
+    if (nxt_app_queue_recv(q, buf, &cookie) != sizeof(msg) || cookie != c3) {
+        return 13;
+    }
+
+    if (nxt_app_queue_slot_state(q, c3, 10) != NXT_APP_QUEUE_SLOT_QUEUED) {
+        return 14;
+    }
+
+    stream = 11;
+    nxt_memcpy(msg, &stream, sizeof(stream));
+
+    if (nxt_app_queue_send(q, msg, sizeof(msg), 11, NULL, &cookie) != NXT_OK) {
+        return 15;
+    }
+
+    if (nxt_app_queue_slot_state(q, cookie, 11) != NXT_APP_QUEUE_SLOT_QUEUED) {
+        return 16;
+    }
+
+    if (nxt_app_queue_recv_claim(q, buf, &cookie, &claimed) != sizeof(msg)
+        || !claimed || nxt_app_queue_depth(q) != 0)
+    {
+        return 17;
+    }
+
+    return 0;
+}
+
+
+typedef struct {
+    nxt_app_queue_t  *q;
+    nxt_barrier_t    start;
+    nxt_barrier_t    done;
+    nxt_atomic_t     stop;
+    nxt_atomic_t     wins;
+    uint32_t         cookie;
+    uint32_t         stream;
+} nxt_app_queue_take_ctx_t;
+
+
+static void *
+nxt_app_queue_take_worker(void *arg)
+{
+    nxt_app_queue_take_ctx_t  *ctx;
+
+    ctx = arg;
+
+    for ( ;; ) {
+        nxt_barrier_wait(&ctx->start);
+
+        if (nxt_atomic_load_acquire(&ctx->stop)) {
+            break;
+        }
+
+        if (nxt_app_queue_slot_take(ctx->q, ctx->cookie, ctx->stream)) {
+            (void) nxt_atomic_fetch_add(&ctx->wins, 1);
+        }
+
+        nxt_barrier_wait(&ctx->done);
+    }
+
+    return NULL;
+}
+
+
+#define NXT_APP_QUEUE_TEST_TAKE_ROUNDS  2000
+
+
+/*
+ * The claim of a worker and the retraction of the router are the same
+ * compare-and-set on one slot.  Whatever the number of takers, exactly one
+ * wins each round, and the slot is idle after it.
+ */
+static int
+nxt_app_queue_test_take_race(void *data)
+{
+    int                       i, rc;
+    long                      r;
+    pthread_t                 threads[NXT_APP_QUEUE_TEST_RACERS];
+    nxt_app_queue_take_ctx_t  ctx;
+    uint8_t                   msg[NXT_APP_QUEUE_MSG_SIZE];
+    uint8_t                   buf[NXT_APP_QUEUE_MSG_SIZE];
+    uint32_t                  cookie;
+
+    nxt_memzero(&ctx, sizeof(ctx));
+    nxt_memzero(msg, sizeof(msg));
+    ctx.q = data;
+    rc = 0;
+
+    nxt_barrier_init(&ctx.start, NXT_APP_QUEUE_TEST_RACERS + 1);
+    nxt_barrier_init(&ctx.done, NXT_APP_QUEUE_TEST_RACERS + 1);
+
+    for (i = 0; i < NXT_APP_QUEUE_TEST_RACERS; i++) {
+        if (pthread_create(&threads[i], NULL, nxt_app_queue_take_worker, &ctx)
+            != 0)
+        {
+            /* The child exits; its threads end with it. */
+            return 1;
+        }
+    }
+
+    for (r = 0; r < NXT_APP_QUEUE_TEST_TAKE_ROUNDS; r++) {
+        ctx.stream = (uint32_t) r + 1;
+        nxt_memcpy(msg, &ctx.stream, sizeof(ctx.stream));
+
+        if (nxt_app_queue_send(ctx.q, msg, sizeof(msg), ctx.stream, NULL,
+                               &ctx.cookie)
+            != NXT_OK)
+        {
+            rc = 2;
+            goto stop;
+        }
+
+        nxt_atomic_store(&ctx.wins, 0);
+
+        nxt_barrier_wait(&ctx.start);
+        nxt_barrier_wait(&ctx.done);
+
+        if (nxt_atomic_load(&ctx.wins) != 1
+            || nxt_app_queue_slot_state(ctx.q, ctx.cookie, ctx.stream)
+               != NXT_APP_QUEUE_SLOT_IDLE)
+        {
+            rc = 3;
+            goto stop;
+        }
+
+        /* The item is still in the queue; the reader finds it taken. */
+        if (nxt_app_queue_recv(ctx.q, buf, &cookie) != sizeof(msg)
+            || cookie != ctx.cookie)
+        {
+            rc = 4;
+            goto stop;
+        }
+    }
+
+stop:
+
+    nxt_atomic_store_release(&ctx.stop, 1);
+    nxt_barrier_wait(&ctx.start);
+
+    while (i > 0) {
+        pthread_join(threads[--i], NULL);
+    }
+
+    nxt_barrier_destroy(&ctx.start);
+    nxt_barrier_destroy(&ctx.done);
+
+    return rc;
+}
+
+
 typedef struct {
     const char  *name;
     int         (*op)(void *q);
@@ -731,6 +981,8 @@ static const nxt_app_queue_test_case_t  nxt_app_queue_test_cases[] = {
     { "app queue concurrent race", nxt_app_queue_test_concurrent_race },
     { "app queue claim before free", nxt_app_queue_test_claim_before_free },
     { "app queue claim on an empty queue", nxt_app_queue_test_claim_empty },
+    { "app queue slot states", nxt_app_queue_test_slot_states },
+    { "app queue take race", nxt_app_queue_test_take_race },
 };
 
 
