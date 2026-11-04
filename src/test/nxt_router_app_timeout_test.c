@@ -233,22 +233,17 @@ nxt_router_app_timeout_test_arm(nxt_task_t *task, nxt_event_engine_t *engine,
     r->timer.work_queue = &engine->fast_work_queue;
     r->timer.log = engine->task.log;
     r->timer.bias = NXT_TIMER_DEFAULT_BIAS;
-    r->timer.handler = nxt_router_test_app_timeout;
     r->timer_data = req_rpc_data;
 
     r->req_rpc_data = req_rpc_data;
 
     req_rpc_data->stream = stream;
     req_rpc_data->app = app;
-    req_rpc_data->app_port = app->shared_port;
-    req_rpc_data->apr_action = NXT_APR_REQUEST_FAILED;
     req_rpc_data->request = r;
     req_rpc_data->msg_info.body_fd = -1;
 
     /* The registration is cancelled at the unlink, as in the router. */
     req_rpc_data->rpc_cancel = (rpc_port != NULL);
-
-    nxt_port_inc_use(app->shared_port);
 
     /*
      * The message chain nxt_router_app_prepare_request() leaves behind: the
@@ -277,16 +272,12 @@ nxt_router_app_timeout_test_arm(nxt_task_t *task, nxt_event_engine_t *engine,
         return NXT_ERROR;
     }
 
-    nxt_thread_mutex_lock(&app->mutex);
-
-    app->active_requests++;
-    nxt_router_app_request_park(app, &r->app_link, req_rpc_data);
-
-    nxt_thread_mutex_unlock(&app->mutex);
-
-    nxt_mp_retain(mp);
-
-    nxt_timer_add(engine, &r->timer, app->timeout);
+    /*
+     * The production call parks the request, retains its pool, takes a use
+     * of the shared port and arms the deadline: with "timeout": 0 that is
+     * NXT_APP_ACK_TIMEOUT.  "max_processes" is 0, so it starts no process.
+     */
+    nxt_router_test_app_port_get(task, app, req_rpc_data);
 
     t->r = r;
     t->req_rpc_data = req_rpc_data;
@@ -337,7 +328,9 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
     nxt_runtime_t                      *rt, *saved_rt;
     nxt_app_queue_t                    *queue;
     nxt_event_engine_t                 engine, *saved_engine;
-    nxt_router_app_timeout_test_req_t  claimed, unclaimed, skipped;
+    nxt_router_app_timeout_test_req_t  claimed, unclaimed, skipped, untimed;
+    nxt_atomic_t                       app_use;
+    nxt_uint_t                         n;
     nxt_log_t                          engine_log;
 
     nxt_thread_time_update(thr);
@@ -347,6 +340,7 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
     shared_port = NULL;
     engine_port = NULL;
     claimed.stream = 0;
+    untimed.stream = 0;
     req_mp = NULL;
     app_mutex = 0;
     timers = 0;
@@ -488,6 +482,7 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
         goto done;
     }
 
+    nxt_mp_retain(req_mp);
     nxt_mp_retain(req_mp);
     nxt_mp_retain(req_mp);
 
@@ -797,6 +792,101 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
         goto done;
     }
 
+    /*
+     * Leg 5: "timeout": 0 (#665).  A request still in the queue is left
+     * there at every expiry of the acknowledgement deadline.  Once a worker
+     * takes it and never acknowledges, it is answered 503 like a claimed
+     * request under a timeout: an alert, then the answer, and the unlink
+     * gives back the reference to the application that keeps its prototype
+     * from being told to quit.
+     */
+
+    app->timeout = 0;
+
+    if (nxt_slow_path(nxt_router_app_timeout_test_arm(task, &engine, req_mp,
+                                                      app, engine_port, 0,
+                                                      &untimed)
+                      != NXT_OK))
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: could not arm a request");
+        goto done;
+    }
+
+    nxt_router_app_timeout_test_completions = 0;
+    nxt_router_app_timeout_test_alerts = 0;
+    app_use = app->use_count;
+
+    nxt_router_app_timeout_test_tick(task, &engine, NXT_APP_ACK_TIMEOUT);
+    nxt_router_app_timeout_test_tick(task, &engine, NXT_APP_ACK_TIMEOUT);
+
+    if (untimed.req_rpc_data->msg_info.cancel != NXT_MSG_QUEUED
+        || untimed.r->status != 0 || untimed.r->req_rpc_data == NULL
+        || nxt_router_app_timeout_test_alerts != 0
+        || nxt_router_app_timeout_test_completions != 0)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: with no timeout, a queued "
+                      "request was not left waiting (cancel %d, status %d, "
+                      "%ui alerts)",
+                      (int) untimed.req_rpc_data->msg_info.cancel,
+                      (int) untimed.r->status,
+                      nxt_router_app_timeout_test_alerts);
+        goto done;
+    }
+
+    /* Retracted messages of earlier legs come first; a worker skips them. */
+
+    for (n = 0; n < 8; n++) {
+        if (nxt_router_app_timeout_test_claim(queue)) {
+            break;
+        }
+    }
+
+    if (nxt_slow_path(n == 8)) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: the worker could not claim "
+                      "the queued message");
+        goto done;
+    }
+
+    nxt_router_app_timeout_test_tick(task, &engine, NXT_APP_ACK_TIMEOUT);
+
+    if (untimed.req_rpc_data->msg_info.cancel != NXT_MSG_CLAIMED
+        || untimed.r->status != 0 || untimed.r->req_rpc_data == NULL
+        || nxt_router_app_timeout_test_alerts != 1)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: with no timeout, the first "
+                      "expiry after a claim did not alert and wait (cancel "
+                      "%d, status %d, %ui alerts)",
+                      (int) untimed.req_rpc_data->msg_info.cancel,
+                      (int) untimed.r->status,
+                      nxt_router_app_timeout_test_alerts);
+        goto done;
+    }
+
+    nxt_router_app_timeout_test_tick(task, &engine, NXT_APP_ACK_TIMEOUT);
+
+    if (untimed.r->status != NXT_HTTP_SERVICE_UNAVAILABLE
+        || untimed.r->req_rpc_data != NULL
+        || app->use_count != app_use - 1
+        || engine_port->use_count != engine_port_use - 1)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: with no timeout, a claimed "
+                      "request with no acknowledgement was not answered 503 "
+                      "or kept the application (status %d, app use %uD, "
+                      "expected %uD)",
+                      (int) untimed.r->status, (uint32_t) app->use_count,
+                      (uint32_t) (app_use - 1));
+        goto done;
+    }
+
+    untimed.stream = 0;
+
+    nxt_router_app_timeout_test_tick(task, &engine, 2 * NXT_APP_ACK_TIMEOUT);
+
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "router app timeout test passed");
 
     ret = NXT_OK;
@@ -811,6 +901,10 @@ done:
         /* A leg that failed can leave the registration behind. */
         if (claimed.stream != 0) {
             nxt_port_rpc_cancel(task, engine_port, claimed.stream);
+        }
+
+        if (untimed.stream != 0) {
+            nxt_port_rpc_cancel(task, engine_port, untimed.stream);
         }
 
         if (engine_port->pair[0] != -1) {

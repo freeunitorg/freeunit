@@ -1403,6 +1403,43 @@ nxt_router_msg_retract(nxt_task_t *task, nxt_request_rpc_data_t *req_rpc_data)
 }
 
 
+/*
+ * The deadline that bounds a request until a worker acknowledges it.  With
+ * "limits": {"timeout"} that is the timeout.  Without one it is
+ * NXT_APP_ACK_TIMEOUT, which nxt_router_app_timeout() applies only once a
+ * worker has taken the request.
+ */
+
+nxt_inline nxt_msec_t
+nxt_router_app_ack_deadline(nxt_app_t *app)
+{
+    return (app->timeout != 0) ? app->timeout : NXT_APP_ACK_TIMEOUT;
+}
+
+
+/*
+ * Whether the request is still in the shared port queue, unclaimed.  Unlike
+ * nxt_router_msg_retract() it leaves the request there.
+ */
+
+nxt_inline nxt_bool_t
+nxt_router_msg_queued(nxt_request_rpc_data_t *req_rpc_data)
+{
+    nxt_port_t      *app_port;
+    nxt_msg_info_t  *msg_info;
+
+    msg_info = &req_rpc_data->msg_info;
+    app_port = req_rpc_data->app_port;
+
+    return msg_info->buf != NULL
+           && msg_info->cancel == NXT_MSG_QUEUED
+           && app_port != NULL
+           && app_port->id == NXT_SHARED_PORT_ID
+           && nxt_app_queue_queued(app_port->queue, msg_info->tracking_cookie,
+                                   req_rpc_data->stream);
+}
+
+
 nxt_inline nxt_bool_t
 nxt_router_msg_cancel(nxt_task_t *task, nxt_request_rpc_data_t *req_rpc_data)
 {
@@ -4930,15 +4967,16 @@ nxt_router_test_app_rpc_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 
 
 /*
- * The request deadline, for src/test/nxt_router_app_timeout_test.c.  That test
- * drives it through the engine's timer machinery, so the wrapper is installed
- * as the timer handler rather than called.
+ * Parks a request and arms its deadline, for
+ * src/test/nxt_router_app_timeout_test.c.  The test goes through the
+ * production call, so a change that stops arming the deadline fails it.
  */
 
 void
-nxt_router_test_app_timeout(nxt_task_t *task, void *obj, void *data)
+nxt_router_test_app_port_get(nxt_task_t *task, nxt_app_t *app,
+    nxt_request_rpc_data_t *req_rpc_data)
 {
-    nxt_router_app_timeout(task, obj, data);
+    nxt_router_app_port_get(task, app, req_rpc_data);
 }
 
 #endif
@@ -6876,6 +6914,10 @@ nxt_router_req_headers_ack_handler(nxt_task_t *task,
         r->timer.handler = nxt_router_app_timeout;
         r->timer_data = req_rpc_data;
         nxt_timer_add(task->thread->engine, &r->timer, app->timeout);
+
+    } else {
+        /* The acknowledgement deadline is met; nothing bounds the rest. */
+        nxt_timer_disable(task->thread->engine, &r->timer);
     }
 }
 
@@ -8518,14 +8560,19 @@ nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
      *
      * An acknowledgement re-arms the same timer with the same handler, which
      * nxt_timer_add() treats as a change, not a second timer.
+     *
+     * With "timeout": 0 the timer is armed all the same, with
+     * NXT_APP_ACK_TIMEOUT.  The wait for capacity stays unbounded -- the
+     * handler only re-arms while the request is still queued -- but a
+     * request that a worker took and never acknowledged is answered instead
+     * of being parked for good (#665).  The acknowledgement disarms it.
      */
 
-    if (app->timeout != 0) {
-        r->timer.handler = nxt_router_app_timeout;
-        r->timer_data = req_rpc_data;
+    r->timer.handler = nxt_router_app_timeout;
+    r->timer_data = req_rpc_data;
 
-        nxt_timer_add(task->thread->engine, &r->timer, app->timeout);
-    }
+    nxt_timer_add(task->thread->engine, &r->timer,
+                  nxt_router_app_ack_deadline(app));
 
     if (start_process) {
         nxt_router_start_app_process(task, app);
@@ -9276,6 +9323,25 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
      * the shared port here means that it has not arrived yet.
      */
 
+    /*
+     * With "timeout": 0 only the acknowledgement deadline applies.  A request
+     * still waiting in the queue is left there, and checked again at the
+     * next one.  One that a worker took is handled below like any claimed
+     * request: an alert, then 503 at the next expiry.  The 503 unlinks the
+     * request, which drops its reference to the application, so a
+     * reconfiguration can release the application and send QUIT to its
+     * prototype (nxt_router_free_app()).
+     */
+
+    if (req_rpc_data->app != NULL
+        && req_rpc_data->app->timeout == 0
+        && nxt_router_msg_queued(req_rpc_data))
+    {
+        nxt_timer_add(task->thread->engine, timer, NXT_APP_ACK_TIMEOUT);
+
+        return;
+    }
+
     if (msg_info->cancel == NXT_MSG_QUEUED) {
         (void) nxt_router_msg_retract(task, req_rpc_data);
     }
@@ -9294,10 +9360,10 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
                       "and the %M ms deadline expired without an "
                       "acknowledgement",
                       &req_rpc_data->app->name, req_rpc_data->stream,
-                      req_rpc_data->app->timeout);
+                      nxt_router_app_ack_deadline(req_rpc_data->app));
 
             nxt_timer_add(task->thread->engine, timer,
-                          req_rpc_data->app->timeout);
+                          nxt_router_app_ack_deadline(req_rpc_data->app));
 
             return;
         }

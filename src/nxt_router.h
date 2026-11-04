@@ -146,6 +146,20 @@ typedef struct {
 #define NXT_APP_START_TIMEOUT  0
 
 
+/*
+ * The deadline for a request that a worker has taken from the shared port
+ * queue but not acknowledged, when "limits": {"timeout"} is 0 (#665).
+ *
+ * The acknowledgement follows the claim within microseconds, so a request
+ * that stays claimed and unacknowledged for this long belongs to a worker
+ * that died or stalled in that window.  Nothing else ever answers such a
+ * request, and the application reference it holds keeps the prototype from
+ * being told to quit.  A request that is still in the queue, waiting for
+ * capacity, is not bounded by this: "timeout": 0 keeps that wait unbounded.
+ */
+#define NXT_APP_ACK_TIMEOUT    5000
+
+
 typedef struct {
     uint32_t               use_count;
     nxt_app_t              *app;
@@ -522,8 +536,9 @@ void nxt_router_test_listen_socket_create(nxt_task_t *task,
 void nxt_router_test_listen_socket_update(nxt_task_t *task,
     nxt_joint_job_t *job, nxt_socket_conf_joint_t *joint);
 
-/* The request deadline handler, for the app-timeout test. */
-void nxt_router_test_app_timeout(nxt_task_t *task, void *obj, void *data);
+/* nxt_router_app_port_get(), for the app-timeout test. */
+void nxt_router_test_app_port_get(nxt_task_t *task, nxt_app_t *app,
+    nxt_request_rpc_data_t *req_rpc_data);
 
 /*
  * A request RPC with the router's response handlers, for the app-timeout
