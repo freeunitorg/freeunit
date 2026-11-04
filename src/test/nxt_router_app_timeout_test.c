@@ -139,27 +139,26 @@ nxt_router_app_timeout_test_tick(nxt_task_t *task, nxt_event_engine_t *engine,
 
 /*
  * What a worker does with a queue item, from nxt_unit_app_queue_recv():
- * dequeue it, then claim it with the same CAS the router's retraction uses.
- * Answers whether this side won.
+ * dequeue it and claim it with the same CAS the router's retraction uses,
+ * before its slot goes back to the free list.  Answers whether this side
+ * won.
  */
 
 static nxt_bool_t
 nxt_router_app_timeout_test_claim(nxt_app_queue_t *queue)
 {
-    uint32_t        cookie;
-    ssize_t         size;
-    uint8_t         rbuf[NXT_APP_QUEUE_MSG_SIZE];
-    nxt_port_msg_t  *port_msg;
+    uint32_t    cookie;
+    ssize_t     size;
+    nxt_bool_t  claimed;
+    uint8_t     rbuf[NXT_APP_QUEUE_MSG_SIZE];
 
-    size = nxt_app_queue_recv(queue, rbuf, &cookie);
+    size = nxt_app_queue_recv_claim(queue, rbuf, &cookie, &claimed);
 
     if (size < (ssize_t) sizeof(nxt_port_msg_t)) {
         return 0;
     }
 
-    port_msg = (nxt_port_msg_t *) rbuf;
-
-    return nxt_app_queue_cancel(queue, cookie, port_msg->stream);
+    return claimed;
 }
 
 

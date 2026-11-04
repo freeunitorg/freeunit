@@ -8,6 +8,24 @@
  */
 
 #include <nxt_main.h>
+
+
+/*
+ * A hook in the claim window of nxt_app_queue_recv_claim(), after the claim
+ * and before the slot goes back to the free list.  Only this file defines
+ * the macro, so no shipped object calls the hook.
+ */
+
+static void  (*nxt_app_queue_test_claim_cb)(volatile void *q, uint32_t i);
+
+#define NXT_APP_QUEUE_TEST_CLAIM_HOOK(q, i)                                   \
+    do {                                                                      \
+        if (nxt_app_queue_test_claim_cb != NULL) {                            \
+            nxt_app_queue_test_claim_cb((volatile void *) (q),                \
+                                        (uint32_t) (i));                      \
+        }                                                                     \
+    } while (0)
+
 #include <nxt_app_queue.h>
 #include "nxt_tests.h"
 #include <pthread.h>
@@ -568,6 +586,137 @@ nxt_app_queue_test_concurrent_race(void *data)
 }
 
 
+/*
+ * The worker claims a queued request before the slot of the request goes
+ * back to the free list.  Otherwise the router can reuse the slot for a new
+ * request in between, and the claim fails for both sides (#889).
+ *
+ * The queue is full, so the free list is empty.  The only slot that a send
+ * can get in the claim window is the slot that is being claimed.  The hook
+ * tries a send in that window: it must get NXT_AGAIN.
+ */
+
+static nxt_int_t  nxt_app_queue_claim_send_rc;
+static uint32_t   nxt_app_queue_claim_send_cookie;
+static uint32_t   nxt_app_queue_claim_hook_calls;
+
+
+static void
+nxt_app_queue_test_claim_window(volatile void *data, uint32_t i)
+{
+    uint32_t         cookie, tracking;
+    nxt_app_queue_t  *q;
+    uint8_t          msg[NXT_APP_QUEUE_MSG_SIZE];
+
+    q = (nxt_app_queue_t *) data;
+
+    nxt_app_queue_claim_hook_calls++;
+
+    tracking = 0xC1A1u;
+    nxt_memzero(msg, sizeof(msg));
+    nxt_memcpy(msg, &tracking, sizeof(uint32_t));
+
+    cookie = 0xFFFFFFFFu;
+
+    nxt_app_queue_claim_send_rc = nxt_app_queue_send(q, msg, sizeof(msg),
+                                                     tracking, NULL, &cookie);
+    nxt_app_queue_claim_send_cookie = cookie;
+}
+
+
+static int
+nxt_app_queue_test_claim_before_free(void *data)
+{
+    uint32_t         n, tracking, cookie;
+    ssize_t          size;
+    nxt_bool_t       claimed;
+    nxt_app_queue_t  *q;
+    uint8_t          msg[NXT_APP_QUEUE_MSG_SIZE];
+    uint8_t          buf[NXT_APP_QUEUE_MSG_SIZE];
+
+    q = data;
+    nxt_memzero(msg, sizeof(msg));
+
+    /* The first four bytes of an item are its tracking value. */
+
+    for (n = 0; n < NXT_APP_QUEUE_SIZE; n++) {
+        tracking = n + 1;
+        nxt_memcpy(msg, &tracking, sizeof(uint32_t));
+
+        if (nxt_app_queue_send(q, msg, sizeof(msg), tracking, NULL, &cookie)
+            != NXT_OK)
+        {
+            return 1;
+        }
+    }
+
+    nxt_app_queue_claim_send_rc = NXT_OK;
+    nxt_app_queue_claim_send_cookie = 0;
+    nxt_app_queue_claim_hook_calls = 0;
+    nxt_app_queue_test_claim_cb = nxt_app_queue_test_claim_window;
+
+    claimed = 0;
+    size = nxt_app_queue_recv_claim(q, buf, &cookie, &claimed);
+
+    nxt_app_queue_test_claim_cb = NULL;
+
+    if (size != (ssize_t) sizeof(msg) || nxt_app_queue_claim_hook_calls != 1) {
+        return 2;
+    }
+
+    if (nxt_app_queue_claim_send_rc != NXT_AGAIN) {
+        nxt_log_error(NXT_LOG_ALERT, &nxt_main_log,
+                      "app queue claim: claimed slot %uD was reusable by a "
+                      "send in the claim window (send cookie %uD)",
+                      cookie, nxt_app_queue_claim_send_cookie);
+        return 3;
+    }
+
+    if (!claimed) {
+        return 4;
+    }
+
+    /* The router cannot take a claimed request back. */
+
+    tracking = 1;
+
+    if (nxt_app_queue_cancel(q, cookie, tracking)) {
+        return 5;
+    }
+
+    return 0;
+}
+
+
+/*
+ * A read from an empty queue sets "claimed" to 0: the out-parameter has a
+ * value on every return.
+ */
+
+static int
+nxt_app_queue_test_claim_empty(void *data)
+{
+    uint32_t         cookie;
+    nxt_bool_t       claimed;
+    nxt_app_queue_t  *q;
+    uint8_t          buf[NXT_APP_QUEUE_MSG_SIZE];
+
+    q = data;
+
+    claimed = 0x5A;
+
+    if (nxt_app_queue_recv_claim(q, buf, &cookie, &claimed) != -1) {
+        return 1;
+    }
+
+    if (claimed != 0) {
+        return 2;
+    }
+
+    return 0;
+}
+
+
 typedef struct {
     const char  *name;
     int         (*op)(void *q);
@@ -580,6 +729,8 @@ static const nxt_app_queue_test_case_t  nxt_app_queue_test_cases[] = {
     { "app queue burst", nxt_app_queue_test_burst },
     { "app queue late head", nxt_app_queue_test_late_head },
     { "app queue concurrent race", nxt_app_queue_test_concurrent_race },
+    { "app queue claim before free", nxt_app_queue_test_claim_before_free },
+    { "app queue claim on an empty queue", nxt_app_queue_test_claim_empty },
 };
 
 
