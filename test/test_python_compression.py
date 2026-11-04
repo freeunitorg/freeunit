@@ -655,6 +655,72 @@ def test_python_compression_unknown_length_identity_refused():
     assert status == 406, 'nothing acceptable'
 
 
+
+@pytest.mark.parametrize(
+    'status, accept',
+    [
+        (406, 'identity;q=0'),
+        (406, 'IDENTITY;Q=0'),
+        (406, 'gzip, identity;q=0'),
+        (406, '*;q=0'),
+        (200, '*;q=0, identity'),
+        (200, 'identity;q=0.5'),
+        (200, 'gzip, deflate, br, zstd'),
+        (200, 'identity'),
+        (200, None),
+    ],
+)
+def test_python_compression_off_unknown_length(accept, status):
+    # Without "compression", a response of unknown length skips negotiation
+    # when no Accept-Encoding field holds a weight.  A refusal of identity
+    # carries a weight, so it is still a 406, and the rest is served as is.
+    client.load('compression_stream', threads=32)
+
+    headers = request_headers(3005, accept or '', 1)
+    headers['X-Content-Length'] = 'none'
+
+    if accept is None:
+        del headers['Accept-Encoding']
+
+    resp = client.get(
+        headers=headers,
+        raw_resp=True,
+        encoding='latin1',
+        read_buffer_size=65536,
+    )
+
+    head, _, body = resp.partition('\r\n\r\n')
+
+    assert int(head.split(' ', 2)[1]) == status, 'status'
+
+    if status == 200:
+        assert 'Content-Encoding' not in head, 'not coded'
+        assert dechunk(body.encode('latin1')) == expected(3005, 1), 'body'
+
+
+def test_python_compression_off_identity_refused_split_fields():
+    # The refusal can sit in the second of two Accept-Encoding fields.
+    client.load('compression_stream', threads=32)
+
+    resp = client.http(
+        b"""GET / HTTP/1.1\r
+Host: localhost\r
+Accept-Encoding: gzip\r
+Accept-Encoding: identity;q=0\r
+X-Id: 3006\r
+X-Parts: 1\r
+X-Size: 4096\r
+X-Delay: 0\r
+X-Content-Length: none\r
+Connection: close\r
+\r
+""",
+        raw=True,
+    )
+
+    assert resp['status'] == 406, 'identity refused in the second field'
+
+
 @pytest.mark.parametrize('length', ['known', 'none'])
 def test_python_compression_unknown_length_206(length):
     # An application's 206 is not coded, whatever its length: its
