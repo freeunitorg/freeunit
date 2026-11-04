@@ -900,6 +900,42 @@ nxt_http_comp_accept_encoding(nxt_http_request_t *r, nxt_str_t *value)
 
 
 /*
+ * With compression off, identity is the only coding, and the client refuses
+ * it only with a weight of 0.  A weight comes after a ';'.  So when no
+ * Accept-Encoding field holds a ';', negotiation cannot end in 406 and has
+ * nothing to select.  This is the same test as the one in
+ * nxt_http_comp_select_compressor(), made on the fields themselves: the
+ * joined value holds a ';' exactly when one of its fields does.  It reads no
+ * response field and allocates nothing.
+ */
+
+static bool
+nxt_http_comp_accept_encoding_has_weight(nxt_http_request_t *r)
+{
+    nxt_http_field_t        *f;
+    nxt_http_fields_iter_t  iter;
+
+    for (f = nxt_http_fields_first(&iter, r->inline_fields,
+                                   r->num_inline_fields, r->fields);
+         f != NULL;
+         f = nxt_http_fields_next(&iter))
+    {
+        if (f->skip || f->name_length != nxt_length("Accept-Encoding")
+            || !nxt_http_comp_is_accept_encoding(f->name))
+        {
+            continue;
+        }
+
+        if (memchr(f->value, ';', f->value_length) != NULL) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+/*
  * The length that the compressor decision uses.  Returns -1 when the length
  * of the body is not known yet.
  *
@@ -1549,6 +1585,24 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
     r->comp_ctx = NULL;
 
     /*
+     * Compression off, no "response_headers" Content-Encoding, and no
+     * Accept-Encoding weight: every path below returns NXT_OK without a
+     * context, because nothing can refuse identity and nothing can code.
+     * So the response fields, the Content-Encoding scan and the joined
+     * Accept-Encoding value are not looked at.  Since every application
+     * response without Content-Length is negotiated, this is the common
+     * case.  A field with a ';' takes the full path, so "identity;q=0" and
+     * "*;q=0" are answered 406 as before.
+     */
+
+    if (conf == NULL
+        && (r->action == NULL || !r->action->set_headers_encoding)
+        && !nxt_http_comp_accept_encoding_has_weight(r))
+    {
+        return NXT_OK;
+    }
+
+    /*
      * An empty body has nothing to code.  An application's
      * "Content-Length: 0" is a field, not content_length_n, so it is read
      * through the same function as the "min_length" test.  Before, such a
@@ -2080,6 +2134,57 @@ nxt_http_comp_test_select(nxt_http_request_t *r, const nxt_str_t *value,
     }
 
     return nxt_http_comp_select_compressor(cp, r, value, identity_refused);
+}
+
+
+/*
+ * For src/test/nxt_http_comp_select_test.c: the compression-off shortcut of
+ * nxt_http_comp_check_acceptable().  The value is put into the request as
+ * one Accept-Encoding field, or as two when "split" falls inside it.  Gives
+ * whether the shortcut is taken, and what the full parse of the joined
+ * value says with compression off.
+ */
+
+nxt_int_t
+nxt_http_comp_test_off_shortcut(nxt_http_request_t *r, const nxt_str_t *value,
+    size_t split, bool *shortcut, bool *identity_refused)
+{
+    nxt_int_t         ret;
+    nxt_str_t         joined;
+    nxt_http_field_t  *f;
+
+    static u_char  name[] = "accept-ENCODING";
+
+    r->num_inline_fields = 0;
+    r->fields = NULL;
+
+    f = &r->inline_fields[r->num_inline_fields++];
+    *f = (nxt_http_field_t) { .name = name,
+                              .name_length = nxt_length("Accept-Encoding"),
+                              .value = value->start,
+                              .value_length = value->length };
+
+    if (split > 0 && split < value->length) {
+        f->value_length = split;
+
+        f = &r->inline_fields[r->num_inline_fields++];
+        *f = (nxt_http_field_t) { .name = name,
+                                  .name_length = nxt_length("Accept-Encoding"),
+                                  .value = value->start + split,
+                                  .value_length = value->length - split };
+    }
+
+    *shortcut = !nxt_http_comp_accept_encoding_has_weight(r);
+
+    ret = nxt_http_comp_accept_encoding(r, &joined);
+
+    if (ret == NXT_OK) {
+        ret = nxt_http_comp_negotiate(NULL, r, &joined, identity_refused);
+    }
+
+    r->num_inline_fields = 0;
+
+    return ret;
 }
 
 #endif
