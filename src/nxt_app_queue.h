@@ -165,6 +165,23 @@ nxt_app_queue_notification_received(nxt_app_queue_t volatile *q)
 }
 
 
+/*
+ * Whether the item is still waiting for a worker: neither claimed nor
+ * cancelled.  A read only; unlike nxt_app_queue_cancel() it takes nothing.
+ */
+
+nxt_inline nxt_bool_t
+nxt_app_queue_queued(nxt_app_queue_t volatile *q, uint32_t cookie,
+    uint32_t tracking)
+{
+    nxt_app_queue_item_t  *qi;
+
+    qi = (nxt_app_queue_item_t *) &q->items[cookie];
+
+    return nxt_atomic_load(&qi->tracking) == tracking;
+}
+
+
 nxt_inline nxt_bool_t
 nxt_app_queue_cancel(nxt_app_queue_t volatile *q, uint32_t cookie,
     uint32_t tracking)
