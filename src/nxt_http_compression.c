@@ -752,6 +752,58 @@ nxt_http_comp_compressor_lookup_enabled(const nxt_http_comp_conf_t *conf,
  * 'identity;q=0' seems to basically mean the same thing...
  */
 /*
+ * Tells whether a field name of 15 bytes is "Accept-Encoding" in any case.
+ * The result is that of nxt_strncasecmp() with "Accept-Encoding", but the
+ * compare takes 8, 4, 2 and 1 bytes at a time, and it reads only the 15
+ * bytes of the name.
+ *
+ * The fold mask sets bit 0x20 in each letter of the name.  A byte then
+ * gives the lowercase letter only if it is that letter in upper or lower
+ * case.  That is the fold of nxt_lowcase().  The '-' is not folded, so it
+ * must match exactly.  A NUL in the name does not match, as in
+ * nxt_strncasecmp(): the constant has no NUL to stop at.
+ *
+ * The constant and the mask are loaded from byte arrays in the same way as
+ * the name.  So the result does not depend on the byte order.
+ */
+
+nxt_inline bool
+nxt_http_comp_is_accept_encoding(const u_char *name)
+{
+    uint16_t  n2, l2, m2;
+    uint32_t  n4, l4, m4;
+    uint64_t  n8, l8, m8;
+
+    static const u_char  low[15] = {
+        'a', 'c', 'c', 'e', 'p', 't', '-',
+        'e', 'n', 'c', 'o', 'd', 'i', 'n', 'g',
+    };
+
+    static const u_char  fold[15] = {
+        0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00,
+        0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+    };
+
+    memcpy(&n8, name, 8);
+    memcpy(&l8, low, 8);
+    memcpy(&m8, fold, 8);
+
+    memcpy(&n4, name + 8, 4);
+    memcpy(&l4, low + 8, 4);
+    memcpy(&m4, fold + 8, 4);
+
+    memcpy(&n2, name + 12, 2);
+    memcpy(&l2, low + 12, 2);
+    memcpy(&m2, fold + 12, 2);
+
+    return (n8 | m8) == l8
+           && (n4 | m4) == l4
+           && (uint16_t) (n2 | m2) == l2
+           && (u_char) (name[14] | fold[14]) == low[14];
+}
+
+
+/*
  * Collects every Accept-Encoding field into one value.
  *
  * RFC 9110 Sect. 5.3: a field that may carry a comma-separated list can be
@@ -787,8 +839,7 @@ nxt_http_comp_accept_encoding(nxt_http_request_t *r, nxt_str_t *value)
          f = nxt_http_fields_next(&iter))
     {
         if (f->skip || f->name_length != accept_encoding.length
-            || nxt_strncasecmp(f->name, accept_encoding.start,
-                               accept_encoding.length) != 0)
+            || !nxt_http_comp_is_accept_encoding(f->name))
         {
             continue;
         }
@@ -832,8 +883,7 @@ nxt_http_comp_accept_encoding(nxt_http_request_t *r, nxt_str_t *value)
          f = nxt_http_fields_next(&iter))
     {
         if (f->skip || f->name_length != accept_encoding.length
-            || nxt_strncasecmp(f->name, accept_encoding.start,
-                               accept_encoding.length) != 0)
+            || !nxt_http_comp_is_accept_encoding(f->name))
         {
             continue;
         }
@@ -1984,6 +2034,19 @@ nxt_http_comp_compression_init(nxt_task_t *task, nxt_router_conf_t *rtcf,
 
 
 #if (NXT_TESTS)
+
+/*
+ * For src/test/nxt_tests.c: the name test of the scan in
+ * nxt_http_comp_accept_encoding().
+ */
+
+bool
+nxt_http_comp_test_accept_encoding_name(const u_char *name, size_t length)
+{
+    return length == nxt_length("Accept-Encoding")
+           && nxt_http_comp_is_accept_encoding(name);
+}
+
 
 /*
  * For src/test/nxt_http_comp_select_test.c.  With "compression" set, every
