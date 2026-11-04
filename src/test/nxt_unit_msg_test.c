@@ -88,6 +88,7 @@ static int                      nxt_unit_msg_test_close_calls;
 static int                      nxt_unit_msg_test_get_mmaps;
 static int                      nxt_unit_msg_test_rpc_errors;
 static int                      nxt_unit_msg_test_get_ports;
+static uint32_t                 nxt_unit_msg_test_get_port_flags;
 static char                     nxt_unit_msg_test_ws_order[8];
 static size_t                   nxt_unit_msg_test_ws_norder;
 static nxt_unit_msg_test_mode_t nxt_unit_msg_test_mode;
@@ -383,6 +384,13 @@ nxt_unit_msg_test_send(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
         && msg->type == _NXT_PORT_MSG_GET_PORT)
     {
         nxt_unit_msg_test_get_ports++;
+
+        if (buf_size >= sizeof(nxt_port_msg_t)
+                       + sizeof(nxt_port_msg_get_port_ext_t))
+        {
+            nxt_unit_msg_test_get_port_flags =
+                ((const nxt_port_msg_get_port_ext_t *) (msg + 1))->flags;
+        }
     }
 
     if (port->id.id == NXT_UNIT_MSG_TEST_ENGINE_PORT
@@ -1938,6 +1946,124 @@ nxt_unit_msg_test_get_port_again_case(void *data)
         fflush(stdout);
 
         return 2;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * The router refused a GET_PORT: the port is gone.  It answers RPC_ERROR
+ * with the refused port (nxt_router_get_port_refuse()).  Before, it sent
+ * nothing, and the request stayed parked on the port for ever.  libunit
+ * must release the request, and remove the port, so a later request asks
+ * for it again.  The GET_PORT must ask for the answer.
+ */
+
+static int
+nxt_unit_msg_test_get_port_refused_case(void *data)
+{
+    int  rc;
+
+    struct {
+        nxt_port_msg_t           msg;
+        nxt_port_msg_get_port_t  port;
+    } refused;
+
+    struct {
+        nxt_port_msg_t           msg;
+        uint8_t                  mode;
+    } nxt_packed quit;
+
+    nxt_unit_msg_test_mode = NXT_UNIT_MSG_TEST_READ_BODY;
+
+    nxt_unit_msg_test_handler_calls = 0;
+    nxt_unit_msg_test_rpc_errors = 0;
+    nxt_unit_msg_test_get_ports = 0;
+    nxt_unit_msg_test_get_port_flags = 0;
+
+    rc = nxt_unit_msg_test_send_to_port(nxt_unit_msg_test_pid, 9);
+
+    if (rc != NXT_UNIT_OK || nxt_unit_msg_test_handler_calls != 0
+        || nxt_unit_msg_test_get_ports != 1
+        || (nxt_unit_msg_test_get_port_flags
+            & NXT_PORT_GET_PORT_ANSWER_REFUSAL) == 0)
+    {
+        printf("unit msg test: rc %d, handler %d, %d GET_PORT, flags %u\n",
+               rc, nxt_unit_msg_test_handler_calls,
+               nxt_unit_msg_test_get_ports,
+               (unsigned) nxt_unit_msg_test_get_port_flags);
+        fflush(stdout);
+
+        return 1;
+    }
+
+    memset(&refused, 0, sizeof(refused));
+
+    refused.msg.pid = nxt_unit_msg_test_pid;
+    refused.msg.type = _NXT_PORT_MSG_RPC_ERROR;
+    refused.msg.last = 1;
+    refused.port.pid = nxt_unit_msg_test_pid;
+    refused.port.id = 9;
+
+    rc = nxt_unit_test_process_msg(nxt_unit_msg_test_ctx, &refused,
+                                   sizeof(refused), -1);
+
+    if (rc != NXT_UNIT_OK || nxt_unit_msg_test_handler_calls != 0
+        || nxt_unit_msg_test_rpc_errors != 0)
+    {
+        printf("unit msg test: the refusal: rc %d, handler %d, "
+               "%d RPC_ERROR messages\n", rc,
+               nxt_unit_msg_test_handler_calls,
+               nxt_unit_msg_test_rpc_errors);
+        fflush(stdout);
+
+        return 2;
+    }
+
+    /* The port was removed: a new request asks for it again. */
+    rc = nxt_unit_msg_test_send_to_port(nxt_unit_msg_test_pid, 9);
+
+    if (rc != NXT_UNIT_OK || nxt_unit_msg_test_get_ports != 2) {
+        printf("unit msg test: the second request: rc %d, %d GET_PORT "
+               "messages, expected 2\n", rc, nxt_unit_msg_test_get_ports);
+        fflush(stdout);
+
+        return 3;
+    }
+
+    /*
+     * Refuse the second request too.  A parked request is counted in
+     * wait_items, and a graceful quit happens only when none is left, so
+     * the quit shows that both requests were released, not only that the
+     * port was removed.
+     */
+    rc = nxt_unit_test_process_msg(nxt_unit_msg_test_ctx, &refused,
+                                   sizeof(refused), -1);
+
+    if (rc != NXT_UNIT_OK) {
+        printf("unit msg test: the second refusal: rc %d\n", rc);
+        fflush(stdout);
+
+        return 4;
+    }
+
+    memset(&quit, 0, sizeof(quit));
+
+    quit.msg.pid = getpid();
+    quit.msg.type = _NXT_PORT_MSG_QUIT;
+    quit.msg.last = 1;
+    quit.mode = NXT_PORT_QUIT_GRACEFUL;
+
+    (void) nxt_unit_test_process_msg(nxt_unit_msg_test_ctx, &quit,
+                                     sizeof(nxt_port_msg_t) + 1, -1);
+
+    if (!nxt_unit_msg_test_quit_called) {
+        printf("unit msg test: a refused request is still parked, so the "
+               "graceful quit did not happen\n");
+        fflush(stdout);
+
+        return 5;
     }
 
     return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
@@ -4150,6 +4276,11 @@ main(void)
     nxt_unit_msg_test_in_child("port whose GET_PORT failed is asked for "
                                "again", nxt_unit_msg_test_get_port_again_case,
                                NULL, NXT_UNIT_OK);
+
+    nxt_unit_msg_test_in_child("request whose GET_PORT is refused is "
+                               "released",
+                               nxt_unit_msg_test_get_port_refused_case, NULL,
+                               NXT_UNIT_OK);
 
     nxt_unit_msg_test_in_child("request that fails while its port is not "
                                "ready is reported as not ready",

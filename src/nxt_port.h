@@ -638,6 +638,21 @@ typedef struct {
 } nxt_port_msg_get_port_t;
 
 
+/*
+ * A libunit that can handle a refused GET_PORT appends this to the
+ * request.  An older router reads only nxt_port_msg_get_port_t and ignores
+ * it.  An older libunit sends no flags, so it gets no answer: it does not
+ * know the RPC_ERROR answer (nxt_router_get_port_handler()).
+ */
+
+#define NXT_PORT_GET_PORT_ANSWER_REFUSAL  0x1
+
+typedef struct {
+    nxt_port_msg_get_port_t  port;
+    uint32_t                 flags;
+} nxt_port_msg_get_port_ext_t;
+
+
 typedef struct {
     uint32_t            id;
 } nxt_port_msg_get_mmap_t;
