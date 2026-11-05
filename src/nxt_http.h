@@ -274,6 +274,8 @@ struct nxt_http_request_s {
     nxt_queue_link_t                app_link;   /* nxt_app_t.ack_waiting_req */
     nxt_event_engine_t              *engine;
     nxt_work_t                      err_work;
+    nxt_work_t                      requeue_work;
+    nxt_timer_t                     requeue_timer;
 
     nxt_http_response_t             resp;
 

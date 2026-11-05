@@ -97,6 +97,20 @@ typedef struct {
      * nxt_router_app_timeout().
      */
     uint8_t                 claimed_expired;
+
+    /*
+     * Set while the request waits in app->requeue_req for a new process,
+     * retracted after the last one died.  With "timeout": 0 its deadline
+     * then only re-arms, as for a request still in the shared queue.  See
+     * nxt_router_app_timeout().
+     */
+    uint8_t                 requeued;
+
+    /*
+     * How many times nxt_router_app_resend() found the shared queue full
+     * while it sent a retracted request again.
+     */
+    uint16_t                resend_retries;
 } nxt_request_rpc_data_t;
 
 

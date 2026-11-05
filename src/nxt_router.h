@@ -251,6 +251,23 @@ struct nxt_app_s {
     nxt_atomic_t           use_count;
     nxt_queue_t            ack_waiting_req; /* of nxt_http_request_t.app_link */
 
+    /*
+     * Requests taken out of ack_waiting_req when the last process died,
+     * whose engines have not yet decided between a resend and an answer
+     * (nxt_router_app_requeue_handler()).  The last one starts the
+     * replacement process.  While it is nonzero no other start is
+     * admitted: see nxt_router_app_can_start().
+     */
+    nxt_atomic_t           requeue_pending;
+
+    /*
+     * Requests those engines retracted from the shared queue, parked here
+     * until a replacement process registers and they are sent again
+     * (nxt_router_app_resend()).  Linked by nxt_http_request_t.app_link,
+     * with ->app_linked set, as in ack_waiting_req.
+     */
+    nxt_queue_t            requeue_req;
+
     nxt_app_joint_t        *joint;
     nxt_port_t             *shared_port;
     nxt_port_t             *proto_port;
@@ -265,6 +282,14 @@ struct nxt_app_s {
  * for the pending_processes accounting, #214 and #269 -- can call the very
  * predicate the router uses instead of keeping a copy that silently drifts
  * from it.
+ *
+ * No start is admitted while engines are still deciding about the requests
+ * that the last process left unacknowledged (requeue_pending): a new process
+ * could take such a request from the shared queue before its engine
+ * retracts it, and the request would be answered 503 for the dead process
+ * while the new one runs it.  The last of those decisions starts the
+ * replacement on the slot nxt_router_app_port_close() reserved, without
+ * passing this gate.
  */
 
 nxt_inline nxt_bool_t
@@ -275,7 +300,8 @@ nxt_router_app_can_start(nxt_app_t *app)
                + nxt_atomic_load(&app->unaccounted_processes)
            < app->max_processes
             && nxt_atomic_load(&app->pending_processes)
-           < app->max_pending_processes;
+           < app->max_pending_processes
+            && nxt_atomic_load(&app->requeue_pending) == 0;
 }
 
 
@@ -539,6 +565,16 @@ void nxt_router_test_listen_socket_update(nxt_task_t *task,
 /* nxt_router_app_port_get(), for the app-timeout test. */
 void nxt_router_test_app_port_get(nxt_task_t *task, nxt_app_t *app,
     nxt_request_rpc_data_t *req_rpc_data);
+
+/* Process deaths, failed starts and resends, for the app-timeout test. */
+void nxt_router_test_app_port_close(nxt_task_t *task, nxt_port_t *port);
+void nxt_router_test_app_start_failed(nxt_task_t *task, nxt_app_t *app,
+    uint32_t count);
+void nxt_router_test_app_resend_post(nxt_task_t *task, nxt_app_t *app);
+void nxt_router_test_http_request_error(nxt_task_t *task, void *obj,
+    void *data);
+extern nxt_bool_t  nxt_router_test_app_start_hold;
+extern nxt_uint_t  nxt_router_test_app_starts;
 
 /*
  * A request RPC with the router's response handlers, for the app-timeout
