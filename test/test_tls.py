@@ -1947,3 +1947,47 @@ def test_tls_handshake_alert_err_log_level(alert, findall, wait_for_record):
 
     assert wait_for_record(rf'\[error\].*{pattern}') is not None, 'error'
     assert not findall(rf'\[info\].*{pattern}'), 'no info'
+
+
+def test_tls_handshake_stalled_past_idle_timeout(findall):
+    # A client that sends a ClientHello and then stalls keeps the handshake
+    # open.  After "idle_timeout", the router tries to send a 408.  The write
+    # cannot finish before the handshake does, so the router arms the write
+    # timer for 10 seconds.  When it fires, the router must close the
+    # connection, not crash.
+    client.certificate()
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "routes",
+                    "tls": {"certificate": "default"},
+                }
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+            "settings": {"http": {"idle_timeout": 1}},
+        }
+    )
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+    tls = ctx.wrap_bio(incoming, outgoing, server_hostname='localhost')
+
+    with pytest.raises(ssl.SSLWantReadError):
+        tls.do_handshake()
+
+    with socket.create_connection(
+        ('127.0.0.1', port_map.port(8080)), timeout=30
+    ) as sock:
+        sock.sendall(outgoing.read())
+
+        # The idle timeout (1 s) and the response write timer (10 s).
+        time.sleep(13)
+
+    assert not findall(r'exited on signal'), 'router survived'
+    assert client.get_ssl()['status'] == 200, 'router serves'
