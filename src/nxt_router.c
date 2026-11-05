@@ -403,6 +403,8 @@ static void nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app,
     nxt_port_t *port, nxt_apr_action_t action);
 static void nxt_router_app_abandoned_settle(nxt_task_t *task,
     nxt_request_rpc_data_t *req_rpc_data);
+static nxt_bool_t nxt_router_app_start_reserve(nxt_app_t *app,
+    nxt_bool_t *unanswerable);
 static void nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
     nxt_request_rpc_data_t *req_rpc_data);
 static void nxt_router_http_request_error(nxt_task_t *task, void *obj,
@@ -410,6 +412,17 @@ static void nxt_router_http_request_error(nxt_task_t *task, void *obj,
 static void nxt_router_http_request_done(nxt_task_t *task, void *obj,
     void *data);
 
+static void nxt_router_app_requeue_handler(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_app_resend_post(nxt_task_t *task, nxt_app_t *app);
+static void nxt_router_app_resend_handler(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_app_resend_timer_handler(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_app_resend(nxt_task_t *task, nxt_http_request_t *r);
+static nxt_int_t nxt_router_app_queue_send(nxt_task_t *task,
+    nxt_request_rpc_data_t *req_rpc_data, nxt_buf_t *buf, u_char *pos,
+    size_t size);
 static void nxt_router_app_prepare_request(nxt_task_t *task,
     nxt_request_rpc_data_t *req_rpc_data);
 static nxt_buf_t *nxt_router_prepare_msg(nxt_task_t *task,
@@ -1314,6 +1327,19 @@ nxt_router_app_joint_use(nxt_task_t *task, nxt_app_joint_t *app_joint, int i)
 }
 
 
+#if (NXT_TESTS)
+
+/*
+ * src/test/nxt_router_app_timeout_test.c holds every process start: it has
+ * no main process to post the start to.
+ */
+
+nxt_bool_t  nxt_router_test_app_start_hold;
+nxt_uint_t  nxt_router_test_app_starts;
+
+#endif
+
+
 static nxt_int_t
 nxt_router_start_app_process(nxt_task_t *task, nxt_app_t *app)
 {
@@ -1322,6 +1348,14 @@ nxt_router_start_app_process(nxt_task_t *task, nxt_app_t *app)
     nxt_runtime_t  *rt;
 
     nxt_debug(task, "app '%V' start process", &app->name);
+
+#if (NXT_TESTS)
+    /* The start counts as in flight: pending_processes keeps its slot. */
+    if (nxt_router_test_app_start_hold) {
+        nxt_router_test_app_starts++;
+        return NXT_OK;
+    }
+#endif
 
     rt = task->thread->runtime;
     router_port = rt->port_by_type[NXT_PROCESS_ROUTER];
@@ -3577,6 +3611,8 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             nxt_queue_init(&app->spare_ports);
             nxt_queue_init(&app->idle_ports);
             nxt_queue_init(&app->ack_waiting_req);
+            app->requeue_pending = 0;
+            nxt_queue_init(&app->requeue_req);
 
             app->name.length = name.length;
             nxt_memcpy(app->name.start, name.start, name.length);
@@ -4977,6 +5013,42 @@ nxt_router_test_app_port_get(nxt_task_t *task, nxt_app_t *app,
     nxt_request_rpc_data_t *req_rpc_data)
 {
     nxt_router_app_port_get(task, app, req_rpc_data);
+}
+
+
+/*
+ * The death of an application port, the end of a failed start, and the
+ * hand-off of retracted requests to a new process, for the same test.
+ */
+
+void
+nxt_router_test_app_port_close(nxt_task_t *task, nxt_port_t *port)
+{
+    nxt_router_app_port_close(task, port);
+}
+
+
+void
+nxt_router_test_app_start_failed(nxt_task_t *task, nxt_app_t *app,
+    uint32_t count)
+{
+    nxt_router_app_start_failed(task, app, count, 0);
+}
+
+
+void
+nxt_router_test_app_resend_post(nxt_task_t *task, nxt_app_t *app)
+{
+    nxt_router_app_resend_post(task, app);
+}
+
+
+/* The handler a request's err_work runs, for the same test. */
+
+void
+nxt_router_test_http_request_error(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_router_http_request_error(task, obj, data);
 }
 
 #endif
@@ -7157,6 +7229,12 @@ nxt_router_app_port_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
     nxt_thread_mutex_unlock(&app->mutex);
 
+    /*
+     * Requests retracted when the last process died wait for this one: its
+     * first dequeues drop their cancelled entries and free the slots.
+     */
+    nxt_router_app_resend_post(task, app);
+
     nxt_debug(task, "app '%V' new port ready, pid %PI, %uA/%uA",
               &app->name, port->pid,
               nxt_atomic_load(&app->processes),
@@ -7420,6 +7498,34 @@ nxt_router_app_port_error(nxt_task_t *task, nxt_port_recv_msg_t *msg,
  * an OS process behind: nxt_router_app_start_expired().
  */
 
+/*
+ * Takes the first request out of requeue_req, or else out of
+ * ack_waiting_req, for nxt_router_app_start_failed().  Called with
+ * app->mutex held.
+ */
+
+static nxt_queue_link_t *
+nxt_router_app_drain_first(nxt_app_t *app)
+{
+    nxt_queue_t       *queue;
+    nxt_queue_link_t  *link;
+
+    queue = !nxt_queue_is_empty(&app->requeue_req) ? &app->requeue_req
+                                                   : &app->ack_waiting_req;
+
+    if (nxt_queue_is_empty(queue)) {
+        return NULL;
+    }
+
+    link = nxt_queue_first(queue);
+
+    nxt_queue_remove(link);
+    link->next = NULL;
+
+    return link;
+}
+
+
 static void
 nxt_router_app_start_failed(nxt_task_t *task, nxt_app_t *app, uint32_t count,
     nxt_bool_t unaccounted)
@@ -7468,13 +7574,28 @@ nxt_router_app_start_failed(nxt_task_t *task, nxt_app_t *app, uint32_t count,
                              (nxt_atomic_uint_t) count);
     }
 
-    if (nxt_atomic_load(&app->processes) == 0
-        && !nxt_queue_is_empty(&app->ack_waiting_req))
-    {
-        link = nxt_queue_first(&app->ack_waiting_req);
+    /*
+     * Requests retracted when the last process died wait in requeue_req
+     * for a process to register; with none running and this start gone,
+     * they are answered as well.
+     */
 
-        nxt_queue_remove(link);
-        link->next = NULL;
+    if (nxt_atomic_load(&app->processes) == 0) {
+
+        if (nxt_atomic_load(&app->pending_processes) == 0) {
+            link = nxt_router_app_drain_first(app);
+
+        } else if (!nxt_queue_is_empty(&app->ack_waiting_req)) {
+            /*
+             * Another start is still pending: the requests in requeue_req
+             * wait for it.  One request in ack_waiting_req is answered, as
+             * before requeue_req existed.
+             */
+            link = nxt_queue_first(&app->ack_waiting_req);
+
+            nxt_queue_remove(link);
+            link->next = NULL;
+        }
     }
 
     nxt_thread_mutex_unlock(&app->mutex);
@@ -7489,13 +7610,9 @@ nxt_router_app_start_failed(nxt_task_t *task, nxt_app_t *app, uint32_t count,
         nxt_thread_mutex_lock(&app->mutex);
 
         if (nxt_atomic_load(&app->processes) == 0
-            && nxt_atomic_load(&app->pending_processes) == 0
-            && !nxt_queue_is_empty(&app->ack_waiting_req))
+            && nxt_atomic_load(&app->pending_processes) == 0)
         {
-            link = nxt_queue_first(&app->ack_waiting_req);
-
-            nxt_queue_remove(link);
-            link->next = NULL;
+            link = nxt_router_app_drain_first(app);
         }
 
         nxt_thread_mutex_unlock(&app->mutex);
@@ -8119,9 +8236,12 @@ nxt_router_test_app_port_release(nxt_task_t *task, nxt_app_t *app,
 void
 nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
 {
-    nxt_app_t   *app;
-    nxt_port_t  *shared_port;
-    nxt_bool_t  unchain, start_process, detached, rearm;
+    nxt_app_t           *app;
+    nxt_port_t          *shared_port;
+    nxt_bool_t          unchain, start_process, detached, rearm;
+    nxt_uint_t          requeue;
+    nxt_queue_link_t    *link;
+    nxt_http_request_t  *r;
 
     app = port->app;
 
@@ -8199,6 +8319,87 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
         nxt_atomic_fetch_add(&app->pending_processes, 1);
     }
 
+    /*
+     * The last process is gone and nothing else is starting, so no live
+     * worker can hold or take a request of this application.  A request in
+     * ack_waiting_req is then in one of two states, and only its own engine
+     * can tell which (#665):
+     *
+     *   - its message is still in the shared queue, or the dead worker took
+     *     it out but died before its claim CAS: the router's retraction
+     *     succeeds, the application never saw the request; it is parked in
+     *     requeue_req and sent again once the replacement has registered
+     *     (nxt_router_app_port_ready());
+     *   - the dead worker claimed it: the application may have started on
+     *     it, so it is not run again, and it is answered 503 now instead of
+     *     at an acknowledgement deadline.
+     *
+     * The replacement start is held back until every engine has decided:
+     * started earlier, the new worker could claim a message that the
+     * router is about to retract, and the claim would be taken for the dead
+     * worker's.  Meanwhile requeue_pending keeps every other start away:
+     * nxt_router_app_can_start() is false while it is nonzero, whatever
+     * "spare" and max_pending_processes allow.  The slot reserved in
+     * pending_processes above is then the only one, and it is not started
+     * until the last handler runs, so no start can fail and drain the
+     * requests meanwhile.
+     *
+     * A process left behind by an expired start (unaccounted_processes)
+     * may still register at any moment, and nxt_router_app_port_ready()
+     * would let it take messages from the shared queue before the
+     * handlers retract them; its takes would then be counted for the dead
+     * worker.  So the sweep runs only when no such process exists;
+     * otherwise the requests are answered at their acknowledgement
+     * deadline, as before.  No new one can appear during the sweep: the
+     * only pending slot is not started until the sweep ends.
+     */
+
+    requeue = 0;
+
+    if (start_process
+        && nxt_atomic_load(&app->processes) == 0
+        && nxt_atomic_load(&app->pending_processes) == 1
+        && nxt_atomic_load(&app->requeue_pending) == 0
+        && nxt_atomic_load(&app->unaccounted_processes) == 0
+        && !nxt_queue_is_empty(&app->ack_waiting_req))
+    {
+        for (link = nxt_queue_first(&app->ack_waiting_req);
+             link != nxt_queue_tail(&app->ack_waiting_req);
+             link = nxt_queue_next(link))
+        {
+            requeue++;
+        }
+
+        nxt_atomic_fetch_add(&app->requeue_pending, requeue);
+
+        /* One reference for each handler; the last one may start. */
+        nxt_router_app_use(task, app, (int) requeue);
+
+        start_process = 0;
+
+        /*
+         * The handler owns the link's memory pool reference from here, as
+         * the drain in nxt_router_app_start_failed() does.
+         */
+
+        while (!nxt_queue_is_empty(&app->ack_waiting_req)) {
+            link = nxt_queue_first(&app->ack_waiting_req);
+
+            nxt_queue_remove(link);
+            link->next = NULL;
+
+            r = nxt_container_of(link, nxt_http_request_t, app_link);
+
+            r->requeue_work.handler = nxt_router_app_requeue_handler;
+            r->requeue_work.task = r->err_work.task;
+            r->requeue_work.obj = r;
+            r->requeue_work.data = app;
+            r->requeue_work.next = NULL;
+
+            nxt_event_engine_post(r->engine, &r->requeue_work);
+        }
+    }
+
     rearm = 0;
     shared_port = app->shared_port;
     if (shared_port != NULL) {
@@ -8214,6 +8415,11 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
     nxt_thread_mutex_unlock(&app->mutex);
 
     nxt_debug(task, "app '%V' pid %PI closed", &app->name, port->pid);
+
+    if (requeue != 0) {
+        nxt_debug(task, "app '%V': %ui unacknowledged requests to check "
+                  "before a new process starts", &app->name, requeue);
+    }
 
     if (unchain) {
         nxt_port_use(task, port, -1);
@@ -8242,6 +8448,285 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
     if (detached) {
         nxt_router_app_use(task, app, -1);
     }
+}
+
+
+/*
+ * Runs on the request's engine for each request that the death of the last
+ * process left unacknowledged; see nxt_router_app_port_close().
+ *
+ * The rule for running a request again is the retraction, not a guess at
+ * what the dead worker did.  The router's CAS on the queue slot succeeds
+ * only while the tracking word still holds the request's stream, that is,
+ * before any worker's tracking CAS.  Since #889 a worker runs that CAS before
+ * it gives the slot back and before it reads the request, so a successful
+ * retraction proves that the application never saw the request, and
+ * sending it again cannot run it twice, whatever its method.  A failed one
+ * means the dead worker took it; it may have run part of it, so it is
+ * answered 503 and never sent again, even for GET.
+ *
+ * A retracted request is not sent again here.  Its original entry stays in
+ * the shared queue, marked cancelled, until a reader dequeues and drops it,
+ * and no reader exists until the replacement starts; sending now would take
+ * a second slot for each request, and with the queue more than half full
+ * the sends would fail.  The request is parked in app->requeue_req instead,
+ * and nxt_router_app_port_ready() sends it once the replacement has
+ * registered: its first dequeues free the cancelled entries.
+ */
+
+static void
+nxt_router_app_requeue_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_app_t               *app;
+    nxt_bool_t              parked;
+    nxt_http_request_t      *r;
+    nxt_request_rpc_data_t  *req_rpc_data;
+
+    r = obj;
+    app = data;
+
+    parked = 0;
+    req_rpc_data = r->req_rpc_data;
+
+    if (req_rpc_data != NULL && req_rpc_data->msg_info.buf != NULL) {
+
+        if (nxt_router_msg_retract(task, req_rpc_data)) {
+            nxt_debug(task, "stream #%uD: not taken by the last process, "
+                      "to be sent again", req_rpc_data->stream);
+
+            /*
+             * The memory pool reference becomes the park's again.  A
+             * deadline or a client close that comes first finds the request
+             * retracted and answers it, and the unlink takes it out of this
+             * queue as out of ack_waiting_req.
+             */
+
+            req_rpc_data->requeued = 1;
+
+            nxt_thread_mutex_lock(&app->mutex);
+
+            nxt_queue_insert_tail(&app->requeue_req, &r->app_link);
+            nxt_atomic_xchg(&req_rpc_data->app_linked, 1);
+
+            nxt_thread_mutex_unlock(&app->mutex);
+
+            parked = 1;
+
+        } else {
+            nxt_log(task, NXT_LOG_WARN, "app '%V': stream #%uD was taken by "
+                    "a process that died before it acknowledged it; the "
+                    "request is not run again", &app->name,
+                    req_rpc_data->stream);
+
+            nxt_http_request_error(task, r, NXT_HTTP_SERVICE_UNAVAILABLE);
+
+            nxt_request_rpc_data_unlink(task, req_rpc_data);
+        }
+    }
+
+    if (!parked) {
+        nxt_mp_release(r->mem_pool);
+    }
+
+    if (nxt_atomic_fetch_add(&app->requeue_pending, -1) == 1) {
+
+        if (nxt_slow_path(task->thread->engine->shutdown)) {
+            /* Give the reserved start back; its requests are answered. */
+            nxt_router_app_start_failed(task, app, 1, 0);
+
+        } else {
+            nxt_debug(task, "app '%V': unacknowledged requests checked, "
+                      "starting a process", &app->name);
+
+            nxt_router_start_app_process(task, app);
+        }
+    }
+
+    nxt_router_app_use(task, app, -1);
+}
+
+
+/*
+ * Posts every request in app->requeue_req to its own engine to be sent
+ * again.  Called by nxt_router_app_port_ready() once a process has
+ * registered.  Each handler owns the link's memory pool reference, as the
+ * drain in nxt_router_app_start_failed() does.
+ */
+
+static void
+nxt_router_app_resend_post(nxt_task_t *task, nxt_app_t *app)
+{
+    nxt_queue_link_t    *link;
+    nxt_http_request_t  *r;
+
+    for ( ;; ) {
+        nxt_thread_mutex_lock(&app->mutex);
+
+        if (nxt_queue_is_empty(&app->requeue_req)) {
+            nxt_thread_mutex_unlock(&app->mutex);
+            return;
+        }
+
+        link = nxt_queue_first(&app->requeue_req);
+
+        nxt_queue_remove(link);
+        link->next = NULL;
+
+        nxt_thread_mutex_unlock(&app->mutex);
+
+        r = nxt_container_of(link, nxt_http_request_t, app_link);
+
+        r->requeue_work.handler = nxt_router_app_resend_handler;
+        r->requeue_work.task = r->err_work.task;
+        r->requeue_work.obj = r;
+        r->requeue_work.data = NULL;
+        r->requeue_work.next = NULL;
+
+        nxt_event_engine_post(r->engine, &r->requeue_work);
+    }
+}
+
+
+static void
+nxt_router_app_resend_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_router_app_resend(task, obj);
+}
+
+
+static void
+nxt_router_app_resend_timer_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_router_app_resend(task,
+                          nxt_timer_data(obj, nxt_http_request_t,
+                                         requeue_timer));
+}
+
+
+#define NXT_ROUTER_RESEND_RETRY      10      /* ms */
+#define NXT_ROUTER_RESEND_RETRIES    500
+
+
+/*
+ * Sends a retracted request again, on its own engine, with the memory pool
+ * reference that nxt_router_app_resend_post() handed over.
+ *
+ * The request may have been answered meanwhile -- a client close or the
+ * deadline -- and then it has no rpc data any more; the reference is all
+ * that is left to drop.  The request memory stays valid until then, which
+ * is also what keeps the retry timer safe to fire.
+ *
+ * A full queue is not an error here: the replacement frees the cancelled
+ * entries as it reads, so the send is tried again shortly.  Meanwhile the
+ * request is in neither queue and stays retracted, so a deadline answers it
+ * as it would a request still waiting for a process.  Only a queue that
+ * stays full for NXT_ROUTER_RESEND_RETRIES tries gets 503.
+ */
+
+static void
+nxt_router_app_resend(nxt_task_t *task, nxt_http_request_t *r)
+{
+    nxt_int_t               res;
+    nxt_app_t               *app;
+    nxt_buf_t               *buf;
+    nxt_bool_t              unlinked, start_process, unanswerable;
+    nxt_request_rpc_data_t  *req_rpc_data;
+
+    req_rpc_data = r->req_rpc_data;
+
+    if (req_rpc_data == NULL
+        || req_rpc_data->app == NULL
+        || req_rpc_data->app_port == NULL
+        || req_rpc_data->msg_info.buf == NULL)
+    {
+        nxt_mp_release(r->mem_pool);
+        return;
+    }
+
+    app = req_rpc_data->app;
+    buf = req_rpc_data->msg_info.buf;
+
+    nxt_debug(task, "stream #%uD: sent again", req_rpc_data->stream);
+
+    req_rpc_data->msg_info.cancel = NXT_MSG_QUEUED;
+    req_rpc_data->requeued = 0;
+
+    /* The memory pool reference becomes the park's again. */
+
+    start_process = 0;
+    unanswerable = 0;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    nxt_router_app_request_park(app, &r->app_link, req_rpc_data);
+
+    /*
+     * The process that registered may have died again before this ran, and
+     * a start after it may have failed while the request was in neither
+     * queue.  Then nothing would take the message: start a process, as for
+     * a new request.
+     */
+
+    if (nxt_atomic_load(&app->processes) == 0
+        && nxt_atomic_load(&app->pending_processes) == 0)
+    {
+        start_process = nxt_router_app_start_reserve(app, &unanswerable);
+    }
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    res = nxt_router_app_queue_send(task, req_rpc_data, buf, buf->mem.start,
+                                    buf->mem.free - buf->mem.start);
+
+    if (start_process) {
+        nxt_router_start_app_process(task, app);
+    }
+
+    if (nxt_fast_path(res == NXT_OK)) {
+
+        if (nxt_slow_path(unanswerable)) {
+            nxt_router_app_start_failed(task, app, 0, 0);
+        }
+
+        return;
+    }
+
+    nxt_thread_mutex_lock(&app->mutex);
+    unlinked = nxt_router_app_request_unpark(&r->app_link, req_rpc_data);
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    /* Nothing was queued, so there is nothing for a worker to take. */
+    req_rpc_data->msg_info.cancel = NXT_MSG_RETRACTED;
+
+    if (nxt_slow_path(!unlinked)) {
+        /*
+         * The process died again in between and its sweep took the request
+         * and its reference; the request is that handler's now.
+         */
+        return;
+    }
+
+    if (res == NXT_AGAIN
+        && req_rpc_data->resend_retries < NXT_ROUTER_RESEND_RETRIES)
+    {
+        req_rpc_data->resend_retries++;
+        req_rpc_data->requeued = 1;
+
+        nxt_timer_add(task->thread->engine, &r->requeue_timer,
+                      NXT_ROUTER_RESEND_RETRY);
+        return;
+    }
+
+    nxt_alert(task, "stream #%uD, app '%V': failed to send app message "
+              "again", req_rpc_data->stream, &app->name);
+
+    nxt_http_request_error(task, r, (res == NXT_AGAIN)
+                                    ? NXT_HTTP_SERVICE_UNAVAILABLE
+                                    : NXT_HTTP_INTERNAL_SERVER_ERROR);
+
+    nxt_request_rpc_data_unlink(task, req_rpc_data);
+
+    nxt_mp_release(r->mem_pool);
 }
 
 
@@ -8486,6 +8971,42 @@ nxt_router_free_app(nxt_task_t *task, void *obj, void *data)
 }
 
 
+/*
+ * Called with app->mutex held for a request that waits for a process.
+ * Reserves a start in pending_processes when one is needed and tells
+ * whether one will be started.
+ *
+ * "unanswerable" is set when nothing is running, nothing is starting, and
+ * nothing may be started: every "processes" slot is held by a process an
+ * expired start left behind (nxt_router_app_start_expired()).  Only a start
+ * can take a request back out of ack_waiting_req, so a request parked then
+ * would stay there until it timed out; the caller answers it at once.
+ *
+ * Reachable only through unaccounted_processes: with no process and none
+ * pending, nxt_router_app_can_start() is otherwise false only for
+ * "processes": {"max": 0}, which the configuration rejects.
+ */
+
+static nxt_bool_t
+nxt_router_app_start_reserve(nxt_app_t *app, nxt_bool_t *unanswerable)
+{
+    nxt_bool_t  start_process;
+
+    start_process = nxt_router_app_can_start(app)
+                    && nxt_router_app_need_start(app);
+
+    if (start_process) {
+        nxt_atomic_fetch_add(&app->pending_processes, 1);
+    }
+
+    *unanswerable = (!start_process
+                     && nxt_atomic_load(&app->processes) == 0
+                     && nxt_atomic_load(&app->pending_processes) == 0);
+
+    return start_process;
+}
+
+
 static void
 nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
     nxt_request_rpc_data_t *req_rpc_data)
@@ -8494,8 +9015,6 @@ nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
     nxt_port_t          *port;
     nxt_http_request_t  *r;
 
-    start_process = 0;
-
     nxt_thread_mutex_lock(&app->mutex);
 
     port = app->shared_port;
@@ -8503,26 +9022,7 @@ nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
 
     nxt_atomic_fetch_add(&app->active_requests, 1);
 
-    if (nxt_router_app_can_start(app) && nxt_router_app_need_start(app)) {
-        nxt_atomic_fetch_add(&app->pending_processes, 1);
-        start_process = 1;
-    }
-
-    /*
-     * Nothing is running, nothing is starting, and nothing may be started:
-     * every "processes" slot is held by a process an expired start left
-     * behind (nxt_router_app_start_expired()).  Only a start can take a
-     * request back out of ack_waiting_req, so parking this one would leave
-     * it there until it timed out.  Answer it below instead, at once.
-     *
-     * Reachable only through unaccounted_processes: with no process and
-     * none pending, nxt_router_app_can_start() is otherwise false only for
-     * "processes": {"max": 0}, which the configuration rejects.
-     */
-
-    unanswerable = (start_process == 0
-                    && nxt_atomic_load(&app->processes) == 0
-                    && nxt_atomic_load(&app->pending_processes) == 0);
+    start_process = nxt_router_app_start_reserve(app, &unanswerable);
 
     r = req_rpc_data->request;
 
@@ -8625,6 +9125,12 @@ nxt_router_process_http_request(nxt_task_t *task, nxt_http_request_t *r,
     r->timer.log = engine->task.log;
     r->timer.bias = NXT_TIMER_DEFAULT_BIAS;
 
+    r->requeue_timer.task = &engine->task;
+    r->requeue_timer.work_queue = &engine->fast_work_queue;
+    r->requeue_timer.log = engine->task.log;
+    r->requeue_timer.bias = NXT_TIMER_DEFAULT_BIAS;
+    r->requeue_timer.handler = nxt_router_app_resend_timer_handler;
+
     r->engine = engine;
     r->err_work.handler = nxt_router_http_request_error;
     r->err_work.task = task;
@@ -8689,32 +9195,16 @@ static void
 nxt_router_app_prepare_request(nxt_task_t *task,
     nxt_request_rpc_data_t *req_rpc_data)
 {
-    size_t             workers;
-    uint32_t           bound, readers;
-    nxt_atomic_uint_t  processes;
     nxt_app_t          *app;
     nxt_buf_t          *buf, *body;
-    nxt_int_t          res;
-    nxt_port_t         *port, *reply_port;
     nxt_http_status_t  status;
-
-    int                   notify;
-    struct {
-        nxt_port_msg_t       pm;
-        nxt_port_mmap_msg_t  mm;
-    } msg;
-
 
     app = req_rpc_data->app;
 
     nxt_assert(app != NULL);
 
-    port = req_rpc_data->app_port;
-
-    nxt_assert(port != NULL);
-    nxt_assert(port->queue != NULL);
-
-    reply_port = task->thread->engine->port;
+    nxt_assert(req_rpc_data->app_port != NULL);
+    nxt_assert(req_rpc_data->app_port->queue != NULL);
 
     buf = nxt_router_prepare_msg(task, req_rpc_data->request, app,
                                  nxt_app_msg_prefix[app->type], &status);
@@ -8726,7 +9216,7 @@ nxt_router_app_prepare_request(nxt_task_t *task,
 
     nxt_debug(task, "about to send %O bytes buffer to app process port %d",
                     nxt_buf_used_size(buf),
-                    port->socket.fd);
+                    req_rpc_data->app_port->socket.fd);
 
     req_rpc_data->msg_info.buf = buf;
 
@@ -8741,6 +9231,51 @@ nxt_router_app_prepare_request(nxt_task_t *task,
         req_rpc_data->msg_info.body_fd = -1;
     }
 
+    if (nxt_slow_path(nxt_router_app_queue_send(task, req_rpc_data, buf,
+                                                buf->mem.pos,
+                                                nxt_buf_used_size(buf))
+                      != NXT_OK))
+    {
+        nxt_alert(task, "stream #%uD, app '%V': failed to send app message",
+                  req_rpc_data->stream, &app->name);
+
+        nxt_http_request_error(task, req_rpc_data->request,
+                               NXT_HTTP_INTERNAL_SERVER_ERROR);
+    }
+}
+
+
+/*
+ * Puts the REQ_HEADERS message for the request into the application's
+ * shared queue and rings the doorbell.  "pos" and "size" describe the
+ * headers chunk: nxt_router_app_requeue_handler() sends a message again
+ * after the first send moved buf->mem.pos.
+ */
+
+static nxt_int_t
+nxt_router_app_queue_send(nxt_task_t *task,
+    nxt_request_rpc_data_t *req_rpc_data, nxt_buf_t *buf, u_char *pos,
+    size_t size)
+{
+    int                      notify;
+    size_t                   workers;
+    uint32_t                 bound, readers;
+    nxt_int_t                res;
+    nxt_app_t                *app;
+    nxt_port_t               *port, *reply_port;
+    nxt_atomic_uint_t        processes;
+    nxt_port_mmap_header_t   *hdr;
+    nxt_port_mmap_handler_t  *mmap_handler;
+
+    struct {
+        nxt_port_msg_t       pm;
+        nxt_port_mmap_msg_t  mm;
+    } msg;
+
+    app = req_rpc_data->app;
+    port = req_rpc_data->app_port;
+    reply_port = task->thread->engine->port;
+
     msg.pm.stream = req_rpc_data->stream;
     msg.pm.pid = reply_port->pid;
     msg.pm.reply_port = reply_port->id;
@@ -8750,12 +9285,12 @@ nxt_router_app_prepare_request(nxt_task_t *task,
     msg.pm.nf = 0;
     msg.pm.mf = 0;
 
-    nxt_port_mmap_handler_t *mmap_handler = buf->parent;
-    nxt_port_mmap_header_t *hdr = mmap_handler->hdr;
+    mmap_handler = buf->parent;
+    hdr = mmap_handler->hdr;
 
     msg.mm.mmap_id = hdr->id;
-    msg.mm.chunk_id = nxt_port_mmap_chunk_id(hdr, buf->mem.pos);
-    msg.mm.size = nxt_buf_used_size(buf);
+    msg.mm.chunk_id = nxt_port_mmap_chunk_id(hdr, pos);
+    msg.mm.size = size;
 
     /*
      * The counter is loaded atomically: a request engine updates it while
@@ -8835,14 +9370,9 @@ nxt_router_app_prepare_request(nxt_task_t *task,
 
         buf->is_port_mmap_sent = 1;
         buf->mem.pos = buf->mem.free;
-
-    } else {
-        nxt_alert(task, "stream #%uD, app '%V': failed to send app message",
-                  req_rpc_data->stream, &app->name);
-
-        nxt_http_request_error(task, req_rpc_data->request,
-                               NXT_HTTP_INTERNAL_SERVER_ERROR);
     }
+
+    return res;
 }
 
 
@@ -9331,11 +9861,15 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
      * request, which drops its reference to the application, so a
      * reconfiguration can release the application and send QUIT to its
      * prototype (nxt_router_free_app()).
+     *
+     * A request retracted when the last process died and waiting for a new
+     * one in app->requeue_req (nxt_router_app_requeue_handler()) is waiting
+     * for capacity as well, so it is left to wait too.
      */
 
     if (req_rpc_data->app != NULL
         && req_rpc_data->app->timeout == 0
-        && nxt_router_msg_queued(req_rpc_data))
+        && (req_rpc_data->requeued || nxt_router_msg_queued(req_rpc_data)))
     {
         nxt_timer_add(task->thread->engine, timer, NXT_APP_ACK_TIMEOUT);
 
