@@ -2804,7 +2804,7 @@ nxt_h1p_idle_response_timeout(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "h1p idle timeout response timeout");
 
-    c = nxt_read_timer_conn(timer);
+    c = nxt_write_timer_conn(timer);
     c->block_write = 1;
 
     nxt_h1p_shutdown(task, c);
