@@ -240,6 +240,7 @@ struct nxt_app_s {
     nxt_msec_t             start_timeout;
 
     nxt_str_t              *targets;
+    nxt_uint_t             targets_count;
 
     nxt_app_type_t         type:8;
 

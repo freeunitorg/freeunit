@@ -3590,6 +3590,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 
             } else {
                 targets = NULL;
+                n = 0;
             }
 
             nxt_debug(task, "application type: %V", &apcf.type);
@@ -3631,6 +3632,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             app->idle_timeout = apcf.idle_timeout;
 
             app->targets = targets;
+            app->targets_count = (targets != NULL) ? n : 0;
 
             engine = task->thread->engine;
 
@@ -4509,9 +4511,14 @@ nxt_router_application_init(nxt_router_conf_t *rtcf, nxt_str_t *name,
     if (target != NULL && target->length != 0) {
         targets = app->targets;
 
-        for (i = 0; !nxt_strstr_eq(target, &targets[i]); i++);
+        for (i = 0; i < app->targets_count; i++) {
+            if (nxt_strstr_eq(target, &targets[i])) {
+                conf->target = i;
+                return NXT_OK;
+            }
+        }
 
-        conf->target = i;
+        return NXT_DECLINED;
 
     } else {
         conf->target = 0;
