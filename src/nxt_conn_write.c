@@ -13,6 +13,14 @@ static ssize_t nxt_conn_io_sendfile(nxt_task_t *task, nxt_sendbuf_t *sb);
 static ssize_t nxt_sendfile(int fd, int s, off_t pos, size_t size);
 
 
+#if (NXT_TESTS)
+
+/* For src/test/nxt_conn_sendfile_test.c: replaces sendfile(2) when set. */
+ssize_t  (*nxt_conn_test_sendfile)(int fd, int s, off_t pos, size_t size);
+
+#endif
+
+
 void
 nxt_conn_io_write(nxt_task_t *task, void *obj, void *data)
 {
@@ -211,14 +219,22 @@ nxt_conn_io_sendfile(nxt_task_t *task, nxt_sendbuf_t *sb)
 {
     size_t     size;
     ssize_t    n;
+    nxt_off_t  rest;
     nxt_buf_t  *b;
     nxt_err_t  err;
 
     b = sb->buf;
 
-    for ( ;; ) {
-        size = b->file_end - b->file_pos;
+    rest = b->file_end - b->file_pos;
 
+    /*
+     * nxt_conn_io_write() subtracts the result from sb->limit, which is
+     * a size_t.  A larger result wraps the limit, and the write loop then
+     * does not yield to the event loop.
+     */
+    size = ((uint64_t) rest < sb->limit) ? (size_t) rest : sb->limit;
+
+    for ( ;; ) {
         n = nxt_sendfile(b->file->fd, sb->socket, b->file_pos, size);
 
         err = (n == -1) ? nxt_errno : 0;
@@ -271,6 +287,12 @@ static ssize_t
 nxt_sendfile(int fd, int s, off_t pos, size_t size)
 {
     ssize_t  res;
+
+#if (NXT_TESTS)
+    if (nxt_conn_test_sendfile != NULL) {
+        return nxt_conn_test_sendfile(fd, s, pos, size);
+    }
+#endif
 
 #if (NXT_HAVE_MACOSX_SENDFILE)
 
