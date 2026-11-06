@@ -178,6 +178,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_var_escape_test.c \
     src/test/nxt_string_test.c \
     src/test/nxt_memcase_eq_test.c \
+    src/test/nxt_http_fields_table_test.c \
     src/test/nxt_buf_test.c \
     src/test/nxt_h1proto_conn_test.c \
     src/test/nxt_http_chunk_parse_test.c \

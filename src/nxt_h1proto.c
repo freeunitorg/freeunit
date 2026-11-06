@@ -172,7 +172,7 @@ const nxt_http_proto_table_t  nxt_http_proto[3] = {
 };
 
 
-static nxt_lvlhsh_t                    nxt_h1p_fields_hash;
+static nxt_http_fields_hash_t          nxt_h1p_fields_hash;
 
 static nxt_http_field_proc_t           nxt_h1p_fields[] = {
     { nxt_string("Connection"),        &nxt_h1p_connection, 0 },
@@ -202,7 +202,7 @@ static nxt_http_field_proc_t           nxt_h1p_fields[] = {
 };
 
 
-static nxt_lvlhsh_t                    nxt_h1p_peer_fields_hash;
+static nxt_http_fields_hash_t          nxt_h1p_peer_fields_hash;
 
 static nxt_http_field_proc_t           nxt_h1p_peer_fields[] = {
     { nxt_string("Connection"),        &nxt_http_proxy_skip, 0 },

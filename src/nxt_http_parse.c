@@ -19,16 +19,17 @@ static u_char *nxt_http_lookup_field_end(u_char *p, const u_char *end);
 static nxt_int_t nxt_http_parse_field_end(nxt_http_request_parse_t *rp,
     u_char **pos, const u_char *end);
 
-static nxt_int_t nxt_http_field_hash_test(nxt_lvlhsh_query_t *lhq, void *data);
-
-static nxt_int_t nxt_http_field_hash_collision(nxt_lvlhsh_query_t *lhq,
-    void *data);
+static uint16_t nxt_http_fields_hash_key(const nxt_str_t *name);
+static uint32_t nxt_http_fields_hash_place(nxt_http_fields_hash_t *hash,
+    nxt_http_field_proc_t items[], nxt_uint_t count);
 
 
 #define NXT_HTTP_MAX_FIELD_NAME         0xFF
 #define NXT_HTTP_MAX_FIELD_VALUE        NXT_INT32_T_MAX
 
-#define NXT_HTTP_FIELD_LVLHSH_SHIFT     5
+/* The most names in one field table, and the multipliers tried. */
+#define NXT_HTTP_FIELDS_HASH_MAX        4096
+#define NXT_HTTP_FIELDS_HASH_TRIES      1024
 
 
 typedef enum {
@@ -1153,112 +1154,216 @@ done:
 }
 
 
-const nxt_lvlhsh_proto_t  nxt_http_fields_hash_proto  nxt_aligned(64) = {
-    NXT_LVLHSH_BUCKET_SIZE(64),
-    { NXT_HTTP_FIELD_LVLHSH_SHIFT, 0, 0, 0, 0, 0, 0, 0 },
-    nxt_http_field_hash_test,
-    nxt_lvlhsh_alloc,
-    nxt_lvlhsh_free,
-};
+/* The hash that the parser and nxt_unit_field_hash() give for a name. */
 
-
-static nxt_int_t
-nxt_http_field_hash_test(nxt_lvlhsh_query_t *lhq, void *data)
+static uint16_t
+nxt_http_fields_hash_key(const nxt_str_t *name)
 {
-    nxt_http_field_proc_t  *field;
+    u_char      ch;
+    uint32_t    key;
+    nxt_uint_t  i;
 
-    field = data;
+    key = NXT_HTTP_FIELD_HASH_INIT;
 
-    if (nxt_strcasestr_eq(&lhq->key, &field->name)) {
+    for (i = 0; i < name->length; i++) {
+        ch = nxt_lowcase(name->start[i]);
+        key = nxt_http_field_hash_char(key, ch);
+    }
+
+    return (uint16_t) nxt_http_field_hash_end(key);
+}
+
+
+/*
+ * Puts the names in the free slots of "hash" with the multiplier
+ * "hash->mult", and returns the slots a lookup must read then: the most
+ * that a name is away from its first slot, plus one.  Only "proc" is set.
+ */
+
+static uint32_t
+nxt_http_fields_hash_place(nxt_http_fields_hash_t *hash,
+    nxt_http_field_proc_t items[], nxt_uint_t count)
+{
+    uint32_t    i, d, probes;
+    nxt_uint_t  k;
+
+    nxt_memzero(hash->slots, (hash->mask + 1) * sizeof(nxt_http_field_slot_t));
+
+    probes = 1;
+
+    for (k = 0; k < count; k++) {
+        i = nxt_http_fields_hash_slot(hash,
+                                      nxt_http_fields_hash_key(&items[k].name));
+
+        for (d = 1; hash->slots[i].proc != NULL; d++) {
+            i = (i + 1) & hash->mask;
+        }
+
+        hash->slots[i].proc = &items[k];
+
+        probes = nxt_max(probes, d);
+    }
+
+    return probes;
+}
+
+
+/*
+ * Builds the table once per process.  It has the smallest power of two of
+ * slots at or above 2 * count.  The multipliers come from a fixed sequence,
+ * so every process builds the same table, and the first one with the fewest
+ * probes is kept.  A name that is equal to an earlier name, ignoring case,
+ * is refused.  The slots and the folded names are one allocation, which is
+ * never freed.  A table that is already built is refused and kept as it is.
+ */
+
+nxt_int_t
+nxt_http_fields_hash(nxt_http_fields_hash_t *hash,
+    nxt_http_field_proc_t items[], nxt_uint_t count)
+{
+    u_char                 *low;
+    size_t                 size, length;
+    uint16_t               key;
+    uint32_t               i, d, x, bits, best, probes, best_probes;
+    nxt_uint_t             k, t;
+    nxt_http_field_slot_t  *slot;
+
+    if (nxt_slow_path(hash->slots != NULL)) {
+        return NXT_ERROR;
+    }
+
+    nxt_memzero(hash, sizeof(nxt_http_fields_hash_t));
+
+    if (count == 0) {
         return NXT_OK;
     }
 
-    return NXT_DECLINED;
-}
+    if (nxt_slow_path(count > NXT_HTTP_FIELDS_HASH_MAX)) {
+        return NXT_ERROR;
+    }
 
+    for (bits = 1; ((nxt_uint_t) 1 << bits) < 2 * count; bits++) {
+        /* void */
+    }
 
-static nxt_int_t
-nxt_http_field_hash_collision(nxt_lvlhsh_query_t *lhq, void *data)
-{
-    return NXT_OK;
-}
+    /*
+     * The sizes are small: at most 8192 slots, and 4096 names of at most
+     * 255 bytes.  A name must have a length that a field can have.
+     */
 
+    size = ((size_t) 1 << bits) * sizeof(nxt_http_field_slot_t);
 
-nxt_int_t
-nxt_http_fields_hash(nxt_lvlhsh_t *hash,
-    nxt_http_field_proc_t items[], nxt_uint_t count)
-{
-    u_char              ch;
-    uint32_t            key;
-    nxt_str_t           *name;
-    nxt_int_t           ret;
-    nxt_uint_t          i, j;
-    nxt_lvlhsh_query_t  lhq;
+    for (k = 0; k < count; k++) {
+        length = items[k].name.length;
 
-    lhq.replace = 0;
-    lhq.proto = &nxt_http_fields_hash_proto;
-    lhq.pool = NULL;
-
-    for (i = 0; i < count; i++) {
-        key = NXT_HTTP_FIELD_HASH_INIT;
-        name = &items[i].name;
-
-        for (j = 0; j < name->length; j++) {
-            ch = nxt_lowcase(name->start[j]);
-            key = nxt_http_field_hash_char(key, ch);
+        if (nxt_slow_path(length == 0 || length > NXT_HTTP_MAX_FIELD_NAME)) {
+            return NXT_ERROR;
         }
 
-        lhq.key_hash = nxt_http_field_hash_end(key) & 0xFFFF;
-        lhq.key = *name;
-        lhq.value = &items[i];
+        size += 2 * length;
+    }
 
-        ret = nxt_lvlhsh_insert(hash, &lhq);
+    hash->slots = nxt_malloc(size);
+    if (nxt_slow_path(hash->slots == NULL)) {
+        return NXT_ERROR;
+    }
 
-        if (nxt_slow_path(ret != NXT_OK)) {
-            return NXT_ERROR;
+    hash->mask = ((uint32_t) 1 << bits) - 1;
+    hash->shift = 32 - bits;
+
+    /* xorshift32: the multipliers must be odd. */
+
+    x = 0x9e3779b9;
+    best = 0;
+    best_probes = 0;
+
+    for (t = 0; t < NXT_HTTP_FIELDS_HASH_TRIES; t++) {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+
+        hash->mult = x | 1;
+
+        probes = nxt_http_fields_hash_place(hash, items, count);
+
+        if (best_probes == 0 || probes < best_probes) {
+            best = hash->mult;
+            best_probes = probes;
+
+            if (probes == 1) {
+                break;
+            }
         }
     }
 
+    hash->mult = best;
+
+    nxt_memzero(hash->slots, (hash->mask + 1) * sizeof(nxt_http_field_slot_t));
+
+    low = (u_char *) &hash->slots[hash->mask + 1];
+    probes = 1;
+
+    for (k = 0; k < count; k++) {
+        length = items[k].name.length;
+
+        nxt_casefold_set(low, items[k].name.start, length);
+
+        key = nxt_http_fields_hash_key(&items[k].name);
+        i = nxt_http_fields_hash_slot(hash, key);
+
+        for (d = 1; hash->slots[i].proc != NULL; d++) {
+            slot = &hash->slots[i];
+
+            if (slot->hash == key && slot->length == length
+                && nxt_memcase_eq_fold(items[k].name.start, slot->low, length))
+            {
+                nxt_free(hash->slots);
+                nxt_memzero(hash, sizeof(nxt_http_fields_hash_t));
+
+                return NXT_ERROR;
+            }
+
+            i = (i + 1) & hash->mask;
+        }
+
+        slot = &hash->slots[i];
+
+        slot->hash = key;
+        slot->length = (uint8_t) length;
+        slot->low = low;
+        slot->proc = &items[k];
+
+        low += 2 * length;
+        probes = nxt_max(probes, d);
+    }
+
+    hash->probes = probes;
+
     return NXT_OK;
 }
 
 
+/* The names that are not in their first slot. */
+
 nxt_uint_t
-nxt_http_fields_hash_collisions(nxt_lvlhsh_t *hash,
-    nxt_http_field_proc_t items[], nxt_uint_t count, nxt_bool_t level)
+nxt_http_fields_hash_collisions(const nxt_http_fields_hash_t *hash)
 {
-    u_char              ch;
-    uint32_t            key, mask;
-    nxt_str_t           *name;
-    nxt_uint_t          colls, i, j;
-    nxt_lvlhsh_proto_t  proto;
-    nxt_lvlhsh_query_t  lhq;
-
-    proto = nxt_http_fields_hash_proto;
-    proto.test = nxt_http_field_hash_collision;
-
-    lhq.replace = 0;
-    lhq.proto = &proto;
-
-    mask = level ? (1 << NXT_HTTP_FIELD_LVLHSH_SHIFT) - 1 : 0xFFFF;
+    uint32_t               i, first;
+    nxt_uint_t             colls;
+    nxt_http_field_slot_t  *slot;
 
     colls = 0;
 
-    for (i = 0; i < count; i++) {
-        key = NXT_HTTP_FIELD_HASH_INIT;
-        name = &items[i].name;
+    for (i = 0; hash->slots != NULL && i <= hash->mask; i++) {
+        slot = &hash->slots[i];
 
-        for (j = 0; j < name->length; j++) {
-            ch = nxt_lowcase(name->start[j]);
-            key = nxt_http_field_hash_char(key, ch);
+        if (slot->proc == NULL) {
+            continue;
         }
 
-        lhq.key_hash = nxt_http_field_hash_end(key) & mask;
-        lhq.value = &items[i];
+        first = nxt_http_fields_hash_slot(hash, slot->hash);
 
-        if (nxt_lvlhsh_insert(hash, &lhq) == NXT_DECLINED) {
-            colls++;
-        }
+        colls += (first != i);
     }
 
     return colls;
@@ -1267,8 +1372,8 @@ nxt_http_fields_hash_collisions(nxt_lvlhsh_t *hash,
 
 nxt_int_t
 nxt_http_fields_process(nxt_http_field_t *inline_fields,
-    uint8_t num_inline_fields, nxt_list_t *fields, nxt_lvlhsh_t *hash,
-    void *ctx)
+    uint8_t num_inline_fields, nxt_list_t *fields,
+    const nxt_http_fields_hash_t *hash, void *ctx)
 {
     nxt_int_t         ret;
     nxt_http_field_t  *field;
