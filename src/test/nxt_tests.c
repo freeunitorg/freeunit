@@ -289,6 +289,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_h1proto_fields_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_http_chunk_parse_test(thr) != NXT_OK) {
         return 1;
     }

@@ -598,6 +598,40 @@ def test_chunked_invalid():
     ), 'Transfer-Encoding HTTP/1.0'
 
 
+def test_chunked_coding_case():
+    # RFC 9112, 7: transfer coding names are case-insensitive.
+    def post(fields):
+        return client.http(
+            b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+            + fields
+            + b'Connection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n',
+            raw=True,
+        )
+
+    for coding in [b'chunked', b'Chunked', b'CHUNKED', b'cHuNkEd']:
+        resp = post(b'Transfer-Encoding: ' + coding + b'\r\n')
+
+        assert resp['status'] == 200, coding
+        assert resp['body'] == 'hello', coding
+
+    # "chunked" twice, or with Content-Length, is a bad request in any
+    # letter case.
+    resp = post(
+        b'Transfer-Encoding: Chunked\r\nTransfer-Encoding: chunked\r\n'
+    )
+    assert resp['status'] == 400, 'two Transfer-Encoding lines'
+
+    resp = post(b'Transfer-Encoding: CHUNKED\r\nContent-Length: 5\r\n')
+    assert resp['status'] == 400, 'Transfer-Encoding and Content-Length'
+
+    # The value must be one "chunked": a list is not supported, also when
+    # its other element is empty.
+    for coding in [b'chunked,', b'Chunked, ', b'gzip, chunked']:
+        resp = post(b'Transfer-Encoding: ' + coding + b'\r\n')
+
+        assert resp['status'] == 501, coding
+
+
 def test_chunked_split_reads():
     # Each write is delivered to the router as its own read, so it parses
     # buffers that carry only framing bytes -- a chunk-size line, a terminal
