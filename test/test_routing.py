@@ -388,6 +388,44 @@ def test_routes_match_regex_negative_case_sensitive(require):
     assert client.get(url='/BLAH')['status'] == 200, '/BLAH'
 
 
+def test_routes_match_regex_utf8(require):
+    require({'modules': {'regex': True}})
+
+    # "\\x{43f}" is a valid code point only in UTF mode.  Builds with PCRE 1
+    # or PCRE2 before 10.34 match bytes and reject the pattern.
+    if 'success' not in route(
+        {"match": {"uri": "~^/\\x{43f}$"}, "action": {"return": 200}}
+    ):
+        pytest.skip('regex UTF mode is not available')
+
+    assert client.get(url='/%D0%BF')['status'] == 200, 'code point'
+    assert client.get(url='/%D0%B0')['status'] == 404, 'other code point'
+
+    route_match({"uri": "~^/.$"})
+    assert client.get(url='/%D0%BF')['status'] == 200, 'dot'
+    assert client.get(url='/%D0%BF%D0%BF')['status'] == 404, 'dot two'
+
+    route_match({"uri": "~^/[а-я]+$"})
+    assert client.get(url='/%D0%BF%D1%8F')['status'] == 200, 'class'
+    assert client.get(url='/%D0%BFz')['status'] == 404, 'class miss'
+
+    # Invalid UTF-8 in the subject must not make the match fail.
+    route_match({"uri": "~^/.*$"})
+    assert client.get(url='/%FF')['status'] == 404, 'invalid uri'
+    assert client.get(url='/a')['status'] == 200, 'valid uri'
+
+    route_match({"headers": {"x-blah": "~^a.*$"}})
+    assert (
+        client.http(
+            b'GET / HTTP/1.1\r\nHost: localhost\r\nX-Blah: a\xff\r\n'
+            b'Connection: close\r\n\r\n',
+            raw=True,
+            encoding='latin-1',
+        )['status']
+        == 404
+    ), 'invalid header'
+
+
 def test_routes_pass_encode():
     python_dir = f'{option.test_dir}/python'
 
