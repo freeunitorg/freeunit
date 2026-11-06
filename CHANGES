@@ -18,6 +18,17 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        memory error, released an njs VM that was never compiled and crashed
        the router.
 
+    *) Bugfix: the router searched the "Connection" request header for each
+       option as a substring, and in one field line "keep-alive" won over
+       "close". Now an option counts only as a whole token of the
+       comma-separated list, in any letter case (RFC 9110, Section 7.6.1),
+       and "close" wins in any order, also when "keep-alive" is in another
+       field line (RFC 9112, Section 9.6). So "X-Closer" no longer closes
+       the connection, and "Keep-Alive-Extension" no longer keeps an
+       HTTP/1.0 connection open. The "Transfer-Encoding" request header now
+       takes "chunked" in any letter case (RFC 9112, Section 7); before,
+       "Chunked" got 501.
+
     *) Feature: the PHP module now builds with PHP 8.7, which removed five
        members of "sapi_module_struct". The module names the members that it
        sets, so a member that PHP removes no longer shifts the others.

@@ -849,27 +849,85 @@ nxt_h1p_header_buffer_test(nxt_task_t *task, nxt_h1proto_t *h1p, nxt_conn_t *c,
 }
 
 
+/*
+ * The value is a comma-separated list of connection options (RFC 9110,
+ * 7.6.1).  An option is a token in any letter case.  Spaces and tabs around
+ * an element are not part of it, and an empty element is ignored (RFC 9110,
+ * 5.6.1).  Only a whole token is an option: "X-Closer" is not "close".
+ *
+ * "close" closes the connection after the response (RFC 9112, 9.6), also
+ * when the request has "keep-alive".  The handler runs once for each field
+ * line, so connection_close keeps "close" for the elements and the lines
+ * after it.
+ */
+
 static nxt_int_t
 nxt_h1p_connection(void *ctx, nxt_http_field_t *field, uintptr_t data)
 {
-    const u_char        *end;
+    size_t              length;
+    u_char              *p, *end, *start, *last;
+    nxt_h1proto_t       *h1p;
     nxt_http_request_t  *r;
 
     r = ctx;
+    h1p = r->proto.h1;
     field->hopbyhop = 1;
 
-    end = field->value + field->value_length;
+    p = field->value;
+    end = p + field->value_length;
 
-    if (nxt_memcasestrn(field->value, end, "close", 5) != NULL) {
-        r->proto.h1->keepalive = 0;
-    }
+    while (p < end) {
+        start = p;
 
-    if (nxt_memcasestrn(field->value, end, "keep-alive", 10) != NULL) {
-        r->proto.h1->keepalive = 1;
-    }
+        while (p < end && *p != ',') {
+            p++;
+        }
 
-    if (nxt_memcasestrn(field->value, end, "upgrade", 7) != NULL) {
-        r->proto.h1->connection_upgrade = 1;
+        last = p;
+
+        if (p < end) {
+            p++;  /* Skip the comma. */
+        }
+
+        while (start < last && (*start == ' ' || *start == '\t')) {
+            start++;
+        }
+
+        while (last > start && (last[-1] == ' ' || last[-1] == '\t')) {
+            last--;
+        }
+
+        length = last - start;
+
+        switch (length) {
+
+        case nxt_length("close"):
+            if (nxt_memcasecmp(start, "close", length) == 0) {
+                h1p->connection_close = 1;
+                h1p->keepalive = 0;
+            }
+
+            break;
+
+        case nxt_length("upgrade"):
+            if (nxt_memcasecmp(start, "upgrade", length) == 0) {
+                h1p->connection_upgrade = 1;
+            }
+
+            break;
+
+        case nxt_length("keep-alive"):
+            if (nxt_memcasecmp(start, "keep-alive", length) == 0
+                && !h1p->connection_close)
+            {
+                h1p->keepalive = 1;
+            }
+
+            break;
+
+        default:
+            break;
+        }
     }
 
     return NXT_OK;
@@ -925,6 +983,12 @@ nxt_h1p_websocket_version(void *ctx, nxt_http_field_t *field, uintptr_t data)
 }
 
 
+/*
+ * Transfer coding names are case-insensitive (RFC 9112, 7).  The router
+ * decodes only "chunked", so any other value of the field line, a list
+ * included, is unsupported: nxt_h1p_request_body_read() answers it with 501.
+ */
+
 static nxt_int_t
 nxt_h1p_transfer_encoding(void *ctx, nxt_http_field_t *field, uintptr_t data)
 {
@@ -936,7 +1000,7 @@ nxt_h1p_transfer_encoding(void *ctx, nxt_http_field_t *field, uintptr_t data)
     field->hopbyhop = 1;
 
     if (field->value_length == 7
-        && memcmp(field->value, "chunked", 7) == 0)
+        && nxt_memcasecmp(field->value, "chunked", 7) == 0)
     {
         if (r->chunked_field != NULL) {
             return NXT_HTTP_BAD_REQUEST;
@@ -953,6 +1017,30 @@ nxt_h1p_transfer_encoding(void *ctx, nxt_http_field_t *field, uintptr_t data)
 
     return NXT_OK;
 }
+
+
+#if (NXT_TESTS)
+
+/*
+ * For src/test/nxt_h1proto_fields_test.c: the "Connection" and the
+ * "Transfer-Encoding" field handlers, called as the field dispatch calls
+ * them.  r->proto.h1 must point to the h1proto of the request.
+ */
+
+nxt_int_t
+nxt_h1p_test_connection(nxt_http_request_t *r, nxt_http_field_t *field)
+{
+    return nxt_h1p_connection(r, field, 0);
+}
+
+
+nxt_int_t
+nxt_h1p_test_transfer_encoding(nxt_http_request_t *r, nxt_http_field_t *field)
+{
+    return nxt_h1p_transfer_encoding(r, field, 0);
+}
+
+#endif
 
 
 /*
