@@ -75,6 +75,12 @@ static nxt_int_t nxt_http_parse_test_headers(nxt_http_request_parse_t *rp,
     nxt_http_parse_test_data_t *data, nxt_str_t *request, nxt_log_t *log);
 
 
+static const nxt_http_test_field_t  nxt_http_test_headers_carry[] = {
+    { nxt_string("X-Carry"),
+      nxt_string("\xff~\xff~\xff~\xff~\xff~\xff~\xff~\xff~\xff~ ~\xff") },
+};
+
+
 static const nxt_http_test_field_t  nxt_http_test_headers_8[] = {
     { nxt_string("Host"), nxt_string("example.com") },
     { nxt_string("User-Agent"), nxt_string("UnitTester/1.0") },
@@ -447,12 +453,51 @@ static nxt_http_parse_test_case_t  nxt_http_test_cases[] = {
         NXT_HTTP_PARSE_INVALID,
         NULL, { NULL }
     },
-    /* DEL is checked at the end of the line, so the parser asks for more. */
+    /* DEL at the end of the first 8 bytes and at the start of the next 8. */
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host: 0123456\x7f" "89abcdef\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host: 01234567\x7f" "9abcdef\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    /* DEL in the 4-byte tail and in the 1-byte tail of the scan. */
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host: ab\x7f\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host: abcd\x7f\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    /* DEL is rejected when the scan reaches it, before the line ends. */
     {
         nxt_string("GET / HTTP/1.1\r\n"
                    "Host: exa\x7fmple.com"),
-        NXT_AGAIN,
+        NXT_HTTP_PARSE_INVALID,
         NULL, { NULL }
+    },
+    /*
+     * In a word, a carry from a 0xFF byte sets the high bit of a 0x7E byte.
+     * No byte ends the value there, so the scan goes on to the CR.
+     */
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "X-Carry: \xff~\xff~\xff~\xff~\xff~\xff~\xff~\xff~"
+                   "\xff~ ~\xff\r\n"
+                   "\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_headers,
+        { .headers = { 1, nxt_http_test_headers_carry } }
     },
     {
         nxt_string("GET / HTTP/1.1\r\n"

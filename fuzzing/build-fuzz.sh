@@ -12,6 +12,7 @@ make fuzz -j"$(nproc)"
 mkdir -p build/fuzz_basic_seed
 mkdir -p build/fuzz_http_chunk_seed
 mkdir -p build/fuzz_http_controller_seed
+mkdir -p build/fuzz_http_field_value_seed
 mkdir -p build/fuzz_http_h1p_seed
 mkdir -p build/fuzz_http_h1p_peer_seed
 mkdir -p build/fuzz_http_h1p_peer_response_seed
