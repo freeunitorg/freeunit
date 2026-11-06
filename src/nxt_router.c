@@ -217,6 +217,18 @@ static void nxt_router_greet_controller(nxt_task_t *task,
     nxt_port_t *controller_port);
 
 static nxt_int_t nxt_router_start_app_process(nxt_task_t *task, nxt_app_t *app);
+static nxt_int_t nxt_router_start_app_process_post(nxt_task_t *task,
+    nxt_app_t *app);
+static nxt_bool_t nxt_router_app_backoff(nxt_task_t *task, nxt_app_t *app);
+static void nxt_router_app_backoff_arm(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_app_backoff_timeout(nxt_task_t *task, void *obj,
+    void *data);
+static nxt_uint_t nxt_router_app_backoff_reset(nxt_app_t *app);
+static void nxt_router_app_backoff_ended(nxt_task_t *task, nxt_app_t *app,
+    nxt_uint_t ended);
+static void nxt_router_app_backoff_kick(nxt_task_t *task, void *obj,
+    void *data);
 
 static nxt_bool_t nxt_router_msg_from(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, nxt_process_type_t type);
@@ -1346,10 +1358,6 @@ nxt_uint_t  nxt_router_test_app_starts;
 static nxt_int_t
 nxt_router_start_app_process(nxt_task_t *task, nxt_app_t *app)
 {
-    nxt_int_t      res;
-    nxt_port_t     *router_port;
-    nxt_runtime_t  *rt;
-
     nxt_debug(task, "app '%V' start process", &app->name);
 
 #if (NXT_TESTS)
@@ -1359,6 +1367,21 @@ nxt_router_start_app_process(nxt_task_t *task, nxt_app_t *app)
         return NXT_OK;
     }
 #endif
+
+    if (nxt_router_app_backoff(task, app)) {
+        return NXT_OK;
+    }
+
+    return nxt_router_start_app_process_post(task, app);
+}
+
+
+static nxt_int_t
+nxt_router_start_app_process_post(nxt_task_t *task, nxt_app_t *app)
+{
+    nxt_int_t      res;
+    nxt_port_t     *router_port;
+    nxt_runtime_t  *rt;
 
     rt = task->thread->runtime;
     router_port = rt->port_by_type[NXT_PROCESS_ROUTER];
@@ -1381,6 +1404,225 @@ nxt_router_start_app_process(nxt_task_t *task, nxt_app_t *app)
     nxt_router_app_use(task, app, -1);
 
     return NXT_ERROR;
+}
+
+
+/*
+ * The restart back-off (#596).  While the application has rounds of
+ * failures counted, a start waits in backoff_starts for backoff_timer.  It
+ * keeps the pending_processes slot its caller took, so nothing else is
+ * started for it meanwhile.  This wraps every start: a process that closed,
+ * a request with no process, a requeue sweep.  The replay of the starts
+ * that waited for a prototype, in nxt_router_app_port_ready(), is not a new
+ * start and does not come here.
+ *
+ * Answers whether the start was put off.
+ */
+
+static nxt_bool_t
+nxt_router_app_backoff(nxt_task_t *task, nxt_app_t *app)
+{
+    nxt_bool_t  arm;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    if (nxt_atomic_load(&app->backoff_rounds) == 0) {
+        nxt_thread_mutex_unlock(&app->mutex);
+        return 0;
+    }
+
+    app->backoff_starts++;
+
+    /* The first start of a round arms the timer; the others wait with it. */
+    arm = (app->backoff_starts == 1);
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    nxt_debug(task, "app '%V' start process put off", &app->name);
+
+    if (arm) {
+        /* The timer's reference, dropped when it fires. */
+        nxt_router_app_use(task, app, 1);
+
+        if (task->thread->engine == app->engine) {
+            nxt_router_app_backoff_arm(task, app, NULL);
+
+        } else {
+            nxt_event_engine_post(app->engine, &app->backoff_work);
+        }
+    }
+
+    return 1;
+}
+
+
+/* Runs on app->engine. */
+
+static void
+nxt_router_app_backoff_arm(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_app_t   *app;
+    nxt_msec_t  delay;
+
+    app = obj;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    delay = nxt_router_app_backoff_delay(
+                                     nxt_atomic_load(&app->backoff_rounds));
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    nxt_debug(task, "app '%V' starts processes in %M ms", &app->name, delay);
+
+    app->backoff_armed = 1;
+
+    nxt_timer_add(task->thread->engine, &app->backoff_timer, delay);
+}
+
+
+/*
+ * Runs on app->engine.  Starts every process that waited, or gives their
+ * slots back if the router is shutting down.  A /restart while they waited
+ * needs no check here: nxt_router_start_app_process_handler() takes the
+ * generation when it sends the start.
+ */
+
+static void
+nxt_router_app_backoff_timeout(nxt_task_t *task, void *obj, void *data)
+{
+    uint32_t    n;
+    nxt_app_t   *app;
+    nxt_bool_t  alert, shutdown;
+    nxt_msec_t  delay;
+
+    app = nxt_container_of(obj, nxt_app_t, backoff_timer);
+
+    app->backoff_armed = 0;
+
+    shutdown = task->thread->engine->shutdown;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    n = app->backoff_starts;
+    app->backoff_starts = 0;
+
+    delay = nxt_router_app_backoff_delay(
+                                     nxt_atomic_load(&app->backoff_rounds));
+
+    alert = (!shutdown && delay != 0 && !app->backoff_alerted);
+
+    if (alert) {
+        app->backoff_alerted = 1;
+    }
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    if (shutdown) {
+        nxt_router_app_start_failed(task, app, n, 0);
+
+    } else {
+        /*
+         * The alert comes when the first delayed start is due, not when the
+         * process exits.  The router can get the REMOVE_PID of a worker that
+         * stops for a shutdown before its own QUIT.
+         */
+        if (alert) {
+            nxt_alert(task, "app '%V': a process exited before it answered "
+                      "anything; new processes start after a delay, "
+                      "now %M ms", &app->name, delay);
+        }
+
+        while (n > 0) {
+            (void) nxt_router_start_app_process_post(task, app);
+            n--;
+        }
+    }
+
+    nxt_router_app_use(task, app, -1);
+}
+
+
+/*
+ * The application answered, or it was restarted: the back-off ends.  Called
+ * with app->mutex held.  Answers what nxt_router_app_backoff_ended() must do
+ * once the caller has dropped the lock: log the end, and start the processes
+ * that wait for the timer now.
+ */
+
+#define NXT_APP_BACKOFF_LOG   1
+#define NXT_APP_BACKOFF_KICK  2
+
+static nxt_uint_t
+nxt_router_app_backoff_reset(nxt_app_t *app)
+{
+    nxt_uint_t  ended;
+
+    if (nxt_fast_path(nxt_atomic_load(&app->backoff_rounds) == 0)) {
+        return 0;
+    }
+
+    nxt_atomic_store(&app->backoff_rounds, 0);
+
+    ended = app->backoff_alerted ? NXT_APP_BACKOFF_LOG : 0;
+    app->backoff_alerted = 0;
+
+    if (app->backoff_starts != 0 && !app->backoff_kick) {
+        app->backoff_kick = 1;
+        ended |= NXT_APP_BACKOFF_KICK;
+    }
+
+    return ended;
+}
+
+
+static void
+nxt_router_app_backoff_ended(nxt_task_t *task, nxt_app_t *app,
+    nxt_uint_t ended)
+{
+    if (ended & NXT_APP_BACKOFF_LOG) {
+        nxt_log(task, NXT_LOG_NOTICE, "app '%V': new processes start without "
+                "a delay again", &app->name);
+    }
+
+    if (ended & NXT_APP_BACKOFF_KICK) {
+        /* The kick's reference, dropped by the kick. */
+        nxt_router_app_use(task, app, 1);
+
+        if (task->thread->engine == app->engine) {
+            nxt_router_app_backoff_kick(task, app, NULL);
+
+        } else {
+            nxt_event_engine_post(app->engine, &app->backoff_kick_work);
+        }
+    }
+}
+
+
+/*
+ * Runs on app->engine.  The starts that wait for the timer run at once.  A
+ * timer that is not armed yet needs nothing: the post that arms it comes
+ * later and reads the count, which is zero now.
+ */
+
+static void
+nxt_router_app_backoff_kick(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_app_t  *app;
+
+    app = obj;
+
+    nxt_thread_mutex_lock(&app->mutex);
+
+    app->backoff_kick = 0;
+
+    nxt_thread_mutex_unlock(&app->mutex);
+
+    if (app->backoff_armed) {
+        nxt_timer_add(task->thread->engine, &app->backoff_timer, 0);
+    }
+
+    nxt_router_app_use(task, app, -1);
 }
 
 
@@ -2263,6 +2505,7 @@ nxt_router_app_restart_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_app_t            *app;
     nxt_int_t            ret;
     nxt_str_t            app_name;
+    nxt_uint_t           backoff_ended;
     nxt_port_t           *reply_port, *shared_port, *old_shared_port;
     nxt_port_t           *proto_port;
     nxt_port_msg_type_t  reply;
@@ -2319,6 +2562,8 @@ nxt_router_app_restart_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
         app->generation++;
 
+        backoff_ended = nxt_router_app_backoff_reset(app);
+
         shared_port->app = app;
 
         old_shared_port = app->shared_port;
@@ -2327,6 +2572,10 @@ nxt_router_app_restart_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         app->shared_port = shared_port;
 
         nxt_thread_mutex_unlock(&app->mutex);
+
+        if (backoff_ended) {
+            nxt_router_app_backoff_ended(task, app, backoff_ended);
+        }
 
         nxt_port_close(task, old_shared_port);
         nxt_port_use(task, old_shared_port, -1);
@@ -3639,6 +3888,21 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             app->adjust_idle_work.handler = nxt_router_adjust_idle_timer;
             app->adjust_idle_work.task = &engine->task;
             app->adjust_idle_work.obj = app;
+
+            /* No bias: the delay is the shortest wait, not a hint. */
+            app->backoff_timer.bias = 0;
+            app->backoff_timer.work_queue = &engine->fast_work_queue;
+            app->backoff_timer.handler = nxt_router_app_backoff_timeout;
+            app->backoff_timer.task = &engine->task;
+            app->backoff_timer.log = app->backoff_timer.task->log;
+
+            app->backoff_work.handler = nxt_router_app_backoff_arm;
+            app->backoff_work.task = &engine->task;
+            app->backoff_work.obj = app;
+
+            app->backoff_kick_work.handler = nxt_router_app_backoff_kick;
+            app->backoff_kick_work.task = &engine->task;
+            app->backoff_kick_work.obj = app;
 
             nxt_queue_insert_tail(&tmcf->apps, &app->link);
 
@@ -7025,11 +7289,44 @@ static void
 nxt_router_response_error_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
+    nxt_app_t               *app;
+    nxt_uint_t              backoff_ended;
+    nxt_port_t              *port;
     nxt_request_rpc_data_t  *req_rpc_data;
 
     req_rpc_data = data;
 
     req_rpc_data->rpc_cancel = 0;
+
+    /*
+     * An RPC_ERROR that the worker sent is an answer for the restart
+     * back-off (#596).  The router makes its own, with its own pid, when it
+     * fails the RPC: the worker died, or a deadline gave up on it.  The
+     * worker can send it before its acknowledgement, so its port is looked
+     * up by pid and not taken from ->app_port.
+     */
+    app = req_rpc_data->app;
+
+    if (msg->port_msg.type == _NXT_PORT_MSG_RPC_ERROR
+        && msg->port_msg.pid != nxt_pid
+        && app != NULL)
+    {
+        nxt_thread_mutex_lock(&app->mutex);
+
+        port = nxt_port_hash_find(&app->port_hash, msg->port_msg.pid, 0);
+
+        if (port != NULL) {
+            port->app_answered = 1;
+        }
+
+        backoff_ended = nxt_router_app_backoff_reset(app);
+
+        nxt_thread_mutex_unlock(&app->mutex);
+
+        if (backoff_ended) {
+            nxt_router_app_backoff_ended(task, app, backoff_ended);
+        }
+    }
 
     /*
      * The worker is gone, so whatever the router gave up on it is over.  The
@@ -7225,6 +7522,7 @@ nxt_router_app_port_ready(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
     port->app = app;
     port->main_app_port = port;
+    port->app_generation = app->generation;
 
     nxt_atomic_fetch_add(&app->processes, 1);
     nxt_port_hash_add(&app->port_hash, port);
@@ -8126,6 +8424,7 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
 {
     int                inc_use;
     uint32_t           got_response, dec_requests, dec_websockets;
+    nxt_uint_t         backoff_ended;
     nxt_bool_t         adjust_idle_timer;
     nxt_atomic_int_t   req_dec;
     nxt_port_t         *main_app_port;
@@ -8172,12 +8471,22 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
      */
     nxt_assert(dec_websockets == 0 || port->id != NXT_SHARED_PORT_ID);
 
+    backoff_ended = 0;
+
     if (port->id == NXT_SHARED_PORT_ID) {
         nxt_thread_mutex_lock(&app->mutex);
 
         nxt_atomic_fetch_add(&app->active_requests, req_dec);
 
+        if (got_response) {
+            backoff_ended = nxt_router_app_backoff_reset(app);
+        }
+
         nxt_thread_mutex_unlock(&app->mutex);
+
+        if (backoff_ended) {
+            nxt_router_app_backoff_ended(task, app, backoff_ended);
+        }
 
         goto adjust_use;
     }
@@ -8185,6 +8494,12 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     main_app_port = port->main_app_port;
 
     nxt_thread_mutex_lock(&app->mutex);
+
+    /* An answer for the restart back-off (#596). */
+    if (got_response) {
+        main_app_port->app_answered = 1;
+        backoff_ended = nxt_router_app_backoff_reset(app);
+    }
 
     main_app_port->active_requests -= got_response + dec_requests;
     main_app_port->active_websockets -= dec_websockets;
@@ -8199,6 +8514,10 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     adjust_idle_timer = nxt_router_app_port_idle(task, app, main_app_port);
 
     nxt_thread_mutex_unlock(&app->mutex);
+
+    if (backoff_ended) {
+        nxt_router_app_backoff_ended(task, app, backoff_ended);
+    }
 
     if (adjust_idle_timer) {
         nxt_router_app_use(task, app, 1);
@@ -8243,6 +8562,7 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
     nxt_port_t          *shared_port;
     nxt_bool_t          unchain, start_process, detached, rearm;
     nxt_uint_t          requeue;
+    nxt_atomic_uint_t   rounds;
     nxt_queue_link_t    *link;
     nxt_http_request_t  *r;
 
@@ -8314,6 +8634,30 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
         nxt_atomic_fetch_add(&app->detached_processes, -1);
     }
 
+    /*
+     * The restart back-off (#596).  A worker that exits before the router
+     * saw any answer from it is a failure, whether it crashed or was
+     * killed: REMOVE_PID carries only the pid.  Exits while starts already
+     * wait for the timer belong to the same round and are not counted
+     * again.  A worker of an earlier generation exits because of a
+     * /restart, so it is not counted either.
+     */
+
+    if (!port->app_answered
+        && port->app_generation == app->generation
+        && !task->thread->engine->shutdown
+        && app->backoff_starts == 0)
+    {
+        rounds = nxt_atomic_load(&app->backoff_rounds);
+
+        if (rounds < NXT_APP_BACKOFF_ROUNDS) {
+            nxt_atomic_store(&app->backoff_rounds, rounds + 1);
+        }
+
+        nxt_debug(task, "app '%V' pid %PI exited before it answered, "
+                  "round %uA", &app->name, port->pid, rounds + 1);
+    }
+
     start_process = !task->thread->engine->shutdown
                     && nxt_router_app_can_start(app)
                     && nxt_router_app_need_start(app);
@@ -8355,6 +8699,16 @@ nxt_router_app_port_close(nxt_task_t *task, nxt_port_t *port)
      * otherwise the requests are answered at their acknowledgement
      * deadline, as before.  No new one can appear during the sweep: the
      * only pending slot is not started until the sweep ends.
+     *
+     * A start that the restart back-off put off holds a pending slot until
+     * its timer fires (nxt_router_app_backoff()).  While it does, the
+     * reserved slot below is not the only one, and the timer could start
+     * a process in the middle of the sweep.  So the sweep is skipped then,
+     * and the requests are answered at their acknowledgement deadline.
+     * The pending_processes test below already says so: the put-off start
+     * is counted there.  The start that the sweep itself reserves may be
+     * put off too, when its last handler runs; it is the only slot then,
+     * and the requests in requeue_req wait for it.
      */
 
     requeue = 0;
@@ -8946,6 +9300,25 @@ nxt_router_free_app(nxt_task_t *task, void *obj, void *data)
     nxt_assert(nxt_queue_is_empty(&app->ports));
     nxt_assert(nxt_queue_is_empty(&app->spare_ports));
     nxt_assert(nxt_queue_is_empty(&app->idle_ports));
+
+    /*
+     * An armed back-off timer holds an application reference, so it cannot
+     * be armed here.  The delete is the guard: a timer change still queued
+     * would point into the memory pool destroyed below.
+     */
+    nxt_assert(app->backoff_starts == 0);
+
+    /* The removal of the application ends its back-off too. */
+    if (app->backoff_alerted) {
+        nxt_router_app_backoff_ended(task, app, NXT_APP_BACKOFF_LOG);
+    }
+
+    if (nxt_slow_path(nxt_timer_delete(task->thread->engine,
+                                       &app->backoff_timer)))
+    {
+        nxt_alert(task, "app '%V' back-off timer is still pending",
+                  &app->name);
+    }
 
     nxt_port_mmaps_destroy(&app->outgoing, 1);
 

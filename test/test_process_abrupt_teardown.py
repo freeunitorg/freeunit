@@ -145,6 +145,9 @@ def test_process_abrupt_teardown(skip_alert, skip_fds_check):
     # Expected, and in fact asserted on below: this is how the main process
     # reports each kill.
     skip_alert(r'app process \d+ exited on signal 9')
+    # A killed process may not have answered yet; then its replacement waits
+    # and the router logs the back-off alert (#596).
+    skip_alert(r'a process exited before it answered anything')
 
     # Exactly one process, so a kill always removes the only worker and the
     # router has to tear the process down rather than route around it, and so

@@ -496,6 +496,15 @@ struct nxt_port_s {
 
     uint32_t            active_requests;
 
+    /*
+     * For the restart back-off of the application (#596).  app_answered is
+     * set once the router has seen an answer from this worker: a response,
+     * an upgrade, or an RPC_ERROR.  app_generation is the generation of the
+     * application that adopted the worker.  Both change under app->mutex.
+     */
+    uint8_t             app_answered;
+    uint32_t            app_generation;
+
     nxt_port_handler_t  handler;
     nxt_port_handler_t  *data;
 

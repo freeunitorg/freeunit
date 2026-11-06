@@ -103,6 +103,8 @@ def test_respawn_application(skip_alert, unit_pid):
 
     kill_pids(pid)
     skip_alert(fr'process {pid} exited on signal 9')
+    # The killed process had not answered, so its replacement waits (#596).
+    skip_alert(r'a process exited before it answered anything')
 
     assert wait_for_process(client.app_name, unit_pid) is not None
 
