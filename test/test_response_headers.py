@@ -194,6 +194,28 @@ def test_response_headers_name_invalid():
     ), 'valid token name'
 
 
+def test_response_headers_name_reserved():
+    # The body length of a response is set by Unit, so these names are
+    # rejected in any letter case.
+    def check_reserved(name):
+        assert 'error' in client.conf(
+            {name: "10"}, 'routes/0/action/response_headers'
+        ), f'name {name!r} rejected'
+
+    check_reserved("Content-Length")
+    check_reserved("content-length")
+    check_reserved("CONTENT-LENGTH")
+    check_reserved("Transfer-Encoding")
+    check_reserved("transfer-encoding")
+    check_reserved("tRANSFER-eNCODING")
+
+    # Similar names still load.
+    assert 'success' in client.conf(
+        {"Content-Length-X": "v", "X-Transfer-Encoding": "v"},
+        'routes/0/action/response_headers',
+    ), 'similar names accepted'
+
+
 def test_response_headers_value_control():
     # Static values must not carry control bytes (< 0x20 except HTAB, plus
     # DEL 0x7F) -- otherwise a CR/LF in a value splits the response header

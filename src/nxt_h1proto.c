@@ -3644,7 +3644,8 @@ again:
     if (peer->status < 0) {
         length = nxt_buf_mem_used_size(bm);
 
-        if (nxt_slow_path(length < 12)) {
+        /* "HTTP/1.x NNN" and at least the line end. */
+        if (nxt_slow_path(length < 13)) {
             return NXT_AGAIN;
         }
 
@@ -3652,6 +3653,18 @@ again:
 
         if (nxt_slow_path(memcmp(p, "HTTP/1.", 7) != 0
                           || (p[7] != '0' && p[7] != '1')))
+        {
+            return NXT_ERROR;
+        }
+
+        /*
+         * RFC 9112, 4: status-line = HTTP-version SP status-code SP
+         * [ reason-phrase ].  Accept a missing reason phrase, with or
+         * without the second space.
+         */
+        if (nxt_slow_path(p[8] != ' '
+                          || (p[12] != ' ' && p[12] != '\r'
+                              && p[12] != '\n')))
         {
             return NXT_ERROR;
         }
