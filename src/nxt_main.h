@@ -63,6 +63,7 @@ typedef uint16_t                     nxt_port_id_t;
 #include <nxt_fs.h>
 #include <nxt_process.h>
 #include <nxt_utf8.h>
+#include <nxt_punycode.h>
 #include <nxt_file_name.h>
 
 #include <nxt_sprintf.h>

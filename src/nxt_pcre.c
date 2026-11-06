@@ -73,6 +73,13 @@ nxt_regex_compile(nxt_mp_t *mp, nxt_str_t *source, nxt_regex_err_t *err)
     pcre_free = nxt_pcre_free;
     nxt_pcre_mp = mp;
 
+    /*
+     * PCRE 1 has no mode that accepts a subject with invalid UTF-8.  With
+     * PCRE_UTF8 such a subject, for example a header value, makes the match
+     * fail, and PCRE_NO_UTF8_CHECK makes it undefined.  So patterns here
+     * match bytes, not UTF-8 characters.
+     */
+
     re->code = pcre_compile(pattern, 0, &err->msg, &erroffset, NULL);
 
     /*

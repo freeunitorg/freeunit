@@ -30,6 +30,19 @@
  */
 #define NXT_PCRE2_RECURSION_LIMIT  2000
 
+/*
+ * Patterns are compiled in UTF mode, so "." and character classes match
+ * whole UTF-8 characters.  A subject such as a header value may hold any
+ * bytes.  PCRE2_MATCH_INVALID_UTF (PCRE2 10.34) lets such a subject match
+ * or not match instead of failing with an error.  Older versions get no
+ * UTF mode, because there an invalid subject makes the match fail.
+ */
+#if defined(PCRE2_MATCH_INVALID_UTF)
+#define NXT_PCRE2_UTF_OPTIONS  (PCRE2_UTF | PCRE2_MATCH_INVALID_UTF)
+#else
+#define NXT_PCRE2_UTF_OPTIONS  0
+#endif
+
 
 static void *nxt_pcre2_malloc(PCRE2_SIZE size, void *memory_data);
 static void nxt_pcre2_free(void *p, void *memory_data);
@@ -110,7 +123,7 @@ nxt_regex_t *
 nxt_regex_compile(nxt_mp_t *mp, nxt_str_t *source, nxt_regex_err_t *err)
 {
     int                    errcode;
-    uint32_t               options;
+    uint32_t               options, utf;
     nxt_int_t              ret;
     PCRE2_SIZE             erroffset;
     pcre2_code             *code;
@@ -140,8 +153,22 @@ nxt_regex_compile(nxt_mp_t *mp, nxt_str_t *source, nxt_regex_err_t *err)
         goto alloc_fail;
     }
 
-    re->code = pcre2_compile((PCRE2_SPTR) source->start, source->length, 0,
+    /*
+     * A pattern that UTF mode does not accept, such as one with invalid
+     * UTF-8 from an old configuration, is compiled again without it.
+     */
+
+    utf = NXT_PCRE2_UTF_OPTIONS;
+
+    re->code = pcre2_compile((PCRE2_SPTR) source->start, source->length, utf,
                              &errcode, &erroffset, compile_ctx);
+
+    if (re->code == NULL && utf != 0) {
+        utf = 0;
+        re->code = pcre2_compile((PCRE2_SPTR) source->start, source->length,
+                                 0, &errcode, &erroffset, compile_ctx);
+    }
+
     if (nxt_slow_path(re->code == NULL)) {
         goto compile_fail;
     }
@@ -160,7 +187,7 @@ nxt_regex_compile(nxt_mp_t *mp, nxt_str_t *source, nxt_regex_err_t *err)
         && (options & PCRE2_ANCHORED) == 0)
     {
         code = pcre2_compile((PCRE2_SPTR) source->start, source->length,
-                             PCRE2_AUTO_CALLOUT, &errcode, &erroffset,
+                             utf | PCRE2_AUTO_CALLOUT, &errcode, &erroffset,
                              compile_ctx);
         if (nxt_slow_path(code == NULL)) {
             goto compile_fail;

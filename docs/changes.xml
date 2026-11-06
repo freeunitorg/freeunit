@@ -106,6 +106,36 @@ Docker images for Python 3.15.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+route regexes matched bytes, so "." and a character class did not match
+one multibyte UTF-8 character.  With PCRE2 10.34 or later they now match
+in UTF-8 mode.  Invalid UTF-8 in a request matches no pattern item and gives
+no error.  PCRE 1 and older PCRE2 still match bytes.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a Java application got a wrong String for a request header, URI or query
+string with bytes that are not valid UTF-8 or with a 4-byte UTF-8 character.
+Valid UTF-8 is now decoded as UTF-8 and other bytes as ISO-8859-1.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a "host" match pattern written in Unicode, such as "münchen.example", matched
+only a Host header sent as raw UTF-8, not the punycode form a browser sends
+("xn--mnchen-3ya.example").  Each non-ASCII label is now converted to punycode
+once, when the configuration is loaded, so the pattern matches the punycode
+form and no longer the raw one.  A wildcard may be a label of its own but not
+part of a non-ASCII label, and a label over 63 bytes in punycode is refused.
+The pattern must be in lowercase Unicode; only ASCII case is folded.  A
+regular expression pattern is used as written.
+</para>
+</change>
+
 </changes>
 
 

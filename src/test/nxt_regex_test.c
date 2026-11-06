@@ -42,6 +42,13 @@
 #define NXT_REGEX_TEST_LONG_RESULT  NXT_ERROR
 #endif
 
+/* PCRE2 10.34 and later compile patterns in UTF mode. */
+#if (NXT_HAVE_PCRE2 && defined(PCRE2_MATCH_INVALID_UTF))
+#define NXT_REGEX_TEST_UTF  1
+#else
+#define NXT_REGEX_TEST_UTF  0
+#endif
+
 static nxt_int_t nxt_regex_jit_test(nxt_thread_t *thr);
 
 /*
@@ -86,7 +93,8 @@ nxt_regex_test(nxt_thread_t *thr)
 {
     u_char     *subject;
     nxt_mp_t   *mp;
-    nxt_int_t  ret, slow, deep, shallow, starts, anchored;
+    nxt_int_t  ret, slow, deep, shallow, starts, anchored, utf_char,
+               utf_invalid, utf_pattern;
 
     nxt_thread_time_update(thr);
 
@@ -133,6 +141,23 @@ nxt_regex_test(nxt_thread_t *thr)
                                  &anchored);
     }
 
+    /* "\xd0\xbf" is U+043F in UTF-8, "\xff" is never valid UTF-8. */
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "^/.$", (u_char *) "/\xd0\xbf", 3,
+                                 &utf_char);
+    }
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "^/[^/]+$", (u_char *) "/\xff", 2,
+                                 &utf_invalid);
+    }
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "^/\xff$", (u_char *) "/\xff", 2,
+                                 &utf_pattern);
+    }
+
     nxt_mp_destroy(mp);
 
     if (ret != NXT_OK) {
@@ -159,6 +184,23 @@ nxt_regex_test(nxt_thread_t *thr)
     NXT_TEST_CHECK(thr->log, anchored == 0, "regex test: anchored pattern "
                    "on %d bytes returned %i, expected 0",
                    NXT_REGEX_TEST_STARTS + 1, anchored);
+
+    NXT_TEST_CHECK(thr->log, utf_char == NXT_REGEX_TEST_UTF, "regex test: "
+                   "\".\" on a 2-byte UTF-8 character returned %i, "
+                   "expected %i", utf_char, (nxt_int_t) NXT_REGEX_TEST_UTF);
+
+    /*
+     * In UTF mode, invalid UTF-8 in the subject matches no pattern item.
+     * The match must not fail with an error.
+     */
+
+    NXT_TEST_CHECK(thr->log, utf_invalid == !NXT_REGEX_TEST_UTF, "regex "
+                   "test: subject with invalid UTF-8 returned %i, "
+                   "expected %i", utf_invalid,
+                   (nxt_int_t) !NXT_REGEX_TEST_UTF);
+
+    NXT_TEST_CHECK(thr->log, utf_pattern == 1, "regex test: pattern with "
+                   "invalid UTF-8 returned %i, expected 1", utf_pattern);
 
     ret = nxt_regex_jit_test(thr);
     if (ret != NXT_OK) {
