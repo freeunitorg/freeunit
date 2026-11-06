@@ -183,6 +183,15 @@ uses more CPU at startup, and the module is about 150 KB larger.
 </para>
 </change>
 
+<change type="feature">
+<para>
+with "conf_commands": {"Options": "KTLS"} and kernel TLS transmit active, the
+static handler sends a file over TLS with SSL_sendfile().  The file is not
+copied into user space.  Without kernel TLS, the file is read and sent as
+before.  This needs OpenSSL 3.0 or later.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 an application response with status 206 was compressed while it kept its

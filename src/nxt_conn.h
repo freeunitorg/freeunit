@@ -66,6 +66,13 @@ typedef struct {
     ssize_t                       (*sendbuf)(nxt_task_t *task,
                                        nxt_sendbuf_t *sb);
     /*
+     * The sendfile() sends the file buffer at sb->buf.  Only a TLS
+     * connection with kernel TLS transmit sets it.  The static handler
+     * sends a file buffer only to a connection that sets it.
+     */
+    ssize_t                       (*sendfile)(nxt_task_t *task,
+                                       nxt_sendbuf_t *sb);
+    /*
      * The sendbuf() is an interface for OS-specific sendfile
      * implementations or simple writev().
      */
