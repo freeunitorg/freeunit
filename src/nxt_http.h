@@ -42,6 +42,7 @@ typedef enum {
     NXT_HTTP_URI_TOO_LONG = 414,
     NXT_HTTP_RANGE_NOT_SATISFIABLE = 416,
     NXT_HTTP_UPGRADE_REQUIRED = 426,
+    NXT_HTTP_TOO_MANY_REQUESTS = 429,
     NXT_HTTP_REQUEST_HEADER_FIELDS_TOO_LARGE = 431,
 
     NXT_HTTP_TO_HTTPS = 497,
@@ -310,6 +311,8 @@ struct nxt_http_request_s {
     uint8_t                         websocket_handshake;  /* 1 bit */
     uint8_t                         chunked;  /* 1 bit */
     uint8_t                         no_body;  /* 1 bit */
+    /* A "limit_req" counted the request; the next ones skip it. */
+    uint8_t                         limited;  /* 1 bit */
 
     /*
      * After the byte flags, not in front of "fields": a byte there leaves
@@ -370,6 +373,7 @@ typedef enum {
 typedef struct nxt_http_route_s            nxt_http_route_t;
 typedef struct nxt_http_route_rule_s       nxt_http_route_rule_t;
 typedef struct nxt_http_route_addr_rule_s  nxt_http_route_addr_rule_t;
+typedef struct nxt_http_limit_req_s        nxt_http_limit_req_t;
 
 
 typedef struct {
@@ -386,6 +390,7 @@ typedef struct {
     nxt_conf_value_t                *traverse_mounts;
     nxt_conf_value_t                *types;
     nxt_conf_value_t                *fallback;
+    nxt_conf_value_t                *limit_req;
 } nxt_http_action_conf_t;
 
 
@@ -405,6 +410,7 @@ struct nxt_http_action_s {
     nxt_tstr_t                      *rewrite;
     nxt_array_t                     *set_headers;  /* of nxt_http_field_t */
     nxt_http_action_t               *fallback;
+    nxt_http_limit_req_t            *limit_req;
 
     /* Key names in "response_headers", set by nxt_http_set_headers_init(). */
     uint8_t                         set_headers_validators;  /* 1 bit */
@@ -476,6 +482,8 @@ void nxt_http_conn_init(nxt_task_t *task, void *obj, void *data);
 nxt_http_request_t *nxt_http_request_create(nxt_task_t *task);
 void nxt_http_request_error(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_status_t status);
+void nxt_http_request_error_retry_after(nxt_task_t *task,
+    nxt_http_request_t *r, nxt_http_status_t status, uint32_t retry_after);
 void nxt_http_request_read_body(nxt_task_t *task, nxt_http_request_t *r);
 nxt_int_t nxt_http_request_body_alloc(nxt_task_t *task, nxt_http_request_t *r,
     size_t body_length);
@@ -517,6 +525,8 @@ nxt_http_action_t *nxt_http_action_create(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf, nxt_str_t *pass);
 nxt_int_t nxt_http_routes_resolve(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf);
+nxt_http_action_t *nxt_http_route_peek(nxt_task_t *task,
+    nxt_http_request_t *r, nxt_http_action_t *action);
 nxt_int_t nxt_http_pass_segments(nxt_mp_t *mp, nxt_str_t *pass,
     nxt_str_t *segments, nxt_uint_t n);
 nxt_http_action_t *nxt_http_pass_application(nxt_task_t *task,

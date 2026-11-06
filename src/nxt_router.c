@@ -24,6 +24,7 @@
 #include <nxt_span.h>
 #include <nxt_checked.h>
 #include <nxt_http_compression.h>
+#include <nxt_http_limit_req.h>
 #include <nxt_usdt.h>
 
 #if (NXT_HAVE_OTEL)
@@ -681,6 +682,7 @@ nxt_router_start(nxt_task_t *task, nxt_process_data_t *data)
     nxt_queue_init(&router->sockets);
     nxt_queue_init(&router->apps);
     nxt_queue_init(&router->access_logs);
+    nxt_queue_init(&router->limit_zones);
 
     nxt_router = router;
 
@@ -2368,6 +2370,9 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_status_report_t      *report;
     nxt_router_access_log_t  *access_log;
     uint64_t                 access_log_lost;
+    nxt_queue_link_t         *lnk;
+    nxt_http_limit_zone_t    *zone;
+    nxt_status_limit_zone_t  *zone_stat;
 
     port = nxt_runtime_port_find(task->thread->runtime,
                                  msg->port_msg.pid,
@@ -2390,6 +2395,27 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         alloc += sizeof(nxt_status_app_t) + app->name.length;
 
     } nxt_queue_loop;
+
+    /*
+     * The "limit_req" zones of every live configuration, less the ones a
+     * newer configuration replaced.  Only this thread adds or removes one,
+     * so the count holds until the report is filled below.
+     */
+
+    nxt_thread_spin_lock(&nxt_router->lock);
+
+    for (lnk = nxt_queue_first(&nxt_router->limit_zones);
+         lnk != nxt_queue_tail(&nxt_router->limit_zones);
+         lnk = nxt_queue_next(lnk))
+    {
+        zone = nxt_queue_link_data(lnk, nxt_http_limit_zone_t, link);
+
+        if (!zone->superseded) {
+            alloc += sizeof(nxt_status_limit_zone_t) + zone->name.length;
+        }
+    }
+
+    nxt_thread_spin_unlock(&nxt_router->lock);
 
     b = nxt_buf_mem_alloc(port->mem_pool, alloc, 0);
     if (nxt_slow_path(b == NULL)) {
@@ -2480,6 +2506,46 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         report->apps_count++;
         app_stat++;
     } nxt_queue_loop;
+
+    report->limit_zones_count = 0;
+    zone_stat = nxt_status_limit_zones(report);
+
+    nxt_thread_spin_lock(&nxt_router->lock);
+
+    for (lnk = nxt_queue_first(&nxt_router->limit_zones);
+         lnk != nxt_queue_tail(&nxt_router->limit_zones);
+         lnk = nxt_queue_next(lnk))
+    {
+        zone = nxt_queue_link_data(lnk, nxt_http_limit_zone_t, link);
+
+        if (zone->superseded) {
+            continue;
+        }
+
+        p -= zone->name.length;
+
+        nxt_memcpy(p, zone->name.start, zone->name.length);
+
+        zone_stat->name.length = zone->name.length;
+        zone_stat->name.start = (u_char *) (p - b->mem.pos);
+
+        /* The counters change under the zone lock; it nests in ours. */
+
+        nxt_thread_spin_lock(&zone->zone->lock);
+
+        zone_stat->keys = zone->zone->keys_used;
+        zone_stat->keys_max = zone->zone->keys_max;
+        zone_stat->passed = zone->zone->passed;
+        zone_stat->rejected = zone->zone->rejected;
+        zone_stat->evicted = zone->zone->evicted;
+
+        nxt_thread_spin_unlock(&zone->zone->lock);
+
+        report->limit_zones_count++;
+        zone_stat++;
+    }
+
+    nxt_thread_spin_unlock(&nxt_router->lock);
 
     type = NXT_PORT_MSG_RPC_READY_LAST;
 
@@ -2811,6 +2877,8 @@ nxt_router_conf_apply(nxt_task_t *task, void *obj, void *data)
     nxt_queue_add(&router->sockets, &updating_sockets);
     nxt_queue_add(&router->sockets, &creating_sockets);
 
+    nxt_http_limit_req_zones_apply(task, rtcf);
+
     if (router->access_log != rtcf->access_log) {
         nxt_router_access_log_use(&router->lock, rtcf->access_log);
 
@@ -2896,6 +2964,8 @@ nxt_router_conf_ready(nxt_task_t *task, nxt_router_temp_conf_t *tmcf)
 
         nxt_router_access_log_release(task, lock, rtcf->access_log);
 
+        nxt_http_limit_req_zones_release(task, lock, rtcf);
+
         nxt_mp_destroy(rtcf->mem_pool);
     }
 
@@ -2949,6 +3019,8 @@ nxt_router_conf_error(nxt_task_t *task, nxt_router_temp_conf_t *tmcf)
     // TODO: new engines and threads
 
     nxt_router_access_log_release(task, &router->lock, rtcf->access_log);
+
+    nxt_http_limit_req_zones_release(task, &router->lock, rtcf);
 
 #if (NXT_TLS)
     /*
@@ -6361,6 +6433,8 @@ nxt_router_conf_release(nxt_task_t *task, nxt_socket_conf_joint_t *joint)
         nxt_router_apps_hash_use(task, rtcf, -1);
 
         nxt_router_access_log_release(task, lock, rtcf->access_log);
+
+        nxt_http_limit_req_zones_release(task, lock, rtcf);
 
         nxt_tstr_state_release(rtcf->tstr_state);
 

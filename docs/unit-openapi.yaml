@@ -6773,6 +6773,13 @@ components:
         access_log:
           path: "/var/log/unit/access.log"
           lost: 0
+        limit_req:
+          login:
+            keys: 12
+            keys_max: 1024
+            passed: 1288
+            rejected: 19
+            evicted: 0
         telemetry:
           spans:
             exported: 4096
@@ -7957,6 +7964,9 @@ components:
         response_headers:
           $ref: "#/components/schemas/configRouteStepActionResponseHeaders"
 
+        limit_req:
+          $ref: "#/components/schemas/configRouteStepActionLimitReq"
+
     #/config/routes/{stepIndex}/action/proxy
     #/config/routes/{routeName}/{stepIndex}/action/proxy
     configRouteStepActionProxy:
@@ -7976,6 +7986,9 @@ components:
 
         response_headers:
           $ref: "#/components/schemas/configRouteStepActionResponseHeaders"
+
+        limit_req:
+          $ref: "#/components/schemas/configRouteStepActionLimitReq"
 
     #/config/routes/{stepIndex}/action/return
     #/config/routes/{routeName}/{stepIndex}/action/return
@@ -8001,6 +8014,9 @@ components:
 
         response_headers:
           $ref: "#/components/schemas/configRouteStepActionResponseHeaders"
+
+        limit_req:
+          $ref: "#/components/schemas/configRouteStepActionLimitReq"
 
     #/config/routes/{stepIndex}/action/share
     #/config/routes/{routeName}/{stepIndex}/action/share
@@ -8050,6 +8066,9 @@ components:
         response_headers:
           $ref: "#/components/schemas/configRouteStepActionResponseHeaders"
 
+        limit_req:
+          $ref: "#/components/schemas/configRouteStepActionLimitReq"
+
     #/config/routes/{stepIndex}/action/rewrite
     #/config/routes/{routeName}/{stepIndex}/action/rewrite
     configRouteStepActionRewrite:
@@ -8065,6 +8084,54 @@ components:
         action is taken."
       additionalProperties:
         type: string
+
+    #/config/routes/{stepIndex}/action/limit_req
+    #/config/routes/{routeName}/{stepIndex}/action/limit_req
+    configRouteStepActionLimitReq:
+      type: object
+      description: "Limits the rate of requests per client address with a
+        token bucket.  A request above the limit is answered with 429 and a
+        `Retry-After` field.  The client address is the peer of the
+        connection, or the one the listener's `client_ip` option takes from
+        a trusted proxy; IPv6 clients are keyed by their /64.  Every
+        `limit_req` that names one zone must ask the same size, `rate` and
+        `burst`."
+      required:
+        - zone
+        - rate
+      properties:
+        zone:
+          type: string
+          description: "The zone that holds the buckets, as `name` or
+            `name:keys`, where `keys` is the number of client addresses the
+            zone can hold, from 1 to 1048576; the default is 4096.  A zone
+            takes 48 bytes per key plus 4 bytes per hash bucket, the buckets
+            being the power of two at or above `keys`: 208 KiB for the
+            default, 52 MiB at most.  When the arena is full the entry that
+            was used the longest time ago is evicted.  A zone of the
+            same name and size survives a reconfiguration with its buckets
+            and counters; a new size is a new zone."
+
+        rate:
+          type: integer
+          description: "Requests per second one client may make, from 1 to
+            1000000."
+
+        burst:
+          type: integer
+          description: "Requests one client may make at once, from 1 to
+            65535; the default is 1.  The bucket holds `burst` requests and
+            refills at `rate`."
+
+        stage:
+          type: string
+          enum:
+            - headers
+            - body
+          description: "When the limit is applied: `headers` (the default)
+            refuses the request as soon as its header is read, before any
+            body, and closes the connection when a body was announced;
+            `body` counts the request after its body is read."
 
     # /config/listeners/
     configListeners:
@@ -8500,6 +8567,9 @@ components:
         access_log:
           $ref: "#/components/schemas/statusAccessLog"
 
+        limit_req:
+          $ref: "#/components/schemas/statusLimitReq"
+
         telemetry:
           $ref: "#/components/schemas/statusTelemetry"
 
@@ -8617,6 +8687,45 @@ components:
           description: "Records dropped because the record could not be
             built or the write did not complete. Cumulative for the live
             log."
+
+    # /status/limit_req
+    statusLimitReq:
+      description: "The counters of every `limit_req` zone, by zone name.
+        The object is omitted when no zone exists."
+      type: object
+      additionalProperties:
+        $ref: "#/components/schemas/statusLimitReqZone"
+
+    # /status/limit_req/{zoneName}
+    statusLimitReqZone:
+      description: "The counters of one `limit_req` zone.  They survive a
+        reconfiguration that keeps the zone name and size."
+      type: object
+      properties:
+        keys:
+          type: integer
+          description: "Client addresses the zone holds now."
+
+        keys_max:
+          type: integer
+          description: "Client addresses the zone can hold: its size."
+
+        passed:
+          type: integer
+          format: int64
+          description: "Requests the zone let through."
+
+        rejected:
+          type: integer
+          format: int64
+          description: "Requests the zone answered with 429."
+
+        evicted:
+          type: integer
+          format: int64
+          description: "Client addresses dropped to make room for a new one.
+            A rising number means the zone is too small and the limit is
+            inexact."
 
     # /status/telemetry
     statusTelemetry:

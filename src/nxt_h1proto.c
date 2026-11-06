@@ -1814,6 +1814,14 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
             }
         }
 
+        /*
+         * A response marked inconsistent closes the connection after it
+         * (nxt_h1p_request_close); say so, as the client reuses it else.
+         */
+        if (r->inconsistent) {
+            h1p->keepalive = 0;
+        }
+
         if (http11 ^ h1p->keepalive) {
             conn = h1p->keepalive;
         }
