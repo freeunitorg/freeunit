@@ -71,6 +71,16 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        4-byte UTF-8 character. Valid UTF-8 is now decoded as UTF-8 and other
        bytes as ISO-8859-1.
 
+    *) Bugfix: a "host" match pattern written in Unicode, such as
+       "münchen.example", matched only a Host header sent as raw UTF-8, not
+       the punycode form a browser sends ("xn--mnchen-3ya.example"). Each
+       non-ASCII label is now converted to punycode once, when the
+       configuration is loaded, so the pattern matches the punycode form and
+       no longer the raw one. A wildcard may be a label of its own but not
+       part of a non-ASCII label, and a label over 63 bytes in punycode is
+       refused. The pattern must be in lowercase Unicode; only ASCII case is
+       folded. A regular expression pattern is used as written.
+
 
 Changes with FreeUnit 1.37.1                                     30 Oct 2026
 

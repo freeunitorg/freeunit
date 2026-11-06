@@ -756,6 +756,77 @@ def test_routes_match_host_case_insensitive():
     host('EXAMPLE.COM', 200)
 
 
+def test_routes_match_host_idn():
+    # A Unicode host pattern matches the punycode form a client sends.
+    route_match({"host": "münchen.example"})
+
+    host('xn--mnchen-3ya.example', 200)
+    host('XN--MNCHEN-3YA.EXAMPLE', 200)
+    host('xn--mnchen-3ya.example:8080', 200)
+    host('xn--mnchen-3ya.example.', 200)
+    host('muenchen.example', 404)
+    host('www.xn--mnchen-3ya.example', 404)
+
+    # A raw UTF-8 Host, which no browser sends, no longer matches by
+    # byte equality: the pattern is stored in punycode.
+    host('münchen.example', 404)
+
+
+def test_routes_match_host_idn_ascii_case():
+    route_match({"host": "München.Example"})
+
+    host('xn--mnchen-3ya.example', 200)
+
+
+def test_routes_match_host_idn_punycode():
+    route_match({"host": "xn--mnchen-3ya.example"})
+
+    host('xn--mnchen-3ya.example', 200)
+    host('XN--MNCHEN-3YA.example', 200)
+
+
+def test_routes_match_host_idn_mixed_labels():
+    route_match({"host": "münchen.xn--e1afmkfd.example"})
+
+    host('xn--mnchen-3ya.xn--e1afmkfd.example', 200)
+    host('xn--mnchen-3ya.example', 404)
+
+
+def test_routes_match_host_idn_wildcard():
+    route_match({"host": "*.münchen.example"})
+
+    host('www.xn--mnchen-3ya.example', 200)
+    host('a.b.xn--mnchen-3ya.example', 200)
+    host('xn--mnchen-3ya.example', 404)
+
+    route_match({"host": "münchen.*"})
+
+    host('xn--mnchen-3ya.example', 200)
+    host('xn--mnchen-3ya.test', 200)
+    host('www.xn--mnchen-3ya.example', 404)
+
+
+def test_routes_match_host_idn_negative():
+    route_match({"host": ["*.example", "!münchen.example"]})
+
+    host('www.example', 200)
+    host('xn--mnchen-3ya.example', 404)
+
+
+def test_routes_match_host_idn_invalid():
+    # A wildcard inside a non-ASCII label cannot be converted.
+    route_match_invalid({"host": "mün*chen.example"})
+    route_match_invalid({"host": "*ünchen.example"})
+    route_match_invalid({"host": "münchen*.example"})
+    route_match_invalid({"host": "!mün*chen.example"})
+
+    # A label over 63 bytes in punycode.
+    route_match_invalid({"host": "ü" * 60 + ".example"})
+
+    # The same labels are fine when the wildcard is a label of its own.
+    route_match({"host": "*.münchen.example"})
+
+
 def test_routes_match_host_port():
     route_match({"host": "example.com"})
 
