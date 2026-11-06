@@ -1240,7 +1240,6 @@ nxt_openssl_conn_init(nxt_task_t *task, nxt_tls_conf_t *conf, nxt_conn_t *c)
     }
 
     c->io = &nxt_openssl_conn_io;
-    c->sendfile = NXT_CONN_SENDFILE_OFF;
 
     nxt_openssl_conn_handshake(task, c, c->socket.data);
 
