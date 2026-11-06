@@ -115,6 +115,14 @@ no error.  PCRE 1 and older PCRE2 still match bytes.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a Java application got a wrong String for a request header, URI or query
+string with bytes that are not valid UTF-8 or with a 4-byte UTF-8 character.
+Valid UTF-8 is now decoded as UTF-8 and other bytes as ISO-8859-1.
+</para>
+</change>
+
 </changes>
 
 

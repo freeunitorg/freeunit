@@ -66,6 +66,11 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        pattern item and gives no error. PCRE 1 and older PCRE2 still match
        bytes.
 
+    *) Bugfix: a Java application got a wrong String for a request header,
+       URI or query string with bytes that are not valid UTF-8 or with a
+       4-byte UTF-8 character. Valid UTF-8 is now decoded as UTF-8 and other
+       bytes as ISO-8859-1.
+
 
 Changes with FreeUnit 1.37.1                                     30 Oct 2026
 
