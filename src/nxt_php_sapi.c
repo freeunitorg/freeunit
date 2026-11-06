@@ -1517,7 +1517,8 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
 #else
     if (nxt_slow_path(php_request_startup(TSRMLS_C) == FAILURE)) {
 #endif
-        nxt_unit_req_debug(ctx->req, "php_request_startup() failed");
+        nxt_unit_req_alert(ctx->req,
+                           "php_request_startup() failed, the worker exits");
 
 #if (PHP_VERSION_ID >= 80100)
         PG(display_errors) = display_errors;
@@ -1528,7 +1529,18 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
         fclose(fp);
 #endif
 
-        return;
+        /*
+         * The engine left php_request_startup() in the middle of its setup.
+         * There is no valid request to shut down, so nothing resets the state
+         * that the failed setup built, and the next request would start on
+         * top of it.  PHP-FPM ends its child process in this case.  The error
+         * is on the wire already, and the router starts a replacement worker
+         * when the application needs one.  A PHP worker has one thread, so
+         * the exit stops no other script.  SG(server_context) is NULL above,
+         * so a PHP message that is logged on the way out goes to the context
+         * log and not to the released request (nxt_php_log_message()).
+         */
+        exit(1);
     }
 
     /*

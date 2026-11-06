@@ -22,6 +22,16 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        members of "sapi_module_struct". The module names the members that it
        sets, so a member that PHP removes no longer shifts the others.
 
+    *) Bugfix: a PHP worker kept serving after php_request_startup()
+       failed, for example when a multipart request body ran PHP out of
+       memory. The failed request was never shut down, so the next
+       requests ran on top of its state. They got 503 or an empty 200,
+       and with some PHP versions the worker answered 503 to every
+       request until it was replaced. The worker now logs an alert and
+       exits with code 1 after it sends the error, and the router starts
+       a replacement worker when the application needs one. PHP-FPM also
+       ends its child process in this case.
+
     *) Change: the gzip and deflate compressors now use the 32 KiB window
        and memLevel 8, the zlib defaults, instead of a 512-byte window. For
        a response of known length both shrink to fit it, as in nginx.
