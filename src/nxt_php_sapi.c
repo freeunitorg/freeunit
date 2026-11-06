@@ -182,6 +182,7 @@ enum {
     NXT_PHP_SCRIPT_NAME,
     NXT_PHP_SCRIPT_FILENAME,
     NXT_PHP_DOCUMENT_ROOT,
+    NXT_PHP_UNIT_REWRITTEN_PATH,
     NXT_PHP_REQUEST_METHOD,
     NXT_PHP_REQUEST_URI,
     NXT_PHP_QUERY_STRING,
@@ -204,6 +205,7 @@ static const nxt_str_t  nxt_php_server_names[NXT_PHP_SERVER_NVARS] = {
     [NXT_PHP_SCRIPT_NAME] = nxt_string("SCRIPT_NAME"),
     [NXT_PHP_SCRIPT_FILENAME] = nxt_string("SCRIPT_FILENAME"),
     [NXT_PHP_DOCUMENT_ROOT] = nxt_string("DOCUMENT_ROOT"),
+    [NXT_PHP_UNIT_REWRITTEN_PATH] = nxt_string("UNIT_REWRITTEN_PATH"),
     [NXT_PHP_REQUEST_METHOD] = nxt_string("REQUEST_METHOD"),
     [NXT_PHP_REQUEST_URI] = nxt_string("REQUEST_URI"),
     [NXT_PHP_QUERY_STRING] = nxt_string("QUERY_STRING"),
@@ -1951,6 +1953,21 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
 
     nxt_php_set_str(req, NXT_PHP_DOCUMENT_ROOT, ctx->root,
                     track_vars_array TSRMLS_CC);
+
+    /*
+     * Keep the parsed path available even without a rewrite.  Only bypass
+     * PHP's no-op filter: an extension's filter may populate INPUT_SERVER
+     * or change the value registered in $_SERVER.
+     */
+    if (sapi_module.input_filter == php_default_input_filter) {
+        nxt_php_set_cstr(req, NXT_PHP_UNIT_REWRITTEN_PATH,
+                         nxt_unit_sptr_get(&r->path), r->path_length,
+                         track_vars_array TSRMLS_CC);
+
+    } else {
+        nxt_php_set_sptr(req, NXT_PHP_UNIT_REWRITTEN_PATH, &r->path,
+                         r->path_length, track_vars_array TSRMLS_CC);
+    }
 
     nxt_php_set_sptr(req, NXT_PHP_REQUEST_METHOD, &r->method, r->method_length,
                      track_vars_array TSRMLS_CC);

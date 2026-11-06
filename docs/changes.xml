@@ -10,6 +10,16 @@
          date="2026-10-31" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="feature">
+<para>
+PHP exposes the decoded, normalized request path without the query in
+$_SERVER['UNIT_REWRITTEN_PATH'], even without a rewrite.
+After a route rewrite it is the rewritten path.
+REQUEST_URI keeps the original request target.
+See https://github.com/nginx/unit/issues/1615.
+</para>
+</change>
+
 <change type="security">
 <para>
 update Wasmtime, wasmtime-wasi and wasmtime-wasi-http to 48.0.8 for
