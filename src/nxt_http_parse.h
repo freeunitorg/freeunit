@@ -111,6 +111,45 @@ typedef struct {
 } nxt_http_field_proc_t;
 
 
+/*
+ * A slot of nxt_http_fields_hash_t.  "low" holds the name in lower case and
+ * then its fold mask, as nxt_casefold_set() writes them.  A free slot is all
+ * zero: only an empty name with the hash 0 is equal to it, and that finds
+ * no proc, as a name that is not in the table.
+ */
+
+typedef struct {
+    uint16_t                  hash;
+    uint8_t                   length;
+    const u_char              *low;
+    nxt_http_field_proc_t     *proc;
+} nxt_http_field_slot_t;
+
+
+/*
+ * A table of field names, built once by nxt_http_fields_hash() and never
+ * freed.  The table must be all zero when it is built, as a static table
+ * is: nxt_http_fields_hash() refuses a table that is already built, because
+ * a second build would leak the first.  The first slot of the hash "h" is
+ * (h * mult) >> shift.  When it is taken, the name goes to the next free
+ * slot (linear probing).  The multiplier is chosen so that few or no names
+ * leave their first slot.  A lookup reads at most "probes" slots.  A table
+ * that is all zero is empty, and a lookup in it reads no slot.
+ */
+
+struct nxt_http_fields_hash_s {
+    nxt_http_field_slot_t     *slots;
+    uint32_t                  mask;
+    uint32_t                  mult;
+    uint32_t                  shift;
+    uint32_t                  probes;
+};
+
+
+#define nxt_http_fields_hash_slot(hash, key)                                  \
+    (((uint32_t) (key) * (hash)->mult) >> (hash)->shift)
+
+
 typedef struct {
     nxt_mp_t                  *mem_pool;
     uint64_t                  chunk_size;
@@ -229,38 +268,63 @@ nxt_int_t nxt_http_parse_request(nxt_http_request_parse_t *rp,
 nxt_int_t nxt_http_parse_fields(nxt_http_request_parse_t *rp,
     nxt_buf_mem_t *b);
 
-nxt_int_t nxt_http_fields_hash(nxt_lvlhsh_t *hash,
+nxt_int_t nxt_http_fields_hash(nxt_http_fields_hash_t *hash,
     nxt_http_field_proc_t items[], nxt_uint_t count);
-nxt_uint_t nxt_http_fields_hash_collisions(nxt_lvlhsh_t *hash,
-    nxt_http_field_proc_t items[], nxt_uint_t count, nxt_bool_t level);
+nxt_uint_t nxt_http_fields_hash_collisions(const nxt_http_fields_hash_t *hash);
 nxt_int_t nxt_http_fields_process(nxt_http_field_t *inline_fields,
-    uint8_t num_inline_fields, nxt_list_t *fields, nxt_lvlhsh_t *hash,
-    void *ctx);
+    uint8_t num_inline_fields, nxt_list_t *fields,
+    const nxt_http_fields_hash_t *hash, void *ctx);
 
 nxt_int_t nxt_http_parse_complex_target(nxt_http_request_parse_t *rp);
 nxt_buf_t *nxt_http_chunk_parse(nxt_task_t *task, nxt_http_chunk_parse_t *hcp,
     nxt_buf_t *in);
 
 
-extern const nxt_lvlhsh_proto_t  nxt_http_fields_hash_proto;
+/*
+ * The proc of the field name, or NULL.  A slot matches when its hash and
+ * its length are those of the field and the names are equal ignoring case.
+ * The name is compared on every match of the hash: the hash has 16 bits, a
+ * client chooses the names, and an application chooses the hash of each
+ * response field.
+ */
 
-nxt_inline nxt_int_t
-nxt_http_field_process(nxt_http_field_t *field, nxt_lvlhsh_t *hash, void *ctx)
+nxt_inline nxt_http_field_proc_t *
+nxt_http_field_find(const nxt_http_field_t *field,
+    const nxt_http_fields_hash_t *hash)
 {
-    nxt_lvlhsh_query_t     lhq;
-    nxt_http_field_proc_t  *proc;
+    uint32_t               i, n;
+    nxt_http_field_slot_t  *slot;
 
-    lhq.proto = &nxt_http_fields_hash_proto;
+    i = nxt_http_fields_hash_slot(hash, field->hash);
 
-    lhq.key_hash = field->hash;
-    lhq.key.length = field->name_length;
-    lhq.key.start = field->name;
+    for (n = hash->probes; n != 0; n--) {
+        slot = &hash->slots[i];
 
-    if (nxt_lvlhsh_find(hash, &lhq) != NXT_OK) {
-        return NXT_OK;
+        if (slot->hash == field->hash
+            && slot->length == field->name_length
+            && nxt_memcase_eq_fold(field->name, slot->low, slot->length))
+        {
+            return slot->proc;
+        }
+
+        i = (i + 1) & hash->mask;
     }
 
-    proc = lhq.value;
+    return NULL;
+}
+
+
+nxt_inline nxt_int_t
+nxt_http_field_process(nxt_http_field_t *field,
+    const nxt_http_fields_hash_t *hash, void *ctx)
+{
+    nxt_http_field_proc_t  *proc;
+
+    proc = nxt_http_field_find(field, hash);
+
+    if (proc == NULL) {
+        return NXT_OK;
+    }
 
     return proc->handler(ctx, field, proc->data);
 }
