@@ -1,0 +1,28 @@
+[package]
+name = "wasm-bench-load"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "Apache-2.0"
+publish = false
+
+# Same wasmtime crates, versions and features as src/wasm-wasi-component
+# (Cargo.lock is a copy of that crate's lock, so wasmtime is 48.0.8).
+[dependencies]
+anyhow = "1.0.75"
+hyper = "1.4.1"
+wasmtime = { version = "48.0.5", default-features = false, features = ['anyhow', 'component-model', 'cranelift'] }
+wasmtime-wasi = "48.0.5"
+wasmtime-wasi-http = { version = "48.0.5", default-features = false, features = ['p2'] }
+
+[features]
+# Not on in src/wasm-wasi-component: needed only for the "cache" mode.
+cache = ["wasmtime/cache"]
+# Not on in src/wasm-wasi-component either: lets Cranelift compile functions
+# on all cores, as the C API build does.
+parallel = ["wasmtime/parallel-compilation"]
+
+[profile.release]
+panic = 'abort'
+
+[workspace]
