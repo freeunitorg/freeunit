@@ -91,6 +91,13 @@
       "package": "zstd-sys",
       "version": "2.0.9+zstd.1.5.5",
       "reason": "Linked by the Wasmtime 48.0.8 C API as the zstd-sys dependency of zstd-safe (zstd-safe 7.0.0 is pulled in by crates/cache via zstd = { version = \"0.13.0\" }). RUSTSEC-2026-0410 targets arch = [\"wasm32\"] only: a WebAssembly allocator shim that corrupts memory on allocation failure. The FreeUnit build targets native x86_64/aarch64, where the shim is not compiled and the affected code path is unreachable. The source archive is vendored and its Cargo.lock cannot be repaired in-tree, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
+    },
+    {
+      "kind": "unmaintained",
+      "id": "RUSTSEC-2026-0441",
+      "package": "pin-utils",
+      "version": "0.1.0",
+      "reason": "Linked by the Wasmtime 48.0.8 C API through futures-util (pin-utils remains in the archived lock through at least Wasmtime 50.0.1). RUSTSEC-2026-0441 is an unmaintained notice, not a vulnerability: the upstream repository was archived after 0.1.1 with no patched versions. The macros it provides (pin_mut!, unsafe_pinned!) are superseded by core::pin::pin! and pin-project-lite; FreeUnit does not call them. The source archive is vendored, so this exact version cannot be updated independently of the source pin. Recheck and remove this exception at the next pin bump."
     }
   ]
 }
