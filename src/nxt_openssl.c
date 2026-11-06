@@ -34,6 +34,17 @@
 #endif
 
 
+/*
+ * SSL_sendfile() and BIO_get_ktls_send() exist from OpenSSL 3.0, as does
+ * SSL_OP_ENABLE_KTLS.  An OpenSSL built with no-ktls has the option too;
+ * there BIO_get_ktls_send() is always 0.
+ */
+
+#ifdef SSL_OP_ENABLE_KTLS
+#define NXT_OPENSSL_KTLS  1
+#endif
+
+
 typedef struct {
     SSL               *session;
     nxt_conn_t        *conn;
@@ -141,6 +152,10 @@ static ssize_t nxt_openssl_conn_io_recvbuf(nxt_conn_t *c, nxt_buf_t *b);
 static ssize_t nxt_openssl_conn_io_sendbuf(nxt_task_t *task, nxt_sendbuf_t *sb);
 static ssize_t nxt_openssl_conn_io_send(nxt_task_t *task, nxt_sendbuf_t *sb,
     void *buf, size_t size);
+#if (NXT_OPENSSL_KTLS)
+static ssize_t nxt_openssl_conn_io_sendfile(nxt_task_t *task,
+    nxt_sendbuf_t *sb);
+#endif
 static void nxt_openssl_conn_io_shutdown(nxt_task_t *task, void *obj,
     void *data);
 static nxt_int_t nxt_openssl_conn_test_error(nxt_task_t *task, nxt_conn_t *c,
@@ -175,6 +190,24 @@ static nxt_conn_io_t  nxt_openssl_conn_io = {
 
     .shutdown = nxt_openssl_conn_io_shutdown,
 };
+
+
+#if (NXT_OPENSSL_KTLS)
+
+/* A connection gets this table when the kernel encrypts its output. */
+
+static nxt_conn_io_t  nxt_openssl_ktls_conn_io = {
+    .read = nxt_conn_io_read,
+    .recvbuf = nxt_openssl_conn_io_recvbuf,
+
+    .write = nxt_conn_io_write,
+    .sendbuf = nxt_openssl_conn_io_sendbuf,
+    .sendfile = nxt_openssl_conn_io_sendfile,
+
+    .shutdown = nxt_openssl_conn_io_shutdown,
+};
+
+#endif
 
 
 static long  nxt_openssl_version;
@@ -1240,7 +1273,6 @@ nxt_openssl_conn_init(nxt_task_t *task, nxt_tls_conf_t *conf, nxt_conn_t *c)
     }
 
     c->io = &nxt_openssl_conn_io;
-    c->sendfile = NXT_CONN_SENDFILE_OFF;
 
     nxt_openssl_conn_handshake(task, c, c->socket.data);
 
@@ -1313,6 +1345,17 @@ nxt_openssl_conn_handshake(nxt_task_t *task, void *obj, void *data)
     if (ret > 0) {
         /* ret == 1, the handshake was successfully completed. */
         tls->handshake = 1;
+
+#if (NXT_OPENSSL_KTLS)
+        /*
+         * This is the only place that selects the file path.  With kernel
+         * TLS transmit active, a file buffer goes to SSL_sendfile().
+         */
+        if (BIO_get_ktls_send(SSL_get_wbio(tls->session))) {
+            nxt_debug(task, "openssl conn fd:%d: ktls send", c->socket.fd);
+            c->io = &nxt_openssl_ktls_conn_io;
+        }
+#endif
 
         if (c->read_state != NULL) {
             if (state->io_read_handler != NULL || c->read != NULL) {
@@ -1402,8 +1445,9 @@ nxt_openssl_conn_io_recvbuf(nxt_conn_t *c, nxt_buf_t *b)
 static ssize_t
 nxt_openssl_conn_io_sendbuf(nxt_task_t *task, nxt_sendbuf_t *sb)
 {
-    nxt_uint_t    niov;
-    struct iovec  iov;
+    nxt_uint_t          niov;
+    struct iovec        iov;
+    nxt_openssl_conn_t  *tls;
 
     niov = nxt_sendbuf_mem_coalesce0(task, sb, &iov, 1);
 
@@ -1411,8 +1455,84 @@ nxt_openssl_conn_io_sendbuf(nxt_task_t *task, nxt_sendbuf_t *sb)
         return 0;
     }
 
+    if (niov == 0 && sb->buf != NULL && nxt_buf_is_file(sb->buf)) {
+        tls = sb->tls;
+
+        if (tls->conn->io->sendfile != NULL) {
+            return tls->conn->io->sendfile(task, sb);
+        }
+
+        nxt_alert(task, "file buffer on a TLS connection without ktls");
+
+        return NXT_ERROR;
+    }
+
     return nxt_openssl_conn_io_send(task, sb, iov.iov_base, iov.iov_len);
 }
+
+
+#if (NXT_OPENSSL_KTLS)
+
+static ssize_t
+nxt_openssl_conn_io_sendfile(nxt_task_t *task, nxt_sendbuf_t *sb)
+{
+    size_t              size;
+    ossl_ssize_t        n;
+    nxt_err_t           err;
+    nxt_off_t           rest;
+    nxt_buf_t           *b;
+    nxt_int_t           ret;
+    nxt_conn_t          *c;
+    nxt_openssl_conn_t  *tls;
+
+    tls = sb->tls;
+    b = sb->buf;
+
+    rest = b->file_end - b->file_pos;
+
+    /* nxt_conn_io_write() subtracts the result from sb->limit. */
+    size = ((uint64_t) rest < sb->limit) ? (size_t) rest : sb->limit;
+
+    n = SSL_sendfile(tls->session, b->file->fd, b->file_pos, size, 0);
+
+    err = (n <= 0) ? nxt_socket_errno : 0;
+
+    nxt_debug(task, "SSL_sendfile(%d, %FD, @%O, %uz): %z err:%d",
+              sb->socket, b->file->fd, b->file_pos, size, (ssize_t) n, err);
+
+    /*
+     * A short count is not an EAGAIN.  The write loop calls again, and
+     * a full socket then gives SSL_ERROR_WANT_WRITE.
+     */
+    if (n > 0) {
+        return n;
+    }
+
+    if (nxt_slow_path(n == 0)) {
+        nxt_alert(task, "SSL_sendfile() reported that file was truncated "
+                  "at %O", b->file_pos);
+
+        return NXT_ERROR;
+    }
+
+    c = tls->conn;
+    c->socket.write_ready = sb->ready;
+
+    ret = nxt_openssl_conn_test_error(task, c, -1, err, NXT_OPENSSL_WRITE);
+
+    sb->ready = c->socket.write_ready;
+
+    if (ret == NXT_ERROR) {
+        sb->error = c->socket.error;
+        nxt_openssl_conn_error(task, err, "SSL_sendfile(%d, %FD, @%O, %uz) "
+                               "failed", sb->socket, b->file->fd, b->file_pos,
+                               size);
+    }
+
+    return ret;
+}
+
+#endif
 
 
 static ssize_t

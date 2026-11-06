@@ -127,6 +127,7 @@ nxt_int_t nxt_port_share_test(nxt_thread_t *thr);
 nxt_int_t nxt_cloexec_test(nxt_thread_t *thr);
 nxt_int_t nxt_checked_test(nxt_thread_t *thr);
 nxt_int_t nxt_conn_close_test(nxt_thread_t *thr);
+nxt_int_t nxt_conn_sendfile_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_response_parse_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_frag_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_release_test(nxt_thread_t *thr);
