@@ -3778,6 +3778,8 @@ nxt_conf_vldt_response_header(nxt_conf_validation_t *vldt, nxt_str_t *name,
     nxt_uint_t  type;
 
     static const nxt_str_t  content_length = nxt_string("Content-Length");
+    static const nxt_str_t  transfer_encoding =
+                                          nxt_string("Transfer-Encoding");
 
     if (name->length == 0) {
         return nxt_conf_vldt_error(vldt, "The response header name "
@@ -3791,9 +3793,16 @@ nxt_conf_vldt_response_header(nxt_conf_validation_t *vldt, nxt_str_t *name,
                                          name);
     }
 
-    if (nxt_strstr_eq(name, &content_length)) {
-        return nxt_conf_vldt_error(vldt, "The \"Content-Length\" response "
-                                         "header value is not supported");
+    /*
+     * Header names are case-insensitive, so compare them that way.  The
+     * message body length of a response is set by Unit itself, so the
+     * fields that describe it can not be set here.
+     */
+    if (nxt_strcasestr_eq(name, &content_length)
+        || nxt_strcasestr_eq(name, &transfer_encoding))
+    {
+        return nxt_conf_vldt_error(vldt, "The \"%V\" response header "
+                                         "value is not supported", name);
     }
 
     type = nxt_conf_type(value);
