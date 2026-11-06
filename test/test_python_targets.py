@@ -103,3 +103,46 @@ def test_python_targets_prefix():
     check_prefix('/api/', '/api /')
     check_prefix('/apis', 'No Script Name /apis')
     check_prefix('/api/users/', '/api /users/')
+
+
+def test_python_targets_lookup_bound():
+    python_dir = f'{option.test_dir}/python'
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "routes"}},
+            "routes": [
+                {
+                    "action": {"pass": "applications/targets/$arg_t"},
+                },
+            ],
+            "applications": {
+                "targets": {
+                    "type": client.get_application_type(),
+                    "working_directory": f'{python_dir}/targets/',
+                    "path": f'{python_dir}/targets/',
+                    "targets": {
+                        "1": {
+                            "module": "wsgi",
+                            "callable": "wsgi_target_a",
+                        },
+                        "2": {
+                            "module": "wsgi",
+                            "callable": "wsgi_target_b",
+                        },
+                    },
+                }
+            },
+        }
+    )
+
+    resp = client.get(url='/?t=missing')
+    assert resp['status'] == 404, 'missing target'
+
+    resp = client.get(url='/?t=1')
+    assert resp['status'] == 200, 'known target after miss'
+    assert resp['body'] == '1'
+
+    assert 'error' in client.conf(
+        {"pass": "applications/targets/missing"}, 'listeners/*:8080'
+    ), 'unknown static target'
