@@ -4,6 +4,7 @@ import re
 import pytest
 
 from unit.applications.lang.node import ApplicationNode
+from unit.log import Log
 from unit.utils import waitforfiles
 
 prerequisites = {'modules': {'node': 'all'}}
@@ -442,3 +443,33 @@ def test_node_application_write_multiple():
     client.load('write_multiple')
 
     assert client.get()['body'] == 'writewrite2end', 'write multiple'
+
+
+def test_node_application_header_name_long(wait_for_record):
+    client.load('header_name_long')
+
+    for length in (255, 256, 300):
+        resp = client.get(
+            headers={
+                'Host': 'localhost',
+                'X-Length': str(length),
+                'Connection': 'close',
+            }
+        )
+
+        if length <= 255:
+            assert resp['status'] == 200, f'status {length}'
+            assert resp['headers']['X' * length] == 'value', f'header {length}'
+            continue
+
+        assert resp['status'] == 503, f'status {length}'
+        assert (
+            'X' * (length % 256) not in resp['headers']
+        ), f'no cut name {length}'
+        assert resp['body'] != 'body', f'no application body {length}'
+        assert (
+            wait_for_record(r'\[error\].+name is too long') is not None
+        ), f'error log {length}'
+        with Log.open() as f:
+            f.read()
+            Log.set_pos(f.tell())

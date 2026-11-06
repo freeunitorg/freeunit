@@ -1760,6 +1760,25 @@ nxt_php_send_headers(sapi_headers_struct *sapi_headers TSRMLS_DC)
          h = zend_llist_get_next_ex(&sapi_headers->headers, &zpos))
     {
         resp_size += h->header_len;
+
+        /*
+         * libunit stores the name length in a uint8_t: a longer name would
+         * go out cut to its length modulo 256.  Answer 500 instead.  Output
+         * is disabled after SAPI_HEADER_SEND_FAILED, so the body is empty.
+         */
+        colon = memchr(h->header, ':', h->header_len);
+        if (nxt_slow_path(colon != NULL
+                          && (size_t) (colon - h->header) > UINT8_MAX))
+        {
+            nxt_unit_req_error(req, "response header name is too long "
+                               "(%zu bytes, the limit is %d)",
+                               (size_t) (colon - h->header), UINT8_MAX);
+
+            (void) nxt_unit_response_init(req, NXT_HTTP_INTERNAL_SERVER_ERROR,
+                                          0, 0);
+
+            return SAPI_HEADER_SEND_FAILED;
+        }
     }
 
     status = SG(sapi_headers).http_response_code;

@@ -6,6 +6,7 @@ from packaging import version
 
 from unit import port as port_map
 from unit.applications.lang.python import ApplicationPython
+from unit.log import Log
 
 prerequisites = {
     'modules': {'python': lambda v: version.parse(v) >= version.parse('3.5')}
@@ -555,3 +556,33 @@ def test_asgi_application_legacy_force():
     )
 
     assert resp['status'] == 200, 'status'
+
+
+def test_asgi_application_header_name_long(wait_for_record):
+    client.load('header_name_long')
+
+    for length in (255, 256, 300):
+        resp = client.get(
+            headers={
+                'Host': 'localhost',
+                'X-Length': str(length),
+                'Connection': 'close',
+            }
+        )
+
+        if length <= 255:
+            assert resp['status'] == 200, f'status {length}'
+            assert resp['headers']['x' * length] == 'value', f'header {length}'
+            continue
+
+        assert resp['status'] == 503, f'status {length}'
+        assert (
+            'x' * (length % 256) not in resp['headers']
+        ), f'no cut name {length}'
+        assert resp['body'] != 'body', f'no application body {length}'
+        assert (
+            wait_for_record(r'\[error\].+name is too long') is not None
+        ), f'error log {length}'
+        with Log.open() as f:
+            f.read()
+            Log.set_pos(f.tell())
