@@ -58,6 +58,13 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        the static handler, the application or "response_headers", although a
        coded body is never served in ranges. It is removed now, as in nginx.
 
+    *) Bugfix: a response header name longer than 255 bytes from a Python,
+       PHP, Perl or Node.js application went out cut to its length modulo
+       256, with no log line; a 300-byte name became a 44-byte one. Such a
+       response now fails, with an error in the log: 500 from PHP, 503 from
+       the others. The Ruby, Java, Go and WebAssembly modules already
+       refused such a name.
+
     *) Feature: Docker images for Python 3.15.
 
 

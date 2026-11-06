@@ -1079,6 +1079,18 @@ Unit::response_send_headers(napi_env env, napi_callback_info info)
                 throw exception("Response headers buffer overflow");
             }
 
+            /*
+             * nxt_unit_field_t stores the name length in a uint8_t: a longer
+             * name would go out cut to its length modulo 256.
+             */
+            if (name_len > UINT8_MAX) {
+                nxt_unit_req_error(req, "Response header name is too long "
+                                   "(%zu bytes, the limit is %d)",
+                                   name_len, UINT8_MAX);
+
+                throw exception("Response header name is too long");
+            }
+
             name_ptr = ptr;
 
             ptr += name_len + 1;
