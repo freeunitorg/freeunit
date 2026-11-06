@@ -24,6 +24,10 @@ on:
       - 'auto/**'
       - 'fuzzing/**'
       - '.github/workflows/fuzzing.yml'
+  # A pull request fuzzes each target for 15 seconds, a smoke run of every
+  # harness.  The nightly run gives each target the full 60 seconds.
+  schedule:
+    - cron: '53 2 * * *'
   workflow_dispatch:
     inputs:
       seconds:
@@ -100,10 +104,12 @@ jobs:
       # subset per changed path was tried and dropped: every path filter above
       # already maps to a target, `fuzzing/**` maps to all of them, and a
       # target left out of the list is a harness that CI compiles but never
-      # runs.  At about 61 seconds each the whole set is close to ten minutes.
+      # runs.  At about 61 seconds each the whole set is close to ten minutes;
+      # a pull request gives each target 15 seconds, about three minutes in
+      # all, and the nightly run and a dispatch keep 60.
       - name: Run the fuzzers
         env:
-          FUZZ_SECONDS: ${{ github.event.inputs.seconds || '60' }}
+          FUZZ_SECONDS: ${{ github.event.inputs.seconds || (github.event_name == 'pull_request' && '15' || '60') }}
           FUZZ_TARGETS: ${{ github.event.inputs.targets }}
         run: |
           # shellcheck disable=SC2086  # deliberate word splitting

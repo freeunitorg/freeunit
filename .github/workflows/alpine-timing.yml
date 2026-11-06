@@ -11,9 +11,25 @@ name: "Alpine timing and word size"
 # finds the router and controller by title.
 
 on:
+  # Only the paths that change what these jobs build or run.  The nightly
+  # run has no path filter.
   pull_request:
+    paths:
+      - configure
+      - 'auto/**'
+      - 'src/**'
+      - 'test/**'
+      - '.github/scripts/alpine-timing.sh'
+      - '.github/workflows/alpine-timing.yml'
   push:
     branches: [ master ]
+    paths:
+      - configure
+      - 'auto/**'
+      - 'src/**'
+      - 'test/**'
+      - '.github/scripts/alpine-timing.sh'
+      - '.github/workflows/alpine-timing.yml'
   schedule:
     - cron: '41 3 * * *'
   workflow_dispatch:
