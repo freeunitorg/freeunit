@@ -244,6 +244,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_app_queue_test.c \
     src/test/nxt_size_bound_test.c \
     src/test/nxt_casecmp_test.c \
+    src/test/nxt_http_field_end_test.c \
     src/test/nxt_cpu_limit_test.c \
     src/test/nxt_process_nofile_test.c \
     src/test/nxt_usdt_test.c \
@@ -396,6 +397,7 @@ NXT_FUZZ_SRCS=" \
     fuzzing/nxt_basic_fuzz.c \
     fuzzing/nxt_http_chunk_fuzz.c \
     fuzzing/nxt_http_controller_fuzz.c \
+    fuzzing/nxt_http_field_value_fuzz.c \
     fuzzing/nxt_http_h1p_fuzz.c \
     fuzzing/nxt_http_h1p_peer_fuzz.c \
     fuzzing/nxt_http_h1p_peer_response_fuzz.c \

@@ -665,16 +665,13 @@ nxt_http_parse_field_value(nxt_http_request_parse_t *rp, u_char **pos,
             break;
         }
 
+        /* A control byte other than HTAB, or DEL (RFC 9110, 5.5). */
+
         if (ch != '\t') {
             return NXT_HTTP_PARSE_INVALID;
         }
 
         p++;
-    }
-
-    /* Reject DEL here, not in the scan loop, to keep that loop short. */
-    if (nxt_slow_path(memchr(start, 0x7F, p - start) != NULL)) {
-        return NXT_HTTP_PARSE_INVALID;
     }
 
     *pos = p;
@@ -699,44 +696,111 @@ nxt_http_parse_field_value(nxt_http_request_parse_t *rp, u_char **pos,
 }
 
 
+/*
+ * A field value is scanned up to the first byte below 0x20 or DEL (0x7F).
+ * nxt_http_parse_field_value() accepts HTAB there, ends the value at CR or
+ * LF, and rejects every other such byte.
+ */
+
+static const uint8_t  nxt_http_field_end_chars[256]  nxt_aligned(64) = {
+    /* 0x00 to 0x1F */
+        1, 1, 1, 1,  1, 1, 1, 1,   1, 1, 1, 1,  1, 1, 1, 1,
+        1, 1, 1, 1,  1, 1, 1, 1,   1, 1, 1, 1,  1, 1, 1, 1,
+
+    /* 0x20 to 0x7F */
+        0, 0, 0, 0,  0, 0, 0, 0,   0, 0, 0, 0,  0, 0, 0, 0,
+        0, 0, 0, 0,  0, 0, 0, 0,   0, 0, 0, 0,  0, 0, 0, 0,
+        0, 0, 0, 0,  0, 0, 0, 0,   0, 0, 0, 0,  0, 0, 0, 0,
+        0, 0, 0, 0,  0, 0, 0, 0,   0, 0, 0, 0,  0, 0, 0, 0,
+        0, 0, 0, 0,  0, 0, 0, 0,   0, 0, 0, 0,  0, 0, 0, 0,
+        0, 0, 0, 0,  0, 0, 0, 0,   0, 0, 0, 0,  0, 0, 0, 1,
+
+    /* 0x80 to 0xFF: 0 */
+};
+
+
+#define NXT_HTTP_FIELD_ONES  ((uint64_t) 0x0101010101010101ULL)
+#define NXT_HTTP_FIELD_HIGH  ((uint64_t) 0x8080808080808080ULL)
+
+
+nxt_inline uint64_t
+nxt_http_load64(const u_char *p)
+{
+    uint64_t  w;
+
+    nxt_memcpy(&w, p, 8);
+
+    return w;
+}
+
+
+/*
+ * nxt_http_field_end_word() is true when one of the 8 bytes at "p" ends the
+ * scan.  "w - 0x20" sets the high bit of a byte below 0x20, and "w + 1"
+ * sets the high bit of DEL.  Both terms also set the high bit of some bytes
+ * from 0x80 to 0xFF, and "& ~w" clears the high bit of each such byte.
+ *
+ * A borrow or a carry can also set the high bit of a byte above the byte
+ * that caused it, in the order of significance.  A borrow from a byte below
+ * 0x20 sets it in a 0x20 byte, and a run of 0x20 bytes passes the borrow on.
+ * A carry from a 0xFF byte sets it in a 0x7E byte, and a run of 0xFE and
+ * 0xFF bytes passes the carry on.  So the result is true for each word that
+ * has a byte that ends the scan, and also for a few words that have none.  The caller tests the bytes of such a word one at a time, in memory
+ * order, and continues with the next word if no byte ends the scan.  Thus
+ * the result of the scan does not depend on the byte order.
+ */
+
+/*
+ * The result is compared with zero here, as an int.  nxt_slow_path() casts
+ * its argument to long, and where long has 32 bits that cast would drop the
+ * high half of the 64-bit mask.
+ */
+
+nxt_inline nxt_bool_t
+nxt_http_field_end_word(const u_char *p)
+{
+    uint64_t  w;
+
+    w = nxt_http_load64(p);
+
+    return (((w - NXT_HTTP_FIELD_ONES * 0x20) | (w + NXT_HTTP_FIELD_ONES))
+            & ~w & NXT_HTTP_FIELD_HIGH) != 0;
+}
+
+
 static u_char *
 nxt_http_lookup_field_end(u_char *p, const u_char *end)
 {
-    while (nxt_fast_path(end - p >= 16)) {
-
 #define nxt_field_end_test_char(ch)                                           \
                                                                               \
-        if (nxt_slow_path((ch) < 0x20)) {                                     \
+        if (nxt_slow_path(nxt_http_field_end_chars[ch] != 0)) {               \
             return &(ch);                                                     \
         }
 
 /* enddef */
 
-        nxt_field_end_test_char(p[0]);
-        nxt_field_end_test_char(p[1]);
-        nxt_field_end_test_char(p[2]);
-        nxt_field_end_test_char(p[3]);
+    while (nxt_fast_path(end - p >= 8)) {
 
-        nxt_field_end_test_char(p[4]);
-        nxt_field_end_test_char(p[5]);
-        nxt_field_end_test_char(p[6]);
-        nxt_field_end_test_char(p[7]);
+        if (nxt_slow_path(nxt_http_field_end_word(p))) {
+            nxt_field_end_test_char(p[0]);
+            nxt_field_end_test_char(p[1]);
+            nxt_field_end_test_char(p[2]);
+            nxt_field_end_test_char(p[3]);
 
-        nxt_field_end_test_char(p[8]);
-        nxt_field_end_test_char(p[9]);
-        nxt_field_end_test_char(p[10]);
-        nxt_field_end_test_char(p[11]);
+            nxt_field_end_test_char(p[4]);
+            nxt_field_end_test_char(p[5]);
+            nxt_field_end_test_char(p[6]);
+            nxt_field_end_test_char(p[7]);
 
-        nxt_field_end_test_char(p[12]);
-        nxt_field_end_test_char(p[13]);
-        nxt_field_end_test_char(p[14]);
-        nxt_field_end_test_char(p[15]);
+            /* No byte ends the scan.  A carry set the high bit. */
+        }
 
-        p += 16;
+        p += 8;
     }
 
-    while (nxt_fast_path(end - p >= 4)) {
+    /* Less than 8 bytes are left, so this runs at most once. */
 
+    if (end - p >= 4) {
         nxt_field_end_test_char(p[0]);
         nxt_field_end_test_char(p[1]);
         nxt_field_end_test_char(p[2]);
@@ -763,6 +827,19 @@ nxt_http_lookup_field_end(u_char *p, const u_char *end)
 
     return p;
 }
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_http_field_end_test.c. */
+
+u_char *
+nxt_http_test_lookup_field_end(u_char *p, const u_char *end)
+{
+    return nxt_http_lookup_field_end(p, end);
+}
+
+#endif
 
 
 static nxt_int_t
