@@ -241,6 +241,10 @@ nxt_int_t nxt_http_parse_complex_target(nxt_http_request_parse_t *rp);
 nxt_buf_t *nxt_http_chunk_parse(nxt_task_t *task, nxt_http_chunk_parse_t *hcp,
     nxt_buf_t *in);
 
+#if (NXT_TESTS)
+u_char *nxt_http_test_lookup_field_end(u_char *p, const u_char *end);
+#endif
+
 
 extern const nxt_lvlhsh_proto_t  nxt_http_fields_hash_proto;
 

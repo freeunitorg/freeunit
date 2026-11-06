@@ -25,6 +25,7 @@ zip -r $OUT/fuzz_http_h1p_seed_corpus.zip  fuzz_http_h1p_seed_corpus/
 zip -r $OUT/fuzz_http_h1p_peer_seed_corpus.zip  fuzz_http_h1p_peer_seed_corpus/
 zip -r $OUT/fuzz_json_seed_corpus.zip fuzz_json_seed_corpus/
 zip -r $OUT/fuzz_http_chunk_seed_corpus.zip fuzz_http_chunk_seed_corpus/
+zip -r $OUT/fuzz_http_field_value_seed_corpus.zip fuzz_http_field_value_seed_corpus/
 zip -r $OUT/fuzz_http_h1p_peer_response_seed_corpus.zip fuzz_http_h1p_peer_response_seed_corpus/
 zip -r $OUT/fuzz_http_ws_utf8_seed_corpus.zip fuzz_http_ws_utf8_seed_corpus/
 
