@@ -25,6 +25,19 @@ static void nxt_http_conn_test(nxt_task_t *task, void *obj, void *data);
 static void nxt_http_conn_tls_conf_release(nxt_task_t *task, void *obj,
     void *data);
 #endif
+static ssize_t nxt_h1p_proxy_protocol_io_read_handler(nxt_task_t *task,
+    nxt_conn_t *c);
+static void nxt_h1p_proxy_protocol_header(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_h1p_proxy_protocol_close(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_h1p_proxy_protocol_error(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_h1p_proxy_protocol_buf_free(nxt_task_t *task, nxt_conn_t *c);
+static nxt_int_t nxt_h1p_proxy_protocol_remote(nxt_task_t *task,
+    nxt_conn_t *c, nxt_proxy_protocol_t *pp);
+static void nxt_h1p_proxy_protocol_timeout(nxt_task_t *task, void *obj,
+    void *data);
 static ssize_t nxt_h1p_idle_io_read_handler(nxt_task_t *task, nxt_conn_t *c);
 static void nxt_h1p_conn_proto_init(nxt_task_t *task, void *obj, void *data);
 static void nxt_h1p_conn_request_init(nxt_task_t *task, void *obj, void *data);
@@ -131,6 +144,7 @@ static nxt_int_t nxt_h1p_peer_transfer_encoding(void *ctx,
 static const nxt_conn_state_t  nxt_http_idle_state;
 static const nxt_conn_state_t  nxt_h1p_shutdown_state;
 #endif
+static const nxt_conn_state_t  nxt_h1p_proxy_protocol_state;
 static const nxt_conn_state_t  nxt_h1p_idle_state;
 static const nxt_conn_state_t  nxt_h1p_header_parse_state;
 static const nxt_conn_state_t  nxt_h1p_continue_state;
@@ -260,6 +274,15 @@ nxt_http_conn_init(nxt_task_t *task, void *obj, void *data)
         c->read_state = &nxt_http_idle_state;
     }
 #endif
+
+    /*
+     * The PROXY protocol header comes before the ClientHello or the
+     * request, so it is read before the TLS-or-plain test.  Its handler
+     * selects one of the two states above when the header is consumed.
+     */
+    if (skcf->proxy_protocol != NXT_PROXY_PROTOCOL_OFF) {
+        c->read_state = &nxt_h1p_proxy_protocol_state;
+    }
 
     nxt_conn_read(engine, c);
 }
@@ -436,6 +459,386 @@ nxt_http_conn_tls_conf_release(nxt_task_t *task, void *obj, void *data)
 #endif
 
 
+/*
+ * The PROXY protocol header on a listener with "proxy_protocol" set.  The
+ * chain is: accept, this header, the TLS-or-plain test, HTTP/1, then the
+ * "forwarded" option, which sees the address announced here as the peer.
+ *
+ * The header is peeked, not read.  The TLS library reads the ClientHello
+ * from the socket itself, so the header must leave the socket exactly
+ * when it has been parsed and not one byte later.  The bytes of a header
+ * that is split across segments are taken off the socket as they come, so
+ * that a peek sees what follows them, including EOF.  A complete header is
+ * then taken off the socket with a read of its exact remaining length, and
+ * the next state starts with an empty buffer, as it does without the
+ * option.
+ *
+ * The header must arrive within the idle timeout of the listener, which is
+ * the time an idle connection gets before its first request today.  The
+ * timer is not reset by a partial header.
+ */
+
+static const nxt_conn_state_t  nxt_h1p_proxy_protocol_state
+    nxt_aligned(64) =
+{
+    .ready_handler = nxt_h1p_proxy_protocol_header,
+    .close_handler = nxt_h1p_proxy_protocol_close,
+    .error_handler = nxt_h1p_proxy_protocol_error,
+
+    .io_read_handler = nxt_h1p_proxy_protocol_io_read_handler,
+
+    .timer_handler = nxt_h1p_proxy_protocol_timeout,
+    .timer_value = nxt_h1p_conn_timer_value,
+    .timer_data = offsetof(nxt_socket_conf_t, idle_timeout),
+};
+
+
+static ssize_t
+nxt_h1p_proxy_protocol_io_read_handler(nxt_task_t *task, nxt_conn_t *c)
+{
+    size_t                   size;
+    ssize_t                  n;
+    nxt_buf_t                *b;
+    nxt_event_engine_t       *engine;
+    nxt_socket_conf_joint_t  *joint;
+
+    engine = task->thread->engine;
+    joint = c->listen->socket.data;
+    b = c->read;
+
+    if (nxt_slow_path(joint == NULL || c->listen->draining)) {
+        /*
+         * Listening socket had been closed or is draining while
+         * connection is still idle.
+         */
+        if (b != NULL) {
+            c->read = NULL;
+            nxt_event_engine_buf_mem_free(engine, b);
+        }
+
+        c->read_state = &nxt_h1p_idle_close_state;
+        return 0;
+    }
+
+    if (b == NULL) {
+        b = nxt_event_engine_buf_mem_alloc(engine,
+                                           NXT_PROXY_PROTOCOL_MAX_LENGTH);
+        if (nxt_slow_path(b == NULL)) {
+            c->socket.error = NXT_ENOMEM;
+            return NXT_ERROR;
+        }
+    }
+
+    /*
+     * The buffer holds the bytes of the header that were taken off the
+     * socket so far.  The peek appends what follows them, and
+     * nxt_conn_io_read() moves "free" by the result.  The parser never
+     * asks for more once the cap is full, so a full buffer is a bug.
+     */
+    size = b->mem.end - b->mem.free;
+
+    if (nxt_slow_path(size == 0)) {
+        c->socket.error = NXT_EINVAL;
+        return NXT_ERROR;
+    }
+
+    n = c->io->recv(c, b->mem.free, size, MSG_PEEK);
+
+    if (n > 0 || n == NXT_AGAIN) {
+        /* The bytes taken so far must survive a wait for the rest. */
+        c->read = b;
+
+    } else {
+        if (n == 0) {
+            nxt_debug(task, "h1p proxy protocol: client closed connection");
+        }
+
+        c->read = NULL;
+        nxt_event_engine_buf_mem_free(engine, b);
+    }
+
+    return n;
+}
+
+
+static void
+nxt_h1p_proxy_protocol_header(nxt_task_t *task, void *obj, void *data)
+{
+    size_t                   size, peeked;
+    ssize_t                  n;
+    nxt_int_t                ret;
+    nxt_buf_t                *b;
+    nxt_conn_t               *c;
+    nxt_uint_t               version;
+    nxt_event_engine_t       *engine;
+    nxt_proxy_protocol_t     pp;
+    nxt_socket_conf_joint_t  *joint;
+
+    c = obj;
+    b = c->read;
+    engine = task->thread->engine;
+
+    nxt_debug(task, "h1p proxy protocol header");
+
+    joint = c->listen->socket.data;
+
+    if (nxt_slow_path(joint == NULL || c->listen->draining)) {
+        /*
+         * Listening socket had been closed or is draining while
+         * connection is still idle.
+         */
+        goto drop;
+    }
+
+    version = joint->socket_conf->proxy_protocol;
+
+    /* The bytes taken off the socket so far, then the peeked ones. */
+    size = nxt_buf_mem_used_size(&b->mem);
+    peeked = c->nbytes;
+
+    ret = nxt_proxy_protocol_parse(version, b->mem.pos, size, &pp);
+
+    if (ret == NXT_AGAIN) {
+        /*
+         * The header is split across segments.  The peeked bytes are
+         * taken off the socket now, so that the next peek returns what
+         * follows them, or EOF when the peer has closed.  The read is of
+         * the exact peeked length, so read_ready stays set and the next
+         * peek runs at once; it gets EAGAIN and waits when nothing else
+         * has arrived.  The parser stops asking at the cap.
+         */
+        if (nxt_slow_path(size >= NXT_PROXY_PROTOCOL_MAX_LENGTH)) {
+            goto invalid;
+        }
+
+        n = c->io->recv(c, b->mem.free - peeked, peeked, 0);
+
+        if (nxt_slow_path(n != (ssize_t) peeked)) {
+            goto read_failed;
+        }
+
+        nxt_conn_read(engine, c);
+        return;
+    }
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto invalid;
+    }
+
+    /*
+     * The header is whole.  Take exactly the rest of it off the socket.
+     * This read is exact too, so read_ready stays set, and the next state
+     * reads the ClientHello or the request at once if it is already there.
+     * This matters with an edge-triggered engine, which announces data
+     * that arrived with the header only once.
+     */
+
+    n = pp.length - (size - peeked);
+
+    if (nxt_slow_path(c->io->recv(c, b->mem.free - peeked, n, 0) != n)) {
+        goto read_failed;
+    }
+
+    c->read = NULL;
+    nxt_event_engine_buf_mem_free(engine, b);
+    b = NULL;
+
+    if (!pp.local) {
+        ret = nxt_h1p_proxy_protocol_remote(task, c, &pp);
+
+        if (nxt_slow_path(ret != NXT_OK)) {
+            nxt_log(task, NXT_LOG_INFO, "PROXY protocol v%ui header announces "
+                    "an address family (%ui) this build does not support, "
+                    "the connection from %*s is dropped",
+                    version, (nxt_uint_t) pp.family,
+                    (size_t) c->remote->length,
+                    nxt_sockaddr_start(c->remote));
+            goto drop;
+        }
+
+        c->proxy_protocol_tls = pp.tls;
+
+        nxt_debug(task, "h1p proxy protocol v%ui: client %*s%s", version,
+                  (size_t) c->remote->length, nxt_sockaddr_start(c->remote),
+                  pp.tls ? " (tls)" : "");
+
+    } else {
+        nxt_debug(task, "h1p proxy protocol v%ui: local, peer %*s kept",
+                  version, (size_t) c->remote->length,
+                  nxt_sockaddr_start(c->remote));
+    }
+
+    /* From here the connection starts as it does without the option. */
+
+    c->read_state = &nxt_h1p_idle_state;
+
+#if (NXT_TLS)
+    if (joint->socket_conf->tls != NULL) {
+        c->read_state = &nxt_http_idle_state;
+    }
+#endif
+
+    /*
+     * The read timer still has the PROXY timeout handler.  nxt_conn_read()
+     * does not re-arm it when data is ready, and the TLS idle state has no
+     * timer_autoreset, so the timer is re-armed with the next state here.
+     */
+    nxt_conn_timer(engine, c, c->read_state, &c->read_timer);
+
+    nxt_conn_read(engine, c);
+    return;
+
+invalid:
+
+    nxt_log(task, NXT_LOG_INFO, "PROXY protocol v%ui header is missing "
+            "or invalid, the connection from %*s is dropped",
+            version, (size_t) c->remote->length,
+            nxt_sockaddr_start(c->remote));
+    goto drop;
+
+read_failed:
+
+    /* The bytes were peeked a moment ago, so this is a socket error. */
+    nxt_log(task, NXT_LOG_INFO, "PROXY protocol v%ui header read failed, "
+            "the connection from %*s is dropped",
+            version, (size_t) c->remote->length,
+            nxt_sockaddr_start(c->remote));
+
+drop:
+
+    if (b != NULL) {
+        c->read = NULL;
+        nxt_event_engine_buf_mem_free(engine, b);
+    }
+
+    nxt_h1p_closing(task, c);
+}
+
+
+/*
+ * An event engine can report EOF or an error straight to the state's close
+ * and error handlers (kqueue does), without the read handler that frees the
+ * bytes of a partial header.  No HTTP protocol object exists yet, so
+ * nxt_h1p_shutdown() does not free them either: free them here.
+ */
+
+static void
+nxt_h1p_proxy_protocol_buf_free(nxt_task_t *task, nxt_conn_t *c)
+{
+    if (c->read != NULL) {
+        nxt_event_engine_buf_mem_free(task->thread->engine, c->read);
+        c->read = NULL;
+    }
+}
+
+
+static void
+nxt_h1p_proxy_protocol_close(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_h1p_proxy_protocol_buf_free(task, obj);
+    nxt_h1p_conn_close(task, obj, data);
+}
+
+
+static void
+nxt_h1p_proxy_protocol_error(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_h1p_proxy_protocol_buf_free(task, obj);
+    nxt_h1p_conn_error(task, obj, data);
+}
+
+
+/*
+ * Replaces the peer address of the connection with the announced one.
+ * The address may be of another family than the listener, so the sockaddr
+ * that nxt_conn_io_accept() sized for the listener cannot always hold it.
+ * The new one comes from the same engine cache, and nxt_h1p_conn_free()
+ * returns it there through nxt_sockaddr_cache_free() as before.
+ */
+
+static nxt_int_t
+nxt_h1p_proxy_protocol_remote(nxt_task_t *task, nxt_conn_t *c,
+    nxt_proxy_protocol_t *pp)
+{
+    size_t              size, address_length;
+    uint8_t             hint;
+    socklen_t           socklen;
+    nxt_sockaddr_t      *sa;
+    nxt_event_engine_t  *engine;
+
+    if (nxt_proxy_protocol_sockaddr_size(pp, &socklen, &address_length)
+        != NXT_OK)
+    {
+        return NXT_ERROR;
+    }
+
+    /*
+     * nxt_conn_local_addr() sizes its getsockname() buffer by the family of
+     * c->remote.  On a wildcard listener c->local is not set yet, so it is
+     * resolved now, while c->remote still has the family of the socket.
+     */
+    if (c->local == NULL
+        && c->remote->u.sockaddr.sa_family != pp->family
+        && nxt_conn_local_addr(task, c) == NULL)
+    {
+        return NXT_ERROR;
+    }
+
+    engine = task->thread->engine;
+
+    size = offsetof(nxt_sockaddr_t, u) + socklen + address_length;
+    hint = NXT_EVENT_ENGINE_NO_MEM_HINT;
+
+    sa = nxt_event_engine_mem_alloc(engine, &hint, size);
+    if (nxt_slow_path(sa == NULL)) {
+        return NXT_ERROR;
+    }
+
+    nxt_memzero(sa, offsetof(nxt_sockaddr_t, u) + socklen);
+
+    sa->cache_hint = hint;
+    sa->socklen = socklen;
+    sa->length = address_length;
+
+    nxt_proxy_protocol_sockaddr_set(pp, sa);
+    nxt_sockaddr_text(sa);
+
+    nxt_sockaddr_cache_free(engine, c);
+    c->remote = sa;
+
+    return NXT_OK;
+}
+
+
+static void
+nxt_h1p_proxy_protocol_timeout(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_conn_t          *c;
+    nxt_timer_t         *timer;
+    nxt_event_engine_t  *engine;
+
+    timer = obj;
+    c = nxt_read_timer_conn(timer);
+
+    nxt_debug(task, "h1p proxy protocol timeout");
+
+    nxt_log(task, NXT_LOG_INFO, "PROXY protocol header did not arrive within "
+            "the idle timeout, the connection from %*s is dropped",
+            (size_t) c->remote->length, nxt_sockaddr_start(c->remote));
+
+    engine = task->thread->engine;
+
+    if (c->read != NULL) {
+        nxt_event_engine_buf_mem_free(engine, c->read);
+        c->read = NULL;
+    }
+
+    c->block_read = 1;
+
+    nxt_h1p_closing(task, c);
+}
+
+
 static const nxt_conn_state_t  nxt_h1p_idle_state
     nxt_aligned(64) =
 {
@@ -558,8 +961,17 @@ nxt_h1p_conn_request_init(nxt_task_t *task, void *obj, void *data)
         /* r->protocol = NXT_HTTP_PROTO_H1 is done by zeroing. */
         r->remote = c->remote;
 
+        /*
+         * A PROXY protocol v2 header can say that the client spoke TLS to
+         * the proxy.  The applications then see "https", as they do for a
+         * TLS listener, although this connection has no TLS session.
+         */
+        r->tls = c->proxy_protocol_tls;
+
 #if (NXT_TLS)
-        r->tls = (c->u.tls != NULL);
+        if (c->u.tls != NULL) {
+            r->tls = 1;
+        }
 #endif
 
         r->task = c->task;

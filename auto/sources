@@ -63,6 +63,7 @@ NXT_LIB_SRCS=" \
     src/nxt_conn_write.c \
     src/nxt_conn_close.c \
     src/nxt_sockaddr.c \
+    src/nxt_proxy_protocol.c \
     src/nxt_listen_socket.c \
     src/nxt_upstream.c \
     src/nxt_upstream_round_robin.c \
@@ -181,6 +182,7 @@ NXT_TEST_SRCS=" \
     src/test/nxt_h1proto_conn_test.c \
     src/test/nxt_http_chunk_parse_test.c \
     src/test/nxt_http_validate_host_test.c \
+    src/test/nxt_proxy_protocol_test.c \
     src/test/nxt_http_request_body_alloc_test.c \
     src/test/nxt_http_comp_select_test.c \
     src/test/nxt_conf_parse_test.c \
