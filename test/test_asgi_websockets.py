@@ -351,6 +351,34 @@ def test_asgi_websockets_handshake_case_insensitive():
     assert resp['status'] == 101, 'status'
 
 
+def test_asgi_websockets_handshake_connection_list():
+    # Firefox sends "keep-alive, Upgrade" (nginx/unit PR 1550).  The
+    # "Connection" value is a list of options, and "upgrade" is one of them.
+    client.load('websockets/mirror')
+
+    key = ws.key()
+    resp, sock, _ = ws.upgrade(
+        headers={
+            'Host': 'localhost',
+            'Upgrade': 'websocket',
+            'Connection': 'keep-alive, Upgrade',
+            'Sec-WebSocket-Key': key,
+            'Sec-WebSocket-Protocol': 'chat',
+            'Sec-WebSocket-Version': 13,
+        }
+    )
+
+    assert resp['status'] == 101, 'status'
+    assert resp['headers']['Connection'] == 'Upgrade', 'connection'
+    assert resp['headers']['Sec-WebSocket-Accept'] == ws.accept(key), 'key'
+
+    ws.frame_write(sock, ws.OP_TEXT, 'blah')
+    frame = ws.frame_read(sock)
+    sock.close()
+
+    assert frame['data'].decode('utf-8') == 'blah', 'mirror'
+
+
 @pytest.mark.skip('not yet')
 def test_asgi_websockets_handshake_connection_absent():  # FAIL
     client.load('websockets/mirror')
