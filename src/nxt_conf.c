@@ -573,7 +573,8 @@ nxt_conf_value_t *
 nxt_conf_get_object_member(const nxt_conf_value_t *value, const nxt_str_t *name,
     uint32_t *index)
 {
-    nxt_str_t                 str;
+    size_t                    length;
+    const u_char              *start;
     nxt_uint_t                n;
     nxt_conf_object_t         *object;
     nxt_conf_object_member_t  *member;
@@ -584,19 +585,41 @@ nxt_conf_get_object_member(const nxt_conf_value_t *value, const nxt_str_t *name,
 
     object = value->u.object;
 
+    /*
+     * The search is linear, and the validator calls it once per reference
+     * (for example, every "pass" to a route), so it runs often on large
+     * objects.  Read the name in place and reject on the length and the
+     * first byte before calling memcmp().
+     */
+
     for (n = 0; n < object->count; n++) {
         member = &object->members[n];
 
-        nxt_conf_get_string(&member->name, &str);
+        if (member->name.type == NXT_CONF_VALUE_SHORT_STRING) {
+            length = member->name.u.str.length;
+            start = member->name.u.str.start;
 
-        if (nxt_strstr_eq(&str, name)) {
-
-            if (index != NULL) {
-                *index = n;
-            }
-
-            return &member->value;
+        } else {
+            length = member->name.u.string.length;
+            start = member->name.u.string.start;
         }
+
+        if (length != name->length) {
+            continue;
+        }
+
+        if (length != 0
+            && (start[0] != name->start[0]
+                || memcmp(start, name->start, length) != 0))
+        {
+            continue;
+        }
+
+        if (index != NULL) {
+            *index = n;
+        }
+
+        return &member->value;
     }
 
     return NULL;
