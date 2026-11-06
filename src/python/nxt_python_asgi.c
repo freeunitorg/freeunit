@@ -1422,14 +1422,29 @@ nxt_py_asgi_add_field(void *data, int i, PyObject *name, PyObject *val)
     nxt_unit_request_info_t      *req;
     nxt_py_asgi_add_field_ctx_t  *ctx;
 
+    ctx = data;
+    req = ctx->req;
+
+    /*
+     * libunit stores the name length in a uint8_t.  Check the full
+     * Py_ssize_t length, before it is narrowed.
+     */
+    if (nxt_slow_path(PyBytes_GET_SIZE(name) > UINT8_MAX)) {
+        nxt_unit_req_error(req, "header #%d name is too long "
+                           "(%zd bytes, the limit is %d)",
+                           i, PyBytes_GET_SIZE(name), UINT8_MAX);
+
+        return PyErr_Format(PyExc_ValueError,
+                            "header #%d name is too long (%zd bytes, "
+                            "the limit is %d)",
+                            i, PyBytes_GET_SIZE(name), UINT8_MAX);
+    }
+
     name_str = PyBytes_AS_STRING(name);
     name_len = PyBytes_GET_SIZE(name);
 
     val_str = PyBytes_AS_STRING(val);
     val_len = PyBytes_GET_SIZE(val);
-
-    ctx = data;
-    req = ctx->req;
 
     rc = nxt_unit_response_add_field(req, name_str, name_len,
                                      val_str, val_len);
