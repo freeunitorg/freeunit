@@ -114,6 +114,18 @@ never served in ranges.  It is removed now, as in nginx.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a response header name longer than 255 bytes from a Python, PHP, Perl or
+Node.js application went out cut to its length modulo 256, with no log line;
+a 300-byte name became a 44-byte one.  Such a response now fails, with an
+error in the log: 500 from PHP, 503 from Python and Perl.  In Node.js,
+setHeader() throws a TypeError.  If the application does not catch it, the
+worker exits and the client gets 503.  The Ruby, Java, Go and WebAssembly
+modules already refused such a name.
+</para>
+</change>
+
 <change type="feature">
 <para>
 Docker images for Python 3.15.

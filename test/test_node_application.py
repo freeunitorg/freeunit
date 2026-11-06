@@ -442,3 +442,49 @@ def test_node_application_write_multiple():
     client.load('write_multiple')
 
     assert client.get()['body'] == 'writewrite2end', 'write multiple'
+
+
+def test_node_application_header_name_long(wait_for_record):
+    client.load('header_name_long')
+
+    def get(length, catch=False):
+        headers = {
+            'Host': 'localhost',
+            'X-Length': str(length),
+            'Connection': 'close',
+        }
+
+        if catch:
+            headers['X-Catch'] = '1'
+
+        return client.get(headers=headers)
+
+    for length in (255, 256, 300):
+        resp = get(length)
+
+        if length <= 255:
+            assert resp['status'] == 200, f'status {length}'
+            assert resp['headers']['X' * length] == 'value', f'header {length}'
+            continue
+
+        # setHeader() throws.  An uncaught error ends the worker, as in
+        # Node.js, and the router answers 503.
+        assert resp['status'] == 503, f'status {length}'
+        # A 256-byte name is cut to an empty one; the status is the check.
+        if length % 256:
+            assert (
+                'X' * (length % 256) not in resp['headers']
+            ), f'no cut name {length}'
+        assert resp['body'] != 'body', f'no application body {length}'
+        assert (
+            wait_for_record(rf'name is too long \({length} bytes') is not None
+        ), f'error log {length}'
+
+        # The error comes before the response changes, so an application
+        # that catches it can still answer.
+        resp = get(length, catch=True)
+        assert resp['status'] == 500, f'caught status {length}'
+        assert (
+            resp['body'] == f'Response header name is too long ({length} '
+            'bytes, the limit is 255)'
+        ), f'caught body {length}'
