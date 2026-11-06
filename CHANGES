@@ -60,6 +60,12 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
 
     *) Feature: Docker images for Python 3.15.
 
+    *) Feature: with "conf_commands": {"Options": "KTLS"} and kernel TLS
+       transmit active, the static handler sends a file over TLS with
+       SSL_sendfile(). The file is not copied into user space. Without
+       kernel TLS, the file is read and sent as before. This needs OpenSSL
+       3.0 or later.
+
 
 Changes with FreeUnit 1.37.1                                     30 Oct 2026
 

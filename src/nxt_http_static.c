@@ -5,6 +5,7 @@
 
 #include <nxt_router.h>
 #include <nxt_http.h>
+#include <nxt_h1proto.h>
 #include <nxt_http_compression.h>
 
 
@@ -245,6 +246,9 @@ static u_char *nxt_http_static_chroot_match(u_char *chr, u_char *shr);
 static void nxt_http_static_extract_extension(nxt_str_t *path,
     nxt_str_t *exten);
 static void nxt_http_static_body_handler(nxt_task_t *task, void *obj,
+    void *data);
+static nxt_bool_t nxt_http_static_sendfile(nxt_http_request_t *r);
+static void nxt_http_static_file_completion(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_http_static_buf_completion(nxt_task_t *task, void *obj,
     void *data);
@@ -1989,6 +1993,28 @@ nxt_http_static_body_handler(nxt_task_t *task, void *obj, void *data)
     r = obj;
     fb = r->out;
 
+    if (nxt_http_static_sendfile(r)) {
+        b = nxt_buf_file_alloc(r->mem_pool, 0, 0);
+        if (nxt_slow_path(b == NULL)) {
+            nxt_http_request_error_handler(task, r, r->proto.any);
+            return;
+        }
+
+        b->file = fb->file;
+        b->file_pos = fb->file_pos;
+        b->file_end = fb->file_end;
+
+        b->completion_handler = nxt_http_static_file_completion;
+        b->parent = r;
+
+        nxt_mp_retain(r->mem_pool);
+
+        b->next = nxt_http_buf_last(r);
+
+        nxt_http_request_send(task, r, b);
+        return;
+    }
+
     rest = fb->file_end - fb->file_pos;
     out = NULL;
     next = &out;
@@ -2036,6 +2062,56 @@ static const nxt_http_request_state_t  nxt_http_static_send_state
 {
     .error_handler = nxt_http_request_error_handler,
 };
+
+
+/*
+ * The body goes as one file buffer only where the connection sends it
+ * without a copy into user space.  Elsewhere it is read into memory
+ * buffers.
+ */
+
+static nxt_bool_t
+nxt_http_static_sendfile(nxt_http_request_t *r)
+{
+    nxt_h1proto_t  *h1p;
+
+    if (r->protocol != NXT_HTTP_PROTO_H1) {
+        return 0;
+    }
+
+    h1p = r->proto.h1;
+
+    return (h1p != NULL && !h1p->chunked && h1p->conn->io->sendfile != NULL);
+}
+
+
+static void
+nxt_http_static_file_completion(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_buf_t           *b, *fb, *next;
+    nxt_http_request_t  *r;
+
+    /* The chain can hold buffers of more than one request. */
+
+    for (b = obj; b != NULL; b = next) {
+        next = b->next;
+        r = b->parent;
+
+        fb = r->out;
+
+        /* The file goes first: the release below can destroy r. */
+
+        if (fb != NULL) {
+            nxt_file_close(task, fb->file);
+            r->out = NULL;
+
+            nxt_http_static_buf_free(fb);
+        }
+
+        nxt_mp_free(r->mem_pool, b);
+        nxt_mp_release(r->mem_pool);
+    }
+}
 
 
 static void
