@@ -6,6 +6,7 @@
 
 #include <nxt_main.h>
 #include <nxt_application.h>
+#include <nxt_router.h>
 #include "nxt_tests.h"
 
 
@@ -127,6 +128,50 @@ nxt_app_shm_limit_test(nxt_thread_t *thr)
     }
 
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "app shm limit test passed");
+
+    return NXT_OK;
+}
+
+
+/*
+ * The steps of the restart back-off (#596): none without a failure, then
+ * 100 ms doubled per round, and 5 s from the seventh round on, however many
+ * rounds there are.
+ */
+
+static nxt_int_t
+nxt_app_backoff_delay_test(nxt_thread_t *thr)
+{
+    nxt_uint_t  i;
+    nxt_msec_t  r;
+
+    static const struct {
+        nxt_uint_t  rounds;
+        nxt_msec_t  delay;
+    } cases[] = {
+        { 0, 0 },
+        { 1, 100 },
+        { 2, 200 },
+        { 3, 400 },
+        { 4, 800 },
+        { 5, 1600 },
+        { 6, 3200 },
+        { 7, 5000 },
+        { 8, 5000 },
+        { 33, 5000 },
+        { 64, 5000 },
+        { (nxt_uint_t) -1, 5000 },
+    };
+
+    for (i = 0; i < nxt_nitems(cases); i++) {
+        r = nxt_router_app_backoff_delay(cases[i].rounds);
+
+        NXT_TEST_CHECK(thr->log, r == cases[i].delay,
+                       "app backoff delay test failed: %ui rounds gave %M ms, "
+                       "not %M ms", cases[i].rounds, r, cases[i].delay);
+    }
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log, "app backoff delay test passed");
 
     return NXT_OK;
 }
@@ -450,6 +495,10 @@ main(int argc, char **argv)
     }
 
     if (nxt_app_shm_limit_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_app_backoff_delay_test(thr) != NXT_OK) {
         return 1;
     }
 

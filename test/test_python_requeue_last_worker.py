@@ -174,6 +174,9 @@ def test_python_requeue_last_worker_spare(skip_alert, skip_fds_check):
 
     skip_fds_check(main=True, router=True, controller=True)
     skip_alert(r'app process \d+ exited on signal 9')
+    # A killed process may not have answered yet; then its replacement waits
+    # and the router logs the back-off alert (#596).
+    skip_alert(r'a process exited before it answered anything')
 
     client.load(
         'requeue_count',

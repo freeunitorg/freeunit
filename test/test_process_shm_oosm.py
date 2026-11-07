@@ -247,6 +247,9 @@ def test_process_shm_oosm_kill(skip_alert):
     # report of it is expected, not a finding.  Nothing else is waived --
     # in particular the assertion alert this test exists to catch is not.
     skip_alert(r'process \d+ exited on signal 9')
+    # A worker killed in the middle of its first response has not answered;
+    # its replacement waits and the router logs the back-off alert (#596).
+    skip_alert(r'a process exited before it answered anything')
 
     client.load(APP, limits={"shm": SHM_LIMIT}, processes=1)
 
@@ -444,6 +447,9 @@ def test_process_shm_oosm_ack_closed_port(skip_alert):
     """
 
     skip_alert(r'process \d+ exited on signal 9')
+    # A worker killed in the middle of its first response has not answered;
+    # its replacement waits and the router logs the back-off alert (#596).
+    skip_alert(r'a process exited before it answered anything')
 
     client.load(APP, limits={"shm": SHM_LIMIT}, processes=1)
 

@@ -104,7 +104,6 @@ enum   NXT_WEBSOCKET_CR_INTERNAL_SERVER_ERROR
 enum   NXT_WEBSOCKET_CR_TLS_HANDSHAKE_FAILED
 
 local  nxt_port_handlers_t
-local  nxt_port_s
 local  nxt_unit_buf_s
 local  nxt_unit_callbacks_s
 local  nxt_unit_ctx_impl_s

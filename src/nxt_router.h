@@ -160,6 +160,21 @@ typedef struct {
 #define NXT_APP_ACK_TIMEOUT    5000
 
 
+/*
+ * The restart back-off (#596).  A process that exits before the router saw
+ * any answer from it is a failure.  An answer is the last buffer of a
+ * response, an upgrade, or an RPC_ERROR from the process, so a process that
+ * crashes in the middle of its first response is a failure too.  While
+ * failures are counted, every new start of the application waits: 100 ms
+ * after the first round, twice as long after each further one, and never
+ * more than 5 s.  Any answer from the application, a /restart and a changed
+ * configuration end the back-off.
+ */
+#define NXT_APP_BACKOFF_FIRST  100
+#define NXT_APP_BACKOFF_MAX    5000
+#define NXT_APP_BACKOFF_ROUNDS 7
+
+
 typedef struct {
     uint32_t               use_count;
     nxt_app_t              *app;
@@ -268,6 +283,25 @@ struct nxt_app_s {
      */
     nxt_queue_t            requeue_req;
 
+    /*
+     * The restart back-off; see NXT_APP_BACKOFF_FIRST.  backoff_rounds
+     * counts the rounds of failures, at most NXT_APP_BACKOFF_ROUNDS.
+     * backoff_starts counts the starts that wait for backoff_timer, which
+     * runs on app->engine and holds one application reference while it is
+     * armed.  backoff_alerted is set once the alert for the current
+     * back-off is logged.  backoff_kick is set while backoff_kick_work is
+     * posted.  These change under app->mutex.  backoff_armed is set while
+     * backoff_timer is in use; only app->engine touches it.
+     */
+    nxt_atomic_t           backoff_rounds;
+    uint32_t               backoff_starts;
+    uint8_t                backoff_alerted;  /* 1 bit */
+    uint8_t                backoff_kick;     /* 1 bit */
+    uint8_t                backoff_armed;    /* 1 bit */
+    nxt_timer_t            backoff_timer;
+    nxt_work_t             backoff_work;
+    nxt_work_t             backoff_kick_work;
+
     nxt_app_joint_t        *joint;
     nxt_port_t             *shared_port;
     nxt_port_t             *proto_port;
@@ -302,6 +336,28 @@ nxt_router_app_can_start(nxt_app_t *app)
             && nxt_atomic_load(&app->pending_processes)
            < app->max_pending_processes
             && nxt_atomic_load(&app->requeue_pending) == 0;
+}
+
+
+/*
+ * The wait before a start after "rounds" rounds of failures.  Zero rounds
+ * means no wait.  Here rather than in src/nxt_router.c so that
+ * src/test/nxt_tests.c can check the steps.
+ */
+
+nxt_inline nxt_msec_t
+nxt_router_app_backoff_delay(nxt_uint_t rounds)
+{
+    if (rounds == 0) {
+        return 0;
+    }
+
+    if (rounds >= NXT_APP_BACKOFF_ROUNDS) {
+        return NXT_APP_BACKOFF_MAX;
+    }
+
+    return nxt_min((nxt_msec_t) NXT_APP_BACKOFF_FIRST << (rounds - 1),
+                   (nxt_msec_t) NXT_APP_BACKOFF_MAX);
 }
 
 
