@@ -50,10 +50,11 @@ a PHP worker kept serving after php_request_startup() failed, for example
 when a multipart request body ran PHP out of memory.  The failed request was
 never shut down, so the next requests ran on top of its state.  They got 503
 or an empty 200, and with some PHP versions the worker answered 503 to every
-request until it was replaced.  The worker now logs an alert and exits with
-code 1 after it sends the error, and the router starts a replacement worker
-when the application needs one.  PHP-FPM also ends its child process in this
-case.
+request until the process was stopped.  The worker now logs an alert and exits
+with code 1 after it sends the error, and the router starts a replacement
+worker when the application needs one.  PHP-FPM also ends its child process in
+this case.  A request body that PHP cannot parse within "memory_limit" now
+costs one worker restart for each such request.
 </para>
 </change>
 

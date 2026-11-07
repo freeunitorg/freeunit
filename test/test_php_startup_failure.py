@@ -39,7 +39,9 @@ def post_oversized_form():
     )
 
 
-def test_php_startup_failure_worker_exits(skip_alert, wait_for_record):
+def test_php_startup_failure_worker_exits(
+    skip_alert, wait_for_record, findall
+):
     """A worker whose request startup failed must not serve another request.
 
     Without the exit, the worker served the next requests on top of the
@@ -74,8 +76,16 @@ def test_php_startup_failure_worker_exits(skip_alert, wait_for_record):
     assert resp['body'].split()[0] != pid, 'worker was replaced'
 
     logged = wait_for_record(
-        r'php_request_startup\(\) failed, the worker exits'
+        r'\[alert\] .*php_request_startup\(\) failed, the worker exits'
     )
+
+    hard = findall(fr'app process {pid} exited with code 137\b')
+
+    if logged is None and hard:
+        # From PHP 8.2.35 on, an allocation past the hard memory limit
+        # (200 % of memory_limit by default) ends the process with
+        # _exit(137) inside the startup, before the module can log.
+        pytest.skip('this PHP reached its hard memory limit')
 
     if logged is None and int(version_id) < 80200:
         # The source backports for 7.4, 8.0 and 8.1 end the process inside the
