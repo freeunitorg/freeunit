@@ -42,6 +42,12 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        shrinks its window to a known length. The coded bytes stay valid for
        any client.
 
+    *) Change: the WebAssembly component module now builds Wasmtime with
+       "parallel-compilation", so Cranelift compiles the functions of a
+       component on several threads when it loads. The first start of a
+       large component is about 4 times faster; it uses more CPU at startup,
+       and the module is a little larger.
+
     *) Bugfix: an application response with status 206 was compressed while
        it kept its Content-Range, which counts the bytes of the uncompressed
        body. Unit no longer compresses a 206, as in nginx; a client that
