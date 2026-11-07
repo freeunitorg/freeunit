@@ -81,16 +81,35 @@ def _app_pids():
     }
 
 
+def _adopted():
+    processes = client.conf_get(f'/status/applications/{APP}/processes')
+
+    return processes['running'] == 1 and processes['starting'] == 0
+
+
 def _wait_new(old, timeout=10):
-    """Waits for a process that is not in "old"; answers its pid or None."""
+    """Waits for a process that is not in "old"; answers its pid or None.
+
+    The time the process first shows in ps goes to _unit['seen'].  Then the
+    wait goes on until the router has adopted the process.  The process
+    shows in ps before it sends PROCESS_READY, and a kill before READY is
+    a failed start, not an exit: the router gives the slot back and starts
+    no replacement for a spare process until a request comes.
+    """
 
     deadline = time.monotonic() + timeout
+    pid = None
 
     while time.monotonic() < deadline:
-        new = _app_pids() - old
+        if pid is None:
+            new = _app_pids() - old
 
-        if new:
-            return new.pop()
+            if new:
+                pid = new.pop()
+                _unit['seen'] = time.monotonic()
+
+        if pid is not None and _adopted():
+            return pid
 
         time.sleep(0.01)
 
@@ -108,16 +127,18 @@ def _kill_and_time(pid, seen):
     new = _wait_new(seen)
     assert new is not None, f'no replacement for {pid}'
 
-    return new, time.monotonic() - killed
+    return new, _unit['seen'] - killed
 
 
-def _setup(skip_alert, skip_fds_check):
+def _setup(skip_alert, skip_fds_check, script=APP, **kwargs):
     skip_fds_check(main=True, router=True, controller=True)
     skip_alert(r'app process \d+ exited on signal 9', ALERT)
 
     client.load(
-        APP,
+        script,
+        name=APP,
         processes={"spare": 1, "max": 1, "idle_timeout": 30},
+        **kwargs,
     )
 
     pid = _wait_new(set())
@@ -235,10 +256,34 @@ def test_python_restart_backoff_restart(skip_alert, skip_fds_check):
     assert 'success' in client.conf_get(f'/control/applications/{APP}/restart')
 
     pid = _wait_new(seen)
-    waited = time.monotonic() - restarted
-
     assert pid is not None, 'no process after the restart'
+    waited = _unit['seen'] - restarted
+
     # Without the restart the start would wait about 4.5 s more.
     assert waited < 3, f'waited {waited} s after the restart'
+
+    assert client.get()['status'] == 200
+
+
+def test_python_restart_backoff_slow_ready(skip_alert, skip_fds_check):
+    """A worker shows in ps before it is ready; a kill waits for READY.
+
+    A kill before PROCESS_READY is a failed start, not an exit, and the
+    router starts no spare process for it.  Each worker here takes 0.3 s
+    from its first line in ps to READY, so a kill that is timed on ps alone
+    always lands in that window, and no replacement comes.
+    """
+
+    pid = _setup(
+        skip_alert,
+        skip_fds_check,
+        script='slow_start',
+        environment={'UNIT_SLOW_START': '0.3'},
+    )
+    seen = set()
+
+    for step in STEPS[:2]:
+        pid, gap = _kill_and_time(pid, seen)
+        assert gap >= step - SLACK, f'gap {gap}'
 
     assert client.get()['status'] == 200
