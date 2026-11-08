@@ -206,7 +206,19 @@ unit_cmd()
         shift;
     done;
 
+    me=$(id -u);
     unit_ps -t m \
+    | while read -r _pid _rest; do
+        # Trust only a "unit: main" owned by the superuser or by us: it never
+        # drops privileges, so a decoy owned by another user is an attacker's.
+        # The filter lives here, not in unit_ps(), because this is the only
+        # path whose bracketed argv is later eval'd (unit_restart) or run
+        # (unit_sock_find); the public "unit_ps" listing stays complete.
+        _owner=$(ps -o uid= -p "$_pid" 2> /dev/null | tr -dc '0-9');
+        if [ -n "$_owner" ] && { [ "$_owner" = 0 ] || [ "$_owner" = "$me" ]; }; then
+            printf '%s %s\n' "$_pid" "$_rest";
+        fi;
+    done \
     | sed 's/.*\[\(.*\)].*/\1/';
 }
 
