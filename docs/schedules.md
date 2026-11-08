@@ -139,10 +139,10 @@ same moment. When a run's `timeout` expires:
 - `failed`: the runs that ended with no response status, with a status
   below 200 or of 400 or more, or with a response the router discarded. A
   1xx status is not a final response, so an application that ends a run
-  with one did not answer. A run whose request
-  the router could not allocate is one of them, and is in `runs` too. A due
-  run that the router could not allocate at all is in `failed` but not in
-  `runs`. A run that timed out is in `timed_out`, not in `failed`.
+  with one did not answer. A run whose request the router could not
+  allocate is one of them, and is in `runs` too. A due run that the router
+  could not allocate at all is in `failed` but not in `runs`. A run that
+  timed out is in `timed_out`, not in `failed`.
 - `timed_out`: the runs that reached their `timeout`.
 - `running`: `1` while a run is in progress, else `0`.
 - `last_start` (Unix time, seconds), `last_status` and `last_duration_ms`.

@@ -126,7 +126,8 @@ The joint count is not atomic, so it is only touched on its engine.
 unchanged: `body_read` calls `ready_handler` with no body (a run never
 calls it: it skips `nxt_http_request_start()`), `header_send`
 proceeds straight to the body, `send` counts the bytes and completes every
-buffer without keeping any, and `close` hands the joint back to the owner. `$body_bytes_sent` works; `$response_connection` and
+buffer without keeping any, and `close` hands the joint back to the owner.
+`$body_bytes_sent` works; `$response_connection` and
 `$response_transfer_encoding` now check for h1.
 
 #### 6.3 Building the request
@@ -153,9 +154,9 @@ not live in the configuration, and the run's pointers to the schedule and
 to the set of schedules are cleared before the post. A run that did not
 time out counts as `failed` when it has no status, a status below 200 or
 of 400 or more, or a discarded response. A 1xx status is not a final
-response (RFC 9110, section 15.2). A due run that cannot be allocated counts
-as `failed` and not in `runs`. A run whose request cannot be allocated on
-the worker engine is in `runs` and in `failed`.
+response (RFC 9110, section 15.2). A due run that cannot be allocated
+counts as `failed` and not in `runs`. A run whose request cannot be
+allocated on the worker engine is in `runs` and in `failed`.
 
 #### 7.2 Timeout
 
@@ -163,20 +164,23 @@ A run has its own timer; `r->timer` already carries `limits.timeout`, or
 the 5 s acknowledgement deadline when that is 0. The run's start time is
 taken on the main engine when the run is due, so the wait in the queue of
 the worker engine counts: the run timer is armed for `timeout` less that
-wait, and `last_duration_ms` counts from the same start. On expiry the run timer
-calls `nxt_router_request_expire()`, factored out of
-`nxt_router_app_timeout()`: a queued request is retracted, and a running
-one is abandoned; both are answered with 503. A request that a worker
-claimed but did not acknowledge is left alone once: the function logs an
-alert and returns the acknowledgement deadline, and the run timer is armed
-again for that time. At the next expiry the request is answered with 503,
-also when the worker died after its claim. So every run ends at most one
-acknowledgement deadline after its `timeout`, and its joint and
+wait, and `last_duration_ms` counts from the same start.
+
+On expiry the run timer calls `nxt_router_request_expire()`, factored out
+of `nxt_router_app_timeout()`: a queued request is retracted, and a
+running one is abandoned; both are answered with 503. A request that a
+worker claimed but did not acknowledge is left alone once: the function
+logs an alert and returns the acknowledgement deadline, and the run timer
+is armed again for that time. At the next expiry the request is answered
+with 503, also when the worker died after its claim. So every run ends at
+most one acknowledgement deadline after its `timeout`, and its joint and
 configuration are released. The application timer shares this state
 (`claimed_expired`), so the timer that expires second answers. The run
-counts as timed out from its first expiry. The application is not
-stopped; the timeout only frees the schedule. After the response header, the router cannot answer 503: it
-discards the rest of the response. `last_status` is 503 for each run that
+counts as timed out from its first expiry.
+
+The application is not stopped; the timeout only frees the schedule.
+After the response header, the router cannot answer 503: it discards the
+rest of the response. `last_status` is 503 for each run that
 timed out. The abandoned worker keeps its slot in `processes.max` until it
 answers or exits; `nxt_router_app_abandon()` keeps it out of the idle
 queue. With `max: 1` the next run waits in the queue and, at its own
