@@ -11,13 +11,15 @@
 
 /*
  * The zone object from slice 1: the token bucket, the burst cap, per-key
- * isolation, eviction when the arena is full, and the counters.  The clock is
+ * isolation, the overflow bucket and the eviction of an idle entry when
+ * the arena is full, and the counters.  The clock is
  * a parameter, so every case is deterministic and needs no sleeps.
  */
 
 static const u_char  nxt_limit_key_a[4] = { 10, 0, 0, 1 };
 static const u_char  nxt_limit_key_b[4] = { 10, 0, 0, 2 };
 static const u_char  nxt_limit_key_c[4] = { 10, 0, 0, 3 };
+static const u_char  nxt_limit_key_d[4] = { 10, 0, 0, 4 };
 
 
 static nxt_bool_t
@@ -182,8 +184,10 @@ nxt_limit_zone_test(nxt_thread_t *thr)
                    "an empty key was limited instead of passed");
 
     /*
-     * Eviction: two slots, three keys.  The oldest entry is dropped and
-     * counted, and the arena never grows past keys_max.
+     * A full zone: two slots, four keys, 1 per second, a burst of 1.  The
+     * entries are in use, so the third and the fourth key share the
+     * overflow bucket: the third one empties it, the fourth one is
+     * rejected.  The arena never grows past keys_max.
      */
 
     small = nxt_limit_zone_create(mp, 2, 1, 1);
@@ -200,21 +204,42 @@ nxt_limit_zone_test(nxt_thread_t *thr)
 
     NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(small, nxt_limit_key_c,
                        20000) == 1,
-                   "the third key was rejected instead of evicting");
+                   "the third key was rejected by a full overflow bucket");
 
-    NXT_TEST_CHECK(thr->log, small->keys_used == 2 && small->evicted == 1,
-                   "after eviction: keys_used %ui, evicted %uL",
-                   small->keys_used, small->evicted);
+    NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(small, nxt_limit_key_d,
+                       30000) == 0,
+                   "the fourth key got a fresh bucket in a full zone");
 
-    /* The evicted key starts a fresh bucket, so its next request passes. */
+    NXT_TEST_CHECK(thr->log, small->keys_used == 2 && small->evicted == 0
+                             && small->overflowed == 2,
+                   "full zone: keys_used %uD, evicted %uL, overflowed %uL",
+                   small->keys_used, small->evicted, small->overflowed);
+
+    /* The first key keeps its empty bucket. */
 
     NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(small, nxt_limit_key_a,
-                       21000) == 1,
-                   "the evicted key did not get a fresh bucket");
+                       40000) == 0,
+                   "a key in a full zone got a fresh bucket");
 
-    NXT_TEST_CHECK(thr->log, small->keys_used == 2 && small->evicted == 2,
-                   "a second eviction was not counted: keys_used %ui, "
-                   "evicted %uL", small->keys_used, small->evicted);
+    /*
+     * One second later the bucket of the least recently used key, b, is
+     * full again: the entry is idle, and the new key takes it.
+     */
+
+    NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(small, nxt_limit_key_c,
+                       1010000) == 1,
+                   "the new key did not take the idle entry");
+
+    NXT_TEST_CHECK(thr->log, small->keys_used == 2 && small->evicted == 1
+                             && small->overflowed == 2,
+                   "idle entry: keys_used %uD, evicted %uL, overflowed %uL",
+                   small->keys_used, small->evicted, small->overflowed);
+
+    /* The key that took the entry has its own bucket now. */
+
+    NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(small, nxt_limit_key_c,
+                       1010001) == 0,
+                   "the key of an idle entry was not limited");
 
     nxt_mp_destroy(mp);
 

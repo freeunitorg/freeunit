@@ -2464,6 +2464,7 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         zone_stat->passed = zone->zone->passed;
         zone_stat->rejected = zone->zone->rejected;
         zone_stat->evicted = zone->zone->evicted;
+        zone_stat->overflow = zone->zone->overflowed;
 
         nxt_thread_spin_unlock(&zone->zone->lock);
 

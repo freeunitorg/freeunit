@@ -27,6 +27,7 @@ typedef struct {
     uint64_t          passed;
     uint64_t          rejected;
     uint64_t          evicted;
+    uint64_t          overflow;
 } nxt_status_limit_zone_t;
 
 

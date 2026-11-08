@@ -12,12 +12,12 @@ static uint32_t nxt_limit_hash(const uint8_t *key, size_t len);
 static nxt_limit_entry_t *nxt_limit_lookup(nxt_limit_zone_t *zone,
     const uint8_t *key, size_t len, uint32_t hash, uint32_t *bucket);
 static nxt_limit_entry_t *nxt_limit_claim(nxt_limit_zone_t *zone,
-    const uint8_t *key, size_t len, uint32_t hash);
+    const uint8_t *key, size_t len, uint32_t hash, uint64_t now_us);
 static void nxt_limit_unlink(nxt_limit_zone_t *zone, uint32_t idx,
     uint32_t bucket);
 static void nxt_limit_lru_unlink(nxt_limit_zone_t *zone, uint32_t idx);
 static void nxt_limit_lru_link(nxt_limit_zone_t *zone, uint32_t idx);
-static uint32_t nxt_limit_evict_oldest(nxt_limit_zone_t *zone);
+static uint32_t nxt_limit_evict_idle(nxt_limit_zone_t *zone, uint64_t now_us);
 static void nxt_limit_refill(nxt_limit_zone_t *zone, nxt_limit_entry_t *entry,
     uint64_t now_us);
 
@@ -105,6 +105,8 @@ nxt_limit_zone_create(nxt_mp_t *mp, uint32_t keys_max, uint32_t rate,
     zone->rate = rate;
     zone->burst = burst;
 
+    zone->overflow.tokens = (uint64_t) burst * NXT_LIMIT_TOKEN_SCALE;
+
     return zone;
 }
 
@@ -149,11 +151,12 @@ nxt_limit_zone_check(nxt_limit_zone_t *zone, const uint8_t *key,
         nxt_limit_lru_link(zone, entry - zone->entries);
 
     } else {
-        entry = nxt_limit_claim(zone, key, key_len, hash);
+        entry = nxt_limit_claim(zone, key, key_len, hash, now_us);
 
         if (entry == NULL) {
-            nxt_thread_spin_unlock(&zone->lock);
-            return 1;
+            /* Full, and no entry is idle: the shared bucket counts it. */
+            entry = &zone->overflow;
+            zone->overflowed++;
         }
     }
 
@@ -206,9 +209,14 @@ nxt_limit_lookup(nxt_limit_zone_t *zone, const uint8_t *key, size_t len,
 }
 
 
+/*
+ * A free entry, or the least recently used one when it is idle.  NULL when
+ * the zone is full and that entry is in use.
+ */
+
 static nxt_limit_entry_t *
 nxt_limit_claim(nxt_limit_zone_t *zone, const uint8_t *key, size_t len,
-    uint32_t hash)
+    uint32_t hash, uint64_t now_us)
 {
     uint32_t            bucket, idx;
     nxt_limit_entry_t   *entry;
@@ -220,7 +228,7 @@ nxt_limit_claim(nxt_limit_zone_t *zone, const uint8_t *key, size_t len,
         zone->keys_used++;
 
     } else {
-        idx = nxt_limit_evict_oldest(zone);
+        idx = nxt_limit_evict_idle(zone, now_us);
 
         if (idx == (uint32_t) -1) {
             return NULL;
@@ -319,10 +327,17 @@ nxt_limit_lru_link(nxt_limit_zone_t *zone, uint32_t idx)
  * oldest last_us, found without a scan of the arena.  A scan cost 28 us
  * per request at 16384 keys, under the lock, for every new key once the
  * arena was full.
+ *
+ * It is given to the new key only when it is idle: its bucket is full at
+ * now_us, as a new bucket is, so its key loses nothing.  An entry in use
+ * is kept: else a client that uses more keys than the zone holds gets a
+ * fresh bucket for every request.  Only the tail is looked at, so an idle
+ * entry elsewhere is not found; the new key then takes the overflow
+ * bucket, which is the safe side.
  */
 
 static uint32_t
-nxt_limit_evict_oldest(nxt_limit_zone_t *zone)
+nxt_limit_evict_idle(nxt_limit_zone_t *zone, uint64_t now_us)
 {
     uint32_t            oldest, bucket, hash;
     nxt_limit_entry_t   *entry;
@@ -333,6 +348,12 @@ nxt_limit_evict_oldest(nxt_limit_zone_t *zone)
 
     oldest = zone->lru_tail - 1;
     entry = &zone->entries[oldest];
+
+    nxt_limit_refill(zone, entry, now_us);
+
+    if (entry->tokens < (uint64_t) zone->burst * NXT_LIMIT_TOKEN_SCALE) {
+        return (uint32_t) -1;
+    }
 
     nxt_limit_lru_unlink(zone, oldest);
 

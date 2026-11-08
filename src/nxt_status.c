@@ -55,6 +55,7 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
     static const nxt_str_t  passed_str = nxt_string("passed");
     static const nxt_str_t  rejected_str = nxt_string("rejected");
     static const nxt_str_t  evicted_str = nxt_string("evicted");
+    static const nxt_str_t  overflow_str = nxt_string("overflow");
 
     /*
      * modules, connections, requests, applications -- plus "telemetry" when
@@ -300,7 +301,7 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
         zone = nxt_status_limit_zones(report);
 
         for (i = 0; i < report->limit_zones_count; i++, zone++) {
-            zone_obj = nxt_conf_create_object(mp, 5);
+            zone_obj = nxt_conf_create_object(mp, 6);
             if (nxt_slow_path(zone_obj == NULL)) {
                 return NULL;
             }
@@ -322,6 +323,8 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
                                         zone->rejected, 3);
             nxt_conf_set_member_integer(zone_obj, &evicted_str,
                                         zone->evicted, 4);
+            nxt_conf_set_member_integer(zone_obj, &overflow_str,
+                                        zone->overflow, 5);
         }
     }
 
