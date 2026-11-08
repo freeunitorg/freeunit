@@ -40,6 +40,28 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        takes "chunked" in any letter case (RFC 9112, Section 7); before,
        "Chunked" got 501.
 
+    *) Change: the "response_headers" option now refuses "Content-Length" in
+       any letter case and "Transfer-Encoding", because Unit sets the body
+       length of a response itself. Before, the name check was
+       case-sensitive, so "content-length" was accepted, and
+       "Transfer-Encoding" was not checked; a response could get two body
+       lengths. A stored configuration from an earlier version with these
+       names still loads: Unit logs a warning and does not send these
+       fields. The control API refuses updates until they are removed.
+
+    *) Bugfix: the proxy read the status code of an upstream response at a
+       fixed offset, so "HTTP/1.1 2049 OK" was read as 204, and "HTTP/1.1
+       200OK" or a tab separator was accepted. Now the status code must have
+       one space before it and a space or the line end after it, and a CR is
+       valid only before the LF (RFC 9112, Sections 2.2 and 4). Other status
+       lines get 502.
+
+    *) Bugfix: the Python WSGI and ASGI modules took a response header whose
+       name had the same hash as "Content-Length" as the body length, and
+       ASGI took a request header with the same hash as
+       "Sec-WebSocket-Protocol" as the WebSocket subprotocols. Now the name
+       is compared too, in any letter case.
+
     *) Feature: the PHP module now builds with PHP 8.7, which removed five
        members of "sapi_module_struct". The module names the members that it
        sets, so a member that PHP removes no longer shifts the others.

@@ -70,6 +70,18 @@ typedef struct {
 } nxt_python_proto_t;
 
 
+/*
+ * A hash match alone does not identify a field name, so compare the name
+ * too.  Field names are case-insensitive.
+ */
+nxt_inline int
+nxt_python_is_content_length(const char *name, size_t length)
+{
+    return length == nxt_length("Content-Length")
+           && nxt_memcasecmp(name, "Content-Length", length) == 0;
+}
+
+
 int nxt_python_init_strings(nxt_python_string_t *pstr);
 void nxt_python_done_strings(nxt_python_string_t *pstr);
 

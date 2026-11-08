@@ -802,6 +802,8 @@ nxt_py_asgi_create_http_scope(nxt_unit_request_info_t *req,
 
         if (f->hash == NXT_UNIT_HASH_WS_PROTOCOL
             && f->name_length == ws_protocol.length
+            && nxt_memcasecmp(nxt_unit_sptr_get(&f->name), ws_protocol.start,
+                              ws_protocol.length) == 0
             && f->value_length > 0
             && r->websocket_handshake)
         {
@@ -1453,7 +1455,9 @@ nxt_py_asgi_add_field(void *data, int i, PyObject *name, PyObject *val)
                             "failed to add header #%d", i);
     }
 
-    if (req->response->fields[i].hash == NXT_UNIT_HASH_CONTENT_LENGTH) {
+    if (req->response->fields[i].hash == NXT_UNIT_HASH_CONTENT_LENGTH
+        && nxt_python_is_content_length(name_str, name_len))
+    {
         content_length = nxt_off_t_parse((u_char *) val_str, val_len);
         if (nxt_slow_path(content_length < 0)) {
             nxt_unit_req_error(req, "failed to parse Content-Length "
