@@ -645,6 +645,40 @@ def test_schedules_run_remove():
     assert len(records('start')) == n
 
 
+def test_schedules_run_remove_add_running():
+    # A schedule that is removed while its run is in progress, and added
+    # again before that run ends, gets its state back
+    # (nxt_router_schedule_update()): the counters carry over, the run
+    # still counts as running, and the state is not freed when the run
+    # ends.
+    with held_runs() as release:
+        s = run(uri=f'/?wait={release}', interval=2, timeout=120)
+
+        put_run(s)
+        wait_for_starts(1, 10)
+
+        put_run({})
+        assert Log.wait_for_record(r'"cron": removed, the run in progress')
+
+        put_run(s)
+        sched = status_schedules()['cron']
+        assert sched['runs'] == 1 and sched['running'] == 1, sched
+
+        # The schedule that is back waits a new interval; that run is
+        # skipped.
+        wait_for_status('cron', lambda s: s['skipped'] >= 1, 10)
+
+        release_runs(release)
+        sched = wait_for_status('cron', lambda s: s['last_status'] == 200, 10)
+        assert sched['failed'] == sched['timed_out'] == 0, sched
+
+    # The state lives on: the next run starts, and "runs" goes on from 1.
+    wait_for_starts(2, 10)
+    sched = wait_for_runs('cron', 2, 10)
+    assert sched['skipped'] >= 1, sched
+    assert len(Log.findall(r'schedule "cron": first run in')) == 2
+
+
 def test_schedules_run_rename():
     put_run(run())
     wait_for_starts(1, 5)
