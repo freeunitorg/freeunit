@@ -225,6 +225,9 @@ struct nxt_http_request_s {
     nxt_buf_t                       *out;
     const nxt_http_request_state_t  *state;
 
+    /* Bytes still to come of the application's current websocket frame. */
+    size_t                          ws_app_rest;
+
     nxt_nsec_t                      start_time;
 
     nxt_str_t                       host;
@@ -305,6 +308,8 @@ struct nxt_http_request_s {
     uint8_t                         header_sent;  /* 1 bit  */
     uint8_t                         inconsistent; /* 1 bit  */
     uint8_t                         ws_paused;    /* 1 bit  */
+    /* A CLOSE frame went to the client, the router's or the application's. */
+    uint8_t                         ws_closed;    /* 1 bit  */
     uint8_t                         truncated;    /* 1 bit  */
     uint8_t                         error;        /* 1 bit  */
     uint8_t                         websocket_handshake;  /* 1 bit */
@@ -483,6 +488,7 @@ void nxt_http_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_work_handler_t body_handler, void *data);
 void nxt_http_request_ws_frame_start(nxt_task_t *task, nxt_http_request_t *r,
     nxt_buf_t *ws_frame);
+void nxt_http_websocket_app_frame(nxt_http_request_t *r, nxt_buf_t *b);
 void nxt_http_request_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_buf_t *out);
 nxt_bool_t nxt_http_request_is_bodyless_final(nxt_http_request_t *r,

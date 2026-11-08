@@ -1,11 +1,16 @@
+import os
+import resource
+import select
 import socket
 import struct
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 from packaging import version
 
+from conftest import pid_by_name
 from unit.applications.lang.python import ApplicationPython
 from unit.applications.websockets import ApplicationWebsocket
 from unit.option import option
@@ -1790,6 +1795,129 @@ def check_app_queue_full_timeout(wait_for_record, gate):
 
     finally:
         sock.close()
+
+
+SHM_ALERT = (
+    r'websocket: no shared memory buffer for \d+ bytes of a \d+ byte frame, '
+    r'closing the connection'
+)
+
+
+@contextmanager
+def shm_segment_failure(skip_alert, text):
+    # The router copies each client frame into the application's outgoing
+    # shared memory.  A frame over 15 bytes goes to the application by
+    # reference and holds its 16 KiB chunk until the application reads it,
+    # so with the application stalled, 2000 frames of 64 bytes want more
+    # chunks than the 640 of one 10 MiB segment.  The pool has no limit but
+    # the segments the router can create: with RLIMIT_NOFILE at the router's
+    # open descriptor count, memfd_create() fails and the frame has nowhere
+    # to go.  The application is held until the assertions are done: a
+    # resumed application frees chunks, and then nothing fails.
+    skip_alert(
+        r'(memfd_create|shm_open)\(.+\) failed',
+        r'websocket: no shared memory buffer',
+    )
+
+    gate = f'{option.temp_dir}/stall-gate'
+    client.load('websockets/stall', environment={'UNIT_TEST_STALL_GATE': gate})
+
+    router = pid_by_name('unit: router')
+    assert router is not None, 'router pid'
+    router = int(router)
+
+    # prlimit() on another process needs the same user or CAP_SYS_RESOURCE,
+    # and a container's seccomp profile can refuse it (Alpine on armv7).
+    try:
+        limits = resource.prlimit(router, resource.RLIMIT_NOFILE)
+
+    except PermissionError:
+        pytest.skip('prlimit() on the router is not permitted here')
+
+    _, sock, _ = ws.upgrade()
+
+    try:
+        ws.frame_write(sock, ws.OP_TEXT, text)
+        assert waitforfiles(gate + '.started', timeout=150), 'application stalled'
+
+        # The soft limit only: raising the hard limit of another process
+        # back needs CAP_SYS_RESOURCE, which a container may not have.
+        nfds = len(os.listdir(f'/proc/{router}/fd'))
+        resource.prlimit(router, resource.RLIMIT_NOFILE, (nfds, limits[1]))
+
+        # The send stops on the close; see frame_write().
+        ws.message(sock, ws.OP_BINARY, b'*' * (2000 * 64), fragmention_size=64)
+
+        yield sock
+
+    finally:
+        resource.prlimit(router, resource.RLIMIT_NOFILE, limits)
+
+        Path(gate + '.release').touch()
+        if Path(gate + '.started').exists():
+            waitforfiles(gate + '.released', timeout=150)
+
+        sock.close()
+
+
+@pytest.mark.skipif(
+    not hasattr(resource, 'prlimit'),
+    reason='lowers the router RLIMIT_NOFILE with prlimit()',
+)
+def test_asgi_websockets_shm_segment_failure_close(
+    findall, skip_alert, wait_for_record
+):
+    # The router must send the client a CLOSE frame with code 1011 before it
+    # closes the connection, and alert once, not once per frame (#658).
+    with shm_segment_failure(skip_alert, 'stall') as sock:
+        try:
+            frame = ws.frame_read(sock)
+
+        except ConnectionResetError:
+            pytest.fail('The server reset the connection, no CLOSE frame.')
+
+        check_close(sock, 1011, frame=frame)  # 1011 - INTERNAL_SERVER_ERROR
+
+        assert wait_for_record(SHM_ALERT), 'alert'
+        assert len(findall(SHM_ALERT)) == 1, 'one alert per connection'
+
+
+@pytest.mark.skipif(
+    not hasattr(resource, 'prlimit'),
+    reason='lowers the router RLIMIT_NOFILE with prlimit()',
+)
+def test_asgi_websockets_shm_segment_failure_after_app_close(
+    skip_alert, wait_for_record
+):
+    # The same failure after the application sent its CLOSE frame and kept
+    # the request open: ASGI sends "websocket.close" as a frame and ends the
+    # request only when the coroutine returns, for example after
+    # "websocket.disconnect".  No frame may follow a CLOSE (RFC 6455 Section
+    # 5.5.1), so the router must close the connection without a CLOSE frame
+    # of its own: the client reads the application's one and then the end
+    # of the connection.
+    with shm_segment_failure(skip_alert, 'close-stall') as sock:
+        try:
+            frame = ws.frame_read(sock)
+
+        except ConnectionResetError:
+            pytest.fail('The server reset the connection, no CLOSE frame.')
+
+        check_close(sock, 1000, no_close=True, frame=frame)  # the app's
+
+        assert wait_for_record(SHM_ALERT), 'alert'
+
+        # Then the end of the connection: an EOF, or a reset when the router
+        # still had unread frames.  A second CLOSE frame would read as b'\x88'.
+        assert select.select([sock], [], [], 60)[0], 'connection closed'
+
+        try:
+            data = sock.recv(1)
+
+        except ConnectionResetError:
+            data = b''
+
+        assert data == b'', 'no frame after the application CLOSE'
 
 
 def test_asgi_websockets_second_frame_over_buffer_limit():

@@ -6,6 +6,14 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        RUSTSEC-2026-0424. Cranelift moves to 0.135.8 with Wasmtime. The
        contrib C API pin is 48.0.8 too.
 
+    *) Bugfix: when the router got no shared memory for a WebSocket frame
+       from the client, because it could not create a new segment, or could
+       not hand the frame to the application, it closed the connection
+       without a CLOSE frame, and the client saw an EOF or a reset. The
+       router now sends a CLOSE frame with code 1011 before it closes the
+       connection, unless a CLOSE frame already went to the client. The
+       shared memory failure is logged at alert level once per connection.
+
     *) Bugfix: a request to a "pass" with variables that named a missing
        application target could crash the router; such a request now gets a
        404 response. Each request to a "pass" with variables that named an
