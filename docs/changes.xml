@@ -134,6 +134,14 @@ refused in the same way.  Valid extensions are still ignored.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a proxy route crashed the router when the upstream answered a WebSocket
+handshake with 101 and the client then sent a frame.  The proxy cannot pass
+WebSocket, so it now answers 502 and logs a warning.
+</para>
+</change>
+
 <change type="feature">
 <para>
 the PHP module now builds with PHP 8.7, which removed five members of
