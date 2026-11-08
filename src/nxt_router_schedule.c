@@ -411,9 +411,13 @@ nxt_router_schedules_joint_init(nxt_task_t *task, nxt_router_conf_t *rtcf,
  * longer fail.  The new joint goes on the first worker engine's joints, so
  * that engine cannot exit under a run; router->engines lists only worker
  * engines, and the main engine's port would take a reply for a
- * configuration.  States are matched by name, so "running" carries over.
- * The previous joint's own reference is dropped on its engine: runs in
- * flight keep that configuration alive.
+ * configuration.  The list is not empty: nxt_router_engines_post() has
+ * added the engines of this configuration, and "listen_threads" is at
+ * least 1.  A decrease of "listen_threads" removes the last engines, never
+ * the first (nxt_router_engines_create()), so every joint has a live
+ * engine.  States are matched by name, so "running" carries over.  The
+ * previous joint's own reference is dropped on its engine: runs in flight
+ * keep that configuration alive.
  */
 
 void
@@ -431,18 +435,15 @@ nxt_router_schedules_apply(nxt_task_t *task, nxt_router_temp_conf_t *tmcf)
     if (sc != NULL) {
         engines = &tmcf->router_conf->router->engines;
 
-        if (!nxt_queue_is_empty(engines)) {
-            engine = nxt_queue_link_data(nxt_queue_first(engines),
-                                         nxt_event_engine_t, link0);
-            sc->joint.engine = engine;
+        nxt_assert(!nxt_queue_is_empty(engines));
 
-            nxt_router_schedule_post(engine, &sc->insert_work,
-                                     nxt_router_schedules_insert_handler,
-                                     &sc->joint);
+        engine = nxt_queue_link_data(nxt_queue_first(engines),
+                                     nxt_event_engine_t, link0);
+        sc->joint.engine = engine;
 
-        } else {
-            nxt_alert(task, "schedules: no worker engine, no run will start");
-        }
+        nxt_router_schedule_post(engine, &sc->insert_work,
+                                 nxt_router_schedules_insert_handler,
+                                 &sc->joint);
 
         for (i = 0; i < sc->nschedules; i++) {
             nxt_router_schedule_update(task, sc, &sc->schedule[i]);
@@ -461,11 +462,6 @@ nxt_router_schedules_apply(nxt_task_t *task, nxt_router_temp_conf_t *tmcf)
     } nxt_queue_loop;
 
     if (old == NULL) {
-        return;
-    }
-
-    if (old->joint.engine == NULL) {
-        nxt_router_conf_release(task, &old->joint);
         return;
     }
 
@@ -704,14 +700,12 @@ nxt_router_schedule_timer_handler(nxt_task_t *task, void *obj, void *data)
 
     engine = state->schedules->joint.engine;
 
-    run = (engine != NULL) ? nxt_zalloc(sizeof(nxt_router_schedule_run_t))
-                           : NULL;
+    run = nxt_zalloc(sizeof(nxt_router_schedule_run_t));
     if (nxt_slow_path(run == NULL)) {
         state->stat.failed++;
 
-        nxt_log(task, NXT_LOG_WARN, "schedule \"%V\": run failed, %s",
-                &state->stat.name, (engine == NULL) ? "no worker engine"
-                                                    : "out of memory");
+        nxt_log(task, NXT_LOG_WARN, "schedule \"%V\": run failed, out of "
+                "memory", &state->stat.name);
         return;
     }
 

@@ -609,7 +609,9 @@ def test_schedules_run_listen_threads():
             settings={"listen_threads": 4})
     wait_for_starts(1, 5)
 
-    # The run's engine may be the one that goes; it must stay until the end.
+    # The runs go to the first router thread.  A decrease removes the last
+    # threads, never the first, so the run in flight ends on its thread,
+    # and the runs go on after each change.
     assert 'success' in client.conf({"listen_threads": 1}, 'settings')
     waitforrecords(run_log(), 1, 5, 'end')
     wait_for_starts(3, 8)
