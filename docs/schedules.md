@@ -166,10 +166,13 @@ was in progress stays in the object until that run ends. Runs also count in
 
 - **The error log shows only a part of the URI.** It drops the query, and
   then cuts the path after its last `/`: `/cron/KEY` shows as `/cron/...`,
-  and `/cron.php?key=a/b` shows as `/...`. A successful run is logged at
-  `debug` level only. A failed run, a timeout and a skip are logged at `warn`
-  level. The line for a failed run also shows up to the first 256 bytes of
-  the response body, with each byte below 0x20 or above 0x7E shown as `.`.
+  and `/cron.php?key=a/b` shows as `/...`. A key in an earlier segment is
+  logged: `/KEY/cron` shows as `/KEY/...`. Put the key in the last segment
+  or in the query. A successful run is logged at `debug` level only. A
+  failed run, a timeout and a skip are logged at `warn` level. The line for
+  a failed run shows the status, not the response body: an application can
+  echo the URI, and with it the key, into the body. A `--debug` build also
+  logs each request line at `debug` level, with the whole URI.
 
 - **`fastcgi_finish_request()` makes a run finish early.** The run is
   complete once the response is sent, so `overlap: "skip"` does not cover

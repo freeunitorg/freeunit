@@ -125,9 +125,8 @@ The joint count is not atomic, so it is only touched on its engine.
 (`src/nxt_http_devnull.c`). With it every guarded protocol call works
 unchanged: `body_read` calls `ready_handler` with no body (a run never
 calls it: it skips `nxt_http_request_start()`), `header_send`
-proceeds straight to the body, `send` counts the bytes, keeps the first 256
-for the log and completes every buffer, and `close` hands the joint back to
-the owner. `$body_bytes_sent` works; `$response_connection` and
+proceeds straight to the body, `send` counts the bytes and completes every
+buffer without keeping any, and `close` hands the joint back to the owner. `$body_bytes_sent` works; `$response_connection` and
 `$response_transfer_encoding` now check for h1.
 
 #### 6.3 Building the request
@@ -179,9 +178,10 @@ timeout, is retracted from there and answered 503.
 Failures, timeouts and skips are logged at `warn`, a success at `debug`
 only: with `interval: 1` an `info` line a second is noise. The URI in these
 lines has no query and is cut after the last `/` of its path, where a cron
-key usually starts (`nxt_router_schedule_uri_public()`). A failure line also
-shows up to 256 bytes of the response body, with bytes outside 0x20 to
-0x7E shown as `.`. The access log records runs from `127.0.0.1` with the
+key usually starts (`nxt_router_schedule_uri_public()`). This is a
+heuristic: a key in an earlier segment is logged. A failure line does not
+show the response body: an application can echo the URI, and with it the
+key, into the body. The access log records runs from `127.0.0.1` with the
 schedule's user agent.
 
 ### 8. Status

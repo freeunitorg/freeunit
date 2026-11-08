@@ -65,12 +65,14 @@ nxt_http_devnull_header_send(nxt_task_t *task, nxt_http_request_t *r,
 }
 
 
-/* Completing the sync "last" buffer is what ends the request. */
+/*
+ * Completing the sync "last" buffer is what ends the request.  The body is
+ * not kept: an application can echo a secret of the request into it.
+ */
 
 void
 nxt_http_devnull_send(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
 {
-    size_t              size, n;
     nxt_buf_t           *b;
     nxt_http_devnull_t  *dn;
 
@@ -81,15 +83,7 @@ nxt_http_devnull_send(nxt_task_t *task, nxt_http_request_t *r, nxt_buf_t *out)
             continue;
         }
 
-        size = nxt_buf_used_size(b);
-        dn->body_bytes += size;
-
-        if (nxt_buf_is_mem(b) && dn->head_length < NXT_HTTP_DEVNULL_HEAD) {
-            n = nxt_min(size, NXT_HTTP_DEVNULL_HEAD - dn->head_length);
-
-            nxt_memcpy(dn->head + dn->head_length, b->mem.pos, n);
-            dn->head_length += n;
-        }
+        dn->body_bytes += nxt_buf_used_size(b);
     }
 
     nxt_debug(task, "devnull request send: %O body bytes", dn->body_bytes);

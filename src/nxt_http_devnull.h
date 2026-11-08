@@ -12,14 +12,11 @@
 
 /*
  * NXT_HTTP_PROTO_DEVNULL: a request with no client connection
- * (docs/adr/0004-schedules.md, section 6.2).  The response is counted and
- * its head kept, and every buffer is completed at once.  r->proto.any
- * points at an nxt_http_devnull_t embedded in the owner's object; ->close
- * replaces the connection close, and must release "joint" on this engine.
+ * (docs/adr/0004-schedules.md, section 6.2).  The response body is counted,
+ * not kept, and every buffer is completed at once.  r->proto.any points at
+ * an nxt_http_devnull_t embedded in the owner's object; ->close replaces
+ * the connection close, and must release "joint" on this engine.
  */
-
-#define NXT_HTTP_DEVNULL_HEAD  256
-
 
 typedef struct nxt_http_devnull_s  nxt_http_devnull_t;
 
@@ -33,9 +30,6 @@ struct nxt_http_devnull_s {
     nxt_off_t                 body_bytes;
     nxt_http_status_t         status;
     uint8_t                   discarded;  /* 1 bit */
-
-    size_t                    head_length;
-    u_char                    head[NXT_HTTP_DEVNULL_HEAD];
 };
 
 

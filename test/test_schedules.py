@@ -466,12 +466,17 @@ def test_schedules_run_status():
             limits={"timeout": 1})
 
     # The line shows the path without the query, cut after its last "/",
-    # and then the start of the response body.
-    assert Log.wait_for_record(
-        r'\[warn\].*schedule "cron" run 1: GET /cron/\.\.\. -> 500 in \d+ ms: '
-        r'"ran /cron/SECRET_KEY\?status=500\."'
-    )
-    assert not Log.findall(r'GET /cron/SECRET'), 'the key was logged'
+    # and the status.  It does not show the response body: the application
+    # echoes the URI there, with the key.
+    line = (r'\[warn\].*schedule "cron" run 1: GET /cron/\.\.\. -> 500 '
+            r'in \d+ ms')
+    assert Log.wait_for_record(line)
+    assert Log.findall(f'{line}$'), 'the line shows more than the status'
+
+    # A --debug build logs each request line at debug level, with the key.
+    leaks = [rec for rec in Log.read().splitlines()
+             if 'SECRET' in rec and '[debug]' not in rec]
+    assert not leaks, 'the key was logged'
 
     # The application's own "limits" answer 503 first.
     assert Log.wait_for_record(

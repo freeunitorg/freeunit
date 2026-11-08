@@ -945,8 +945,7 @@ nxt_router_schedule_run_close(nxt_task_t *task, nxt_http_devnull_t *dn,
 static void
 nxt_router_schedule_run_finish(nxt_task_t *task, void *obj, void *data)
 {
-    size_t                     i, n;
-    u_char                     *p;
+    size_t                     n;
     nxt_http_status_t          status;
     nxt_router_schedule_t      *sched;
     nxt_socket_conf_joint_t    *joint;
@@ -970,18 +969,15 @@ nxt_router_schedule_run_finish(nxt_task_t *task, void *obj, void *data)
     {
         run->failed = 1;
 
-        p = run->devnull.head;
-
-        for (i = 0; i < run->devnull.head_length; i++) {
-            if (p[i] < 0x20 || p[i] >= 0x7F) {
-                p[i] = '.';
-            }
-        }
+        /*
+         * Not the response body: the application can echo the URI, and
+         * with it the key that the URI above leaves out.
+         */
 
         nxt_log(task, NXT_LOG_WARN, "schedule \"%V\" run %uD: GET %*s%s -> "
-                "%d in %M ms: \"%*s\"", &sched->name, run->seq, n,
-                sched->uri.start, (n < sched->uri.length) ? "..." : "",
-                (int) status, run->duration, run->devnull.head_length, p);
+                "%d in %M ms", &sched->name, run->seq, n, sched->uri.start,
+                (n < sched->uri.length) ? "..." : "", (int) status,
+                run->duration);
 
     } else {
         /* Debug only: with "interval": 1, an info line a second is noise. */
