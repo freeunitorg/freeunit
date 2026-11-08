@@ -174,10 +174,30 @@ static nxt_int_t nxt_conf_vldt_limit_req_zone(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_limit_req_stage(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
-static nxt_int_t nxt_conf_vldt_limit_req_shared(nxt_conf_validation_t *vldt,
-    nxt_conf_value_t *value);
+/* A "limit_req" as nxt_conf_vldt_limit_req_get() reads it. */
+typedef struct {
+    nxt_str_t         name;
+    uint32_t          keys_max;
+    int64_t           rate;
+    int64_t           burst;
+    /* The "limit_req" object. */
+    nxt_conf_value_t  *value;
+} nxt_conf_vldt_limit_zone_t;
+
+typedef nxt_int_t (*nxt_conf_vldt_limit_req_handler_t)(
+    nxt_conf_validation_t *vldt, nxt_conf_value_t *limit, void *data);
+static nxt_int_t nxt_conf_vldt_limit_req_get(nxt_conf_value_t *limit,
+    nxt_conf_vldt_limit_zone_t *zone);
+static nxt_int_t nxt_conf_vldt_limit_req_each(nxt_conf_validation_t *vldt,
+    nxt_conf_vldt_limit_req_handler_t handler, void *data);
 static nxt_int_t nxt_conf_vldt_limit_req_route(nxt_conf_validation_t *vldt,
-    nxt_conf_value_t *value, nxt_conf_value_t *route);
+    nxt_conf_value_t *route, nxt_conf_vldt_limit_req_handler_t handler,
+    void *data);
+static nxt_int_t nxt_conf_vldt_limit_req_shared(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *limit, void *data);
+static nxt_int_t nxt_conf_vldt_limit_req_count(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *limit, void *data);
+static nxt_int_t nxt_conf_vldt_limit_req_total(nxt_conf_validation_t *vldt);
 static nxt_int_t nxt_conf_vldt_compression_level(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_compression_encoding(nxt_conf_validation_t *vldt,
@@ -3817,14 +3837,32 @@ static nxt_int_t
 nxt_conf_vldt_limit_req(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
     void *data)
 {
-    nxt_int_t  ret;
+    nxt_int_t                   ret;
+    nxt_conf_vldt_limit_zone_t  zone;
 
     ret = nxt_conf_vldt_object(vldt, value, nxt_conf_vldt_limit_req_members);
     if (ret != NXT_OK) {
         return ret;
     }
 
-    return nxt_conf_vldt_limit_req_shared(vldt, value);
+    if (nxt_conf_vldt_limit_req_get(value, &zone) == NXT_OK) {
+        ret = nxt_conf_vldt_limit_req_each(vldt,
+                                           nxt_conf_vldt_limit_req_shared,
+                                           &zone);
+        if (ret != NXT_OK) {
+            return ret;
+        }
+    }
+
+    /* The zones of the whole configuration are counted once. */
+
+    if (!vldt->limit_req_counted) {
+        vldt->limit_req_counted = 1;
+
+        return nxt_conf_vldt_limit_req_total(vldt);
+    }
+
+    return NXT_OK;
 }
 
 
@@ -3925,15 +3963,15 @@ nxt_conf_vldt_limit_req_stage(nxt_conf_validation_t *vldt,
 
 
 /*
- * Every "limit_req" that names one zone must ask the same size, "rate"
- * and "burst": the zone object holds one of each.  The others are looked
- * for in the whole configuration before their own validation: a member
- * of a wrong type is skipped here and refused there.
+ * Calls the handler for every "limit_req" object of the routes: in the
+ * action of each step, and in the "fallback" of an action, at any depth.
+ * The values are looked at before their own validation: a member of a
+ * wrong type is skipped here and refused there.
  */
 
 static nxt_int_t
-nxt_conf_vldt_limit_req_shared(nxt_conf_validation_t *vldt,
-    nxt_conf_value_t *value)
+nxt_conf_vldt_limit_req_each(nxt_conf_validation_t *vldt,
+    nxt_conf_vldt_limit_req_handler_t handler, void *data)
 {
     uint32_t          index;
     nxt_str_t         name;
@@ -3948,7 +3986,7 @@ nxt_conf_vldt_limit_req_shared(nxt_conf_validation_t *vldt,
     }
 
     if (nxt_conf_type(routes) == NXT_CONF_ARRAY) {
-        return nxt_conf_vldt_limit_req_route(vldt, value, routes);
+        return nxt_conf_vldt_limit_req_route(vldt, routes, handler, data);
     }
 
     if (nxt_conf_type(routes) != NXT_CONF_OBJECT) {
@@ -3967,7 +4005,7 @@ nxt_conf_vldt_limit_req_shared(nxt_conf_validation_t *vldt,
             continue;
         }
 
-        ret = nxt_conf_vldt_limit_req_route(vldt, value, route);
+        ret = nxt_conf_vldt_limit_req_route(vldt, route, handler, data);
         if (ret != NXT_OK) {
             return ret;
         }
@@ -3977,33 +4015,16 @@ nxt_conf_vldt_limit_req_shared(nxt_conf_validation_t *vldt,
 
 static nxt_int_t
 nxt_conf_vldt_limit_req_route(nxt_conf_validation_t *vldt,
-    nxt_conf_value_t *value, nxt_conf_value_t *route)
+    nxt_conf_value_t *route, nxt_conf_vldt_limit_req_handler_t handler,
+    void *data)
 {
-    uint32_t          i, n, keys_max, other_keys_max;
-    int64_t           rate, burst, other_rate, other_burst;
-    nxt_str_t         zone, name, other_name;
+    uint32_t          i, n;
     nxt_int_t         ret;
-    nxt_conf_value_t  *step, *action, *other, *member;
+    nxt_conf_value_t  *step, *action, *limit;
 
     static const nxt_str_t  action_str = nxt_string("action");
+    static const nxt_str_t  fallback_str = nxt_string("fallback");
     static const nxt_str_t  limit_req_str = nxt_string("limit_req");
-    static const nxt_str_t  zone_str = nxt_string("zone");
-    static const nxt_str_t  rate_str = nxt_string("rate");
-    static const nxt_str_t  burst_str = nxt_string("burst");
-
-    member = nxt_conf_get_object_member(value, &zone_str, NULL);
-    nxt_conf_get_string(member, &zone);
-
-    ret = nxt_http_limit_req_zone_parse(&zone, &name, &keys_max);
-    if (ret != NXT_OK) {
-        return NXT_OK;
-    }
-
-    member = nxt_conf_get_object_member(value, &rate_str, NULL);
-    rate = nxt_conf_get_number(member);
-
-    member = nxt_conf_get_object_member(value, &burst_str, NULL);
-    burst = (member != NULL) ? nxt_conf_get_number(member) : 1;
 
     n = nxt_conf_array_elements_count(route);
 
@@ -4016,60 +4037,195 @@ nxt_conf_vldt_limit_req_route(nxt_conf_validation_t *vldt,
 
         action = nxt_conf_get_object_member(step, &action_str, NULL);
 
-        if (action == NULL || nxt_conf_type(action) != NXT_CONF_OBJECT) {
-            continue;
+        while (action != NULL && nxt_conf_type(action) == NXT_CONF_OBJECT) {
+            limit = nxt_conf_get_object_member(action, &limit_req_str, NULL);
+
+            if (limit != NULL && nxt_conf_type(limit) == NXT_CONF_OBJECT) {
+                ret = handler(vldt, limit, data);
+                if (ret != NXT_OK) {
+                    return ret;
+                }
+            }
+
+            action = nxt_conf_get_object_member(action, &fallback_str, NULL);
         }
+    }
 
-        other = nxt_conf_get_object_member(action, &limit_req_str, NULL);
+    return NXT_OK;
+}
 
-        if (other == NULL || other == value
-            || nxt_conf_type(other) != NXT_CONF_OBJECT)
-        {
-            continue;
+
+/*
+ * The zone, the size, "rate" and "burst" of a "limit_req".  NXT_DECLINED
+ * when one of them has a wrong type or value: its own validation says so.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_limit_req_get(nxt_conf_value_t *limit,
+    nxt_conf_vldt_limit_zone_t *zone)
+{
+    nxt_str_t         str;
+    nxt_conf_value_t  *member;
+
+    static const nxt_str_t  zone_str = nxt_string("zone");
+    static const nxt_str_t  rate_str = nxt_string("rate");
+    static const nxt_str_t  burst_str = nxt_string("burst");
+
+    zone->value = limit;
+
+    member = nxt_conf_get_object_member(limit, &zone_str, NULL);
+
+    if (member == NULL || nxt_conf_type(member) != NXT_CONF_STRING) {
+        return NXT_DECLINED;
+    }
+
+    nxt_conf_get_string(member, &str);
+
+    if (nxt_http_limit_req_zone_parse(&str, &zone->name, &zone->keys_max)
+        != NXT_OK)
+    {
+        return NXT_DECLINED;
+    }
+
+    member = nxt_conf_get_object_member(limit, &rate_str, NULL);
+
+    if (member == NULL || nxt_conf_type(member) != NXT_CONF_INTEGER) {
+        return NXT_DECLINED;
+    }
+
+    zone->rate = nxt_conf_get_number(member);
+
+    member = nxt_conf_get_object_member(limit, &burst_str, NULL);
+
+    if (member == NULL) {
+        zone->burst = 1;
+
+    } else if (nxt_conf_type(member) != NXT_CONF_INTEGER) {
+        return NXT_DECLINED;
+
+    } else {
+        zone->burst = nxt_conf_get_number(member);
+    }
+
+    return NXT_OK;
+}
+
+
+/*
+ * Every "limit_req" that names one zone must ask the same size, "rate"
+ * and "burst": the zone object holds one of each.  "data" is the zone of
+ * the "limit_req" being validated.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_limit_req_shared(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *limit, void *data)
+{
+    nxt_conf_vldt_limit_zone_t  *zone, other;
+
+    zone = data;
+
+    if (limit == zone->value
+        || nxt_conf_vldt_limit_req_get(limit, &other) != NXT_OK
+        || !nxt_strstr_eq(&zone->name, &other.name))
+    {
+        return NXT_OK;
+    }
+
+    if (zone->keys_max != other.keys_max || zone->rate != other.rate
+        || zone->burst != other.burst)
+    {
+        return nxt_conf_vldt_error(vldt, "The \"limit_req\" zone \"%V\" is "
+                                   "used with another size, \"rate\" or "
+                                   "\"burst\" elsewhere.", &zone->name);
+    }
+
+    return NXT_OK;
+}
+
+
+/*
+ * The zones of the configuration, each once, into an array of
+ * nxt_conf_vldt_limit_zone_t.  The ones with another size are refused by
+ * nxt_conf_vldt_limit_req_shared().
+ */
+
+static nxt_int_t
+nxt_conf_vldt_limit_req_count(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *limit, void *data)
+{
+    nxt_uint_t                  i;
+    nxt_array_t                 *zones;
+    nxt_conf_vldt_limit_zone_t  zone, *z;
+
+    zones = data;
+
+    if (nxt_conf_vldt_limit_req_get(limit, &zone) != NXT_OK) {
+        return NXT_OK;
+    }
+
+    z = zones->elts;
+
+    for (i = 0; i < zones->nelts; i++) {
+        if (nxt_strstr_eq(&z[i].name, &zone.name)) {
+            return NXT_OK;
         }
+    }
 
-        member = nxt_conf_get_object_member(other, &zone_str, NULL);
+    z = nxt_array_add(zones);
+    if (nxt_slow_path(z == NULL)) {
+        return NXT_ERROR;
+    }
 
-        if (member == NULL || nxt_conf_type(member) != NXT_CONF_STRING) {
-            continue;
-        }
+    *z = zone;
 
-        nxt_conf_get_string(member, &zone);
+    return NXT_OK;
+}
 
-        ret = nxt_http_limit_req_zone_parse(&zone, &other_name,
-                                            &other_keys_max);
 
-        if (ret != NXT_OK || !nxt_strstr_eq(&name, &other_name)) {
-            continue;
-        }
+/*
+ * A zone takes its memory when the configuration is applied, so the zones
+ * of one configuration are limited in number and in keys.
+ */
 
-        member = nxt_conf_get_object_member(other, &rate_str, NULL);
+static nxt_int_t
+nxt_conf_vldt_limit_req_total(nxt_conf_validation_t *vldt)
+{
+    int64_t                     keys;
+    nxt_int_t                   ret;
+    nxt_uint_t                  i;
+    nxt_array_t                 *zones;
+    nxt_conf_vldt_limit_zone_t  *z;
 
-        if (member == NULL || nxt_conf_type(member) != NXT_CONF_INTEGER) {
-            continue;
-        }
+    zones = nxt_array_create(vldt->pool, 4,
+                             sizeof(nxt_conf_vldt_limit_zone_t));
+    if (nxt_slow_path(zones == NULL)) {
+        return NXT_ERROR;
+    }
 
-        other_rate = nxt_conf_get_number(member);
+    ret = nxt_conf_vldt_limit_req_each(vldt, nxt_conf_vldt_limit_req_count,
+                                       zones);
+    if (ret != NXT_OK) {
+        return ret;
+    }
 
-        member = nxt_conf_get_object_member(other, &burst_str, NULL);
+    if (zones->nelts > NXT_HTTP_LIMIT_REQ_ZONES_MAX) {
+        return nxt_conf_vldt_error(vldt, "The configuration has %ui "
+                                   "\"limit_req\" zones, more than %d.",
+                                   zones->nelts, NXT_HTTP_LIMIT_REQ_ZONES_MAX);
+    }
 
-        if (member == NULL) {
-            other_burst = 1;
+    keys = 0;
+    z = zones->elts;
 
-        } else if (nxt_conf_type(member) != NXT_CONF_INTEGER) {
-            continue;
+    for (i = 0; i < zones->nelts; i++) {
+        keys += z[i].keys_max;
+    }
 
-        } else {
-            other_burst = nxt_conf_get_number(member);
-        }
-
-        if (keys_max != other_keys_max || rate != other_rate
-            || burst != other_burst)
-        {
-            return nxt_conf_vldt_error(vldt, "The \"limit_req\" zone \"%V\" "
-                                       "is used with another size, \"rate\" "
-                                       "or \"burst\" elsewhere.", &name);
-        }
+    if (keys > NXT_HTTP_LIMIT_REQ_KEYS_TOTAL) {
+        return nxt_conf_vldt_error(vldt, "The \"limit_req\" zones hold %L "
+                                   "keys in total, more than %d.", keys,
+                                   NXT_HTTP_LIMIT_REQ_KEYS_TOTAL);
     }
 
     return NXT_OK;
