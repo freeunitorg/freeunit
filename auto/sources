@@ -35,6 +35,7 @@ NXT_LIB_SRCS=" \
     src/nxt_tstr.c \
     src/nxt_file_name.c \
     src/nxt_log.c \
+    src/nxt_log_file_sink.c \
     src/nxt_djb_hash.c \
     src/nxt_murmur_hash.c \
     src/nxt_lvlhsh.c \
