@@ -80,6 +80,63 @@ def test_asgi_websockets_handshake():
     client.load('websockets/subprotocol')
 
 
+def test_asgi_websockets_pipelined_frame():
+    """A frame pipelined with the handshake reaches the application once."""
+    client.load('websockets/mirror')
+
+    key = ws.key()
+
+    request = (
+        'GET / HTTP/1.1\r\n'
+        'Host: localhost\r\n'
+        'Upgrade: websocket\r\n'
+        'Connection: Upgrade\r\n'
+        f'Sec-WebSocket-Key: {key}\r\n'
+        'Sec-WebSocket-Version: 13\r\n'
+        '\r\n'
+    ).encode()
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5)
+
+    try:
+        sock.connect(('127.0.0.1', port_map.port(8080)))
+        sock.sendall(request + ws.frame_to_send(ws.OP_TEXT, 'hello'))
+
+        resp = b''
+
+        while not resp.endswith(b'\r\n\r\n'):
+            part = sock.recv(1)
+
+            if not part:
+                break
+
+            resp += part
+
+        assert resp.startswith(b'HTTP/1.1 101'), f'no 101: {resp[:300]!r}'
+        assert b'Upgrade: websocket' in resp, f'no upgrade: {resp[:300]!r}'
+
+        frame = ws.frame_read(sock, read_timeout=5)
+
+        assert frame['opcode'] == ws.OP_TEXT, f'opcode: {frame}'
+        assert frame['data'].decode('utf-8') == 'hello', f'echo: {frame}'
+
+        # Exactly once: the next frame on the connection must be the echo of
+        # a second, distinct message, not a second "hello" and not bytes of
+        # a second HTTP response.  Then the close handshake must complete.
+        ws.frame_write(sock, ws.OP_TEXT, 'second')
+
+        frame = ws.frame_read(sock, read_timeout=5)
+
+        assert frame['opcode'] == ws.OP_TEXT, f'opcode 2: {frame}'
+        assert frame['data'].decode('utf-8') == 'second', f'echo 2: {frame}'
+
+        close_connection(sock)
+
+    finally:
+        sock.close()
+
+
 def test_asgi_websockets_close_then_exception():
     client.load('websockets/close_exception')
 

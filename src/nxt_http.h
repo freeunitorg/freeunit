@@ -309,6 +309,8 @@ struct nxt_http_request_s {
     uint8_t                         truncated;    /* 1 bit  */
     uint8_t                         error;        /* 1 bit  */
     uint8_t                         websocket_handshake;  /* 1 bit */
+    /* The router decided this response is a WebSocket upgrade. */
+    uint8_t                         websocket_upgrade;    /* 1 bit */
     uint8_t                         chunked;  /* 1 bit */
     uint8_t                         no_body;  /* 1 bit */
 
@@ -605,6 +607,7 @@ void nxt_h1p_websocket_first_frame_start(nxt_task_t *task,
     nxt_http_request_t *r, nxt_buf_t *ws_frame);
 void nxt_h1p_websocket_frame_start(nxt_task_t *task, nxt_http_request_t *r,
     nxt_buf_t *ws_frame);
+void nxt_h1p_websocket_start(nxt_task_t *task, nxt_http_request_t *r);
 void nxt_h1p_complete_buffers(nxt_task_t *task, nxt_h1proto_t *h1p,
     nxt_bool_t all);
 nxt_msec_t nxt_h1p_conn_request_timer_value(nxt_conn_t *c, uintptr_t data);
