@@ -8703,8 +8703,11 @@ components:
 
     # /status/limit_req
     statusLimitReq:
-      description: "The counters of every `limit_req` zone, by zone name.
-        The object is omitted when no zone exists."
+      description: "The counters of every `limit_req` zone of the applied
+        configuration, by zone name.  A zone of a configuration that is not
+        applied yet, or of an older configuration that a request still
+        uses, is not shown.  The object is omitted when the applied
+        configuration has no zone."
       type: object
       additionalProperties:
         $ref: "#/components/schemas/statusLimitReqZone"

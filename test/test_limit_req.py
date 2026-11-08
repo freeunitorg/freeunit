@@ -810,3 +810,32 @@ def test_limit_req_rate_above_1000():
 
     assert result == [200] * 50
     assert counters()['passed'] == 50
+
+
+def test_limit_req_status_applied():
+    # /status shows the zones of the applied configuration only.  A request
+    # that waits for its body keeps the configuration before, and with it
+    # the zone "old"; the zone is not in /status.
+    old = f'{ZONE}-old'
+    new = f'{ZONE}-new'
+
+    load(limited(zone=old, rate=100))
+
+    sock = client.http(PARTIAL_POST, raw=True, no_recv=True)
+
+    try:
+        # The headers stage counted the request: the router has it.
+        for _ in range(50):
+            if counters(old)['passed'] == 1:
+                break
+
+            time.sleep(0.1)
+
+        assert counters(old)['passed'] == 1
+
+        load(limited(zone=new, rate=100))
+
+        assert list(client.conf_get('/status')['limit_req']) == [new]
+
+    finally:
+        sock.close()
