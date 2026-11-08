@@ -9848,6 +9848,7 @@ nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
 static void
 nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
 {
+    nxt_msec_t              delay;
     nxt_timer_t             *timer;
     nxt_http_request_t      *r;
     nxt_request_rpc_data_t  *req_rpc_data;
@@ -9885,9 +9886,10 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
         return;
     }
 
-    if (!nxt_router_request_expire(task, r, req_rpc_data)) {
-        nxt_timer_add(task->thread->engine, timer,
-                      nxt_router_app_ack_deadline(req_rpc_data->app));
+    delay = nxt_router_request_expire(task, r, req_rpc_data);
+
+    if (delay != 0) {
+        nxt_timer_add(task->thread->engine, timer, delay);
     }
 }
 
@@ -9895,12 +9897,15 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
 /*
  * The request deadline, shared by "limits": {"timeout"} above and a
  * schedule's own "timeout" (src/nxt_router_schedule.c).  Returns 0 when the
- * request was left alone because a worker claimed it and has not
- * acknowledged it yet; the caller then arms its timer again.  The next call
- * answers the request.
+ * request was answered with 503 and unlinked.  A request that a worker
+ * claimed and did not acknowledge is left alone at the first call: the
+ * function then returns the acknowledgement deadline, and the caller arms
+ * its timer again for that time.  The next call answers the request.  So a
+ * claimed request ends at most one deadline after the first call, also when
+ * the worker that claimed it is dead.
  */
 
-nxt_bool_t
+nxt_msec_t
 nxt_router_request_expire(nxt_task_t *task, nxt_http_request_t *r,
     nxt_request_rpc_data_t *req_rpc_data)
 {
@@ -9969,13 +9974,18 @@ nxt_router_request_expire(nxt_task_t *task, nxt_http_request_t *r,
         if (req_rpc_data->claimed_expired == 0) {
             req_rpc_data->claimed_expired = 1;
 
+            /*
+             * The deadline that expired is the application's or a
+             * schedule's, so the line names only the wait that follows.
+             */
+
             nxt_alert(task, "app \"%V\": stream #%uD was claimed by a worker, "
-                      "and the %M ms deadline expired without an "
-                      "acknowledgement",
+                      "and the deadline expired without an acknowledgement; "
+                      "answering 503 in %M ms if none comes",
                       &req_rpc_data->app->name, req_rpc_data->stream,
                       nxt_router_app_ack_deadline(req_rpc_data->app));
 
-            return 0;
+            return nxt_router_app_ack_deadline(req_rpc_data->app);
         }
 
         nxt_log(task, NXT_LOG_WARN, "app \"%V\": stream #%uD is still not "
@@ -10016,7 +10026,7 @@ nxt_router_request_expire(nxt_task_t *task, nxt_http_request_t *r,
 
     nxt_request_rpc_data_unlink(task, req_rpc_data);
 
-    return 1;
+    return 0;
 }
 
 

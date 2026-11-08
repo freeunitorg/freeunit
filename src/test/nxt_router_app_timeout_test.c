@@ -22,7 +22,8 @@
  * deadline fires, and the handler runs through the engine's real timer
  * machinery.
  *
- * Four things are pinned down:
+ * Four things are pinned down, for the application deadline and for the
+ * deadline of a schedule run, which calls nxt_router_request_expire():
  *
  *   - a claimed request is not answered at its first expiry and its message
  *     is left intact, since the tail of that chain is the body the
@@ -395,6 +396,8 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
     nxt_event_engine_t                 engine, *saved_engine;
     nxt_router_app_timeout_test_req_t  claimed, unclaimed, skipped, untimed;
     nxt_router_app_timeout_test_req_t  acked, requeued, taken, lost;
+    nxt_router_app_timeout_test_req_t  scheduled;
+    nxt_msec_t                         delay;
     nxt_port_t                         *dead_port;
     uint32_t                           cookie;
     uint8_t                            rbuf[NXT_APP_QUEUE_MSG_SIZE];
@@ -416,6 +419,7 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
     requeued.stream = 0;
     taken.stream = 0;
     lost.stream = 0;
+    scheduled.stream = 0;
     dead_port = NULL;
     worker_port = NULL;
     worker_hashed = 0;
@@ -1339,6 +1343,83 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
 
     nxt_router_app_timeout_test_tick(task, &engine, 2 * NXT_APP_ACK_TIMEOUT);
 
+    /*
+     * Leg 9: a schedule's own "timeout" (src/nxt_router_schedule.c).  Its
+     * timer calls nxt_router_request_expire() directly, and arms itself
+     * again for the time that the function returns.  A worker claimed the
+     * request and died before its acknowledgement, so no acknowledgement
+     * comes.  The first call must alert and return the acknowledgement
+     * deadline; the second must answer 503 and return 0.  Before, the first
+     * call returned 0 and the schedule asked again every second, for ever:
+     * its run stayed "running", and every later run was skipped.
+     */
+
+    app->timeout = 0;
+
+    if (nxt_slow_path(nxt_router_app_timeout_test_arm(task, &engine, req_mp,
+                                                      app, engine_port, 0,
+                                                      &scheduled)
+                      != NXT_OK))
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: could not arm a request");
+        goto done;
+    }
+
+    if (nxt_slow_path(!nxt_router_app_timeout_test_claim(queue))) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: the worker could not claim "
+                      "the queued message");
+        goto done;
+    }
+
+    nxt_router_app_timeout_test_completions = 0;
+    nxt_router_app_timeout_test_alerts = 0;
+    engine_port_use = engine_port->use_count;
+
+    delay = nxt_router_request_expire(&engine.task, scheduled.r,
+                                      scheduled.req_rpc_data);
+
+    if (delay != NXT_APP_ACK_TIMEOUT
+        || scheduled.r->status != 0 || scheduled.r->req_rpc_data == NULL
+        || nxt_router_app_timeout_test_alerts != 1
+        || nxt_router_app_timeout_test_completions != 0)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: the first schedule deadline "
+                      "of a claimed request with no acknowledgement returned "
+                      "%M, expected %M (status %d, %ui alerts)",
+                      delay, (nxt_msec_t) NXT_APP_ACK_TIMEOUT,
+                      (int) scheduled.r->status,
+                      nxt_router_app_timeout_test_alerts);
+        goto done;
+    }
+
+    delay = nxt_router_request_expire(&engine.task, scheduled.r,
+                                      scheduled.req_rpc_data);
+
+    if (delay != 0
+        || scheduled.r->status != NXT_HTTP_SERVICE_UNAVAILABLE
+        || scheduled.r->req_rpc_data != NULL
+        || engine_port->use_count != engine_port_use - 1
+        || nxt_router_app_timeout_test_alerts != 1)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: the second schedule deadline "
+                      "of a claimed request with no acknowledgement returned "
+                      "%M and did not end the request (status %d, port use "
+                      "%uD, expected %uD, %ui alerts)",
+                      delay, (int) scheduled.r->status,
+                      (uint32_t) engine_port->use_count,
+                      (uint32_t) (engine_port_use - 1),
+                      nxt_router_app_timeout_test_alerts);
+        goto done;
+    }
+
+    scheduled.stream = 0;
+
+    nxt_router_app_timeout_test_tick(task, &engine, 2 * NXT_APP_ACK_TIMEOUT);
+
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "router app timeout test passed");
 
     ret = NXT_OK;
@@ -1390,6 +1471,10 @@ done:
 
         if (lost.stream != 0) {
             nxt_port_rpc_cancel(task, engine_port, lost.stream);
+        }
+
+        if (scheduled.stream != 0) {
+            nxt_port_rpc_cancel(task, engine_port, scheduled.stream);
         }
 
         if (engine_port->pair[0] != -1) {

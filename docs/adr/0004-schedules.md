@@ -154,12 +154,20 @@ worker engine, counts as `failed` and not in `runs`.
 
 #### 7.2 Timeout
 
-A run has its own timer; `r->timer` already carries `limits.timeout`. On
-expiry it calls `nxt_router_request_expire()`, factored out of
-`nxt_router_app_timeout()`: a queued request is retracted, a claimed but
-unacknowledged one is retried later, and a running one is abandoned and
-answered with 503. The application is not stopped; the timeout only frees
-the schedule. After the response header, the router cannot answer 503: it
+A run has its own timer; `r->timer` already carries `limits.timeout`, or
+the 5 s acknowledgement deadline when that is 0. On expiry the run timer
+calls `nxt_router_request_expire()`, factored out of
+`nxt_router_app_timeout()`: a queued request is retracted, and a running
+one is abandoned; both are answered with 503. A request that a worker
+claimed but did not acknowledge is left alone once: the function logs an
+alert and returns the acknowledgement deadline, and the run timer is armed
+again for that time. At the next expiry the request is answered with 503,
+also when the worker died after its claim. So every run ends at most one
+acknowledgement deadline after its `timeout`, and its joint and
+configuration are released. The application timer shares this state
+(`claimed_expired`), so the timer that expires second answers. The run
+counts as timed out from its first expiry. The application is not
+stopped; the timeout only frees the schedule. After the response header, the router cannot answer 503: it
 discards the rest of the response. `last_status` is 503 for each run that
 timed out. The abandoned worker keeps its slot in `processes.max` until it
 answers or exits; `nxt_router_app_abandon()` keeps it out of the idle

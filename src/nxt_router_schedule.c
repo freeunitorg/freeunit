@@ -20,9 +20,6 @@
 /* "run_on_start": the first run, 1 s plus up to "jitter" after the apply. */
 #define NXT_SCHEDULE_START_DELAY  1000
 
-/* A timed-out request a worker claimed but has not acknowledged yet. */
-#define NXT_SCHEDULE_CLAIM_RETRY  1000
-
 
 /* Survives reconfiguration (section 4).  Main engine only. */
 typedef struct {
@@ -854,14 +851,19 @@ nxt_router_schedule_request_init(nxt_http_request_t *r,
 
 /*
  * The schedule's "timeout" (section 7.2), through the same function as
- * "limits": {"timeout"}.  A claimed request is checked again every
- * NXT_SCHEDULE_CLAIM_RETRY until it is acknowledged.  The application is
+ * "limits": {"timeout"}.  A request that a worker claimed and did not
+ * acknowledge gets one more acknowledgement deadline
+ * (nxt_router_request_expire() logs an alert), and then 503, as with the
+ * application timer.  So the run ends also when the worker that claimed it
+ * died.  The application timer can answer first; the run counts as timed
+ * out all the same, because its own deadline expired.  The application is
  * not stopped.
  */
 
 static void
 nxt_router_schedule_run_timeout(nxt_task_t *task, void *obj, void *data)
 {
+    nxt_msec_t                 delay;
     nxt_http_request_t         *r;
     nxt_router_schedule_run_t  *run;
 
@@ -879,13 +881,13 @@ nxt_router_schedule_run_timeout(nxt_task_t *task, void *obj, void *data)
         return;
     }
 
-    if (!nxt_router_request_expire(task, r, r->req_rpc_data)) {
-        nxt_timer_add(task->thread->engine, &run->timer,
-                      NXT_SCHEDULE_CLAIM_RETRY);
-        return;
-    }
-
     run->timed_out = 1;
+
+    delay = nxt_router_request_expire(task, r, r->req_rpc_data);
+
+    if (delay != 0) {
+        nxt_timer_add(task->thread->engine, &run->timer, delay);
+    }
 }
 
 

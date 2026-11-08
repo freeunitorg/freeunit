@@ -492,7 +492,7 @@ void nxt_router_joint_release(nxt_task_t *task,
     nxt_socket_conf_joint_t *joint);
 nxt_int_t nxt_router_socket_conf_http(nxt_mp_t *mp, nxt_socket_conf_t *skcf,
     nxt_conf_value_t *http);
-nxt_bool_t nxt_router_request_expire(nxt_task_t *task, nxt_http_request_t *r,
+nxt_msec_t nxt_router_request_expire(nxt_task_t *task, nxt_http_request_t *r,
     nxt_request_rpc_data_t *req_rpc_data);
 
 nxt_int_t nxt_router_access_log_create(nxt_task_t *task,

@@ -103,8 +103,12 @@ Each schedule has its own `timeout`, independent of the application's
 - If the request is still in the queue for a process, the router retracts
   it.
 - If a worker has claimed the request but has not acknowledged it yet, the
-  router checks it again every second. After the acknowledgement, the next
-  check treats the request as running (see the next item).
+  router logs an alert and waits one more acknowledgement deadline: the
+  application's `limits.timeout`, or 5 s if that is `0`. Then the run gets
+  `503`, also when the worker died after its claim. If the acknowledgement
+  comes first, the request is running at that check (see the next item).
+  The application's own deadline can answer `503` before that check. The
+  run counts in `timed_out` in each case.
 - If a worker runs the request, the router *abandons* that worker. The
   router does not stop the worker, but it does not return the worker to the
   idle pool. The router discards the answer of the worker.
