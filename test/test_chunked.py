@@ -364,6 +364,90 @@ def test_chunked_trailer():
     check_invalid(f'X: {"a" * 4200}\r\n', 'oversized trailer')
 
 
+def test_chunked_extension():
+    # RFC 9112, 7.1.1: chunk-ext = *( BWS ";" BWS chunk-ext-name
+    # [ BWS "=" BWS chunk-ext-val ] ).  A valid extension is ignored.  Any
+    # other bytes before the CRLF were skipped, so a peer that frames the
+    # body another way could disagree with Unit about where it ends.
+    # https://github.com/freeunitorg/freeunit/issues/916
+    head = (
+        b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+        b'Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n'
+    )
+
+    rest = b'hello\r\n0\r\n\r\n'
+
+    def post(*writes):
+        # Each write after the first goes in its own read.  The short read
+        # timeout ends the wait for a request that hangs: the response is
+        # then empty and has no status.
+        sock = client.http(head + writes[0], raw=True, no_recv=True)
+
+        for w in writes[1:]:
+            time.sleep(0.2)
+            sock.sendall(w)
+
+        resp = client.recvall(sock, read_timeout=5).decode()
+        sock.close()
+
+        return client._resp_to_dict(resp)
+
+    for size_line in [
+        b'5;a\r\n',
+        b'5;a=b\r\n',
+        b'5;a=b;c;d=e\r\n',
+        b'5 ;a\r\n',
+        b'5\t;a=b\r\n',
+        b'5; a = b ;\tc\r\n',
+        b'5;a=""\r\n',
+        b'5;a="b \\"c\\" ;d=e"\r\n',
+        b'5;a="\\\\";b=c\r\n',
+    ]:
+        resp = post(size_line + rest)
+
+        assert resp.get('status') == 200, size_line
+        assert resp['body'] == 'hello', size_line
+
+    # The extension split across reads.
+    resp = post(b'5;a="b', b' c";d', b'=e\r\n' + rest)
+    assert resp.get('status') == 200, 'split extension'
+    assert resp['body'] == 'hello', 'split extension'
+
+    accepted = []
+
+    for size_line, reason in [
+        # The rows of the issue.
+        (b'5;\r\n', 'bare ";"'),
+        (b'5;bad[=x\r\n', 'non-token name'),
+        (b'5;\0ext\r\n', 'NUL'),
+        (b'5;\n', 'bare LF'),
+        # More of the grammar.
+        (b'5;a\rb\r\n', 'bare CR'),
+        (b'5;a\n\r\n', 'bare LF after the name'),
+        (b'5;a;\r\n', 'trailing ";"'),
+        (b'5;=b\r\n', 'empty name'),
+        (b'5;a=\r\n', 'empty value'),
+        (b'5;a=b c\r\n', 'space in the value'),
+        (b'5;a \r\n', 'space before the CRLF'),
+        (b'5 \r\n', 'space after the size, no extension'),
+        (b'5;a="b\r\n', 'unterminated quoted-string'),
+        (b'5;a="b\0"\r\n', 'NUL in a quoted-string'),
+    ]:
+        status = post(size_line + rest).get('status')
+
+        if status != 400:
+            accepted.append((reason, status))
+
+    resp = post(b'5;a="b', b'\0"\r\n' + rest)
+
+    if resp.get('status') != 400:
+        accepted.append(('split extension with NUL', resp.get('status')))
+
+    # All of them in one assert, to see every row that is not refused.
+    # A status of None is no response within the read timeout.
+    assert not accepted, accepted
+
+
 def test_chunked_transform():
     assert 'success' in client.conf(
         [
