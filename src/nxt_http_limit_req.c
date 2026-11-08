@@ -343,6 +343,8 @@ nxt_http_limit_req_init(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     }
 
     limit->zone = zcf->zone;
+    limit->index = zcf
+                   - (nxt_http_limit_zone_conf_t *) rtcf->limit_zones->elts;
     limit->stage = nxt_str_eq(&lrcf.stage, "body", 4)
                    ? NXT_HTTP_LIMIT_REQ_BODY : NXT_HTTP_LIMIT_REQ_HEADERS;
 
@@ -472,25 +474,43 @@ nxt_http_limit_req_reject(nxt_task_t *task, nxt_http_request_t *r,
 
 
 /*
- * One request is counted once, by the first limit on its path, whatever
- * the stage: the action chain is entered again by every "pass", and the
- * headers stage looks at the chain before the body stage does.
+ * Every limit on the path of a request counts it, at its stage, and a zone
+ * counts it once: the action chain is entered again by every "pass", the
+ * headers stage looks at the chain before the body stage does, and two
+ * limits can name one zone.  A zone that counted the request has its bit
+ * in r->limit_req_counted.  A request that a limit refuses is not counted
+ * by the limits after it, but stays counted by the ones before it.
  */
 
 nxt_int_t
 nxt_http_limit_req_check(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_limit_req_t *limit)
 {
-    size_t      len;
-    u_char      key[NXT_LIMIT_KEY_MAX];
-    uint64_t    now_ms, wait_ms;
-    nxt_bool_t  allow;
+    size_t             len;
+    u_char             key[NXT_LIMIT_KEY_MAX], bit, *counted;
+    uint64_t           now_ms, wait_ms;
+    nxt_bool_t         allow;
+    nxt_router_conf_t  *rtcf;
 
-    if (r->limited) {
+    if (r->limit_req_counted == NULL) {
+        rtcf = r->conf->socket_conf->router_conf;
+
+        r->limit_req_counted = nxt_mp_zget(r->mem_pool,
+                                           (rtcf->limit_zones->nelts + 7) / 8);
+        if (nxt_slow_path(r->limit_req_counted == NULL)) {
+            nxt_http_request_error(task, r, NXT_HTTP_INTERNAL_SERVER_ERROR);
+            return NXT_ERROR;
+        }
+    }
+
+    counted = &r->limit_req_counted[limit->index / 8];
+    bit = (u_char) (1 << (limit->index % 8));
+
+    if (*counted & bit) {
         return NXT_OK;
     }
 
-    r->limited = 1;
+    *counted |= bit;
 
     len = nxt_http_limit_req_key(r->remote, key);
 
@@ -511,17 +531,18 @@ nxt_http_limit_req_check(nxt_task_t *task, nxt_http_request_t *r,
 
 
 /*
- * The headers stage.  The routes are matched before the body is read, to
- * find the first limit on the path of the request.  The walk follows the
- * routes only: it stops at an action that is not a route, at one that
- * rewrites the URI, because the next route would match the new URI, and at
- * a "pass" with a variable.  A headers stage limit behind such an action
- * takes effect at the body stage, which looks at every action.
+ * The headers stage.  The routes are matched before the body is read, and
+ * every headers stage limit on the path of the request counts it.  The
+ * walk follows the routes only: it stops at an action that is not a route,
+ * at one that rewrites the URI, because the next route would match the new
+ * URI, and at a "pass" with a variable.  A headers stage limit behind such
+ * an action takes effect at the body stage, which looks at every action.
  */
 
 nxt_int_t
 nxt_http_limit_req_headers(nxt_task_t *task, nxt_http_request_t *r)
 {
+    nxt_int_t             ret;
     nxt_uint_t            n;
     nxt_http_action_t     *action;
     nxt_http_limit_req_t  *limit;
@@ -532,7 +553,10 @@ nxt_http_limit_req_headers(nxt_task_t *task, nxt_http_request_t *r)
         limit = action->limit_req;
 
         if (limit != NULL && limit->stage == NXT_HTTP_LIMIT_REQ_HEADERS) {
-            return nxt_http_limit_req_check(task, r, limit);
+            ret = nxt_http_limit_req_check(task, r, limit);
+            if (ret != NXT_OK) {
+                return ret;
+            }
         }
 
         if (action->rewrite != NULL) {

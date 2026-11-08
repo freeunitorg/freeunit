@@ -8095,7 +8095,12 @@ components:
         connection, or the one the listener's `client_ip` option takes from
         a trusted proxy; IPv6 clients are keyed by their /64.  Every
         `limit_req` that names one zone must ask the same size, `rate` and
-        `burst`."
+        `burst`.  Every `limit_req` on the path of a request counts it, and
+        a zone counts it once, also when two `limit_req` on the path name
+        it.  The `headers` stage limits count the request before the body,
+        the `body` stage ones after it, in the order of the path.  A
+        request that a limit refuses is not counted by the limits after
+        it, but stays counted by the ones before it."
       required:
         - zone
         - rate
