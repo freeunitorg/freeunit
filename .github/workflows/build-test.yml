@@ -1526,13 +1526,25 @@ jobs:
       # The test files with "~" route or match patterns.  The one in
       # test_static_compression.py is left out: it needs a --zlib build.
       # --port as in the test legs, so the run is off the default base port.
+      # unitd runs as root and discovers modules as an unprivileged user,
+      # which cannot enter /home/runner (mode 750) without this.  Then the
+      # python module is not found and every test here is skipped.
+      - name: Let unprivileged unitd processes reach the build
+        run: sudo chmod -R +x /home/runner
+
       - name: Run routing tests
         timeout-minutes: 8
         run: |
+          set -o pipefail
           sudo /usr/bin/pytest-3 --print-log --port 18080 \
             test/test_routing.py \
             test/test_route_if.py \
-            test/test_static_types.py
+            test/test_static_types.py 2>&1 | tee routing-jit.log
+          # Fail if the module was not found and the tests were skipped, or
+          # if UTF mode was lost: every leg has PCRE2 with Unicode support.
+          grep -F 'test_routes_match_regex_deny_invalid_utf8 PASSED' \
+            routing-jit.log
+          grep -F 'test_routes_match_regex_utf8 PASSED' routing-jit.log
 
   # Same C unit-test suite as c-tests above, built with AddressSanitizer and
   # run with LeakSanitizer's default ASAN_OPTIONS (detect_leaks is on unless
