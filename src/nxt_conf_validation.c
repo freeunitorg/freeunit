@@ -146,14 +146,26 @@ static nxt_int_t nxt_conf_vldt_listen_threads(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_min_rate(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_msec(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_requests(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_restored_range(nxt_conf_validation_t *vldt,
+    const char *name, int64_t min, int64_t max, const char *effect);
+static nxt_int_t nxt_conf_vldt_size(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_threads(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_thread_stack_size(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_compressors(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_compression_object(
+    nxt_conf_validation_t *vldt, nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_compression(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value);
+static nxt_int_t nxt_conf_vldt_compression_level(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_compression_encoding(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_routes(nxt_conf_validation_t *vldt,
@@ -416,12 +428,18 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_http_members[] = {
     {
         .name       = nxt_string("header_read_timeout"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_msec,
+        .u.string   = "header_read_timeout",
     }, {
         .name       = nxt_string("body_read_timeout"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_msec,
+        .u.string   = "body_read_timeout",
     }, {
         .name       = nxt_string("send_timeout"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_msec,
+        .u.string   = "send_timeout",
     }, {
         .name       = nxt_string("body_min_rate"),
         .type       = NXT_CONF_VLDT_INTEGER,
@@ -435,18 +453,28 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_http_members[] = {
     }, {
         .name       = nxt_string("idle_timeout"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_msec,
+        .u.string   = "idle_timeout",
     }, {
         .name       = nxt_string("large_header_buffer_size"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_size,
+        .u.string   = "large_header_buffer_size",
     }, {
         .name       = nxt_string("large_header_buffers"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_size,
+        .u.string   = "large_header_buffers",
     }, {
         .name       = nxt_string("body_buffer_size"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_size,
+        .u.string   = "body_buffer_size",
     }, {
         .name       = nxt_string("max_body_size"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_size,
+        .u.string   = "max_body_size",
     }, {
         .name       = nxt_string("body_temp_path"),
         .type       = NXT_CONF_VLDT_STRING,
@@ -475,7 +503,7 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_http_members[] = {
     }, {
         .name       = nxt_string("compression"),
         .type       = NXT_CONF_VLDT_OBJECT,
-        .validator  = nxt_conf_vldt_object,
+        .validator  = nxt_conf_vldt_compression_object,
         .u.members  = nxt_conf_vldt_compression_members,
     },
 
@@ -515,13 +543,19 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_websocket_members[] = {
     {
         .name       = nxt_string("read_timeout"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_msec,
+        .u.string   = "read_timeout",
     }, {
 
         .name       = nxt_string("keepalive_interval"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_msec,
+        .u.string   = "keepalive_interval",
     }, {
         .name       = nxt_string("max_frame_size"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_size,
+        .u.string   = "max_frame_size",
     },
 
     NXT_CONF_VLDT_END
@@ -563,9 +597,12 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_compressor_members[] = {
     }, {
         .name       = nxt_string("level"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_compression_level,
     }, {
         .name       = nxt_string("min_length"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_size,
+        .u.string   = "min_length",
     },
 
     NXT_CONF_VLDT_END
@@ -1408,15 +1445,20 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_app_limits_members[] = {
     {
         .name       = nxt_string("timeout"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_msec,
+        .u.string   = "timeout",
     }, {
         .name       = nxt_string("start_timeout"),
         .type       = NXT_CONF_VLDT_INTEGER,
     }, {
         .name       = nxt_string("requests"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_requests,
     }, {
         .name       = nxt_string("shm"),
         .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_size,
+        .u.string   = "shm",
     },
 
     NXT_CONF_VLDT_END
@@ -2464,6 +2506,9 @@ nxt_conf_vldt_listener(nxt_conf_validation_t *vldt, nxt_str_t *name,
     nxt_str_t       str;
     nxt_sockaddr_t  *sa;
 
+    static const nxt_str_t  pass_str = nxt_string("pass");
+    static const nxt_str_t  app_str = nxt_string("application");
+
     if (nxt_slow_path(nxt_str_dup(vldt->pool, &str, name) == NULL)) {
         return NXT_ERROR;
     }
@@ -2478,6 +2523,20 @@ nxt_conf_vldt_listener(nxt_conf_validation_t *vldt, nxt_str_t *name,
     ret = nxt_conf_vldt_type(vldt, name, value, NXT_CONF_VLDT_OBJECT);
     if (ret != NXT_OK) {
         return ret;
+    }
+
+    /*
+     * The router refuses a listener with no action.  A stored configuration
+     * cannot have one, because the router never applied it, so a restored
+     * configuration is checked the same way.
+     */
+
+    if (nxt_conf_get_object_member(value, &pass_str, NULL) == NULL
+        && nxt_conf_get_object_member(value, &app_str, NULL) == NULL)
+    {
+        return nxt_conf_vldt_error(vldt, "The listener \"%V\" must have "
+                                   "either \"pass\" or \"application\" "
+                                   "option set.", name);
     }
 
     return nxt_conf_vldt_object(vldt, value, nxt_conf_vldt_listener_members);
@@ -2910,6 +2969,200 @@ nxt_conf_vldt_min_rate(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
 }
 
 
+/*
+ * A timeout in seconds.  NXT_CONF_MAP_MSEC converts it to milliseconds in a
+ * 32-bit nxt_msec_t.  nxt_msec_diff() compares two such values as a signed
+ * difference, so a timeout above NXT_INT32_T_MAX milliseconds fires at once.
+ * The bound is the same as for "start_timeout".
+ *
+ * Earlier versions accepted any integer.  A stored configuration can have a
+ * value out of the range.  It is kept, with a warning.  nxt_conf_map_object()
+ * maps it to 4294967 seconds, so the timer fires at once, as before on x86.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_msec(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
+    void *data)
+{
+    double      num;
+    const char  *name;
+
+    name = data;
+    num = nxt_conf_get_number(value);
+
+    if (num >= 0 && num <= NXT_INT32_T_MAX / 1000) {
+        return NXT_OK;
+    }
+
+    if (!vldt->restored) {
+        if (num < 0) {
+            return nxt_conf_vldt_error(vldt, "The \"%s\" number must not "
+                                       "be negative.", name);
+        }
+
+        return nxt_conf_vldt_error(vldt, "The \"%s\" number must not "
+                                   "exceed %d.", name, NXT_INT32_T_MAX / 1000);
+    }
+
+    return nxt_conf_vldt_restored_range(vldt, name, 0, NXT_INT32_T_MAX / 1000,
+                                        "the timer fires at once");
+}
+
+
+/*
+ * A stored configuration from an earlier version can have a number that the
+ * control API now refuses.  Refusing it at startup would leave unitd with no
+ * configuration.  So it is kept, with a warning.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_restored_range(nxt_conf_validation_t *vldt, const char *name,
+    int64_t min, int64_t max, const char *effect)
+{
+    nxt_str_t  pointer;
+
+    pointer = vldt->pointer;
+    nxt_conf_vldt_render_pointer(vldt);
+
+    nxt_thread_log_error(NXT_LOG_WARN, "the restored configuration has a "
+                         "\"%s\" number out of the range %L to %L at \"%V\".  "
+                         "The control API now refuses it.  It is kept, and "
+                         "%s.  Correct it to be able to update the "
+                         "configuration.", name, min, max, &vldt->pointer,
+                         effect);
+
+    vldt->pointer = pointer;
+
+    return NXT_OK;
+}
+
+
+/*
+ * The "level" of a compressor is mapped with NXT_CONF_MAP_INT.  The router
+ * does not check the result of nxt_http_comp_compression_init(), so a
+ * number out of the range of an int turned compression off for the whole
+ * configuration.  A number in the range but not supported by the encoder
+ * is replaced with its default level, with a notice in the log, when the
+ * router applies the configuration.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_compression_level(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    double  num;
+
+    num = nxt_conf_get_number(value);
+
+    if (num >= -(double) NXT_INT32_T_MAX - 1 && num <= NXT_INT32_T_MAX) {
+        return NXT_OK;
+    }
+
+    if (!vldt->restored) {
+        return nxt_conf_vldt_error(vldt, "The \"level\" number must be "
+                                   "between %d and %d.",
+                                   -NXT_INT32_T_MAX - 1, NXT_INT32_T_MAX);
+    }
+
+    return nxt_conf_vldt_restored_range(vldt, "level",
+                                        -(int64_t) NXT_INT32_T_MAX - 1,
+                                        NXT_INT32_T_MAX,
+                                        "compression is off");
+}
+
+
+/*
+ * A size option.  The number must be from 0 to NXT_SIZE_T_MAX
+ * (NXT_CONF_SIZE_BOUND in src/nxt_conf.h).  It is compared as a double: a
+ * conversion to an integer type first is undefined for a number out of range.
+ *
+ * Earlier versions accepted a negative size, and NXT_CONF_MAP_SIZE gave a
+ * size near SIZE_MAX.  A stored configuration with one is still loaded, with
+ * a warning, as nxt_controller_start() does for the encoding.  Else unitd
+ * would start with no configuration at all.  The control API refuses a
+ * negative size: vldt->restored is set only for the stored configuration.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_size(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
+    void *data)
+{
+    double      size;
+    nxt_str_t   pointer;
+    const char  *name;
+
+    name = data;
+    size = nxt_conf_get_number(value);
+
+    if (size < 0) {
+        if (vldt->restored && size >= -(double) NXT_CONF_SIZE_BOUND) {
+            pointer = vldt->pointer;
+            nxt_conf_vldt_render_pointer(vldt);
+
+            nxt_thread_log_error(NXT_LOG_WARN, "the restored configuration "
+                                 "has a negative \"%s\" at \"%V\".  The "
+                                 "control API now refuses it.  It is kept, "
+                                 "and it works as before; correct it to be "
+                                 "able to update the configuration.",
+                                 name, &vldt->pointer);
+
+            vldt->pointer = pointer;
+
+            return NXT_OK;
+        }
+
+        return nxt_conf_vldt_error(vldt, "The \"%s\" number must not be "
+                                   "negative.", name);
+    }
+
+    if (size >= (double) NXT_CONF_SIZE_BOUND) {
+        return nxt_conf_vldt_error(vldt, "The \"%s\" number must be less "
+                                   "than %uL.", name, NXT_CONF_SIZE_BOUND);
+    }
+
+    return NXT_OK;
+}
+
+
+/*
+ * "requests" is mapped with NXT_CONF_MAP_INT32.  0, the default, means no
+ * limit.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_requests(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
+    void *data)
+{
+    double  num;
+
+    num = nxt_conf_get_number(value);
+
+    if (num >= 0 && num <= NXT_INT32_T_MAX) {
+        return NXT_OK;
+    }
+
+    if (!vldt->restored) {
+        if (num < 0) {
+            return nxt_conf_vldt_error(vldt, "The \"requests\" number must "
+                                       "be equal to or greater than 0.");
+        }
+
+        return nxt_conf_vldt_error(vldt, "The \"requests\" number must not "
+                                   "exceed %d.", NXT_INT32_T_MAX);
+    }
+
+    if (num < 0 && num >= -(double) NXT_INT32_T_MAX - 1) {
+        return nxt_conf_vldt_restored_range(vldt, "requests", 0,
+                                            NXT_INT32_T_MAX,
+                                            "it has the same effect as "
+                                            "before");
+    }
+
+    return nxt_conf_vldt_restored_range(vldt, "requests", 0, NXT_INT32_T_MAX,
+                                        "the application does not start");
+}
+
+
 static nxt_int_t
 nxt_conf_vldt_threads(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
     void *data)
@@ -2953,6 +3206,20 @@ nxt_conf_vldt_thread_stack_size(nxt_conf_validation_t *vldt,
                              nxt_pagesize);
     }
 
+    /* It is mapped with NXT_CONF_MAP_INT32. */
+
+    if (size > NXT_INT32_T_MAX) {
+        if (!vldt->restored) {
+            return nxt_conf_vldt_error(vldt, "The \"thread_stack_size\" "
+                                       "number must not exceed %d.",
+                                       NXT_INT32_T_MAX);
+        }
+
+        return nxt_conf_vldt_restored_range(vldt, "thread_stack_size",
+                                            min_size, NXT_INT32_T_MAX,
+                                            "the application does not start");
+    }
+
     return NXT_OK;
 }
 
@@ -2969,6 +3236,55 @@ nxt_conf_vldt_compressors(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
     /* NXT_CONF_OBJECT */
 
     return nxt_conf_vldt_object(vldt, value, nxt_conf_vldt_compressor_members);
+}
+
+
+/*
+ * A "compression" object needs "compressors".  Without it the router cannot
+ * build compression and leaves it off, so earlier versions accepted such an
+ * object and compressed nothing.  The control API now refuses it.  A stored
+ * configuration with one is still loaded, with a warning: refusing it at
+ * startup would leave unitd with no configuration.
+ */
+
+static nxt_int_t
+nxt_conf_vldt_compression_object(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    nxt_int_t             ret;
+    nxt_str_t             pointer;
+    nxt_conf_vldt_path_t  seg;
+
+    static const nxt_str_t  compressors = nxt_string("compressors");
+
+    if (nxt_conf_get_object_member(value, &compressors, NULL) == NULL) {
+        seg.prev = vldt->path;
+        seg.seg = compressors;
+        vldt->path = &seg;
+
+        if (!vldt->restored) {
+            ret = nxt_conf_vldt_error(vldt, "Required parameter \"%V\" "
+                                      "is missing.", &compressors);
+            vldt->path = seg.prev;
+
+            return ret;
+        }
+
+        pointer = vldt->pointer;
+        nxt_conf_vldt_render_pointer(vldt);
+
+        nxt_thread_log_error(NXT_LOG_WARN, "the restored configuration has "
+                             "no \"%V\" at \"%V\".  The control API now "
+                             "refuses it.  It is kept, and compression is "
+                             "off.  Add \"%V\" to be able to update the "
+                             "configuration.", &compressors, &vldt->pointer,
+                             &compressors);
+
+        vldt->pointer = pointer;
+        vldt->path = seg.prev;
+    }
+
+    return nxt_conf_vldt_object(vldt, value, data);
 }
 
 
@@ -3986,9 +4302,11 @@ nxt_conf_vldt_app_limits(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
  * segment.
  *
  * The number is compared as a double: a conversion of a number out of range
- * to an integer type is undefined.  A negative number is not checked here.
+ * to an integer type is undefined.  A negative number is refused too:
+ * nxt_conf_map_object() converts it to ssize_t, so -1 is stored in the
+ * size_t field as SIZE_MAX.
  *
- * A stored configuration with a larger number is still loaded, with a
+ * A stored configuration with such a number is still loaded, with a
  * warning.  Else unitd would start with no configuration at all.
  * nxt_main_start_process_handler() gives such an application UINT32_MAX.
  */
@@ -3996,7 +4314,7 @@ nxt_conf_vldt_app_limits(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
 static nxt_int_t
 nxt_conf_vldt_app_shm(nxt_conf_validation_t *vldt, nxt_conf_value_t *value)
 {
-    nxt_str_t             pointer;
+    double                num;
     nxt_conf_value_t      *shm;
     nxt_conf_vldt_path_t  seg;
 
@@ -4004,11 +4322,23 @@ nxt_conf_vldt_app_shm(nxt_conf_validation_t *vldt, nxt_conf_value_t *value)
 
     shm = nxt_conf_get_object_member(value, &shm_str, NULL);
 
-    if (shm == NULL || nxt_conf_get_number(shm) <= (double) UINT32_MAX) {
+    if (shm == NULL) {
+        return NXT_OK;
+    }
+
+    num = nxt_conf_get_number(shm);
+
+    if (num >= 0 && num <= (double) UINT32_MAX) {
         return NXT_OK;
     }
 
     if (!vldt->restored) {
+        if (num < 0) {
+            return nxt_conf_vldt_member_error(vldt, &shm_str,
+                                              "The \"shm\" number must not "
+                                              "be negative.");
+        }
+
         return nxt_conf_vldt_member_error(vldt, &shm_str,
                                           "The \"shm\" number must not "
                                           "exceed %uD.", (uint32_t) UINT32_MAX);
@@ -4018,18 +4348,11 @@ nxt_conf_vldt_app_shm(nxt_conf_validation_t *vldt, nxt_conf_value_t *value)
     seg.seg = shm_str;
     vldt->path = &seg;
 
-    pointer = vldt->pointer;
-    nxt_conf_vldt_render_pointer(vldt);
+    (void) nxt_conf_vldt_restored_range(vldt, "shm", 0, UINT32_MAX,
+                                        "on a 64-bit platform the "
+                                        "application gets a limit of "
+                                        "4294967295 bytes");
 
-    nxt_thread_log_error(NXT_LOG_WARN, "the restored configuration has a "
-                         "\"shm\" number over %uD at \"%V\".  The control "
-                         "API now refuses it.  It is kept, and the "
-                         "application gets a limit of %uD bytes.  Correct it "
-                         "to be able to update the configuration.",
-                         (uint32_t) UINT32_MAX, &vldt->pointer,
-                         (uint32_t) UINT32_MAX);
-
-    vldt->pointer = pointer;
     vldt->path = seg.prev;
 
     return NXT_OK;

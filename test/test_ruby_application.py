@@ -3,6 +3,7 @@ import subprocess
 
 import pytest
 
+from unit import port as port_map
 from unit.applications.lang.ruby import ApplicationRuby
 
 prerequisites = {'modules': {'ruby': 'all'}}
@@ -35,7 +36,7 @@ def test_ruby_application(date_to_sec_epoch, sec_epoch):
 
     date = headers.pop('Date')
     assert date[-4:] == ' GMT', 'date header timezone'
-    assert abs(date_to_sec_epoch(date) - sec_epoch) < 5, 'date header'
+    assert abs(date_to_sec_epoch(date) - sec_epoch()) < 5, 'date header'
 
     assert headers == {
         'Connection': 'close',
@@ -91,8 +92,8 @@ def test_ruby_application_query_string_absent():
 def test_ruby_application_server_port():
     client.load('server_port')
 
-    assert (
-        client.get()['headers']['Server-Port'] == '8080'
+    assert client.get()['headers']['Server-Port'] == str(
+        port_map.port(8080)
     ), 'Server-Port header'
 
 
@@ -322,6 +323,29 @@ def test_ruby_application_header_custom():
         '',
     ], 'header custom'
 
+    resp = client.post(
+        headers={
+            'Host': 'localhost',
+            'X-Long-Name': '1',
+            'Connection': 'close',
+        },
+        body='',
+    )
+    assert resp['status'] == 503, 'header custom name > 255'
+
+
+def test_ruby_application_header_custom_nul():
+    client.load('header_custom')
+
+    # A newline after a NUL byte still splits the value into two fields.
+    resp = client.post(body='a\x00b\nc')
+
+    assert resp['status'] == 200, 'status'
+    assert resp['headers']['Custom-Header'] == [
+        'a\x00b',
+        'c',
+    ], 'header custom nul'
+
 
 @pytest.mark.skip('not yet')
 def test_ruby_application_header_custom_non_printable():
@@ -414,6 +438,21 @@ def test_ruby_application_body_file():
     client.load('body_file')
 
     assert client.get()['body'] == 'body\n', 'body file'
+
+
+def test_ruby_application_body_close_error(wait_for_record):
+    client.load('body_close_error')
+
+    assert client.get()['status'] == 503, 'body file error status'
+
+    assert (
+        wait_for_record(r'\[error\].+Failed to open content file') is not None
+    ), 'body file error'
+
+    # The module calls body.close also when it fails to send the body.
+    resp = client.get(url='/closed')
+    assert resp['status'] == 200, 'closed status'
+    assert resp['headers']['X-Closed'] == '1', 'body closed'
 
 
 def test_ruby_keepalive_body():

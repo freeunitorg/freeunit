@@ -8,6 +8,7 @@ import socket
 
 import pytest
 
+from unit import port as port_map
 from unit.option import option
 
 
@@ -42,7 +43,11 @@ def request_headers(headers=None, connection_close=True):
 class HTTP1:
     def http(self, start_str, **kwargs):
         sock_type = kwargs.get('sock_type', 'ipv4')
-        port = kwargs.get('port', 8080)
+        # The one place the client resolves a listener port; see unit.port for
+        # why the literals are translated here rather than at every call site.
+        # No port (None) means the session default, and port_map.port() passes
+        # a non-integer through.
+        port = port_map.port(kwargs.get('port') or port_map.base())
         url = kwargs.get('url', '/')
         http = 'HTTP/1.0' if 'http_10' in kwargs else 'HTTP/1.1'
 
@@ -217,7 +222,10 @@ class HTTP1:
         buff_size = kwargs.get('buff_size', 4096)
         framed = kwargs.get('framed', False)
 
-        data = b''
+        # A bytearray grows in place.  "data += part" on bytes copied the
+        # whole response for every read, so a large body took quadratic
+        # time: 12 MiB in 4 KiB reads took about 14 s.
+        data = bytearray()
         while True:
             rlist = select.select([sock], [], [], timeout)[0]
             if not rlist:
@@ -244,7 +252,7 @@ class HTTP1:
             if framed and self._response_complete(data):
                 break
 
-        return data
+        return bytes(data)
 
     @staticmethod
     def _response_complete(data):

@@ -200,6 +200,41 @@ def test_njs_modules_replace_restart(requires_restart):
         shutil.rmtree(statedir, ignore_errors=True)
 
 
+def test_njs_modules_delete_store_failure(requires_restart, skip_alert):
+    """A module whose file the store child cannot remove stays listed, and
+    the control API answers an error.  The answer waits for the store."""
+
+    skip_alert(
+        r'.*unlink.*failed.*Is a directory.*',
+        r'.*failed to delete JS module.*',
+    )
+
+    unit_stop()
+
+    statedir = Path(tempfile.mkdtemp(prefix='unit-state-'))
+    stored = statedir / 'scripts' / 'm'
+
+    try:
+        start_on(statedir)
+
+        assert 'success' in client.conf(SHORT_MODULE, '/js_modules/m')
+        assert stored.read_bytes() == SHORT_MODULE, 'stored'
+
+        # A directory in the place of the file: unlink(2) fails with
+        # EISDIR in the store child.
+        stored.unlink()
+        stored.mkdir()
+
+        assert 'error' in client.conf_delete('/js_modules/m'), 'delete refused'
+
+        # The file is still there, so the module stays listed.
+        assert 'm' in client.conf_get('/js_modules'), 'still listed'
+
+    finally:
+        unit_stop()
+        shutil.rmtree(statedir, ignore_errors=True)
+
+
 def test_njs_modules_replace_torn_file(requires_restart, skip_alert):
     """A module file left torn on disk, as a write cut short leaves it, is
     not loaded at startup.  Uploading the module again must replace the

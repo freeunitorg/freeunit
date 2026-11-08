@@ -463,6 +463,11 @@ nxt_py_asgi_request_handler(nxt_unit_request_info_t *req)
     nxt_python_target_t     *target;
     nxt_py_asgi_ctx_data_t  *ctx_data;
 
+    if (nxt_slow_path(req->request->app_target >= nxt_py_targets->count)) {
+        nxt_unit_request_done(req, NXT_UNIT_ERROR);
+        return;
+    }
+
     if (req->request->websocket_handshake) {
         asgi = nxt_py_asgi_websocket_create(req);
 
@@ -532,6 +537,8 @@ nxt_py_asgi_request_handler(nxt_unit_request_info_t *req)
     if (nxt_slow_path(PyDict_SetItem(scope, nxt_py_state_str, newstate)
                       == -1))
     {
+        nxt_unit_req_alert(req, "Python failed to set 'scope.state' item");
+        nxt_unit_request_done(req, NXT_UNIT_ERROR);
         Py_DECREF(newstate);
         goto release_scope;
     }
@@ -698,8 +705,9 @@ nxt_py_asgi_create_http_scope(nxt_unit_request_info_t *req,
     }
 
     p = nxt_unit_sptr_get(&r->version);
-    SET_ITEM(scope, http_version, p[7] == '1' ? nxt_py_1_1_str
-                                              : nxt_py_1_0_str)
+    SET_ITEM(scope, http_version,
+             (r->version_length >= 8 && p[7] == '1') ? nxt_py_1_1_str
+                                                     : nxt_py_1_0_str)
     SET_ITEM(scope, scheme, scheme)
 
     if (!r->websocket_handshake) {
@@ -854,6 +862,7 @@ nxt_py_asgi_create_address(nxt_unit_sptr_t *sptr, uint8_t len, uint16_t port)
             return NULL;
         }
 
+        Py_INCREF(Py_None);
         PyTuple_SET_ITEM(pair, 0, v);
         PyTuple_SET_ITEM(pair, 1, Py_None);
 
@@ -1163,6 +1172,7 @@ nxt_py_asgi_shm_ack_handler(nxt_unit_ctx_t *ctx)
         }
 
         nxt_queue_remove(lnk);
+        lnk->next = NULL;
     }
 }
 

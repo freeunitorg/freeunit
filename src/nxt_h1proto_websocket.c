@@ -242,7 +242,12 @@ nxt_h1p_conn_ws_frame_header_read(nxt_task_t *task, void *obj, void *data)
     nxt_websocket_header_t  *wsh;
 
     c = obj;
-    h1p = data;
+    h1p = nxt_h1p_from_conn(c);
+
+    if (nxt_slow_path(h1p == NULL)) {
+        nxt_h1p_shutdown(task, c);
+        return;
+    }
 
     nxt_h1p_conn_ws_keepalive_disable(task, h1p);
 
@@ -723,10 +728,17 @@ nxt_h1p_conn_ws_frame_process(nxt_task_t *task, nxt_conn_t *c,
 static void
 nxt_h1p_conn_ws_error(nxt_task_t *task, void *obj, void *data)
 {
+    nxt_conn_t          *c;
     nxt_h1proto_t       *h1p;
     nxt_http_request_t  *r;
 
-    h1p = data;
+    c = obj;
+    h1p = nxt_h1p_from_conn(c);
+
+    if (nxt_slow_path(h1p == NULL)) {
+        nxt_h1p_shutdown(task, c);
+        return;
+    }
 
     nxt_debug(task, "h1p conn ws error");
 
@@ -794,11 +806,18 @@ nxt_h1p_conn_ws_timeout(nxt_task_t *task, void *obj, void *data)
      */
     c->socket.timedout = 0;
 
-    h1p = c->socket.data;
+    h1p = nxt_h1p_from_conn(c);
+
+    if (nxt_slow_path(h1p == NULL)) {
+        nxt_h1p_shutdown(task, c);
+        return;
+    }
+
     h1p->keepalive = 0;
 
     r = h1p->request;
     if (nxt_slow_path(r == NULL)) {
+        nxt_h1p_shutdown(task, c);
         return;
     }
 
@@ -830,7 +849,12 @@ nxt_h1p_conn_ws_frame_payload_read(nxt_task_t *task, void *obj, void *data)
     nxt_websocket_header_t  *wsh;
 
     c = obj;
-    h1p = data;
+    h1p = nxt_h1p_from_conn(c);
+
+    if (nxt_slow_path(h1p == NULL)) {
+        nxt_h1p_shutdown(task, c);
+        return;
+    }
 
     nxt_h1p_conn_ws_keepalive_disable(task, h1p);
 

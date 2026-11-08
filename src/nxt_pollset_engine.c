@@ -216,7 +216,15 @@ nxt_pollset_enable_read(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
     nxt_uint_t  op, events;
 
-    if (ev->read != NXT_EVENT_BLOCKED) {
+    /*
+     * A side that nxt_fd_event_is_active() reports is registered already,
+     * and this engine reports it while it is ready, so there is nothing to
+     * change.  The port layer enables an active write event on purpose to
+     * re-arm it; adding the descriptor again would fail and raise the
+     * event's error handler.
+     */
+
+    if (ev->read != NXT_EVENT_BLOCKED && !nxt_fd_event_is_active(ev->read)) {
 
         events = POLLIN;
 
@@ -244,7 +252,15 @@ nxt_pollset_enable_write(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
     nxt_uint_t  op, events;
 
-    if (ev->write != NXT_EVENT_BLOCKED) {
+    /*
+     * A side that nxt_fd_event_is_active() reports is registered already,
+     * and this engine reports it while it is ready, so there is nothing to
+     * change.  The port layer enables an active write event on purpose to
+     * re-arm it; adding the descriptor again would fail and raise the
+     * event's error handler.
+     */
+
+    if (ev->write != NXT_EVENT_BLOCKED && !nxt_fd_event_is_active(ev->write)) {
 
         events = POLLOUT;
 

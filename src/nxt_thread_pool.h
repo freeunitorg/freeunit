@@ -15,7 +15,7 @@ struct nxt_thread_pool_s {
     nxt_atomic_t             ready;
     nxt_atomic_t             waiting;
     nxt_atomic_t             threads;
-    nxt_uint_t               max_threads;
+    nxt_atomic_t             max_threads;
 
     nxt_sem_t                sem;
     nxt_nsec_t               timeout;

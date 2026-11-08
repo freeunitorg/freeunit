@@ -16,6 +16,8 @@
  * is allocated from.  The cases
  * run in a child process: the accepted cases' buffers hold shared memory
  * that only a real engine can release, and the child's exit frees it.
+ * nxt_prepare_msg_test_duplicates() below checks how the lines of one
+ * field name are joined.
  */
 
 #include <nxt_main.h>
@@ -188,6 +190,363 @@ nxt_prepare_msg_test_case(nxt_task_t *task, nxt_mp_t *mp, nxt_app_t *app,
 }
 
 
+/*
+ * For PHP, Perl and Ruby the lines of one field name are joined into the
+ * first line of that name.  For the other app types they are passed as
+ * they are.  A case gives the request lines in order and the lines that
+ * r->content_length, r->content_type, r->cookie and r->authorization point
+ * at.  The h1 field handlers leave each one at the last line of its name
+ * (nxt_http_request_field() in src/nxt_http_request.c).  The expected
+ * message lists the fields in order and the four indices, with -1 for
+ * NXT_UNIT_NONE_FIELD.  As in the parser, the first 16 lines go to
+ * r->inline_fields and the others to the r->fields list.  The call must
+ * leave the request lines as they were: the skip flags as before, and no
+ * merged mark.
+ */
+
+#define NXT_PMT_IN   24
+#define NXT_PMT_OUT  20
+
+
+typedef struct {
+    const char      *name;
+    const char      *value;
+    uint8_t         skip;
+} nxt_pmt_line_t;
+
+
+typedef struct {
+    const char      *name;
+    nxt_bool_t      prefixed;  /* PHP, Perl and Ruby; else Python */
+    nxt_pmt_line_t  in[NXT_PMT_IN];
+    int             ptr[4];
+    nxt_pmt_line_t  out[NXT_PMT_OUT];
+    int             idx[4];
+} nxt_pmt_case_t;
+
+
+static const nxt_pmt_case_t  nxt_pmt_cases[] = {
+    {
+        "special lines last", 1,
+        { { "Cookie", "a=1", 0 },
+          { "Content-Type", "text/plain", 0 },
+          { "Authorization", "Bearer x", 0 },
+          { "Cookie", "b=2", 0 },
+          { "Content-Type", "charset=utf-8", 0 },
+          { "Authorization", "Bearer y", 0 },
+          { "Cookie", "c=3", 0 } },
+        { -1, 4, 6, 5 },
+        { { "HTTP_COOKIE", "a=1; b=2; c=3", 0 },
+          { "HTTP_CONTENT_TYPE", "text/plain, charset=utf-8", 0 },
+          { "HTTP_AUTHORIZATION", "Bearer x, Bearer y", 0 } },
+        { -1, 1, 0, 2 },
+    },
+    {
+        "special lines once", 1,
+        { { "Host", "localhost", 0 },
+          { "Content-Length", "3", 0 },
+          { "Content-Type", "text/plain", 0 },
+          { "Cookie", "a=1", 0 },
+          { "Authorization", "Basic dTpw", 0 } },
+        { 1, 2, 3, 4 },
+        { { "HTTP_HOST", "localhost", 0 },
+          { "HTTP_CONTENT_LENGTH", "3", 0 },
+          { "HTTP_CONTENT_TYPE", "text/plain", 0 },
+          { "HTTP_COOKIE", "a=1", 0 },
+          { "HTTP_AUTHORIZATION", "Basic dTpw", 0 } },
+        { 1, 2, 3, 4 },
+    },
+    {
+        "skipped lines between", 1,
+        { { "X-A", "1", 0 },
+          { "Transfer-Encoding", "chunked", 1 },
+          { "Cookie", "a=1", 0 },
+          { "X-A", "2", 0 },
+          { "Traceparent",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01", 1 },
+          { "Cookie", "b=2", 0 },
+          { "X-A", "3", 0 } },
+        { -1, -1, 5, -1 },
+        { { "HTTP_X_A", "1, 2, 3", 0 },
+          { "HTTP_COOKIE", "a=1; b=2", 0 } },
+        { -1, -1, 1, -1 },
+    },
+    {
+        "case and similar names", 1,
+        { { "cookie", "a=1", 0 },
+          { "Set-Cookie", "s=1", 0 },
+          { "COOKIE", "b=2", 0 },
+          { "Set-Cookie", "s=2", 0 },
+          { "Cookie2", "c=1", 0 },
+          { "Cookie2", "c=2", 0 } },
+        { -1, -1, 2, -1 },
+        { { "HTTP_COOKIE", "a=1; b=2", 0 },
+          { "HTTP_SET_COOKIE", "s=1, s=2", 0 },
+          { "HTTP_COOKIE2", "c=1, c=2", 0 } },
+        { -1, -1, 0, -1 },
+    },
+    {
+        "inline and list lines", 1,
+        { { "Cookie", "a=1", 0 },
+          { "X-1", "v", 0 }, { "X-2", "v", 0 }, { "X-3", "v", 0 },
+          { "X-4", "v", 0 }, { "X-5", "v", 0 }, { "X-6", "v", 0 },
+          { "X-7", "v", 0 }, { "X-8", "v", 0 }, { "X-9", "v", 0 },
+          { "X-10", "v", 0 }, { "X-11", "v", 0 }, { "X-12", "v", 0 },
+          { "X-13", "v", 0 }, { "X-14", "v", 0 },
+          { "Content-Type", "text/plain", 0 },
+          { "X-3", "w", 0 },
+          { "Cookie", "b=2", 0 },
+          { "Content-Type", "text/html", 0 },
+          { "Authorization", "Bearer z", 0 } },
+        { -1, 18, 17, 19 },
+        { { "HTTP_COOKIE", "a=1; b=2", 0 },
+          { "HTTP_X_1", "v", 0 }, { "HTTP_X_2", "v", 0 },
+          { "HTTP_X_3", "v, w", 0 }, { "HTTP_X_4", "v", 0 },
+          { "HTTP_X_5", "v", 0 }, { "HTTP_X_6", "v", 0 },
+          { "HTTP_X_7", "v", 0 }, { "HTTP_X_8", "v", 0 },
+          { "HTTP_X_9", "v", 0 }, { "HTTP_X_10", "v", 0 },
+          { "HTTP_X_11", "v", 0 }, { "HTTP_X_12", "v", 0 },
+          { "HTTP_X_13", "v", 0 }, { "HTTP_X_14", "v", 0 },
+          { "HTTP_CONTENT_TYPE", "text/plain, text/html", 0 },
+          { "HTTP_AUTHORIZATION", "Bearer z", 0 } },
+        { -1, 15, 0, 16 },
+    },
+    {
+        "no prefix, not joined", 0,
+        { { "Cookie", "a=1", 0 },
+          { "Content-Type", "text/plain", 0 },
+          { "Cookie", "b=2", 0 },
+          { "Content-Type", "text/html", 0 } },
+        { -1, 3, 2, -1 },
+        { { "Cookie", "a=1", 0 },
+          { "Content-Type", "text/plain", 0 },
+          { "Cookie", "b=2", 0 },
+          { "Content-Type", "text/html", 0 } },
+        { -1, 3, 2, -1 },
+    },
+};
+
+
+static const nxt_app_type_t  nxt_pmt_prefixed_types[] = {
+    NXT_APP_PHP, NXT_APP_PERL, NXT_APP_RUBY,
+};
+
+
+static const char  *nxt_pmt_idx_names[] = {
+    "content_length_field", "content_type_field", "cookie_field",
+    "authorization_field",
+};
+
+
+static uint16_t
+nxt_pmt_hash(const char *name)
+{
+    u_char    c;
+    uint32_t  hash;
+
+    hash = NXT_HTTP_FIELD_HASH_INIT;
+
+    while (*name != '\0') {
+        c = *name++;
+        hash = nxt_http_field_hash_char(hash, nxt_lowcase(c));
+    }
+
+    return nxt_http_field_hash_end(hash) & 0xFFFF;
+}
+
+
+/*
+ * "marks" sets the merged bit of every line before the call, as the memory
+ * that nxt_list_add() returns can hold it.
+ */
+
+static nxt_int_t
+nxt_pmt_run(nxt_task_t *task, nxt_mp_t *mp, nxt_app_t *app,
+    nxt_sockaddr_t *sa, const char *name, nxt_app_type_t type,
+    nxt_bool_t marks, const nxt_pmt_line_t *in, nxt_uint_t n_in,
+    const int *ptr, const nxt_pmt_line_t *out, nxt_uint_t n_out,
+    const int *idx)
+{
+    u_char              *s, *v, label[128];
+    uint32_t            got[4], want;
+    nxt_buf_t           *b;
+    nxt_str_t           *method, *args;
+    nxt_uint_t          i, status;
+    nxt_http_field_t    *f, **fields, **refs[4];
+    nxt_unit_field_t    *uf;
+    nxt_unit_request_t  *req;
+    nxt_http_request_t  *r;
+
+    (void) nxt_sprintf(label, label + sizeof(label), "\"%s\" (type %d%s)%Z",
+                       name, (int) type, marks ? ", marks set" : "");
+
+    r = nxt_mp_zalloc(mp, sizeof(nxt_http_request_t));
+    method = nxt_mp_zalloc(mp, sizeof(nxt_str_t));
+    args = nxt_mp_zalloc(mp, sizeof(nxt_str_t));
+    fields = nxt_mp_zalloc(mp, n_in * sizeof(nxt_http_field_t *));
+
+    if (r == NULL || method == NULL || args == NULL || fields == NULL) {
+        return NXT_ERROR;
+    }
+
+    r->mem_pool = mp;
+    nxt_str_set(method, "GET");
+    r->method = method;
+    nxt_str_set(&r->version, "HTTP/1.1");
+    nxt_str_set(&r->server_name, "localhost");
+    nxt_str_set(&r->target, "/");
+    r->path = &r->target;
+    r->args = args;
+    r->remote = sa;
+    r->local = sa;
+    r->content_length_n = -1;
+
+    for (i = 0; i < n_in; i++) {
+        f = nxt_http_req_field_zero_add(r);
+        if (f == NULL) {
+            return NXT_ERROR;
+        }
+
+        f->hash = nxt_pmt_hash(in[i].name);
+        f->skip = in[i].skip;
+        f->merged = marks;
+        f->name = (u_char *) in[i].name;
+        f->name_length = nxt_strlen(in[i].name);
+        f->value = (u_char *) in[i].value;
+        f->value_length = nxt_strlen(in[i].value);
+
+        fields[i] = f;
+    }
+
+    refs[0] = &r->content_length;
+    refs[1] = &r->content_type;
+    refs[2] = &r->cookie;
+    refs[3] = &r->authorization;
+
+    for (i = 0; i < 4; i++) {
+        *refs[i] = (ptr[i] >= 0) ? fields[ptr[i]] : NULL;
+    }
+
+    app->type = type;
+    status = 0;
+
+    b = nxt_router_test_prepare_msg(task, r, app, &status);
+    if (b == NULL) {
+        nxt_log_alert(task->log, "prepare msg dup test %s: refused with %d",
+                      label, (int) status);
+        return NXT_ERROR;
+    }
+
+    req = (nxt_unit_request_t *) b->mem.pos;
+
+    if (req->fields_count != n_out) {
+        nxt_log_alert(task->log, "prepare msg dup test %s: %uD fields, "
+                      "expected %ui", label, req->fields_count, n_out);
+        return NXT_ERROR;
+    }
+
+    got[0] = req->content_length_field;
+    got[1] = req->content_type_field;
+    got[2] = req->cookie_field;
+    got[3] = req->authorization_field;
+
+    for (i = 0; i < 4; i++) {
+        want = (idx[i] < 0) ? NXT_UNIT_NONE_FIELD : (uint32_t) idx[i];
+
+        if (got[i] != want) {
+            nxt_log_alert(task->log, "prepare msg dup test %s: %s %uD, "
+                          "expected %uD", label, nxt_pmt_idx_names[i],
+                          got[i], want);
+            return NXT_ERROR;
+        }
+    }
+
+    for (i = 0; i < n_out; i++) {
+        uf = &req->fields[i];
+        s = nxt_unit_sptr_get(&uf->name);
+        v = nxt_unit_sptr_get(&uf->value);
+
+        if (uf->name_length != nxt_strlen(out[i].name)
+            || memcmp(s, out[i].name, uf->name_length) != 0
+            || s[uf->name_length] != '\0'
+            || uf->value_length != nxt_strlen(out[i].value)
+            || memcmp(v, out[i].value, uf->value_length) != 0
+            || v[uf->value_length] != '\0')
+        {
+            nxt_log_alert(task->log, "prepare msg dup test %s: field %ui is "
+                          "\"%*s: %*s\", expected \"%s: %s\"", label, i,
+                          (size_t) uf->name_length, s,
+                          (size_t) uf->value_length, v, out[i].name,
+                          out[i].value);
+            return NXT_ERROR;
+        }
+    }
+
+    /* The request lines are as they were, with no mark left. */
+
+    for (i = 0; i < n_in; i++) {
+        if (fields[i]->skip != in[i].skip
+            || (!in[i].skip && fields[i]->merged))
+        {
+            nxt_log_alert(task->log, "prepare msg dup test %s: line %ui "
+                          "\"%s\" has skip %d and merged %d after the call, "
+                          "skip %d before", label, i, in[i].name,
+                          (int) fields[i]->skip, (int) fields[i]->merged,
+                          (int) in[i].skip);
+            return NXT_ERROR;
+        }
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_prepare_msg_test_duplicates(nxt_task_t *task, nxt_mp_t *mp, nxt_app_t *app,
+    nxt_sockaddr_t *sa)
+{
+    nxt_int_t             ret;
+    nxt_uint_t            i, t, n, n_in, n_out;
+    nxt_app_type_t        type;
+    const nxt_pmt_case_t  *tc;
+
+    ret = NXT_OK;
+
+    for (i = 0; i < nxt_nitems(nxt_pmt_cases); i++) {
+        tc = &nxt_pmt_cases[i];
+
+        for (n_in = 0; n_in < NXT_PMT_IN && tc->in[n_in].name != NULL; n_in++)
+        {
+            /* void */
+        }
+
+        for (n_out = 0;
+             n_out < NXT_PMT_OUT && tc->out[n_out].name != NULL;
+             n_out++)
+        {
+            /* void */
+        }
+
+        /* Each type with and without the marks set before the call. */
+        n = tc->prefixed ? nxt_nitems(nxt_pmt_prefixed_types) : 1;
+
+        for (t = 0; t < 2 * n; t++) {
+            type = tc->prefixed ? nxt_pmt_prefixed_types[t / 2]
+                                : NXT_APP_PYTHON;
+
+            if (nxt_pmt_run(task, mp, app, sa, tc->name, type, t % 2, tc->in,
+                            n_in, tc->ptr, tc->out, n_out, tc->idx)
+                != NXT_OK)
+            {
+                ret = NXT_ERROR;
+            }
+        }
+    }
+
+    return ret;
+}
+
+
 static nxt_int_t
 nxt_prepare_msg_test_run(nxt_thread_t *thr)
 {
@@ -272,6 +631,10 @@ nxt_prepare_msg_test_run(nxt_thread_t *thr)
                           tc->name, used, live_used);
             ret = NXT_ERROR;
         }
+    }
+
+    if (nxt_prepare_msg_test_duplicates(task, mp, app, sa) != NXT_OK) {
+        ret = NXT_ERROR;
     }
 
     thr->engine = saved_engine;

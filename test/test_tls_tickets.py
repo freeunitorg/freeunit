@@ -10,6 +10,7 @@ from OpenSSL.SSL import (
     _lib,
 )
 from unit.applications.tls import ApplicationTLS
+from unit import port as port_map
 
 prerequisites = {'modules': {'openssl': 'any'}}
 
@@ -47,7 +48,7 @@ def setup_method_fixture():
 
 
 def connect(ctx=None, session=None, port=8080):
-    sock = socket.create_connection(('127.0.0.1', port))
+    sock = socket.create_connection(('127.0.0.1', port_map.port(port)))
 
     if ctx is None:
         ctx = Context(TLSv1_2_METHOD)

@@ -1,0 +1,220 @@
+name: "Nightly (strict build, OpenSSL 4.0)"
+
+on:
+  # Two compile gates that pull requests and master pushes no longer run.
+  # hardening-strict-fedora in build-test.yml runs the strict build with the
+  # newest gcc and clang and builds against Fedora's OpenSSL 4.0.x on every
+  # pull request.  These jobs add the runner compilers and an upstream
+  # OpenSSL at a pinned version once a night, so a breakage there shows up
+  # within a day without costing pull requests a runner.  Scheduled runs
+  # test the default branch only.
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # OpenSSL 4.0 for the openssl4 job below.  Ubuntu does not ship 4.0 (Fedora
+  # 45 does, see hardening-strict-fedora in build-test.yml), so this job builds
+  # it from source for the runner's toolchain and -DOPENSSL_NO_DEPRECATED.
+  # The /opt/openssl-4.0 slot is stable across patch bumps.
+  OPENSSL4_VERSION: 4.0.3
+  # SHA256 of openssl-${OPENSSL4_VERSION}.tar.gz, from
+  # https://github.com/openssl/openssl/releases/tag/openssl-4.0.3.
+  OPENSSL4_SHA256: 325b5c806167c13b40b1ffeadfe0248197c00eccc4cf123ec1e28d2d2fd216d9
+
+jobs:
+
+  # OpenSSL 4.0 compile gate.  4.0 removed nothing Unit uses, but it deprecated
+  # more of what Unit still calls, and 5.0 is where the deprecated symbols
+  # actually go away -- so the value here is having a leg that fails when a new
+  # deprecation lands, instead of noticing at removal time.  Deliberately cheap:
+  # a build plus the C test suite, no language modules and no pytest run, since
+  # nothing above the TLS layer changes with the OpenSSL version.
+  openssl4:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
+      - name: Install packages
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libpcre2-dev
+
+      - name: Cache OpenSSL 4.0
+        id: cache-openssl4
+        uses: actions/cache@v6
+        with:
+          path: /opt/openssl-4.0
+          key: openssl-${{ env.OPENSSL4_VERSION }}-${{ env.OPENSSL4_SHA256 }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build OpenSSL 4.0
+        if: steps.cache-openssl4.outputs.cache-hit != 'true'
+        run: |
+          cd /tmp
+          wget -q "https://www.openssl.org/source/openssl-${OPENSSL4_VERSION}.tar.gz"
+          echo "${OPENSSL4_SHA256}  openssl-${OPENSSL4_VERSION}.tar.gz" | sha256sum -c -
+          tar -xzf "openssl-${OPENSSL4_VERSION}.tar.gz"
+          cd "openssl-${OPENSSL4_VERSION}"
+          ./Configure --prefix=/opt/openssl-4.0 shared no-docs
+          make -j"$(nproc)"
+          sudo mkdir -p /opt/openssl-4.0
+          sudo make install_sw
+
+      - name: Set OpenSSL 4.0 build environment
+        # Same isolation as the 3.5 slot: never overwrite the system libraries,
+        # because sudo links against them.
+        run: |
+          OSSL=/opt/openssl-4.0
+          LIBDIR=$( [ -d "$OSSL/lib64" ] && echo "$OSSL/lib64" || echo "$OSSL/lib" )
+          echo "OPENSSL4_INCDIR=${OSSL}/include" >> "$GITHUB_ENV"
+          echo "OPENSSL4_LIBDIR=${LIBDIR}"        >> "$GITHUB_ENV"
+
+      - name: Configure unit (--openssl --tests)
+        # LD_LIBRARY_PATH is scoped to this step only so that auto/feature test
+        # binaries load OpenSSL 4.0; exporting it globally would break sudo.
+        # The build itself needs no such help -- -Wl,-rpath below is baked into
+        # the binaries, and is honoured under sudo too.
+        env:
+          LD_LIBRARY_PATH: ${{ env.OPENSSL4_LIBDIR }}
+        run: |
+          ./configure \
+            --tests \
+            --openssl \
+            --cc-opt="-I${OPENSSL4_INCDIR} -DOPENSSL_NO_DEPRECATED" \
+            --ld-opt="-L${OPENSSL4_LIBDIR} -Wl,-rpath,${OPENSSL4_LIBDIR}"
+
+      # Assert rather than print: if the include/lib flags ever stop taking
+      # effect, configure falls back to the runner's system OpenSSL 3.x and the
+      # leg would pass while testing nothing it was added for.
+      - name: Assert configure found OpenSSL 4.0
+        run: |
+          grep NXT_HAVE_OPENSSL_VERSION build/include/nxt_auto_config.h
+          grep -q '#define NXT_HAVE_OPENSSL_VERSION  "OpenSSL 4\.' \
+            build/include/nxt_auto_config.h
+
+      - name: Build unit
+        run: make -j4
+
+      - name: Build C tests
+        run: make -j4 tests
+
+      - name: Run C tests
+        run: sudo ./build/tests
+
+  # --hardening=strict compile gate with the runner compilers, gcc 15.2.0 and
+  # clang 21.1.8 on ubuntu-26.04; hardening-strict-fedora in build-test.yml
+  # runs the same gate with the newest ones on every pull request.
+  # auto/cc/test already passes -Werror to both, so a new warning from
+  # -Wformat=2, -Wvla or -Wimplicit-fallthrough (a fall-through without
+  # nxt_fallthrough) fails the job.  The assert step fails when a compiler
+  # stops accepting one of the probed flags: auto/cc/hardening only drops such
+  # a flag, so a plain build would pass while testing nothing.  Cheap on
+  # purpose: a build plus the C test suite, no language modules.
+  hardening-strict:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
+      - name: Install packages
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev clang
+
+      - name: Configure unit (--hardening=strict --tests --openssl)
+        run: |
+          ./configure \
+            --cc=${{ matrix.cc }} \
+            --hardening=strict \
+            --tests \
+            --openssl 2>&1 | tee configure.log
+          test "${PIPESTATUS[0]}" -eq 0
+
+      # Every flag that this job exists for must be found.  The FORTIFY probe
+      # falls back from level 3 to 2, so either level passes.  The CET and
+      # branch-protection flags are not asserted: each applies to one target
+      # only.
+      - name: Assert configure found the hardening flags
+        run: |
+          grep -q 'hardening: .* strict$' configure.log
+          for flag in -fstack-protector-strong -fstack-clash-protection \
+                      -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack \
+                      -Wformat=2 -Wvla -Wimplicit-fallthrough \
+                      -ftrivial-auto-var-init=pattern
+          do
+            grep -q "checking for $flag \.\.\. found" configure.log \
+              || { echo "$flag was not found"; exit 1; }
+          done
+          grep -q 'checking for -D_FORTIFY_SOURCE=[23] \.\.\. found' \
+            configure.log \
+            || { echo "_FORTIFY_SOURCE was not found"; exit 1; }
+          grep -q 'define NXT_HAVE_BUILTIN_OVERFLOW' \
+            build/include/nxt_auto_config.h
+
+      - name: Build unit
+        run: make -j4
+
+      - name: Build C tests
+        run: make -j4 tests
+
+      - name: Run C tests
+        run: sudo ./build/tests
+
+  # A nightly red check on master is easy to miss, so a scheduled failure is
+  # reported as a tracking issue, the same way build-distros.yml and
+  # eol-check.yml handle their weekly runs.  A manual run reports nothing:
+  # whoever started it is watching it.
+  report:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    needs: [ openssl4, hardening-strict ]
+    if: failure() && github.event_name == 'schedule'
+    permissions:
+      issues: write
+
+    steps:
+      - name: Open or update tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # No checkout here, so gh has no git remote to infer the repository.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          title='Nightly build is failing (hardening-strict / openssl4)'
+          {
+            echo 'The nightly strict build on the runner compilers or the build'
+            echo 'against upstream OpenSSL 4.0 failed on master. Pull requests'
+            echo 'do not run these jobs, so a merged change can break them.'
+            echo
+            echo "Commit: ${{ github.sha }}"
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > issue-body.md
+          existing=$(gh issue list --state open --search "in:title ${title}" \
+            --json number,title --jq ".[] | select(.title == \"${title}\") | .number" | head -n1)
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body-file issue-body.md
+          else
+            gh issue create --title "${title}" --body-file issue-body.md
+          fi

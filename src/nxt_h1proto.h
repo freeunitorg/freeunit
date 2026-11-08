@@ -86,6 +86,41 @@ struct nxt_h1proto_s {
     nxt_conn_t                *conn;
 };
 
+/*
+ * The h1proto object is kept in the connection's socket.data, but that slot
+ * is not the h1proto's alone: the peer side of a proxied request keeps
+ * nxt_http_peer_t there, so that the generic connection handlers hand the
+ * peer to the peer handlers (nxt_h1p_peer_connect()), and nxt_h1p_closing()
+ * empties the slot.  Every h1proto points back at the connection that owns
+ * it -- the accept path and the peer path bind them together, and the
+ * keep-alive path zeroes the h1proto up to, never including, conn -- so the
+ * object is a h1proto for this connection only when it does.  Reading the
+ * slot without this check hands a peer object to code that reads it as a
+ * h1proto: the conn field then comes from beyond that object, a zero that
+ * the caller dereferences.
+ */
+typedef struct {
+    nxt_conn_t     *owner;   /* offset 0 */
+    nxt_h1proto_t  h1p;
+} nxt_h1p_slot_t;
+
+nxt_inline nxt_h1proto_t *
+nxt_h1p_from_conn(nxt_conn_t *c)
+{
+    nxt_h1p_slot_t  *slot;
+
+    slot = c->socket.data;
+
+    if (nxt_slow_path(slot == NULL || slot->owner != c)) {
+        return NULL;
+    }
+
+    return &slot->h1p;
+}
+void nxt_h1p_shutdown(nxt_task_t *task, nxt_conn_t *c);
+
+
+
 #define nxt_h1p_is_http11(h1p)                                              \
     ((h1p)->parser.version.s.minor != '0')
 

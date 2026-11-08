@@ -883,24 +883,51 @@ fail:
 
 
 void
-nxt_script_store_delete(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp)
+nxt_script_store_delete(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp,
+    nxt_port_rpc_handler_t handler, void *ctx)
 {
+    uint32_t       stream;
+    nxt_int_t      ret;
     nxt_buf_t      *b;
-    nxt_port_t     *main_port;
+    nxt_port_t     *main_port, *ctl_port;
     nxt_runtime_t  *rt;
 
     b = nxt_buf_mem_alloc(mp, name->length + 1, 0);
-
-    if (nxt_fast_path(b != NULL)) {
-        nxt_buf_cpystr(b, name);
-        *b->mem.free++ = '\0';
-
-        rt = task->thread->runtime;
-        main_port = rt->port_by_type[NXT_PROCESS_MAIN];
-
-        (void) nxt_port_socket_write(task, main_port,
-                                     NXT_PORT_MSG_SCRIPT_DELETE, -1, 0, 0, b);
+    if (nxt_slow_path(b == NULL)) {
+        goto fail;
     }
+
+    b->completion_handler = nxt_script_buf_completion;
+
+    nxt_buf_cpystr(b, name);
+    *b->mem.free++ = '\0';
+
+    rt = task->thread->runtime;
+    main_port = rt->port_by_type[NXT_PROCESS_MAIN];
+    ctl_port = rt->port_by_type[NXT_PROCESS_CONTROLLER];
+
+    stream = nxt_port_rpc_register_handler(task, ctl_port, handler, handler,
+                                           -1, ctx);
+    if (nxt_slow_path(stream == 0)) {
+        goto fail;
+    }
+
+    ret = nxt_port_socket_write(task, main_port, NXT_PORT_MSG_SCRIPT_DELETE,
+                                -1, stream, ctl_port->id, b);
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_port_rpc_cancel(task, ctl_port, stream);
+        goto fail;
+    }
+
+    /* See nxt_script_store_get(). */
+    nxt_mp_retain(mp);
+
+    return;
+
+fail:
+
+    handler(task, NULL, ctx);
 }
 
 
@@ -908,47 +935,63 @@ nxt_script_store_delete(nxt_task_t *task, nxt_str_t *name, nxt_mp_t *mp)
  * The delete is a job of the store child, as a store is.  Jobs run in the
  * order they come, so a delete cannot run before the rename(2) of an
  * earlier store of the same module, which would bring the module back.
+ * The controller waits for the answer: the module is gone from the store
+ * only when this job has run.
  */
 void
 nxt_script_store_delete_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
     nxt_str_t             name;
-    nxt_port_t            *ctl_port;
+    nxt_port_t            *port;
     nxt_runtime_t         *rt;
     nxt_main_store_job_t  *job;
 
-    rt = task->thread->runtime;
-    ctl_port = rt->port_by_type[NXT_PROCESS_CONTROLLER];
+    port = nxt_runtime_port_find(task->thread->runtime,
+                                 nxt_recv_msg_cmsg_pid(msg),
+                                 msg->port_msg.reply_port);
 
-    if (nxt_slow_path(ctl_port == NULL)) {
-        nxt_alert(task, "controller port not found");
-        nxt_port_recv_msg_close_fds(msg);
-        return;
-    }
-
-    if (nxt_slow_path(nxt_recv_msg_cmsg_pid(msg) != ctl_port->pid)) {
+    if (nxt_slow_path(port == NULL || port->type != NXT_PROCESS_CONTROLLER)) {
         nxt_alert(task, "process %PI cannot delete scripts",
                   nxt_recv_msg_cmsg_pid(msg));
         nxt_port_recv_msg_close_fds(msg);
         return;
     }
 
+    rt = task->thread->runtime;
+
     if (nxt_slow_path(rt->scripts.start == NULL)) {
         nxt_alert(task, "no scripts storage directory");
-        return;
+        goto fail;
     }
 
     if (nxt_slow_path(nxt_script_store_name(msg->buf, 0, &name) != NXT_OK)) {
         nxt_alert(task, "script_delete_handler: invalid script name");
-        return;
+        goto fail;
     }
 
     job = nxt_main_store_job_create(NXT_MAIN_STORE_DELETE, "JS module",
                                     &rt->scripts, &name);
 
-    if (nxt_fast_path(job != NULL)) {
-        nxt_main_store_submit(task, job);
+    if (nxt_slow_path(job == NULL)) {
+        goto fail;
     }
+
+    job->reply_pid = port->pid;
+    job->reply_port = port->id;
+    job->stream = msg->port_msg.stream;
+
+    nxt_port_recv_msg_close_fds(msg);
+
+    nxt_main_store_submit(task, job);
+
+    return;
+
+fail:
+
+    (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_ERROR, -1,
+                                 msg->port_msg.stream, 0, NULL);
+
+    nxt_port_recv_msg_close_fds(msg);
 }
 
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # run-local-full.sh — pre-commit / PR static analysis via clang-ast
 #
 # Runs the FreeUnit C build under the freeunitorg/clang-ast LLVM plugin
@@ -18,9 +18,15 @@
 #
 # To force image rebuild: docker rmi freeunit-test-full:local
 
-set -euo pipefail
+set -eu
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# pipefail is not in POSIX; use it when the shell supports it.
+# shellcheck disable=SC3040
+if (set -o pipefail) 2>/dev/null; then
+    set -o pipefail
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 IMAGE_NAME="freeunit-test-full:local"
 # Pre-built image (clang-ast plugin + rustc/cargo).  Pulled when present so the
@@ -44,7 +50,7 @@ case "${1:-}" in
     *)  err "Unknown option: $1"; exit 1 ;;
 esac
 
-if ! command -v docker &>/dev/null; then
+if ! command -v docker >/dev/null 2>&1; then
     err "docker not found in PATH"; exit 1
 fi
 
@@ -62,9 +68,9 @@ prepare_tmp() {
 }
 
 cleanup_tmp() {
-    local rc=$?
-    if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
-        if [[ $rc -eq 0 ]]; then
+    rc=$?
+    if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
+        if [ "$rc" -eq 0 ]; then
             info "Removing tmp dir $TMP_DIR"
             rm -rf "$TMP_DIR"
         else
@@ -78,7 +84,7 @@ trap cleanup_tmp EXIT
 # Build the clang-ast image if missing
 # ---------------------------------------------------------------------------
 build_image() {
-    if docker image inspect "$IMAGE_NAME" &>/dev/null; then
+    if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
         info "Using cached image: $IMAGE_NAME"
         return 0
     fi
@@ -95,7 +101,6 @@ build_image() {
 
     info "Building clang-ast image: $IMAGE_NAME (one-time, slow)"
 
-    local DOCKERFILE
     DOCKERFILE="$(mktemp /tmp/Dockerfile.full.XXXXXX)"
 
     cat > "$DOCKERFILE" <<'EOF'

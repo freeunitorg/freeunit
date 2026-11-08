@@ -1,11 +1,13 @@
 import gzip
 import os
+import random
 import zlib
 from pathlib import Path
 
 import pytest
 
 from unit.applications.proto import ApplicationProto
+from unit.compression import brotli_decompress, zstd_decompress
 
 client = ApplicationProto()
 
@@ -51,6 +53,44 @@ def test_static_compression_baseline():
     )
     assert resp['status'] == 200, 'compressed 200'
     assert resp['headers']['Content-Encoding'] == 'gzip', 'gzip applied'
+
+
+@pytest.mark.parametrize('configured', [False, True])
+def test_static_compression_no_accept_ranges(temp_dir, configured):
+    # A coded response is never served in ranges, so it does not advertise
+    # them, even when "response_headers" adds the field after the coding.
+    # The identity response does, and a Range still gets a 206 of the
+    # identity bytes.
+    if configured:
+        assert 'success' in client.conf(
+            {
+                "share": f'{temp_dir}/assets$uri',
+                "response_headers": {"Accept-Ranges": "bytes"},
+            },
+            'routes/0/action',
+        ), 'configure'
+
+    def get(**headers):
+        return client.get(
+            url='/big.css',
+            headers={'Host': 'localhost', 'Connection': 'close', **headers},
+        )
+
+    coded = get(**{'Accept-Encoding': 'gzip'})
+    assert coded['status'] == 200, 'coded status'
+    assert coded['headers']['Content-Encoding'] == 'gzip', 'coded'
+    assert 'Accept-Ranges' not in coded['headers'], 'coded: no Accept-Ranges'
+
+    plain = get()
+    assert plain['status'] == 200, 'identity status'
+    assert 'Content-Encoding' not in plain['headers'], 'identity'
+    assert plain['headers']['Accept-Ranges'] == 'bytes', 'identity: ranges'
+
+    part = get(**{'Accept-Encoding': 'gzip', 'Range': 'bytes=0-3'})
+    assert part['status'] == 206, 'range status'
+    assert 'Content-Encoding' not in part['headers'], 'range not coded'
+    assert part['headers']['Accept-Ranges'] == 'bytes', 'range: ranges'
+    assert part['body'] == 'body', 'range body'
 
 
 def test_static_compression_regex_match_limit(
@@ -1093,3 +1133,135 @@ def test_static_compression_response_headers_content_encoding_resolved_once(
     assert headers['Accept-Ranges'] == 'bytes', 'Accept-Ranges is sent'
     assert headers['Content-Encoding'] == '', 'the value of the check'
     assert body == stored, 'the stored bytes'
+
+
+def test_static_compression_level_above_int8(wait_for_record):
+    # "level" was stored in one byte.  265 (0x109) became 9 on little-endian
+    # and 0 on big-endian, both valid gzip levels, so there was no notice.
+    # Now 265 is out of range, and the default level is used.
+    assert 'success' in client.conf(
+        {
+            "types": ["text/css"],
+            "compressors": [{"encoding": "gzip", "level": 265}],
+        },
+        'settings/http/compression',
+    ), 'compression configure'
+
+    assert (
+        wait_for_record(
+            r'Overriding invalid compression level for \[gzip\] \[265\]'
+        )
+        is not None
+    ), 'level 265 is out of range'
+
+
+def test_static_compression_head_matches_get(temp_dir):
+    # https://github.com/freeunitorg/freeunit/issues/391: HEAD skipped the
+    # compression step, so it answered with no Content-Encoding and the
+    # identity length while GET answered gzip.  RFC 9110 Sect. 9.3.2: HEAD
+    # carries the same fields as GET, less the ones learnt only while
+    # generating the content.  The coded length is computed, not omitted.
+    _age(f'{temp_dir}/assets/big.css')
+
+    get_status, get_headers, body = _raw_get(
+        method='GET', **{'Accept-Encoding': 'gzip'}
+    )
+    head_status, head_headers, head_body = _raw_get(
+        method='HEAD', **{'Accept-Encoding': 'gzip'}
+    )
+
+    assert get_status == head_status == 200, 'status'
+    assert get_headers['Content-Encoding'] == 'gzip', 'GET coded'
+    assert gzip.decompress(body) == b'body{color:red}' * 500, 'GET body'
+
+    assert head_headers.get('Content-Encoding') == 'gzip', 'HEAD coded'
+    assert head_headers.get('Vary') == get_headers.get('Vary'), 'HEAD Vary'
+    assert head_headers.get('ETag') == get_headers.get('ETag'), 'HEAD ETag'
+    assert head_headers['ETag'].startswith('W/'), 'HEAD weak ETag'
+    assert head_headers['Content-Length'] == get_headers['Content-Length'], (
+        'HEAD gives the coded length GET sends'
+    )
+    assert int(head_headers['Content-Length']) == len(body), 'coded length'
+    assert 'Transfer-Encoding' not in head_headers, 'HEAD not chunked'
+    assert head_body == b'', 'HEAD has no body'
+
+    # Identity is unchanged: no Accept-Encoding, the real length.
+    _, plain_headers, _ = _raw_get(method='HEAD')
+    assert 'Content-Encoding' not in plain_headers, 'identity HEAD'
+    assert plain_headers['Content-Length'] == str(len('body{color:red}' * 500))
+
+
+def _set_compressor(coding):
+    """Configures one compressor for text/css, or skips the test."""
+
+    resp = client.conf(
+        {
+            "types": ["text/css"],
+            "compressors": [{"encoding": coding, "level": 5, "min_length": 10}],
+        },
+        'settings/http/compression',
+    )
+
+    if 'success' in resp:
+        return
+
+    if 'supported compressor' in resp.get('detail', ''):
+        pytest.skip(f'unit built without {coding} compression support')
+
+    pytest.fail(f'could not configure {coding} compression: {resp}')
+
+
+@pytest.mark.parametrize('coding', ['gzip', 'zstd', 'br'])
+def test_static_compression_head_length_many_chunks(temp_dir, coding):
+    # More than one NXT_HTTP_STATIC_BUF_SIZE chunk (128 KiB): the HEAD sizing
+    # pass has to flush at the same chunk boundaries as GET, and the coded
+    # body of each compressor has to decode from the temp file.  zstd and br
+    # flush every piece too, so their frames are built from several flush
+    # blocks here.
+    path = f'{temp_dir}/assets/huge.css'
+    Path(path).write_bytes(
+        b''.join(b'.c%d{color:#%06x}\n' % (i, i * 7919 % 0xFFFFFF)
+                 for i in range(20000))
+    )
+    _age(path)
+
+    decoders = {
+        'gzip': gzip.decompress,
+        'zstd': zstd_decompress,
+        'br': brotli_decompress,
+    }
+    decode = decoders[coding]
+    _set_compressor(coding)
+
+    get_status, get_headers, body = _raw_get(
+        url='/huge.css', **{'Accept-Encoding': coding}
+    )
+    head_status, head_headers, _ = _raw_get(
+        url='/huge.css', method='HEAD', **{'Accept-Encoding': coding}
+    )
+
+    assert get_status == head_status == 200, 'status'
+    assert get_headers.get('Content-Encoding') == coding, 'GET coded'
+    assert decode(body) == Path(path).read_bytes(), 'GET body'
+    assert head_headers.get('Content-Encoding') == coding, 'HEAD coded'
+    assert head_headers['Content-Length'] == get_headers['Content-Length']
+    assert int(head_headers['Content-Length']) == len(body)
+
+
+def test_static_compression_incompressible_multi_piece(temp_dir):
+    # A static file is compressed in 128 KiB pieces, each but the last ended
+    # with a flush, into one buffer sized by the compressor's bound for the
+    # whole file.  With zlib's 15-bit window that bound is tight, and an
+    # incompressible file of several pieces filled the buffer about 5 bytes
+    # per flush short: Z_FINISH did not complete and a truncated gzip body
+    # was sent as a success.
+    data = random.Random(42).randbytes(512 * 1024 + 7)
+    Path(f'{temp_dir}/assets/noise.css').write_bytes(data)
+
+    status, hdrs, body = _raw_get(
+        url='/noise.css', **{'Accept-Encoding': 'gzip'}
+    )
+
+    assert status == 200, 'status'
+    assert hdrs.get('Content-Encoding') == 'gzip', 'coded'
+    assert gzip.decompress(body) == data, 'complete gzip stream'

@@ -32,6 +32,7 @@ import pytest
 
 from unit.applications.tls import ApplicationTLS
 from unit.utils import waitforsocket
+from unit import port as port_map
 
 prerequisites = {'modules': {'openssl': 'any'}}
 
@@ -47,11 +48,13 @@ SIZE = SIZE_MIB * 1024 * 1024
 # Fixed upstream ports reserved for this case in test/fake_upstream/README.md.
 # One documented port per test → no cross-test collisions, greppable alongside
 # the `chunked-response` mode / `respond_chunked_response` Rust handler.
-UPSTREAM_PORT = 7994        # plain + tls relay tests
-UPSTREAM_ABORT_PORT = 7995  # client-abort mid-write test (same upstream behavior)
-UPSTREAM_ABORT_MID_PORT = 7996  # upstream dies mid-stream (abort-mid)
-UPSTREAM_SLOW_DRIP_PORT = 7997  # one small chunk every N ms (slow-drip)
-UPSTREAM_DUP_TE_PORT = 7998     # duplicate Transfer-Encoding header (dup-te)
+# port_map moves them with the listener band; the Rust helper is handed the
+# mapped value on its command line, so both sides move together.
+UPSTREAM_PORT = port_map.port(7994)  # plain + tls relay tests
+UPSTREAM_ABORT_PORT = port_map.port(7995)  # client-abort mid-write
+UPSTREAM_ABORT_MID_PORT = port_map.port(7996)  # upstream dies mid-stream
+UPSTREAM_SLOW_DRIP_PORT = port_map.port(7997)  # one chunk every N ms
+UPSTREAM_DUP_TE_PORT = port_map.port(7998)  # duplicate Transfer-Encoding
 
 FAKE_UPSTREAM_BIN = '/usr/local/bin/fake_upstream'
 

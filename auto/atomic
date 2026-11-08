@@ -3,15 +3,18 @@
 # Copyright (C) NGINX, Inc.
 
 
-# GCC 4.1+ builtin atomic operations.
+# GCC atomic builtins: the 4.1 __sync_* intrinsics, which src/nxt_atomic.h
+# requires.
 
 nxt_feature="GCC builtin atomic operations"
 nxt_feature_name=NXT_HAVE_GCC_ATOMIC
 nxt_feature_run=yes
 nxt_feature_incs=
 nxt_feature_libs=
-nxt_feature_test="int main(void) {
-                      long  n = 0;
+nxt_feature_test="#include <stdint.h>
+
+                  int main(void) {
+                      volatile uintptr_t  n = 0;
 
                       if (!__sync_bool_compare_and_swap(&n, 0, 3))
                           return 1;
@@ -26,6 +29,7 @@ nxt_feature_test="int main(void) {
                       if (__sync_and_and_fetch(&n, 5) != 5)
                           return 1;
                       __sync_lock_release(&n);
+                      __sync_synchronize();
                       if (n != 0)
                           return 1;
                       return 0;
@@ -39,3 +43,22 @@ if [ $nxt_found = no ]; then
     $echo
     exit 1;
 fi
+
+
+# The 4.7 __atomic_load_n and __atomic_store_n.  Without them, as on GCC 4.4,
+# src/nxt_atomic.h uses volatile accesses and __sync_synchronize().
+
+nxt_feature="GCC builtin ordered atomic loads and stores"
+nxt_feature_name=NXT_HAVE_GCC_ATOMIC_ORDERED
+nxt_feature_run=yes
+nxt_feature_incs=
+nxt_feature_libs=
+nxt_feature_test="#include <stdint.h>
+
+                  int main(void) {
+                      volatile uintptr_t  n = 0;
+
+                      __atomic_store_n(&n, 1, __ATOMIC_RELEASE);
+                      return __atomic_load_n(&n, __ATOMIC_ACQUIRE) != 1;
+                  }"
+. auto/feature

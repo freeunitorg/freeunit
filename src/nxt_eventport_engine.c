@@ -116,6 +116,10 @@ nxt_eventport_create(nxt_event_engine_t *engine, nxt_uint_t mchanges,
         goto fail;
     }
 
+    if (nxt_fd_cloexec(&engine->task, engine->u.eventport.fd) != NXT_OK) {
+        goto fail;
+    }
+
     nxt_debug(&engine->task, "port_create(): %d", engine->u.eventport.fd);
 
     if (engine->signals != NULL) {

@@ -18,9 +18,6 @@
 #include <nxt_clang.h>
 
 
-#define NXT_OTEL_TRACEPARENT_LEN    55
-
-
 
 static void
 nxt_otel_state_transition(nxt_otel_state_t *state, nxt_otel_status_t status)
@@ -106,6 +103,29 @@ nxt_otel_attr_str(nxt_otel_attr_batch_t *batch, nxt_otel_attr_id_t id,
 
 
 /*
+ * Add a string attribute whose text is a compile-time constant.  The id
+ * indexes the Rust-side ATTR_VALUE_STRINGS table, so the value costs no
+ * allocation, unlike the owned String the pointer form builds.
+ */
+static void
+nxt_otel_attr_static(nxt_otel_attr_batch_t *batch, nxt_otel_attr_id_t id,
+    nxt_otel_value_id_t val)
+{
+    nxt_otel_attr_t  *attr;
+
+    attr = nxt_otel_attr_next(batch, id);
+    if (attr == NULL) {
+        return;
+    }
+
+    attr->type = NXT_OTEL_ATTR_TYPE_STATIC;
+    attr->ival = val;
+    attr->sval.start = NULL;
+    attr->sval.length = 0;
+}
+
+
+/*
  * Add an integer attribute. The semantic conventions type these as integers,
  * and passing one as an integer avoids a sprintf round-trip on the request
  * path as well as being the correct value type on the wire.
@@ -142,27 +162,27 @@ nxt_otel_attr_flush(nxt_http_request_t *r, nxt_otel_attr_batch_t *batch)
 }
 
 
-static const char *
-nxt_otel_app_type_name(nxt_app_type_t type)
+static nxt_otel_value_id_t
+nxt_otel_app_type_value(nxt_app_type_t type)
 {
     switch (type) {
     case NXT_APP_PYTHON:
-        return "python";
+        return NXT_OTEL_VAL_APP_PYTHON;
     case NXT_APP_PHP:
-        return "php";
+        return NXT_OTEL_VAL_APP_PHP;
     case NXT_APP_PERL:
-        return "perl";
+        return NXT_OTEL_VAL_APP_PERL;
     case NXT_APP_RUBY:
-        return "ruby";
+        return NXT_OTEL_VAL_APP_RUBY;
     case NXT_APP_JAVA:
-        return "java";
+        return NXT_OTEL_VAL_APP_JAVA;
     case NXT_APP_WASM:
     case NXT_APP_WASM_WC:
-        return "wasm";
+        return NXT_OTEL_VAL_APP_WASM;
     case NXT_APP_EXTERNAL:
-        return "external";
+        return NXT_OTEL_VAL_APP_EXTERNAL;
     default:
-        return "unknown";
+        return NXT_OTEL_VAL_APP_UNKNOWN;
     }
 }
 
@@ -170,10 +190,15 @@ nxt_otel_app_type_name(nxt_app_type_t type)
 static void
 nxt_otel_propagate_header(nxt_task_t *task, nxt_http_request_t *r)
 {
+    size_t            traceval_len;
     u_char            *traceval;
     nxt_http_field_t  *f;
 
-    traceval = nxt_mp_zalloc(r->mem_pool, NXT_OTEL_TRACEPARENT_LEN + 1);
+    /*
+     * nxt_mp_alloc(), not zalloc: the writer fills all 55 bytes and the NUL
+     * that terminates them, and reports how many it wrote.
+     */
+    traceval = nxt_mp_alloc(r->mem_pool, NXT_OTEL_TRACEPARENT_LEN + 1);
     if (nxt_slow_path(traceval == NULL)) {
         /*
          * let it go blank here.
@@ -196,7 +221,7 @@ nxt_otel_propagate_header(nxt_task_t *task, nxt_http_request_t *r)
      * accepted, or freshly generated ones otherwise -- so one call covers
      * both cases.
      */
-    nxt_otel_rs_copy_traceparent(traceval, r->otel->trace);
+    traceval_len = nxt_otel_rs_copy_traceparent(traceval, r->otel->trace);
 
     /*
      * Any inbound traceparent, valid or not, is replaced by the value
@@ -224,7 +249,7 @@ nxt_otel_propagate_header(nxt_task_t *task, nxt_http_request_t *r)
 
     nxt_http_field_name_set(f, "traceparent");
     f->value = traceval;
-    f->value_length = nxt_strlen(traceval);
+    f->value_length = traceval_len;
 
     f = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
     if (nxt_slow_path(f == NULL)) {
@@ -235,7 +260,7 @@ nxt_otel_propagate_header(nxt_task_t *task, nxt_http_request_t *r)
 
     nxt_http_field_name_set(f, "traceparent");
     f->value = traceval;
-    f->value_length = nxt_strlen(traceval);
+    f->value_length = traceval_len;
 }
 
 
@@ -255,11 +280,9 @@ nxt_otel_span_add_request_attrs(nxt_http_request_t *r)
     nxt_otel_attr_str(&batch, NXT_OTEL_ATTR_METHOD, r->method);
     nxt_otel_attr_str(&batch, NXT_OTEL_ATTR_PATH, r->path);
 
-    nxt_str_set(&val, "http");
-    if (r->tls) {
-        nxt_str_set(&val, "https");
-    }
-    nxt_otel_attr_str(&batch, NXT_OTEL_ATTR_SCHEME, &val);
+    nxt_otel_attr_static(&batch, NXT_OTEL_ATTR_SCHEME,
+                         r->tls ? NXT_OTEL_VAL_SCHEME_HTTPS
+                                : NXT_OTEL_VAL_SCHEME_HTTP);
 
     /* "HTTP/1.1" -> "1.1" for network.protocol.version */
     val = r->version;
@@ -269,7 +292,21 @@ nxt_otel_span_add_request_attrs(nxt_http_request_t *r)
         val.start += nxt_length("HTTP/");
         val.length -= nxt_length("HTTP/");
     }
-    nxt_otel_attr_str(&batch, NXT_OTEL_ATTR_FLAVOR, &val);
+
+    if (val.length == nxt_length("1.0") && memcmp(val.start, "1.0", 3) == 0) {
+        nxt_otel_attr_static(&batch, NXT_OTEL_ATTR_FLAVOR,
+                             NXT_OTEL_VAL_VERSION_1_0);
+
+    } else if (val.length == nxt_length("1.1")
+               && memcmp(val.start, "1.1", 3) == 0)
+    {
+        nxt_otel_attr_static(&batch, NXT_OTEL_ATTR_FLAVOR,
+                             NXT_OTEL_VAL_VERSION_1_1);
+
+    } else {
+        /* A version this build does not know, such as HTTP/2. */
+        nxt_otel_attr_str(&batch, NXT_OTEL_ATTR_FLAVOR, &val);
+    }
 
     if (r->user_agent != NULL) {
         val.start = r->user_agent->value;
@@ -346,8 +383,6 @@ nxt_otel_span_add_body(nxt_http_request_t *r)
 static void
 nxt_otel_span_add_status(nxt_task_t *task, nxt_http_request_t *r)
 {
-    const char              *type_name;
-    nxt_str_t               val;
     nxt_app_t               *app;
     nxt_otel_attr_batch_t   batch;
     nxt_request_rpc_data_t  *rpc;
@@ -368,10 +403,8 @@ nxt_otel_span_add_status(nxt_task_t *task, nxt_http_request_t *r)
         app = rpc->app;
         nxt_otel_attr_str(&batch, NXT_OTEL_ATTR_APP_NAME, &app->name);
 
-        type_name = nxt_otel_app_type_name(app->type);
-        val.start = (u_char *) type_name;
-        val.length = nxt_strlen(type_name);
-        nxt_otel_attr_str(&batch, NXT_OTEL_ATTR_APP_TYPE, &val);
+        nxt_otel_attr_static(&batch, NXT_OTEL_ATTR_APP_TYPE,
+                             nxt_otel_app_type_value(app->type));
     }
 
     // dont bother logging an unset status

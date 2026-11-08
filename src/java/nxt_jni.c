@@ -6,6 +6,8 @@
 #include <nxt_auto_config.h>
 
 #include <jni.h>
+#include <stdlib.h>
+#include <string.h>
 #include <nxt_unit.h>
 #include <nxt_unit_field.h>
 
@@ -156,20 +158,24 @@ nxt_java_lowcase(char c)
 jstring
 nxt_java_newString(JNIEnv *env, char *str, uint32_t len)
 {
-    char     tmp;
+    char     *copy;
     jstring  res;
 
-    tmp = str[len];
-
-    if (tmp != '\0') {
-        str[len] = '\0';
+    if (str[len] == '\0') {
+        return (*env)->NewStringUTF(env, str);
     }
 
-    res = (*env)->NewStringUTF(env, str);
-
-    if (tmp != '\0') {
-        str[len] = tmp;
+    copy = malloc(len + 1);
+    if (copy == NULL) {
+        return NULL;
     }
+
+    memcpy(copy, str, len);
+    copy[len] = '\0';
+
+    res = (*env)->NewStringUTF(env, copy);
+
+    free(copy);
 
     return res;
 }

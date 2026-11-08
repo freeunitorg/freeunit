@@ -4,6 +4,42 @@ This directory contains Dockerfiles for all FreeUnit language variants and
 a helper script (`build-local.sh`) for building them locally — mirroring
 the behavior of `.github/workflows/release-docker.yml`.
 
+## Security: PHP session upload progress
+
+The PHP images set `session.upload_progress.enabled = 0` through the ini fragment
+`/usr/local/etc/php/conf.d/zz-freeunit-security.ini`. The `RUN_php` value in the
+`Makefile` creates the file. The command `make dockerfiles` copies the value into
+`Dockerfile.php-*`.
+
+The setting applies to every PHP application in the image. It also applies to the
+applications that a user adds later through the control API. The `zz-` prefix makes
+the file load last in `conf.d`, so it wins over the directives of the files that load
+before it.
+
+The PHP default is on, so the change removes the session upload progress feature
+from the image. See `pkg/community/PHP.CVE.md` for the CVE map.
+
+Check it in a built image:
+
+```bash
+docker run --rm --entrypoint sh ghcr.io/freeunitorg/freeunit:latest-php-8.5 \
+    -c "php -i | grep -E '^session\.upload_progress\.enabled'"
+# Expected: session.upload_progress.enabled => Off => Off
+```
+
+The target `make -C pkg/docker verify IMAGE=<tag>` checks a built image. It runs
+the script `verify-php-cve.sh`. The script reads the PHP version, the ini
+setting `session.upload_progress.enabled`, the `libbrotli1` version and the
+daemon version. The target expects the daemon version of the `version` file.
+Pass `VERSION=<version>` to check another version. The release workflow runs
+the target for the PHP images after the build and passes the version of the
+release tag. A failing check stops the release, so the final and the floating
+tags are not created.
+
+```bash
+make -C pkg/docker verify IMAGE=ghcr.io/freeunitorg/freeunit:latest-php-8.5
+```
+
 ## Security: CVE-2026-31431 (AF_ALG privilege escalation)
 
 CVE-2026-31431 is a **kernel bug** (CVSS 7.8) — local privilege escalation via
@@ -193,7 +229,6 @@ A summary (OK / FAILED) is printed at the end.
 | `java-25` | eclipse-temurin:25-jdk-resolute |
 | `java-26` | eclipse-temurin:26-jdk-resolute |
 | `java-27` | eclipse-temurin:27-jdk-resolute |
-| `node-20` | node:20 |
 | `node-22` | node:22 |
 | `node-24` | node:24 |
 | `node-26` | node:26 |
@@ -210,9 +245,41 @@ A summary (OK / FAILED) is printed at the end.
 | `python-3.13-slim` | python:3.13-slim |
 | `python-3.14` | python:3.14 |
 | `python-3.14-slim` | python:3.14-slim |
+| `python-3.15` | python:3.15 |
+| `python-3.15-slim` | python:3.15-slim |
 | `ruby-3.3` | ruby:3.3 |
 | `ruby-3.4` | ruby:3.4 |
 | `ruby-4.0` | ruby:4.0 |
+
+## Alpine / musl allocator note
+
+On musl (Alpine) FreeUnit uses 12 to 17 percent more server CPU per request
+than on glibc, and the extra is system time: musl's allocator returns freed
+blocks to the kernel at once, so steady-state allocations cost `mmap`,
+`munmap` and page faults on every request. In the router this is largely
+fixed since 1.37.1 (per-thread reuse of freed pool clusters); under Drupal
+the gap lives in PHP's own allocations and preloading another allocator
+closes it. Measured on Drupal 12 `/user/login` (arm64):
+
+| variant | system us/req | page faults/req |
+|---------|--------------|-----------------|
+| musl mallocng | 1162 | 199 |
+| musl + `LD_PRELOAD=libjemalloc.so.2` | 479 | 48 |
+| glibc (Debian, same host) | 496 | 1.4 |
+
+mimalloc (v3, built from source; the Alpine package ships v2) measures the
+same way. The preload must reach every process of the instance — unitd and
+all application workers — e.g. `Environment=LD_PRELOAD=...` in the service
+file or `-e LD_PRELOAD=...` on `docker run`. Memory use of the preloaded
+allocator was measured next to CPU in
+https://github.com/freeunitorg/freeunit/issues/688 before choosing one.
+
+Limitation: the preload travels through the environment, so it has no effect
+where secure execution drops it — a set-id unitd or a unitd binary with file
+capabilities (for example to bind privileged ports that way) keeps mallocng
+with no warning. The test suite checks the same rule in
+`test/test_capget_fallback.py:152-175`. Linking the allocator at build time
+is the alternative for such deployments.
 
 ## Reference build environment
 
@@ -232,11 +299,72 @@ With apt-cacher-ng, repeated builds that share base layers are significantly fas
 Builder mode (`-b`) for `minimal`, `wasm`, and `php-8.5` cuts those three variants to
 ~2–3 min each by skipping apt and Rust downloads entirely.
 
+### Build flags
+
+`--cc-opt` and `--ld-opt` are the CFLAGS and LDFLAGS of `dpkg-buildflags`.
+The hardening flags come from `./configure --hardening=default` (see `auto/cc/hardening`),
+including `-D_FORTIFY_SOURCE`, which `dpkg-buildflags` puts only in CPPFLAGS.
+The build stops when `build/autoconf.data` has no `-D_FORTIFY_SOURCE` after configure.
+Do not add the CPPFLAGS as well: their `-D_FORTIFY_SOURCE=2` makes the level 3 probe fail.
+unitd and libunit are not fortified yet: `src/nxt_unix.h` undefines `_FORTIFY_SOURCE`
+(https://github.com/freeunitorg/freeunit/issues/773).
+The `-specs=` flags are removed. `unitd --version` stores the configure options, and they
+would name `/usr/share/dpkg/no-pie-*.specs`. libdpkg-perl owns those files, and the image
+purges it with the build packages. A module build that reuses the stored options then fails
+with "cannot read spec file". With `-fPIC` and `-pie` set, the specs did nothing.
+
 ## CI workflow
 
 The GitHub Actions workflow (`.github/workflows/release-docker.yml`) builds and pushes
-images to GHCR (`ghcr.io/freeunitorg/freeunit`) on every `v*` release tag or
-via `workflow_dispatch`. It produces:
+multi-arch (`linux/amd64`, `linux/arm64`) images to GHCR (`ghcr.io/freeunitorg/freeunit`)
+and Docker Hub (`docker.io/freeunitorg/freeunit`) on every release tag or via
+`workflow_dispatch`.
 
-- Per-arch tags: `VERSION-VARIANT-amd64`, `VERSION-VARIANT-arm64`
-- Multi-arch manifest: `VERSION-VARIANT`, `latest-VARIANT`
+`.github/workflows/docker-nightly.yml` builds FreeUnit master on a schedule for PHP
+versions without a release image: `nightly-php-8.6` every night (from
+`php:8.6-rc-cli-trixie`, `php:8.6-cli-trixie` once 8.6.0 is out) and `weekly-php-8.7`
+every Monday (from a PHP built from php-src master by
+`pkg/docker/nightly/Dockerfile.php-src`), each also with a
+`<channel>-<variant>-YYYYMMDD` tag. It pushes to GHCR only, `linux/amd64` only. The
+build and smoke job has a read-only token; a separate publish job holds
+`packages: write` and runs only from `master`, on a schedule or on a dispatch with
+`push=true`, never on `pull_request` or a dispatch of another branch. These images
+are not for production.
+
+### Rebuilding individual variants without a new FreeUnit release
+
+When an upstream runtime base image (for example `php:8.5-cli-trixie` or
+`python:3.14-slim`) publishes a patch release or Debian security update, trigger
+`Release Docker Images` via `workflow_dispatch` with:
+
+- `tag`: the FreeUnit release tag to rebuild (e.g. `1.37.1`)
+- `variants` *(optional)*: comma-separated list of exact variant names or language
+  prefixes (e.g. `php` to rebuild `php-8.3`, `php-8.4`, `php-8.5`, or
+  `php-8.5,python-3.14`); leave empty to build all variants in `pkg/eol.json`.
+
+### Tagging and provenance policy
+
+- **Floating tags** (`<version>-<variant>` and `latest-<variant>`, plus legacy
+  `latest-<lang><ver>` aliases on GHCR): overwritten on rebuild so deployments
+  pinning `1.37.1-php-8.5` automatically receive patched upstream runtimes while
+  keeping FreeUnit core pinned to `1.37.1`.
+- **Immutable build-date tag** (`<version>-<variant>-<YYYYMMDD>`, e.g.
+  `1.37.1-php-8.5-20261028`): published alongside the floating tags so users who
+  require an immutable tag reference can pin a specific rebuild date (or pin by
+  `@sha256:<digest>`).
+- **Temporary per-arch tags** (`<version>-<variant>-amd64`,
+  `<version>-<variant>-arm64`): merged into the multi-arch index and deleted in the
+  `cleanup` job.
+- **OCI annotations and labels**:
+  - `org.opencontainers.image.version` — FreeUnit core release version (`1.37.1`)
+  - `org.opencontainers.image.revision` — exact git commit SHA of the FreeUnit tag
+  - `org.opencontainers.image.base.name` — canonical upstream base image reference
+    (e.g. `docker.io/library/php:8.5-cli-trixie`)
+  - `org.opencontainers.image.base.digest` — upstream base image `sha256` digest
+    pulled at build time (`pull: true`)
+  - `org.freeunit.runtime.version` — exact upstream runtime patch version detected
+    from the base image (e.g. `8.5.12`)
+- **Build provenance and SBOM**: `provenance: mode=max` and `sbom: true` attach
+  SLSA provenance and SPDX SBOM attestations to the image index, and
+  `SOURCE_DATE_EPOCH` (set to the FreeUnit tag commit timestamp) ensures
+  reproducible compilation of `unitd` and modules per PR #626.

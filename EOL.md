@@ -19,7 +19,6 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Java (JSC) | 25 (LTS) | Sep 2031 | Sep 2032 |
 | Java (JSC) | 26 (EOL) † | Sep 2026 | Sep 2027 |
 | Java (JSC) | 27 | Mar 2027 | Mar 2028 |
-| Node.js | 20 (LTS) (EOL) † | Apr 2026 | Apr 2027 |
 | Node.js | 22 (LTS) | Apr 2027 | Apr 2028 |
 | Node.js | 24 (LTS) | Apr 2028 | Apr 2029 |
 | Node.js | 26 (LTS) | Apr 2029 | Apr 2030 |
@@ -33,6 +32,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Python | 3.12 | Oct 2028 | Oct 2029 |
 | Python | 3.13 | Oct 2029 | Oct 2030 |
 | Python | 3.14 | Oct 2030 | Oct 2031 |
+| Python | 3.15 | Oct 2031 | Oct 2032 |
 | Ruby | 3.3 | Mar 2027 | Mar 2028 |
 | Ruby | 3.4 | Mar 2028 | Mar 2029 |
 | Ruby | 4.0 | Mar 2029 | Mar 2030 |
@@ -89,14 +89,14 @@ needs an upgrade or replacement decision instead.
 | Dependency | Role | Floor / Version | Upstream EOL | Notes |
 |------------|------|-----------------|--------------|-------|
 | OpenSSL | TLS backend (`--openssl`) | 1.1.1 (floor) | Sep 2023 | The floor stays at 1.1.1 rather than 3.x because RHEL 8 still ships a vendor-patched 1.1.1 and Red Hat maintains it into 2029 -- from 2026-09 it is the last platform in the matrix still receiving vendor patches for it. Amazon Linux 2's ended 2026-06-30 and Debian 11's LTS ends 2026-08-31; both remain inside FreeUnit's own three-year post-EOL support window (see `_grace_os` in `pkg/eol.json`). Floor declared by the `auto/ssltls` probe (PR #224). |
-| OpenSSL | tested ceiling | 3.6.5 (CI build) | Nov 2026 | `build-test.yml` builds it into `/opt/openssl-3.6` (`OPENSSL_VERSION`). **The pin needs a bump before 2026-11-01** (3.5 is the LTS, EOL Apr 2030). |
-| OpenSSL | tested ceiling | 4.0.3 (CI build) | May 2027 | The `openssl4` job builds it into `/opt/openssl-4.0` (`OPENSSL4_VERSION`) and compiles with `-DOPENSSL_NO_DEPRECATED`, so any use of an API 4.0 deprecates fails the build. |
+| OpenSSL | tested ceiling | 3.5.9 (CI build) | Apr 2030 | `build-test.yml` builds it into `/opt/openssl-3.5` (`OPENSSL_VERSION`). 3.5 is the LTS line. It replaced 3.6.5, which reaches upstream EOL on 2026-11-01. |
+| OpenSSL | tested ceiling | 4.0.x (Fedora 45) | May 2027 | The `hardening-strict-fedora` job builds against the `openssl-devel` of the `fedora:45` image, which moves with Fedora updates; the job log prints the exact version. Its gcc leg compiles with `-DOPENSSL_NO_DEPRECATED`, so any use of an API that OpenSSL deprecates fails the build. The nightly `openssl4` job (`nightly.yml`) also builds upstream 4.0.3 (`OPENSSL4_VERSION`) from source with the same define. |
 | Apache Tomcat | Servlet/JSP/EL API + Jasper jars bundled by the Java module | 9.0.x | Mar 2027 ([no earlier than](https://tomcat.apache.org/whichversion.html)) | Bundled by `auto/modules/java`; independent of the JDK variant. |
 | Eclipse Jetty | `jetty-util` / `jetty-server` / `jetty-http` jars bundled by the Java module | 9.4.58.v20250814 | **Aug 2025 (EOL)** † | Jetty 9.4 lost community support on 2025-08-14 and the bundled build is its last release. Needs an upgrade-or-replace decision — Jetty 10/11 are EOL too; 12.x is the supported line. |
 | Eclipse ECJ (JDT batch compiler) | JSP compilation jar bundled by the Java module | 3.26.0 | none published | Tracks Eclipse releases; endoflife.date has no product for it. Pinned build is from Jun 2021; current is 3.42.0 (Jun 2025). |
 | ClassGraph | classpath scanning jar bundled by the Java module | latest | — | No upstream EOL schedule; pinned and bumped as needed. |
-| Wasmtime (C API) | WebAssembly runtime built by `pkg/contrib` and linked by the `wasm` module | 48.0.5 | none published | Fetched as a source tarball (`pkg/contrib/src/wasmtime/version`), so `cargo audit` never sees it; the `Audit (cargo)` pins job queries OSV for the pinned version instead. Same 48.0.5 as the Rust pin below; 48 is a long-term support line. The 47.0.4 to 48.0.5 bump closed twelve advisories from 2026-09-24 and 2026-10-02. The 43.0.1 bump closed RUSTSEC-2026-0269, -0222, -0114 and three wasmtime-wasi path/permission advisories — see #400. |
-| Wasmtime (Rust crate) | WebAssembly runtime used by the `wasm-wasi-component` module | 48.0.5 | none published | `src/wasm-wasi-component/Cargo.lock`, audited by the `Audit (cargo)` workflow on every lock. Bumped with the advisories it closes. |
+| Wasmtime (C API) | WebAssembly runtime built by `pkg/contrib` and linked by the `wasm` module | 48.0.8 | none published | Source tarball pin (`pkg/contrib/src/wasmtime/version`); the FreeUnit mirror holds `wasmtime-v48.0.8-src.tar.gz`, and its `SHA512SUMS` entry is the digest of the official release archive. The `Audit (cargo)` pins job queries OSV and gates the archived lock on the actual linked C API graph. Same 48.0.8 as the Rust pin below; 48 is a long-term support line. This bump closes RUSTSEC-2026-0420, -0423 and -0424. The 48.0.7 bump closed RUSTSEC-2026-0350 through -0359, -0361 through -0364, and -0375 through -0379. The vendored lock retains reviewed exact-version exceptions for yanked chacha20 0.10.0 and Tokio 1.51.1 (RUSTSEC-2026-0386; no downstream AsyncFd callers found). Earlier security bumps are recorded in `pkg/eol.json` and #400. |
+| Wasmtime (Rust crate) | WebAssembly runtime used by the `wasm-wasi-component` module | 48.0.8 | none published | `src/wasm-wasi-component/Cargo.lock`, audited by the `Audit (cargo)` workflow on every lock. Bumped with the advisories it closes. |
 
 ## Rules
 

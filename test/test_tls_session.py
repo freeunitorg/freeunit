@@ -13,6 +13,7 @@ from OpenSSL.SSL import (
     _lib,
 )
 from unit.applications.tls import ApplicationTLS
+from unit import port as port_map
 
 prerequisites = {'modules': {'openssl': 'any'}}
 
@@ -49,7 +50,7 @@ def add_session(cache_size=None, timeout=None):
 
 
 def connect(ctx=None, session=None):
-    sock = socket.create_connection(('127.0.0.1', 8080))
+    sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
 
     if ctx is None:
         ctx = Context(TLSv1_2_METHOD)

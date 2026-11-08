@@ -9,15 +9,17 @@ filesystem leaves no conf.json at all.
 
 The failure is arranged by putting the state directory on a 64 KiB tmpfs,
 which needs root and CAP_SYS_ADMIN (pytest as root in a --privileged
-container) as well as --restart; the test skips otherwise.
+container) as well as --restart; the test skips otherwise.  A store that
+fails is answered with 500, and the configuration before it stays the one
+that a restart loads.
 
 Main runs each store in a short-lived child process, one at a time, and waits
 for it before it exits (https://github.com/freeunitorg/freeunit/issues/516).
-The other tests here check that a configuration answered with 200 is on disk
-after an immediate SIGTERM, and that stores in quick succession leave the
-last configuration.  They need --restart only.  They catch a regression only
-when a store takes longer than the few milliseconds main needs to exit, so on
-a tmpfs they pass either way.
+The controller answers a PUT only after that child has written and flushed
+the file, so a 200 means that the configuration is on the disk.  The other
+tests here check that a configuration answered with 200 is on disk after an
+immediate SIGTERM, and that stores in quick succession leave the last
+configuration.  They need --restart only.
 
 The version tests seed a state directory by hand.  unitd writes the version
 file with no line end, but a file written by hand often has one.
@@ -38,6 +40,7 @@ import pytest
 from conftest import unit_run, unit_stop
 from unit.applications.proto import ApplicationProto
 from unit.log import Log
+from unit import port as port_map
 from unit.utils import waitforsocket
 
 client = ApplicationProto()
@@ -62,8 +65,12 @@ def big_conf(routes):
 
 
 def wait_for_stored(statedir, expected, wait=100):
-    """The store is asynchronous: the controller answers the PUT and only
-    then asks the main process to persist it."""
+    """The configuration in <statedir>/conf.json, when its listeners match
+    "expected".
+
+    The controller answers a PUT only after the store child of main has
+    written and flushed that file, so the first look finds it.  The retries
+    are a guard against a slower machine, not a part of the contract."""
 
     conf_json = statedir / 'conf.json'
 
@@ -117,13 +124,16 @@ def test_state_store_full_filesystem(requires_restart, skip_alert):
 
         # The configuration that must survive.
         assert 'success' in client.conf(SMALL_CONF), 'the small store'
-        assert wait_for_stored(statedir, SMALL_CONF) is not None, 'stored'
+        assert wait_for_stored(
+            statedir, port_map.expected(SMALL_CONF)
+        ) is not None, 'stored'
 
         stored = (statedir / 'conf.json').read_bytes()
 
-        assert 'success' in client.conf(big_conf(400)), 'the large PUT'
+        # The configuration is too large for the filesystem, so the store
+        # child fails.  The answer waits for that child and refuses.
+        assert 'error' in client.conf(big_conf(400)), 'the large PUT'
 
-        # The store is attempted asynchronously; wait for it to give up.
         # The store child logs the first alert, and main logs the second
         # when it reaps the child.
         assert Log.wait_for_record(
@@ -140,7 +150,9 @@ def test_state_store_full_filesystem(requires_restart, skip_alert):
         assert after == stored, (
             'conf.json was damaged by a store that could not complete'
         )
-        assert json.loads(after)['listeners'] == SMALL_CONF['listeners']
+        assert json.loads(after)['listeners'] == port_map.expected(
+            SMALL_CONF['listeners']
+        )
 
         # And nothing was left half-written next to it.
         assert [p.name for p in statedir.iterdir() if '.tmp' in p.name] == []
@@ -252,9 +264,13 @@ def test_state_store_survives_exit(requires_restart):
         shutil.rmtree(statedir, ignore_errors=True)
 
 
-def test_state_store_pending_at_exit(requires_restart):
-    """Stores that wait behind a running store child are not dropped at
-    exit: the last configuration is on disk."""
+def test_state_store_many_at_exit(requires_restart):
+    """Four accepted configurations leave the last one on disk when SIGTERM
+    follows the last answer, and no store child outlives main.
+
+    Every answer waits for its store, so no store waits in line here.  The
+    C test nxt_main_store_test() covers a store that waits behind another,
+    and the SIGKILL of a store child at exit."""
 
     unit_stop()
 
@@ -327,7 +343,7 @@ def test_state_store_serialised(requires_restart):
 
         conf = json.loads((statedir / 'conf.json').read_text(encoding='utf-8'))
 
-        assert conf == last, 'conf.json is the last configuration'
+        assert conf == port_map.expected(last), 'conf.json is the last conf'
         assert [p.name for p in statedir.iterdir() if '.tmp' in p.name] == []
 
         # Two stores that run at the same time race on the temporary name,
@@ -354,7 +370,9 @@ def run_with_version(version):
 
     statedir = Path(tempfile.mkdtemp(prefix='unit-state-'))
 
-    (statedir / 'conf.json').write_text(json.dumps(VERSION_CONF))
+    (statedir / 'conf.json').write_text(
+        json.dumps(port_map.expected(VERSION_CONF))
+    )
     (statedir / 'version').write_bytes(version)
 
     unit_run(state_dir=str(statedir))
@@ -374,11 +392,12 @@ def test_state_store_version_line_end(requires_restart, version):
 
     try:
         assert (
-            client.conf_get('listeners') == VERSION_CONF['listeners']
+            client.conf_get('listeners')
+            == port_map.expected(VERSION_CONF)['listeners']
         ), 'stored configuration loaded'
 
         # GET /config can answer before the router has bound the listener.
-        waitforsocket(8080)
+        waitforsocket(port_map.port(8080))
 
         assert client.get()['status'] == 204, 'stored configuration runs'
         assert not Log.findall(r'invalid version string'), 'no alert'

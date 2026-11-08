@@ -98,8 +98,6 @@ typedef struct {
 
 #include <nxt_djb_hash.h>
 #include <nxt_murmur_hash.h>
-#include <nxt_hash.h>
-
 #include <nxt_sort.h>
 #include <nxt_list.h>
 
@@ -107,7 +105,6 @@ typedef struct {
 
 typedef struct nxt_buf_s                nxt_buf_t;
 #include <nxt_buf.h>
-#include <nxt_buf_pool.h>
 #include <nxt_recvbuf.h>
 
 typedef struct nxt_conn_s               nxt_conn_t;
@@ -161,9 +158,19 @@ NXT_EXPORT nxt_uint_t nxt_cgroup_cpu_max_parse(const u_char *p, size_t len);
 NXT_EXPORT void nxt_cgroup_mountinfo_unescape(char *s);
 NXT_EXPORT const char *nxt_cgroup_relative_path(const char *cgroup,
     const char *root);
+NXT_EXPORT nxt_int_t nxt_cgroup_mountinfo_parse(char *line, char **root,
+    char **mnt);
+NXT_EXPORT nxt_uint_t nxt_cgroup_cpu_limit_walk(char *dir, size_t base,
+    nxt_uint_t (*reader)(const char *dir, void *data), void *data);
+#if (NXT_LINUX)
+NXT_EXPORT nxt_int_t nxt_cgroup_mountinfo_find(FILE *fp, const char *cgroup,
+    char *dir, size_t size, size_t *base);
+#endif
 
 
 NXT_EXPORT extern nxt_uint_t    nxt_ncpu;
+/* The CPU count before the cgroup CPU limit lowered it, or 0. */
+NXT_EXPORT extern nxt_uint_t    nxt_ncpu_unlimited;
 NXT_EXPORT extern nxt_uint_t    nxt_pagesize;
 NXT_EXPORT extern nxt_task_t    nxt_main_task;
 NXT_EXPORT extern nxt_atomic_t  nxt_task_ident;

@@ -1,0 +1,42 @@
+#!/usr/bin/env bpftrace
+/*
+ * Copyright (C) FreeUnit contributors.
+ *
+ * App-queue residency (enqueue to dequeue or cancel) and depth.
+ *   bpftrace tools/usdt/queue-residency.bt <path to unitd> <path to module>
+ * Enqueue, cancel and the enqueue failure fire in unitd, dequeue in the
+ * application (libunit).  @depth is a sum() because the probes fire on
+ * many CPUs at once.
+ */
+
+usdt:$1:freeunit:queue__enqueue
+{
+    @qstart[arg0, arg1] = nsecs;
+    @depth = sum(1);
+}
+
+usdt:$2:freeunit:queue__dequeue,
+usdt:$1:freeunit:queue__cancel
+/@qstart[arg0, arg1]/
+{
+    @queue_residency_ns = hist(nsecs - @qstart[arg0, arg1]);
+    delete(@qstart[arg0, arg1]);
+    @depth = sum(-1);
+}
+
+usdt:$1:freeunit:queue__enqueue__fail
+/@qstart[arg0, arg1]/
+{
+    delete(@qstart[arg0, arg1]);
+    @depth = sum(-1);
+}
+
+interval:s:5
+{
+    print(@depth);
+}
+
+END
+{
+    clear(@qstart);
+}

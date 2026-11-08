@@ -25,7 +25,7 @@ def test_asgi_websockets_timeout_quiet_session(skip_alert):
     resp, sock, _ = ws.upgrade()
     assert resp['status'] == 101, 'upgrade'
 
-    # frame_read() would spin on EOF.
+    # frame_read() has no "nothing arrived" result.
     sock.settimeout(3)
 
     try:

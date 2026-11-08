@@ -33,7 +33,10 @@ enum {
 void
 nxt_wasm_do_response_end(nxt_wasm_ctx_t *ctx)
 {
-    nxt_unit_request_done(ctx->req, NXT_UNIT_OK);
+    if (ctx->req != NULL) {
+        nxt_unit_request_done(ctx->req, NXT_UNIT_OK);
+        ctx->req = NULL;
+    }
 
     NXT_WASM_DO_HOOK(NXT_WASM_FH_RESPONSE_END);
 }
@@ -228,6 +231,7 @@ nxt_wasm_request_handler(nxt_unit_request_info_t *req)
             nxt_unit_req_alert(req,                                            \
                 "WASM request buffer overflow at offset %zu", offset);         \
             nxt_unit_request_done(req, NXT_UNIT_ERROR);                        \
+            nxt_wasm_ctx.req = NULL;                                           \
             goto request_done;                                                 \
         }                                                                      \
     } while (0)
@@ -251,6 +255,7 @@ nxt_wasm_request_handler(nxt_unit_request_info_t *req)
         nxt_unit_req_alert(req, "WASM request header table exceeds linear "
                            "memory: fields_count=%u", r->fields_count);
         nxt_unit_request_done(req, NXT_UNIT_ERROR);
+        nxt_wasm_ctx.req = NULL;
         goto request_done;
     }
 
@@ -296,6 +301,10 @@ nxt_wasm_request_handler(nxt_unit_request_info_t *req)
     read_bytes = nxt_min(wr->content_len, NXT_WASM_MEM_SIZE - offset);
 
     bytes_read = nxt_unit_request_read(req, (uint8_t *)wr + offset, read_bytes);
+    if (nxt_slow_path(bytes_read < 0)) {
+        goto out_err_500;
+    }
+
     wr->content_sent = wr->total_content_sent = content_sent = bytes_read;
 
     wr->request_size = offset + bytes_read;
@@ -319,6 +328,9 @@ nxt_wasm_request_handler(nxt_unit_request_info_t *req)
                              NXT_WASM_MEM_SIZE - offset);
         bytes_read = nxt_unit_request_read(req, (uint8_t *)wr + offset,
                                            read_bytes);
+        if (nxt_slow_path(bytes_read <= 0)) {
+            goto out_err_500;
+        }
 
         content_sent += bytes_read;
         wr->request_size = wr->content_sent = bytes_read;
@@ -334,11 +346,22 @@ nxt_wasm_request_handler(nxt_unit_request_info_t *req)
     goto request_done;
 
 out_err_500:
-    nxt_unit_response_init(req, NXT_WASM_HTTP_ERROR, 0, 0);
-    nxt_unit_request_done(req, NXT_UNIT_OK);
+    if (nxt_wasm_ctx.req != NULL) {
+        if (!nxt_unit_response_is_sent(nxt_wasm_ctx.req)) {
+            nxt_unit_response_init(nxt_wasm_ctx.req, NXT_WASM_HTTP_ERROR, 0, 0);
+        }
+
+        nxt_unit_request_done(nxt_wasm_ctx.req, NXT_UNIT_OK);
+        nxt_wasm_ctx.req = NULL;
+    }
 
 request_done:
     NXT_WASM_DO_HOOK(NXT_WASM_FH_REQUEST_END);
+
+    if (nxt_wasm_ctx.req != NULL) {
+        nxt_unit_request_done(nxt_wasm_ctx.req, NXT_UNIT_OK);
+        nxt_wasm_ctx.req = NULL;
+    }
 }
 
 
@@ -419,7 +442,7 @@ nxt_wasm_setup(nxt_task_t *task, nxt_process_t *process,
         dirs = nxt_conf_get_object_member(c->access, &filesystem_str, NULL);
     }
 
-    n = (dirs != NULL) ? nxt_conf_object_members_count(dirs) : 0;
+    n = (dirs != NULL) ? nxt_conf_array_elements_count(dirs) : 0;
     if (n == 0) {
         goto out_init;
     }

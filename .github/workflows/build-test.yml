@@ -12,6 +12,7 @@ on:
       - 'pkg/eol.json'
       - '.github/workflows/build-test.yml'
       - '.github/scripts/check-test-hooks.sh'
+      - '.github/scripts/test-matrix.sh'
   push:
     branches: master
     paths:
@@ -24,16 +25,28 @@ on:
       - 'pkg/eol.json'
       - '.github/workflows/build-test.yml'
       - '.github/scripts/check-test-hooks.sh'
+      - '.github/scripts/test-matrix.sh'
+  # The weekly run tests every Python version.  A pull request and a master
+  # push test the oldest and the newest one; see .github/scripts/test-matrix.sh.
+  # The path filters above do not apply to this event.
+  schedule:
+    - cron: '23 3 * * 0'
+  workflow_dispatch:
 
 env:
   # OpenSSL patch version built from source (see "Build OpenSSL" step). Only the
-  # patch level lives here; the 3.6 "slot" (/opt/openssl-3.6, OPENSSL36_* vars)
+  # patch level lives here; the 3.5 "slot" (/opt/openssl-3.5, OPENSSL35_* vars)
   # is stable across patch bumps and intentionally not templated.
-  OPENSSL_VERSION: 3.6.5
-  # OpenSSL 4.0 for the openssl4 leg below.  No distribution ships 4.0 yet, so
-  # like the 3.6 slot it is built from source; the /opt/openssl-4.0 slot is
-  # stable across patch bumps.
-  OPENSSL4_VERSION: 4.0.3
+  OPENSSL_VERSION: 3.5.9
+  # SHA256 of openssl-${OPENSSL_VERSION}.tar.gz, from
+  # https://github.com/openssl/openssl/releases/tag/openssl-3.5.9 and the
+  # .sha256 file next to the tarball on openssl.org.  Bump both together.
+  OPENSSL_SHA256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+  # The OpenSSL major that the Fedora container in hardening-strict-fedora is
+  # expected to bring.  Fedora 45 ships the 4.0 line, so a 4.1 stays covered
+  # while a 5.0 is a decision to take and a 3.x means the container moved.
+  # hardening-strict-fedora asserts the running container against this.
+  FEDORA_OPENSSL_MAJOR: "4"
 
 concurrency:
   # Cancel superseded runs for the same pull request.  Non-PR events fall back
@@ -46,52 +59,101 @@ concurrency:
 jobs:
   # Single source of truth for the test matrix. The version-tested language
   # modules (go/java/node/php/python/ruby) are derived from pkg/eol.json; the
-  # fixed extras below are not runtime-versioned in CI. Excluded on purpose:
+  # fixed extras in .github/scripts/test-matrix.sh are not runtime-versioned
+  # in CI. Excluded on purpose:
   # per-version perl (tested against the runner's system perl), python "-slim"
   # and the "minimal" image — those are Docker packaging flavors, not test axes.
+  # A pull request gets one version of each runtime unless it changes that
+  # runtime's paths, and the oldest and the newest Python whatever it
+  # changes; .github/scripts/test-matrix.sh has the rules.
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     outputs:
       builds: ${{ steps.list.outputs.builds }}
     steps:
+      # For a pull request, github.sha is the merge of the pull request into
+      # its base, and its first parent is the base.  Depth 2 fetches both.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      # The diff of the tested merge against its base is exactly what the
+      # run tests.  --no-renames lists both names of a renamed file, so a
+      # file moved out of a runtime's paths still counts for that runtime.
+      # When the diff fails or is empty, the step writes no list, and the
+      # next step builds the full matrix.  A pull request with the label
+      # "ci-full" skips this step, so it gets the full matrix too, with
+      # every Python version (see the next step).  The
+      # label counts from the next push, or a close and reopen; a re-run
+      # does not see a new label.
+      - name: List the files that the pull request changes
+        id: files
+        if: >-
+          github.event_name == 'pull_request' &&
+          !contains(github.event.pull_request.labels.*.name, 'ci-full')
+        run: |
+          list="$RUNNER_TEMP/pr-files.txt"
+          if git diff --name-only --no-renames HEAD^1 HEAD > "$list" &&
+             [ -s "$list" ]
+          then
+            echo "list=${list}" >> "$GITHUB_OUTPUT"
+            echo "$(wc -l < "$list") changed files"
+          else
+            echo "::warning::could not list the changed files; every runtime version runs"
+          fi
+
+      # A broken rule in the script can drop legs from pull requests while
+      # the run stays green.  The self-test runs fixed cases of the rules
+      # and fails the run when one gives a different matrix.
+      - name: Check the matrix rules
+        run: .github/scripts/test-matrix.sh --self-test
+
       - name: Derive build list from pkg/eol.json
         id: list
-        # Slow legs come first in the list.  All 25 legs are created at
+        # Slow legs come first in the list.  All legs are created at
         # once.  The hosted runner pool is smaller than the matrix, so some
         # legs wait for a runner.  GitHub does not promise to start legs in
         # matrix order.  Two runs (36318226905 and 36322425869) showed no
         # such order: python-3.12 was last in the old matrix and started
         # last; it was first in this matrix and started 12th of 23.  The
-        # order is a hypothesis and has no cost.  The set of legs does not
-        # change.  Times from run 36318226905: python-3.12 372 s (pytest
+        # order is a hypothesis and has no cost; it does not change the set
+        # of legs.  Times from run 36318226905: python-3.12 372 s (pytest
         # 332 s; 243 s and 170 s on 3.13 and 3.14), wasm-wasi-component
         # 322 s, java 250 to 273 s, php-8.4 255 s.  Short legs: perl 109 s,
         # wasm 88 s, node about 150 s, ruby about 125 s.
+        env:
+          CHANGED: ${{ steps.files.outputs.list }}
+          EVENT: ${{ github.event_name }}
+          # contains() of a missing label list is false, so only a pull
+          # request with the label sets this.
+          CI_FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci-full') }}
         run: |
-          builds=$(jq -c '
-            def legs($rt): [ (.runtimes[$rt] // [])[] | $rt + "-" + .version ];
-            legs("python")
-            + ["wasm-wasi-component"]
-            + legs("java")
-            + legs("php")
-            + ["unit", "perl", "wasm"]
-            + legs("go")
-            + legs("node")
-            + legs("ruby")
-          ' pkg/eol.json)
+          # The weekly run, a manual run and a pull request with the
+          # "ci-full" label test every Python version.
+          flag=""
+          case "${EVENT}:${CI_FULL}" in
+            schedule:*|workflow_dispatch:*|*:true) flag="--scheduled" ;;
+          esac
+          builds=$(.github/scripts/test-matrix.sh ${flag} pkg/eol.json "${CHANGED}")
           echo "builds=${builds}" >> "$GITHUB_OUTPUT"
+          echo "${builds}"
 
   # The core build, once for the whole run.  Every matrix leg below used to
   # run the same "Configure unit" and "Make unit" steps with the same flags,
-  # so the same objects were compiled 26 times.  This job does it once and
+  # so every leg compiled the same objects again.  This job does it once and
   # ships the result as an artifact; the legs unpack it and build only their
   # own module.  Flags here are a copy of what the legs ran before -- keep
   # the two in step if they ever change.
   core:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
+
+    # Cargo rebuilds the whole target when the Rust flags change, and the
+    # otel cache key below carries this value.  The Make step passes it to
+    # cargo as CARGO_ENCODED_RUSTFLAGS.
+    env:
+      RUST_ENCODED_FLAGS: -Cdebuginfo=1
 
     steps:
       - uses: actions/checkout@v7
@@ -102,7 +164,16 @@ jobs:
           NJS_VERSION=$(sed -n "s/NJS_VERSION := \(.*\)/\1/p" pkg/contrib/src/njs/version)
           echo "njs_version=${NJS_VERSION}" >> "$GITHUB_OUTPUT"
 
+      # A stalled mirror must fail the step, not the job. Apt retries 3 times
+      # and treats 30 s without data as a stall. Later apt commands use this.
+      # Each job writes its own copy: jobs cannot share a step.
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
       - name: Install packages
+        timeout-minutes: 5
         run: sudo apt-get -y install libbrotli-dev ccache
 
       - name: Cache ccache
@@ -119,32 +190,33 @@ jobs:
           echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
           echo "CCACHE_MAXSIZE=500M" >> "$GITHUB_ENV"
 
-      - name: Cache OpenSSL 3.6
-        id: cache-openssl36
+      - name: Cache OpenSSL 3.5
+        id: cache-openssl35
         uses: actions/cache@v6
         with:
-          path: /opt/openssl-3.6
-          key: openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+          path: /opt/openssl-3.5
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ env.OPENSSL_SHA256 }}-${{ runner.os }}-${{ runner.arch }}
 
-      - name: Build OpenSSL 3.6
-        if: steps.cache-openssl36.outputs.cache-hit != 'true'
+      - name: Build OpenSSL 3.5
+        if: steps.cache-openssl35.outputs.cache-hit != 'true'
         run: |
           sudo apt-get -y install build-essential
           cd /tmp
           wget -q "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
+          echo "${OPENSSL_SHA256}  openssl-${OPENSSL_VERSION}.tar.gz" | sha256sum -c -
           tar -xzf "openssl-${OPENSSL_VERSION}.tar.gz"
           cd "openssl-${OPENSSL_VERSION}"
-          ./Configure --prefix=/opt/openssl-3.6 shared no-docs
+          ./Configure --prefix=/opt/openssl-3.5 shared no-docs
           make -j$(nproc)
-          sudo mkdir -p /opt/openssl-3.6
+          sudo mkdir -p /opt/openssl-3.5
           sudo make install_sw
 
-      - name: Set OpenSSL 3.6 build environment
+      - name: Set OpenSSL 3.5 build environment
         run: |
-          OSSL=/opt/openssl-3.6
+          OSSL=/opt/openssl-3.5
           LIBDIR=$( [ -d "$OSSL/lib64" ] && echo "$OSSL/lib64" || echo "$OSSL/lib" )
-          echo "OPENSSL36_INCDIR=${OSSL}/include" >> $GITHUB_ENV
-          echo "OPENSSL36_LIBDIR=${LIBDIR}"        >> $GITHUB_ENV
+          echo "OPENSSL35_INCDIR=${OSSL}/include" >> $GITHUB_ENV
+          echo "OPENSSL35_LIBDIR=${LIBDIR}"        >> $GITHUB_ENV
 
       - name: Cache njs
         id: cache-njs
@@ -172,14 +244,24 @@ jobs:
       # covers only C.  In run 36318226905 that cargo build took 44.5 s of
       # the 55 s of "Make unit", on every run.  This step caches the crates
       # and the target directory.  The target directory is cargo's default,
-      # src/otel/target: auto/make gives no --target-dir.  The key has the
-      # rustc version: the runner image updates rust, and a different rustc
-      # rebuilds the target anyway.  The otel crate itself is rebuilt on
-      # every run, because checkout gives its sources a new mtime.  Local
-      # test with a warm target: 52 s -> 2 s.
+      # src/otel/target: auto/make gives no --target-dir.  The otel crate
+      # itself is rebuilt on every run, because checkout gives its sources a
+      # new mtime.  Local test with a warm target: 52 s -> 2 s.
+      #
+      # Cargo rebuilds the whole target when rustc or the Rust flags change.
+      # The key covers the rustc version, the flags, auto/make (which builds
+      # the --remap-path-prefix flags), the two remapped paths, and the lock
+      # file.  The restore prefix stops after the flags: a target built with
+      # other flags is useless, and restoring it is slower than a miss.  The v2 prefix
+      # skips the entry saved before the remap existed: restoring that one
+      # rebuilt all 117 crates on every run, and a primary-key hit stopped
+      # the post step from replacing it.
       - name: Read rustc version
         id: rustc
-        run: echo "version=$(rustc -V | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "version=$(rustc -V | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
+          echo "flags=$(printf '%s' "${RUST_ENCODED_FLAGS}" | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
+          echo "paths=$(printf '%s %s' "$GITHUB_WORKSPACE" "${CARGO_HOME:-$HOME/.cargo}" | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
 
       - name: Cache the otel Rust build
         uses: actions/cache@v6
@@ -188,9 +270,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             src/otel/target
-          key: otel-cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('src/otel/Cargo.lock') }}
+          key: otel-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-${{ steps.rustc.outputs.flags }}-${{ steps.rustc.outputs.paths }}-${{ hashFiles('auto/make', 'src/otel/Cargo.lock') }}
           restore-keys: |
-            otel-cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-
+            otel-cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-${{ steps.rustc.outputs.flags }}-${{ steps.rustc.outputs.paths }}-
 
       # An --otel build without --openssl must not link OpenSSL.  The
       # src/otel crate links no TLS stack.  This check reads the link
@@ -208,13 +290,13 @@ jobs:
           rm -rf build Makefile
 
       - name: Configure unit
-        # LD_LIBRARY_PATH is set only for this step so that auto/feature
-        # test binaries load OpenSSL 3.6 at runtime.  It is NOT exported
-        # globally — doing so would break sudo (sudoers.so links against
-        # system libssl 3.3 which requires OPENSSL_3.3.0 from libcrypto,
-        # a symbol version that 3.6 does not export in the same slot).
+        # LD_LIBRARY_PATH is scoped to this step only so that auto/feature test
+        # binaries load OpenSSL 3.5; exporting it globally would break sudo,
+        # which links against the system libssl and libcrypto.  The build
+        # itself needs no such help: -Wl,-rpath below is baked into the
+        # binaries, and is honoured under sudo too.
         env:
-          LD_LIBRARY_PATH: ${{ env.OPENSSL36_LIBDIR }}
+          LD_LIBRARY_PATH: ${{ env.OPENSSL35_LIBDIR }}
         run: |
           ./configure \
             --tests \
@@ -224,8 +306,19 @@ jobs:
             --zstd \
             --brotli \
             --otel \
-            --cc-opt="-I${OPENSSL36_INCDIR} -I njs/src/ -I njs/build" \
-            --ld-opt="-L${OPENSSL36_LIBDIR} -Wl,-rpath,${OPENSSL36_LIBDIR} -L njs/build"
+            --cc-opt="-I${OPENSSL35_INCDIR} -I njs/src/ -I njs/build" \
+            --ld-opt="-L${OPENSSL35_LIBDIR} -Wl,-rpath,${OPENSSL35_LIBDIR} -L njs/build"
+
+      # This proves that the slot holds OpenSSL ${OPENSSL_VERSION}.  It cannot
+      # prove that the -L flag and the rpath took effect: configure runs its
+      # version probe with LD_LIBRARY_PATH on the slot (the step above), so the
+      # probe prints the slot version either way.  The ldd check after "Make
+      # unit" proves which libssl unitd loads.
+      - name: Assert configure found OpenSSL ${{ env.OPENSSL_VERSION }}
+        run: |
+          grep NXT_HAVE_OPENSSL_VERSION build/include/nxt_auto_config.h
+          grep -qF "#define NXT_HAVE_OPENSSL_VERSION  \"OpenSSL ${OPENSSL_VERSION} " \
+            build/include/nxt_auto_config.h
 
       # CARGO_INCREMENTAL=0, as for wasm-wasi-component: incremental data
       # only makes the cached src/otel/target bigger.  This build uses
@@ -234,8 +327,55 @@ jobs:
       - name: Make unit
         env:
           CARGO_INCREMENTAL: 0
+          # Exercise the encoded-flags branch and retain source paths in
+          # debug info, so the check below detects a missing remap.  The job
+          # env carries the same value into the otel cache key.
+          CARGO_ENCODED_RUSTFLAGS: ${{ env.RUST_ENCODED_FLAGS }}
         run: |
           make -j$(nproc) -k || make
+
+      - name: Assert encoded Rust flags preserve path remapping
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          archive = Path('build/lib/libotel.a').read_bytes()
+          if not archive:
+              raise SystemExit('::error::the otel archive is empty')
+          if os.fsencode(os.getcwd()) in archive:
+              raise SystemExit('::error::the otel archive contains the build path')
+          print('otel archive contains no build path with encoded Rust flags')
+          PY
+
+      # unitd needs only OPENSSL_3.0.0 symbols, so without the rpath it would
+      # load the runner's system libssl.so.3 and every TLS test would still
+      # pass.  No LD_LIBRARY_PATH is set here, so ldd shows the real choice.
+      - name: Assert unitd loads OpenSSL from /opt/openssl-3.5
+        run: |
+          ldd build/sbin/unitd | grep -E 'libssl|libcrypto'
+          ldd build/sbin/unitd \
+            | grep -qE '=> /opt/openssl-3\.5/lib[0-9]*/libssl\.so\.3 '
+          ldd build/sbin/unitd \
+            | grep -qE '=> /opt/openssl-3\.5/lib[0-9]*/libcrypto\.so\.3 '
+
+      # The crate's unit tests count the allocations of the per-request span
+      # attribute and traceparent path, and assert the traceparent format.
+      # Nothing else runs them.  --release reuses the dependencies "Make unit"
+      # built in this job: the default test profile would rebuild all of them.
+      - name: Run the otel crate unit tests
+        run: cargo test --release --locked --manifest-path src/otel/Cargo.toml
+
+      # The c-tests job configures without --njs, so this is the only leg
+      # that runs the C suite against a real njs.  The invalid shm fd path
+      # in nxt_router_conf_overlap_test releases a temporary configuration
+      # before nxt_js_compile() creates the VM.  Without the guard in
+      # nxt_js.c, njs_vm_destroy(NULL) segfaults there.
+      - name: Build C tests
+        run: make -j$(nproc) tests
+
+      - name: Run C tests with njs
+        run: sudo ./build/tests
 
       # The default target is `all: unitd manpage`, so --tests above only
       # makes this target available -- it does not build it.  Without it
@@ -247,27 +387,40 @@ jobs:
       - name: Make the libunit test application
         run: make -j$(nproc) build/unit_app_test
 
+      # The legs build their module from the shipped core objects and run
+      # the prebuilt unitd and unit_app_test: node and go archive
+      # libunit.a, ruby and php compile build/src/nxt_unit.o.  No leg runs
+      # make all, so unitd is not relinked.  The 124 MB Rust staticlib and
+      # the 10 MB core archive are dead weight in the artifact.  Keep
+      # unitd's symbol table but drop its debug info: the symbol table
+      # still names frames in a backtrace.
+      - name: Trim the core build
+        run: |
+          rm -f build/lib/libotel.a build/lib/libnxt.a
+          strip --strip-debug build/sbin/unitd
+
       # tar, not a bare upload: actions/upload-artifact stores a zip and
       # restores neither the executable bit nor mtimes.  Both matter here --
       # the legs run build/unit_app_test directly, and `make <module>` decides
       # what to rebuild from mtimes.  The root Makefile is generated by
       # configure (it just includes build/Makefile), so it travels too, and
       # build/autoconf.data is what a module configure sources for the core's
-      # flags.
+      # flags.  zstd, not gzip: it compresses on all cores, and the runner
+      # already has it for the cache action.
       - name: Pack the core build
-        run: tar -czf /tmp/unit-core-build.tar.gz Makefile build
+        run: tar -c --use-compress-program 'zstd -T0 -3' -f /tmp/unit-core-build.tar.zst Makefile build
 
       - name: Upload the core build
         uses: actions/upload-artifact@v7
         with:
           name: unit-core-build
-          path: /tmp/unit-core-build.tar.gz
+          path: /tmp/unit-core-build.tar.zst
           retention-days: 1
           compression-level: 0
 
   test:
     needs: [prepare, core]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-26.04
     # 45, not 30: the wasm leg now runs the suite on a cold contrib wasmtime
     # build (the cache key moves with the pin) and builds the guest toolchain.
     timeout-minutes: 45
@@ -275,14 +428,20 @@ jobs:
       fail-fast: false
       matrix:
         build: ${{ fromJSON(needs.prepare.outputs.builds) }}
-        os: [ubuntu-latest]
 
     steps:
       - uses: actions/checkout@v7
 
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
       # Provides module, language version and testpath from build name
       - name: Output build metadata
         id: metadata
+        env:
+          BUILDS: ${{ needs.prepare.outputs.builds }}
         run: |
           if [ "${{ matrix.build }}" = "wasm-wasi-component" ]; then
             module="wasm-wasi-component"
@@ -298,48 +457,60 @@ jobs:
           # libunit port/fd lifecycle covered in the python leg only.
           testpath="test/test_${module}* test/test_app_lifecycle.py"
 
-          # "unit" is the only leg that runs the language-agnostic suite in
-          # one piece; the Python-application tests self-skip there without
-          # the module, and every other test runs as written.
-          if [ "$module" = "unit" ]; then
-            testpath="test"
-          fi
-
           # A Python leg runs its interpreter-specific suites whole.  That is
-          # what the three versions are for.  It also takes a share of the
-          # other files, balanced by measured time (see below).  Three runs
-          # of the whole language-agnostic suite cost about 12 minutes per
-          # leg, twice any other language, for tests that no interpreter
-          # distinguishes.  Each shared file now runs on one Python version
-          # instead of three.  The union over the legs does not change.
+          # what the Python versions are for.  It also takes a share of the
+          # other files, balanced by measured time (see below).  A run of the
+          # whole language-agnostic suite on every version costs about 12
+          # minutes per leg, twice any other language, for tests that no
+          # interpreter distinguishes.  Each shared file now runs on one
+          # Python version instead of on all of them.  The union over the
+          # legs does not change.
           #
           # Both lists are built from the files that exist, never from a glob
           # handed to pytest.  There is no test_wsgi_*.py -- WSGI is exercised
           # through the python module in test_python_* -- and an unmatched
           # pattern survives shell expansion literally, so pytest aborts the
           # whole leg with "file or directory not found" instead of running the
-          # rest.  `test/test_*.py` is depth 1 while the unit leg runs the whole
-          # `test` tree, so a nested test file would run on unit and on no
-          # python leg; keep the two definitions of "the suite" in step.
+          # rest.
+          #
+          # The python legs are the only legs that run the language-agnostic
+          # suite.  They list `test/test_*.py`, depth 1.  pytest also collects
+          # `*_test.py` and test files in subdirectories, but no leg would
+          # run such a file, so fail on one.
           if [ "$module" = "python" ]; then
-            versions=$(jq -r '.runtimes.python | length' pkg/eol.json)
-            shard=$(jq -r --arg v "${version}" \
-              '[.runtimes.python[].version] | index($v)' pkg/eol.json)
+            stray=$(find test -name '*_test.py' -o \
+                              -path 'test/*/*' -name 'test_*.py')
+            if [ -n "${stray}" ]; then
+              echo "::error::no leg runs these test files:" \
+                   "$(echo "${stray}" | tr '\n' ' ')" >&2
+              exit 1
+            fi
+
+            # The shards are the Python legs that this run has: two on a
+            # pull request or a master push, every version in the weekly
+            # run.  Counting the versions in pkg/eol.json instead would
+            # give a shard to a leg that does not run, and its files would
+            # not be tested.
+            versions=$(jq -r '[.[] | select(startswith("python-"))] | length' \
+              <<< "${BUILDS}")
+            shard=$(jq -r --arg b "python-${version}" \
+              '[.[] | select(startswith("python-"))] | index($b)' \
+              <<< "${BUILDS}")
 
             # A jq miss prints "null" rather than failing, and a non-integer
             # in either comparison below fails open: the leg would run its
             # interpreter files, skip every shared one, and still report
-            # green.  Fail loudly instead, like the OpenSSL 4.0 assertion.
+            # green.  Fail loudly instead, like the OpenSSL assertions.
             case "${versions}" in
               ''|0|*[!0-9]*)
-                echo "::error::no python runtimes in pkg/eol.json" >&2
+                echo "::error::no python legs in the matrix" >&2
                 exit 1
                 ;;
             esac
 
             case "${shard}" in
               ''|*[!0-9]*)
-                echo "::error::no shard for python-${version} in pkg/eol.json" >&2
+                echo "::error::no shard for python-${version} in the matrix" >&2
                 exit 1
                 ;;
             esac
@@ -357,9 +528,26 @@ jobs:
             # built, so one Python leg is enough for it.  The other language
             # legs still run it.  A file that is not in this list only costs
             # balance, not coverage.
+            #
+            # test_settings.py cost 170 s on the python-3.13 leg of
+            # https://github.com/freeunitorg/freeunit/actions/runs/40428047422
+            # (360 s of pytest), 59 s of it test_settings_send_timeout: its
+            # 40 MiB body went through recvall(), which appended 4 KiB reads
+            # to a bytes object.  recvall() collects into a bytearray now
+            # (#866).  The JUnit report of run 41226901509 puts the file's
+            # tests at 125 s with that copy capped; the full body adds less
+            # than a second.
+            #
+            # The entries are in descending order of time: each one goes to
+            # the least loaded shard, so a large file late in the list would
+            # land on a shard that is already full.
+            #
+            # The python legs upload a JUnit report (junit-python-*), which
+            # has the time of each test, to recompute the table from.
+            # Re-measure a file when its cost changes.
             heavy="
+              test/test_settings.py:125
               test/test_app_start_timeout.py:72
-              test/test_settings.py:64
               test/test_otel.py:34
               test/test_proxy.py:27
               test/test_tls.py:22
@@ -446,74 +634,35 @@ jobs:
 
           cat "$GITHUB_OUTPUT"
 
-      # https://github.com/actions/runner-images/issues/2821
-      - name: Kill mono process
-        run: |
-          set +e
-          sudo systemctl status mono-xsp4.service
-          if [ $? -ne 0 ]; then
-            true
-          else
-            sudo systemctl stop mono-xsp4.service
-            sudo systemctl mask mono-xsp4.service
-            sudo systemctl status mono-xsp4.service
-            PID=$(sudo lsof -t -i :8084)
-            echo "Killing PID $PID"
-            sudo kill -9 $PID
-          fi
-
       - name: Install packages
-        run: sudo apt-get -y install libbrotli-dev ccache
+        timeout-minutes: 5
+        run: sudo apt-get -y install libbrotli-dev
 
-      # ccache transparently caches C object files across runs. The Debian
-      # ccache package ships compiler symlinks in /usr/lib/ccache; putting it
-      # first on PATH makes `cc`/`gcc` resolve to ccache for njs, unit and the
-      # OpenSSL build with no configure changes. Falls back to real cc on any
-      # miss, so it can only speed things up, never break the build.
-      - name: Cache ccache
+      # This job builds nothing against OpenSSL.  unitd from the core artifact
+      # carries an rpath to /opt/openssl-3.5, so the slot must exist here with
+      # the same version.  The cache key matches the core job, so a miss only
+      # happens when the core job's cache entry was evicted or the runner
+      # architecture differs; the build then fills the slot the same way.
+      - name: Cache OpenSSL 3.5
+        id: cache-openssl35
         uses: actions/cache@v6
         with:
-          path: ~/.ccache
-          key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.build }}-${{ github.run_id }}
-          restore-keys: |
-            ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.build }}-
+          path: /opt/openssl-3.5
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ env.OPENSSL_SHA256 }}-${{ runner.os }}-${{ runner.arch }}
 
-      - name: Enable ccache
-        run: |
-          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
-          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
-          echo "CCACHE_MAXSIZE=500M" >> "$GITHUB_ENV"
-
-      - name: Cache OpenSSL 3.6
-        id: cache-openssl36
-        uses: actions/cache@v6
-        with:
-          path: /opt/openssl-3.6
-          key: openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}-${{ runner.arch }}
-
-      - name: Build OpenSSL 3.6
-        if: steps.cache-openssl36.outputs.cache-hit != 'true'
+      - name: Build OpenSSL 3.5
+        if: steps.cache-openssl35.outputs.cache-hit != 'true'
         run: |
           sudo apt-get -y install build-essential
           cd /tmp
           wget -q "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
+          echo "${OPENSSL_SHA256}  openssl-${OPENSSL_VERSION}.tar.gz" | sha256sum -c -
           tar -xzf "openssl-${OPENSSL_VERSION}.tar.gz"
           cd "openssl-${OPENSSL_VERSION}"
-          ./Configure --prefix=/opt/openssl-3.6 shared no-docs
+          ./Configure --prefix=/opt/openssl-3.5 shared no-docs
           make -j$(nproc)
-          sudo mkdir -p /opt/openssl-3.6
+          sudo mkdir -p /opt/openssl-3.5
           sudo make install_sw
-
-      - name: Set OpenSSL 3.6 build environment
-        # Keep OpenSSL 3.6 isolated in /opt/openssl-3.6.
-        # Mixing libssl.so.3 (3.3) with libcrypto.so.3 (3.6) breaks sudo,
-        # so we never overwrite system libraries.
-        # Export the two helper variables used in later steps.
-        run: |
-          OSSL=/opt/openssl-3.6
-          LIBDIR=$( [ -d "$OSSL/lib64" ] && echo "$OSSL/lib64" || echo "$OSSL/lib" )
-          echo "OPENSSL36_INCDIR=${OSSL}/include" >> $GITHUB_ENV
-          echo "OPENSSL36_LIBDIR=${LIBDIR}"        >> $GITHUB_ENV
 
       ##
       ## njs
@@ -563,11 +712,14 @@ jobs:
         # date.  Everything under build/ came from this same commit, so there
         # is no real staleness to mask.
         run: |
-          tar -xzf /tmp/unit-core-build.tar.gz
+          tar -x --use-compress-program unzstd -f /tmp/unit-core-build.tar.zst
           find Makefile build -exec touch {} +
           test -f build/autoconf.data
           test -x build/sbin/unitd
           test -x build/unit_app_test
+          # The core job asserted the same; this proves the slot restored here.
+          ldd build/sbin/unitd \
+            | grep -qE '=> /opt/openssl-3\.5/lib[0-9]*/libssl\.so\.3 '
 
       ##
       ## Go
@@ -642,6 +794,7 @@ jobs:
       # https://github.com/actions/runner-images#available-images
 
       - name: Install libperl-dev
+        timeout-minutes: 5
         run: |
           sudo apt-get -y update
           sudo apt-get -y install libperl-dev
@@ -796,6 +949,7 @@ jobs:
         if: steps.metadata.outputs.module == 'wasm' && steps.cache-wasi-sysroot.outputs.cache-hit != 'true'
 
       - name: Install wasm guest toolchain
+        timeout-minutes: 5
         run: |
           sudo apt install -y clang lld
           sudo apt install -y "libclang-rt-$(clang -dumpversion | cut -d. -f1)-dev-wasm32"
@@ -813,7 +967,7 @@ jobs:
       # Prebuilt binary instead of `cargo install cargo-component` (which
       # compiles it from source on every run). Same tool, much faster.
       - name: Install cargo-component
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: cargo-component
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
@@ -822,11 +976,15 @@ jobs:
       # crates built from nothing on every run.  This step caches the
       # crates and the target directory, like the otel build in the core
       # job.  "Setup rust" above installs the latest stable, so the key has
-      # the rustc version.  This crate is rebuilt on every run, because
-      # checkout gives its sources a new mtime.
+      # the rustc version.  The key also covers the module script, which
+      # builds the --remap-path-prefix flags, and the two remapped paths.
+      # This crate is rebuilt on every run, because checkout gives its
+      # sources a new mtime.
       - name: Read rustc version
         id: rustc
-        run: echo "version=$(rustc -V | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "version=$(rustc -V | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
+          echo "paths=$(printf '%s %s' "$GITHUB_WORKSPACE" "${CARGO_HOME:-$HOME/.cargo}" | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
 
       - name: Cache the wasm-wasi-component Rust build
@@ -836,9 +994,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             src/wasm-wasi-component/target
-          key: wasm-wasi-component-cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('src/wasm-wasi-component/Cargo.lock') }}
+          key: wasm-wasi-component-cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-${{ steps.rustc.outputs.paths }}-${{ hashFiles('auto/modules/wasm-wasi-component', 'src/wasm-wasi-component/Cargo.lock') }}
           restore-keys: |
-            wasm-wasi-component-cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-
+            wasm-wasi-component-cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-${{ steps.rustc.outputs.paths }}-
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
 
       - name: Configure wasm-wasi-component
@@ -864,7 +1022,7 @@ jobs:
       ##
 
       - name: Cache Cargo artifacts
-        if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
+        if: steps.metadata.outputs.module == 'python'
         uses: actions/cache@v6
         with:
           path: |
@@ -877,17 +1035,17 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-cargo-
 
       - name: Install Rust toolchain
-        if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
+        if: steps.metadata.outputs.module == 'python'
         run: rustup toolchain install stable --no-self-update --profile minimal
 
       - name: Build fake_upstream
-        if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
+        if: steps.metadata.outputs.module == 'python'
         run: |
           cargo build --release --manifest-path test/fake_upstream/Cargo.toml
           sudo cp test/fake_upstream/target/release/fake_upstream /usr/local/bin/
 
       - name: Build fake_otlp
-        if: steps.metadata.outputs.module == 'unit' || steps.metadata.outputs.module == 'python'
+        if: steps.metadata.outputs.module == 'python'
         run: |
           cargo build --release --manifest-path test/fake_otlp/Cargo.toml
           sudo cp test/fake_otlp/target/release/fake_otlp /usr/local/bin/
@@ -906,17 +1064,19 @@ jobs:
         if: steps.metadata.outputs.module != 'wasm'
 
       - name: Install pytest
+        timeout-minutes: 5
         run: |
           sudo apt install -y python3-pytest
 
       - name: Run ${{ steps.metadata.outputs.module }} tests
+        timeout-minutes: 12
         # GitHub runners are UTC, where localtime() and gmtime() agree, so a
         # UTC-only run cannot tell a correct HTTP-date from one rendered in
         # local time and labelled "GMT" (see test_static_last_modified_is_gmt,
         # which skips itself, loudly, when the offset is zero).  Kolkata is
         # +05:30 all year: never UTC, no DST to shift it, and a half-hour
         # offset that also catches whole-hour assumptions.
-        # "sudo -E" below keeps it for unitd, which inherits pytest's env.
+        # sudo below passes it on to unitd, which inherits pytest's env.
         env:
           TZ: Asia/Kolkata
         run: |
@@ -929,12 +1089,49 @@ jobs:
           # they run unprivileged to keep the result reachable by pytest; the
           # others install applications as root.
           # --unsafe runs the long Autobahn 9.x websocket cases.
+          #
+          # The port map (test/unit/port.py) is the identity at the default
+          # base of 8080, so a run there proves only its no-op path: a literal
+          # that bypasses the map is invisible until the base moves.  Thus
+          # each leg runs off-base, except go and node: their fixtures name
+          # port 8080.  The python legs run the shared files between them, so
+          # each test file runs off-base once on each pull request, at no
+          # extra cost.  go and node keep the default base covered.  --port,
+          # not UNIT_TEST_PORT: sudo-rs ignores -E.
+          case "${{ steps.metadata.outputs.module }}" in
+            go|node) port= ;;
+            *) port="--port 18080" ;;
+          esac
           if [ "${{ matrix.build }}" == "wasm-wasi-component" ] || [ "${{ matrix.build }}" == "wasm" ]; then
             set -o pipefail
-            pytest-3 --print-log --unsafe ${{ steps.metadata.outputs.testpath }} 2>&1 | tee "$RUNNER_TEMP/pytest.out"
+            pytest-3 --print-log --unsafe ${port} ${{ steps.metadata.outputs.testpath }} 2>&1 | tee "$RUNNER_TEMP/pytest.out"
           else
-            sudo -E pytest-3 --print-log --unsafe ${{ steps.metadata.outputs.testpath }}
+            # ubuntu-26.04 ships sudo-rs, which ignores -E ("preserving the
+            # entire environment is not supported").  Pass the variables the
+            # suite reads by name; this works with sudo-rs and classic sudo.
+            #
+            # The python legs also write a JUnit report, uploaded below, so
+            # the heavy= shard table can be recomputed from measured times.
+            junit=
+            if [ "${{ steps.metadata.outputs.module }}" == "python" ]; then
+              junit="--junitxml=$RUNNER_TEMP/junit-python-${{ steps.metadata.outputs.version }}.xml"
+            fi
+            sudo env UNIT_PYTHONHOME="${UNIT_PYTHONHOME:-}" \
+                     JAVA_HOME="${JAVA_HOME:-}" TZ="${TZ:-}" \
+              pytest-3 --print-log --unsafe ${port} ${junit} \
+              ${{ steps.metadata.outputs.testpath }}
           fi
+
+      # Per-test times of the python legs, for the heavy= table above.
+      # always(): a failed or timed-out run still has times worth keeping.
+      - name: Upload the JUnit report
+        if: ${{ always() && steps.metadata.outputs.module == 'python' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-python-${{ steps.metadata.outputs.version }}
+          path: ${{ runner.temp }}/junit-python-${{ steps.metadata.outputs.version }}.xml
+          retention-days: 14
+          if-no-files-found: ignore
 
       # check_prerequisites() skips the whole file when the clang/wasi-sysroot
       # fixture cannot be built, so an incomplete toolchain would leave this
@@ -963,7 +1160,7 @@ jobs:
 
       # test_capget_fallback.py needs a unitd that actually calls capget(),
       # which a root one never does, so every leg above skips it -- the file
-      # is inside "test" but has never once run.  Repeat it here without
+      # is in the suite but has never once run.  Repeat it here without
       # sudo.  The python leg is the one chosen because the test drives a
       # real application to show it inherits the shim harmlessly, and this
       # leg is where a language module exists.
@@ -981,6 +1178,7 @@ jobs:
       # above would let one unrelated flake silently take that coverage away
       # again -- the very problem this step exists to fix.
       - name: Run capget fallback and configuration tests unprivileged
+        timeout-minutes: 5
         run: |
           export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
           /usr/bin/pytest-3 --print-log test/test_capget_fallback.py test/test_configuration.py
@@ -992,15 +1190,31 @@ jobs:
       # unitd on its own state directory and stops it while a store runs.
       # test_njs_modules.py stores njs modules and starts unitd again to
       # check what it loads from the state directory.
+      # test_python_shm_limit_stored, test_settings_timeout_stored,
+      # test_settings_size_negative_stored,
+      # test_access_log_credential_header_stored,
+      # test_compressors_level_stored and test_compressors_missing_stored
+      # start unitd on a stored configuration.
       # All need --restart, which the run above does not pass, so they skip
-      # there.  Run them again.
+      # there.  Run them again, off the default base port: no other step runs
+      # a requires_restart test with --port.
       - name: Run the tests that restart unitd, with --restart
+        timeout-minutes: 5
         run: |
           export UNIT_PYTHONHOME="${UNIT_PYTHON_PREFIX}"
-          sudo -E /usr/bin/pytest-3 --print-log --restart \
+          # By name, not -E: see the step above.
+          sudo env UNIT_PYTHONHOME="${UNIT_PYTHONHOME:-}" \
+                   JAVA_HOME="${JAVA_HOME:-}" TZ="${TZ:-}" \
+            /usr/bin/pytest-3 --print-log --restart --port 18080 \
             test/test_asgi_lifespan.py \
             test/test_njs_modules.py \
             test/test_state_store.py \
+            test/test_python_shm_limit.py::test_python_shm_limit_stored \
+            test/test_settings.py::test_settings_timeout_stored \
+            test/test_settings.py::test_settings_size_negative_stored \
+            test/test_config_validation_errors.py::test_access_log_credential_header_stored \
+            test/test_conf_compressors_object.py::test_compressors_level_stored \
+            test/test_conf_compressors_object.py::test_compressors_missing_stored \
             test/test_tls.py::test_tls_certificate_update_restart
         if: ${{ !cancelled() && steps.metadata.outputs.module == 'python' }}
 
@@ -1010,19 +1224,30 @@ jobs:
   # own check, like the language tests. sudo mirrors the pytest suite so
   # privilege-sensitive cases (clone creds) work.
   c-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v7
 
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
       - name: Install packages
+        timeout-minutes: 5
         run: |
           sudo apt-get -y update
-          sudo apt-get -y install build-essential libssl-dev libpcre2-dev
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev \
+            systemtap-sdt-dev zlib1g-dev libzstd-dev libbrotli-dev
 
-      - name: Configure unit (--tests)
-        run: ./configure --openssl --tests
+      # --usdt is here because no other job compiles the probes.  The other
+      # C test jobs build without it, so nxt_usdt_test runs with and without
+      # the probes.  --zlib, --zstd and --brotli are here so
+      # nxt_http_comp_select_test runs the compressor checks.
+      - name: Configure unit (--tests --usdt)
+        run: ./configure --openssl --zlib --zstd --brotli --tests --usdt
 
       - name: Build unitd and libunit
         run: |
@@ -1031,6 +1256,18 @@ jobs:
 
       - name: Build C tests
         run: make -j4 tests
+
+      # Every NXT_USDT() name in the source must be a probe note in unitd or
+      # libunit.a.  A probe in a language module needs its module added here.
+      - name: Check the USDT probes are in the build
+        run: |
+          src=$(grep -rhoE --exclude-dir=test --exclude=nxt_usdt.h \
+                  'NXT_USDT\([a-z_]+' src | sed 's/NXT_USDT(//' | sort -u)
+          bin=$(LC_ALL=C readelf -n build/sbin/unitd build/lib/libunit.a |
+                  sed -n 's/^ *Name: //p' | sort -u)
+          echo "$src"
+          test -n "$src"
+          test "$src" = "$bin"
 
       # The hooks (fault-injection branches and counters inside
       # "#if (NXT_TESTS)") must reach the test programs and nothing else.
@@ -1058,6 +1295,114 @@ jobs:
       - name: Run libunit malformed port message test
         run: ./build/unit_msg_test
 
+  # Compile-only leg with 32-bit size_t and pointers and a 64-bit off_t, the
+  # widths of i386, armv7 and armhf.  A type-width -Werror (#582, #579) folds
+  # only there and cannot show up in an amd64 job.  Nothing is linked against
+  # 32-bit libraries beyond libc, so --no-regex and no --openssl; build/tests
+  # is compiled and not run.  This leg blocks pull requests, as #632 asks.
+  build-m32:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
+      # The .deb files are kept across runs, so a slow mirror costs less.
+      # The key changes every ISO week, and restore-keys only match the same
+      # week, so a stale cache is never restored.
+      - name: Compute the week of the package cache
+        id: week
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache apt packages
+        uses: actions/cache@v6
+        with:
+          path: ~/apt-archives
+          key: ${{ runner.os }}-m32-pkgs-${{ steps.week.outputs.week }}-${{ hashFiles('.github/workflows/build-test.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-m32-pkgs-${{ steps.week.outputs.week }}-
+
+      # Three attempts, each bounded to 4 minutes, with a pause of 10 and
+      # then 20 seconds between them.
+      - name: Install packages
+        timeout-minutes: 14
+        run: |
+          arch="$HOME/apt-archives"
+          mkdir -p "$arch/partial"
+          for n in 1 2 3; do
+            if sudo timeout 240 sh -c '
+                 apt-get -y update &&
+                 apt-get -y -o Dir::Cache::Archives="$1" \
+                   install build-essential gcc-multilib' sh "$arch"
+            then
+              break
+            fi
+            if [ "$n" = 3 ]; then
+              exit 1
+            fi
+            echo "Install attempt $n failed, retrying"
+            sleep $((n * 10))
+          done
+          sudo rm -rf "$arch/partial" "$arch/lock"
+          sudo chown -R "$(id -u):$(id -g)" "$arch"
+
+      - name: Configure unit (-m32 -D_FILE_OFFSET_BITS=64)
+        run: >-
+          ./configure --tests --no-regex
+          --cc-opt='-m32 -D_FILE_OFFSET_BITS=64' --ld-opt='-m32'
+
+      - name: Build unitd
+        run: make -j4
+
+      - name: Check the target is 32-bit
+        run: file build/sbin/unitd | grep -q "ELF 32-bit"
+
+      - name: Build C tests (not run)
+        run: make -j4 tests
+
+  # The oldest compiler the tree still builds with: GCC 4.4.7 and glibc 2.12
+  # of RHEL 6.  It has no -std=gnu11 and no __atomic_* builtins, so the job
+  # tests the fallbacks for both.  It is a best-effort target:
+  # there is no package for it.  The build runs in a plain docker run, not
+  # in a job container, because the Node of the checkout action cannot run
+  # on glibc 2.12.  CentOS 6 is end of life, so yum reads the vault.  There
+  # is no OpenSSL (1.0.1 is below the 1.1.1 floor) and no PCRE2.
+  c-tests-centos6:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build and run the C tests in CentOS 6.10
+        run: |
+          docker run --rm -v "$PWD":/src -w /src centos:6.10 bash -ec '
+            sed -i "s|^mirrorlist=|#mirrorlist=|; s|^#baseurl=http://mirror.centos.org/centos/\$releasever|baseurl=http://vault.centos.org/6.10|" \
+                /etc/yum.repos.d/CentOS-Base.repo
+            yum -y -q install gcc make which
+            gcc --version | head -1
+            ./configure --no-regex --tests
+            make -j4
+            make -j4 build/lib/libunit.a
+            make -j4 tests
+            sh .github/scripts/check-test-hooks.sh
+            ./build/tests
+            ./build/unit_close_test
+            ./build/unit_port_recv_test
+            ./build/unit_msg_test
+          '
+
+      # The container runs as root: give the files back so that the runner
+      # can clean up the workspace.
+      - name: Give the build tree back to the runner user
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" "$PWD"
+
   # The C unit-test suite with PCRE 1 instead of PCRE2.  nxt_pcre.c has its
   # own match limits, recursion limit and callout.  No other job compiles
   # it.  ubuntu-24.04 is pinned because it still ships libpcre3-dev.
@@ -1068,7 +1413,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
       - name: Install packages
+        timeout-minutes: 5
         run: |
           sudo apt-get -y update
           sudo apt-get -y install build-essential libpcre3-dev
@@ -1085,6 +1436,98 @@ jobs:
       - name: Run C tests
         run: sudo ./build/tests
 
+  # JIT is opt-in, so the default jobs do not execute its regression cases.
+  c-tests-jit:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [none, address]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install packages
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev
+
+      - name: Configure unit with PCRE2 JIT
+        env:
+          SANITIZER: ${{ matrix.sanitizer }}
+        run: |
+          if [ "$SANITIZER" = address ]; then
+            ASAN_OPTIONS=detect_leaks=0 ./configure \
+              --openssl --debug --hardening=strict --tests --regex-jit \
+              --cc-opt='-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g' \
+              --ld-opt='-fsanitize=address,undefined'
+          else
+            ./configure --openssl --debug --hardening=strict --tests --regex-jit
+          fi
+
+      - name: Build unitd, libunit and C tests
+        run: |
+          make -j4
+          make -j4 build/lib/libunit.a
+          make -j4 tests
+
+      - name: Check test-hook isolation
+        run: .github/scripts/check-test-hooks.sh
+
+      - name: Run C tests
+        run: |
+          set -o pipefail
+          sudo env ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+            ./build/tests 2>&1 | tee jit-tests.log
+          grep -F 'regex JIT test passed: execution, fallback, cleanup' jit-tests.log
+
+  # The routing tests against a --regex-jit build: configuration
+  # validation, route matching on the engine threads, reconfiguration and
+  # the limit-hit error with JIT-compiled patterns.  Its own build, so the
+  # shared core build that the other pytest legs use stays without JIT.
+  routing-jit:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
+      - name: Install packages
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential libssl-dev libpcre2-dev \
+            python3-dev python3-pytest
+
+      - name: Configure unit with PCRE2 JIT
+        run: ./configure --openssl --debug --regex-jit
+
+      - name: Make unit and the python3 module
+        run: |
+          make -j4
+          ./configure python --config=python3-config
+          make -j4 python3
+
+      - name: Assert the build has --regex-jit
+        run: ./build/sbin/unitd --version 2>&1 | grep -F -- --regex-jit
+
+      # The test files with "~" route or match patterns.  The one in
+      # test_static_compression.py is left out: it needs a --zlib build.
+      # --port as in the test legs, so the run is off the default base port.
+      - name: Run routing tests
+        timeout-minutes: 8
+        run: |
+          sudo /usr/bin/pytest-3 --print-log --port 18080 \
+            test/test_routing.py \
+            test/test_route_if.py \
+            test/test_static_types.py
+
   # Same C unit-test suite as c-tests above, built with AddressSanitizer and
   # run with LeakSanitizer's default ASAN_OPTIONS (detect_leaks is on unless
   # something turns it off). Separate from sanitize.yml: that workflow runs
@@ -1097,30 +1540,87 @@ jobs:
   # (test fixtures freeing what they allocated -- lvlhsh buckets, ports,
   # runtime processes).
   c-tests-asan:
-    runs-on: ubuntu-latest
+    # Both compilers, or the C core is sanitized by exactly one of them.  The
+    # gcc branches of the sanitizer detection that
+    # https://github.com/freeunitorg/freeunit/pull/693 adds to nxt_clang.h
+    # (__SANITIZE_ADDRESS__ and friends) would then never run here.  Both legs
+    # of this matrix use one flag set, so a UBSan report fails both or
+    # neither.  The runtime leg in sanitize.yml keeps UBSan recoverable on
+    # purpose: aborting on the first report kills an exec'd application worker
+    # mid-response (see the halt_on_error note and the "Configure unit"
+    # comment there).  This leg runs one test process with no allowlist, so it
+    # fails fast.
+    # MemorySanitizer cannot be added to this matrix: gcc rejects the option
+    # outright ("unrecognized argument to '-fsanitize=' option: 'memory'", gcc
+    # 15.3.0 and 16.2.0), so MSan stays a clang-only leg.  HWAddressSanitizer
+    # builds on both compilers but aborts at startup on x86_64 ("requires a
+    # kernel with tagged address ABI"), so it belongs on an aarch64 leg.
+    name: "c-tests-asan (${{ matrix.cc }})"
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [clang, gcc]
 
     steps:
       - uses: actions/checkout@v7
 
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
       - name: Install packages
+        timeout-minutes: 5
         run: |
           sudo apt-get -y update
           sudo apt-get -y install build-essential libssl-dev libpcre2-dev clang
 
       # -fno-sanitize-recover: the first UBSan report fails the job.
       # nxt_conf_map_object_test fails only under UBSan.
-      - name: Configure unit (ASan+LSan+UBSan, --tests)
+      #
+      # -O1 is spelled out as in sanitize.yml: --cc-opt lands after the
+      # built-in -O, so a change of that default cannot split the two
+      # workflows.
+      #
+      # detect_leaks=0 for configure only, as in sanitize.yml: auto/feature
+      # runs its probes, and auto/malloc's malloc_usable_size() probe does not
+      # free.  With LeakSanitizer on, the probe exits nonzero, configure
+      # prints "found but is not working", and NXT_HAVE_MALLOC_USABLE_SIZE is
+      # dropped.  The tests below still run with leak detection on.
+      - name: Configure unit (ASan+LSan+UBSan, --tests, --openssl)
+        env:
+          ASAN_OPTIONS: "detect_leaks=0"
         run: |
           ./configure \
-            --cc=clang \
+            --cc=${{ matrix.cc }} \
             --debug \
             --tests \
-            --cc-opt="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g" \
+            --openssl \
+            --cc-opt="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -O1 -g" \
             --ld-opt="-fsanitize=address,undefined"
+
+      # The hook gate needs the plain objects as well as the instrumented ones:
+      # it compares X.o with X.test.o, and it checks the hook symbols against
+      # unitd, libnxt.a, libunit.a and nxt_unit.o.  "make tests" builds the
+      # instrumented archive only.
+      - name: Build unitd and libunit
+        run: |
+          make -j4
+          make -j4 build/lib/libunit.a
 
       - name: Build C tests
         run: make -j4 tests
+
+      # The gate derives the hook set from the difference between the two
+      # objects, so it depends on what the optimizer inlines away.  This leg is
+      # the only --debug build of the C suite: c-tests, c-tests-almalinux8 and
+      # hardening-strict-fedora are release builds.  --openssl above is what
+      # puts nxt_openssl.c and its hooks in the set.
+      - name: Check the test hooks are in the test programs only
+        run: .github/scripts/check-test-hooks.sh
 
       # sudo for the same reason as c-tests above: the clone creds cases
       # need real root. Running as root does not disable LeakSanitizer --
@@ -1161,121 +1661,75 @@ jobs:
           LSAN_OPTIONS: use_stacks=0
         run: ./build/unit_msg_test
 
-  # OpenSSL 4.0 compile gate.  4.0 removed nothing Unit uses, but it deprecated
-  # more of what Unit still calls, and 5.0 is where the deprecated symbols
-  # actually go away -- so the value here is having a leg that fails when a new
-  # deprecation lands, instead of noticing at removal time.  Deliberately cheap:
-  # a build plus the C test suite, no language modules and no pytest run, since
-  # nothing above the TLS layer changes with the OpenSSL version.
-  openssl4:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install packages
-        run: |
-          sudo apt-get -y update
-          sudo apt-get -y install build-essential libpcre2-dev
-
-      - name: Cache OpenSSL 4.0
-        id: cache-openssl4
-        uses: actions/cache@v6
-        with:
-          path: /opt/openssl-4.0
-          key: openssl-${{ env.OPENSSL4_VERSION }}-${{ runner.os }}-${{ runner.arch }}
-
-      - name: Build OpenSSL 4.0
-        if: steps.cache-openssl4.outputs.cache-hit != 'true'
-        run: |
-          cd /tmp
-          wget -q "https://www.openssl.org/source/openssl-${OPENSSL4_VERSION}.tar.gz"
-          tar -xzf "openssl-${OPENSSL4_VERSION}.tar.gz"
-          cd "openssl-${OPENSSL4_VERSION}"
-          ./Configure --prefix=/opt/openssl-4.0 shared no-docs
-          make -j$(nproc)
-          sudo mkdir -p /opt/openssl-4.0
-          sudo make install_sw
-
-      - name: Set OpenSSL 4.0 build environment
-        # Same isolation as the 3.6 slot: never overwrite the system libraries,
-        # because sudo links against them.
-        run: |
-          OSSL=/opt/openssl-4.0
-          LIBDIR=$( [ -d "$OSSL/lib64" ] && echo "$OSSL/lib64" || echo "$OSSL/lib" )
-          echo "OPENSSL4_INCDIR=${OSSL}/include" >> $GITHUB_ENV
-          echo "OPENSSL4_LIBDIR=${LIBDIR}"        >> $GITHUB_ENV
-
-      - name: Configure unit (--openssl --tests)
-        # LD_LIBRARY_PATH is scoped to this step only so that auto/feature test
-        # binaries load OpenSSL 4.0; exporting it globally would break sudo.
-        # The build itself needs no such help -- -Wl,-rpath below is baked into
-        # the binaries, and is honoured under sudo too.
-        env:
-          LD_LIBRARY_PATH: ${{ env.OPENSSL4_LIBDIR }}
-        run: |
-          ./configure \
-            --tests \
-            --openssl \
-            --cc-opt="-I${OPENSSL4_INCDIR} -DOPENSSL_NO_DEPRECATED" \
-            --ld-opt="-L${OPENSSL4_LIBDIR} -Wl,-rpath,${OPENSSL4_LIBDIR}"
-
-      # Assert rather than print: if the include/lib flags ever stop taking
-      # effect, configure falls back to the runner's system OpenSSL 3.x and the
-      # leg would pass while testing nothing it was added for.
-      - name: Assert configure found OpenSSL 4.0
-        run: |
-          grep NXT_HAVE_OPENSSL_VERSION build/include/nxt_auto_config.h
-          grep -q '#define NXT_HAVE_OPENSSL_VERSION  "OpenSSL 4\.' \
-            build/include/nxt_auto_config.h
-
-      - name: Build unit
-        run: make -j4
-
-      - name: Build C tests
-        run: make -j4 tests
-
-      - name: Run C tests
-        run: sudo ./build/tests
-
-  # --hardening=strict compile gate, with gcc and with clang.  auto/cc/test
-  # already passes -Werror to both, so a new warning from -Wformat=2, -Wvla or
+  # --hardening=strict compile gate with the newest gcc and clang: gcc 16.2.1
+  # and clang 23.1.2 in a Fedora 45 container, which also brings OpenSSL
+  # 4.0.3, the major declared in FEDORA_OPENSSL_MAJOR.  auto/cc/test already
+  # passes -Werror to both, so a new warning from -Wformat=2, -Wvla or
   # -Wimplicit-fallthrough (a fall-through without nxt_fallthrough) fails the
-  # job.  The assert step fails when a compiler stops accepting one of the
-  # probed flags: auto/cc/hardening only drops such a flag, so a plain build
-  # would pass while testing nothing.  Cheap on purpose: a build plus the C
-  # test suite, no language modules.
-  hardening-strict:
-    runs-on: ubuntu-latest
+  # job.  Each new compiler adds warnings to -Wall
+  # and -Wextra, and -Werror makes each one a failure; the weekly rawhide job
+  # sees them up to 7 days later.  This job runs build/tests, so a new
+  # optimizer meets the tests in the pull request.  The container runs as
+  # root, so there is no sudo, and its default capabilities are enough for
+  # build/tests.
+  #
+  # The gcc leg also builds with -DOPENSSL_NO_DEPRECATED.  That hides every
+  # API that OpenSSL deprecates, the macros too, so a new deprecation fails
+  # the build when it lands and not when OpenSSL removes the API.  -Werror
+  # alone catches only the deprecated functions.  The clang leg builds as a
+  # distribution package does, with the deprecated API visible.
+  #
+  # nightly.yml runs the same strict gate with the runner's gcc and clang and
+  # builds against upstream OpenSSL 4.0 at a pinned version, once a night.
+  hardening-strict-fedora:
+    name: hardening-strict-fedora (${{ matrix.cc }})
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
 
     strategy:
       fail-fast: false
       matrix:
         cc: [gcc, clang]
+        include:
+          - cc: gcc
+            cc_opt: -DOPENSSL_NO_DEPRECATED
+
+    container:
+      image: fedora:45
 
     steps:
-      - uses: actions/checkout@v7
-
+      # git before checkout: without it actions/checkout downloads the tree
+      # through the REST API.  auto/cc/test needs which.  binutils and
+      # diffutils give check-test-hooks.sh nm, objcopy and cmp.
+      # dnf already gives up on a mirror after 30 s without data (its default
+      # timeout); the step limit bounds the whole install.  It takes 15-33 s.
       - name: Install packages
+        timeout-minutes: 5
         run: |
-          sudo apt-get -y update
-          sudo apt-get -y install build-essential libssl-dev libpcre2-dev clang
+          dnf -y install --setopt=install_weak_deps=False \
+              git gcc make which binutils diffutils findutils \
+              openssl-devel pcre2-devel
+          if [ "${{ matrix.cc }}" = clang ]; then
+            dnf -y install --setopt=install_weak_deps=False clang
+          fi
+
+      - uses: actions/checkout@v7
 
       - name: Configure unit (--hardening=strict --tests --openssl)
         run: |
           ./configure \
             --cc=${{ matrix.cc }} \
+            --cc-opt="${{ matrix.cc_opt }}" \
             --hardening=strict \
             --tests \
             --openssl 2>&1 | tee configure.log
           test "${PIPESTATUS[0]}" -eq 0
 
-      # Every flag that this job exists for must be found.  The FORTIFY probe
-      # falls back from level 3 to 2, so either level passes.  The CET and
-      # branch-protection flags are not asserted: each applies to one target
-      # only.
+      # Every flag that this job exists for must be found.  auto/cc/hardening
+      # drops a flag that the compiler does not accept, so a plain build would
+      # pass while testing nothing.  The FORTIFY probe falls back from level 3
+      # to 2, so either level passes.  The CET and branch-protection flags are
+      # not asserted: each applies to one target only.
       - name: Assert configure found the hardening flags
         run: |
           grep -q 'hardening: .* strict$' configure.log
@@ -1293,11 +1747,197 @@ jobs:
           grep -q 'define NXT_HAVE_BUILTIN_OVERFLOW' \
             build/include/nxt_auto_config.h
 
-      - name: Build unit
-        run: make -j4
+      # The point of this job is the compiler and the OpenSSL line, so check
+      # that the image still brings them.  configure writes the version that
+      # auto/cc/test found into NXT_COMPILER_VERSION, as
+      # "gcc version 16.2.1 ..." or "clang version 23.1.2 ...", the same
+      # string it prints.  The header is read and not the log, because the
+      # header is what the build uses; the log line is for people and a
+      # distribution is free to put its own name in front of the version, as
+      # Ubuntu does with "Ubuntu clang version".  What is compared is a floor
+      # and not an exact version: the job exists for the oldest compiler that
+      # this image is expected to carry, gcc 16 or clang 23, so a gcc 17 or a
+      # clang 24 passes, and the job comment above is what a bump updates.
+      # The name is the one the same auto/cc/test detection reported, which is
+      # gcc or clang, and the literal cc when the compiler -v output matches
+      # neither.  Fedora 45 ships no OpenSSL 3.x, and the container must
+      # report the major in FEDORA_OPENSSL_MAJOR: a 4.1 stays covered, any
+      # other major, or no version at all, fails with the version printed.
+      - name: Assert the container toolchain versions
+        run: |
+          version=$(awk -F'"' '/^#define NXT_COMPILER_VERSION/ { print $2 }' \
+                          build/include/nxt_auto_config.h)
+          if [ -z "$version" ]; then
+            echo "no NXT_COMPILER_VERSION in build/include/nxt_auto_config.h" \
+              >&2
+            exit 1
+          fi
+          case "$version" in
+            *"${{ matrix.cc }} version "*)
+              ;;
+            *)
+              echo "configure used \"$version\", not ${{ matrix.cc }}" >&2
+              exit 1
+              ;;
+          esac
+          major=$(echo "$version" | sed -n 's/.* version \([0-9][0-9]*\).*/\1/p')
+          case "$major" in
+            '' | *[!0-9]*)
+              echo "no major version in \"$version\"" >&2
+              exit 1
+              ;;
+          esac
+          case "${{ matrix.cc }}" in
+            gcc)   want=16 ;;
+            clang) want=23 ;;
+          esac
+          if [ "$major" -lt "$want" ]; then
+            echo "$version is older than the ${{ matrix.cc }} $want that this job expects" \
+              >&2
+            exit 1
+          fi
+          # Built in two steps: a line continuation inside quotes keeps its
+          # leading spaces, which would not match the header.
+          openssl="NXT_HAVE_OPENSSL_VERSION  \"OpenSSL $FEDORA_OPENSSL_MAJOR"
+          openssl="$openssl\\."
+          grep -q "$openssl" build/include/nxt_auto_config.h || {
+            grep NXT_HAVE_OPENSSL_VERSION build/include/nxt_auto_config.h \
+              >&2 || true
+            {
+              echo "configure found no OpenSSL $FEDORA_OPENSSL_MAJOR.x for"
+              echo "fedora:45"
+            } >&2
+            exit 1
+          }
+          # Print the version on every run: fedora:45 moves with Fedora
+          # updates, so the log is the record of the patch level tested.
+          grep NXT_HAVE_OPENSSL_VERSION build/include/nxt_auto_config.h
+
+      - name: Build unitd and libunit
+        run: |
+          make -j4
+          make -j4 build/lib/libunit.a
 
       - name: Build C tests
         run: make -j4 tests
 
+      - name: Check the test hooks are in the test programs only
+        run: .github/scripts/check-test-hooks.sh
+
       - name: Run C tests
-        run: sudo ./build/tests
+        run: ./build/tests
+
+      - name: Run libunit close-provenance test
+        run: ./build/unit_close_test
+
+      - name: Run libunit port_recv fd-ownership test
+        run: ./build/unit_port_recv_test
+
+      - name: Run libunit malformed port message test
+        run: ./build/unit_msg_test
+
+  # The oldest toolchain that the packages target.  pkg/rpm/Makefile builds
+  # for centos8 (RHEL 8), and AlmaLinux 8 ships the same gcc 8.5.0, OpenSSL
+  # 1.1.1k and PCRE2 10.32.  auto/ssltls requires OpenSSL 1.1.1 or later, and
+  # no other job builds against 1.1.1.  Default flags, as a package build
+  # uses.  The container runs as root, so there is no sudo.
+  c-tests-almalinux8:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+
+    container:
+      image: almalinux:8
+
+    steps:
+      # dnf already gives up on a mirror after 30 s without data (its default
+      # timeout); the step limit bounds the whole install.  It takes 15-33 s.
+      - name: Install packages
+        timeout-minutes: 5
+        run: |
+          dnf -y install --setopt=install_weak_deps=False \
+              git gcc make which binutils diffutils findutils \
+              openssl-devel pcre2-devel
+
+      - uses: actions/checkout@v7
+
+      - name: Configure unit (--openssl --tests)
+        run: ./configure --openssl --tests
+
+      # Fail if configure found another OpenSSL than the 1.1.1 floor.
+      - name: Assert configure found OpenSSL 1.1.1
+        run: |
+          grep NXT_HAVE_OPENSSL_VERSION build/include/nxt_auto_config.h
+          grep -q '#define NXT_HAVE_OPENSSL_VERSION  "OpenSSL 1\.1\.1' \
+            build/include/nxt_auto_config.h
+
+      - name: Build unitd and libunit
+        run: |
+          make -j4
+          make -j4 build/lib/libunit.a
+
+      - name: Build C tests
+        run: make -j4 tests
+
+      - name: Check the test hooks are in the test programs only
+        run: .github/scripts/check-test-hooks.sh
+
+      - name: Run C tests
+        run: ./build/tests
+
+      - name: Run libunit close-provenance test
+        run: ./build/unit_close_test
+
+      - name: Run libunit port_recv fd-ownership test
+        run: ./build/unit_port_recv_test
+
+      - name: Run libunit malformed port message test
+        run: ./build/unit_msg_test
+
+  # The middle Python versions run only in the weekly run, so its red check
+  # is easy to miss.  A scheduled failure is reported as a tracking issue,
+  # as nightly.yml, build-distros.yml and eol-check.yml do.  A manual run
+  # reports nothing: whoever started it is watching it.
+  report:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    # Every job above, so any red job of the weekly run is reported.
+    needs:
+      - prepare
+      - core
+      - test
+      - c-tests
+      - build-m32
+      - c-tests-centos6
+      - c-tests-pcre1
+      - c-tests-jit
+      - routing-jit
+      - c-tests-asan
+      - hardening-strict-fedora
+      - c-tests-almalinux8
+    if: failure() && github.event_name == 'schedule'
+    permissions:
+      issues: write
+
+    steps:
+      - name: Open or update tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # No checkout here, so gh has no git remote to infer the repository.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          title='Weekly build-test run is failing (every Python version)'
+          {
+            echo 'The weekly build-test run failed on master.  It is the only'
+            echo 'run that tests the Python versions between the oldest and the'
+            echo 'newest, so a merged change can break them unseen.'
+            echo
+            echo "Commit: ${{ github.sha }}"
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > issue-body.md
+          existing=$(gh issue list --state open --search "in:title ${title}" \
+            --json number,title --jq ".[] | select(.title == \"${title}\") | .number" | head -n1)
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body-file issue-body.md
+          else
+            gh issue create --title "${title}" --body-file issue-body.md
+          fi

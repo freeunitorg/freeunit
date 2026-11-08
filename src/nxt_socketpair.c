@@ -177,7 +177,7 @@ nxt_socketpair_send_ex(nxt_fd_event_t *ev, nxt_fd_t *fd, nxt_iobuf_t *iob,
 #endif
 
         if (nxt_fast_path(err == 0)) {
-            n = nxt_sendmsg(ev->fd, iob, niob, &oob);
+            n = nxt_sendmsg(ev->fd, iob, niob, &oob, 0);
 
             err = (n == -1) ? nxt_socket_errno : 0;
         }

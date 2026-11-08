@@ -9,6 +9,7 @@ import pytest
 
 from unit.applications.proto import ApplicationProto
 from unit.utils import waitforfiles
+from unit import port as port_map
 
 
 client = ApplicationProto()
@@ -147,6 +148,48 @@ def test_static_etag(temp_dir):
         f.write('blah')
 
     assert etag != client.get(url='/')['headers']['ETag'], 'new ETag'
+
+
+def test_static_validators_follow_file_on_one_connection(temp_dir):
+    # Each router thread keeps the Last-Modified and ETag strings of recent
+    # files, keyed by mtime and size.  One connection stays on one thread, so
+    # these requests reach that memo.  Each change of the mtime or the size
+    # must give new strings.  The mtime moves by 1024 seconds and the size by
+    # 16 bytes, so the low bits that pick a slot do not change.
+    path = f'{temp_dir}/assets/index.html'
+    mtime = int(os.stat(path).st_mtime)
+
+    def validators(sock=None):
+        kwargs = {} if sock is None else {'sock': sock}
+        resp, sock = client.get(
+            url='/index.html',
+            headers={'Host': 'localhost', 'Connection': 'keep-alive'},
+            start=True,
+            framed=True,
+            **kwargs,
+        )
+        return resp['headers']['Last-Modified'], resp['headers']['ETag'], sock
+
+    def expected(mtime, size):
+        return formatdate(mtime, usegmt=True), f'"{mtime:x}-{size:x}"'
+
+    last_modified, etag, sock = validators()
+    assert (last_modified, etag) == expected(mtime, 10), 'first'
+
+    os.utime(path, (mtime - 1024, mtime - 1024))
+    last_modified, etag, sock = validators(sock)
+    assert (last_modified, etag) == expected(mtime - 1024, 10), 'new mtime'
+
+    Path(path).write_text('0123456789abcdef0123456789', encoding='utf-8')
+    os.utime(path, (mtime - 1024, mtime - 1024))
+    last_modified, etag, sock = validators(sock)
+    assert (last_modified, etag) == expected(mtime - 1024, 26), 'new size'
+
+    os.utime(path, (mtime, mtime))
+    last_modified, etag, sock = validators(sock)
+    assert (last_modified, etag) == expected(mtime, 26), 'old mtime'
+
+    sock.close()
 
 
 def test_static_accept_ranges():
@@ -1141,7 +1184,7 @@ def test_static_buffer_reuse():
     # corrupted recycle would surface as a wrong or truncated body.
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    sock.connect(('127.0.0.1', 8080))
+    sock.connect(('127.0.0.1', port_map.port(8080)))
     sock.settimeout(5)
 
     def one_request():
@@ -1742,7 +1785,7 @@ def test_static_range_keepalive_mix(temp_dir):
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    sock.connect(('127.0.0.1', 8080))
+    sock.connect(('127.0.0.1', port_map.port(8080)))
     sock.settimeout(5)
 
     def request(extra=''):

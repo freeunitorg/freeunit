@@ -159,6 +159,7 @@ nxt_router_start_fail_soak_test(nxt_thread_t *thr)
     nxt_queue_init(&app->spare_ports);
     nxt_queue_init(&app->idle_ports);
     nxt_queue_init(&app->ack_waiting_req);
+    nxt_queue_init(&app->requeue_req);
 
     nxt_str_set(&app->name, "start-fail-soak-test");
 
@@ -219,7 +220,7 @@ nxt_router_start_fail_soak_test(nxt_thread_t *thr)
         if (app->pending_processes != baseline) {
             nxt_log_error(NXT_LOG_NOTICE, thr->log,
                           "router start fail soak test: iteration %ui site %ui "
-                          "pending_processes %uD (expected %uD)",
+                          "pending_processes %uA (expected %uD)",
                           i, site + 1, app->pending_processes, baseline);
             goto done;
         }
@@ -251,7 +252,7 @@ nxt_router_start_fail_soak_test(nxt_thread_t *thr)
     if (!nxt_router_app_can_start(app)) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start fail soak test: app cannot start after "
-                      "%d failures, processes %uD pending %uD",
+                      "%d failures, processes %uA pending %uA",
                       NXT_ROUTER_START_FAIL_SOAK_N, app->processes,
                       app->pending_processes);
         goto done;
@@ -270,7 +271,7 @@ nxt_router_start_fail_soak_test(nxt_thread_t *thr)
     if (app->pending_processes != 1 || joint->use_count != 2) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start fail soak test: successful start left "
-                      "pending %uD joint %uD (expected 1 and 2)",
+                      "pending %uA joint %uD (expected 1 and 2)",
                       app->pending_processes, joint->use_count);
         goto done;
     }
@@ -285,7 +286,7 @@ nxt_router_start_fail_soak_test(nxt_thread_t *thr)
 
     if (app->pending_processes != 0 || joint->use_count != 1) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
-                      "router start fail soak test: release left pending %uD "
+                      "router start fail soak test: release left pending %uA "
                       "joint %uD (expected 0 and 1)",
                       app->pending_processes, joint->use_count);
         goto done;

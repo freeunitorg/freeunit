@@ -12,6 +12,7 @@
 #include <nxt_router.h>
 #include <nxt_port_queue.h>
 #include <nxt_checked.h>
+#include <nxt_span.h>
 #if (NXT_TLS)
 #include <nxt_cert.h>
 #endif
@@ -48,6 +49,9 @@ typedef struct {
     nxt_uint_t            ahead;      /* Queued jobs older than "pending". */
     nxt_main_store_job_t  *jobs;      /* The jobs that wait, in order. */
     nxt_bool_t            controller; /* Start it when the store ends. */
+    nxt_pid_t             reply_pid;  /* The controller that waits, or 0. */
+    nxt_port_id_t         reply_port;
+    uint32_t              stream;
 } nxt_main_store_t;
 
 
@@ -76,6 +80,10 @@ static void nxt_main_port_modules_handler(nxt_task_t *task,
 static int nxt_cdecl nxt_app_lang_compare(const void *v1, const void *v2);
 static void nxt_main_process_whoami_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
+static nxt_int_t nxt_main_process_whoami_ready(nxt_task_t *task,
+    nxt_port_t *port, uint32_t stream, nxt_buf_t *buf);
+static void nxt_main_process_whoami_refuse(nxt_task_t *task, nxt_fd_t fd,
+    nxt_port_recv_msg_t *msg, nxt_process_t *pprocess);
 #if (NXT_USE_CMSG_PID)
 static void nxt_main_process_name_child(nxt_task_t *task,
     nxt_process_t *pprocess, nxt_process_t *process, nxt_pid_t ns_pid);
@@ -95,6 +103,7 @@ static nxt_int_t nxt_main_store_job_run(nxt_task_t *task,
     nxt_main_store_job_t *job);
 static void nxt_main_store_job_done(nxt_task_t *task,
     nxt_main_store_job_t *job, nxt_int_t ret);
+static void nxt_main_store_reply(nxt_task_t *task, nxt_int_t ret);
 static void nxt_main_store_close_fds(void);
 #if (NXT_LINUX)
 static nxt_int_t nxt_main_store_close_proc_fds(void);
@@ -114,6 +123,7 @@ static void nxt_main_port_access_log_handler(nxt_task_t *task,
 #if (NXT_TESTS)
 static nxt_uint_t  nxt_main_test_process_new_failure_count;
 static nxt_msec_t  nxt_main_test_store_delay;
+static nxt_uint_t  nxt_main_test_whoami_ready_failure_count;
 
 
 void
@@ -801,6 +811,17 @@ nxt_main_test_run_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
 
 /*
+ * Make the next "failures" RPC_READY replies to WHOAMI fail before they are
+ * written, as a failed nxt_port_socket_write() does.
+ */
+void
+nxt_main_test_whoami_ready_failures(nxt_uint_t failures)
+{
+    nxt_main_test_whoami_ready_failure_count = failures;
+}
+
+
+/*
  * Let src/test/nxt_main_store_test.c drive the state store.  The delay
  * makes each store child sleep before it stores, so that the test can act
  * while the child runs.  The test reaps the child with waitpid() and
@@ -938,13 +959,220 @@ nxt_main_process_created_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 }
 
 
+/*
+ * The gate of the main port, as nxt_router_gates[] is the gate of the
+ * router main port.  Every child gets a copy of the main port socket, so
+ * any process can write to it.
+ *
+ * NEW_PORT and REMOVE_PID change the records of another process, and only
+ * a prototype sends them here, for a worker that it forked.  It announces
+ * the main port of the worker (nxt_port_process_ready_handler()) and
+ * reports its exit (nxt_proto_child_exited()).  Main forks every other
+ * process itself, so nothing else sends these two types to main.
+ *
+ * Thus the sender must be a registered prototype, and the process that the
+ * message names must be a child of that prototype.  NEW_PORT must also be
+ * for an application port that main has already.  Main links a worker to
+ * its prototype and creates the port of the worker when it gets the WHOAMI
+ * of the worker (nxt_main_process_whoami_handler()).  The worker sends
+ * PROCESS_READY to the prototype only after the reply, so the link and the
+ * port are there when the NEW_PORT comes.  The NEW_PORT only brings the
+ * queue of the port.
+ *
+ * A prototype can exit before main reads its last messages, and a worker
+ * can exit before its WHOAMI.  Thus a sender or a process that main has no
+ * record of is dropped without an alert.
+ */
+
+#if (NXT_TESTS)
+static nxt_uint_t  nxt_main_test_port_msgs_dropped;
+static nxt_uint_t  nxt_main_test_port_msgs_alerted;
+#endif
+
+
+/* The record of a live process; a record with no ports is on its way out. */
+
+static nxt_process_t *
+nxt_main_process_live(nxt_runtime_t *rt, nxt_pid_t pid)
+{
+    nxt_process_t  *process;
+
+    process = nxt_runtime_process_find(rt, pid);
+
+    if (process == NULL || nxt_queue_is_empty(&process->ports)) {
+        return NULL;
+    }
+
+    return process;
+}
+
+
+static nxt_bool_t
+nxt_main_process_is_child(nxt_process_t *pprocess, nxt_pid_t pid)
+{
+    nxt_process_t  *child;
+
+    nxt_queue_each(child, &pprocess->children, nxt_process_t, link) {
+
+        if (child->pid == pid) {
+            return 1;
+        }
+
+    } nxt_queue_loop;
+
+    return 0;
+}
+
+
+/* Reads the body; gives the pid it names, or the reason to refuse it. */
+
+static const char *
+nxt_main_gate_new_port(nxt_port_recv_msg_t *msg,
+    nxt_port_msg_new_port_t *new_port, nxt_pid_t *pid)
+{
+    if (nxt_slow_path(nxt_port_new_port_msg(msg, new_port) != NXT_OK)) {
+        return "short or bad new port message";
+    }
+
+    if (nxt_slow_path(new_port->type != NXT_PROCESS_APP)) {
+        return "not an application port";
+    }
+
+    *pid = new_port->pid;
+
+    return NULL;
+}
+
+
+static const char *
+nxt_main_gate_remove_pid(nxt_port_recv_msg_t *msg, nxt_pid_t *pid)
+{
+    nxt_span_t  span;
+
+    if (nxt_slow_path(msg->buf == NULL)) {
+        return "bad remove pid message";
+    }
+
+    nxt_span_init(&span, msg->buf->mem.pos, msg->buf->mem.free);
+
+    /* nxt_port_remove_pid_handler() expects the pid and nothing more. */
+
+    if (nxt_slow_path(nxt_span_copy(&span, pid, sizeof(nxt_pid_t)) != 0
+                      || nxt_span_len(&span) != 0))
+    {
+        return "bad remove pid message";
+    }
+
+    return NULL;
+}
+
+
+static void
+nxt_main_gate_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_pid_t                pid, sender;
+    nxt_bool_t               remove_pid;
+    const char               *reason;
+    nxt_runtime_t            *rt;
+    nxt_process_t            *pprocess;
+    nxt_port_msg_new_port_t  new_port;
+
+    /* GCC 4.4 does not see that the helpers set pid before it is read. */
+    pid = 0;
+
+    rt = task->thread->runtime;
+
+    sender = nxt_recv_msg_cmsg_pid(msg);
+
+    /* Unreferenced: the main process runs a single engine. */
+
+    pprocess = nxt_main_process_live(rt, sender);
+
+    if (pprocess == NULL) {
+        nxt_debug(task, "message type %uD from process %PI, which main has "
+                  "no record of; dropped", (uint32_t) msg->port_msg.type,
+                  sender);
+#if (NXT_TESTS)
+        nxt_main_test_port_msgs_dropped++;
+#endif
+        goto refused;
+    }
+
+    if (nxt_slow_path(nxt_process_type(pprocess) != NXT_PROCESS_PROTOTYPE)) {
+        reason = "not a prototype";
+        goto alert;
+    }
+
+    remove_pid = (msg->port_msg.type == _NXT_PORT_MSG_REMOVE_PID);
+
+    reason = remove_pid ? nxt_main_gate_remove_pid(msg, &pid)
+                        : nxt_main_gate_new_port(msg, &new_port, &pid);
+
+    if (nxt_slow_path(reason != NULL)) {
+        goto alert;
+    }
+
+    if (nxt_slow_path(!nxt_main_process_is_child(pprocess, pid))) {
+        if (nxt_main_process_live(rt, pid) == NULL) {
+            nxt_debug(task, "message type %uD from process %PI names process "
+                      "%PI, which main has no record of; dropped",
+                      (uint32_t) msg->port_msg.type, sender, pid);
+#if (NXT_TESTS)
+            nxt_main_test_port_msgs_dropped++;
+#endif
+            goto refused;
+        }
+
+        reason = "not a child of the sender";
+        goto alert_pid;
+    }
+
+    if (remove_pid) {
+        nxt_port_remove_pid_handler(task, msg);
+        return;
+    }
+
+    if (nxt_slow_path(nxt_runtime_port_find(rt, new_port.pid, new_port.id)
+                      == NULL))
+    {
+        reason = "not a port that main has";
+        goto alert_pid;
+    }
+
+    nxt_main_new_port_handler(task, msg);
+    return;
+
+alert_pid:
+
+    nxt_alert(task, "process %PI sent message type %uD naming process %PI; "
+              "refused: %s", sender, (uint32_t) msg->port_msg.type, pid,
+              reason);
+    goto alerted;
+
+alert:
+
+    nxt_alert(task, "process %PI sent message type %uD; refused: %s", sender,
+              (uint32_t) msg->port_msg.type, reason);
+
+alerted:
+
+#if (NXT_TESTS)
+    nxt_main_test_port_msgs_alerted++;
+#endif
+
+refused:
+
+    nxt_port_recv_msg_close_fds(msg);
+}
+
+
 static nxt_port_handlers_t  nxt_main_process_port_handlers = {
     .data             = nxt_main_data_handler,
-    .new_port         = nxt_main_new_port_handler,
+    .new_port         = nxt_main_gate_handler,
     .process_created  = nxt_main_process_created_handler,
     .process_ready    = nxt_port_process_ready_handler,
     .whoami           = nxt_main_process_whoami_handler,
-    .remove_pid       = nxt_port_remove_pid_handler,
+    .remove_pid       = nxt_main_gate_handler,
 #if (NXT_USE_CMSG_PID)
     .remove_child_pid = nxt_main_remove_child_pid_handler,
 #endif
@@ -967,6 +1195,40 @@ static nxt_port_handlers_t  nxt_main_process_port_handlers = {
     .rpc_ready        = nxt_port_rpc_handler,
     .rpc_error        = nxt_port_rpc_handler,
 };
+
+
+#if (NXT_TESTS)
+
+/*
+ * Lets src/test/nxt_main_port_gate_test.c send a message through the
+ * handler table of the main port, as nxt_port_handler() does.
+ */
+void
+nxt_main_test_run_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_port_handler_t  handler;
+
+    handler = ((const nxt_port_handler_t *)
+               &nxt_main_process_port_handlers)[msg->port_msg.type];
+
+    handler(task, msg);
+}
+
+
+nxt_uint_t
+nxt_main_test_port_dropped(void)
+{
+    return nxt_main_test_port_msgs_dropped;
+}
+
+
+nxt_uint_t
+nxt_main_test_port_alerted(void)
+{
+    return nxt_main_test_port_msgs_alerted;
+}
+
+#endif
 
 
 #if (NXT_USE_CMSG_PID)
@@ -1027,11 +1289,16 @@ nxt_main_process_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
     nxt_buf_t      *buf;
     nxt_pid_t      pid, ppid;
+    nxt_bool_t     taken, replied;
     nxt_port_t     *port;
     nxt_runtime_t  *rt;
-    nxt_process_t  *pprocess;
+    nxt_process_t  *pprocess, *process;
 
     nxt_assert(msg->port_msg.reply_port == 0);
+
+    taken = 0;
+
+    pprocess = NULL;
 
     if (nxt_slow_path(msg->buf == NULL
         || nxt_buf_used_size(msg->buf) != sizeof(nxt_pid_t)))
@@ -1096,6 +1363,22 @@ nxt_main_process_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
             nxt_alert(task, "whoami: process %PI sent WHOAMI again", pid);
             goto fail;
         }
+
+        /*
+         * nxt_runtime_process_port_create() below reuses a record that
+         * exists for this pid.  If that record is still in a "children"
+         * queue, the insert below would link it twice.  No way to reach
+         * this state is known.  The check makes the invariant hold in a
+         * release build too, where the nxt_assert() below is compiled out.
+         */
+
+        process = nxt_runtime_process_find(rt, pid);
+
+        if (nxt_slow_path(process != NULL && process->link.next != NULL)) {
+            nxt_alert(task, "whoami: process %PI is already a child of "
+                      "a prototype", pid);
+            goto fail;
+        }
     }
 
     if (msg->fd[0] != -1) {
@@ -1110,6 +1393,7 @@ nxt_main_process_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         port->pair[0] = -1;
         port->pair[1] = msg->fd[0];
         msg->fd[0] = -1;
+        taken = 1;
 
         port->max_size = 16 * 1024;
         port->max_share = 64 * 1024;
@@ -1136,26 +1420,49 @@ nxt_main_process_whoami_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 #endif
     }
 
+    replied = 0;
+
     buf = nxt_buf_mem_alloc(task->thread->engine->mem_pool,
                             sizeof(nxt_pid_t), 0);
-    if (nxt_slow_path(buf == NULL)) {
-        goto fail;
+
+    if (nxt_fast_path(buf != NULL)) {
+        buf->mem.free = nxt_cpymem(buf->mem.free, &pid, sizeof(nxt_pid_t));
+
+        if (nxt_fast_path(nxt_main_process_whoami_ready(task, port,
+                                                        msg->port_msg.stream,
+                                                        buf)
+                          == NXT_OK))
+        {
+            replied = 1;
+
+        } else {
+            /* Still ours: the port layer takes the buffer only on NXT_OK. */
+
+            nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                               buf->completion_handler, task, buf,
+                               buf->parent);
+        }
     }
 
-    buf->mem.free = nxt_cpymem(buf->mem.free, &pid, sizeof(nxt_pid_t));
-
-    if (nxt_slow_path(nxt_port_socket_write(task, port,
-                                            NXT_PORT_MSG_RPC_READY_LAST, -1,
-                                            msg->port_msg.stream, 0, buf)
-                      != NXT_OK))
-    {
-        /* Still ours: the port layer takes the buffer only on NXT_OK. */
-
-        nxt_work_queue_add(&task->thread->engine->fast_work_queue,
-                           buf->completion_handler, task, buf, buf->parent);
+    /*
+     * The worker waits for a reply on the port that main took.  If no
+     * RPC_READY went out, send it RPC_ERROR there, as for a refusal.
+     */
+    if (nxt_slow_path(!replied && taken)) {
+        nxt_main_process_whoami_refuse(task, port->pair[1], msg, pprocess);
     }
 
 fail:
+
+    /*
+     * An accepted WHOAMI has taken its descriptor or never had one.  So a
+     * descriptor still here means the message was refused.  The sender
+     * waits for the reply on the other end of that socket, and closing our
+     * copy does not wake it: the sender holds a copy too.  So tell it.
+     */
+    if (msg->fd[0] != -1) {
+        nxt_main_process_whoami_refuse(task, msg->fd[0], msg, pprocess);
+    }
 
     /*
      * Close both descriptors: WHOAMI carries one, but a compromised sender
@@ -1163,6 +1470,100 @@ fail:
      * leak a descriptor of the main process on every forged message.
      */
     nxt_port_recv_msg_close_fds(msg);
+}
+
+
+static nxt_int_t
+nxt_main_process_whoami_ready(nxt_task_t *task, nxt_port_t *port,
+    uint32_t stream, nxt_buf_t *buf)
+{
+#if (NXT_TESTS)
+    if (nxt_slow_path(nxt_main_test_whoami_ready_failure_count != 0)) {
+        nxt_main_test_whoami_ready_failure_count--;
+        return NXT_ERROR;
+    }
+#endif
+
+    return nxt_port_socket_write(task, port, NXT_PORT_MSG_RPC_READY_LAST, -1,
+                                 stream, 0, buf);
+}
+
+
+/*
+ * Answer a refused WHOAMI with RPC_ERROR on the descriptor that came with
+ * it, or on the port taken from it if the reply could not be sent.  The sender has registered the stream, so its error handler runs, and
+ * it logs the refusal and exits.
+ *
+ * The sender is not trusted, and it chooses both the descriptor and the
+ * stream.  A message that main writes passes every sender check of the
+ * receiver.  So an application could attach its copy of the router's port
+ * and make main fail a router RPC.  The answer is sent only if the socket
+ * was created by the prototype that the message names, as a worker's port
+ * is (nxt_process_start()).  Elsewhere the sender is not told.
+ *
+ * The message is one header with no payload, sent once and not queued: the
+ * descriptor is not a port of main, and it is closed right after this call.
+ * The send does not block, so that a sender cannot stall main.  If the send
+ * fails, the sender is not told; main logs that.
+ */
+
+static void
+nxt_main_process_whoami_refuse(nxt_task_t *task, nxt_fd_t fd,
+    nxt_port_recv_msg_t *msg, nxt_process_t *pprocess)
+{
+    ssize_t         n;
+    nxt_port_msg_t  pm;
+#if (NXT_HAVE_UCRED)
+    socklen_t       len;
+    struct ucred    cred;
+#endif
+
+    if (pprocess == NULL
+        || nxt_process_type(pprocess) != NXT_PROCESS_PROTOTYPE)
+    {
+        return;
+    }
+
+#if (NXT_HAVE_UCRED)
+    len = sizeof(struct ucred);
+
+    /*
+     * SO_PEERCRED names the process that called socketpair(), not the
+     * process that holds the socket.  That is enough because a worker holds
+     * exactly one socketpair end that the prototype created: its own port.
+     * nxt_process_child_fixup() closes the ports of the sibling workers in
+     * a new worker, and its other ports come from main and the router.
+     */
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0
+        || len != sizeof(struct ucred)
+        || cred.pid != pprocess->pid)
+    {
+        nxt_log(task, NXT_LOG_WARN, "whoami: process %PI sent a socket "
+                "that its prototype did not create", msg->port_msg.pid);
+        return;
+    }
+#else
+    return;
+#endif
+
+    nxt_memzero(&pm, sizeof(nxt_port_msg_t));
+
+    pm.stream = msg->port_msg.stream;
+    pm.pid = nxt_pid;
+    pm.type = _NXT_PORT_MSG_RPC_ERROR;
+    pm.last = 1;
+
+    /*
+     * MSG_DONTWAIT, not O_NONBLOCK: the sender shares the file status flags
+     * and could clear O_NONBLOCK.  The receiver sets SO_PASSCRED, so the
+     * kernel adds main's credentials.
+     */
+    n = send(fd, &pm, sizeof(nxt_port_msg_t), MSG_DONTWAIT);
+
+    if (nxt_slow_path(n != (ssize_t) sizeof(nxt_port_msg_t))) {
+        nxt_log(task, NXT_LOG_WARN, "whoami: the refusal was not sent to "
+                "process %PI", msg->port_msg.pid);
+    }
 }
 
 
@@ -2214,6 +2615,7 @@ nxt_main_port_conf_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
     void           *p;
     size_t         size;
+    uint32_t       stream;
     nxt_port_t     *ctl_port;
     nxt_runtime_t  *rt;
 
@@ -2237,6 +2639,8 @@ nxt_main_port_conf_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         nxt_port_recv_msg_close_fds(msg);
         return;
     }
+
+    stream = msg->port_msg.stream;
 
     p = MAP_FAILED;
 
@@ -2270,6 +2674,18 @@ nxt_main_port_conf_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     nxt_debug(task, "conf_store_handler(%uz): %*s", size, size, p);
 
+    /*
+     * The controller answers the client only when this store ends, so it
+     * waits for the answer.  A second store cannot wait: the controller
+     * postpones the next request until it has this answer.  Answer that
+     * impossible waiter rather than leaving it waiting for ever.
+     */
+    nxt_main_store_reply(task, NXT_ERROR);
+
+    nxt_main_store.reply_pid = ctl_port->pid;
+    nxt_main_store.reply_port = ctl_port->id;
+    nxt_main_store.stream = stream;
+
     /* The scheduler owns the mapping from here on. */
     nxt_main_store_schedule(task, p, size);
 
@@ -2286,6 +2702,11 @@ error:
     if (msg->fd[0] != -1) {
         nxt_fd_close(msg->fd[0]);
         msg->fd[0] = -1;
+    }
+
+    if (stream != 0) {
+        (void) nxt_port_socket_write(task, ctl_port, NXT_PORT_MSG_RPC_ERROR,
+                                     -1, stream, 0, NULL);
     }
 }
 
@@ -2686,6 +3107,40 @@ nxt_main_store_job_run(nxt_task_t *task, nxt_main_store_job_t *job)
 
 
 /*
+ * Answer the controller that waits for the conf.json store, if one does.
+ * The controller holds the answer of a configuration PUT until this
+ * message arrives, so a 200 means that the configuration is on the disk.
+ * A return of "ret" other than NXT_OK says that it is not, and that a
+ * restart loads the configuration before it.
+ */
+static void
+nxt_main_store_reply(nxt_task_t *task, nxt_int_t ret)
+{
+    nxt_port_t  *port;
+
+    if (nxt_main_store.reply_pid == 0) {
+        return;
+    }
+
+    port = nxt_runtime_port_find(task->thread->runtime,
+                                 nxt_main_store.reply_pid,
+                                 nxt_main_store.reply_port);
+
+    if (port != NULL) {
+        (void) nxt_port_socket_write(task, port,
+                                     (ret == NXT_OK)
+                                         ? NXT_PORT_MSG_RPC_READY_LAST
+                                         : NXT_PORT_MSG_RPC_ERROR,
+                                     -1, nxt_main_store.stream, 0, NULL);
+    }
+
+    nxt_main_store.reply_pid = 0;
+    nxt_main_store.reply_port = 0;
+    nxt_main_store.stream = 0;
+}
+
+
+/*
  * Log a failed job, answer the sender and free the job.  Main logs the
  * failure: the alerts of the child can go to a rotated log, because
  * SIGUSR1 reopens the log in main only.  A sender that has gone has no
@@ -2930,13 +3385,24 @@ nxt_main_store_exited(nxt_task_t *task, nxt_pid_t pid, int status)
             nxt_conf_ver = NXT_VERNUM;
         }
 
+        nxt_main_store_reply(task, NXT_OK);
+
     } else if (nxt_main_store_cancelled(pid, status)) {
         nxt_debug(task, "state store child %PI stopped, a newer store follows",
                   pid);
 
+        /*
+         * Main killed it to store a newer configuration instead, so this
+         * one may or may not be on the disk.  The controller cannot be
+         * told that it is, and unitd is exiting.
+         */
+        nxt_main_store_reply(task, NXT_ERROR);
+
     } else {
         nxt_alert(task, "state store child %PI failed, "
                   "the configuration was not stored", pid);
+
+        nxt_main_store_reply(task, NXT_ERROR);
     }
 
     nxt_main_store.pid = 0;

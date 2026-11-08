@@ -65,7 +65,7 @@ jobs:
     # future tool is covered the moment it is committed.  Passing it to the
     # audit job also makes that a matrix, so every failing lock is reported,
     # not just the first.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     outputs:
       locks: ${{ steps.list.outputs.locks }}
@@ -82,7 +82,7 @@ jobs:
 
   audit:
     needs: locks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -96,7 +96,7 @@ jobs:
       # Prebuilt binary instead of `cargo install cargo-audit`, which would
       # compile it from source on every run.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: cargo-audit
 
@@ -114,7 +114,7 @@ jobs:
     # library, so check-lock-audit.py fails only on a finding against a crate
     # that library actually links, and only when the allowlist does not carry
     # a reason for that exact version.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -130,7 +130,7 @@ jobs:
           python3 -m pytest pkg/contrib/test_check_lock_audit.py
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: cargo-audit
 

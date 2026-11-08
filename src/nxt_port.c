@@ -214,7 +214,7 @@ nxt_port_use_unless_zero(nxt_port_t *port)
     nxt_atomic_int_t  c;
 
     for ( ;; ) {
-        c = port->use_count;
+        c = nxt_atomic_load(&port->use_count);
 
         if (c <= 0) {
             return 0;
@@ -286,7 +286,7 @@ nxt_port_release(nxt_task_t *task, nxt_port_t *port)
          * before the unlink takes the mutex and fails the try-ref, and every
          * reader after it cannot reach the port at all.
          *
-         * rt->processes_mutex must stay a leaf (src/nxt_process.c:150), so
+         * rt->processes_mutex must stay a leaf (see nxt_process_use()), so
          * the process reference is dropped after the unlock:
          * nxt_process_use() takes the same mutex itself.
          */
@@ -337,7 +337,17 @@ void
 nxt_port_enable(nxt_task_t *task, nxt_port_t *port,
     const nxt_port_handlers_t *handlers)
 {
-    port->pid = nxt_pid;
+    /*
+     * The engine's port already carries this pid: it is created with it on
+     * the main thread and published to rt->ports before the engine starts,
+     * and the main thread can be looking it up while this thread runs.  A
+     * redundant store would race that lookup's read, so store a pid only
+     * when it is not there yet.
+     */
+    if (port->pid != nxt_pid) {
+        port->pid = nxt_pid;
+    }
+
     port->handler = nxt_port_handler;
     port->data = (nxt_port_handler_t *) (handlers);
 
@@ -362,7 +372,9 @@ nxt_port_enable(nxt_task_t *task, nxt_port_t *port,
  * nxt_main_process_created_handler(), nxt_main_start_process_handler(),
  * nxt_port_process_ready_handler(), nxt_proto_process_created_handler(),
  * nxt_proto_start_process_handler() and the cert/script/socket/
- * access-log handlers already are.
+ * access-log handlers already are.  NEW_PORT and REMOVE_PID on the main
+ * port go through nxt_main_gate_handler(), as the router main port goes
+ * through nxt_router_gates[].
  *
  * What is left is the table-driven part: a per-message-type sender
  * ACL applied here, in the dispatcher, so that a handler which
@@ -410,13 +422,6 @@ nxt_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
      * no handler.  Nothing runs to take the descriptors it attached.
      */
     nxt_port_recv_msg_close_fds(msg);
-}
-
-
-void
-nxt_port_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
-{
-    nxt_runtime_quit(task, 0);
 }
 
 
@@ -561,7 +566,9 @@ nxt_port_send_port(nxt_task_t *task, nxt_port_t *port, nxt_port_t *new_port,
 /*
  * Copies the body of a NEW_PORT message.  The sender sets the size.  A body
  * shorter than nxt_port_msg_new_port_t is an error: the missing bytes would
- * come from an earlier message in the same buffer.
+ * come from an earlier message in the same buffer.  The sender also sets the
+ * type, and the receiver uses it as an index of rt->port_by_type[] and of
+ * nxt_proc_send_matrix[], so a type out of range is an error too.
  */
 
 nxt_int_t
@@ -577,6 +584,10 @@ nxt_port_new_port_msg(const nxt_port_recv_msg_t *msg,
     nxt_span_init(&span, msg->buf->mem.pos, msg->buf->mem.free);
 
     if (nxt_slow_path(nxt_span_copy(&span, out, sizeof(*out)) != 0)) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_slow_path((nxt_uint_t) out->type >= NXT_PROCESS_MAX)) {
         return NXT_ERROR;
     }
 
@@ -603,8 +614,8 @@ nxt_port_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     msg->new_port_created = 0;
 
     if (nxt_slow_path(nxt_port_new_port_msg(msg, &new_port_msg) != NXT_OK)) {
-        nxt_alert(task, "process %PI sent a short new port message; refused",
-                  msg->port_msg.pid);
+        nxt_alert(task, "process %PI sent a short or bad new port message; "
+                  "refused", msg->port_msg.pid);
 
         nxt_port_recv_msg_close_fds(msg);
         return;
@@ -1388,13 +1399,6 @@ nxt_port_remove_pid(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 }
 
 
-void
-nxt_port_empty_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
-{
-    nxt_debug(task, "port empty handler");
-}
-
-
 typedef struct {
     nxt_work_t               work;
     nxt_port_t               *port;
@@ -1539,7 +1543,7 @@ nxt_port_use(nxt_task_t *task, nxt_port_t *port, int i)
      */
 
     for ( ;; ) {
-        c = port->use_count;
+        c = nxt_atomic_load(&port->use_count);
 
         if (c != -i) {
             nxt_assert(c > -i);

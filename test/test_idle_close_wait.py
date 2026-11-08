@@ -19,11 +19,12 @@ import time
 import pytest
 
 from unit.applications.proto import ApplicationProto
+from unit import port as port_map
 
 client = ApplicationProto()
 
 _FIN_COUNT = 10
-_PORT = 8080
+_PORT = port_map.port(8080)
 _TCP_CLOSE_WAIT = 8  # Linux kernel state value
 
 # Grace period for CLOSE_WAIT to drain.  Must be well below idle_timeout so

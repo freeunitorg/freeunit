@@ -78,8 +78,8 @@ nxt_wasmtime_update_baddr(nxt_wasm_ctx_t *ctx, wasmtime_context_t *wctx)
  * answer then.  Before nxt_wasmtime_init_memory() it also has no handle for
  * the memory.  An import that needs a request traps in that case.  The host
  * serves a request only after nxt_wasmtime_init() succeeds, so a request
- * implies a memory handle.  The host does not clear ctx->req after a
- * request, so this check does not show that a request is still live.
+ * implies a memory handle.  The host clears ctx->req when the request
+ * completes, so NULL means no live request.
  */
 static wasm_trap_t *
 nxt_wasmtime_check_request(const nxt_wasm_ctx_t *ctx, const char *msg)

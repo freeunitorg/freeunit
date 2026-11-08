@@ -16,6 +16,7 @@ import pytest
 from unit.applications.lang.python import ApplicationPython
 from unit.applications.tls import ApplicationTLS
 from unit.option import option
+from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'any'}}
 
@@ -63,7 +64,7 @@ def setup_method_fixture():
 
 
 def connect(port=8080, wrap=None):
-    sock = socket.create_connection(('127.0.0.1', port))
+    sock = socket.create_connection(('127.0.0.1', port_map.port(port)))
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     if wrap is not None:
@@ -241,7 +242,7 @@ def test_expect_continue_proxy():
     """The router meets the expectation, so a proxied upstream does not get
     the field.  An application gets it."""
 
-    for port, seen in ((8082, True), (8081, False)):
+    def check(port, seen):
         with connect(port) as sock:
             sock.sendall(head(extra='Connection: close\r\n'))
 
@@ -254,6 +255,9 @@ def test_expect_continue_proxy():
 
             names = fields['all-headers'].split(',')
             assert ('HTTP_EXPECT' in names) == seen, f'{port}: {names}'
+
+    check(port=8082, seen=True)
+    check(port=8081, seen=False)
 
 
 def test_expect_continue_tls():

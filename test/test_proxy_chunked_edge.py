@@ -18,6 +18,7 @@ import pytest
 
 from unit.applications.proto import ApplicationProto
 from unit.utils import waitforsocket
+from unit import port as port_map
 
 client = ApplicationProto()
 
@@ -28,8 +29,8 @@ EDGE_LEN = 40
 EXPECTED_BODY = (PATTERN * (EDGE_LEN // len(PATTERN) + 1))[:EDGE_LEN]
 
 # Reserved fake_upstream ports (see test/fake_upstream/README.md).
-UPSTREAM_CHUNKED_TRAILER_PORT = 7986
-UPSTREAM_CHUNKED_EXT_PORT = 7985
+UPSTREAM_CHUNKED_TRAILER_PORT = port_map.port(7986)
+UPSTREAM_CHUNKED_EXT_PORT = port_map.port(7985)
 
 FAKE_UPSTREAM_BIN = '/usr/local/bin/fake_upstream'
 

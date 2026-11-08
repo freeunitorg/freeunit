@@ -10,32 +10,44 @@ You should create a new branch for doing this work. E.g.
 
 # Create a set of commits
 
-## unitctl
+## Set the version
 
-Create a commit that updates the version of tools/unitctl. There are a
-few places where this needs updating, find them with
+    $ tools/bump-version.sh X.Y.Z
 
-    $ grep -rn x.y.z tools/unitctl/
+This is the one way to set the version.  The files that carry it are
+listed in `.github/scripts/version-sites`, and the script reads that list.
+It sets the version in the `version` file (`NXT_VERSION` and
+`NXT_VERNUM`), the title of `docs/unit-openapi.yaml`, the three unitctl
+crates and their `Cargo.lock` entries, `tools/unitctl/openapi-config.json`
+and `tools/unitctl/unit-openapi/README.md`.  It regenerates the
+Dockerfiles in pkg/docker with `make -B dockerfiles`, and sets the default
+of `UNIT_VERSION` in the three hand-written files in pkg/docker/local/.
 
-See 3144710fe for an example.
+It then runs `.github/scripts/check-version.sh`, which names what still
+needs a person: docs/changes.xml, CHANGES, the unitctl CHANGELOG and
+SECURITY.md (see below).  Edit those, run the check again until it
+passes, and commit.  The script does not commit.  The same check runs on
+every pull request, on every push to master and on the release tag.
 
-## unit-openapi.yaml
+Earlier releases made one commit per file by hand (3144710fe for
+unitctl, 4d627c8f8 for unit-openapi.yaml, f7771378f for the Dockerfiles);
+do not edit those files by hand any more.
 
-Create a commit that updates the version in docs/unit-openapi.yaml
+If pkg/eol.json dropped a runtime version, `make dockerfiles` no longer
+writes its Dockerfile, and check-version.sh names the file that is left
+over; `git rm` it.
 
-See 4d627c8f8 for an example.
+## unitctl CHANGELOG
 
-## Dockerfiles
+Add a `## [X.Y.Z]` section and its `[X.Y.Z]:` link to
+tools/unitctl/CHANGELOG.md.
 
-Create a commit that generates new dockerfiles.
+## SECURITY.md
 
-    $ cd pkg/docker
-    $ make clean
-    $ make dockerfiles
-
-    $ git rm/add as required
-
-See f7771378f for an example.
+For a new minor release, make its `X.Y.x` row `✅ Active` and mark the
+previous line EOL, or `✅ LTS` if it becomes a long-term line; one row
+says Active.  A patch release of a line that is already Active or LTS
+needs no change.
 
 ## changes.xml
 
@@ -44,18 +56,41 @@ Create a commit that updates the docs/changes.xml for this release.
 As well as adding the various entries also update the 'date' and 'time'
 fields.
 
-## Update the CHANGES file
+Each entry is a `<change>` with a `type` of bugfix, feature, change,
+security or workaround, and one or more `<para>` elements.  A paragraph
+becomes a paragraph of the changelog, so use a second `<para>` for the
+paragraphs of one entry that stand apart.
 
-CHANGES is maintained by hand: every changelog commit adds its entry to
-both docs/changes.xml and CHANGES.  For the release, retitle the top block
-and set its date, keeping the leading blank line and the column the date
-sits in:
+## The CHANGES file
 
-    Changes with FreeUnit X.Y.Z                                     DD Mon YYYY
+The CHANGES file in the root of the tree is generated from
+docs/changes.xml:
 
-Do not regenerate it with `make -C docs/ changes`: the generator titles the
-block "Changes with Unit" and wraps every entry differently from the file
-in the tree, so the result is a rewrite rather than an update.
+    $ make -C docs changes
+
+It writes build/CHANGES and copies it over CHANGES.  Never edit CHANGES by
+hand: edit docs/changes.xml and run the command again.  A hand edit is lost
+the next time the file is generated, and the two files diverge.
+
+The CI job "Check the generated files" runs "make -C docs check" and compares
+the generated file with the committed one.  The job fails when the two differ.
+Run the target before the release commit.
+
+The packager of a stanza names the product in the title.  A stanza packed
+by "FreeUnit Packaging" is titled "Changes with FreeUnit X.Y.Z".  Any other
+packager is titled "Changes with Unit X.Y.Z".
+The date of a block comes from the 'date' and 'time' fields of its stanza.
+
+The stylesheet that renders the file, docs/changes.xslt, is the compiled
+form of docs/changes.xsls.  xslscript.pl, which compiles it, is not
+packaged in most distributions, so the compiled file is committed and the
+two must be changed together.  If xslscript.pl is at hand, "make -C docs
+xslt XSLS=/path/to/xslscript.pl" rebuilds it.
+
+The target "make -C docs stylesheet-check" compares the named templates of
+the two files.  It fails when they differ.  The compiler is not available in
+most environments, so the target cannot compare the body of a template.
+Run it after a change to either file.
 
 
 # Merge it
@@ -108,10 +143,12 @@ source/CHANGES.txt
 
 # Post release
 
-Immediately after release we should bump the version of Unit by editing
-the version file and docs/changes.xml to add a new changes header.
+Immediately after release we should open the next version: add a new
+changes header to docs/changes.xml and CHANGES.  Run
+`tools/bump-version.sh` for the new version only when the release is
+prepared, as above.
 
-See e67d74332 for an example.
+See 47d2f933a for an example.
 
 
 # Appendix: the `version` file and what consumes it
@@ -143,16 +180,6 @@ release number:
 
 ## Files that must move in lockstep with a bump
 
-1. `version` — `NXT_VERSION` **and** `NXT_VERNUM`.
-2. `CHANGES` — new `Changes with FreeUnit X.Y.Z   DD Mon YYYY` block at the top.
-3. `docs/changes.xml` — the two `<changes>` blocks (the `unit` block and the
-   per-module block), with matching `ver=` and `date=`.
-4. `docs/unit-openapi.yaml` line 3 — `title: "FreeUnit X.Y.Z (ex NGINX Unit)"`.
-   This line is **not** auto-generated and is the one most often forgotten.
-
-Quick consistency check:
-
-    grep -nE 'NXT_VERSION=|NXT_VERNUM=' version
-    grep -m1 'Changes with FreeUnit' CHANGES
-    grep -m2 'ver=' docs/changes.xml
-    sed -n '3p' docs/unit-openapi.yaml
+The list lives in `.github/scripts/version-sites`, with the reason each
+file carries the version.  Run `.github/scripts/check-version.sh` to
+check them all.

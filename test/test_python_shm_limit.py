@@ -13,6 +13,7 @@ the application create them (see test_process_shm_oosm.py).
 """
 
 import json
+import re
 import shutil
 import tempfile
 import time
@@ -28,7 +29,14 @@ prerequisites = {'modules': {'python': 'any'}}
 
 client = ApplicationPython()
 
-LIMIT = 2**32 - 1
+# Use the configured server's width, since pytest's interpreter may have a
+# different ABI.  NXT_CONF_MAP_SIZE converts through ssize_t before the
+# uint32_t libunit limit is checked.
+header = Path(option.current_dir) / 'build/include/nxt_auto_config.h'
+size_t_size = re.search(r'^#define NXT_SIZE_T_SIZE\s+(\d+)$', header.read_text(), re.M)
+assert size_t_size is not None, f'NXT_SIZE_T_SIZE in {header}'
+SIZE_BOUND = 2 ** (int(size_t_size.group(1)) * 8 - 1)
+LIMIT = min(2**32 - 1, SIZE_BOUND - 1)
 
 # The application counts its segments in /proc/self/maps.
 linux_only = pytest.mark.skipif(
@@ -70,19 +78,55 @@ def test_python_shm_limit_validation():
     def shm(value):
         return client.conf({'shm': value}, 'applications/empty/limits')
 
-    for value in (LIMIT + 1, 2**40):
+    for value in (LIMIT + 1, 2**32, 2**40):
         resp = shm(value)
 
         assert 'error' in resp, f'shm {value}'
-        assert (
-            resp['detail'] == f'The "shm" number must not exceed {LIMIT}.'
-        ), f'shm {value} detail'
+        detail = (
+            f'The "shm" number must be less than {SIZE_BOUND}.'
+            if value >= SIZE_BOUND
+            else f'The "shm" number must not exceed {LIMIT}.'
+        )
+        assert resp['detail'] == detail, f'shm {value} detail'
         assert (
             resp['location']['path'] == '/applications/empty/limits/shm'
         ), f'shm {value} pointer'
 
     assert 'success' in shm(LIMIT), 'largest shm'
     assert client.conf_get('applications/empty/limits/shm') == LIMIT
+
+
+def test_python_shm_limit_negative():
+    """A negative "shm" is stored as a large size_t (-1 as SIZE_MAX), and
+    the application would get LIMIT.  The control API refuses it."""
+
+    client.load('empty')
+
+    assert 'success' in client.conf(
+        {'shm': 1048576}, 'applications/empty/limits'
+    )
+
+    for value in (-1, -(2**40)):
+        resp = client.conf({'shm': value}, 'applications/empty/limits')
+
+        assert 'error' in resp, f'shm {value}'
+        assert (
+            resp['detail'] == 'The "shm" number must not be negative.'
+        ), f'shm {value} detail'
+        assert (
+            resp['location']['path'] == '/applications/empty/limits/shm'
+        ), f'shm {value} pointer'
+
+    assert client.conf_get('applications/empty/limits/shm') == 1048576
+
+    # A fraction is not an integer.
+    resp = client.conf({'shm': 1.5}, 'applications/empty/limits')
+
+    assert 'error' in resp, 'shm 1.5'
+    assert resp['detail'] == (
+        'The "shm" value must be an integer number, '
+        'but not a fractional number.'
+    ), 'shm 1.5 detail'
 
 
 @linux_only
@@ -98,17 +142,21 @@ def test_python_shm_limit_segments():
 
 
 @linux_only
+@pytest.mark.parametrize('stored', [2**33 if SIZE_BOUND > 2**32 else -SIZE_BOUND, -1])
 def test_python_shm_limit_stored(
-    requires_restart, wait_for_record, monkeypatch
+    stored, requires_restart, wait_for_record, monkeypatch
 ):
-    """Earlier versions accepted a larger "shm".  unitd still loads a stored
-    configuration with one, and the application gets LIMIT, not the low
-    32 bits of the number."""
+    """Restore legacy values representable by NXT_CONF_MAP_SIZE.
+
+    Positive values >= 2**31 cannot be restored on 32-bit systems.  Exercise
+    negative size restoration there; conversion to size_t allows multiple
+    segments.  On 64-bit systems also check the uint32_t overflow case.
+    """
 
     client.load('shm_limit', limits={'shm': 1}, processes=1)
 
     conf = client.conf_get()
-    conf['applications']['shm_limit']['limits']['shm'] = 2**33
+    conf['applications']['shm_limit']['limits']['shm'] = stored
 
     unit_stop()
 
@@ -123,15 +171,17 @@ def test_python_shm_limit_stored(
         unit_run(state_dir=str(statedir))
 
         assert (
-            client.conf_get('applications/shm_limit/limits/shm') == 2**33
+            client.conf_get('applications/shm_limit/limits/shm') == stored
         ), 'stored configuration loaded'
 
-        # 2**33 cut to 32 bits is 0, and so one segment.
+        # 2**33 cut to 32 bits is 0, and so one segment.  A restored
+        # negative value becomes a large size_t instead.
         assert segments_after_large_response() > 1, 'stored shm'
 
         assert wait_for_record(
-            r'\[warn\].+the restored configuration has a "shm" number over '
-            rf'{LIMIT} at "/applications/shm_limit/limits/shm"'
+            r'\[warn\].+the restored configuration has a "shm" number '
+            rf'out of the range 0 to {2**32 - 1} at '
+            r'"/applications/shm_limit/limits/shm"'
         ), 'warning'
 
         # The control API validates the whole configuration.

@@ -1,0 +1,25 @@
+id: memcpy-computed-size
+language: c
+severity: warning
+message: >-
+  The size argument of memcpy(), nxt_memcpy() or memmove() is a sum or a
+  difference. Compute the size first and pass the checked result. For a + b,
+  use nxt_size_add() (src/nxt_checked.h). For a - b, check the order first,
+  for example "if (a < b) { return NXT_ERROR; }". A size that wraps makes the
+  copy read or write past the end of a buffer.
+note: >-
+  The rule matches only a top-level "+" or "-" in the size argument. It does
+  not match a product or a sum in parentheses. ast-grep does not parse the
+  body of a macro, thus a regex finds the same call in a "#define": a "+" or
+  a "-" with a space on each side (the Unit style) in the third argument,
+  outside of parentheses.
+rule:
+  any:
+    - pattern: memcpy($DST, $SRC, $A + $B)
+    - pattern: memcpy($DST, $SRC, $A - $B)
+    - pattern: memmove($DST, $SRC, $A + $B)
+    - pattern: memmove($DST, $SRC, $A - $B)
+    - pattern: nxt_memcpy($DST, $SRC, $A + $B)
+    - pattern: nxt_memcpy($DST, $SRC, $A - $B)
+    - kind: preproc_arg
+      regex: '\b(?:nxt_memcpy|memcpy|memmove)\s*\((?:[^,()]|\([^()]*\))*,(?:[^,()]|\([^()]*\))*,(?:[^,();]|\([^()]*\))*\s[-+]\s'

@@ -474,7 +474,7 @@ nxt_port_new_port_mmap(nxt_task_t *task, nxt_port_mmaps_t *mmaps, nxt_int_t n)
     /* Mark as busy chunk followed the last available chunk. */
     nxt_port_mmap_set_chunk_busy(hdr->free_map, PORT_MMAP_CHUNK_COUNT);
 
-    nxt_log(task, NXT_LOG_DEBUG, "new mmap #%D created for %PI -> ...",
+    nxt_log(task, NXT_LOG_DEBUG, "new mmap #%uD created for %PI -> ...",
             hdr->id, nxt_pid);
 
     return mmap_handler;
@@ -625,7 +625,11 @@ nxt_port_mmap_get(nxt_task_t *task, nxt_port_mmaps_t *mmaps, nxt_chunk_id_t *c,
             }
         }
 
-        hdr->oosm = 1;
+        /*
+         * No data is published with the flag and setting it twice changes
+         * nothing; the clear is the side that uses the compare-and-set result.
+         */
+        nxt_atomic_store(&hdr->oosm, 1);
     }
 
     /* TODO introduce port_mmap limit and release wait. */
@@ -709,19 +713,19 @@ nxt_port_mmap_get_buf(nxt_task_t *task, nxt_port_mmaps_t *mmaps, size_t size)
     nxt_port_mmap_header_t   *hdr;
     nxt_port_mmap_handler_t  *mmap_handler;
 
-    nxt_debug(task, "request %z bytes shm buffer", size);
+    nxt_debug(task, "request %uz bytes shm buffer", size);
 
     nchunks = (size + PORT_MMAP_CHUNK_SIZE - 1) / PORT_MMAP_CHUNK_SIZE;
 
     if (nxt_slow_path(nchunks > PORT_MMAP_CHUNK_COUNT)) {
-        nxt_alert(task, "requested buffer (%z) too big", size);
+        nxt_alert(task, "requested buffer (%uz) too big", size);
 
         return NULL;
     }
 
     b = nxt_buf_mem_ts_alloc(task, task->thread->engine->mem_pool, 0);
     if (nxt_slow_path(b == NULL)) {
-        nxt_alert(task, "failed to allocate a buffer for %z bytes of shared "
+        nxt_alert(task, "failed to allocate a buffer for %uz bytes of shared "
                   "memory", size);
 
         return NULL;
@@ -749,7 +753,7 @@ nxt_port_mmap_get_buf(nxt_task_t *task, nxt_port_mmaps_t *mmaps, size_t size)
     b->mem.free = b->mem.start;
     b->mem.end = b->mem.start + nchunks * PORT_MMAP_CHUNK_SIZE;
 
-    nxt_debug(task, "outgoing mmap buf allocation: %p [%p,%uz] %PI->%PI,%d,%d",
+    nxt_debug(task, "outgoing mmap buf allocation: %p [%p,%uz] %PI->%PI,%uD,%uD",
               b, b->mem.start, b->mem.end - b->mem.start,
               hdr->src_pid, hdr->dst_pid, hdr->id, c);
 
@@ -1086,7 +1090,7 @@ nxt_process_broadcast_shm_ack(nxt_task_t *task, nxt_process_t *process)
      *
      * Only the lookup is done under the mutex.  Everything after it takes
      * other locks (nxt_process_use() takes this very mutex), and
-     * rt->processes_mutex is a leaf -- see src/nxt_process.c:150.
+     * rt->processes_mutex is a leaf -- see nxt_process_use().
      */
 
     nxt_thread_mutex_lock(&rt->processes_mutex);
@@ -1143,7 +1147,30 @@ nxt_port_broadcast_shm_ack(nxt_task_t *task, nxt_port_t *port, void *data)
 
     process = data;
 
+    /*
+     * A port of a dead process stays in process->ports while an in-flight
+     * request still holds a reference to it.  nxt_port_close() sets pair[1]
+     * to -1 but keeps the old number in socket.fd.  A write to that port gets
+     * EBADF, or it goes to the socket of a new worker that got the same
+     * number.  That worker then quits with "too many port socket messages".
+     * So skip a closed port.
+     *
+     * The check does not race.  This handler runs on port->engine.
+     * nxt_port_write_enable() sets port->engine to the engine that creates
+     * the port.  The router creates an application port in
+     * nxt_port_new_port_handler() while the main engine reads the router's
+     * own port, so port->engine is the main engine.  nxt_port_close() runs
+     * on the main engine too.
+     */
+
     nxt_queue_each(port, &process->ports, nxt_port_t, link) {
+
+        if (port->pair[1] == -1) {
+            nxt_debug(task, "port %PI:%d closed, no shm ack", port->pid,
+                      port->id);
+            continue;
+        }
+
         (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_SHM_ACK,
                                      -1, 0, 0, NULL);
     } nxt_queue_loop;

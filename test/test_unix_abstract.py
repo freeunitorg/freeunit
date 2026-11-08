@@ -1,5 +1,6 @@
 from unit.applications.lang.python import ApplicationPython
 from unit.option import option
+from unit import port as port_map
 
 prerequisites = {
     'modules': {'python': 'any'},
@@ -44,9 +45,9 @@ def test_unix_abstract_source():
 def test_unix_abstract_client_ip():
     def get_xff(xff, sock_type='ipv4'):
         address = {
-            'ipv4': ('127.0.0.1', 8080),
-            'ipv6': ('::1', 8081),
-            'unix': ('\0sock', None),
+            'ipv4': ('127.0.0.1', port_map.port(8080)),
+            'ipv6': ('::1', port_map.port(8081)),
+            'unix': ('\0sock', None),  # port_map.port() passes None through
         }
         (addr, port) = address[sock_type]
 

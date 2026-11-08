@@ -134,6 +134,10 @@ static SSize_t
 nxt_perl_psgi_io_input_read(PerlInterpreter *my_perl,
     nxt_perl_psgi_io_arg_t *arg, void *vbuf, size_t length)
 {
+    if (nxt_slow_path(arg->req == NULL)) {
+        return 0;
+    }
+
     return nxt_unit_request_read(arg->req, vbuf, length);
 }
 
@@ -158,7 +162,8 @@ static SSize_t
 nxt_perl_psgi_io_error_write(PerlInterpreter *my_perl,
     nxt_perl_psgi_io_arg_t *arg, const void *vbuf, size_t length)
 {
-    nxt_unit_req_error(arg->req, "Perl: %s", (const char*) vbuf);
+    nxt_unit_req_error(arg->req, "Perl: %.*s", (int) length,
+                       (const char *) vbuf);
 
     return (SSize_t) length;
 }
@@ -214,6 +219,9 @@ XS(XS_NGINX__Unit__Sandbox_write)
     body = SvPV(ST(1), len);
 
     pctx = CvXSUBANY(cv).any_ptr;
+    if (nxt_slow_path(pctx->req == NULL)) {
+        XSRETURN_EMPTY;
+    }
 
     rc = nxt_unit_response_write(pctx->req, body, len);
     if (nxt_slow_path(rc != NXT_UNIT_OK)) {
@@ -232,6 +240,10 @@ nxt_perl_psgi_cb_request_done(nxt_perl_psgi_ctx_t *pctx, int status)
     if (pctx->req != NULL) {
         nxt_unit_request_done(pctx->req, status);
         pctx->req = NULL;
+
+        /* Until the next request, a retained psgi.input reads EOF. */
+        pctx->arg_input.req = NULL;
+        pctx->arg_error.req = NULL;
     }
 }
 
@@ -913,7 +925,7 @@ static int
 nxt_perl_psgi_result_body_ref(PerlInterpreter *my_perl, SV *sv_body,
     nxt_unit_request_info_t *req)
 {
-    SV          *data, *old_rs, *old_perl_rs;
+    SV          *data, *rs, *old_rs, *perl_rs, *old_perl_rs;
     int         rc;
     size_t      len;
     const char  *body;
@@ -924,12 +936,16 @@ nxt_perl_psgi_result_body_ref(PerlInterpreter *my_perl, SV *sv_body,
      * This is done by setting $/ with a reference to an integer ($/ = \8192).
      */
 
-    old_rs = PL_rs;
-    old_perl_rs = get_sv("/", GV_ADD);
+    old_rs = newSVsv(PL_rs);
 
-    PL_rs = sv_2mortal(newRV_noinc(newSViv(nxt_unit_buf_min())));
+    perl_rs = get_sv("/", GV_ADD);
+    old_perl_rs = newSVsv(perl_rs);
 
-    sv_setsv(old_perl_rs, PL_rs);
+    rs = newRV_noinc(newSViv(nxt_unit_buf_min()));
+
+    sv_setsv(PL_rs, rs);
+    sv_setsv(perl_rs, rs);
+    SvREFCNT_dec(rs);
 
     rc = NXT_UNIT_OK;
 
@@ -940,17 +956,16 @@ nxt_perl_psgi_result_body_ref(PerlInterpreter *my_perl, SV *sv_body,
             break;
         }
 
+        if (!SvOK(data)) {
+            SvREFCNT_dec(data);
+            break;
+        }
+
         body = SvPV(data, len);
 
         if (len == 0) {
             SvREFCNT_dec(data);
-
-            data = nxt_perl_psgi_call_method(my_perl, sv_body, "close", req);
-            if (nxt_fast_path(data != NULL)) {
-                SvREFCNT_dec(data);
-            }
-
-            break;
+            continue;
         }
 
         rc = nxt_unit_response_write(req, body, len);
@@ -962,10 +977,18 @@ nxt_perl_psgi_result_body_ref(PerlInterpreter *my_perl, SV *sv_body,
                                "Perl Application");
             break;
         }
-    };
+    }
 
-    PL_rs =  old_rs;
-    sv_setsv(get_sv("/", GV_ADD), old_perl_rs);
+    data = nxt_perl_psgi_call_method(my_perl, sv_body, "close", req);
+    if (nxt_fast_path(data != NULL)) {
+        SvREFCNT_dec(data);
+    }
+
+    sv_setsv(PL_rs, old_rs);
+    SvREFCNT_dec(old_rs);
+
+    sv_setsv(perl_rs, old_perl_rs);
+    SvREFCNT_dec(old_perl_rs);
 
     return rc;
 }
@@ -982,12 +1005,13 @@ nxt_perl_psgi_result_body_fh(PerlInterpreter *my_perl, SV *sv_body,
     nxt_unit_request_info_t *req)
 {
     IO                      *io;
+    int                     rc;
     nxt_unit_read_info_t    read_info;
     nxt_perl_psgi_io_ctx_t  io_ctx;
 
     io = GvIO(SvRV(sv_body));
 
-    if (io == NULL) {
+    if (io == NULL || IoIFP(io) == NULL) {
         return NXT_UNIT_OK;
     }
 
@@ -999,7 +1023,11 @@ nxt_perl_psgi_result_body_fh(PerlInterpreter *my_perl, SV *sv_body,
     read_info.buf_size = 8192;
     read_info.data = &io_ctx;
 
-    return nxt_unit_response_write_cb(req, &read_info);
+    rc = nxt_unit_response_write_cb(req, &read_info);
+
+    do_close((GV *) SvRV(sv_body), FALSE);
+
+    return rc;
 }
 
 
@@ -1122,6 +1150,9 @@ nxt_perl_psgi_result_cb(PerlInterpreter *my_perl, SV *result,
                        SvPV_nolen(ERRSV));
 
         nxt_perl_psgi_cb_request_done(pctx, NXT_UNIT_ERROR);
+
+    } else {
+        nxt_perl_psgi_cb_request_done(pctx, NXT_UNIT_OK);
     }
 
     PUTBACK;
@@ -1227,6 +1258,8 @@ nxt_perl_psgi_request_handler(nxt_unit_request_info_t *req)
                            "PSGI: Failed to create 'env' for Perl Application");
         nxt_unit_request_done(req, NXT_UNIT_ERROR);
         pctx->req = NULL;
+        pctx->arg_input.req = NULL;
+        pctx->arg_error.req = NULL;
 
         return;
     }
@@ -1258,6 +1291,9 @@ nxt_perl_psgi_request_handler(nxt_unit_request_info_t *req)
     pctx->req = NULL;
 
 release:
+
+    pctx->arg_input.req = NULL;
+    pctx->arg_error.req = NULL;
 
     SvREFCNT_dec(result);
     SvREFCNT_dec(env);
@@ -1395,6 +1431,10 @@ nxt_perl_psgi_join_threads(nxt_unit_ctx_t *ctx, nxt_perl_app_conf_t *c)
 
     for (i = 0; i < c->threads - 1; i++) {
         pctx = &nxt_perl_psgi_ctxs[i];
+
+        if ((uintptr_t) pctx->thread == 0) {
+            continue;
+        }
 
         res = pthread_join(pctx->thread, NULL);
 

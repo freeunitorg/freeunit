@@ -1,3 +1,4 @@
+import json
 import re
 
 import pytest
@@ -69,7 +70,7 @@ def test_node_application_variables(date_to_sec_epoch, sec_epoch):
 
     date = headers.pop('Date')
     assert date[-4:] == ' GMT', 'date header timezone'
-    assert abs(date_to_sec_epoch(date) - sec_epoch) < 5, 'date header'
+    assert abs(date_to_sec_epoch(date) - sec_epoch()) < 5, 'date header'
 
     raw_headers = headers.pop('Request-Raw-Headers')
     assert re.search(
@@ -99,6 +100,45 @@ def test_node_application_get_variables():
     assert resp['headers']['X-Var-1'] == 'val1', 'GET variables'
     assert resp['headers']['X-Var-2'] == '', 'GET variables 2'
     assert resp['headers']['X-Var-3'] == '', 'GET variables 3'
+
+
+def test_node_application_header_dup():
+    client.load('header_dup')
+
+    resp = client.get(
+        headers={
+            'Host': 'localhost',
+            'Cookie': ['a=1', 'b=2'],
+            'X-Dup': ['1', '2'],
+            'User-Agent': ['first', 'second'],
+            'Connection': 'close',
+        }
+    )
+
+    assert resp['status'] == 200, 'status'
+    body = json.loads(resp['body'])
+    headers = body['headers']
+    assert headers['cookie'] == 'a=1; b=2', 'Cookie lines joined with "; "'
+    assert headers['x-dup'] == '1, 2', 'other lines joined with ", "'
+    assert headers['user-agent'] == 'first', 'first User-Agent kept'
+    assert body['raw'] == [
+        'Host',
+        'localhost',
+        'Cookie',
+        'a=1',
+        'Cookie',
+        'b=2',
+        'X-Dup',
+        '1',
+        'X-Dup',
+        '2',
+        'User-Agent',
+        'first',
+        'User-Agent',
+        'second',
+        'Connection',
+        'close',
+    ], 'rawHeaders'
 
 
 def test_node_application_post_variables():
@@ -242,6 +282,49 @@ def test_node_application_set_header_array_with_override():
         'tc=four,five,six',
         'tc=seven,eight,nine',
     ], 'set header array with override'
+
+
+def test_node_application_set_header_array_mutate():
+    client.load('set_header_array_mutate')
+
+    resp = client.get()
+    assert resp['status'] == 200, 'status'
+    assert resp['body'] == 'body', 'body'
+    assert resp['headers'].get('Set-Cookie') == 'a=1', 'array copied'
+
+
+def test_node_application_set_header_array_empty():
+    client.load('set_header_array_empty')
+
+    resp = client.get()
+    assert resp['status'] == 200, 'empty array status'
+    assert resp['body'] == 'body', 'empty array body'
+    assert 'Set-Cookie' not in resp['headers'], 'empty array'
+
+    resp = client.get(url='/last')
+    assert resp['status'] == 200, 'empty array last status'
+    assert resp['body'] == 'body', 'empty array last body'
+    assert resp['headers'].get('X-Header') == '1', 'empty array last header'
+    assert 'Set-Cookie' not in resp['headers'], 'empty array last'
+
+    resp = client.get(url='/override')
+    assert resp['status'] == 200, 'empty array override status'
+    assert 'Set-Cookie' not in resp['headers'], 'empty array override'
+
+    resp = client.get(url='/two')
+    assert resp['status'] == 200, 'two values status'
+    assert resp['headers'].get('Set-Cookie') == ['a=1', 'b=2'], 'two values'
+    assert 'X-Empty' not in resp['headers'], 'two values empty array'
+
+
+def test_node_application_set_header_array_empty_first():
+    client.load('set_header_array_empty')
+
+    resp = client.get(url='/first')
+    assert resp['status'] == 200, 'empty array first status'
+    assert resp['body'] == 'body', 'empty array first body'
+    assert resp['headers'].get('X-Header') == '1', 'empty array first header'
+    assert 'Set-Cookie' not in resp['headers'], 'empty array first'
 
 
 @pytest.mark.skip('not yet')

@@ -25,6 +25,7 @@ import pytest
 
 from unit.applications.proto import ApplicationProto
 from unit.utils import waitforsocket
+from unit import port as port_map
 
 client = ApplicationProto()
 
@@ -33,7 +34,7 @@ BAD_CL_BODY = '0123456789'
 BAD_CL_VALUE = 'notanumber'
 
 # Reserved fake_upstream port for this case (see test/fake_upstream/README.md).
-UPSTREAM_BAD_CL_PORT = 7988
+UPSTREAM_BAD_CL_PORT = port_map.port(7988)
 
 FAKE_UPSTREAM_BIN = '/usr/local/bin/fake_upstream'
 

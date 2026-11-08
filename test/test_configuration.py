@@ -6,6 +6,7 @@ import pytest
 
 from unit.control import Control
 from unit.log import Log
+from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'any'}}
 
@@ -352,12 +353,18 @@ def test_access_log_cstring_nul(temp_dir):
     ), 'path valid'
 
 
-@pytest.mark.xfail(
-    reason='validation accepts an empty listener; the router then fails',
-    strict=False,
-)
 def test_listeners_empty():
-    assert 'error' in client.conf({"*:8080": {}}, 'listeners'), 'listener empty'
+    resp = client.conf({"*:8080": {}}, 'listeners')
+
+    assert resp.get('error') == 'Invalid configuration.', 'listener empty'
+    assert '"pass" or "application"' in resp['detail'], 'reason given'
+    assert resp['location']['path'] == port_map.expected(
+        '/listeners/*:8080'
+    ), 'names listener'
+
+    resp = client.conf({"*:8080": {"backlog": 10}}, 'listeners')
+
+    assert '"pass" or "application"' in resp['detail'], 'no action member'
 
 
 def test_listeners_no_app():
@@ -416,7 +423,7 @@ def test_listeners_port_release():
 
             while True:
                 try:
-                    s.bind(('127.0.0.1', 8080))
+                    s.bind(('127.0.0.1', port_map.port(8080)))
                     s.listen()
                     break
 

@@ -19,11 +19,12 @@ static void nxt_thread_key_dtor(void *data);
 void
 nxt_thread_init_data(nxt_thread_specific_data_t tsd)
 {
-    void           *p;
-    nxt_err_t      err;
-    pthread_key_t  key;
+    void             *p;
+    nxt_err_t        err;
+    pthread_key_t    key;
+    nxt_atomic_int_t key_id;
 
-    while ((nxt_atomic_int_t) tsd->key < 0) {
+    while ((nxt_atomic_int_t) nxt_atomic_load(&tsd->key) < 0) {
         /*
          * Atomic allocation of a key number.
          * -1 means an uninitialized key,
@@ -37,13 +38,23 @@ nxt_thread_init_data(nxt_thread_specific_data_t tsd)
                 goto fail;
             }
 
-            tsd->key = (nxt_atomic_t) key;
+            /*
+             * The compare-and-swap is a full barrier.  It publishes the key
+             * together with the state that pthread_key_create() wrote.
+             * This thread holds the -2 lock, so the swap always succeeds.
+             */
+            (void) nxt_atomic_cmp_set(&tsd->key, -2, (nxt_atomic_uint_t) key);
 
-            nxt_main_log_debug("pthread_key_create(): %A", tsd->key);
+            nxt_main_log_debug("pthread_key_create(): %A",
+                               nxt_atomic_load(&tsd->key));
         }
     }
 
-    if (pthread_getspecific((pthread_key_t) tsd->key) != NULL) {
+    /* The acquire load pairs with the compare-and-swap that set the key. */
+
+    key_id = (nxt_atomic_int_t) nxt_atomic_load_acquire(&tsd->key);
+
+    if (pthread_getspecific((pthread_key_t) key_id) != NULL) {
         return;
     }
 
@@ -52,12 +63,12 @@ nxt_thread_init_data(nxt_thread_specific_data_t tsd)
         goto fail;
     }
 
-    err = pthread_setspecific((pthread_key_t) tsd->key, p);
+    err = pthread_setspecific((pthread_key_t) key_id, p);
     if (err == 0) {
         return;
     }
 
-    nxt_main_log_alert("pthread_setspecific(%A) failed %E", tsd->key, err);
+    nxt_main_log_alert("pthread_setspecific(%A) failed %E", key_id, err);
 
 fail:
 
@@ -128,7 +139,8 @@ nxt_thread_trampoline(void *data)
     /*
      * nxt_thread_time_cleanup() should be called only if a thread
      * would be canceled, so ignore it here because nxt_thread_exit()
-     * calls nxt_thread_time_free() as well.
+     * calls nxt_thread_time_free() and nxt_mp_cluster_cache_drain()
+     * as well.
      */
     pthread_cleanup_pop(0);
 
@@ -176,6 +188,14 @@ nxt_thread_time_cleanup(void *data)
     nxt_log_debug(thr->log, "thread time cleanup");
 
     nxt_thread_time_free(thr);
+
+    /*
+     * A canceled thread does not call nxt_thread_exit().  The handler runs
+     * on the canceled thread, so it frees the pool cluster cache of that
+     * thread.  When nxt_thread_exit() runs inside start(), pthread_exit()
+     * calls this handler after it, and the cache is already empty.
+     */
+    nxt_mp_cluster_cache_drain();
 }
 
 
@@ -201,6 +221,9 @@ nxt_thread_exit(nxt_thread_t *thr)
 
         nxt_event_engine_post(engine, &link->work);
     }
+
+    /* The cache is in the storage of this thread, so free it here. */
+    nxt_mp_cluster_cache_drain();
 
     nxt_thread_time_free(thr);
 

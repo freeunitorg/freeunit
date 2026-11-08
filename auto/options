@@ -21,6 +21,7 @@ NXT_PCRE_LIB=
 
 NXT_REGEX=YES
 NXT_TRY_PCRE2=YES
+NXT_REGEX_JIT=NO
 
 NXT_TLS=NO
 NXT_OPENSSL=NO
@@ -31,6 +32,7 @@ NXT_BROTLI=NO
 
 NXT_NJS=NO
 NXT_OTEL=NO
+NXT_USDT=NO
 
 NXT_TEST_BUILD_EPOLL=NO
 NXT_TEST_BUILD_EVENTPORT=NO
@@ -111,6 +113,7 @@ do
 
         --no-regex)                      NXT_REGEX=NO                        ;;
         --no-pcre2)                      NXT_TRY_PCRE2=NO                    ;;
+        --regex-jit)                     NXT_REGEX_JIT=YES                   ;;
 
         --openssl)                       NXT_OPENSSL=YES                     ;;
 
@@ -120,6 +123,7 @@ do
 
         --njs)                           NXT_NJS=YES                         ;;
         --otel)                          NXT_OTEL=YES                        ;;
+        --usdt)                          NXT_USDT=YES                        ;;
 
         --test-build-epoll)              NXT_TEST_BUILD_EPOLL=YES            ;;
         --test-build-eventport)          NXT_TEST_BUILD_EVENTPORT=YES        ;;
@@ -153,9 +157,28 @@ do
 
     nxt_opt=`$echo $nxt_option | sed -e "s/\(--[^=]*=\)\(.* .*\)/\1'\2'/"`
 
+    # A path map flag in --cc-opt holds the build directory of a packager.
+    # It does not belong in "unitd --version" or in unit.pc.  The old path
+    # runs up to the "=" of the mapping, so a path with a space is removed
+    # whole instead of leaving its tail behind.
+    # Basic regular expressions only: sed on Solaris has no -E.
+    for nxt_map in file debug macro; do
+        nxt_re="-f$nxt_map-prefix-map=[^=']*=[^ ']*"
+        nxt_opt=`printf "%s\n" "$nxt_opt" | sed \
+            -e "s/ $nxt_re//g" \
+            -e "s/$nxt_re \\{0,1\\}//g"`
+    done
+    nxt_opt=`printf "%s\n" "$nxt_opt" | sed -e "s/^--cc-opt=$//" \
+                                           -e "s/^--cc-opt=''$//"`
+
     NXT_CONFIGURE_OPTIONS="$NXT_CONFIGURE_OPTIONS $nxt_opt"
 
 done
+
+if [ $NXT_REGEX_JIT = YES ] && [ $NXT_REGEX = NO ]; then
+    $echo "$0: error: --regex-jit requires regex support."
+    exit 1
+fi
 
 
 NXT_PREFIX="${NXT_PREFIX-"/usr/local"}"

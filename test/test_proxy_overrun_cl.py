@@ -27,6 +27,7 @@ import pytest
 
 from unit.applications.proto import ApplicationProto
 from unit.utils import waitforsocket
+from unit import port as port_map
 
 client = ApplicationProto()
 
@@ -39,8 +40,8 @@ DECLARED = 100
 EXCESS = 50
 
 # Reserved fake_upstream ports for these cases (see test/fake_upstream/README.md).
-UPSTREAM_OVERRUN_PORT = 7989
-UPSTREAM_OVERRUN_KA_PORT = 7987
+UPSTREAM_OVERRUN_PORT = port_map.port(7989)
+UPSTREAM_OVERRUN_KA_PORT = port_map.port(7987)
 
 FAKE_UPSTREAM_BIN = '/usr/local/bin/fake_upstream'
 

@@ -49,13 +49,13 @@ typedef struct {
 
 
 nxt_int_t nxt_var_register(nxt_var_decl_t *decl, size_t n);
-
-nxt_var_field_t *nxt_var_field_get(nxt_array_t *fields, uint16_t index);
 nxt_var_field_t *nxt_var_field_new(nxt_mp_t *mp, nxt_str_t *name,
     uint32_t hash);
 
 nxt_var_t *nxt_var_compile(nxt_tstr_state_t *state, nxt_str_t *str);
 nxt_int_t nxt_var_test(nxt_tstr_state_t *state, nxt_str_t *str, u_char *error);
+/* The variable lexer, shared with callers that need the names in a template. */
+u_char *nxt_var_next_part(u_char *start, u_char *end, nxt_str_t *part);
 
 typedef enum {
     /* Write "-" for a variable that has no value, as an access log does. */
@@ -76,6 +76,7 @@ nxt_str_t *nxt_var_get(nxt_task_t *task, nxt_tstr_state_t *state,
 
 nxt_int_t nxt_http_unknown_var_ref(nxt_mp_t *mp, nxt_var_ref_t *ref,
     nxt_str_t *name);
+nxt_bool_t nxt_http_var_credential(const nxt_str_t *name);
 
 
 #endif /* _NXT_VAR_H_INCLUDED_ */

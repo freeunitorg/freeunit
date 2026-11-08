@@ -58,7 +58,6 @@
       {"version": "27", "eol": "2027-03", "supported_until": "2028-03", "base": "eclipse-temurin"}
     ],
     "node": [
-      {"version": "20", "eol": "2026-04", "supported_until": "2027-04", "note": "EOL"},
       {"version": "22", "eol": "2027-04", "supported_until": "2028-04"},
       {"version": "24", "eol": "2028-04", "supported_until": "2029-04"},
       {"version": "26", "eol": "2029-04", "supported_until": "2030-04", "lts": true}
@@ -77,7 +76,8 @@
     "python": [
       {"version": "3.12", "eol": "2028-10", "supported_until": "2029-10", "slim": true},
       {"version": "3.13", "eol": "2029-10", "supported_until": "2030-10", "slim": true},
-      {"version": "3.14", "eol": "2030-10", "supported_until": "2031-10", "slim": true}
+      {"version": "3.14", "eol": "2030-10", "supported_until": "2031-10", "slim": true},
+      {"version": "3.15", "eol": "2031-10", "supported_until": "2032-10", "slim": true}
     ],
     "ruby": [
       {"version": "3.3", "eol": "2027-03", "supported_until": "2028-03"},
@@ -99,8 +99,8 @@
       "floor_eol": "2023-09",
       "floor_note": "The floor stays at 1.1.1 rather than 3.x because RHEL 8 (openssl-devel) still ships a vendor-patched 1.1.1 that Red Hat maintains into 2029, and from 2026-09 it is the last platform in the matrix still receiving those patches; Amazon Linux 2 builds against openssl11-devel (see pkg/rpm/Makefile and pkg/rpm/unit.spec.in). Amazon Linux 2 and Debian 11 remain inside FreeUnit's own three-year post-EOL support window (see _grace_os).",
       "floor_declared_by": "auto/ssltls probe (PR #224), which also drops the pre-1.1.0 compatibility code in src/nxt_openssl.c",
-      "tested_ceiling": "3.6.5 and 4.0.3",
-      "tested_ceiling_note": "build-test.yml tests two ceilings from source: 3.6.5 (OPENSSL_VERSION env, built into /opt/openssl-3.6) and 4.0.3 (OPENSSL4_VERSION env, /opt/openssl-4.0, built by the openssl4 job with --cc-opt=-DOPENSSL_NO_DEPRECATED so any use of an API OpenSSL 4.0 deprecates fails the build). ACTION: OpenSSL 3.6 goes upstream-EOL 2026-11-01, so the OPENSSL_VERSION pin needs a bump to a supported branch (3.5 is the LTS, EOL 2030-04); 4.0 is supported to 2027-05.",
+      "tested_ceiling": "3.5.9 and 4.0.x",
+      "tested_ceiling_note": "build-test.yml tests two ceilings: 3.5.9 from source (OPENSSL_VERSION env, built into /opt/openssl-3.5) and 4.0.x from the openssl-devel package of the fedora:45 image, which moves with Fedora updates (the hardening-strict-fedora job prints the exact version in its log; its gcc leg builds with --cc-opt=-DOPENSSL_NO_DEPRECATED, so any use of an API that OpenSSL deprecates fails the build). nightly.yml also builds upstream 4.0.3 from source (OPENSSL4_VERSION env, /opt/openssl-4.0, the openssl4 job) with the same define once a night. 3.5 is the LTS line, supported to 2030-04-08. It replaced 3.6.5 because OpenSSL 3.6 reaches upstream EOL on 2026-11-01. 4.0 is supported to 2027-05-14.",
       "source": "https://endoflife.date/api/openssl.json"
     },
     "tomcat": {
@@ -132,14 +132,14 @@
     },
     "wasmtime_c_api": {
       "role": "WebAssembly runtime built by pkg/contrib and linked by the wasm module (pkg/contrib/src/wasmtime/version, WASMTIME_VERSION)",
-      "version": "48.0.5",
+      "version": "48.0.8",
       "eol": null,
-      "eol_note": "Fetched as a source tarball from packages.freeunit.org, so its Cargo.lock is not among the repository locks. The Audit (cargo) pins job verifies the tarball digest, queries OSV for the direct source-package pin, and audits the archived Cargo.lock, so an advisory here arrives as a red job rather than silence. That lock is the whole Wasmtime workspace, so pkg/contrib/check-lock-audit.py fails it only for a crate the C API library links, with pkg/contrib/wasmtime-lock-audit.allow.json recording the accepted ones; the archive is vendored, so a finding moves only when the pin does. Same 48.0.5 as the wasmtime_crate pin. Wasmtime 48 is a long-term support line: upstream supports a release whose number divides by 12 for 24 months and backports security fixes to it. The 47.0.4 to 48.0.5 bump closed twelve advisories published on 2026-09-24 and 2026-10-02. The 43.0.1 bump closed RUSTSEC-2026-0269 (filesystem sandbox escape), -0222, -0114, and wasmtime-wasi -0149, -0182 and -0188 (WASI path and file-permission bypasses). Tracked in freeunitorg/freeunit#400.",
+      "eol_note": "Fetched as a source tarball from packages.freeunit.org, so its Cargo.lock is not among the repository locks. The mirror holds wasmtime-v48.0.8-src.tar.gz, and its SHA512SUMS entry is the digest of the official release archive. The Audit (cargo) pins job verifies the tarball digest, queries OSV for the direct source-package pin, and audits the archived Cargo.lock. That lock is the whole Wasmtime workspace, so pkg/contrib/check-lock-audit.py fails it only for a crate the C API library links, with pkg/contrib/wasmtime-lock-audit.allow.json recording the accepted ones; the archive is vendored, so a finding moves only when the pin does. Same 48.0.8 as the wasmtime_crate pin. This patch closes RUSTSEC-2026-0420, -0423 and -0424; 48.0.7 closed RUSTSEC-2026-0350 through -0359, -0361 through -0364, and -0375 through -0379; the source lock retains reviewed exact-version exceptions for yanked chacha20 0.10.0 and Tokio 1.51.1 (RUSTSEC-2026-0386, no downstream AsyncFd callers found). Wasmtime 48 is a long-term support line: upstream supports a release whose number divides by 12 for 24 months and backports security fixes to it. The 47.0.4 to 48.0.5 bump closed twelve advisories published on 2026-09-24 and 2026-10-02. The 43.0.1 bump closed RUSTSEC-2026-0269 (filesystem sandbox escape), -0222, -0114, and wasmtime-wasi -0149, -0182 and -0188 (WASI path and file-permission bypasses). Tracked in freeunitorg/freeunit#400.",
       "source": "https://github.com/bytecodealliance/wasmtime/releases"
     },
     "wasmtime_crate": {
       "role": "WebAssembly runtime used by the wasm-wasi-component module (src/wasm-wasi-component/Cargo.lock)",
-      "version": "48.0.5",
+      "version": "48.0.8",
       "eol": null,
       "eol_note": "Audited by the Audit (cargo) workflow, which checks every tracked Cargo.lock against the RustSec database, so an advisory here arrives as a red job rather than silence. Bumped with the advisories it closes.",
       "source": "https://github.com/bytecodealliance/wasmtime/releases"

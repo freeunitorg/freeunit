@@ -1942,13 +1942,13 @@ nxt_port_fail_test_cross_engine_race(nxt_thread_t *thr)
          * watches for is gone before it looks.
          */
 
-        while (race.ready == 0) {
+        while (nxt_atomic_load(&race.ready) == 0) {
             nxt_cpu_pause();
         }
 
         nxt_port_use(task, port, -1);
 
-        race.stop = 1;
+        nxt_atomic_store(&race.stop, 1);
 
         nxt_thread_wait(handle);
 
@@ -2039,16 +2039,16 @@ nxt_port_fail_test_racer(void *data)
     task.thread = thr;
     task.log = thr->log;
 
-    race->ready = 1;
+    nxt_atomic_store(&race->ready, 1);
 
     for (i = 0; i < NXT_PORT_FAIL_TEST_RACE_SPINS; i++) {
 
-        if (nxt_slow_path(race->port->use_count == 0)) {
+        if (nxt_slow_path(nxt_atomic_load(&race->port->use_count) == 0)) {
             race->zeroes++;
             break;
         }
 
-        if (race->stop != 0) {
+        if (nxt_atomic_load(&race->stop) != 0) {
             break;
         }
 

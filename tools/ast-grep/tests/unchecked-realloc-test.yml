@@ -1,0 +1,28 @@
+id: unchecked-realloc
+valid:
+  - |
+    void f(char *p, size_t n) {
+        char *tmp = realloc(p, n);
+        if (tmp != NULL) {
+            p = tmp;
+        }
+    }
+invalid:
+  - |
+    void f(char *p, size_t n) {
+        p = realloc(p, n);
+    }
+  - |
+    void f(char *p, size_t n) {
+        p = nxt_realloc(p, n);
+    }
+  - |
+    void f(char *p, size_t n) {
+        if ((p = realloc(p, n)) == NULL) {
+            return;
+        }
+    }
+  - |
+    void f(char **p, size_t n) {
+        *p = (char *) nxt_realloc(*p, n);
+    }

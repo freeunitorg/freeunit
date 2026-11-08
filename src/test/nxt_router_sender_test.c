@@ -243,8 +243,9 @@ typedef struct {
 
     union {
         nxt_port_msg_new_port_t  new_port;
-        nxt_port_msg_get_port_t  get_port;
-        nxt_port_msg_get_mmap_t  get_mmap;
+        nxt_port_msg_get_port_t      get_port;
+        nxt_port_msg_get_port_ext_t  get_port_ext;
+        nxt_port_msg_get_mmap_t      get_mmap;
     } body;
 } nxt_router_sender_test_msg_t;
 
@@ -270,9 +271,9 @@ static nxt_bool_t
 nxt_router_sender_test_accepts(nxt_uint_t from, nxt_uint_t sender,
     nxt_bool_t known)
 {
-    nxt_bool_t  main, controller, proto, worker;
+    nxt_bool_t  is_main, controller, proto, worker;
 
-    main = (known && sender == NXT_ROUTER_SENDER_TEST_MAIN);
+    is_main = (known && sender == NXT_ROUTER_SENDER_TEST_MAIN);
     controller = (known && sender == NXT_ROUTER_SENDER_TEST_CONTROLLER);
     proto = (sender == NXT_ROUTER_SENDER_TEST_PROTO);
     worker = (sender == NXT_ROUTER_SENDER_TEST_WORKER);
@@ -280,22 +281,22 @@ nxt_router_sender_test_accepts(nxt_uint_t from, nxt_uint_t sender,
     switch (from) {
 
     case NXT_ROUTER_SENDER_TEST_FROM_MAIN:
-        return main;
+        return is_main;
 
     case NXT_ROUTER_SENDER_TEST_FROM_CONTROLLER:
         return controller;
 
     case NXT_ROUTER_SENDER_TEST_FROM_MAIN_OR_PROTO:
-        return (main || proto);
+        return (is_main || proto);
 
     case NXT_ROUTER_SENDER_TEST_FROM_NOT_APP:
-        return (main || controller || proto);
+        return (is_main || controller || proto);
 
     case NXT_ROUTER_SENDER_TEST_FROM_SELF:
         return worker;
 
     default:
-        return (main || proto || worker);
+        return (is_main || proto || worker);
     }
 }
 
@@ -608,6 +609,136 @@ nxt_router_sender_test_run(nxt_thread_t *thr, nxt_task_t *task,
 }
 
 
+static void nxt_router_sender_test_drain(nxt_task_t *task);
+
+
+/*
+ * A worker asks for a port that the router does not have (#665, step 4).
+ * With NXT_PORT_GET_PORT_ANSWER_REFUSAL the router answers RPC_ERROR on
+ * stream 0 with the port asked for (nxt_router_get_port_refuse()).
+ * Without the flag, as from an older libunit, it answers nothing.  The
+ * reply port of the worker gets a socket pair for this check, and the
+ * answer is read from its other end.
+ */
+
+static nxt_int_t
+nxt_router_sender_test_get_port_refused(nxt_thread_t *thr, nxt_task_t *task,
+    nxt_port_t *reply_port)
+{
+    int                           sv[2];
+    ssize_t                       n;
+    nxt_int_t                     ret;
+    nxt_uint_t                    flag;
+    nxt_port_msg_get_port_t       *refused;
+    nxt_router_sender_test_msg_t  m;
+
+    struct {
+        nxt_port_msg_t           msg;
+        nxt_port_msg_get_port_t  port;
+        u_char                   tail[16];
+    } answer;
+
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != 0) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router sender test: socketpair() failed %E",
+                      nxt_errno);
+        return NXT_ERROR;
+    }
+
+    (void) fcntl(sv[1], F_SETFL, O_NONBLOCK);
+
+    reply_port->socket.fd = sv[0];
+    reply_port->socket.task = task;
+    reply_port->socket.write_ready = 1;
+
+    ret = NXT_ERROR;
+
+    for (flag = 0; flag < 2; flag++) {
+        nxt_router_sender_test_msg(&m, _NXT_PORT_MSG_GET_PORT,
+                                   NXT_ROUTER_SENDER_TEST_WORKER,
+                                   NXT_ROUTER_SENDER_TEST_WORKER);
+
+        /* A port of the router that is gone. */
+        m.body.get_port_ext.port.pid = nxt_pid;
+        m.body.get_port_ext.port.id = 999;
+
+        if (flag) {
+            m.body.get_port_ext.flags = NXT_PORT_GET_PORT_ANSWER_REFUSAL;
+            m.buf.mem.free = m.buf.mem.start
+                             + sizeof(nxt_port_msg_get_port_ext_t);
+            m.buf.mem.end = m.buf.mem.free;
+        }
+
+        nxt_router_sender_test_dispatch(task, &m.msg);
+
+        nxt_router_sender_test_drain(task);
+
+        n = recv(sv[1], &answer, sizeof(answer), 0);
+
+        if (!flag) {
+            if (n != -1) {
+                nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                              "router sender test: a refused GET_PORT with "
+                              "no flags got an answer of %z bytes", n);
+                goto done;
+            }
+
+            continue;
+        }
+
+        refused = &answer.port;
+
+        if (n != (ssize_t) (sizeof(nxt_port_msg_t)
+                            + sizeof(nxt_port_msg_get_port_t))
+            || answer.msg.type != _NXT_PORT_MSG_RPC_ERROR
+            || answer.msg.stream != 0
+            || refused->pid != nxt_pid || refused->id != 999)
+        {
+            nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                          "router sender test: a refused GET_PORT with "
+                          "NXT_PORT_GET_PORT_ANSWER_REFUSAL got %z bytes, "
+                          "type %d, stream %uD",
+                          n, (n > 0) ? (int) answer.msg.type : -1,
+                          (n > 0) ? answer.msg.stream : 0);
+            goto done;
+        }
+    }
+
+    ret = NXT_OK;
+
+done:
+
+    reply_port->socket.fd = -1;
+    reply_port->socket.task = NULL;
+    reply_port->socket.write_ready = 0;
+
+    close(sv[0]);
+    close(sv[1]);
+
+    return ret;
+}
+
+
+/* Runs the completions that a port write queued on the engine. */
+
+static void
+nxt_router_sender_test_drain(nxt_task_t *task)
+{
+    void                *obj, *data;
+    nxt_task_t          *wq_task;
+    nxt_work_handler_t  handler;
+    nxt_event_engine_t  *engine;
+
+    engine = task->thread->engine;
+
+    while (engine->fast_work_queue.head != NULL) {
+        handler = nxt_work_queue_pop(&engine->fast_work_queue, &wq_task,
+                                     &obj, &data);
+        handler(wq_task, obj, data);
+    }
+}
+
+
 static nxt_port_t *
 nxt_router_sender_test_port(nxt_task_t *task, nxt_port_id_t id,
     nxt_uint_t sender, nxt_process_type_t type)
@@ -683,7 +814,7 @@ nxt_router_sender_test(nxt_thread_t *thr)
     nxt_task_t          *task;
     nxt_port_t          *port, *ports[NXT_ROUTER_SENDER_TEST_PORTS];
     nxt_port_t          *hashed[nxt_nitems(nxt_router_sender_test_hashed)];
-    nxt_bool_t          mutex;
+    nxt_bool_t          mutex, wq_cache;
     nxt_router_t        *saved_router;
     nxt_runtime_t       *rt, *saved_rt;
     nxt_process_t       *processes[NXT_ROUTER_SENDER_TEST_PORTS];
@@ -694,6 +825,7 @@ nxt_router_sender_test(nxt_thread_t *thr)
 
     ret = NXT_ERROR;
     mutex = 0;
+    wq_cache = 0;
 
     nxt_memzero(ports, sizeof(ports));
     nxt_memzero(hashed, sizeof(hashed));
@@ -728,6 +860,14 @@ nxt_router_sender_test(nxt_thread_t *thr)
     /* The handlers run on the main engine only. */
 
     nxt_memzero(&engine, sizeof(nxt_event_engine_t));
+
+    /* The answer to a refused GET_PORT is allocated and completed here. */
+
+    nxt_work_queue_cache_create(&engine.work_queue_cache, 64);
+    engine.fast_work_queue.cache = &engine.work_queue_cache;
+    nxt_work_queue_name(&engine.fast_work_queue, "fast");
+    engine.mem_pool = mp;
+    wq_cache = 1;
 
     thr->runtime = rt;
     thr->engine = &engine;
@@ -786,6 +926,11 @@ nxt_router_sender_test(nxt_thread_t *thr)
     }
 
     if (ret == NXT_OK) {
+        /* hashed[1] is the reply port of the worker. */
+        ret = nxt_router_sender_test_get_port_refused(thr, task, hashed[1]);
+    }
+
+    if (ret == NXT_OK) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log, "router sender test passed");
     }
 
@@ -813,6 +958,11 @@ done:
         if (processes[i] != NULL && processes[i]->registered) {
             nxt_runtime_process_remove(rt, processes[i]);
         }
+    }
+
+    if (wq_cache) {
+        nxt_router_sender_test_drain(task);
+        nxt_work_queue_cache_destroy(&engine.work_queue_cache);
     }
 
     nxt_router = saved_router;

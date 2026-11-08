@@ -212,6 +212,7 @@ nxt_router_start_proto_gone_test_run(nxt_thread_t *thr, nxt_err_t inject,
     nxt_queue_init(&app->spare_ports);
     nxt_queue_init(&app->idle_ports);
     nxt_queue_init(&app->ack_waiting_req);
+    nxt_queue_init(&app->requeue_req);
 
     nxt_str_set(&app->name, "start-proto-gone-test");
 
@@ -251,7 +252,7 @@ nxt_router_start_proto_gone_test_run(nxt_thread_t *thr, nxt_err_t inject,
 
     if (app->pending_processes != 0) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
-                      "router start proto gone test: pending_processes %uD "
+                      "router start proto gone test: pending_processes %uA "
                       "leaked (expected 0, inject %d)",
                       app->pending_processes, (int) inject);
         goto done;

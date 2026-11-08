@@ -128,12 +128,18 @@ nxt_devpoll_create(nxt_event_engine_t *engine, nxt_uint_t mchanges,
         goto fail;
     }
 
-    engine->u.devpoll.fd = open("/dev/poll", O_RDWR);
+    engine->u.devpoll.fd = open("/dev/poll", O_RDWR | NXT_FILE_CLOEXEC);
 
     if (engine->u.devpoll.fd == -1) {
         nxt_alert(&engine->task, "open(\"/dev/poll\") failed %E", nxt_errno);
         goto fail;
     }
+
+#if !(defined O_CLOEXEC)
+    if (nxt_fd_cloexec(&engine->task, engine->u.devpoll.fd) != NXT_OK) {
+        goto fail;
+    }
+#endif
 
     nxt_debug(&engine->task, "open(\"/dev/poll\"): %d", engine->u.devpoll.fd);
 
@@ -242,7 +248,15 @@ nxt_devpoll_enable_read(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
     nxt_uint_t  op, events;
 
-    if (ev->read != NXT_EVENT_BLOCKED) {
+    /*
+     * A side that nxt_fd_event_is_active() reports is registered already,
+     * and this engine reports it while it is ready, so there is nothing to
+     * change.  The port layer enables an active write event on purpose to
+     * re-arm it; adding the descriptor again would fail and raise the
+     * event's error handler.
+     */
+
+    if (ev->read != NXT_EVENT_BLOCKED && !nxt_fd_event_is_active(ev->read)) {
 
         events = POLLIN;
 
@@ -270,7 +284,15 @@ nxt_devpoll_enable_write(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
     nxt_uint_t  op, events;
 
-    if (ev->write != NXT_EVENT_BLOCKED) {
+    /*
+     * A side that nxt_fd_event_is_active() reports is registered already,
+     * and this engine reports it while it is ready, so there is nothing to
+     * change.  The port layer enables an active write event on purpose to
+     * re-arm it; adding the descriptor again would fail and raise the
+     * event's error handler.
+     */
+
+    if (ev->write != NXT_EVENT_BLOCKED && !nxt_fd_event_is_active(ev->write)) {
 
         events = POLLOUT;
 

@@ -5,13 +5,15 @@ import socket
 import pytest
 
 from unit.applications.lang.php import ApplicationPHP
+from unit.compression import zstd_decompress
+from unit import port as port_map
 
 prerequisites = {'modules': {'php': 'any'}}
 
 client = ApplicationPHP()
 
 
-def configure_compression(encoding='gzip'):
+def configure_compression(encoding='gzip', level=None):
     conf = {
         "compression": {
             "types": ["text/html*"],
@@ -21,6 +23,9 @@ def configure_compression(encoding='gzip'):
 
     if encoding == 'gzip':
         conf["compression"]["compressors"][0]["level"] = 1
+
+    if level is not None:
+        conf["compression"]["compressors"][0]["level"] = level
 
     resp = client.conf({"http": conf}, 'settings')
 
@@ -104,39 +109,37 @@ def test_php_compression_large_body():
     assert gzip.decompress(body) == b'A' * 100000, 'round-trips'
 
 
-@pytest.mark.skip(
-    reason='#162: small app responses are advertised gzip but sent '
-    'uncompressed'
-)
-def test_php_compression_small_body():
-    # Staged for issue #162.  nxt_http_comp_check_compression() commits to
-    # compression and emits Content-Encoding before any body buffer exists,
-    # but nxt_http_comp_compress_app_response() then declines the buffer:
-    #
-    #     if (!nxt_buf_is_port_mmap(*b)) { return NXT_OK; }
-    #
-    # A body small enough to arrive in an ordinary port message is plain
-    # memory, so it goes out verbatim under the Content-Encoding already sent
-    # and no client can decode it.
-    #
-    # Un-skip once #162 is fixed.  The assertion holds whichever way it is
-    # fixed: either the body really is gzip, or the encoding was never
-    # advertised.
+@pytest.mark.parametrize('encoding', ['gzip', 'br', 'zstd'])
+def test_php_compression_small_body(encoding):
+    # Issue #162: a body small enough to arrive in an ordinary port message
+    # (plain memory, not a port-mmap buffer) used to go out verbatim under
+    # the Content-Encoding already committed, so no client could decode it.
+    # It is compressed like a shared-memory body now.
     client.load('comp_small_body')
+    # Leave Brotli/Zstandard at their default levels on this small body.
+    configure_compression(encoding)
+
+    status, headers, body = get_gzip(encoding)
+
+    assert status == 200, 'status'
+    assert headers['Content-Encoding'] == encoding, 'encoding advertised'
+    assert decompress(encoding, body) == b'A' * 8, 'round-trips'
+
+
+def test_php_compression_unknown_length():
+    # Most PHP scripts echo their output and send no Content-Length (#856).
+    # The router used to skip compression for an unknown length, so these
+    # responses were never compressed.
+    client.load('comp_unknown_length')
     configure_compression()
 
     status, headers, body = get_gzip()
 
     assert status == 200, 'status'
-
-    if headers.get('Content-Encoding') == 'gzip':
-        assert body[:2] == b'\x1f\x8b', 'advertised gzip must really be gzip'
-        assert gzip.decompress(body) == b'A' * 64, 'round-trips'
-
-    else:
-        # Declining to compress is an equally valid fix, as long as the
-        # encoding is not advertised.
-        assert body == b'A' * 64, 'uncompressed body delivered verbatim'
+    assert headers['Content-Encoding'] == 'gzip', 'encoding advertised'
+    assert headers.get('Transfer-Encoding') == 'chunked', 'chunked'
+    assert 'Content-Length' not in headers, 'no length'
+    assert gzip.decompress(body) == b'B' * 100000, 'round-trips'
 
 
 RANDOM_BODY_SIZE = 9 * 1024 * 1024
@@ -148,7 +151,9 @@ def raw_get(path, encoding, timeout=30, method='GET'):
     A plain socket request.  The shared client cannot express "fail rather
     than block forever", which is exactly the failure these tests look for.
     """
-    sock = socket.create_connection(('127.0.0.1', 8080), timeout)
+    sock = socket.create_connection(
+        ('127.0.0.1', port_map.port(8080)), timeout
+    )
     sock.settimeout(timeout)
 
     try:
@@ -197,15 +202,7 @@ def decompress(encoding, data):
         return brotli.decompress(data)
 
     if encoding == 'zstd':
-        try:
-            from compression import zstd  # Python >= 3.14
-
-            return zstd.decompress(data)
-        except ImportError:
-            zstandard = pytest.importorskip(
-                'zstandard', reason='python zstd bindings not installed'
-            )
-            return zstandard.ZstdDecompressor().decompressobj().decompress(data)
+        return zstd_decompress(data)
 
     pytest.fail(f'no decompressor for {encoding}')
 
@@ -219,7 +216,10 @@ def test_php_compression_large_random_body(encoding):
     the finishing one arriving last.  Check the body still round-trips.
     """
     client.load('comp_random_body')
-    configure_compression(encoding)
+    # Exercise the multi-buffer path without making the 30 s I/O timeout
+    # depend on Brotli's default quality 11 processing 9 MiB of random data.
+    # Default-level coverage uses the small-body test above.
+    configure_compression(encoding, level=1 if encoding == 'br' else None)
 
     status, headers, body = raw_get(
         f'/?n={RANDOM_BODY_SIZE}', encoding
@@ -370,7 +370,7 @@ def test_php_compression_identity_refused_below_min_length():
 
     assert status == 200, 'identity is acceptable here'
     assert 'Content-Encoding' not in headers
-    assert body == b'A' * 64, 'the body, uncompressed'
+    assert body == b'A' * 8, 'the body, uncompressed'
 
 
 def test_php_compression_identity_refused_no_representation():

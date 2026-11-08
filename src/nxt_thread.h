@@ -71,8 +71,13 @@ typedef struct {
 
 NXT_EXPORT void nxt_thread_init_data(nxt_thread_specific_data_t tsd);
 
+/*
+ * A relaxed load is enough.  A thread calls nxt_thread_init_data() before
+ * it uses the data, and that call makes an acquire load of the key.
+ */
+
 #define nxt_thread_get_data(tsd)                                              \
-    pthread_getspecific((pthread_key_t) tsd->key)
+    pthread_getspecific((pthread_key_t) nxt_atomic_load(&tsd->key))
 
 #endif
 

@@ -1,4 +1,5 @@
 import atexit
+import datetime
 import fcntl
 import json
 import os
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from multiprocessing import Process
 from pathlib import Path
 
@@ -21,6 +23,7 @@ from unit.http import HTTP1
 from unit.log import Log
 from unit.log import print_log_on_assert
 from unit.option import option
+from unit import port as port_map
 from unit.status import Status
 from unit.utils import check_findmnt
 from unit.utils import public_dir
@@ -70,6 +73,29 @@ def pytest_addoption(parser):
         action="store_true",
         help="Force Unit to restart after every test",
     )
+    parser.addoption(
+        "--port",
+        type=int,
+        default=None,
+        help="Base TCP port for the suite.  The historical literals are "
+        "translated onto it (see unit/port.py), so concurrent runs can each "
+        "own a private band.  Default: UNIT_TEST_PORT, else 8080",
+    )
+    # 300 s sits between two limits.  Below it, the slowest test that
+    # passes: the Autobahn 9.x case with --unsafe, 10.2 s on a release
+    # build, so 300 s leaves a factor of 29 for an emulated builder.  It is
+    # also above faulthandler_timeout in pytest.ini, so the stack dump at
+    # 120 s comes first.  Above it, the step that runs pytest in
+    # .github/workflows/build-test.yml, with timeout-minutes 12, that is
+    # 720 s.  That cap covers the whole run, so a hang costs a step its
+    # normal time plus this limit, and the step has to finish before the
+    # cap kills the report.
+    parser.addoption(
+        "--test-timeout",
+        type=int,
+        default=300,
+        help="Fail a test that runs longer than this many seconds; 0 is off",
+    )
 
 
 unit_instance = {}
@@ -81,13 +107,24 @@ _processes = []
 # interpreter exit so an error path that bypassed unit_stop can never leak a
 # unitd tree.
 _pgids = {}
+# Temp dirs that _recover_unit() left behind on purpose: the unitd group
+# survived SIGKILL, or a mount under the dir is still busy.  Session
+# shutdown must not remove them either.
+_retained_temp_dirs = set()
 _fds_info = {
-    'main': {'fds': 0, 'skip': False},
-    'router': {'name': 'unit: router', 'pid': -1, 'fds': 0, 'skip': False},
+    'main': {'fds': 0, 'kinds': {}, 'skip': False},
+    'router': {
+        'name': 'unit: router',
+        'pid': -1,
+        'fds': 0,
+        'kinds': {},
+        'skip': False,
+    },
     'controller': {
         'name': 'unit: controller',
         'pid': -1,
         'fds': 0,
+        'kinds': {},
         'skip': False,
     },
 }
@@ -98,6 +135,22 @@ is_findmnt = check_findmnt()
 def pytest_configure(config):
     option.config = config.option
 
+    # Before anything resolves a port: the session base is set here and only
+    # here, and it has to be live before the fixtures below start unitd.  A
+    # bad base (out of range, or one whose bands collide) exits the session
+    # rather than letting every listener land somewhere unintended.
+    # --port wins.  An empty UNIT_TEST_PORT (sudo env X="${X:-}") is unset.
+    base = config.option.port
+
+    if base is None:
+        base = os.environ.get('UNIT_TEST_PORT') or port_map.MIN_BASE
+
+    try:
+        port_map.set_base(base)
+
+    except ValueError as err:
+        raise pytest.UsageError(f'--port or UNIT_TEST_PORT: {err}') from None
+
     option.detailed = config.option.detailed
     option.fds_threshold = config.option.fds_threshold
     option.print_log = config.option.print_log
@@ -105,6 +158,7 @@ def pytest_configure(config):
     option.unsafe = config.option.unsafe
     option.user = config.option.user
     option.restart = config.option.restart
+    option.test_timeout = config.option.test_timeout
 
     option.generated_tests = {}
     option.current_dir = os.path.abspath(
@@ -199,6 +253,15 @@ def pytest_runtest_makereport(item):
 
     setattr(item, f'rep_{rep.when}', rep)
 
+    # A deadline that fired in teardown and was caught there leaves the
+    # teardown report passed.  Fail it here, once: a raise that escaped
+    # has already failed the report.
+    expired = getattr(item, 'deadline_teardown_expired', None)
+
+    if rep.when == 'teardown' and expired and rep.passed:
+        rep.outcome = 'failed'
+        rep.longrepr = f'{expired}  A teardown caught the failure.'
+
 
 @pytest.fixture(scope='module', autouse=True)
 def check_prerequisites_module(request):
@@ -206,8 +269,103 @@ def check_prerequisites_module(request):
         check_prerequisites(request.module.prerequisites)
 
 
+# How long the deadline waits before it raises again, once it has expired
+# and the raise was caught.  Past the deadline every further second is time
+# the run already decided not to spend, so this is short: it drains a retry
+# loop quickly and breaks a stop() that hangs.
+REARM_SECONDS = 1
+
+
+def timeout_plugin_active(config):
+    # pytest-timeout takes its limit from --timeout, then PYTEST_TIMEOUT,
+    # then the "timeout" ini option.  Look in the same places.
+    if not config.pluginmanager.hasplugin('timeout'):
+        return False
+
+    for value in (
+        config.getoption('timeout'),
+        os.environ.get('PYTEST_TIMEOUT'),
+        config.getini('timeout'),
+    ):
+        if value not in (None, ''):
+            return float(value) > 0
+
+    return False
+
+
+# True while the deadline fixture below owns SIGALRM.  pytest-timeout uses
+# SIGALRM too when it is active, and _recover_unit() must not cancel that.
+_deadline_alarm = []
+
+
+@pytest.fixture
+def deadline(request):
+    # Limits the whole test, with the start and stop of unitd in run().
+    # A blocked socket call has no other limit.  pytest-timeout, when it is
+    # installed and enabled, uses SIGALRM too, so this guard steps aside.
+    seconds = option.test_timeout
+
+    if seconds <= 0 or timeout_plugin_active(request.config):
+        yield
+        return
+
+    message = f'The test ran longer than {seconds} s.'
+    expired = []
+    in_body = []
+
+    def expire(signum, frame):
+        expired.append(True)
+
+        # The call report exists as soon as the test body has returned or
+        # raised.  While it is absent, the deadline fired inside setup or
+        # the body, and a raise the body swallows would leave the test
+        # green.  Record that for the teardown check below.  A fire after
+        # it, in run()'s teardown, raises out of that teardown and reports
+        # itself, so it must not be reported a second time.
+        if getattr(request.node, 'rep_call', None) is None:
+            in_body.append(True)
+        else:
+            # In teardown, a cleanup may catch the raise too.  The
+            # makereport hook fails the teardown report if it passed.
+            request.node.deadline_teardown_expired = message
+
+        # pytest.fail() raises a BaseException, and test code does catch
+        # that: _reload_and_poll_mounts() in test_go_isolation.py has an
+        # "except BaseException" around every request.  A caught failure
+        # would leave this one-shot alarm spent and the test running with
+        # no limit again, which is the hang this guard is here to stop.
+        # So re-arm, to interrupt the next wait as well, and record the
+        # expiry, so that teardown below fails a test that swallowed
+        # every raise and would otherwise finish green.
+        signal.alarm(REARM_SECONDS)
+
+        pytest.fail(message)
+
+    handler = signal.signal(signal.SIGALRM, expire)
+    signal.alarm(seconds)
+    _deadline_alarm.append(True)
+
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, handler)
+        _deadline_alarm.clear()
+
+        # Report only a deadline the test body swallowed, so the test
+        # cannot finish green.  A hang in setup leaves no call report, and
+        # a hang in run()'s teardown leaves a report that passed: both
+        # already raise out of their own phase.  Reporting those here
+        # would add a second failure for one hang, and would say the test
+        # caught a failure it never saw.
+        report = getattr(request.node, 'rep_call', None)
+
+        if expired and in_body and report is not None and not report.failed:
+            pytest.fail(f'{message}  The test caught the failure.')
+
+
 @pytest.fixture(autouse=True)
-def run(request):
+def run(request, deadline):
     unit = unit_run()
 
     option.skip_alerts = [
@@ -224,11 +382,11 @@ def run(request):
     # lazy initialization (e.g. OTel tokio runtime) that occurred after
     # unit_run() captured the initial baseline is not counted as a leak.
     if not option.restart:
-        _fds_info['main']['fds'] = _count_fds(unit_instance['pid'])
+        _fd_baseline(_fds_info['main'], unit_instance['pid'])
         router = _fds_info['router']
-        router['fds'] = _count_fds(router['pid'])
+        _fd_baseline(router, router['pid'])
         controller = _fds_info['controller']
-        controller['fds'] = _count_fds(controller['pid'])
+        _fd_baseline(controller, controller['pid'])
 
     yield
 
@@ -247,27 +405,48 @@ def run(request):
         shutil.rmtree(unit['temp_dir'])
         Log.set_pos(0)
 
-    # clean temp_dir before the next test
+    # The checks below are the ones that see unitd itself.  When one of
+    # them fails or is interrupted (a leftover process, an fd leak, the
+    # deadline), the shared unitd may carry the fault into every later
+    # test.  So stop that unitd and let the next test start a fresh one.
+    try:
+        # clean temp_dir before the next test
 
-    if not option.restart:
-        _clear_conf(log=log)
+        if not option.restart:
+            _clear_conf(log=log)
 
-        # Workers must be gone before their files are.  _clear_conf() returns
-        # on the controller's ack, but the router quits workers asynchronously,
-        # and a java one still in scanClasses() keeps reading temp_dir.
-        # Only wait here: the identity asserts belong after _check_fds(),
-        # which is what refreshes the router/controller pids a respawn test
-        # has changed.
-        _wait_for_processes()
-        _clear_temp_dir()
+            # Workers must be gone before their files are.  _clear_conf()
+            # returns on the controller's ack, but the router quits workers
+            # asynchronously, and a java one still in scanClasses() keeps
+            # reading temp_dir.  Only wait here: the identity asserts belong
+            # after _check_fds(), which is what refreshes the router/
+            # controller pids a respawn test has changed.  When this wait
+            # ran out, a process outlived the test: report that now, as the
+            # cause.  The fd leak it holds would only wait and hide it.
+            procs = _wait_for_processes()
+            if len(procs) > 3:
+                _check_processes(procs)
 
-    # check descriptors
+            _clear_temp_dir()
 
-    _check_fds(log=log)
+        # check descriptors
 
-    # check processes id's and amount
+        _check_fds(log=log)
 
-    _check_processes()
+        # check processes id's and amount
+
+        _check_processes()
+
+    except BaseException:
+        # The failure above is the report.  A recovery that fails too must
+        # not replace it.
+        try:
+            _recover_unit()
+        except Exception as err:
+            print(
+                f'\nrecovery after teardown failed: {err!r}', file=sys.stderr
+            )
+        raise
 
     # Teardown logs too, after the snapshot at the top of this fixture, so
     # read again or those lines are charged to the next test.  Not under
@@ -574,22 +753,44 @@ def unit_run(state_dir=None):
     unit_instance['control_sock'] = control_sock
     unit_instance['unitd'] = unitd
 
-    unit_instance['pid'] = (
-        Path(f'{temporary_dir}/unit.pid').read_text(encoding='utf-8').rstrip()
-    )
+    # The control socket is set up in nxt_runtime_conf_init(), before
+    # nxt_runtime_pid_file_create() writes unit.pid.  Under load the file
+    # is missing, or opened with O_TRUNC and still empty, when the socket
+    # appears.  Unit ends the pid with a newline: wait for it.
+    pid_file = Path(f'{temporary_dir}/unit.pid')
+    pid_end = time.monotonic() + start_timeout
+    pid = ''
+
+    while True:
+        try:
+            pid = pid_file.read_text(encoding='utf-8')
+        except FileNotFoundError:
+            pid = ''
+
+        if pid.endswith('\n') and pid.strip().isdigit():
+            break
+
+        if time.monotonic() >= pid_end:
+            _reap_group(p, p.pid, timeout=5)
+            Log.print_log()
+            sys.exit(f'Could not read the pid of unit from {pid_file}')
+
+        time.sleep(0.1)
+
+    unit_instance['pid'] = pid.rstrip()
 
     if state_dir is None:
         _clear_conf()
 
-    _fds_info['main']['fds'] = _count_fds(unit_instance['pid'])
+    _fd_baseline(_fds_info['main'], unit_instance['pid'])
 
     router = _fds_info['router']
     router['pid'] = pid_by_name(router['name'])
-    router['fds'] = _count_fds(router['pid'])
+    _fd_baseline(router, router['pid'])
 
     controller = _fds_info['controller']
     controller['pid'] = pid_by_name(controller['name'])
-    controller['fds'] = _count_fds(controller['pid'])
+    _fd_baseline(controller, controller['pid'])
 
     Status._check_zeros()
 
@@ -768,86 +969,181 @@ def _clear_temp_dir():
                         time.sleep(1)
 
 
-def _wait_for_processes():
+# How long teardown waits for the app processes of a test to exit.
+# Wall time, not a count of polls: one "ps" can take most of a second on
+# an emulated builder.
+PROCESS_WAIT_SECONDS = int(os.environ.get('UNIT_TEST_PROCESS_TIMEOUT', 60))
+
+
+def _unit_processes():
     main_pid = unit_instance['pid']
 
-    for _ in range(600):
-        out = (
-            subprocess.check_output(
-                ['ps', '-ax', '-o', 'pid', '-o', 'ppid', '-o', 'command']
-            )
-            .decode()
-            .splitlines()
+    out = (
+        subprocess.check_output(
+            ['ps', '-ax', '-o', 'pid', '-o', 'ppid', '-o', 'command']
         )
-        # match only the pid/ppid columns; a substring match against the
-        # whole line can catch unrelated processes whose arguments contain
-        # the same number (e.g. agetty's baud rates vs. pid 9600)
-        out = [l for l in out if main_pid in l.split()[:2]]
+        .decode()
+        .splitlines()
+    )
+    # match only the pid/ppid columns; a substring match against the
+    # whole line can catch unrelated processes whose arguments contain
+    # the same number (e.g. agetty's baud rates vs. pid 9600)
+    return [l for l in out if main_pid in l.split()[:2]]
 
-        if len(out) <= 3:
-            break
+
+def _wait_for_processes(timeout=None):
+    if timeout is None:
+        timeout = PROCESS_WAIT_SECONDS
+
+    end = time.monotonic() + timeout
+
+    while True:
+        out = _unit_processes()
+
+        if len(out) <= 3 or time.monotonic() >= end:
+            return out
 
         time.sleep(0.1)
 
-    return out
+
+def _processes_message(text, out):
+    lines = '\n'.join(f'    {l.strip()}' for l in out)
+    return f'{text}; {len(out)} left:\n{lines}'
 
 
-def _check_processes():
+def _check_processes(out=None):
     router_pid = _fds_info['router']['pid']
     controller_pid = _fds_info['controller']['pid']
     main_pid = unit_instance['pid']
 
-    out = _wait_for_processes()
+    if out is None:
+        out = _wait_for_processes()
 
     if option.restart:
-        assert len(out) == 0, 'all termimated'
+        assert len(out) == 0, _processes_message('all terminated', out)
         return
 
-    assert len(out) == 3, 'main, router, and controller expected'
+    # More than three means the wait ran out; fewer returns at once.
+    waited = f' after {PROCESS_WAIT_SECONDS} s' if len(out) > 3 else ''
 
-    out = [l for l in out if 'unit: main' not in l]
-    assert len(out) == 2, 'one main'
+    assert len(out) == 3, _processes_message(
+        f'main, router, and controller expected{waited}', out
+    )
 
-    out = [
+    rest = [l for l in out if 'unit: main' not in l]
+    assert len(rest) == 2, _processes_message('one main', out)
+
+    rest = [
         l
-        for l in out
+        for l in rest
         if re.search(fr'{router_pid}\s+{main_pid}.*unit: router', l) is None
     ]
-    assert len(out) == 1, 'one router'
+    assert len(rest) == 1, _processes_message('one router', out)
 
-    out = [
+    rest = [
         l
-        for l in out
+        for l in rest
         if re.search(fr'{controller_pid}\s+{main_pid}.*unit: controller', l)
         is None
     ]
-    assert len(out) == 0, 'one controller'
+    assert len(rest) == 0, _processes_message('one controller', out)
+
+
+def _recover_unit():
+    # Called when a teardown check of the shared unitd failed.  Kill its
+    # whole process group, so no leftover worker outlives it, and forget
+    # it: the next unit_run() starts a fresh unitd in a new temp dir.
+    # Under --restart, unit_stop() has already reaped the group; only a
+    # process that left it can remain, and that is reported, not hunted.
+    #
+    # The deadline re-arms SIGALRM every second once it has fired.  Its
+    # own teardown cancels the alarm after this one; cancel it now, or it
+    # interrupts the reap below.  A pytest-timeout alarm is not ours.
+    if _deadline_alarm:
+        signal.alarm(0)
+
+    p = unit_instance.get('process')
+    pgid = unit_instance.get('pgid')
+
+    if p is None or option.restart:
+        return
+
+    _reap_group(p, pgid, timeout=1)
+    _forget_pgid(p, pgid)
+
+    temp_dir = unit_instance.get('temp_dir')
+    unit_instance.clear()
+
+    # A group that survived SIGKILL keeps its temp dir: _forget_pgid() kept
+    # its unitd.pgid file there for an external sweeper.
+    if _group_alive(p, pgid):
+        print(
+            f'\nteardown failed: unitd group {pgid} survived SIGKILL; '
+            f'kept {temp_dir}, the next test starts a new unitd',
+            file=sys.stderr,
+        )
+        _retained_temp_dirs.add(temp_dir)
+        return
+
+    print(
+        f'\nteardown failed: unitd {pgid} killed, the next test starts '
+        'a new one',
+        file=sys.stderr,
+    )
+
+    if temp_dir is None or option.save_log:
+        return
+
+    # A mount that is still there would let rmtree() reach outside the
+    # temp dir.  Leave the dir behind then.
+    if is_findmnt and not waitforunmount(temp_dir, timeout=50):
+        print(f'kept {temp_dir}: still mounted', file=sys.stderr)
+        _retained_temp_dirs.add(temp_dir)
+        return
+
+    try:
+        public_dir(temp_dir)
+    except OSError:
+        pass
+
+    shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 @print_log_on_assert
 def _check_fds(*, log=None):
-    def waitforfds(diff):
+    def waitforfds(pid, base):
+        # The count and the descriptor kinds come from one listing, so the
+        # "+N fds" of a leak message matches the kinds that it names.
         for _ in range(600):
-            fds_diff = diff()
+            sample = _fd_targets(pid)
+            count = sample[0] if sample is not None else _count_fds(pid)
+            fds_diff = count - base
 
             if fds_diff <= option.fds_threshold:
                 break
 
             time.sleep(0.1)
 
-        return fds_diff
+        return fds_diff, sample[1] if sample is not None else []
+
+    # The three processes share one network namespace: read its socket
+    # tables once per check.
+    tables = {}
 
     ps = _fds_info['main']
     if not ps['skip']:
-        fds_diff = waitforfds(
-            lambda: _count_fds(unit_instance['pid']) - ps['fds']
-        )
+        fds_diff, targets = waitforfds(unit_instance['pid'], ps['fds'])
         ps['fds'] += fds_diff
+        before, ps['kinds'] = ps['kinds'], _fd_kinds(
+            unit_instance['pid'], tables, targets
+        )
 
-        assert fds_diff <= option.fds_threshold, 'descriptors leak main process'
+        assert fds_diff <= option.fds_threshold, _fd_leak(
+            'main process', fds_diff, before, ps['kinds']
+        )
 
     else:
-        ps['fds'] = _count_fds(unit_instance['pid'])
+        _fd_baseline(ps, unit_instance['pid'], tables)
 
     for name in ['controller', 'router']:
         ps = _fds_info[name]
@@ -855,16 +1151,186 @@ def _check_fds(*, log=None):
         ps['pid'] = pid_by_name(ps['name'])
 
         if not ps['skip']:
-            fds_diff = waitforfds(lambda: _count_fds(ps['pid']) - ps['fds'])
+            fds_diff, targets = waitforfds(ps['pid'], ps['fds'])
             ps['fds'] += fds_diff
+            before, ps['kinds'] = ps['kinds'], _fd_kinds(
+                ps['pid'], tables, targets
+            )
 
             if not option.restart:
                 assert ps['pid'] == ps_pid, f'same pid {name}'
 
-            assert fds_diff <= option.fds_threshold, f'descriptors leak {name}'
+            assert fds_diff <= option.fds_threshold, _fd_leak(
+                name, fds_diff, before, ps['kinds']
+            )
 
         else:
-            ps['fds'] = _count_fds(ps['pid'])
+            _fd_baseline(ps, ps['pid'], tables)
+
+
+def _fd_baseline(ps, pid, tables=None):
+    sample = _fd_targets(pid)
+
+    if sample is None:
+        ps['fds'] = _count_fds(pid)
+        ps['kinds'] = Counter()
+        return
+
+    ps['fds'], targets = sample
+    ps['kinds'] = _fd_kinds(pid, tables, targets)
+
+
+_TCP_STATES = {
+    '01': 'established',
+    '02': 'syn-sent',
+    '03': 'syn-recv',
+    '04': 'fin-wait1',
+    '05': 'fin-wait2',
+    '06': 'time-wait',
+    '07': 'close',
+    '08': 'close-wait',
+    '09': 'last-ack',
+    '0A': 'listen',
+    '0B': 'closing',
+    '0C': 'new-syn-recv',
+}
+
+
+def _parse_socket_table(proto, text):
+    """Map socket inodes to names from the decoded text of /proc/net/<proto>."""
+    names = {}
+
+    for line in text.splitlines()[1:]:
+        # The last unix column is the path, and it can hold spaces.
+        f = line.split(maxsplit=7 if proto == 'unix' else -1)
+
+        if proto == 'unix':
+            if len(f) < 7:
+                continue
+            path = f[7] if len(f) > 7 else ''
+            if re.fullmatch(r'@[0-9a-f]{5}', path):
+                path = '@autobind'
+            names[f[6]] = f'unix:{path}' if path else 'unix'
+
+        elif len(f) > 9:
+            if proto.startswith('tcp'):
+                name = f'{proto} {_TCP_STATES.get(f[3], f[3])}'
+            else:
+                name = proto
+            names[f[9]] = name
+
+    return names
+
+
+def _socket_names(pid, tables=None):
+    # tables caches the parsed result by network namespace.
+    try:
+        key = os.readlink(f'/proc/{pid}/ns/net')
+    except OSError:
+        key = None
+
+    if tables is not None and key is not None and key in tables:
+        return tables[key]
+
+    names = {}
+
+    for proto in ('tcp', 'tcp6', 'udp', 'udp6', 'netlink', 'unix'):
+        try:
+            text = (
+                Path(f'/proc/{pid}/net/{proto}')
+                .read_bytes()
+                .decode('utf-8', 'backslashreplace')
+            )
+        except OSError:
+            continue
+
+        names.update(_parse_socket_table(proto, text))
+
+    if tables is not None and key is not None:
+        tables[key] = names
+
+    return names
+
+
+def _fd_kind(target, sockets):
+    if target.startswith('socket:'):
+        return sockets.get(target[len('socket:') :].strip('[]'), 'socket')
+
+    for prefix, kind in (
+        ('pipe:', 'pipe'),
+        ('/memfd:', 'memfd'),
+    ):
+        if target.startswith(prefix):
+            return kind
+
+    if target.startswith('anon_inode:'):
+        return target[len('anon_inode:') :].strip('[]')
+
+    # os.readlink gives surrogates for a name that is not UTF-8.
+    return target.encode('utf-8', 'surrogateescape').decode(
+        'utf-8', 'backslashreplace'
+    )
+
+
+def _fd_targets(pid):
+    """Count the descriptors of a process and read their targets, from one
+    listing of /proc/<pid>/fd.  None when there is no such listing."""
+    try:
+        fds = list(Path(f'/proc/{pid}/fd').iterdir())
+    except OSError:
+        return None
+
+    targets = []
+
+    for fd in fds:
+        try:
+            targets.append(os.readlink(fd))
+        except OSError:
+            # The descriptor closed after the listing.  It still counts,
+            # as it does in _count_fds().
+            pass
+
+    return len(fds), targets
+
+
+def _fd_kinds(pid, tables=None, targets=None):
+    kinds = Counter()
+
+    if targets is None:
+        sample = _fd_targets(pid)
+        if sample is None:
+            return kinds
+        targets = sample[1]
+
+    sockets = (
+        _socket_names(pid, tables)
+        if any(t.startswith('socket:') for t in targets)
+        else {}
+    )
+
+    for target in targets:
+        kinds[_fd_kind(target, sockets)] += 1
+
+    return kinds
+
+
+def _fd_leak(name, fds_diff, before, after):
+    kinds = _fd_kinds_diff(before, after)
+    return f'descriptors leak {name}: {fds_diff:+d} fds, {kinds}'
+
+
+def _fd_kinds_diff(before, after):
+    if not before and not after:
+        return 'no /proc fd detail'
+
+    delta = Counter(after)
+    delta.subtract(before)
+    changed = sorted((k, n) for k, n in delta.items() if n)
+
+    if not changed:
+        return 'same descriptor kinds as the baseline'
+
+    return ', '.join(f'{k} {n:+d}' for k, n in changed)
 
 
 def _count_fds(pid):
@@ -942,6 +1408,11 @@ def pytest_sessionfinish():
     public_dir(option.cache_dir)
     shutil.rmtree(option.cache_dir)
 
+    # A recovery on the last test leaves option.temp_dir at the dir it
+    # kept.  Keep it here too, with its unitd.pgid file and its mounts.
+    if option.temp_dir in _retained_temp_dirs:
+        return
+
     if not option.save_log and Path(option.temp_dir).is_dir():
         public_dir(option.temp_dir)
         shutil.rmtree(option.temp_dir)
@@ -949,8 +1420,18 @@ def pytest_sessionfinish():
 
 @pytest.fixture
 def date_to_sec_epoch():
+    # Seconds since the epoch, independent of the host time zone.  A date
+    # with a numeric offset (%z) is converted by that offset.  A date
+    # without one is UTC: HTTP dates ("GMT") and OpenSSL validity dates
+    # are.  time.mktime() would read it as local time instead, which is
+    # off by the zone offset, and by another hour at a DST change.
     def _date_to_sec_epoch(date, template='%a, %d %b %Y %X %Z'):
-        return time.mktime(time.strptime(date, template))
+        parsed = datetime.datetime.strptime(date, template)
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+
+        return parsed.timestamp()
 
     return _date_to_sec_epoch
 
@@ -992,7 +1473,11 @@ def search_in_file():
 
 @pytest.fixture
 def sec_epoch():
-    return time.mktime(time.gmtime())
+    # Return a function, not a value.  The fixture runs before the test
+    # starts the application, which can take several seconds on a slow
+    # host.  Read the clock when the test checks the time.  time.time() is
+    # the epoch in UTC; compare it with date_to_sec_epoch(), which is too.
+    return time.time
 
 
 @pytest.fixture()

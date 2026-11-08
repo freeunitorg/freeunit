@@ -1150,6 +1150,29 @@ def test_routes_match_headers_case_insensitive():
     ), 'match headers case insensitive'
 
 
+def test_routes_match_headers_transfer_encoding():
+    # The parser marks Transfer-Encoding "skip" so that it is not forwarded.
+    # A route still sees it.
+    assert 'success' in client.conf(
+        {"http": {"chunked_transform": True}}, 'settings'
+    )
+
+    route_match({"headers": {"Transfer-Encoding": "chunked"}})
+
+    assert client.get()['status'] == 404, 'no Transfer-Encoding'
+    assert (
+        client.post(
+            headers={
+                "Host": "localhost",
+                "Transfer-Encoding": "chunked",
+                "Connection": "close",
+            },
+            body='1\r\nx\r\n0\r\n\r\n',
+        )['status']
+        == 200
+    ), 'match Transfer-Encoding'
+
+
 def test_routes_match_headers_invalid():
     route_match_invalid({"headers": ["blah"]})
     route_match_invalid({"headers": {"foo": ["bar", {}]}})

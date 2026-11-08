@@ -1,0 +1,11 @@
+id: sprintf-unbounded
+valid:
+  - |
+    void f(char *buf, char *end, int n) {
+        nxt_sprintf(buf, end, "%d", n);
+    }
+invalid:
+  - |
+    void f(char *buf, int n) {
+        sprintf(buf, "%d", n);
+    }

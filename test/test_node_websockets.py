@@ -1354,6 +1354,35 @@ def test_node_websockets_9_1_1__9_6_6(system):
     close_connection(sock)
 
 
+def test_node_websockets_app_queue_full(wait_for_record):
+    client.load('websockets/stall')
+
+    _, sock, _ = ws.upgrade()
+
+    # The application blocks for 2 s on "stall" and reads nothing.  The
+    # router puts each frame of the next message in the application port
+    # queue, 16384 items, so 20000 one-byte frames fill it.  The router must
+    # wait for room, not close the connection.  This is what 9_3_1 in the
+    # test above does when the application falls behind the client.  The
+    # bytes differ, so a frame out of order shows.
+    ws.frame_write(sock, ws.OP_TEXT, 'stall')
+
+    payload = bytes(i % 251 for i in range(20000))
+    ws.message(sock, ws.OP_BINARY, payload, fragmention_size=1)
+
+    frame = ws.message_read(sock, read_timeout=30)
+
+    assert frame['opcode'] == ws.OP_BINARY, 'opcode'
+    assert frame['data'] == payload, 'payload'
+
+    assert wait_for_record(
+        r'websocket: the application queue is full, reading from the '
+        r'client paused'
+    ), 'paused'
+
+    close_connection(sock)
+
+
 def test_node_websockets_10_1_1():
     client.load('websockets/mirror')
 

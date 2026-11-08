@@ -42,6 +42,7 @@
 #define NXT_REGEX_TEST_LONG_RESULT  NXT_ERROR
 #endif
 
+static nxt_int_t nxt_regex_jit_test(nxt_thread_t *thr);
 
 /*
  * Compile the pattern and match it against the subject.  The match result
@@ -159,7 +160,204 @@ nxt_regex_test(nxt_thread_t *thr)
                    "on %d bytes returned %i, expected 0",
                    NXT_REGEX_TEST_STARTS + 1, anchored);
 
+    ret = nxt_regex_jit_test(thr);
+    if (ret != NXT_OK) {
+        return ret;
+    }
+
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "regex test passed");
+
+    return NXT_OK;
+}
+
+
+#if (NXT_HAVE_PCRE2 && NXT_REGEX_JIT && NXT_LINUX)
+
+/*
+ * The JIT allocator maps executable memory with mmap(), so a missing
+ * pcre2_code_free() is invisible to the pool and to LeakSanitizer.  Sum
+ * the anonymous executable mappings of the process instead.
+ */
+
+static size_t
+nxt_regex_jit_test_exec_bytes(void)
+{
+    int            n;
+    FILE           *f;
+    char           line[512], perms[8];
+    size_t         total;
+    unsigned long  start, end, inode;
+
+    f = fopen("/proc/self/maps", "r");
+    if (f == NULL) {
+        return 0;
+    }
+
+    total = 0;
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        n = 0;
+
+        if (sscanf(line, "%lx-%lx %7s %*s %*s %lu %n",
+                   &start, &end, perms, &inode, &n) < 4)
+        {
+            continue;
+        }
+
+        if (perms[2] == 'x' && inode == 0
+            && (line[n] == '\0' || line[n] == '\n'))
+        {
+            total += end - start;
+        }
+    }
+
+    (void) fclose(f);
+
+    return total;
+}
+
+#endif
+
+static nxt_int_t
+nxt_regex_jit_test(nxt_thread_t *thr)
+{
+#if (NXT_HAVE_PCRE2 && NXT_REGEX_JIT)
+    nxt_mp_t                    *mp;
+    nxt_int_t                   ret, result;
+    nxt_uint_t                  mode, i;
+    nxt_str_t                   source;
+    nxt_regex_t                 *re;
+    nxt_regex_err_t             err;
+    nxt_regex_jit_test_stats_t   before, after;
+#if (NXT_LINUX)
+    size_t                      exec_before, exec_after;
+#endif
+
+    if (!nxt_regex_jit_test_available()) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "regex JIT test: JIT unavailable, interpreter used");
+        return NXT_OK;
+    }
+
+    /* Modes cover execution, no-JIT libraries, compile failure and retry. */
+    for (mode = 0; mode < 4; mode++) {
+        before = nxt_regex_jit_test_stats();
+        nxt_regex_jit_test_mode(mode);
+
+        for (i = 0; i < 64; i++) {
+            mp = nxt_mp_create(1024, 128, 256, 32);
+            if (mp == NULL) {
+                return NXT_ERROR;
+            }
+
+            ret = nxt_regex_test_run(thr, mp, "^/(foo|bar)$",
+                                     (u_char *) "/foo", 4, &result);
+            if (ret == NXT_OK && result == 1) {
+                ret = nxt_regex_test_run(thr, mp, "^/(foo|bar)$",
+                                         (u_char *) "/baz", 4, &result);
+                if (result != 0) {
+                    ret = NXT_ERROR;
+                }
+            } else {
+                ret = NXT_ERROR;
+            }
+
+            /* A failed validation still releases preceding JIT patterns. */
+            source.start = (u_char *) "(";
+            source.length = 1;
+            re = nxt_regex_compile(mp, &source, &err);
+            nxt_mp_destroy(mp);
+
+            NXT_TEST_CHECK(thr->log, ret == NXT_OK && re == NULL,
+                           "regex JIT test: mode %ui matching/validation", mode);
+        }
+
+        after = nxt_regex_jit_test_stats();
+        if (mode == 0 || mode == 3) {
+            NXT_TEST_CHECK(thr->log, after.compiled - before.compiled == 128,
+                           "regex JIT test: compiled %ui, expected 128",
+                           after.compiled - before.compiled);
+            NXT_TEST_CHECK(thr->log, after.executed - before.executed == 128,
+                           "regex JIT test: executed %ui, expected 128",
+                           after.executed - before.executed);
+            NXT_TEST_CHECK(thr->log, after.freed - before.freed == 128,
+                           "regex JIT test: freed %ui, expected 128",
+                           after.freed - before.freed);
+        } else {
+            NXT_TEST_CHECK(thr->log, after.compiled == before.compiled
+                           && after.executed == before.executed,
+                           "regex JIT test: fallback mode %ui used JIT", mode);
+        }
+
+        NXT_TEST_CHECK(thr->log,
+                       after.fallback - before.fallback == (mode == 3 ? 128 : 0),
+                       "regex JIT test: retry count %ui in mode %ui",
+                       after.fallback - before.fallback, mode);
+    }
+
+#if (NXT_LINUX)
+    /*
+     * Each compile/destroy cycle must give its executable memory back.
+     * A missing pcre2_code_free() leaks about 1 kB of mappings per
+     * pattern here, 1 MB over the loop; the allocator itself keeps a
+     * free chunk or two, so allow 256 kB of noise.
+     */
+    nxt_regex_jit_test_mode(0);
+    exec_before = nxt_regex_jit_test_exec_bytes();
+
+    for (i = 0; i < 1024; i++) {
+        mp = nxt_mp_create(1024, 128, 256, 32);
+        if (mp == NULL) {
+            return NXT_ERROR;
+        }
+
+        ret = nxt_regex_test_run(thr, mp, "^/(foo|bar)$",
+                                 (u_char *) "/foo", 4, &result);
+        nxt_mp_destroy(mp);
+
+        if (ret != NXT_OK || result != 1) {
+            break;
+        }
+    }
+
+    exec_after = nxt_regex_jit_test_exec_bytes();
+
+    NXT_TEST_CHECK(thr->log, i == 1024 && exec_after <= exec_before + 262144,
+                   "regex JIT test: executable mappings grew from %uz to "
+                   "%uz bytes over %ui compile/destroy cycles",
+                   exec_before, exec_after, i);
+#endif
+
+    /* A stack retry must not replenish an unanchored match's budget. */
+    nxt_regex_jit_test_mode(5);
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (mp == NULL) {
+        return NXT_ERROR;
+    }
+    result = 0;
+    ret = nxt_regex_test_run(thr, mp, "foo", (u_char *) "/foo", 4, &result);
+    nxt_mp_destroy(mp);
+    NXT_TEST_CHECK(thr->log, ret == NXT_OK && result == NXT_ERROR,
+                   "regex JIT test: exhausted retry budget returned %i, "
+                   "expected %i", result, (nxt_int_t) NXT_ERROR);
+
+    /* Registering cleanup is mandatory, even before a JIT attempt. */
+    nxt_regex_jit_test_mode(4);
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (mp == NULL) {
+        return NXT_ERROR;
+    }
+    source.start = (u_char *) "^/foo$";
+    source.length = 6;
+    re = nxt_regex_compile(mp, &source, &err);
+    nxt_mp_destroy(mp);
+    nxt_regex_jit_test_mode(0);
+    NXT_TEST_CHECK(thr->log, re == NULL,
+                   "regex JIT test: cleanup failure accepted a pattern");
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                  "regex JIT test passed: execution, fallback, cleanup");
+#endif
 
     return NXT_OK;
 }

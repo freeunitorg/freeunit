@@ -272,6 +272,7 @@ nxt_router_start_timeout_test(nxt_thread_t *thr)
     nxt_queue_init(&app->spare_ports);
     nxt_queue_init(&app->idle_ports);
     nxt_queue_init(&app->ack_waiting_req);
+    nxt_queue_init(&app->requeue_req);
 
     nxt_str_set(&app->name, "start-timeout-test");
 
@@ -318,7 +319,7 @@ nxt_router_start_timeout_test(nxt_thread_t *thr)
     {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start timeout test: deadline fired early, "
-                      "%ui handlers, pending %uD proto_port_requests %uD "
+                      "%ui handlers, pending %uA proto_port_requests %uD "
                       "(expected 0, 1 and 1)",
                       ran, app->pending_processes, app->proto_port_requests);
         goto done;
@@ -345,7 +346,7 @@ nxt_router_start_timeout_test(nxt_thread_t *thr)
     {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start timeout test: expired start left "
-                      "proto_port_requests %uD pending %uD joint %uD "
+                      "proto_port_requests %uD pending %uA joint %uD "
                       "(expected 0, 0 and 1)",
                       app->proto_port_requests, app->pending_processes,
                       joint->use_count);
@@ -410,7 +411,7 @@ nxt_router_start_timeout_test(nxt_thread_t *thr)
     if (app->proto_port_requests != 0 || app->pending_processes != 0) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start timeout test: answered start left "
-                      "proto_port_requests %uD pending %uD (expected 0 and 0)",
+                      "proto_port_requests %uD pending %uA (expected 0 and 0)",
                       app->proto_port_requests, app->pending_processes);
         goto done;
     }
@@ -487,7 +488,7 @@ nxt_router_start_timeout_test(nxt_thread_t *thr)
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start timeout test: taking the message back "
                       "failed the start by itself, proto_port_requests %uD "
-                      "pending %uD (expected 1 and 1)",
+                      "pending %uA (expected 1 and 1)",
                       app->proto_port_requests, app->pending_processes);
         goto done;
     }
@@ -505,7 +506,7 @@ nxt_router_start_timeout_test(nxt_thread_t *thr)
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start timeout test: a sent-but-uncompleted "
                       "start was not failed once its completion ran, "
-                      "proto_port_requests %uD pending %uD (expected 0 and 0)",
+                      "proto_port_requests %uD pending %uA (expected 0 and 0)",
                       app->proto_port_requests, app->pending_processes);
         goto done;
     }
@@ -558,7 +559,7 @@ nxt_router_start_timeout_test(nxt_thread_t *thr)
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start timeout test: a partially sent start was "
                       "failed while its payload was still queued, "
-                      "proto_port_requests %uD pending %uD (expected 1 and 1)",
+                      "proto_port_requests %uD pending %uA (expected 1 and 1)",
                       app->proto_port_requests, app->pending_processes);
         goto done;
     }
@@ -577,7 +578,7 @@ nxt_router_start_timeout_test(nxt_thread_t *thr)
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start timeout test: a partially sent start was "
                       "not failed by its final completion, "
-                      "proto_port_requests %uD pending %uD (expected 0 and 0)",
+                      "proto_port_requests %uD pending %uA (expected 0 and 0)",
                       app->proto_port_requests, app->pending_processes);
         goto done;
     }
@@ -648,7 +649,7 @@ nxt_router_start_timeout_test(nxt_thread_t *thr)
     if (app->pending_processes != 0 || app->unaccounted_processes != 0) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start timeout test: a recalled worker start left "
-                      "pending %uD unaccounted %uD (expected 0 and 0)",
+                      "pending %uA unaccounted %uA (expected 0 and 0)",
                       app->pending_processes, app->unaccounted_processes);
         goto done;
     }
@@ -713,7 +714,7 @@ nxt_router_start_timeout_test(nxt_thread_t *thr)
     if (app->pending_processes != 0 || app->unaccounted_processes != 1) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start timeout test: an expired worker start left "
-                      "pending %uD unaccounted %uD (expected 0 and 1)",
+                      "pending %uA unaccounted %uA (expected 0 and 1)",
                       app->pending_processes, app->unaccounted_processes);
         goto done;
     }
@@ -732,7 +733,7 @@ nxt_router_start_timeout_test(nxt_thread_t *thr)
     if (app->unaccounted_processes != 0 || joint->use_count != joint_use) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start timeout test: the death of the process an "
-                      "expired start left behind gave back unaccounted %uD "
+                      "expired start left behind gave back unaccounted %uA "
                       "joint %uD (expected 0 and %uD)",
                       app->unaccounted_processes, joint->use_count, joint_use);
         goto done;
@@ -818,7 +819,7 @@ nxt_router_start_timeout_test(nxt_thread_t *thr)
     {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start timeout test: an expired prototype start "
-                      "left pending %uD unaccounted %uD proto_port_requests "
+                      "left pending %uA unaccounted %uA proto_port_requests "
                       "%uD (expected 0, 1 and 0)",
                       app->pending_processes, app->unaccounted_processes,
                       app->proto_port_requests);
@@ -836,7 +837,7 @@ nxt_router_start_timeout_test(nxt_thread_t *thr)
     if (app->unaccounted_processes != 0 || joint->use_count != joint_use) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start timeout test: the death of the prototype "
-                      "an expired start left behind gave back unaccounted %uD "
+                      "an expired start left behind gave back unaccounted %uA "
                       "joint %uD (expected 0 and %uD)",
                       app->unaccounted_processes, joint->use_count, joint_use);
         goto done;
@@ -911,7 +912,7 @@ nxt_router_start_timeout_test(nxt_thread_t *thr)
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start timeout test: a start whose write was "
                       "refused stayed armed, proto_port_requests %uD pending "
-                      "%uD (expected 0 and 0)",
+                      "%uA (expected 0 and 0)",
                       app->proto_port_requests, app->pending_processes);
         goto done;
     }

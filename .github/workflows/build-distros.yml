@@ -16,7 +16,7 @@ permissions:
 jobs:
 
   fedora-rawhide:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
 
     strategy:
@@ -58,11 +58,16 @@ jobs:
 
       # --tests has always been configured here, but only "all" was built,
       # so a toolchain that breaks the tests binary alone went unnoticed
-      # (musl's CMSG_NXTHDR under clang, #475).  build/tests itself is built,
-      # not run: the clone and credential cases need capabilities this
-      # container may not have, and nxt_tests.c has no per-test filter.
+      # (musl's CMSG_NXTHDR under clang, #475).
       - name: make tests
         run: make -j 4 tests
+
+      # build/tests runs here as root with the default container capabilities.
+      # It needs nothing more: nxt_clone_creds_test() only runs the credential
+      # map validators and never calls clone(), and no other case uses a
+      # namespace or a privileged call.
+      - name: Run C tests
+        run: ./build/tests
 
       # The two standalone binaries need no privileges and run here as they do
       # in build-test's c-tests.  See the same steps in alpine-edge for why.
@@ -119,15 +124,16 @@ jobs:
       # wasmtime version is pinned in pkg/contrib/src/wasmtime/version and
       # built from a checksum-verified source tarball — same as build-test.
       # Keeps the wasm runtime in sync with what Unit is actually built against.
-      # Cache the compiled artifacts (keyed by the pinned version + this distro,
-      # so it never mixes with the ubuntu/debian glibc builds) to skip the slow
-      # from-source compile on a hit.
+      # Cache the compiled artifacts (keyed by the files in
+      # pkg/contrib/src/wasmtime, so a Makefile flag change rebuilds it, + this
+      # distro, so it never mixes with the ubuntu/debian glibc builds) to skip
+      # the slow from-source compile on a hit.
       - name: Cache wasmtime
         id: cache-wasmtime
         uses: actions/cache@v6
         with:
           path: pkg/contrib/wasmtime/artifacts
-          key: wasmtime-fedora-rawhide-${{ runner.arch }}-${{ hashFiles('pkg/contrib/src/wasmtime/version') }}
+          key: wasmtime-fedora-rawhide-${{ runner.arch }}-${{ hashFiles('pkg/contrib/src/wasmtime/*') }}
 
       - name: Build wasmtime (pinned via pkg/contrib)
         if: steps.cache-wasmtime.outputs.cache-hit != 'true'
@@ -156,7 +162,7 @@ jobs:
         if: matrix.compiler == 'gcc'
 
   alpine-edge:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
 
     strategy:
@@ -194,11 +200,16 @@ jobs:
 
       # --tests has always been configured here, but only "all" was built,
       # so a toolchain that breaks the tests binary alone went unnoticed
-      # (musl's CMSG_NXTHDR under clang, #475).  build/tests itself is built,
-      # not run: the clone and credential cases need capabilities this
-      # container may not have, and nxt_tests.c has no per-test filter.
+      # (musl's CMSG_NXTHDR under clang, #475).
       - name: make tests
         run: make -j 4 tests
+
+      # build/tests runs here as root with the default container capabilities.
+      # It needs nothing more: nxt_clone_creds_test() only runs the credential
+      # map validators and never calls clone(), and no other case uses a
+      # namespace or a privileged call.
+      - name: Run C tests
+        run: ./build/tests
 
       # The two standalone binaries need no privileges, so they run here as
       # they do in build-test's c-tests.  unit_port_recv_test moves control
@@ -265,7 +276,7 @@ jobs:
   # tests the probe and nothing else, and it asserts the probe result instead of
   # trusting a green build, which would stay green with the fallback in place.
   alpine-no-linux-headers:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
 
     container:
@@ -303,7 +314,7 @@ jobs:
   # scheduled failure is reported as a tracking issue instead, the same way
   # eol-check.yml handles its weekly run.
   report:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     needs: [ fedora-rawhide, alpine-edge, alpine-no-linux-headers ]
     if: failure() && github.event_name == 'schedule'

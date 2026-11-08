@@ -2,6 +2,7 @@ import re
 
 import pytest
 
+from unit import port as port_map
 from unit.applications.lang.perl import ApplicationPerl
 from unit.option import option
 
@@ -35,7 +36,7 @@ def test_perl_application(date_to_sec_epoch, sec_epoch):
 
     date = headers.pop('Date')
     assert date[-4:] == ' GMT', 'date header timezone'
-    assert abs(date_to_sec_epoch(date) - sec_epoch) < 5, 'date header'
+    assert abs(date_to_sec_epoch(date) - sec_epoch()) < 5, 'date header'
 
     assert headers == {
         'Connection': 'close',
@@ -55,6 +56,68 @@ def test_perl_application(date_to_sec_epoch, sec_epoch):
         'Psgi-Streaming': '1',
     }, 'headers'
     assert resp['body'] == body, 'body'
+
+
+def test_perl_application_content_type_lines():
+    # The router joins the two lines into one field.  Before, it did not
+    # tell the application which field that was, so CONTENT_TYPE was unset.
+    client.load('variables')
+
+    resp = client.post(
+        headers={
+            'Host': 'localhost',
+            'Content-Type': ['text/plain', 'charset=utf-8'],
+            'Connection': 'close',
+        },
+        body='x',
+    )
+
+    assert resp['status'] == 200, 'status'
+    assert (
+        resp['headers'].get('Content-Type') == 'text/plain, charset=utf-8'
+    ), 'CONTENT_TYPE'
+
+
+def test_perl_application_compression_accept_encoding_lines():
+    # Only the second Accept-Encoding line names gzip.  Before, the router
+    # marked that line skipped when it joined the lines for the application,
+    # and the response compression read the first line only.
+    client.load('variables')
+
+    resp = client.conf(
+        {
+            "http": {
+                "compression": {
+                    "types": ["text/plain"],
+                    "compressors": [{"encoding": "gzip"}],
+                }
+            }
+        },
+        'settings',
+    )
+
+    if 'supported compressor' in resp.get('detail', ''):
+        pytest.skip('unit built without gzip compression support')
+
+    assert 'success' in resp, 'compression'
+
+    # The coded body is not parsed: only the header is checked.
+    resp = client.post(
+        headers={
+            'Host': 'localhost',
+            'Content-Type': 'text/plain',
+            'Accept-Encoding': ['deflate', 'gzip'],
+            'Connection': 'close',
+        },
+        body='x' * 1024,
+        raw_resp=True,
+        encoding='latin1',
+    )
+
+    head = resp.partition('\r\n\r\n')[0].split('\r\n')
+
+    assert head[0].startswith('HTTP/1.1 200 '), 'status'
+    assert 'Content-Encoding: gzip' in head[1:], 'gzip'
 
 
 def test_perl_application_query_string():
@@ -89,8 +152,8 @@ def test_perl_application_query_string_absent():
 def test_perl_application_server_port():
     client.load('server_port')
 
-    assert (
-        client.get()['headers']['Server-Port'] == '8080'
+    assert client.get()['headers']['Server-Port'] == str(
+        port_map.port(8080)
     ), 'Server-Port header'
 
 
@@ -140,6 +203,33 @@ def test_perl_application_input_copy():
     assert client.post(body=body)['body'] == body, 'input copy'
 
 
+def test_perl_application_input_read_after_done(findall):
+    client.load('input_read_after_done')
+
+    body = '0123456789'
+
+    # The env holds an object whose DESTROY reads psgi.input.  It runs
+    # after the request is done, when the env is released.
+    resp = client.post(body=body)
+    assert resp['status'] == 200, 'status'
+    assert resp['headers']['X-Read'] == 'none', 'no earlier read'
+    pid = resp['headers']['X-Pid']
+
+    # This response reports the read from DESTROY.  The app then reads
+    # psgi.input after $writer->close.
+    resp = client.post(url='/?streaming', body=body)
+    assert resp['status'] == 200, 'streaming status'
+    assert resp['headers']['X-Pid'] == pid, 'same worker after DESTROY'
+    assert resp['headers']['X-Read'] == '0', 'DESTROY read gets EOF'
+
+    resp = client.get()
+    assert resp['status'] == 200, 'status after streaming'
+    assert resp['headers']['X-Pid'] == pid, 'same worker after close'
+    assert resp['headers']['X-Read'] == '0', 'read after close gets EOF'
+
+    assert findall(r'exited on signal') == [], 'worker crash'
+
+
 def test_perl_application_errors_print(wait_for_record):
     client.load('errors_print')
 
@@ -148,6 +238,38 @@ def test_perl_application_errors_print(wait_for_record):
     assert (
         wait_for_record(r'\[error\].+Error in application') is not None
     ), 'errors print'
+
+
+def test_perl_application_cookie_var_dup():
+    # The router joins the two Cookie lines for the application.  A cookie
+    # variable read after that still sees both lines.
+    client.load('body_empty')
+
+    assert 'success' in client.conf(
+        [
+            {
+                "action": {
+                    "pass": "applications/body_empty",
+                    "response_headers": {"X-Cookie-B": "$cookie_b"},
+                }
+            }
+        ],
+        'routes',
+    )
+    assert 'success' in client.conf(
+        {"*:8080": {"pass": "routes"}}, 'listeners'
+    )
+
+    resp = client.get(
+        headers={
+            'Host': 'localhost',
+            'Cookie': ['a=1', 'b=2'],
+            'Connection': 'close',
+        }
+    )
+
+    assert resp['status'] == 200, 'status'
+    assert resp['headers'].get('X-Cookie-B') == '2', '$cookie_b'
 
 
 def test_perl_application_header_equal_names():
@@ -197,6 +319,61 @@ def test_perl_application_body_io_file():
     client.load('body_io_file')
 
     assert client.get()['body'] == 'body\n', 'body io file'
+    assert client.get()['body'] == 'body\n', 'body io file retained handle'
+
+
+def test_perl_application_body_io_file_close():
+    client.load('body_io_file_close')
+
+    resp = client.get()
+    assert resp['body'] == 'body\n', 'body io file'
+    assert resp['headers']['X-Prev-Open'] == '0', 'no previous handle'
+
+    # The application keeps the handle of the previous response.  The
+    # module closes it when the response is sent.
+    resp = client.get()
+    assert resp['body'] == 'body\n', 'body io file again'
+    assert resp['headers']['X-Prev-Open'] == '0', 'previous handle closed'
+
+
+def test_perl_application_body_io_lines_empty():
+    client.load('body_io_lines')
+
+    resp = client.get(url='/?empty')
+    assert resp['status'] == 200, 'status'
+    assert resp['body'] == 'abcd', 'empty lines do not end the body'
+    assert client.get()['headers']['X-Closed'] == '1', 'body closed'
+
+
+def test_perl_application_body_io_lines_rs():
+    client.load('body_io_lines')
+
+    resp = client.get()
+    assert resp['body'] == 'abcd', 'body'
+    assert resp['headers']['X-RS'] == '0a', 'record separator'
+
+    # The module sets $/ to read the body.  It gives the old value back.
+    resp = client.get()
+    assert resp['body'] == 'abcd', 'body again'
+    assert resp['headers']['X-RS'] == '0a', 'record separator restored'
+
+
+def test_perl_application_threads_init_fail(
+    findall, skip_alert, wait_for_record
+):
+    skip_alert(r'PSGI: Failed to parse script')
+    client.load('threads_init_fail', threads=2)
+
+    assert client.get()['status'] == 503, 'application start fails'
+
+    assert wait_for_record(r'second load') is not None, 'second load fails'
+    assert (
+        wait_for_record(r'app process \d+ exited with code 1') is not None
+    ), 'application exit'
+
+    # The second thread was never created.  The module must not join it.
+    assert findall(r'join failed') == [], 'no join of a thread never created'
+    assert findall(r'exited on signal') == [], 'no crash'
 
 
 def test_perl_streaming_body_multiple_responses():

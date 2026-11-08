@@ -1,0 +1,23 @@
+id: narrowing-to-proto
+valid:
+  - |
+    nxt_int_t f(nxt_buf_t *b, uint32_t *out) {
+        if (b->len > UINT32_MAX) {
+            return NXT_ERROR;
+        }
+        *out = b->len;
+        return NXT_OK;
+    }
+  - |
+    void f(nxt_unit_request_t *req, nxt_http_request_t *r) {
+        req->server_name_length = r->server_name.length;
+    }
+invalid:
+  - |
+    void f(nxt_buf_t *b) {
+        uint8_t n = (uint8_t) b->len;
+    }
+  - |
+    void f(nxt_unit_request_t *req, nxt_http_request_t *r) {
+        req->method_length = r->method->length;
+    }

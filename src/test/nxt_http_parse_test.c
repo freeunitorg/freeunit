@@ -61,7 +61,7 @@ typedef struct {
 
 
 static nxt_int_t nxt_http_parse_test_run(nxt_http_request_parse_t *rp,
-    nxt_str_t *request);
+    nxt_str_t *request, nxt_bool_t one_read);
 static nxt_int_t nxt_http_parse_test_bench(nxt_thread_t *thr,
     nxt_str_t *request, nxt_lvlhsh_t *hash, const char *name, nxt_uint_t n);
 static void nxt_http_parse_test_hash_destroy(nxt_lvlhsh_t *hash);
@@ -418,6 +418,44 @@ static nxt_http_parse_test_case_t  nxt_http_test_cases[] = {
     },
     {
         nxt_string("GET / HTTP/1.1\r\n"
+                   "Host: exa\x7fmple.com\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host: example.com/\x7f\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host: exa\tmple\x7f.com\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host: \x7f" "example.com\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    /* DEL in the second 16 bytes of the value. */
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host: 0123456789abcdef0123\x7f" "56789abcdef\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    /* DEL is checked at the end of the line, so the parser asks for more. */
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
+                   "Host: exa\x7fmple.com"),
+        NXT_AGAIN,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r\n"
                    "Host: пример.испытание\r\n\r\n"),
         NXT_DONE,
         NULL, { NULL }
@@ -765,8 +803,10 @@ nxt_http_parse_test(nxt_thread_t *thr)
         return NXT_ERROR;
     }
 
-    for (i = 0; i < nxt_nitems(nxt_http_test_cases); i++) {
-        test = &nxt_http_test_cases[i];
+    /* Each case runs twice: one byte per read, then all bytes in one read. */
+
+    for (i = 0; i < 2 * nxt_nitems(nxt_http_test_cases); i++) {
+        test = &nxt_http_test_cases[i / 2];
 
         nxt_memzero(&rp, sizeof(nxt_http_request_parse_t));
 
@@ -783,13 +823,14 @@ nxt_http_parse_test(nxt_thread_t *thr)
             rp.discard_unsafe_fields = test->data.fields.discard_unsafe_fields;
         }
 
-        rc = nxt_http_parse_test_run(&rp, &test->request);
+        rc = nxt_http_parse_test_run(&rp, &test->request, i % 2);
 
         if (rc != test->result) {
             nxt_log_alert(thr->log, "http parse test case failed:\n"
                                     " - request:\n\"%V\"\n"
+                                    " - one read: %ui\n"
                                     " - result: %i (expected: %i)",
-                                    &test->request, rc, test->result);
+                                    &test->request, i % 2, rc, test->result);
             return NXT_ERROR;
         }
 
@@ -949,7 +990,8 @@ done:
 
 
 static nxt_int_t
-nxt_http_parse_test_run(nxt_http_request_parse_t *rp, nxt_str_t *request)
+nxt_http_parse_test_run(nxt_http_request_parse_t *rp, nxt_str_t *request,
+    nxt_bool_t one_read)
 {
     nxt_int_t      rc;
     nxt_buf_mem_t  buf;
@@ -958,7 +1000,7 @@ nxt_http_parse_test_run(nxt_http_request_parse_t *rp, nxt_str_t *request)
     buf.end = request->start + request->length;
 
     buf.pos = buf.start;
-    buf.free = buf.pos + 1;
+    buf.free = one_read ? buf.end - 1 : buf.pos + 1;
 
     do {
         buf.free++;

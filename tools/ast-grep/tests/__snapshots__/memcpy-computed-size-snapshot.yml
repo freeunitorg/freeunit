@@ -1,0 +1,27 @@
+id: memcpy-computed-size
+snapshots:
+  ? |
+    #define COPY(dst, src, n)  do { memcpy((char *) dst + off, src, n + 1); } while (0)
+  : labels:
+    - source: do { memcpy((char *) dst + off, src, n + 1); } while (0)
+      style: primary
+      start: 27
+      end: 83
+  ? |
+    void f(char *dst, char *src, size_t a, size_t b) {
+        memcpy(dst, src, a + b);
+    }
+  : labels:
+    - source: memcpy(dst, src, a + b)
+      style: primary
+      start: 55
+      end: 78
+  ? |
+    void f(char *dst, char *src, size_t n) {
+        nxt_memcpy(dst, src, n + 1);
+    }
+  : labels:
+    - source: nxt_memcpy(dst, src, n + 1)
+      style: primary
+      start: 45
+      end: 72

@@ -1039,6 +1039,14 @@ nxt_http_route_pattern_create(nxt_task_t *task, nxt_mp_t *mp,
             return NXT_ERROR;
         }
 
+#if (NXT_REGEX_JIT)
+        /* Configuration load only; an operator can see the option had effect. */
+        if (!nxt_regex_jit_compiled(re)) {
+            nxt_log(task, NXT_LOG_INFO, "regex \"%V\" is not JIT compiled, "
+                    "the interpreter is used", &test);
+        }
+#endif
+
         pattern->u.regex = re;
         pattern->regex = 1;
 

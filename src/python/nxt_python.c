@@ -144,6 +144,149 @@ nxt_python3_init_config(nxt_int_t pep405)
 #endif
 
 
+#ifdef NXT_PYTHON_EXECUTABLE
+
+/*
+ * The interpreter the module was built against, for an application with no
+ * "home".  Without it CPython finds its prefix through a PATH lookup of the
+ * program name, and a system Python of the same minor version can win: the
+ * application then imports the system standard library.  The absolute path
+ * makes CPython search from the right place.  "home" is not used, because
+ * it would pin one prefix where an installation can have two (prefix and
+ * exec_prefix), and the search from the path finds both.
+ */
+
+#if PY_VERSION_HEX >= NXT_PYTHON_VER(3, 8)
+
+static nxt_int_t
+nxt_python_init_default_program(nxt_task_t *task)
+{
+    PyConfig     config;
+    PyStatus     status;
+    nxt_int_t    ret;
+    PyPreConfig  preconfig;
+
+    ret = NXT_ERROR;
+
+    /*
+     * Start the way Py_InitializeEx(0) has always started these
+     * interpreters: the normal preconfiguration and configuration, which read
+     * the environment (such as "PYTHONPATH" or "PYTHONDEVMODE") and set the
+     * locale from it, without parsing a command line, coercing the C locale,
+     * turning on the UTF-8 mode, setting up the C stdio or installing signal
+     * handlers.  The isolated ones would not set the locale, and the
+     * filesystem encoding would be ASCII even with LANG=C.UTF-8.
+     */
+    PyPreConfig_InitPythonConfig(&preconfig);
+
+    preconfig.parse_argv = 0;
+    preconfig.utf8_mode = 0;
+    preconfig.coerce_c_locale = 0;
+    preconfig.coerce_c_locale_warn = 0;
+
+    status = Py_PreInitialize(&preconfig);
+    if (PyStatus_Exception(status)) {
+        goto fail;
+    }
+
+    PyConfig_InitPythonConfig(&config);
+
+    config.parse_argv = 0;
+    config.configure_c_stdio = 0;
+    config.install_signal_handlers = 0;
+
+    /*
+     * Both fields: up to Python 3.10 the prefix search starts from
+     * "program_name", from Python 3.11 from "executable".
+     * PyConfig_SetBytesString() decodes the path the way Python decodes
+     * its own, independent of the C locale of this process.
+     */
+    status = PyConfig_SetBytesString(&config, &config.program_name,
+                                     NXT_PYTHON_EXECUTABLE);
+    if (PyStatus_Exception(status)) {
+        goto out;
+    }
+
+    status = PyConfig_SetBytesString(&config, &config.executable,
+                                     NXT_PYTHON_EXECUTABLE);
+    if (PyStatus_Exception(status)) {
+        goto out;
+    }
+
+    status = Py_InitializeFromConfig(&config);
+    if (PyStatus_Exception(status)) {
+        goto out;
+    }
+
+    ret = NXT_OK;
+
+out:
+
+    PyConfig_Clear(&config);
+
+    if (ret == NXT_OK) {
+        return ret;
+    }
+
+fail:
+
+    /*
+     * Not an alert: Py_InitializeEx() used to fail here with a fatal error,
+     * and an application whose rootfs has no standard library is expected
+     * to fail this way.
+     */
+    nxt_log(task, NXT_LOG_ERR, "Python initialization failed: %s%s%s",
+              status.func != NULL ? status.func : "",
+              status.func != NULL ? ": " : "",
+              status.err_msg != NULL ? status.err_msg : "");
+
+    return NXT_ERROR;
+}
+
+#elif PY_VERSION_HEX >= NXT_PYTHON_VER(3, 5)
+
+static nxt_int_t
+nxt_python_init_default_program(nxt_task_t *task)
+{
+    static wchar_t  *program;
+
+    /* Py_SetProgramName() keeps the pointer, so the string must live on. */
+    program = Py_DecodeLocale(NXT_PYTHON_EXECUTABLE, NULL);
+    if (program == NULL) {
+        return NXT_ERROR;
+    }
+
+    Py_SetProgramName(program);
+
+    return NXT_OK;
+}
+
+#elif PY_MAJOR_VERSION == 2
+
+static nxt_int_t
+nxt_python_init_default_program(nxt_task_t *task)
+{
+    /* Py_SetProgramName() keeps the pointer; a literal lives on. */
+    Py_SetProgramName((char *) NXT_PYTHON_EXECUTABLE);
+
+    return NXT_OK;
+}
+
+#else
+
+/* Python 3.0 to 3.4 have no Py_DecodeLocale(): keep the default search. */
+
+static nxt_int_t
+nxt_python_init_default_program(nxt_task_t *task)
+{
+    return NXT_OK;
+}
+
+#endif
+
+#endif /* NXT_PYTHON_EXECUTABLE */
+
+
 static nxt_int_t
 nxt_python_start(nxt_task_t *task, nxt_process_data_t *data)
 {
@@ -227,6 +370,35 @@ nxt_python_start(nxt_task_t *task, nxt_process_data_t *data)
 
         nxt_memcpy(nxt_py_home, c->home, len + 1);
         Py_SetPythonHome(nxt_py_home);
+#endif
+
+    } else {
+#if defined(NXT_PYTHON_EXECUTABLE)
+        /*
+         * No "home" in the application configuration: use the interpreter
+         * the module was built against.  An explicit "home" still wins.
+         *
+         * The binary is not mounted in a rootfs, but the prefix search from
+         * its path still finds the mounted standard library, so the path is
+         * used while either is there.  If both are gone, CPython would fall
+         * back to its compiled-in prefix but keep the missing path as
+         * sys.executable, and an application that starts sys.executable
+         * would fail.  Search the PATH as before instead.
+         */
+        if (access(NXT_PYTHON_EXECUTABLE, X_OK) == 0
+            || access(NXT_PYTHON_STDLIB_FILE, R_OK) == 0)
+        {
+            ret = nxt_python_init_default_program(task);
+            if (nxt_slow_path(ret == NXT_ERROR)) {
+                return NXT_ERROR;
+            }
+
+        } else {
+            nxt_log(task, NXT_LOG_WARN, "neither the Python interpreter the "
+                    "module was built against, \"%s\", nor its standard "
+                    "library is available %E; the prefix is searched from "
+                    "the PATH", NXT_PYTHON_EXECUTABLE, nxt_errno);
+        }
 #endif
     }
 

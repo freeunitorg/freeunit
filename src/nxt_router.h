@@ -48,6 +48,8 @@ typedef struct {
     nxt_queue_t              apps;     /* of nxt_app_t */
 
     nxt_router_access_log_t  *access_log;
+    /* The live logs of all configurations; under the lock. */
+    nxt_queue_t              access_logs;
 } nxt_router_t;
 
 
@@ -148,6 +150,20 @@ typedef struct {
 #define NXT_APP_START_TIMEOUT  0
 
 
+/*
+ * The deadline for a request that a worker has taken from the shared port
+ * queue but not acknowledged, when "limits": {"timeout"} is 0 (#665).
+ *
+ * The acknowledgement follows the claim within microseconds, so a request
+ * that stays claimed and unacknowledged for this long belongs to a worker
+ * that died or stalled in that window.  Nothing else ever answers such a
+ * request, and the application reference it holds keeps the prototype from
+ * being told to quit.  A request that is still in the queue, waiting for
+ * capacity, is not bounded by this: "timeout": 0 keeps that wait unbounded.
+ */
+#define NXT_APP_ACK_TIMEOUT    5000
+
+
 typedef struct {
     uint32_t               use_count;
     nxt_app_t              *app;
@@ -168,12 +184,22 @@ struct nxt_app_s {
 
     nxt_str_t              name;
 
-    uint32_t               port_hash_count;
+    /*
+     * The accounting counters are atomics.  The config-apply prefork path
+     * updates some of them without the application lock, so a plain uint32_t
+     * was a C-level data race; the atomic type makes those updates defined.
+     * Every read that can run on another thread is a nxt_atomic_load(), and
+     * the readers that also run under app->mutex keep it, because the lock
+     * still serializes the port set and the queue transitions the counters
+     * describe.
+     */
+    nxt_atomic_t           port_hash_count;
 
-    uint32_t               active_requests;
-    uint32_t               pending_processes;
-    uint32_t               processes;
-    uint32_t               idle_processes;
+    nxt_atomic_t           active_requests;
+    nxt_atomic_t           pending_processes;
+    nxt_atomic_t           processes;
+    nxt_atomic_t           idle_processes;
+    uint32_t               threads;
 
     /*
      * Workers that answered a request and kept running.  Counted in
@@ -182,7 +208,7 @@ struct nxt_app_s {
      * idle_ports and asserts that queue is non-empty while idle_processes
      * exceeds spare_processes.
      */
-    uint32_t               detached_processes;
+    nxt_atomic_t           detached_processes;
 
     /*
      * Application processes the router asked for, that were forked, and that
@@ -197,7 +223,7 @@ struct nxt_app_s {
      * accounted for: it announces itself late, or it dies and the router is
      * told.  See nxt_router_app_start_expired() in src/nxt_router.c.
      */
-    uint32_t               unaccounted_processes;
+    nxt_atomic_t           unaccounted_processes;
 
     uint32_t               max_processes;
     uint32_t               spare_processes;
@@ -229,6 +255,23 @@ struct nxt_app_s {
     nxt_atomic_t           use_count;
     nxt_queue_t            ack_waiting_req; /* of nxt_http_request_t.app_link */
 
+    /*
+     * Requests taken out of ack_waiting_req when the last process died,
+     * whose engines have not yet decided between a resend and an answer
+     * (nxt_router_app_requeue_handler()).  The last one starts the
+     * replacement process.  While it is nonzero no other start is
+     * admitted: see nxt_router_app_can_start().
+     */
+    nxt_atomic_t           requeue_pending;
+
+    /*
+     * Requests those engines retracted from the shared queue, parked here
+     * until a replacement process registers and they are sent again
+     * (nxt_router_app_resend()).  Linked by nxt_http_request_t.app_link,
+     * with ->app_linked set, as in ack_waiting_req.
+     */
+    nxt_queue_t            requeue_req;
+
     nxt_app_joint_t        *joint;
     nxt_port_t             *shared_port;
     nxt_port_t             *proto_port;
@@ -243,14 +286,70 @@ struct nxt_app_s {
  * for the pending_processes accounting, #214 and #269 -- can call the very
  * predicate the router uses instead of keeping a copy that silently drifts
  * from it.
+ *
+ * No start is admitted while engines are still deciding about the requests
+ * that the last process left unacknowledged (requeue_pending): a new process
+ * could take such a request from the shared queue before its engine
+ * retracts it, and the request would be answered 503 for the dead process
+ * while the new one runs it.  The last of those decisions starts the
+ * replacement on the slot nxt_router_app_port_close() reserved, without
+ * passing this gate.
  */
 
 nxt_inline nxt_bool_t
 nxt_router_app_can_start(nxt_app_t *app)
 {
-    return app->processes + app->pending_processes
-               + app->unaccounted_processes < app->max_processes
-            && app->pending_processes < app->max_pending_processes;
+    return nxt_atomic_load(&app->processes)
+               + nxt_atomic_load(&app->pending_processes)
+               + nxt_atomic_load(&app->unaccounted_processes)
+           < app->max_processes
+            && nxt_atomic_load(&app->pending_processes)
+           < app->max_pending_processes
+            && nxt_atomic_load(&app->requeue_pending) == 0;
+}
+
+
+/*
+ * Park a request in the application-wide list, and take it back out.  They
+ * take the link rather than the request so that they can live here, where
+ * the request struct is only forward-declared, for the same reason as the
+ * gate above: the timeout regression test calls the same code the router
+ * calls, so a dropped membership bit or a dropped clear cannot pass the
+ * suite.
+ */
+
+nxt_inline void
+nxt_router_app_request_park(nxt_app_t *app, nxt_queue_link_t *app_link,
+    nxt_request_rpc_data_t *req_rpc_data)
+{
+    nxt_queue_insert_tail(&app->ack_waiting_req, app_link);
+
+    nxt_atomic_xchg(&req_rpc_data->app_linked, 1);
+}
+
+
+/*
+ * Take a request out of the application-wide list and clear its membership
+ * flag, the removal the acknowledgement runs.  Called with app->mutex held;
+ * answers whether the request was linked.  The removal stays spelled out
+ * rather than calling the router's nxt_queue_chk_remove(), which is not
+ * visible here.
+ */
+
+nxt_inline nxt_bool_t
+nxt_router_app_request_unpark(nxt_queue_link_t *app_link,
+    nxt_request_rpc_data_t *req_rpc_data)
+{
+    if (app_link->next == NULL) {
+        return 0;
+    }
+
+    nxt_queue_remove(app_link);
+    app_link->next = NULL;
+
+    nxt_atomic_cmp_set(&req_rpc_data->app_linked, 1, 0);
+
+    return 1;
 }
 
 
@@ -344,6 +443,35 @@ struct nxt_router_access_log_s {
                                       nxt_router_access_log_format_t *format);
     nxt_fd_t               fd;
     nxt_str_t              path;
+
+    /*
+     * One mutex per log.  O_APPEND makes a single write() atomic, not the
+     * retry loop, the marker or the repair of a torn record: all of them are
+     * one critical section, or two engines interleave and both records are
+     * unreadable.  The reopen replaces the descriptor under it too, so a
+     * record and its retries go to one file.  It is held across a write(),
+     * which blocks.
+     */
+    nxt_thread_mutex_t     mutex;
+
+    /*
+     * The counters are 64-bit also on a 32-bit build, so they are read and
+     * changed under a spin lock.  It is held for a few instructions, never
+     * across a write(), so the status report does not wait for a stalled
+     * log.  It nests inside the mutex.
+     */
+    nxt_thread_spinlock_t  lock;
+
+    /* Records the writer dropped; under the lock. */
+    uint64_t               lost;
+    /* Dropped records not yet marked in the log itself; under the lock. */
+    uint64_t               pending;
+
+    /* The log ends inside a line; under the mutex. */
+    uint8_t                torn;
+
+    /* The link in the router's live logs and the count; under its lock. */
+    nxt_queue_link_t       link;
     uint32_t               count;
 };
 
@@ -369,6 +497,8 @@ nxt_bool_t nxt_router_request_expire(nxt_task_t *task, nxt_http_request_t *r,
 
 nxt_int_t nxt_router_access_log_create(nxt_task_t *task,
     nxt_router_conf_t *rtcf, nxt_conf_value_t *value);
+nxt_router_access_log_t *nxt_router_access_log_get(nxt_task_t *task,
+    nxt_router_t *router, nxt_str_t *path);
 void nxt_router_access_log_open(nxt_task_t *task, nxt_router_temp_conf_t *tmcf);
 void nxt_router_access_log_use(nxt_thread_spinlock_t *lock,
     nxt_router_access_log_t *access_log);
@@ -398,6 +528,20 @@ void nxt_router_test_detached_handler(nxt_task_t *task,
 /* The port release, for the websocket accounting test. */
 void nxt_router_test_app_port_release(nxt_task_t *task, nxt_app_t *app,
     nxt_port_t *port, nxt_apr_action_t action);
+
+/*
+ * The access log record write, the loss of a record that could not be built,
+ * the reopen reply and the write faults, for the access log test.
+ */
+void nxt_router_access_log_test_record(nxt_task_t *task,
+    nxt_router_access_log_t *access_log, u_char *start, size_t length);
+void nxt_router_access_log_test_lost(nxt_task_t *task,
+    nxt_router_access_log_t *access_log);
+nxt_int_t nxt_router_access_log_test_reopen_ready(nxt_task_t *task,
+    nxt_router_access_log_t *access_log, nxt_fd_t fd);
+
+extern const ssize_t  *nxt_router_access_log_test_fault;
+extern nxt_uint_t     nxt_router_access_log_test_faults;
 #endif
 
 #if (NXT_TESTS)
@@ -406,6 +550,15 @@ void nxt_router_test_app_port_release(nxt_task_t *task, nxt_app_t *app,
  * releases, for the start-deadline test.
  */
 nxt_router_temp_conf_t *nxt_router_test_temp_conf(nxt_task_t *task);
+
+/* The deferral of an overlapping apply, for the conf overlap test. */
+extern nxt_uint_t  nxt_router_test_confs_deferred;
+extern nxt_uint_t  nxt_router_test_temp_conf_failures;
+void nxt_router_test_conf_data_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+void nxt_router_test_conf_applying_set(nxt_bool_t applying);
+nxt_bool_t nxt_router_test_conf_applying(void);
+nxt_bool_t nxt_router_test_conf_deferred(void);
 void nxt_router_test_app_rpc_create(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf, nxt_app_t *app);
 
@@ -420,8 +573,26 @@ void nxt_router_test_listen_socket_create(nxt_task_t *task,
 void nxt_router_test_listen_socket_update(nxt_task_t *task,
     nxt_joint_job_t *job, nxt_socket_conf_joint_t *joint);
 
-/* The request deadline handler, for the app-timeout test. */
-void nxt_router_test_app_timeout(nxt_task_t *task, void *obj, void *data);
+/* nxt_router_app_port_get(), for the app-timeout test. */
+void nxt_router_test_app_port_get(nxt_task_t *task, nxt_app_t *app,
+    nxt_request_rpc_data_t *req_rpc_data);
+
+/* Process deaths, failed starts and resends, for the app-timeout test. */
+void nxt_router_test_app_port_close(nxt_task_t *task, nxt_port_t *port);
+void nxt_router_test_app_start_failed(nxt_task_t *task, nxt_app_t *app,
+    uint32_t count);
+void nxt_router_test_app_resend_post(nxt_task_t *task, nxt_app_t *app);
+void nxt_router_test_http_request_error(nxt_task_t *task, void *obj,
+    void *data);
+extern nxt_bool_t  nxt_router_test_app_start_hold;
+extern nxt_uint_t  nxt_router_test_app_starts;
+
+/*
+ * A request RPC with the router's response handlers, for the app-timeout
+ * test.  The result is an nxt_request_rpc_data_t.
+ */
+void *nxt_router_test_request_rpc_register(nxt_task_t *task,
+    nxt_port_t *port);
 
 /* The application response decoder, for the response parse test. */
 nxt_int_t nxt_router_test_response_header_parse(nxt_task_t *task,
@@ -434,6 +605,10 @@ nxt_int_t nxt_router_test_response_header_parse(nxt_task_t *task,
  */
 nxt_buf_t *nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     nxt_app_t *app, nxt_uint_t *status);
+
+/* The engine thread start, for the engine port test. */
+nxt_int_t nxt_router_test_thread_create(nxt_task_t *task, nxt_runtime_t *rt,
+    nxt_event_engine_t *engine);
 #endif
 
 

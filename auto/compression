@@ -67,15 +67,39 @@ if [ $NXT_ZSTD = YES ]; then
                       }"
     . auto/feature
 
-    if [ $nxt_found = yes ]; then
-        NXT_HAVE_ZSTD=YES
-        echo " + zstd version: $(pkgconf --modversion libzstd)"
-    else
+    if [ $nxt_found = no ]; then
         $echo
         $echo $0: error: zstd library not found.
         $echo
         exit 1;
     fi
+
+    # src/nxt_zstd.c flushes each part with ZSTD_compressStream2(), which
+    # libzstd added in 1.4.0.  Checking it here fails configure with a
+    # clear message instead of leaving an older library to stop the build.
+    nxt_feature="zstd 1.4.0 or later"
+    nxt_feature_name=
+    nxt_feature_run=no
+    nxt_feature_test="#include <zstd.h>
+
+                      #if ZSTD_VERSION_NUMBER < 10400
+                      #error zstd 1.4.0 or later is required.
+                      #endif
+
+                      int main(void) {
+                          return 0;
+                      }"
+    . auto/feature
+
+    if [ $nxt_found = no ]; then
+        $echo
+        $echo $0: error: zstd 1.4.0 or later is required.
+        $echo
+        exit 1;
+    fi
+
+    NXT_HAVE_ZSTD=YES
+    echo " + zstd version: $(pkgconf --modversion libzstd)"
 fi
 
 

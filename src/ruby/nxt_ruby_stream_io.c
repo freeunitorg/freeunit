@@ -211,6 +211,9 @@ nxt_ruby_stream_io_gets(VALUE obj)
     }
 
     res = nxt_unit_request_read(req, RSTRING_PTR(buf), res);
+    if (nxt_slow_path(res < 0)) {
+        return Qnil;
+    }
 
     rb_str_set_len(buf, res);
 
@@ -283,9 +286,12 @@ nxt_ruby_stream_io_read(VALUE obj, VALUE args)
     }
 
     copy_size = nxt_unit_request_read(req, RSTRING_PTR(buf), copy_size);
+    if (nxt_slow_path(copy_size < 0)) {
+        return Qnil;
+    }
 
     if (RARRAY_LEN(args) > 1 && TYPE(RARRAY_PTR(args)[1]) == T_STRING) {
-
+        rb_str_modify(RARRAY_PTR(args)[1]);
         rb_str_set_len(RARRAY_PTR(args)[1], 0);
         rb_str_cat(RARRAY_PTR(args)[1], RSTRING_PTR(buf), copy_size);
     }
@@ -367,11 +373,13 @@ nxt_ruby_stream_io_s_write(nxt_ruby_io_bind_t *bind, VALUE val)
      */
     req = nxt_ruby_bind_req(bind);
     if (req == NULL) {
-        nxt_unit_log(NULL, NXT_UNIT_LOG_ERR, "Ruby: %s", RSTRING_PTR(val));
+        nxt_unit_log(NULL, NXT_UNIT_LOG_ERR, "Ruby: %.*s",
+                     (int) RSTRING_LEN(val), RSTRING_PTR(val));
         return RSTRING_LEN(val);
     }
 
-    nxt_unit_req_error(req, "Ruby: %s", RSTRING_PTR(val));
+    nxt_unit_req_error(req, "Ruby: %.*s",
+                       (int) RSTRING_LEN(val), RSTRING_PTR(val));
 
     return RSTRING_LEN(val);
 }

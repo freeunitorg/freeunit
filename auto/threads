@@ -131,6 +131,10 @@ fi
 #
 # Linux, FreeBSD 5.3, Solaris.
 # MacOSX 10.7 (Lion) Clang.
+#
+# The test runs a program with two threads.  A compile test is not
+# sufficient: Apple GCC did not support __thread, and on old NetBSD
+# releases a program that used __thread compiled but crashed.
 
 nxt_feature="__thread"
 nxt_feature_name=NXT_HAVE_THREAD_STORAGE_CLASS
@@ -166,9 +170,24 @@ nxt_feature_test="#include <pthread.h>
 
 
 if [ $nxt_found = no ]; then
+    $echo
+    $echo $0: error: FreeUnit requires __thread \
+                     \(thread-local storage support in the compiler and libc\).
+    $echo The test either did not compile with \"$CC\" or did not run \
+          correctly.
+    $echo $NXT_AUTOCONF_ERR has the compiler and test output.
+    $echo Use a compiler and libc with __thread, and build on a host that
+    $echo can run test programs.
+    $echo
+    exit 1;
+fi
 
-    # MacOSX GCC lacks __thread support.
-    # On NetBSD __thread causes segmentation fault.
+
+# The pthread key fallback below does not run now.  Remove after 1.38,
+# together with the pthread key code in src/nxt_thread.h and
+# src/nxt_thread.c.
+
+if [ $nxt_found = no ]; then
 
     nxt_feature="phtread_key_t"
     nxt_feature_name=NXT_HAVE_PTHREAD_SPECIFIC_DATA

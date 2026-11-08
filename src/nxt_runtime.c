@@ -366,6 +366,12 @@ nxt_runtime_start(nxt_task_t *task, void *obj, void *data)
                 "namespace, and applications run as uid %d", (int) nxt_euid);
     }
 
+    if (nxt_ncpu_unlimited != 0) {
+        /* nxt_lib_start() lowers the count before the log file exists. */
+        nxt_log(task, NXT_LOG_INFO, "the cgroup CPU limit lowers the CPU "
+                "count from %ui to %ui", nxt_ncpu_unlimited, nxt_ncpu);
+    }
+
     if (nxt_runtime_event_engine_change(task, rt) != NXT_OK) {
         goto fail;
     }
@@ -787,20 +793,6 @@ nxt_runtime_event_engine_change(nxt_task_t *task, nxt_runtime_t *rt)
     }
 
     return NXT_ERROR;
-}
-
-
-void
-nxt_runtime_event_engine_free(nxt_runtime_t *rt)
-{
-    nxt_queue_link_t    *link;
-    nxt_event_engine_t  *engine;
-
-    link = nxt_queue_first(&rt->engines);
-    nxt_queue_remove(link);
-
-    engine = nxt_queue_link_data(link, nxt_event_engine_t, link);
-    nxt_event_engine_free(engine);
 }
 
 
@@ -1456,45 +1448,6 @@ nxt_runtime_log_files_init(nxt_runtime_t *rt)
 }
 
 
-nxt_file_t *
-nxt_runtime_log_file_add(nxt_runtime_t *rt, nxt_str_t *name)
-{
-    nxt_int_t            ret;
-    nxt_file_t           *file;
-    nxt_file_name_str_t  file_name;
-
-    ret = nxt_file_name_create(rt->mem_pool, &file_name, "V%Z", name);
-
-    if (nxt_slow_path(ret != NXT_OK)) {
-        return NULL;
-    }
-
-    nxt_list_each(file, rt->log_files) {
-
-        /* STUB: hardecoded case sensitive/insensitive. */
-
-        if (file->name != NULL
-            && nxt_file_name_eq(file->name, file_name.start))
-        {
-            return file;
-        }
-
-    } nxt_list_loop;
-
-    file = nxt_list_zero_add(rt->log_files);
-
-    if (nxt_slow_path(file == NULL)) {
-        return NULL;
-    }
-
-    file->fd = NXT_FILE_INVALID;
-    file->log_level = NXT_LOG_ALERT;
-    file->name = file_name.start;
-
-    return file;
-}
-
-
 static nxt_int_t
 nxt_runtime_log_files_create(nxt_task_t *task, nxt_runtime_t *rt)
 {
@@ -1586,31 +1539,6 @@ nxt_runtime_listen_sockets_enable(nxt_task_t *task, nxt_runtime_t *rt)
 }
 
 
-nxt_str_t *
-nxt_current_directory(nxt_mp_t *mp)
-{
-    size_t     length;
-    u_char     *p;
-    nxt_str_t  *name;
-    char       buf[NXT_MAX_PATH_LEN];
-
-    length = nxt_dir_current(buf, NXT_MAX_PATH_LEN);
-
-    if (nxt_fast_path(length != 0)) {
-        name = nxt_str_alloc(mp, length + 1);
-
-        if (nxt_fast_path(name != NULL)) {
-            p = nxt_cpymem(name->start, buf, length);
-            *p = '/';
-
-            return name;
-        }
-    }
-
-    return NULL;
-}
-
-
 static nxt_int_t
 nxt_runtime_pid_file_create(nxt_task_t *task, nxt_file_name_t *pid_file)
 {
@@ -1674,7 +1602,7 @@ nxt_runtime_process_free(nxt_runtime_t *rt, nxt_process_t *process)
         nxt_process_unlink(child);
     } nxt_queue_loop;
 
-    nxt_assert(process->use_count == 0);
+    nxt_assert(nxt_atomic_load(&process->use_count) == 0);
     nxt_assert(process->registered == 0);
     nxt_assert(nxt_queue_is_empty(&process->ports));
 
@@ -1866,8 +1794,7 @@ nxt_runtime_process_find(nxt_runtime_t *rt, nxt_pid_t pid)
  *
  * Cost, since this sits on the shared-memory message path: the find already
  * took the mutex, so the increment itself is free; the matching release in
- * nxt_process_use() is one additional acquisition of the same uncontended
- * global mutex per lookup.
+ * nxt_process_use() takes no lock unless it drops the last reference.
  */
 
 nxt_process_t *
@@ -1884,7 +1811,7 @@ nxt_runtime_process_ref(nxt_runtime_t *rt, nxt_pid_t pid)
 
     if (nxt_lvlhsh_find(&rt->processes, &lhq) == NXT_OK) {
         process = lhq.value;
-        process->use_count++;
+        (void) nxt_atomic_fetch_add(&process->use_count, 1);
 
     } else {
         nxt_thread_log_debug("process %PI not found", pid);
@@ -1917,7 +1844,7 @@ nxt_runtime_process_get(nxt_runtime_t *rt, nxt_pid_t pid)
          */
 
         process = lhq.value;
-        process->use_count++;
+        (void) nxt_atomic_fetch_add(&process->use_count, 1);
 
         nxt_thread_mutex_unlock(&rt->processes_mutex);
 

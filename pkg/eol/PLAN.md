@@ -119,7 +119,7 @@ still future work).
 ## CI wiring — DONE (2026-07)
 
 `.github/workflows/eol-check.yml` runs `cargo run --release --manifest-path
-pkg/eol/Cargo.toml -- --ci` on `ubuntu-latest`. Weekly `schedule:` cron (report-only,
+pkg/eol/Cargo.toml -- --ci` on `ubuntu-26.04`. Weekly `schedule:` cron (report-only,
 opens/updates a tracking issue on error) **plus** `pull_request:` on the eol
 data/tooling paths (hard-fails on validator errors). Distinguished by
 `github.event_name`; exit 2 (all fetches failed) is treated as a neutral outcome.
@@ -174,6 +174,8 @@ Optionally patch `pkg/docker/Makefile` in place.
 [ WARN  ] go 1.24: Dockerfile.go-1.24 — drop in 9 months (2027-02)
 [ OK    ] php 8.3 8.4 8.5 — in sync
 ```
+
+Since this example was written, go 1.24 and node 20 have been dropped before their drop dates, because upstream no longer fixes known CVEs in them. The comment at the top of `.github/workflows/release-docker.yml` names the CVEs.
 
 Exit code: `0` = in sync · `1` = missing or stale Dockerfiles
 

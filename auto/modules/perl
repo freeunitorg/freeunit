@@ -61,6 +61,19 @@ if /bin/sh -c "$NXT_PERL -MConfig -e 'print \"Perl version: \",
     NXT_PERL_INCLUDE=`$NXT_PERL -MExtUtils::Embed -e perl_inc | sed -e 's/^ //;s/ $//'`
     NXT_PERL_LDOPTS=`$NXT_PERL -MExtUtils::Embed -e ldopts | sed -e 's/^ //;s/ $//'`
 
+    # The ccflags of Perl can have -D_FORTIFY_SOURCE=2.  When --hardening
+    # put a -D_FORTIFY_SOURCE in NXT_CFLAGS, a second one with another
+    # level is a "redefined" error under -Werror.  Thus remove the one of
+    # Perl, and keep the level that configure found.
+    case " $NXT_CFLAGS " in
+        *" -D_FORTIFY_SOURCE="*)
+            NXT_PERL_CFLAGS=`echo " $NXT_PERL_CFLAGS " \
+                | sed -e 's/ -[DU]_FORTIFY_SOURCE\(=[0-9]*\)\{0,1\} / /g' \
+                      -e 's/ -[DU]_FORTIFY_SOURCE\(=[0-9]*\)\{0,1\} / /g' \
+                      -e 's/^ *//;s/ *$//'`
+        ;;
+    esac
+
     if [ "$NXT_SYSTEM" = "Darwin" ]; then
         # OS X system perl wants to link universal binaries
         NXT_PERL_LDOPTS=`echo $NXT_PERL_LDOPTS \

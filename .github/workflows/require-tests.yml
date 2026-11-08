@@ -1,0 +1,118 @@
+name: "Require tests"
+
+# Runs on each pull request.  A change to production code under src/ must
+# come with a change under test/ or src/test/.  For now the job only writes
+# a warning and does not block the merge.  The PR can opt out in two ways.
+# It can have the "no-test-needed" label.  Or one of its own commits can
+# have a "No-Test-Reason: <why>" trailer with a value that is not empty.
+# A label change runs the job again.
+
+on:
+  pull_request:
+    types: [ opened, synchronize, reopened, labeled, unlabeled ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  require-tests:
+    name: "require a test for a src/ change"
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    # Not blocking for now: a PR without a test gets a warning, and the
+    # job passes.  An error of the job itself, such as a failed git
+    # command, makes the job fail.  Make the warning blocking when a
+    # release cycle shows how often the opt-out is needed.
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # The step reads commits and trees only, so blobs are not fetched.
+          filter: blob:none
+
+      - name: Check the diff has a matching test change
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: |
+          if echo "$LABELS" | grep -qi '"no-test-needed"'; then
+            echo "opted out via the 'no-test-needed' label"
+            exit 0
+          fi
+
+          # The PR's own commits start at the merge base with the current
+          # tip of the base branch.  The base.sha of the event can be older
+          # than a master commit that a merge from master brought into the
+          # branch.  Then "base.sha..HEAD" has that master commit, and its
+          # trailer or its files count for the PR.  The merge base of
+          # base.sha and HEAD is base.sha itself, so it does not help.
+          # fetch-depth: 0 fetches the base branch as origin/<base>.
+          merge_base="$(git merge-base "refs/remotes/origin/$BASE_REF" \
+              "$HEAD_SHA")"
+
+          # Only a real trailer counts.  Text in the commit body does not.
+          # The trailer value must not be blank.  --no-merges skips the
+          # merge commits.
+          reasons="$(git log --no-merges \
+              --format='%(trailers:key=No-Test-Reason,valueonly)' \
+              "$merge_base..$HEAD_SHA" | grep -E '[^[:space:]]' || true)"
+
+          if [ -n "$reasons" ]; then
+            echo "opted out via a No-Test-Reason: trailer:"
+            echo "$reasons"
+            exit 0
+          fi
+
+          # --no-renames: a rename out of src/ lists its old src/ path
+          # as a deletion, so it still needs a test.
+          #
+          # -z prints each path as it is, NUL-separated.  Without -z git
+          # C-quotes a path that holds a tab, so "src/a\tb.c" is printed
+          # as "\"src/a\\tb.c\"" and the "^src/" match misses it.  A path
+          # with a space needs no quotes and matches either way.  The
+          # grep calls read the NUL-separated records with -z, and tr
+          # turns the result into lines for the report.
+          #
+          # Each file under src/ is production code (C, C++, JS, Java,
+          # Rust and build files).  The tests in src/test/ and the docs
+          # are not.
+          src_changed="$(git diff -z --name-only --no-renames \
+              "$merge_base" "$HEAD_SHA" \
+            | grep -zE '^src/' \
+            | grep -zvE '^src/test/|\.md$|/\.gitignore$' \
+            | tr '\0' '\n' || true)"
+
+          if [ -z "$src_changed" ]; then
+            echo "no production src/ changes; nothing to require"
+            exit 0
+          fi
+
+          # Count added and changed tests only.  A deleted test covers
+          # nothing.  --diff-filter=ACM drops every rename record, so
+          # "git mv src/foo.c test/foo.c" adds no test, whether or not
+          # the content changed with the rename.  A similarity below R100
+          # must not count: a renamed and edited production file is not a
+          # test.  Dropping the record at the source also leaves each
+          # remaining record with one path in field 2.
+          test_changed="$(git diff --name-status -M --diff-filter=ACM \
+              "$merge_base" "$HEAD_SHA" \
+            | cut -f 2 \
+            | grep -E '^(test/|src/test/)' || true)"
+
+          if [ -n "$test_changed" ]; then
+            echo "src/ change is covered by a test/ or src/test/ change"
+            exit 0
+          fi
+
+          echo "This PR changes production files under src/:"
+          echo "$src_changed"
+          echo
+          echo "::warning::This PR changes production files under src/" \
+               "and no file under test/ or src/test/. Add a test, or opt" \
+               "out with the 'no-test-needed' label or a" \
+               "'No-Test-Reason: <why>' trailer on a commit in this PR."

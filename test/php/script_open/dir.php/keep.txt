@@ -1,0 +1,2 @@
+The directory is named like a script on purpose: a request for /dir.php
+reaches the PHP module as that directory, and the module must refuse it.

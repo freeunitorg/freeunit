@@ -149,7 +149,16 @@ nxt_poll_enable(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 static void
 nxt_poll_disable(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
-    if (ev->read != NXT_EVENT_INACTIVE && ev->write != NXT_EVENT_INACTIVE) {
+    /*
+     * Either side non-inactive means the descriptor is in the set, as in
+     * the devpoll, pollset and epoll engines.  With "and" instead, a full
+     * disable with one side already inactive changed nothing: the
+     * descriptor stayed registered, and the close that follows told its
+     * caller that no change was pending, so the socket was closed with the
+     * descriptor still in the set.
+     */
+
+    if (ev->read != NXT_EVENT_INACTIVE || ev->write != NXT_EVENT_INACTIVE) {
         ev->read = NXT_EVENT_INACTIVE;
         ev->write = NXT_EVENT_INACTIVE;
 
@@ -167,21 +176,29 @@ nxt_poll_close(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 }
 
 
+/*
+ * The descriptor is added only when neither side is registered, as in the
+ * epoll engine: an enable on a side that is already active, which the port
+ * layer does on purpose to re-arm a write event, must not add it again.
+ * The hash refuses a duplicate descriptor, and the commit would then raise
+ * the event's error handler.
+ */
+
 static void
 nxt_poll_enable_read(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
     nxt_uint_t  op, events;
 
-    ev->read = NXT_EVENT_ACTIVE;
-
-    if (ev->write == NXT_EVENT_INACTIVE) {
+    if (ev->read == NXT_EVENT_INACTIVE && ev->write == NXT_EVENT_INACTIVE) {
         op = NXT_POLL_ADD;
         events = POLLIN;
 
     } else {
         op = NXT_POLL_CHANGE;
-        events = POLLIN | POLLOUT;
+        events = (ev->write == NXT_EVENT_INACTIVE) ? POLLIN : POLLIN | POLLOUT;
     }
+
+    ev->read = NXT_EVENT_ACTIVE;
 
     nxt_poll_change(engine, ev, op, events);
 }
@@ -192,16 +209,16 @@ nxt_poll_enable_write(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
     nxt_uint_t  op, events;
 
-    ev->write = NXT_EVENT_ACTIVE;
-
-    if (ev->read == NXT_EVENT_INACTIVE) {
+    if (ev->read == NXT_EVENT_INACTIVE && ev->write == NXT_EVENT_INACTIVE) {
         op = NXT_POLL_ADD;
         events = POLLOUT;
 
     } else {
         op = NXT_POLL_CHANGE;
-        events = POLLIN | POLLOUT;
+        events = (ev->read == NXT_EVENT_INACTIVE) ? POLLOUT : POLLIN | POLLOUT;
     }
+
+    ev->write = NXT_EVENT_ACTIVE;
 
     nxt_poll_change(engine, ev, op, events);
 }

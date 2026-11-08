@@ -1,6 +1,7 @@
 import socket
 import struct
 import time
+from pathlib import Path
 
 import pytest
 from packaging import version
@@ -8,6 +9,8 @@ from packaging import version
 from unit.applications.lang.python import ApplicationPython
 from unit.applications.websockets import ApplicationWebsocket
 from unit.option import option
+from unit.utils import waitforfiles
+from unit import port as port_map
 
 prerequisites = {
     'modules': {'python': lambda v: version.parse(v) >= version.parse('3.5')}
@@ -72,6 +75,25 @@ def test_asgi_websockets_handshake():
     client.load('websockets/subprotocol')
 
 
+def test_asgi_websockets_close_then_exception():
+    client.load('websockets/close_exception')
+
+    # A coroutine exception must not turn an already queued close frame
+    # into an RPC error that discards it.  The 4 MiB body is more than the
+    # kernel socket buffers take at once, so the close frame is still in
+    # the router's write queue when the exception arrives.  Repeat to
+    # expose queue ordering.
+    for _ in range(3):
+        _, sock, _ = ws.upgrade()
+        try:
+            ws.frame_write(sock, ws.OP_TEXT, 'close')
+            frame = ws.message_read(sock)
+            assert frame['data'] == b'x' * (4 * 1024 * 1024), 'queued body'
+            check_close(sock, 1008, no_close=True)
+        finally:
+            sock.close()
+
+
 def test_asgi_websockets_subprotocol():
     client.load('websockets/subprotocol')
 
@@ -83,6 +105,44 @@ def test_asgi_websockets_subprotocol():
         resp['headers']['x-subprotocols'] == "('chat', 'phone', 'video')"
     ), 'subprotocols'
     assert resp['headers']['sec-websocket-protocol'] == 'chat', 'key'
+
+
+def test_asgi_websockets_subprotocol_utf8():
+    client.load('websockets/subprotocol_utf8')
+
+    resp, sock, _ = ws.upgrade()
+    sock.close()
+
+    # The header carries the UTF-8 bytes of the string, not its internal
+    # UCS-2 bytes.
+    assert resp['status'] == 101, 'status'
+    assert (
+        resp['headers']['sec-websocket-protocol'] == 'chat-\u0442'
+    ), 'utf-8 subprotocol'
+
+
+def test_asgi_websockets_receive_invalid_utf8(findall, skip_alert):
+    skip_alert(r'Failed to create Unicode for payload')
+
+    client.load('websockets/receive_invalid_utf8')
+
+    _, sock, _ = ws.upgrade()
+
+    # A text frame that is not valid UTF-8 fails receive().  The module
+    # clears the Python error before it gives the exception to the
+    # application, so the application gets the exception and the call
+    # to set_exception() succeeds.  The router does not check the UTF-8
+    # of a frame with an RSV bit set, so RSV1 brings the bytes to the
+    # module.
+    ws.frame_write(sock, ws.OP_TEXT, b'\xff\xfe', rsv1=True)
+    frame = ws.frame_read(sock)
+
+    check_frame(frame, True, ws.OP_TEXT, 'RuntimeError')
+
+    sock.close()
+
+    assert findall(r'set_exception\' call failed') == [], 'set_exception'
+    assert findall(r'SystemError') == [], 'no SystemError'
 
 
 def test_asgi_websockets_mirror():
@@ -586,7 +646,7 @@ def test_asgi_websockets_ping_pong_pending():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    sock.connect(('127.0.0.1', 8080))
+    sock.connect(('127.0.0.1', port_map.port(8080)))
 
     _, sock, _ = ws.upgrade(sock=sock)
 
@@ -1604,6 +1664,83 @@ def test_asgi_websockets_message_over_buffer_limit():
     ws.message(sock, ws.OP_TEXT, payload, fragmention_size=f_size)
 
     check_close(sock, 1009)  # 1009 - CLOSE_TOO_LARGE
+
+
+def test_asgi_websockets_app_queue_full(wait_for_record):
+    client.load('websockets/stall')
+
+    _, sock, _ = ws.upgrade()
+
+    # The application blocks for 2 s on "stall" and reads nothing.  The
+    # router puts each frame of the next message in the application port
+    # queue, 16384 items, so 20000 one-byte frames fill it.  The router must
+    # wait for room, not close the connection.  The bytes differ, so a frame
+    # out of order shows.
+    ws.frame_write(sock, ws.OP_TEXT, 'stall')
+
+    payload = bytes(i % 251 for i in range(20000))
+    ws.message(sock, ws.OP_BINARY, payload, fragmention_size=1)
+
+    frame = ws.message_read(sock, read_timeout=30)
+
+    assert frame['opcode'] == ws.OP_BINARY, 'opcode'
+    assert frame['data'] == payload, 'payload'
+
+    assert wait_for_record(
+        r'websocket: the application queue is full, reading from the '
+        r'client paused'
+    ), 'paused'
+
+    close_connection(sock)
+
+
+def test_asgi_websockets_app_queue_full_timeout(wait_for_record):
+    # A fixed 2 s application sleep does not guarantee a full queue for
+    # 1 s: sending 20000 fragments can itself take seconds on slower CPUs.
+    # Hold the application until the timeout assertion finishes instead.
+    gate = f'{option.temp_dir}/stall-gate'
+    client.load('websockets/stall', environment={'UNIT_TEST_STALL_GATE': gate})
+
+    try:
+        check_app_queue_full_timeout(wait_for_record, gate)
+    finally:
+        # Release the application, and wait for it without an assert: a
+        # failure here must not hide the first one.
+        Path(gate + '.release').touch()
+        if Path(gate + '.started').exists():
+            waitforfiles(gate + '.released', timeout=150)
+
+
+def check_app_queue_full_timeout(wait_for_record, gate):
+    assert 'success' in client.conf(
+        {'http': {'websocket': {'read_timeout': 1, 'keepalive_interval': 0}}},
+        'settings',
+    ), 'read_timeout'
+
+    _, sock, _ = ws.upgrade()
+
+    ws.frame_write(sock, ws.OP_TEXT, 'stall')
+    try:
+        assert waitforfiles(gate + '.started', timeout=150), 'application stalled'
+        ws.message(sock, ws.OP_BINARY, b'*' * 20000, fragmention_size=1)
+
+        assert wait_for_record(
+            r'websocket: the application read nothing for 1000 ms, closing'
+        ), 'closed'
+
+        # The router closes the connection.  A reset is also a close: the
+        # client frames the router did not read are still in its socket.  An
+        # open socket raises a timeout here.
+        sock.settimeout(5)
+
+        try:
+            assert sock.recv(1) == b'', 'connection closed'
+
+        except ConnectionResetError:
+            pass
+
+    finally:
+        sock.close()
 
 
 def test_asgi_websockets_second_frame_over_buffer_limit():

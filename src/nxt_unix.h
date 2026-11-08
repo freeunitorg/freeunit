@@ -27,7 +27,9 @@
 #define _GNU_SOURCE                 /* pread(), pwrite(), gethostname(). */
 #endif
 
-#define _FILE_OFFSET_BITS  64
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS  64       /* Also set by configure. */
+#endif
 
 #include <malloc.h>                 /* malloc_usable_size(). */
 #include <sys/syscall.h>            /* syscall(SYS_gettid). */
@@ -112,7 +114,9 @@
 
 #if (NXT_HPUX)
 
-#define _FILE_OFFSET_BITS  64
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS  64       /* Also set by configure. */
+#endif
 
 /*
  * HP-UX provides three sockets API:

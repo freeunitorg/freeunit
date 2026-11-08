@@ -8,6 +8,9 @@
 #include "nxt_tests.h"
 
 
+extern char  **environ;
+
+
 #if (NXT_TIME_T_SIZE == 4)
 
 /* A 86400-fold number below 2^31. */
@@ -62,6 +65,140 @@ static const struct {
     { -62135596800, -1899, 0, 1, 1, 0, 0, 0, 0 },     /* Mon, 01 Jan 0001 */
 #endif
 };
+
+
+/*
+ * A thread in a signal context cannot call localtime(), so
+ * nxt_thread_time_string_no_cache() takes the GMT offset of the local
+ * time that the thread cached last, as nxt_thread_time_string() does.
+ * Each case runs with a fixed time zone and compares the calendar fields
+ * the handler was given with nxt_gmtime() of the same second plus the
+ * expected offset.  JST has no DST, so the offset is 9 hours all year.
+ */
+
+static struct tm   nxt_signal_time_tm;
+static nxt_time_t  nxt_signal_time_sec;
+
+
+static u_char *
+nxt_signal_time_handler(u_char *buf, nxt_realtime_t *now, struct tm *tm,
+    size_t size, const char *format)
+{
+    nxt_signal_time_tm = *tm;
+    nxt_signal_time_sec = now->sec;
+
+    return buf;
+}
+
+
+static nxt_int_t
+nxt_signal_time_check(nxt_thread_t *thr, const char *name, nxt_time_t offset)
+{
+    struct tm  tm;
+
+    nxt_gmtime(nxt_signal_time_sec + offset, &tm);
+
+    if (tm.tm_year != nxt_signal_time_tm.tm_year
+        || tm.tm_yday != nxt_signal_time_tm.tm_yday
+        || tm.tm_hour != nxt_signal_time_tm.tm_hour
+        || tm.tm_min != nxt_signal_time_tm.tm_min
+        || tm.tm_sec != nxt_signal_time_tm.tm_sec)
+    {
+        nxt_log_alert(thr->log, "signal time test failed: %s: "
+                      "%02d:%02d:%02d, expected %02d:%02d:%02d",
+                      name, nxt_signal_time_tm.tm_hour,
+                      nxt_signal_time_tm.tm_min, nxt_signal_time_tm.tm_sec,
+                      tm.tm_hour, tm.tm_min, tm.tm_sec);
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_signal_time_test(nxt_thread_t *thr)
+{
+    char               **env;
+    u_char             buf[1];
+    struct tm          tm;
+    nxt_int_t          ret;
+    nxt_thread_time_t  saved;
+
+    static nxt_time_string_t  ts = {
+        (nxt_atomic_uint_t) -1,
+        nxt_signal_time_handler,
+        NULL,
+        0,
+        NXT_THREAD_TIME_LOCAL,
+        NXT_THREAD_TIME_SEC,
+    };
+
+    /*
+     * nxt_process_arguments() moved environ[] into memory that only
+     * environ points to.  setenv() replaces the array, so the test keeps
+     * the old pointer and puts it back at the end: the environment is
+     * then exactly as before, TZ included, and LeakSanitizer does not
+     * report the moved array as lost.
+     */
+
+    env = environ;
+
+    (void) setenv("TZ", "JST-9", 1);
+    tzset();
+
+    /*
+     * no_cache sends every call through nxt_thread_time_string_no_cache(),
+     * which does not touch the cached strings; the whole struct is restored
+     * at the end, the signal flag and the local time with it.
+     */
+
+    saved = thr->time;
+    thr->time.no_cache = 1;
+
+    /* Non-signal context: localtime(). */
+
+    thr->time.signal = -1;
+    (void) nxt_thread_time_string(thr, &ts, buf);
+    ret = nxt_signal_time_check(thr, "normal context", 9 * 3600);
+
+    /* Signal context: the GMT offset of the cached local time. */
+
+    if (ret == NXT_OK) {
+        thr->time.localtime = nxt_signal_time_tm;
+        thr->time.signal = 1;
+        (void) nxt_thread_time_string(thr, &ts, buf);
+        ret = nxt_signal_time_check(thr, "signal context", 9 * 3600);
+    }
+
+    /*
+     * Signal context before the thread has cached any local time: the
+     * offset is whatever nxt_timezone() reads from a zeroed struct tm.
+     * That is 0 where it is the tm_gmtoff field, so localtime() would
+     * give a different answer and this case tells the two apart; where it
+     * is the global timezone the two agree and only the first two cases
+     * matter.
+     */
+
+    if (ret == NXT_OK) {
+        nxt_memzero(&tm, sizeof(struct tm));
+        thr->time.localtime = tm;
+        (void) nxt_thread_time_string(thr, &ts, buf);
+        ret = nxt_signal_time_check(thr, "no local time yet",
+                                    nxt_timezone(&tm));
+    }
+
+    thr->time = saved;
+
+    environ = env;
+    tzset();
+
+    if (ret == NXT_OK) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log, "signal time test passed");
+    }
+
+    return ret;
+}
 
 
 nxt_int_t
@@ -191,6 +328,10 @@ nxt_gmtime_test(nxt_thread_t *thr)
 
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "gmtime(): %0.1fns",
                   (end - start) / 10000000.0);
+
+    if (nxt_signal_time_test(thr) != NXT_OK) {
+        return NXT_ERROR;
+    }
 
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "gmtime test passed");
     return NXT_OK;

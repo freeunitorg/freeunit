@@ -5,6 +5,7 @@
  */
 
 #include <nxt_main.h>
+#include <nxt_checked.h>
 
 
 static void nxt_buf_completion(nxt_task_t *task, void *obj, void *data);
@@ -17,22 +18,17 @@ typedef struct {
 } nxt_buf_ts_t;
 
 
-void
-nxt_buf_mem_init(nxt_buf_t *b, void *start, size_t size)
-{
-    b->mem.start = start;
-    b->mem.pos = start;
-    b->mem.free = start;
-    b->mem.end = nxt_pointer_to(start, size);
-}
-
-
 nxt_buf_t *
 nxt_buf_mem_alloc(nxt_mp_t *mp, size_t size, nxt_uint_t flags)
 {
+    size_t     total;
     nxt_buf_t  *b;
 
-    b = nxt_mp_alloc(mp, NXT_BUF_MEM_SIZE + size);
+    if (nxt_slow_path(nxt_size_add(NXT_BUF_MEM_SIZE, size, &total) != 0)) {
+        return NULL;
+    }
+
+    b = nxt_mp_alloc(mp, total);
     if (nxt_slow_path(b == NULL)) {
         return NULL;
     }
@@ -56,10 +52,18 @@ nxt_buf_mem_alloc(nxt_mp_t *mp, size_t size, nxt_uint_t flags)
 nxt_buf_t *
 nxt_buf_mem_ts_alloc(nxt_task_t *task, nxt_mp_t *mp, size_t size)
 {
+    size_t        total;
     nxt_buf_t     *b;
     nxt_buf_ts_t  *ts;
 
-    b = nxt_mp_alloc(mp, NXT_BUF_MEM_SIZE + sizeof(nxt_buf_ts_t) + size);
+    if (nxt_slow_path(nxt_size_add(NXT_BUF_MEM_SIZE + sizeof(nxt_buf_ts_t),
+                                   size, &total)
+                      != 0))
+    {
+        return NULL;
+    }
+
+    b = nxt_mp_alloc(mp, total);
     if (nxt_slow_path(b == NULL)) {
         return NULL;
     }
@@ -95,9 +99,14 @@ nxt_buf_mem_ts_alloc(nxt_task_t *task, nxt_mp_t *mp, size_t size)
 nxt_buf_t *
 nxt_buf_file_alloc(nxt_mp_t *mp, size_t size, nxt_uint_t flags)
 {
+    size_t     total;
     nxt_buf_t  *b;
 
-    b = nxt_mp_alloc(mp, NXT_BUF_FILE_SIZE + size);
+    if (nxt_slow_path(nxt_size_add(NXT_BUF_FILE_SIZE, size, &total) != 0)) {
+        return NULL;
+    }
+
+    b = nxt_mp_alloc(mp, total);
     if (nxt_slow_path(b == NULL)) {
         return NULL;
     }

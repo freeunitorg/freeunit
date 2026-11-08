@@ -1,0 +1,92 @@
+id: shm-double-fetch
+snapshots:
+  ? |
+    void f(nxt_port_msg_t *msg, size_t max) {
+        size_t len;
+
+        if (max < msg->len)
+            return;
+
+        other();
+        len = msg->len;
+    }
+  : labels:
+    - source: len = msg->len;
+      style: primary
+      start: 117
+      end: 132
+    - source: max < msg->len
+      style: secondary
+      start: 67
+      end: 81
+    - source: |-
+        if (max < msg->len)
+                return;
+      style: secondary
+      start: 63
+      end: 98
+  ? |
+    void f(nxt_port_msg_t *msg, size_t max) {
+        size_t len;
+
+        if (msg->len > max) {
+            return;
+        }
+
+        len = msg->len;
+    }
+  : labels:
+    - source: len = msg->len;
+      style: primary
+      start: 112
+      end: 127
+    - source: msg->len > max
+      style: secondary
+      start: 67
+      end: 81
+    - source: |-
+        if (msg->len > max) {
+                return;
+            }
+      style: secondary
+      start: 63
+      end: 106
+  ? |
+    void f(nxt_unit_response_t *resp, size_t count) {
+        nxt_unit_field_t  *f;
+
+        if (nxt_slow_path(count < resp->fields_count)) {
+            return;
+        }
+
+        for (f = resp->fields; f < resp->fields + resp->fields_count; f++) {
+            use(f);
+        }
+    }
+  : labels:
+    - source: resp->fields_count
+      style: primary
+      start: 199
+      end: 217
+    - source: count < resp->fields_count
+      style: secondary
+      start: 99
+      end: 125
+    - source: |-
+        if (nxt_slow_path(count < resp->fields_count)) {
+                return;
+            }
+      style: secondary
+      start: 81
+      end: 151
+    - source: |-
+        for (f = resp->fields; f < resp->fields + resp->fields_count; f++) {
+                use(f);
+            }
+      style: secondary
+      start: 157
+      end: 247
+    - source: f < resp->fields + resp->fields_count
+      style: secondary
+      start: 180
+      end: 217

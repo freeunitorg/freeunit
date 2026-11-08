@@ -6,6 +6,7 @@ from pathlib import Path
 from unit.applications.lang.java import ApplicationJava
 from unit.option import option
 from unit.utils import public_dir
+from unit import port as port_map
 
 prerequisites = {'modules': {'java': 'all'}}
 
@@ -151,7 +152,7 @@ def test_java_application_session_active(date_to_sec_epoch, sec_epoch):
     assert (
         abs(
             date_to_sec_epoch(resp['headers']['X-Session-Last-Access-Time'])
-            - sec_epoch
+            - sec_epoch()
         )
         < 5
     ), 'session last access time'
@@ -374,6 +375,29 @@ def test_java_application_header():
     assert headers['X-Add-Test'] == 'v1', 'add null header'
     assert 'X-Set-Test1' not in headers, 'set null header'
     assert headers['X-Set-Test2'] == '', 'set empty header'
+
+
+def test_java_application_header_long_name():
+    client.load('header_size')
+
+    resp = client.get()
+    assert resp['status'] == 200, 'status'
+    assert resp['headers']['X-Short'] == '1', 'short name'
+
+    # A name longer than 255 bytes is dropped, not cut to its low byte.
+    long_names = [
+        h for h in resp['headers'] if h.lower()[:3] in ('x-a', 'x-b', 'x-c')
+    ]
+    assert long_names == [], 'long names'
+
+
+def test_java_application_header_large_value():
+    client.load('header_size')
+
+    resp = client.get(url='/large')
+    assert resp['status'] == 200, 'status'
+    assert resp['headers'].get('X-Large') == 'x' * 100000, 'large value'
+    assert resp['headers']['X-Short'] == '1', 'header after large value'
 
 
 def test_java_application_content_type():
@@ -857,7 +881,9 @@ def test_java_application_server_name():
     assert server_name('[::1]:8080') == '[::1]', 'ipv6 literal with port'
 
     # the port comes from the listener, never from the Host field
-    assert headers('[::1]:9999')['X-Server-Port'] == '8080', 'server port'
+    assert headers('[::1]:9999')['X-Server-Port'] == str(
+        port_map.port(8080)
+    ), 'server port'
 
     # HTTP/1.0 may omit Host.  The router substitutes "localhost" rather than
     # leaving the name empty, so that is what the servlet sees -- previously

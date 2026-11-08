@@ -53,6 +53,13 @@ typedef struct nxt_http_comp_operations_s      nxt_http_comp_operations_t;
 struct nxt_http_comp_compressor_ctx_s {
     int8_t level;
 
+    /*
+     * The length of the body when it is known, else 0 or -1.  zlib sizes
+     * its window and hash from it, as nginx does: a short body needs no
+     * 32 KiB window.
+     */
+    nxt_off_t size_hint;
+
     union {
 #if NXT_HAVE_ZLIB
         z_stream zlib_ctx;
@@ -93,6 +100,9 @@ extern const nxt_http_comp_operations_t  nxt_http_comp_brotli_ops;
 
 extern nxt_int_t nxt_http_comp_compress_app_response(nxt_task_t *task,
     nxt_http_request_t *r, nxt_buf_t **b);
+extern nxt_int_t nxt_http_comp_static_response_length(nxt_task_t *task,
+    nxt_http_request_t *r, nxt_file_t *f, nxt_file_info_t *fi,
+    size_t static_buf_len, size_t *out_total);
 extern nxt_int_t nxt_http_comp_compress_static_response(nxt_task_t *task,
     nxt_http_request_t *r, nxt_file_t **f, nxt_file_info_t *fi,
     size_t static_buf_len, size_t *out_total);
@@ -105,5 +115,11 @@ extern nxt_int_t nxt_http_comp_apply_compression(nxt_task_t *task,
     nxt_http_request_t *r);
 extern nxt_int_t nxt_http_comp_compression_init(nxt_task_t *task,
     nxt_router_conf_t *rtcf, const nxt_conf_value_t *comp_conf);
+
+#if (NXT_TESTS)
+extern nxt_int_t nxt_http_comp_test_select(nxt_http_request_t *r,
+    const nxt_str_t *value, nxt_bool_t compression, nxt_off_t min_len,
+    nxt_bool_t negotiate, bool *identity_refused);
+#endif
 
 #endif  /* _NXT_COMPRESSION_H_INCLUDED_ */

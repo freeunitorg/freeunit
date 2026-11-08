@@ -8,6 +8,7 @@
 
 #include <nxt_main.h>
 #include <nxt_conf.h>
+#include <nxt_checked.h>
 
 #include <float.h>
 #include <math.h>
@@ -602,6 +603,38 @@ nxt_conf_get_object_member(const nxt_conf_value_t *value, const nxt_str_t *name,
 }
 
 
+/*
+ * The conversion of a number to an integer type is defined only if the
+ * truncated number is in the range of that type (C11 6.3.1.4).  A signed
+ * type of N bits holds -2^(N-1) to 2^(N-1) - 1.  Each bound below is 2^(N-1).
+ * A power of two is exact as a double, so the check compares exact values.
+ */
+#define NXT_CONF_INT32_BOUND  ((uint64_t) NXT_INT32_T_MAX + 1)
+#define NXT_CONF_INT64_BOUND  ((uint64_t) NXT_INT64_T_MAX + 1)
+#define NXT_CONF_INT_BOUND    ((uint64_t) INT_MAX + 1)
+#define NXT_CONF_OFF_BOUND    ((uint64_t) NXT_OFF_T_MAX + 1)
+
+/*
+ * NXT_CONF_MAP_MSEC maps seconds to milliseconds in an unsigned 32-bit
+ * nxt_msec_t.  The largest number of seconds whose product fits is 4294967.
+ * The validator refuses a timeout out of 0 to 2147483 seconds, except in the
+ * stored configuration at startup (see nxt_conf_vldt_msec()).  Earlier
+ * versions accepted any number there, so the map does not fail the whole
+ * configuration.  A negative number, or one above 4294967, gives 4294967
+ * seconds.  A timer of more than NXT_INT32_T_MAX milliseconds fires at once
+ * (see nxt_msec_diff()), and so did -1 on x86, where the conversion gave
+ * 4294966296 milliseconds.  0 would disable the timer instead.
+ */
+#define NXT_CONF_MSEC_MAX     (UINT32_MAX / 1000)
+
+
+nxt_inline nxt_bool_t
+nxt_conf_map_in_range(double num, uint64_t bound)
+{
+    return num >= -(double) bound && num < (double) bound;
+}
+
+
 nxt_int_t
 nxt_conf_map_object(nxt_mp_t *mp, const nxt_conf_value_t *value,
     const nxt_conf_map_t *map, nxt_uint_t n, void *data)
@@ -666,31 +699,71 @@ nxt_conf_map_object(nxt_mp_t *mp, const nxt_conf_value_t *value,
             switch (map[i].type) {
 
             case NXT_CONF_MAP_INT32:
+                if (nxt_slow_path(!nxt_conf_map_in_range(num,
+                                                         NXT_CONF_INT32_BOUND)))
+                {
+                    return NXT_ERROR;
+                }
+
                 val.i32 = num;
                 len = sizeof(val.i32);
                 break;
 
             case NXT_CONF_MAP_INT64:
+                if (nxt_slow_path(!nxt_conf_map_in_range(num,
+                                                         NXT_CONF_INT64_BOUND)))
+                {
+                    return NXT_ERROR;
+                }
+
                 val.i64 = num;
                 len = sizeof(val.i64);
                 break;
 
             case NXT_CONF_MAP_INT:
+                if (nxt_slow_path(!nxt_conf_map_in_range(num,
+                                                         NXT_CONF_INT_BOUND)))
+                {
+                    return NXT_ERROR;
+                }
+
                 val.i = num;
                 len = sizeof(val.i);
                 break;
 
             case NXT_CONF_MAP_SIZE:
+                /*
+                 * The conversion of a number out of the range of ssize_t is
+                 * undefined.  A negative number in the range is defined: -1
+                 * gives SIZE_MAX.  A stored configuration from an earlier
+                 * version can have one (see nxt_conf_vldt_size()).
+                 */
+                if (nxt_slow_path(num < -(double) NXT_CONF_SIZE_BOUND
+                                  || num >= (double) NXT_CONF_SIZE_BOUND))
+                {
+                    return NXT_ERROR;
+                }
+
                 val.size = num;
                 len = sizeof(val.size);
                 break;
 
             case NXT_CONF_MAP_OFF:
+                if (nxt_slow_path(!nxt_conf_map_in_range(num,
+                                                         NXT_CONF_OFF_BOUND)))
+                {
+                    return NXT_ERROR;
+                }
+
                 val.off = num;
                 len = sizeof(val.off);
                 break;
 
             case NXT_CONF_MAP_MSEC:
+                if (nxt_slow_path(num < 0 || num > NXT_CONF_MSEC_MAX)) {
+                    num = NXT_CONF_MSEC_MAX;
+                }
+
                 val.msec = (nxt_msec_t) num * 1000;
                 len = sizeof(val.msec);
                 break;
@@ -2311,6 +2384,27 @@ nxt_conf_json_parse_error(nxt_conf_json_error_t *error, u_char *pos,
 }
 
 
+/* Adds n to len.  A sum that does not fit in size_t gives SIZE_MAX. */
+
+nxt_inline size_t
+nxt_conf_json_length_add(size_t len, size_t n)
+{
+    size_t  sum;
+
+    if (nxt_slow_path(nxt_size_add(len, n, &sum) != 0)) {
+        return SIZE_MAX;
+    }
+
+    return sum;
+}
+
+
+/*
+ * Returns SIZE_MAX if the length does not fit in size_t.  An escaped control
+ * byte takes six bytes, so the printed value can be six times longer than
+ * the value in memory.  No allocation of SIZE_MAX bytes succeeds.
+ */
+
 size_t
 nxt_conf_json_length(const nxt_conf_value_t *value,
     nxt_conf_json_pretty_t *pretty)
@@ -2385,7 +2479,8 @@ nxt_conf_json_string_length(const nxt_conf_value_t *value)
 
     nxt_conf_get_string(value, &str);
 
-    return 2 + nxt_conf_json_escape_length(str.start, str.length);
+    return nxt_conf_json_length_add(2, nxt_conf_json_escape_length(str.start,
+                                                                   str.length));
 }
 
 
@@ -2426,11 +2521,12 @@ nxt_conf_json_array_length(const nxt_conf_value_t *value,
     value = array->elements;
 
     for (n = 0; n < array->count; n++) {
-        len += nxt_conf_json_length(&value[n], pretty);
+        len = nxt_conf_json_length_add(len,
+                                       nxt_conf_json_length(&value[n], pretty));
 
         if (pretty != NULL) {
             /* Indentation and new line. */
-            len += pretty->level + 2;
+            len = nxt_conf_json_length_add(len, pretty->level + 2);
         }
     }
 
@@ -2439,12 +2535,12 @@ nxt_conf_json_array_length(const nxt_conf_value_t *value,
 
         if (n != 0) {
             /* Indentation and new line. */
-            len += pretty->level + 2;
+            len = nxt_conf_json_length_add(len, pretty->level + 2);
         }
     }
 
     /* Reserve space for "n" commas. */
-    return len + n;
+    return nxt_conf_json_length_add(len, n);
 }
 
 
@@ -2521,15 +2617,19 @@ nxt_conf_json_object_length(const nxt_conf_value_t *value,
     member = object->members;
 
     for (n = 0; n < object->count; n++) {
-        len += nxt_conf_json_string_length(&member[n].name) + 1
-               + nxt_conf_json_length(&member[n].value, pretty) + 1;
+        /* The name, ":", the value, and ",". */
+        len = nxt_conf_json_length_add(len,
+                               nxt_conf_json_string_length(&member[n].name));
+        len = nxt_conf_json_length_add(len,
+                               nxt_conf_json_length(&member[n].value, pretty));
+        len = nxt_conf_json_length_add(len, 2);
 
         if (pretty != NULL) {
             /*
              * Indentation, space after ":", new line, and possible
              * additional empty line between non-empty objects.
              */
-            len += pretty->level + 1 + 2 + 2;
+            len = nxt_conf_json_length_add(len, pretty->level + 1 + 2 + 2);
         }
     }
 
@@ -2537,7 +2637,7 @@ nxt_conf_json_object_length(const nxt_conf_value_t *value,
         pretty->level--;
 
         /* Indentation and new line. */
-        len += pretty->level + 2;
+        len = nxt_conf_json_length_add(len, pretty->level + 2);
     }
 
     return len;
@@ -2628,7 +2728,7 @@ nxt_conf_json_escape_length(u_char *p, size_t size)
         ch = *p++;
 
         if (ch == '\\' || ch == '"') {
-            len++;
+            len = nxt_conf_json_length_add(len, 1);
 
         } else if (ch <= 0x1F) {
 
@@ -2638,11 +2738,11 @@ nxt_conf_json_escape_length(u_char *p, size_t size)
             case '\t':
             case '\b':
             case '\f':
-                len++;
+                len = nxt_conf_json_length_add(len, 1);
                 break;
 
             default:
-                len += sizeof("\\u001F") - 2;
+                len = nxt_conf_json_length_add(len, sizeof("\\u001F") - 2);
             }
         }
 

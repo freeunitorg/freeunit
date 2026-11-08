@@ -142,9 +142,50 @@ sudo pytest-3 --print-log --restart test/
 
 # 7. Save logs after execution
 sudo pytest-3 --print-log --save-log test/
+
+# 8. Move the suite off the default base port 8080
+sudo pytest-3 --print-log --port 18080 test/
 ```
 
+### Base port (`--port`)
+
+The suite uses `*:8080` and near ports. Only one run can use them in a network
+namespace. Use `--port N` to move the suite to a different band. Two runs on
+one host must use different bases, for example 8080 and 18080.
+
+`UNIT_TEST_PORT=N` sets the default. `sudo-rs` ignores `-E`, thus use `--port`
+under `sudo`.
+
+`test/unit/port.py` adds `N - 8080` to each known port: 8080–8085, 8090, 8443
+and the helper ports 7976–7999 (see `test/fake_upstream/README.md`). At the
+default base, the map does not change a port. The base must be 8080 plus a
+multiple of 1000, up to 32080, so that the bands of two runs do not overlap.
+
+When you write a test:
+
+- `client.get(port=8081)` and `"*:8081"` in a configuration: no change.
+- A raw socket, `ssl.get_server_certificate()`, a helper process, or a port
+  that Unit sends back: use `port_map.port(8081)`.
+- A configuration from `client.conf_get()` that you compare with a literal:
+  use `port_map.expected(value)`.
+
+`test_port_map.py` runs `unit/port_lint.py`. It fails when a test uses a known
+port that is not mapped. In CI, each leg runs with `--port 18080`, except
+go and node: their fixtures name port 8080. Thus each test file runs off-base
+on each pull request.
+
 (clang-ast static analysis is Docker-only — see the section below.)
+
+### Shell scripts
+
+`test/run-local.sh` and `test/run-local-full.sh` are POSIX sh, and so are the
+other tracked `#!/bin/sh` scripts. `Lint (shell)` runs
+`.github/scripts/lint-shell.sh`, which checks them with
+`shellcheck -s sh -S warning` and `dash -n`. The same job runs
+`test/unitc/argv_test.sh`, which stubs `curl`, `docker`, `ssh` and `ps` and
+asserts the `tools/unitc` control-target argv for the local socket,
+`docker://`, `ssh://` and `http://` on the PUT path, and for GET and DELETE
+under `script(1)`. CI runs both on every pull request.
 
 ## Static analysis (clang-ast)
 
@@ -186,6 +227,8 @@ test/
 ├── requirements.txt      # Python dependencies (pyOpenSSL, pytest)
 ├── run-local.sh          # Docker-based local test runner
 ├── unit/                 # Test utilities (HTTP helpers, status checks, logging)
+│   ├── port.py           # Base port map (--port)
+│   └── port_lint.py      # Finds port literals that bypass the map
 ├── test_*.py             # Core and Python tests
 ├── test_go*/             # Go application and isolation tests
 ├── test_java*/           # Java application and isolation tests
@@ -207,6 +250,33 @@ test/
 
 ## CI
 
-All tests run on GitHub Actions for every PR and push to `master`. See
-`.github/workflows/build-test.yml` for the full matrix (PHP 8.3–8.5, Python 3.12–3.14,
-Go 1.25–1.26, Node.js 20/22/24/26, Java 17/21, Ruby 3.3/3.4/4.0, WASM, WASI).
+GitHub Actions runs the tests in `.github/workflows/build-test.yml`. The
+language versions come from `pkg/eol.json`.
+
+- A push to `master` runs every version of Go, PHP and Ruby, and the one
+  Perl leg, on the runner's system Perl. Node.js, Java and Python run fewer
+  legs. Node.js and Java run the oldest supported version, the newest
+  version and, when it is neither of those, the newest LTS: Node.js 22 and
+  26, Java 17, 25 and 27 today. Python runs the oldest and the newest
+  supported version: 3.12 and 3.15 today.
+- A pull request runs Perl, WASM and WASI, the oldest and the newest Python,
+  and one version each of Go, Java, Node.js, PHP and Ruby. A runtime whose
+  own files change gets every version, except Node.js and Java, which get
+  the legs above. A change to Python's own files does not add Python
+  versions. A change to `pkg/eol.json`, to `build-test.yml` or to
+  `.github/scripts/test-matrix.sh` gives the full matrix, with the Node.js,
+  Java and Python legs above.
+- The `ci-full` label on a pull request gives the full matrix with every
+  Python version.
+- A weekly run on `master` (Sunday, 03:23 UTC) and a manual run
+  (`workflow_dispatch`) test every Python version. A failed weekly run opens
+  or updates a tracking issue. A manual run reports nothing.
+
+`.github/scripts/test-matrix.sh` has the rules and the version that a pull
+request gets for each runtime.
+
+`.github/workflows/nightly.yml` runs two compile gates on `master` once a
+night and on demand: `--hardening=strict` with the runner's gcc and clang,
+and a build against upstream OpenSSL 4.0 at a pinned version. Pull requests
+and pushes do not run them. A failed nightly run opens or updates a tracking
+issue.

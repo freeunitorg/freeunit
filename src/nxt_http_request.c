@@ -7,6 +7,8 @@
 #include <nxt_router.h>
 #include <nxt_http.h>
 #include <nxt_otel.h>
+#include <nxt_checked.h>
+#include <nxt_usdt.h>
 
 
 static void nxt_http_request_start(nxt_task_t *task, void *obj, void *data);
@@ -50,6 +52,25 @@ static nxt_http_name_value_t *nxt_http_cookie(nxt_array_t *array, u_char *name,
      nxt_http_field_hash_char(                                                \
      nxt_http_field_hash_char(NXT_HTTP_FIELD_HASH_INIT,                       \
         'c'), 'o'), 'o'), 'k'), 'i'), 'e')) & 0xFFFF)
+
+#define NXT_HTTP_CONTENT_LENGTH_HASH                                          \
+    (nxt_http_field_hash_end(                                                 \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(                                                \
+     nxt_http_field_hash_char(NXT_HTTP_FIELD_HASH_INIT,                       \
+        'c'), 'o'), 'n'), 't'), 'e'), 'n'), 't'), '-'), 'l'), 'e'), 'n'),     \
+        'g'), 't'), 'h')) & 0xFFFF)
 
 
 static const nxt_http_request_state_t  nxt_http_request_init_state;
@@ -249,6 +270,7 @@ nxt_http_request_create(nxt_task_t *task)
 {
     nxt_mp_t            *mp;
     nxt_buf_t           *last;
+    nxt_event_engine_t  *engine;
     nxt_http_request_t  *r;
 
     mp = nxt_mp_create(4096, 128, 512, 32);
@@ -279,7 +301,9 @@ nxt_http_request_create(nxt_task_t *task)
 
     r->start_time = nxt_thread_monotonic_time(task->thread);
 
-    task->thread->engine->requests_cnt++;
+    engine = task->thread->engine;
+    nxt_atomic_store(&engine->requests_cnt,
+                     nxt_atomic_load(&engine->requests_cnt) + 1);
 
     r->tstr_cache.var.pool = mp;
 
@@ -566,6 +590,7 @@ nxt_http_request_chunked_transform(nxt_http_request_t *r)
     }
 
     nxt_http_field_name_set(f, "Content-Length");
+    f->hash = NXT_HTTP_CONTENT_LENGTH_HASH;
 
     p = nxt_mp_nget(r->mem_pool, NXT_OFF_T_LEN);
     if (nxt_slow_path(p == NULL)) {
@@ -694,7 +719,7 @@ nxt_int_t
 nxt_http_request_body_alloc(nxt_task_t *task, nxt_http_request_t *r,
     size_t body_length)
 {
-    size_t             body_buffer_size;
+    size_t             body_buffer_size, size;
     nxt_buf_t          *b;
     nxt_socket_conf_t  *skcf;
 
@@ -711,9 +736,16 @@ nxt_http_request_body_alloc(nxt_task_t *task, nxt_http_request_t *r,
 
         tmp_name.length = tmp_path->length + tmp_name_pattern.length;
 
-        b = nxt_buf_file_alloc(r->mem_pool,
-                               body_buffer_size + sizeof(nxt_file_t)
-                               + tmp_name.length + 1, 0);
+        /* "body_buffer_size" can be near SIZE_MAX with a 32-bit size_t. */
+        if (nxt_slow_path(nxt_size_add(body_buffer_size,
+                                       sizeof(nxt_file_t) + tmp_name.length
+                                       + 1, &size)
+                          != 0))
+        {
+            return NXT_ERROR;
+        }
+
+        b = nxt_buf_file_alloc(r->mem_pool, size, 0);
         if (nxt_slow_path(b == NULL)) {
             return NXT_ERROR;
         }
@@ -788,6 +820,12 @@ nxt_http_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
         if (nxt_slow_path(ret != NXT_OK)) {
             goto fail;
         }
+    }
+
+    /* After "response_headers", which can add the field. */
+
+    if (r->comp_ctx != NULL) {
+        nxt_http_comp_drop_accept_ranges(r);
     }
 
     /*
@@ -1206,7 +1244,8 @@ nxt_http_request_close_handler(nxt_task_t *task, void *obj, void *data)
         if (rtcf->access_log != NULL) {
             access_log = rtcf->access_log;
 
-            if (nxt_http_cond_value(task, r, &rtcf->log_cond)) {
+            /* -1 means that the condition could not be rendered: no record. */
+            if (nxt_http_cond_value(task, r, &rtcf->log_cond) > 0) {
                 access_log->handler(task, r, access_log, rtcf->log_format);
                 return;
             }
@@ -1214,6 +1253,9 @@ nxt_http_request_close_handler(nxt_task_t *task, void *obj, void *data)
     }
 
     nxt_debug(task, "http request close handler");
+
+    /* Every request ends here once.  Status 0: no response was sent. */
+    NXT_USDT(request__done, (uintptr_t) r, (nxt_int_t) r->status);
 
     r->proto.any = NULL;
 
