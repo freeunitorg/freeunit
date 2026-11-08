@@ -261,6 +261,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_punycode_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_http_parse_test(thr) != NXT_OK) {
         return 1;
     }

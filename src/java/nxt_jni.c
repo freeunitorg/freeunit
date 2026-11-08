@@ -155,27 +155,121 @@ nxt_java_lowcase(char c)
 }
 
 
-jstring
-nxt_java_newString(JNIEnv *env, char *str, uint32_t len)
+/*
+ * Decodes UTF-8 to UTF-16.  Returns the number of UTF-16 units, or -1 if
+ * the bytes are not valid UTF-8.  An overlong form, such as the 0xC0 0x80
+ * of the modified UTF-8 of JNI, and an encoded surrogate are not valid.
+ */
+
+static int32_t
+nxt_java_utf8_decode(jchar *dst, const unsigned char *p, uint32_t len)
 {
-    char     *copy;
-    jstring  res;
+    jchar                *d;
+    uint32_t             u, min, n;
+    const unsigned char  *end;
 
-    if (str[len] == '\0') {
-        return (*env)->NewStringUTF(env, str);
+    d = dst;
+    end = p + len;
+
+    while (p < end) {
+        u = *p++;
+
+        if (u < 0x80) {
+            *d++ = (jchar) u;
+            continue;
+        }
+
+        if (u >= 0xC2 && u <= 0xDF) {
+            n = 1;
+            min = 0x80;
+            u &= 0x1F;
+
+        } else if (u >= 0xE0 && u <= 0xEF) {
+            n = 2;
+            min = 0x800;
+            u &= 0x0F;
+
+        } else if (u >= 0xF0 && u <= 0xF4) {
+            n = 3;
+            min = 0x10000;
+            u &= 0x07;
+
+        } else {
+            return -1;
+        }
+
+        if ((uint32_t) (end - p) < n) {
+            return -1;
+        }
+
+        while (n-- != 0) {
+            if ((*p & 0xC0) != 0x80) {
+                return -1;
+            }
+
+            u = (u << 6) | (*p++ & 0x3F);
+        }
+
+        if (u < min || u > 0x10FFFF || (u >= 0xD800 && u <= 0xDFFF)) {
+            return -1;
+        }
+
+        if (u >= 0x10000) {
+            u -= 0x10000;
+            *d++ = (jchar) (0xD800 | (u >> 10));
+            *d++ = (jchar) (0xDC00 | (u & 0x3FF));
+
+        } else {
+            *d++ = (jchar) u;
+        }
     }
 
-    copy = malloc(len + 1);
-    if (copy == NULL) {
-        return NULL;
+    return (int32_t) (d - dst);
+}
+
+
+/*
+ * Makes a String of "len" bytes.  The bytes need no NUL at the end and may
+ * hold NUL.  If all of them are valid UTF-8, they are decoded as UTF-8.
+ * Else all of them are decoded as ISO-8859-1, the encoding that the Servlet
+ * API uses for headers, so each byte gives one char and no byte is lost.
+ */
+
+jstring
+nxt_java_newString(JNIEnv *env, const char *str, uint32_t len)
+{
+    jchar     buf[256], *chars;
+    int32_t   n;
+    jstring   res;
+    uint32_t  i;
+
+    /* A byte gives at most one UTF-16 unit. */
+
+    if (len <= sizeof(buf) / sizeof(buf[0])) {
+        chars = buf;
+
+    } else {
+        chars = malloc(len * sizeof(jchar));
+        if (chars == NULL) {
+            return NULL;
+        }
     }
 
-    memcpy(copy, str, len);
-    copy[len] = '\0';
+    n = nxt_java_utf8_decode(chars, (const unsigned char *) str, len);
 
-    res = (*env)->NewStringUTF(env, copy);
+    if (n < 0) {
+        for (i = 0; i < len; i++) {
+            chars[i] = (unsigned char) str[i];
+        }
 
-    free(copy);
+        n = len;
+    }
+
+    res = (*env)->NewString(env, chars, n);
+
+    if (chars != buf) {
+        free(chars);
+    }
 
     return res;
 }

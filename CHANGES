@@ -131,6 +131,28 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
 
     *) Feature: Docker images for Python 3.15.
 
+    *) Bugfix: a Java application got a wrong String for a request header,
+       URI or query string with bytes that are not valid UTF-8 or with a
+       4-byte UTF-8 character, and a response header value that the
+       application set was read back only up to a NUL. Now a value that is
+       all valid UTF-8 is decoded as UTF-8, and any other value is decoded
+       as ISO-8859-1, one char for each byte. An overlong form, such as C0
+       80, and an encoded surrogate are not valid UTF-8.
+
+    *) Bugfix: a "host" match pattern written in Unicode, such as
+       "münchen.example", matched only a Host header sent as raw UTF-8, not
+       the punycode form a browser sends ("xn--mnchen-3ya.example"). Each
+       non-ASCII label is now converted to punycode once, when the
+       configuration is loaded, so the pattern matches the punycode form and
+       no longer the raw one. A wildcard may be a label of its own but not
+       part of a non-ASCII label, and a label over 63 bytes in punycode is
+       refused. If the stored configuration has such a pattern from an
+       earlier version, it is kept with a warning and compared as written,
+       as before. The pattern must be in lowercase Unicode in NFC; only
+       ASCII case is folded, and a warning is logged for an uppercase
+       non-ASCII letter or a decomposed character. A regular expression
+       pattern is used as written.
+
 
 Changes with FreeUnit 1.37.1                                     30 Oct 2026
 

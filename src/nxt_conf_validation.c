@@ -3320,8 +3320,10 @@ static nxt_int_t
 nxt_conf_vldt_match_pattern(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value)
 {
-    nxt_str_t        pattern;
+    nxt_str_t        pattern, original;
+    nxt_int_t        ret;
     nxt_uint_t       i, first, last;
+    const char       *error;
 #if (NXT_HAVE_REGEX)
     nxt_regex_t      *re;
     nxt_regex_err_t  err;
@@ -3371,6 +3373,61 @@ nxt_conf_vldt_match_pattern(nxt_conf_validation_t *vldt,
         if (pattern.start[i] == '*' && pattern.start[i + 1] == '*') {
             return nxt_conf_vldt_error(vldt, "The \"match\" pattern must "
                                        "not contain double \"*\" markers.");
+        }
+    }
+
+    /*
+     * The router converts a Unicode host pattern to punycode at load,
+     * see nxt_http_route_pattern_create(); this rejects what it cannot
+     * convert, with the reason.  A regex host pattern is used as written.
+     * The context is NULL for "types", which has no name set.
+     *
+     * Earlier versions accepted such a pattern.  If the restored
+     * configuration holds one, refusing it would leave unitd with no
+     * configuration.  So it is kept with a warning, and the router
+     * compares it as written, as before.
+     */
+    if (vldt->ctx != NULL && nxt_strcmp(vldt->ctx, "host") == 0) {
+        pattern.start += first;
+        pattern.length -= first;
+
+        original = pattern;
+
+        ret = nxt_punycode_host(vldt->pool, &pattern, &error);
+
+        if (ret == NXT_ERROR) {
+            return NXT_ERROR;
+        }
+
+        if (ret == NXT_DECLINED) {
+            if (!vldt->restored) {
+                return nxt_conf_vldt_error(vldt, "The \"host\" pattern "
+                                           "\"%V\" cannot be converted to "
+                                           "punycode: %s.", &pattern, error);
+            }
+
+            nxt_thread_log_error(NXT_LOG_WARN, "the restored configuration "
+                                 "has the \"host\" pattern \"%V\", which "
+                                 "cannot be converted to punycode: %s.  The "
+                                 "control API now refuses it.  It is kept, "
+                                 "and it is compared as written.  Correct it "
+                                 "to be able to update the configuration.",
+                                 &pattern, error);
+
+            return NXT_OK;
+        }
+
+        /*
+         * A pattern with an uppercase non-ASCII letter or in NFD is
+         * converted, but no browser sends that form.
+         */
+        if (nxt_punycode_host_suspect(&original)) {
+            nxt_thread_log_error(NXT_LOG_WARN, "the \"host\" pattern \"%V\" "
+                                 "is matched as \"%V\".  It seems to have an "
+                                 "uppercase letter or a decomposed character, "
+                                 "so it never matches the host name that a "
+                                 "browser sends.  Write it in lowercase NFC.",
+                                 &original, &pattern);
         }
     }
 
