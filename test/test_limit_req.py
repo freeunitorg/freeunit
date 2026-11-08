@@ -744,3 +744,22 @@ def test_limit_req_every_zone_once():
     c = counters(zone(attempt, f'{ZONE}-all'))
     assert c['passed'] == 3
     assert c['rejected'] == 0
+
+
+def test_limit_req_ipv4_mapped():
+    # An IPv4 address mapped into IPv6 is the IPv4 client: it has the key
+    # of its IPv4 address, not of the /64 that all the mapped addresses
+    # share.
+    load(limited(), {'pass': 'routes', 'client_ip': CLIENT_IP})
+
+    def run(attempt):
+        return [
+            get_as(f'::ffff:10.{attempt}.0.1'),
+            get_as(f'::ffff:10.{attempt}.0.2'),
+            get_as(f'10.{attempt}.0.1'),
+            get_as(f'10.{attempt}.0.2'),
+        ]
+
+    attempt, result = quick(run, 1)
+    assert result == [200, 200, 429, 429]
+    assert counters()['keys'] == 2 * (attempt + 1)

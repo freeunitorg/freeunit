@@ -98,8 +98,11 @@ nxt_http_limit_req_zone_parse(const nxt_str_t *zone, nxt_str_t *name,
 
 /*
  * The key: the client address without its port, IPv4 as /32 and IPv6 as
- * /64.  The lengths differ, so the families cannot collide.  A UNIX socket
- * has no client address: all its clients share one bucket.
+ * /64.  The lengths differ, so the families cannot collide.  An IPv4
+ * address mapped into IPv6 (::ffff:a.b.c.d, from a dual-stack socket or
+ * from "client_ip") is the IPv4 client: it takes the IPv4 key, else all
+ * the mapped clients share the /64 ::ffff:0:0.  A UNIX socket has no
+ * client address: all its clients share one bucket.
  */
 
 size_t
@@ -113,6 +116,11 @@ nxt_http_limit_req_key(const nxt_sockaddr_t *sa, u_char *key)
 
 #if (NXT_INET6)
     case AF_INET6:
+        if (IN6_IS_ADDR_V4MAPPED(&sa->u.sockaddr_in6.sin6_addr)) {
+            nxt_memcpy(key, &sa->u.sockaddr_in6.sin6_addr.s6_addr[12], 4);
+            return 4;
+        }
+
         nxt_memcpy(key, &sa->u.sockaddr_in6.sin6_addr, 8);
         return 8;
 #endif
