@@ -98,7 +98,10 @@ given schedule in flight. `"overlap": "skip"` states this explicitly.
 ### Timeout
 
 Each schedule has its own `timeout`, independent of the application's
-`limits.timeout`. When a run's `timeout` expires:
+`limits.timeout`. It counts from the moment the run is due, so a wait in
+the router before the request reaches the application queue is part of
+it, and so is the wait in that queue. `last_duration_ms` counts from the
+same moment. When a run's `timeout` expires:
 
 - If the request is still in the queue for a process, the router retracts
   it.

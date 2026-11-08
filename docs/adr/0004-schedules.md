@@ -154,7 +154,10 @@ worker engine, counts as `failed` and not in `runs`.
 #### 7.2 Timeout
 
 A run has its own timer; `r->timer` already carries `limits.timeout`, or
-the 5 s acknowledgement deadline when that is 0. On expiry the run timer
+the 5 s acknowledgement deadline when that is 0. The run's start time is
+taken on the main engine when the run is due, so the wait in the queue of
+the worker engine counts: the run timer is armed for `timeout` less that
+wait, and `last_duration_ms` counts from the same start. On expiry the run timer
 calls `nxt_router_request_expire()`, factored out of
 `nxt_router_app_timeout()`: a queued request is retracted, and a running
 one is abandoned; both are answered with 503. A request that a worker

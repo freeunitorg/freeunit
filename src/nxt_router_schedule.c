@@ -105,6 +105,8 @@ static void nxt_router_schedule_arm(nxt_event_engine_t *engine,
     nxt_router_schedule_state_t *state, nxt_msec_t delay);
 static void nxt_router_schedule_timer_handler(nxt_task_t *task, void *obj,
     void *data);
+static nxt_msec_t nxt_router_schedule_msec_since(nxt_task_t *task,
+    nxt_nsec_t start);
 static void nxt_router_schedule_run(nxt_task_t *task, void *obj, void *data);
 static nxt_int_t nxt_router_schedule_fields_init(void);
 static nxt_int_t nxt_router_schedule_request_init(nxt_http_request_t *r,
@@ -718,6 +720,13 @@ nxt_router_schedule_timer_handler(nxt_task_t *task, void *obj, void *data)
     run->main = task->thread->engine;
     run->seq = ++state->stat.runs;
 
+    /*
+     * The run starts when it is due, not when the worker engine takes the
+     * job: the wait in that queue counts in its "timeout" and in
+     * "last_duration_ms" (section 7.2).
+     */
+    run->started = nxt_thread_monotonic_time(task->thread);
+
     state->stat.running = 1;
 
     nxt_realtime(&now);
@@ -732,6 +741,23 @@ nxt_router_schedule_timer_handler(nxt_task_t *task, void *obj, void *data)
 
 
 /*
+ * The time since "start", a monotonic time of another thread: each thread
+ * keeps its own copy of the clock, updated at each loop of its engine, so
+ * the copy of this thread can be the earlier one.
+ */
+
+static nxt_msec_t
+nxt_router_schedule_msec_since(nxt_task_t *task, nxt_nsec_t start)
+{
+    nxt_nsec_t  now;
+
+    now = nxt_thread_monotonic_time(task->thread);
+
+    return (now > start) ? (nxt_msec_t) ((now - start) / 1000000) : 0;
+}
+
+
+/*
  * The run, on the worker engine (section 6.3): a devnull request with the
  * internal joint as r->conf, its header parsed as a client's would be, and
  * the schedule's own "pass" action.
@@ -741,6 +767,7 @@ static void
 nxt_router_schedule_run(nxt_task_t *task, void *obj, void *data)
 {
     nxt_int_t                  ret;
+    nxt_msec_t                 waited, timeout;
     nxt_event_engine_t         *engine;
     nxt_http_request_t         *r;
     nxt_router_schedules_t     *sc;
@@ -753,7 +780,10 @@ nxt_router_schedule_run(nxt_task_t *task, void *obj, void *data)
     /* The run's reference; nxt_router_schedule_run_finish() drops it. */
     sc->joint.count++;
 
-    run->started = nxt_thread_monotonic_time(task->thread);
+    waited = nxt_router_schedule_msec_since(task, run->started);
+    timeout = run->sched->timeout;
+    timeout = (waited < timeout) ? timeout - waited : 0;
+
     run->devnull.close = nxt_router_schedule_run_close;
 
     nxt_router_schedule_timer_init(&run->timer, engine,
@@ -793,8 +823,11 @@ nxt_router_schedule_run(nxt_task_t *task, void *obj, void *data)
     r->path = &run->empty_path;
     r->args = &run->empty_args;
 
-    /* The schedule's deadline; r->timer carries the application's. */
-    nxt_timer_add(engine, &run->timer, run->sched->timeout);
+    /*
+     * The schedule's deadline, less the wait in the queue of this engine;
+     * r->timer carries the application's.
+     */
+    nxt_timer_add(engine, &run->timer, timeout);
 
     ret = nxt_router_schedule_request_init(r, run->sched);
     if (nxt_slow_path(ret != NXT_OK)) {
@@ -928,8 +961,7 @@ nxt_router_schedule_run_close(nxt_task_t *task, nxt_http_devnull_t *dn,
 
     run = (nxt_router_schedule_run_t *) dn;
 
-    run->duration = (nxt_msec_t) ((nxt_thread_monotonic_time(task->thread)
-                                   - run->started) / 1000000);
+    run->duration = nxt_router_schedule_msec_since(task, run->started);
 
     run->timer.handler = nxt_router_schedule_run_finish;
     nxt_timer_add(task->thread->engine, &run->timer, 0);

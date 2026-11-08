@@ -7652,9 +7652,10 @@ components:
 
         timeout:
           type: integer
-          description: "Seconds before an unfinished run is abandoned. The
-            application process is not stopped; see the caveats above.
-            Defaults to `interval`."
+          description: "Seconds before an unfinished run is abandoned,
+            counted from the moment the run is due. The application
+            process is not stopped; see the caveats above. Defaults to
+            `interval`."
           minimum: 1
           maximum: 2147483
           example: 240
@@ -9155,7 +9156,7 @@ components:
           minimum: 0
           maximum: 4294967295
           description: "The most recently finished run's duration, in
-            milliseconds."
+            milliseconds, from the moment the run was due."
 
         last_start:
           type: integer
