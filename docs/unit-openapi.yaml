@@ -8115,7 +8115,10 @@ components:
             zone can hold, from 1 to 1048576; the default is 4096.  A zone
             takes 48 bytes per key plus 4 bytes per hash bucket, the buckets
             being the power of two at or above `keys`: 208 KiB for the
-            default, 52 MiB at most.  When the zone is full, a new client
+            default, 52 MiB at most.  The zones of one configuration hold
+            1048576 keys in total at most, and there are 1024 zones at
+            most; the memory is taken when the configuration is applied.
+            When the zone is full, a new client
             address takes the entry that was used the longest time ago only
             when that entry is idle: its bucket is full again, so nothing is
             lost.  Else the new address is counted in one overflow bucket

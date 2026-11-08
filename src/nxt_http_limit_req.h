@@ -25,6 +25,15 @@
 /* "zone": "name" without a size. */
 #define NXT_HTTP_LIMIT_REQ_KEYS_DEFAULT  4096
 
+/*
+ * The zones of one configuration: at most this many, with this many keys
+ * in all.  A zone takes its memory when the configuration is applied: 52
+ * bytes per key and a pool of 32 KiB, so the zones take about 84 MiB at
+ * most.
+ */
+#define NXT_HTTP_LIMIT_REQ_ZONES_MAX     1024
+#define NXT_HTTP_LIMIT_REQ_KEYS_TOTAL    NXT_LIMIT_KEYS_MAX
+
 
 typedef enum {
     NXT_HTTP_LIMIT_REQ_HEADERS = 0,

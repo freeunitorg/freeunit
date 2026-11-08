@@ -839,3 +839,63 @@ def test_limit_req_status_applied():
 
     finally:
         sock.close()
+
+
+def test_limit_req_invalid_fallback():
+    # A "limit_req" in a "fallback", also in the "fallback" of a
+    # "fallback", is compared with the other ones of its zone, also with
+    # one in another "fallback".
+    detail = (
+        f'The "limit_req" zone "{ZONE}" is used with another size, "rate" '
+        'or "burst" elsewhere.'
+    )
+
+    def share(fallback):
+        return {'share': '/nonexistent', 'fallback': fallback}
+
+    def limited_action(rate):
+        return {'limit_req': limit(rate=rate), 'return': 200}
+
+    for first, second in (
+        (share(limited_action(2)), limited_action(1)),
+        (share(limited_action(2)), share(limited_action(1))),
+        (share(share(limited_action(2))), share(limited_action(1))),
+    ):
+        resp = client.conf(
+            config(
+                [
+                    {'match': {'uri': '/a'}, 'action': first},
+                    {'action': second},
+                ]
+            )
+        )
+
+        assert resp.get('detail') == detail, resp
+
+
+def test_limit_req_invalid_total():
+    # The zones of one configuration hold 1048576 keys in all at most, and
+    # there are 1024 zones at most: each zone takes its memory when the
+    # configuration is applied.
+    def routes(zones):
+        return [
+            {
+                'match': {'uri': f'/{i}'},
+                'action': {'limit_req': limit(zone=name), 'return': 200},
+            }
+            for i, name in enumerate(zones)
+        ]
+
+    resp = client.conf(config(routes([f'z{i}:400000' for i in range(3)])))
+    assert resp.get('detail') == (
+        'The "limit_req" zones hold 1200000 keys in total, more than 1048576.'
+    ), resp
+
+    resp = client.conf(config(routes([f'z{i}:1' for i in range(1025)])))
+    assert resp.get('detail') == (
+        'The configuration has 1025 "limit_req" zones, more than 1024.'
+    ), resp
+
+    # A zone that two limits name is counted once.
+    load(routes([f'{ZONE}:600000', f'{ZONE}:600000']))
+    assert counters()['keys_max'] == 600000
