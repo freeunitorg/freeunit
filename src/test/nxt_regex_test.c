@@ -44,11 +44,25 @@
 #define NXT_REGEX_TEST_LONG_RESULT  NXT_ERROR
 #endif
 
+/*
+ * "(?s).*(a+)+[bc]" on 12 "a" bytes and an invalid byte, 512 times.  With
+ * PCRE2_MATCH_INVALID_UTF, the library matched each valid fragment with a
+ * new step count, and the match took about 180 ms.  A subject that is not
+ * valid UTF-8 now matches the byte-mode twin, which stops at the match limit.
+ */
+#define NXT_REGEX_TEST_FRAGMENTS  512
+#define NXT_REGEX_TEST_FRAGMENT   13
+
 static nxt_regex_t *nxt_regex_test_compile(nxt_thread_t *thr, nxt_mp_t *mp,
     const char *pattern);
 static nxt_int_t nxt_regex_reuse_test(nxt_thread_t *thr);
 static nxt_int_t nxt_regex_route_test(nxt_thread_t *thr);
+static nxt_int_t nxt_regex_test_utf(void);
+static nxt_int_t nxt_regex_test_restrict(void);
 static nxt_int_t nxt_regex_jit_test(nxt_thread_t *thr);
+static nxt_int_t nxt_regex_warn_test(nxt_thread_t *thr);
+static nxt_int_t nxt_regex_ascii_test(nxt_thread_t *thr);
+static int nxt_regex_ascii_test_child(void *data);
 
 /* Compile the pattern.  A failure is logged and returns NULL. */
 
@@ -69,6 +83,69 @@ nxt_regex_test_compile(nxt_thread_t *thr, nxt_mp_t *mp, const char *pattern)
     }
 
     return re;
+}
+
+
+/*
+ * Caseless matching keeps ASCII and non-ASCII characters apart in UTF mode
+ * if the library that runs accepts PCRE2_EXTRA_CASELESS_RESTRICT (10.43).
+ */
+
+static nxt_int_t
+nxt_regex_test_restrict(void)
+{
+#if (NXT_HAVE_PCRE2 && defined(PCRE2_EXTRA_CASELESS_RESTRICT))
+    int                    errcode;
+    nxt_int_t              ret;
+    PCRE2_SIZE             offset;
+    pcre2_code             *code;
+    pcre2_compile_context  *ctx;
+
+    if (!nxt_regex_test_utf()) {
+        return 0;
+    }
+
+    ctx = pcre2_compile_context_create(NULL);
+    if (ctx == NULL) {
+        return 0;
+    }
+
+    ret = 0;
+
+    if (pcre2_set_compile_extra_options(ctx, PCRE2_EXTRA_CASELESS_RESTRICT)
+        == 0)
+    {
+        code = pcre2_compile((PCRE2_SPTR) "a", 1, 0, &errcode, &offset, ctx);
+        if (code != NULL) {
+            ret = 1;
+            pcre2_code_free(code);
+        }
+    }
+
+    pcre2_compile_context_free(ctx);
+
+    return ret;
+#else
+    return 0;
+#endif
+}
+
+
+/* Patterns match in UTF mode with PCRE2 that has Unicode support. */
+
+static nxt_int_t
+nxt_regex_test_utf(void)
+{
+#if (NXT_HAVE_PCRE2)
+    uint32_t  unicode;
+
+    unicode = 0;
+
+    return (pcre2_config(PCRE2_CONFIG_UNICODE, &unicode) == 0
+            && unicode != 0);
+#else
+    return 0;
+#endif
 }
 
 
@@ -107,7 +184,13 @@ nxt_regex_test(nxt_thread_t *thr)
 {
     u_char     *subject;
     nxt_mp_t   *mp;
-    nxt_int_t  ret, slow, deep, shallow, starts, anchored;
+    nxt_int_t  ret, slow, deep, shallow, starts, anchored, utf, utf_char,
+               utf_invalid, utf_pattern, utf_escape, utf_escape_byte,
+               utf_negative, utf_lookbehind, utf_dotstar, utf_caseless,
+               utf_only, utf_fragments, utf_unanchored, utf_word,
+               utf_word_valid, utf_block, utf_caseless_ascii,
+               utf_caseless_cyrillic, utf_kelvin, restrict_;
+    size_t     i;
 
     nxt_thread_time_update(thr);
 
@@ -154,6 +237,160 @@ nxt_regex_test(nxt_thread_t *thr)
                                  &anchored);
     }
 
+    /* "\xd0\xbf" is U+043F in UTF-8, "\xff" is never valid UTF-8. */
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "^/.$", (u_char *) "/\xd0\xbf", 3,
+                                 &utf_char);
+    }
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "^/[^/]+$", (u_char *) "/\xff", 2,
+                                 &utf_invalid);
+    }
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "^/\xff$", (u_char *) "/\xff", 2,
+                                 &utf_pattern);
+    }
+
+    /* In UTF mode "\xff" in a pattern is U+00FF, the bytes C3 BF. */
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "^\\xff$", (u_char *) "\xc3\xbf", 2,
+                                 &utf_escape);
+    }
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "^\\xff$", (u_char *) "\xff", 1,
+                                 &utf_escape_byte);
+    }
+
+    /*
+     * ".*" does not go past an invalid byte in UTF mode.  So a negative
+     * route pattern such as "!~^/admin/.*$" gives the opposite result.
+     */
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "^/admin/.*$",
+                                 (u_char *) "/admin/\xff", 8, &utf_negative);
+    }
+
+    /*
+     * The JIT of PCRE2 before 10.48 with PCRE2_MATCH_INVALID_UTF gives no
+     * match here, and the interpreter a match.
+     */
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "(?<=a)", (u_char *) "a\x80", 2,
+                                 &utf_lookbehind);
+    }
+
+    /*
+     * The interpreter and the JIT gave different results here with
+     * PCRE2_MATCH_INVALID_UTF.
+     */
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "(?s).*b", (u_char *) "a\xff" "b", 3,
+                                 &utf_dotstar);
+    }
+
+    /*
+     * An unanchored pattern is compiled again with PCRE2_AUTO_CALLOUT.  The
+     * second compile must keep UTF mode.
+     */
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "\\xff", (u_char *) "\xc3\xbf", 2,
+                                 &utf_unanchored);
+    }
+
+    /*
+     * An ASCII subject skips the UTF-8 check, tested 8 bytes at a time.  An
+     * invalid byte in the last byte of a word or in the tail must still go
+     * to the byte-mode twin, where "\xff" is the byte FF.
+     */
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "\\xff",
+                                 (u_char *) "/admin/\xff" "aaaaaaaa", 16,
+                                 &utf_word);
+    }
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "\\xff",
+                                 (u_char *) "/admin/aaaaaaaaaaaaaaaaaaaaaaaa"
+                                            "\xff" "aaaaaaaa", 40,
+                                 &utf_block);
+    }
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "^/admin/a.$",
+                                 (u_char *) "/admin/a\xd0\xbf", 10,
+                                 &utf_word_valid);
+    }
+
+    /*
+     * In UTF mode "s" also matches U+017F caselessly, unless
+     * PCRE2_EXTRA_CASELESS_RESTRICT keeps ASCII and non-ASCII apart.  ASCII
+     * and non-ASCII letters still match their own other case.
+     */
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "(?i)^/admins$",
+                                 (u_char *) "/ADMINS", 7, &utf_caseless_ascii);
+    }
+
+    /* U+212A KELVIN SIGN, with "k" as for U+017F with "s". */
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "(?i)^/k$",
+                                 (u_char *) "/\xe2\x84\xaa", 4, &utf_kelvin);
+    }
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "(?i)^/\xd0\xbf$",
+                                 (u_char *) "/\xd0\x9f", 3,
+                                 &utf_caseless_cyrillic);
+    }
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "(?i)^/admins$",
+                                 (u_char *) "/admin\xc5\xbf", 8,
+                                 &utf_caseless);
+    }
+
+    /* "\x{43f}" is valid only in UTF mode, so the pattern has no twin. */
+
+    utf_only = NXT_ERROR;
+
+    if (ret == NXT_OK && nxt_regex_test_utf()) {
+        ret = nxt_regex_test_run(thr, mp, "^/\\x{43f}$", (u_char *) "/\xff",
+                                 2, &utf_only);
+    }
+
+    if (ret == NXT_OK) {
+        subject = nxt_mp_alloc(mp, NXT_REGEX_TEST_FRAGMENTS
+                                   * NXT_REGEX_TEST_FRAGMENT);
+        if (subject == NULL) {
+            ret = NXT_ERROR;
+
+        } else {
+            for (i = 0; i < NXT_REGEX_TEST_FRAGMENTS * NXT_REGEX_TEST_FRAGMENT;
+                 i++)
+            {
+                subject[i] = (i % NXT_REGEX_TEST_FRAGMENT
+                              == NXT_REGEX_TEST_FRAGMENT - 1) ? 0xff : 'a';
+            }
+
+            ret = nxt_regex_test_run(thr, mp, "(?s).*(a+)+[bc]", subject,
+                                     NXT_REGEX_TEST_FRAGMENTS
+                                     * NXT_REGEX_TEST_FRAGMENT,
+                                     &utf_fragments);
+        }
+    }
+
     nxt_mp_destroy(mp);
 
     if (ret != NXT_OK) {
@@ -180,6 +417,93 @@ nxt_regex_test(nxt_thread_t *thr)
     NXT_TEST_CHECK(thr->log, anchored == 0, "regex test: anchored pattern "
                    "on %d bytes returned %i, expected 0",
                    NXT_REGEX_TEST_STARTS + 1, anchored);
+
+    utf = nxt_regex_test_utf();
+
+    NXT_TEST_CHECK(thr->log, utf_char == utf, "regex test: \".\" on a "
+                   "2-byte UTF-8 character returned %i, expected %i",
+                   utf_char, utf);
+
+    /*
+     * A subject with invalid UTF-8 matches the byte-mode twin, so it gets
+     * the result of byte mode, and no error.
+     */
+
+    NXT_TEST_CHECK(thr->log, utf_invalid == 1, "regex test: subject "
+                   "with invalid UTF-8 returned %i, expected 1", utf_invalid);
+
+    NXT_TEST_CHECK(thr->log, utf_pattern == 1, "regex test: pattern with "
+                   "invalid UTF-8 returned %i, expected 1", utf_pattern);
+
+    NXT_TEST_CHECK(thr->log, utf_escape == utf, "regex test: \"\\xff\" on "
+                   "U+00FF returned %i, expected %i", utf_escape, utf);
+
+    NXT_TEST_CHECK(thr->log, utf_escape_byte == 1, "regex test: "
+                   "\"\\xff\" on the byte FF returned %i, expected 1",
+                   utf_escape_byte);
+
+    /* So a client cannot make a deny rule such as "~^/admin/.*$" miss. */
+
+    NXT_TEST_CHECK(thr->log, utf_negative == 1, "regex test: \".*\" on "
+                   "an invalid byte returned %i, expected 1", utf_negative);
+
+    NXT_TEST_CHECK(thr->log, utf_lookbehind == 1, "regex test: lookbehind "
+                   "before an invalid byte returned %i, expected 1",
+                   utf_lookbehind);
+
+    NXT_TEST_CHECK(thr->log, utf_unanchored == utf, "regex test: "
+                   "unanchored \"\\xff\" on U+00FF returned %i, expected %i",
+                   utf_unanchored, utf);
+
+    NXT_TEST_CHECK(thr->log, utf_word == 1, "regex test: an invalid byte "
+                   "in an 8-byte word returned %i, expected 1", utf_word);
+
+    NXT_TEST_CHECK(thr->log, utf_block == 1, "regex test: an invalid byte "
+                   "in a 32-byte block returned %i, expected 1", utf_block);
+
+    NXT_TEST_CHECK(thr->log, utf_word_valid == utf, "regex test: a UTF-8 "
+                   "character after 8 ASCII bytes returned %i, expected %i",
+                   utf_word_valid, utf);
+
+    NXT_TEST_CHECK(thr->log, utf_dotstar == 1, "regex test: \"(?s).*b\" "
+                   "on an invalid byte returned %i, expected 1", utf_dotstar);
+
+    restrict_ = nxt_regex_test_restrict();
+
+    NXT_TEST_CHECK(thr->log, utf_caseless == (utf && !restrict_), "regex "
+                   "test: caseless \"s\" on U+017F returned %i, expected %i",
+                   utf_caseless, (nxt_int_t) (utf && !restrict_));
+
+    NXT_TEST_CHECK(thr->log, utf_kelvin == (utf && !restrict_), "regex test: "
+                   "caseless \"k\" on U+212A returned %i, expected %i",
+                   utf_kelvin, (nxt_int_t) (utf && !restrict_));
+
+    NXT_TEST_CHECK(thr->log, utf_caseless_ascii == 1, "regex test: caseless "
+                   "\"admins\" on \"ADMINS\" returned %i, expected 1",
+                   utf_caseless_ascii);
+
+    NXT_TEST_CHECK(thr->log, utf_caseless_cyrillic == utf, "regex test: "
+                   "caseless U+043F on U+041F returned %i, expected %i",
+                   utf_caseless_cyrillic, utf);
+
+    NXT_TEST_CHECK(thr->log, utf_only == NXT_ERROR, "regex test: a UTF-only "
+                   "pattern on invalid UTF-8 returned %i, expected %i",
+                   utf_only, (nxt_int_t) NXT_ERROR);
+
+    NXT_TEST_CHECK(thr->log, utf_fragments == NXT_ERROR, "regex test: %d "
+                   "invalid UTF-8 fragments returned %i, expected %i",
+                   NXT_REGEX_TEST_FRAGMENTS, utf_fragments,
+                   (nxt_int_t) NXT_ERROR);
+
+    ret = nxt_regex_warn_test(thr);
+    if (ret != NXT_OK) {
+        return ret;
+    }
+
+    ret = nxt_regex_ascii_test(thr);
+    if (ret != NXT_OK) {
+        return ret;
+    }
 
     ret = nxt_regex_reuse_test(thr);
     if (ret != NXT_OK) {
@@ -566,4 +890,186 @@ nxt_regex_jit_test(nxt_thread_t *thr)
 #endif
 
     return NXT_OK;
+}
+
+
+/*
+ * A pattern warns once for a limit and once for invalid UTF-8, however many
+ * requests reach each.  One warning must not hide the other.
+ */
+
+static nxt_int_t
+nxt_regex_warn_test(nxt_thread_t *thr)
+{
+    u_char             subject[32];
+    nxt_mp_t           *mp;
+    nxt_int_t          limit1, limit2, utf1, utf2;
+    nxt_uint_t         warnings;
+    nxt_regex_t        *re;
+    nxt_regex_match_t  *match;
+
+    if (!nxt_regex_test_utf()) {
+        return NXT_OK;
+    }
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (mp == NULL) {
+        return NXT_ERROR;
+    }
+
+    match = nxt_regex_match_create(mp, 1);
+
+    re = (match != NULL)
+         ? nxt_regex_test_compile(thr, mp, "^(?:\\x{43f}|(a+)+[bc])") : NULL;
+
+    if (re == NULL) {
+        nxt_mp_destroy(mp);
+        return NXT_ERROR;
+    }
+
+    nxt_memset(subject, 'a', sizeof(subject));
+
+    warnings = nxt_regex_test_warnings;
+
+    limit1 = nxt_regex_match(re, subject, sizeof(subject), match);
+    limit2 = nxt_regex_match(re, subject, sizeof(subject), match);
+    utf1 = nxt_regex_match(re, (u_char *) "\xff", 1, match);
+    utf2 = nxt_regex_match(re, (u_char *) "\xff", 1, match);
+
+    warnings = nxt_regex_test_warnings - warnings;
+
+    nxt_mp_destroy(mp);
+
+    NXT_TEST_CHECK(thr->log, limit1 == NXT_ERROR && limit2 == NXT_ERROR,
+                   "regex warn test: limit returned %i and %i, expected %i",
+                   limit1, limit2, (nxt_int_t) NXT_ERROR);
+
+    NXT_TEST_CHECK(thr->log, utf1 == NXT_ERROR && utf2 == NXT_ERROR,
+                   "regex warn test: invalid UTF-8 returned %i and %i, "
+                   "expected %i", utf1, utf2, (nxt_int_t) NXT_ERROR);
+
+    NXT_TEST_CHECK(thr->log, warnings == 2, "regex warn test: %ui warnings, "
+                   "expected 2", warnings);
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                  "regex warn test passed: one warning per kind");
+
+    return NXT_OK;
+}
+
+
+/*
+ * An ASCII subject skips the UTF-8 check of a UTF pattern, and only then:
+ * not for a subject with a byte from 0x80, and not for a pattern that
+ * matches bytes.  The ASCII test must read no byte after the subject: each
+ * subject ends at a page with no access, in a child process.
+ */
+
+static nxt_int_t
+nxt_regex_ascii_test(nxt_thread_t *thr)
+{
+    int                rc;
+    nxt_mp_t           *mp;
+    nxt_uint_t         checks;
+    nxt_regex_t        *utf, *bytes;
+    nxt_regex_match_t  *match;
+
+    if (!nxt_regex_test_utf()) {
+        return NXT_OK;
+    }
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (mp == NULL) {
+        return NXT_ERROR;
+    }
+
+    match = nxt_regex_match_create(mp, 1);
+    utf = (match != NULL) ? nxt_regex_test_compile(thr, mp, "^/a") : NULL;
+
+    /* A raw FF byte is not valid in UTF mode, so this pattern matches bytes. */
+    bytes = (utf != NULL) ? nxt_regex_test_compile(thr, mp, "^/a\xff$")
+                          : NULL;
+
+    if (bytes == NULL) {
+        nxt_mp_destroy(mp);
+        return NXT_ERROR;
+    }
+
+    checks = nxt_regex_test_no_utf_check;
+    (void) nxt_regex_match(utf, (u_char *) "/abc", 4, match);
+    checks = nxt_regex_test_no_utf_check - checks;
+
+    NXT_TEST_CHECK(thr->log, checks == 1, "regex ASCII test: an ASCII "
+                   "subject skipped the UTF-8 check %ui times, expected 1",
+                   checks);
+
+    checks = nxt_regex_test_no_utf_check;
+    (void) nxt_regex_match(utf, (u_char *) "/a\xd0\xbf", 4, match);
+    (void) nxt_regex_match(bytes, (u_char *) "/abc", 4, match);
+    checks = nxt_regex_test_no_utf_check - checks;
+
+    nxt_mp_destroy(mp);
+
+    NXT_TEST_CHECK(thr->log, checks == 0, "regex ASCII test: a UTF-8 "
+                   "subject or a byte-mode pattern skipped the check %ui "
+                   "times, expected 0", checks);
+
+    rc = nxt_test_in_child(thr, "regex ASCII test", nxt_regex_ascii_test_child,
+                           NULL);
+
+    NXT_TEST_CHECK(thr->log, rc == 0, "regex ASCII test: a subject at the "
+                   "end of a page failed (child status %d)", rc);
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                  "regex ASCII test passed: fast path, page end");
+
+    return NXT_OK;
+}
+
+
+static int
+nxt_regex_ascii_test_child(void *data)
+{
+    u_char             *page, *end;
+    size_t             size, length;
+    nxt_mp_t           *mp;
+    nxt_regex_t        *re;
+    nxt_regex_err_t    rerr;
+    nxt_regex_match_t  *match;
+
+    static nxt_str_t  pattern = nxt_string("^/admin/.*$");
+
+    size = getpagesize();
+
+    page = mmap(NULL, 2 * size, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) {
+        return 1;
+    }
+
+    if (mprotect(page + size, size, PROT_NONE) != 0) {
+        return 2;
+    }
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    match = (mp != NULL) ? nxt_regex_match_create(mp, 1) : NULL;
+    re = (match != NULL) ? nxt_regex_compile(mp, &pattern, &rerr) : NULL;
+
+    if (re == NULL) {
+        return 3;
+    }
+
+    end = page + size;
+
+    for (length = 0; length <= 33; length++) {
+        nxt_memset(end - length, 'a', length);
+        (void) nxt_regex_match(re, end - length, length, match);
+
+        if (length != 0) {
+            end[-1] = 0xff;
+            (void) nxt_regex_match(re, end - length, length, match);
+        }
+    }
+
+    return 0;
 }

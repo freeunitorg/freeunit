@@ -7,6 +7,30 @@ Changes with FreeUnit 1.38.0                                     09 Nov 2026
        such a request. Percent-encoded spaces in paths and arguments remain
        supported.
 
+    *) Change: with a PCRE2 library built with Unicode support, route
+       regexes match in UTF-8 mode: "." and a character class match one
+       whole UTF-8 character, not one byte, and "\xHH" is a code point, so
+       "\xff" matches U+00FF (the bytes C3 BF). So a class of bytes such as
+       "[\x80-\xff]" is a class of the code points U+0080 to U+00FF and no
+       longer matches a Cyrillic path, and "\xc3\xa9" is U+00C3 U+00A9, not
+       the UTF-8 bytes of U+00E9: write the character itself. A pattern that
+       counts bytes, such as ".{2}" for one 2-byte character, counts
+       characters now. Check route rules that deny access before the
+       upgrade; a notice is logged at configuration load for a pattern with
+       an escape from "\x80" to "\xff", also in the "\x{...}" form; octal
+       escapes get no notice. Caseless matching also folds non-ASCII
+       letters, such as Cyrillic. With PCRE2 10.43 or later, in the headers
+       at build time and in the library at run time, it keeps ASCII and
+       non-ASCII apart; with an older PCRE2 "(?i)k" also matches U+212A and
+       "(?i)s" matches U+017F. A request value that is not valid UTF-8, such
+       as "/admin/%FF", matches a byte-mode twin of the pattern, as before,
+       so an invalid byte cannot make a pattern miss. A pattern that has no
+       byte-mode twin fails such a request with a 500 response, also when a
+       later route would match it: one that is valid only in UTF mode, such
+       as "\x{43f}", or one that starts with "(*UTF)". A pattern that UTF
+       mode does not accept matches bytes, and a notice is logged. PCRE 1
+       and PCRE2 without Unicode support still match bytes.
+
     *) Feature: PHP exposes the decoded, normalized request path, without
        the query, in $_SERVER['UNIT_REWRITTEN_PATH'] whenever it differs
        from the verbatim request target in REQUEST_URI: after a route

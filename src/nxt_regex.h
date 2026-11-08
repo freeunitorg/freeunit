@@ -56,6 +56,12 @@ NXT_EXPORT nxt_bool_t nxt_regex_jit_compiled(nxt_regex_t *re);
  * route test: one router thread makes one, however many requests it matches.
  */
 extern nxt_uint_t  nxt_regex_test_match_creates;
+
+/* The warnings nxt_regex_match() has logged, once per pattern and kind. */
+extern nxt_uint_t  nxt_regex_test_warnings;
+
+/* The matches that skipped the UTF-8 check for an ASCII subject. */
+extern nxt_uint_t  nxt_regex_test_no_utf_check;
 #endif
 
 #if (NXT_TESTS && NXT_HAVE_PCRE2)

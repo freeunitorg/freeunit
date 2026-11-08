@@ -35,6 +35,8 @@ static nxt_mp_t  *nxt_pcre_mp;
 
 #if (NXT_TESTS)
 nxt_uint_t  nxt_regex_test_match_creates;
+nxt_uint_t  nxt_regex_test_warnings;
+nxt_uint_t  nxt_regex_test_no_utf_check;
 #endif
 
 /*
@@ -78,6 +80,13 @@ nxt_regex_compile(nxt_mp_t *mp, nxt_str_t *source, nxt_regex_err_t *err)
     pcre_malloc = nxt_pcre_malloc;
     pcre_free = nxt_pcre_free;
     nxt_pcre_mp = mp;
+
+    /*
+     * PCRE 1 has no mode that accepts a subject with invalid UTF-8.  With
+     * PCRE_UTF8 such a subject, for example a header value, makes the match
+     * fail, and PCRE_NO_UTF8_CHECK makes it undefined.  So patterns here
+     * match bytes, not UTF-8 characters.
+     */
 
     re->code = pcre_compile(pattern, 0, &err->msg, &erroffset, NULL);
 
@@ -216,6 +225,9 @@ nxt_regex_match(nxt_regex_t *re, u_char *subject, size_t length,
              */
 
             if (nxt_atomic_cmp_set(&re->warned, 0, 1)) {
+#if (NXT_TESTS)
+                nxt_regex_test_warnings++;
+#endif
                 nxt_thread_log_error(NXT_LOG_WARN,
                                      "pcre_exec() reached the %s limit on %uz "
                                      "bytes using \"%V\"",
