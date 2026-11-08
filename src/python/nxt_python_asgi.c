@@ -1011,6 +1011,19 @@ nxt_py_asgi_create_subprotocols(nxt_unit_field_t *f)
         }
 
         PyTuple_SET_ITEM(res, n, proto);
+
+        n++;
+    }
+
+    /*
+     * The tuple was sized to the comma count plus one, but an empty segment
+     * -- a leading, trailing or doubled comma, or a comma then only spaces --
+     * fills no slot.  Shrink the tuple to the slots actually set, so no NULL
+     * element is left for the application to iterate over or index, which
+     * would crash the worker.
+     */
+    if (nxt_slow_path(_PyTuple_Resize(&res, n) != 0)) {
+        return NULL;
     }
 
     return res;

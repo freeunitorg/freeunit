@@ -81,6 +81,13 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        "Sec-WebSocket-Protocol" as the WebSocket subprotocols. Now the name
        is compared too, in any letter case.
 
+    *) Bugfix: an ASGI application that read scope["subprotocols"] by
+       iterating it or by an index past the first entry could crash its
+       worker: an empty segment in the Sec-WebSocket-Protocol header -- a
+       leading, trailing or doubled comma, or a comma then only spaces --
+       left an unset slot in the tuple. The tuple no longer keeps an empty
+       slot.
+
     *) Bugfix: the router skipped any bytes between a chunk size and the CR
        that ends its line, so a chunk extension that is not valid syntax
        (RFC 9112, Section 7.1.1), for example a bare ";", a name that is not
