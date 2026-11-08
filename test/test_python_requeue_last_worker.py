@@ -318,10 +318,15 @@ def test_python_requeue_last_worker_unaccounted(skip_alert, skip_fds_check):
         except BaseException as exc:  # noqa: BLE001
             results[tag] = (None, repr(exc))
 
-    assert client.get()['status'] == 200
+    # The late start below must be the second process, so no request is sent
+    # before the marker exists.  A worker can pause its first read on an mmap
+    # segment, and the router then starts another process for that request
+    # at once: that process does not sleep, and no start can expire.
+    assert _wait(lambda: processes()['idle'] == 1), processes()
 
     pids = _wait(_app_pids_of('requeue_late'))
     assert pids, 'no application process'
+    assert processes()['running'] == 1, processes()
 
     with open(marker, 'w', encoding='utf-8'):
         pass
