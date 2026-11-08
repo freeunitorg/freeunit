@@ -309,6 +309,18 @@ expression pattern is used as written.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+when a TLS session was in init at close, mostly after a fatal TLS error
+such as a record that does not decrypt, the router still called
+SSL_shutdown(), which OpenSSL refuses in that state, and logged
+"SSL_shutdown() failed" at alert level for every such connection.  The router
+now closes such a connection without SSL_shutdown(), and a fatal error is
+logged once, where it happened.  A session that is not in init still sends
+close_notify.
+</para>
+</change>
+
 </changes>
 
 
