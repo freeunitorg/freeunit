@@ -3191,9 +3191,13 @@ static nxt_conf_map_t  nxt_router_http_conf[] = {
         offsetof(nxt_socket_conf_t, send_min_rate),
     },
 
+    /*
+     * Copied: the parsed configuration is in tmcf->mem_pool, which
+     * nxt_router_conf_ready() frees, and a request reads the path later.
+     */
     {
         nxt_string("body_temp_path"),
-        NXT_CONF_MAP_STR,
+        NXT_CONF_MAP_STR_COPY,
         offsetof(nxt_socket_conf_t, body_temp_path),
     },
 

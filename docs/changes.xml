@@ -27,6 +27,15 @@ it answers or exits.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+with "body_temp_path" in "settings/http", the router read freed memory for
+each request body larger than "body_buffer_size": the path pointed into the
+parsed configuration, which the router frees once the configuration is
+applied.  The router now copies the path.
+</para>
+</change>
+
 </changes>
 
 

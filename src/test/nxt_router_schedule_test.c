@@ -908,6 +908,81 @@ done:
 
 
 /*
+ * The skcf of the schedules takes "settings/http" from the parsed
+ * configuration, as a listener's does (nxt_router_socket_conf_http()).
+ * The parsed tree is in tmcf->mem_pool, which nxt_router_conf_ready() frees
+ * once the configuration is applied, so a string must be copied into the
+ * rtcf pool.  "body_temp_path" was not.  The test overwrites the string in
+ * the tree, as a reuse of the freed memory would.
+ */
+
+static nxt_int_t
+nxt_router_schedule_temp_path_test(nxt_thread_t *thr)
+{
+    nxt_mp_t                *mp, *tree_mp;
+    nxt_int_t               ret;
+    nxt_str_t               json, tree_path;
+    nxt_conf_value_t        *http, *member;
+    nxt_router_conf_t       *rtcf;
+    nxt_router_schedules_t  *sc;
+
+    static nxt_str_t  name = nxt_string("body_temp_path");
+    static nxt_str_t  path = nxt_string("/var/tmp/unit-schedule-body");
+
+    ret = NXT_ERROR;
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    tree_mp = nxt_mp_create(1024, 128, 256, 32);
+
+    if (mp == NULL || tree_mp == NULL) {
+        goto done;
+    }
+
+    rtcf = nxt_mp_zget(mp, sizeof(nxt_router_conf_t));
+    sc = nxt_mp_zget(mp, sizeof(nxt_router_schedules_t));
+
+    nxt_str_set(&json, "{\"body_temp_path\": \"/var/tmp/unit-schedule-body\"}");
+
+    http = nxt_conf_json_parse_str(tree_mp, &json);
+
+    if (rtcf == NULL || sc == NULL || http == NULL) {
+        goto done;
+    }
+
+    rtcf->mem_pool = mp;
+
+    if (nxt_router_schedules_joint_init(thr->task, rtcf, sc, http) != NXT_OK) {
+        goto done;
+    }
+
+    member = nxt_conf_get_object_member(http, &name, NULL);
+    nxt_conf_get_string(member, &tree_path);
+    nxt_memset(tree_path.start, 'X', tree_path.length);
+
+    if (!nxt_strstr_eq(&sc->skcf.body_temp_path, &path)) {
+        nxt_log_alert(thr->log, "schedule body_temp_path: \"%V\" after the "
+                      "parsed configuration changed, expected \"%V\"",
+                      &sc->skcf.body_temp_path, &path);
+        goto done;
+    }
+
+    ret = NXT_OK;
+
+done:
+
+    if (tree_mp != NULL) {
+        nxt_mp_destroy(tree_mp);
+    }
+
+    if (mp != NULL) {
+        nxt_mp_destroy(mp);
+    }
+
+    return ret;
+}
+
+
+/*
  * A configuration whose schedule cannot be resolved fails as a whole, and
  * takes no reference on the rtcf.
  */
@@ -979,6 +1054,7 @@ nxt_router_schedule_test(nxt_thread_t *thr)
         || nxt_router_schedule_queued_test(thr) != NXT_OK
         || nxt_router_schedule_parse_fail_test(thr) != NXT_OK
         || nxt_router_schedule_queue_wait_test(thr) != NXT_OK
+        || nxt_router_schedule_temp_path_test(thr) != NXT_OK
         || nxt_router_schedule_resolve_test(thr) != NXT_OK)
     {
         return NXT_ERROR;

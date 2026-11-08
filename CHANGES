@@ -15,6 +15,12 @@ Changes with FreeUnit 1.38.0                                     06 Oct 2026
        FreeUnit stops waiting for it. The application process continues, and
        it counts against "processes" until it answers or exits.
 
+    *) Bugfix: with "body_temp_path" in "settings/http", the router read
+       freed memory for each request body larger than "body_buffer_size":
+       the path pointed into the parsed configuration, which the router
+       frees once the configuration is applied. The router now copies the
+       path.
+
 
 Changes with FreeUnit 1.37.2                                     31 Oct 2026
 
