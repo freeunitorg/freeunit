@@ -10,6 +10,22 @@
          date="2026-11-09" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="change">
+<para>
+with PCRE2 10.48 or later, route regexes match in UTF-8 mode: "." and a
+character class match one whole UTF-8 character, not one byte, and "\xHH"
+is a code point, so "\xff" matches U+00FF (the bytes C3 BF) and not the
+byte FF.  An invalid UTF-8 byte in a request gives no error, but no pattern
+item matches it, so ".*" does not go past it.  So "~^/api/.*$" does not
+match "/api/%FF", and a negative pattern such as "!~^/admin/.*$" matches
+"/admin/%FF".  PCRE 1 and PCRE2 before 10.48, in the headers at build time
+or in the library at run time, still match bytes: before 10.48 the UTF-8
+mode is not safe with invalid UTF-8 from a client.  So the same
+configuration can route a request with such bytes differently on two
+builds.
+</para>
+</change>
+
 </changes>
 
 

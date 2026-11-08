@@ -44,10 +44,23 @@
 #define NXT_REGEX_TEST_LONG_RESULT  NXT_ERROR
 #endif
 
+/*
+ * Patterns match in UTF mode only with PCRE2 10.48 or later, in the headers
+ * and in the library that runs.  Before 10.48, PCRE2_MATCH_INVALID_UTF is
+ * not safe with a subject from a client.
+ */
+#if (NXT_HAVE_PCRE2 && defined(PCRE2_MATCH_INVALID_UTF)                     \
+     && (PCRE2_MAJOR > 10 || (PCRE2_MAJOR == 10 && PCRE2_MINOR >= 48)))
+#define NXT_REGEX_TEST_UTF_HEADERS  1
+#else
+#define NXT_REGEX_TEST_UTF_HEADERS  0
+#endif
+
 static nxt_regex_t *nxt_regex_test_compile(nxt_thread_t *thr, nxt_mp_t *mp,
     const char *pattern);
 static nxt_int_t nxt_regex_reuse_test(nxt_thread_t *thr);
 static nxt_int_t nxt_regex_route_test(nxt_thread_t *thr);
+static nxt_int_t nxt_regex_test_utf(void);
 static nxt_int_t nxt_regex_jit_test(nxt_thread_t *thr);
 
 /* Compile the pattern.  A failure is logged and returns NULL. */
@@ -69,6 +82,26 @@ nxt_regex_test_compile(nxt_thread_t *thr, nxt_mp_t *mp, const char *pattern)
     }
 
     return re;
+}
+
+
+static nxt_int_t
+nxt_regex_test_utf(void)
+{
+#if (NXT_REGEX_TEST_UTF_HEADERS)
+    int   major, minor;
+    char  version[64];
+
+    if (pcre2_config(PCRE2_CONFIG_VERSION, version) <= 0
+        || sscanf(version, "%d.%d", &major, &minor) != 2)
+    {
+        return 0;
+    }
+
+    return (major > 10 || (major == 10 && minor >= 48));
+#else
+    return 0;
+#endif
 }
 
 
@@ -107,7 +140,9 @@ nxt_regex_test(nxt_thread_t *thr)
 {
     u_char     *subject;
     nxt_mp_t   *mp;
-    nxt_int_t  ret, slow, deep, shallow, starts, anchored;
+    nxt_int_t  ret, slow, deep, shallow, starts, anchored, utf, utf_char,
+               utf_invalid, utf_pattern, utf_escape, utf_escape_byte,
+               utf_negative, utf_lookbehind;
 
     nxt_thread_time_update(thr);
 
@@ -154,6 +189,55 @@ nxt_regex_test(nxt_thread_t *thr)
                                  &anchored);
     }
 
+    /* "\xd0\xbf" is U+043F in UTF-8, "\xff" is never valid UTF-8. */
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "^/.$", (u_char *) "/\xd0\xbf", 3,
+                                 &utf_char);
+    }
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "^/[^/]+$", (u_char *) "/\xff", 2,
+                                 &utf_invalid);
+    }
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "^/\xff$", (u_char *) "/\xff", 2,
+                                 &utf_pattern);
+    }
+
+    /* In UTF mode "\xff" in a pattern is U+00FF, the bytes C3 BF. */
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "^\\xff$", (u_char *) "\xc3\xbf", 2,
+                                 &utf_escape);
+    }
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "^\\xff$", (u_char *) "\xff", 1,
+                                 &utf_escape_byte);
+    }
+
+    /*
+     * ".*" does not go past an invalid byte in UTF mode.  So a negative
+     * route pattern such as "!~^/admin/.*$" gives the opposite result.
+     */
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "^/admin/.*$",
+                                 (u_char *) "/admin/\xff", 8, &utf_negative);
+    }
+
+    /*
+     * The JIT of PCRE2 before 10.48 with PCRE2_MATCH_INVALID_UTF gives no
+     * match here, and the interpreter a match.
+     */
+
+    if (ret == NXT_OK) {
+        ret = nxt_regex_test_run(thr, mp, "(?<=a)", (u_char *) "a\x80", 2,
+                                 &utf_lookbehind);
+    }
+
     nxt_mp_destroy(mp);
 
     if (ret != NXT_OK) {
@@ -180,6 +264,39 @@ nxt_regex_test(nxt_thread_t *thr)
     NXT_TEST_CHECK(thr->log, anchored == 0, "regex test: anchored pattern "
                    "on %d bytes returned %i, expected 0",
                    NXT_REGEX_TEST_STARTS + 1, anchored);
+
+    utf = nxt_regex_test_utf();
+
+    NXT_TEST_CHECK(thr->log, utf_char == utf, "regex test: \".\" on a "
+                   "2-byte UTF-8 character returned %i, expected %i",
+                   utf_char, utf);
+
+    /*
+     * In UTF mode, invalid UTF-8 in the subject matches no pattern item.
+     * The match must not fail with an error.
+     */
+
+    NXT_TEST_CHECK(thr->log, utf_invalid == !utf, "regex test: subject "
+                   "with invalid UTF-8 returned %i, expected %i",
+                   utf_invalid, (nxt_int_t) !utf);
+
+    NXT_TEST_CHECK(thr->log, utf_pattern == 1, "regex test: pattern with "
+                   "invalid UTF-8 returned %i, expected 1", utf_pattern);
+
+    NXT_TEST_CHECK(thr->log, utf_escape == utf, "regex test: \"\\xff\" on "
+                   "U+00FF returned %i, expected %i", utf_escape, utf);
+
+    NXT_TEST_CHECK(thr->log, utf_escape_byte == !utf, "regex test: "
+                   "\"\\xff\" on the byte FF returned %i, expected %i",
+                   utf_escape_byte, (nxt_int_t) !utf);
+
+    NXT_TEST_CHECK(thr->log, utf_negative == !utf, "regex test: \".*\" on "
+                   "an invalid byte returned %i, expected %i",
+                   utf_negative, (nxt_int_t) !utf);
+
+    NXT_TEST_CHECK(thr->log, utf_lookbehind == 1, "regex test: lookbehind "
+                   "before an invalid byte returned %i, expected 1",
+                   utf_lookbehind);
 
     ret = nxt_regex_reuse_test(thr);
     if (ret != NXT_OK) {
