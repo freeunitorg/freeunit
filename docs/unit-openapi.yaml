@@ -9140,9 +9140,10 @@ components:
           maximum: 4294967295
           description: "Runs that did not time out and ended with no
             response status, with a status of 400 or more, or with a
-            response the router discarded. Also the due runs that could
-            not start because the router had no memory or no worker
-            thread; those are not counted in `runs`."
+            response the router discarded. A run whose request the router
+            could not allocate is one of them, and is counted in `runs`
+            too. A due run that the router could not allocate at all is
+            counted here but not in `runs`."
 
         timed_out:
           type: integer

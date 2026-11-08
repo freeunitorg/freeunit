@@ -44,7 +44,8 @@ typedef struct {
     nxt_http_devnull_t           devnull;    /* r->proto.any */
 
     nxt_router_schedule_state_t  *state;     /* main engine only */
-    nxt_router_schedule_t        *sched;     /* valid while the joint is */
+    /* Valid while the run holds the joint; NULL in the result. */
+    nxt_router_schedule_t        *sched;
     nxt_router_schedules_t       *schedules;
     nxt_event_engine_t           *main;
 
@@ -971,7 +972,9 @@ nxt_router_schedule_run_close(nxt_task_t *task, nxt_http_devnull_t *dn,
 /*
  * Log the result while the configuration is still held, post it to the main
  * engine, which frees the run, then drop the run's joint reference, which
- * may free the configuration and end the thread.
+ * may free the configuration and end the thread.  The main engine can take
+ * the result after that, so the run must not point into the configuration
+ * any more: nxt_router_schedule_done() reads only the run and the state.
  */
 
 static void
@@ -1018,6 +1021,9 @@ nxt_router_schedule_run_finish(nxt_task_t *task, void *obj, void *data)
                   (n < sched->uri.length) ? "..." : "", (int) status,
                   run->duration);
     }
+
+    run->sched = NULL;
+    run->schedules = NULL;
 
     nxt_router_schedule_post(run->main, &run->work, nxt_router_schedule_done,
                              run);

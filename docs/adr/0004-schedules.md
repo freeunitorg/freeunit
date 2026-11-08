@@ -144,12 +144,17 @@ the schedule's own `pass`.
 
 #### 7.1 Completion
 
-The devnull `close` logs the result while the configuration is still held,
-posts it to the main engine, which clears `running` and updates the
-counters, and then drops the run's joint reference. A run that did not
-time out counts as `failed` when it has no status, a status of 400 or more,
-or a discarded response. A due run that cannot be allocated, or that has no
-worker engine, counts as `failed` and not in `runs`.
+The devnull `close` logs the result while the configuration is still held.
+Then it posts the result to the main engine and at once drops the run's
+joint reference, so the configuration can be freed before the main engine
+clears `running` and updates the counters. Thus
+`nxt_router_schedule_done()` reads only the run and the state, which do
+not live in the configuration, and the run's pointers to the schedule and
+to the set of schedules are cleared before the post. A run that did not
+time out counts as `failed` when it has no status, a status of 400 or
+more, or a discarded response. A due run that cannot be allocated counts
+as `failed` and not in `runs`. A run whose request cannot be allocated on
+the worker engine is in `runs` and in `failed`.
 
 #### 7.2 Timeout
 
