@@ -7913,6 +7913,8 @@ nxt_router_app_port_busy(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
 
     nxt_router_app_spare_rebalance(task, app, port);
 
+    /* A busy spare is replaced at once, up to "max". */
+
     if (nxt_router_app_can_start(app) && nxt_router_app_need_start(app)) {
         nxt_atomic_fetch_add(&app->pending_processes, 1);
         start_process = 1;

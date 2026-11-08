@@ -319,9 +319,11 @@ def test_python_requeue_last_worker_unaccounted(skip_alert, skip_fds_check):
             results[tag] = (None, repr(exc))
 
     # The late start below must be the second process, so no request is sent
-    # before the marker exists.  A worker can pause its first read on an mmap
-    # segment, and the router then starts another process for that request
-    # at once: that process does not sleep, and no start can expire.
+    # before the marker exists.  With "spare": 1, the acknowledgement of any
+    # request takes the only spare out of the idle pool, and the router starts
+    # a replacement at once (nxt_router_app_port_busy()).  A request sent here
+    # would start that process before the marker exists, so it would not
+    # sleep, and no start could expire.
     assert _wait(lambda: processes()['idle'] == 1), processes()
 
     pids = _wait(_app_pids_of('requeue_late'))
