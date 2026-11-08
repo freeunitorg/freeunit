@@ -6640,17 +6640,33 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
         nxt_request_rpc_data_unlink(task, req_rpc_data);
 
-    } else {
+    } else if (r->state == &nxt_http_websocket) {
         /*
-         * The deadline bounds the worker's answer, and an upgraded
-         * WebSocket has had its answer: the frames that follow are a
-         * session, however quiet (#422).
+         * An upgraded WebSocket has had its answer: the frames that follow
+         * are a session, however quiet, so the deadline below does not
+         * apply (#422).  They are followed for a CLOSE among them, and once
+         * a CLOSE went to the client, the router's or the application's,
+         * no frame may follow it (RFC 6455 Section 5.5.1): the router's own
+         * can wait behind a blocked client socket until its last buffer
+         * completes and ends the request, and a frame forwarded meanwhile
+         * would be written after it.  So the rest is dropped here, with
+         * msg->buf in place for the port to release its shared memory.
          */
-        if (app->timeout != 0 && r->state != &nxt_http_websocket) {
-            r->timer.handler = nxt_router_app_timeout;
-            r->timer_data = req_rpc_data;
-            nxt_timer_add(task->thread->engine, &r->timer, app->timeout);
+        if (b != NULL) {
+            if (nxt_slow_path(r->ws_closed)) {
+                nxt_debug(task, "websocket: application frame after a CLOSE "
+                          "dropped");
+                return;
+            }
+
+            nxt_http_websocket_app_frame(r, b);
         }
+
+    } else if (app->timeout != 0) {
+        /* The deadline bounds the worker's answer. */
+        r->timer.handler = nxt_router_app_timeout;
+        r->timer_data = req_rpc_data;
+        nxt_timer_add(task->thread->engine, &r->timer, app->timeout);
     }
 
     if (b == NULL) {
