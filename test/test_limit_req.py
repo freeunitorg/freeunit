@@ -80,6 +80,39 @@ def counters(name=None):
     return client.conf_get('/status')['limit_req'][ZONE if name is None else name]
 
 
+def quick(run, rate, setup=None, attempts=5):
+    """
+    Returns (attempt, run(attempt)) for the first attempt that takes less
+    than 0.9 / rate seconds.  In that time no token comes into a bucket
+    that is full at the first request, so the statuses are exact.  Every
+    attempt must start with full buckets: setup() or run() takes a new
+    zone or a new client address from the attempt number.  A slow attempt
+    says nothing about the limiter, so it is done again; the test fails
+    when all the attempts are slow.
+    """
+    window = 0.9 / rate
+
+    for attempt in range(attempts):
+        if setup is not None:
+            setup(attempt)
+
+        start = time.monotonic()
+        result = run(attempt)
+
+        if time.monotonic() - start < window:
+            return attempt, result
+
+    pytest.fail(f'all {attempts} attempts took {window} s or more')
+
+
+def zone(attempt, name=None):
+    return f'{ZONE if name is None else name}-{attempt}'
+
+
+def statuses(n, **kwargs):
+    return [client.get(**kwargs)['status'] for _ in range(n)]
+
+
 def test_limit_req_invalid():
     def check(conf, detail=None):
         resp = client.conf(conf)
@@ -188,121 +221,169 @@ def test_limit_req_under_rate():
 
 
 def test_limit_req_burst():
-    load(limited(rate=1, burst=3))
+    def setup(attempt):
+        load(limited(zone=zone(attempt), burst=3))
 
-    for _ in range(3):
-        assert client.get()['status'] == 200
+    def run(attempt):
+        return [client.get() for _ in range(4)]
 
-    resp = client.get()
-    assert resp['status'] == 429
-    assert resp['headers']['Retry-After'] == '1'
-    assert 'Error 429' in resp['body']
+    attempt, resps = quick(run, 1, setup)
 
-    c = counters()
+    assert [resp['status'] for resp in resps] == [200, 200, 200, 429]
+    assert resps[3]['headers']['Retry-After'] == '1'
+    assert 'Error 429' in resps[3]['body']
+
+    c = counters(zone(attempt))
     assert c['passed'] == 3
     assert c['rejected'] == 1
 
 
 def test_limit_req_retry_after():
-    # One per second, 100 at once: the bucket is empty after 100 requests
-    # and one request fits after one second, so "Retry-After" is 1.  With
-    # 1 per 2 seconds being not expressible, the estimate cannot be tested
-    # above 1 here; the C test checks the milliseconds.
-    load(limited(rate=1, burst=100))
+    # One per second, 10 at once: one request fits again after one
+    # second, not after the 10 seconds that fill the bucket, so
+    # "Retry-After" is 1.  With 1 per 2 seconds not expressible, the
+    # estimate cannot be tested above 1 here; the C test checks it.
+    def setup(attempt):
+        load(limited(zone=zone(attempt), burst=10))
 
-    for _ in range(100):
-        assert client.get()['status'] == 200
+    def run(attempt):
+        return statuses(10), client.get()
 
-    resp = client.get()
+    _, (passed, resp) = quick(run, 1, setup)
+
+    assert passed == [200] * 10
     assert resp['status'] == 429
     assert resp['headers']['Retry-After'] == '1'
 
 
 def test_limit_req_refill():
-    load(limited(rate=2))
+    def setup(attempt):
+        load(limited(zone=zone(attempt), rate=2))
 
-    assert client.get()['status'] == 200
-    assert client.get()['status'] == 429
+    assert quick(lambda attempt: statuses(2), 2, setup)[1] == [200, 429]
 
-    time.sleep(0.6)
+    # 0.6 s brings in at least one token: the bucket of one is full again.
+    def wait(attempt):
+        time.sleep(0.6)
 
-    assert client.get()['status'] == 200
-    assert client.get()['status'] == 429
+    assert quick(lambda attempt: statuses(2), 2, wait)[1] == [200, 429]
 
 
 def test_limit_req_per_client():
     load(limited(), {'pass': 'routes', 'client_ip': CLIENT_IP})
 
-    assert get_as('10.0.0.1') == 200
-    assert get_as('10.0.0.1') == 429
-    assert get_as('10.0.0.2') == 200
-    assert get_as('10.0.0.1') == 429
+    def run(attempt):
+        a = f'10.{attempt}.0.1'
+        b = f'10.{attempt}.0.2'
+
+        return [get_as(a), get_as(a), get_as(b), get_as(a)]
+
+    v4, result = quick(run, 1)
+    assert result == [200, 429, 200, 429]
 
     # IPv6 clients are keyed by their /64
-    assert get_as('2001:db8::1') == 200
-    assert get_as('2001:db8::2') == 429
-    assert get_as('2001:db8:1::1') == 200
+    def run6(attempt):
+        return [
+            get_as(f'2001:db8:{attempt}::1'),
+            get_as(f'2001:db8:{attempt}::2'),
+            get_as(f'2001:db8:{attempt}:1::1'),
+        ]
 
-    assert counters()['keys'] == 4
+    v6, result = quick(run6, 1)
+    assert result == [200, 429, 200]
+
+    # Two keys for each attempt of each family.
+    assert counters()['keys'] == 2 * (v4 + 1) + 2 * (v6 + 1)
 
 
 def test_limit_req_untrusted_xff():
     # Without "client_ip" the header is not looked at: one peer, one key.
-    load(limited())
+    def setup(attempt):
+        load(limited(zone=zone(attempt)))
 
-    assert get_as('10.0.0.1') == 200
-    assert get_as('10.0.0.2') == 429
-    assert client.get()['status'] == 429
+    def run(attempt):
+        return [get_as('10.0.0.1'), get_as('10.0.0.2'), client.get()['status']]
 
-    assert counters()['keys'] == 1
+    attempt, result = quick(run, 1, setup)
+    assert result == [200, 429, 429]
+    assert counters(zone(attempt))['keys'] == 1
 
-    # With "client_ip" from a source that is not the peer: the same.  A new
-    # zone name: the one above is kept with its bucket by the same name.
-    load(
-        limited(zone=f'{ZONE}-2'),
-        {
-            'pass': 'routes',
-            'client_ip': {'header': 'X-Forwarded-For', 'source': '10.0.0.0/8'},
-        },
-    )
+    # With "client_ip" from a source that is not the peer: the same.
+    def setup2(attempt):
+        load(
+            limited(zone=zone(attempt, f'{ZONE}-2')),
+            {
+                'pass': 'routes',
+                'client_ip': {
+                    'header': 'X-Forwarded-For',
+                    'source': '10.0.0.0/8',
+                },
+            },
+        )
 
-    assert get_as('10.0.0.1') == 200
-    assert get_as('10.0.0.2') == 429
+    def run2(attempt):
+        return [get_as('10.0.0.1'), get_as('10.0.0.2')]
 
-    assert counters(f'{ZONE}-2')['keys'] == 1
+    attempt, result = quick(run2, 1, setup2)
+    assert result == [200, 429]
+    assert counters(zone(attempt, f'{ZONE}-2'))['keys'] == 1
+
+
+def partial_post():
+    # The body never arrives.  A 429 comes at once; a request that passed
+    # waits for its body, and nothing comes.
+    sock = client.http(PARTIAL_POST, raw=True, no_recv=True)
+    resp = client.recvall(sock, read_timeout=5).decode()
+    sock.close()
+
+    return client._resp_to_dict(resp)
 
 
 def test_limit_req_headers_stage_post():
-    load(limited(stage='headers'))
+    def setup(attempt):
+        load(limited(zone=zone(attempt), stage='headers'))
 
-    assert client.get()['status'] == 200
+    def run(attempt):
+        return client.get()['status'], partial_post()
 
-    # The body never arrives; the 429 does, and the connection is closed
-    # instead of waiting for the 100 bytes.
-    resp = client.http(PARTIAL_POST, raw=True, read_timeout=5)
+    _, (first, resp) = quick(run, 1, setup)
 
+    # The 429 arrives, and the connection is closed instead of waiting for
+    # the 100 bytes.
+    assert first == 200
     assert resp['status'] == 429
     assert resp['headers']['Retry-After'] == '1'
     assert resp['headers']['Connection'] == 'close'
 
     # The default stage is "headers".
-    load(limited())
+    def setup2(attempt):
+        load(limited(zone=zone(attempt, f'{ZONE}-2')))
 
-    resp = client.http(PARTIAL_POST, raw=True, read_timeout=5)
+    _, (first, resp) = quick(run, 1, setup2)
+    assert first == 200
     assert resp['status'] == 429
 
 
 def test_limit_req_body_stage_post():
-    load(limited(stage='body'))
+    def setup(attempt):
+        load(limited(zone=zone(attempt), stage='body'))
 
-    assert client.post(body='x' * 10)['status'] == 200
+    def run(attempt):
+        first = client.post(body='x' * 10)['status']
 
-    # The body was read: nothing is left on the connection, it stays open.
-    resp = client.post(body='x' * 10, connection_close=False, framed=True)
+        # The body was read: nothing is left on the connection, it stays
+        # open.
+        resp = client.post(body='x' * 10, connection_close=False, framed=True)
+
+        return first, resp
+
+    _, (first, resp) = quick(run, 1, setup)
+    assert first == 200
     assert resp['status'] == 429
     assert 'Connection' not in resp['headers']
 
-    # The body is read first: a request without one waits.
+    # The body is read first: a request without one waits, whatever the
+    # state of the bucket.
     sock = client.http(PARTIAL_POST, raw=True, no_recv=True)
 
     assert client.recvall(sock, read_timeout=1) == b''
@@ -311,54 +392,70 @@ def test_limit_req_body_stage_post():
 
 
 def test_limit_req_keepalive():
-    load(limited())
+    def setup(attempt):
+        load(limited(zone=zone(attempt)))
 
-    # Without a body nothing is left on the connection: it stays open.
-    resp, sock = client.get(start=True, connection_close=False, framed=True)
-    assert resp['status'] == 200
+    def run(attempt):
+        # Without a body nothing is left on the connection: it stays open.
+        first, sock = client.get(start=True, connection_close=False, framed=True)
+        resp = client.get(sock=sock, connection_close=False, framed=True)
+        sock.close()
 
-    resp = client.get(sock=sock, connection_close=False, framed=True)
+        return first, resp
+
+    _, (first, resp) = quick(run, 1, setup)
+    assert first['status'] == 200
     assert resp['status'] == 429
     assert 'Connection' not in resp['headers']
 
-    sock.close()
-
 
 def test_limit_req_reload():
-    load(limited())
+    def run(attempt):
+        name = zone(attempt)
+        load(limited(zone=name))
 
-    assert client.get()['status'] == 200
-    assert client.get()['status'] == 429
+        result = statuses(2)
+        result.append(counters(name))
 
-    c = counters()
-    assert c['passed'] == 1
-    assert c['rejected'] == 1
+        # A new configuration with the same zone name and size: the zone,
+        # its bucket and its counters stay.
+        load(
+            [{'match': {'uri': '/other'}, 'action': {'return': 204}}]
+            + limited(zone=name)
+        )
 
-    # A new configuration with the same zone name and size: the zone, its
-    # bucket and its counters stay.
-    load([{'match': {'uri': '/other'}, 'action': {'return': 204}}] + limited())
+        result.append(counters(name))
+        result.append(client.get()['status'])
+        result.append(counters(name)['rejected'])
 
-    assert counters() == {
+        # A new "burst" applies to the bucket as it is: still empty.
+        load(limited(zone=name, burst=5))
+
+        result.append(client.get()['status'])
+        result.append(counters(name)['rejected'])
+
+        return result
+
+    attempt, result = quick(run, 1)
+    name = zone(attempt)
+
+    assert result[0:2] == [200, 429]
+    assert result[2]['passed'] == 1
+    assert result[2]['rejected'] == 1
+    assert result[3] == {
         'keys': 1,
         'keys_max': 4096,
         'passed': 1,
         'rejected': 1,
         'evicted': 0,
     }
-
-    assert client.get()['status'] == 429
-    assert counters()['rejected'] == 2
-
-    # A new "burst" applies to the bucket as it is: still empty.
-    load(limited(burst=5))
-
-    assert client.get()['status'] == 429
-    assert counters()['rejected'] == 3
+    assert result[4:6] == [429, 2]
+    assert result[6:8] == [429, 3]
 
     # A new size is a new zone: the keys and the counters start again.
-    load(limited(zone=f'{ZONE}:8', burst=5))
+    load(limited(zone=f'{name}:8', burst=5))
 
-    assert counters() == {
+    assert counters(name) == {
         'keys': 0,
         'keys_max': 8,
         'passed': 0,
@@ -371,7 +468,7 @@ def test_limit_req_reload():
     # A zone that no configuration names any more is gone.
     load(limited(zone=f'{ZONE}-other'))
 
-    assert ZONE not in client.conf_get('/status')['limit_req']
+    assert name not in client.conf_get('/status')['limit_req']
 
     load([{'action': {'return': 200}}])
 
@@ -379,102 +476,125 @@ def test_limit_req_reload():
 
 
 def test_limit_req_shared_zone():
-    load(
-        [
-            {'match': {'uri': '/a'}, 'action': {'limit_req': limit(), 'return': 200}},
-            {'match': {'uri': '/b'}, 'action': {'limit_req': limit(), 'return': 200}},
-        ]
-    )
+    def setup(attempt):
+        name = zone(attempt)
 
-    assert client.get(url='/a')['status'] == 200
-    assert client.get(url='/b')['status'] == 429
+        load(
+            [
+                {
+                    'match': {'uri': '/a'},
+                    'action': {'limit_req': limit(zone=name), 'return': 200},
+                },
+                {
+                    'match': {'uri': '/b'},
+                    'action': {'limit_req': limit(zone=name), 'return': 200},
+                },
+            ]
+        )
 
-    c = counters()
+    def run(attempt):
+        return [client.get(url='/a')['status'], client.get(url='/b')['status']]
+
+    attempt, result = quick(run, 1, setup)
+    assert result == [200, 429]
+
+    c = counters(zone(attempt))
     assert c['passed'] == 1
     assert c['rejected'] == 1
 
 
 def test_limit_req_pass_chain_counted_once():
-    load(
-        {
-            'first': [{'action': {'pass': 'routes/second'}}],
-            'second': limited(burst=2),
-        },
-        {'pass': 'routes/first'},
-    )
+    def setup(attempt):
+        load(
+            {
+                'first': [{'action': {'pass': 'routes/second'}}],
+                'second': limited(zone=zone(attempt), burst=2),
+            },
+            {'pass': 'routes/first'},
+        )
 
-    assert client.get()['status'] == 200
-    assert client.get()['status'] == 200
-    assert client.get()['status'] == 429
+    attempt, result = quick(lambda attempt: statuses(3), 1, setup)
+    assert result == [200, 200, 429]
 
-    c = counters()
+    c = counters(zone(attempt))
     assert c['passed'] == 2
     assert c['rejected'] == 1
 
     # Behind a rewrite the headers stage cannot see the limit; the body
-    # stage counts the request, once.  A new zone: the one above is kept.
-    load(
-        {
-            'first': [
-                {'action': {'rewrite': '/second', 'pass': 'routes/second'}}
-            ],
-            'second': limited(zone=f'{ZONE}-2', burst=2),
-        },
-        {'pass': 'routes/first'},
-    )
+    # stage counts the request, once.
+    def setup2(attempt):
+        load(
+            {
+                'first': [
+                    {'action': {'rewrite': '/second', 'pass': 'routes/second'}}
+                ],
+                'second': limited(zone=zone(attempt, f'{ZONE}-2'), burst=2),
+            },
+            {'pass': 'routes/first'},
+        )
 
-    assert client.get()['status'] == 200
-    assert client.get()['status'] == 200
-    assert client.get()['status'] == 429
+    assert quick(lambda attempt: statuses(3), 1, setup2)[1] == [200, 200, 429]
 
 
 def test_limit_req_eviction():
     load(limited(zone=f'{ZONE}:1'), {'pass': 'routes', 'client_ip': CLIENT_IP})
 
-    assert get_as('10.0.0.1') == 200
-    assert get_as('10.0.0.1') == 429
+    def run(attempt):
+        a = f'10.{attempt}.0.1'
+        b = f'10.{attempt}.0.2'
 
-    # The second client takes the one entry; the first one starts afresh.
-    assert get_as('10.0.0.2') == 200
-    assert get_as('10.0.0.1') == 200
+        # The second client takes the one entry; the first one starts
+        # afresh.
+        return [get_as(a), get_as(a), get_as(b), get_as(a)]
 
+    attempt, result = quick(run, 1)
+    assert result == [200, 429, 200, 200]
+
+    # Every request of an attempt but the second takes the entry of
+    # another client: the first one evicts the client of the attempt
+    # before.
     c = counters()
     assert c['keys'] == 1
     assert c['keys_max'] == 1
-    assert c['evicted'] == 2
-    assert c['passed'] == 3
-    assert c['rejected'] == 1
+    assert c['evicted'] == 3 * (attempt + 1) - 1
+    assert c['passed'] == 3 * (attempt + 1)
+    assert c['rejected'] == attempt + 1
 
 
 def test_limit_req_threads():
     # Four router threads, one zone: sixteen connections at once from one
     # client pass "burst" requests between them, not "burst" per thread.
-    load(limited(burst=4), settings={'listen_threads': 4})
+    def setup(attempt):
+        load(limited(zone=zone(attempt), burst=4), settings={'listen_threads': 4})
 
-    socks = []
+    def run(attempt):
+        socks = []
 
-    for _ in range(16):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect(('127.0.0.1', port_map.port(8080)))
-        socks.append(sock)
+        for _ in range(16):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect(('127.0.0.1', port_map.port(8080)))
+            socks.append(sock)
 
-    for sock in socks:
-        sock.sendall(
-            b'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
-        )
+        for sock in socks:
+            sock.sendall(
+                b'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
+            )
 
-    statuses = []
+        result = []
 
-    for sock in socks:
-        resp = client.recvall(sock).decode()
-        statuses.append(int(resp.split(' ')[1]))
-        sock.close()
+        for sock in socks:
+            resp = client.recvall(sock).decode()
+            result.append(int(resp.split(' ')[1]))
+            sock.close()
 
-    # One more token can arrive while the batch runs, no more.
-    assert 4 <= statuses.count(200) <= 5
-    assert statuses.count(429) == 16 - statuses.count(200)
+        return result
 
-    c = counters()
-    assert c['passed'] == statuses.count(200)
-    assert c['rejected'] == statuses.count(429)
+    attempt, result = quick(run, 1, setup)
+
+    assert result.count(200) == 4
+    assert result.count(429) == 12
+
+    c = counters(zone(attempt))
+    assert c['passed'] == 4
+    assert c['rejected'] == 12
     assert c['keys'] == 1
