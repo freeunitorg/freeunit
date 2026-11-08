@@ -648,3 +648,99 @@ def test_limit_req_route_matched_after_rewrite():
 
     assert client.get(url='/a')['status'] == 200
     assert counters()['passed'] == 1
+
+
+def two_zones(attempt, all_stage=None, login_stage=None, login_zone=None):
+    # A zone for all the requests, then a smaller one for one URI.
+    all_zone = zone(attempt, f'{ZONE}-all')
+
+    if login_zone is None:
+        login_zone = zone(attempt, f'{ZONE}-login')
+        login_burst = 2
+
+    else:
+        login_zone = all_zone
+        login_burst = 10
+
+    load(
+        {
+            'main': [
+                {
+                    'action': {
+                        'limit_req': limit(
+                            zone=all_zone, burst=10, stage=all_stage
+                        ),
+                        'pass': 'routes/uri',
+                    }
+                }
+            ],
+            'uri': [
+                {
+                    'match': {'uri': '/login'},
+                    'action': {
+                        'limit_req': limit(
+                            zone=login_zone,
+                            burst=login_burst,
+                            stage=login_stage,
+                        ),
+                        'return': 200,
+                    },
+                },
+                {'action': {'return': 200}},
+            ],
+        },
+        {'pass': 'routes/main'},
+    )
+
+
+def test_limit_req_every_zone():
+    # Every zone on the path of a request counts it.
+    def run(attempt):
+        return statuses(3, url='/login') + statuses(2)
+
+    attempt, result = quick(run, 1, two_zones)
+    assert result == [200, 200, 429, 200, 200]
+
+    # "all" counted the request before "login" refused it.
+    c = counters(zone(attempt, f'{ZONE}-all'))
+    assert c['passed'] == 5
+    assert c['rejected'] == 0
+
+    c = counters(zone(attempt, f'{ZONE}-login'))
+    assert c['passed'] == 2
+    assert c['rejected'] == 1
+
+
+def test_limit_req_every_zone_stages():
+    # The headers stage comes first, whatever the order on the path: a
+    # request that "login" refuses before its body does not get to the
+    # body stage of "all".
+    def setup(attempt):
+        two_zones(attempt, all_stage='body', login_stage='headers')
+
+    def run(attempt):
+        return statuses(3, url='/login') + statuses(2)
+
+    attempt, result = quick(run, 1, setup)
+    assert result == [200, 200, 429, 200, 200]
+
+    c = counters(zone(attempt, f'{ZONE}-all'))
+    assert c['passed'] == 4
+    assert c['rejected'] == 0
+
+    c = counters(zone(attempt, f'{ZONE}-login'))
+    assert c['passed'] == 2
+    assert c['rejected'] == 1
+
+
+def test_limit_req_every_zone_once():
+    # Two limits of one zone on the path count the request once.
+    def setup(attempt):
+        two_zones(attempt, login_zone='all')
+
+    attempt, result = quick(lambda attempt: statuses(3, url='/login'), 1, setup)
+    assert result == [200, 200, 200]
+
+    c = counters(zone(attempt, f'{ZONE}-all'))
+    assert c['passed'] == 3
+    assert c['rejected'] == 0

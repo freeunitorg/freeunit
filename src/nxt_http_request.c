@@ -370,7 +370,7 @@ nxt_http_request_start(nxt_task_t *task, void *obj, void *data)
     if (skcf->router_conf->limit_zones != NULL) {
         ret = nxt_http_limit_req_headers(task, r);
         if (ret != NXT_OK) {
-            /* The 429 is sent. */
+            /* The 429 or the 500 is sent. */
             return;
         }
     }
@@ -655,7 +655,7 @@ nxt_http_request_action(nxt_task_t *task, nxt_http_request_t *r,
             if (action->limit_req != NULL) {
                 ret = nxt_http_limit_req_check(task, r, action->limit_req);
                 if (ret != NXT_OK) {
-                    /* The 429 is sent. */
+                    /* The 429 or the 500 is sent. */
                     return;
                 }
             }

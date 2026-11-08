@@ -271,6 +271,8 @@ struct nxt_http_request_s {
      * body; the route handler takes the same steps.  NULL without it.
      */
     nxt_array_t                     *route_peeks;
+    /* A bit for each "limit_req" zone that counted the request. */
+    u_char                          *limit_req_counted;
     void                            *req_rpc_data;
 
     nxt_http_peer_t                 *peer;
@@ -318,8 +320,6 @@ struct nxt_http_request_s {
     uint8_t                         websocket_upgrade;    /* 1 bit */
     uint8_t                         chunked;  /* 1 bit */
     uint8_t                         no_body;  /* 1 bit */
-    /* A "limit_req" counted the request; the next ones skip it. */
-    uint8_t                         limited;  /* 1 bit */
 
     /*
      * After the byte flags, not in front of "fields": a byte there leaves

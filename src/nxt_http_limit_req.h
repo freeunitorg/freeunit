@@ -59,6 +59,8 @@ typedef struct {
 
 struct nxt_http_limit_req_s {
     nxt_http_limit_zone_t       *zone;
+    /* The zone in rtcf->limit_zones, and its bit in the request. */
+    uint32_t                    index;
     uint8_t                     stage;  /* nxt_http_limit_req_stage_t */
 };
 
