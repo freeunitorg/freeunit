@@ -18,6 +18,19 @@ typedef struct {
 } nxt_status_app_t;
 
 
+/* The counters of one "limit_req" zone; the name is an offset, see below. */
+
+typedef struct {
+    nxt_str_t         name;
+    uint64_t          keys;
+    uint64_t          keys_max;
+    uint64_t          passed;
+    uint64_t          rejected;
+    uint64_t          evicted;
+    uint64_t          overflow;
+} nxt_status_limit_zone_t;
+
+
 typedef struct {
     uint64_t          accepted_conns;
     uint64_t          idle_conns;
@@ -48,9 +61,25 @@ typedef struct {
     nxt_str_t         access_log_path;
     uint8_t           access_log_configured;
 
+    /* The zones follow the apps, see nxt_status_limit_zones(). */
+    size_t            limit_zones_count;
+
     size_t            apps_count;
     nxt_status_app_t  apps[];
 } nxt_status_report_t;
+
+
+/*
+ * The report is one buffer: the apps, then the zones, then the names at
+ * the end.  nxt_status_app_t is a multiple of 8 bytes, so the zones are
+ * aligned.
+ */
+
+nxt_inline nxt_status_limit_zone_t *
+nxt_status_limit_zones(nxt_status_report_t *report)
+{
+    return (nxt_status_limit_zone_t *) &report->apps[report->apps_count];
+}
 
 
 nxt_conf_value_t *nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp);

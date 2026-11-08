@@ -6,6 +6,7 @@
 
 #include <nxt_router.h>
 #include <nxt_http.h>
+#include <nxt_http_limit_req.h>
 #include <nxt_sockaddr.h>
 #include <nxt_http_route_addr.h>
 #include <nxt_regex.h>
@@ -158,6 +159,21 @@ struct nxt_http_routes_s {
 };
 
 
+/*
+ * A route that the "limit_req" headers stage matched before the body: the
+ * step it took and the result of the step, so that the route handler
+ * takes the same one later and does not match again.
+ */
+
+typedef struct {
+    nxt_http_route_t               *route;
+    /* The action of the step, NULL, or NXT_HTTP_ACTION_ERROR. */
+    nxt_http_action_t              *action;
+    /* route->items when no step matched. */
+    uint32_t                       step;
+} nxt_http_route_peek_t;
+
+
 static nxt_http_route_t *nxt_http_route_create(nxt_task_t *task,
     nxt_router_temp_conf_t *tmcf, nxt_conf_value_t *cv);
 static nxt_http_route_match_t *nxt_http_route_match_create(nxt_task_t *task,
@@ -204,6 +220,8 @@ static nxt_int_t nxt_http_route_find(nxt_http_routes_t *routes, nxt_str_t *name,
 
 static nxt_http_action_t *nxt_http_route_handler(nxt_task_t *task,
     nxt_http_request_t *r, nxt_http_action_t *start);
+static nxt_http_route_peek_t *nxt_http_route_peek_find(nxt_http_request_t *r,
+    nxt_http_route_t *route);
 static nxt_http_action_t *nxt_http_route_match(nxt_task_t *task,
     nxt_http_request_t *r, nxt_http_route_match_t *match);
 static nxt_int_t nxt_http_route_table(nxt_http_request_t *r,
@@ -682,6 +700,11 @@ static nxt_conf_map_t  nxt_http_route_action_conf[] = {
         NXT_CONF_MAP_PTR,
         offsetof(nxt_http_action_conf_t, fallback)
     },
+    {
+        nxt_string("limit_req"),
+        NXT_CONF_MAP_PTR,
+        offsetof(nxt_http_action_conf_t, limit_req)
+    },
 };
 
 
@@ -717,6 +740,13 @@ nxt_http_action_init(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 
     if (acf.set_headers != NULL) {
         ret = nxt_http_set_headers_init(rtcf, action, &acf);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return ret;
+        }
+    }
+
+    if (acf.limit_req != NULL) {
+        ret = nxt_http_limit_req_init(task, tmcf, action, acf.limit_req);
         if (nxt_slow_path(ret != NXT_OK)) {
             return ret;
         }
@@ -1632,11 +1662,21 @@ nxt_http_route_handler(nxt_task_t *task, nxt_http_request_t *r,
     size_t                  i;
     nxt_http_route_t        *route;
     nxt_http_action_t       *action;
+    nxt_http_route_peek_t   *peek;
 
     route = start->u.route;
 
+    peek = nxt_http_route_peek_find(r, route);
+
     for (i = 0; i < route->items; i++) {
-        action = nxt_http_route_match(task, r, route->match[i]);
+
+        if (peek != NULL) {
+            /* The steps are not matched again: see nxt_http_route_peek(). */
+            action = (i == peek->step) ? peek->action : NULL;
+
+        } else {
+            action = nxt_http_route_match(task, r, route->match[i]);
+        }
 
         if (nxt_slow_path(r->log_route)) {
             uint32_t    lvl = (action == NULL) ? NXT_LOG_INFO : NXT_LOG_NOTICE;
@@ -1660,6 +1700,97 @@ nxt_http_route_handler(nxt_task_t *task, nxt_http_request_t *r,
     }
 
     nxt_http_request_error(task, r, NXT_HTTP_NOT_FOUND);
+
+    return NULL;
+}
+
+
+/*
+ * The action a route selects for the request, without taking it: no log,
+ * no 404, r->action is not set.  NULL when the action is not a route, when
+ * no step matches, or when a match fails.  The rate limiter uses it before
+ * the body is read.
+ *
+ * The result is kept in the request, and the route handler takes it
+ * instead of a second match.  A condition can give another result the
+ * second time ("if" with njs), and the limit that counted the request must
+ * be the one on its path.  A rewrite changes the URI, so the results are
+ * not used after it.
+ */
+
+nxt_http_action_t *
+nxt_http_route_peek(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_http_action_t *start)
+{
+    uint32_t               i;
+    nxt_http_route_t       *route;
+    nxt_http_action_t      *action;
+    nxt_http_route_peek_t  *peek;
+
+    if (start->handler != nxt_http_route_handler) {
+        return NULL;
+    }
+
+    route = start->u.route;
+
+    peek = nxt_http_route_peek_find(r, route);
+
+    if (peek == NULL) {
+        if (r->route_peeks == NULL) {
+            r->route_peeks = nxt_array_create(r->mem_pool, 4,
+                                              sizeof(nxt_http_route_peek_t));
+            if (nxt_slow_path(r->route_peeks == NULL)) {
+                return NULL;
+            }
+        }
+
+        /* No match without a place for its result. */
+
+        peek = nxt_array_add(r->route_peeks);
+        if (nxt_slow_path(peek == NULL)) {
+            return NULL;
+        }
+
+        action = NULL;
+
+        for (i = 0; i < route->items; i++) {
+            action = nxt_http_route_match(task, r, route->match[i]);
+
+            if (action != NULL) {
+                break;
+            }
+        }
+
+        peek->route = route;
+        peek->action = action;
+        peek->step = i;
+    }
+
+    if (peek->action == NXT_HTTP_ACTION_ERROR) {
+        return NULL;
+    }
+
+    return peek->action;
+}
+
+
+static nxt_http_route_peek_t *
+nxt_http_route_peek_find(nxt_http_request_t *r, nxt_http_route_t *route)
+{
+    nxt_uint_t             i;
+    nxt_http_route_peek_t  *peek;
+
+    if (r->route_peeks == NULL || r->uri_changed) {
+        return NULL;
+    }
+
+    peek = r->route_peeks->elts;
+
+    for (i = 0; i < r->route_peeks->nelts; i++) {
+        if (peek[i].route == route) {
+            return &peek[i];
+        }
+    }
 
     return NULL;
 }

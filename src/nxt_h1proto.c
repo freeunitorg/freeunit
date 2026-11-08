@@ -1759,7 +1759,7 @@ static const nxt_str_t  nxt_http_client_error[] = {
     nxt_string("HTTP/1.1 426 Upgrade Required\r\n"),
     nxt_string("HTTP/1.1 427 \r\n"),
     nxt_string("HTTP/1.1 428 \r\n"),
-    nxt_string("HTTP/1.1 429 \r\n"),
+    nxt_string("HTTP/1.1 429 Too Many Requests\r\n"),
     nxt_string("HTTP/1.1 430 \r\n"),
     nxt_string("HTTP/1.1 431 Request Header Fields Too Large\r\n"),
 };
@@ -1900,6 +1900,14 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
                  */
                 h1p->keepalive = 0;
             }
+        }
+
+        /*
+         * A response marked inconsistent closes the connection after it
+         * (nxt_h1p_request_close); say so, as the client reuses it else.
+         */
+        if (r->inconsistent) {
+            h1p->keepalive = 0;
         }
 
         if (http11 ^ h1p->keepalive) {
