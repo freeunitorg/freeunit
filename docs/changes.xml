@@ -18,6 +18,19 @@ to 0.135.8 with Wasmtime.  The contrib C API pin is 48.0.8 too.
 </para>
 </change>
 
+<change type="security">
+<para>
+the "unitc" and "setup-unit" tools found a running unitd by its process title
+alone and trusted the command line and files of whatever matched.  A local
+user could run a process titled "unit: main" so that an operator running the
+tool as root ran that user's program -- unitc built a command from the title,
+setup-unit passed it to "eval" -- or sourced a cache file the user had planted
+in the world-writable /tmp.  The tools now trust only a "unit: main" owned by
+the superuser or by the user running them, and unitc reads and creates its
+/tmp cache only as a regular file it owns, refusing a symlink.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 when the router got no shared memory for a WebSocket frame from the client,
