@@ -899,3 +899,15 @@ def test_limit_req_invalid_total():
     # A zone that two limits name is counted once.
     load(routes([f'{ZONE}:600000', f'{ZONE}:600000']))
     assert counters()['keys_max'] == 600000
+
+
+def test_limit_req_status_line():
+    def setup(attempt):
+        load(limited(zone=zone(attempt)))
+
+    def run(attempt):
+        return client.get()['status'], client.get(raw_resp=True)
+
+    _, (first, raw) = quick(run, 1, setup)
+    assert first == 200
+    assert raw.startswith('HTTP/1.1 429 Too Many Requests\r\n'), raw
