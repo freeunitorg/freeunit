@@ -263,6 +263,11 @@ struct nxt_http_request_s {
     nxt_http_set_headers_ctx_t      *set_headers;
 
     nxt_http_action_t               *action;
+    /*
+     * The routes that the "limit_req" headers stage matched before the
+     * body; the route handler takes the same steps.  NULL without it.
+     */
+    nxt_array_t                     *route_peeks;
     void                            *req_rpc_data;
 
 #if (NXT_HAVE_REGEX)

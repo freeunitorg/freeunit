@@ -598,3 +598,53 @@ def test_limit_req_threads():
     assert c['passed'] == 4
     assert c['rejected'] == 12
     assert c['keys'] == 1
+
+
+def test_limit_req_route_matched_once(require):
+    require({'modules': {'njs': 'any'}})
+
+    # The condition is true when a request evaluates it for the first
+    # time, and false after that: the njs state lives as long as the
+    # request.  The route handler must take the step that the headers
+    # stage matched and whose limit counted the request.  A second match
+    # takes the other step.
+    first = '`${(globalThis.n = (globalThis.n || 0) + 1) == 1}`'
+
+    routes = [
+        {'match': {'if': first}, 'action': {'return': 200}},
+        {'action': {'return': 204}},
+    ]
+
+    # Without a limit the condition is evaluated once.
+    load(routes)
+    assert client.get()['status'] == 200
+
+    routes[0]['action']['limit_req'] = limit(burst=10)
+    load(routes)
+
+    assert client.get()['status'] == 200
+    assert counters()['passed'] == 1
+
+
+def test_limit_req_route_matched_after_rewrite():
+    # The headers stage matches "/a" in "main" and stops at the rewrite.
+    # After the rewrite "main" is matched again, with the new URI: the
+    # step of "/a" taken again would loop.
+    load(
+        {
+            'main': [
+                {
+                    'match': {'uri': '/a'},
+                    'action': {'rewrite': '/b', 'pass': 'routes/main'},
+                },
+                {
+                    'match': {'uri': '/b'},
+                    'action': {'limit_req': limit(burst=10), 'return': 200},
+                },
+            ],
+        },
+        {'pass': 'routes/main'},
+    )
+
+    assert client.get(url='/a')['status'] == 200
+    assert counters()['passed'] == 1
