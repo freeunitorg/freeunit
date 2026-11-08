@@ -6229,11 +6229,15 @@ components:
 
     scheduleName:
       in: path
-      description: "A schedule's name in the configuration (`schedules`)."
+      description: "A schedule's name in the configuration (`schedules`):
+        1 to 128 bytes, each a printable ASCII character (0x20 to 0x7E)."
       name: scheduleName
       required: true
       schema:
         type: string
+        minLength: 1
+        maxLength: 128
+        pattern: "^[ -~]+$"
 
     arrayIndex:
       in: path
@@ -7570,7 +7574,10 @@ components:
       type: object
       description: "An object whose options define individual schedules:
         periodic internal requests Unit issues to an application, such as a
-        cron trigger, with no external client involved."
+        cron trigger, with no external client involved. Each key is a
+        schedule name: 1 to 128 bytes, each a printable ASCII character
+        (0x20 to 0x7E). OpenAPI 3.0 cannot constrain an object key, so the
+        `scheduleName` parameter carries the same rule as a pattern."
       additionalProperties:
         $ref: "#/components/schemas/configSchedule"
 
@@ -7612,6 +7619,10 @@ components:
         - pass
         - uri
         - interval
+
+      # The validator refuses any other member
+      # (nxt_conf_vldt_schedule_members in src/nxt_conf_validation.c).
+      additionalProperties: false
 
       properties:
         pass:
@@ -9089,11 +9100,12 @@ components:
     # /status/schedules
     statusSchedules:
       description: "Lists the run counters and last-run result of each
-        configured schedule (`schedules`), keyed by schedule name. The
-        object is omitted entirely from `/status` when no schedules are
-        configured, so its absence is how a client tells a build or
-        configuration with no schedules from one whose schedules simply
-        have not run yet."
+        configured schedule (`schedules`), keyed by schedule name. A
+        schedule that was removed while its run was in progress is listed
+        too, until that run ends. The object is omitted entirely from
+        `/status` when no schedule is listed, so its absence is how a
+        client tells a build or configuration with no schedules from one
+        whose schedules simply have not run yet."
       type: object
       additionalProperties:
         $ref: "#/components/schemas/statusSchedulesSchedule"
