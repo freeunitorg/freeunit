@@ -1151,7 +1151,9 @@ nxt_python_response_add_field(nxt_python_ctx_t *pctx, PyObject *name,
         goto fail;
     }
 
-    if (pctx->req->response->fields[i].hash == NXT_UNIT_HASH_CONTENT_LENGTH) {
+    if (pctx->req->response->fields[i].hash == NXT_UNIT_HASH_CONTENT_LENGTH
+        && nxt_python_is_content_length(name_str, name_length))
+    {
         content_length = nxt_off_t_parse((u_char *) value_str, value_length);
         if (nxt_slow_path(content_length < 0)) {
             nxt_unit_req_error(pctx->req, "failed to parse Content-Length "

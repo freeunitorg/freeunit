@@ -240,6 +240,17 @@ def test_python_application_working_directory_invalid():
     assert client.get()['status'] == 500, 'status'
 
 
+def test_python_application_field_name():
+    # Only a field named "Content-Length" sets the body length.
+    client.load('field_name')
+
+    resp = client.get()
+
+    assert resp['status'] == 200, 'status'
+    assert resp['headers']['X-Fnup'] == '3', 'field kept'
+    assert resp['body'] == '0123456789', 'body'
+
+
 def test_python_application_204_transfer_encoding():
     client.load('204_no_content')
 

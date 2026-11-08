@@ -3720,7 +3720,7 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
 static nxt_int_t
 nxt_h1p_peer_header_parse(nxt_http_peer_t *peer, nxt_buf_mem_t *bm)
 {
-    u_char                    *p;
+    u_char                    *p, *q;
     size_t                    length;
     nxt_int_t                 ret, status;
     nxt_http_request_parse_t  *rp;
@@ -3732,7 +3732,8 @@ again:
     if (peer->status < 0) {
         length = nxt_buf_mem_used_size(bm);
 
-        if (nxt_slow_path(length < 12)) {
+        /* "HTTP/1.x NNN" and at least the line end. */
+        if (nxt_slow_path(length < 13)) {
             return NXT_AGAIN;
         }
 
@@ -3744,19 +3745,38 @@ again:
             return NXT_ERROR;
         }
 
+        /*
+         * RFC 9112, 4: status-line = HTTP-version SP status-code SP
+         * [ reason-phrase ].  A sender must send the second space, but
+         * a line without it is accepted, as a recipient may be lenient.
+         * The space before the code is required.
+         */
+        if (nxt_slow_path(p[8] != ' '
+                          || (p[12] != ' ' && p[12] != '\r'
+                              && p[12] != '\n')))
+        {
+            return NXT_ERROR;
+        }
+
         status = nxt_int_parse(&p[9], 3);
 
         if (nxt_slow_path(status < 0)) {
             return NXT_ERROR;
         }
 
-        p += 12;
-        length -= 12;
+        q = p + 12;
 
-        p = memchr(p, '\n', length);
+        p = memchr(q, '\n', length - 12);
 
         if (nxt_slow_path(p == NULL)) {
             return NXT_AGAIN;
+        }
+
+        /* A CR is valid only before the LF (RFC 9112, 2.2). */
+        q = memchr(q, '\r', p - q);
+
+        if (nxt_slow_path(q != NULL && q != p - 1)) {
+            return NXT_ERROR;
         }
 
         bm->pos = p + 1;

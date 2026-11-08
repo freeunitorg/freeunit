@@ -107,6 +107,27 @@ def test_asgi_websockets_subprotocol():
     assert resp['headers']['sec-websocket-protocol'] == 'chat', 'key'
 
 
+def test_asgi_websockets_subprotocol_field_name():
+    # Only a field named "Sec-WebSocket-Protocol" gives the subprotocols.
+    client.load('websockets/subprotocol')
+
+    resp, sock, _ = ws.upgrade(
+        headers={
+            'Host': 'localhost',
+            'Upgrade': 'websocket',
+            'Connection': 'Upgrade',
+            'Sec-WebSocket-Key': ws.key(),
+            'Sec-WebSocket-Protocol': 'chat',
+            'X-Websocket-Protoairzz': 'other',
+            'Sec-WebSocket-Version': 13,
+        }
+    )
+    sock.close()
+
+    assert resp['status'] == 101, 'status'
+    assert resp['headers']['x-subprotocols'] == "('chat',)", 'subprotocols'
+
+
 def test_asgi_websockets_subprotocol_utf8():
     client.load('websockets/subprotocol_utf8')
 
