@@ -56,9 +56,19 @@ typedef struct {
     uint32_t                rate;      /* requests per second */
     uint32_t                burst;     /* bucket depth, in requests */
 
+    /*
+     * The bucket of the keys that find the zone full, with no idle entry
+     * to take: they share it, so a full zone does not give a fresh bucket
+     * to each new key.  Not in the hash and not in the list.
+     */
+    nxt_limit_entry_t       overflow;
+
     uint64_t                passed;
     uint64_t                rejected;
+    /* Idle entries given to a new key. */
     uint64_t                evicted;
+    /* Requests counted in the overflow bucket. */
+    uint64_t                overflowed;
 } nxt_limit_zone_t;
 
 

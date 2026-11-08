@@ -448,6 +448,7 @@ def test_limit_req_reload():
         'passed': 1,
         'rejected': 1,
         'evicted': 0,
+        'overflow': 0,
     }
     assert result[4:6] == [429, 2]
     assert result[6:8] == [429, 3]
@@ -461,6 +462,7 @@ def test_limit_req_reload():
         'passed': 0,
         'rejected': 0,
         'evicted': 0,
+        'overflow': 0,
     }
 
     assert client.get()['status'] == 200
@@ -536,29 +538,52 @@ def test_limit_req_pass_chain_counted_once():
     assert quick(lambda attempt: statuses(3), 1, setup2)[1] == [200, 200, 429]
 
 
-def test_limit_req_eviction():
-    load(limited(zone=f'{ZONE}:1'), {'pass': 'routes', 'client_ip': CLIENT_IP})
+def test_limit_req_zone_full():
+    # A zone of one key.  While its entry is in use, the new clients share
+    # one overflow bucket: a full zone does not give a fresh bucket to
+    # each new client.
+    def setup(attempt):
+        load(
+            limited(zone=f'{zone(attempt)}:1'),
+            {'pass': 'routes', 'client_ip': CLIENT_IP},
+        )
 
     def run(attempt):
-        a = f'10.{attempt}.0.1'
-        b = f'10.{attempt}.0.2'
+        return [
+            get_as('10.0.0.1'),
+            get_as('10.0.0.1'),
+            get_as('10.0.0.2'),
+            get_as('10.0.0.3'),
+            get_as('10.0.0.1'),
+        ]
 
-        # The second client takes the one entry; the first one starts
-        # afresh.
-        return [get_as(a), get_as(a), get_as(b), get_as(a)]
+    attempt, result = quick(run, 1, setup)
+    assert result == [200, 429, 200, 429, 429]
 
-    attempt, result = quick(run, 1)
-    assert result == [200, 429, 200, 200]
-
-    # Every request of an attempt but the second takes the entry of
-    # another client: the first one evicts the client of the attempt
-    # before.
-    c = counters()
+    c = counters(zone(attempt))
     assert c['keys'] == 1
     assert c['keys_max'] == 1
-    assert c['evicted'] == 3 * (attempt + 1) - 1
-    assert c['passed'] == 3 * (attempt + 1)
-    assert c['rejected'] == attempt + 1
+    assert c['evicted'] == 0
+    assert c['overflow'] == 2
+    assert c['passed'] == 2
+    assert c['rejected'] == 3
+
+    # After 1.1 s the bucket of the first client is full again: the entry
+    # is idle, and a new client takes it with nothing lost.  Each attempt
+    # waits, so the entry of the client before is idle.
+    def wait(attempt):
+        time.sleep(1.1)
+
+    def run2(attempt):
+        return [get_as(f'10.1.0.{attempt}'), get_as(f'10.1.0.{attempt}')]
+
+    again, result = quick(run2, 1, wait)
+    assert result == [200, 429]
+
+    c = counters(zone(attempt))
+    assert c['keys'] == 1
+    assert c['evicted'] == again + 1
+    assert c['overflow'] == 2
 
 
 def test_limit_req_threads():
