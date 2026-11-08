@@ -43,6 +43,9 @@ typedef struct {
 typedef struct {
     nxt_thread_spinlock_t   lock;
 
+    /* The random key of the hash, set when the zone is created. */
+    uint64_t                hash_key[2];
+
     nxt_limit_entry_t      *entries;
     uint32_t               *buckets;   /* 1-based entry index, 0 is empty */
     uint32_t                buckets_mask;
@@ -76,6 +79,8 @@ nxt_limit_zone_t *nxt_limit_zone_create(nxt_mp_t *mp, uint32_t keys_max,
     uint32_t rate, uint32_t burst);
 nxt_bool_t nxt_limit_zone_check(nxt_limit_zone_t *zone, const uint8_t *key,
     size_t key_len, uint64_t now_us, uint64_t *wait_us);
+uint64_t nxt_limit_siphash(const uint64_t key[2], const uint8_t *data,
+    size_t len);
 
 
 #endif /* _NXT_LIMIT_ZONE_H_INCLUDED_ */

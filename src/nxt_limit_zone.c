@@ -8,7 +8,8 @@
 #include "nxt_limit_zone.h"
 
 
-static uint32_t nxt_limit_hash(const uint8_t *key, size_t len);
+static uint32_t nxt_limit_hash(nxt_limit_zone_t *zone, const uint8_t *key,
+    size_t len);
 static nxt_limit_entry_t *nxt_limit_lookup(nxt_limit_zone_t *zone,
     const uint8_t *key, size_t len, uint32_t hash, uint32_t *bucket);
 static nxt_limit_entry_t *nxt_limit_claim(nxt_limit_zone_t *zone,
@@ -22,22 +23,78 @@ static void nxt_limit_refill(nxt_limit_zone_t *zone, nxt_limit_entry_t *entry,
     uint64_t now_us);
 
 
-static uint32_t
-nxt_limit_hash(const uint8_t *key, size_t len)
+/*
+ * SipHash-2-4 with a random key for each zone.  The keys are client
+ * addresses, which a client can often choose (its own /64, or a trusted
+ * "client_ip"), and every lookup walks a chain under the zone lock.  With
+ * an unkeyed hash a client can send addresses that all go to one chain;
+ * without the key it cannot know which addresses collide.
+ */
+
+#define NXT_LIMIT_ROTL(x, b)  (((x) << (b)) | ((x) >> (64 - (b))))
+
+#define NXT_LIMIT_SIPROUND(v0, v1, v2, v3)                                    \
+    do {                                                                      \
+        v0 += v1; v1 = NXT_LIMIT_ROTL(v1, 13); v1 ^= v0;                      \
+        v0 = NXT_LIMIT_ROTL(v0, 32);                                          \
+        v2 += v3; v3 = NXT_LIMIT_ROTL(v3, 16); v3 ^= v2;                      \
+        v0 += v3; v3 = NXT_LIMIT_ROTL(v3, 21); v3 ^= v0;                      \
+        v2 += v1; v1 = NXT_LIMIT_ROTL(v1, 17); v1 ^= v2;                      \
+        v2 = NXT_LIMIT_ROTL(v2, 32);                                          \
+    } while (0)
+
+
+uint64_t
+nxt_limit_siphash(const uint64_t key[2], const uint8_t *data, size_t len)
 {
-    size_t    i;
-    uint32_t  h;
+    size_t    i, j, end;
+    uint64_t  v0, v1, v2, v3, m;
 
-    /* FNV-1a: small, no state, good enough for a bounded key set. */
+    v0 = key[0] ^ 0x736f6d6570736575ULL;
+    v1 = key[1] ^ 0x646f72616e646f6dULL;
+    v2 = key[0] ^ 0x6c7967656e657261ULL;
+    v3 = key[1] ^ 0x7465646279746573ULL;
 
-    h = 2166136261u;
+    end = len & ~(size_t) 7;
 
-    for (i = 0; i < len; i++) {
-        h ^= key[i];
-        h *= 16777619u;
+    for (i = 0; i < end; i += 8) {
+        m = 0;
+
+        for (j = 0; j < 8; j++) {
+            m |= (uint64_t) data[i + j] << (8 * j);
+        }
+
+        v3 ^= m;
+        NXT_LIMIT_SIPROUND(v0, v1, v2, v3);
+        NXT_LIMIT_SIPROUND(v0, v1, v2, v3);
+        v0 ^= m;
     }
 
-    return h;
+    m = (uint64_t) len << 56;
+
+    for (j = 0; i + j < len; j++) {
+        m |= (uint64_t) data[i + j] << (8 * j);
+    }
+
+    v3 ^= m;
+    NXT_LIMIT_SIPROUND(v0, v1, v2, v3);
+    NXT_LIMIT_SIPROUND(v0, v1, v2, v3);
+    v0 ^= m;
+
+    v2 ^= 0xff;
+    NXT_LIMIT_SIPROUND(v0, v1, v2, v3);
+    NXT_LIMIT_SIPROUND(v0, v1, v2, v3);
+    NXT_LIMIT_SIPROUND(v0, v1, v2, v3);
+    NXT_LIMIT_SIPROUND(v0, v1, v2, v3);
+
+    return v0 ^ v1 ^ v2 ^ v3;
+}
+
+
+static uint32_t
+nxt_limit_hash(nxt_limit_zone_t *zone, const uint8_t *key, size_t len)
+{
+    return (uint32_t) nxt_limit_siphash(zone->hash_key, key, len);
 }
 
 
@@ -47,6 +104,7 @@ nxt_limit_zone_create(nxt_mp_t *mp, uint32_t keys_max, uint32_t rate,
 {
     uint32_t            i, buckets;
     uint32_t            *heads;
+    nxt_thread_t        *thr;
     nxt_limit_zone_t    *zone;
     nxt_limit_entry_t   *entry;
 
@@ -90,6 +148,13 @@ nxt_limit_zone_create(nxt_mp_t *mp, uint32_t keys_max, uint32_t rate,
     nxt_memzero(zone, sizeof(nxt_limit_zone_t));
     nxt_memzero(entry, keys_max * sizeof(nxt_limit_entry_t));
     nxt_memzero(heads, buckets * sizeof(uint32_t));
+
+    thr = nxt_thread();
+
+    for (i = 0; i < 2; i++) {
+        zone->hash_key[i] = (uint64_t) nxt_random(&thr->random) << 32
+                            | nxt_random(&thr->random);
+    }
 
     zone->entries = entry;
     zone->buckets = heads;
@@ -139,7 +204,7 @@ nxt_limit_zone_check(nxt_limit_zone_t *zone, const uint8_t *key,
         return 1;
     }
 
-    hash = nxt_limit_hash(key, key_len);
+    hash = nxt_limit_hash(zone, key, key_len);
 
     nxt_thread_spin_lock(&zone->lock);
 
@@ -357,7 +422,7 @@ nxt_limit_evict_idle(nxt_limit_zone_t *zone, uint64_t now_us)
 
     nxt_limit_lru_unlink(zone, oldest);
 
-    hash = nxt_limit_hash(entry->key, entry->key_len);
+    hash = nxt_limit_hash(zone, entry->key, entry->key_len);
     bucket = hash & zone->buckets_mask;
 
     nxt_limit_unlink(zone, oldest, bucket);
