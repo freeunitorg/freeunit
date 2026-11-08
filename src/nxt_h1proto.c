@@ -3550,6 +3550,25 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
         h1p->chunked = (h1p->transfer_encoding == NXT_HTTP_TE_CHUNKED);
 
         /*
+         * The proxy cannot pass WebSocket.  The 101 of an application starts
+         * the WebSocket frame reader of the client connection, and the reader
+         * calls the request state with no peer.  The states of a proxy
+         * request all read the peer from that argument.  Refuse the upgrade
+         * here, where "b" can still be freed: bytes that the upstream sent
+         * after the 101 are in "b" too.
+         */
+        if (nxt_slow_path(peer->status == NXT_HTTP_SWITCHING_PROTOCOLS
+                          && r->websocket_handshake))
+        {
+            nxt_log(task, NXT_LOG_WARN,
+                    "upstream answered a WebSocket handshake with 101, "
+                    "a proxy cannot pass WebSocket");
+
+            peer->status = NXT_HTTP_BAD_GATEWAY;
+            break;
+        }
+
+        /*
          * RFC 9112 Sect. 6.3: a response to HEAD, and any 204 or 304 response,
          * is terminated by the first empty line after the header fields no
          * matter what Content-Length or Transfer-Encoding say.  Such a response

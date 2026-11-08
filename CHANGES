@@ -78,6 +78,11 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        and a chunked response from an upstream server is refused in the same
        way. Valid extensions are still ignored.
 
+    *) Bugfix: a proxy route crashed the router when the upstream answered a
+       WebSocket handshake with 101 and the client then sent a frame. The
+       proxy cannot pass WebSocket, so it now answers 502 and logs a
+       warning.
+
     *) Feature: the PHP module now builds with PHP 8.7, which removed five
        members of "sapi_module_struct". The module names the members that it
        sets, so a member that PHP removes no longer shifts the others.
