@@ -9139,8 +9139,8 @@ components:
           minimum: 0
           maximum: 4294967295
           description: "Runs that did not time out and ended with no
-            response status, with a status of 400 or more, or with a
-            response the router discarded. A run whose request the router
+            response status, with a status below 200 or of 400 or more,
+            or with a response the router discarded. A run whose request the router
             could not allocate is one of them, and is counted in `runs`
             too. A due run that the router could not allocate at all is
             counted here but not in `runs`."

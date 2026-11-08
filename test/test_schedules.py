@@ -491,6 +491,19 @@ def test_schedules_run_status():
     assert sched['last_status'] == 503 and sched['timed_out'] == 0, sched
 
 
+def test_schedules_run_status_1xx():
+    # A 1xx status is not a final response: the application did not answer.
+    put_run(run(uri="/?status=103"))
+
+    sched = wait_for_status('cron', lambda s: s['last_status'] != 0, 5)
+    assert sched['last_status'] == 103, sched
+    assert sched['failed'] >= 1 and sched['timed_out'] == 0, sched
+
+    assert Log.wait_for_record(
+        r'\[warn\].*schedule "cron" run 1: GET /\.\.\. -> 103 in \d+ ms'
+    )
+
+
 def test_schedules_run_no_listeners():
     put_run(run(), listeners=False)
     wait_for_starts(3, 10)

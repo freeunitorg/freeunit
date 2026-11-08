@@ -151,8 +151,9 @@ clears `running` and updates the counters. Thus
 `nxt_router_schedule_done()` reads only the run and the state, which do
 not live in the configuration, and the run's pointers to the schedule and
 to the set of schedules are cleared before the post. A run that did not
-time out counts as `failed` when it has no status, a status of 400 or
-more, or a discarded response. A due run that cannot be allocated counts
+time out counts as `failed` when it has no status, a status below 200 or
+of 400 or more, or a discarded response. A 1xx status is not a final
+response (RFC 9110, section 15.2). A due run that cannot be allocated counts
 as `failed` and not in `runs`. A run whose request cannot be allocated on
 the worker engine is in `runs` and in `failed`.
 

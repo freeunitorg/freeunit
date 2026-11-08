@@ -993,9 +993,13 @@ nxt_router_schedule_run_finish(nxt_task_t *task, void *obj, void *data)
                 sched->uri.start, (n < sched->uri.length) ? "..." : "",
                 run->duration);
 
-    } else if (status == 0 || status >= NXT_HTTP_BAD_REQUEST
+    } else if (status < NXT_HTTP_OK || status >= NXT_HTTP_BAD_REQUEST
                || run->devnull.discarded)
     {
+        /*
+         * A 1xx status is not a final response (RFC 9110, section 15.2):
+         * an application that ends with one did not answer.
+         */
         run->failed = 1;
 
         /*
