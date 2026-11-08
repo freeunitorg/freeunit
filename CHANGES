@@ -172,6 +172,13 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        pattern that reaches a match limit is now logged once, so a flood of
        crafted requests cannot flood the log.
 
+    *) Bugfix: a control-API PUT whose path descended one step past a scalar
+       configuration member -- for example
+       /config/settings/http/body_read_timeout/x when body_read_timeout is
+       an integer -- read the scalar's value as a pointer and crashed the
+       controller. Such a request now gets a 404 response, as the delete and
+       append operations already did for the same path.
+
     *) Feature: Docker images for Python 3.15.
 
     *) Bugfix: a Java application got a wrong String for a request header,

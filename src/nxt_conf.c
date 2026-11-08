@@ -1076,7 +1076,7 @@ nxt_conf_op_compile(nxt_mp_t *mp, nxt_conf_op_t **ops,
 
         op->ctx = value;
 
-    } else {
+    } else if (root->type == NXT_CONF_VALUE_OBJECT) {
         member = nxt_mp_zget(mp, sizeof(nxt_conf_object_member_t));
         if (nxt_slow_path(member == NULL)) {
             return NXT_CONF_OP_ERROR;
@@ -1091,6 +1091,15 @@ nxt_conf_op_compile(nxt_mp_t *mp, nxt_conf_op_t **ops,
 
         op->index = root->u.object->count;
         op->ctx = member;
+
+    } else {
+        /*
+         * The path descended one step past a scalar member, which is not a
+         * container to create into.  Refuse it as not found -- the same way
+         * the delete and append paths above handle this condition -- instead
+         * of reading the scalar's union as an nxt_conf_object_t pointer.
+         */
+        return NXT_CONF_OP_NOT_FOUND;
     }
 
     return NXT_CONF_OP_OK;

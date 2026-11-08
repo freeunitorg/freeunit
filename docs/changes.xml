@@ -256,6 +256,16 @@ flood the log.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a control-API PUT whose path descended one step past a scalar configuration
+member -- for example /config/settings/http/body_read_timeout/x when
+body_read_timeout is an integer -- read the scalar's value as a pointer and
+crashed the controller.  Such a request now gets a 404 response, as the
+delete and append operations already did for the same path.
+</para>
+</change>
+
 <change type="feature">
 <para>
 Docker images for Python 3.15.
