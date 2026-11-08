@@ -30,6 +30,120 @@ nxt_limit_zone_check_key(nxt_limit_zone_t *zone, const u_char *key,
 }
 
 
+/*
+ * What a client that chooses its addresses can do with an unkeyed hash:
+ * the addresses whose FNV-1a hash falls in one bucket all go to one chain,
+ * and every lookup walks it under the zone lock.  With a keyed hash the
+ * same addresses spread over the buckets.
+ */
+
+static uint32_t
+nxt_limit_zone_test_fnv1a(const u_char *key, size_t len)
+{
+    size_t    i;
+    uint32_t  h;
+
+    h = 2166136261u;
+
+    for (i = 0; i < len; i++) {
+        h ^= key[i];
+        h *= 16777619u;
+    }
+
+    return h;
+}
+
+
+/*
+ * The vectors of the SipHash paper (Aumasson, Bernstein): key 00 01 .. 0f,
+ * messages 00 01 .. of 0, 8 and 15 bytes.
+ */
+
+static nxt_int_t
+nxt_limit_zone_test_siphash(nxt_thread_t *thr)
+{
+    u_char    data[15];
+    uint64_t  key[2], h;
+    uint32_t  i;
+
+    key[0] = 0x0706050403020100ULL;
+    key[1] = 0x0f0e0d0c0b0a0908ULL;
+
+    for (i = 0; i < sizeof(data); i++) {
+        data[i] = (u_char) i;
+    }
+
+    h = nxt_limit_siphash(key, data, 0);
+    NXT_TEST_CHECK(thr->log, h == 0x726fdb47dd0e0e31ULL,
+                   "siphash of 0 bytes: %016xL", h);
+
+    h = nxt_limit_siphash(key, data, 8);
+    NXT_TEST_CHECK(thr->log, h == 0x93f5f5799a932462ULL,
+                   "siphash of 8 bytes: %016xL", h);
+
+    h = nxt_limit_siphash(key, data, 15);
+    NXT_TEST_CHECK(thr->log, h == 0xa129ca6149be45e5ULL,
+                   "siphash of 15 bytes: %016xL", h);
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_limit_zone_test_collisions(nxt_thread_t *thr, nxt_mp_t *mp)
+{
+    u_char            key[4];
+    uint32_t          i, n, chain, longest, link;
+    nxt_limit_zone_t  *zone;
+
+    zone = nxt_limit_zone_create(mp, 1024, 1, 1);
+
+    NXT_TEST_CHECK(thr->log, zone != NULL, "collision zone creation failed");
+
+    n = 0;
+    key[0] = 10;
+
+    for (i = 0; i < 0x1000000 && n < 64; i++) {
+        key[1] = (u_char) (i >> 16);
+        key[2] = (u_char) (i >> 8);
+        key[3] = (u_char) i;
+
+        if ((nxt_limit_zone_test_fnv1a(key, 4) & zone->buckets_mask) == 0) {
+            (void) nxt_limit_zone_check(zone, key, 4, 1000000, NULL);
+            n++;
+        }
+    }
+
+    NXT_TEST_CHECK(thr->log, n == 64 && zone->keys_used == 64,
+                   "collisions: %uD keys found, %uD stored", n,
+                   zone->keys_used);
+
+    longest = 0;
+
+    for (i = 0; i <= zone->buckets_mask; i++) {
+        chain = 0;
+
+        for (link = zone->buckets[i]; link != 0;
+             link = zone->entries[link - 1].next)
+        {
+            chain++;
+        }
+
+        longest = nxt_max(longest, chain);
+    }
+
+    /*
+     * 64 keys in 1024 buckets: a chain of 9 or more with a keyed hash has
+     * a probability below 1e-10.
+     */
+
+    NXT_TEST_CHECK(thr->log, longest <= 8,
+                   "64 chosen keys make a chain of %uD", longest);
+
+    return NXT_OK;
+}
+
+
 nxt_int_t
 nxt_limit_zone_test(nxt_thread_t *thr)
 {
@@ -43,6 +157,12 @@ nxt_limit_zone_test(nxt_thread_t *thr)
     mp = nxt_mp_create(32768, 128, 4096, 64);
 
     NXT_TEST_CHECK(thr->log, mp != NULL, "nxt_mp_create() failed");
+
+    if (nxt_limit_zone_test_siphash(thr) != NXT_OK
+        || nxt_limit_zone_test_collisions(thr, mp) != NXT_OK)
+    {
+        return NXT_ERROR;
+    }
 
     /* Parameters are validated, not clamped. */
 
