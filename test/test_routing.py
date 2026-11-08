@@ -351,6 +351,52 @@ def test_routes_regex_match_limit_unanchored(require, wait_for_record):
     ), 'short subject'
 
 
+def test_routes_regex_match_limit_reuse(require, wait_for_record, findall):
+    require({'modules': {'regex': True}})
+
+    # One match object serves the whole router thread, reused across requests.
+    # Pin one thread so the reuse and the once-per-pattern warning are
+    # deterministic.
+    assert 'success' in client.conf({"listen_threads": 1}, 'settings'), (
+        'one listen thread'
+    )
+
+    # The distinctive 1500-byte subject keeps this test's warning apart from
+    # the one in test_routes_regex_match_limit, which uses 2000 bytes.
+    route_match({"headers": {"x-blah": "~^(.*),(.*)[xy]$"}})
+
+    crafted = {'Host': 'localhost', 'X-Blah': ',' * 1500, 'Connection': 'close'}
+
+    # A flood of crafted requests: each is a bounded 500, and the warning is
+    # logged once for the pattern, not once per request, so the flood cannot
+    # flood the log.
+    for _ in range(20):
+        assert client.get(headers=crafted)['status'] == 500, 'match limit'
+
+    assert (
+        wait_for_record(r'\[warn\].+reached the match limit on 1500 bytes')
+        is not None
+    ), 'match limit log'
+
+    # A limit error must not poison the reused object: a normal request still
+    # matches, and a non-matching one is still rejected.
+    assert (
+        client.get(headers={'Host': 'localhost', 'X-Blah': 'a,bx',
+                            'Connection': 'close'})['status']
+        == 200
+    ), 'match after a limit'
+
+    assert (
+        client.get(headers={'Host': 'localhost', 'X-Blah': 'nope',
+                            'Connection': 'close'})['status']
+        == 404
+    ), 'non-match after a limit'
+
+    assert (
+        len(findall(r'reached the match limit on 1500 bytes')) == 1
+    ), 'warn once per pattern'
+
+
 def test_routes_match_regex_captures(require):
     require({'modules': {'regex': True}})
 

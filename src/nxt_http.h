@@ -264,10 +264,6 @@ struct nxt_http_request_s {
     nxt_http_action_t               *action;
     void                            *req_rpc_data;
 
-#if (NXT_HAVE_REGEX)
-    nxt_regex_match_t               *regex_match;
-#endif
-
     nxt_http_peer_t                 *peer;
     nxt_buf_t                       *last;
 
@@ -529,6 +525,12 @@ nxt_http_route_rule_t *nxt_http_route_types_rule_create(nxt_task_t *task,
     nxt_mp_t *mp, nxt_conf_value_t *types);
 nxt_int_t nxt_http_route_test_rule(nxt_http_request_t *r,
     nxt_http_route_rule_t *rule, u_char *start, size_t length);
+
+#if (NXT_TESTS && NXT_HAVE_REGEX)
+/* The regex match of a route pattern, for the regex route test. */
+nxt_int_t nxt_http_route_test_regex(nxt_http_request_t *r, nxt_regex_t *re,
+    u_char *start, size_t length);
+#endif
 
 nxt_int_t nxt_http_action_init(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     nxt_conf_value_t *cv, nxt_http_action_t *action);
