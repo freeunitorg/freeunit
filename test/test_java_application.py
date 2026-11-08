@@ -954,6 +954,42 @@ def test_java_application_header_bytes():
     assert res['header'] == 'ed,a0,80', 'surrogate'
 
 
+def test_java_application_get_header_case():
+    # getHeader("X-Header") must find the field in any case.  Each request
+    # sends the name in a case that differs from the lookup name.
+    client.load('get_header')
+
+    for name in ['x-header', 'X-HEADER', 'x-HeAdEr']:
+        resp = client.get(
+            headers={
+                name: 'blah',
+                'Host': 'localhost',
+                'Connection': 'close',
+            }
+        )
+
+        assert resp['headers']['X-Reply'] == 'blah', f'get header {name}'
+
+
+def test_java_application_get_headers_case():
+    # getHeaders("X-Header") must give the values of the fields in all cases.
+    client.load('get_headers')
+
+    headers = client.get(
+        headers={
+            'X-Header': 'one',
+            'x-header': 'two',
+            'X-HEADER': 'three',
+            'Host': 'localhost',
+            'Connection': 'close',
+        }
+    )['headers']
+
+    assert headers['X-Reply-0'] == 'one', 'get headers case 0'
+    assert headers['X-Reply-1'] == 'two', 'get headers case 1'
+    assert headers['X-Reply-2'] == 'three', 'get headers case 2'
+
+
 def test_java_application_get_header_empty():
     client.load('get_header')
 

@@ -736,43 +736,46 @@ lowcase(char c)
 static bool
 single_value_field(const char *name, uint8_t length)
 {
-    size_t  i;
+    /*
+     * Switch on the length first, so most names need one or two memcmp()
+     * calls instead of a scan over all 18 entries.  NXT_NODE_IS() also
+     * checks the length of the literal, so a wrong "case" label gives
+     * "false" and never a match of a name with a different length.
+     */
 
-#define NXT_NODE_FIELD(s)  { s, sizeof(s) - 1 }
+#define NXT_NODE_IS(s)                                                        \
+    (sizeof(s) - 1 == length && memcmp(name, s, sizeof(s) - 1) == 0)
 
-    static const struct {
-        const char  *name;
-        size_t      length;
-    }  fields[] = {
-        NXT_NODE_FIELD("age"),
-        NXT_NODE_FIELD("authorization"),
-        NXT_NODE_FIELD("content-length"),
-        NXT_NODE_FIELD("content-type"),
-        NXT_NODE_FIELD("etag"),
-        NXT_NODE_FIELD("expires"),
-        NXT_NODE_FIELD("from"),
-        NXT_NODE_FIELD("host"),
-        NXT_NODE_FIELD("if-modified-since"),
-        NXT_NODE_FIELD("if-unmodified-since"),
-        NXT_NODE_FIELD("last-modified"),
-        NXT_NODE_FIELD("location"),
-        NXT_NODE_FIELD("max-forwards"),
-        NXT_NODE_FIELD("proxy-authorization"),
-        NXT_NODE_FIELD("referer"),
-        NXT_NODE_FIELD("retry-after"),
-        NXT_NODE_FIELD("server"),
-        NXT_NODE_FIELD("user-agent"),
-    };
-
-#undef NXT_NODE_FIELD
-
-    for (i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
-        if (fields[i].length == length
-            && memcmp(fields[i].name, name, length) == 0)
-        {
-            return true;
-        }
+    switch (length) {
+    case 3:
+        return NXT_NODE_IS("age");
+    case 4:
+        return NXT_NODE_IS("host") || NXT_NODE_IS("etag")
+               || NXT_NODE_IS("from");
+    case 6:
+        return NXT_NODE_IS("server");
+    case 7:
+        return NXT_NODE_IS("referer") || NXT_NODE_IS("expires");
+    case 8:
+        return NXT_NODE_IS("location");
+    case 10:
+        return NXT_NODE_IS("user-agent");
+    case 11:
+        return NXT_NODE_IS("retry-after");
+    case 12:
+        return NXT_NODE_IS("content-type") || NXT_NODE_IS("max-forwards");
+    case 13:
+        return NXT_NODE_IS("authorization") || NXT_NODE_IS("last-modified");
+    case 14:
+        return NXT_NODE_IS("content-length");
+    case 17:
+        return NXT_NODE_IS("if-modified-since");
+    case 19:
+        return NXT_NODE_IS("if-unmodified-since")
+               || NXT_NODE_IS("proxy-authorization");
     }
+
+#undef NXT_NODE_IS
 
     return false;
 }

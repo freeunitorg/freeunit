@@ -141,6 +141,59 @@ def test_node_application_header_dup():
     ], 'rawHeaders'
 
 
+def test_node_application_header_dup_single_value():
+    # Node keeps only the first value of a repeated single-value field and
+    # joins the values of any other field.  Check the whole set of 18 names,
+    # and names that differ from them in one byte or in the length.
+    client.load('header_dup')
+
+    single = [
+        'age',
+        'authorization',
+        'content-length',
+        'content-type',
+        'etag',
+        'expires',
+        'from',
+        'host',
+        'if-modified-since',
+        'if-unmodified-since',
+        'last-modified',
+        'location',
+        'max-forwards',
+        'proxy-authorization',
+        'referer',
+        'retry-after',
+        'server',
+        'user-agent',
+    ]
+
+    # The router refuses a request with two Host or Content-Length fields.
+    sent = [name for name in single if name not in ('host', 'content-length')]
+
+    other = []
+    for name in single:
+        other.append(f'x{name[1:]}')
+        other.append(f'{name[:-1]}x')
+        other.append(f'{name}x')
+        other.append(name[:-1])
+
+    headers = {'Host': 'localhost', 'Connection': 'close'}
+    for name in sent + other:
+        headers[name.title()] = ['first', 'second']
+
+    resp = client.get(headers=headers)
+
+    assert resp['status'] == 200, 'status'
+    got = json.loads(resp['body'])['headers']
+
+    for name in sent:
+        assert got[name] == 'first', f'first {name} kept'
+
+    for name in other:
+        assert got[name] == 'first, second', f'{name} lines joined'
+
+
 def test_node_application_post_variables():
     client.load('post_variables')
 

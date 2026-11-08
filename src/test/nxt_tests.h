@@ -80,6 +80,7 @@ nxt_int_t nxt_conf_json_depth_test(nxt_thread_t *thr);
 nxt_int_t nxt_http_route_addr_test(nxt_thread_t *thr);
 nxt_int_t nxt_conf_map_object_test(nxt_thread_t *thr);
 nxt_int_t nxt_conf_map_bound_test(nxt_thread_t *thr);
+nxt_int_t nxt_conf_member_lookup_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_fail_test(nxt_thread_t *thr);
 nxt_int_t nxt_fd_event_change_test(nxt_thread_t *thr);
 nxt_int_t nxt_signalfd_test(nxt_thread_t *thr);

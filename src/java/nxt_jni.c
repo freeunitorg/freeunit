@@ -136,10 +136,14 @@ nxt_java_strcaseeq(const char *str1, const char *str2, int len)
     end1 = str1 + len;
 
     while (str1 < end1) {
-        c1 = nxt_java_lowcase(*str1++);
-        c2 = nxt_java_lowcase(*str2++);
+        c1 = *str1++;
+        c2 = *str2++;
 
-        if (c1 != c2) {
+        /* Equal bytes need no case folding. */
+
+        if (c1 != c2
+            && nxt_java_lowcase(c1) != nxt_java_lowcase(c2))
+        {
             return 0;
         }
     }
