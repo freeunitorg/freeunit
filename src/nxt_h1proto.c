@@ -1671,7 +1671,7 @@ static const nxt_str_t  nxt_http_client_error[] = {
     nxt_string("HTTP/1.1 426 Upgrade Required\r\n"),
     nxt_string("HTTP/1.1 427 \r\n"),
     nxt_string("HTTP/1.1 428 \r\n"),
-    nxt_string("HTTP/1.1 429 \r\n"),
+    nxt_string("HTTP/1.1 429 Too Many Requests\r\n"),
     nxt_string("HTTP/1.1 430 \r\n"),
     nxt_string("HTTP/1.1 431 Request Header Fields Too Large\r\n"),
 };
