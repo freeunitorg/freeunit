@@ -62,6 +62,14 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        "Sec-WebSocket-Protocol" as the WebSocket subprotocols. Now the name
        is compared too, in any letter case.
 
+    *) Bugfix: the router skipped any bytes between a chunk size and the CR
+       that ends its line, so a chunk extension that is not valid syntax
+       (RFC 9112, Section 7.1.1), for example a bare ";", a name that is not
+       a token or a NUL byte, was accepted, and a bare LF in an extension
+       made the request hang. Such a chunked body now gets a 400 response,
+       and a chunked response from an upstream server is refused in the same
+       way. Valid extensions are still ignored.
+
     *) Feature: the PHP module now builds with PHP 8.7, which removed five
        members of "sapi_module_struct". The module names the members that it
        sets, so a member that PHP removes no longer shifts the others.

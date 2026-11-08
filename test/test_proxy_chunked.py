@@ -228,6 +228,15 @@ def test_proxy_chunked_invalid():
     resp = get_http10(body='\r\n\r\n0\r\nX')
     assert resp['status'] == 502, 'colonless trailer'
 
+    # A chunk extension that is not valid syntax (RFC 9112 7.1.1) is a
+    # framing error as well.  freeunitorg/freeunit#916.
+    resp = get_http10(body='\r\n\r\n5;\r\nhello\r\n0\r\n\r\n')
+    assert resp['status'] == 502, 'bare ";" in a chunk extension'
+
+    resp = get_http10(body='\r\n\r\n5;a="b \\" c";d\r\nhello\r\n0\r\n\r\n')
+    assert resp['status'] == 200, 'valid chunk extensions'
+    assert resp['body'] == 'hello', 'valid chunk extensions'
+
     resp = get_http10(body='\r\n\r\n65#\r\nA X 100')
     assert resp['status'] == 200, 'incomplete chunk status'
     assert resp['body'][-5:] != '0\r\n\r\n', 'incomplete chunk'
