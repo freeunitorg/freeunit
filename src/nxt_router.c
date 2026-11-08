@@ -3183,7 +3183,7 @@ static nxt_conf_map_t  nxt_router_http_conf[] = {
 
     {
         nxt_string("body_temp_path"),
-        NXT_CONF_MAP_STR,
+        NXT_CONF_MAP_STR_COPY,
         offsetof(nxt_socket_conf_t, body_temp_path),
     },
 

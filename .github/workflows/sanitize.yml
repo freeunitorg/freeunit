@@ -159,6 +159,10 @@ jobs:
             # memory that is kept until the next reconfiguration.  The
             # build-test legs that run test_python_targets.py are release
             # builds, so this leg is the only gate that catches it.
+            #
+            # test_settings_body_temp_path is here because the old code read
+            # "body_temp_path" from released memory.  Only a --debug build
+            # fills that memory, so only this leg makes the test fail.
             tests: >-
               test/test_graceful_reload.py
               test/test_state_store.py
@@ -172,6 +176,7 @@ jobs:
               test/test_configuration.py
               test/test_settings.py
               test/test_python_targets.py
+              test/test_settings_body_temp_path.py
           - runtime: php
             apt: ""
             configure: php
