@@ -49,7 +49,14 @@ impl UnitdProcess {
             .with_exe(UpdateKind::Always)
             .with_user(UpdateKind::Always);
         let refresh_kind = sysinfo::RefreshKind::nothing().with_processes(process_refresh_kind);
-        let sys = System::new_with_specifics(refresh_kind);
+        // sysinfo 0.40 returns an error when the process list cannot be read.
+        let sys = match System::new_with_specifics(refresh_kind) {
+            Ok(sys) => sys,
+            Err(error) => {
+                eprintln!("Failed to list processes: {}", error);
+                return Vec::new();
+            }
+        };
 
         let unitd_processes: HashMap<&Pid, &Process> = sys
             .processes()
@@ -59,7 +66,10 @@ impl UnitdProcess {
                 UNITD_BINARY_NAMES.iter().any(|&name| process_name == name)
             })
             .collect::<HashMap<&Pid, &Process>>();
-        let users = Users::new_with_refreshed_list();
+        // Without the user list, the user names are left empty.
+        let users = Users::new_with_refreshed_list()
+            .map_err(|error| eprintln!("Failed to list users: {}", error))
+            .ok();
 
         unitd_processes
             .iter()
@@ -100,11 +110,11 @@ impl UnitdProcess {
 
                 let user = process
                     .user_id()
-                    .and_then(|uid| users.get_user_by_id(uid))
+                    .and_then(|uid| users.as_ref()?.get_user_by_id(uid))
                     .map(UnitdProcessUser::from);
                 let effective_user = process
                     .effective_user_id()
-                    .and_then(|uid| users.get_user_by_id(uid))
+                    .and_then(|uid| users.as_ref()?.get_user_by_id(uid))
                     .map(UnitdProcessUser::from);
 
                 UnitdProcess {
