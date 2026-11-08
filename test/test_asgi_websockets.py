@@ -147,6 +147,41 @@ def test_asgi_websockets_subprotocol_utf8():
     ), 'utf-8 subprotocol'
 
 
+@pytest.mark.parametrize(
+    'value, expect',
+    [
+        ('chat,', 'chat'),
+        (',chat', 'chat'),
+        ('chat,,phone', 'chat,phone'),
+        ('chat,  ,phone', 'chat,phone'),
+        (',', ''),
+    ],
+)
+def test_asgi_websockets_subprotocol_empty_segment(value, expect):
+    client.load('websockets/subprotocol_iter')
+
+    # An empty Sec-WebSocket-Protocol segment -- from a leading, trailing or
+    # doubled comma, or a comma then only spaces -- must not leave a NULL slot
+    # in the scope['subprotocols'] tuple.  The app joins the tuple, touching
+    # every slot, so a NULL one crashes the worker; an all-comma value shrinks
+    # the tuple to empty.  Every shape the fix handles is pinned here, so a
+    # narrower fix (e.g. one stripping only a trailing comma) is still caught.
+    resp, sock, _ = ws.upgrade(
+        headers={
+            'Host': 'localhost',
+            'Upgrade': 'websocket',
+            'Connection': 'Upgrade',
+            'Sec-WebSocket-Key': ws.key(),
+            'Sec-WebSocket-Protocol': value,
+            'Sec-WebSocket-Version': 13,
+        }
+    )
+    sock.close()
+
+    assert resp['status'] == 101, 'status'
+    assert resp['headers']['x-subprotocols'] == expect, 'no NULL slot'
+
+
 def test_asgi_websockets_receive_invalid_utf8(findall, skip_alert):
     skip_alert(r'Failed to create Unicode for payload')
 
