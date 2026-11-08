@@ -9852,6 +9852,16 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
     nxt_http_request_t       *r;
     nxt_request_rpc_data_t   *req_rpc_data;
 
+    static nxt_log_moderation_t  nxt_app_queue_timeout_log_moderation = {
+        NXT_LOG_INFO, 2, "application requests expired in the queue",
+        NXT_LOG_MODERATION
+    };
+
+    static nxt_log_moderation_t  nxt_app_worker_timeout_log_moderation = {
+        NXT_LOG_INFO, 2, "application requests expired in a worker",
+        NXT_LOG_MODERATION
+    };
+
     timer = obj;
 
     nxt_debug(task, "router app timeout");
@@ -9959,6 +9969,15 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
         nxt_log(task, NXT_LOG_WARN, "app \"%V\": stream #%uD is still not "
                 "acknowledged, answering 503", &req_rpc_data->app->name,
                 req_rpc_data->stream);
+
+    } else if (msg_info->cancel == NXT_MSG_RETRACTED) {
+        nxt_assert(req_rpc_data->app != NULL);
+
+        nxt_log_moderate(&nxt_app_queue_timeout_log_moderation, NXT_LOG_INFO,
+                         task->log,
+                         "app \"%V\": request expired in the queue after "
+                         "%M ms", &req_rpc_data->app->name,
+                         req_rpc_data->app->timeout);
     }
 
     /*
@@ -9985,6 +10004,13 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
     {
         /* The request is still linked, so it holds the application. */
         nxt_assert(req_rpc_data->app != NULL);
+
+        nxt_log_moderate(&nxt_app_worker_timeout_log_moderation, NXT_LOG_INFO,
+                         task->log,
+                         "app \"%V\": request expired in worker %PI after "
+                         "%M ms", &req_rpc_data->app->name,
+                         req_rpc_data->app_port->pid,
+                         req_rpc_data->app->timeout);
 
         nxt_router_app_abandon(task, req_rpc_data->app, req_rpc_data,
                                req_rpc_data->app_port);

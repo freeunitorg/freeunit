@@ -224,7 +224,7 @@ def test_php_detached_completion_releases_the_worker():
     assert app_processes().get('detached', 0) == 0, 'detached count cleared'
 
 
-def test_php_detached_parked_request_times_out():
+def test_php_detached_parked_request_times_out(wait_for_record):
     """limits.timeout bounds the wait for capacity, and the request never runs.
 
     The second request cannot be served until the detached work ends, so a
@@ -249,6 +249,13 @@ def test_php_detached_parked_request_times_out():
 
     assert resp['status'] == 503, f'parked request timed out, got {resp}'
     assert elapsed < timeout + 5, f'answered at the deadline, took {elapsed:.1f}s'
+    assert (
+        wait_for_record(
+            r'\[info\].*app "detached_worker": request expired in the queue '
+            r'after 3000 ms'
+        )
+        is not None
+    ), 'queue expiry logged'
     # The end-to-end half of the claim.  What it cannot show is the race
     # underneath it -- a worker claiming the slot in the same instant the
     # timer fires -- because that window is a single CAS.  That half is
@@ -356,7 +363,7 @@ def test_php_detached_start_after_the_worker_went_idle():
     assert os.path.exists(done), 'the detached work ran to completion'
 
 
-def test_php_timed_out_request_keeps_the_worker_busy():
+def test_php_timed_out_request_keeps_the_worker_busy(wait_for_record):
     """A request the router gave up on must not free the worker running it.
 
     The script holds the worker past limits.timeout and then answers normally:
@@ -437,6 +444,13 @@ def test_php_timed_out_request_keeps_the_worker_busy():
         pids = f.read().split()
 
     assert len(pids) == 1, f'the request executed {len(pids)} times: {pids}'
+    assert (
+        wait_for_record(
+            rf'\[info\].*app "detached_worker": request expired in worker '
+            rf'{pids[0]} after 2000 ms'
+        )
+        is not None
+    ), 'worker expiry logged'
 
     assert client.get()['status'] == 200, 'the worker serves again'
 
