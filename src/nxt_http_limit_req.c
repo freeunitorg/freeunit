@@ -22,8 +22,9 @@ static void nxt_http_limit_zone_release(nxt_task_t *task,
     nxt_thread_spinlock_t *lock, nxt_http_limit_zone_t *zone);
 static nxt_http_limit_zone_conf_t *nxt_http_limit_zone_find(
     nxt_router_conf_t *rtcf, nxt_str_t *name);
+static uint64_t nxt_http_limit_req_now(nxt_task_t *task);
 static nxt_int_t nxt_http_limit_req_reject(nxt_task_t *task,
-    nxt_http_request_t *r, nxt_http_limit_req_t *limit, uint64_t wait_ms);
+    nxt_http_request_t *r, nxt_http_limit_req_t *limit, uint64_t wait_us);
 
 
 static nxt_conf_map_t  nxt_http_limit_req_conf[] = {
@@ -441,9 +442,32 @@ nxt_http_limit_req_zones_release(nxt_task_t *task,
 
 /* The request path. */
 
+/*
+ * The time of the limiter, in microseconds.  The time of the thread comes
+ * from CLOCK_MONOTONIC_COARSE on Linux and CLOCK_MONOTONIC_FAST on
+ * FreeBSD, which move in steps of a timer tick (1 to 10 ms): a bucket
+ * gets new tokens once a step, so it passes "burst" requests per step at
+ * most, below a high "rate".  CLOCK_MONOTONIC is read from the vDSO.
+ */
+
+static uint64_t
+nxt_http_limit_req_now(nxt_task_t *task)
+{
+#if (NXT_HAVE_CLOCK_MONOTONIC)
+    struct timespec  ts;
+
+    if (nxt_fast_path(clock_gettime(CLOCK_MONOTONIC, &ts) == 0)) {
+        return (uint64_t) ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+    }
+#endif
+
+    return nxt_thread_monotonic_time(task->thread) / 1000;
+}
+
+
 static nxt_int_t
 nxt_http_limit_req_reject(nxt_task_t *task, nxt_http_request_t *r,
-    nxt_http_limit_req_t *limit, uint64_t wait_ms)
+    nxt_http_limit_req_t *limit, uint64_t wait_us)
 {
     uint32_t  retry_after;
 
@@ -471,7 +495,7 @@ nxt_http_limit_req_reject(nxt_task_t *task, nxt_http_request_t *r,
 
     /* The time until one request fits, in whole seconds, at least 1. */
 
-    retry_after = (uint32_t) nxt_min((wait_ms + 999) / 1000,
+    retry_after = (uint32_t) nxt_min((wait_us + 999999) / 1000000,
                                      (uint64_t) NXT_INT32_T_MAX);
 
     nxt_http_request_error_retry_after(task, r, NXT_HTTP_TOO_MANY_REQUESTS,
@@ -496,7 +520,7 @@ nxt_http_limit_req_check(nxt_task_t *task, nxt_http_request_t *r,
 {
     size_t             len;
     u_char             key[NXT_LIMIT_KEY_MAX], bit, *counted;
-    uint64_t           now_ms, wait_ms;
+    uint64_t           now_us, wait_us;
     nxt_bool_t         allow;
     nxt_router_conf_t  *rtcf;
 
@@ -522,10 +546,10 @@ nxt_http_limit_req_check(nxt_task_t *task, nxt_http_request_t *r,
 
     len = nxt_http_limit_req_key(r->remote, key);
 
-    now_ms = nxt_thread_monotonic_time(task->thread) / 1000000;
+    now_us = nxt_http_limit_req_now(task);
 
-    allow = nxt_limit_zone_check(limit->zone->zone, key, len, now_ms,
-                                 &wait_ms);
+    allow = nxt_limit_zone_check(limit->zone->zone, key, len, now_us,
+                                 &wait_us);
 
     nxt_debug(task, "http limit_req \"%V\": %s", &limit->zone->name,
               allow ? "pass" : "reject");
@@ -534,7 +558,7 @@ nxt_http_limit_req_check(nxt_task_t *task, nxt_http_request_t *r,
         return NXT_OK;
     }
 
-    return nxt_http_limit_req_reject(task, r, limit, wait_ms);
+    return nxt_http_limit_req_reject(task, r, limit, wait_us);
 }
 
 

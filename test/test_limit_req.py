@@ -763,3 +763,25 @@ def test_limit_req_ipv4_mapped():
     attempt, result = quick(run, 1)
     assert result == [200, 200, 429, 429]
     assert counters()['keys'] == 2 * (attempt + 1)
+
+
+def test_limit_req_rate_above_1000():
+    # 1000000 per second is one request per microsecond: with a bucket of
+    # one, a token comes in 1 us after a request.  The next request of a
+    # connection is later than that, so every one passes.  A clock that
+    # moves in steps of milliseconds lets one request pass per step.
+    load(limited(rate=1000000))
+
+    resp, sock = client.get(start=True, connection_close=False, framed=True)
+    result = [resp['status']]
+
+    for _ in range(49):
+        resp, sock = client.get(
+            sock=sock, start=True, connection_close=False, framed=True
+        )
+        result.append(resp['status'])
+
+    sock.close()
+
+    assert result == [200] * 50
+    assert counters()['passed'] == 50

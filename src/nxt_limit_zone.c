@@ -19,7 +19,7 @@ static void nxt_limit_lru_unlink(nxt_limit_zone_t *zone, uint32_t idx);
 static void nxt_limit_lru_link(nxt_limit_zone_t *zone, uint32_t idx);
 static uint32_t nxt_limit_evict_oldest(nxt_limit_zone_t *zone);
 static void nxt_limit_refill(nxt_limit_zone_t *zone, nxt_limit_entry_t *entry,
-    uint64_t now_ms);
+    uint64_t now_us);
 
 
 static uint32_t
@@ -110,21 +110,27 @@ nxt_limit_zone_create(nxt_mp_t *mp, uint32_t keys_max, uint32_t rate,
 
 
 /*
- * When the request is rejected and wait_ms is given, it is set to the
- * milliseconds until one request fits the bucket at the rate: what a
+ * The time is in microseconds: a bucket gets "rate" micro-tokens in each
+ * one, so every "rate" up to NXT_LIMIT_RATE_MAX is exact with a "burst" of
+ * one.  A clock in milliseconds limited a bucket to "burst" requests per
+ * millisecond.
+ *
+ * When the request is rejected and wait_us is given, it is set to the
+ * microseconds until one request fits the bucket at the rate: what a
  * "Retry-After" is made of.  It is 0 when the request passes.
  */
 
 nxt_bool_t
 nxt_limit_zone_check(nxt_limit_zone_t *zone, const uint8_t *key,
-    size_t key_len, uint64_t now_ms, uint64_t *wait_ms)
+    size_t key_len, uint64_t now_us, uint64_t *wait_us)
 {
-    uint32_t            hash, bucket, need;
+    uint32_t            hash, bucket;
+    uint64_t            need;
     nxt_bool_t          allow;
     nxt_limit_entry_t   *entry;
 
-    if (wait_ms != NULL) {
-        *wait_ms = 0;
+    if (wait_us != NULL) {
+        *wait_us = 0;
     }
 
     if (key_len == 0 || key_len > NXT_LIMIT_KEY_MAX) {
@@ -151,7 +157,7 @@ nxt_limit_zone_check(nxt_limit_zone_t *zone, const uint8_t *key,
         }
     }
 
-    nxt_limit_refill(zone, entry, now_ms);
+    nxt_limit_refill(zone, entry, now_us);
 
     allow = (entry->tokens >= NXT_LIMIT_TOKEN_SCALE);
 
@@ -162,9 +168,9 @@ nxt_limit_zone_check(nxt_limit_zone_t *zone, const uint8_t *key,
     } else {
         zone->rejected++;
 
-        if (wait_ms != NULL) {
+        if (wait_us != NULL) {
             need = NXT_LIMIT_TOKEN_SCALE - entry->tokens;
-            *wait_ms = (need + zone->rate - 1) / zone->rate;
+            *wait_us = (need + zone->rate - 1) / zone->rate;
         }
     }
 
@@ -225,8 +231,8 @@ nxt_limit_claim(nxt_limit_zone_t *zone, const uint8_t *key, size_t len,
 
     entry->key_len = (uint8_t) len;
     nxt_memcpy(entry->key, key, len);
-    entry->last_ms = 0;
-    entry->tokens = zone->burst * NXT_LIMIT_TOKEN_SCALE;
+    entry->last_us = 0;
+    entry->tokens = (uint64_t) zone->burst * NXT_LIMIT_TOKEN_SCALE;
     entry->next = 0;
 
     bucket = hash & zone->buckets_mask;
@@ -310,7 +316,7 @@ nxt_limit_lru_link(nxt_limit_zone_t *zone, uint32_t idx)
 
 /*
  * The least recently used entry is the tail of the list: the one with the
- * oldest last_ms, found without a scan of the arena.  A scan cost 28 us
+ * oldest last_us, found without a scan of the arena.  A scan cost 28 us
  * per request at 16384 keys, under the lock, for every new key once the
  * arena was full.
  */
@@ -346,25 +352,29 @@ nxt_limit_evict_oldest(nxt_limit_zone_t *zone)
 
 static void
 nxt_limit_refill(nxt_limit_zone_t *zone, nxt_limit_entry_t *entry,
-    uint64_t now_ms)
+    uint64_t now_us)
 {
-    uint64_t  add, max;
+    uint64_t  elapsed, max;
 
-    if (now_ms <= entry->last_ms) {
+    if (now_us <= entry->last_us) {
         return;
     }
 
-    /* milli-tokens added: elapsed milliseconds times rate per second. */
-    add = (now_ms - entry->last_ms) * zone->rate;
-
+    elapsed = now_us - entry->last_us;
     max = (uint64_t) zone->burst * NXT_LIMIT_TOKEN_SCALE;
 
-    if (add >= max || entry->tokens + add >= max) {
-        entry->tokens = (uint32_t) max;
+    /*
+     * Micro-tokens added: elapsed microseconds times rate per second.  The
+     * rate is at least 1, so "max" microseconds fill any bucket, and below
+     * that the product is under 2^56: no overflow.
+     */
+
+    if (elapsed >= max || entry->tokens + elapsed * zone->rate >= max) {
+        entry->tokens = max;
 
     } else {
-        entry->tokens += (uint32_t) add;
+        entry->tokens += elapsed * zone->rate;
     }
 
-    entry->last_ms = now_ms;
+    entry->last_us = now_us;
 }
