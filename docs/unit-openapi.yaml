@@ -8093,7 +8093,9 @@ components:
         token bucket.  A request above the limit is answered with 429 and a
         `Retry-After` field.  The client address is the peer of the
         connection, or the one the listener's `client_ip` option takes from
-        a trusted proxy; IPv6 clients are keyed by their /64.  Every
+        a trusted proxy; IPv6 clients are keyed by their /64, and an IPv4
+        address mapped into IPv6 (`::ffff:a.b.c.d`) by its IPv4 address.
+        Every
         `limit_req` that names one zone must ask the same size, `rate` and
         `burst`.  Every `limit_req` on the path of a request counts it, and
         a zone counts it once, also when two `limit_req` on the path name

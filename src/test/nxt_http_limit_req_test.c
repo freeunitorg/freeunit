@@ -116,6 +116,35 @@ nxt_http_limit_req_test_keys(nxt_thread_t *thr)
 
     NXT_TEST_CHECK(thr->log, memcmp(k1, k2, 8) != 0, "key: IPv6 prefix");
 
+    /*
+     * IPv4 mapped into IPv6 (::ffff:10.0.0.1): the key of the IPv4
+     * address, not of the /64 that all the mapped addresses share.
+     */
+
+    nxt_memzero(&sa1, sizeof(nxt_sockaddr_t));
+    sa1.u.sockaddr_in6.sin6_family = AF_INET6;
+    sa1.u.sockaddr_in6.sin6_addr.s6_addr[10] = 0xff;
+    sa1.u.sockaddr_in6.sin6_addr.s6_addr[11] = 0xff;
+    sa1.u.sockaddr_in6.sin6_addr.s6_addr[12] = 10;
+    sa1.u.sockaddr_in6.sin6_addr.s6_addr[15] = 1;
+
+    nxt_memzero(&sa2, sizeof(nxt_sockaddr_t));
+    sa2.u.sockaddr_in.sin_family = AF_INET;
+    sa2.u.sockaddr_in.sin_addr.s_addr = htonl(0x0a000001);
+
+    len1 = nxt_http_limit_req_key(&sa1, k1);
+    len2 = nxt_http_limit_req_key(&sa2, k2);
+
+    NXT_TEST_CHECK(thr->log, len1 == 4 && len2 == 4
+                             && memcmp(k1, k2, 4) == 0,
+                   "key: IPv4-mapped IPv6 is the IPv4 key");
+
+    sa1.u.sockaddr_in6.sin6_addr.s6_addr[15] = 2;
+    len1 = nxt_http_limit_req_key(&sa1, k1);
+
+    NXT_TEST_CHECK(thr->log, len1 == 4 && memcmp(k1, k2, 4) != 0,
+                   "key: two IPv4-mapped addresses");
+
 #endif
 
     return NXT_OK;
