@@ -42,6 +42,10 @@ env:
   # https://github.com/openssl/openssl/releases/tag/openssl-3.5.9 and the
   # .sha256 file next to the tarball on openssl.org.  Bump both together.
   OPENSSL_SHA256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+  # Configure options of that build.  The cache key includes them, so a
+  # change rebuilds the slot.  OpenSSL 3.x leaves kernel TLS out by default;
+  # enable-ktls lets test/test_tls_ktls_static.py run.
+  OPENSSL_CONFIG: shared no-docs enable-ktls
   # The OpenSSL major that the Fedora container in hardening-strict-fedora is
   # expected to bring.  Fedora 45 ships the 4.0 line, so a 4.1 stays covered
   # while a 5.0 is a decision to take and a 3.x means the container moved.
@@ -195,7 +199,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: /opt/openssl-3.5
-          key: openssl-${{ env.OPENSSL_VERSION }}-${{ env.OPENSSL_SHA256 }}-${{ runner.os }}-${{ runner.arch }}
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ env.OPENSSL_SHA256 }}-${{ env.OPENSSL_CONFIG }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Build OpenSSL 3.5
         if: steps.cache-openssl35.outputs.cache-hit != 'true'
@@ -206,7 +210,7 @@ jobs:
           echo "${OPENSSL_SHA256}  openssl-${OPENSSL_VERSION}.tar.gz" | sha256sum -c -
           tar -xzf "openssl-${OPENSSL_VERSION}.tar.gz"
           cd "openssl-${OPENSSL_VERSION}"
-          ./Configure --prefix=/opt/openssl-3.5 shared no-docs
+          ./Configure --prefix=/opt/openssl-3.5 ${OPENSSL_CONFIG}
           make -j$(nproc)
           sudo mkdir -p /opt/openssl-3.5
           sudo make install_sw
@@ -648,7 +652,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: /opt/openssl-3.5
-          key: openssl-${{ env.OPENSSL_VERSION }}-${{ env.OPENSSL_SHA256 }}-${{ runner.os }}-${{ runner.arch }}
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ env.OPENSSL_SHA256 }}-${{ env.OPENSSL_CONFIG }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Build OpenSSL 3.5
         if: steps.cache-openssl35.outputs.cache-hit != 'true'
@@ -659,7 +663,7 @@ jobs:
           echo "${OPENSSL_SHA256}  openssl-${OPENSSL_VERSION}.tar.gz" | sha256sum -c -
           tar -xzf "openssl-${OPENSSL_VERSION}.tar.gz"
           cd "openssl-${OPENSSL_VERSION}"
-          ./Configure --prefix=/opt/openssl-3.5 shared no-docs
+          ./Configure --prefix=/opt/openssl-3.5 ${OPENSSL_CONFIG}
           make -j$(nproc)
           sudo mkdir -p /opt/openssl-3.5
           sudo make install_sw
@@ -1067,6 +1071,14 @@ jobs:
         timeout-minutes: 5
         run: |
           sudo apt install -y python3-pytest
+
+      # test/test_tls_ktls_static.py needs /proc/net/tls_stat.  Without the
+      # module the file skips and says so.
+      - name: Load the kernel TLS module
+        if: steps.metadata.outputs.module == 'python'
+        run: |
+          sudo modprobe tls || echo "::warning::modprobe tls failed"
+          grep -E '^TlsTxSw' /proc/net/tls_stat || true
 
       - name: Run ${{ steps.metadata.outputs.module }} tests
         timeout-minutes: 12
