@@ -40,8 +40,12 @@ typedef struct {
     /* The link in the router's live zones and the count; under its lock. */
     nxt_queue_link_t            link;
     uint32_t                    count;
-    /* A zone of the same name and another size took its place. */
-    uint8_t                     superseded;  /* 1 bit */
+    /*
+     * The applied configuration has the zone, so /status shows it; under
+     * the router lock.  A zone of a configuration that is not applied yet,
+     * or of an older one that a request still holds, is not shown.
+     */
+    uint8_t                     current;  /* 1 bit */
 
     nxt_str_t                   name;
 } nxt_http_limit_zone_t;

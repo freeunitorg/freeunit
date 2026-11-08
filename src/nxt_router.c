@@ -2397,9 +2397,10 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     } nxt_queue_loop;
 
     /*
-     * The "limit_req" zones of every live configuration, less the ones a
-     * newer configuration replaced.  Only this thread adds or removes one,
-     * so the count holds until the report is filled below.
+     * The "limit_req" zones of the applied configuration.  Only this thread
+     * adds a zone or applies a configuration; a worker thread can remove
+     * one.  So the zones to report can only become fewer before the report
+     * is filled below.
      */
 
     nxt_thread_spin_lock(&nxt_router->lock);
@@ -2410,7 +2411,7 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     {
         zone = nxt_queue_link_data(lnk, nxt_http_limit_zone_t, link);
 
-        if (!zone->superseded) {
+        if (zone->current) {
             alloc += sizeof(nxt_status_limit_zone_t) + zone->name.length;
         }
     }
@@ -2518,7 +2519,7 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     {
         zone = nxt_queue_link_data(lnk, nxt_http_limit_zone_t, link);
 
-        if (zone->superseded) {
+        if (!zone->current) {
             continue;
         }
 

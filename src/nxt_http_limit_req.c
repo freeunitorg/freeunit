@@ -139,8 +139,8 @@ nxt_http_limit_req_key(const nxt_sockaddr_t *sa, u_char *key)
  * A zone stays alive while an old configuration has requests, so the reuse
  * looks at all live zones, as the access log does.  The match is on the
  * name and the size: a zone of the same name and another size is a new
- * object, and the old one is marked when the configuration is applied.
- * Only the router main thread adds a zone.
+ * object.  A new zone is not in /status until its configuration is
+ * applied.  Only the router main thread adds a zone.
  */
 
 static nxt_http_limit_zone_t *
@@ -366,8 +366,9 @@ nxt_http_limit_req_init(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 /*
  * The configuration is accepted: a new "rate" or "burst" applies in place
  * to the live buckets of a zone it shares with an older configuration,
- * and a zone of the same name that an older configuration keeps with
- * another size leaves the status report.
+ * and its zones, and only its zones, are in the status report.  A zone of
+ * the same name that an older configuration keeps with another size, or
+ * a zone that it alone has, leaves the report at once.
  */
 
 void
@@ -375,17 +376,19 @@ nxt_http_limit_req_zones_apply(nxt_task_t *task, nxt_router_conf_t *rtcf)
 {
     nxt_router_t                *router;
     nxt_queue_link_t            *lnk;
-    nxt_http_limit_zone_t       *zone, *other;
+    nxt_http_limit_zone_t       *zone;
     nxt_http_limit_zone_conf_t  *zcf, *end;
-
-    if (rtcf->limit_zones == NULL) {
-        return;
-    }
 
     router = rtcf->router;
 
-    zcf = rtcf->limit_zones->elts;
-    end = zcf + rtcf->limit_zones->nelts;
+    if (rtcf->limit_zones != NULL) {
+        zcf = rtcf->limit_zones->elts;
+        end = zcf + rtcf->limit_zones->nelts;
+
+    } else {
+        zcf = NULL;
+        end = NULL;
+    }
 
     for ( ; zcf < end; zcf++) {
         zone = zcf->zone;
@@ -396,24 +399,27 @@ nxt_http_limit_req_zones_apply(nxt_task_t *task, nxt_router_conf_t *rtcf)
         zone->zone->burst = zcf->burst;
 
         nxt_thread_spin_unlock(&zone->zone->lock);
-
-        nxt_thread_spin_lock(&router->lock);
-
-        zone->superseded = 0;
-
-        for (lnk = nxt_queue_first(&router->limit_zones);
-             lnk != nxt_queue_tail(&router->limit_zones);
-             lnk = nxt_queue_next(lnk))
-        {
-            other = nxt_queue_link_data(lnk, nxt_http_limit_zone_t, link);
-
-            if (other != zone && nxt_strstr_eq(&other->name, &zone->name)) {
-                other->superseded = 1;
-            }
-        }
-
-        nxt_thread_spin_unlock(&router->lock);
     }
+
+    nxt_thread_spin_lock(&router->lock);
+
+    for (lnk = nxt_queue_first(&router->limit_zones);
+         lnk != nxt_queue_tail(&router->limit_zones);
+         lnk = nxt_queue_next(lnk))
+    {
+        zone = nxt_queue_link_data(lnk, nxt_http_limit_zone_t, link);
+        zone->current = 0;
+    }
+
+    if (rtcf->limit_zones != NULL) {
+        zcf = rtcf->limit_zones->elts;
+
+        for ( ; zcf < end; zcf++) {
+            zcf->zone->current = 1;
+        }
+    }
+
+    nxt_thread_spin_unlock(&router->lock);
 }
 
 
