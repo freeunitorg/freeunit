@@ -197,8 +197,8 @@ static nxt_http_action_t *nxt_http_pass_var(nxt_task_t *task,
     nxt_http_request_t *r, nxt_http_action_t *action);
 static void nxt_http_pass_query(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_action_t *action);
-static nxt_int_t nxt_http_pass_find(nxt_mp_t *mp, nxt_router_conf_t *rtcf,
-    nxt_str_t *pass, nxt_http_action_t *action);
+static nxt_int_t nxt_http_pass_find(nxt_mp_t *mp, nxt_mp_t *action_mp,
+    nxt_router_conf_t *rtcf, nxt_str_t *pass, nxt_http_action_t *action);
 static nxt_int_t nxt_http_route_find(nxt_http_routes_t *routes, nxt_str_t *name,
     nxt_http_action_t *action);
 
@@ -1373,8 +1373,8 @@ nxt_http_action_resolve(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     if (nxt_tstr_is_const(action->u.tstr)) {
         nxt_tstr_str(action->u.tstr, &pass);
 
-        ret = nxt_http_pass_find(tmcf->mem_pool, tmcf->router_conf, &pass,
-                                 action);
+        ret = nxt_http_pass_find(tmcf->mem_pool, tmcf->router_conf->mem_pool,
+                                 tmcf->router_conf, &pass, action);
         if (nxt_slow_path(ret != NXT_OK)) {
             return NXT_ERROR;
         }
@@ -1446,7 +1446,8 @@ nxt_http_pass_query(nxt_task_t *task, nxt_http_request_t *r,
 
     nxt_debug(task, "http pass lookup: %V", action->u.pass);
 
-    ret = nxt_http_pass_find(r->mem_pool, rtcf, action->u.pass, action);
+    ret = nxt_http_pass_find(r->mem_pool, r->mem_pool, rtcf, action->u.pass,
+                             action);
 
     if (ret != NXT_OK) {
         status = (ret == NXT_DECLINED) ? NXT_HTTP_NOT_FOUND
@@ -1461,8 +1462,8 @@ nxt_http_pass_query(nxt_task_t *task, nxt_http_request_t *r,
 
 
 static nxt_int_t
-nxt_http_pass_find(nxt_mp_t *mp, nxt_router_conf_t *rtcf, nxt_str_t *pass,
-    nxt_http_action_t *action)
+nxt_http_pass_find(nxt_mp_t *mp, nxt_mp_t *action_mp, nxt_router_conf_t *rtcf,
+    nxt_str_t *pass, nxt_http_action_t *action)
 {
     nxt_int_t  ret;
     nxt_str_t  segments[3];
@@ -1473,8 +1474,8 @@ nxt_http_pass_find(nxt_mp_t *mp, nxt_router_conf_t *rtcf, nxt_str_t *pass,
     }
 
     if (nxt_str_eq(&segments[0], "applications", 12)) {
-        return nxt_router_application_init(rtcf, &segments[1], &segments[2],
-                                           action);
+        return nxt_router_application_init(rtcf, action_mp, &segments[1],
+                                           &segments[2], action);
     }
 
     if (segments[2].length == 0) {
@@ -1617,7 +1618,8 @@ nxt_http_pass_application(nxt_task_t *task, nxt_router_conf_t *rtcf,
         return NULL;
     }
 
-    (void) nxt_router_application_init(rtcf, name, NULL, action);
+    (void) nxt_router_application_init(rtcf, rtcf->mem_pool, name, NULL,
+                                       action);
 
     return action;
 }

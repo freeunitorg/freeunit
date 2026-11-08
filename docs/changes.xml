@@ -20,6 +20,16 @@ to 0.135.8 with Wasmtime.  The contrib C API pin is 48.0.8 too.
 
 <change type="bugfix">
 <para>
+a request to a "pass" with variables that named a missing application target
+could crash the router; such a request now gets a 404 response.  Each request
+to a "pass" with variables that named an application also took memory from
+the configuration pool, which other router threads use at the same time, and
+kept it until the next reconfiguration.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
 an ASGI application that sent a WebSocket close frame and then raised an
 exception could make the client see a closed connection without the close
 frame.  A message above the 10 MiB buffer limit gave EOF instead of close code
