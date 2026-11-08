@@ -463,7 +463,7 @@ nxt_router_schedule_parse_fail_test(nxt_thread_t *thr)
     u_char                  name[32], buf[256];
     ssize_t                 n;
     nxt_mp_t                *mp;
-    nxt_int_t               ret;
+    nxt_int_t               ret, check;
     nxt_str_t               json;
     nxt_uint_t              nstates;
     nxt_task_t              *task;
@@ -633,10 +633,33 @@ nxt_router_schedule_parse_fail_test(nxt_thread_t *thr)
 
     nxt_router_schedules_status(&stat, name + sizeof(name), name);
 
-    if (stat.running != 0 || stat.runs != 1 || stat.failed != 1) {
+    /* No memory is an internal error, not a request the router refuses. */
+
+    if (stat.running != 0 || stat.runs != 1 || stat.failed != 1
+        || stat.last_status != NXT_HTTP_INTERNAL_SERVER_ERROR)
+    {
         nxt_log_alert(thr->log, "schedule parse failure: running %uD, runs "
-                      "%uD, failed %uD after the run", stat.running,
-                      stat.runs, stat.failed);
+                      "%uD, failed %uD, last status %uD after the run",
+                      stat.running, stat.runs, stat.failed,
+                      stat.last_status);
+        goto release;
+    }
+
+    /*
+     * The validator reports the same failure as no memory, not as a "uri"
+     * that does not make a request.
+     */
+
+    nxt_router_schedule_test_parse_failures = 1;
+
+    check = nxt_router_schedule_request_check(mp, &sched->name, &sched->uri,
+                                              NULL);
+
+    nxt_router_schedule_test_parse_failures = 0;
+
+    if (check != NXT_ERROR) {
+        nxt_log_alert(thr->log, "schedule parse failure: the check returned "
+                      "%i, expected NXT_ERROR", check);
         goto release;
     }
 

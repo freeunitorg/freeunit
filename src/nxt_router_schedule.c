@@ -828,6 +828,7 @@ static nxt_int_t
 nxt_router_schedule_request_init(nxt_http_request_t *r,
     nxt_router_schedule_t *sched)
 {
+    nxt_int_t                 ret;
     nxt_http_request_parse_t  *rp;
 
     rp = nxt_mp_zget(r->mem_pool, sizeof(nxt_http_request_parse_t));
@@ -835,10 +836,16 @@ nxt_router_schedule_request_init(nxt_http_request_t *r,
         return NXT_ERROR;
     }
 
-    if (nxt_router_schedule_parse(r->mem_pool, &sched->request, rp)
-        != NXT_DONE)
-    {
-        return NXT_HTTP_BAD_REQUEST;
+    /*
+     * NXT_ERROR is an allocation failure, not a request that the parser
+     * refuses: the run gets 500, and the validator does not report the
+     * configuration as wrong.
+     */
+
+    ret = nxt_router_schedule_parse(r->mem_pool, &sched->request, rp);
+
+    if (nxt_slow_path(ret != NXT_DONE)) {
+        return (ret == NXT_ERROR) ? NXT_ERROR : NXT_HTTP_BAD_REQUEST;
     }
 
     r->request_line.start = rp->method.start;
@@ -1159,7 +1166,8 @@ nxt_router_schedule_parse(nxt_mp_t *mp, nxt_str_t *request,
  * nxt_router_schedule_run() does.  A request that the run would refuse
  * with 400 is refused at configuration time instead.  Examples are a "Host"
  * that is not a host name, a field given twice, and a name over 255 bytes.
- * Returns NXT_DECLINED for such a request.
+ * Returns NXT_DECLINED for such a request, and NXT_ERROR when there is no
+ * memory.
  */
 
 nxt_int_t
