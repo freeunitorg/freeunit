@@ -13,6 +13,10 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        router threads use at the same time, and kept it until the next
        reconfiguration.
 
+    *) Bugfix: with "body_temp_path" set, the router read the path from
+       memory that it had released after it applied the configuration, so a
+       request body larger than "body_buffer_size" could get a 500 response.
+
     *) Bugfix: an ASGI application that sent a WebSocket close frame and
        then raised an exception could make the client see a closed
        connection without the close frame. A message above the 10 MiB buffer
