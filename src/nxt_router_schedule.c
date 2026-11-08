@@ -51,6 +51,16 @@ typedef struct {
     nxt_timer_t                  timer;      /* worker engine */
     nxt_work_t                   work;
 
+    /*
+     * r->method, r->path and r->args until the parse sets them.  A request
+     * that fails before the parse still reaches the access log, and "$method",
+     * "$uri" and "$arg_*" read them.  They live here, not in the request
+     * pool, because the failure can be that the pool has no memory.
+     */
+    nxt_str_t                    empty_method;
+    nxt_str_t                    empty_path;
+    nxt_str_t                    empty_args;
+
     nxt_nsec_t                   started;
     nxt_msec_t                   duration;
     uint32_t                     seq;
@@ -184,6 +194,9 @@ static nxt_http_field_proc_t    nxt_router_schedule_fields[] = {
 
 /* For src/test/nxt_router_schedule_test.c: the next N runs get no request. */
 nxt_uint_t  nxt_router_schedule_test_request_failures;
+
+/* The next N parses of a run's request fail as on no memory. */
+nxt_uint_t  nxt_router_schedule_test_parse_failures;
 
 #endif
 
@@ -776,6 +789,10 @@ nxt_router_schedule_run(nxt_task_t *task, void *obj, void *data)
     r->local = sc->local;
     r->log_route = sc->skcf.log_route;
 
+    r->method = &run->empty_method;
+    r->path = &run->empty_path;
+    r->args = &run->empty_args;
+
     /* The schedule's deadline; r->timer carries the application's. */
     nxt_timer_add(engine, &run->timer, run->sched->timeout);
 
@@ -1111,6 +1128,13 @@ nxt_router_schedule_parse(nxt_mp_t *mp, nxt_str_t *request,
 {
     u_char         *p;
     nxt_buf_mem_t  mem;
+
+#if (NXT_TESTS)
+    if (nxt_router_schedule_test_parse_failures > 0) {
+        nxt_router_schedule_test_parse_failures--;
+        return NXT_ERROR;
+    }
+#endif
 
     p = nxt_mp_nget(mp, request->length);
     if (nxt_slow_path(p == NULL)) {

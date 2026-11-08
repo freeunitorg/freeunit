@@ -85,6 +85,7 @@ void nxt_router_schedules_status(nxt_status_schedule_t *stat, u_char *p,
 
 #if (NXT_TESTS)
 extern nxt_uint_t  nxt_router_schedule_test_request_failures;
+extern nxt_uint_t  nxt_router_schedule_test_parse_failures;
 #endif
 
 

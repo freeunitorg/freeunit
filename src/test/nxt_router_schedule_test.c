@@ -447,6 +447,252 @@ free_timers:
 }
 
 /*
+ * A run whose request parse fails, as on no memory, before it sets the
+ * method, the path and the arguments (the NXT_TESTS hook).  The request
+ * still goes through the access log, and its format reads all three:
+ * "$method", "$uri" and "$arg_x".  The log is a pipe.  The fixture is the
+ * one of the test above, with the real access log code and the real
+ * variables.
+ */
+
+static nxt_int_t
+nxt_router_schedule_parse_fail_test(nxt_thread_t *thr)
+{
+    int                      fds[2];
+    void                    *objs[4];
+    u_char                  name[32], buf[256];
+    ssize_t                 n;
+    nxt_mp_t                *mp;
+    nxt_int_t               ret;
+    nxt_str_t               json;
+    nxt_uint_t              nstates;
+    nxt_task_t              *task;
+    nxt_router_t            router, *saved_router;
+    nxt_conf_value_t        *value;
+    nxt_event_engine_t      main_engine, worker, *saved;
+    nxt_router_conf_t       *rtcf, empty;
+    nxt_status_schedule_t   stat;
+    nxt_router_temp_conf_t  tmcf;
+    nxt_work_queue_cache_t  cache;
+    nxt_router_schedule_t   *sched;
+    nxt_router_schedules_t  *sc;
+
+    /* An empty value is logged as "-". */
+    static const char  expect[] = "[-] [-] [-]\n";
+
+    task = thr->task;
+    saved = thr->engine;
+    saved_router = nxt_router;
+    ret = NXT_ERROR;
+    fds[0] = -1;
+    fds[1] = -1;
+
+    nxt_memzero(&main_engine, sizeof(nxt_event_engine_t));
+    nxt_memzero(&worker, sizeof(nxt_event_engine_t));
+    nxt_memzero(&router, sizeof(nxt_router_t));
+    nxt_memzero(&empty, sizeof(nxt_router_conf_t));
+    nxt_memzero(&tmcf, sizeof(nxt_router_temp_conf_t));
+
+    if (nxt_timers_init(&main_engine.timers, 4) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_timers_init(&worker.timers, 4) != NXT_OK) {
+        nxt_free(main_engine.timers.changes);
+        return NXT_ERROR;
+    }
+
+    nxt_work_queue_cache_create(&cache, 0);
+
+    main_engine.task = *task;
+    main_engine.event.signal = nxt_router_schedule_test_signal;
+    main_engine.fast_work_queue.cache = &cache;
+
+    worker.task = *task;
+    worker.event.signal = nxt_router_schedule_test_signal;
+    worker.fast_work_queue.cache = &cache;
+    nxt_queue_init(&worker.joints);
+
+    nxt_queue_init(&router.engines);
+    nxt_queue_insert_tail(&router.engines, &worker.link0);
+    nxt_queue_init(&router.access_logs);
+
+    nxt_router = &router;
+    empty.router = &router;
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (mp == NULL) {
+        goto free_timers;
+    }
+
+    rtcf = nxt_mp_zget(mp, sizeof(nxt_router_conf_t));
+    sc = nxt_mp_zget(mp, sizeof(nxt_router_schedules_t));
+    sched = nxt_mp_zget(mp, sizeof(nxt_router_schedule_t));
+
+    if (rtcf == NULL || sc == NULL || sched == NULL) {
+        goto destroy;
+    }
+
+    rtcf->mem_pool = mp;
+    rtcf->router = &router;
+    rtcf->count = 1;                                /* a listener */
+
+    rtcf->tstr_state = nxt_tstr_state_new(mp, 0);
+    if (rtcf->tstr_state == NULL) {
+        goto destroy;
+    }
+
+    /*
+     * The router registers the variables at its start; this program does
+     * not.  A second registration fails at its first name and changes
+     * nothing, so the result does not matter: the compile below fails if a
+     * name is missing.
+     */
+
+    (void) nxt_http_register_variables();
+
+    nxt_str_set(&json, "{\"path\": \"/dev/null\", "
+                       "\"format\": \"[$method] [$uri] [$arg_x]\"}");
+
+    value = nxt_conf_json_parse_str(mp, &json);
+
+    if (value == NULL
+        || nxt_router_access_log_create(task, rtcf, value) != NXT_OK
+        || nxt_tstr_state_done(rtcf->tstr_state, NULL) != NXT_OK
+        || pipe(fds) != 0)
+    {
+        nxt_log_alert(thr->log, "schedule parse failure: no access log");
+        goto release;
+    }
+
+    if (fcntl(fds[0], F_SETFL, O_NONBLOCK) != 0) {
+        goto release;
+    }
+
+    rtcf->access_log->fd = fds[1];
+    fds[1] = -1;
+
+    if (nxt_router_schedules_joint_init(task, rtcf, sc, NULL) != NXT_OK) {
+        goto release;
+    }
+
+    nxt_str_set(&sched->name, "parse");
+    nxt_str_set(&sched->uri, "/cron?x=1");
+    sched->interval = 60000;
+    sched->timeout = 60000;
+
+    if (nxt_router_schedule_request_build(mp, sched, NULL) != NXT_OK) {
+        goto release;
+    }
+
+    sc->schedule = sched;
+    sc->nschedules = 1;
+    rtcf->schedules = sc;
+
+    thr->engine = &main_engine;
+    tmcf.router_conf = rtcf;
+    nxt_router_schedules_apply(task, &tmcf);
+
+    nxt_router_schedule_test_timers(thr, &main_engine, sched->interval + 1);
+
+    /* The insert and the run; the run's parse fails. */
+
+    nxt_router_schedule_test_parse_failures = 1;
+
+    (void) nxt_router_schedule_test_posted(thr, &worker, objs,
+                                           nxt_nitems(objs));
+
+    nxt_router_schedule_test_parse_failures = 0;
+
+    /* The error response, the access log, the close and the run's end. */
+
+    nxt_router_schedule_test_timers(thr, &worker, 0);
+    nxt_router_schedule_test_timers(thr, &worker, 1);
+
+    n = read(fds[0], buf, sizeof(buf));
+
+    if (n != (ssize_t) nxt_length(expect)
+        || memcmp(buf, expect, n) != 0)
+    {
+        nxt_log_alert(thr->log, "schedule parse failure: the access log got "
+                      "\"%*s\", expected \"%s\"", (size_t) nxt_max(n, 0), buf,
+                      expect);
+        goto release;
+    }
+
+    if (sc->joint.count != 1 || rtcf->count != 2) {
+        nxt_log_alert(thr->log, "schedule parse failure: joint %uD, rtcf %uD "
+                      "after the run", sc->joint.count, rtcf->count);
+        goto release;
+    }
+
+    /* The result, on the main engine. */
+
+    (void) nxt_router_schedule_test_posted(thr, &main_engine, objs,
+                                           nxt_nitems(objs));
+
+    nxt_router_schedules_status(&stat, name + sizeof(name), name);
+
+    if (stat.running != 0 || stat.runs != 1 || stat.failed != 1) {
+        nxt_log_alert(thr->log, "schedule parse failure: running %uD, runs "
+                      "%uD, failed %uD after the run", stat.running,
+                      stat.runs, stat.failed);
+        goto release;
+    }
+
+    /* The next configuration has no schedules: the joint goes. */
+
+    thr->engine = &main_engine;
+    tmcf.router_conf = &empty;
+    nxt_router_schedules_apply(task, &tmcf);
+
+    (void) nxt_router_schedule_test_posted(thr, &worker, objs,
+                                           nxt_nitems(objs));
+    nxt_router_schedule_test_timers(thr, &main_engine, 1);
+
+    (void) nxt_router_schedules_status_size(&nstates);
+
+    if (nstates != 0 || rtcf->count != 1) {
+        nxt_log_alert(thr->log, "schedule parse failure: %ui states, rtcf "
+                      "%uD at the end", nstates, rtcf->count);
+        goto release;
+    }
+
+    ret = NXT_OK;
+
+release:
+
+    /* See nxt_router_schedule_queued_test() about a "goto release". */
+
+    nxt_router_access_log_release(task, &router.lock, rtcf->access_log);
+    nxt_tstr_state_release(rtcf->tstr_state);
+
+destroy:
+
+    nxt_mp_destroy(mp);
+
+free_timers:
+
+    if (fds[0] != -1) {
+        (void) close(fds[0]);
+    }
+
+    if (fds[1] != -1) {
+        (void) close(fds[1]);
+    }
+
+    thr->engine = saved;
+    nxt_router = saved_router;
+
+    nxt_work_queue_cache_destroy(&cache);
+    nxt_free(main_engine.timers.changes);
+    nxt_free(worker.timers.changes);
+
+    return ret;
+}
+
+
+/*
  * A configuration whose schedule cannot be resolved fails as a whole, and
  * takes no reference on the rtcf.
  */
@@ -516,6 +762,7 @@ nxt_router_schedule_test(nxt_thread_t *thr)
         || nxt_router_schedule_request_test(thr) != NXT_OK
         || nxt_router_schedule_joint_test(thr) != NXT_OK
         || nxt_router_schedule_queued_test(thr) != NXT_OK
+        || nxt_router_schedule_parse_fail_test(thr) != NXT_OK
         || nxt_router_schedule_resolve_test(thr) != NXT_OK)
     {
         return NXT_ERROR;
