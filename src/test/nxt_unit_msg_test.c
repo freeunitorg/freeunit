@@ -4071,6 +4071,282 @@ nxt_unit_msg_test_shm_ack_case(void *data)
 }
 
 
+/*
+ * nxt_unit_memcasecmp() folds the case of two bytes only when the bytes
+ * differ.  Its results, value and sign, must stay those of the old loop
+ * that folded every byte.  The reference below is that loop, with its own
+ * copy of the fold: only 'A' to 'Z' fold.  Each string ends where a
+ * PROT_NONE page starts, so a read past the length kills the child.
+ */
+
+#define NXT_UNIT_MSG_TEST_CASE_MAX     40
+#define NXT_UNIT_MSG_TEST_CASE_ROUNDS  100000
+
+#define nxt_unit_msg_test_lowcase(c)                                          \
+    (u_char) ((c >= 'A' && c <= 'Z') ? c | 0x20 : c)
+
+
+typedef struct {
+    u_char    *end1;
+    u_char    *end2;
+    uint32_t  seed;
+    int       errors;
+} nxt_unit_msg_test_case_t;
+
+
+/* The names that nxt_unit_request_group_dup_fields() compares. */
+
+static const char  *nxt_unit_msg_test_case_names[] = {
+    "Content-Length", "Content-Type", "Cookie", "Authorization", "X-Dup",
+};
+
+
+static const u_char  nxt_unit_msg_test_case_edge[] = {
+    0x00, 0x20, '-', '0', '9', '@', 'A', 'Z', '[', '`', 'a', 'z', '{', 0x7f,
+    0x80, 0xa0, 0xc0, 0xc1, 0xda, 0xe0, 0xe1, 0xfa, 0xff,
+};
+
+
+static int
+nxt_unit_msg_test_case_ref(const u_char *s1, const u_char *s2, size_t length)
+{
+    u_char  c1, c2;
+    int     n;
+
+    while (length-- != 0) {
+        c1 = *s1++;
+        c2 = *s2++;
+
+        c1 = nxt_unit_msg_test_lowcase(c1);
+        c2 = nxt_unit_msg_test_lowcase(c2);
+
+        n = c1 - c2;
+
+        if (n != 0) {
+            return n;
+        }
+    }
+
+    return 0;
+}
+
+
+/* Copies both strings to the ends of their pages and compares them. */
+
+static void
+nxt_unit_msg_test_case_pair(nxt_unit_msg_test_case_t *ctx, const u_char *s1,
+    const u_char *s2, size_t length)
+{
+    int     r, ref;
+    u_char  *p1, *p2;
+    size_t  i;
+
+    p1 = ctx->end1 - length;
+    p2 = ctx->end2 - length;
+
+    memcpy(p1, s1, length);
+    memcpy(p2, s2, length);
+
+    r = nxt_unit_test_memcasecmp(p1, p2, length);
+    ref = nxt_unit_msg_test_case_ref(p1, p2, length);
+
+    if (r == ref) {
+        return;
+    }
+
+    if (ctx->errors++ < 5) {
+        printf("unit msg test: nxt_unit_memcasecmp(");
+
+        for (i = 0; i < length; i++) {
+            printf("%02x", p1[i]);
+        }
+
+        printf(", ");
+
+        for (i = 0; i < length; i++) {
+            printf("%02x", p2[i]);
+        }
+
+        printf(", %zu) gave %d, expected %d\n", length, r, ref);
+    }
+}
+
+
+static uint32_t
+nxt_unit_msg_test_case_random(nxt_unit_msg_test_case_t *ctx)
+{
+    uint32_t  x;
+
+    /* xorshift32: the same sequence on every run. */
+
+    x = ctx->seed;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    ctx->seed = x;
+
+    return x;
+}
+
+
+static u_char
+nxt_unit_msg_test_case_byte(nxt_unit_msg_test_case_t *ctx)
+{
+    uint32_t  r;
+
+    r = nxt_unit_msg_test_case_random(ctx);
+
+    switch (r & 3) {
+
+    case 0:
+    case 1:
+        return 'A' + (r >> 8) % 26 + ((r >> 16) & 0x20);
+
+    case 2:
+        return nxt_unit_msg_test_case_edge[(r >> 8)
+                                       % sizeof(nxt_unit_msg_test_case_edge)];
+
+    default:
+        return (u_char) (r >> 8);
+    }
+}
+
+
+static int
+nxt_unit_msg_test_memcasecmp_case(void *data)
+{
+    u_char                    *map, c;
+    u_char                    s1[NXT_UNIT_MSG_TEST_CASE_MAX];
+    u_char                    s2[NXT_UNIT_MSG_TEST_CASE_MAX];
+    size_t                    page, length, i, k;
+    uint32_t                  r;
+    nxt_uint_t                a, b;
+    const char                *name;
+    nxt_unit_msg_test_case_t  ctx;
+
+    page = getpagesize();
+
+    map = mmap(NULL, 4 * page, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (map == MAP_FAILED) {
+        return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_ERROR);
+    }
+
+    if (mprotect(map + page, page, PROT_NONE) != 0
+        || mprotect(map + 3 * page, page, PROT_NONE) != 0)
+    {
+        return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_ERROR);
+    }
+
+    ctx.end1 = map + page;
+    ctx.end2 = map + 3 * page;
+    ctx.seed = 2463534242;
+    ctx.errors = 0;
+
+    /* The empty string, with both pointers at the guard page. */
+
+    nxt_unit_msg_test_case_pair(&ctx, s1, s2, 0);
+
+    /*
+     * Every pair of bytes, alone and between "a" and "b" on one side and
+     * "A" and "B" on the other, so the byte after an equal-by-fold pair
+     * counts too.
+     */
+
+    for (a = 0; a < 256; a++) {
+        for (b = 0; b < 256; b++) {
+            s1[0] = a;
+            s2[0] = b;
+            nxt_unit_msg_test_case_pair(&ctx, s1, s2, 1);
+
+            s1[0] = 'a';
+            s1[1] = a;
+            s1[2] = 'b';
+
+            s2[0] = 'A';
+            s2[1] = b;
+            s2[2] = 'B';
+
+            nxt_unit_msg_test_case_pair(&ctx, s1, s2, 3);
+        }
+    }
+
+    /*
+     * The well-known names against themselves in four cases, and with each
+     * byte changed by one bit.
+     */
+
+    for (k = 0; k < nxt_nitems(nxt_unit_msg_test_case_names); k++) {
+        name = nxt_unit_msg_test_case_names[k];
+        length = strlen(name);
+
+        for (i = 0; i < length; i++) {
+            s1[i] = name[i];
+            s2[i] = nxt_unit_msg_test_lowcase(name[i]);
+        }
+
+        nxt_unit_msg_test_case_pair(&ctx, s1, s1, length);
+        nxt_unit_msg_test_case_pair(&ctx, s1, s2, length);
+        nxt_unit_msg_test_case_pair(&ctx, s2, s1, length);
+
+        for (i = 0; i < length; i++) {
+            s2[i] = (s1[i] >= 'a' && s1[i] <= 'z') ? s1[i] & ~0x20 : s1[i];
+        }
+
+        nxt_unit_msg_test_case_pair(&ctx, s1, s2, length);
+
+        for (i = 0; i < length; i++) {
+            for (b = 0; b < 8; b++) {
+                memcpy(s2, s1, length);
+                s2[i] ^= 1 << b;
+                nxt_unit_msg_test_case_pair(&ctx, s1, s2, length);
+                nxt_unit_msg_test_case_pair(&ctx, s2, s1, length);
+            }
+        }
+    }
+
+    /*
+     * Random strings, and their copies with some bytes flipped in case or
+     * replaced, in both argument orders.
+     */
+
+    for (k = 0; k < NXT_UNIT_MSG_TEST_CASE_ROUNDS; k++) {
+        r = nxt_unit_msg_test_case_random(&ctx);
+        length = r % (NXT_UNIT_MSG_TEST_CASE_MAX + 1);
+
+        for (i = 0; i < length; i++) {
+            s1[i] = nxt_unit_msg_test_case_byte(&ctx);
+            s2[i] = s1[i];
+
+            r = nxt_unit_msg_test_case_random(&ctx);
+
+            if ((r & 3) == 0) {
+                s2[i] ^= 0x20;
+
+            } else if ((r & 31) == 1) {
+                c = nxt_unit_msg_test_case_byte(&ctx);
+                s2[i] = c;
+            }
+        }
+
+        nxt_unit_msg_test_case_pair(&ctx, s1, s2, length);
+        nxt_unit_msg_test_case_pair(&ctx, s2, s1, length);
+    }
+
+    if (ctx.errors != 0) {
+        printf("unit msg test: nxt_unit_memcasecmp() %d mismatch(es)\n",
+               ctx.errors);
+
+        /* The child leaves with _exit(), which does not flush stdout. */
+        fflush(stdout);
+
+        return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_ERROR);
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
 int
 main(void)
 {
@@ -4093,6 +4369,11 @@ main(void)
     }
 
     nxt_unit_msg_test_pid = getpid();
+
+    nxt_unit_msg_test_in_child("nxt_unit_memcasecmp() gives the results of "
+                               "the old loop",
+                               nxt_unit_msg_test_memcasecmp_case, NULL,
+                               NXT_UNIT_OK);
 
     memset(&init, 0, sizeof(init));
 
