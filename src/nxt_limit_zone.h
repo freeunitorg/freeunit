@@ -8,16 +8,22 @@
 
 
 /*
- * A rate-limit zone: one bucket per key, all state in one preallocated arena
- * so the hit path never allocates.  Slice 1 of the limit_req work: the object
- * only.  Nothing calls it yet; the route action and the 429 come in slice 2.
+ * A rate-limit zone: one token bucket per key, all state in one
+ * preallocated arena so the hit path never allocates.  The "limit_req"
+ * action of nxt_http_limit_req.c uses it; the clock is a parameter, in
+ * microseconds, so the C test needs no sleeps.
  *
  * The zone is created in the router (one process, N threads), so the lock is a
  * thread spinlock, not SHM.  Counters live inside the zone and are read with
  * the zone, so a reload that keeps the zone by name keeps its numbers.
  */
 
-#define NXT_LIMIT_KEY_MAX       16     /* 4-byte v4 or 16-byte v6 address */
+/*
+ * The longest key.  nxt_http_limit_req_key() gives 4 bytes for IPv4, also
+ * mapped into IPv6, 8 bytes for the /64 of IPv6, and 1 byte for a UNIX
+ * socket.
+ */
+#define NXT_LIMIT_KEY_MAX       16
 #define NXT_LIMIT_TOKEN_SCALE   1000000  /* micro-tokens per request */
 #define NXT_LIMIT_BURST_MAX     65535
 #define NXT_LIMIT_RATE_MAX      1000000

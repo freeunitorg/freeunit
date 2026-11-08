@@ -499,13 +499,18 @@ nxt_http_limit_req_reject(nxt_task_t *task, nxt_http_request_t *r,
         r->inconsistent = 1;
     }
 
-    /* The time until one request fits, in whole seconds, at least 1. */
+    /*
+     * The time until one request fits, in whole seconds, rounded up.  The
+     * rate is 1 per second at least, so one request fits within 1 s, and
+     * the field is always 1.  It is larger only with a rate below 1 per
+     * second, which the configuration cannot give now.  On a reject the
+     * wait is 1 us at least, so the field is never 0.
+     */
 
-    retry_after = (uint32_t) nxt_min((wait_us + 999999) / 1000000,
-                                     (uint64_t) NXT_INT32_T_MAX);
+    retry_after = (uint32_t) ((wait_us + 999999) / 1000000);
 
     nxt_http_request_error_retry_after(task, r, NXT_HTTP_TOO_MANY_REQUESTS,
-                                       nxt_max(retry_after, 1u));
+                                       retry_after);
 
     return NXT_DECLINED;
 }
