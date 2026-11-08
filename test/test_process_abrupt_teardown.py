@@ -242,6 +242,27 @@ def test_process_abrupt_teardown(skip_alert, skip_fds_check):
             else:
                 record(failures, f'unexpected status {status}')
 
+    def answered():
+        """A request answered by the fresh worker, before it is killed.
+
+        A worker that exits before it answered anything is a failed start
+        for the restart back-off (#596): the router would put off its
+        replacement and log an alert.  With one process, the fresh worker
+        is the only one that can answer this, so a kill after it is an
+        abrupt teardown of a serving worker, which is what the test drives.
+        """
+
+        try:
+            resp = client.post(body='ping', read_timeout=READ_TIMEOUT)
+
+        except KeyboardInterrupt:
+            raise
+
+        except BaseException:  # noqa: BLE001
+            return False
+
+        return resp['status'] == 200
+
     workers = [threading.Thread(target=request_worker) for _ in range(WORKERS)]
 
     for worker in workers:
@@ -254,6 +275,10 @@ def test_process_abrupt_teardown(skip_alert, skip_fds_check):
             record(
                 failures, f'no fresh application worker for kill {round_ + 1}'
             )
+            break
+
+        if not answered():
+            record(failures, f'worker {sorted(pids)} did not answer a request')
             break
 
         subprocess.call(['kill', '-9', *pids])

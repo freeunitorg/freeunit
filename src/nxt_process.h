@@ -187,6 +187,18 @@ struct nxt_process_s {
     nxt_process_data_t       data;
 
     nxt_process_isolation_t  isolation;
+
+    /*
+     * For the restart back-off of an application worker (#596), in the
+     * router.  app_answered is set once the router has seen an answer from
+     * the worker: a response, an upgrade, or an RPC_ERROR.  app_generation
+     * is the generation of the application that adopted the worker.  Both
+     * change under app->mutex, not under rt->processes_mutex.  They are
+     * here and not in nxt_port_t, because tools/perf/layout-structs.txt
+     * pins the layout of nxt_port_s.
+     */
+    uint8_t                  app_answered;
+    uint32_t                 app_generation;
 };
 
 

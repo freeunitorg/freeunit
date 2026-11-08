@@ -44,6 +44,7 @@ Cheap on purpose: one request and one deliberate client stall, about a second
 of work once the PHP worker is warm.
 """
 
+import os
 import re
 import subprocess
 import threading
@@ -149,13 +150,7 @@ def test_process_shm_oosm():
     assert 'oosm: retry' in log, 'application got a SHM_ACK back'
 
     # Still serving, from the same worker, after the round trip.
-    sock = client.get(url='/?mb=1', no_recv=True)
-    resp = client.recvall(sock, read_timeout=READ_TIMEOUT, buff_size=65536)
-    sock.close()
-
-    assert _body(resp, 1024 * 1024).count(b'x') == 1024 * 1024, (
-        'still serving'
-    )
+    assert _answers(), 'still serving'
 
     Log.check_alerts()
 
@@ -175,11 +170,12 @@ KILL_INTERVAL = 0.4
 # -- stay busy for the whole run instead of draining between kills.
 STALLERS = 3
 
-# Bounded on purpose: this is a race driver, not a soak.  Five kills at 0.4 s
-# is about three seconds of workload, cheap enough for any --debug run.  It is
-# timing-dependent by nature: a green run is evidence only in the same weak
-# sense as test_process_abrupt_teardown.py, and the deterministic check of
-# the primitive this test exercises lives in the C suite
+# Bounded on purpose: this is a race driver, not a soak.  Five kills at 0.4 s,
+# each after the worker has answered a request behind the stalled responses
+# and blocked again, is about ten seconds of workload, cheap enough for any
+# --debug run.  It is timing-dependent by nature: a green run is evidence
+# only in the same weak sense as test_process_abrupt_teardown.py, and the
+# deterministic check of the primitive this test exercises lives in the C suite
 # (src/test/nxt_port_use_unless_zero_test.c).
 
 
@@ -210,6 +206,46 @@ def _wait_for_fresh_pids(spent, timeout=5):
         time.sleep(0.05)
 
     return set()
+
+
+def _answers():
+    """Whether the worker answers a 1 MiB request, intact and to the end.
+
+    Before a kill: a worker that exits before it answered anything is a
+    failed start for the restart back-off (#596), and the router would put
+    off its replacement and log an alert.  The application has one process,
+    so the worker in ps is the one that answers here, and a kill after this
+    is the abrupt teardown of a serving worker.  1 MiB fits the segment, so
+    this response never blocks in OOSM."""
+
+    sock = client.get(url='/?mb=1', no_recv=True)
+    resp = client.recvall(sock, read_timeout=READ_TIMEOUT, buff_size=65536)
+    sock.close()
+
+    return _body(resp, 1024 * 1024).count(b'x') == 1024 * 1024
+
+
+def _wait_for_oosm(pid, timeout=10):
+    """An OOSM report from `pid` written from now on, i.e. the worker blocked
+    in nxt_unit_wait_shm_ack() again.  Reads only what the log gets from
+    here: the debug log is large, and grows fast while responses stream."""
+
+    deadline = time.time() + timeout
+    pattern = re.compile(rf'oosm in {pid}\b')
+
+    with Log.open() as file:
+        file.seek(0, os.SEEK_END)
+        tail = ''
+
+        while time.time() < deadline:
+            tail += file.read()
+
+            if pattern.search(tail):
+                return True
+
+            time.sleep(0.05)
+
+    return False
 
 
 def test_process_shm_oosm_kill(skip_alert):
@@ -295,6 +331,17 @@ def test_process_shm_oosm_kill(skip_alert):
             failures.append(f'no fresh worker for kill {round_ + 1}')
             break
 
+        # The fresh worker answers first, so its kill is not a failed start
+        # (see _answers()), and then blocks in OOSM on a staller's response,
+        # so the kill lands on a blocked worker and not on an idle one.
+        if not _answers():
+            failures.append(f'worker {sorted(pids)} did not answer')
+            break
+
+        if not all(_wait_for_oosm(pid) for pid in pids):
+            failures.append(f'worker {sorted(pids)} did not reach OOSM')
+            break
+
         subprocess.call(['kill', '-9', *pids])
 
         killed.extend(pids)
@@ -329,13 +376,7 @@ def test_process_shm_oosm_kill(skip_alert):
     )
 
     # Still serving, on a worker started after the last kill.
-    sock = client.get(url='/?mb=1', no_recv=True)
-    resp = client.recvall(sock, read_timeout=READ_TIMEOUT, buff_size=65536)
-    sock.close()
-
-    assert _body(resp, 1024 * 1024).count(b'x') == 1024 * 1024, (
-        'still serving'
-    )
+    assert _answers(), 'still serving'
 
     # Same proof as the test above that the OOSM round trip really ran; here
     # it also establishes that the kills landed on a blocked worker rather
@@ -372,7 +413,13 @@ ACK_ATTEMPTS = 4
 
 
 def _oosm_kill(pid):
-    """Put the worker into OOSM, kill it, and return the new worker PID."""
+    """Put the worker into OOSM, kill it, and return the new worker PID.
+
+    The worker answers a small request first, so the kill is not a failed
+    start for the restart back-off (see _answers()).  That response never
+    blocks, so the OOSM record waited for below is the big response's."""
+
+    assert _answers(), f'worker {pid} did not answer'
 
     sock = client.get(url=f'/?mb={RESPONSE_MB}', no_recv=True)
 
@@ -488,12 +535,6 @@ def test_process_shm_oosm_ack_closed_port(skip_alert):
 
     # The new worker serves a request.  Before the fix it could quit on a
     # stray SHM_ACK.
-    sock = client.get(url='/?mb=1', no_recv=True)
-    resp = client.recvall(sock, read_timeout=READ_TIMEOUT, buff_size=65536)
-    sock.close()
-
-    assert _body(resp, 1024 * 1024).count(b'x') == 1024 * 1024, (
-        'still serving'
-    )
+    assert _answers(), 'still serving'
 
     Log.check_alerts()
