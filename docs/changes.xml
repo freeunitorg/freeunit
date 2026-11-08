@@ -152,6 +152,25 @@ WebSocket, so it now answers 502 and logs a warning.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a route whose action was a configured "return": 101 crashed the router when a
+client sent a WebSocket handshake and a frame in the same write.  Such a 101 is
+sent as a plain response now; only an application response can switch the
+client connection to WebSocket.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+a client frame sent in the same write as an application WebSocket handshake
+could run the route action a second time for the same request.  The router sent
+the application's second response bytes to the client and left an application
+prototype process behind.  The frame now reaches the application as the first
+WebSocket frame.
+</para>
+</change>
+
 <change type="feature">
 <para>
 the PHP module now builds with PHP 8.7, which removed five members of

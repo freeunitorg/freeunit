@@ -6791,10 +6791,24 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
             last_b = NULL;
         }
 
-        nxt_http_request_header_send(task, r, nxt_http_request_send_body, NULL);
-
+        /*
+         * Only an application response upgrades the client connection.  A
+         * 101 that the router builds itself, for example a configured
+         * "return": 101, is sent as a plain response: the h1 sender arms the
+         * WebSocket reader from this flag only, and the reader starts below
+         * after r->state is the WebSocket state, so a frame the client
+         * pipelined with the handshake reaches the application instead of
+         * re-running the route action for the same request.
+         */
         if (r->websocket_handshake
             && r->status == NXT_HTTP_SWITCHING_PROTOCOLS)
+        {
+            r->websocket_upgrade = 1;
+        }
+
+        nxt_http_request_header_send(task, r, nxt_http_request_send_body, NULL);
+
+        if (r->websocket_upgrade)
         {
             app_port = req_rpc_data->app_port;
             if (nxt_slow_path(app_port == NULL)) {
@@ -6827,6 +6841,8 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
              * deadline goes with it (#422).
              */
             nxt_timer_disable(task->thread->engine, &r->timer);
+
+            nxt_h1p_websocket_start(task, r);
 
         } else {
             r->state = &nxt_http_request_send_state;

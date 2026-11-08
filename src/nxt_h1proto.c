@@ -1865,7 +1865,7 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
 
     conn = -1;
 
-    if (r->websocket_handshake && n == NXT_HTTP_SWITCHING_PROTOCOLS) {
+    if (r->websocket_upgrade && n == NXT_HTTP_SWITCHING_PROTOCOLS) {
         h1p->websocket = 1;
         h1p->keepalive = 0;
         conn = 2;
@@ -1928,6 +1928,11 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
 
     header = nxt_http_buf_mem(task, r, size);
     if (nxt_slow_path(header == NULL)) {
+        /*
+         * The request is closing.  Clear the flag set above, so that
+         * nxt_h1p_websocket_start() does not start the frame reader.
+         */
+        h1p->websocket = 0;
         nxt_h1p_request_error(task, h1p, r);
         return;
     }
@@ -1999,9 +2004,26 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
     }
 
     nxt_conn_write(task->thread->engine, c);
+}
 
-    if (h1p->websocket) {
-        nxt_h1p_websocket_first_frame_start(task, r, c->read);
+
+/*
+ * Start reading client WebSocket frames.  The router calls this after it has
+ * set r->state to the WebSocket state: the first read can hold bytes the
+ * client pipelined with the handshake, and those bytes are dispatched through
+ * r->state, so the state has to be final here.
+ */
+void
+nxt_h1p_websocket_start(nxt_task_t *task, nxt_http_request_t *r)
+{
+    nxt_h1proto_t  *h1p;
+
+    h1p = r->proto.h1;
+
+    if (h1p != NULL && h1p->websocket && h1p->request == r
+        && h1p->conn != NULL)
+    {
+        nxt_h1p_websocket_first_frame_start(task, r, h1p->conn->read);
     }
 }
 
@@ -3550,12 +3572,12 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
         h1p->chunked = (h1p->transfer_encoding == NXT_HTTP_TE_CHUNKED);
 
         /*
-         * The proxy cannot pass WebSocket.  The 101 of an application starts
-         * the WebSocket frame reader of the client connection, and the reader
-         * calls the request state with no peer.  The states of a proxy
-         * request all read the peer from that argument.  Refuse the upgrade
-         * here, where "b" can still be freed: bytes that the upstream sent
-         * after the 101 are in "b" too.
+         * The proxy cannot pass WebSocket.  The router starts the client
+         * frame reader only for an application 101 (r->websocket_upgrade),
+         * so a relayed 101 would hand the client the upstream's Upgrade
+         * fields with nobody relaying frames.  Refuse the upgrade here,
+         * where "b" can still be freed: bytes that the upstream sent after
+         * the 101 are in "b" too.
          */
         if (nxt_slow_path(peer->status == NXT_HTTP_SWITCHING_PROTOCOLS
                           && r->websocket_handshake))

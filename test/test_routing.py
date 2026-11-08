@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import json
 import shutil
+import socket
 import tempfile
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from conftest import unit_run, unit_stop
 from unit.applications.lang.python import ApplicationPython
 from unit.option import option
 from unit.status import Status
+from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'any'}}
 
@@ -2398,3 +2400,64 @@ def test_routes_match_if_njs(require):
     assert client.get(url='/foo_2?foo=2')['status'] == 200
 
     assert 'error' in client.conf('$arg_', 'routes/0/match/if')
+
+
+def test_route_return_101_websocket_handshake():
+    """A configured 101 is a plain response, not a protocol switch."""
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "routes"}},
+            "routes": [{"action": {"return": 101}}],
+            "applications": {},
+        }
+    ), 'route return 101'
+
+    # A valid WebSocket handshake with one masked text frame pipelined in the
+    # same write.  The frame must not start a frame reader on a 101 the router
+    # built itself; before this it ran a NULL request state and crashed the
+    # router.
+    request = (
+        'GET / HTTP/1.1\r\n'
+        'Host: localhost\r\n'
+        'Upgrade: websocket\r\n'
+        'Connection: Upgrade\r\n'
+        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+        'Sec-WebSocket-Version: 13\r\n'
+        '\r\n'
+    ).encode()
+
+    mask = b'\x01\x02\x03\x04'
+    frame = b'\x81\x85' + mask + bytes(
+        b ^ mask[i % 4] for i, b in enumerate(b'hello')
+    )
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5)
+
+    raw = b''
+
+    try:
+        sock.connect(('127.0.0.1', port_map.port(8080)))
+        sock.sendall(request + frame)
+
+        while not raw.endswith(b'\r\n\r\n'):
+            part = sock.recv(1)
+
+            if not part:
+                break
+
+            raw += part
+
+    except OSError:
+        pass
+
+    finally:
+        sock.close()
+
+    assert raw.startswith(b'HTTP/1.1 101'), f'no plain 101: {raw[:200]!r}'
+    assert b'Upgrade: websocket' not in raw, (
+        f'101 treated as an upgrade: {raw[:400]!r}'
+    )
+
+    # The fixture fails the test if the router process was restarted.
+    assert client.get()['status'] == 101, 'router lost after the frame'
