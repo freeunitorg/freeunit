@@ -18,15 +18,15 @@
  */
 
 #define NXT_LIMIT_KEY_MAX       16     /* 4-byte v4 or 16-byte v6 address */
-#define NXT_LIMIT_TOKEN_SCALE   1000   /* milli-tokens per request */
+#define NXT_LIMIT_TOKEN_SCALE   1000000  /* micro-tokens per request */
 #define NXT_LIMIT_BURST_MAX     65535
 #define NXT_LIMIT_RATE_MAX      1000000
 #define NXT_LIMIT_KEYS_MAX      1048576
 
 
 typedef struct {
-    uint64_t    last_ms;
-    uint32_t    tokens;                /* milli-tokens, <= burst * SCALE */
+    uint64_t    last_us;
+    uint64_t    tokens;                /* micro-tokens, <= burst * SCALE */
     uint32_t    next;                  /* 1-based: hash chain or free list */
     /*
      * 1-based, 0 at the ends: the list of the entries in use from the most
@@ -65,7 +65,7 @@ typedef struct {
 nxt_limit_zone_t *nxt_limit_zone_create(nxt_mp_t *mp, uint32_t keys_max,
     uint32_t rate, uint32_t burst);
 nxt_bool_t nxt_limit_zone_check(nxt_limit_zone_t *zone, const uint8_t *key,
-    size_t key_len, uint64_t now_ms, uint64_t *wait_ms);
+    size_t key_len, uint64_t now_us, uint64_t *wait_us);
 
 
 #endif /* _NXT_LIMIT_ZONE_H_INCLUDED_ */

@@ -22,9 +22,9 @@ static const u_char  nxt_limit_key_c[4] = { 10, 0, 0, 3 };
 
 static nxt_bool_t
 nxt_limit_zone_check_key(nxt_limit_zone_t *zone, const u_char *key,
-    uint64_t now_ms)
+    uint64_t now_us)
 {
-    return nxt_limit_zone_check(zone, key, 4, now_ms, NULL);
+    return nxt_limit_zone_check(zone, key, 4, now_us, NULL);
 }
 
 
@@ -32,10 +32,10 @@ nxt_int_t
 nxt_limit_zone_test(nxt_thread_t *thr)
 {
     nxt_mp_t            *mp;
-    nxt_limit_zone_t    *zone, *small, *capz;
-    nxt_uint_t           i;
+    nxt_limit_zone_t    *zone, *small, *capz, *fast;
+    nxt_uint_t           i, passed;
     u_char               long_key[17];
-    uint64_t             now;
+    uint64_t             now, t;
 
     /* cluster must be at least a page: 8 pages, 4 KiB pages. */
     mp = nxt_mp_create(32768, 128, 4096, 64);
@@ -69,7 +69,7 @@ nxt_limit_zone_test(nxt_thread_t *thr)
 
     NXT_TEST_CHECK(thr->log, zone != NULL, "zone creation failed");
 
-    now = 1000;
+    now = 1000000;
 
     for (i = 0; i < 3; i++) {
         NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(zone,
@@ -86,16 +86,17 @@ nxt_limit_zone_test(nxt_thread_t *thr)
                    zone->passed, zone->rejected);
 
     /*
-     * 10 tokens per second is one token per 100 ms: at 99 ms there is still
-     * no token, at 100 ms there is exactly one.
+     * 10 tokens per second is one token per 100 ms: at 99.999 ms there is
+     * still no token, at 100 ms there is exactly one.  The time is in
+     * microseconds.
      */
 
     NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(zone, nxt_limit_key_a,
-                       now + 99) == 0,
+                       now + 99999) == 0,
                    "a request passed before a whole token accrued");
 
     NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(zone, nxt_limit_key_a,
-                       now + 100) == 1,
+                       now + 100000) == 1,
                    "a request was rejected at a whole token");
 
     /* A second key has its own bucket. */
@@ -121,16 +122,51 @@ nxt_limit_zone_test(nxt_thread_t *thr)
     }
 
     NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(capz, nxt_limit_key_c,
-                       3600 * 1000) == 1,
+                       3600 * 1000000ULL) == 1,
                    "the first request after an idle hour was rejected");
 
     NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(capz, nxt_limit_key_c,
-                       3600 * 1000) == 1,
+                       3600 * 1000000ULL) == 1,
                    "the second request after an idle hour was rejected");
 
     NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(capz, nxt_limit_key_c,
-                       3600 * 1000) == 0,
+                       3600 * 1000000ULL) == 0,
                    "an idle hour accrued more than the burst");
+
+    /*
+     * Above 1000 per second: 5000 per second with a burst of 1 is one
+     * request per 200 us.  A clock in milliseconds passed one request
+     * per millisecond at most, 1000 per second.
+     */
+
+    fast = nxt_limit_zone_create(mp, 4, 5000, 1);
+
+    NXT_TEST_CHECK(thr->log, fast != NULL, "fast zone creation failed");
+
+    now = 1000000;
+
+    NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(fast, nxt_limit_key_a,
+                       now) == 1,
+                   "the first request at 5000/s was rejected");
+
+    NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(fast, nxt_limit_key_a,
+                       now + 199) == 0,
+                   "a request at 5000/s passed after 199 us");
+
+    NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(fast, nxt_limit_key_a,
+                       now + 200) == 1,
+                   "a request at 5000/s was rejected after 200 us");
+
+    /* One second, a request every 50 us: 5000 pass, one each 200 us. */
+
+    passed = 0;
+
+    for (t = now + 250; t <= now + 200 + 1000000; t += 50) {
+        passed += nxt_limit_zone_check_key(fast, nxt_limit_key_a, t);
+    }
+
+    NXT_TEST_CHECK(thr->log, passed == 5000,
+                   "%ui requests passed in one second at 5000/s", passed);
 
     /* An oversized key is not limited: it cannot be stored, so it passes. */
 
@@ -159,11 +195,11 @@ nxt_limit_zone_test(nxt_thread_t *thr)
                    "first key in a fresh small zone was rejected");
 
     NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(small, nxt_limit_key_b,
-                       10) == 1,
+                       10000) == 1,
                    "second key in a fresh small zone was rejected");
 
     NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(small, nxt_limit_key_c,
-                       20) == 1,
+                       20000) == 1,
                    "the third key was rejected instead of evicting");
 
     NXT_TEST_CHECK(thr->log, small->keys_used == 2 && small->evicted == 1,
@@ -173,7 +209,7 @@ nxt_limit_zone_test(nxt_thread_t *thr)
     /* The evicted key starts a fresh bucket, so its next request passes. */
 
     NXT_TEST_CHECK(thr->log, nxt_limit_zone_check_key(small, nxt_limit_key_a,
-                       21) == 1,
+                       21000) == 1,
                    "the evicted key did not get a fresh bucket");
 
     NXT_TEST_CHECK(thr->log, small->keys_used == 2 && small->evicted == 2,

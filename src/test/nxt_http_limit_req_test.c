@@ -170,28 +170,33 @@ nxt_http_limit_req_test_wait(nxt_thread_t *thr)
     NXT_TEST_CHECK(thr->log, zone != NULL, "nxt_limit_zone_create() failed");
 
     wait = 1;
-    allow = nxt_limit_zone_check(zone, key, 4, 1000, &wait);
+    allow = nxt_limit_zone_check(zone, key, 4, 1000000, &wait);
     NXT_TEST_CHECK(thr->log, allow && wait == 0, "wait: first request");
 
-    allow = nxt_limit_zone_check(zone, key, 4, 1000, &wait);
+    allow = nxt_limit_zone_check(zone, key, 4, 1000000, &wait);
     NXT_TEST_CHECK(thr->log, allow && wait == 0, "wait: burst request");
 
-    /* Empty: one request is 1000 milli-tokens at 2 per millisecond. */
+    /*
+     * Empty: one request is 1000000 micro-tokens at 2 per microsecond.
+     * The time and the wait are in microseconds.
+     */
 
-    allow = nxt_limit_zone_check(zone, key, 4, 1000, &wait);
-    NXT_TEST_CHECK(thr->log, !allow && wait == 500, "wait: empty %uL", wait);
+    allow = nxt_limit_zone_check(zone, key, 4, 1000000, &wait);
+    NXT_TEST_CHECK(thr->log, !allow && wait == 500000, "wait: empty %uL",
+                   wait);
 
-    /* 100 ms later 200 milli-tokens are in: 800 to go. */
+    /* 100 ms later 200000 micro-tokens are in: 800000 to go. */
 
-    allow = nxt_limit_zone_check(zone, key, 4, 1100, &wait);
-    NXT_TEST_CHECK(thr->log, !allow && wait == 400, "wait: 100 ms %uL", wait);
+    allow = nxt_limit_zone_check(zone, key, 4, 1100000, &wait);
+    NXT_TEST_CHECK(thr->log, !allow && wait == 400000, "wait: 100 ms %uL",
+                   wait);
 
-    allow = nxt_limit_zone_check(zone, key, 4, 1500, &wait);
+    allow = nxt_limit_zone_check(zone, key, 4, 1500000, &wait);
     NXT_TEST_CHECK(thr->log, allow && wait == 0, "wait: refilled");
 
     /* The estimate without the pointer is simply not given. */
 
-    allow = nxt_limit_zone_check(zone, key, 4, 1500, NULL);
+    allow = nxt_limit_zone_check(zone, key, 4, 1500000, NULL);
     NXT_TEST_CHECK(thr->log, !allow, "wait: no pointer");
 
     nxt_mp_destroy(mp);
