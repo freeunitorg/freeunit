@@ -73,6 +73,7 @@ nxt_int_t nxt_h1proto_conn_test(nxt_thread_t *thr);
 nxt_int_t nxt_h1proto_fields_test(nxt_thread_t *thr);
 nxt_int_t nxt_http_chunk_parse_test(nxt_thread_t *thr);
 nxt_int_t nxt_http_validate_host_test(nxt_thread_t *thr);
+nxt_int_t nxt_proxy_protocol_test(nxt_thread_t *thr);
 nxt_int_t nxt_http_request_body_alloc_test(nxt_thread_t *thr);
 nxt_int_t nxt_http_comp_select_test(nxt_thread_t *thr);
 nxt_int_t nxt_conf_json_depth_test(nxt_thread_t *thr);
