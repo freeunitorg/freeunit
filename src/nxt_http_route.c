@@ -37,6 +37,8 @@ typedef enum {
     NXT_HTTP_ROUTE_PATTERN_NOCASE = 0,
     NXT_HTTP_ROUTE_PATTERN_LOWCASE,
     NXT_HTTP_ROUTE_PATTERN_UPCASE,
+    /* LOWCASE, with non-ASCII labels in punycode: the Host header form. */
+    NXT_HTTP_ROUTE_PATTERN_HOST,
 } nxt_http_route_pattern_case_t;
 
 
@@ -499,9 +501,14 @@ nxt_http_route_match_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
          * case-insensitive, and there is no per-rule sensitivity
          * flag — an admin expecting case-sensitive host filtering
          * will not get it from this rule.
+         *
+         * A Unicode (IDN) pattern is converted to punycode here, once,
+         * so that it matches the "xn--" form a client sends and the
+         * request path stays a byte compare against the lowercased
+         * Host, see nxt_http_validate_host().
          */
         rule = nxt_http_route_rule_create(task, mp, mtcf.host, 1,
-                                          NXT_HTTP_ROUTE_PATTERN_LOWCASE,
+                                          NXT_HTTP_ROUTE_PATTERN_HOST,
                                           NXT_HTTP_URI_ENCODING_NONE);
         if (rule == NULL) {
             return NULL;
@@ -993,6 +1000,7 @@ nxt_http_route_pattern_create(nxt_task_t *task, nxt_mp_t *mp,
     u_char                          c, *p, *end;
     nxt_str_t                       test, tmp;
     nxt_int_t                       ret;
+    const char                      *error;
     nxt_array_t                     *slices;
 #if (NXT_HAVE_REGEX)
     nxt_regex_t                     *re;
@@ -1055,6 +1063,27 @@ nxt_http_route_pattern_create(nxt_task_t *task, nxt_mp_t *mp,
 #else
         return NXT_ERROR;
 #endif
+    }
+
+    /*
+     * The control API refuses a pattern that cannot be converted.  A
+     * restored configuration can still hold one, and the validator keeps
+     * it, see nxt_conf_vldt_match_pattern().  It is used as written, with
+     * the byte compare of earlier versions.
+     */
+    if (pattern_case == NXT_HTTP_ROUTE_PATTERN_HOST) {
+        ret = nxt_punycode_host(mp, &test, &error);
+
+        if (nxt_slow_path(ret == NXT_ERROR)) {
+            nxt_alert(task, "host pattern \"%V\": %s", &test, error);
+            return NXT_ERROR;
+        }
+
+        if (nxt_slow_path(ret == NXT_DECLINED)) {
+            nxt_log(task, NXT_LOG_WARN, "the \"host\" pattern \"%V\" "
+                    "cannot be converted to punycode: %s.  It is compared "
+                    "as written", &test, error);
+        }
     }
 
     slices = nxt_array_create(mp, 1, sizeof(nxt_http_route_pattern_slice_t));
@@ -1284,6 +1313,7 @@ nxt_http_route_pattern_slice(nxt_array_t *slices,
         break;
 
     case NXT_HTTP_ROUTE_PATTERN_LOWCASE:
+    case NXT_HTTP_ROUTE_PATTERN_HOST:
         nxt_memcpy_lowcase(start, test->start, test->length);
         break;
 

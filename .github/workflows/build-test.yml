@@ -1194,9 +1194,10 @@ jobs:
       # test_settings_size_negative_stored,
       # test_access_log_credential_header_stored,
       # test_compressors_level_stored, test_compressors_missing_stored,
-      # test_response_headers_name_reserved_stored and
-      # test_response_headers_name_reserved_stored_null start unitd on a
-      # stored configuration.
+      # test_response_headers_name_reserved_stored,
+      # test_response_headers_name_reserved_stored_null and
+      # test_routes_match_host_idn_stored start unitd on a stored
+      # configuration.
       # All need --restart, which the run above does not pass, so they skip
       # there.  Run them again, off the default base port: no other step runs
       # a requires_restart test with --port.
@@ -1219,6 +1220,7 @@ jobs:
             test/test_conf_compressors_object.py::test_compressors_missing_stored \
             test/test_response_headers.py::test_response_headers_name_reserved_stored \
             test/test_response_headers.py::test_response_headers_name_reserved_stored_null \
+            test/test_routing.py::test_routes_match_host_idn_stored \
             test/test_tls.py::test_tls_certificate_update_restart
         if: ${{ !cancelled() && steps.metadata.outputs.module == 'python' }}
 
