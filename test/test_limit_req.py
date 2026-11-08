@@ -911,3 +911,37 @@ def test_limit_req_status_line():
     _, (first, raw) = quick(run, 1, setup)
     assert first == 200
     assert raw.startswith('HTTP/1.1 429 Too Many Requests\r\n'), raw
+
+
+def test_limit_req_headers_stage_fallback():
+    # The headers stage stops at an action that is not a route: a
+    # "headers" limit in a "fallback" counts the request after its body,
+    # so a request without its body waits instead of getting a 429.
+    def setup(attempt):
+        load(
+            [
+                {
+                    'action': {
+                        'share': '/nonexistent',
+                        'fallback': {
+                            'limit_req': limit(zone=zone(attempt)),
+                            'return': 200,
+                        },
+                    }
+                }
+            ]
+        )
+
+    def run(attempt):
+        first = client.get()['status']
+
+        sock = client.http(PARTIAL_POST, raw=True, no_recv=True)
+        data = client.recvall(sock, read_timeout=0.5)
+        sock.close()
+
+        return first, data
+
+    attempt, (first, data) = quick(run, 1, setup)
+    assert first == 200
+    assert data == b''
+    assert counters(zone(attempt))['passed'] == 1
