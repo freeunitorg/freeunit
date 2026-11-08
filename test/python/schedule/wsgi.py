@@ -23,8 +23,16 @@ def record(event, environ, **extra):
     }
     rec.update(extra)
 
-    with open(os.environ['SCHEDULE_LOG'], 'a', encoding='utf-8') as f:
-        f.write(json.dumps(rec) + '\n')
+    # One write() on an O_APPEND descriptor: the records of two processes
+    # do not mix, and a reader sees a record end only once it is complete.
+    data = (json.dumps(rec) + '\n').encode()
+    fd = os.open(os.environ['SCHEDULE_LOG'],
+                 os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+
+    try:
+        assert os.write(fd, data) == len(data)
+    finally:
+        os.close(fd)
 
 
 def application(environ, start_response):

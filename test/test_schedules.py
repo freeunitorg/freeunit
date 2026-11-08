@@ -259,6 +259,14 @@ def wait_for_no_schedules(timeout):
     pytest.fail(f'the schedules stay in /status: {status_schedules()}')
 
 
+def test_schedules_jsonl_partial_record(tmp_path):
+    # The test reads the log while a worker can still write a record.
+    path = tmp_path / 'schedule.log'
+    path.write_bytes(b'{"event": "start", "uri": "/a"}\n{"event": "sta')
+
+    assert jsonl_records(str(path)) == [{'event': 'start', 'uri': '/a'}]
+
+
 def test_schedules_run_fires():
     uri = '/cron/SECRET_KEY?x=1'
     begin = time.time()

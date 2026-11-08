@@ -59,11 +59,26 @@ def waitforglob(pattern, count=1, timeout=50):
 
 
 def jsonl_records(path, event=None, uri=None):
+    """The records of a JSON Lines file that test applications append to.
+
+    A read() of a file can see a part of a write() that another process
+    makes at the same time.  So only the lines that end with "\n" are
+    complete: a last line without it is a record still being written, and
+    the next call reads it.  A complete line that is not JSON is an error
+    of the writer, and fails the test.
+    """
     try:
-        with open(path, encoding='utf-8') as f:
-            recs = [json.loads(line) for line in f if line.strip()]
+        with open(path, 'rb') as f:
+            data = f.read()
     except FileNotFoundError:
         return []
+
+    # The last part is b'' after a complete record, or a part of a record.
+    recs = [
+        json.loads(line.decode('utf-8'))
+        for line in data.split(b'\n')[:-1]
+        if line.strip()
+    ]
 
     return [
         r
