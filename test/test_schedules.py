@@ -1,5 +1,6 @@
 """The top-level "schedules" object (docs/adr/0004-schedules.md)."""
 
+import contextlib
 import os
 import re
 import shutil
@@ -247,6 +248,18 @@ def wait_for_runs(name, n, timeout):
     return wait_for_status(name, lambda s: s['runs'] >= n, timeout)
 
 
+def wait_for_log(pattern, n, timeout):
+    end = time.monotonic() + timeout
+
+    while len(found := Log.findall(pattern)) < n:
+        if time.monotonic() >= end:
+            break
+
+        time.sleep(0.1)
+
+    return found
+
+
 def wait_for_no_schedules(timeout):
     end = time.monotonic() + timeout
 
@@ -358,8 +371,10 @@ def test_schedules_run_on_start_jitter():
     put_run({f'c{i}': run(interval=20, jitter=10, run_on_start=True)['cron']
              for i in range(5)})
 
+    # The router logs the delays before it answers the PUT; the wait is
+    # only so that the test does not depend on that order.
     delays = [int(d) for d in
-              Log.findall(r'schedule "c\d": first run in (\d+) ms')]
+              wait_for_log(r'schedule "c\d": first run in (\d+) ms', 5, 5)]
 
     assert len(delays) == 5, delays
     assert all(1000 <= d <= 11000 for d in delays), delays
@@ -370,12 +385,19 @@ def test_schedules_run_on_start_jitter():
 def test_schedules_run_jitter_bounds():
     put_run(run(interval=1, jitter=1))
 
-    starts = wait_for_starts(7, 25)
-    g = gaps(starts[1:])
+    # From the second run: the first one can wait for the application.
+    starts = wait_for_starts(10, 40)[1:]
+    g = gaps(starts)
 
-    assert all(0.7 < gap < 2.7 for gap in g), g
-    # Without jitter every gap is about 1 s.  With it, all five at or below
-    # 1.2 s has a chance of 0.2^5.
+    # Each wait is 1 s plus 0 to 1 s, and the timer can fire 50 ms early.
+    # A start that is late makes one gap longer and the next one shorter,
+    # so no bound is set on one gap.  The mean of the gaps changes only by
+    # the lateness of the first and the last start, divided by 8.
+    mean = (starts[-1]['time'] - starts[0]['time']) / len(g)
+    assert 0.9 < mean < 2.25, g
+
+    # Without jitter every gap is about 1 s.  With it, all eight at or below
+    # 1.2 s has a chance of 0.2^8.  A late start only makes a gap longer.
     assert max(g) > 1.2, g
 
 
@@ -582,16 +604,38 @@ def test_schedules_run_reconfigure_interval_running():
     assert len(Log.findall(r'schedule "cron": first run in')) == 1
 
 
+@contextlib.contextmanager
+def held_runs():
+    # A run with "?wait=<path>" waits until the test creates <path>.  The
+    # file is also created when the test fails, so that the worker ends
+    # before the teardown looks for it.
+    release = f'{option.temp_dir}/release'
+
+    try:
+        yield release
+
+    finally:
+        release_runs(release)
+
+
+def release_runs(release):
+    open(release, 'a').close()
+
+
 def test_schedules_run_remove():
-    put_run(run(uri="/?sleep=2", timeout=10))
-    wait_for_starts(1, 5)
-    put_run({})
+    # The run is held, so the removal finds it in progress, also when a PUT
+    # is slow.
+    with held_runs() as release:
+        put_run(run(uri=f'/?wait={release}', timeout=120))
+        wait_for_starts(1, 5)
+        put_run({})
 
-    # The run in flight completes and is reported; nothing starts after.
-    assert Log.findall(r'schedule "cron": removed, the run in progress')
-    assert status_schedules()['cron']['running'] == 1
+        # The run in flight completes and is reported; nothing starts after.
+        assert Log.wait_for_record(r'"cron": removed, the run in progress')
+        assert status_schedules()['cron']['running'] == 1
 
-    waitforrecords(run_log(), 1, 5, 'end')
+        release_runs(release)
+        waitforrecords(run_log(), 1, 10, 'end')
 
     # With no "schedules" the key is left out, not emptied.
     wait_for_no_schedules(5)

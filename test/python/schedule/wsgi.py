@@ -35,6 +35,14 @@ def record(event, environ, **extra):
         os.close(fd)
 
 
+def wait_for(path):
+    # ?wait=<path>: the run is held until the test creates <path>.
+    end = time.monotonic() + 120
+
+    while not os.path.exists(path) and time.monotonic() < end:
+        time.sleep(0.05)
+
+
 def application(environ, start_response):
     args = parse_qs(environ.get('QUERY_STRING', ''))
 
@@ -46,6 +54,11 @@ def application(environ, start_response):
     if hang is not None and not os.path.exists(hang):
         open(hang, 'w').close()
         time.sleep(3600)
+
+    wait = args.get('wait', [None])[0]
+
+    if wait is not None:
+        wait_for(wait)
 
     time.sleep(float(args.get('sleep', ['0'])[0]))
 
