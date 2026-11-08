@@ -145,6 +145,17 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        503. The Ruby, Java, Go and WebAssembly modules already refused such
        a name.
 
+    *) Bugfix: a route regular expression was matched against a request with
+       a fresh PCRE2 match context built for that request, and from PCRE2
+       10.41 the backtracking frames of the match, up to the 16 MB heap
+       limit, were taken from the request's memory pool, which never frees
+       memory, so a crafted request held them until the request ended. One
+       bounded match object now serves each router thread and reuses its
+       frame memory across requests, so the frames are bounded per thread
+       instead of per request and are not kept in the request pool. A
+       pattern that reaches a match limit is now logged once, so a flood of
+       crafted requests cannot flood the log.
+
     *) Feature: Docker images for Python 3.15.
 
 

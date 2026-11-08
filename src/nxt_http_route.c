@@ -2178,6 +2178,29 @@ nxt_http_route_test_rule(nxt_http_request_t *r, nxt_http_route_rule_t *rule,
 }
 
 
+#if (NXT_TESTS && NXT_HAVE_REGEX)
+
+/*
+ * src/test/nxt_regex_test.c matches a route regex as a request does: with
+ * the match object of the router thread, through nxt_http_route_pattern().
+ */
+
+nxt_int_t
+nxt_http_route_test_regex(nxt_http_request_t *r, nxt_regex_t *re,
+    u_char *start, size_t length)
+{
+    nxt_http_route_pattern_t  pattern;
+
+    nxt_memzero(&pattern, sizeof(nxt_http_route_pattern_t));
+    pattern.regex = 1;
+    pattern.u.regex = re;
+
+    return nxt_http_route_pattern(r, &pattern, start, length);
+}
+
+#endif
+
+
 static nxt_int_t
 nxt_http_route_pattern(nxt_http_request_t *r, nxt_http_route_pattern_t *pattern,
     u_char *start, size_t length)
@@ -2190,24 +2213,39 @@ nxt_http_route_pattern(nxt_http_request_t *r, nxt_http_route_pattern_t *pattern,
 
 #if (NXT_HAVE_REGEX)
     if (pattern->regex) {
-        if (r->regex_match == NULL) {
+        nxt_thread_t        *thr;
+        nxt_event_engine_t  *engine;
+
+        /*
+         * The request is matched on its router thread, but r->engine is not
+         * set until the request reaches an application, after routing.  The
+         * match object lives on the engine of the thread that runs the match.
+         */
+        thr = nxt_thread();
+        engine = thr->engine;
+
+        if (engine->regex_match == NULL) {
             /*
-             * One match object serves every pattern tested against this
-             * request.  Its match data holds the minimum ovector: one
-             * offset pair, the overall match.  The matcher does not read
-             * captures.  pcre2_match_data_create() treats an ovecsize of 0
-             * as 1 (pcre2_match_data_create(3)); 1 is passed to make the
-             * minimum explicit.  With PCRE1 the size counts ints, not
-             * pairs; pcre_exec() then returns 0 on a match, and
+             * One match object serves every route pattern tested on this
+             * router thread, across requests: the thread matches one subject
+             * at a time, and nxt_regex_match() resets the per-match state.
+             * It is held on the engine and freed with the engine pool, so a
+             * request allocates no match context.  Its match data holds the
+             * minimum ovector: one offset pair, the overall match.  The
+             * matcher does not read captures.  pcre2_match_data_create()
+             * treats an ovecsize of 0 as 1 (pcre2_match_data_create(3)); 1 is
+             * passed to make the minimum explicit.  With PCRE1 the size counts
+             * ints, not pairs; pcre_exec() then returns 0 on a match, and
              * nxt_regex_match() counts 0 as a match.
              */
-            r->regex_match = nxt_regex_match_create(r->mem_pool, 1);
-            if (nxt_slow_path(r->regex_match == NULL)) {
+            engine->regex_match = nxt_regex_match_create(engine->mem_pool, 1);
+            if (nxt_slow_path(engine->regex_match == NULL)) {
                 return NXT_ERROR;
             }
         }
 
-        return nxt_regex_match(pattern->u.regex, start, length, r->regex_match);
+        return nxt_regex_match(pattern->u.regex, start, length,
+                               engine->regex_match);
     }
 #endif
 
