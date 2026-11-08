@@ -4193,7 +4193,7 @@ nxt_conf_vldt_limit_req_total(nxt_conf_validation_t *vldt)
 {
     int64_t                     keys;
     nxt_int_t                   ret;
-    nxt_uint_t                  i;
+    nxt_uint_t                  i, n;
     nxt_array_t                 *zones;
     nxt_conf_vldt_limit_zone_t  *z;
 
@@ -4209,16 +4209,18 @@ nxt_conf_vldt_limit_req_total(nxt_conf_validation_t *vldt)
         return ret;
     }
 
-    if (zones->nelts > NXT_HTTP_LIMIT_REQ_ZONES_MAX) {
+    n = zones->nelts;
+
+    if (n > NXT_HTTP_LIMIT_REQ_ZONES_MAX) {
         return nxt_conf_vldt_error(vldt, "The configuration has %ui "
                                    "\"limit_req\" zones, more than %d.",
-                                   zones->nelts, NXT_HTTP_LIMIT_REQ_ZONES_MAX);
+                                   n, NXT_HTTP_LIMIT_REQ_ZONES_MAX);
     }
 
     keys = 0;
     z = zones->elts;
 
-    for (i = 0; i < zones->nelts; i++) {
+    for (i = 0; i < n; i++) {
         keys += z[i].keys_max;
     }
 
