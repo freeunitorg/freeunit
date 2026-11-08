@@ -3590,6 +3590,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 
             } else {
                 targets = NULL;
+                n = 0;
             }
 
             nxt_debug(task, "application type: %V", &apcf.type);
@@ -3631,6 +3632,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             app->idle_timeout = apcf.idle_timeout;
 
             app->targets = targets;
+            app->targets_count = n;
 
             engine = task->thread->engine;
 
@@ -4483,11 +4485,10 @@ typedef struct {
 
 
 nxt_int_t
-nxt_router_application_init(nxt_router_conf_t *rtcf, nxt_str_t *name,
-    nxt_str_t *target, nxt_http_action_t *action)
+nxt_router_application_init(nxt_router_conf_t *rtcf, nxt_mp_t *mp,
+    nxt_str_t *name, nxt_str_t *target, nxt_http_action_t *action)
 {
     nxt_app_t            *app;
-    nxt_str_t            *targets;
     nxt_uint_t           i;
     nxt_http_app_conf_t  *conf;
 
@@ -4496,26 +4497,42 @@ nxt_router_application_init(nxt_router_conf_t *rtcf, nxt_str_t *name,
         return NXT_DECLINED;
     }
 
-    conf = nxt_mp_get(rtcf->mem_pool, sizeof(nxt_http_app_conf_t));
+    /*
+     * Look the target up before anything is allocated or set, so a target
+     * that the application does not have leaves the action as it was.
+     */
+
+    i = 0;
+
+    if (target != NULL && target->length != 0) {
+        while (i < app->targets_count
+               && !nxt_strstr_eq(target, &app->targets[i]))
+        {
+            i++;
+        }
+
+        if (i == app->targets_count) {
+            return NXT_DECLINED;
+        }
+    }
+
+    /*
+     * The pool lives as long as the action: the configuration pool for a
+     * constant "pass", the request pool for a "pass" with variables.  The
+     * configuration pool belongs to the thread that loads the configuration,
+     * so a request thread must not allocate from it.
+     */
+
+    conf = nxt_mp_get(mp, sizeof(nxt_http_app_conf_t));
     if (nxt_slow_path(conf == NULL)) {
         return NXT_ERROR;
     }
 
+    conf->app = app;
+    conf->target = i;
+
     action->handler = nxt_http_application_handler;
     action->u.conf = conf;
-
-    conf->app = app;
-
-    if (target != NULL && target->length != 0) {
-        targets = app->targets;
-
-        for (i = 0; !nxt_strstr_eq(target, &targets[i]); i++);
-
-        conf->target = i;
-
-    } else {
-        conf->target = 0;
-    }
 
     return NXT_OK;
 }
