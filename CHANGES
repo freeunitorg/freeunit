@@ -15,7 +15,8 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        world-writable /tmp. The tools now trust only a "unit: main" owned by
        the superuser or by the user running them, and unitc reads and
        creates its /tmp cache only as a regular file it owns, refusing a
-       symlink.
+       symlink. unitctl applies the same owner rule when it discovers a
+       running unitd.
 
     *) Security: when a "rewrite" action changed a proxied request's URI,
        the router sent the rewritten target to the upstream without
