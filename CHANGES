@@ -17,6 +17,14 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        creates its /tmp cache only as a regular file it owns, refusing a
        symlink.
 
+    *) Security: when a "rewrite" action changed a proxied request's URI,
+       the router sent the rewritten target to the upstream without
+       re-encoding it. A rewrite that interpolated the decoded request path
+       (for example "$uri") could place a raw CR, LF or space into the
+       target, injecting a header into -- or smuggling a request to -- the
+       upstream. The router now percent-encodes the rewritten target by its
+       actual content before it builds the upstream request line.
+
     *) Bugfix: when the router got no shared memory for a WebSocket frame
        from the client, because it could not create a new segment, or could
        not hand the frame to the application, it closed the connection

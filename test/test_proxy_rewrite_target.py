@@ -1,0 +1,101 @@
+import os
+import socket
+import time
+
+import pytest
+
+from conftest import run_process
+from unit.applications.proto import ApplicationProto
+from unit.option import option
+from unit.utils import waitforsocket
+from unit import port as port_map
+
+client = ApplicationProto()
+UPSTREAM_PORT = port_map.port(7999)
+
+
+# A raw upstream that records the exact request head Unit forwards, so the test
+# can check what the proxy actually put on the wire.
+def capture_upstream(server_port, out_file):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(('', server_port))
+    sock.listen(5)
+
+    resp = b'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'
+
+    while True:
+        conn, _ = sock.accept()
+
+        data = b''
+        while b'\r\n\r\n' not in data:
+            part = conn.recv(4096)
+            if not part:
+                break
+            data += part
+
+        with open(out_file, 'wb') as f:
+            f.write(data)
+
+        conn.sendall(resp)
+        conn.close()
+
+
+def upstream_file():
+    return f'{option.temp_dir}/proxy_target_req'
+
+
+@pytest.fixture(autouse=True)
+def setup_method_fixture():
+    out_file = upstream_file()
+
+    if os.path.exists(out_file):
+        os.unlink(out_file)
+
+    run_process(capture_upstream, UPSTREAM_PORT, out_file)
+    waitforsocket(UPSTREAM_PORT)
+
+    # A rewrite re-parses its result, so "$uri" turns the decoded request path
+    # back into the proxied target; the second route then proxies it upstream.
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "routes/rewrite"}},
+            "routes": {
+                "rewrite": [
+                    {"action": {"rewrite": "$uri", "pass": "routes/proxy"}}
+                ],
+                "proxy": [
+                    {"action": {"proxy": f"http://127.0.0.1:{UPSTREAM_PORT}"}}
+                ],
+            },
+        }
+    ), 'proxy rewrite configuration'
+
+
+def test_proxy_rewrite_target_crlf():
+    # The request path carries a percent-encoded CR/LF.  The main parser decodes
+    # it into a raw CR/LF in r->path (quoted); the rewrite then re-parses "$uri"
+    # and the raw bytes leave quoted_target unset.  The proxied upstream request
+    # line must carry them percent-encoded, not raw -- a raw CR/LF would inject a
+    # header into, or smuggle a request to, the upstream.
+    client.get(
+        url='/x%0D%0AInjected:%20smuggled',
+        headers={'Host': 'localhost', 'Connection': 'close'},
+    )
+
+    out_file = upstream_file()
+
+    for _ in range(50):
+        if os.path.exists(out_file):
+            break
+        time.sleep(0.1)
+
+    assert os.path.exists(out_file), 'upstream received the proxied request'
+
+    with open(out_file, 'rb') as f:
+        sent = f.read()
+
+    # No raw CR/LF injection: the "Injected" marker must not begin a new line.
+    assert b'\r\nInjected' not in sent, 'no raw CRLF injected upstream'
+    # The rewritten target reached the upstream percent-encoded instead.
+    assert b'%0D%0AInjected' in sent, 'rewritten target is re-encoded'
