@@ -162,6 +162,17 @@ Changes with FreeUnit 1.37.2                                     31 Oct 2026
        (measured on an 8-vCPU VM); it uses more CPU at startup, and the
        module is about 150 KB larger.
 
+    *) Change: the prototype and discovery processes now accept NEW_PORT and
+       REMOVE_PID only from the main process, as the main process does for
+       these two types on its main port. An application worker inherits the
+       port of the prototype that forked it, so it could write to that port
+       and forge either type to corrupt the process records the prototype
+       keeps; the discovery port is announced only to the main process, so
+       gating it is defense in depth. A message of either type is now
+       dropped, and the descriptors it carries are closed, unless its sender
+       -- validated by SCM_CREDENTIALS where the platform provides it,
+       otherwise the pid in the message header -- is the main process.
+
     *) Bugfix: an application response with status 206 was compressed while
        it kept its Content-Range, which counts the bytes of the uncompressed
        body. Unit no longer compresses a 206, as in nginx; a client that
