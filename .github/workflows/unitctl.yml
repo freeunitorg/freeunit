@@ -33,8 +33,11 @@ on:
         description: "Semver tag"
         required: true
 
+# Default every job to read-only.  Only the release job writes to the
+# repository, and it raises its own permission below; a fork pull_request
+# build therefore never gets a write-scoped token.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   # Cancel superseded runs for the same pull request.  Non-PR events fall back
@@ -305,6 +308,12 @@ jobs:
     needs: [build]
     runs-on: ubuntu-26.04
     timeout-minutes: 15
+    # The only job that writes to the repository: it creates a GitHub release
+    # (and its tag) via the GITHUB_TOKEN.  Artifact upload/download and the
+    # Rust cache used elsewhere go through the Actions runtime token, not this
+    # one, so no other job needs write.
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v8
         with:
