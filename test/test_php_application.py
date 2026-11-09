@@ -164,7 +164,7 @@ def test_php_application_query_string():
         resp['headers']['Query-String'] == 'var1=val1&var2=val2'
     ), 'query string'
     assert resp['headers']['Request-Uri'] == '/?var1=val1&var2=val2'
-    assert resp['headers']['Unit-Rewritten-Path'] == '/'
+    assert resp['headers']['Unit-Rewritten-Path'] == ''
 
 
 def test_php_application_query_string_empty():
@@ -175,7 +175,7 @@ def test_php_application_query_string_empty():
     assert resp['status'] == 200, 'query string empty status'
     assert resp['headers']['Query-String'] == '', 'query string empty'
     assert resp['headers']['Request-Uri'] == '/?'
-    assert resp['headers']['Unit-Rewritten-Path'] == '/'
+    assert resp['headers']['Unit-Rewritten-Path'] == ''
 
 
 def test_php_application_query_string_rewrite():
@@ -215,21 +215,15 @@ def test_php_application_query_string_rewrite():
 
 
 @pytest.mark.parametrize(
-    'url, path, query',
+    'url',
     [
-        ('/', '/', ''),
-        ('/?', '/', ''),
-        ('/a%20b?x=1', '/a b', 'x=1'),
-        ('/%6Eew', '/new', ''),
-        ('/a/b/../c', '/a/c', ''),
-        ('/a/%2e%2e/c', '/c', ''),
-        ('//a//b/./c', '/a/b/c', ''),
-        ('/a%2Fb', '/a/b', ''),
-        ('/a%3Fb%23c?x=%2F', '/a?b#c', 'x=%2F'),
-        ('/%E4%B8%AD', '/\u4e2d', ''),
+        '/',
+        '/?x=1',
+        '/index.php',
+        '/index.php/info?a=1',
     ],
 )
-def test_php_application_rewritten_path_no_rewrite(url, path, query):
+def test_php_application_rewritten_path_verbatim(url):
     client.load('rewritten_path')
     assert 'success' in client.conf(
         '"index.php"', 'applications/rewritten_path/script',
@@ -238,13 +232,40 @@ def test_php_application_rewritten_path_no_rewrite(url, path, query):
     resp = client.getjson(url=url)
     assert resp['status'] == 200
     data = resp['body']
+
+    # The target already equals its decoded, normalized path and was not
+    # rewritten, so no UNIT_REWRITTEN_PATH is registered.
+    assert data['present'] is False
+    assert data['path'] is None
+    assert data['request_uri'] == url
+
+
+@pytest.mark.parametrize(
+    'url, path',
+    [
+        ('/a%20b?x=1', '/a b'),
+        ('/a/b/../c', '/a/c'),
+        ('/a/%2e%2e/c', '/c'),
+        ('//a//b/./c', '/a/b/c'),
+        ('/a%2Fb', '/a/b'),
+        ('/%E4%B8%AD', '/中'),
+    ],
+)
+def test_php_application_rewritten_path_normalized(url, path):
+    client.load('rewritten_path')
+    assert 'success' in client.conf(
+        '"index.php"', 'applications/rewritten_path/script',
+    )
+
+    resp = client.getjson(url=url)
+    assert resp['status'] == 200
+    data = resp['body']
+
+    # The decoded, normalized path differs from the verbatim target, so PHP
+    # sees that path in UNIT_REWRITTEN_PATH even without a route rewrite.
     assert data['present'] is True
     assert data['path'] == path
     assert data['request_uri'] == url
-    assert data['query'] == query
-    if data['filter_available']:
-        assert data['filter_path'] == path
-        assert data['filter_request_uri'] == url
 
 
 @pytest.mark.parametrize(
@@ -256,6 +277,10 @@ def test_php_application_rewritten_path_no_rewrite(url, path, query):
         ('/new$uri', '/old?x=1', '/new/old'),
         ('/new$uri', '/a%20b?x=1', '/new/a b'),
         ('/old', '/old?x=1', '/old'),
+        # The rewritten path is decoded and normalized like any request path.
+        ('/a%20b', '/old?x=1', '/a b'),
+        ('/a/b/../c', '/old?x=1', '/a/c'),
+        ('//x//y', '/old?x=1', '/x/y'),
     ],
 )
 def test_php_application_rewritten_path_rewrite(rewrite, url, path):
@@ -279,9 +304,6 @@ def test_php_application_rewritten_path_rewrite(rewrite, url, path):
     assert data['path'] == path
     assert data['request_uri'] == url
     assert data['query'] == 'x=1'
-    if data['filter_available']:
-        assert data['filter_path'] == path
-        assert data['filter_request_uri'] == url
 
 
 def test_php_application_rewritten_path_multiple_rewrites():
@@ -305,6 +327,7 @@ def test_php_application_rewritten_path_multiple_rewrites():
 
     resp = client.getjson(url='/old?x=1')
     assert resp['status'] == 200
+    assert resp['body']['present'] is True
     assert resp['body']['path'] == '/final/mid'
     assert resp['body']['request_uri'] == '/old?x=1'
     assert resp['body']['query'] == 'x=1'
@@ -312,27 +335,50 @@ def test_php_application_rewritten_path_multiple_rewrites():
 
 def test_php_application_rewritten_path_path_info():
     client.load('rewritten_path')
+    assert 'success' in client.conf(
+        [{'action': {
+            'rewrite': '/index.php/a%20b',
+            'pass': 'applications/rewritten_path',
+        }}],
+        'routes',
+    )
+    assert 'success' in client.conf('"routes"', 'listeners/*:8080/pass')
 
-    resp = client.getjson(url='/index.php/a%20b?x=1')
+    resp = client.getjson(url='/start?x=1')
     assert resp['status'] == 200
-    assert resp['body']['path'] == '/index.php/a b'
-    assert resp['body']['path_info'] == '/a b'
-    assert resp['body']['php_self'] == '/index.php/a b'
-    assert resp['body']['request_uri'] == '/index.php/a%20b?x=1'
+    data = resp['body']
+    assert data['present'] is True
+    assert data['path'] == '/index.php/a b'
+    assert data['path_info'] == '/a b'
+    assert data['php_self'] == '/index.php/a b'
+    assert data['request_uri'] == '/start?x=1'
 
 
 def test_php_application_rewritten_path_filter_input():
     client.load('rewritten_path')
+    assert 'success' in client.conf(
+        [{'action': {
+            'rewrite': '/index.php/a%20b',
+            'pass': 'applications/rewritten_path',
+        }}],
+        'routes',
+    )
+    assert 'success' in client.conf('"routes"', 'listeners/*:8080/pass')
 
-    resp = client.getjson(url='/index.php/a%20b?x=1')
+    resp = client.getjson(url='/start?x=1')
     assert resp['status'] == 200
     data = resp['body']
     if not data['filter_available']:
         pytest.skip('filter extension is not loaded')
 
+    # UNIT_REWRITTEN_PATH is registered like SCRIPT_NAME and DOCUMENT_ROOT,
+    # with its interned key and without the INPUT_SERVER filter, so it is in
+    # $_SERVER but not reachable through filter_input(INPUT_SERVER, ...).
+    # REQUEST_URI still goes through the filter, so it stays reachable.
     assert data['present'] is True
-    assert data['filter_path'] == '/index.php/a b'
-    assert data['filter_request_uri'] == '/index.php/a%20b?x=1'
+    assert data['path'] == '/index.php/a b'
+    assert data['filter_path'] is None
+    assert data['filter_request_uri'] == '/start?x=1'
 
 
 def test_php_application_rewritten_path_worker_reuse():
@@ -354,7 +400,19 @@ def test_php_application_rewritten_path_worker_reuse():
     )
     assert 'success' in client.conf('"routes"', 'listeners/*:8080/pass')
 
-    for url, path in [('/old', '/new'), ('/a%20b', '/a b'), ('/old', '/new')]:
+    # The worker is reused across requests whose path is rewritten (/old),
+    # left verbatim (/plain) or only normalized (/a%20b).  A request must not
+    # inherit the previous one's value, and the client's own
+    # Unit-Rewritten-Path header only ever reaches PHP prefixed as
+    # HTTP_UNIT_REWRITTEN_PATH.
+    cases = [
+        ('/old', '/new'),
+        ('/plain', None),
+        ('/a%20b', '/a b'),
+        ('/old', '/new'),
+    ]
+
+    for url, path in cases:
         resp = client.getjson(
             url=url,
             headers={
@@ -365,12 +423,10 @@ def test_php_application_rewritten_path_worker_reuse():
         )
         assert resp['status'] == 200
         data = resp['body']
-        assert data['present'] is True
+        assert data['present'] is (path is not None)
         assert data['path'] == path
         assert data['request_uri'] == url
         assert data['http_path'] == '/spoofed'
-        if data['filter_available']:
-            assert data['filter_path'] == path
 
 
 def test_php_application_fastcgi_finish_request(findall, unit_pid):
@@ -520,7 +576,7 @@ def test_php_application_query_string_absent():
     assert resp['status'] == 200, 'query string absent status'
     assert resp['headers']['Query-String'] == '', 'query string absent'
     assert resp['headers']['Request-Uri'] == '/'
-    assert resp['headers']['Unit-Rewritten-Path'] == '/'
+    assert resp['headers']['Unit-Rewritten-Path'] == ''
 
 
 def test_php_application_phpinfo():
