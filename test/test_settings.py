@@ -1167,38 +1167,53 @@ def test_settings_send_min_rate_gap_longer_than_grace(search_in_file):
 def test_settings_send_min_rate_stream_slow_read(
     system, temp_dir, wait_for_record
 ):
-    # An application sends a stream in bursts, 1.5 s apart.  The client
-    # keeps the socket send buffer full.  Each 1.5 s it reads only one burst.
-    # Then the parts of the burst that wait can go out before send_timeout.
-    # Thus each write event empties the router write queue, and each send
-    # period stops there.  The router must check the rate at that point
-    # too.  Otherwise it never checks this client, and the client reads
-    # below the floor for as long as the stream lasts.
+    # An application sends a stream in bursts, 2 s apart.  The client keeps
+    # the socket send buffer full.  Each 2 s it reads only one burst.  Then
+    # the parts of the burst that wait can go out before send_timeout.  Thus
+    # each write event empties the router write queue, and each send period
+    # stops there.  The router must check the rate at that point too.
+    # Otherwise it never checks this client, and the client reads below the
+    # floor for as long as the stream lasts.
     #
     # The test uses a unix socket.  On Linux, the kernel takes a unix socket
-    # write of 32 KiB whole or not at all, and the send buffer has the fixed
-    # size net.core.wmem_default.  A write event comes when 3/4 of the
-    # buffer is free.  Thus a part that does not fit waits whole, and the
-    # next write event sends all the parts that wait.  No write sends only
-    # some of the queued data.
+    # write of 32 KiB whole or not at all.  A write event comes when 3/4 of
+    # the send buffer is free.  Thus a part that does not fit waits whole,
+    # and the next write event sends all the parts that wait.  No write
+    # sends only some of the queued data.
     if system != 'Linux':
         pytest.skip('Linux unix socket buffers only')
 
-    # A new unix socket gets this size, the router socket too.  A container
-    # can have no /proc/sys/net/core/wmem_default, so ask a socket.
-    pair = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-    wmem = pair[0].getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
-    pair[0].close()
-    pair[1].close()
-
-    # The first burst fills the send buffer, and 2 or 3 parts wait.  Each
-    # next burst is a little more than the space that a write event frees.
-    # The client reads one burst each time, so 2 or 3 parts wait in each
-    # cycle, for about 1 s.  With wmem_default 212992: 9, then 6 parts.
     part = 32768
-    first = wmem // part + 3
-    parts = wmem * 3 // 4 // part + 2
+
+    # Count the parts that a new unix socket takes before a write blocks.
+    # The router socket is new too, so it takes the same number.  The count
+    # depends on the kernel: it adds its own overhead to each part.  Thus
+    # count the parts, do not compute them from SO_SNDBUF.
+    pair = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    pair[0].setblocking(False)
+    fill = 0
+
+    try:
+        while fill < 1000:
+            pair[0].send(b'x' * part)
+            fill += 1
+
+    except BlockingIOError:
+        pass
+
+    finally:
+        pair[0].close()
+        pair[1].close()
+
+    assert 2 <= fill < 1000, 'send buffer parts'
+
+    # The first burst fills the send buffer, and 2 parts wait.  Each next
+    # burst is one full buffer.  The client reads one full buffer each time.
+    # Then 2 parts wait in each cycle, from the burst until the read.
+    first = fill + 2
+    parts = fill
     bursts = 5
+    interval = 2
     length = part * (first + parts * (bursts - 1))
 
     client.load('send_bursts')
@@ -1209,12 +1224,21 @@ def test_settings_send_min_rate_stream_slow_read(
         {f'unix:{addr}': {'application': 'send_bursts'}}, 'listeners'
     )
 
-    # The router measures about one burst for each 1 s of waiting.  The
-    # floor is four bursts each second.
-    min_rate_conf({'send_timeout': 2, 'send_min_rate': 4 * parts * part})
+    # The client reads 1.25 s after each burst.  Thus the parts wait about
+    # 1.2 s in each cycle.  The router adds the cycles until they reach the
+    # grace time, 3 s; this is after 3 cycles.  It then measures less than
+    # one burst for each second of waiting.  The floor is four bursts each
+    # second.
+    #
+    # The send_timeout gap timer starts when a part waits.  It closes the
+    # connection if the client reads 1.8 s later than the schedule.  That
+    # close writes no record, so the test fails.  Then the message shows
+    # the reads.
+    min_rate_conf({'send_timeout': 3, 'send_min_rate': 4 * parts * part})
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     start = time.monotonic()
+    reads = []
 
     def read(size):
         # Returns "size" bytes, or less if the connection closes.
@@ -1223,7 +1247,8 @@ def test_settings_send_min_rate_stream_slow_read(
         while len(data) < size:
             try:
                 chunk = sock.recv(min(65536, size - len(data)))
-            except OSError:
+            except OSError as e:
+                reads.append(f'error {e!r}')
                 break
 
             if not chunk:
@@ -1243,10 +1268,9 @@ def test_settings_send_min_rate_stream_slow_read(
             + f'X-Parts: {parts}\r\n'.encode()
             + f'X-Part-Size: {part}\r\n'.encode()
             + f'X-Bursts: {bursts}\r\n'.encode()
-            + b'X-Interval: 1.5\r\n'
-            b'Connection: close\r\n\r\n'
+            + f'X-Interval: {interval}\r\n'.encode()
+            + b'Connection: close\r\n\r\n'
         )
-        start = time.monotonic()
 
         head = b''
         while not head.endswith(b'\r\n\r\n'):
@@ -1256,28 +1280,45 @@ def test_settings_send_min_rate_stream_slow_read(
 
             head += byte
 
+        # The head is sent just before the first part.  The application
+        # starts its schedule just before it, so count the client schedule
+        # from here.
+        start = time.monotonic()
+
         assert head.startswith(b'HTTP/1.1 200'), 'stream status'
 
         total = 0
 
         for burst in range(bursts):
-            time.sleep(max(0, start + 1.5 * burst + 1 - time.monotonic()))
+            time.sleep(
+                max(0, start + interval * burst + 1.25 - time.monotonic())
+            )
 
             size = parts * part if burst < bursts - 1 else length - total
             got = len(read(size))
             total += got
 
+            reads.append(
+                f'{got} of {size} bytes at {time.monotonic() - start:.2f} s'
+            )
+
             if got < size:
                 break
 
-        assert total < length, 'slow stream reader stopped'
+        assert total < length, (
+            f'slow stream reader stopped: {fill} parts fill the buffer; '
+            f'reads: {"; ".join(reads)}'
+        )
 
         assert (
             wait_for_record(
                 r'client send rate is less than send_min_rate', wait=50
             )
             is not None
-        ), 'slow stream reader stopped by the floor'
+        ), (
+            f'slow stream reader stopped by the floor: {fill} parts fill '
+            f'the buffer; reads: {"; ".join(reads)}'
+        )
 
     finally:
         sock.close()
@@ -1285,7 +1326,9 @@ def test_settings_send_min_rate_stream_slow_read(
 
         # The application still runs its schedule.  Let it end before the
         # next test changes the configuration.
-        time.sleep(max(0, start + 7 - time.monotonic()))
+        time.sleep(
+            max(0, start + interval * (bursts - 1) + 0.5 - time.monotonic())
+        )
 
 
 def test_settings_min_rate_validation():
