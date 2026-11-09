@@ -656,6 +656,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_app_gate_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_port_change_file_test(thr) != NXT_OK) {
         return 1;
     }
