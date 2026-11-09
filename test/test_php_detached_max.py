@@ -12,6 +12,8 @@ prototype must never exceed "max".
 
 import os
 import signal
+import socket
+import struct
 import subprocess
 import threading
 import time
@@ -267,6 +269,62 @@ def test_php_detached_parked_request_times_out(wait_for_record):
     time.sleep(3)
     assert not os.path.exists(ran), (
         'the timed-out request executed after the worker freed up'
+    )
+
+    assert drain(), 'the detached work finished and the count cleared'
+
+
+def test_php_detached_parked_request_client_closes():
+    """A queued request whose client disconnects is retracted before a worker runs it."""
+
+    aborted = marker('client_closed_ran')
+    pipe1 = marker('client_pipe1_ran')
+    pipe2 = marker('client_pipe2_ran')
+    served = marker('client_served_ran')
+    short = 4
+
+    client.load(
+        'detached_worker',
+        processes={'max': 1, 'spare': 0, 'idle_timeout': IDLE_TIMEOUT},
+        limits={'timeout': 30},
+    )
+
+    assert client.get(url=f'/?sleep={short}')['status'] == 200
+
+    sock = client.get(url=f'/?ran={aborted}', start=True, no_recv=True)
+    time.sleep(0.2)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+    sock.close()
+
+    # A second request arriving on a keep-alive connection while the first is
+    # queued must not be treated as a disconnect or corrupt the read buffer.
+    pipe_sock = client.get(
+        url=f'/?ran={pipe1}',
+        headers={'Host': 'localhost', 'Connection': 'keep-alive'},
+        start=True,
+        no_recv=True,
+    )
+    time.sleep(0.2)
+    pipe_sock.sendall(
+        f'GET /?ran={pipe2} HTTP/1.1\r\n'
+        'Host: localhost\r\n'
+        'Connection: close\r\n\r\n'.encode()
+    )
+
+    resp = client.get(url=f'/?ran={served}', read_timeout=short + 15)
+    assert resp['status'] == 200, f'live request behind disconnected one failed: {resp}'
+
+    pipe_raw = client.recvall(pipe_sock, read_timeout=10).decode()
+    pipe_sock.close()
+
+    assert pipe_raw.count('HTTP/1.1 200 OK') == 2, (
+        f'expected two pipelined 200 responses, got: {pipe_raw!r}'
+    )
+    assert os.path.exists(pipe1), 'the first pipelined request executed'
+    assert os.path.exists(pipe2), 'the second pipelined request executed'
+    assert os.path.exists(served), 'the live request executed'
+    assert not os.path.exists(aborted), (
+        'the disconnected request executed after the worker freed up'
     )
 
     assert drain(), 'the detached work finished and the count cleared'

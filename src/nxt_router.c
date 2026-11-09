@@ -409,8 +409,12 @@ static void nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
     nxt_request_rpc_data_t *req_rpc_data);
 static void nxt_router_http_request_error(nxt_task_t *task, void *obj,
     void *data);
+static void nxt_router_http_request_error_handler(nxt_task_t *task, void *obj,
+    void *data);
 static void nxt_router_http_request_done(nxt_task_t *task, void *obj,
     void *data);
+static void nxt_router_http_request_unlink(nxt_task_t *task,
+    nxt_http_request_t *r);
 
 static void nxt_router_app_requeue_handler(nxt_task_t *task, void *obj,
     void *data);
@@ -7049,7 +7053,7 @@ nxt_router_req_headers_ack_handler(nxt_task_t *task,
 static const nxt_http_request_state_t  nxt_http_request_send_state
     nxt_aligned(64) =
 {
-    .error_handler = nxt_http_request_error_handler,
+    .error_handler = nxt_router_http_request_error_handler,
 };
 
 
@@ -9204,6 +9208,8 @@ nxt_router_process_http_request(nxt_task_t *task, nxt_http_request_t *r,
         r->last->completion_handler = nxt_router_http_request_done;
     }
 
+    r->state = &nxt_http_request_send_state;
+
     nxt_router_app_port_get(task, conf->app, req_rpc_data);
     nxt_router_app_prepare_request(task, req_rpc_data);
 }
@@ -9229,6 +9235,22 @@ nxt_router_http_request_error(nxt_task_t *task, void *obj, void *data)
 
 
 static void
+nxt_router_http_request_error_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_http_request_t  *r;
+
+    r = obj;
+
+    nxt_debug(task, "router http request error handler (rpc_data %p)",
+              r->req_rpc_data);
+
+    nxt_router_http_request_unlink(task, r);
+
+    nxt_http_request_error_handler(task, r, data);
+}
+
+
+static void
 nxt_router_http_request_done(nxt_task_t *task, void *obj, void *data)
 {
     nxt_http_request_t  *r;
@@ -9237,11 +9259,35 @@ nxt_router_http_request_done(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "router http request done (rpc_data %p)", r->req_rpc_data);
 
-    if (r->req_rpc_data != NULL) {
-        nxt_request_rpc_data_unlink(task, r->req_rpc_data);
-    }
+    nxt_router_http_request_unlink(task, r);
 
     nxt_http_request_close_handler(task, r, r->proto.any);
+}
+
+
+static void
+nxt_router_http_request_unlink(nxt_task_t *task, nxt_http_request_t *r)
+{
+    nxt_request_rpc_data_t  *req_rpc_data;
+
+    req_rpc_data = r->req_rpc_data;
+
+    if (req_rpc_data == NULL) {
+        return;
+    }
+
+    if (req_rpc_data->app_port != NULL
+        && req_rpc_data->app_port->id != NXT_SHARED_PORT_ID
+        && req_rpc_data->apr_action == NXT_APR_REQUEST_FAILED
+        && r->state != &nxt_http_websocket)
+    {
+        nxt_assert(req_rpc_data->app != NULL);
+
+        nxt_router_app_abandon(task, req_rpc_data->app, req_rpc_data,
+                               req_rpc_data->app_port);
+    }
+
+    nxt_request_rpc_data_unlink(task, req_rpc_data);
 }
 
 
