@@ -1881,6 +1881,7 @@ void
 nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
 {
     const char               *name;
+    const char               *rewritten_path;
 #if NXT_PHP8
     zval                     value;
     uint32_t                 size, nfields;
@@ -1990,17 +1991,24 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
                     track_vars_array TSRMLS_CC);
 
     /*
-     * Keep the parsed path available even without a rewrite.  Only bypass
-     * PHP's no-op filter: an extension's filter may populate INPUT_SERVER
-     * or change the value registered in $_SERVER.
+     * 'UNIT_REWRITTEN_PATH'
+     * The decoded, normalized request path, without the query.  The router
+     * points req->path at the same bytes as req->target when the verbatim
+     * target already is that path, and at a separate copy when the two differ
+     * -- after a route "rewrite" action replaced the path, or when the target
+     * was percent-encoded or carried redundant or dot path segments
+     * (src/nxt_router.c).  Comparing the two resolved pointers is that flag,
+     * without changing the shared nxt_unit_request_t: the common request whose
+     * target needs neither a rewrite nor normalization does no further
+     * $_SERVER work and the key stays absent.  Like SCRIPT_NAME and
+     * DOCUMENT_ROOT the value is registered with its interned key and without
+     * the INPUT_SERVER filter, which it does not need.
      */
-    if (sapi_module.input_filter == php_default_input_filter) {
-        nxt_php_set_cstr(req, NXT_PHP_UNIT_REWRITTEN_PATH,
-                         nxt_unit_sptr_get(&r->path), r->path_length,
-                         track_vars_array TSRMLS_CC);
 
-    } else {
-        nxt_php_set_sptr(req, NXT_PHP_UNIT_REWRITTEN_PATH, &r->path,
+    rewritten_path = nxt_unit_sptr_get(&r->path);
+
+    if (rewritten_path != (const char *) nxt_unit_sptr_get(&r->target)) {
+        nxt_php_set_cstr(req, NXT_PHP_UNIT_REWRITTEN_PATH, rewritten_path,
                          r->path_length, track_vars_array TSRMLS_CC);
     }
 
