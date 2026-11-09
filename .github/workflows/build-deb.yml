@@ -377,28 +377,35 @@ jobs:
           path: debs
 
       - name: Generate checksums and release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eux
           # SHA256SUMS lists every published .deb; users verify with
           # `sha256sum -c`. Paths are stored relative to debs/ so the
           # checksum file works next to the downloaded packages.
           ( cd debs && sha256sum -- *.deb > SHA256SUMS )
-          # The asset version (e.g. 1.35.5-1.trixie) is the .deb file
-          # name, which GitHub derives from the package version by
-          # replacing the '~' of "1.35.5-1~trixie" with a '.'.
+          # DEB is the package version from the .deb file name (e.g.
+          # 1.35.5-1~trixie). SHA256SUMS lists the files under this name.
+          # GitHub renames each uploaded asset and replaces the '~' with a
+          # '.', so the asset URLs use ASSET (e.g. 1.35.5-1.trixie). The
+          # instructions download each ASSET URL to the DEB file name, so
+          # `sha256sum -c` finds the files.
           core=(debs/"${BRAND}"_*_amd64.deb)
           DEB="$(basename "${core[0]}" \
             | sed -E "s#^${BRAND}_(.+)_amd64\.deb\$#\1#")"
+          ASSET="$(printf '%s\n' "$DEB" | tr '~' '.')"
           # @BRAND@/@RUNTIME@ keep the user-facing instructions in sync with the
           # package identity (mirrors $BRAND/$RUNTIME used everywhere else).
           sed -e "s/@TAG@/${GITHUB_REF_NAME}/g" -e "s/@DEB@/${DEB}/g" \
+              -e "s/@ASSET@/${ASSET}/g" -e "s#@REPO@#${GITHUB_REPOSITORY}#g" \
               -e "s/@BRAND@/${BRAND}/g" -e "s/@RUNTIME@/${RUNTIME}/g" \
-            > RELEASE_NOTES.md <<'NOTES'
+            > DEB_NOTES.md <<'NOTES'
           ## Debian trixie packages
 
           Binary `.deb` packages for FreeUnit on Debian **trixie**
           (amd64 only): install the core daemon plus exactly one language
-          module — the PHP embed SAPI allows only one PHP version per
+          module. The PHP embed SAPI allows only one PHP version per
           instance.
 
           ### 1. Enable deb.sury.org (PHP modules only)
@@ -412,7 +419,7 @@ jobs:
             ca-certificates curl gnupg lsb-release
           sudo curl -fsSL https://packages.sury.org/php/apt.gpg \
             -o /usr/share/keyrings/sury-php.gpg
-          sudo tee /etc/apt/sources.list.d/sury-php.sources >/dev/null <<'SURY'
+          sudo tee /etc/apt/sources.list.d/sury-php.sources >/dev/null <<SURY
           Types: deb
           URIs: https://packages.sury.org/php/
           Suites: $(lsb_release -sc)
@@ -430,13 +437,15 @@ jobs:
           ### 2. Download, verify checksums, install
 
           ```bash
-          DEB=@DEB@                 # version inside the .deb file names
+          DEB=@DEB@       # package version, as listed in SHA256SUMS
+          ASSET=@ASSET@     # the same version in the asset URLs (GitHub renames ~ to .)
           MOD=php8.4                # php8.3 | php8.4 | php8.5 | python3.13
-          BASE="https://github.com/${{ github.repository }}/releases/download/@TAG@"
+          BASE="https://github.com/@REPO@/releases/download/@TAG@"
 
           curl -fLO "$BASE/SHA256SUMS"
-          curl -fLO "$BASE/@BRAND@_${DEB}_amd64.deb"
-          curl -fLO "$BASE/@BRAND@-${MOD}_${DEB}_amd64.deb"
+          curl -fL -o "@BRAND@_${DEB}_amd64.deb" "$BASE/@BRAND@_${ASSET}_amd64.deb"
+          curl -fL -o "@BRAND@-${MOD}_${DEB}_amd64.deb" \
+            "$BASE/@BRAND@-${MOD}_${ASSET}_amd64.deb"
 
           sha256sum -c --ignore-missing SHA256SUMS
           sudo apt-get install -y \
@@ -458,6 +467,69 @@ jobs:
           authenticity. The installed package version is `X.Y.Z-1~trixie`
           (the `.` in the asset file name is GitHub's renaming of `~`).
           NOTES
+
+          # Keep the rest of the release body. The package section sits
+          # between two marker comments. A re-run replaces only the text
+          # between the markers. Without markers, the section is appended.
+          # A missing release or an empty body gives the section alone.
+          # Any other gh error stops the job, so the notes are never lost.
+          # The body is read into a variable, which drops the newline that
+          # gh adds, and CR bytes are removed, so a body saved with CRLF
+          # line ends still matches the markers. A lone marker, a repeated
+          # marker or an end marker before the begin marker stops the job,
+          # so the step never adds a second section and never drops text.
+          # No xtrace here: it would print the whole body to the log.
+          set +x
+          begin='<!-- deb-packages:begin -->'
+          end='<!-- deb-packages:end -->'
+          if raw=$(gh release view "$GITHUB_REF_NAME" \
+                     --repo "$GITHUB_REPOSITORY" --json body --jq .body \
+                     2> gh.err); then
+            body=$(printf '%s' "$raw" | tr -d '\r')
+          elif grep -q 'release not found' gh.err; then
+            body=
+          else
+            cat gh.err >&2
+            exit 1
+          fi
+          {
+            printf '%s\n' "$begin"
+            cat DEB_NOTES.md
+            printf '%s\n' "$end"
+          } > SECTION.md
+          printf '%s\n' "$body" > OLD_BODY.md
+          markers=empty
+          grep -q '[^[:space:]]' OLD_BODY.md && markers=$(awk -v b="$begin" -v e="$end" '
+            { sub(/[ \t]+$/, "") }
+            $0 == b { nb++; if (!lb) lb = NR }
+            $0 == e { ne++; if (!le) le = NR }
+            END {
+              if (nb == 0 && ne == 0) print "none"
+              else if (nb == 1 && ne == 1 && lb < le) print "one"
+              else printf "begin=%d (line %d), end=%d (line %d)", nb, lb, ne, le
+            }' OLD_BODY.md)
+          case $markers in
+          empty)
+            cp SECTION.md RELEASE_NOTES.md
+            ;;
+          none)
+            { cat OLD_BODY.md; printf '\n'; cat SECTION.md; } > RELEASE_NOTES.md
+            ;;
+          one)
+            awk -v b="$begin" -v e="$end" -v f=SECTION.md '
+              { line = $0; sub(/[ \t]+$/, "", line) }
+              line == b { while ((getline l < f) > 0) print l; skip = 1; next }
+              line == e { skip = 0; next }
+              !skip
+            ' OLD_BODY.md > RELEASE_NOTES.md
+            ;;
+          *)
+            echo "::error::The release body has broken deb-packages markers:" \
+              "$markers. Fix the markers by hand: one begin line, then one" \
+              "end line, or none. Then re-run this job." >&2
+            exit 1
+            ;;
+          esac
 
       - name: Attach .deb to GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64   # v3.0.3
