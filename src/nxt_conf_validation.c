@@ -15,6 +15,7 @@
 #include <nxt_http_route_addr.h>
 #include <nxt_http_compression.h>
 #include <nxt_regex.h>
+#include <nxt_app_queue.h>
 
 
 typedef enum {
@@ -148,6 +149,8 @@ static nxt_int_t nxt_conf_vldt_min_rate(nxt_conf_validation_t *vldt,
 static nxt_int_t nxt_conf_vldt_msec(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_requests(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_pending_requests(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_restored_range(nxt_conf_validation_t *vldt,
     const char *name, int64_t min, int64_t max, const char *effect);
@@ -1431,6 +1434,10 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_app_limits_members[] = {
         .name       = nxt_string("requests"),
         .type       = NXT_CONF_VLDT_INTEGER,
         .validator  = nxt_conf_vldt_requests,
+    }, {
+        .name       = nxt_string("pending_requests"),
+        .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_pending_requests,
     }, {
         .name       = nxt_string("shm"),
         .type       = NXT_CONF_VLDT_INTEGER,
@@ -3091,6 +3098,34 @@ nxt_conf_vldt_requests(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
 
     return nxt_conf_vldt_restored_range(vldt, "requests", 0, NXT_INT32_T_MAX,
                                         "the application does not start");
+}
+
+
+/*
+ * "pending_requests" is mapped with NXT_CONF_MAP_INT32.  0, the default,
+ * means no limit beyond the application queue's own capacity
+ * (NXT_APP_QUEUE_SIZE).
+ */
+
+static nxt_int_t
+nxt_conf_vldt_pending_requests(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    double  num;
+
+    num = nxt_conf_get_number(value);
+
+    if (num < 0) {
+        return nxt_conf_vldt_error(vldt, "The \"pending_requests\" number "
+                                   "must be equal to or greater than 0.");
+    }
+
+    if (num > NXT_APP_QUEUE_SIZE) {
+        return nxt_conf_vldt_error(vldt, "The \"pending_requests\" number "
+                                   "must not exceed %d.", NXT_APP_QUEUE_SIZE);
+    }
+
+    return NXT_OK;
 }
 
 

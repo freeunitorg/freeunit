@@ -37,6 +37,7 @@ typedef struct {
     uint32_t          max_processes;
     uint32_t          spare_processes;
     uint32_t          threads;
+    uint32_t          max_pending_requests;
     nxt_msec_t        timeout;
     nxt_msec_t        idle_timeout;
     nxt_conf_value_t  *limits_value;
@@ -405,7 +406,7 @@ static void nxt_router_app_abandoned_settle(nxt_task_t *task,
     nxt_request_rpc_data_t *req_rpc_data);
 static nxt_bool_t nxt_router_app_start_reserve(nxt_app_t *app,
     nxt_bool_t *unanswerable);
-static void nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
+static nxt_int_t nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
     nxt_request_rpc_data_t *req_rpc_data);
 static void nxt_router_http_request_error(nxt_task_t *task, void *obj,
     void *data);
@@ -3073,6 +3074,12 @@ static nxt_conf_map_t  nxt_router_app_limits_conf[] = {
         NXT_CONF_MAP_MSEC,
         offsetof(nxt_router_app_conf_t, start_timeout),
     },
+
+    {
+        nxt_string("pending_requests"),
+        NXT_CONF_MAP_INT32,
+        offsetof(nxt_router_app_conf_t, max_pending_requests),
+    },
 };
 
 
@@ -3518,6 +3525,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             apcf.spare_processes = 0;
             apcf.threads = 1;
             apcf.timeout = 0;
+            apcf.max_pending_requests = 0;
             apcf.start_timeout = NXT_APP_START_TIMEOUT;
             apcf.idle_timeout = 15000;
             apcf.limits_value = NULL;
@@ -3631,6 +3639,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             app->threads = nxt_max(apcf.threads, 1);
             app->max_pending_processes = apcf.spare_processes
                                          ? apcf.spare_processes : 1;
+            app->max_pending_requests = apcf.max_pending_requests;
             app->timeout = apcf.timeout;
             app->start_timeout = apcf.start_timeout;
             app->idle_timeout = apcf.idle_timeout;
@@ -5032,11 +5041,11 @@ nxt_router_test_app_rpc_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
  * production call, so a change that stops arming the deadline fails it.
  */
 
-void
+nxt_int_t
 nxt_router_test_app_port_get(nxt_task_t *task, nxt_app_t *app,
     nxt_request_rpc_data_t *req_rpc_data)
 {
-    nxt_router_app_port_get(task, app, req_rpc_data);
+    return nxt_router_app_port_get(task, app, req_rpc_data);
 }
 
 
@@ -6974,6 +6983,14 @@ nxt_router_req_headers_ack_handler(nxt_task_t *task,
 
     start_process = nxt_router_app_port_busy(task, app, main_app_port, "ack");
 
+    if (nxt_fast_path(req_rpc_data->app_port != NULL
+                      && req_rpc_data->app_port->id == NXT_SHARED_PORT_ID))
+    {
+        nxt_assert(nxt_atomic_load(&app->pending_requests) != 0);
+
+        nxt_atomic_fetch_add(&app->pending_requests, -1);
+    }
+
     main_app_port->active_requests++;
 
     nxt_port_inc_use(app_port);
@@ -8230,6 +8247,10 @@ nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
     if (port->id == NXT_SHARED_PORT_ID) {
         nxt_thread_mutex_lock(&app->mutex);
 
+        nxt_assert(nxt_atomic_load(&app->pending_requests)
+                   >= (nxt_atomic_uint_t) -req_dec);
+
+        nxt_atomic_fetch_add(&app->pending_requests, req_dec);
         nxt_atomic_fetch_add(&app->active_requests, req_dec);
 
         nxt_thread_mutex_unlock(&app->mutex);
@@ -8995,6 +9016,7 @@ nxt_router_free_app(nxt_task_t *task, void *obj, void *data)
     nxt_assert(app->proto_port == NULL);
     nxt_assert(nxt_atomic_load(&app->processes) == 0);
     nxt_assert(nxt_atomic_load(&app->detached_processes) == 0);
+    nxt_assert(nxt_atomic_load(&app->pending_requests) == 0);
     nxt_assert(nxt_atomic_load(&app->active_requests) == 0);
     nxt_assert(nxt_atomic_load(&app->port_hash_count) == 0);
     nxt_assert(nxt_atomic_load(&app->idle_processes) == 0);
@@ -9065,7 +9087,7 @@ nxt_router_app_start_reserve(nxt_app_t *app, nxt_bool_t *unanswerable)
 }
 
 
-static void
+static nxt_int_t
 nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
     nxt_request_rpc_data_t *req_rpc_data)
 {
@@ -9073,16 +9095,41 @@ nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
     nxt_port_t          *port;
     nxt_http_request_t  *r;
 
+    static nxt_log_moderation_t  nxt_app_pending_requests_log_moderation = {
+        NXT_LOG_INFO, 2, "application pending requests limit reached",
+        NXT_LOG_MODERATION
+    };
+
+    r = req_rpc_data->request;
+
     nxt_thread_mutex_lock(&app->mutex);
+
+    if (app->max_pending_requests != 0
+        && nxt_atomic_load(&app->pending_requests) >= app->max_pending_requests)
+    {
+        nxt_thread_mutex_unlock(&app->mutex);
+
+        nxt_log_moderate(&nxt_app_pending_requests_log_moderation,
+                         NXT_LOG_INFO, task->log,
+                         "app \"%V\": pending requests limit %uD reached",
+                         &app->name, app->max_pending_requests);
+
+        nxt_http_request_error(task, r, NXT_HTTP_SERVICE_UNAVAILABLE);
+
+        if (r->req_rpc_data != NULL) {
+            nxt_request_rpc_data_unlink(task, req_rpc_data);
+        }
+
+        return NXT_DECLINED;
+    }
 
     port = app->shared_port;
     nxt_port_inc_use(port);
 
+    nxt_atomic_fetch_add(&app->pending_requests, 1);
     nxt_atomic_fetch_add(&app->active_requests, 1);
 
     start_process = nxt_router_app_start_reserve(app, &unanswerable);
-
-    r = req_rpc_data->request;
 
     /*
      * Put request into application-wide list to be able to cancel request
@@ -9143,6 +9190,8 @@ nxt_router_app_port_get(nxt_task_t *task, nxt_app_t *app,
 
         nxt_router_app_start_failed(task, app, 0, 0);
     }
+
+    return NXT_OK;
 }
 
 
@@ -9210,8 +9259,11 @@ nxt_router_process_http_request(nxt_task_t *task, nxt_http_request_t *r,
 
     r->state = &nxt_http_request_send_state;
 
-    nxt_router_app_port_get(task, conf->app, req_rpc_data);
-    nxt_router_app_prepare_request(task, req_rpc_data);
+    if (nxt_fast_path(nxt_router_app_port_get(task, conf->app, req_rpc_data)
+                      == NXT_OK))
+    {
+        nxt_router_app_prepare_request(task, req_rpc_data);
+    }
 }
 
 
@@ -9295,6 +9347,7 @@ static void
 nxt_router_app_prepare_request(nxt_task_t *task,
     nxt_request_rpc_data_t *req_rpc_data)
 {
+    nxt_int_t          res;
     nxt_app_t          *app;
     nxt_buf_t          *buf, *body;
     nxt_http_status_t  status;
@@ -9331,16 +9384,17 @@ nxt_router_app_prepare_request(nxt_task_t *task,
         req_rpc_data->msg_info.body_fd = -1;
     }
 
-    if (nxt_slow_path(nxt_router_app_queue_send(task, req_rpc_data, buf,
-                                                buf->mem.pos,
-                                                nxt_buf_used_size(buf))
-                      != NXT_OK))
-    {
+    res = nxt_router_app_queue_send(task, req_rpc_data, buf,
+                                    buf->mem.pos,
+                                    nxt_buf_used_size(buf));
+    if (nxt_slow_path(res != NXT_OK)) {
         nxt_alert(task, "stream #%uD, app '%V': failed to send app message",
                   req_rpc_data->stream, &app->name);
 
         nxt_http_request_error(task, req_rpc_data->request,
-                               NXT_HTTP_INTERNAL_SERVER_ERROR);
+                               (res == NXT_AGAIN)
+                               ? NXT_HTTP_SERVICE_UNAVAILABLE
+                               : NXT_HTTP_INTERNAL_SERVER_ERROR);
     }
 }
 

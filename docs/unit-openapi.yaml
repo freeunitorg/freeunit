@@ -7420,6 +7420,16 @@ components:
               description: "Maximum number of requests an app process
                 can serve."
 
+            pending_requests:
+              type: integer
+              minimum: 0
+              maximum: 131072
+              description: "Maximum number of requests that may wait in the
+                application queue for a worker to take them; 0, the default,
+                means no limit beyond the queue capacity (131072). When the
+                limit is reached, Unit answers new requests with 503 Service
+                Unavailable at once."
+
             timeout:
               type: integer
               description: "Request timeout in seconds; 0, the default, means
