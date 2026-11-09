@@ -27,7 +27,8 @@ tool as root ran that user's program -- unitc built a command from the title,
 setup-unit passed it to "eval" -- or sourced a cache file the user had planted
 in the world-writable /tmp.  The tools now trust only a "unit: main" owned by
 the superuser or by the user running them, and unitc reads and creates its
-/tmp cache only as a regular file it owns, refusing a symlink.
+/tmp cache only as a regular file it owns, refusing a symlink.  unitctl
+applies the same owner rule when it discovers a running unitd.
 </para>
 </change>
 
