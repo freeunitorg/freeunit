@@ -41,6 +41,16 @@ impl Serialize for UnitdProcess {
     }
 }
 
+// Trust only a unitd owned by root (uid 0) or by the user running unitctl; an
+// owner uid that cannot be read fails closed.  The real unitd main process
+// never drops privileges, so an unprivileged decoy is rejected.
+fn trusted_owner(owner: Option<u32>, current_uid: Option<u32>) -> bool {
+    match owner {
+        Some(uid) => uid == 0 || Some(uid) == current_uid,
+        None => false,
+    }
+}
+
 impl UnitdProcess {
     pub fn find_unitd_processes() -> Vec<UnitdProcess> {
         let process_refresh_kind = ProcessRefreshKind::nothing()
@@ -58,6 +68,18 @@ impl UnitdProcess {
             }
         };
 
+        // An unprivileged local user can plant a decoy process named "unitd"
+        // whose command line reads "unit: main ...".  The real unitd main
+        // process never drops privileges, so it runs as root (or, for a
+        // rootless instance, as the user running unitctl).  Resolve that user's
+        // uid from our own process so a decoy owned by anyone else is ignored;
+        // this mirrors the unitc/setup-unit shell tools.
+        let current_uid: Option<u32> = sysinfo::get_current_pid()
+            .ok()
+            .and_then(|pid| sys.process(pid))
+            .and_then(|process| process.user_id())
+            .map(|uid| *uid.clone());
+
         let unitd_processes: HashMap<&Pid, &Process> = sys
             .processes()
             .iter()
@@ -65,6 +87,8 @@ impl UnitdProcess {
                 let process_name = p.1.name();
                 UNITD_BINARY_NAMES.iter().any(|&name| process_name == name)
             })
+            // Trust only a unitd owned by root or by the current user.
+            .filter(|p| trusted_owner(p.1.user_id().map(|uid| *uid.clone()), current_uid))
             .collect::<HashMap<&Pid, &Process>>();
         // Without the user list, the user names are left empty.
         let users = Users::new_with_refreshed_list()
@@ -209,5 +233,33 @@ mod tests {
     #[test]
     fn can_parse_runtime_cmd_unitd_debug_relative_path() {
         can_parse_runtime_cmd_relative_path("unitd-debug");
+    }
+
+    #[test]
+    fn trusted_owner_accepts_root() {
+        // root-owned unitd is the normal case, trusted even if our own uid is
+        // unknown.
+        assert!(trusted_owner(Some(0), Some(1000)));
+        assert!(trusted_owner(Some(0), None));
+    }
+
+    #[test]
+    fn trusted_owner_accepts_self() {
+        // a rootless instance owned by the user running unitctl.
+        assert!(trusted_owner(Some(1000), Some(1000)));
+    }
+
+    #[test]
+    fn trusted_owner_rejects_another_user() {
+        // a decoy owned by a different user is never trusted.
+        assert!(!trusted_owner(Some(1000), Some(1001)));
+        assert!(!trusted_owner(Some(1000), None));
+    }
+
+    #[test]
+    fn trusted_owner_rejects_unreadable_owner() {
+        // fail closed when the owner uid cannot be read.
+        assert!(!trusted_owner(None, Some(1000)));
+        assert!(!trusted_owner(None, None));
     }
 }

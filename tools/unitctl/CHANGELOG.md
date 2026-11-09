@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `unitctl` discovered a running unitd by its process title alone and trusted
+  whatever matched. A local user could run a process titled `unit: main` and
+  have `unitctl` act on their decoy; it now trusts only a unitd owned by the
+  superuser or by the user running it.
+
 ## [1.37.1] - 2026-10-28
 
 ### Security
