@@ -293,7 +293,6 @@ struct nxt_http_request_s {
     nxt_http_status_t               status:16;
 
     uint8_t                         log_route;    /* 1 bit */
-    uint8_t                         quoted_target;  /* 1 bit */
     uint8_t                         uri_changed;  /* 1 bit */
 
     uint8_t                         pass_count;   /* 8 bits */

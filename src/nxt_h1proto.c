@@ -750,8 +750,6 @@ nxt_h1p_header_process(nxt_task_t *task, nxt_h1proto_t *h1p,
     r->target.start = h1p->parser.target_start;
     r->target.length = h1p->parser.target_end - h1p->parser.target_start;
 
-    r->quoted_target = h1p->parser.quoted_target;
-
     if (h1p->parser.version.ui64 != 0) {
         r->version.start = h1p->parser.version.str;
         r->version.length = sizeof(h1p->parser.version.str);
@@ -3335,16 +3333,19 @@ nxt_h1p_peer_request_target(nxt_http_request_t *r, nxt_str_t *target)
         return NXT_OK;
     }
 
-    if (!r->quoted_target && r->args->length == 0) {
+    /*
+     * The URI was rewritten, so r->path is the rewrite result, not the request
+     * line as received.  nxt_http_parse_complex_target() copies any byte that
+     * is not "%"-quoted verbatim, so a rewrite that interpolates a variable
+     * (e.g. "$uri") can place a raw CR, LF or space into r->path.  Encode by
+     * the path's actual content so such a byte cannot break the upstream
+     * request line (request smuggling / header injection).
+     */
+    encode = nxt_encode_complex_uri(NULL, r->path->start, r->path->length);
+
+    if (encode == 0 && r->args->length == 0) {
         *target = *r->path;
         return NXT_OK;
-    }
-
-    if (r->quoted_target) {
-        encode = nxt_encode_complex_uri(NULL, r->path->start,
-                                        r->path->length);
-    } else {
-        encode = 0;
     }
 
     size = r->path->length + encode * 2 + 1 + r->args->length;
@@ -3354,7 +3355,7 @@ nxt_h1p_peer_request_target(nxt_http_request_t *r, nxt_str_t *target)
         return NXT_ERROR;
     }
 
-    if (r->quoted_target) {
+    if (encode > 0) {
         p = (u_char *) nxt_encode_complex_uri(target->start, r->path->start,
                                               r->path->length);
 

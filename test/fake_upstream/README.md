@@ -97,9 +97,9 @@ single `grep` finds every side of a case. E.g. token `chunked_response`:
 | 7997 | `slow_drip` | `slow-drip` | `respond_slow_drip` | `test_proxy_chunked_response_slow_drip` (#72 case 5) |
 | 7998 | `dup_te` | `dup-te` | `respond_dup_te` | `test_proxy_chunked_response_dup_te` (#72 case 6, nginx/unit#1088) |
 
-> **7999 is not available here.** `test/test_proxy.py`, `test/test_proxy_chunked.py`
-> and `test/test_proxy_status_line.py` already bind port 7999 for their own
-> upstream, so this registry ends at
+> **7999 is not available here.** `test/test_proxy.py`, `test/test_proxy_chunked.py`,
+> `test/test_proxy_status_line.py` and `test/test_proxy_rewrite_target.py` already
+> bind port 7999 for their own upstream, so this registry ends at
 > 7998. New `fake_upstream` slots go to the 7974–7975 gap (7976 is taken by
 > `test_proxy_te.py` and 7977 by `test_proxy_interim.py` above, 7978–7979 are
 > taken above, 7980–7982 are `fake_otlp`).
