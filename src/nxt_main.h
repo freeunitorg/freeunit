@@ -63,6 +63,7 @@ typedef uint16_t                     nxt_port_id_t;
 #include <nxt_fs.h>
 #include <nxt_process.h>
 #include <nxt_utf8.h>
+#include <nxt_punycode.h>
 #include <nxt_file_name.h>
 
 #include <nxt_sprintf.h>
@@ -98,8 +99,6 @@ typedef struct {
 
 #include <nxt_djb_hash.h>
 #include <nxt_murmur_hash.h>
-#include <nxt_hash.h>
-
 #include <nxt_sort.h>
 #include <nxt_list.h>
 
@@ -107,7 +106,6 @@ typedef struct {
 
 typedef struct nxt_buf_s                nxt_buf_t;
 #include <nxt_buf.h>
-#include <nxt_buf_pool.h>
 #include <nxt_recvbuf.h>
 
 typedef struct nxt_conn_s               nxt_conn_t;

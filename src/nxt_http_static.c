@@ -1011,6 +1011,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
             goto fail;
         }
 
+        /* nxt_http_comp_drop_accept_ranges() skips it if the body is coded. */
         nxt_http_field_name_set(field, "Accept-Ranges");
 
         field->value = (u_char *) "bytes";

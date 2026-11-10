@@ -9,13 +9,28 @@ prerequisites = {'modules': {'python': 'any'}}
 client = ApplicationPython()
 
 
-def check_connections(accepted, active, idle, closed):
-    assert Status.get('/connections') == {
+def check_connections(accepted, active, idle, closed, timeout=50):
+    # The client sees EOF at the shutdown(2) in nxt_conn_shutdown_handler().
+    # The router counts the close later, in nxt_conn_close_handler()
+    # (src/nxt_conn_close.c), and /status reads the counters without
+    # waiting for it.  Poll for a bounded time, then compare the last
+    # reading, so that a wrong count still fails with its values.
+    expected = {
         'accepted': accepted,
         'active': active,
         'idle': idle,
         'closed': closed,
     }
+
+    for _ in range(timeout):
+        conns = Status.get('/connections')
+
+        if conns == expected:
+            break
+
+        time.sleep(0.1)
+
+    assert conns == expected
 
 
 def app_default(name="empty", module="wsgi"):

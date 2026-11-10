@@ -225,6 +225,9 @@ struct nxt_http_request_s {
     nxt_buf_t                       *out;
     const nxt_http_request_state_t  *state;
 
+    /* Bytes still to come of the application's current websocket frame. */
+    size_t                          ws_app_rest;
+
     nxt_nsec_t                      start_time;
 
     nxt_str_t                       host;
@@ -264,16 +267,14 @@ struct nxt_http_request_s {
     nxt_http_action_t               *action;
     void                            *req_rpc_data;
 
-#if (NXT_HAVE_REGEX)
-    nxt_regex_match_t               *regex_match;
-#endif
-
     nxt_http_peer_t                 *peer;
     nxt_buf_t                       *last;
 
     nxt_queue_link_t                app_link;   /* nxt_app_t.ack_waiting_req */
     nxt_event_engine_t              *engine;
     nxt_work_t                      err_work;
+    nxt_work_t                      requeue_work;
+    nxt_timer_t                     requeue_timer;
 
     nxt_http_response_t             resp;
 
@@ -292,7 +293,6 @@ struct nxt_http_request_s {
     nxt_http_status_t               status:16;
 
     uint8_t                         log_route;    /* 1 bit */
-    uint8_t                         quoted_target;  /* 1 bit */
     uint8_t                         uri_changed;  /* 1 bit */
 
     uint8_t                         pass_count;   /* 8 bits */
@@ -303,9 +303,13 @@ struct nxt_http_request_s {
     uint8_t                         header_sent;  /* 1 bit  */
     uint8_t                         inconsistent; /* 1 bit  */
     uint8_t                         ws_paused;    /* 1 bit  */
+    /* A CLOSE frame went to the client, the router's or the application's. */
+    uint8_t                         ws_closed;    /* 1 bit  */
     uint8_t                         truncated;    /* 1 bit  */
     uint8_t                         error;        /* 1 bit  */
     uint8_t                         websocket_handshake;  /* 1 bit */
+    /* The router decided this response is a WebSocket upgrade. */
+    uint8_t                         websocket_upgrade;    /* 1 bit */
     uint8_t                         chunked;  /* 1 bit */
     uint8_t                         no_body;  /* 1 bit */
 
@@ -481,6 +485,7 @@ void nxt_http_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_work_handler_t body_handler, void *data);
 void nxt_http_request_ws_frame_start(nxt_task_t *task, nxt_http_request_t *r,
     nxt_buf_t *ws_frame);
+void nxt_http_websocket_app_frame(nxt_http_request_t *r, nxt_buf_t *b);
 void nxt_http_request_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_buf_t *out);
 nxt_bool_t nxt_http_request_is_bodyless_final(nxt_http_request_t *r,
@@ -528,6 +533,12 @@ nxt_http_route_rule_t *nxt_http_route_types_rule_create(nxt_task_t *task,
 nxt_int_t nxt_http_route_test_rule(nxt_http_request_t *r,
     nxt_http_route_rule_t *rule, u_char *start, size_t length);
 
+#if (NXT_TESTS && NXT_HAVE_REGEX)
+/* The regex match of a route pattern, for the regex route test. */
+nxt_int_t nxt_http_route_test_regex(nxt_http_request_t *r, nxt_regex_t *re,
+    u_char *start, size_t length);
+#endif
+
 nxt_int_t nxt_http_action_init(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     nxt_conf_value_t *cv, nxt_http_action_t *action);
 void nxt_http_request_action(nxt_task_t *task, nxt_http_request_t *r,
@@ -546,6 +557,7 @@ nxt_bool_t nxt_http_set_headers_override_validators(nxt_http_request_t *r);
 nxt_http_set_header_op_t nxt_http_set_headers_encoding_op(
     nxt_http_request_t *r);
 nxt_int_t nxt_http_comp_merge_vary(nxt_http_request_t *r);
+void nxt_http_comp_drop_accept_ranges(nxt_http_request_t *r);
 nxt_int_t nxt_http_set_headers_init(nxt_router_conf_t *rtcf,
     nxt_http_action_t *action, nxt_http_action_conf_t *acf);
 nxt_int_t nxt_http_set_headers(nxt_http_request_t *r);
@@ -594,6 +606,7 @@ void nxt_h1p_websocket_first_frame_start(nxt_task_t *task,
     nxt_http_request_t *r, nxt_buf_t *ws_frame);
 void nxt_h1p_websocket_frame_start(nxt_task_t *task, nxt_http_request_t *r,
     nxt_buf_t *ws_frame);
+void nxt_h1p_websocket_start(nxt_task_t *task, nxt_http_request_t *r);
 void nxt_h1p_complete_buffers(nxt_task_t *task, nxt_h1proto_t *h1p,
     nxt_bool_t all);
 nxt_msec_t nxt_h1p_conn_request_timer_value(nxt_conn_t *c, uintptr_t data);

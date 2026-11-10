@@ -61,6 +61,16 @@ OVERSIZED_HINTS = 'HTTP/1.1 103 Early Hints\r\n' + (
 
 assert len(OVERSIZED_HINTS) > 64 * 1024, len(OVERSIZED_HINTS)
 
+# 101 for a WebSocket handshake.
+WS_SWITCH = (
+    'HTTP/1.1 101 Switching Protocols\r\n'
+    'Upgrade: websocket\r\nConnection: Upgrade\r\n'
+    'Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n'
+)
+
+# Targets whose upstream connection stays open after the 101.
+WS_HELD = ('/ws', '/ws-frame')
+
 # Upstream response for each target.  A string is sent in one write.  Each
 # item of a list is sent separately, with a pause, so Unit reads it separately.
 UPSTREAM_RESPONSES = {
@@ -100,6 +110,12 @@ UPSTREAM_RESPONSES = {
     '/eleven': INTERIM * 11 + FINAL,
     # 101 changes the protocol, so it is the response.
     '/switch': 'HTTP/1.1 101 Switching Protocols\r\n\r\n',
+    # 101 for a WebSocket handshake, alone and with a server frame after it
+    # in the same write.  The proxy cannot pass WebSocket: 502.
+    '/ws': WS_SWITCH,
+    '/ws-frame': WS_SWITCH + 'hello',
+    # An upstream that refuses the handshake.
+    '/ws-refuse': 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n',
     # A 1xx without a final response.
     '/truncated': 'HTTP/1.1 100 Continue\r\n\r\n',
     # A 1xx bigger than the header buffer.
@@ -174,6 +190,11 @@ def run_server(server_port):
             except OSError:
                 # Unit closed the connection before reading it all.
                 pass
+
+            if target in WS_HELD:
+                # Keep the connection open, as a WebSocket server does, until
+                # Unit closes it or the client frame has had time to arrive.
+                select.select([conn], [], [], 3)
 
         conn.close()
 
@@ -272,6 +293,60 @@ def get_alone(target):
     )
 
 
+def handshake(target):
+    """Send a valid WebSocket handshake.  If a 101 comes back, send one masked
+    text frame.  Return what the client read."""
+
+    request = (
+        f'GET {target} HTTP/1.1\r\n'
+        'Host: localhost\r\n'
+        'Upgrade: websocket\r\n'
+        'Connection: Upgrade\r\n'
+        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+        'Sec-WebSocket-Version: 13\r\n'
+        '\r\n'
+    )
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5)
+
+    data = b''
+
+    try:
+        sock.connect(('127.0.0.1', port_map.port(8080)))
+        sock.sendall(request.encode())
+
+        while b'\r\n\r\n' not in data:
+            part = sock.recv(4096)
+            if not part:
+                break
+
+            data += part
+
+        if data.startswith(b'HTTP/1.1 101'):
+            mask = b'\x01\x02\x03\x04'
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(b'hello'))
+            sock.sendall(b'\x81\x85' + mask + payload)
+
+        # A 502 keeps the connection open, so stop after a short wait.
+        sock.settimeout(1)
+
+        while True:
+            part = sock.recv(4096)
+            if not part:
+                break
+
+            data += part
+
+    except (socket.timeout, ConnectionError):
+        pass
+
+    finally:
+        sock.close()
+
+    return data.decode('latin-1')
+
+
 @pytest.mark.parametrize(
     'target',
     [
@@ -342,6 +417,31 @@ def test_proxy_interim_101_is_the_response():
     assert raw.startswith(
         'HTTP/1.1 101 Switching Protocols'
     ), f'101 not relayed: {raw!r}'
+
+
+@pytest.mark.parametrize('target', ['/ws', '/ws-frame'])
+def test_proxy_interim_101_websocket_is_bad_gateway(target):
+    """The proxy cannot pass WebSocket.  It used to start the WebSocket frame
+    reader of the client connection, and the first client frame crashed the
+    router.  The upstream keeps its connection open after the 101, so the
+    frame reaches a live proxy request.  The '/ws-frame' target sends server
+    bytes in the same read as the 101.  The test cannot see a stranded
+    buffer; that was measured with the debug log of the request pool."""
+
+    raw = handshake(target)
+
+    # The router still serves requests.  Check it before the status, so a
+    # crash is reported even when the status assertion fails.
+    alive = get_alone('/ok').startswith('HTTP/1.1 200')
+
+    assert raw.startswith('HTTP/1.1 502'), f'expected 502: {raw[:200]!r}'
+    assert alive, 'router lost after 101'
+
+
+def test_proxy_interim_websocket_refused_is_relayed():
+    raw = handshake('/ws-refuse')
+
+    assert raw.startswith('HTTP/1.1 400'), f'expected 400: {raw[:200]!r}'
 
 
 @pytest.mark.parametrize(

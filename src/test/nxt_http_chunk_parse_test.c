@@ -70,6 +70,48 @@ nxt_http_chunk_parse_test(nxt_thread_t *thr)
         { nxt_string("0\r\n X-T: v\r\n\r\n"),  1, 0 },  /* obs-fold (SP) */
         { nxt_string("0\r\n\tX-T: v\r\n\r\n"), 1, 0 },  /* obs-fold (HTAB) */
 
+        /*
+         * Chunk extensions (RFC 9112 7.1.1): ignored, but each must be
+         * BWS ";" BWS token [ BWS "=" BWS ( token / quoted-string ) ].
+         */
+        { nxt_string("0;a\r\n\r\n"),           0, 1 },  /* name only */
+        { nxt_string("0;a=b\r\n\r\n"),         0, 1 },  /* token value */
+        { nxt_string("0;a=b;c;d=e\r\n\r\n"),   0, 1 },  /* several */
+        { nxt_string("0 ;a\r\n\r\n"),          0, 1 },  /* BWS before ";" */
+        { nxt_string("0\t;a=b;c\r\n\r\n"),     0, 1 },  /* HTAB before ";" */
+        { nxt_string("0; a = b ;\tc\r\n\r\n"),
+                                               0, 1 },  /* BWS */
+        { nxt_string("0;!#$%&'*+-.^_`|~09AZaz=x\r\n\r\n"),
+                                               0, 1 },  /* every tchar kind */
+        { nxt_string("0;a=\"\"\r\n\r\n"),      0, 1 },  /* empty quoted */
+        { nxt_string("0;a=\"b c;d=e\"\r\n\r\n"),
+                                               0, 1 },  /* ";" "=" SP quoted */
+        { nxt_string("0;a=\"\\\"\\\\\";b\r\n\r\n"),
+                                               0, 1 },  /* quoted-pair */
+        { nxt_string("0;a=\"\x80\tx\"\r\n\r\n"),
+                                               0, 1 },  /* obs-text, HTAB */
+
+        { nxt_string("0;\r\n\r\n"),            1, 0 },  /* bare ";" */
+        { nxt_string("0;a;\r\n\r\n"),          1, 0 },  /* trailing ";" */
+        { nxt_string("0;;a\r\n\r\n"),          1, 0 },  /* empty name */
+        { nxt_string("0;=b\r\n\r\n"),          1, 0 },  /* empty name 2 */
+        { nxt_string("0;a=\r\n\r\n"),          1, 0 },  /* empty value */
+        { nxt_string("0;bad[=x\r\n\r\n"),      1, 0 },  /* non-tchar name */
+        { nxt_string("0;a=b@\r\n\r\n"),        1, 0 },  /* non-tchar value */
+        { nxt_string("0;a=b=c\r\n\r\n"),       1, 0 },  /* second "=" */
+        { nxt_string("0;a b\r\n\r\n"),         1, 0 },  /* SP in name */
+        { nxt_string("0;a=b c\r\n\r\n"),       1, 0 },  /* SP in value */
+        { nxt_string("0;a \r\n\r\n"),          1, 0 },  /* BWS before CRLF */
+        { nxt_string("0 \r\n\r\n"),            1, 0 },  /* BWS, no ";" */
+        { nxt_string("0;a=b\t\r\n\r\n"),       1, 0 },  /* HTAB before CRLF */
+        { nxt_string("0;a=\"b\"c\r\n\r\n"),    1, 0 },  /* byte after quote */
+        { nxt_string("0;a=\"b\r\n\r\n"),       1, 0 },  /* unterminated */
+        { nxt_string("0;a=\"\\\r\n\r\n"),      1, 0 },  /* CR quoted-pair */
+        { nxt_string("0;\n\r\n"),              1, 0 },  /* bare LF */
+        { nxt_string("0;a\n\r\n"),             1, 0 },  /* LF after name */
+        { nxt_string("0;a=b\n\r\n"),           1, 0 },  /* LF after value */
+        { nxt_string("0;a\rb\r\n\r\n"),        1, 0 },  /* bare CR */
+
         { nxt_string("0\r\nX-T: v\r\n"),       0, 0 },  /* trailer, no final CRLF */
         { nxt_string("0\r\n"),                 0, 0 },  /* incomplete terminal */
         { nxt_string("0\r\n\r"),               0, 0 },  /* incomplete terminal 2 */
@@ -258,6 +300,78 @@ nxt_http_chunk_parse_test(nxt_thread_t *thr)
                               (int) c, (int) hcp.chunk_error, (int) expect_err,
                               (int) hcp.last, (int) expect_last);
                 return NXT_ERROR;
+            }
+        }
+    }
+
+    /*
+     * Every byte in each position of a chunk extension: an extension name and
+     * a token value take a tchar only, a quoted-string takes qdtext and a
+     * quoted-pair HTAB, SP, VCHAR or obs-text.  So NUL, every other CTL, DEL
+     * and the bare LF are refused in each position.  Built at runtime because
+     * a C-string literal cannot carry an embedded NUL.
+     */
+    {
+        static u_char  buf[16];
+        u_char         *p;
+        nxt_uint_t     c, n;
+        nxt_bool_t     tchar, text;
+        uint8_t        expect_err;
+
+        static const struct {
+            const char  *prefix;
+            const char  *suffix;
+        }  pos[] = {
+            { "0;",       "\r\n\r\n" },     /* extension name */
+            { "0;a=",     "\r\n\r\n" },     /* token value */
+            { "0;a=\"",   "\"\r\n\r\n" },   /* qdtext */
+            { "0;a=\"\\", "\"\r\n\r\n" },   /* quoted-pair */
+        };
+
+        for (n = 0; n < nxt_nitems(pos); n++) {
+            for (c = 0; c <= 0xff; c++) {
+                tchar = (c >= '0' && c <= '9')
+                        || ((c | 0x20) >= 'a' && (c | 0x20) <= 'z')
+                        || (c != 0 && strchr("!#$%&'*+-.^_`|~", c) != NULL);
+                text = (c >= 0x20 && c != 0x7f) || c == '\t';
+
+                switch (n) {
+                case 0:
+                case 1:
+                    expect_err = !tchar;
+                    break;
+                case 2:
+                    expect_err = !text || c == '"' || c == '\\';
+                    break;
+                default:
+                    expect_err = !text;
+                    break;
+                }
+
+                p = nxt_cpymem(buf, pos[n].prefix, nxt_strlen(pos[n].prefix));
+                *p++ = (u_char) c;
+                p = nxt_cpymem(p, pos[n].suffix, nxt_strlen(pos[n].suffix));
+
+                nxt_memzero(&hcp, sizeof(nxt_http_chunk_parse_t));
+                nxt_memzero(&b, sizeof(nxt_buf_t));
+                b.mem.pos = buf;
+                b.mem.free = p;
+                b.retain = 1;
+
+                (void) nxt_http_chunk_parse(thr->task, &hcp, &b);
+
+                if (hcp.chunk_error != expect_err
+                    || hcp.last != !expect_err)
+                {
+                    nxt_log_alert(thr->log,
+                                  "nxt_http_chunk_parse() chunk-ext test "
+                                  "failed for 0x%02Xd after \"%s\": "
+                                  "chunk_error=%d/%d last=%d/%d",
+                                  (int) c, pos[n].prefix,
+                                  (int) hcp.chunk_error, (int) expect_err,
+                                  (int) hcp.last, (int) !expect_err);
+                    return NXT_ERROR;
+                }
             }
         }
     }

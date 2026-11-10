@@ -1,13 +1,20 @@
+import os
+import resource
+import select
 import socket
 import struct
 import time
+from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 from packaging import version
 
+from conftest import pid_by_name
 from unit.applications.lang.python import ApplicationPython
 from unit.applications.websockets import ApplicationWebsocket
 from unit.option import option
+from unit.utils import waitforfiles
 from unit import port as port_map
 
 prerequisites = {
@@ -73,6 +80,82 @@ def test_asgi_websockets_handshake():
     client.load('websockets/subprotocol')
 
 
+def test_asgi_websockets_pipelined_frame():
+    """A frame pipelined with the handshake reaches the application once."""
+    client.load('websockets/mirror')
+
+    key = ws.key()
+
+    request = (
+        'GET / HTTP/1.1\r\n'
+        'Host: localhost\r\n'
+        'Upgrade: websocket\r\n'
+        'Connection: Upgrade\r\n'
+        f'Sec-WebSocket-Key: {key}\r\n'
+        'Sec-WebSocket-Version: 13\r\n'
+        '\r\n'
+    ).encode()
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5)
+
+    try:
+        sock.connect(('127.0.0.1', port_map.port(8080)))
+        sock.sendall(request + ws.frame_to_send(ws.OP_TEXT, 'hello'))
+
+        resp = b''
+
+        while not resp.endswith(b'\r\n\r\n'):
+            part = sock.recv(1)
+
+            if not part:
+                break
+
+            resp += part
+
+        assert resp.startswith(b'HTTP/1.1 101'), f'no 101: {resp[:300]!r}'
+        assert b'Upgrade: websocket' in resp, f'no upgrade: {resp[:300]!r}'
+
+        frame = ws.frame_read(sock, read_timeout=5)
+
+        assert frame['opcode'] == ws.OP_TEXT, f'opcode: {frame}'
+        assert frame['data'].decode('utf-8') == 'hello', f'echo: {frame}'
+
+        # Exactly once: the next frame on the connection must be the echo of
+        # a second, distinct message, not a second "hello" and not bytes of
+        # a second HTTP response.  Then the close handshake must complete.
+        ws.frame_write(sock, ws.OP_TEXT, 'second')
+
+        frame = ws.frame_read(sock, read_timeout=5)
+
+        assert frame['opcode'] == ws.OP_TEXT, f'opcode 2: {frame}'
+        assert frame['data'].decode('utf-8') == 'second', f'echo 2: {frame}'
+
+        close_connection(sock)
+
+    finally:
+        sock.close()
+
+
+def test_asgi_websockets_close_then_exception():
+    client.load('websockets/close_exception')
+
+    # A coroutine exception must not turn an already queued close frame
+    # into an RPC error that discards it.  The 4 MiB body is more than the
+    # kernel socket buffers take at once, so the close frame is still in
+    # the router's write queue when the exception arrives.  Repeat to
+    # expose queue ordering.
+    for _ in range(3):
+        _, sock, _ = ws.upgrade()
+        try:
+            ws.frame_write(sock, ws.OP_TEXT, 'close')
+            frame = ws.message_read(sock)
+            assert frame['data'] == b'x' * (4 * 1024 * 1024), 'queued body'
+            check_close(sock, 1008, no_close=True)
+        finally:
+            sock.close()
+
+
 def test_asgi_websockets_subprotocol():
     client.load('websockets/subprotocol')
 
@@ -84,6 +167,27 @@ def test_asgi_websockets_subprotocol():
         resp['headers']['x-subprotocols'] == "('chat', 'phone', 'video')"
     ), 'subprotocols'
     assert resp['headers']['sec-websocket-protocol'] == 'chat', 'key'
+
+
+def test_asgi_websockets_subprotocol_field_name():
+    # Only a field named "Sec-WebSocket-Protocol" gives the subprotocols.
+    client.load('websockets/subprotocol')
+
+    resp, sock, _ = ws.upgrade(
+        headers={
+            'Host': 'localhost',
+            'Upgrade': 'websocket',
+            'Connection': 'Upgrade',
+            'Sec-WebSocket-Key': ws.key(),
+            'Sec-WebSocket-Protocol': 'chat',
+            'X-Websocket-Protoairzz': 'other',
+            'Sec-WebSocket-Version': 13,
+        }
+    )
+    sock.close()
+
+    assert resp['status'] == 101, 'status'
+    assert resp['headers']['x-subprotocols'] == "('chat',)", 'subprotocols'
 
 
 def test_asgi_websockets_subprotocol_utf8():
@@ -98,6 +202,41 @@ def test_asgi_websockets_subprotocol_utf8():
     assert (
         resp['headers']['sec-websocket-protocol'] == 'chat-\u0442'
     ), 'utf-8 subprotocol'
+
+
+@pytest.mark.parametrize(
+    'value, expect',
+    [
+        ('chat,', 'chat'),
+        (',chat', 'chat'),
+        ('chat,,phone', 'chat,phone'),
+        ('chat,  ,phone', 'chat,phone'),
+        (',', ''),
+    ],
+)
+def test_asgi_websockets_subprotocol_empty_segment(value, expect):
+    client.load('websockets/subprotocol_iter')
+
+    # An empty Sec-WebSocket-Protocol segment -- from a leading, trailing or
+    # doubled comma, or a comma then only spaces -- must not leave a NULL slot
+    # in the scope['subprotocols'] tuple.  The app joins the tuple, touching
+    # every slot, so a NULL one crashes the worker; an all-comma value shrinks
+    # the tuple to empty.  Every shape the fix handles is pinned here, so a
+    # narrower fix (e.g. one stripping only a trailing comma) is still caught.
+    resp, sock, _ = ws.upgrade(
+        headers={
+            'Host': 'localhost',
+            'Upgrade': 'websocket',
+            'Connection': 'Upgrade',
+            'Sec-WebSocket-Key': ws.key(),
+            'Sec-WebSocket-Protocol': value,
+            'Sec-WebSocket-Version': 13,
+        }
+    )
+    sock.close()
+
+    assert resp['status'] == 101, 'status'
+    assert resp['headers']['x-subprotocols'] == expect, 'no NULL slot'
 
 
 def test_asgi_websockets_receive_invalid_utf8(findall, skip_alert):
@@ -328,6 +467,34 @@ def test_asgi_websockets_handshake_case_insensitive():
     sock.close()
 
     assert resp['status'] == 101, 'status'
+
+
+def test_asgi_websockets_handshake_connection_list():
+    # Firefox sends "keep-alive, Upgrade" (nginx/unit PR 1550).  The
+    # "Connection" value is a list of options, and "upgrade" is one of them.
+    client.load('websockets/mirror')
+
+    key = ws.key()
+    resp, sock, _ = ws.upgrade(
+        headers={
+            'Host': 'localhost',
+            'Upgrade': 'websocket',
+            'Connection': 'keep-alive, Upgrade',
+            'Sec-WebSocket-Key': key,
+            'Sec-WebSocket-Protocol': 'chat',
+            'Sec-WebSocket-Version': 13,
+        }
+    )
+
+    assert resp['status'] == 101, 'status'
+    assert resp['headers']['Connection'] == 'Upgrade', 'connection'
+    assert resp['headers']['Sec-WebSocket-Accept'] == ws.accept(key), 'key'
+
+    ws.frame_write(sock, ws.OP_TEXT, 'blah')
+    frame = ws.frame_read(sock)
+    sock.close()
+
+    assert frame['data'].decode('utf-8') == 'blah', 'mirror'
 
 
 @pytest.mark.skip('not yet')
@@ -1674,8 +1841,23 @@ def test_asgi_websockets_app_queue_full(wait_for_record):
 
 
 def test_asgi_websockets_app_queue_full_timeout(wait_for_record):
-    client.load('websockets/stall')
+    # A fixed 2 s application sleep does not guarantee a full queue for
+    # 1 s: sending 20000 fragments can itself take seconds on slower CPUs.
+    # Hold the application until the timeout assertion finishes instead.
+    gate = f'{option.temp_dir}/stall-gate'
+    client.load('websockets/stall', environment={'UNIT_TEST_STALL_GATE': gate})
 
+    try:
+        check_app_queue_full_timeout(wait_for_record, gate)
+    finally:
+        # Release the application, and wait for it without an assert: a
+        # failure here must not hide the first one.
+        Path(gate + '.release').touch()
+        if Path(gate + '.started').exists():
+            waitforfiles(gate + '.released', timeout=150)
+
+
+def check_app_queue_full_timeout(wait_for_record, gate):
     assert 'success' in client.conf(
         {'http': {'websocket': {'read_timeout': 1, 'keepalive_interval': 0}}},
         'settings',
@@ -1683,27 +1865,151 @@ def test_asgi_websockets_app_queue_full_timeout(wait_for_record):
 
     _, sock, _ = ws.upgrade()
 
-    # The application reads nothing for 2 s, longer than the 1 s
-    # "read_timeout": the router stops waiting and fails the connection.
     ws.frame_write(sock, ws.OP_TEXT, 'stall')
-    ws.message(sock, ws.OP_BINARY, b'*' * 20000, fragmention_size=1)
+    try:
+        assert waitforfiles(gate + '.started', timeout=150), 'application stalled'
+        ws.message(sock, ws.OP_BINARY, b'*' * 20000, fragmention_size=1)
 
-    assert wait_for_record(
-        r'websocket: the application read nothing for 1000 ms, closing'
-    ), 'closed'
+        assert wait_for_record(
+            r'websocket: the application read nothing for 1000 ms, closing'
+        ), 'closed'
 
-    # The router closes the connection.  A reset is also a close: the
-    # client frames the router did not read are still in its socket.  An
-    # open socket raises a timeout here.
-    sock.settimeout(5)
+        # The router closes the connection.  A reset is also a close: the
+        # client frames the router did not read are still in its socket.  An
+        # open socket raises a timeout here.
+        sock.settimeout(5)
+
+        try:
+            assert sock.recv(1) == b'', 'connection closed'
+
+        except ConnectionResetError:
+            pass
+
+    finally:
+        sock.close()
+
+
+SHM_ALERT = (
+    r'websocket: no shared memory buffer for \d+ bytes of a \d+ byte frame, '
+    r'closing the connection'
+)
+
+
+@contextmanager
+def shm_segment_failure(skip_alert, text):
+    # The router copies each client frame into the application's outgoing
+    # shared memory.  A frame over 15 bytes goes to the application by
+    # reference and holds its 16 KiB chunk until the application reads it,
+    # so with the application stalled, 2000 frames of 64 bytes want more
+    # chunks than the 640 of one 10 MiB segment.  The pool has no limit but
+    # the segments the router can create: with RLIMIT_NOFILE at the router's
+    # open descriptor count, memfd_create() fails and the frame has nowhere
+    # to go.  The application is held until the assertions are done: a
+    # resumed application frees chunks, and then nothing fails.
+    skip_alert(
+        r'(memfd_create|shm_open)\(.+\) failed',
+        r'websocket: no shared memory buffer',
+    )
+
+    gate = f'{option.temp_dir}/stall-gate'
+    client.load('websockets/stall', environment={'UNIT_TEST_STALL_GATE': gate})
+
+    router = pid_by_name('unit: router')
+    assert router is not None, 'router pid'
+    router = int(router)
+
+    # prlimit() on another process needs the same user or CAP_SYS_RESOURCE,
+    # and a container's seccomp profile can refuse it (Alpine on armv7).
+    try:
+        limits = resource.prlimit(router, resource.RLIMIT_NOFILE)
+
+    except PermissionError:
+        pytest.skip('prlimit() on the router is not permitted here')
+
+    _, sock, _ = ws.upgrade()
 
     try:
-        assert sock.recv(1) == b'', 'connection closed'
+        ws.frame_write(sock, ws.OP_TEXT, text)
+        assert waitforfiles(gate + '.started', timeout=150), 'application stalled'
 
-    except ConnectionResetError:
-        pass
+        # The soft limit only: raising the hard limit of another process
+        # back needs CAP_SYS_RESOURCE, which a container may not have.
+        nfds = len(os.listdir(f'/proc/{router}/fd'))
+        resource.prlimit(router, resource.RLIMIT_NOFILE, (nfds, limits[1]))
 
-    sock.close()
+        # The send stops on the close; see frame_write().
+        ws.message(sock, ws.OP_BINARY, b'*' * (2000 * 64), fragmention_size=64)
+
+        yield sock
+
+    finally:
+        resource.prlimit(router, resource.RLIMIT_NOFILE, limits)
+
+        Path(gate + '.release').touch()
+        if Path(gate + '.started').exists():
+            waitforfiles(gate + '.released', timeout=150)
+
+        sock.close()
+
+
+@pytest.mark.skipif(
+    not hasattr(resource, 'prlimit'),
+    reason='lowers the router RLIMIT_NOFILE with prlimit()',
+)
+def test_asgi_websockets_shm_segment_failure_close(
+    findall, skip_alert, wait_for_record
+):
+    # The router must send the client a CLOSE frame with code 1011 before it
+    # closes the connection, and alert once, not once per frame (#658).
+    with shm_segment_failure(skip_alert, 'stall') as sock:
+        try:
+            frame = ws.frame_read(sock)
+
+        except ConnectionResetError:
+            pytest.fail('The server reset the connection, no CLOSE frame.')
+
+        check_close(sock, 1011, frame=frame)  # 1011 - INTERNAL_SERVER_ERROR
+
+        assert wait_for_record(SHM_ALERT), 'alert'
+        assert len(findall(SHM_ALERT)) == 1, 'one alert per connection'
+
+
+@pytest.mark.skipif(
+    not hasattr(resource, 'prlimit'),
+    reason='lowers the router RLIMIT_NOFILE with prlimit()',
+)
+def test_asgi_websockets_shm_segment_failure_after_app_close(
+    skip_alert, wait_for_record
+):
+    # The same failure after the application sent its CLOSE frame and kept
+    # the request open: ASGI sends "websocket.close" as a frame and ends the
+    # request only when the coroutine returns, for example after
+    # "websocket.disconnect".  No frame may follow a CLOSE (RFC 6455 Section
+    # 5.5.1), so the router must close the connection without a CLOSE frame
+    # of its own: the client reads the application's one and then the end
+    # of the connection.
+    with shm_segment_failure(skip_alert, 'close-stall') as sock:
+        try:
+            frame = ws.frame_read(sock)
+
+        except ConnectionResetError:
+            pytest.fail('The server reset the connection, no CLOSE frame.')
+
+        check_close(sock, 1000, no_close=True, frame=frame)  # the app's
+
+        assert wait_for_record(SHM_ALERT), 'alert'
+
+        # Then the end of the connection: an EOF, or a reset when the router
+        # still had unread frames.  A second CLOSE frame would read as b'\x88'.
+        assert select.select([sock], [], [], 60)[0], 'connection closed'
+
+        try:
+            data = sock.recv(1)
+
+        except ConnectionResetError:
+            data = b''
+
+        assert data == b'', 'no frame after the application CLOSE'
 
 
 def test_asgi_websockets_second_frame_over_buffer_limit():

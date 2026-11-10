@@ -152,7 +152,7 @@ def test_java_application_session_active(date_to_sec_epoch, sec_epoch):
     assert (
         abs(
             date_to_sec_epoch(resp['headers']['X-Session-Last-Access-Time'])
-            - sec_epoch
+            - sec_epoch()
         )
         < 5
     ), 'session last access time'
@@ -910,6 +910,84 @@ def test_java_application_get_header():
         )['headers']['X-Reply']
         == 'blah'
     ), 'get header'
+
+
+def test_java_application_header_bytes():
+    client.load('header_bytes')
+
+    def units(header, target):
+        body = client.http(
+            b'GET ' + target + b' HTTP/1.1\r\nHost: localhost\r\n'
+            b'X-Header: ' + header + b'\r\nConnection: close\r\n\r\n',
+            raw=True,
+            encoding='latin-1',
+        )['body']
+
+        return dict(line.split('=', 1) for line in body.split())
+
+    # Valid UTF-8 is decoded as UTF-8, a 4-byte character as a surrogate
+    # pair.
+    res = units('a\u043f\U0001f600'.encode(), b'/\xd0\xbf?\xd0\xbf')
+    assert res['header'] == '61,43f,d83d,de00', 'utf-8 header'
+    assert res['uri'] == '2f,43f', 'utf-8 uri'
+    assert res['query'] == '43f', 'utf-8 query'
+
+    # A response header value is read by its length, not up to a NUL.
+    assert res['resp'] == '61,0,62', 'response header with nul'
+
+    # Other bytes are decoded as ISO-8859-1, one char for each byte.
+    res = units(b'a\xff\xd0b', b'/\xff?\xe9')
+    assert res['header'] == '61,ff,d0,62', 'iso-8859-1 header'
+    assert res['uri'] == '2f,ff', 'iso-8859-1 uri'
+    assert res['query'] == 'e9', 'iso-8859-1 query'
+
+    # If a byte is not valid UTF-8, the whole value is ISO-8859-1, also
+    # the valid UTF-8 before it.
+    res = units(b'a\xd0\xbf\xff', b'/')
+    assert res['header'] == '61,d0,bf,ff', 'iso-8859-1 whole value'
+
+    # An overlong NUL and an encoded surrogate are not valid UTF-8.
+    res = units(b'\xc0\x80', b'/')
+    assert res['header'] == 'c0,80', 'overlong nul'
+
+    res = units(b'\xed\xa0\x80', b'/')
+    assert res['header'] == 'ed,a0,80', 'surrogate'
+
+
+def test_java_application_get_header_case():
+    # getHeader("X-Header") must find the field in any case.  Each request
+    # sends the name in a case that differs from the lookup name.
+    client.load('get_header')
+
+    for name in ['x-header', 'X-HEADER', 'x-HeAdEr']:
+        resp = client.get(
+            headers={
+                name: 'blah',
+                'Host': 'localhost',
+                'Connection': 'close',
+            }
+        )
+
+        assert resp['headers']['X-Reply'] == 'blah', f'get header {name}'
+
+
+def test_java_application_get_headers_case():
+    # getHeaders("X-Header") must give the values of the fields in all cases.
+    client.load('get_headers')
+
+    headers = client.get(
+        headers={
+            'X-Header': 'one',
+            'x-header': 'two',
+            'X-HEADER': 'three',
+            'Host': 'localhost',
+            'Connection': 'close',
+        }
+    )['headers']
+
+    assert headers['X-Reply-0'] == 'one', 'get headers case 0'
+    assert headers['X-Reply-1'] == 'two', 'get headers case 1'
+    assert headers['X-Reply-2'] == 'three', 'get headers case 2'
 
 
 def test_java_application_get_header_empty():

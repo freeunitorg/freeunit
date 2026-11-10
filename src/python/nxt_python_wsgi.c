@@ -967,7 +967,7 @@ nxt_py_start_resp(PyObject *self, PyObject *args)
     char              *status_str, *space_ptr;
     uint32_t          status_len;
     PyObject          *headers, *tuple, *string, *status_bytes;
-    Py_ssize_t        i, n, fields_size, fields_count;
+    Py_ssize_t        i, n, len, fields_size, fields_count;
     nxt_python_ctx_t  *pctx;
 
     pctx = (nxt_python_ctx_t *) self;
@@ -1013,15 +1013,32 @@ nxt_py_start_resp(PyObject *self, PyObject *args)
 
         string = PyTuple_GET_ITEM(tuple, 0);
         if (PyBytes_Check(string)) {
-            fields_size += PyBytes_GET_SIZE(string);
+            len = PyBytes_GET_SIZE(string);
 
         } else if (PyUnicode_Check(string)) {
-            fields_size += PyUnicode_GET_LENGTH(string);
+            /* Latin-1, so one byte for each character. */
+            len = PyUnicode_GET_LENGTH(string);
 
         } else {
             return PyErr_Format(PyExc_TypeError,
                                 "header #%d name is not a string", (int) i);
         }
+
+        /*
+         * libunit stores the name length in a uint8_t.  Check the full
+         * Py_ssize_t length here, before nxt_python_str_buf() narrows it.
+         */
+        if (nxt_slow_path(len > UINT8_MAX)) {
+            nxt_unit_req_error(pctx->req, "header #%d name is too long "
+                               "(%zd bytes, the limit is %d)",
+                               (int) i, len, UINT8_MAX);
+
+            return PyErr_Format(PyExc_ValueError,
+                                "header #%d name is too long (%zd bytes, "
+                                "the limit is %d)", (int) i, len, UINT8_MAX);
+        }
+
+        fields_size += len;
 
         string = PyTuple_GET_ITEM(tuple, 1);
         if (PyBytes_Check(string)) {
@@ -1134,7 +1151,9 @@ nxt_python_response_add_field(nxt_python_ctx_t *pctx, PyObject *name,
         goto fail;
     }
 
-    if (pctx->req->response->fields[i].hash == NXT_UNIT_HASH_CONTENT_LENGTH) {
+    if (pctx->req->response->fields[i].hash == NXT_UNIT_HASH_CONTENT_LENGTH
+        && nxt_python_is_content_length(name_str, name_length))
+    {
         content_length = nxt_off_t_parse((u_char *) value_str, value_length);
         if (nxt_slow_path(content_length < 0)) {
             nxt_unit_req_error(pctx->req, "failed to parse Content-Length "

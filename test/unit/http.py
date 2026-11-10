@@ -222,7 +222,10 @@ class HTTP1:
         buff_size = kwargs.get('buff_size', 4096)
         framed = kwargs.get('framed', False)
 
-        data = b''
+        # A bytearray grows in place.  "data += part" on bytes copied the
+        # whole response for every read, so a large body took quadratic
+        # time: 12 MiB in 4 KiB reads took about 14 s.
+        data = bytearray()
         while True:
             rlist = select.select([sock], [], [], timeout)[0]
             if not rlist:
@@ -249,7 +252,7 @@ class HTTP1:
             if framed and self._response_complete(data):
                 break
 
-        return data
+        return bytes(data)
 
     @staticmethod
     def _response_complete(data):

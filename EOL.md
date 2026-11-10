@@ -32,6 +32,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Python | 3.12 | Oct 2028 | Oct 2029 |
 | Python | 3.13 | Oct 2029 | Oct 2030 |
 | Python | 3.14 | Oct 2030 | Oct 2031 |
+| Python | 3.15 | Oct 2031 | Oct 2032 |
 | Ruby | 3.3 | Mar 2027 | Mar 2028 |
 | Ruby | 3.4 | Mar 2028 | Mar 2029 |
 | Ruby | 4.0 | Mar 2029 | Mar 2030 |
@@ -94,8 +95,8 @@ needs an upgrade or replacement decision instead.
 | Eclipse Jetty | `jetty-util` / `jetty-server` / `jetty-http` jars bundled by the Java module | 9.4.58.v20250814 | **Aug 2025 (EOL)** † | Jetty 9.4 lost community support on 2025-08-14 and the bundled build is its last release. Needs an upgrade-or-replace decision — Jetty 10/11 are EOL too; 12.x is the supported line. |
 | Eclipse ECJ (JDT batch compiler) | JSP compilation jar bundled by the Java module | 3.26.0 | none published | Tracks Eclipse releases; endoflife.date has no product for it. Pinned build is from Jun 2021; current is 3.42.0 (Jun 2025). |
 | ClassGraph | classpath scanning jar bundled by the Java module | latest | — | No upstream EOL schedule; pinned and bumped as needed. |
-| Wasmtime (C API) | WebAssembly runtime built by `pkg/contrib` and linked by the `wasm` module | 48.0.7 | none published | Source tarball pin (`pkg/contrib/src/wasmtime/version`); maintainers must mirror `wasmtime-v48.0.7-src.tar.gz` before contrib and uncached CI downloads work. The official archive was checked against `SHA512SUMS` locally; the FreeUnit mirror URL is unchanged. The `Audit (cargo)` pins job queries OSV and gates the archived lock on the actual linked C API graph. Same 48.0.7 as the Rust pin below; 48 is a long-term support line. This bump closes RUSTSEC-2026-0350 through -0359, -0361 through -0364, and -0375 through -0379. The vendored lock retains reviewed exact-version exceptions for yanked chacha20 0.10.0 and Tokio 1.51.1 (RUSTSEC-2026-0386; no downstream AsyncFd callers found). Earlier security bumps are recorded in `pkg/eol.json` and #400. |
-| Wasmtime (Rust crate) | WebAssembly runtime used by the `wasm-wasi-component` module | 48.0.7 | none published | `src/wasm-wasi-component/Cargo.lock`, audited by the `Audit (cargo)` workflow on every lock. Bumped with the advisories it closes. |
+| Wasmtime (C API) | WebAssembly runtime built by `pkg/contrib` and linked by the `wasm` module | 48.0.8 | none published | Source tarball pin (`pkg/contrib/src/wasmtime/version`); the FreeUnit mirror holds `wasmtime-v48.0.8-src.tar.gz`, and its `SHA512SUMS` entry is the digest of the official release archive. The `Audit (cargo)` pins job queries OSV and gates the archived lock on the actual linked C API graph. Same 48.0.8 as the Rust pin below; 48 is a long-term support line. This bump closes RUSTSEC-2026-0420 through -0424. The 48.0.7 bump closed RUSTSEC-2026-0350 through -0359, -0361 through -0364, and -0375 through -0379. The vendored lock retains reviewed exact-version exceptions for yanked chacha20 0.10.0 and Tokio 1.51.1 (RUSTSEC-2026-0386; no downstream AsyncFd callers found). Earlier security bumps are recorded in `pkg/eol.json` and #400. |
+| Wasmtime (Rust crate) | WebAssembly runtime used by the `wasm-wasi-component` module | 48.0.8 | none published | `src/wasm-wasi-component/Cargo.lock`, audited by the `Audit (cargo)` workflow on every lock. Bumped with the advisories it closes. |
 
 ## Rules
 
