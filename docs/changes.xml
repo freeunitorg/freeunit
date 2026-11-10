@@ -7,8 +7,19 @@
 
 <changes apply="unit"
          ver="1.38.0" rev="1"
-         date="2026-11-09" time="00:00:00 +0000"
+         date="2026-11-10" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
+
+<change type="security">
+<para>
+the access log wrote the value of a header that can carry a credential to the
+log file: Authorization, Proxy-Authorization, Cookie or Set-Cookie, named as
+"$header_&lt;name&gt;" or "$response_header_&lt;name&gt;".  Such a variable is
+now written as "REDACTED".  The new boolean option "log_credentials" of
+"access_log" keeps the value; it is false by default.  This replaces the
+1.37.1 warning about such a format.
+</para>
+</change>
 
 <change type="feature">
 <para>
@@ -27,6 +38,18 @@ it answers or exits.
 </para>
 </change>
 
+<change type="feature">
+<para>
+the "wasm-wasi-component" module runs components that export
+"wasi:http/handler@0.3.0".  A component that exports the WASI 0.2
+"wasi:http/incoming-handler@0.2.x" interface runs on the unchanged 0.2 path.
+The module checks the exports of a component once, when it loads it, so no
+configuration key selects the path.  The 0.3 path uses the asynchronous
+component model and the wasmtime-wasi p3 interfaces; outbound HTTP from a
+guest stays disabled on both paths.
+</para>
+</change>
+
 <change type="change">
 <para>
 with PCRE2 10.48 or later, route regexes match in UTF-8 mode: "." and a
@@ -40,6 +63,48 @@ or in the library at run time, still match bytes: before 10.48 the UTF-8
 mode is not safe with invalid UTF-8 from a client.  So the same
 configuration can route a request with such bytes differently on two
 builds.
+</para>
+</change>
+
+<change type="change">
+<para>
+libunit carries a protocol number, "NXT_UNIT_PROTOCOL_VERSION" 1.  The main
+process writes "&lt;version&gt;/&lt;number&gt;" as the first field of
+"NXT_UNIT_INIT", and libunit refuses a daemon whose version or protocol number
+differs, with a separate "protocol mismatch" alert.  A daemon without the
+number counts as protocol 0.  "nxt_unit_callbacks_t" is frozen at 12 members,
+and "nxt_unit_init_t.size" is appended after "max_processes"; it holds the
+size of the struct as the caller built it, and 0 means the 1.38 layout.  An
+external application linked against libunit must be rebuilt against 1.38; a
+statically linked copy keeps its own protocol and refuses a daemon that speaks
+another.
+</para>
+</change>
+
+<change type="change">
+<para>
+the exported "nxt_lib_stop()" function is removed.  It had no caller in the
+tree and is not part of the 1.38 libunit interface.
+</para>
+</change>
+
+<change type="change">
+<para>
+on Linux, an idle libunit context waits for a message in an epoll set with
+"EPOLLEXCLUSIVE" on the shared port when the application has 4 or more
+processes, so one "READ_QUEUE" wakes one idle context instead of every idle
+context.  With fewer processes it still waits in "poll()".  The read order and
+the behaviour do not change.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+when a graceful "QUIT" arrived on the read port while the shared port was
+readable, the context could go offline without taking the request that the
+router had just queued, so that request waited for the next doorbell or for
+another context's one-second wait.  The context now takes one request before it
+returns the rung.
 </para>
 </change>
 </changes>
@@ -56,7 +121,7 @@ builds.
                 unit-jsc19 unit-jsc20 unit-jsc21
                 unit-wasm"
          ver="1.38.0" rev="1"
-         date="2026-11-09" time="00:00:00 +0000"
+         date="2026-11-10" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change>
