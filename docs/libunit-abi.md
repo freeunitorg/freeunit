@@ -101,3 +101,7 @@ size -= n;   /* size > 0: write p, size again from shm_ack_handler */
 - `nxt_unit_callbacks_t` is frozen at 12 members.
 - `nxt_unit_init_t` has `max_processes` and `size` at its end: 256 bytes
   on LP64 (was 248) and 168 on ILP32 (was 160).  No earlier field moves.
+- The vestigial `nxt_lib_stop()` exported symbol is removed (`src/nxt_lib.c`
+  and `src/nxt_main.h`).  It had no caller in the tree, upstream or
+  downstream, and only called `exit(0)`; the daemon quits on the
+  `nxt_runtime_quit()` path.  Nothing that links libunit called it.
