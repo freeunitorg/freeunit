@@ -630,20 +630,3 @@ nxt_cgroup_cpu_max_read(const char *dir, void *data)
 }
 
 #endif
-
-
-void
-nxt_lib_stop(void)
-{
-    /*
-     * There is no in-tree caller for this exported symbol, and it has no
-     * access to the runtime.  Event engines are per-thread and are torn down
-     * on the nxt_runtime_quit path by their owning threads; stopping them
-     * from here would require runtime access -- either an ABI-breaking change
-     * to this signature or a new global.  The symbol keeps its historical
-     * immediate-exit behavior for ABI compatibility.
-     */
-
-    exit(0);
-    nxt_unreachable();
-}

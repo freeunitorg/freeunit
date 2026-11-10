@@ -4072,6 +4072,167 @@ nxt_unit_msg_test_shm_ack_case(void *data)
 
 
 /*
+ * Runs nxt_unit_init() on "init", which must fail, and checks that libunit
+ * logged "expect".  libunit logs to stderr until it has the log fd of the
+ * daemon, so stderr goes to a file.  Returns 0, or the step that failed.
+ */
+static int
+nxt_unit_msg_test_init_refused(nxt_unit_init_t *init, const char *expect)
+{
+    char     log[2048];
+    FILE     *f;
+    ssize_t  n;
+
+    f = tmpfile();
+    if (f == NULL || dup2(fileno(f), STDERR_FILENO) == -1) {
+        return 2;
+    }
+
+    if (nxt_unit_init(init) != NULL) {
+        return 3;
+    }
+
+    n = pread(fileno(f), log, sizeof(log) - 1, 0);
+    log[n > 0 ? n : 0] = '\0';
+
+    if (strstr(log, expect) == NULL) {
+        printf("unit msg test: logged \"%s\", expected \"%s\"\n", log,
+               expect);
+        fflush(stdout);
+
+        return 4;
+    }
+
+    return 0;
+}
+
+
+/*
+ * NXT_UNIT_INIT starts with "<NXT_VERSION>/<NXT_UNIT_PROTOCOL_VERSION>".
+ * Two builds of one release can speak different protocols, so libunit
+ * refuses a daemon whose number differs from its own, or that writes
+ * none, although the version is the same.  The variable has no fields
+ * after the version, so a version that is accepted fails at the fields;
+ * the log tells which check refused it.
+ */
+
+typedef struct {
+    const char  *name;
+    const char  *version;    /* NULL: NXT_VERSION. */
+    int         protocol;    /* Added to NXT_UNIT_PROTOCOL_VERSION. */
+    int         form;        /* 0: "V;x", 1: "V/P;x", 2: "V/;x". */
+    const char  *expect;     /* In the log. */
+} nxt_unit_msg_test_handshake_t;
+
+
+static const nxt_unit_msg_test_handshake_t  handshakes[] = {
+    { "NXT_UNIT_INIT with this version and protocol is accepted",
+      NULL, 0, 1, "invalid number of variables" },
+    { "NXT_UNIT_INIT with no protocol number is refused",
+      NULL, 0, 0, "protocol mismatch" },
+    { "NXT_UNIT_INIT with an empty protocol number is refused",
+      NULL, 0, 2, "protocol mismatch" },
+    { "NXT_UNIT_INIT with another protocol number is refused",
+      NULL, 1, 1, "protocol mismatch" },
+    { "NXT_UNIT_INIT with another version is refused",
+      "0.0.0", 0, 1, "versions mismatch" },
+};
+
+
+static int
+nxt_unit_msg_test_handshake_case(void *data)
+{
+    int                                  rc;
+    char                                 env[128];
+    const char                           *version;
+    nxt_unit_init_t                      init;
+    const nxt_unit_msg_test_handshake_t  *t = data;
+
+    version = (t->version != NULL) ? t->version : NXT_VERSION;
+
+    if (t->form == 0) {
+        snprintf(env, sizeof(env), "%s;x", version);
+
+    } else if (t->form == 1) {
+        snprintf(env, sizeof(env), "%s/%d;x", version,
+                 NXT_UNIT_PROTOCOL_VERSION + t->protocol);
+
+    } else {
+        snprintf(env, sizeof(env), "%s/;x", version);
+    }
+
+    if (setenv(NXT_UNIT_INIT_ENV, env, 1) != 0) {
+        return 1;
+    }
+
+    memset(&init, 0, sizeof(init));
+    init.callbacks.request_handler = nxt_unit_msg_test_handler;
+
+    rc = nxt_unit_msg_test_init_refused(&init, t->expect);
+    if (rc != 0) {
+        printf("unit msg test: with %s=\"%s\"\n", NXT_UNIT_INIT_ENV, env);
+        fflush(stdout);
+
+        return rc;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
+ * nxt_unit_init_t.size is 0 or the size of the struct as the caller built
+ * it.  A size that libunit accepts gets as far as NXT_UNIT_INIT, which the
+ * child does not have.  A caller built for a later libunit is refused
+ * before anything else.
+ */
+
+typedef struct {
+    const char  *name;
+    int         set;         /* 0: size 0, 1: sizeof + delta. */
+    int         delta;
+    const char  *expect;     /* In the log. */
+} nxt_unit_msg_test_init_size_t;
+
+
+static const nxt_unit_msg_test_init_size_t  init_sizes[] = {
+    { "nxt_unit_init_t.size 0 is accepted", 0, 0,
+      "is not in the current environment" },
+    { "nxt_unit_init_t.size of the struct is accepted", 1, 0,
+      "is not in the current environment" },
+    { "nxt_unit_init_t.size of a later struct is refused", 1, 8,
+      "nxt_unit_init_t.size is" },
+};
+
+
+static int
+nxt_unit_msg_test_init_size_case(void *data)
+{
+    int                                  rc;
+    nxt_unit_init_t                      init;
+    const nxt_unit_msg_test_init_size_t  *t = data;
+
+    if (unsetenv(NXT_UNIT_INIT_ENV) != 0) {
+        return 1;
+    }
+
+    memset(&init, 0, sizeof(init));
+    init.callbacks.request_handler = nxt_unit_msg_test_handler;
+
+    if (t->set) {
+        init.size = (uint32_t) ((int) sizeof(init) + t->delta);
+    }
+
+    rc = nxt_unit_msg_test_init_refused(&init, t->expect);
+    if (rc != 0) {
+        return rc;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
  * nxt_unit_memcasecmp() folds the case of two bytes only when the bytes
  * differ.  Its results, value and sign, must stay those of the old loop
  * that folded every byte.  The reference below is that loop, with its own
@@ -4644,6 +4805,18 @@ main(void)
                                "wait shrunk",
                                nxt_unit_msg_test_shm_ack_case, NULL,
                                NXT_UNIT_OK);
+
+    for (i = 0; i < nxt_nitems(handshakes); i++) {
+        nxt_unit_msg_test_in_child(handshakes[i].name,
+                                   nxt_unit_msg_test_handshake_case,
+                                   (void *) &handshakes[i], NXT_UNIT_OK);
+    }
+
+    for (i = 0; i < nxt_nitems(init_sizes); i++) {
+        nxt_unit_msg_test_in_child(init_sizes[i].name,
+                                   nxt_unit_msg_test_init_size_case,
+                                   (void *) &init_sizes[i], NXT_UNIT_OK);
+    }
 
     /*
      * Release the library.  Otherwise the global context pointer keeps it
