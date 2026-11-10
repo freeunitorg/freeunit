@@ -887,8 +887,16 @@ nxt_router_schedule_queue_wait_test(nxt_thread_t *thr)
 
     nxt_router_schedules_status(&stat, name + sizeof(name), name);
 
+    /*
+     * The thread's monotonic clock is CLOCK_MONOTONIC_COARSE: a tickless
+     * kernel may not have updated it yet when the sleep above returns, so
+     * the wait can read up to a tick short.  The timer bias is the slack,
+     * far below the wait: without the wait in "last_duration" the duration
+     * would be a few milliseconds.
+     */
+
     if (stat.running != 0 || stat.runs != 1
-        || stat.last_duration < NXT_SCHEDULE_TEST_WAIT)
+        || stat.last_duration + NXT_TIMER_DEFAULT_BIAS < NXT_SCHEDULE_TEST_WAIT)
     {
         nxt_log_alert(thr->log, "schedule queue wait: running %uD, runs %uD, "
                       "last duration %uD ms after a wait of %d ms",
