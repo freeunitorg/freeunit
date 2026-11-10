@@ -7,13 +7,16 @@ FreeUnit application process pays when it starts: engine creation, reading
 the file, compiling or loading the code, and linking/instantiation.
 
 Modes, for each guest:
-  jit          what unitd does today
+  jit          what unitd did when these numbers were taken (before #912
+               for the component module; the C API always had parallel
+               compilation on).  Used as the baseline mode here.
   cache-cold   Wasmtime cache on, cache directory empty (first start)
   cache-warm   Wasmtime cache on, directory filled by the previous start
   aot          precompiled .cwasm, deserialize_file
   aot-mem      (C only) fopen/fread the .cwasm, wasmtime_module_deserialize
   jit-par      (Rust only) jit with wasmtime's parallel-compilation feature,
-               which src/wasm-wasi-component does not enable today
+               which src/wasm-wasi-component did not enable when the numbers
+               were measured; #912 turned it on later
   jit-epoch    (Rust only) jit with epoch interruption, as with
                "execution_timeout"
 

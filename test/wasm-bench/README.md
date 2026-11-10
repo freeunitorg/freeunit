@@ -86,7 +86,12 @@ see [RESULTS.md](RESULTS.md) for spread, read times and the unitd check.
 `ci-hello` and `ci-hello-world` are the guests of `test_wasm.py` and
 `test_wasm-wasi-component.py`.
 
-| guest | path | .wasm KiB | .cwasm KiB | JIT (today) | JIT, parallel compile | cache, 1st start | cache, next starts | AOT .cwasm |
+The `JIT` column is what the component module did when the numbers were
+taken; #912 has since turned on `parallel-compilation` there, so today's
+component start is the `JIT, parallel compile` column.  The C API module has
+always compiled in parallel, hence "(already on)".
+
+| guest | path | .wasm KiB | .cwasm KiB | JIT | JIT, parallel compile | cache, 1st start | cache, next starts | AOT .cwasm |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
 | ci-hello | wasm (C API) | 248 | 106 | 15.28 | (already on) | 16.76 | 1.41 | 0.46 |
 | c-echo | wasm (C API) | 155 | 87 | 15.82 | (already on) | 18.11 | 1.19 | 0.47 |
@@ -99,10 +104,12 @@ see [RESULTS.md](RESULTS.md) for spread, read times and the unitd check.
 * JIT cost grows with code size: 15–20 ms for the C guests, 80–800 ms for
   the components.  A real unitd shows the same on the first request after a
   restart (22–24 ms C, 78–783 ms components).
-* The Rust module compiles on one core: Wasmtime's `parallel-compilation`
-  feature is off in `src/wasm-wasi-component`, and turning it on cuts JIT
-  3.5–5.5x on this machine.  Epoch interruption (`execution_timeout`) adds
-  20–35 % to JIT.
+* The Rust module compiled on one core when the numbers were taken:
+  Wasmtime's `parallel-compilation` feature was off in
+  `src/wasm-wasi-component`, and the `JIT, parallel compile` column shows
+  that turning it on cuts JIT 3.5–5.5x on this machine.  #912 has since
+  turned the feature on, so a component start should now look like that
+  column.  Epoch interruption (`execution_timeout`) adds 20–35 % to JIT.
 * A warm cache makes a start 10–100x faster (1–8 ms) but the first start
   per module stays at JIT cost (slightly more: it also writes the cache).
 * AOT loads in under 1 ms for every guest, independent of size, because
@@ -111,9 +118,9 @@ see [RESULTS.md](RESULTS.md) for spread, read times and the unitd check.
 
 ## Recommendation
 
-* **Development: JIT**, as today, plus parallel compilation for the Rust
-  module.  Edit, restart, and the new module is compiled; nothing to keep in
-  sync.
+* **Development: JIT**, as today; the Rust module now compiles components
+  in parallel (#912).  Edit, restart, and the new module is compiled;
+  nothing to keep in sync.
 * **Production: AOT `.cwasm`**, with the cache as the cheap middle step.
   The cache needs no build step and only a writable directory; AOT also
   removes the first-start compile and is the only mode with a flat start

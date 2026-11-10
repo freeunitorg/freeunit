@@ -17,14 +17,18 @@ cache) or `wasmtime_module_deserialize(_file)` /
 instantiated module (C: `wasmtime_linker_module`) or a `ProxyPre` (Rust),
 without exec and dynamic linking of the harness itself.
 
-Modes: `jit` is what unitd does today.  `cache-cold` is the first start with
+Modes: `jit` is what unitd did for these runs: the C API module compiles in
+parallel, the component module did not (no `parallel-compilation` feature)
+until #912 landed after the measurement.  `cache-cold` is the first start with
 an empty Wasmtime cache directory, `cache-warm` a later start.  `aot` loads
 a `.cwasm` made by `wasmtime_module_serialize` /
 `Engine::precompile_component` with the same engine config.  `aot-mem` (C)
 reads the `.cwasm` into memory first.  `jit-par` (Rust) turns on Wasmtime's
-`parallel-compilation` feature, which `src/wasm-wasi-component` does not
-enable today (the C API build has it on).  `jit-epoch` (Rust) is JIT with
-epoch interruption, as with `execution_timeout`.
+`parallel-compilation` feature, which `src/wasm-wasi-component` did not
+enable when these numbers were measured (the C API build always had it on);
+#912 has since turned it on, so a component start should now match this
+row.  `jit-epoch` (Rust) is JIT with epoch interruption, as with
+`execution_timeout`.
 
 | path | guest | .wasm KiB | .cwasm KiB | mode | read ms | compile/load ms | ready (process) ms |
 |---|---|---:|---:|---|---:|---:|---:|

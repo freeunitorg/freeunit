@@ -7,7 +7,8 @@
 #                            (make -C pkg/contrib .wasmtime), i.e. the same
 #                            libwasmtime the "wasm" module links
 #   wasm-bench-load          Rust, wasmtime crates and features as in
-#                            src/wasm-wasi-component (lock copied from it)
+#                            src/wasm-wasi-component before #912 (lock
+#                            copied from it)
 #   wasm-bench-load-cache    + wasmtime "cache" feature
 #   wasm-bench-load-par      + "cache" and "parallel-compilation"
 
