@@ -1,6 +1,8 @@
 # Copyright (C) FreeUnit contributors.
 
+import os
 import time
+from pathlib import Path
 
 
 async def application(scope, receive, send):
@@ -11,10 +13,28 @@ async def application(scope, receive, send):
                 await send({'type': 'websocket.accept'})
 
             if m['type'] == 'websocket.receive':
-                if m.get('text') == 'stall':
+                if m.get('text') in ('stall', 'close-stall'):
+                    if m['text'] == 'close-stall':
+                        # A CLOSE frame to the client first; the request
+                        # stays open while the stall holds the coroutine.
+                        await send({'type': 'websocket.close'})
+
                     # Block the event loop, so libunit reads nothing from
                     # the port queue while the router fills it.
-                    time.sleep(2)
+                    gate = os.environ.get('UNIT_TEST_STALL_GATE')
+                    if gate is None:
+                        time.sleep(2)
+                    else:
+                        Path(gate + '.started').touch()
+                        deadline = time.monotonic() + 60
+                        while not Path(gate + '.release').exists():
+                            if time.monotonic() >= deadline:
+                                raise RuntimeError('stall gate not released')
+                            time.sleep(0.01)
+                        Path(gate + '.released').touch()
+                        # The timeout test has already closed the socket;
+                        # do not echo the queued flood during teardown.
+                        return
                     continue
 
                 await send(

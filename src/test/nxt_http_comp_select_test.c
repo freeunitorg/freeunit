@@ -107,6 +107,41 @@ nxt_hcs_compare(nxt_hcs_ctx_t *ctx, const u_char *p, size_t len)
                        (int) ref_refused);
     }
 
+    /*
+     * The compression-off shortcut of nxt_http_comp_check_acceptable(): it
+     * may skip negotiation only where the full parse with compression off
+     * selects identity and refuses nothing.  It is checked on the value as
+     * one field and split into two fields.
+     */
+
+    for (mode = 0; mode < 3; mode++) {
+        bool    shortcut;
+        size_t  split;
+
+        split = (mode == 0) ? 0 : (mode == 1) ? len / 2 : 1;
+
+        ctx->r->resp.content_length_n = -1;
+
+        ref = nxt_http_comp_test_off_shortcut(ctx->r, &value, split,
+                                              &shortcut, &ref_refused);
+
+        NXT_TEST_CHECK(ctx->thr->log,
+                       ref != -1 || !shortcut,
+                       "http comp off shortcut test failed: split %uz value "
+                       "\"%*s\" skipped a refusal", split, len, p);
+
+        NXT_TEST_CHECK(ctx->thr->log,
+                       !shortcut || (ref == 0 && !ref_refused),
+                       "http comp off shortcut test failed: split %uz value "
+                       "\"%*s\" skipped %i/%d", split, len, p, ref,
+                       (int) ref_refused);
+
+        NXT_TEST_CHECK(ctx->thr->log,
+                       shortcut == (memchr(p, ';', len) == NULL),
+                       "http comp off shortcut test failed: split %uz value "
+                       "\"%*s\" shortcut %d", split, len, p, (int) shortcut);
+    }
+
     if (memchr(p, ';', len) == NULL) {
         ctx->skipped++;
     }
@@ -150,6 +185,110 @@ nxt_hcs_random(uint32_t *state)
 
     return *state >> 8;
 }
+
+
+#if (NXT_HAVE_BROTLI)
+
+/*
+ * nxt_brotli_compress() writes the whole flush or the whole end of the
+ * stream, or it fails.  An output buffer 2 bytes short of what the call
+ * needs gives -1, not a part of the output, and a buffer of exactly that
+ * size is enough.  Quality 1 is the fast path of the encoder, 5 and 11 are
+ * the other path.
+ */
+
+static ssize_t
+nxt_hcs_brotli_call(int8_t level, bool last, bool empty, size_t out_len)
+{
+    ssize_t                         n;
+    uint8_t                         out[1024];
+    nxt_http_comp_compressor_ctx_t  cctx;
+
+    static const uint8_t  in[] = "FreeUnit compression test string for an "
+                                 "incomplete flush or finish.";
+
+    nxt_memzero(&cctx, sizeof(cctx));
+    cctx.level = level;
+
+    if (nxt_http_comp_brotli_ops.init(&cctx) != 0) {
+        return -2;
+    }
+
+    n = nxt_http_comp_brotli_ops.deflate(&cctx, in, empty ? 0 : sizeof(in) - 1,
+                                         out, nxt_min(out_len, sizeof(out)),
+                                         last);
+
+    nxt_http_comp_brotli_ops.free(&cctx);
+
+    return n;
+}
+
+
+static nxt_int_t
+nxt_hcs_brotli(nxt_hcs_ctx_t *ctx)
+{
+    bool        last;
+    ssize_t     need, n;
+    nxt_uint_t  i, k;
+
+    static const int8_t  levels[] = { 1, 5, 11 };
+
+    for (i = 0; i < nxt_nitems(levels); i++) {
+        for (k = 0; k < 2; k++) {
+            last = (k == 1);
+
+            need = nxt_hcs_brotli_call(levels[i], last, false, 1024);
+
+            NXT_TEST_CHECK(ctx->thr->log, need > 4,
+                           "brotli level %d %s gave %z", (int) levels[i],
+                           last ? "finish" : "flush", need);
+
+            n = nxt_hcs_brotli_call(levels[i], last, false, need - 2);
+
+            NXT_TEST_CHECK(ctx->thr->log, n == -1,
+                           "brotli level %d %s into %z of %z bytes "
+                           "returned %z, expected -1", (int) levels[i],
+                           last ? "finish" : "flush", need - 2, need, n);
+
+            n = nxt_hcs_brotli_call(levels[i], last, false, 4);
+
+            NXT_TEST_CHECK(ctx->thr->log, n == -1,
+                           "brotli level %d %s into 4 bytes returned %z, "
+                           "expected -1", (int) levels[i],
+                           last ? "finish" : "flush", n);
+
+            n = nxt_hcs_brotli_call(levels[i], last, false, need);
+
+            NXT_TEST_CHECK(ctx->thr->log, n == need,
+                           "brotli level %d %s into %z bytes returned %z",
+                           (int) levels[i], last ? "finish" : "flush",
+                           need, n);
+        }
+    }
+
+    /*
+     * The application path compresses an empty last part, so the end of the
+     * stream alone must work.  It is one byte.
+     */
+
+    for (i = 0; i < nxt_nitems(levels); i++) {
+        n = nxt_hcs_brotli_call(levels[i], true, true, 1024);
+
+        NXT_TEST_CHECK(ctx->thr->log, n == 1,
+                       "brotli level %d finish of an empty part gave %z, "
+                       "expected 1", (int) levels[i], n);
+
+        n = nxt_hcs_brotli_call(levels[i], true, true, 0);
+
+        NXT_TEST_CHECK(ctx->thr->log, n == -1,
+                       "brotli level %d finish of an empty part into 0 bytes "
+                       "returned %z, expected -1", (int) levels[i], n);
+    }
+
+    return NXT_OK;
+}
+
+#endif
 
 
 static nxt_int_t
@@ -247,6 +386,35 @@ nxt_hcs_expect(nxt_hcs_ctx_t *ctx)
                        res, (int) refused);
 
         ctx->r->resp.content_length = NULL;
+    }
+
+    {
+        ssize_t                         n;
+        uint8_t                         out[4];
+        nxt_http_comp_compressor_ctx_t  cctx;
+
+        static const uint8_t  str[] = "a last call with no room left";
+
+        /*
+         * A last call whose output cannot hold the whole stream leaves
+         * Z_FINISH unfinished: deflate() returns Z_OK, not Z_STREAM_END.
+         * nxt_zlib_deflate() must report that as an error.  Returning the
+         * bytes written would send a truncated body as a success.
+         */
+        nxt_memzero(&cctx, sizeof(cctx));
+        cctx.level = 6;
+
+        NXT_TEST_CHECK(ctx->thr->log,
+                       nxt_http_comp_gzip_ops.init(&cctx) == 0,
+                       "gzip init failed");
+
+        n = nxt_http_comp_gzip_ops.deflate(&cctx, str, sizeof(str) - 1,
+                                           out, sizeof(out), true);
+        nxt_http_comp_gzip_ops.free(&cctx);
+
+        NXT_TEST_CHECK(ctx->thr->log, n == -1,
+                       "gzip of %uz bytes into %uz gave %z, not -1",
+                       sizeof(str) - 1, sizeof(out), n);
     }
 
 #if (NXT_64BIT) && defined(MAP_NORESERVE)
@@ -464,6 +632,12 @@ nxt_http_comp_select_test(nxt_thread_t *thr)
     if (ret == NXT_OK) {
         ret = nxt_hcs_expect(&ctx);
     }
+
+#if (NXT_HAVE_BROTLI)
+    if (ret == NXT_OK) {
+        ret = nxt_hcs_brotli(&ctx);
+    }
+#endif
 
     if (r->mem_pool != NULL) {
         nxt_mp_destroy(r->mem_pool);

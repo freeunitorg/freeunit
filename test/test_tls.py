@@ -1104,7 +1104,7 @@ def test_tls_certificate_chain_options(date_to_sec_epoch, sec_epoch):
 
     assert (
         abs(
-            sec_epoch
+            sec_epoch()
             - date_to_sec_epoch(cert['validity']['since'], date_format)
         )
         < 60
@@ -1431,6 +1431,96 @@ def test_tls_write_abrupt_close():
     # Router must still be responsive — not stuck in a busy-loop.
     assert client.get_ssl(read_timeout=5).get('status') == 200, \
         'router hung after aborted TLS write (issue #28)'
+
+
+@pytest.mark.parametrize(
+    'version',
+    [ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_3],
+    ids=['tls1.2', 'tls1.3'],
+)
+def test_tls_shutdown_after_fatal_error(version, wait_for_record, findall):
+    """A record that fails to decrypt is a fatal TLS error: the router logs
+    it at info and closes the connection.  It must not then call
+    SSL_shutdown(), which fails on a session in that state and was logged
+    at alert as "SSL_shutdown(...) failed"."""
+    client.certificate()
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "routes",
+                    "tls": {"certificate": "default"},
+                }
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    ), 'load application configuration'
+
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    context.minimum_version = version
+    context.maximum_version = version
+
+    with context.wrap_socket(
+        socket.create_connection(('127.0.0.1', port_map.port(8080)))
+    ) as sock:
+        sock.sendall(b'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
+        assert sock.recv(4096).startswith(b'HTTP/1.1 200'), 'keep-alive'
+
+        # An application data record with a payload that cannot decrypt.
+        os.write(sock.fileno(), b'\x17\x03\x03\x00\x20' + os.urandom(32))
+
+        assert (
+            wait_for_record(r'\[info\].*SSL_read.*bad record mac')
+            is not None
+        )
+
+    assert client.get_ssl()['status'] == 200, 'router is alive'
+    assert not findall(r'\[alert\].*SSL_shutdown')
+
+
+def test_tls_shutdown_close_notify():
+    """A normal close still sends close_notify: SSL_shutdown() is skipped
+    only for a session in init."""
+    client.certificate()
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "routes",
+                    "tls": {"certificate": "default"},
+                }
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    ), 'load application configuration'
+
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+
+    with context.wrap_socket(
+        socket.create_connection(('127.0.0.1', port_map.port(8080))),
+        suppress_ragged_eofs=False,
+    ) as sock:
+        sock.sendall(
+            b'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
+        )
+
+        data = b''
+        while True:
+            # Without close_notify, this raises ssl.SSLEOFError.
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+
+    assert data.startswith(b'HTTP/1.1 200'), 'response'
 
 
 @pytest.mark.skip('not yet')
@@ -1947,3 +2037,47 @@ def test_tls_handshake_alert_err_log_level(alert, findall, wait_for_record):
 
     assert wait_for_record(rf'\[error\].*{pattern}') is not None, 'error'
     assert not findall(rf'\[info\].*{pattern}'), 'no info'
+
+
+def test_tls_handshake_stalled_past_idle_timeout(findall):
+    # A client that sends a ClientHello and then stalls keeps the handshake
+    # open.  After "idle_timeout", the router tries to send a 408.  The write
+    # cannot finish before the handshake does, so the router arms the write
+    # timer for 10 seconds.  When it fires, the router must close the
+    # connection, not crash.
+    client.certificate()
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "routes",
+                    "tls": {"certificate": "default"},
+                }
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+            "settings": {"http": {"idle_timeout": 1}},
+        }
+    )
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+    tls = ctx.wrap_bio(incoming, outgoing, server_hostname='localhost')
+
+    with pytest.raises(ssl.SSLWantReadError):
+        tls.do_handshake()
+
+    with socket.create_connection(
+        ('127.0.0.1', port_map.port(8080)), timeout=30
+    ) as sock:
+        sock.sendall(outgoing.read())
+
+        # The idle timeout (1 s) and the response write timer (10 s).
+        time.sleep(13)
+
+    assert not findall(r'exited on signal'), 'router survived'
+    assert client.get_ssl()['status'] == 200, 'router serves'

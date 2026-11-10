@@ -18,7 +18,7 @@ http-body = { version = "1.0.0", default-features = false }
 http-body-util = "0.1.0"
 hyper = "1.4.1"
 tokio = { version = "1.33.0", default-features = false }
-wasmtime = { version = "48.0.5", default-features = false, features = ['anyhow', 'component-model', 'cranelift'] }
+wasmtime = { version = "48.0.5", default-features = false, features = ['anyhow', 'component-model', 'cranelift', 'parallel-compilation'] }
 wasmtime-wasi = "48.0.5"
 # default-features = false drops the "default-send-request" feature and
 # with it the whole rustls TLS stack (rustls, tokio-rustls, webpki-roots,

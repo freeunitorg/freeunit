@@ -180,8 +180,13 @@ nxt_conf_json_indentation(u_char *p, uint32_t level)
 }
 
 
-void
-nxt_conf_get_string(const nxt_conf_value_t *value, nxt_str_t *str)
+/*
+ * The one place that reads a string value.  It is inline, so the member
+ * lookup in nxt_conf_get_object_member() does not call out for each name.
+ */
+
+nxt_inline void
+nxt_conf_string_get(const nxt_conf_value_t *value, nxt_str_t *str)
 {
     if (value->type == NXT_CONF_VALUE_SHORT_STRING) {
         str->length = value->u.str.length;
@@ -191,6 +196,13 @@ nxt_conf_get_string(const nxt_conf_value_t *value, nxt_str_t *str)
         str->length = value->u.string.length;
         str->start = (u_char *) value->u.string.start;
     }
+}
+
+
+void
+nxt_conf_get_string(const nxt_conf_value_t *value, nxt_str_t *str)
+{
+    nxt_conf_string_get(value, str);
 }
 
 
@@ -584,19 +596,34 @@ nxt_conf_get_object_member(const nxt_conf_value_t *value, const nxt_str_t *name,
 
     object = value->u.object;
 
+    /*
+     * The search is linear, and the validator calls it once per reference
+     * (for example, every "pass" to a route), so it runs often on large
+     * objects.  Read the name inline and reject on the length and the
+     * first byte before calling memcmp().
+     */
+
     for (n = 0; n < object->count; n++) {
         member = &object->members[n];
 
-        nxt_conf_get_string(&member->name, &str);
+        nxt_conf_string_get(&member->name, &str);
 
-        if (nxt_strstr_eq(&str, name)) {
-
-            if (index != NULL) {
-                *index = n;
-            }
-
-            return &member->value;
+        if (str.length != name->length) {
+            continue;
         }
+
+        if (str.length != 0
+            && (str.start[0] != name->start[0]
+                || memcmp(str.start, name->start, str.length) != 0))
+        {
+            continue;
+        }
+
+        if (index != NULL) {
+            *index = n;
+        }
+
+        return &member->value;
     }
 
     return NULL;
@@ -1049,7 +1076,7 @@ nxt_conf_op_compile(nxt_mp_t *mp, nxt_conf_op_t **ops,
 
         op->ctx = value;
 
-    } else {
+    } else if (root->type == NXT_CONF_VALUE_OBJECT) {
         member = nxt_mp_zget(mp, sizeof(nxt_conf_object_member_t));
         if (nxt_slow_path(member == NULL)) {
             return NXT_CONF_OP_ERROR;
@@ -1064,6 +1091,15 @@ nxt_conf_op_compile(nxt_mp_t *mp, nxt_conf_op_t **ops,
 
         op->index = root->u.object->count;
         op->ctx = member;
+
+    } else {
+        /*
+         * The path descended one step past a scalar member, which is not a
+         * container to create into.  Refuse it as not found -- the same way
+         * the delete and append paths above handle this condition -- instead
+         * of reading the scalar's union as an nxt_conf_object_t pointer.
+         */
+        return NXT_CONF_OP_NOT_FOUND;
     }
 
     return NXT_CONF_OP_OK;

@@ -66,6 +66,7 @@ X:template = "changes" {
     X:var dow = { !day_of_week(date="$date_") }
     X:var apply = { !string_in_list(list="@apply", string="$pkgname") }
     X:var pkgname_ = { !beautify(pkgname="$pkgname") }
+    X:var product_ = { !product(packager="@packager", pkgname="$pkgname_") }
 
     X:choose {
     X:when "$pkgname='unit' and $format='generic' and @rev!=1" {}
@@ -76,7 +77,7 @@ X:template = "changes" {
         X:text {&#10;}
 
         !{substring(concat($conf/changes/title,
-                           $pkgname_,
+                           $product_,
                            ' ', @ver,
                            '                                                    '),
                     1, $conf/changes/length)}
@@ -250,6 +251,16 @@ X:template string_in_list(list, string) {
 X:template beautify(pkgname) {
     X:choose {
         X:when "$pkgname='unit'" {Unit}
+        X:otherwise {
+            !{$pkgname}
+        }
+    }
+}
+
+
+X:template product(packager, pkgname) {
+    X:choose {
+        X:when "starts-with($packager, 'FreeUnit')" {FreeUnit}
         X:otherwise {
             !{$pkgname}
         }
