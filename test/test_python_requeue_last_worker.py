@@ -318,10 +318,17 @@ def test_python_requeue_last_worker_unaccounted(skip_alert, skip_fds_check):
         except BaseException as exc:  # noqa: BLE001
             results[tag] = (None, repr(exc))
 
-    assert client.get()['status'] == 200
+    # The late start below must be the second process, so no request is sent
+    # before the marker exists.  With "spare": 1, the acknowledgement of any
+    # request takes the only spare out of the idle pool, and the router starts
+    # a replacement at once (nxt_router_app_port_busy()).  A request sent here
+    # would start that process before the marker exists, so it would not
+    # sleep, and no start could expire.
+    assert _wait(lambda: processes()['idle'] == 1), processes()
 
     pids = _wait(_app_pids_of('requeue_late'))
     assert pids, 'no application process'
+    assert processes()['running'] == 1, processes()
 
     with open(marker, 'w', encoding='utf-8'):
         pass

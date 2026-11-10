@@ -603,7 +603,7 @@ nxt_http_var_response_connection(nxt_task_t *task, nxt_str_t *str, void *ctx,
 
     conn = -1;
 
-    if (r->websocket_handshake && r->status == NXT_HTTP_SWITCHING_PROTOCOLS) {
+    if (r->websocket_upgrade && r->status == NXT_HTTP_SWITCHING_PROTOCOLS) {
         conn = 2;
 
     } else {

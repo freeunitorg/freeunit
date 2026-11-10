@@ -113,8 +113,6 @@ static jstring JNICALL
 nxt_java_HeaderNamesEnumeration_nextElement(JNIEnv *env, jclass cls,
     jlong headers_ptr, jlong size, jlong pos)
 {
-    char              *name, tmp;
-    jstring           res;
     nxt_unit_field_t  *f;
 
     f = nxt_jlong2ptr(headers_ptr);
@@ -136,18 +134,6 @@ nxt_java_HeaderNamesEnumeration_nextElement(JNIEnv *env, jclass cls,
 
     f += pos;
 
-    name = nxt_unit_sptr_get(&f->name);
-    tmp = name[f->name_length];
-
-    if (tmp != '\0') {
-        name[f->name_length] = '\0';
-    }
-
-    res = (*env)->NewStringUTF(env, name);
-
-    if (tmp != '\0') {
-        name[f->name_length] = tmp;
-    }
-
-    return res;
+    return nxt_java_newString(env, nxt_unit_sptr_get(&f->name),
+                              f->name_length);
 }

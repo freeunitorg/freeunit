@@ -1,8 +1,17 @@
 # -*- coding: utf-8 -*-
+import json
+import shutil
+import socket
+import tempfile
+from pathlib import Path
+
 import pytest
 
+from conftest import unit_run, unit_stop
 from unit.applications.lang.python import ApplicationPython
 from unit.option import option
+from unit.status import Status
+from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'any'}}
 
@@ -349,6 +358,52 @@ def test_routes_regex_match_limit_unanchored(require, wait_for_record):
                             'Connection': 'close'})['status']
         == 200
     ), 'short subject'
+
+
+def test_routes_regex_match_limit_reuse(require, wait_for_record, findall):
+    require({'modules': {'regex': True}})
+
+    # One match object serves the whole router thread, reused across requests.
+    # Pin one thread so the reuse and the once-per-pattern warning are
+    # deterministic.
+    assert 'success' in client.conf({"listen_threads": 1}, 'settings'), (
+        'one listen thread'
+    )
+
+    # The distinctive 1500-byte subject keeps this test's warning apart from
+    # the one in test_routes_regex_match_limit, which uses 2000 bytes.
+    route_match({"headers": {"x-blah": "~^(.*),(.*)[xy]$"}})
+
+    crafted = {'Host': 'localhost', 'X-Blah': ',' * 1500, 'Connection': 'close'}
+
+    # A flood of crafted requests: each is a bounded 500, and the warning is
+    # logged once for the pattern, not once per request, so the flood cannot
+    # flood the log.
+    for _ in range(20):
+        assert client.get(headers=crafted)['status'] == 500, 'match limit'
+
+    assert (
+        wait_for_record(r'\[warn\].+reached the match limit on 1500 bytes')
+        is not None
+    ), 'match limit log'
+
+    # A limit error must not poison the reused object: a normal request still
+    # matches, and a non-matching one is still rejected.
+    assert (
+        client.get(headers={'Host': 'localhost', 'X-Blah': 'a,bx',
+                            'Connection': 'close'})['status']
+        == 200
+    ), 'match after a limit'
+
+    assert (
+        client.get(headers={'Host': 'localhost', 'X-Blah': 'nope',
+                            'Connection': 'close'})['status']
+        == 404
+    ), 'non-match after a limit'
+
+    assert (
+        len(findall(r'reached the match limit on 1500 bytes')) == 1
+    ), 'warn once per pattern'
 
 
 def test_routes_match_regex_captures(require):
@@ -716,6 +771,149 @@ def test_routes_match_host_case_insensitive():
 
     host('example.com', 200)
     host('EXAMPLE.COM', 200)
+
+
+def test_routes_match_host_idn():
+    # A Unicode host pattern matches the punycode form a client sends.
+    route_match({"host": "münchen.example"})
+
+    host('xn--mnchen-3ya.example', 200)
+    host('XN--MNCHEN-3YA.EXAMPLE', 200)
+    host('xn--mnchen-3ya.example:8080', 200)
+    host('xn--mnchen-3ya.example.', 200)
+    host('muenchen.example', 404)
+    host('www.xn--mnchen-3ya.example', 404)
+
+    # A raw UTF-8 Host, which no browser sends, no longer matches by
+    # byte equality: the pattern is stored in punycode.
+    host('münchen.example', 404)
+
+
+def test_routes_match_host_idn_ascii_case():
+    route_match({"host": "München.Example"})
+
+    host('xn--mnchen-3ya.example', 200)
+
+
+def test_routes_match_host_idn_punycode():
+    route_match({"host": "xn--mnchen-3ya.example"})
+
+    host('xn--mnchen-3ya.example', 200)
+    host('XN--MNCHEN-3YA.example', 200)
+
+
+def test_routes_match_host_idn_mixed_labels():
+    route_match({"host": "münchen.xn--e1afmkfd.example"})
+
+    host('xn--mnchen-3ya.xn--e1afmkfd.example', 200)
+    host('xn--mnchen-3ya.example', 404)
+
+
+def test_routes_match_host_idn_wildcard():
+    route_match({"host": "*.münchen.example"})
+
+    host('www.xn--mnchen-3ya.example', 200)
+    host('a.b.xn--mnchen-3ya.example', 200)
+    host('xn--mnchen-3ya.example', 404)
+
+    route_match({"host": "münchen.*"})
+
+    host('xn--mnchen-3ya.example', 200)
+    host('xn--mnchen-3ya.test', 200)
+    host('www.xn--mnchen-3ya.example', 404)
+
+
+def test_routes_match_host_idn_negative():
+    route_match({"host": ["*.example", "!münchen.example"]})
+
+    host('www.example', 200)
+    host('xn--mnchen-3ya.example', 404)
+
+
+def test_routes_match_host_idn_invalid():
+    # A wildcard inside a non-ASCII label cannot be converted.
+    route_match_invalid({"host": "mün*chen.example"})
+    route_match_invalid({"host": "*ünchen.example"})
+    route_match_invalid({"host": "münchen*.example"})
+    route_match_invalid({"host": "!mün*chen.example"})
+
+    # A label over 63 bytes in punycode.
+    route_match_invalid({"host": "ü" * 60 + ".example"})
+
+    # The same labels are fine when the wildcard is a label of its own.
+    route_match({"host": "*.münchen.example"})
+
+
+def test_routes_match_host_idn_not_nfc(wait_for_record):
+    # An uppercase non-ASCII letter or an NFD form is accepted, but its
+    # punycode form is not the one a browser sends, so a warning is logged.
+    route_match({"host": "MÜNCHEN.example"})
+
+    assert wait_for_record(
+        r'\[warn\].+the "host" pattern "MÜNCHEN.example" is matched as '
+        r'"xn--MNCHEN-psa.example"'
+    ), 'uppercase warning'
+    host('xn--mnchen-3ya.example', 404)
+
+    route_match({"host": "mu\u0308nchen.example"})
+
+    assert wait_for_record(
+        r'\[warn\].+the "host" pattern "mu\u0308nchen.example" is matched as '
+        r'"xn--munchen-gie.example"'
+    ), 'nfd warning'
+    host('xn--mnchen-3ya.example', 404)
+
+
+def test_routes_match_host_idn_stored(
+    requires_restart, wait_for_record, monkeypatch
+):
+    """Earlier versions accepted a "*" inside a non-ASCII label.  unitd
+    still loads a stored configuration with one, warns, and compares the
+    pattern as written.  An update through the API is refused until the
+    pattern is corrected."""
+
+    routes = [
+        {"match": {"host": "mün*chen.example"}, "action": {"return": 200}},
+        {"match": {"host": "!mün*chen.example"}, "action": {"return": 403}},
+    ]
+    conf = client.conf_get()
+    conf['routes'] = routes
+
+    unit_stop()
+
+    statedir = Path(tempfile.mkdtemp(prefix='unit-state-'))
+    (statedir / 'conf.json').write_text(json.dumps(conf))
+
+    monkeypatch.setattr(Status, '_check_zeros', lambda: None)
+
+    try:
+        unit_run(state_dir=str(statedir))
+
+        assert client.conf_get('routes') == routes, 'stored configuration'
+
+        assert wait_for_record(
+            r'\[warn\].+the restored configuration has the "host" pattern '
+            r'"mün\*chen.example", which cannot be converted to punycode'
+        ), 'validator warning'
+        assert wait_for_record(
+            r'\[warn\].+the "host" pattern "mün\*chen.example" cannot be '
+            r'converted to punycode: .+  It is compared as written'
+        ), 'router warning'
+
+        # As in earlier versions, a byte compare of the raw UTF-8 Host.
+        host('münXchen.example', 200)
+        host('example', 403)
+
+        resp = client.conf(routes, 'routes')
+        assert 'error' in resp, 'update refused'
+
+        routes[0]['match']['host'] = '*chen.example'
+        routes[1]['match']['host'] = '!*chen.example'
+        assert 'success' in client.conf(routes, 'routes'), 'update'
+
+    finally:
+        unit_stop()
+        shutil.rmtree(statedir, ignore_errors=True)
 
 
 def test_routes_match_host_port():
@@ -2202,3 +2400,64 @@ def test_routes_match_if_njs(require):
     assert client.get(url='/foo_2?foo=2')['status'] == 200
 
     assert 'error' in client.conf('$arg_', 'routes/0/match/if')
+
+
+def test_route_return_101_websocket_handshake():
+    """A configured 101 is a plain response, not a protocol switch."""
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "routes"}},
+            "routes": [{"action": {"return": 101}}],
+            "applications": {},
+        }
+    ), 'route return 101'
+
+    # A valid WebSocket handshake with one masked text frame pipelined in the
+    # same write.  The frame must not start a frame reader on a 101 the router
+    # built itself; before this it ran a NULL request state and crashed the
+    # router.
+    request = (
+        'GET / HTTP/1.1\r\n'
+        'Host: localhost\r\n'
+        'Upgrade: websocket\r\n'
+        'Connection: Upgrade\r\n'
+        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+        'Sec-WebSocket-Version: 13\r\n'
+        '\r\n'
+    ).encode()
+
+    mask = b'\x01\x02\x03\x04'
+    frame = b'\x81\x85' + mask + bytes(
+        b ^ mask[i % 4] for i, b in enumerate(b'hello')
+    )
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5)
+
+    raw = b''
+
+    try:
+        sock.connect(('127.0.0.1', port_map.port(8080)))
+        sock.sendall(request + frame)
+
+        while not raw.endswith(b'\r\n\r\n'):
+            part = sock.recv(1)
+
+            if not part:
+                break
+
+            raw += part
+
+    except OSError:
+        pass
+
+    finally:
+        sock.close()
+
+    assert raw.startswith(b'HTTP/1.1 101'), f'no plain 101: {raw[:200]!r}'
+    assert b'Upgrade: websocket' not in raw, (
+        f'101 treated as an upgrade: {raw[:400]!r}'
+    )
+
+    # The fixture fails the test if the router process was restarted.
+    assert client.get()['status'] == 101, 'router lost after the frame'

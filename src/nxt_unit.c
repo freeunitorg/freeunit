@@ -10280,15 +10280,32 @@ nxt_unit_memcasecmp(const void *p1, const void *p2, size_t length)
         c1 = *s1++;
         c2 = *s2++;
 
-        c1 = nxt_lowcase(c1);
-        c2 = nxt_lowcase(c2);
+        /* Equal bytes need no case folding. */
 
-        n = c1 - c2;
+        if (c1 != c2) {
+            c1 = nxt_lowcase(c1);
+            c2 = nxt_lowcase(c2);
 
-        if (n != 0) {
-            return n;
+            n = c1 - c2;
+
+            if (n != 0) {
+                return n;
+            }
         }
     }
 
     return 0;
 }
+
+
+#if (NXT_TESTS)
+
+/* Lets the C tests compare nxt_unit_memcasecmp() with the old loop. */
+
+int
+nxt_unit_test_memcasecmp(const void *p1, const void *p2, size_t length)
+{
+    return nxt_unit_memcasecmp(p1, p2, length);
+}
+
+#endif

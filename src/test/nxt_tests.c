@@ -6,6 +6,9 @@
 
 #include <nxt_main.h>
 #include <nxt_application.h>
+#include <nxt_router.h>
+#include <nxt_http.h>
+#include <nxt_http_compression.h>
 #include "nxt_tests.h"
 
 
@@ -71,13 +74,177 @@ nxt_test_in_child(nxt_thread_t *thr, const char *name, int (*fn)(void *),
 }
 
 
+/*
+ * The name test of nxt_http_comp_accept_encoding() compares 8, 4, 2 and 1
+ * bytes at a time.  Its result must be that of nxt_strncasecmp() with
+ * "Accept-Encoding", the compare that it replaced.  The names are every
+ * case variant, every byte at every position of three spellings, and each
+ * length from 0 to 16.  Each name ends where a PROT_NONE page starts, so a
+ * read past the length kills the child.
+ */
+
+typedef struct {
+    nxt_thread_t  *thr;
+    u_char        *end;
+} nxt_http_comp_name_test_ctx_t;
+
+
+static nxt_int_t
+nxt_http_comp_name_test_one(nxt_http_comp_name_test_ctx_t *ctx,
+    const u_char *src, size_t length)
+{
+    bool    got, want;
+    u_char  *name, *p;
+    size_t  i;
+    u_char  hex[2 * 16];
+
+    static const u_char  digits[] = "0123456789abcdef";
+
+    name = ctx->end - length;
+    nxt_memcpy(name, src, length);
+
+    got = nxt_http_comp_test_accept_encoding_name(name, length);
+    want = (length == nxt_length("Accept-Encoding")
+            && nxt_strncasecmp(name, (const u_char *) "Accept-Encoding",
+                               length) == 0);
+
+    if (got != want) {
+        p = hex;
+
+        for (i = 0; i < length; i++) {
+            *p++ = digits[src[i] >> 4];
+            *p++ = digits[src[i] & 0xf];
+        }
+
+        nxt_log_alert(ctx->thr->log, "accept-encoding name test failed: "
+                      "name %*s (hex), length %uz, gave %d, not %d",
+                      (size_t) (p - hex), hex, length, got, want);
+
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+
+static int
+nxt_http_comp_name_test_child(void *data)
+{
+    u_char                         buf[17];
+    size_t                         len, pos;
+    nxt_uint_t                     v, b, i, k;
+    nxt_http_comp_name_test_ctx_t  *ctx;
+
+    static const char  *bases[] = {
+        "Accept-Encoding", "accept-encoding", "ACCEPT-ENCODING",
+    };
+
+    ctx = data;
+
+    len = nxt_length("Accept-Encoding");
+
+    /* Each of the 2^14 case variants of the 14 letters matches. */
+
+    for (v = 0; v < (1u << 14); v++) {
+        nxt_memcpy(buf, "accept-encoding", len);
+
+        for (i = 0, k = 0; i < len; i++) {
+            if (buf[i] == '-') {
+                continue;
+            }
+
+            if (v & (1u << k)) {
+                buf[i] &= (u_char) ~0x20;
+            }
+
+            k++;
+        }
+
+        if (nxt_http_comp_name_test_one(ctx, buf, len) != NXT_OK) {
+            return 1;
+        }
+    }
+
+    /*
+     * Every byte at every position: NUL, the bytes next to the letters,
+     * '-', '_', and the high bytes that differ from a letter only in the
+     * high bit.
+     */
+
+    for (i = 0; i < nxt_nitems(bases); i++) {
+        for (pos = 0; pos < len; pos++) {
+            for (b = 0; b < 256; b++) {
+                nxt_memcpy(buf, bases[i], len);
+                buf[pos] = (u_char) b;
+
+                if (nxt_http_comp_name_test_one(ctx, buf, len) != NXT_OK) {
+                    return 1;
+                }
+            }
+        }
+    }
+
+    /* Each length from 0 to 16, as a prefix of a longer name. */
+
+    nxt_memcpy(buf, "Accept-Encodings", 16);
+
+    for (pos = 0; pos <= 16; pos++) {
+        if (nxt_http_comp_name_test_one(ctx, buf, pos) != NXT_OK) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+static nxt_int_t
+nxt_http_comp_name_test(nxt_thread_t *thr)
+{
+    int                            ret;
+    u_char                         *p;
+    nxt_http_comp_name_test_ctx_t  ctx;
+
+    p = mmap(NULL, 2 * nxt_pagesize, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED) {
+        nxt_log_alert(thr->log, "accept-encoding name test: mmap() failed %E",
+                      nxt_errno);
+        return NXT_ERROR;
+    }
+
+    if (mprotect(p + nxt_pagesize, nxt_pagesize, PROT_NONE) != 0) {
+        nxt_log_alert(thr->log,
+                      "accept-encoding name test: mprotect() failed %E",
+                      nxt_errno);
+        (void) munmap(p, 2 * nxt_pagesize);
+        return NXT_ERROR;
+    }
+
+    ctx.thr = thr;
+    ctx.end = p + nxt_pagesize;
+
+    ret = nxt_test_in_child(thr, "accept-encoding name test",
+                            nxt_http_comp_name_test_child, &ctx);
+
+    (void) munmap(p, 2 * nxt_pagesize);
+
+    NXT_TEST_CHECK(thr->log, ret == 0,
+                   "accept-encoding name test failed: the child gave %d", ret);
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log, "accept-encoding name test passed");
+
+    return NXT_OK;
+}
+
+
 static nxt_int_t (*const nxt_security_tests[])(nxt_thread_t *) = {
     nxt_checked_test, nxt_port_mmap_read_test,
     nxt_router_response_parse_test, nxt_port_frag_test,
     nxt_port_release_test, nxt_process_use_test, nxt_nncq_bound_test,
     nxt_nncq_wrap_test,
     nxt_app_queue_test, nxt_size_bound_test, nxt_mp_cluster_cache_test,
-    nxt_casecmp_test,
+    nxt_casecmp_test, nxt_http_comp_name_test,
 #if (NXT_HAVE_REGEX)
     nxt_regex_test,
 #endif
@@ -261,6 +428,10 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (nxt_punycode_test(thr) != NXT_OK) {
+        return 1;
+    }
+
     if (nxt_http_parse_test(thr) != NXT_OK) {
         return 1;
     }
@@ -286,6 +457,10 @@ main(int argc, char **argv)
     }
 
     if (nxt_h1proto_conn_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_h1proto_fields_test(thr) != NXT_OK) {
         return 1;
     }
 
@@ -318,6 +493,10 @@ main(int argc, char **argv)
     }
 
     if (nxt_conf_map_bound_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_conf_member_lookup_test(thr) != NXT_OK) {
         return 1;
     }
 
@@ -474,6 +653,10 @@ main(int argc, char **argv)
     }
 
     if (nxt_main_port_gate_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_app_gate_test(thr) != NXT_OK) {
         return 1;
     }
 
