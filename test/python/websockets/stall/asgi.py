@@ -13,7 +13,12 @@ async def application(scope, receive, send):
                 await send({'type': 'websocket.accept'})
 
             if m['type'] == 'websocket.receive':
-                if m.get('text') == 'stall':
+                if m.get('text') in ('stall', 'close-stall'):
+                    if m['text'] == 'close-stall':
+                        # A CLOSE frame to the client first; the request
+                        # stays open while the stall holds the coroutine.
+                        await send({'type': 'websocket.close'})
+
                     # Block the event loop, so libunit reads nothing from
                     # the port queue while the router fills it.
                     gate = os.environ.get('UNIT_TEST_STALL_GATE')

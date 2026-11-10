@@ -1517,7 +1517,8 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
 #else
     if (nxt_slow_path(php_request_startup(TSRMLS_C) == FAILURE)) {
 #endif
-        nxt_unit_req_debug(ctx->req, "php_request_startup() failed");
+        nxt_unit_req_alert(ctx->req,
+                           "php_request_startup() failed, the worker exits");
 
 #if (PHP_VERSION_ID >= 80100)
         PG(display_errors) = display_errors;
@@ -1528,7 +1529,18 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
         fclose(fp);
 #endif
 
-        return;
+        /*
+         * The engine left php_request_startup() in the middle of its setup.
+         * There is no valid request to shut down, so nothing resets the state
+         * that the failed setup built, and the next request would start on
+         * top of it.  PHP-FPM ends its child process in this case.  The error
+         * is on the wire already, and the router starts a replacement worker
+         * when the application needs one.  A PHP worker has one thread, so
+         * the exit stops no other script.  SG(server_context) is NULL above,
+         * so a PHP message that is logged on the way out goes to the context
+         * log and not to the released request (nxt_php_log_message()).
+         */
+        exit(1);
     }
 
     /*
@@ -1760,6 +1772,29 @@ nxt_php_send_headers(sapi_headers_struct *sapi_headers TSRMLS_DC)
          h = zend_llist_get_next_ex(&sapi_headers->headers, &zpos))
     {
         resp_size += h->header_len;
+
+        /*
+         * libunit stores the name length in a uint8_t: a longer name would
+         * go out cut to its length modulo 256.  Answer 500 instead.  Output
+         * is disabled after SAPI_HEADER_SEND_FAILED, so the body is empty.
+         * PHP sends the headers again at request shutdown after a failure.
+         * The response is initialized then, so log only the first time.
+         */
+        colon = memchr(h->header, ':', h->header_len);
+        if (nxt_slow_path(colon != NULL
+                          && (size_t) (colon - h->header) > UINT8_MAX))
+        {
+            if (!nxt_unit_response_is_init(req)) {
+                nxt_unit_req_error(req, "response header name is too long "
+                                   "(%zu bytes, the limit is %d)",
+                                   (size_t) (colon - h->header), UINT8_MAX);
+            }
+
+            (void) nxt_unit_response_init(req, NXT_HTTP_INTERNAL_SERVER_ERROR,
+                                          0, 0);
+
+            return SAPI_HEADER_SEND_FAILED;
+        }
     }
 
     status = SG(sapi_headers).http_response_code;

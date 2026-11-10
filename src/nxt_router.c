@@ -3183,7 +3183,7 @@ static nxt_conf_map_t  nxt_router_http_conf[] = {
 
     {
         nxt_string("body_temp_path"),
-        NXT_CONF_MAP_STR,
+        NXT_CONF_MAP_STR_COPY,
         offsetof(nxt_socket_conf_t, body_temp_path),
     },
 
@@ -3590,6 +3590,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 
             } else {
                 targets = NULL;
+                n = 0;
             }
 
             nxt_debug(task, "application type: %V", &apcf.type);
@@ -3631,6 +3632,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             app->idle_timeout = apcf.idle_timeout;
 
             app->targets = targets;
+            app->targets_count = n;
 
             engine = task->thread->engine;
 
@@ -4483,11 +4485,10 @@ typedef struct {
 
 
 nxt_int_t
-nxt_router_application_init(nxt_router_conf_t *rtcf, nxt_str_t *name,
-    nxt_str_t *target, nxt_http_action_t *action)
+nxt_router_application_init(nxt_router_conf_t *rtcf, nxt_mp_t *mp,
+    nxt_str_t *name, nxt_str_t *target, nxt_http_action_t *action)
 {
     nxt_app_t            *app;
-    nxt_str_t            *targets;
     nxt_uint_t           i;
     nxt_http_app_conf_t  *conf;
 
@@ -4496,26 +4497,42 @@ nxt_router_application_init(nxt_router_conf_t *rtcf, nxt_str_t *name,
         return NXT_DECLINED;
     }
 
-    conf = nxt_mp_get(rtcf->mem_pool, sizeof(nxt_http_app_conf_t));
+    /*
+     * Look the target up before anything is allocated or set, so a target
+     * that the application does not have leaves the action as it was.
+     */
+
+    i = 0;
+
+    if (target != NULL && target->length != 0) {
+        while (i < app->targets_count
+               && !nxt_strstr_eq(target, &app->targets[i]))
+        {
+            i++;
+        }
+
+        if (i == app->targets_count) {
+            return NXT_DECLINED;
+        }
+    }
+
+    /*
+     * The pool lives as long as the action: the configuration pool for a
+     * constant "pass", the request pool for a "pass" with variables.  The
+     * configuration pool belongs to the thread that loads the configuration,
+     * so a request thread must not allocate from it.
+     */
+
+    conf = nxt_mp_get(mp, sizeof(nxt_http_app_conf_t));
     if (nxt_slow_path(conf == NULL)) {
         return NXT_ERROR;
     }
 
+    conf->app = app;
+    conf->target = i;
+
     action->handler = nxt_http_application_handler;
     action->u.conf = conf;
-
-    conf->app = app;
-
-    if (target != NULL && target->length != 0) {
-        targets = app->targets;
-
-        for (i = 0; !nxt_strstr_eq(target, &targets[i]); i++);
-
-        conf->target = i;
-
-    } else {
-        conf->target = 0;
-    }
 
     return NXT_OK;
 }
@@ -6623,17 +6640,33 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
         nxt_request_rpc_data_unlink(task, req_rpc_data);
 
-    } else {
+    } else if (r->state == &nxt_http_websocket) {
         /*
-         * The deadline bounds the worker's answer, and an upgraded
-         * WebSocket has had its answer: the frames that follow are a
-         * session, however quiet (#422).
+         * An upgraded WebSocket has had its answer: the frames that follow
+         * are a session, however quiet, so the deadline below does not
+         * apply (#422).  They are followed for a CLOSE among them, and once
+         * a CLOSE went to the client, the router's or the application's,
+         * no frame may follow it (RFC 6455 Section 5.5.1): the router's own
+         * can wait behind a blocked client socket until its last buffer
+         * completes and ends the request, and a frame forwarded meanwhile
+         * would be written after it.  So the rest is dropped here, with
+         * msg->buf in place for the port to release its shared memory.
          */
-        if (app->timeout != 0 && r->state != &nxt_http_websocket) {
-            r->timer.handler = nxt_router_app_timeout;
-            r->timer_data = req_rpc_data;
-            nxt_timer_add(task->thread->engine, &r->timer, app->timeout);
+        if (b != NULL) {
+            if (nxt_slow_path(r->ws_closed)) {
+                nxt_debug(task, "websocket: application frame after a CLOSE "
+                          "dropped");
+                return;
+            }
+
+            nxt_http_websocket_app_frame(r, b);
         }
+
+    } else if (app->timeout != 0) {
+        /* The deadline bounds the worker's answer. */
+        r->timer.handler = nxt_router_app_timeout;
+        r->timer_data = req_rpc_data;
+        nxt_timer_add(task->thread->engine, &r->timer, app->timeout);
     }
 
     if (b == NULL) {
@@ -6758,10 +6791,24 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
             last_b = NULL;
         }
 
-        nxt_http_request_header_send(task, r, nxt_http_request_send_body, NULL);
-
+        /*
+         * Only an application response upgrades the client connection.  A
+         * 101 that the router builds itself, for example a configured
+         * "return": 101, is sent as a plain response: the h1 sender arms the
+         * WebSocket reader from this flag only, and the reader starts below
+         * after r->state is the WebSocket state, so a frame the client
+         * pipelined with the handshake reaches the application instead of
+         * re-running the route action for the same request.
+         */
         if (r->websocket_handshake
             && r->status == NXT_HTTP_SWITCHING_PROTOCOLS)
+        {
+            r->websocket_upgrade = 1;
+        }
+
+        nxt_http_request_header_send(task, r, nxt_http_request_send_body, NULL);
+
+        if (r->websocket_upgrade)
         {
             app_port = req_rpc_data->app_port;
             if (nxt_slow_path(app_port == NULL)) {
@@ -6794,6 +6841,8 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
              * deadline goes with it (#422).
              */
             nxt_timer_disable(task->thread->engine, &r->timer);
+
+            nxt_h1p_websocket_start(task, r);
 
         } else {
             r->state = &nxt_http_request_send_state;
@@ -7895,6 +7944,8 @@ nxt_router_app_port_busy(nxt_task_t *task, nxt_app_t *app, nxt_port_t *port,
               (port->idle_start ? "idle_ports" : "spare_ports"), reason);
 
     nxt_router_app_spare_rebalance(task, app, port);
+
+    /* A busy spare is replaced at once, up to "max". */
 
     if (nxt_router_app_can_start(app) && nxt_router_app_need_start(app)) {
         nxt_atomic_fetch_add(&app->pending_processes, 1);

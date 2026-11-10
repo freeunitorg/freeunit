@@ -35,11 +35,15 @@ static void *nxt_pcre2_malloc(PCRE2_SIZE size, void *memory_data);
 static void nxt_pcre2_free(void *p, void *memory_data);
 static int nxt_pcre2_callout(pcre2_callout_block *block, void *data);
 static void nxt_pcre2_match_cleanup(nxt_task_t *task, void *obj, void *data);
+static void nxt_pcre2_match_data_cleanup(nxt_task_t *task, void *obj,
+    void *data);
 static void nxt_pcre2_code_cleanup(nxt_task_t *task, void *obj, void *data);
 
 #if (NXT_TESTS)
 static nxt_uint_t                   nxt_pcre2_test_mode;
 static nxt_regex_jit_test_stats_t   nxt_pcre2_test_stats;
+
+nxt_uint_t  nxt_regex_test_match_creates;
 
 void
 nxt_regex_jit_test_mode(nxt_uint_t mode)
@@ -88,15 +92,16 @@ nxt_pcre2_test_jit_stack(void *data)
 
 
 struct nxt_regex_s {
-    pcre2_code  *code;
-    nxt_str_t   pattern;
-    nxt_bool_t  jit;
+    pcre2_code    *code;
+    nxt_str_t     pattern;
+    nxt_bool_t    jit;
+    nxt_atomic_t  warned;
 };
 
 
 /*
- * The match data and the match context of one request.  The callout of the
- * context gets the structure and counts down "budget".
+ * The match data and the match context of one router thread.  The callout
+ * of the context gets the structure and counts down "budget".
  */
 
 struct nxt_regex_match_s {
@@ -171,6 +176,7 @@ nxt_regex_compile(nxt_mp_t *mp, nxt_str_t *source, nxt_regex_err_t *err)
     }
 
     re->jit = 0;
+    re->warned = 0;
 
     /* JIT executable memory is not owned by the configuration pool. */
 #if (NXT_TESTS)
@@ -302,6 +308,13 @@ nxt_pcre2_match_cleanup(nxt_task_t *task, void *obj, void *data)
 
 
 static void
+nxt_pcre2_match_data_cleanup(nxt_task_t *task, void *obj, void *data)
+{
+    pcre2_match_data_free(obj);
+}
+
+
+static void
 nxt_pcre2_code_cleanup(nxt_task_t *task, void *obj, void *data)
 {
     nxt_regex_t  *re;
@@ -319,34 +332,41 @@ nxt_pcre2_code_cleanup(nxt_task_t *task, void *obj, void *data)
 nxt_regex_match_t *
 nxt_regex_match_create(nxt_mp_t *mp, size_t size)
 {
-    nxt_regex_match_t      *match;
-    pcre2_match_context    *ctx;
-    pcre2_general_context  *general_ctx;
+    nxt_regex_match_t    *match;
+    pcre2_match_context  *ctx;
 
     match = nxt_mp_get(mp, sizeof(nxt_regex_match_t));
     if (nxt_slow_path(match == NULL)) {
         return NULL;
     }
 
-    general_ctx = pcre2_general_context_create(nxt_pcre2_malloc,
-                                               nxt_pcre2_free, mp);
-    if (nxt_slow_path(general_ctx == NULL)) {
-        nxt_thread_log_alert("pcre2_general_context_create() failed");
-        return NULL;
-    }
+    /*
+     * The backtracking frame vector of a match is the large, subject-driven
+     * allocation: from PCRE2 10.41 it comes from the match data's allocator,
+     * before 10.41 from the match context's.  The subject can come from a
+     * client, so a match may grow the vector up to the heap limit.  "mp" is
+     * the router thread's pool: one match object serves the whole thread and
+     * "mp" never frees memory, so a vector taken from it, and every larger
+     * one a later match reallocates, would be stranded for the thread's life.
+     * Both the match data and the match context therefore use the system
+     * allocator (a NULL general context): the library frees each outgrown
+     * vector in place and keeps only the live one, bounded by the heap limit,
+     * which "mp" releases through the cleanups below when it is destroyed.
+     */
 
-    match->data = pcre2_match_data_create(size, general_ctx);
+    match->data = pcre2_match_data_create(size, NULL);
     if (nxt_slow_path(match->data == NULL)) {
         nxt_thread_log_alert("pcre2_match_data_create(%uz) failed", size);
         return NULL;
     }
 
-    /*
-     * PCRE2 10.30 to 10.40 allocate the backtracking frames of a match with
-     * the allocator of the match context, and free them after the match.
-     * The pool does not free memory.  So the context uses the system
-     * allocator, and the pool frees the context when the pool is destroyed.
-     */
+    if (nxt_slow_path(nxt_mp_cleanup(mp, nxt_pcre2_match_data_cleanup, NULL,
+                                     match->data, NULL)
+                      != NXT_OK))
+    {
+        pcre2_match_data_free(match->data);
+        return NULL;
+    }
 
     ctx = pcre2_match_context_create(NULL);
     if (nxt_slow_path(ctx == NULL)) {
@@ -377,6 +397,10 @@ nxt_regex_match_create(nxt_mp_t *mp, size_t size)
 #endif
 
     match->ctx = ctx;
+
+#if (NXT_TESTS)
+    nxt_regex_test_match_creates++;
+#endif
 
     return match;
 }
@@ -453,10 +477,20 @@ nxt_regex_match(nxt_regex_t *re, u_char *subject, size_t length,
         }
 
         if (limit != NULL) {
-            nxt_thread_log_error(NXT_LOG_WARN,
-                                 "pcre2_match() reached the %s limit on %uz "
-                                 "bytes using \"%V\"", limit, length,
-                                 &re->pattern);
+
+            /*
+             * A client can reach a limit on every request.  Warn once per
+             * compiled pattern, so a flood of crafted requests cannot flood
+             * the log.  The pattern is shared by the router threads, so the
+             * flag is set with an atomic compare-and-set: one thread warns.
+             */
+
+            if (nxt_atomic_cmp_set(&re->warned, 0, 1)) {
+                nxt_thread_log_error(NXT_LOG_WARN,
+                                     "pcre2_match() reached the %s limit on "
+                                     "%uz bytes using \"%V\"", limit, length,
+                                     &re->pattern);
+            }
 
             return NXT_ERROR;
         }

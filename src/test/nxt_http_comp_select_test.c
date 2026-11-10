@@ -107,6 +107,41 @@ nxt_hcs_compare(nxt_hcs_ctx_t *ctx, const u_char *p, size_t len)
                        (int) ref_refused);
     }
 
+    /*
+     * The compression-off shortcut of nxt_http_comp_check_acceptable(): it
+     * may skip negotiation only where the full parse with compression off
+     * selects identity and refuses nothing.  It is checked on the value as
+     * one field and split into two fields.
+     */
+
+    for (mode = 0; mode < 3; mode++) {
+        bool    shortcut;
+        size_t  split;
+
+        split = (mode == 0) ? 0 : (mode == 1) ? len / 2 : 1;
+
+        ctx->r->resp.content_length_n = -1;
+
+        ref = nxt_http_comp_test_off_shortcut(ctx->r, &value, split,
+                                              &shortcut, &ref_refused);
+
+        NXT_TEST_CHECK(ctx->thr->log,
+                       ref != -1 || !shortcut,
+                       "http comp off shortcut test failed: split %uz value "
+                       "\"%*s\" skipped a refusal", split, len, p);
+
+        NXT_TEST_CHECK(ctx->thr->log,
+                       !shortcut || (ref == 0 && !ref_refused),
+                       "http comp off shortcut test failed: split %uz value "
+                       "\"%*s\" skipped %i/%d", split, len, p, ref,
+                       (int) ref_refused);
+
+        NXT_TEST_CHECK(ctx->thr->log,
+                       shortcut == (memchr(p, ';', len) == NULL),
+                       "http comp off shortcut test failed: split %uz value "
+                       "\"%*s\" shortcut %d", split, len, p, (int) shortcut);
+    }
+
     if (memchr(p, ';', len) == NULL) {
         ctx->skipped++;
     }

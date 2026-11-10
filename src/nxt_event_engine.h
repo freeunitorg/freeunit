@@ -7,6 +7,10 @@
 #ifndef _NXT_EVENT_ENGINE_H_INCLUDED_
 #define _NXT_EVENT_ENGINE_H_INCLUDED_
 
+#if (NXT_HAVE_REGEX)
+#include <nxt_regex.h>
+#endif
+
 /*
  * An event interface is kernel interface such as kqueue, epoll, etc.
  * intended to get event notifications about file descriptor state,
@@ -531,6 +535,17 @@ struct nxt_event_engine_s {
 
     nxt_port_t                 *port;
     nxt_mp_t                   *mem_pool;
+
+#if (NXT_HAVE_REGEX)
+    /*
+     * One bounded match object for every route regex tested on this thread.
+     * It is created on first use from "mem_pool" and reused across requests,
+     * so the per-request path allocates no match context (see
+     * nxt_http_route_pattern()).
+     */
+    nxt_regex_match_t          *regex_match;
+#endif
+
     nxt_queue_t                joints;
     nxt_queue_t                listen_connections;
     nxt_queue_t                idle_connections;

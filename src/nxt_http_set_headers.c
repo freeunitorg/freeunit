@@ -167,6 +167,9 @@ nxt_http_set_headers_init(nxt_router_conf_t *rtcf, nxt_http_action_t *action,
     static const nxt_str_t  etag = nxt_string("ETag");
     static const nxt_str_t  last_modified = nxt_string("Last-Modified");
     static const nxt_str_t  content_encoding = nxt_string("Content-Encoding");
+    static const nxt_str_t  content_length = nxt_string("Content-Length");
+    static const nxt_str_t  transfer_encoding =
+                                          nxt_string("Transfer-Encoding");
 
     headers = nxt_array_create(rtcf->mem_pool, 4,
                                sizeof(nxt_http_header_val_t));
@@ -182,6 +185,20 @@ nxt_http_set_headers_init(nxt_router_conf_t *rtcf, nxt_http_action_t *action,
         value = nxt_conf_next_object_member(acf->set_headers, &name, &next);
         if (value == NULL) {
             break;
+        }
+
+        /*
+         * Unit sets the body length of a response itself.  The validator
+         * refuses these names, but keeps them in a configuration stored
+         * by an earlier version, so a value for them is ignored here.  A
+         * null entry still removes the field, as it did before: a removal
+         * cannot give a response a second body length.
+         */
+        if (nxt_conf_type(value) == NXT_CONF_STRING
+            && (nxt_strcasestr_eq(&name, &content_length)
+                || nxt_strcasestr_eq(&name, &transfer_encoding)))
+        {
+            continue;
         }
 
         hv = nxt_array_zero_add(headers);

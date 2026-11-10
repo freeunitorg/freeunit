@@ -1009,14 +1009,15 @@ nxt_http_request_is_bodyless(nxt_http_request_t *r)
      * not a message body -- they are the upgraded protocol (WebSocket), and
      * nxt_h1proto_websocket.c pushes them through nxt_http_request_send().
      *
-     * The status matters as much as the flag.  websocket_handshake is set when
-     * the request headers are parsed (src/nxt_h1proto.c), long before the
-     * application chooses a status, and the h1 sender only treats the response
-     * as an upgrade when it is also 101 (src/nxt_h1proto.c).  Testing the flag
-     * alone would leave an application that answers a WebSocket-upgrade
-     * request with 204 plus a body on the unframed path.
+     * Only an upgrade the router decided on has that property.
+     * websocket_handshake is set when the request headers are parsed
+     * (src/nxt_h1proto.c), long before the application chooses a status.  A
+     * 101 the router builds itself, such as a configured "return": 101, is a
+     * plain response even when the request was a WebSocket handshake.
      */
-    if (r->websocket_handshake && r->status == NXT_HTTP_SWITCHING_PROTOCOLS) {
+    if (r->websocket_upgrade
+        && r->status == NXT_HTTP_SWITCHING_PROTOCOLS)
+    {
         return 0;
     }
 

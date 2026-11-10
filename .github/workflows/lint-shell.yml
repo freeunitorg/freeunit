@@ -47,3 +47,6 @@ jobs:
 
       - name: Check the unitc control-target argv
         run: ./test/unitc/argv_test.sh
+
+      - name: Check the setup-unit process-owner filter
+        run: ./test/setup-unit/cmd_filter_test.sh
