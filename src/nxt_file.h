@@ -43,21 +43,6 @@ typedef struct {
     nxt_cpymem(dst, src, len)
 
 
-#if (NXT_HAVE_CASELESS_FILESYSTEM)
-
-/* MacOSX, Cygwin. */
-
-#define nxt_file_name_eq(fn1, fn2)                                            \
-    (nxt_strcasecmp(fn1, fn2) == 0)
-
-#else
-
-#define nxt_file_name_eq(fn1, fn2)                                            \
-    (nxt_strcmp(fn1, fn2) == 0)
-
-#endif
-
-
 #define nxt_file_name_is_absolute(name)                                       \
     (name[0] == '/')
 

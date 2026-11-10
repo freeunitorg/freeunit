@@ -1147,7 +1147,30 @@ nxt_port_broadcast_shm_ack(nxt_task_t *task, nxt_port_t *port, void *data)
 
     process = data;
 
+    /*
+     * A port of a dead process stays in process->ports while an in-flight
+     * request still holds a reference to it.  nxt_port_close() sets pair[1]
+     * to -1 but keeps the old number in socket.fd.  A write to that port gets
+     * EBADF, or it goes to the socket of a new worker that got the same
+     * number.  That worker then quits with "too many port socket messages".
+     * So skip a closed port.
+     *
+     * The check does not race.  This handler runs on port->engine.
+     * nxt_port_write_enable() sets port->engine to the engine that creates
+     * the port.  The router creates an application port in
+     * nxt_port_new_port_handler() while the main engine reads the router's
+     * own port, so port->engine is the main engine.  nxt_port_close() runs
+     * on the main engine too.
+     */
+
     nxt_queue_each(port, &process->ports, nxt_port_t, link) {
+
+        if (port->pair[1] == -1) {
+            nxt_debug(task, "port %PI:%d closed, no shm ack", port->pid,
+                      port->id);
+            continue;
+        }
+
         (void) nxt_port_socket_write(task, port, NXT_PORT_MSG_SHM_ACK,
                                      -1, 0, 0, NULL);
     } nxt_queue_loop;

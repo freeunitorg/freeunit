@@ -53,8 +53,12 @@ EOF
 
 cat > "$tmp/bin/ps" <<'EOF'
 #!/bin/sh
+# Stubs the three ps(1) forms unitc uses: the "ax" listing, the per-pid
+# owner query ("-o uid=") and the per-pid argv query ("-wwo args=").
 case "$*" in
-    ax) printf ' 111 ? S 0:00 unit: main\n' ;;
+    *uid=*)  id -u ;;
+    *args=*) printf 'unit: main v1 [unitd]\n' ;;
+    *ax*)    printf ' 111 ? S 0:00 unit: main\n' ;;
 esac
 exit 0
 EOF
@@ -158,5 +162,86 @@ assert_arg --unix-socket "$tmp/delete.args"
 assert_arg /tmp/unitc-argv.sock "$tmp/delete.args"
 assert_arg _/config "$tmp/delete.args"
 assert_no_arg "--unix-socket /tmp/unitc-argv.sock _/config" "$tmp/delete.args"
+
+# Security: a "unit: main" owned by another user is a decoy.  unitc must not
+# read its command line (and run it with --help) or its PID-named /tmp cache.
+# Here the owner query returns a uid that is neither root nor ours, and the
+# argv names a planted program; unitc must refuse the instance and never run
+# the program.
+cat > "$tmp/bin/ps" <<'EOF'
+#!/bin/sh
+case "$*" in
+    *uid=*)  echo 65534 ;;
+    *args=*) printf 'unit: main v1 [%s]\n' "$EVIL" ;;
+    *ax*)    printf ' 111 ? S 0:00 unit: main\n' ;;
+esac
+exit 0
+EOF
+rm -f "/tmp/$name.111.env"
+cat > "$tmp/evil" <<EOF
+#!/bin/sh
+: > "$tmp/pwned"
+EOF
+chmod +x "$tmp/evil"
+EVIL=$tmp/evil
+export EVIL
+if PATH="$tmp/bin:$PATH" "$UNITC" /config "$tmp/conf.json" </dev/null \
+    >/dev/null 2>&1; then
+    fail "unitc trusted a foreign-owned 'unit: main' process"
+fi
+[ ! -e "$tmp/pwned" ] || fail "unitc executed a foreign process's argv path"
+
+# Security: the PID-named cache in world-writable /tmp must not be sourced
+# when it is a symlink (an attacker could point it at a file of their own).
+cat > "$tmp/bin/ps" <<'EOF'
+#!/bin/sh
+case "$*" in
+    *uid=*)  id -u ;;
+    *args=*) printf 'unit: main v1 [unitd]\n' ;;
+    *ax*)    printf ' 111 ? S 0:00 unit: main\n' ;;
+esac
+exit 0
+EOF
+cat > "$tmp/evilenv" <<EOF
+UNIT_CTRL="x"
+: > "$tmp/pwned"
+EOF
+ln -sf "$tmp/evilenv" "/tmp/$name.111.env"
+PATH="$tmp/bin:$PATH" "$UNITC" /config "$tmp/conf.json" </dev/null \
+    >/dev/null 2>&1 || true
+[ ! -e "$tmp/pwned" ] || fail "unitc sourced a symlinked cache file"
+rm -f "/tmp/$name.111.env"
+
+# Security: the cache must be created without following a symlink.  A local
+# user who wins the "rm -f" -> create race points the predictable PID-named
+# path at a file of their own; unitc must refuse the redirect, not truncate
+# and write it as root.  The argv carries --control so unitc reaches the
+# cache-write step without needing a cached env.
+cat > "$tmp/bin/ps" <<EOF
+#!/bin/sh
+case "\$*" in
+    *uid=*)  id -u ;;
+    *args=*) printf 'unit: main v1 [unitd --control unix:$tmp/ctl.sock]\n' ;;
+    *ax*)    printf ' 111 ? S 0:00 unit: main\n' ;;
+esac
+exit 0
+EOF
+: > "$tmp/ctl.sock"
+printf 'VICTIM\n' > "$tmp/victim"
+# A rm shim: do the real rm, then plant the symlink a winning race would.
+real_rm=$(command -v rm)
+cat > "$tmp/bin/rm" <<EOF
+#!/bin/sh
+"$real_rm" "\$@"
+ln -sf "$tmp/victim" "/tmp/$name.111.env"
+EOF
+chmod +x "$tmp/bin/rm"
+"$real_rm" -f "/tmp/$name.111.env"
+PATH="$tmp/bin:$PATH" "$UNITC" /config "$tmp/conf.json" </dev/null \
+    >/dev/null 2>&1 || true
+if [ "$(cat "$tmp/victim")" != "VICTIM" ]; then
+    fail "unitc wrote through a planted symlink when creating its cache"
+fi
+"$real_rm" -f "/tmp/$name.111.env" "$tmp/bin/rm"
 
 printf '%s\n' "unitc argv test: OK"

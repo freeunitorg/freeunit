@@ -208,6 +208,17 @@ nxt_app_type_t nxt_app_parse_type(u_char *p, size_t length);
 void nxt_proto_test_run_start_process_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 void nxt_proto_test_set_exiting(nxt_bool_t exiting);
+/*
+ * Drive a message through the prototype or discovery port handler table, and
+ * read the counters nxt_app_gate_handler() keeps; see
+ * src/test/nxt_app_gate_test.c.
+ */
+void nxt_app_test_run_proto_port_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+void nxt_app_test_run_discovery_port_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+nxt_uint_t nxt_app_test_gate_accepted(void);
+nxt_uint_t nxt_app_test_gate_refused(void);
 #endif
 
 NXT_EXPORT extern nxt_str_t  nxt_server;

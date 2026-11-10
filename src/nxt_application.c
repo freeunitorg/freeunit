@@ -97,13 +97,99 @@ static nxt_app_module_t       *nxt_app;
 static nxt_common_app_conf_t  *nxt_app_conf;
 
 
+#if (NXT_TESTS)
+/* Counts what nxt_app_gate_handler() does, for src/test/nxt_app_gate_test.c. */
+static nxt_uint_t  nxt_app_test_gate_msgs_accepted;
+static nxt_uint_t  nxt_app_test_gate_msgs_refused;
+#endif
+
+
+/*
+ * The prototype and discovery processes get a copy of the main port socket,
+ * so any process that holds one -- an application worker among them -- can
+ * write to their ports.  NEW_PORT and REMOVE_PID change the record of another
+ * process, and only the main process sends them here: main announces ports to
+ * these processes and, per nxt_proc_remove_notify_matrix, is the one that
+ * reports a death to the prototype (the discovery process is sent none at
+ * all).  Gate both types on the kernel-validated sender (SCM_CREDENTIALS where
+ * the platform gives it, else the header pid), so a worker cannot forge one to
+ * corrupt the process records -- as nxt_main_gate_handler() does for the main
+ * port.
+ *
+ * The credential the kernel writes is relative to the receiver's pid
+ * namespace, so the comparison has two arms, exactly as
+ * nxt_proto_start_process_sender_ok() does below for START_PROCESS:
+ *
+ *  - Sharing main's namespace, main is an ordinary visible process and the
+ *    credential is its global pid, which is what rt->port_by_type[] is keyed
+ *    on.
+ *
+ *  - Under "isolation": {"namespaces": {"pid": true}} the prototype is the
+ *    init of its own namespace (nxt_process.c) and main lives in an ancestor
+ *    of it, so main has no pid there: the kernel translates its credential to
+ *    0 (pid_vnr() returns 0 outside the receiver's namespace).  Comparing
+ *    against main's global pid would then refuse every legitimate NEW_PORT and
+ *    REMOVE_PID -- so an isolated prototype would never clear a dead router's
+ *    ports or process record.  The prototype's workers are forked inside this
+ *    namespace and present a non-zero namespace-local pid, so a credential of
+ *    0 is what "from outside this namespace" looks like and a worker can never
+ *    present it; that set is main and the router, both trusted core processes
+ *    (nxt_proc_keep_matrix[] keeps only those two in a worker), and neither a
+ *    forged REMOVE_PID from a worker nor a NEW_PORT it fabricates gets in.
+ */
+
+static void
+nxt_app_gate_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_bool_t     from_main;
+    nxt_pid_t      sender;
+    nxt_port_t     *main_port;
+    nxt_runtime_t  *rt;
+
+    rt = task->thread->runtime;
+    sender = nxt_recv_msg_cmsg_pid(msg);
+
+    if (rt->is_pid_isolated) {
+        from_main = (sender == 0);
+
+    } else {
+        main_port = rt->port_by_type[NXT_PROCESS_MAIN];
+        from_main = (main_port != NULL && sender == main_port->pid);
+    }
+
+    if (nxt_slow_path(!from_main)) {
+        nxt_alert(task, "process %PI sent message type %uD; refused: only the "
+                  "main process may send it here", sender,
+                  (uint32_t) msg->port_msg.type);
+
+#if (NXT_TESTS)
+        nxt_app_test_gate_msgs_refused++;
+#endif
+
+        nxt_port_recv_msg_close_fds(msg);
+        return;
+    }
+
+#if (NXT_TESTS)
+    nxt_app_test_gate_msgs_accepted++;
+#endif
+
+    if (msg->port_msg.type == _NXT_PORT_MSG_REMOVE_PID) {
+        nxt_port_remove_pid_handler(task, msg);
+        return;
+    }
+
+    nxt_app_new_port_handler(task, msg);
+}
+
+
 static const nxt_port_handlers_t  nxt_discovery_process_port_handlers = {
     .quit         = nxt_signal_quit_handler,
-    .new_port     = nxt_app_new_port_handler,
+    .new_port     = nxt_app_gate_handler,
     .change_file  = nxt_port_change_log_file_handler,
     .mmap         = nxt_port_mmap_handler,
     .data         = nxt_port_data_handler,
-    .remove_pid   = nxt_port_remove_pid_handler,
+    .remove_pid   = nxt_app_gate_handler,
     .rpc_ready    = nxt_port_rpc_handler,
     .rpc_error    = nxt_port_rpc_handler,
 };
@@ -122,10 +208,10 @@ const nxt_sig_event_t  nxt_prototype_signals[] = {
 static const nxt_port_handlers_t  nxt_proto_process_port_handlers = {
     .quit            = nxt_proto_quit_handler,
     .change_file     = nxt_port_change_log_file_handler,
-    .new_port        = nxt_app_new_port_handler,
+    .new_port        = nxt_app_gate_handler,
     .process_created = nxt_proto_process_created_handler,
     .process_ready   = nxt_port_process_ready_handler,
-    .remove_pid      = nxt_port_remove_pid_handler,
+    .remove_pid      = nxt_app_gate_handler,
     .start_process   = nxt_proto_start_process_handler,
     .rpc_ready       = nxt_port_rpc_handler,
     .rpc_error       = nxt_port_rpc_handler,
@@ -188,6 +274,56 @@ nxt_app_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     nxt_port_recv_msg_close_fds(msg);
 }
+
+
+#if (NXT_TESTS)
+
+/*
+ * Let src/test/nxt_app_gate_test.c drive a message through the real prototype
+ * or discovery port handler table, as nxt_port_handler() does, so the test
+ * exercises nxt_app_gate_handler() together with the wiring that routes
+ * NEW_PORT and REMOVE_PID through it, and reads the counters the gate keeps.
+ */
+
+void
+nxt_app_test_run_proto_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_port_handler_t  handler;
+
+    handler = ((const nxt_port_handler_t *)
+               &nxt_proto_process_port_handlers)[msg->port_msg.type];
+
+    handler(task, msg);
+}
+
+
+void
+nxt_app_test_run_discovery_port_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg)
+{
+    nxt_port_handler_t  handler;
+
+    handler = ((const nxt_port_handler_t *)
+               &nxt_discovery_process_port_handlers)[msg->port_msg.type];
+
+    handler(task, msg);
+}
+
+
+nxt_uint_t
+nxt_app_test_gate_accepted(void)
+{
+    return nxt_app_test_gate_msgs_accepted;
+}
+
+
+nxt_uint_t
+nxt_app_test_gate_refused(void)
+{
+    return nxt_app_test_gate_msgs_refused;
+}
+
+#endif
 
 
 static nxt_int_t

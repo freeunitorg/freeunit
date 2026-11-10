@@ -50,6 +50,14 @@ NXT_EXPORT nxt_int_t nxt_regex_match(nxt_regex_t *re, u_char *subject,
 NXT_EXPORT nxt_bool_t nxt_regex_jit_compiled(nxt_regex_t *re);
 #endif
 
+#if (NXT_TESTS)
+/*
+ * The number of match objects nxt_regex_match_create() has made, for the
+ * route test: one router thread makes one, however many requests it matches.
+ */
+extern nxt_uint_t  nxt_regex_test_match_creates;
+#endif
+
 #if (NXT_TESTS && NXT_HAVE_PCRE2)
 typedef struct {
     nxt_uint_t  compiled;

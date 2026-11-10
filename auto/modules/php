@@ -211,31 +211,6 @@ else
 fi
 
 
-nxt_feature="PHP sapi_module_struct pre_request_init field"
-nxt_feature_name=""
-nxt_feature_run=no
-nxt_feature_incs="${NXT_PHP_INCLUDE}"
-nxt_feature_libs="${NXT_PHP_LIB} ${NXT_PHP_LDFLAGS}"
-nxt_feature_test="
-    #include <php.h>
-    #include <main/SAPI.h>
-
-    int main(void) {
-        sapi_module_struct m;
-        m.pre_request_init = NULL;
-        (void) m;
-        return 0;
-    }"
-
-. auto/feature
-
-if [ $nxt_found = yes ]; then
-    NXT_PHP_PRE_REQUEST_INIT=1
-else
-    NXT_PHP_PRE_REQUEST_INIT=0
-fi
-
-
 if grep ^$NXT_PHP_MODULE: $NXT_MAKEFILE 2>&1 > /dev/null; then
     $echo
     $echo $0: error: duplicate \"$NXT_PHP_MODULE\" module configured.
@@ -617,7 +592,6 @@ $NXT_BUILD_DIR/$nxt_obj:	$nxt_src $NXT_VERSION_H
 	\$(PP_CC) \$@
 	\$(v)\$(CC) -c \$(CFLAGS) $NXT_PHP_ADDITIONAL_FLAGS \$(NXT_INCS) \\
 	$NXT_PHP_INCLUDE -DNXT_ZEND_SIGNAL_STARTUP=$NXT_ZEND_SIGNAL_STARTUP \\
-	-DNXT_PHP_PRE_REQUEST_INIT=$NXT_PHP_PRE_REQUEST_INIT \\
 	-DNXT_PHP_MOUNTS_H=\"$NXT_PHP_MOUNTS_HEADER\" \\
 	$nxt_dep_flags \\
 	-o $NXT_BUILD_DIR/$nxt_obj $nxt_src

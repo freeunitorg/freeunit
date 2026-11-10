@@ -567,6 +567,8 @@ int      nxt_unit_test_add_queue_port(nxt_unit_ctx_t *ctx, pid_t pid,
 void     nxt_unit_test_new_mmap_failures(unsigned int failures);
 void     nxt_unit_test_shm_probe_failures(unsigned int failures);
 void     nxt_unit_test_read_buf_failures(unsigned int failures);
+int      nxt_unit_test_memcasecmp(const void *p1, const void *p2,
+    size_t length);
 #endif
 
 #if (NXT_TESTS || NXT_FUZZ_BUILD)
