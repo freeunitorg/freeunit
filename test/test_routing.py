@@ -443,6 +443,79 @@ def test_routes_match_regex_negative_case_sensitive(require):
     assert client.get(url='/BLAH')['status'] == 200, '/BLAH'
 
 
+def regex_utf():
+    # "\\x{43f}" is a valid code point only in UTF mode.  UTF mode needs
+    # PCRE2 10.48 or later; PCRE 1 and older PCRE2 match bytes and reject
+    # the pattern.  This probe cannot tell an old PCRE2 from code without
+    # UTF mode; "regex test" in build/tests checks the mode by the version.
+    return 'success' in route(
+        {"match": {"uri": "~^/\\x{43f}$"}, "action": {"return": 200}}
+    )
+
+
+def test_routes_match_regex_utf8(require):
+    require({'modules': {'regex': True}})
+
+    if not regex_utf():
+        pytest.skip('regex UTF mode is not available')
+
+    assert client.get(url='/%D0%BF')['status'] == 200, 'code point'
+    assert client.get(url='/%D0%B0')['status'] == 404, 'other code point'
+
+    route_match({"uri": "~^/.$"})
+    assert client.get(url='/%D0%BF')['status'] == 200, 'dot'
+    assert client.get(url='/%D0%BF%D0%BF')['status'] == 404, 'dot two'
+
+    route_match({"uri": "~^/[а-я]+$"})
+    assert client.get(url='/%D0%BF%D1%8F')['status'] == 200, 'class'
+    assert client.get(url='/%D0%BFz')['status'] == 404, 'class miss'
+
+    # Invalid UTF-8 in the subject must not make the match fail.
+    route_match({"uri": "~^/.*$"})
+    assert client.get(url='/%FF')['status'] == 404, 'invalid uri'
+    assert client.get(url='/a')['status'] == 200, 'valid uri'
+
+    route_match({"headers": {"x-blah": "~^a.*$"}})
+    assert (
+        client.http(
+            b'GET / HTTP/1.1\r\nHost: localhost\r\nX-Blah: a\xff\r\n'
+            b'Connection: close\r\n\r\n',
+            raw=True,
+            encoding='latin-1',
+        )['status']
+        == 404
+    ), 'invalid header'
+
+    # "\\xff" is the code point U+00FF, not the byte FF.
+    route_match({"uri": "~^/\\xff$"})
+    assert client.get(url='/%C3%BF')['status'] == 200, 'escape code point'
+    assert client.get(url='/%FF')['status'] == 404, 'escape byte'
+
+
+def test_routes_match_regex_negative_invalid_utf8(require):
+    require({'modules': {'regex': True}})
+
+    utf = regex_utf()
+
+    assert 'success' in client.conf(
+        [
+            {"match": {"uri": "!~^/admin/.*$"}, "action": {"return": 200}},
+            {"action": {"return": 403}},
+        ],
+        'routes',
+    )
+
+    assert client.get(url='/admin/a')['status'] == 403, 'admin'
+    assert client.get(url='/a')['status'] == 200, 'other'
+
+    # In UTF mode ".*" does not go past an invalid byte, so the negative
+    # pattern does not match and the first rule is selected.  In byte mode
+    # it matches as for any other byte.
+    assert client.get(url='/admin/%FF')['status'] == (
+        200 if utf else 403
+    ), 'invalid byte'
+
+
 def test_routes_pass_encode():
     python_dir = f'{option.test_dir}/python'
 
