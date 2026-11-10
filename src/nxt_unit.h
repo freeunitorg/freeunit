@@ -17,6 +17,11 @@
 #include "nxt_unit_typedefs.h"
 
 
+/*
+ * A binding that declares these structs again in another language must
+ * match their layout: see docs/libunit-abi.md.
+ */
+
 enum {
     NXT_UNIT_OK          = 0,
     NXT_UNIT_ERROR       = 1,
@@ -34,6 +39,15 @@ enum {
 };
 
 #define NXT_UNIT_INIT_ENV  "NXT_UNIT_INIT"
+
+/*
+ * The protocol between libunit and the daemon (port messages, queues,
+ * shared memory, NXT_UNIT_INIT).  NXT_UNIT_INIT starts with
+ * "<NXT_VERSION>/<number>", and libunit refuses a daemon whose version or
+ * number differs.  Bump it in a change that makes either side misread the
+ * other.
+ */
+#define NXT_UNIT_PROTOCOL_VERSION  1
 
 #define NXT_UNIT_SHARED_PORT_ID  ((uint16_t) 0xFFFFu)
 
@@ -116,6 +130,10 @@ struct nxt_unit_request_info_s {
 /*
  * Set of application-specific callbacks.  The application may leave all
  * optional callbacks as NULL.
+ *
+ * Frozen at these 12 members since 1.38: nxt_unit_init_t holds the struct
+ * by value, so a new member would move every later field of it.  A new
+ * hook goes at the end of nxt_unit_init_t.
  */
 struct nxt_unit_callbacks_s {
     /*
@@ -163,14 +181,26 @@ struct nxt_unit_callbacks_s {
     ssize_t  (*port_recv)(nxt_unit_ctx_t *, nxt_unit_port_t *port,
                  void *buf, size_t buf_size, void *oob, size_t *oob_size);
 
+    /*
+     * The main context became ready for requests.  Optional.  A result
+     * other than NXT_UNIT_OK stops the read loop.
+     */
     int      (*ready_handler)(nxt_unit_ctx_t *);
 };
 
+nxt_unit_layout_assert(callbacks_frozen,
+    sizeof(nxt_unit_callbacks_t) == 12 * sizeof(void (*)(void)),
+    "nxt_unit_callbacks_t is frozen: add a hook after nxt_unit_init_t.size");
 
+
+/*
+ * The fields up to "size" keep their offsets.  A later field or hook goes
+ * after "size", and libunit reads it only when "size" covers it.
+ */
 struct nxt_unit_init_s {
     void                  *data;     /* Opaque pointer to user-defined data. */
     void                  *ctx_data; /* Opaque pointer to user-defined data. */
-    int                   max_pending_requests;
+    int                   max_pending_requests;  /* Unused. */
 
     uint32_t              request_data_size;
     uint32_t              shm_limit;
@@ -178,6 +208,11 @@ struct nxt_unit_init_s {
 
     nxt_unit_callbacks_t  callbacks;
 
+    /*
+     * Unless ready_port.id.pid, ready_stream and read_port.id.pid are all
+     * set, nxt_unit_init() ignores the fields from here to max_processes,
+     * and shm_limit and request_limit, and reads them from NXT_UNIT_INIT.
+     */
     nxt_unit_port_t       ready_port;
     uint32_t              ready_stream;
     nxt_unit_port_t       router_port;
@@ -191,6 +226,12 @@ struct nxt_unit_init_s {
      * See nxt_unit_wait_set_init().
      */
     uint32_t              max_processes;
+
+    /*
+     * sizeof(nxt_unit_init_t) as the caller built it, or 0 for the struct
+     * of 1.38, which ends here.  nxt_unit_init() refuses any other size.
+     */
+    uint32_t              size;
 };
 
 

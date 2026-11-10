@@ -43,6 +43,11 @@
 
 #define NXT_UNIT_EPOLL_OFF  (-2)
 
+/* NXT_UNIT_PROTOCOL_VERSION as text, as NXT_UNIT_INIT carries it. */
+#define NXT_UNIT_STR(x)        #x
+#define NXT_UNIT_XSTR(x)       NXT_UNIT_STR(x)
+#define NXT_UNIT_PROTOCOL_STR  NXT_UNIT_XSTR(NXT_UNIT_PROTOCOL_VERSION)
+
 /*
  * A context uses a wait set only when the application can have this number
  * of processes or more ("processes" or "processes": {"max"}).  With 2
@@ -909,6 +914,21 @@ nxt_unit_create(nxt_unit_init_t *init)
     int              rc;
     nxt_unit_impl_t  *lib;
 
+    /*
+     * 0 or sizeof is the struct of 1.38, which ends with "size".  A release
+     * that adds a field after it accepts sizes from the 1.38 one up to its
+     * own.  A caller built for a later libunit is refused.
+     */
+    if (nxt_slow_path(init->size != 0
+                      && init->size != sizeof(nxt_unit_init_t)))
+    {
+        nxt_unit_alert(NULL, "nxt_unit_init_t.size is %u, while this libunit "
+                       "takes 0 or %u", (unsigned) init->size,
+                       (unsigned) sizeof(nxt_unit_init_t));
+
+        return NULL;
+    }
+
     if (nxt_slow_path(init->callbacks.request_handler == NULL)) {
         nxt_unit_alert(NULL, "request_handler is NULL");
 
@@ -1190,12 +1210,13 @@ nxt_unit_read_env(nxt_unit_port_t *ready_port, nxt_unit_port_t *router_port,
     int *log_fd, uint32_t *stream,
     uint32_t *shm_limit, uint32_t *request_limit, uint32_t *max_processes)
 {
-    int       rc;
-    int       ready_fd, router_fd, read_in_fd, read_out_fd;
-    char      *unit_init, *version_end, *vars;
-    size_t    version_length;
-    int64_t   ready_pid, router_pid, read_pid;
-    uint32_t  ready_stream, router_id, ready_id, read_id;
+    int         rc;
+    int         ready_fd, router_fd, read_in_fd, read_out_fd;
+    char        *unit_init, *version_end, *vars;
+    size_t      version_length, protocol_length;
+    int64_t     ready_pid, router_pid, read_pid;
+    uint32_t    ready_stream, router_id, ready_id, read_id;
+    const char  *protocol;
 
     unit_init = getenv(NXT_UNIT_INIT_ENV);
     if (nxt_slow_path(unit_init == NULL)) {
@@ -1213,7 +1234,25 @@ nxt_unit_read_env(nxt_unit_port_t *ready_port, nxt_unit_port_t *router_port,
         return NXT_UNIT_ERROR;
     }
 
+    /*
+     * "<NXT_VERSION>/<NXT_UNIT_PROTOCOL_VERSION>".  A daemon older than the
+     * protocol number writes only the version: that is protocol 0, which
+     * no libunit speaks.  Both parts must be equal to ours.
+     */
+
     version_length = version_end - unit_init;
+
+    protocol = memchr(unit_init, '/', version_length);
+
+    if (protocol != NULL) {
+        version_length = protocol - unit_init;
+        protocol++;
+        protocol_length = version_end - protocol;
+
+    } else {
+        protocol = "0";
+        protocol_length = 1;
+    }
 
     rc = version_length != nxt_length(NXT_VERSION)
          || memcmp(unit_init, NXT_VERSION, nxt_length(NXT_VERSION));
@@ -1222,6 +1261,19 @@ nxt_unit_read_env(nxt_unit_port_t *ready_port, nxt_unit_port_t *router_port,
         nxt_unit_alert(NULL, "versions mismatch: the Unit daemon has version "
                        "%.*s, while the app was compiled with libunit %s",
                        (int) version_length, unit_init, NXT_VERSION);
+
+        return NXT_UNIT_ERROR;
+    }
+
+    rc = protocol_length != nxt_length(NXT_UNIT_PROTOCOL_STR)
+         || memcmp(protocol, NXT_UNIT_PROTOCOL_STR, protocol_length) != 0;
+
+    if (nxt_slow_path(rc != 0)) {
+        nxt_unit_alert(NULL, "protocol mismatch: the Unit daemon %s speaks "
+                       "libunit protocol %.*s, while the app was compiled "
+                       "with libunit protocol %s", NXT_VERSION,
+                       (int) protocol_length, protocol,
+                       NXT_UNIT_PROTOCOL_STR);
 
         return NXT_UNIT_ERROR;
     }
