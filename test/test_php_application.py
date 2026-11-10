@@ -1250,3 +1250,38 @@ def test_php_application_header_only(
         rf'rpc: stream #{stream} (?:last )?handler, type {last[1]}$'
     )
     assert len(messages) == 1, f'{method} response messages: {len(messages)}'
+
+
+def test_php_application_header_name_long(findall, wait_for_record):
+    client.load('header_name_long')
+
+    for length in (255, 256, 300):
+        resp = client.get(
+            headers={
+                'Host': 'localhost',
+                'X-Length': str(length),
+                'Connection': 'close',
+            }
+        )
+
+        if length <= 255:
+            assert resp['status'] == 200, f'status {length}'
+            assert resp['headers']['X' * length] == 'value', f'header {length}'
+            continue
+
+        assert resp['status'] == 500, f'status {length}'
+        # A 256-byte name is cut to an empty one; the status is the check.
+        if length % 256:
+            assert (
+                'X' * (length % 256) not in resp['headers']
+            ), f'no cut name {length}'
+        assert resp['body'] != 'body', f'no application body {length}'
+        assert (
+            wait_for_record(rf'\[error\].+name is too long \({length} bytes')
+            is not None
+        ), f'error log {length}'
+        # PHP sends the headers again at request shutdown.  One line only.
+        assert (
+            len(findall(rf'\[error\].+name is too long \({length} bytes'))
+            == 1
+        ), f'one error line {length}'

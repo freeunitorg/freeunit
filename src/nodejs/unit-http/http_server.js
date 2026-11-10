@@ -87,13 +87,23 @@ ServerResponse.prototype.setHeader = function setHeader(name, value) {
         value_len = Buffer.byteLength(value + "", 'latin1');
     }
 
+    let name_len = Buffer.byteLength(name, 'latin1');
+
+    /*
+     * libunit stores the name length in a uint8_t.  Refuse a longer name
+     * here, before the response changes, so that the application can catch
+     * the error and still send a response.
+     */
+    if (name_len > 255) {
+        throw new TypeError('Response header name is too long ('
+                            + name_len + ' bytes, the limit is 255)');
+    }
+
     let lc_name = name.toLowerCase();
 
     if (lc_name in this.headers) {
         this._removeHeader(lc_name);
     }
-
-    let name_len = Buffer.byteLength(name, 'latin1');
 
     this.headers[lc_name] = [name, value];
     this.headers_len += value_len + (name_len * count);

@@ -117,6 +117,11 @@ extern nxt_int_t nxt_http_comp_compression_init(nxt_task_t *task,
     nxt_router_conf_t *rtcf, const nxt_conf_value_t *comp_conf);
 
 #if (NXT_TESTS)
+extern bool nxt_http_comp_test_accept_encoding_name(const u_char *name,
+    size_t length);
+extern nxt_int_t nxt_http_comp_test_off_shortcut(nxt_http_request_t *r,
+    const nxt_str_t *value, size_t split, bool *shortcut,
+    bool *identity_refused);
 extern nxt_int_t nxt_http_comp_test_select(nxt_http_request_t *r,
     const nxt_str_t *value, nxt_bool_t compression, nxt_off_t min_len,
     nxt_bool_t negotiate, bool *identity_refused);

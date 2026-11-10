@@ -470,3 +470,140 @@ nxt_conf_map_bound_test(nxt_thread_t *thr)
 
     return ret;
 }
+
+
+/*
+ * nxt_conf_get_object_member() rejects a member on its name length and
+ * first byte before memcmp().  It must still return the first member with
+ * an equal name, and its index, as a plain scan with nxt_strstr_eq() does,
+ * and leave "index" alone on a miss.  The names include an empty one,
+ * short strings and long strings (more than 14 bytes are stored out of
+ * line), names that differ only in the length, the first byte or the last
+ * byte, and a duplicate.
+ */
+
+nxt_int_t
+nxt_conf_member_lookup_test(nxt_thread_t *thr)
+{
+    uint32_t          index, ref_index, next;
+    nxt_mp_t          *mp;
+    nxt_str_t         name, str;
+    nxt_int_t         ret;
+    nxt_uint_t        i, n, k;
+    nxt_conf_value_t  *object, *value, *ref, *member;
+
+    static const char  *members[] = {
+        "", "a", "b", "A", "ab", "ba", "aa", "dup", "pass", "dup",
+        "abcdefghijklmn", "abcdefghijklmo", "bbcdefghijklmn",
+        "abcdefghijklmno", "abcdefghijklmnp", "bbcdefghijklmno",
+        "abcdefghijklmnop", "route0", "route1", "route9", "routes",
+    };
+
+    static const char  *misses[] = {
+        "c", "B", "abc", "du", "dupx", "Dup", "pas", "passx",
+        "abcdefghijklm", "abcdefghijklmnq", "cbcdefghijklmno",
+        "abcdefghijklmnopq", "route2", "Route0", "route",
+    };
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (mp == NULL) {
+        return NXT_ERROR;
+    }
+
+    ret = NXT_ERROR;
+
+    n = nxt_nitems(members);
+
+    object = nxt_conf_create_object(mp, n);
+    if (object == NULL) {
+        goto done;
+    }
+
+    for (i = 0; i < n; i++) {
+        name.length = nxt_strlen(members[i]);
+        name.start = (u_char *) members[i];
+
+        nxt_conf_set_member_integer(object, &name, i, i);
+    }
+
+    for (k = 0; k < n + nxt_nitems(misses) + 1; k++) {
+
+        if (k < n) {
+            name.length = nxt_strlen(members[k]);
+            name.start = (u_char *) members[k];
+
+        } else if (k < n + nxt_nitems(misses)) {
+            name.length = nxt_strlen(misses[k - n]);
+            name.start = (u_char *) misses[k - n];
+
+        } else {
+            /* An empty name with a NULL start, as nxt_str_null() makes. */
+            name.length = 0;
+            name.start = NULL;
+        }
+
+        /* The reference: a plain scan for the first equal name. */
+
+        ref = NULL;
+        ref_index = 0xdeadbeef;
+        next = 0;
+
+        for ( ;; ) {
+            member = nxt_conf_next_object_member(object, &str, &next);
+            if (member == NULL) {
+                break;
+            }
+
+            if (nxt_strstr_eq(&str, &name)) {
+                ref = member;
+                ref_index = next - 1;
+                break;
+            }
+        }
+
+        index = 0xdeadbeef;
+        value = nxt_conf_get_object_member(object, &name, &index);
+
+        if (value != ref || index != ref_index
+            || (k < n && value == NULL))
+        {
+            nxt_log_alert(thr->log, "nxt_conf_get_object_member(\"%V\") "
+                          "gave member %D, expected %D", &name,
+                          (value != NULL) ? (int32_t) index : -1,
+                          (ref != NULL) ? (int32_t) ref_index : -1);
+            goto done;
+        }
+
+        /* NULL "index" is allowed. */
+
+        if (nxt_conf_get_object_member(object, &name, NULL) != ref) {
+            nxt_log_alert(thr->log, "nxt_conf_get_object_member() with NULL "
+                          "index gave another member");
+            goto done;
+        }
+    }
+
+    /* The duplicate name gives the first of the two members. */
+
+    name.length = 3;
+    name.start = (u_char *) "dup";
+
+    if (nxt_conf_get_object_member(object, &name, &index) == NULL
+        || index != 7)
+    {
+        nxt_log_alert(thr->log, "nxt_conf_get_object_member(\"dup\") did not "
+                      "give the first duplicate");
+        goto done;
+    }
+
+    ret = NXT_OK;
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                  "nxt_conf_get_object_member() test passed");
+
+done:
+
+    nxt_mp_destroy(mp);
+
+    return ret;
+}

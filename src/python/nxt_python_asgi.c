@@ -802,6 +802,8 @@ nxt_py_asgi_create_http_scope(nxt_unit_request_info_t *req,
 
         if (f->hash == NXT_UNIT_HASH_WS_PROTOCOL
             && f->name_length == ws_protocol.length
+            && nxt_memcasecmp(nxt_unit_sptr_get(&f->name), ws_protocol.start,
+                              ws_protocol.length) == 0
             && f->value_length > 0
             && r->websocket_handshake)
         {
@@ -1009,6 +1011,19 @@ nxt_py_asgi_create_subprotocols(nxt_unit_field_t *f)
         }
 
         PyTuple_SET_ITEM(res, n, proto);
+
+        n++;
+    }
+
+    /*
+     * The tuple was sized to the comma count plus one, but an empty segment
+     * -- a leading, trailing or doubled comma, or a comma then only spaces --
+     * fills no slot.  Shrink the tuple to the slots actually set, so no NULL
+     * element is left for the application to iterate over or index, which
+     * would crash the worker.
+     */
+    if (nxt_slow_path(_PyTuple_Resize(&res, n) != 0)) {
+        return NULL;
     }
 
     return res;
@@ -1422,14 +1437,29 @@ nxt_py_asgi_add_field(void *data, int i, PyObject *name, PyObject *val)
     nxt_unit_request_info_t      *req;
     nxt_py_asgi_add_field_ctx_t  *ctx;
 
+    ctx = data;
+    req = ctx->req;
+
+    /*
+     * libunit stores the name length in a uint8_t.  Check the full
+     * Py_ssize_t length, before it is narrowed.
+     */
+    if (nxt_slow_path(PyBytes_GET_SIZE(name) > UINT8_MAX)) {
+        nxt_unit_req_error(req, "header #%d name is too long "
+                           "(%zd bytes, the limit is %d)",
+                           i, PyBytes_GET_SIZE(name), UINT8_MAX);
+
+        return PyErr_Format(PyExc_ValueError,
+                            "header #%d name is too long (%zd bytes, "
+                            "the limit is %d)",
+                            i, PyBytes_GET_SIZE(name), UINT8_MAX);
+    }
+
     name_str = PyBytes_AS_STRING(name);
     name_len = PyBytes_GET_SIZE(name);
 
     val_str = PyBytes_AS_STRING(val);
     val_len = PyBytes_GET_SIZE(val);
-
-    ctx = data;
-    req = ctx->req;
 
     rc = nxt_unit_response_add_field(req, name_str, name_len,
                                      val_str, val_len);
@@ -1438,7 +1468,9 @@ nxt_py_asgi_add_field(void *data, int i, PyObject *name, PyObject *val)
                             "failed to add header #%d", i);
     }
 
-    if (req->response->fields[i].hash == NXT_UNIT_HASH_CONTENT_LENGTH) {
+    if (req->response->fields[i].hash == NXT_UNIT_HASH_CONTENT_LENGTH
+        && nxt_python_is_content_length(name_str, name_len))
+    {
         content_length = nxt_off_t_parse((u_char *) val_str, val_len);
         if (nxt_slow_path(content_length < 0)) {
             nxt_unit_req_error(req, "failed to parse Content-Length "
