@@ -24,7 +24,7 @@ nxt_unit_field_t *nxt_java_findHeader(nxt_unit_field_t *f, nxt_unit_field_t *e,
 
 int nxt_java_strcaseeq(const char *str1, const char *str2, int len);
 
-jstring nxt_java_newString(JNIEnv *env, char *str, uint32_t len);
+jstring nxt_java_newString(JNIEnv *env, const char *str, uint32_t len);
 
 
 typedef struct {

@@ -44,6 +44,7 @@ Cheap on purpose: one request and one deliberate client stall, about a second
 of work once the PHP worker is warm.
 """
 
+import re
 import subprocess
 import threading
 import time
@@ -92,12 +93,28 @@ def _body(resp, size):
     return resp[-size:]
 
 
+def _require_debug_build():
+    """The evidence below is nxt_debug() output, compiled out unless Unit was
+    configured with --debug.  Skip loudly rather than let the test degrade
+    into a smoke test that proves nothing.  No leg of this repository's CI
+    runs this file on a --debug build with the PHP module; run it by hand
+    on such a build.  Ask the log before the workload, not after it: a
+    release build would otherwise run the whole kill workload only to skip.
+    client.load() and the settings PUT above it already wrote debug records
+    in a --debug build."""
+
+    if not Log.findall(r'\[debug\]'):
+        pytest.skip('OOSM evidence needs a --debug build')
+
+
 def test_process_shm_oosm():
     client.load(APP, limits={"shm": SHM_LIMIT}, processes=1)
 
     assert 'success' in client.conf(
         {"listen_threads": LISTEN_THREADS}, 'settings'
     ), 'listen_threads'
+
+    _require_debug_build()
 
     sock = client.get(url=f'/?mb={RESPONSE_MB}', no_recv=True)
 
@@ -112,14 +129,6 @@ def test_process_shm_oosm():
     assert body.count(b'x') == RESPONSE_SIZE, 'intact response'
 
     log = Log.read()
-
-    # The records asserted on below are nxt_debug()/nxt_unit_debug(), compiled
-    # out unless Unit was configured with --debug.  Skip loudly rather than
-    # let the test degrade into a smoke test that proves nothing about the
-    # path it claims to cover.  The sanitiser workflow builds --debug, which
-    # is the leg this test exists for.
-    if '[debug]' not in log:
-        pytest.skip('OOSM evidence needs a --debug build')
 
     # nxt_router_oosm_handler() logs this on entry, immediately before the
     # reference it now takes; its presence is the proof that the converted
@@ -167,11 +176,11 @@ KILL_INTERVAL = 0.4
 STALLERS = 3
 
 # Bounded on purpose: this is a race driver, not a soak.  Five kills at 0.4 s
-# is about three seconds of workload, cheap enough for every leg including the
-# sanitiser ones.  It is timing-dependent by nature: a green run is evidence
-# only in the same weak sense as test_process_abrupt_teardown.py, and the
-# deterministic check of the primitive this test exercises lives in the C
-# suite (src/test/nxt_port_use_unless_zero_test.c).
+# is about three seconds of workload, cheap enough for any --debug run.  It is
+# timing-dependent by nature: a green run is evidence only in the same weak
+# sense as test_process_abrupt_teardown.py, and the deterministic check of
+# the primitive this test exercises lives in the C suite
+# (src/test/nxt_port_use_unless_zero_test.c).
 
 
 def _oosm_app_pids():
@@ -244,6 +253,8 @@ def test_process_shm_oosm_kill(skip_alert):
     assert 'success' in client.conf(
         {"listen_threads": LISTEN_THREADS}, 'settings'
     ), 'listen_threads'
+
+    _require_debug_build()
 
     stop = threading.Event()
     failures = []
@@ -326,12 +337,163 @@ def test_process_shm_oosm_kill(skip_alert):
         'still serving'
     )
 
-    if '[debug]' not in log:
-        pytest.skip('OOSM evidence needs a --debug build')
-
     # Same proof as the test above that the OOSM round trip really ran; here
     # it also establishes that the kills landed on a blocked worker rather
     # than an idle one.
     assert 'oosm in ' in log, 'router handled an OOSM message'
+
+    Log.check_alerts()
+
+
+# ---------------------------------------------------------------------------
+# The OOSM ack after the worker is gone (issue #665)
+# ---------------------------------------------------------------------------
+
+
+def _wait_for_app_pids(timeout=5):
+    """The PIDs serving the application, once there is at least one."""
+
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        pids = _oosm_app_pids()
+
+        if pids:
+            return pids
+
+        time.sleep(0.05)
+
+    return set()
+
+
+# The race below is lost in about one run of ten, so a run tries more than
+# once.  Each try costs about half a second.
+ACK_ATTEMPTS = 4
+
+
+def _oosm_kill(pid):
+    """Put the worker into OOSM, kill it, and return the new worker PID."""
+
+    sock = client.get(url=f'/?mb={RESPONSE_MB}', no_recv=True)
+
+    assert (
+        Log.wait_for_record(rf'oosm in {pid}\b') is not None
+    ), 'worker in OOSM'
+
+    # Let the router write until the client socket is full.  The worker then
+    # stays blocked with hdr->oosm set.
+    time.sleep(STALL)
+
+    subprocess.call(['kill', '-9', pid])
+
+    new_pids = _wait_for_fresh_pids({pid})
+    assert len(new_pids) == 1, f'one new worker: {new_pids}'
+
+    new_pid = next(iter(new_pids))
+
+    assert (
+        Log.wait_for_record(rf'new port ready, pid {new_pid}\b') is not None
+    ), 'router has the port of the new worker'
+
+    # The response is cut short when the router drops it, so only the drain
+    # matters here, not the body.
+    client.recvall(sock, read_timeout=5, buff_size=65536)
+    sock.close()
+
+    return new_pid
+
+
+# The records of a SHM_ACK written to a closed port.
+STRAY = r'Bad file descriptor|too many port socket messages'
+
+
+def _assert_no_stray(log):
+    stray = [line for line in log.splitlines() if re.search(STRAY, line)]
+
+    assert not stray, f'SHM_ACK to a closed port: {stray[0]}'
+
+
+def test_process_shm_oosm_ack_closed_port(skip_alert):
+    """Send no SHM_ACK to the closed port of a dead worker.
+
+    The worker blocks in OOSM with its whole segment queued to a client that
+    does not read.  The test kills the worker.  On the router main thread,
+    ``nxt_port_close()`` closes the ports of the worker.  It sets ``pair[1]``
+    to -1 but keeps the old number in ``socket.fd``.  The in-flight request
+    still holds a reference to the port, so the closed port stays in
+    ``process->ports``.
+    The router then drops the response, the chunks complete, and
+    ``nxt_port_mmap_buf_completion()`` sees ``hdr->oosm`` and broadcasts a
+    SHM_ACK to the dead process.
+
+    Before the fix the broadcast wrote to the old number.  In the runs on
+    this tree the write failed with EBADF.  If a new worker port got the
+    number first, the 16 bytes went to that worker, and it quit with "too
+    many port socket messages".  The conftest skips "sendmsg ... failed"
+    alerts, so the test looks for both records itself.
+
+    The broadcast does not always reach the closed port.  When the last
+    port reference goes first, the router removes the process, and there is
+    nothing to acknowledge.  So the test tries again with the new worker.
+    A try reached the path when the log has the stray write (before the fix)
+    or the skip record (after the fix).  Each try waits for one of these
+    records, and then scans the log from the start of the first try.  So a
+    stray write that comes late is found by the next try.  After the last
+    try, the test waits and scans once more.  If no try reaches the path,
+    the test skips: a pass is never a run that did not reach it.
+    """
+
+    skip_alert(r'process \d+ exited on signal 9')
+
+    client.load(APP, limits={"shm": SHM_LIMIT}, processes=1)
+
+    _require_debug_build()
+
+    pids = _wait_for_app_pids()
+    assert len(pids) == 1, f'one worker: {pids}'
+
+    pid = next(iter(pids))
+
+    start = len(Log.read())
+    reached = False
+
+    for _ in range(ACK_ATTEMPTS):
+        pid = _oosm_kill(pid)
+
+        # The broadcast can come after the drain.  Wait for a record of it,
+        # but only for a short time: a try that did not reach the path has
+        # no record.
+        Log.wait_for_record(STRAY + r'|closed, no shm ack', wait=20)
+
+        log = Log.read()[start:]
+
+        _assert_no_stray(log)
+
+        # nxt_port_broadcast_shm_ack() logs this when it skips the closed
+        # port.
+        if 'closed, no shm ack' in log:
+            reached = True
+            break
+
+    # A stray write can come after the wait of the last try.  Look once
+    # more before the skip or the pass.
+    Log.wait_for_record(STRAY, wait=20)
+
+    _assert_no_stray(Log.read()[start:])
+
+    if not reached:
+        pytest.skip(
+            f'no SHM_ACK reached a closed port in {ACK_ATTEMPTS} tries'
+        )
+
+    # The new worker serves a request.  Before the fix it could quit on a
+    # stray SHM_ACK.
+    sock = client.get(url='/?mb=1', no_recv=True)
+    resp = client.recvall(sock, read_timeout=READ_TIMEOUT, buff_size=65536)
+    sock.close()
+
+    assert _body(resp, 1024 * 1024).count(b'x') == 1024 * 1024, (
+        'still serving'
+    )
 
     Log.check_alerts()

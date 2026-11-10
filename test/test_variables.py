@@ -297,7 +297,7 @@ def test_variables_time_local(
     assert (
         abs(
             date_to_sec_epoch(date, '%d/%b/%Y:%X %z')
-            - time.mktime(time.localtime())
+            - time.time()
         )
         < 5
     ), '$time_local'

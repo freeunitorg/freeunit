@@ -931,6 +931,9 @@ hxt_h1p_send_ws_error(nxt_task_t *task, nxt_http_request_t *r,
         out->next->completion_handler = nxt_h1p_conn_ws_error_sent;
     }
 
+    /* No frame may follow this one; see nxt_http_websocket_close(). */
+    r->ws_closed = 1;
+
     nxt_http_request_send(task, r, out);
 }
 

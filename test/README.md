@@ -253,16 +253,24 @@ test/
 GitHub Actions runs the tests in `.github/workflows/build-test.yml`. The
 language versions come from `pkg/eol.json`.
 
-- A push to `master` runs every version of every runtime, except Node.js and
-  Java. Those two run the oldest supported version, the newest version and,
-  when it is neither of those, the newest LTS: Node.js 22 and 26, Java 17, 25
-  and 27 today.
-- A pull request runs every Python version, Perl, WASM and WASI, and one
-  version each of Go, Java, Node.js, PHP and Ruby. A runtime whose own files
-  change gets every version, except Node.js and Java, which get the legs
-  above. A change to `pkg/eol.json`, to `build-test.yml` or to
-  `.github/scripts/test-matrix.sh` gives the full matrix. So does the
-  `ci-full` label on the pull request.
+- A push to `master` runs every version of Go, PHP and Ruby, and the one
+  Perl leg, on the runner's system Perl. Node.js, Java and Python run fewer
+  legs. Node.js and Java run the oldest supported version, the newest
+  version and, when it is neither of those, the newest LTS: Node.js 22 and
+  26, Java 17, 25 and 27 today. Python runs the oldest and the newest
+  supported version: 3.12 and 3.15 today.
+- A pull request runs Perl, WASM and WASI, the oldest and the newest Python,
+  and one version each of Go, Java, Node.js, PHP and Ruby. A runtime whose
+  own files change gets every version, except Node.js and Java, which get
+  the legs above. A change to Python's own files does not add Python
+  versions. A change to `pkg/eol.json`, to `build-test.yml` or to
+  `.github/scripts/test-matrix.sh` gives the full matrix, with the Node.js,
+  Java and Python legs above.
+- The `ci-full` label on a pull request gives the full matrix with every
+  Python version.
+- A weekly run on `master` (Sunday, 03:23 UTC) and a manual run
+  (`workflow_dispatch`) test every Python version. A failed weekly run opens
+  or updates a tracking issue. A manual run reports nothing.
 
 `.github/scripts/test-matrix.sh` has the rules and the version that a pull
 request gets for each runtime.

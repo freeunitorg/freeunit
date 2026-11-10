@@ -148,6 +148,21 @@ jobs:
             # A floor closes the connection from a read or a write handler,
             # in the middle of a body or a response.  It also has a TLS case,
             # which this leg runs because it is configured with --openssl.
+            #
+            # test_python_targets is here for its "pass" with variables cases.
+            # For each such request, a router thread allocates the action conf
+            # of the application.  If that allocation goes back to
+            # rtcf->mem_pool, the pool of the thread that loads the
+            # configuration, only nxt_mp_thread_assert() aborts on it, and only
+            # a --debug build has that check.  It is not a memory error, so
+            # ASan does not report it, and in a release build it shows only as
+            # memory that is kept until the next reconfiguration.  The
+            # build-test legs that run test_python_targets.py are release
+            # builds, so this leg is the only gate that catches it.
+            #
+            # test_settings_body_temp_path is here because the old code read
+            # "body_temp_path" from released memory.  Only a --debug build
+            # fills that memory, so only this leg makes the test fail.
             tests: >-
               test/test_graceful_reload.py
               test/test_state_store.py
@@ -160,6 +175,8 @@ jobs:
               test/test_app_lifecycle.py
               test/test_configuration.py
               test/test_settings.py
+              test/test_python_targets.py
+              test/test_settings_body_temp_path.py
           - runtime: php
             apt: ""
             configure: php

@@ -44,13 +44,6 @@ nxt_nvbcq_tail_cmp_inc(nxt_nvbcq_t volatile *q, nxt_nvbcq_atomic_t t)
 
 
 static inline nxt_nvbcq_atomic_t
-nxt_nvbcq_index(nxt_nvbcq_t const volatile *q, nxt_nvbcq_atomic_t i)
-{
-    return i % NXT_NVBCQ_SIZE;
-}
-
-
-static inline nxt_nvbcq_atomic_t
 nxt_nvbcq_map(nxt_nvbcq_t const volatile *q, nxt_nvbcq_atomic_t i)
 {
     return i % NXT_NVBCQ_SIZE;

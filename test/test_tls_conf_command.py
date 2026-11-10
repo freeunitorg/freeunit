@@ -27,29 +27,52 @@ def setup_method_fixture():
     ), 'load application configuration'
 
 
+# The highest protocol below each one, for the fallback probe.  Nothing
+# below TLS 1.2: the client's default minimum is TLS 1.2, so a context
+# pinned to TLS 1.1 fails on the client side, not on the server.
+LOWER = {
+    'TLSv1.3': ssl.TLSVersion.TLSv1_2,
+}
+
+
+def client_context(maximum):
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    context.maximum_version = maximum
+    return context
+
+
 def test_tls_conf_command():
-    def check_no_connection():
-        try:
-            client.get_ssl()
-            pytest.fail('Unexpected connection.')
-
-        except (ssl.SSLError, ConnectionRefusedError):
-            pass
-
-    # Set one conf_commands (disable protocol).
+    # sock.version() is the negotiated protocol.  sock.cipher()[1] is the
+    # version that defines the cipher, which can be older (a TLS 1.2
+    # connection with ECDHE-RSA-AES256-SHA reports TLSv1.0), so it is not
+    # used for protocol checks.
 
     (_, sock) = client.get_ssl(start=True)
+    protocol = sock.version()
+    sock.close()
 
-    shared_ciphers = sock.shared_ciphers()
+    # The test needs a lower protocol that both sides speak.  Prove it
+    # exists before any conf_commands, with a client pinned below
+    # "protocol": a failure after conf_commands is then a server failure,
+    # not a missing protocol.
 
-    if not shared_ciphers:
-        pytest.skip('no shared ciphers')
+    lower = LOWER.get(protocol)
+    if lower is None:
+        pytest.skip(f'no protocol below {protocol} to fall back to')
 
-    protocols = list(set(c[1] for c in shared_ciphers))
-    protocol = sock.cipher()[1]
+    try:
+        (_, sock) = client.get_ssl(start=True, context=client_context(lower))
 
-    if '/' in protocol:
-        pytest.skip('Complex protocol format.')
+    except ssl.SSLError:
+        pytest.skip('One TLS protocol available only.')
+
+    fallback = sock.version()
+    sock.close()
+
+    # Set one conf_commands (disable protocol): the default client must
+    # now fall back.
 
     assert 'success' in client.conf(
         {
@@ -59,46 +82,33 @@ def test_tls_conf_command():
         'listeners/*:8080/tls',
     ), 'protocol disabled'
 
+    (_, sock) = client.get_ssl(start=True)
+
+    assert sock.version() == fallback, 'new protocol used'
+    cipher = sock.cipher()[0]
+
     sock.close()
 
-    if len(protocols) > 1:
-        (_, sock) = client.get_ssl(start=True)
-
-        cipher = sock.cipher()
-        assert cipher[1] != protocol, 'new protocol used'
-
-        shared_ciphers = sock.shared_ciphers()
-        ciphers = list(set(c for c in shared_ciphers if c[1] == cipher[1]))
-
-        sock.close()
-    else:
-        check_no_connection()
-        pytest.skip('One TLS protocol available only.')
-
-    # Set two conf_commands (disable protocol and cipher).
+    # Set two conf_commands (disable protocol and cipher): the connection
+    # must stay on the fallback protocol with another cipher.
 
     assert 'success' in client.conf(
         {
             "certificate": "default",
             "conf_commands": {
                 "protocol": f'-{protocol}',
-                "cipherstring": f"{cipher[1]}:!{cipher[0]}",
+                "cipherstring": f'DEFAULT:!{cipher}',
             },
         },
         'listeners/*:8080/tls',
     ), 'cipher disabled'
 
-    if len(ciphers) > 1:
-        (_, sock) = client.get_ssl(start=True)
+    (_, sock) = client.get_ssl(start=True)
 
-        cipher_new = sock.cipher()
-        assert cipher_new[1] == cipher[1], 'previous protocol used'
-        assert cipher_new[0] != cipher[0], 'new cipher used'
+    assert sock.version() == fallback, 'previous protocol used'
+    assert sock.cipher()[0] != cipher, 'new cipher used'
 
-        sock.close()
-
-    else:
-        check_no_connection()
+    sock.close()
 
 
 def test_tls_conf_command_invalid(skip_alert):
