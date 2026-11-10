@@ -212,9 +212,10 @@ static nxt_int_t
 nxt_main_store_test_running(nxt_thread_t *thr, nxt_task_t *task,
     nxt_main_store_test_paths_t *paths)
 {
-    int        status;
-    nxt_int_t  ret;
-    nxt_pid_t  first, second;
+    int         status;
+    nxt_int_t   ret;
+    nxt_pid_t   first, second;
+    nxt_bool_t  held;
 
     ret = NXT_ERROR;
 
@@ -248,9 +249,17 @@ nxt_main_store_test_running(nxt_thread_t *thr, nxt_task_t *task,
                                  first, (nxt_uint_t) status);
     }
 
+    /*
+     * Read the file before nxt_main_test_store_exited(): it starts the
+     * pending store at once, with no delay, and that child can write
+     * conf.json before this process reads it.
+     */
+
+    held = nxt_main_store_test_holds(paths->conf, "{\"r\":1}");
+
     (void) nxt_main_test_store_exited(task, first, status);
 
-    if (!nxt_main_store_test_holds(paths->conf, "{\"r\":1}")) {
+    if (!held) {
         nxt_main_store_test_fail(thr, "\"%s\" does not hold the first "
                                  "configuration", paths->conf);
     }
@@ -688,36 +697,57 @@ nxt_main_store_test_write(const char *name, const char *content)
 }
 
 
+/*
+ * Wait for the store child that runs now, and require that it exited with
+ * 0.  Main does not know yet that it exited, so the next store does not
+ * start until nxt_main_test_store_exited() is called with *pid and
+ * *status.  A check of what the child did must come before that call: the
+ * next child starts at once and can change the same files.
+ */
+static nxt_int_t
+nxt_main_store_test_wait_child(nxt_thread_t *thr, const char *what,
+    nxt_pid_t *pid, int *status)
+{
+    *pid = nxt_main_test_store_pid();
+    if (*pid == 0) {
+        nxt_log_alert(thr->log, "main store test: no store child for %s",
+                      what);
+        return NXT_ERROR;
+    }
+
+    if (nxt_main_store_test_wait(*pid, status) != 0) {
+        nxt_log_alert(thr->log, "main store test: waitpid(%PI) failed %E",
+                      *pid, nxt_errno);
+        *pid = 0;
+        return NXT_ERROR;
+    }
+
+    if (!WIFEXITED(*status) || WEXITSTATUS(*status) != 0) {
+        nxt_log_alert(thr->log, "main store test: the store child of %s "
+                      "ended with status 0x%Xi", what, (nxt_uint_t) *status);
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+
 /* Reap the store child that runs now, and require that it exited with 0. */
 static nxt_int_t
 nxt_main_store_test_reap(nxt_thread_t *thr, nxt_task_t *task,
     const char *what)
 {
     int        status;
+    nxt_int_t  ret;
     nxt_pid_t  pid;
 
-    pid = nxt_main_test_store_pid();
-    if (pid == 0) {
-        nxt_log_alert(thr->log, "main store test: no store child for %s",
-                      what);
-        return NXT_ERROR;
+    ret = nxt_main_store_test_wait_child(thr, what, &pid, &status);
+
+    if (pid != 0) {
+        (void) nxt_main_test_store_exited(task, pid, status);
     }
 
-    if (nxt_main_store_test_wait(pid, &status) != 0) {
-        nxt_log_alert(thr->log, "main store test: waitpid(%PI) failed %E",
-                      pid, nxt_errno);
-        return NXT_ERROR;
-    }
-
-    (void) nxt_main_test_store_exited(task, pid, status);
-
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        nxt_log_alert(thr->log, "main store test: the store child of %s "
-                      "ended with status 0x%Xi", what, (nxt_uint_t) status);
-        return NXT_ERROR;
-    }
-
-    return NXT_OK;
+    return ret;
 }
 
 
@@ -770,10 +800,14 @@ static nxt_int_t
 nxt_main_store_test_order(nxt_thread_t *thr, nxt_task_t *task,
     nxt_main_store_test_paths_t *paths)
 {
+    int        status;
     nxt_int_t  ret;
+    nxt_pid_t  pid;
     char       dir[NXT_MAX_PATH_LEN], name[NXT_MAX_PATH_LEN];
 
     ret = NXT_ERROR;
+    pid = 0;
+    status = 0;
 
     nxt_main_store_test_alerts = 0;
 
@@ -830,9 +864,16 @@ nxt_main_store_test_order(nxt_thread_t *thr, nxt_task_t *task,
         nxt_main_store_test_fail(thr, "\"%s\" does not hold A", paths->conf);
     }
 
-    /* The DELETE of "first" came before B, so it runs before C. */
+    /*
+     * The DELETE of "first" came before B, so it runs before C.  The files
+     * are checked before main learns that the child exited, because C
+     * starts then and writes conf.json.
+     */
 
-    if (nxt_main_store_test_reap(thr, task, "the second store") != NXT_OK) {
+    if (nxt_main_store_test_wait_child(thr, "the second store", &pid,
+                                       &status)
+        != NXT_OK)
+    {
         goto done;
     }
 
@@ -843,9 +884,18 @@ nxt_main_store_test_order(nxt_thread_t *thr, nxt_task_t *task,
                                  "of \"first\", which came before B");
     }
 
-    /* C took the place of B, so it runs before the DELETE of "old". */
+    (void) nxt_main_test_store_exited(task, pid, status);
+    pid = 0;
 
-    if (nxt_main_store_test_reap(thr, task, "the third store") != NXT_OK) {
+    /*
+     * C took the place of B, so it runs before the DELETE of "old".  That
+     * DELETE starts when main learns that C exited, so the files are
+     * checked first.
+     */
+
+    if (nxt_main_store_test_wait_child(thr, "the third store", &pid, &status)
+        != NXT_OK)
+    {
         goto done;
     }
 
@@ -858,6 +908,9 @@ nxt_main_store_test_order(nxt_thread_t *thr, nxt_task_t *task,
         nxt_main_store_test_fail(thr, "\"%s\" does not hold C after the "
                                  "third store", paths->conf);
     }
+
+    (void) nxt_main_test_store_exited(task, pid, status);
+    pid = 0;
 
     if (nxt_main_store_test_reap(thr, task, "the DELETE of old") != NXT_OK) {
         goto done;
@@ -879,6 +932,12 @@ nxt_main_store_test_order(nxt_thread_t *thr, nxt_task_t *task,
     ret = NXT_OK;
 
 done:
+
+    /* A child that was waited for, but that main does not know has exited. */
+
+    if (pid != 0) {
+        (void) nxt_main_test_store_exited(task, pid, status);
+    }
 
     nxt_main_store_test_reap_all(task);
 

@@ -375,3 +375,31 @@ def test_access_log_credential_header_stored(
     finally:
         unit_stop()
         shutil.rmtree(statedir, ignore_errors=True)
+
+
+def test_put_past_scalar_member_is_refused():
+    """A control-API PUT whose path descends one step past a scalar member has
+    no container to create into.  nxt_conf_op_compile() must refuse it as not
+    found, the same way the delete and append paths do, rather than read the
+    scalar's union as an nxt_conf_object_t pointer and crash the controller.
+    (The controller auto-restarts, so a crash would show up as the next
+    request failing or the stored value being lost.)
+    """
+    assert 'success' in _put(
+        {
+            "listeners": {"*:8080": {"pass": "routes"}},
+            "routes": [{"action": {"return": 200}}],
+            "settings": {"http": {"body_read_timeout": 30}},
+        }
+    ), 'base config'
+
+    # One step past an integer scalar, both in an object and in an array.
+    assert 'error' in _put(
+        '0', '/config/settings/http/body_read_timeout/x'
+    ), 'descend past object scalar'
+    assert 'error' in _put(
+        '0', '/config/routes/0/action/return/deeper'
+    ), 'descend past array-element scalar'
+
+    # The controller is still up and the stored configuration is intact.
+    assert client.conf_get('/config/settings/http/body_read_timeout') == 30

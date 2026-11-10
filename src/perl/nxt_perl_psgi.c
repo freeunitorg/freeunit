@@ -844,6 +844,15 @@ nxt_perl_psgi_result_head(PerlInterpreter *my_perl, SV *sv_head,
         size += value_len;
 
         if ((i % 2) == 0) {
+            /* libunit stores the name length in a uint8_t. */
+            if (nxt_slow_path(value_len > UINT8_MAX)) {
+                nxt_unit_req_error(req, "PSGI: header name is too long "
+                                   "(%zu bytes, the limit is %d)",
+                                   (size_t) value_len, UINT8_MAX);
+
+                return NXT_UNIT_ERROR;
+            }
+
             fields++;
         }
     }

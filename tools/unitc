@@ -158,20 +158,41 @@ if [ $REMOTE -eq 0 ]; then
 	#
 	# shellcheck disable=SC2009,SC2046
 	set -- $(ps ax | grep unit:\ main | grep -v \ grep | awk '{print $1}')
-	if [ $# -eq 0 ]; then
+	# Keep only a "unit: main" owned by the superuser or by us.  The unitd
+	# main process never drops privileges, so it runs as root (or, for a
+	# rootless instance, as the user running unitc).  This drops an
+	# unprivileged user's decoy "unit: main" process, whose command line and
+	# PID-named /tmp cache file are trusted just below (its argv is run with
+	# --help to detect the control socket, and the cache file is sourced).
+	me=$(id -u)
+	PID=
+	for _pid in "$@"; do
+		_owner=$(ps -o uid= -p "$_pid" 2>/dev/null | tr -dc '0-9')
+		[ -n "$_owner" ] || continue
+		if [ "$_owner" = 0 ] || [ "$_owner" = "$me" ]; then
+			if [ -n "$PID" ]; then
+				echo "${0##*/}: ERROR: multiple unitd processes detected" >&2
+				exit 1
+			fi
+			PID=$_pid
+		fi
+	done
+	if [ -z "$PID" ]; then
 		echo "${0##*/}: ERROR: unitd not running (set \$UNIT_CTRL to configure a remote instance)" >&2
 		exit 1
-	elif [ $# -gt 1 ]; then
-		echo "${0##*/}: ERROR: multiple unitd processes detected ($*)" >&2
-		exit 1
 	fi
-	PID=$1
 
 	# Read the significant unitd conifuration from cache file (or create it)
 	#
-	if [ -r "/tmp/${0##*/}.$PID.env" ]; then
+	cache="/tmp/${0##*/}.$PID.env"
+	# /tmp is world-writable, so only source the cache when it is a regular
+	# file (not a symlink) that we own.  Otherwise an unprivileged user could
+	# pre-create a PID-named file whose contents this shell would execute.
+	if [ -f "$cache" ] \
+	   && [ "$(find "$cache" -prune -type f -user "$me" 2> /dev/null)" = "$cache" ]
+	then
 		# shellcheck source=/dev/null
-		. "/tmp/${0##*/}.$PID.env"
+		. "$cache"
 	else
 		# Check we have all the tools we will need (that we didn't already use)
 		#
@@ -229,8 +250,20 @@ if [ $REMOTE -eq 0 ]; then
 		# Cache the discovery for this unit PID (and cleanup any old files)
 		#
 		rm -f /tmp/"${0##*/}".* 2> /dev/null
-		printf '%s\n' "UNIT_CTRL=\"${UNIT_CTRL}\"" > "/tmp/${0##*/}.$PID.env"
-		printf '%s\n' "ERROR_LOG=\"${ERROR_LOG}\"" >> "/tmp/${0##*/}.$PID.env"
+		# Create the cache without following a symlink that an attacker may
+		# have planted at this predictable path in the (small) window after
+		# the rm.  "set -C" makes ">" fail when the path already exists, so a
+		# planted link is refused instead of being written through as root.
+		# Both lines share the one guarded redirect -- noclobber guards ">"
+		# but not ">>" -- so neither the create nor the append can follow a
+		# link; a refused redirect just skips the cache this run.
+		(
+			set -C
+			{
+				printf '%s\n' "UNIT_CTRL=\"${UNIT_CTRL}\""
+				printf '%s\n' "ERROR_LOG=\"${ERROR_LOG}\""
+			} > "$cache"
+		) 2> /dev/null || :
 	fi
 fi
 

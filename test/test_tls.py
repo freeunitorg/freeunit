@@ -1433,6 +1433,96 @@ def test_tls_write_abrupt_close():
         'router hung after aborted TLS write (issue #28)'
 
 
+@pytest.mark.parametrize(
+    'version',
+    [ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_3],
+    ids=['tls1.2', 'tls1.3'],
+)
+def test_tls_shutdown_after_fatal_error(version, wait_for_record, findall):
+    """A record that fails to decrypt is a fatal TLS error: the router logs
+    it at info and closes the connection.  It must not then call
+    SSL_shutdown(), which fails on a session in that state and was logged
+    at alert as "SSL_shutdown(...) failed"."""
+    client.certificate()
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "routes",
+                    "tls": {"certificate": "default"},
+                }
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    ), 'load application configuration'
+
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    context.minimum_version = version
+    context.maximum_version = version
+
+    with context.wrap_socket(
+        socket.create_connection(('127.0.0.1', port_map.port(8080)))
+    ) as sock:
+        sock.sendall(b'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
+        assert sock.recv(4096).startswith(b'HTTP/1.1 200'), 'keep-alive'
+
+        # An application data record with a payload that cannot decrypt.
+        os.write(sock.fileno(), b'\x17\x03\x03\x00\x20' + os.urandom(32))
+
+        assert (
+            wait_for_record(r'\[info\].*SSL_read.*bad record mac')
+            is not None
+        )
+
+    assert client.get_ssl()['status'] == 200, 'router is alive'
+    assert not findall(r'\[alert\].*SSL_shutdown')
+
+
+def test_tls_shutdown_close_notify():
+    """A normal close still sends close_notify: SSL_shutdown() is skipped
+    only for a session in init."""
+    client.certificate()
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "routes",
+                    "tls": {"certificate": "default"},
+                }
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    ), 'load application configuration'
+
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+
+    with context.wrap_socket(
+        socket.create_connection(('127.0.0.1', port_map.port(8080))),
+        suppress_ragged_eofs=False,
+    ) as sock:
+        sock.sendall(
+            b'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
+        )
+
+        data = b''
+        while True:
+            # Without close_notify, this raises ssl.SSLEOFError.
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+
+    assert data.startswith(b'HTTP/1.1 200'), 'response'
+
+
 @pytest.mark.skip('not yet')
 def test_tls_keepalive_certificate_remove():
     client.load('empty')

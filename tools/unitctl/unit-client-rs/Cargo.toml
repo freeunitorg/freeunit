@@ -1,6 +1,6 @@
 [package]
 name = "unit-client-rs"
-version = "1.37.1"
+version = "1.37.2"
 authors = ["Elijah Zupancic"]
 edition = "2021"
 rust-version = "1.95"
@@ -32,7 +32,7 @@ serde = { version = "1.0", features = ["derive"] }
 # the same body member by member, in order, and a sorted map would pair them
 # wrongly.  It also keeps the server's member order in what unitctl prints.
 serde_json = { version = "1.0", features = ["preserve_order"] }
-sysinfo = "0.39"
+sysinfo = { version = "0.40", default-features = false, features = ["system", "user"] }
 tokio = { version = "1.34", features = ["macros"] }
 futures = "0.3"
 hex = "0.4"

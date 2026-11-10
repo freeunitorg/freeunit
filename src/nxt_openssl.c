@@ -1485,6 +1485,23 @@ nxt_openssl_conn_io_shutdown(nxt_task_t *task, void *obj, void *data)
         goto done;
     }
 
+    /*
+     * SSL_shutdown() refuses a session in init: with "shutdown while in
+     * init" or, in OpenSSL 4.0, with SSL_ERROR_SSL and an empty error queue,
+     * which logs at alert.  A session is in init after a fatal TLS error
+     * (the peer has had a fatal alert, and the error was logged where it
+     * happened) or while a renegotiation or post-handshake message is still
+     * in progress.  No close_notify can be sent in either case.  nginx skips
+     * SSL_shutdown() here too.
+     */
+    if (SSL_in_init(s)) {
+        nxt_debug(task, "SSL_shutdown(%d) skipped: session in init",
+                  c->socket.fd);
+
+        handler = c->write_state->close_handler;
+        goto done;
+    }
+
     mode = SSL_get_shutdown(s);
 
     if (c->socket.timedout || c->socket.error != 0) {

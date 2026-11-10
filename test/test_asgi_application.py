@@ -189,6 +189,17 @@ def test_asgi_application_working_directory_invalid():
     assert client.get()['status'] == 500, 'status'
 
 
+def test_asgi_application_field_name():
+    # Only a field named "Content-Length" sets the body length.
+    client.load('field_name')
+
+    resp = client.get()
+
+    assert resp['status'] == 200, 'status'
+    assert resp['headers']['x-fnup'] == '3', 'field kept'
+    assert resp['body'] == '0123456789', 'body'
+
+
 def test_asgi_application_204_transfer_encoding():
     client.load('204_no_content')
 
@@ -555,3 +566,33 @@ def test_asgi_application_legacy_force():
     )
 
     assert resp['status'] == 200, 'status'
+
+
+def test_asgi_application_header_name_long(wait_for_record):
+    client.load('header_name_long')
+
+    for length in (255, 256, 300):
+        resp = client.get(
+            headers={
+                'Host': 'localhost',
+                'X-Length': str(length),
+                'Connection': 'close',
+            }
+        )
+
+        if length <= 255:
+            assert resp['status'] == 200, f'status {length}'
+            assert resp['headers']['x' * length] == 'value', f'header {length}'
+            continue
+
+        assert resp['status'] == 503, f'status {length}'
+        # A 256-byte name is cut to an empty one; the status is the check.
+        if length % 256:
+            assert (
+                'x' * (length % 256) not in resp['headers']
+            ), f'no cut name {length}'
+        assert resp['body'] != 'body', f'no application body {length}'
+        assert (
+            wait_for_record(rf'\[error\].+name is too long \({length} bytes')
+            is not None
+        ), f'error log {length}'

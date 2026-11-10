@@ -37,6 +37,8 @@ typedef enum {
     NXT_HTTP_ROUTE_PATTERN_NOCASE = 0,
     NXT_HTTP_ROUTE_PATTERN_LOWCASE,
     NXT_HTTP_ROUTE_PATTERN_UPCASE,
+    /* LOWCASE, with non-ASCII labels in punycode: the Host header form. */
+    NXT_HTTP_ROUTE_PATTERN_HOST,
 } nxt_http_route_pattern_case_t;
 
 
@@ -197,8 +199,8 @@ static nxt_http_action_t *nxt_http_pass_var(nxt_task_t *task,
     nxt_http_request_t *r, nxt_http_action_t *action);
 static void nxt_http_pass_query(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_action_t *action);
-static nxt_int_t nxt_http_pass_find(nxt_mp_t *mp, nxt_router_conf_t *rtcf,
-    nxt_str_t *pass, nxt_http_action_t *action);
+static nxt_int_t nxt_http_pass_find(nxt_mp_t *mp, nxt_mp_t *action_mp,
+    nxt_router_conf_t *rtcf, nxt_str_t *pass, nxt_http_action_t *action);
 static nxt_int_t nxt_http_route_find(nxt_http_routes_t *routes, nxt_str_t *name,
     nxt_http_action_t *action);
 
@@ -499,9 +501,14 @@ nxt_http_route_match_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
          * case-insensitive, and there is no per-rule sensitivity
          * flag — an admin expecting case-sensitive host filtering
          * will not get it from this rule.
+         *
+         * A Unicode (IDN) pattern is converted to punycode here, once,
+         * so that it matches the "xn--" form a client sends and the
+         * request path stays a byte compare against the lowercased
+         * Host, see nxt_http_validate_host().
          */
         rule = nxt_http_route_rule_create(task, mp, mtcf.host, 1,
-                                          NXT_HTTP_ROUTE_PATTERN_LOWCASE,
+                                          NXT_HTTP_ROUTE_PATTERN_HOST,
                                           NXT_HTTP_URI_ENCODING_NONE);
         if (rule == NULL) {
             return NULL;
@@ -993,6 +1000,7 @@ nxt_http_route_pattern_create(nxt_task_t *task, nxt_mp_t *mp,
     u_char                          c, *p, *end;
     nxt_str_t                       test, tmp;
     nxt_int_t                       ret;
+    const char                      *error;
     nxt_array_t                     *slices;
 #if (NXT_HAVE_REGEX)
     nxt_regex_t                     *re;
@@ -1055,6 +1063,27 @@ nxt_http_route_pattern_create(nxt_task_t *task, nxt_mp_t *mp,
 #else
         return NXT_ERROR;
 #endif
+    }
+
+    /*
+     * The control API refuses a pattern that cannot be converted.  A
+     * restored configuration can still hold one, and the validator keeps
+     * it, see nxt_conf_vldt_match_pattern().  It is used as written, with
+     * the byte compare of earlier versions.
+     */
+    if (pattern_case == NXT_HTTP_ROUTE_PATTERN_HOST) {
+        ret = nxt_punycode_host(mp, &test, &error);
+
+        if (nxt_slow_path(ret == NXT_ERROR)) {
+            nxt_alert(task, "host pattern \"%V\": %s", &test, error);
+            return NXT_ERROR;
+        }
+
+        if (nxt_slow_path(ret == NXT_DECLINED)) {
+            nxt_log(task, NXT_LOG_WARN, "the \"host\" pattern \"%V\" "
+                    "cannot be converted to punycode: %s.  It is compared "
+                    "as written", &test, error);
+        }
     }
 
     slices = nxt_array_create(mp, 1, sizeof(nxt_http_route_pattern_slice_t));
@@ -1284,6 +1313,7 @@ nxt_http_route_pattern_slice(nxt_array_t *slices,
         break;
 
     case NXT_HTTP_ROUTE_PATTERN_LOWCASE:
+    case NXT_HTTP_ROUTE_PATTERN_HOST:
         nxt_memcpy_lowcase(start, test->start, test->length);
         break;
 
@@ -1373,8 +1403,8 @@ nxt_http_action_resolve(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     if (nxt_tstr_is_const(action->u.tstr)) {
         nxt_tstr_str(action->u.tstr, &pass);
 
-        ret = nxt_http_pass_find(tmcf->mem_pool, tmcf->router_conf, &pass,
-                                 action);
+        ret = nxt_http_pass_find(tmcf->mem_pool, tmcf->router_conf->mem_pool,
+                                 tmcf->router_conf, &pass, action);
         if (nxt_slow_path(ret != NXT_OK)) {
             return NXT_ERROR;
         }
@@ -1446,7 +1476,8 @@ nxt_http_pass_query(nxt_task_t *task, nxt_http_request_t *r,
 
     nxt_debug(task, "http pass lookup: %V", action->u.pass);
 
-    ret = nxt_http_pass_find(r->mem_pool, rtcf, action->u.pass, action);
+    ret = nxt_http_pass_find(r->mem_pool, r->mem_pool, rtcf, action->u.pass,
+                             action);
 
     if (ret != NXT_OK) {
         status = (ret == NXT_DECLINED) ? NXT_HTTP_NOT_FOUND
@@ -1461,8 +1492,8 @@ nxt_http_pass_query(nxt_task_t *task, nxt_http_request_t *r,
 
 
 static nxt_int_t
-nxt_http_pass_find(nxt_mp_t *mp, nxt_router_conf_t *rtcf, nxt_str_t *pass,
-    nxt_http_action_t *action)
+nxt_http_pass_find(nxt_mp_t *mp, nxt_mp_t *action_mp, nxt_router_conf_t *rtcf,
+    nxt_str_t *pass, nxt_http_action_t *action)
 {
     nxt_int_t  ret;
     nxt_str_t  segments[3];
@@ -1473,8 +1504,8 @@ nxt_http_pass_find(nxt_mp_t *mp, nxt_router_conf_t *rtcf, nxt_str_t *pass,
     }
 
     if (nxt_str_eq(&segments[0], "applications", 12)) {
-        return nxt_router_application_init(rtcf, &segments[1], &segments[2],
-                                           action);
+        return nxt_router_application_init(rtcf, action_mp, &segments[1],
+                                           &segments[2], action);
     }
 
     if (segments[2].length == 0) {
@@ -1617,7 +1648,8 @@ nxt_http_pass_application(nxt_task_t *task, nxt_router_conf_t *rtcf,
         return NULL;
     }
 
-    (void) nxt_router_application_init(rtcf, name, NULL, action);
+    (void) nxt_router_application_init(rtcf, rtcf->mem_pool, name, NULL,
+                                       action);
 
     return action;
 }
@@ -2176,6 +2208,29 @@ nxt_http_route_test_rule(nxt_http_request_t *r, nxt_http_route_rule_t *rule,
 }
 
 
+#if (NXT_TESTS && NXT_HAVE_REGEX)
+
+/*
+ * src/test/nxt_regex_test.c matches a route regex as a request does: with
+ * the match object of the router thread, through nxt_http_route_pattern().
+ */
+
+nxt_int_t
+nxt_http_route_test_regex(nxt_http_request_t *r, nxt_regex_t *re,
+    u_char *start, size_t length)
+{
+    nxt_http_route_pattern_t  pattern;
+
+    nxt_memzero(&pattern, sizeof(nxt_http_route_pattern_t));
+    pattern.regex = 1;
+    pattern.u.regex = re;
+
+    return nxt_http_route_pattern(r, &pattern, start, length);
+}
+
+#endif
+
+
 static nxt_int_t
 nxt_http_route_pattern(nxt_http_request_t *r, nxt_http_route_pattern_t *pattern,
     u_char *start, size_t length)
@@ -2188,24 +2243,39 @@ nxt_http_route_pattern(nxt_http_request_t *r, nxt_http_route_pattern_t *pattern,
 
 #if (NXT_HAVE_REGEX)
     if (pattern->regex) {
-        if (r->regex_match == NULL) {
+        nxt_thread_t        *thr;
+        nxt_event_engine_t  *engine;
+
+        /*
+         * The request is matched on its router thread, but r->engine is not
+         * set until the request reaches an application, after routing.  The
+         * match object lives on the engine of the thread that runs the match.
+         */
+        thr = nxt_thread();
+        engine = thr->engine;
+
+        if (engine->regex_match == NULL) {
             /*
-             * One match object serves every pattern tested against this
-             * request.  Its match data holds the minimum ovector: one
-             * offset pair, the overall match.  The matcher does not read
-             * captures.  pcre2_match_data_create() treats an ovecsize of 0
-             * as 1 (pcre2_match_data_create(3)); 1 is passed to make the
-             * minimum explicit.  With PCRE1 the size counts ints, not
-             * pairs; pcre_exec() then returns 0 on a match, and
+             * One match object serves every route pattern tested on this
+             * router thread, across requests: the thread matches one subject
+             * at a time, and nxt_regex_match() resets the per-match state.
+             * It is held on the engine and freed with the engine pool, so a
+             * request allocates no match context.  Its match data holds the
+             * minimum ovector: one offset pair, the overall match.  The
+             * matcher does not read captures.  pcre2_match_data_create()
+             * treats an ovecsize of 0 as 1 (pcre2_match_data_create(3)); 1 is
+             * passed to make the minimum explicit.  With PCRE1 the size counts
+             * ints, not pairs; pcre_exec() then returns 0 on a match, and
              * nxt_regex_match() counts 0 as a match.
              */
-            r->regex_match = nxt_regex_match_create(r->mem_pool, 1);
-            if (nxt_slow_path(r->regex_match == NULL)) {
+            engine->regex_match = nxt_regex_match_create(engine->mem_pool, 1);
+            if (nxt_slow_path(engine->regex_match == NULL)) {
                 return NXT_ERROR;
             }
         }
 
-        return nxt_regex_match(pattern->u.regex, start, length, r->regex_match);
+        return nxt_regex_match(pattern->u.regex, start, length,
+                               engine->regex_match);
     }
 #endif
 

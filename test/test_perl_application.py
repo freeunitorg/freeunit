@@ -522,3 +522,33 @@ def test_perl_script_cstring_nul():
     assert 'success' in conf_script(
         f'{option.test_dir}/perl/variables/psgi.pl'
     ), 'script valid'
+
+
+def test_perl_application_header_name_long(wait_for_record):
+    client.load('header_name_long')
+
+    for length in (255, 256, 300):
+        resp = client.get(
+            headers={
+                'Host': 'localhost',
+                'X-Length': str(length),
+                'Connection': 'close',
+            }
+        )
+
+        if length <= 255:
+            assert resp['status'] == 200, f'status {length}'
+            assert resp['headers']['X' * length] == 'value', f'header {length}'
+            continue
+
+        assert resp['status'] == 503, f'status {length}'
+        # A 256-byte name is cut to an empty one; the status is the check.
+        if length % 256:
+            assert (
+                'X' * (length % 256) not in resp['headers']
+            ), f'no cut name {length}'
+        assert resp['body'] != 'body', f'no application body {length}'
+        assert (
+            wait_for_record(rf'\[error\].+name is too long \({length} bytes')
+            is not None
+        ), f'error log {length}'
