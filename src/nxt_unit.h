@@ -504,7 +504,10 @@ uint64_t nxt_unit_test_detached_now(void);
 void     *nxt_unit_test_wait_set_new(void);
 int      nxt_unit_test_wait(void *ws, int read_fd, int shared_fd, int timeout,
     short *revents);
+int      nxt_unit_test_wait_set_epoll(void *ws);
 void     nxt_unit_test_wait_set_free(void *ws);
+void     nxt_unit_test_wait_set_failures(unsigned int failures, int err);
+int      nxt_unit_test_epoll_release(const char *release);
 uint8_t  nxt_unit_test_ctx_online(nxt_unit_ctx_t *ctx);
 void     nxt_unit_test_ctx_set_quit_pending(nxt_unit_ctx_t *ctx,
              uint8_t quit_param);
