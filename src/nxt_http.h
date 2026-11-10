@@ -91,6 +91,7 @@ typedef struct {
 
 
 typedef struct nxt_h1proto_s        nxt_h1proto_t;
+typedef struct nxt_h2p_stream_s     nxt_h2p_stream_t;
 
 struct nxt_h1p_websocket_timer_s {
     nxt_timer_t                     timer;
@@ -102,6 +103,7 @@ struct nxt_h1p_websocket_timer_s {
 typedef union {
     void                            *any;
     nxt_h1proto_t                   *h1;
+    nxt_h2p_stream_t                *h2;
 } nxt_http_proto_t;
 
 
@@ -455,17 +457,10 @@ struct nxt_http_forward_s {
 nxt_inline u_char *
 nxt_http_date(u_char *buf, struct tm *tm)
 {
-    static const char * const  week[] = { "Sun", "Mon", "Tue", "Wed", "Thu",
-                                          "Fri", "Sat" };
-
-    static const char * const  month[] = { "Jan", "Feb", "Mar", "Apr", "May",
-                                           "Jun", "Jul", "Aug", "Sep", "Oct",
-                                           "Nov", "Dec" };
-
     return nxt_sprintf(buf, buf + NXT_HTTP_DATE_LEN,
                        "%s, %02d %s %4d %02d:%02d:%02d GMT",
-                       week[tm->tm_wday], tm->tm_mday,
-                       month[tm->tm_mon], tm->tm_year + 1900,
+                       nxt_wday_abbr[tm->tm_wday], tm->tm_mday,
+                       nxt_month_abbr[tm->tm_mon], tm->tm_year + 1900,
                        tm->tm_hour, tm->tm_min, tm->tm_sec);
 }
 
@@ -598,6 +593,7 @@ void nxt_http_proxy_buf_mem_free(nxt_task_t *task, nxt_http_request_t *r,
 
 extern nxt_time_string_t  nxt_http_date_cache;
 
+extern nxt_lvlhsh_t                        nxt_http_request_fields_hash;
 extern nxt_lvlhsh_t                        nxt_response_fields_hash;
 
 extern const nxt_http_proto_table_t  nxt_http_proto[];

@@ -1905,6 +1905,8 @@ nxt_unit_default_init(nxt_task_t *task, nxt_unit_init_t *init,
 
     nxt_memzero(init, sizeof(nxt_unit_init_t));
 
+    init->size = sizeof(nxt_unit_init_t);
+
     rt = task->thread->runtime;
 
     proto_port = rt->port_by_type[NXT_PROCESS_PROTOTYPE];
@@ -1946,6 +1948,7 @@ nxt_unit_default_init(nxt_task_t *task, nxt_unit_init_t *init,
 
     init->shm_limit = conf->shm_limit;
     init->request_limit = conf->request_limit;
+    init->max_processes = conf->max_processes;
 
     return NXT_OK;
 }

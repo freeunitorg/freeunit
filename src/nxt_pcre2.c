@@ -30,6 +30,28 @@
  */
 #define NXT_PCRE2_RECURSION_LIMIT  2000
 
+/*
+ * Patterns are compiled in UTF mode, so "." and character classes match
+ * whole UTF-8 characters.  A subject such as a header value may hold any
+ * bytes.  PCRE2_MATCH_INVALID_UTF lets such a subject match or not match
+ * instead of failing with an error.
+ *
+ * The option came in PCRE2 10.34, but before 10.48 it is not safe with a
+ * subject from a client.  The interpreter and the JIT can read before the
+ * subject when it starts with a UTF-8 continuation byte and the pattern
+ * has "\X" or a variable-length lookbehind (GHSA-9qww-pwc4-77qq), and the
+ * JIT can skip characters next to an invalid byte, so it can give a
+ * different result from the interpreter.  So UTF mode needs PCRE2 10.48 or
+ * later, both in the headers at build time and in the library at run time.
+ * Other versions match bytes.
+ */
+#if (defined(PCRE2_MATCH_INVALID_UTF)                                       \
+     && (PCRE2_MAJOR > 10 || (PCRE2_MAJOR == 10 && PCRE2_MINOR >= 48)))
+#define NXT_PCRE2_UTF_OPTIONS  (PCRE2_UTF | PCRE2_MATCH_INVALID_UTF)
+#else
+#define NXT_PCRE2_UTF_OPTIONS  0
+#endif
+
 
 static void *nxt_pcre2_malloc(PCRE2_SIZE size, void *memory_data);
 static void nxt_pcre2_free(void *p, void *memory_data);
@@ -38,6 +60,7 @@ static void nxt_pcre2_match_cleanup(nxt_task_t *task, void *obj, void *data);
 static void nxt_pcre2_match_data_cleanup(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_pcre2_code_cleanup(nxt_task_t *task, void *obj, void *data);
+static uint32_t nxt_pcre2_utf_options(void);
 
 #if (NXT_TESTS)
 static nxt_uint_t                   nxt_pcre2_test_mode;
@@ -115,7 +138,7 @@ nxt_regex_t *
 nxt_regex_compile(nxt_mp_t *mp, nxt_str_t *source, nxt_regex_err_t *err)
 {
     int                    errcode;
-    uint32_t               options;
+    uint32_t               options, utf;
     nxt_int_t              ret;
     PCRE2_SIZE             erroffset;
     pcre2_code             *code;
@@ -145,8 +168,22 @@ nxt_regex_compile(nxt_mp_t *mp, nxt_str_t *source, nxt_regex_err_t *err)
         goto alloc_fail;
     }
 
-    re->code = pcre2_compile((PCRE2_SPTR) source->start, source->length, 0,
+    /*
+     * A pattern that UTF mode does not accept, such as one with invalid
+     * UTF-8 from an old configuration, is compiled again without it.
+     */
+
+    utf = nxt_pcre2_utf_options();
+
+    re->code = pcre2_compile((PCRE2_SPTR) source->start, source->length, utf,
                              &errcode, &erroffset, compile_ctx);
+
+    if (re->code == NULL && utf != 0) {
+        utf = 0;
+        re->code = pcre2_compile((PCRE2_SPTR) source->start, source->length,
+                                 0, &errcode, &erroffset, compile_ctx);
+    }
+
     if (nxt_slow_path(re->code == NULL)) {
         goto compile_fail;
     }
@@ -165,7 +202,7 @@ nxt_regex_compile(nxt_mp_t *mp, nxt_str_t *source, nxt_regex_err_t *err)
         && (options & PCRE2_ANCHORED) == 0)
     {
         code = pcre2_compile((PCRE2_SPTR) source->start, source->length,
-                             PCRE2_AUTO_CALLOUT, &errcode, &erroffset,
+                             utf | PCRE2_AUTO_CALLOUT, &errcode, &erroffset,
                              compile_ctx);
         if (nxt_slow_path(code == NULL)) {
             goto compile_fail;
@@ -254,6 +291,53 @@ alloc_fail:
     nxt_memcpy(err->msg, alloc_error, sizeof(alloc_error));
 
     return NULL;
+}
+
+
+/*
+ * Returns the UTF options if the library that runs is PCRE2 10.48 or
+ * later, else 0.  A binary built with new headers can run with an older
+ * library.  The version string is, for example, "10.48 2026-08-31".  The
+ * result is the same on each call, so a race on the cache is harmless.
+ */
+
+static uint32_t
+nxt_pcre2_utf_options(void)
+{
+#if (NXT_PCRE2_UTF_OPTIONS != 0)
+    u_char            *p;
+    nxt_uint_t        major, minor;
+    static nxt_int_t  utf = -1;
+    char              version[64];
+
+    if (utf >= 0) {
+        return utf ? NXT_PCRE2_UTF_OPTIONS : 0;
+    }
+
+    utf = 0;
+
+    if (pcre2_config(PCRE2_CONFIG_VERSION, version) > 0) {
+        p = (u_char *) version;
+        major = 0;
+        minor = 0;
+
+        while (*p >= '0' && *p <= '9' && major < 1000) {
+            major = major * 10 + (*p++ - '0');
+        }
+
+        if (*p++ == '.') {
+            while (*p >= '0' && *p <= '9' && minor < 1000) {
+                minor = minor * 10 + (*p++ - '0');
+            }
+
+            utf = (major > 10 || (major == 10 && minor >= 48));
+        }
+    }
+
+    return utf ? NXT_PCRE2_UTF_OPTIONS : 0;
+#else
+    return 0;
+#endif
 }
 
 

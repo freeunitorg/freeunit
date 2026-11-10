@@ -249,6 +249,7 @@ static nxt_int_t (*const nxt_security_tests[])(nxt_thread_t *) = {
     nxt_regex_test,
 #endif
     nxt_usdt_test,
+    nxt_router_schedule_test,
 };
 
 
@@ -433,6 +434,10 @@ main(int argc, char **argv)
     }
 
     if (nxt_http_parse_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_http_request_fields_test(thr) != NXT_OK) {
         return 1;
     }
 

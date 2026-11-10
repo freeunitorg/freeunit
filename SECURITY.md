@@ -6,9 +6,10 @@ FreeUnit provides security maintenance for the following versions:
 
 | Version | Supported |
 |---------|-----------|
-| 1.37.x  | ✅ Active |
-| 1.36.x  | ❌ EOL — upgrade to 1.37.x |
-| 1.35.x  | ❌ EOL — upgrade to 1.37.x |
+| 1.38.x  | ✅ Active |
+| 1.37.x  | ❌ EOL — upgrade to 1.38.x |
+| 1.36.x  | ❌ EOL — upgrade to 1.38.x |
+| 1.35.x  | ❌ EOL — upgrade to 1.38.x |
 | 1.34.x  | ✅ LTS    |
 | < 1.34  | ❌ No     |
 

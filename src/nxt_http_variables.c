@@ -138,8 +138,8 @@ nxt_http_register_variables(void)
  * A variable that names a header that carries a credential by definition:
  * Authorization, Proxy-Authorization, Cookie or Set-Cookie, after "header_"
  * (a request header) or "response_header_" (a response header), the two
- * prefixes that nxt_http_unknown_var_ref() resolves to a header.  The router
- * warns about such a variable in an access log format.
+ * prefixes that nxt_http_unknown_var_ref() resolves to a header.  The access
+ * log writes such a variable as "REDACTED".
  *
  * The comparison follows nxt_http_header_hash() for a request header and
  * nxt_http_field_name_cmp() for a response header: a header name is matched
@@ -439,10 +439,6 @@ nxt_http_log_date(u_char *buf, nxt_realtime_t *now, struct tm *tm,
     u_char  sign;
     time_t  gmtoff;
 
-    static const char * const  month[] = { "Jan", "Feb", "Mar", "Apr", "May",
-                                           "Jun", "Jul", "Aug", "Sep", "Oct",
-                                           "Nov", "Dec" };
-
     gmtoff = nxt_timezone(tm) / 60;
 
     if (gmtoff < 0) {
@@ -454,7 +450,8 @@ nxt_http_log_date(u_char *buf, nxt_realtime_t *now, struct tm *tm,
     }
 
     return nxt_sprintf(buf, buf + size, format,
-                       tm->tm_mday, month[tm->tm_mon], tm->tm_year + 1900,
+                       tm->tm_mday, nxt_month_abbr[tm->tm_mon],
+                       tm->tm_year + 1900,
                        tm->tm_hour, tm->tm_min, tm->tm_sec,
                        sign, gmtoff / 60, gmtoff % 60);
 }
@@ -599,6 +596,13 @@ nxt_http_var_response_connection(nxt_task_t *task, nxt_str_t *str, void *ctx,
     };
 
     r = ctx;
+
+    /* Only h1 has a connection; a schedule's request has none. */
+    if (r->protocol != NXT_HTTP_PROTO_H1) {
+        nxt_str_null(str);
+        return NXT_OK;
+    }
+
     h1p = r->proto.h1;
 
     conn = -1;
@@ -669,7 +673,7 @@ nxt_http_var_response_transfer_encoding(nxt_task_t *task, nxt_str_t *str,
 
     r = ctx;
 
-    if (r->proto.h1->chunked) {
+    if (r->protocol == NXT_HTTP_PROTO_H1 && r->proto.h1->chunked) {
         nxt_str_set(str, "chunked");
 
     } else {

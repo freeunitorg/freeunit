@@ -1,6 +1,6 @@
 {
   "packageName": "unit-openapi",
-  "packageVersion": "1.37.2",
+  "packageVersion": "1.38.0",
   "library": "hyper",
   "preferUnsignedInt": true
 }

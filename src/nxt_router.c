@@ -25,6 +25,7 @@
 #include <nxt_checked.h>
 #include <nxt_http_compression.h>
 #include <nxt_usdt.h>
+#include <nxt_router_schedule.h>
 
 #if (NXT_HAVE_OTEL)
 #define NXT_OTEL_BATCH_DEFAULT     128
@@ -2359,6 +2360,8 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
     u_char                   *p;
     size_t                   alloc;
+    uint64_t                 access_log_lost;
+    nxt_uint_t               nsched;
     nxt_app_t                *app;
     nxt_buf_t                *b;
     nxt_uint_t               type;
@@ -2367,7 +2370,6 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_event_engine_t       *engine;
     nxt_status_report_t      *report;
     nxt_router_access_log_t  *access_log;
-    uint64_t                 access_log_lost;
 
     port = nxt_runtime_port_find(task->thread->runtime,
                                  msg->port_msg.pid,
@@ -2390,6 +2392,8 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         alloc += sizeof(nxt_status_app_t) + app->name.length;
 
     } nxt_queue_loop;
+
+    alloc += nxt_router_schedules_status_size(&nsched);
 
     b = nxt_buf_mem_alloc(port->mem_pool, alloc, 0);
     if (nxt_slow_path(b == NULL)) {
@@ -2480,6 +2484,10 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         report->apps_count++;
         app_stat++;
     } nxt_queue_loop;
+
+    report->schedules_count = nsched;
+    nxt_router_schedules_status(nxt_status_report_schedules(report), p,
+                                b->mem.pos);
 
     type = NXT_PORT_MSG_RPC_READY_LAST;
 
@@ -2807,6 +2815,8 @@ nxt_router_conf_apply(nxt_task_t *task, void *obj, void *data)
     nxt_router_apps_hash_use(task, rtcf, 1);
 
     nxt_router_engines_post(router, tmcf);
+
+    nxt_router_schedules_apply(task, tmcf);
 
     nxt_queue_add(&router->sockets, &updating_sockets);
     nxt_queue_add(&router->sockets, &creating_sockets);
@@ -3181,6 +3191,10 @@ static nxt_conf_map_t  nxt_router_http_conf[] = {
         offsetof(nxt_socket_conf_t, send_min_rate),
     },
 
+    /*
+     * Copied: the parsed configuration is in tmcf->mem_pool, which
+     * nxt_router_conf_ready() frees, and a request reads the path later.
+     */
     {
         nxt_string("body_temp_path"),
         NXT_CONF_MAP_STR_COPY,
@@ -3332,6 +3346,49 @@ nxt_router_otel_conf_remember(nxt_str_t *endpoint, nxt_str_t *protocol,
 
 #endif
 
+
+
+/* A listener's HTTP settings: the defaults, then "settings/http". */
+
+nxt_int_t
+nxt_router_socket_conf_http(nxt_mp_t *mp, nxt_socket_conf_t *skcf,
+    nxt_conf_value_t *http)
+{
+    skcf->header_buffer_size = 2048;
+    skcf->large_header_buffer_size = 8192;
+    skcf->large_header_buffers = 4;
+    skcf->discard_unsafe_fields = 1;
+    skcf->body_buffer_size = 16 * 1024;
+    skcf->max_body_size = 8 * 1024 * 1024;
+    skcf->proxy_header_buffer_size = 64 * 1024;
+    skcf->proxy_buffer_size = 4096;
+    skcf->proxy_buffers = 256;
+    skcf->idle_timeout = 30 * 1000;
+    skcf->header_read_timeout = 30 * 1000;
+    skcf->body_read_timeout = 30 * 1000;
+    skcf->send_timeout = 30 * 1000;
+    skcf->proxy_timeout = 60 * 1000;
+    skcf->proxy_send_timeout = 30 * 1000;
+    skcf->proxy_read_timeout = 30 * 1000;
+    skcf->body_min_rate = 0;
+    skcf->send_min_rate = 0;
+
+    skcf->server_version = 1;
+    skcf->chunked_transform = 0;
+
+    skcf->websocket_conf.max_frame_size = 1024 * 1024;
+    skcf->websocket_conf.read_timeout = 60 * 1000;
+    skcf->websocket_conf.keepalive_interval = 30 * 1000;
+
+    nxt_str_null(&skcf->body_temp_path);
+
+    if (http == NULL) {
+        return NXT_OK;
+    }
+
+    return nxt_conf_map_object(mp, http, nxt_router_http_conf,
+                               nxt_nitems(nxt_router_http_conf), skcf);
+}
 
 static nxt_int_t
 nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
@@ -3763,45 +3820,10 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
                 goto fail;
             }
 
-            // STUB, default values if http block is not defined.
-            skcf->header_buffer_size = 2048;
-            skcf->large_header_buffer_size = 8192;
-            skcf->large_header_buffers = 4;
-            skcf->discard_unsafe_fields = 1;
-            skcf->body_buffer_size = 16 * 1024;
-            skcf->max_body_size = 8 * 1024 * 1024;
-            skcf->proxy_header_buffer_size = 64 * 1024;
-            skcf->proxy_buffer_size = 4096;
-            skcf->proxy_buffers = 256;
-            skcf->idle_timeout = 30 * 1000;
-            skcf->header_read_timeout = 30 * 1000;
-            skcf->body_read_timeout = 30 * 1000;
-            skcf->send_timeout = 30 * 1000;
-            skcf->proxy_timeout = 60 * 1000;
-            skcf->proxy_send_timeout = 30 * 1000;
-            skcf->proxy_read_timeout = 30 * 1000;
-            skcf->body_min_rate = 0;
-            skcf->send_min_rate = 0;
-
-            skcf->server_version = 1;
-            skcf->chunked_transform = 0;
-
-            skcf->websocket_conf.max_frame_size = 1024 * 1024;
-            skcf->websocket_conf.read_timeout = 60 * 1000;
-            skcf->websocket_conf.keepalive_interval = 30 * 1000;
-
-            nxt_str_null(&skcf->body_temp_path);
-
-            if (http != NULL) {
-
-                ret = nxt_conf_map_object(mp, http, nxt_router_http_conf,
-                                          nxt_nitems(nxt_router_http_conf),
-                                          skcf);
-                if (ret != NXT_OK) {
-                    nxt_alert(task, "http map error");
-                    goto fail;
-                }
-
+            ret = nxt_router_socket_conf_http(mp, skcf, http);
+            if (ret != NXT_OK) {
+                nxt_alert(task, "http map error");
+                goto fail;
             }
 
             if (websocket != NULL) {
@@ -3908,7 +3930,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
         }
     }
 
-    ret = nxt_http_routes_resolve(task, tmcf);
+    ret = nxt_router_conf_resolve(task, tmcf, root);
     if (nxt_slow_path(ret != NXT_OK)) {
         goto fail;
     }
@@ -6384,6 +6406,28 @@ nxt_router_conf_release(nxt_task_t *task, nxt_socket_conf_joint_t *joint)
         nxt_mp_thread_adopt(rtcf->mem_pool);
 
         nxt_mp_destroy(rtcf->mem_pool);
+    }
+}
+
+
+/*
+ * Release a joint from its own engine, and let a worker engine that is
+ * quitting exit once no joint holds it, as a connection's release does in
+ * nxt_router_listen_event_release().  For the internal requests of
+ * src/nxt_router_schedule.c.  Does not return if the engine exits.
+ */
+
+void
+nxt_router_joint_release(nxt_task_t *task, nxt_socket_conf_joint_t *joint)
+{
+    nxt_event_engine_t  *engine;
+
+    engine = task->thread->engine;
+
+    nxt_router_conf_release(task, joint);
+
+    if (engine->shutdown && nxt_queue_is_empty(&engine->joints)) {
+        nxt_router_worker_thread_exit(task);
     }
 }
 
@@ -9434,6 +9478,18 @@ nxt_router_app_queue_send(nxt_task_t *task,
 
 
 /*
+ * The configuration validator checks schedule header names against this:
+ * nxt_router_prepare_msg() refuses a name that is too long with the prefix.
+ */
+
+size_t
+nxt_router_app_field_prefix_length(nxt_app_type_t type)
+{
+    return nxt_app_msg_prefix[type]->length;
+}
+
+
+/*
  * Builds the nxt_unit_request_t for the application in shared memory.
  *
  * Every length that lands in a narrow field of the libunit protocol is
@@ -9847,10 +9903,10 @@ nxt_router_test_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
 static void
 nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
 {
-    nxt_timer_t              *timer;
-    nxt_msg_info_t           *msg_info;
-    nxt_http_request_t       *r;
-    nxt_request_rpc_data_t   *req_rpc_data;
+    nxt_msec_t              delay;
+    nxt_timer_t             *timer;
+    nxt_http_request_t      *r;
+    nxt_request_rpc_data_t  *req_rpc_data;
 
     timer = obj;
 
@@ -9858,6 +9914,57 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
 
     r = nxt_timer_data(timer, nxt_http_request_t, timer);
     req_rpc_data = r->timer_data;
+
+    /*
+     * With "timeout": 0 only the acknowledgement deadline applies.  A request
+     * still waiting in the queue is left there, and checked again at the
+     * next one.  One that a worker took is handled below like any claimed
+     * request: an alert, then 503 at the next expiry.  The 503 unlinks the
+     * request, which drops its reference to the application, so a
+     * reconfiguration can release the application and send QUIT to its
+     * prototype (nxt_router_free_app()).
+     *
+     * A request retracted when the last process died and waiting for a new
+     * one in app->requeue_req (nxt_router_app_requeue_handler()) is waiting
+     * for capacity as well, so it is left to wait too.
+     *
+     * This is for the application deadline only.  A schedule's "timeout"
+     * also retracts a request that still waits for capacity.
+     */
+
+    if (req_rpc_data->app != NULL
+        && req_rpc_data->app->timeout == 0
+        && (req_rpc_data->requeued || nxt_router_msg_queued(req_rpc_data)))
+    {
+        nxt_timer_add(task->thread->engine, timer, NXT_APP_ACK_TIMEOUT);
+
+        return;
+    }
+
+    delay = nxt_router_request_expire(task, r, req_rpc_data);
+
+    if (delay != 0) {
+        nxt_timer_add(task->thread->engine, timer, delay);
+    }
+}
+
+
+/*
+ * The request deadline, shared by "limits": {"timeout"} above and a
+ * schedule's own "timeout" (src/nxt_router_schedule.c).  Returns 0 when the
+ * request was answered with 503 and unlinked.  A request that a worker
+ * claimed and did not acknowledge is left alone at the first call: the
+ * function then returns the acknowledgement deadline, and the caller arms
+ * its timer again for that time.  The next call answers the request.  So a
+ * claimed request ends at most one deadline after the first call, also when
+ * the worker that claimed it is dead.
+ */
+
+nxt_msec_t
+nxt_router_request_expire(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_request_rpc_data_t *req_rpc_data)
+{
+    nxt_msg_info_t  *msg_info;
 
     msg_info = &req_rpc_data->msg_info;
 
@@ -9880,8 +9987,9 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
      * The acknowledgement usually comes within microseconds of the claim.
      * A whole timeout without it means that the worker failed or died
      * before it sent one.  Log an alert, because nothing else reports this
-     * state, and re-arm the timer.  The acknowledgement replaces the timer
-     * with its own deadline.
+     * state, and let the caller re-arm its timer.  For the application
+     * deadline, the acknowledgement replaces the timer with its own
+     * deadline.
      *
      * At the second expiry, answer 503 and unlink, as for a request that a
      * worker acknowledged and runs too long.  The unlink cancels the RPC.
@@ -9907,29 +10015,6 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
      * the shared port here means that it has not arrived yet.
      */
 
-    /*
-     * With "timeout": 0 only the acknowledgement deadline applies.  A request
-     * still waiting in the queue is left there, and checked again at the
-     * next one.  One that a worker took is handled below like any claimed
-     * request: an alert, then 503 at the next expiry.  The 503 unlinks the
-     * request, which drops its reference to the application, so a
-     * reconfiguration can release the application and send QUIT to its
-     * prototype (nxt_router_free_app()).
-     *
-     * A request retracted when the last process died and waiting for a new
-     * one in app->requeue_req (nxt_router_app_requeue_handler()) is waiting
-     * for capacity as well, so it is left to wait too.
-     */
-
-    if (req_rpc_data->app != NULL
-        && req_rpc_data->app->timeout == 0
-        && (req_rpc_data->requeued || nxt_router_msg_queued(req_rpc_data)))
-    {
-        nxt_timer_add(task->thread->engine, timer, NXT_APP_ACK_TIMEOUT);
-
-        return;
-    }
-
     if (msg_info->cancel == NXT_MSG_QUEUED) {
         (void) nxt_router_msg_retract(task, req_rpc_data);
     }
@@ -9944,16 +10029,18 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
         if (req_rpc_data->claimed_expired == 0) {
             req_rpc_data->claimed_expired = 1;
 
+            /*
+             * The deadline that expired is the application's or a
+             * schedule's, so the line names only the wait that follows.
+             */
+
             nxt_alert(task, "app \"%V\": stream #%uD was claimed by a worker, "
-                      "and the %M ms deadline expired without an "
-                      "acknowledgement",
+                      "and the deadline expired without an acknowledgement; "
+                      "answering 503 in %M ms if none comes",
                       &req_rpc_data->app->name, req_rpc_data->stream,
                       nxt_router_app_ack_deadline(req_rpc_data->app));
 
-            nxt_timer_add(task->thread->engine, timer,
-                          nxt_router_app_ack_deadline(req_rpc_data->app));
-
-            return;
+            return nxt_router_app_ack_deadline(req_rpc_data->app);
         }
 
         nxt_log(task, NXT_LOG_WARN, "app \"%V\": stream #%uD is still not "
@@ -9993,6 +10080,8 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
     nxt_http_request_error(task, r, NXT_HTTP_SERVICE_UNAVAILABLE);
 
     nxt_request_rpc_data_unlink(task, req_rpc_data);
+
+    return 0;
 }
 
 
