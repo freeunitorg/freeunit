@@ -29,4 +29,9 @@ class ApplicationProto(Control):
                     if key in kwargs:
                         app_conf[key] = kwargs[key]
 
+        # A whole-config PUT replaces /config/settings too, so a test that
+        # needs a setting to survive each load passes it here.
+        if 'settings' in kwargs:
+            conf['settings'] = kwargs['settings']
+
         assert 'success' in self.conf(conf), 'load application configuration'

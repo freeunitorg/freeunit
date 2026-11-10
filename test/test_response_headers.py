@@ -1,10 +1,15 @@
+import json
+import shutil
+import tempfile
 from pathlib import Path
 
 import pytest
 
+from conftest import unit_run, unit_stop
 from unit.applications.lang.python import ApplicationPython
 from unit.applications.proto import ApplicationProto
 from unit.option import option
+from unit.status import Status
 
 client = ApplicationProto()
 client_python = ApplicationPython()
@@ -192,6 +197,133 @@ def test_response_headers_name_invalid():
     assert 'success' in client.conf(
         {"X-Custom_Header.1": "v"}, 'routes/0/action/response_headers'
     ), 'valid token name'
+
+
+def test_response_headers_name_reserved():
+    # The body length of a response is set by Unit, so these names are
+    # rejected in any letter case.
+    def check_reserved(name):
+        assert 'error' in client.conf(
+            {name: "10"}, 'routes/0/action/response_headers'
+        ), f'name {name!r} rejected'
+
+    check_reserved("Content-Length")
+    check_reserved("content-length")
+    check_reserved("CONTENT-LENGTH")
+    check_reserved("Transfer-Encoding")
+    check_reserved("transfer-encoding")
+    check_reserved("tRANSFER-eNCODING")
+
+    # Similar names still load.
+    assert 'success' in client.conf(
+        {"Content-Length-X": "v", "X-Transfer-Encoding": "v"},
+        'routes/0/action/response_headers',
+    ), 'similar names accepted'
+
+
+def test_response_headers_name_reserved_stored_null(
+    requires_restart, wait_for_record, monkeypatch
+):
+    """A stored null entry for a reserved name is kept as it was before the
+    names were refused: it goes to the removal path, not to the skip of a
+    value.  Unit sets the body length itself, so the response still has
+    exactly one Content-Length."""
+
+    conf = client.conf_get()
+    conf['routes'][0]['action']['response_headers'] = {
+        "X-Foo": "foo",
+        "Content-Length": None,
+    }
+
+    unit_stop()
+
+    statedir = Path(tempfile.mkdtemp(prefix='unit-state-'))
+    (statedir / 'conf.json').write_text(json.dumps(conf))
+
+    monkeypatch.setattr(Status, '_check_zeros', lambda: None)
+
+    try:
+        unit_run(state_dir=str(statedir))
+
+        assert wait_for_record(
+            r'\[warn\].+the restored configuration has the "Content-Length" '
+            r'response header'
+        ), 'warning'
+
+        resp = client.get()
+        assert resp['status'] == 200, 'served'
+        assert resp['body'] == '0123456789', 'body'
+        assert resp['headers']['X-Foo'] == 'foo', 'other header kept'
+
+        names = [n.lower() for n in resp['headers']]
+        assert names.count('content-length') == 1, 'one Content-Length'
+        assert resp['headers']['Content-Length'] == '10', 'file length'
+
+    finally:
+        unit_stop()
+        shutil.rmtree(statedir, ignore_errors=True)
+
+
+def test_response_headers_name_reserved_stored(
+    requires_restart, wait_for_record, monkeypatch
+):
+    """Earlier versions accepted "content-length" in other letter cases and
+    any "Transfer-Encoding".  unitd still loads such a stored configuration,
+    warns, and does not send these fields.  An update through the API is
+    refused until they are removed."""
+
+    conf = client.conf_get()
+    conf['routes'][0]['action']['response_headers'] = {
+        "X-Foo": "foo",
+        "content-length": "5",
+        "Transfer-Encoding": "chunked",
+    }
+
+    unit_stop()
+
+    statedir = Path(tempfile.mkdtemp(prefix='unit-state-'))
+    (statedir / 'conf.json').write_text(json.dumps(conf))
+
+    monkeypatch.setattr(Status, '_check_zeros', lambda: None)
+
+    try:
+        unit_run(state_dir=str(statedir))
+
+        assert client.conf_get('routes/0/action/response_headers') == {
+            "X-Foo": "foo",
+            "content-length": "5",
+            "Transfer-Encoding": "chunked",
+        }, 'stored configuration loaded'
+
+        for name in ('content-length', 'Transfer-Encoding'):
+            assert wait_for_record(
+                rf'\[warn\].+the restored configuration has the "{name}" '
+                rf'response header at "/routes/0/action/response_headers/'
+                rf'{name}"'
+            ), f'warning {name}'
+
+        resp = client.get()
+        assert resp['status'] == 200, 'served'
+        assert resp['body'] == '0123456789', 'body'
+        assert resp['headers']['X-Foo'] == 'foo', 'other header kept'
+
+        names = [n.lower() for n in resp['headers']]
+        assert names.count('content-length') == 1, 'one Content-Length'
+        assert resp['headers']['Content-Length'] == '10', 'file length'
+        assert 'transfer-encoding' not in names, 'no Transfer-Encoding'
+
+        resp = client.conf(
+            '"bar"', 'routes/0/action/response_headers/X-Bar'
+        )
+        assert 'error' in resp, 'update refused'
+
+        assert 'success' in client.conf(
+            {"X-Foo": "foo"}, 'routes/0/action/response_headers'
+        ), 'corrected'
+
+    finally:
+        unit_stop()
+        shutil.rmtree(statedir, ignore_errors=True)
 
 
 def test_response_headers_value_control():

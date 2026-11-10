@@ -2,23 +2,29 @@
 #
 # Print the test matrix of build-test.yml as a JSON list of leg names.
 #
-# Usage: test-matrix.sh EOL_JSON [CHANGED_FILES]
+# Usage: test-matrix.sh [--scheduled] EOL_JSON [CHANGED_FILES]
 #        test-matrix.sh --self-test
 #
 # The versions come from EOL_JSON (pkg/eol.json).  Without CHANGED_FILES,
-# every version of every runtime gets a leg, apart from node and java, which
-# get the legs of the rule below.  That is the matrix for master pushes and
-# for any other event that is not a pull request.
+# every version of every runtime gets a leg, apart from node, java and
+# python, which get the legs of the rule below.  That is the matrix for
+# master pushes and for any other event that is not a pull request.
+#
+# --scheduled is for the weekly run and for a manual run.  It gives python
+# every version, as well.  Without it, python gets the legs of the rule
+# below, for a pull request and for a master push alike.
 #
 # CHANGED_FILES is a file with one changed path per line, the list of a pull
 # request.  Then each of go, java, node, php and ruby gets one leg, unless a
 # changed path belongs to that runtime: then it gets every version, and node
 # and java get the legs of the rule below.  A change to pkg/eol.json, to
-# build-test.yml or to this script gives every runtime every version.  A
-# missing or empty list also gives the full matrix.
+# build-test.yml or to this script gives the full matrix: every version of
+# go, php and ruby, while node, java and python keep the legs of the rules
+# below, and perl keeps its one leg.  A missing or empty list also gives the full matrix.
 #
 # A pull request with the label "ci-full" gets no list from build-test.yml,
-# so it runs the full matrix.  Use it for a shared change that one version
+# and build-test.yml passes --scheduled for it, so it runs the full matrix
+# with every python version.  Use it for a shared change that one version
 # of each runtime does not cover.  The label counts from the next run that
 # a push, or a close and reopen, starts.  A re-run uses the event of the old
 # run and does not see a new label.
@@ -31,6 +37,7 @@
 # from node and java.
 #
 # node and java do not run every version, not even in the full matrix.
+# python does not either, unless --scheduled is given.
 # They run the oldest supported version, the newest supported version, and
 # the newest supported LTS when it is neither of those.  Supported means
 # that the note does not contain "EOL", as in pkg/eol/src/main.rs.  node
@@ -44,10 +51,13 @@
 # java get this rule: go-1.25 and perl-5.38 carry the same EOL note and
 # still run every version.
 #
-# All python legs always run.  Each takes a share of the language-agnostic
-# test files (see "Output build metadata" in build-test.yml), so a dropped
-# python leg would drop that share.  perl, wasm and wasm-wasi-component have
-# one leg each.
+# python gets the oldest and the newest supported version on every pull
+# request and master push, whatever paths change, because the language-
+# agnostic test files run in the python legs only.  The legs that run share
+# those files: build-test.yml takes the number of shards and the shard of a
+# leg from this list, so a leg that is dropped here drops no file.  The
+# versions in between run in the weekly run.  perl, wasm and
+# wasm-wasi-component have one leg each.
 #
 # --self-test checks these rules on a fixed eol.json and fixed lists of
 # changed files.  It prints each case and exits 1 when one fails.  The
@@ -74,10 +84,12 @@ declare -A own=(
 
 matrix_re='^(pkg/eol\.json|\.github/workflows/build-test\.yml|\.github/scripts/test-matrix\.sh)$'
 
-# matrix EOL_JSON [CHANGED_FILES]
+# matrix EOL_JSON [CHANGED_FILES] [SCHEDULED]
+# SCHEDULED is 1 for the weekly run: python then gets every version.
 matrix() {
     local eol=$1
     local changed=${2:-}
+    local scheduled=${3:-0}
     local every="" rt
 
     if [ -z "$changed" ] || [ ! -s "$changed" ]; then
@@ -100,7 +112,8 @@ matrix() {
     fi
 
     # Slow legs come first, as before; see the comment in build-test.yml.
-    jq -c --arg every "$every" --arg minmax "$minmax_rts" '
+    jq -c --arg every "$every" --arg minmax "$minmax_rts" \
+        --arg scheduled "$scheduled" '
         def vkey: .version | split(".") | map(tonumber? // 0);
 
         def one($v):
@@ -132,7 +145,12 @@ matrix() {
               end
             | map($rt + "-" + .version);
 
-        [ (.runtimes.python // [])[] | "python-" + .version ]
+        def python_legs:
+            (.runtimes.python // []) as $v
+            | if $scheduled == "1" then $v else minmax($v) end
+            | map("python-" + .version);
+
+        python_legs
         + ["wasm-wasi-component"]
         + legs("java")
         + legs("php")
@@ -157,7 +175,7 @@ self_test() {
     # that.
     cat > "$dir/eol.json" <<'EOF'
 {"runtimes": {
-  "python": [{"version": "3.12"}, {"version": "3.13"}],
+  "python": [{"version": "3.12"}, {"version": "3.13"}, {"version": "3.14"}],
   "java": [{"version": "17", "lts": true}, {"version": "21", "lts": true},
            {"version": "25", "lts": true}, {"version": "26"}, {"version": "27"}],
   "php": [{"version": "8.4"}, {"version": "8.5"}],
@@ -168,12 +186,14 @@ self_test() {
 }}
 EOF
 
-    local py="python-3.12 python-3.13"
+    local py="python-3.12 python-3.14"
+    local pyall="python-3.12 python-3.13 python-3.14"
     local j1="java-25" jall="java-17 java-25 java-27"
     local p1="php-8.5" pall="php-8.4 php-8.5"
     local g1="go-1.10" gall="go-1.9 go-1.10"
     local n1="node-26" nall="node-22 node-26"
     local r1="ruby-4.0" rall="ruby-3.4 ruby-4.0"
+    # The full matrix: python, node and java keep their two or three legs.
     local full="$py $jall $pall $gall $nall $rall"
 
     # check NAME EXPECTED [PATH...]
@@ -187,7 +207,7 @@ EOF
         "no such file") list=$dir/none ;;
         *) printf '%s\n' "$@" | sed '/^$/d' > "$list" ;;
         esac
-        got=$(matrix "$dir/eol.json" "$list" 2>/dev/null) || got="exit $?"
+        got=$(matrix "$dir/eol.json" "$list" "${sched:-0}" 2>/dev/null) || got="exit $?"
         # Only python and the versioned runtimes: the fixed legs are not
         # part of these rules.
         got=$(jq -r '[.[] | select(test("^(python|go|java|node|php|ruby)-"))]
@@ -213,6 +233,16 @@ EOF
     check "test-matrix.sh" "$full" .github/scripts/test-matrix.sh
     check "matrix file among others" "$full" src/nxt_router.c pkg/eol.json
     check "go/" "$py $j1 $p1 $gall $n1 $r1" go/nxt_cgo_lib.c
+    check "python paths still give the oldest and the newest" \
+        "$py $j1 $p1 $g1 $n1 $r1" src/python/nxt_python.c \
+        test/test_python_application.py
+
+    # The weekly run: python gets every version, the other runtimes keep
+    # their rules.
+    sched=1
+    check "scheduled, no list" "$pyall $jall $pall $gall $nall $rall"
+    check "scheduled, a list" "$pyall $j1 $p1 $g1 $n1 $r1" src/nxt_router.c
+    sched=0
     check "test/test_go_*" "$py $j1 $p1 $gall $n1 $r1" \
         test/test_go_application.py
     check "src/java/" "$py $jall $p1 $g1 $n1 $r1" \
@@ -296,4 +326,10 @@ if [ "${1:-}" = --self-test ]; then
     exit
 fi
 
-matrix "$1" "${2:-}"
+scheduled=0
+if [ "${1:-}" = --scheduled ]; then
+    scheduled=1
+    shift
+fi
+
+matrix "$1" "${2:-}" "$scheduled"

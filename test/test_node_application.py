@@ -70,7 +70,7 @@ def test_node_application_variables(date_to_sec_epoch, sec_epoch):
 
     date = headers.pop('Date')
     assert date[-4:] == ' GMT', 'date header timezone'
-    assert abs(date_to_sec_epoch(date) - sec_epoch) < 5, 'date header'
+    assert abs(date_to_sec_epoch(date) - sec_epoch()) < 5, 'date header'
 
     raw_headers = headers.pop('Request-Raw-Headers')
     assert re.search(
@@ -139,6 +139,59 @@ def test_node_application_header_dup():
         'Connection',
         'close',
     ], 'rawHeaders'
+
+
+def test_node_application_header_dup_single_value():
+    # Node keeps only the first value of a repeated single-value field and
+    # joins the values of any other field.  Check the whole set of 18 names,
+    # and names that differ from them in one byte or in the length.
+    client.load('header_dup')
+
+    single = [
+        'age',
+        'authorization',
+        'content-length',
+        'content-type',
+        'etag',
+        'expires',
+        'from',
+        'host',
+        'if-modified-since',
+        'if-unmodified-since',
+        'last-modified',
+        'location',
+        'max-forwards',
+        'proxy-authorization',
+        'referer',
+        'retry-after',
+        'server',
+        'user-agent',
+    ]
+
+    # The router refuses a request with two Host or Content-Length fields.
+    sent = [name for name in single if name not in ('host', 'content-length')]
+
+    other = []
+    for name in single:
+        other.append(f'x{name[1:]}')
+        other.append(f'{name[:-1]}x')
+        other.append(f'{name}x')
+        other.append(name[:-1])
+
+    headers = {'Host': 'localhost', 'Connection': 'close'}
+    for name in sent + other:
+        headers[name.title()] = ['first', 'second']
+
+    resp = client.get(headers=headers)
+
+    assert resp['status'] == 200, 'status'
+    got = json.loads(resp['body'])['headers']
+
+    for name in sent:
+        assert got[name] == 'first', f'first {name} kept'
+
+    for name in other:
+        assert got[name] == 'first, second', f'{name} lines joined'
 
 
 def test_node_application_post_variables():
@@ -442,3 +495,49 @@ def test_node_application_write_multiple():
     client.load('write_multiple')
 
     assert client.get()['body'] == 'writewrite2end', 'write multiple'
+
+
+def test_node_application_header_name_long(wait_for_record):
+    client.load('header_name_long')
+
+    def get(length, catch=False):
+        headers = {
+            'Host': 'localhost',
+            'X-Length': str(length),
+            'Connection': 'close',
+        }
+
+        if catch:
+            headers['X-Catch'] = '1'
+
+        return client.get(headers=headers)
+
+    for length in (255, 256, 300):
+        resp = get(length)
+
+        if length <= 255:
+            assert resp['status'] == 200, f'status {length}'
+            assert resp['headers']['X' * length] == 'value', f'header {length}'
+            continue
+
+        # setHeader() throws.  An uncaught error ends the worker, as in
+        # Node.js, and the router answers 503.
+        assert resp['status'] == 503, f'status {length}'
+        # A 256-byte name is cut to an empty one; the status is the check.
+        if length % 256:
+            assert (
+                'X' * (length % 256) not in resp['headers']
+            ), f'no cut name {length}'
+        assert resp['body'] != 'body', f'no application body {length}'
+        assert (
+            wait_for_record(rf'name is too long \({length} bytes') is not None
+        ), f'error log {length}'
+
+        # The error comes before the response changes, so an application
+        # that catches it can still answer.
+        resp = get(length, catch=True)
+        assert resp['status'] == 500, f'caught status {length}'
+        assert (
+            resp['body'] == f'Response header name is too long ({length} '
+            'bytes, the limit is 255)'
+        ), f'caught body {length}'

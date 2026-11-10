@@ -24,6 +24,10 @@ static void nxt_http_websocket_client_retry(nxt_task_t *task, void *obj,
     void *data);
 static nxt_bool_t nxt_http_websocket_queue_full(nxt_port_t *port);
 static void nxt_http_websocket_wait(nxt_task_t *task, nxt_http_request_t *r);
+static void nxt_http_websocket_close(nxt_task_t *task, nxt_http_request_t *r,
+    const nxt_str_t *reason);
+static void nxt_http_websocket_close_sent(nxt_task_t *task, void *obj,
+    void *data);
 static void nxt_http_websocket_error_handler(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_http_websocket_last(nxt_task_t *task, nxt_http_request_t *r);
@@ -37,6 +41,13 @@ const nxt_http_request_state_t  nxt_http_websocket
     .ready_handler = nxt_http_websocket_client,
     .error_handler = nxt_http_websocket_error_handler,
 };
+
+
+/* The reasons of the router's CLOSE frames, 123 bytes of ASCII at most. */
+static const nxt_str_t  nxt_http_websocket_no_shm =
+                            nxt_string("Out of shared memory");
+static const nxt_str_t  nxt_http_websocket_no_app =
+                            nxt_string("Application unreachable");
 
 
 static void
@@ -110,7 +121,8 @@ nxt_http_websocket_client(nxt_task_t *task, void *obj, void *data)
                      * the buffer was allocated names the reason; this line
                      * names the consequence, the bytes that were wanted, and
                      * the frame they belong to (one buffer holds at most
-                     * PORT_MMAP_DATA_SIZE bytes of it).
+                     * PORT_MMAP_DATA_SIZE bytes of it).  Once per
+                     * connection: the close below reads no more frames.
                      */
                     nxt_alert(task, "websocket: no shared memory buffer for "
                               "%uz bytes of a %uz byte frame, closing the "
@@ -123,7 +135,8 @@ nxt_http_websocket_client(nxt_task_t *task, void *obj, void *data)
                         out = buf;
                     }
 
-                    nxt_http_websocket_error_handler(task, r, r->proto.any);
+                    nxt_http_websocket_close(task, r,
+                                             &nxt_http_websocket_no_shm);
 
                     return;
                 }
@@ -189,16 +202,16 @@ nxt_http_websocket_client(nxt_task_t *task, void *obj, void *data)
 
         /*
          * And fail the connection, the way the allocation failure above
-         * does.  A non-OK answer here means the application port is gone or
-         * its shared queue is full, so this frame is not reaching the
-         * application at all; carrying on would leave the peer's stream
-         * short a frame it is never told about, which for a fragmented
-         * message is a protocol error the client cannot detect.  This is
-         * what the "// TODO: handle" that used to stand here was asking
-         * for.
+         * does: a CLOSE frame to the client, then the close.  Any other
+         * answer here means the application port is gone or the message
+         * could not be built, so this frame is not reaching the application
+         * at all; carrying on would leave the peer's stream short a frame it
+         * is never told about, which for a fragmented message is a protocol
+         * error the client cannot detect.  This is what the "// TODO:
+         * handle" that used to stand here was asking for.
          */
 
-        nxt_http_websocket_error_handler(task, r, r->proto.any);
+        nxt_http_websocket_close(task, r, &nxt_http_websocket_no_app);
 
         return;
     }
@@ -317,6 +330,135 @@ nxt_http_websocket_client_retry(nxt_task_t *task, void *obj, void *data)
     }
 
     nxt_http_websocket_client(task, r, NULL);
+}
+
+
+/*
+ * Fail the connection the way RFC 6455 Section 7.1.7 asks: a CLOSE frame to
+ * the client, then the close.  The code is 1011 (Section 7.4.1): the frame
+ * was within every limit and the client did nothing wrong, the router could
+ * not get memory for it, or could not hand it to the application.  The
+ * application is told with WEBSOCKET_LAST as for any failure, once the frame
+ * is written, by nxt_http_websocket_close_sent().
+ *
+ * No frame may follow a CLOSE (Section 5.5.1).  So none is sent after a
+ * CLOSE the router or the application wrote, r->ws_closed, nor once r->last
+ * is gone: that is the application's last message, which ends the stream
+ * whether or not a CLOSE frame went before it.  Either way the connection
+ * is closing already, and the request is only failed.  Nor is one sent
+ * while a frame of the application's is only partly forwarded, r->ws_app_rest
+ * (nxt_http_websocket_app_frame()): the client would read the CLOSE as that
+ * frame's payload, and the frame cannot be finished here, so the connection
+ * is closed as before this frame existed.  A CLOSE the client sent does not
+ * stop this one: its CLOSE is the frame that got no shared memory, and
+ * Section 5.5.1 requires a CLOSE in response.
+ */
+
+static void
+nxt_http_websocket_close(nxt_task_t *task, nxt_http_request_t *r,
+    const nxt_str_t *reason)
+{
+    u_char                  *p;
+    nxt_buf_t               *out;
+    nxt_websocket_header_t  *wsh;
+
+    if (r->ws_closed || r->last == NULL || r->ws_app_rest != 0) {
+        nxt_http_websocket_error_handler(task, r, r->proto.any);
+        return;
+    }
+
+    r->ws_closed = 1;
+
+    out = nxt_http_buf_mem(task, r, 2 + 2 + reason->length);
+    if (nxt_slow_path(out == NULL)) {
+        nxt_http_request_error_handler(task, r, r->proto.any);
+        return;
+    }
+
+    out->mem.start[0] = 0;
+    out->mem.start[1] = 0;
+
+    wsh = (nxt_websocket_header_t *) out->mem.start;
+    p = nxt_websocket_frame_init(wsh, 2 + reason->length);
+
+    wsh->fin = 1;
+    wsh->opcode = NXT_WEBSOCKET_OP_CLOSE;
+
+    *p++ = NXT_WEBSOCKET_CR_INTERNAL_SERVER_ERROR >> 8;
+    *p++ = NXT_WEBSOCKET_CR_INTERNAL_SERVER_ERROR & 0xFF;
+
+    out->mem.free = nxt_cpymem(p, reason->start, reason->length);
+
+    out->next = nxt_http_buf_last(r);
+    out->next->completion_handler = nxt_http_websocket_close_sent;
+
+    nxt_http_request_send(task, r, out);
+}
+
+
+/*
+ * Follow the application's frames on their way to the client, so that
+ * nxt_http_websocket_close() knows when a CLOSE went among them.  The
+ * router copies none of them: libunit begins each frame with a message of
+ * its own, header first (nxt_unit_websocket_sendv()), and a frame longer
+ * than one shared memory buffer goes on in the messages that follow.  So a
+ * message begins a frame when nothing of the previous one is still to come,
+ * and its header gives the size of the next one; the buffers of the other
+ * messages are only counted.  A message of another shape, a header the
+ * first buffer does not hold or a frame that ends mid-message, is not
+ * libunit's and is left alone.
+ */
+
+void
+nxt_http_websocket_app_frame(nxt_http_request_t *r, nxt_buf_t *b)
+{
+    size_t                  size, used, header_size, frame_size;
+    nxt_buf_t               *in;
+    nxt_websocket_header_t  *wsh;
+
+    size = 0;
+
+    for (in = b; in != NULL; in = in->next) {
+        size += nxt_buf_mem_used_size(&in->mem);
+    }
+
+    if (r->ws_app_rest != 0) {
+        r->ws_app_rest -= nxt_min(r->ws_app_rest, size);
+        return;
+    }
+
+    used = nxt_buf_mem_used_size(&b->mem);
+
+    if (nxt_slow_path(used < 2)) {
+        return;
+    }
+
+    wsh = (nxt_websocket_header_t *) b->mem.pos;
+    header_size = nxt_websocket_frame_header_size(wsh);
+
+    if (nxt_slow_path(used < header_size)) {
+        return;
+    }
+
+    if (nxt_slow_path(wsh->opcode == NXT_WEBSOCKET_OP_CLOSE)) {
+        r->ws_closed = 1;
+    }
+
+    frame_size = header_size + nxt_websocket_frame_payload_len(wsh);
+    r->ws_app_rest = (frame_size > size) ? frame_size - size : 0;
+}
+
+
+static void
+nxt_http_websocket_close_sent(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_http_request_t  *r;
+
+    r = data;
+
+    nxt_debug(task, "http websocket close sent");
+
+    nxt_http_websocket_error_handler(task, r, r->proto.any);
 }
 
 

@@ -43,12 +43,6 @@
   },
   {
     "ruleId": "len-add-to-checked",
-    "file": "src/nxt_listen_socket.c",
-    "function": "nxt_listen_socket_pool_min_size",
-    "text": "size = ls->socklen + nxt_length(\"unix:\");"
-  },
-  {
-    "ruleId": "len-add-to-checked",
     "file": "src/nxt_php_sapi.c",
     "function": "nxt_php_send_headers",
     "text": "resp_size += h->header_len;"
