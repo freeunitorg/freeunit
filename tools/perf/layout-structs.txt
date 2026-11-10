@@ -57,6 +57,7 @@ shm    nxt_port_msg_t
 shm    nxt_port_mmap_msg_s
 shm    nxt_port_msg_get_mmap_t
 shm    nxt_port_msg_get_port_t
+shm    nxt_port_msg_get_port_ext_t
 shm    nxt_port_msg_new_port_t
 shm    nxt_websocket_header_t
 shm    nxt_unit_sptr_u
@@ -80,6 +81,7 @@ enum   NXT_UNIT_LOG_DEBUG
 enum   NXT_UNIT_HASH_CONTENT_LENGTH
 enum   NXT_UNIT_HASH_CONTENT_TYPE
 enum   NXT_UNIT_HASH_COOKIE
+enum   NXT_UNIT_HASH_AUTHORIZATION
 enum   NXT_WEBSOCKET_OP_CONT
 enum   NXT_WEBSOCKET_OP_TEXT
 enum   NXT_WEBSOCKET_OP_BINARY

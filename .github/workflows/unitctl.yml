@@ -33,8 +33,11 @@ on:
         description: "Semver tag"
         required: true
 
+# Default every job to read-only.  Only the release job writes to the
+# repository, and it raises its own permission below; a fork pull_request
+# build therefore never gets a write-scoped token.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   # Cancel superseded runs for the same pull request.  Non-PR events fall back
@@ -74,7 +77,7 @@ jobs:
 
       - name: Install cross
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: cross
 
@@ -227,11 +230,11 @@ jobs:
 
       - name: Install cross
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: cross
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: rust-${{ matrix.build }}
           workspaces: ./tools/unitctl -> target
@@ -305,6 +308,12 @@ jobs:
     needs: [build]
     runs-on: ubuntu-26.04
     timeout-minutes: 15
+    # The only job that writes to the repository: it creates a GitHub release
+    # (and its tag) via the GITHUB_TOKEN.  Artifact upload/download and the
+    # Rust cache used elsewhere go through the Actions runtime token, not this
+    # one, so no other job needs write.
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v8
         with:

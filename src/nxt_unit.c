@@ -223,6 +223,8 @@ static nxt_unit_port_t *nxt_unit_add_port(nxt_unit_ctx_t *ctx,
     nxt_unit_port_t *port, void *queue);
 static void nxt_unit_process_awaiting_req(nxt_unit_ctx_t *ctx,
     nxt_queue_t *awaiting_req);
+static void nxt_unit_process_port_refused(nxt_unit_ctx_t *ctx,
+    nxt_unit_recv_msg_t *recv_msg);
 static void nxt_unit_remove_port(nxt_unit_impl_t *lib, nxt_unit_ctx_t *ctx,
     nxt_unit_port_id_t *port_id);
 static nxt_unit_port_t *nxt_unit_remove_port_unsafe(nxt_unit_impl_t *lib,
@@ -236,6 +238,7 @@ static void nxt_unit_send_quit(nxt_unit_ctx_t *ctx,
     nxt_unit_ctx_impl_t *target, uint8_t quit_param);
 static void nxt_unit_take_quit(nxt_unit_ctx_t *ctx, nxt_atomic_uint_t pending);
 static int nxt_unit_get_port(nxt_unit_ctx_t *ctx, nxt_unit_port_id_t *port_id);
+static int nxt_unit_response_port_ready(nxt_unit_request_info_t *req);
 static ssize_t nxt_unit_port_send(nxt_unit_ctx_t *ctx,
     nxt_unit_port_t *port, const void *buf, size_t buf_size,
     const nxt_send_oob_t *oob);
@@ -1481,6 +1484,22 @@ nxt_unit_process_msg(nxt_unit_ctx_t *ctx, nxt_unit_read_buf_t *rbuf,
         rc = nxt_unit_process_shm_ack(ctx);
         break;
 
+    case _NXT_PORT_MSG_RPC_ERROR:
+        if (port_msg->stream == 0
+            && recv_msg.size == sizeof(nxt_port_msg_get_port_t))
+        {
+            nxt_unit_process_port_refused(ctx, &recv_msg);
+
+            rc = NXT_UNIT_OK;
+            break;
+        }
+
+        nxt_unit_alert(ctx, "#%"PRIu32": ignore message type: %d",
+                       port_msg->stream, (int) port_msg->type);
+
+        rc = NXT_UNIT_ERROR;
+        goto done;
+
     default:
         nxt_unit_alert(ctx, "#%"PRIu32": ignore message type: %d",
                        port_msg->stream, (int) port_msg->type);
@@ -2266,6 +2285,25 @@ nxt_unit_request_check_response_port(nxt_unit_request_info_t *req,
 
 
 static int
+nxt_unit_response_port_ready(nxt_unit_request_info_t *req)
+{
+    int                   ready;
+    nxt_unit_impl_t       *lib;
+    nxt_unit_port_impl_t  *port_impl;
+
+    lib = nxt_container_of(req->ctx->unit, nxt_unit_impl_t, unit);
+    port_impl = nxt_container_of(req->response_port, nxt_unit_port_impl_t,
+                                 port);
+
+    pthread_mutex_lock(&lib->mutex);
+    ready = port_impl->ready;
+    pthread_mutex_unlock(&lib->mutex);
+
+    return ready;
+}
+
+
+static int
 nxt_unit_send_req_headers_ack(nxt_unit_request_info_t *req)
 {
     ssize_t                       res;
@@ -2761,12 +2799,14 @@ nxt_unit_request_group_dup_fields(nxt_unit_request_info_t *req)
     char                *name, *jname;
     void                *start;
     uint32_t            i, j, n, size;
+    uint64_t            bit, seen_hashes, dup_hashes;
     nxt_unit_field_t    *fields, f, fi, fj;
     nxt_unit_request_t  *r;
 
     static const nxt_str_t  content_length = nxt_string("content-length");
     static const nxt_str_t  content_type = nxt_string("content-type");
     static const nxt_str_t  cookie = nxt_string("cookie");
+    static const nxt_str_t  authorization = nxt_string("authorization");
 
     nxt_unit_req_debug(req, "group_dup_fields");
 
@@ -2778,7 +2818,8 @@ nxt_unit_request_group_dup_fields(nxt_unit_request_info_t *req)
      * sibling process can write, and this runs later.  So the count is read
      * once and checked again, each field is copied out before use, and the
      * names are resolved with nxt_unit_sptr_in_buf().  A request that does
-     * not pass is left as it is.
+     * not pass is left as it is.  So is a request without duplicate hashes:
+     * it returns below, before any name is resolved.
      */
     start = req->request_buf->start;
     size = req->request_buf->end - req->request_buf->start;
@@ -2791,6 +2832,25 @@ nxt_unit_request_group_dup_fields(nxt_unit_request_info_t *req)
     {
         nxt_unit_req_warn(req, "group_dup_fields: fields_count %"PRIu32
                           " exceeds buffer", n);
+        return;
+    }
+
+    /*
+     * Two fields with equal hashes set the same bit.  So a field whose bit
+     * is not in dup_hashes has no duplicate, and a request with no bit in
+     * dup_hashes has nothing to group.
+     */
+
+    seen_hashes = 0;
+    dup_hashes = 0;
+
+    for (i = 0; i < n; i++) {
+        bit = 1ULL << (fields[i].hash & 63);
+        dup_hashes |= seen_hashes & bit;
+        seen_hashes |= bit;
+    }
+
+    if (nxt_fast_path(dup_hashes == 0)) {
         return;
     }
 
@@ -2835,6 +2895,20 @@ nxt_unit_request_group_dup_fields(nxt_unit_request_info_t *req)
             }
 
             break;
+
+        case NXT_UNIT_HASH_AUTHORIZATION:
+            if (fi.name_length == authorization.length
+                && nxt_unit_memcasecmp(name, authorization.start,
+                                       authorization.length) == 0)
+            {
+                r->authorization_field = i;
+            }
+
+            break;
+        }
+
+        if ((dup_hashes & (1ULL << (fi.hash & 63))) == 0) {
+            continue;
         }
 
         for (j = i + 1; j < n; j++) {
@@ -3642,6 +3716,18 @@ nxt_unit_free_outgoing_buf(nxt_unit_mmap_buf_t *mmap_buf)
 }
 
 
+#if (NXT_TESTS)
+static unsigned int  nxt_unit_test_read_buf_failure_count;
+
+
+void
+nxt_unit_test_read_buf_failures(unsigned int failures)
+{
+    nxt_unit_test_read_buf_failure_count = failures;
+}
+#endif
+
+
 static nxt_unit_read_buf_t *
 nxt_unit_read_buf_get(nxt_unit_ctx_t *ctx)
 {
@@ -3656,7 +3742,9 @@ nxt_unit_read_buf_get(nxt_unit_ctx_t *ctx)
 
     pthread_mutex_unlock(&ctx_impl->mutex);
 
-    nxt_socket_msg_oob_reset(&rbuf->oob);
+    if (nxt_fast_path(rbuf != NULL)) {
+        nxt_socket_msg_oob_reset(&rbuf->oob);
+    }
 
     return rbuf;
 }
@@ -3667,6 +3755,13 @@ nxt_unit_read_buf_get_impl(nxt_unit_ctx_impl_t *ctx_impl)
 {
     nxt_queue_link_t     *link;
     nxt_unit_read_buf_t  *rbuf;
+
+#if (NXT_TESTS)
+    if (nxt_slow_path(nxt_unit_test_read_buf_failure_count > 0)) {
+        nxt_unit_test_read_buf_failure_count--;
+        return NULL;
+    }
+#endif
 
     if (!nxt_queue_is_empty(&ctx_impl->free_rbuf)) {
         link = nxt_queue_first(&ctx_impl->free_rbuf);
@@ -3992,24 +4087,25 @@ nxt_unit_request_read(nxt_unit_request_info_t *req, void *dst, size_t size)
     buf_res = nxt_unit_buf_read(&req->content_buf, &req->content_length,
                                 dst, size);
 
-    if (buf_res < (ssize_t) size && req->content_fd != -1) {
+    if ((size_t) buf_res < size && req->content_fd != -1) {
+        dst = nxt_pointer_to(dst, buf_res);
+        size -= (size_t) buf_res;
+
         res = read(req->content_fd, dst, size);
         if (nxt_slow_path(res < 0)) {
             nxt_unit_req_alert(req, "failed to read content: %s (%d)",
                                strerror(errno), errno);
 
-            return res;
+            return (buf_res > 0) ? buf_res : res;
         }
 
-        if (res < (ssize_t) size) {
+        if ((size_t) res < size) {
             nxt_unit_close(req->content_fd);
 
             req->content_fd = -1;
         }
 
         req->content_length -= res;
-
-        dst = nxt_pointer_to(dst, res);
 
     } else {
         res = 0;
@@ -7017,6 +7113,13 @@ nxt_unit_process_ready_req(nxt_unit_ctx_t *ctx)
 
         req = &req_impl->req;
 
+        if (nxt_slow_path(!nxt_unit_response_port_ready(req))) {
+            /* The router refused the port (nxt_unit_process_port_refused()). */
+            nxt_unit_request_info_release(req);
+
+            continue;
+        }
+
         res = nxt_unit_send_req_headers_ack(req);
         if (nxt_slow_path(res != NXT_UNIT_OK)) {
             nxt_unit_request_done(req, NXT_UNIT_ERROR);
@@ -8214,6 +8317,78 @@ nxt_unit_process_awaiting_req(nxt_unit_ctx_t *ctx, nxt_queue_t *awaiting_req)
 }
 
 
+/*
+ * The router refused a GET_PORT (nxt_router_get_port_refuse()): the port
+ * is gone.  The port that nxt_unit_request_check_response_port() added has
+ * no descriptor and never gets one.  Remove it, so a later request asks
+ * again, and hand its parked requests back to their contexts.  There
+ * nxt_unit_process_ready_req() finds the port not ready and releases them.
+ * No reply can reach the router through that port, and the request in the
+ * router went away with it.
+ */
+
+static void
+nxt_unit_process_port_refused(nxt_unit_ctx_t *ctx,
+    nxt_unit_recv_msg_t *recv_msg)
+{
+    nxt_queue_t              awaiting_req;
+    nxt_unit_impl_t          *lib;
+    nxt_unit_port_t          *port;
+    nxt_unit_port_id_t       port_id;
+    nxt_unit_port_impl_t     *port_impl;
+    nxt_port_msg_get_port_t  refused;
+
+    lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
+
+    memcpy(&refused, recv_msg->start, sizeof(refused));
+
+    nxt_unit_port_id_init(&port_id, refused.pid, refused.id);
+
+    nxt_queue_init(&awaiting_req);
+
+    pthread_mutex_lock(&lib->mutex);
+
+    port = nxt_unit_port_hash_find(&lib->ports, &port_id, 0);
+
+    if (port == NULL) {
+        pthread_mutex_unlock(&lib->mutex);
+
+        nxt_unit_debug(ctx, "port_refused: port{%d,%d} not found",
+                       (int) port_id.pid, (int) port_id.id);
+        return;
+    }
+
+    port_impl = nxt_container_of(port, nxt_unit_port_impl_t, port);
+
+    if (port_impl->ready) {
+        /* Not the port this answer is about. */
+        pthread_mutex_unlock(&lib->mutex);
+
+        nxt_unit_port_release(port);
+
+        return;
+    }
+
+    (void) nxt_unit_port_hash_find(&lib->ports, &port_id, 1);
+
+    nxt_queue_remove(&port_impl->link);
+
+    nxt_queue_add(&awaiting_req, &port_impl->awaiting_req);
+    nxt_queue_init(&port_impl->awaiting_req);
+
+    pthread_mutex_unlock(&lib->mutex);
+
+    nxt_unit_warn(ctx, "port{%d,%d} refused by the router, its requests "
+                  "are dropped", (int) port_id.pid, (int) port_id.id);
+
+    nxt_unit_process_awaiting_req(ctx, &awaiting_req);
+
+    /* The reference of the lookup above, then the one of the hash. */
+    nxt_unit_port_release(port);
+    nxt_unit_port_release(port);
+}
+
+
 static void
 nxt_unit_remove_port(nxt_unit_impl_t *lib, nxt_unit_ctx_t *ctx,
     nxt_unit_port_id_t *port_id)
@@ -8517,8 +8692,8 @@ nxt_unit_get_port(nxt_unit_ctx_t *ctx, nxt_unit_port_id_t *port_id)
     nxt_unit_ctx_impl_t  *ctx_impl;
 
     struct {
-        nxt_port_msg_t           msg;
-        nxt_port_msg_get_port_t  get_port;
+        nxt_port_msg_t               msg;
+        nxt_port_msg_get_port_ext_t  get_port;
     } m;
 
     lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
@@ -8530,8 +8705,9 @@ nxt_unit_get_port(nxt_unit_ctx_t *ctx, nxt_unit_port_id_t *port_id)
     m.msg.reply_port = ctx_impl->read_port->id.id;
     m.msg.type = _NXT_PORT_MSG_GET_PORT;
 
-    m.get_port.id = port_id->id;
-    m.get_port.pid = port_id->pid;
+    m.get_port.port.id = port_id->id;
+    m.get_port.port.pid = port_id->pid;
+    m.get_port.flags = NXT_PORT_GET_PORT_ANSWER_REFUSAL;
 
     nxt_unit_debug(ctx, "get_port: %d %d", (int) port_id->pid,
                    (int) port_id->id);
@@ -9369,9 +9545,9 @@ static int
 nxt_unit_app_queue_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
     nxt_unit_read_buf_t *rbuf)
 {
+    nxt_bool_t            claimed;
     nxt_atomic_uint_t     count;
     uint32_t              cookie;
-    nxt_port_msg_t        *port_msg;
     nxt_app_queue_t       *queue;
     nxt_unit_impl_t       *lib;
     nxt_unit_port_impl_t  *port_impl;
@@ -9381,15 +9557,15 @@ nxt_unit_app_queue_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port,
 
 retry:
 
-    rbuf->size = nxt_app_queue_recv(queue, rbuf->buf, &cookie);
+    rbuf->size = nxt_app_queue_recv_claim(queue, rbuf->buf, &cookie,
+                                          &claimed);
 
     nxt_unit_debug(NULL, "app_queue_recv: %d", (int) rbuf->size);
 
     if (rbuf->size >= (ssize_t) sizeof(nxt_port_msg_t)) {
-        port_msg = (nxt_port_msg_t *) rbuf->buf;
-
-        if (nxt_app_queue_cancel(queue, cookie, port_msg->stream)) {
-            NXT_USDT(queue__dequeue, cookie, port_msg->stream);
+        if (claimed) {
+            NXT_USDT(queue__dequeue, cookie,
+                     ((nxt_port_msg_t *) rbuf->buf)->stream);
 
             lib = nxt_container_of(ctx->unit, nxt_unit_impl_t, unit);
 
@@ -10104,15 +10280,32 @@ nxt_unit_memcasecmp(const void *p1, const void *p2, size_t length)
         c1 = *s1++;
         c2 = *s2++;
 
-        c1 = nxt_lowcase(c1);
-        c2 = nxt_lowcase(c2);
+        /* Equal bytes need no case folding. */
 
-        n = c1 - c2;
+        if (c1 != c2) {
+            c1 = nxt_lowcase(c1);
+            c2 = nxt_lowcase(c2);
 
-        if (n != 0) {
-            return n;
+            n = c1 - c2;
+
+            if (n != 0) {
+                return n;
+            }
         }
     }
 
     return 0;
 }
+
+
+#if (NXT_TESTS)
+
+/* Lets the C tests compare nxt_unit_memcasecmp() with the old loop. */
+
+int
+nxt_unit_test_memcasecmp(const void *p1, const void *p2, size_t length)
+{
+    return nxt_unit_memcasecmp(p1, p2, length);
+}
+
+#endif

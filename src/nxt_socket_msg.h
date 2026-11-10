@@ -77,6 +77,19 @@ typedef struct cmsgcred     nxt_socket_cred_t;
 
 
 /*
+ * With MSG_CMSG_CLOEXEC, recvmsg() sets close-on-exec on the descriptors of
+ * SCM_RIGHTS.  Linux has it since 2.6.23, and FreeBSD, NetBSD and OpenBSD
+ * have it too.  macOS does not: there nxt_socket_msg_fds_cloexec() sets the
+ * flag with fcntl().
+ */
+#if (defined MSG_CMSG_CLOEXEC)
+#define NXT_MSG_CMSG_CLOEXEC  MSG_CMSG_CLOEXEC
+#else
+#define NXT_MSG_CMSG_CLOEXEC  0
+#endif
+
+
+/*
  * "buf" holds a control block that CMSG_FIRSTHDR()/CMSG_NXTHDR() walk as
  * struct cmsghdr, so its address has to carry that struct's alignment.
  * Nothing here states that alignment: it comes from "buf" following a size_t
@@ -156,6 +169,28 @@ NXT_CMSG_NXTHDR(struct msghdr *msgh, struct cmsghdr *cmsg)
 #if (defined(__clang__))
 #pragma clang diagnostic pop
 #endif
+#endif
+}
+
+
+nxt_inline nxt_int_t
+nxt_socket_msg_fds_cloexec(nxt_fd_t *fd, size_t size)
+{
+#if !(defined MSG_CMSG_CLOEXEC)
+    size_t     i;
+    nxt_int_t  ret;
+
+    ret = NXT_OK;
+
+    for (i = 0; i < size / sizeof(int); i++) {
+        if (nxt_slow_path(fcntl(fd[i], F_SETFD, FD_CLOEXEC) == -1)) {
+            ret = NXT_ERROR;
+        }
+    }
+
+    return ret;
+#else
+    return NXT_OK;
 #endif
 }
 
@@ -269,6 +304,16 @@ nxt_socket_msg_oob_get_fds(nxt_recv_oob_t *oob, nxt_fd_t *fd)
 
             nxt_memcpy(fd, CMSG_DATA(cmsg), size);
 
+            /*
+             * fd[] already names the descriptors, so the caller closes
+             * them when the message is refused.
+             */
+            if (nxt_slow_path(nxt_socket_msg_fds_cloexec(fd, size)
+                              != NXT_OK))
+            {
+                return NXT_ERROR;
+            }
+
             break;
         }
     }
@@ -331,6 +376,16 @@ nxt_socket_msg_oob_get(nxt_recv_oob_t *oob, nxt_fd_t *fd, nxt_pid_t *pid)
             }
 
             nxt_memcpy(fd, CMSG_DATA(cmsg), size);
+
+            /*
+             * fd[] already names the descriptors, so the caller closes
+             * them when the message is refused.
+             */
+            if (nxt_slow_path(nxt_socket_msg_fds_cloexec(fd, size)
+                              != NXT_OK))
+            {
+                return NXT_ERROR;
+            }
 
 #if (!NXT_CRED_USECMSG)
             break;

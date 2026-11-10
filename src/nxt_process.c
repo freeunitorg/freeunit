@@ -140,20 +140,44 @@ nxt_process_new(nxt_runtime_t *rt)
 void
 nxt_process_use(nxt_task_t *task, nxt_process_t *process, int i)
 {
-    nxt_int_t      use_count;
-    nxt_bool_t     released;
-    nxt_runtime_t  *rt;
+    nxt_int_t          use_count;
+    nxt_bool_t         released;
+    nxt_runtime_t      *rt;
+    nxt_atomic_uint_t  c;
 
     rt = task->thread->runtime;
 
     /*
-     * The count is mutated from every engine thread, so it is serialized on
-     * rt->processes_mutex rather than made atomic: an atomic increment would
-     * still let a lookup take a reference on a process whose teardown has
-     * already started.  Dropping to zero therefore unlinks the process from
-     * rt->processes while the mutex is still held, which makes {find, ref}
-     * and {unref to zero, unlink} mutually exclusive.  The teardown itself
-     * runs after the unlock -- it takes other locks and must not nest.
+     * A drop that leaves at least one reference takes no lock.  The
+     * compare-and-swap never stores zero, so the count still reaches zero
+     * only under rt->processes_mutex, in the critical section below that
+     * unlinks the process.  A lookup that finds the process under the mutex
+     * therefore still sees a count of one or more, as before.  The
+     * compare-and-swap is a full barrier: the accesses of this thread to
+     * the process happen before the teardown that the last drop starts.
+     */
+
+    if (i < 0) {
+        c = nxt_atomic_load(&process->use_count);
+
+        while ((nxt_atomic_int_t) c > -i) {
+            if (nxt_atomic_cmp_set(&process->use_count, c, c + i)) {
+                return;
+            }
+
+            c = nxt_atomic_load(&process->use_count);
+        }
+    }
+
+    /*
+     * The count is mutated from every engine thread.  Every change other
+     * than the drop above is serialized on rt->processes_mutex: a lock-free
+     * drop to zero would let a lookup take a reference on a process whose
+     * teardown has already started.  Dropping to zero therefore unlinks the
+     * process from rt->processes while the mutex is still held, which makes
+     * {find, ref} and {unref to zero, unlink} mutually exclusive.  The
+     * teardown itself runs after the unlock -- it takes other locks and must
+     * not nest.
      *
      * This makes rt->processes_mutex reachable from any nxt_port_use()
      * that drops a last port reference, including callers that already hold
@@ -168,8 +192,7 @@ nxt_process_use(nxt_task_t *task, nxt_process_t *process, int i)
 
     nxt_thread_mutex_lock(&rt->processes_mutex);
 
-    process->use_count += i;
-    use_count = process->use_count;
+    use_count = (nxt_int_t) (nxt_atomic_fetch_add(&process->use_count, i) + i);
 
     /*
      * A second drop to zero is not detectable from use_count or registered
@@ -852,6 +875,12 @@ nxt_process_setup(nxt_task_t *task, nxt_process_t *process)
 
     rt->type = init->type;
 
+    if (init->type == NXT_PROCESS_ROUTER
+        || init->type == NXT_PROCESS_CONTROLLER)
+    {
+        (void) nxt_process_nofile_raise(task);
+    }
+
     engine = thread->engine;
 
     /* Update inherited main process event engine and signals processing. */
@@ -893,6 +922,119 @@ nxt_process_setup(nxt_task_t *task, nxt_process_t *process)
     }
 
     return ret;
+}
+
+
+/*
+ * The router holds the listen sockets and all client connections.  The
+ * controller holds the control connections.  A container often starts
+ * unitd with a soft RLIMIT_NOFILE of 1024 and a much higher hard limit.
+ * At 1024 the router cannot accept more connections.  So these two
+ * processes raise their soft limit to the hard limit.
+ *
+ * The new soft limit is not more than NXT_PROCESS_NOFILE_MAX, the
+ * default fs.nr_open of Linux.  The hard limit can be unlimited or much
+ * higher, and code that loops over each descriptor number up to the limit
+ * then becomes slow.  A soft limit that is already higher stays as it is.
+ * On macOS the limit is not more than OPEN_MAX.  The macOS manual page
+ * asks for min(OPEN_MAX, rlim_max).  macOS 10.15 and older refuse a soft
+ * limit above kern.maxfilesperproc.  Newer versions use at most
+ * kern.maxfilesperproc.
+ *
+ * Main does not raise its limit.  So the discovery, prototype,
+ * application and store processes that come from main keep the limit that
+ * unitd started with.  Application code that uses select() and FD_SETSIZE
+ * stays safe, and nxt_main_store_close_fds() loops to the same limit as
+ * before.
+ */
+
+#define NXT_PROCESS_NOFILE_MAX  1048576
+
+
+#if (NXT_TESTS)
+
+static nxt_err_t  nxt_process_test_nofile_err;
+
+
+/*
+ * Let src/test/nxt_process_nofile_test.c make setrlimit() fail.  A
+ * non-zero value is the error that the next calls report.
+ */
+void
+nxt_process_test_nofile_failure(nxt_err_t err)
+{
+    nxt_process_test_nofile_err = err;
+}
+
+#endif
+
+
+rlim_t
+nxt_process_nofile_target(rlim_t cur, rlim_t max)
+{
+    rlim_t  target;
+
+    target = nxt_min(max, (rlim_t) NXT_PROCESS_NOFILE_MAX);
+
+#if (NXT_MACOSX) && defined(OPEN_MAX)
+    target = nxt_min(target, (rlim_t) OPEN_MAX);
+#endif
+
+    return nxt_max(cur, target);
+}
+
+
+/*
+ * Returns NXT_OK when the soft limit was raised, NXT_DECLINED when it
+ * stays as it is, and NXT_ERROR when getrlimit() or setrlimit() failed.
+ * A failure is logged, and the process continues with the old limit.
+ */
+nxt_int_t
+nxt_process_nofile_raise(nxt_task_t *task)
+{
+    int            ret;
+    rlim_t         old;
+    struct rlimit  rlim;
+
+    if (getrlimit(RLIMIT_NOFILE, &rlim) != 0) {
+        nxt_log(task, NXT_LOG_WARN, "getrlimit(RLIMIT_NOFILE) failed %E",
+                nxt_errno);
+        return NXT_ERROR;
+    }
+
+    old = rlim.rlim_cur;
+    rlim.rlim_cur = nxt_process_nofile_target(old, rlim.rlim_max);
+
+    if (rlim.rlim_cur == old) {
+        nxt_debug(task, "RLIMIT_NOFILE soft limit stays %uL, hard limit %uL",
+                  (uint64_t) old, (uint64_t) rlim.rlim_max);
+        return NXT_DECLINED;
+    }
+
+#if (NXT_TESTS)
+    if (nxt_process_test_nofile_err != 0) {
+        nxt_set_errno(nxt_process_test_nofile_err);
+        ret = -1;
+
+    } else {
+        ret = setrlimit(RLIMIT_NOFILE, &rlim);
+    }
+#else
+    ret = setrlimit(RLIMIT_NOFILE, &rlim);
+#endif
+
+    if (ret != 0) {
+        nxt_log(task, NXT_LOG_WARN,
+                "setrlimit(RLIMIT_NOFILE) failed to raise the soft limit "
+                "from %uL to %uL %E", (uint64_t) old,
+                (uint64_t) rlim.rlim_cur, nxt_errno);
+        return NXT_ERROR;
+    }
+
+    nxt_debug(task, "RLIMIT_NOFILE soft limit raised from %uL to %uL",
+              (uint64_t) old, (uint64_t) rlim.rlim_cur);
+
+    return NXT_OK;
 }
 
 

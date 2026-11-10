@@ -750,8 +750,6 @@ nxt_h1p_header_process(nxt_task_t *task, nxt_h1proto_t *h1p,
     r->target.start = h1p->parser.target_start;
     r->target.length = h1p->parser.target_end - h1p->parser.target_start;
 
-    r->quoted_target = h1p->parser.quoted_target;
-
     if (h1p->parser.version.ui64 != 0) {
         r->version.start = h1p->parser.version.str;
         r->version.length = sizeof(h1p->parser.version.str);
@@ -849,27 +847,85 @@ nxt_h1p_header_buffer_test(nxt_task_t *task, nxt_h1proto_t *h1p, nxt_conn_t *c,
 }
 
 
+/*
+ * The value is a comma-separated list of connection options (RFC 9110,
+ * 7.6.1).  An option is a token in any letter case.  Spaces and tabs around
+ * an element are not part of it, and an empty element is ignored (RFC 9110,
+ * 5.6.1).  Only a whole token is an option: "X-Closer" is not "close".
+ *
+ * "close" closes the connection after the response (RFC 9112, 9.6), also
+ * when the request has "keep-alive".  The handler runs once for each field
+ * line, so connection_close keeps "close" for the elements and the lines
+ * after it.
+ */
+
 static nxt_int_t
 nxt_h1p_connection(void *ctx, nxt_http_field_t *field, uintptr_t data)
 {
-    const u_char        *end;
+    size_t              length;
+    u_char              *p, *end, *start, *last;
+    nxt_h1proto_t       *h1p;
     nxt_http_request_t  *r;
 
     r = ctx;
+    h1p = r->proto.h1;
     field->hopbyhop = 1;
 
-    end = field->value + field->value_length;
+    p = field->value;
+    end = p + field->value_length;
 
-    if (nxt_memcasestrn(field->value, end, "close", 5) != NULL) {
-        r->proto.h1->keepalive = 0;
-    }
+    while (p < end) {
+        start = p;
 
-    if (nxt_memcasestrn(field->value, end, "keep-alive", 10) != NULL) {
-        r->proto.h1->keepalive = 1;
-    }
+        while (p < end && *p != ',') {
+            p++;
+        }
 
-    if (nxt_memcasestrn(field->value, end, "upgrade", 7) != NULL) {
-        r->proto.h1->connection_upgrade = 1;
+        last = p;
+
+        if (p < end) {
+            p++;  /* Skip the comma. */
+        }
+
+        while (start < last && (*start == ' ' || *start == '\t')) {
+            start++;
+        }
+
+        while (last > start && (last[-1] == ' ' || last[-1] == '\t')) {
+            last--;
+        }
+
+        length = last - start;
+
+        switch (length) {
+
+        case nxt_length("close"):
+            if (nxt_memcasecmp(start, "close", length) == 0) {
+                h1p->connection_close = 1;
+                h1p->keepalive = 0;
+            }
+
+            break;
+
+        case nxt_length("upgrade"):
+            if (nxt_memcasecmp(start, "upgrade", length) == 0) {
+                h1p->connection_upgrade = 1;
+            }
+
+            break;
+
+        case nxt_length("keep-alive"):
+            if (nxt_memcasecmp(start, "keep-alive", length) == 0
+                && !h1p->connection_close)
+            {
+                h1p->keepalive = 1;
+            }
+
+            break;
+
+        default:
+            break;
+        }
     }
 
     return NXT_OK;
@@ -925,6 +981,12 @@ nxt_h1p_websocket_version(void *ctx, nxt_http_field_t *field, uintptr_t data)
 }
 
 
+/*
+ * Transfer coding names are case-insensitive (RFC 9112, 7).  The router
+ * decodes only "chunked", so any other value of the field line, a list
+ * included, is unsupported: nxt_h1p_request_body_read() answers it with 501.
+ */
+
 static nxt_int_t
 nxt_h1p_transfer_encoding(void *ctx, nxt_http_field_t *field, uintptr_t data)
 {
@@ -936,7 +998,7 @@ nxt_h1p_transfer_encoding(void *ctx, nxt_http_field_t *field, uintptr_t data)
     field->hopbyhop = 1;
 
     if (field->value_length == 7
-        && memcmp(field->value, "chunked", 7) == 0)
+        && nxt_memcasecmp(field->value, "chunked", 7) == 0)
     {
         if (r->chunked_field != NULL) {
             return NXT_HTTP_BAD_REQUEST;
@@ -953,6 +1015,30 @@ nxt_h1p_transfer_encoding(void *ctx, nxt_http_field_t *field, uintptr_t data)
 
     return NXT_OK;
 }
+
+
+#if (NXT_TESTS)
+
+/*
+ * For src/test/nxt_h1proto_fields_test.c: the "Connection" and the
+ * "Transfer-Encoding" field handlers, called as the field dispatch calls
+ * them.  r->proto.h1 must point to the h1proto of the request.
+ */
+
+nxt_int_t
+nxt_h1p_test_connection(nxt_http_request_t *r, nxt_http_field_t *field)
+{
+    return nxt_h1p_connection(r, field, 0);
+}
+
+
+nxt_int_t
+nxt_h1p_test_transfer_encoding(nxt_http_request_t *r, nxt_http_field_t *field)
+{
+    return nxt_h1p_transfer_encoding(r, field, 0);
+}
+
+#endif
 
 
 /*
@@ -982,12 +1068,112 @@ nxt_h1p_expect(void *ctx, nxt_http_field_t *field, uintptr_t data)
 }
 
 
+/*
+ * Write the decoded data slices of one chunked parse to the body file and
+ * free each slice.  On the request path the parser does not install
+ * nxt_http_chunk_buf_completion() (retain_buffers is set), so no completion
+ * runs for a slice, and without this function the request memory pool keeps
+ * one buffer per chunk until the request ends.  The chain is consumed here
+ * and never queued: a queued slice would be freed a second time by its
+ * default completion.  When the function fails the request, the slices that
+ * it has not reached stay in the pool until the request ends.
+ *
+ * The slices are gathered into an iovec of NXT_IOBUF_MAX entries and written
+ * with one writev().  Once the iovec is full, each further slice is moved
+ * down onto the end of the last entry.  So one parse costs one write call
+ * however many chunks it holds, and a large slice is moved only after
+ * NXT_IOBUF_MAX others.
+ *
+ * The move is safe because the parser lists the slices of one read buffer
+ * in address order, with the chunk framing that it consumed between them:
+ * the end of the last entry never lies above the next slice, and the move
+ * never reaches a slice that is not written yet.  The function checks this
+ * for every slice and fails the request if it does not hold.  It returns
+ * NXT_HTTP_OK, or the HTTP status to fail the request with.
+ */
+
+static nxt_http_status_t
+nxt_h1p_body_chunks_write(nxt_buf_t *b, nxt_buf_t *out, size_t max_body_size)
+{
+    u_char        *p, *prev;
+    size_t        size, total;
+    ssize_t       n;
+    nxt_uint_t    niov;
+    nxt_buf_t     *chunk, *next, *parent;
+    struct iovec  iov[NXT_IOBUF_MAX];
+
+    if (out == NULL) {
+        return NXT_HTTP_OK;
+    }
+
+    total = 0;
+    niov = 0;
+    prev = out->mem.pos;
+    parent = out->parent;
+
+    for (chunk = out; chunk != NULL; chunk = next) {
+        next = chunk->next;
+
+        if (nxt_slow_path(chunk->parent != parent || chunk->mem.pos < prev)) {
+            nxt_thread_log_alert("chunked body slices are not in order");
+            return NXT_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        size = nxt_buf_mem_used_size(&chunk->mem);
+        prev = chunk->mem.free;
+
+        if (niov < nxt_nitems(iov)) {
+            iov[niov].iov_base = chunk->mem.pos;
+            iov[niov].iov_len = size;
+            niov++;
+
+        } else {
+            p = iov[niov - 1].iov_base;
+            p += iov[niov - 1].iov_len;
+
+            nxt_memmove(p, chunk->mem.pos, size);
+
+            iov[niov - 1].iov_len += size;
+        }
+
+        /* The slices share one read buffer, so the sum cannot overflow. */
+        total += size;
+
+        /* The slice is written now, so free it instead of pooling it. */
+        nxt_buf_free(chunk->data, chunk);
+    }
+
+    n = writev(b->file->fd, iov, niov);
+
+    if (nxt_slow_path(n < (ssize_t) total)) {
+        if (n == -1) {
+            nxt_thread_log_alert("writev(%FD, %ui) of %uz failed %E",
+                                 b->file->fd, niov, total, nxt_errno);
+
+        } else {
+            nxt_thread_log_alert("writev(%FD, %ui) wrote %z of %uz",
+                                 b->file->fd, niov, n, total);
+        }
+
+        return NXT_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    b->file_end += total;
+
+    if ((size_t) b->file_end > max_body_size) {
+        return NXT_HTTP_PAYLOAD_TOO_LARGE;
+    }
+
+    return NXT_HTTP_OK;
+}
+
+
 static void
 nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
 {
     size_t             size, body_length, body_rest;
     ssize_t            res;
-    nxt_buf_t          *in, *b, *out, *chunk;
+    nxt_buf_t          *in, *b, *out;
     nxt_int_t          ret;
     nxt_conn_t         *c;
     nxt_h1proto_t      *h1p;
@@ -1072,25 +1258,17 @@ nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
                     goto error;
                 }
 
-                for (chunk = out; chunk != NULL; chunk = chunk->next) {
-                    size = nxt_buf_mem_used_size(&chunk->mem);
-
-                    res = nxt_fd_write(b->file->fd, chunk->mem.pos, size);
-                    if (nxt_slow_path(res < (ssize_t) size)) {
-                        status = NXT_HTTP_INTERNAL_SERVER_ERROR;
-                        goto error;
-                    }
-
-                    b->file_end += size;
-
-                    if ((size_t) b->file_end > skcf->max_body_size) {
-                        status = NXT_HTTP_PAYLOAD_TOO_LARGE;
-                        goto error;
-                    }
+                status = nxt_h1p_body_chunks_write(b, out,
+                                                   skcf->max_body_size);
+                if (nxt_slow_path(status != NXT_HTTP_OK)) {
+                    goto error;
                 }
 
                 if (h1p->chunked_parse.last) {
                     body_rest = 0;
+
+                } else {
+                    in->mem.pos = in->mem.free;
                 }
 
             } else {
@@ -1119,6 +1297,14 @@ nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
     nxt_debug(task, "h1p body rest: %uz", body_rest);
 
     if (body_rest != 0) {
+        if (nxt_buf_is_file(b) && !r->chunked
+            && body_rest < (size_t) nxt_buf_mem_size(&b->mem))
+        {
+            /* Avoid reading pipelined bytes of the next request into b->mem. */
+            b->mem.free = b->mem.end - body_rest;
+            b->mem.pos = b->mem.free;
+        }
+
         in->next = h1p->buffers;
         h1p->buffers = in;
         h1p->nbuffers++;
@@ -1297,10 +1483,11 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
 {
     size_t              size, body_rest;
     ssize_t             res;
-    nxt_buf_t           *b, *out, *chunk;
+    nxt_buf_t           *b, *out;
     nxt_msec_t          msec;
     nxt_conn_t          *c;
     nxt_h1proto_t       *h1p;
+    nxt_http_status_t   status;
     nxt_socket_conf_t   *skcf;
     nxt_http_request_t  *r;
     nxt_event_engine_t  *engine;
@@ -1342,24 +1529,11 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
                 return;
             }
 
-            for (chunk = out; chunk != NULL; chunk = chunk->next) {
-                size = nxt_buf_mem_used_size(&chunk->mem);
-                res = nxt_fd_write(b->file->fd, chunk->mem.pos, size);
-                if (nxt_slow_path(res < (ssize_t) size)) {
-                    h1p->keepalive = 0;
-                    nxt_http_request_error(task, r,
-                                           NXT_HTTP_INTERNAL_SERVER_ERROR);
-                    return;
-                }
-
-                b->file_end += size;
-
-                if ((size_t) b->file_end > skcf->max_body_size) {
-                    h1p->keepalive = 0;
-                    nxt_http_request_error(task, r,
-                                           NXT_HTTP_PAYLOAD_TOO_LARGE);
-                    return;
-                }
+            status = nxt_h1p_body_chunks_write(b, out, skcf->max_body_size);
+            if (nxt_slow_path(status != NXT_HTTP_OK)) {
+                h1p->keepalive = 0;
+                nxt_http_request_error(task, r, status);
+                return;
             }
 
             if (h1p->chunked_parse.last) {
@@ -1461,6 +1635,38 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
 
     } else {
         if (nxt_buf_is_file(b)) {
+            size = nxt_buf_mem_used_size(&b->mem);
+
+            if (size != 0) {
+                nxt_buf_t  *rest;
+
+                rest = h1p->buffers;
+
+                if (rest != NULL
+                    && size <= (size_t) nxt_buf_mem_free_size(&rest->mem))
+                {
+                    rest->mem.free = nxt_cpymem(rest->mem.free, b->mem.pos,
+                                                size);
+
+                } else {
+                    rest = nxt_event_engine_buf_mem_alloc(engine,
+                                       nxt_max(size, skcf->header_buffer_size));
+                    if (nxt_slow_path(rest == NULL)) {
+                        h1p->keepalive = 0;
+                        nxt_http_request_error(task, r,
+                                               NXT_HTTP_INTERNAL_SERVER_ERROR);
+                        return;
+                    }
+
+                    rest->mem.free = nxt_cpymem(rest->mem.pos, b->mem.pos,
+                                                size);
+
+                    rest->next = h1p->buffers;
+                    h1p->buffers = rest;
+                    h1p->nbuffers++;
+                }
+            }
+
             b->mem.start = NULL;
             b->mem.end = NULL;
             b->mem.pos = NULL;
@@ -1657,7 +1863,7 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
 
     conn = -1;
 
-    if (r->websocket_handshake && n == NXT_HTTP_SWITCHING_PROTOCOLS) {
+    if (r->websocket_upgrade && n == NXT_HTTP_SWITCHING_PROTOCOLS) {
         h1p->websocket = 1;
         h1p->keepalive = 0;
         conn = 2;
@@ -1720,6 +1926,11 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
 
     header = nxt_http_buf_mem(task, r, size);
     if (nxt_slow_path(header == NULL)) {
+        /*
+         * The request is closing.  Clear the flag set above, so that
+         * nxt_h1p_websocket_start() does not start the frame reader.
+         */
+        h1p->websocket = 0;
         nxt_h1p_request_error(task, h1p, r);
         return;
     }
@@ -1791,9 +2002,26 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
     }
 
     nxt_conn_write(task->thread->engine, c);
+}
 
-    if (h1p->websocket) {
-        nxt_h1p_websocket_first_frame_start(task, r, c->read);
+
+/*
+ * Start reading client WebSocket frames.  The router calls this after it has
+ * set r->state to the WebSocket state: the first read can hold bytes the
+ * client pipelined with the handshake, and those bytes are dispatched through
+ * r->state, so the state has to be final here.
+ */
+void
+nxt_h1p_websocket_start(nxt_task_t *task, nxt_http_request_t *r)
+{
+    nxt_h1proto_t  *h1p;
+
+    h1p = r->proto.h1;
+
+    if (h1p != NULL && h1p->websocket && h1p->request == r
+        && h1p->conn != NULL)
+    {
+        nxt_h1p_websocket_first_frame_start(task, r, h1p->conn->read);
     }
 }
 
@@ -2684,7 +2912,7 @@ nxt_h1p_idle_response_timeout(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "h1p idle timeout response timeout");
 
-    c = nxt_read_timer_conn(timer);
+    c = nxt_write_timer_conn(timer);
     c->block_write = 1;
 
     nxt_h1p_shutdown(task, c);
@@ -3105,16 +3333,19 @@ nxt_h1p_peer_request_target(nxt_http_request_t *r, nxt_str_t *target)
         return NXT_OK;
     }
 
-    if (!r->quoted_target && r->args->length == 0) {
+    /*
+     * The URI was rewritten, so r->path is the rewrite result, not the request
+     * line as received.  nxt_http_parse_complex_target() copies any byte that
+     * is not "%"-quoted verbatim, so a rewrite that interpolates a variable
+     * (e.g. "$uri") can place a raw CR, LF or space into r->path.  Encode by
+     * the path's actual content so such a byte cannot break the upstream
+     * request line (request smuggling / header injection).
+     */
+    encode = nxt_encode_complex_uri(NULL, r->path->start, r->path->length);
+
+    if (encode == 0 && r->args->length == 0) {
         *target = *r->path;
         return NXT_OK;
-    }
-
-    if (r->quoted_target) {
-        encode = nxt_encode_complex_uri(NULL, r->path->start,
-                                        r->path->length);
-    } else {
-        encode = 0;
     }
 
     size = r->path->length + encode * 2 + 1 + r->args->length;
@@ -3124,7 +3355,7 @@ nxt_h1p_peer_request_target(nxt_http_request_t *r, nxt_str_t *target)
         return NXT_ERROR;
     }
 
-    if (r->quoted_target) {
+    if (encode > 0) {
         p = (u_char *) nxt_encode_complex_uri(target->start, r->path->start,
                                               r->path->length);
 
@@ -3342,6 +3573,25 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
         h1p->chunked = (h1p->transfer_encoding == NXT_HTTP_TE_CHUNKED);
 
         /*
+         * The proxy cannot pass WebSocket.  The router starts the client
+         * frame reader only for an application 101 (r->websocket_upgrade),
+         * so a relayed 101 would hand the client the upstream's Upgrade
+         * fields with nobody relaying frames.  Refuse the upgrade here,
+         * where "b" can still be freed: bytes that the upstream sent after
+         * the 101 are in "b" too.
+         */
+        if (nxt_slow_path(peer->status == NXT_HTTP_SWITCHING_PROTOCOLS
+                          && r->websocket_handshake))
+        {
+            nxt_log(task, NXT_LOG_WARN,
+                    "upstream answered a WebSocket handshake with 101, "
+                    "a proxy cannot pass WebSocket");
+
+            peer->status = NXT_HTTP_BAD_GATEWAY;
+            break;
+        }
+
+        /*
          * RFC 9112 Sect. 6.3: a response to HEAD, and any 204 or 304 response,
          * is terminated by the first empty line after the header fields no
          * matter what Content-Length or Transfer-Encoding say.  Such a response
@@ -3432,6 +3682,28 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
         }
 
         if (nxt_buf_mem_used_size(&b->mem) != 0) {
+            if (h1p->chunked) {
+                /*
+                 * r->resp fields ($response_header_*) point into the header
+                 * buffer "b".  Hold "b" until r->mem_pool is destroyed after
+                 * access logging so neither a framing-only tail ("0\r\n\r\n")
+                 * nor early slice completion recycles "b" while r->resp still
+                 * references it.
+                 */
+                if (nxt_slow_path(nxt_http_proxy_buf_mem_hold(task, r, b)
+                                  != NXT_OK))
+                {
+                    peer->status = NXT_HTTP_INTERNAL_SERVER_ERROR;
+                    break;
+                }
+
+                /*
+                 * retain = 1 keeps the parser from queueing b's completion;
+                 * the pool cleanup owns the buffer now.
+                 */
+                b->retain = 1;
+            }
+
             nxt_h1p_peer_body_process(task, peer, b);
             return;
         }
@@ -3490,7 +3762,7 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
 static nxt_int_t
 nxt_h1p_peer_header_parse(nxt_http_peer_t *peer, nxt_buf_mem_t *bm)
 {
-    u_char                    *p;
+    u_char                    *p, *q;
     size_t                    length;
     nxt_int_t                 ret, status;
     nxt_http_request_parse_t  *rp;
@@ -3502,7 +3774,8 @@ again:
     if (peer->status < 0) {
         length = nxt_buf_mem_used_size(bm);
 
-        if (nxt_slow_path(length < 12)) {
+        /* "HTTP/1.x NNN" and at least the line end. */
+        if (nxt_slow_path(length < 13)) {
             return NXT_AGAIN;
         }
 
@@ -3514,19 +3787,38 @@ again:
             return NXT_ERROR;
         }
 
+        /*
+         * RFC 9112, 4: status-line = HTTP-version SP status-code SP
+         * [ reason-phrase ].  A sender must send the second space, but
+         * a line without it is accepted, as a recipient may be lenient.
+         * The space before the code is required.
+         */
+        if (nxt_slow_path(p[8] != ' '
+                          || (p[12] != ' ' && p[12] != '\r'
+                              && p[12] != '\n')))
+        {
+            return NXT_ERROR;
+        }
+
         status = nxt_int_parse(&p[9], 3);
 
         if (nxt_slow_path(status < 0)) {
             return NXT_ERROR;
         }
 
-        p += 12;
-        length -= 12;
+        q = p + 12;
 
-        p = memchr(p, '\n', length);
+        p = memchr(q, '\n', length - 12);
 
         if (nxt_slow_path(p == NULL)) {
             return NXT_AGAIN;
+        }
+
+        /* A CR is valid only before the LF (RFC 9112, 2.2). */
+        q = memchr(q, '\r', p - q);
+
+        if (nxt_slow_path(q != NULL && q != p - 1)) {
+            return NXT_ERROR;
         }
 
         bm->pos = p + 1;
@@ -3635,6 +3927,19 @@ nxt_h1p_peer_body_process(nxt_task_t *task, nxt_http_peer_t *peer,
         out = nxt_http_chunk_parse(task, &h1p->chunked_parse, out);
 
         if (h1p->chunked_parse.chunk_error || h1p->chunked_parse.error) {
+            nxt_buf_t         *b, *next;
+            nxt_work_queue_t  *wq;
+
+            wq = &task->thread->engine->fast_work_queue;
+
+            for (b = out; b != NULL; b = next) {
+                next = b->next;
+                b->next = NULL;
+
+                nxt_work_queue_add(wq, b->completion_handler, task, b,
+                                   b->parent);
+            }
+
             peer->status = NXT_HTTP_BAD_GATEWAY;
             r = peer->request;
             r->state->error_handler(task, r, peer);

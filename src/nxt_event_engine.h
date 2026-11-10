@@ -7,6 +7,10 @@
 #ifndef _NXT_EVENT_ENGINE_H_INCLUDED_
 #define _NXT_EVENT_ENGINE_H_INCLUDED_
 
+#if (NXT_HAVE_REGEX)
+#include <nxt_regex.h>
+#endif
+
 /*
  * An event interface is kernel interface such as kqueue, epoll, etc.
  * intended to get event notifications about file descriptor state,
@@ -263,6 +267,12 @@ nxt_epoll_signalfd_eagain(ssize_t n, int err)
 {
     return (n == -1 && err == NXT_EAGAIN);
 }
+
+#if (NXT_TESTS)
+/* The signalfd read handler, for the signalfd test. */
+void nxt_epoll_test_signalfd_handler(nxt_task_t *task, nxt_fd_event_t *ev,
+    nxt_work_handler_t handler);
+#endif
 
 #endif
 
@@ -525,6 +535,17 @@ struct nxt_event_engine_s {
 
     nxt_port_t                 *port;
     nxt_mp_t                   *mem_pool;
+
+#if (NXT_HAVE_REGEX)
+    /*
+     * One bounded match object for every route regex tested on this thread.
+     * It is created on first use from "mem_pool" and reused across requests,
+     * so the per-request path allocates no match context (see
+     * nxt_http_route_pattern()).
+     */
+    nxt_regex_match_t          *regex_match;
+#endif
+
     nxt_queue_t                joints;
     nxt_queue_t                listen_connections;
     nxt_queue_t                idle_connections;
@@ -569,15 +590,6 @@ void nxt_event_engine_buf_mem_free(nxt_event_engine_t *engine, nxt_buf_t *b);
 void nxt_event_engine_buf_mem_completion(nxt_task_t *task, void *obj,
     void *data);
 
-
-nxt_inline nxt_event_engine_t *
-nxt_thread_event_engine(void)
-{
-    nxt_thread_t  *thr;
-
-    thr = nxt_thread();
-    return thr->engine;
-}
 
 #if (NXT_DEBUG)
 

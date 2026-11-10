@@ -7,6 +7,15 @@
 #include "nxt_tests.h"
 
 
+static void
+nxt_http_chunk_test_buf_completion(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_uint_t  *completed = data;
+
+    (*completed)++;
+}
+
+
 nxt_int_t
 nxt_http_chunk_parse_test(nxt_thread_t *thr)
 {
@@ -60,6 +69,48 @@ nxt_http_chunk_parse_test(nxt_thread_t *thr)
         { nxt_string("0\r\nX@T: v\r\n\r\n"),   1, 0 },  /* non-tchar in name */
         { nxt_string("0\r\n X-T: v\r\n\r\n"),  1, 0 },  /* obs-fold (SP) */
         { nxt_string("0\r\n\tX-T: v\r\n\r\n"), 1, 0 },  /* obs-fold (HTAB) */
+
+        /*
+         * Chunk extensions (RFC 9112 7.1.1): ignored, but each must be
+         * BWS ";" BWS token [ BWS "=" BWS ( token / quoted-string ) ].
+         */
+        { nxt_string("0;a\r\n\r\n"),           0, 1 },  /* name only */
+        { nxt_string("0;a=b\r\n\r\n"),         0, 1 },  /* token value */
+        { nxt_string("0;a=b;c;d=e\r\n\r\n"),   0, 1 },  /* several */
+        { nxt_string("0 ;a\r\n\r\n"),          0, 1 },  /* BWS before ";" */
+        { nxt_string("0\t;a=b;c\r\n\r\n"),     0, 1 },  /* HTAB before ";" */
+        { nxt_string("0; a = b ;\tc\r\n\r\n"),
+                                               0, 1 },  /* BWS */
+        { nxt_string("0;!#$%&'*+-.^_`|~09AZaz=x\r\n\r\n"),
+                                               0, 1 },  /* every tchar kind */
+        { nxt_string("0;a=\"\"\r\n\r\n"),      0, 1 },  /* empty quoted */
+        { nxt_string("0;a=\"b c;d=e\"\r\n\r\n"),
+                                               0, 1 },  /* ";" "=" SP quoted */
+        { nxt_string("0;a=\"\\\"\\\\\";b\r\n\r\n"),
+                                               0, 1 },  /* quoted-pair */
+        { nxt_string("0;a=\"\x80\tx\"\r\n\r\n"),
+                                               0, 1 },  /* obs-text, HTAB */
+
+        { nxt_string("0;\r\n\r\n"),            1, 0 },  /* bare ";" */
+        { nxt_string("0;a;\r\n\r\n"),          1, 0 },  /* trailing ";" */
+        { nxt_string("0;;a\r\n\r\n"),          1, 0 },  /* empty name */
+        { nxt_string("0;=b\r\n\r\n"),          1, 0 },  /* empty name 2 */
+        { nxt_string("0;a=\r\n\r\n"),          1, 0 },  /* empty value */
+        { nxt_string("0;bad[=x\r\n\r\n"),      1, 0 },  /* non-tchar name */
+        { nxt_string("0;a=b@\r\n\r\n"),        1, 0 },  /* non-tchar value */
+        { nxt_string("0;a=b=c\r\n\r\n"),       1, 0 },  /* second "=" */
+        { nxt_string("0;a b\r\n\r\n"),         1, 0 },  /* SP in name */
+        { nxt_string("0;a=b c\r\n\r\n"),       1, 0 },  /* SP in value */
+        { nxt_string("0;a \r\n\r\n"),          1, 0 },  /* BWS before CRLF */
+        { nxt_string("0 \r\n\r\n"),            1, 0 },  /* BWS, no ";" */
+        { nxt_string("0;a=b\t\r\n\r\n"),       1, 0 },  /* HTAB before CRLF */
+        { nxt_string("0;a=\"b\"c\r\n\r\n"),    1, 0 },  /* byte after quote */
+        { nxt_string("0;a=\"b\r\n\r\n"),       1, 0 },  /* unterminated */
+        { nxt_string("0;a=\"\\\r\n\r\n"),      1, 0 },  /* CR quoted-pair */
+        { nxt_string("0;\n\r\n"),              1, 0 },  /* bare LF */
+        { nxt_string("0;a\n\r\n"),             1, 0 },  /* LF after name */
+        { nxt_string("0;a=b\n\r\n"),           1, 0 },  /* LF after value */
+        { nxt_string("0;a\rb\r\n\r\n"),        1, 0 },  /* bare CR */
 
         { nxt_string("0\r\nX-T: v\r\n"),       0, 0 },  /* trailer, no final CRLF */
         { nxt_string("0\r\n"),                 0, 0 },  /* incomplete terminal */
@@ -251,6 +302,242 @@ nxt_http_chunk_parse_test(nxt_thread_t *thr)
                 return NXT_ERROR;
             }
         }
+    }
+
+    /*
+     * Every byte in each position of a chunk extension: an extension name and
+     * a token value take a tchar only, a quoted-string takes qdtext and a
+     * quoted-pair HTAB, SP, VCHAR or obs-text.  So NUL, every other CTL, DEL
+     * and the bare LF are refused in each position.  Built at runtime because
+     * a C-string literal cannot carry an embedded NUL.
+     */
+    {
+        static u_char  buf[16];
+        u_char         *p;
+        nxt_uint_t     c, n;
+        nxt_bool_t     tchar, text;
+        uint8_t        expect_err;
+
+        static const struct {
+            const char  *prefix;
+            const char  *suffix;
+        }  pos[] = {
+            { "0;",       "\r\n\r\n" },     /* extension name */
+            { "0;a=",     "\r\n\r\n" },     /* token value */
+            { "0;a=\"",   "\"\r\n\r\n" },   /* qdtext */
+            { "0;a=\"\\", "\"\r\n\r\n" },   /* quoted-pair */
+        };
+
+        for (n = 0; n < nxt_nitems(pos); n++) {
+            for (c = 0; c <= 0xff; c++) {
+                tchar = (c >= '0' && c <= '9')
+                        || ((c | 0x20) >= 'a' && (c | 0x20) <= 'z')
+                        || (c != 0 && strchr("!#$%&'*+-.^_`|~", c) != NULL);
+                text = (c >= 0x20 && c != 0x7f) || c == '\t';
+
+                switch (n) {
+                case 0:
+                case 1:
+                    expect_err = !tchar;
+                    break;
+                case 2:
+                    expect_err = !text || c == '"' || c == '\\';
+                    break;
+                default:
+                    expect_err = !text;
+                    break;
+                }
+
+                p = nxt_cpymem(buf, pos[n].prefix, nxt_strlen(pos[n].prefix));
+                *p++ = (u_char) c;
+                p = nxt_cpymem(p, pos[n].suffix, nxt_strlen(pos[n].suffix));
+
+                nxt_memzero(&hcp, sizeof(nxt_http_chunk_parse_t));
+                nxt_memzero(&b, sizeof(nxt_buf_t));
+                b.mem.pos = buf;
+                b.mem.free = p;
+                b.retain = 1;
+
+                (void) nxt_http_chunk_parse(thr->task, &hcp, &b);
+
+                if (hcp.chunk_error != expect_err
+                    || hcp.last != !expect_err)
+                {
+                    nxt_log_alert(thr->log,
+                                  "nxt_http_chunk_parse() chunk-ext test "
+                                  "failed for 0x%02Xd after \"%s\": "
+                                  "chunk_error=%d/%d last=%d/%d",
+                                  (int) c, pos[n].prefix,
+                                  (int) hcp.chunk_error, (int) expect_err,
+                                  (int) hcp.last, (int) !expect_err);
+                    return NXT_ERROR;
+                }
+            }
+        }
+    }
+
+    /*
+     * retain_buffers == 1 (request body path): non-empty chunk slices are
+     * consumed synchronously by the caller without running completion
+     * handlers, so nxt_http_chunk_buffer() must not retain hcp->mem_pool or
+     * increment b.retain.
+     */
+    {
+        nxt_mp_t   *mp;
+        nxt_buf_t  *out;
+        nxt_str_t  body = nxt_string("5\r\nhello\r\n3\r\nbye\r\n0\r\n\r\n");
+
+        mp = nxt_mp_create(1024, 128, 256, 32);
+        if (mp == NULL) {
+            return NXT_ERROR;
+        }
+
+        nxt_memzero(&hcp, sizeof(nxt_http_chunk_parse_t));
+        hcp.mem_pool = mp;
+        hcp.retain_buffers = 1;
+
+        nxt_memzero(&b, sizeof(nxt_buf_t));
+        b.mem.pos = body.start;
+        b.mem.free = body.start + body.length;
+
+        out = nxt_http_chunk_parse(thr->task, &hcp, &b);
+
+        if (out == NULL || out->next == NULL || out->next->next != NULL
+            || out->parent != &b || out->next->parent != &b
+            || nxt_buf_mem_used_size(&out->mem) != 5
+            || memcmp(out->mem.pos, "hello", 5) != 0
+            || nxt_buf_mem_used_size(&out->next->mem) != 3
+            || memcmp(out->next->mem.pos, "bye", 3) != 0
+            || hcp.chunk_error != 0 || hcp.error != 0 || hcp.last != 1
+            || b.retain != 0 || nxt_mp_test_retain_count(mp) != 1)
+        {
+            nxt_log_alert(thr->log,
+                          "nxt_http_chunk_parse() retain_buffers=1 test "
+                          "failed: retain=%uD mp_retain=%uD",
+                          b.retain, nxt_mp_test_retain_count(mp));
+            nxt_mp_destroy(mp);
+            return NXT_ERROR;
+        }
+
+        nxt_mp_release(mp);
+    }
+
+    /*
+     * retain_buffers == 0 (upstream proxy path): an input buffer that produces
+     * no data slices (e.g., a separate terminal "0\r\n\r\n" buffer or a
+     * malformed chunk) must still have its completion_handler queued on
+     * fast_work_queue so the upstream buffer's pool retention is released.
+     */
+    {
+        void                *obj, *data;
+        nxt_mp_t            *mp;
+        nxt_buf_t           *out;
+        nxt_task_t          *task;
+        nxt_uint_t          completed;
+        nxt_thread_t        *saved_thread;
+        nxt_event_engine_t  engine, *saved_engine;
+        nxt_work_handler_t  handler;
+        nxt_str_t           last_chunk = nxt_string("0\r\n\r\n");
+        nxt_str_t           bad_chunk = nxt_string("5\r\nhello\r\nz\r\n");
+
+        nxt_memzero(&engine, sizeof(nxt_event_engine_t));
+        nxt_work_queue_cache_create(&engine.work_queue_cache, 16);
+        engine.fast_work_queue.cache = &engine.work_queue_cache;
+        nxt_work_queue_name(&engine.fast_work_queue, "test");
+
+        saved_thread = thr->task->thread;
+        saved_engine = thr->engine;
+        thr->task->thread = thr;
+        thr->engine = &engine;
+
+        completed = 0;
+
+        nxt_memzero(&hcp, sizeof(nxt_http_chunk_parse_t));
+        nxt_memzero(&b, sizeof(nxt_buf_t));
+        b.mem.pos = last_chunk.start;
+        b.mem.free = last_chunk.start + last_chunk.length;
+        b.completion_handler = nxt_http_chunk_test_buf_completion;
+        b.parent = &completed;
+
+        (void) nxt_http_chunk_parse(thr->task, &hcp, &b);
+
+        while (engine.fast_work_queue.head != NULL) {
+            handler = nxt_work_queue_pop(&engine.fast_work_queue, &task, &obj,
+                                         &data);
+            handler(task, obj, data);
+        }
+
+        if (hcp.last != 1 || hcp.chunk_error != 0 || completed != 1) {
+            thr->engine = saved_engine;
+            thr->task->thread = saved_thread;
+            nxt_work_queue_cache_destroy(&engine.work_queue_cache);
+            nxt_log_alert(thr->log,
+                          "nxt_http_chunk_parse() terminal completion test "
+                          "failed: last=%d chunk_error=%d completed=%ui",
+                          (int) hcp.last, (int) hcp.chunk_error, completed);
+            return NXT_ERROR;
+        }
+
+        mp = nxt_mp_create(1024, 128, 256, 32);
+        if (mp == NULL) {
+            thr->engine = saved_engine;
+            thr->task->thread = saved_thread;
+            nxt_work_queue_cache_destroy(&engine.work_queue_cache);
+            return NXT_ERROR;
+        }
+
+        completed = 0;
+
+        nxt_memzero(&hcp, sizeof(nxt_http_chunk_parse_t));
+        hcp.mem_pool = mp;
+
+        nxt_memzero(&b, sizeof(nxt_buf_t));
+        b.mem.pos = bad_chunk.start;
+        b.mem.free = bad_chunk.start + bad_chunk.length;
+        b.completion_handler = nxt_http_chunk_test_buf_completion;
+        b.parent = &completed;
+
+        out = nxt_http_chunk_parse(thr->task, &hcp, &b);
+
+        if (out == NULL || hcp.chunk_error != 1
+            || b.retain != 1 || nxt_mp_test_retain_count(mp) != 2)
+        {
+            thr->engine = saved_engine;
+            thr->task->thread = saved_thread;
+            nxt_work_queue_cache_destroy(&engine.work_queue_cache);
+            nxt_log_alert(thr->log,
+                          "nxt_http_chunk_parse() error slice test failed: "
+                          "chunk_error=%d retain=%uD mp_retain=%uD",
+                          (int) hcp.chunk_error, b.retain,
+                          nxt_mp_test_retain_count(mp));
+            nxt_mp_destroy(mp);
+            return NXT_ERROR;
+        }
+
+        out->completion_handler(thr->task, out, out->parent);
+
+        while (engine.fast_work_queue.head != NULL) {
+            handler = nxt_work_queue_pop(&engine.fast_work_queue, &task, &obj,
+                                         &data);
+            handler(task, obj, data);
+        }
+
+        thr->engine = saved_engine;
+        thr->task->thread = saved_thread;
+        nxt_work_queue_cache_destroy(&engine.work_queue_cache);
+
+        if (b.retain != 0 || completed != 1
+            || nxt_mp_test_retain_count(mp) != 1)
+        {
+            nxt_log_alert(thr->log,
+                          "nxt_http_chunk_parse() error completion test "
+                          "failed: retain=%uD completed=%ui mp_retain=%uD",
+                          b.retain, completed, nxt_mp_test_retain_count(mp));
+            nxt_mp_destroy(mp);
+            return NXT_ERROR;
+        }
+
+        nxt_mp_release(mp);
     }
 
     nxt_log_error(NXT_LOG_NOTICE, thr->log,

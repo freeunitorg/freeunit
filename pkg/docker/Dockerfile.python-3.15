@@ -1,11 +1,14 @@
-FROM node:20-trixie
+FROM python:3.15-trixie
 
 # The FreeUnit release this image builds.  "make dockerfiles" writes the
 # default from NXT_VERSION in the version file.  release-docker.yml passes
 # the tag with --build-arg UNIT_VERSION=<tag>.
-ARG UNIT_VERSION=1.37.0
+ARG UNIT_VERSION=1.37.2
+# Optional commit timestamp for reproducible builds (PR #626).  When unset,
+# the build step falls back to the commit timestamp of the cloned tag.
+ARG SOURCE_DATE_EPOCH
 
-LABEL org.opencontainers.image.title="FreeUnit (node-20)"
+LABEL org.opencontainers.image.title="FreeUnit (python-3.15)"
 LABEL org.opencontainers.image.description="Community build of FreeUnit for Docker."
 LABEL org.opencontainers.image.url="https://freeunit.org"
 LABEL org.opencontainers.image.source="https://github.com/freeunitorg/freeunit"
@@ -43,6 +46,7 @@ RUN set -ex \
     && cd /usr/src/unit \
     && git clone --depth 1 -b "${UNIT_VERSION}" https://github.com/freeunitorg/freeunit unit \
     && cd unit \
+    && export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}" \
     && NCPU="$(getconf _NPROCESSORS_ONLN)" \
     && DEB_HOST_MULTIARCH="$(dpkg-architecture -q DEB_HOST_MULTIARCH)" \
     && CC_OPT="$(DEB_BUILD_MAINT_OPTIONS="hardening=+all,-pie" DEB_CFLAGS_MAINT_APPEND="-fPIC" dpkg-buildflags --get CFLAGS | tr ' ' '\n' | grep -v '^-specs=' | tr '\n' ' ')" \
@@ -78,14 +82,14 @@ RUN set -ex \
     && make -j $NCPU unitd \
     && install -pm755 build/sbin/unitd /usr/sbin/unitd \
     && make clean \
-    && npm -g install node-gyp \
+    && /bin/true \
     && ./configure $CONFIGURE_ARGS_MODULES --cc-opt="$CC_OPT" --modulesdir=/usr/lib/unit/debug-modules --debug \
-    && ./configure nodejs --node-gyp=/usr/local/bin/node-gyp \
-    && make -j $NCPU node node-install libunit-install \
+    && ./configure python --config=/usr/local/bin/python3-config \
+    && make -j $NCPU python3-install \
     && make clean \
     && ./configure $CONFIGURE_ARGS_MODULES --cc-opt="$CC_OPT" --modulesdir=/usr/lib/unit/modules \
-    && ./configure nodejs --node-gyp=/usr/local/bin/node-gyp \
-    && make -j $NCPU node node-install libunit-install \
+    && ./configure python --config=/usr/local/bin/python3-config \
+    && make -j $NCPU python3-install \
     && cd \
     && rm -rf /usr/src/unit \
     && for f in /usr/sbin/unitd /usr/lib/unit/modules/*.unit.so; do \
@@ -94,7 +98,7 @@ RUN set -ex \
        done \
     && apt-mark showmanual | xargs apt-mark auto > /dev/null \
     && { [ -z "$savedAptMark" ] || apt-mark manual $savedAptMark; } \
-    && rm -rf /root/.cache/ && rm -rf /root/.npm \
+    && /bin/true \
     && mkdir -p /var/lib/unit/ \
     && mkdir -p /docker-entrypoint.d/ \
     && groupadd --gid 999 unit \

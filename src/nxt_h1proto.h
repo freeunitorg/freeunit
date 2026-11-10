@@ -39,6 +39,7 @@ struct nxt_h1proto_s {
     uint8_t                   chunked;              /* 1 bit  */
     uint8_t                   chunk_sent;           /* 1 bit  */
     uint8_t                   websocket;            /* 1 bit  */
+    uint8_t                   connection_close;     /* 1 bit  */
     uint8_t                   connection_upgrade;   /* 1 bit  */
     uint8_t                   upgrade_websocket;    /* 1 bit  */
     uint8_t                   websocket_version_ok; /* 1 bit  */
@@ -118,6 +119,13 @@ nxt_h1p_from_conn(nxt_conn_t *c)
     return &slot->h1p;
 }
 void nxt_h1p_shutdown(nxt_task_t *task, nxt_conn_t *c);
+
+#if (NXT_TESTS)
+nxt_int_t nxt_h1p_test_connection(nxt_http_request_t *r,
+    nxt_http_field_t *field);
+nxt_int_t nxt_h1p_test_transfer_encoding(nxt_http_request_t *r,
+    nxt_http_field_t *field);
+#endif
 
 
 

@@ -113,7 +113,12 @@ struct nxt_process_s {
     nxt_queue_t              ports;      /* of nxt_port_t.link */
     nxt_process_state_t      state;
     nxt_bool_t               registered;
-    nxt_int_t                use_count;
+
+    /*
+     * Changed only by atomic operations.  It reaches zero only under
+     * rt->processes_mutex; see nxt_process_use().
+     */
+    nxt_atomic_t             use_count;
 
     /*
      * Latched, under rt->processes_mutex, when use_count reaches zero.  A
@@ -274,6 +279,13 @@ nxt_int_t nxt_process_core_setup(nxt_task_t *task, nxt_process_t *process);
 nxt_int_t nxt_process_creds_set(nxt_task_t *task, nxt_process_t *process,
     nxt_str_t *user, nxt_str_t *group);
 nxt_int_t nxt_process_apply_creds(nxt_task_t *task, nxt_process_t *process);
+
+rlim_t nxt_process_nofile_target(rlim_t cur, rlim_t max);
+nxt_int_t nxt_process_nofile_raise(nxt_task_t *task);
+
+#if (NXT_TESTS)
+void nxt_process_test_nofile_failure(nxt_err_t err);
+#endif
 
 #if (NXT_HAVE_SETPROCTITLE)
 

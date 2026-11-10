@@ -115,3 +115,35 @@ def test_wasm_handler_not_function(handler, wait_for_record):
 
     record = rf'module export \({handler}\) is not a function'
     assert wait_for_record(record) is not None
+
+
+def test_wasm_request_end_twice(findall, skip_alert):
+    skip_alert(r'wasm trap|trap|unreachable')
+
+    client.load('request_end')
+
+    # The guest ends the response and then traps.  The host must not end
+    # the request again.
+    resp = client.get(url='/trap')
+    assert resp['status'] == 200, 'trap status'
+    assert resp['body'] == 'trap\n', 'trap body'
+
+    resp = client.get()
+    assert resp['status'] == 200, 'status after trap'
+    assert resp['body'] == 'ok\n', 'body after trap'
+
+    assert findall(r'exited on signal') == [], 'no crash'
+
+
+def test_wasm_request_no_end():
+    client.load('request_end')
+
+    # The guest never calls luw_http_response_end().  The host ends the
+    # request when the handler returns.
+    resp = client.get(url='/noend', read_timeout=5)
+    assert resp['status'] == 200, 'no end status'
+    assert resp['body'] == 'noend\n', 'no end body'
+
+    resp = client.get(read_timeout=5)
+    assert resp['status'] == 200, 'status after no end'
+    assert resp['body'] == 'ok\n', 'body after no end'

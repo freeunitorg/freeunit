@@ -400,7 +400,7 @@ nxt_java_start(nxt_task_t *task, nxt_process_data_t *data)
         goto env_failed;
     }
 
-    nxt_java_jni_init(env);
+    rc = nxt_java_jni_init(env);
     if (rc != NXT_UNIT_OK) {
         nxt_alert(task, "nxt_java_jni_init() failed");
         goto env_failed;
@@ -565,7 +565,7 @@ nxt_java_websocket_handler(nxt_unit_websocket_frame_t *ws)
     env = ws->req->ctx->data;
     data = ws->req->data;
 
-    b = malloc(ws->payload_len);
+    b = malloc(nxt_max(ws->payload_len, 1));
     if (b != NULL) {
         nxt_unit_websocket_read(ws, b, ws->payload_len);
 
@@ -600,8 +600,15 @@ nxt_java_close_handler(nxt_unit_request_info_t *req)
 
     nxt_java_Request_close(env, data->jreq);
 
-    (*env)->DeleteGlobalRef(env, data->jresp);
-    (*env)->DeleteGlobalRef(env, data->jreq);
+    if (data->jresp != NULL) {
+        (*env)->DeleteGlobalRef(env, data->jresp);
+        data->jresp = NULL;
+    }
+
+    if (data->jreq != NULL) {
+        (*env)->DeleteGlobalRef(env, data->jreq);
+        data->jreq = NULL;
+    }
 
     nxt_unit_request_done(req, NXT_UNIT_OK);
 }

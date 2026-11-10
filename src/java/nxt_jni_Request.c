@@ -293,7 +293,8 @@ nxt_java_Request_getHeader(JNIEnv *env, jclass cls, jlong req_ptr,
         return NULL;
     }
 
-    return (*env)->NewStringUTF(env, nxt_unit_sptr_get(&f->value));
+    return nxt_java_newString(env, nxt_unit_sptr_get(&f->value),
+                              f->value_length);
 }
 
 
@@ -385,7 +386,8 @@ nxt_java_Request_getMethod(JNIEnv *env, jclass cls, jlong req_ptr)
 
     r = nxt_jlong2ptr(req_ptr);
 
-    return (*env)->NewStringUTF(env, nxt_unit_sptr_get(&r->method));
+    return nxt_java_newString(env, nxt_unit_sptr_get(&r->method),
+                              r->method_length);
 }
 
 
@@ -399,7 +401,7 @@ nxt_java_Request_getQueryString(JNIEnv *env, jclass cls, jlong req_ptr)
 
     if (r->query.offset != 0) {
         query = nxt_unit_sptr_get(&r->query);
-        return (*env)->NewStringUTF(env, query);
+        return nxt_java_newString(env, query, r->query_length);
     }
 
     return NULL;
@@ -421,7 +423,7 @@ nxt_java_Request_getRequestURI(JNIEnv *env, jclass cls, jlong req_ptr)
         return nxt_java_newString(env, target, query - target - 1);
     }
 
-    return (*env)->NewStringUTF(env, target);
+    return nxt_java_newString(env, target, r->target_length);
 }
 
 
@@ -447,7 +449,8 @@ nxt_java_Request_getContentType(JNIEnv *env, jclass cls, jlong req_ptr)
     if (r->content_type_field != NXT_UNIT_NONE_FIELD) {
         f = r->fields + r->content_type_field;
 
-        return (*env)->NewStringUTF(env, nxt_unit_sptr_get(&f->value));
+        return nxt_java_newString(env, nxt_unit_sptr_get(&f->value),
+                                  f->value_length);
     }
 
     return NULL;
@@ -520,7 +523,8 @@ nxt_java_Request_getProtocol(JNIEnv *env, jclass cls, jlong req_ptr)
 
     r = nxt_jlong2ptr(req_ptr);
 
-    return (*env)->NewStringUTF(env, nxt_unit_sptr_get(&r->version));
+    return nxt_java_newString(env, nxt_unit_sptr_get(&r->version),
+                              r->version_length);
 }
 
 
@@ -733,6 +737,10 @@ nxt_java_Request_sendWsFrameBuf(JNIEnv *env, jclass cls,
             return;
         }
 
+        if (!nxt_unit_response_is_sent(req)) {
+            nxt_unit_response_send(req);
+        }
+
         nxt_unit_websocket_send(req, opCode, last, b + pos, len);
 
     } else {
@@ -792,8 +800,15 @@ nxt_java_Request_closeWs(JNIEnv *env, jclass cls, jlong req_info_ptr)
 
     data = req->data;
 
-    (*env)->DeleteGlobalRef(env, data->jresp);
-    (*env)->DeleteGlobalRef(env, data->jreq);
+    if (data->jresp != NULL) {
+        (*env)->DeleteGlobalRef(env, data->jresp);
+        data->jresp = NULL;
+    }
+
+    if (data->jreq != NULL) {
+        (*env)->DeleteGlobalRef(env, data->jreq);
+        data->jreq = NULL;
+    }
 
     nxt_unit_request_done(req, NXT_UNIT_OK);
 }

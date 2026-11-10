@@ -159,6 +159,7 @@ nxt_router_start_fail_soak_test(nxt_thread_t *thr)
     nxt_queue_init(&app->spare_ports);
     nxt_queue_init(&app->idle_ports);
     nxt_queue_init(&app->ack_waiting_req);
+    nxt_queue_init(&app->requeue_req);
 
     nxt_str_set(&app->name, "start-fail-soak-test");
 

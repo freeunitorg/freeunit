@@ -24,8 +24,9 @@ churn test never kills anything.
 What this proves and what it does not: a green run is *weak* evidence for the
 absence of the double free.  The window is a handful of instructions wide and
 an uninstrumented build will usually miss it.  The value of this test is as a
-crash and ASan/UBSan *driver* -- run under ``.github/workflows/sanitize.yml``
-instrumentation, a second teardown of the same process becomes a hard failure.
+crash and ASan/UBSan *driver*: under that instrumentation, a second teardown of
+the same process becomes a hard failure.  It needs a --debug build, and no leg
+of this repository's CI runs it on one today; run it by hand on such a build.
 Read a pass as "workers died hard under load, the router noticed each one, and
 the daemon kept serving correctly", nothing stronger.
 
@@ -153,6 +154,17 @@ def test_process_abrupt_teardown(skip_alert, skip_fds_check):
     assert 'success' in client.conf(
         {"listen_threads": LISTEN_THREADS}, 'settings'
     ), 'listen_threads'
+
+    # The direct evidence below - "port remove pid <pid> handler" is logged by
+    # nxt_port_remove_pid() itself - is nxt_debug(), compiled out unless Unit
+    # was configured with --debug.  Skip loudly rather than let the test
+    # degrade into a smoke test that never checks the site it names.  Ask the
+    # log before the workload, not after it: on a release build the kills can
+    # lose a request (https://github.com/freeunitorg/freeunit/issues/665) and
+    # fail the run for a bug this test does not check.  client.load() and the
+    # settings PUT above already wrote debug records in a --debug build.
+    if not Log.findall(r'\[debug\]'):
+        pytest.skip('remove_pid evidence needs a --debug build')
 
     assert client.post(body='ping', read_timeout=READ_TIMEOUT)['status'] == 200
 
@@ -303,13 +315,7 @@ def test_process_abrupt_teardown(skip_alert, skip_fds_check):
             f'main process did not report the death of {pid}'
         )
 
-    # The direct evidence - "port remove pid <pid> handler" is logged by
-    # nxt_port_remove_pid() itself - is nxt_debug(), compiled out unless Unit
-    # was configured with --debug.  Skip loudly rather than let the test
-    # degrade into a smoke test that never checks the site it names.
-    if '[debug]' not in log:
-        pytest.skip('remove_pid evidence needs a --debug build')
-
+    # The direct evidence, checked for above.
     for pid in set(killed):
         assert f'port remove pid {pid} handler' in log, (
             f'nxt_port_remove_pid() did not run for {pid}'

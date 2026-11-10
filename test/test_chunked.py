@@ -1,8 +1,10 @@
 import re
 import socket
+import sys
 import time
 
 import pytest
+from conftest import pid_by_name
 from unit.applications.lang.python import ApplicationPython
 from unit import port as port_map
 
@@ -76,6 +78,95 @@ def test_chunked_pipeline():
     assert len(re.findall('Content-Length: 1', resp)) == 2
     assert len(re.findall('$', resp)) == 1
     assert len(re.findall('%', resp)) == 1
+
+    continue_resp = b'HTTP/1.1 100 Continue\r\n\r\n'
+
+    def read_continue(sock):
+        data = b''
+        sock.settimeout(5)
+
+        while len(data) < len(continue_resp):
+            part = sock.recv(len(continue_resp) - len(data))
+            if not part:
+                break
+
+            data += part
+
+        assert data == continue_resp
+
+    # Pipelined request arriving in the same body read after "0\r\n\r\n".
+    sock = client.http(
+        b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+        b'Expect: 100-continue\r\n'
+        b'Transfer-Encoding: chunked\r\n\r\n',
+        raw=True,
+        no_recv=True,
+    )
+    read_continue(sock)
+    sock.sendall(
+        b'1\r\n$\r\n0\r\n\r\n'
+        b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+        b'Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n'
+        b'1\r\n%\r\n0\r\n\r\n'
+    )
+    resp = client.recvall(sock, read_timeout=5).decode()
+    sock.close()
+
+    assert len(re.findall('200 OK', resp)) == 2
+    assert len(re.findall('Content-Length: 1', resp)) == 2
+    assert len(re.findall(r'\$', resp)) == 1
+    assert len(re.findall('%', resp)) == 1
+
+    # S2: Content-Length larger than body_buffer_size (16 KiB) with a
+    # pipelined second request arriving in the final body read.
+    sock = client.http(
+        b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+        b'Expect: 100-continue\r\n'
+        b'Content-Length: 17000\r\n\r\n',
+        raw=True,
+        no_recv=True,
+    )
+    read_continue(sock)
+    sock.sendall(
+        b'a' * 17000
+        + b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+        b'Content-Length: 1\r\nConnection: close\r\n\r\n%'
+    )
+    resp = client.recvall(sock, read_timeout=5).decode()
+    sock.close()
+
+    assert len(re.findall('200 OK', resp)) == 2
+    assert len(re.findall('Content-Length: 17000', resp)) == 1
+    assert len(re.findall('Content-Length: 1\r\n', resp)) == 1
+    assert 'a' * 17000 in resp
+    assert resp.endswith('\r\n\r\n%')
+
+    # S3: Chunked file-backed body split across CHUNK_MIDDLE in the first
+    # read ("1000\r\nabc") and the remaining 4093 chunk bytes + "0\r\n\r\n"
+    # + pipelined request in the second read.
+    sock = client.http(
+        b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+        b'Expect: 100-continue\r\n'
+        b'Transfer-Encoding: chunked\r\n\r\n'
+        b'1000\r\nabc',
+        raw=True,
+        no_recv=True,
+    )
+    read_continue(sock)
+    sock.sendall(
+        b'a' * 4093
+        + b'\r\n0\r\n\r\n'
+        + b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+        b'Content-Length: 1\r\nConnection: close\r\n\r\n%'
+    )
+    resp = client.recvall(sock, read_timeout=5).decode()
+    sock.close()
+
+    assert len(re.findall('200 OK', resp)) == 2
+    assert len(re.findall('Content-Length: 4096', resp)) == 1
+    assert len(re.findall('Content-Length: 1\r\n', resp)) == 1
+    assert 'abc' + 'a' * 4093 in resp
+    assert resp.endswith('\r\n\r\n%')
 
 
 def test_chunked_max_body_size():
@@ -273,7 +364,118 @@ def test_chunked_trailer():
     check_invalid(f'X: {"a" * 4200}\r\n', 'oversized trailer')
 
 
+def test_chunked_extension():
+    # RFC 9112, 7.1.1: chunk-ext = *( BWS ";" BWS chunk-ext-name
+    # [ BWS "=" BWS chunk-ext-val ] ).  A valid extension is ignored.  Any
+    # other bytes before the CRLF were skipped, so a peer that frames the
+    # body another way could disagree with Unit about where it ends.
+    # https://github.com/freeunitorg/freeunit/issues/916
+    head = (
+        b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+        b'Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n'
+    )
+
+    rest = b'hello\r\n0\r\n\r\n'
+
+    def post(*writes):
+        # Each write after the first goes in its own read.  The short read
+        # timeout ends the wait for a request that hangs: the response is
+        # then empty and has no status.
+        sock = client.http(head + writes[0], raw=True, no_recv=True)
+
+        for w in writes[1:]:
+            time.sleep(0.2)
+            sock.sendall(w)
+
+        resp = client.recvall(sock, read_timeout=5).decode()
+        sock.close()
+
+        return client._resp_to_dict(resp)
+
+    for size_line in [
+        b'5;a\r\n',
+        b'5;a=b\r\n',
+        b'5;a=b;c;d=e\r\n',
+        b'5 ;a\r\n',
+        b'5\t;a=b\r\n',
+        b'5; a = b ;\tc\r\n',
+        b'5;a=""\r\n',
+        b'5;a="b \\"c\\" ;d=e"\r\n',
+        b'5;a="\\\\";b=c\r\n',
+    ]:
+        resp = post(size_line + rest)
+
+        assert resp.get('status') == 200, size_line
+        assert resp['body'] == 'hello', size_line
+
+    # The extension split across reads.
+    resp = post(b'5;a="b', b' c";d', b'=e\r\n' + rest)
+    assert resp.get('status') == 200, 'split extension'
+    assert resp['body'] == 'hello', 'split extension'
+
+    accepted = []
+
+    for size_line, reason in [
+        # The rows of the issue.
+        (b'5;\r\n', 'bare ";"'),
+        (b'5;bad[=x\r\n', 'non-token name'),
+        (b'5;\0ext\r\n', 'NUL'),
+        (b'5;\n', 'bare LF'),
+        # More of the grammar.
+        (b'5;a\rb\r\n', 'bare CR'),
+        (b'5;a\n\r\n', 'bare LF after the name'),
+        (b'5;a;\r\n', 'trailing ";"'),
+        (b'5;=b\r\n', 'empty name'),
+        (b'5;a=\r\n', 'empty value'),
+        (b'5;a=b c\r\n', 'space in the value'),
+        (b'5;a \r\n', 'space before the CRLF'),
+        (b'5 \r\n', 'space after the size, no extension'),
+        (b'5;a="b\r\n', 'unterminated quoted-string'),
+        (b'5;a="b\0"\r\n', 'NUL in a quoted-string'),
+    ]:
+        status = post(size_line + rest).get('status')
+
+        if status != 400:
+            accepted.append((reason, status))
+
+    resp = post(b'5;a="b', b'\0"\r\n' + rest)
+
+    if resp.get('status') != 400:
+        accepted.append(('split extension with NUL', resp.get('status')))
+
+    # All of them in one assert, to see every row that is not refused.
+    # A status of None is no response within the read timeout.
+    assert not accepted, accepted
+
+
 def test_chunked_transform():
+    assert 'success' in client.conf(
+        [
+            {
+                "match": {"headers": {"Content-Length": "5"}},
+                "action": {
+                    "return": 200,
+                    "response_headers": {"X-CL": "$header_content_length"},
+                },
+            }
+        ],
+        'routes',
+    )
+    assert 'success' in client.conf(
+        {"*:8080": {"pass": "routes"}}, 'listeners'
+    )
+
+    resp = client.get(
+        headers={
+            'Host': 'localhost',
+            'Connection': 'close',
+            'Transfer-Encoding': 'chunked',
+        },
+        body='5\r\nhello\r\n0\r\n\r\n',
+    )
+    assert resp['status'] == 200
+    assert resp['headers']['X-CL'] == '5'
+
     assert 'success' in client.conf(
         {"http": {"chunked_transform": False}}, 'settings'
     )
@@ -289,6 +491,126 @@ def test_chunked_transform():
         )['status']
         == 411
     )
+
+    assert 'success' in client.conf(
+        {"*:8080": {"pass": "applications/mirror"}}, 'listeners'
+    )
+
+
+def _proc_field(path, name):
+    try:
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                if line.startswith(name + ':'):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        return None
+
+    return None
+
+
+@pytest.mark.skipif(
+    sys.platform != 'linux',
+    reason='reads the router /proc/<pid>/status and /proc/<pid>/io',
+)
+def test_chunked_body_memory():
+    # Each decoded chunk is one buffer from the request memory pool.  The
+    # router frees the buffers as it writes them, one writev() per parsed
+    # read buffer, so it holds a bounded number of them and makes one write
+    # per read, not one per chunk.  Reads the router's peak RSS and write
+    # syscall count from /proc.
+    assert 'success' in client.conf([{"action": {"return": 200}}], 'routes')
+    assert 'success' in client.conf(
+        {"*:8080": {"pass": "routes"}}, 'listeners'
+    )
+
+    router = pid_by_name('unit: router')
+    assert router is not None, 'router pid'
+
+    status = f'/proc/{router}/status'
+    io = f'/proc/{router}/io'
+
+    hwm0 = _proc_field(status, 'VmHWM')
+    syscw0 = _proc_field(io, 'syscw')
+    vmpeak = _proc_field(status, 'VmPeak')
+
+    if hwm0 is None or syscw0 is None:
+        pytest.skip('router /proc/<pid>/{status,io} is unreadable')
+
+    # n is large enough that one held buffer per chunk would raise the
+    # router's peak RSS above the heap high-water mark that an earlier test
+    # in the same unitd leaves (glibc keeps freed pages resident), so the
+    # RSS bound can fail in a shared unitd too.  The decoded body, n bytes,
+    # is under the default max_body_size, so this is not a 413.
+    n = 1000000
+    body = b'1\r\nx\r\n' * n + b'0\r\n\r\n'
+
+    resp = client.post(
+        headers={
+            'Host': 'localhost',
+            'Connection': 'close',
+            'Transfer-Encoding': 'chunked',
+        },
+        body=body,
+    )
+    assert resp['status'] == 200
+
+    hwm1 = _proc_field(status, 'VmHWM')
+    syscw1 = _proc_field(io, 'syscw')
+
+    assert hwm1 is not None and syscw1 is not None
+
+    # The write bound is relative to n.  One writev() per read buffer is a
+    # few hundred writes for this body on a release build (382 measured),
+    # and about n/8 on a debug build, where the debug log lines of the
+    # memory pool's malloc, free and posix_memalign calls are writes too
+    # (116,242 measured).  One write per chunk would be at least n.
+    syscalls = syscw1 - syscw0
+
+    assert syscalls < n // 2, f'{syscalls} write syscalls for {n} chunks'
+
+    # The RSS bound runs only on an uninstrumented build.  AddressSanitizer
+    # reserves a shadow of terabytes (VmPeak) and grows RSS for this
+    # workload however the slices are handled; the write bound above still
+    # holds under it.
+    if vmpeak is not None and vmpeak < 100 * 1024 * 1024:
+        peak_growth = hwm1 - hwm0
+
+        assert peak_growth < 10000, (
+            f'router peak RSS grew {peak_growth} kB for {n} chunks'
+        )
+
+
+def test_chunked_many_chunks_body():
+    # More chunks in a read than one writev() takes.  The router moves the
+    # slices beyond the first ones down in the read buffer and writes them
+    # with one call, so a wrong move shows in the body that the application
+    # gets back.  The chunks have 1 to 13 bytes, so the size lines use the
+    # hex digits 1 to 9 and a to d, and the reads cut the chunks at
+    # different places.
+    chunks = []
+
+    for i in range(20000):
+        chunks.append(
+            ''.join(chr(97 + (i + j) % 26) for j in range(1 + i % 13))
+        )
+
+    body = ''.join(f'{len(c):x}\r\n{c}\r\n' for c in chunks) + '0\r\n\r\n'
+
+    resp = client.get(
+        headers={
+            'Host': 'localhost',
+            'Connection': 'close',
+            'Transfer-Encoding': 'chunked',
+        },
+        body=body,
+    )
+
+    expect_body = ''.join(chunks)
+
+    assert resp['status'] == 200, 'status'
+    assert resp['headers']['Content-Length'] == str(len(expect_body)), 'length'
+    assert resp['body'] == expect_body, 'body'
 
 
 def test_chunked_invalid():
@@ -358,6 +680,40 @@ def test_chunked_invalid():
         )['status']
         == 400
     ), 'Transfer-Encoding HTTP/1.0'
+
+
+def test_chunked_coding_case():
+    # RFC 9112, 7: transfer coding names are case-insensitive.
+    def post(fields):
+        return client.http(
+            b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+            + fields
+            + b'Connection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n',
+            raw=True,
+        )
+
+    for coding in [b'chunked', b'Chunked', b'CHUNKED', b'cHuNkEd']:
+        resp = post(b'Transfer-Encoding: ' + coding + b'\r\n')
+
+        assert resp['status'] == 200, coding
+        assert resp['body'] == 'hello', coding
+
+    # "chunked" twice, or with Content-Length, is a bad request in any
+    # letter case.
+    resp = post(
+        b'Transfer-Encoding: Chunked\r\nTransfer-Encoding: chunked\r\n'
+    )
+    assert resp['status'] == 400, 'two Transfer-Encoding lines'
+
+    resp = post(b'Transfer-Encoding: CHUNKED\r\nContent-Length: 5\r\n')
+    assert resp['status'] == 400, 'Transfer-Encoding and Content-Length'
+
+    # The value must be one "chunked": a list is not supported, also when
+    # its other element is empty.
+    for coding in [b'chunked,', b'Chunked, ', b'gzip, chunked']:
+        resp = post(b'Transfer-Encoding: ' + coding + b'\r\n')
+
+        assert resp['status'] == 501, coding
 
 
 def test_chunked_split_reads():

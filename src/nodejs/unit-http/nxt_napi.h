@@ -72,6 +72,21 @@ struct nxt_napi {
 
 
     inline napi_value
+    create_buffer_copy(const void *data, size_t size)
+    {
+        napi_value   res;
+        napi_status  status;
+
+        status = napi_create_buffer_copy(env_, size, data, NULL, &res);
+        if (status != napi_ok) {
+            throw exception("Failed to create buffer copy");
+        }
+
+        return res;
+    }
+
+
+    inline napi_value
     create_function(const char *name, size_t len, napi_callback cb, void *data)
     {
         napi_value   res;

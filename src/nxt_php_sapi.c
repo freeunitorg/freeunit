@@ -25,8 +25,6 @@
 
 #if (PHP_VERSION_ID >= 70100)
 #define NXT_HAVE_PHP_LOG_MESSAGE_WITH_SYSLOG_TYPE 1
-#else
-#define NXT_HAVE_PHP_INTERRUPTS 1
 #endif
 
 #if (PHP_VERSION_ID >= 70000)
@@ -353,66 +351,37 @@ PHP_FUNCTION(fastcgi_finish_request)
 }
 
 
+/*
+ * Designated initializers: only the members the module sets are listed, the
+ * rest are zero.  PHP adds and removes members of sapi_module_struct (8.7
+ * removed terminate_process, get_fd, force_http_10, get_target_uid and
+ * get_target_gid), and a positional list then shifts every member after the
+ * change; without -Werror that is a silent mismatch.  A removed member that
+ * is named here fails to compile instead.
+ */
 static sapi_module_struct  nxt_php_sapi_module =
 {
-    (char *) "cli-server",
-    (char *) "unit",
+    .name                      = (char *) "cli-server",
+    .pretty_name               = (char *) "unit",
 
-    nxt_php_startup,             /* startup */
-    php_module_shutdown_wrapper, /* shutdown */
+    .startup                   = nxt_php_startup,
+    .shutdown                  = php_module_shutdown_wrapper,
 
-    NULL,                        /* activate */
-    NULL,                        /* deactivate */
+    .ub_write                  = nxt_php_unbuffered_write,
+    .flush                     = nxt_php_flush,
 
-    nxt_php_unbuffered_write,    /* unbuffered write */
-    nxt_php_flush,               /* flush */
-    NULL,                        /* get uid */
-    NULL,                        /* getenv */
+    .sapi_error                = php_error,
 
-    php_error,                   /* error handler */
+    .send_headers              = nxt_php_send_headers,
 
-    NULL,                        /* header handler */
-    nxt_php_send_headers,        /* send headers handler */
-    NULL,                        /* send header handler */
+    .read_post                 = nxt_php_read_post,
+    .read_cookies              = nxt_php_read_cookies,
 
-    nxt_php_read_post,           /* read POST data */
-    nxt_php_read_cookies,        /* read Cookies */
+    .register_server_variables = nxt_php_register_variables,
+    .log_message               = nxt_php_log_message,
 
-    nxt_php_register_variables,  /* register server variables */
-    nxt_php_log_message,         /* log message */
-    NULL,                        /* get request time */
-    NULL,                        /* terminate process */
-
-    NULL,                        /* php_ini_path_override */
-#ifdef NXT_HAVE_PHP_INTERRUPTS
-    NULL,                        /* block_interruptions */
-    NULL,                        /* unblock_interruptions */
-#endif
-    NULL,                        /* default_post_reader */
-    NULL,                        /* treat_data */
-    NULL,                        /* executable_location */
-
-    0,                           /* php_ini_ignore */
 #ifdef NXT_HAVE_PHP_IGNORE_CWD
-    1,                           /* php_ini_ignore_cwd */
-#endif
-    NULL,                        /* get_fd */
-
-    NULL,                        /* force_http_10 */
-
-    NULL,                        /* get_target_uid */
-    NULL,                        /* get_target_gid */
-
-    NULL,                        /* input_filter */
-
-    NULL,                        /* ini_defaults */
-    0,                           /* phpinfo_as_text */
-
-    NULL,                        /* ini_entries */
-    NULL,                        /* additional_functions */
-    NULL,                        /* input_filter_init */
-#if NXT_PHP_PRE_REQUEST_INIT
-    NULL,                        /* pre_request_init */
+    .php_ini_ignore_cwd        = 1,
 #endif
 };
 
@@ -1173,6 +1142,11 @@ nxt_php_request_handler(nxt_unit_request_info_t *req)
 
     r = req->request;
     app_target = r->app_target;
+    if (nxt_slow_path(app_target >= nxt_php_targets_count)) {
+        nxt_unit_request_done(req, NXT_UNIT_ERROR);
+        return;
+    }
+
     target = &nxt_php_targets[app_target];
 
     nxt_memzero(&ctx, sizeof(ctx));
@@ -1543,17 +1517,30 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
 #else
     if (nxt_slow_path(php_request_startup(TSRMLS_C) == FAILURE)) {
 #endif
-        nxt_unit_req_debug(ctx->req, "php_request_startup() failed");
+        nxt_unit_req_alert(ctx->req,
+                           "php_request_startup() failed, the worker exits");
 
 #if (PHP_VERSION_ID >= 80100)
         PG(display_errors) = display_errors;
 #endif
+        SG(server_context) = NULL;
         nxt_unit_request_done(ctx->req, NXT_UNIT_ERROR);
 #if (PHP_VERSION_ID < 80100)
         fclose(fp);
 #endif
 
-        return;
+        /*
+         * The engine left php_request_startup() in the middle of its setup.
+         * There is no valid request to shut down, so nothing resets the state
+         * that the failed setup built, and the next request would start on
+         * top of it.  PHP-FPM ends its child process in this case.  The error
+         * is on the wire already, and the router starts a replacement worker
+         * when the application needs one.  A PHP worker has one thread, so
+         * the exit stops no other script.  SG(server_context) is NULL above,
+         * so a PHP message that is logged on the way out goes to the context
+         * log and not to the released request (nxt_php_log_message()).
+         */
+        exit(1);
     }
 
     /*
@@ -1643,6 +1630,8 @@ shutdown:
 #endif
 
     php_request_shutdown(NULL);
+
+    SG(server_context) = NULL;
 
     if (ctx->req != NULL) {
         nxt_unit_request_done(ctx->req, NXT_UNIT_OK);
@@ -1783,6 +1772,29 @@ nxt_php_send_headers(sapi_headers_struct *sapi_headers TSRMLS_DC)
          h = zend_llist_get_next_ex(&sapi_headers->headers, &zpos))
     {
         resp_size += h->header_len;
+
+        /*
+         * libunit stores the name length in a uint8_t: a longer name would
+         * go out cut to its length modulo 256.  Answer 500 instead.  Output
+         * is disabled after SAPI_HEADER_SEND_FAILED, so the body is empty.
+         * PHP sends the headers again at request shutdown after a failure.
+         * The response is initialized then, so log only the first time.
+         */
+        colon = memchr(h->header, ':', h->header_len);
+        if (nxt_slow_path(colon != NULL
+                          && (size_t) (colon - h->header) > UINT8_MAX))
+        {
+            if (!nxt_unit_response_is_init(req)) {
+                nxt_unit_req_error(req, "response header name is too long "
+                                   "(%zu bytes, the limit is %d)",
+                                   (size_t) (colon - h->header), UINT8_MAX);
+            }
+
+            (void) nxt_unit_response_init(req, NXT_HTTP_INTERNAL_SERVER_ERROR,
+                                          0, 0);
+
+            return SAPI_HEADER_SEND_FAILED;
+        }
     }
 
     status = SG(sapi_headers).http_response_code;

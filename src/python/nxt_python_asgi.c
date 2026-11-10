@@ -463,6 +463,11 @@ nxt_py_asgi_request_handler(nxt_unit_request_info_t *req)
     nxt_python_target_t     *target;
     nxt_py_asgi_ctx_data_t  *ctx_data;
 
+    if (nxt_slow_path(req->request->app_target >= nxt_py_targets->count)) {
+        nxt_unit_request_done(req, NXT_UNIT_ERROR);
+        return;
+    }
+
     if (req->request->websocket_handshake) {
         asgi = nxt_py_asgi_websocket_create(req);
 
@@ -532,6 +537,8 @@ nxt_py_asgi_request_handler(nxt_unit_request_info_t *req)
     if (nxt_slow_path(PyDict_SetItem(scope, nxt_py_state_str, newstate)
                       == -1))
     {
+        nxt_unit_req_alert(req, "Python failed to set 'scope.state' item");
+        nxt_unit_request_done(req, NXT_UNIT_ERROR);
         Py_DECREF(newstate);
         goto release_scope;
     }
@@ -698,8 +705,9 @@ nxt_py_asgi_create_http_scope(nxt_unit_request_info_t *req,
     }
 
     p = nxt_unit_sptr_get(&r->version);
-    SET_ITEM(scope, http_version, p[7] == '1' ? nxt_py_1_1_str
-                                              : nxt_py_1_0_str)
+    SET_ITEM(scope, http_version,
+             (r->version_length >= 8 && p[7] == '1') ? nxt_py_1_1_str
+                                                     : nxt_py_1_0_str)
     SET_ITEM(scope, scheme, scheme)
 
     if (!r->websocket_handshake) {
@@ -794,6 +802,8 @@ nxt_py_asgi_create_http_scope(nxt_unit_request_info_t *req,
 
         if (f->hash == NXT_UNIT_HASH_WS_PROTOCOL
             && f->name_length == ws_protocol.length
+            && nxt_memcasecmp(nxt_unit_sptr_get(&f->name), ws_protocol.start,
+                              ws_protocol.length) == 0
             && f->value_length > 0
             && r->websocket_handshake)
         {
@@ -854,6 +864,7 @@ nxt_py_asgi_create_address(nxt_unit_sptr_t *sptr, uint8_t len, uint16_t port)
             return NULL;
         }
 
+        Py_INCREF(Py_None);
         PyTuple_SET_ITEM(pair, 0, v);
         PyTuple_SET_ITEM(pair, 1, Py_None);
 
@@ -1000,6 +1011,19 @@ nxt_py_asgi_create_subprotocols(nxt_unit_field_t *f)
         }
 
         PyTuple_SET_ITEM(res, n, proto);
+
+        n++;
+    }
+
+    /*
+     * The tuple was sized to the comma count plus one, but an empty segment
+     * -- a leading, trailing or doubled comma, or a comma then only spaces --
+     * fills no slot.  Shrink the tuple to the slots actually set, so no NULL
+     * element is left for the application to iterate over or index, which
+     * would crash the worker.
+     */
+    if (nxt_slow_path(_PyTuple_Resize(&res, n) != 0)) {
+        return NULL;
     }
 
     return res;
@@ -1163,6 +1187,7 @@ nxt_py_asgi_shm_ack_handler(nxt_unit_ctx_t *ctx)
         }
 
         nxt_queue_remove(lnk);
+        lnk->next = NULL;
     }
 }
 
@@ -1412,14 +1437,29 @@ nxt_py_asgi_add_field(void *data, int i, PyObject *name, PyObject *val)
     nxt_unit_request_info_t      *req;
     nxt_py_asgi_add_field_ctx_t  *ctx;
 
+    ctx = data;
+    req = ctx->req;
+
+    /*
+     * libunit stores the name length in a uint8_t.  Check the full
+     * Py_ssize_t length, before it is narrowed.
+     */
+    if (nxt_slow_path(PyBytes_GET_SIZE(name) > UINT8_MAX)) {
+        nxt_unit_req_error(req, "header #%d name is too long "
+                           "(%zd bytes, the limit is %d)",
+                           i, PyBytes_GET_SIZE(name), UINT8_MAX);
+
+        return PyErr_Format(PyExc_ValueError,
+                            "header #%d name is too long (%zd bytes, "
+                            "the limit is %d)",
+                            i, PyBytes_GET_SIZE(name), UINT8_MAX);
+    }
+
     name_str = PyBytes_AS_STRING(name);
     name_len = PyBytes_GET_SIZE(name);
 
     val_str = PyBytes_AS_STRING(val);
     val_len = PyBytes_GET_SIZE(val);
-
-    ctx = data;
-    req = ctx->req;
 
     rc = nxt_unit_response_add_field(req, name_str, name_len,
                                      val_str, val_len);
@@ -1428,7 +1468,9 @@ nxt_py_asgi_add_field(void *data, int i, PyObject *name, PyObject *val)
                             "failed to add header #%d", i);
     }
 
-    if (req->response->fields[i].hash == NXT_UNIT_HASH_CONTENT_LENGTH) {
+    if (req->response->fields[i].hash == NXT_UNIT_HASH_CONTENT_LENGTH
+        && nxt_python_is_content_length(name_str, name_len))
+    {
         content_length = nxt_off_t_parse((u_char *) val_str, val_len);
         if (nxt_slow_path(content_length < 0)) {
             nxt_unit_req_error(req, "failed to parse Content-Length "

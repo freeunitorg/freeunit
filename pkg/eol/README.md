@@ -40,7 +40,7 @@ Dates are compared per category against the field that carries *standard* suppor
 
 ### Runtimes — warnings
 
-None. All shipped runtimes are within (or ahead of) upstream EOL; `go 1.25`, `node 20` and `perl 5.38` are already flagged `(EOL)` in the matrix.
+None. All shipped runtimes are within (or ahead of) upstream EOL; `go 1.25` and `perl 5.38` are already flagged `(EOL)` in the matrix. `node 20` was flagged too. It has since been dropped before its grace window ended, because Node.js 20 receives no fix for CVE-2026-111497.
 
 ### OS — warnings
 

@@ -43,21 +43,6 @@ typedef struct {
     nxt_cpymem(dst, src, len)
 
 
-#if (NXT_HAVE_CASELESS_FILESYSTEM)
-
-/* MacOSX, Cygwin. */
-
-#define nxt_file_name_eq(fn1, fn2)                                            \
-    (nxt_strcasecmp(fn1, fn2) == 0)
-
-#else
-
-#define nxt_file_name_eq(fn1, fn2)                                            \
-    (nxt_strcmp(fn1, fn2) == 0)
-
-#endif
-
-
 #define nxt_file_name_is_absolute(name)                                       \
     (name[0] == '/')
 
@@ -165,6 +150,17 @@ NXT_EXPORT nxt_int_t nxt_file_openat2(nxt_task_t *task, nxt_file_t *file,
 #define NXT_FILE_NOFOLLOW           0
 #endif
 
+/*
+ * nxt_file_open() opens every file close-on-exec.  Only an external
+ * application process calls exec(), and no file that Unit opens is for it:
+ * its stdout and stderr are dup2() copies, which do not keep the flag.
+ */
+#if defined(O_CLOEXEC)
+#define NXT_FILE_CLOEXEC            O_CLOEXEC
+#else
+#define NXT_FILE_CLOEXEC            0
+#endif
+
 
 /* The file creation modes. */
 #define NXT_FILE_CREATE_OR_OPEN     O_CREAT
@@ -231,6 +227,7 @@ NXT_EXPORT nxt_int_t nxt_file_dir_sync(nxt_task_t *task,
 
 NXT_EXPORT nxt_int_t nxt_fd_nonblocking(nxt_task_t *task, nxt_fd_t fd);
 NXT_EXPORT nxt_int_t nxt_fd_blocking(nxt_task_t *task, nxt_fd_t fd);
+NXT_EXPORT nxt_int_t nxt_fd_cloexec(nxt_task_t *task, nxt_fd_t fd);
 NXT_EXPORT ssize_t nxt_fd_write(nxt_fd_t fd, u_char *buf, size_t size);
 NXT_EXPORT ssize_t nxt_fd_read(nxt_fd_t fd, u_char *buf, size_t size);
 NXT_EXPORT void nxt_fd_close(nxt_fd_t fd);

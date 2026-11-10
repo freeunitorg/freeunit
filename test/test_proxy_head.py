@@ -53,6 +53,10 @@ UPSTREAM_PORT = port_map.port(7978)
 UPSTREAM_RESPONSES = {
     '/cl10': 'HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n',
     '/chunked': 'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n',
+    '/chunked_empty': (
+        'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n'
+        'X-Tag: empty-chunked\r\n\r\n0\r\n\r\n'
+    ),
     '/204': 'HTTP/1.1 204 No Content\r\nContent-Length: 10\r\n\r\n',
     '/304': 'HTTP/1.1 304 Not Modified\r\nContent-Length: 10\r\n\r\n',
     # Header block and 10 junk bytes in a single write, so the bytes land in
@@ -287,3 +291,27 @@ def test_proxy_get_body_still_relayed():
 
     assert raw.count('HTTP/1.1 200') == 2, f'expected two responses: {raw!r}'
     assert raw.count('\r\n\r\nOK') == 2, f'both bodies relayed: {raw!r}'
+
+
+def test_proxy_chunked_empty_response_header_variable(wait_for_record):
+    """Coverage: upstream chunked response with "0\r\n\r\n" in the header read
+    keeps its header buffer valid for $response_header_* in the access log.
+    """
+
+    assert 'success' in client.conf(
+        {
+            'path': f'{option.temp_dir}/access.log',
+            'format': '$request_line "$response_header_x_tag"\n',
+        },
+        'access_log',
+    ), 'access_log format'
+
+    raw = pipeline('GET', '/chunked_empty')
+    assert raw.count('HTTP/1.1 200') == 2, f'expected two responses: {raw!r}'
+
+    assert (
+        wait_for_record(
+            r'GET /chunked_empty HTTP/1.1 "empty-chunked"', 'access.log'
+        )
+        is not None
+    ), 'X-Tag readable from the access log after empty chunked response'

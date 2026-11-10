@@ -223,67 +223,38 @@ def test_no_body_status_app_transfer_encoding():
         sock.close()
 
 
-def test_no_body_status_response_headers_content_length():
-    """Framing headers added by "response_headers" must go too.
+def test_no_body_status_response_headers_rejected():
+    """Body length fields can not be added with "response_headers".
 
-    They are added as generic fields, without setting r->resp.content_length,
-    so skipping that one pointer is not enough.  Note the lowercase name: the
-    config validator rejects "Content-Length" here, but with a case-sensitive
-    memcmp (nxt_conf_vldt_response_header()), so "content-length" is accepted
-    and reaches the response.  Transfer-Encoding is not guarded at all.
+    The config validator rejects them in any letter case, so they never
+    reach a 204/304 response this way.
     """
 
     php_dir = f'{option.test_dir}/php'
 
-    assert 'success' in client.conf(
-        {
-            "listeners": {"*:8080": {"pass": "routes"}},
-            "routes": [
-                {
-                    # Scoped to the 204 so the follow-up 200 on the same
-                    # connection is framed by the application alone.
-                    "match": {"arguments": {"status": "204"}},
-                    "action": {
-                        "pass": "applications/no_body_status",
-                        "response_headers": {
-                            "content-length": "10",
-                            "Transfer-Encoding": "chunked",
+    for headers in (
+        {"content-length": "10"},
+        {"Transfer-Encoding": "chunked"},
+    ):
+        assert 'error' in client.conf(
+            {
+                "listeners": {"*:8080": {"pass": "routes"}},
+                "routes": [
+                    {
+                        "action": {
+                            "pass": "applications/no_body_status",
+                            "response_headers": headers,
                         },
                     },
+                ],
+                "applications": {
+                    "no_body_status": {
+                        "type": client.get_application_type(),
+                        "processes": {"spare": 0},
+                        "root": f'{php_dir}/no_body_status',
+                        "working_directory": f'{php_dir}/no_body_status',
+                        "index": "index.php",
+                    }
                 },
-                {"action": {"pass": "applications/no_body_status"}},
-            ],
-            "applications": {
-                "no_body_status": {
-                    "type": client.get_application_type(),
-                    "processes": {"spare": 0},
-                    "root": f'{php_dir}/no_body_status',
-                    "working_directory": f'{php_dir}/no_body_status',
-                    "index": "index.php",
-                }
-            },
-        }
-    ), 'response_headers configuration'
-
-    raw, sock = request_raw('/?status=204')
-
-    try:
-        head, rest = split_response(raw)
-
-        assert ' 204 ' in head.split('\r\n')[0], 'status line'
-        assert (
-            'content-length' not in head.lower()
-        ), f'response_headers Content-Length kept on 204: {head!r}'
-        assert (
-            'transfer-encoding' not in head.lower()
-        ), f'response_headers Transfer-Encoding kept on 204: {head!r}'
-        assert SMUGGLED not in raw, f'body forwarded on 204: {raw!r}'
-        assert rest == '', f'trailing bytes after header: {rest!r}'
-
-        resp = client.get(sock=sock, url='/?status=200', headers=CLOSE)
-
-        assert resp['status'] == 200, 'keep-alive: status'
-        assert resp['body'] == SMUGGLED, 'keep-alive: body'
-
-    finally:
-        sock.close()
+            }
+        ), f'response_headers {headers!r} rejected'

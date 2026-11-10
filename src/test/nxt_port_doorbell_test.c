@@ -14,9 +14,10 @@
  *
  * The leg replays the router's send sequence from
  * nxt_router_app_prepare_request() against a real non-blocking datagram
- * socketpair whose reader never reads: enqueue, decide, skip the doorbell
- * when nxt_port_socket_backlogged(), otherwise write it; then the "worker"
- * dequeues the item.  The heap queue must hold at most the one doorbell
+ * socketpair whose reader never reads: enqueue, then
+ * nxt_port_socket_doorbell(), which skips the doorbell when the port is
+ * backlogged and writes it otherwise; then the "worker" dequeues the item.
+ * The heap queue must hold at most the one doorbell
  * that met EAGAIN, and the sequence must still have asked for a doorbell
  * on every item (the condition the gate exists for).
  */
@@ -81,7 +82,7 @@ nxt_port_doorbell_test(nxt_thread_t *thr)
     uint8_t                buf[NXT_APP_QUEUE_MSG_SIZE];
     uint32_t               cookie;
     nxt_fd_t               pair[2];
-    nxt_int_t              ret;
+    nxt_int_t              ret, sent;
     nxt_uint_t             i, asked, written, queued;
     nxt_task_t             *task;
     nxt_port_t             *port;
@@ -169,16 +170,13 @@ nxt_port_doorbell_test(nxt_thread_t *thr)
             asked++;
 
             /* The gate in nxt_router_app_prepare_request(). */
-            if (!nxt_port_socket_backlogged(port)) {
-                if (nxt_port_socket_write(task, port,
-                                          NXT_PORT_MSG_READ_QUEUE, -1, i, 0,
-                                          NULL)
-                    != NXT_OK)
-                {
-                    goto done;
-                }
+            sent = nxt_port_socket_doorbell(task, port, i, 0);
 
+            if (sent == NXT_OK) {
                 written++;
+
+            } else if (sent != NXT_DONE) {
+                goto done;
             }
         }
 

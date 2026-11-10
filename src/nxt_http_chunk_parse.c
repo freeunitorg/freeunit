@@ -22,15 +22,23 @@
 #define nxt_size_is_sufficient(cs)                                            \
     (cs < ((__typeof__(cs)) 1 << (sizeof(cs) * 8 - 4)))
 
+/*
+ * HTAB, SP, VCHAR and obs-text (RFC 9110, sec 5.6.4): the byte after the "\"
+ * of a quoted-pair.  qdtext is the same set without '"' and "\".
+ */
+#define nxt_http_chunk_ext_text(ch)                                           \
+    (((ch) >= 0x20 && (ch) != 0x7f) || (ch) == '\t')
+
 
 static nxt_int_t nxt_http_chunk_buffer(nxt_http_chunk_parse_t *hcp,
     nxt_buf_t ***tail, nxt_buf_t *in);
 
 
 /*
- * Trailer field-name bytes: tchar, RFC 9110 (sec 5.6.2) -- the same token set
- * the request header parser accepts for a field-name.  Everything else is 0,
- * including SP, HTAB, ':', DEL and obs-text (%x80-FF, implicitly zero-filled).
+ * Trailer field-name and chunk-ext token bytes: tchar, RFC 9110 (sec 5.6.2) --
+ * the same token set the request header parser accepts for a field-name.
+ * Everything else is 0, including SP, HTAB, ':', ';', '=', '"', DEL and
+ * obs-text (%x80-FF, implicitly zero-filled).
  */
 static const uint8_t  nxt_http_trailer_tchar[256]  nxt_aligned(64) = {
     /* 0x00-0x0F */  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -64,7 +72,15 @@ nxt_http_chunk_parse(nxt_task_t *task, nxt_http_chunk_parse_t *hcp,
     enum {
         sw_start = 0,
         sw_chunk_size,
-        sw_chunk_ext,
+        sw_chunk_ext_name_start,
+        sw_chunk_ext_name,
+        sw_chunk_ext_name_end,
+        sw_chunk_ext_value_start,
+        sw_chunk_ext_value,
+        sw_chunk_ext_quoted,
+        sw_chunk_ext_quoted_pair,
+        sw_chunk_ext_value_end,
+        sw_chunk_ext_bws,
         sw_chunk_size_linefeed,
         sw_chunk_end_newline,
         sw_chunk_end_linefeed,
@@ -96,7 +112,7 @@ nxt_http_chunk_parse(nxt_task_t *task, nxt_http_chunk_parse_t *hcp,
 
                 if (nxt_slow_path(ret == NXT_ERROR)) {
                     hcp->error = 1;
-                    return out;
+                    goto done;
                 }
 
                 state = sw_chunk_end_newline;
@@ -146,7 +162,11 @@ nxt_http_chunk_parse(nxt_task_t *task, nxt_http_chunk_parse_t *hcp,
                         continue;
 
                     } else if (ch == ';') {
-                        state = sw_chunk_ext;
+                        state = sw_chunk_ext_name_start;
+                        continue;
+
+                    } else if (ch == ' ' || ch == '\t') {
+                        state = sw_chunk_ext_bws;
                         continue;
 
                     } else {
@@ -161,12 +181,141 @@ nxt_http_chunk_parse(nxt_task_t *task, nxt_http_chunk_parse_t *hcp,
 
                 goto chunk_error;
 
-            case sw_chunk_ext:
-                if (ch == '\r') {
-                    state = sw_chunk_size_linefeed;
+            /*
+             * chunk-ext = *( BWS ";" BWS chunk-ext-name
+             *                [ BWS "=" BWS chunk-ext-val ] ),
+             * chunk-ext-name = token, chunk-ext-val = token / quoted-string
+             * (RFC 9112, sec 7.1.1).  Extensions are ignored, but their syntax
+             * is checked: skipping to the next CR accepted any bytes, and a
+             * bare LF in an extension was taken as part of it, so the chunk
+             * data was read from the wrong place.  A peer that frames the
+             * body differently would disagree with Unit about where the
+             * request ends.  Every byte not in the grammar is a chunk_error,
+             * a bare LF and a bare CR among them.
+             */
+            case sw_chunk_ext_name_start:
+                if (ch == ' ' || ch == '\t') {
+                    continue;
                 }
 
-                continue;
+                if (nxt_fast_path(nxt_http_trailer_tchar[ch] != 0)) {
+                    state = sw_chunk_ext_name;
+                    continue;
+                }
+
+                goto chunk_error;
+
+            case sw_chunk_ext_name:
+                if (nxt_http_trailer_tchar[ch] != 0) {
+                    continue;
+                }
+
+                if (ch == '\r') {
+                    state = sw_chunk_size_linefeed;
+                    continue;
+                }
+
+                nxt_fallthrough;
+
+            case sw_chunk_ext_name_end:
+                switch (ch) {
+                case ' ':
+                case '\t':
+                    state = sw_chunk_ext_name_end;
+                    continue;
+                case '=':
+                    state = sw_chunk_ext_value_start;
+                    continue;
+                case ';':
+                    state = sw_chunk_ext_name_start;
+                    continue;
+                }
+
+                goto chunk_error;
+
+            case sw_chunk_ext_value_start:
+                if (ch == ' ' || ch == '\t') {
+                    continue;
+                }
+
+                if (ch == '"') {
+                    state = sw_chunk_ext_quoted;
+                    continue;
+                }
+
+                if (nxt_fast_path(nxt_http_trailer_tchar[ch] != 0)) {
+                    state = sw_chunk_ext_value;
+                    continue;
+                }
+
+                goto chunk_error;
+
+            case sw_chunk_ext_value:
+                if (nxt_http_trailer_tchar[ch] != 0) {
+                    continue;
+                }
+
+                nxt_fallthrough;
+
+            case sw_chunk_ext_value_end:
+                /* After a token or the closing quote of a quoted-string. */
+                switch (ch) {
+                case ' ':
+                case '\t':
+                    state = sw_chunk_ext_bws;
+                    continue;
+                case ';':
+                    state = sw_chunk_ext_name_start;
+                    continue;
+                case '\r':
+                    state = sw_chunk_size_linefeed;
+                    continue;
+                }
+
+                goto chunk_error;
+
+            case sw_chunk_ext_bws:
+                /*
+                 * BWS after the chunk size or after a value may only
+                 * precede an extension (RFC 9112, 7.1.1).
+                 */
+                if (ch == ' ' || ch == '\t') {
+                    continue;
+                }
+
+                if (nxt_fast_path(ch == ';')) {
+                    state = sw_chunk_ext_name_start;
+                    continue;
+                }
+
+                goto chunk_error;
+
+            case sw_chunk_ext_quoted:
+                /* qdtext: HTAB, SP, %x21, %x23-5B, %x5D-7E, obs-text. */
+                if (ch == '"') {
+                    state = sw_chunk_ext_value_end;
+                    continue;
+                }
+
+                if (ch == '\\') {
+                    state = sw_chunk_ext_quoted_pair;
+                    continue;
+                }
+
+                if (nxt_fast_path(nxt_http_chunk_ext_text(ch))) {
+                    continue;
+                }
+
+                goto chunk_error;
+
+            case sw_chunk_ext_quoted_pair:
+                /* "\" ( HTAB / SP / VCHAR / obs-text ) */
+                if (nxt_fast_path(nxt_http_chunk_ext_text(ch))) {
+                    state = sw_chunk_ext_quoted;
+                    continue;
+                }
+
+                goto chunk_error;
 
             case sw_chunk_size_linefeed:
                 if (nxt_fast_path(ch == '\n')) {
@@ -241,7 +390,7 @@ nxt_http_chunk_parse(nxt_task_t *task, nxt_http_chunk_parse_t *hcp,
                     }
 
                     hcp->last = 1;
-                    return out;
+                    goto done;
                 }
 
                 goto chunk_error;
@@ -351,6 +500,20 @@ chunk_error:
 
     hcp->chunk_error = 1;
 
+done:
+
+    while (b != NULL) {
+        next = b->next;
+        b->next = NULL;
+
+        if (b->retain == 0 && !hcp->retain_buffers) {
+            nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                               b->completion_handler, task, b, b->parent);
+        }
+
+        b = next;
+    }
+
     return out;
 }
 
@@ -374,11 +537,13 @@ nxt_http_chunk_buffer(nxt_http_chunk_parse_t *hcp, nxt_buf_t ***tail,
     **tail = b;
     *tail = &b->next;
 
-    nxt_mp_retain(hcp->mem_pool);
-    b->completion_handler = nxt_http_chunk_buf_completion;
-
     b->parent = in;
-    in->retain++;
+
+    if (!hcp->retain_buffers) {
+        nxt_mp_retain(hcp->mem_pool);
+        b->completion_handler = nxt_http_chunk_buf_completion;
+        in->retain++;
+    }
     b->mem.pos = p;
     b->mem.start = p;
 

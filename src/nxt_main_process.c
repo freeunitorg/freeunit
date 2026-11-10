@@ -12,6 +12,7 @@
 #include <nxt_router.h>
 #include <nxt_port_queue.h>
 #include <nxt_checked.h>
+#include <nxt_span.h>
 #if (NXT_TLS)
 #include <nxt_cert.h>
 #endif
@@ -958,13 +959,220 @@ nxt_main_process_created_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 }
 
 
+/*
+ * The gate of the main port, as nxt_router_gates[] is the gate of the
+ * router main port.  Every child gets a copy of the main port socket, so
+ * any process can write to it.
+ *
+ * NEW_PORT and REMOVE_PID change the records of another process, and only
+ * a prototype sends them here, for a worker that it forked.  It announces
+ * the main port of the worker (nxt_port_process_ready_handler()) and
+ * reports its exit (nxt_proto_child_exited()).  Main forks every other
+ * process itself, so nothing else sends these two types to main.
+ *
+ * Thus the sender must be a registered prototype, and the process that the
+ * message names must be a child of that prototype.  NEW_PORT must also be
+ * for an application port that main has already.  Main links a worker to
+ * its prototype and creates the port of the worker when it gets the WHOAMI
+ * of the worker (nxt_main_process_whoami_handler()).  The worker sends
+ * PROCESS_READY to the prototype only after the reply, so the link and the
+ * port are there when the NEW_PORT comes.  The NEW_PORT only brings the
+ * queue of the port.
+ *
+ * A prototype can exit before main reads its last messages, and a worker
+ * can exit before its WHOAMI.  Thus a sender or a process that main has no
+ * record of is dropped without an alert.
+ */
+
+#if (NXT_TESTS)
+static nxt_uint_t  nxt_main_test_port_msgs_dropped;
+static nxt_uint_t  nxt_main_test_port_msgs_alerted;
+#endif
+
+
+/* The record of a live process; a record with no ports is on its way out. */
+
+static nxt_process_t *
+nxt_main_process_live(nxt_runtime_t *rt, nxt_pid_t pid)
+{
+    nxt_process_t  *process;
+
+    process = nxt_runtime_process_find(rt, pid);
+
+    if (process == NULL || nxt_queue_is_empty(&process->ports)) {
+        return NULL;
+    }
+
+    return process;
+}
+
+
+static nxt_bool_t
+nxt_main_process_is_child(nxt_process_t *pprocess, nxt_pid_t pid)
+{
+    nxt_process_t  *child;
+
+    nxt_queue_each(child, &pprocess->children, nxt_process_t, link) {
+
+        if (child->pid == pid) {
+            return 1;
+        }
+
+    } nxt_queue_loop;
+
+    return 0;
+}
+
+
+/* Reads the body; gives the pid it names, or the reason to refuse it. */
+
+static const char *
+nxt_main_gate_new_port(nxt_port_recv_msg_t *msg,
+    nxt_port_msg_new_port_t *new_port, nxt_pid_t *pid)
+{
+    if (nxt_slow_path(nxt_port_new_port_msg(msg, new_port) != NXT_OK)) {
+        return "short or bad new port message";
+    }
+
+    if (nxt_slow_path(new_port->type != NXT_PROCESS_APP)) {
+        return "not an application port";
+    }
+
+    *pid = new_port->pid;
+
+    return NULL;
+}
+
+
+static const char *
+nxt_main_gate_remove_pid(nxt_port_recv_msg_t *msg, nxt_pid_t *pid)
+{
+    nxt_span_t  span;
+
+    if (nxt_slow_path(msg->buf == NULL)) {
+        return "bad remove pid message";
+    }
+
+    nxt_span_init(&span, msg->buf->mem.pos, msg->buf->mem.free);
+
+    /* nxt_port_remove_pid_handler() expects the pid and nothing more. */
+
+    if (nxt_slow_path(nxt_span_copy(&span, pid, sizeof(nxt_pid_t)) != 0
+                      || nxt_span_len(&span) != 0))
+    {
+        return "bad remove pid message";
+    }
+
+    return NULL;
+}
+
+
+static void
+nxt_main_gate_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_pid_t                pid, sender;
+    nxt_bool_t               remove_pid;
+    const char               *reason;
+    nxt_runtime_t            *rt;
+    nxt_process_t            *pprocess;
+    nxt_port_msg_new_port_t  new_port;
+
+    /* GCC 4.4 does not see that the helpers set pid before it is read. */
+    pid = 0;
+
+    rt = task->thread->runtime;
+
+    sender = nxt_recv_msg_cmsg_pid(msg);
+
+    /* Unreferenced: the main process runs a single engine. */
+
+    pprocess = nxt_main_process_live(rt, sender);
+
+    if (pprocess == NULL) {
+        nxt_debug(task, "message type %uD from process %PI, which main has "
+                  "no record of; dropped", (uint32_t) msg->port_msg.type,
+                  sender);
+#if (NXT_TESTS)
+        nxt_main_test_port_msgs_dropped++;
+#endif
+        goto refused;
+    }
+
+    if (nxt_slow_path(nxt_process_type(pprocess) != NXT_PROCESS_PROTOTYPE)) {
+        reason = "not a prototype";
+        goto alert;
+    }
+
+    remove_pid = (msg->port_msg.type == _NXT_PORT_MSG_REMOVE_PID);
+
+    reason = remove_pid ? nxt_main_gate_remove_pid(msg, &pid)
+                        : nxt_main_gate_new_port(msg, &new_port, &pid);
+
+    if (nxt_slow_path(reason != NULL)) {
+        goto alert;
+    }
+
+    if (nxt_slow_path(!nxt_main_process_is_child(pprocess, pid))) {
+        if (nxt_main_process_live(rt, pid) == NULL) {
+            nxt_debug(task, "message type %uD from process %PI names process "
+                      "%PI, which main has no record of; dropped",
+                      (uint32_t) msg->port_msg.type, sender, pid);
+#if (NXT_TESTS)
+            nxt_main_test_port_msgs_dropped++;
+#endif
+            goto refused;
+        }
+
+        reason = "not a child of the sender";
+        goto alert_pid;
+    }
+
+    if (remove_pid) {
+        nxt_port_remove_pid_handler(task, msg);
+        return;
+    }
+
+    if (nxt_slow_path(nxt_runtime_port_find(rt, new_port.pid, new_port.id)
+                      == NULL))
+    {
+        reason = "not a port that main has";
+        goto alert_pid;
+    }
+
+    nxt_main_new_port_handler(task, msg);
+    return;
+
+alert_pid:
+
+    nxt_alert(task, "process %PI sent message type %uD naming process %PI; "
+              "refused: %s", sender, (uint32_t) msg->port_msg.type, pid,
+              reason);
+    goto alerted;
+
+alert:
+
+    nxt_alert(task, "process %PI sent message type %uD; refused: %s", sender,
+              (uint32_t) msg->port_msg.type, reason);
+
+alerted:
+
+#if (NXT_TESTS)
+    nxt_main_test_port_msgs_alerted++;
+#endif
+
+refused:
+
+    nxt_port_recv_msg_close_fds(msg);
+}
+
+
 static nxt_port_handlers_t  nxt_main_process_port_handlers = {
     .data             = nxt_main_data_handler,
-    .new_port         = nxt_main_new_port_handler,
+    .new_port         = nxt_main_gate_handler,
     .process_created  = nxt_main_process_created_handler,
     .process_ready    = nxt_port_process_ready_handler,
     .whoami           = nxt_main_process_whoami_handler,
-    .remove_pid       = nxt_port_remove_pid_handler,
+    .remove_pid       = nxt_main_gate_handler,
 #if (NXT_USE_CMSG_PID)
     .remove_child_pid = nxt_main_remove_child_pid_handler,
 #endif
@@ -987,6 +1195,40 @@ static nxt_port_handlers_t  nxt_main_process_port_handlers = {
     .rpc_ready        = nxt_port_rpc_handler,
     .rpc_error        = nxt_port_rpc_handler,
 };
+
+
+#if (NXT_TESTS)
+
+/*
+ * Lets src/test/nxt_main_port_gate_test.c send a message through the
+ * handler table of the main port, as nxt_port_handler() does.
+ */
+void
+nxt_main_test_run_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_port_handler_t  handler;
+
+    handler = ((const nxt_port_handler_t *)
+               &nxt_main_process_port_handlers)[msg->port_msg.type];
+
+    handler(task, msg);
+}
+
+
+nxt_uint_t
+nxt_main_test_port_dropped(void)
+{
+    return nxt_main_test_port_msgs_dropped;
+}
+
+
+nxt_uint_t
+nxt_main_test_port_alerted(void)
+{
+    return nxt_main_test_port_msgs_alerted;
+}
+
+#endif
 
 
 #if (NXT_USE_CMSG_PID)

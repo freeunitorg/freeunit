@@ -73,14 +73,30 @@ ServerResponse.prototype.setHeader = function setHeader(name, value) {
 
     if (Array.isArray(value)) {
         count = value.length;
+        let copy = new Array(count);
 
-        value.forEach(function(val) {
-            value_len += Buffer.byteLength(val + "", 'latin1');
-        });
+        for (let i = 0; i < count; i++) {
+            copy[i] = value[i];
+            value_len += Buffer.byteLength(value[i] + "", 'latin1');
+        }
+
+        value = copy;
 
     } else {
         count = 1;
         value_len = Buffer.byteLength(value + "", 'latin1');
+    }
+
+    let name_len = Buffer.byteLength(name, 'latin1');
+
+    /*
+     * libunit stores the name length in a uint8_t.  Refuse a longer name
+     * here, before the response changes, so that the application can catch
+     * the error and still send a response.
+     */
+    if (name_len > 255) {
+        throw new TypeError('Response header name is too long ('
+                            + name_len + ' bytes, the limit is 255)');
     }
 
     let lc_name = name.toLowerCase();
@@ -88,8 +104,6 @@ ServerResponse.prototype.setHeader = function setHeader(name, value) {
     if (lc_name in this.headers) {
         this._removeHeader(lc_name);
     }
-
-    let name_len = Buffer.byteLength(name, 'latin1');
 
     this.headers[lc_name] = [name, value];
     this.headers_len += value_len + (name_len * count);
@@ -521,20 +535,26 @@ Server.prototype.emit_drain = function () {
             l = o.chunk.length;
         }
 
-        res = o.resp._write(o.chunk, o.offset, l);
+        try {
+            res = o.resp._write(o.chunk, o.offset, l);
+
+        } catch (e) {
+            this._output.shift();
+            throw e;
+        }
 
         o.offset += res;
         if (o.offset < l) {
             return;
         }
 
+        this._output.shift();
+
         this._drain_resp.add(o.resp);
 
         if (typeof o.callback === 'function') {
             process.nextTick(o.callback);
         }
-
-        this._output.shift();
     }
 
     for (var resp of this._drain_resp) {
