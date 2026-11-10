@@ -7,7 +7,7 @@ written.
 
 Related issues: #902 (compilation cache), #904 (AOT `.cwasm` load path),
 #905 (wasm benchmark), #909 (wasm umbrella issue), #912 (parallel
-compilation).
+compilation, merged for 1.38.0).
 
 ## Why
 
@@ -20,10 +20,11 @@ start the same way today:
   Wasmtime 48.0.8, `feature(parallel-compilation ON)`). The engine is
   created with `wasm_engine_new()` in `src/wasm/nxt_rt_wasmtime.c`, so a
   core module already compiles in parallel.
-- `"type": "wasm-wasi-component"` builds the Rust crate without that
+- `"type": "wasm-wasi-component"` built the Rust crate without that
   feature (`src/wasm-wasi-component/Cargo.toml` uses
-  `default-features = false` with only `anyhow`, `component-model` and
-  `cranelift`). That is what #912 turns on.
+  `default-features = false`).  #912 turned the feature on for 1.38.0, so
+  both runtimes now compile in parallel by default; the benchmark below
+  was measured before that.
 
 The benchmark posted on #905 (from `test/wasm-bench/RESULTS.md` in #911)
 shows how much the first start costs, and how much the other ways save.
@@ -32,8 +33,8 @@ Each row below names which runtime was measured:
 | Mode | Runtime measured | Time to a ready module or component |
 |------|------------------|-------------------------------------|
 | JIT, C guests | C API (`"type": "wasm"`), already parallel | about 15-20 ms |
-| JIT, Rust guests | component crate (`"type": "wasm-wasi-component"`), no parallel compile | about 80-800 ms |
-| JIT with parallel compile | component crate with `parallel-compilation` on (as #912) | about 4x faster on large components (rust-image: about 800 ms to about 140 ms) |
+| JIT, Rust guests | component crate (`"type": "wasm-wasi-component"`), no parallel compile (before #912) | about 80-800 ms |
+| JIT with parallel compile | component crate with `parallel-compilation` on, which #912 enabled for 1.38.0 | about 4x faster on large components (rust-image: about 800 ms to about 140 ms) |
 | Compilation cache, warm | both runtimes (C API and component crate harnesses) | about 1-8 ms |
 | Compilation cache, first start | both runtimes | about the same as JIT for that runtime |
 | AOT `.cwasm` | both runtimes | about 0.5-0.7 ms |
@@ -89,8 +90,9 @@ for `"type": "wasm"` too. There is no second name for the guest timeout.
 The two `compilation` values:
 
 - `"jit"`: compile when the process starts. With `parallel: true` (the
-  default) this matches today's core-module behaviour and, after #912, the
-  component runtime too. With `parallel: false` the engine turns
+  default) this matches today's behaviour of both runtimes: the core
+  module always had parallel compilation and #912 enabled it for the
+  component runtime for 1.38.0. With `parallel: false` the engine turns
   parallel compilation off for that app. Setting `"jit"` does not mean
   "one thread"; use `parallel: false` for that.
 - `"aot"`: load a `.cwasm` file that was compiled ahead of time. The
@@ -98,9 +100,9 @@ The two `compilation` values:
   stale, corrupt, or does not match this build, use `fallback`.
 
 `"parallel"` is not a `compilation` value. Parallel compilation is a
-build feature of the component runtime (#912) and is already on for the
-C API. A boolean keeps the strategy list short and matches what Wasmtime
-exposes.
+build feature that #912 enabled for the component runtime (1.38.0) and
+that the C API build always had. A boolean keeps the strategy list short
+and matches what Wasmtime exposes.
 
 ### AOT fallback (default: loud JIT)
 
@@ -218,8 +220,8 @@ only accepts a path to a cache config file
 (`wasmtime_config_cache_config_load`). The core-module build already has
 the cache feature compiled in (`feature(cache ON)`), but the cache stays
 off until that file is loaded. The component crate still needs the
-`cache` feature added in `src/wasm-wasi-component/Cargo.toml` (same line
-that #912 edits for parallel compilation).
+`cache` feature added in `src/wasm-wasi-component/Cargo.toml` (the line
+where "parallel-compilation" now sits, after #912).
 
 So Unit must write a small per-app TOML from `cache.path` and
 `cache.size`, for example:
@@ -302,11 +304,12 @@ Open questions:
 
 ## Examples
 
-### Development: JIT with parallel compile and a cache
+### Development: JIT with a cache
 
 Fast restarts while you change the code. The cache keeps later starts at a
-few milliseconds, and parallel compilation (on by default) makes the first
-start after a change faster. Guest timeout stays as `execution_timeout`.
+few milliseconds, and parallel compilation (now on by default for both
+runtimes) makes the first start after a change faster. Guest timeout stays
+as `execution_timeout`.
 
 ```json
 {
