@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import shutil
 import socket
@@ -15,6 +16,7 @@ from unit.applications.tls import ApplicationTLS
 from unit.option import option
 from unit import port as port_map
 from unit.status import Status
+from unit.utils import public_dir
 
 prerequisites = {'modules': {'python': 'any'}}
 
@@ -1476,6 +1478,30 @@ def test_settings_max_body_size():
 
     assert client.post(body='01234')['status'] == 200, 'status size'
     assert client.post(body='012345')['status'] == 413, 'status size max'
+
+
+def test_settings_body_temp_path(temp_dir):
+    # A body above body_buffer_size goes to an unlinked file in
+    # body_temp_path.  The router kept the path as a pointer into the parsed
+    # configuration, which it frees once the configuration is applied, so
+    # each such body read freed memory.  An ASan build reports it; a release
+    # build usually finds the old bytes there.
+    client.load('mirror')
+
+    spool = f'{temp_dir}/spool'
+    os.mkdir(spool)
+    # The router can run as another user than the tests.
+    public_dir(spool)
+
+    assert 'success' in client.conf(
+        {'http': {'body_buffer_size': 64, 'body_temp_path': spool}},
+        'settings',
+    )
+
+    body = '0123456789abcdef' * 256
+    resp = client.post(body=body)
+    assert resp['status'] == 200, 'status spooled body'
+    assert resp['body'] == body, 'spooled body'
 
 
 def test_settings_max_body_size_large():
