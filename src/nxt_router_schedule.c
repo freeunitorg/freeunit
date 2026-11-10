@@ -881,7 +881,6 @@ nxt_router_schedule_request_init(nxt_http_request_t *r,
 
     r->target.start = rp->target_start;
     r->target.length = rp->target_end - rp->target_start;
-    r->quoted_target = rp->quoted_target;
 
     r->version.start = rp->version.str;
     r->version.length = sizeof(rp->version.str);
