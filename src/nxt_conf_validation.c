@@ -5537,6 +5537,7 @@ nxt_conf_vldt_schedule(nxt_conf_validation_t *vldt, nxt_str_t *name,
     nxt_conf_value_t *value)
 {
     double            interval, jitter;
+    size_t            name_len;
     nxt_int_t         ret;
     nxt_str_t         uri;
     nxt_uint_t        i;
@@ -5552,12 +5553,15 @@ nxt_conf_vldt_schedule(nxt_conf_validation_t *vldt, nxt_str_t *name,
         return ret;
     }
 
-    if (name->length == 0 || name->length > NXT_SCHEDULE_NAME_MAX) {
+    /* Read once: the rule "shm-double-fetch" watches a check then a read. */
+    name_len = name->length;
+
+    if (name_len == 0 || name_len > NXT_SCHEDULE_NAME_MAX) {
         return nxt_conf_vldt_error(vldt, "A schedule name must be 1 to %d "
                                    "bytes long.", NXT_SCHEDULE_NAME_MAX);
     }
 
-    for (i = 0; i < name->length; i++) {
+    for (i = 0; i < name_len; i++) {
         if (name->start[i] < 0x20 || name->start[i] > 0x7E) {
             return nxt_conf_vldt_error(vldt, "The schedule name \"%V\" must "
                                        "contain only printable ASCII "
