@@ -136,6 +136,19 @@ static int  nxt_unit_msg_test_wake_cb;
 static int  nxt_unit_msg_test_wake_dropped;
 static int  nxt_unit_msg_test_quit_dropped;
 static int  nxt_unit_msg_test_read_fds[2] = { -1, -1 };
+static int  nxt_unit_msg_test_shared_fds[2] = { -1, -1 };
+static int  nxt_unit_msg_test_shared_queue_fd = -1;
+
+/* See nxt_unit_msg_test_quit_drain_case(). */
+static int              nxt_unit_msg_test_real_recv;
+static int              nxt_unit_msg_test_drain_limit;
+static int              nxt_unit_msg_test_drain_count;
+static nxt_app_queue_t  *nxt_unit_msg_test_drain_queue;
+
+static struct {
+    nxt_port_msg_t       msg;
+    nxt_port_mmap_msg_t  rec;
+} nxt_packed  nxt_unit_msg_test_drain_item;
 static int nxt_unit_msg_test_send_records_to(nxt_unit_ctx_t *ctx,
     const nxt_port_mmap_msg_t *records, size_t nrecords, size_t tail);
 
@@ -451,9 +464,46 @@ static ssize_t
 nxt_unit_msg_test_recv(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port, void *buf,
     size_t buf_size, void *oob, size_t *oob_size)
 {
+    int       notify;
+    ssize_t   n;
+    uint32_t  cookie;
+
     *oob_size = 0;
 
-    return 0;
+    if (!nxt_unit_msg_test_real_recv) {
+        return 0;
+    }
+
+    /* A blocking read, as libunit makes without this callback. */
+    n = recv(port->in_fd, buf, buf_size, 0);
+
+    /*
+     * The router puts a request in the shared queue after the context
+     * checked the queue and before the context read the read port.
+     */
+    if (n > 0 && port->in_fd == nxt_unit_msg_test_read_fds[0]
+        && nxt_unit_msg_test_drain_queue != NULL)
+    {
+        while (nxt_unit_msg_test_drain_count-- > 0) {
+            (void) nxt_app_queue_send(nxt_unit_msg_test_drain_queue,
+                                      &nxt_unit_msg_test_drain_item,
+                                      sizeof(nxt_unit_msg_test_drain_item),
+                                      nxt_unit_msg_test_drain_item.msg.stream,
+                                      &notify, &cookie);
+        }
+
+        nxt_unit_msg_test_drain_queue = NULL;
+
+        /*
+         * The context stopped being ready since the wait, as when another
+         * context took the last request the limit allows.
+         */
+        if (nxt_unit_msg_test_drain_limit) {
+            nxt_unit_test_ctx_set_ready(ctx, 0);
+        }
+    }
+
+    return n;
 }
 
 
@@ -4007,6 +4057,206 @@ nxt_unit_msg_test_ws_unpark_case(void *data)
 
 
 /*
+ * A graceful QUIT on the read port, and the shared port readable in the
+ * same wait: the router rang it for a request.  The context reads the read
+ * port first.  It serves that request and then quits, and it takes no
+ * other.  A normal QUIT stops the worker at once and leaves the request in
+ * the queue for another one; so does a graceful QUIT when the context
+ * stopped being ready since the wait (the request limit), or when the
+ * shared port was not readable.  A pending graceful QUIT does not stop the
+ * drain; a pending normal one does.
+ *
+ * The router sends a QUIT to a ready worker through the read port queue,
+ * which the context reads before it waits.  That QUIT drains the same way.
+ *
+ * The request must not be in the queue when the context checks the queue
+ * before it waits, or it is taken there.  So the recv callback puts it in
+ * the queue when it reads the QUIT, after the wait.  alarm() turns a hang
+ * into a failure.
+ */
+
+typedef struct {
+    const char  *name;
+    uint8_t     quit_param;   /* NXT_PORT_QUIT_*. */
+    int         doorbell;     /* The shared port is readable. */
+    int         limit;        /* The context stops being ready meanwhile. */
+    int         queued;       /* QUIT and request queued before the run. */
+    int         pending;      /* A pending QUIT: -1 none, else NXT_QUIT_*. */
+    int         requests;     /* Requests in the shared queue. */
+    int         served;       /* Requests served. */
+} nxt_unit_msg_test_drain_t;
+
+
+static const nxt_unit_msg_test_drain_t  quit_drains[] = {
+    { "graceful QUIT serves the request rung for, then quits",
+      NXT_PORT_QUIT_GRACEFUL, 1, 0, 0, -1, 1, 1 },
+    { "normal QUIT leaves the request rung for in the queue",
+      NXT_PORT_QUIT_NORMAL, 1, 0, 0, -1, 1, 0 },
+    { "graceful QUIT on a context no longer ready leaves the request",
+      NXT_PORT_QUIT_GRACEFUL, 1, 1, 0, -1, 1, 0 },
+    { "graceful QUIT with no doorbell leaves the request",
+      NXT_PORT_QUIT_GRACEFUL, 0, 0, 0, -1, 1, 0 },
+    { "graceful QUIT in the read port queue serves the request",
+      NXT_PORT_QUIT_GRACEFUL, 0, 0, 1, -1, 1, 1 },
+    { "graceful QUIT serves one request of two",
+      NXT_PORT_QUIT_GRACEFUL, 1, 0, 0, -1, 2, 1 },
+    { "graceful QUIT with a graceful QUIT pending serves the request",
+      NXT_PORT_QUIT_GRACEFUL, 1, 0, 0, NXT_PORT_QUIT_GRACEFUL, 1, 1 },
+    { "graceful QUIT with a normal QUIT pending leaves the request",
+      NXT_PORT_QUIT_GRACEFUL, 1, 0, 0, NXT_PORT_QUIT_NORMAL, 1, 0 },
+};
+
+
+static int
+nxt_unit_msg_test_quit_drain_case(void *data)
+{
+    int                              rc, i, left, notify;
+    void                             *port_queue;
+    u_char                           *p, junk[64];
+    uint32_t                         cookie;
+    nxt_app_queue_t                  *q;
+    nxt_port_msg_t                   bell;
+    const nxt_unit_msg_test_drain_t  *t = data;
+
+    struct {
+        nxt_port_msg_t  msg;
+        uint8_t         quit_param;
+    } nxt_packed  quit;
+
+    alarm(10);
+
+    /* What earlier cases left on the two sockets, which this child shares. */
+    while (recv(nxt_unit_msg_test_read_fds[0], junk, sizeof(junk),
+                MSG_DONTWAIT) >= 0)
+    { /* void */ }
+
+    while (recv(nxt_unit_msg_test_shared_fds[0], junk, sizeof(junk),
+                MSG_DONTWAIT) >= 0)
+    { /* void */ }
+
+    port_queue = nxt_unit_test_port_queue(
+                     nxt_unit_test_ctx_read_port(nxt_unit_msg_test_ctx));
+    nxt_port_queue_init(port_queue);
+
+    q = mmap(NULL, sizeof(nxt_app_queue_t), PROT_READ | PROT_WRITE,
+             MAP_SHARED, nxt_unit_msg_test_shared_queue_fd, 0);
+    if (q == MAP_FAILED) {
+        return 1;
+    }
+
+    nxt_app_queue_init(q);
+
+    /* The request, as the router enqueues it: a record over chunk 2. */
+    p = nxt_port_mmap_chunk_start(nxt_unit_msg_test_seg0, 2);
+
+    memset(&nxt_unit_msg_test_drain_item, 0,
+           sizeof(nxt_unit_msg_test_drain_item));
+
+    nxt_unit_msg_test_drain_item.msg.stream = nxt_unit_msg_test_stream;
+    nxt_unit_msg_test_drain_item.msg.pid = nxt_unit_msg_test_pid;
+    nxt_unit_msg_test_drain_item.msg.reply_port = nxt_unit_msg_test_reply_port;
+    nxt_unit_msg_test_drain_item.msg.type = _NXT_PORT_MSG_REQ_HEADERS;
+    nxt_unit_msg_test_drain_item.msg.last = 1;
+    nxt_unit_msg_test_drain_item.msg.mmap = 1;
+    nxt_unit_msg_test_drain_item.rec.mmap_id = 0;
+    nxt_unit_msg_test_drain_item.rec.chunk_id = 2;
+    nxt_unit_msg_test_drain_item.rec.size =
+                                     nxt_unit_msg_test_write_request(p);
+
+    nxt_unit_msg_test_drain_queue = q;
+    nxt_unit_msg_test_drain_limit = t->limit;
+    nxt_unit_msg_test_drain_count = t->requests;
+
+    if (t->queued) {
+        for (i = 0; i < t->requests; i++) {
+            (void) nxt_app_queue_send(q, &nxt_unit_msg_test_drain_item,
+                                      sizeof(nxt_unit_msg_test_drain_item),
+                                      nxt_unit_msg_test_drain_item.msg.stream,
+                                      &notify, &cookie);
+        }
+
+        nxt_unit_msg_test_drain_queue = NULL;
+    }
+
+    nxt_unit_msg_test_mode = NXT_UNIT_MSG_TEST_READ_BODY;
+    nxt_unit_msg_test_handler_calls = 0;
+    nxt_unit_msg_test_handler_ok = 0;
+    nxt_unit_msg_test_quit_called = 0;
+
+    if (t->doorbell) {
+        memset(&bell, 0, sizeof(bell));
+        bell.type = _NXT_PORT_MSG_READ_QUEUE;
+
+        if (write(nxt_unit_msg_test_shared_fds[1], &bell, sizeof(bell))
+            != (ssize_t) sizeof(bell))
+        {
+            return 2;
+        }
+    }
+
+    /* The QUIT nxt_runtime_port_send_quit() writes. */
+    memset(&quit, 0, sizeof(quit));
+    quit.msg.pid = nxt_unit_msg_test_pid;
+    quit.msg.type = _NXT_PORT_MSG_QUIT;
+    quit.quit_param = t->quit_param;
+
+    if (t->queued) {
+        if (nxt_port_queue_send(port_queue, &quit, sizeof(quit), &notify)
+            != NXT_OK)
+        {
+            return 3;
+        }
+
+    } else if (write(nxt_unit_msg_test_read_fds[1], &quit, sizeof(quit))
+               != (ssize_t) sizeof(quit))
+    {
+        return 3;
+    }
+
+    if (t->pending >= 0) {
+        nxt_unit_test_ctx_set_quit_pending(nxt_unit_msg_test_ctx,
+                                           (uint8_t) t->pending);
+    }
+
+    nxt_unit_test_ctx_set_ready(nxt_unit_msg_test_ctx, 1);
+    nxt_unit_msg_test_real_recv = 1;
+
+    rc = nxt_unit_run(nxt_unit_msg_test_ctx);
+
+    alarm(0);
+
+    /* The requests that were not served are still in the queue. */
+    left = 0;
+
+    while (nxt_app_queue_recv(q, junk, &cookie) != -1) {
+        left++;
+    }
+
+    if (rc != NXT_UNIT_OK
+        || nxt_unit_test_ctx_online(nxt_unit_msg_test_ctx)
+        || !nxt_unit_msg_test_quit_called
+        || nxt_unit_msg_test_drain_queue != NULL
+        || nxt_unit_msg_test_handler_calls != t->served
+        || nxt_unit_msg_test_handler_ok != t->served
+        || left != t->requests - t->served)
+    {
+        printf("unit msg test: rc %d, online %d, quit %d, handler %d/%d, "
+               "request left %d, expected rc %d, online 0, quit 1, "
+               "handler %d/%d, request left %d\n", rc,
+               (int) nxt_unit_test_ctx_online(nxt_unit_msg_test_ctx),
+               nxt_unit_msg_test_quit_called, nxt_unit_msg_test_handler_calls,
+               nxt_unit_msg_test_handler_ok, left, NXT_UNIT_OK, t->served,
+               t->served, t->requests - t->served);
+        fflush(stdout);
+
+        return 4;
+    }
+
+    return NXT_UNIT_MSG_TEST_RC(NXT_UNIT_OK);
+}
+
+
+/*
  * While nxt_unit_wait_shm_ack() waits for SHM_ACK, it reads on and puts
  * every other message into pending_rbuf.  Each one took a whole read
  * buffer, over 16 KiB, for a message of 20 bytes.  Now each one is a
@@ -4404,6 +4654,9 @@ main(void)
     nxt_unit_msg_test_read_fds[0] = read[0];
     nxt_unit_msg_test_read_fds[1] = read[1];
 
+    nxt_unit_msg_test_shared_fds[0] = shared[0];
+    nxt_unit_msg_test_shared_fds[1] = shared[1];
+
     init.shared_port_fd = shared[0];
     init.shared_queue_fd = nxt_unit_msg_test_shm(sizeof(nxt_app_queue_t));
     init.log_fd = STDERR_FILENO;
@@ -4411,6 +4664,9 @@ main(void)
     if (init.shared_queue_fd == -1) {
         return 1;
     }
+
+    /* nxt_unit_init() closes it once it is mapped. */
+    nxt_unit_msg_test_shared_queue_fd = dup(init.shared_queue_fd);
 
     nxt_unit_msg_test_ctx = nxt_unit_init(&init);
     if (nxt_unit_msg_test_ctx == NULL) {
@@ -4644,6 +4900,12 @@ main(void)
                                "wait shrunk",
                                nxt_unit_msg_test_shm_ack_case, NULL,
                                NXT_UNIT_OK);
+
+    for (i = 0; i < nxt_nitems(quit_drains); i++) {
+        nxt_unit_msg_test_in_child(quit_drains[i].name,
+                                   nxt_unit_msg_test_quit_drain_case,
+                                   (void *) &quit_drains[i], NXT_UNIT_OK);
+    }
 
     /*
      * Release the library.  Otherwise the global context pointer keeps it
