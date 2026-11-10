@@ -201,6 +201,50 @@ nxt_signal_time_test(nxt_thread_t *thr)
 }
 
 
+/*
+ * nxt_wday_abbr[] and nxt_month_abbr[] against strftime() "%a" and "%b".
+ * A program starts in the "C" locale, and the tests do not change it, so
+ * strftime() gives the English names that HTTP dates need.
+ */
+
+static nxt_int_t
+nxt_time_abbr_test(nxt_thread_t *thr)
+{
+    char        buf[16];
+    size_t      n;
+    struct tm   tm;
+    nxt_uint_t  i;
+
+    nxt_memzero(&tm, sizeof(struct tm));
+
+    for (i = 0; i < nxt_nitems(nxt_wday_abbr); i++) {
+        tm.tm_wday = i;
+        n = strftime(buf, sizeof(buf), "%a", &tm);
+
+        if (n != 3 || nxt_strcmp(buf, nxt_wday_abbr[i]) != 0) {
+            nxt_log_alert(thr->log, "nxt_wday_abbr[%ui] is \"%s\", "
+                          "strftime() gives \"%s\"",
+                          i, nxt_wday_abbr[i], buf);
+            return NXT_ERROR;
+        }
+    }
+
+    for (i = 0; i < nxt_nitems(nxt_month_abbr); i++) {
+        tm.tm_mon = i;
+        n = strftime(buf, sizeof(buf), "%b", &tm);
+
+        if (n != 3 || nxt_strcmp(buf, nxt_month_abbr[i]) != 0) {
+            nxt_log_alert(thr->log, "nxt_month_abbr[%ui] is \"%s\", "
+                          "strftime() gives \"%s\"",
+                          i, nxt_month_abbr[i], buf);
+            return NXT_ERROR;
+        }
+    }
+
+    return NXT_OK;
+}
+
+
 nxt_int_t
 nxt_gmtime_test(nxt_thread_t *thr)
 {
@@ -330,6 +374,10 @@ nxt_gmtime_test(nxt_thread_t *thr)
                   (end - start) / 10000000.0);
 
     if (nxt_signal_time_test(thr) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_time_abbr_test(thr) != NXT_OK) {
         return NXT_ERROR;
     }
 
