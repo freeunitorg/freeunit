@@ -56,7 +56,14 @@ class ApplicationWasmComponent(ApplicationProto):
 
         try:
             subprocess.check_output(
-                ['cargo', 'build', '--release', '--target', 'wasm32-wasip2'],
+                [
+                    'cargo',
+                    'build',
+                    '--release',
+                    '--locked',
+                    '--target',
+                    'wasm32-wasip2',
+                ],
                 cwd=app_path,
                 stderr=subprocess.STDOUT,
             )
