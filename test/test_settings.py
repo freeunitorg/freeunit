@@ -16,6 +16,7 @@ from unit.applications.tls import ApplicationTLS
 from unit.option import option
 from unit import port as port_map
 from unit.status import Status
+from unit.utils import public_dir
 
 prerequisites = {'modules': {'python': 'any'}}
 
@@ -1489,6 +1490,8 @@ def test_settings_body_temp_path(temp_dir):
 
     spool = f'{temp_dir}/spool'
     os.mkdir(spool)
+    # The router can run as another user than the tests.
+    public_dir(spool)
 
     assert 'success' in client.conf(
         {'http': {'body_buffer_size': 64, 'body_temp_path': spool}},
