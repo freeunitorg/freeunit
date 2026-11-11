@@ -49,20 +49,26 @@ jobs:
           sudo apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/probe.list \
             -o Dir::Etc::sourceparts=- 2>&1 | tail -5
 
-      - name: Host apt with a fallback line in apt-mirrors.txt
-        run: |
-          printf 'http://mirrors.edge.kernel.org/ubuntu/\tpriority:4\n' \
-            | sudo tee -a /etc/apt/apt-mirrors.txt
-          sudo apt-get update 2>&1 | tail -6
-          sudo apt-get install -y --no-install-recommends xsltproc dwarves 2>&1 | tail -3
-
       - name: Docker xenial (the cross image) with fallback mirrors
+        if: always()
+        timeout-minutes: 5
         run: |
           docker run --rm ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5 sh -c '
-            cat /etc/apt/sources.list | grep -v "^#" | sort -u
+            cat /etc/apt/sources.list | grep -v "^#" | grep . | sort -u
             sed -i -e "s#http://[a-z.]*archive.ubuntu.com/ubuntu#http://mirrors.edge.kernel.org/ubuntu#" \
                    -e "s#http://ports.ubuntu.com/ubuntu-ports#http://ftp.halifax.rwth-aachen.de/ubuntu-ports#" \
-                   /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null
+                   /etc/apt/sources.list
             dpkg --add-architecture arm64
-            apt-get update 2>&1 | tail -8
-            apt-get install --assume-yes libssl-dev:arm64 2>&1 | tail -2' 2>&1 | tail -25
+            apt-get update 2>&1 | tail -12
+            apt-get install --assume-yes libssl-dev:arm64 2>&1 | tail -2' 2>&1 | tail -30
+
+      - name: Host apt with the mirror list replaced
+        if: always()
+        timeout-minutes: 5
+        run: |
+          if ! getent hosts archive.ubuntu.com > /dev/null; then
+            printf 'http://mirrors.edge.kernel.org/ubuntu/\tpriority:1\n' \
+              | sudo tee /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get update 2>&1 | tail -6
+          sudo apt-get install -y --no-install-recommends xsltproc dwarves 2>&1 | tail -3
