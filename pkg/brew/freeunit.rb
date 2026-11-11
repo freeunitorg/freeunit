@@ -4,27 +4,33 @@
 class Freeunit < Formula
   desc "Universal web app server, a community fork of NGINX Unit"
   homepage "https://freeunit.org"
+  # The version is explicit: "arm64" in the URL would be read as 64.
+  version "1.37.2"
   license "Apache-2.0"
 
   # The archives are built by .github/workflows/release-macos.yml: unitd has
   # OpenSSL and PCRE2 linked in and needs only the libraries of macOS.
-  on_arm do
-    url "https://github.com/freeunitorg/freeunit/releases/download/1.37.2/freeunit-1.37.2-macos-arm64.tar.gz"
-    sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  depends_on :macos
 
-    resource "unitctl" do
-      url "https://github.com/freeunitorg/freeunit/releases/download/unitctl/1.37.2/unitctl-1.37.2-aarch64-apple-darwin"
-      sha256 "e20320870795493025441166dce1c4211d11f30118b3d37d1855d06d043c443f"
+  on_macos do
+    on_arm do
+      url "https://github.com/freeunitorg/freeunit/releases/download/1.37.2/freeunit-1.37.2-macos-arm64.tar.gz"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+
+      resource "unitctl" do
+        url "https://github.com/freeunitorg/freeunit/releases/download/unitctl/1.37.2/unitctl-1.37.2-aarch64-apple-darwin"
+        sha256 "e20320870795493025441166dce1c4211d11f30118b3d37d1855d06d043c443f"
+      end
     end
-  end
 
-  on_intel do
-    url "https://github.com/freeunitorg/freeunit/releases/download/1.37.2/freeunit-1.37.2-macos-x86_64.tar.gz"
-    sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+    on_intel do
+      url "https://github.com/freeunitorg/freeunit/releases/download/1.37.2/freeunit-1.37.2-macos-x86_64.tar.gz"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
 
-    resource "unitctl" do
-      url "https://github.com/freeunitorg/freeunit/releases/download/unitctl/1.37.2/unitctl-1.37.2-x86_64-apple-darwin"
-      sha256 "603f83bfdfe42a6c0f03c49b48c2b0dfb731052f48b4e45099b8d311d050ac6f"
+      resource "unitctl" do
+        url "https://github.com/freeunitorg/freeunit/releases/download/unitctl/1.37.2/unitctl-1.37.2-x86_64-apple-darwin"
+        sha256 "603f83bfdfe42a6c0f03c49b48c2b0dfb731052f48b4e45099b8d311d050ac6f"
+      end
     end
   end
 
@@ -33,8 +39,6 @@ class Freeunit < Formula
     url "https://raw.githubusercontent.com/freeunitorg/freeunit/unitctl/1.37.2/tools/unitctl/man/unitctl.1"
     sha256 "459bdeac5dfd72ee47cd26e62c02dc72d50a8c1ef873f983bb9d2212cfd389d7"
   end
-
-  depends_on :macos
 
   def install
     # The archive's unitd has the default paths under /usr/local.  Keep the

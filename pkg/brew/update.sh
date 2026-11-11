@@ -48,7 +48,8 @@ man=$(fetch \
     man)
 
 # freeunit.rb: the version in each URL and the sha256 line after it.
-sed -e "s#\(releases/download/\)[0-9.]*\(/freeunit-\)[0-9.]*-#\1$ver\2$ver-#" \
+sed -e "s/^  version \"[^\"]*\"/  version \"$ver\"/" \
+    -e "s#\(releases/download/\)[0-9.]*\(/freeunit-\)[0-9.]*-#\1$ver\2$ver-#" \
     -e "s#\(releases/download/unitctl/\)[0-9.]*/unitctl-[0-9.]*-#\1$ver/unitctl-$ver-#" \
     -e "/-macos-arm64.tar.gz\"/{n;s/sha256 \"[0-9a-f]*\"/sha256 \"$sum_arm_pkg\"/;}" \
     -e "/-macos-x86_64.tar.gz\"/{n;s/sha256 \"[0-9a-f]*\"/sha256 \"$sum_x86_pkg\"/;}" \
