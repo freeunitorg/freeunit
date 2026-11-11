@@ -67,7 +67,7 @@ check 'merge fallback selects first, not second, parent' '' "$merge" "$head"
 rc=0
 sh "$selector" "$root" nonexistent > /dev/null 2>&1 || rc=$?
 if [ "$rc" -eq 0 ]; then
-    echo 'FAIL: invalid head succeeded' >&2
+    printf '%s\n' 'FAIL: invalid head succeeded' >&2
     exit 1
 fi
 printf 'ok: invalid head fails\n'
@@ -79,7 +79,7 @@ base=$(sh "$selector" ffffffffffffffffffffffffffffffffffffffff "$bad")
 rc=0
 git log --check --format= "$base..$bad" > "$tmp/check.log" 2>&1 || rc=$?
 if [ "$rc" -ne 2 ] || ! grep -q 'trailing whitespace' "$tmp/check.log"; then
-    echo 'FAIL: genuine whitespace error did not fail' >&2
+    printf '%s\n' 'FAIL: genuine whitespace error did not fail' >&2
     exit 1
 fi
 printf 'ok: genuine whitespace error still fails\n'
@@ -96,7 +96,7 @@ imported=$(git rev-parse HEAD)
 rc=0
 git log --check --format= "$sibling..$imported" > "$tmp/history.log" 2>&1 || rc=$?
 if [ "$rc" -ne 2 ] || ! grep -q 'leftover conflict marker' "$tmp/history.log"; then
-    echo 'FAIL: historical-error control did not fail' >&2
+    printf '%s\n' 'FAIL: historical-error control did not fail' >&2
     exit 1
 fi
 printf 'ok: the unfiltered imported history reproduces the old failure\n'
