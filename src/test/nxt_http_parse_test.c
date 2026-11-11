@@ -304,38 +304,131 @@ static nxt_http_parse_test_case_t  nxt_http_test_cases[] = {
     },
     {
         nxt_string("GET / a HTTP/1.0\r\n\r\n"),
-        NXT_DONE,
-        &nxt_http_parse_test_request_line,
-        { .request_line = {
-            nxt_string("GET"),
-            nxt_string("/ a"),
-            nxt_null_string,
-            "HTTP/1.0",
-            0, 0, 1
-        }}
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
     },
     {
         nxt_string("GET /na %20me.ext?args HTTP/1.0\r\n\r\n"),
-        NXT_DONE,
-        &nxt_http_parse_test_request_line,
-        { .request_line = {
-            nxt_string("GET"),
-            nxt_string("/na %20me.ext?args"),
-            nxt_string("args"),
-            "HTTP/1.0",
-            0, 1, 1
-        }}
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
     },
     {
         nxt_string("GET / HTTP/1.0 HTTP/1.1\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /pa th HTTP/1.1\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /?q=a b HTTP/1.1\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /./pa th HTTP/1.1\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET //pa th HTTP/1.1\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /pa%20 th HTTP/1.1\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /#a b HTTP/1.1\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /pa  th HTTP/1.1\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /pa Hx"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /pa HTTP/x"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /pa HTTP/1x"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /pa HTTP/1.x"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /pa HTTP/1.10\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP"),
+        NXT_AGAIN,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/"),
+        NXT_AGAIN,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1"),
+        NXT_AGAIN,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1."),
+        NXT_AGAIN,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1"),
+        NXT_AGAIN,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET / HTTP/1.1\r"),
+        NXT_AGAIN,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /pa%20th?q=a%20b+c HTTP/1.1\r\n\r\n"),
         NXT_DONE,
         &nxt_http_parse_test_request_line,
         { .request_line = {
             nxt_string("GET"),
-            nxt_string("/ HTTP/1.0"),
-            nxt_null_string,
+            nxt_string("/pa%20th?q=a%20b+c"),
+            nxt_string("q=a%20b+c"),
             "HTTP/1.1",
-            0, 0, 1
+            0, 1, 0
+        }}
+    },
+    {
+        nxt_string("GET /pa+th?q=a+b%20c HTTP/1.0\r\n\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_request_line,
+        { .request_line = {
+            nxt_string("GET"),
+            nxt_string("/pa+th?q=a+b%20c"),
+            nxt_string("q=a+b%20c"),
+            "HTTP/1.0",
+            0, 0, 0
         }}
     },
     {
