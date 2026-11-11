@@ -6,7 +6,7 @@
 set -eu
 
 if [ "$#" -gt 2 ]; then
-    echo "check-base.sh: expected an event base and optional head" >&2
+    printf '%s\n' 'check-base.sh: expected an event base and optional head' >&2
     exit 2
 fi
 
