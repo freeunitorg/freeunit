@@ -43,9 +43,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # A pull request runs on a test merge commit.  Its first parent
-          # is the tip of the base branch.
-          fetch-depth: 2
+          # Full ancestry distinguishes an older ancestor from a retained
+          # non-ancestor after a branch replacement or force-push.
+          fetch-depth: 0
 
       # A stalled mirror must fail the step, not the job. Apt retries 3 times
       # and treats 30 s without data as a stall. Later apt commands use this.
@@ -72,10 +72,15 @@ jobs:
           EVENT_BASE: ${{ github.event.merge_group.base_sha || github.event.before }}
         run: |
           if [ "$EVENT" = pull_request ]; then
-            base=$(git rev-parse HEAD^1)
+            event_base=$(git rev-parse HEAD^1)
           else
-            git fetch --no-tags --depth=1 origin "$EVENT_BASE"
-            base=$EVENT_BASE
+            event_base=$EVENT_BASE
+          fi
+          base=$(sh .github/scripts/check-base.sh "$event_base")
+          if [ -z "$base" ]; then
+            # A root has no preceding layout. Still run every coverage,
+            # self-test and declaration check against the available tree.
+            base=$(git rev-parse HEAD)
           fi
           echo "sha=$base" >> "$GITHUB_OUTPUT"
 

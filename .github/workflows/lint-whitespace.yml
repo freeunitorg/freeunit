@@ -29,26 +29,22 @@ jobs:
       with:
         fetch-depth: 0
 
+    - name: Test the commit-check baseline selection
+      run: sh .github/scripts/check-base-test.sh
+
     - name: git log --check
       id: check_out
       if: ${{ !startsWith(github.ref, 'refs/tags/') }}
       env:
         BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
       run: |
-        # A push that creates a branch has an all-zero base.  A force-push
-        # can leave the base out of the clone.  Check only the head commit.
-        range="${BASE}.."
-        if test -z "${BASE}" \
-           || test "${BASE}" = 0000000000000000000000000000000000000000 \
-           || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null
+        base=$(sh .github/scripts/check-base.sh "$BASE")
+        if test -n "$base"
         then
-          if git rev-parse -q --verify HEAD^ >/dev/null
-          then
-            range="HEAD^..HEAD"
-          else
-            range="HEAD"
-          fi
-          echo "::notice::Base '${BASE}' is not usable. Checking ${range} only."
+          range="${base}..HEAD"
+        else
+          # A root commit has no parent; check its additions directly.
+          range="HEAD"
         fi
 
         # Run git log before the loop, so that its failure fails the step.
