@@ -1487,6 +1487,7 @@ def test_routes_match_arguments_chars():
 
     def check_args(args, query):
         route_match({"arguments": args})
+        query = query.replace(' ', '%20')
         assert client.get(url=f'/?{query}')['status'] == 200
 
     check_args({chars: chars}, f'{chars}={chars}')
