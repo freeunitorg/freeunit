@@ -115,9 +115,10 @@ The tag can be pushed just as the branch is. E.g.
 Do not create the `unitctl/X.Y.Z` tag by hand.  Pushing `X.Y.Z` runs
 .github/workflows/unitctl.yml, whose release job creates `unitctl/X.Y.Z`
 and its release itself; a tag that already exists makes that step fail.
-The same push runs build-deb.yml and release-docker.yml; the latter logs
-in to Docker Hub, so the DOCKERHUB_USERNAME and DOCKERHUB_TOKEN secrets
-have to be set before the tag is pushed.
+The same push runs build-deb.yml, release-docker.yml and
+release-source.yml.  release-docker.yml logs in to Docker Hub, so the
+DOCKERHUB_USERNAME and DOCKERHUB_TOKEN secrets have to be set before the
+tag is pushed.
 
 
 # A new 'Release'
@@ -128,11 +129,60 @@ After a while the new release should show up at
 
 # Tarball
 
-We need to publish an archive of the source and a checksum.
+Pushing the tag `X.Y.Z` runs .github/workflows/release-source.yml.  It
+runs `make -C pkg dist` and attaches `unit-X.Y.Z.tar.gz` and
+`unit-X.Y.Z.tar.gz.sha512` to the published GitHub release for the tag.
+If no release exists yet, the job creates a published release with a
+one-line body, and build-deb.yml adds its package section later.  The
+job fails if the version file at the tag does not name `X.Y.Z`, or if
+the release for the tag is still a draft.
 
-    $ cd pkg
-    $ make dist
-    $ rsync -tv unit-X.Y.Z.tar.* dev:/data/www/freeunit.org/download/
+To verify the published files:
+
+    $ base=https://github.com/freeunitorg/freeunit/releases/download/X.Y.Z
+    $ curl -fLO $base/unit-X.Y.Z.tar.gz
+    $ curl -fLO $base/unit-X.Y.Z.tar.gz.sha512
+    $ sha512sum -c unit-X.Y.Z.tar.gz.sha512
+
+The tar stream is reproducible: the file times are the commit time.
+The .tar.gz is not always the same.  Since git 2.38, `git archive`
+compresses .tar.gz inside git with the zlib that git is linked to, and
+the gzip header has no time stamp.  So a rebuild from the same tag gives
+the same checksum only with git 2.38 or newer linked to zlib, as on the
+Ubuntu runner.  A git linked to zlib-ng (Fedora, Arch), an older git, or
+a `tar.tar.gz.command` setting gives other bytes with the same content.
+
+The job never replaces a published file.  When the release already has
+`unit-X.Y.Z.tar.gz` or its `.sha512`, the job compares the sha512.  If
+it is equal, the job does not upload the file again.  If it differs, the
+job fails and prints both sums.  Packagers pin this checksum, so do not
+replace a published tarball.
+
+If the job failed, re-run it from the default branch: on the Actions tab
+pick "Release source tarball", "Run workflow", the default branch, and
+enter the release tag `X.Y.Z`.  Dispatching from the default branch runs
+the current workflow definition; "Re-run jobs" on the original tag push
+repeats the definition at the pushed tag, so a later fix would not apply.
+To upload by hand instead, check out the tag and rebuild the files.
+Then download the files that are already on the release and compare
+them with the rebuilt ones:
+
+    $ git checkout X.Y.Z
+    $ make -C pkg dist
+    $ rm -rf old
+    $ gh release download X.Y.Z -D old -p 'unit-X.Y.Z.tar.gz*'
+    $ cmp old/unit-X.Y.Z.tar.gz pkg/unit-X.Y.Z.tar.gz
+    $ cmp old/unit-X.Y.Z.tar.gz.sha512 pkg/unit-X.Y.Z.tar.gz.sha512
+
+`gh release download` fails when the release has neither file, and
+`cmp` reports a missing file for each file that is not on the release.
+If `cmp` reports that a file differs, stop and upload nothing, as the
+job does.  Otherwise upload only the files that are missing.  Without
+`--clobber`, `gh` refuses the whole command when any file it names is
+already on the release, so give each file its own command:
+
+    $ gh release upload X.Y.Z pkg/unit-X.Y.Z.tar.gz
+    $ gh release upload X.Y.Z pkg/unit-X.Y.Z.tar.gz.sha512
 
 
 # Docs
