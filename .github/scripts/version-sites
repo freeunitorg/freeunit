@@ -95,3 +95,8 @@ pkg/docker/README.md	pin	rust	freeunit-builder:[a-z0-9.]+-rust
 test/README.md	pin	rust	freeunit-builder:[a-z0-9.]+-rust
 test/README.md	pin	rust	Rust[ ]
 test/run-local.sh	pin	rust	RUST_VERSION=
+
+# OpenSSL built from source: the same release in CI and in the macOS
+# archive.  The sha256 next to each version has to move with it.
+.github/workflows/build-test.yml	pin-source	openssl	OPENSSL_VERSION:[ ]
+pkg/macos/build-tarball.sh	pin	openssl	OPENSSL_VERSION=

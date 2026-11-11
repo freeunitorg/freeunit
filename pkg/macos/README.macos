@@ -1,0 +1,59 @@
+FreeUnit @VERSION@ for macOS
+============================
+
+This archive has unitd, its man page, and libunit with its headers.
+OpenSSL @OPENSSL@ and PCRE2 @PCRE2@ are linked into unitd; it needs only
+the libraries of macOS 13 or later.  There are no language modules:
+applications of type "external" (Go, Node.js) build with libunit.  The
+other way to install is the Homebrew tap of the repository:
+
+    brew tap freeunitorg/freeunit https://github.com/freeunitorg/freeunit
+    brew install freeunitorg/freeunit/freeunit
+
+Check the archive, then install it under /usr/local:
+
+    shasum -a 256 -c @NAME@.tar.gz.sha256
+    sudo tar -xzf @NAME@.tar.gz -C /usr/local --strip-components 1 \
+        --no-same-owner --exclude README.macos
+
+An archive that a browser downloaded carries the quarantine attribute,
+and macOS refuses to run the unsigned unitd from it.  curl does not set
+the attribute.  To remove it:
+
+    xattr -d com.apple.quarantine @NAME@.tar.gz
+
+unitd was configured with the default paths:
+
+    control socket   /usr/local/var/run/unit/control.unit.sock
+    state            /usr/local/var/lib/unit
+    log              /usr/local/var/log/unit/unit.log
+    pid file         /usr/local/var/run/unit/unit.pid
+    modules          /usr/local/lib/unit/modules
+
+Create the directories and start it:
+
+    sudo mkdir -p /usr/local/var/lib/unit /usr/local/var/log/unit \
+        /usr/local/var/run/unit
+    sudo /usr/local/sbin/unitd
+
+Run as a user, any path can be given on the command line instead.
+unitd does not create the state directory:
+
+    mkdir -p $HOME/unit/state
+    unitd --no-daemon --control unix:$HOME/unit/control.sock \
+        --statedir $HOME/unit/state --pid $HOME/unit/unit.pid \
+        --log $HOME/unit/unit.log --tmpdir $HOME/unit
+
+Then configure it through the control socket.  The socket of unitd
+started with sudo is for root only:
+
+    sudo curl -X PUT --unix-socket /usr/local/var/run/unit/control.unit.sock \
+        -d '{"listeners": {"127.0.0.1:8080": {"pass": "routes"}},
+             "routes": [{"action": {"return": 200}}]}' \
+        http://localhost/config
+
+For unitd run as a user, use its socket, here $HOME/unit/control.sock,
+without sudo.
+
+unitctl for macOS is in the unitctl/@VERSION@ release.  The licenses are
+in share/doc/freeunit.
