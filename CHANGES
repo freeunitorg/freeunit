@@ -24,6 +24,13 @@ Changes with FreeUnit 1.38.0                                     09 Nov 2026
        "opcache.restrict_api" is set, when the script is not cached, and on
        PHP older than 8.1.
 
+    *) Feature: the repository is a Homebrew tap. The "freeunit" formula
+       builds unitd and libunit from the release tarball, with OpenSSL,
+       PCRE2, zlib, zstd and Brotli, and has a service for "brew services".
+       The "unitctl" formula installs the released unitctl binary for macOS
+       or Linux. They replace a unitctl formula that still pointed at the
+       releases of an older project.
+
 
 Changes with FreeUnit 1.37.2                                     09 Nov 2026
 

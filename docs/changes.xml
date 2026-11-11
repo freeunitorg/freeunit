@@ -42,6 +42,16 @@ than 8.1.
 </para>
 </change>
 
+<change type="feature">
+<para>
+the repository is a Homebrew tap.  The "freeunit" formula builds unitd and
+libunit from the release tarball, with OpenSSL, PCRE2, zlib, zstd and Brotli,
+and has a service for "brew services".  The "unitctl" formula installs the
+released unitctl binary for macOS or Linux.  They replace a unitctl formula
+that still pointed at the releases of an older project.
+</para>
+</change>
+
 </changes>
 
 

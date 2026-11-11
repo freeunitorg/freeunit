@@ -134,6 +134,26 @@ We need to publish an archive of the source and a checksum.
     $ make dist
     $ rsync -tv unit-X.Y.Z.tar.* dev:/data/www/freeunit.org/download/
 
+Attach the same files to the GitHub release; the Homebrew formula
+downloads the tarball from there:
+
+    $ gh release upload X.Y.Z unit-X.Y.Z.tar.gz unit-X.Y.Z.tar.gz.sha512
+
+
+# Homebrew
+
+The repository is also a Homebrew tap: `HomebrewFormula` links to
+pkg/brew.  When the tarball is attached to the X.Y.Z release and the
+unitctl/X.Y.Z release has its binaries, point the formulae at them and
+open a pull request with the result:
+
+    $ pkg/brew/update.sh X.Y.Z
+
+The Homebrew workflow builds and tests both formulae on macOS, and its
+weekly run fails while the formulae name an older release than the
+newest tag.  A new run of the unitctl workflow for a tag replaces the
+binaries of unitctl/X.Y.Z; run update.sh again after one.
+
 
 # Docs
 
