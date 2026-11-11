@@ -1,5 +1,5 @@
-# TEMPORARY: lists which hosted runner labels this repo can use and what
-# hardware they give.  Not for merge.
+# TEMPORARY: checks which Ubuntu mirrors resolve and serve apt on the hosted
+# runners, on the host and inside Docker.  Not for merge.
 name: "zz probe runners"
 
 on:
@@ -15,29 +15,44 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ ubuntu-22.04, ubuntu-24.04, ubuntu-26.04,
-                  ubuntu-22.04-arm, ubuntu-24.04-arm, ubuntu-26.04-arm,
-                  macos-15, macos-15-intel, macos-26 ]
+        runner: [ ubuntu-24.04, ubuntu-26.04 ]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     steps:
-      - name: Hardware
-        shell: bash
+      - name: Resolver
         run: |
-          {
-            echo "### ${{ matrix.runner }}"
-            echo '```'
-            uname -srm
-            if command -v lscpu > /dev/null; then
-              lscpu | grep -E '^(Model name|CPU\(s\)|Thread|Core|Socket|Flags)' | cut -c1-200
-              free -g | head -2
-              nproc
-            else
-              sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
-            fi
-            df -h / | tail -1
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Single-thread speed (openssl speed sha256, 3 s)
-        shell: bash
-        run: openssl speed -seconds 3 sha256 2>/dev/null | tail -1 | tee -a "$GITHUB_STEP_SUMMARY"
+          cat /etc/resolv.conf || true
+          resolvectl status 2>/dev/null | head -20 || true
+          cat /etc/apt/apt-mirrors.txt 2>/dev/null || true
+
+      - name: Host DNS and HTTP
+        run: |
+          for h in azure.archive.ubuntu.com archive.ubuntu.com \
+                   security.ubuntu.com ports.ubuntu.com \
+                   archive.archive.ubuntu.com security.archive.ubuntu.com \
+                   mirrors.edge.kernel.org mirror.leaseweb.net \
+                   ftp.halifax.rwth-aachen.de mirrors.kernel.org \
+                   deb.debian.org github.com; do
+            ip=$(getent ahostsv4 "$h" | awk 'NR==1{print $1}')
+            code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "http://$h/" || echo ERR)
+            echo "$h ip=${ip:-NONE} http=$code"
+          done
+
+      - name: Host apt via the default mirrors
+        run: sudo apt-get update 2>&1 | tail -5
+
+      - name: Host apt via mirrors.edge.kernel.org
+        run: |
+          . /etc/os-release
+          echo "deb http://mirrors.edge.kernel.org/ubuntu $VERSION_CODENAME main" \
+            | sudo tee /etc/apt/sources.list.d/probe.list
+          sudo apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/probe.list \
+            -o Dir::Etc::sourceparts=- 2>&1 | tail -5
+
+      - name: Docker DNS (xenial, as cross uses)
+        run: |
+          docker run --rm ubuntu:16.04 sh -c '
+            cat /etc/resolv.conf
+            for h in archive.ubuntu.com ports.ubuntu.com mirrors.edge.kernel.org; do
+              getent hosts $h || echo "$h NONE"
+            done' 2>&1 | tail -10
