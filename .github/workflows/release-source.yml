@@ -1,0 +1,188 @@
+name: "Release source tarball"
+
+# Pushing a release tag X.Y.Z attaches the source tarball
+# unit-X.Y.Z.tar.gz and its checksum unit-X.Y.Z.tar.gz.sha512 to the
+# GitHub release for that tag.  The files are made by "make -C pkg dist",
+# the same command RELEASE-PROCESS.md gives for a rebuild by hand.
+#
+# The "-buildN" packaging tags of build-deb.yml are not matched: they
+# carry no new source.
+#
+# The release for the tag usually exists already: it is made in the web
+# interface, and publishing it creates the tag.  When the tag is pushed
+# with git and no release exists yet, this job creates a published
+# release with the tag as its title and a one-line body.  build-deb.yml
+# adds its package section to that body between two marker comments and
+# keeps the rest.  unitctl.yml uses its own unitctl/X.Y.Z tag.
+#
+# The job uploads only to the published release for the tag.  It stops
+# when the release for the tag is still a draft.  build-deb.yml creates
+# its release as a draft and publishes it after its uploads
+# (softprops/action-gh-release), so this job can meet that draft if it
+# runs late or is re-run while build-deb.yml uploads.  "gh release
+# upload" can then pick the draft, so the job checks afterwards that
+# the files are on the published release, and fails if not.  A re-run
+# of the job then finishes the upload.
+#
+# The job never replaces a published file.  The .tar.gz bytes depend on
+# the deflate code that git uses (see RELEASE-PROCESS.md), so a rebuild
+# can give another checksum.  When the release already has a file, the
+# job compares its sha512 with the new one.  Equal: the file is not
+# uploaded again.  Different: the job fails and prints both sums.
+#
+# The job never edits the release body, title or flags of a release that
+# exists.
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+  # A manual run from the default branch re-does an already-pushed tag
+  # with the workflow definition of the default branch.  A tag push runs
+  # the file at the pushed tag, and re-running that run repeats it, so a
+  # later fix would not reach it.  A manual run from another branch or
+  # from a tag runs the file at that ref.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag X.Y.Z to attach the source tarball to"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Key on the tag itself so a tag push (refs/tags/X) and a manual run
+  # dispatched from the default branch (refs/heads/master) for the same
+  # tag serialize instead of running at once.
+  group: release-source-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  tarball:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write   # required to create the release and upload assets
+    steps:
+      # Check out the tag.  On a tag push github.ref_name is the tag; a
+      # manual run names it in the tag input.  The default depth of 1 is
+      # enough: git archive needs the tree and the commit time only.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          persist-credentials: false
+
+      - name: Build the tarball and its checksum
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          # pkg/Makefile archives the tree-ish named by NXT_VERSION from the
+          # version file, so the tag and the version file must agree.
+          ver=$(sed -n 's/^NXT_VERSION=//p' version)
+          if [ "$ver" != "$TAG" ]; then
+            echo "::error::tag $TAG, but the version file has ${ver:-no NXT_VERSION}"
+            exit 1
+          fi
+          git rev-parse --verify --quiet "refs/tags/$TAG^{commit}" >/dev/null \
+            || { echo "::error::tag $TAG is not in the checkout"; exit 1; }
+
+          make -C pkg dist
+
+          tgz="pkg/unit-$TAG.tar.gz"
+          # The archive must hold the tagged version file.
+          arc_ver=$(tar -xzOf "$tgz" "unit-$TAG/version" \
+                    | sed -n 's/^NXT_VERSION=//p')
+          if [ "$arc_ver" != "$TAG" ]; then
+            echo "::error::$tgz has NXT_VERSION ${arc_ver:-none}, expected $TAG"
+            exit 1
+          fi
+          (cd pkg && sha512sum -c "unit-$TAG.tar.gz.sha512")
+          ls -l "$tgz" "$tgz.sha512"
+
+      - name: Attach the tarball to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          tgz="unit-$TAG.tar.gz"
+          sum=$(cut -d' ' -f1 "pkg/$tgz.sha512")
+
+          # The tag endpoint returns only a published release, never a
+          # draft.
+          pub_id() {
+            gh api "repos/$GH_REPO/releases/tags/$TAG" --jq .id 2> gh.err
+          }
+          if ! id=$(pub_id); then
+            grep -q 'HTTP 404' gh.err || { cat gh.err >&2; exit 1; }
+            # The tag endpoint returned no published release.  "gh release
+            # view" also finds a draft, and succeeds for a published
+            # release too, so read isDraft rather than treat any hit as a
+            # draft: build-deb.yml may have published its draft between the
+            # two lookups.
+            if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft \
+                       2> gh.err)
+            then
+              if [ "$draft" = true ]; then
+                echo "::error::The release for $TAG is a draft." \
+                  "Publish it, then re-run this job."
+                exit 1
+              fi
+              # Published between the two lookups; resolve its id.
+              id=$(pub_id) || { cat gh.err >&2; exit 1; }
+            elif grep -q 'release not found' gh.err; then
+              gh release create "$TAG" --verify-tag --title "$TAG" \
+                --notes "The source tarball is attached. The release notes and the packages follow."
+              id=$(pub_id) || { cat gh.err >&2; exit 1; }
+            else
+              cat gh.err >&2
+              exit 1
+            fi
+          fi
+
+          list_assets() {
+            gh api "repos/$GH_REPO/releases/$id/assets?per_page=100" \
+              --paginate --jq '.[] | [.id, .name] | @tsv' > assets.tsv
+          }
+          asset_id() {
+            awk -F '\t' -v n="$1" '$2 == n { print $1 }' assets.tsv
+          }
+          list_assets
+          set --
+          for name in "$tgz" "$tgz.sha512"; do
+            aid=$(asset_id "$name")
+            if [ -z "$aid" ]; then
+              set -- "$@" "pkg/$name"
+              continue
+            fi
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/$GH_REPO/releases/assets/$aid" > old.bin
+            if [ "$name" = "$tgz" ]; then
+              old=$(sha512sum < old.bin | cut -d' ' -f1)
+            else
+              old=$(cut -d' ' -f1 old.bin)
+            fi
+            if [ "$old" != "$sum" ]; then
+              echo "::error::The release has $name for sha512 $old." \
+                "This build gives sha512 $sum." \
+                "The job does not replace a published file."
+              exit 1
+            fi
+            echo "$name is on the release with the same sha512, not uploaded again."
+          done
+          [ "$#" -gt 0 ] || exit 0
+
+          gh release upload "$TAG" "$@"
+          list_assets
+          for name in "$tgz" "$tgz.sha512"; do
+            if [ -z "$(asset_id "$name")" ]; then
+              echo "::error::$name is not on the published release for $TAG." \
+                "The upload may have gone to a draft for the same tag." \
+                "Re-run this job."
+              exit 1
+            fi
+          done
