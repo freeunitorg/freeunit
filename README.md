@@ -100,6 +100,21 @@ $ docker run -d \
       ghcr.io/freeunitorg/freeunit:latest-minimal
 ```
 
+### Homebrew (macOS)
+
+The repository is a Homebrew tap.  `freeunit` builds unitd from the release
+tarball; `unitctl` installs the released binary.
+
+```console
+$ brew tap freeunitorg/freeunit https://github.com/freeunitorg/freeunit
+$ brew install freeunitorg/freeunit/freeunit freeunitorg/freeunit/unitctl
+$ brew services start freeunit
+```
+
+The control socket is `$(brew --prefix)/var/run/unit/control.unit.sock`.
+The formula has no language modules; applications of type `external`
+(Go, Node.js) use the libunit that it installs.
+
 ### Build from Source
 
 ```console
@@ -114,10 +129,14 @@ $ sudo make unitd-install
 
 [`unitctl`](tools/README.md) streamlines the management of FreeUnit processes
 through an easy-to-use command line interface. Download it from the
-[releases page](https://github.com/freeunitorg/freeunit/releases).
+[releases page](https://github.com/freeunitorg/freeunit/releases): each
+`unitctl/X.Y.Z` release has a binary for Linux and macOS, x86_64 and
+aarch64.  On macOS, `brew install freeunitorg/freeunit/unitctl` installs it.
 
 ```console
-$ tar xzvf unitctl-master-x86_64-unknown-linux-gnu.tar.gz
+$ VER=X.Y.Z    # the version of the unitctl/X.Y.Z release
+$ curl -fLo unitctl https://github.com/freeunitorg/freeunit/releases/download/unitctl/$VER/unitctl-$VER-x86_64-unknown-linux-gnu
+$ chmod +x unitctl
 # mv unitctl /usr/local/bin/
 ```
 

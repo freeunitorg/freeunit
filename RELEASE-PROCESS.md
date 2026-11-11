@@ -135,6 +135,18 @@ We need to publish an archive of the source and a checksum.
     $ rsync -tv unit-X.Y.Z.tar.* dev:/data/www/freeunit.org/download/
 
 
+# Homebrew
+
+The repository is also a Homebrew tap: `HomebrewFormula` links to
+pkg/brew.  When the tarball is attached to the X.Y.Z release and the
+unitctl/X.Y.Z release has its binaries, point the formulae at them and
+open a pull request with the result:
+
+    $ pkg/brew/update.sh X.Y.Z
+
+The Homebrew workflow builds and tests both formulae on macOS.
+
+
 # Docs
 
 The unit-docs repository needs a copy of CHANGES under

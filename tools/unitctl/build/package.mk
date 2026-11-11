@@ -97,22 +97,11 @@ rpm-packages: install-packaging-rpm $(TARGETS) manpage $(RPM_PACKAGE_TARGETS)
 ### Homebrew Packages
 ################################################################################
 
-## Modifies the homebrew formula to point to the latest release
+## The Homebrew formula is pkg/brew/unitctl.rb at the top of the repository.
+## After a release, pkg/brew/update.sh X.Y.Z points it at the new binaries.
 .PHONY: homebrew-packages
-.ONESHELL: homebrew-packages
-homebrew-packages: target/dist/SHA256SUMS
-ifdef NEW_VERSION
-	VERSION=$(NEW_VERSION)
-endif
-	$Q \
-	VERSION="$(VERSION)" \
-    PACKAGE_NAME="$(PACKAGE_NAME)" \
-    SRC_REPO="$(SRC_REPO)" \
-	AARCH64_UNKNOWN_LINUX_GNU_SHA256="$$($(GREP) $(PACKAGE_NAME)_v$(VERSION)_aarch64-unknown-linux-gnu.tar.gz $(CURDIR)/target/dist/SHA256SUMS | cut -d ' ' -f 1)" \
-	X86_64_UNKNOWN_LINUX_GNU_SHA256="$$($(GREP) $(PACKAGE_NAME)_v$(VERSION)_x86_64-unknown-linux-gnu.tar.gz $(CURDIR)/target/dist/SHA256SUMS | cut -d ' ' -f 1)" \
-	X86_64_APPLE_DARWIN_SHA256="$$($(GREP) $(PACKAGE_NAME)_v$(VERSION)_x86_64-apple-darwin.tar.gz $(CURDIR)/target/dist/SHA256SUMS | cut -d ' ' -f 1)" \
-    AARCH64_APPLE_DARWIN_SHA256="$$($(GREP) $(PACKAGE_NAME)_v$(VERSION)_aarch64-apple-darwin.tar.gz $(CURDIR)/target/dist/SHA256SUMS | cut -d ' ' -f 1)" \
-	envsubst < $(CURDIR)/pkg/brew/$(PACKAGE_NAME).rb.template > $(CURDIR)/pkg/brew/$(PACKAGE_NAME).rb
+homebrew-packages:
+	$Q $(CURDIR)/../../pkg/brew/update.sh $(VERSION)
 
 
 ################################################################################
