@@ -10,6 +10,15 @@
          date="2026-11-09" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="change">
+<para>
+a request target that contains an unencoded space now gets a 400 response.
+Before, the space was accepted as part of the target.  The control API uses
+the same parser and closes the connection on such a request.  Percent-encoded
+spaces in paths and arguments remain supported.
+</para>
+</change>
+
 <change type="feature">
 <para>
 PHP exposes the decoded, normalized request path, without the query, in
