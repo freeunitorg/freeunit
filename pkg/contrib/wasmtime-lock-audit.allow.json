@@ -98,6 +98,13 @@
       "package": "pin-utils",
       "version": "0.1.0",
       "reason": "Linked by the Wasmtime 48.0.8 C API through futures-util (pin-utils remains in the archived lock through at least Wasmtime 50.0.1). RUSTSEC-2026-0441 is an unmaintained notice, not a vulnerability: the upstream repository was archived after 0.1.1 with no patched versions. The macros it provides (pin_mut!, unsafe_pinned!) are superseded by core::pin::pin! and pin-project-lite; FreeUnit does not call them. The source archive is vendored, so this exact version cannot be updated independently of the source pin. Recheck and remove this exception at the next pin bump."
+    },
+    {
+      "kind": "unsound",
+      "id": "RUSTSEC-2026-0486",
+      "package": "rustix",
+      "version": "1.1.4",
+      "reason": "Linked by the Wasmtime 48.0.8 C API through wasmtime, wasmtime-wasi, wasmtime-internal-cache, -fiber and -jit-debug, and through cap-primitives, fs-set-times, memfd and rustix-linux-procfs. RUSTSEC-2026-0486 concerns rustix::fs::getxattr, lgetxattr, fgetxattr, listxattr, llistxattr and flistxattr, which mark unwritten bytes as initialized when given a zero-length buffer. None of these crates calls those functions. The xattr crate, which does call them, is in the archived lock only through tar and is not linked by the C API. The source archive is vendored, so this exact version cannot be updated independently of the source pin. Recheck reachability and remove this exception at the next pin bump."
     }
   ]
 }
