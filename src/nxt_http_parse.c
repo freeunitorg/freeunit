@@ -158,7 +158,6 @@ nxt_http_parse_request_line(nxt_http_request_parse_t *rp, u_char **pos,
 {
     u_char                   *p, ch, *after_slash, *args;
     nxt_int_t                rc;
-    nxt_bool_t               rest;
     nxt_http_ver_t           ver;
     nxt_http_target_traps_e  trap;
 
@@ -250,9 +249,6 @@ nxt_http_parse_request_line(nxt_http_request_parse_t *rp, u_char **pos,
 
     after_slash = p + 1;
     args = NULL;
-    rest = 0;
-
-continue_target:
 
     for ( ;; ) {
         p++;
@@ -306,8 +302,6 @@ continue_target:
     }
 
 rest_of_target:
-
-    rest = 1;
 
     for ( ;; ) {
         p++;
@@ -374,13 +368,8 @@ space_after_target:
             }
         }
 
-        //rp->space_in_target = 1;
-
-        if (rest) {
-            goto rest_of_target;
-        }
-
-        goto continue_target;
+        /* A space ends the request target; only HTTP-version may follow. */
+        return NXT_HTTP_PARSE_INVALID;
     }
 
     /* " HTTP/1.1\r\n" or " HTTP/1.1\n" */
@@ -388,18 +377,12 @@ space_after_target:
     if (nxt_slow_path(p[9] != '\r' && p[9] != '\n')) {
 
         if (p[1] == ' ') {
-            /* surplus space after tartet */
+            /* surplus space after target */
             p++;
             goto space_after_target;
         }
 
-        //rp->space_in_target = 1;
-
-        if (rest) {
-            goto rest_of_target;
-        }
-
-        goto continue_target;
+        return NXT_HTTP_PARSE_INVALID;
     }
 
     nxt_memcpy(ver.str, &p[1], 8);

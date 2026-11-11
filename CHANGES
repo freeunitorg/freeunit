@@ -1,6 +1,10 @@
 
 Changes with FreeUnit 1.38.0                                     09 Nov 2026
 
+    *) Bugfix: a request target containing an unencoded space was accepted
+       as part of the request line; such requests now get a 400 response.
+       Percent-encoded spaces in paths and arguments remain supported.
+
 
 Changes with FreeUnit 1.37.2                                     09 Nov 2026
 

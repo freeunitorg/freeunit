@@ -1509,15 +1509,15 @@ def test_routes_match_arguments_empty():
 
 def test_routes_match_arguments_space():
     route_match({"arguments": {"+fo o%20": "%20b+a r"}})
-    assert client.get(url='/? fo o = b a r&')['status'] == 200
+    assert client.get(url='/? fo o = b a r&')['status'] == 400
     assert client.get(url='/?+fo+o+=+b+a+r&')['status'] == 200
     assert client.get(url='/?%20fo%20o%20=%20b%20a%20r&')['status'] == 200
 
     route_match({"arguments": {"%20foo": " bar"}})
-    assert client.get(url='/? foo= bar')['status'] == 200
+    assert client.get(url='/? foo= bar')['status'] == 400
     assert client.get(url='/?+foo=+bar')['status'] == 200
     assert client.get(url='/?%20foo=%20bar')['status'] == 200
-    assert client.get(url='/?+foo= bar')['status'] == 200
+    assert client.get(url='/?+foo= bar')['status'] == 400
     assert client.get(url='/?%20foo=+bar')['status'] == 200
 
 
@@ -1728,7 +1728,9 @@ def test_routes_match_query():
     assert client.get(url='/?a=b&c=d')['status'] == 200
 
     route_match({"query": "a=b%26c%3Dd+e"})
-    assert client.get(url='/?a=b&c=d e')['status'] == 200
+    assert client.get(url='/?a=b&c=d e')['status'] == 400
+    assert client.get(url='/?a=b&c=d+e')['status'] == 200
+    assert client.get(url='/?a=b&c=d%20e')['status'] == 200
 
 
 def test_routes_match_query_array():
