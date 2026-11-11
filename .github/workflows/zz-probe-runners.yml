@@ -49,10 +49,20 @@ jobs:
           sudo apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/probe.list \
             -o Dir::Etc::sourceparts=- 2>&1 | tail -5
 
-      - name: Docker DNS (xenial, as cross uses)
+      - name: Host apt with a fallback line in apt-mirrors.txt
         run: |
-          docker run --rm ubuntu:16.04 sh -c '
-            cat /etc/resolv.conf
-            for h in archive.ubuntu.com ports.ubuntu.com mirrors.edge.kernel.org; do
-              getent hosts $h || echo "$h NONE"
-            done' 2>&1 | tail -10
+          printf 'http://mirrors.edge.kernel.org/ubuntu/\tpriority:4\n' \
+            | sudo tee -a /etc/apt/apt-mirrors.txt
+          sudo apt-get update 2>&1 | tail -6
+          sudo apt-get install -y --no-install-recommends xsltproc dwarves 2>&1 | tail -3
+
+      - name: Docker xenial (the cross image) with fallback mirrors
+        run: |
+          docker run --rm ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5 sh -c '
+            cat /etc/apt/sources.list | grep -v "^#" | sort -u
+            sed -i -e "s#http://[a-z.]*archive.ubuntu.com/ubuntu#http://mirrors.edge.kernel.org/ubuntu#" \
+                   -e "s#http://ports.ubuntu.com/ubuntu-ports#http://ftp.halifax.rwth-aachen.de/ubuntu-ports#" \
+                   /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null
+            dpkg --add-architecture arm64
+            apt-get update 2>&1 | tail -8
+            apt-get install --assume-yes libssl-dev:arm64 2>&1 | tail -2' 2>&1 | tail -25
