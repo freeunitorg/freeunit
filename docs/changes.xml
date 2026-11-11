@@ -23,11 +23,11 @@ request target.  See https://github.com/nginx/unit/issues/1615.
 
 <change type="feature">
 <para>
-the repository is a Homebrew tap.  The "freeunit" formula builds unitd and
-libunit from the release tarball, with OpenSSL, PCRE2, zlib, zstd and Brotli,
-and has a service for "brew services".  The "unitctl" formula installs the
-released unitctl binary for macOS or Linux.  They replace a unitctl formula
-that still pointed at the releases of an older project.
+the repository is a Homebrew tap.  The "freeunit" formula installs unitd and
+libunit from the macOS archive of the release,
+has a service for "brew services", and installs the released unitctl binary
+for macOS or Linux.  It replaces a unitctl formula that still pointed at the
+releases of an older project.
 </para>
 </change>
 

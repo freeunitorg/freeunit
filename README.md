@@ -102,12 +102,12 @@ $ docker run -d \
 
 ### Homebrew (macOS)
 
-The repository is a Homebrew tap.  `freeunit` builds unitd from the release
-tarball; `unitctl` installs the released binary.
+The repository is a Homebrew tap.  The `freeunit` formula installs the unitd
+archive of the release for macOS, and the released `unitctl` binary with it.
 
 ```console
 $ brew tap freeunitorg/freeunit https://github.com/freeunitorg/freeunit
-$ brew install freeunitorg/freeunit/freeunit freeunitorg/freeunit/unitctl
+$ brew install freeunitorg/freeunit/freeunit
 $ brew services start freeunit
 ```
 
@@ -131,7 +131,7 @@ $ sudo make unitd-install
 through an easy-to-use command line interface. Download it from the
 [releases page](https://github.com/freeunitorg/freeunit/releases): each
 `unitctl/X.Y.Z` release has a binary for Linux and macOS, x86_64 and
-aarch64.  On macOS, `brew install freeunitorg/freeunit/unitctl` installs it.
+aarch64.  On macOS, `brew install freeunitorg/freeunit/freeunit` installs it with unitd.
 
 ```console
 $ VER=X.Y.Z    # the version of the unitctl/X.Y.Z release

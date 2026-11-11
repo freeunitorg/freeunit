@@ -138,13 +138,13 @@ We need to publish an archive of the source and a checksum.
 # Homebrew
 
 The repository is also a Homebrew tap: `HomebrewFormula` links to
-pkg/brew.  When the tarball is attached to the X.Y.Z release and the
+pkg/brew.  When the macOS archives are attached to the X.Y.Z release and the
 unitctl/X.Y.Z release has its binaries, point the formulae at them and
 open a pull request with the result:
 
     $ pkg/brew/update.sh X.Y.Z
 
-The Homebrew workflow builds and tests both formulae on macOS.
+The Homebrew workflow installs and tests the formula, with unitctl, on macOS.
 
 
 # Docs

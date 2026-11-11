@@ -97,8 +97,9 @@ rpm-packages: install-packaging-rpm $(TARGETS) manpage $(RPM_PACKAGE_TARGETS)
 ### Homebrew Packages
 ################################################################################
 
-## The Homebrew formula is pkg/brew/unitctl.rb at the top of the repository.
-## After a release, pkg/brew/update.sh X.Y.Z points it at the new binaries.
+## unitctl is installed by the freeunit formula, pkg/brew/freeunit.rb at the
+## top of the repository.  After a release, pkg/brew/update.sh X.Y.Z points it
+## at the new binaries.
 .PHONY: homebrew-packages
 homebrew-packages:
 	$Q $(CURDIR)/../../pkg/brew/update.sh $(VERSION)
