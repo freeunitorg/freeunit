@@ -106,7 +106,7 @@ jobs:
     - name: Check the generated files
       if: ${{ !cancelled() }}
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends xsltproc libxml2-utils
+        sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" update
+        sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" install -y --no-install-recommends xsltproc libxml2-utils
         make -C docs check
         make -C pkg/docker check

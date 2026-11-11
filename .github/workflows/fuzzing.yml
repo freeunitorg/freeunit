@@ -74,8 +74,8 @@ jobs:
       - name: Install clang and the sanitizer runtimes
         timeout-minutes: 5
         run: |
-          sudo apt-get -qq update
-          sudo apt-get -qq install -y --no-install-recommends \
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -qq update
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -qq install -y --no-install-recommends \
               clang llvm libclang-rt-dev
 
       - name: Build the fuzzers

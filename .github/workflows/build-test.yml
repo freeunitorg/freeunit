@@ -174,7 +174,7 @@ jobs:
 
       - name: Install packages
         timeout-minutes: 5
-        run: sudo apt-get -y install libbrotli-dev ccache
+        run: sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -y install libbrotli-dev ccache
 
       - name: Cache ccache
         uses: actions/cache@v6
@@ -200,7 +200,7 @@ jobs:
       - name: Build OpenSSL 3.5
         if: steps.cache-openssl35.outputs.cache-hit != 'true'
         run: |
-          sudo apt-get -y install build-essential
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -y install build-essential
           cd /tmp
           wget -q "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
           echo "${OPENSSL_SHA256}  openssl-${OPENSSL_VERSION}.tar.gz" | sha256sum -c -
@@ -636,7 +636,7 @@ jobs:
 
       - name: Install packages
         timeout-minutes: 5
-        run: sudo apt-get -y install libbrotli-dev
+        run: sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -y install libbrotli-dev
 
       # This job builds nothing against OpenSSL.  unitd from the core artifact
       # carries an rpath to /opt/openssl-3.5, so the slot must exist here with
@@ -653,7 +653,7 @@ jobs:
       - name: Build OpenSSL 3.5
         if: steps.cache-openssl35.outputs.cache-hit != 'true'
         run: |
-          sudo apt-get -y install build-essential
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -y install build-essential
           cd /tmp
           wget -q "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
           echo "${OPENSSL_SHA256}  openssl-${OPENSSL_VERSION}.tar.gz" | sha256sum -c -
@@ -796,8 +796,8 @@ jobs:
       - name: Install libperl-dev
         timeout-minutes: 5
         run: |
-          sudo apt-get -y update
-          sudo apt-get -y install libperl-dev
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -y update
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -y install libperl-dev
         if: steps.metadata.outputs.module == 'perl'
 
       - name: Configure perl
@@ -1244,8 +1244,8 @@ jobs:
       - name: Install packages
         timeout-minutes: 5
         run: |
-          sudo apt-get -y update
-          sudo apt-get -y install build-essential libssl-dev libpcre2-dev \
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -y update
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -y install build-essential libssl-dev libpcre2-dev \
             systemtap-sdt-dev zlib1g-dev libzstd-dev libbrotli-dev
 
       # --usdt is here because no other job compiles the probes.  The other
@@ -1427,8 +1427,8 @@ jobs:
       - name: Install packages
         timeout-minutes: 5
         run: |
-          sudo apt-get -y update
-          sudo apt-get -y install build-essential libpcre3-dev
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -y update
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -y install build-essential libpcre3-dev
 
       - name: Configure unit (--no-pcre2 --tests)
         run: ./configure --no-pcre2 --tests
@@ -1456,8 +1456,8 @@ jobs:
 
       - name: Install packages
         run: |
-          sudo apt-get -y update
-          sudo apt-get -y install build-essential libssl-dev libpcre2-dev
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -y update
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -y install build-essential libssl-dev libpcre2-dev
 
       - name: Configure unit with PCRE2 JIT
         env:
@@ -1507,8 +1507,8 @@ jobs:
       - name: Install packages
         timeout-minutes: 5
         run: |
-          sudo apt-get -y update
-          sudo apt-get -y install build-essential libssl-dev libpcre2-dev \
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -y update
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -y install build-essential libssl-dev libpcre2-dev \
             python3-dev python3-pytest
 
       - name: Configure unit with PCRE2 JIT
@@ -1581,8 +1581,8 @@ jobs:
       - name: Install packages
         timeout-minutes: 5
         run: |
-          sudo apt-get -y update
-          sudo apt-get -y install build-essential libssl-dev libpcre2-dev clang
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -y update
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -y install build-essential libssl-dev libpcre2-dev clang
 
       # -fno-sanitize-recover: the first UBSan report fails the job.
       # nxt_conf_map_object_test fails only under UBSan.
