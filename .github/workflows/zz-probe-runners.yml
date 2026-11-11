@@ -57,13 +57,15 @@ jobs:
             cat /etc/apt/sources.list | grep -v "^#" | grep . | sort -u
             sed -i -e "s#http://[a-z.]*archive.ubuntu.com/ubuntu#http://mirrors.edge.kernel.org/ubuntu#" \
                    -e "s#http://ports.ubuntu.com/ubuntu-ports#http://ftp.halifax.rwth-aachen.de/ubuntu-ports#" \
-                   /etc/apt/sources.list
+                   /etc/apt/sources.list $(ls /etc/apt/sources.list.d/*.list 2>/dev/null)
+            dpkg --add-architecture arm64
+            grep -rh "^deb" /etc/apt/sources.list /etc/apt/sources.list.d/ | sort -u
             dpkg --add-architecture arm64
             apt-get update 2>&1 | tail -12
             apt-get install --assume-yes libssl-dev:arm64 2>&1 | tail -2' 2>&1 | tail -30
 
       - name: Host apt with the mirror list replaced
-        if: always()
+        if: false
         timeout-minutes: 5
         run: |
           if ! getent hosts archive.ubuntu.com > /dev/null; then
