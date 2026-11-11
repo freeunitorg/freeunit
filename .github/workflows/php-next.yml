@@ -74,8 +74,8 @@ jobs:
 
       - name: Build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" update
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" install -y --no-install-recommends \
             build-essential autoconf bison re2c pkg-config git \
             libssl-dev libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev \
             brotli zstd

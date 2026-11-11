@@ -58,8 +58,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get -y update
-          sudo apt-get -y install build-essential libssl-dev libpcre2-dev
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -y update
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" -y install build-essential libssl-dev libpcre2-dev
 
       - name: Configure unit (ThreadSanitizer, --tests, --openssl)
         run: |
