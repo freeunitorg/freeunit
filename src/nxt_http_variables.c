@@ -71,6 +71,7 @@ static nxt_var_decl_t  nxt_http_vars[] = {
         .name = nxt_string("request_uri"),
         .handler = nxt_http_var_request_uri,
         .cacheable = 1,
+        .uri_encoded = 1,
     }, {
         .name = nxt_string("uri"),
         .handler = nxt_http_var_uri,

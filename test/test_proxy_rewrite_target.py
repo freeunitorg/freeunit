@@ -74,10 +74,11 @@ def setup_method_fixture():
 
 def test_proxy_rewrite_target_crlf():
     # The request path carries a percent-encoded CR/LF.  The main parser decodes
-    # it into a raw CR/LF in r->path (quoted); the rewrite then re-parses "$uri"
-    # and the raw bytes leave quoted_target unset.  The proxied upstream request
-    # line must carry them percent-encoded, not raw -- a raw CR/LF would inject a
-    # header into, or smuggle a request to, the upstream.
+    # it into a raw CR/LF in r->path.  The rewrite writes the value of "$uri"
+    # encoded and parses it again, so r->path holds the raw CR/LF again.  The
+    # proxied upstream request line must carry them percent-encoded, not raw --
+    # a raw CR/LF would inject a header into, or smuggle a request to, the
+    # upstream.
     client.get(
         url='/x%0D%0AInjected:%20smuggled',
         headers={'Host': 'localhost', 'Connection': 'close'},
@@ -173,6 +174,35 @@ def test_proxy_rewrite_target_delimiters():
         ('/q/x', b'/qq'),
         ('/q/x?a=1', b'/qq?a=1'),
         ('/p/x?a=1', b'/pp%3Fk=v?a=1'),
+    ]
+
+    seen = [(url, proxied_target(url)) for url, _ in cases]
+
+    assert seen == [(url, want) for url, want in cases]
+
+
+def test_proxy_rewrite_target_uri_value():
+    # "$uri" is decoded once.  A rewrite keeps its value as data, so a "?"
+    # or "#" in it is part of the path, and the upstream gets it encoded.
+    # A path that the client encoded twice stays encoded once.
+    assert 'success' in client.conf(
+        {
+            "rewrite": [
+                {"action": {"rewrite": "/app$uri", "pass": "routes/proxy"}}
+            ],
+            "proxy": [
+                {"action": {"proxy": f"http://127.0.0.1:{UPSTREAM_PORT}"}}
+            ],
+        },
+        'routes',
+    ), 'uri value routes'
+
+    cases = [
+        ('/v1/a%3Fb', b'/app/v1/a%3Fb'),
+        ('/v1/a%23b?q=1', b'/app/v1/a%23b?q=1'),
+        ('/v1/a%253Fb', b'/app/v1/a%253Fb'),
+        ('/v1/a%0D%0Ab', b'/app/v1/a%0D%0Ab'),
+        ('/v1/plain?q=1', b'/app/v1/plain?q=1'),
     ]
 
     seen = [(url, proxied_target(url)) for url, _ in cases]

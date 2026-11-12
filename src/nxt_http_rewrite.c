@@ -16,7 +16,13 @@ nxt_http_rewrite_init(nxt_router_conf_t *rtcf, nxt_http_action_t *action,
 
     nxt_conf_get_string(acf->rewrite, &str);
 
-    action->rewrite = nxt_tstr_compile(rtcf->tstr_state, &str, 0);
+    /*
+     * The result is parsed as an encoded request target.  A variable such as
+     * $uri is already decoded: it is written encoded, so that the parse does
+     * not decode it a second time.
+     */
+    action->rewrite = nxt_tstr_compile(rtcf->tstr_state, &str,
+                                       NXT_TSTR_URI_ENCODE);
     if (nxt_slow_path(action->rewrite == NULL)) {
         return NXT_ERROR;
     }

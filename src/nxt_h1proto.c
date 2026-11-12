@@ -3350,11 +3350,11 @@ nxt_h1p_peer_request_target(nxt_http_request_t *r, nxt_str_t *target)
 
     /*
      * The URI was rewritten, so r->path is the rewrite result, not the request
-     * line as received.  nxt_http_parse_complex_target() copies any byte that
-     * is not "%"-quoted verbatim, so a rewrite that interpolates a variable
-     * (e.g. "$uri") can place a raw CR, LF or space into r->path.  Encode by
-     * the path's actual content so such a byte cannot break the upstream
-     * request line (request smuggling / header injection).
+     * line as received.  The parse of the rewrite result decodes "%XX" and
+     * copies every other byte, so r->path can hold a raw CR, LF or space: from
+     * the value of a variable such as "$uri", or from the text of the
+     * template.  Encode by the path's actual content so such a byte cannot
+     * break the upstream request line (request smuggling / header injection).
      *
      * r->path is a decoded path only.  A "?" or "#" in it is data, so it is
      * encoded too.  The query follows from r->args.

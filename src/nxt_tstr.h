@@ -42,6 +42,13 @@ typedef enum {
      * record and starts a line the client chose.
      */
     NXT_TSTR_ESCAPE     = 1 << 3,
+    /*
+     * The result is read as an encoded URI, as "rewrite" does.  Write what a
+     * variable expands to percent-encoded, so that the decode of the result
+     * gives the value back unchanged.  A variable that holds encoded URI text
+     * ($request_uri) is copied as it is.
+     */
+    NXT_TSTR_URI_ENCODE = 1 << 4,
 } nxt_tstr_flags_t;
 
 

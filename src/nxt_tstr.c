@@ -338,6 +338,10 @@ nxt_tstr_query(nxt_task_t *task, nxt_tstr_query_t *query, nxt_tstr_t *tstr,
             flags |= NXT_VAR_ESCAPE;
         }
 
+        if (tstr->flags & NXT_TSTR_URI_ENCODE) {
+            flags |= NXT_VAR_URI_ENCODE;
+        }
+
         ret = nxt_var_interpreter(task, query->state, &query->cache->var,
                                   tstr->u.var, val, query->ctx, flags);
 

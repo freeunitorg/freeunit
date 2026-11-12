@@ -21,6 +21,8 @@ typedef struct {
     nxt_str_t               name;
     nxt_var_handler_t       handler;
     uint8_t                 cacheable;  /* 1 bit */
+    /* The value is encoded URI text; see NXT_VAR_URI_ENCODE. */
+    uint8_t                 uri_encoded;  /* 1 bit */
 } nxt_var_decl_t;
 
 
@@ -30,6 +32,7 @@ typedef struct {
     void                    *data;
     uint32_t                index;
     uint8_t                 cacheable;  /* 1 bit */
+    uint8_t                 uri_encoded;  /* 1 bit */
 } nxt_var_ref_t;
 
 
@@ -62,6 +65,11 @@ typedef enum {
     NXT_VAR_LOGGING     = 1 << 0,
     /* Escape the bytes a variable expands to; see nxt_var_escape(). */
     NXT_VAR_ESCAPE      = 1 << 1,
+    /*
+     * Percent-encode the value of each variable but one whose declaration
+     * sets uri_encoded, with nxt_encode_uri().  Not used with NXT_VAR_ESCAPE.
+     */
+    NXT_VAR_URI_ENCODE  = 1 << 2,
 } nxt_var_flags_t;
 
 
