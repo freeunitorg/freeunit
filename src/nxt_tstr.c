@@ -4,6 +4,7 @@
  */
 
 #include <nxt_main.h>
+#include <nxt_checked.h>
 
 
 typedef enum {
@@ -312,6 +313,56 @@ nxt_tstr_escape(nxt_mp_t *mp, nxt_str_t *val, nxt_bool_t newline)
     return NXT_OK;
 }
 
+
+/*
+ * A JS template gives one string, and the literal text of the template cannot
+ * be told apart from the values in it.  For a result that is read as an
+ * encoded URI, percent-encode all of it: the decode of the result then gives
+ * the string back unchanged.  Not for a template with NXT_TSTR_STRZ: its
+ * trailing NUL would be encoded too.
+ */
+
+static nxt_int_t
+nxt_tstr_uri_encode(nxt_mp_t *mp, nxt_str_t *val)
+{
+    size_t     n, size;
+    u_char     *p;
+    nxt_str_t  encoded;
+
+    if (val->length == 0) {
+        return NXT_OK;
+    }
+
+    n = nxt_encode_uri(NULL, val->start, val->length);
+
+    if (n == 0) {
+        return NXT_OK;
+    }
+
+    /* Each byte to encode becomes three: "%" and two hex digits. */
+
+    if (nxt_slow_path(nxt_size_mul(n, 2, &size)
+                      || nxt_size_add(val->length, size, &size)))
+    {
+        return NXT_ERROR;
+    }
+
+    encoded.start = nxt_mp_nget(mp, size);
+    if (nxt_slow_path(encoded.start == NULL)) {
+        return NXT_ERROR;
+    }
+
+    p = (u_char *) nxt_encode_uri(encoded.start, val->start, val->length);
+
+    nxt_assert(p == encoded.start + size);
+
+    encoded.length = p - encoded.start;
+
+    *val = encoded;
+
+    return NXT_OK;
+}
+
 #endif
 
 
@@ -366,6 +417,13 @@ nxt_tstr_query(nxt_task_t *task, nxt_tstr_query_t *query, nxt_tstr_t *tstr,
              */
             ret = nxt_tstr_escape(query->cache->var.pool, val,
                                   (tstr->flags & NXT_TSTR_NEWLINE) != 0);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                return NXT_ERROR;
+            }
+        }
+
+        if (tstr->flags & NXT_TSTR_URI_ENCODE) {
+            ret = nxt_tstr_uri_encode(query->cache->var.pool, val);
             if (nxt_slow_path(ret != NXT_OK)) {
                 return NXT_ERROR;
             }
