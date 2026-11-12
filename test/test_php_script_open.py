@@ -526,6 +526,7 @@ def test_php_script_open_static_script_opcache_open_path(
 
 
 MISSED = r'missed OPcache and is opened'
+MISS_FAILED = r'missed OPcache and cannot be opened'
 
 # Runs after the module decided that OPcache serves the script, and before
 # the script is compiled.  It makes the compile miss the cache, and it can
@@ -541,6 +542,9 @@ MISS_PREPEND = (
     '$s = $_SERVER["SCRIPT_FILENAME"];\n'
     'if (isset($_GET["invalidate"])) {\n'
     '    opcache_invalidate($s, true);\n'
+    '}\n'
+    'if (isset($_GET["disable"])) {\n'
+    '    ini_set("opcache.enable", "0");\n'
     '}\n'
     'if (isset($_GET["remove"])) {\n'
     '    unlink($s);\n'
@@ -641,7 +645,28 @@ def test_php_script_open_static_script_opcache_miss_protected(script_tree):
     assert resp['body'] == 'second', resp
 
 
-def test_php_script_open_static_script_opcache_miss_removed(script_tree):
+def test_php_script_open_static_script_opcache_miss_disabled(
+    script_tree, findall
+):
+    script = require_opcache_miss(script_tree)
+
+    write_opcache_script(script, 'second')
+
+    # The prepend script turns OPcache off after the module decided that
+    # OPcache serves the script, so the compile reads the file.
+    resp = client.get(url='/?disable=1')
+    assert resp['status'] == 200, resp
+    assert resp['body'] == 'second', resp
+
+    if not findall(r'\[debug\]'):
+        return
+
+    assert len(findall(MISSED)) == 1, 'the module opened the missed script'
+
+
+def test_php_script_open_static_script_opcache_miss_removed(
+    script_tree, findall
+):
     script = require_opcache_miss(script_tree)
     Path(f'{script_tree}/miss/info.php').write_bytes(script.read_bytes())
 
@@ -656,6 +681,38 @@ def test_php_script_open_static_script_opcache_miss_removed(script_tree):
     resp = client.get(url='/')
     assert resp['status'] == 200, resp
     assert resp['body'] == 'first', resp
+
+    if not findall(r'\[debug\]'):
+        return
+
+    assert len(findall(MISS_FAILED)) == 1, 'the failed open is recorded'
+
+
+def test_php_script_open_static_script_opcache_miss_unreadable(
+    script_tree, findall
+):
+    # The script becomes unreadable after the module decided that OPcache
+    # serves it: the prepend script moves a file with no permissions over
+    # it.  The failed open of the miss gets the status of the open path.
+    script = require_opcache_miss(script_tree)
+    replacement = Path(f'{script_tree}/miss/replacement')
+    write_opcache_script(replacement, 'second')
+    replacement.chmod(0)
+
+    resp = client.get(url='/?invalidate=1&replace=replacement')
+    assert resp['status'] == 403, resp
+    assert resp['body'] == '', resp
+
+    script.chmod(0o644)
+
+    resp = client.get(url='/')
+    assert resp['status'] == 200, resp
+    assert resp['body'] == 'second', resp
+
+    if not findall(r'\[debug\]'):
+        return
+
+    assert len(findall(MISS_FAILED)) == 1, 'the failed open is recorded'
 
 
 @pytest.mark.parametrize(

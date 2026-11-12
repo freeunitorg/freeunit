@@ -8,7 +8,6 @@
 #include "SAPI.h"
 #include "php_main.h"
 #include "php_variables.h"
-#include "zend_exceptions.h"
 #include "ext/standard/php_standard.h"
 
 #include <nxt_main.h>
@@ -1558,10 +1557,10 @@ nxt_php_ini_value(const char *name, size_t len)
  * The checks take no lock on the cache.  After the query, these make the
  * compile miss: an opcache_invalidate() of the script, a cache restart that
  * another process completes, or an "auto_prepend_file" script that calls
- * opcache_invalidate() or uses ini_set() to disable OPcache or to turn
- * "opcache.revalidate_path" on.  The compile then reads the stream that
- * nxt_php_execute() gives it, and nxt_php_miss_open() opens the script as
- * the open path does and answers a failed open with its status.
+ * opcache_invalidate() or uses ini_set() to disable OPcache.  The compile
+ * then reads the stream that nxt_php_execute() gives it, and
+ * nxt_php_miss_open() opens the script as the open path does and answers a
+ * failed open with its status.
  */
 static nxt_int_t
 nxt_php_opcache_serves(nxt_php_run_ctx_t *ctx, const char *filename)
