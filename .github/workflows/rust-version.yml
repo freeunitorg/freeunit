@@ -81,8 +81,8 @@ jobs:
       - name: Build nxt_unit.o
         if: matrix.setup == 'libunit'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libclang-dev
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" update
+          sudo sh "$GITHUB_WORKSPACE/.github/scripts/apt-get.sh" install -y libclang-dev
           ./configure --no-regex
           make -j"$(nproc)" build/src/nxt_unit.o
 
