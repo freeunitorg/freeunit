@@ -501,6 +501,10 @@ void     *nxt_unit_test_port_queue(nxt_unit_port_t *port);
 int      nxt_unit_test_wait_shm_ack(nxt_unit_ctx_t *ctx, size_t *held);
 size_t   nxt_unit_test_parked_rbufs(nxt_unit_ctx_t *ctx);
 uint64_t nxt_unit_test_detached_now(void);
+void     *nxt_unit_test_wait_set_new(void);
+int      nxt_unit_test_wait(void *ws, int read_fd, int shared_fd, int timeout,
+    short *revents);
+void     nxt_unit_test_wait_set_free(void *ws);
 uint8_t  nxt_unit_test_ctx_online(nxt_unit_ctx_t *ctx);
 void     nxt_unit_test_ctx_set_quit_pending(nxt_unit_ctx_t *ctx,
              uint8_t quit_param);
