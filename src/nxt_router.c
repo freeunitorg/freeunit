@@ -6653,6 +6653,17 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
          * msg->buf in place for the port to release its shared memory.
          */
         if (b != NULL) {
+            /*
+             * A closed request has no connection to send to:
+             * nxt_http_request_send() would drop the frame, and its shared
+             * memory with it.  Leave msg->buf to the port here as well.
+             */
+            if (nxt_slow_path(r->proto.any == NULL)) {
+                nxt_debug(task, "websocket: application frame after the "
+                          "request closed dropped");
+                return;
+            }
+
             if (nxt_slow_path(r->ws_closed)) {
                 nxt_debug(task, "websocket: application frame after a CLOSE "
                           "dropped");

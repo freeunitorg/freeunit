@@ -80,6 +80,7 @@ nxt_inline void nxt_h1p_request_error(nxt_task_t *task, nxt_h1proto_t *h1p,
     nxt_http_request_t *r);
 static void nxt_h1p_request_close(nxt_task_t *task, nxt_http_proto_t proto,
     nxt_socket_conf_joint_t *joint);
+static void nxt_h1p_request_unsent(nxt_task_t *task, nxt_conn_t *c);
 static void nxt_h1p_conn_sent(nxt_task_t *task, void *obj, void *data);
 static void nxt_h1p_conn_close(nxt_task_t *task, void *obj, void *data);
 static void nxt_h1p_conn_error(nxt_task_t *task, void *obj, void *data);
@@ -2643,8 +2644,56 @@ nxt_h1p_request_close(nxt_task_t *task, nxt_http_proto_t proto,
         nxt_h1p_keepalive(task, h1p, c);
 
     } else {
+        nxt_h1p_request_unsent(task, c);
         nxt_h1p_shutdown(task, c);
     }
+}
+
+
+/*
+ * The connection closes, so the buffers still in c->write are not sent.
+ * Usually there are none.  An upgraded connection can have frames of the
+ * application there when the client goes away: its error handler closes
+ * the request directly, and nxt_h1p_request_discard() does not run.
+ * Complete the buffers now, while the request exists: their handlers give
+ * shared memory back to the application and release the request pool.
+ * nxt_conn_close() later only drops the pointer.
+ *
+ * A last buffer is not completed.  Its handler ends the request, and the
+ * request ends here already.  Its memory is in the request pool.
+ */
+
+static void
+nxt_h1p_request_unsent(nxt_task_t *task, nxt_conn_t *c)
+{
+    nxt_buf_t  *b, *next, *out, **tail;
+
+    b = c->write;
+
+    if (b == NULL) {
+        return;
+    }
+
+    c->write = NULL;
+
+    out = NULL;
+    tail = &out;
+
+    do {
+        next = b->next;
+        b->next = NULL;
+
+        if (!nxt_buf_is_last(b)) {
+            *tail = b;
+            tail = &b->next;
+        }
+
+        b = next;
+    } while (b != NULL);
+
+    nxt_debug(task, "h1p request unsent");
+
+    nxt_sendbuf_drain(task, &task->thread->engine->fast_work_queue, out);
 }
 
 

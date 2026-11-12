@@ -180,6 +180,10 @@ jobs:
             # test_static_mtime_range serves files whose mtime has no HTTP
             # date.  The old code read outside the month table for some of
             # them, and only ASan reports that read.
+            #
+            # test_asgi_websockets_unsent is here because a WebSocket that
+            # ends with unsent data can leave the router with a freed buffer
+            # in its write chain.  Without ASan that read is often silent.
             tests: >-
               test/test_graceful_reload.py
               test/test_state_store.py
@@ -198,6 +202,7 @@ jobs:
               test/test_asgi_websockets_access_log.py
               test/test_python_local_addr_reconf.py
               test/test_static_mtime_range.py
+              test/test_asgi_websockets_unsent.py
           - runtime: php
             apt: ""
             configure: php
