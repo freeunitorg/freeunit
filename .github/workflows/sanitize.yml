@@ -168,6 +168,10 @@ jobs:
             # wrote the access log record of a WebSocket request from header
             # buffers that were released at the upgrade.  Only ASan reports
             # the read when the engine has freed such a buffer.
+            #
+            # test_python_local_addr_reconf is here because the old code read
+            # the listener address from a released configuration.  A release
+            # build can keep the old bytes, so only ASan makes the test fail.
             tests: >-
               test/test_graceful_reload.py
               test/test_state_store.py
@@ -183,6 +187,7 @@ jobs:
               test/test_python_targets.py
               test/test_settings_body_temp_path.py
               test/test_asgi_websockets_access_log.py
+              test/test_python_local_addr_reconf.py
           - runtime: php
             apt: ""
             configure: php

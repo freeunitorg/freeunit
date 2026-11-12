@@ -235,19 +235,15 @@ void
 nxt_http_conn_init(nxt_task_t *task, void *obj, void *data)
 {
     nxt_conn_t               *c;
-    nxt_socket_conf_t        *skcf;
     nxt_event_engine_t       *engine;
+#if (NXT_TLS)
     nxt_listen_event_t       *lev;
     nxt_socket_conf_joint_t  *joint;
+#endif
 
     c = obj;
-    lev = data;
 
     nxt_debug(task, "http conn init");
-
-    joint = lev->socket.data;
-    skcf = joint->socket_conf;
-    c->local = skcf->sockaddr;
 
     engine = task->thread->engine;
     c->read_work_queue = &engine->fast_work_queue;
@@ -256,7 +252,10 @@ nxt_http_conn_init(nxt_task_t *task, void *obj, void *data)
     c->read_state = &nxt_h1p_idle_state;
 
 #if (NXT_TLS)
-    if (skcf->tls != NULL) {
+    lev = data;
+    joint = lev->socket.data;
+
+    if (joint->socket_conf->tls != NULL) {
         c->read_state = &nxt_http_idle_state;
     }
 #endif
@@ -600,7 +599,15 @@ nxt_h1p_conn_request_init(nxt_task_t *task, void *obj, void *data)
             skcf = joint->socket_conf;
             r->log_route = skcf->log_route;
 
-            if (c->local == NULL) {
+            /*
+             * The address is memory of the configuration.  Take it from
+             * the joint of this request.  A connection keeps no joint of
+             * a finished request, so the address of an earlier request
+             * can be freed by now.  For a wildcard listener the
+             * address is NULL; then c->local is from getsockname() in the
+             * connection pool and stays valid.
+             */
+            if (skcf->sockaddr != NULL) {
                 c->local = skcf->sockaddr;
             }
 
