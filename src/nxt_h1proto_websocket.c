@@ -90,6 +90,8 @@ void
 nxt_h1p_websocket_first_frame_start(nxt_task_t *task, nxt_http_request_t *r,
     nxt_buf_t *ws_frame)
 {
+    size_t                size;
+    nxt_buf_t             *in;
     nxt_conn_t            *c;
     nxt_timer_t           *timer;
     nxt_h1proto_t         *h1p;
@@ -126,6 +128,46 @@ nxt_h1p_websocket_first_frame_start(nxt_task_t *task, nxt_http_request_t *r,
         timer->handler = nxt_h1p_conn_ws_keepalive;
     }
 
+    /*
+     * The request fields point into the header buffers, and the access log
+     * reads them when the request closes.  Keep the buffers in h1p->buffers,
+     * so that nxt_h1p_shutdown() releases them after the log record.  The
+     * frame reader moves bytes inside its buffer, so it gets a copy of the
+     * bytes that the client sent after the handshake.
+     */
+    in = ws_frame;
+
+    if (in != NULL) {
+        in->next = h1p->buffers;
+        h1p->buffers = in;
+        h1p->nbuffers++;
+
+        c->read = NULL;
+
+    } else {
+        /*
+         * After a request body that went to a file, the bytes that
+         * followed the body wait in the first buffer of h1p->buffers.
+         */
+        in = h1p->buffers;
+    }
+
+    ws_frame = NULL;
+
+    size = (in != NULL) ? nxt_buf_mem_used_size(&in->mem) : 0;
+
+    if (size != 0) {
+        ws_frame = nxt_buf_mem_alloc(c->mem_pool,
+                                     nxt_buf_mem_size(&in->mem), 0);
+        if (nxt_slow_path(ws_frame == NULL)) {
+            hxt_h1p_send_ws_error(task, r, &nxt_ws_err_out_of_memory);
+            return;
+        }
+
+        ws_frame->mem.free = nxt_cpymem(ws_frame->mem.free, in->mem.pos,
+                                        size);
+    }
+
     nxt_h1p_websocket_frame_start(task, r, ws_frame);
 }
 
@@ -147,10 +189,18 @@ nxt_h1p_websocket_frame_start(nxt_task_t *task, nxt_http_request_t *r,
         return;
     }
 
+    /*
+     * Release an empty frame buffer only.  The header buffers stay in
+     * h1p->buffers until nxt_h1p_shutdown(): the request fields point
+     * into them.
+     */
+    if (ws_frame != NULL && nxt_buf_mem_used_size(&ws_frame->mem) == 0) {
+        ws_frame->completion_handler(task, ws_frame, ws_frame->parent);
+        ws_frame = NULL;
+    }
+
     c = h1p->conn;
     c->read = ws_frame;
-
-    nxt_h1p_complete_buffers(task, h1p, 0);
 
     in = c->read;
     c->read_state = &nxt_h1p_read_ws_frame_header_state;
