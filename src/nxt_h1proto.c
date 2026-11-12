@@ -1649,8 +1649,15 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
                                                 size);
 
                 } else {
-                    rest = nxt_event_engine_buf_mem_alloc(engine,
-                                       nxt_max(size, skcf->header_buffer_size));
+                    /*
+                     * The client chooses "size".  The engine buffer cache
+                     * keeps one class for each size and never frees it,
+                     * so the buffer comes from the connection pool.  Its
+                     * completion handler frees it into that pool.
+                     */
+                    rest = nxt_buf_mem_alloc(c->mem_pool,
+                                       nxt_max(size, skcf->header_buffer_size),
+                                       0);
                     if (nxt_slow_path(rest == NULL)) {
                         h1p->keepalive = 0;
                         nxt_http_request_error(task, r,
