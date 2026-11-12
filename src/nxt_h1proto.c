@@ -753,11 +753,25 @@ static nxt_int_t
 nxt_h1p_header_process(nxt_task_t *task, nxt_h1proto_t *h1p,
     nxt_http_request_t *r)
 {
-    u_char     *m;
+    u_char     *m, *p;
     nxt_int_t  ret;
 
     r->target.start = h1p->parser.target_start;
     r->target.length = h1p->parser.target_end - h1p->parser.target_start;
+
+    /*
+     * A raw "#" starts a fragment.  The parser ends the path and the query
+     * there, and it marks such a target as complex.  The target also ends
+     * there, so a proxy upstream, an application and "$request_uri" do not
+     * get the fragment.  "$request_line" keeps the line as received.
+     */
+    if (h1p->parser.complex_target) {
+        p = memchr(r->target.start, '#', r->target.length);
+
+        if (p != NULL) {
+            r->target.length = p - r->target.start;
+        }
+    }
 
     if (h1p->parser.version.ui64 != 0) {
         r->version.start = h1p->parser.version.str;

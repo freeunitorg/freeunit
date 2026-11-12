@@ -108,6 +108,25 @@ a""".encode(),
     assert resp['headers']['Request-Uri'] == '/bar', 'REQUEST_URI unchanged'
 
 
+def test_python_application_request_uri_fragment():
+    # A raw "#" starts the fragment.  REQUEST_URI ends before it.
+    client.load('variables')
+
+    resp = client.post(
+        url='/a?q=1#frag',
+        headers={
+            'Host': 'localhost',
+            'Content-Type': 'text/html',
+            'Custom-Header': 'blah',
+            'Connection': 'close',
+        },
+        body='',
+    )
+
+    assert resp['status'] == 200, 'status'
+    assert resp['headers']['Request-Uri'] == '/a?q=1', 'REQUEST_URI'
+
+
 def test_python_application_header_dup():
     client.load('header_dup')
 

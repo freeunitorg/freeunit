@@ -46,6 +46,24 @@ def test_go_application_variables(date_to_sec_epoch, sec_epoch):
     assert resp['body'] == body, 'body'
 
 
+def test_go_application_request_uri_fragment():
+    # A raw "#" starts the fragment.  RequestURI ends before it.
+    client.load('variables')
+
+    resp = client.post(
+        url='/a?q=1#frag',
+        headers={
+            'Host': 'localhost',
+            'Content-Type': 'text/html',
+            'Connection': 'close',
+        },
+        body='',
+    )
+
+    assert resp['status'] == 200, 'status'
+    assert resp['headers']['Request-Uri'] == '/a?q=1', 'RequestURI'
+
+
 def test_go_application_get_variables():
     client.load('get_variables')
 

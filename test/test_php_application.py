@@ -447,6 +447,14 @@ def test_php_application_get_variables():
     assert resp['headers']['X-Var-4'] == 'not set', 'GET variables 4'
 
 
+def test_php_application_get_variables_fragment():
+    # A raw "#" starts the fragment.  $_GET ends before it.
+    client.load('get_variables')
+
+    resp = client.get(url='/?var1=val1#frag')
+    assert resp['headers']['X-Var-1'] == 'val1', 'GET variables'
+
+
 def test_php_application_post_variables():
     client.load('post_variables')
 

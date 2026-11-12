@@ -132,7 +132,7 @@ def test_proxy_rewrite_target_delimiters():
     # The query is sent as the router holds it: a rewrite does not change
     # it, so the text after a raw "?" of a rewrite result is not sent, and a
     # "%3F" in a rewrite result is path data too.  A target that was not
-    # rewritten goes out as the client sent it.
+    # rewritten goes out as the client sent it, up to a raw "#".
     assert 'success' in client.conf(
         {
             "rewrite": [
@@ -203,6 +203,49 @@ def test_proxy_rewrite_target_uri_value():
         ('/v1/a%253Fb', b'/app/v1/a%253Fb'),
         ('/v1/a%0D%0Ab', b'/app/v1/a%0D%0Ab'),
         ('/v1/plain?q=1', b'/app/v1/plain?q=1'),
+    ]
+
+    seen = [(url, proxied_target(url)) for url, _ in cases]
+
+    assert seen == [(url, want) for url, want in cases]
+
+
+def test_proxy_target_fragment():
+    # The router matches the path before a raw "#".  The upstream must get
+    # the same path, without the fragment, whether or not a rewrite ran.
+    # The "#" stands at each place where the parser can meet it.
+    assert 'success' in client.conf(
+        {
+            "rewrite": [
+                {
+                    "match": {"uri": "/rw/*"},
+                    "action": {"rewrite": "/new$uri", "pass": "routes/proxy"},
+                },
+                {"action": {"pass": "routes/proxy"}},
+            ],
+            "proxy": [
+                {"action": {"proxy": f"http://127.0.0.1:{UPSTREAM_PORT}"}}
+            ],
+        },
+        'routes',
+    ), 'fragment routes'
+
+    cases = [
+        ('/a#frag', b'/a'),
+        ('/a?q=1#frag', b'/a?q=1'),
+        ('/a#frag?q=1', b'/a'),
+        ('/%23a#frag', b'/%23a'),
+        ('/a#frag#frag', b'/a'),
+        ('/#frag', b'/'),
+        ('/a#', b'/a'),
+        ('/a?q=%23#frag', b'/a?q=%23'),
+        ('/a?#frag', b'/a?'),
+        ('/a%41#frag', b'/a%41'),
+        ('/a.b#frag', b'/a.b'),
+        ('/a/.#frag', b'/a/.'),
+        ('//a#frag', b'//a'),
+        ('/rw/a#frag', b'/new/rw/a'),
+        ('/rw/a?q=1#frag', b'/new/rw/a?q=1'),
     ]
 
     seen = [(url, proxied_target(url)) for url, _ in cases]

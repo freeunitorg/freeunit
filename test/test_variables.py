@@ -100,8 +100,8 @@ def test_variables_request_uri(
 ):
     set_format('$request_uri')
 
-    def check_request_uri(req_uri):
-        reg = fr'^{re.escape(req_uri)}$'
+    def check_request_uri(req_uri, expect=None):
+        reg = fr'^{re.escape(expect or req_uri)}$'
 
         assert search_in_file(reg, 'access.log') is None
         assert client.get(url=req_uri)['status'] == 200
@@ -110,7 +110,10 @@ def test_variables_request_uri(
     check_request_uri('/3')
     check_request_uri('/4*')
     check_request_uri('/4%2A')
-    check_request_uri('/9?q#a')
+
+    # A raw "#" starts the fragment.  "$request_uri" ends before it.
+    check_request_uri('/8#a', '/8')
+    check_request_uri('/9?q#a', '/9?q')
 
     # $request_uri + proxy
 
@@ -309,6 +312,12 @@ def test_variables_request_line(search_in_file, wait_for_record):
     reg = r'^GET \/r_line HTTP\/1\.1$'
     assert search_in_file(reg, 'access.log') is None
     assert client.get(url='/r_line')['status'] == 200
+    assert wait_for_record(reg, 'access.log') is not None
+
+    # "$request_line" keeps the line as received, with the fragment.
+    reg = r'^GET \/r_line\?q#frag HTTP\/1\.1$'
+    assert search_in_file(reg, 'access.log') is None
+    assert client.get(url='/r_line?q#frag')['status'] == 200
     assert wait_for_record(reg, 'access.log') is not None
 
 
