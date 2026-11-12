@@ -29,6 +29,15 @@ check() {
     printf 'ok: %s\n' "$1"
 }
 
+check_tree() {
+    actual=$(sh "$selector" --tree "$2" "$3" 2> "$tmp/notice")
+    if [ "$actual" != "$4" ]; then
+        printf 'FAIL: --tree %s\n  want: %s\n  got:  %s\n' "$1" "$4" "$actual" >&2
+        exit 1
+    fi
+    printf 'ok: --tree %s\n' "$1"
+}
+
 printf 'root\n' > file
 git add file
 git commit -qm root
@@ -56,6 +65,34 @@ check 'present non-ancestor uses first parent' "$sibling" "$head" "$parent"
 check 'root with no base has no preceding version' '' "$root" ''
 check 'root with non-ancestor has no preceding version' "$sibling" "$root" ''
 
+# A tree comparison keeps a present base, even the old tip of a replaced
+# branch, and falls back only when there is no base to compare with.
+check_tree 'ancestor is preserved' "$root" "$head" "$root"
+check_tree 'present non-ancestor is preserved' "$sibling" "$head" "$sibling"
+check_tree 'empty base uses first parent' '' "$head" "$parent"
+check_tree 'all-zero base uses first parent' 0000000000000000000000000000000000000000 "$head" "$parent"
+check_tree 'missing base uses first parent' ffffffffffffffffffffffffffffffffffffffff "$head" "$parent"
+check_tree 'root with no base has no preceding version' '' "$root" ''
+
+# A git error in the ancestor test must fail, not select a fallback.
+real_git=$(command -v git)
+mkdir "$tmp/bin"
+cat > "$tmp/bin/git" <<EOF
+#!/bin/sh
+if [ "\$1" = merge-base ]; then
+    exit 128
+fi
+exec "$real_git" "\$@"
+EOF
+chmod +x "$tmp/bin/git"
+rc=0
+out=$(PATH="$tmp/bin:$PATH" sh "$selector" "$parent" "$head" 2> "$tmp/notice") || rc=$?
+if [ "$rc" -ne 128 ] || [ -n "$out" ]; then
+    printf 'FAIL: merge-base error\n  want: status 128, no output\n  got:  status %s, output %s\n' "$rc" "$out" >&2
+    exit 1
+fi
+printf 'ok: merge-base error fails\n'
+
 # A pull-request merge keeps the base branch at its first parent.
 git checkout -q -B main "$head"
 git merge -qm 'test merge' "$sibling"
@@ -75,7 +112,7 @@ printf 'bad trailing space \n' > bad
 git add bad
 git commit -qm 'real whitespace error'
 bad=$(git rev-parse HEAD)
-base=$(sh "$selector" ffffffffffffffffffffffffffffffffffffffff "$bad")
+base=$(sh "$selector" ffffffffffffffffffffffffffffffffffffffff "$bad" 2> "$tmp/notice")
 rc=0
 git log --check --format= "$base..$bad" > "$tmp/check.log" 2>&1 || rc=$?
 if [ "$rc" -ne 2 ] || ! grep -q 'trailing whitespace' "$tmp/check.log"; then
@@ -100,6 +137,6 @@ if [ "$rc" -ne 2 ] || ! grep -q 'leftover conflict marker' "$tmp/history.log"; t
     exit 1
 fi
 printf 'ok: the unfiltered imported history reproduces the old failure\n'
-base=$(sh "$selector" "$sibling" "$imported")
+base=$(sh "$selector" "$sibling" "$imported" 2> "$tmp/notice")
 git log --check --format= "$base..$imported" > "$tmp/head.log" 2>&1
 printf 'ok: a replaced branch checks its clean head without obsolete errors\n'

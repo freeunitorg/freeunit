@@ -76,7 +76,9 @@ jobs:
           else
             event_base=$EVENT_BASE
           fi
-          base=$(sh .github/scripts/check-base.sh "$event_base")
+          # The check compares two trees, so a present base that is not an
+          # ancestor, such as the old tip of a replaced branch, is kept.
+          base=$(sh .github/scripts/check-base.sh --tree "$event_base")
           if [ -z "$base" ]; then
             # A root has no preceding layout. Still run every coverage,
             # self-test and declaration check against the available tree.
