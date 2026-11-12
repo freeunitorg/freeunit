@@ -38,6 +38,9 @@ jobs:
       env:
         BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
       run: |
+        # After a branch is replaced, its old tip is not an ancestor. Then
+        # only the last commit is checked, so that errors already removed
+        # in the imported history do not fail the job.
         base=$(sh .github/scripts/check-base.sh "$BASE")
         if test -n "$base"
         then
